@@ -12,11 +12,11 @@
 //! | Backend | Primitives | Selected when |
 //! | --- | --- | --- |
 //! | [`native_std`] | `std::sync` + `std::thread` | `std`, non-wasm |
-//! | [`single`] | borrow-checked cells, jobs run inline | everything else |
+//! | `single` | borrow-checked cells, jobs run inline | everything else |
 //! | `native-raw` | futex / `WaitOnAddress` by raw syscall | *not implemented* |
 //! | `wasm-atomics` | shared memory + `Atomics.wait` | *not implemented* |
 //!
-//! [`single`] is not a degraded mode to be tolerated: it is the **reference
+//! `single` is not a degraded mode to be tolerated: it is the **reference
 //! semantics**. It is the only backend that can *detect* the mistakes the other
 //! three merely survive — a lock taken twice, a job that re-enters its
 //! submitter — because with one thread those are unambiguously bugs rather than
@@ -25,7 +25,7 @@
 //! file run one identical workload through both and compare.
 //!
 //! The two unimplemented backends are extension points, not omissions. Both
-//! plug in at the same place: add a module beside [`single`] exporting the same
+//! plug in at the same place: add a module beside `single` exporting the same
 //! items, then extend the `cfg` on the re-export block at the end of this file.
 //! Each is marked `EXTENSION POINT` where it will attach.
 //!
@@ -60,7 +60,7 @@
 //! **release it**, and only then call outward. This module supplies the
 //! enforcement, not the good intentions:
 //!
-//! - Under [`single`], a blocking acquire of a held lock panics rather than
+//! - Under `single`, a blocking acquire of a held lock panics rather than
 //!   deadlocking, and a job runs inline at [`Pool::submit`], so a job that
 //!   re-enters its submitter's critical section is caught immediately.
 //! - Under every backend, the rank check turns "took two locks at once" into a
@@ -521,7 +521,13 @@ mod rank_track {
 // from safe code, which no amount of documentation makes acceptable in a public
 // API. The selected backend is re-exported publicly below, so nothing legitimate
 // is lost, and the in-crate equivalence tests still see both backends.
-#[allow(unsafe_code)]
+// Three allows, one reason. On a target where `native_std` is selected this
+// module is compiled but not re-exported, so its items are both dead and
+// unreachable — expected, since it stays compiled only so the equivalence tests
+// can instantiate both backends in one binary. The items must still be declared
+// `pub` because the `no_std` path re-exports them publicly. Unused crate-private
+// items are dropped by the compiler rather than shipped.
+#[allow(unsafe_code, dead_code, unreachable_pub)]
 pub(crate) mod single {
     use super::{LockRank, RankGuard, Tripwire};
     use ::core::cell::{Cell, UnsafeCell};
@@ -1701,6 +1707,7 @@ pub mod native_std {
 /// mistake is possible and cheap to catch: a debug build that selected
 /// `native-std` but touched a `single` lock anyway.
 #[cfg(all(debug_assertions, feature = "std"))]
+#[allow(dead_code)] // used only by the `single` backend; see above.
 struct Tripwire {
     owner: Cell<Option<std::thread::ThreadId>>,
 }
