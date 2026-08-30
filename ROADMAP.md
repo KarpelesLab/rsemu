@@ -569,6 +569,19 @@ that wires two sources to one sink is a **resolver error**, not a silent
 mis-wiring. rsemu does the former, and the DSL's implicit fan-in (§5) is sugar
 that the resolver expands into an explicit combiner.
 
+**Realize must sweep the graph.** An undriven wire sits low, which contradicts
+an inverter's idle-high output, so a freshly realized *or freshly restored*
+machine is inconsistent until every gate drives what its inputs imply. Reset
+therefore walks wire sources in topological order and announces their levels.
+Skip it and interrupt lines come up wrong on some machines and only on some
+paths — the worst class of bug to find later.
+
+**One edge of every wire cycle must be weak.** A real IRQ/ack loop is cyclic,
+and a graph wired with strong references is necessarily acyclic, so the realize
+protocol states which edge is weak: the machine owns devices, and a wire merely
+refers to them. §5's resolver must reject *wire* cycles explicitly, not only
+name and include cycles.
+
 Level and edge semantics both, with the *edge detector as a device* rather than
 a flag, so it snapshots correctly. Ships with the standard combinators as
 ordinary devices: `wire.split`, `wire.or`, `wire.and`, `wire.not`,
