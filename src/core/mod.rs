@@ -22,11 +22,21 @@
 //! | `state` | versioned snapshots (§4.5) |
 //! | `sync` | the concurrency portability seam (§4.7) |
 //!
-//! Only [`error`] and [`value`] exist so far. The rest are listed because the
-//! shape of this module is a design decision already made, not one deferred.
+//! The module tree is declared up front so that the shape of the core is a
+//! settled decision rather than one rediscovered per module; several are still
+//! stubs.
 
+pub mod clock;
+pub mod device;
 pub mod error;
+pub mod props;
+pub mod registry;
+pub mod sched;
+pub mod space;
+pub mod state;
+pub mod sync;
 pub mod value;
+pub mod wire;
 
-pub use error::{Error, Result};
+pub use error::{BusError, Error, Result};
 pub use value::{Endian, Width};

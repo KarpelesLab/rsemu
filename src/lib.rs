@@ -22,6 +22,7 @@
 extern crate alloc;
 
 pub mod core;
+pub mod machine;
 
 #[cfg(feature = "wasm")]
 #[cfg_attr(docsrs, doc(cfg(feature = "wasm")))]
