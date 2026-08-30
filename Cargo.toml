@@ -31,6 +31,12 @@ std = []
 # The `rsemu` binary. Needs `std`.
 cli = ["std"]
 
+# The NES APU (RP2A03 audio): two pulse channels with sweep, triangle, noise,
+# the DMC with its CPU-stalling sample fetch, the frame counter and its IRQ, and
+# the non-linear mixer. `no_std`, no floats in the time path. Pulls in nothing —
+# a NES build enables this plus a 6502 and a PPU.
+dev-nes-apu = []
+
 # WebAssembly bindings (src/wasm.rs): plain C-ABI exports plus embedder-supplied
 # imports, following purecrypto's browser convention. Deliberately no
 # wasm-bindgen — the dependency policy forbids it, and the exports are simple
