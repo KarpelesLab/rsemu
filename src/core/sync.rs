@@ -514,8 +514,15 @@ mod rank_track {
 /// equivalence tests can run both backends in one binary. Outside those tests,
 /// use the re-exports at the top of [`crate::core::sync`] and let the `cfg`
 /// choose.
+// Crate-private, deliberately. The `unsafe impl Sync` below is sound only on a
+// target that cannot create a second thread, and it is upheld by construction
+// rather than by the type system. Left `pub`, a caller on a threaded target
+// could name `single::Mutex` directly, share it, and reach a data race — UB
+// from safe code, which no amount of documentation makes acceptable in a public
+// API. The selected backend is re-exported publicly below, so nothing legitimate
+// is lost, and the in-crate equivalence tests still see both backends.
 #[allow(unsafe_code)]
-pub mod single {
+pub(crate) mod single {
     use super::{LockRank, RankGuard, Tripwire};
     use ::core::cell::{Cell, UnsafeCell};
     use ::core::fmt;
