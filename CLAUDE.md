@@ -60,12 +60,36 @@ non-negotiables (§0) win.
 
 ## Concurrency
 
-- No async. Devices are `Send + Sync` with synchronous methods.
+- No async. Devices are `Send + Sync` with synchronous methods — from the first
+  commit, not once threading "is needed".
+- **Everything goes through `core::sync`.** Nothing under `core/`, `cpu/`,
+  `dev/`, `machine/` or `ir/` may name `std::sync`, `std::thread`, or the host
+  clock. One `std::sync::Mutex` in a device model breaks `no_std`, both wasm
+  targets, and the `fullrust` build simultaneously. `host/`, `jit/` and `accel/`
+  may use `std` directly.
+- **Submit jobs, never spawn threads.** Background work goes to the seam's task
+  pool. wasm cannot create a worker synchronously from arbitrary code, and
+  thread count belongs to the machine configuration anyway.
 - Shared mutable device state: `Mutex`/`RwLock` for cold paths, atomics for
   hot ones. Prefer designing the hot path to need neither.
-- Background work is `std::thread::spawn`, and only under `host/`.
+- No lock is held across a guest instruction boundary, across a scheduler
+  callback, or across a call into another device. Respect the ranked lock order
+  documented in `core::sync`.
 - The scheduler owns time. A device never sleeps, never reads the wall clock,
   and never spawns a thread to "tick" itself — it registers an event.
+- Stopping the world (TLB shootdown, remap, snapshot, reset) uses the
+  safe-point protocol: a generation counter plus a per-CPU exit flag checked at
+  block boundaries. Never a signal — wasm has none.
+
+## Targets
+
+- Build the matrix, not just your host: native, `no_std`, `wasm32-unknown-
+  unknown` **with and without threads**, `wasm32-wasip1`. CI does this on every
+  commit; if you break wasm you will find out immediately, which is the point.
+- The non-threaded browser configuration is a supported target, not a fallback.
+  It shares a code path with the deterministic test runner, so it stays honest.
+- Guest RAM is addressed by byte offset, never by handing out `&mut [u8]`, so it
+  can live in a `SharedArrayBuffer`. Do not "simplify" that API.
 
 ## Determinism
 

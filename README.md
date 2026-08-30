@@ -39,6 +39,14 @@ one snapshot format, one debugger, shared by every machine ever added.
   core generically. No device type ever appears in a `core::` signature.
 - **`no_std` + `alloc` core.** Host I/O, JIT, acceleration and frontends live
   above the `std` line.
+- **Multithreaded by design.** Guest CPUs, background JIT compilation, and
+  device I/O can all run in parallel — with the same state hash whether the
+  machine runs on one thread or many. All of it goes through one portability
+  seam, so a device is written once.
+- **Runs in the browser.** `wasm32-unknown-unknown` with *and* without threads
+  is a CI target from the first commit: Web Workers over shared memory, a JIT
+  that emits WebAssembly instead of native code, and no `mmap`, signals, or
+  host clock anywhere in the core.
 - **One crate, one feature per component.** A NES build links a 6502 and
   nothing else.
 
@@ -58,6 +66,8 @@ with acceptance gates, and the design invariants.
 [`compcol`](https://github.com/KarpelesLab/compcol) (image + snapshot
 compression), [`purecrypto`](https://github.com/KarpelesLab/purecrypto)
 (disk/snapshot encryption, emulated crypto devices),
+[`fstool`](https://github.com/KarpelesLab/fstool) (block devices, qcow2,
+partition tables, and a dozen read-write filesystems),
 [`noroi`](https://github.com/KarpelesLab/noroi) (monitor TUI).
 
 ## License
