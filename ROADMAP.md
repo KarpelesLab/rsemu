@@ -362,14 +362,23 @@ would be a slideshow and the PC would take minutes to boot.
 | | **Rebase** | **Retopology** |
 | --- | --- | --- |
 | What changed | an alias's `offset` slides; the region *set* is identical | regions added, removed, resized, re-prioritized |
-| Examples | cartridge bank switching, BAR *address* change | BAR enable/disable, hotplug, ROM shadowing toggle, realize |
+| Examples | cartridge bank switching; any fixed aperture whose *contents* slide | BAR programming (the mapping **moves**), enable/disable, hotplug, ROM shadowing toggle, realize |
 | Cost | one atomic store per affected dispatch entry | full flatten + rebuild |
 | Generation counter | untouched | bumped |
 | JIT invalidation | only if bytes under a page holding translations changed | all caches for the affected range |
 
-Bank switching and BAR moves must be rebase-shaped, which means `Alias` holds its
-`offset` in an atomic cell rather than as a frozen enum payload. Design this in
-phase 1; phase 3 depends on it.
+Bank switching must be rebase-shaped, which means `Alias` holds its `offset` in
+an atomic cell rather than as a frozen enum payload. Design this in phase 1;
+phase 3 depends on it.
+
+**A BAR *address* change is not a rebase** — an earlier revision of this table
+said it was, and that was wrong. Moving a mapping changes the addresses in the
+sorted flat view and invalidates every cache keyed on the old address, so it is
+a retopology. The genuinely cheap case is the other one: a *fixed* aperture
+whose contents slide underneath it, which is exactly what a cartridge mapper
+does and exactly why the NES needs this. Enforce the distinction in the type
+system rather than by convention — a rebase should not be able to reach
+topology.
 
 **Dispatch.** On retopology, the container tree is flattened into a sorted,
 non-overlapping `FlatView`. Lookup is two-level: a page-granular dispatch table
