@@ -44,6 +44,12 @@ cli = ["std"]
 #       --no-default-features --features wasm --release
 wasm = ["std"]
 
+# The NES / Famicom picture processing unit (RP2C02): the per-dot rendering
+# pipeline, $2000-$2007 with their quirks, the two-phase sprite evaluation and
+# NMI generation. `machine-nes` will require it; on its own it is enough to run
+# PPU conformance work against. `no_std + alloc`, no dependencies.
+dev-nes-ppu = []
+
 [lib]
 name = "rsemu"
 path = "src/lib.rs"
