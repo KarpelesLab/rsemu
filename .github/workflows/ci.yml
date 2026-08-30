@@ -184,6 +184,43 @@ jobs:
           path: target/wasm32-unknown-unknown/release/rsemu.wasm
           if-no-files-found: error
 
+  fuzz:
+    name: fuzz smoke (nightly, advisory)
+    runs-on: ubuntu-latest
+    # Nightly by necessity: cargo-fuzz requires it. Advisory for the same reason
+    # as the wasm-threads job — it must not block a merge for a toolchain
+    # regression outside our control. Sixty seconds per target is not the phase
+    # gate (fuzz/README.md has that command); it is drift detection, so a target
+    # that stops compiling against a changed API is caught the day it happens
+    # rather than the day someone next runs the real campaign.
+    continue-on-error: true
+    env:
+      RUSTUP_TOOLCHAIN: nightly
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: build targets
+        run: cargo fuzz build
+      - name: smoke each target
+        # The committed corpus is passed read-only as a second input so a CI run
+        # never rewrites the curated seeds.
+        run: |
+          set -euxo pipefail
+          for t in machine_parser state_decoder state_roundtrip; do
+            mkdir -p "/tmp/corpus-$t"
+            cargo fuzz run "$t" "/tmp/corpus-$t" "fuzz/corpus/$t" -- \
+              -max_total_time=60 -timeout=10
+          done
+      - uses: actions/upload-artifact@v5
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
   wasm-threads-browser:
     name: wasm threads, browser (nightly, advisory)
     runs-on: ubuntu-latest
