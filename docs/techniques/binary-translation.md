@@ -1,6 +1,6 @@
 # Dynamic binary translation and JIT compilation
 
-Consumed by: `ir/`, `jit/`, phases 6 and 9. This is the one area where the
+Consumed by: `ir/`, `jit/`. This is the one area where the
 primary sources are **academic papers rather than datasheets** — and where the
 temptation to read a GPL implementation is strongest. The literature is
 extensive, public, and enough.

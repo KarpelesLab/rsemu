@@ -1,6 +1,6 @@
 # WebAssembly and the browser target
 
-Consumed by: `jit/wasm`, `host/` wasm shim, from phase 0 in CI. See
+Consumed by: `jit/wasm`, `host/` wasm shim, from in CI. See
 `ROADMAP.md` §11 for the target matrix and the design.
 
 ## Specifications
@@ -37,7 +37,7 @@ and documented on MDN. Two constraints drive the whole design:
 - **No `mmap` means no native code path.** The JIT emits wasm modules instead;
   synchronous `new WebAssembly.Module()` is permitted inside a worker.
 - Per-module instantiation cost means only superblocks are worth compiling.
-  Measure this at phase 6 and cut the backend if the numbers say so — the IR
+  Measure this at and cut the backend if the numbers say so — the IR
   interpreter is always the fallback.
 - Guest RAM lives in the shared linear memory, so generated code addresses it
   with plain loads and stores.

@@ -1,6 +1,6 @@
 # Sega Master System / Game Gear
 
-Consumed by: `boards/sms`, phase 5. Shares the Z80 core with nothing else we
+Consumed by: `boards/sms`. Shares the Z80 core with nothing else we
 build, but reuses it — which is exactly the point of doing it.
 
 ## Primary

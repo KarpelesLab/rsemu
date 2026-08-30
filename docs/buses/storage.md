@@ -1,6 +1,6 @@
 # Storage transports
 
-Consumed by: `dev/blk/*`, phase 7. The image and filesystem layers below these
+Consumed by: `dev/blk/*`. The image and filesystem layers below these
 controllers come from [`fstool`](https://github.com/KarpelesLab/fstool) — see
 `ROADMAP.md` §7.1.
 
@@ -26,8 +26,11 @@ guests require it.
 
 ## Implementation notes
 
-- Controllers sit on `fstool::BlockDevice` (`Read + Write + Seek + Send`). Do
-  not invent a parallel block abstraction.
+- Controllers sit on `fstool::BlockDevice` (`std::io::Read + Write + Seek +
+  Send`). Do not invent a parallel block abstraction — but note it is `Send`,
+  *not* `Sync`, and its methods take `&mut self`, so a controller owns its
+  device behind the seam rather than sharing it. This is also why `dev/blk/*`
+  is one of the two documented `std` exceptions to the `no_std` rule.
 - **The flush contract matters more than throughput.** A guest issuing FLUSH
   expects durability; a snapshot taken mid-write must restore to a consistent
   state. Decide the write-back cache semantics before writing the first

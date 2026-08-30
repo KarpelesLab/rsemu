@@ -32,10 +32,16 @@ being accused of anything.
 
 ### The same applies to every copyleft source
 
-The rule is the licence, not the name. GPL, LGPL, AGPL, SSPL and CDDL sources
-are all off limits, including the emulators people reach for by reflex: Bochs,
-DOSBox, MAME, VICE, Dolphin, PCSX2, Nestopia, higan. **Check a project's
-licence before you open it.**
+The rule is the licence, not the name. GPL, LGPL, AGPL, SSPL, CDDL, MPL-2.0 and
+EPL sources are all off limits, including the emulators people reach for by
+reflex: Bochs, DOSBox, MAME, VICE, Dolphin, PCSX2, Nestopia, higan. **Check a
+project's licence before you open it.**
+
+Two *documentation* licences get a different answer rather than a ban. **GFDL**
+(the GDB manual, the Multiboot spec) and **CC-BY-SA** (several hardware wikis)
+are fine to implement from — that is what a published specification is for — but
+do not copy their prose into our source or docs. Read it, write your own words,
+cite the section.
 
 LGPL is the one people get wrong: it permits *linking*, not *copying source
 into an MIT crate*. Treat it exactly like GPL here.

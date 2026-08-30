@@ -1,6 +1,6 @@
 # RISC-V `virt` board
 
-Consumed by: `boards/riscv-virt`, phase 6 — the first machine that boots a real
+Consumed by: `boards/riscv-virt` — the first machine that boots a real
 operating system.
 
 ## Why this board

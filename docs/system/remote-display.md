@@ -1,6 +1,6 @@
 # Remote display protocols
 
-Consumed by: `host/vnc` (and later SPICE), phase 10. Remote display is the
+Consumed by: `host/vnc` (and later SPICE). Remote display is the
 highest-value frontend: no GUI dependencies, works over a network, and doubles
 as the CI screenshot mechanism.
 

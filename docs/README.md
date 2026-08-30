@@ -118,12 +118,16 @@ It is still GPLv2 and still forbidden. Read the specification the driver
 implements — for virtio that is the OASIS standard, for NVMe the NVM Express
 spec, for xHCI the Intel specification.
 
-**One narrow exception:** the kernel's userspace ABI headers under
-`include/uapi/` are licensed `GPL-2.0 WITH Linux-syscall-note`, an explicit
-exception permitting their use in non-GPL programs. That is what makes the KVM
-accel backend possible ([`techniques/virtualization.md`](techniques/virtualization.md)).
-It covers the UAPI headers only — not drivers, not `Documentation/`, not the
-rest of the tree.
+**On the KVM ABI.** The kernel's userspace ABI headers under `include/uapi/`
+carry `GPL-2.0 WITH Linux-syscall-note`, and everyone relies on that exception.
+But a project that elsewhere insists no paraphrasing launders a copyleft source
+should not lean on one exception being obviously broad enough. **Use our own
+doctrine instead: the KVM ABI is a *fact*.** Transcribe the ioctl numbers and
+structure layouts you need from the documented API
+([`techniques/virtualization.md`](techniques/virtualization.md)); do not copy
+the header text. That needs no exception at all, and it is the same rule that
+governs everything else here. Either way it covers the ABI only — never
+drivers, `Documentation/`, or the rest of the tree.
 
 ## Link status
 

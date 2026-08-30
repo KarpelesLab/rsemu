@@ -1,6 +1,6 @@
 # Other architectures
 
-Candidates for after the IR stabilises (`ROADMAP.md` §6, "post-9"). Each is a
+Candidates for after the IR stabilises (`ROADMAP.md` §6, "later"). Each is a
 short project once the IR and the framework exist; the work is a frontend lifter
 plus a machine description.
 

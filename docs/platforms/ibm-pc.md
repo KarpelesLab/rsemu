@@ -1,6 +1,6 @@
 # IBM PC, PC/AT, and modern PC chipsets
 
-Consumed by: `boards/i440fx`, `boards/q35`, phase 7 — the long phase.
+Consumed by: `boards/i440fx`, `boards/q35` — the long phase.
 
 ## The legacy machine
 
@@ -9,7 +9,7 @@ Consumed by: `boards/i440fx`, `boards/q35`, phase 7 — the long phase.
 | [bitsavers.org](https://bitsavers.org/) | IBM PC, XT and AT **Technical Reference** manuals — including the original BIOS listings and full schematics. The primary source for the legacy PC |
 | [minuszerodegrees.net](https://minuszerodegrees.net/) | Detailed hardware analysis, card documentation, and scans of the original machines **[browser]** (blocks `curl`) |
 | [PCjs](https://www.pcjs.org/) | Hosts a large collection of scanned original documentation and manuals |
-| [Bochs `PORTS.LST`](https://bochs.sourceforge.io/techspec/PORTS.LST) | The consolidated I/O port map. A **data table of hardware facts** — safe to read, unlike Bochs' source |
+| ~~Bochs `PORTS.LST`~~ | **Withdrawn** — documentation inside a copyleft tree (`../../ROADMAP.md` §1). The IBM AT Technical Reference on bitsavers is the primary source for the port map |
 
 ## The modern machine
 

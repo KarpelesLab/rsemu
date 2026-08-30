@@ -1,6 +1,6 @@
 # PCI and PCI Express
 
-Consumed by: `bus/pci`, phase 7. PCI is the hardest test of the memory-region
+Consumed by: `bus/pci`. PCI is the hardest test of the memory-region
 model — if BARs map cleanly through the priority/alias machinery of
 `ROADMAP.md` §4.1, that design is right.
 

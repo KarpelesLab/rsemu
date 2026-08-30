@@ -1,6 +1,6 @@
 # USB
 
-Consumed by: `bus/usb` and the host controllers, phase 7.
+Consumed by: `bus/usb` and the host controllers.
 
 ## Primary
 

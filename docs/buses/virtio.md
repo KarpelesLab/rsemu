@@ -1,6 +1,6 @@
 # virtio
 
-Consumed by: `dev/virtio/*`, phases 6–7. The fastest path to a working device
+Consumed by: `dev/virtio/*`. The fastest path to a working device
 for any modern guest, and freely specified.
 
 ## Primary

@@ -1,6 +1,6 @@
 # Debugging protocols
 
-Consumed by: `host/gdbstub`, phase 10. Debugging a guest kernel is a headline
+Consumed by: `host/gdbstub`. Debugging a guest kernel is a headline
 feature, not a nicety — and it is what makes rsemu useful to people doing
 bring-up work rather than just running old games.
 

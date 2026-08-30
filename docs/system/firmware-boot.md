@@ -1,6 +1,6 @@
 # Firmware, boot, and platform description
 
-Consumed by: `boards/*`, phase 7. This is the layer where a machine stops being
+Consumed by: `boards/*`. This is the layer where a machine stops being
 a pile of devices and becomes something an OS will boot on.
 
 ## Specifications

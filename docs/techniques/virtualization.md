@@ -1,6 +1,6 @@
 # Hardware virtualization interfaces
 
-Consumed by: `accel/`, phase 8. Running guest code natively when guest ISA ==
+Consumed by: `accel/`. Running guest code natively when guest ISA ==
 host ISA.
 
 ## KVM (Linux)
@@ -48,4 +48,4 @@ Same caveat as Hypervisor.framework: a DLL import, therefore opt-in and labelled
 - Time under accel is host-driven, which forfeits determinism. That is a
   documented property of the mode, not a bug (`ROADMAP.md` §4.2).
 - Snapshots must remain compatible across an accel/JIT switch; that is an
-  explicit phase-8 gate.
+  explicit gate on the acceleration phase.

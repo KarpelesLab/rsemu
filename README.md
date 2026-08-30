@@ -27,12 +27,13 @@ one snapshot format, one debugger, shared by every machine ever added.
 - **Determinism is a mode, not an accident.** Deterministic runs are
   bit-reproducible across hosts and across execution engines, which is what
   makes save states, record/replay, rewind, and the regression suite possible.
-- **Two time bases.** `exact` represents every clock ratio with zero error
-  (rational integer arithmetic) for cycle-accurate machines; `best-effort`
-  uses fixed-point with a residual accumulator — cheaper, tolerant of runtime
-  clock changes, bounded non-accumulating drift. Both are integer-only and
-  both are deterministic; picking one is a declaration, never a silent
-  fallback.
+- **Time follows the crystals.** A machine is a *forest* of clock domains, one
+  tree per oscillator. Within a tree, ratios are exact integers — the NES PPU
+  advances exactly 3 dots per CPU cycle, forever, because both descend from one
+  crystal, and games depend on that absolutely. Across independent oscillators
+  the relationship is bounded rather than exact, because on real hardware it is
+  genuinely loose: separate crystals drift, and no correct software can depend
+  on their phase. Both paths are integer-only and deterministic.
 - **Accuracy is measured.** Every CPU core ships with a published conformance
   suite and a known-failures ledger that only ever shrinks.
 - **Generic first.** A device that needs a new mechanism gets it added to the
@@ -67,7 +68,7 @@ with acceptance gates, and the design invariants.
 compression), [`purecrypto`](https://github.com/KarpelesLab/purecrypto)
 (disk/snapshot encryption, emulated crypto devices),
 [`fstool`](https://github.com/KarpelesLab/fstool) (block devices, qcow2,
-partition tables, and a dozen read-write filesystems),
+partition tables, and read-write ext/FAT/exFAT/NTFS/XFS/HFS+),
 [`noroi`](https://github.com/KarpelesLab/noroi) (monitor TUI).
 
 ## License and provenance

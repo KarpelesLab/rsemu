@@ -1,6 +1,6 @@
 # ARM
 
-Consumed by: `cpu/arm` (ARMv7-A), `cpu/aarch64` (ARMv8-A), phases 7–9.
+Consumed by: `cpu/arm` (ARMv7-A), `cpu/aarch64` (ARMv8-A).
 
 ## Primary
 

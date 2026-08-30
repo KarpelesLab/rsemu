@@ -1,6 +1,6 @@
 # Interrupt controllers, timers, and clocks
 
-Consumed by: `dev/intc/*`, `dev/timer/*`, phases 6–7. In rsemu these are
+Consumed by: `dev/intc/*`, `dev/timer/*`. In rsemu these are
 ordinary devices with wire sinks and sources — the core knows nothing about
 "interrupts" (`ROADMAP.md` §4.3).
 

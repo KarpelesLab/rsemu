@@ -31,6 +31,8 @@ anything**; this table records a point in time.
 | [riscv-tests](https://github.com/riscv-software-src/riscv-tests) | RISC-V ISA tests | **BSD-3-Clause** (UC Regents) ✅ | Yes, with attribution |
 | [riscv-arch-test](https://github.com/riscv-non-isa/riscv-arch-test) | RISC-V architectural compliance, driven by [RISCOF](https://github.com/riscv-software-src/riscof) | Not auto-detected — **check the in-tree licence** ⚠️ | Verify first |
 | [barotto/test386.asm](https://github.com/barotto/test386.asm) | 80386 CPU test ROM | **GPL-3.0** ⛔ | **No.** Download and run only |
+| [OpenSBI](https://github.com/riscv-software-src/opensbi) | RISC-V M-mode firmware | **BSD-2-Clause** ✅ | Yes — readable *and* usable |
+| [EDK II / OVMF](https://github.com/tianocore/edk2) | UEFI firmware | BSD-2-Clause-Patent ✅ | Readable; fetched as a prebuilt rather than vendored (building it needs a C toolchain) |
 | [kvm-unit-tests](https://gitlab.com/kvm-unit-tests/kvm-unit-tests) | Atomics, barriers, interrupt controllers — the parallel-execution stress suite | **GPL-2.0** ⛔ | **No.** Download and run only |
 | [retrio/gb-test-roms](https://github.com/retrio/gb-test-roms) (blargg) | Game Boy CPU, timing, sound | **No licence file** ⛔ | **No.** Provenance unclear — run only |
 | blargg's NES test ROMs | NES CPU, PPU, APU | Freely circulated, licence unclear ⛔ | **No.** Run only |
@@ -42,15 +44,18 @@ The MIT-licensed SingleStepTests corpora are the ones we could legitimately
 vendor — and they are also the most valuable, since they test at bus-cycle
 granularity. Even so, size argues for downloading them.
 
-## What each phase is gated on
+## What each milestone is gated on
 
-| Phase | Machine | Suites |
-| --- | --- | --- |
-| 4 | NES | SingleStepTests 65x02 (100 %), `nestest` trace-identical, blargg `cpu_instrs` + `instr_timing`, AccuracyCoin |
-| 5 | Game Boy / SMS | mooneye acceptance, blargg GB, `zexall` |
-| 6 | RISC-V `virt` | `riscv-tests`, `riscv-arch-test` via RISCOF, Linux boot to shell |
-| 7 | PC | `test386.asm`, SingleStepTests 8088, then real-OS boots (FreeDOS → Win 3.11 → Win 95 → Linux → Win XP) |
-| 9 | Parallel execution | `kvm-unit-tests` atomics/barriers, plus memory-model litmus tests ([`../techniques/memory-models.md`](../techniques/memory-models.md)) |
+Phase numbers live in [`../../ROADMAP.md`](../../ROADMAP.md) §13 and are not
+repeated here — they drifted once already.
+
+| Milestone | Suites |
+| --- | --- |
+| NES | SingleStepTests 65x02 (documented opcodes 100 %; the analog unstable ones ledgered separately), `nestest` trace-identical, blargg `cpu_instrs` + `instr_timing`, AccuracyCoin (licence permitting) |
+| Game Boy / SMS | `mooneye-test-suite` acceptance, blargg GB, `zexall` |
+| RISC-V `virt` | `riscv-tests`, `riscv-arch-test` via RISCOF, Linux boot to shell |
+| PC | `test386.asm`, SingleStepTests 8088, then real-OS boots (FreeDOS → Win 3.11 → Win 95 → Linux → Win XP) |
+| SMP emulation | `kvm-unit-tests` atomics/barriers, plus memory-model litmus tests ([`../techniques/memory-models.md`](../techniques/memory-models.md)) |
 
 ## Framework-level testing
 

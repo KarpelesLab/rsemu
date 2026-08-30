@@ -1,7 +1,7 @@
 # NES / Famicom
 
-Consumed by: `boards/nes`, phase 4 — the first real machine, and therefore the
-phase that proves the framework.
+Consumed by: `boards/nes` — the first real machine, and therefore the phase
+that proves the framework (`../../ROADMAP.md` §13).
 
 ## Primary
 

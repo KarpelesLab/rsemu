@@ -1,6 +1,6 @@
 # RISC-V
 
-Consumed by: `cpu/riscv`, the `virt` board, and the phase 6 IR/JIT work.
+Consumed by: `cpu/riscv`, the `virt` board IR/JIT work.
 
 RISC-V is the best-documented architecture rsemu targets and the whole
 specification set is **freely and legitimately downloadable** — which is part of

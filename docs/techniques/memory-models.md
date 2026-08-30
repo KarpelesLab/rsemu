@@ -35,7 +35,7 @@ the core provides atomic primitives, the lifter owns the ordering.
 The Cambridge group publishes **litmus tests** — small multi-threaded programs
 with a defined set of allowed outcomes. Running them as guest programs under
 parallel translated execution is the only practical way to gain confidence that
-barrier lowering is right, and it belongs in the phase-9 gate alongside the
+barrier lowering is right, and it belongs in the SMP-emulation gate alongside the
 atomics stress suite.
 
 ## Implementation notes

@@ -1,7 +1,8 @@
 # Game Boy / Game Boy Color
 
-Consumed by: `boards/gameboy`, phase 5 — the genericity proof. If any core API
-has to change to accommodate the Game Boy, that was a phase-2 design bug.
+Consumed by: `boards/gameboy` — the genericity proof. If any core API
+has to change to accommodate the Game Boy, that was a core-design bug and the
+fix belongs in the core.
 
 ## Primary
 

@@ -56,24 +56,32 @@ Roadmap §1 has the long form. When in doubt, ask **before** reading.
 
 - Default build: `cargo tree` shows only `rsemu`. This is checked in CI.
 - Permitted dependencies are first-party and feature-gated only: `pktkit`,
-  `compcol`, `purecrypto`, `puremp`, `noroi`. Nothing else — no `serde`, no
-  `libc`, no async runtime, no GUI toolkit.
+  `compcol`, `purecrypto`, **`fstool`**, `puremp`, `noroi`. Nothing else — no
+  `serde`, no `libc`, no async runtime, no GUI toolkit.
+- The empty-`cargo tree` rule holds for *default* features. Several siblings
+  pull external crates under optional features, so CI checks the feature-enabled
+  tree too.
 - OS interaction is by raw syscall (the `purestd` pattern), not via `libc`.
 - The two exceptions that break purity — macOS Hypervisor.framework and Windows
   WHPX — are opt-in features labelled as such in the README. Never silent.
 
 ## `no_std`
 
-- `core/`, `ir/`, `cpu/`, `dev/`, and `machine/` are `no_std + alloc`. `std`
-  only appears under `host/`, `jit/`, and `accel/`.
+- `core/`, `ir/`, `cpu/`, `machine/` and most of `dev/` are `no_std + alloc`.
+  `std` appears under `host/`, `jit/`, `accel/` — and, as documented exceptions,
+  `dev/blk/*` and `dev/net/*`, because `fstool` and `pktkit` are `std` crates.
+  Those two are feature-gated so a `no_std` build excludes them.
 - CI builds `--no-default-features --features alloc`. A `std` leak into the
   emulation core is a build break, not a style nit.
 
 ## `unsafe`
 
-- Crate-wide `unsafe_code = "deny"` (not `forbid`), so four subsystems can opt
-  back in with a scoped `#[allow(unsafe_code)]`: the RAM host-pointer fast
-  path, the JIT code buffer, the raw-syscall accel backends, and `ffi`.
+- Crate-wide `unsafe_code = "deny"` (not `forbid`), so **six** subsystems can
+  opt back in with a scoped `#[allow(unsafe_code)]`: the RAM host-pointer fast
+  path, the JIT code buffer, the raw-syscall accel backends, `ffi`, the
+  `core::sync` `single` backend (`RefCell` is not `Sync`), and per-CPU execution
+  state (a lock per instruction cannot hit the throughput gate). Six is the
+  ceiling; a seventh is a design review, not a commit.
 - Every `unsafe` block carries a `// SAFETY:` comment stating the invariant and
   who upholds it. No exceptions, including in the hot path.
 
@@ -107,9 +115,12 @@ Roadmap §1 has the long form. When in doubt, ask **before** reading.
   thread count belongs to the machine configuration anyway.
 - Shared mutable device state: `Mutex`/`RwLock` for cold paths, atomics for
   hot ones. Prefer designing the hot path to need neither.
-- No lock is held across a guest instruction boundary, across a scheduler
-  callback, or across a call into another device. Respect the ranked lock order
-  documented in `core::sync`.
+- **Follow the re-entrancy contract, not a blanket no-locks rule.** Mutate your
+  own state in a short critical section, release it, *then* make any outward
+  call — DMA, wire change, remap, a call into a sibling — or push the action
+  onto the handler's deferred queue. "Never hold a lock across a call into
+  another device" was unimplementable: NES OAM DMA and a BAR-moving config write
+  both require exactly that. Respect the ranked lock order in `core::sync`.
 - The scheduler owns time. A device never sleeps, never reads the wall clock,
   and never spawns a thread to "tick" itself — it registers an event.
 - Stopping the world (TLB shootdown, remap, snapshot, reset) uses the
@@ -118,9 +129,15 @@ Roadmap §1 has the long form. When in doubt, ask **before** reading.
 
 ## Targets
 
-- Build the matrix, not just your host: native, `no_std`, `wasm32-unknown-
-  unknown` **with and without threads**, `wasm32-wasip1`. CI does this on every
-  commit; if you break wasm you will find out immediately, which is the point.
+- Build the matrix, not just your host: native, `no_std`,
+  `wasm32-wasip1-threads`, `wasm32-wasip1`, and `wasm32-unknown-unknown` with
+  and without threads. CI does this every commit; if you break wasm you find out
+  immediately, which is the point.
+- **Threaded `wasm32-unknown-unknown` needs a nightly** (`-Z build-std`) —
+  stable's precompiled std lacks `+atomics`, so `--shared-memory` fails at link.
+  That job is the project's only nightly and no shipping artifact uses it;
+  `wasm32-wasip1-threads` is the stable threaded target CI gates on. Roadmap
+  §11.1.
 - The non-threaded browser configuration is a supported target, not a fallback.
   It shares a code path with the deterministic test runner, so it stays honest.
 - Guest RAM is addressed by byte offset, never by handing out `&mut [u8]`, so it
@@ -130,9 +147,11 @@ Roadmap §1 has the long form. When in doubt, ask **before** reading.
 
 - No `HashMap` iteration order in anything that affects guest-visible state.
   Use `BTreeMap` or an insertion-ordered map.
-- No floats in the time path, under either time base. `exact` is rational
-  integer arithmetic; `best-effort` is fixed-point plus a residual
-  accumulator. Never `f64` seconds.
+- No floats in the time path. Ratios *within* an oscillator tree are exact
+  integer arithmetic; the *cross-tree* timeline is fixed-point plus a residual
+  accumulator. Never `f64` seconds — and never route an intra-tree relationship
+  through absolute time, which throws away the exactness the design exists to
+  preserve.
 - No wall-clock reads outside `host/` and the rate controller.
 - Any non-deterministic input crossing into the machine goes through the
   record/replay seam, or it is a determinism bug.
@@ -154,11 +173,13 @@ Roadmap §1 has the long form. When in doubt, ask **before** reading.
   differentially tested against the interpreter forever. **The interpreter is
   the oracle.**
 - Instruction tables are generated from a declarative description in the same
-  file, not hand-written twice for decode and disassembly.
+  file, not hand-written twice for decode and disassembly. That generator also
+  emits the **disassembler**, which gdb and the monitor both need — it is not a
+  separate project.
 - Cycle accounting is per-access, driven through the bus, not a post-hoc table
   of instruction lengths — otherwise timing-sensitive software breaks in ways
   no unit test will catch.
-- A core lands with its conformance suite (roadmap §10) and a known-failures
+- A core lands with its conformance suite (roadmap §12) and a known-failures
   ledger that only ever shrinks.
 
 ## Testing
@@ -175,6 +196,14 @@ Roadmap §1 has the long form. When in doubt, ask **before** reading.
   Confirm the licence of any fixture before vendoring it.
 - `fuzz/` targets for the `.machine` parser, disk-image parsers, and every MMIO
   surface.
+
+## Arithmetic
+
+- Guest arithmetic wraps by definition. Use `wrapping_*` / `checked_*` /
+  `overflow_checks` deliberately and say which you meant; never rely on the
+  profile, or debug builds will panic exactly where release silently wraps.
+- Guest addresses are computed in the guest's width, then widened. Widening
+  first and masking later hides wrap bugs.
 
 ## Style
 
