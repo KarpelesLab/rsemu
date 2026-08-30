@@ -27,6 +27,7 @@
 extern crate alloc;
 
 pub mod core;
+pub mod dev;
 pub mod machine;
 
 #[cfg(feature = "wasm")]
