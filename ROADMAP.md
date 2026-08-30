@@ -1266,7 +1266,8 @@ The credibility of the whole project. Each core lands *with* its suite.
 
 | Target | Suite |
 | --- | --- |
-| 6502 | Tom Harte `SingleStepTests/65x02` (10k vectors/opcode, MIT), `nestest.log` trace diff, blargg `cpu_instrs`/`instr_timing`, `AccuracyCoin` (**no licence file — download-and-run only**, §1) |
+| 6502 | Tom Harte `SingleStepTests/65x02` (10k vectors/opcode, MIT), `nestest.log` trace diff, blargg `cpu_instrs`/`instr_timing` |
+| NES, whole machine | `AccuracyCoin` (MIT, §1) — a *machine* gate, not a CPU one; see the bring-up order below |
 | Z80 / SM83 | `zexall`/`zexdoc`, SingleStepTests z80 (MIT), `Gekkio/mooneye-test-suite` acceptance (MIT — **not** `mooneye-gb`, which is the emulator, not the suite), blargg GB suites |
 | x86 | `test386.asm`, SingleStepTests 8088/80286/80386, then real-OS boots: FreeDOS → Win 3.11 → Win 95 → Linux → Win XP |
 | RISC-V | `riscv-tests`, `riscv-arch-test` via RISCOF, Linux boot on `virt` |
@@ -1275,6 +1276,22 @@ The credibility of the whole project. Each core lands *with* its suite.
 | Threading | Identical state hash under `single` / `native-std` / `wasm-atomics`; safe-point protocol under stress; ranked-lock-order assertions; guest-atomics conformance per frontend (a TSO guest on a weakly-ordered host is the case that finds the bugs) |
 | Targets | Every row of §11 built in CI; the browser build runs the machine-level regression suite headlessly under both threaded and non-threaded configurations |
 | Cross-cutting | **Differential**: interpreter vs JIT vs accel on randomized instruction streams; **fuzzing** (`fuzz/`) on the DSL parser, disk-image parsers, and every MMIO surface |
+
+**Bring-up order, because AccuracyCoin is last.** It is not a CPU suite: its 67
+sections break down roughly as 22 CPU-only, 24 PPU, 10 APU, 7 DMA and 3
+controller, and the ones that bite — NMI suppression, sprite-0-hit timing, DMC
+DMA bus conflicts, `DMA + $2007`, OAM corruption, open bus — are precisely about
+*interaction* between components at exact cycle offsets. None can pass until a
+CPU, a PPU, an APU, DMA and a cartridge run together in a realized machine on
+correctly-related clock domains.
+
+1. **SingleStepTests 65x02** — pure CPU, no machine. The bring-up gate, and what
+   a CPU author iterates against.
+2. **`nestest`** — CPU plus a minimal bus, trace-compared. Needs a cartridge, no
+   rendering.
+3. **AccuracyCoin** — the whole-machine gate, and the real definition of "the NES
+   works". Its runner reports per-test results while the machine is still
+   incomplete, rather than being all-or-nothing.
 
 Machine-level regression: run a machine deterministically for N virtual seconds
 and assert the final state hash plus periodic framebuffer hashes. Cheap, brutal,
@@ -1354,8 +1371,7 @@ self-inflicted wound — and it costs roughly two weeks.
 **Gate:** SingleStepTests 65x02 100 % on documented opcodes, with the analog
 unstable ones (`ANE`, `LAX #imm`, `SHA`/`SHX`/`SHY`/`TAS`) ledgered separately
 against the suite's chosen constants; `nestest.log` trace-identical; blargg
-`cpu_instrs` + `instr_timing` pass; AccuracyCoin passes (licence permitting —
-§1); three named commercial titles hold 60 emulated fps with 99th-percentile
+`cpu_instrs` + `instr_timing` pass; AccuracyCoin passes; three named commercial titles hold 60 emulated fps with 99th-percentile
 frame times under 16.6 ms on the reference host, with a headless frame-hash
 regression; a human can play one with sound and a controller and attach gdb to
 the 6502; the whole machine is one `.machine` file; and it runs **in a browser**
