@@ -1,0 +1,10 @@
+# Deliberately invalid. Every rejected input runs Diagnostic::render, which is
+# byte arithmetic over this text, so the error path deserves seeds of its own —
+# and the multi-byte characters below are exactly what a caret placed by byte
+# offset gets wrong.
+machine "unterminated" {
+  osc é = 1 Hz
+  osc master = 236250000/0 Hz
+  osc huge = 99999999999999999999 GHz
+  object 日本 "cls" { size = 0b12 }
+  wire a.b ->

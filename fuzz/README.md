@@ -1,0 +1,204 @@
+# `rsemu` fuzz targets
+
+`cargo-fuzz` targets for the two parsers in rsemu that read input a user can
+hand us: the `.machine` description front end and the snapshot container.
+
+This is a **separate crate, detached from the parent workspace** — `fuzz/Cargo.toml`
+carries its own `[workspace]` line for exactly that reason. Nothing in the
+repo root builds it, `cargo test` at the root does not run it, and
+`libfuzzer-sys` never appears in `rsemu`'s dependency tree. It is the one place
+in the repo where an external dependency is acceptable, on the same terms as
+the sibling crates `compcol` and `purecrypto`: nothing here ships.
+
+## Why these targets
+
+`CLAUDE.md` (Testing) requires `fuzz/` targets for the `.machine` parser, disk
+image parsers and every MMIO surface. Of those, the parser and the snapshot
+reader exist today; the rest arrive with the code they cover.
+
+`ROADMAP.md` §13, phase 2, states the gate:
+
+> the parser fuzz target survives **1 CPU-hour from a seeded corpus** with zero
+> crashes and zero timeouts (unbounded fuzzing is never "clean"; a stated budget
+> is).
+
+That is `machine_parser`, run for 3600 seconds against `corpus/machine_parser`.
+See [The phase-2 gate](#the-phase-2-gate) for the exact command.
+
+| Target            | What it drives                                     | Property |
+|-------------------|----------------------------------------------------|----------|
+| `machine_parser`  | `machine::lexer` → `machine::parser` → `Diagnostic::render`, plus constant folding | never panics |
+| `state_decoder`   | `core::state::StateReader` over arbitrary bytes     | never panics; canonical encoding |
+| `state_roundtrip` | `StateWriter` → `StateReader`, structured input     | writer/reader are inverses |
+
+### `machine_parser`
+
+Bytes become source text (lossily, so every input is a parse rather than a
+discard) and go through the front end. The claim being tested is written down
+in `src/machine/parser.rs`: nesting is capped at `MAX_DEPTH`, which bounds both
+parser recursion *and* the recursion in dropping the tree, so no input can
+overflow the stack.
+
+Both branches matter. The error path runs `Diagnostic::render`, which maps a
+span back to `file:line:col` and slices the offending line out of the input to
+hang a caret under it — byte arithmetic over untrusted text with multi-byte
+characters in it, and it runs on every input the happy path rejects. The
+success path walks the tree, evaluating every constant expression through
+`Expr::eval_rational` and `OscDecl::frequency_hz`, which do exact `i128`
+rational arithmetic on literals the input chose.
+
+### `state_decoder`
+
+`core::state` states its own contract: the reader "never panics, never indexes
+without a bounds check, never trusts a length field it has not compared against
+the bytes actually remaining, and never allocates proportional to a claimed
+count". This drives `StateReader::new` over arbitrary bytes, then every
+accessor over whatever parsed, then the typed `ChunkReader` decoders over each
+chunk payload.
+
+It also asserts the module's **canonical-form** claim: a snapshot has exactly
+one valid encoding, so decoding the fuzzer's bytes and re-encoding them must
+reproduce them byte for byte. If the reader ever accepts two spellings of one
+snapshot, this finds the pair — and a state hash stops being an identity.
+
+### `state_roundtrip`
+
+The differential. A no-panic check is blind to the failure that actually loses
+a save state: a field written one way and read back another, which crashes
+nothing and produces a subtly wrong machine a million cycles later. Structured
+input builds a `MachineShape` and a set of chunks whose payloads are a
+fuzzer-chosen sequence of typed values — every integer width signed and
+unsigned, bools, byte arrays, strings, sequences — writes the snapshot, reads
+it back, and compares structure and values element by element. It also checks
+that emitting the same state twice is byte-identical, which is what
+`ROADMAP.md` §0's hash-the-state regression method rests on.
+
+Structured input is decoded by hand (`Gen`) rather than through `arbitrary`'s
+derive, so a dependency bump cannot silently reinterpret every committed seed.
+
+## Setup (one-time)
+
+```sh
+cargo install cargo-fuzz
+rustup toolchain install nightly   # cargo-fuzz needs nightly for -Z flags
+```
+
+The repo pins stable in `rust-toolchain.toml`, so **every command below needs
+an explicit `+nightly`**; the rustup proxy's `+toolchain` overrides the
+toolchain file for the whole build.
+
+## Running a target
+
+From the repo root (cargo-fuzz finds `./fuzz` on its own):
+
+```sh
+cargo +nightly fuzz build                       # all three targets
+cargo +nightly fuzz list
+cargo +nightly fuzz run machine_parser -- -max_total_time=60
+```
+
+Runs pick up `fuzz/corpus/<target>/` by default. **That is the seed corpus and
+it is committed**, so a default run will grow it with libFuzzer's own
+discoveries. To keep the committed seeds curated, point the writable corpus
+somewhere else and pass the seeds as a second, read-only input:
+
+```sh
+mkdir -p /tmp/rsemu-corpus/machine_parser
+cargo +nightly fuzz run machine_parser \
+    /tmp/rsemu-corpus/machine_parser fuzz/corpus/machine_parser \
+    -- -max_total_time=60
+```
+
+libFuzzer writes new units to the *first* corpus directory listed.
+
+## The phase-2 gate
+
+```sh
+mkdir -p /tmp/rsemu-corpus/machine_parser
+cargo +nightly fuzz run machine_parser \
+    /tmp/rsemu-corpus/machine_parser fuzz/corpus/machine_parser \
+    -- -max_total_time=3600 -timeout=10 -print_final_stats=1
+```
+
+The gate is met when that exits 0: **zero crashes and zero timeouts** over one
+CPU-hour, starting from the committed seeds. `-timeout=10` makes "timeout"
+mean something — without it libFuzzer's default is 1200 s per input, which no
+run would ever reach. `-print_final_stats=1` prints the execution count to
+record alongside the result; a run that managed only a few thousand executions
+has not tested anything, however green it looks.
+
+Anything the run finds lands in `fuzz/artifacts/machine_parser/`.
+
+## Seed corpora
+
+Seeds are committed because the gate is stated in terms of a *seeded* corpus.
+They are hand-written, not fuzzer output.
+
+`corpus/machine_parser/` — valid `.machine` files, one deliberately invalid:
+
+| File | Why |
+|---|---|
+| `nes.machine` | `ROADMAP.md` §5's worked example, verbatim: the language's acceptance test |
+| `minimal.machine` | the smallest legal file |
+| `templated.machine` | the phase-2 fixture: `include`, `template`, indexed instantiation, `param` |
+| `heterogeneous.machine` | two CPU classes, two spaces, one shared RAM region, differing endianness |
+| `expressions.machine` | every literal form, radix, size/duration suffix and operator |
+| `comments.machine` | comments in every position, optional separators |
+| `deep.machine` | nesting, well inside `MAX_DEPTH`, for the mutator to push past it |
+| `errors.machine` | **invalid on purpose** — seeds the diagnostic renderer, with multi-byte characters where a caret placed by byte offset would go wrong |
+
+`corpus/state_decoder/` — snapshots written by `StateWriter` (so they are valid
+by construction), plus four malformed derivatives:
+
+| File | Why |
+|---|---|
+| `empty.snap` | the smallest legal snapshot: empty shape, no chunks |
+| `one-chunk.snap` | the `core::state` doc example |
+| `nes-shaped.snap` | five devices, three regions, features, arches, chunks using every typed encoder, including a scheduler chunk (§4.5: the scheduler is architectural state) |
+| `unicode.snap` | multi-byte and empty strings in every string position |
+| `bad-magic.snap`, `truncated-header.snap`, `truncated-chunks.snap`, `trailing.snap` | the four rejection paths, so the mutator starts from them |
+
+`corpus/state_roundtrip/` — inputs to that target's own `Gen` decoder, not
+snapshots: `empty`, `widths` (every integer width at its extremes),
+`nes-shaped`, `unicode`, and `short-truncated` — five bytes that run the
+generator off the end of its input, which is where the harness's first version
+had its own out-of-bounds bug.
+
+## Triaging a crash
+
+`cargo fuzz` writes the failing input to `fuzz/artifacts/<target>/crash-<sha>`
+and prints the reproduce command. Then:
+
+```sh
+cargo +nightly fuzz run  <target> fuzz/artifacts/<target>/crash-<sha>   # reproduce
+cargo +nightly fuzz tmin <target> fuzz/artifacts/<target>/crash-<sha>   # minimize
+cargo +nightly fuzz fmt  <target> fuzz/artifacts/<target>/crash-<sha>   # show the decoded input
+```
+
+`fmt` is the useful one for `state_roundtrip`, whose input is structured: it
+prints the `Debug` of what the harness decoded rather than the raw bytes.
+
+Then, in order:
+
+1. **Decide whose bug it is.** A panic inside `rsemu` is a finding. A panic
+   inside a `fuzz_targets/` frame is a harness bug — the input decoder running
+   off the end of a short input is the classic one — and fixing the harness is
+   not fixing the crash.
+2. **Turn it into a unit test** in the module that owns the code, beside the
+   rest of its tests (`CLAUDE.md`, Testing). The fuzz corpus is not a
+   regression suite; a `#[test]` is.
+3. **Commit the minimised input** as a corpus seed, so the mutator keeps that
+   region of the input space warm.
+
+## Adding a target
+
+1. Write `fuzz_targets/<name>.rs`, modeled on the closest existing one.
+2. Add a `[[bin]]` entry to `fuzz/Cargo.toml`.
+3. Seed `corpus/<name>/` with inputs that are valid for whatever it parses.
+   A target with no seeds spends its first CPU-hour rediscovering the file
+   format.
+
+Next in line, as the code lands: the disk-image parsers (§7.1), every MMIO
+register surface (§4.1), and the JSON projection of the machine language once
+`rsemu convert` exists — the JSON side is a second parser for the same AST and
+inherits the same obligations.

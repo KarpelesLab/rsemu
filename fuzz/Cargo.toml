@@ -1,0 +1,66 @@
+# The fuzz harness is its own crate, deliberately detached from the parent.
+#
+# `[workspace]` below is not decoration: the parent `Cargo.toml` has no
+# `[workspace]` section, so without this line cargo would walk up, find
+# `rsemu`, and pull `libfuzzer-sys` into the parent's dependency graph — which
+# would break the dependency-policy check (CLAUDE.md: `cargo tree` on the
+# default build shows only `rsemu`) for a crate that is not even part of the
+# product. Detaching keeps the sanitizer-instrumented, nightly-only, externally
+# dependent half of the repo out of every build that is not a fuzz run.
+#
+# This is the one place in the repo where external dependencies are acceptable,
+# for the same reason the sibling crates `compcol` and `purecrypto` allow it:
+# nothing here ships.
+[workspace]
+
+[package]
+name           = "rsemu-fuzz"
+version        = "0.0.0"
+edition        = "2024"
+authors        = ["Karpeles Lab Inc."]
+license        = "MIT"
+description    = "cargo-fuzz targets for rsemu's parsers (ROADMAP.md §13, phase 2 gate)."
+publish        = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# `std` but not `cli`: the fuzz targets link the library, never the binary, and
+# a fuzz target is a `no_main` std program regardless. Structured input is
+# hand-decoded from the raw byte stream (see `state_roundtrip`), so no
+# `arbitrary` derive dependency is needed — which also keeps the corpus stable
+# across `arbitrary` versions, since a derive change silently reinterprets
+# every seed.
+[dependencies.rsemu]
+path             = ".."
+default-features = false
+features         = ["std"]
+
+# Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
+# under fuzz_targets/.
+
+# ROADMAP.md §13 phase 2 gate: "the parser fuzz target survives 1 CPU-hour from
+# a seeded corpus with zero crashes and zero timeouts".
+[[bin]]
+name  = "machine_parser"
+path  = "fuzz_targets/machine_parser.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "state_decoder"
+path  = "fuzz_targets/state_decoder.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "state_roundtrip"
+path  = "fuzz_targets/state_roundtrip.rs"
+test  = false
+doc   = false
+bench = false

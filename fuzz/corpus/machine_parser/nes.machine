@@ -1,0 +1,29 @@
+machine "nes" {
+  param region = "ntsc"
+
+  # One crystal, so every domain below is exactly related to every other.
+  # The literal is rational because the real frequency is not an integer;
+  # it affects wall-clock rate only, never the CPU:PPU ratio.
+  osc master = 236250000/11 Hz           # 21477272.72… — NTSC colorburst × 6
+
+  space cpubus  { width = 16, unassigned = open-bus }
+  space ppubus  { width = 14, unassigned = open-bus }
+
+  object ram "wram" { size = 2K }
+
+  object cpu "mos6502" {
+    clock  = master / 12                 # PPU advances exactly 3 dots per cycle
+    space  = cpubus
+    engine = "interp"
+  }
+  object ppu "nes.ppu" { clock = master / 4, space = ppubus }
+  object apu "nes.apu" { clock = master / 12 }
+
+  map cpubus 0x0000 size 0x2000 = mirror(wram)      # 2K mirrored 4×
+  map cpubus 0x2000 size 0x2000 = mirror(ppu.regs)
+  map cpubus 0x4000 size 0x0020 = apu.regs
+
+  wire ppu.nmi   -> cpu.nmi
+  wire apu.irq   -> cpu.irq
+  wire cart.irq  -> cpu.irq                          # wired-OR, declared once
+}

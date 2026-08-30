@@ -1,0 +1,21 @@
+# Two CPU classes, two spaces, one shared RAM region, differing endianness —
+# the motivating case of ROADMAP.md §5.
+machine "heterogeneous" {
+  param shared = 64K
+
+  osc master = 100 MHz
+
+  space little { width = 32, unassigned = open-bus, endian = "little" }
+  space big    { width = 16, unassigned = open-bus, endian = "big" }
+
+  object shared_ram "ram" { size = shared }
+
+  object cpu_a "riscv64" { clock = master, space = little, engine = "interp" }
+  object cpu_b "mos6502" { clock = master / 100, space = big, engine = "interp" }
+
+  map little 0x80000000 size shared  = shared_ram { priority = 1 }
+  map big    0x4000     size 0x4000  = window(shared_ram, 0, 0x4000)
+
+  wire cpu_a.irq -> plic.in0
+  wire cpu_b.nmi -> cpu_a.irq
+}

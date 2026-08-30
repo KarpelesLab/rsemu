@@ -1,0 +1,24 @@
+# The phase-2 gate fixture: include, template, indexed instantiation and a
+# param override in one file (ROADMAP.md §13).
+include "pci-common.machine"
+
+param cores = 4
+param ram   = 4M
+
+template cpu_complex(id, clock, l2 = 512K) {
+  object cpu$id "riscv64" { clock = clock, space = mem$id }
+  object l2$id "cache"    { size = l2 }
+  wire cpu$id.irq -> plic.in$id
+}
+
+machine "quad" {
+  osc master = 1 GHz
+
+  for i in 0..4 {
+    instance core$i = cpu_complex(id = i, clock = master / (i + 1))
+  }
+
+  for j in 0..=1 {
+    object bank${j * 2} "ram" { size = ram / 2 }
+  }
+}
