@@ -18,8 +18,11 @@ use alloc::vec::Vec;
 
 use crate::core::Error;
 use crate::machine::ast::{Expr, Stmt};
+use crate::machine::resolver::ResolveOptions;
+use crate::machine::sources::{MemoryLoader, SourceMap};
 use crate::machine::span::SourceFile;
-use crate::machine::{parse, parse_file};
+use crate::machine::validate::{ClassTable, ValidateOptions, validate};
+use crate::machine::{parse, parse_file, resolve, resolve_file};
 
 /// §5's worked example, copied exactly, comments and all.
 const NES: &str = r#"machine "nes" {
@@ -422,4 +425,144 @@ fn a_deeply_nested_tree_is_refused_rather_than_overflowing_the_stack() {
     }
     let src = SourceFile::new("t.machine", &lists);
     assert!(parse(&src).is_err());
+}
+
+// ---- the whole pipeline --------------------------------------------------
+
+/// §5's own example, all the way through resolve and validate.
+///
+/// Two corrections, and they are the point of this test: §5's example maps
+/// `mirror(wram)` when the object it declared is called `ram` (`wram` is its
+/// *class*), and wires `cart.irq -> cpu.irq` without declaring a cartridge.
+/// Neither is visible to a parser; both are exactly what this stage exists to
+/// catch, and the golden test below pins the message for the first.
+#[test]
+fn the_nes_example_resolves_and_validates() {
+    let text = NES.replacen("mirror(wram)", "mirror(ram)", 1).replacen(
+        "  map cpubus",
+        "  object cart \"nes.cart\" { }\n\n  map cpubus",
+        1,
+    );
+    let machine = resolve_file("nes.machine", &text, &ResolveOptions::new())
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    assert_eq!(machine.name, "nes");
+    assert_eq!(machine.oscillators.len(), 1);
+    assert_eq!(machine.spaces.len(), 2);
+    assert_eq!(machine.objects.len(), 5);
+    assert_eq!(machine.maps.len(), 3);
+    assert_eq!(machine.wires.len(), 3);
+    validate(&machine, &ClassTable::new(), &ValidateOptions::new()).expect("valid");
+}
+
+/// §5's example as literally written is rejected, and the message says what
+/// was in scope — `mirror(wram)` names the class, not the object.
+#[test]
+fn golden_the_roadmaps_own_example_names_an_object_that_does_not_exist() {
+    let err = resolve_file("nes.machine", NES, &ResolveOptions::new()).expect_err("no `wram`");
+    assert_eq!(
+        err.to_string(),
+        "\
+nes.machine:22:42: no object named `wram`; objects in scope are `ram`, `cpu`, `ppu`, `apu`
+   |
+22 |   map cpubus 0x0000 size 0x2000 = mirror(wram)      # 2K mirrored 4×
+   |                                          ^^^^"
+    );
+
+    // And with that corrected, the undeclared cartridge is next.
+    let fixed = NES.replacen("mirror(wram)", "mirror(ram)", 1);
+    let err = resolve_file("nes.machine", &fixed, &ResolveOptions::new()).expect_err("no cart");
+    assert!(
+        err.to_string()
+            .starts_with("nes.machine:28:8: no object named `cart`;"),
+        "{err}"
+    );
+}
+
+/// The phase-2 gate (§13): `include` + `template` + indexed instantiation +
+/// `param` override, resolved into objects with the names they should have.
+#[test]
+fn the_gate_fixture_resolves_through_every_hard_feature() {
+    let mut map = SourceMap::new();
+    let root = map.add("quad.machine", TEMPLATED).expect("fits");
+    let mut loader = MemoryLoader::new().with(
+        "pci-common.machine",
+        "space mem0 { width = 32 }\nspace mem1 { width = 32 }\n\
+         space mem2 { width = 32 }\nspace mem3 { width = 32 }\n\
+         object plic \"riscv.plic\" { }\n",
+    );
+    let options = ResolveOptions::new().with_param("ram", "16M");
+    let machine = resolve(&mut map, root, &mut loader, &options)
+        .unwrap_or_else(|d| panic!("{}", map.render(&d)));
+
+    let names: Vec<&str> = machine.objects.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "plic",
+            "core0.cpu0",
+            "core0.l20",
+            "core1.cpu1",
+            "core1.l21",
+            "core2.cpu2",
+            "core2.l22",
+            "core3.cpu3",
+            "core3.l23",
+            "bank0",
+            "bank2",
+        ]
+    );
+    // Four instantiations, four wires into the interrupt controller.
+    assert_eq!(machine.wires.len(), 4);
+    assert_eq!(machine.fan_in(machine.wires[0].to.object, "in0"), 1);
+    // `size = ram / 2` with `-p ram=16M`.
+    assert_eq!(
+        machine
+            .object_named("bank2")
+            .expect("declared")
+            .1
+            .props
+            .get("size"),
+        Some(&crate::core::props::Value::Size(8 << 20))
+    );
+    validate(&machine, &ClassTable::new(), &ValidateOptions::new()).expect("valid");
+}
+
+#[test]
+fn the_whole_pipeline_is_deterministic() {
+    let a = resolve_file("q.machine", NES, &ResolveOptions::new());
+    let b = resolve_file("q.machine", NES, &ResolveOptions::new());
+    assert_eq!(a.map_err(|e| e.to_string()), b.map_err(|e| e.to_string()));
+}
+
+#[test]
+fn generated_garbage_never_panics_in_the_resolver_either() {
+    // The same deterministic LCG as the parser's fuzz smoke test, run through
+    // the whole pipeline: resolution must fail, never panic.
+    const ALPHABET: &[u8] =
+        b"machine{}\"#$-0123456789xKHz/*+.,=>()[] \n\t_objectmapwirefor..=osc space param template instance";
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 33) as usize
+    };
+
+    for case in 0..2000 {
+        let len = case % 137;
+        let mut text = String::with_capacity(len);
+        for _ in 0..len {
+            text.push(ALPHABET[next() % ALPHABET.len()] as char);
+        }
+        let mut map = SourceMap::new();
+        let root = map.add("fuzz.machine", &text).expect("fits");
+        let mut loader = MemoryLoader::new().with("fuzz.machine", &text);
+        match resolve(&mut map, root, &mut loader, &ResolveOptions::new()) {
+            Ok(machine) => {
+                let _ = validate(&machine, &ClassTable::new(), &ValidateOptions::new());
+            }
+            Err(d) => assert!(!map.render(&d).is_empty()),
+        }
+    }
 }
