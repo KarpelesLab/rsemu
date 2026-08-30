@@ -31,6 +31,12 @@ std = []
 # The `rsemu` binary. Needs `std`.
 cli = ["std"]
 
+# NES cartridges (src/dev/cart): iNES and NES 2.0 image parsing, the
+# `Cartridge` type, and NROM (iNES mapper 0) as a device that maps PRG ROM,
+# CHR ROM/RAM and the nametable mirroring into `core::space`. `no_std + alloc`
+# and dependency-free; a `machine-nes` build needs it, nothing else does.
+dev-nes-cart = []
+
 # WebAssembly bindings (src/wasm.rs): plain C-ABI exports plus embedder-supplied
 # imports, following purecrypto's browser convention. Deliberately no
 # wasm-bindgen — the dependency policy forbids it, and the exports are simple
