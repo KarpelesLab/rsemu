@@ -7,12 +7,12 @@
 //!
 //! # What is here
 //!
-//! Everything up to, but not including, building anything:
+//! The whole front end, and the layer that turns its output into a machine:
 //!
 //! ```text
 //! lex → parse (spans preserved) → resolve → validate → realize → run
-//! ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^   ~~~~~~~~~~~~~
-//!                   this module                        not yet written
+//! ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+//!                          all of it, ending in [`build`]
 //! ```
 //!
 //! | Module | Role |
@@ -26,17 +26,18 @@
 //! | [`sources`] | several files in one span space, and the `include` seam |
 //! | [`resolver`] | params, includes, templates, loops, links, cycles |
 //! | [`mod@validate`] | classes, properties, pins, address ranges, wire cycles |
+//! | [`mod@realize`] | construct, map, wire, bind, reset, sweep |
+//! | [`mod@machine`] | the assembled [`Machine`], its snapshot and its run loop |
 //!
 //! # What is not here, and where it plugs in
 //!
-//! * **The realizer** — constructing devices, mapping regions, connecting
-//!   wires. It reads [`resolver::Resolved`], which is why that type carries a
-//!   span on everything: a failure at realize time still owes the user a
-//!   caret.
-//! * **The device registry.** [`validate()`] takes a
-//!   [`ClassTable`](validate::ClassTable) as an argument rather than reaching
-//!   for `core::registry`, which does not exist yet; when it does, it
-//!   implements [`validate::Classes`] and nothing else moves.
+//! * **The device registry as a validator input.** [`validate()`] takes a
+//!   [`ClassTable`] rather than reaching for `core::registry`, and [`build`]
+//!   passes whatever the caller put in
+//!   [`BuildOptions::classes`]. It cannot derive one: `DeviceClass` declares a
+//!   class's *properties* but not its pins or its mappable regions, so a table
+//!   built from the registry would reject every `map x = dev.regs` as naming a
+//!   region the class does not have.
 //! * **The JSON projection** (`rsemu convert`, §2), which will read the same
 //!   AST: one AST, two syntaxes.
 //! * **File loading.** This module is `no_std` and never touches a
@@ -74,8 +75,13 @@
 pub mod ast;
 pub mod diag;
 pub mod lexer;
+// `machine::machine` reads oddly, but the type it holds is `Machine` and the
+// module is where a reader looks for it.
+#[allow(clippy::module_inception)]
+pub mod machine;
 pub mod parser;
 pub mod rational;
+pub mod realize;
 pub mod resolver;
 pub mod sources;
 pub mod span;
@@ -86,12 +92,16 @@ mod tests;
 
 pub use crate::machine::ast::SourceUnit;
 pub use crate::machine::diag::Diagnostic;
+pub use crate::machine::machine::Machine;
 pub use crate::machine::parser::parse;
 pub use crate::machine::rational::Rational;
+pub use crate::machine::realize::{
+    BindCtx, Bindings, Instance, RealizeOptions, SinkPin, realize, realize_with,
+};
 pub use crate::machine::resolver::{ResolveOptions, Resolved, resolve};
 pub use crate::machine::sources::{IncludeLoader, SourceMap};
 pub use crate::machine::span::{SourceFile, Span, Spanned};
-pub use crate::machine::validate::{ValidateOptions, validate};
+pub use crate::machine::validate::{ClassTable, ValidateOptions, validate};
 
 /// Parse a machine description, reporting failures as [`Error::Config`].
 ///
@@ -127,4 +137,102 @@ pub fn resolve_file(
     let mut map = SourceMap::new();
     let root = map.add(name, text).map_err(|d| map.to_error(&d))?;
     resolve(&mut map, root, &mut sources::NoIncludes, options).map_err(|d| map.to_error(&d))
+}
+
+/// Everything the pipeline needs beyond the source text and the registry.
+///
+/// A struct rather than eight arguments, and owned rather than borrowed, so a
+/// caller can build one once and reuse it for every machine it loads.
+#[derive(Debug, Default)]
+pub struct BuildOptions {
+    /// Parameter overrides and expansion limits.
+    pub resolve: ResolveOptions,
+    /// What the validator insists on beyond its always-on checks.
+    pub validate: ValidateOptions,
+    /// Scheduler configuration.
+    pub realize: realize::RealizeOptions,
+    /// Class descriptions for the validator. Empty skips the class-specific
+    /// checks; see the module docs for why the registry cannot supply this.
+    pub classes: ClassTable,
+    /// The classes that take part in the memory map and the wire graph.
+    pub bindings: Bindings,
+}
+
+impl BuildOptions {
+    /// Defaults: no parameter overrides, no class table, no bindings.
+    pub fn new() -> BuildOptions {
+        BuildOptions::default()
+    }
+
+    /// Use `bindings` for the classes that connect to the machine graph.
+    #[must_use]
+    pub fn with_bindings(mut self, bindings: Bindings) -> BuildOptions {
+        self.bindings = bindings;
+        self
+    }
+
+    /// Validate against `classes`.
+    #[must_use]
+    pub fn with_classes(mut self, classes: ClassTable) -> BuildOptions {
+        self.classes = classes;
+        self
+    }
+
+    /// Override a `param`, as `rsemu run … -p ram=4M` would.
+    #[must_use]
+    pub fn with_param(
+        mut self,
+        name: impl Into<alloc::string::String>,
+        value: impl Into<alloc::string::String>,
+    ) -> BuildOptions {
+        self.resolve = core::mem::take(&mut self.resolve).with_param(name, value);
+        self
+    }
+}
+
+/// The whole pipeline: source text to a machine that can run.
+///
+/// ```text
+/// lex → parse → resolve → validate → realize
+/// ```
+///
+/// Front-end failures are rendered against the source, so the error carries
+/// `file:line:col` and a caret (§5). Realize-time failures name the instance
+/// instead — see [`mod@realize`] for why that is a seam rather than a choice.
+///
+/// ```
+/// use rsemu::core::Registry;
+/// use rsemu::machine::{BuildOptions, build};
+///
+/// // No device features are enabled in this build, so the machine this
+/// // registry can assemble is one with no devices in it — which still has
+/// // spaces, a scheduler and a snapshot.
+/// let machine = build(
+///     "empty.machine",
+///     r#"machine "empty" { space cpubus { width = 16, unassigned = read-as-ones } }"#,
+///     &Registry::new(),
+///     &BuildOptions::new(),
+/// )?;
+/// assert_eq!(machine.name(), "empty");
+/// assert_eq!(machine.spaces().len(), 1);
+/// assert!(machine.devices().is_empty());
+/// # Ok::<(), rsemu::Error>(())
+/// ```
+///
+/// # Errors
+///
+/// A syntax error, an unresolved name, a failed validation, or anything
+/// [`realize()`] refuses.
+pub fn build(
+    name: &str,
+    text: &str,
+    registry: &crate::core::Registry,
+    options: &BuildOptions,
+) -> crate::core::Result<Machine> {
+    let mut map = SourceMap::new();
+    let root = map.add(name, text).map_err(|d| map.to_error(&d))?;
+    let resolved = resolve(&mut map, root, &mut sources::NoIncludes, &options.resolve)
+        .map_err(|d| map.to_error(&d))?;
+    validate(&resolved, &options.classes, &options.validate).map_err(|d| map.to_error(&d))?;
+    realize_with(&resolved, registry, &options.bindings, &options.realize)
 }
