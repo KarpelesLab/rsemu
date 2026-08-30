@@ -1,0 +1,22 @@
+# Known failures: AccuracyCoin (125 whole-machine tests, MIT, (c) 2025 Chris Siebert).
+#
+# Keyed by the low byte of the test's result address rather than by name: the
+# address is what the ROM writes and is stable across releases, whereas the
+# display name is text on a menu. tests/conformance/accuracycoin_tests.rs has
+# the mapping, and the runner prints both.
+#
+#   4d                # $044D, "PC Wraparound"
+#
+# The `# why` note is mandatory, and this file only ever shrinks.
+#
+# Empty on purpose. AccuracyCoin is the last gate of phase 3 and nothing has run
+# it yet; entries added before a first measurement would be guesses.
+#
+# Two caveats worth knowing before anything is written down here:
+#
+#   * The ROM targets an RP2A03G CPU and an RP2C02G PPU. A handful of tests
+#     legitimately behave differently on other revisions — a divergence must be
+#     traced to a documented revision difference before it is excused, not
+#     assumed to be one.
+#   * The five "DRAW" pages assert nothing and are excluded by the runner, so
+#     they can never appear here.

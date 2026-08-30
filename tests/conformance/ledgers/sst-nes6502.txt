@@ -1,0 +1,35 @@
+# Known failures: SingleStepTests/65x02, nes6502 (Ricoh RP2A03).
+#
+# This file only ever shrinks. Adding a line is a decision someone has to
+# defend; the runner fails the suite if an entry here starts passing, so a
+# stale excuse cannot quietly accumulate.
+#
+# Format, one entry per line:
+#
+#   a9                # whole opcode
+#   8b :: 8b 5c 21    # one vector, by its upstream name
+#
+# The `# why` note is mandatory.
+#
+# It is empty on purpose. The phase-3 gate (ROADMAP.md §13) is 100 % of the
+# documented opcodes, with the analog-unstable ones ledgered *separately against
+# the suite's chosen constants* — and "against the suite's constants" means a
+# core that reproduces the magic value Tom Harte's generator used will pass them
+# outright, so there is nothing to excuse until measurement says otherwise.
+#
+# The candidates, if measurement does say otherwise, are the instructions whose
+# result on real silicon depends on an analog effect rather than on logic:
+#
+#   8b  ANE #imm   A = (A | magic) & X & imm
+#   ab  LXA #imm   A = X = (A | magic) & imm
+#   93  SHA (zp),Y
+#   9f  SHA abs,Y
+#   9b  SHS abs,Y  (also called TAS)
+#   9c  SHY abs,X
+#   9e  SHX abs,Y
+#
+# The first two depend on a "magic" constant that varies with the part, its
+# temperature and its supply voltage; the SH* family drops the address's high
+# byte when a page is crossed, and the value it stores is unstable in the same
+# way. NESdev's CPU unofficial opcodes page has the details, and
+# docs/cpu/6502.md points at it.

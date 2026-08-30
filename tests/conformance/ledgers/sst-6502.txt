@@ -1,0 +1,9 @@
+# Known failures: SingleStepTests/65x02, 6502 (NMOS, decimal mode working).
+#
+# This file only ever shrinks; see sst-nes6502.txt for the format and the
+# reasoning. Empty on purpose.
+#
+# This variant is not on the phase-3 gate — the NES's RP2A03 has decimal mode
+# disabled — but it is the same core with `decimal: true`, so a divergence here
+# that is absent from the nes6502 run points squarely at the BCD path in ADC and
+# SBC, and at the undefined N, V and Z that NMOS decimal arithmetic produces.
