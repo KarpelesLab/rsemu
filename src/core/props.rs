@@ -2077,10 +2077,7 @@ mod tests {
         let mut r = props.reader();
         let _ = r.require_size("size").unwrap();
         let e = r.finish().unwrap_err().to_string();
-        assert!(
-            e.starts_with("invalid property: unknown properties `zzz`, `aaa`"),
-            "{e}"
-        );
+        assert!(e.starts_with("unknown properties `zzz`, `aaa`"), "{e}");
     }
 
     #[test]
