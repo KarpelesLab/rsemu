@@ -7,12 +7,12 @@
 //!
 //! # What is here
 //!
-//! The **front end**, which is the first two stages of §5's pipeline:
+//! Everything up to, but not including, building anything:
 //!
 //! ```text
 //! lex → parse (spans preserved) → resolve → validate → realize → run
-//! ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-//!         this module                       not yet written
+//! ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^   ~~~~~~~~~~~~~
+//!                   this module                        not yet written
 //! ```
 //!
 //! | Module | Role |
@@ -23,40 +23,51 @@
 //! | [`ast`] | the syntax tree, with a span on every node |
 //! | [`parser`] | recursive descent, depth-guarded |
 //! | [`rational`] | exact frequencies, because 236250000/11 Hz is not an integer |
+//! | [`sources`] | several files in one span space, and the `include` seam |
+//! | [`resolver`] | params, includes, templates, loops, links, cycles |
+//! | [`mod@validate`] | classes, properties, pins, address ranges, wire cycles |
 //!
 //! # What is not here, and where it plugs in
 //!
-//! * **The resolver** — parameters, `include` search paths, `template`
-//!   expansion, loop unrolling, link resolution, cycle detection. The AST keeps
-//!   all of these unexpanded and spanned, which is exactly what a resolver
-//!   needs; nothing in this module interprets a name.
-//! * **The validator** — does this device class exist, does it take this
-//!   property, is this bus compatible. That needs `core::registry`, which does
-//!   not exist yet.
-//! * **The realizer** and the JSON projection (`rsemu convert`, §2). The
-//!   projection will read this same AST: one AST, two syntaxes.
-//! * **File loading.** The front end is `no_std` and takes a `&str` plus a name
-//!   for diagnostics. Reading files, and choosing which directories an
-//!   `include` may name, belong to the caller.
+//! * **The realizer** — constructing devices, mapping regions, connecting
+//!   wires. It reads [`resolver::Resolved`], which is why that type carries a
+//!   span on everything: a failure at realize time still owes the user a
+//!   caret.
+//! * **The device registry.** [`validate()`] takes a
+//!   [`ClassTable`](validate::ClassTable) as an argument rather than reaching
+//!   for `core::registry`, which does not exist yet; when it does, it
+//!   implements [`validate::Classes`] and nothing else moves.
+//! * **The JSON projection** (`rsemu convert`, §2), which will read the same
+//!   AST: one AST, two syntaxes.
+//! * **File loading.** This module is `no_std` and never touches a
+//!   filesystem. An `include` goes through
+//!   [`sources::IncludeLoader`], so the caller owns the search
+//!   path and the sandbox.
 //!
 //! # Example
 //!
 //! ```
-//! use rsemu::machine::{parse_file, ast::Stmt};
+//! use rsemu::machine::resolver::ResolveOptions;
+//! use rsemu::machine::resolve_file;
 //!
 //! let text = r#"
 //! machine "nes" {
+//!   param region = "ntsc"
 //!   osc master = 236250000/11 Hz     # not an integer number of hertz
-//!   object cpu "mos6502" { clock = master / 12 }
+//!   space cpubus { width = 16, unassigned = open-bus }
+//!   object cpu "mos6502" { clock = master / 12, space = cpubus }
+//!   object ppu "nes.ppu" { clock = master / 4 }
+//!   wire ppu.nmi -> cpu.nmi
 //! }
 //! "#;
-//! let unit = parse_file("nes.machine", text)?;
-//! let Stmt::Machine(m) = &unit.stmts[0] else { unreachable!() };
-//! assert_eq!(m.name.node, "nes");
+//! let machine = resolve_file("nes.machine", text, &ResolveOptions::new())?;
 //!
-//! let Stmt::Osc(osc) = &m.body[0] else { unreachable!() };
-//! let hz = osc.frequency_hz().expect("a literal frequency");
-//! assert_eq!((hz.numerator(), hz.denominator()), (236_250_000, 11));
+//! // The crystal stays rational; the ratios are exact integers (§4.2).
+//! assert_eq!(machine.oscillators[0].hz.denominator(), 11);
+//! let cpu = machine.objects[0].clock.expect("a clock");
+//! let ppu = machine.objects[1].clock.expect("a clock");
+//! assert_eq!((cpu.div, ppu.div), (12, 4));
+//! assert_eq!(machine.wires[0].to.port, "nmi");
 //! # Ok::<(), rsemu::Error>(())
 //! ```
 
@@ -65,7 +76,10 @@ pub mod diag;
 pub mod lexer;
 pub mod parser;
 pub mod rational;
+pub mod resolver;
+pub mod sources;
 pub mod span;
+pub mod validate;
 
 #[cfg(test)]
 mod tests;
@@ -74,7 +88,10 @@ pub use crate::machine::ast::SourceUnit;
 pub use crate::machine::diag::Diagnostic;
 pub use crate::machine::parser::parse;
 pub use crate::machine::rational::Rational;
+pub use crate::machine::resolver::{ResolveOptions, Resolved, resolve};
+pub use crate::machine::sources::{IncludeLoader, SourceMap};
 pub use crate::machine::span::{SourceFile, Span, Spanned};
+pub use crate::machine::validate::{ValidateOptions, validate};
 
 /// Parse a machine description, reporting failures as [`Error::Config`].
 ///
@@ -90,4 +107,24 @@ pub use crate::machine::span::{SourceFile, Span, Spanned};
 pub fn parse_file(name: &str, text: &str) -> crate::core::Result<SourceUnit> {
     let src = SourceFile::new(name, text);
     parse(&src).map_err(|d| d.to_error(&src))
+}
+
+/// Parse and resolve a self-contained machine description.
+///
+/// The whole pipeline short of validation, for a description that needs no
+/// `include` and no search path — the common case for a test, a fixture or an
+/// embedded string. A description that includes other files, or that should be
+/// checked against a device registry, wants [`SourceMap`] plus [`resolve`] and
+/// [`validate()`] directly, so that diagnostics can name whichever file they
+/// point into.
+///
+/// [`Error::Config`]: crate::core::Error::Config
+pub fn resolve_file(
+    name: &str,
+    text: &str,
+    options: &ResolveOptions,
+) -> crate::core::Result<Resolved> {
+    let mut map = SourceMap::new();
+    let root = map.add(name, text).map_err(|d| map.to_error(&d))?;
+    resolve(&mut map, root, &mut sources::NoIncludes, options).map_err(|d| map.to_error(&d))
 }

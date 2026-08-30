@@ -74,13 +74,25 @@ impl Diagnostic {
     ///   | ^
     /// ```
     pub fn render(&self, src: &SourceFile<'_>) -> String {
+        self.render_in(src)
+    }
+
+    /// The same rendering, over a whole set of files.
+    ///
+    /// A resolver diagnostic can point at two files at once — an `include`
+    /// cycle's note belongs to the file that closed the loop, not the one that
+    /// opened it — so each label is located independently. For a single
+    /// [`SourceFile`] this is exactly [`Diagnostic::render`].
+    pub fn render_in(&self, sources: &impl Sources) -> String {
+        let (src, span) = sources.locate(self.span);
         let mut out = format!("error: {}\n", self.message);
-        out.push_str(&header(src, self.span));
-        out.push_str(&snippet(src, self.span));
+        out.push_str(&header(&src, span));
+        out.push_str(&snippet(&src, span));
         if let Some(note) = &self.note {
+            let (nsrc, nspan) = sources.locate(note.span);
             out.push_str(&format!("\nnote: {}\n", note.message));
-            out.push_str(&header(src, note.span));
-            out.push_str(&snippet(src, note.span));
+            out.push_str(&header(&nsrc, nspan));
+            out.push_str(&snippet(&nsrc, nspan));
         }
         // Every block ends with a newline from `snippet`; trim the last one so
         // the caller controls the final line break.
@@ -96,24 +108,55 @@ impl Diagnostic {
     /// `-->` line that would repeat it — [`Error::Config`]'s `Display` prints
     /// `at`, then the message, then the caret block.
     pub fn to_error(&self, src: &SourceFile<'_>) -> Error {
+        self.to_error_in(src)
+    }
+
+    /// The same conversion, over a whole set of files.
+    ///
+    /// See [`Diagnostic::render_in`] for why the two labels are located
+    /// separately.
+    pub fn to_error_in(&self, sources: &impl Sources) -> Error {
+        let (src, span) = sources.locate(self.span);
         let mut message = self.message.clone();
         message.push('\n');
-        message.push_str(&snippet(src, self.span));
+        message.push_str(&snippet(&src, span));
         if let Some(note) = &self.note {
+            let (nsrc, nspan) = sources.locate(note.span);
             message.push_str(&format!(
                 "note: {} (at {})\n",
                 note.message,
-                src.position(note.span.start)
+                nsrc.position(nspan.start)
             ));
-            message.push_str(&snippet(src, note.span));
+            message.push_str(&snippet(&nsrc, nspan));
         }
         while message.ends_with('\n') {
             message.pop();
         }
         Error::Config {
-            at: src.position(self.span.start),
+            at: src.position(span.start),
             message,
         }
+    }
+}
+
+/// Where a [`Span`] points, for rendering.
+///
+/// The front end has one file and needs no indirection; the resolver splices
+/// several files into one span space and does. Implementing this rather than
+/// widening [`Span`] with a file index keeps every span in the AST two `u32`s,
+/// which is what makes parsing a large included tree cheap.
+pub trait Sources {
+    /// The file `span` falls in, and `span` rebased into that file's offsets.
+    ///
+    /// Must never fail: a diagnostic that cannot be printed is worse than the
+    /// error it describes, so an unknown span resolves to whatever file is
+    /// nearest rather than to nothing.
+    fn locate(&self, span: Span) -> (SourceFile<'_>, Span);
+}
+
+impl Sources for SourceFile<'_> {
+    fn locate(&self, span: Span) -> (SourceFile<'_>, Span) {
+        (*self, span)
     }
 }
 
