@@ -22,9 +22,10 @@
 //! | `state` | versioned snapshots (§4.5) |
 //! | `sync` | the concurrency portability seam (§4.7) |
 //!
-//! The module tree is declared up front so that the shape of the core is a
-//! settled decision rather than one rediscovered per module; several are still
-//! stubs.
+//! Every module listed above now exists. What remains before a machine can be
+//! assembled is the layer that owns the pieces together — spaces, the clock
+//! forest, wires and devices in one object — which is where [`device::RealizeCtx`]
+//! grows the accessors realize needs.
 
 pub mod clock;
 pub mod device;
@@ -38,5 +39,7 @@ pub mod sync;
 pub mod value;
 pub mod wire;
 
+pub use device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
 pub use error::{BusError, Error, Result};
+pub use registry::Registry;
 pub use value::{Endian, Width};
