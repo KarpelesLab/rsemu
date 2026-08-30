@@ -6,10 +6,15 @@
 //!
 //! # Status
 //!
-//! Scaffolding. The core abstractions described in `ROADMAP.md` §4 — address
-//! spaces, the clock forest, wires, devices, snapshots — are not implemented
-//! yet. What exists here is the crate skeleton, the error and value types, and
-//! the CI matrix that keeps every target honest from the first commit.
+//! Most of the phase-1 core exists: address spaces and regions ([`core::space`]),
+//! the oscillator forest and scheduler ([`core::clock`], [`core::sched`]), wires
+//! ([`core::wire`]), the concurrency seam ([`core::sync`]), properties
+//! ([`core::props`]), snapshots ([`core::state`]), and the machine-description
+//! front end ([`machine`]).
+//!
+//! Not yet: the device trait and registry ([`core::device`], [`core::registry`])
+//! that bind them together, and the DSL resolver/validator/realizer. Nothing is
+//! emulated yet — no CPU core exists.
 //!
 //! # `no_std`
 //!
