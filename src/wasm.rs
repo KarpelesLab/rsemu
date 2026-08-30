@@ -28,7 +28,8 @@
 //! sanctions to opt back in. Two things here need it: `#[unsafe(no_mangle)]`,
 //! which edition 2024 classifies as an unsafe attribute because duplicate
 //! exported symbols are the linker's problem rather than the compiler's; and
-//! [`leaked`], which rebuilds a `&'static str` from a pointer/length pair. The
+//! the private `leaked` helper, which rebuilds a `&'static str` from a
+//! pointer/length pair. The
 //! allow is module-scoped rather than crate-wide, and every genuine `unsafe`
 //! block below carries its own `// SAFETY:` argument.
 #![allow(unsafe_code)]

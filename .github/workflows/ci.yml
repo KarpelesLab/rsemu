@@ -36,6 +36,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Broken intra-doc links and undocumented public items are invisible to
+      # clippy, so they need their own gate — missing_docs is only a warning
+      # until something turns warnings into errors.
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

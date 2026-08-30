@@ -30,6 +30,10 @@ pub enum Error {
     /// so.
     UnknownClass(String),
     /// A property was missing, of the wrong type, or out of range.
+    ///
+    /// Carries a complete sentence rather than a fragment: these messages are
+    /// the main way a user learns what a device wanted, so they are written to
+    /// be read on their own and are printed verbatim.
     Property(String),
     /// A guest access could not be completed.
     Bus(BusError),
@@ -68,7 +72,7 @@ impl fmt::Display for Error {
             Error::UnknownClass(name) => {
                 write!(f, "unknown device class `{name}` (is its feature enabled?)")
             }
-            Error::Property(message) => write!(f, "invalid property: {message}"),
+            Error::Property(message) => f.write_str(message),
             Error::Bus(e) => write!(f, "bus error: {e}"),
             Error::State(message) => write!(f, "snapshot error: {message}"),
             Error::Unimplemented(what) => write!(f, "not implemented yet: {what}"),

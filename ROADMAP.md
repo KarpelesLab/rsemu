@@ -620,10 +620,14 @@ being theoretical.
 
 Built in phase 1, not bolted on later.
 
-- **Format.** Chunked and versioned: a machine header (config hash, feature
-  set, guest arch list), then one chunk per device instance keyed by
-  `(instance path, class name, class version)`. Loading a snapshot into a
-  differently-shaped machine fails with a diff, not a crash.
+- **Format.** Chunked and versioned: a machine header (structural fingerprint,
+  feature set, guest arch list), then one chunk per device instance **keyed by
+  instance path, carrying the class name and class version as attributes**.
+  The version must *not* be part of the key: if it were, bumping a class
+  version would make the old chunk unfindable and the migration chain below
+  unreachable — the class is verified on load and the version feeds migration.
+  Loading a snapshot into a differently-shaped machine fails with a diff, not a
+  crash.
 - **Content.** Devices serialize *architectural* state only. Derived caches
   (TLBs, translation blocks, flattened views, host pointers) are rebuilt on
   load. A device whose `save`/`load` round-trip does not reproduce an identical
