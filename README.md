@@ -1,16 +1,20 @@
 # rsemu
 
-**A generic, multiplatform emulator framework in pure Rust.**
+**A multiplatform emulator in pure Rust, built from the bottom up.**
 
-rsemu is not an emulator — it is the machinery emulators are built from:
-address spaces, clock domains, wires, devices, buses, and a translation IR,
-with concrete components (CPU cores, PCI, USB, storage, NICs) layered on top,
-and a **machine description language** that wires arbitrary topologies together
-at runtime.
+rsemu is an emulator — the thing you point at a ROM or a disk image and run.
+It is *built* on a generic framework, and that framework comes first: address
+spaces, clock domains, wires, devices, buses and a translation IR, then CPU
+cores, PCI, USB, storage and NICs on top of them, then machines described by a
+config file rather than compiled in.
 
 If you want a NES, you write a `.machine` file. If you want four heterogeneous
 CPUs sharing one RAM region across three bus fabrics, you write a stranger
-`.machine` file. The framework does not care which.
+`.machine` file. Nothing in rsemu needs patching to allow either.
+
+Starting low costs time before the first ROM boots. It buys what every emulator
+that started at the top eventually wishes it had: one memory model, one clock,
+one snapshot format, one debugger, shared by every machine ever added.
 
 ## Design principles
 
@@ -23,6 +27,12 @@ CPUs sharing one RAM region across three bus fabrics, you write a stranger
 - **Determinism is a mode, not an accident.** Deterministic runs are
   bit-reproducible across hosts and across execution engines, which is what
   makes save states, record/replay, rewind, and the regression suite possible.
+- **Two time bases.** `exact` represents every clock ratio with zero error
+  (rational integer arithmetic) for cycle-accurate machines; `best-effort`
+  uses fixed-point with a residual accumulator — cheaper, tolerant of runtime
+  clock changes, bounded non-accumulating drift. Both are integer-only and
+  both are deterministic; picking one is a declaration, never a silent
+  fallback.
 - **Accuracy is measured.** Every CPU core ships with a published conformance
   suite and a known-failures ledger that only ever shrinks.
 - **Generic first.** A device that needs a new mechanism gets it added to the
@@ -34,7 +44,9 @@ CPUs sharing one RAM region across three bus fabrics, you write a stranger
 
 ## Status
 
-Planning. Nothing is implemented yet.
+Planning. Nothing is implemented yet. The plan is ordered so that value lands
+early: phase 3 is a usable NES emulator, phase 5 a RISC-V machine that boots
+Linux, phase 6 a PC that boots DOS through Windows XP.
 
 **Read [`ROADMAP.md`](ROADMAP.md)** — it contains the architecture (memory,
 time, devices, state, IR), the machine description language, the phase plan

@@ -71,7 +71,9 @@ non-negotiables (§0) win.
 
 - No `HashMap` iteration order in anything that affects guest-visible state.
   Use `BTreeMap` or an insertion-ordered map.
-- No floats in the time path. Rational integer arithmetic only.
+- No floats in the time path, under either time base. `exact` is rational
+  integer arithmetic; `best-effort` is fixed-point plus a residual
+  accumulator. Never `f64` seconds.
 - No wall-clock reads outside `host/` and the rate controller.
 - Any non-deterministic input crossing into the machine goes through the
   record/replay seam, or it is a determinism bug.
@@ -97,7 +99,7 @@ non-negotiables (§0) win.
 - Cycle accounting is per-access, driven through the bus, not a post-hoc table
   of instruction lengths — otherwise timing-sensitive software breaks in ways
   no unit test will catch.
-- A core lands with its conformance suite (roadmap §9) and a known-failures
+- A core lands with its conformance suite (roadmap §10) and a known-failures
   ledger that only ever shrinks.
 
 ## Testing

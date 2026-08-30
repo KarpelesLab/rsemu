@@ -1,20 +1,27 @@
-# rsemu Roadmap — a generic, pure-Rust emulator framework
+# rsemu Roadmap — a pure-Rust emulator, built from the bottom up
 
-`rsemu` is a **machine emulator framework**, not an emulator. The deliverable is
-a set of generic mechanisms — address spaces, clock domains, wires, devices,
-buses, a translation IR — plus concrete components built on those mechanisms
-(CPU cores, PCI, USB, storage, NICs), plus a **machine description language**
-that wires arbitrary topologies together at runtime. Whether the described
-machine is a NES, a q35 PC, or four heterogeneous CPUs sharing one RAM region
-through three different bus fabrics is the config file's problem, not the
-framework's.
+`rsemu` is an **emulator** — the thing you point at a ROM or a disk image and
+run. It is *built* on a generic framework, and that framework is what gets
+written first, because bottom-up is the order that produces an emulator worth
+having: address spaces, clock domains, wires, devices, buses and a translation
+IR; then CPU cores, PCI, USB, storage and NICs on top of them; then machines
+described by a config file rather than compiled in.
+
+The framework is the means. The end is a binary that emulates a NES, a Game Boy,
+a RISC-V board and a PC — and that a stranger can point at a machine file
+describing four heterogeneous CPUs sharing one RAM region across three bus
+fabrics without patching rsemu to allow it.
+
+Starting low costs time before the first ROM boots. It buys the thing every
+emulator that started at the top eventually wishes it had: **one** memory model,
+**one** clock, **one** snapshot format, **one** debugger, shared by every
+machine that will ever be added.
 
 This roadmap defines the architecture, the phase order, and the acceptance gate
-for each phase. It is written to be executed top-to-bottom; every phase ends in
-something that runs and is measured.
+for each phase. It is written to be executed top-to-bottom; every phase ships
+something a person can actually run (§1).
 
 > **Status (2026-08-30):** nothing implemented. This document is the plan.
-
 ---
 
 ## 0. Non-negotiables
@@ -23,7 +30,7 @@ These are decided. Do not relitigate them mid-implementation.
 
 - **Pure Rust, no foreign code.** No C, no `bindgen`, no vendored assembly, no
   build scripts that invoke a compiler. The dependency budget is *first-party
-  Karpelès Lab crates only* (§14) — and even those stay feature-gated so the
+  Karpelès Lab crates only* (§12) — and even those stay feature-gated so the
   core builds with an empty `cargo tree`.
 - **`unsafe` is quarantined.** Crate-wide `unsafe_code = "deny"` (not `forbid`).
   Exactly four subsystems may opt back in with a scoped
@@ -36,7 +43,7 @@ These are decided. Do not relitigate them mid-implementation.
   Record/replay, save states, rewind, and the entire regression suite are built
   on this. Speed is never traded for determinism without a flag.
 - **Accuracy is measured, never asserted.** Every CPU core ships with a
-  published conformance suite (§12) and a known-failures ledger that only ever
+  published conformance suite (§10) and a known-failures ledger that only ever
   shrinks. A core with no suite is not "done", it is "untested".
 - **Generic first, specific second.** If a device model needs a mechanism the
   core does not have, the mechanism gets added to the core generically — never
@@ -50,7 +57,63 @@ These are decided. Do not relitigate them mid-implementation.
 
 ---
 
-## 1. Crate shape
+## 1. What rsemu is when it's finished
+
+The framework is judged by the emulator it produces, so the product surface is
+specified here rather than discovered in the last phase.
+
+### The binary
+
+```console
+$ rsemu run nes.machine --cart smb.nes              # a machine file + its media
+$ rsemu run q35.machine -p ram=8G --disk win.qcow2 --accel kvm
+$ rsemu run --machine gb --rom tetris.gb            # catalog shorthand
+$ rsemu machines                                    # what this build can emulate
+$ rsemu describe pci.nvme                           # class, properties, defaults
+$ rsemu convert nes.machine --json                  # tooling projection
+$ rsemu record session.trace -- run nes.machine --cart smb.nes
+$ rsemu replay session.trace                        # bit-identical, on any host
+$ rsemu debug q35.machine --gdb :1234               # gdbstub attached to the guest
+```
+
+Save states, rewind, screenshots, VNC display, and the monitor console are
+properties of the framework (§3.5, §7), so every machine gets them the day it
+exists — not once someone writes per-machine plumbing.
+
+### The machine catalog
+
+`machines/` ships description files as **data**: consoles, boards, and PC
+chipsets, each a readable file a user can copy and modify. Adding a machine
+that rsemu already has the components for requires no Rust and no rebuild.
+This is the test of whether §4 succeeded.
+
+### The library and the C ABI
+
+The same tri-modal model proven in `purecrypto` and `kataan`: a Rust library, a
+C library (`ffi`), and a standalone binary. Embedding rsemu into someone else's
+application — a test harness, a CI runner, a game front-end, a hardware
+bring-up tool — is a supported use, not a fork.
+
+### Every phase ships a usable emulator
+
+The phase plan (§11) is ordered so that value lands long before the framework is
+"finished":
+
+| After | Someone can actually… |
+| --- | --- |
+| Phase 3 | play NES games, with save states and a debugger |
+| Phase 4 | play Game Boy and Master System games on the same binary |
+| Phase 5 | boot a RISC-V Linux to a shell and debug the kernel over gdb |
+| Phase 6 | run a PC — DOS, Win95, Linux, XP — with disks, USB and networking |
+| Phase 7 | run that PC at near-native speed under KVM |
+| Phase 9 | drive all of it over VNC, record and replay sessions, embed it in something else |
+
+Phases 1–2 are the only ones with no user-facing artifact. That is the price of
+starting low, and it is paid once.
+
+---
+
+## 2. Crate shape
 
 One crate, `rsemu`, with **one Cargo feature per component** — the `compcol`
 model, scaled up. A machine is then a feature set: `--features "cpu-mos6502,
@@ -64,7 +127,7 @@ src/
     value.rs          #   widths, endianness, typed access
     space.rs          #   AddressSpace, MemRegion, FlatView, dispatch tables
     ram.rs rom.rs     #   backing stores
-    clock.rs          #   clock domain tree, exact rational virtual time
+    clock.rs          #   clock domain tree, exact + best-effort time bases
     sched.rs          #   event queue, execution budgets, quantum, threading modes
     wire.rs           #   IRQ / GPIO lines, splitters, combiners
     device.rs         #   Device trait, lifecycle, composition
@@ -93,11 +156,11 @@ sibling crates — those have the fewest inbound edges. Do not split `cpu/` or
 
 ---
 
-## 2. The generic core
+## 3. The generic core
 
 This is the part that must be right. Everything else is replaceable.
 
-### 2.1 Address spaces and memory
+### 3.1 Address spaces and memory
 
 The single most important abstraction. Modelled as a **region tree flattened
 into a dispatch table**, which is the design QEMU converged on after a decade of
@@ -139,7 +202,7 @@ non-overlapping `FlatView`. Lookup is two-level: a page-granular dispatch table
 (dense `Vec` for the low 4 GiB, radix trie above) yields either a **host pointer
 + length** (the RAM fast path — no virtual call, no bounds walk) or a `FlatView`
 index (the slow path). Guest-virtual→host translation for CPUs with an MMU adds
-a per-CPU **softmmu TLB** in front of this (§9).
+a per-CPU **softmmu TLB** in front of this (§8).
 
 *Note on gones.* The `memory.Bus` in `../gones` OR-combines the results of every
 handler mapped at an address and logs a "bus conflict". That is the correct
@@ -148,20 +211,63 @@ rsemu this becomes a per-container `CombinePolicy { Priority, WiredOr, WiredAnd,
 Conflict }` — the NES keeps its behaviour, everyone else gets deterministic
 priority.
 
-### 2.2 Time, clocks, and scheduling
+### 3.2 Time, clocks, and scheduling
 
-Generalizes the `../gones` master-clock-plus-dividers model, which is the right
-shape, to a tree with exact arithmetic.
+Generalizes the `../gones` master-clock-plus-dividers model — which is the right
+shape — to a clock domain tree with **two time bases**, because the two things
+people want from emulated time are not the same thing and one implementation
+cannot serve both.
 
 - **Clock domain tree.** `ClockDomain { parent, mul: u64, div: u64 }`, root = a
-  named frequency. Domains can be reparented and gated at runtime (a PLL, a
-  power-managed peripheral, a CPU that halts).
-- **Exact virtual time.** The global timeline unit is `1/L` seconds where
-  `L = lcm(all root frequencies)`, computed at realize time and held in `u128`.
-  For real machines (21477272, 1789773, 44100, 48000, …) `L` fits comfortably;
-  if it overflows, fall back to femtoseconds and *log the bounded drift* rather
-  than silently accumulating it. Every domain converts to and from this unit by
-  exact integer multiply/divide — **no floats anywhere in the time path.**
+  named frequency. Domains can be reparented, re-rated and gated at runtime: a
+  PLL, a guest reprogramming a divider, a power-managed peripheral, a CPU that
+  halts.
+
+#### Exact and best-effort time
+
+The machine declares one as its default (`timebase = "exact" | "best-effort"`)
+and individual domains may override it. Both are **integer-only** and both are
+**fully deterministic** — the difference is whether clock ratios are represented
+exactly or to a bounded tolerance, not whether the run is reproducible.
+
+| | `exact` | `best-effort` |
+| --- | --- | --- |
+| Unit | `1/L` second, `L = lcm(root frequencies)`, held in `u128` | fixed-point femtoseconds (`u64`, ≈ 5 h span; `u128` for longer runs) |
+| Ratio arithmetic | exact integer multiply/divide — zero error, ever | precomputed reciprocal multiply, plus a per-domain **residual accumulator** |
+| Error | none | < 1 unit, and **non-accumulating** |
+| Cost per conversion | `u128` multiply + divide | `u64` multiply + shift |
+| Runtime frequency change | recompute `L`; can fail | free |
+| Use for | conformance suites, record/replay, cycle-accurate consoles — anything where a one-tick phase error is guest-visible | PC-class machines, USB/audio frame timers, dynamically-clocked SoCs, fast-forward |
+
+**`exact` is the default** whenever the root frequencies are known, fixed, and
+few — which describes every retro console. `L` for the NES (21477272) or a Game
+Boy (4194304 + 32768) is trivial, and a machine mixing 21477272, 1789773, 44100
+and 48000 still fits in `u64`.
+
+**`best-effort` is for when `L` cannot exist**: a guest that reprograms a PLL to
+an arbitrary ratio, a board with a dozen unrelated crystals, or an `L` that
+overflows. Selecting it is a decision, never a silent fallback — if `L` cannot
+be computed under `exact`, realize **fails with an error naming the offending
+domains**, and the config must say `timebase = "best-effort"` to proceed. A
+timing model that quietly degrades is worse than one that refuses.
+
+The residual accumulator is what makes best-effort worth having at all: naive
+fixed-point conversion drifts without bound across 10¹² ticks, whereas carrying
+each domain's remainder forward holds total error below one unit indefinitely.
+Drift is *observable* — `rsemu run --stats` reports per-domain residual — rather
+than something discovered when a guest's audio desyncs after an hour.
+
+**Precision is orthogonal to determinism.** Exact/best-effort chooses how
+faithfully ratios are represented; both are reproducible. Non-determinism enters
+only from the *source* of time — the `accel` threading mode below slaves virtual
+time to the host clock — and that is a separate, explicitly-labelled choice.
+
+The selected time base is part of the machine's identity and is recorded in the
+snapshot header: a snapshot taken under `exact` will not silently reload under
+`best-effort`, because the queued event deadlines mean different things.
+
+#### Scheduling
+
 - **Event queue.** A hierarchical timing wheel for the dense near term plus a
   binary heap for far-future events. Events carry a monotonically increasing
   sequence number so ties break deterministically.
@@ -174,13 +280,13 @@ shape, to a tree with exact arithmetic.
     quantum. Required for record/replay and the regression suite.
   - `parallel` — thread per CPU with a rendezvous barrier per quantum. Fast,
     non-deterministic, the default for interactive use.
-  - `accel` — CPUs run in hardware (§10); virtual time is driven by the host
+  - `accel` — CPUs run in hardware (§9); virtual time is slaved to the host
     clock and the scheduler becomes a deadline service.
 - **Rate control.** `realtime` (throttle to wall clock, with catch-up limits and
   frame pacing), `unbounded` (as fast as possible), `fixed-ratio` (2× slow for
   debugging).
 
-### 2.3 Wires: interrupts and GPIO
+### 3.3 Wires: interrupts and GPIO
 
 ```rust
 pub trait WireSink: Send + Sync { fn set_level(&self, line: u32, level: Level); }
@@ -194,7 +300,7 @@ ordinary devices: `wire.split`, `wire.or`, `wire.and`, `wire.not`,
 line) are then just devices with wire sinks and sources — the core knows nothing
 about "interrupts".
 
-### 2.4 Devices, properties, registry
+### 3.4 Devices, properties, registry
 
 ```rust
 pub trait Device: Send + Sync {
@@ -225,7 +331,7 @@ pub trait Device: Send + Sync {
   `rsemu list-devices` / `rsemu describe pci.nvme` prints classes, properties,
   defaults and bus requirements, and the doc generator reads the same data.
 
-### 2.5 State: snapshots, replay, rewind
+### 3.5 State: snapshots, replay, rewind
 
 Built in phase 1, not bolted on later.
 
@@ -246,7 +352,7 @@ Built in phase 1, not bolted on later.
   reports, CI regression fixtures, and **rewind** (periodic snapshot + replay
   forward to an earlier point).
 
-### 2.6 Execution engines
+### 3.6 Execution engines
 
 The core does not know what a CPU *is* beyond:
 
@@ -260,14 +366,14 @@ pub trait Cpu: Device {
 ```
 
 A core may implement `run` by interpreting, by translating through the IR
-(§9), or by entering hardware (§10). The choice is a per-CPU config property
+(§8), or by entering hardware (§9). The choice is a per-CPU config property
 (`engine = "interp" | "jit" | "kvm"`), and **all engines for one guest
 architecture must agree instruction-for-instruction** — enforced by differential
-testing (§12), which is the only thing that keeps a JIT honest.
+testing (§10), which is the only thing that keeps a JIT honest.
 
 ---
 
-## 3. The machine description language
+## 4. The machine description language
 
 The framework's user interface. It must express arbitrary graphs — including
 heterogeneous CPUs sharing memory, multiple disjoint address spaces, and
@@ -282,8 +388,9 @@ next person learns why a mirror exists.
 
 ```
 machine "nes" {
-  param  region = "ntsc"
-  clock  master = 21477272 Hz            # NTSC colorburst × 6
+  param    region   = "ntsc"
+  timebase exact                         # every ratio here is an integer divide
+  clock    master   = 21477272 Hz        # NTSC colorburst × 6
 
   space cpubus  { width = 16, unassigned = open-bus }
   space ppubus  { width = 14, unassigned = open-bus }
@@ -330,7 +437,7 @@ run. Errors carry file:line:col and a caret, always.
 
 ---
 
-## 4. CPU cores
+## 5. CPU cores
 
 Each core is a feature. The order below is chosen so that each one proves a
 *new mechanism* in the framework rather than adding another opcode table.
@@ -349,7 +456,7 @@ frontend**, and the two are differentially tested against each other forever.
 
 ---
 
-## 5. Buses and devices
+## 6. Buses and devices
 
 Generic `Bus` trait (attach/detach, enumeration, address routing, hotplug),
 with concrete fabrics as features:
@@ -368,14 +475,14 @@ with concrete fabrics as features:
 - **Interrupt controllers, timers, RTC, DMA controllers, UARTs** — the
   unglamorous majority.
 
-### 5.1 Storage
+### 6.1 Storage
 
 Disk image layer: `raw`, `qcow2` (compression via `compcol`, encryption via
 `purecrypto`), `vmdk`, `vhdx`, `vdi`, plus a copy-on-write overlay, snapshots,
 discard/TRIM, and a write-back cache with a flush contract that survives
 snapshotting. Read-only ISO/UDF via the existing `iso9660` work.
 
-### 5.2 Networking
+### 6.2 Networking
 
 **Solved by `pktkit`.** Every emulated NIC (`e1000`, `rtl8139`, `virtio-net`,
 `ne2000`, …) is a `pktkit::L2Device`; the config then attaches it to a
@@ -385,7 +492,7 @@ project that most emulators have to write themselves.
 
 ---
 
-## 6. Host-facing layer (`host/`, std only)
+## 7. Host-facing layer (`host/`, std only)
 
 - **Display** — a framebuffer/scanout abstraction; guest surface → host window.
   Backends: raw framebuffer, X11/Wayland (reusing `x11anywhere` protocol work),
@@ -406,7 +513,7 @@ project that most emulators have to write themselves.
 
 ---
 
-## 7. The translation IR and JIT
+## 8. The translation IR and JIT
 
 The performance story. Design it once, correctly; every guest and every host
 pays for mistakes here.
@@ -454,7 +561,7 @@ speed rather than failing to run. Code buffers are W^X: `mmap` RW → emit →
 
 ---
 
-## 8. Hardware acceleration
+## 9. Hardware acceleration
 
 Two distinct meanings, both in scope, tracked separately.
 
@@ -477,7 +584,7 @@ a hard interface boundary; it must never become a build requirement.
 
 ---
 
-## 9. Validation
+## 10. Validation
 
 The credibility of the whole project. Each core lands *with* its suite.
 
@@ -497,10 +604,12 @@ catches nearly everything.
 
 ---
 
-## 10. Phase plan
+## 11. Phase plan
 
-Each phase ends in something that **runs and is measured**. No phase is
-"framework only" — generic code with no consumer is generic code that is wrong.
+Each phase ends in something that **runs and is measured**, and from phase 3
+onward in something a person can *use* (§1). No phase is "framework only" —
+generic code with no consumer is generic code that is wrong, and a framework
+that never becomes an emulator was never validated.
 
 ### Phase 0 — Scaffolding
 Repo skeleton, `Cargo.toml` feature scaffold, `CLAUDE.md` design rules, CI
@@ -511,13 +620,17 @@ only `rsemu`).
 
 ### Phase 1 — The core kernel
 `core/`: value/endianness, address spaces + regions + flat view + dispatch,
-RAM/ROM stores, clock tree with exact rational time, scheduler + event queue,
+RAM/ROM stores, clock tree with **both time bases** (`exact` rational and
+`best-effort` fixed-point + residual), scheduler + event queue,
 wires, device trait + lifecycle + composition, props, registry, snapshot
 reader/writer, reset trees, error/trace.
 **Gate:** a synthetic machine (RAM + a counter device + a stub CPU) built in
-Rust runs deterministically for 10⁹ ticks; snapshot → restore → continue
-produces a bit-identical state hash; the region-priority/alias/attrs unit matrix
-is complete and green; `no_std` build passes.
+Rust runs deterministically for 10⁹ ticks under *both* time bases, with
+best-effort drift measured and proven non-accumulating against the exact base;
+`exact` refuses (with a useful error) a machine whose `L` cannot be computed;
+snapshot → restore → continue produces a bit-identical state hash; the
+region-priority/alias/attrs unit matrix is complete and green; `no_std` build
+passes.
 
 ### Phase 2 — The machine description language
 Lexer, parser with spans, resolver (params, includes, templates, links),
@@ -587,7 +700,7 @@ the known-failures ledger; and the machine library under `machines/`.
 
 ---
 
-## 11. Reused Karpelès Lab crates
+## 12. Reused Karpelès Lab crates
 
 | Crate | Used for | Feature-gated |
 | --- | --- | --- |
@@ -602,13 +715,15 @@ the known-failures ledger; and the machine library under `machines/`.
 
 ---
 
-## 12. Design invariants to hold under pressure
+## 13. Design invariants to hold under pressure
 
 Recorded here because each will be tempting to violate around phase 5–6.
 
 1. **No device type appears in a `core::` signature.** If the core needs to know
    about PCI, the abstraction is wrong.
-2. **No floats in the time path.** Ever. Rational integer arithmetic only.
+2. **No floats in the time path.** Ever — under *either* time base. `exact`
+   is rational integer arithmetic; `best-effort` is fixed-point with a residual
+   accumulator. An `f64` seconds value anywhere near the scheduler is a bug.
 3. **Caches are derived state.** A TLB, a translation block, a flat view, and a
    host pointer must all be reconstructible from architectural state alone, and
    must all be invalidated by the topology generation counter.
@@ -624,13 +739,13 @@ Recorded here because each will be tempting to violate around phase 5–6.
 
 ---
 
-## 13. Known risks
+## 14. Known risks
 
 - **Scope.** This is a decade-scale project measured against QEMU. The phase
   gates exist so that value lands early: phase 3 is a shippable NES emulator,
   phase 5 a shippable RISC-V VM, phase 6 a shippable PC emulator.
 - **Compile time** at `--all-features` in one crate. Mitigated by the feature
-  discipline; escape hatch in §1.
+  discipline; escape hatch in §2.
 - **The purity rule vs. the host.** GPU, HVF, and WHPX cannot be reached without
   foreign code. The answer is explicit, labelled opt-in features — never a
   silent compromise.
