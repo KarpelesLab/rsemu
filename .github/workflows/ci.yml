@@ -163,7 +163,7 @@ jobs:
           if missing:
               sys.exit(f'missing exports: {sorted(missing)}')
           PY
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: matrix.target == 'wasm32-unknown-unknown'
         with:
           name: rsemu-wasm
