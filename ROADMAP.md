@@ -177,11 +177,18 @@ emulated guest is ordinary use and creates no derivative work; *shipping* it in
 our repository would be redistribution under its terms. Confirm a fixture's
 licence before vendoring it.
 
-**`AccuracyCoin` is settled, not pending:** `gones/AccuracyCoin/` has no licence
-file at all, and it ships `nesasm.exe`, a third-party Windows binary of unstated
-provenance. It is **download-and-run only, never vendored**, and if its licence
-cannot be established it comes out of the phase-3 gate rather than into the
-repository.
+**`AccuracyCoin` is settled — and it is MIT.** An earlier revision here said it
+had no licence and was run-only. That was true of the *copy* in `../gones`,
+which predates the licence file, and wrong about the project:
+[100thCoin/AccuracyCoin](https://github.com/100thCoin/AccuracyCoin) is MIT,
+© 2025 Chris Siebert (verified against the upstream `LICENSE`). It may therefore
+be used *and* redistributed with its notice — a rare and valuable thing for a
+conformance ROM. Take it from upstream rather than from `../gones`, and do not
+copy `nesasm.exe`, a third-party Windows binary of unstated provenance that the
+local tree also carries.
+
+The lesson generalises: **check the upstream, not the copy in front of you.** A
+vendored tree missing a licence file says nothing about the project's licence.
 
 ### Practical discipline
 

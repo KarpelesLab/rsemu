@@ -37,7 +37,7 @@ anything**; this table records a point in time.
 | [retrio/gb-test-roms](https://github.com/retrio/gb-test-roms) (blargg) | Game Boy CPU, timing, sound | **No licence file** ⛔ | **No.** Provenance unclear — run only |
 | blargg's NES test ROMs | NES CPU, PPU, APU | Freely circulated, licence unclear ⛔ | **No.** Run only |
 | `nestest` + reference log | 6502 trace comparison — the fastest way to first-boot a 6502 | Licence unclear ⛔ | **No.** Run only |
-| AccuracyCoin | NES accuracy test ROM | **No licence file present** in `../gones` ⛔ | **No** — flagged in `ROADMAP.md` §1 |
+| [AccuracyCoin](https://github.com/100thCoin/AccuracyCoin) | 125 NES accuracy tests on one NROM cart, with per-test error codes | **MIT** ✅ (© 2025 Chris Siebert — verified upstream; the copy in `../gones` predates the licence file) | Yes, with attribution |
 | `zexall` / `zexdoc` | Z80 exerciser | Verify before use ⚠️ | Verify first |
 
 The MIT-licensed SingleStepTests corpora are the ones we could legitimately
