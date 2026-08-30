@@ -12,9 +12,11 @@
 //! ([`core::props`]), snapshots ([`core::state`]), and the machine-description
 //! front end ([`machine`]).
 //!
-//! Not yet: the device trait and registry ([`core::device`], [`core::registry`])
-//! that bind them together, and the DSL resolver/validator/realizer. Nothing is
-//! emulated yet — no CPU core exists.
+//! The first CPU core is in: `cpu::mos6502`, a cycle-accurate 6502 interpreter
+//! behind the `cpu-mos6502` feature (enable it to see [`cpu`]).
+//!
+//! Not yet: the DSL resolver/validator/realizer, and the machine assembly
+//! layer that hands a realizing device its address spaces, clocks and wires.
 //!
 //! # `no_std`
 //!
@@ -27,6 +29,7 @@
 extern crate alloc;
 
 pub mod core;
+pub mod cpu;
 pub mod machine;
 
 #[cfg(feature = "wasm")]

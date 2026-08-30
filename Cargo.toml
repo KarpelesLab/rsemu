@@ -44,6 +44,12 @@ cli = ["std"]
 #       --no-default-features --features wasm --release
 wasm = ["std"]
 
+# The MOS 6502 core (src/cpu/mos6502): a cycle-accurate interpreter with every
+# documented and undocumented opcode, a disassembler generated from the same
+# table, and the RP2A03 (NES) variant selected by a construction property. Adds
+# no dependencies and is `no_std + alloc`.
+cpu-mos6502 = []
+
 [lib]
 name = "rsemu"
 path = "src/lib.rs"
