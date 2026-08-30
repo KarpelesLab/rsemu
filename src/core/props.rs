@@ -1689,7 +1689,24 @@ pub fn check_enum<'a>(prop: &str, value: &'a str, allowed: &[&str]) -> Result<&'
 /// The threshold scales with length so that short names do not collide (`irq`
 /// should not "mean" `iru`) while a longer one tolerates a transposition, which
 /// costs two edits.
-fn suggest<'a>(name: &str, candidates: &[&'a str]) -> Option<&'a str> {
+/// The candidate closest to `name`, if one is close enough to be worth naming.
+///
+/// Public because every layer that resolves a name by string needs it and they
+/// must agree: an unknown *property* and an unknown *object link* should be
+/// equally helpful, and two thresholds would make one of them quietly worse.
+/// The distance is optimal string alignment, so a transposition costs one —
+/// `siez` for `size` is a slip, and plain Levenshtein scores it 2, outside any
+/// threshold short enough to stay quiet on three-letter names like `irq`.
+///
+/// Returns `None` rather than a poor guess: sending a reader after a name that
+/// was never going to work is worse than saying nothing.
+///
+/// ```
+/// # use rsemu::core::props::suggest;
+/// assert_eq!(suggest("siez", &["size", "base"]), Some("size"));
+/// assert_eq!(suggest("completely-different", &["size", "base"]), None);
+/// ```
+pub fn suggest<'a>(name: &str, candidates: &[&'a str]) -> Option<&'a str> {
     let limit = (name.chars().count() / 3).max(1);
     let mut best: Option<(usize, &str)> = None;
     for candidate in candidates {
