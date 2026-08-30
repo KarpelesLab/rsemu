@@ -464,14 +464,26 @@ that the relationship is genuinely loose.
 | Representation | per-domain `u64` tick counters, **authoritative architectural state** | a global fixed-point timeline (2⁻⁶⁴ s), used only for ordering |
 | Ratio arithmetic | exact integer multiply/divide over the divisors — small numbers | reciprocal multiply + a per-root **residual accumulator** |
 | Error | **none, by construction** | bounded < 1 unit, non-accumulating, and physically justified |
-| Cost | `u64` mul/div on values like 12 and 4 | `u64` mul + shift |
+| Cost | `u64` mul/div on values like 12 and 4 | ticks→time is a `u64` mul + shift; **time→ticks is a 128×64 product and a 192-bit division** — `core` has no `u256`, so this needs a multi-limb helper, and the inverse must be the true inverse of the forward map or a tree can never reach its own reported time |
 | Runtime re-rating | recompute the tree's small internal lcm | free |
 
-The critical simplification: **the lcm is computed per tree, over the derived
-rates inside that tree — never across trees.** For the NES that is lcm(12, 4) =
-12, i.e. the master tick itself. This is what makes the exact path cheap, and it
-dissolves the failure mode of a global lcm, where adding one ordinary 32.768 kHz
-RTC crystal to a machine multiplies the unit by 10⁵ and overflows.
+The critical simplification: **the unit is derived per tree, from the rates
+inside that tree — never across trees.** This is what makes the exact path
+cheap, and it dissolves the failure mode of a global lcm, where adding one
+ordinary 32.768 kHz RTC crystal multiplies the unit by 10⁵ and overflows.
+
+The derivation, stated correctly: with each domain's rate reduced to
+`root × aᵢ/bᵢ`, the unit rate is `root × A` where **`A = lcm(aᵢ)` — an lcm over
+the rate *numerators*** — and domain *i* advances one tick per
+`kᵢ = (A/aᵢ) × bᵢ` units. For the NES both numerators are 1, so `A = 1`, the
+unit *is* the master tick, and `k_cpu = 12`, `k_ppu = 4` — giving exactly 3 PPU
+dots per CPU cycle by construction.
+
+> An earlier revision of this paragraph said "lcm(12, 4) = 12, i.e. the master
+> tick", taking the lcm over the *divisors*. That is wrong and points the wrong
+> way: a unit of 12 master ticks cannot represent a 4-master-tick PPU period at
+> all. The conclusion was right for the NES only because its numerators happen
+> to be 1, which is exactly what made the error invisible.
 
 Two consequences worth stating:
 
@@ -539,6 +551,13 @@ snapshot header, since queued deadlines are meaningless without it.
   Catch-up is bounded by the device's own next scheduled event, so it never
   simulates past a point where its behaviour would change. A `MemAttrs::debug`
   access advances nothing.
+- **A budget rarely lands on a tick boundary, and that has to be decided.** An
+  event at PPU dot 82181 falls two-thirds of the way through a CPU cycle. The
+  rule: **stop at the cycle boundary before, never drag a domain mid-cycle** —
+  dragging permanently shifts a domain's phase against its own crystal, which is
+  precisely the exactness §4.2 exists to protect. An event dispatcher that needs
+  a device *on* a particular tick asks for it explicitly. This was unaddressed
+  until the implementation forced the question.
 - **Threading modes**, selectable per machine:
   - `deterministic` — one host thread, round-robin over CPUs with a fixed
     quantum. Required for record/replay and the regression suite.
