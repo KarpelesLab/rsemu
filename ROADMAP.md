@@ -598,8 +598,17 @@ paths — the worst class of bug to find later.
 **One edge of every wire cycle must be weak.** A real IRQ/ack loop is cyclic,
 and a graph wired with strong references is necessarily acyclic, so the realize
 protocol states which edge is weak: the machine owns devices, and a wire merely
-refers to them. §5's resolver must reject *wire* cycles explicitly, not only
-name and include cycles.
+refers to them.
+
+**Which cycles the resolver rejects**, since "reject wire cycles" and "a real
+IRQ/ack loop is cyclic" plainly conflict: a cycle is an error only when *every*
+device in it is **combinational** — forwarding levels with no state
+(`wire.not`, `wire.or`, `wire.and`, `wire.split`). A cycle through a
+**sequential** device (`wire.level-to-edge`, and any device model, which is
+sequential by default) is a legitimate handshake and is accepted. That is
+exactly the condition under which the realize sweep above has a topological
+order, so the cycle check and the sweep ordering are **one computation** rather
+than two rules that could disagree.
 
 Level and edge semantics both, with the *edge detector as a device* rather than
 a flag, so it snapshots correctly. Ships with the standard combinators as
@@ -847,7 +856,7 @@ machine "nes" {
   space cpubus  { width = 16, unassigned = open-bus }
   space ppubus  { width = 14, unassigned = open-bus }
 
-  object ram "wram" { size = 2K }
+  object wram "ram" { size = 2K }        # instance `wram`, class `ram`
 
   object cpu "mos6502" {
     clock  = master / 12                 # PPU advances exactly 3 dots per cycle
@@ -855,7 +864,8 @@ machine "nes" {
     engine = "interp"
   }
   object ppu "nes.ppu" { clock = master / 4, space = ppubus }
-  object apu "nes.apu" { clock = master / 12 }
+  object apu  "nes.apu"  { clock = master / 12 }
+  object cart "nes.cart" { space = cpubus }   # the mapper drives an IRQ below
 
   map cpubus 0x0000 size 0x2000 = mirror(wram)      # 2K mirrored 4×
   map cpubus 0x2000 size 0x2000 = mirror(ppu.regs)
@@ -863,9 +873,16 @@ machine "nes" {
 
   wire ppu.nmi   -> cpu.nmi
   wire apu.irq   -> cpu.irq
-  wire cart.irq  -> cpu.irq                          # wired-OR, declared once
+  wire cart.irq  -> cpu.irq                          # wired-OR: see §4.3
 }
 ```
+
+> This example did not resolve until the resolver was written against it. It had
+> `object ram "wram"` — instance `ram`, class `wram` — and then `mirror(wram)`,
+> which names the *class*; and it wired `cart.irq` without ever declaring a
+> cartridge. Both are fixed above and both are pinned by golden tests in
+> `src/machine/tests.rs`, so the document cannot drift from the grammar again.
+> A worked example nobody has executed is a plausible-looking guess.
 
 Required language features, all driven by "any remotely possible configuration":
 
