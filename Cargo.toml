@@ -1,0 +1,78 @@
+[package]
+name          = "rsemu"
+version       = "0.0.0"
+edition       = "2024"
+# Edition 2024 stabilised in 1.85; 1.88 is the floor we hold to, for let-chains
+# and to match the sibling crates (compcol, purecrypto) so the whole family
+# shares one MSRV. The project is stable-only (ROADMAP.md §0) — the sole nightly
+# is one CI job for threaded wasm32-unknown-unknown, impossible on stable
+# (§11.1). CI pins a 1.88 job so the MSRV is a checked claim, not a comment.
+rust-version  = "1.88"
+authors       = ["Karpeles Lab Inc."]
+license       = "MIT"
+description   = "A multiplatform emulator in pure Rust, built bottom-up on a generic framework."
+repository    = "https://github.com/KarpelesLab/rsemu"
+readme        = "README.md"
+keywords      = ["emulator", "emulation", "virtualization", "no_std"]
+categories    = ["emulators", "no-std", "virtualization"]
+exclude       = ["/docs/local", "/.github"]
+
+[features]
+# The emulation core is always compiled and never feature-gated. Everything
+# else is one feature per component, so a NES build links a 6502 and nothing
+# else. Component features (cpu-*, dev-*, bus-*, machine-*) are added as those
+# components land; the list is deliberately short while there is nothing to gate.
+default = ["std", "cli"]
+
+# Pulls in `std`. Without it the crate is `no_std + alloc`, which CI builds on
+# every commit — the emulation core must never depend on `std` (ROADMAP.md §0).
+std = []
+
+# The `rsemu` binary. Needs `std`.
+cli = ["std"]
+
+# WebAssembly bindings (src/wasm.rs): plain C-ABI exports plus embedder-supplied
+# imports, following purecrypto's browser convention. Deliberately no
+# wasm-bindgen — the dependency policy forbids it, and the exports are simple
+# enough not to need it.
+#
+# Implies `std`: the wasm shim is part of the host layer (ROADMAP.md §3), and
+# wasm targets ship a std with an allocator and a panic handler. The `no_std`
+# guarantee is about the emulation core and is checked separately by the
+# `--no-default-features` CI job. Build with:
+#   cargo rustc --crate-type cdylib --target wasm32-unknown-unknown \
+#       --no-default-features --features wasm --release
+wasm = ["std"]
+
+[lib]
+name = "rsemu"
+path = "src/lib.rs"
+# Native builds stay lean (rlib only); the wasm cdylib is produced on demand
+# with `cargo rustc --crate-type cdylib`, so no platform pays for the other's
+# link step.
+crate-type = ["rlib"]
+
+[[bin]]
+name              = "rsemu"
+path              = "src/bin/rsemu.rs"
+required-features = ["cli"]
+
+[lints.rust]
+# Six subsystems may opt back in with a scoped #[allow(unsafe_code)] and a
+# SAFETY comment; see ROADMAP.md §0. Six is the ceiling.
+unsafe_code       = "deny"
+missing_docs      = "warn"
+unreachable_pub   = "warn"
+
+[lints.clippy]
+# Guest arithmetic wraps by definition, so the intent must be spelled out at
+# every site rather than inherited from the build profile (CLAUDE.md).
+arithmetic_side_effects = "allow"
+
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

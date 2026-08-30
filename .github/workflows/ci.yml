@@ -1,0 +1,199 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-features
+      - run: cargo test --all-features
+      # The default build is what users get; it must stand on its own.
+      - run: cargo test
+
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned so the rust-version in Cargo.toml is a checked claim rather than
+      # a comment that drifts.
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-features
+
+  no_std:
+    name: no_std core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The emulation core must never depend on std (ROADMAP.md §0). A std leak
+      # is a build break, not a style nit, so it is checked every commit.
+      - run: cargo build --no-default-features
+      - run: cargo test --no-default-features
+
+  features:
+    name: feature sweep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Cargo features are additive-only, so a component that silently needs a
+      # sibling feature passes --all-features forever and breaks for the first
+      # user who picks a narrow set. Build each feature alone.
+      - name: each feature in isolation
+        run: |
+          set -euxo pipefail
+          cargo build --no-default-features
+          for f in std cli wasm; do
+            cargo build --no-default-features --features "$f"
+          done
+
+  deps:
+    name: dependency policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The default build pulls in nothing at all (ROADMAP.md §0). Permitted
+      # dependencies are first-party and feature-gated; this asserts the floor.
+      - name: default build has no dependencies
+        run: |
+          set -euo pipefail
+          cargo tree --edges normal --prefix none | sort -u > /tmp/tree.txt
+          cat /tmp/tree.txt
+          if [ "$(wc -l < /tmp/tree.txt)" -ne 1 ]; then
+            echo "::error::default build gained a dependency"
+            exit 1
+          fi
+
+  wasm:
+    name: wasm (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wasm32-unknown-unknown, wasm32-wasip1, wasm32-wasip1-threads]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      # wasm rots faster than anything else, so every wasm target is built on
+      # every commit from the first one (ROADMAP.md §11).
+      - name: build library
+        run: cargo build --target ${{ matrix.target }} --no-default-features --features wasm
+      - name: build browser cdylib
+        if: matrix.target == 'wasm32-unknown-unknown'
+        run: |
+          cargo rustc --crate-type cdylib --target wasm32-unknown-unknown \
+            --no-default-features --features wasm --release
+      - name: check exported ABI
+        if: matrix.target == 'wasm32-unknown-unknown'
+        # A module that compiles but exports nothing is useless to the web
+        # harness, and the failure is silent. Assert the symbols exist.
+        run: |
+          python3 - <<'PY'
+          import sys
+          d = open('target/wasm32-unknown-unknown/release/rsemu.wasm','rb').read()
+          assert d[:4] == b'\0asm', 'not a wasm module'
+          def uleb(d, i):
+              r = s = 0
+              while True:
+                  b = d[i]; i += 1; r |= (b & 0x7f) << s; s += 7
+                  if not b & 0x80: return r, i
+          names, i = set(), 8
+          while i < len(d):
+              sid = d[i]; i += 1
+              size, i = uleb(d, i); end = i + size
+              if sid == 7:
+                  n, j = uleb(d, i)
+                  for _ in range(n):
+                      ln, j = uleb(d, j); names.add(d[j:j+ln].decode()); j += ln
+                      j += 1; _, j = uleb(d, j)
+              i = end
+          want = {'memory', 'rsemu_echo', 'rsemu_version_ptr', 'rsemu_version_len'}
+          missing = want - names
+          print('exports:', sorted(names))
+          if missing:
+              sys.exit(f'missing exports: {sorted(missing)}')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: matrix.target == 'wasm32-unknown-unknown'
+        with:
+          name: rsemu-wasm
+          path: target/wasm32-unknown-unknown/release/rsemu.wasm
+          if-no-files-found: error
+
+  wasm-threads-browser:
+    name: wasm threads, browser (nightly)
+    runs-on: ubuntu-latest
+    # The project's ONLY nightly job, and the only one allowed to break on a
+    # toolchain bump. Threaded wasm32-unknown-unknown cannot be built on stable:
+    # the precompiled std lacks +atomics, so rust-lld rejects --shared-memory.
+    # Rebuilding std needs -Z build-std, which is nightly-only. No shipping
+    # artifact comes from here — wasm32-wasip1-threads above is the stable
+    # threaded target CI actually gates on. See ROADMAP.md §11.1.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: wasm32-unknown-unknown
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: build with shared memory
+        env:
+          RUSTFLAGS: >-
+            -C target-feature=+atomics,+bulk-memory,+mutable-globals
+            -C link-arg=--shared-memory
+            -C link-arg=--max-memory=1073741824
+        run: |
+          cargo rustc -Z build-std=std,panic_abort \
+            --crate-type cdylib --target wasm32-unknown-unknown \
+            --no-default-features --features wasm --release

@@ -53,9 +53,34 @@ one snapshot format, one debugger, shared by every machine ever added.
 
 ## Status
 
-Planning. Nothing is implemented yet. The plan is ordered so that value lands
-early: phase 3 is a usable NES emulator, phase 5 a RISC-V machine that boots
-Linux, phase 6 a PC that boots DOS through Windows XP.
+Scaffolding. Nothing is emulated yet — what exists is the crate skeleton, the
+error and value types, and a CI matrix that builds and tests every target from
+the first commit. The plan is ordered so that value lands early: the NES
+milestone is a usable emulator, then a RISC-V machine that boots Linux, then a
+PC that boots DOS through Windows XP.
+
+## Build
+
+```sh
+cargo build              # library + the rsemu binary
+cargo test --all-features
+cargo run -- --version
+
+cargo build --no-default-features   # no_std core, as CI checks it
+```
+
+WebAssembly — no `wasm-bindgen`; the module is instantiated directly and
+strings cross as a pointer/length pair read from exported memory:
+
+```sh
+cargo rustc --crate-type cdylib --target wasm32-unknown-unknown \
+    --no-default-features --features wasm --release
+cp target/wasm32-unknown-unknown/release/rsemu.wasm web/
+python3 -m http.server -d web 8080     # then open http://localhost:8080/
+```
+
+See [`web/README.md`](web/README.md). MSRV is 1.88, pinned by a CI job so it
+stays a checked claim.
 
 **Read [`ROADMAP.md`](ROADMAP.md)** — it contains the architecture (memory,
 time, devices, state, IR), the machine description language, the phase plan

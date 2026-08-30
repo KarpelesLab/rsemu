@@ -1,3 +1,13 @@
 [toolchain]
+# Stable only. The single nightly in this project is one CI job for threaded
+# wasm32-unknown-unknown, which cannot work on stable (ROADMAP.md §11.1); it
+# pins its own toolchain and produces no shipping artifact.
 channel = "stable"
 components = ["rustfmt", "clippy"]
+# Fetched up front so `cargo build --target …` works without a separate
+# `rustup target add`, and so the wasm targets are never "someone else's job".
+targets = [
+    "wasm32-unknown-unknown",
+    "wasm32-wasip1",
+    "wasm32-wasip1-threads",
+]

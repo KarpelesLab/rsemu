@@ -1,0 +1,63 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>rsemu (wasm)</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 3rem auto; max-width: 42rem; padding: 0 1rem; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre { background: color-mix(in srgb, currentColor 8%, transparent); padding: .75rem 1rem; border-radius: 6px; overflow-x: auto; }
+  .err { color: #c00; }
+</style>
+
+<h1>rsemu — WebAssembly build</h1>
+<p>
+  Nothing is emulated yet; see <code>ROADMAP.md</code> for the phase plan. This
+  page exists so the wasm target is loaded and exercised from the first commit
+  rather than only compiled — a target that is built but never run is a target
+  that quietly stops working.
+</p>
+
+<pre id="out">loading…</pre>
+
+<script type="module">
+  const out = document.getElementById("out");
+  const log = (s, cls) => {
+    const line = document.createElement("div");
+    if (cls) line.className = cls;
+    line.textContent = s;
+    out.append(line);
+  };
+
+  try {
+    out.textContent = "";
+
+    // No wasm-bindgen: the module is instantiated directly and its exported
+    // memory is read by hand. The whole boundary is three functions.
+    const { instance } = await WebAssembly.instantiateStreaming(
+      fetch("./rsemu.wasm"),
+      {},
+    );
+    const { memory, rsemu_version_ptr, rsemu_version_len, rsemu_echo } =
+      instance.exports;
+
+    const bytes = new Uint8Array(
+      memory.buffer,
+      rsemu_version_ptr(),
+      rsemu_version_len(),
+    );
+    log(new TextDecoder().decode(bytes));
+
+    // Round-trip an argument, so a module that loads but does not actually run
+    // is distinguishable from one that works.
+    const sent = 0xdeadbeef;
+    const got = rsemu_echo(sent) >>> 0;
+    log(`echo(0x${sent.toString(16)}) -> 0x${got.toString(16)}` +
+        (got === sent ? "  ok" : "  MISMATCH"), got === sent ? null : "err");
+
+    log(`shared memory: ${memory.buffer instanceof SharedArrayBuffer}` +
+        `  (cross-origin isolated: ${self.crossOriginIsolated})`);
+  } catch (e) {
+    log(String(e), "err");
+    log("Serve this directory over HTTP — file:// cannot fetch the module.");
+  }
+</script>
