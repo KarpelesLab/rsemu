@@ -3,3 +3,4 @@
 /Cargo.lock
 # Per-agent worktrees created by Claude Code's parallel-agent tooling.
 /.claude/
+docs/local/

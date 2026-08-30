@@ -1,0 +1,133 @@
+# rsemu documentation index
+
+This directory is a **register of primary sources** — the specifications,
+datasheets and hardware documentation rsemu is implemented *from*. It is an
+annotated bibliography, not a copy of the documents.
+
+## Why an index and not the documents themselves
+
+Almost every specification here is copyrighted by its publisher and cannot be
+redistributed from an MIT repository. Vendoring the Intel SDM or the PCIe base
+spec would create exactly the licensing problem [`../CONTRIBUTING.md`](../CONTRIBUTING.md)
+exists to prevent. So this directory records **what to read, where to get it,
+what it authoritatively answers, and whether it is safe to quote** — and each
+contributor fetches their own copies.
+
+Downloaded documents belong in `docs/local/`, which is git-ignored. The same
+rule as test corpora: fetch it, don't ship it.
+
+## How to use this
+
+1. Find the subsystem you're implementing below.
+2. Read the **primary** source first — the datasheet or the ISA manual. It
+   describes the hardware; everything else describes someone's understanding of
+   it.
+3. Cite what you used, in the commit message or a comment: document, revision,
+   section. Provenance must be auditable years later.
+
+## The provenance rule, in one paragraph
+
+rsemu is MIT and **cannot absorb GPL'd code**. Do not read the QEMU source tree,
+and do not read any other copyleft emulator (Bochs, DOSBox, MAME, VICE, Dolphin,
+PCSX2, Nestopia, higan). Work from hardware documentation instead. Permissively
+licensed code (MIT/BSD/Apache/ISC) is usable with its attribution retained.
+Black-box use of a GPL program — running it, benchmarking it, diffing its trace
+— creates no derivative work and is fine. Full policy:
+[`../ROADMAP.md` §1](../ROADMAP.md).
+
+**Facts versus expression:** a cycle count from a datasheet is a fact and is
+free. The identical number copied from a GPL emulator's timing table is
+expression obtained from a forbidden source. Take facts from primary sources and
+the question never arises.
+
+## Index
+
+### CPU architectures
+| | |
+| --- | --- |
+| [`cpu/6502.md`](cpu/6502.md) | MOS 6502, RP2A03, 65C02, 65816 |
+| [`cpu/z80-sm83.md`](cpu/z80-sm83.md) | Zilog Z80, Sharp SM83 (Game Boy), Intel 8080 |
+| [`cpu/x86.md`](cpu/x86.md) | 8086 → i386 → x86-64, SSE/AVX, paging, segmentation |
+| [`cpu/arm.md`](cpu/arm.md) | ARMv7-A, ARMv8-A / AArch64, GIC |
+| [`cpu/riscv.md`](cpu/riscv.md) | RV32/RV64, privileged spec, SBI |
+| [`cpu/other.md`](cpu/other.md) | 68000, MIPS, PowerPC, SuperH, V850 |
+
+### Machines
+| | |
+| --- | --- |
+| [`platforms/nes.md`](platforms/nes.md) | NES / Famicom |
+| [`platforms/game-boy.md`](platforms/game-boy.md) | Game Boy, Game Boy Color |
+| [`platforms/master-system.md`](platforms/master-system.md) | Sega Master System, Game Gear |
+| [`platforms/ibm-pc.md`](platforms/ibm-pc.md) | IBM PC/AT and modern PC chipsets |
+| [`platforms/riscv-virt.md`](platforms/riscv-virt.md) | The RISC-V `virt` board |
+
+### Buses
+| | |
+| --- | --- |
+| [`buses/pci.md`](buses/pci.md) | PCI, PCI Express, config space, MSI |
+| [`buses/usb.md`](buses/usb.md) | USB 1.1/2.0/3.x, UHCI/EHCI/xHCI, device classes |
+| [`buses/storage.md`](buses/storage.md) | ATA/ATAPI, AHCI, NVMe, SCSI, SD/MMC |
+| [`buses/virtio.md`](buses/virtio.md) | virtio, virtqueues, PCI and MMIO transports |
+| [`buses/low-speed.md`](buses/low-speed.md) | I²C/SMBus, SPI, 1-Wire, GPIO |
+
+### Devices
+| | |
+| --- | --- |
+| [`devices/interrupts-timers.md`](devices/interrupts-timers.md) | 8259, APIC/IOAPIC, PIT, HPET, RTC, PLIC/CLINT |
+| [`devices/video-audio.md`](devices/video-audio.md) | VGA/VBE, framebuffers, sound hardware |
+| [`devices/network-input.md`](devices/network-input.md) | NIC models, PS/2, HID |
+
+### System software interfaces
+| | |
+| --- | --- |
+| [`system/firmware-boot.md`](system/firmware-boot.md) | BIOS, UEFI, ACPI, SMBIOS, device tree, boot protocols |
+| [`system/debug-protocols.md`](system/debug-protocols.md) | GDB remote serial protocol, DWARF |
+| [`system/remote-display.md`](system/remote-display.md) | RFB/VNC, SPICE |
+
+### Techniques
+| | |
+| --- | --- |
+| [`techniques/binary-translation.md`](techniques/binary-translation.md) | DBT, JIT, register allocation |
+| [`techniques/memory-models.md`](techniques/memory-models.md) | x86-TSO, ARM/POWER relaxed models, barrier lowering |
+| [`techniques/virtualization.md`](techniques/virtualization.md) | KVM, Hypervisor.framework, WHPX |
+| [`techniques/webassembly.md`](techniques/webassembly.md) | Wasm core, threads, browser APIs |
+
+### Testing
+| | |
+| --- | --- |
+| [`testing/conformance-suites.md`](testing/conformance-suites.md) | Every suite, **with its licence** and whether it may be vendored |
+
+## Deliberately excluded
+
+Listed so nobody adds them later thinking they were an oversight. Each is a
+resource an emulator author would reach for by reflex, and each is off limits:
+
+| Excluded | Licence | Note |
+| --- | --- | --- |
+| QEMU — source, headers, in-tree docs, commit messages, mailing list | GPLv2 | Permanently forbidden. Black-box benchmarking only |
+| Unicorn Engine | GPLv2 | Derived from QEMU |
+| Bochs, DOSBox, MAME, VICE, Dolphin, PCSX2, Nestopia, higan | GPL/LGPL | Copyleft |
+| **Linux kernel source and in-tree `Documentation/`** | GPLv2 | See below — this one catches people |
+| SeaBIOS, coreboot | GPL | Use EDK II (BSD-2-Clause-Patent) instead |
+
+### The Linux kernel trap
+
+Reading a Linux *driver* to learn how a device behaves is the most common way
+this rule gets broken, because the driver is easy to find and the spec is not.
+It is still GPLv2 and still forbidden. Read the specification the driver
+implements — for virtio that is the OASIS standard, for NVMe the NVM Express
+spec, for xHCI the Intel specification.
+
+**One narrow exception:** the kernel's userspace ABI headers under
+`include/uapi/` are licensed `GPL-2.0 WITH Linux-syscall-note`, an explicit
+exception permitting their use in non-GPL programs. That is what makes the KVM
+accel backend possible ([`techniques/virtualization.md`](techniques/virtualization.md)).
+It covers the UAPI headers only — not drivers, not `Documentation/`, not the
+rest of the tree.
+
+## Link status
+
+Every URL in this directory was checked at the time of writing. A few
+publishers (Intel, Arm, PCI-SIG, UEFI Forum, DMTF, SD Association) block
+automated requests, so those links are marked **[browser]** — they work
+normally, just not from `curl`.

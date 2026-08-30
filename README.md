@@ -82,5 +82,9 @@ NESdev wiki, Pan Docs and real hardware; permissively licensed code is welcome
 with its attribution intact. Benchmarking against a GPL emulator is fine —
 that is black-box use, not derivation.
 
+[`docs/`](docs/) is the curated register of primary sources — ISA manuals,
+platform specs, PCI/USB/virtio, OSDev resources and conformance suites — each
+annotated with what it authoritatively answers and whether it is safe to quote.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) before your first patch, and
 [`ROADMAP.md` §1](ROADMAP.md) for the full policy.

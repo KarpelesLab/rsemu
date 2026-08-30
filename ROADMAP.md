@@ -111,7 +111,9 @@ GPL.
 ### What you may absolutely use
 
 The rule above is narrow on purpose. This is the other half, and it is where
-essentially all legitimate work happens:
+essentially all legitimate work happens. **[`docs/`](docs/) is the curated,
+link-checked register of these sources**, organized by subsystem — start there
+rather than searching:
 
 - **Hardware documentation.** Datasheets, ISA manuals (Intel SDM, ARM ARM,
   RISC-V ISA specs), chip service manuals, schematics, errata sheets. This is
@@ -172,6 +174,9 @@ licence explicitly.
    translated from one, and no constant table is copied from one unless the
    values are independently obtainable hardware facts (§1, above).
 5. When in doubt, ask before reading — not after.
+
+The [`docs/`](docs/) index also records what is **deliberately excluded** and
+why, so a forbidden source does not get added later as an apparent oversight.
 
 ---
 
