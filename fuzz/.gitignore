@@ -1,0 +1,10 @@
+# Build output and coverage profiles are per-machine.
+target
+coverage
+# The lockfile is per-machine too: this crate ships nothing, so pinning its
+# external dependencies buys nothing and only creates merge conflicts.
+Cargo.lock
+# `corpus/` and `artifacts/` are deliberately NOT ignored. The phase-2 gate is
+# stated in terms of "a seeded corpus" (ROADMAP.md §13), so the seeds are part
+# of the repo; libFuzzer's own additions to the corpus should be committed only
+# when they are minimised and add real coverage.

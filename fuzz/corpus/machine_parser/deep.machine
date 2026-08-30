@@ -1,0 +1,11 @@
+# Nesting, well inside parser::MAX_DEPTH. The mutator's job is to push this
+# past the guard; the seed's job is to get it to the guard cheaply.
+machine "deep" {
+  param x = ((((((((((((((((1))))))))))))))))
+  object o "cls" { p = [[[[[[[[1]]]]]]]], q = { a = { b = { c = 1 } } } }
+  for i in 0..2 {
+    for j in 0..2 {
+      object cell${i * 2 + j} "cls" { addr = 0x1000 * (i + j) }
+    }
+  }
+}

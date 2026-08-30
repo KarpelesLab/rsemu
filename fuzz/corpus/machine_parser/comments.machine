@@ -1,0 +1,11 @@
+# A leading comment.
+machine "commented" { # trailing on the header line
+  # A whole-line comment, with a “quoted” unicode aside.
+  osc clk = 1 MHz # after a statement
+
+  object ram "wram" { size = 1K } # after a block
+
+  space bus { width = 16 unassigned = open-bus }   # separators are optional
+  map bus 0 size 0x400 = ram
+}
+# A trailing comment at end of file, with no newline after it

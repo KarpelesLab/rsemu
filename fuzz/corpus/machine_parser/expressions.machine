@@ -1,0 +1,35 @@
+# Every literal form, suffix and operator in one file, so the mutator starts
+# from syntax that already reaches the constant folder rather than having to
+# invent it. `osc f` is §5's rational master clock; `osc g` is the negative
+# case the checked negation exists for.
+param bin    = 0b1010_1010
+param oct    = 0o755
+param dec    = 1_234
+param hex    = 0xdead_beef
+param kilo   = 4K
+param kib    = 4KiB
+param mega   = 16MB
+param giga   = 2Gi
+param tera   = 1TiB
+param nanos  = 30ns
+param micros = 25us
+param millis = 16ms
+param secs   = 3s
+param neg    = -1
+param sum    = 1 + 2 * 3 - 4 / 2 % 3
+param nested = ((((1 + 2))))
+param items  = [1, 2, 3, "four", true, false]
+param table  = { a = 1, b = [2, 3], c = { d = 4 } }
+param called = mirror(wram, 0x2000)
+param text   = "escapes: \" \\ \n \t \0 \x7f"
+param needed
+
+machine "exprs" {
+  osc a = 1 Hz
+  osc b = 1 kHz
+  osc c = 1 KHz
+  osc d = 1 MHz
+  osc e = 1 GHz
+  osc f = 236250000/11 Hz
+  osc g = -1 Hz
+}
