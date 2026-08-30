@@ -70,6 +70,17 @@ compression), [`purecrypto`](https://github.com/KarpelesLab/purecrypto)
 partition tables, and a dozen read-write filesystems),
 [`noroi`](https://github.com/KarpelesLab/noroi) (monitor TUI).
 
-## License
+## License and provenance
 
 MIT — see [LICENSE](LICENSE).
+
+rsemu is written **clean-room from hardware documentation**. MIT cannot absorb
+GPL'd code, so copyleft sources are off limits to contributors — **the QEMU
+source tree above all**, along with Bochs, DOSBox, MAME, VICE, Dolphin, PCSX2
+and every other GPL/LGPL emulator. We work from datasheets, ISA manuals, the
+NESdev wiki, Pan Docs and real hardware; permissively licensed code is welcome
+with its attribution intact. Benchmarking against a GPL emulator is fine —
+that is black-box use, not derivation.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) before your first patch, and
+[`ROADMAP.md` §1](ROADMAP.md) for the full policy.

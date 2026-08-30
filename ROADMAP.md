@@ -19,7 +19,7 @@ machine that will ever be added.
 
 This roadmap defines the architecture, the phase order, and the acceptance gate
 for each phase. It is written to be executed top-to-bottom; every phase ships
-something a person can actually run (§1).
+something a person can actually run (§2).
 
 > **Status (2026-08-30):** nothing implemented. This document is the plan.
 ---
@@ -30,7 +30,7 @@ These are decided. Do not relitigate them mid-implementation.
 
 - **Pure Rust, no foreign code.** No C, no `bindgen`, no vendored assembly, no
   build scripts that invoke a compiler. The dependency budget is *first-party
-  Karpelès Lab crates only* (§13) — and even those stay feature-gated so the
+  Karpelès Lab crates only* (§14) — and even those stay feature-gated so the
   core builds with an empty `cargo tree`.
 - **`unsafe` is quarantined.** Crate-wide `unsafe_code = "deny"` (not `forbid`).
   Exactly four subsystems may opt back in with a scoped
@@ -43,7 +43,7 @@ These are decided. Do not relitigate them mid-implementation.
   Record/replay, save states, rewind, and the entire regression suite are built
   on this. Speed is never traded for determinism without a flag.
 - **Accuracy is measured, never asserted.** Every CPU core ships with a
-  published conformance suite (§11) and a known-failures ledger that only ever
+  published conformance suite (§12) and a known-failures ledger that only ever
   shrinks. A core with no suite is not "done", it is "untested".
 - **Generic first, specific second.** If a device model needs a mechanism the
   core does not have, the mechanism gets added to the core generically — never
@@ -51,7 +51,7 @@ These are decided. Do not relitigate them mid-implementation.
   signature.
 - **`no_std` + `alloc` core stays buildable.** The emulation core (memory,
   clock, devices, IR, interpreters) never touches `std` — including for
-  threading, which goes through the `core::sync` seam (§3.7). Host I/O, JIT,
+  threading, which goes through the `core::sync` seam (§4.7). Host I/O, JIT,
   accel and frontends live above the `std` line. CI builds both.
 - **Multithreaded by design, single-threaded by contract.** Every core type is
   `Send + Sync` from phase 1, and the same machine must produce an identical
@@ -59,14 +59,123 @@ These are decided. Do not relitigate them mid-implementation.
   configuration, never an assumption baked into a device.
 - **The browser is a first-class target.** rsemu builds and runs on
   `wasm32-unknown-unknown` with *and without* threads, from phase 0, in CI
-  (§10). No `mmap`, no OS threads, no signals, no monotonic clock — a
+  (§11). No `mmap`, no OS threads, no signals, no monotonic clock — a
   constraint that keeps the core portable rather than one that limits it.
-- **MIT licensed**, `edition = "2024"`, stable toolchain, `rustfmt` + `clippy`
-  clean under `-D warnings`.
+- **MIT licensed, and clean-room.** GPL/LGPL/AGPL sources are off limits —
+  **QEMU above all**, permanently and in its entirety. Work from hardware
+  documentation, not from somebody else's emulator. Read §1 before writing
+  anything; a tainted contribution cannot be undone by deleting the file.
+- `edition = "2024"`, stable toolchain, `rustfmt` + `clippy` clean under
+  `-D warnings`.
 
 ---
 
-## 1. What rsemu is when it's finished
+## 1. Licensing and provenance — read this before writing a line
+
+rsemu is **MIT licensed**. MIT is a permissive licence and is **one-way
+incompatible with the GPL family**: GPL'd code can absorb MIT code, but MIT code
+can never absorb GPL'd code. There is no exception, no "just for reference", and
+no amount of paraphrasing that launders it. A single tainted contribution makes
+the project undistributable under its own licence and is not fixable by deleting
+the file later — the history and everything derived from it are contaminated.
+
+### QEMU is specifically and permanently off limits
+
+**Do not read, open, clone, grep, quote, adapt, translate, or consult the QEMU
+source tree.** QEMU is GPLv2. This prohibition covers the whole artifact, not
+just `.c` files:
+
+- source files, headers, and build system
+- comments and documentation inside the tree
+- commit messages, mailing-list patches, and code review threads
+- any project derived from it (Unicorn Engine, libvirt's QEMU-specific code,
+  forks, and vendored copies inside other emulators)
+
+"I only looked at it to understand the concept" is exactly the act this rule
+forbids, because the resulting code is a derivative work of what you read
+whether or not it looks similar. If you have previously read QEMU source for a
+given subsystem, **say so and let someone else write that subsystem.** That is
+not a judgment; it is ordinary clean-room hygiene and it protects you too.
+
+### Other copyleft sources, same rule
+
+The rule is the licence, not the name. Any GPL, LGPL, AGPL, SSPL or CDDL source
+is off limits. Emulator projects people reach for by reflex — Bochs, DOSBox,
+MAME, VICE, Dolphin, PCSX2, Nestopia, higan — are copyleft and are all
+forbidden. **Verify a project's licence before you open it**, not after.
+
+LGPL deserves its own sentence because it is routinely misread: LGPL permits
+*linking*, not *copying source into an MIT crate*. It is as forbidden here as
+GPL.
+
+### What you may absolutely use
+
+The rule above is narrow on purpose. This is the other half, and it is where
+essentially all legitimate work happens:
+
+- **Hardware documentation.** Datasheets, ISA manuals (Intel SDM, ARM ARM,
+  RISC-V ISA specs), chip service manuals, schematics, errata sheets. This is
+  the *primary* source and should be the first thing you reach for anyway — it
+  describes the machine we are emulating, not somebody's emulation of it.
+- **Community reverse-engineering documentation**: the NESdev wiki, Pan Docs,
+  OSDev wiki, hardware-test write-ups. These document *facts about hardware*.
+  Respect each site's licence for verbatim text; the facts themselves are free.
+- **Academic papers and textbooks** on dynamic binary translation, JIT
+  compilation, register allocation, and memory models.
+- **Permissively licensed code** — MIT, BSD, Apache-2.0, ISC, public domain —
+  used *with* its copyright notice and licence text retained. Attribution is not
+  optional just because the licence is easy.
+- **Real hardware.** Measuring a real console or PC is unimpeachable and often
+  more accurate than any secondary source.
+- **Black-box observation of any program, including GPL ones.** Running QEMU,
+  benchmarking it, comparing its output to ours, or diffing an execution trace
+  creates no derivative work. Using a GPL emulator as a *measuring instrument*
+  is fine; reading its source is not. Where this roadmap compares performance
+  against QEMU (§13), that is black-box benchmarking and nothing more.
+- **Our own code.** `../gones` is MIT (© Mark Karpelès), and the PPU/APU lineage
+  inside it derives from Michael Fogleman's MIT-licensed NES emulator. The
+  phase-4 port is therefore clean — but the Fogleman copyright notice travels
+  with that code and must be preserved in the ported files.
+
+### Facts versus expression
+
+The line that matters in practice: **hardware behaviour is fact, somebody's
+implementation of it is expression.** An opcode's cycle count taken from a
+datasheet is a fact and may be used freely. The same number copied out of a GPL
+emulator's timing table is expression you obtained from a forbidden source —
+even though the number is identical. Get facts from primary sources so the
+provenance question never arises.
+
+### Test corpora: run them, never vendor them
+
+Conformance suites and test ROMs carry their own licences, several of them
+copyleft (`kvm-unit-tests` is GPLv2), and some are of unclear provenance
+entirely. rsemu therefore **downloads test corpora at test time into an ignored
+directory and never commits them** (§12). *Executing* a GPL binary as an
+emulated guest is ordinary use and creates no derivative work; *shipping* it in
+our repository would be redistribution under its terms. Before vendoring any
+fixture — including `AccuracyCoin`, which `../gones` carries — confirm its
+licence explicitly.
+
+### Practical discipline
+
+1. **Cite the source** for any non-obvious algorithm, in the commit message or a
+   comment: which manual, which section. Provenance must be auditable years
+   later by someone who was not there.
+2. **Tool-generated code is subject to the same rule.** An AI assistant that
+   reproduces recognizable GPL code has not cleaned it. Origin is a property of
+   the code, not of the keyboard it arrived through.
+3. **Do not adopt another project's internal jargon** in our public API or
+   module names. It is bad naming in its own right, and it makes an
+   independently-written subsystem look derived when it is not.
+4. **No file is named after a forbidden project's file**, no comment is
+   translated from one, and no constant table is copied from one unless the
+   values are independently obtainable hardware facts (§1, above).
+5. When in doubt, ask before reading — not after.
+
+---
+
+## 2. What rsemu is when it's finished
 
 The framework is judged by the emulator it produces, so the product surface is
 specified here rather than discovered in the last phase.
@@ -86,7 +195,7 @@ $ rsemu debug q35.machine --gdb :1234               # gdbstub attached to the gu
 ```
 
 Save states, rewind, screenshots, VNC display, and the monitor console are
-properties of the framework (§3.5, §7), so every machine gets them the day it
+properties of the framework (§4.5, §8), so every machine gets them the day it
 exists — not once someone writes per-machine plumbing.
 
 ### The machine catalog
@@ -94,7 +203,7 @@ exists — not once someone writes per-machine plumbing.
 `machines/` ships description files as **data**: consoles, boards, and PC
 chipsets, each a readable file a user can copy and modify. Adding a machine
 that rsemu already has the components for requires no Rust and no rebuild.
-This is the test of whether §4 succeeded.
+This is the test of whether §5 succeeded.
 
 ### The library and the C ABI
 
@@ -105,7 +214,7 @@ bring-up tool — is a supported use, not a fork.
 
 ### Every phase ships a usable emulator
 
-The phase plan (§12) is ordered so that value lands long before the framework is
+The phase plan (§13) is ordered so that value lands long before the framework is
 "finished":
 
 | After | Someone can actually… |
@@ -122,7 +231,7 @@ starting low, and it is paid once.
 
 ---
 
-## 2. Crate shape
+## 3. Crate shape
 
 One crate, `rsemu`, with **one Cargo feature per component** — the `compcol`
 model, scaled up. A machine is then a feature set: `--features "cpu-mos6502,
@@ -167,15 +276,18 @@ sibling crates — those have the fewest inbound edges. Do not split `cpu/` or
 
 ---
 
-## 3. The generic core
+## 4. The generic core
 
 This is the part that must be right. Everything else is replaceable.
 
-### 3.1 Address spaces and memory
+### 4.1 Address spaces and memory
 
 The single most important abstraction. Modelled as a **region tree flattened
-into a dispatch table**, which is the design QEMU converged on after a decade of
-alternatives; it is worth adopting deliberately rather than rediscovering.
+into a dispatch table**: a tree because that is how real hardware composes
+(a chipset contains a bridge contains a device, each with its own window), and a
+flattened dispatch table because a tree walk per access would be ruinous. The
+tree is what the machine file describes and what a human reasons about; the flat
+view is a derived cache, rebuilt whenever the topology changes.
 
 ```rust
 pub trait MemOps: Send + Sync {
@@ -213,7 +325,7 @@ non-overlapping `FlatView`. Lookup is two-level: a page-granular dispatch table
 (dense `Vec` for the low 4 GiB, radix trie above) yields either a **host pointer
 + length** (the RAM fast path — no virtual call, no bounds walk) or a `FlatView`
 index (the slow path). Guest-virtual→host translation for CPUs with an MMU adds
-a per-CPU **softmmu TLB** in front of this (§8).
+a per-CPU **software TLB** in front of this (§9).
 
 *Note on gones.* The `memory.Bus` in `../gones` OR-combines the results of every
 handler mapped at an address and logs a "bus conflict". That is the correct
@@ -222,7 +334,7 @@ rsemu this becomes a per-container `CombinePolicy { Priority, WiredOr, WiredAnd,
 Conflict }` — the NES keeps its behaviour, everyone else gets deterministic
 priority.
 
-### 3.2 Time, clocks, and scheduling
+### 4.2 Time, clocks, and scheduling
 
 Generalizes the `../gones` master-clock-plus-dividers model — which is the right
 shape — to a clock domain tree with **two time bases**, because the two things
@@ -291,13 +403,13 @@ snapshot header: a snapshot taken under `exact` will not silently reload under
     quantum. Required for record/replay and the regression suite.
   - `parallel` — thread per CPU with a rendezvous barrier per quantum. Fast,
     non-deterministic, the default for interactive use.
-  - `accel` — CPUs run in hardware (§9); virtual time is slaved to the host
+  - `accel` — CPUs run in hardware (§10); virtual time is slaved to the host
     clock and the scheduler becomes a deadline service.
 - **Rate control.** `realtime` (throttle to wall clock, with catch-up limits and
   frame pacing), `unbounded` (as fast as possible), `fixed-ratio` (2× slow for
   debugging).
 
-### 3.3 Wires: interrupts and GPIO
+### 4.3 Wires: interrupts and GPIO
 
 ```rust
 pub trait WireSink: Send + Sync { fn set_level(&self, line: u32, level: Level); }
@@ -311,7 +423,7 @@ ordinary devices: `wire.split`, `wire.or`, `wire.and`, `wire.not`,
 line) are then just devices with wire sinks and sources — the core knows nothing
 about "interrupts".
 
-### 3.4 Devices, properties, registry
+### 4.4 Devices, properties, registry
 
 ```rust
 pub trait Device: Send + Sync {
@@ -342,7 +454,7 @@ pub trait Device: Send + Sync {
   `rsemu list-devices` / `rsemu describe pci.nvme` prints classes, properties,
   defaults and bus requirements, and the doc generator reads the same data.
 
-### 3.5 State: snapshots, replay, rewind
+### 4.5 State: snapshots, replay, rewind
 
 Built in phase 1, not bolted on later.
 
@@ -363,7 +475,7 @@ Built in phase 1, not bolted on later.
   reports, CI regression fixtures, and **rewind** (periodic snapshot + replay
   forward to an earlier point).
 
-### 3.6 Execution engines
+### 4.6 Execution engines
 
 The core does not know what a CPU *is* beyond:
 
@@ -377,12 +489,12 @@ pub trait Cpu: Device {
 ```
 
 A core may implement `run` by interpreting, by translating through the IR
-(§8), or by entering hardware (§9). The choice is a per-CPU config property
+(§9), or by entering hardware (§10). The choice is a per-CPU config property
 (`engine = "interp" | "jit" | "kvm"`), and **all engines for one guest
 architecture must agree instruction-for-instruction** — enforced by differential
-testing (§11), which is the only thing that keeps a JIT honest.
+testing (§12), which is the only thing that keeps a JIT honest.
 
-### 3.7 Concurrency: the `sync` seam and shared guest memory
+### 4.7 Concurrency: the `sync` seam and shared guest memory
 
 Threading is designed in at phase 1, not added at phase 8. Retrofitting
 `Send + Sync`, a shareable RAM store, and a safe-point protocol onto a core that
@@ -394,7 +506,7 @@ semantics; the other three must be invisible.
 
 | Axis | What runs in parallel | Guest-visible? |
 | --- | --- | --- |
-| **Multi-CPU execution** (MTTCG) | one thread per guest CPU | **Yes** — needs a memory model and safe points |
+| **Multi-CPU execution** (parallel translated execution) | one thread per guest CPU | **Yes** — needs a memory model and safe points |
 | **Background compilation** | JIT tier-up while the interpreter runs the same block | No |
 | **Device / host offload** | disk I/O, VNC encode, audio resample, snapshot compression | No, *provided* results land at a virtual time derived from the guest clock |
 | **Data-parallel helpers** | framebuffer conversion, hashing, `compcol` compression | No |
@@ -441,7 +553,7 @@ create an OS thread.
   wasm host), **the frontend lifter inserts the barriers** — the core provides
   the primitives, the lifter owns the ordering. Getting this wrong produces bugs
   that appear only under load on one host architecture, so it is a documented
-  per-frontend responsibility with its own test suite (§11).
+  per-frontend responsibility with its own test suite (§12).
 
 #### Safe points and stop-the-world
 
@@ -465,7 +577,7 @@ requester waits on the pool's barrier.
 
 ---
 
-## 4. The machine description language
+## 5. The machine description language
 
 The framework's user interface. It must express arbitrary graphs — including
 heterogeneous CPUs sharing memory, multiple disjoint address spaces, and
@@ -529,7 +641,7 @@ run. Errors carry file:line:col and a caret, always.
 
 ---
 
-## 5. CPU cores
+## 6. CPU cores
 
 Each core is a feature. The order below is chosen so that each one proves a
 *new mechanism* in the framework rather than adding another opcode table.
@@ -538,7 +650,7 @@ Each core is a feature. The order below is chosen so that each one proves a
 | --- | --- | --- |
 | **MOS 6502** (+ illegal opcodes, 2A03 variant) | Cycle-accurate interpretation, bus timing, the whole core is exercised end to end | 3 |
 | **SM83** (Game Boy) and **Z80** | That the framework is not 6502-shaped; different interrupt model, I/O space | 4 |
-| **RISC-V rv64gc** (+ rv32) | MMU/softmmu, privilege levels, atomics, FPU, and the IR/JIT path. Smallest ISA that boots real Linux | 5 |
+| **RISC-V rv64gc** (+ rv32) | MMU + software TLB, privilege levels, atomics, FPU, and the IR/JIT path. Smallest ISA that boots real Linux | 5 |
 | **x86**: i386 → x86-64 (real/protected/long mode, SSE) | The hard one: segmentation, variable-length decode, self-modifying code, paging quirks | 6 |
 | **ARM**: ARMv7-A, ARMv8-A AArch64 | Second major JIT frontend; validates IR generality | 6–8 |
 | Later: 68000, MIPS, PowerPC, SuperH, 8080, 65816, V850 | Breadth; each is a weekend once the IR is stable | post-8 |
@@ -548,7 +660,7 @@ frontend**, and the two are differentially tested against each other forever.
 
 ---
 
-## 6. Buses and devices
+## 7. Buses and devices
 
 Generic `Bus` trait (attach/detach, enumeration, address routing, hotplug),
 with concrete fabrics as features:
@@ -567,7 +679,7 @@ with concrete fabrics as features:
 - **Interrupt controllers, timers, RTC, DMA controllers, UARTs** — the
   unglamorous majority.
 
-### 6.1 Storage
+### 7.1 Storage
 
 **Largely solved by [`fstool`](https://github.com/KarpelesLab/fstool).** It
 already provides the `BlockDevice` trait (`Read + Write + Seek + Send`), file /
@@ -577,7 +689,7 @@ F2FS, littlefs, SquashFS and ISO9660. Emulated storage controllers sit directly
 on `fstool::BlockDevice` rather than on a parallel rsemu invention.
 
 What rsemu adds on top: the remaining image formats (`vmdk`, `vhdx`, `vdi`),
-copy-on-write overlays and image snapshots tied to machine snapshots (§3.5),
+copy-on-write overlays and image snapshots tied to machine snapshots (§4.5),
 discard/TRIM, and a write-back cache whose flush contract survives snapshotting.
 
 What this buys the user directly: `rsemu run --disk-from-dir ./rootfs` builds a
@@ -586,7 +698,7 @@ booting it; and CI fixtures generate their own FAT/ext4 boot media with no
 external tools and no `mkfs`. `fstool`'s `crash_inject` block device also gives
 guest-filesystem robustness testing for free.
 
-### 6.2 Networking
+### 7.2 Networking
 
 **Solved by `pktkit`.** Every emulated NIC (`e1000`, `rtl8139`, `virtio-net`,
 `ne2000`, …) is a `pktkit::L2Device`; the config then attaches it to a
@@ -596,7 +708,7 @@ project that most emulators have to write themselves.
 
 ---
 
-## 7. Host-facing layer (`host/`, std only)
+## 8. Host-facing layer (`host/`, std only)
 
 - **Display** — a framebuffer/scanout abstraction; guest surface → host window.
   Backends: raw framebuffer, X11/Wayland (reusing `x11anywhere` protocol work),
@@ -617,14 +729,19 @@ project that most emulators have to write themselves.
 
 ---
 
-## 8. The translation IR and JIT
+## 9. The translation IR and JIT
 
 The performance story. Design it once, correctly; every guest and every host
 pays for mistakes here.
 
-**IR shape** — TCG-like, deliberately: ~60 architecture-neutral ops over typed
-temporaries (`i32 i64 i128 f32 f64 v128`), SSA within a translation block,
-helper calls for anything messy (rare instructions, MMIO, exceptions).
+**IR shape** — deliberately small and low-level: ~60 architecture-neutral ops
+over typed temporaries (`i32 i64 i128 f32 f64 v128`), SSA within a translation
+block, helper calls for anything messy (rare instructions, MMIO, exceptions).
+The op set is chosen so that the *common* case of every target ISA lowers to one
+or two host instructions, and everything else becomes a helper call rather than
+a new op. Design it from the ISA manuals of the guests and hosts we target
+(§1) — the op list below is derived from what those instruction sets actually
+need, and it is short because breadth belongs in helpers.
 
 - Data: `mov ext trunc bswap deposit extract`
 - Arith: `add sub mul div rem neg`, `add2 sub2 mulu2 muls2` (carry chains)
@@ -641,22 +758,22 @@ propagation, dead-code elimination, liveness, memory-op fusion) → register
 allocation (linear scan) → host backend.
 
 **Backends.** `x86_64` first (the dev machine), then `aarch64` and `riscv64`,
-then **`wasm`** (§10.3) for the browser, plus a **portable IR interpreter
+then **`wasm`** (§11.3) for the browser, plus a **portable IR interpreter
 backend** so an unsupported host degrades in speed rather than failing to run.
 Native code buffers are W^X: `mmap` RW → emit → `mprotect` RX, via raw syscalls,
 no libc — the `purestd`/`kataan::jit` pattern. The wasm backend has no such
 buffer; it emits a module and instantiates it.
 
 **Compilation runs off the emulation thread.** Translation is submitted to the
-`core::sync` task pool (§3.7) while the interpreter keeps executing the same
+`core::sync` task pool (§4.7) while the interpreter keeps executing the same
 block; the compiled entry is published with a single atomic store. This is the
 cheapest large win in the whole JIT and it is only available if the core was
-`Send + Sync` from the start — which is the argument for §3.7 landing in
+`Send + Sync` from the start — which is the argument for §4.7 landing in
 phase 1.
 
 **The mechanisms that actually produce speed** (all in phase 5–8):
 
-1. **Softmmu TLB** — per-CPU, direct-mapped (4096 entries), split by access
+1. **Software TLB** — per-CPU, direct-mapped (4096 entries), split by access
    type, entry = `{ guest page tag, host addend | IO slot }`. The fast path is
    inlined into generated code: mask, compare, add, load. Everything else about
    the JIT is secondary to this.
@@ -669,12 +786,12 @@ phase 1.
 5. **Tier 2, feedback-driven** — hot loops get a second compile with better
    allocation and specialization on observed values. Mirrors the tiering already
    proven in `kataan`.
-6. **MTTCG** — parallel translated execution with a correct memory model
+6. **parallel translation** — parallel translated execution with a correct memory model
    (atomics lowered to host atomics, cross-CPU TLB shootdown).
 
 ---
 
-## 9. Hardware acceleration
+## 10. Hardware acceleration
 
 Two distinct meanings, both in scope, tracked separately.
 
@@ -697,7 +814,7 @@ a hard interface boundary; it must never become a build requirement.
 
 ---
 
-## 10. Execution targets: native and WebAssembly
+## 11. Execution targets: native and WebAssembly
 
 rsemu runs natively **and in a browser**. The browser is not a stunt target: it
 is the distribution mechanism that needs no install, the demo that makes the
@@ -719,21 +836,21 @@ every commit is a target that does not work; wasm rots faster than anything else
 | `wasm32-wasip1` | `single` (threads when the host offers them) | wasm JIT or IR interpreter | WASI `clock_time_get` | WASI preview-1 fs |
 | bare metal `no_std` | `single` | IR interpreter | board timer | none |
 
-### 10.1 The browser, with threads
+### 11.1 The browser, with threads
 
 Requires cross-origin isolation (COOP/COEP) for `SharedArrayBuffer`. The JS shim
 creates the worker pool and the shared `WebAssembly.Memory` up front and hands
 both to rsemu — which is exactly why the `sync` seam exposes a pool rather than
-`spawn` (§3.7).
+`spawn` (§4.7).
 
 - **Emulation never runs on the main thread.** `Atomics.wait` is forbidden
   there, and a blocked main thread freezes the page. The main thread does
   display and input only; it talks to the emulation worker through lock-free
   ring buffers in shared memory.
 - Guest RAM lives in the shared linear memory, so worker threads and generated
-  code address it with the same offsets they would natively (§3.7).
+  code address it with the same offsets they would natively (§4.7).
 
-### 10.2 The browser, without threads
+### 11.2 The browser, without threads
 
 COOP/COEP is often unavailable (a GitHub Pages default, an embedded iframe, a
 corporate proxy), so **this configuration must work, not merely compile**: the
@@ -742,13 +859,13 @@ corporate proxy), so **this configuration must work, not merely compile**: the
 round-robined cooperatively, which is the same code path the deterministic test
 runner uses — it gets exercised constantly rather than only in demos.
 
-### 10.3 The JIT without `mmap`
+### 11.3 The JIT without `mmap`
 
 wasm has no writable-then-executable memory, so the native code path is simply
 unavailable. **The JIT emits WebAssembly instead**: IR → wasm bytecode module →
 `WebAssembly.Module` (synchronous instantiation is permitted inside a worker) →
 dispatched through a function table. This is a real backend alongside `x86_64`
-/`aarch64`/`riscv64` (§8), and it is cheap to build precisely because the IR
+/`aarch64`/`riscv64` (§9), and it is cheap to build precisely because the IR
 already exists — a translation block is a wasm function, guest RAM is the shared
 linear memory, and helper calls are imports.
 
@@ -757,23 +874,23 @@ so the wasm backend only tiers up superblocks; module count is bounded with an
 LRU eviction of cold code; and the portable IR interpreter is always the
 fallback, so a browser with no `WebAssembly.Module` budget still runs.
 
-### 10.4 Host imports
+### 11.4 Host imports
 
 Follows `purecrypto`'s browser convention — an embedder-supplied import object,
 not a bundled JS runtime: `rsemu.now`, `rsemu.random_get`, `rsemu.compile`
 (bytes → module handle), `rsemu.log`. Under WASI the same functions bind to
 preview-1 imports instead. Nothing else crosses the boundary.
 
-### 10.5 What determinism buys here
+### 11.5 What determinism buys here
 
 Virtual time is computed entirely inside the emulator, so a deterministic run
 produces the *same state hash in a browser as on a Linux host*. A user can
 record a session in the browser demo, attach the trace to a bug report, and it
 replays bit-identically under a native debugger. That is a genuinely unusual
 property and it falls straight out of §0 — but only if nothing in `core/` ever
-reads the host clock (§14).
+reads the host clock (§15).
 
-### 10.6 Deliverable
+### 11.6 Deliverable
 
 A static browser demo page — the `fstool` `web/` + GitHub Pages pattern —
 shipping from phase 3: load a ROM, play it, take a save state, all client-side
@@ -781,7 +898,7 @@ with nothing uploaded.
 
 ---
 
-## 11. Validation
+## 12. Validation
 
 The credibility of the whole project. Each core lands *with* its suite.
 
@@ -794,7 +911,7 @@ The credibility of the whole project. Each core lands *with* its suite.
 | ARM | SingleStepTests ARM7TDMI, Linux boot on `virt` |
 | Framework | Snapshot round-trip identity per device; replay determinism; region-priority/alias unit matrix; DSL parser corpus incl. error-message goldens |
 | Threading | Identical state hash under `single` / `native-std` / `wasm-atomics`; safe-point protocol under stress; ranked-lock-order assertions; guest-atomics conformance per frontend (a TSO guest on a weakly-ordered host is the case that finds the bugs) |
-| Targets | Every row of §10 built in CI; the browser build runs the machine-level regression suite headlessly under both threaded and non-threaded configurations |
+| Targets | Every row of §11 built in CI; the browser build runs the machine-level regression suite headlessly under both threaded and non-threaded configurations |
 | Cross-cutting | **Differential**: interpreter vs JIT vs accel on randomized instruction streams; **fuzzing** (`fuzz/`) on the DSL parser, disk-image parsers, and every MMIO surface |
 
 Machine-level regression: run a machine deterministically for N virtual seconds
@@ -803,10 +920,10 @@ catches nearly everything.
 
 ---
 
-## 12. Phase plan
+## 13. Phase plan
 
 Each phase ends in something that **runs and is measured**, and from phase 3
-onward in something a person can *use* (§1). No phase is "framework only" —
+onward in something a person can *use* (§2). No phase is "framework only" —
 generic code with no consumer is generic code that is wrong, and a framework
 that never becomes an emulator was never validated.
 
@@ -816,7 +933,7 @@ Repo skeleton, `Cargo.toml` feature scaffold, `CLAUDE.md` design rules, CI
 `LICENSE`, dependency-policy check (`cargo tree` on default features must show
 only `rsemu`), and the **full target matrix in CI from the first commit** —
 native, `no_std`, `wasm32-unknown-unknown` with and without threads,
-`wasm32-wasip1` (§10).
+`wasm32-wasip1` (§11).
 **Gate:** CI green on an empty crate across every target; policy check in place
 and enforced. Adding wasm on day one costs an afternoon; adding it at phase 6
 costs a refactor of everything.
@@ -853,7 +970,7 @@ NES PPU/APU/mappers/input, ported from `../gones` onto the generic core.
 **Gate:** SingleStepTests 65x02 100 %; `nestest.log` trace-identical; blargg
 `cpu_instrs` + `instr_timing` pass; AccuracyCoin passes; a real game runs at
 60 fps with a headless frame-hash regression; the whole machine is one
-`.machine` file; and it runs **in a browser** from the demo page (§10.6),
+`.machine` file; and it runs **in a browser** from the demo page (§11.6),
 threaded and non-threaded, with the same frame hashes as the native build.
 **This is the phase that proves the framework — expect to change core APIs here,
 and do it now rather than later.**
@@ -865,8 +982,8 @@ core API may need to change to accommodate these** — if one does, it was a
 phase-1 design bug and the fix belongs in the core, not the board.
 
 ### Phase 5 — IR, JIT, and the first real OS
-IR + verifier + passes, x86-64 backend, **wasm backend** (§10.3), portable
-interpreter backend, **background compilation on the task pool**, softmmu TLB,
+IR + verifier + passes, x86-64 backend, **wasm backend** (§11.3), portable
+interpreter backend, **background compilation on the task pool**, software TLB,
 TB cache + chaining, SMC detection. RISC-V rv64gc frontend + interpreter.
 `virt` machine: CLINT, PLIC, 16550 UART, virtio-mmio (blk, net via `pktkit`).
 **Gate:** boots an upstream Linux kernel to a shell prompt; `riscv-arch-test`
@@ -890,10 +1007,11 @@ under the JIT and vice versa; near-native CPU benchmark on an accelerated guest.
 
 ### Phase 8 — Performance
 Superblocks, cross-block guest-register allocation, tier-2 feedback-driven
-recompilation, `aarch64` + `riscv64` backends, **MTTCG on both native threads
+recompilation, `aarch64` + `riscv64` backends, **Parallel translated execution on both native threads
 and wasm workers** with a correct memory model, memory-op fusion.
 **Gate:** published benchmark suite; within a stated factor of QEMU on the same
-workloads; MTTCG passes a stress suite (`kvm-unit-tests` atomics/barriers) with
+workloads (**black-box comparison only** — running it as a measuring
+instrument, never reading it, §1); Parallel execution passes a stress suite (`kvm-unit-tests` atomics/barriers) with
 no memory-model violations, on native threads *and* in a threaded browser build.
 
 ### Phase 9 — Frontends, remote, and debugging depth
@@ -909,7 +1027,7 @@ the known-failures ledger; and the machine library under `machines/`.
 
 ---
 
-## 13. Reused Karpelès Lab crates
+## 14. Reused Karpelès Lab crates
 
 | Crate | Used for | Feature-gated |
 | --- | --- | --- |
@@ -925,7 +1043,7 @@ the known-failures ledger; and the machine library under `machines/`.
 
 ---
 
-## 14. Design invariants to hold under pressure
+## 15. Design invariants to hold under pressure
 
 Recorded here because each will be tempting to violate around phase 5–6.
 
@@ -954,17 +1072,18 @@ Recorded here because each will be tempting to violate around phase 5–6.
 
 ---
 
-## 15. Known risks
+## 16. Known risks
 
-- **Scope.** This is a decade-scale project measured against QEMU. The phase
+- **Scope.** This is a decade-scale project whose yardstick — measured
+  black-box, per §1 — is QEMU. The phase
   gates exist so that value lands early: phase 3 is a shippable NES emulator,
   phase 5 a shippable RISC-V VM, phase 6 a shippable PC emulator.
 - **Compile time** at `--all-features` in one crate. Mitigated by the feature
-  discipline; escape hatch in §2.
+  discipline; escape hatch in §3.
 - **The purity rule vs. the host.** GPU, HVF, and WHPX cannot be reached without
   foreign code. The answer is explicit, labelled opt-in features — never a
   silent compromise.
-- **Determinism vs. MTTCG.** Parallel translated execution is fundamentally at
+- **Determinism vs. parallel translation.** Parallel translated execution is fundamentally at
   odds with bit-reproducibility. Resolution: they are different modes; the
   regression suite only ever runs deterministic mode.
 - **Cross-origin isolation.** The threaded browser build needs COOP/COEP, which
@@ -978,7 +1097,7 @@ Recorded here because each will be tempting to violate around phase 5–6.
 - **Guest memory models.** A TSO guest on a weakly-ordered host is where
   parallel emulation goes wrong, and the failures are load-dependent and
   host-specific. This is why the barrier responsibility is pinned to the
-  frontend lifter with its own suite (§11) rather than left implicit.
+  frontend lifter with its own suite (§12) rather than left implicit.
 - **x86 is a tar pit.** Segmentation, SMC, and the paging corner cases have
   consumed larger teams. Phase 6 is the long one; treat its estimate with
   suspicion.

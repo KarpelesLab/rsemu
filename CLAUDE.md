@@ -4,6 +4,41 @@ Read this before writing any code. [`ROADMAP.md`](ROADMAP.md) is the *what* and
 the phase order; this file is the *how*. Where the two disagree, the roadmap's
 non-negotiables (§0) win.
 
+## Provenance — the rule that outranks every other rule
+
+rsemu is MIT. **MIT code can never absorb GPL'd code**, and no amount of
+paraphrasing changes that. Taint is not fixable by deleting a file afterwards:
+the history and everything derived from it are contaminated.
+
+- **Never open the QEMU source tree.** Not the code, not the headers, not the
+  comments, not the commit messages, not the mailing list, not anything derived
+  from it (Unicorn Engine, forks, vendored copies). "Just to see how they did
+  it" is precisely the forbidden act.
+- Same for every other copyleft source — GPL, LGPL, AGPL, SSPL, CDDL. Bochs,
+  DOSBox, MAME, VICE, Dolphin, PCSX2, Nestopia, higan are all off limits.
+  **Check a project's licence before opening it.** LGPL permits linking, not
+  copying source into an MIT crate.
+- **Work from hardware documentation**: datasheets, ISA manuals, the NESdev
+  wiki, Pan Docs, service manuals, papers. These describe the machine we are
+  emulating rather than someone's emulation of it, and they are better sources
+  anyway.
+- **Permissive code is fine with attribution** (MIT/BSD/Apache/ISC). `../gones`
+  is ours and MIT; its PPU/APU lineage is Michael Fogleman's MIT emulator —
+  carry his copyright notice into any ported file.
+- **Black-box use of a GPL program is fine.** Run it, benchmark it, diff its
+  trace. Reading its source is not.
+- **Hardware behaviour is fact; an implementation of it is expression.** A cycle
+  count from a datasheet is free. The identical number lifted from a GPL
+  emulator's table is not.
+- **Cite your source** for any non-obvious algorithm — which manual, which
+  section — in the commit message or a comment.
+- This applies to tool-generated code. Origin is a property of the code, not of
+  how it reached the editor.
+- If you have previously read forbidden source for a subsystem, say so and let
+  someone else write it. That is hygiene, not blame.
+
+Roadmap §1 has the long form. When in doubt, ask **before** reading.
+
 ## Crate shape
 
 - One crate, `rsemu`. Every component is a Cargo **feature**, not a separate
@@ -134,6 +169,10 @@ non-negotiables (§0) win.
   the final state hash and periodic framebuffer hashes.
 - Conformance corpora are downloaded by a script into an ignored directory and
   gated behind an env var — never committed, never required for `cargo test`.
+  This is a licensing rule as much as a size one: several suites are copyleft
+  (`kvm-unit-tests` is GPLv2). Running a GPL binary as an emulated guest is
+  ordinary use; shipping it in our repo is redistribution under its terms.
+  Confirm the licence of any fixture before vendoring it.
 - `fuzz/` targets for the `.machine` parser, disk-image parsers, and every MMIO
   surface.
 
