@@ -19,7 +19,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -29,7 +29,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -44,7 +44,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all-features
@@ -56,7 +56,7 @@ jobs:
     name: MSRV (1.88)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Pinned so the rust-version in Cargo.toml is a checked claim rather than
       # a comment that drifts.
       - uses: dtolnay/rust-toolchain@1.88.0
@@ -67,7 +67,7 @@ jobs:
     name: no_std core
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # The emulation core must never depend on std (ROADMAP.md §0). A std leak
@@ -79,7 +79,7 @@ jobs:
     name: feature sweep
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Cargo features are additive-only, so a component that silently needs a
@@ -97,7 +97,7 @@ jobs:
     name: dependency policy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       # The default build pulls in nothing at all (ROADMAP.md §0). Permitted
       # dependencies are first-party and feature-gated; this asserts the floor.
@@ -119,7 +119,7 @@ jobs:
       matrix:
         target: [wasm32-unknown-unknown, wasm32-wasip1, wasm32-wasip1-threads]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -171,7 +171,7 @@ jobs:
           if-no-files-found: error
 
   wasm-threads-browser:
-    name: wasm threads, browser (nightly)
+    name: wasm threads, browser (nightly, advisory)
     runs-on: ubuntu-latest
     # The project's ONLY nightly job, and the only one allowed to break on a
     # toolchain bump. Threaded wasm32-unknown-unknown cannot be built on stable:
@@ -180,8 +180,13 @@ jobs:
     # artifact comes from here — wasm32-wasip1-threads above is the stable
     # threaded target CI actually gates on. See ROADMAP.md §11.1.
     continue-on-error: true
+    env:
+      # rust-toolchain.toml pins `stable`, and that file beats whatever the
+      # toolchain action installs — so without this the "nightly" job runs
+      # stable cargo and -Z is rejected. RUSTUP_TOOLCHAIN overrides the file.
+      RUSTUP_TOOLCHAIN: nightly
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: wasm32-unknown-unknown
@@ -189,6 +194,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: build with shared memory
         env:
+          # Replaces the workflow-wide `-D warnings` on purpose: `+atomics` is
+          # an unstable target feature and warns, which would otherwise fail
+          # the build for saying exactly what we asked it to do.
           RUSTFLAGS: >-
             -C target-feature=+atomics,+bulk-memory,+mutable-globals
             -C link-arg=--shared-memory
@@ -197,3 +205,27 @@ jobs:
           cargo rustc -Z build-std=std,panic_abort \
             --crate-type cdylib --target wasm32-unknown-unknown \
             --no-default-features --features wasm --release
+      - name: assert the memory is actually shared
+        # Without this the job can pass while producing an ordinary
+        # single-threaded module — which would make it prove nothing at all.
+        run: |
+          python3 - <<'PY'
+          import sys
+          d = open('target/wasm32-unknown-unknown/release/rsemu.wasm','rb').read()
+          def uleb(d, i):
+              r = s = 0
+              while True:
+                  b = d[i]; i += 1; r |= (b & 0x7f) << s; s += 7
+                  if not b & 0x80: return r, i
+          i, shared = 8, None
+          while i < len(d):
+              sid = d[i]; i += 1
+              size, i = uleb(d, i); end = i + size
+              if sid == 5:
+                  _, j = uleb(d, i)
+                  shared = bool(d[j] & 0x02)
+              i = end
+          print('shared memory:', shared)
+          if not shared:
+              sys.exit('memory section is not shared - threads would not work')
+          PY
