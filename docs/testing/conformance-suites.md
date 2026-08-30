@@ -17,6 +17,14 @@ never committed** (`CLAUDE.md`, Testing). Two independent reasons:
 The suites are gated behind an environment variable so `cargo test` works
 offline with no corpus present.
 
+## Running them
+
+[`README.md`](README.md) in this directory is the operating manual: the fetch
+script, the environment variables, the bring-up order, and what each gate
+requires. The harness itself is [`tests/conformance/`](../../tests/conformance),
+and three of the suites below have runners today — SingleStepTests 65x02,
+`nestest`, and AccuracyCoin.
+
 ## Licences — verified
 
 Checked against each project's own licence file. **Re-verify before vendoring

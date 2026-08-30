@@ -95,7 +95,10 @@ the question never arises.
 ### Testing
 | | |
 | --- | --- |
+| [`testing/README.md`](testing/README.md) | How to run each suite, the bring-up order, and what each gate requires |
 | [`testing/conformance-suites.md`](testing/conformance-suites.md) | Every suite, **with its licence** and whether it may be vendored |
+| [`testing/cpu-interface.md`](testing/cpu-interface.md) | The four methods a 6502 core must expose for the harness to drive it |
+| [`testing/accuracycoin.md`](testing/accuracycoin.md) | Reading AccuracyCoin's 125 results out of RAM with no screen and no controller |
 
 ## Deliberately excluded
 

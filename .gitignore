@@ -5,3 +5,8 @@
 /.claude/
 docs/local/
 web/*.wasm
+# Conformance corpora, fetched by scripts/fetch-testdata.sh. Never committed:
+# several suites are copyleft or unlicensed, and running one as an emulated
+# guest is ordinary use while shipping it here is redistribution.
+# docs/testing/conformance-suites.md has the verified licence table.
+/testdata/
