@@ -11,6 +11,7 @@
 //! | Module | Feature | Covers |
 //! | --- | --- | --- |
 //! | [`spi`] | `bus-spi` | SPI: chip selects, the four modes, word size, bit order, full duplex — modelled transactionally *or* as clocked wires |
+//! | [`usb`] | `bus-usb` | USB: devices, endpoints, the four transfer types, descriptors, enumeration, speeds and ports — controller-agnostic |
 //!
 //! Everything here is `no_std + alloc` and names no host facility.
 //!
@@ -45,3 +46,7 @@
 #[cfg(feature = "bus-spi")]
 #[cfg_attr(docsrs, doc(cfg(feature = "bus-spi")))]
 pub mod spi;
+
+#[cfg(feature = "bus-usb")]
+#[cfg_attr(docsrs, doc(cfg(feature = "bus-usb")))]
+pub mod usb;

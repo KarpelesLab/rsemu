@@ -361,6 +361,12 @@ pub fn registry() -> Result<Registry> {
     crate::dev::sitronix::register(&mut reg)?;
     #[cfg(feature = "dev-lcdc")]
     crate::dev::lcd::register(&mut reg)?;
+    #[cfg(any(
+        feature = "dev-usb-ehci",
+        feature = "dev-usb-chipidea",
+        feature = "dev-usb-hid"
+    ))]
+    crate::dev::usb::register(&mut reg)?;
     Ok(reg)
 }
 
@@ -428,6 +434,12 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::sitronix::bind(&mut b)?;
     #[cfg(feature = "dev-lcdc")]
     crate::dev::lcd::bind(&mut b)?;
+    #[cfg(any(
+        feature = "dev-usb-ehci",
+        feature = "dev-usb-chipidea",
+        feature = "dev-usb-hid"
+    ))]
+    crate::dev::usb::bind(&mut b)?;
     Ok(b)
 }
 
@@ -500,6 +512,14 @@ pub fn classes() -> ClassTable {
     }
     #[cfg(feature = "dev-lcdc")]
     for schema in crate::dev::lcd::schemas() {
+        table.insert(schema);
+    }
+    #[cfg(any(
+        feature = "dev-usb-ehci",
+        feature = "dev-usb-chipidea",
+        feature = "dev-usb-hid"
+    ))]
+    for schema in crate::dev::usb::schemas() {
         table.insert(schema);
     }
     table
