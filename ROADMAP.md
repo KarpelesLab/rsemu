@@ -54,9 +54,11 @@ something a person can actually run (§2).
 > named piece of hardware. Also `gameboy`; `apple1` and `beneater-6502`,
 > interactive over a terminal; and `riscv-virt`, which is the one that boots
 > real system software: **OpenSBI 1.6 completely**, on a device tree generated
-> from the realized machine rather than shipped, then **Linux 6.12 as far as
-> `asids_init`** and **EDK2 to the end of the DXE dispatcher**. Where each stops
-> is written down, not rounded up. `pc-at` — a complete PC/AT chipset with a
+> from the realized machine rather than shipped, then **Linux 6.12 all the way
+> to `prepare_namespace`** — every initcall, the driver model, and the console
+> handover off the SBI earlycon onto our own 16550A — where it panics for want
+> of a root filesystem nobody supplied, and **EDK2 to the end of the DXE
+> dispatcher**. Where each stops is written down, not rounded up. `pc-at` — a complete PC/AT chipset with a
 > user-supplied BIOS path — is now **in the catalog**: every CPU core in the
 > tree is bindable from a `.machine` file, so the asymmetry that held it out is
 > gone.

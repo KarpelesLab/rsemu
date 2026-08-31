@@ -114,6 +114,13 @@ struct Scheme {
     pte_bytes: u32,
     /// How many bits of the virtual address are significant.
     va_bits: u32,
+    /// How wide a physical page number is, in both `satp` and a PTE.
+    ///
+    /// This is a *field width*, and reading it as anything wider silently
+    /// folds the neighbouring field into the address: in `satp` the neighbour
+    /// is `ASID`, and software probes `ASID`'s width by writing all ones to
+    /// it (Volume II, "Supervisor Address Translation and Protection").
+    ppn_bits: u32,
 }
 
 /// Sv32: two levels of 10-bit indices over a 32-bit address space.
@@ -122,6 +129,7 @@ const SV32: Scheme = Scheme {
     vpn_bits: 10,
     pte_bytes: 4,
     va_bits: 32,
+    ppn_bits: 22,
 };
 
 /// Sv39: three levels of 9-bit indices over a 39-bit sign-extended address
@@ -131,7 +139,21 @@ const SV39: Scheme = Scheme {
     vpn_bits: 9,
     pte_bytes: 8,
     va_bits: 39,
+    ppn_bits: 44,
 };
+
+/// The translation scheme this `XLEN` walks.
+const fn scheme(xlen: Xlen) -> &'static Scheme {
+    match xlen {
+        Xlen::Rv32 => &SV32,
+        Xlen::Rv64 => &SV39,
+    }
+}
+
+/// A mask of the low `bits` bits.
+const fn mask(bits: u32) -> u64 {
+    (1u64 << bits) - 1
+}
 
 /// Whether address translation is switched on for `mode`.
 ///
@@ -159,12 +181,14 @@ pub fn asid(csrs: &Csrs) -> u64 {
 }
 
 /// The root page table's physical address.
+///
+/// `satp.PPN` is 22 bits under Sv32 and **44** under Sv39; `ASID` sits
+/// directly above it. Masking wider than the field moves the root page table
+/// the moment a guest writes a non-zero `ASID` — which every Linux kernel
+/// does at boot, writing all ones to discover how many `ASID` bits the
+/// hardware implements.
 fn root(csrs: &Csrs) -> u64 {
-    let ppn = match csrs.xlen {
-        Xlen::Rv32 => csrs.satp & 0x3f_ffff,
-        Xlen::Rv64 => csrs.satp & 0xf_ffff_ffff_ffff,
-    };
-    ppn << PAGE_BITS
+    (csrs.satp & mask(scheme(csrs.xlen).ppn_bits)) << PAGE_BITS
 }
 
 /// Translate a virtual address, walking the page tables.
@@ -187,10 +211,7 @@ pub fn translate<M: PhysMem>(
     if !translation_active(csrs, mode) {
         return Ok(addr);
     }
-    let s = match csrs.xlen {
-        Xlen::Rv32 => &SV32,
-        Xlen::Rv64 => &SV39,
-    };
+    let s = scheme(csrs.xlen);
     // Sv39 requires bits 63:39 of the virtual address to be a sign extension
     // of bit 38. An address that is not is not merely unmapped, it is
     // malformed, and faults without a walk.
@@ -220,7 +241,16 @@ pub fn translate<M: PhysMem>(
             // Invalid, or the reserved write-without-read encoding.
             return Err(Fault::Page);
         }
-        let ppn = pte >> 10;
+        // A PTE's `PPN` is the same width as `satp`'s, and everything above it
+        // is reserved: bits 63:54 of an Sv39 PTE belong to `N` (Svnapot) and
+        // `PBMT` (Svpbmt), neither of which this core implements. Volume II
+        // says a guest must leave a reserved bit zero and that setting one
+        // raises a page fault, so this refuses rather than translating with a
+        // physical address that has a reserved bit folded into it.
+        if csrs.xlen == Xlen::Rv64 && pte >> (10 + s.ppn_bits) != 0 {
+            return Err(Fault::Page);
+        }
+        let ppn = (pte >> 10) & mask(s.ppn_bits);
         if pte & (pte::R | pte::X) == 0 {
             // A pointer to the next level down.
             if level == 0 {
@@ -797,6 +827,60 @@ mod tests {
             tlb.lookup(Access::Load, 0x1234, 7, Priv::Supervisor, 3),
             None
         );
+    }
+
+    #[test]
+    fn a_non_zero_asid_does_not_move_the_root_page_table() {
+        // How Linux discovers ASIDLEN, and the shape that found this bug:
+        // write all ones to `satp.ASID`, read back which bits stuck. Volume
+        // II makes `ASID` a separate field from `PPN`, so a walk under an
+        // all-ones ASID must reach exactly the same leaf.
+        let (mut csrs, mut ram) = sv39_machine(pte::R | pte::A);
+        let bare = translate(&csrs, &mut ram, 0x0123, Access::Load, Priv::Supervisor);
+        assert_eq!(bare, Ok(0x4123));
+        csrs.satp |= 0xffff << 44;
+        assert_eq!(root(&csrs), 0x1000, "ASID is not part of the root address");
+        assert_eq!(
+            translate(&csrs, &mut ram, 0x0123, Access::Load, Priv::Supervisor),
+            bare,
+            "an all-ones ASID must not move the page tables"
+        );
+    }
+
+    #[test]
+    fn every_asid_bit_sticks_and_none_of_them_reaches_the_ppn() {
+        // `satp.ASID` is WARL and this core implements all of it: 16 bits
+        // under Sv39, 9 under Sv32. Software probes the width by writing ones
+        // and reading back, so what sticks here is what a guest believes.
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
+        csrs.write(num::SATP, (8 << 60) | (0xffff << 44) | 0x81fcb, 0)
+            .unwrap();
+        assert_eq!(asid(&csrs), 0xffff);
+        assert_eq!(root(&csrs), 0x81fcb << 12);
+
+        let mut csrs = Csrs::new(Xlen::Rv32, Extensions::GC, 0, PMP_ENTRIES);
+        csrs.write(num::SATP, (1 << 31) | (0x1ff << 22) | 0x123, 0)
+            .unwrap();
+        assert_eq!(asid(&csrs), 0x1ff);
+        assert_eq!(root(&csrs), 0x123 << 12);
+    }
+
+    #[test]
+    fn a_reserved_pte_bit_faults_rather_than_moving_the_page() {
+        // Bits 63:54 of an Sv39 PTE are `N` and `PBMT` and the reserved space
+        // between them. This core implements neither Svnapot nor Svpbmt, and
+        // Volume II says a guest that sets one of those bits takes a page
+        // fault — never a translation with the bit folded into the address.
+        for bit in [54, 61, 62, 63] {
+            let (csrs, mut ram) = sv39_machine(pte::R | pte::A);
+            let leaf = ram.read_pte(0x3000, 8).unwrap();
+            ram.write_pte(0x3000, 8, leaf | (1 << bit)).unwrap();
+            assert_eq!(
+                translate(&csrs, &mut ram, 0, Access::Load, Priv::Supervisor),
+                Err(Fault::Page),
+                "bit {bit} is reserved"
+            );
+        }
     }
 
     #[test]
