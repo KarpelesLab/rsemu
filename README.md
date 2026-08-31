@@ -60,20 +60,28 @@ one snapshot format, one debugger, shared by every machine ever added.
 
 Early, but it runs things.
 
-**Five CPU cores**, each with a conformance number that was measured rather
-than claimed:
+**Eight CPU cores.** Where a public corpus exists the number is measured, not
+claimed; where one does not, the row says what stands in for it rather than
+quietly leaving the impression of a number.
 
 | Core | Suite | Result |
 | --- | --- | --- |
 | MOS 6502 / RP2A03 | SingleStepTests 65x02 | **2,560,000 / 2,560,000** incl. bus traces |
+| WDC 65C02S | SingleStepTests 65x02 | **2,530,025 / 2,540,000** |
 | Zilog Z80 | SingleStepTests z80, zexall | **1,604,000 / 1,604,000**, 67/67 |
 | RISC-V RV64GC | riscv-tests | **409 / 409** |
 | Intel 8086/8088 | SingleStepTests 8088 | **2,974,160 / 3,007,000** |
-| ARMv5TE | — | no public v5 corpus exists |
+| Motorola 68000 | SingleStepTests 680x0 | runner in-tree; fetch the corpus to reproduce |
+| Sharp SM83 (Game Boy) | blargg, mooneye | `cpu_instrs` 11/11; mooneye acceptance 22/66 |
+| ARMv5TE | ARM7TDMI corpus (v4T subset) | no public v5 corpus exists — see §12 |
+| ARMv7E-M | differential vs. our own ARMv5TE | 83,597 encodings identical, 13,683 divergences *asserted* |
 
-**Three machines you can run.** `nes-ntsc` and `nes-pal` boot a cartridge,
-raise NMI and render — AccuracyCoin draws its menu. `apple1` is interactive
-over your terminal:
+Every corpus is fetched by `scripts/fetch-testdata.sh`, never vendored, and
+gated behind an environment variable — a licensing rule as much as a size one.
+
+**Six machines you can run.** `nes-ntsc` and `nes-pal` boot a cartridge, raise
+NMI and render — AccuracyCoin draws its menu. `gameboy` runs blargg's suite.
+`beneater-6502` and `apple1` are interactive over your terminal:
 
 ```console
 $ cargo run --features machine-apple1 -- run apple1
@@ -82,13 +90,29 @@ RSMON
 FF00: D8 A2 FF 9A A9 7F 8D 12
 ```
 
+`riscv-virt` is the one that boots real system software. OpenSBI 1.6 runs
+completely on a device tree **generated from the realized machine** — addresses
+from the actual mappings, interrupt numbers from the wire graph — and Linux
+6.12 riscv64 gets as far as `asids_init`. EDK2/UEFI reaches the end of the DXE
+dispatcher. Neither reaches a shell yet; where each stops is written down in
+`docs/platforms/riscv-virt.md` rather than rounded up.
+
+A seventh, `pc-at`, is a complete IBM PC/AT chipset — cascaded 8259As, 8254,
+MC146818, 8042, two 8237As, MC6845/VGA text mode, µPD765A — with a
+user-supplied BIOS path in the QEMU style (`--bios`, `--vgabios`). It ships as
+data and is exercised by integration tests rather than being in the catalog,
+because the 8086 core is not yet bindable into a machine file.
+
 The framework underneath is complete: address spaces with priority and
 mirroring, an oscillator forest with exact intra-tree ratios, wires, devices,
-snapshots, and a `.machine` description language that goes parse → resolve →
-validate → realize → run.
+snapshots, a typed export seam so one device can hand another a handle, and a
+`.machine` description language that goes parse → resolve → validate → realize
+→ run. There is a **gdb stub** (`rsemu debug apple1 --gdb :1234`) and a
+**browser build** at <https://karpeleslab.github.io/rsemu/>.
 
-Not started: the IR and JIT (so everything is interpreted), hardware
-acceleration, and the PC. See [`ROADMAP.md`](ROADMAP.md).
+Not started: the IR and JIT, so everything is interpreted; hardware
+acceleration; and i386 protected mode, without which no stock PC BIOS runs. See
+[`ROADMAP.md`](ROADMAP.md).
 
 ## Build
 
@@ -104,10 +128,15 @@ WebAssembly — no `wasm-bindgen`; the module is instantiated directly and
 strings cross as a pointer/length pair read from exported memory:
 
 ```sh
+# the minimal module: the ABI boundary and nothing else
 cargo rustc --crate-type cdylib --target wasm32-unknown-unknown \
     --no-default-features --features wasm --release
-cp target/wasm32-unknown-unknown/release/rsemu.wasm web/
-python3 -m http.server -d web 8080     # then open http://localhost:8080/
+
+# the demo the browser page runs — adds the machines it offers
+cargo rustc --crate-type cdylib --target wasm32-unknown-unknown \
+    --no-default-features --features demo --release
+cp target/wasm32-unknown-unknown/release/rsemu.wasm web/public/
+cd web && npm ci && npm run build && python3 -m http.server -d dist 8080
 ```
 
 See [`web/README.md`](web/README.md). MSRV is 1.88, pinned by a CI job so it

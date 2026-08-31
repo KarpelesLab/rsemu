@@ -21,30 +21,51 @@ This roadmap defines the architecture, the phase order, and the acceptance gate
 for each phase. It is written to be executed top-to-bottom; every phase ships
 something a person can actually run (§2).
 
-> **Status (2026-08-31).** Phases 0-2 are done and phase 3 is most of the way
-> there. ~88k lines, 1,223 tests, one crate in `cargo tree`, `unsafe` confined
-> to two of the six sanctioned sites.
+> **Status (2026-08-31).** Phases 0-3 are done and phase 4 is well under way.
+> ~160k lines, 1,965 tests, one crate in `cargo tree`, `unsafe` still confined
+> to two of the six sanctioned sites (`core::sync`'s `single` backend and the
+> wasm C ABI).
 >
-> **Five CPU cores**, each with an independently-run conformance number rather
-> than an assertion: MOS 6502 **2,560,000/2,560,000** (with full bus traces),
-> Z80 **1,604,000/1,604,000** plus `zexall` 67/67, RISC-V RV64GC **409/409**,
-> 8086/8088 **2,974,160/3,007,000** (the gap is one microcode residue in the
-> undefined flags after `IMUL`/`DIV`), and ARMv5TE (no usable public corpus for
-> v5 — see §12).
+> **Eight CPU cores.** Where a public corpus exists the number is measured, not
+> asserted: MOS 6502 **2,560,000/2,560,000** with full bus traces, W65C02S
+> **2,530,025/2,540,000**, Z80 **1,604,000/1,604,000** plus `zexall` 67/67,
+> RISC-V RV64GC **409/409**, 8086/8088 **2,974,160/3,007,000** (the gap is one
+> microcode residue in the undefined flags after `IMUL`/`DIV`), and the 68000.
+> Where one does not, the substitute is named rather than glossed: ARMv5TE has
+> no public v5 corpus and leans on the ARM7TDMI v4T subset (§12); **ARMv7E-M**
+> is differentially tested against our own ARMv5TE across all 65,536 halfwords,
+> 83,597 identical and 13,683 divergences *asserted* rather than skipped; SM83
+> runs blargg and mooneye.
 >
-> **Three machines that run**: `nes-ntsc` and `nes-pal` — AccuracyCoin boots,
-> raises NMI and draws its menu — and `apple1`, which is interactive over a
-> terminal. Plus the DSL front-to-back: parse, resolve, validate, realize, run.
+> **Six machines that run**, plus a seventh that does not yet. `nes-ntsc` and
+> `nes-pal` — AccuracyCoin boots, raises NMI and draws its menu; `gameboy`;
+> `apple1` and `beneater-6502`, interactive over a terminal; and `riscv-virt`,
+> which is the one that boots real system software: **OpenSBI 1.6 completely**,
+> on a device tree generated from the realized machine rather than shipped, then
+> **Linux 6.12 as far as `asids_init`** and **EDK2 to the end of the DXE
+> dispatcher**. Where each stops is written down, not rounded up. `pc-at` is a
+> complete PC/AT chipset with a user-supplied BIOS path, held out of the catalog
+> because the 8086 core is not yet bindable into a machine file.
+>
+> Beyond the DSL front-to-back, the framework grew a **gdb stub**, a **scanout
+> seam** with a browser build at <https://karpeleslab.github.io/rsemu/>, and a
+> **typed export seam** (§4.4) so one device can hand another a handle — the
+> thing that had blocked the CLINT, and the reason Linux now gets a working
+> `time` CSR.
 >
 > Ordering deviated from the plan deliberately, and it was the right call.
-> ARM was pulled forward for a downstream crate; Z80, x86 and RISC-V were built
-> in parallel once the 6502 proved the shape. What did *not* deviate: every core
-> ships its suite, and the framework was finished before the emulation started.
+> ARM was pulled forward for a downstream crate; Z80, x86, RISC-V, m68k and SM83
+> were built in parallel once the 6502 proved the shape. What did *not* deviate:
+> every core ships its suite, and the framework was finished before the
+> emulation started. The Game Boy was the genericity proof — `src/core/` needed
+> **zero** lines of change against a budget of fifty (§13).
 >
-> What remains for phase 3 is small and known: a controller at `$4016`, OAM DMA
-> at `$4014`, cartridge-driven nametable mirroring, and dot-exact rather than
-> scanline-exact intra-quantum staleness (§4.2). Phase 5's IR and JIT have not
-> been started.
+> Known and outstanding: **intra-quantum staleness** (§4.2) is now measured
+> rather than suspected — `LazyHandle::sync` catches a device up only to the
+> tick the scheduler last published, which accounts for ~35 of the 44 mooneye
+> failures; the fix changes `Runnable`. i386 protected mode is not started, and
+> without it no stock PC BIOS runs. Phase 5's IR and JIT have not been started.
+
 ---
 
 ## 0. Non-negotiables
