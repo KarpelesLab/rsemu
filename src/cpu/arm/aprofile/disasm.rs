@@ -11,7 +11,7 @@
 //! [`Listed::branch_target`].
 //!
 //! ```
-//! use rsemu::cpu::arm::disasm::disassemble_arm;
+//! use rsemu::cpu::arm::aprofile::disasm::disassemble_arm;
 //!
 //! // e3a0_0042: MOV r0, #0x42
 //! let d = disassemble_arm(0x8000, 0xe3a0_0042);

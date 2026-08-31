@@ -988,9 +988,11 @@ Each core is a feature. The order below is chosen so that each one proves a
 
 ### 6.1 ARM: one module or several?
 
-Planned, not built. **ARMv7E-M gets its own module, `src/cpu/armv7m/`, beside
-`src/cpu/arm/` rather than inside it** — and that is a different answer from the
-one the 6502 got, for a reason worth stating.
+**ARMv7E-M gets its own core rather than being a variant of the existing
+one** — a different answer from the one the 6502 got, for a reason worth
+stating. (It lives at `arm/v7m/`, inside the family module; an earlier revision
+of this section put it at `src/cpu/armv7m/`, outside it. Inside is right: they
+are two cores of one family and will share `common/`.)
 
 The 6502's three parts share one architectural model: NMOS, RP2A03 and W65C02S
 differ in about a tenth of the instruction table and in nothing else, so
@@ -1020,10 +1022,15 @@ not by version**:
 src/cpu/arm/
   mod.rs       — family types and re-exports; always compiles, links nothing
   common/      — shifter, flag rules, DSP semantics, Thumb-1        (LATER)
-  aprofile/    — A32 + Thumb, banked modes, CP15, an MMU
+  aprofile/    — A32 + Thumb, banked modes, CP15, an MMU        DONE (v5TE)
                  Arch::{V5TE, V6, V6Z, V7A}                  (cpu-arm-aprofile)
   v7m/         — Thumb-2 only, Handler/Thread, NVIC              (cpu-arm-v7m)
 ```
+
+The move happened: `arm/` is now the family module, always compiled and linking
+nothing, with the ARMv5TE core under `aprofile/` behind `cpu-arm-aprofile`. No
+compatibility re-exports were left at the old `cpu::arm::*` paths — the crate is
+0.0.x, and `release-plz.toml` already sets `semver_check = false`.
 
 An earlier revision of this section put ARMv5TE in a `v5te/` directory. That was
 wrong the moment ARMv6 entered the plan, and the correction is worth recording
@@ -1211,7 +1218,7 @@ almost wholesale. Perhaps a third of the work.
 **Do not extract that up front.** Factoring shared code out of one
 implementation, before the second exists to disagree with it, is guessing at
 the seam — and the guess is usually wrong in the direction that hurts. Build
-`armv7m` standalone, let the duplication become real and visible, then extract
+`v7m/` standalone, let the duplication become real and visible, then extract
 against two working consumers. The cost of waiting is some duplicated
 arithmetic for one release; the cost of guessing is an abstraction both cores
 have to fight.

@@ -243,7 +243,7 @@ static ALL: &[&Arch] = &[
     &MOS6502,
     #[cfg(feature = "cpu-z80")]
     &Z80,
-    #[cfg(feature = "cpu-arm")]
+    #[cfg(feature = "cpu-arm-aprofile")]
     &ARM,
     #[cfg(feature = "cpu-riscv")]
     &RISCV,
@@ -353,10 +353,10 @@ pub static Z80: Arch = Arch {
 // -- ARMv5TE ----------------------------------------------------------------
 
 /// `src/cpu/arm/mod.rs`'s `save`: `r[0..16]` then `cpsr`, all `u32`.
-#[cfg(feature = "cpu-arm")]
+#[cfg(feature = "cpu-arm-aprofile")]
 static ARM_REGS: [RegDesc; 17] = arm_regs();
 
-#[cfg(feature = "cpu-arm")]
+#[cfg(feature = "cpu-arm-aprofile")]
 const fn arm_regs() -> [RegDesc; 17] {
     const NAMES: [&str; 16] = [
         "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12", "sp",
@@ -381,9 +381,9 @@ const fn arm_regs() -> [RegDesc; 17] {
 }
 
 /// The ARM926EJ-S-class core.
-#[cfg(feature = "cpu-arm")]
+#[cfg(feature = "cpu-arm-aprofile")]
 pub static ARM: Arch = Arch {
-    class: &crate::cpu::arm::CLASS,
+    class: &crate::cpu::arm::aprofile::CLASS,
     verified_version: 1,
     feature: "org.rsemu.arm",
     architecture: Some("arm"),

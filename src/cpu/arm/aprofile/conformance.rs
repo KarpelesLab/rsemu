@@ -40,7 +40,7 @@
 //! # the upstream files are gzipped; there is no decompressor in this crate's
 //! # dependency budget, so unpack them first
 //! gunzip -r /tmp/arm7tdmi
-//! RSEMU_ARM7TDMI_DIR=/tmp/arm7tdmi/v1 cargo test --features cpu-arm conformance -- --nocapture
+//! RSEMU_ARM7TDMI_DIR=/tmp/arm7tdmi/v1 cargo test --features cpu-arm-aprofile conformance -- --nocapture
 //! ```
 //!
 //! Without the variable the test prints why it did nothing and passes, so

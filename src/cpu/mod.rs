@@ -28,8 +28,8 @@ pub mod m68k;
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-mos6502")))]
 pub mod mos6502;
 
-#[cfg(feature = "cpu-arm")]
-#[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm")))]
+// The family module always compiles and links nothing; the cores underneath
+// it are individually gated.
 pub mod arm;
 
 #[cfg(feature = "cpu-z80")]

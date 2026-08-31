@@ -144,14 +144,22 @@ machine-beneater = ["cpu-mos6502", "dev-wdc"]
 # no dependencies and is `no_std + alloc`.
 cpu-mos6502 = []
 
-# The ARMv5TE core (src/cpu/arm): an ARM926EJ-S-class interpreter with the full
-# ARM and Thumb instruction sets, interworking, the DSP (E) extensions, all
-# seven modes with their banked registers and the complete exception model, plus
-# a disassembler generated from the same decoders. The MMU, caches and TCMs are
-# not included: CP15 attaches through the `cp::Coprocessor` and `cp::Mmu` traits
-# so a downstream SoC crate supplies its own, and a flat identity map is the
-# default. Adds no dependencies and is `no_std + alloc`.
-cpu-arm = []
+# The A-profile ARM core (src/cpu/arm/aprofile): today an ARM926EJ-S-class
+# ARMv5TE interpreter with the full ARM and Thumb instruction sets,
+# interworking, the DSP (E) extensions, all seven modes with their banked
+# registers and the complete exception model, plus a disassembler generated
+# from the same decoders. The MMU, caches and TCMs are not included: CP15
+# attaches through the `cp::Coprocessor` and `cp::Mmu` traits so a downstream
+# SoC crate supplies its own, and a flat identity map is the default.
+#
+# Named for the profile, not the version, because ARMv6 and ARMv7-A share this
+# core's whole shape -- A32 plus Thumb, banked modes, CP15, the exception model
+# -- and select their differences with a construction property rather than a
+# module of their own (ROADMAP.md §6.1.1). The M profile shares none of it and
+# is a separate core.
+#
+# Adds no dependencies and is `no_std + alloc`.
+cpu-arm-aprofile = []
 
 # The Zilog Z80 core (src/cpu/z80): a cycle-accurate interpreter covering the
 # base, CB, ED, DD/FD and DDCB/FDCB pages, the undocumented IX/IY halves, SLL
