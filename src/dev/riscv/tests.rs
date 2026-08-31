@@ -280,6 +280,8 @@ fn board(tag: &str, firmware: &[u8]) -> Board {
         .with_media("firmware", firmware)
         .with_media("flash0", &[][..])
         .with_media("flash1", &[][..])
+        .with_media("initrd", &[][..])
+        .with_media("disk", &[][..])
         .with_param("console", console_name.clone())
         .with_param("power", power_name.clone())
         // Enough for the programs here, and small enough that the cold reset
@@ -380,6 +382,68 @@ fn the_boot_rom_hands_over_a_device_tree_that_parses() {
 }
 
 #[test]
+fn a_ramdisk_is_staged_in_memory_and_pointed_at_by_the_tree() {
+    // Both halves of the initrd contract in one test, because either alone is
+    // useless: the bytes have to be *in* memory, and `/chosen` has to say
+    // where. The two numbers come from different objects in the machine file
+    // — a `riscv.loader` puts the image down, the boot ROM describes it — so a
+    // test that checked only one would not notice them disagreeing.
+    let at = DRAM + 0x10_0000;
+    let ramdisk = alloc::vec![0x5au8; 4096];
+    let entry = catalog::machine("riscv-virt").expect("shipped");
+    let options = catalog::build_options()
+        .unwrap()
+        .with_media("firmware", &[][..])
+        .with_media("flash0", &[][..])
+        .with_media("flash1", &[][..])
+        .with_media("initrd", ramdisk.as_slice())
+        .with_media("disk", &[][..])
+        .with_param("console", "test.riscv.console.initrd")
+        .with_param("power", "test.riscv.power.initrd")
+        .with_param("ram", "8M")
+        // Inside this board's 8 MiB rather than at the shipped default, which
+        // assumes the 256M a real kernel wants.
+        .with_param("initrd_addr", alloc::format!("{at:#x}"));
+    let machine = crate::machine::build(
+        entry.name,
+        entry.source,
+        &catalog::registry().unwrap(),
+        &options,
+    )
+    .expect("a board with a ramdisk still builds");
+    let b = Board {
+        machine,
+        console: ports::open("test.riscv.console.initrd"),
+        power: signals::open("test.riscv.power.initrd"),
+    };
+
+    let dtb = b.device_tree();
+    assert_eq!(
+        prop_u64(&dtb, "chosen", "linux,initrd-start"),
+        Some(at),
+        "{}",
+        super::dt::describe(&dtb).expect("it parses")
+    );
+    assert_eq!(
+        prop_u64(&dtb, "chosen", "linux,initrd-end"),
+        Some(at + ramdisk.len() as u64),
+        "the end is one past the last byte"
+    );
+    assert_eq!(b.peek(at, Width::U8), 0x5a, "the first byte of the ramdisk");
+    assert_eq!(
+        b.peek(at + ramdisk.len() as u64 - 1, Width::U8),
+        0x5a,
+        "the last byte of the ramdisk"
+    );
+
+    // And with nothing bound, `/chosen` says nothing at all — a kernel that
+    // finds the properties present but zero would try to unpack address zero.
+    let plain = board("no-initrd", &[]).device_tree();
+    assert_eq!(prop_u64(&plain, "chosen", "linux,initrd-start"), None);
+    assert_eq!(prop_u64(&plain, "chosen", "linux,initrd-end"), None);
+}
+
+#[test]
 fn every_address_in_the_tree_came_from_the_memory_map() {
     // The claim `docs/platforms/riscv-virt.md` makes: the tree is produced
     // mechanically from the realized machine. Move a device in the machine
@@ -399,6 +463,8 @@ fn every_address_in_the_tree_came_from_the_memory_map() {
         .with_media("firmware", &[][..])
         .with_media("flash0", &[][..])
         .with_media("flash1", &[][..])
+        .with_media("initrd", &[][..])
+        .with_media("disk", &[][..])
         .with_param("console", "test.riscv.console.moved")
         .with_param("power", "test.riscv.power.moved")
         .with_param("ram", "8M");
@@ -580,6 +646,8 @@ fn a_hart_with_no_timer_named_reads_zero() {
         .with_media("firmware", rdtime_loop().bytes().as_slice())
         .with_media("flash0", &[][..])
         .with_media("flash1", &[][..])
+        .with_media("initrd", &[][..])
+        .with_media("disk", &[][..])
         .with_param("console", "test.riscv.console.untimed")
         .with_param("power", "test.riscv.power.untimed")
         .with_param("ram", "8M");
@@ -612,6 +680,8 @@ fn naming_a_timer_that_publishes_none_says_so() {
         .with_media("firmware", &[][..])
         .with_media("flash0", &[][..])
         .with_media("flash1", &[][..])
+        .with_media("initrd", &[][..])
+        .with_media("disk", &[][..])
         .with_param("console", "test.riscv.console.mistimed")
         .with_param("power", "test.riscv.power.mistimed")
         .with_param("ram", "8M");
@@ -793,6 +863,33 @@ fn with_payload(source: &str, index: usize, slot: &str, addr: u64, len: u64) -> 
     out
 }
 
+/// `\n`, `\r`, `\t` and `\\` in a value that reached us through the
+/// environment, where a real newline cannot.
+#[cfg(feature = "std")]
+fn unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('\\') => out.push('\\'),
+            // Anything else is not an escape, so both characters are literal.
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 /// Boot whatever `RSEMU_RISCV_FIRMWARE` points at and report what it printed.
 ///
 /// Skipped, cleanly, when the variable is unset — which is every ordinary
@@ -819,6 +916,18 @@ fn with_payload(source: &str, index: usize, slot: &str, addr: u64, len: u64) -> 
 /// back out when the run ends, so pointing `FLASH1` at that same file on the
 /// next run is a reboot — and a variable written in one run is there in the
 /// next, which is the whole reason the flash is a device rather than memory.
+///
+/// `RSEMU_RISCV_INITRD` binds a ramdisk to the `initrd` media slot, staged at
+/// `RSEMU_RISCV_INITRD_ADDR` (default `0x88000000`) and described to the kernel
+/// by `/chosen/linux,initrd-start`. `scripts/fetch-testdata.sh initramfs`
+/// builds one that boots to a busybox shell.
+///
+/// `RSEMU_RISCV_INPUT` types at the guest: one `marker=>text` step per line,
+/// where `text` takes `\n`, `\r`, `\t` and `\\`. Each step waits for its marker
+/// in the guest's output and then feeds its text to the console. A prompt that
+/// echoes what is typed at it is the only proof that the console is
+/// bidirectional, and matching on output rather than on elapsed time keeps the
+/// run deterministic.
 #[cfg(feature = "std")]
 #[test]
 fn firmware_from_the_environment_reaches_its_console() {
@@ -864,6 +973,12 @@ fn firmware_from_the_environment_reaches_its_console() {
     };
     let flash0 = bank("RSEMU_RISCV_FLASH0");
     let flash1 = bank("RSEMU_RISCV_FLASH1");
+    // The ramdisk. Empty is a board that boots without one, which is every run
+    // that came before this variable existed.
+    let initrd = bank("RSEMU_RISCV_INITRD");
+    // The virtio disk's contents. Empty is a blank disk of the machine file's
+    // `storage` size, which is what every run before this variable had.
+    let disk = bank("RSEMU_RISCV_DISK");
 
     let console_name = String::from("test.riscv.console.firmware");
     let power_name = String::from("test.riscv.power.firmware");
@@ -873,9 +988,15 @@ fn firmware_from_the_environment_reaches_its_console() {
         .with_media("firmware", image.as_slice())
         .with_media("flash0", flash0.as_slice())
         .with_media("flash1", flash1.as_slice())
+        .with_media("initrd", initrd.as_slice())
+        .with_media("disk", disk.as_slice())
         .with_param("console", console_name.clone())
         .with_param("power", power_name.clone())
         .with_param("ram", ram)
+        .with_param(
+            "initrd_addr",
+            std::env::var("RSEMU_RISCV_INITRD_ADDR").unwrap_or_else(|_| String::from("0x88000000")),
+        )
         .with_param(
             "cmdline",
             std::env::var("RSEMU_RISCV_BOOTARGS")
@@ -910,6 +1031,34 @@ fn firmware_from_the_environment_reaches_its_console() {
     // to say what it already said — and, worse, one whose flash never gets
     // written back out.
     let stop_at = std::env::var("RSEMU_RISCV_STOP_AT").unwrap_or_default();
+    // A scripted session: one `marker=>text` step per line. Once the guest has
+    // printed `marker`, `text` is typed at it. Typing is the only way to show
+    // that a console is bidirectional rather than write-only, and keying it
+    // off what the guest *said* rather than off elapsed time keeps the run
+    // deterministic — no wall clock is consulted anywhere in the loop. The
+    // separator is a newline rather than anything punctuation-shaped because
+    // the text is usually a shell command, and every candidate separator is
+    // something a shell command is allowed to contain.
+    let script: Vec<(String, String)> = std::env::var("RSEMU_RISCV_INPUT")
+        .unwrap_or_default()
+        .split('\n')
+        .filter(|s| !s.trim().is_empty())
+        .map(|step| {
+            let (marker, text) = step
+                .split_once("=>")
+                .unwrap_or_else(|| panic!("`{step}` is not `marker=>text`"));
+            (String::from(marker), unescape(text))
+        })
+        .collect();
+    let mut step = 0usize;
+    // Enough tail to span a marker that arrives split across two quanta.
+    let window = script
+        .iter()
+        .map(|(marker, _)| marker.len())
+        .chain(core::iter::once(stop_at.len()))
+        .max()
+        .unwrap_or(0)
+        .max(1);
     let mut printed = 0usize;
     let mut seen = String::new();
     eprintln!("--- guest console ---");
@@ -919,22 +1068,37 @@ fn firmware_from_the_environment_reaches_its_console() {
         }
         b.machine.run_quantum().expect("the machine advances");
         let out = b.output();
-        if !out.is_empty() {
-            printed += out.len();
-            eprint!("{out}");
-            let _ = std::io::stderr().flush();
-            if !stop_at.is_empty() {
-                seen.push_str(&out);
-                if seen.contains(&stop_at) {
-                    eprintln!("\n(stopping: the guest printed `{stop_at}`)");
-                    break;
-                }
-                // Keep only enough tail to span a marker that arrives split
-                // across two quanta.
-                if seen.len() > 4 * stop_at.len() {
-                    seen.drain(..seen.len() - 2 * stop_at.len());
-                }
-            }
+        if out.is_empty() {
+            continue;
+        }
+        printed += out.len();
+        eprint!("{out}");
+        let _ = std::io::stderr().flush();
+        seen.push_str(&out);
+        if let Some((marker, text)) = script.get(step)
+            && seen.contains(marker.as_str())
+        {
+            eprintln!("\n(typing `{}`)", text.escape_debug());
+            let fed = b.console.feed(text.as_bytes());
+            assert_eq!(
+                fed,
+                text.len(),
+                "the console took {fed} of {} byte(s)",
+                text.len()
+            );
+            step += 1;
+            // So the next step's marker is matched against what the guest says
+            // *after* this keystroke, not against the prompt that triggered it.
+            seen.clear();
+        }
+        // Only once the script has run: the marker that ends the run is
+        // usually the reply to the last thing typed.
+        if !stop_at.is_empty() && step >= script.len() && seen.contains(&stop_at) {
+            eprintln!("\n(stopping: the guest printed `{stop_at}`)");
+            break;
+        }
+        if seen.len() > 4 * window {
+            seen.drain(..seen.len() - 2 * window);
         }
     }
     let tail = b.output();
@@ -973,8 +1137,22 @@ fn interrupts_of(dtb: &[u8], name: &str) -> Option<u32> {
     prop_u32(dtb, name, "interrupts")
 }
 
+/// The first two cells of property `prop` in node `name`, as one 64-bit value.
+fn prop_u64(dtb: &[u8], name: &str, prop: &str) -> Option<u64> {
+    let bytes = prop_bytes(dtb, name, prop)?;
+    let eight: [u8; 8] = bytes.get(..8)?.try_into().ok()?;
+    Some(u64::from_be_bytes(eight))
+}
+
 /// The first cell of property `prop` in node `name`.
 fn prop_u32(dtb: &[u8], name: &str, prop: &str) -> Option<u32> {
+    let bytes = prop_bytes(dtb, name, prop)?;
+    let four: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+    Some(u32::from_be_bytes(four))
+}
+
+/// The raw value of property `prop` in node `name`.
+fn prop_bytes<'a>(dtb: &'a [u8], name: &str, prop: &str) -> Option<&'a [u8]> {
     let word =
         |at: usize| -> u32 { u32::from_be_bytes([dtb[at], dtb[at + 1], dtb[at + 2], dtb[at + 3]]) };
     let off_struct = word(8) as usize;
@@ -1012,8 +1190,8 @@ fn prop_u32(dtb: &[u8], name: &str, prop: &str) -> Option<u32> {
                 let len = word(at) as usize;
                 let name_off = word(at + 4) as usize;
                 at += 8;
-                if inside && name_at(off_strings + name_off) == prop && len >= 4 {
-                    return Some(word(at));
+                if inside && name_at(off_strings + name_off) == prop {
+                    return dtb.get(at..at + len);
                 }
                 at += len;
                 at = at.next_multiple_of(4);

@@ -61,6 +61,26 @@ readonly OPENSBI_MEMBER="./usr/lib/riscv64-linux-gnu/opensbi/generic/fw_jump.bin
 # would be redistribution under its terms (ROADMAP.md §1).
 readonly LINUX_IMAGE_URL="https://deb.debian.org/debian/dists/trixie/main/installer-riscv64/current/images/netboot/debian-installer/riscv64/linux"
 
+# The userland that kernel boots into. One statically linked riscv64 busybox,
+# out of Debian's own package, wrapped in a cpio archive this script builds.
+#
+# GPL-2.0, so FETCH-ONLY like the kernel: running busybox as an emulated guest
+# is ordinary use, and its source is off limits (CLAUDE.md, Provenance). The
+# cpio around it is ours, and it is *built* rather than downloaded because
+# rsemu will not run a stranger's root filesystem image and because a shell
+# prompt is the whole fixture — there is nothing else in it.
+#
+# `busybox-static` rather than `busybox`: an initramfs has no dynamic loader
+# in it, and supplying one would mean unpacking a libc too.
+readonly BUSYBOX_DEB="https://deb.debian.org/debian/pool/main/b/busybox/busybox-static_1.37.0-6+b8_riscv64.deb"
+readonly BUSYBOX_DEB_SHA="1a41dc2cb6c45f2d9a3dd1dcd027d888400c8f51e958a9b9b9fd2922f8735b86"
+readonly BUSYBOX_MEMBER="./usr/bin/busybox"
+# Debian's pool keeps only the current build of a binary package, so the URL
+# above stops resolving the next time busybox is rebuilt. This is where the
+# name is looked up when that happens — and it is also how the kernel package
+# matching the fetched `linux` image is found, for `initramfs-virtio` below.
+readonly DEBIAN_PACKAGES="https://deb.debian.org/debian/dists/trixie/main/binary-riscv64/Packages.gz"
+
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
@@ -597,6 +617,312 @@ Consumed by RSEMU_RISCV_PAYLOAD in src/dev/riscv/tests.rs."
 }
 
 # ---------------------------------------------------------------------------
+# The initramfs
+# ---------------------------------------------------------------------------
+#
+# A `newc` cpio archive, written here in shell rather than with `cpio(1)`,
+# because the dependency list at the top of this file is short on purpose and
+# because the format is 110 ASCII bytes of header per entry. It is described in
+# the kernel's own `initramfs buffer format` documentation and, for the header
+# fields, by POSIX and the SVR4 `cpio` manual page — the layout is:
+#
+#     "070701"  magic
+#     8 hex chars each: ino mode uid gid nlink mtime filesize
+#                       devmajor devminor rdevmajor rdevminor namesize check
+#     the name, NUL-terminated, then NUL padding to a 4-byte boundary
+#     the data, then NUL padding to a 4-byte boundary
+#
+# Every entry is written with mtime 0 and sequential inode numbers, so the same
+# busybox produces byte-identical archives — a fixture whose checksum moves on
+# its own is a fixture that cannot be pinned.
+
+CPIO_INO=0
+
+# NUL padding to bring an offset of `$1` bytes up to a multiple of four.
+cpio_pad() {
+	local n=$1
+	local need=$(( (4 - n % 4) % 4 ))
+	[ "$need" -eq 0 ] || head -c "$need" /dev/zero
+}
+
+# cpio_header <name> <mode> <nlink> <filesize> <rdevmajor> <rdevminor>
+cpio_header() {
+	local name="$1" mode="$2" nlink="$3" size="$4" rmaj="$5" rmin="$6"
+	CPIO_INO=$(( CPIO_INO + 1 ))
+	printf '070701%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x' \
+		"$CPIO_INO" "$mode" 0 0 "$nlink" 0 "$size" 0 0 "$rmaj" "$rmin" \
+		"$(( ${#name} + 1 ))" 0
+	printf '%s\0' "$name"
+	cpio_pad $(( 110 + ${#name} + 1 ))
+}
+
+cpio_dir()  { cpio_header "$1" $(( 0040000 | 0755 )) 2 0 0 0; }
+cpio_node() { cpio_header "$1" $(( 0020000 | 0600 )) 1 0 "$2" "$3"; }
+cpio_link() { cpio_header "$1" $(( 0120000 | 0777 )) 1 "${#2}" 0 0; printf '%s' "$2"; cpio_pad "${#2}"; }
+cpio_end()  { cpio_header 'TRAILER!!!' 0 1 0 0 0; }
+
+# cpio_file <name> <path> [mode]
+cpio_file() {
+	local name="$1" src="$2" mode="${3:-0755}" size
+	size="$(wc -c <"$src" | tr -d ' ')"
+	cpio_header "$name" $(( 0100000 | mode )) 1 "$size" 0 0
+	cat "$src"
+	cpio_pad "$size"
+}
+
+# Where busybox actually comes from today, since the pool URL goes stale.
+busybox_url() {
+	if curl --fail --silent --head --location "$BUSYBOX_DEB" >/dev/null 2>&1; then
+		printf '%s' "$BUSYBOX_DEB"
+		return 0
+	fi
+	need gzip
+	warn "the pinned busybox-static build is gone from the pool; asking the index"
+	local filename
+	filename="$(curl --fail --silent --location "$DEBIAN_PACKAGES" | gzip -cd |
+		awk '/^Package: busybox-static$/ { found = 1 }
+		     found && /^Filename: / { print $2; exit }')"
+	[ -n "$filename" ] || die "busybox-static is not in ${DEBIAN_PACKAGES}"
+	printf 'https://deb.debian.org/debian/%s' "$filename"
+}
+
+# The riscv64 busybox binary, unpacked into <scratch dir>. Sets BUSYBOX_BIN
+# rather than echoing the path, because the fetch it does prints as it goes and
+# a command substitution would swallow that into the answer.
+BUSYBOX_BIN=""
+busybox_binary() {
+	local work="$1" url
+	url="$(busybox_url)"
+	if [ "$url" = "$BUSYBOX_DEB" ]; then
+		# Advisory rather than fatal: Debian rebuilds busybox, and a rebuild
+		# under the same file name is a new binary rather than a wrong one.
+		fetch_verified "$url" "${work}/busybox.deb" "$BUSYBOX_DEB_SHA" advisory
+	else
+		note "  downloading $(basename -- "$url") ..."
+		download "$url" "${work}/busybox.deb"
+	fi
+	( cd "$work" && ar x busybox.deb data.tar.xz ) || die "that .deb is not an ar archive"
+	tar -xf "${work}/data.tar.xz" -C "$work" "$BUSYBOX_MEMBER" 2>/dev/null ||
+		die "no ${BUSYBOX_MEMBER} in the package; upstream may have moved it"
+	rm -f "${work}/data.tar.xz" "${work}/busybox.deb"
+	local bb="${work}/${BUSYBOX_MEMBER}"
+
+	# Shape check rather than a second checksum: a riscv64 ELF starts with the
+	# ELF magic and carries machine type 243 (EM_RISCV) in the two little-endian
+	# bytes at offset 18. That catches the wrong architecture, which is the one
+	# mistake that would otherwise show up as a kernel panic ten minutes into a
+	# boot rather than here.
+	local elf machine
+	elf="$(dd if="$bb" bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+	machine="$(od -An -tu2 -j 18 -N 2 "$bb" | tr -d ' \n')"
+	[ "$elf" = "7f454c46" ] || die "${BUSYBOX_MEMBER} is not an ELF file"
+	[ "$machine" = "243" ] || die "${BUSYBOX_MEMBER} is for machine ${machine}, not RISC-V (243)"
+	BUSYBOX_BIN="$bb"
+}
+
+fetch_initramfs() {
+	need curl
+	need tar
+	need ar
+	local dest="${DEST_ROOT}/riscv"
+	local target="${dest}/initramfs.cpio"
+	mkdir -p "$dest"
+
+	local work="${dest}/.initramfs"
+	rm -rf "$work"
+	mkdir -p "$work"
+
+	busybox_binary "$work"
+	build_initramfs "$target" "$BUSYBOX_BIN" "$work"
+	rm -rf "$work"
+
+	ok "$(basename -- "$target") ($(wc -c <"$target" | tr -d ' ') bytes)"
+	initramfs_notice "$dest"
+	initramfs_hint "$dest" "$(basename -- "$target")"
+}
+
+# build_initramfs <target> <busybox> <scratch dir> [module.ko ...]
+build_initramfs() {
+	local target="$1" bb="$2" work="$3"
+	shift 3
+
+	# PID 1. `--install -s` fills /bin with the applet symlinks, so the shell
+	# that follows has a userland rather than one binary; every mount is
+	# tolerated failing, because the point of this fixture is the prompt and a
+	# kernel without devtmpfs should still reach one. The module loop is a
+	# no-op when /lib/modules is empty, which is the plain archive.
+	cat >"${work}/init" <<'INIT'
+#!/bin/sh
+# rsemu's initramfs init. Reaches a shell and nothing else.
+/bin/busybox --install -s /bin 2>/dev/null
+mount -t proc     proc     /proc 2>/dev/null
+mount -t sysfs    sysfs    /sys  2>/dev/null
+mount -t devtmpfs devtmpfs /dev  2>/dev/null
+for module in /lib/modules/*.ko; do
+	[ -f "$module" ] && insmod "$module"
+done
+echo
+echo "rsemu initramfs on $(uname -srm)"
+export PS1='rsemu# '
+exec /bin/sh
+INIT
+
+	{
+		cpio_dir bin
+		cpio_dir dev
+		cpio_dir lib
+		cpio_dir lib/modules
+		cpio_dir proc
+		cpio_dir sys
+		cpio_file bin/busybox "$bb" 0755
+		cpio_link bin/sh busybox
+		# The console the kernel hands PID 1 as its stdin, stdout and stderr,
+		# and the null every shell wants. Both are made here because nothing
+		# has mounted devtmpfs yet at the moment init is executed.
+		cpio_node dev/console 5 1
+		cpio_node dev/null 1 3
+		local module
+		# Order here is only the archive's; /init loads whatever it finds by
+		# glob, and either order works — the driver model binds a driver to a
+		# device whichever of the two arrives second.
+		for module in "$@"; do
+			cpio_file "lib/modules/$(basename -- "$module")" "$module" 0644
+		done
+		cpio_file init "${work}/init" 0755
+		cpio_end
+	} >"${target}.part"
+	mv -f "${target}.part" "$target"
+}
+
+# The kernel package whose modules match the `linux` image already fetched.
+#
+# Read out of the image rather than pinned, because a module whose vermagic
+# disagrees with the running kernel is refused at insmod time — and the two
+# come from different places in the archive, so nothing else keeps them in
+# step. Every Linux image carries its own banner as a plain string.
+kernel_module_deb() {
+	local image="$1" version
+	version="$(grep -ao 'Linux version [^ ]*' "$image" | head -1 | cut -d' ' -f3)"
+	[ -n "$version" ] || die "no Linux version banner in ${image}"
+	note "  the fetched kernel is ${version}" >&2
+	need gzip
+	local filename
+	filename="$(curl --fail --silent --location "$DEBIAN_PACKAGES" | gzip -cd |
+		awk -v want="linux-image-${version}" '
+			$1 == "Package:" { pkg = $2 }
+			pkg == want && $1 == "Filename:" { print $2; exit }')"
+	[ -n "$filename" ] || die "no linux-image-${version} in ${DEBIAN_PACKAGES}
+  Its modules are what initramfs-virtio needs, and only the build that matches
+  the kernel will load. Re-fetch the linux suite and try again."
+	printf 'https://deb.debian.org/debian/%s' "$filename"
+}
+
+# The same archive with virtio-mmio and virtio-blk in it.
+#
+# The Debian kernel this board boots builds both as modules, so an unadorned
+# initramfs never claims the `virtio.blk` the machine file provides. Two
+# `insmod`s at the top of init are the whole difference, and they are what
+# turns "Linux runs" into "Linux drives our virtio device".
+fetch_initramfs_virtio() {
+	need curl
+	need tar
+	need ar
+	need xz
+	local dest="${DEST_ROOT}/riscv"
+	local image="${dest}/linux"
+	[ -s "$image" ] || die "fetch the kernel first: scripts/fetch-testdata.sh linux"
+
+	local work="${dest}/.initramfs-virtio"
+	rm -rf "$work"
+	mkdir -p "$work"
+
+	local url
+	busybox_binary "$work"
+
+	url="$(kernel_module_deb "$image")"
+	note "  downloading $(basename -- "$url") (about 110 MiB) ..."
+	download "$url" "${work}/linux-image.deb"
+	( cd "$work" && ar x linux-image.deb data.tar.xz ) || die "that .deb is not an ar archive"
+
+	# Named by glob rather than by path: the version is in the path and it has
+	# already been resolved once, and Debian has moved these between
+	# /lib/modules and /usr/lib/modules before.
+	local module member modules=()
+	for module in virtio_mmio virtio_blk; do
+		member="$(tar -tf "${work}/data.tar.xz" |
+			grep -E "/${module}\.ko(\.xz)?\$" | head -1)"
+		[ -n "$member" ] || die "no ${module} in the kernel package"
+		tar -xf "${work}/data.tar.xz" -C "$work" "$member"
+		if [ "${member%.xz}" != "$member" ]; then
+			xz -df "${work}/${member}"
+			member="${member%.xz}"
+		fi
+		modules+=("${work}/${member}")
+	done
+	rm -f "${work}/data.tar.xz"
+
+	local target="${dest}/initramfs-virtio.cpio"
+	build_initramfs "$target" "$BUSYBOX_BIN" "$work" "${modules[@]}"
+	rm -rf "$work"
+	ok "initramfs-virtio.cpio ($(wc -c <"$target" | tr -d ' ') bytes)"
+
+	# Something recognisable in sector zero, so a guest reading /dev/vda is
+	# reading *our* bytes rather than the zeroes any blank disk would give.
+	printf 'rsemu virtio-blk fixture, sector 0\n' >"${dest}/disk.img"
+	ok "disk.img ($(wc -c <"${dest}/disk.img" | tr -d ' ') bytes)"
+
+	initramfs_notice "$dest"
+	virtio_hint "$dest"
+}
+
+virtio_hint() {
+	local dest="$1"
+	note ""
+	note "  Boot Linux, load the two modules and talk to the virtio disk:"
+	note "      RSEMU_RISCV_FIRMWARE=${dest}/fw_jump.bin \\"
+	note "      RSEMU_RISCV_PAYLOAD=0x80200000:${dest}/linux \\"
+	note "      RSEMU_RISCV_INITRD=${dest}/initramfs-virtio.cpio \\"
+	note "      RSEMU_RISCV_DISK=${dest}/disk.img \\"
+	note "      RSEMU_RISCV_BOOTARGS='console=ttyS0 earlycon=sbi' \\"
+	note "      RSEMU_RISCV_RAM=512M RSEMU_RISCV_QUANTA=2000000 \\"
+	note "      RSEMU_RISCV_INPUT='rsemu# =>head -c 34 /dev/vda\\n' \\"
+	note "      RSEMU_RISCV_STOP_AT='sector 0' \\"
+	note "          cargo test --release --all-features firmware_from_the --lib -- --nocapture"
+}
+
+initramfs_notice() {
+	printf '%s\n' "initramfs*.cpio — a busybox root filesystem for riscv-virt
+busybox-static, riscv64, from ${BUSYBOX_DEB}
+https://www.busybox.net
+
+Licence: GPL-2.0. FETCH-ONLY — running busybox as an emulated guest is
+ordinary use; committing it here would be redistribution under its terms, and
+its source is off limits to this project entirely (CLAUDE.md, Provenance).
+
+The cpio archive around it is built by scripts/fetch-testdata.sh, which also
+writes the /init inside it. Nothing in the archive was downloaded except the
+busybox binary — and, in initramfs-virtio.cpio, the kernel's own virtio_mmio
+and virtio_blk modules, which are GPL-2.0 on the same terms as the kernel.
+
+Consumed by RSEMU_RISCV_INITRD in src/dev/riscv/tests.rs, and by
+\`rsemu run riscv-virt --initrd …\`." >"${1}/PROVENANCE-initramfs.txt"
+}
+
+initramfs_hint() {
+	local dest="$1" archive="$2"
+	note ""
+	note "  Boot Linux to a shell on it:"
+	note "      RSEMU_RISCV_FIRMWARE=${dest}/fw_jump.bin \\"
+	note "      RSEMU_RISCV_PAYLOAD=0x80200000:${dest}/linux \\"
+	note "      RSEMU_RISCV_INITRD=${dest}/${archive} \\"
+	note "      RSEMU_RISCV_BOOTARGS='console=ttyS0 earlycon=sbi' \\"
+	note "      RSEMU_RISCV_RAM=512M RSEMU_RISCV_QUANTA=2000000 \\"
+	note "      RSEMU_RISCV_INPUT='rsemu# =>uname -a\\n' \\"
+	note "      RSEMU_RISCV_STOP_AT='GNU/Linux' \\"
+	note "          cargo test --release --all-features firmware_from_the --lib -- --nocapture"
+}
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -614,6 +940,11 @@ Suites:
   edk2           UEFI for riscv-virt, copied from the local qemu firmware
                  package (BSD-2-Clause-Patent; nothing to download)
   linux          riscv64 Linux Image to boot on it (GPL-2.0, FETCH-ONLY)
+  initramfs      a busybox root filesystem for that kernel, built here around
+                 Debian's riscv64 busybox-static (GPL-2.0, FETCH-ONLY)
+  initramfs-virtio
+                 the same archive with the kernel's own virtio-mmio and
+                 virtio-blk modules in it, plus a disk image to read
 
 Options:
   --all               fetch every suite (the default when none is named).
@@ -696,6 +1027,8 @@ for suite in "${SUITES[@]}"; do
 		opensbi|riscv) fetch_opensbi ;;
 		edk2|uefi) fetch_edk2 ;;
 		linux|kernel) fetch_linux ;;
+		initramfs|rootfs) fetch_initramfs ;;
+		initramfs-virtio|virtio) fetch_initramfs_virtio ;;
 		*) die "unknown suite $suite (try --help)" ;;
 	esac
 done

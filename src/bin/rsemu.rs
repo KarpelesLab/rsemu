@@ -53,6 +53,9 @@ RUN OPTIONS:
                         contents. `riscv-virt` boots UEFI out of it.
     --flash1 <file>     Bind the `flash1` media slot: the second NOR bank,
                         which is where UEFI keeps its variables.
+    --initrd <file>     Bind the `initrd` media slot: a ramdisk staged in
+                        guest RAM, which the generated device tree then points
+                        the kernel at
     --media <n>=<file>  Bind any media slot by name
     -p <name>=<value>   Override a `param` declared in the machine file
     --for <duration>    How much virtual time to run, as `1s`, `500ms`, `2m`
@@ -279,7 +282,7 @@ fn run(args: &[String]) -> ExitCode {
     // UEFI build will format for itself. Naming the slots explicitly on every
     // run to say "empty" would be ceremony, and an unbound slot is an error by
     // design (`machine::realize`).
-    for slot in ["flash0", "flash1"] {
+    for slot in ["flash0", "flash1", "initrd", "disk"] {
         if !images.iter().any(|(bound, _)| bound == slot) {
             images.push((String::from(slot), Vec::new()));
         }
@@ -799,7 +802,7 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             // exist at all because `--media bios=…` is correct and nobody
             // types it.
             "--cart" | "--rom" | "--disk" | "--bios" | "--vgabios" | "--floppy" | "--flash0"
-            | "--flash1" => {
+            | "--flash1" | "--initrd" => {
                 let slot = arg.trim_start_matches('-').to_string();
                 let path = value(arg)?;
                 out.media.push((slot, path));
