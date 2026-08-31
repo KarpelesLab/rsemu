@@ -21,7 +21,7 @@
 #
 # ---------------------------------------------------------------------------
 # 2026-08-31: 130 of 141 pass, 11 fail.
-# 2026-09-01: 137 of 141 pass, 4 fail — the PPU closed seven.
+# 2026-09-01: 138 of 141 pass, 3 fail.
 # ---------------------------------------------------------------------------
 #
 # The measurement before this one read "81 of 125", through a stale copy of the
@@ -60,7 +60,7 @@
 # the ROM reported, what it measures, and what specifically is missing.
 
 # ---------------------------------------------------------------------------
-# A. The DMC's choreography against the OAM DMA, and the $4015 enable latency
+# A. The DMC's choreography against the OAM DMA
 # ---------------------------------------------------------------------------
 #
 # The arbiter runs both DMAs and gets each right on its own. What it does not
@@ -68,9 +68,15 @@
 # bus: `Job` carries a single `dummy` flag rather than a Halt -> Dummy ->
 # [Align] -> Get sequence whose no-op phases are allowed to overlap OAM access
 # cycles ("no-operation cycles are allowed to overlap with each other and with
-# access cycles, allowing cycles to be saved" — NESdev, DMA). Nor does it model
-# the DMC enable latching three CPU cycles after a `$4015` write, which is what
-# lets a reload scheduled in the interim slip its halt to the following get.
+# access cycles, allowing cycles to be saved" — NESdev, DMA).
+#
+# The `$4015` enable latch *is* modelled now, and it closed "Delta Modulation
+# Channel": a fetch the timer schedules while an enabling `$4015` write is still
+# settling is ready but may not halt until three CPU cycles after that write.
+# Three is the ROM's own figure and it is measured three times over — subtests
+# L, M and N write `$4015` two, one and zero cycles before the timer reaches
+# zero and demand one, two and three cycles of delay — and both two and four
+# fail all three.
 
 77                # $0477 "DMC DMA + OAM DMA" code 2: the thirty-two entry
                   # answer key sweeps a DMC fetch across the start and the end
@@ -91,14 +97,6 @@
                   # stops on. The explicit path is right; this one is not, and
                   # guessing an offset to make it line up would be fitting a
                   # constant to a test rather than modelling the chip.
-6a                # $046A "Delta Modulation Channel" code L (subtest 21): a
-                  # `$4015` write two cycles before the DMC timer clocks must
-                  # not let the fetch halt until the enable has latched, which
-                  # makes that fetch cost three cycles rather than four. Codes
-                  # 1-K pass, so the channel, its IRQ, its looping and its
-                  # address arithmetic are all right; this is the enable
-                  # latency and nothing else. M and N are the one- and
-                  # zero-cycle variants behind it.
 
 # ---------------------------------------------------------------------------
 # B. The 2A03's internal block does not answer a DMA aimed at somebody else

@@ -36,8 +36,10 @@
 //! A *load* fetch — one a `$4015` write scheduled — starts trying to halt on
 //! the get cycle of the second APU cycle after that write, which is the third
 //! or fourth CPU cycle after it. A *reload* — one the output unit scheduled by
-//! emptying the sample buffer — starts trying on the next put. Either way, if
-//! the CPU happens to be writing the halt fails and is retried the next cycle.
+//! emptying the sample buffer — starts trying on the next put, but never before
+//! the channel's enable latch has settled, three CPU cycles after the `$4015`
+//! write that started playback ([`DmaRequest::not_before`](crate::dev::apu::DmaRequest::not_before)). Either way, if the
+//! CPU happens to be writing the halt fails and is retried the next cycle.
 //!
 //! # Bus conflicts
 //!
@@ -590,8 +592,10 @@ impl CycleGate for Gate {
                     // or fourth CPU cycle. A reload starts on the next put.
                     start: match r.kind {
                         DmaKind::Load => phase_at_or_after(r.at + 3, phase, true),
+                        // A fetch the timer scheduled while a `$4015` enable
+                        // was still settling cannot halt until it has.
                         DmaKind::Reload | DmaKind::Abort => {
-                            phase_at_or_after(r.at + 1, phase, false)
+                            phase_at_or_after(r.at + 1, phase, false).max(r.not_before)
                         }
                     },
                     abort: r.kind == DmaKind::Abort,

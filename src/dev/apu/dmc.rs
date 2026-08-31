@@ -9,6 +9,15 @@ use crate::core::state::{Sink, Source};
 
 use super::frame::Region;
 
+/// CPU cycles between a `$4015` write that starts playback and the enable
+/// reaching the DMA unit.
+///
+/// AccuracyCoin's subtests L, M and N write `$4015` two, one and zero cycles
+/// before the DMC timer reaches zero and check that the resulting fetch is
+/// delayed by one, two and three cycles respectively - three measurements of
+/// one constant, which is what makes it a latch and not a fudge.
+const ENABLE_LATCH_CYCLES: u64 = 3;
+
 /// DMC timer periods in **CPU cycles**, indexed by `$4010` bits 3-0.
 const NTSC_RATES: [u16; 16] = [
     428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54,
@@ -78,6 +87,19 @@ pub struct DmaRequest {
     pub serial: u64,
     /// The CPU cycle the fetch was scheduled on.
     pub at: u64,
+    /// The earliest cycle the DMA unit may halt the CPU for this fetch,
+    /// whatever its own phase rule says.
+    ///
+    /// A `$4015` write that starts playback does not enable the channel on the
+    /// cycle it lands: the enable latches a few cycles later, and a fetch the
+    /// timer schedules in the interim is *ready* but cannot halt yet. "Per my
+    /// current understanding, if a sample is playing, you disable the DMC, and
+    /// the final bit is read from the buffer, the DMA will still attempt to run
+    /// every cycle until the DMC is re-enabled. It just doesn't run until the
+    /// DMA is enabled, 2 or 3 cycles after a write to `$4015`."
+    /// (AccuracyCoin.asm, MIT, (c) 2025 Chris Siebert; its "Delta Modulation
+    /// Channel" subtests L, M and N are one cycle apart on purpose.)
+    pub not_before: u64,
 }
 
 /// A scheduled but unserviced fetch.
@@ -129,6 +151,9 @@ pub struct Dmc {
     irq: bool,
     /// A fetch waiting for the CPU.
     dma: Option<Pending>,
+    /// The cycle the channel's enable latch settles on after a `$4015` write
+    /// that started playback. See [`DmaRequest::not_before`].
+    enabled_at: u64,
     /// The CPU cycle playback last stopped on, explicitly or implicitly.
     ///
     /// Kept so the output unit can tell whether the buffer emptied *just* after
@@ -158,6 +183,7 @@ impl Dmc {
             timer: 0,
             irq: false,
             dma: None,
+            enabled_at: 0,
             stopped_at: None,
             next_serial: 1,
         }
@@ -260,6 +286,10 @@ impl Dmc {
     pub fn set_enabled(&mut self, enabled: bool, now: u64) {
         if enabled {
             if self.bytes_remaining == 0 {
+                // The channel was off, so this write starts it - and the enable
+                // does not latch on the write's own cycle. See
+                // [`DmaRequest::not_before`] and [`ENABLE_LATCH_CYCLES`].
+                self.enabled_at = now + ENABLE_LATCH_CYCLES;
                 self.restart();
             }
             self.schedule(DmaKind::Load, now);
@@ -294,6 +324,7 @@ impl Dmc {
             addr: self.cur_addr,
             serial: p.serial,
             at: p.at,
+            not_before: self.enabled_at,
         })
     }
 
@@ -465,7 +496,8 @@ impl Dmc {
         w.write_u64(self.next_serial)?;
         // Appended: the cycle a pending fetch was scheduled on, which decides
         // the phase it may halt the CPU on.
-        w.write_u64(self.dma.map_or(0, |p| p.at))
+        w.write_u64(self.dma.map_or(0, |p| p.at))?;
+        w.write_u64(self.enabled_at)
     }
 
     /// Restore what [`Dmc::save`] wrote.
@@ -493,6 +525,7 @@ impl Dmc {
         // has no such field; zero is the right restore, because a fetch whose
         // schedule cycle is already past halts on the next legal phase.
         let at = r.read_u64().unwrap_or(0);
+        self.enabled_at = r.read_u64().unwrap_or(0);
         self.dma = match kind {
             1 => Some(Pending {
                 kind: DmaKind::Load,
