@@ -9,6 +9,7 @@
 //! | Core | Feature | State |
 //! | --- | --- | --- |
 //! | `mos6502` | `cpu-mos6502` | cycle-accurate interpreter, illegal opcodes, disassembler |
+//! | `riscv` | `cpu-riscv` | RV64GC/RV32 interpreter, privileged modes, Sv39, software IEEE-754 |
 //!
 //! Every core ships an interpreter first; the IR frontend comes later and is
 //! differentially tested against it forever. **The interpreter is the oracle.**
@@ -16,3 +17,7 @@
 #[cfg(feature = "cpu-mos6502")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-mos6502")))]
 pub mod mos6502;
+
+#[cfg(feature = "cpu-riscv")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-riscv")))]
+pub mod riscv;

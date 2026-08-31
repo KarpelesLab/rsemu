@@ -1,0 +1,809 @@
+//! Address translation: the Sv39 and Sv32 page-table walk, PMP, and the
+//! software TLB that sits in front of both.
+//!
+//! *The RISC-V Instruction Set Manual, Volume II: Privileged Architecture*
+//! (CC-BY-4.0) — the "Supervisor Address Translation and Protection" chapter
+//! for `satp` and the Sv32/Sv39 walk algorithm, and the "Physical Memory
+//! Protection" chapter for the `pmpcfg`/`pmpaddr` matching rules.
+//!
+//! # Why the TLB is unconditional
+//!
+//! `ROADMAP.md` §4.1 makes the software TLB part of every CPU, not an
+//! MMU-only feature, and this is the core it was designed for. It is
+//! **derived state**: never serialized, and invalidated wholesale by a
+//! generation counter that `SFENCE.VMA`, a `satp` write and any `mstatus`
+//! change that alters translation all bump. A snapshot restores the
+//! generation and the TLB comes back empty, which is always correct and never
+//! stale.
+//!
+//! # Structure
+//!
+//! [`Tlb`] is direct-mapped and **split by access type**, which is what makes
+//! caching safe: an entry only exists because a walk for *that* access type
+//! succeeded, so a cached store translation has already had its dirty bit set
+//! and a cached fetch translation has already been checked for execute
+//! permission. One shared array would need the permission bits re-checked on
+//! every hit, which is most of the walk's cost back again.
+
+use super::csr::{Csrs, Priv, status};
+use super::isa::Xlen;
+
+/// What an access is for.
+///
+/// The three cases differ in which PTE permission bit they need, which fault
+/// they raise, and which half of the TLB they use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Access {
+    /// An instruction fetch.
+    Fetch,
+    /// A load, or the read half of an atomic.
+    Load,
+    /// A store, or the write half of an atomic.
+    Store,
+}
+
+impl Access {
+    /// The index of this access type's half of the TLB.
+    #[inline]
+    const fn slot(self) -> usize {
+        match self {
+            Access::Fetch => 0,
+            Access::Load => 1,
+            Access::Store => 2,
+        }
+    }
+}
+
+/// Why a translation failed.
+///
+/// The distinction matters to the guest: a page fault means "the tables say
+/// no" and a well-written kernel will handle it, while an access fault means
+/// "the physical memory protection says no" and normally will not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    /// The page tables refused, or a PTE is malformed.
+    Page,
+    /// PMP refused, or a page-table read itself faulted.
+    Access,
+}
+
+/// PTE bit positions, shared by Sv32 and Sv39.
+pub mod pte {
+    /// Valid.
+    pub const V: u64 = 1 << 0;
+    /// Readable.
+    pub const R: u64 = 1 << 1;
+    /// Writable.
+    pub const W: u64 = 1 << 2;
+    /// Executable.
+    pub const X: u64 = 1 << 3;
+    /// Accessible from user mode.
+    pub const U: u64 = 1 << 4;
+    /// Global: valid in every address space.
+    pub const G: u64 = 1 << 5;
+    /// Accessed.
+    pub const A: u64 = 1 << 6;
+    /// Dirty.
+    pub const D: u64 = 1 << 7;
+}
+
+/// The size of a page, in bytes and in bits.
+pub const PAGE_BITS: u32 = 12;
+/// The number of bytes in a page.
+pub const PAGE_SIZE: u64 = 1 << PAGE_BITS;
+
+/// Physical memory as the page-table walker needs to see it.
+///
+/// A trait rather than two closures because a walk both reads a PTE and may
+/// write it back to set the accessed and dirty bits, and threading two
+/// `FnMut`s through a loop is worse than one object.
+pub trait PhysMem {
+    /// Read a `bytes`-wide page-table entry from a physical address.
+    fn read_pte(&mut self, addr: u64, bytes: u32) -> Option<u64>;
+    /// Write a `bytes`-wide page-table entry back to a physical address.
+    fn write_pte(&mut self, addr: u64, bytes: u32, value: u64) -> Option<()>;
+}
+
+/// The parameters of one translation scheme.
+struct Scheme {
+    /// How many levels the walk has.
+    levels: u32,
+    /// How many bits of virtual page number each level consumes.
+    vpn_bits: u32,
+    /// How wide a page-table entry is, in bytes.
+    pte_bytes: u32,
+    /// How many bits of the virtual address are significant.
+    va_bits: u32,
+}
+
+/// Sv32: two levels of 10-bit indices over a 32-bit address space.
+const SV32: Scheme = Scheme {
+    levels: 2,
+    vpn_bits: 10,
+    pte_bytes: 4,
+    va_bits: 32,
+};
+
+/// Sv39: three levels of 9-bit indices over a 39-bit sign-extended address
+/// space.
+const SV39: Scheme = Scheme {
+    levels: 3,
+    vpn_bits: 9,
+    pte_bytes: 8,
+    va_bits: 39,
+};
+
+/// Whether address translation is switched on for `mode`.
+///
+/// Machine mode is never translated — Volume II is explicit that `satp` has no
+/// effect on M-mode accesses — which is why the effective privilege that
+/// `MPRV` produces is what this takes, not the current mode.
+#[must_use]
+pub fn translation_active(csrs: &Csrs, mode: Priv) -> bool {
+    if mode == Priv::Machine {
+        return false;
+    }
+    match csrs.xlen {
+        Xlen::Rv32 => csrs.satp >> 31 != 0,
+        Xlen::Rv64 => csrs.satp >> 60 == 8,
+    }
+}
+
+/// The address-space identifier currently installed, for tagging TLB entries.
+#[must_use]
+pub fn asid(csrs: &Csrs) -> u64 {
+    match csrs.xlen {
+        Xlen::Rv32 => (csrs.satp >> 22) & 0x1ff,
+        Xlen::Rv64 => (csrs.satp >> 44) & 0xffff,
+    }
+}
+
+/// The root page table's physical address.
+fn root(csrs: &Csrs) -> u64 {
+    let ppn = match csrs.xlen {
+        Xlen::Rv32 => csrs.satp & 0x3f_ffff,
+        Xlen::Rv64 => csrs.satp & 0xf_ffff_ffff_ffff,
+    };
+    ppn << PAGE_BITS
+}
+
+/// Translate a virtual address, walking the page tables.
+///
+/// Returns the physical address, or the fault to raise. The caller is
+/// responsible for the PMP check on the result — [`pmp_allows`] — because the
+/// walk itself must also PMP-check every table read, and doing both here would
+/// hide which one refused.
+///
+/// # Panics
+///
+/// Never: every array index is derived from a masked field.
+pub fn translate<M: PhysMem>(
+    csrs: &Csrs,
+    mem: &mut M,
+    addr: u64,
+    kind: Access,
+    mode: Priv,
+) -> Result<u64, Fault> {
+    if !translation_active(csrs, mode) {
+        return Ok(addr);
+    }
+    let s = match csrs.xlen {
+        Xlen::Rv32 => &SV32,
+        Xlen::Rv64 => &SV39,
+    };
+    // Sv39 requires bits 63:39 of the virtual address to be a sign extension
+    // of bit 38. An address that is not is not merely unmapped, it is
+    // malformed, and faults without a walk.
+    if csrs.xlen == Xlen::Rv64 {
+        let shift = 64 - s.va_bits;
+        if ((addr as i64) << shift) >> shift != addr as i64 {
+            return Err(Fault::Page);
+        }
+    }
+
+    let mut table = root(csrs);
+    let mut level = s.levels;
+    loop {
+        level -= 1;
+        let shift = PAGE_BITS + s.vpn_bits * level;
+        let index = (addr >> shift) & ((1 << s.vpn_bits) - 1);
+        let entry_addr = table + index * u64::from(s.pte_bytes);
+        // Every page-table read is itself a physical access and is subject to
+        // PMP; a walk that reads outside the permitted region is an access
+        // fault, not a page fault.
+        if !pmp_allows(csrs, entry_addr, u64::from(s.pte_bytes), Access::Load, mode) {
+            return Err(Fault::Access);
+        }
+        let pte = mem.read_pte(entry_addr, s.pte_bytes).ok_or(Fault::Access)?;
+
+        if pte & pte::V == 0 || (pte & pte::R == 0 && pte & pte::W != 0) {
+            // Invalid, or the reserved write-without-read encoding.
+            return Err(Fault::Page);
+        }
+        let ppn = pte >> 10;
+        if pte & (pte::R | pte::X) == 0 {
+            // A pointer to the next level down.
+            if level == 0 {
+                return Err(Fault::Page);
+            }
+            table = ppn << PAGE_BITS;
+            continue;
+        }
+
+        // A leaf. Check the permissions before anything else, so a
+        // permission failure never sets the accessed bit.
+        if !permitted(csrs, pte, kind, mode) {
+            return Err(Fault::Page);
+        }
+        // A superpage whose low physical page-number bits are not zero is
+        // misaligned and faults.
+        if level > 0 && ppn & ((1 << (s.vpn_bits * level)) - 1) != 0 {
+            return Err(Fault::Page);
+        }
+
+        // The specification allows either raising a page fault when A or D is
+        // clear, or setting them in hardware. Setting them is what real
+        // implementations do and what lets an operating system leave them out
+        // of its fault handler entirely.
+        let need = pte::A | if kind == Access::Store { pte::D } else { 0 };
+        if pte & need != need {
+            if !pmp_allows(
+                csrs,
+                entry_addr,
+                u64::from(s.pte_bytes),
+                Access::Store,
+                mode,
+            ) {
+                return Err(Fault::Access);
+            }
+            mem.write_pte(entry_addr, s.pte_bytes, pte | need)
+                .ok_or(Fault::Access)?;
+        }
+
+        // Assemble the physical address: the untranslated low bits of the
+        // virtual address for the levels the superpage spans, then the PTE's
+        // page number above.
+        let low_bits = PAGE_BITS + s.vpn_bits * level;
+        let phys = (ppn << PAGE_BITS) & !((1u64 << low_bits) - 1);
+        return Ok(phys | (addr & ((1u64 << low_bits) - 1)));
+    }
+}
+
+/// Whether a leaf PTE permits this access from this privilege.
+fn permitted(csrs: &Csrs, pte: u64, kind: Access, mode: Priv) -> bool {
+    let user_page = pte & pte::U != 0;
+    match mode {
+        Priv::User => {
+            if !user_page {
+                return false;
+            }
+        }
+        Priv::Supervisor => {
+            if user_page {
+                // A supervisor may never *execute* from a user page, and may
+                // only read or write one when SUM permits it.
+                if kind == Access::Fetch || csrs.mstatus & status::SUM == 0 {
+                    return false;
+                }
+            }
+        }
+        // Machine mode does not translate, so it never reaches this function.
+        Priv::Machine => {}
+    }
+    match kind {
+        Access::Fetch => pte & pte::X != 0,
+        // MXR makes an execute-only page readable, which is how a kernel
+        // inspects code it has mapped without execute-and-read permission.
+        Access::Load => pte & pte::R != 0 || (csrs.mstatus & status::MXR != 0 && pte & pte::X != 0),
+        Access::Store => pte & pte::W != 0,
+    }
+}
+
+/// Whether physical memory protection permits an access.
+///
+/// Volume II, "Physical Memory Protection": entries are matched in order and
+/// the **first** match decides, whether it grants or refuses. An M-mode access
+/// that matches an unlocked entry is permitted regardless of the entry's
+/// permission bits; a locked entry constrains M-mode too, which is what makes
+/// the lock bit useful. An S-mode or U-mode access that matches nothing is
+/// refused, because at least one entry is implemented.
+#[must_use]
+pub fn pmp_allows(csrs: &Csrs, addr: u64, len: u64, kind: Access, mode: Priv) -> bool {
+    let last = addr.wrapping_add(len.saturating_sub(1));
+    let mut matched = None;
+    for i in 0..csrs.pmp_count {
+        let cfg = csrs.pmpcfg[i];
+        let a = (cfg >> 3) & 3;
+        if a == 0 {
+            continue;
+        }
+        let (lo, hi) = match a {
+            // TOR: the previous entry's address is the bottom of the range.
+            1 => {
+                let lo = if i == 0 { 0 } else { csrs.pmpaddr[i - 1] << 2 };
+                (lo, csrs.pmpaddr[i] << 2)
+            }
+            2 => {
+                let base = csrs.pmpaddr[i] << 2;
+                (base, base + 4)
+            }
+            _ => napot(csrs.pmpaddr[i]),
+        };
+        if hi <= lo {
+            continue;
+        }
+        // An access that straddles the edge of a region is refused rather than
+        // split: the specification requires the whole access to match one
+        // entry.
+        if addr >= lo && addr < hi {
+            if last >= hi {
+                return false;
+            }
+            matched = Some(cfg);
+            break;
+        }
+        if last >= lo && last < hi {
+            return false;
+        }
+    }
+    match matched {
+        Some(cfg) => {
+            let locked = cfg & 0x80 != 0;
+            if mode == Priv::Machine && !locked {
+                return true;
+            }
+            let bit = match kind {
+                Access::Load => 0b001,
+                Access::Store => 0b010,
+                Access::Fetch => 0b100,
+            };
+            cfg & bit != 0
+        }
+        // No entry matched: machine mode may do anything, and so may everyone
+        // else if PMP is not implemented at all.
+        None => mode == Priv::Machine || csrs.pmp_count == 0,
+    }
+}
+
+/// Decode a NAPOT `pmpaddr` into a half-open physical range.
+///
+/// The encoding is a run of low ones marking the size: `yyyy0` is 8 bytes,
+/// `yyy01` is 16, and so on, with an all-ones register covering everything.
+fn napot(addr: u64) -> (u64, u64) {
+    let ones = (!addr).trailing_zeros();
+    if ones >= 62 {
+        return (0, u64::MAX);
+    }
+    let size_bits = ones + 3;
+    let base = (addr & !((1u64 << ones) - 1)) << 2;
+    (base, base + (1u64 << size_bits))
+}
+
+/// How many entries each half of the TLB holds.
+///
+/// Direct-mapped and a power of two, so a lookup is a mask and a compare —
+/// `ROADMAP.md` §9's fast path is "mask, compare, add" and this is the
+/// interpreter's version of it.
+pub const TLB_ENTRIES: usize = 256;
+
+/// One cached translation.
+#[derive(Debug, Clone, Copy, Default)]
+struct Entry {
+    /// The tag: virtual page number, ASID, privilege and generation, so a
+    /// stale entry can never be mistaken for a hit.
+    tag: u64,
+    /// The physical address of the page this maps to.
+    base: u64,
+    /// Whether this slot holds anything.
+    valid: bool,
+}
+
+/// The per-hart software TLB.
+///
+/// Derived state in the strict sense of `ROADMAP.md` §4.5: never serialized,
+/// and safe to throw away at any moment.
+#[derive(Debug)]
+pub struct Tlb {
+    slots: [[Entry; TLB_ENTRIES]; 3],
+    hits: u64,
+    misses: u64,
+}
+
+impl Default for Tlb {
+    fn default() -> Self {
+        Tlb::new()
+    }
+}
+
+impl Tlb {
+    /// An empty TLB.
+    #[must_use]
+    pub fn new() -> Tlb {
+        Tlb {
+            slots: [[Entry::default(); TLB_ENTRIES]; 3],
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Throw everything away.
+    ///
+    /// Cheaper than it looks and used rarely: the generation counter in the
+    /// tag already invalidates entries logically, so this exists for reset and
+    /// for a snapshot restore.
+    pub fn flush(&mut self) {
+        self.slots = [[Entry::default(); TLB_ENTRIES]; 3];
+    }
+
+    /// How many lookups hit and how many missed, for `rsemu` statistics.
+    #[must_use]
+    pub fn stats(&self) -> (u64, u64) {
+        (self.hits, self.misses)
+    }
+
+    /// The tag for a page.
+    #[inline]
+    fn tag(vpn: u64, asid: u64, mode: Priv, generation: u64) -> u64 {
+        // The generation goes in the high bits so a bump invalidates every
+        // entry at once without touching them.
+        (generation << 40) ^ (vpn.wrapping_mul(0x9e37_79b9_7f4a_7c15)) ^ (asid << 2) ^ mode.bits()
+    }
+
+    /// Look a page up.
+    #[inline]
+    pub fn lookup(
+        &mut self,
+        kind: Access,
+        vpn: u64,
+        asid: u64,
+        mode: Priv,
+        generation: u64,
+    ) -> Option<u64> {
+        let tag = Self::tag(vpn, asid, mode, generation);
+        let slot = &self.slots[kind.slot()][(vpn as usize) & (TLB_ENTRIES - 1)];
+        if slot.valid && slot.tag == tag {
+            self.hits += 1;
+            Some(slot.base)
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
+    /// Record a successful translation.
+    #[inline]
+    pub fn insert(
+        &mut self,
+        kind: Access,
+        vpn: u64,
+        asid: u64,
+        mode: Priv,
+        generation: u64,
+        base: u64,
+    ) {
+        self.slots[kind.slot()][(vpn as usize) & (TLB_ENTRIES - 1)] = Entry {
+            tag: Self::tag(vpn, asid, mode, generation),
+            base,
+            valid: true,
+        };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::csr::{Extensions, PMP_ENTRIES, num};
+    use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    /// A flat physical memory for the walker to read tables out of.
+    struct Ram(Vec<u8>);
+
+    impl PhysMem for Ram {
+        fn read_pte(&mut self, addr: u64, bytes: u32) -> Option<u64> {
+            let at = addr as usize;
+            let end = at + bytes as usize;
+            let slice = self.0.get(at..end)?;
+            let mut v = 0u64;
+            for (i, b) in slice.iter().enumerate() {
+                v |= u64::from(*b) << (8 * i);
+            }
+            Some(v)
+        }
+
+        fn write_pte(&mut self, addr: u64, bytes: u32, value: u64) -> Option<()> {
+            let at = addr as usize;
+            for i in 0..bytes as usize {
+                *self.0.get_mut(at + i)? = (value >> (8 * i)) as u8;
+            }
+            Some(())
+        }
+    }
+
+    /// An Sv39 hierarchy mapping one 4 KiB page, with the root at 0x1000.
+    fn sv39_machine(perms: u64) -> (Csrs, Ram) {
+        let mut ram = Ram(vec![0; 0x8000]);
+        // Level 2 entry at 0x1000 points at 0x2000; level 1 at 0x2000 points
+        // at 0x3000; level 0 at 0x3000 is the leaf for physical 0x4000.
+        ram.write_pte(0x1000, 8, ((0x2000 >> 12) << 10) | pte::V)
+            .unwrap();
+        ram.write_pte(0x2000, 8, ((0x3000 >> 12) << 10) | pte::V)
+            .unwrap();
+        ram.write_pte(0x3000, 8, ((0x4000 >> 12) << 10) | pte::V | perms)
+            .unwrap();
+        // PMP is left unimplemented in these fixtures so a walk exercises the
+        // page tables and nothing else; the PMP tests below build their own.
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, 0);
+        csrs.satp = (8 << 60) | (0x1000 >> 12);
+        csrs.priv_mode = Priv::Supervisor;
+        (csrs, ram)
+    }
+
+    #[test]
+    fn machine_mode_is_never_translated() {
+        let (csrs, mut ram) = sv39_machine(pte::R | pte::W | pte::A | pte::D);
+        assert_eq!(
+            translate(&csrs, &mut ram, 0x1234, Access::Load, Priv::Machine),
+            Ok(0x1234)
+        );
+    }
+
+    #[test]
+    fn a_three_level_walk_finds_the_leaf() {
+        let (csrs, mut ram) = sv39_machine(pte::R | pte::W | pte::A | pte::D);
+        assert_eq!(
+            translate(&csrs, &mut ram, 0x0123, Access::Load, Priv::Supervisor),
+            Ok(0x4123)
+        );
+    }
+
+    #[test]
+    fn permissions_are_enforced_per_access_type() {
+        let (csrs, mut ram) = sv39_machine(pte::R | pte::A);
+        assert!(translate(&csrs, &mut ram, 0, Access::Load, Priv::Supervisor).is_ok());
+        assert_eq!(
+            translate(&csrs, &mut ram, 0, Access::Store, Priv::Supervisor),
+            Err(Fault::Page)
+        );
+        assert_eq!(
+            translate(&csrs, &mut ram, 0, Access::Fetch, Priv::Supervisor),
+            Err(Fault::Page)
+        );
+    }
+
+    #[test]
+    fn the_user_bit_and_sum_decide_supervisor_access() {
+        let (mut csrs, mut ram) = sv39_machine(pte::R | pte::U | pte::A);
+        assert_eq!(
+            translate(&csrs, &mut ram, 0, Access::Load, Priv::Supervisor),
+            Err(Fault::Page),
+            "a supervisor needs SUM to read a user page"
+        );
+        csrs.mstatus |= status::SUM;
+        assert!(translate(&csrs, &mut ram, 0, Access::Load, Priv::Supervisor).is_ok());
+        // SUM never permits execution from a user page.
+        let (mut csrs, mut ram) = sv39_machine(pte::X | pte::U | pte::A);
+        csrs.mstatus |= status::SUM;
+        assert_eq!(
+            translate(&csrs, &mut ram, 0, Access::Fetch, Priv::Supervisor),
+            Err(Fault::Page)
+        );
+        // And a user may not touch a supervisor page.
+        let (csrs, mut ram) = sv39_machine(pte::R | pte::A);
+        assert_eq!(
+            translate(&csrs, &mut ram, 0, Access::Load, Priv::User),
+            Err(Fault::Page)
+        );
+    }
+
+    #[test]
+    fn mxr_makes_an_execute_only_page_readable() {
+        let (mut csrs, mut ram) = sv39_machine(pte::X | pte::A);
+        assert_eq!(
+            translate(&csrs, &mut ram, 0, Access::Load, Priv::Supervisor),
+            Err(Fault::Page)
+        );
+        csrs.mstatus |= status::MXR;
+        assert!(translate(&csrs, &mut ram, 0, Access::Load, Priv::Supervisor).is_ok());
+    }
+
+    #[test]
+    fn the_accessed_and_dirty_bits_are_set_by_the_walk() {
+        let (csrs, mut ram) = sv39_machine(pte::R | pte::W);
+        translate(&csrs, &mut ram, 0, Access::Store, Priv::Supervisor).unwrap();
+        let leaf = ram.read_pte(0x3000, 8).unwrap();
+        assert_ne!(leaf & pte::A, 0);
+        assert_ne!(leaf & pte::D, 0);
+        // A load sets A but not D.
+        let (csrs, mut ram) = sv39_machine(pte::R | pte::W);
+        translate(&csrs, &mut ram, 0, Access::Load, Priv::Supervisor).unwrap();
+        let leaf = ram.read_pte(0x3000, 8).unwrap();
+        assert_ne!(leaf & pte::A, 0);
+        assert_eq!(leaf & pte::D, 0);
+    }
+
+    #[test]
+    fn a_non_canonical_sv39_address_faults_without_a_walk() {
+        let (csrs, mut ram) = sv39_machine(pte::R | pte::A);
+        assert_eq!(
+            translate(
+                &csrs,
+                &mut ram,
+                0x0000_8000_0000_0000,
+                Access::Load,
+                Priv::Supervisor
+            ),
+            Err(Fault::Page)
+        );
+        // The top of the address space is canonical and merely unmapped.
+        assert_eq!(
+            translate(&csrs, &mut ram, !0xfffu64, Access::Load, Priv::Supervisor),
+            Err(Fault::Page)
+        );
+    }
+
+    #[test]
+    fn a_misaligned_superpage_faults() {
+        let mut ram = Ram(vec![0; 0x8000]);
+        // A level-1 leaf (2 MiB superpage) whose PPN[0] is not zero.
+        ram.write_pte(0x1000, 8, ((0x2000 >> 12) << 10) | pte::V)
+            .unwrap();
+        ram.write_pte(0x2000, 8, ((0x4001) << 10) | pte::V | pte::R | pte::A)
+            .unwrap();
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, 0);
+        csrs.satp = (8 << 60) | (0x1000 >> 12);
+        assert_eq!(
+            translate(&csrs, &mut ram, 0, Access::Load, Priv::Supervisor),
+            Err(Fault::Page)
+        );
+    }
+
+    #[test]
+    fn a_superpage_carries_the_low_virtual_bits_through() {
+        let mut ram = Ram(vec![0; 0x8000]);
+        ram.write_pte(0x1000, 8, ((0x2000 >> 12) << 10) | pte::V)
+            .unwrap();
+        // A 2 MiB superpage at physical 0x40_0000.
+        ram.write_pte(
+            0x2000,
+            8,
+            ((0x40_0000u64 >> 12) << 10) | pte::V | pte::R | pte::A,
+        )
+        .unwrap();
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, 0);
+        csrs.satp = (8 << 60) | (0x1000 >> 12);
+        assert_eq!(
+            translate(&csrs, &mut ram, 0x1_2345, Access::Load, Priv::Supervisor),
+            Ok(0x41_2345)
+        );
+    }
+
+    #[test]
+    fn the_reserved_write_without_read_encoding_faults() {
+        let (_, mut ram) = sv39_machine(0);
+        ram.write_pte(0x3000, 8, ((0x4000 >> 12) << 10) | pte::V | pte::W)
+            .unwrap();
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, 0);
+        csrs.satp = (8 << 60) | (0x1000 >> 12);
+        assert_eq!(
+            translate(&csrs, &mut ram, 0, Access::Load, Priv::Supervisor),
+            Err(Fault::Page)
+        );
+    }
+
+    #[test]
+    fn pmp_lets_machine_mode_through_when_nothing_is_configured() {
+        let csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
+        assert!(pmp_allows(
+            &csrs,
+            0x8000_0000,
+            4,
+            Access::Load,
+            Priv::Machine
+        ));
+        assert!(
+            !pmp_allows(&csrs, 0x8000_0000, 4, Access::Load, Priv::Supervisor),
+            "an unmatched supervisor access is refused"
+        );
+    }
+
+    #[test]
+    fn a_napot_entry_covers_its_declared_range() {
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
+        // A 16-byte NAPOT region at physical 0x1000: address = 0x1000>>2 with
+        // one trailing one.
+        csrs.pmpaddr[0] = (0x1000 >> 2) | 1;
+        csrs.pmpcfg[0] = 0b0001_1001; // A = NAPOT, R
+        assert!(pmp_allows(&csrs, 0x1000, 4, Access::Load, Priv::Supervisor));
+        assert!(pmp_allows(&csrs, 0x100c, 4, Access::Load, Priv::Supervisor));
+        assert!(!pmp_allows(
+            &csrs,
+            0x1010,
+            4,
+            Access::Load,
+            Priv::Supervisor
+        ));
+        assert!(!pmp_allows(
+            &csrs,
+            0x1000,
+            4,
+            Access::Store,
+            Priv::Supervisor
+        ));
+        // An access that straddles the top edge is refused whole.
+        assert!(!pmp_allows(
+            &csrs,
+            0x100e,
+            4,
+            Access::Load,
+            Priv::Supervisor
+        ));
+    }
+
+    #[test]
+    fn the_all_ones_napot_entry_covers_everything() {
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
+        csrs.pmpaddr[0] = u64::MAX >> 10;
+        csrs.pmpcfg[0] = 0b0001_1111;
+        for mode in [Priv::User, Priv::Supervisor, Priv::Machine] {
+            assert!(pmp_allows(&csrs, 0x8000_0000, 8, Access::Store, mode));
+        }
+    }
+
+    #[test]
+    fn a_tor_entry_uses_the_previous_address_as_its_base() {
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
+        csrs.pmpaddr[0] = 0x1000 >> 2;
+        csrs.pmpaddr[1] = 0x2000 >> 2;
+        csrs.pmpcfg[1] = 0b0000_1001; // A = TOR, R
+        assert!(!pmp_allows(&csrs, 0x0fff, 1, Access::Load, Priv::User));
+        assert!(pmp_allows(&csrs, 0x1000, 1, Access::Load, Priv::User));
+        assert!(!pmp_allows(&csrs, 0x2000, 1, Access::Load, Priv::User));
+    }
+
+    #[test]
+    fn a_locked_entry_constrains_machine_mode_too() {
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
+        csrs.pmpaddr[0] = u64::MAX >> 10;
+        csrs.pmpcfg[0] = 0x80 | 0b0001_1001; // locked, NAPOT, read-only
+        assert!(pmp_allows(&csrs, 0x1000, 4, Access::Load, Priv::Machine));
+        assert!(!pmp_allows(&csrs, 0x1000, 4, Access::Store, Priv::Machine));
+    }
+
+    #[test]
+    fn the_tlb_hits_only_on_an_exact_tag() {
+        let mut tlb = Tlb::new();
+        tlb.insert(Access::Load, 0x1234, 7, Priv::Supervisor, 3, 0x4000);
+        assert_eq!(
+            tlb.lookup(Access::Load, 0x1234, 7, Priv::Supervisor, 3),
+            Some(0x4000)
+        );
+        // A different access type, ASID, privilege or generation all miss.
+        assert_eq!(
+            tlb.lookup(Access::Store, 0x1234, 7, Priv::Supervisor, 3),
+            None
+        );
+        assert_eq!(
+            tlb.lookup(Access::Load, 0x1234, 8, Priv::Supervisor, 3),
+            None
+        );
+        assert_eq!(tlb.lookup(Access::Load, 0x1234, 7, Priv::User, 3), None);
+        assert_eq!(
+            tlb.lookup(Access::Load, 0x1234, 7, Priv::Supervisor, 4),
+            None
+        );
+        tlb.flush();
+        assert_eq!(
+            tlb.lookup(Access::Load, 0x1234, 7, Priv::Supervisor, 3),
+            None
+        );
+    }
+
+    #[test]
+    fn a_satp_write_invalidates_the_whole_tlb_by_generation() {
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
+        let before = csrs.translation_gen;
+        csrs.write(num::SATP, 8 << 60, 0).unwrap();
+        assert_ne!(csrs.translation_gen, before);
+    }
+}
