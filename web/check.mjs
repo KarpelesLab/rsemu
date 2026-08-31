@@ -264,6 +264,37 @@ if (nes) {
   console.log(`  ${colours.size} distinct colours in the last frame`);
   if (romPath) check(colours.size > 1, "a real cartridge draws more than one colour");
 
+  // Sound. A headless check cannot listen, but it can prove there is something
+  // to listen to and that listening changes nothing.
+  check(emu.hasAudio, "it has an audio device");
+  check(emu.audioChannels === 1, "mono, as an RP2A03 is");
+  check(emu.audioSetRate(44100) && emu.audioRate === 44100, "the page can set the output rate");
+  emu.audioConsume(emu.audioFrames());
+  const before = emu.stateHash();
+  emu.runFrames(30);
+  const heard = emu.audioFrames();
+  check(heard > 20000, `half a second produced ${heard} frames of audio at 44.1 kHz`);
+  const pcm = emu.audioView(heard);
+  check(
+    pcm.every((v) => v >= -1 && v <= 1),
+    "every sample is a normalised float in [-1, 1]",
+  );
+  check(emu.audioConsume(heard) === heard, "and the page drains what it copied");
+  check(emu.audioDropped() === 0, "nothing was dropped");
+
+  // The same thirty frames again with nobody reading the queue: the state hash
+  // must be identical, or the audio path is moving guest state.
+  emu.boot(nes.index, image);
+  emu.runFrames(30);
+  const ignored = emu.stateHash();
+  emu.boot(nes.index, image);
+  emu.audioSetRate(44100);
+  emu.runFrames(30);
+  let queued = emu.audioFrames();
+  emu.audioConsume(queued);
+  check(emu.stateHash() === ignored, "the state hash does not depend on the audio path");
+  check(before !== ignored, "and the machine did advance, so that was not a tautology");
+
   const hash = emu.stateHash();
   const state = emu.save();
   check(state.length > 0, `save state is ${state.length} bytes`);

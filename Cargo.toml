@@ -53,9 +53,9 @@ gdb = ["std"]
 display-png = ["std", "dep:oxideav-png"]
 
 # The browser demo (web/): the wasm exports the page calls, plus the machines it
-# offers — an NTSC NES with a picture, and an Apple 1 on a terminal. This is the
-# feature set `web/README.md` builds; plain `wasm` stays minimal so the CI wasm
-# job keeps checking the boundary rather than the catalog.
+# offers — an NTSC NES with a picture and sound, and an Apple 1 on a terminal.
+# This is the feature set `web/README.md` builds; plain `wasm` stays minimal so
+# the CI wasm job keeps checking the boundary rather than the catalog.
 demo = ["wasm", "machine-nes", "dev-nes-ppu", "dev-nes-apu", "machine-apple1"]
 
 # NES cartridges (src/dev/cart): iNES and NES 2.0 image parsing, the
@@ -68,6 +68,11 @@ dev-nes-cart = []
 # the DMC with its CPU-stalling sample fetch, the frame counter and its IRQ, and
 # the non-linear mixer. `no_std`, no floats in the time path. Pulls in nothing —
 # a NES build enables this plus a 6502 and a PPU.
+#
+# It also selects this chip's adapter in `host::audio` (`host/audio/nes.rs`),
+# which is what turns those samples into something a `.wav` or a browser can
+# play. The seam itself is not gated: like `host::display` it always compiles,
+# and the WAV writer needs no dependency to gate.
 dev-nes-apu = []
 
 # WebAssembly bindings (src/wasm.rs): plain C-ABI exports plus embedder-supplied

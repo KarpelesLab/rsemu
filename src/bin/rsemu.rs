@@ -68,6 +68,13 @@ RUN OPTIONS:
                         Needs a build with `display-png` and a machine with a
                         display; a machine with neither says so rather than
                         writing nothing
+    --record-audio <f>  Write the machine's sound to a RIFF/WAVE file when the
+                        run ends. Needs a machine with an audio device. The
+                        device's ring has to hold the whole run, so a recording
+                        is capped at about 18 seconds; longer runs say what they
+                        lost.
+    --audio-rate <hz>   Sample rate for --record-audio (default 44100)
+
     --gdb <addr>        Listen for GDB on <addr> and hold the machine stopped
                         until it attaches. `1234`, `:1234` and `host:1234` all
                         work; a bare port binds the loopback interface only,
@@ -225,6 +232,11 @@ struct RunArgs {
     /// Where to write a PNG of the display when the run ends, if `--screenshot`
     /// was given.
     screenshot: Option<String>,
+    /// Where to write a WAV of the sound when the run ends, if `--record-audio`
+    /// was given.
+    record_audio: Option<String>,
+    /// The rate `--record-audio` writes at.
+    audio_rate: u32,
     quiet: bool,
     /// Where to listen for a debugger, if `--gdb` was given.
     #[cfg(feature = "gdb")]
@@ -316,7 +328,7 @@ fn run(args: &[String]) -> ExitCode {
     // concrete type exists: construction. Installed unconditionally rather than
     // only under `--screenshot`, so that asking for a screenshot after the fact
     // is never the thing that changes how the machine was built.
-    if let Err(e) = install_capture(&mut options) {
+    if let Err(e) = install_capture(&mut options, &parsed) {
         return fail(&e);
     }
 
@@ -364,27 +376,71 @@ fn run(args: &[String]) -> ExitCode {
         eprintln!("rsemu: {e}");
         summarise(&machine);
         write_screenshot(&parsed);
+        write_recording(&parsed);
         return ExitCode::FAILURE;
     }
     summarise(&machine);
-    if !write_screenshot(&parsed) {
+    // Both, always: a `--screenshot` that failed must not be the reason a
+    // recording is silently skipped.
+    let drew = write_screenshot(&parsed);
+    let played = write_recording(&parsed);
+    if !drew || !played {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
 }
 
-/// Wrap the machine's bindings so a display device hands the host a handle.
+/// Wrap the machine's bindings so a display or audio device hands the host a
+/// handle.
 ///
-/// One arm per device family that publishes a scanout, exactly like the
-/// registration lists in `machine::catalog`: a family that is not named here is
-/// not in the build, and that is visible by reading the code.
+/// One arm per device family that publishes a scanout or a sample stream,
+/// exactly like the registration lists in `machine::catalog`: a family that is
+/// not named here is not in the build, and that is visible by reading the code.
 #[allow(unused_variables, unused_mut)]
-fn install_capture(options: &mut rsemu::machine::BuildOptions) -> rsemu::Result<()> {
+fn install_capture(
+    options: &mut rsemu::machine::BuildOptions,
+    args: &RunArgs,
+) -> rsemu::Result<()> {
     #[cfg(feature = "dev-nes-ppu")]
     rsemu::host::display::nes::capture::install(options)?;
     #[cfg(feature = "dev-pc-video")]
     rsemu::host::display::pc::capture::install(options)?;
+    #[cfg(feature = "dev-nes-apu")]
+    rsemu::host::audio::nes::capture::install(options, ring_for(args))?;
     Ok(())
+}
+
+/// How deep an audio device's output ring has to be for this run.
+///
+/// **The recording must not change how the machine is driven.** A headless run
+/// is one `run_for(span)` with nothing between, so there is no cadence at which
+/// the host could drain — which leaves exactly one honest option: make the ring
+/// big enough for the whole run. That is why a recording is capped at what the
+/// device will allocate (`dev::apu::MAX_SAMPLE_BUFFER`, about 18 seconds) and
+/// why `write_recording` reports what a longer run lost rather than quietly
+/// producing a short file.
+///
+/// Slicing the run instead would be worse than it sounds: `Machine::run_until`
+/// ends a quantum at `min(now + quantum, deadline, next deadline)`, so an extra
+/// deadline is an extra quantum boundary, and a run cut into pieces does not
+/// reach the same state as the same run taken whole. `--record-audio` would
+/// then change the state hash it is printed beside.
+///
+/// Zero when nothing is being recorded, which leaves whatever the machine
+/// description asked for untouched.
+///
+/// Only the audio interception calls it, so a build with no sound chip in it
+/// has no use for the function — and the compiler is right to say so rather
+/// than being told to be quiet, exactly as with `take_scanout`.
+#[cfg(feature = "dev-nes-apu")]
+fn ring_for(args: &RunArgs) -> u64 {
+    if args.record_audio.is_none() {
+        return 0;
+    }
+    // One sample per APU cycle at a little under 1 MHz, so a nanosecond of
+    // virtual time is under a thousandth of a sample. Dividing by 1000 is
+    // therefore an over-estimate by about 12%, which is the direction to err.
+    args.span.as_nanos() / 1_000
 }
 
 /// The display of the machine just built, if it has one this build can see.
@@ -454,6 +510,68 @@ fn write_screenshot(args: &RunArgs) -> bool {
                 eprintln!("rsemu: cannot write {path}: {e}");
                 false
             }
+        }
+    }
+}
+
+/// The sound of the machine just built, if it has any this build can hear.
+#[allow(unused_mut)]
+fn take_audio() -> Option<Box<dyn rsemu::host::audio::AudioSource>> {
+    #[cfg(feature = "dev-nes-apu")]
+    if let Some(s) = rsemu::host::audio::nes::capture::take() {
+        return Some(Box::new(s));
+    }
+    None
+}
+
+/// Write `--record-audio`'s WAV, reporting whether the run should still count
+/// as a success.
+///
+/// Returns true when nothing was asked for. As with `--screenshot`, a
+/// recording that could not be made is an error rather than a silence.
+fn write_recording(args: &RunArgs) -> bool {
+    let Some(path) = args.record_audio.as_deref() else {
+        return true;
+    };
+    use rsemu::host::audio::{AudioStream, SampleFormat, wav};
+
+    let Some(source) = take_audio() else {
+        eprintln!("rsemu: --record-audio: this machine has no audio device");
+        return false;
+    };
+    let mut stream = AudioStream::new(source, args.audio_rate, SampleFormat::S16);
+    // The whole run is in the device's ring, so nothing may be trimmed on the
+    // way out: the default queue limit is two seconds and this is not that.
+    stream.set_limit_frames(u64::MAX);
+    stream.pull();
+
+    let bytes = wav::encode(stream.info(), stream.buffer());
+    match std::fs::write(path, &bytes) {
+        Ok(()) => {
+            let frames = stream.buffer().frames();
+            if !args.quiet {
+                let ms = frames.saturating_mul(1000) / u64::from(args.audio_rate.max(1));
+                println!(
+                    "audio       {path} ({} Hz, {frames} frames, {}.{:03} s, {} bytes)",
+                    args.audio_rate,
+                    ms / 1000,
+                    ms % 1000,
+                    bytes.len()
+                );
+            }
+            let lost = stream.dropped();
+            if lost > 0 {
+                eprintln!(
+                    "rsemu: --record-audio: {lost} samples were lost. The device's ring holds \
+                     about 18 seconds of audio and this run was longer, so the file is its \
+                     *tail* — a ring keeps the newest. Record a shorter --for."
+                );
+            }
+            true
+        }
+        Err(e) => {
+            eprintln!("rsemu: cannot write {path}: {e}");
+            false
         }
     }
 }
@@ -774,6 +892,10 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         machine: String::new(),
         media: Vec::new(),
         screenshot: None,
+        // 44 100 rather than 48 000: it is what a `.wav` is expected to be, and
+        // every player on earth opens one without resampling it again.
+        record_audio: None,
+        audio_rate: 44_100,
         monitor: None,
         params: Vec::new(),
         // One second of virtual time: long enough to prove a machine runs,
@@ -836,6 +958,17 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             "--console" => out.console = Some(value(arg)?),
             "--headless" => out.headless = true,
             "--screenshot" => out.screenshot = Some(value(arg)?),
+            "--record-audio" => out.record_audio = Some(value(arg)?),
+            "--audio-rate" => {
+                let text = value(arg)?;
+                let hz: u32 = text
+                    .parse()
+                    .map_err(|_| format!("--audio-rate {text}: not a number of hertz"))?;
+                if !(8_000..=384_000).contains(&hz) {
+                    return Err(format!("--audio-rate {hz}: outside 8000..=384000 Hz"));
+                }
+                out.audio_rate = hz;
+            }
             "-q" | "--quiet" => out.quiet = true,
             other if other.starts_with('-') => {
                 return Err(format!("unknown option `{other}`"));

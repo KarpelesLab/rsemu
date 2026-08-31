@@ -29,6 +29,14 @@
 //! hands it to a canvas. `web/` is the browser demo that does the last of those,
 //! from the `demo` feature.
 //!
+//! The sound comes out through [`host::audio`], which is the same seam again: a
+//! device emits what the silicon does — the RP2A03 emits an unsigned level out
+//! of a non-linear DAC pair at 894 886.36… Hz — and the host centres it, applies
+//! the console's own RC network, resamples it to 44.1 or 48 kHz with an exact
+//! integer phase, and writes it to a `.wav` or hands it to WebAudio. Every float
+//! in that path is an amplitude, never a time, so a machine's state hash does
+//! not depend on whether anybody is listening.
+//!
 //! With `gdb`, [`host::gdb`] speaks the GDB remote serial protocol over TCP, so
 //! `rsemu debug apple1 --gdb :1234` is a guest a debugger can step through.
 //!
@@ -39,8 +47,10 @@
 //! contract for guest threads, and the record/replay funnel; the syscall
 //! kernel is a downstream crate's (`ROADMAP.md` §2.1).
 //!
-//! Not yet: audio anywhere but inside the APU; a native window; the IR and JIT;
-//! and the rest of the host layer (VNC, an interactive monitor console).
+//! Not yet: a native window or a native sound card — both need either a
+//! GUI/audio dependency the policy forbids or a seventh `unsafe` subsystem the
+//! ceiling forbids; the IR and JIT; and the rest of the host layer (VNC, an
+//! interactive monitor console).
 //!
 //! # `no_std`
 //!

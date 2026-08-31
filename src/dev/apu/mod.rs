@@ -42,13 +42,16 @@
 //!
 //! Resampling is likewise not here. [`Apu::take_samples`] hands out Q16 samples
 //! at the APU's own rate and the host layer decides what to do with them
-//! (`ROADMAP.md` §15, invariant 4).
+//! (`ROADMAP.md` §15, invariant 4) — see [`crate::host::audio`], where the
+//! adapter for this chip lives.
 //!
 //! # Deliberately not modelled
 //!
 //! - The RC filter chain after the DACs (90 Hz and 440 Hz high-pass, 14 kHz
 //!   low-pass). It is a host-side filter over the sample stream, and the
-//!   Famicom's is different again.
+//!   Famicom's is different again — so the corners are *declared* to the host
+//!   as [`StreamInfo::output_stage`](crate::host::audio::StreamInfo) and
+//!   applied there.
 //! - The pre-mode-flag 2A03 revisions, whose noise channel had no short mode
 //!   and whose rate `$F` lasted 2046 cycles.
 //! - Famiclones other than the UA6527P. The cycle reference chart lists two
@@ -115,6 +118,24 @@ use mixer::SampleRing;
 use noise::Noise;
 use pulse::Pulse;
 use triangle::Triangle;
+
+/// Capacity of the output ring when a machine does not say, in samples.
+///
+/// One NTSC video frame is 14 890 APU cycles and a PAL one is 16 627, so this
+/// is a little over four frames: enough that a host draining once per frame —
+/// which is the cadence every front end in this tree uses — never loses a
+/// sample, without reserving a megabyte for a machine nobody is listening to.
+///
+/// It is public because the host layer sizes the ring for its own drain cadence
+/// ([`crate::host::audio::nes::capture`]) and the two must not drift.
+pub const DEFAULT_SAMPLE_BUFFER: u64 = 65_536;
+
+/// The largest ring a machine may ask for, in samples.
+///
+/// 16 777 216 is about 18.7 seconds of NTSC audio and 33 MiB. A host that wants
+/// to record longer than that drains as it goes rather than buying a bigger
+/// bucket.
+pub const MAX_SAMPLE_BUFFER: u64 = 1 << 24;
 
 /// Register indices, as offsets from `$4000`.
 mod reg {
@@ -531,7 +552,11 @@ impl Apu {
     pub fn new(props: &Props) -> Result<Apu> {
         let mut reader = props.reader();
         let name = reader.or_enum("region", Region::Ntsc.name(), Region::NAMES)?;
-        let capacity = reader.or_range::<u64>("sample-buffer", 8192, 0..=1 << 24)?;
+        let capacity = reader.or_range::<u64>(
+            "sample-buffer",
+            DEFAULT_SAMPLE_BUFFER,
+            0..=MAX_SAMPLE_BUFFER,
+        )?;
         let halt_ultrasonic = reader.or("halt-ultrasonic", false)?;
         let phase = reader.or_range::<u64>("put-phase", 0, 0..=1)?;
         reader.finish()?;
@@ -1133,7 +1158,7 @@ static APU_PROPERTIES: &[PropertySpec] = &[
         name: "sample-buffer",
         kind: ValueKind::Uint,
         required: false,
-        summary: "audio ring capacity in samples; 0 produces no audio at all",
+        summary: "audio ring capacity in samples (default 65536); 0 produces no audio at all",
     },
     PropertySpec {
         name: "halt-ultrasonic",

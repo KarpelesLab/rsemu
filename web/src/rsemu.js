@@ -184,6 +184,61 @@ export class Rsemu {
     return new ImageData(pixels, this.width, this.height);
   }
 
+  // -- the sound ------------------------------------------------------------
+
+  // Interleaved `f32` in [-1, 1] at whatever rate was last announced, which is
+  // exactly what an `AudioBuffer` holds — the conversion from the console's own
+  // crystal-derived rate happened in Rust, where the exact ratio lives.
+
+  get hasAudio() {
+    return this.e.rsemu_has_audio() !== 0;
+  }
+
+  /**
+   * Tell rsemu what rate the page's `AudioContext` runs at.
+   *
+   * The browser picks that rate, not us, and it differs between machines. Say
+   * it once per context; anything queued at the old rate is discarded.
+   */
+  audioSetRate(hz) {
+    return this.e.rsemu_audio_set_rate(hz) !== 0;
+  }
+
+  get audioRate() {
+    return this.e.rsemu_audio_rate();
+  }
+
+  get audioChannels() {
+    return this.e.rsemu_audio_channels();
+  }
+
+  /** How many frames are waiting. A frame is one sample per channel. */
+  audioFrames() {
+    return this.e.rsemu_audio_frames();
+  }
+
+  /**
+   * A view over the queued frames.
+   *
+   * Like `imageData()`, a view rather than a copy, and like it the view must be
+   * rebuilt every time: this queue grows, and a wasm memory that grows detaches
+   * every existing view. Copy out of it before calling anything else.
+   */
+  audioView(frames) {
+    const count = frames * Math.max(1, this.audioChannels);
+    return new Float32Array(this.e.memory.buffer, this.e.rsemu_audio_ptr(), count);
+  }
+
+  /** Say the frames have been taken. Nothing drops them on its own. */
+  audioConsume(frames) {
+    return this.e.rsemu_audio_consume(frames);
+  }
+
+  /** Frames lost because the page did not keep up. A diagnostic, never state. */
+  audioDropped() {
+    return Number(this.e.rsemu_audio_dropped());
+  }
+
   // -- input ----------------------------------------------------------------
 
   /**
