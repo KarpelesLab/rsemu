@@ -47,7 +47,7 @@ anything**; this table records a point in time.
 | `nestest` + reference log | 6502 trace comparison — the fastest way to first-boot a 6502 | Licence unclear ⛔ | **No.** Run only |
 | Woz Monitor (Apple-1 Operation Manual, 1976) | The Apple 1's 256-byte monitor | **Public domain** ✅ — published pre-1978 with no copyright notice; see [`../platforms/apple1.md`](../platforms/apple1.md) | Yes |
 | [Ben Eater's Wozmon port](https://eater.net/6502) (`wozmon.s`, `wozmon.bin`) | The same monitor on a 65C51 ACIA | **CC-BY** ✅ — eater.net/6502 releases all video code under Creative Commons Attribution | Yes, **with attribution**: credit Ben Eater, name the licence, note any modification |
-| [AccuracyCoin](https://github.com/100thCoin/AccuracyCoin) | 125 NES accuracy tests on one NROM cart, with per-test error codes | **MIT** ✅ (© 2025 Chris Siebert — verified upstream; the copy in `../gones` predates the licence file) | Yes, with attribution |
+| [AccuracyCoin](https://github.com/100thCoin/AccuracyCoin) | 141 NES accuracy tests on one NROM cart, with per-test error codes | **MIT** ✅ (© 2025 Chris Siebert — verified upstream; the copy in `../gones` predates the licence file) | Yes, with attribution |
 | `zexall` / `zexdoc` | Z80 exerciser | Verify before use ⚠️ | Verify first |
 
 The MIT-licensed SingleStepTests corpora are the ones we could legitimately

@@ -118,8 +118,8 @@ too.
 
 ## Gate 3 — AccuracyCoin
 
-MIT, © 2025 Chris Siebert, <https://github.com/100thCoin/AccuracyCoin>. 125
-tests plus 5 information-only "DRAW" pages on one NROM cartridge.
+MIT, © 2025 Chris Siebert, <https://github.com/100thCoin/AccuracyCoin>. 141
+asserting tests plus 5 information-only "DRAW" pages on one NROM cartridge.
 
 ```sh
 scripts/fetch-testdata.sh accuracycoin
@@ -127,7 +127,7 @@ RSEMU_CONFORMANCE=1 cargo test --test conformance accuracycoin -- --nocapture
 ```
 
 Driven headlessly with no rendering and no human: boot, press Start at the menu,
-wait for the ROM's own completion flag, read 125 result bytes out of work RAM.
+wait for the ROM's own completion flag, read 141 result bytes out of work RAM.
 [`accuracycoin.md`](accuracycoin.md) documents exactly how, and why each byte
 means what it means.
 

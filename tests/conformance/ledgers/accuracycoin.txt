@@ -1,6 +1,8 @@
 # Known failures: AccuracyCoin (141 asserting whole-machine tests, MIT,
 # (c) 2025 Chris Siebert).
 #
+# **This file is empty. All 141 pass.**
+#
 # Keyed by the low byte of the test's result address rather than by name: the
 # address is what the ROM writes and is stable across releases, whereas the
 # display name is text on a menu. tests/conformance/accuracycoin_tests.rs has
@@ -15,22 +17,24 @@
 #   * The ROM targets an RP2A03G CPU and an RP2C02G PPU. A handful of tests
 #     legitimately behave differently on other revisions — a divergence must be
 #     traced to a documented revision difference before it is excused, not
-#     assumed to be one.
+#     assumed to be one. Two of them ask which of two known behaviours the part
+#     has and accept either: "Implicit DMA Abort" reports "Implicit Abort
+#     Behavior 1" for us, its post-1990 key set, which is what an RP2A03G
+#     should give.
 #   * The five "DRAW" pages assert nothing — they all share `result_DrawTest`
 #     on page 3 — and are excluded by the runner, so they can never appear here.
 #
 # ---------------------------------------------------------------------------
-# 2026-08-31: 130 of 141 pass, 11 fail.
-# 2026-09-01: 140 of 141 pass, 1 fails.
+# 2026-08-31: 130 of 141.  2026-09-01: **141 of 141**.
 # ---------------------------------------------------------------------------
 #
-# The measurement before this one read "81 of 125", through a stale copy of the
+# The measurement before those read "81 of 125", through a stale copy of the
 # ROM's `TestPages:` table. The pinned ROM carries 146 menu entries — 141 that
 # assert plus the 5 DRAW pages — and the old table named three addresses the ROM
 # never writes while omitting nineteen tests it does run. Regenerated against
 # the ROM, the honest starting point was **85 of 141**.
 #
-# What closed the other forty-five, in the order it was done:
+# What closed the first forty-five:
 #
 #   * `unassigned = open-bus` really is open bus. `MemAttrs::bus` carries the
 #     master's last driven byte and `AccessConstraints::internal()` marks a
@@ -46,8 +50,8 @@
 #     one get/put cadence and one precedence rule — and a stolen cycle carries
 #     the byte it left on the bus back into the core's latch.
 #   * `/NMI` on the dot it happens: the CPU's edge detector is clocked once per
-#     cycle, the PPU's output lags its request by a dot, and `next_event_dot`
-#     stopped dropping the two events it exists to report.
+#     cycle, the PPU's output lags its request, and `next_event_dot` stopped
+#     dropping the two events it exists to report.
 #   * The interrupt vector is latched on cycle five, not four, and a `/RDY`
 #     stretch polls once rather than on each of its cycles.
 #   * The PPU's OAM read bus, a delayed `$2001`, the shifters' serial input,
@@ -56,108 +60,73 @@
 #   * The APU's frame IRQ: the flag is not the line, `$4015` only arms its
 #     clear, and the output lags by a CPU cycle.
 #
-# What is left is eleven tests in four groups. Every entry names the error code
-# the ROM reported, what it measures, and what specifically is missing.
-
-# ---------------------------------------------------------------------------
-# A. The DMC's choreography against the OAM DMA — closed
-# ---------------------------------------------------------------------------
+# And what closed the last eleven, in four groups:
+#
+# --- The 2C02 has an address bus of its own -------------------------------
+#
+# A 2C02 access is **two dots**, because the chip multiplexes the low eight
+# address bits onto its eight data pins: ALE strobes them into an octal latch
+# on the cartridge board, and the read that follows composes the top six pins
+# *as they stand on the read dot* with the eight the latch is holding. With
+# that came the `$2007` state machine (ALE two PPU cycles after M2 falls, Read
+# two after that, and `v`'s increment at the end rather than during the CPU's
+# cycle), the two garbage *nametable* fetches inside each sprite slot, the
+# dot-337-340 pair, and the `$2006` write's own two-cycle path to `v`. That is
+# "$2007 Stress Test", "ALE + Read" and "Hybrid Addresses".
+#
+# "$2004 Stress Test" needed the OAM read line understood as *registered* — the
+# CPU takes the bus at the end of its cycle, so every phase boundary the guest
+# sees sits one dot after the sprite unit's own — plus steps 3 and 4 of sprite
+# evaluation reading secondary OAM on the even dot instead of writing it, and
+# step 3a reading its three entries rather than range-checking them.
+#
+# --- Three single-dot questions in the render pipeline --------------------
+#
+# The sprite X **counters** keep counting through forced blank while the
+# shifters stop (the ROM separates the two in consecutive subtests), and the
+# background shift registers' load pulse is registered too, so rendering
+# switched back on exactly at a reload dot misses that reload and the register
+# shifts its serial input in for another eight dots. With both, the artifact
+# "BG Serial In" draws starts on the very pixel its sprite zero sits on.
+#
+# "NMI at VBlank end" was one dot in the `/NMI` output register: the core
+# samples the pin on the φ1→φ2 boundary, one dot into its own three-dot cycle,
+# so the level it must be shown is two dots behind the request, not one. An
+# earlier attempt at that second dot "stopped the ROM booting" because
+# `next_event_dot` was not extended with it; moved together, the whole vblank
+# page passes at once.
+#
+# --- The DMC's choreography against the OAM DMA ---------------------------
 #
 # A DMC fetch is halt, dummy, [alignment], get, and only the get is an access.
-# The rest do nothing on the bus and are therefore allowed to **overlap** an
-# access another transfer is making — "no-operation cycles are allowed to
-# overlap with each other and with access cycles, allowing cycles to be saved"
-# (NESdev, DMA) — so a sprite copy runs straight through them and loses only the
-# get the DMC takes and the alignment it then needs. `Job` carried a single
-# `dummy` flag and stopped the copy on it; it now carries the count of no-op
-# cycles still owed, two for a fetch joining a core the copy has already halted
-# and one where the stretched read was the fetch's own halt. That is
-# "DMC DMA + OAM DMA", both of its thirty-two-entry sweeps.
+# The rest do nothing on the bus and are allowed to **overlap** an access
+# another transfer is making — "no-operation cycles are allowed to overlap with
+# each other and with access cycles, allowing cycles to be saved" (NESdev,
+# DMA) — so a sprite copy runs straight through them and loses only the get the
+# DMC takes and the alignment it then needs. That is "DMC DMA + OAM DMA".
 #
-# Also modelled, and what closed "Delta Modulation Channel" and
-# "Implicit DMA Abort":
+# Three more constants, each measured several times over rather than fitted:
+# the `$4015` enable latches three CPU cycles after the write that starts
+# playback (subtests L, M and N of the DMC test demand one, two and three
+# cycles of delay, and two and four fail all three); the memory reader's
+# counter settles a cycle *after* the byte arrives, which gives "Implicit DMA
+# Abort" its three-band answer key; and "the DMA cannot occur within 2 cycles
+# of a previous DMC DMA", the ROM's own words for that test's fourth subtest.
 #
-#   * the `$4015` enable latch. A fetch the timer schedules while an enabling
-#     `$4015` write is still settling is ready but may not halt until three CPU
-#     cycles after that write. Three is the ROM's own figure and it is measured
-#     three times over — subtests L, M and N of the DMC test write `$4015` two,
-#     one and zero cycles before the timer reaches zero and demand one, two and
-#     three cycles of delay — and both two and four fail all three.
-#   * the memory reader's counter settles a cycle *after* the byte arrives, so a
-#     sample buffer that empties before it does schedules an ordinary four-cycle
-#     fetch, one that empties within two cycles after it gets the one-cycle
-#     aborted DMA, and one later than that gets nothing. That three-band shape
-#     is "Implicit DMA Abort"'s three sixteen-entry keys.
-#   * "the DMA cannot occur within 2 cycles of a previous DMC DMA" — the ROM's
-#     own words for that test's fourth subtest. Without the gap a reload halts
-#     on the very next cycle, a get, and costs three cycles instead of four.
-#
-# Our profile is the one the ROM calls "Implicit Abort Behavior 1" (its
-# post-1990 CPU key set), which is consistent with targeting an RP2A03G.
-
-
-# ---------------------------------------------------------------------------
-# B. The 2A03's internal block does not answer a DMA aimed at somebody else
-# ---------------------------------------------------------------------------
+# --- The 2A03's internal block, and one address with two registers --------
 #
 # The chip decodes `$4000`-`$401F` from bits 4-0 of the DMA's address and bits
-# 15-5 of the *core's*. Half of that is modelled — a DMA read made while the
-# core sits inside the block also activates the aliased register, and the
-# resulting merge is what makes "DMC DMA Bus Conflicts" pass. The other half is
-# not: a DMA read of an address *inside* the block while the core is outside it
-# should reach nothing at all.
-
-5c                # $045C "APU Register Activation" code 4: an OAM DMA over
-                  # page $40 must not clear the frame interrupt flag, because
-                  # the block is on the 2A03 die and the DMA's address alone
-                  # cannot select it.
-                  #
-                  # Implemented and reverted, deliberately. Gating the primary
-                  # read makes code 4 pass and the test proceeds into code 5,
-                  # which *executes code out of open bus*; something in that
-                  # execution then overwrites the verdict byte of "DMC DMA Bus
-                  # Conflicts" — which had already been written, and passing —
-                  # with zero. Trading a test that passes for one that reports
-                  # "not run" is not progress, and the right fix is to find what
-                  # the floating fetch is executing, not to keep the half that
-                  # scores better. `read_with_conflict` says the same thing in
-                  # its own documentation.
-
-# ---------------------------------------------------------------------------
-# C. The PPU's own address bus
-# ---------------------------------------------------------------------------
+# 15-5 of the *core's*, and both halves of that are modelled now: a DMA read
+# aimed inside the block while the core is outside it reaches nothing at all.
+# The block also answers on two buses at once — the byte a transfer *carries*
+# and the byte left on the *pins* are different when an internal register like
+# `$4015` is involved, which is why "APU Register Activation" finds the APU
+# status in OAM while "DMC DMA Bus Conflicts" finds the cartridge's byte in
+# open bus.
 #
-# The 2C02's two-dot access — ALE into the board's octal latch, then the read
-# composed from the top six pins *as they stand on the read dot* and the eight
-# bits the latch is holding — is modelled now, and with it the `$2007` state
-# machine (ALE two PPU cycles after M2 falls, Read two after that), the two
-# garbage nametable fetches inside each sprite slot, the dot-337-340 pair, and
-# the `$2006` write's own two-cycle path to `v`. "$2007 Stress Test",
-# "ALE + Read" and "Hybrid Addresses" all pass. So does "$2004 Stress Test",
-# once the OAM read line is understood to be *registered* — the CPU takes the
-# bus at the end of its cycle, so every phase boundary the guest sees sits one
-# dot after the sprite unit's own — and once step 3a of sprite evaluation reads
-# its three entries rather than range-checking them.
-
-
-# ---------------------------------------------------------------------------
-# D. The single-dot questions in the render pipeline — closed
-# ---------------------------------------------------------------------------
-#
-# "Stale Sprite Shift Regs" and "BG Serial In" went together: the sprite X
-# **counters** keep counting through forced blank while the shifters stop (the
-# ROM separates the two in consecutive subtests), and the background shift
-# registers' load pulse is a *registered* signal, so rendering switched back on
-# exactly at a reload dot misses that reload and the register shifts its serial
-# input in for another eight dots. With both, the artifact "BG Serial In" draws
-# starts on the very pixel its sprite zero sits on, which is the arithmetic the
-# ROM was written around.
-#
-# "NMI at VBlank end" was the third, and it was one dot in the `/NMI` output
-# register: the core samples the pin on the φ1→φ2 boundary, one dot into its own
-# three-dot cycle, and the scheduler catches this chip up to the dot *after* the
-# cycle before the core looks — so the level the core must be shown is two dots
-# behind the request, not one. A previous attempt at that second dot "stopped
-# the ROM booting" because `next_event_dot` was not extended with it; with both
-# moved together every test on the vblank page passes at once.
-
+# The last of it was not a device bug at all but a missing mechanism: `$4017`
+# is *two registers on one address*, the APU frame counter on a write and
+# controller two on a read, and a `map` statement routes both halves of an
+# access to one region. `core::space` grew `Region::split` and the machine DSL
+# grew `split(reads, writes)` for it; `nes-ntsc` and `nes-pal` no longer have
+# to choose which half of `$4017` to have.

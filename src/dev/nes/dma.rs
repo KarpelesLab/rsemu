@@ -39,7 +39,7 @@
 //! That is why a DMC fetch landing inside a sprite copy costs the copy two
 //! cycles rather than four: the halt and dummy pass straight over the copy's
 //! own get and put, the DMC takes the next get, and the copy needs one
-//! alignment cycle to get back on its phase. See [`Job::noop`].
+//! alignment cycle to get back on its phase.
 //!
 //! A *load* fetch — one a `$4015` write scheduled — starts trying to halt on
 //! the get cycle of the second APU cycle after that write, which is the third
@@ -550,20 +550,20 @@ impl Gate {
         match act {
             Act::Release | Act::Halted | Act::Hold => data,
             Act::OamRead(addr) => {
-                let byte = self.read_with_conflict(&space, attrs, addr, held);
+                let (byte, pins) = self.read_with_conflict(&space, attrs, addr, held);
                 self.shared.latch_oam(byte);
-                byte
+                pins
             }
             Act::OamWrite(byte) => {
                 let _ = space.write(OAM_DATA_ADDR, Width::U8, u64::from(byte), attrs);
                 byte
             }
             Act::DmcRead(addr, serial) => {
-                let byte = self.read_with_conflict(&space, attrs, u64::from(addr), held);
+                let (byte, pins) = self.read_with_conflict(&space, attrs, u64::from(addr), held);
                 if let Some(dmc) = dmc {
                     dmc.complete(serial, byte);
                 }
-                byte
+                pins
             }
         }
     }
@@ -581,26 +581,83 @@ impl Gate {
     /// bits 4-0, so a conflicting read of `$4016` comes back as the sample
     /// byte's top three bits with the controller's in the bottom.
     ///
-    /// Not a wired-AND: a register that drives nothing — `$4015`, which is
-    /// internal, and the whole write-only stretch below it — leaves the DMA's
-    /// byte alone rather than erasing it.
+    /// Not a wired-AND: a register that drives nothing — the whole write-only
+    /// stretch of the block — leaves the DMA's byte alone rather than erasing
+    /// it.
     ///
-    /// The **other** half of the same decode is not modelled yet: a DMA read of
-    /// an address inside the block while the core is *outside* it should reach
-    /// nothing at all, since the block is on the 2A03 die and there is no
-    /// external responder behind it. "APU Register Activation" code 4 is
-    /// exactly that, and the ledger says why it is still open.
-    fn read_with_conflict(&self, bus: &AddressSpace, attrs: MemAttrs, addr: u64, held: u64) -> u8 {
-        let external = bus.read(addr, Width::U8, attrs).unwrap_or(0) as u8;
-        if held & INTERNAL_MASK != INTERNAL_BASE {
-            return external;
+    /// # Two answers, because there are two buses
+    ///
+    /// The byte the transfer **carries** and the byte left on the **pins** are
+    /// not always the same, and AccuracyCoin measures each of them separately.
+    /// `$4015` is on the 2A03's own die: its value reaches the DMA over the
+    /// internal bus and shows up in OAM — "APU Register Activation" reads the
+    /// whole block through an OAM DMA over RAM full of `$FF` and expects the
+    /// APU status byte, not the `$FF` — but it never drives the pins, so a CPU
+    /// reading open bus afterwards still sees what the cartridge put there.
+    /// "DMC DMA Bus Conflicts" is the other half of that and says so in its own
+    /// preamble: "the value the CPU reads, and the value that the DMC DMA
+    /// reloads the shift counter with ... these values are different, and this
+    /// test can only check for the value the CPU sees" (AccuracyCoin.asm, MIT,
+    /// (c) 2025 Chris Siebert).
+    ///
+    /// Returns `(carried, pins)`.
+    ///
+    /// The **other** half of the same decode is the same statement read
+    /// backwards: a DMA read of an address inside the block while the core is
+    /// *outside* it reaches nothing at all, because the block is on the 2A03
+    /// die and there is no external responder behind it. An OAM DMA over page
+    /// `$40` therefore does not clear the frame interrupt flag, which is what
+    /// "APU Register Activation" code 4 measures.
+    fn read_with_conflict(
+        &self,
+        bus: &AddressSpace,
+        attrs: MemAttrs,
+        addr: u64,
+        held: u64,
+    ) -> (u8, u8) {
+        let core_inside = held & INTERNAL_MASK == INTERNAL_BASE;
+        if !core_inside && addr & INTERNAL_MASK == INTERNAL_BASE {
+            // The other half of the decode: the block is selected by bits 15-5
+            // of the *core's* address, so with the core outside it nothing
+            // answers a DMA aimed inside it and the data bus keeps what it had.
+            // "If the OAM address bus is pointing to $4000 through $401F, and
+            // the 6502 address bus isn't, then the OAM DMA will only read open
+            // bus from that range" (AccuracyCoin.asm, "APU Register
+            // Activation", MIT, (c) 2025 Chris Siebert).
+            return (attrs.bus, attrs.bus);
+        }
+        let external = match bus.read_driven(addr, Width::U8, attrs) {
+            Ok((v, _)) => v as u8,
+            Err(_) => attrs.bus,
+        };
+        if !core_inside {
+            return (external, external);
         }
         let alias = INTERNAL_BASE | (addr & 0x1f);
         // The register is handed the DMA's byte as its bus value, so whatever
         // it does not drive floats through.
-        match bus.read_driven(alias, Width::U8, attrs.with_bus(external)) {
-            Ok((v, true)) => v as u8,
-            _ => external,
+        //
+        // Whether it drives the *external* pins decides what happens when
+        // something out on the cartridge is driving them too. `$4015` is on the
+        // 2A03's own die and leaves the pins alone, so a sample fetched from
+        // ROM at an address ending `$15` comes back as the ROM byte and not as
+        // the APU's status — which is what makes "DMC DMA Bus Conflicts" work.
+        // But when nothing external answered at all, the internal register's
+        // value is the only thing on the bus and the DMA reads it: an OAM DMA
+        // over a page nothing decodes comes back full of APU status bytes,
+        // which is what "APU Register Activation" measures.
+        // The aliased register is handed the DMA's byte on *both* buses: the
+        // transfer's own byte is what the internal bus is carrying while it
+        // runs, so `$4015`'s open-bus bit comes from that and not from the
+        // core's. "APU Register Activation" reads the block through a DMA over
+        // RAM full of `$FF` and expects `$24` — bit 5 of the DMA's byte.
+        let attrs = attrs.with_bus(external).with_core_bus(external);
+        match bus.read_driven(alias, Width::U8, attrs) {
+            Ok((v, drives)) => {
+                let v = v as u8;
+                (v, if drives { v } else { external })
+            }
+            Err(_) => (external, external),
         }
     }
 }

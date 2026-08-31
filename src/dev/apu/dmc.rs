@@ -126,8 +126,7 @@ pub struct DmaRequest {
     /// Modulation Channel" subtests L, M and N are one cycle apart on purpose.)
     ///
     /// And two fetches cannot be back to back: "the DMA cannot occur within 2
-    /// cycles of a previous DMC DMA" ("Implicit DMA Abort", subtest 4). See
-    /// [`ENABLE_LATCH_CYCLES`] and [`FETCH_SPACING_CYCLES`].
+    /// cycles of a previous DMC DMA" ("Implicit DMA Abort", subtest 4).
     ///
     /// (AccuracyCoin.asm, MIT, (c) 2025 Chris Siebert.)
     pub not_before: u64,

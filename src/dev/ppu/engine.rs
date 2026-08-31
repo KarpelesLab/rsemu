@@ -1677,7 +1677,7 @@ impl Engine {
         // Coarse X moves at dots 8, 16, ... 256, 328 and 336 (NESdev PPU
         // scrolling) — after the read on that dot, which is the high bitplane
         // of the tile the increment is finishing.
-        if dot % 8 == 0 && ((8..=256).contains(&dot) || dot == 328 || dot == 336) {
+        if dot.is_multiple_of(8) && ((8..=256).contains(&dot) || dot == 328 || dot == 336) {
             self.increment_coarse_x();
         }
         if dot == 256 {
