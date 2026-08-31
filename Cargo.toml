@@ -104,6 +104,13 @@ cpu-arm = []
 # dependencies and is `no_std + alloc`.
 cpu-z80 = []
 
+# The Intel 8086/8088 core (src/cpu/x86): a real-mode interpreter with every
+# documented and undocumented encoding, segment:offset addressing that wraps at
+# 1 MiB, a separate I/O address space, the prefetch queue, and a disassembler
+# generated from the same table. Gated against SingleStepTests/8088, a corpus
+# captured from real silicon. Adds no dependencies and is `no_std + alloc`.
+cpu-x86 = []
+
 [lib]
 name = "rsemu"
 path = "src/lib.rs"
