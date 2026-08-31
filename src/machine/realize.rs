@@ -21,8 +21,10 @@
 //! 4. **Realize** every device, in declaration order, draining its deferred
 //!    actions after each. A failure here unrealizes what was already realized
 //!    and returns — a half-wired machine never escapes this function.
-//! 5. **Map** every `map` statement into its space. This is the last step that
-//!    can take `&mut AddressSpace`; see the seam note below.
+//! 5. **Map** every `map` statement into its space, through
+//!    [`AddressSpace::topology`](crate::core::space::AddressSpace::topology).
+//!    Nothing about this step is final any more: a space stays retopologisable
+//!    after realize, which is what hot-plug and a BAR move need.
 //! 6. **Bind**: hand each device its clock domain and its address space.
 //! 7. **Wire** (§4.3): build one [`Wire`] per net, connect sinks weakly, hand
 //!    each driving pin its [`WireSource`].
@@ -56,12 +58,13 @@
 //! Recorded here because they are load-bearing and invisible from inside any
 //! one module:
 //!
-//! * **`AddressSpace` topology takes `&mut self`.** A device that initiates
-//!   accesses needs to hold its space (§4.4's `Initiator`), which means an
-//!   `Arc` — and once an `Arc` has clones, nothing can borrow it mutably
-//!   again. Spaces are therefore mapped *before* they are handed out, and a
-//!   post-realize retopology (a BAR move, hot-plug) needs the space behind a
-//!   `core::sync::RwLock`, or `map`/`unmap`/`remap` need to take `&self`.
+//! * **`AddressSpace` topology used to take `&mut self`,** which meant a space
+//!   handed out as an `Arc` (§4.4's `Initiator` needs one) could never be
+//!   retopologised again. It now lives behind a `core::sync::RwLock` at
+//!   `LockRank::TOPOLOGY` and `AddressSpace::topology()` hands out the write
+//!   guard, so mapping before or after realize is the same operation and
+//!   hot-plug is expressible. The order below is unchanged only because a
+//!   machine still wants its memory map complete before the first access.
 //! * **Catch-up cannot reach the scheduler.** `Scheduler::sync_for_access`
 //!   takes `&mut self`, but the access path that must call it —
 //!   `MemOps::read` — has `&self`. Sync-on-access (§4.2) is therefore not
@@ -679,10 +682,10 @@ impl<'a> Realizer<'a> {
     // -- the memory map ----------------------------------------------------
 
     fn map_regions(&mut self) -> Result<Vec<(String, AddressSpace)>> {
-        let mut spaces = core::mem::take(&mut self.spaces);
+        let spaces = core::mem::take(&mut self.spaces);
         for mapping in &self.machine.maps {
             let index = mapping.space.0 as usize;
-            let Some((name, space)) = spaces.get_mut(index) else {
+            let Some((name, space)) = spaces.get(index) else {
                 return Err(config(
                     self.machine.name.clone(),
                     format!("mapping names address space {index}, which does not exist"),
@@ -715,7 +718,12 @@ impl<'a> Realizer<'a> {
             };
             self.shape
                 .add_region(name, region.name(), mapping.base, mapping.size);
-            space.map_with(SpaceMapping::new(region, mapping.base).with_priority(priority))?;
+            // One guard per statement rather than one for the whole loop:
+            // consecutive `map` statements may name different spaces, and two
+            // topology guards at once is a lock-order violation.
+            space
+                .topology()
+                .map_with(SpaceMapping::new(region, mapping.base).with_priority(priority))?;
         }
         Ok(spaces)
     }

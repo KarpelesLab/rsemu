@@ -149,8 +149,9 @@ struct Harness {
 impl Harness {
     fn with_config(cfg: Config) -> Harness {
         let bus = Arc::new(TestBus::new());
-        let mut space = AddressSpace::new("cpu", 16).with_unassigned(UnassignedPolicy::FAULT);
+        let space = AddressSpace::new("cpu", 16).with_unassigned(UnassignedPolicy::FAULT);
         space
+            .topology()
             .map(Region::io("ram", 0x1_0000, bus.clone()), 0)
             .expect("64 KiB fits in a 16-bit space");
         let cpu = Arc::new(Mos6502::new(cfg));
@@ -1107,8 +1108,9 @@ fn a_refused_access_reads_open_bus_and_is_counted() {
     // bus-error input, so the read returns the last value on the bus — but the
     // counter says it happened.
     let bus = Arc::new(TestBus::new());
-    let mut space = AddressSpace::new("cpu", 16).with_unassigned(UnassignedPolicy::FAULT);
+    let space = AddressSpace::new("cpu", 16).with_unassigned(UnassignedPolicy::FAULT);
     space
+        .topology()
         .map(Region::io("ram", 0x8000, bus.clone()), 0)
         .unwrap();
     let cpu = Mos6502::new(Config::default());

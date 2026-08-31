@@ -29,8 +29,8 @@
 //! ram.write_u8(0xc000, 0xa9).unwrap();
 //! ram.write_u8(0xc001, 0x42).unwrap();
 //!
-//! let mut space = AddressSpace::new("cpu", 16);
-//! space.map(Region::ram("ram", ram), 0).unwrap();
+//! let space = AddressSpace::new("cpu", 16);
+//! space.topology().map(Region::ram("ram", ram), 0).unwrap();
 //!
 //! let cpu = Mos6502::new(Config::default());
 //! cpu.attach_space(Arc::new(space));

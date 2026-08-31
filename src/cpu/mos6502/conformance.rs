@@ -293,8 +293,9 @@ fn run_file(path: &Path, cfg: Config) -> Vec<Failure> {
             bus.0.lock().0[cell[0].num() as usize] = cell[1].num() as u8;
         }
 
-        let mut space = AddressSpace::new("cpu", 16).with_unassigned(UnassignedPolicy::FAULT);
+        let space = AddressSpace::new("cpu", 16).with_unassigned(UnassignedPolicy::FAULT);
         space
+            .topology()
             .map(Region::io("ram", 0x1_0000, bus.clone()), 0)
             .expect("64 KiB fits");
         let cpu = Mos6502::new(cfg);

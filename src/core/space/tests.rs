@@ -7,7 +7,9 @@
 //! and it is the thing that says whether this design works.
 
 use super::*;
-use alloc::sync::Arc;
+use crate::core::device::Deferred;
+use crate::core::sync;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -183,9 +185,9 @@ fn ram(name: &str, len: u64) -> (Arc<RamStore>, Region) {
 
 #[test]
 fn ram_round_trips_through_the_space() {
-    let mut space = AddressSpace::new("mem", 32);
+    let space = AddressSpace::new("mem", 32);
     let (store, region) = ram("ram", 0x1000);
-    space.map(region, 0x1000).unwrap();
+    space.topology().map(region, 0x1000).unwrap();
 
     space
         .write(0x1004, Width::U32, 0xdead_beef, MemAttrs::DEFAULT)
@@ -212,10 +214,10 @@ fn ram_round_trips_through_the_space() {
 
 #[test]
 fn a_region_that_does_not_fit_is_refused_at_map_time() {
-    let mut space = AddressSpace::new("small", 16);
+    let space = AddressSpace::new("small", 16);
     let (_, region) = ram("big", 0x1_0000);
-    assert!(space.map(region, 0x8000).is_err());
-    assert!(space.flat_view().is_empty());
+    assert!(space.topology().map(region, 0x8000).is_err());
+    assert!(space.view().flat_view().is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -224,13 +226,13 @@ fn a_region_that_does_not_fit_is_refused_at_map_time() {
 
 #[test]
 fn a_bar_at_higher_priority_covers_the_ram_under_it() {
-    let mut space = AddressSpace::new("mem", 32);
+    let space = AddressSpace::new("mem", 32);
     let (ram_store, ram_region) = ram("ram", 0x4000);
     let bar_ops = Arc::new(Scratch::new(0x100));
     let bar = Region::io("bar", 0x100, bar_ops.clone());
 
-    space.map(ram_region, 0).unwrap();
-    space.map_with_priority(bar, 0x1000, 1).unwrap();
+    space.topology().map(ram_region, 0).unwrap();
+    space.topology().map_with_priority(bar, 0x1000, 1).unwrap();
 
     // The RAM underneath still exists and is untouched by a write to the BAR.
     ram_store.write_at(0x1000, &[0xaa]).unwrap();
@@ -255,18 +257,18 @@ fn a_bar_at_higher_priority_covers_the_ram_under_it() {
     );
 
     // Three entries: RAM, BAR, RAM.
-    assert_eq!(space.flat_view().len(), 3);
+    assert_eq!(space.view().flat_view().len(), 3);
 }
 
 #[test]
 fn equal_priority_is_broken_by_mapping_order() {
-    let mut space = AddressSpace::new("mem", 16);
+    let space = AddressSpace::new("mem", 16);
     let (first, a) = ram("a", 0x100);
     let (second, b) = ram("b", 0x100);
     first.write_at(0, &[1]).unwrap();
     second.write_at(0, &[2]).unwrap();
-    space.map(a, 0).unwrap();
-    space.map(b, 0).unwrap();
+    space.topology().map(a, 0).unwrap();
+    space.topology().map(b, 0).unwrap();
     // Later wins, so a machine file reads top to bottom with overrides last.
     assert_eq!(space.read(0, Width::U8, MemAttrs::DEFAULT).unwrap(), 2);
 }
@@ -286,9 +288,9 @@ fn priority_inside_a_container_does_not_leak_out_of_it() {
         vec![Mapping::new(inner, 0).with_priority(1000)],
     );
 
-    let mut space = AddressSpace::new("mem", 16);
-    space.map_with_priority(container, 0, 0).unwrap();
-    space.map_with_priority(outer, 0, 1).unwrap();
+    let space = AddressSpace::new("mem", 16);
+    space.topology().map_with_priority(container, 0, 0).unwrap();
+    space.topology().map_with_priority(outer, 0, 1).unwrap();
     assert_eq!(space.read(0, Width::U8, MemAttrs::DEFAULT).unwrap(), 0x22);
 }
 
@@ -298,12 +300,12 @@ fn priority_inside_a_container_does_not_leak_out_of_it() {
 
 #[test]
 fn an_alias_is_the_same_memory_seen_twice() {
-    let mut space = AddressSpace::new("mem", 16);
+    let space = AddressSpace::new("mem", 16);
     let (store, region) = ram("ram", 0x800);
     let region: RegionRef = region.into();
     let mirror = Region::alias("mirror", region.clone(), 0, 0x800).unwrap();
-    space.map(region, 0).unwrap();
-    space.map(mirror, 0x800).unwrap();
+    space.topology().map(region, 0).unwrap();
+    space.topology().map(mirror, 0x800).unwrap();
 
     space
         .write(0x0004, Width::U16, 0x1234, MemAttrs::DEFAULT)
@@ -333,13 +335,17 @@ fn an_alias_window_must_fit_inside_its_target() {
 
 #[test]
 fn a_repeating_window_is_one_entry_however_many_times_it_mirrors() {
-    let mut space = AddressSpace::new("mem", 16);
+    let space = AddressSpace::new("mem", 16);
     let (store, region) = ram("ram", 0x800);
     let region: RegionRef = region.into();
     let mirrored = Region::mirror("ram-mirror", region, 0x2000).unwrap();
-    space.map(mirrored, 0).unwrap();
+    space.topology().map(mirrored, 0).unwrap();
 
-    assert_eq!(space.flat_view().len(), 1, "a mirror is one flat entry");
+    assert_eq!(
+        space.view().flat_view().len(),
+        1,
+        "a mirror is one flat entry"
+    );
 
     store.write_at(0x10, &[0x5a]).unwrap();
     for base in [0x0000u64, 0x0800, 0x1000, 0x1800] {
@@ -385,11 +391,11 @@ fn a_rebase_slides_a_window_without_bumping_the_generation() {
     let prg: RegionRef = Region::rom("prg", rom, RomWrite::Ignore).into();
     let window: RegionRef = Region::alias("prg-bank", prg, 0, 0x2000).unwrap().into();
 
-    let mut space = AddressSpace::new("cpu", 16);
-    space.map(window.clone(), 0x8000).unwrap();
+    let space = AddressSpace::new("cpu", 16);
+    space.topology().map(window.clone(), 0x8000).unwrap();
 
     let gen_before = space.generation();
-    let entries_before = space.flat_view().len();
+    let entries_before = space.view().flat_view().len();
 
     for bank in 0..16u64 {
         space.rebase(&window, bank * 0x2000).unwrap();
@@ -409,29 +415,29 @@ fn a_rebase_slides_a_window_without_bumping_the_generation() {
         gen_before,
         "a rebase must not invalidate a single translation block"
     );
-    assert_eq!(space.flat_view().len(), entries_before);
+    assert_eq!(space.view().flat_view().len(), entries_before);
 }
 
 #[test]
 fn a_retopology_bumps_the_generation() {
-    let mut space = AddressSpace::new("mem", 16);
+    let space = AddressSpace::new("mem", 16);
     let (_, a) = ram("a", 0x100);
     let (_, b) = ram("b", 0x100);
 
     let g0 = space.generation();
-    let id = space.map(a, 0).unwrap();
+    let id = space.topology().map(a, 0).unwrap();
     let g1 = space.generation();
     assert!(g1 > g0, "map is a retopology");
 
-    space.map(b, 0x100).unwrap();
+    space.topology().map(b, 0x100).unwrap();
     let g2 = space.generation();
     assert!(g2 > g1);
 
-    space.remap(id, 0x200).unwrap();
+    space.topology().remap(id, 0x200).unwrap();
     let g3 = space.generation();
     assert!(g3 > g2, "moving a mapping is a retopology, not a rebase");
 
-    space.unmap(id).unwrap();
+    space.topology().unmap(id).unwrap();
     assert!(space.generation() > g3);
 }
 
@@ -442,8 +448,8 @@ fn a_rebase_through_two_aliases_composes() {
     let inner: RegionRef = Region::alias("inner", rom, 0, 32).unwrap().into();
     let outer: RegionRef = Region::alias("outer", inner.clone(), 0, 16).unwrap().into();
 
-    let mut space = AddressSpace::new("mem", 16);
-    space.map(outer.clone(), 0).unwrap();
+    let space = AddressSpace::new("mem", 16);
+    space.topology().map(outer.clone(), 0).unwrap();
 
     assert_eq!(space.read(0, Width::U8, MemAttrs::DEFAULT).unwrap(), 0);
     space.rebase(&inner, 16).unwrap();
@@ -461,8 +467,8 @@ fn a_rebase_that_is_really_a_retopology_is_refused() {
         Region::container("bridge", 0x100, vec![Mapping::new(inner, 0)]).into();
     let window: RegionRef = Region::alias("win", container, 0, 0x80).unwrap().into();
 
-    let mut space = AddressSpace::new("mem", 16);
-    space.map(window.clone(), 0).unwrap();
+    let space = AddressSpace::new("mem", 16);
+    space.topology().map(window.clone(), 0).unwrap();
     // Sliding a window onto a container changes which regions appear in it.
     assert!(space.rebase(&window, 0x80).is_err());
 
@@ -470,7 +476,7 @@ fn a_rebase_that_is_really_a_retopology_is_refused() {
     let (_, leaf) = ram("leaf", 0x100);
     let leaf: RegionRef = leaf.into();
     let ok: RegionRef = Region::alias("ok", leaf, 0, 0x80).unwrap().into();
-    space.map(ok.clone(), 0x100).unwrap();
+    space.topology().map(ok.clone(), 0x100).unwrap();
     assert!(space.rebase(&ok, 0x80).is_ok());
     assert!(space.rebase(&ok, 0x81).is_err());
     // Not an alias at all.
@@ -485,8 +491,11 @@ fn a_rebase_that_is_really_a_retopology_is_refused() {
 #[test]
 fn a_32_bit_only_register_rejects_a_byte_write() {
     let ops = Arc::new(Reg32::default());
-    let mut space = AddressSpace::new("mem", 16);
-    space.map(Region::io("reg", 4, ops.clone()), 0x100).unwrap();
+    let space = AddressSpace::new("mem", 16);
+    space
+        .topology()
+        .map(Region::io("reg", 4, ops.clone()), 0x100)
+        .unwrap();
 
     assert_eq!(
         space.write(0x100, Width::U8, 0x12, MemAttrs::DEFAULT),
@@ -510,6 +519,7 @@ fn a_32_bit_only_register_rejects_a_byte_write() {
 
     // Misaligned, and a bulk burst, are both rejected too.
     space
+        .topology()
         .map(Region::io("reg2", 8, Arc::new(Reg32::default())), 0x200)
         .unwrap();
     assert_eq!(
@@ -527,8 +537,8 @@ fn a_32_bit_only_register_rejects_a_byte_write() {
 fn secure_and_privileged_regions_reject_the_wrong_master() {
     let (_, region) = ram("secure-ram", 0x100);
     let region = region.with_constraints(AccessConstraints::ANY.with_secure_only(true));
-    let mut space = AddressSpace::new("mem", 16);
-    space.map(region, 0).unwrap();
+    let space = AddressSpace::new("mem", 16);
+    space.topology().map(region, 0).unwrap();
 
     assert_eq!(
         space.read(0, Width::U8, MemAttrs::DEFAULT),
@@ -546,10 +556,13 @@ fn secure_and_privileged_regions_reject_the_wrong_master() {
 #[test]
 fn per_region_endianness_is_honoured() {
     let be = Arc::new(BeReg::default());
-    let mut space = AddressSpace::new("mem", 16);
-    space.map(Region::io("be", 2, be.clone()), 0x10).unwrap();
+    let space = AddressSpace::new("mem", 16);
+    space
+        .topology()
+        .map(Region::io("be", 2, be.clone()), 0x10)
+        .unwrap();
     let (store, le) = ram("le", 2);
-    space.map(le, 0x20).unwrap();
+    space.topology().map(le, 0x20).unwrap();
 
     space
         .write(0x10, Width::U16, 0x1234, MemAttrs::DEFAULT)
@@ -583,8 +596,9 @@ fn per_region_endianness_is_honoured() {
 #[test]
 fn a_debug_read_does_not_pop_a_fifo() {
     let fifo = Arc::new(Fifo::new(&[0x11, 0x22, 0x33]));
-    let mut space = AddressSpace::new("mem", 16);
+    let space = AddressSpace::new("mem", 16);
     space
+        .topology()
         .map(Region::io("fifo", 1, fifo.clone()), 0x40)
         .unwrap();
 
@@ -653,13 +667,13 @@ fn unassigned_policies() {
 
 #[test]
 fn a_hole_between_two_regions_follows_the_policy() {
-    let mut space = AddressSpace::new("mem", 16).with_unassigned(UnassignedPolicy::ONES);
+    let space = AddressSpace::new("mem", 16).with_unassigned(UnassignedPolicy::ONES);
     let (a_store, a) = ram("a", 2);
     let (b_store, b) = ram("b", 2);
     a_store.write_at(0, &[1, 2]).unwrap();
     b_store.write_at(0, &[3, 4]).unwrap();
-    space.map(a, 0).unwrap();
-    space.map(b, 6).unwrap();
+    space.topology().map(a, 0).unwrap();
+    space.topology().map(b, 6).unwrap();
 
     let mut buf = [0u8; 8];
     space.read_bytes(0, &mut buf, MemAttrs::DEFAULT).unwrap();
@@ -672,10 +686,13 @@ fn a_hole_between_two_regions_follows_the_policy() {
 
 #[test]
 fn retry_is_returned_before_a_commit_and_refused_after_one() {
-    let mut space = AddressSpace::new("mem", 16);
+    let space = AddressSpace::new("mem", 16);
     let (_, region) = ram("ram", 4);
-    space.map(region, 0).unwrap();
-    space.map(Region::io("busy", 4, Arc::new(Busy)), 4).unwrap();
+    space.topology().map(region, 0).unwrap();
+    space
+        .topology()
+        .map(Region::io("busy", 4, Arc::new(Busy)), 4)
+        .unwrap();
 
     // Nothing has happened yet: the caller may retry.
     let mut buf = [0u8; 4];
@@ -703,9 +720,12 @@ fn retry_is_returned_before_a_commit_and_refused_after_one() {
 
 #[test]
 fn writes_mark_pages_dirty_and_reads_do_not() {
-    let mut space = AddressSpace::new("mem", 32);
+    let space = AddressSpace::new("mem", 32);
     let store = Arc::new(RamStore::with_page_bits(0x4000, 12));
-    space.map(Region::ram("fb", store.clone()), 0).unwrap();
+    space
+        .topology()
+        .map(Region::ram("fb", store.clone()), 0)
+        .unwrap();
 
     assert_eq!(store.dirty_page_count(), 0);
     space.read(0x2000, Width::U32, MemAttrs::DEFAULT).unwrap();
@@ -750,16 +770,21 @@ fn writes_mark_pages_dirty_and_reads_do_not() {
 #[test]
 fn a_dense_table_agrees_with_the_flat_view_everywhere() {
     let build = |policy: DispatchPolicy| {
-        let mut space = AddressSpace::new("mem", 32).with_dispatch(policy);
+        let space = AddressSpace::new("mem", 32).with_dispatch(policy);
         let store = Arc::new(RamStore::new(0x8000));
         for i in 0..0x8000u64 {
             store.write_u8(i, (i & 0xff) as u8).unwrap();
         }
-        space.map(Region::ram("ram", store), 0x1_0000).unwrap();
         space
+            .topology()
+            .map(Region::ram("ram", store), 0x1_0000)
+            .unwrap();
+        space
+            .topology()
             .map(Region::io("io", 0x20, Arc::new(Scratch::new(0x20))), 0x4000)
             .unwrap();
         space
+            .topology()
             .map(Region::io("io2", 0x8, Arc::new(Scratch::new(0x8))), 0x4100)
             .unwrap();
         space.with_unassigned(UnassignedPolicy::ONES)
@@ -769,14 +794,15 @@ fn a_dense_table_agrees_with_the_flat_view_everywhere() {
         page_bits: 12,
         cover: 0x2_0000,
     });
-    assert!(flat.dispatch().is_none());
-    let table = dense.dispatch().expect("dense table asked for");
+    assert!(flat.view().dispatch().is_none());
+    let dense_view = dense.view();
+    let table = dense_view.dispatch().expect("dense table asked for");
     assert_eq!(table.len(), 0x20);
 
     // The 32-byte I/O window is a sub-page entry; a full RAM page is direct.
     assert_eq!(table.lookup(0x4000), Some(DispatchEntry::SubPage));
     assert_eq!(table.lookup(0x1_1000), {
-        let i = dense.flat_view().find(0x1_1000).unwrap() as u32;
+        let i = dense.view().flat_view().find(0x1_1000).unwrap() as u32;
         Some(DispatchEntry::Direct(i))
     });
     assert_eq!(table.lookup(0x3000), Some(DispatchEntry::Unassigned));
@@ -811,10 +837,13 @@ fn a_dense_table_agrees_with_the_flat_view_everywhere() {
 
 #[test]
 fn auto_dispatch_declines_a_tiny_map() {
-    let mut space = AddressSpace::new("mem", 16).with_dispatch(DispatchPolicy::Auto);
+    let space = AddressSpace::new("mem", 16).with_dispatch(DispatchPolicy::Auto);
     let (_, region) = ram("ram", 0x800);
-    space.map(region, 0).unwrap();
-    assert!(space.dispatch().is_none(), "one entry needs no table");
+    space.topology().map(region, 0).unwrap();
+    assert!(
+        space.view().dispatch().is_none(),
+        "one entry needs no table"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -834,8 +863,8 @@ fn a_wired_or_container_combines_its_children() {
         CombinePolicy::WiredOr,
     );
 
-    let mut space = AddressSpace::new("mem", 16);
-    space.map(bus, 0).unwrap();
+    let space = AddressSpace::new("mem", 16);
+    space.topology().map(bus, 0).unwrap();
     assert_eq!(
         space.read(0, Width::U8, MemAttrs::DEFAULT).unwrap(),
         0b1010_0101
@@ -907,30 +936,33 @@ fn the_nes_memory_map() {
 
     // The 6502 sees an open bus: unmapped reads return the last thing on it,
     // which for our purposes is all-ones, and we want them counted.
-    let mut cpu = AddressSpace::new("cpu", 16)
+    let cpu = AddressSpace::new("cpu", 16)
         .with_unassigned(UnassignedPolicy::ONES.logged())
         .with_dispatch(DispatchPolicy::Dense {
             page_bits: 12,
             cover: 0x1_0000,
         });
 
-    cpu.map(
-        Region::mirror("wram-mirror", wram_region, 0x2000).unwrap(),
-        0,
-    )
-    .unwrap();
-    cpu.map(
-        Region::mirror("ppu-mirror", ppu_region, 0x2000).unwrap(),
-        0x2000,
-    )
-    .unwrap();
-    cpu.map(Region::io("apu-io", 0x20, apu_ops.clone()), 0x4000)
+    cpu.topology()
+        .map(
+            Region::mirror("wram-mirror", wram_region, 0x2000).unwrap(),
+            0,
+        )
         .unwrap();
-    cpu.map(bank_lo.clone(), 0x8000).unwrap();
-    cpu.map(bank_hi, 0xc000).unwrap();
+    cpu.topology()
+        .map(
+            Region::mirror("ppu-mirror", ppu_region, 0x2000).unwrap(),
+            0x2000,
+        )
+        .unwrap();
+    cpu.topology()
+        .map(Region::io("apu-io", 0x20, apu_ops.clone()), 0x4000)
+        .unwrap();
+    cpu.topology().map(bank_lo.clone(), 0x8000).unwrap();
+    cpu.topology().map(bank_hi, 0xc000).unwrap();
 
     // Five regions, five flat entries plus the two holes are not entries.
-    assert_eq!(cpu.flat_view().len(), 5);
+    assert_eq!(cpu.view().flat_view().len(), 5);
 
     // --- RAM, mirrored four times -------------------------------------
     cpu.write(0x0000, Width::U8, 0x42, MemAttrs::DEFAULT)
@@ -1025,7 +1057,8 @@ fn the_nes_memory_map() {
     );
 
     // --- The dispatch table over a 64 KiB space ------------------------
-    let table = cpu.dispatch().expect("dense table asked for");
+    let cpu_view = cpu.view();
+    let table = cpu_view.dispatch().expect("dense table asked for");
     assert_eq!(table.len(), 16);
     // RAM pages are the fast path.
     assert!(matches!(
@@ -1072,8 +1105,8 @@ fn a_bridge_window_translates_addresses_through_two_levels() {
     );
     let outer = Region::container("root-bus", 0x1000, vec![Mapping::new(inner, 0x200)]);
 
-    let mut space = AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::ZEROS);
-    space.map(outer, 0x1000).unwrap();
+    let space = AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::ZEROS);
+    space.topology().map(outer, 0x1000).unwrap();
 
     // $1000 + $200 + $40 + 3
     space
@@ -1084,9 +1117,9 @@ fn a_bridge_window_translates_addresses_through_two_levels() {
     assert_eq!(seen[0], 0xab, "the device sees its own register offset");
 
     // Only the device's 16 bytes are mapped; the rest of the bridge is a hole.
-    assert_eq!(space.flat_view().len(), 1);
-    assert_eq!(space.flat_view().entries()[0].start(), 0x1240);
-    assert_eq!(space.flat_view().entries()[0].len(), 0x10);
+    assert_eq!(space.view().flat_view().len(), 1);
+    assert_eq!(space.view().flat_view().entries()[0].start(), 0x1240);
+    assert_eq!(space.view().flat_view().entries()[0].len(), 0x10);
 }
 
 #[test]
@@ -1098,8 +1131,8 @@ fn an_alias_onto_a_container_exposes_its_children_shifted() {
     // The top half of the container, seen at $2000.
     let window = Region::alias("upper-half", container, 0x80, 0x80).unwrap();
 
-    let mut space = AddressSpace::new("mem", 16);
-    space.map(window, 0x2000).unwrap();
+    let space = AddressSpace::new("mem", 16);
+    space.topology().map(window, 0x2000).unwrap();
     assert_eq!(
         space.read(0x2000, Width::U8, MemAttrs::DEFAULT).unwrap(),
         0x5a
@@ -1113,13 +1146,307 @@ fn a_container_does_not_decode_past_its_own_end() {
     // The container is only $80 wide, so the top half of the RAM inside it is
     // simply not decoded — a window does not wrap.
     let container = Region::container("narrow", 0x80, vec![Mapping::new(region, 0)]);
-    let mut space = AddressSpace::new("mem", 16).with_unassigned(UnassignedPolicy::ONES);
-    space.map(container, 0).unwrap();
+    let space = AddressSpace::new("mem", 16).with_unassigned(UnassignedPolicy::ONES);
+    space.topology().map(container, 0).unwrap();
 
-    assert_eq!(space.flat_view().extent(), 0x80);
+    assert_eq!(space.view().flat_view().extent(), 0x80);
     assert_eq!(space.read(0x7f, Width::U8, MemAttrs::DEFAULT).unwrap(), 0);
     assert_eq!(
         space.read(0x80, Width::U8, MemAttrs::DEFAULT).unwrap(),
         0xff
     );
+}
+
+// ---------------------------------------------------------------------------
+// Sharing, and the topology guard
+// ---------------------------------------------------------------------------
+//
+// The blocking flaw these cover, stated once: topology used to take `&mut
+// self`, so as soon as a machine wrapped a space in an `Arc` and handed clones
+// to its bus masters (§4.4's `Initiator`), nothing could borrow it mutably
+// again and a BAR move or a hot-plug was unrepresentable.
+
+/// A device that moves its own aperture when written — a PCI BAR in miniature.
+///
+/// `inline` selects the *wrong* way to do it, which the lock ladder must catch
+/// rather than merely discourage.
+#[derive(Debug)]
+struct Bar {
+    /// Filled in once the mapping exists. `Weak`, so the region the space holds
+    /// does not keep that space alive.
+    link: sync::Mutex<Option<(Weak<AddressSpace>, MappingId)>>,
+    /// Where a handler that plays by the rules puts its remap.
+    queue: sync::Mutex<Deferred>,
+    inline: bool,
+}
+
+impl Bar {
+    fn new(inline: bool) -> Bar {
+        Bar {
+            link: sync::Mutex::new(None),
+            queue: sync::Mutex::new(Deferred::new()),
+            inline,
+        }
+    }
+
+    fn attach(&self, space: &Arc<AddressSpace>, id: MappingId) {
+        *self.link.lock() = Some((Arc::downgrade(space), id));
+    }
+
+    /// Run whatever the last write deferred, with no lock of ours held.
+    fn drain(&self) -> usize {
+        // The queue is taken out rather than drained under the lock: the
+        // actions reach back into the space, and holding a lock across an
+        // outward call is the mistake this whole exercise is about.
+        let mut pending = core::mem::take(&mut *self.queue.lock());
+        pending.drain()
+    }
+}
+
+impl MemOps for Bar {
+    fn read(&self, _offset: u64, dst: &mut [u8], _attrs: MemAttrs) -> MemResult {
+        dst.fill(0);
+        Ok(())
+    }
+
+    fn write(&self, _offset: u64, src: &[u8], _attrs: MemAttrs) -> MemResult {
+        // Read the link into a local so the `link` lock is released before
+        // anything outward happens — including before the deliberate mistake,
+        // so what that asserts is TOPOLOGY-under-TOPOLOGY rather than an
+        // artefact of holding a leaf.
+        let link = self.link.lock().clone();
+        let Some((space, id)) = link else {
+            return Ok(());
+        };
+        let base = u64::from(src[0]) << 12;
+        if self.inline {
+            // Wrong: this handler was reached *through* the space's read guard,
+            // so taking the write guard here inverts the ladder.
+            if let Some(space) = space.upgrade() {
+                let _ = space.topology().remap(id, base);
+            }
+        } else {
+            // Right: queue it, and let the caller run it once we have returned
+            // and the access has released its guard.
+            self.queue.lock().push(move || {
+                if let Some(space) = space.upgrade() {
+                    let _ = space.topology().remap(id, base);
+                }
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A space with a one-byte BAR register at $0000 and 4 KiB of RAM at $8000.
+fn bar_machine(inline: bool) -> (Arc<AddressSpace>, Arc<Bar>, MappingId) {
+    let (store, ram_region) = ram("bar-ram", 0x1000);
+    store.write_at(0, &[0xa5]).unwrap();
+    let bar = Arc::new(Bar::new(inline));
+
+    let space = Arc::new(AddressSpace::new("mem", 20).with_unassigned(UnassignedPolicy::ONES));
+    let id = {
+        let mut topo = space.topology();
+        topo.map(Region::io("bar-reg", 1, bar.clone()), 0).unwrap();
+        topo.map(ram_region, 0x8000).unwrap()
+    };
+    bar.attach(&space, id);
+    (space, bar, id)
+}
+
+#[test]
+fn a_shared_space_can_still_be_retopologised() {
+    let (store, region) = ram("ram", 0x100);
+    store.write_at(0, &[0x77]).unwrap();
+    let space = Arc::new(AddressSpace::new("mem", 16).with_unassigned(UnassignedPolicy::ONES));
+
+    // Two more holders, exactly as a CPU and a DMA engine would be.
+    let cpu_view = Arc::clone(&space);
+    let dma_view = Arc::clone(&space);
+    assert_eq!(Arc::strong_count(&space), 3);
+
+    // Every line below goes through `&AddressSpace`.
+    let id = space.topology().map(region, 0x1000).unwrap();
+    assert_eq!(
+        cpu_view.read(0x1000, Width::U8, MemAttrs::DEFAULT).unwrap(),
+        0x77
+    );
+
+    // A BAR move, from a shared handle.
+    space.topology().remap(id, 0x4000).unwrap();
+    assert_eq!(
+        cpu_view.read(0x1000, Width::U8, MemAttrs::DEFAULT).unwrap(),
+        0xff,
+        "the old aperture is gone"
+    );
+    assert_eq!(
+        dma_view.read(0x4000, Width::U8, MemAttrs::DEFAULT).unwrap(),
+        0x77
+    );
+
+    // And a hot-unplug.
+    space.topology().unmap(id).unwrap();
+    assert_eq!(
+        dma_view.read(0x4000, Width::U8, MemAttrs::DEFAULT).unwrap(),
+        0xff
+    );
+}
+
+#[test]
+fn a_rebase_through_a_shared_space_still_leaves_the_generation_alone() {
+    // The property the guard had to preserve: `rebase` takes a read guard and a
+    // retopology takes the write guard, so the cheap case provably cannot touch
+    // the topology even now that both are callable from `&self`.
+    let mut rom = Vec::new();
+    for bank in 0..4u8 {
+        rom.extend(core::iter::repeat_n(bank, 0x2000));
+    }
+    let prg: RegionRef = Region::rom("prg", Arc::new(RomStore::new(rom)), RomWrite::Ignore).into();
+    let window: RegionRef = Region::alias("prg-bank", prg, 0, 0x2000).unwrap().into();
+
+    let space = Arc::new(AddressSpace::new("cpu", 16));
+    let mapper = Arc::clone(&space);
+    let id = space.topology().map(window.clone(), 0x8000).unwrap();
+
+    let gen_after_map = space.generation();
+    let entries = space.view().flat_view().len();
+    for bank in 0..4u64 {
+        mapper.rebase(&window, bank * 0x2000).unwrap();
+        assert_eq!(
+            space.read(0x8000, Width::U8, MemAttrs::DEFAULT).unwrap(),
+            bank
+        );
+    }
+    assert_eq!(
+        space.generation(),
+        gen_after_map,
+        "a rebase must not invalidate a single TLB entry"
+    );
+    assert_eq!(space.view().flat_view().len(), entries);
+
+    // The retopology next door does bump it, so the counter is not simply dead.
+    space.topology().remap(id, 0xa000).unwrap();
+    assert!(space.generation() > gen_after_map);
+}
+
+#[test]
+fn a_remap_from_a_write_handler_goes_through_deferred() {
+    let (space, bar, id) = bar_machine(false);
+
+    // The BAR write reaches the handler through the space's *read* guard, so
+    // the handler queues the move instead of making it.
+    space.write(0, Width::U8, 0x04, MemAttrs::DEFAULT).unwrap();
+    assert_eq!(
+        space.read(0x8000, Width::U8, MemAttrs::DEFAULT).unwrap(),
+        0xa5,
+        "nothing observable happens until the queue is drained"
+    );
+
+    // The caller drains once the handler has returned and the guard is gone.
+    assert_eq!(bar.drain(), 1);
+    assert_eq!(
+        space.read(0x8000, Width::U8, MemAttrs::DEFAULT).unwrap(),
+        0xff,
+        "the aperture moved"
+    );
+    assert_eq!(
+        space.read(0x4000, Width::U8, MemAttrs::DEFAULT).unwrap(),
+        0xa5
+    );
+
+    // And it really was the mapping the device was handed, not a new one.
+    let view = space.view();
+    assert!(view.mappings().any(|(i, m)| i == id && m.base == 0x4000));
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn a_topology_lock_under_a_bus_lock_is_a_ladder_violation() {
+    // A CPU holds a BUS-ranked lock across every access it issues (see
+    // `Mos6502`), and TOPOLOGY sits *above* BUS because a retopology calls down
+    // into buses. Taking one under the other is the inversion that deadlocks a
+    // threaded backend, and the rank check reports it without having to try.
+    let cpu_session = sync::Mutex::with_rank(sync::LockRank::BUS, ());
+    assert!(!sync::violates_lock_order(sync::LockRank::TOPOLOGY));
+    let held = cpu_session.lock();
+    assert!(
+        sync::violates_lock_order(sync::LockRank::TOPOLOGY),
+        "TOPOLOGY under BUS must be reported as an inversion"
+    );
+    drop(held);
+    assert!(!sync::violates_lock_order(sync::LockRank::TOPOLOGY));
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "lock order violation")]
+fn opening_topology_under_a_bus_lock_panics() {
+    let space = AddressSpace::new("mem", 16);
+    let cpu_session = sync::Mutex::with_rank(sync::LockRank::BUS, ());
+    let _held = cpu_session.lock();
+    // Not "discouraged": this is a panic naming both ranks.
+    let _topo = space.topology();
+}
+
+#[test]
+#[cfg(any(debug_assertions, not(feature = "std")))]
+#[should_panic(expected = "TOPOLOGY")]
+fn an_inline_remap_from_a_write_handler_panics() {
+    // The same device as the deferred test, wired the wrong way. No CPU lock is
+    // involved here at all: the access path's own read guard is already
+    // recorded at TOPOLOGY and the ladder is strictly increasing, so
+    // TOPOLOGY-under-TOPOLOGY is caught on its own.
+    //
+    // Two independent mechanisms catch it, which is why the `cfg` is wider than
+    // the other ladder tests and the expected text is just the rank's name: the
+    // rank check in any debug build ("lock order violation: acquiring TOPOLOGY
+    // while holding TOPOLOGY"), and the `single` backend's own re-entrancy
+    // assert in a release one ("write of a `single` RwLock (TOPOLOGY) that is
+    // already held"). A release `native-std` build has neither and would
+    // deadlock instead — which is the deal the ladder makes everywhere else in
+    // this crate, not a gap peculiar to spaces.
+    let (space, _bar, _id) = bar_machine(true);
+    let _ = space.write(0, Width::U8, 0x04, MemAttrs::DEFAULT);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "lock order violation")]
+fn two_spaces_cannot_have_their_topology_open_at_once() {
+    // Same rank twice is a violation, so a cross-space retopology is two
+    // sequential guards. Asserted rather than merely documented, because it is
+    // the one thing about this design that surprises people — see `Nrom`.
+    let cpu = AddressSpace::new("cpu", 16);
+    let ppu = AddressSpace::new("ppu", 14);
+    let _a = cpu.topology();
+    let _b = ppu.topology();
+}
+
+#[test]
+fn an_access_during_a_retopology_retries_rather_than_deadlocking() {
+    // A reader never *blocks* on the topology lock: waiting there while holding
+    // a BUS lock is the other half of the deadlock the ladder forbids, since a
+    // retopology is allowed to take BUS locks underneath TOPOLOGY. It reports
+    // `Retry` instead, which is legal precisely because nothing has happened.
+    let (_store, region) = ram("ram", 0x100);
+    let space = AddressSpace::new("mem", 16);
+    space.topology().map(region, 0).unwrap();
+
+    let topo = space.topology();
+    assert_eq!(
+        space.read(0, Width::U8, MemAttrs::DEFAULT),
+        Err(BusError::Retry)
+    );
+    assert_eq!(
+        space.write(0, Width::U8, 1, MemAttrs::DEFAULT),
+        Err(BusError::Retry)
+    );
+    assert!(space.try_view().is_none());
+    assert!(
+        space.try_topology().is_none(),
+        "and a second writer is told so rather than waiting"
+    );
+    drop(topo);
+
+    assert!(space.read(0, Width::U8, MemAttrs::DEFAULT).is_ok());
 }
