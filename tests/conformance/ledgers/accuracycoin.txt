@@ -19,7 +19,7 @@
 #     they can never appear here.
 #
 # ---------------------------------------------------------------------------
-# Measured 2026-08-31 against the pinned ROM: 128 of 141 pass, 13 fail.
+# Measured 2026-08-31 against the pinned ROM: 129 of 141 pass, 12 fail.
 # ---------------------------------------------------------------------------
 #
 # The earlier "81 of 125" was measured through a stale copy of the ROM's
@@ -144,8 +144,6 @@
 # fifteen do not. Each entry names the error code the ROM reported and the
 # subsystem it belongs to, from the README's own tables.
 
-8d                # $048D "$2002 flag timing" code 1: the sprite-0/overflow
-                  # flags must clear on an exact dot. Cause (D).
 8f                # $048F "Stale Sprite Shift Regs" code 3: as above, for the
                   # eight sprite shifters.
 87                # $0487 "BG Serial In" code 2: the serial input to the

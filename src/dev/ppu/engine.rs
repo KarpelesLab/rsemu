@@ -1411,7 +1411,19 @@ impl Engine {
         let now = self.dots;
         match index & 7 {
             PPUSTATUS => {
-                let value = (self.status & STATUS_DRIVEN) | (self.open_bus(debug) & !STATUS_DRIVEN);
+                let mut status = self.status;
+                // The three flags are not sampled together. The vblank bit is
+                // latched when the read begins — M2 going high — while the two
+                // sprite flags are taken at the end of it, about 1.875 PPU
+                // clocks later on a revision-G part. All three clear on
+                // pre-render dot 1, so a read that begins on the dot before
+                // that reports vblank still set and the sprite flags already
+                // gone, and AccuracyCoin's "$2002 flag timing" steps a read
+                // across exactly that boundary to see it.
+                if self.scanline == self.geom.pre_render_scanline && self.dot == 1 {
+                    status &= !(STATUS_SPRITE0 | STATUS_OVERFLOW);
+                }
+                let value = (status & STATUS_DRIVEN) | (self.open_bus(debug) & !STATUS_DRIVEN);
                 if !debug {
                     self.status &= !STATUS_VBLANK;
                     self.w = false;
