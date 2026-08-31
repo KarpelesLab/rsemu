@@ -1234,3 +1234,43 @@ fn a_transfer_from_above_dfff_reads_work_ram() {
     assert_eq!(ppu.peek_oam(0), 0x40);
     assert_eq!(ppu.peek_oam(0x9f), 0x40 + 0x9f);
 }
+
+/// Switching the LCD on does not start line 0 from its beginning, and the scan
+/// it lands in the middle of is reported as mode **0** rather than mode 2 —
+/// "line 0 starts with mode 0 and goes straight to mode 3" (Gekkio,
+/// `ppu/lcdon_timing`). Object memory is not shut out for it either.
+#[test]
+fn switching_the_lcd_on_lands_part_way_into_a_scan_that_reports_mode_zero() {
+    let ppu = lcd(0);
+    let oam = Device::region(&ppu, ppu::OAM_REGION).expect("OAM");
+    let oam = io(&oam);
+    let mut byte = [0u8; 1];
+    let read_mode = |ppu: &GbPpu| ppu.read_register(0x01) & 3;
+
+    ppu.write_register(0x00, 0);
+    ppu.advance_by(1000);
+    ppu.write_register(0x00, lcdc::LCD_ENABLE);
+
+    assert_eq!(
+        ppu.position(),
+        (0, ppu::LCD_ON_SKIP),
+        "already inside line 0"
+    );
+    assert_eq!(read_mode(&ppu), Mode::HBlank.bits(), "mode 0, not mode 2");
+    oam.read(0, &mut byte, MemAttrs::DEFAULT).expect("answers");
+    assert_eq!(byte[0], 0x00, "and object memory is not shut out");
+
+    // Straight into mode 3: the reported mode never shows 2, so the
+    // suppression holds right up to the machine cycle mode 3 appears on.
+    ppu.advance_by(ppu::OAM_SCAN_DOTS - ppu::LCD_ON_SKIP);
+    assert_eq!(read_mode(&ppu), Mode::HBlank.bits());
+    ppu.advance_by(ppu::MODE_VISIBLE_LAG);
+    assert_eq!(read_mode(&ppu), Mode::Drawing.bits());
+
+    // And the line is four dots short, so `LY` moves one machine cycle early.
+    ppu.advance_by(ppu::DOTS_PER_LINE - ppu::OAM_SCAN_DOTS - ppu::MODE_VISIBLE_LAG);
+    assert_eq!(ppu.position().0, 1, "line 0 ran 452 dots, not 456");
+    // Every line after it is normal again.
+    ppu.advance_by(ppu::MODE_VISIBLE_LAG);
+    assert_eq!(read_mode(&ppu), Mode::OamScan.bits());
+}

@@ -691,7 +691,7 @@ impl Sm83 {
     /// What makes a lazily-advanced device sampled from inside an instruction
     /// see the cycle the access really happened on rather than the one the
     /// quantum began at (`ROADMAP.md` §4.2 and
-    /// [`TickCursor`](crate::core::sched::TickCursor)). On a Game Boy that is
+    /// [`TickCursor`]). On a Game Boy that is
     /// the whole of `instr_timing` and most of Gekkio's timer group: every one
     /// of them measures a device against single instructions, so a bias of a
     /// few cycles is exactly what they are built to detect.

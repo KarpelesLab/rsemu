@@ -67,11 +67,28 @@
 //!   `STAT` interrupt produces — work correctly, because the interrupt fires
 //!   before the next line is drawn.
 //! * **The mode-3 penalty for objects** is Pan Docs' documented approximation,
-//!   not a fetcher simulation.
+//!   not a fetcher simulation. Right on average and wrong per case, which is
+//!   what `ppu/intr_2_mode0_timing_sprites` measures.
 //! * **`STAT`'s DMG write bug** — writing `STAT` briefly reads all conditions as
 //!   true and can raise a spurious interrupt.
-//! * **The first frame after the LCD is switched on** is a normal frame here;
-//!   on hardware it is shorter and mode 0 is reported for its first line.
+//! * **The first line after the LCD is switched on** is modelled to the machine
+//!   cycle ([`LCD_ON_SKIP`], and the scan reporting mode 0) but not below it:
+//!   hardware comes up two *dots* into the line, and this timeline is
+//!   quantised to the CPU's machine cycle.
+//!
+//! # What is modelled and was not obvious
+//!
+//! * **The mode a program reads lags the controller's own by a machine cycle**
+//!   ([`MODE_VISIBLE_LAG`]). The `STAT` interrupt conditions come off the
+//!   controller's; `STAT`'s mode bits and the two memory gates come off it
+//!   registered.
+//! * **The `LY == LYC` comparator is a latch with a clock**, and the clock stops
+//!   with the LCD.
+//! * **Entering vertical blanking asserts the object-scan condition too**, at
+//!   the same instant as the vertical one.
+//! * **An OAM transfer starts two machine cycles after the write** and holds the
+//!   bus for its hundred and sixty ([`DMA_START_DELAY`]), and its source address
+//!   is decoded with fifteen bits, so pages above `$DF` read work RAM.
 //!
 //! # Sources
 //!
@@ -150,6 +167,17 @@ pub const MODE3_MIN_DOTS: u64 = 172;
 /// chips.
 pub const MODE_VISIBLE_LAG: u64 = 4;
 
+/// How far into line 0 the controller is when the LCD is switched on.
+///
+/// It does not start the line from the beginning. Gekkio's `lcdon_timing`
+/// tabulates `LY` against the machine cycle the enabling write was made on and
+/// puts the increment to `LY = 1` on cycle 113 rather than 114, so the first
+/// line is four dots short of the 456 every other line takes — the controller
+/// comes up already inside it. (Its header calls this "the PPU is late by 2
+/// T-cycles"; two dots is finer than the CPU can sample, and four is what the
+/// measurement resolves to.)
+pub const LCD_ON_SKIP: u64 = 4;
+
 /// How many bytes of video RAM the console has.
 pub const VRAM_LEN: u64 = 0x2000;
 
@@ -208,7 +236,7 @@ const CLOCKS_PER_MCYCLE: u64 = 4;
 /// built on: each of them aligns a memory access against the *end* of a
 /// transfer, so an emulator whose window is two cycles early fails all of them
 /// and one whose window is the wrong length fails half.
-const DMA_START_DELAY: u64 = 2;
+pub const DMA_START_DELAY: u64 = 2;
 
 /// The four LCD modes, in the order a drawn line visits them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -316,6 +344,14 @@ struct Engine {
     window_line: u8,
     /// Whether the window has been drawn on this frame yet.
     window_active: bool,
+    /// Whether the controller is still inside the first object scan after the
+    /// LCD was switched on.
+    ///
+    /// That period is reported as mode **0**, not mode 2, and it does not block
+    /// object memory: Gekkio's `lcdon_timing` reads `$80`/`$84` from `STAT` and
+    /// `$00` from object memory throughout it, and its header states the rule —
+    /// "line 0 starts with mode 0 and goes straight to mode 3".
+    first_scan_after_on: bool,
     /// The latched output of the `LY == LYC` comparator.
     ///
     /// Latched rather than computed, because the comparator is *clocked* and
@@ -386,6 +422,7 @@ impl Engine {
             mode3_len: MODE3_MIN_DOTS,
             window_line: 0,
             window_active: false,
+            first_scan_after_on: false,
             // `LY` and `LYC` both start at zero, so the comparator's latch
             // starts where running it once would leave it.
             lyc_match: true,
@@ -445,6 +482,11 @@ impl Engine {
     /// rather than assumed — see that constant.
     fn visible_mode(&self) -> Mode {
         if !self.lcd_on() {
+            return Mode::HBlank;
+        }
+        if self.first_scan_after_on {
+            // Straight from mode 0 into mode 3: the scan happens, and the
+            // controller does not report it or shut anything out for it.
             return Mode::HBlank;
         }
         let (ly, dot) = if self.dot >= MODE_VISIBLE_LAG {
@@ -792,6 +834,12 @@ impl Engine {
             return false;
         }
         let ended = self.step_position();
+        // Cleared at the boundary a *program* sees, not the controller's: what
+        // the flag suppresses is the reported mode, so it has to hold until the
+        // reported mode becomes 3.
+        if self.first_scan_after_on && self.dot >= OAM_SCAN_DOTS + MODE_VISIBLE_LAG {
+            self.first_scan_after_on = false;
+        }
         self.update_lyc();
         ended
     }
@@ -918,7 +966,9 @@ impl Engine {
                     self.window_active = false;
                 } else if !was_on && now_on {
                     self.ly = 0;
-                    self.dot = 0;
+                    // Not from the beginning of the line — see `LCD_ON_SKIP`.
+                    self.dot = LCD_ON_SKIP;
+                    self.first_scan_after_on = true;
                     self.mode3_len = self.compute_mode3();
                 }
                 // Switching the controller on starts the comparison clock, and
@@ -1500,7 +1550,7 @@ impl MemOps for LcdPort {
 /// The `gb.ppu` device class.
 pub static CLASS: DeviceClass = DeviceClass {
     name: "gb.ppu",
-    version: 2,
+    version: 3,
     summary: "Game Boy LCD controller: VRAM, OAM, $FF40-$FF4B, OAM DMA",
     properties: &[],
     construct: |props| Ok(Box::new(GbPpu::from_props(props)?) as Box<dyn Device>),
@@ -1632,6 +1682,11 @@ impl Device for GbPpu {
         w.write_u64(engine.dma_next_dot)?;
         w.write_u64(engine.dma_block_from)?;
         w.write_u64(engine.dma_block_until)?;
+        // Appended rather than written beside `window_active`, where it
+        // belongs: `dev::gb::conformance` walks this chunk by hand as far as
+        // the frame counter, and a field inserted before that silently breaks
+        // the runner rather than a test.
+        w.write_bool(engine.first_scan_after_on)?;
         Ok(())
     }
 
@@ -1676,6 +1731,7 @@ impl Device for GbPpu {
             engine.dma_next_dot = r.read_u64()?;
             engine.dma_block_from = r.read_u64()?;
             engine.dma_block_until = r.read_u64()?;
+            engine.first_scan_after_on = r.read_bool()?;
             // The dot counter and the next event both came from the snapshot;
             // the lock-free copies of them are derived state and must follow.
             self.shared.publish(&engine);

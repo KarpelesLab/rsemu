@@ -342,7 +342,7 @@ fn blargg_on_the_shipped_machine() {
             }
         } else {
             println!(
-                "  ???? {name}: no verdict in {limit} frames ({})",
+                "???? {name}: no verdict in {limit} frames ({})",
                 text.trim().replace('\n', " / ")
             );
             failures.push(name);
@@ -370,6 +370,84 @@ const MOONEYE_PASS: [u8; 6] = [3, 5, 8, 13, 21, 34];
 
 /// The pattern it sets on failure: `$42` in all six.
 const MOONEYE_FAIL: [u8; 6] = [0x42; 6];
+
+/// The known-failures ledger for Gekkio's acceptance suite, with the reason for
+/// each one.
+///
+/// `ROADMAP.md` §0 asks for a ledger that **only ever shrinks**, and for the
+/// reason to be stated rather than implied. Anything failing that is *not* here
+/// fails the test, so a regression in a passing ROM is a build break while the
+/// seven below stay measured rather than hidden.
+///
+/// Three of them are the same fact: rsemu ships no boot ROM, because the DMG's
+/// is 256 bytes of Nintendo's copyrighted code and vendoring it is not ours to
+/// do (`ROADMAP.md` §1). Post-boot register values substitute, and these three
+/// measure things a *table* of post-boot values cannot carry.
+const MOONEYE_LEDGER: &[(&str, &str)] = &[
+    (
+        "boot_div-dmgABCmgb.gb",
+        "no boot ROM: the divider's visible byte is documented as $AB at \
+         handover and its low byte is not documented anywhere, so it starts \
+         at zero rather than guessed at. This ROM measures the low byte.",
+    ),
+    (
+        "boot_hwio-dmgABCmgb.gb",
+        "no boot ROM: this compares the whole I/O page against what a real \
+         boot ROM leaves behind, including registers whose handover values \
+         are not documented.",
+    ),
+    (
+        "serial/boot_sclk_align-dmgABCmgb.gb",
+        "no boot ROM: this measures the serial shift clock's phase against \
+         the divider at handover, which is a consequence of how long the \
+         boot ROM ran rather than a value anything publishes.",
+    ),
+    (
+        "ppu/intr_2_mode0_timing_sprites.gb",
+        "the mode-3 object penalty is Pan Docs' documented approximation — \
+         six dots each and up to five more for the first object in a \
+         background tile — rather than a fetcher simulation. This ROM \
+         tabulates 34 object configurations against the machine cycle mode \
+         0 arrives on, and the approximation is right on average and wrong \
+         per case.",
+    ),
+    (
+        "ppu/lcdon_timing-GS.gb",
+        "the first line after the LCD is switched on is modelled to the \
+         machine cycle (`ppu::LCD_ON_SKIP`, and the scan reporting mode 0), \
+         which is what `stat_lyc_onoff` needs and what this ROM's LY column \
+         says. Its STAT and memory-gate columns disagree with each other by \
+         one machine cycle unless the controller comes up on a *half*-cycle \
+         boundary — its own header says the PPU is late by 2 T-cycles — and \
+         this timeline is quantised to the CPU's machine cycle.",
+    ),
+    (
+        "ppu/lcdon_write_timing-GS.gb",
+        "the same 2-T-cycle phase as `lcdon_timing`.",
+    ),
+    (
+        "timer/rapid_toggle.gb",
+        "one missing increment out of sixteen. The ROM starts and stops the \
+         timer every 17 machine cycles and counts on the falling edges that \
+         produces; ours takes the interrupt one instruction later than \
+         hardware (`BC` = $FFD8 against $FFD9). Traced to iteration 29 of \
+         its loop, where the enabling write lands exactly on the divider \
+         bit's falling edge: four clocks earlier and the edge falls inside \
+         the window the timer is enabled for, which is the increment we do \
+         not make. Whether the write should see the counter four clocks \
+         earlier is a question about the whole write path, and fitting the \
+         offset would defeat the rest of the group rather than pass this \
+         one.",
+    ),
+];
+
+/// Whether `name` is on the ledger, and why.
+fn ledgered(name: &str) -> Option<&'static str> {
+    MOONEYE_LEDGER
+        .iter()
+        .find(|(rom, _)| name.ends_with(rom))
+        .map(|(_, why)| *why)
+}
 
 /// Which of Gekkio's ROMs target a DMG at all.
 ///
@@ -406,7 +484,16 @@ fn mooneye_acceptance_on_the_shipped_machine() {
     }
     let limit = frame_limit();
     let mut passed = 0usize;
+    let mut ledger_hits = 0usize;
     let mut failed = Vec::new();
+    let record =
+        |name: String, failed: &mut Vec<String>, ledger_hits: &mut usize| match ledgered(&name) {
+            Some(why) => {
+                *ledger_hits += 1;
+                println!("  LDGR {name}: {why}");
+            }
+            None => failed.push(name),
+        };
     for rom in &roms {
         let name = label(&dir, rom);
         let Ok(bytes) = std::fs::read(rom) else {
@@ -434,16 +521,18 @@ fn mooneye_acceptance_on_the_shipped_machine() {
                 println!("  pass {name}");
             }
             Some(MOONEYE_FAIL) => {
-                println!("  FAIL {name}");
-                failed.push(name);
+                if ledgered(&name).is_none() {
+                    println!("  FAIL {name}");
+                }
+                record(name, &mut failed, &mut ledger_hits);
             }
             Some(regs) => {
                 println!(
-                    "  TIME {name}: no verdict in {limit} frames \
+                    "  TIME {name}: no verdict in {limit} frames  \
                      (B={:02x} C={:02x} D={:02x} E={:02x} H={:02x} L={:02x})",
                     regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]
                 );
-                failed.push(name);
+                record(name, &mut failed, &mut ledger_hits);
             }
             None => {
                 println!("  ???? {name}: could not read the register file");
@@ -452,14 +541,18 @@ fn mooneye_acceptance_on_the_shipped_machine() {
         }
     }
     println!(
-        "mooneye acceptance (DMG subset): {passed}/{} ROMs passed",
+        "mooneye acceptance (DMG subset): {passed}/{} ROMs passed, {ledger_hits} ledgered",
         roms.len()
     );
-    println!("  {} still failing", failed.len());
-    // Not an assertion, deliberately. `ROADMAP.md` §0 asks for a *measured*
-    // number and a ledger that only shrinks; the suite covers behaviours this
-    // machine does not claim (the pixel FIFO above all), and asserting on it
-    // would make the number a pass/fail rather than a measurement.
+    // The number is the measurement `ROADMAP.md` §0 asks for; the assertion is
+    // the ledger it also asks for. Only *unexplained* failures fail the test,
+    // so the seven arguments in `MOONEYE_LEDGER` stay visible rather than
+    // hidden, and a ROM that stops passing is a build break.
+    assert!(
+        failed.is_empty(),
+        "mooneye failures with no ledger entry: {}",
+        failed.join(", ")
+    );
 }
 
 // ---------------------------------------------------------------------------
