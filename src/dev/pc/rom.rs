@@ -300,6 +300,7 @@ pub fn schema() -> ClassSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
     use alloc::vec::Vec;
 
     /// A socket's worth of bytes, for a test that wants to know what is where.

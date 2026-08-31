@@ -561,19 +561,212 @@ fn construction_from_properties_validates_what_it_is_given() {
 }
 
 #[test]
-fn realize_refuses_a_core_with_nowhere_to_fetch_from() {
+fn realize_does_nothing_outward_because_the_space_has_not_arrived_yet() {
     use crate::core::device::{Deferred, RealizeCtx};
     use crate::core::space::RequesterId;
 
+    // The check that a core has an address space used to live in `realize`. It
+    // cannot: the realizer runs `realize` for every device *before* it binds
+    // any of them, so a core that refused here would refuse every machine. The
+    // check is in `Instance::bind`, and the test for it is below.
     let cpu = M68k::new(Config::default());
     let mut deferred = Deferred::new();
     let mut ctx = RealizeCtx::new("cpu", RequesterId::ANONYMOUS, &mut deferred);
-    assert!(cpu.realize(&mut ctx).is_err());
+    assert!(cpu.realize(&mut ctx).is_ok());
+}
+
+/// A `BuildOptions` and registry that know about this core and `ram`/`rom`.
+fn machine_layer() -> (crate::core::Registry, crate::machine::BuildOptions) {
+    let mut options = crate::machine::BuildOptions::new();
+    options.classes.insert(super::schema());
+    for schema in crate::machine::builtin::schemas() {
+        options.classes.insert(schema);
+    }
+    super::bind(&mut options.bindings).expect("nothing else claims cpu.m68k");
+    crate::machine::builtin::bind(&mut options.bindings).expect("ram and rom");
+
+    let mut registry = crate::core::Registry::new();
+    crate::machine::builtin::register(&mut registry).expect("ram and rom");
+    super::register(&mut registry).expect("nothing else claims cpu.m68k");
+    (registry, options)
+}
+
+#[test]
+fn binding_a_core_with_no_address_space_is_a_machine_error() {
+    let (registry, options) = machine_layer();
+    let text = "machine \"m\" {\n  osc x = 8000000 Hz\n  \
+                space mem { width = 24, endian = big }\n  \
+                object dram \"ram\" { size = 64K }\n  object cpu \"cpu.m68k\" { clock = x }\n  \
+                map mem 0 size 64K = dram\n}\n";
+    let err = crate::machine::build("t.machine", text, &registry, &options)
+        .expect_err("a core with no `space =` cannot fetch");
+    let text = alloc::format!("{err}");
+    assert!(text.contains("address space"), "{text}");
+}
+
+#[test]
+fn the_three_ipl_pins_are_one_sink_seen_through_three_ports() {
+    use crate::core::device::Device;
+    use crate::core::wire::{Level, Wire, WireId};
+
+    // The shape a 68000 forces: the pins encode a *level*, so nothing can
+    // resolve one of them alone, and all three ports therefore have to reach
+    // the same object. Three separate sinks would each see a third of the
+    // answer and drive a third of the level.
+    let board = Board::new();
+    let mut wires = Vec::new();
+    let mut pins = Vec::new();
+    for (line, port) in ["ipl0", "ipl1", "ipl2"].iter().enumerate() {
+        let src = WireId::new(line as u64 + 1);
+        let pin = board.cpu.sink(port, &[src]).expect("an IPL pin");
+        assert_eq!(pin.line, line as u32, "the port names which line it is");
+        let wire = Wire::builder()
+            .source(src)
+            .sink_weak(Arc::downgrade(&pin.sink), pin.line)
+            .build();
+        pins.push(pin);
+        wires.push((wire, src));
+    }
+
+    assert_eq!(board.cpu.ipl(), 0);
+    wires[1].0.set(wires[1].1, Level::High);
+    assert_eq!(board.cpu.ipl(), 2, "IPL1 alone encodes level 2");
+    wires[0].0.set(wires[0].1, Level::High);
+    assert_eq!(board.cpu.ipl(), 3, "and with IPL0, level 3");
+    wires[2].0.set(wires[2].1, Level::High);
+    assert_eq!(board.cpu.ipl(), 7, "all three is the non-maskable level");
+    wires[1].0.set(wires[1].1, Level::Low);
+    assert_eq!(board.cpu.ipl(), 5);
+}
+
+#[test]
+fn the_pins_a_machine_file_may_name_are_exactly_these_four() {
+    use crate::core::device::Device;
+    let cpu = M68k::new(Config::default());
+    for port in ["ipl0", "ipl1", "ipl2", "reset"] {
+        assert!(cpu.sink(port, &[]).is_some(), "`{port}` should be a pin");
+    }
+    for port in ["irq", "ipl", "ipl3", ""] {
+        assert!(
+            cpu.sink(port, &[]).is_none(),
+            "`{port}` is not a pin this core has"
+        );
+    }
+}
+
+#[test]
+fn the_reset_pin_latches_and_the_next_step_runs_the_sequence() {
+    use crate::core::device::Device;
+    use crate::core::wire::{Level, Wire, WireId};
 
     let board = Board::new();
-    let mut deferred = Deferred::new();
-    let mut ctx = RealizeCtx::new("cpu", RequesterId::ANONYMOUS, &mut deferred);
-    assert!(board.cpu.realize(&mut ctx).is_ok());
+    board.boot(&[0x4e71]); // NOP
+    board.cpu.step();
+    assert_eq!(board.cpu.regs().pc, 0x402);
+
+    let src = WireId::new(1);
+    let pin = board.cpu.sink("reset", &[src]).expect("a reset pin");
+    let wire = Wire::builder()
+        .source(src)
+        .sink_weak(Arc::downgrade(&pin.sink), pin.line)
+        .build();
+    // The latch lives outside the execution lock, so it becomes execution
+    // state on the step that consumes it — which is what keeps a device
+    // asserting reset from inside an access this core issued out of the core's
+    // own critical section.
+    wire.set(src, Level::High);
+    board.cpu.step();
+    let regs = board.cpu.regs();
+    assert_eq!(regs.pc, 0x400, "the sequence re-read vector 1");
+    assert_eq!(regs.a[7], 0x2000, "and vector 0");
+    assert_eq!(regs.ipl_mask(), 7);
+}
+
+/// A controller that answers the acknowledge cycle with a vector, the way a
+/// 68000 peripheral that does *not* assert `VPA` does.
+#[derive(Debug)]
+struct Vectoring {
+    vector: u8,
+    acknowledged: crate::core::sync::AtomicU32,
+}
+
+impl crate::core::wire::IntAck for Vectoring {
+    fn acknowledge(&self) -> u32 {
+        self.acknowledged
+            .fetch_add(1, crate::core::sync::Ordering::Relaxed);
+        u32::from(self.vector)
+    }
+}
+
+#[test]
+fn a_controller_that_answers_the_acknowledge_vectors_and_one_that_does_not_autovectors() {
+    use crate::core::device::Device;
+    use crate::core::sync::{AtomicU32, Ordering};
+    use crate::core::wire::IntAck;
+
+    // Autovector first: nothing attached, so the level picks the vector.
+    let board = Board::new();
+    board.boot(&[0x4e71, 0x4e71]);
+    board.poke_long(u64::from(vector::AUTOVECTOR_BASE + 5) * 4, 0x0800);
+    // Drop the mask, which a reset leaves at 7, so level 5 gets through.
+    let mut regs = board.cpu.regs();
+    regs.sr = (regs.sr & !flags::IPL) | (1 << 8);
+    board.cpu.set_regs(regs);
+    board.cpu.set_ipl(5);
+    board.cpu.step();
+    assert_eq!(
+        board.cpu.regs().pc,
+        0x0800,
+        "with nothing answering, `VPA` and the autovector for level 5"
+    );
+
+    // And now with a controller on the net.
+    let board = Board::new();
+    board.boot(&[0x4e71, 0x4e71]);
+    board.poke_long(64 * 4, 0x0900);
+    let mut regs = board.cpu.regs();
+    regs.sr = (regs.sr & !flags::IPL) | (1 << 8);
+    board.cpu.set_regs(regs);
+    let device: Arc<Vectoring> = Arc::new(Vectoring {
+        vector: 64,
+        acknowledged: AtomicU32::new(0),
+    });
+    let weak: alloc::sync::Weak<dyn IntAck> = Arc::downgrade(&device) as _;
+    board.cpu.attach_int_ack("ipl2", weak);
+    board.cpu.set_ipl(5);
+    board.cpu.step();
+    assert_eq!(
+        device.acknowledged.load(Ordering::Relaxed),
+        1,
+        "the CPU must run the acknowledge cycle"
+    );
+    assert_eq!(
+        board.cpu.regs().pc,
+        0x0900,
+        "and take the vector the controller drove, not the autovector"
+    );
+}
+
+#[test]
+fn the_scheduler_budget_is_never_overshot_and_the_debt_is_paid_back() {
+    // `MOVEM.L` of every register is far longer than a one-cycle budget, so
+    // this is the case where a plain `run` reports more than it was handed —
+    // which the scheduler rejects outright.
+    let board = Board::new();
+    board.boot(&[0x48e7, 0xffff, 0x60fa]); // MOVEM.L d0-a7,-(a7) ; BRA .-4
+    let before = board.cpu.cycles();
+    let mut total = 0u64;
+    for _ in 0..64 {
+        let used = board.cpu.run_budget(1);
+        assert!(used <= 1, "a budget of one cycle reported {used}");
+        total += used;
+    }
+    assert_eq!(total, 64, "every tick of every budget was granted and used");
+    assert_eq!(
+        board.cpu.cycles() - before,
+        total + board.cpu.cycle_debt(),
+        "cycles executed but not yet reported are exactly the debt"
+    );
 }
 
 #[test]

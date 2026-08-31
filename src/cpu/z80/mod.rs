@@ -91,20 +91,23 @@ mod tests;
 mod conformance;
 
 use alloc::boxed::Box;
-use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::string::{String, ToString};
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::core::device::{Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind};
+use crate::core::device::{
+    Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
+};
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
+use crate::core::sched::{Budget, Consumed};
 use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::core::sync::{self, AtomicBool, AtomicU8, LockRank, Ordering};
+use crate::core::sync::{self, AtomicBool, AtomicU8, AtomicU32, LockRank, Ordering};
 use crate::core::value::Width;
-use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink};
+use crate::core::wire::{FanIn, IntAck, Level, Resolve, WireId, WireSink};
 
 use exec::{Exec, State};
 
@@ -630,7 +633,27 @@ pub(crate) struct Lines {
     nmi_latch: AtomicBool,
     /// The byte the interrupting device puts on the data bus during the
     /// acknowledge cycle: the mode 2 vector, or the `RST` opcode in mode 0.
+    ///
+    /// The fallback for a machine that has no acknowledging device, which is
+    /// most of them: a Master System's VDP drives `INT` and nothing answers,
+    /// so the value latched here is what the CPU reads. A board with a real
+    /// vectored peripheral attaches an [`IntAck`] instead.
     vector: AtomicU8,
+    /// A reset asked for by the `reset` pin, latched until the next step folds
+    /// it into the execution state.
+    ///
+    /// A latch rather than a write into `State::reset_pending`, because a wire
+    /// is driven from inside whatever device changed it — often from inside an
+    /// access this very core issued — and reaching for the session lock there
+    /// would re-enter the core's own critical section (`ROADMAP.md` §4.7).
+    reset: AtomicBool,
+    /// What answers the acknowledge cycle, if a device on the `INT` net does.
+    ///
+    /// Weak, and behind its own leaf lock: the machine owns both devices, and a
+    /// CPU that kept its peripheral alive would close a cycle nothing could
+    /// drop (§4.3). Taken and released *before* `acknowledge` is called, so the
+    /// peripheral is free to take its own.
+    ack: sync::Mutex<Option<Weak<dyn IntAck>>>,
 }
 
 impl Default for Lines {
@@ -642,6 +665,8 @@ impl Default for Lines {
             // An idle bus with pull-ups reads as $ff, which in mode 0 is
             // `RST 38` — the historical default a machine gets for free.
             vector: AtomicU8::new(0xff),
+            reset: AtomicBool::new(false),
+            ack: sync::Mutex::new(None),
         }
     }
 }
@@ -682,6 +707,33 @@ impl Lines {
 
     fn set_vector(&self, value: u8) {
         self.vector.store(value, Ordering::Release);
+    }
+
+    /// Latch a reset request. Cleared by whoever folds it into the state.
+    fn request_reset(&self) {
+        self.reset.store(true, Ordering::Release);
+    }
+
+    /// Consume the latch, reporting whether a reset was owed.
+    fn take_reset_request(&self) -> bool {
+        self.reset.swap(false, Ordering::AcqRel)
+    }
+
+    /// Install what answers the acknowledge cycle on `INT`.
+    fn attach_ack(&self, ack: Weak<dyn IntAck>) {
+        *self.ack.lock() = Some(ack);
+    }
+
+    /// Run the acknowledge cycle and report the byte the device drove.
+    ///
+    /// The lock is released before the outward call: the re-entrancy contract
+    /// forbids holding one across a call into another device (§4.7).
+    pub(crate) fn acknowledge(&self) -> u8 {
+        let handler = self.ack.lock().clone();
+        match handler.and_then(|weak| weak.upgrade()) {
+            Some(ack) => ack.acknowledge() as u8,
+            None => self.vector(),
+        }
     }
 
     fn snapshot(&self) -> (bool, bool, bool, u8) {
@@ -725,8 +777,33 @@ struct Session {
 #[derive(Debug)]
 pub struct Z80 {
     cfg: Config,
-    lines: Lines,
+    lines: Arc<Lines>,
+    /// This core's identity in `MemAttrs::requester`, assigned at bind time.
+    ///
+    /// Separate from [`Config::requester`] because a machine file names no
+    /// requester: the machine layer allocates one per initiator and hands it
+    /// over in [`Instance::bind`](crate::machine::Instance::bind), which is
+    /// after `new` (`ROADMAP.md` §4.4).
+    requester: AtomicU32,
+    /// The name of the address space `IN` and `OUT` reach, from the `iospace`
+    /// property. Resolved in `bind`, because spaces do not exist before then.
+    iospace: String,
     session: sync::Mutex<Session>,
+    /// The strong end of every pin this core has handed to a wire.
+    ///
+    /// A net holds its sinks weakly — the machine owns devices and a wire
+    /// merely refers to them (§4.3) — so a pin nothing else kept alive would
+    /// die on the way out of [`Device::sink`] and the wire would silently
+    /// deliver to nothing.
+    pins: sync::Mutex<Pins>,
+}
+
+/// The pins [`Device::sink`] has built, kept alive by the core that owns them.
+#[derive(Debug, Default)]
+struct Pins {
+    int: Option<Arc<InterruptPin>>,
+    nmi: Option<Arc<InterruptPin>>,
+    reset: Option<Arc<ResetPin>>,
 }
 
 impl Z80 {
@@ -739,7 +816,9 @@ impl Z80 {
     pub fn new(cfg: Config) -> Z80 {
         Z80 {
             cfg,
-            lines: Lines::default(),
+            lines: Arc::new(Lines::default()),
+            requester: AtomicU32::new(cfg.requester.0),
+            iospace: String::new(),
             session: sync::Mutex::with_rank(
                 LockRank::BUS,
                 Session {
@@ -748,6 +827,7 @@ impl Z80 {
                     io: None,
                 },
             ),
+            pins: sync::Mutex::new(Pins::default()),
         }
     }
 
@@ -764,18 +844,46 @@ impl Z80 {
         let default = if cmos { Config::CMOS } else { Config::NMOS };
         let out_c_zero = r.or_range("out-c-zero", u64::from(default.out_c_zero), 0..=0xff)?;
         let floating = r.or_range("floating-bus", u64::from(default.floating_bus), 0..=0xff)?;
+        // Accepted and ignored: there is one engine until phase 5, and a
+        // machine file that names it should not need editing when the second
+        // one lands.
+        let _engine = r.or_enum("engine", "interp", &["interp"])?;
+        // `space =` is structural and there is exactly one of it, so the Z80's
+        // *second* space — the 64 KiB of ports `IN` and `OUT` reach, which no
+        // memory-mapped core has — is named by an ordinary string property and
+        // looked up with `BindCtx::space_named`.
+        let iospace = r.optional_str("iospace")?.unwrap_or("").to_string();
         r.finish()?;
-        Ok(Z80::new(Config {
+        let mut cpu = Z80::new(Config {
             out_c_zero: out_c_zero as u8,
             floating_bus: floating as u8,
             requester: RequesterId::ANONYMOUS,
-        }))
+        });
+        cpu.iospace = iospace;
+        Ok(cpu)
     }
 
-    /// This core's configuration.
+    /// Which address space `IN` and `OUT` reach, by name, or `""` for none.
+    #[must_use]
+    pub fn io_space_name(&self) -> &str {
+        &self.iospace
+    }
+
+    /// This core's configuration, with the bind-time requester folded in.
     #[must_use]
     pub fn config(&self) -> Config {
-        self.cfg
+        Config {
+            requester: RequesterId(self.requester.load(Ordering::Relaxed)),
+            ..self.cfg
+        }
+    }
+
+    /// Give the core the identity its accesses travel under.
+    ///
+    /// The machine layer calls this from `bind`; a crate driving the core
+    /// directly usually sets [`Config::requester`] at construction instead.
+    pub fn set_requester(&self, id: RequesterId) {
+        self.requester.store(id.0, Ordering::Relaxed);
     }
 
     /// Give the core the memory address space it executes from.
@@ -975,17 +1083,23 @@ impl Z80 {
     /// attached, which the caller must treat as "stop", not "retry". A halted
     /// core still returns four, because it is still refreshing.
     pub fn step(&self) -> u64 {
+        let reset = self.lines.take_reset_request();
+        let cfg = self.config();
         let mut session = self.session.lock();
         // Destructured so the two spaces can be borrowed while `state` is
         // borrowed mutably: they are different fields. Cloning the `Arc`s
         // instead would put two atomic refcount updates on the path of every
         // instruction, for a lifetime the lock already guarantees.
         let Session { state, space, io } = &mut *session;
+        // The `reset` pin latches outside the lock; this is where the latch
+        // becomes execution state, before the step, so a pulse is honoured at
+        // the very next instruction boundary.
+        state.reset_pending |= reset;
         let io = io.as_deref();
         let Some(space) = space.as_deref() else {
             return 0;
         };
-        Exec::new(state, space, io, &self.cfg, &self.lines).step()
+        Exec::new(state, space, io, &cfg, &self.lines).step()
     }
 
     /// Execute until at least `budget` T-states have been charged.
@@ -993,6 +1107,9 @@ impl Z80 {
     /// Returns the T-states actually used, which overshoots by at most one
     /// instruction — a Z80 cannot be stopped mid-instruction, and pretending
     /// otherwise is how a scheduler ends up with a CPU in an impossible state.
+    ///
+    /// [`run_budget`](Z80::run_budget) is the same loop with the overshoot
+    /// carried forward instead, which is what the scheduler needs.
     pub fn run(&self, budget: u64) -> u64 {
         let mut used = 0;
         while used < budget {
@@ -1003,6 +1120,48 @@ impl Z80 {
             used += n;
         }
         used
+    }
+
+    /// Execute for at most `ticks`, carrying any overshoot into the next call.
+    ///
+    /// The scheduler hands out a budget and refuses a report larger than it, so
+    /// the instruction that ran past the end is paid for by the *following*
+    /// budget through `State::debt` — which keeps the core's T-state count
+    /// exact while never letting its clock domain run ahead of the timeline.
+    ///
+    /// A core with no address space consumes only the debt it owed: a halted
+    /// one is still refreshing and still charges.
+    pub fn run_budget(&self, ticks: u64) -> u64 {
+        let owed = self.session.lock().state.debt;
+        if owed >= ticks {
+            // The last instruction was longer than this whole budget: charge
+            // the budget against the debt and execute nothing.
+            self.session.lock().state.debt = owed - ticks;
+            return ticks;
+        }
+        let allowance = ticks - owed;
+        let mut used = 0u64;
+        while used < allowance {
+            let n = self.step();
+            if n == 0 {
+                // No address space. Stop — retrying would spin.
+                break;
+            }
+            used += n;
+        }
+        if used >= allowance {
+            self.session.lock().state.debt = used - allowance;
+            ticks
+        } else {
+            self.session.lock().state.debt = 0;
+            owed + used
+        }
+    }
+
+    /// T-states owed to the next budget — see [`run_budget`](Z80::run_budget).
+    #[must_use]
+    pub fn cycle_debt(&self) -> u64 {
+        self.session.lock().state.debt
     }
 
     /// Disassemble `count` instructions starting at `pc`, reading guest memory
@@ -1028,7 +1187,9 @@ impl Z80 {
 /// The `cpu.z80` device class.
 pub static CLASS: DeviceClass = DeviceClass {
     name: "cpu.z80",
-    version: 1,
+    // 2: the chunk gained the scheduler debt, without which a restored core
+    // runs one instruction free.
+    version: 2,
     summary: "Zilog Z80 8-bit CPU core, cycle-accurate interpreter",
     properties: &[
         PropertySpec {
@@ -1048,6 +1209,18 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Uint,
             required: false,
             summary: "what a read nothing answers returns; $ff is a bus with pull-ups",
+        },
+        PropertySpec {
+            name: "engine",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "which execution engine; only `interp` exists until phase 5",
+        },
+        PropertySpec {
+            name: "iospace",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "the name of the separate 64 KiB address space IN and OUT reach",
         },
     ],
     construct: |props| Ok(Box::new(Z80::from_props(props)?)),
@@ -1071,14 +1244,64 @@ impl Device for Z80 {
         &CLASS
     }
 
-    fn realize(&self, ctx: &mut RealizeCtx<'_>) -> Result<()> {
-        // A CPU with no address space cannot fetch, and failing here is the
-        // difference between a config error and a machine that runs zero
-        // instructions and says nothing.
-        if self.session.lock().space.is_none() {
-            return Err(ctx.error("no address space attached to this core"));
-        }
+    fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
+        // Nothing outward. A CPU with no address space cannot fetch, but
+        // realize runs *before* the machine binds one — that check belongs to
+        // `Instance::bind`, which is where the space arrives.
         Ok(())
+    }
+
+    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        // The fan-in can only be built now: it is told its sources at
+        // construction and no `WireId` existed when this core was made.
+        //
+        // Every pin is named the way the package names it, minus the bar:
+        // `/INT`, `/NMI` and `/RESET` are asserted low on real silicon, and
+        // inverting a level belongs to whatever models the wire.
+        let mut pins = self.pins.lock();
+        let sink: Arc<dyn WireSink> = match port {
+            "int" => {
+                let pin = Arc::new(InterruptPin::from_lines(
+                    Arc::clone(&self.lines),
+                    Interrupt::Int,
+                    sources,
+                ));
+                pins.int = Some(Arc::clone(&pin));
+                pin
+            }
+            "nmi" => {
+                let pin = Arc::new(InterruptPin::from_lines(
+                    Arc::clone(&self.lines),
+                    Interrupt::Nmi,
+                    sources,
+                ));
+                pins.nmi = Some(Arc::clone(&pin));
+                pin
+            }
+            "reset" => {
+                let pin = Arc::new(ResetPin::new(Arc::clone(&self.lines), sources));
+                pins.reset = Some(Arc::clone(&pin));
+                pin
+            }
+            _ => return None,
+        };
+        Some(SinkPin { sink, line: 0 })
+    }
+
+    fn attach_int_ack(&self, port: &str, ack: Weak<dyn IntAck>) {
+        // Only `INT` has an acknowledge cycle. `NMI` is vectored through
+        // $0066 by the architecture and no device drives a byte for it.
+        if port == "int" {
+            self.lines.attach_ack(ack);
+        }
+    }
+
+    fn is_runnable(&self) -> bool {
+        true
+    }
+
+    fn run(&self, budget: Budget) -> Consumed {
+        Consumed::new(self.run_budget(budget.ticks))
     }
 
     fn reset(&self, kind: ResetKind) {
@@ -1101,10 +1324,21 @@ impl Device for Z80 {
             // machine. The edge latch is internal, so it goes.
             self.lines.clear_nmi_latch();
         }
+        // The sequence the machine just asked for is the one the pin owed.
+        self.lines.take_reset_request();
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
-        let state = self.session.lock().state;
+        // Fold the `reset` pin's latch in first. It is not a field of its own
+        // in the chunk: `reset_pending` is where it was always going, and a
+        // snapshot taken between an assertion and the next step would otherwise
+        // lose the reset entirely.
+        let reset = self.lines.take_reset_request();
+        let state = {
+            let mut session = self.session.lock();
+            session.state.reset_pending |= reset;
+            session.state
+        };
         let r = state.regs;
         for value in [
             r.af(),
@@ -1136,6 +1370,7 @@ impl Device for Z80 {
         w.write_bool(state.reset_pending)?;
         w.write_u64(state.faults)?;
         w.write_u16(state.last_fault)?;
+        w.write_u64(state.debt)?;
         let (int, nmi_level, nmi_latch, vector) = self.lines.snapshot();
         w.write_bool(int)?;
         w.write_bool(nmi_level)?;
@@ -1181,6 +1416,7 @@ impl Device for Z80 {
         state.reset_pending = r.read_bool()?;
         state.faults = r.read_u64()?;
         state.last_fault = r.read_u16()?;
+        state.debt = r.read_u64()?;
         let int = r.read_bool()?;
         let nmi_level = r.read_bool()?;
         let nmi_latch = r.read_bool()?;
@@ -1193,8 +1429,68 @@ impl Device for Z80 {
 
 impl Initiator for Z80 {
     fn requester(&self) -> RequesterId {
-        self.cfg.requester
+        RequesterId(self.requester.load(Ordering::Relaxed))
     }
+}
+
+/// The machine layer's half: a Z80 needs its memory space, and — unlike every
+/// memory-mapped core in this crate — may need a second one.
+///
+/// `IN` and `OUT` reach a **separate 64 KiB address space**, not a window into
+/// memory: the chip drives `/IORQ` instead of `/MREQ` and a board decodes it
+/// differently. `space =` is structural and there is one of it, so the I/O
+/// space is named by the `iospace` string property. A machine that names none
+/// gets a core whose `IN` reads [`Config::floating_bus`] and whose `OUT` goes
+/// nowhere, which is what an unpopulated port bus does.
+impl crate::machine::Instance for Z80 {
+    fn bind(&self, ctx: &crate::machine::BindCtx<'_>) -> Result<()> {
+        let space = ctx.space().ok_or_else(|| Error::Config {
+            at: ctx.path().to_string(),
+            message: String::from("a Z80 needs an address space to fetch from (`space = mem`)"),
+        })?;
+        self.attach_space(Arc::clone(space));
+        if !self.iospace.is_empty() {
+            let io = ctx
+                .space_named(&self.iospace)
+                .ok_or_else(|| Error::Config {
+                    at: ctx.path().to_string(),
+                    message: alloc::format!(
+                        "`iospace = \"{}\"` names no address space in this machine",
+                        self.iospace
+                    ),
+                })?;
+            self.attach_io_space(Arc::clone(io));
+        }
+        self.set_requester(ctx.requester());
+        Ok(())
+    }
+}
+
+/// Bind [`CLASS`] into the machine graph.
+///
+/// # Errors
+///
+/// If the class name is already bound.
+pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
+    bindings.bind(CLASS.name, |props| Ok(Arc::new(Z80::from_props(props)?)))
+}
+
+/// What the validator should know about `cpu.z80`.
+#[must_use]
+pub fn schema() -> crate::machine::validate::ClassSchema {
+    use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
+    ClassSchema::new(CLASS.name)
+        .prop(PropSchema::new("cmos", ValueKind::Bool))
+        .prop(PropSchema::new("out-c-zero", ValueKind::Uint).range(0, 0xff))
+        .prop(PropSchema::new("floating-bus", ValueKind::Uint).range(0, 0xff))
+        .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
+        .prop(PropSchema::new("iospace", ValueKind::Str))
+        // Inputs only. `/BUSRQ` and `/WAIT` are real pins with no model behind
+        // them yet, and the outputs (`/M1`, `/IORQ`, `/RFSH`) are the address
+        // space's business rather than a wire's.
+        .port("int", PortDir::In)
+        .port("nmi", PortDir::In)
+        .port("reset", PortDir::In)
 }
 
 /// One of the CPU's two interrupt inputs, as something a [`Wire`] can drive.
@@ -1208,7 +1504,7 @@ impl Initiator for Z80 {
 /// [`Wire`]: crate::core::wire::Wire
 #[derive(Debug)]
 pub struct InterruptPin {
-    cpu: Arc<Z80>,
+    lines: Arc<Lines>,
     which: Interrupt,
     inputs: FanIn,
     resolve: Resolve,
@@ -1219,10 +1515,20 @@ impl InterruptPin {
     ///
     /// Wire-OR by default: any source asserting asserts the pin, which is how
     /// an open-collector interrupt line behaves.
+    ///
+    /// The pin keeps a handle on the core's *input latches*, not on the core:
+    /// the core owns the pin — something must, since a net holds only a weak
+    /// reference to its sinks — and a pin that owned the core back would be a
+    /// cycle the machine could never drop.
     #[must_use]
     pub fn new(cpu: Arc<Z80>, which: Interrupt, sources: &[WireId]) -> InterruptPin {
+        InterruptPin::from_lines(Arc::clone(&cpu.lines), which, sources)
+    }
+
+    /// The same, given the latches directly.
+    fn from_lines(lines: Arc<Lines>, which: Interrupt, sources: &[WireId]) -> InterruptPin {
         InterruptPin {
-            cpu,
+            lines,
             which,
             inputs: FanIn::new(sources),
             resolve: Resolve::Or,
@@ -1254,8 +1560,58 @@ impl WireSink for InterruptPin {
         self.inputs.set(src, level);
         let asserted = self.inputs.resolve(self.resolve).is_high();
         match self.which {
-            Interrupt::Int => self.cpu.set_int(asserted),
-            Interrupt::Nmi => self.cpu.set_nmi(asserted),
+            Interrupt::Int => self.lines.set_int(asserted),
+            Interrupt::Nmi => self.lines.set_nmi(asserted),
+        }
+    }
+}
+
+/// The core's `/RESET` input, as something a [`Wire`] can drive.
+///
+/// Separate from [`InterruptPin`] because a reset is not an interrupt: it has
+/// no flip-flop to gate it, no mode to vector it, and it clears `I` and `R`
+/// rather than pushing anything. Asserting the line latches a request; the
+/// sequence runs on the next [`Z80::step`].
+///
+/// [`Wire`]: crate::core::wire::Wire
+#[derive(Debug)]
+pub struct ResetPin {
+    lines: Arc<Lines>,
+    inputs: FanIn,
+    resolve: Resolve,
+}
+
+impl ResetPin {
+    /// Connect `cpu`'s `/RESET` pin to a net driven by `sources`.
+    #[must_use]
+    pub fn new_for(cpu: Arc<Z80>, sources: &[WireId]) -> ResetPin {
+        ResetPin::new(Arc::clone(&cpu.lines), sources)
+    }
+
+    /// The same, given the latches directly.
+    fn new(lines: Arc<Lines>, sources: &[WireId]) -> ResetPin {
+        ResetPin {
+            lines,
+            inputs: FanIn::new(sources),
+            resolve: Resolve::Or,
+        }
+    }
+
+    /// The per-source levels currently seen.
+    #[must_use]
+    pub fn inputs(&self) -> &FanIn {
+        &self.inputs
+    }
+}
+
+impl WireSink for ResetPin {
+    fn set_level(&self, src: WireId, _line: u32, level: Level) {
+        self.inputs.set(src, level);
+        // Latch on assertion rather than on release: a machine holding its
+        // reset button down should still come up, instead of waiting for a
+        // release nobody modelled.
+        if self.inputs.resolve(self.resolve).is_high() {
+            self.lines.request_reset();
         }
     }
 }

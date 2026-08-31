@@ -322,6 +322,15 @@ pub(super) struct State {
     pub faults: u64,
     /// Physical address of the most recent refused access.
     pub last_fault: u32,
+    /// Clocks owed to the next scheduler budget.
+    ///
+    /// An x86 cannot be stopped mid-instruction, so a budget that runs out
+    /// part-way through one is overshot. The scheduler refuses a `Consumed`
+    /// larger than the budget it handed out — rightly, since that would put
+    /// the domain ahead of the timeline — so the overshoot is carried here and
+    /// charged against the next budget instead. Architectural, because a
+    /// restored machine that forgot its debt runs one instruction free.
+    pub debt: u64,
 }
 
 impl State {
@@ -350,6 +359,7 @@ impl State {
             open_bus: 0,
             faults: 0,
             last_fault: 0,
+            debt: 0,
         }
     }
 }
@@ -472,7 +482,12 @@ impl<'a> Exec<'a> {
                 // Two INTA bus cycles; a PC's 8259A drives the vector onto the
                 // data bus during the second.
                 self.charge(2 * self.variant().bus_clocks() + Op::INT.clocks());
-                let vector = self.lines.intr_vector();
+                // The acknowledge cycle proper: whatever drives `INTR` answers
+                // it with a vector, and moves the request from pending to in
+                // service on its own side. A net with no `IntAck` on it falls
+                // back to the latched byte, which is what a test that drives
+                // the pin by hand sets.
+                let vector = self.lines.acknowledge();
                 self.entry = self.state.regs;
                 self.deliver(Fault::bare(vector));
                 return self.used;
@@ -598,6 +613,7 @@ impl<'a> Exec<'a> {
             2 => Width::U16,
             _ => Width::U32,
         };
+        let addr = addr & self.lines.a20_mask();
         match self.mem.read(u64::from(addr), width, self.attrs) {
             Ok(value) => {
                 self.state.open_bus = (value >> ((size as u32 - 1) * 8)) as u8;
@@ -628,6 +644,7 @@ impl<'a> Exec<'a> {
             2 => Width::U16,
             _ => Width::U32,
         };
+        let addr = addr & self.lines.a20_mask();
         if self
             .mem
             .write(u64::from(addr), width, u64::from(value), self.attrs)

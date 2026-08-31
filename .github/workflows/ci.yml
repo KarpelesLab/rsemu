@@ -111,7 +111,13 @@ jobs:
           echo "sweeping: $feats"
           for f in $feats; do
             echo "::group::$f"
-            cargo build --no-default-features --features "$f"
+            # --all-targets, not a plain build: a *test* that reaches for a
+            # sibling feature's module -- or for `std` under a feature that
+            # does not imply it -- compiles fine under --all-features and
+            # breaks for the first user who picks a narrow set. Five features
+            # were in exactly that state when this check was added, and a
+            # library-only sweep had reported all of them green.
+            cargo check --all-targets --no-default-features --features "$f"
             echo "::endgroup::"
           done
 

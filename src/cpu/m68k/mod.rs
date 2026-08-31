@@ -136,20 +136,23 @@ mod tests;
 mod conformance;
 
 use alloc::boxed::Box;
-use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::string::{String, ToString};
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt::{self, Write as _};
 
-use crate::core::device::{Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind};
+use crate::core::device::{
+    Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
+};
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
+use crate::core::sched::{Budget, Consumed};
 use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{self, AtomicBool, AtomicU8, AtomicU16, AtomicU32, LockRank, Ordering};
 use crate::core::value::Width;
-use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink};
+use crate::core::wire::{FanIn, IntAck, Level, Resolve, WireId, WireSink};
 
 use exec::{Exec, State};
 
@@ -507,6 +510,27 @@ pub(crate) struct Lines {
     /// A counter rather than a wire because `RESET` resets *peripherals*, not
     /// the processor, and what is on the other end is the machine's business.
     resets: AtomicU32,
+    /// A reset asked for by the `reset` pin, latched until the next step folds
+    /// it into the execution state.
+    ///
+    /// A latch rather than a write into `State::reset_pending`, because a wire
+    /// is driven from inside whatever device changed it — often from inside an
+    /// access this very core issued — and reaching for the session lock there
+    /// would re-enter the core's own critical section (`ROADMAP.md` §4.7).
+    reset: AtomicBool,
+    /// What answers the interrupt-acknowledge cycle, if a controller does.
+    ///
+    /// Weak, and behind its own leaf lock: the machine owns both devices, and a
+    /// CPU that kept its controller alive would close a cycle nothing could
+    /// drop (§4.3). Taken and released *before* `acknowledge` is called, so the
+    /// controller is free to take its own.
+    ///
+    /// **One slot, not one per level**, and that is a limitation rather than a
+    /// design: [`IntAck::acknowledge`] carries no argument, so a controller
+    /// cannot be told which level is being acknowledged and a board with two
+    /// vectoring controllers on different `IPL` pins cannot be expressed. The
+    /// 68000 is the first core to want that; see `docs/`.
+    ack: sync::Mutex<Option<Weak<dyn IntAck>>>,
 }
 
 impl Default for Lines {
@@ -518,6 +542,8 @@ impl Default for Lines {
             vector: AtomicU16::new(NO_VECTOR),
             level_seven: AtomicBool::new(false),
             resets: AtomicU32::new(0),
+            reset: AtomicBool::new(false),
+            ack: sync::Mutex::new(None),
         }
     }
 }
@@ -551,6 +577,42 @@ impl Lines {
             NO_VECTOR => None,
             other => Some(other as u8),
         }
+    }
+
+    /// Latch a reset request from the `reset` pin.
+    fn request_reset_pin(&self) {
+        self.reset.store(true, Ordering::Release);
+    }
+
+    /// Consume that latch, reporting whether a reset was owed.
+    fn take_reset_request(&self) -> bool {
+        self.reset.swap(false, Ordering::AcqRel)
+    }
+
+    /// Install what answers the interrupt-acknowledge cycle.
+    fn attach_ack(&self, ack: Weak<dyn IntAck>) {
+        *self.ack.lock() = Some(ack);
+    }
+
+    /// Run the acknowledge cycle: the vector a controller supplies, or `None`
+    /// for the autovector.
+    ///
+    /// A controller that answers offers an [`IntAck`]; one that asserts `VPA`
+    /// offers none, and `None` is what the caller turns into
+    /// `AUTOVECTOR_BASE + level`. An armed
+    /// [`set_interrupt_vector`](M68k::set_interrupt_vector) is checked first,
+    /// so a test or a host driving the core by hand still works.
+    ///
+    /// The lock is released before the outward call: the re-entrancy contract
+    /// forbids holding one across a call into another device (§4.7).
+    pub(crate) fn acknowledge(&self) -> Option<u8> {
+        if let Some(armed) = self.take_vector() {
+            return Some(armed);
+        }
+        let handler = self.ack.lock().clone();
+        handler
+            .and_then(|weak| weak.upgrade())
+            .map(|ack| ack.acknowledge() as u8)
     }
 
     pub(crate) fn pulse_reset(&self) {
@@ -600,9 +662,32 @@ struct Session {
 /// re-enter the CPU's own critical section.
 #[derive(Debug)]
 pub struct M68k {
-    cfg: Config,
-    lines: Lines,
+    lines: Arc<Lines>,
+    /// This core's identity in `MemAttrs::requester`, assigned at bind time.
+    ///
+    /// The `requester` property sets it at construction; the machine layer
+    /// overrides it in [`Instance::bind`](crate::machine::Instance::bind),
+    /// because a machine allocates one per initiator (`ROADMAP.md` §4.4).
+    requester: AtomicU32,
     session: sync::Mutex<Session>,
+    /// The strong end of every pin this core has handed to a wire.
+    ///
+    /// A net holds its sinks weakly — the machine owns devices and a wire
+    /// merely refers to them (§4.3) — so a pin nothing else kept alive would
+    /// die on the way out of [`Device::sink`] and the wire would silently
+    /// deliver to nothing.
+    pins: sync::Mutex<Pins>,
+}
+
+/// The pins [`Device::sink`] has built, kept alive by the core that owns them.
+///
+/// One [`InterruptPins`] for all three `IPL` lines, not one per line: they
+/// carry an encoded *level* rather than three independent requests, so the pin
+/// object has to see all three to know what the level is.
+#[derive(Debug, Default)]
+struct Pins {
+    ipl: Option<Arc<InterruptPins>>,
+    reset: Option<Arc<ResetPin>>,
 }
 
 impl M68k {
@@ -615,8 +700,8 @@ impl M68k {
     #[must_use]
     pub fn new(cfg: Config) -> M68k {
         M68k {
-            cfg,
-            lines: Lines::default(),
+            lines: Arc::new(Lines::default()),
+            requester: AtomicU32::new(cfg.requester.0),
             session: sync::Mutex::with_rank(
                 LockRank::BUS,
                 Session {
@@ -624,6 +709,7 @@ impl M68k {
                     space: None,
                 },
             ),
+            pins: sync::Mutex::new(Pins::default()),
         }
     }
 
@@ -636,6 +722,10 @@ impl M68k {
     pub fn from_props(props: &Props) -> Result<M68k> {
         let mut r = props.reader();
         let requester = r.or_range("requester", 0u64, 0..=u64::from(u32::MAX))?;
+        // Accepted and ignored: there is one engine until phase 5, and a
+        // machine file that names it should not need editing when the second
+        // one lands.
+        let _engine = r.or_enum("engine", "interp", &["interp"])?;
         r.finish()?;
         Ok(M68k::new(
             Config::default().with_requester(RequesterId(requester as u32)),
@@ -643,9 +733,23 @@ impl M68k {
     }
 
     /// This core's configuration.
+    ///
+    /// [`Config`] holds only the requester id, and that lives in an atomic
+    /// because the machine layer assigns it at bind time — so this is built
+    /// rather than stored.
     #[must_use]
     pub fn config(&self) -> Config {
-        self.cfg
+        Config {
+            requester: RequesterId(self.requester.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// Give the core the identity its accesses travel under.
+    ///
+    /// The machine layer calls this from `bind`; a crate driving the core
+    /// directly usually sets the `requester` property at construction instead.
+    pub fn set_requester(&self, id: RequesterId) {
+        self.requester.store(id.0, Ordering::Relaxed);
     }
 
     /// Give the core the address space it executes from.
@@ -838,12 +942,18 @@ impl M68k {
     /// Returns the cycles charged: zero if the core is halted or has no
     /// address space, which the caller must treat as "stop", not "retry".
     pub fn step(&self) -> u64 {
+        let reset = self.lines.take_reset_request();
+        let cfg = self.config();
         let mut session = self.session.lock();
         let Session { state, space } = &mut *session;
+        // The `reset` pin latches outside the lock; this is where the latch
+        // becomes execution state, before the step, so a pulse is honoured at
+        // the very next instruction boundary.
+        state.reset_pending |= reset;
         let Some(space) = space.clone() else {
             return 0;
         };
-        Exec::new(state, &space, &self.cfg, &self.lines).step()
+        Exec::new(state, &space, &cfg, &self.lines).step()
     }
 
     /// Execute until at least `budget` cycles have been charged.
@@ -852,6 +962,9 @@ impl M68k {
     /// instruction — a 68000 cannot be stopped mid-instruction, and pretending
     /// otherwise is how a scheduler ends up with a CPU in an impossible state.
     /// Stops early if the core halts.
+    ///
+    /// [`run_budget`](M68k::run_budget) is the same loop with the overshoot
+    /// carried forward instead, which is what the scheduler needs.
     pub fn run(&self, budget: u64) -> u64 {
         let mut used = 0;
         while used < budget {
@@ -862,6 +975,45 @@ impl M68k {
             used += n;
         }
         used
+    }
+
+    /// Execute for at most `ticks`, carrying any overshoot into the next call.
+    ///
+    /// The scheduler hands out a budget and refuses a report larger than it, so
+    /// the instruction that ran past the end is paid for by the *following*
+    /// budget through `State::debt` — which keeps the core's cycle count exact
+    /// while never letting its clock domain run ahead of the timeline.
+    ///
+    /// A halted core — one a double bus fault stopped — still consumes its
+    /// budget: the clock keeps running, and a domain that freezes there falls
+    /// behind the reset that would restart it.
+    pub fn run_budget(&self, ticks: u64) -> u64 {
+        let owed = self.session.lock().state.debt;
+        if owed >= ticks {
+            // The last instruction was longer than this whole budget: charge
+            // the budget against the debt and execute nothing.
+            self.session.lock().state.debt = owed - ticks;
+            return ticks;
+        }
+        let allowance = ticks - owed;
+        let mut used = 0u64;
+        while used < allowance {
+            let n = self.step();
+            if n == 0 {
+                // Halted, stopped, or no address space. Retrying would spin.
+                self.session.lock().state.debt = 0;
+                return ticks;
+            }
+            used += n;
+        }
+        self.session.lock().state.debt = used - allowance;
+        ticks
+    }
+
+    /// Cycles owed to the next budget — see [`run_budget`](M68k::run_budget).
+    #[must_use]
+    pub fn cycle_debt(&self) -> u64 {
+        self.session.lock().state.debt
     }
 
     /// Disassemble `count` instructions starting at `pc`, reading guest memory
@@ -887,14 +1039,24 @@ impl M68k {
 /// The `cpu.m68k` device class.
 pub static CLASS: DeviceClass = DeviceClass {
     name: "cpu.m68k",
-    version: 1,
+    // 2: the chunk gained the scheduler debt, without which a restored core
+    // runs one instruction free.
+    version: 2,
     summary: "Motorola MC68000 32-bit CPU core, bus-accurate interpreter",
-    properties: &[PropertySpec {
-        name: "requester",
-        kind: ValueKind::Uint,
-        required: false,
-        summary: "this core's requester id in MemAttrs, for an IOMMU or a per-master filter",
-    }],
+    properties: &[
+        PropertySpec {
+            name: "requester",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "this core's requester id in MemAttrs, for an IOMMU or a per-master filter",
+        },
+        PropertySpec {
+            name: "engine",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "which execution engine; only `interp` exists until phase 5",
+        },
+    ],
     construct: |props| Ok(Box::new(M68k::from_props(props)?)),
 };
 
@@ -916,14 +1078,71 @@ impl Device for M68k {
         &CLASS
     }
 
-    fn realize(&self, ctx: &mut RealizeCtx<'_>) -> Result<()> {
-        // A CPU with no address space cannot fetch, and failing here is the
-        // difference between a config error and a machine that runs zero
-        // instructions and says nothing.
-        if self.session.lock().space.is_none() {
-            return Err(ctx.error("no address space attached to this core"));
-        }
+    fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
+        // Nothing outward. A CPU with no address space cannot fetch, but
+        // realize runs *before* the machine binds one — that check belongs to
+        // `Instance::bind`, which is where the space arrives.
         Ok(())
+    }
+
+    /// The three `IPL` pins and `RESET`.
+    ///
+    /// **`ipl0`, `ipl1` and `ipl2` are three ports onto one sink**, and that is
+    /// the shape a 68000 forces. The pins carry an encoded *priority level*,
+    /// not three independent requests, so nothing can decide what the level is
+    /// without seeing all three at once — which means one [`InterruptPins`]
+    /// object with a [`FanIn`] per line, handed out three times with different
+    /// [`SinkPin::line`] numbers. A machine with a single source drives one
+    /// line and gets level 1, 2 or 4; a machine with a priority encoder drives
+    /// all three.
+    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        let line = match port {
+            "ipl0" => 0u32,
+            "ipl1" => 1,
+            "ipl2" => 2,
+            "reset" => {
+                let mut pins = self.pins.lock();
+                let pin = Arc::new(ResetPin::new(Arc::clone(&self.lines), sources));
+                pins.reset = Some(Arc::clone(&pin));
+                return Some(SinkPin { sink: pin, line: 0 });
+            }
+            _ => return None,
+        };
+        // One object, created on the first `IPL` port asked for and *kept*.
+        // Rebuilding it per port would hand each net a different sink, and a
+        // net holds its sink weakly — the earlier ones would die on the spot.
+        // So the fan-in for this line is installed into the object that
+        // already exists; a line nothing asked for has no sources and rests
+        // low, which is a zero in that bit of the level.
+        let object = {
+            let mut pins = self.pins.lock();
+            Arc::clone(pins.ipl.get_or_insert_with(|| {
+                Arc::new(InterruptPins::from_lines(Arc::clone(&self.lines)))
+            }))
+        };
+        // Outside the critical section: `install` takes the pins' own
+        // `WIRE`-ranked lock, and this one is a leaf (`ROADMAP.md` §4.7).
+        object.install(line as usize, sources);
+        Some(SinkPin { sink: object, line })
+    }
+
+    fn attach_int_ack(&self, port: &str, ack: Weak<dyn IntAck>) {
+        // Any `IPL` pin: a 68000's acknowledge cycle puts the *level* on
+        // A3-A1 and a device decides whether it is the one being asked, so the
+        // handler does not belong to one line. `IntAck::acknowledge` takes no
+        // argument, though, so only one controller on this core can vector —
+        // see [`Lines::acknowledge`].
+        if matches!(port, "ipl0" | "ipl1" | "ipl2") {
+            self.lines.attach_ack(ack);
+        }
+    }
+
+    fn is_runnable(&self) -> bool {
+        true
+    }
+
+    fn run(&self, budget: Budget) -> Consumed {
+        Consumed::new(self.run_budget(budget.ticks))
     }
 
     fn reset(&self, kind: ResetKind) {
@@ -941,13 +1160,24 @@ impl Device for M68k {
             session.state.stopped = false;
         }
         drop(session);
+        // The sequence the machine just asked for is the one the pin owed.
+        self.lines.take_reset_request();
         if kind == ResetKind::Cold {
             self.lines.restore((0, NO_VECTOR, false, 0));
         }
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
-        let state = self.session.lock().state;
+        // Fold the `RESET` pin's latch in first. It is not a field of its own
+        // in the chunk: `reset_pending` is where it was always going, and a
+        // snapshot taken between an assertion and the next step would otherwise
+        // lose the reset entirely.
+        let reset = self.lines.take_reset_request();
+        let state = {
+            let mut session = self.session.lock();
+            session.state.reset_pending |= reset;
+            session.state
+        };
         for value in state.d {
             w.write_u32(value)?;
         }
@@ -965,6 +1195,7 @@ impl Device for M68k {
         w.write_bool(state.reset_pending)?;
         w.write_u64(state.faults)?;
         w.write_u32(state.last_fault)?;
+        w.write_u64(state.debt)?;
         let (ipl, vector, level_seven, resets) = self.lines.snapshot();
         w.write_u8(ipl)?;
         w.write_u16(vector)?;
@@ -998,6 +1229,7 @@ impl Device for M68k {
         state.reset_pending = r.read_bool()?;
         state.faults = r.read_u64()?;
         state.last_fault = r.read_u32()?;
+        state.debt = r.read_u64()?;
         let ipl = r.read_u8()?;
         if ipl > 7 {
             return Err(Error::State(alloc::format!(
@@ -1020,8 +1252,63 @@ impl Device for M68k {
 
 impl Initiator for M68k {
     fn requester(&self) -> RequesterId {
-        self.cfg.requester
+        RequesterId(self.requester.load(Ordering::Relaxed))
     }
+}
+
+/// The machine layer's half: a core needs an address space, and this is where
+/// the machine gives it one.
+///
+/// **The space must be big-endian.** A 68000 reads a word as high byte first,
+/// and `core::space` carries endianness per region rather than per initiator,
+/// so a machine file that maps little-endian RAM under a 68000 gets every word
+/// byte-swapped. That is not something `bind` can check — the map is the
+/// board's, and a big-endian core sharing a region with a little-endian one is
+/// a legitimate configuration (`ROADMAP.md` §5's motivating case).
+impl crate::machine::Instance for M68k {
+    fn bind(&self, ctx: &crate::machine::BindCtx<'_>) -> Result<()> {
+        let space = ctx.space().ok_or_else(|| Error::Config {
+            at: ctx.path().to_string(),
+            message: String::from("a 68000 needs an address space to fetch from (`space = mem`)"),
+        })?;
+        self.attach_space(Arc::clone(space));
+        self.set_requester(ctx.requester());
+        Ok(())
+    }
+}
+
+/// Bind [`CLASS`] into the machine graph.
+///
+/// # Errors
+///
+/// If the class name is already bound.
+pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
+    bindings.bind(CLASS.name, |props| Ok(Arc::new(M68k::from_props(props)?)))
+}
+
+/// What the validator should know about `cpu.m68k`.
+///
+/// # Three interrupt pins, not one
+///
+/// `ipl0`, `ipl1` and `ipl2` carry an encoded **priority level**, 0 to 7, not
+/// three independent requests — which is genuinely different from an IRQ line
+/// and is why this core has three ports where the others have one. A board with
+/// a single source wires it to one pin and gets level 1, 2 or 4; a board with a
+/// priority encoder wires all three.
+#[must_use]
+pub fn schema() -> crate::machine::validate::ClassSchema {
+    use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
+    ClassSchema::new(CLASS.name)
+        .prop(PropSchema::new("requester", ValueKind::Uint))
+        .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
+        // Inputs only. `BERR`, `HALT`, `BR`/`BG` and `VPA` are real pins with
+        // no model behind them: a bus error is reported through the address
+        // space's result rather than a wire, and `VPA` is what *not* answering
+        // the acknowledge cycle means.
+        .port("ipl0", PortDir::In)
+        .port("ipl1", PortDir::In)
+        .port("ipl2", PortDir::In)
+        .port("reset", PortDir::In)
 }
 
 /// The three interrupt priority inputs, as something a [`Wire`] can drive.
@@ -1038,8 +1325,18 @@ impl Initiator for M68k {
 /// [`Wire`]: crate::core::wire::Wire
 #[derive(Debug)]
 pub struct InterruptPins {
-    cpu: Arc<M68k>,
-    inputs: [FanIn; 3],
+    lines: Arc<Lines>,
+    /// One fan-in per line, behind a lock because the machine layer installs
+    /// them **one port at a time**.
+    ///
+    /// `Device::sink` is asked for `ipl0`, `ipl1` and `ipl2` separately and is
+    /// told each net's drivers only when that net is built — but all three have
+    /// to live in one object, because they encode a single level and no one of
+    /// them can be resolved alone. Rebuilding the object per port would hand
+    /// each net a different sink, and a net holds its sink weakly, so the
+    /// earlier ones would die on the spot. Hence interior mutability rather
+    /// than a `[FanIn; 3]` fixed at construction.
+    inputs: sync::Mutex<[FanIn; 3]>,
     resolve: Resolve,
 }
 
@@ -1048,17 +1345,35 @@ impl InterruptPins {
     ///
     /// `sources[i]` is every id that drives IPL`i`. Wire-OR by default, which
     /// is how an open-collector interrupt line behaves.
+    ///
+    /// The object keeps a handle on the core's *input latches*, not on the
+    /// core: the core owns the pins — something must, since a net holds only a
+    /// weak reference to its sinks — and pins that owned the core back would be
+    /// a cycle the machine could never drop.
     #[must_use]
     pub fn new(cpu: Arc<M68k>, sources: [&[WireId]; 3]) -> InterruptPins {
+        let pins = InterruptPins::from_lines(Arc::clone(&cpu.lines));
+        for (line, srcs) in sources.iter().enumerate() {
+            pins.install(line, srcs);
+        }
+        pins
+    }
+
+    /// The same, given the latches directly and no sources yet.
+    fn from_lines(lines: Arc<Lines>) -> InterruptPins {
         InterruptPins {
-            cpu,
-            inputs: [
-                FanIn::new(sources[0]),
-                FanIn::new(sources[1]),
-                FanIn::new(sources[2]),
-            ],
+            lines,
+            inputs: sync::Mutex::with_rank(
+                LockRank::WIRE,
+                [FanIn::new(&[]), FanIn::new(&[]), FanIn::new(&[])],
+            ),
             resolve: Resolve::Or,
         }
+    }
+
+    /// Tell line `line` which ids drive it.
+    fn install(&self, line: usize, sources: &[WireId]) {
+        self.inputs.lock()[line.min(2)] = FanIn::new(sources);
     }
 
     /// The same pins with an explicit resolution rule.
@@ -1068,24 +1383,95 @@ impl InterruptPins {
         self
     }
 
-    /// The per-source levels currently seen on one line.
+    /// The level currently resolved on one line.
     #[must_use]
-    pub fn inputs(&self, line: usize) -> &FanIn {
-        &self.inputs[line.min(2)]
+    pub fn level(&self, line: usize) -> Level {
+        self.inputs.lock()[line.min(2)].resolve(self.resolve)
+    }
+
+    /// The three lines as the priority level they encode, 0 to 7.
+    #[must_use]
+    pub fn encoded(&self) -> u8 {
+        let inputs = self.inputs.lock();
+        let mut encoded = 0u8;
+        for (bit, input) in inputs.iter().enumerate() {
+            if input.resolve(self.resolve).is_high() {
+                encoded |= 1 << bit;
+            }
+        }
+        encoded
     }
 }
 
 impl WireSink for InterruptPins {
     fn set_level(&self, src: WireId, line: u32, level: Level) {
-        let index = (line as usize).min(2);
-        self.inputs[index].set(src, level);
-        let mut encoded = 0u8;
-        for (bit, input) in self.inputs.iter().enumerate() {
-            if input.resolve(self.resolve).is_high() {
-                encoded |= 1 << bit;
+        let encoded = {
+            let inputs = self.inputs.lock();
+            inputs[(line as usize).min(2)].set(src, level);
+            let mut encoded = 0u8;
+            for (bit, input) in inputs.iter().enumerate() {
+                if input.resolve(self.resolve).is_high() {
+                    encoded |= 1 << bit;
+                }
             }
+            encoded
+        };
+        // Outside the critical section, per the re-entrancy contract — even
+        // though what follows is one atomic store (`ROADMAP.md` §4.7).
+        self.lines.set_ipl(encoded);
+    }
+}
+
+/// The core's `RESET` input, as something a [`Wire`] can drive.
+///
+/// Not one of the `IPL` pins, and not an interrupt: `RESET` is a level the
+/// board holds, and on a 68000 it is bidirectional — the `RESET` *instruction*
+/// drives it outward to reset peripherals without resetting the processor,
+/// which is what [`M68k::reset_pulses`] counts. This is the inward half.
+///
+/// Asserting the line latches a request; the sequence, which reads vectors 0
+/// and 1, runs on the next [`M68k::step`].
+///
+/// [`Wire`]: crate::core::wire::Wire
+#[derive(Debug)]
+pub struct ResetPin {
+    lines: Arc<Lines>,
+    inputs: FanIn,
+    resolve: Resolve,
+}
+
+impl ResetPin {
+    /// Connect `cpu`'s `RESET` pin to a net driven by `sources`.
+    #[must_use]
+    pub fn new_for(cpu: Arc<M68k>, sources: &[WireId]) -> ResetPin {
+        ResetPin::new(Arc::clone(&cpu.lines), sources)
+    }
+
+    /// The same, given the latches directly.
+    fn new(lines: Arc<Lines>, sources: &[WireId]) -> ResetPin {
+        ResetPin {
+            lines,
+            inputs: FanIn::new(sources),
+            resolve: Resolve::Or,
         }
-        self.cpu.set_ipl(encoded);
+    }
+
+    /// The per-source levels currently seen.
+    #[must_use]
+    pub fn inputs(&self) -> &FanIn {
+        &self.inputs
+    }
+}
+
+impl WireSink for ResetPin {
+    fn set_level(&self, src: WireId, _line: u32, level: Level) {
+        self.inputs.set(src, level);
+        // Latch on assertion rather than on release: a machine holding its
+        // reset button down should still come up, instead of waiting for a
+        // release nobody modelled.
+        if self.inputs.resolve(self.resolve).is_high() {
+            self.lines.request_reset_pin();
+        }
     }
 }
 

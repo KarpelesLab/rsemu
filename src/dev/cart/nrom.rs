@@ -654,6 +654,7 @@ mod tests {
     use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
     use crate::core::value::Width;
     use crate::dev::cart::ines::Mirroring;
+    use alloc::string::ToString;
     use alloc::vec;
 
     /// An iNES 1.0 image with `prg_units` × 16 KiB of PRG and `chr_units` × 8

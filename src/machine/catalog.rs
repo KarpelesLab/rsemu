@@ -162,6 +162,73 @@ pub static SPI_PANEL: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/spi-panel.machine"),
 };
 
+/// A bare ARM926EJ-S SoC skeleton, when this build has an A-profile core.
+///
+/// A synthetic board rather than a product: a boot ROM at the reset vector,
+/// DRAM, and one peripheral aperture, with every address a parameter because an
+/// ARM9 SoC's memory map belongs to the SoC and not to the architecture. It is
+/// the starting point a downstream part copies and edits — the immediate one
+/// being a Conexant DigiColor CX92755-class SoC, whose peripherals sit at
+/// `0xf0000000`. The `firmware` slot takes whatever should be at `0x00000000`,
+/// where the core resets to.
+#[cfg(feature = "machine-arm926")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-arm926")))]
+pub static ARM926: CatalogEntry = CatalogEntry {
+    name: "arm926",
+    summary: "a bare ARM926EJ-S SoC skeleton: ARMv5TE core, boot ROM, DRAM, one peripheral window",
+    media: &["firmware"],
+    source: include_str!("../../machines/arm926.machine"),
+};
+
+/// The PC/AT, when this build has an x86 core and the board's chips.
+///
+/// Held out of the catalog until now for one reason: `cpu.i8086` was registered
+/// but not bound, so a machine file could not hand it an address space or wire
+/// an interrupt to it. It can, so the board is here.
+///
+/// **No firmware is shipped and none will be.** The `bios` slot takes an image
+/// the user supplies; `vgabios` and `floppy` likewise. A PC with no BIOS is a
+/// board that realizes and executes open bus, which is a useful thing to be
+/// able to look at and not a machine that boots.
+#[cfg(feature = "machine-pc-at")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-pc-at")))]
+pub static PC_AT: CatalogEntry = CatalogEntry {
+    name: "pc-at",
+    summary: "IBM PC/AT-class board: x86, two 8259As, 8254, MC146818, 8042, 8237s, VGA, floppy",
+    media: &["bios", "vgabios", "floppy"],
+    source: include_str!("../../machines/pc-at.machine"),
+};
+
+/// A minimal Z80 board, when this build has a Z80.
+///
+/// A synthetic board rather than a product: ROM at the reset vector, RAM above
+/// it, and a second address space for the 64 KiB of ports `IN` and `OUT` reach.
+/// It is where the Z80's separate I/O space is actually exercised through a
+/// machine file. The `firmware` slot takes whatever should be at `0x0000`.
+#[cfg(feature = "machine-z80-mini")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-z80-mini")))]
+pub static Z80_MINI: CatalogEntry = CatalogEntry {
+    name: "z80-mini",
+    summary: "a minimal Z80 board: ROM, RAM, and the separate 64 KiB port space IN and OUT reach",
+    media: &["firmware"],
+    source: include_str!("../../machines/z80-mini.machine"),
+};
+
+/// A minimal MC68000 board, when this build has a 68000.
+///
+/// A synthetic board rather than a product: a big-endian 24-bit space, ROM at
+/// zero holding the exception vector table, and RAM above it. The `firmware`
+/// slot takes whatever should be at `0x000000` — whose first two longwords are
+/// the reset stack pointer and the reset program counter.
+#[cfg(feature = "machine-m68k-mini")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-m68k-mini")))]
+pub static M68K_MINI: CatalogEntry = CatalogEntry {
+    name: "m68k-mini",
+    summary: "a minimal MC68000 board: 8 MHz, a big-endian 24-bit space, ROM at the vectors, RAM",
+    media: &["firmware"],
+    source: include_str!("../../machines/m68k-mini.machine"),
+};
+
 /// Every machine this build can realize, in catalog order.
 // One `#[cfg]`-gated push per shipped machine, which is what the lint is
 // complaining about: a `vec![]` literal cannot carry an attribute on one of its
@@ -173,10 +240,16 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     let mut out: Vec<&'static CatalogEntry> = Vec::new();
     #[cfg(feature = "machine-apple1")]
     out.push(&APPLE1);
+    #[cfg(feature = "machine-arm926")]
+    out.push(&ARM926);
     #[cfg(feature = "machine-beneater")]
     out.push(&BENEATER_6502);
     #[cfg(feature = "machine-gameboy")]
     out.push(&GAMEBOY);
+    #[cfg(feature = "machine-m68k-mini")]
+    out.push(&M68K_MINI);
+    #[cfg(feature = "machine-pc-at")]
+    out.push(&PC_AT);
     #[cfg(feature = "machine-nes")]
     out.push(&NES_NTSC);
     #[cfg(feature = "machine-nes")]
@@ -185,6 +258,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&RISCV_VIRT);
     #[cfg(feature = "machine-spi-panel")]
     out.push(&SPI_PANEL);
+    #[cfg(feature = "machine-z80-mini")]
+    out.push(&Z80_MINI);
     out
 }
 
@@ -221,6 +296,12 @@ pub fn registry() -> Result<Registry> {
     crate::dev::apu::register(&mut reg)?;
     #[cfg(feature = "dev-apple1")]
     crate::dev::apple1::register(&mut reg)?;
+    #[cfg(feature = "cpu-arm-aprofile")]
+    crate::cpu::arm::aprofile::register(&mut reg)?;
+    #[cfg(feature = "cpu-z80")]
+    crate::cpu::z80::register(&mut reg)?;
+    #[cfg(feature = "cpu-m68k")]
+    crate::cpu::m68k::register(&mut reg)?;
     #[cfg(feature = "cpu-riscv")]
     crate::cpu::riscv::register(&mut reg)?;
     #[cfg(feature = "dev-riscv")]
@@ -241,16 +322,6 @@ pub fn registry() -> Result<Registry> {
 }
 
 /// Every class that takes part in the memory map and the wire graph.
-///
-/// # The x86 core is registered but not bound
-///
-/// `cpu.i8086` appears in [`registry`] and not here, which is the one asymmetry
-/// in this file. The core has a `DeviceClass` and can be constructed, but no
-/// `Instance` impl, no `bind`, no input pins and no `schema` — so a machine
-/// file cannot hand it an address space or wire an interrupt to it, and
-/// `machines/pc-at.machine` is therefore shipped as data and checked by
-/// `dev::pc`'s own tests rather than listed in [`machines`]. The direction the
-/// agreement test checks — bound implies registered — still holds.
 ///
 /// # The PPU and the APU
 ///
@@ -288,12 +359,20 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::apu::bind(&mut b)?;
     #[cfg(feature = "dev-apple1")]
     crate::dev::apple1::bind(&mut b)?;
+    #[cfg(feature = "cpu-arm-aprofile")]
+    crate::cpu::arm::aprofile::bind(&mut b)?;
+    #[cfg(feature = "cpu-z80")]
+    crate::cpu::z80::bind(&mut b)?;
+    #[cfg(feature = "cpu-m68k")]
+    crate::cpu::m68k::bind(&mut b)?;
     #[cfg(feature = "cpu-riscv")]
     crate::cpu::riscv::bind(&mut b)?;
     #[cfg(feature = "dev-riscv")]
     crate::dev::riscv::bind(&mut b)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::bind(&mut b)?;
+    #[cfg(feature = "cpu-x86")]
+    crate::cpu::x86::bind(&mut b)?;
     #[cfg(feature = "dev-pc")]
     crate::dev::pc::bind(&mut b)?;
     #[cfg(feature = "bus-spi")]
@@ -334,6 +413,12 @@ pub fn classes() -> ClassTable {
     for schema in crate::dev::apple1::schemas() {
         table.insert(schema);
     }
+    #[cfg(feature = "cpu-arm-aprofile")]
+    table.insert(crate::cpu::arm::aprofile::schema());
+    #[cfg(feature = "cpu-z80")]
+    table.insert(crate::cpu::z80::schema());
+    #[cfg(feature = "cpu-m68k")]
+    table.insert(crate::cpu::m68k::schema());
     #[cfg(feature = "cpu-riscv")]
     table.insert(crate::cpu::riscv::schema());
     #[cfg(feature = "dev-riscv")]
@@ -348,6 +433,10 @@ pub fn classes() -> ClassTable {
     table.insert(crate::bus::spi::controller::schema());
     #[cfg(feature = "dev-st7272a")]
     for schema in crate::dev::sitronix::schemas() {
+        table.insert(schema);
+    }
+    #[cfg(feature = "cpu-x86")]
+    for schema in crate::cpu::x86::schemas() {
         table.insert(schema);
     }
     #[cfg(feature = "dev-pc")]
@@ -858,7 +947,7 @@ mod tests {
     /// The catch-up hook sits at the top of the PPU's own `MemOps::read`, which
     /// is exactly where it would be easiest to move the chip's clock on a
     /// monitor read. It must not.
-    #[cfg(feature = "machine-nes")]
+    #[cfg(all(feature = "machine-nes", feature = "dev-nes-ppu"))]
     #[test]
     fn a_debug_read_of_2002_advances_no_clock() {
         use crate::core::space::MemAttrs;
@@ -900,7 +989,7 @@ mod tests {
     }
 
     /// The PPU's dot counter, out of its snapshot chunk.
-    #[cfg(feature = "machine-nes")]
+    #[cfg(all(feature = "machine-nes", feature = "dev-nes-ppu"))]
     fn ppu_dots(machine: &Machine) -> u64 {
         use crate::core::state::{Migrations, Source, StateReader};
         let class = &crate::dev::ppu::NES_PPU_CLASS;
@@ -951,7 +1040,7 @@ mod tests {
         match (machine, slot) {
             // Two machines take a slot called `cart` and they are not the same
             // kind of cartridge at all, which is why this is keyed by both.
-            #[cfg(feature = "machine-gameboy")]
+            #[cfg(all(feature = "machine-gameboy", feature = "std"))]
             ("gameboy", "cart") => minimal_gb(),
             (_, "cart") => MINIMAL_NROM,
             // Each board's default monitor: rsemu's own, committed precisely so
@@ -973,14 +1062,63 @@ mod tests {
             // time by `dev::lcd::demo`, so it needs no toolchain either.
             #[cfg(feature = "machine-spi-panel")]
             ("spi-panel", "firmware") => crate::dev::lcd::demo::PANEL_DEMO,
+            // `B .` — the ARM branch-to-self, which is the whole four-byte
+            // program needed to prove the board realizes and the core fetches.
+            // `tests/arm926_board.rs` supplies the one that does something.
+            #[cfg(feature = "machine-arm926")]
+            ("arm926", "firmware") => &[0xfe, 0xff, 0xff, 0xea],
+            // `JR -2` — the Z80 branch-to-self, which is the whole two-byte
+            // program needed to prove the board realizes and the core fetches.
+            // `tests/z80_mini_board.rs` supplies the one that does something.
+            #[cfg(feature = "machine-z80-mini")]
+            ("z80-mini", "firmware") => &[0x18, 0xfe],
+            // The two longwords a 68000 fetches out of reset — a stack pointer
+            // at the top of the board's RAM and a program counter at $000008 —
+            // followed by `BRA .-0`, the two-byte branch to itself. Everything
+            // needed to prove the board realizes and the core fetches; the
+            // program that does something is in `tests/m68k_mini_board.rs`.
+            #[cfg(feature = "machine-m68k-mini")]
+            ("m68k-mini", "firmware") => &[
+                0x00, 0x20, 0x00, 0x00, // SSP = $00200000
+                0x00, 0x00, 0x00, 0x08, // PC  = $00000008
+                0x60, 0xfe, // BRA .
+            ],
+            // No firmware is shipped for the PC and none ever will be, so what
+            // this board gets is the right *shape*: a socket-sized image of
+            // zeroes, which realizes and executes open bus. `tests/pc_at_board`
+            // is where the board is actually exercised.
+            #[cfg(all(feature = "machine-pc-at", feature = "std"))]
+            ("pc-at", "bios") => blank(128 * 1024),
+            #[cfg(all(feature = "machine-pc-at", feature = "std"))]
+            ("pc-at", "vgabios") => blank(32 * 1024),
+            #[cfg(all(feature = "machine-pc-at", feature = "std"))]
+            ("pc-at", "floppy") => blank(1_474_560),
             (m, other) => panic!("no fixture for `{m}`'s media slot `{other}`"),
         }
+    }
+
+    /// A run of zeroes of a given length, leaked once per length asked for.
+    ///
+    /// A media fixture has to outlive the machine that binds it, and the sizes
+    /// wanted here are a socket's, not a constant's — so the array cannot be a
+    /// `static`. Leaking a handful of buffers in a test process is the honest
+    /// trade against threading a lifetime through the whole fixture table.
+    #[cfg(all(feature = "machine-pc-at", feature = "std"))]
+    fn blank(len: usize) -> &'static [u8] {
+        use std::collections::BTreeMap;
+        use std::sync::{Mutex, OnceLock};
+        static CACHE: OnceLock<Mutex<BTreeMap<usize, &'static [u8]>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .entry(len)
+            .or_insert_with(|| alloc::vec![0u8; len].leak())
     }
 
     /// The smallest legal Game Boy image: two 16 KiB banks, a correct header
     /// checksum, and a one-instruction program (`JR -2`, the smallest program
     /// that neither ends nor wanders). Generated, never vendored.
-    #[cfg(feature = "machine-gameboy")]
+    #[cfg(all(feature = "machine-gameboy", feature = "std"))]
     fn minimal_gb() -> &'static [u8] {
         // A `OnceLock` rather than a `static` array because the header checksum
         // is computed over the image, and the generator is where that lives.

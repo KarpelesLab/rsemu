@@ -916,19 +916,125 @@ fn a_snapshot_naming_an_impossible_interrupt_mode_is_rejected() {
 }
 
 #[test]
-fn realize_refuses_a_core_with_no_address_space() {
+fn realize_does_nothing_outward_because_the_space_has_not_arrived_yet() {
+    // The check that a core has an address space used to live in `realize`. It
+    // cannot: the realizer runs `realize` for every device *before* it binds
+    // any of them, so a core that refused here would refuse every machine. The
+    // check is in `Instance::bind`, and the test for it is below.
     let cpu = Z80::new(Config::NMOS);
     let mut deferred = Deferred::new();
     let mut ctx = RealizeCtx::new("/cpu0", RequesterId::ANONYMOUS, &mut deferred);
-    assert!(cpu.realize(&mut ctx).is_err());
-
-    let space = AddressSpace::new("cpu", 16);
-    space
-        .topology()
-        .map(Region::ram("ram", Arc::new(RamStore::new(0x1_0000))), 0)
-        .expect("fits");
-    cpu.attach_space(Arc::new(space));
     assert!(cpu.realize(&mut ctx).is_ok());
+}
+
+/// A `BuildOptions` and registry that know about this core and `ram`/`rom`.
+fn machine_layer() -> (crate::core::Registry, crate::machine::BuildOptions) {
+    let mut options = crate::machine::BuildOptions::new();
+    options.classes.insert(super::schema());
+    for schema in crate::machine::builtin::schemas() {
+        options.classes.insert(schema);
+    }
+    super::bind(&mut options.bindings).expect("nothing else claims cpu.z80");
+    crate::machine::builtin::bind(&mut options.bindings).expect("ram and rom");
+
+    let mut registry = crate::core::Registry::new();
+    crate::machine::builtin::register(&mut registry).expect("ram and rom");
+    super::register(&mut registry).expect("nothing else claims cpu.z80");
+    (registry, options)
+}
+
+#[test]
+fn binding_a_core_with_no_address_space_is_a_machine_error() {
+    let (registry, options) = machine_layer();
+    let text = "machine \"m\" {\n  osc x = 3500000 Hz\n  space mem { width = 16 }\n  \
+                object dram \"ram\" { size = 4K }\n  object cpu \"cpu.z80\" { clock = x }\n  \
+                map mem 0 size 4K = dram\n}\n";
+    let err = crate::machine::build("t.machine", text, &registry, &options)
+        .expect_err("a core with no `space =` cannot fetch");
+    let text = alloc::format!("{err}");
+    assert!(text.contains("address space"), "{text}");
+}
+
+#[test]
+fn an_iospace_that_names_nothing_is_a_machine_error() {
+    let (registry, options) = machine_layer();
+    let text = "machine \"m\" {\n  osc x = 3500000 Hz\n  space mem { width = 16 }\n  \
+                object dram \"ram\" { size = 4K }\n  \
+                object cpu \"cpu.z80\" { clock = x, space = mem, iospace = \"ports\" }\n  \
+                map mem 0 size 4K = dram\n}\n";
+    let err = crate::machine::build("t.machine", text, &registry, &options)
+        .expect_err("there is no space called `ports`");
+    let text = alloc::format!("{err}");
+    assert!(text.contains("ports"), "{text}");
+}
+
+#[test]
+fn the_pins_a_machine_file_may_name_are_exactly_these_three() {
+    use crate::core::device::Device;
+    let cpu = Z80::new(Config::NMOS);
+    for port in ["int", "nmi", "reset"] {
+        assert!(cpu.sink(port, &[]).is_some(), "`{port}` should be a pin");
+    }
+    for port in ["irq", "busrq", ""] {
+        assert!(
+            cpu.sink(port, &[]).is_none(),
+            "`{port}` is not a pin this core has"
+        );
+    }
+}
+
+#[test]
+fn the_reset_pin_latches_and_the_next_step_runs_the_sequence() {
+    use crate::core::device::Device;
+    use crate::core::wire::{Level, Wire, WireId};
+
+    let m = Machine::new();
+    m.load(0x0100, &[0x3e, 0x42]); // LD A,$42
+    m.start(0x0100);
+    m.cpu.step();
+    assert_eq!(m.cpu.reg(Reg::Af) >> 8, 0x42);
+
+    let src = WireId::new(1);
+    let pin = m.cpu.sink("reset", &[src]).expect("a reset pin");
+    let wire = Wire::builder()
+        .source(src)
+        .sink_weak(Arc::downgrade(&pin.sink), pin.line)
+        .build();
+    // The latch lives outside the execution lock, so it becomes execution
+    // state on the step that consumes it — which is what keeps a device
+    // asserting reset from inside an access this core issued out of the core's
+    // own critical section.
+    wire.set(src, Level::High);
+    m.cpu.step();
+    assert_eq!(m.cpu.reg(Reg::Pc), 0, "the reset sequence clears PC");
+    assert_eq!(m.cpu.reg(Reg::I), 0);
+}
+
+#[test]
+fn the_scheduler_budget_is_never_overshot_and_the_debt_is_paid_back() {
+    // `LDIR` with a long count is far longer than a one-T-state budget, so this
+    // is the case where a plain `run` reports more than it was handed — which
+    // the scheduler rejects outright.
+    let m = Machine::new();
+    m.load(0x0100, &[0xed, 0xb0]); // LDIR
+    m.start(0x0100);
+    m.cpu.set_reg(Reg::Bc, 0x0400);
+    m.cpu.set_reg(Reg::Hl, 0x2000);
+    m.cpu.set_reg(Reg::De, 0x3000);
+
+    let before = m.cpu.cycles();
+    let mut total = 0u64;
+    for _ in 0..64 {
+        let used = m.cpu.run_budget(1);
+        assert!(used <= 1, "a budget of one T-state reported {used}");
+        total += used;
+    }
+    assert_eq!(total, 64, "every tick of every budget was granted and used");
+    assert_eq!(
+        m.cpu.cycles() - before,
+        total + m.cpu.cycle_debt(),
+        "T-states executed but not yet reported are exactly the debt"
+    );
 }
 
 #[test]
@@ -974,4 +1080,84 @@ fn properties_reach_the_configuration() {
         Z80::from_props(&Props::new().with("clok", 1u64)).is_err(),
         "a typo'd property must not be swallowed"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The acknowledge cycle
+// ---------------------------------------------------------------------------
+
+/// A peripheral that answers the acknowledge cycle, the way a Z80 PIO or CTC
+/// does: it drives `INT`, and when the CPU acknowledges it puts its programmed
+/// vector on the data bus and counts the service.
+#[derive(Debug)]
+struct Peripheral {
+    vector: u8,
+    acknowledged: crate::core::sync::AtomicU32,
+}
+
+impl crate::core::wire::IntAck for Peripheral {
+    fn acknowledge(&self) -> u32 {
+        self.acknowledged
+            .fetch_add(1, crate::core::sync::Ordering::Relaxed);
+        u32::from(self.vector)
+    }
+}
+
+#[test]
+fn mode_two_takes_its_vector_from_the_device_that_answers_the_acknowledge() {
+    use crate::core::device::Device;
+    use crate::core::sync::{AtomicU32, Ordering};
+    use crate::core::wire::IntAck;
+
+    let m = Machine::new();
+    // The interrupt vector table at $8000, with entry $80/$0e pointing at
+    // $2000. In mode 2 the CPU forms the address from `I` and the byte the
+    // device drove, with bit 0 forced clear on real silicon.
+    m.load(0x800e, &[0x00, 0x20]);
+    m.load(0x2000, &[0xed, 0x4d]); // RETI
+    m.load(0x0100, &[0x00]); // NOP
+
+    let device: Arc<Peripheral> = Arc::new(Peripheral {
+        vector: 0x0e,
+        acknowledged: AtomicU32::new(0),
+    });
+    let weak: alloc::sync::Weak<dyn IntAck> = Arc::downgrade(&device) as _;
+    m.cpu.attach_int_ack("int", weak);
+
+    // After `start`, which runs the reset sequence -- and a reset clears `I`.
+    m.start(0x0100);
+    m.cpu.set_reg(Reg::I, 0x80);
+    m.cpu.set_interrupt_mode(2).expect("mode 2 exists");
+    m.cpu.set_iff(true, true);
+    m.cpu.set_int(true);
+    m.cpu.step();
+
+    assert_eq!(
+        device.acknowledged.load(Ordering::Relaxed),
+        1,
+        "the CPU must run the acknowledge cycle, not read a latched byte"
+    );
+    assert_eq!(
+        m.cpu.reg(Reg::Pc),
+        0x2000,
+        "the vector the device drove is what the CPU jumped through"
+    );
+}
+
+#[test]
+fn with_nothing_attached_the_latched_byte_still_answers() {
+    // The common case: a Master System's VDP drives `INT` and nothing answers
+    // the cycle, so what the CPU reads is whatever is on the bus. A machine
+    // with one fixed source sets that once.
+    let m = Machine::new();
+    m.load(0x8022, &[0x00, 0x30]);
+    m.load(0x0100, &[0x00]);
+    m.start(0x0100);
+    m.cpu.set_reg(Reg::I, 0x80);
+    m.cpu.set_interrupt_mode(2).expect("mode 2 exists");
+    m.cpu.set_iff(true, true);
+    m.cpu.set_interrupt_vector(0x22);
+    m.cpu.set_int(true);
+    m.cpu.step();
+    assert_eq!(m.cpu.reg(Reg::Pc), 0x3000);
 }

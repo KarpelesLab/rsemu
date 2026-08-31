@@ -99,9 +99,15 @@ dispatcher. Neither reaches a shell yet; where each stops is written down in
 
 A seventh, `pc-at`, is a complete IBM PC/AT chipset — cascaded 8259As, 8254,
 MC146818, 8042, two 8237As, MC6845/VGA text mode, µPD765A — with a
-user-supplied BIOS path in the QEMU style (`--bios`, `--vgabios`). It ships as
-data and is exercised by integration tests rather than being in the catalog,
-because the 8086 core is not yet bindable into a machine file.
+user-supplied BIOS path in the QEMU style (`--bios`, `--vgabios`). No firmware
+is shipped and none will be.
+
+Beside them are four synthetic boards, each the smallest machine that exercises
+one thing: `spi-panel` (a display path over SPI), `arm926` (an ARM926EJ-S with a
+parameterised peripheral aperture, the starting point for a downstream SoC),
+`z80-mini` (the Z80's separate 64 KiB I/O space) and `m68k-mini` (a 68000 on a
+big-endian map). They model no products; they exist so those subsystems have
+somewhere real to run.
 
 The framework underneath is complete: address spaces with priority and
 mirroring, an oscillator forest with exact intra-tree ratios, wires, devices,

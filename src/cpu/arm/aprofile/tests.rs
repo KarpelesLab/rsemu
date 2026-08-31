@@ -1697,7 +1697,12 @@ fn the_device_surface_is_wired_up() {
 }
 
 #[test]
-fn realize_refuses_a_core_with_no_address_space() {
+fn realize_does_nothing_outward_because_the_space_has_not_arrived_yet() {
+    // The check that a core has an address space used to live here. It cannot:
+    // the realizer runs `realize` for every device *before* it binds any of
+    // them, so a core that refused here would refuse every machine. The check
+    // is in `Instance::bind`, and the test for it is
+    // `binding_a_core_with_no_address_space_is_a_machine_error` below.
     let cpu = Arm::new(Config::ARM926EJS);
     let mut deferred = crate::core::device::Deferred::new();
     let mut ctx = crate::core::device::RealizeCtx::new(
@@ -1705,7 +1710,33 @@ fn realize_refuses_a_core_with_no_address_space() {
         crate::core::space::RequesterId::ANONYMOUS,
         &mut deferred,
     );
-    assert!(cpu.realize(&mut ctx).is_err());
+    assert!(cpu.realize(&mut ctx).is_ok());
+}
+
+#[test]
+fn binding_a_core_with_no_address_space_is_a_machine_error() {
+    // Through the machine layer, because that is the only thing that can build
+    // a `BindCtx` — and it is the path a user's typo actually takes.
+    let mut options = crate::machine::BuildOptions::new();
+    options.classes.insert(super::schema());
+    super::bind(&mut options.bindings).expect("nothing else claims cpu.arm");
+    crate::machine::builtin::bind(&mut options.bindings).expect("ram and rom");
+    for schema in crate::machine::builtin::schemas() {
+        options.classes.insert(schema);
+    }
+
+    let mut registry = crate::core::Registry::new();
+    crate::machine::builtin::register(&mut registry).expect("ram and rom");
+    super::register(&mut registry).expect("nothing else claims cpu.arm");
+
+    let text = "machine \"m\" {\n  osc x = 1000000 Hz\n  space mem { width = 32 }\n                  object dram \"ram\" { size = 4K }\n  object cpu \"cpu.arm\" { clock = x }\n                  map mem 0 size 4K = dram\n}\n";
+    let err = crate::machine::build("t.machine", text, &registry, &options)
+        .expect_err("a core with no `space =` cannot fetch");
+    let text = alloc::format!("{err}");
+    assert!(
+        text.contains("address space"),
+        "the error should say what is missing, not just that something is: {text}"
+    );
 }
 
 #[test]
@@ -2245,4 +2276,162 @@ fn a_block_transfer_forces_its_base_word_aligned_without_rotating() {
     h.cpu.set_reg(0, 0x2002);
     h.step();
     assert_eq!(h.cpu.reg(1), 0x1122_3344);
+}
+
+// ---------------------------------------------------------------------------
+// The machine surface: the input pins a `.machine` file can wire
+// ---------------------------------------------------------------------------
+
+use crate::core::wire::{Wire, WireId};
+
+/// Build a one-driver net onto `port` of `cpu`, the way the realizer does.
+///
+/// The net holds its sink **weakly** — the machine owns devices and a wire only
+/// refers to them (`ROADMAP.md` §4.3) — so nothing here keeps the pin alive.
+/// That is the point: if [`Device::sink`] did not stash the `Arc` inside the
+/// core, the sink would already be dead by the first `set` and the wire would
+/// silently deliver to nothing.
+fn net(cpu: &Arm, port: &str) -> (Wire, WireId) {
+    let src = WireId(1);
+    let pin = cpu
+        .sink(port, &[src])
+        .unwrap_or_else(|| panic!("this core has no `{port}` pin"));
+    let wire = Wire::builder()
+        .source(src)
+        .sink_weak(Arc::downgrade(&pin.sink), pin.line)
+        .build();
+    (wire, src)
+}
+
+#[test]
+fn the_irq_and_fiq_pins_reach_the_input_latches_through_a_wire() {
+    let h = Harness::new();
+    let (irq, irq_src) = net(&h.cpu, "irq");
+    let (fiq, fiq_src) = net(&h.cpu, "fiq");
+
+    assert!(!h.cpu.irq_asserted());
+    assert!(!h.cpu.fiq_asserted());
+
+    irq.set(irq_src, Level::High);
+    assert!(h.cpu.irq_asserted(), "the wire never reached the pin");
+    assert!(
+        !h.cpu.fiq_asserted(),
+        "and it reached only the one it names"
+    );
+
+    fiq.set(fiq_src, Level::High);
+    assert!(h.cpu.fiq_asserted());
+
+    irq.set(irq_src, Level::Low);
+    assert!(
+        !h.cpu.irq_asserted(),
+        "a level-sensitive pin follows the level"
+    );
+    assert!(h.cpu.fiq_asserted());
+}
+
+#[test]
+fn a_shared_irq_net_stays_asserted_while_either_driver_holds_it() {
+    // The classic shared-line bug: two devices on one open-collector `nIRQ`,
+    // and the one that deasserts must not drop the line the other is holding.
+    let h = Harness::new();
+    let (a, b) = (WireId(1), WireId(2));
+    let pin = h.cpu.sink("irq", &[a, b]).expect("an irq pin");
+    let wire = Wire::builder()
+        .sources(&[a, b])
+        .sink_weak(Arc::downgrade(&pin.sink), pin.line)
+        .build();
+
+    wire.set(a, Level::High);
+    wire.set(b, Level::High);
+    assert!(h.cpu.irq_asserted());
+    wire.set(a, Level::Low);
+    assert!(
+        h.cpu.irq_asserted(),
+        "the other driver is still holding the line"
+    );
+    wire.set(b, Level::Low);
+    assert!(!h.cpu.irq_asserted());
+}
+
+#[test]
+fn an_irq_arriving_on_a_wire_is_taken_as_an_exception() {
+    // End to end: the pin, the latch, and the interpreter's own check.
+    let h = running(&[0xe1a0_0000, 0xe1a0_0000]); // NOP, NOP
+    let (wire, src) = net(&h.cpu, "irq");
+    // System mode with I clear, so the interrupt is not masked.
+    h.cpu.set_cpsr(u32::from(Mode::SYSTEM.0));
+
+    wire.set(src, Level::High);
+    h.step();
+    assert_eq!(
+        h.cpu.mode(),
+        Mode::IRQ,
+        "the core did not enter IRQ mode on an asserted pin"
+    );
+    assert_eq!(
+        h.cpu.pc(),
+        0x18,
+        "the IRQ vector is at 0x18 with low vectors"
+    );
+}
+
+#[test]
+fn the_reset_pin_latches_and_the_next_step_runs_the_sequence() {
+    let h = Harness::new();
+    let (wire, src) = net(&h.cpu, "reset");
+
+    h.program(0x1000, &[0xe3a0_0042]); // MOV r0, #0x42
+    h.boot(0x1000);
+    h.step();
+    assert_eq!(h.cpu.reg(0), 0x42);
+    assert!(!h.cpu.reset_pending(), "the boot sequence is already spent");
+
+    // The latch lives outside the execution lock, so it becomes execution
+    // state on the step that consumes it rather than inside the wire's own
+    // call — which is what keeps a device asserting reset from inside an
+    // access this core issued out of the core's critical section.
+    wire.set(src, Level::High);
+    h.step();
+    assert_eq!(
+        h.cpu.pc(),
+        0,
+        "the reset sequence puts the pc on the low vector"
+    );
+    assert_eq!(h.cpu.mode(), Mode::SUPERVISOR);
+}
+
+#[test]
+fn the_pins_a_machine_file_may_name_are_exactly_these_three() {
+    let h = Harness::new();
+    for port in ["irq", "fiq", "reset"] {
+        assert!(h.cpu.sink(port, &[]).is_some(), "`{port}` should be a pin");
+    }
+    for port in ["nmi", "vinithi", ""] {
+        assert!(
+            h.cpu.sink(port, &[]).is_none(),
+            "`{port}` is not a pin this core has"
+        );
+    }
+}
+
+#[test]
+fn the_scheduler_budget_is_never_overshot_and_the_debt_is_paid_back() {
+    // A sixteen-register `LDM` is far longer than a one-tick budget, so this is
+    // the case where a plain `run` reports more than it was handed — which the
+    // scheduler rejects outright.
+    let h = running(&[0xe89f_ffff]); // LDMIA r15, {r0-r15}
+    let before = h.cpu.cycles();
+    let mut total = 0u64;
+    for _ in 0..64 {
+        let used = h.cpu.run_budget(1);
+        assert!(used <= 1, "a budget of one tick reported {used}");
+        total += used;
+    }
+    assert_eq!(total, 64, "every tick of every budget was granted and used");
+    assert_eq!(
+        h.cpu.cycles() - before,
+        total + h.cpu.cycle_debt(),
+        "cycles executed but not yet reported are exactly the debt"
+    );
 }

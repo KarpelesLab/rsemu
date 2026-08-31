@@ -48,15 +48,22 @@ something a person can actually run (§2).
 > 32-bit instructions with no unexpected exception, stopping only where it waits
 > on a timer no machine has supplied yet.
 >
-> **Six machines that run**, plus a seventh that does not yet. `nes-ntsc` and
+> **Seven machines that run**, plus four synthetic boards. `nes-ntsc` and
 > `nes-pal` — AccuracyCoin boots, raises NMI and draws its menu; `gameboy`;
 > `apple1` and `beneater-6502`, interactive over a terminal; and `riscv-virt`,
 > which is the one that boots real system software: **OpenSBI 1.6 completely**,
 > on a device tree generated from the realized machine rather than shipped, then
 > **Linux 6.12 as far as `asids_init`** and **EDK2 to the end of the DXE
-> dispatcher**. Where each stops is written down, not rounded up. `pc-at` is a
-> complete PC/AT chipset with a user-supplied BIOS path, held out of the catalog
-> because the 8086 core is not yet bindable into a machine file.
+> dispatcher**. Where each stops is written down, not rounded up. `pc-at` — a
+> complete PC/AT chipset with a user-supplied BIOS path — is now **in the
+> catalog**: every CPU core in the tree is bindable from a `.machine` file, so
+> the asymmetry that held it out is gone.
+>
+> The synthetic boards are `spi-panel`, `arm926`, `z80-mini` and `m68k-mini`:
+> minimum machines that exist so a subsystem has somewhere real to run. Each is
+> the smallest thing that exercises what it is named for — a display path over
+> SPI, an ARMv5TE core with a parameterised peripheral aperture, the Z80's
+> separate I/O space, a 68000 on a big-endian map.
 >
 > Beyond the DSL front-to-back, the framework grew a **gdb stub**, a **scanout
 > seam** with a browser build at <https://karpeleslab.github.io/rsemu/>, and a

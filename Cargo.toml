@@ -201,6 +201,16 @@ cpu-mos6502 = []
 # Adds no dependencies and is `no_std + alloc`.
 cpu-arm-aprofile = []
 
+# The `arm926` board (machines/arm926.machine plus the classes it names): a bare
+# ARM926EJ-S SoC skeleton -- an ARMv5TE core, a boot ROM at the reset vector,
+# DRAM, and one peripheral aperture, with every address a `param` because an ARM9
+# SoC's memory map belongs to the SoC rather than to the architecture. It models
+# no product; it exists so `cpu.arm` has somewhere to run inside a machine file,
+# and so a downstream SoC starts from a file it copies rather than from nothing.
+# No CP15: the core's coprocessor seam is a Rust trait and a machine file cannot
+# yet name one, so the board runs on the flat identity map. Adds no dependencies.
+machine-arm926 = ["cpu-arm-aprofile"]
+
 # The RISC-V `virt` board's chips (src/dev/riscv): the CLINT, the PLIC, a 16550
 # UART on the character-device seam, a system controller, virtio-MMIO with block
 # and entropy devices, and a **device tree generator** that emits the DTB from
@@ -238,6 +248,16 @@ cpu-arm-v7m = []
 # machine supplies. A disassembler is generated from the same tables. Adds no
 # dependencies and is `no_std + alloc`.
 cpu-z80 = []
+
+# The `z80-mini` board (machines/z80-mini.machine plus the classes it names):
+# ROM at the reset vector, RAM above it, and a **second address space** for the
+# 64 KiB of ports `IN` and `OUT` reach -- the thing a Z80 has and no
+# memory-mapped core in this crate does. It models no product; it exists so
+# `cpu.z80` has somewhere to run inside a machine file and so the I/O space has
+# a board that exercises it. No interrupt controller: mode 2 needs a device that
+# answers the acknowledge cycle, and there is none to wire yet. Adds no
+# dependencies.
+machine-z80-mini = ["cpu-z80"]
 
 # The Sharp SM83 core (src/cpu/sm83): the Game Boy's processor, an M-cycle
 # accurate interpreter with all 256 base and 256 $CB encodings, the eleven
@@ -318,6 +338,15 @@ machine-pc-at = ["cpu-x86", "dev-pc", "dev-pc-video", "dev-pc-floppy"]
 # The plain 68000 of the Amiga, Atari ST, Mega Drive and early Macs; not the
 # 010 or the 020. Adds no dependencies and is `no_std + alloc`.
 cpu-m68k = []
+
+# The `m68k-mini` board (machines/m68k-mini.machine plus the classes it names):
+# a big-endian 24-bit space, ROM at zero holding the exception vector table and
+# the two longwords a 68000 fetches out of reset, and RAM above it. It models no
+# product; it exists so `cpu.m68k` has somewhere to run inside a machine file.
+# Nothing raises an interrupt on it: the core's three `IPL` pins carry an
+# encoded priority level rather than a request, and there is no priority encoder
+# to wire. Adds no dependencies.
+machine-m68k-mini = ["cpu-m68k"]
 
 [lib]
 name = "rsemu"

@@ -6,24 +6,21 @@
 //! isolated tests structurally cannot show, and which is where a memory map, an
 //! I/O map or a wire graph goes wrong.
 //!
-//! # Why there is a stub processor in here
+//! # The processor
 //!
-//! `cpu.i8086` is registered but not **bound**: the core has no `Instance` impl,
-//! no `bind`, no input pins and no `schema`, so a machine file cannot hand it an
-//! address space or wire an interrupt to it. Until that lands, the board cannot
-//! be realized with the real core — so this test supplies a processor-shaped
-//! stub under the same class name and realizes the board around it.
+//! The real `cpu.x86` core, under the class name the board uses. There used to
+//! be a stub here, because `cpu.i8086` was registered but not **bound** — no
+//! `Instance` impl, no `bind`, no input pins, no `schema` — so a machine file
+//! could not hand it an address space or wire an interrupt to it. That stub was
+//! written as a specification of what the core had to grow; the core has grown
+//! it, so the stub is gone and the same assertions run against the real thing.
 //!
-//! That is not a workaround so much as a specification. [`StubCpu`] is exactly
-//! what the real core has to grow, and no more: two address spaces (memory, and
-//! the separate I/O space named by `iospace`), four input pins, an
-//! acknowledge handler on `intr`, and a runnable that consumes a budget. When
-//! the core has those, this file's stub is deleted and the same assertions run
-//! against it.
+//! The one thing this file still does for itself is build its own [`Bindings`]
+//! rather than taking the catalog's, so that the constructor can keep an
+//! `Arc<X86>`. `Device` keeps `Any` out of its supertrait chain on purpose, so
+//! the only moment a concrete type exists is construction — the same seam
+//! `host::display` uses, and for the same reason.
 
-// `cpu-x86` too, though nothing here executes an instruction: the class has to
-// be in the *registry* for the machine file to name it, and the stub below
-// supplies only the machine-layer half the core does not have yet.
 #![cfg(all(
     feature = "cpu-x86",
     feature = "dev-pc",
@@ -33,225 +30,40 @@
 
 use std::sync::Arc;
 
-use rsemu::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
-use rsemu::core::props::{Props, ValueKind};
-use rsemu::core::sched::{Budget, Consumed};
-use rsemu::core::space::{AddressSpace, MemAttrs};
-use rsemu::core::sync::{AtomicBool, AtomicU32, LockRank, Mutex, Ordering};
+use rsemu::core::device::ResetKind;
+use rsemu::core::space::MemAttrs;
 use rsemu::core::value::Width;
-use rsemu::core::wire::{FanIn, IntAck, Level, Resolve, WireId, WireSink};
-use rsemu::machine::validate::{ClassSchema, PortDir, PropSchema};
-use rsemu::machine::{BindCtx, Instance, build};
+use rsemu::cpu::x86::{Variant, X86};
+use rsemu::machine::build;
+use rsemu::machine::realize::Bindings;
 
 // ---------------------------------------------------------------------------
-// the processor-shaped hole in the middle of the board
+// reaching the processor
 // ---------------------------------------------------------------------------
-
-/// One input pin of the stub, with the fan-in that makes two drivers work.
-///
-/// A20 and reset each have two drivers on this board — the keyboard controller
-/// and the chipset's fast port — so a pin that only remembered "somebody said
-/// high" would drop the line when either of them said low. That is the classic
-/// shared-line bug `FanIn` exists for, and the real core needs the same.
-#[derive(Debug)]
-struct Pin {
-    inputs: FanIn,
-    level: AtomicBool,
-    /// How many times this pin has been asserted, so a *pulse* is
-    /// distinguishable from a line that merely ended where it started.
-    edges: AtomicU32,
-}
-
-impl Pin {
-    fn new(sources: &[WireId]) -> Pin {
-        Pin {
-            inputs: FanIn::new(sources),
-            level: AtomicBool::new(false),
-            edges: AtomicU32::new(0),
-        }
-    }
-}
-
-impl WireSink for Pin {
-    fn set_level(&self, src: WireId, _line: u32, level: Level) {
-        self.inputs.set(src, level);
-        let now = self.inputs.resolve(Resolve::Or).is_high();
-        if now && !self.level.swap(now, Ordering::AcqRel) {
-            self.edges.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.level.store(now, Ordering::Release);
-        }
-    }
-}
-
-/// What the machine hands the stub when it binds it.
-#[derive(Debug, Default)]
-struct Bound {
-    memory: Option<Arc<AddressSpace>>,
-    io: Option<Arc<AddressSpace>>,
-    /// The controller that answers this pin's acknowledge cycle.
-    ack: Option<std::sync::Weak<dyn IntAck>>,
-}
 
 thread_local! {
-    /// The stub built most recently on this thread.
+    /// The core built most recently on this thread.
     ///
     /// There is no route from a `dyn Device` to a concrete type — `Device`
     /// keeps `Any` out of its supertrait chain on purpose — so the handle is
-    /// taken at the one moment the concrete type exists: construction. The same
-    /// seam `host::display` uses, and for the same reason.
-    static LAST_STUB: std::cell::RefCell<Option<Arc<StubCpu>>> =
+    /// taken at the one moment the concrete type exists: construction.
+    static LAST_CPU: std::cell::RefCell<Option<Arc<X86>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// A processor with no instruction set: pins, two address spaces, and an
-/// acknowledge cycle.
-#[derive(Debug)]
-struct StubCpu {
-    iospace: String,
-    bound: Mutex<Bound>,
-    pins: Mutex<Vec<(String, Arc<Pin>)>>,
-}
-
-impl StubCpu {
-    fn new(props: &Props) -> rsemu::Result<StubCpu> {
-        let mut r = props.reader();
-        let _model = r.or_enum("model", "8088", &["8086", "8088"])?;
-        let _engine = r.or_enum("engine", "interp", &["interp"])?;
-        let iospace = r.optional_str("iospace")?.unwrap_or("").to_string();
-        r.finish()?;
-        Ok(StubCpu {
-            iospace,
-            bound: Mutex::with_rank(LockRank::BUS, Bound::default()),
-            pins: Mutex::with_rank(LockRank::LEAF, Vec::new()),
-        })
-    }
-
-    fn pin(&self, name: &str) -> Option<Arc<Pin>> {
-        self.pins
-            .lock()
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, p)| Arc::clone(p))
-    }
-
-    fn level(&self, name: &str) -> bool {
-        self.pin(name)
-            .map(|p| p.level.load(Ordering::Acquire))
-            .unwrap_or(false)
-    }
-
-    fn edges(&self, name: &str) -> u32 {
-        self.pin(name)
-            .map(|p| p.edges.load(Ordering::Relaxed))
-            .unwrap_or(0)
-    }
-
-    /// Run the acknowledge cycle the way a real core would when it takes an
-    /// interrupt with `IF` set.
-    fn acknowledge(&self) -> Option<u32> {
-        let weak = self.bound.lock().ack.clone()?;
-        weak.upgrade().map(|ack| ack.acknowledge())
-    }
-}
-
-static STUB_CLASS: DeviceClass = DeviceClass {
-    name: "cpu.i8086",
-    version: 1,
-    summary: "a processor-shaped stub: pins and two address spaces, no instruction set",
-    properties: &[
-        PropertySpec {
-            name: "model",
-            kind: ValueKind::Str,
-            required: false,
-            summary: "8086 or 8088",
-        },
-        PropertySpec {
-            name: "engine",
-            kind: ValueKind::Str,
-            required: false,
-            summary: "which execution engine",
-        },
-        PropertySpec {
-            name: "iospace",
-            kind: ValueKind::Str,
-            required: false,
-            summary: "the separate address space IN and OUT reach",
-        },
-    ],
-    construct: |props| Ok(Box::new(StubCpu::new(props)?)),
-};
-
-impl Device for StubCpu {
-    fn class(&self) -> &'static DeviceClass {
-        &STUB_CLASS
-    }
-
-    fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> rsemu::Result<()> {
-        Ok(())
-    }
-
-    fn reset(&self, _kind: ResetKind) {}
-
-    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
-        if !matches!(port, "intr" | "nmi" | "reset" | "a20") {
-            return None;
-        }
-        let pin = Arc::new(Pin::new(sources));
-        self.pins.lock().push((port.to_string(), Arc::clone(&pin)));
-        Some(SinkPin {
-            sink: pin as Arc<dyn WireSink>,
-            line: 0,
-        })
-    }
-
-    fn attach_int_ack(&self, port: &str, ack: std::sync::Weak<dyn IntAck>) {
-        if port == "intr" {
-            self.bound.lock().ack = Some(ack);
-        }
-    }
-
-    fn is_runnable(&self) -> bool {
-        true
-    }
-
-    fn run(&self, budget: Budget) -> Consumed {
-        // A stub executes nothing, but it must still consume its budget or the
-        // scheduler makes no progress and every other device stands still.
-        Consumed::new(budget.ticks)
-    }
-}
-
-impl Instance for StubCpu {
-    fn bind(&self, ctx: &BindCtx<'_>) -> rsemu::Result<()> {
-        let memory = ctx.space().ok_or_else(|| rsemu::Error::Config {
-            at: ctx.path().to_string(),
-            message: "a processor needs an address space to fetch from".to_string(),
-        })?;
-        let mut bound = self.bound.lock();
-        bound.memory = Some(Arc::clone(memory));
-        if !self.iospace.is_empty() {
-            let io = ctx
-                .space_named(&self.iospace)
-                .ok_or_else(|| rsemu::Error::Config {
-                    at: ctx.path().to_string(),
-                    message: format!("no address space named `{}`", self.iospace),
-                })?;
-            bound.io = Some(Arc::clone(io));
-        }
-        Ok(())
-    }
-}
-
-fn stub_schema() -> ClassSchema {
-    ClassSchema::new("cpu.i8086")
-        .prop(PropSchema::new("model", ValueKind::Str))
-        .prop(PropSchema::new("engine", ValueKind::Str))
-        .prop(PropSchema::new("iospace", ValueKind::Str))
-        .port("intr", PortDir::In)
-        .port("nmi", PortDir::In)
-        .port("reset", PortDir::In)
-        .port("a20", PortDir::In)
+/// Everything this board needs to construct, with a `cpu.i8086` that hands a
+/// handle back.
+fn bindings() -> Bindings {
+    let mut b = Bindings::new();
+    rsemu::machine::builtin::bind(&mut b).expect("ram and rom");
+    rsemu::dev::pc::bind(&mut b).expect("the chipset");
+    b.bind("cpu.i8086", |props| {
+        let cpu = Arc::new(X86::from_props_defaulting(props, Variant::I8088)?.as_i8086());
+        LAST_CPU.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&cpu)));
+        Ok(cpu)
+    })
+    .expect("nothing else in this table claims the name");
+    b
 }
 
 // ---------------------------------------------------------------------------
@@ -303,12 +115,12 @@ fn fake_floppy() -> Vec<u8> {
 
 fn board_with_display() -> (
     rsemu::machine::Machine,
-    Arc<StubCpu>,
+    Arc<X86>,
     rsemu::dev::pc::video::VideoScanout,
 ) {
     let guard = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
     let machine = build_board();
-    let cpu = LAST_STUB
+    let cpu = LAST_CPU
         .with(|slot| slot.borrow().clone())
         .expect("the constructor kept a handle");
     let scanout =
@@ -317,28 +129,16 @@ fn board_with_display() -> (
     (machine, cpu, scanout)
 }
 
-/// The board and its stub processor, for a test with no interest in the
-/// picture.
-fn board() -> (rsemu::machine::Machine, Arc<StubCpu>) {
+/// The board and its processor, for a test with no interest in the picture.
+fn board() -> (rsemu::machine::Machine, Arc<X86>) {
     let (machine, cpu, _) = board_with_display();
     (machine, cpu)
 }
 
 fn build_board() -> rsemu::machine::Machine {
-    let mut options = rsemu::machine::catalog::build_options().expect("this build's classes");
-    options
-        .bindings
-        .bind("cpu.i8086", |props| {
-            let cpu = Arc::new(StubCpu::new(props)?);
-            // The only moment the concrete type exists. `Device` keeps `Any`
-            // out of its supertrait chain on purpose, so there is no route back
-            // from the realized `Arc<dyn Instance>` — the same seam the NES
-            // scanout uses, and for the same reason.
-            LAST_STUB.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&cpu)));
-            Ok(cpu)
-        })
-        .expect("the core does not bind it yet — that is why this stub exists");
-    options.classes.insert(stub_schema());
+    let mut options = rsemu::machine::BuildOptions::new()
+        .with_classes(rsemu::machine::catalog::classes())
+        .with_bindings(bindings());
     options.realize.media.insert("bios", fake_bios(128 * 1024));
     options
         .realize
@@ -385,6 +185,40 @@ fn inb(m: &rsemu::machine::Machine, port: u64) -> u8 {
 // ---------------------------------------------------------------------------
 // the tests
 // ---------------------------------------------------------------------------
+
+#[cfg(feature = "machine-pc-at")]
+#[test]
+fn the_catalog_realizes_this_board_with_its_own_bindings() {
+    // The rest of this file builds its own `Bindings` so it can keep a handle
+    // on the core. This one does not: it goes through `catalog::build_options`,
+    // which is what `rsemu run pc-at` uses — and which could only realize the
+    // board once `cpu.i8086` was bound, `schema`'d and given its pins.
+    let _guard = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = rsemu::machine::catalog::machine("pc-at").expect("this build ships pc-at");
+    let mut options = rsemu::machine::catalog::build_options().expect("this build's classes");
+    options.realize.media.insert("bios", fake_bios(128 * 1024));
+    options
+        .realize
+        .media
+        .insert("vgabios", fake_vgabios(32 * 1024));
+    options.realize.media.insert("floppy", fake_floppy());
+    rsemu::host::display::pc::capture::clear();
+    rsemu::host::display::pc::capture::install(&mut options).expect("one display class");
+    let registry = rsemu::machine::catalog::registry().expect("this build's registry");
+    let mut m = match build(entry.name, entry.source, &registry, &options) {
+        Ok(m) => m,
+        Err(e) => panic!("the catalog cannot realize its own pc-at: {e}"),
+    };
+    m.reset(ResetKind::Cold);
+    m.sweep();
+    // And it runs: the core fetches from the reset vector at the top of the
+    // ROM's high window and executes whatever is there. The image is not
+    // firmware, so what it executes is nonsense — the assertion is that the
+    // scheduler drove a bound processor at all, which a machine whose CPU has
+    // no address space cannot do.
+    m.run_for(rsemu::core::clock::GlobalTime::from_nanos(200_000))
+        .expect("the machine runs");
+}
 
 #[test]
 fn the_board_realizes_with_every_chip_mapped_and_wired() {
@@ -496,16 +330,16 @@ fn the_fast_a20_gate_reaches_the_processors_pin() {
     let (mut m, cpu) = board();
     m.reset(ResetKind::Cold);
     m.sweep();
-    assert!(!cpu.level("a20"), "A20 is shut at power on");
+    assert!(!cpu.a20_open(), "A20 is shut at power on");
     outb(&m, 0x92, 0x02);
-    assert!(cpu.level("a20"), "port 0x92 bit 1 opens it");
+    assert!(cpu.a20_open(), "port 0x92 bit 1 opens it");
     // And the keyboard controller's path opens the same net — two drivers,
     // wire-ORed, which is why the pin keeps a `FanIn`.
     outb(&m, 0x92, 0x00);
-    assert!(!cpu.level("a20"));
+    assert!(!cpu.a20_open());
     outb(&m, 0x64, 0xd1);
     outb(&m, 0x60, 0x03);
-    assert!(cpu.level("a20"), "the 8042's output port opens it too");
+    assert!(cpu.a20_open(), "the 8042's output port opens it too");
 }
 
 #[test]
@@ -517,18 +351,20 @@ fn both_reset_paths_pulse_the_processors_reset_pin() {
     let (mut m, cpu) = board();
     m.reset(ResetKind::Cold);
     m.sweep();
-    let before = cpu.edges("reset");
+    assert!(!cpu.reset_requested(), "nothing has pulsed it yet");
     outb(&m, 0x64, 0xfe);
-    assert_eq!(
-        cpu.edges("reset"),
-        before + 1,
+    assert!(
+        cpu.reset_requested(),
         "the 8042's pulse command must reach the pin"
     );
-    assert!(!cpu.level("reset"), "and it must be a pulse, not a latch");
+
+    // The latch is consumed by the sequence it asks for, which is what makes
+    // the second path observable rather than indistinguishable from the first.
+    cpu.step();
+    assert!(!cpu.reset_requested());
     outb(&m, 0x92, 0x01);
-    assert_eq!(
-        cpu.edges("reset"),
-        before + 2,
+    assert!(
+        cpu.reset_requested(),
         "and so must the chipset's fast reset"
     );
 }
@@ -541,7 +377,7 @@ fn a_timer_tick_reaches_the_processor_and_acknowledges_to_a_vector() {
     let (mut m, cpu) = board();
     m.reset(ResetKind::Cold);
     m.sweep();
-    assert!(!cpu.level("intr"), "nothing is pending at power on");
+    assert!(!cpu.intr_asserted(), "nothing is pending at power on");
 
     // Initialise the master exactly as a PC's firmware does: ICW1 with ICW4 to
     // follow, vector base 0x08, a slave on IR2, 8086 mode. Then unmask IR0
@@ -562,23 +398,23 @@ fn a_timer_tick_reaches_the_processor_and_acknowledges_to_a_vector() {
         .expect("the machine runs");
 
     assert!(
-        cpu.level("intr"),
+        cpu.intr_asserted(),
         "the timer's output never reached the processor's pin"
     );
     assert_eq!(
         cpu.acknowledge(),
-        Some(0x08),
+        0x08,
         "the acknowledge cycle must return the vector the controller was given"
     );
     // Having taken it, the line drops: the request moved from pending to in
     // service, which is the bookkeeping `IntAck` exists to make possible.
-    assert!(!cpu.level("intr"), "the request is now in service");
+    assert!(!cpu.intr_asserted(), "the request is now in service");
 
     // And an end-of-interrupt lets the next tick through.
     outb(&m, 0x20, 0x20);
     m.run_for(rsemu::core::clock::GlobalTime::from_nanos(1_000_000))
         .expect("the machine runs");
-    assert!(cpu.level("intr"), "the next tick");
+    assert!(cpu.intr_asserted(), "the next tick");
 }
 
 #[test]
