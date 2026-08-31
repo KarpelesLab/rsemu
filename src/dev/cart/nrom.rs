@@ -224,8 +224,8 @@ impl Nrom {
     /// `ciram` is under 2 KiB, or if a mapping does not fit.
     pub fn install(
         &self,
-        cpu: &mut AddressSpace,
-        ppu: &mut AddressSpace,
+        cpu: &AddressSpace,
+        ppu: &AddressSpace,
         ciram: &Arc<RamStore>,
     ) -> Result<CartMappings> {
         if cpu.size() < CPU_SPACE_LEN {
@@ -259,20 +259,31 @@ impl Nrom {
             NAMETABLE_MIRROR_WINDOW,
         )?);
 
+        // One topology guard per space, and never both at once: two locks at
+        // the same rank is a lock-order violation (`core::sync`), so a
+        // cross-space install is two sequential batches rather than one atomic
+        // step. Regions were all built above, so the first batch cannot fail
+        // for a reason the second would not have caught.
         let mut mappings = CartMappings::default();
-        if let Some(work) = &self.work_ram_window {
-            mappings.cpu.push(cpu.map(work.clone(), WORK_RAM_BASE)?);
+        {
+            let mut topo = cpu.topology();
+            if let Some(work) = &self.work_ram_window {
+                mappings.cpu.push(topo.map(work.clone(), WORK_RAM_BASE)?);
+            }
+            mappings
+                .cpu
+                .push(topo.map(self.prg_window.clone(), PRG_BASE)?);
         }
-        mappings
-            .cpu
-            .push(cpu.map(self.prg_window.clone(), PRG_BASE)?);
-        mappings
-            .ppu
-            .push(ppu.map(self.chr_window.clone(), CHR_BASE)?);
-        mappings.ppu.push(ppu.map(nametables, NAMETABLE_BASE)?);
-        mappings
-            .ppu
-            .push(ppu.map(nametable_mirror, NAMETABLE_MIRROR_BASE)?);
+        {
+            let mut topo = ppu.topology();
+            mappings
+                .ppu
+                .push(topo.map(self.chr_window.clone(), CHR_BASE)?);
+            mappings.ppu.push(topo.map(nametables, NAMETABLE_BASE)?);
+            mappings
+                .ppu
+                .push(topo.map(nametable_mirror, NAMETABLE_MIRROR_BASE)?);
+        }
         Ok(mappings)
     }
 
@@ -283,15 +294,22 @@ impl Nrom {
     /// [`Error::Config`] if a mapping is not one of that space's.
     pub fn uninstall(
         &self,
-        cpu: &mut AddressSpace,
-        ppu: &mut AddressSpace,
+        cpu: &AddressSpace,
+        ppu: &AddressSpace,
         mappings: &CartMappings,
     ) -> Result<()> {
-        for id in &mappings.cpu {
-            cpu.unmap(*id)?;
+        // Sequential guards, for the same reason `install` uses them.
+        {
+            let mut topo = cpu.topology();
+            for id in &mappings.cpu {
+                topo.unmap(*id)?;
+            }
         }
-        for id in &mappings.ppu {
-            ppu.unmap(*id)?;
+        {
+            let mut topo = ppu.topology();
+            for id in &mappings.ppu {
+                topo.unmap(*id)?;
+            }
         }
         Ok(())
     }
@@ -571,9 +589,8 @@ mod tests {
     #[test]
     fn sixteen_kib_of_prg_answers_in_both_banks() {
         let nrom = board(1, 1, 0);
-        let mut b = bus();
-        nrom.install(&mut b.cpu, &mut b.ppu, &b.ciram)
-            .expect("installs");
+        let b = bus();
+        nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
 
         for offset in [0u64, 1, 0x1234, 0x3ffc, 0x3fff] {
             let low = rd(&b.cpu, PRG_BASE + offset);
@@ -588,8 +605,9 @@ mod tests {
         assert_eq!(rd(&b.cpu, 0xfffc), rd(&b.cpu, 0xbffc));
 
         // One flat entry, not two copies of the data.
-        let idx = b.cpu.locate(PRG_BASE).expect("mapped");
-        let entry = b.cpu.flat_view().entry(idx).expect("entry");
+        let view = b.cpu.view();
+        let idx = view.locate(PRG_BASE).expect("mapped");
+        let entry = view.flat_view().entry(idx).expect("entry");
         assert_eq!(entry.start(), PRG_BASE);
         assert_eq!(entry.len(), PRG_WINDOW);
     }
@@ -597,9 +615,8 @@ mod tests {
     #[test]
     fn thirty_two_kib_of_prg_is_contiguous() {
         let nrom = board(2, 1, 0);
-        let mut b = bus();
-        nrom.install(&mut b.cpu, &mut b.ppu, &b.ciram)
-            .expect("installs");
+        let b = bus();
+        nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
 
         for offset in [0u64, 0x3fff, 0x4000, 0x7fff] {
             let want = ((offset >> 8) as u8) ^ (offset as u8);
@@ -612,9 +629,8 @@ mod tests {
     #[test]
     fn prg_rom_ignores_writes() {
         let nrom = board(2, 1, 0);
-        let mut b = bus();
-        nrom.install(&mut b.cpu, &mut b.ppu, &b.ciram)
-            .expect("installs");
+        let b = bus();
+        nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
         let before = rd(&b.cpu, 0x8000);
         wr(&b.cpu, 0x8000, before.wrapping_add(1));
         assert_eq!(rd(&b.cpu, 0x8000), before, "a mask ROM swallows writes");
@@ -623,9 +639,8 @@ mod tests {
     #[test]
     fn chr_rom_is_readable_and_chr_ram_is_writable() {
         let nrom = board(1, 1, 0);
-        let mut b = bus();
-        nrom.install(&mut b.cpu, &mut b.ppu, &b.ciram)
-            .expect("installs");
+        let b = bus();
+        nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
         for offset in [0u64, 0x1000, 0x1fff] {
             let want = !(((offset >> 8) as u8) ^ (offset as u8));
             assert_eq!(rd(&b.ppu, CHR_BASE + offset), want, "chr {offset:#06x}");
@@ -635,9 +650,8 @@ mod tests {
 
         // A CHR-RAM cartridge (CHR size 0) is.
         let nrom = board(1, 0, 0);
-        let mut b = bus();
-        nrom.install(&mut b.cpu, &mut b.ppu, &b.ciram)
-            .expect("installs");
+        let b = bus();
+        nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
         assert!(nrom.cartridge().chr().is_ram());
         wr(&b.ppu, 0x0100, 0x99);
         assert_eq!(rd(&b.ppu, 0x0100), 0x99);
@@ -646,9 +660,8 @@ mod tests {
     #[test]
     fn work_ram_is_mapped_and_mirrored() {
         let nrom = board(1, 1, 0);
-        let mut b = bus();
-        nrom.install(&mut b.cpu, &mut b.ppu, &b.ciram)
-            .expect("installs");
+        let b = bus();
+        nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
         wr(&b.cpu, 0x6000, 0x42);
         assert_eq!(rd(&b.cpu, 0x6000), 0x42);
         // 8 KiB of RAM in an 8 KiB window: no mirroring, but the far end works.
@@ -670,10 +683,8 @@ mod tests {
         let cart = Cartridge::from_ines(&img).expect("valid image");
         assert!(cart.work_ram().is_none());
         let nrom = Nrom::new(cart).expect("board");
-        let mut b = bus();
-        let m = nrom
-            .install(&mut b.cpu, &mut b.ppu, &b.ciram)
-            .expect("installs");
+        let b = bus();
+        let m = nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
         assert_eq!(m.cpu.len(), 1, "only the PRG window");
         assert!(b.cpu.locate(0x6000).is_none(), "$6000 is open bus");
     }
@@ -683,9 +694,8 @@ mod tests {
     /// Write a marker into each of the four nametable slots in turn and record
     /// what all four slots read back as, which is the mirroring made visible.
     fn nametable_pattern(nrom: &Nrom) -> [[u8; 4]; 4] {
-        let mut b = bus();
-        nrom.install(&mut b.cpu, &mut b.ppu, &b.ciram)
-            .expect("installs");
+        let b = bus();
+        nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
         let mut out = [[0u8; 4]; 4];
         for (written, row) in out.iter_mut().enumerate() {
             // Clear, then mark one slot, so each row is independent.
@@ -743,9 +753,8 @@ mod tests {
         assert_eq!(Mirroring::SingleScreenUpper.banks(), [1; 4]);
 
         let nrom = board(1, 1, 0x00);
-        let mut b = bus();
-        nrom.install(&mut b.cpu, &mut b.ppu, &b.ciram)
-            .expect("installs");
+        let b = bus();
+        nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
         // Horizontal, so slot 0 is CIRAM bank 0 and slot 2 is bank 1: the two
         // banks are genuinely distinct storage.
         wr(&b.ppu, 0x2000, 0x11);
@@ -757,9 +766,8 @@ mod tests {
     #[test]
     fn the_nametables_appear_again_at_3000() {
         let nrom = board(1, 1, 0x01);
-        let mut b = bus();
-        nrom.install(&mut b.cpu, &mut b.ppu, &b.ciram)
-            .expect("installs");
+        let b = bus();
+        nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
         wr(&b.ppu, 0x2000, 0x5a);
         assert_eq!(rd(&b.ppu, 0x3000), 0x5a);
         wr(&b.ppu, 0x3eff, 0xa5);
@@ -771,12 +779,10 @@ mod tests {
     #[test]
     fn uninstall_puts_the_spaces_back() {
         let nrom = board(1, 1, 0);
-        let mut b = bus();
-        let m = nrom
-            .install(&mut b.cpu, &mut b.ppu, &b.ciram)
-            .expect("installs");
+        let b = bus();
+        let m = nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
         assert!(b.cpu.locate(0x8000).is_some());
-        nrom.uninstall(&mut b.cpu, &mut b.ppu, &m).expect("unmaps");
+        nrom.uninstall(&b.cpu, &b.ppu, &m).expect("unmaps");
         assert!(b.cpu.locate(0x8000).is_none());
         assert!(b.ppu.locate(0x0000).is_none());
         assert!(b.ppu.locate(0x2000).is_none());
@@ -820,18 +826,18 @@ mod tests {
     #[test]
     fn a_space_that_is_not_a_nes_bus_is_rejected() {
         let nrom = board(1, 1, 0);
-        let mut cpu = AddressSpace::new("cpu", 15);
-        let mut ppu = AddressSpace::new("ppu", 14);
+        let cpu = AddressSpace::new("cpu", 15);
+        let ppu = AddressSpace::new("ppu", 14);
         let ciram = Arc::new(RamStore::new(CIRAM_LEN));
-        assert!(nrom.install(&mut cpu, &mut ppu, &ciram).is_err());
+        assert!(nrom.install(&cpu, &ppu, &ciram).is_err());
 
-        let mut cpu = AddressSpace::new("cpu", 16);
-        let mut ppu = AddressSpace::new("ppu", 13);
-        assert!(nrom.install(&mut cpu, &mut ppu, &ciram).is_err());
+        let cpu = AddressSpace::new("cpu", 16);
+        let ppu = AddressSpace::new("ppu", 13);
+        assert!(nrom.install(&cpu, &ppu, &ciram).is_err());
 
-        let mut ppu = AddressSpace::new("ppu", 14);
+        let ppu = AddressSpace::new("ppu", 14);
         let small = Arc::new(RamStore::new(1024));
-        assert!(nrom.install(&mut cpu, &mut ppu, &small).is_err());
+        assert!(nrom.install(&cpu, &ppu, &small).is_err());
     }
 
     #[test]

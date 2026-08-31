@@ -26,11 +26,13 @@ fn new_ppu() -> (NesPpu, Arc<RamStore>, Arc<RamStore>) {
 
     let chr = Arc::new(RamStore::new(0x2000));
     let nt = Arc::new(RamStore::new(0x1000));
-    let mut space = AddressSpace::new("ppu", 14).with_unassigned(UnassignedPolicy::ZEROS);
+    let space = AddressSpace::new("ppu", 14).with_unassigned(UnassignedPolicy::ZEROS);
     space
+        .topology()
         .map(Arc::new(Region::ram("chr", Arc::clone(&chr))), 0x0000)
         .expect("chr fits");
     space
+        .topology()
         .map(
             Arc::new(
                 Region::mirror(

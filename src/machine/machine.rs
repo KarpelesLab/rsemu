@@ -84,10 +84,10 @@ pub const MACHINE_STATE_VERSION: u32 = 1;
 /// One address space, with the name the machine description gave it.
 ///
 /// The space is behind an `Arc` because devices that initiate accesses need to
-/// hold their own view of it (§4.4's `Initiator`). That is also why the
-/// topology is fixed once realize has finished: `AddressSpace::map` takes
-/// `&mut self`, and an `Arc` with clones outstanding can never be borrowed
-/// mutably again.
+/// hold their own view of it (§4.4's `Initiator`). The topology is *not* frozen
+/// by that: every `AddressSpace` method takes `&self`, and a retopology goes
+/// through `AddressSpace::topology()`, so a BAR move or a hot-plug can still
+/// remap a space this entry has already handed out.
 #[derive(Debug)]
 pub struct SpaceEntry {
     name: String,

@@ -31,7 +31,7 @@
 //!
 //! | | Rebase | Retopology |
 //! | --- | --- | --- |
-//! | Method | [`AddressSpace::rebase`] — takes `&self` | [`AddressSpace::map`] / [`unmap`](AddressSpace::unmap) / [`remap`](AddressSpace::remap) — take `&mut self` |
+//! | Method | [`AddressSpace::rebase`] — a **read** guard | [`AddressSpace::topology`] then [`map`](TopologyGuard::map) / [`unmap`](TopologyGuard::unmap) / [`remap`](TopologyGuard::remap) — a **write** guard |
 //! | What changed | an alias's offset slides; the region *set* is identical | regions added, removed, resized, re-prioritized |
 //! | Examples | cartridge bank switching | BAR enable/disable, hotplug, ROM shadowing toggle |
 //! | Cost | one atomic store per affected flat entry | full flatten + table rebuild |
@@ -43,6 +43,79 @@
 //! atomic offset cell and the cached offsets of the flat entries that read it,
 //! and nothing else: not the entry list, not its ordering, not the dispatch
 //! table, not the generation counter.
+//!
+//! # Why a guard, and not `&mut self`
+//!
+//! Topology used to take `&mut self`, which made the distinction above
+//! borrow-checker enforced for free. It also made the design unusable: a PCI
+//! BAR write remaps memory *from inside the device's own MMIO write handler*
+//! (`ROADMAP.md` §4.7), device methods take `&self`, and once a machine has
+//! wrapped a space in an `Arc` and handed clones to its bus masters (§4.4's
+//! `Initiator`) nothing can ever borrow it mutably again. Hot-plug and BAR
+//! moves were impossible by construction.
+//!
+//! The mutable half of a space therefore lives behind one [`RwLock`] at
+//! [`LockRank::TOPOLOGY`], and the rebase/retopology distinction stays in the
+//! type system as *which guard* the caller has to be holding:
+//!
+//! - [`AddressSpace::rebase`] and every access take a **read** guard
+//!   ([`SpaceView`]), so a cheap window slide still provably cannot touch
+//!   topology — a `SpaceView` has no method that can.
+//! - [`AddressSpace::topology`] takes the **write** guard
+//!   ([`TopologyGuard`]) and is the only route to
+//!   [`map`](TopologyGuard::map), [`unmap`](TopologyGuard::unmap),
+//!   [`remap`](TopologyGuard::remap) and [`rebuild`](TopologyGuard::rebuild).
+//!   One acquisition covers a whole batch of maps.
+//!
+//! `map` is reachable only by naming `topology()`, so a retopology is as
+//! explicit and as greppable as `&mut self` was — and callable from `&self`.
+//!
+//! # A remap from a write handler goes through `Deferred`
+//!
+//! [`LockRank::TOPOLOGY`] sits **above** [`LockRank::BUS`] and
+//! [`LockRank::DEVICE`], because the ladder runs in the direction calls travel:
+//! a retopology may call down into buses and devices, never the reverse. A CPU
+//! holds a `BUS`-ranked lock across the accesses it issues, and the access path
+//! itself holds this space's topology lock for reading — so a handler that
+//! reached back for the *write* guard would invert the ladder and, on a
+//! threaded backend, deadlock against a concurrent retopology that is waiting
+//! for that same `BUS` lock.
+//!
+//! That is not left to good intentions. Acquiring the write guard while an
+//! access is in flight is a lock-order violation, and
+//! [`LockRank::enter`](crate::core::sync::LockRank::enter) panics on it in
+//! debug builds naming both ranks — whether or not a CPU's `BUS` lock is also
+//! held, because the access path's own read guard is already recorded at
+//! `TOPOLOGY` and `TOPOLOGY <= TOPOLOGY` fails the strictly-increasing rule.
+//! Under the `single` backend the lock itself catches the re-entry in release
+//! builds too.
+//!
+//! The supported spelling is [`Deferred`](crate::core::device::Deferred): the
+//! handler pushes the remap and returns, its critical section is released, and
+//! whoever drove the access drains the queue.
+//!
+//! ```
+//! use std::sync::Arc;
+//!
+//! use rsemu::core::device::Deferred;
+//! use rsemu::core::space::{AddressSpace, MappingId};
+//!
+//! // Inside a BAR write handler: queue the remap, do not perform it.
+//! fn bar_written(space: &Arc<AddressSpace>, bar: MappingId, base: u64, q: &mut Deferred) {
+//!     let space = Arc::clone(space);
+//!     q.push(move || {
+//!         // Runs after the handler returned and the access released its
+//!         // read guard, so `TOPOLOGY` is the outermost lock again.
+//!         let _ = space.topology().remap(bar, base);
+//!     });
+//! }
+//! ```
+//!
+//! Two *different* spaces cannot have their topology guards open at once
+//! either: the same rank twice is a violation, so a cross-space retopology is
+//! two sequential guards rather than one atomic step. That is a real
+//! limitation and it is deliberate — the alternative is a rank per space, which
+//! is no ladder at all.
 //!
 //! # `unsafe`
 //!
@@ -62,9 +135,15 @@
 //!   addressed by is a property of the master, not of the space, so the newtypes
 //!   belong with the MMU that translates between them. Addresses here are plain
 //!   `u64`.
-//! - **`core::sync`.** This module needs no lock: the access path is atomics
-//!   only, and a topology change takes `&mut self`. When the seam lands, nothing
-//!   here has to change.
+//! - **The safe-point handshake.** A retopology is still meant to happen at a
+//!   safe point (§4.7), with the world stopped. The lock makes it *correct*
+//!   without one, not free: until §4.7's generation counter and per-CPU exit
+//!   flag land, a retopology racing a running CPU costs that CPU a
+//!   [`BusError::Retry`] rather than a stall. Honest, but not the design.
+//!
+//! [`LockRank::TOPOLOGY`]: crate::core::sync::LockRank::TOPOLOGY
+//! [`LockRank::BUS`]: crate::core::sync::LockRank::BUS
+//! [`LockRank::DEVICE`]: crate::core::sync::LockRank::DEVICE
 
 mod attrs;
 mod dispatch;
@@ -85,6 +164,7 @@ pub use region::{
 pub use store::{DEFAULT_PAGE_BITS, RamStore, RomStore};
 
 use crate::core::error::{BusError, Error};
+use crate::core::sync::{LockRank, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::core::value::{Endian, Width};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -166,6 +246,21 @@ pub struct UnassignedLog {
     pub last_was_write: bool,
 }
 
+/// Everything about a space that a retopology changes, under one lock.
+///
+/// One struct so that one acquisition covers all of it: a flat view that
+/// disagreed with the mapping list it was built from, or a dispatch table that
+/// indexed a flat view it had never seen, is precisely the derived-cache bug
+/// invariant 3 exists to prevent.
+#[derive(Debug)]
+struct Topology {
+    root: Vec<(MappingId, Mapping)>,
+    next_id: u64,
+    flat: FlatView,
+    dispatch: Option<Dispatch>,
+    rebase_index: RebaseIndex,
+}
+
 /// One address space: the view of memory that one bus master has.
 ///
 /// Per-master, deliberately. The CPU's view is not the DMA engine's view is not
@@ -173,24 +268,28 @@ pub struct UnassignedLog {
 /// express an IOMMU, a bridge window, or a cartridge that sees a different bus
 /// than the CPU does.
 ///
-/// `Send + Sync`: the read and write paths take `&self` and use only atomics,
-/// so several CPU threads may drive the same space at once. Topology changes
-/// take `&mut self` and are therefore a stop-the-world operation by
-/// construction — which is what the safe-point protocol (`ROADMAP.md` §4.7)
-/// already requires them to be.
+/// `Send + Sync`, and *every* method takes `&self`: a space is meant to be
+/// shared through an `Arc` between the CPUs that execute from it and the
+/// devices that initiate accesses on it, and to stay retopologisable
+/// afterwards. Topology lives behind an [`RwLock`] at
+/// [`LockRank::TOPOLOGY`](crate::core::sync::LockRank::TOPOLOGY) — see the
+/// [module docs](self) for which guard does what, and why a remap from inside
+/// an MMIO handler has to be deferred.
 #[derive(Debug)]
 pub struct AddressSpace {
+    // Immutable after construction: set only by the `with_*` builders, which
+    // take `self` by value, so no lock guards them and the access path can read
+    // them without one.
     name: String,
     bits: u32,
     endian: Endian,
     unassigned: UnassignedPolicy,
     combine: CombinePolicy,
     dispatch_policy: DispatchPolicy,
-    root: Vec<(MappingId, Mapping)>,
-    next_id: u64,
-    flat: FlatView,
-    dispatch: Option<Dispatch>,
-    rebase_index: RebaseIndex,
+    topo: RwLock<Topology>,
+    // Outside the lock on purpose: a derived cache validating itself wants the
+    // generation *without* acquiring anything, which is the whole point of
+    // having a generation counter.
     generation: AtomicU64,
     unassigned_count: AtomicU64,
     unassigned_last: AtomicU64,
@@ -213,11 +312,16 @@ impl AddressSpace {
             unassigned: UnassignedPolicy::FAULT,
             combine: CombinePolicy::Priority,
             dispatch_policy: DispatchPolicy::Flat,
-            root: Vec::new(),
-            next_id: 1,
-            flat: FlatView::default(),
-            dispatch: None,
-            rebase_index: RebaseIndex::new(),
+            topo: RwLock::with_rank(
+                LockRank::TOPOLOGY,
+                Topology {
+                    root: Vec::new(),
+                    next_id: 1,
+                    flat: FlatView::default(),
+                    dispatch: None,
+                    rebase_index: RebaseIndex::new(),
+                },
+            ),
             generation: AtomicU64::new(1),
             unassigned_count: AtomicU64::new(0),
             unassigned_last: AtomicU64::new(0),
@@ -260,7 +364,7 @@ impl AddressSpace {
     /// [`dispatch`](DispatchPolicy) for what this implementation spends
     /// instead.
     ///
-    /// Takes effect on the next retopology; use [`AddressSpace::rebuild`] to
+    /// Takes effect on the next retopology; use [`TopologyGuard::rebuild`] to
     /// force one.
     #[must_use]
     pub fn with_dispatch(mut self, policy: DispatchPolicy) -> Self {
@@ -298,29 +402,13 @@ impl AddressSpace {
     /// Every derived cache in the emulator — TLB entries, translation blocks,
     /// direct pointers — records this and throws itself away when it changes
     /// (`ROADMAP.md` §15, invariant 3). A rebase does **not** change it.
+    ///
+    /// Lock-free on purpose: a cache checking whether it is still valid must
+    /// not queue behind the retopology that invalidated it.
     #[inline]
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
-    }
-
-    /// The flattened view. Derived state; valid for the current generation.
-    #[inline]
-    #[must_use]
-    pub fn flat_view(&self) -> &FlatView {
-        &self.flat
-    }
-
-    /// The dense dispatch table, if this space has one.
-    #[inline]
-    #[must_use]
-    pub fn dispatch(&self) -> Option<&Dispatch> {
-        self.dispatch.as_ref()
-    }
-
-    /// The root mappings, in mapping order.
-    pub fn mappings(&self) -> impl Iterator<Item = (MappingId, &Mapping)> {
-        self.root.iter().map(|(id, m)| (*id, m))
     }
 
     /// Unassigned accesses seen so far, when the policy asks for them to be
@@ -335,147 +423,86 @@ impl AddressSpace {
     }
 
     // -----------------------------------------------------------------
-    // Retopology — the expensive kind of change
+    // The two guards
     // -----------------------------------------------------------------
 
-    /// Map `region` at `base` with priority 0. **Retopology.**
+    /// Open the space for **retopology**: the only route to
+    /// [`map`](TopologyGuard::map), [`map_with`](TopologyGuard::map_with),
+    /// [`map_with_priority`](TopologyGuard::map_with_priority),
+    /// [`unmap`](TopologyGuard::unmap), [`remap`](TopologyGuard::remap) and
+    /// [`rebuild`](TopologyGuard::rebuild).
     ///
-    /// # Errors
+    /// Takes the write guard, so a batch of maps costs one acquisition and is
+    /// atomic with respect to every reader.
     ///
-    /// If the region does not fit in the space, or the tree cannot be
-    /// flattened.
-    pub fn map(&mut self, region: impl Into<RegionRef>, base: u64) -> Result<MappingId, Error> {
-        self.map_with(Mapping::new(region, base))
-    }
-
-    /// Map `region` at `base` with an explicit priority, higher winning where
-    /// regions overlap. **Retopology.**
+    /// # Where this may be called from
     ///
-    /// This is how a PCI BAR sits over RAM, how a boot ROM shadows the reset
-    /// vector, and how a cartridge mapper puts a window over the open bus.
+    /// Machine assembly, a safe point, or a
+    /// [`Deferred`](crate::core::device::Deferred) action — anywhere no access
+    /// is in flight. **Not** from inside an MMIO handler: the access that
+    /// reached that handler holds this same lock for reading and a CPU holds a
+    /// `BUS`-ranked lock above it, so acquiring `TOPOLOGY` there inverts the
+    /// ladder. See the [module docs](self) for the deferred spelling.
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// As [`AddressSpace::map`].
-    pub fn map_with_priority(
-        &mut self,
-        region: impl Into<RegionRef>,
-        base: u64,
-        priority: i32,
-    ) -> Result<MappingId, Error> {
-        self.map_with(Mapping::new(region, base).with_priority(priority))
-    }
-
-    /// Add a prepared [`Mapping`]. **Retopology.**
-    ///
-    /// # Errors
-    ///
-    /// As [`AddressSpace::map`].
-    pub fn map_with(&mut self, mapping: Mapping) -> Result<MappingId, Error> {
-        self.check_fits(&mapping)?;
-        let id = MappingId(self.next_id);
-        self.next_id += 1;
-        self.root.push((id, mapping));
-        match self.rebuild() {
-            Ok(()) => Ok(id),
-            Err(e) => {
-                self.root.pop();
-                // Leave the space in the state the caller had before the
-                // failed map, rather than half-changed.
-                let _ = self.rebuild();
-                Err(e)
-            }
+    /// In debug builds, if the lock order would be violated — which covers the
+    /// inline-remap-from-a-handler mistake, and also a second space's topology
+    /// guard opened while this one is held. Under the `single` backend the
+    /// lock catches a re-entrant acquisition in release builds too.
+    #[must_use]
+    pub fn topology(&self) -> TopologyGuard<'_> {
+        TopologyGuard {
+            space: self,
+            topo: self.topo.write(),
         }
     }
 
-    /// Remove a mapping. **Retopology.**
+    /// [`topology`](AddressSpace::topology), but `None` rather than blocking
+    /// when the space is in use.
     ///
-    /// # Errors
-    ///
-    /// If `id` is not a mapping of this space.
-    pub fn unmap(&mut self, id: MappingId) -> Result<(), Error> {
-        let Some(pos) = self.root.iter().position(|(i, _)| *i == id) else {
-            return Err(Error::Config {
-                at: self.name.clone(),
-                message: alloc::format!("no mapping {id:?} in this space"),
-            });
-        };
-        self.root.remove(pos);
-        self.rebuild()
+    /// For a caller with somewhere else to be — a monitor offering to hot-plug,
+    /// a test asserting that a retopology is impossible right now. A failed
+    /// try-lock cannot join a deadlock cycle, so this is order-exempt and never
+    /// trips the rank check.
+    #[must_use]
+    pub fn try_topology(&self) -> Option<TopologyGuard<'_>> {
+        Some(TopologyGuard {
+            space: self,
+            topo: self.topo.try_write()?,
+        })
     }
 
-    /// Move a mapping to a new base address. **Retopology.**
+    /// Open the space for reading: accesses, lookups, the flattened view.
     ///
-    /// A PCI BAR address change lands here, and `ROADMAP.md` §4.1 files that
-    /// under "rebase". It is not one, and cannot be: moving a mapping changes
-    /// the *addresses* in the flat view, not an offset behind an entry, so the
-    /// sorted view has to be rebuilt and every cache keyed on the old address
-    /// has to be invalidated. The roadmap's cheap case is real, but it is the
-    /// one where a fixed aperture's *contents* slide — [`AddressSpace::rebase`].
+    /// Hold one across a burst — a DMA transfer, a debugger dump, a
+    /// disassembly — and every access in it sees one consistent topology
+    /// instead of re-acquiring per byte and possibly straddling a remap.
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// If `id` is not a mapping of this space, or the region no longer fits.
-    pub fn remap(&mut self, id: MappingId, base: u64) -> Result<(), Error> {
-        let Some(pos) = self.root.iter().position(|(i, _)| *i == id) else {
-            return Err(Error::Config {
-                at: self.name.clone(),
-                message: alloc::format!("no mapping {id:?} in this space"),
-            });
-        };
-        let old = self.root[pos].1.base;
-        self.root[pos].1.base = base;
-        let mapping = self.root[pos].1.clone();
-        if let Err(e) = self.check_fits(&mapping) {
-            self.root[pos].1.base = old;
-            return Err(e);
-        }
-        self.rebuild()
+    /// If a retopology holds the space. The read side is acquired
+    /// *non-blocking* on purpose: a reader that waited here while holding a
+    /// `BUS`-ranked lock would be the other half of the deadlock the ladder
+    /// exists to prevent, since a retopology is allowed to take `BUS` locks
+    /// underneath `TOPOLOGY`. Access-path callers use [`AddressSpace::read`]
+    /// and friends, which turn the same condition into [`BusError::Retry`];
+    /// this method is for setup, tests and monitors, where a concurrent
+    /// retopology means someone skipped the safe point.
+    #[must_use]
+    pub fn view(&self) -> SpaceView<'_> {
+        self.try_view()
+            .expect("address space is being retopologised; use `read`/`try_view` on an access path")
     }
 
-    /// Reflatten and rebuild the dispatch table, bumping the generation.
-    /// **Retopology.**
-    ///
-    /// Called for you by every topology change; public because a container's
-    /// contents can be rebuilt out from under a space and a machine may need
-    /// to say so.
-    ///
-    /// # Errors
-    ///
-    /// If the region tree cannot be flattened.
-    pub fn rebuild(&mut self) -> Result<(), Error> {
-        let children: Vec<Mapping> = self.root.iter().map(|(_, m)| m.clone()).collect();
-        let (flat, index) = FlatView::build(&children, self.size(), self.combine)?;
-        self.dispatch = Dispatch::build(&flat, self.dispatch_policy);
-        self.flat = flat;
-        self.rebase_index = index;
-        // `&mut self`, so this cannot race; `fetch_add` for the ordering, not
-        // for the atomicity.
-        self.generation.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn check_fits(&self, mapping: &Mapping) -> Result<(), Error> {
-        // A 64-bit space reports its size as `u64::MAX`, so a region that ends
-        // exactly at 2^64 is rejected. Nothing real is mapped there, and the
-        // alternative is an off-by-one in every bounds check downstream.
-        let fits = mapping
-            .base
-            .checked_add(mapping.region.len())
-            .is_some_and(|e| e <= self.size());
-        if !fits {
-            return Err(Error::Config {
-                at: self.name.clone(),
-                message: alloc::format!(
-                    "region `{}` at {:#x} (+{:#x}) does not fit in a {}-bit space",
-                    mapping.region.name(),
-                    mapping.base,
-                    mapping.region.len(),
-                    self.bits
-                ),
-            });
-        }
-        Ok(())
+    /// [`view`](AddressSpace::view), but `None` rather than panicking while a
+    /// retopology holds the space.
+    #[must_use]
+    pub fn try_view(&self) -> Option<SpaceView<'_>> {
+        Some(SpaceView {
+            space: self,
+            topo: self.topo.try_read()?,
+        })
     }
 
     // -----------------------------------------------------------------
@@ -484,13 +511,13 @@ impl AddressSpace {
 
     /// Slide an alias's window to `offset`. **Rebase.**
     ///
-    /// Takes `&self`: this is the operation a cartridge mapper performs from
-    /// inside its own MMIO write handler, ~15 000 times a second, while the
-    /// CPU thread is running. It stores the new offset in the alias's atomic
-    /// cell and refreshes the cached offset of every flat entry that reads it
-    /// — one relaxed store each. The flat view, the dispatch table, and the
-    /// generation counter are untouched, so no TLB and no translation block is
-    /// invalidated.
+    /// Takes a *read* guard: this is the operation a cartridge mapper performs
+    /// from inside its own MMIO write handler, ~15 000 times a second, while
+    /// the CPU thread is running. It stores the new offset in the alias's
+    /// atomic cell and refreshes the cached offset of every flat entry that
+    /// reads it — one relaxed store each. The flat view, the dispatch table and
+    /// the generation counter are untouched, so no TLB and no translation block
+    /// is invalidated, and no retopology can be smuggled in this way.
     ///
     /// # Errors
     ///
@@ -500,33 +527,12 @@ impl AddressSpace {
     ///   retopology however it is spelled.
     /// - If the window would run off the end of the target. That too changes
     ///   the region set; rebuild instead.
+    /// - [`BusError::Retry`] if a retopology holds the space, in which case the
+    ///   window is about to be rebuilt anyway.
     pub fn rebase(&self, region: &RegionRef, offset: u64) -> Result<(), Error> {
-        let Some(alias) = region.as_alias() else {
-            return Err(Error::Config {
-                at: region.name().to_string(),
-                message: "not an alias".to_string(),
-            });
-        };
-        if !alias.is_rebasable() {
-            return Err(Error::Config {
-                at: region.name().to_string(),
-                message: "alias targets a container; sliding it is a retopology".to_string(),
-            });
-        }
-        let end = offset.checked_add(region.len());
-        if end.is_none_or(|e| e > alias.target().len()) {
-            return Err(Error::Config {
-                at: region.name().to_string(),
-                message: alloc::format!(
-                    "offset {offset:#x} (+{:#x}) runs off the end of `{}`",
-                    region.len(),
-                    alias.target().name()
-                ),
-            });
-        }
-        alias.cell().store(offset, Ordering::Relaxed);
-        self.flat.rebase(&self.rebase_index, alias.id());
-        Ok(())
+        self.try_view()
+            .ok_or(Error::Bus(BusError::Retry))?
+            .rebase(region, offset)
     }
 
     // -----------------------------------------------------------------
@@ -535,20 +541,28 @@ impl AddressSpace {
 
     /// Locate the flat entry covering `addr`, consulting the dispatch table
     /// first when there is one.
+    ///
+    /// The index is into [`SpaceView::flat_view`] and means nothing outside the
+    /// generation it was obtained in.
+    ///
+    /// # Panics
+    ///
+    /// As [`AddressSpace::view`].
     #[inline]
     #[must_use]
     pub fn locate(&self, addr: u64) -> Option<usize> {
-        if let Some(d) = &self.dispatch {
-            match d.lookup(addr) {
-                Some(DispatchEntry::Unassigned) => return None,
-                Some(DispatchEntry::Mapped(i) | DispatchEntry::Direct(i)) => {
-                    return Some(i as usize);
-                }
-                // Sub-page, or above the table's reach: fall through.
-                Some(DispatchEntry::SubPage) | None => {}
-            }
-        }
-        self.flat.find(addr)
+        self.view().locate(addr)
+    }
+
+    /// The byte order a value-typed access at `addr` would use.
+    ///
+    /// # Panics
+    ///
+    /// As [`AddressSpace::view`].
+    #[inline]
+    #[must_use]
+    pub fn endian_at(&self, addr: u64) -> Endian {
+        self.view().endian_at(addr)
     }
 
     /// Read `width` bytes at `addr` and assemble them into a value using the
@@ -558,13 +572,14 @@ impl AddressSpace {
     ///
     /// [`BusError::Unassigned`] if nothing is mapped and the policy faults,
     /// [`BusError::BadAccess`] if the region rejects the width or alignment,
-    /// [`BusError::Retry`] if the target is busy and nothing has happened yet.
+    /// [`BusError::Retry`] if the target is busy — or if a retopology holds the
+    /// space, in which case nothing has happened yet and the access may be
+    /// reissued.
     #[inline]
     pub fn read(&self, addr: u64, width: Width, attrs: MemAttrs) -> MemResult<u64> {
-        let n = width.bytes() as usize;
-        let mut buf = [0u8; 8];
-        let endian = self.read_span(addr, &mut buf[..n], attrs, Some(width))?;
-        endian.load(&buf[..n], width)
+        self.try_view()
+            .ok_or(BusError::Retry)?
+            .read(addr, width, attrs)
     }
 
     /// Write the low `width` bytes of `value` at `addr`, in the target
@@ -575,13 +590,9 @@ impl AddressSpace {
     /// As [`AddressSpace::read`].
     #[inline]
     pub fn write(&self, addr: u64, width: Width, value: u64, attrs: MemAttrs) -> MemResult {
-        let n = width.bytes() as usize;
-        let mut buf = [0u8; 8];
-        // Byte order has to be known before the bytes exist, so the target is
-        // located twice for a write. The second lookup is a dispatch-table
-        // index or a binary search, not a tree walk.
-        self.endian_at(addr).store(&mut buf[..n], width, value)?;
-        self.write_span(addr, &buf[..n], attrs, Some(width))
+        self.try_view()
+            .ok_or(BusError::Retry)?
+            .write(addr, width, value, attrs)
     }
 
     /// Read raw bytes in ascending address order — a DMA burst, a debugger
@@ -595,7 +606,9 @@ impl AddressSpace {
     ///
     /// As [`AddressSpace::read`].
     pub fn read_bytes(&self, addr: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
-        self.read_span(addr, dst, attrs, None).map(|_| ())
+        self.try_view()
+            .ok_or(BusError::Retry)?
+            .read_bytes(addr, dst, attrs)
     }
 
     /// Write raw bytes in ascending address order.
@@ -604,118 +617,9 @@ impl AddressSpace {
     ///
     /// As [`AddressSpace::read`].
     pub fn write_bytes(&self, addr: u64, src: &[u8], attrs: MemAttrs) -> MemResult {
-        self.write_span(addr, src, attrs, None)
-    }
-
-    /// The byte order a value-typed access at `addr` would use.
-    #[inline]
-    #[must_use]
-    pub fn endian_at(&self, addr: u64) -> Endian {
-        self.locate(addr)
-            .and_then(|i| self.flat.entry(i))
-            .map_or(self.endian, FlatEntry::endian)
-    }
-
-    /// The distance from `addr` to the next mapped byte, capped at `max`.
-    fn gap_len(&self, addr: u64, max: u64) -> u64 {
-        let entries = self.flat.entries();
-        let i = entries.partition_point(|e| e.start() <= addr);
-        match entries.get(i) {
-            Some(e) => (e.start() - addr).min(max),
-            None => max,
-        }
-    }
-
-    fn read_span(
-        &self,
-        addr: u64,
-        dst: &mut [u8],
-        attrs: MemAttrs,
-        width: Option<Width>,
-    ) -> MemResult<Endian> {
-        let total = dst.len() as u64;
-        if total == 0 {
-            return Ok(self.endian);
-        }
-        addr.checked_add(total - 1).ok_or(BusError::BadAccess)?;
-        let mut endian = None;
-        let mut done = 0u64;
-        let mut committed = false;
-        while done < total {
-            let a = addr + done;
-            let remaining = total - done;
-            let (n, res) = match self.locate(a) {
-                Some(i) => {
-                    let e = self.flat.entry(i).expect("index came from locate");
-                    let rel = a - e.start();
-                    let n = e.run_len(rel).min(remaining);
-                    if endian.is_none() {
-                        endian = Some(e.endian());
-                    }
-                    let piece = &mut dst[usize_of(done)..usize_of(done + n)];
-                    let w = if n == total { width } else { None };
-                    (n, e.read(rel, piece, attrs, w))
-                }
-                None => {
-                    let n = self.gap_len(a, remaining);
-                    let piece = &mut dst[usize_of(done)..usize_of(done + n)];
-                    (n, self.unassigned_read(a, piece, attrs))
-                }
-            };
-            // `Retry` is only legal before any side effect or partial
-            // transfer. Re-running a half-completed multi-region access would
-            // read a FIFO twice; the dispatcher refuses instead.
-            match res {
-                Err(BusError::Retry) if committed => return Err(BusError::BadAccess),
-                Err(e) => return Err(e),
-                Ok(()) => {}
-            }
-            committed = true;
-            done += n;
-        }
-        Ok(endian.unwrap_or(self.endian))
-    }
-
-    fn write_span(
-        &self,
-        addr: u64,
-        src: &[u8],
-        attrs: MemAttrs,
-        width: Option<Width>,
-    ) -> MemResult {
-        let total = src.len() as u64;
-        if total == 0 {
-            return Ok(());
-        }
-        addr.checked_add(total - 1).ok_or(BusError::BadAccess)?;
-        let mut done = 0u64;
-        let mut committed = false;
-        while done < total {
-            let a = addr + done;
-            let remaining = total - done;
-            let (n, res) = match self.locate(a) {
-                Some(i) => {
-                    let e = self.flat.entry(i).expect("index came from locate");
-                    let rel = a - e.start();
-                    let n = e.run_len(rel).min(remaining);
-                    let piece = &src[usize_of(done)..usize_of(done + n)];
-                    let w = if n == total { width } else { None };
-                    (n, e.write(rel, piece, attrs, w))
-                }
-                None => {
-                    let n = self.gap_len(a, remaining);
-                    (n, self.unassigned_write(a, attrs))
-                }
-            };
-            match res {
-                Err(BusError::Retry) if committed => return Err(BusError::BadAccess),
-                Err(e) => return Err(e),
-                Ok(()) => {}
-            }
-            committed = true;
-            done += n;
-        }
-        Ok(())
+        self.try_view()
+            .ok_or(BusError::Retry)?
+            .write_bytes(addr, src, attrs)
     }
 
     fn note_unassigned(&self, addr: u64, is_write: bool, attrs: MemAttrs) {
@@ -749,6 +653,464 @@ impl AddressSpace {
         match self.unassigned.action {
             UnassignedAction::Fault => Err(BusError::Unassigned),
             UnassignedAction::ReadAsOnes | UnassignedAction::ReadAsZeros => Ok(()),
+        }
+    }
+
+    /// Whether `mapping` lies inside the space. Reads only immutable fields, so
+    /// it is callable with either guard held.
+    fn check_fits(&self, mapping: &Mapping) -> Result<(), Error> {
+        // A 64-bit space reports its size as `u64::MAX`, so a region that ends
+        // exactly at 2^64 is rejected. Nothing real is mapped there, and the
+        // alternative is an off-by-one in every bounds check downstream.
+        let fits = mapping
+            .base
+            .checked_add(mapping.region.len())
+            .is_some_and(|e| e <= self.size());
+        if !fits {
+            return Err(Error::Config {
+                at: self.name.clone(),
+                message: alloc::format!(
+                    "region `{}` at {:#x} (+{:#x}) does not fit in a {}-bit space",
+                    mapping.region.name(),
+                    mapping.base,
+                    mapping.region.len(),
+                    self.bits
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The read guard
+// ---------------------------------------------------------------------------
+
+/// A consistent view of one [`AddressSpace`]: accesses, lookups, the flat view,
+/// and rebase.
+///
+/// Holds the space's topology lock for **reading**, which is what keeps the
+/// rebase/retopology distinction a type-level fact rather than a convention. A
+/// `SpaceView` can slide an alias window ([`rebase`](SpaceView::rebase)) and
+/// touch every byte in the space, and it has no method that can add, remove or
+/// move a region — for that a caller must name [`AddressSpace::topology`].
+///
+/// Not `Send`: a lock guard belongs to the thread that took it.
+#[derive(Debug)]
+pub struct SpaceView<'a> {
+    space: &'a AddressSpace,
+    topo: RwLockReadGuard<'a, Topology>,
+}
+
+impl SpaceView<'_> {
+    /// The space this view is of.
+    #[inline]
+    #[must_use]
+    pub fn space(&self) -> &AddressSpace {
+        self.space
+    }
+
+    /// The flattened view. Derived state; valid for the current generation.
+    #[inline]
+    #[must_use]
+    pub fn flat_view(&self) -> &FlatView {
+        &self.topo.flat
+    }
+
+    /// The dense dispatch table, if this space has one.
+    #[inline]
+    #[must_use]
+    pub fn dispatch(&self) -> Option<&Dispatch> {
+        self.topo.dispatch.as_ref()
+    }
+
+    /// The root mappings, in mapping order.
+    pub fn mappings(&self) -> impl Iterator<Item = (MappingId, &Mapping)> {
+        self.topo.root.iter().map(|(id, m)| (*id, m))
+    }
+
+    /// Locate the flat entry covering `addr`, consulting the dispatch table
+    /// first when there is one.
+    #[inline]
+    #[must_use]
+    pub fn locate(&self, addr: u64) -> Option<usize> {
+        if let Some(d) = &self.topo.dispatch {
+            match d.lookup(addr) {
+                Some(DispatchEntry::Unassigned) => return None,
+                Some(DispatchEntry::Mapped(i) | DispatchEntry::Direct(i)) => {
+                    return Some(i as usize);
+                }
+                // Sub-page, or above the table's reach: fall through.
+                Some(DispatchEntry::SubPage) | None => {}
+            }
+        }
+        self.topo.flat.find(addr)
+    }
+
+    /// The byte order a value-typed access at `addr` would use.
+    #[inline]
+    #[must_use]
+    pub fn endian_at(&self, addr: u64) -> Endian {
+        self.locate(addr)
+            .and_then(|i| self.topo.flat.entry(i))
+            .map_or(self.space.endian, FlatEntry::endian)
+    }
+
+    /// Slide an alias's window to `offset`. **Rebase.**
+    ///
+    /// [`AddressSpace::rebase`] is this with the guard taken for you; use this
+    /// form when a mapper rebanks several windows at once.
+    ///
+    /// # Errors
+    ///
+    /// As [`AddressSpace::rebase`], less the `Retry` case: this view already
+    /// holds the lock.
+    pub fn rebase(&self, region: &RegionRef, offset: u64) -> Result<(), Error> {
+        let Some(alias) = region.as_alias() else {
+            return Err(Error::Config {
+                at: region.name().to_string(),
+                message: "not an alias".to_string(),
+            });
+        };
+        if !alias.is_rebasable() {
+            return Err(Error::Config {
+                at: region.name().to_string(),
+                message: "alias targets a container; sliding it is a retopology".to_string(),
+            });
+        }
+        let end = offset.checked_add(region.len());
+        if end.is_none_or(|e| e > alias.target().len()) {
+            return Err(Error::Config {
+                at: region.name().to_string(),
+                message: alloc::format!(
+                    "offset {offset:#x} (+{:#x}) runs off the end of `{}`",
+                    region.len(),
+                    alias.target().name()
+                ),
+            });
+        }
+        alias.cell().store(offset, Ordering::Relaxed);
+        self.topo.flat.rebase(&self.topo.rebase_index, alias.id());
+        Ok(())
+    }
+
+    /// Read `width` bytes at `addr` and assemble them into a value using the
+    /// target region's byte order.
+    ///
+    /// # Errors
+    ///
+    /// As [`AddressSpace::read`], less the retopology `Retry` case.
+    #[inline]
+    pub fn read(&self, addr: u64, width: Width, attrs: MemAttrs) -> MemResult<u64> {
+        let n = width.bytes() as usize;
+        let mut buf = [0u8; 8];
+        let endian = self.read_span(addr, &mut buf[..n], attrs, Some(width))?;
+        endian.load(&buf[..n], width)
+    }
+
+    /// Write the low `width` bytes of `value` at `addr`, in the target
+    /// region's byte order.
+    ///
+    /// # Errors
+    ///
+    /// As [`SpaceView::read`].
+    #[inline]
+    pub fn write(&self, addr: u64, width: Width, value: u64, attrs: MemAttrs) -> MemResult {
+        let n = width.bytes() as usize;
+        let mut buf = [0u8; 8];
+        // Byte order has to be known before the bytes exist, so the target is
+        // located twice for a write. The second lookup is a dispatch-table
+        // index or a binary search, not a tree walk — and both happen under
+        // this one guard, so they cannot disagree.
+        self.endian_at(addr).store(&mut buf[..n], width, value)?;
+        self.write_span(addr, &buf[..n], attrs, Some(width))
+    }
+
+    /// Read raw bytes in ascending address order.
+    ///
+    /// # Errors
+    ///
+    /// As [`SpaceView::read`].
+    pub fn read_bytes(&self, addr: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
+        self.read_span(addr, dst, attrs, None).map(|_| ())
+    }
+
+    /// Write raw bytes in ascending address order.
+    ///
+    /// # Errors
+    ///
+    /// As [`SpaceView::read`].
+    pub fn write_bytes(&self, addr: u64, src: &[u8], attrs: MemAttrs) -> MemResult {
+        self.write_span(addr, src, attrs, None)
+    }
+
+    /// The distance from `addr` to the next mapped byte, capped at `max`.
+    fn gap_len(&self, addr: u64, max: u64) -> u64 {
+        let entries = self.topo.flat.entries();
+        let i = entries.partition_point(|e| e.start() <= addr);
+        match entries.get(i) {
+            Some(e) => (e.start() - addr).min(max),
+            None => max,
+        }
+    }
+
+    fn read_span(
+        &self,
+        addr: u64,
+        dst: &mut [u8],
+        attrs: MemAttrs,
+        width: Option<Width>,
+    ) -> MemResult<Endian> {
+        let total = dst.len() as u64;
+        if total == 0 {
+            return Ok(self.space.endian);
+        }
+        addr.checked_add(total - 1).ok_or(BusError::BadAccess)?;
+        let mut endian = None;
+        let mut done = 0u64;
+        let mut committed = false;
+        while done < total {
+            let a = addr + done;
+            let remaining = total - done;
+            let (n, res) = match self.locate(a) {
+                Some(i) => {
+                    let e = self.topo.flat.entry(i).expect("index came from locate");
+                    let rel = a - e.start();
+                    let n = e.run_len(rel).min(remaining);
+                    if endian.is_none() {
+                        endian = Some(e.endian());
+                    }
+                    let piece = &mut dst[usize_of(done)..usize_of(done + n)];
+                    let w = if n == total { width } else { None };
+                    (n, e.read(rel, piece, attrs, w))
+                }
+                None => {
+                    let n = self.gap_len(a, remaining);
+                    let piece = &mut dst[usize_of(done)..usize_of(done + n)];
+                    (n, self.space.unassigned_read(a, piece, attrs))
+                }
+            };
+            // `Retry` is only legal before any side effect or partial
+            // transfer. Re-running a half-completed multi-region access would
+            // read a FIFO twice; the dispatcher refuses instead.
+            match res {
+                Err(BusError::Retry) if committed => return Err(BusError::BadAccess),
+                Err(e) => return Err(e),
+                Ok(()) => {}
+            }
+            committed = true;
+            done += n;
+        }
+        Ok(endian.unwrap_or(self.space.endian))
+    }
+
+    fn write_span(
+        &self,
+        addr: u64,
+        src: &[u8],
+        attrs: MemAttrs,
+        width: Option<Width>,
+    ) -> MemResult {
+        let total = src.len() as u64;
+        if total == 0 {
+            return Ok(());
+        }
+        addr.checked_add(total - 1).ok_or(BusError::BadAccess)?;
+        let mut done = 0u64;
+        let mut committed = false;
+        while done < total {
+            let a = addr + done;
+            let remaining = total - done;
+            let (n, res) = match self.locate(a) {
+                Some(i) => {
+                    let e = self.topo.flat.entry(i).expect("index came from locate");
+                    let rel = a - e.start();
+                    let n = e.run_len(rel).min(remaining);
+                    let piece = &src[usize_of(done)..usize_of(done + n)];
+                    let w = if n == total { width } else { None };
+                    (n, e.write(rel, piece, attrs, w))
+                }
+                None => {
+                    let n = self.gap_len(a, remaining);
+                    (n, self.space.unassigned_write(a, attrs))
+                }
+            };
+            match res {
+                Err(BusError::Retry) if committed => return Err(BusError::BadAccess),
+                Err(e) => return Err(e),
+                Ok(()) => {}
+            }
+            committed = true;
+            done += n;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The write guard
+// ---------------------------------------------------------------------------
+
+/// Exclusive access to one [`AddressSpace`]'s topology: the only way to change
+/// its region set.
+///
+/// Obtained from [`AddressSpace::topology`], which is where the rules about
+/// when it may be taken are written down. Holding it excludes every reader —
+/// every access, on every thread — so keep it short, and keep it out of MMIO
+/// handlers, which are readers by definition.
+///
+/// Every mutating method here is a **retopology**: it reflattens the tree,
+/// rebuilds the dispatch table and bumps the generation, invalidating every
+/// derived cache in the machine. A batch under one guard still costs one
+/// rebuild per call; the guard saves the acquisitions, not the flattening.
+#[derive(Debug)]
+pub struct TopologyGuard<'a> {
+    space: &'a AddressSpace,
+    topo: RwLockWriteGuard<'a, Topology>,
+}
+
+impl TopologyGuard<'_> {
+    /// The space this guard is open on.
+    #[inline]
+    #[must_use]
+    pub fn space(&self) -> &AddressSpace {
+        self.space
+    }
+
+    /// The flattened view as it stands. Derived state.
+    #[inline]
+    #[must_use]
+    pub fn flat_view(&self) -> &FlatView {
+        &self.topo.flat
+    }
+
+    /// The dense dispatch table, if this space has one.
+    #[inline]
+    #[must_use]
+    pub fn dispatch(&self) -> Option<&Dispatch> {
+        self.topo.dispatch.as_ref()
+    }
+
+    /// The root mappings, in mapping order.
+    pub fn mappings(&self) -> impl Iterator<Item = (MappingId, &Mapping)> {
+        self.topo.root.iter().map(|(id, m)| (*id, m))
+    }
+
+    /// Map `region` at `base` with priority 0. **Retopology.**
+    ///
+    /// # Errors
+    ///
+    /// If the region does not fit in the space, or the tree cannot be
+    /// flattened.
+    pub fn map(&mut self, region: impl Into<RegionRef>, base: u64) -> Result<MappingId, Error> {
+        self.map_with(Mapping::new(region, base))
+    }
+
+    /// Map `region` at `base` with an explicit priority, higher winning where
+    /// regions overlap. **Retopology.**
+    ///
+    /// This is how a PCI BAR sits over RAM, how a boot ROM shadows the reset
+    /// vector, and how a cartridge mapper puts a window over the open bus.
+    ///
+    /// # Errors
+    ///
+    /// As [`TopologyGuard::map`].
+    pub fn map_with_priority(
+        &mut self,
+        region: impl Into<RegionRef>,
+        base: u64,
+        priority: i32,
+    ) -> Result<MappingId, Error> {
+        self.map_with(Mapping::new(region, base).with_priority(priority))
+    }
+
+    /// Add a prepared [`Mapping`]. **Retopology.**
+    ///
+    /// # Errors
+    ///
+    /// As [`TopologyGuard::map`].
+    pub fn map_with(&mut self, mapping: Mapping) -> Result<MappingId, Error> {
+        self.space.check_fits(&mapping)?;
+        let id = MappingId(self.topo.next_id);
+        self.topo.next_id += 1;
+        self.topo.root.push((id, mapping));
+        match self.rebuild() {
+            Ok(()) => Ok(id),
+            Err(e) => {
+                self.topo.root.pop();
+                // Leave the space in the state the caller had before the
+                // failed map, rather than half-changed.
+                let _ = self.rebuild();
+                Err(e)
+            }
+        }
+    }
+
+    /// Remove a mapping. **Retopology.**
+    ///
+    /// # Errors
+    ///
+    /// If `id` is not a mapping of this space.
+    pub fn unmap(&mut self, id: MappingId) -> Result<(), Error> {
+        let Some(pos) = self.topo.root.iter().position(|(i, _)| *i == id) else {
+            return Err(self.no_such_mapping(id));
+        };
+        self.topo.root.remove(pos);
+        self.rebuild()
+    }
+
+    /// Move a mapping to a new base address. **Retopology.**
+    ///
+    /// A PCI BAR address change lands here, and `ROADMAP.md` §4.1 files that
+    /// under "rebase". It is not one, and cannot be: moving a mapping changes
+    /// the *addresses* in the flat view, not an offset behind an entry, so the
+    /// sorted view has to be rebuilt and every cache keyed on the old address
+    /// has to be invalidated. The roadmap's cheap case is real, but it is the
+    /// one where a fixed aperture's *contents* slide — [`AddressSpace::rebase`].
+    ///
+    /// # Errors
+    ///
+    /// If `id` is not a mapping of this space, or the region no longer fits.
+    pub fn remap(&mut self, id: MappingId, base: u64) -> Result<(), Error> {
+        let Some(pos) = self.topo.root.iter().position(|(i, _)| *i == id) else {
+            return Err(self.no_such_mapping(id));
+        };
+        let old = self.topo.root[pos].1.base;
+        self.topo.root[pos].1.base = base;
+        let mapping = self.topo.root[pos].1.clone();
+        if let Err(e) = self.space.check_fits(&mapping) {
+            self.topo.root[pos].1.base = old;
+            return Err(e);
+        }
+        self.rebuild()
+    }
+
+    /// Reflatten and rebuild the dispatch table, bumping the generation.
+    /// **Retopology.**
+    ///
+    /// Called for you by every topology change; public because a container's
+    /// contents can be rebuilt out from under a space and a machine may need
+    /// to say so.
+    ///
+    /// # Errors
+    ///
+    /// If the region tree cannot be flattened.
+    pub fn rebuild(&mut self) -> Result<(), Error> {
+        let children: Vec<Mapping> = self.topo.root.iter().map(|(_, m)| m.clone()).collect();
+        let (flat, index) = FlatView::build(&children, self.space.size(), self.space.combine)?;
+        self.topo.dispatch = Dispatch::build(&flat, self.space.dispatch_policy);
+        self.topo.flat = flat;
+        self.topo.rebase_index = index;
+        // The write guard excludes every reader, so this cannot race;
+        // `fetch_add` for the ordering, not for the atomicity.
+        self.space.generation.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn no_such_mapping(&self, id: MappingId) -> Error {
+        Error::Config {
+            at: self.space.name.clone(),
+            message: alloc::format!("no mapping {id:?} in this space"),
         }
     }
 }

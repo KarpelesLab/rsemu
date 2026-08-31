@@ -57,11 +57,15 @@
 //! assert_eq!(forest.convert_ticks(cpu, dots, 1)?, 3);
 //!
 //! // The PPU's own bus: $0000-$3FFF, pattern tables and nametables.
-//! let mut vram = AddressSpace::new("ppu", 14).with_unassigned(UnassignedPolicy::ONES);
+//! let vram = AddressSpace::new("ppu", 14).with_unassigned(UnassignedPolicy::ONES);
 //! let chr = Arc::new(RamStore::new(0x2000));
-//! vram.map(Arc::new(Region::ram("chr", chr)), 0x0000)?;
 //! let nt = Arc::new(RamStore::new(0x1000));
-//! vram.map(Arc::new(Region::ram("nametables", nt)), 0x2000)?;
+//! // One topology guard covers the whole batch (`core::space`).
+//! {
+//!     let mut topo = vram.topology();
+//!     topo.map(Arc::new(Region::ram("chr", chr)), 0x0000)?;
+//!     topo.map(Arc::new(Region::ram("nametables", nt)), 0x2000)?;
+//! }
 //!
 //! let ppu = NesPpu::new(&Props::new())?;
 //! ppu.attach_bus(Arc::new(vram));

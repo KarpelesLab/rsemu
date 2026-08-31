@@ -23,11 +23,14 @@ fn a_clock_forest_and_an_address_space_coexist() {
     let ppu = forest.add_domain("ppu", master, 1, 4).unwrap();
 
     // Memory. 2 KiB of RAM mirrored across $0000-$1FFF.
-    let mut space = AddressSpace::new("cpubus", 16);
+    let space = AddressSpace::new("cpubus", 16);
     let ram = Region::ram("wram", Arc::new(RamStore::new(0x800)));
     let mirror = Region::mirror("wram-mirror", ram, 0x2000).unwrap();
-    space.map(mirror, 0x0000).unwrap();
-    space.rebuild().unwrap();
+    {
+        let mut topo = space.topology();
+        topo.map(mirror, 0x0000).unwrap();
+        topo.rebuild().unwrap();
+    }
 
     let attrs = MemAttrs::default();
     space.write(0x0003, Width::U8, 0xa5, attrs).unwrap();
