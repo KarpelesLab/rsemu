@@ -84,14 +84,14 @@ pub const PORT2: &str = "port2";
 /// The pad port a machine gets when its description names none.
 pub const DEFAULT_PAD_PORT: &str = "nes-pads";
 
-/// What a read of an empty port returns in bits 7-5.
+/// Which bits of a `$4016`/`$4017` read the port does *not* drive.
 ///
-/// Those bits are not driven by the controller at all: they are whatever the
-/// CPU last left on the data bus, and for a read of `$4016`/`$4017` that is the
-/// high byte of the address the CPU just put out — `$40`. rsemu does not model
-/// a CPU-side open-bus latch across the port boundary, so the constant real
-/// hardware produces is used directly (NESdev, "Open bus behavior").
-const OPEN_BUS: u8 = 0x40;
+/// Bits 7-5 are not connected to the controller at all: they float, and what
+/// floats is whatever the master last left on the data bus — for an ordinary
+/// `LDA $4016` that is `$40`, the high byte of the address it just put out
+/// (NESdev, "Open bus behavior"). Bits 4-0 belong to the port, and on an
+/// NES-001 only D0, D3 and D4 have anything on them.
+const OPEN_BUS_BITS: u8 = 0xe0;
 
 /// Controller button bits, in the shift register's output order.
 ///
@@ -268,7 +268,7 @@ impl Shared {
     ///
     /// `advance` is false for a debug read: a monitor looking at `$4016` must
     /// not clock the controller (`ROADMAP.md` §15, invariant 5).
-    fn read_port(&self, port: usize, advance: bool) -> u8 {
+    fn read_port(&self, port: usize, bus: u8, advance: bool) -> u8 {
         let mut regs = self.regs.lock();
         if regs.strobe {
             // Latched continuously while the line is high, so every read is the
@@ -279,7 +279,7 @@ impl Shared {
         if advance && !regs.strobe {
             regs.shift[port] = (regs.shift[port] << 1) | 1;
         }
-        OPEN_BUS | bit
+        (bus & OPEN_BUS_BITS) | bit
     }
 
     /// A write of `value` to `$4016`.
@@ -382,7 +382,7 @@ impl MemOps for PortWindow {
         let ([byte], 0) = (dst, offset) else {
             return Err(BusError::BadAccess);
         };
-        *byte = self.shared.read_port(self.index, !attrs.debug);
+        *byte = self.shared.read_port(self.index, attrs.bus, !attrs.debug);
         Ok(())
     }
 
@@ -531,7 +531,7 @@ mod tests {
         p.shared.write_strobe(0);
         let mut out = 0u8;
         for _ in 0..8 {
-            out = (out << 1) | (p.shared.read_port(0, true) & 1);
+            out = (out << 1) | (p.shared.read_port(0, 0x40, true) & 1);
         }
         out
     }
@@ -558,12 +558,12 @@ mod tests {
         p.shared.write_strobe(1);
         p.shared.write_strobe(0);
         for _ in 0..8 {
-            assert_eq!(p.shared.read_port(0, true) & 1, 0);
+            assert_eq!(p.shared.read_port(0, 0x40, true) & 1, 0);
         }
         // The 4021's serial input is tied high on an NES pad, so everything
         // after the eighth clock is a 1. Software counts pads with this.
         for _ in 0..4 {
-            assert_eq!(p.shared.read_port(0, true) & 1, 1);
+            assert_eq!(p.shared.read_port(0, 0x40, true) & 1, 1);
         }
     }
 
@@ -574,13 +574,17 @@ mod tests {
         p.shared.write_strobe(1);
         // Latched continuously: every read is A, and nothing shifts past it.
         for _ in 0..16 {
-            assert_eq!(p.shared.read_port(0, true) & 1, 1);
+            assert_eq!(p.shared.read_port(0, 0x40, true) & 1, 1);
         }
         // Release the strobe and what was latched is the state at the falling
         // edge, not the state at the rising one.
         p.pad().set(0, buttons::NONE);
         p.shared.write_strobe(0);
-        assert_eq!(p.shared.read_port(0, true) & 1, 0, "A was released first");
+        assert_eq!(
+            p.shared.read_port(0, 0x40, true) & 1,
+            0,
+            "A was released first"
+        );
     }
 
     #[test]
@@ -591,7 +595,7 @@ mod tests {
         p.shared.write_strobe(0);
         // Bits 7-5 come from the CPU's own bus, and for a read of $4016 that
         // is the high byte of the address.
-        assert_eq!(p.shared.read_port(0, true), OPEN_BUS | 1);
+        assert_eq!(p.shared.read_port(0, 0x40, true), 0x40 | 1);
     }
 
     #[test]
@@ -602,12 +606,16 @@ mod tests {
         p.shared.write_strobe(1);
         p.shared.write_strobe(0);
         // Port 1 shifts A out first; port 2's A is clear and its Right is last.
-        assert_eq!(p.shared.read_port(0, true) & 1, 1);
-        assert_eq!(p.shared.read_port(1, true) & 1, 0);
+        assert_eq!(p.shared.read_port(0, 0x40, true) & 1, 1);
+        assert_eq!(p.shared.read_port(1, 0x40, true) & 1, 0);
         for _ in 0..6 {
-            let _ = p.shared.read_port(1, true);
+            let _ = p.shared.read_port(1, 0x40, true);
         }
-        assert_eq!(p.shared.read_port(1, true) & 1, 1, "Right, the eighth bit");
+        assert_eq!(
+            p.shared.read_port(1, 0x40, true) & 1,
+            1,
+            "Right, the eighth bit"
+        );
     }
 
     #[test]
@@ -617,10 +625,10 @@ mod tests {
         p.shared.write_strobe(1);
         p.shared.write_strobe(0);
         for _ in 0..8 {
-            assert_eq!(p.shared.read_port(0, false), OPEN_BUS | 1, "still A");
+            assert_eq!(p.shared.read_port(0, 0x40, false), 0x40 | 1, "still A");
         }
         // And the guest's own first read still gets the first bit.
-        assert_eq!(p.shared.read_port(0, true) & 1, 1);
+        assert_eq!(p.shared.read_port(0, 0x40, true) & 1, 1);
     }
 
     #[test]
@@ -674,7 +682,7 @@ mod tests {
         p.pad().set(0, buttons::B | buttons::DOWN);
         p.shared.write_strobe(1);
         p.shared.write_strobe(0);
-        let _ = p.shared.read_port(0, true);
+        let _ = p.shared.read_port(0, 0x40, true);
 
         let mut shape = MachineShape::new();
         shape.add_device("ports", CLASS_NAME).expect("unique path");
@@ -700,8 +708,8 @@ mod tests {
         // And it keeps shifting from where the original stood.
         for _ in 0..7 {
             assert_eq!(
-                other.shared.read_port(0, true) & 1,
-                p.shared.read_port(0, true) & 1
+                other.shared.read_port(0, 0x40, true) & 1,
+                p.shared.read_port(0, 0x40, true) & 1
             );
         }
     }

@@ -35,7 +35,7 @@ use core::fmt;
 
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
-use crate::core::sched::{Budget, Consumed, LazyHandle};
+use crate::core::sched::{Budget, Consumed, LazyHandle, TickCursor};
 use crate::core::space::{RegionRef, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter};
 use crate::core::wire::{WireId, WireSink, WireSource};
@@ -246,6 +246,28 @@ pub trait Device: Send + Sync + fmt::Debug {
         Consumed::default()
     }
 
+    /// This device's `/RDY`-style arbiter, if it has one to offer.
+    ///
+    /// How a machine wires one device's cycle-stealing DMA to another device's
+    /// halt input without either of them naming the other's type: the core
+    /// resolves a link to the DMA unit and asks it for this.
+    fn cycle_gate(&self) -> Option<Arc<dyn CycleGate>> {
+        None
+    }
+
+    /// Told where to publish its own tick counter as it runs.
+    ///
+    /// A core that is sampled mid-budget — every CPU on a machine with a
+    /// lazily-advanced PPU — writes its cycle count here on each cycle, so
+    /// catch-up aims at the tick the access really happened on rather than at
+    /// the start of the quantum (`ROADMAP.md` §4.2, and
+    /// [`TickCursor`](crate::core::sched::TickCursor)). Called once, by the
+    /// machine layer, for every runnable device; ignoring it is legitimate and
+    /// costs only accuracy inside one quantum.
+    fn attach_cursor(&self, cursor: TickCursor) {
+        let _ = cursor;
+    }
+
     /// An event this device posted has come due.
     ///
     /// Outward actions — driving a wire, starting a burst — go on `deferred`,
@@ -331,6 +353,55 @@ pub trait Device: Send + Sync + fmt::Debug {
     fn attach_lazy(&self, handle: LazyHandle) {
         let _ = handle;
     }
+}
+
+/// What a `/RDY`-style arbiter does with the cycle *after* the one a core has
+/// just charged.
+///
+/// The three outcomes are the three things a halted 6502's bus can be doing,
+/// and keeping them apart is the whole point: a stolen cycle is invisible to
+/// the core's own address, while a held one repeats the core's read on the bus
+/// where devices can see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arbitration {
+    /// Nothing is pending. The core keeps the bus.
+    Release,
+    /// The arbiter is holding the core but is not driving the bus itself, so
+    /// the core's own read happens again and is externally visible — which is
+    /// how a DMA's halt and alignment cycles clock a NES controller port or
+    /// advance `$2007`.
+    Hold,
+    /// The arbiter drove the bus this cycle. The core charges a cycle and makes
+    /// no access of its own.
+    Steal,
+}
+
+/// A bus master that can stop a core mid-instruction: the `/RDY` pin.
+///
+/// A cycle-stealing DMA unit is not a device that runs on its own schedule —
+/// it runs *instead of* the core, cycle by cycle, and what it does to the bus
+/// on each of those cycles is guest-visible. So the core consults its arbiter
+/// after every bus cycle it charges, and the arbiter answers with what happens
+/// to the next one.
+///
+/// The core may only be halted on a **read**: that is a property of the 6502's
+/// `/RDY` input and of every part that copies it, and it is why `write` is a
+/// parameter rather than something the arbiter has to infer. An arbiter that
+/// wants the bus during a write cycle says [`Arbitration::Release`] and asks
+/// again next cycle.
+///
+/// # Sources
+///
+/// NESdev wiki, [DMA](https://www.nesdev.org/wiki/DMA): "the 6502 core repeats
+/// the last read cycle indefinitely, making no forward progress nor handling
+/// interrupts", and "the CPU only permits halting during read cycles".
+pub trait CycleGate: Send + Sync + fmt::Debug {
+    /// Consulted after every bus cycle a core charges.
+    ///
+    /// `cycle` is the core's own cycle counter *after* that cycle, `held` is
+    /// the address the core is driving, and `write` says whether the cycle was
+    /// a write.
+    fn arbitrate(&self, cycle: u64, held: u64, write: bool) -> Arbitration;
 }
 
 /// A device that performs its own accesses: DMA engines, bus masters, host

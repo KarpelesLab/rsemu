@@ -70,7 +70,7 @@
 //! apu.write(0x00, 0x9F); // pulse 1: 50% duty, halt, constant volume 15
 //! apu.write(0x03, 0x08); // length load, timer high bits
 //! apu.advance(29830); // one full 4-step sequence
-//! assert!(apu.read(0x15) & 0x40 != 0, "the frame IRQ should have fired");
+//! assert!(apu.read(0x15, 0) & 0x40 != 0, "the frame IRQ should have fired");
 //! ```
 
 pub mod dmc;
@@ -99,7 +99,7 @@ use crate::core::space::{
     AccessConstraints, MemAttrs, MemOps, MemResult, Region as MmioRegion, RegionRef,
 };
 use crate::core::state::{ChunkReader, ChunkWriter};
-use crate::core::sync::{AtomicU8, AtomicU64, LockRank, Mutex, Ordering};
+use crate::core::sync::{AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{Level, WireSource};
 use crate::machine::realize::{BindCtx, Instance};
@@ -380,13 +380,6 @@ struct ApuState {
     core: Mutex<Core>,
     /// The IRQ output port, connected at realize time.
     irq: Mutex<Option<WireSource>>,
-    /// The last value the CPU's external data bus held.
-    ///
-    /// `$4015` bit 5 reads back from here. The register is internal to the CPU,
-    /// so a `$4015` read neither drives the external bus nor updates it — the
-    /// bus layer must not feed the result of a `$4015` read back in through
-    /// [`Apu::set_open_bus`].
-    open_bus: AtomicU8,
     /// The clock domain whose ticks [`Apu::advance_to`] is called with.
     ///
     /// Recorded rather than used: the APU counts its own CPU cycles, and the
@@ -413,7 +406,6 @@ impl fmt::Debug for ApuState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ApuState")
             .field("region", &self.region)
-            .field("open_bus", &self.open_bus.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
@@ -450,9 +442,11 @@ impl ApuState {
         self.refresh_irq();
     }
 
-    fn read_with(&self, index: u8, peek: bool) -> u8 {
-        let open_bus = self.open_bus.load(Ordering::Relaxed);
+    fn read_with(&self, index: u8, open_bus: u8, peek: bool) -> u8 {
         if index != reg::STATUS {
+            // Nothing in the RP2A03 decodes a *read* of $4000-$4013: no gate
+            // drives the bus, so the byte the CPU put there last is the byte it
+            // reads back (NESdev, "Open bus behavior").
             return open_bus;
         }
         let value = self.core.lock().read_status(open_bus, peek);
@@ -525,7 +519,6 @@ impl Apu {
                 Core::new(region, phase, halt_ultrasonic, capacity as usize),
             ),
             irq: Mutex::with_rank(LockRank::WIRE, None),
-            open_bus: AtomicU8::new(0),
             domain: Mutex::with_rank(LockRank::LEAF, None),
             lazy: Mutex::new(None),
             ticks: AtomicU64::new(0),
@@ -673,39 +666,21 @@ impl Apu {
         self.state.write(index, value);
     }
 
-    /// Read a register by its offset from `$4000`.
+    /// Read a register by its offset from `$4000`, with `bus` as whatever the
+    /// master last drove.
     ///
-    /// Only `$4015` is readable; everything else returns the open-bus value.
-    pub fn read(&self, index: u8) -> u8 {
-        self.read_with(index, false)
+    /// Only `$4015` is readable; everything else answers with `bus`, because
+    /// nothing in the chip drives the wires for those addresses.
+    pub fn read(&self, index: u8, bus: u8) -> u8 {
+        self.state.read_with(index, bus, false)
     }
 
     /// Read a register without side effects, for a debugger or the monitor.
     ///
     /// Honours `MemAttrs::debug` (`ROADMAP.md` §15, invariant 5): the frame
     /// interrupt flag is reported but not cleared.
-    pub fn peek(&self, index: u8) -> u8 {
-        self.read_with(index, true)
-    }
-
-    fn read_with(&self, index: u8, peek: bool) -> u8 {
-        self.state.read_with(index, peek)
-    }
-
-    /// Record the value the CPU's external data bus last held.
-    ///
-    /// `$4015` bit 5 reads back from here. Do **not** call this with the result
-    /// of a `$4015` read: that register is internal to the CPU and the external
-    /// bus is disconnected for it, so the open-bus value must come from the
-    /// last cycle that read something else ([NESdev
-    /// APU](https://www.nesdev.org/wiki/APU)).
-    pub fn set_open_bus(&self, value: u8) {
-        self.state.open_bus.store(value, Ordering::Relaxed);
-    }
-
-    /// The open-bus value currently latched.
-    pub fn open_bus(&self) -> u8 {
-        self.state.open_bus.load(Ordering::Relaxed)
+    pub fn peek(&self, index: u8, bus: u8) -> u8 {
+        self.state.read_with(index, bus, true)
     }
 
     // -- DMC DMA ------------------------------------------------------------
@@ -849,7 +824,7 @@ impl MemOps for ApuPort {
             .ok_or(crate::core::error::BusError::BadAccess)?;
         // First, and outside every lock this device owns.
         self.state.sync(attrs);
-        *byte = self.state.read_with(index, attrs.debug);
+        *byte = self.state.read_with(index, attrs.bus, attrs.debug);
         Ok(())
     }
 
@@ -871,7 +846,15 @@ impl MemOps for ApuPort {
     }
 
     fn constraints(&self) -> AccessConstraints {
-        AccessConstraints::word(Width::U8, Endian::Little)
+        let word = AccessConstraints::word(Width::U8, Endian::Little);
+        if self.first == reg::STATUS {
+            // `$4015` is on the CPU's own die: reading it never puts anything
+            // on the external data bus, so the next open-bus read still sees
+            // the byte from before it (NESdev, "APU").
+            word.internal()
+        } else {
+            word
+        }
     }
 }
 

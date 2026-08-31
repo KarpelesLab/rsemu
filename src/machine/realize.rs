@@ -127,6 +127,7 @@ pub struct BindCtx<'a> {
     domain: Option<DomainId>,
     space: Option<&'a Arc<AddressSpace>>,
     spaces: &'a [(String, Arc<AddressSpace>)],
+    peers: &'a [(&'a str, Arc<dyn Instance>)],
 }
 
 impl<'a> BindCtx<'a> {
@@ -154,6 +155,22 @@ impl<'a> BindCtx<'a> {
     /// Any address space by name, for a device that reaches more than one.
     pub fn space_named(&self, name: &str) -> Option<&'a Arc<AddressSpace>> {
         self.spaces.iter().find(|(n, _)| n == name).map(|(_, s)| s)
+    }
+
+    /// Another device in this machine, by the name the file declared it under.
+    ///
+    /// What a property that *links* two devices resolves through — a CPU whose
+    /// `/RDY` a DMA unit drives, say. Every instance exists before any of them
+    /// is bound, so the order two linked devices appear in the file does not
+    /// matter.
+    ///
+    /// Deliberately narrow: it hands back the neighbour's `Instance`, and the
+    /// only way to get anything out of it is through a method the `Device`
+    /// trait already publishes. A device cannot reach for a sibling's concrete
+    /// type, which is what keeps `machine/` from growing a dependency on every
+    /// device that has ever wanted a friend.
+    pub fn peer(&self, name: &str) -> Option<&'a Arc<dyn Instance>> {
+        self.peers.iter().find(|(n, _)| *n == name).map(|(_, i)| i)
     }
 }
 
@@ -533,10 +550,11 @@ impl<'a> Realizer<'a> {
 
             let policy = match unassigned {
                 "fault" => UnassignedPolicy::FAULT,
-                // `open-bus` is §5's spelling. Until `core::space` grows a
-                // last-value-on-the-bus policy it is reads-as-ones, which is
-                // what the validator already documents.
-                "open-bus" | "read-as-ones" => UnassignedPolicy::ONES,
+                // `open-bus` really is open bus: the read answers with the
+                // byte the master last drove (`MemAttrs::bus`). Not the same
+                // thing as read-as-ones, which is a bus with pull-ups.
+                "open-bus" => UnassignedPolicy::OPEN_BUS,
+                "read-as-ones" => UnassignedPolicy::ONES,
                 "read-as-zeros" => UnassignedPolicy::ZEROS,
                 other => {
                     return Err(config(at(), format!("unknown unassigned policy `{other}`")));
@@ -768,6 +786,17 @@ impl<'a> Realizer<'a> {
     }
 
     fn bind_devices(&mut self, spaces: &[(String, Arc<AddressSpace>)]) -> Result<()> {
+        // Gathered first, so that `bind` sees every device however the file
+        // ordered them: a link is not a dependency edge.
+        let peers: Vec<(&str, Arc<dyn Instance>)> = self
+            .built
+            .iter()
+            .filter_map(|b| {
+                b.instance
+                    .as_ref()
+                    .map(|i| (b.path.as_str(), Arc::clone(i)))
+            })
+            .collect();
         for built in &self.built {
             let Some(instance) = built.instance.as_ref() else {
                 continue;
@@ -778,6 +807,7 @@ impl<'a> Realizer<'a> {
                 domain: built.domain,
                 space: built.space.and_then(|i| spaces.get(i)).map(|(_, s)| s),
                 spaces,
+                peers: &peers,
             };
             instance.bind(&ctx)?;
         }
@@ -813,9 +843,13 @@ impl<'a> Realizer<'a> {
                         "a device that takes execution budgets needs a clock domain",
                     )
                 })?;
-                runnable = Some(
-                    sched.add_runnable(domain, Box::new(RunAdapter::new(Arc::clone(instance)))),
-                );
+                let id =
+                    sched.add_runnable(domain, Box::new(RunAdapter::new(Arc::clone(instance))));
+                let cursor = sched
+                    .runnable_cursor(id)
+                    .map_err(|e| config(built.path.clone(), e.to_string()))?;
+                built.device.attach_cursor(cursor);
+                runnable = Some(id);
             }
             let mut lazy = None;
             if built.device.is_lazy() {

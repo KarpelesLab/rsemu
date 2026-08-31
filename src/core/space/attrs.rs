@@ -64,6 +64,20 @@ pub struct MemAttrs {
     /// The core honours this by never charging an access to the unassigned
     /// log; every MMIO device is required to honour it in its own handler.
     pub debug: bool,
+    /// The last byte this master drove on its data bus.
+    ///
+    /// A bus is wires, not a function: nothing pulls an unanswered line to a
+    /// defined level, so the charge the master itself last put there is what
+    /// it reads back. Every machine that decodes fewer addresses than it has
+    /// depends on this — a 6502 reading `$4000` gets `$40`, the high byte of
+    /// its own operand — and so does every write-only register, which answers
+    /// a read by not driving the bus at all.
+    ///
+    /// Carried on the access rather than remembered by the space because it
+    /// belongs to the *master*: two masters on one bus have two latches, and
+    /// a DMA cycle updates the one that drove it. A master with no such latch
+    /// leaves it zero, which is what a bus with a pull-down does.
+    pub bus: u8,
 }
 
 impl MemAttrs {
@@ -74,6 +88,7 @@ impl MemAttrs {
         privileged: false,
         exclusive: false,
         debug: false,
+        bus: 0,
     };
 
     /// A side-effect-free access, as issued by a debugger or a snapshot.
@@ -86,6 +101,7 @@ impl MemAttrs {
         privileged: true,
         exclusive: false,
         debug: true,
+        bus: 0,
     };
 
     /// Same attributes, from `id`.
@@ -113,6 +129,13 @@ impl MemAttrs {
     #[must_use]
     pub const fn with_exclusive(mut self, exclusive: bool) -> Self {
         self.exclusive = exclusive;
+        self
+    }
+
+    /// Same attributes, carrying `bus` as the master's last driven byte.
+    #[must_use]
+    pub const fn with_bus(mut self, bus: u8) -> Self {
+        self.bus = bus;
         self
     }
 
@@ -157,6 +180,17 @@ pub struct AccessConstraints {
     pub secure_only: bool,
     /// Reject unprivileged accesses.
     pub privileged_only: bool,
+    /// Whether a read of this region drives the master's external data bus.
+    ///
+    /// True for anything on the far side of the pins, which is nearly
+    /// everything. False for a register on the *master's own die*: the 2A03's
+    /// `$4015` is read straight into the core, so the external bus keeps
+    /// whatever was on it and the next open-bus read still sees the old byte
+    /// (NESdev wiki, "APU": "this register is internal to the CPU and so the
+    /// external CPU data bus is disconnected when reading it").
+    ///
+    /// Only a master that models an open-bus latch looks at it.
+    pub drives_data_bus: bool,
 }
 
 impl AccessConstraints {
@@ -169,6 +203,7 @@ impl AccessConstraints {
         allow_bulk: true,
         secure_only: false,
         privileged_only: false,
+        drives_data_bus: true,
     };
 
     /// The default for an I/O region: any width, but no bulk bursts.
@@ -189,7 +224,16 @@ impl AccessConstraints {
             allow_bulk: false,
             secure_only: false,
             privileged_only: false,
+            drives_data_bus: true,
         }
+    }
+
+    /// Same constraints, but a read of this region leaves the master's data
+    /// bus alone — the register is on the master's own die.
+    #[must_use]
+    pub const fn internal(mut self) -> Self {
+        self.drives_data_bus = false;
+        self
     }
 
     /// Same constraints, in `endian` byte order.

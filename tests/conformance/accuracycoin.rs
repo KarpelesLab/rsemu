@@ -324,7 +324,11 @@ mod tests {
     fn every_result_address_is_distinct_and_on_a_page_the_rom_uses() {
         // The DRAW pages share one byte — `result_DrawTest` — because none of
         // them writes a verdict; the tests that assert must not.
-        let mut seen: Vec<u16> = TESTS.iter().filter(|t| !t.is_draw()).map(|t| t.result).collect();
+        let mut seen: Vec<u16> = TESTS
+            .iter()
+            .filter(|t| !t.is_draw())
+            .map(|t| t.result)
+            .collect();
         seen.sort_unstable();
         let before = seen.len();
         seen.dedup();

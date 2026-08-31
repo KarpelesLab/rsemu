@@ -19,7 +19,7 @@
 #     they can never appear here.
 #
 # ---------------------------------------------------------------------------
-# Measured 2026-08-31 against the pinned ROM: 85 of 141 pass, 56 fail.
+# Measured 2026-08-31 against the pinned ROM: 91 of 141 pass, 50 fail.
 # ---------------------------------------------------------------------------
 #
 # The earlier "81 of 125" was measured through a stale copy of the ROM's
@@ -39,12 +39,21 @@
 #   A. No /RDY on cpu.mos6502, so no DMA can halt the CPU.
 #   B. No DMC DMA at all — the APU's sample fetch is a CPU-side stall that
 #      needs (A) first.
-#   C. No CPU-side open-bus data latch: the 6502 does not remember the last
-#      byte it drove, so reads of write-only addresses do not float.
+#   C. [FIXED] No CPU-side open-bus data latch. `unassigned = open-bus` really
+#      is open bus now: `MemAttrs::bus` carries the master's last driven byte,
+#      the space answers an unmapped read with it, and `$4014`, `$4016`/`$4017`
+#      and `$4000`-`$4013` take their undriven bits from it rather than from a
+#      constant. `$4015` is marked `internal()`, so reading it leaves the latch
+#      alone. What is left of (C) is only what needs a DMA to observe it.
 #   D. PPU staleness is scanline-exact, not dot-exact (ROADMAP.md 4.2's one
 #      remaining phase-3 item).
 #   E. APU frame-counter and length-counter edges are not on the right CPU
 #      cycle, and neither the APU nor the ports can see get/put phase.
+#
+# Since that measurement `core::sched` grew `TickCursor`: a runnable publishes
+# its own tick counter as it executes, and catch-up aims at the cycle an access
+# really happened on rather than at the start of the quantum. That closed the
+# APU's length-counter tests and half of (D) on its own.
 #
 # ---------------------------------------------------------------------------
 # A. The CPU has no /RDY line, so nothing can halt it
@@ -106,11 +115,6 @@
 # write-only register returns that byte rather than anything the device chose.
 # That latch belongs in cpu.mos6502, beside the cycle accounting.
 
-08                # $0408 "Open Bus" code 2: LDA absolute from open bus should
-                  # return the high byte of its own operand.
-7c                # $047C "JSR Edge Cases" code 3: the ROM says "incorrect open
-                  # bus emulation". Codes 1, 2 and 4 — the push order and the
-                  # operand fetch — pass.
 60                # $0460 "Instruction Timing" code 1: "the DMA should update
                   # the data bus". Every cycle count from code 3 on is untested
                   # until this passes; it is not a timing failure.
@@ -128,10 +132,6 @@
 
 50                # $0450 "VBlank beginning" code 1: the $2002 vblank flag was
                   # not set on the correct PPU cycle.
-51                # $0451 "VBlank end" code 1: and not cleared on the correct
-                  # one either.
-52                # $0452 "NMI Control" code 3: an NMI enabled during vblank
-                  # while the vblank flag is set must fire immediately.
 53                # $0453 "NMI Timing" code 1: the NMI did not occur on the
                   # correct PPU cycle.
 54                # $0454 "NMI Suppression" code 1: a precisely timed $2002 read
@@ -173,10 +173,6 @@
 # the APU nor the controller ports can see whether an access lands on a "get" or
 # a "put" cycle, because a device is handed a bus access, not a CPU half-cycle.
 
-65                # $0465 "Length Counter" code 4: writing $80 to $4017 must
-                  # clock the length counter immediately.
-66                # $0466 "Length Table" code 1: its prerequisite, $0465, did
-                  # not pass. The table itself is untested until then.
 67                # $0467 "Frame Counter IRQ" code 7: the IRQ flag must not be
                   # cleared yet on a get -> put transition.
 68                # $0468 "Frame Counter 4-step" code 2: the first clock of the

@@ -1131,6 +1131,81 @@ fn a_refused_access_reads_open_bus_and_is_counted() {
     assert_eq!(cpu.regs().a, 0x90, "the last byte that was on the bus");
 }
 
+/// A register on the core's own die: it answers, but it drives no external bus.
+#[derive(Debug)]
+struct OnDie(u8);
+
+impl MemOps for OnDie {
+    fn read(&self, _offset: u64, dst: &mut [u8], _attrs: MemAttrs) -> MemResult {
+        dst.fill(self.0);
+        Ok(())
+    }
+    fn write(&self, _offset: u64, _src: &[u8], _attrs: MemAttrs) -> MemResult {
+        Ok(())
+    }
+    fn constraints(&self) -> AccessConstraints {
+        AccessConstraints::word(Width::U8, crate::core::value::Endian::Little).internal()
+    }
+}
+
+/// A core over 32 KiB of RAM at `$0000` and an open-bus space above it.
+fn open_bus_harness() -> (Arc<TestBus>, Mos6502) {
+    let bus = Arc::new(TestBus::new());
+    let space = AddressSpace::new("cpu", 16).with_unassigned(UnassignedPolicy::OPEN_BUS);
+    {
+        let mut topo = space.topology();
+        topo.map(Region::io("ram", 0x8000, bus.clone()), 0).unwrap();
+        topo.map(Region::io("ondie", 1, Arc::new(OnDie(0x5a))), 0x9015)
+            .unwrap();
+    }
+    let cpu = Mos6502::new(Config::default());
+    cpu.attach_space(Arc::new(space));
+    cpu.set_regs(Regs {
+        pc: 0x0000,
+        ..Regs::new()
+    });
+    cpu.session.lock().state.reset_pending = false;
+    (bus, cpu)
+}
+
+#[test]
+fn an_absolute_read_of_open_bus_returns_its_own_operand_high_byte() {
+    // The classic NES observation: `LDA $4000` reads back `$40`, because the
+    // last thing the core drove on the bus was the high half of its operand
+    // (NESdev, "Open bus behavior").
+    let (bus, cpu) = open_bus_harness();
+    bus.poke(0x0000, &[0xad, 0x01, 0xa5]); // LDA $a501, which nothing answers
+    cpu.step();
+    assert_eq!(cpu.regs().a, 0xa5);
+}
+
+#[test]
+fn a_read_of_an_on_die_register_leaves_the_data_bus_alone() {
+    // `$4015` on a 2A03: the value reaches the accumulator without ever
+    // appearing on the pins, so the *next* open-bus read still floats the byte
+    // from before it.
+    let (bus, cpu) = open_bus_harness();
+    bus.poke(0x0000, &[0xad, 0x15, 0x90, 0xad, 0x00, 0xb7]);
+    cpu.step();
+    assert_eq!(cpu.regs().a, 0x5a, "the register answered");
+    cpu.step();
+    assert_eq!(
+        cpu.regs().a,
+        0xb7,
+        "and the floating read still sees its own operand, not $5a"
+    );
+}
+
+#[test]
+fn a_write_leaves_the_byte_it_drove_on_the_bus() {
+    let (bus, cpu) = open_bus_harness();
+    bus.poke(0x0000, &[0xa9, 0x3c, 0x8d, 0x00, 0xa0, 0xad, 0x34, 0xb2]);
+    cpu.step(); // LDA #$3c
+    cpu.step(); // STA $a000 — unmapped, but the core still drives $3c
+    cpu.step(); // LDA $b234 — unmapped
+    assert_eq!(cpu.regs().a, 0xb2, "the operand high byte, driven since");
+}
+
 #[test]
 fn a_debug_read_leaves_no_trace() {
     let h = Harness::running(&[0xa9, 0x42]);

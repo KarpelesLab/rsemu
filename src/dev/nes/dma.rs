@@ -284,15 +284,14 @@ struct DmaPort {
 }
 
 impl MemOps for DmaPort {
-    fn read(&self, offset: u64, dst: &mut [u8], _attrs: MemAttrs) -> MemResult {
+    fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
         let ([byte], 0) = (dst, offset) else {
             return Err(BusError::BadAccess);
         };
-        // `$4014` is write-only. Nothing drives the bus on a read, so the CPU
-        // sees whatever was last on it — which for a NES is the high byte of
-        // the address, `$40`. Modelling a CPU-side open-bus latch would be the
-        // honest version; this is the value hardware produces.
-        *byte = 0x40;
+        // `$4014` is write-only: nothing drives the bus on a read, so the master
+        // gets back the byte it last drove itself. For an ordinary `LDA $4014`
+        // that is `$40`, the high byte of its own operand.
+        *byte = attrs.bus;
         Ok(())
     }
 
@@ -547,11 +546,18 @@ mod tests {
     #[test]
     fn the_register_reads_as_open_bus() {
         let b = bus();
+        // Whatever the master last drove — for `LDA $4014` that is `$40`, the
+        // high byte of its own operand.
         let value = b
             .space
-            .read(0x4014, Width::U8, MemAttrs::DEFAULT)
+            .read(0x4014, Width::U8, MemAttrs::DEFAULT.with_bus(0x40))
             .expect("answered");
         assert_eq!(value, 0x40, "$4014 is write-only");
+        let value = b
+            .space
+            .read(0x4014, Width::U8, MemAttrs::DEFAULT.with_bus(0xa5))
+            .expect("answered");
+        assert_eq!(value, 0xa5, "and it really is the bus, not a constant");
     }
 
     #[test]

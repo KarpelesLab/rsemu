@@ -110,12 +110,12 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::core::device::{
-    Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
+    CycleGate, Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
 };
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
-use crate::core::sched::{Budget, Consumed};
+use crate::core::sched::{Budget, Consumed, TickCursor};
 use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{self, AtomicBool, AtomicU32, LockRank, Ordering};
@@ -507,6 +507,22 @@ pub struct Mos6502 {
     /// These hold an `Arc<Lines>` rather than an `Arc<Mos6502>` for exactly
     /// that reason.
     pins: sync::Mutex<Pins>,
+    /// The two things the machine layer hands over after construction: where to
+    /// publish the cycle counter, and who may pull `/RDY`.
+    ///
+    /// A leaf-ranked lock read once per instruction, outside the execution
+    /// lock. Both are wiring rather than state, so neither is snapshotted.
+    links: sync::Mutex<CoreLinks>,
+}
+
+/// What the machine layer wires onto a core after it is built.
+#[derive(Debug, Default, Clone)]
+struct CoreLinks {
+    cursor: Option<TickCursor>,
+    rdy: Option<Arc<dyn CycleGate>>,
+    /// The object the machine file named as this core's `/RDY` driver, kept
+    /// until `bind` can resolve it.
+    rdy_link: Option<String>,
 }
 
 /// The sinks this core has published, one per input pin.
@@ -538,6 +554,7 @@ impl Mos6502 {
             ),
             requester: AtomicU32::new(cfg.requester.0),
             pins: sync::Mutex::new(Pins::default()),
+            links: sync::Mutex::new(CoreLinks::default()),
         }
     }
 
@@ -582,13 +599,18 @@ impl Mos6502 {
         // the spelling the language documents would be the wrong half to be
         // strict about.
         let _ = r.or_enum("engine", "interp", &["interp"])?;
+        // Which object drives `/RDY`. Resolved at bind time, because the device
+        // it names may not have been built yet.
+        let rdy = r.optional_link("rdy")?.map(|l| String::from(l.as_str()));
         r.finish()?;
-        Ok(Mos6502::new(Config {
+        let cpu = Mos6502::new(Config {
             variant,
             decimal,
             magic: magic as u8,
             requester: RequesterId::ANONYMOUS,
-        }))
+        });
+        cpu.links.lock().rdy_link = rdy;
+        Ok(cpu)
     }
 
     /// This core's configuration.
@@ -741,6 +763,10 @@ impl Mos6502 {
     /// address space, which the caller must treat as "stop", not "retry".
     pub fn step(&self) -> u64 {
         let cfg = self.effective_config();
+        // Read before the execution lock: `links` is a leaf, and taking it
+        // under `BUS` would be legal but pointless — nothing changes it while
+        // an instruction runs.
+        let links = self.links.lock().clone();
         let mut session = self.session.lock();
         let Session { state, space } = &mut *session;
         // A `/RES` assertion is latched outside the lock; this is where it
@@ -755,7 +781,10 @@ impl Mos6502 {
         let Some(space) = space.clone() else {
             return 0;
         };
-        Exec::new(state, &space, &cfg, &self.lines).step()
+        Exec::new(state, &space, &cfg, &self.lines)
+            .with_cursor(links.cursor.as_ref())
+            .with_rdy(links.rdy.as_deref())
+            .step()
     }
 
     /// Execute until at least `budget` cycles have been charged.
@@ -817,6 +846,23 @@ impl Mos6502 {
         }
     }
 
+    /// Publish this core's cycle counter here as it executes.
+    ///
+    /// What makes a lazily-advanced device sampled from inside an instruction
+    /// see the cycle the access really happened on (`ROADMAP.md` §4.2). The
+    /// machine layer calls this for every runnable device.
+    pub fn attach_cursor(&self, cursor: TickCursor) {
+        self.links.lock().cursor = Some(cursor);
+    }
+
+    /// Connect the `/RDY` input to an arbiter that may halt this core.
+    ///
+    /// Without one the core is never held: `/RDY` idles high, which is what a
+    /// board with no DMA unit does. See [`CycleGate`].
+    pub fn attach_rdy(&self, gate: Arc<dyn CycleGate>) {
+        self.links.lock().rdy = Some(gate);
+    }
+
     /// Cycles owed to the next budget — see [`run_budget`](Mos6502::run_budget).
     #[must_use]
     pub fn cycle_debt(&self) -> u64 {
@@ -875,6 +921,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Str,
             required: false,
             summary: "which execution engine; only `interp` exists until phase 5",
+        },
+        PropertySpec {
+            name: "rdy",
+            kind: ValueKind::Link,
+            required: false,
+            summary: "the object that drives /RDY: a DMA unit that halts this core",
         },
     ],
     construct: |props| Ok(Box::new(Mos6502::from_props(props)?)),
@@ -944,6 +996,10 @@ impl Device for Mos6502 {
 
     fn is_runnable(&self) -> bool {
         true
+    }
+
+    fn attach_cursor(&self, cursor: TickCursor) {
+        Mos6502::attach_cursor(self, cursor);
     }
 
     fn run(&self, budget: Budget) -> Consumed {
@@ -1064,6 +1120,21 @@ impl crate::machine::Instance for Mos6502 {
         })?;
         self.attach_space(Arc::clone(space));
         self.set_requester(ctx.requester());
+
+        let wanted = self.links.lock().rdy_link.clone();
+        if let Some(name) = wanted {
+            let peer = ctx.peer(&name).ok_or_else(|| Error::Config {
+                at: alloc::string::String::from(ctx.path()),
+                message: alloc::format!("`rdy = {name}` names no object in this machine"),
+            })?;
+            let gate = peer.cycle_gate().ok_or_else(|| Error::Config {
+                at: alloc::string::String::from(ctx.path()),
+                message: alloc::format!(
+                    "`rdy = {name}` names a device that cannot halt a core: it drives no /RDY"
+                ),
+            })?;
+            self.attach_rdy(gate);
+        }
         Ok(())
     }
 }
@@ -1088,6 +1159,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("decimal", ValueKind::Bool))
         .prop(PropSchema::new("magic", ValueKind::Uint).range(0, 0xff))
         .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
+        .prop(PropSchema::new("rdy", ValueKind::Link))
         // Inputs only: a 6502 drives no line this core models. `/SYNC` and
         // `R/W` are real pins, but nothing yet listens to either.
         .port("irq", PortDir::In)
