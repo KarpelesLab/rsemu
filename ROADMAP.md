@@ -1139,6 +1139,57 @@ beside the semantics, adding an extension cannot silently light it up on parts
 that never had it, and the disassembler the same generator emits stays honest
 about which core it is disassembling for.
 
+**Cargo features and `Arch` are both wanted, and they are not alternatives.**
+The obvious simplification is to make each extension a Cargo feature and let
+`cpu-arm-v6z` be a meta-feature depending on the pieces. That is right for one
+of the two jobs and cannot do the other, so we do both, layered:
+
+| | decides | selected by | when |
+|---|---|---|---|
+| Cargo feature | what is **compiled** | the downstream crate | build |
+| `Arch` / `Extensions` | what an **instance** does | the `.machine` file | construction |
+
+Features cannot do the instance job, for two reasons that bite immediately.
+**Cargo features are additive and unified**: if anything in the dependency graph
+turns on `arm-thumb2`, it is on for the whole compilation, so a `#[cfg]` around
+Thumb-2 decode would light it up on an ARM926EJ-S that never had it — precisely
+the mis-decode 6.1.1 exists to prevent. And §2 promises heterogeneous machines
+(*"multiple different CPUs sharing the same memory"*): an ARM1176JZF-S beside a
+Cortex-A8 is one binary that must decode two different instruction sets, which a
+compile-time switch cannot express at all.
+
+What features *do* buy is the thing §3 actually promises — a NES build links a
+6502 and nothing else. A build that only ever runs an ARM7TDMI should not carry
+the VMSAv7 LPAE walker, NEON, or the TrustZone banking, and that is a code-size
+question with a compile-time answer. So the extensions become features, and the
+parts become meta-features in exactly the shape suggested:
+
+```toml
+arm-thumb   = []                     # T: the 16-bit encodings
+arm-dsp     = []                     # E: saturating and packed-multiply
+arm-media   = ["arm-dsp"]            # v6 SIMD, REV/extend, SEL, saturation
+arm-security = []                    # Z: Monitor mode, CP15 banking
+arm-vfp2    = ["soft-float"]         # F: the VFPv2 register file
+arm-vmsav6  = []                     # supersections, ASIDs, TEX remap
+
+# parts, as meta-features
+cpu-arm-v5te = ["cpu-arm-aprofile", "arm-thumb", "arm-dsp", "arm-vmsav5"]
+cpu-arm-v6z  = ["cpu-arm-v6", "arm-security", "arm-vfp2"]
+```
+
+The two layers are joined by one rule: **a preset whose features were not
+compiled in fails at `new`, with an error naming the missing feature.** Not a
+silent downgrade, and not a core that quietly lacks instructions — `new`
+validates and `realize` acts (§4.4), and "this binary has no VFP" is exactly a
+`new` failure. `Extensions` itself stays **total and un-`cfg`'d**: the fields
+exist in every build so `Arch` is one type with one shape, and a downstream
+crate can name `Arch::ARM1176JZF_S` portably and get a build error or a
+construction error rather than a struct that changes fields underneath it. This
+is what `cpu/riscv` already does — its `Extensions` has no `cfg` on any field.
+
+CI's feature sweep gains the job of proving the meta-features are honest: every
+`cpu-arm-*` preset must build alone, and each must construct its own `Arch`.
+
 **Where the profiles split.** Extensions handle variation *within* a profile.
 The A/R and M profiles differ in the parts an extension flag cannot express —
 register banking versus a stack-pointer pair, CP15 versus a memory-mapped SCB,
