@@ -96,7 +96,7 @@ use alloc::vec::Vec;
 
 use crate::core::clock::{ClockForest, DomainId, Rational as ClockRational};
 pub use crate::core::device::SinkPin;
-use crate::core::device::{Deferred, Device, DeviceClass, RealizeCtx, ResetKind};
+use crate::core::device::{Deferred, Device, DeviceClass, Export, ExportId, RealizeCtx, ResetKind};
 use crate::core::error::{Error, Result};
 use crate::core::props::{Media, Props, Value, ValueKind};
 use crate::core::registry::Registry;
@@ -105,6 +105,7 @@ use crate::core::space::{
     AddressSpace, Mapping as SpaceMapping, Region, RegionRef, RequesterId, UnassignedPolicy,
 };
 use crate::core::state::MachineShape;
+use crate::core::sync::AtomicU64;
 use crate::core::value::Endian;
 use crate::core::wire::{Wire, WireId, WireIdAllocator, WireSource};
 use crate::machine::machine::{
@@ -127,6 +128,11 @@ pub struct BindCtx<'a> {
     domain: Option<DomainId>,
     space: Option<&'a Arc<AddressSpace>>,
     spaces: &'a [(String, Arc<AddressSpace>)],
+    /// Every device in the machine, so a `bind` can reach a sibling's
+    /// [`Export`]. Private, and reached only through
+    /// [`export`](BindCtx::export) — a device gets a named handle, never the
+    /// device table.
+    peers: &'a [Built],
 }
 
 impl<'a> BindCtx<'a> {
@@ -154,6 +160,74 @@ impl<'a> BindCtx<'a> {
     /// Any address space by name, for a device that reaches more than one.
     pub fn space_named(&self, name: &str) -> Option<&'a Arc<AddressSpace>> {
         self.spaces.iter().find(|(n, _)| n == name).map(|(_, s)| s)
+    }
+
+    /// The handle `which` published by the sibling device at `path`.
+    ///
+    /// The route from one device to another's [`Export`] (`ROADMAP.md` §4.4),
+    /// and the first thing `RealizeCtx` will carry when it grows the machine
+    /// graph.
+    ///
+    /// **The consumer names its source explicitly**, in the machine file, as a
+    /// link-valued property — `timer = clint` on a hart. The machine never
+    /// scans for "the timer": a machine with two of anything would then depend
+    /// on which one iteration reached first, which `ROADMAP.md` §0 forbids
+    /// outright, and the failure would be a silently mis-wired board rather
+    /// than an error.
+    ///
+    /// Every device is constructed and realized before any is bound, and
+    /// [`Device::export`] is answerable from construction, so this works
+    /// regardless of the order the two objects appear in the file.
+    ///
+    /// # Errors
+    ///
+    /// If nothing in the machine is called `path`, or if it publishes no such
+    /// handle. Both name the consumer, the source and the kind, because
+    /// "no such export" in a machine with forty devices is unactionable.
+    pub fn export(&self, path: &str, which: ExportId) -> Result<Export> {
+        let Some(peer) = self.peers.iter().find(|b| b.path == path) else {
+            let names: Vec<&str> = self.peers.iter().map(|b| b.path.as_str()).collect();
+            return Err(config(
+                self.path,
+                format!(
+                    "names `{path}` as its {which}, but this machine has no object called \
+                     `{path}`; it has {}",
+                    list(&names)
+                ),
+            ));
+        };
+        peer.device.export(which).ok_or_else(|| {
+            config(
+                self.path,
+                format!(
+                    "names `{path}` as its {which}, but `{path}` is a `{}` and publishes no \
+                     {which}",
+                    peer.class.name
+                ),
+            )
+        })
+    }
+
+    /// The 64-bit cell `path` publishes as `which`.
+    ///
+    /// The shape is fixed by the [`ExportId`], so a handle that comes back in
+    /// another one is a bug in the publisher rather than in the machine file —
+    /// which is exactly why the check lives here and not in every consumer.
+    ///
+    /// # Errors
+    ///
+    /// As [`export`](BindCtx::export), plus a handle of the wrong shape.
+    pub fn export_cell(&self, path: &str, which: ExportId) -> Result<Arc<AtomicU64>> {
+        let export = self.export(path, which)?;
+        export.cell().cloned().ok_or_else(|| {
+            config(
+                self.path,
+                format!(
+                    "`{path}` publishes its {which} as {}, which is not a 64-bit cell",
+                    export.shape()
+                ),
+            )
+        })
     }
 }
 
@@ -411,6 +485,7 @@ pub fn realize_with(
 // ---------------------------------------------------------------------------
 
 /// One device under construction.
+#[derive(Debug)]
 struct Built {
     path: String,
     class: &'static DeviceClass,
@@ -767,7 +842,13 @@ impl<'a> Realizer<'a> {
         self.deferred.drain();
     }
 
-    fn bind_devices(&mut self, spaces: &[(String, Arc<AddressSpace>)]) -> Result<()> {
+    /// Hand each device its clock domain, its address space, and a route to a
+    /// sibling's [`Export`].
+    ///
+    /// Takes `&self`: every device is already built, and the context borrows
+    /// the same table this loop walks, which is what lets one device reach
+    /// another's handle here.
+    fn bind_devices(&self, spaces: &[(String, Arc<AddressSpace>)]) -> Result<()> {
         for built in &self.built {
             let Some(instance) = built.instance.as_ref() else {
                 continue;
@@ -778,6 +859,7 @@ impl<'a> Realizer<'a> {
                 domain: built.domain,
                 space: built.space.and_then(|i| spaces.get(i)).map(|(_, s)| s),
                 spaces,
+                peers: &self.built,
             };
             instance.bind(&ctx)?;
         }
@@ -1452,6 +1534,9 @@ mod tests {
         regs: Arc<TimerRegs>,
         region: RegionRef,
         out: Mutex<Option<WireSource>>,
+        /// Published as [`ExportId::TIMEBASE`], and counted up on every event —
+        /// the fixture's stand-in for a CLINT's `mtime`.
+        ticks: Arc<AtomicU64>,
     }
 
     impl Timer {
@@ -1464,6 +1549,7 @@ mod tests {
                 regs,
                 region,
                 out: Mutex::new(None),
+                ticks: Arc::new(AtomicU64::new(0)),
             })
         }
     }
@@ -1529,7 +1615,12 @@ mod tests {
             }
         }
 
+        fn export(&self, which: ExportId) -> Option<Export> {
+            (which == ExportId::TIMEBASE).then(|| Export::Cell(Arc::clone(&self.ticks)))
+        }
+
         fn event(&self, token: u64, deferred: &mut Deferred) {
+            self.ticks.fetch_add(1, Relaxed);
             self.regs.fires.fetch_add(1, Relaxed);
             self.regs.token.store(token as u32, Relaxed);
             self.regs.level.store(1, Relaxed);
@@ -1706,6 +1797,12 @@ mod tests {
         irq: Arc<IrqPin>,
         space: Mutex<Option<Arc<AddressSpace>>>,
         requester: Mutex<RequesterId>,
+        /// The instance named by `timer = …`, validated here and resolved at
+        /// bind. Two-phase construction: `new` may not reach a sibling.
+        timer: Option<String>,
+        /// The cell that instance published, if any. Wiring rather than state,
+        /// so `reset` leaves it alone.
+        time: Mutex<Option<Arc<AtomicU64>>>,
     }
 
     impl Cpu {
@@ -1713,6 +1810,7 @@ mod tests {
             let mut r = props.reader();
             // Accepted so the fixture can carry §5's `engine = "interp"`.
             let _ = r.or_str("engine", "interp")?;
+            let timer = r.optional_link("timer")?.map(|l| String::from(l.as_str()));
             r.finish()?;
             Ok(Cpu {
                 pc: AtomicU64::new(0),
@@ -1723,7 +1821,17 @@ mod tests {
                 }),
                 space: Mutex::new(None),
                 requester: Mutex::new(RequesterId::ANONYMOUS),
+                timer,
+                time: Mutex::new(None),
             })
+        }
+
+        /// What the timer it was pointed at currently reads.
+        fn now(&self) -> u64 {
+            self.time
+                .lock()
+                .as_ref()
+                .map_or(0, |cell| cell.load(Relaxed))
         }
     }
 
@@ -1794,6 +1902,9 @@ mod tests {
                 u64::from(self.irq.level().is_high()),
                 attrs,
             );
+            // …and, when a machine file pointed it at one, what the timer it
+            // was handed reads. That is the export seam, end to end.
+            let _ = space.write(0x0108, Width::U32, self.now() & 0xffff_ffff, attrs);
             Consumed::new(budget.ticks)
         }
     }
@@ -1805,6 +1916,9 @@ mod tests {
                 .ok_or_else(|| config(ctx.path(), "a cpu needs an address space (`space = …`)"))?;
             *self.space.lock() = Some(Arc::clone(space));
             *self.requester.lock() = ctx.requester();
+            if let Some(path) = &self.timer {
+                *self.time.lock() = Some(ctx.export_cell(path, ExportId::TIMEBASE)?);
+            }
             Ok(())
         }
     }
@@ -1813,12 +1927,20 @@ mod tests {
         name: "test.cpu",
         version: 1,
         summary: "test-only runnable that reads its own address space",
-        properties: &[PropertySpec {
-            name: "engine",
-            kind: ValueKind::Str,
-            required: false,
-            summary: "which execution engine",
-        }],
+        properties: &[
+            PropertySpec {
+                name: "engine",
+                kind: ValueKind::Str,
+                required: false,
+                summary: "which execution engine",
+            },
+            PropertySpec {
+                name: "timer",
+                kind: ValueKind::Link,
+                required: false,
+                summary: "the object publishing the timebase this core samples",
+            },
+        ],
         construct: |props| Ok(Box::new(Cpu::new(props)?)),
     };
 
@@ -2655,6 +2777,99 @@ machine "bare" {
             .run_for(a_millisecond())
             .expect_err("cannot advance");
         assert!(e.to_string().contains("quantum is zero"), "{e}");
+    }
+
+    // -----------------------------------------------------------------
+    // exports: one device's handle in another device's hand
+    // -----------------------------------------------------------------
+
+    /// The toy machine with the CPU pointed at the timer's timebase.
+    ///
+    /// Note the declaration order: the consumer is declared *before* the
+    /// publisher, which is the case that would break if exports were resolved
+    /// during realize rather than during bind.
+    const EXPORTS: &str = r#"
+machine "exports" {
+  osc master = 1000000 Hz
+  space cpubus { width = 16, unassigned = read-as-ones }
+
+  object wram  "test.ram"   { size = 2K }
+  object cpu   "test.cpu"   { clock = master / 4, space = cpubus, timer = timer }
+  object timer "test.timer" { clock = master / 8 }
+
+  map cpubus 0x0000 size 0x2000 = mirror(wram)
+  map cpubus 0x4000 size 0x0010 = timer.regs
+}
+"#;
+
+    fn build_exports(source: &str) -> Result<Machine> {
+        let options = BuildOptions::new().with_bindings(bindings());
+        build("exports.machine", source, &registry(), &options)
+    }
+
+    #[test]
+    fn a_device_reaches_a_siblings_handle_at_bind_time() {
+        let mut machine = build_exports(EXPORTS).expect("builds");
+        machine
+            .schedule_after_ticks("timer", 10, 0)
+            .expect("the timer has a clock domain");
+        machine.run_for(a_millisecond()).expect("a millisecond");
+        // The CPU writes what its timer reads to 0x0108 at the end of every
+        // budget, so a non-zero value there is the publisher's own counter
+        // arriving in the consumer's hand.
+        let seen = machine
+            .space("cpubus")
+            .expect("cpubus")
+            .read(0x0108, Width::U32, MemAttrs::DEFAULT)
+            .expect("mapped");
+        assert!(seen > 0, "the CPU sampled the timer's cell, got {seen}");
+    }
+
+    #[test]
+    fn a_handle_survives_a_reset() {
+        // The rule the seam has to keep: a handle is wiring, not guest state.
+        // Rebooting must not unplug the clock, which is the bug this whole
+        // mechanism exists to make impossible rather than merely unlikely.
+        let mut machine = build_exports(EXPORTS).expect("builds");
+        machine
+            .schedule_after_ticks("timer", 10, 0)
+            .expect("the timer has a clock domain");
+        machine.run_for(a_millisecond()).expect("a millisecond");
+        machine.reset(ResetKind::Cold);
+        machine
+            .schedule_after_ticks("timer", 10, 0)
+            .expect("the timer still has a clock domain");
+        machine
+            .run_for(a_millisecond())
+            .expect("another millisecond");
+        let seen = machine
+            .space("cpubus")
+            .expect("cpubus")
+            .read(0x0108, Width::U32, MemAttrs::DEFAULT)
+            .expect("mapped");
+        assert!(seen > 0, "still sampling after a cold reset, got {seen}");
+    }
+
+    #[test]
+    fn naming_an_object_that_does_not_exist_is_an_error() {
+        // Caught by the resolver, before realize ever sees it — a link is a
+        // name in the file's own scope, so this is a `file:line:col` error
+        // rather than a realize-time one.
+        let source = EXPORTS.replace("timer = timer", "timer = nosuch");
+        let e = build_exports(&source).expect_err("no such object");
+        assert!(e.to_string().contains("nosuch"), "{e}");
+    }
+
+    #[test]
+    fn naming_an_object_that_publishes_nothing_is_an_error() {
+        let source = EXPORTS.replace("timer = timer", "timer = wram");
+        let e = build_exports(&source).expect_err("ram publishes no timebase");
+        let text = e.to_string();
+        // The message has to name all three: who asked, who was asked, and for
+        // what. "no such export" in a forty-device machine is unactionable.
+        for want in ["cpu", "wram", "test.ram", "timebase"] {
+            assert!(text.contains(want), "{want} missing from {text}");
+        }
     }
 
     #[test]
