@@ -330,6 +330,28 @@ dev-gb = []
 # a machine that is not NES-shaped, on the same core. Adds no dependencies.
 machine-gameboy = ["cpu-sm83", "dev-gb"]
 
+# The Sega Master System's chips (src/dev/sms): the 315-5124 VDP with mode 4 --
+# four bitplanes, 32 colours, per-tile flip and priority, hardware scroll and
+# the programmable line interrupt -- plus the four TMS9918A legacy modes it
+# inherits; the SN76489 PSG with its three square channels, noise shift register
+# and 4-bit attenuators; Sega's standard cartridge mapper with three 16 KiB
+# slots, a fixed first kilobyte and cartridge RAM; the two control ports at
+# $DC/$DD with $3E/$3F, the Reset button and Pause wired to /NMI; and the SDSC
+# debug console at $FC/$FD, which is how a Master System test ROM reports a
+# result without a screen. `no_std + alloc` and dependency-free.
+dev-sms = []
+
+# The Master System as a machine (machines/sms-ntsc.machine and
+# machines/sms-pal.machine plus the classes they name).
+# `rsemu run sms-ntsc --cart game.sms`. The second half of phase 4's genericity
+# proof: a Z80 with a **separate I/O address space**, a VDP and pads that live
+# in it rather than in memory, and one address that is the sound chip on a write
+# and the VDP's counters on a read. Two files rather than one with a flag,
+# because the region changes the oscillator and the frame height, and
+# ROADMAP.md 4.2 makes that part of the machine's identity. Adds no
+# dependencies.
+machine-sms = ["cpu-z80", "dev-sms"]
+
 # The Intel x86 core (src/cpu/x86): one interpreter covering the 8086, the
 # 8088, the 80386 and the 80486, chosen by a construction property rather than
 # a build flag. Real mode with every documented and undocumented 8086 encoding

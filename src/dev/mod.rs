@@ -67,6 +67,10 @@ pub mod lcd;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-st7272a")))]
 pub mod sitronix;
 
+#[cfg(feature = "dev-sms")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-sms")))]
+pub mod sms;
+
 #[cfg(feature = "dev-riscv")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-riscv")))]
 pub mod riscv;

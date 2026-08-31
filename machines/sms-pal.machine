@@ -1,0 +1,193 @@
+# The PAL Sega Master System (1987).
+#
+#   rsemu run sms-pal --cart game.sms
+#
+# The second half of phase 4's genericity proof (ROADMAP.md §13). The Game Boy
+# proved the framework could describe a console that is not a NES; this one is
+# not shaped like either. It has a **Z80 with a separate I/O address space**, a
+# video chip and a pair of joystick ports that live in that space rather than in
+# memory, an address that is the sound chip on a write and the video chip's
+# counters on a read, three bank-switched ROM windows, and a Pause button wired
+# to /NMI. Every one of those is said below with a mechanism core/ already had.
+#
+# Sources: SMS Power!'s development documents throughout
+# (https://www.smspower.org/Development/Documents) — the memory map, the mapper,
+# the I/O port assignments, the VDP registers and the video timing — plus the
+# TMS9918A and SN76489 datasheets and Zilog's UM0080 for the core.
+# docs/platforms/master-system.md has the register of sources.
+
+machine "sms-pal" {
+  # 10 640 685 Hz, and this one *is* an integer: 12/5 of the PAL colour
+  # subcarrier, 4 433 618.75 Hz. The NTSC console's crystal is not
+  # (945000000/88 Hz, three times 315/88 MHz), which is why that file writes a
+  # rational literal and this one does not — the syntax is a general rule, and a
+  # machine that satisfies it trivially is worth showing beside one that does
+  # not (ROADMAP.md §4.2).
+  #
+  # About 0.9 % slower than the NTSC part, which is why PAL games sound flat and
+  # run slow. The frame difference is much larger and lives in the VDP: 313
+  # lines rather than 262, giving 50 Hz rather than 60.
+  osc master = 10640685 Hz
+
+  # Whether the sound chip keeps output frames for a host audio sink to drain.
+  # `-p audio=true` when something is listening.
+  param audio = false
+
+  # -- the two buses ---------------------------------------------------------
+  #
+  # A Z80 has two address spaces, not one window into one space: it drives
+  # /IORQ where it would drive /MREQ, and this board decodes the two very
+  # differently. `space =` is structural and there is one of it per object, so
+  # the second is named by the `iospace` string property and resolved with
+  # `BindCtx::space_named` — the same shape `cpu.x86` uses, and the reason
+  # machines/z80-mini.machine exists at all.
+  #
+  # `unassigned = open-bus` on both, because a Z80 has **no bus-error input**:
+  # a read nothing answers leaves the data pins floating and the chip latches
+  # whatever was there. Faulting would model an exception the hardware cannot
+  # take.
+  space mem  { width = 16, unassigned = open-bus }
+  space port { width = 16, unassigned = open-bus }
+
+  # -- the chips -------------------------------------------------------------
+
+  object cpu "cpu.z80" {
+    # Master ÷ 3 = 3.546895 MHz, the PAL Z80 clock.
+    clock        = master / 3
+    space        = mem
+    iospace      = "port"
+    engine       = "interp"
+    cmos         = false
+    floating-bus = 0xff
+  }
+
+  # 8 KiB of work RAM on the console's board.
+  object wram "ram" { size = 8K }
+
+  # The cartridge on Sega's standard mapper board. `space = mem` because a bank
+  # switch **slides its own windows** in that space: the two ROM slots are
+  # rebasable aliases and rebanking is `AddressSpace::rebase`, one atomic store
+  # with no retopology and no translation block invalidated (ROADMAP.md §4.1).
+  #
+  # `rom` names a media slot rather than a file: the machine description says
+  # which slot, and whoever runs it binds the bytes (`--cart game.sms`).
+  # Nothing below host/ opens a file.
+  object cart "sms.mapper" { space = mem, rom = "cart" }
+
+  # The 315-5246. `clock = master / 2` because it counts pixels, one per two
+  # crystal periods — 342 to a line and **313 lines** to a PAL frame, against
+  # NTSC's 262. That is not a scaling factor: the extra 51 lines are why PAL
+  # machines can display 240 active lines when an NTSC one cannot, and why the V
+  # counter's backwards jump sits somewhere else entirely. It is the reason this
+  # is a second file rather than a parameter (ROADMAP.md §4.2).
+  #
+  # It has no address space of its own: its 16 KiB of video RAM is *inside* it
+  # and is reached a byte at a time through two I/O ports, which is the whole
+  # difference between this chip and a NES PPU.
+  object vdp "sms.vdp" { clock = master / 2, region = "pal" }
+
+  # The SN76489, on the CPU's own domain. It divides by 16 internally.
+  object psg "sms.psg" { clock = master / 3, record = audio }
+
+  # The I/O chip: two control pads, the memory and port control registers, and
+  # the console's own two buttons.
+  object io "sms.io" { region = "export" }
+
+  # The SDSC debug console. Not hardware — a convention SMS Power! publishes and
+  # every Master System test ROM reports through, mapped on the **write** half
+  # of two addresses that answer nothing at all on a real console. See
+  # src/dev/sms/sdsc.rs; without it a conformance run has to hash a
+  # framebuffer and hope.
+  object sdsc "sms.sdsc" {}
+
+  # -- the memory map --------------------------------------------------------
+  #
+  # SMS Power!, "Memory map". The cartridge answers the whole bottom 48 KiB
+  # through one container region holding four windows: a fixed first kilobyte,
+  # two rebasable ROM windows, and a third that is ROM or cartridge RAM
+  # depending on $FFFC.
+  map mem 0x0000 size 0xc000 = cart.rom
+
+  map mem 0xc000 size 0x2000 = wram
+  # The board decodes thirteen address lines here, so $E000-$FFFF is the same
+  # 8 KiB again. Software uses it constantly — the stack usually lives there.
+  map mem 0xe000 size 0x2000 = alias(wram)
+
+  # The mapper's four registers sit on top of that mirror, at the very top of
+  # memory, which is why a program's stack must not reach $FFFC. Later mappings
+  # win ties, so this one covers the RAM alias above.
+  map mem 0xfffc size 0x0004 = cart.regs
+
+  # -- the port map ----------------------------------------------------------
+  #
+  # The board decodes **A7, A6 and A0 of the low byte, and nothing above it**:
+  # A8-A15 are simply not connected to anything. That matters more here than on
+  # most machines, because a Z80 puts a register on the high half of the port
+  # address — A for `OUT (n),A`, B for `OUT (C),r` — so the same peripheral is
+  # reached at 256 different 16-bit addresses depending on what happened to be
+  # in a register. The loop below is that missing decode written out.
+  #
+  # It is 1024 mappings, which is honest rather than clever: a repeating window
+  # (`mirror`) needs a single leaf to repeat, and one page here is four
+  # different chips. The alternative — a region kind that repeats a *container*
+  # — is a core::space change, and phase 4 is explicitly not the place to make
+  # one (ROADMAP.md §13). The cost is paid once, at realize.
+  for page in 0..256 {
+    # $00-$3F: memory control on an even address, I/O port control on an odd
+    # one. Write-only; a read finds nothing driving the bus.
+    map port page * 0x100 + 0x00 size 0x40 = mirror(io.ctrl)
+
+    # $40-$7F: **one aperture, two chips**. A write goes to the sound chip; a
+    # read returns the V counter (even) or the H counter (odd), which is how a
+    # game finds the scanline it is on. `split()` is exactly that, and it is the
+    # same mechanism the NES needed for $4017 (ROADMAP.md §4.1).
+    map port page * 0x100 + 0x40 size 0x40 = mirror(split(vdp.counters, psg))
+
+    # $80-$BF: the VDP's data port (even) and control/status port (odd).
+    map port page * 0x100 + 0x80 size 0x40 = mirror(vdp.ports)
+
+    # $C0-$FF: the two control pads. Read-only.
+    map port page * 0x100 + 0xc0 size 0x40 = mirror(io.pads)
+
+    # $FC/$FD: the debug console, on the write side only. The read side stays on
+    # the pads, exactly where the hardware's incomplete decode puts it, so a
+    # guest cannot tell the difference.
+    map port page * 0x100 + 0xfc size 0x0002 = split(io.pads, sdsc)
+  }
+
+  # -- interrupts ------------------------------------------------------------
+  #
+  # Two lines, and they could hardly be less alike.
+  #
+  # The VDP's is a **level**: it goes high when the frame flag or a pending line
+  # interrupt is enabled, and it stays high until the guest reads $BF. A handler
+  # that returns without reading the status register is interrupted again
+  # immediately — on hardware and here, for the same reason, because a wire
+  # carries a level and the core's pin is level-sensitive. Nothing about that
+  # had to be coded.
+  wire vdp.irq -> cpu.int
+
+  # Pause is not in any register: the button is wired to /NMI. The I/O chip
+  # drives a level and the core's pin latches its rising edge, so one press is
+  # one non-maskable interrupt however long it is held. A device that tried to
+  # deliver an edge itself would have to invent one, and nets deliver *changes*
+  # (ROADMAP.md §4.3).
+  wire io.nmi -> cpu.nmi
+
+  # Reset is both: a bit in $DD that a game can poll, and this.
+  wire io.reset -> cpu.reset
+
+  # -- not here, and deliberately --------------------------------------------
+  #
+  # The BIOS. Export consoles shipped with one and it is Sega's copyrighted
+  # code, so rsemu ships none and $3E's BIOS-enable bit is recorded rather than
+  # acted on. A cartridge boots directly, which is what a Japanese Mark III did.
+  #
+  # The Game Gear, which is this machine with a smaller screen crop, a 12-bit
+  # palette written through a two-byte CRAM latch, and a stereo control port at
+  # $06. It should be its own file when those land, for the same reason nes-pal
+  # is not a parameter of nes-ntsc.
+  #
+  # The Codemasters and Korean mappers, the FM sound board, the Light Phaser and
+  # the 3-D glasses. Each is a device, and none is this board.
+}

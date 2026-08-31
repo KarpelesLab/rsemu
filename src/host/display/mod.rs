@@ -92,6 +92,10 @@ pub mod nes;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-video")))]
 pub mod pc;
 
+#[cfg(feature = "dev-sms")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-sms")))]
+pub mod sms;
+
 #[cfg(feature = "display-png")]
 #[cfg_attr(docsrs, doc(cfg(feature = "display-png")))]
 pub mod png;

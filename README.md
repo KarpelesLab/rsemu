@@ -68,7 +68,7 @@ quietly leaving the impression of a number.
 | --- | --- | --- |
 | MOS 6502 / RP2A03 | SingleStepTests 65x02 | **2,560,000 / 2,560,000** incl. bus traces |
 | WDC 65C02S | SingleStepTests 65x02 | **2,530,025 / 2,540,000** |
-| Zilog Z80 | SingleStepTests z80, zexall | **1,604,000 / 1,604,000**, 67/67 |
+| Zilog Z80 | SingleStepTests z80, zexall | **1,604,000 / 1,604,000**, 67/67; **77/77** again inside a Master System |
 | RISC-V RV64GC | riscv-tests | **409 / 409** |
 | Intel 8086/8088 | SingleStepTests 8088 | **2,974,160 / 3,007,000** |
 | Motorola 68000 | SingleStepTests 680x0 | runner in-tree; fetch the corpus to reproduce |
@@ -79,9 +79,12 @@ quietly leaving the impression of a number.
 Every corpus is fetched by `scripts/fetch-testdata.sh`, never vendored, and
 gated behind an environment variable — a licensing rule as much as a size one.
 
-**Six machines you can run.** `nes-ntsc` and `nes-pal` boot a cartridge, raise
+**Eight machines you can run.** `nes-ntsc` and `nes-pal` boot a cartridge, raise
 NMI and render — AccuracyCoin draws its menu. `gameboy` runs blargg's suite.
-`beneater-6502` and `apple1` are interactive over your terminal:
+`sms-ntsc` and `sms-pal` are a Sega Master System: a Z80 with a **separate I/O
+address space**, a 315-5124 VDP and an SN76489 living in it, Sega's bank-switched
+mapper, and a Pause button wired to /NMI. `beneater-6502` and `apple1` are
+interactive over your terminal:
 
 ```console
 $ cargo run --features machine-apple1 -- run apple1
