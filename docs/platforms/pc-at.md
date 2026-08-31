@@ -40,7 +40,7 @@ address; every one of them is written once, in that file.
 | Interrupt controllers (2, cascaded) | `pc.pic` | 0x20, 0xa0, ELCR at 0x4d0/1 | Intel 8259A data sheet |
 | Timer | `pc.pit` | 0x40-0x43 | Intel 8254 data sheet |
 | Keyboard controller, A20, reset | `pc.kbc` | 0x60, 0x64 | Intel 8042 data sheet |
-| System control ports | `pc.sysctl` | 0x61, 0x92 | AT Technical Reference |
+| System control ports | `pc.sysctl` | 0x61, 0x92, 0xcf9 | AT Technical Reference, Intel chipset data sheets |
 | RTC and CMOS | `pc.rtc` | 0x70-0x71 | Motorola MC146818 data sheet |
 | DMA (2, byte and word) | `pc.dma` | 0x00-0x0f, 0xc0-0xdf, pages at 0x80 | Intel 8237A data sheet |
 | Display | `pc.video` | 0x3b4/0x3d4, 0x3c0-0x3cf, 0x3da | MC6845 data sheet, VGA register set |
@@ -118,7 +118,6 @@ So the missing pieces below are ranked by that evidence, not by guesswork.
   paravirtual interface at those ports. Its strings show it *detects* the
   interface rather than requiring it, so the fallback path exists; how far it
   goes is unmeasured, and measuring it needs the 386 core.
-- **`0xcf9`**, the chipset reset control port, is not modelled.
 - **A video BIOS needs a real VGA**, not a text-mode CRTC: setting even mode 3
   writes the sequencer, the graphics controller, the attribute controller and
   the DAC. `pc.video` implements that register file; what it does *not* implement

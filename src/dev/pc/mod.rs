@@ -214,9 +214,9 @@ mod tests {
             Err(e) => panic!("{e}"),
         };
         assert_eq!(resolved.name, "pc-at");
-        // Five crystals, because the board has five cans and they are five
-        // trees rather than dividers off one (`ROADMAP.md` §4.2).
-        assert_eq!(resolved.oscillators.len(), 5);
+        // Six crystals, because the board has six cans and they are six trees
+        // rather than dividers off one (`ROADMAP.md` §4.2).
+        assert_eq!(resolved.oscillators.len(), 6);
         // The 8254's input is not an integer number of hertz, which is the
         // whole reason the language takes rational frequency literals. Written
         // 105000000/88 because that is 14.31818 MHz over 12 and how the board

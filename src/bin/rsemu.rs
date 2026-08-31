@@ -361,6 +361,11 @@ fn install_capture(options: &mut rsemu::machine::BuildOptions) -> rsemu::Result<
 }
 
 /// The display of the machine just built, if it has one this build can see.
+///
+/// Only the PNG path calls it, so a build without an encoder has no use for it
+/// — and the compiler is right to say so rather than being told to be quiet
+/// about a function that might one day be called.
+#[cfg(feature = "display-png")]
 #[allow(unused_mut)]
 fn take_scanout() -> Option<Box<dyn rsemu::host::display::Scanout>> {
     #[cfg(feature = "dev-pc-video")]

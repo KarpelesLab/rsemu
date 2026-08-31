@@ -58,7 +58,7 @@ machine "pc-at" {
 
   # -- crystals ---------------------------------------------------------------
   #
-  # Five, because the board has five, and they are five separate trees rather
+  # Six, because the board has six, and they are six separate trees rather
   # than dividers off one because they are five separate cans (ROADMAP.md §4.2).
   # Only the ratios *within* a tree are guest-visible; the absolute frequencies
   # set the wall-clock rate and nothing architectural.
@@ -84,6 +84,14 @@ machine "pc-at" {
   # only one that matters until a graphics mode exists. Divided by 9 for the
   # nine-pixel character cell; the device counts character clocks.
   osc dot = 28322000 Hz
+
+  # The 8042's own crystal. Divided down to a byte rate: an AT keyboard's serial
+  # line runs at 10-16.7 kHz and a frame is eleven bits, so a scan code takes
+  # about a millisecond, and one tick of this domain is one opportunity to move
+  # one byte between the keyboard and the host. The scheduler is the only thing
+  # allowed to decide when that happens (`CLAUDE.md`: a device never reads the
+  # wall clock).
+  osc kbd = 12000000 Hz
 
   # The floppy controller's data separator. Nothing here divides by it; the
   # controller completes its operations without modelling their duration, and
@@ -174,7 +182,7 @@ machine "pc-at" {
   # An 8042, which is a microcontroller with its own firmware; what is modelled
   # is the interface, not the program. It owns the A20 gate and the system reset
   # line, which is why leaving protected mode goes through a keyboard chip.
-  object kbc "pc.kbc" { port = keyboard }
+  object kbc "pc.kbc" { clock = kbd / 12000, port = keyboard }
 
   # -- the system control ports -----------------------------------------------
   #
