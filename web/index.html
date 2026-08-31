@@ -1,105 +1,35 @@
 <!doctype html>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>rsemu — in the browser</title>
-<style>
-  :root { color-scheme: light dark; }
-  body {
-    font: 14px/1.5 system-ui, sans-serif;
-    margin: 2rem auto; max-width: 46rem; padding: 0 1rem;
-  }
-  h1 { font-size: 1.4rem; margin-bottom: .25rem; }
-  code, pre, #build, #stats { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .muted { opacity: .7; }
-  .row { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin: .5rem 0; }
-  select, button, input[type=file] { font: inherit; }
-  button { padding: .3rem .8rem; }
-  button:disabled { opacity: .45; }
-  #status { min-height: 1.5em; }
-  .err { color: #c00; }
-  #screen {
-    /* 256x240 of guest pixels, tripled and left hard-edged: a NES picture is
-       not a photograph and smoothing it is a lie about the hardware. */
-    width: min(100%, 768px); aspect-ratio: 256 / 240;
-    image-rendering: pixelated;
-    background: #000; border-radius: 4px;
-  }
-  #console {
-    background: #111; color: #cfc; padding: .75rem 1rem; border-radius: 4px;
-    height: 18rem; overflow-y: auto; white-space: pre-wrap; margin: 0;
-  }
-  #stats { font-size: 12px; opacity: .75; min-height: 1.5em; }
-  fieldset { border: 1px solid color-mix(in srgb, currentColor 25%, transparent); border-radius: 6px; }
-  legend { padding: 0 .4rem; }
-  kbd {
-    font: 12px ui-monospace, monospace; border: 1px solid currentColor;
-    border-radius: 3px; padding: 0 .3em; opacity: .8;
-  }
-</style>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>rsemu in the browser</title>
+    <meta
+      name="description"
+      content="A whole emulated machine running client-side in WebAssembly: pick a machine, load a ROM, take a save state. Nothing is uploaded."
+    />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f4f2ef" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#131316" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23131316'/%3E%3Crect x='6' y='9' width='20' height='14' rx='2' fill='%23f0a45c'/%3E%3C/svg%3E" />
+    <!-- The module is fetched at runtime from ./rsemu.wasm, next to this file.
+         It is a cargo build product copied into public/, never a bundler
+         input, so its name is stable and the fetch is relative — which is what
+         makes one dist/ work both at /rsemu/ on Pages and at / locally.
 
-<h1>rsemu in the browser</h1>
-<p class="muted">
-  A whole emulated machine, client-side. Nothing is uploaded: the ROM you pick
-  is read by the page, and a save state is a file this tab writes.
-  <span id="build">loading…</span>
-</p>
-
-<fieldset>
-  <legend>machine</legend>
-  <div class="row">
-    <label for="machine">Machine</label>
-    <select id="machine"></select>
-    <button id="boot" disabled>Boot</button>
-  </div>
-  <div class="row">
-    <input type="file" id="rom" accept=".nes,.bin,.rom,application/octet-stream" disabled>
-    <span class="muted" id="rom-label"></span>
-  </div>
-  <div class="row">
-    <button id="reset" disabled>Reset</button>
-    <button id="pause" disabled>Pause</button>
-    <button id="save-state" disabled>Save state</button>
-    <label class="muted">Load state <input type="file" id="load-state" disabled></label>
-  </div>
-  <div id="status">…</div>
-</fieldset>
-
-<div id="screen-box" hidden>
-  <canvas id="screen" width="256" height="240"></canvas>
-  <div id="stats"></div>
-  <p class="muted" id="keys" hidden>
-    Controller 1: <kbd>Z</kbd> A, <kbd>X</kbd> B, <kbd>Enter</kbd> Start,
-    <kbd>Shift</kbd> Select, arrows for the d-pad. They reach the console's
-    controller port at <code>$4016</code>, which samples them whenever the game
-    strobes it — a level, not an event, which is what makes a recorded session
-    replayable.
-  </p>
-</div>
-
-<div id="console-box" hidden>
-  <pre id="console" tabindex="0"></pre>
-  <p class="muted">Click the pane and type — the keyboard is wired straight to the machine.</p>
-</div>
-
-<h2>What this is</h2>
-<p>
-  The same emulator that runs natively, built for
-  <code>wasm32-unknown-unknown</code> and driven from
-  <code>requestAnimationFrame</code>. No <code>wasm-bindgen</code>: the module
-  exports plain C functions and <code>rsemu.js</code> is the entire glue.
-</p>
-<p>
-  This page deliberately does <em>not</em> need cross-origin isolation. The
-  threaded configuration needs <code>SharedArrayBuffer</code> and therefore
-  COOP/COEP, which is often unavailable — so the non-threaded path is a
-  supported target rather than a fallback, and it is the one shipped here
-  (<code>ROADMAP.md</code> §11.3).
-</p>
-<p class="muted">
-  Virtual time is computed inside the emulator, never read from the host clock,
-  so a run here produces the same state hash as the same run under a native
-  debugger (<code>ROADMAP.md</code> §11.6). The hash is on screen; compare it
-  with what <code>rsemu run</code> prints.
-</p>
-
-<script type="module" src="./app.js"></script>
+         Deliberately not preloaded: `rel=preload as=fetch` has to match the
+         request's credentials mode or the browser fetches the module twice,
+         and 900 KB fetched twice is a worse page than 900 KB fetched late. -->
+  </head>
+  <body>
+    <div id="app"></div>
+    <noscript>
+      <p style="max-width: 40rem; margin: 3rem auto; font: 15px/1.6 system-ui, sans-serif">
+        This page runs an emulator compiled to WebAssembly, so it needs
+        JavaScript. The emulator itself runs natively too — see
+        <a href="https://github.com/KarpelesLab/rsemu">github.com/KarpelesLab/rsemu</a>.
+      </p>
+    </noscript>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

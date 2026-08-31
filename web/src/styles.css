@@ -1,0 +1,319 @@
+/* The page's design tokens and its handful of shared primitives.
+ *
+ * Component-specific rules live in the components' own <style scoped> blocks;
+ * what is here is what more than one of them needs. Colour is defined once, as
+ * custom properties, in a light palette on :root and a dark one under
+ * prefers-color-scheme — never a colour whose only definition is inside a
+ * media query. */
+
+:root {
+  color-scheme: light dark;
+
+  /* Surfaces, from the page backdrop inward. */
+  --bg: #f4f2ef;
+  --bg-grain: #e9e5df;
+  --panel: #fffefc;
+  --panel-2: #f7f4f0;
+  --line: #ddd6cc;
+  --line-strong: #c6bcae;
+
+  /* Ink. */
+  --fg: #21201d;
+  --fg-dim: #5f5b53;
+  --fg-faint: #8b857a;
+
+  /* The accent is a warm amber: instrument panel, not corporate blue. */
+  --accent: #a8541b;
+  --accent-fg: #ffffff;
+  --accent-soft: #f5e6d6;
+  --danger: #a3231b;
+  --good: #1f6b3f;
+
+  /* The screen bezel is the same in both themes — a CRT is dark either way. */
+  --bezel: #16161a;
+  --bezel-line: #2c2c33;
+  --phosphor: #8ff0a4;
+  --phosphor-dim: #3d7a4e;
+
+  --radius: 10px;
+  --radius-sm: 6px;
+  --shadow: 0 1px 2px rgb(0 0 0 / 0.05), 0 8px 24px -12px rgb(0 0 0 / 0.18);
+
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", Menlo,
+    Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131316;
+    --bg-grain: #191920;
+    --panel: #1c1c21;
+    --panel-2: #232329;
+    --line: #2e2e36;
+    --line-strong: #43434e;
+
+    --fg: #ecebe8;
+    --fg-dim: #a6a49e;
+    --fg-faint: #75736d;
+
+    --accent: #f0a45c;
+    --accent-fg: #1b1206;
+    --accent-soft: #33240f;
+    --danger: #ef7a72;
+    --good: #6fd39a;
+
+    --shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 12px 32px -16px rgb(0 0 0 / 0.7);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  /* The keyboard drives a d-pad; a page that scrolls under it is a page that
+     fights the game. Arrow keys are preventDefault()ed while a machine runs,
+     but smooth-scroll on top of that is still worse than no scroll. */
+  scroll-behavior: auto;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font: 15px/1.55 var(--sans);
+  color: var(--fg);
+  background:
+    radial-gradient(1200px 600px at 50% -10%, var(--bg-grain), transparent 70%),
+    var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+
+a {
+  color: var(--accent);
+}
+
+code,
+kbd,
+samp,
+.mono {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* -- focus ----------------------------------------------------------------- */
+
+/* One visible focus style for everything, and never `outline: none`. The page
+   is playable from the keyboard, so the keyboard has to be able to see. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* -- primitives ------------------------------------------------------------ */
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.panel-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.7rem 0.9rem;
+  border-bottom: 1px solid var(--line);
+  font-size: 0.72rem;
+  font-weight: 650;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+
+.panel-body {
+  padding: 0.9rem;
+  display: grid;
+  gap: 0.7rem;
+}
+
+.field {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.field > label,
+.label {
+  font-size: 0.74rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+}
+
+.hint {
+  margin: 0;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  color: var(--fg-dim);
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  align-items: center;
+}
+
+/* -- controls -------------------------------------------------------------- */
+
+button,
+select,
+input[type="file"]::file-selector-button {
+  font: inherit;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  padding: 0.42rem 0.8rem;
+  min-height: 2.1rem;
+  font-size: 0.88rem;
+  font-weight: 550;
+  color: var(--fg);
+  background: var(--panel-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    transform 60ms ease;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.btn:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  color: var(--accent-fg);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent);
+  filter: brightness(1.08);
+}
+
+select {
+  width: 100%;
+  padding: 0.42rem 0.6rem;
+  min-height: 2.1rem;
+  color: var(--fg);
+  background: var(--panel-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+/* A file input styled as a button, with the native control still doing the
+   work — a div with a click handler would lose the label, the keyboard and
+   the drop target all at once. */
+.file {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.42rem 0.8rem;
+  min-height: 2.1rem;
+  font-size: 0.88rem;
+  font-weight: 550;
+  background: var(--panel-2);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.file:hover,
+.file:focus-within {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.file input[type="file"] {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.file:has(input:disabled) {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+kbd {
+  display: inline-block;
+  min-width: 1.6em;
+  padding: 0.1em 0.4em;
+  font: 600 0.76rem/1.5 var(--mono);
+  text-align: center;
+  color: var(--fg-dim);
+  background: var(--panel-2);
+  border: 1px solid var(--line-strong);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+}
+
+/* -- utility --------------------------------------------------------------- */
+
+.dim {
+  color: var(--fg-dim);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
