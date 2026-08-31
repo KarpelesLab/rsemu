@@ -1205,6 +1205,73 @@ fn a_write_leaves_the_byte_it_drove_on_the_bus() {
     assert_eq!(cpu.regs().a, 0xb2, "the operand high byte, driven since");
 }
 
+/// An arbiter that halts the core once and drives one byte onto the bus.
+///
+/// The shape of a DMC sample fetch: one held cycle, one stolen cycle, release.
+#[derive(Debug)]
+struct OneShotDma {
+    byte: u8,
+    at: sync::Mutex<u64>,
+    step: sync::Mutex<u8>,
+}
+
+impl crate::core::device::CycleGate for OneShotDma {
+    fn arbitrate(
+        &self,
+        cycle: u64,
+        _held: u64,
+        _bus: u8,
+        write: bool,
+    ) -> crate::core::device::Arbitration {
+        use crate::core::device::Arbitration;
+        if write || cycle < *self.at.lock() {
+            return Arbitration::Release;
+        }
+        let step = {
+            let mut step = self.step.lock();
+            *step += 1;
+            *step
+        };
+        match step {
+            1 => Arbitration::Hold,
+            2 => Arbitration::Steal(self.byte),
+            _ => {
+                // Done: move the trigger out of reach so this fires once.
+                *self.at.lock() = u64::MAX;
+                Arbitration::Release
+            }
+        }
+    }
+}
+
+#[test]
+fn a_stolen_cycle_moves_the_pins_and_not_the_core_s_own_bus() {
+    // Two latches, and on a 2A03 the difference is observable: `$4015` is a
+    // register on the CPU's own die and its open-bus bit comes from the
+    // internal one, so a DMA that steals a cycle mid-instruction must not show
+    // up there (AccuracyCoin, "Internal Data Bus").
+    let (bus, cpu) = open_bus_harness();
+    bus.poke(0x0000, &[0xad, 0x00, 0xb7]); // LDA $b700, which nothing answers
+    cpu.attach_rdy(Arc::new(OneShotDma {
+        byte: 0x5a,
+        // The fourth cycle of the LDA: the read of $b700 itself.
+        at: sync::Mutex::new(4),
+        step: sync::Mutex::new(0),
+    }));
+    cpu.step();
+
+    let state = cpu.session.lock().state;
+    assert_eq!(
+        state.open_bus, 0x5a,
+        "the DMA's byte is what the pins were left holding"
+    );
+    assert_eq!(
+        state.core_bus, 0x5a,
+        "and the core's own read of open bus then picks it up"
+    );
+    assert_eq!(cpu.regs().a, 0x5a, "which is what the instruction loaded");
+}
+
 #[test]
 fn a_debug_read_leaves_no_trace() {
     let h = Harness::running(&[0xa9, 0x42]);

@@ -849,7 +849,15 @@ impl MemOps for ApuPort {
             .ok_or(crate::core::error::BusError::BadAccess)?;
         // First, and outside every lock this device owns.
         self.state.sync(attrs);
-        *byte = self.state.read_with(index, attrs.bus, attrs.debug);
+        // `$4015` is on the CPU's own die, so its open-bus bit comes from the
+        // core's *internal* bus — a DMA that stole a cycle moved the pins and
+        // not that. Everything else in the block is undecoded external space.
+        let bus = if index == reg::STATUS {
+            attrs.core_bus
+        } else {
+            attrs.bus
+        };
+        *byte = self.state.read_with(index, bus, attrs.debug);
         Ok(())
     }
 

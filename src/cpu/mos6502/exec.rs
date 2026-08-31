@@ -113,6 +113,15 @@ pub(super) struct State {
     /// the previous value on the bus, and that is what the CPU reads. Modelled
     /// rather than guessed at, because the NES depends on open-bus reads.
     pub open_bus: u8,
+    /// The last value on the core's **own** data bus, inside the pins.
+    ///
+    /// It follows every read and write the core makes, driven or not — and
+    /// **not** a cycle somebody else ran on the bus. A DMA that steals a cycle
+    /// moves the pins; it does not reach in here. On an RP2A03 that difference
+    /// is observable: `$4015` is an on-die register whose bit 5 comes from this
+    /// latch, so a DMC DMA landing inside a `LDA $4015` must not show up in it
+    /// (`MemAttrs::core_bus`).
+    pub core_bus: u8,
     /// How many accesses the address space refused.
     pub faults: u64,
     /// Address of the most recent refused access.
@@ -139,6 +148,7 @@ impl State {
             reset_pending: true,
             pending: None,
             open_bus: 0,
+            core_bus: 0,
             faults: 0,
             last_fault: 0,
             debt: 0,
@@ -392,9 +402,10 @@ impl<'a> Exec<'a> {
                 Arbitration::Steal(byte) => {
                     held = true;
                     self.stolen_cycle();
-                    // Somebody else drove the wires, and the core's latch is
-                    // the wires: the next read of an address nothing decodes
-                    // answers with the byte the DMA left behind.
+                    // Somebody else drove the wires, and the core's *external*
+                    // latch is the wires: the next read of an address nothing
+                    // decodes answers with the byte the DMA left behind. The
+                    // core's own bus is inside the pins and does not move.
                     self.state.open_bus = byte;
                 }
             }
@@ -419,13 +430,20 @@ impl<'a> Exec<'a> {
     /// open-bus read still sees the byte from before it (NESdev wiki, "APU").
     fn cycle_read(&mut self, addr: u16) -> u8 {
         self.begin_cycle();
-        let attrs = self.attrs.with_bus(self.state.open_bus);
+        let attrs = self
+            .attrs
+            .with_bus(self.state.open_bus)
+            .with_core_bus(self.state.core_bus);
         match self.space.read_driven(u64::from(addr), Width::U8, attrs) {
             Ok((v, driven)) => {
                 let byte = v as u8;
                 if driven {
                     self.state.open_bus = byte;
                 }
+                // The core's own bus follows every read it makes, driven or
+                // not: the byte reached the accumulator, so it was on the wires
+                // inside the chip whatever the pins were doing.
+                self.state.core_bus = byte;
                 byte
             }
             Err(_) => {
@@ -433,6 +451,7 @@ impl<'a> Exec<'a> {
                 // is open bus — and the fault counter is how anyone finds out.
                 self.state.faults = self.state.faults.wrapping_add(1);
                 self.state.last_fault = addr;
+                self.state.core_bus = self.state.open_bus;
                 self.state.open_bus
             }
         }
@@ -460,7 +479,8 @@ impl<'a> Exec<'a> {
     fn write(&mut self, addr: u16, value: u8) {
         self.begin_cycle();
         self.state.open_bus = value;
-        let attrs = self.attrs.with_bus(value);
+        self.state.core_bus = value;
+        let attrs = self.attrs.with_bus(value).with_core_bus(value);
         if self
             .space
             .write(u64::from(addr), Width::U8, u64::from(value), attrs)

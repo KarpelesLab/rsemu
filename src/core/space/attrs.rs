@@ -78,6 +78,19 @@ pub struct MemAttrs {
     /// a DMA cycle updates the one that drove it. A master with no such latch
     /// leaves it zero, which is what a bus with a pull-down does.
     pub bus: u8,
+    /// The last byte on the master's **own, on-die** data bus.
+    ///
+    /// Usually the same byte as [`MemAttrs::bus`], and deliberately not always.
+    /// A master with registers on its own die has two buses: the pins, and the
+    /// wires inside it. A cycle *another* master ran — a DMA that stole the bus
+    /// — moves the pins and not the inside; a read of an on-die register moves
+    /// the inside and not the pins.
+    ///
+    /// The RP2A03 is the case that needs it. `$4015` is on the CPU's die, its
+    /// bit 5 comes from the internal bus, and AccuracyCoin's "Internal Data
+    /// Bus" test lands a DMC DMA in the middle of a `LDA $4015` to prove the
+    /// sample byte does *not* reach it.
+    pub core_bus: u8,
 }
 
 impl MemAttrs {
@@ -89,6 +102,7 @@ impl MemAttrs {
         exclusive: false,
         debug: false,
         bus: 0,
+        core_bus: 0,
     };
 
     /// A side-effect-free access, as issued by a debugger or a snapshot.
@@ -102,6 +116,7 @@ impl MemAttrs {
         exclusive: false,
         debug: true,
         bus: 0,
+        core_bus: 0,
     };
 
     /// Same attributes, from `id`.
@@ -136,6 +151,13 @@ impl MemAttrs {
     #[must_use]
     pub const fn with_bus(mut self, bus: u8) -> Self {
         self.bus = bus;
+        self
+    }
+
+    /// Same attributes, carrying `bus` as the master's own on-die bus value.
+    #[must_use]
+    pub const fn with_core_bus(mut self, bus: u8) -> Self {
+        self.core_bus = bus;
         self
     }
 

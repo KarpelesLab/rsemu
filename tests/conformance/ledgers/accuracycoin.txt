@@ -19,7 +19,7 @@
 #     they can never appear here.
 #
 # ---------------------------------------------------------------------------
-# Measured 2026-08-31 against the pinned ROM: 123 of 141 pass, 18 fail.
+# Measured 2026-08-31 against the pinned ROM: 124 of 141 pass, 17 fail.
 # ---------------------------------------------------------------------------
 #
 # The earlier "81 of 125" was measured through a stale copy of the ROM's
@@ -166,8 +166,6 @@
                   # behaviour on the pattern bus. Not modelled.
 92                # $0492 "Hybrid Addresses" code 2: the same bus, mixing a
                   # nametable and a pattern fetch. Not modelled.
-90                # $0490 "Internal Data Bus" code 1: the CPU-side open-bus data
-                  # latch. Cause (C).
 
 # ---------------------------------------------------------------------------
 # H. What is left of $045B, after the sprite page mostly closed
