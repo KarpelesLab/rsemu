@@ -3,8 +3,17 @@
 //! The subcommand surface is fixed by `ROADMAP.md` §2 so that it does not drift
 //! as components land. Commands whose machinery does not exist yet say exactly
 //! that and exit non-zero, rather than pretending to work.
+//!
+//! This is the one place in the tree that opens a file. Everything below it is
+//! `no_std`: a machine description arrives as text and a ROM image arrives as
+//! bytes bound to a named media slot, so the emulation core never learns what a
+//! path is (`CLAUDE.md`, and [`MediaTable`](rsemu::machine::MediaTable)).
 
+use std::path::Path;
 use std::process::ExitCode;
+
+use rsemu::core::clock::GlobalTime;
+use rsemu::machine::{Machine, catalog};
 
 const USAGE: &str = "\
 rsemu — a multiplatform emulator built bottom-up on a generic framework
@@ -19,12 +28,20 @@ COMMANDS:
     describe <class>    Show a device class: properties, defaults, buses
     convert <machine>   Convert a machine file between its text and JSON forms
 
+RUN OPTIONS:
+    <machine>           A path to a .machine file, or a name from `rsemu machines`
+    --cart <file>       Bind the `cart` media slot (a NES cartridge)
+    --rom <file>        Bind the `rom` media slot
+    --disk <file>       Bind the `disk` media slot
+    --media <n>=<file>  Bind any media slot by name
+    -p <name>=<value>   Override a `param` declared in the machine file
+    --for <duration>    How much virtual time to run, as `1s`, `500ms`, `2m`
+                        (default 1s)
+    -q, --quiet         Only print the summary
+
 OPTIONS:
     -h, --help          Print this help
     -V, --version       Print version and build configuration
-
-Nothing is emulated yet — see ROADMAP.md for the phase plan. Commands that
-need machinery which does not exist report that and exit 2.
 ";
 
 fn main() -> ExitCode {
@@ -45,23 +62,15 @@ fn main() -> ExitCode {
             println!("{}", rsemu::build_info());
             ExitCode::SUCCESS
         }
-        "machines" => {
-            // A machine is a feature set, so an empty list is the correct
-            // answer for this build rather than a failure.
-            println!("no machines in this build");
-            ExitCode::SUCCESS
-        }
-        "devices" => {
-            println!("no device classes in this build");
-            ExitCode::SUCCESS
-        }
-        "run" | "describe" | "convert" => {
-            let what: &'static str = match first {
-                "run" => "running a machine (ROADMAP.md phases 1-3)",
-                "describe" => "the device registry (ROADMAP.md §4.4)",
-                _ => "the machine description language (ROADMAP.md §5)",
-            };
-            eprintln!("rsemu: {}", rsemu::Error::Unimplemented(what));
+        "machines" => machines(),
+        "devices" => devices(),
+        "describe" => describe(args.get(1).map(String::as_str)),
+        "run" => run(&args[1..]),
+        "convert" => {
+            eprintln!(
+                "rsemu: {}",
+                rsemu::Error::Unimplemented("the JSON projection (ROADMAP.md §5)")
+            );
             ExitCode::from(2)
         }
         other => {
@@ -70,4 +79,300 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// introspection
+// ---------------------------------------------------------------------------
+
+/// `rsemu machines` — the shipped catalog, filtered to what this build has.
+fn machines() -> ExitCode {
+    let machines = catalog::machines();
+    if machines.is_empty() {
+        // A machine is a feature set, so an empty catalog is a correct answer
+        // about this build rather than a failure.
+        println!("no machines in this build; rebuild with a `machine-*` feature");
+        return ExitCode::SUCCESS;
+    }
+    for entry in machines {
+        println!("{:<12} {}", entry.name, entry.summary);
+        if !entry.media.is_empty() {
+            let slots: Vec<String> = entry
+                .media
+                .iter()
+                .map(|s| format!("--{s} <file>"))
+                .collect();
+            println!("{:<12} needs {}", "", slots.join(", "));
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `rsemu devices` — every class the registry can construct.
+fn devices() -> ExitCode {
+    let registry = match catalog::registry() {
+        Ok(r) => r,
+        Err(e) => return fail(&e),
+    };
+    if registry.is_empty() {
+        println!("no device classes in this build");
+        return ExitCode::SUCCESS;
+    }
+    for class in registry.classes() {
+        println!("{:<16} {}", class.name, class.summary);
+    }
+    ExitCode::SUCCESS
+}
+
+/// `rsemu describe <class>` — one class, its version and its properties.
+fn describe(class: Option<&str>) -> ExitCode {
+    let Some(name) = class else {
+        eprintln!("rsemu: describe needs a class name; `rsemu devices` lists them");
+        return ExitCode::from(2);
+    };
+    let registry = match catalog::registry() {
+        Ok(r) => r,
+        Err(e) => return fail(&e),
+    };
+    let Some(class) = registry.get(name) else {
+        // The registry composes the "is its feature enabled?" message and the
+        // near-miss suggestion; reproducing them here would be a second copy.
+        let e = registry
+            .create(name, &rsemu::core::props::Props::new())
+            .expect_err("a class that is not there cannot construct");
+        return fail(&e);
+    };
+    println!("{} (v{})", class.name, class.version);
+    println!("  {}", class.summary);
+    if class.properties.is_empty() {
+        println!("  no properties");
+        return ExitCode::SUCCESS;
+    }
+    println!("  properties:");
+    for p in class.properties {
+        println!(
+            "    {:<10} {:<10} {:<9} {}",
+            p.name,
+            p.kind.as_str(),
+            if p.required { "required" } else { "optional" },
+            p.summary
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// run
+// ---------------------------------------------------------------------------
+
+/// Everything `rsemu run` was told.
+struct RunArgs {
+    machine: String,
+    /// Media slot to file path, in the order they were given.
+    media: Vec<(String, String)>,
+    params: Vec<(String, String)>,
+    span: GlobalTime,
+    quiet: bool,
+}
+
+fn run(args: &[String]) -> ExitCode {
+    let parsed = match parse_run(args) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("rsemu: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // Read every image before building anything, so a typo'd path fails before
+    // a machine is half assembled.
+    let mut images: Vec<(String, Vec<u8>)> = Vec::new();
+    for (slot, path) in &parsed.media {
+        match std::fs::read(path) {
+            Ok(bytes) => images.push((slot.clone(), bytes)),
+            Err(e) => {
+                eprintln!("rsemu: cannot read {path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // A path wins over a catalog name, so a user editing a copy of a shipped
+    // file gets their copy.
+    let (name, source) = match load_description(&parsed.machine) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("rsemu: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let mut options = match catalog::build_options() {
+        Ok(o) => o,
+        Err(e) => return fail(&e),
+    };
+    for (slot, bytes) in &images {
+        options
+            .realize
+            .media
+            .insert(slot.as_str(), bytes.as_slice());
+    }
+    for (key, value) in &parsed.params {
+        options = options.with_param(key.clone(), value.clone());
+    }
+
+    let registry = match catalog::registry() {
+        Ok(r) => r,
+        Err(e) => return fail(&e),
+    };
+    let mut machine = match rsemu::machine::build(&name, &source, &registry, &options) {
+        Ok(m) => m,
+        // Front-end failures already carry `file:line:col` and a caret; realize
+        // failures name the instance. Either way `{e}` is the whole report.
+        Err(e) => return fail(&e),
+    };
+
+    if !parsed.quiet {
+        describe_machine(&machine);
+    }
+    if let Err(e) = machine.run_for(parsed.span) {
+        eprintln!("rsemu: {e}");
+        summarise(&machine);
+        return ExitCode::FAILURE;
+    }
+    summarise(&machine);
+    ExitCode::SUCCESS
+}
+
+/// A machine description by path, or by catalog name.
+fn load_description(what: &str) -> Result<(String, String), String> {
+    let path = Path::new(what);
+    if path.is_file() {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {what}: {e}"))?;
+        return Ok((what.to_string(), text));
+    }
+    if let Some(entry) = catalog::machine(what) {
+        return Ok((entry.name.to_string(), entry.source.to_string()));
+    }
+    // A name that looks like a path deserves the filesystem's complaint rather
+    // than "not in the catalog", which would send the reader the wrong way.
+    if what.contains('/') || what.ends_with(".machine") {
+        return Err(format!("no such machine file: {what}"));
+    }
+    Err(format!(
+        "no machine named `{what}`; `rsemu machines` lists this build's catalog"
+    ))
+}
+
+fn parse_run(args: &[String]) -> Result<RunArgs, String> {
+    let mut out = RunArgs {
+        machine: String::new(),
+        media: Vec::new(),
+        params: Vec::new(),
+        // One second of virtual time: long enough to prove a machine runs,
+        // short enough that a broken one does not hang a terminal. There is no
+        // "until the user quits" yet — that needs the host window (phase 3).
+        span: GlobalTime::from_nanos(1_000_000_000),
+        quiet: false,
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let mut value = |name: &str| -> Result<String, String> {
+            i += 1;
+            args.get(i)
+                .cloned()
+                .ok_or_else(|| format!("{name} needs a value"))
+        };
+        match arg {
+            "--cart" | "--rom" | "--disk" => {
+                let slot = arg.trim_start_matches('-').to_string();
+                let path = value(arg)?;
+                out.media.push((slot, path));
+            }
+            "--media" => {
+                let spec = value(arg)?;
+                let (slot, path) = spec
+                    .split_once('=')
+                    .ok_or_else(|| format!("--media wants <name>=<file>, got `{spec}`"))?;
+                out.media.push((slot.to_string(), path.to_string()));
+            }
+            "-p" | "--param" => {
+                let spec = value(arg)?;
+                let (key, val) = spec
+                    .split_once('=')
+                    .ok_or_else(|| format!("-p wants <name>=<value>, got `{spec}`"))?;
+                out.params.push((key.to_string(), val.to_string()));
+            }
+            "--for" => {
+                let text = value(arg)?;
+                let d = rsemu::core::props::parse_duration(&text)
+                    .map_err(|e| format!("--for {text}: {e}"))?;
+                // The timeline is in 2^-64-second units and durations are in
+                // picoseconds; nanoseconds is the unit both agree on.
+                out.span = GlobalTime::from_nanos(d.as_picos() / 1_000);
+            }
+            "-q" | "--quiet" => out.quiet = true,
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option `{other}`"));
+            }
+            other => {
+                if !out.machine.is_empty() {
+                    return Err(format!("`{other}`: only one machine at a time"));
+                }
+                out.machine = other.to_string();
+            }
+        }
+        i += 1;
+    }
+    if out.machine.is_empty() {
+        return Err(String::from(
+            "run needs a machine; `rsemu machines` lists this build's catalog",
+        ));
+    }
+    Ok(out)
+}
+
+/// What was assembled, before it starts running.
+fn describe_machine(machine: &Machine) {
+    println!("machine \"{}\"", machine.name());
+    for space in machine.spaces() {
+        println!("  space  {:<8} {} bits", space.name(), space.space().bits());
+    }
+    for device in machine.devices() {
+        let clock = match device.domain() {
+            Some(_) => "clocked",
+            None => "",
+        };
+        println!(
+            "  object {:<8} {:<16} {clock}",
+            device.path(),
+            device.class().name
+        );
+    }
+}
+
+/// Where the machine got to.
+fn summarise(machine: &Machine) {
+    println!("ran to {} ns of virtual time", machine.now().as_nanos());
+    for device in machine.devices() {
+        let Some(domain) = device.domain() else {
+            continue;
+        };
+        if let Ok(ticks) = machine.clocks().ticks(domain) {
+            println!("  {:<8} {ticks} ticks", device.path());
+        }
+    }
+    match machine.state_hash() {
+        // The regression method of §0 in one number: run deterministically for
+        // N virtual units and compare this.
+        Ok(hash) => println!("state hash {hash:#018x}"),
+        Err(e) => eprintln!("rsemu: cannot hash state: {e}"),
+    }
+}
+
+/// Print an error the way §5 promises and exit non-zero.
+fn fail(e: &rsemu::Error) -> ExitCode {
+    eprintln!("rsemu: {e}");
+    ExitCode::FAILURE
 }

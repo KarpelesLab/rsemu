@@ -44,11 +44,12 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::core::device::{Device, DeviceClass, RealizeCtx, ResetKind};
+use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
 use crate::core::error::{Error, Result};
-use crate::core::props::Props;
+use crate::core::props::{Props, ValueKind};
 use crate::core::space::{AddressSpace, Mapping, MappingId, RamStore, Region, RegionRef, RomWrite};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
+use crate::machine::realize::Instance;
 
 use super::ines::{Cartridge, Chr};
 
@@ -120,6 +121,8 @@ pub struct Nrom {
     /// The extra 2 KiB a four-screen board carries. Cartridge state, unlike
     /// CIRAM.
     vram: Option<Arc<RamStore>>,
+    /// That same VRAM as a mappable region, so a machine file can place it.
+    vram_region: Option<RegionRef>,
 }
 
 impl Nrom {
@@ -188,13 +191,48 @@ impl Nrom {
             None
         };
 
+        let vram_region = vram
+            .as_ref()
+            .map(|v| Arc::new(Region::ram("nes.nrom.vram", Arc::clone(v))) as RegionRef);
+
         Ok(Nrom {
             cart,
             prg_window,
             chr_window,
             work_ram_window,
             vram,
+            vram_region,
         })
+    }
+
+    /// Build the board from an iNES or NES 2.0 image.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Cartridge::from_ines`] rejects, plus everything
+    /// [`Nrom::new`] does.
+    pub fn from_image(bytes: &[u8]) -> Result<Nrom> {
+        Nrom::new(Cartridge::from_ines(bytes)?)
+    }
+
+    /// Build the board from machine-description properties.
+    ///
+    /// The image arrives as the `rom` property, which a machine file writes as
+    /// the *name* of a media slot (`rom = "cart"`) and the realizer replaces
+    /// with the bytes bound to that slot — see
+    /// [`MediaTable`](crate::machine::MediaTable). A caller assembling `Props`
+    /// itself puts a [`Value::Media`](crate::core::props::Value::Media) there
+    /// directly.
+    ///
+    /// # Errors
+    ///
+    /// If `rom` is missing or unbound, if the image does not parse, or if the
+    /// cartridge is not something an NROM board could be.
+    pub fn from_props(props: &Props) -> Result<Nrom> {
+        let mut r = props.reader();
+        let image = r.require_media("rom")?.to_bytes();
+        r.finish()?;
+        Nrom::from_image(&image)
     }
 
     /// The cartridge this board holds.
@@ -413,20 +451,14 @@ pub static NROM_CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
     version: STATE_VERSION,
     summary: "NES NROM cartridge (iNES mapper 0): fixed PRG and CHR windows, no banking",
-    // No properties yet. The one this class will grow is the ROM image, and an
-    // image is bytes rather than a `Value` — it arrives through a loader in
-    // `host/`, which does not exist. Declaring a property that cannot work
-    // would be worse than declaring none.
-    properties: &[],
-    construct,
+    properties: &[PropertySpec {
+        name: "rom",
+        kind: ValueKind::Media,
+        required: true,
+        summary: "the iNES image, as the name of a media slot (`rom = \"cart\"`)",
+    }],
+    construct: |props| Ok(Box::new(Nrom::from_props(props)?)),
 };
-
-fn construct(_props: &Props) -> Result<Box<dyn Device>> {
-    Err(Error::Unimplemented(
-        "nes.nrom needs a ROM image, which no property can carry; \
-         build it with Nrom::new until the host ROM loader lands",
-    ))
-}
 
 /// Add [`NROM_CLASS`] to a registry.
 ///
@@ -446,11 +478,25 @@ impl Device for Nrom {
     }
 
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
-        // Deliberately empty. Realize is where a device maps its regions, and
-        // `RealizeCtx` cannot yet hand one its address spaces (`core::device`
-        // says so). Until it can, a machine builder calls `Nrom::install`; when
-        // it can, that call moves in here and nothing else changes.
+        // Deliberately empty. The board's windows are placed by `map`
+        // statements, which the realizer runs after every device has realized
+        // — the memory map is a statement in the machine file rather than a
+        // decision inside the cartridge (`ROADMAP.md` §5). `Nrom::install` is
+        // still there for a caller assembling a NES without the DSL.
         Ok(())
+    }
+
+    fn region(&self, name: &str) -> Option<RegionRef> {
+        // Named windows only: a cartridge has no single aperture — it decodes
+        // in two different address spaces — so `map … = cart` with no region
+        // would have to guess which one was meant.
+        match name {
+            "prg" => Some(Arc::clone(&self.prg_window)),
+            "chr" => Some(Arc::clone(&self.chr_window)),
+            "work" => self.work_ram_window.clone(),
+            "vram" => self.vram_region.clone(),
+            _ => None,
+        }
     }
 
     fn reset(&self, kind: ResetKind) {
@@ -526,9 +572,39 @@ impl Device for Nrom {
     }
 }
 
+/// The machine layer's half: NROM has no clock, no pins and no space of its
+/// own, so binding it is nothing at all.
+///
+/// The `impl` still has to exist — a class with no [`Instance`] publishes no
+/// regions to the machine graph, and `map cpubus 0x8000 = cart.prg` would be
+/// told the class publishes none.
+impl Instance for Nrom {}
+
+/// Bind [`NROM_CLASS`] into the machine graph.
+///
+/// # Errors
+///
+/// [`Error::Config`] if the class name is already bound.
+pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
+    bindings.bind(CLASS_NAME, |props| Ok(Arc::new(Nrom::from_props(props)?)))
+}
+
+/// What the validator should know about `nes.nrom`.
+#[must_use]
+pub fn schema() -> crate::machine::validate::ClassSchema {
+    use crate::machine::validate::{ClassSchema, PropSchema};
+    ClassSchema::new(CLASS_NAME)
+        .prop(PropSchema::new("rom", ValueKind::Media).required())
+        .region("prg")
+        .region("chr")
+        .region("work")
+        .region("vram")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::props::Media;
     use crate::core::space::MemAttrs;
     use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
     use crate::core::value::Width;
@@ -841,9 +917,43 @@ mod tests {
     }
 
     #[test]
-    fn construction_from_properties_says_why_it_cannot() {
-        let err = (NROM_CLASS.construct)(&Props::new()).expect_err("needs an image");
-        assert!(matches!(err, Error::Unimplemented(_)), "{err}");
+    fn construction_needs_a_bound_rom() {
+        // No `rom` at all: the message has to say how to supply one, because
+        // "missing required property" alone does not tell you that a media
+        // slot is a thing.
+        let err = (NROM_CLASS.construct)(&Props::new())
+            .expect_err("needs an image")
+            .to_string();
+        assert!(err.contains("rom") && err.contains("media"), "{err}");
+
+        // A bare string is a slot name nothing was bound to. Realize
+        // substitutes bound slots before construction, so one that survives is
+        // an unbound one and the message must say so rather than complain
+        // about a type.
+        let err = (NROM_CLASS.construct)(&Props::new().with("rom", "cart"))
+            .expect_err("nothing bound")
+            .to_string();
+        assert!(err.contains("cart"), "{err}");
+    }
+
+    #[test]
+    fn a_bound_image_constructs_the_board() {
+        let bytes: Arc<[u8]> = image(2, 1, 0).into();
+        let props = Props::new().with("rom", Media::new("cart", bytes));
+        let device = (NROM_CLASS.construct)(&props).expect("a real image");
+        assert_eq!(device.class().name, CLASS_NAME);
+        // And the regions a `map` statement names are there.
+        assert_eq!(device.region("prg").expect("prg").len(), PRG_WINDOW);
+        assert_eq!(device.region("chr").expect("chr").len(), CHR_WINDOW);
+        assert!(device.region("").is_none(), "no single aperture");
+        assert!(device.region("nonesuch").is_none());
+    }
+
+    #[test]
+    fn a_truncated_image_is_refused_by_name() {
+        let bytes: Arc<[u8]> = alloc::vec![0u8; 8].into();
+        let props = Props::new().with("rom", Media::new("cart", bytes));
+        assert!((NROM_CLASS.construct)(&props).is_err(), "eight bytes");
     }
 
     #[test]

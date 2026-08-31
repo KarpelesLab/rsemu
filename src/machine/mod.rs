@@ -17,6 +17,8 @@
 //!
 //! | Module | Role |
 //! | --- | --- |
+//! | [`builtin`] | the classes the language ships with: `ram` |
+//! | [`catalog`] | what this build can emulate: classes, bindings, machines |
 //! | [`span`] | byte-offset spans, and mapping them to `file:line:col` |
 //! | [`diag`] | one precise error, rendered with the line and a caret |
 //! | [`lexer`] | hand-written tokenizer, no generator and no regex |
@@ -73,6 +75,8 @@
 //! ```
 
 pub mod ast;
+pub mod builtin;
+pub mod catalog;
 pub mod diag;
 pub mod lexer;
 // `machine::machine` reads oddly, but the type it holds is `Machine` and the
@@ -96,7 +100,7 @@ pub use crate::machine::machine::Machine;
 pub use crate::machine::parser::parse;
 pub use crate::machine::rational::Rational;
 pub use crate::machine::realize::{
-    BindCtx, Bindings, Instance, RealizeOptions, SinkPin, realize, realize_with,
+    BindCtx, Bindings, Instance, MediaTable, RealizeOptions, SinkPin, realize, realize_with,
 };
 pub use crate::machine::resolver::{ResolveOptions, Resolved, resolve};
 pub use crate::machine::sources::{IncludeLoader, SourceMap};
@@ -175,6 +179,20 @@ impl BuildOptions {
     #[must_use]
     pub fn with_classes(mut self, classes: ClassTable) -> BuildOptions {
         self.classes = classes;
+        self
+    }
+
+    /// Bind a media slot, as `rsemu run … --cart smb.nes` would.
+    ///
+    /// The bytes reach whichever object's machine file names the slot; see
+    /// [`MediaTable`].
+    #[must_use]
+    pub fn with_media(
+        mut self,
+        slot: impl Into<alloc::string::String>,
+        bytes: impl Into<alloc::sync::Arc<[u8]>>,
+    ) -> BuildOptions {
+        self.realize.media.insert(slot, bytes);
         self
     }
 

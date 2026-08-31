@@ -22,10 +22,12 @@
 //! | `state` | versioned snapshots (§4.5) |
 //! | `sync` | the concurrency portability seam (§4.7) |
 //!
-//! Every module listed above now exists. What remains before a machine can be
-//! assembled is the layer that owns the pieces together — spaces, the clock
-//! forest, wires and devices in one object — which is where [`device::RealizeCtx`]
-//! grows the accessors realize needs.
+//! Every module listed above now exists, and [`machine`](crate::machine)
+//! assembles them into a running [`Machine`](crate::machine::Machine). The
+//! seam still open is [`device::RealizeCtx`]: it carries a path, a requester id
+//! and a deferred queue, but not the address spaces, clock domains and wires a
+//! device needs, so the machine layer hands those over afterwards through its
+//! own `Instance::bind`.
 
 pub mod clock;
 pub mod device;

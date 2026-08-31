@@ -716,6 +716,16 @@ fn check_kind(value: &Value, kind: ValueKind, name: &str) -> Result<(), String> 
         ValueKind::List => value.to_list(name).map(|_| ()),
         ValueKind::Map => value.to_map(name).map(|_| ()),
         ValueKind::Link => value.to_link(name).map(|_| ()),
+        // A media property is written as the *name* of a slot, and realize
+        // substitutes the bound bytes long after this runs — so a string is
+        // exactly what a well-formed file has here.
+        ValueKind::Media => match value {
+            Value::Str(_) | Value::Media(_) => Ok(()),
+            other => Err(crate::core::Error::Property(format!(
+                "property `{name}`: expected the name of a media slot, found {} {other}",
+                other.kind()
+            ))),
+        },
     };
     outcome.map_err(|e| e.to_string())
 }

@@ -95,7 +95,7 @@ use crate::core::clock::{ClockForest, DomainId, Rational as ClockRational};
 pub use crate::core::device::SinkPin;
 use crate::core::device::{Deferred, Device, DeviceClass, RealizeCtx, ResetKind};
 use crate::core::error::{Error, Result};
-use crate::core::props::Props;
+use crate::core::props::{Media, Props, Value, ValueKind};
 use crate::core::registry::Registry;
 use crate::core::sched::{Scheduler, SchedulerConfig};
 use crate::core::space::{
@@ -263,6 +263,83 @@ impl Bindings {
     }
 }
 
+// ---------------------------------------------------------------------------
+// media
+// ---------------------------------------------------------------------------
+
+/// The blobs bound to a machine's media slots: ROM images, disk images,
+/// firmware.
+///
+/// # How media reaches a device
+///
+/// A device needs bytes, and nothing below `host/` may open a file — the core
+/// is `no_std` and `CLAUDE.md` gives file access to the caller. So the loop is
+/// closed by *name*:
+///
+/// ```text
+/// machine file:  object cart "nes.nrom" { rom = "cart" }   # names a slot
+/// caller:        rsemu run nes.machine --cart smb.nes      # binds the slot
+/// realize:       rom = "cart"  ──►  Value::Media(40976 bytes)
+/// device:        r.require_media("rom")?                   # sees only bytes
+/// ```
+///
+/// The substitution happens before `construct`, so two-phase construction is
+/// untouched: `new(props)` still validates and allocates everything, including
+/// parsing the image, and nothing observable happens until realize. A class
+/// opts in by declaring a [`PropertySpec`](crate::core::PropertySpec) of kind
+/// [`ValueKind::Media`]; the realizer looks at nothing else.
+///
+/// A slot nothing is bound to is an error naming the slot, not a device that
+/// quietly comes up empty.
+#[derive(Debug, Clone, Default)]
+pub struct MediaTable {
+    entries: BTreeMap<String, Media>,
+}
+
+impl MediaTable {
+    /// No media bound.
+    pub fn new() -> MediaTable {
+        MediaTable::default()
+    }
+
+    /// Bind `slot` to `bytes`, replacing anything already there.
+    ///
+    /// Replacing rather than refusing: a caller that passes `--cart` twice
+    /// means the second one, the way every other command-line option works.
+    pub fn insert(&mut self, slot: impl Into<String>, bytes: impl Into<Arc<[u8]>>) {
+        let slot = slot.into();
+        let media = Media::new(slot.clone(), bytes);
+        self.entries.insert(slot, media);
+    }
+
+    /// Builder form of [`MediaTable::insert`].
+    #[must_use]
+    pub fn with(mut self, slot: impl Into<String>, bytes: impl Into<Arc<[u8]>>) -> MediaTable {
+        self.insert(slot, bytes);
+        self
+    }
+
+    /// What is bound to `slot`.
+    pub fn get(&self, slot: &str) -> Option<&Media> {
+        self.entries.get(slot)
+    }
+
+    /// Every bound slot, in name order.
+    pub fn slots(&self) -> impl Iterator<Item = &str> + '_ {
+        self.entries.keys().map(String::as_str)
+    }
+
+    /// How many slots are bound.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether nothing is bound.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 /// What realize needs beyond the description itself.
 #[derive(Debug, Clone, Default)]
 pub struct RealizeOptions {
@@ -272,12 +349,22 @@ pub struct RealizeOptions {
     /// machine property, and when the DSL grows a statement for it this is
     /// where it lands.
     pub scheduler: SchedulerConfig,
+    /// The bytes bound to the machine's media slots. See [`MediaTable`].
+    pub media: MediaTable,
 }
 
 impl RealizeOptions {
-    /// Defaults: deterministic threading, unbounded rate, a 1 ms quantum.
+    /// Defaults: deterministic threading, unbounded rate, a 1 ms quantum, and
+    /// no media bound.
     pub fn new() -> RealizeOptions {
         RealizeOptions::default()
+    }
+
+    /// Bind a media slot, as `rsemu run … --cart smb.nes` does.
+    #[must_use]
+    pub fn with_media(mut self, slot: impl Into<String>, bytes: impl Into<Arc<[u8]>>) -> Self {
+        self.media.insert(slot, bytes);
+        self
     }
 }
 
@@ -560,16 +647,21 @@ impl<'a> Realizer<'a> {
             // Requester ids are 1-based: `RequesterId::ANONYMOUS` is 0 and
             // means "nobody in particular", which no device is.
             let requester = RequesterId(u32::try_from(i + 1).unwrap_or(u32::MAX));
+            // Media slots become bytes here, before construction, so a device
+            // is fully built by `new(props)` (§4.4) and never has to reach out
+            // for its own image.
+            let bound = self.bind_media(object, class)?;
+            let props = bound.as_ref().unwrap_or(&object.props);
             let (device, instance) = match self.bindings.get(&object.class) {
                 Some(ctor) => {
-                    let instance = ctor(&object.props)?;
+                    let instance = ctor(props)?;
                     check_class(&object.name, class.name, instance.class().name)?;
                     let device: Arc<dyn Device> = instance.clone();
                     (device, Some(instance))
                 }
                 None => {
                     let device: Arc<dyn Device> =
-                        Arc::from(self.registry.create(&object.class, &object.props)?);
+                        Arc::from(self.registry.create(&object.class, props)?);
                     check_class(&object.name, class.name, device.class().name)?;
                     (device, None)
                 }
@@ -586,6 +678,55 @@ impl<'a> Realizer<'a> {
             });
         }
         Ok(())
+    }
+
+    /// Substitute bound bytes for every media slot `object` names.
+    ///
+    /// Returns `None` when the object has no media property at all, which is
+    /// every object in most machines — the common path clones nothing.
+    fn bind_media(
+        &self,
+        object: &crate::machine::resolver::Object,
+        class: &'static DeviceClass,
+    ) -> Result<Option<Props>> {
+        let mut out: Option<Props> = None;
+        for spec in class
+            .properties
+            .iter()
+            .filter(|p| p.kind == ValueKind::Media)
+        {
+            let slot = match object.props.get(spec.name) {
+                // Already bytes: a caller built the `Props` itself, which is
+                // how a test or an embedder skips the slot dance entirely.
+                None | Some(Value::Media(_)) => continue,
+                Some(Value::Str(slot)) => slot,
+                Some(other) => {
+                    return Err(config(
+                        object.name.clone(),
+                        format!(
+                            "`{}` takes the name of a media slot, not {} {other}",
+                            spec.name,
+                            other.kind()
+                        ),
+                    ));
+                }
+            };
+            let media = self.options.media.get(slot).ok_or_else(|| {
+                let bound: Vec<&str> = self.options.media.slots().collect();
+                config(
+                    object.name.clone(),
+                    format!(
+                        "`{}` names the media slot `{slot}`, which nothing is bound to; bound \
+                         slots are {}",
+                        spec.name,
+                        list(&bound)
+                    ),
+                )
+            })?;
+            out.get_or_insert_with(|| object.props.clone())
+                .insert(spec.name, Value::Media(media.clone()));
+        }
+        Ok(out)
     }
 
     fn realize_devices(&mut self) -> Result<()> {
@@ -1651,6 +1792,61 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // test.cart — a class whose whole configuration is host-supplied bytes
+    // -----------------------------------------------------------------
+
+    /// A device that exists only to have a media property.
+    ///
+    /// It publishes the bound bytes as a read-only region, which is what a
+    /// cartridge or a firmware ROM does and is the only way a test can prove
+    /// the *right* bytes arrived rather than merely some.
+    #[derive(Debug)]
+    struct Cart {
+        region: RegionRef,
+    }
+
+    impl Cart {
+        fn new(props: &Props) -> Result<Cart> {
+            let mut r = props.reader();
+            let image = r.require_media("image")?;
+            r.finish()?;
+            let store = Arc::new(RamStore::new(image.len()));
+            store.write_at(0, image.bytes())?;
+            Ok(Cart {
+                region: Arc::new(Region::ram("cart.image", store)),
+            })
+        }
+    }
+
+    impl Device for Cart {
+        fn class(&self) -> &'static DeviceClass {
+            &CART_CLASS
+        }
+        fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
+            Ok(())
+        }
+        fn reset(&self, _kind: ResetKind) {}
+        fn region(&self, name: &str) -> Option<RegionRef> {
+            name.is_empty().then(|| Arc::clone(&self.region))
+        }
+    }
+
+    impl Instance for Cart {}
+
+    static CART_CLASS: DeviceClass = DeviceClass {
+        name: "test.cart",
+        version: 1,
+        summary: "test-only device configured entirely by host-supplied bytes",
+        properties: &[PropertySpec {
+            name: "image",
+            kind: ValueKind::Media,
+            required: true,
+            summary: "the image, as the name of a media slot",
+        }],
+        construct: |props| Ok(Box::new(Cart::new(props)?)),
+    };
+
+    // -----------------------------------------------------------------
     // test.witness / test.explode — the failed-realize path
     // -----------------------------------------------------------------
 
@@ -1720,6 +1916,7 @@ mod tests {
             &TIMER_CLASS,
             &NOT_CLASS,
             &CPU_CLASS,
+            &CART_CLASS,
             &WITNESS_CLASS,
             &EXPLODE_CLASS,
         ] {
@@ -1734,6 +1931,7 @@ mod tests {
             .with("test.timer", make_timer)
             .with("test.not", make_not)
             .with("test.cpu", make_cpu)
+            .with("test.cart", |props| Ok(Arc::new(Cart::new(props)?)))
             .with("test.witness", |_props| Ok(Arc::new(Witness)))
             .with("test.explode", |_props| Ok(Arc::new(Explode)))
     }
@@ -1796,6 +1994,88 @@ machine "toy" {
     // -----------------------------------------------------------------
     // tests
     // -----------------------------------------------------------------
+
+    /// The media dance in one file: a slot named in the description, bytes
+    /// bound by the caller, and a region a `map` statement can place.
+    const WITH_MEDIA: &str = r#"
+machine "handheld" {
+  space bus { width = 16, unassigned = read-as-ones }
+  object cart "test.cart" { image = "rom" }
+  map bus 0x8000 size 4 = cart
+}
+"#;
+
+    fn build_with_media(source: &str, media: MediaTable) -> Result<Machine> {
+        let mut options = BuildOptions::new().with_bindings(bindings());
+        options.realize.media = media;
+        build("handheld.machine", source, &registry(), &options)
+    }
+
+    #[test]
+    fn bound_media_reaches_the_device_as_bytes() {
+        let image: &[u8] = &[0xde, 0xad, 0xbe, 0xef];
+        let machine = build_with_media(WITH_MEDIA, MediaTable::new().with("rom", image))
+            .expect("a bound slot");
+        // Read back through the bus: the bytes travelled from the caller,
+        // through the property system, into a region, into the memory map.
+        let space = machine.space("bus").expect("bus");
+        for (i, want) in image.iter().enumerate() {
+            let got = space
+                .read(0x8000 + i as u64, Width::U8, MemAttrs::DEFAULT)
+                .expect("mapped");
+            assert_eq!(got, u64::from(*want), "byte {i}");
+        }
+    }
+
+    #[test]
+    fn an_unbound_media_slot_names_itself_and_what_is_bound() {
+        // The failure a user actually hits: they forgot `--cart`. The message
+        // has to name the slot the file asked for *and* what was bound, or the
+        // reader cannot tell a typo from an omission.
+        let e = build_with_media(WITH_MEDIA, MediaTable::new())
+            .expect_err("nothing bound")
+            .to_string();
+        assert!(e.contains("rom"), "{e}");
+        assert!(e.contains("cart"), "{e}");
+
+        let e = build_with_media(WITH_MEDIA, MediaTable::new().with("disk", &[0u8][..]))
+            .expect_err("the wrong slot")
+            .to_string();
+        assert!(e.contains("`disk`"), "{e}");
+    }
+
+    #[test]
+    fn a_media_property_that_is_not_a_slot_name_is_refused() {
+        let source = r#"
+machine "handheld" {
+  space bus { width = 16, unassigned = read-as-ones }
+  object cart "test.cart" { image = 4096 }
+}
+"#;
+        let e = build_with_media(source, MediaTable::new().with("rom", &[0u8][..]))
+            .expect_err("a number is not a slot")
+            .to_string();
+        assert!(e.contains("image"), "{e}");
+    }
+
+    #[test]
+    fn media_bound_directly_as_a_value_skips_the_slot_dance() {
+        // An embedder assembling `Props` itself — a wasm host, a test — puts
+        // the bytes straight in, and realize leaves them alone.
+        let props = Props::new().with("image", Media::new("inline", &[1u8, 2, 3][..]));
+        let cart = Cart::new(&props).expect("bytes are bytes");
+        assert_eq!(cart.region("").expect("a region").len(), 3);
+    }
+
+    #[test]
+    fn a_class_with_no_media_property_clones_nothing() {
+        // The common path: every object in the toy machine has no media, so
+        // the substitution pass must not touch their properties at all. Proven
+        // by the toy machine building with an empty media table, which it
+        // would not if an absent slot were an error.
+        let machine = toy();
+        assert_eq!(machine.devices().len(), 4);
+    }
 
     #[test]
     fn a_machine_is_built_from_source_text() {

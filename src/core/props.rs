@@ -68,6 +68,7 @@
 use alloc::borrow::ToOwned;
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 use core::ops::RangeInclusive;
@@ -194,6 +195,77 @@ impl fmt::Display for Duration {
 }
 
 // ---------------------------------------------------------------------------
+// Media
+// ---------------------------------------------------------------------------
+
+/// A blob of host-supplied media: a ROM image, a disk image, a firmware blob.
+///
+/// # Why media is a property and not a file name
+///
+/// A device needs the *bytes*, and nothing below `host/` may open a file
+/// (`CLAUDE.md`: the caller owns file access, and `no_std` has no filesystem to
+/// open one with). So a machine description names a **media slot** — a string
+/// like `rom = "cart"` — and whoever realizes the machine binds that slot to
+/// bytes it obtained however it likes: `rsemu run nes.machine --cart smb.nes`,
+/// a wasm embedder handing over an `ArrayBuffer`, a test with a `const`.
+/// Realize substitutes the bound blob for the slot name before the device is
+/// constructed, so a device sees only [`Value::Media`] and never a path.
+///
+/// The bytes are behind an `Arc<[u8]>`, so cloning a `Value` holding a 4 MiB
+/// ROM is a refcount bump; [`Debug`](fmt::Debug) prints the name and the length
+/// rather than the contents, because a 40 KiB hex dump in an error message
+/// helps nobody.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Media {
+    name: String,
+    bytes: Arc<[u8]>,
+}
+
+impl Media {
+    /// Media named `name`, holding `bytes`.
+    pub fn new(name: impl Into<String>, bytes: impl Into<Arc<[u8]>>) -> Media {
+        Media {
+            name: name.into(),
+            bytes: bytes.into(),
+        }
+    }
+
+    /// The slot name this blob was bound to, for error messages.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// A cheap clone of the byte handle.
+    pub fn to_bytes(&self) -> Arc<[u8]> {
+        Arc::clone(&self.bytes)
+    }
+
+    /// How many bytes there are.
+    pub fn len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    /// Whether the blob is empty — usually a truncated download.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+impl fmt::Debug for Media {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Media")
+            .field("name", &self.name)
+            .field("len", &self.bytes.len())
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Link
 // ---------------------------------------------------------------------------
 
@@ -288,6 +360,8 @@ pub enum ValueKind {
     Map,
     /// A reference to another object by path.
     Link,
+    /// Host-supplied bytes, named in the file and bound at realize time.
+    Media,
 }
 
 impl ValueKind {
@@ -304,6 +378,7 @@ impl ValueKind {
             ValueKind::List => "list",
             ValueKind::Map => "map",
             ValueKind::Link => "link",
+            ValueKind::Media => "media",
         }
     }
 }
@@ -344,6 +419,11 @@ pub enum Value {
     Map(Props),
     /// A reference to another object, as in `space = cpubus`.
     Link(Link),
+    /// Host-supplied bytes bound to the slot a property named — see [`Media`].
+    ///
+    /// The only variant a machine file cannot write directly: it says
+    /// `rom = "cart"` and realize substitutes the bytes bound to `cart`.
+    Media(Media),
 }
 
 impl Value {
@@ -360,6 +440,7 @@ impl Value {
             Value::List(_) => ValueKind::List,
             Value::Map(_) => ValueKind::Map,
             Value::Link(_) => ValueKind::Link,
+            Value::Media(_) => ValueKind::Media,
         }
     }
 
@@ -449,6 +530,14 @@ impl Value {
     pub fn as_link(&self) -> Option<&Link> {
         match self {
             Value::Link(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    /// The bound media, if this is some.
+    pub fn as_media(&self) -> Option<&Media> {
+        match self {
+            Value::Media(m) => Some(m),
             _ => None,
         }
     }
@@ -547,6 +636,24 @@ impl Value {
             .ok_or_else(|| type_error(prop, ValueKind::Link, self))
     }
 
+    /// Extracts bound media, naming `prop` in the error.
+    ///
+    /// A [`Value::Str`] here means the machine file named a media slot that
+    /// nothing was bound to — realize substitutes bound slots before a device
+    /// is constructed, so a surviving string is an unbound one.
+    pub fn to_media(&self, prop: &str) -> Result<&Media> {
+        match self {
+            Value::Media(m) => Ok(m),
+            Value::Str(slot) => Err(type_error_hint(
+                prop,
+                ValueKind::Media,
+                self,
+                &format!("nothing is bound to the media slot `{slot}`"),
+            )),
+            _ => Err(type_error(prop, ValueKind::Media, self)),
+        }
+    }
+
     /// Guesses the kind of a scalar written as text.
     ///
     /// For `rsemu run nes.machine -p ram=4M`, where there is no declaration to
@@ -611,6 +718,9 @@ impl fmt::Display for Value {
                 f.write_str(" }")
             }
             Value::Link(l) => write!(f, "{l}"),
+            // Not the file's own spelling — there is none — so it says what is
+            // actually there, which is what a reader needs to see.
+            Value::Media(m) => write!(f, "media `{}` ({} bytes)", m.name(), m.len()),
         }
     }
 }
@@ -675,6 +785,12 @@ impl From<Duration> for Value {
 impl From<Link> for Value {
     fn from(l: Link) -> Value {
         Value::Link(l)
+    }
+}
+
+impl From<Media> for Value {
+    fn from(m: Media) -> Value {
+        Value::Media(m)
     }
 }
 
@@ -1178,6 +1294,13 @@ impl FromValue for Link {
     }
 }
 
+impl FromValue for Media {
+    const EXPECTED: &'static str = "media";
+    fn from_value(prop: &str, value: &Value) -> Result<Self> {
+        value.to_media(prop).cloned()
+    }
+}
+
 impl FromValue for Props {
     const EXPECTED: &'static str = "map";
     fn from_value(prop: &str, value: &Value) -> Result<Self> {
@@ -1557,6 +1680,25 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// Extracts required media — a ROM image, a disk image, a firmware blob.
+    pub fn require_media(&mut self, name: &str) -> Result<&'a Media> {
+        match self.lookup(name) {
+            Some(value) => value.to_media(name),
+            None => Err(prop_err(format!(
+                "missing required property `{name}` (expected media: name a slot and bind it, \
+                 as in `{name} = \"cart\"` with `--{name} <file>`)"
+            ))),
+        }
+    }
+
+    /// Extracts media if it is set.
+    pub fn optional_media(&mut self, name: &str) -> Result<Option<&'a Media>> {
+        match self.lookup(name) {
+            Some(value) => value.to_media(name).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Extracts a required link.
     pub fn require_link(&mut self, name: &str) -> Result<&'a Link> {
         match self.lookup(name) {
@@ -1776,6 +1918,12 @@ pub fn parse_as(prop: &str, kind: ValueKind, text: &str) -> Result<Value> {
         ValueKind::Link => Link::new(text).map(Value::Link),
         ValueKind::List | ValueKind::Map => Err(prop_err(format!(
             "a {kind} cannot be written as a bare scalar"
+        ))),
+        // Text names a media *slot*, never its contents; whoever realizes the
+        // machine binds the bytes. Producing a `Value::Str` here would be a
+        // lie the device only discovers at construction.
+        ValueKind::Media => Err(prop_err(String::from(
+            "media is bound by name at realize time, not written in a file",
         ))),
     };
     value.map_err(|e| at_prop(prop, e))
@@ -2095,6 +2243,57 @@ mod tests {
         let _ = r.require_size("size").unwrap();
         let e = r.finish().unwrap_err().to_string();
         assert!(e.starts_with("unknown properties `zzz`, `aaa`"), "{e}");
+    }
+
+    // -- media --------------------------------------------------------------
+
+    #[test]
+    fn media_is_cheap_to_clone_and_says_nothing_about_its_contents() {
+        let image: &[u8] = &[0u8; 4096];
+        let media = Media::new("cart", image);
+        assert_eq!(media.name(), "cart");
+        assert_eq!(media.len(), 4096);
+        assert!(!media.is_empty());
+        // A 4 KiB hex dump in an error message helps nobody, and a ROM is
+        // measured in megabytes.
+        let shown = format!("{media:?}");
+        assert!(shown.contains("cart") && shown.contains("4096"), "{shown}");
+        assert!(shown.len() < 60, "debug output is a summary: {shown}");
+        // Display is the same promise, for the `{value}` in a property error.
+        let shown = Value::Media(media.clone()).to_string();
+        assert!(shown.contains("cart") && shown.contains("4096"), "{shown}");
+    }
+
+    #[test]
+    fn an_unbound_media_slot_is_told_apart_from_a_type_error() {
+        // A surviving string means realize found nothing bound to the slot,
+        // which is a different problem from writing `rom = 4096`.
+        let named = Props::new().with("rom", "cart");
+        let e = named.reader().require_media("rom").unwrap_err().to_string();
+        assert!(e.contains("cart"), "{e}");
+        assert!(e.contains("nothing is bound"), "{e}");
+
+        let wrong = Props::new().with("rom", 4096u64);
+        let e = wrong.reader().require_media("rom").unwrap_err().to_string();
+        assert!(e.contains("expected media"), "{e}");
+
+        // And a missing one says how to supply it, because "missing required
+        // property" alone does not tell you that a media slot is a thing.
+        let empty = Props::new();
+        let e = empty.reader().require_media("rom").unwrap_err().to_string();
+        assert!(e.contains("--rom"), "{e}");
+        assert!(empty.reader().optional_media("rom").unwrap().is_none());
+    }
+
+    #[test]
+    fn media_cannot_be_written_as_text() {
+        // `-p rom=smb.nes` must not silently produce a slot named `smb.nes`;
+        // media is bound by the caller, never parsed out of a machine file.
+        let e = parse_as("rom", ValueKind::Media, "smb.nes")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("bound by name"), "{e}");
+        assert_eq!(ValueKind::Media.as_str(), "media");
     }
 
     #[test]
