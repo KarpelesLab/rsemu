@@ -83,6 +83,10 @@ pub mod palette;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-ppu")))]
 pub mod nes;
 
+#[cfg(feature = "dev-pc-video")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-video")))]
+pub mod pc;
+
 #[cfg(feature = "display-png")]
 #[cfg_attr(docsrs, doc(cfg(feature = "display-png")))]
 pub mod png;

@@ -190,10 +190,24 @@ pub fn registry() -> Result<Registry> {
     crate::dev::riscv::register(&mut reg)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::register(&mut reg)?;
+    #[cfg(feature = "cpu-x86")]
+    crate::cpu::x86::register(&mut reg)?;
+    #[cfg(feature = "dev-pc")]
+    crate::dev::pc::register(&mut reg)?;
     Ok(reg)
 }
 
 /// Every class that takes part in the memory map and the wire graph.
+///
+/// # The x86 core is registered but not bound
+///
+/// `cpu.i8086` appears in [`registry`] and not here, which is the one asymmetry
+/// in this file. The core has a `DeviceClass` and can be constructed, but no
+/// `Instance` impl, no `bind`, no input pins and no `schema` — so a machine
+/// file cannot hand it an address space or wire an interrupt to it, and
+/// `machines/pc-at.machine` is therefore shipped as data and checked by
+/// `dev::pc`'s own tests rather than listed in [`machines`]. The direction the
+/// agreement test checks — bound implies registered — still holds.
 ///
 /// # The PPU and the APU
 ///
@@ -233,6 +247,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::riscv::bind(&mut b)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::bind(&mut b)?;
+    #[cfg(feature = "dev-pc")]
+    crate::dev::pc::bind(&mut b)?;
     Ok(b)
 }
 
@@ -267,6 +283,10 @@ pub fn classes() -> ClassTable {
     }
     #[cfg(feature = "dev-wdc")]
     for schema in crate::dev::wdc::schemas() {
+        table.insert(schema);
+    }
+    #[cfg(feature = "dev-pc")]
+    for schema in crate::dev::pc::schemas() {
         table.insert(schema);
     }
     table

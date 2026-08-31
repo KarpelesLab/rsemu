@@ -1,0 +1,764 @@
+//! Does the PC/AT board actually assemble, and does an interrupt get all the
+//! way from the timer to the processor's pin?
+//!
+//! Every chip in `src/dev/pc` has unit tests proving it works alone. This proves
+//! they fit together the way `machines/pc-at.machine` says they do — which
+//! isolated tests structurally cannot show, and which is where a memory map, an
+//! I/O map or a wire graph goes wrong.
+//!
+//! # Why there is a stub processor in here
+//!
+//! `cpu.i8086` is registered but not **bound**: the core has no `Instance` impl,
+//! no `bind`, no input pins and no `schema`, so a machine file cannot hand it an
+//! address space or wire an interrupt to it. Until that lands, the board cannot
+//! be realized with the real core — so this test supplies a processor-shaped
+//! stub under the same class name and realizes the board around it.
+//!
+//! That is not a workaround so much as a specification. [`StubCpu`] is exactly
+//! what the real core has to grow, and no more: two address spaces (memory, and
+//! the separate I/O space named by `iospace`), four input pins, an
+//! acknowledge handler on `intr`, and a runnable that consumes a budget. When
+//! the core has those, this file's stub is deleted and the same assertions run
+//! against it.
+
+// `cpu-x86` too, though nothing here executes an instruction: the class has to
+// be in the *registry* for the machine file to name it, and the stub below
+// supplies only the machine-layer half the core does not have yet.
+#![cfg(all(
+    feature = "cpu-x86",
+    feature = "dev-pc",
+    feature = "dev-pc-video",
+    feature = "dev-pc-floppy"
+))]
+
+use std::sync::Arc;
+
+use rsemu::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
+use rsemu::core::props::{Props, ValueKind};
+use rsemu::core::sched::{Budget, Consumed};
+use rsemu::core::space::{AddressSpace, MemAttrs};
+use rsemu::core::sync::{AtomicBool, AtomicU32, LockRank, Mutex, Ordering};
+use rsemu::core::value::Width;
+use rsemu::core::wire::{FanIn, IntAck, Level, Resolve, WireId, WireSink};
+use rsemu::machine::validate::{ClassSchema, PortDir, PropSchema};
+use rsemu::machine::{BindCtx, Instance, build};
+
+// ---------------------------------------------------------------------------
+// the processor-shaped hole in the middle of the board
+// ---------------------------------------------------------------------------
+
+/// One input pin of the stub, with the fan-in that makes two drivers work.
+///
+/// A20 and reset each have two drivers on this board — the keyboard controller
+/// and the chipset's fast port — so a pin that only remembered "somebody said
+/// high" would drop the line when either of them said low. That is the classic
+/// shared-line bug `FanIn` exists for, and the real core needs the same.
+#[derive(Debug)]
+struct Pin {
+    inputs: FanIn,
+    level: AtomicBool,
+    /// How many times this pin has been asserted, so a *pulse* is
+    /// distinguishable from a line that merely ended where it started.
+    edges: AtomicU32,
+}
+
+impl Pin {
+    fn new(sources: &[WireId]) -> Pin {
+        Pin {
+            inputs: FanIn::new(sources),
+            level: AtomicBool::new(false),
+            edges: AtomicU32::new(0),
+        }
+    }
+}
+
+impl WireSink for Pin {
+    fn set_level(&self, src: WireId, _line: u32, level: Level) {
+        self.inputs.set(src, level);
+        let now = self.inputs.resolve(Resolve::Or).is_high();
+        if now && !self.level.swap(now, Ordering::AcqRel) {
+            self.edges.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.level.store(now, Ordering::Release);
+        }
+    }
+}
+
+/// What the machine hands the stub when it binds it.
+#[derive(Debug, Default)]
+struct Bound {
+    memory: Option<Arc<AddressSpace>>,
+    io: Option<Arc<AddressSpace>>,
+    /// The controller that answers this pin's acknowledge cycle.
+    ack: Option<std::sync::Weak<dyn IntAck>>,
+}
+
+thread_local! {
+    /// The stub built most recently on this thread.
+    ///
+    /// There is no route from a `dyn Device` to a concrete type — `Device`
+    /// keeps `Any` out of its supertrait chain on purpose — so the handle is
+    /// taken at the one moment the concrete type exists: construction. The same
+    /// seam `host::display` uses, and for the same reason.
+    static LAST_STUB: std::cell::RefCell<Option<Arc<StubCpu>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A processor with no instruction set: pins, two address spaces, and an
+/// acknowledge cycle.
+#[derive(Debug)]
+struct StubCpu {
+    iospace: String,
+    bound: Mutex<Bound>,
+    pins: Mutex<Vec<(String, Arc<Pin>)>>,
+}
+
+impl StubCpu {
+    fn new(props: &Props) -> rsemu::Result<StubCpu> {
+        let mut r = props.reader();
+        let _model = r.or_enum("model", "8088", &["8086", "8088"])?;
+        let _engine = r.or_enum("engine", "interp", &["interp"])?;
+        let iospace = r.optional_str("iospace")?.unwrap_or("").to_string();
+        r.finish()?;
+        Ok(StubCpu {
+            iospace,
+            bound: Mutex::with_rank(LockRank::BUS, Bound::default()),
+            pins: Mutex::with_rank(LockRank::LEAF, Vec::new()),
+        })
+    }
+
+    fn pin(&self, name: &str) -> Option<Arc<Pin>> {
+        self.pins
+            .lock()
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, p)| Arc::clone(p))
+    }
+
+    fn level(&self, name: &str) -> bool {
+        self.pin(name)
+            .map(|p| p.level.load(Ordering::Acquire))
+            .unwrap_or(false)
+    }
+
+    fn edges(&self, name: &str) -> u32 {
+        self.pin(name)
+            .map(|p| p.edges.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Run the acknowledge cycle the way a real core would when it takes an
+    /// interrupt with `IF` set.
+    fn acknowledge(&self) -> Option<u32> {
+        let weak = self.bound.lock().ack.clone()?;
+        weak.upgrade().map(|ack| ack.acknowledge())
+    }
+}
+
+static STUB_CLASS: DeviceClass = DeviceClass {
+    name: "cpu.i8086",
+    version: 1,
+    summary: "a processor-shaped stub: pins and two address spaces, no instruction set",
+    properties: &[
+        PropertySpec {
+            name: "model",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "8086 or 8088",
+        },
+        PropertySpec {
+            name: "engine",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "which execution engine",
+        },
+        PropertySpec {
+            name: "iospace",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "the separate address space IN and OUT reach",
+        },
+    ],
+    construct: |props| Ok(Box::new(StubCpu::new(props)?)),
+};
+
+impl Device for StubCpu {
+    fn class(&self) -> &'static DeviceClass {
+        &STUB_CLASS
+    }
+
+    fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> rsemu::Result<()> {
+        Ok(())
+    }
+
+    fn reset(&self, _kind: ResetKind) {}
+
+    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        if !matches!(port, "intr" | "nmi" | "reset" | "a20") {
+            return None;
+        }
+        let pin = Arc::new(Pin::new(sources));
+        self.pins.lock().push((port.to_string(), Arc::clone(&pin)));
+        Some(SinkPin {
+            sink: pin as Arc<dyn WireSink>,
+            line: 0,
+        })
+    }
+
+    fn attach_int_ack(&self, port: &str, ack: std::sync::Weak<dyn IntAck>) {
+        if port == "intr" {
+            self.bound.lock().ack = Some(ack);
+        }
+    }
+
+    fn is_runnable(&self) -> bool {
+        true
+    }
+
+    fn run(&self, budget: Budget) -> Consumed {
+        // A stub executes nothing, but it must still consume its budget or the
+        // scheduler makes no progress and every other device stands still.
+        Consumed::new(budget.ticks)
+    }
+}
+
+impl Instance for StubCpu {
+    fn bind(&self, ctx: &BindCtx<'_>) -> rsemu::Result<()> {
+        let memory = ctx.space().ok_or_else(|| rsemu::Error::Config {
+            at: ctx.path().to_string(),
+            message: "a processor needs an address space to fetch from".to_string(),
+        })?;
+        let mut bound = self.bound.lock();
+        bound.memory = Some(Arc::clone(memory));
+        if !self.iospace.is_empty() {
+            let io = ctx
+                .space_named(&self.iospace)
+                .ok_or_else(|| rsemu::Error::Config {
+                    at: ctx.path().to_string(),
+                    message: format!("no address space named `{}`", self.iospace),
+                })?;
+            bound.io = Some(Arc::clone(io));
+        }
+        Ok(())
+    }
+}
+
+fn stub_schema() -> ClassSchema {
+    ClassSchema::new("cpu.i8086")
+        .prop(PropSchema::new("model", ValueKind::Str))
+        .prop(PropSchema::new("engine", ValueKind::Str))
+        .prop(PropSchema::new("iospace", ValueKind::Str))
+        .port("intr", PortDir::In)
+        .port("nmi", PortDir::In)
+        .port("reset", PortDir::In)
+        .port("a20", PortDir::In)
+}
+
+// ---------------------------------------------------------------------------
+// building the board
+// ---------------------------------------------------------------------------
+
+/// A firmware image that is not firmware: recognisable bytes, so a test can say
+/// where the socket landed without needing anything to execute.
+fn fake_bios(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// A video option ROM header, which is all a scan looks at.
+fn fake_vgabios(len: usize) -> Vec<u8> {
+    let mut v = vec![0u8; len];
+    v[0] = 0x55;
+    v[1] = 0xaa;
+    v[2] = (len / 512) as u8;
+    v
+}
+
+/// Serialises board construction.
+///
+/// Both handles a test needs — the stub processor's and the display's — are
+/// taken from process-wide tables, because `Device` has no route back to a
+/// concrete type. Those tables are documented as "build one machine at a time";
+/// `cargo test` runs test functions in parallel, so this is the "at a time".
+static BUILDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The board, its stub processor, and its display — all three taken while the
+/// construction lock is held, so two tests building at once cannot swap them.
+/// A 1.44 MB image whose every sector says which sector it is, so a transfer
+/// that lands one sector out is a failure rather than a coincidence.
+fn fake_floppy() -> Vec<u8> {
+    const SECTORS: usize = 2880;
+    let mut image = vec![0u8; SECTORS * 512];
+    for lba in 0..SECTORS {
+        let at = lba * 512;
+        image[at] = 0xa5;
+        image[at + 1] = lba as u8;
+        image[at + 2] = (lba >> 8) as u8;
+        image[at + 511] = 0x5a;
+    }
+    // The boot signature, where firmware looks for it.
+    image[510] = 0x55;
+    image[511] = 0xaa;
+    image
+}
+
+fn board_with_display() -> (
+    rsemu::machine::Machine,
+    Arc<StubCpu>,
+    rsemu::dev::pc::video::VideoScanout,
+) {
+    let guard = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
+    let machine = build_board();
+    let cpu = LAST_STUB
+        .with(|slot| slot.borrow().clone())
+        .expect("the constructor kept a handle");
+    let scanout =
+        rsemu::host::display::pc::capture::take().expect("the board has a display adapter");
+    drop(guard);
+    (machine, cpu, scanout)
+}
+
+/// The board and its stub processor, for a test with no interest in the
+/// picture.
+fn board() -> (rsemu::machine::Machine, Arc<StubCpu>) {
+    let (machine, cpu, _) = board_with_display();
+    (machine, cpu)
+}
+
+fn build_board() -> rsemu::machine::Machine {
+    let mut options = rsemu::machine::catalog::build_options().expect("this build's classes");
+    options
+        .bindings
+        .bind("cpu.i8086", |props| {
+            let cpu = Arc::new(StubCpu::new(props)?);
+            // The only moment the concrete type exists. `Device` keeps `Any`
+            // out of its supertrait chain on purpose, so there is no route back
+            // from the realized `Arc<dyn Instance>` — the same seam the NES
+            // scanout uses, and for the same reason.
+            LAST_STUB.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&cpu)));
+            Ok(cpu)
+        })
+        .expect("the core does not bind it yet — that is why this stub exists");
+    options.classes.insert(stub_schema());
+    options.realize.media.insert("bios", fake_bios(128 * 1024));
+    options
+        .realize
+        .media
+        .insert("vgabios", fake_vgabios(32 * 1024));
+    // 1.44 MB of zeroes: a formatted-looking blank, enough for the controller
+    // to infer a geometry and report a drive that is ready.
+    options.realize.media.insert("floppy", fake_floppy());
+    // Intercept the display's constructor so a test can look at the picture,
+    // exactly as `rsemu run --screenshot` does.
+    rsemu::host::display::pc::capture::clear();
+    rsemu::host::display::pc::capture::install(&mut options).expect("one display class");
+    let registry = rsemu::machine::catalog::registry().expect("this build's registry");
+    match build("pc-at.machine", rsemu::dev::pc::PC_AT, &registry, &options) {
+        Ok(m) => m,
+        Err(e) => panic!("the board does not realize: {e}"),
+    }
+}
+
+/// Read one byte of the guest's memory space.
+fn peek(m: &rsemu::machine::Machine, addr: u64) -> u64 {
+    m.space("mem")
+        .expect("the memory space")
+        .read(addr, Width::U8, MemAttrs::DEFAULT)
+        .expect("a mapped byte")
+}
+
+/// Write one byte to an I/O port, as an `OUT` would.
+fn outb(m: &rsemu::machine::Machine, port: u64, value: u8) {
+    m.space("port")
+        .expect("the I/O space")
+        .write(port, Width::U8, u64::from(value), MemAttrs::DEFAULT)
+        .expect("a decoded port");
+}
+
+/// Read one byte from an I/O port, as an `IN` would.
+fn inb(m: &rsemu::machine::Machine, port: u64) -> u8 {
+    m.space("port")
+        .expect("the I/O space")
+        .read(port, Width::U8, MemAttrs::DEFAULT)
+        .expect("a decoded port") as u8
+}
+
+// ---------------------------------------------------------------------------
+// the tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_board_realizes_with_every_chip_mapped_and_wired() {
+    let (m, _cpu) = board();
+    assert_eq!(m.name(), "pc-at");
+    for path in [
+        "cpu0", "ram_low", "ram_high", "pic1", "pic2", "pit0", "cmos", "kbc", "sysctl", "dma1",
+        "dma2", "vga", "fdc", "bios", "vgarom",
+    ] {
+        assert!(
+            m.device(path).is_some(),
+            "no `{path}` in the realized board"
+        );
+    }
+    // Two spaces, and they are genuinely separate: the 8086 family drives I/O
+    // with its own status lines, so port 0x60 is not memory address 0x60.
+    assert_eq!(m.spaces().len(), 2);
+}
+
+#[test]
+fn the_system_rom_answers_in_both_of_its_windows() {
+    // The one mapping on this board that looks like a mistake and is not: a 386
+    // fetches its first instruction from just below 4 GiB and only reaches
+    // 0xf0000 after firmware's own first far jump. Both windows are one chip.
+    let (m, _cpu) = board();
+    let image = fake_bios(128 * 1024);
+    let low = 0x000e_0000u64;
+    let high = 0x1_0000_0000u64 - 128 * 1024;
+    for offset in [0u64, 1, 0x1_0000, 128 * 1024 - 16, 128 * 1024 - 1] {
+        let expect = u64::from(image[offset as usize]);
+        assert_eq!(peek(&m, low + offset), expect, "low window at {offset:#x}");
+        assert_eq!(
+            peek(&m, high + offset),
+            expect,
+            "high window at {offset:#x}"
+        );
+    }
+    // And the reset vector itself, sixteen bytes below the top.
+    assert_eq!(peek(&m, 0xffff_fff0), peek(&m, 0x000e_0000 + 0x1_fff0));
+}
+
+#[test]
+fn the_video_option_rom_signature_is_where_a_scan_looks_for_it() {
+    // Firmware finds a video BIOS by walking 0xc0000 upward on 2 KiB boundaries
+    // looking for 0x55 0xaa. A top-aligned image would hide it.
+    let (m, _cpu) = board();
+    assert_eq!(peek(&m, 0x000c_0000), 0x55);
+    assert_eq!(peek(&m, 0x000c_0001), 0xaa);
+    assert_eq!(peek(&m, 0x000c_0002), 64, "32 KiB, in 512-byte blocks");
+}
+
+#[test]
+fn base_memory_is_writable_and_the_video_hole_is_not_ram() {
+    let (m, _cpu) = board();
+    let mem = m.space("mem").expect("the memory space");
+    mem.write(0x0004_1234, Width::U8, 0x5a, MemAttrs::DEFAULT)
+        .expect("base memory");
+    assert_eq!(peek(&m, 0x0004_1234), 0x5a);
+    // Extended memory, above the 1 MiB line.
+    mem.write(0x0020_0000, Width::U8, 0xa5, MemAttrs::DEFAULT)
+        .expect("extended memory");
+    assert_eq!(peek(&m, 0x0020_0000), 0xa5);
+    // 0xa0000 is the video hole: nothing is mapped, and an ISA bus with nothing
+    // driving it reads as ones. Firmware sizes memory by exactly this.
+    assert_eq!(peek(&m, 0x000a_0000), 0xff);
+}
+
+#[test]
+fn every_chip_answers_at_the_port_the_at_decodes_it_at() {
+    let (mut m, _cpu) = board();
+    m.reset(ResetKind::Cold);
+    // The 8042's status port: bit 2, the system flag, is clear before the
+    // self test and set after it, which is a reply only the chip can give.
+    assert_eq!(inb(&m, 0x64) & 0x04, 0, "the system flag before self test");
+    outb(&m, 0x64, 0xaa);
+    assert_eq!(inb(&m, 0x60), 0x55, "the 8042 self test");
+
+    // The RTC: seconds read back as the machine file's declared start time.
+    outb(&m, 0x70, 0x00);
+    assert_eq!(inb(&m, 0x71), 0x00, "the declared start second");
+    outb(&m, 0x70, 0x09);
+    assert_eq!(inb(&m, 0x71), 0x26, "the year, in BCD, from `time`");
+
+    // The CMOS base-memory bytes, which firmware reads before it trusts
+    // anything else.
+    outb(&m, 0x70, 0x15);
+    let lo = u32::from(inb(&m, 0x71));
+    outb(&m, 0x70, 0x16);
+    let hi = u32::from(inb(&m, 0x71));
+    assert_eq!(lo | (hi << 8), 640, "640 KiB of base memory");
+
+    // Port B's timer-2 gate reads back what was written, and port A's A20 bit
+    // reaches the processor's pin.
+    outb(&m, 0x61, 0x01);
+    assert_eq!(inb(&m, 0x61) & 0x01, 0x01);
+    outb(&m, 0x92, 0x02);
+
+    // The floppy controller. Bit 2 of the digital output register is the
+    // controller's reset, active low, so a board that has only been powered on
+    // holds it in reset — which is why every BIOS's first floppy access is a
+    // write here. Taking it out of reset makes the main status register say it
+    // is ready for a command.
+    outb(&m, 0x3f2, 0x0c);
+    assert_eq!(inb(&m, 0x3f4) & 0xc0, 0x80, "RQM set, DIO clear");
+}
+
+#[test]
+fn the_fast_a20_gate_reaches_the_processors_pin() {
+    let (mut m, cpu) = board();
+    m.reset(ResetKind::Cold);
+    m.sweep();
+    assert!(!cpu.level("a20"), "A20 is shut at power on");
+    outb(&m, 0x92, 0x02);
+    assert!(cpu.level("a20"), "port 0x92 bit 1 opens it");
+    // And the keyboard controller's path opens the same net — two drivers,
+    // wire-ORed, which is why the pin keeps a `FanIn`.
+    outb(&m, 0x92, 0x00);
+    assert!(!cpu.level("a20"));
+    outb(&m, 0x64, 0xd1);
+    outb(&m, 0x60, 0x03);
+    assert!(cpu.level("a20"), "the 8042's output port opens it too");
+}
+
+#[test]
+fn both_reset_paths_pulse_the_processors_reset_pin() {
+    // Two drivers on one net again, and the reason every PC has two ways to
+    // reboot: the keyboard controller's pulse command is the original, and the
+    // chipset's port 0x92 bit 0 is the fast one firmware uses to leave
+    // protected mode.
+    let (mut m, cpu) = board();
+    m.reset(ResetKind::Cold);
+    m.sweep();
+    let before = cpu.edges("reset");
+    outb(&m, 0x64, 0xfe);
+    assert_eq!(
+        cpu.edges("reset"),
+        before + 1,
+        "the 8042's pulse command must reach the pin"
+    );
+    assert!(!cpu.level("reset"), "and it must be a pulse, not a latch");
+    outb(&m, 0x92, 0x01);
+    assert_eq!(
+        cpu.edges("reset"),
+        before + 2,
+        "and so must the chipset's fast reset"
+    );
+}
+
+#[test]
+fn a_timer_tick_reaches_the_processor_and_acknowledges_to_a_vector() {
+    // The whole point of the board: a crystal, through a counter, through two
+    // interrupt controllers, onto a pin — and then the acknowledge cycle back
+    // down the same wire to fetch the vector.
+    let (mut m, cpu) = board();
+    m.reset(ResetKind::Cold);
+    m.sweep();
+    assert!(!cpu.level("intr"), "nothing is pending at power on");
+
+    // Initialise the master exactly as a PC's firmware does: ICW1 with ICW4 to
+    // follow, vector base 0x08, a slave on IR2, 8086 mode. Then unmask IR0
+    // alone.
+    outb(&m, 0x20, 0x11);
+    outb(&m, 0x21, 0x08);
+    outb(&m, 0x21, 0x04);
+    outb(&m, 0x21, 0x01);
+    outb(&m, 0x21, 0xfe);
+
+    // Counter 0, low-then-high access, mode 2, binary. A divisor of 100 is
+    // 83.8 microseconds of virtual time at 105/88 MHz.
+    outb(&m, 0x43, 0x34);
+    outb(&m, 0x40, 100);
+    outb(&m, 0x40, 0);
+
+    m.run_for(rsemu::core::clock::GlobalTime::from_nanos(1_000_000))
+        .expect("the machine runs");
+
+    assert!(
+        cpu.level("intr"),
+        "the timer's output never reached the processor's pin"
+    );
+    assert_eq!(
+        cpu.acknowledge(),
+        Some(0x08),
+        "the acknowledge cycle must return the vector the controller was given"
+    );
+    // Having taken it, the line drops: the request moved from pending to in
+    // service, which is the bookkeeping `IntAck` exists to make possible.
+    assert!(!cpu.level("intr"), "the request is now in service");
+
+    // And an end-of-interrupt lets the next tick through.
+    outb(&m, 0x20, 0x20);
+    m.run_for(rsemu::core::clock::GlobalTime::from_nanos(1_000_000))
+        .expect("the machine runs");
+    assert!(cpu.level("intr"), "the next tick");
+}
+
+#[test]
+fn the_board_snapshots_and_restores_to_an_identical_state_hash() {
+    let (mut m, _cpu) = board();
+    m.reset(ResetKind::Cold);
+    m.sweep();
+    outb(&m, 0x43, 0x34);
+    outb(&m, 0x40, 100);
+    outb(&m, 0x40, 0);
+    outb(&m, 0x61, 0x03);
+    outb(&m, 0x70, 0x0b);
+    outb(&m, 0x71, 0x42);
+    m.run_for(rsemu::core::clock::GlobalTime::from_nanos(500_000))
+        .expect("the machine runs");
+
+    let image = m.save().expect("the board saves");
+    let before = m.state_hash().expect("a hash");
+
+    let (mut other, _) = board();
+    other.reset(ResetKind::Cold);
+    other.load(&image).expect("the board loads");
+    assert_eq!(
+        other.state_hash().expect("a hash"),
+        before,
+        "a restored board must be indistinguishable from the one it came from"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the picture
+// ---------------------------------------------------------------------------
+
+/// Put a string into the colour text page, the way firmware's teletype output
+/// does: a character byte and an attribute byte per cell, starting at 0xb8000.
+fn write_text(m: &rsemu::machine::Machine, row: u32, col: u32, text: &str, attr: u8) {
+    let mem = m.space("mem").expect("the memory space");
+    let mut at = 0x000b_8000u64 + u64::from(row * 80 + col) * 2;
+    for byte in text.bytes() {
+        mem.write(at, Width::U8, u64::from(byte), MemAttrs::DEFAULT)
+            .expect("the text page");
+        mem.write(at + 1, Width::U8, u64::from(attr), MemAttrs::DEFAULT)
+            .expect("the text page");
+        at += 2;
+    }
+}
+
+#[test]
+fn what_the_guest_writes_into_the_text_page_comes_out_of_the_scanout() {
+    // The last link in the chain: guest memory, through the character
+    // generator and the DAC, to host pixels. If this works, `--screenshot`
+    // works, and so does the browser.
+    use rsemu::host::display::{Scanout, Surface};
+
+    let (mut m, _cpu, scanout) = board_with_display();
+    m.reset(ResetKind::Cold);
+
+    write_text(&m, 0, 0, "rsemu pc-at", 0x0f);
+    write_text(
+        &m,
+        2,
+        0,
+        "no firmware is shipped; point --bios at your own",
+        0x07,
+    );
+
+    let mut surface = Surface::for_scanout(&scanout);
+    scanout.capture(&mut surface);
+
+    // 80 columns of nine-pixel cells by 25 rows of sixteen: the shape a VGA
+    // comes out of reset in.
+    assert_eq!(surface.width(), 720);
+    assert_eq!(surface.height(), 400);
+
+    // Something was actually drawn: the first row is not uniform.
+    let row = surface.row(0).expect("the top row").to_vec();
+    let mut nonblank = 0usize;
+    for y in 0..surface.height() {
+        for x in 0..surface.width() {
+            if surface.get(x, y) != Some([0, 0, 0]) {
+                nonblank += 1;
+            }
+        }
+    }
+    assert!(
+        nonblank > 200,
+        "only {nonblank} lit pixels — the character generator drew nothing"
+    );
+    let _ = row;
+
+    // Deterministic, because everything under it is: the same board, the same
+    // bytes, the same picture, on any host (`ROADMAP.md` §0).
+    let first = surface.hash();
+    let mut again = Surface::for_scanout(&scanout);
+    scanout.capture(&mut again);
+    assert_eq!(again.hash(), first, "the same frame twice");
+
+    // Written out only when asked, into a directory the caller names — the
+    // convention the conformance corpora already use. `RSEMU_SCREENSHOT_DIR=…
+    // cargo test --all-features pc_at_board` regenerates it.
+    #[cfg(feature = "display-png")]
+    if let Ok(dir) = std::env::var("RSEMU_SCREENSHOT_DIR") {
+        let bytes = rsemu::host::display::png::encode(&surface).expect("a PNG");
+        let path = std::path::Path::new(&dir).join("pc-at.png");
+        std::fs::write(&path, &bytes).expect("the screenshot directory exists");
+        println!("wrote {} ({} bytes)", path.display(), bytes.len());
+    }
+}
+
+#[test]
+fn a_sector_travels_from_the_floppy_through_the_dma_controller_into_memory() {
+    // The other end-to-end path, and the one a boot depends on: a command to
+    // the controller, a DRQ, an 8237 that builds the physical address the chip
+    // cannot drive, and 512 bytes in guest memory. Nothing in this test knows
+    // about either device's internals — it is written the way firmware writes
+    // it, through the I/O ports.
+    let (mut m, _cpu) = board();
+    m.reset(ResetKind::Cold);
+    m.sweep();
+
+    // Where the sector is to land: 0x00500, well inside base memory.
+    const DEST: u64 = 0x0000_0500;
+
+    // Channel 2, single mode, write to memory, no autoinitialise, increment.
+    outb(&m, 0x0a, 0x06); // mask channel 2 while it is programmed
+    outb(&m, 0x0c, 0x00); // clear the byte-pointer flip-flop
+    outb(&m, 0x0b, 0x46); // mode: single, write, increment, channel 2
+    outb(&m, 0x04, (DEST & 0xff) as u8);
+    outb(&m, 0x04, ((DEST >> 8) & 0xff) as u8);
+    outb(&m, 0x81, (DEST >> 16) as u8); // the page latch for channel 2
+    outb(&m, 0x0c, 0x00);
+    outb(&m, 0x05, 0xff); // count is n-1, so 0x01ff is 512 bytes
+    outb(&m, 0x05, 0x01);
+    outb(&m, 0x0a, 0x02); // unmask channel 2
+
+    // The controller: out of reset, DMA and interrupts enabled, motor on.
+    outb(&m, 0x3f2, 0x1c);
+    // Four SENSE INTERRUPT STATUS commands clear the post-reset state, which is
+    // what every BIOS does before its first real command.
+    for _ in 0..4 {
+        outb(&m, 0x3f5, 0x08);
+        let _st0 = inb(&m, 0x3f5);
+        let _pcn = inb(&m, 0x3f5);
+    }
+
+    // READ DATA, MFM, drive 0, head 0, cylinder 0, sector 1.
+    for byte in [0x46u8, 0x00, 0x00, 0x00, 0x01, 0x02, 0x12, 0x1b, 0xff] {
+        outb(&m, 0x3f5, byte);
+    }
+
+    // The result phase: seven bytes, and ST0's top two bits clear means the
+    // command finished normally.
+    let st0 = inb(&m, 0x3f5);
+    let st1 = inb(&m, 0x3f5);
+    let _st2 = inb(&m, 0x3f5);
+    let cylinder = inb(&m, 0x3f5);
+    let head = inb(&m, 0x3f5);
+    let sector = inb(&m, 0x3f5);
+    let _n = inb(&m, 0x3f5);
+    assert_eq!(st0 & 0xc0, 0x00, "ST0 says the read failed: {st0:#04x}");
+    assert_eq!(st1, 0x00, "ST1 reports an error: {st1:#04x}");
+    assert_eq!(
+        (cylinder, head, sector),
+        (0, 0, 2),
+        "the next sector address"
+    );
+
+    // And the bytes are in memory, at the address the page latch and the
+    // address register named between them.
+    let image = fake_floppy();
+    for offset in [0u64, 1, 2, 100, 510, 511] {
+        assert_eq!(
+            peek(&m, DEST + offset),
+            u64::from(image[offset as usize]),
+            "byte {offset} of the sector"
+        );
+    }
+    // Sector one, not sector two: the classic off-by-one, caught.
+    assert_eq!(peek(&m, DEST + 1), 0x00, "the sector number in the payload");
+    // And the boot signature is where firmware looks.
+    assert_eq!(peek(&m, DEST + 510), 0x55);
+    assert_eq!(peek(&m, DEST + 511), 0xaa);
+}

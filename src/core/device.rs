@@ -29,7 +29,7 @@
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -38,7 +38,7 @@ use crate::core::props::{Props, ValueKind};
 use crate::core::sched::{Budget, Consumed, LazyHandle};
 use crate::core::space::{RegionRef, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter};
-use crate::core::wire::{WireId, WireSink, WireSource};
+use crate::core::wire::{DmaPeripheral, IntAck, WireId, WireSink, WireSource};
 
 /// How deep a reset goes.
 ///
@@ -211,6 +211,49 @@ pub trait Device: Send + Sync + fmt::Debug {
             message: "this device drives no such pin".to_string(),
         })
     }
+
+    /// The acknowledge handler this device offers on output pin `port`.
+    ///
+    /// **The device must own the `Arc`**, exactly as it owns the one behind a
+    /// [`SinkPin`]: what reaches the sink is a `Weak`, so a handler built on
+    /// the fly would arrive already dead.
+    ///
+    /// An interrupt controller returns one here; everything else returns
+    /// `None`, which is the answer for a line that carries a level and nothing
+    /// more. The realizer asks every driver on a net and hands what it gets to
+    /// that net's sinks — see [`IntAck`] for why the vector travels with the
+    /// wire rather than through a device handle.
+    fn int_ack(&self, _port: &str) -> Option<Arc<dyn IntAck>> {
+        None
+    }
+
+    /// Told what answers the acknowledge cycle on input pin `port`.
+    ///
+    /// A CPU with a vectored interrupt input keeps this and calls
+    /// [`IntAck::acknowledge`] when it takes the interrupt. The reference is
+    /// **weak**: the machine owns both devices, and a CPU that kept its
+    /// controller alive would close a cycle nothing could drop.
+    ///
+    /// Called once per driver on the net, before reset and before the realize
+    /// sweep.
+    fn attach_int_ack(&self, _port: &str, _ack: Weak<dyn IntAck>) {}
+
+    /// The DMA transfer interface this device offers on output pin `port`.
+    ///
+    /// A peripheral that raises `DRQ` returns one here; the realizer hands it
+    /// to the controller that is the sink on that net. As with
+    /// [`int_ack`](Device::int_ack), **the device must own the `Arc`** — what
+    /// reaches the controller is a `Weak`.
+    fn dma_peripheral(&self, _port: &str) -> Option<Arc<dyn DmaPeripheral>> {
+        None
+    }
+
+    /// Told which peripheral raises `DRQ` on input pin `port`.
+    ///
+    /// A DMA controller keeps this and moves bytes through it when the channel
+    /// is unmasked and the request arrives. Weak, for the same reason
+    /// [`attach_int_ack`](Device::attach_int_ack) is.
+    fn attach_dma_peripheral(&self, _port: &str, _peer: Weak<dyn DmaPeripheral>) {}
 
     /// Announce the level `port` idles at — the realize sweep (§4.3).
     ///

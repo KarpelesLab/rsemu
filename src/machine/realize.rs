@@ -91,7 +91,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
 use crate::core::clock::{ClockForest, DomainId, Rational as ClockRational};
@@ -1034,7 +1034,12 @@ impl<'a> Realizer<'a> {
             }
             let source_ids: Vec<WireId> = sources.iter().map(|p| ids[*p]).collect();
             let mut builder = Wire::builder().sources(&source_ids);
-            for pin in group.iter().copied().filter(|p| pins.receives[*p]) {
+            let receivers: Vec<usize> = group
+                .iter()
+                .copied()
+                .filter(|p| pins.receives[*p])
+                .collect();
+            for pin in receivers.iter().copied() {
                 let (object, port) = pins.pin(pin);
                 let built = self.device(object, "wire")?;
                 let instance = built.instance.as_ref().ok_or_else(|| {
@@ -1076,6 +1081,41 @@ impl<'a> Realizer<'a> {
                 instance
                     .connect(port, WireSource::new(Arc::clone(&wire), ids[pin]))
                     .map_err(|e| config(built.path.clone(), e.to_string()))?;
+                // The reverse half of a vectored interrupt (`core::wire`'s
+                // `IntAck`): a controller that answers an acknowledge cycle
+                // offers a handler here, and every CPU on the same net is told
+                // about it. Weak, for the same reason the sinks are: the
+                // machine owns devices and the wire only refers to them.
+                if let Some(ack) = instance.int_ack(port) {
+                    let weak = Arc::downgrade(&ack);
+                    for sink_pin in receivers.iter().copied() {
+                        let (sink_object, sink_port) = pins.pin(sink_pin);
+                        let sink_built = self.device(sink_object, "wire")?;
+                        if let Some(sink_instance) = sink_built.instance.as_ref() {
+                            sink_instance.attach_int_ack(sink_port, Weak::clone(&weak));
+                        }
+                    }
+                    // Nothing here keeps `ack` alive: the driving device owns
+                    // it, exactly as it owns the `Arc` behind a `SinkPin`. A
+                    // device that built one on the fly would hand out a weak
+                    // reference that is already dead, which is the same
+                    // contract `Device::sink` has.
+                    drop(ack);
+                }
+                // The data half of a DMA request line, by the same route: the
+                // peripheral drives `DRQ`, and the controller on the other end
+                // of that net is what moves its bytes.
+                if let Some(peer) = instance.dma_peripheral(port) {
+                    let weak = Arc::downgrade(&peer);
+                    for sink_pin in receivers.iter().copied() {
+                        let (sink_object, sink_port) = pins.pin(sink_pin);
+                        let sink_built = self.device(sink_object, "wire")?;
+                        if let Some(sink_instance) = sink_built.instance.as_ref() {
+                            sink_instance.attach_dma_peripheral(sink_port, Weak::clone(&weak));
+                        }
+                    }
+                    drop(peer);
+                }
                 refs.push(PinRef {
                     device: object.0 as usize,
                     port: port.to_string(),

@@ -206,6 +206,37 @@ cpu-z80 = []
 # captured from real silicon. Adds no dependencies and is `no_std + alloc`.
 cpu-x86 = []
 
+# The chips an IBM PC/AT-class board is built from (src/dev/pc): two 8259A
+# interrupt controllers, an 8254 timer, an 8042 keyboard controller with the
+# A20 gate, an MC146818 RTC and its CMOS RAM, two 8237A DMA controllers with
+# the AT's page registers, the system control ports at 0x61 and 0x92, and the
+# firmware ROM socket a user-supplied BIOS image is bound to. Written from the
+# IBM PC/AT Technical Reference, the Intel and Motorola data sheets and Ralf
+# Brown's Interrupt List; no emulator source was consulted (ROADMAP.md §1).
+# `no_std + alloc`, no dependencies.
+dev-pc = []
+
+# The PC's display side (src/dev/pc/video): an MC6845-derived CRTC, the
+# attribute-plus-character text buffer at 0xb8000, and the character generator
+# that turns the two into pixels on the `host::display` scanout seam — so a
+# `--screenshot` and the browser demo see the same picture the guest drew. Text
+# mode only, deliberately: it is what reaches a DOS prompt, and a graphics mode
+# nothing yet asks for would be untested code. Needs `dev-pc`.
+dev-pc-video = ["dev-pc"]
+
+# The PC's floppy controller (src/dev/pc/fdc): a NEC uPD765A as the AT wires
+# it, with the command phases, the result phases, seek and interrupt handling,
+# and both DMA and non-DMA data transfer. Needs `dev-pc` for the DMA controller
+# it hands bytes to.
+dev-pc-floppy = ["dev-pc"]
+
+# An IBM PC/AT-class machine (machines/pc-at.machine plus the classes it
+# names). The firmware is **not** shipped: the `bios` media slot takes the
+# user's own image (`rsemu run pc-at --bios /usr/share/qemu/bios.bin`) and the
+# `vgabios` slot takes a video option ROM, exactly as `riscv-virt` takes its
+# firmware. Adds no dependencies.
+machine-pc-at = ["cpu-x86", "dev-pc", "dev-pc-video", "dev-pc-floppy"]
+
 # The Motorola MC68000 core (src/cpu/m68k): an interpreter that models the
 # two-word prefetch queue explicitly, charges four cycles per bus access rather
 # than reading a per-instruction table, implements the supervisor/user split
