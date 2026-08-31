@@ -87,7 +87,11 @@ wasm = ["std"]
 # $4016/$4017 with the OUT0 latch and their 8-bit shift registers, and the OAM
 # DMA unit at $4014. Neither belongs to the CPU, the PPU, the APU or the
 # cartridge, so neither is gated with them. `no_std + alloc`, no dependencies.
-dev-nes-io = []
+# Depends on `dev-nes-apu` because the RP2A03's DMA unit is a single arbiter
+# serving both halves of the chip -- OAM DMA at $4014 and the DMC's sample
+# fetch -- and the DMC half is the APU's. Splitting the arbiter to break the
+# dependency would model the silicon less accurately, not more.
+dev-nes-io = ["dev-nes-apu"]
 
 # The NES / Famicom picture processing unit (RP2C02): the per-dot rendering
 # pipeline, $2000-$2007 with their quirks, the two-phase sprite evaluation and

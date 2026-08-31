@@ -70,7 +70,7 @@
 //! apu.write(0x00, 0x9F); // pulse 1: 50% duty, halt, constant volume 15
 //! apu.write(0x03, 0x08); // length load, timer high bits
 //! apu.advance(29830); // one full 4-step sequence
-//! assert!(apu.read(0x15) & 0x40 != 0, "the frame IRQ should have fired");
+//! assert!(apu.read(0x15, 0) & 0x40 != 0, "the frame IRQ should have fired");
 //! ```
 
 pub mod dmc;
@@ -99,7 +99,7 @@ use crate::core::space::{
     AccessConstraints, MemAttrs, MemOps, MemResult, Region as MmioRegion, RegionRef,
 };
 use crate::core::state::{ChunkReader, ChunkWriter};
-use crate::core::sync::{AtomicU8, AtomicU64, LockRank, Mutex, Ordering};
+use crate::core::sync::{AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{Level, WireSource};
 use crate::machine::realize::{BindCtx, Instance};
@@ -169,6 +169,9 @@ struct Core {
     dmc: Dmc,
     /// CPU cycles since power-on, in this device's clock domain.
     ticks: u64,
+    /// The `/IRQ` level as it stood one CPU cycle ago — what the core samples.
+    /// See [`Core::irq_asserted`].
+    irq_out: bool,
     /// The power-on alignment between CPU and APU cycles: 0 when CPU cycle 0 is
     /// a get cycle, 1 when it is a put cycle.
     ///
@@ -190,6 +193,7 @@ impl Core {
             noise: Noise::new(region),
             dmc: Dmc::new(region),
             ticks: 0,
+            irq_out: false,
             phase,
             samples: SampleRing::with_capacity(capacity),
         }
@@ -203,10 +207,13 @@ impl Core {
 
     /// Advance one CPU cycle.
     fn tick(&mut self) {
+        // What the core samples this cycle is the level the last one left —
+        // see [`Core::irq_asserted`].
+        self.irq_out = self.irq_raw();
         self.ticks += 1;
         let now = self.ticks;
 
-        let event = self.frame.tick(now);
+        let event = self.frame.tick(now, self.on_put_cycle());
         if event.quarter {
             self.clock_quarter_frame();
         }
@@ -220,7 +227,7 @@ impl Core {
             self.pulse1.tick_timer();
             self.pulse2.tick_timer();
             self.noise.tick_timer();
-            self.dmc.tick_timer();
+            self.dmc.tick_timer(now);
             let sample = self.mix();
             self.samples.push(sample);
         }
@@ -257,8 +264,26 @@ impl Core {
 
     /// Whether either interrupt flag is asserting the IRQ line.
     #[inline]
+    /// The level the `/IRQ` request is at right now, before the output delay.
+    ///
+    /// The inhibit bit gates the *line*, not the flag: `$4015` still reports a
+    /// frame interrupt that was suppressed, which is what AccuracyCoin's
+    /// "Frame Counter IRQ" codes I-M measure.
+    fn irq_raw(&self) -> bool {
+        (self.frame.irq() && !self.frame.inhibited()) || self.dmc.irq()
+    }
+
+    /// The level the CPU sees on `/IRQ` — one CPU cycle behind the request.
+    ///
+    /// The same argument as the PPU's `/NMI` output: a 6502 samples its
+    /// interrupt inputs during φ2 and the flag moves at the end of the cycle,
+    /// so a request raised on cycle *n* is one the core acts on from cycle
+    /// *n + 1*. AccuracyCoin's "Frame Counter IRQ" codes N and O measure it to
+    /// the instruction: with the flag set 29832 cycles after a `$4017` write,
+    /// the interrupt is taken after the *third* following `INX` and not the
+    /// second, and one cycle either way moves that answer.
     fn irq_asserted(&self) -> bool {
-        self.frame.irq() || self.dmc.irq()
+        self.irq_out
     }
 
     fn write(&mut self, index: u8, value: u8) {
@@ -281,7 +306,7 @@ impl Core {
             reg::DMC_LOAD => self.dmc.write_output(value),
             reg::DMC_ADDR => self.dmc.write_address(value),
             reg::DMC_LEN => self.dmc.write_length(value),
-            reg::STATUS => self.write_status(value),
+            reg::STATUS => self.write_status(value, self.ticks),
             reg::FRAME => self.frame.write(value, self.on_put_cycle()),
             // $4009, $400D and $4014/$4016 are not APU registers. The first two
             // are unimplemented on the chip; the last two belong to the PPU's
@@ -291,13 +316,13 @@ impl Core {
     }
 
     /// `$4015` write: `---D NT21`.
-    fn write_status(&mut self, value: u8) {
+    fn write_status(&mut self, value: u8, now: u64) {
         self.pulse1.length.set_enabled(value & 0x01 != 0);
         self.pulse2.length.set_enabled(value & 0x02 != 0);
         self.triangle.length.set_enabled(value & 0x04 != 0);
         self.noise.length.set_enabled(value & 0x08 != 0);
         self.dmc.clear_irq();
-        self.dmc.set_enabled(value & 0x10 != 0);
+        self.dmc.set_enabled(value & 0x10 != 0, now);
     }
 
     /// `$4015` read: `IF-D NT21`, with bit 5 from the open bus.
@@ -318,7 +343,7 @@ impl Core {
         if self.dmc.active() {
             value |= 0x10;
         }
-        if self.frame.read_irq(self.ticks, peek) {
+        if self.frame.read_irq(peek) {
             value |= 0x40;
         }
         if self.dmc.irq() {
@@ -338,7 +363,7 @@ impl Core {
                 // A reset is documented as a $4015 write of $00 plus a handful
                 // of chip-specific effects; $4017 is left alone
                 // (NESdev CPU power up state).
-                self.write_status(0x00);
+                self.write_status(0x00, self.ticks);
                 self.frame.reset_warm();
                 self.dmc.reset_warm();
                 self.triangle.reset_phase();
@@ -380,13 +405,6 @@ struct ApuState {
     core: Mutex<Core>,
     /// The IRQ output port, connected at realize time.
     irq: Mutex<Option<WireSource>>,
-    /// The last value the CPU's external data bus held.
-    ///
-    /// `$4015` bit 5 reads back from here. The register is internal to the CPU,
-    /// so a `$4015` read neither drives the external bus nor updates it — the
-    /// bus layer must not feed the result of a `$4015` read back in through
-    /// [`Apu::set_open_bus`].
-    open_bus: AtomicU8,
     /// The clock domain whose ticks [`Apu::advance_to`] is called with.
     ///
     /// Recorded rather than used: the APU counts its own CPU cycles, and the
@@ -413,7 +431,6 @@ impl fmt::Debug for ApuState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ApuState")
             .field("region", &self.region)
-            .field("open_bus", &self.open_bus.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
@@ -450,9 +467,11 @@ impl ApuState {
         self.refresh_irq();
     }
 
-    fn read_with(&self, index: u8, peek: bool) -> u8 {
-        let open_bus = self.open_bus.load(Ordering::Relaxed);
+    fn read_with(&self, index: u8, open_bus: u8, peek: bool) -> u8 {
         if index != reg::STATUS {
+            // Nothing in the RP2A03 decodes a *read* of $4000-$4013: no gate
+            // drives the bus, so the byte the CPU put there last is the byte it
+            // reads back (NESdev, "Open bus behavior").
             return open_bus;
         }
         let value = self.core.lock().read_status(open_bus, peek);
@@ -525,7 +544,6 @@ impl Apu {
                 Core::new(region, phase, halt_ultrasonic, capacity as usize),
             ),
             irq: Mutex::with_rank(LockRank::WIRE, None),
-            open_bus: AtomicU8::new(0),
             domain: Mutex::with_rank(LockRank::LEAF, None),
             lazy: Mutex::new(None),
             ticks: AtomicU64::new(0),
@@ -673,39 +691,21 @@ impl Apu {
         self.state.write(index, value);
     }
 
-    /// Read a register by its offset from `$4000`.
+    /// Read a register by its offset from `$4000`, with `bus` as whatever the
+    /// master last drove.
     ///
-    /// Only `$4015` is readable; everything else returns the open-bus value.
-    pub fn read(&self, index: u8) -> u8 {
-        self.read_with(index, false)
+    /// Only `$4015` is readable; everything else answers with `bus`, because
+    /// nothing in the chip drives the wires for those addresses.
+    pub fn read(&self, index: u8, bus: u8) -> u8 {
+        self.state.read_with(index, bus, false)
     }
 
     /// Read a register without side effects, for a debugger or the monitor.
     ///
     /// Honours `MemAttrs::debug` (`ROADMAP.md` §15, invariant 5): the frame
     /// interrupt flag is reported but not cleared.
-    pub fn peek(&self, index: u8) -> u8 {
-        self.read_with(index, true)
-    }
-
-    fn read_with(&self, index: u8, peek: bool) -> u8 {
-        self.state.read_with(index, peek)
-    }
-
-    /// Record the value the CPU's external data bus last held.
-    ///
-    /// `$4015` bit 5 reads back from here. Do **not** call this with the result
-    /// of a `$4015` read: that register is internal to the CPU and the external
-    /// bus is disconnected for it, so the open-bus value must come from the
-    /// last cycle that read something else ([NESdev
-    /// APU](https://www.nesdev.org/wiki/APU)).
-    pub fn set_open_bus(&self, value: u8) {
-        self.state.open_bus.store(value, Ordering::Relaxed);
-    }
-
-    /// The open-bus value currently latched.
-    pub fn open_bus(&self) -> u8 {
-        self.state.open_bus.load(Ordering::Relaxed)
+    pub fn peek(&self, index: u8, bus: u8) -> u8 {
+        self.state.read_with(index, bus, true)
     }
 
     // -- DMC DMA ------------------------------------------------------------
@@ -728,7 +728,8 @@ impl Apu {
     /// Returns false if the request was withdrawn before the get cycle, in
     /// which case nothing changed and the byte is discarded.
     pub fn dma_complete(&self, serial: u64, byte: u8) -> bool {
-        let accepted = self.state.core.lock().dmc.dma_complete(serial, byte);
+        let now = self.state.core.lock().ticks;
+        let accepted = self.state.core.lock().dmc.dma_complete(serial, byte, now);
         if accepted {
             self.refresh_irq();
         }
@@ -849,7 +850,15 @@ impl MemOps for ApuPort {
             .ok_or(crate::core::error::BusError::BadAccess)?;
         // First, and outside every lock this device owns.
         self.state.sync(attrs);
-        *byte = self.state.read_with(index, attrs.debug);
+        // `$4015` is on the CPU's own die, so its open-bus bit comes from the
+        // core's *internal* bus — a DMA that stole a cycle moved the pins and
+        // not that. Everything else in the block is undecoded external space.
+        let bus = if index == reg::STATUS {
+            attrs.core_bus
+        } else {
+            attrs.bus
+        };
+        *byte = self.state.read_with(index, bus, attrs.debug);
         Ok(())
     }
 
@@ -871,13 +880,88 @@ impl MemOps for ApuPort {
     }
 
     fn constraints(&self) -> AccessConstraints {
-        AccessConstraints::word(Width::U8, Endian::Little)
+        // Nothing here drives the master's data bus on a read. `$4015` is on
+        // the CPU's own die, so reading it never puts anything on the external
+        // bus and the next open-bus read still sees the byte from before it;
+        // `$4000`-`$4013` and `$4017` are write-only and no circuit in the
+        // console decodes a read of them at all (NESdev, "APU" and "Open bus
+        // behavior"). Either way the byte this port hands back *is* the bus
+        // value it was given, so leaving the latch alone is the only
+        // self-consistent thing to do.
+        AccessConstraints::word(Width::U8, Endian::Little).internal()
+    }
+}
+
+/// The name a DMA unit asks [`Device::interface`] for to reach the DMC.
+pub const DMC_FETCH: &str = "nes.dmc-fetch";
+
+/// The DMC's sample fetch, as the chip's cycle-stealing DMA unit sees it.
+///
+/// The DMC and the OAM DMA unit are the same arbiter on the RP2A03 die: one
+/// `/RDY` line, one get/put cadence, one precedence rule between them. So the
+/// unit that runs OAM DMA runs this too, and it reaches the channel through
+/// here rather than by owning it. Handed over by
+/// [`Device::interface`]`(`[`DMC_FETCH`]`)`.
+#[derive(Debug)]
+pub struct DmcFetch {
+    state: Arc<ApuState>,
+}
+
+impl DmcFetch {
+    /// Catch the APU up to the cycle the arbiter is standing on.
+    ///
+    /// Called once per CPU cycle from inside the arbiter, which runs inside the
+    /// core's own cycle loop — so the core's published position is live and the
+    /// APU lands on exactly this cycle (`core::sched::TickCursor`).
+    pub fn sync(&self) {
+        self.state.sync(MemAttrs::DEFAULT);
+    }
+
+    /// The fetch the DMC wants, if it wants one.
+    #[must_use]
+    pub fn request(&self) -> Option<DmaRequest> {
+        self.state.core.lock().dmc.dma_request()
+    }
+
+    /// Whether the request identified by `serial` is still outstanding.
+    ///
+    /// False once playback has stopped, which is how an arbiter that has
+    /// already halted the CPU learns it is servicing an aborted DMA.
+    #[must_use]
+    pub fn is_pending(&self, serial: u64) -> bool {
+        self.state.core.lock().dmc.dma_is_pending(serial)
+    }
+
+    /// Forget a request the arbiter refused to take up.
+    pub fn withdraw(&self, serial: u64) {
+        self.state.core.lock().dmc.dma_withdraw(serial);
+    }
+
+    /// Hand the DMC the byte the arbiter fetched.
+    ///
+    /// Returns false if the request was withdrawn before the get cycle, in
+    /// which case nothing changed and the byte is discarded.
+    pub fn complete(&self, serial: u64, byte: u8) -> bool {
+        let now = self.state.core.lock().ticks;
+        let accepted = self.state.core.lock().dmc.dma_complete(serial, byte, now);
+        if accepted {
+            self.state.refresh_irq();
+        }
+        accepted
     }
 }
 
 impl Device for Apu {
     fn class(&self) -> &'static DeviceClass {
         &APU_CLASS
+    }
+
+    fn interface(&self, name: &str) -> Option<Arc<dyn core::any::Any + Send + Sync>> {
+        (name == DMC_FETCH).then(|| {
+            Arc::new(DmcFetch {
+                state: Arc::clone(&self.state),
+            }) as Arc<dyn core::any::Any + Send + Sync>
+        })
     }
 
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {

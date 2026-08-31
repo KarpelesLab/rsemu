@@ -153,10 +153,6 @@ impl Region {
         // PAL's lockout is 94905.6 dots, which no dot counter can hold; the
         // floor is the last dot that is certainly still inside the window.
         let warmup_dots = RESET_LOCKOUT_CPU_CYCLES * cpu / dot;
-        // The 6502 samples /NMI once per CPU cycle, so a request withdrawn
-        // inside one cycle is one the CPU never saw. On PAL a CPU cycle is 3.2
-        // dots and the first *integer* dot at or past it is the ceiling.
-        let nmi_announce_dots = cpu.div_ceil(dot);
         let (scanlines_per_frame, picture_height, post_render_lines, vblank_lines, odd_frame_skip) =
             match self {
                 Region::Ntsc => (262, 240, 1, 20, true),
@@ -174,7 +170,6 @@ impl Region {
             odd_frame_skip,
             dots_per_frame: DOTS_PER_SCANLINE as u64 * scanlines_per_frame as u64,
             warmup_dots,
-            nmi_announce_dots,
         }
     }
 }
@@ -242,10 +237,6 @@ pub struct Geometry {
     /// Dots the chip ignores `$2000`/`$2001`/`$2005`/`$2006` writes for after
     /// a reset — [`RESET_LOCKOUT_CPU_CYCLES`] converted through the dividers.
     pub warmup_dots: u64,
-    /// Dots between the vblank flag being set and `/NMI` reaching the wire.
-    ///
-    /// One CPU cycle, rounded up: 3 dots on NTSC and Dendy, 4 on PAL.
-    pub nmi_announce_dots: u64,
 }
 
 impl Geometry {

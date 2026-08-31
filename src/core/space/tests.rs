@@ -649,6 +649,8 @@ fn unassigned_policies() {
         (UnassignedPolicy::FAULT, Err(BusError::Unassigned)),
         (UnassignedPolicy::ONES, Ok(0xffff)),
         (UnassignedPolicy::ZEROS, Ok(0)),
+        // `OPEN_BUS` answers with `MemAttrs::bus`, which `DEFAULT` leaves at 0.
+        (UnassignedPolicy::OPEN_BUS, Ok(0)),
     ] {
         let space = AddressSpace::new("mem", 16).with_unassigned(policy);
         assert_eq!(
@@ -663,6 +665,70 @@ fn unassigned_policies() {
             "{policy:?}"
         );
     }
+}
+
+#[test]
+fn open_bus_answers_with_whatever_the_master_last_drove() {
+    let space = AddressSpace::new("mem", 16).with_unassigned(UnassignedPolicy::OPEN_BUS);
+    for byte in [0x00u8, 0x40, 0xa5, 0xff] {
+        let attrs = MemAttrs::DEFAULT.with_bus(byte);
+        assert_eq!(space.read(0x1000, Width::U8, attrs), Ok(u64::from(byte)));
+        // Every byte of a wide read floats the same way: one byte was driven
+        // last and there is nothing else on the wires.
+        assert_eq!(
+            space.read(0x1000, Width::U16, attrs),
+            Ok(u64::from(byte) << 8 | u64::from(byte))
+        );
+    }
+    // And a write to nothing is still discarded rather than faulting.
+    assert!(space.write(0x1000, Width::U8, 0, MemAttrs::DEFAULT).is_ok());
+}
+
+#[test]
+fn an_unassigned_read_reports_that_nothing_drove_the_bus() {
+    let space = AddressSpace::new("mem", 16).with_unassigned(UnassignedPolicy::OPEN_BUS);
+    let (store, region) = ram("a", 2);
+    store.write_at(0, &[0x11, 0x22]).unwrap();
+    space.topology().map(region, 0).unwrap();
+    assert_eq!(
+        space.read_driven(0, Width::U8, MemAttrs::DEFAULT),
+        Ok((0x11, true)),
+        "RAM is on the far side of the pins"
+    );
+    assert_eq!(
+        space.read_driven(0x1000, Width::U8, MemAttrs::DEFAULT.with_bus(0x5a)),
+        Ok((0x5a, false)),
+        "a hole drives nothing"
+    );
+}
+
+#[test]
+fn an_internal_region_answers_without_driving_the_bus() {
+    // The 2A03's `$4015` shape: a register on the master's own die, whose read
+    // must leave the master's data-bus latch alone.
+    #[derive(Debug)]
+    struct OnDie;
+    impl MemOps for OnDie {
+        fn read(&self, _offset: u64, dst: &mut [u8], _attrs: MemAttrs) -> MemResult {
+            dst.fill(0x5a);
+            Ok(())
+        }
+        fn write(&self, _offset: u64, _src: &[u8], _attrs: MemAttrs) -> MemResult {
+            Ok(())
+        }
+        fn constraints(&self) -> AccessConstraints {
+            AccessConstraints::word(Width::U8, Endian::Little).internal()
+        }
+    }
+    let space = AddressSpace::new("mem", 16).with_unassigned(UnassignedPolicy::OPEN_BUS);
+    space
+        .topology()
+        .map(Arc::new(Region::io("ondie", 1, Arc::new(OnDie))), 0x4015)
+        .unwrap();
+    assert_eq!(
+        space.read_driven(0x4015, Width::U8, MemAttrs::DEFAULT),
+        Ok((0x5a, false))
+    );
 }
 
 #[test]

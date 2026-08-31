@@ -164,8 +164,8 @@ use crate::machine::realize::{BindCtx, Instance};
 
 pub use engine::{
     DEFAULT_DECAY_DOTS, DOTS_PER_FRAME, DOTS_PER_SCANLINE, Engine, EvalPhase, FRAMEBUFFER_LEN,
-    NMI_ANNOUNCE_DOTS, PRE_RENDER_SCANLINE, Pixel, SCANLINES_PER_FRAME, SCREEN_HEIGHT,
-    SCREEN_WIDTH, VBLANK_SCANLINE, WARMUP_DOTS,
+    PRE_RENDER_SCANLINE, Pixel, SCANLINES_PER_FRAME, SCREEN_HEIGHT, SCREEN_WIDTH, VBLANK_SCANLINE,
+    WARMUP_DOTS,
 };
 pub use region::{BORDER_BLACK, Geometry, RESET_LOCKOUT_CPU_CYCLES, Region};
 pub use regs::{
@@ -631,7 +631,10 @@ static PPU_PROPERTIES: &[PropertySpec] = &[
 /// The device class, for [`crate::core::Registry`].
 pub static NES_PPU_CLASS: DeviceClass = DeviceClass {
     name: "nes.ppu",
-    version: 1,
+    // v2 appended the dot-exact pipeline's own state: the sampled `/NMI`
+    // output, which sprite output units have stopped counting, and a `$2001`
+    // write still travelling.
+    version: 2,
     summary: "NES / Famicom picture processing unit (RP2C02 / RP2C07 / UA6538)",
     properties: PPU_PROPERTIES,
     construct: |props| Ok(Box::new(NesPpu::new(props)?) as Box<dyn Device>),
@@ -772,6 +775,13 @@ impl Device for NesPpu {
     /// scanline so a mid-quantum `$2002` read is never more than a line stale.
     fn next_event_tick(&self) -> Option<u64> {
         Some(self.shared.next_event.load(Ordering::Relaxed))
+    }
+
+    /// Yes: this chip drives `/NMI`, and the CPU looks at that pin once per
+    /// cycle. Three dots to a CPU cycle, and whether the pin was up or down on
+    /// a given one is the whole subject of AccuracyCoin's vblank page.
+    fn sampled_every_cycle(&self) -> bool {
+        true
     }
 
     fn attach_lazy(&self, handle: LazyHandle) {

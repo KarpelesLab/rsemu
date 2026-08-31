@@ -267,6 +267,22 @@ impl FlatEntry {
         }
     }
 
+    /// Whether a read of this entry drives the master's external data bus.
+    ///
+    /// A combined entry answers with its highest-priority member, the same way
+    /// [`FlatEntry::endian`] does: a wired-or of an on-die register and an external
+    /// one is not a board the core tries to make sense of.
+    #[inline]
+    #[must_use]
+    pub fn drives_data_bus(&self) -> bool {
+        match &self.kind {
+            EntryKind::Single(l) => l.constraints.drives_data_bus,
+            EntryKind::Combine { members, .. } => members
+                .first()
+                .is_none_or(|m| m.constraints.drives_data_bus),
+        }
+    }
+
     /// Whether this entry is plain RAM, with no combining — the case the
     /// dispatch table flags as its fast path.
     #[inline]

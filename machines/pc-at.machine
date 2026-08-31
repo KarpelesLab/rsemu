@@ -103,18 +103,24 @@ machine "pc-at" {
   # 32 bits, because this board is meant for a 386. A real-mode-only core
   # simply never drives an address above 0x10ffff, and this costs it nothing.
   #
-  # `unassigned = open-bus`: an unmapped read returns ones. That is what an ISA
-  # bus with nothing driving it does, and firmware **depends** on it — sizing
-  # memory, scanning for option ROMs and probing for adapters all work by
+  # `unassigned = read-as-ones`: an unmapped read returns ones. That is what an
+  # ISA bus with nothing driving it does, and firmware **depends** on it —
+  # sizing memory, scanning for option ROMs and probing for adapters all work by
   # reading a hole and recognising 0xff. `fault` would be a more honest default
   # for a machine we were debugging, and the wrong model of this one.
-  space mem { width = 32, unassigned = open-bus }
+  #
+  # Not `open-bus`, which now means something narrower and more literal: the
+  # value left on the *master's own* data bus by its last cycle. That is right
+  # for a 6502, whose bus floats and decays; on an AT the ISA bus has pull-ups
+  # and genuinely reads as ones, which is a different claim about different
+  # silicon.
+  space mem { width = 32, unassigned = read-as-ones }
 
   # The separate I/O space the 8086 family drives with its own status lines. 16
   # bits, though an AT decodes only ten and every port below therefore aliases
   # every 0x400 — an alias nothing uses, so it is not modelled and this is the
   # comment saying so.
-  space port { width = 16, unassigned = open-bus }
+  space port { width = 16, unassigned = read-as-ones }
 
   # -- the processor ----------------------------------------------------------
   #

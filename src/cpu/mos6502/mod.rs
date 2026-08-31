@@ -110,12 +110,12 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::core::device::{
-    Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
+    CycleGate, Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
 };
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
-use crate::core::sched::{Budget, Consumed};
+use crate::core::sched::{Budget, Consumed, TickCursor};
 use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{self, AtomicBool, AtomicU32, LockRank, Ordering};
@@ -394,8 +394,19 @@ pub(crate) struct Lines {
     /// IRQ is level-sensitive: it is taken whenever it is asserted and **I**
     /// is clear.
     irq: AtomicBool,
-    /// The last level seen on NMI, for edge detection.
+    /// The level the NMI pin is being driven at right now.
     nmi_level: AtomicBool,
+    /// What the edge detector saw last time it was clocked.
+    ///
+    /// **The edge detector is clocked, once per CPU cycle** — that is what the
+    /// pin's flip-flop is — so a request raised and withdrawn inside a single
+    /// cycle is one the CPU never sees. On a NES that is not a curiosity: the
+    /// PPU raises `/NMI` when the vblank flag sets and a `$2002` read on the
+    /// same or the next PPU clock pulls it straight back up, and the whole
+    /// point of that test is that no interrupt happens. Comparing levels *at
+    /// the sampling point*, rather than latching every transition the wire
+    /// makes, is what models the flip-flop.
+    nmi_sampled: AtomicBool,
     /// NMI is edge-sensitive: a high-going edge sets this latch, which stays
     /// set until the interrupt is serviced, however long that takes.
     nmi_latch: AtomicBool,
@@ -418,10 +429,17 @@ impl Lines {
         self.irq.load(Ordering::Acquire)
     }
 
-    /// Drive the NMI pin, latching a high-going edge.
+    /// Drive the NMI pin. The edge is not looked for until the detector is
+    /// clocked — see [`Lines::sample_nmi`].
     fn set_nmi(&self, asserted: bool) {
-        let previous = self.nmi_level.swap(asserted, Ordering::AcqRel);
-        if asserted && !previous {
+        self.nmi_level.store(asserted, Ordering::Release);
+    }
+
+    /// Clock the edge detector: once per CPU cycle, and never anywhere else.
+    fn sample_nmi(&self) {
+        let now = self.nmi_level.load(Ordering::Acquire);
+        let previous = self.nmi_sampled.swap(now, Ordering::AcqRel);
+        if now && !previous {
             self.nmi_latch.store(true, Ordering::Release);
         }
     }
@@ -462,6 +480,9 @@ impl Lines {
     fn restore(&self, (irq, level, latch, reset): (bool, bool, bool, bool)) {
         self.irq.store(irq, Ordering::Release);
         self.nmi_level.store(level, Ordering::Release);
+        // The detector comes back holding the level it is standing on, so a
+        // restore does not manufacture an edge out of the load itself.
+        self.nmi_sampled.store(level, Ordering::Release);
         self.nmi_latch.store(latch, Ordering::Release);
         self.reset_req.store(reset, Ordering::Release);
     }
@@ -507,6 +528,22 @@ pub struct Mos6502 {
     /// These hold an `Arc<Lines>` rather than an `Arc<Mos6502>` for exactly
     /// that reason.
     pins: sync::Mutex<Pins>,
+    /// The two things the machine layer hands over after construction: where to
+    /// publish the cycle counter, and who may pull `/RDY`.
+    ///
+    /// A leaf-ranked lock read once per instruction, outside the execution
+    /// lock. Both are wiring rather than state, so neither is snapshotted.
+    links: sync::Mutex<CoreLinks>,
+}
+
+/// What the machine layer wires onto a core after it is built.
+#[derive(Debug, Default, Clone)]
+struct CoreLinks {
+    cursor: Option<TickCursor>,
+    rdy: Option<Arc<dyn CycleGate>>,
+    /// The object the machine file named as this core's `/RDY` driver, kept
+    /// until `bind` can resolve it.
+    rdy_link: Option<String>,
 }
 
 /// The sinks this core has published, one per input pin.
@@ -538,6 +575,7 @@ impl Mos6502 {
             ),
             requester: AtomicU32::new(cfg.requester.0),
             pins: sync::Mutex::new(Pins::default()),
+            links: sync::Mutex::new(CoreLinks::default()),
         }
     }
 
@@ -582,13 +620,18 @@ impl Mos6502 {
         // the spelling the language documents would be the wrong half to be
         // strict about.
         let _ = r.or_enum("engine", "interp", &["interp"])?;
+        // Which object drives `/RDY`. Resolved at bind time, because the device
+        // it names may not have been built yet.
+        let rdy = r.optional_link("rdy")?.map(|l| String::from(l.as_str()));
         r.finish()?;
-        Ok(Mos6502::new(Config {
+        let cpu = Mos6502::new(Config {
             variant,
             decimal,
             magic: magic as u8,
             requester: RequesterId::ANONYMOUS,
-        }))
+        });
+        cpu.links.lock().rdy_link = rdy;
+        Ok(cpu)
     }
 
     /// This core's configuration.
@@ -705,8 +748,13 @@ impl Mos6502 {
     }
 
     /// A complete NMI pulse, for a caller that does not model the pin's level.
+    ///
+    /// The edge detector is clocked once per CPU cycle, so a pulse that went
+    /// up and down between two cycles would be invisible. This one is clocked
+    /// while the line is high, which is what "a pulse the CPU saw" means.
     pub fn pulse_nmi(&self) {
         self.lines.set_nmi(true);
+        self.lines.sample_nmi();
         self.lines.set_nmi(false);
     }
 
@@ -741,6 +789,10 @@ impl Mos6502 {
     /// address space, which the caller must treat as "stop", not "retry".
     pub fn step(&self) -> u64 {
         let cfg = self.effective_config();
+        // Read before the execution lock: `links` is a leaf, and taking it
+        // under `BUS` would be legal but pointless — nothing changes it while
+        // an instruction runs.
+        let links = self.links.lock().clone();
         let mut session = self.session.lock();
         let Session { state, space } = &mut *session;
         // A `/RES` assertion is latched outside the lock; this is where it
@@ -755,7 +807,10 @@ impl Mos6502 {
         let Some(space) = space.clone() else {
             return 0;
         };
-        Exec::new(state, &space, &cfg, &self.lines).step()
+        Exec::new(state, &space, &cfg, &self.lines)
+            .with_cursor(links.cursor.as_ref())
+            .with_rdy(links.rdy.as_deref())
+            .step()
     }
 
     /// Execute until at least `budget` cycles have been charged.
@@ -817,6 +872,23 @@ impl Mos6502 {
         }
     }
 
+    /// Publish this core's cycle counter here as it executes.
+    ///
+    /// What makes a lazily-advanced device sampled from inside an instruction
+    /// see the cycle the access really happened on (`ROADMAP.md` §4.2). The
+    /// machine layer calls this for every runnable device.
+    pub fn attach_cursor(&self, cursor: TickCursor) {
+        self.links.lock().cursor = Some(cursor);
+    }
+
+    /// Connect the `/RDY` input to an arbiter that may halt this core.
+    ///
+    /// Without one the core is never held: `/RDY` idles high, which is what a
+    /// board with no DMA unit does. See [`CycleGate`].
+    pub fn attach_rdy(&self, gate: Arc<dyn CycleGate>) {
+        self.links.lock().rdy = Some(gate);
+    }
+
     /// Cycles owed to the next budget — see [`run_budget`](Mos6502::run_budget).
     #[must_use]
     pub fn cycle_debt(&self) -> u64 {
@@ -846,10 +918,11 @@ impl Mos6502 {
 /// The `cpu.mos6502` device class.
 pub static CLASS: DeviceClass = DeviceClass {
     name: "cpu.mos6502",
-    // v3 added the CMOS `WAI` stall flag; v2 added the cycle debt
-    // `run_budget` carries between quanta and the latched `/RES` request; v1
-    // snapshots predate any released build.
-    version: 3,
+    // v4 added the core's own data bus, which is not the same latch as the
+    // external one once a DMA can steal a cycle; v3 added the CMOS `WAI` stall
+    // flag; v2 added the cycle debt `run_budget` carries between quanta and the
+    // latched `/RES` request; v1 snapshots predate any released build.
+    version: 4,
     summary: "MOS 6502 / RP2A03 / W65C02S 8-bit CPU core, cycle-accurate interpreter",
     properties: &[
         PropertySpec {
@@ -875,6 +948,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Str,
             required: false,
             summary: "which execution engine; only `interp` exists until phase 5",
+        },
+        PropertySpec {
+            name: "rdy",
+            kind: ValueKind::Link,
+            required: false,
+            summary: "the object that drives /RDY: a DMA unit that halts this core",
         },
     ],
     construct: |props| Ok(Box::new(Mos6502::from_props(props)?)),
@@ -946,6 +1025,10 @@ impl Device for Mos6502 {
         true
     }
 
+    fn attach_cursor(&self, cursor: TickCursor) {
+        Mos6502::attach_cursor(self, cursor);
+    }
+
     fn run(&self, budget: Budget) -> Consumed {
         Consumed::new(self.run_budget(budget.ticks))
     }
@@ -1003,8 +1086,10 @@ impl Device for Mos6502 {
         w.write_bool(reset_req)?;
         // Appended in v3 rather than slotted in beside `halted`, so that the
         // prefix of this chunk keeps the layout v2 wrote and anything reading
-        // it field by field still lines up.
+        // it field by field still lines up. v4 appends the core's own data bus
+        // for the same reason.
         w.write_bool(state.waiting)?;
+        w.write_u8(state.core_bus)?;
         Ok(())
     }
 
@@ -1038,6 +1123,7 @@ impl Device for Mos6502 {
         let nmi_latch = r.read_bool()?;
         let reset_req = r.read_bool()?;
         state.waiting = r.read_bool()?;
+        state.core_bus = r.read_u8()?;
         self.session.lock().state = state;
         self.lines.restore((irq, nmi_level, nmi_latch, reset_req));
         Ok(())
@@ -1064,6 +1150,21 @@ impl crate::machine::Instance for Mos6502 {
         })?;
         self.attach_space(Arc::clone(space));
         self.set_requester(ctx.requester());
+
+        let wanted = self.links.lock().rdy_link.clone();
+        if let Some(name) = wanted {
+            let peer = ctx.peer(&name).ok_or_else(|| Error::Config {
+                at: alloc::string::String::from(ctx.path()),
+                message: alloc::format!("`rdy = {name}` names no object in this machine"),
+            })?;
+            let gate = peer.cycle_gate().ok_or_else(|| Error::Config {
+                at: alloc::string::String::from(ctx.path()),
+                message: alloc::format!(
+                    "`rdy = {name}` names a device that cannot halt a core: it drives no /RDY"
+                ),
+            })?;
+            self.attach_rdy(gate);
+        }
         Ok(())
     }
 }
@@ -1088,6 +1189,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("decimal", ValueKind::Bool))
         .prop(PropSchema::new("magic", ValueKind::Uint).range(0, 0xff))
         .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
+        .prop(PropSchema::new("rdy", ValueKind::Link))
         // Inputs only: a 6502 drives no line this core models. `/SYNC` and
         // `R/W` are real pins, but nothing yet listens to either.
         .port("irq", PortDir::In)

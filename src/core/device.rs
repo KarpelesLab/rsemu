@@ -31,11 +31,12 @@ use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::any::Any;
 use core::fmt;
 
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
-use crate::core::sched::{Budget, Consumed, LazyHandle};
+use crate::core::sched::{Budget, Consumed, LazyHandle, TickCursor};
 use crate::core::space::{RegionRef, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter};
 use crate::core::sync::AtomicU64;
@@ -439,6 +440,46 @@ pub trait Device: Send + Sync + fmt::Debug {
         Consumed::default()
     }
 
+    /// A named seam onto this device, for a link the other three cannot carry.
+    ///
+    /// Nearly every connection between two devices is a **region**, a **wire**
+    /// or a **clock domain**, and those stay the way to do it. A few are none
+    /// of the three: the RP2A03's DMC hands its sample fetch to the same
+    /// cycle-stealing arbiter that runs OAM DMA, and neither an address nor a
+    /// level can express "fetch this byte and give it back to me".
+    ///
+    /// So a device may publish a named handle, and a sibling that the machine
+    /// file linked to it asks for the name it understands and downcasts. The
+    /// name is the contract: it belongs to the pair, not to the core, and a
+    /// device that does not recognise it answers `None`. `Any` rather than a
+    /// trait object because `core::device` must not learn what a DMC is.
+    fn interface(&self, name: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+        let _ = name;
+        None
+    }
+
+    /// This device's `/RDY`-style arbiter, if it has one to offer.
+    ///
+    /// How a machine wires one device's cycle-stealing DMA to another device's
+    /// halt input without either of them naming the other's type: the core
+    /// resolves a link to the DMA unit and asks it for this.
+    fn cycle_gate(&self) -> Option<Arc<dyn CycleGate>> {
+        None
+    }
+
+    /// Told where to publish its own tick counter as it runs.
+    ///
+    /// A core that is sampled mid-budget — every CPU on a machine with a
+    /// lazily-advanced PPU — writes its cycle count here on each cycle, so
+    /// catch-up aims at the tick the access really happened on rather than at
+    /// the start of the quantum (`ROADMAP.md` §4.2, and
+    /// [`TickCursor`]). Called once, by the
+    /// machine layer, for every runnable device; ignoring it is legitimate and
+    /// costs only accuracy inside one quantum.
+    fn attach_cursor(&self, cursor: TickCursor) {
+        let _ = cursor;
+    }
+
     /// An event this device posted has come due.
     ///
     /// Outward actions — driving a wire, starting a burst — go on `deferred`,
@@ -512,6 +553,25 @@ pub trait Device: Send + Sync + fmt::Debug {
         None
     }
 
+    /// Whether this device has to be caught up on **every** cycle of whatever
+    /// is running, rather than only at its own next event.
+    ///
+    /// [`next_event_tick`](Device::next_event_tick) is enough for a device
+    /// whose outputs change only at instants it can name. It is not enough for
+    /// one whose output is *sampled* continuously by a core it does not know
+    /// about: the NES PPU drives `/NMI`, the 6502 looks at that pin once per
+    /// CPU cycle, and whether the pin was up or down on a given cycle is a
+    /// question with a different answer three dots later. A device that says
+    /// yes is caught up from inside the core's own cycle loop
+    /// ([`TickCursor`]), which costs a catch-up
+    /// per cycle and buys dot-exact sampling.
+    ///
+    /// Default false, because most lazily-advanced devices are read rather than
+    /// watched, and the ones that are read are caught up by the access itself.
+    fn sampled_every_cycle(&self) -> bool {
+        false
+    }
+
     /// Told the handle that catches this device up.
     ///
     /// This is how sync-on-access reaches the code that answers an access:
@@ -524,6 +584,67 @@ pub trait Device: Send + Sync + fmt::Debug {
     fn attach_lazy(&self, handle: LazyHandle) {
         let _ = handle;
     }
+}
+
+/// What a `/RDY`-style arbiter does with the cycle *after* the one a core has
+/// just charged.
+///
+/// The three outcomes are the three things a halted 6502's bus can be doing,
+/// and keeping them apart is the whole point: a stolen cycle is invisible to
+/// the core's own address, while a held one repeats the core's read on the bus
+/// where devices can see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arbitration {
+    /// Nothing is pending. The core keeps the bus.
+    Release,
+    /// The arbiter is holding the core but is not driving the bus itself, so
+    /// the core's own read happens again and is externally visible — which is
+    /// how a DMA's halt and alignment cycles clock a NES controller port or
+    /// advance `$2007`.
+    Hold,
+    /// The arbiter held the core for the cycle it has just charged and is
+    /// letting go now.
+    ///
+    /// The difference from [`Arbitration::Release`] is one cycle: the read the
+    /// core just made was a *halt* cycle, so it has to make it again, and the
+    /// core loses exactly one cycle and no more. A DMA that is scheduled and
+    /// then withdrawn before it can do anything — the NES's aborted DMC fetch —
+    /// costs precisely this.
+    Halted,
+    /// The arbiter drove the bus this cycle, leaving this byte on it. The core
+    /// charges a cycle, makes no access of its own, and takes the byte into its
+    /// own data-bus latch — a DMA cycle is a bus cycle, and the next open-bus
+    /// read the core makes answers with whatever the DMA left there.
+    Steal(u8),
+}
+
+/// A bus master that can stop a core mid-instruction: the `/RDY` pin.
+///
+/// A cycle-stealing DMA unit is not a device that runs on its own schedule —
+/// it runs *instead of* the core, cycle by cycle, and what it does to the bus
+/// on each of those cycles is guest-visible. So the core consults its arbiter
+/// after every bus cycle it charges, and the arbiter answers with what happens
+/// to the next one.
+///
+/// The core may only be halted on a **read**: that is a property of the 6502's
+/// `/RDY` input and of every part that copies it, and it is why `write` is a
+/// parameter rather than something the arbiter has to infer. An arbiter that
+/// wants the bus during a write cycle says [`Arbitration::Release`] and asks
+/// again next cycle.
+///
+/// # Sources
+///
+/// NESdev wiki, [DMA](https://www.nesdev.org/wiki/DMA): "the 6502 core repeats
+/// the last read cycle indefinitely, making no forward progress nor handling
+/// interrupts", and "the CPU only permits halting during read cycles".
+pub trait CycleGate: Send + Sync + fmt::Debug {
+    /// Consulted after every bus cycle a core charges.
+    ///
+    /// `cycle` is the core's own cycle counter *after* that cycle, `held` is
+    /// the address the core is driving, `bus` is the byte the core last left on
+    /// the data bus — an arbiter that reads an undecoded address gets it back —
+    /// and `write` says whether the cycle was a write.
+    fn arbitrate(&self, cycle: u64, held: u64, bus: u8, write: bool) -> Arbitration;
 }
 
 /// A device that performs its own accesses: DMA engines, bus masters, host

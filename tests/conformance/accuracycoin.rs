@@ -1,6 +1,6 @@
 //! AccuracyCoin — the final phase-3 gate, read out of RAM with no screen.
 //!
-//! 125 accuracy tests (plus 5 "DRAW" pages that only print information) on one
+//! 141 accuracy tests (plus 5 "DRAW" pages that only print information) on one
 //! NROM cartridge, MIT, © 2025 Chris Siebert,
 //! <https://github.com/100thCoin/AccuracyCoin>.
 //!
@@ -24,9 +24,10 @@
 //!   `0` not run, `1` PASS, `2` FAIL, `3` in progress. On a failure the error
 //!   code is `byte >> 2`, and it is the number printed on screen after "FAIL" —
 //!   the README's per-section tables list what each one means.
-//! * **Five tests store their result on page 3 instead** (`$03FB-$03FF`). Those
-//!   are the "DRAW" pages, which display information and assert nothing; the
-//!   ROM's own run-all loop skips them, and so does this runner.
+//! * **Five tests store their result on page 3 instead** — all of them into the
+//!   one byte `result_DrawTest = $03FF`. Those are the "DRAW" pages, which
+//!   display information and assert nothing; the ROM's own run-all loop skips
+//!   them, and so does this runner.
 //! * **`$0035` is the "running all tests" flag.** The engine sets it to 1 for
 //!   the duration of a run-everything pass and clears it at the end — which is
 //!   the completion signal a headless runner needs, and much better than
@@ -77,7 +78,11 @@ pub(crate) const RESULTS_BASE: u16 = 0x0400;
 pub(crate) const SCRATCH_START: u16 = 0x0500;
 
 /// Last byte of it.
-pub(crate) const SCRATCH_END: u16 = 0x05ff;
+///
+/// Past the end of the page: the two stress tests lay out one sample per dot of
+/// a 341-dot scanline, which runs to `$0654`, and a dump that stopped at the
+/// page boundary would cut it off exactly where the sprite fetches begin.
+pub(crate) const SCRATCH_END: u16 = 0x0654;
 
 /// What a result byte says about one test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +256,42 @@ impl Report {
     }
 }
 
+/// Which test to snapshot RAM for the moment it finishes.
+///
+/// `RSEMU_AC_WATCH=0450` dumps zero page and the per-test scratch as soon as
+/// `$0450` stops reading "not run". Most of these tests measure something into
+/// an array and then compare it against a table the ROM carries; the verdict
+/// byte says only *that* the comparison failed, so without the array a failure
+/// is a dead end. The run-all loop clears the scratch per test, so the dump has
+/// to happen the frame the result appears.
+pub(crate) const WATCH_ENV: &str = "RSEMU_AC_WATCH";
+
+/// The address named by [`WATCH_ENV`], if it is set to a hex result address.
+fn watched() -> Option<u16> {
+    let text = std::env::var(WATCH_ENV).ok()?;
+    u16::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok()
+}
+
+/// Print a labelled hex dump of `range`.
+fn dump(machine: &dyn NesMachine, label: &str, range: core::ops::RangeInclusive<u16>) {
+    let start = *range.start();
+    println!("  {label}:");
+    let mut line = String::new();
+    for addr in range {
+        if (addr - start).is_multiple_of(16) {
+            if !line.is_empty() {
+                println!("{line}");
+            }
+            line.clear();
+            let _ = write!(line, "    ${addr:04X} ");
+        }
+        let _ = write!(line, " {:02X}", machine.peek(addr));
+    }
+    if !line.is_empty() {
+        println!("{line}");
+    }
+}
+
 /// Boot the ROM, press Start at the menu, wait for the pass, read the results.
 pub(crate) fn run(machine: &mut dyn NesMachine) -> Report {
     machine.set_controller1(buttons::NONE);
@@ -277,15 +318,40 @@ pub(crate) fn run(machine: &mut dyn NesMachine) -> Report {
         status = RunStatus::TimedOut {
             completed: machine.peek(ADDR_TALLY),
         };
+        let watch = watched();
+        let mut dumped = false;
         for _ in 0..RUN_TIMEOUT_FRAMES {
             if machine.peek(ADDR_RUNNING_ALL) == 0 {
                 status = RunStatus::Complete;
                 break;
             }
+            if let Some(addr) = watch
+                && !dumped
+                && machine.peek(addr) != 0
+            {
+                dumped = true;
+                println!(
+                    "\n${addr:04X} finished with {:?}; RAM as it stood:",
+                    decode(machine.peek(addr))
+                );
+                dump(machine, "zero page", 0x0000..=0x00ff);
+                dump(machine, "scratch", SCRATCH_START..=SCRATCH_END);
+                println!();
+            }
             machine.run_frames(1);
+        }
+        if let Some(addr) = watch {
+            println!(
+                "\n${addr:04X} at the end of the pass: {:?}",
+                decode(machine.peek(addr))
+            );
+            dump(machine, "results page", RESULTS_BASE..=RESULTS_BASE + 0xff);
         }
         if let RunStatus::TimedOut { completed } = &mut status {
             *completed = machine.peek(ADDR_TALLY);
+            if let Some(cpu) = machine.cpu_state() {
+                println!("  the machine stopped making progress at {cpu}");
+            }
         }
     }
 
@@ -311,24 +377,30 @@ mod tests {
 
     #[test]
     fn the_table_matches_what_the_rom_documents() {
-        // The README says 125 tests plus 5 "DRAW" pages. If the table ever
-        // drifts from that, the runner is checking the wrong bytes — which is
-        // worse than not running at all.
-        assert_eq!(TESTS.len(), 130);
+        // 141 tests that assert plus 5 "DRAW" pages. If the table ever drifts
+        // from the ROM, the runner is checking the wrong bytes — which is worse
+        // than not running at all.
+        assert_eq!(TESTS.len(), 146);
         assert_eq!(TESTS.iter().filter(|t| t.is_draw()).count(), 5);
-        assert_eq!(TESTS.iter().filter(|t| !t.is_draw()).count(), 125);
+        assert_eq!(TESTS.iter().filter(|t| !t.is_draw()).count(), 141);
     }
 
     #[test]
     fn every_result_address_is_distinct_and_on_a_page_the_rom_uses() {
-        let mut seen: Vec<u16> = TESTS.iter().map(|t| t.result).collect();
+        // The DRAW pages share one byte — `result_DrawTest` — because none of
+        // them writes a verdict; the tests that assert must not.
+        let mut seen: Vec<u16> = TESTS
+            .iter()
+            .filter(|t| !t.is_draw())
+            .map(|t| t.result)
+            .collect();
         seen.sort_unstable();
         let before = seen.len();
         seen.dedup();
         assert_eq!(seen.len(), before, "two tests share a result address");
         for t in &TESTS {
             assert!(
-                (0x03fb..=0x03ff).contains(&t.result) || (0x0400..=0x04ff).contains(&t.result),
+                t.result == 0x03ff || (0x0400..=0x04ff).contains(&t.result),
                 "{} has result address ${:04X}, which is neither page",
                 t.name,
                 t.result
@@ -346,7 +418,7 @@ mod tests {
         assert_eq!(
             draw,
             [
-                "Print magic values",
+                "PPU Reset Flag",
                 "CPU RAM",
                 "CPU Registers",
                 "PPU RAM",
@@ -468,10 +540,10 @@ mod tests {
         let mut machine = FakeCoin::default();
         let report = run(&mut machine);
         assert_eq!(report.status, RunStatus::Complete);
-        assert_eq!(report.results.len(), 125);
-        assert_eq!(report.passed(), 125);
+        assert_eq!(report.results.len(), 141);
+        assert_eq!(report.passed(), 141);
         assert!(report.failed().is_empty());
-        assert!(report.describe().contains("125 of 125 tests passed"));
+        assert!(report.describe().contains("141 of 141 tests passed"));
     }
 
     #[test]
@@ -484,7 +556,7 @@ mod tests {
         let report = run(&mut machine);
         assert_eq!(report.status, RunStatus::Complete);
         assert_eq!(report.passed(), 0);
-        assert_eq!(report.failed().len(), 125);
+        assert_eq!(report.failed().len(), 141);
         assert!(report.failed().iter().all(|(_, code)| *code == 3));
         assert!(report.describe().contains("FAIL 3"));
     }
@@ -503,7 +575,7 @@ mod tests {
             }
         );
         // A partly-built machine still gets a per-test report, all "not run".
-        assert_eq!(report.not_run().len(), 125);
+        assert_eq!(report.not_run().len(), 141);
     }
 
     #[test]
@@ -524,6 +596,9 @@ mod tests {
     fn the_scratch_region_is_captured_for_diagnosis() {
         let mut machine = FakeCoin::default();
         let report = run(&mut machine);
-        assert_eq!(report.scratch.len(), 0x100);
+        assert_eq!(
+            report.scratch.len(),
+            usize::from(SCRATCH_END - SCRATCH_START) + 1
+        );
     }
 }

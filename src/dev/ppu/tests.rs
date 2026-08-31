@@ -75,10 +75,22 @@ fn draw_two_frames(ppu: &NesPpu) {
 }
 
 fn enable_rendering(ppu: &NesPpu) {
-    ppu.write_register(
-        PPUMASK,
-        MASK_BG | MASK_SPRITE | MASK_BG_LEFT | MASK_SPRITE_LEFT,
-    );
+    set_mask(ppu, MASK_BG | MASK_SPRITE | MASK_BG_LEFT | MASK_SPRITE_LEFT);
+}
+
+/// Write `$2001` and let its travel time elapse at once.
+///
+/// A `$2001` write reaches the pipeline three dots later on hardware. Nearly
+/// every test here is *setting the chip up* rather than measuring that, and
+/// three dots of setup would put each of them on a different dot from the one
+/// it means to assert about. The write still goes through the register path, so
+/// the I/O latch is charged the way a real one charges it.
+fn set_mask(ppu: &NesPpu, value: u8) {
+    ppu.write_register(PPUMASK, value);
+    ppu.with_engine(|e| {
+        e.mask = value;
+        e.mask_delay = 0;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -221,9 +233,7 @@ fn reading_2002_one_dot_before_the_set_suppresses_the_flag_entirely() {
 #[test]
 fn reading_2002_on_the_set_dot_returns_the_flag_and_suppresses_the_nmi() {
     // "Reading on the same PPU clock or one later reads it as set, clears it,
-    // and suppresses the NMI for that frame." The request is not announced for
-    // NMI_ANNOUNCE_DOTS, so a read inside that window withdraws it before any
-    // edge reaches the wire at all.
+    // and suppresses the NMI for that frame."
     for dot in [2u16, 3] {
         let (ppu, _, _) = new_ppu();
         let nmi = with_nmi(&ppu);
@@ -234,19 +244,35 @@ fn reading_2002_on_the_set_dot_returns_the_flag_and_suppresses_the_nmi() {
         let status = ppu.read_register(PPUSTATUS);
         assert_eq!(status & STATUS_VBLANK, STATUS_VBLANK, "dot {dot}");
         assert!(ppu.with_engine(|e| e.suppress_nmi), "dot {dot}");
-        // Through to the end of vblank: still nothing.
+        // Through to the end of vblank: the request never comes back.
+        let before = nmi.levels.lock().len();
         ppu.advance_by(u64::from(DOTS_PER_SCANLINE) * 19);
         assert!(
-            !nmi.levels.lock().iter().any(|high| *high),
+            !nmi.levels.lock()[before..].iter().any(|high| *high),
             "dot {dot}: the NMI must stay suppressed for the frame"
         );
     }
+    // At dot 2 the read is early enough that the output — which lags the
+    // request by a dot, because the CPU samples `/NMI` at φ2 — never went high
+    // at all. At dot 3 it had, and the read only pulls it back down; whether
+    // the CPU acted on it is exactly the case AccuracyCoin leaves as "either".
+    let (ppu, _, _) = new_ppu();
+    let nmi = with_nmi(&ppu);
+    ppu.write_register(PPUCTRL, CTRL_NMI);
+    seek(&ppu, VBLANK_SCANLINE, 1);
+    ppu.advance_by(1);
+    ppu.read_register(PPUSTATUS);
+    ppu.advance_by(20);
+    assert!(
+        !nmi.levels.lock().iter().any(|high| *high),
+        "a read on the set dot withdraws the request before the CPU sees it"
+    );
 }
 
 #[test]
 fn a_read_four_dots_after_the_set_is_too_late_to_suppress() {
-    // Outside the window the request has already been announced, so the CPU has
-    // seen the edge and clearing the flag only lowers the line again.
+    // By then the output has been high for a dot, so the CPU has had it under
+    // its φ2 sample and clearing the flag only lowers the line again.
     let (ppu, _, _) = new_ppu();
     let nmi = with_nmi(&ppu);
     ppu.write_register(PPUCTRL, CTRL_NMI);
@@ -255,6 +281,8 @@ fn a_read_four_dots_after_the_set_is_too_late_to_suppress() {
     assert_eq!(ppu.position(), (VBLANK_SCANLINE, 4));
     assert_eq!(nmi.levels.lock().as_slice(), &[true]);
     ppu.read_register(PPUSTATUS);
+    // The output follows a dot later, which is the whole point of the delay.
+    ppu.advance_by(1);
     assert_eq!(nmi.levels.lock().as_slice(), &[true, false]);
 }
 
@@ -268,9 +296,15 @@ fn enabling_nmi_mid_vblank_requests_one_immediately() {
     ppu.advance_by(10);
     assert!(nmi.levels.lock().is_empty(), "NMI output is still off");
     ppu.write_register(PPUCTRL, CTRL_NMI);
+    // The output lags the request by one dot — the CPU samples `/NMI` at φ2 and
+    // latches the data bus at the end of it — so the write is on the wire by
+    // the time the core next looks, which is the next cycle.
+    ppu.advance_by(1);
     assert_eq!(nmi.levels.lock().as_slice(), &[true]);
     ppu.write_register(PPUCTRL, 0);
+    ppu.advance_by(1);
     ppu.write_register(PPUCTRL, CTRL_NMI);
+    ppu.advance_by(1);
     assert_eq!(nmi.levels.lock().as_slice(), &[true, false, true]);
 }
 
@@ -282,9 +316,10 @@ fn the_nmi_falls_when_vblank_ends() {
     seek(&ppu, VBLANK_SCANLINE, 1);
     ppu.advance_by(3);
     assert_eq!(nmi.levels.lock().as_slice(), &[true]);
-    // Straight through to the pre-render line's dot 1, where the flag clears.
+    // Straight through to the pre-render line's dot 1, where the flag clears —
+    // and one dot further, for the output to follow it.
     seek(&ppu, PRE_RENDER_SCANLINE, 0);
-    ppu.advance_by(2);
+    ppu.advance_by(3);
     assert_eq!(nmi.levels.lock().as_slice(), &[true, false]);
 }
 
@@ -381,7 +416,7 @@ fn open_bus_fills_the_unused_bits_of_2002_and_decays() {
     let ppu = NesPpu::new(&props).unwrap();
     ppu.attach_bus(Arc::new(AddressSpace::new("ppu", 14)));
     // A write to a write-only port charges the whole latch.
-    ppu.write_register(PPUMASK, 0x1f);
+    set_mask(&ppu, 0x1f);
     assert_eq!(ppu.read_register(PPUSTATUS) & 0x1f, 0x1f);
     // Reading a write-only port returns the latch, unchanged.
     assert_eq!(ppu.read_register(PPUCTRL), 0x1f);
@@ -483,7 +518,7 @@ fn palette_entries_are_six_bits() {
 fn a_palette_read_reports_the_top_two_bits_as_open_bus() {
     let (ppu, _, _) = new_ppu();
     ppu.poke_palette(0x3f00, 0x0f);
-    ppu.write_register(PPUMASK, 0xc0); // charges the latch with $C0
+    set_mask(&ppu, 0xc0); // charges the latch with $C0
     ppu.write_register(PPUADDR, 0x3f);
     ppu.write_register(PPUADDR, 0x00);
     // $2006 writes recharged the latch with the last written byte, $00.
@@ -512,7 +547,7 @@ fn the_background_pipeline_draws_a_uniform_screen() {
     plain_background(&chr, &nt, 1);
     ppu.poke_palette(0x3f00, 0x0f); // backdrop
     ppu.poke_palette(0x3f01, 0x21); // colour 1 of palette 0
-    ppu.write_register(PPUMASK, MASK_BG | MASK_BG_LEFT);
+    set_mask(&ppu, MASK_BG | MASK_BG_LEFT);
     draw_two_frames(&ppu);
     for x in [0usize, 1, 7, 8, 128, 255] {
         assert_eq!(ppu.pixel(x, 100).unwrap().index(), 0x21, "x = {x}");
@@ -525,7 +560,7 @@ fn the_left_column_mask_hides_the_first_eight_pixels() {
     plain_background(&chr, &nt, 1);
     ppu.poke_palette(0x3f00, 0x0f);
     ppu.poke_palette(0x3f01, 0x21);
-    ppu.write_register(PPUMASK, MASK_BG); // no MASK_BG_LEFT
+    set_mask(&ppu, MASK_BG); // no MASK_BG_LEFT
     draw_two_frames(&ppu);
     assert_eq!(ppu.pixel(0, 100).unwrap().index(), 0x0f);
     assert_eq!(ppu.pixel(7, 100).unwrap().index(), 0x0f);
@@ -546,7 +581,7 @@ fn fine_x_shifts_the_background_left() {
     }
     ppu.poke_palette(0x3f00, 0x0f);
     ppu.poke_palette(0x3f01, 0x21);
-    ppu.write_register(PPUMASK, MASK_BG | MASK_BG_LEFT);
+    set_mask(&ppu, MASK_BG | MASK_BG_LEFT);
     ppu.write_register(PPUSCROLL, 3); // fine X = 3, coarse X = 0
     ppu.write_register(PPUSCROLL, 0);
     draw_two_frames(&ppu);
@@ -559,7 +594,7 @@ fn greyscale_masks_the_palette_index() {
     let (ppu, chr, nt) = new_ppu();
     plain_background(&chr, &nt, 1);
     ppu.poke_palette(0x3f01, 0x21);
-    ppu.write_register(PPUMASK, MASK_BG | MASK_BG_LEFT | MASK_GREYSCALE);
+    set_mask(&ppu, MASK_BG | MASK_BG_LEFT | MASK_GREYSCALE);
     draw_two_frames(&ppu);
     assert_eq!(ppu.pixel(100, 100).unwrap().index(), 0x20);
 }
@@ -568,7 +603,7 @@ fn greyscale_masks_the_palette_index() {
 fn emphasis_travels_with_the_pixel() {
     let (ppu, _, _) = new_ppu();
     ppu.poke_palette(0x3f00, 0x0f);
-    ppu.write_register(PPUMASK, MASK_EMPHASIS_R | MASK_EMPHASIS_B);
+    set_mask(&ppu, MASK_EMPHASIS_R | MASK_EMPHASIS_B);
     draw_two_frames(&ppu);
     assert_eq!(ppu.pixel(10, 10).unwrap().emphasis(), 0b101);
 }
@@ -666,7 +701,7 @@ fn a_sprite_is_drawn_one_line_below_its_y_byte() {
     ppu.poke_oam(1, 1); // tile
     ppu.poke_oam(2, 0); // attributes: palette 0, in front
     ppu.poke_oam(3, 40); // X
-    ppu.write_register(PPUMASK, MASK_SPRITE | MASK_SPRITE_LEFT);
+    set_mask(&ppu, MASK_SPRITE | MASK_SPRITE_LEFT);
     draw_two_frames(&ppu);
     assert_eq!(ppu.pixel(40, 50).unwrap().index(), 0x0f, "not on line 50");
     assert_eq!(ppu.pixel(40, 51).unwrap().index(), 0x27);
@@ -685,7 +720,7 @@ fn sprites_never_appear_on_scanline_zero() {
     ppu.poke_oam(0, 0xff); // Y = 255 wraps into range for line 0 if evaluated
     ppu.poke_oam(1, 1);
     ppu.poke_oam(3, 0);
-    ppu.write_register(PPUMASK, MASK_SPRITE | MASK_SPRITE_LEFT);
+    set_mask(&ppu, MASK_SPRITE | MASK_SPRITE_LEFT);
     draw_two_frames(&ppu);
     assert_eq!(ppu.pixel(0, 0).unwrap().index(), 0x0f);
 }
@@ -709,7 +744,7 @@ fn an_8x16_sprite_takes_its_bank_from_the_tile_byte() {
     ppu.poke_oam(2, 0);
     ppu.poke_oam(3, 40);
     ppu.write_register(PPUCTRL, CTRL_SPRITE_16);
-    ppu.write_register(PPUMASK, MASK_SPRITE | MASK_SPRITE_LEFT);
+    set_mask(&ppu, MASK_SPRITE | MASK_SPRITE_LEFT);
     draw_two_frames(&ppu);
     assert_eq!(ppu.pixel(40, 51).unwrap().index(), 0x27, "top half");
     assert_eq!(ppu.pixel(40, 59).unwrap().index(), 0x28, "bottom half");
@@ -730,7 +765,7 @@ fn sprite_flipping_mirrors_the_pattern() {
     ppu.poke_oam(1, 1);
     ppu.poke_oam(2, SPRITE_FLIP_X | SPRITE_FLIP_Y);
     ppu.poke_oam(3, 40);
-    ppu.write_register(PPUMASK, MASK_SPRITE | MASK_SPRITE_LEFT);
+    set_mask(&ppu, MASK_SPRITE | MASK_SPRITE_LEFT);
     draw_two_frames(&ppu);
     // Flipped both ways, the solid row is at the bottom and the column right.
     assert_eq!(ppu.pixel(47, 58).unwrap().index(), 0x27);
@@ -751,7 +786,7 @@ fn only_eight_sprites_are_drawn_and_the_ninth_sets_overflow() {
         ppu.poke_oam(index * 4 + 2, 0);
         ppu.poke_oam(index * 4 + 3, index * 8);
     }
-    ppu.write_register(PPUMASK, MASK_SPRITE | MASK_SPRITE_LEFT);
+    set_mask(&ppu, MASK_SPRITE | MASK_SPRITE_LEFT);
     draw_two_frames(&ppu);
     assert_eq!(
         ppu.pixel(56, 51).unwrap().index(),
@@ -787,7 +822,7 @@ fn the_overflow_bug_reads_a_tile_byte_as_a_y_coordinate() {
     // The walk examines (n=8, m=0), then (9, 1), then (10, 2): the second byte
     // it looks at is sprite 9's *tile* number.
     ppu.poke_oam(9 * 4 + 1, 50);
-    ppu.write_register(PPUMASK, MASK_SPRITE | MASK_SPRITE_LEFT);
+    set_mask(&ppu, MASK_SPRITE | MASK_SPRITE_LEFT);
     draw_two_frames(&ppu);
     assert_ne!(
         ppu.with_engine(|e| e.status) & STATUS_OVERFLOW,
@@ -811,7 +846,7 @@ fn the_overflow_flag_stays_clear_with_eight_sprites_and_nothing_in_range() {
             ppu.poke_oam(index * 4 + byte, 0xf0);
         }
     }
-    ppu.write_register(PPUMASK, MASK_SPRITE | MASK_SPRITE_LEFT);
+    set_mask(&ppu, MASK_SPRITE | MASK_SPRITE_LEFT);
     draw_two_frames(&ppu);
     assert_eq!(ppu.with_engine(|e| e.status) & STATUS_OVERFLOW, 0);
 }
@@ -914,7 +949,7 @@ fn sprite_zero_never_hits_in_a_clipped_left_column() {
     let (ppu, chr, nt) = new_ppu();
     sprite_zero_scene(&ppu, &chr, &nt, 0, 50);
     // Background left column shown, sprites clipped: no hit in x 0..7.
-    ppu.write_register(PPUMASK, MASK_BG | MASK_SPRITE | MASK_BG_LEFT);
+    set_mask(&ppu, MASK_BG | MASK_SPRITE | MASK_BG_LEFT);
     draw_two_frames(&ppu);
     assert_eq!(ppu.with_engine(|e| e.status) & STATUS_SPRITE0, 0);
 }
@@ -923,7 +958,7 @@ fn sprite_zero_never_hits_in_a_clipped_left_column() {
 fn sprite_zero_never_hits_with_a_layer_disabled() {
     let (ppu, chr, nt) = new_ppu();
     sprite_zero_scene(&ppu, &chr, &nt, 40, 50);
-    ppu.write_register(PPUMASK, MASK_SPRITE | MASK_SPRITE_LEFT); // no background
+    set_mask(&ppu, MASK_SPRITE | MASK_SPRITE_LEFT); // no background
     draw_two_frames(&ppu);
     assert_eq!(ppu.with_engine(|e| e.status) & STATUS_SPRITE0, 0);
 }
@@ -998,14 +1033,34 @@ fn writing_2004_while_rendering_bumps_oamaddr_without_storing() {
 }
 
 #[test]
-fn reading_2004_during_the_secondary_oam_clear_returns_ff() {
-    // NESdev PPU sprite evaluation, dots 1-64.
+fn reading_2004_listens_in_on_whatever_the_sprite_unit_is_reading() {
+    // `OAMADDR` is not the answer while the sprite unit owns OAM: a `$2004`
+    // read picks up the OAM read line, and that carries something different on
+    // each phase of the scanline (NESdev, *PPU sprite evaluation*).
     let (ppu, _, _) = new_ppu();
     enable_rendering(&ppu);
     ppu.poke_oam(0, 0x12);
+    // Dots 1-64: the secondary-OAM clear forces the read line.
     seek(&ppu, 10, 30);
     assert_eq!(ppu.read_register(OAMDATA), 0xff);
-    seek(&ppu, 10, 100);
+    // Dots 65-256: the primary-OAM read latch. Run dots 64 and 65 for real —
+    // 64 captures the base OAMADDR, 65 is the odd dot that fills the latch with
+    // the first sprite's Y coordinate.
+    seek(&ppu, 10, 64);
+    ppu.advance_by(2);
+    assert_eq!(ppu.position(), (10, 66));
+    assert_eq!(ppu.read_register(OAMDATA), 0x12);
+    // Dots 257-320: secondary OAM, which nothing was copied into.
+    seek(&ppu, 10, 300);
+    assert_eq!(ppu.read_register(OAMDATA), 0xff);
+    // And with rendering off the unit is not driving the line at all, so the
+    // read is the ordinary `OAMADDR` one.
+    ppu.write_register(PPUMASK, 0);
+    ppu.with_engine(|e| {
+        e.mask = 0;
+        e.mask_delay = 0;
+    });
+    ppu.write_register(OAMADDR, 0);
     assert_eq!(ppu.read_register(OAMDATA), 0x12);
 }
 
@@ -1019,6 +1074,45 @@ fn oam_dma_bytes_go_through_the_2004_path() {
     assert_eq!(ppu.peek_oam(0), 0x40);
     assert_eq!(ppu.peek_oam(2), 0x42 & SPRITE_ATTR_IMPLEMENTED);
     assert_eq!(ppu.oam_addr(), 4);
+}
+
+#[test]
+fn switching_rendering_off_mid_line_corrupts_the_row_it_comes_back_on() {
+    // The other half of the same handover. Rendering goes away while the sprite
+    // unit is standing somewhere in secondary OAM; the address goes back to
+    // `OAMADDR`, and when rendering returns it is handed over again — copying
+    // `OAMADDR`'s row over the row the unit had reached (NESdev, *Errata*).
+    let (ppu, _, _) = new_ppu();
+    for index in 0..64u8 {
+        ppu.poke_oam(index, 0xa0 | (index & 0x0f));
+    }
+    ppu.write_register(OAMADDR, 0);
+    enable_rendering(&ppu);
+    // Somewhere inside the secondary-OAM clear, so the pointer is not zero.
+    seek(&ppu, 10, 40);
+    ppu.advance_by(1);
+
+    // The real write path, because the handover is armed where the delayed
+    // `$2001` write finally commits.
+    ppu.write_register(PPUMASK, 0);
+    ppu.advance_by(4);
+    let row = ppu
+        .with_engine(|e| e.corrupt_row)
+        .expect("armed on the way down");
+    assert_ne!(row, 0, "the unit was standing somewhere real");
+    ppu.write_register(
+        PPUMASK,
+        MASK_BG | MASK_SPRITE | MASK_BG_LEFT | MASK_SPRITE_LEFT,
+    );
+    ppu.advance_by(4);
+
+    for i in 0..8u8 {
+        assert_eq!(
+            ppu.peek_oam(row * 8 + i),
+            ppu.peek_oam(i),
+            "row {row}, byte {i}: OAMADDR's row should have been copied here"
+        );
+    }
 }
 
 #[test]
@@ -1060,7 +1154,7 @@ fn a_misaligned_oamaddr_reinterprets_oam_bytes() {
     ppu.poke_oam(5, 1);
     ppu.poke_oam(6, 0);
     ppu.poke_oam(7, 60);
-    ppu.write_register(PPUMASK, MASK_SPRITE | MASK_SPRITE_LEFT);
+    set_mask(&ppu, MASK_SPRITE | MASK_SPRITE_LEFT);
     // OAMADDR is forced back to zero at dots 257-320 of every rendering line,
     // so the write has to land after that window and before the next line's
     // evaluation starts at dot 65.
@@ -1117,7 +1211,7 @@ fn realize_announces_the_nmi_line() {
 fn a_cold_reset_returns_every_register_to_its_documented_value() {
     let (ppu, _, _) = new_ppu();
     ppu.write_register(PPUCTRL, 0xff);
-    ppu.write_register(PPUMASK, 0xff);
+    set_mask(&ppu, 0xff);
     ppu.advance_by(1000);
     ppu.reset(ResetKind::Cold);
     ppu.with_engine(|e| {
@@ -1437,39 +1531,32 @@ fn a_frame_is_the_number_of_cpu_cycles_the_chart_gives() {
 }
 
 #[test]
-fn the_nmi_announce_delay_is_one_cpu_cycle_rounded_up() {
-    // Three dots on NTSC and Dendy; four on PAL, because a 2C07 CPU cycle is
-    // 3.2 dots and the first whole dot at or past it is the fourth.
-    assert_eq!(Region::Ntsc.geometry().nmi_announce_dots, 3);
-    assert_eq!(Region::Pal.geometry().nmi_announce_dots, 4);
-    assert_eq!(Region::Dendy.geometry().nmi_announce_dots, 3);
-    for region in REGIONS {
-        let g = region.geometry();
-        assert!(
-            g.nmi_announce_dots * region.dot_divider() >= region.cpu_divider(),
-            "{region} must not announce before a CPU cycle has passed"
-        );
-    }
-}
-
-#[test]
-fn the_nmi_reaches_the_wire_after_that_delay_in_every_region() {
+fn the_nmi_output_lags_the_request_by_exactly_one_dot_in_every_region() {
+    // A 6502 samples `/NMI` during φ2 and latches its data bus at the end of
+    // it, so what it acts on is the level from a dot earlier — see
+    // `Engine::nmi_active`. Every region, because the ratio differs and the
+    // rule does not.
     for region in REGIONS {
         let g = region.geometry();
         let (ppu, _, _) = new_ppu_in(region);
         let log = with_nmi(&ppu);
         ppu.write_register(PPUCTRL, CTRL_NMI);
         seek(&ppu, g.vblank_scanline, 1);
-        // Stop one dot short of the announce delay expiring.
-        ppu.advance_by(g.nmi_announce_dots - 1);
         assert!(
             !log.levels.lock().iter().any(|high| *high),
-            "{region}: /NMI must not be announced inside one CPU cycle"
+            "{region}: nothing before the flag is even set"
+        );
+        // Run the dot that sets the flag: the output still shows the level from
+        // before it.
+        ppu.advance_by(1);
+        assert!(
+            !log.levels.lock().iter().any(|high| *high),
+            "{region}: the output lags the request"
         );
         ppu.advance_by(1);
         assert!(
             log.levels.lock().iter().any(|high| *high),
-            "{region}: /NMI must be announced once the CPU cycle has passed"
+            "{region}: and follows it one dot later"
         );
     }
 }
@@ -1649,6 +1736,10 @@ fn the_nmi_pin_connects_announces_and_refuses_anything_else() {
         "connecting is not an outward action; announcing is"
     );
     ppu.announce(NMI_PIN);
+    // Nothing has ticked, so the sampled output is still the idle level and the
+    // net has nothing new to deliver.
+    assert!(sink.levels.lock().iter().all(|high| !*high));
+    ppu.advance_by(1);
     assert_eq!(sink.levels.lock().last().copied(), Some(true));
 
     // An unknown pin is an error naming the port, and an unknown announce is
@@ -1684,17 +1775,15 @@ fn the_class_constructs_through_the_registry_with_a_region() {
 
 #[test]
 fn the_next_event_is_always_far_enough_ahead_to_be_reachable() {
-    // Two things depend on this bound, and both fail silently without it:
-    // catch-up that returns the tick a device already stands on makes no
-    // progress, and a clock tree may sit up to one driving-domain tick behind
-    // virtual time, so a nearer answer names an instant already in the past and
-    // a run loop discards it.
+    // Catch-up that returns the tick a device already stands on makes no
+    // progress and stalls where it is, so every candidate must be strictly
+    // ahead — and none may be dropped for being close, because the one that
+    // matters is two dots away.
     for region in [Region::Ntsc, Region::Pal, Region::Dendy] {
         let (ppu, _, _) = new_ppu_in(region);
-        let lead = ppu.geometry().nmi_announce_dots + 1;
-        // Two scanlines is the ceiling: the next line boundary, or the one
-        // after it when the first is inside the lead.
-        let ceiling = 2 * u64::from(DOTS_PER_SCANLINE) + lead;
+        let lead = 1;
+        // One scanline is the ceiling: the line boundary is always a candidate.
+        let ceiling = u64::from(DOTS_PER_SCANLINE);
         // A frame and a bit, one dot at a time.
         for _ in 0..(ppu.geometry().dots_per_frame + 500) {
             let next = ppu.next_event_dot();
@@ -1733,11 +1822,11 @@ fn stopping_at_every_next_event_still_reaches_the_nmi_on_its_own_dot() {
         }
     }
     let at = first_high.expect("the NMI never asserted in a frame");
-    // The flag is set by the dot at (vblank_scanline, 1) and the request
-    // reaches the wire `nmi_announce_dots` later — one CPU cycle, rounded up.
+    // The flag is set by the dot at (vblank_scanline, 1) and the output follows
+    // one dot later.
     let flag_dot = u64::from(geom.vblank_scanline) * u64::from(DOTS_PER_SCANLINE) + 1;
     assert!(
-        (flag_dot + geom.nmi_announce_dots..=flag_dot + geom.nmi_announce_dots + 8).contains(&at),
+        (flag_dot + 1..=flag_dot + 8).contains(&at),
         "the request reached the wire at dot {at}, not just after {flag_dot}"
     );
 }

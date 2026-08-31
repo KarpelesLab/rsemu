@@ -49,6 +49,14 @@ pub enum DmaKind {
     Load,
     /// Scheduled by the output unit emptying the sample buffer.
     Reload,
+    /// A reload that will never happen, and halts the CPU anyway.
+    ///
+    /// When playback stops during the APU cycle before a reload would have been
+    /// scheduled, the DMA still starts — and is aborted after a single cycle
+    /// ([NESdev DMA](https://www.nesdev.org/wiki/DMA)). One cycle of `/RDY`
+    /// low, no dummy, no fetch. And unlike a real fetch, which a write cycle
+    /// merely delays, an abort that meets a write cycle does not happen at all.
+    Abort,
 }
 
 /// A sample fetch the DMC wants the CPU to perform.
@@ -68,6 +76,8 @@ pub struct DmaRequest {
     pub addr: u16,
     /// Identifies this request for the lifetime of the machine.
     pub serial: u64,
+    /// The CPU cycle the fetch was scheduled on.
+    pub at: u64,
 }
 
 /// A scheduled but unserviced fetch.
@@ -75,6 +85,13 @@ pub struct DmaRequest {
 struct Pending {
     kind: DmaKind,
     serial: u64,
+    /// The CPU cycle the fetch was scheduled on.
+    ///
+    /// The DMA unit needs it: a *load* fetch does not halt the CPU until the
+    /// get cycle of the second APU cycle after the write that scheduled it —
+    /// the third or fourth CPU cycle, depending on the phase the write landed
+    /// on (NESdev wiki, "DMA").
+    at: u64,
 }
 
 /// The delta modulation channel: memory reader, sample buffer, timer, output
@@ -112,6 +129,11 @@ pub struct Dmc {
     irq: bool,
     /// A fetch waiting for the CPU.
     dma: Option<Pending>,
+    /// The CPU cycle playback last stopped on, explicitly or implicitly.
+    ///
+    /// Kept so the output unit can tell whether the buffer emptied *just* after
+    /// the stop, which is the window the aborted DMA lives in.
+    stopped_at: Option<u64>,
     /// Source of [`DmaRequest::serial`] values.
     next_serial: u64,
 }
@@ -136,6 +158,7 @@ impl Dmc {
             timer: 0,
             irq: false,
             dma: None,
+            stopped_at: None,
             next_serial: 1,
         }
     }
@@ -234,15 +257,18 @@ impl Dmc {
     /// has not yet performed. Setting it restarts the sample only if the
     /// counter is already zero, and schedules a *load* fetch if the buffer is
     /// empty.
-    pub fn set_enabled(&mut self, enabled: bool) {
+    pub fn set_enabled(&mut self, enabled: bool, now: u64) {
         if enabled {
             if self.bytes_remaining == 0 {
                 self.restart();
             }
-            self.schedule(DmaKind::Load);
+            self.schedule(DmaKind::Load, now);
         } else {
+            // Playback stops, but a fetch that is already scheduled still
+            // happens: the CPU has been told to halt and the DMA runs its full
+            // length. What the byte is used for afterwards is another matter.
             self.bytes_remaining = 0;
-            self.dma = None;
+            self.stopped_at = Some(now);
         }
     }
 
@@ -250,11 +276,12 @@ impl Dmc {
     ///
     /// The wiki's condition verbatim: any time the sample buffer is empty and
     /// bytes remaining is not zero.
-    fn schedule(&mut self, kind: DmaKind) {
+    fn schedule(&mut self, kind: DmaKind, now: u64) {
         if self.dma.is_none() && self.buffer.is_none() && self.bytes_remaining > 0 {
             self.dma = Some(Pending {
                 kind,
                 serial: self.next_serial,
+                at: now,
             });
             self.next_serial = self.next_serial.wrapping_add(1);
         }
@@ -266,6 +293,7 @@ impl Dmc {
             kind: p.kind,
             addr: self.cur_addr,
             serial: p.serial,
+            at: p.at,
         })
     }
 
@@ -278,11 +306,22 @@ impl Dmc {
         self.dma.is_some_and(|p| p.serial == serial)
     }
 
+    /// Withdraw a request the arbiter refused to take up.
+    ///
+    /// An aborted DMA whose halt attempt landed on a write cycle does not
+    /// happen at all — the ordinary "wait and try again" rule does not apply to
+    /// it — so the arbiter tells the channel to forget it.
+    pub fn dma_withdraw(&mut self, serial: u64) {
+        if self.dma_is_pending(serial) {
+            self.dma = None;
+        }
+    }
+
     /// Deliver the byte the CPU fetched.
     ///
     /// Returns false — and changes nothing — if the request was withdrawn in
     /// the meantime.
-    pub fn dma_complete(&mut self, serial: u64, byte: u8) -> bool {
+    pub fn dma_complete(&mut self, serial: u64, byte: u8, now: u64) -> bool {
         if !self.dma_is_pending(serial) {
             return false;
         }
@@ -293,29 +332,39 @@ impl Dmc {
         } else {
             self.cur_addr + 1
         };
+        if self.bytes_remaining == 0 {
+            // Playback was stopped while this fetch was in flight. The byte is
+            // in the buffer and the memory reader has nothing left to count.
+            return true;
+        }
         self.bytes_remaining -= 1;
         if self.bytes_remaining == 0 {
             if self.loop_flag {
                 self.restart();
-            } else if self.irq_enabled {
-                self.irq = true;
+            } else {
+                // Playback has ended of its own accord. That counts as a stop
+                // for the aborted-DMA window exactly as a `$4015` write does.
+                self.stopped_at = Some(now);
+                if self.irq_enabled {
+                    self.irq = true;
+                }
             }
         }
         true
     }
 
     /// Clock the timer. Called once per APU cycle.
-    pub fn tick_timer(&mut self) {
+    pub fn tick_timer(&mut self, now: u64) {
         if self.timer == 0 {
             self.timer = self.reload();
-            self.clock_output();
+            self.clock_output(now);
         } else {
             self.timer -= 1;
         }
     }
 
     /// One output-unit clock: adjust the level, shift, count the bit.
-    fn clock_output(&mut self) {
+    fn clock_output(&mut self, now: u64) {
         if !self.silence {
             if self.shift & 1 != 0 {
                 if self.output <= 125 {
@@ -338,7 +387,24 @@ impl Dmc {
             }
             // Emptying the buffer is exactly the condition that schedules the
             // next fetch, and it is a reload rather than a load.
-            self.schedule(DmaKind::Reload);
+            self.schedule(DmaKind::Reload, now);
+            // ...unless playback stopped a moment ago, in which case the DMA
+            // starts and is aborted after one cycle. "This aborted DMA
+            // schedules regardless of how playback was stopped, whether
+            // explicitly or implicitly" (NESdev, "DMA").
+            if self.dma.is_none()
+                && self.bytes_remaining == 0
+                && self
+                    .stopped_at
+                    .is_some_and(|at| now.saturating_sub(at) <= 2)
+            {
+                self.dma = Some(Pending {
+                    kind: DmaKind::Abort,
+                    serial: self.next_serial,
+                    at: now,
+                });
+                self.next_serial = self.next_serial.wrapping_add(1);
+            }
         }
     }
 
@@ -387,6 +453,7 @@ impl Dmc {
                 w.write_u8(match p.kind {
                     DmaKind::Load => 1,
                     DmaKind::Reload => 2,
+                    DmaKind::Abort => 3,
                 })?;
                 w.write_u64(p.serial)?;
             }
@@ -395,7 +462,10 @@ impl Dmc {
                 w.write_u64(0)?;
             }
         }
-        w.write_u64(self.next_serial)
+        w.write_u64(self.next_serial)?;
+        // Appended: the cycle a pending fetch was scheduled on, which decides
+        // the phase it may halt the CPU on.
+        w.write_u64(self.dma.map_or(0, |p| p.at))
     }
 
     /// Restore what [`Dmc::save`] wrote.
@@ -418,18 +488,29 @@ impl Dmc {
         self.irq = r.read_bool()?;
         let kind = r.read_u8()?;
         let serial = r.read_u64()?;
+        self.next_serial = r.read_u64()?;
+        // v2 appended the cycle a pending fetch was scheduled on. A v1 chunk
+        // has no such field; zero is the right restore, because a fetch whose
+        // schedule cycle is already past halts on the next legal phase.
+        let at = r.read_u64().unwrap_or(0);
         self.dma = match kind {
             1 => Some(Pending {
                 kind: DmaKind::Load,
                 serial,
+                at,
             }),
             2 => Some(Pending {
                 kind: DmaKind::Reload,
                 serial,
+                at,
+            }),
+            3 => Some(Pending {
+                kind: DmaKind::Abort,
+                serial,
+                at,
             }),
             _ => None,
         };
-        self.next_serial = r.read_u64()?;
         Ok(())
     }
 }

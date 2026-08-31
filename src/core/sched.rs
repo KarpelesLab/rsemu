@@ -96,7 +96,7 @@ use core::cmp::{Ordering, Reverse};
 use core::fmt;
 
 use crate::core::clock::{ClockError, ClockForest, DomainId, GlobalTime, OscillatorId};
-use crate::core::sync::Mutex;
+use crate::core::sync::{AtomicU64, Mutex, Ordering as AtomicOrdering};
 
 // ---------------------------------------------------------------------------
 // errors
@@ -728,6 +728,154 @@ impl Consumed {
     }
 }
 
+/// Where a runnable has got to **inside** the quantum it is running.
+///
+/// A [`Runnable`] reports what it consumed only when it returns, so for the
+/// length of one `run` call the clock forest still stands where the quantum
+/// began. That is fine for a device nobody is looking at and wrong for one that
+/// is sampled: a 6502 reading `$2002` on the ninth cycle of a budget needs the
+/// PPU on the dot that cycle really is, not on the dot the quantum started at.
+///
+/// So a core publishes its own cycle counter here as it runs, and the scheduler
+/// converts that into every lazily-advanced device's domain through the
+/// oscillator tree they share -- exact integer arithmetic, never absolute time
+/// (`ROADMAP.md` 4.2). This is the "letting a runnable report progress *as* it
+/// runs" that [`LazyHandle`] names as the proper resolution of its own
+/// staleness.
+///
+/// Publishing is optional: a core that never touches its cursor leaves catch-up
+/// exactly where it was, bounded by the quantum.
+#[derive(Debug, Clone, Default)]
+pub struct TickCursor {
+    inner: Arc<CursorInner>,
+}
+
+/// What a cursor shares between the runnable and the scheduler.
+#[derive(Debug, Default)]
+struct CursorInner {
+    /// The runnable's own tick counter.
+    ticks: AtomicU64,
+    /// The first tick at which some lazily-advanced device has an event of its
+    /// own, in the *runnable's* ticks. `u64::MAX` when none has one.
+    deadline: AtomicU64,
+    /// The slots to catch up when that tick arrives.
+    slots: Mutex<Option<Arc<[Arc<LazySlot>]>>>,
+}
+
+impl TickCursor {
+    /// A fresh cursor at zero.
+    #[must_use]
+    pub fn new() -> TickCursor {
+        TickCursor {
+            inner: Arc::new(CursorInner {
+                ticks: AtomicU64::new(0),
+                deadline: AtomicU64::new(u64::MAX),
+                slots: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// Publish the runnable's own tick counter.
+    ///
+    /// Monotonic and free-running -- it is the core's ticks-since-power-on, not
+    /// an offset into the budget, so nothing has to be reset between quanta and
+    /// a core carrying cycle debt still reports the truth.
+    ///
+    /// **This is also where a lazily-advanced device's own event lands.** A
+    /// vblank NMI is caused by nothing the core did, so nothing on the access
+    /// path will ever ask for it; if the core is running a long stretch that
+    /// touches no PPU register the flag would otherwise not be raised until the
+    /// quantum ended, tens of cycles late. So the cursor knows the next tick at
+    /// which some device has an event, and crossing it catches every one of
+    /// them up right here — inside the cycle, before the core samples its pins.
+    #[inline]
+    pub fn set(&self, ticks: u64) {
+        self.inner.ticks.store(ticks, AtomicOrdering::Relaxed);
+        if ticks >= self.inner.deadline.load(AtomicOrdering::Relaxed) {
+            self.reach(ticks);
+        }
+    }
+
+    /// What was last published.
+    #[inline]
+    #[must_use]
+    pub fn get(&self) -> u64 {
+        self.inner.ticks.load(AtomicOrdering::Relaxed)
+    }
+
+    /// A device's event tick has arrived: catch every device up and work out
+    /// where the next one is.
+    ///
+    /// Cold on purpose. It runs a handful of times per scanline on a NES, and
+    /// the common path is one relaxed load.
+    #[cold]
+    fn reach(&self, ticks: u64) {
+        // Cloned out: the slot list is fixed after realize, and holding a leaf
+        // lock across `LazySlot::sync` — which takes another leaf — is the
+        // order violation `core::sync` exists to catch.
+        let slots = self.inner.slots.lock().clone();
+        let Some(slots) = slots else {
+            self.inner.deadline.store(u64::MAX, AtomicOrdering::Relaxed);
+            return;
+        };
+        let mut next = u64::MAX;
+        for slot in slots.iter() {
+            let _ = slot.sync(slot.id, None, AccessKind::Guest);
+            if let Some(at) = slot.cursor_deadline(ticks) {
+                next = next.min(at.max(ticks + 1));
+            }
+        }
+        self.inner.deadline.store(next, AtomicOrdering::Relaxed);
+    }
+
+    /// Point the cursor at the devices it should keep in step, and recompute
+    /// the first tick at which one of them has something to do.
+    fn watch(&self, slots: Option<Arc<[Arc<LazySlot>]>>) {
+        let mut next = u64::MAX;
+        if let Some(slots) = &slots {
+            let now = self.get();
+            for slot in slots.iter() {
+                if let Some(at) = slot.cursor_deadline(now) {
+                    next = next.min(at.max(now));
+                }
+            }
+        }
+        *self.inner.slots.lock() = slots;
+        self.inner.deadline.store(next, AtomicOrdering::Relaxed);
+    }
+}
+
+/// A lazy slot's view of the runnable that is executing right now.
+///
+/// Armed by the scheduler immediately before a `run` call and disarmed after
+/// it, so it exists only while there is a live position to convert. The ratio
+/// is in oscillator units of the tree both domains hang off -- an intra-tree
+/// relationship, which is exact.
+#[derive(Debug, Clone)]
+struct Live {
+    cursor: TickCursor,
+    /// The runnable's tick counter when the run call began.
+    base_cursor: u64,
+    /// This slot's domain position at that same instant.
+    base_tick: u64,
+    /// Tree units per tick of the *runnable's* domain.
+    mul: u64,
+    /// Tree units per tick of *this slot's* domain.
+    div: u64,
+}
+
+impl Live {
+    /// Where this slot's domain stands, given what the runnable has published.
+    fn present(&self) -> u64 {
+        let elapsed = self.cursor.get().saturating_sub(self.base_cursor);
+        // `elapsed * mul` converts ticks to tree units; dividing by this
+        // domain's units-per-tick lands in its ticks. Both factors come from
+        // one oscillator, so there is no rounding to accumulate.
+        let units = elapsed.saturating_mul(self.mul);
+        self.base_tick.saturating_add(units / self.div)
+    }
+}
+
 /// Something the scheduler gives execution budgets to: a CPU, a DMA engine, a
 /// coprocessor.
 ///
@@ -765,6 +913,15 @@ pub trait LazyDevice: Send + Sync {
     /// `None` means "nothing pending", and catch-up runs to the present.
     fn next_event_tick(&self) -> Option<u64> {
         None
+    }
+
+    /// Whether this device must be caught up on every tick of the runnable that
+    /// is executing, rather than only at its own next event.
+    ///
+    /// See [`crate::core::device::Device::sampled_every_cycle`], which is where
+    /// this is documented and where a device declares it.
+    fn sampled_every_cycle(&self) -> bool {
+        false
     }
 }
 
@@ -996,6 +1153,8 @@ impl Default for SchedulerConfig {
 struct RunnableSlot {
     domain: DomainId,
     inner: Option<Box<dyn Runnable>>,
+    /// The runnable's live position, if it publishes one.
+    cursor: TickCursor,
 }
 
 impl fmt::Debug for RunnableSlot {
@@ -1003,6 +1162,7 @@ impl fmt::Debug for RunnableSlot {
         f.debug_struct("RunnableSlot")
             .field("domain", &self.domain)
             .field("registered", &self.inner.is_some())
+            .field("cursor", &self.cursor.get())
             .finish()
     }
 }
@@ -1010,6 +1170,8 @@ impl fmt::Debug for RunnableSlot {
 /// What a lazy slot protects: the device, and where its domain has got to.
 struct LazyState {
     device: Option<Box<dyn LazyDevice>>,
+    /// The executing runnable's live position, while one is executing.
+    live: Option<Live>,
     /// The tick of the slot's domain the scheduler last published.
     ///
     /// Catch-up reached from inside a memory access cannot read the clock
@@ -1030,6 +1192,9 @@ struct LazyState {
 /// put-back nests under every rank in the ladder, which is exactly what an
 /// access already holding `BUS` needs.
 struct LazySlot {
+    /// This slot's own handle, so it can report which device an error is about
+    /// from a path that was not given one.
+    id: LazyId,
     domain: DomainId,
     state: Mutex<LazyState>,
 }
@@ -1068,7 +1233,13 @@ impl LazySlot {
             if let Some(p) = present {
                 state.present = p;
             }
-            let target = state.present;
+            // The executing runnable's live position, where there is one, is
+            // ahead of what the forest has been told: the quantum has not ended
+            // yet. It is the honest target -- see [`TickCursor`].
+            let target = match &state.live {
+                Some(live) => state.present.max(live.present()),
+                None => state.present,
+            };
             let device = state
                 .device
                 .as_ref()
@@ -1077,18 +1248,32 @@ impl LazySlot {
             if kind == AccessKind::Debug {
                 return Ok(from);
             }
-            // Never past the device's own next event: beyond that tick its
-            // behaviour changes, and simulating through it in one step would
-            // compute the wrong answer.
-            let target = target.min(device.next_event_tick().unwrap_or(u64::MAX));
             if target <= from {
                 return Ok(from);
             }
             let device = state.device.take().expect("borrowed successfully above");
             (device, from, target)
         };
-        device.advance_to(target);
-        let to = device.current_tick();
+        // Never *through* the device's own next event in one step: beyond that
+        // tick its behaviour changes. So walk to it, let it happen, and ask
+        // again -- a target several events away still arrives, which a single
+        // clamped step would not.
+        let mut to = from;
+        loop {
+            let stop = target.min(device.next_event_tick().unwrap_or(u64::MAX));
+            if stop <= to {
+                break;
+            }
+            device.advance_to(stop);
+            let reached = device.current_tick();
+            if reached <= to {
+                // No progress: an event tick that is not in the future, which
+                // `Device::next_event_tick` forbids. Stop rather than spin.
+                to = reached;
+                break;
+            }
+            to = reached;
+        }
         self.state.lock().device = Some(device);
         if to < from {
             return Err(SchedError::NonMonotonicDevice {
@@ -1098,6 +1283,37 @@ impl LazySlot {
             });
         }
         Ok(to)
+    }
+
+    /// Arm the live view of the runnable that is about to execute.
+    fn arm(&self, live: Live) {
+        self.state.lock().live = Some(live);
+    }
+
+    /// The device's next event, expressed in the *running runnable's* ticks.
+    ///
+    /// `None` when the device has no event, or when no runnable is executing
+    /// and there is therefore nothing to express it in.
+    fn cursor_deadline(&self, now: u64) -> Option<u64> {
+        let state = self.state.lock();
+        let live = state.live.as_ref()?;
+        let device = state.device.as_ref()?;
+        if device.sampled_every_cycle() {
+            // Nothing to convert: this one is looked at every cycle, so the
+            // next cycle is the deadline.
+            return Some(now + 1);
+        }
+        let event = device.next_event_tick()?;
+        let ahead = event.saturating_sub(live.base_tick);
+        // Round up: the runnable tick that *reaches* the event is the first one
+        // whose converted position is at or past it.
+        let units = ahead.saturating_mul(live.div);
+        Some(live.base_cursor + units.div_ceil(live.mul))
+    }
+
+    /// Drop it again, so a sync between quanta uses the published position.
+    fn disarm(&self) {
+        self.state.lock().live = None;
     }
 
     /// Puts the device on a specific tick of its own domain.
@@ -1307,6 +1523,10 @@ pub struct Scheduler {
     /// Where the round-robin starts next round, so no runnable is permanently
     /// first.
     cursor: usize,
+    /// [`Scheduler::lazy`] as one shared slice, so arming a cursor does not
+    /// allocate. Rebuilt when a device is registered, which happens at realize
+    /// and nowhere else.
+    lazy_snapshot: Option<Arc<[Arc<LazySlot>]>>,
     rate: RateController,
     host_clock: Option<Box<dyn HostClock>>,
 }
@@ -1337,6 +1557,7 @@ impl Scheduler {
             runnables: Vec::new(),
             lazy: Vec::new(),
             cursor: 0,
+            lazy_snapshot: None,
             rate,
             host_clock: None,
         }
@@ -1388,6 +1609,7 @@ impl Scheduler {
         self.runnables.push(RunnableSlot {
             domain,
             inner: Some(runnable),
+            cursor: TickCursor::new(),
         });
         id
     }
@@ -1400,12 +1622,15 @@ impl Scheduler {
         // position either way, since nothing has been simulated yet.
         let present = self.forest.ticks(domain).unwrap_or(0);
         self.lazy.push(Arc::new(LazySlot {
+            id,
             domain,
             state: Mutex::new(LazyState {
                 device: Some(device),
+                live: None,
                 present,
             }),
         }));
+        self.lazy_snapshot = None;
         id
     }
 
@@ -1428,6 +1653,24 @@ impl Scheduler {
                 slot: Arc::clone(slot),
             })
             .ok_or(SchedError::UnknownLazyDevice(id))
+    }
+
+    /// The live-position cursor of a registered runnable.
+    ///
+    /// A core publishes its own tick counter into this as it executes, so that
+    /// a lazily-advanced device sampled from inside the core's `run` call is
+    /// caught up to the tick the access really happened on rather than to the
+    /// start of the quantum. See [`TickCursor`].
+    ///
+    /// # Errors
+    ///
+    /// [`SchedError::UnknownRunnable`] if the handle is not from this
+    /// scheduler.
+    pub fn runnable_cursor(&self, id: RunnableId) -> SchedResult<TickCursor> {
+        self.runnables
+            .get(id.index())
+            .map(|slot| slot.cursor.clone())
+            .ok_or(SchedError::UnknownRunnable(id))
     }
 
     /// The clock domain a lazily-advanced device is registered in.
@@ -1724,7 +1967,12 @@ impl Scheduler {
                 consumed.push((id, 0));
                 continue;
             };
+            // Everything sampled while this runnable executes must see where it
+            // has got to, not where the quantum began (see [`TickCursor`]).
+            let cursor = self.runnables[index].cursor.clone();
+            self.arm_live_cursors(domain, &cursor);
             let used = runnable.run(budget);
+            self.disarm_live_cursors(&cursor);
             self.runnables[index].inner = Some(runnable);
             if used.ticks > allowed {
                 return Err(SchedError::BudgetExceeded {
@@ -1761,6 +2009,70 @@ impl Scheduler {
             consumed,
             fired,
         })
+    }
+
+    /// Point every lazily-advanced device on `domain`'s own oscillator tree at
+    /// the cursor of the runnable that is about to execute.
+    ///
+    /// Only devices on the same tree: a ratio between two trees is not exact,
+    /// and routing an intra-quantum position through absolute time would throw
+    /// away the exactness the oscillator forest exists to preserve
+    /// (`ROADMAP.md` 4.2). A device on another tree keeps the published
+    /// position, which is what it had before this existed.
+    fn arm_live_cursors(&mut self, domain: DomainId, cursor: &TickCursor) {
+        if self.lazy_snapshot.is_none() {
+            self.lazy_snapshot = Some(self.lazy.iter().cloned().collect());
+        }
+        let (Ok(osc), Ok(mul)) = (
+            self.forest.root_of(domain),
+            self.forest.domain(domain).map(|d| d.units_per_tick()),
+        ) else {
+            return;
+        };
+        // The forest's position for the runnable's own domain, **not** what the
+        // cursor currently reads. A core that overran its last budget has
+        // already executed cycles the forest has not been told about and
+        // carries them as debt; its cursor is ahead by exactly that much. Using
+        // the cursor here would cancel the debt out and leave every lazy device
+        // three dots per owed cycle behind — and, because the debt varies from
+        // quantum to quantum, behind by a different amount each time.
+        let Ok(base_cursor) = self.forest.ticks(domain) else {
+            return;
+        };
+        for slot in &self.lazy {
+            if self.forest.root_of(slot.domain) != Ok(osc) {
+                continue;
+            }
+            let (Ok(div), Ok(base_tick)) = (
+                self.forest.domain(slot.domain).map(|d| d.units_per_tick()),
+                self.forest.ticks(slot.domain),
+            ) else {
+                continue;
+            };
+            if div == 0 {
+                continue;
+            }
+            slot.arm(Live {
+                cursor: cursor.clone(),
+                base_cursor,
+                base_tick,
+                mul,
+                div,
+            });
+        }
+        // Armed, so every slot can now say where its next event falls in the
+        // runnable's own ticks — which is what the cursor needs in order to
+        // catch them up from inside a cycle.
+        cursor.watch(self.lazy_snapshot.clone());
+    }
+
+    /// Drop every live view. Between runnables the published position is the
+    /// only honest one.
+    fn disarm_live_cursors(&self, cursor: &TickCursor) {
+        cursor.watch(None);
+        for slot in &self.lazy {
+            slot.disarm();
+        }
     }
 
     /// Moves an idle machine forward without running anything.
@@ -2295,6 +2607,97 @@ mod tests {
         // what makes a `$2002` read see the right vblank flag.
         let at = sched.sync_for_access(dev, AccessKind::Guest).unwrap();
         assert_eq!(at, cpu_ticks * 3);
+    }
+
+    /// A core that publishes its position and samples a lazy device mid-run.
+    ///
+    /// The shape of a 6502 reading `$2002`: the read happens on cycle `at` of
+    /// the budget, thousands of cycles before the quantum ends, and the answer
+    /// has to describe *that* cycle.
+    #[derive(Debug)]
+    struct SamplingCpu {
+        /// Handed over after registration, exactly as the machine layer does it.
+        cursor: Arc<Mutex<Option<TickCursor>>>,
+        slot: Arc<LazySlot>,
+        /// Which cycle of the run to sample on.
+        at: u64,
+        /// The device tick the sample saw.
+        saw: Arc<AtomicU64>,
+        ticks: u64,
+    }
+
+    impl Runnable for SamplingCpu {
+        fn run(&mut self, budget: Budget) -> Consumed {
+            let cursor = self.cursor.lock().clone();
+            for _ in 0..budget.ticks {
+                self.ticks += 1;
+                if let Some(cursor) = &cursor {
+                    cursor.set(self.ticks);
+                }
+                if self.ticks == self.at {
+                    let at = self
+                        .slot
+                        .sync(LazyId(0), None, AccessKind::Guest)
+                        .expect("the device is registered");
+                    self.saw.store(at, AtomicOrdering::Relaxed);
+                }
+            }
+            Consumed::new(budget.ticks)
+        }
+    }
+
+    fn sampling_cpu(sched: &mut Scheduler, cpu: DomainId, dev: LazyId, at: u64) -> Arc<AtomicU64> {
+        let saw = Arc::new(AtomicU64::new(u64::MAX));
+        let cursor = Arc::new(Mutex::new(None));
+        let id = sched.add_runnable(
+            cpu,
+            Box::new(SamplingCpu {
+                cursor: Arc::clone(&cursor),
+                slot: Arc::clone(&sched.lazy[dev.index()]),
+                at,
+                saw: Arc::clone(&saw),
+                ticks: 0,
+            }),
+        );
+        *cursor.lock() = Some(sched.runnable_cursor(id).expect("just registered"));
+        saw
+    }
+
+    #[test]
+    fn a_published_position_makes_catch_up_dot_exact_inside_a_quantum() {
+        let (mut sched, cpu, ppu) = nes_scheduler();
+        let dev = sched.add_lazy_device(ppu, Box::new(Ppu::default()));
+        let saw = sampling_cpu(&mut sched, cpu, dev, 40);
+
+        sched.run_quantum().unwrap();
+        // Three dots per CPU cycle, sampled on cycle 40 — not at the start of
+        // the quantum (0) and not at its end (thousands of dots later). This is
+        // the whole point of `TickCursor`.
+        assert_eq!(saw.load(AtomicOrdering::Relaxed), 120);
+    }
+
+    #[test]
+    fn a_core_that_publishes_nothing_still_sees_the_quantums_position() {
+        let (mut sched, cpu, ppu) = nes_scheduler();
+        let dev = sched.add_lazy_device(ppu, Box::new(Ppu::default()));
+        let saw = Arc::new(AtomicU64::new(u64::MAX));
+        sched.add_runnable(
+            cpu,
+            Box::new(SamplingCpu {
+                // Never given one: publishing is optional.
+                cursor: Arc::new(Mutex::new(None)),
+                slot: Arc::clone(&sched.lazy[dev.index()]),
+                at: 40,
+                saw: Arc::clone(&saw),
+                ticks: 0,
+            }),
+        );
+        sched.run_quantum().unwrap();
+        assert_eq!(
+            saw.load(AtomicOrdering::Relaxed),
+            0,
+            "with nothing published the device stands where the quantum began"
+        );
     }
 
     #[test]

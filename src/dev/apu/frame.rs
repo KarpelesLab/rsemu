@@ -212,6 +212,15 @@ pub struct FrameCounter {
     mode: Mode,
     /// `$4017` bit 6. While set, the frame interrupt flag cannot be set.
     inhibit: bool,
+    /// A `$4015` read has armed the interrupt flag's clear.
+    ///
+    /// The clear is not applied by the read: it happens inside the frame
+    /// counter, on the next **get** cycle strictly after the read, and a set
+    /// signal on that same cycle wins. AccuracyCoin's "Frame Counter IRQ"
+    /// codes 6 and 7 are exactly this — two `$4015` reads on consecutive
+    /// cycles, and whether the second sees the flag depends only on which of
+    /// them landed on the get.
+    clear_armed: bool,
     /// The frame interrupt flag, wired to the CPU's IRQ line.
     irq: bool,
     /// The APU tick at which `irq` was last set, so that a `$4015` read on the
@@ -235,6 +244,7 @@ impl FrameCounter {
             region,
             mode: Mode::FourStep,
             inhibit: false,
+            clear_armed: false,
             irq: false,
             irq_set_at: u64::MAX,
             cycle: 0,
@@ -272,18 +282,22 @@ impl FrameCounter {
         self.reset_delay > 0
     }
 
-    /// Read and conditionally clear the flag, as a `$4015` read does.
+    /// Read the flag, arming its clear, as a `$4015` read does.
     ///
-    /// `now` is the current APU tick. Per [NESdev
-    /// APU](https://www.nesdev.org/wiki/APU), a flag set at the same moment as
-    /// the read reads back as 1 and is *not* cleared. `peek` is true for a
-    /// `MemAttrs::debug` access, which must have no side effect at all.
-    pub fn read_irq(&mut self, now: u64, peek: bool) -> bool {
-        let was = self.irq;
-        if !peek && self.irq_set_at != now {
-            self.irq = false;
+    /// The read reports what the flag is *now* and does not clear it: it arms
+    /// a clear that the counter applies on its next get cycle, where a set
+    /// signal on the same cycle overrides it. The ROM says outright where this
+    /// belongs — "you probably want to clear bit 6 inside the APU cycle code of
+    /// your emulator, and not in your 'read $4015' code" (`AccuracyCoin.asm`,
+    /// MIT, © 2025 Chris Siebert).
+    ///
+    /// `peek` is true for a `MemAttrs::debug` access, which must have no side
+    /// effect at all.
+    pub fn read_irq(&mut self, peek: bool) -> bool {
+        if !peek {
+            self.clear_armed = true;
         }
-        was
+        self.irq
     }
 
     /// Clear the flag unconditionally (a `$4017` write with bit 6 set).
@@ -311,10 +325,10 @@ impl FrameCounter {
         };
         self.inhibit = value & 0x40 != 0;
         if self.inhibit {
-            // A flag set this very cycle is still cleared by the inhibit bit:
-            // the same-cycle race documented for $4015 is a property of the
-            // read path, not of the flag.
+            // Setting the inhibit bit clears the flag outright — unlike a
+            // `$4015` read, which only arms a clear for the next get cycle.
             self.irq = false;
+            self.clear_armed = false;
         }
         self.reset_delay = if on_put_cycle { 3 } else { 4 };
     }
@@ -324,7 +338,14 @@ impl FrameCounter {
     /// `now` is the APU tick this cycle corresponds to; it is recorded when the
     /// interrupt flag is set so [`FrameCounter::read_irq`] can detect the
     /// same-cycle race.
-    pub fn tick(&mut self, now: u64) -> FrameEvent {
+    pub fn tick(&mut self, now: u64, on_put_cycle: bool) -> FrameEvent {
+        // An armed `$4015` clear lands here, on a get cycle, and the sequencer
+        // below may set the flag again on this very cycle — which is what makes
+        // a read on the last cycle before the flag is set leave it set.
+        if self.clear_armed && !on_put_cycle {
+            self.irq = false;
+            self.clear_armed = false;
+        }
         if self.reset_delay > 0 {
             self.reset_delay -= 1;
             if self.reset_delay == 0 {
@@ -349,13 +370,22 @@ impl FrameCounter {
                 } else if self.cycle == t[2] {
                     FrameEvent::QUARTER
                 } else if self.cycle == t[3] {
+                    // The flag is raised whether or not interrupts are
+                    // inhibited: what the inhibit bit gates is the *line*, and
+                    // a program that reads `$4015` on one of these two cycles
+                    // sees the flag even with interrupts suppressed. The third
+                    // cycle is where the inhibit finally wins.
                     self.set_irq(now);
                     FrameEvent::NONE
                 } else if self.cycle == t[4] {
                     self.set_irq(now);
                     FrameEvent::BOTH
                 } else if self.cycle == t[5] {
-                    self.set_irq(now);
+                    if self.inhibit {
+                        self.irq = false;
+                    } else {
+                        self.set_irq(now);
+                    }
                     self.cycle = 0;
                     FrameEvent::NONE
                 } else {
@@ -383,12 +413,22 @@ impl FrameCounter {
         }
     }
 
-    /// Set the interrupt flag unless inhibited, remembering when.
+    /// Raise the interrupt flag, remembering when.
+    ///
+    /// Not gated on the inhibit bit: that gates the IRQ *line*
+    /// ([`FrameCounter::inhibited`]), and the flag is readable through `$4015`
+    /// either way.
     fn set_irq(&mut self, now: u64) {
-        if !self.inhibit {
-            self.irq = true;
-            self.irq_set_at = now;
-        }
+        self.irq = true;
+        self.irq_set_at = now;
+        // A set on this cycle beats a clear armed by an earlier read.
+        self.clear_armed = false;
+    }
+
+    /// Whether `$4017` bit 6 is suppressing the IRQ line.
+    #[inline]
+    pub const fn inhibited(&self) -> bool {
+        self.inhibit
     }
 
     /// Return to the power-on state, keeping the timing variant.
@@ -416,6 +456,7 @@ impl FrameCounter {
             Mode::FiveStep => 1,
         })?;
         w.write_bool(self.inhibit)?;
+        w.write_bool(self.clear_armed)?;
         w.write_bool(self.irq)?;
         w.write_u64(self.irq_set_at)?;
         w.write_u32(self.cycle)?;
@@ -430,6 +471,7 @@ impl FrameCounter {
             Mode::FiveStep
         };
         self.inhibit = r.read_bool()?;
+        self.clear_armed = r.read_bool()?;
         self.irq = r.read_bool()?;
         self.irq_set_at = r.read_u64()?;
         self.cycle = r.read_u32()?;

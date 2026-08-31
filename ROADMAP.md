@@ -49,15 +49,23 @@ something a person can actually run (§2).
 > on a timer no machine has supplied yet.
 >
 > **Seven machines that run**, plus four synthetic boards. `nes-ntsc` and
-> `nes-pal` — AccuracyCoin boots, raises NMI and draws its menu; `gameboy`;
-> `apple1` and `beneater-6502`, interactive over a terminal; and `riscv-virt`,
-> which is the one that boots real system software: **OpenSBI 1.6 completely**,
-> on a device tree generated from the realized machine rather than shipped, then
-> **Linux 6.12 as far as `asids_init`** and **EDK2 to the end of the DXE
-> dispatcher**. Where each stops is written down, not rounded up. `pc-at` — a
-> complete PC/AT chipset with a user-supplied BIOS path — is now **in the
-> catalog**: every CPU core in the tree is bindable from a `.machine` file, so
-> the asymmetry that held it out is gone.
+> `nes-pal` pass **AccuracyCoin 130/141** — the whole-machine gate, run
+> headlessly, with the eleven remaining failures ledgered and each traced to a
+> named piece of hardware. Also `gameboy`; `apple1` and `beneater-6502`,
+> interactive over a terminal; and `riscv-virt`, which is the one that boots
+> real system software: **OpenSBI 1.6 completely**, on a device tree generated
+> from the realized machine rather than shipped, then **Linux 6.12 as far as
+> `asids_init`** and **EDK2 to the end of the DXE dispatcher**. Where each stops
+> is written down, not rounded up. `pc-at` — a complete PC/AT chipset with a
+> user-supplied BIOS path — is now **in the catalog**: every CPU core in the
+> tree is bindable from a `.machine` file, so the asymmetry that held it out is
+> gone.
+>
+> That 141 is itself a finding. The conformance table described an *older* ROM
+> release: it listed three tests the pinned ROM never writes and omitted
+> nineteen it does run, so the long-quoted "81/125" was measuring the wrong
+> denominator. Regenerated from the ROM's own menu, the honest before-and-after
+> is **85/141 → 130/141**.
 >
 > The synthetic boards are `spi-panel`, `arm926`, `z80-mini` and `m68k-mini`:
 > minimum machines that exist so a subsystem has somewhere real to run. Each is
@@ -78,12 +86,19 @@ something a person can actually run (§2).
 > emulation started. The Game Boy was the genericity proof — `src/core/` needed
 > **zero** lines of change against a budget of fifty (§13).
 >
-> Known and outstanding: **intra-quantum staleness** (§4.2) is now measured
-> rather than suspected — `LazyHandle::sync` catches a device up only to the
-> tick the scheduler last published, which accounts for ~35 of the 44 mooneye
-> failures; the fix changes `Runnable`. i386 protected mode is not started, and
-> without it no stock PC BIOS runs. Phase 5's IR and JIT have not been started.
-
+> Phase 3's named gaps are closed. **Intra-quantum staleness is dot-exact**
+> (§4.2): a runnable publishes its position *as* it runs, and a device that is
+> sampled rather than read can ask to be caught up on every cycle of it. The
+> RP2A03's DMA unit drives a real `/RDY`, so OAM DMA and the DMC's sample fetch
+> halt the core a cycle at a time and what they do to the bus on each of those
+> cycles is guest-visible. `unassigned = open-bus` answers with the master's own
+> data bus.
+>
+> What is left on the NES is written down in
+> `tests/conformance/ledgers/accuracycoin.txt`: the PPU has no address bus of
+> its own — a 2C02 access is two dots and an external octal latch, and four
+> tests are about nothing else — and the DMC's phase machine does not overlap
+> the OAM DMA's cycles. Phase 5's IR and JIT have not been started.
 ---
 
 ## 0. Non-negotiables
@@ -661,11 +676,13 @@ snapshot header, since queued deadlines are meaningless without it.
   scores **16/66 against 22/66**, because the core then drifts behind and
   catches up in bursts. Recorded so nobody re-derives it.
 
-  The real fix is the one `core::sched`'s own docs name: **let a runnable report
-  progress *as* it runs**, which changes `Runnable` rather than `LazyHandle`.
-  That trait is implemented by every core, so it is a deliberate cross-cutting
-  change and not an opportunistic one — which is exactly why it has not been
-  made yet.
+  **That fix has since landed.** `core::sched::TickCursor` is the "let a
+  runnable report progress *as* it runs" change: a runnable publishes its own
+  tick as it goes, and a device that is *sampled* rather than read declares
+  `Device::sampled_every_cycle` and is caught up on every cycle rather than
+  every quantum. It is what made AccuracyCoin's cycle-exact `/RDY` and DMA
+  tests measurable at all. The Game Boy numbers above predate it and are the
+  record of what the limitation cost, not of a limitation that still stands.
 - **A budget rarely lands on a tick boundary, and that has to be decided.** An
   event at PPU dot 82181 falls two-thirds of the way through a CPU cycle. The
   rule: **stop at the cycle boundary before, never drag a domain mid-cycle** —

@@ -53,6 +53,8 @@
 //! in the 6502" (6502.org) for the decimal `ADC`/`SBC` algorithm. See
 //! `docs/cpu/6502.md`.
 
+use crate::core::device::{Arbitration, CycleGate};
+use crate::core::sched::TickCursor;
 use crate::core::space::{AddressSpace, MemAttrs};
 use crate::core::value::Width;
 
@@ -111,6 +113,15 @@ pub(super) struct State {
     /// the previous value on the bus, and that is what the CPU reads. Modelled
     /// rather than guessed at, because the NES depends on open-bus reads.
     pub open_bus: u8,
+    /// The last value on the core's **own** data bus, inside the pins.
+    ///
+    /// It follows every read and write the core makes, driven or not — and
+    /// **not** a cycle somebody else ran on the bus. A DMA that steals a cycle
+    /// moves the pins; it does not reach in here. On an RP2A03 that difference
+    /// is observable: `$4015` is an on-die register whose bit 5 comes from this
+    /// latch, so a DMC DMA landing inside a `LDA $4015` must not show up in it
+    /// (`MemAttrs::core_bus`).
+    pub core_bus: u8,
     /// How many accesses the address space refused.
     pub faults: u64,
     /// Address of the most recent refused access.
@@ -137,6 +148,7 @@ impl State {
             reset_pending: true,
             pending: None,
             open_bus: 0,
+            core_bus: 0,
             faults: 0,
             last_fault: 0,
             debt: 0,
@@ -168,6 +180,25 @@ pub(super) struct Exec<'a> {
     polling: bool,
     /// Cycles this step has charged.
     used: u64,
+    /// Where to publish the cycle counter, so anything sampled from inside an
+    /// instruction sees the cycle the access really happened on.
+    cursor: Option<&'a TickCursor>,
+    /// The `/RDY` arbiter, if the board has one.
+    rdy: Option<&'a dyn CycleGate>,
+    /// Whether the cycle being charged is one the arbiter is holding.
+    ///
+    /// A halt is not a sequence of cycles as far as the core's control logic is
+    /// concerned: it is *one* cycle stretched, and its interrupt poll already
+    /// happened at its start. Polling again on every held cycle lets an
+    /// interrupt asserted by the DMA itself be taken an instruction early.
+    held: bool,
+    /// Whether the most recent read cycle was one the arbiter held.
+    ///
+    /// Only the unstable stores care, and they care a great deal: `SHA`,
+    /// `SHX`, `SHY` and `TAS` compute what they write out of the addressing
+    /// hardware, and holding the core over the index fix-up leaves the AND
+    /// with the high byte out of it entirely.
+    held_read: bool,
 }
 
 impl<'a> Exec<'a> {
@@ -190,7 +221,23 @@ impl<'a> Exec<'a> {
             skip_poll: false,
             polling: true,
             used: 0,
+            cursor: None,
+            rdy: None,
+            held: false,
+            held_read: false,
         }
+    }
+
+    /// Publish the cycle counter here as the step runs.
+    pub(super) fn with_cursor(mut self, cursor: Option<&'a TickCursor>) -> Exec<'a> {
+        self.cursor = cursor;
+        self
+    }
+
+    /// Let `gate` halt this core between cycles.
+    pub(super) fn with_rdy(mut self, gate: Option<&'a dyn CycleGate>) -> Exec<'a> {
+        self.rdy = gate;
+        self
     }
 
     /// Run one reset sequence, interrupt sequence, or instruction.
@@ -231,16 +278,39 @@ impl<'a> Exec<'a> {
 
     /// Charge a cycle and poll the interrupt lines if this is not the first.
     fn begin_cycle(&mut self) {
-        if self.icycle > 0 {
+        self.icycle += 1;
+        self.used += 1;
+        self.state.cycles = self.state.cycles.wrapping_add(1);
+        // Say which cycle this is *first*: anything sampled during it — the
+        // interrupt lines below, the bus access above — has to see the machine
+        // as of this cycle rather than as of the last one.
+        self.publish();
+        // Then clock the `/NMI` edge detector, always. The pin's flip-flop runs
+        // on every cycle whether or not this one polls, and it is what makes a
+        // request raised and withdrawn inside one cycle invisible: what it
+        // samples is a level, and the level it samples is the one from a dot
+        // before the bus access, because the CPU looks at `/NMI` during φ2 and
+        // latches the data bus at the end of it.
+        self.lines.sample_nmi();
+        if self.icycle > 1 && !self.held {
             if self.skip_poll {
                 self.skip_poll = false;
             } else {
                 self.poll();
             }
         }
-        self.icycle += 1;
-        self.used += 1;
-        self.state.cycles = self.state.cycles.wrapping_add(1);
+    }
+
+    /// Tell whoever is watching which cycle this core is on.
+    ///
+    /// Before the access, not after: a device catching itself up in order to
+    /// answer must be caught up *to this cycle*, and it is this cycle's access
+    /// that is about to reach it.
+    #[inline]
+    fn publish(&self) {
+        if let Some(cursor) = self.cursor {
+            cursor.set(self.state.cycles);
+        }
     }
 
     /// Charge a cycle that makes no bus access.
@@ -254,6 +324,7 @@ impl<'a> Exec<'a> {
         self.icycle += 1;
         self.used += 1;
         self.state.cycles = self.state.cycles.wrapping_add(1);
+        self.publish();
     }
 
     /// Whether an interrupt line has released a `WAI`, latching what to do next.
@@ -297,13 +368,89 @@ impl<'a> Exec<'a> {
         };
     }
 
-    /// One read cycle.
+    /// One read cycle, including however long `/RDY` holds the core off the bus.
+    ///
+    /// # What a halt looks like
+    ///
+    /// The 6502 has no way to abandon a cycle. When `/RDY` goes low it finishes
+    /// the read it is making — that read is the DMA's *halt cycle* and it
+    /// really happens on the bus — and then keeps re-driving the same address,
+    /// re-reading it every cycle, until the line comes back up. On the cycles
+    /// the arbiter is not itself driving the bus those repeats are externally
+    /// visible, which is how a DMC DMA clocks a controller port or bumps the
+    /// PPU's `v` register several times over. When the line is released the
+    /// core performs the read it was trying to make, and *that* is the value
+    /// the instruction uses (NESdev wiki, "DMA").
     fn read(&mut self, addr: u16) -> u8 {
+        let mut value = self.cycle_read(addr);
+        self.held_read = false;
+        let Some(gate) = self.rdy else {
+            return value;
+        };
+        let mut held = false;
+        // Everything from here to the release is the same stretched cycle: it
+        // has had its poll.
+        self.held = true;
+        loop {
+            let bus = self.state.open_bus;
+            match gate.arbitrate(self.state.cycles, u64::from(addr), bus, false) {
+                Arbitration::Release => break,
+                Arbitration::Halted => {
+                    // Held for one cycle and let go: the read just made was the
+                    // halt cycle, so it is made again below and nothing else
+                    // happens.
+                    held = true;
+                    break;
+                }
+                Arbitration::Hold => {
+                    held = true;
+                    value = self.cycle_read(addr);
+                }
+                Arbitration::Steal(byte) => {
+                    held = true;
+                    self.stolen_cycle();
+                    // Somebody else drove the wires, and the core's *external*
+                    // latch is the wires: the next read of an address nothing
+                    // decodes answers with the byte the DMA left behind. The
+                    // core's own bus is inside the pins and does not move.
+                    self.state.open_bus = byte;
+                }
+            }
+        }
+        if held {
+            // "When DMA completes, the CPU performs the read it attempted when
+            // halted" — the one whose value the instruction goes on to use.
+            value = self.cycle_read(addr);
+            self.held_read = true;
+        }
+        self.held = false;
+        value
+    }
+
+    /// The bus half of a read cycle: one charged cycle, one access.
+    ///
+    /// The data-bus latch is updated only when something on the far side of
+    /// the pins actually drove the wires. An unmapped address drives nothing —
+    /// the space answers with the latch itself — and neither does a register
+    /// on the core's own die, which on a 2A03 is `$4015`: its read reaches the
+    /// accumulator without ever appearing on the external bus, so the *next*
+    /// open-bus read still sees the byte from before it (NESdev wiki, "APU").
+    fn cycle_read(&mut self, addr: u16) -> u8 {
         self.begin_cycle();
-        match self.space.read(u64::from(addr), Width::U8, self.attrs) {
-            Ok(v) => {
+        let attrs = self
+            .attrs
+            .with_bus(self.state.open_bus)
+            .with_core_bus(self.state.core_bus);
+        match self.space.read_driven(u64::from(addr), Width::U8, attrs) {
+            Ok((v, driven)) => {
                 let byte = v as u8;
-                self.state.open_bus = byte;
+                if driven {
+                    self.state.open_bus = byte;
+                }
+                // The core's own bus follows every read it makes, driven or
+                // not: the byte reached the accumulator, so it was on the wires
+                // inside the chip whatever the pins were doing.
+                self.state.core_bus = byte;
                 byte
             }
             Err(_) => {
@@ -311,22 +458,46 @@ impl<'a> Exec<'a> {
                 // is open bus — and the fault counter is how anyone finds out.
                 self.state.faults = self.state.faults.wrapping_add(1);
                 self.state.last_fault = addr;
+                self.state.core_bus = self.state.open_bus;
                 self.state.open_bus
             }
         }
     }
 
+    /// A cycle the arbiter took: time passes and the core drives nothing.
+    ///
+    /// The one other place a cycle is charged without an access of the core's
+    /// own — and unlike [`Exec::stall`] the bus is not idle at all, it is
+    /// simply somebody else's.
+    fn stolen_cycle(&mut self) {
+        self.icycle += 1;
+        self.used += 1;
+        self.state.cycles = self.state.cycles.wrapping_add(1);
+        self.publish();
+    }
+
     /// One write cycle.
+    ///
+    /// `/RDY` is not honoured here: the 6502 can only be halted on a read, so
+    /// an arbiter that wants the bus during a write waits (NESdev wiki, "DMA":
+    /// "if the CPU is writing, the DMA unit waits until the next cycle to try
+    /// again"). The arbiter is still told the cycle happened, because a write
+    /// is exactly what delays a pending transfer by one.
     fn write(&mut self, addr: u16, value: u8) {
         self.begin_cycle();
         self.state.open_bus = value;
+        self.state.core_bus = value;
+        let attrs = self.attrs.with_bus(value).with_core_bus(value);
         if self
             .space
-            .write(u64::from(addr), Width::U8, u64::from(value), self.attrs)
+            .write(u64::from(addr), Width::U8, u64::from(value), attrs)
             .is_err()
         {
             self.state.faults = self.state.faults.wrapping_add(1);
             self.state.last_fault = addr;
+        }
+        if let Some(gate) = self.rdy {
+            let _ = gate.arbitrate(self.state.cycles, u64::from(addr), value, true);
         }
     }
 
@@ -399,14 +570,6 @@ impl<'a> Exec<'a> {
         self.push((pc >> 8) as u8);
         self.push(pc as u8);
 
-        // End of the fourth cycle: the hijack point.
-        let stolen = self.lines.take_nmi_pending();
-        let vector = if stolen || source == Source::Nmi {
-            NMI_VECTOR
-        } else {
-            IRQ_VECTOR
-        };
-
         // B is not a register bit: it only exists in the byte that reaches the
         // stack, set by a software break and clear for a hardware interrupt.
         let pushed = match source {
@@ -414,6 +577,23 @@ impl<'a> Exec<'a> {
             Source::Irq | Source::Nmi => (self.state.regs.p | flags::U) & !flags::B,
         };
         self.push(pushed);
+
+        // The hijack point: the *fifth* cycle, not the fourth. NESdev's
+        // cycle-by-cycle listing puts its "at this point, the signal status
+        // determines which interrupt vector is used" marker between ticks 4 and
+        // 5, and reading the latch here is exactly that instant — the edge
+        // detector is clocked from `begin_cycle`, so nothing moves it between
+        // the start of this cycle and the vector fetch below.
+        //
+        // One cycle earlier makes the window four cycles wide instead of five,
+        // which is a difference AccuracyCoin's NMI-overlap answer keys measure
+        // directly: fifteen PPU dots of hijack for BRK, twenty-seven for IRQ.
+        let stolen = self.lines.take_nmi_pending();
+        let vector = if stolen || source == Source::Nmi {
+            NMI_VECTOR
+        } else {
+            IRQ_VECTOR
+        };
         self.set_flag(flags::I, true);
         if self.cmos {
             // The CMOS part clears D on entering an interrupt, so a handler no
@@ -907,8 +1087,24 @@ impl<'a> Exec<'a> {
     /// the bus while the high address byte is being driven, so it wins. This
     /// is the behaviour `SingleStepTests/65x02` expects
     /// (`docs/cpu/6502.md`).
+    ///
+    /// **Unless `/RDY` went low over the index fix-up**, in which case the AND
+    /// does not happen at all and the register is stored unmodified. NESdev's
+    /// *Programming with unofficial opcodes* says so for `SHX`/`SHY` — "unless
+    /// interrupted by DMC DMA on the 4th clock (i.e. RDY goes low between
+    /// fetching the high byte of the address and the dummy read), data written
+    /// is ANDed with (high byte of literal address + 1)" — and AccuracyCoin's
+    /// SH\* tests measure the same thing for `SHA` and `TAS`, which NESdev
+    /// documents no formula for at all (`AccuracyCoin.asm`, MIT, © 2025 Chris
+    /// Siebert: the SH\* expectation tables, whose comment on the `/RDY` case
+    /// is "H isn't part of the equation anymore"). The *address* still carries
+    /// the AND on a page cross, whatever `/RDY` did.
     fn unstable_store(&mut self, reg: u8, loc: Located) -> (u16, u8) {
-        let value = reg & loc.base_hi.wrapping_add(1);
+        let value = if self.held_read {
+            reg
+        } else {
+            reg & loc.base_hi.wrapping_add(1)
+        };
         let addr = if loc.crossed {
             (u16::from(value) << 8) | (loc.addr & 0x00ff)
         } else {

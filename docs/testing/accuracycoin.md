@@ -1,6 +1,6 @@
 # AccuracyCoin, headlessly
 
-125 NES accuracy tests plus 5 information-only pages on a single NROM cartridge.
+141 NES accuracy tests plus 5 information-only pages on a single NROM cartridge.
 MIT, © 2025 Chris Siebert, <https://github.com/100thCoin/AccuracyCoin>.
 
 The ROM is a menu program: you press buttons, it prints `PASS` or `FAIL x` on
@@ -75,15 +75,16 @@ The README's per-section tables say what each code means; the fetch script pulls
 ### Which test owns which byte
 
 [`tests/conformance/accuracycoin_tests.rs`](../../tests/conformance/accuracycoin_tests.rs)
-is the full 130-entry table — suite, name, result address — read out of the
+is the full 146-entry table — suite, name, result address — read out of the
 ROM's own `TestPages:` table and the `result_*` equates beside it, in menu
-order. It is checked by a unit test that runs with no corpus present: 130
-entries, 125 real and 5 "DRAW", every address distinct and on a page the ROM
-uses.
+order. It is checked by a unit test that runs with no corpus present: 146
+entries, 141 that assert and 5 "DRAW", every asserting address distinct and on
+a page the ROM uses.
 
 The five DRAW pages are exactly the ones whose result byte lives on **page 3**
-rather than page 4 (`$03FB` `Print magic values`, `$03FC` `CPU RAM`, `$03FD`
-`CPU Registers`, `$03FE` `PPU RAM`, `$03FF` `Palette RAM`). That is not a
+rather than page 4 — all five share the one byte `result_DrawTest = $03FF`
+(`PPU Reset Flag`, `CPU RAM`, `CPU Registers`, `PPU RAM`, `Palette RAM`), which
+is why the distinct-address check exempts them. That is not a
 coincidence — the ROM's own run-all loop compares the result pointer's high byte
 against 3 and skips those tests. The runner uses the same rule, so the two can
 never disagree.
@@ -116,7 +117,7 @@ The whole sequence is:
 3. Wait for `$0035` to become 1 — the ROM has entered the run-everything pass.
 4. Wait for `$0035` to return to 0 — the pass is finished. `$0037` counts
    progress meanwhile, so a timeout can say how far it got.
-5. Read the 125 result bytes.
+5. Read the 141 result bytes.
 
 Rendering is never needed. The run-all path disables the NMI and rendering
 itself while it works, and the runner never looks at a pixel. Nothing in this
@@ -142,7 +143,7 @@ the ROM the way a person does is both more robust and a wider test.
   `completed` is `$0037`, the number of tests that finished, so the next test in
   menu order is the one that hung.
 
-Per test, each of the 125 comes back as `Pass`, `Fail(code)`, `NotRun`, or
+Per test, each of the 141 comes back as `Pass`, `Fail(code)`, `NotRun`, or
 `Hung` (the engine marked it in progress and never came back). A partly-built
 machine yields a report full of `NotRun` and a handful of passes, which is
 exactly the progress meter that makes this suite worth running early.

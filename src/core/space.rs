@@ -186,6 +186,15 @@ pub enum UnassignedAction {
     ReadAsOnes,
     /// Reads return zero; writes are discarded.
     ReadAsZeros,
+    /// Reads return the last byte the *master* drove
+    /// ([`MemAttrs::bus`](crate::core::space::MemAttrs::bus)); writes are
+    /// discarded.
+    ///
+    /// What a board with no bus-error line and no pull-ups actually does. On a
+    /// NES this is load-bearing rather than cosmetic: software reads `$4000`
+    /// expecting `$40` back, and a DMC DMA that steals a cycle changes the
+    /// answer.
+    OpenBus,
 }
 
 /// The per-space unassigned-access policy: what happens, and whether it is
@@ -219,6 +228,11 @@ impl UnassignedPolicy {
     /// Read as zero.
     pub const ZEROS: UnassignedPolicy = UnassignedPolicy {
         action: UnassignedAction::ReadAsZeros,
+        log: false,
+    };
+    /// Read back whatever the master last drove — a bus with nothing on it.
+    pub const OPEN_BUS: UnassignedPolicy = UnassignedPolicy {
+        action: UnassignedAction::OpenBus,
         log: false,
     };
 
@@ -582,6 +596,24 @@ impl AddressSpace {
             .read(addr, width, attrs)
     }
 
+    /// Read, and say whether anything on the far side of the master's pins
+    /// drove the data bus.
+    ///
+    /// `false` means the value came from an unmapped address or from a
+    /// register on the master's own die, and a master that models an open-bus
+    /// latch must leave that latch alone. Everything else can use
+    /// [`AddressSpace::read`] and ignore the question.
+    ///
+    /// # Errors
+    ///
+    /// As [`AddressSpace::read`].
+    #[inline]
+    pub fn read_driven(&self, addr: u64, width: Width, attrs: MemAttrs) -> MemResult<(u64, bool)> {
+        self.try_view()
+            .ok_or(BusError::Retry)?
+            .read_driven(addr, width, attrs)
+    }
+
     /// Write the low `width` bytes of `value` at `addr`, in the target
     /// region's byte order.
     ///
@@ -645,6 +677,12 @@ impl AddressSpace {
                 dst.fill(0x00);
                 Ok(())
             }
+            UnassignedAction::OpenBus => {
+                // Every byte of a wide read floats the same way: the master
+                // drove one byte last and there is nothing else on the wires.
+                dst.fill(attrs.bus);
+                Ok(())
+            }
         }
     }
 
@@ -652,7 +690,9 @@ impl AddressSpace {
         self.note_unassigned(addr, true, attrs);
         match self.unassigned.action {
             UnassignedAction::Fault => Err(BusError::Unassigned),
-            UnassignedAction::ReadAsOnes | UnassignedAction::ReadAsZeros => Ok(()),
+            UnassignedAction::ReadAsOnes
+            | UnassignedAction::ReadAsZeros
+            | UnassignedAction::OpenBus => Ok(()),
         }
     }
 
@@ -808,6 +848,19 @@ impl SpaceView<'_> {
         endian.load(&buf[..n], width)
     }
 
+    /// Read, and say whether anything actually drove the master's data bus.
+    ///
+    /// # Errors
+    ///
+    /// As [`SpaceView::read`].
+    pub fn read_driven(&self, addr: u64, width: Width, attrs: MemAttrs) -> MemResult<(u64, bool)> {
+        let n = width.bytes() as usize;
+        let mut buf = [0u8; 8];
+        let mut driven = true;
+        let endian = self.read_span_driven(addr, &mut buf[..n], attrs, Some(width), &mut driven)?;
+        Ok((endian.load(&buf[..n], width)?, driven))
+    }
+
     /// Write the low `width` bytes of `value` at `addr`, in the target
     /// region's byte order.
     ///
@@ -861,6 +914,20 @@ impl SpaceView<'_> {
         attrs: MemAttrs,
         width: Option<Width>,
     ) -> MemResult<Endian> {
+        let mut driven = true;
+        self.read_span_driven(addr, dst, attrs, width, &mut driven)
+    }
+
+    /// [`SpaceView::read_span`], also reporting whether anything on the far
+    /// side of the master's pins drove the data bus.
+    fn read_span_driven(
+        &self,
+        addr: u64,
+        dst: &mut [u8],
+        attrs: MemAttrs,
+        width: Option<Width>,
+        driven: &mut bool,
+    ) -> MemResult<Endian> {
         let total = dst.len() as u64;
         if total == 0 {
             return Ok(self.space.endian);
@@ -882,11 +949,15 @@ impl SpaceView<'_> {
                     }
                     let piece = &mut dst[usize_of(done)..usize_of(done + n)];
                     let w = if n == total { width } else { None };
+                    *driven &= e.drives_data_bus();
                     (n, e.read(rel, piece, attrs, w))
                 }
                 None => {
                     let n = self.gap_len(a, remaining);
                     let piece = &mut dst[usize_of(done)..usize_of(done + n)];
+                    // Nothing answered, so nothing drove the wires either: the
+                    // byte the master reads back is the byte it left there.
+                    *driven = false;
                     (n, self.space.unassigned_read(a, piece, attrs))
                 }
             };

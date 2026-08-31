@@ -692,7 +692,7 @@ fn an_nmi_arriving_after_the_pushes_does_not_hijack() {
     h.bus.poke(0xfffe, &[0x00, 0xe0]);
     h.step();
     assert_eq!(h.regs().pc, 0xe000);
-    h.cpu.set_nmi(true);
+    h.cpu.pulse_nmi();
     assert!(h.cpu.nmi_pending());
 }
 
@@ -700,8 +700,8 @@ fn an_nmi_arriving_after_the_pushes_does_not_hijack() {
 fn an_nmi_is_edge_triggered_and_latches_until_serviced() {
     let h = Harness::running(&[0xea, 0xea, 0xea]);
     h.bus.poke(0xfffa, &[0x00, 0xf0]);
-    h.cpu.set_nmi(true);
-    h.cpu.set_nmi(false); // a pulse: the latch survives the line dropping
+    // A pulse the detector saw: the latch survives the line dropping.
+    h.cpu.pulse_nmi();
     assert!(h.cpu.nmi_pending());
     h.step(); // NOP polls and latches
     assert_eq!(h.cpu.pending_interrupt(), Some(Interrupt::Nmi));
@@ -710,10 +710,9 @@ fn an_nmi_is_edge_triggered_and_latches_until_serviced() {
     assert!(!h.cpu.nmi_pending());
 
     // A level that never falls produces no second interrupt.
-    h.cpu.set_nmi(true);
-    h.cpu.set_nmi(true);
+    h.cpu.pulse_nmi();
     assert!(h.cpu.nmi_pending(), "the first edge latched");
-    h.cpu.set_nmi(false);
+    h.cpu.pulse_nmi();
     h.cpu.set_nmi(false);
 }
 
@@ -1131,6 +1130,148 @@ fn a_refused_access_reads_open_bus_and_is_counted() {
     assert_eq!(cpu.regs().a, 0x90, "the last byte that was on the bus");
 }
 
+/// A register on the core's own die: it answers, but it drives no external bus.
+#[derive(Debug)]
+struct OnDie(u8);
+
+impl MemOps for OnDie {
+    fn read(&self, _offset: u64, dst: &mut [u8], _attrs: MemAttrs) -> MemResult {
+        dst.fill(self.0);
+        Ok(())
+    }
+    fn write(&self, _offset: u64, _src: &[u8], _attrs: MemAttrs) -> MemResult {
+        Ok(())
+    }
+    fn constraints(&self) -> AccessConstraints {
+        AccessConstraints::word(Width::U8, crate::core::value::Endian::Little).internal()
+    }
+}
+
+/// A core over 32 KiB of RAM at `$0000` and an open-bus space above it.
+fn open_bus_harness() -> (Arc<TestBus>, Mos6502) {
+    let bus = Arc::new(TestBus::new());
+    let space = AddressSpace::new("cpu", 16).with_unassigned(UnassignedPolicy::OPEN_BUS);
+    {
+        let mut topo = space.topology();
+        topo.map(Region::io("ram", 0x8000, bus.clone()), 0).unwrap();
+        topo.map(Region::io("ondie", 1, Arc::new(OnDie(0x5a))), 0x9015)
+            .unwrap();
+    }
+    let cpu = Mos6502::new(Config::default());
+    cpu.attach_space(Arc::new(space));
+    cpu.set_regs(Regs {
+        pc: 0x0000,
+        ..Regs::new()
+    });
+    cpu.session.lock().state.reset_pending = false;
+    (bus, cpu)
+}
+
+#[test]
+fn an_absolute_read_of_open_bus_returns_its_own_operand_high_byte() {
+    // The classic NES observation: `LDA $4000` reads back `$40`, because the
+    // last thing the core drove on the bus was the high half of its operand
+    // (NESdev, "Open bus behavior").
+    let (bus, cpu) = open_bus_harness();
+    bus.poke(0x0000, &[0xad, 0x01, 0xa5]); // LDA $a501, which nothing answers
+    cpu.step();
+    assert_eq!(cpu.regs().a, 0xa5);
+}
+
+#[test]
+fn a_read_of_an_on_die_register_leaves_the_data_bus_alone() {
+    // `$4015` on a 2A03: the value reaches the accumulator without ever
+    // appearing on the pins, so the *next* open-bus read still floats the byte
+    // from before it.
+    let (bus, cpu) = open_bus_harness();
+    bus.poke(0x0000, &[0xad, 0x15, 0x90, 0xad, 0x00, 0xb7]);
+    cpu.step();
+    assert_eq!(cpu.regs().a, 0x5a, "the register answered");
+    cpu.step();
+    assert_eq!(
+        cpu.regs().a,
+        0xb7,
+        "and the floating read still sees its own operand, not $5a"
+    );
+}
+
+#[test]
+fn a_write_leaves_the_byte_it_drove_on_the_bus() {
+    let (bus, cpu) = open_bus_harness();
+    bus.poke(0x0000, &[0xa9, 0x3c, 0x8d, 0x00, 0xa0, 0xad, 0x34, 0xb2]);
+    cpu.step(); // LDA #$3c
+    cpu.step(); // STA $a000 — unmapped, but the core still drives $3c
+    cpu.step(); // LDA $b234 — unmapped
+    assert_eq!(cpu.regs().a, 0xb2, "the operand high byte, driven since");
+}
+
+/// An arbiter that halts the core once and drives one byte onto the bus.
+///
+/// The shape of a DMC sample fetch: one held cycle, one stolen cycle, release.
+#[derive(Debug)]
+struct OneShotDma {
+    byte: u8,
+    at: sync::Mutex<u64>,
+    step: sync::Mutex<u8>,
+}
+
+impl crate::core::device::CycleGate for OneShotDma {
+    fn arbitrate(
+        &self,
+        cycle: u64,
+        _held: u64,
+        _bus: u8,
+        write: bool,
+    ) -> crate::core::device::Arbitration {
+        use crate::core::device::Arbitration;
+        if write || cycle < *self.at.lock() {
+            return Arbitration::Release;
+        }
+        let step = {
+            let mut step = self.step.lock();
+            *step += 1;
+            *step
+        };
+        match step {
+            1 => Arbitration::Hold,
+            2 => Arbitration::Steal(self.byte),
+            _ => {
+                // Done: move the trigger out of reach so this fires once.
+                *self.at.lock() = u64::MAX;
+                Arbitration::Release
+            }
+        }
+    }
+}
+
+#[test]
+fn a_stolen_cycle_moves_the_pins_and_not_the_core_s_own_bus() {
+    // Two latches, and on a 2A03 the difference is observable: `$4015` is a
+    // register on the CPU's own die and its open-bus bit comes from the
+    // internal one, so a DMA that steals a cycle mid-instruction must not show
+    // up there (AccuracyCoin, "Internal Data Bus").
+    let (bus, cpu) = open_bus_harness();
+    bus.poke(0x0000, &[0xad, 0x00, 0xb7]); // LDA $b700, which nothing answers
+    cpu.attach_rdy(Arc::new(OneShotDma {
+        byte: 0x5a,
+        // The fourth cycle of the LDA: the read of $b700 itself.
+        at: sync::Mutex::new(4),
+        step: sync::Mutex::new(0),
+    }));
+    cpu.step();
+
+    let state = cpu.session.lock().state;
+    assert_eq!(
+        state.open_bus, 0x5a,
+        "the DMA's byte is what the pins were left holding"
+    );
+    assert_eq!(
+        state.core_bus, 0x5a,
+        "and the core's own read of open bus then picks it up"
+    );
+    assert_eq!(cpu.regs().a, 0x5a, "which is what the instruction loaded");
+}
+
 #[test]
 fn a_debug_read_leaves_no_trace() {
     let h = Harness::running(&[0xa9, 0x42]);
@@ -1334,11 +1475,28 @@ fn a_wire_driven_through_the_sink_reaches_the_interrupt_latches() {
     pin.sink.set_level(cart, pin.line, Level::Low);
     assert!(!h.cpu.irq_asserted());
 
-    // NMI is edge-sensitive: the latch survives the level going away.
+    // NMI is edge-sensitive, but the edge detector is *clocked*: a level that
+    // goes up and back down between two cycles is one the CPU never sampled.
+    // A separate core, running NOPs, so that stepping it does not service the
+    // very interrupt being asserted.
+    let n = Harness::running(&[0xea, 0xea, 0xea]);
+    let device: &dyn Device = n.cpu.as_ref();
     let nmi = device.sink("nmi", &[apu]).expect("an nmi pin");
     nmi.sink.set_level(apu, nmi.line, Level::High);
     nmi.sink.set_level(apu, nmi.line, Level::Low);
-    assert!(h.cpu.nmi_pending(), "a high-going edge latches");
+    assert!(
+        !n.cpu.nmi_pending(),
+        "a pulse between two cycles is invisible"
+    );
+    // Held across a cycle, it is seen — and the latch then survives the level
+    // going away.
+    nmi.sink.set_level(apu, nmi.line, Level::High);
+    n.step();
+    nmi.sink.set_level(apu, nmi.line, Level::Low);
+    assert!(
+        n.cpu.nmi_pending(),
+        "a high-going edge the detector saw latches"
+    );
 }
 
 #[test]

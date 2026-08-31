@@ -69,23 +69,17 @@ pub const WARMUP_DOTS: u64 = Region::Ntsc.geometry().warmup_dots;
 /// and 600 ms is the figure blargg's `ppu_open_bus` test is written against.
 pub const DEFAULT_DECAY_DOTS: u64 = 3_221_591;
 
-/// Dots between the vblank flag being set and the NMI request being announced
-/// on the wire.
-///
-/// The 6502 samples `/NMI` once per CPU cycle, which is three dots, so a request
-/// that is withdrawn inside that window is one the CPU never saw. Announcing at
-/// the next CPU-cycle boundary is what turns the `$2002` race described in
-/// [NESdev PPU frame timing](https://www.nesdev.org/wiki/PPU_frame_timing) into
-/// behaviour rather than a special case: a read on the set dot or one dot later
-/// clears the flag before this expires, and no edge ever reaches the wire.
-///
-/// PAL's CPU cycle is 3.2 dots and so takes 4; see
-/// [`Geometry::nmi_announce_dots`].
-pub const NMI_ANNOUNCE_DOTS: u64 = Region::Ntsc.geometry().nmi_announce_dots;
-
 // ---------------------------------------------------------------------------
 // Pixels
 // ---------------------------------------------------------------------------
+
+/// Dots between a `$2001` write and the pipeline seeing it.
+///
+/// "Toggling rendering takes effect approximately 3-4 dots after the write"
+/// (NESdev, *PPU registers*); AccuracyCoin's OAM-corruption test measures the
+/// consequence and accepts either 2 or 3 dots of delay from the *write cycle*,
+/// which is this counter started at the dot the write lands on.
+const MASK_WRITE_DELAY_DOTS: u8 = 3;
 
 /// One framebuffer entry: a palette index plus the colour-emphasis bits that
 /// were in force when it was drawn.
@@ -234,6 +228,10 @@ pub struct Engine {
     /// bytes as Y coordinates exactly as hardware does.
     pub(crate) eval_base: u8,
     /// The byte read on the odd dot, written on the even dot.
+    ///
+    /// Also what a `$2004` read sees during evaluation: the read line the
+    /// sprite unit is driving is the primary-OAM read bus, and it holds its
+    /// value across the odd/even pair.
     pub(crate) eval_latch: u8,
     /// Whether sprite 0 was among the sprites copied for the next scanline.
     pub(crate) sprite_zero_next: bool,
@@ -242,7 +240,42 @@ pub struct Engine {
     pub(crate) sprite_pat_lo: [u8; 8],
     pub(crate) sprite_pat_hi: [u8; 8],
     pub(crate) sprite_attr: [u8; 8],
+    /// The per-slot X **counter**, not the X coordinate.
+    ///
+    /// Loaded with the sprite's X during the fetch slots and counted down once
+    /// per dot of the visible scanline while rendering is on. A slot whose
+    /// counter has reached zero is outputting: its pattern registers shift one
+    /// bit per dot and bit 7 is the pixel.
+    ///
+    /// Modelled as the counter it is rather than as a comparison against the
+    /// pixel's column, because the two only agree while rendering stays on. A
+    /// slot that reached zero and then had rendering taken away from it keeps
+    /// its half-shifted pattern and finishes drawing when rendering returns,
+    /// which is what AccuracyCoin's two "stale shift register" tests measure.
     pub(crate) sprite_x: [u8; 8],
+    /// Which output units have stopped counting and started shifting.
+    ///
+    /// One bit per slot. Set when a slot's X counter reaches zero, and cleared
+    /// — every slot at once — on **dot 339 of a rendered scanline**. That is
+    /// the whole of the rule: "if the PPU is rendering on dot 339, then the
+    /// shifter counters are set to counting; if rendering was not enabled on
+    /// dot 339, the shifter counters will be in whatever state they were
+    /// previously in, which is likely halted" (AccuracyCoin.asm, MIT, © 2025
+    /// Chris Siebert). A frame that takes rendering away before dot 339 comes
+    /// back with every unit already halted, which draws every sprite as though
+    /// its X were zero.
+    /// The secondary-OAM address the sprite unit is standing on.
+    ///
+    /// Not the same thing as the evaluation write cursor: it follows whichever
+    /// phase of the scanline is using secondary OAM, and it is what seeds the
+    /// OAM corruption when rendering is switched off mid-line.
+    pub(crate) sec_addr: u8,
+    /// A row of OAM waiting to be corrupted, and which row.
+    ///
+    /// Set when rendering is taken away mid-line; consumed on the first dot
+    /// with rendering back on. See [`Engine::corrupt_oam`].
+    pub(crate) corrupt_row: Option<u8>,
+    pub(crate) sprite_halted: u8,
     pub(crate) sprite_active: u8,
     pub(crate) sprite_zero_active: bool,
     /// Latches held between the four secondary-OAM reads and the two pattern
@@ -256,7 +289,17 @@ pub struct Engine {
     /// dot: "sprite 0 hit acts as if the image starts at cycle 2"
     /// (NESdev PPU rendering).
     pub(crate) sprite0_pending: bool,
-    /// The dot the vblank flag was last set on, for [`NMI_ANNOUNCE_DOTS`].
+    /// `$2001` as written, waiting out [`Engine::mask_delay`].
+    pub(crate) mask_pending: u8,
+    /// Dots left before a `$2001` write takes effect.
+    ///
+    /// "Toggling rendering takes effect approximately 3-4 dots after the
+    /// write" (NESdev, *PPU registers*). It is not cosmetic: three of
+    /// AccuracyCoin's tests switch rendering off at a named dot and measure
+    /// what the pipeline was in the middle of, and the delay is the difference
+    /// between the answer and the one before it.
+    pub(crate) mask_delay: u8,
+    /// The dot the vblank flag was last set on.
     pub(crate) vblank_set_dot: u64,
     /// A `$2002` read landed one dot before the vblank flag would be set, so it
     /// is not set at all this frame (NESdev PPU frame timing).
@@ -264,6 +307,9 @@ pub struct Engine {
     /// A `$2002` read landed on or just after the set, so `/NMI` never drops
     /// for long enough this frame.
     pub(crate) suppress_nmi: bool,
+    /// The `/NMI` level as it stood one dot ago — what the CPU samples. See
+    /// [`Engine::nmi_active`].
+    pub(crate) nmi_out: bool,
 
     // -- configuration ------------------------------------------------------
     /// Which console this is. Machine configuration, not architectural state,
@@ -346,15 +392,21 @@ impl Engine {
             sprite_pat_hi: [0; 8],
             sprite_attr: [0; 8],
             sprite_x: [0; 8],
+            sec_addr: 0,
+            corrupt_row: None,
+            sprite_halted: 0,
             sprite_active: 0,
             sprite_zero_active: false,
             sp_y_latch: 0,
             sp_tile_latch: 0,
             sp_attr_latch: 0,
+            mask_pending: 0,
+            mask_delay: 0,
             sprite0_pending: false,
             vblank_set_dot: 0,
             suppress_vblank_set: false,
             suppress_nmi: false,
+            nmi_out: false,
             region,
             geom: region.geometry(),
             warmup,
@@ -476,22 +528,39 @@ impl Engine {
             || self.scanline == self.geom.pre_render_scanline
     }
 
-    /// The level of the (logical) NMI request: `vblank_flag AND nmi_output`,
-    /// with the frame's suppression applied.
+    /// The level the `/NMI` request is at *right now*, before the output delay.
     ///
-    /// [NESdev NMI](https://www.nesdev.org/wiki/NMI). Expressed as an active-high
-    /// request rather than the chip's active-low `/NMI` pin, because
+    /// `vblank_flag AND nmi_output`, with the frame's suppression applied
+    /// ([NESdev NMI](https://www.nesdev.org/wiki/NMI)). Expressed as an
+    /// active-high request rather than the chip's active-low pin, because
     /// [`crate::core::wire`] nets idle low and an inverter is a device
     /// (`ROADMAP.md` §4.3) if a machine wants the pin polarity.
     #[inline]
+    fn nmi_raw(&self) -> bool {
+        self.status & STATUS_VBLANK != 0 && self.ctrl & CTRL_NMI != 0 && !self.suppress_nmi
+    }
+
+    /// The level the CPU sees on `/NMI` — one dot behind the request itself.
+    ///
+    /// # Why a dot
+    ///
+    /// A 6502 samples `/NMI` during φ2, roughly two thirds of the way through
+    /// its cycle, and completes its bus access at the very end of it. Three
+    /// dots to a CPU cycle, so a request raised on the *first* two dots of a
+    /// cycle is one the CPU acts on that cycle, and one raised on the third is
+    /// not — while a `$2002` read, which happens after the sample, cannot
+    /// unmake a request the CPU has already seen.
+    ///
+    /// Both halves of that are load-bearing, and AccuracyCoin's "NMI
+    /// Suppression" sweep is precisely a measurement of them: a read landing
+    /// one PPU clock after the flag is set suppresses the NMI, one landing
+    /// three clocks after does not, and the difference is which side of φ2 the
+    /// flag moved on. Publishing the level as it stood one dot ago, and
+    /// sampling it at the cycle boundary, is the same statement with the delay
+    /// moved to where it can be written down once.
+    #[inline]
     pub fn nmi_active(&self) -> bool {
-        self.status & STATUS_VBLANK != 0
-            && self.ctrl & CTRL_NMI != 0
-            && !self.suppress_nmi
-            && self.dots
-                >= self
-                    .vblank_set_dot
-                    .saturating_add(self.geom.nmi_announce_dots)
+        self.nmi_out
     }
 
     /// Sprite height from `$2000` bit 5.
@@ -648,8 +717,13 @@ impl Engine {
     }
 
     fn shift_background(&mut self) {
+        // Not zeros: "shift registers each shift in a constant: logically 1 for
+        // the high bitplane, 0 for the low bitplane" (NESdev, *PPU rendering*).
+        // Shifted often enough without a reload — which is what switching
+        // rendering off across the reload dot does — the high plane fills with
+        // ones and a transparent nametable starts drawing pixel `%10`.
         self.bg_shift_lo <<= 1;
-        self.bg_shift_hi <<= 1;
+        self.bg_shift_hi = (self.bg_shift_hi << 1) | 1;
         self.at_shift_lo <<= 1;
         self.at_shift_hi <<= 1;
     }
@@ -822,6 +896,100 @@ impl Engine {
         }
     }
 
+    /// Where the sprite unit's secondary-OAM pointer is standing.
+    ///
+    /// Three phases, three answers: the clear walks 0-31 two dots at a time,
+    /// evaluation uses its write cursor rounded *up* to a multiple of four, and
+    /// the fetch slots step through the eight-dot cadence. Outside those it
+    /// sits at zero.
+    fn secondary_addr(&self, dot: u16) -> u8 {
+        match dot {
+            1..=64 => ((dot - 1) / 2) as u8,
+            65..=256 => (self.eval_sec.wrapping_add(3)) & 0x1c,
+            257..=320 => {
+                let slot = ((dot - 257) / 8) as u8;
+                let byte = ((dot - 257) % 8).min(3) as u8;
+                (slot * 4 + byte) & 31
+            }
+            _ => 0,
+        }
+    }
+
+    /// The row copy that a mid-frame rendering change leaves behind.
+    ///
+    /// Changing the OAM address while the PPU is accessing OAM corrupts the row
+    /// it moves to: the old row is copied over the new one. Switching rendering
+    /// *off* mid-line hands the address back from the sprite unit to `OAMADDR`
+    /// and freezes wherever the sprite unit had got to; switching it back on
+    /// hands it the other way, and on a 2C02G that second handover reliably
+    /// copies OAM row 0 over the row the sprite unit was standing on (NESdev
+    /// wiki, *Errata*: "on C, E, G and H PPUs, when rendering begins
+    /// automatically on pre-render dot 0, the address changes from OAM1ADDR to
+    /// OAM2ADDR mid-access and reliably copies the OAM1ADDR row to the OAM2ADDR
+    /// row, regardless of alignment").
+    ///
+    /// Identical rows corrupt nothing, which the errata is explicit about and
+    /// which is what makes the ordinary case — rendering enabled in vblank with
+    /// the pointer at zero — silent.
+    fn corrupt_oam(&mut self) {
+        let Some(row) = self.corrupt_row.take() else {
+            return;
+        };
+        // The row the address is handed *to* takes a copy of the row it was
+        // handed *from*: `OAM1ADDR` is `OAMADDR`, `OAM2ADDR` is where the
+        // sprite unit was standing. Identical rows corrupt nothing, which is
+        // what makes the ordinary case — a frame starting with `OAMADDR` at
+        // zero and the pointer at zero — silent.
+        let dst = usize::from(row & 31) * 8;
+        let src = usize::from(self.oam_addr & 0xf8);
+        if dst == src {
+            return;
+        }
+        for i in 0..8 {
+            let byte = self.oam[(src + i) & 0xff];
+            self.write_oam(((dst + i) & 0xff) as u8, byte);
+        }
+        self.secondary_oam[usize::from(row & 31)] = self.secondary_oam[0];
+    }
+
+    /// What `$2004` reads back while the sprite unit owns OAM.
+    ///
+    /// `OAMADDR` is not the answer during rendering. The sprite unit is driving
+    /// the OAM read line for its own purposes, and a CPU read of `$2004`
+    /// listens in on whatever that line happens to be carrying — which is a
+    /// different thing on each of the scanline's four phases:
+    ///
+    /// * **dots 1-64**, the secondary-OAM clear: the read line is *forced*, so
+    ///   every read comes back `$FF` (NESdev, *PPU sprite evaluation*).
+    /// * **dots 65-256**, evaluation: the primary-OAM read latch, held across
+    ///   the odd/even pair. This is the live evaluation pointer made visible,
+    ///   and it is how a program can watch sprite evaluation happen.
+    /// * **dots 257-320**, the sprite fetches: secondary OAM, following the
+    ///   eight-dot slot cadence — and the fourth byte of a slot is read on five
+    ///   of its eight dots, which is why an empty slot reads `$FF` five times
+    ///   over.
+    /// * **dots 321-340 and dot 0**: secondary OAM entry 0.
+    ///
+    /// `None` when the sprite unit is not driving the line at all, which is
+    /// every dot with rendering off and every line that does not render.
+    fn oam_read_bus(&self) -> Option<u8> {
+        if !self.rendering_enabled() || !self.render_line() {
+            return None;
+        }
+        Some(match self.dot {
+            1..=64 => 0xff,
+            65..=256 => self.eval_latch,
+            257..=320 => {
+                let slot = usize::from((self.dot - 257) / 8);
+                // The slot reads Y, tile, attribute, X — and then keeps the X
+                // byte on the line for the rest of the slot.
+                let byte = usize::from((self.dot - 257) % 8).min(3);
+                self.secondary_oam[(slot * 4 + byte) & 31]
+            }
+            _ => self.secondary_oam[0],
+        })
+    }
+
     /// Dots 257-320: eight 8-dot slots that read secondary OAM and fetch the
     /// two pattern planes for the next scanline.
     ///
@@ -857,6 +1025,37 @@ impl Engine {
                 self.sprite_pat_hi[slot] = byte;
             }
             _ => {}
+        }
+    }
+
+    /// One dot of the eight sprite output units: count down, or shift.
+    ///
+    /// Runs on dots 1-256 of a rendered scanline and nowhere else. Neither the
+    /// counters nor the shifters move during horizontal blanking or with
+    /// rendering switched off — the ROM's own summary is "if rendering was not
+    /// enabled on dot 339, the shifter counters will be in whatever state they
+    /// were previously in" — and that is what lets a partly-drawn sprite
+    /// survive ten forced-blank scanlines and finish where it left off.
+    fn sprite_output_dot(&mut self) {
+        for slot in 0..8 {
+            if self.sprite_halted & (1 << slot) != 0 {
+                self.sprite_pat_lo[slot] <<= 1;
+                self.sprite_pat_hi[slot] <<= 1;
+            } else {
+                self.sprite_x[slot] -= 1;
+            }
+        }
+    }
+
+    /// A unit whose counter has run out stops counting and starts drawing.
+    ///
+    /// Taken at the top of the dot, before the pixel: a sprite at X = 0 draws
+    /// on column 0.
+    fn sprite_arm(&mut self) {
+        for slot in 0..8 {
+            if self.sprite_x[slot] == 0 {
+                self.sprite_halted |= 1 << slot;
+            }
         }
     }
 
@@ -919,13 +1118,13 @@ impl Engine {
         let mut sp_is_zero = false;
         if sp_visible {
             for slot in 0..usize::from(self.sprite_active) {
-                let dx = x.wrapping_sub(u16::from(self.sprite_x[slot]));
-                if dx >= 8 {
+                // A slot is drawing exactly while its counter is at zero; the
+                // pixel is the top of its shift registers.
+                if self.sprite_halted & (1 << slot) == 0 {
                     continue;
                 }
-                let bit = 7 - dx;
-                let lo = (self.sprite_pat_lo[slot] >> bit) & 1;
-                let hi = (self.sprite_pat_hi[slot] >> bit) & 1;
+                let lo = (self.sprite_pat_lo[slot] >> 7) & 1;
+                let hi = (self.sprite_pat_hi[slot] >> 7) & 1;
                 let pixel = (hi << 1) | lo;
                 if pixel == 0 {
                     continue;
@@ -966,6 +1165,25 @@ impl Engine {
 
     /// Execute the dot at the current position and advance to the next.
     pub fn tick(&mut self) {
+        // The output the CPU samples lags the request by one dot — see
+        // [`Engine::nmi_active`]. Taken before the dot runs, so after a
+        // catch-up to dot *d* it holds the level as it stood at *d* − 1.
+        self.nmi_out = self.nmi_raw();
+        // A `$2001` write reaches the pipeline a few dots late.
+        if self.mask_delay > 0 {
+            self.mask_delay -= 1;
+            if self.mask_delay == 0 {
+                let was = self.rendering_enabled();
+                self.mask = self.mask_pending;
+                if was && !self.rendering_enabled() && self.render_line() {
+                    // The sprite unit hands the OAM address back mid-access,
+                    // and where it had got to is the seed for the row copy that
+                    // happens when rendering comes back — see
+                    // [`Engine::corrupt_oam`].
+                    self.corrupt_row = Some(self.sec_addr);
+                }
+            }
+        }
         let scanline = self.scanline;
         let dot = self.dot;
         let rendering = self.rendering_enabled();
@@ -999,14 +1217,16 @@ impl Engine {
             self.suppress_vblank_set = false;
         }
 
-        // The OAMADDR-at-rendering-start corruption: if OAMADDR is 8 or more
-        // when rendering begins, the eight bytes at `OAMADDR & $F8` are copied
-        // over OAM's first eight ([NESdev PPU registers], OAMADDR).
-        if pre_render && dot == 0 && rendering && self.oam_addr >= 8 {
-            let src = usize::from(self.oam_addr & 0xf8);
-            for i in 0..8 {
-                self.oam[i] = self.oam[(src + i) & 0xff];
-            }
+        // The OAM address changes hands at the top of the rendering region
+        // every frame, whether or not anything switched rendering off — and
+        // hands over to secondary-OAM address zero, so it is silent unless
+        // `OAMADDR` is pointing at some other row.
+        if pre_render && dot == 0 && rendering && self.corrupt_row.is_none() {
+            self.corrupt_row = Some(0);
+        }
+        // The row copy itself, on the first dot rendering is back on for.
+        if rendering && (visible || pre_render) {
+            self.corrupt_oam();
         }
 
         if rendering && (visible || pre_render) {
@@ -1015,6 +1235,11 @@ impl Engine {
 
         if visible && (1..=256).contains(&dot) {
             self.output_pixel(dot - 1, scanline);
+        }
+        // After the pixel: the units that drew it then advance, which is what
+        // makes a sprite eight pixels wide starting at its own X.
+        if rendering && visible && (1..=256).contains(&dot) {
+            self.sprite_output_dot();
         }
 
         self.advance_position(pre_render, rendering);
@@ -1057,6 +1282,15 @@ impl Engine {
         }
 
         // -- sprites --
+        self.sec_addr = self.secondary_addr(dot);
+        if (1..=256).contains(&dot) {
+            self.sprite_arm();
+        }
+        if dot == 339 {
+            // Every unit goes back to counting, and only here. See
+            // [`Engine::sprite_halted`].
+            self.sprite_halted = 0;
+        }
         if (1..=64).contains(&dot) {
             self.secondary_clear_dot(dot);
         } else if visible && (65..=256).contains(&dot) {
@@ -1109,8 +1343,7 @@ impl Engine {
     ///
     /// Two kinds of instant, and the smaller one wins:
     ///
-    /// * **The vblank edges.** `/NMI` is raised
-    ///   [`Geometry::nmi_announce_dots`] after the flag is set at
+    /// * **The vblank edges.** `/NMI` is raised when the flag is set at
     ///   (`vblank_scanline`, 1) and dropped when the flag is cleared at
     ///   (`pre_render_scanline`, 1). Those are the only dots at which the chip
     ///   drives a wire without anybody having touched it, so a run loop that
@@ -1122,41 +1355,33 @@ impl Engine {
     ///   `$2002` read taken mid-quantum can be. Stopping *more* often is never
     ///   wrong: catch-up is a floor on precision, never a ceiling.
     ///
-    /// The result is always at least [`Geometry::nmi_announce_dots`] + 1 dots
-    /// ahead — one CPU cycle, rounded up, plus one. Two reasons, and both
-    /// matter: catch-up that returns a tick the device is already standing on
-    /// makes no progress, and a clock tree may sit up to one driving-domain
-    /// tick behind virtual time (`core::sched`), so a nearer answer would name
-    /// an instant already in the past and be discarded.
+    /// The result is always **strictly ahead** of where the chip stands, which
+    /// `Device::next_event_tick` requires: a target the device is already on
+    /// makes no progress and would stall catch-up where it is. No candidate is
+    /// ever discarded for being close, though — the one that matters most is
+    /// the one two dots away.
     pub fn next_event_dot(&self) -> u64 {
-        let lead = self.geom.nmi_announce_dots + 1;
-        let floor = self.dots + lead;
-        // Distance from here to (`scanline`, `dot`) on this line or the next.
+        // Distance from here to (`line`, `at`), always strictly ahead: catch-up
+        // that returns a tick the device already stands on makes no progress.
         let ahead = |line: u16, at: u16| -> u64 {
             let here = u64::from(self.scanline) * DOTS_PER_SCANLINE as u64 + u64::from(self.dot);
             let there = u64::from(line) * DOTS_PER_SCANLINE as u64 + u64::from(at);
             let frame = self.geom.dots_per_frame;
-            self.dots + (there + frame - here) % frame
+            self.dots + 1 + (there + frame - here - 1) % frame
         };
-        // `run_to(target)` has executed every dot below `target`, so the dot
-        // that *does* the thing is one less than the target that includes it.
-        let vblank_nmi = ahead(
-            self.geom.vblank_scanline,
-            1 + self.geom.nmi_announce_dots as u16,
-        );
-        let vblank_clear = ahead(self.geom.pre_render_scanline, 2);
-        // The line boundary is the ceiling and must always be eligible, so a
-        // boundary inside the lead is skipped to the one after it — a scanline
-        // is 341 dots, which is far more than any lead.
-        let mut next_line = self.dots + u64::from(DOTS_PER_SCANLINE - self.dot);
-        if next_line < floor {
-            next_line += u64::from(DOTS_PER_SCANLINE);
-        }
-        [vblank_nmi, vblank_clear, next_line]
-            .into_iter()
-            .filter(|t| *t >= floor)
-            .min()
-            .unwrap_or(next_line)
+        // `run_to(target)` has executed every dot below `target`, so the target
+        // that *includes* the dot doing the work is one past it — and one past
+        // *that*, because the `/NMI` output lags the request by a dot
+        // ([`Engine::nmi_active`]) and a stop that did not run the following dot
+        // would leave the wire still showing the old level. The flag is set at
+        // (241, 1) and cleared at (pre-render, 1), and both move `/NMI`, so
+        // neither is an instant a core may be let run past.
+        let vblank_set = ahead(self.geom.vblank_scanline, 3);
+        let vblank_clear = ahead(self.geom.pre_render_scanline, 3);
+        // The line boundary is the ceiling: nothing may go stale by more than a
+        // scanline, whatever else the chip is or is not about to do.
+        let next_line = self.dots + u64::from(DOTS_PER_SCANLINE - self.dot);
+        vblank_set.min(vblank_clear).min(next_line)
     }
 
     /// Run dots until `target` total dots have executed, or until the NMI
@@ -1186,7 +1411,19 @@ impl Engine {
         let now = self.dots;
         match index & 7 {
             PPUSTATUS => {
-                let value = (self.status & STATUS_DRIVEN) | (self.open_bus(debug) & !STATUS_DRIVEN);
+                let mut status = self.status;
+                // The three flags are not sampled together. The vblank bit is
+                // latched when the read begins — M2 going high — while the two
+                // sprite flags are taken at the end of it, about 1.875 PPU
+                // clocks later on a revision-G part. All three clear on
+                // pre-render dot 1, so a read that begins on the dot before
+                // that reports vblank still set and the sprite flags already
+                // gone, and AccuracyCoin's "$2002 flag timing" steps a read
+                // across exactly that boundary to see it.
+                if self.scanline == self.geom.pre_render_scanline && self.dot == 1 {
+                    status &= !(STATUS_SPRITE0 | STATUS_OVERFLOW);
+                }
+                let value = (status & STATUS_DRIVEN) | (self.open_bus(debug) & !STATUS_DRIVEN);
                 if !debug {
                     self.status &= !STATUS_VBLANK;
                     self.w = false;
@@ -1196,16 +1433,9 @@ impl Engine {
                 value
             }
             OAMDATA => {
-                // During the secondary-OAM clear the read line is forced, so
-                // every read comes back $FF
-                // ([NESdev PPU sprite evaluation]).
-                let value = if self.rendering_enabled()
-                    && self.scanline < self.geom.visible_scanlines
-                    && (1..=64).contains(&self.dot)
-                {
-                    0xff
-                } else {
-                    self.oam[usize::from(self.oam_addr)]
+                let value = match self.oam_read_bus() {
+                    Some(byte) => byte,
+                    None => self.oam[usize::from(self.oam_addr)],
                 };
                 if !debug {
                     self.latch.refresh(now, value, 0xff);
@@ -1322,7 +1552,14 @@ impl Engine {
             }
             PPUMASK => {
                 if self.warm() {
-                    self.mask = value;
+                    // Not immediate: "toggling rendering takes effect
+                    // approximately 3-4 dots after the write" (NESdev, *PPU
+                    // registers*). Three of AccuracyCoin's tests switch
+                    // rendering off at a named dot and then measure what the
+                    // pipeline was in the middle of, so the delay is the
+                    // difference between the right answer and the one before it.
+                    self.mask_pending = value;
+                    self.mask_delay = MASK_WRITE_DELAY_DOTS;
                 }
             }
             PPUSTATUS => {}
@@ -1360,9 +1597,12 @@ impl Engine {
     fn write_oam_data(&mut self, value: u8) {
         if self.rendering_enabled() && self.render_line() {
             // OAM is busy being evaluated, so the write is lost — but OAMADDR
-            // still takes a glitched bump of its high six bits
-            // ([NESdev PPU registers], OAMDATA).
-            self.oam_addr = self.oam_addr.wrapping_add(4);
+            // still takes a glitched bump of its high six bits: it is the
+            // *high six* that move, so the low two are cleared as well as
+            // carried into ([NESdev PPU registers], OAMDATA, and AccuracyCoin's
+            // "Address $2004 behavior" code A, which starts from an odd
+            // OAMADDR precisely to tell the two apart).
+            self.oam_addr = self.oam_addr.wrapping_add(4) & 0xfc;
             return;
         }
         self.write_oam(self.oam_addr, value);
@@ -1451,6 +1691,15 @@ impl Engine {
         w.write_u64(self.vblank_set_dot)?;
         w.write_bool(self.suppress_vblank_set)?;
         w.write_bool(self.suppress_nmi)?;
+        // Appended: everything the dot-exact pipeline gained. The prefix above
+        // keeps the layout the previous chunk version wrote.
+        w.write_bool(self.nmi_out)?;
+        w.write_u8(self.sprite_halted)?;
+        w.write_u8(self.sec_addr)?;
+        w.write_bool(self.corrupt_row.is_some())?;
+        w.write_u8(self.corrupt_row.unwrap_or(0))?;
+        w.write_u8(self.mask_pending)?;
+        w.write_u8(self.mask_delay)?;
         w.write_bool(self.warmup)?;
 
         w.write_seq_len(self.fb.len() as u64)?;
@@ -1516,6 +1765,14 @@ impl Engine {
         self.vblank_set_dot = r.read_u64()?;
         self.suppress_vblank_set = r.read_bool()?;
         self.suppress_nmi = r.read_bool()?;
+        self.nmi_out = r.read_bool()?;
+        self.sprite_halted = r.read_u8()?;
+        self.sec_addr = r.read_u8()?;
+        let pending = r.read_bool()?;
+        let row = r.read_u8()?;
+        self.corrupt_row = pending.then_some(row);
+        self.mask_pending = r.read_u8()?;
+        self.mask_delay = r.read_u8()?;
         self.warmup = r.read_bool()?;
 
         let len = r.read_seq_len(2)? as usize;

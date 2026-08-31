@@ -564,6 +564,7 @@ impl MemOps for Registers {
             allow_bulk: false,
             secure_only: false,
             privileged_only: false,
+            drives_data_bus: true,
         }
     }
 }

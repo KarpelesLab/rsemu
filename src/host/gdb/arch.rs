@@ -256,9 +256,10 @@ static ALL: &[&Arch] = &[
 /// `src/cpu/mos6502/mod.rs`'s `save`: `a x y s p` as bytes, `pc` as a `u16`,
 /// then the cycle counter.
 ///
-/// Re-verified at chunk version 3, which appends `waiting` at the end of the
-/// chunk rather than beside `halted`, precisely so the prefix these offsets
-/// index keeps the layout version 2 wrote. Nothing below moved.
+/// Re-verified at chunk version 4. Both v3's `waiting` and v4's `core_bus` are
+/// appended at the *end* of the chunk rather than slotted in beside the fields
+/// they belong with, precisely so the prefix these offsets index keeps the
+/// layout version 2 wrote. Nothing below moved.
 #[cfg(feature = "cpu-mos6502")]
 static MOS6502_REGS: &[RegDesc] = &[
     RegDesc::int("a", 1, 0),
@@ -286,7 +287,7 @@ static MOS6502_REGS: &[RegDesc] = &[
 #[cfg(feature = "cpu-mos6502")]
 pub static MOS6502: Arch = Arch {
     class: &crate::cpu::mos6502::CLASS,
-    verified_version: 3,
+    verified_version: 4,
     feature: "org.rsemu.mos6502",
     architecture: None,
     regs: MOS6502_REGS,
