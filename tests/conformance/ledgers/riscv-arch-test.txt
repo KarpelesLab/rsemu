@@ -1,0 +1,40 @@
+# Known failures: riscv-arch-test (the RISC-V architectural certification
+# tests, BSD-3-Clause, (c) RISC-V International).
+#
+# Keyed by the runner's name for a test, which is the corpus directory it was
+# built into and its file stem: `rv64-I/add-01`,
+# `rv64-privilege/misalign-lh-01`. That is what tests/conformance/riscv.rs
+# prints and what the fetch script writes on disk.
+#
+#   rv64-I/add-01     # why
+#
+# The `# why` note is mandatory, and this file only ever shrinks.
+#
+# Read this before adding a line. Conformance here is defined as *our
+# signature equals the reference model's signature, byte for byte* — so a
+# difference is one of exactly three things, and they are not interchangeable:
+#
+#   * a defect in this core. Fix it; do not write it down.
+#   * a place where the ISA genuinely leaves the choice to the implementation
+#     and the reference model was configured to make the other one. Say which
+#     specification paragraph grants the choice, and which way each side went.
+#     Better still, configure the reference model to agree — that is what
+#     scripts/fetch-testdata.sh's config override is for, and an entry here is
+#     an admission that it could not be done.
+#   * a defect in the test. Rare, and it needs the specification quoted before
+#     it is claimed (`CLAUDE.md`: a corpus is evidence, not authority).
+#
+# ---------------------------------------------------------------------------
+# 2026-09-01: **181 of 181** signatures match, across I, M, A, F, D, C,
+# Zifencei and privilege for RV64GC with M/S/U mode and Sv39 — 94 152 signature
+# words. This file is empty.
+#
+# The first run of that suite scored 178 — rv64-privilege/ecall,
+# rv64-privilege/ebreak and rv64-C/cebreak-01. All three differences were the
+# same bit of `misa`: the reference model had the hypervisor extension enabled
+# and the suite's own trap handler stores a wider trap signature when it sees H.
+# Configuring the model to describe this hart
+# (scripts/riscv-arch-test/sail-config.json) made all three agree, and nothing
+# in the core was changed. That is the second bullet above, and it is why the
+# configuration is the first thing to check.
+# ---------------------------------------------------------------------------

@@ -1,0 +1,14 @@
+// The RV32 half of the reference model's configuration.
+//
+// Copyright (c) 2026 the rsemu authors. MIT.
+//
+// Layered on top of sail-config.json, and only ever with `--rv32`. RV32 and
+// RV64 are the same rsemu core with a different `Config::xlen`
+// (`ROADMAP.md` §6), so the two configurations differ by exactly what the
+// width forces: the supported page-table format.
+{
+  "extensions": {
+    "Sv32": { "supported": true },
+    "Sv39": { "supported": false }
+  }
+}

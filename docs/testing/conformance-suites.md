@@ -37,7 +37,8 @@ anything**; this table records a point in time.
 | [SingleStepTests/8088](https://github.com/SingleStepTests/8088) | 8088/8086, same format | **MIT** ✅ | Yes, with attribution |
 | [Gekkio/mooneye-test-suite](https://github.com/Gekkio/mooneye-test-suite) | Game Boy acceptance tests — timing, PPU, interrupts | **MIT** ✅ | Yes, with attribution |
 | [riscv-tests](https://github.com/riscv-software-src/riscv-tests) | RISC-V ISA tests | **BSD-3-Clause** (UC Regents) ✅ | Yes, with attribution |
-| [riscv-arch-test](https://github.com/riscv-non-isa/riscv-arch-test) | RISC-V architectural compliance, driven by [RISCOF](https://github.com/riscv-software-src/riscof) | Not auto-detected — **check the in-tree licence** ⚠️ | Verify first |
+| [riscv-arch-test](https://github.com/riscv-non-isa/riscv-arch-test) | RISC-V architectural certification — one signature per test, diffed against a reference model | **BSD-3-Clause** ✅ (© RISC-V International — verified against upstream `COPYING.BSD` and the `SPDX-License-Identifier` line on all 2 088 files of `riscv-test-suite` at tag 3.9.1) | Yes, with attribution — but it is *built*, not vendored: `scripts/fetch-testdata.sh riscv-arch-test` |
+| [sail-riscv](https://github.com/riscv/sail-riscv) | The RISC-V formal model, used as the reference that `riscv-arch-test` signatures are diffed against | **BSD-2-Clause** ✅ (verified against the `copyright` file in the release tarball) | Permissive, so readable — but it is only ever **run**, as a downloaded binary |
 | [barotto/test386.asm](https://github.com/barotto/test386.asm) | 80386 CPU test ROM | **GPL-3.0** ⛔ | **No.** Download and run only |
 | [OpenSBI](https://github.com/riscv-software-src/opensbi) | RISC-V M-mode firmware | **BSD-2-Clause** ✅ | Yes — readable *and* usable |
 | [EDK II / OVMF](https://github.com/tianocore/edk2) | UEFI firmware | BSD-2-Clause-Patent ✅ | Readable; taken as a prebuilt rather than vendored (building it needs a C toolchain). `scripts/fetch-testdata.sh edk2` copies the RISC-V build out of the local `qemu` firmware package |
@@ -63,7 +64,7 @@ repeated here — they drifted once already.
 | --- | --- |
 | NES | SingleStepTests 65x02 (documented opcodes 100 %; the analog unstable ones ledgered separately), `nestest` trace-identical, blargg `cpu_instrs` + `instr_timing`, AccuracyCoin (licence permitting) |
 | Game Boy / SMS | `mooneye-test-suite` acceptance, blargg GB, `zexall` |
-| RISC-V `virt` | `riscv-tests`, `riscv-arch-test` via RISCOF, Linux boot to shell |
+| RISC-V `virt` | `riscv-tests`, `riscv-arch-test` (in-tree runner, Sail as the reference — no RISCOF), Linux boot to shell |
 | PC | `test386.asm`, SingleStepTests 8088, then real-OS boots (FreeDOS → Win 3.11 → Win 95 → Linux → Win XP) |
 | SMP emulation | `kvm-unit-tests` atomics/barriers, plus memory-model litmus tests ([`../techniques/memory-models.md`](../techniques/memory-models.md)) |
 

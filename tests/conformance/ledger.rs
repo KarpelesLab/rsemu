@@ -231,6 +231,172 @@ pub(crate) fn judge(ledger: &Ledger, ran: &[u8], failures: &[(u8, String)]) -> V
     v
 }
 
+// ---------------------------------------------------------------------------
+// The same discipline, for suites whose tests have names rather than opcodes
+// ---------------------------------------------------------------------------
+
+/// One excused failure in a suite keyed by test name.
+///
+/// `riscv-arch-test` has no opcode to key on — its unit is a built test image,
+/// `I/add-01` — so it gets its own entry type rather than a `u8` pressed into
+/// service as an index. Everything else about the discipline is identical:
+/// a note is required, an unexcused failure fails the run, and an entry whose
+/// test now passes fails the run too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NamedEntry {
+    /// The test this entry covers, exactly as the runner names it.
+    pub(crate) test: String,
+    /// The justification written after `#`. Required.
+    pub(crate) note: String,
+    /// 1-based line number, for error messages.
+    pub(crate) line: usize,
+}
+
+/// A parsed name-keyed ledger.
+#[derive(Debug)]
+pub(crate) struct NamedLedger {
+    /// Where it came from, for error messages.
+    pub(crate) path: PathBuf,
+    /// The entries, in file order.
+    pub(crate) entries: Vec<NamedEntry>,
+}
+
+impl NamedLedger {
+    /// Load one. A missing file is an empty ledger — the strictest state.
+    pub(crate) fn load(path: &Path) -> Result<NamedLedger, ParseError> {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let entries = parse_named(&text)?;
+        Ok(NamedLedger {
+            path: path.to_path_buf(),
+            entries,
+        })
+    }
+
+    /// Does the ledger excuse this test?
+    pub(crate) fn excuses(&self, test: &str) -> bool {
+        self.entries.iter().any(|e| e.test == test)
+    }
+}
+
+fn parse_named(text: &str) -> Result<Vec<NamedEntry>, ParseError> {
+    let mut out: Vec<NamedEntry> = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = i + 1;
+        let (body, note) = match raw.split_once('#') {
+            Some((body, note)) => (body.trim(), note.trim()),
+            None => (raw.trim(), ""),
+        };
+        if body.is_empty() {
+            continue;
+        }
+        if body.split_whitespace().count() != 1 {
+            return Err(ParseError {
+                line,
+                msg: format!("{body:?} is not a single test name"),
+            });
+        }
+        if note.is_empty() {
+            return Err(ParseError {
+                line,
+                msg: "every entry needs a `# why` note; an unexplained entry is a forgotten one"
+                    .into(),
+            });
+        }
+        if let Some(dup) = out.iter().find(|e| e.test == body) {
+            return Err(ParseError {
+                line,
+                msg: format!("duplicates the entry on line {}", dup.line),
+            });
+        }
+        out.push(NamedEntry {
+            test: body.to_string(),
+            note: note.to_string(),
+            line,
+        });
+    }
+    Ok(out)
+}
+
+/// What a name-keyed ledger says about a completed run.
+#[derive(Debug, Default)]
+pub(crate) struct NamedVerdict {
+    /// Failures nobody has excused.
+    pub(crate) unexcused: Vec<String>,
+    /// Entries that no longer match a failure — the ledger must shrink.
+    pub(crate) stale: Vec<NamedEntry>,
+    /// Failures the ledger excused.
+    pub(crate) excused: usize,
+}
+
+impl NamedVerdict {
+    /// Is the run acceptable?
+    pub(crate) fn is_ok(&self) -> bool {
+        self.unexcused.is_empty() && self.stale.is_empty()
+    }
+
+    /// A report a human can act on.
+    pub(crate) fn describe(&self, ledger: &NamedLedger) -> String {
+        let mut s = String::new();
+        if !self.unexcused.is_empty() {
+            let _ = writeln!(s, "{} unexcused failure(s):", self.unexcused.len());
+            for name in self.unexcused.iter().take(40) {
+                let _ = writeln!(s, "  {name}");
+            }
+            if self.unexcused.len() > 40 {
+                let _ = writeln!(s, "  ... and {} more", self.unexcused.len() - 40);
+            }
+            let _ = writeln!(
+                s,
+                "Fix the core. If a failure is genuinely expected, add a line to {} \
+                 with a note saying why.",
+                ledger.path.display()
+            );
+        }
+        if !self.stale.is_empty() {
+            let _ = writeln!(
+                s,
+                "\n{} ledger entr(y/ies) now pass — the ledger only ever shrinks, \
+                 so delete them from {}:",
+                self.stale.len(),
+                ledger.path.display()
+            );
+            for e in &self.stale {
+                let _ = writeln!(s, "  line {}: {}", e.line, e.test);
+            }
+        }
+        s
+    }
+}
+
+/// Compare a run against a name-keyed ledger.
+///
+/// `ran` is the set of tests that were actually executed; entries for tests
+/// outside it are left alone rather than reported stale, so narrowing a run
+/// does not condemn the rest of the file.
+pub(crate) fn judge_named(
+    ledger: &NamedLedger,
+    ran: &[String],
+    failures: &[String],
+) -> NamedVerdict {
+    let mut v = NamedVerdict::default();
+    for name in failures {
+        if ledger.excuses(name) {
+            v.excused += 1;
+        } else {
+            v.unexcused.push(name.clone());
+        }
+    }
+    for entry in &ledger.entries {
+        if !ran.contains(&entry.test) {
+            continue;
+        }
+        if !failures.contains(&entry.test) {
+            v.stale.push(entry.clone());
+        }
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +485,68 @@ mod tests {
     fn a_missing_file_loads_as_an_empty_ledger() {
         let l = Ledger::load(Path::new("/nonexistent/ledger-3f9a.txt")).unwrap();
         assert!(l.entries.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // The name-keyed half
+    // ------------------------------------------------------------------
+
+    fn named_ledger_of(text: &str) -> NamedLedger {
+        NamedLedger {
+            path: PathBuf::from("<test>"),
+            entries: parse_named(text).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_named_ledger_ignores_comments_and_blank_lines() {
+        let l = named_ledger_of("# header\n\n  \nI/add-01  # because\n");
+        assert_eq!(l.entries.len(), 1);
+        assert_eq!(l.entries[0].test, "I/add-01");
+        assert_eq!(l.entries[0].note, "because");
+        assert_eq!(l.entries[0].line, 4);
+        assert!(l.excuses("I/add-01"));
+        assert!(!l.excuses("I/addi-01"));
+    }
+
+    #[test]
+    fn malformed_named_entries_are_rejected() {
+        assert!(parse_named("I/add-01\n").is_err(), "note required");
+        assert!(parse_named("I/add-01 extra # why\n").is_err(), "one name");
+        assert!(parse_named("I/a # one\nI/a # two\n").is_err(), "duplicate");
+    }
+
+    #[test]
+    fn an_unexcused_named_failure_fails_the_run() {
+        let l = named_ledger_of("");
+        let ran = vec!["I/add-01".to_string()];
+        let v = judge_named(&l, &ran, &ran);
+        assert!(!v.is_ok());
+        assert!(v.describe(&l).contains("I/add-01"));
+    }
+
+    #[test]
+    fn an_excused_named_failure_passes_the_run() {
+        let l = named_ledger_of("I/add-01 # known bad\n");
+        let ran = vec!["I/add-01".to_string()];
+        let v = judge_named(&l, &ran, &ran);
+        assert!(v.is_ok());
+        assert_eq!(v.excused, 1);
+    }
+
+    #[test]
+    fn a_named_ledger_entry_that_now_passes_fails_the_run() {
+        let l = named_ledger_of("I/add-01 # was broken once\n");
+        let v = judge_named(&l, &["I/add-01".to_string()], &[]);
+        assert!(!v.is_ok());
+        assert_eq!(v.stale.len(), 1);
+        assert!(v.describe(&l).contains("only ever shrinks"));
+    }
+
+    #[test]
+    fn named_entries_for_tests_that_did_not_run_are_left_alone() {
+        let l = named_ledger_of("D/fdiv-01 # known bad\n");
+        let v = judge_named(&l, &["I/add-01".to_string()], &[]);
+        assert!(v.is_ok());
     }
 }
