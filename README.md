@@ -120,6 +120,17 @@ snapshots, a typed export seam so one device can hand another a handle, and a
 → run. There is a **gdb stub** (`rsemu debug apple1 --gdb :1234`) and a
 **browser build** at <https://karpeleslab.github.io/rsemu/>.
 
+There is **sound**, too. The audio seam mirrors the display one: a device emits
+what the silicon does — the RP2A03 emits an unsigned level out of a non-linear
+DAC pair at 894 886.36… Hz — and the host applies the board's own RC network,
+resamples with an exact integer phase, and either writes a `.wav`
+(`rsemu run nes-ntsc --cart game.nes --for 5s --record-audio game.wav`) or hands
+it to WebAudio in the browser. Every float in that path is an amplitude, never a
+duration, so a machine's state hash does not depend on whether anybody is
+listening. There is no native sound-card backend for the same reason there is no
+native window: ALSA is an `ioctl` protocol and the alternative to `libc` is a
+seventh `unsafe` subsystem, which the ceiling of six forbids.
+
 Not started: the IR and JIT, so everything is interpreted; hardware
 acceleration; and i386 protected mode, without which no stock PC BIOS runs. See
 [`ROADMAP.md`](ROADMAP.md).

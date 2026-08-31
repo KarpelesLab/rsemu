@@ -10,6 +10,7 @@
 //! | [`chardev`] | no | the character-stream seam: a byte pipe a device model can hold |
 //! | [`terminal`] | yes | that seam, driven by the process's own stdin and stdout |
 //! | [`display`] | no | the scanout seam: a guest surface, converted to host pixels |
+//! | [`audio`] | no | the audio seam: a guest's samples, converted and rate-matched |
 //! | `gdb` | yes | the GDB remote serial protocol over TCP (§8) |
 //!
 //! # Why the trait is not itself `std`
@@ -21,6 +22,7 @@
 //! A `no_std` build gets the trait and the in-memory port, which is exactly
 //! what a deterministic test or a wasm embedder wants.
 
+pub mod audio;
 pub mod chardev;
 pub mod display;
 
