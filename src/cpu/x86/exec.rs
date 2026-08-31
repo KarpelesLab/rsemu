@@ -2162,8 +2162,12 @@ impl<'a> Exec<'a> {
         let insn = f.insn;
         let bits = u32::from(size) * 8;
         let raw = self.read_arg(f, insn.src, if insn.src == Arg::Ib { 1 } else { size })?;
-        let register_operand = f.rm_is_register() || insn.src == Arg::Ib;
-        let (index, offset_bytes) = if register_operand {
+        // An *immediate* bit number is always taken modulo the operand size,
+        // and so is a register bit number applied to a register operand: in
+        // neither case is there anywhere for a byte offset to point. Only a
+        // register bit number with a memory operand gets the unbounded form.
+        let bounded = f.rm_is_register() || insn.src == Arg::Ib;
+        let (index, offset_bytes) = if bounded {
             (raw % bits, 0i32)
         } else {
             let signed = Self::sign_extend32(raw, size) as i32;
@@ -2172,7 +2176,7 @@ impl<'a> Exec<'a> {
             (bit, word * i32::from(size))
         };
 
-        let value = if register_operand {
+        let value = if bounded {
             self.read_arg(f, insn.dst, size)?
         } else {
             let (sr, off) = self.ea();
@@ -2187,7 +2191,7 @@ impl<'a> Exec<'a> {
             Op::BTC => value ^ (1 << index),
             _ => return Ok(()),
         };
-        if register_operand {
+        if bounded {
             self.write_arg(f, insn.dst, size, updated)?;
         } else {
             let (sr, off) = self.ea();
@@ -2490,16 +2494,24 @@ impl<'a> Exec<'a> {
         } else if signed {
             let n = Self::sign_extend_wide(dividend, bits * 2);
             let d = i64::from(Self::sign_extend32(source, size) as i32);
-            let mut q = n / d;
-            if negate {
-                q = q.wrapping_neg();
+            // `IDIV` of the most negative 64-bit dividend by -1 has a quotient
+            // that is not representable at all — `2^63`. That is a divide
+            // error on hardware and it is a *panic* on the host, so it has to
+            // be caught here rather than divided and then range-checked.
+            match (n.checked_div(d), n.checked_rem(d)) {
+                (Some(mut q), Some(r)) => {
+                    if negate {
+                        q = q.wrapping_neg();
+                    }
+                    let limit = 1i64 << (bits - 1);
+                    (
+                        (q as u64) & mask,
+                        (r as u64) & mask,
+                        !(-limit..limit).contains(&q),
+                    )
+                }
+                _ => (0, 0, true),
             }
-            let limit = 1i64 << (bits - 1);
-            (
-                (q as u64) & mask,
-                ((n % d) as u64) & mask,
-                !(-limit..limit).contains(&q),
-            )
         } else {
             let q = dividend / divisor_magnitude;
             // The loop and the host's divide have to agree whenever the result

@@ -57,7 +57,15 @@
 //!   emulate, which is what an operating system that wants to do so asks for.
 //! - **No virtual-8086 mode.** `EFLAGS.VM` has storage and nothing sets it.
 //! - **No debug breakpoints.** `DR0`-`DR7` round-trip; arming one fires
-//!   nothing.
+//!   nothing. `TR6`/`TR7` likewise store and do nothing.
+//! - **No alignment check.** `CR0.AM` and `EFLAGS.AC` have storage; no `#AC`
+//!   is ever raised.
+//! - **`LOCK` is decoded and ignored.** One core, one bus, and nothing to
+//!   contend with; the invalid-opcode exception a `LOCK` on a non-lockable
+//!   instruction should raise is not enforced.
+//! - **The accessed bit** is set when a selector is loaded by `MOV Sreg` or by
+//!   a far transfer to a code segment, but not by the segment loads a gate,
+//!   an `IRET` or a task switch performs. Hardware sets it in all of them.
 //! - **No 286-format task state segment.** Switching to one raises `#TS`
 //!   rather than silently truncating the state it cannot hold.
 //! - **No A20 gate.** Masking address line 20 happens between the processor

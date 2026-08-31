@@ -1073,6 +1073,8 @@ mod rights {
     pub(super) const DATA32: u32 = ar::PRESENT | ar::S | ar::RW | ar::DB;
     /// An executable, readable 16-bit code segment — no `D` bit.
     pub(super) const CODE16: u32 = ar::PRESENT | ar::S | ar::CODE | ar::RW;
+    /// A writable 16-bit data segment — no `B` bit, so `SP` moves in sixteen.
+    pub(super) const DATA16: u32 = ar::PRESENT | ar::S | ar::RW;
     /// The same at privilege 3.
     pub(super) const DPL3: u32 = ar::DPL;
 }
@@ -2629,4 +2631,284 @@ fn a_page_fault_restarts_the_instruction_that_caused_it() {
     pc.cpu.set_sys(sys);
     pc.cpu.step();
     assert_eq!(pc.read32(at::MARK), 0x0bad_f00d);
+}
+
+#[test]
+fn a_sixteen_bit_code_segment_in_protected_mode_runs_sixteen_bit_code() {
+    // The mode a PC firmware spends its BIOS services in, and the one a
+    // "just widen everything to 32 bits" core gets wrong: protection is on,
+    // but `CS.D` is clear, so the *default* operand and address sizes are
+    // sixteen and `66`/`67` select the wide forms rather than the narrow ones.
+    let pc = pc386();
+    pc.start_protected();
+    pc.gdt(3, descriptor(0, 0xffff, rights::CODE16));
+    pc.gdt(4, descriptor(0, 0xffff, rights::DATA16));
+    pc.write(
+        at::CODE0,
+        &[0xea, 0x00, 0x40, 0x00, 0x00, 0x18, 0x00], // jmp far 0x18:0x4000
+    );
+    pc.write(
+        at::CODE3,
+        &[
+            0xb8, 0x34, 0x12, // mov ax, 0x1234      — sixteen bits by default
+            0x66, 0xbb, 0x78, 0x56, 0x34, 0x12, // mov ebx, 0x12345678
+            0xa3, 0x00, 0x70, // mov [0x7000], ax    — a sixteen-bit offset
+            0xf4,
+        ],
+    );
+    let steps = pc.run(8);
+    assert!(steps < 8);
+    let regs = pc.regs();
+    assert_eq!(regs.cs, 0x18);
+    assert!(!pc.cpu.sys().seg(isa::seg::CS).big());
+    assert_eq!(regs.eax & 0xffff, 0x1234);
+    assert_eq!(regs.ebx, 0x1234_5678);
+    assert_eq!(pc.read32(at::MARK) & 0xffff, 0x1234);
+}
+
+#[test]
+fn a_far_call_crosses_between_sixteen_and_thirty_two_bit_segments() {
+    let pc = pc386();
+    pc.start_protected();
+    pc.gdt(3, descriptor(0, 0xffff, rights::CODE16));
+    // 32-bit code calls into a 16-bit segment and the callee returns. The
+    // return address was pushed as two doublewords by the caller's operand
+    // size, so the callee's `RETF` needs a `66` prefix to pop them the same
+    // way — which is the detail that makes a mixed-width far return
+    // interesting, and the reason firmware writes it that way.
+    pc.write(
+        at::CODE0,
+        &[
+            0x9a, 0x00, 0x40, 0x00, 0x00, 0x18, 0x00, // callf 0x18:0x4000
+            0xbb, 0x0d, 0x60, 0x00, 0x00, // mov ebx, 0x600d
+            0xf4,
+        ],
+    );
+    pc.write(
+        at::CODE3,
+        &[
+            0xb8, 0x99, 0x99, // mov ax, 0x9999
+            0x66, 0xcb, // retf, with a 32-bit operand size
+        ],
+    );
+    let steps = pc.run(8);
+    assert!(steps < 8);
+    let regs = pc.regs();
+    assert_eq!(regs.eax & 0xffff, 0x9999, "the 16-bit callee ran");
+    assert_eq!(regs.ebx, 0x600d, "and control came back");
+    assert_eq!(regs.cs, 0x08);
+    assert_eq!(regs.esp, at::STACK0, "the stack is balanced");
+}
+
+#[test]
+fn an_interrupt_onto_a_sixteen_bit_stack_moves_the_pointer_in_sixteen_bits() {
+    let pc = pc386();
+    pc.start_protected();
+    // A stack segment with `B` clear: `SP` moves, `ESP`'s high half does not,
+    // and a 16-bit gate pushes words rather than doublewords.
+    pc.gdt(3, descriptor(0, 0xffff, rights::DATA16));
+    pc.gdt(4, descriptor(0, 0xffff, rights::CODE16));
+    pc.idt(0x40, gate(0x20, 0x4000, sys_type::INT_GATE16, 0));
+    pc.write(0x4000, &[0xf4]);
+    let mut sys = pc.cpu.sys();
+    sys.segs[usize::from(isa::seg::SS)] = SegReg {
+        selector: 0x18,
+        base: 0,
+        limit: 0xffff,
+        ar: rights::DATA16,
+    };
+    pc.cpu.set_sys(sys);
+    pc.cpu.set_regs(Regs {
+        ss: 0x18,
+        esp: 0xdead_9000,
+        ..pc.regs()
+    });
+    pc.write(at::CODE0, &[0xcd, 0x40, 0xf4]); // int 0x40
+    pc.cpu.step();
+    let regs = pc.regs();
+    assert_eq!(regs.cs, 0x20);
+    assert_eq!(regs.eip, 0x4000);
+    assert_eq!(
+        regs.esp, 0xdead_8ffa,
+        "three words pushed, and the high half of ESP untouched"
+    );
+    assert_eq!(
+        pc.read32(0x8ffc) & 0xffff,
+        0x08,
+        "the caller's CS, stored as a word"
+    );
+}
+
+#[test]
+fn smsw_sldt_and_str_read_back_what_was_loaded() {
+    let pc = pc386();
+    pc.start_protected();
+    pc.gdt(
+        5,
+        descriptor(
+            at::TSS,
+            0x67,
+            ar::PRESENT | (u32::from(sys_type::TSS32_AVAIL) << 8),
+        ),
+    );
+    pc.gdt(
+        6,
+        descriptor(0x9800, 0xff, ar::PRESENT | (u32::from(sys_type::LDT) << 8)),
+    );
+    pc.write(
+        at::CODE0,
+        &[
+            0xb8, 0x28, 0x00, 0x00, 0x00, // mov eax, 0x28
+            0x0f, 0x00, 0xd8, // ltr ax
+            0xb8, 0x30, 0x00, 0x00, 0x00, // mov eax, 0x30
+            0x0f, 0x00, 0xd0, // lldt ax
+            0x0f, 0x00, 0xc1, // sldt ecx
+            0x0f, 0x00, 0xca, // str edx
+            0x0f, 0x01, 0xe3, // smsw ebx
+            0xf4,
+        ],
+    );
+    let steps = pc.run(10);
+    assert!(steps < 10);
+    let regs = pc.regs();
+    assert_eq!(regs.ecx & 0xffff, 0x30, "sldt");
+    assert_eq!(regs.edx & 0xffff, 0x28, "str");
+    assert_eq!(regs.ebx & 1, 1, "smsw sees CR0.PE");
+    assert_eq!(pc.cpu.sys().ldtr.base, 0x9800);
+    // Marking the task state segment busy is what stops a second task being
+    // switched into the same state; `LTR` does it as a side effect.
+    assert_eq!(
+        (pc.read32(at::GDT + 5 * 8 + 4) >> 8) & 0xf,
+        u32::from(sys_type::TSS32_BUSY)
+    );
+}
+
+#[test]
+fn two_saves_of_the_same_state_are_byte_identical() {
+    // CLAUDE.md asks a save/load round trip to reach an identical state hash.
+    // Comparing the bytes is that without a hash function: if any part of the
+    // core's state reached the snapshot in a form that does not round-trip,
+    // the second save would differ from the first.
+    let pc = pc386();
+    pc.start_protected();
+    pc.write(at::CODE0, &[0xb8, 0x11, 0x22, 0x33, 0x44, 0x50, 0x58, 0xf4]);
+    pc.run(5);
+
+    let snapshot = |cpu: &X86| {
+        let mut shape = MachineShape::new();
+        shape.add_device("/cpu0", "cpu.x86").unwrap();
+        let mut writer = StateWriter::new(shape);
+        {
+            let mut chunk = writer.chunk("/cpu0", "cpu.x86", 2).unwrap();
+            cpu.save(&mut chunk).unwrap();
+        }
+        writer.to_vec().unwrap()
+    };
+
+    let first = snapshot(&pc.cpu);
+    pc.cpu.reset(ResetKind::Cold);
+    let reader = crate::core::state::StateReader::new(&first).unwrap();
+    let (_, _, data) = reader.load_raw("/cpu0").unwrap();
+    let mut chunk = ChunkReader::new(data);
+    pc.cpu.load(&mut chunk).unwrap();
+    chunk.end().unwrap();
+    let second = snapshot(&pc.cpu);
+    assert_eq!(first, second, "the snapshot does not round-trip exactly");
+}
+
+#[test]
+fn the_divide_that_has_no_representable_quotient_is_a_divide_error() {
+    // `EDX:EAX` of `0x8000000000000000` divided by -1 would be `2^63`, which
+    // does not fit in `EAX`. Hardware raises #DE; a host that divides first
+    // and range-checks afterwards traps on the division instead, which is why
+    // this case is checked rather than assumed.
+    let pc = pc386();
+    pc.start_protected();
+    pc.idt(0, gate(0x08, 0x3100, sys_type::INT_GATE32, 0));
+    pc.write(0x3100, &[0xf4]);
+    pc.write(
+        at::CODE0,
+        &[
+            0x31, 0xc0, // xor eax, eax
+            0xba, 0x00, 0x00, 0x00, 0x80, // mov edx, 0x80000000
+            0xb9, 0xff, 0xff, 0xff, 0xff, // mov ecx, -1
+            0xf7, 0xf9, // idiv ecx
+            0xf4,
+        ],
+    );
+    for _ in 0..4 {
+        pc.cpu.step();
+    }
+    assert_eq!(pc.regs().eip, 0x3100, "#DE, not a host panic");
+    // #DE is a fault on a 386: the saved address is the `idiv`, not the `hlt`.
+    assert_eq!(pc.read32(at::STACK0 - 12), at::CODE0 + 12);
+
+    // The ordinary overflow — a quotient that is merely too large — is the
+    // same fault.
+    let pc = pc386();
+    pc.start_protected();
+    pc.idt(0, gate(0x08, 0x3100, sys_type::INT_GATE32, 0));
+    pc.write(0x3100, &[0xf4]);
+    pc.write(
+        at::CODE0,
+        &[
+            0xb8, 0x00, 0x00, 0x00, 0x00, // mov eax, 0
+            0xba, 0x01, 0x00, 0x00, 0x00, // mov edx, 1
+            0xb9, 0x01, 0x00, 0x00, 0x00, // mov ecx, 1
+            0xf7, 0xf1, // div ecx
+            0xf4,
+        ],
+    );
+    for _ in 0..4 {
+        pc.cpu.step();
+    }
+    assert_eq!(pc.regs().eip, 0x3100);
+}
+
+#[test]
+fn a_bit_test_on_memory_with_a_register_offset_reaches_outside_the_operand() {
+    // `bt [mem], ebx` takes a **signed and unbounded** bit number: the
+    // processor divides it by the operand size and addresses that far from the
+    // operand, forward or backward. An implementation that masks it to the
+    // operand size reads the wrong dword and nothing complains.
+    let pc = pc386();
+    pc.start_protected();
+    pc.write32(0x8000, 0);
+    pc.write32(0x8004, 0x0000_0004); // bit 34 of the array at 0x8000
+    pc.write32(0x7ffc, 0x8000_0000); // bit -1
+    pc.write(
+        at::CODE0,
+        &[
+            0xbb, 0x22, 0x00, 0x00, 0x00, // mov ebx, 34
+            0x0f, 0xa3, 0x1d, 0x00, 0x80, 0x00, 0x00, // bt [0x8000], ebx
+            0x0f, 0x92, 0xc0, // setb al
+            0xbb, 0xff, 0xff, 0xff, 0xff, // mov ebx, -1
+            0x0f, 0xa3, 0x1d, 0x00, 0x80, 0x00, 0x00, // bt [0x8000], ebx
+            0x0f, 0x92, 0xc4, // setb ah
+            0xf4,
+        ],
+    );
+    let steps = pc.run(10);
+    assert!(steps < 10);
+    let regs = pc.regs();
+    assert_eq!(regs.eax & 0xff, 1, "bit 34 is one doubleword along");
+    assert_eq!((regs.eax >> 8) & 0xff, 1, "bit -1 is one doubleword back");
+
+    // With an immediate the bit number is taken modulo the operand size and
+    // never leaves the operand, which is the other half of the same rule.
+    let pc = pc386();
+    pc.start_protected();
+    pc.write32(0x8000, 0x0000_0001);
+    pc.write32(0x8004, 0xffff_ffff);
+    pc.write(
+        at::CODE0,
+        &[
+            0x0f, 0xba, 0x25, 0x00, 0x80, 0x00, 0x00, 0x20, // bt [0x8000], 32
+            0x0f, 0x92, 0xc0, // setb al
+            0xf4,
+        ],
+    );
+    let steps = pc.run(5);
+    assert!(steps < 5);
+    assert_eq!(pc.regs().eax & 0xff, 1, "bit 32 wrapped to bit 0");
 }
