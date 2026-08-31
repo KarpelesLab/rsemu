@@ -41,7 +41,7 @@ use alloc::vec::Vec;
 
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
 use crate::core::error::{BusError, Error, Result};
-use crate::core::props::{Props, ValueKind};
+use crate::core::props::{Media, Props, ValueKind};
 use crate::core::space::{AccessConstraints, AddressSpace, MemAttrs, MemOps, MemResult};
 use crate::core::space::{Region, RegionRef};
 use crate::core::sync::{LockRank, Mutex};
@@ -206,6 +206,13 @@ impl BootRom {
         let isa = r.or("isa", String::from("rv64imafdc"))?;
         let mmu = r.or("mmu", String::from("sv39"))?;
         let bootargs = r.or("bootargs", String::new())?;
+        // The ramdisk is *described* here and *placed* by a `riscv.loader`, so
+        // the same media slot is named twice and its length is read out of the
+        // bytes rather than written down a second time. Only the address is
+        // repeated, which is the same duplication a `map` statement already
+        // has, and a wrong one is visible in the generated tree.
+        let initrd_len = r.optional_media("initrd")?.map_or(0, Media::len);
+        let initrd_addr = r.or_addr("initrd-addr", 0)?;
         let model = r.or("model", String::from("rsemu riscv-virt"))?;
         let timebase = r.or_range(
             "timebase",
@@ -214,6 +221,27 @@ impl BootRom {
         )?;
         r.finish()?;
 
+        // Computed here rather than at the tree, so a ramdisk that cannot be
+        // described is a construction error rather than a wrong `/chosen`.
+        let initrd = if initrd_len == 0 {
+            None
+        } else if initrd_addr == 0 {
+            return Err(Error::Property(String::from(
+                "property `initrd`: a ramdisk was bound but `initrd-addr` says where it is not; \
+                 give the address the `riscv.loader` staging it writes to",
+            )));
+        } else {
+            // Deliberately checked, not wrapping: this is a host-side
+            // description of where an image was put, and an end that wrapped
+            // past the top of the address space would describe nothing.
+            let end = initrd_addr.checked_add(initrd_len).ok_or_else(|| {
+                Error::Property(format!(
+                    "property `initrd-addr`: {initrd_len} byte(s) at {initrd_addr:#x} runs off \
+                     the end of a 64-bit address space"
+                ))
+            })?;
+            Some((initrd_addr, end))
+        };
         if size < DTB_OFFSET + 0x100 {
             return Err(Error::Property(format!(
                 "property `size`: a boot ROM of {size} byte(s) has no room for a device tree; \
@@ -247,6 +275,7 @@ impl BootRom {
             config: TreeConfig {
                 model,
                 bootargs,
+                initrd,
                 cpus: CpuSpec {
                     harts: harts as u32,
                     isa,
@@ -396,6 +425,19 @@ pub static CLASS: DeviceClass = DeviceClass {
             summary: "the kernel command line, as `/chosen/bootargs`",
         },
         PropertySpec {
+            name: "initrd",
+            kind: ValueKind::Media,
+            required: false,
+            summary: "the ramdisk to describe, as a media slot — read for its length only, \
+                      because a `riscv.loader` is what puts it in memory",
+        },
+        PropertySpec {
+            name: "initrd-addr",
+            kind: ValueKind::Addr,
+            required: false,
+            summary: "where that ramdisk was staged, as `/chosen/linux,initrd-start`",
+        },
+        PropertySpec {
             name: "model",
             kind: ValueKind::Str,
             required: false,
@@ -479,6 +521,8 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("isa", ValueKind::Str))
         .prop(PropSchema::new("mmu", ValueKind::Str))
         .prop(PropSchema::new("bootargs", ValueKind::Str))
+        .prop(PropSchema::new("initrd", ValueKind::Media))
+        .prop(PropSchema::new("initrd-addr", ValueKind::Addr))
         .prop(PropSchema::new("model", ValueKind::Str))
         .prop(PropSchema::new("timebase", ValueKind::Uint))
         .region("")

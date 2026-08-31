@@ -54,11 +54,13 @@ something a person can actually run (§2).
 > interactive over a terminal; and `riscv-virt`, which is the one that boots
 > real system software: **OpenSBI 1.6 completely**, on a device tree generated
 > from the realized machine rather than shipped, then **Linux 6.12 all the way
-> to `prepare_namespace`** — every initcall, the driver model, and the console
-> handover off the SBI earlycon onto our own 16550A — where it panics for want
-> of a root filesystem nobody supplied, and **EDK2 all the way to a UEFI shell
-> prompt**, out of two CFI NOR flash banks the board maps and the generated tree
-> describes. The variable store is real flash, so a variable written in one run
+> to a shell prompt that echoes what is typed at it** — every initcall, the
+> driver model, the console handover off the SBI earlycon onto our own 16550A,
+> and then busybox on an initramfs the fetch script builds, in two and a half
+> minutes of host time under the interpreter. With the kernel's own
+> `virtio_mmio` and `virtio_blk` loaded it also claims the board's virtio disk
+> and reads and writes it. And **EDK2 all the way to a UEFI shell prompt**, out
+> of two CFI NOR flash banks the board maps and the generated tree describes. The variable store is real flash, so a variable written in one run
 > is there in the next. Where each stops is written down, not rounded up.
 > `pc-at` — a complete PC/AT chipset with a user-supplied BIOS path — is now
 > **in the catalog**: every CPU core in the tree is bindable from a `.machine`

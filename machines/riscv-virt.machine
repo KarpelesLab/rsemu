@@ -3,6 +3,8 @@
 #
 #   rsemu run riscv-virt --media firmware=fw.bin
 #   rsemu run riscv-virt --media firmware=fw_payload.bin -p ram=256M
+#   rsemu run riscv-virt --media firmware=fw_payload.bin --initrd rootfs.cpio \
+#       -p ram=512M -p cmdline="console=ttyS0"
 #
 # There is no such chip as a "virt". This is the board every RISC-V toolchain
 # and every RISC-V kernel already knows how to target: one hart, a CLINT for the
@@ -34,13 +36,20 @@ machine "riscv-virt" {
   # The kernel command line, handed over as `/chosen/bootargs`.
   param cmdline = ""
 
+  # Where a ramdisk bound to the `initrd` media slot is staged, and what
+  # `/chosen/linux,initrd-start` therefore says. It only means anything when
+  # something is bound to that slot, so the default is a plain address rather
+  # than "off": 128 MiB into DRAM, clear of a kernel loaded at 0x80200000 and
+  # of the pages it decompresses into, which needs `ram` to be at least 256M.
+  param initrd_addr = 0x88000000
+
   # Which named power signal a guest's poweroff request lands on, so two of
   # these can run in one process without stopping each other.
   param power = "power"
 
-  # The virtio disk's size. It starts as zeroes; a real image goes in through
-  # the `disk` media slot once `virtio.blk` grows one
-  # (`-p storage=64M`, or add `image = "disk"` to the object below).
+  # The virtio disk's size. Whatever is bound to the `disk` media slot is the
+  # start of it, padded out to this with zeroes — so `-p storage=64M` alone is
+  # a blank 64 MiB disk, and `--disk foo.img` alone is exactly that image.
   param storage = 16M
 
   # How big each of the two NOR flash banks is. Two, because that is how a
@@ -141,6 +150,7 @@ machine "riscv-virt" {
   object blk "virtio.blk" {
     space  = mem
     size   = storage
+    image  = "disk"
     serial = "rsemu-virt-0"
   }
 
@@ -207,6 +217,12 @@ machine "riscv-virt" {
     bootargs = cmdline
     timebase = 10000000
     model    = "rsemu riscv-virt"
+    # Described here, placed by the `initrd` loader at the bottom of this file.
+    # The same media slot is named twice on purpose: the length comes out of
+    # the bytes in both places, so the only thing written down twice is the
+    # address, and a wrong one shows up in the generated tree.
+    initrd      = "initrd"
+    initrd-addr = initrd_addr
   }
 
   # -- the memory map --------------------------------------------------------
@@ -244,5 +260,14 @@ machine "riscv-virt" {
     space = mem
     image = "firmware"
     addr  = 0x80000000
+  }
+
+  # The ramdisk, if one was bound. An unbound slot is empty bytes, and an empty
+  # image loads nothing — so this object costs a machine with no initrd
+  # nothing but the line it is written on.
+  object initrd "riscv.loader" {
+    space = mem
+    image = "initrd"
+    addr  = initrd_addr
   }
 }

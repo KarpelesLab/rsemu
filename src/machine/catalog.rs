@@ -129,10 +129,13 @@ pub static BENEATER_6502: CatalogEntry = CatalogEntry {
 pub static RISCV_VIRT: CatalogEntry = CatalogEntry {
     name: "riscv-virt",
     summary: "RISC-V `virt`: RV64GC hart, CLINT, PLIC, 16550, virtio-MMIO, NOR flash, DTB",
-    // The two NOR banks are listed because they are what a UEFI build needs,
-    // not because the board will not come up without them: unbound means a
-    // board with blank parts on it, and `rsemu run` binds them empty.
-    media: &["firmware", "flash0", "flash1"],
+    // Only `firmware` is needed to come up. The rest are listed because they
+    // are what a particular guest wants — the NOR banks for a UEFI build, the
+    // ramdisk for a kernel that has to find a root filesystem, the disk image
+    // for one that reads a real one — and unbound means the empty version of
+    // each: blank flash, no initrd, a disk of zeroes. `rsemu run` binds them
+    // empty so nobody has to say so.
+    media: &["firmware", "flash0", "flash1", "initrd", "disk"],
     source: include_str!("../../machines/riscv-virt.machine"),
 };
 
@@ -1084,6 +1087,17 @@ mod tests {
             // ships and the state a UEFI build initialises for itself.
             #[cfg(feature = "machine-riscv-virt")]
             ("riscv-virt", "flash0" | "flash1") => &[],
+            // No ramdisk, which is what a bare-metal or disk-rooted boot has.
+            // The `initrd` loader writes nothing for an empty image and the
+            // boot ROM leaves `/chosen` without the two `linux,initrd-*`
+            // properties, so a machine with this slot unbound is the machine
+            // that existed before the slot did.
+            #[cfg(feature = "machine-riscv-virt")]
+            ("riscv-virt", "initrd") => &[],
+            // And no disk image, which leaves the `size` in the machine file
+            // to supply a blank one — a board with an unwritten disk in it.
+            #[cfg(feature = "machine-riscv-virt")]
+            ("riscv-virt", "disk") => &[],
             // The board's own demo: it configures the panel over SPI, paints a
             // gradient and enables the scanout engine. Assembled at compile
             // time by `dev::lcd::demo`, so it needs no toolchain either.

@@ -175,6 +175,14 @@ pub struct TreeConfig {
     pub model: String,
     /// `/chosen/bootargs`, the kernel command line.
     pub bootargs: String,
+    /// Where a ramdisk was staged, as `(first byte, one past the last)`.
+    ///
+    /// `None` when nothing staged one, which is every bare-metal run. The two
+    /// addresses become `/chosen/linux,initrd-start` and `linux,initrd-end`:
+    /// they are not in the Devicetree Specification, they are the convention
+    /// Linux has read since it grew a device tree, and a kernel that finds
+    /// neither one simply has no ramdisk.
+    pub initrd: Option<(u64, u64)>,
     /// The harts.
     pub cpus: CpuSpec,
     /// The timebase to use when no CLINT published one.
@@ -388,6 +396,15 @@ pub fn generate(space: &AddressSpace, cfg: &TreeConfig) -> Result<Vec<u8>> {
     }
     if let Some(path) = &stdout {
         w.prop_str("stdout-path", path);
+    }
+    // Sixty-four bits each rather than one cell: the kernel reads whatever
+    // width the property is, and an address that needs more than 32 bits is
+    // the ordinary case on a board whose RAM starts at 0x80000000 and can be
+    // large. `-end` is one past the last byte, which is what every reader of
+    // these two properties has always assumed.
+    if let Some((start, end)) = cfg.initrd {
+        w.prop_u64("linux,initrd-start", start);
+        w.prop_u64("linux,initrd-end", end);
     }
     w.end_node()?;
 
@@ -727,6 +744,7 @@ mod tests {
         let cfg = TreeConfig {
             model: "test".to_string(),
             bootargs: String::new(),
+            initrd: None,
             cpus: CpuSpec {
                 harts: 1,
                 isa: "rv64imac".to_string(),

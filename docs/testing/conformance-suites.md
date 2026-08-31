@@ -42,6 +42,8 @@ anything**; this table records a point in time.
 | [OpenSBI](https://github.com/riscv-software-src/opensbi) | RISC-V M-mode firmware | **BSD-2-Clause** ✅ | Yes — readable *and* usable |
 | [EDK II / OVMF](https://github.com/tianocore/edk2) | UEFI firmware | BSD-2-Clause-Patent ✅ | Readable; taken as a prebuilt rather than vendored (building it needs a C toolchain). `scripts/fetch-testdata.sh edk2` copies the RISC-V build out of the local `qemu` firmware package |
 | [kvm-unit-tests](https://gitlab.com/kvm-unit-tests/kvm-unit-tests) | Atomics, barriers, interrupt controllers — the parallel-execution stress suite | **GPL-2.0** ⛔ | **No.** Download and run only |
+| Linux (Debian riscv64 installer kernel, and the matching `linux-image` for its `virtio_mmio` and `virtio_blk` modules) | The `riscv-virt` boot-to-shell gate | **GPL-2.0** ⛔ | **No.** Download and run only — and its source is off limits to this project, not merely unvendorable |
+| [busybox](https://www.busybox.net) (Debian's `busybox-static`, riscv64) | The userland `/init` execs, so the boot reaches a prompt | **GPL-2.0** ⛔ | **No.** Download and run only. The `newc` cpio archive built around it by `scripts/fetch-testdata.sh` is ours; the binary inside it is not |
 | [retrio/gb-test-roms](https://github.com/retrio/gb-test-roms) (blargg) | Game Boy CPU, timing, sound | **No licence file** ⛔ | **No.** Provenance unclear — run only |
 | blargg's NES test ROMs | NES CPU, PPU, APU | Freely circulated, licence unclear ⛔ | **No.** Run only |
 | `nestest` + reference log | 6502 trace comparison — the fastest way to first-boot a 6502 | Licence unclear ⛔ | **No.** Run only |

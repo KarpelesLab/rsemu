@@ -58,6 +58,58 @@ $ RSEMU_RISCV_FIRMWARE=$TD/fw_jump.bin \
 OpenSBI's `fw_jump` runs at `0x80000000` and hands control to `0x80200000` in
 S-mode, which is where a RISC-V `Image` expects to be.
 
+## Booting to a shell
+
+A kernel with no root filesystem panics in `prepare_namespace`, correctly. Give
+it a ramdisk and it does not:
+
+```console
+$ scripts/fetch-testdata.sh linux initramfs
+$ RSEMU_RISCV_FIRMWARE=$TD/fw_jump.bin \
+  RSEMU_RISCV_PAYLOAD=0x80200000:$TD/linux \
+  RSEMU_RISCV_INITRD=$TD/initramfs.cpio \
+  RSEMU_RISCV_BOOTARGS='console=ttyS0 earlycon=sbi' \
+  RSEMU_RISCV_RAM=512M RSEMU_RISCV_QUANTA=2000000 \
+  RSEMU_RISCV_INPUT='rsemu# =>uname -a\n' \
+  RSEMU_RISCV_STOP_AT='GNU/Linux' \
+  cargo test --release --all-features firmware_from_the --lib -- --nocapture
+```
+
+`initramfs.cpio` is **built** by the fetch script, not downloaded: one
+statically linked riscv64 busybox out of Debian's own package, a `/dev/console`
+node, and a ten-line `/init`. The `newc` cpio writer is forty lines of shell in
+`scripts/fetch-testdata.sh`, so the fixture needs no cross toolchain and no
+`cpio(1)`, and every entry is written with mtime 0 so the archive is
+reproducible.
+
+The board carries the ramdisk the way a real one does. A `riscv.loader` writes
+it into DRAM at `initrd_addr`, and the boot ROM puts
+`/chosen/linux,initrd-start` and `linux,initrd-end` in the generated tree — the
+same media slot named twice, so the length is read from the bytes in both
+places and only the address is written down more than once.
+
+`RSEMU_RISCV_INPUT` types at the guest: one `marker=>text` step per line, fed
+when the guest has printed `marker`. That is what makes the console
+*bidirectional* rather than write-only, and matching on output rather than on
+elapsed time keeps the run deterministic.
+
+## Booting with the virtio disk
+
+The Debian kernel builds `virtio_mmio` and `virtio_blk` as modules, so an
+unadorned initramfs never claims the `virtio.blk` this board provides.
+`initramfs-virtio` is the same archive with those two modules in `/lib/modules`
+and an `insmod` loop at the top of `/init`; it resolves the kernel package from
+the fetched image's own version banner, because a module whose vermagic
+disagrees is refused at load time.
+
+```console
+$ scripts/fetch-testdata.sh linux initramfs-virtio
+$ RSEMU_RISCV_INITRD=$TD/initramfs-virtio.cpio RSEMU_RISCV_DISK=$TD/disk.img …
+```
+
+`--disk` / `RSEMU_RISCV_DISK` binds the `disk` media slot, which is the front of
+the disk; the `storage` parameter pads it out with zeroes.
+
 ## Booting UEFI
 
 `edk2-riscv-code.fd` from EDK2's `OvmfPkg/RiscVVirt` (BSD-2-Clause-Patent) is
@@ -106,19 +158,61 @@ this board's own 16550A —
 [  110.975106] printk: legacy bootconsole [sbi0] disabled
 ```
 
-— and then panics in `prepare_namespace` because nothing supplied a root
-filesystem. That is the correct end of a kernel booted with neither an initrd
-nor a disk driver: the Debian installer kernel builds `virtio_mmio` as a
-module, so the `virtio.blk` in this machine file is never claimed. Staging a
-rootfs is the next step, and it is a fixture problem rather than a machine one.
+— and, given a ramdisk, **reaches a shell prompt that echoes what is typed at
+it**:
 
-Two observations from that run that are ours, not the kernel's:
+```text
+[  222.376146] Run /init as init process
+
+rsemu initramfs on Linux 6.12.94+deb13-riscv64 riscv64
+
+BusyBox v1.37.0 (Debian 1:1.37.0-6+b8) built-in shell (ash)
+Enter 'help' for a list of built-in commands.
+
+/bin/sh: can't access tty; job control turned off
+rsemu# uname -a
+Linux (none) 6.12.94+deb13-riscv64 #1 SMP Debian 6.12.94-1 (2026-06-20) riscv64 GNU/Linux
+```
+
+`uname -a` on the second-to-last line is the *echo* of the nine bytes the
+harness fed to the port; the line under it is the reply. Nothing echoes it but
+the guest's own terminal line discipline, so that pair is the console proving
+it carries bytes in both directions. **143 seconds of host time** from reset to
+that prompt, under the interpreter, on one core.
+
+With `initramfs-virtio` — the same archive plus the kernel's own
+`virtio_mmio.ko` and `virtio_blk.ko` — Linux claims the board's virtio disk and
+reads and writes it:
+
+```text
+[  284.552146] virtio_blk virtio0: 1/0/0 default/read/poll queues
+[  284.876146] virtio_blk virtio0: [vda] 32768 512-byte logical blocks (16.8 MB/16.0 MiB)
+rsemu# head -c 34 /dev/vda
+rsemu virtio-blk fixture, sector 0
+rsemu# printf "vda-%s" roundtrip-ok > /w && dd if=/w of=/dev/vda bs=512 seek=1 && sync && dd if=/dev/vda bs=512 skip=1 count=1 | head -c 16
+vda-roundtrip-ok
+```
+
+The first read is the host's `disk.img` arriving through the virtqueue; the
+second command writes a sector and reads it back, so the descriptor ring is
+exercised in both directions by Linux's own driver rather than by ours. 205
+seconds of host time, the extra minute being module relocation and probe.
+
+Without a ramdisk the kernel still panics in `prepare_namespace`, and that
+remains the correct end of a boot nobody gave a root filesystem to.
+
+Two observations from these runs that are ours, not the kernel's:
 
 - `jitterentropy` trips the soft-lockup watchdog during `jent_entropy_init`
   (`BUG: soft lockup - CPU#0 stuck for 22s!`, and again at 44s). Virtual time
   here is derived from bus accesses, and jitterentropy's calibration loop makes
   a great many of them; the kernel warns, taints itself `[L]=SOFTLOCKUP`, and
-  carries on.
+  carries on. It costs real time as well as virtual: the initcall spans t=59s
+  to t=105s of the 212 virtual seconds before `/init`, a little over a fifth of
+  the boot — call it **half a minute of the two and a half wall-clock
+  minutes**. Worth knowing before this becomes a CI fixture, and worth
+  measuring against a kernel built without the module before assuming a
+  command-line switch would skip it.
 - Time is virtual throughout, so the timestamps above measure emulated seconds,
   not patience.
 
