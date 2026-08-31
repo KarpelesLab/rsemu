@@ -5,7 +5,7 @@
 use crate::core::error::Result;
 use crate::core::state::{Sink, Source};
 
-use super::frame::Timing;
+use super::frame::Region;
 use super::units::{Envelope, LengthCounter};
 
 /// Noise timer periods in **CPU cycles**, indexed by `$400E` bits 3-0.
@@ -20,15 +20,24 @@ const NTSC_PERIODS: [u16; 16] = [
 ];
 
 /// Noise timer periods in CPU cycles for the RP2A07.
+///
+/// A genuinely different table, not the NTSC one rescaled: the wiki lists both
+/// ([NESdev APU Noise](https://www.nesdev.org/wiki/APU_Noise)), and the ratios
+/// between corresponding entries are not constant.
 const PAL_PERIODS: [u16; 16] = [
     4, 8, 14, 30, 60, 88, 118, 148, 188, 236, 354, 472, 708, 944, 1890, 3778,
 ];
 
 /// The period table for a console variant, in CPU cycles.
-pub const fn periods(timing: Timing) -> [u16; 16] {
-    match timing {
-        Timing::Ntsc => NTSC_PERIODS,
-        Timing::Pal => PAL_PERIODS,
+///
+/// The wiki has no Dendy table, and does not need one: the UA6527P is a 2A03
+/// clone, so its dividers are the NTSC ones and only the rate they are clocked
+/// at differs — the same reading the 59 Hz frame-counter rate forces in
+/// [`Region::four_step`](super::frame::Region::four_step).
+pub const fn periods(region: Region) -> [u16; 16] {
+    match region {
+        Region::Ntsc | Region::Dendy => NTSC_PERIODS,
+        Region::Pal => PAL_PERIODS,
     }
 }
 
@@ -39,7 +48,7 @@ pub struct Noise {
     pub envelope: Envelope,
     /// The length counter.
     pub length: LengthCounter,
-    timing: Timing,
+    region: Region,
     /// `$400E` bit 7: short mode, which taps bit 6 instead of bit 1.
     mode: bool,
     /// `$400E` bits 3-0.
@@ -59,11 +68,11 @@ impl Noise {
     /// measured `$0000` with a first clock shifting in a 1; the two agree on
     /// the sequence from the second clock onward, and 1 is the value the
     /// channel documentation specifies, so that is what is used.)
-    pub const fn new(timing: Timing) -> Noise {
+    pub const fn new(region: Region) -> Noise {
         Noise {
             envelope: Envelope::new(),
             length: LengthCounter::new(),
-            timing,
+            region,
             mode: false,
             period_index: 0,
             timer: 0,
@@ -80,7 +89,7 @@ impl Noise {
     /// The timer period in CPU cycles, as the wiki's table gives it.
     #[inline]
     pub fn period_cycles(&self) -> u16 {
-        periods(self.timing)[usize::from(self.period_index)]
+        periods(self.region)[usize::from(self.period_index)]
     }
 
     /// The divider's reload value, in APU cycles.
@@ -155,8 +164,8 @@ impl Noise {
 
     /// Restore what [`Noise::save`] wrote.
     ///
-    /// The timing variant is machine configuration, not state, so it is not
-    /// stored: a snapshot never changes which console it is being restored on.
+    /// The region is machine configuration, not state, so it is not stored: a
+    /// snapshot never changes which console it is being restored on.
     pub fn load<'a>(&mut self, r: &mut dyn Source<'a>) -> Result<()> {
         self.envelope.load(r)?;
         self.length.load_state(r)?;

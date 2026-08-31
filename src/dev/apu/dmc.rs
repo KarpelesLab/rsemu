@@ -7,7 +7,7 @@
 use crate::core::error::Result;
 use crate::core::state::{Sink, Source};
 
-use super::frame::Timing;
+use super::frame::Region;
 
 /// DMC timer periods in **CPU cycles**, indexed by `$4010` bits 3-0.
 const NTSC_RATES: [u16; 16] = [
@@ -15,15 +15,23 @@ const NTSC_RATES: [u16; 16] = [
 ];
 
 /// DMC timer periods in CPU cycles for the RP2A07.
+///
+/// A genuinely different table, listed separately by the wiki
+/// ([NESdev APU DMC](https://www.nesdev.org/wiki/APU_DMC)) rather than derived
+/// from the NTSC one.
 const PAL_RATES: [u16; 16] = [
     398, 354, 316, 298, 276, 236, 210, 198, 176, 148, 132, 118, 98, 78, 66, 50,
 ];
 
 /// The rate table for a console variant, in CPU cycles.
-pub const fn rates(timing: Timing) -> [u16; 16] {
-    match timing {
-        Timing::Ntsc => NTSC_RATES,
-        Timing::Pal => PAL_RATES,
+///
+/// Dendy shares NTSC's, for the reason
+/// [`Region::four_step`](super::frame::Region::four_step) sets out: the UA6527P
+/// is a 2A03 clone on a slower clock, not a chip with its own dividers.
+pub const fn rates(region: Region) -> [u16; 16] {
+    match region {
+        Region::Ntsc | Region::Dendy => NTSC_RATES,
+        Region::Pal => PAL_RATES,
     }
 }
 
@@ -73,7 +81,7 @@ struct Pending {
 /// unit, and the DMC interrupt flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dmc {
-    timing: Timing,
+    region: Region,
     /// `$4010` bit 7.
     irq_enabled: bool,
     /// `$4010` bit 6.
@@ -110,9 +118,9 @@ pub struct Dmc {
 
 impl Dmc {
     /// A powered-on DMC: everything zero, output unit silent.
-    pub const fn new(timing: Timing) -> Dmc {
+    pub const fn new(region: Region) -> Dmc {
         Dmc {
-            timing,
+            region,
             irq_enabled: false,
             loop_flag: false,
             rate_index: 0,
@@ -167,7 +175,7 @@ impl Dmc {
     /// The timer period in CPU cycles, as the wiki's rate table gives it.
     #[inline]
     pub fn rate_cycles(&self) -> u16 {
-        rates(self.timing)[usize::from(self.rate_index)]
+        rates(self.region)[usize::from(self.rate_index)]
     }
 
     /// The divider's reload value, in APU cycles.

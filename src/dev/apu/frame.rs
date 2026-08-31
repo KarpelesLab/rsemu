@@ -25,25 +25,46 @@ use crate::core::state::{Sink, Source};
 
 /// Which console the APU is modelling.
 ///
+/// A **construction property**, never a `#[cfg]` (`region = "pal"`): one build
+/// runs all three, and only the tables below and the CPU divider change.
+///
 /// A real enum rather than the `#[repr(transparent)]` newtype `CLAUDE.md`
 /// prescribes for extensible enumerations, because exhaustiveness genuinely is
 /// wanted: every table in this module has one entry per variant, and a new
 /// variant must not silently fall through to NTSC.
+///
+/// This is deliberately *not* the same type as
+/// [`ppu::Region`](crate::dev::ppu): `dev-nes-apu` and `dev-nes-ppu` are
+/// independent features and neither may require the other (`CLAUDE.md`, "crate
+/// shape"). The two agree on the names a machine file writes, which is the only
+/// place they meet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum Timing {
-    /// RP2A03, 1.789773 MHz CPU.
+pub enum Region {
+    /// RP2A03, 1.789773 MHz CPU, frame counter at 60 Hz.
     #[default]
     Ntsc,
-    /// RP2A07, 1.662607 MHz CPU.
+    /// RP2A07, 1.662607 MHz CPU, frame counter at 50 Hz.
     Pal,
+    /// UMC UA6527P, the "Dendy" famiclone: 1.773448 MHz CPU, 59 Hz.
+    ///
+    /// The chip is a 2A03 clone hung off a PAL crystal divided by 15 rather
+    /// than 16, so its *sequence* is NTSC's and only the rate it is clocked at
+    /// differs. See [`Region::four_step`] for why that is the reading of the
+    /// wiki's 59 Hz.
+    Dendy,
 }
 
-impl Timing {
-    /// Parse the `timing` property.
-    pub fn from_name(name: &str) -> Option<Timing> {
+impl Region {
+    /// Every name [`Region::from_name`] accepts, for `or_enum` and
+    /// `rsemu describe`.
+    pub const NAMES: &'static [&'static str] = &["ntsc", "pal", "dendy"];
+
+    /// Parse the `region` property.
+    pub fn from_name(name: &str) -> Option<Region> {
         match name {
-            "ntsc" => Some(Timing::Ntsc),
-            "pal" => Some(Timing::Pal),
+            "ntsc" => Some(Region::Ntsc),
+            "pal" => Some(Region::Pal),
+            "dendy" => Some(Region::Dendy),
             _ => None,
         }
     }
@@ -51,18 +72,70 @@ impl Timing {
     /// The name this variant is written with in a `.machine` file.
     pub const fn name(self) -> &'static str {
         match self {
-            Timing::Ntsc => "ntsc",
-            Timing::Pal => "pal",
+            Region::Ntsc => "ntsc",
+            Region::Pal => "pal",
+            Region::Dendy => "dendy",
+        }
+    }
+
+    /// The part number of the CPU whose audio half this is.
+    pub const fn part_number(self) -> &'static str {
+        match self {
+            Region::Ntsc => "RP2A03",
+            Region::Pal => "RP2A07",
+            Region::Dendy => "UA6527P",
+        }
+    }
+
+    /// The board's master crystal, as an exact `(numerator, denominator)` in
+    /// hertz.
+    ///
+    /// Neither is an integer number of hertz — NTSC is 236.25 MHz ÷ 11 and PAL
+    /// is 26.6017125 MHz, both *by definition*
+    /// ([NESdev cycle reference chart](https://www.nesdev.org/wiki/Cycle_reference_chart))
+    /// — which is exactly the case `ROADMAP.md` §4.2's rational oscillator
+    /// literals exist for.
+    pub const fn master_clock(self) -> (u64, u64) {
+        match self {
+            Region::Ntsc => (236_250_000, 11),
+            // Dendy is a PAL board: same crystal, a different divider.
+            Region::Pal | Region::Dendy => (53_203_425, 2),
+        }
+    }
+
+    /// Master clocks per CPU cycle, which is also per APU tick.
+    ///
+    /// 12, 16 and 15 respectively. The APU counts CPU cycles, so this is the
+    /// only rate figure it needs; it is here rather than in the CPU core
+    /// because a board building the clock forest wants it from whichever NES
+    /// device it has.
+    pub const fn cpu_divider(self) -> u64 {
+        match self {
+            Region::Ntsc => 12,
+            Region::Pal => 16,
+            Region::Dendy => 15,
         }
     }
 
     /// The six mode-0 landmarks, in CPU cycles since the sequence restarted.
     ///
     /// `[quarter, quarter+half, quarter, irq, quarter+half+irq, irq+wrap]`.
+    ///
+    /// The PAL row is the wiki's PAL table — APU cycles 4156.5, 8313.5,
+    /// 12469.5, 16626, 16626.5, 16627 — doubled, exactly as the NTSC row is
+    /// derived in this module's header.
+    ///
+    /// **Dendy uses the NTSC sequence.** The wiki has no Dendy frame-counter
+    /// table; what it has is a measured rate of 59 Hz (cycle reference chart,
+    /// citing a nesdev forum post by Eugene.S). The NTSC sequence at Dendy's
+    /// 1773448 Hz CPU is 1773448 / 29830 = 59.45 Hz, which rounds to 59; the
+    /// PAL sequence would give 53.3 Hz, which does not. The rate is therefore
+    /// the *consequence* of a Famicom-compatible chip on a slower clock, not a
+    /// third table.
     pub const fn four_step(self) -> [u32; 6] {
         match self {
-            Timing::Ntsc => [7457, 14913, 22371, 29828, 29829, 29830],
-            Timing::Pal => [8313, 16627, 24939, 33252, 33253, 33254],
+            Region::Ntsc | Region::Dendy => [7457, 14913, 22371, 29828, 29829, 29830],
+            Region::Pal => [8313, 16627, 24939, 33252, 33253, 33254],
         }
     }
 
@@ -71,11 +144,23 @@ impl Timing {
     /// `[quarter, quarter+half, quarter, nothing, quarter+half, wrap]`. Index 3
     /// is the wiki's step 4, which clocks nothing at all; it is kept so the
     /// table lines up with the documented sequence rather than hiding a step.
+    ///
+    /// Dendy is NTSC here for the reason [`Region::four_step`] gives.
     pub const fn five_step(self) -> [u32; 6] {
         match self {
-            Timing::Ntsc => [7457, 14913, 22371, 29829, 37281, 37282],
-            Timing::Pal => [8313, 16627, 24939, 33253, 41565, 41566],
+            Region::Ntsc | Region::Dendy => [7457, 14913, 22371, 29829, 37281, 37282],
+            Region::Pal => [8313, 16627, 24939, 33253, 41565, 41566],
         }
+    }
+}
+
+impl core::fmt::Display for Region {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Region::Ntsc => "NTSC",
+            Region::Pal => "PAL",
+            Region::Dendy => "Dendy",
+        })
     }
 }
 
@@ -123,7 +208,7 @@ impl FrameEvent {
 /// The frame counter: a divider, a looping sequencer, and the frame IRQ flag.
 #[derive(Debug, Clone)]
 pub struct FrameCounter {
-    timing: Timing,
+    region: Region,
     mode: Mode,
     /// `$4017` bit 6. While set, the frame interrupt flag cannot be set.
     inhibit: bool,
@@ -145,9 +230,9 @@ impl FrameCounter {
     /// [NESdev CPU power up
     /// state](https://www.nesdev.org/wiki/CPU_power_up_state) records `$4017`
     /// as 0 at power-up, which is to say the frame IRQ is enabled.
-    pub const fn new(timing: Timing) -> FrameCounter {
+    pub const fn new(region: Region) -> FrameCounter {
         FrameCounter {
-            timing,
+            region,
             mode: Mode::FourStep,
             inhibit: false,
             irq: false,
@@ -159,8 +244,8 @@ impl FrameCounter {
 
     /// Which console this counter is timed for.
     #[inline]
-    pub const fn timing(&self) -> Timing {
-        self.timing
+    pub const fn tv_region(&self) -> Region {
+        self.region
     }
 
     /// The sequence currently selected.
@@ -256,7 +341,7 @@ impl FrameCounter {
         self.cycle += 1;
         match self.mode {
             Mode::FourStep => {
-                let t = self.timing.four_step();
+                let t = self.region.four_step();
                 if self.cycle == t[0] {
                     FrameEvent::QUARTER
                 } else if self.cycle == t[1] {
@@ -278,7 +363,7 @@ impl FrameCounter {
                 }
             }
             Mode::FiveStep => {
-                let t = self.timing.five_step();
+                let t = self.region.five_step();
                 if self.cycle == t[0] {
                     FrameEvent::QUARTER
                 } else if self.cycle == t[1] {
@@ -308,7 +393,7 @@ impl FrameCounter {
 
     /// Return to the power-on state, keeping the timing variant.
     pub fn reset_cold(&mut self) {
-        *self = FrameCounter::new(self.timing);
+        *self = FrameCounter::new(self.region);
     }
 
     /// A `$4017`-preserving reset.

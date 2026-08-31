@@ -7,10 +7,12 @@
 //! table and memory reader, and a save/load round trip. A test that only
 //! asserted "something happened" would pass against a wrong table.
 
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use super::*;
-use crate::core::state::{ChunkReader, MachineShape, StateReader, StateWriter};
+use crate::core::space::AddressSpace;
+use crate::core::state::{ChunkReader, MachineShape, Migrations, StateReader, StateWriter};
 use crate::core::sync::{AtomicU32, Ordering as AtomicOrdering};
 use crate::core::wire::{Wire, WireId, WireIdAllocator, WireSink};
 use frame::{FrameCounter, FrameEvent};
@@ -63,7 +65,7 @@ fn record(fc: &mut FrameCounter, from: u64, cycles: u64) -> Schedule {
 fn the_four_step_sequence_clocks_on_the_documented_cpu_cycles() {
     // NESdev APU Frame Counter, mode 0, converted from APU cycles: 3728 PUT is
     // CPU 7457, 14914 GET is CPU 29828, and the wrap is CPU 29830.
-    let mut fc = FrameCounter::new(Timing::Ntsc);
+    let mut fc = FrameCounter::new(Region::Ntsc);
     let s = record(&mut fc, 1, 29830);
     assert_eq!(s.quarters, [7457, 14913, 22371, 29829]);
     assert_eq!(s.halves, [14913, 29829]);
@@ -73,7 +75,7 @@ fn the_four_step_sequence_clocks_on_the_documented_cpu_cycles() {
 
 #[test]
 fn the_four_step_sequence_repeats_every_29830_cycles() {
-    let mut fc = FrameCounter::new(Timing::Ntsc);
+    let mut fc = FrameCounter::new(Region::Ntsc);
     let first = record(&mut fc, 1, 29830);
     let second = record(&mut fc, 29831, 29830);
     assert_eq!(first.quarters, second.quarters);
@@ -85,7 +87,7 @@ fn the_four_step_sequence_repeats_every_29830_cycles() {
 
 #[test]
 fn the_pal_four_step_sequence_uses_its_own_table() {
-    let mut fc = FrameCounter::new(Timing::Pal);
+    let mut fc = FrameCounter::new(Region::Pal);
     let s = record(&mut fc, 1, 33254);
     assert_eq!(s.quarters, [8313, 16627, 24939, 33253]);
     assert_eq!(s.halves, [16627, 33253]);
@@ -94,7 +96,7 @@ fn the_pal_four_step_sequence_uses_its_own_table() {
 
 #[test]
 fn the_five_step_sequence_clocks_immediately_and_never_raises_an_irq() {
-    let mut fc = FrameCounter::new(Timing::Ntsc);
+    let mut fc = FrameCounter::new(Region::Ntsc);
     // Written on a get cycle, so the reset lands 4 CPU cycles later.
     fc.write(0x80, false);
     assert_eq!(fc.mode(), Mode::FiveStep);
@@ -117,7 +119,7 @@ fn the_five_step_sequence_clocks_immediately_and_never_raises_an_irq() {
 
 #[test]
 fn a_four_step_write_resets_without_clocking_anything() {
-    let mut fc = FrameCounter::new(Timing::Ntsc);
+    let mut fc = FrameCounter::new(Region::Ntsc);
     // Get some distance into the sequence first.
     record(&mut fc, 1, 10_000);
     assert_ne!(fc.cycle(), 0);
@@ -135,7 +137,7 @@ fn a_four_step_write_resets_without_clocking_anything() {
 #[test]
 fn the_4017_reset_delay_is_three_or_four_cycles_by_alignment() {
     for (on_put, delay) in [(true, 3u64), (false, 4u64)] {
-        let mut fc = FrameCounter::new(Timing::Ntsc);
+        let mut fc = FrameCounter::new(Region::Ntsc);
         record(&mut fc, 1, 1000);
         fc.write(0x00, on_put);
         for i in 1..delay {
@@ -150,7 +152,7 @@ fn the_4017_reset_delay_is_three_or_four_cycles_by_alignment() {
 
 #[test]
 fn the_frame_irq_is_cleared_by_a_status_read_but_not_on_the_setting_cycle() {
-    let mut fc = FrameCounter::new(Timing::Ntsc);
+    let mut fc = FrameCounter::new(Region::Ntsc);
     // Cycle 29828 is where the flag is first set.
     record(&mut fc, 1, 29828);
     assert!(fc.irq());
@@ -164,7 +166,7 @@ fn the_frame_irq_is_cleared_by_a_status_read_but_not_on_the_setting_cycle() {
 
 #[test]
 fn a_debug_read_never_clears_the_frame_irq() {
-    let mut fc = FrameCounter::new(Timing::Ntsc);
+    let mut fc = FrameCounter::new(Region::Ntsc);
     record(&mut fc, 1, 29830);
     assert!(fc.irq());
     assert!(fc.read_irq(99_999, true));
@@ -173,7 +175,7 @@ fn a_debug_read_never_clears_the_frame_irq() {
 
 #[test]
 fn setting_the_inhibit_bit_clears_and_suppresses_the_frame_irq() {
-    let mut fc = FrameCounter::new(Timing::Ntsc);
+    let mut fc = FrameCounter::new(Region::Ntsc);
     record(&mut fc, 1, 29830);
     assert!(fc.irq());
     fc.write(0x40, false);
@@ -374,26 +376,26 @@ fn the_triangle_holds_its_output_when_ultrasonic_halt_is_enabled() {
 #[test]
 fn the_noise_period_table_matches_the_documented_values() {
     assert_eq!(
-        noise::periods(Timing::Ntsc),
+        noise::periods(Region::Ntsc),
         [
             4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068
         ]
     );
     assert_eq!(
-        noise::periods(Timing::Pal),
+        noise::periods(Region::Pal),
         [
             4, 8, 14, 30, 60, 88, 118, 148, 188, 236, 354, 472, 708, 944, 1890, 3778
         ]
     );
     // Every entry is even, because the timer is clocked once per APU cycle.
-    for period in noise::periods(Timing::Ntsc) {
+    for period in noise::periods(Region::Ntsc) {
         assert_eq!(period % 2, 0);
     }
 }
 
 /// Shift the LFSR until it returns to its starting value, up to `limit` steps.
 fn lfsr_period(mode: u8, limit: u32) -> u32 {
-    let mut n = noise::Noise::new(Timing::Ntsc);
+    let mut n = noise::Noise::new(Region::Ntsc);
     n.write_period(mode); // period index 0: one shift every two APU cycles
     let start = n.shift();
     for step in 1..=limit {
@@ -416,7 +418,7 @@ fn the_noise_lfsr_has_the_documented_periods_in_both_modes() {
 
 #[test]
 fn the_noise_lfsr_shifts_right_with_feedback_into_bit_14() {
-    let mut n = noise::Noise::new(Timing::Ntsc);
+    let mut n = noise::Noise::new(Region::Ntsc);
     assert_eq!(n.shift(), 1, "power-on value");
     n.write_period(0x00);
     n.tick_timer();
@@ -434,18 +436,18 @@ fn the_noise_lfsr_shifts_right_with_feedback_into_bit_14() {
 #[test]
 fn the_dmc_rate_table_matches_the_documented_values() {
     assert_eq!(
-        dmc::rates(Timing::Ntsc),
+        dmc::rates(Region::Ntsc),
         [
             428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54
         ]
     );
     assert_eq!(
-        dmc::rates(Timing::Pal),
+        dmc::rates(Region::Pal),
         [
             398, 354, 316, 298, 276, 236, 210, 198, 176, 148, 132, 118, 98, 78, 66, 50
         ]
     );
-    for rate in dmc::rates(Timing::Ntsc) {
+    for rate in dmc::rates(Region::Ntsc) {
         assert_eq!(rate % 2, 0, "rates are even: the timer runs at APU rate");
     }
 }
@@ -804,17 +806,18 @@ fn an_undrained_ring_drops_the_oldest_samples_and_says_so() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn an_unknown_property_is_rejected_and_a_bad_timing_names_the_options() {
-    let bad = Apu::new(&Props::new().with("timeing", "ntsc"));
+fn an_unknown_property_is_rejected_and_a_bad_region_names_the_options() {
+    let bad = Apu::new(&Props::new().with("reigon", "ntsc"));
     assert!(
         bad.is_err(),
         "a typo'd property must not be silently ignored"
     );
 
-    let err = Apu::new(&Props::new().with("timing", "secam")).unwrap_err();
+    let err = Apu::new(&Props::new().with("region", "secam")).unwrap_err();
     let text = alloc::format!("{err}");
     assert!(text.contains("ntsc"), "{text}");
     assert!(text.contains("pal"), "{text}");
+    assert!(text.contains("dendy"), "{text}");
 }
 
 #[test]
@@ -968,4 +971,294 @@ fn a_pending_dmc_fetch_survives_a_round_trip() {
 
     assert_eq!(restored.dma_request(), Some(request));
     assert!(restored.dma_complete(request.serial, 0x11));
+}
+
+// ---------------------------------------------------------------------------
+// Regions
+//
+// Sources: NESdev APU Frame Counter (the NTSC and PAL step tables), APU Noise
+// and APU DMC (the two period tables each lists), and the cycle reference
+// chart (https://www.nesdev.org/wiki/Cycle_reference_chart) for the CPU
+// dividers and the three frame-counter rates.
+// ---------------------------------------------------------------------------
+
+/// The three regions, for tests that must cover all of them.
+const REGIONS: [Region; 3] = [Region::Ntsc, Region::Pal, Region::Dendy];
+
+#[test]
+fn each_region_runs_its_own_four_step_schedule() {
+    let expected = [
+        (
+            Region::Ntsc,
+            29830u64,
+            [7457u32, 14913, 22371, 29829],
+            [14913u32, 29829],
+            29828u32,
+        ),
+        (
+            Region::Pal,
+            33254,
+            [8313, 16627, 24939, 33253],
+            [16627, 33253],
+            33252,
+        ),
+        // Dendy runs the NTSC sequence; only the rate it is clocked at differs.
+        (
+            Region::Dendy,
+            29830,
+            [7457, 14913, 22371, 29829],
+            [14913, 29829],
+            29828,
+        ),
+    ];
+    for (region, wrap, quarters, halves, irq) in expected {
+        let mut fc = FrameCounter::new(region);
+        assert_eq!(fc.tv_region(), region);
+        let s = record(&mut fc, 1, wrap);
+        assert_eq!(s.quarters, quarters.map(u64::from), "{region}");
+        assert_eq!(s.halves, halves.map(u64::from), "{region}");
+        assert_eq!(s.irq_rises, [u64::from(irq)], "{region}");
+        assert_eq!(fc.cycle(), 0, "{region} wraps at {wrap}");
+    }
+}
+
+#[test]
+fn each_region_runs_its_own_five_step_schedule() {
+    for region in REGIONS {
+        let t = region.five_step();
+        let mut fc = FrameCounter::new(region);
+        fc.write(0x80, true);
+        // The write's 3-cycle delay, whose last cycle clocks both units.
+        record(&mut fc, 1, 3);
+        let s = record(&mut fc, 4, u64::from(t[5]));
+        assert_eq!(
+            s.quarters,
+            [
+                u64::from(t[0]),
+                u64::from(t[1]),
+                u64::from(t[2]),
+                u64::from(t[4])
+            ],
+            "{region}"
+        );
+        assert_eq!(s.halves, [u64::from(t[1]), u64::from(t[4])], "{region}");
+        assert!(s.irq_rises.is_empty(), "{region}: mode 1 never raises IRQ");
+    }
+    assert_eq!(
+        Region::Pal.five_step(),
+        [8313, 16627, 24939, 33253, 41565, 41566]
+    );
+    assert_eq!(Region::Dendy.five_step(), Region::Ntsc.five_step());
+}
+
+#[test]
+fn dendy_uses_the_ntsc_sequence_because_that_is_what_59_hz_means() {
+    // The cycle reference chart gives the frame counter rate as 60 Hz (NTSC),
+    // 50 Hz (PAL) and 59 Hz (Dendy), and gives no Dendy step table. Only one
+    // of the two existing tables produces 59 Hz at Dendy's CPU rate, and the
+    // check below is that arithmetic, in integers.
+    //
+    // rate = cpu_hz / wrap, with cpu_hz = master_num / (master_den * divider).
+    for (region, hz) in [
+        (Region::Ntsc, 60u64),
+        (Region::Pal, 50),
+        (Region::Dendy, 59),
+    ] {
+        let (num, den) = region.master_clock();
+        let wrap = u64::from(region.four_step()[5]);
+        // Round-to-nearest, done as integers: 2*num / (2*den*divider*wrap).
+        let denom = den * region.cpu_divider() * wrap;
+        let rounded = (2 * num + denom) / (2 * denom);
+        assert_eq!(rounded, hz, "{region}");
+    }
+    // And the alternative really is wrong for Dendy: the PAL sequence at a
+    // Dendy CPU rate would be 53 Hz, not 59.
+    let (num, den) = Region::Dendy.master_clock();
+    let denom = den * Region::Dendy.cpu_divider() * u64::from(Region::Pal.four_step()[5]);
+    assert_eq!((2 * num + denom) / (2 * denom), 53);
+}
+
+#[test]
+fn the_noise_and_dmc_tables_are_pal_only_where_the_wiki_says_so() {
+    // Both tables are genuinely different on the RP2A07 — they are listed
+    // separately by NESdev APU Noise and APU DMC, not derived — while the
+    // UA6527P is a 2A03 clone and keeps NTSC's.
+    assert_eq!(
+        noise::periods(Region::Pal),
+        [
+            4, 8, 14, 30, 60, 88, 118, 148, 188, 236, 354, 472, 708, 944, 1890, 3778
+        ]
+    );
+    assert_eq!(
+        dmc::rates(Region::Pal),
+        [
+            398, 354, 316, 298, 276, 236, 210, 198, 176, 148, 132, 118, 98, 78, 66, 50
+        ]
+    );
+    assert_ne!(noise::periods(Region::Pal), noise::periods(Region::Ntsc));
+    assert_ne!(dmc::rates(Region::Pal), dmc::rates(Region::Ntsc));
+    assert_eq!(noise::periods(Region::Dendy), noise::periods(Region::Ntsc));
+    assert_eq!(dmc::rates(Region::Dendy), dmc::rates(Region::Ntsc));
+
+    // Every noise period stays even, because the timer is clocked once per APU
+    // cycle and the table is in CPU cycles.
+    for region in REGIONS {
+        for period in noise::periods(region) {
+            assert_eq!(period % 2, 0, "{region}");
+        }
+    }
+}
+
+#[test]
+fn the_frame_irq_lands_on_each_regions_own_cycle() {
+    // The device-level version of the table test: run the whole APU and watch
+    // $4015 bit 6.
+    for region in REGIONS {
+        let irq_at = u64::from(region.four_step()[3]);
+        let apu = apu_with(Props::new().with("region", region.name()));
+        assert_eq!(apu.tv_region(), region);
+        apu.advance(irq_at - 1);
+        assert_eq!(apu.read(0x15) & 0x40, 0, "{region}: one cycle too early");
+        apu.advance(1);
+        assert_ne!(apu.read(0x15) & 0x40, 0, "{region}: the frame IRQ fires");
+    }
+}
+
+#[test]
+fn the_dividers_are_12_16_and_15() {
+    // The chart, with the reason for PAL's 16: Nintendo kept the Johnson
+    // counter, which always has an even period.
+    assert_eq!(Region::Ntsc.cpu_divider(), 12);
+    assert_eq!(Region::Pal.cpu_divider(), 16);
+    assert_eq!(Region::Dendy.cpu_divider(), 15);
+    assert_eq!(Region::Ntsc.master_clock(), (236_250_000, 11));
+    assert_eq!(Region::Pal.master_clock(), (53_203_425, 2));
+    assert_eq!(Region::Dendy.master_clock(), Region::Pal.master_clock());
+    for region in REGIONS {
+        let (num, den) = region.master_clock();
+        assert_ne!(num % den, 0, "{region} is not a whole number of hertz");
+        assert!(!region.part_number().is_empty());
+        assert_eq!(Region::from_name(region.name()), Some(region));
+        assert!(Region::NAMES.contains(&region.name()));
+    }
+    assert_eq!(Region::from_name("secam"), None);
+}
+
+#[test]
+fn the_region_is_configuration_and_a_snapshot_cannot_change_it() {
+    let pal = apu_with(Props::new().with("region", "pal"));
+    pal.advance(5_000);
+    let mut w = StateWriter::new(MachineShape::new());
+    {
+        let mut chunk = w.chunk("/apu", APU_CLASS.name, APU_CLASS.version).unwrap();
+        pal.save(&mut chunk).unwrap();
+    }
+    let bytes = w.to_vec().unwrap();
+
+    let ntsc = apu_with(Props::new().with("region", "ntsc"));
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load(
+            "/apu",
+            APU_CLASS.name,
+            APU_CLASS.version,
+            &Migrations::new(),
+        )
+        .unwrap();
+    ntsc.load(&mut chunk.reader()).unwrap();
+    assert_eq!(
+        ntsc.tv_region(),
+        Region::Ntsc,
+        "the machine decides, not the file"
+    );
+    assert_eq!(ntsc.ticks(), 5_000);
+}
+
+// ---------------------------------------------------------------------------
+// The connection surface (`ROADMAP.md` §4.4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_three_windows_are_the_regions_a_map_statement_names() {
+    let apu = apu();
+    for window in WINDOWS {
+        let region = Device::region(&apu, window.name)
+            .unwrap_or_else(|| panic!("no region `{}`", window.name));
+        assert_eq!(region.len(), window.len, "{}", window.name);
+        // One window, one region: two `map` statements naming it must not get
+        // two identities for one piece of hardware.
+        let again = Device::region(&apu, window.name).unwrap();
+        assert!(Arc::ptr_eq(&region, &again), "{}", window.name);
+    }
+    // $4014 and $4016 are holes, and there is no "whole aperture" to hand out.
+    assert!(Device::region(&apu, "").is_none());
+    assert!(Device::region(&apu, "regs").is_none());
+
+    // `regions` and `Device::region` agree, offsets included.
+    let listed = apu.regions();
+    assert_eq!(listed.len(), WINDOWS.len());
+    for ((offset, region), window) in listed.iter().zip(WINDOWS) {
+        assert_eq!(*offset, window.offset);
+        assert!(Arc::ptr_eq(
+            region,
+            &Device::region(&apu, window.name).unwrap()
+        ));
+    }
+
+    // And the status window really is $4015: read it through an address space.
+    let space = AddressSpace::new("cpu", 16);
+    for (offset, region) in apu.regions() {
+        space.topology().map(region, 0x4000 + offset).unwrap();
+    }
+    apu.advance(29_831);
+    let status = space.read(0x4015, Width::U8, MemAttrs::DEFAULT).unwrap();
+    assert_ne!(status as u8 & 0x40, 0, "the frame IRQ flag");
+}
+
+#[test]
+fn the_irq_pin_connects_announces_and_refuses_anything_else() {
+    let apu = apu();
+    // Raise the frame interrupt before anything is connected, so the net is
+    // undriven and inconsistent — which is what the realize sweep is for.
+    apu.advance(29_831);
+
+    let ids = WireIdAllocator::new();
+    let id = ids.alloc();
+    let sink = Arc::new(Counter::default());
+    let wire = Arc::new(Wire::builder().source(id).sink(sink.clone(), 0).build());
+    apu.connect(IRQ_PIN, WireSource::new(Arc::clone(&wire), id))
+        .unwrap();
+    // `connect_irq` refreshes on connection, so the level is already right;
+    // announcing again is idempotent and is what the sweep calls.
+    apu.announce(IRQ_PIN);
+    assert!(sink.highs.load(AtomicOrdering::SeqCst) >= 1);
+
+    let other = Arc::new(Wire::builder().source(id).build());
+    let err = apu
+        .connect("nmi", WireSource::new(other, id))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("nmi"), "{err}");
+    // An unknown pin announce is silently nothing: the sweep asks everyone.
+    apu.announce("nmi");
+}
+
+#[test]
+fn the_class_constructs_through_the_registry_with_a_region() {
+    let mut registry = Registry::new();
+    register(&mut registry).unwrap();
+    let device = registry
+        .create("nes.apu", &Props::new().with("region", "dendy"))
+        .unwrap();
+    assert_eq!(device.class().name, "nes.apu");
+    assert!(
+        APU_CLASS.properties.iter().any(|p| p.name == "region"),
+        "`rsemu describe nes.apu` must list it"
+    );
+    assert!(Device::region(device.as_ref(), "status").is_some());
+    assert!(
+        registry
+            .create("nes.apu", &Props::new().with("region", "secam"))
+            .is_err()
+    );
 }

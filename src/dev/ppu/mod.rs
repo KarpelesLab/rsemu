@@ -1,4 +1,4 @@
-//! The NES / Famicom picture processing unit, RP2C02 (`dev-nes-ppu`).
+//! The NES / Famicom picture processing unit (`dev-nes-ppu`).
 //!
 //! A cycle-accurate 2C02: 341 dots by 262 scanlines, the pre-render line, the
 //! odd-frame skipped dot, the background fetch pipeline on its exact dots, the
@@ -6,6 +6,28 @@
 //! vblank/NMI race windows. It is written from the
 //! [NESdev wiki](https://www.nesdev.org/wiki/PPU); the table below says which
 //! page settles what.
+//!
+//! # Regions
+//!
+//! [`Region`] picks the chip: NTSC (RP2C02), PAL (RP2C07) or Dendy (UA6538).
+//! It is a construction property — `region = "pal"` — never a `#[cfg]`, so one
+//! build runs all three:
+//!
+//! | | NTSC | PAL | Dendy |
+//! | --- | --- | --- | --- |
+//! | Master ÷ CPU | 12 | 16 | 15 |
+//! | Master ÷ dot | 4 | 5 | 5 |
+//! | Scanlines | 262 | 312 | 312 |
+//! | Post-render lines | 1 | 1 | 51 |
+//! | VBlank at scanline | 241 | 241 | 291 |
+//! | VBlank lines | 20 | 70 | 20 |
+//! | Odd-frame skip | yes | no | no |
+//!
+//! Two things the framework was built for show up here. Neither master clock is
+//! an integer number of hertz, and PAL runs **3.2 dots per CPU cycle** — which
+//! is exact only because the forest counts master ticks rather than CPU cycles
+//! (`ROADMAP.md` §4.2). There is deliberately no dots-per-CPU-cycle constant
+//! anywhere in this module; see [`Region`] and [`add_clock_domain`].
 //!
 //! # Sources
 //!
@@ -45,14 +67,16 @@
 //!
 //! use rsemu::core::clock::{ClockForest, Rational};
 //! use rsemu::core::props::Props;
-//! use rsemu::core::space::{AddressSpace, RamStore, Region, UnassignedPolicy};
-//! use rsemu::dev::ppu::NesPpu;
+//! use rsemu::core::space::{AddressSpace, RamStore, Region as MmioRegion, UnassignedPolicy};
+//! use rsemu::dev::ppu::{NesPpu, Region};
 //!
 //! // The oscillator forest: one crystal, the CPU at ÷12 and the PPU at ÷4.
+//! let region = Region::Ntsc;
+//! let (num, den) = region.master_clock();
 //! let mut forest = ClockForest::new();
-//! let master = forest.add_oscillator("master", Rational::new(236_250_000, 11)?)?;
-//! let cpu = forest.add_domain("cpu", master, 1, 12)?;
-//! let dots = rsemu::dev::ppu::add_clock_domain(&mut forest, master)?;
+//! let master = forest.add_oscillator("master", Rational::new(num, den)?)?;
+//! let cpu = forest.add_domain("cpu", master, 1, region.cpu_divider())?;
+//! let dots = rsemu::dev::ppu::add_clock_domain(&mut forest, master, region)?;
 //! // Exactly three dots per CPU cycle, by construction (ROADMAP.md §4.2).
 //! assert_eq!(forest.convert_ticks(cpu, dots, 1)?, 3);
 //!
@@ -63,11 +87,11 @@
 //! // One topology guard covers the whole batch (`core::space`).
 //! {
 //!     let mut topo = vram.topology();
-//!     topo.map(Arc::new(Region::ram("chr", chr)), 0x0000)?;
-//!     topo.map(Arc::new(Region::ram("nametables", nt)), 0x2000)?;
+//!     topo.map(Arc::new(MmioRegion::ram("chr", chr)), 0x0000)?;
+//!     topo.map(Arc::new(MmioRegion::ram("nametables", nt)), 0x2000)?;
 //! }
 //!
-//! let ppu = NesPpu::new(&Props::new())?;
+//! let ppu = NesPpu::new(&Props::new().with("region", "ntsc"))?;
 //! ppu.attach_bus(Arc::new(vram));
 //! ppu.attach_clock(dots);
 //! # Ok::<(), rsemu::Error>(())
@@ -90,6 +114,7 @@
 //! the engine where the timing that triggers them is.
 
 mod engine;
+mod region;
 mod regs;
 
 #[cfg(test)]
@@ -103,7 +128,9 @@ use crate::core::clock::{ClockForest, ClockResult, DomainId};
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
 use crate::core::error::{BusError, Result};
 use crate::core::props::{Props, ValueKind};
-use crate::core::space::{AccessConstraints, AddressSpace, MemAttrs, MemOps, MemResult};
+use crate::core::space::{
+    AccessConstraints, AddressSpace, MemAttrs, MemOps, MemResult, Region as MmioRegion, RegionRef,
+};
 use crate::core::state::{ChunkReader, ChunkWriter};
 use crate::core::sync::{LockRank, Mutex};
 use crate::core::value::Width;
@@ -114,6 +141,7 @@ pub use engine::{
     NMI_ANNOUNCE_DOTS, PRE_RENDER_SCANLINE, Pixel, SCANLINES_PER_FRAME, SCREEN_HEIGHT,
     SCREEN_WIDTH, VBLANK_SCANLINE, WARMUP_DOTS,
 };
+pub use region::{BORDER_BLACK, Geometry, RESET_LOCKOUT_CPU_CYCLES, Region};
 pub use regs::{
     CTRL_BG_TABLE, CTRL_INCREMENT, CTRL_MASTER, CTRL_NAMETABLE, CTRL_NMI, CTRL_SPRITE_16,
     CTRL_SPRITE_TABLE, IoLatch, MASK_BG, MASK_BG_LEFT, MASK_EMPHASIS_B, MASK_EMPHASIS_G,
@@ -134,22 +162,36 @@ pub const REGISTER_BASE: u64 = 0x2000;
 /// (`ROADMAP.md` §4.1).
 pub const REGISTER_WINDOW_LEN: u64 = 0x2000;
 
-/// The PPU dot domain's rate relative to the NES master crystal: master ÷ 4.
-pub const DOT_DIVIDER: u64 = 4;
-
-/// Add the PPU's clock domain under `master`, rated master ÷ 4.
+/// The name of the region a `map` statement reaches the register block by.
 ///
-/// The CPU is master ÷ 12 and the PPU master ÷ 4, so the PPU advances exactly
-/// three dots per CPU cycle — forever, on every console ever made, because both
-/// counters descend from one crystal. That ratio is what games depend on, not
-/// the absolute frequency (`ROADMAP.md` §4.2).
+/// Also what an empty region name resolves to, so
+/// `map cpubus 0x2000 size 8K = ppu` is enough.
+pub const REGISTER_REGION: &str = "regs";
+
+/// The name of the `/NMI` output pin.
+pub const NMI_PIN: &str = "nmi";
+
+/// Add the PPU's dot domain under `master`, rated master ÷
+/// [`Region::dot_divider`].
+///
+/// On NTSC the CPU is master ÷ 12 and the PPU master ÷ 4, so the PPU advances
+/// exactly three dots per CPU cycle — forever, on every console ever made,
+/// because both counters descend from one crystal. On PAL the dividers are 16
+/// and 5, which is 3.2 dots per CPU cycle: not an integer, and *still exact*,
+/// because the forest counts master ticks rather than CPU cycles
+/// (`ROADMAP.md` §4.2). That is why this function takes the divider and no
+/// dots-per-CPU-cycle figure exists anywhere in this module.
 ///
 /// # Errors
 ///
 /// Whatever [`ClockForest::add_domain`] reports: an unknown parent, or no exact
 /// common unit tick for the tree.
-pub fn add_clock_domain(forest: &mut ClockForest, master: DomainId) -> ClockResult<DomainId> {
-    forest.add_domain("ppu", master, 1, DOT_DIVIDER)
+pub fn add_clock_domain(
+    forest: &mut ClockForest,
+    master: DomainId,
+    region: Region,
+) -> ClockResult<DomainId> {
+    forest.add_domain("ppu", master, 1, region.dot_divider())
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +256,13 @@ impl Shared {
 /// register block to the address space while the machine keeps the device.
 pub struct NesPpu {
     shared: Arc<Shared>,
+    /// The `$2000`-`$3FFF` aperture, built once at construction.
+    ///
+    /// Built here rather than in [`NesPpu::region`] so that every `map`
+    /// statement naming this device gets the *same* region: a fresh `Arc` per
+    /// call would be a second identity for one piece of hardware, and
+    /// `AddressSpace::rebase` identifies a mapping by exactly that.
+    regs: RegionRef,
 }
 
 impl fmt::Debug for NesPpu {
@@ -232,15 +281,41 @@ impl NesPpu {
     /// [`crate::Error::Property`] for an unknown or ill-typed property.
     pub fn new(props: &Props) -> Result<NesPpu> {
         let mut r = props.reader();
+        let name = r.or_enum("region", Region::Ntsc.name(), Region::NAMES)?;
         let warmup = r.or("warmup", true)?;
         let decay = r.or("open-bus-decay-dots", DEFAULT_DECAY_DOTS)?;
         r.finish()?;
-        Ok(NesPpu {
-            shared: Arc::new(Shared {
-                engine: Mutex::with_rank(LockRank::BUS, Engine::new(warmup, decay)),
-                links: Mutex::with_rank(LockRank::WIRE, Links::default()),
-            }),
-        })
+        // `or_enum` has already rejected everything else; this is the one place
+        // the name becomes the variant, so it stays a checked conversion.
+        let region = Region::from_name(name).ok_or_else(|| {
+            crate::core::Error::Property(alloc::format!("unknown `region` `{name}`"))
+        })?;
+        let shared = Arc::new(Shared {
+            engine: Mutex::with_rank(LockRank::BUS, Engine::new(region, warmup, decay)),
+            links: Mutex::with_rank(LockRank::WIRE, Links::default()),
+        });
+        let regs = Arc::new(MmioRegion::io(
+            "nes.ppu.regs",
+            REGISTER_WINDOW_LEN,
+            Arc::new(PpuPort {
+                shared: Arc::clone(&shared),
+            }) as Arc<dyn MemOps>,
+        ));
+        Ok(NesPpu { shared, regs })
+    }
+
+    /// Which console this PPU is.
+    ///
+    /// Named `tv_region` rather than `region` because [`Device::region`] is the
+    /// MMIO aperture lookup and the two would shadow each other on the concrete
+    /// type.
+    pub fn tv_region(&self) -> Region {
+        self.shared.engine.lock().tv_region()
+    }
+
+    /// The frame geometry [`NesPpu::tv_region`] implies.
+    pub fn geometry(&self) -> Geometry {
+        self.shared.engine.lock().geometry()
     }
 
     /// Connect the PPU's own 14-bit address space: pattern tables at
@@ -272,6 +347,9 @@ impl NesPpu {
     /// The CPU-facing register block, ready to be wrapped in a
     /// [`Region::io`](crate::core::space::Region::io) of
     /// [`REGISTER_WINDOW_LEN`] bytes at [`REGISTER_BASE`].
+    ///
+    /// A machine described in the DSL does not need this: [`Device::region`]
+    /// hands out the same window already wrapped.
     pub fn port(&self) -> Arc<PpuPort> {
         Arc::new(PpuPort {
             shared: Arc::clone(&self.shared),
@@ -411,6 +489,12 @@ impl NesPpu {
 /// Properties [`NES_PPU_CLASS`] accepts.
 static PPU_PROPERTIES: &[PropertySpec] = &[
     PropertySpec {
+        name: "region",
+        kind: ValueKind::Str,
+        required: false,
+        summary: "console variant: `ntsc` (RP2C02), `pal` (RP2C07) or `dendy` (UA6538)",
+    },
+    PropertySpec {
         name: "warmup",
         kind: ValueKind::Bool,
         required: false,
@@ -428,7 +512,7 @@ static PPU_PROPERTIES: &[PropertySpec] = &[
 pub static NES_PPU_CLASS: DeviceClass = DeviceClass {
     name: "nes.ppu",
     version: 1,
-    summary: "NES / Famicom picture processing unit (RP2C02)",
+    summary: "NES / Famicom picture processing unit (RP2C02 / RP2C07 / UA6538)",
     properties: PPU_PROPERTIES,
     construct: |props| Ok(Box::new(NesPpu::new(props)?) as Box<dyn Device>),
 };
@@ -488,6 +572,47 @@ impl Device for NesPpu {
         let nmi = self.shared.engine.lock().nmi_active();
         self.shared.drive_nmi(nmi);
         result
+    }
+
+    // -- the connection surface (`ROADMAP.md` §4.4) --------------------------
+
+    /// The register block, for `map cpubus 0x2000 size 8K = ppu`.
+    ///
+    /// One aperture, so the empty name and [`REGISTER_REGION`] both reach it.
+    /// The 1024-fold mirroring inside `$2000`-`$3FFF` is the port's `& 7`, not
+    /// a thousand alias regions (`ROADMAP.md` §4.1).
+    fn region(&self, name: &str) -> Option<RegionRef> {
+        (name.is_empty() || name == REGISTER_REGION).then(|| Arc::clone(&self.regs))
+    }
+
+    /// The `/NMI` output.
+    ///
+    /// Driven **high when the NMI is requested**, which is the logical
+    /// assertion rather than the chip's active-low pin: nets idle low and
+    /// inverting is a `wire.not` device's job (`ROADMAP.md` §4.3).
+    ///
+    /// The PPU has no wire *input* — nothing on a NES drives a pin of it — so
+    /// [`Device::sink`] keeps its default.
+    fn connect(&self, port: &str, source: WireSource) -> Result<()> {
+        if port != NMI_PIN {
+            return Err(crate::core::Error::Config {
+                at: alloc::string::String::from(port),
+                message: alloc::format!("the PPU drives only `{NMI_PIN}`"),
+            });
+        }
+        self.attach_nmi(source);
+        Ok(())
+    }
+
+    /// Announce what `/NMI` idles at, for the realize sweep (§4.3).
+    ///
+    /// It idles low out of reset, but a machine restored from a snapshot inside
+    /// vblank comes up asserting, and a net nobody announced to would be wrong.
+    fn announce(&self, port: &str) {
+        if port == NMI_PIN {
+            let nmi = self.shared.engine.lock().nmi_active();
+            self.shared.drive_nmi(nmi);
+        }
     }
 }
 
