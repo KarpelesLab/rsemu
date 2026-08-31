@@ -175,6 +175,13 @@ pub(super) struct Exec<'a> {
     cursor: Option<&'a TickCursor>,
     /// The `/RDY` arbiter, if the board has one.
     rdy: Option<&'a dyn CycleGate>,
+    /// Whether the cycle being charged is one the arbiter is holding.
+    ///
+    /// A halt is not a sequence of cycles as far as the core's control logic is
+    /// concerned: it is *one* cycle stretched, and its interrupt poll already
+    /// happened at its start. Polling again on every held cycle lets an
+    /// interrupt asserted by the DMA itself be taken an instruction early.
+    held: bool,
     /// Whether the most recent read cycle was one the arbiter held.
     ///
     /// Only the unstable stores care, and they care a great deal: `SHA`,
@@ -206,6 +213,7 @@ impl<'a> Exec<'a> {
             used: 0,
             cursor: None,
             rdy: None,
+            held: false,
             held_read: false,
         }
     }
@@ -274,7 +282,7 @@ impl<'a> Exec<'a> {
         // before the bus access, because the CPU looks at `/NMI` during φ2 and
         // latches the data bus at the end of it.
         self.lines.sample_nmi();
-        if self.icycle > 1 {
+        if self.icycle > 1 && !self.held {
             if self.skip_poll {
                 self.skip_poll = false;
             } else {
@@ -370,6 +378,9 @@ impl<'a> Exec<'a> {
             return value;
         };
         let mut held = false;
+        // Everything from here to the release is the same stretched cycle: it
+        // has had its poll.
+        self.held = true;
         loop {
             let bus = self.state.open_bus;
             match gate.arbitrate(self.state.cycles, u64::from(addr), bus, false) {
@@ -394,6 +405,7 @@ impl<'a> Exec<'a> {
             value = self.cycle_read(addr);
             self.held_read = true;
         }
+        self.held = false;
         value
     }
 
@@ -531,14 +543,6 @@ impl<'a> Exec<'a> {
         self.push((pc >> 8) as u8);
         self.push(pc as u8);
 
-        // End of the fourth cycle: the hijack point.
-        let stolen = self.lines.take_nmi_pending();
-        let vector = if stolen || source == Source::Nmi {
-            NMI_VECTOR
-        } else {
-            IRQ_VECTOR
-        };
-
         // B is not a register bit: it only exists in the byte that reaches the
         // stack, set by a software break and clear for a hardware interrupt.
         let pushed = match source {
@@ -546,6 +550,23 @@ impl<'a> Exec<'a> {
             Source::Irq | Source::Nmi => (self.state.regs.p | flags::U) & !flags::B,
         };
         self.push(pushed);
+
+        // The hijack point: the *fifth* cycle, not the fourth. NESdev's
+        // cycle-by-cycle listing puts its "at this point, the signal status
+        // determines which interrupt vector is used" marker between ticks 4 and
+        // 5, and reading the latch here is exactly that instant — the edge
+        // detector is clocked from `begin_cycle`, so nothing moves it between
+        // the start of this cycle and the vector fetch below.
+        //
+        // One cycle earlier makes the window four cycles wide instead of five,
+        // which is a difference AccuracyCoin's NMI-overlap answer keys measure
+        // directly: fifteen PPU dots of hijack for BRK, twenty-seven for IRQ.
+        let stolen = self.lines.take_nmi_pending();
+        let vector = if stolen || source == Source::Nmi {
+            NMI_VECTOR
+        } else {
+            IRQ_VECTOR
+        };
         self.set_flag(flags::I, true);
         if self.cmos {
             // The CMOS part clears D on entering an interrupt, so a handler no

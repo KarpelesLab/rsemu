@@ -19,7 +19,7 @@
 #     they can never appear here.
 #
 # ---------------------------------------------------------------------------
-# Measured 2026-08-31 against the pinned ROM: 120 of 141 pass, 21 fail.
+# Measured 2026-08-31 against the pinned ROM: 123 of 141 pass, 18 fail.
 # ---------------------------------------------------------------------------
 #
 # The earlier "81 of 125" was measured through a stale copy of the ROM's
@@ -91,9 +91,6 @@
                   # outright that a series of prerequisites failed — CPU and PPU
                   # open bus, DMA + Open Bus, DMA + $2007 Read. Cascades from
                   # (B) and (C); nothing of its own.
-61                # $0461 "Interrupt flag latency" code 1: an IRQ should occur
-                  # when a DMC sample ends with the DMC IRQ enabled. Without the
-                  # sample fetch the sample never ends.
 
 # ---------------------------------------------------------------------------
 # C. No CPU-side open-bus data latch
@@ -141,10 +138,6 @@
 
 6a                # $046A "Delta Modulation Channel" code 1: $4015 bit 4 must
                   # follow a playing sample. See (B) — there is no sample fetch.
-62                # $0462 "NMI Overlap BRK" code 2: interrupt hijacking — an NMI
-                  # arriving during BRK's vector fetch. The core polls
-                  # interrupts per instruction, not per cycle.
-63                # $0463 "NMI Overlap IRQ" code 1: the same hijacking, for IRQ.
 
 
 # ---------------------------------------------------------------------------
