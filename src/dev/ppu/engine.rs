@@ -14,6 +14,7 @@ use crate::core::space::{AddressSpace, MemAttrs};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::value::Width;
 
+use super::region::{BORDER_BLACK, Geometry, Region};
 use super::regs::*;
 
 // ---------------------------------------------------------------------------
@@ -21,22 +22,35 @@ use super::regs::*;
 // ---------------------------------------------------------------------------
 
 /// Dots in one scanline, visible and blanking together.
+///
+/// 341 in every region: the differences between the 2C02, the 2C07 and the
+/// UA6538 are all vertical, plus the master clocks each dot takes.
 pub const DOTS_PER_SCANLINE: u16 = 341;
-/// Scanlines in one NTSC frame.
-pub const SCANLINES_PER_FRAME: u16 = 262;
-/// Dots in a full (even) NTSC frame. An odd frame with rendering enabled is one
-/// dot shorter.
-pub const DOTS_PER_FRAME: u64 = DOTS_PER_SCANLINE as u64 * SCANLINES_PER_FRAME as u64;
 /// Visible pixels per scanline.
 pub const SCREEN_WIDTH: usize = 256;
-/// Visible scanlines per frame.
+/// Scanlines the render pipeline draws, in every region.
+///
+/// PAL and Dendy show 239 of them, because their video border paints over the
+/// top one ([`Geometry::picture_height`]); all three chips still *render* 240,
+/// so the framebuffer is one shape everywhere and so is the snapshot.
 pub const SCREEN_HEIGHT: usize = 240;
 /// Framebuffer length, in pixels.
 pub const FRAMEBUFFER_LEN: usize = SCREEN_WIDTH * SCREEN_HEIGHT;
-/// The scanline on which the vertical blank flag is set (at dot 1).
-pub const VBLANK_SCANLINE: u16 = 241;
-/// The pre-render (dummy) scanline.
-pub const PRE_RENDER_SCANLINE: u16 = 261;
+
+/// Scanlines in one NTSC frame.
+///
+/// The other regions are in [`Geometry::scanlines_per_frame`]; this and the
+/// constants below name the NTSC figure because it is the default region and
+/// because most of the wiki's prose is written about the 2C02.
+pub const SCANLINES_PER_FRAME: u16 = Region::Ntsc.geometry().scanlines_per_frame;
+/// Dots in a full (even) NTSC frame. An odd frame with rendering enabled is one
+/// dot shorter. See [`Geometry::dots_per_frame`].
+pub const DOTS_PER_FRAME: u64 = Region::Ntsc.geometry().dots_per_frame;
+/// The NTSC scanline on which the vertical blank flag is set (at dot 1).
+/// See [`Geometry::vblank_scanline`].
+pub const VBLANK_SCANLINE: u16 = Region::Ntsc.geometry().vblank_scanline;
+/// The NTSC pre-render (dummy) scanline. See [`Geometry::pre_render_scanline`].
+pub const PRE_RENDER_SCANLINE: u16 = Region::Ntsc.geometry().pre_render_scanline;
 
 /// PPU dots the 2C02 ignores writes to `$2000`, `$2001`, `$2005` and `$2006`
 /// after a reset.
@@ -45,7 +59,8 @@ pub const PRE_RENDER_SCANLINE: u16 = 261;
 /// 3:1 because both descend from one crystal (`ROADMAP.md` §4.2), so the dot
 /// count is exact even though the master frequency is irrational.
 /// [NESdev PPU registers](https://www.nesdev.org/wiki/PPU_registers), PPUCTRL.
-pub const WARMUP_DOTS: u64 = 29_658 * 3;
+/// PAL's is not a whole number of dots; see [`Geometry::warmup_dots`].
+pub const WARMUP_DOTS: u64 = Region::Ntsc.geometry().warmup_dots;
 
 /// Default life of a charge on the PPU I/O latch, in dots.
 ///
@@ -63,7 +78,10 @@ pub const DEFAULT_DECAY_DOTS: u64 = 3_221_591;
 /// [NESdev PPU frame timing](https://www.nesdev.org/wiki/PPU_frame_timing) into
 /// behaviour rather than a special case: a read on the set dot or one dot later
 /// clears the flag before this expires, and no edge ever reaches the wire.
-pub const NMI_ANNOUNCE_DOTS: u64 = 3;
+///
+/// PAL's CPU cycle is 3.2 dots and so takes 4; see
+/// [`Geometry::nmi_announce_dots`].
+pub const NMI_ANNOUNCE_DOTS: u64 = Region::Ntsc.geometry().nmi_announce_dots;
 
 // ---------------------------------------------------------------------------
 // Pixels
@@ -155,7 +173,8 @@ pub struct Engine {
     pub(crate) dots: u64,
     /// Frames completed. Its parity chooses the odd-frame skip.
     pub(crate) frame: u64,
-    /// The scanline about to be executed, 0-261.
+    /// The scanline about to be executed, 0 to
+    /// [`Geometry::pre_render_scanline`].
     pub(crate) scanline: u16,
     /// The dot about to be executed, 0-340.
     pub(crate) dot: u16,
@@ -247,6 +266,11 @@ pub struct Engine {
     pub(crate) suppress_nmi: bool,
 
     // -- configuration ------------------------------------------------------
+    /// Which console this is. Machine configuration, not architectural state,
+    /// so it is not serialized: a snapshot never changes region.
+    pub(crate) region: Region,
+    /// [`Region::geometry`] of `region`, resolved once. Derived, never saved.
+    pub(crate) geom: Geometry,
     /// Honour the ~29658-CPU-cycle write lockout after reset.
     pub(crate) warmup: bool,
 
@@ -264,6 +288,7 @@ impl fmt::Debug for Engine {
         // The framebuffer and the three memories are 61 kB of noise in a
         // backtrace; the position and the registers are what anyone wants.
         f.debug_struct("Engine")
+            .field("region", &self.region)
             .field("dots", &self.dots)
             .field("frame", &self.frame)
             .field("scanline", &self.scanline)
@@ -281,7 +306,7 @@ impl fmt::Debug for Engine {
 
 impl Engine {
     /// A powered-off engine. [`Engine::reset_cold`] gives it its reset state.
-    pub fn new(warmup: bool, decay_dots: u64) -> Engine {
+    pub fn new(region: Region, warmup: bool, decay_dots: u64) -> Engine {
         let mut engine = Engine {
             dots: 0,
             frame: 0,
@@ -330,12 +355,26 @@ impl Engine {
             vblank_set_dot: 0,
             suppress_vblank_set: false,
             suppress_nmi: false,
+            region,
+            geom: region.geometry(),
             warmup,
             fb: vec![Pixel::default(); FRAMEBUFFER_LEN].into_boxed_slice(),
             bus: None,
         };
         engine.reset_cold();
         engine
+    }
+
+    /// Which console this engine is modelling.
+    #[inline]
+    pub const fn tv_region(&self) -> Region {
+        self.region
+    }
+
+    /// The frame geometry [`Engine::tv_region`] implies.
+    #[inline]
+    pub const fn geometry(&self) -> Geometry {
+        self.geom
     }
 
     /// Power-on state.
@@ -433,7 +472,8 @@ impl Engine {
     /// on: the 240 visible lines plus the pre-render line.
     #[inline]
     fn render_line(&self) -> bool {
-        self.scanline < SCREEN_HEIGHT as u16 || self.scanline == PRE_RENDER_SCANLINE
+        self.scanline < self.geom.visible_scanlines
+            || self.scanline == self.geom.pre_render_scanline
     }
 
     /// The level of the (logical) NMI request: `vblank_flag AND nmi_output`,
@@ -448,7 +488,10 @@ impl Engine {
         self.status & STATUS_VBLANK != 0
             && self.ctrl & CTRL_NMI != 0
             && !self.suppress_nmi
-            && self.dots >= self.vblank_set_dot.saturating_add(NMI_ANNOUNCE_DOTS)
+            && self.dots
+                >= self
+                    .vblank_set_dot
+                    .saturating_add(self.geom.nmi_announce_dots)
     }
 
     /// Sprite height from `$2000` bit 5.
@@ -464,7 +507,7 @@ impl Engine {
     /// Whether `$2000`/`$2001`/`$2005`/`$2006` writes are accepted yet.
     #[inline]
     fn warm(&self) -> bool {
-        !self.warmup || self.dots >= WARMUP_DOTS
+        !self.warmup || self.dots >= self.geom.warmup_dots
     }
 
     /// Read one byte from the PPU bus, or the bus latch if nothing answers.
@@ -837,6 +880,18 @@ impl Engine {
         } else {
             index
         };
+        // The 2C07's video border is forced black and intrudes on the top
+        // scanline of the picture, which is the whole reason the PAL and Dendy
+        // picture is 239 lines out of 240 rendered (NESdev cycle reference
+        // chart, "Height of picture" and "Side and bottom borders"). The
+        // pipeline above still runs — sprite 0 can hit on this line — because
+        // the border is painted by the video output stage, not by the
+        // multiplexer.
+        let index = if scanline < self.geom.top_border_lines() {
+            BORDER_BLACK
+        } else {
+            index
+        };
         let offset = usize::from(scanline) * SCREEN_WIDTH + usize::from(x);
         self.fb[offset] = Pixel::new(index, emphasis);
     }
@@ -914,8 +969,8 @@ impl Engine {
         let scanline = self.scanline;
         let dot = self.dot;
         let rendering = self.rendering_enabled();
-        let visible = scanline < SCREEN_HEIGHT as u16;
-        let pre_render = scanline == PRE_RENDER_SCANLINE;
+        let visible = scanline < self.geom.visible_scanlines;
+        let pre_render = scanline == self.geom.pre_render_scanline;
 
         // The sprite 0 flag becomes visible one dot after the pixel that caused
         // it, so the earliest possible dot is 2 (NESdev PPU rendering).
@@ -925,12 +980,12 @@ impl Engine {
         }
 
         // -- vblank edges --
-        if scanline == VBLANK_SCANLINE && dot == 0 {
+        if scanline == self.geom.vblank_scanline && dot == 0 {
             // A read that lands here is "one PPU clock before" and has already
             // set `suppress_vblank_set`; anything earlier has not.
             self.suppress_nmi = false;
         }
-        if scanline == VBLANK_SCANLINE && dot == 1 {
+        if scanline == self.geom.vblank_scanline && dot == 1 {
             if self.suppress_vblank_set {
                 self.suppress_vblank_set = false;
             } else {
@@ -1023,10 +1078,17 @@ impl Engine {
 
     fn advance_position(&mut self, pre_render: bool, rendering: bool) {
         self.dot += 1;
-        // The odd-frame skip: with rendering enabled, an odd frame jumps
+        // The odd-frame skip: with rendering enabled, an odd 2C02 frame jumps
         // straight from (339, 261) to (0, 0), making it one dot shorter
-        // (NESdev PPU frame timing).
-        if pre_render && self.dot == 340 && rendering && !self.frame.is_multiple_of(2) {
+        // (NESdev PPU frame timing). The 2C07 and the UA6538 do not do it —
+        // the cycle reference chart gives both a flat 341 x 312 — so it is a
+        // property of the region, not of the pipeline.
+        if self.geom.odd_frame_skip
+            && pre_render
+            && self.dot == DOTS_PER_SCANLINE - 1
+            && rendering
+            && !self.frame.is_multiple_of(2)
+        {
             self.dot = 0;
             self.scanline = 0;
             self.frame += 1;
@@ -1035,7 +1097,7 @@ impl Engine {
         if self.dot == DOTS_PER_SCANLINE {
             self.dot = 0;
             self.scanline += 1;
-            if self.scanline == SCANLINES_PER_FRAME {
+            if self.scanline == self.geom.scanlines_per_frame {
                 self.scanline = 0;
                 self.frame += 1;
             }
@@ -1083,7 +1145,7 @@ impl Engine {
                 // every read comes back $FF
                 // ([NESdev PPU sprite evaluation]).
                 let value = if self.rendering_enabled()
-                    && self.scanline < SCREEN_HEIGHT as u16
+                    && self.scanline < self.geom.visible_scanlines
                     && (1..=64).contains(&self.dot)
                 {
                     0xff
@@ -1120,7 +1182,7 @@ impl Engine {
     /// set, and a read while `dot == 2` happens on the same clock as far as the
     /// CPU is concerned.
     fn apply_status_read_race(&mut self) {
-        if self.scanline != VBLANK_SCANLINE {
+        if self.scanline != self.geom.vblank_scanline {
             return;
         }
         match self.dot {

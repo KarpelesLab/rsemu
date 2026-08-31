@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use super::*;
 use crate::core::clock::{ClockForest, Rational};
 use crate::core::device::Deferred;
-use crate::core::space::{RamStore, Region, RequesterId, UnassignedPolicy};
+use crate::core::space::{RamStore, Region as MmioRegion, RequesterId, UnassignedPolicy};
 use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
 use crate::core::wire::{Wire, WireId, WireIdAllocator, WireSink};
 
@@ -20,7 +20,13 @@ use crate::core::wire::{Wire, WireId, WireIdAllocator, WireSink};
 
 /// A PPU with 8 KiB of CHR RAM and 4 KiB of nametable RAM, no write lockout.
 fn new_ppu() -> (NesPpu, Arc<RamStore>, Arc<RamStore>) {
+    new_ppu_in(Region::Ntsc)
+}
+
+/// The same, for a named region.
+fn new_ppu_in(region: Region) -> (NesPpu, Arc<RamStore>, Arc<RamStore>) {
     let mut props = Props::new();
+    props.insert("region", region.name());
     props.insert("warmup", false);
     let ppu = NesPpu::new(&props).expect("properties are valid");
 
@@ -29,15 +35,15 @@ fn new_ppu() -> (NesPpu, Arc<RamStore>, Arc<RamStore>) {
     let space = AddressSpace::new("ppu", 14).with_unassigned(UnassignedPolicy::ZEROS);
     space
         .topology()
-        .map(Arc::new(Region::ram("chr", Arc::clone(&chr))), 0x0000)
+        .map(Arc::new(MmioRegion::ram("chr", Arc::clone(&chr))), 0x0000)
         .expect("chr fits");
     space
         .topology()
         .map(
             Arc::new(
-                Region::mirror(
+                MmioRegion::mirror(
                     "nametables",
-                    Arc::new(Region::ram("nt", Arc::clone(&nt))),
+                    Arc::new(MmioRegion::ram("nt", Arc::clone(&nt))),
                     0x1000,
                 )
                 .expect("mirror fits"),
@@ -88,7 +94,7 @@ fn three_dots_per_cpu_cycle_exactly() {
         .add_oscillator("master", Rational::new(236_250_000, 11).unwrap())
         .unwrap();
     let cpu = forest.add_domain("cpu", master, 1, 12).unwrap();
-    let dots = add_clock_domain(&mut forest, master).unwrap();
+    let dots = add_clock_domain(&mut forest, master, Region::Ntsc).unwrap();
     assert_eq!(forest.convert_ticks(cpu, dots, 1).unwrap(), 3);
     assert_eq!(forest.convert_ticks(cpu, dots, 29_780).unwrap(), 89_340);
 }
@@ -1227,4 +1233,441 @@ fn a_debug_write_is_refused_rather_than_guessed_at() {
     let port = ppu.port();
     assert!(port.write(0, &[0xff], MemAttrs::DEBUG).is_err());
     assert_eq!(ppu.with_engine(|e| e.ctrl), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Regions
+//
+// Every figure asserted here comes from the NESdev cycle reference chart
+// (https://www.nesdev.org/wiki/Cycle_reference_chart) and the two sentences on
+// PPU rendering: "Dendy PPUs render 51 post-render scanlines instead of 1" and
+// "PAL NES PPUs render 70 vblank scanlines instead of 20".
+// ---------------------------------------------------------------------------
+
+/// The three regions, for tests that must cover all of them.
+const REGIONS: [Region; 3] = [Region::Ntsc, Region::Pal, Region::Dendy];
+
+#[test]
+fn every_regions_geometry_adds_up_to_its_frame() {
+    // The chart states picture, post-render, vblank and pre-render separately
+    // and a total dots-per-frame elsewhere; the two only agree if all four
+    // parts and 240 rendered scanlines are accounted for. That they do is the
+    // reason "picture height 239" is read as "240 rendered, top one blacked
+    // out by the border" rather than "239 rendered".
+    for region in REGIONS {
+        let g = region.geometry();
+        assert_eq!(
+            g.visible_scanlines + g.post_render_lines + g.vblank_lines + 1,
+            g.scanlines_per_frame,
+            "{region}"
+        );
+        assert_eq!(g.vblank_scanline, g.visible_scanlines + g.post_render_lines);
+        assert_eq!(g.pre_render_scanline, g.scanlines_per_frame - 1);
+        assert_eq!(
+            g.dots_per_frame,
+            u64::from(DOTS_PER_SCANLINE) * u64::from(g.scanlines_per_frame)
+        );
+        assert!(g.picture_height <= g.visible_scanlines);
+    }
+}
+
+#[test]
+fn the_frame_is_89342_106392_and_106392_dots() {
+    assert_eq!(Region::Ntsc.geometry().dots_per_frame, 89_342);
+    assert_eq!(Region::Pal.geometry().dots_per_frame, 106_392);
+    assert_eq!(Region::Dendy.geometry().dots_per_frame, 106_392);
+
+    // And the engine really walks that many dots per frame.
+    for region in REGIONS {
+        let (ppu, _, _) = new_ppu_in(region);
+        ppu.advance_by(region.geometry().dots_per_frame);
+        assert_eq!(ppu.frame(), 1, "{region}");
+        assert_eq!(ppu.position(), (0, 0), "{region}");
+    }
+}
+
+#[test]
+fn the_odd_frame_skip_is_ntsc_only() {
+    // The chart gives 341 x 261 + 340.5 for the 2C02 and a flat 341 x 312 for
+    // the 2C07 and the UA6538.
+    for region in REGIONS {
+        let g = region.geometry();
+        let (ppu, _, _) = new_ppu_in(region);
+        enable_rendering(&ppu);
+        ppu.advance_by(g.dots_per_frame); // frame 0 is even, always full length
+        assert_eq!(ppu.frame(), 1, "{region}");
+        assert_eq!(ppu.position(), (0, 0), "{region}");
+
+        // Frame 1 is odd: one dot shorter on NTSC, the same length elsewhere.
+        let odd = g.dots_per_frame - u64::from(g.odd_frame_skip);
+        ppu.advance_by(odd);
+        assert_eq!(ppu.frame(), 2, "{region}");
+        assert_eq!(ppu.position(), (0, 0), "{region}");
+        assert_eq!(g.odd_frame_skip, region == Region::Ntsc, "{region}");
+    }
+}
+
+#[test]
+fn an_odd_pal_frame_is_not_short_even_with_rendering_on() {
+    // The negative half of the test above, stated as the bug it prevents: on a
+    // 2C07 the dot after (339, 311) is (340, 311), not (0, 0).
+    let g = Region::Pal.geometry();
+    let (ppu, _, _) = new_ppu_in(Region::Pal);
+    enable_rendering(&ppu);
+    ppu.advance_by(g.dots_per_frame); // frame 0
+    ppu.advance_by(g.dots_per_frame - 2); // two dots short of the end of frame 1
+    assert_eq!(ppu.position(), (g.pre_render_scanline, 339));
+    ppu.advance_by(1);
+    assert_eq!(ppu.position(), (g.pre_render_scanline, 340));
+    assert_eq!(ppu.frame(), 1, "still inside the odd frame");
+    ppu.advance_by(1);
+    assert_eq!(ppu.frame(), 2);
+}
+
+#[test]
+fn vblank_is_set_and_cleared_on_each_regions_own_scanlines() {
+    // NTSC and PAL raise the NMI one scanline after the picture; Dendy waits
+    // 51, which is the whole trick that lets it keep a Famicom CPU rate.
+    assert_eq!(Region::Ntsc.geometry().vblank_scanline, 241);
+    assert_eq!(Region::Pal.geometry().vblank_scanline, 241);
+    assert_eq!(Region::Dendy.geometry().vblank_scanline, 291);
+    assert_eq!(Region::Ntsc.geometry().pre_render_scanline, 261);
+    assert_eq!(Region::Pal.geometry().pre_render_scanline, 311);
+    assert_eq!(Region::Dendy.geometry().pre_render_scanline, 311);
+
+    for region in REGIONS {
+        let g = region.geometry();
+        let (ppu, _, _) = new_ppu_in(region);
+
+        seek(&ppu, g.vblank_scanline, 0);
+        ppu.advance_by(1); // dot 0: not yet
+        assert_eq!(ppu.with_engine(|e| e.status) & STATUS_VBLANK, 0, "{region}");
+        ppu.advance_by(1); // dot 1: set
+        assert_eq!(
+            ppu.with_engine(|e| e.status) & STATUS_VBLANK,
+            STATUS_VBLANK,
+            "{region}"
+        );
+
+        seek(&ppu, g.pre_render_scanline, 0);
+        ppu.advance_by(1); // dot 0: still set
+        assert_ne!(ppu.with_engine(|e| e.status) & STATUS_VBLANK, 0, "{region}");
+        ppu.advance_by(1); // dot 1: cleared
+        assert_eq!(ppu.with_engine(|e| e.status) & STATUS_VBLANK, 0, "{region}");
+    }
+}
+
+#[test]
+fn the_vblank_window_is_the_length_the_chart_gives() {
+    // 20, 70 and 20 scanlines between the NMI and the pre-render line.
+    assert_eq!(Region::Ntsc.geometry().vblank_lines, 20);
+    assert_eq!(Region::Pal.geometry().vblank_lines, 70);
+    assert_eq!(Region::Dendy.geometry().vblank_lines, 20);
+    for region in REGIONS {
+        let g = region.geometry();
+        assert_eq!(
+            g.pre_render_scanline - g.vblank_scanline,
+            g.vblank_lines,
+            "{region}"
+        );
+    }
+}
+
+#[test]
+fn the_dividers_give_3_16_over_5_and_3_dots_per_cpu_cycle() {
+    // ROADMAP.md §4.2: the ratio is exact because both counters descend from
+    // one crystal, and PAL's 3.2 is exact for the same reason — the forest
+    // counts master ticks, so nothing ever holds 3.2.
+    for region in REGIONS {
+        let (num, den) = region.master_clock();
+        let mut forest = ClockForest::new();
+        let master = forest
+            .add_oscillator("master", Rational::new(num, den).unwrap())
+            .unwrap();
+        let cpu = forest
+            .add_domain("cpu", master, 1, region.cpu_divider())
+            .unwrap();
+        let dots = add_clock_domain(&mut forest, master, region).unwrap();
+        // Five CPU cycles is a whole number of dots in every region, which is
+        // the smallest common statement of 3, 3.2 and 3.
+        assert_eq!(
+            forest.convert_ticks(cpu, dots, 5).unwrap(),
+            5 * region.cpu_divider() / region.dot_divider(),
+            "{region}"
+        );
+    }
+    assert_eq!(Region::Pal.cpu_divider(), 16);
+    assert_eq!(Region::Pal.dot_divider(), 5);
+    assert_eq!(Region::Dendy.cpu_divider(), 15);
+    assert_eq!(Region::Dendy.dot_divider(), 5);
+    // The famous one, stated the way games depend on it.
+    let mut forest = ClockForest::new();
+    let master = forest
+        .add_oscillator("master", Rational::new(236_250_000, 11).unwrap())
+        .unwrap();
+    let cpu = forest.add_domain("cpu", master, 1, 12).unwrap();
+    let dots = add_clock_domain(&mut forest, master, Region::Ntsc).unwrap();
+    assert_eq!(forest.convert_ticks(cpu, dots, 1).unwrap(), 3);
+}
+
+#[test]
+fn a_frame_is_the_number_of_cpu_cycles_the_chart_gives() {
+    // 29780.5, 33247.5 and 35464 CPU cycles. The first two are not whole
+    // numbers, so the check is on master clocks, which is where the exactness
+    // actually lives.
+    for (region, cycles_x2) in [
+        (Region::Ntsc, 59_561u64), // 2 x 29780.5, with the odd-frame skip
+        (Region::Pal, 66_495),     // 2 x 33247.5
+        (Region::Dendy, 70_928),   // 2 x 35464
+    ] {
+        let g = region.geometry();
+        let dots_x2 = 2 * g.dots_per_frame - u64::from(g.odd_frame_skip);
+        assert_eq!(
+            dots_x2 * region.dot_divider(),
+            cycles_x2 * region.cpu_divider(),
+            "{region}"
+        );
+    }
+}
+
+#[test]
+fn the_nmi_announce_delay_is_one_cpu_cycle_rounded_up() {
+    // Three dots on NTSC and Dendy; four on PAL, because a 2C07 CPU cycle is
+    // 3.2 dots and the first whole dot at or past it is the fourth.
+    assert_eq!(Region::Ntsc.geometry().nmi_announce_dots, 3);
+    assert_eq!(Region::Pal.geometry().nmi_announce_dots, 4);
+    assert_eq!(Region::Dendy.geometry().nmi_announce_dots, 3);
+    for region in REGIONS {
+        let g = region.geometry();
+        assert!(
+            g.nmi_announce_dots * region.dot_divider() >= region.cpu_divider(),
+            "{region} must not announce before a CPU cycle has passed"
+        );
+    }
+}
+
+#[test]
+fn the_nmi_reaches_the_wire_after_that_delay_in_every_region() {
+    for region in REGIONS {
+        let g = region.geometry();
+        let (ppu, _, _) = new_ppu_in(region);
+        let log = with_nmi(&ppu);
+        ppu.write_register(PPUCTRL, CTRL_NMI);
+        seek(&ppu, g.vblank_scanline, 1);
+        // Stop one dot short of the announce delay expiring.
+        ppu.advance_by(g.nmi_announce_dots - 1);
+        assert!(
+            !log.levels.lock().iter().any(|high| *high),
+            "{region}: /NMI must not be announced inside one CPU cycle"
+        );
+        ppu.advance_by(1);
+        assert!(
+            log.levels.lock().iter().any(|high| *high),
+            "{region}: /NMI must be announced once the CPU cycle has passed"
+        );
+    }
+}
+
+#[test]
+fn the_write_lockout_is_29658_cpu_cycles_in_every_region() {
+    // The measurement is in CPU cycles; only the conversion to dots differs,
+    // and PAL's is not a whole number of dots (94905.6), so it is floored.
+    for region in REGIONS {
+        let dots = region.geometry().warmup_dots;
+        assert_eq!(
+            dots,
+            RESET_LOCKOUT_CPU_CYCLES * region.cpu_divider() / region.dot_divider(),
+            "{region}"
+        );
+    }
+    assert_eq!(Region::Ntsc.geometry().warmup_dots, 88_974);
+    assert_eq!(Region::Pal.geometry().warmup_dots, 94_905);
+    assert_eq!(Region::Dendy.geometry().warmup_dots, 88_974);
+}
+
+#[test]
+fn pal_and_dendy_black_out_the_top_scanline_of_the_picture() {
+    // The chart: the 2C07 border is "always black ($0E), intruding on left and
+    // right 2 pixels and top 1 pixel of picture", which is exactly why its
+    // picture is 239 scanlines out of 240 rendered.
+    assert_eq!(Region::Ntsc.geometry().picture_height, 240);
+    assert_eq!(Region::Pal.geometry().picture_height, 239);
+    assert_eq!(Region::Dendy.geometry().picture_height, 239);
+
+    for region in REGIONS {
+        let (ppu, _, _) = new_ppu_in(region);
+        // A backdrop nothing could mistake for black.
+        ppu.poke_palette(0x3f00, 0x21);
+        ppu.advance_by(u64::from(DOTS_PER_SCANLINE) * 2);
+        let top = ppu.pixel(0, 0).unwrap().index();
+        let next = ppu.pixel(0, 1).unwrap().index();
+        assert_eq!(next, 0x21, "{region}: line 1 is picture in every region");
+        if region.geometry().top_border_lines() == 0 {
+            assert_eq!(top, 0x21, "{region}");
+        } else {
+            assert_eq!(top, BORDER_BLACK, "{region}");
+        }
+    }
+}
+
+#[test]
+fn a_region_is_a_property_and_a_bad_one_names_the_alternatives() {
+    for region in REGIONS {
+        let ppu = NesPpu::new(&Props::new().with("region", region.name())).unwrap();
+        assert_eq!(ppu.tv_region(), region);
+        assert_eq!(ppu.geometry(), region.geometry());
+    }
+    // The default is the 2C02, so an existing machine file keeps working.
+    assert_eq!(
+        NesPpu::new(&Props::new()).unwrap().tv_region(),
+        Region::Ntsc
+    );
+
+    let err = NesPpu::new(&Props::new().with("region", "secam"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("ntsc"), "{err}");
+    assert!(err.contains("pal"), "{err}");
+    assert!(err.contains("dendy"), "{err}");
+
+    assert_eq!(Region::from_name("dendy"), Some(Region::Dendy));
+    assert_eq!(Region::from_name("secam"), None);
+    for region in REGIONS {
+        assert_eq!(Region::from_name(region.name()), Some(region));
+        assert!(Region::NAMES.contains(&region.name()));
+        assert!(!region.part_number().is_empty());
+    }
+}
+
+#[test]
+fn the_master_clock_is_an_exact_rational_in_every_region() {
+    // Neither is an integer number of hertz (ROADMAP.md §4.2).
+    assert_eq!(Region::Ntsc.master_clock(), (236_250_000, 11));
+    assert_eq!(Region::Pal.master_clock(), (53_203_425, 2));
+    assert_eq!(Region::Dendy.master_clock(), Region::Pal.master_clock());
+    for region in REGIONS {
+        let (num, den) = region.master_clock();
+        assert_ne!(num % den, 0, "{region} is not a whole number of hertz");
+        assert!(Rational::new(num, den).is_ok());
+    }
+}
+
+#[test]
+fn the_region_is_configuration_and_survives_a_snapshot_untouched() {
+    // Derived from the machine, never from the stream: a snapshot must not be
+    // able to turn a PAL machine into an NTSC one.
+    let (pal, _, _) = new_ppu_in(Region::Pal);
+    pal.advance_by(1234);
+    let mut w = StateWriter::new(MachineShape::new());
+    {
+        let mut chunk = w
+            .chunk("/ppu", NES_PPU_CLASS.name, NES_PPU_CLASS.version)
+            .unwrap();
+        pal.save(&mut chunk).unwrap();
+    }
+    let bytes = w.to_vec().unwrap();
+
+    let (restored, _, _) = new_ppu_in(Region::Pal);
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load(
+            "/ppu",
+            NES_PPU_CLASS.name,
+            NES_PPU_CLASS.version,
+            &Migrations::new(),
+        )
+        .unwrap();
+    restored.load(&mut chunk.reader()).unwrap();
+    assert_eq!(restored.tv_region(), Region::Pal);
+    assert_eq!(restored.dots(), 1234);
+    // Loading a PAL snapshot into an NTSC PPU leaves it NTSC: the region is
+    // the machine's, not the stream's.
+    let (ntsc, _, _) = new_ppu_in(Region::Ntsc);
+    ntsc.load(&mut chunk.reader()).unwrap();
+    assert_eq!(ntsc.tv_region(), Region::Ntsc);
+}
+
+// ---------------------------------------------------------------------------
+// The connection surface (`ROADMAP.md` §4.4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_register_block_is_the_region_a_map_statement_names() {
+    let (ppu, _, _) = new_ppu();
+    let unnamed = Device::region(&ppu, "").expect("the whole aperture");
+    let named = Device::region(&ppu, REGISTER_REGION).expect("`regs`");
+    assert_eq!(unnamed.len(), REGISTER_WINDOW_LEN);
+    // One piece of hardware, one region: a fresh Arc per call would be a second
+    // identity for the same window.
+    assert!(Arc::ptr_eq(&unnamed, &named));
+    assert!(Device::region(&ppu, "vram").is_none());
+
+    // And it really is the register block: $2002 through the mapped region.
+    let space = AddressSpace::new("cpu", 16);
+    space.topology().map(named, REGISTER_BASE).unwrap();
+    ppu.with_engine(|e| e.status |= STATUS_VBLANK);
+    let status = space
+        .read(REGISTER_BASE + 2, Width::U8, MemAttrs::DEFAULT)
+        .unwrap();
+    assert_ne!(status as u8 & STATUS_VBLANK, 0);
+    // Mirrored every 8 bytes across the whole 8 KiB.
+    ppu.with_engine(|e| e.status |= STATUS_VBLANK);
+    let mirrored = space
+        .read(REGISTER_BASE + 0x1ffa, Width::U8, MemAttrs::DEFAULT)
+        .unwrap();
+    assert_ne!(mirrored as u8 & STATUS_VBLANK, 0);
+}
+
+#[test]
+fn the_nmi_pin_connects_announces_and_refuses_anything_else() {
+    let (ppu, _, _) = new_ppu();
+    // Put it in vblank with NMIs enabled *before* connecting, so nothing has
+    // driven the net yet when the sweep reaches it — which is the situation a
+    // freshly restored machine is in.
+    ppu.with_engine(|e| {
+        e.status |= STATUS_VBLANK;
+        e.ctrl |= CTRL_NMI;
+        e.dots = 100;
+    });
+
+    let ids = WireIdAllocator::new();
+    let id = ids.alloc();
+    let sink = Arc::new(Recorder::default());
+    let wire = Wire::builder()
+        .source(id)
+        .sink(Arc::clone(&sink) as Arc<dyn WireSink>, 0)
+        .build_shared();
+    ppu.connect(NMI_PIN, WireSource::new(wire, id)).unwrap();
+    assert!(
+        sink.levels.lock().is_empty(),
+        "connecting is not an outward action; announcing is"
+    );
+    ppu.announce(NMI_PIN);
+    assert_eq!(sink.levels.lock().last().copied(), Some(true));
+
+    // An unknown pin is an error naming the port, and an unknown announce is
+    // silently nothing — the sweep asks every device about every pin.
+    let other = Wire::builder().source(id).build_shared();
+    let err = ppu
+        .connect("irq", WireSource::new(other, id))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("irq"), "{err}");
+    ppu.announce("irq");
+}
+
+#[test]
+fn the_class_constructs_through_the_registry_with_a_region() {
+    let mut registry = crate::core::Registry::new();
+    register(&mut registry).unwrap();
+    let device = registry
+        .create("nes.ppu", &Props::new().with("region", "dendy"))
+        .unwrap();
+    assert_eq!(device.class().name, "nes.ppu");
+    // The class advertises the property the machine file writes.
+    assert!(
+        NES_PPU_CLASS.properties.iter().any(|p| p.name == "region"),
+        "`rsemu describe nes.ppu` must list it"
+    );
+    assert!(Device::region(device.as_ref(), "").is_some());
 }

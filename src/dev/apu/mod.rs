@@ -6,10 +6,19 @@
 //! source citations — and from nothing else; `CLAUDE.md`'s provenance rule
 //! forbids the obvious alternatives.
 //!
+//! # Regions
+//!
+//! [`Region`] picks the console: NTSC (RP2A03), PAL (RP2A07) or Dendy
+//! (UA6527P). It is a construction property — `region = "pal"` — never a
+//! `#[cfg]`, so one build runs all three. What actually differs is the frame
+//! counter's sequence, the noise period table, the DMC rate table and the CPU
+//! divider; every register bit is the same chip.
+//!
 //! # Where the time comes from
 //!
-//! The APU is clocked by the CPU clock, which on the NES is the master
-//! oscillator divided by 12. It is therefore a domain in the machine's
+//! The APU is clocked by the CPU clock, which on an NTSC NES is the master
+//! oscillator divided by 12 — 16 on PAL and 15 on Dendy
+//! ([`Region::cpu_divider`]). It is therefore a domain in the machine's
 //! oscillator forest ([`crate::core::clock`]) and never reads a host clock. The
 //! device is **lazily advanced** (`ROADMAP.md` §4.2): it holds a tick counter
 //! and the machine calls [`Apu::advance_to`] before dispatching any access to
@@ -42,6 +51,9 @@
 //!   Famicom's is different again.
 //! - The pre-mode-flag 2A03 revisions, whose noise channel had no short mode
 //!   and whose rate `$F` lasted 2046 cycles.
+//! - Famiclones other than the UA6527P. The cycle reference chart lists two
+//!   more (Brazil and Argentina); both are recorded there as "like NTSC" for
+//!   the frame counter and are not separate variants here.
 //! - The `$4011` write-versus-timer-clock race, which has no documented rule.
 //! - The `RP2A03H` "unexpected reload DMA" bug. The aborted-DMA case *is*
 //!   reachable, because withdrawing a scheduled fetch is exactly what
@@ -53,7 +65,7 @@
 //! use rsemu::core::props::Props;
 //! use rsemu::dev::apu::Apu;
 //!
-//! let apu = Apu::new(&Props::new()).unwrap();
+//! let apu = Apu::new(&Props::new().with("region", "ntsc")).unwrap();
 //! apu.write(0x15, 0x0F); // enable the four waveform channels
 //! apu.write(0x00, 0x9F); // pulse 1: 50% duty, halt, constant volume 15
 //! apu.write(0x03, 0x08); // length load, timer high bits
@@ -82,14 +94,16 @@ use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKi
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
-use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region};
+use crate::core::space::{
+    AccessConstraints, MemAttrs, MemOps, MemResult, Region as MmioRegion, RegionRef,
+};
 use crate::core::state::{ChunkReader, ChunkWriter};
 use crate::core::sync::{AtomicU8, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{Level, WireSource};
 
 pub use dmc::{DmaKind, DmaRequest};
-pub use frame::{Mode, Timing};
+pub use frame::{Mode, Region};
 
 use dmc::Dmc;
 use frame::FrameCounter;
@@ -165,14 +179,14 @@ struct Core {
 }
 
 impl Core {
-    fn new(timing: Timing, phase: u64, halt_ultrasonic: bool, capacity: usize) -> Core {
+    fn new(region: Region, phase: u64, halt_ultrasonic: bool, capacity: usize) -> Core {
         Core {
-            frame: FrameCounter::new(timing),
+            frame: FrameCounter::new(region),
             pulse1: Pulse::new(true),
             pulse2: Pulse::new(false),
             triangle: Triangle::new(halt_ultrasonic),
-            noise: Noise::new(timing),
-            dmc: Dmc::new(timing),
+            noise: Noise::new(region),
+            dmc: Dmc::new(region),
             ticks: 0,
             phase,
             samples: SampleRing::with_capacity(capacity),
@@ -311,12 +325,12 @@ impl Core {
         value
     }
 
-    fn reset(&mut self, kind: ResetKind, timing: Timing, halt_ultrasonic: bool) {
+    fn reset(&mut self, kind: ResetKind, region: Region, halt_ultrasonic: bool) {
         match kind {
             ResetKind::Cold => {
                 let phase = self.phase;
                 let capacity = self.samples.capacity();
-                *self = Core::new(timing, phase, halt_ultrasonic, capacity);
+                *self = Core::new(region, phase, halt_ultrasonic, capacity);
             }
             ResetKind::Warm | ResetKind::Bus => {
                 // A reset is documented as a $4015 write of $00 plus a handful
@@ -378,14 +392,14 @@ struct ApuState {
     /// and so a monitor can report it. The machine assembly layer will set it
     /// from `RealizeCtx` once that layer can hand out the forest.
     domain: Mutex<Option<DomainId>>,
-    timing: Timing,
+    region: Region,
     halt_ultrasonic: bool,
 }
 
 impl fmt::Debug for ApuState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ApuState")
-            .field("timing", &self.timing)
+            .field("region", &self.region)
             .field("open_bus", &self.open_bus.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
@@ -440,45 +454,68 @@ impl ApuState {
 #[derive(Debug)]
 pub struct Apu {
     state: Arc<ApuState>,
+    /// The three apertures, in [`WINDOWS`] order.
+    windows: [RegionRef; 3],
 }
 
 impl Apu {
     /// Validate properties and allocate. Performs no outward action.
     ///
-    /// Properties: `timing` (`ntsc` or `pal`), `sample-buffer` (capacity of the
-    /// output ring in samples; 0 disables it), `halt-ultrasonic`, and
-    /// `put-phase` (0 or 1).
+    /// Properties: `region` (`ntsc`, `pal` or `dendy`), `sample-buffer`
+    /// (capacity of the output ring in samples; 0 disables it),
+    /// `halt-ultrasonic`, and `put-phase` (0 or 1).
     pub fn new(props: &Props) -> Result<Apu> {
         let mut reader = props.reader();
-        let timing_name = reader.or_str("timing", "ntsc")?;
-        let timing = Timing::from_name(timing_name).ok_or_else(|| {
-            Error::Property(alloc::format!(
-                "property `timing` must be `ntsc` or `pal`, not `{timing_name}`"
-            ))
-        })?;
+        let name = reader.or_enum("region", Region::Ntsc.name(), Region::NAMES)?;
         let capacity = reader.or_range::<u64>("sample-buffer", 8192, 0..=1 << 24)?;
         let halt_ultrasonic = reader.or("halt-ultrasonic", false)?;
         let phase = reader.or_range::<u64>("put-phase", 0, 0..=1)?;
         reader.finish()?;
+        // `or_enum` has already rejected everything else; this is the one place
+        // the name becomes the variant, so it stays a checked conversion.
+        let region = Region::from_name(name)
+            .ok_or_else(|| Error::Property(alloc::format!("unknown `region` `{name}`")))?;
 
-        Ok(Apu {
-            state: Arc::new(ApuState {
-                core: Mutex::with_rank(
-                    LockRank::DEVICE,
-                    Core::new(timing, phase, halt_ultrasonic, capacity as usize),
-                ),
-                irq: Mutex::with_rank(LockRank::WIRE, None),
-                open_bus: AtomicU8::new(0),
-                domain: Mutex::with_rank(LockRank::LEAF, None),
-                timing,
-                halt_ultrasonic,
-            }),
-        })
+        let state = Arc::new(ApuState {
+            core: Mutex::with_rank(
+                LockRank::DEVICE,
+                Core::new(region, phase, halt_ultrasonic, capacity as usize),
+            ),
+            irq: Mutex::with_rank(LockRank::WIRE, None),
+            open_bus: AtomicU8::new(0),
+            domain: Mutex::with_rank(LockRank::LEAF, None),
+            region,
+            halt_ultrasonic,
+        });
+        // Built once, here, rather than in `Device::region`: two `map`
+        // statements naming one window must get one region, because
+        // `AddressSpace::rebase` identifies a mapping by that `Arc`.
+        //
+        // Derived from [`WINDOWS`] rather than written out again, so the table
+        // the machine layer reads and the regions it gets cannot drift. A
+        // register index *is* its offset from `$4000`, which is what makes the
+        // one table enough.
+        let windows = core::array::from_fn(|i| {
+            let w = &WINDOWS[i];
+            Arc::new(MmioRegion::io(
+                w.region_name,
+                w.len,
+                Arc::new(ApuPort {
+                    state: Arc::clone(&state),
+                    first: w.offset as u8,
+                }) as Arc<dyn MemOps>,
+            ))
+        });
+        Ok(Apu { state, windows })
     }
 
     /// Which console variant this APU is timed for.
-    pub fn timing(&self) -> Timing {
-        self.state.timing
+    ///
+    /// Named `tv_region` rather than `region` because [`Device::region`] is the
+    /// MMIO aperture lookup and the two would shadow each other on the concrete
+    /// type.
+    pub fn tv_region(&self) -> Region {
+        self.state.region
     }
 
     // -- Wiring -------------------------------------------------------------
@@ -670,25 +707,57 @@ impl Apu {
     /// and `$4016` (the controller port) sit inside that range and belong to
     /// other devices. Mapping three exact windows means a machine description
     /// cannot accidentally give the APU an address it does not decode.
-    pub fn regions(&self) -> Vec<(u64, Region)> {
-        alloc::vec![
-            (
-                0x00,
-                Region::io("apu.channels", 0x14, self.port(reg::PULSE1_CTRL)),
-            ),
-            (0x15, Region::io("apu.status", 1, self.port(reg::STATUS))),
-            (0x17, Region::io("apu.frame", 1, self.port(reg::FRAME))),
-        ]
-    }
-
-    /// A [`MemOps`] view whose offset 0 is register `first`.
-    fn port(&self, first: u8) -> Arc<dyn MemOps> {
-        Arc::new(ApuPort {
-            state: Arc::clone(&self.state),
-            first,
-        })
+    pub fn regions(&self) -> Vec<(u64, RegionRef)> {
+        WINDOWS
+            .iter()
+            .zip(self.windows.iter())
+            .map(|(w, region)| (w.offset, Arc::clone(region)))
+            .collect()
     }
 }
+
+/// One of the APU's three memory-mapped windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Window {
+    /// The name a `map` statement reaches it by.
+    pub name: &'static str,
+    /// The name the region carries, for diagnostics and `info mtree`.
+    pub region_name: &'static str,
+    /// Its offset from `$4000`, which is also the index of its first register.
+    pub offset: u64,
+    /// Its length in bytes.
+    pub len: u64,
+}
+
+/// Every window [`Device::region`] answers to, in address order.
+///
+/// `$4014` and `$4016` are the two holes: OAM DMA belongs to the PPU's side of
+/// the CPU and the controller port to its own device, so the APU decodes
+/// neither and a machine file naming an address it does not own gets an error
+/// rather than a silent capture.
+pub static WINDOWS: &[Window; 3] = &[
+    Window {
+        name: "channels",
+        region_name: "nes.apu.channels",
+        offset: reg::PULSE1_CTRL as u64,
+        len: 0x14,
+    },
+    Window {
+        name: "status",
+        region_name: "nes.apu.status",
+        offset: reg::STATUS as u64,
+        len: 1,
+    },
+    Window {
+        name: "frame",
+        region_name: "nes.apu.frame",
+        offset: reg::FRAME as u64,
+        len: 1,
+    },
+];
+
+/// The name of the IRQ output pin.
+pub const IRQ_PIN: &str = "irq";
 
 /// One memory-mapped window onto an [`Apu`].
 struct ApuPort {
@@ -764,9 +833,9 @@ impl Device for Apu {
     fn reset(&self, kind: ResetKind) {
         {
             let mut core = self.state.core.lock();
-            let timing = self.state.timing;
+            let region = self.state.region;
             let halt = self.state.halt_ultrasonic;
-            core.reset(kind, timing, halt);
+            core.reset(kind, region, halt);
         }
         self.refresh_irq();
     }
@@ -780,15 +849,58 @@ impl Device for Apu {
         self.refresh_irq();
         Ok(())
     }
+
+    // -- the connection surface (`ROADMAP.md` §4.4) --------------------------
+
+    /// One of the three windows in [`WINDOWS`], by name.
+    ///
+    /// The empty name gets nothing on purpose: the APU has no single aperture
+    /// to be "the" region, and quietly handing back the channel block would
+    /// leave `$4015` and `$4017` unmapped in a machine that looked complete.
+    fn region(&self, name: &str) -> Option<RegionRef> {
+        let index = WINDOWS.iter().position(|w| w.name == name)?;
+        Some(Arc::clone(&self.windows[index]))
+    }
+
+    /// The IRQ output.
+    ///
+    /// One pin for two flags — the frame interrupt and the DMC interrupt —
+    /// because on the chip they really are one output. Fan-in with a
+    /// cartridge's IRQ is the net's job, which is what
+    /// [`WireSink::set_level`](crate::core::wire::WireSink::set_level)'s source
+    /// id exists for (`ROADMAP.md` §4.3).
+    ///
+    /// The APU drives no other pin and receives none, so [`Device::sink`] keeps
+    /// its default: nothing on a NES drives an input of the 2A03's audio half.
+    fn connect(&self, port: &str, source: WireSource) -> Result<()> {
+        if port != IRQ_PIN {
+            return Err(Error::Config {
+                at: alloc::string::String::from(port),
+                message: alloc::format!("the APU drives only `{IRQ_PIN}`"),
+            });
+        }
+        self.connect_irq(source);
+        Ok(())
+    }
+
+    /// Announce what the IRQ line idles at, for the realize sweep (§4.3).
+    ///
+    /// It idles low out of reset, but a machine restored from a snapshot with
+    /// the frame interrupt flag set comes up asserting.
+    fn announce(&self, port: &str) {
+        if port == IRQ_PIN {
+            self.refresh_irq();
+        }
+    }
 }
 
 /// The properties [`APU_CLASS`] accepts.
 static APU_PROPERTIES: &[PropertySpec] = &[
     PropertySpec {
-        name: "timing",
+        name: "region",
         kind: ValueKind::Str,
         required: false,
-        summary: "console variant: `ntsc` (RP2A03) or `pal` (RP2A07)",
+        summary: "console variant: `ntsc` (RP2A03), `pal` (RP2A07) or `dendy` (UA6527P)",
     },
     PropertySpec {
         name: "sample-buffer",
@@ -814,7 +926,7 @@ static APU_PROPERTIES: &[PropertySpec] = &[
 pub static APU_CLASS: DeviceClass = DeviceClass {
     name: "nes.apu",
     version: 1,
-    summary: "NES APU (RP2A03 audio): two pulse, triangle, noise and DMC channels",
+    summary: "NES APU (RP2A03 / RP2A07 / UA6527P audio): two pulse, triangle, noise, DMC",
     properties: APU_PROPERTIES,
     construct: |props| Ok(Box::new(Apu::new(props)?) as Box<dyn Device>),
 };
