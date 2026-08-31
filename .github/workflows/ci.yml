@@ -111,13 +111,19 @@ jobs:
           echo "sweeping: $feats"
           for f in $feats; do
             echo "::group::$f"
-            # --all-targets, not a plain build: a *test* that reaches for a
-            # sibling feature's module -- or for `std` under a feature that
-            # does not imply it -- compiles fine under --all-features and
-            # breaks for the first user who picks a narrow set. Five features
-            # were in exactly that state when this check was added, and a
-            # library-only sweep had reported all of them green.
-            cargo check --all-targets --no-default-features --features "$f"
+            # `cargo test`, not `check`: three bugs shipped past a
+            # compile-only sweep in one day. `machine-nes` did not imply
+            # `dev-nes-ppu`, and `machine-pc-at` and `machine-gameboy` had
+            # media fixtures gated on `std` as well as their own feature --
+            # every one of them compiles under every feature set and dies at
+            # realize. A sweep that only compiles cannot see that; running the
+            # feature's own tests can.
+            #
+            # This became possible only once narrow-feature runs were
+            # deterministic: the `single` backend's locks were racy under
+            # libtest's threads, so this job would have been a flake
+            # generator. See `core::sync`'s `single` module.
+            cargo test --no-default-features --features "$f"
             echo "::endgroup::"
           done
 
