@@ -177,6 +177,20 @@ dev-riscv = []
 # on the terminal. Adds no dependencies.
 machine-riscv-virt = ["cpu-riscv", "dev-riscv"]
 
+# The ARMv7E-M core (src/cpu/arm/v7m): a Cortex-M4/M7-class interpreter —
+# the whole T32 instruction set in both encoding widths, `IT` blocks, the DSP
+# (E) extension (SIMD add/sub, saturating arithmetic, the half-word and dual
+# multiplies), Handler/Thread modes with MSP and PSP, automatic register
+# stacking with EXC_RETURN and tail-chaining, the HardFault/MemManage/BusFault/
+# UsageFault taxonomy with its status registers, and the memory-mapped NVIC,
+# SysTick, SCB and MPU at 0xE000E000. No A32 decoder: this architecture has no
+# ARM state, so a Cortex-M build links none. The FPv4-SP/FPv5 floating-point
+# unit is *not* implemented; CPACR reads zero so a coprocessor access raises a
+# NOCP UsageFault, as it would on a part without the option. Independent of
+# `cpu-arm-aprofile` — the two share the `arm` family module and nothing else.
+# Adds no dependencies and is `no_std + alloc`.
+cpu-arm-v7m = []
+
 # The Zilog Z80 core (src/cpu/z80): a cycle-accurate interpreter covering the
 # base, CB, ED, DD/FD and DDCB/FDCB pages, the undocumented IX/IY halves, SLL
 # and the DDCB register copies, the MEMPTR (WZ) latch and flag bits 3 and 5,

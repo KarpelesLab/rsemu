@@ -47,3 +47,7 @@
 #[cfg(feature = "cpu-arm-aprofile")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-aprofile")))]
 pub mod aprofile;
+
+#[cfg(feature = "cpu-arm-v7m")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v7m")))]
+pub mod v7m;
