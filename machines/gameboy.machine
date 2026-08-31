@@ -1,0 +1,180 @@
+# The Nintendo Game Boy (DMG, 1989).
+#
+#   rsemu run gameboy --cart tetris.gb
+#
+# Phase 4's genericity proof (ROADMAP.md §13). Nothing in this file needed a new
+# core mechanism: it is the same address spaces, the same oscillator forest, the
+# same wire graph and the same lazily-advanced devices the NES is built from,
+# pointed at a machine that is not shaped like a NES at all. Where the Game Boy
+# asks for something the NES never did, the note is beside the line.
+#
+# Sources: Pan Docs (https://gbdev.io/pandocs/, CC0) throughout — "Memory Map",
+# "Interrupts", "Timer and Divider Registers", "Audio Details" — plus Gekkio's
+# "Game Boy: Complete Technical Reference" for sub-instruction timing.
+# docs/platforms/game-boy.md has the long form and the citations.
+
+machine "gameboy" {
+  # 4.194304 MHz — and it is exactly 2^22.
+  #
+  # This is worth a paragraph precisely because it is the *exception*. The NES's
+  # master is 236250000/11 Hz and the Apple 1's crystal is 315/22 MHz; neither is
+  # an integer number of hertz, and writing a rounded decimal into either file
+  # would nail a rounding error into the timeline (ROADMAP.md §4.2). Here the
+  # frequency is an exact power of two, so the rational literal buys nothing —
+  # which is the whole point of showing it. The syntax is not ceremony that the
+  # NES happens to need; it is a general rule that this machine satisfies
+  # trivially, and a design decision only defends itself when the case against it
+  # is written down beside the case for it.
+  #
+  # Every domain below descends from this one crystal by an integer divisor, so
+  # every ratio in the console is exact by construction: the CPU advances one
+  # machine cycle per four dots, forever, with no drift and no residual.
+  osc master = 4194304 Hz
+
+  # The *second* crystal, and the reason this machine has a forest rather than a
+  # tree. An MBC3 cartridge with a real-time clock carries its own 32.768 kHz
+  # watch can, soldered next to the mapper, with no relationship whatever to the
+  # console's. ROADMAP.md §4.2 is explicit that across independent oscillators
+  # exactness is not merely expensive but meaningless — two crystals have
+  # independent tolerances and an arbitrary power-on phase — so this is declared
+  # as what it is rather than folded into `master` at some invented ratio.
+  #
+  # Cartridges without an RTC still take this clock. A cartridge that reported
+  # "no clock needed" for some images and "clock required" for others would make
+  # this line conditional on the file the user passes, which is a worse machine
+  # description than one dead counter.
+  osc rtc = 32768 Hz
+
+  # Whether the sound unit keeps output frames for a host audio sink to drain.
+  # `-p audio=true` when something is listening.
+  param audio = false
+
+  # The SM83 drives sixteen address lines and there is exactly one bus: no
+  # separate I/O space (that is the Z80, and the SM83 is not one), no second
+  # space for the LCD controller. Anything nobody answers reads as $FF, because
+  # the data bus is pulled up — and programs depend on that, which is why the
+  # policy is stated rather than left to fault.
+  space cpubus { width = 16, unassigned = read-as-ones }
+
+  # 8 KiB of work RAM on the console's board.
+  object wram "ram" { size = 8K }
+
+  # 127 bytes of "high RAM" inside the CPU package. Programs put their OAM DMA
+  # routine here because it is the only memory the CPU can reach while a transfer
+  # is running.
+  object hram "ram" { size = 127 }
+
+  object cpu "cpu.sm83" {
+    # Master / 4 is the machine cycle: this core's clock domain counts M-cycles,
+    # so one tick here is four dots of the LCD's, exactly.
+    clock  = master / 4
+    space  = cpubus
+    engine = "interp"
+    # rsemu ships no boot ROM — the DMG's is 256 bytes of Nintendo's copyrighted
+    # code and vendoring it is not ours to do (ROADMAP.md §1). So the core starts
+    # at $0100 with the register file the boot ROM would have left behind. A
+    # machine that maps a real boot image at $0000 sets this false.
+    post-boot = true
+  }
+
+  # The LCD controller. `clock = master` because it counts dots, one per crystal
+  # period — and `space = cpubus` because an OAM DMA is a *bus master*: it reads
+  # 160 bytes through the CPU's own address space. A device that could only
+  # respond could not model $FF46 at all (ROADMAP.md §4.4).
+  object ppu "gb.ppu" { clock = master, space = cpubus }
+
+  # The divider and timer. One 16-bit counter at the crystal rate, of which DIV
+  # is the top byte; TIMA is clocked by a falling edge *inside* it, which is
+  # where every one of the divider's documented side effects comes from.
+  object timer "gb.timer" { clock = master }
+
+  # Four sound channels. Its frame sequencer is not its own: see the wire below.
+  object apu "gb.apu" { clock = master, record = audio }
+
+  object pad "gb.joypad" {}
+
+  # The link port. With nothing on the other end the byte shifted in is $FF —
+  # and the byte shifted *out* is how blargg's test ROMs report their results,
+  # which is what makes a headless conformance run possible without a screen.
+  object link "gb.serial" { clock = master }
+
+  # The cartridge. `rom` names a media slot rather than a file: the machine
+  # description says which slot, and whoever runs the machine binds the bytes
+  # (`--cart tetris.gb`). Nothing below host/ opens a file.
+  object cart "gb.cart" { clock = rtc, rom = "cart" }
+
+  # -- the memory map --------------------------------------------------------
+  # Pan Docs, "Memory Map". Note how much of it belongs to devices rather than to
+  # RAM the file supplies: video RAM and object memory are inside the LCD
+  # controller because whether they answer at all depends on which mode it is in,
+  # and IF and IE are inside the CPU because they are part of the processor.
+  map cpubus 0x0000 size 0x8000 = cart.rom     # ROM bank 0 and the switchable one
+  map cpubus 0x8000 size 0x2000 = ppu.vram     # video RAM — blocked during mode 3
+  map cpubus 0xa000 size 0x2000 = cart.ram     # cartridge RAM, or the MBC3 clock
+  map cpubus 0xc000 size 0x2000 = wram
+  # Echo RAM: the console decodes only fifteen bits here, so $E000-$FDFF is the
+  # same 7.5 KiB again. Nintendo's manuals say not to use it; software does.
+  map cpubus 0xe000 size 0x1e00 = alias(wram)
+  map cpubus 0xfe00 size 0x00a0 = ppu.oam      # 40 objects of four bytes
+  map cpubus 0xff00 size 0x0001 = pad
+  map cpubus 0xff01 size 0x0002 = link
+  map cpubus 0xff04 size 0x0004 = timer        # DIV, TIMA, TMA, TAC
+  map cpubus 0xff0f size 0x0001 = cpu.if       # the interrupt flags are the CPU's
+  map cpubus 0xff10 size 0x0030 = apu          # $FF10-$FF3F, wave RAM included
+  map cpubus 0xff40 size 0x000c = ppu.regs     # $FF40-$FF4B, OAM DMA included
+  map cpubus 0xff80 size 0x007f = hram
+  map cpubus 0xffff size 0x0001 = cpu.ie       # and so is the interrupt enable
+
+  # -- interrupts ------------------------------------------------------------
+  # Five sources, five pins, and every one of them is driven **high when
+  # requested** rather than low: nets idle low, and inverting an active-low
+  # signal is a `wire.not` device's job (ROADMAP.md §4.3).
+  #
+  # The CPU's pins are edge-triggered, and that is not a detail. The LCD's STAT
+  # output is a *level* — the OR of up to four enabled conditions — so a second
+  # condition becoming true while the first still holds produces no second
+  # interrupt. Emulators call that "STAT blocking" and implement it on purpose;
+  # here it is simply what an edge detector on a level does.
+  wire ppu.vblank -> cpu.vblank
+  wire ppu.stat   -> cpu.stat
+  wire timer.irq  -> cpu.timer
+  wire link.irq   -> cpu.serial
+  wire pad.irq    -> cpu.joypad
+
+  # The line that makes writing $FF04 audible.
+  #
+  # The sound unit's 512 Hz frame sequencer — which steps every length counter,
+  # every volume envelope and channel 1's frequency sweep — is clocked off bit 12
+  # of the divider's internal counter, and any write to DIV resets that counter
+  # to zero. So a program that pokes $FF04 in a loop can stall every envelope in
+  # the machine. On the die the two blocks share a wire; here they share a wire.
+  # Nothing in core/ had to learn what a Game Boy is for that to work, which is
+  # the phase-4 claim in one line.
+  wire timer.div-apu -> apu.div-apu
+
+  # -- not here, and deliberately --------------------------------------------
+  #
+  # The boot ROM and its $FF50 disable latch: see `post-boot` above.
+  #
+  # The Game Boy Color's double-speed mode, its second VRAM bank, its palette
+  # RAM and its HDMA. A CGB is a different machine and would be a different file,
+  # for the same reason nes-pal is not a parameter of nes-ntsc: the region
+  # changes the oscillator topology, and §4.2 makes that part of the machine's
+  # identity rather than a flag.
+  #
+  # The Super Game Boy's border and colour commands, which ride on the joypad
+  # register.
+  #
+  # A link cable. `gb.serial` accepts `link = "none"` and there is nothing else
+  # to accept yet; a second console on the other end needs a second machine and
+  # a way to relate their clocks, which is a §4.2 conversation rather than a
+  # device.
+  #
+  # TODO(space): the cartridge decodes $0000-$7FFF in software rather than
+  # through a rebasable alias, because reads there go to ROM and writes go to the
+  # mapper's registers, and one region cannot answer both ways. That costs the
+  # host-pointer fast path on every opcode fetch. The generic fix is a region
+  # kind whose writes reach a handler while its reads stay direct — a
+  # `core::space` change, and phase 4 is explicitly not the place to make one.
+  # See the head of src/dev/gb/cart.rs.
+}

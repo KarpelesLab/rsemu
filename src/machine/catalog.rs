@@ -133,6 +133,19 @@ pub static RISCV_VIRT: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/riscv-virt.machine"),
 };
 
+/// The Game Boy, when this build has an SM83 and the console's chips.
+///
+/// Phase 4's genericity proof (`ROADMAP.md` §13): a machine that is not
+/// NES-shaped, realized by the same core.
+#[cfg(feature = "machine-gameboy")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-gameboy")))]
+pub static GAMEBOY: CatalogEntry = CatalogEntry {
+    name: "gameboy",
+    summary: "Nintendo Game Boy (DMG, 1989): SM83 at 4.194304 MHz, 160x144 LCD",
+    media: &["cart"],
+    source: include_str!("../../machines/gameboy.machine"),
+};
+
 /// Every machine this build can realize, in catalog order.
 // One `#[cfg]`-gated push per shipped machine, which is what the lint is
 // complaining about: a `vec![]` literal cannot carry an attribute on one of its
@@ -146,6 +159,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&APPLE1);
     #[cfg(feature = "machine-beneater")]
     out.push(&BENEATER_6502);
+    #[cfg(feature = "machine-gameboy")]
+    out.push(&GAMEBOY);
     #[cfg(feature = "machine-nes")]
     out.push(&NES_NTSC);
     #[cfg(feature = "machine-nes")]
@@ -174,6 +189,10 @@ pub fn registry() -> Result<Registry> {
     builtin::register(&mut reg)?;
     #[cfg(feature = "cpu-mos6502")]
     crate::cpu::mos6502::register(&mut reg)?;
+    #[cfg(feature = "cpu-sm83")]
+    crate::cpu::sm83::register(&mut reg)?;
+    #[cfg(feature = "dev-gb")]
+    crate::dev::gb::register(&mut reg)?;
     #[cfg(feature = "dev-nes-cart")]
     crate::dev::cart::nrom::register(&mut reg)?;
     #[cfg(feature = "dev-nes-io")]
@@ -231,6 +250,10 @@ pub fn bindings() -> Result<Bindings> {
     builtin::bind(&mut b)?;
     #[cfg(feature = "cpu-mos6502")]
     crate::cpu::mos6502::bind(&mut b)?;
+    #[cfg(feature = "cpu-sm83")]
+    crate::cpu::sm83::bind(&mut b)?;
+    #[cfg(feature = "dev-gb")]
+    crate::dev::gb::bind(&mut b)?;
     #[cfg(feature = "dev-nes-cart")]
     crate::dev::cart::nrom::bind(&mut b)?;
     #[cfg(feature = "dev-nes-io")]
@@ -261,6 +284,12 @@ pub fn classes() -> ClassTable {
     }
     #[cfg(feature = "cpu-mos6502")]
     table.insert(crate::cpu::mos6502::schema());
+    #[cfg(feature = "cpu-sm83")]
+    table.insert(crate::cpu::sm83::schema());
+    #[cfg(feature = "dev-gb")]
+    for schema in crate::dev::gb::schemas() {
+        table.insert(schema);
+    }
     #[cfg(feature = "dev-nes-cart")]
     table.insert(crate::dev::cart::nrom::schema());
     #[cfg(feature = "dev-nes-io")]
@@ -390,10 +419,10 @@ mod tests {
 
     #[test]
     fn an_unknown_machine_lists_what_there_is() {
-        let e = build_catalog("gameboy", &[])
-            .expect_err("no gameboy")
+        let e = build_catalog("megadrive", &[])
+            .expect_err("no megadrive")
             .to_string();
-        assert!(e.contains("gameboy"), "{e}");
+        assert!(e.contains("megadrive"), "{e}");
     }
 
     /// The CPU's architectural state, read back out of a snapshot.
@@ -880,6 +909,10 @@ mod tests {
     /// realized without a corpus.
     fn fixture(machine: &str, slot: &str) -> &'static [u8] {
         match (machine, slot) {
+            // Two machines take a slot called `cart` and they are not the same
+            // kind of cartridge at all, which is why this is keyed by both.
+            #[cfg(feature = "machine-gameboy")]
+            ("gameboy", "cart") => minimal_gb(),
             (_, "cart") => MINIMAL_NROM,
             // Each board's default monitor: rsemu's own, committed precisely so
             // that this needs no download and no licence question. The two are
@@ -897,6 +930,18 @@ mod tests {
             ("riscv-virt", "firmware") => &[0x73, 0x00, 0x50, 0x10, 0x6f, 0xf0, 0xdf, 0xff],
             (m, other) => panic!("no fixture for `{m}`'s media slot `{other}`"),
         }
+    }
+
+    /// The smallest legal Game Boy image: two 16 KiB banks, a correct header
+    /// checksum, and a one-instruction program (`JR -2`, the smallest program
+    /// that neither ends nor wanders). Generated, never vendored.
+    #[cfg(feature = "machine-gameboy")]
+    fn minimal_gb() -> &'static [u8] {
+        // A `OnceLock` rather than a `static` array because the header checksum
+        // is computed over the image, and the generator is where that lives.
+        use std::sync::OnceLock;
+        static IMAGE: OnceLock<Vec<u8>> = OnceLock::new();
+        IMAGE.get_or_init(|| crate::dev::gb::cart::synthetic_image(2, 0x00, 0x00, &[0x18, 0xfe]))
     }
 
     /// The smallest legal NROM image: an iNES header, 16 KiB of PRG, 8 KiB of
