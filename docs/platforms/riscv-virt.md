@@ -88,9 +88,9 @@ initcall, the driver model, and the console handover off the SBI earlycon onto
 this board's own 16550A —
 
 ```
-[  115.186028] 10000000.serial: ttyS0 at MMIO 0x10000000 (irq = 12, base_baud = 115200) is a 16550A
-[  115.192028] printk: legacy console [ttyS0] enabled
-[  115.197028] printk: legacy bootconsole [sbi0] disabled
+[  110.961106] 10000000.serial: ttyS0 at MMIO 0x10000000 (irq = 12, base_baud = 115200) is a 16550A
+[  110.969106] printk: legacy console [ttyS0] enabled
+[  110.975106] printk: legacy bootconsole [sbi0] disabled
 ```
 
 — and then panics in `prepare_namespace` because nothing supplied a root
@@ -101,10 +101,11 @@ rootfs is the next step, and it is a fixture problem rather than a machine one.
 
 Two observations from that run that are ours, not the kernel's:
 
-- `jitterentropy` trips the 23-second soft-lockup watchdog during
-  `jent_entropy_init`. Virtual time here is derived from bus accesses, and
-  jitterentropy's calibration loop makes a great many of them; the kernel warns
-  and carries on.
+- `jitterentropy` trips the soft-lockup watchdog during `jent_entropy_init`
+  (`BUG: soft lockup - CPU#0 stuck for 22s!`, and again at 44s). Virtual time
+  here is derived from bus accesses, and jitterentropy's calibration loop makes
+  a great many of them; the kernel warns, taints itself `[L]=SOFTLOCKUP`, and
+  carries on.
 - Time is virtual throughout, so the timestamps above measure emulated seconds,
   not patience.
 
