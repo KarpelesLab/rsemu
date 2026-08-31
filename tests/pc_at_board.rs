@@ -518,6 +518,59 @@ fn the_board_snapshots_and_restores_to_an_identical_state_hash() {
     m.run_for(rsemu::core::clock::GlobalTime::from_nanos(500_000))
         .expect("the machine runs");
     assert_round_trips(&m, "after the speaker gate has been lowered again");
+
+    // And across a reset of a board that was *running*, which is the case a
+    // test that resets a fresh board and then drives it structurally cannot
+    // reach. A cold reset out of the box finds every shared level already at
+    // its idle, so a chip that invents one for an input pin invents the right
+    // answer by luck; a reset taken while the timer's outputs are mid-waveform
+    // does not have that luck. This is the reset firmware itself takes on its
+    // way out of protected mode.
+    outb(&m, 0x43, 0x34);
+    outb(&m, 0x40, 100);
+    outb(&m, 0x40, 0);
+    outb(&m, 0x43, 0x74);
+    outb(&m, 0x41, 18);
+    outb(&m, 0x41, 0);
+    outb(&m, 0x61, 0x01);
+    m.run_for(rsemu::core::clock::GlobalTime::from_nanos(500_000))
+        .expect("the machine runs");
+    m.reset(ResetKind::Warm);
+    assert_round_trips(&m, "after a warm reset of a board that was running");
+    m.run_for(rsemu::core::clock::GlobalTime::from_nanos(500_000))
+        .expect("the machine runs");
+    assert_round_trips(&m, "and after it has run on from that reset");
+}
+
+#[test]
+fn what_the_guest_wrote_into_the_text_page_survives_a_snapshot() {
+    // Asserted by content, from the guest's side of the bus, because a chunk
+    // diff structurally cannot see this one: a device that forgets to
+    // serialize something is invisible to a comparison of what it *did*
+    // serialize, and the state hash agrees with itself for the same reason.
+    // The adapter's 32 KiB character buffer is its own store rather than a
+    // `ram` instance, and `Machine::save` walks devices, not regions — so
+    // nothing but the adapter was ever going to write it.
+    let (mut m, _cpu) = board();
+    m.reset(ResetKind::Cold);
+    m.sweep();
+    write_text(&m, 3, 7, "rsemu pc-at", 0x0f);
+    assert_eq!(peek(&m, 0x000b_8000 + (3 * 80 + 7) * 2), u64::from(b'r'));
+
+    let image = m.save().expect("the board saves");
+    let (mut other, _) = board();
+    other.reset(ResetKind::Cold);
+    other.load(&image).expect("the board loads");
+
+    for (i, byte) in b"rsemu pc-at".iter().enumerate() {
+        let at = 0x000b_8000 + ((3 * 80 + 7) as u64 + i as u64) * 2;
+        assert_eq!(
+            peek(&other, at),
+            u64::from(*byte),
+            "the text page did not survive the snapshot, at cell {i}"
+        );
+        assert_eq!(peek(&other, at + 1), 0x0f, "nor did the attribute byte");
+    }
 }
 
 #[test]

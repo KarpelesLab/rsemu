@@ -97,7 +97,14 @@ use crate::machine::validate::ClassSchema;
 pub const CLASS_NAME: &str = "pc.video";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+///
+/// v2 added the character buffer. v1 chunks left it out on the belief that the
+/// machine snapshots RAM regions by itself; it does not — [`Machine::save`]
+/// walks *devices*, and this adapter's `vram` is its own store rather than a
+/// `ram` instance, so 32 KiB of guest-writable memory went missing on restore.
+///
+/// [`Machine::save`]: crate::machine::Machine::save
+const STATE_VERSION: u32 = 2;
 
 /// The CRTC's address and data registers: two bytes.
 pub const CRTC_WINDOW_LEN: u64 = 2;
@@ -129,6 +136,10 @@ const GC_REGISTERS: usize = 9;
 
 /// The width of the DAC's index, and so how many colours it holds.
 const DAC_ENTRIES: usize = 256;
+
+/// Components per DAC entry: red, green, blue, read and written in that order
+/// through the single data port at 0x3c9.
+const DAC_COMPONENTS: usize = 3;
 
 /// The sentinel [`Shared::next_event`] holds when there is nothing pending.
 const NO_EVENT: u64 = u64::MAX;
@@ -1708,6 +1719,17 @@ pub struct Video {
     vram: RegionRef,
 }
 
+/// The whole of a store, as bytes a chunk can carry.
+fn read_store(store: &RamStore) -> Result<alloc::vec::Vec<u8>> {
+    let len = usize::try_from(store.len())
+        .map_err(|_| Error::State(String::from("RAM larger than the host address space")))?;
+    let mut buf = alloc::vec![0u8; len];
+    store
+        .read_at(0, &mut buf)
+        .map_err(|e| Error::State(alloc::format!("cannot read the character buffer: {e}")))?;
+    Ok(buf)
+}
+
 impl Video {
     /// Validate `props` and build the device.
     ///
@@ -1945,10 +1967,19 @@ impl Device for Video {
                 w.write_u8(component)?;
             }
         }
+        // The character buffer. This *is* architectural state and it has to be
+        // here: `Machine::save` walks devices, not regions, so the only RAM a
+        // machine snapshots by itself is a `ram` device instance. This adapter's
+        // `vram` is its own store, mapped from `region("vram")`, so nothing else
+        // in the tree was ever going to write it — 32 KiB of guest-writable and
+        // guest-*readable* memory (BIOS scroll routines read the text page back)
+        // came out of a restore as zeroes, and neither a chunk diff nor a state
+        // hash could see it, because it was absent from both sides.
+        //
+        // The rendered pixels stay out: those are derived from this buffer on
+        // every capture.
+        w.write_bytes(&read_store(&self.shared.vram)?)?;
         Ok(())
-        // The character buffer is **not** here: it is a RAM region, and the
-        // machine snapshots those itself (`ROADMAP.md` §4.5). Nor are the
-        // rendered pixels, which are derived from it every capture.
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -1984,16 +2015,42 @@ impl Device for Video {
         state.vga.dac_write_sub = r.read_u8()?;
         state.vga.dac_reading = r.read_bool()?;
         for i in 0..DAC_ENTRIES {
-            for c in 0..3 {
+            for c in 0..DAC_COMPONENTS {
                 state.vga.dac[i][c] = r.read_u8()?;
             }
         }
+        let vram = r.read_bytes()?;
+        if vram.len() as u64 != VRAM_LEN {
+            return Err(Error::State(alloc::format!(
+                "snapshot has {} byte(s) of character buffer, this adapter has {VRAM_LEN}",
+                vram.len()
+            )));
+        }
+        self.shared.vram.write_at(0, vram).map_err(|e| {
+            Error::State(alloc::format!("cannot restore the character buffer: {e}"))
+        })?;
         if state.frame_start > state.ticks {
             return Err(Error::State(alloc::format!(
                 "snapshot has a frame beginning at {} after the current tick {}",
                 state.frame_start,
                 state.ticks
             )));
+        }
+        // Both sub-indices select one of three DAC components and are used as
+        // an array index unchecked on the 0x3c9 path, so a snapshot is the one
+        // place they can arrive out of range. §4.5 asks for a diagnosis rather
+        // than a crash, and every peer in this directory range-checks the
+        // indices it restores.
+        for (what, sub) in [
+            ("read", state.vga.dac_read_sub),
+            ("write", state.vga.dac_write_sub),
+        ] {
+            if usize::from(sub) >= DAC_COMPONENTS {
+                return Err(Error::State(alloc::format!(
+                    "snapshot has the DAC {what} sub-index at {sub}, past the \
+                     {DAC_COMPONENTS} components of an entry"
+                )));
+            }
         }
         let level = {
             let mut current = self.shared.state.lock();
@@ -2673,6 +2730,13 @@ mod tests {
         poke(&saved, Window::Vga, 0x9, 0x22);
         poke(&saved, Window::Vga, 0xe, 4);
         poke(&saved, Window::Vga, 0xf, 0x0f);
+        // The character buffer is architectural state too, and it is the one
+        // piece of it a byte-identical comparison of two save images cannot
+        // catch on its own: state that is in neither image agrees with itself.
+        // So it is written here and read back below.
+        saved.vram().write_u8(0, b'r').unwrap();
+        saved.vram().write_u8(1, 0x0f).unwrap();
+        saved.vram().write_u8(VRAM_LEN - 1, 0xa5).unwrap();
         saved.advance_to(123_456);
 
         let image = |video: &Video| {
@@ -2698,6 +2762,50 @@ mod tests {
         assert_eq!(restored.ticks(), 123_456);
         assert_eq!(restored.frames(), saved.frames());
         assert_eq!(restored.status(), saved.status());
+        assert_eq!(restored.vram().read_u8(0).unwrap(), b'r');
+        assert_eq!(restored.vram().read_u8(1).unwrap(), 0x0f);
+        assert_eq!(restored.vram().read_u8(VRAM_LEN - 1).unwrap(), 0xa5);
+    }
+
+    #[test]
+    fn a_dac_sub_index_out_of_range_is_diagnosed_rather_than_panicked() {
+        // The two sub-indices select one of three components and are used as an
+        // array index unchecked on the 0x3c9 path, so a snapshot is the one
+        // place they can arrive out of range (§4.5: a diagnosis, not a crash).
+        let image = |video: &Video| {
+            let mut shape = MachineShape::new();
+            shape.add_device("vga", CLASS.name).unwrap();
+            let mut w = StateWriter::new(shape);
+            {
+                let mut chunk = w.chunk("vga", CLASS.name, CLASS.version).unwrap();
+                video.save(&mut chunk).unwrap();
+            }
+            w.to_vec().unwrap()
+        };
+
+        // Locate `dac_write_sub` without hard-coding an offset that the next
+        // field added to this chunk would silently invalidate: it is the first
+        // byte that moves when one DAC component is written.
+        let plain = image(&device());
+        let stepped = device();
+        poke(&stepped, Window::Vga, 0x9, 0x2a);
+        let at = plain
+            .iter()
+            .zip(image(&stepped).iter())
+            .position(|(a, b)| a != b)
+            .expect("writing a component moves the sub-index");
+
+        let mut bytes = plain;
+        bytes[at] = 7;
+        let restored = device();
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("vga", CLASS.name, CLASS.version, &Migrations::new())
+            .unwrap();
+        assert!(
+            restored.load(&mut chunk.reader()).is_err(),
+            "a DAC sub-index of 7 was accepted, and indexes an array of {DAC_COMPONENTS}"
+        );
     }
 
     #[test]
