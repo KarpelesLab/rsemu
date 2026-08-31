@@ -1,26 +1,49 @@
 #!/usr/bin/env node
-// Verify the module the page loads, without a browser.
+// Verify the module the page loads, and the site that loads it, without a
+// browser.
 //
-//   node web/check.mjs [path/to/rsemu.wasm] [path/to/cartridge.nes]
+//   node web/check.mjs [path/to/rsemu.wasm] [path/to/cartridge.nes] [--site DIR]
 //
-// Two things a browser would find out the hard way, and one it cannot:
+// Three things a browser would find out the hard way, and one it cannot:
 //
-//   1. the module exports every symbol `rsemu.js` calls, and imports nothing —
-//      a module that loads but is missing a function fails silently at the
+//   1. the module exports every symbol the glue calls, and imports nothing — a
+//      module that loads but is missing a function fails silently at the
 //      moment somebody clicks Boot;
-//   2. the ABI works: boot a machine, run frames, take a save state, put it
+//   2. the *built* site still asks for exactly those symbols, still fetches
+//      ./rsemu.wasm, and references only assets that exist and only by
+//      relative path — the site is published at /rsemu/ and served from / in
+//      development, and an absolute asset URL is a 404 in one of the two;
+//   3. the ABI works: boot a machine, run frames, take a save state, put it
 //      back, read the console;
-//   3. and the *picture* is a picture — the framebuffer is checked for more
+//   4. and the *picture* is a picture — the framebuffer is checked for more
 //      than one distinct colour, which no export list can tell you.
 //
-// It is deliberately runnable under node or deno, so CI can gate on it the way
-// it already gates on the export section.
+// Check 2 replaces the element-id cross-reference this file used to do against
+// the hand-written index.html. Single-file components have no stable element
+// ids to cross-reference, but the thing that check was really protecting — the
+// page and the module drifting apart without anyone noticing — is protected
+// better by reading the built bundle, because that is the artifact that ships.
+//
+// It is deliberately runnable under node or deno, with no dependencies, so CI
+// can gate on it the way it already gates on the export section.
 
-import { readFileSync } from "node:fs";
-import { Rsemu } from "./rsemu.js";
+import { readFileSync, existsSync, statSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join, resolve } from "node:path";
+import { Rsemu } from "./src/rsemu.js";
 
-const wasmPath = process.argv[2] ?? "target/wasm32-unknown-unknown/release/rsemu.wasm";
-const romPath = process.argv[3] ?? process.env.RSEMU_NES_TEST_ROM ?? null;
+const here = dirname(fileURLToPath(import.meta.url));
+
+const argv = process.argv.slice(2);
+const siteFlag = argv.indexOf("--site");
+const siteArg = siteFlag >= 0 ? argv.splice(siteFlag, 2)[1] : null;
+const positional = argv.filter((a) => !a.startsWith("--"));
+
+const wasmPath = positional[0] ?? "target/wasm32-unknown-unknown/release/rsemu.wasm";
+const romPath = positional[1] ?? process.env.RSEMU_NES_TEST_ROM ?? null;
+// Without --site, fall back to web/dist when it happens to be there, so a
+// local `node web/check.mjs` after a build gets the site checks for free.
+const sitePath = siteArg ?? (existsSync(join(here, "dist", "index.html")) ? join(here, "dist") : null);
 
 let failures = 0;
 const ok = (what) => console.log(`  ok   ${what}`);
@@ -42,7 +65,8 @@ check(wasm.subarray(0, 4).toString("latin1") === "\0asm", "is a wasm module");
 function sections(bytes) {
   let i = 8;
   const uleb = () => {
-    let r = 0, s = 0;
+    let r = 0,
+      s = 0;
     for (;;) {
       const b = bytes[i++];
       r |= (b & 0x7f) << s;
@@ -87,36 +111,110 @@ console.log(`  ${exports.size} exports, ${imports.length} imports`);
 
 // What the glue actually calls, read out of the glue rather than duplicated
 // here — a list maintained by hand is a list that goes stale.
-const glue = readFileSync(new URL("./rsemu.js", import.meta.url), "utf8");
+const glue = readFileSync(join(here, "src", "rsemu.js"), "utf8");
 const wanted = new Set([...glue.matchAll(/\bthis\.e\.(\w+)/g)].map((m) => m[1]));
 check(wanted.size > 20, `rsemu.js calls ${wanted.size} exports`);
 for (const name of [...wanted].sort()) {
   if (!exports.has(name)) bad(`export missing: ${name}`);
 }
-check([...wanted].every((n) => exports.has(n)), "every export the page calls exists");
+check(
+  [...wanted].every((n) => exports.has(n)),
+  "every export the page calls exists",
+);
 check(imports.length === 0, "the module imports nothing (the page passes {})");
 
 // ---------------------------------------------------------------------------
-// 1b. The page's own wiring
+// 1b. The built site
 // ---------------------------------------------------------------------------
 //
-// There is no DOM here, so this cannot prove the page *behaves*. It can prove
-// the one thing that silently half-works in a browser: every element `app.js`
-// reaches for exists in the markup, and the other way round.
+// There is still no DOM here, so this cannot prove the page *behaves*. It can
+// prove the things that silently half-work in a browser: a bundle that no
+// longer talks to this ABI, an asset that did not get emitted, an absolute URL
+// that only resolves at the domain root, and a .wasm that the bundler mangled
+// or the assembly step forgot.
 
-const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
-const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");
-const markupIds = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]));
-const scriptIds = new Set([...app.matchAll(/\$\("([^"]+)"\)/g)].map((m) => m[1]));
-for (const id of scriptIds) {
-  if (!markupIds.has(id)) bad(`app.js wants #${id}, which the page does not have`);
+if (!sitePath) {
+  console.log(
+    "  SKIP the built site — pass --site DIR (or run `npm run build` in web/ first).\n" +
+      "       Both CI workflows always pass it, so it is never skipped where it matters.",
+  );
+} else {
+  const site = resolve(sitePath);
+  console.log(`site: ${site}`);
+  const indexPath = join(site, "index.html");
+  check(existsSync(indexPath), "the site has an index.html");
+  const html = existsSync(indexPath) ? readFileSync(indexPath, "utf8") : "";
+
+  check(html.includes('id="app"'), "index.html has the mount point Vue asks for");
+  check(
+    !html.includes("/src/main.js"),
+    "index.html is built, not the raw Vite entry (no /src/main.js)",
+  );
+
+  // Every local URL the document names must exist on disk, and must be
+  // relative: the site lives at https://karpeleslab.github.io/rsemu/, so a
+  // leading slash points at someone else's site root.
+  const refs = [...html.matchAll(/\b(?:src|href)="([^"]+)"/g)]
+    .map((m) => m[1])
+    .filter((u) => !/^(?:https?:|data:|mailto:|#)/.test(u));
+  check(refs.length > 0, `index.html references ${refs.length} local assets`);
+  for (const url of refs) {
+    if (url.startsWith("/")) {
+      bad(`absolute asset URL "${url}" — it would 404 under the /rsemu/ subpath`);
+    } else if (!existsSync(join(site, url))) {
+      bad(`index.html references ${url}, which the site does not contain`);
+    }
+  }
+  check(
+    refs.every((u) => !u.startsWith("/") && existsSync(join(site, u))),
+    "every asset it references is relative and present",
+  );
+
+  // The module has to sit next to index.html under exactly that name, because
+  // the page fetches "./rsemu.wasm" and nothing rewrites it.
+  const siteWasm = join(site, "rsemu.wasm");
+  check(existsSync(siteWasm), "rsemu.wasm sits beside index.html");
+  if (existsSync(siteWasm)) {
+    const shipped = readFileSync(siteWasm);
+    check(
+      shipped.length === wasm.length && shipped.equals(wasm),
+      "and it is byte-identical to the module checked above",
+    );
+    check(
+      shipped.subarray(0, 4).toString("latin1") === "\0asm",
+      "the bundler passed the .wasm through untouched",
+    );
+  }
+
+  // The bundle is the artifact that ships, so ask *it* what ABI it speaks.
+  // Property accesses survive minification, which is what makes this work.
+  const scripts = refs.filter((u) => u.endsWith(".js"));
+  check(scripts.length > 0, "the site ships a script bundle");
+  const bundle = scripts.map((u) => readFileSync(join(site, u), "utf8")).join("\n");
+  const called = new Set([...bundle.matchAll(/\brsemu_\w+/g)].map((m) => m[0]));
+  console.log(`  the bundle names ${called.size} rsemu_* exports`);
+  // `memory` is the one export that is not a function and not prefixed, so it
+  // is checked by the shape of its only use rather than by name.
+  const abi = [...wanted].filter((n) => n.startsWith("rsemu_")).sort();
+  for (const name of abi) {
+    if (!called.has(name)) bad(`the built bundle no longer calls ${name}`);
+  }
+  check(abi.every((n) => called.has(n)), `the built bundle calls all ${abi.length} of them`);
+  check(bundle.includes(".memory.buffer"), "and still reads the module's exported memory");
+  for (const name of [...called].sort()) {
+    if (!exports.has(name)) bad(`the built bundle calls ${name}, which the module does not export`);
+  }
+  check(
+    [...called].every((n) => exports.has(n)),
+    "and calls nothing the module does not export",
+  );
+  check(bundle.includes("./rsemu.wasm"), "the bundle fetches ./rsemu.wasm relative to the page");
+
+  const css = refs.filter((u) => u.endsWith(".css"));
+  check(css.length > 0, "the site ships a stylesheet");
+  const bytes = refs.reduce((n, u) => n + statSync(join(site, u)).size, 0);
+  console.log(`  ${refs.length} assets, ${(bytes / 1024).toFixed(1)} KiB before the module`);
 }
-check(
-  [...scriptIds].every((id) => markupIds.has(id)),
-  `every one of app.js's ${scriptIds.size} elements is in the markup`,
-);
-check(html.includes('src="./app.js"'), "the page loads app.js");
-check(app.includes('from "./rsemu.js"'), "app.js loads the glue");
 
 // ---------------------------------------------------------------------------
 // 2. The ABI, exercised
@@ -135,8 +233,12 @@ if (machines.length === 0) {
   // the one CI compiles every commit. Everything above still applies to it;
   // there is simply no machine to run, which the page also says out loud.
   ok("boundary-only build: exports and ABI check out, no machines to run");
-  console.log("\nall checks passed (build --features demo for the machines)");
-  process.exit(0);
+  console.log(
+    failures === 0
+      ? "\nall checks passed (build --features demo for the machines)"
+      : `\n${failures} check(s) failed`,
+  );
+  process.exit(failures === 0 ? 0 : 1);
 }
 
 const nes = machines.find((m) => m.name.startsWith("nes"));
@@ -187,6 +289,124 @@ if (apple1) {
   text += decode(emu.consoleRead());
   check(text.length > 0, `the monitor says something (${JSON.stringify(text.slice(0, 40))})`);
   emu.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 3. The page's own driver
+// ---------------------------------------------------------------------------
+//
+// `session.js` is the half of the page Vue does not own: the frame loop, the
+// canvas blit, the console pump and the keyboard. None of it needs a DOM to be
+// worth testing — it needs a canvas context, a clock and a
+// requestAnimationFrame — so it gets a handful of stubs and is driven for two
+// seconds of loop time here.
+//
+// This is not a browser test and does not pretend to be one: Vue never renders,
+// nothing is laid out, and `image-rendering: pixelated` is the browser's
+// business alone. What it does prove is that the loop paces itself off the
+// machine's own frame period, that whole frames reach putImageData, that a
+// console machine's output reaches the pane, and that a key becomes a
+// controller bit — every one of which used to be provable only by opening the
+// page and looking at it.
+
+globalThis.ImageData ??= class ImageData {
+  constructor(data, width, height) {
+    Object.assign(this, { data, width, height });
+  }
+};
+
+let frameCallback = null;
+globalThis.requestAnimationFrame = (cb) => ((frameCallback = cb), 1);
+globalThis.cancelAnimationFrame = () => (frameCallback = null);
+globalThis.addEventListener ??= () => {};
+globalThis.removeEventListener ??= () => {};
+
+// The real path through Rsemu.load, with its two browser-only halves supplied.
+globalThis.fetch = async (url) =>
+  new Response(readFileSync(url.startsWith(".") ? wasmPath : url), {
+    headers: { "content-type": "application/wasm" },
+  });
+WebAssembly.instantiateStreaming = async (source) =>
+  WebAssembly.instantiate(await (await source).arrayBuffer(), {});
+
+const blits = [];
+const fakeCanvas = {
+  width: 0,
+  height: 0,
+  getContext: () => ({
+    fillStyle: "",
+    fillRect() {},
+    putImageData: (image) => blits.push(image),
+  }),
+};
+
+/** An event as the session reads one: a code, a key, and a target to ignore. */
+const press = (fields) => ({ target: {}, preventDefault() {}, ...fields });
+
+let clock = 1000;
+/** Run the rAF loop for `ms` of make-believe wall time, one display frame at a time. */
+function spin(ms, step = 1000 / 60) {
+  const start = clock;
+  while (clock - start < ms) {
+    clock += step;
+    frameCallback?.(clock);
+  }
+}
+
+const { Session } = await import("./src/session.js");
+const driver = new Session();
+let consoleSeen = "";
+driver.on({ console: (text) => (consoleSeen = text) });
+await driver.load("./rsemu.wasm");
+driver.attach(fakeCanvas);
+check(driver.machines.length === machines.length, "the driver reads the same catalog");
+
+if (nes) {
+  driver.boot(nes, minimalNrom());
+  check(fakeCanvas.width === 256 && fakeCanvas.height === 240, "the driver sizes the canvas");
+  const before = blits.length;
+  spin(2000);
+  const drew = blits.length - before;
+  // NTSC runs at 60.098 Hz against a 60 Hz display, so two seconds is ~120.
+  check(drew > 100 && drew < 140, `${drew} blits in 2 s of loop time`);
+  const last = blits[blits.length - 1];
+  check(
+    last?.width === 256 && last?.height === 240 && last?.data.length === 256 * 240 * 4,
+    "each blit is a whole 256x240 RGBA frame",
+  );
+  check(driver.emu.nowNs() > 1.9e9, "and virtual time kept up with real time");
+
+  // Pausing must stop the machine, not merely stop drawing it.
+  driver.pause();
+  const parked = driver.emu.frameSerial();
+  spin(500);
+  check(driver.emu.frameSerial() === parked, "pause stops the machine, not just the picture");
+  driver.step();
+  check(driver.emu.frameSerial() === parked + 1, "step advances exactly one frame");
+
+  driver.key(press({ code: "KeyZ", key: "z" }), true);
+  check(driver.emu.buttons(0) === Rsemu.BUTTONS.a, "Z presses A on controller 1");
+  driver.key(press({ code: "KeyZ", key: "z" }), false);
+  check(driver.emu.buttons(0) === 0, "and releasing it lets go");
+  driver.key(press({ code: "ArrowLeft", key: "ArrowLeft", target: { tagName: "SELECT" } }), true);
+  check(driver.emu.buttons(0) === 0, "but a key aimed at the machine picker is left alone");
+  driver.key(press({ code: "ArrowLeft", key: "ArrowLeft" }), true);
+  driver.releaseAll();
+  check(driver.emu.buttons(0) === 0, "and losing focus never leaves a button stuck down");
+}
+
+if (apple1) {
+  driver.boot(apple1, null);
+  driver.consoleFocused = true;
+  spin(500);
+  for (const key of ["F", "F", "0", "0", "Enter"]) driver.key(press({ key }), true);
+  spin(700);
+  check(consoleSeen.includes("RSMON"), "the monitor's banner reaches the console pane");
+  check(
+    consoleSeen.includes("FF00:"),
+    `typing FF00 and Return dumps that address (${JSON.stringify(consoleSeen.slice(-30))})`,
+  );
+  driver.shutdown();
 }
 
 console.log(failures === 0 ? "\nall checks passed" : `\n${failures} check(s) failed`);

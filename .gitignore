@@ -4,7 +4,13 @@
 # Per-agent worktrees created by Claude Code's parallel-agent tooling.
 /.claude/
 docs/local/
+# The browser demo. The .wasm is a cargo build product copied in, never a
+# source file; node_modules/ and dist/ are npm's and Vite's. package-lock.json
+# is *not* ignored — the site is built in CI with `npm ci`, which needs it.
 web/*.wasm
+web/public/*.wasm
+web/node_modules/
+web/dist/
 # Conformance corpora, fetched by scripts/fetch-testdata.sh. Never committed:
 # several suites are copyleft or unlicensed, and running one as an emulated
 # guest is ordinary use while shipping it here is redistribution.

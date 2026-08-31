@@ -8,6 +8,11 @@ name: Pages
 # SharedArrayBuffer, which needs COOP/COEP headers, which GitHub Pages cannot
 # send — so the target that works here is the one CI already gates on as a
 # first-class configuration rather than a fallback (ROADMAP.md §11).
+#
+# The site is a Vue 3 application built by Vite. Two artifacts meet in _site:
+# `npm run build`'s output, and the cdylib cargo produced. The .wasm is copied
+# into web/public/ *before* the Vite build so it lands in dist/ untouched —
+# public/ is verbatim-copied, never hashed, inlined or transformed.
 on:
   push:
     branches: [master]
@@ -39,6 +44,11 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
 
       # The lib is rlib-only so native builds stay lean; the cdylib is produced
       # on demand. `demo` is `wasm` plus the machines the page offers.
@@ -47,22 +57,44 @@ jobs:
           cargo rustc --crate-type cdylib --target wasm32-unknown-unknown \
             --no-default-features --features demo --release
 
-      - name: assemble the site
-        # Only what the page needs. check.mjs is a test harness and README.md is
-        # developer documentation; neither belongs on the published site.
+      # `npm ci`, not `npm install`: the committed lockfile is the build's
+      # input, and a deploy that silently resolves a different Vue is not the
+      # thing that was tested.
+      - name: install the site's dependencies
+        run: npm ci
+        working-directory: web
+
+      # Every bundled package ships inside dist/, so the same provenance rule
+      # the crate lives under applies to them (CLAUDE.md). A copyleft
+      # dependency arriving transitively would otherwise reach the published
+      # site unnoticed.
+      - name: check bundled licences
+        run: npm run licenses
+        working-directory: web
+
+      - name: build the site
         run: |
           set -euo pipefail
-          mkdir -p _site
-          cp web/index.html web/app.js web/rsemu.js _site/
-          cp target/wasm32-unknown-unknown/release/rsemu.wasm _site/
-          ls -l _site
+          cp target/wasm32-unknown-unknown/release/rsemu.wasm web/public/rsemu.wasm
+          npm run build --prefix web
+
+      - name: assemble the site
+        # Vite's dist/ is already the whole site — the wasm rode through
+        # public/ — so this is a move rather than a hand-picked copy. check.mjs
+        # and README.md never enter dist: one is a test harness and the other
+        # is developer documentation.
+        run: |
+          set -euo pipefail
+          mv web/dist _site
+          ls -lR _site
 
       - name: check the site before publishing it
         # Against the exact artifact being deployed, not a rebuild: instantiates
-        # the module, checks every export the glue calls exists, boots a machine,
-        # runs frames, and asserts save/restore hash equality. A broken page
-        # fails here rather than in someone's browser.
-        run: node web/check.mjs _site/rsemu.wasm
+        # the module, checks every export the glue calls exists, checks the
+        # built bundle still calls them and references only relative assets that
+        # exist, boots a machine, runs frames, and asserts save/restore hash
+        # equality. A broken page fails here rather than in someone's browser.
+        run: node web/check.mjs _site/rsemu.wasm --site _site
 
       - uses: actions/upload-pages-artifact@v4
         with:
