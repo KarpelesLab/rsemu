@@ -1,0 +1,20 @@
+# release-plz configuration — https://release-plz.dev/docs/config
+#
+# The crate is 0.0.x, which under Cargo's semver rules means *every* release may
+# break: 0.0.1 and 0.0.2 are not compatible with each other. That is the correct
+# state for something this early and it is deliberate — there is no API
+# stability to promise yet, so breaking changes should cost nothing.
+
+[workspace]
+
+# Don't run cargo-semver-checks.
+#
+# It exists to detect API breakage and escalate the version accordingly, which
+# is exactly what we do not want while pre-release: the core is still being
+# reshaped (address-space topology, the scheduler and the device trait all
+# changed shape in a single day), so it would find real breakage constantly and
+# push 0.0.x out to 0.1.0 for changes nobody is depending on yet.
+#
+# Turn this back on when the API is worth protecting. That is a decision, not a
+# default.
+semver_check = false
