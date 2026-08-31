@@ -631,7 +631,10 @@ static PPU_PROPERTIES: &[PropertySpec] = &[
 /// The device class, for [`crate::core::Registry`].
 pub static NES_PPU_CLASS: DeviceClass = DeviceClass {
     name: "nes.ppu",
-    version: 1,
+    // v2 appended the dot-exact pipeline's own state: the sampled `/NMI`
+    // output, which sprite output units have stopped counting, and a `$2001`
+    // write still travelling.
+    version: 2,
     summary: "NES / Famicom picture processing unit (RP2C02 / RP2C07 / UA6538)",
     properties: PPU_PROPERTIES,
     construct: |props| Ok(Box::new(NesPpu::new(props)?) as Box<dyn Device>),

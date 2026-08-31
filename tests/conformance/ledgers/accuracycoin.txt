@@ -19,7 +19,7 @@
 #     they can never appear here.
 #
 # ---------------------------------------------------------------------------
-# Measured 2026-08-31 against the pinned ROM: 124 of 141 pass, 17 fail.
+# Measured 2026-08-31 against the pinned ROM: 125 of 141 pass, 16 fail.
 # ---------------------------------------------------------------------------
 #
 # The earlier "81 of 125" was measured through a stale copy of the ROM's
@@ -151,9 +151,6 @@
 
 8d                # $048D "$2002 flag timing" code 1: the sprite-0/overflow
                   # flags must clear on an exact dot. Cause (D).
-83                # $0483 "Stale BG Shift Registers" code 3: the background
-                  # shift registers keep their contents when rendering is
-                  # switched off; rsemu's engine has no shift registers.
 8f                # $048F "Stale Sprite Shift Regs" code 3: as above, for the
                   # eight sprite shifters.
 87                # $0487 "BG Serial In" code 2: the serial input to the

@@ -240,7 +240,31 @@ pub struct Engine {
     pub(crate) sprite_pat_lo: [u8; 8],
     pub(crate) sprite_pat_hi: [u8; 8],
     pub(crate) sprite_attr: [u8; 8],
+    /// The per-slot X **counter**, not the X coordinate.
+    ///
+    /// Loaded with the sprite's X during the fetch slots and counted down once
+    /// per dot of the visible scanline while rendering is on. A slot whose
+    /// counter has reached zero is outputting: its pattern registers shift one
+    /// bit per dot and bit 7 is the pixel.
+    ///
+    /// Modelled as the counter it is rather than as a comparison against the
+    /// pixel's column, because the two only agree while rendering stays on. A
+    /// slot that reached zero and then had rendering taken away from it keeps
+    /// its half-shifted pattern and finishes drawing when rendering returns,
+    /// which is what AccuracyCoin's two "stale shift register" tests measure.
     pub(crate) sprite_x: [u8; 8],
+    /// Which output units have stopped counting and started shifting.
+    ///
+    /// One bit per slot. Set when a slot's X counter reaches zero, and cleared
+    /// — every slot at once — on **dot 339 of a rendered scanline**. That is
+    /// the whole of the rule: "if the PPU is rendering on dot 339, then the
+    /// shifter counters are set to counting; if rendering was not enabled on
+    /// dot 339, the shifter counters will be in whatever state they were
+    /// previously in, which is likely halted" (AccuracyCoin.asm, MIT, © 2025
+    /// Chris Siebert). A frame that takes rendering away before dot 339 comes
+    /// back with every unit already halted, which draws every sprite as though
+    /// its X were zero.
+    pub(crate) sprite_halted: u8,
     pub(crate) sprite_active: u8,
     pub(crate) sprite_zero_active: bool,
     /// Latches held between the four secondary-OAM reads and the two pattern
@@ -357,6 +381,7 @@ impl Engine {
             sprite_pat_hi: [0; 8],
             sprite_attr: [0; 8],
             sprite_x: [0; 8],
+            sprite_halted: 0,
             sprite_active: 0,
             sprite_zero_active: false,
             sp_y_latch: 0,
@@ -934,6 +959,37 @@ impl Engine {
         }
     }
 
+    /// One dot of the eight sprite output units: count down, or shift.
+    ///
+    /// Runs on dots 1-256 of a rendered scanline and nowhere else. Neither the
+    /// counters nor the shifters move during horizontal blanking or with
+    /// rendering switched off — the ROM's own summary is "if rendering was not
+    /// enabled on dot 339, the shifter counters will be in whatever state they
+    /// were previously in" — and that is what lets a partly-drawn sprite
+    /// survive ten forced-blank scanlines and finish where it left off.
+    fn sprite_output_dot(&mut self) {
+        for slot in 0..8 {
+            if self.sprite_halted & (1 << slot) != 0 {
+                self.sprite_pat_lo[slot] <<= 1;
+                self.sprite_pat_hi[slot] <<= 1;
+            } else {
+                self.sprite_x[slot] -= 1;
+            }
+        }
+    }
+
+    /// A unit whose counter has run out stops counting and starts drawing.
+    ///
+    /// Taken at the top of the dot, before the pixel: a sprite at X = 0 draws
+    /// on column 0.
+    fn sprite_arm(&mut self) {
+        for slot in 0..8 {
+            if self.sprite_x[slot] == 0 {
+                self.sprite_halted |= 1 << slot;
+            }
+        }
+    }
+
     // -- the pixel multiplexer ----------------------------------------------
 
     /// Draw the pixel at column `x` of `scanline`.
@@ -993,13 +1049,13 @@ impl Engine {
         let mut sp_is_zero = false;
         if sp_visible {
             for slot in 0..usize::from(self.sprite_active) {
-                let dx = x.wrapping_sub(u16::from(self.sprite_x[slot]));
-                if dx >= 8 {
+                // A slot is drawing exactly while its counter is at zero; the
+                // pixel is the top of its shift registers.
+                if self.sprite_halted & (1 << slot) == 0 {
                     continue;
                 }
-                let bit = 7 - dx;
-                let lo = (self.sprite_pat_lo[slot] >> bit) & 1;
-                let hi = (self.sprite_pat_hi[slot] >> bit) & 1;
+                let lo = (self.sprite_pat_lo[slot] >> 7) & 1;
+                let hi = (self.sprite_pat_hi[slot] >> 7) & 1;
                 let pixel = (hi << 1) | lo;
                 if pixel == 0 {
                     continue;
@@ -1101,6 +1157,11 @@ impl Engine {
         if visible && (1..=256).contains(&dot) {
             self.output_pixel(dot - 1, scanline);
         }
+        // After the pixel: the units that drew it then advance, which is what
+        // makes a sprite eight pixels wide starting at its own X.
+        if rendering && visible && (1..=256).contains(&dot) {
+            self.sprite_output_dot();
+        }
 
         self.advance_position(pre_render, rendering);
         self.dots += 1;
@@ -1142,6 +1203,14 @@ impl Engine {
         }
 
         // -- sprites --
+        if (1..=256).contains(&dot) {
+            self.sprite_arm();
+        }
+        if dot == 339 {
+            // Every unit goes back to counting, and only here. See
+            // [`Engine::sprite_halted`].
+            self.sprite_halted = 0;
+        }
         if (1..=64).contains(&dot) {
             self.secondary_clear_dot(dot);
         } else if visible && (65..=256).contains(&dot) {
@@ -1530,6 +1599,12 @@ impl Engine {
         w.write_u64(self.vblank_set_dot)?;
         w.write_bool(self.suppress_vblank_set)?;
         w.write_bool(self.suppress_nmi)?;
+        // Appended: everything the dot-exact pipeline gained. The prefix above
+        // keeps the layout the previous chunk version wrote.
+        w.write_bool(self.nmi_out)?;
+        w.write_u8(self.sprite_halted)?;
+        w.write_u8(self.mask_pending)?;
+        w.write_u8(self.mask_delay)?;
         w.write_bool(self.warmup)?;
 
         w.write_seq_len(self.fb.len() as u64)?;
@@ -1595,6 +1670,10 @@ impl Engine {
         self.vblank_set_dot = r.read_u64()?;
         self.suppress_vblank_set = r.read_bool()?;
         self.suppress_nmi = r.read_bool()?;
+        self.nmi_out = r.read_bool()?;
+        self.sprite_halted = r.read_u8()?;
+        self.mask_pending = r.read_u8()?;
+        self.mask_delay = r.read_u8()?;
         self.warmup = r.read_bool()?;
 
         let len = r.read_seq_len(2)? as usize;
