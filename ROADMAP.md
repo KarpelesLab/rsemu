@@ -627,6 +627,27 @@ snapshot header, since queued deadlines are meaningless without it.
   Catch-up is bounded by the device's own next scheduled event, so it never
   simulates past a point where its behaviour would change. A `MemAttrs::debug`
   access advances nothing.
+
+  **What catch-up does *not* fix, now measured.** `LazyHandle::sync` brings a
+  device up to the tick the scheduler *last published*, and the forest is
+  advanced from a runnable's report only *after* it returns. So a handle used
+  from inside a runnable's execution sees that runnable's position at the
+  **start of the quantum**: an instruction that reads a timer mid-quantum reads
+  a stale one. The Game Boy put a number on it — roughly **35 of its 44 mooneye
+  acceptance failures** trace to this one cause, and it is also the single
+  ledgered blargg failure.
+
+  The obvious alternative was measured rather than assumed, and it is **worse**:
+  having `run_budget` decline to start an instruction that would overrun the
+  quantum — never overshooting, instead of carrying the overshoot as debt —
+  scores **16/66 against 22/66**, because the core then drifts behind and
+  catches up in bursts. Recorded so nobody re-derives it.
+
+  The real fix is the one `core::sched`'s own docs name: **let a runnable report
+  progress *as* it runs**, which changes `Runnable` rather than `LazyHandle`.
+  That trait is implemented by every core, so it is a deliberate cross-cutting
+  change and not an opportunistic one — which is exactly why it has not been
+  made yet.
 - **A budget rarely lands on a tick boundary, and that has to be decided.** An
   event at PPU dot 82181 falls two-thirds of the way through a CPU cycle. The
   rule: **stop at the cycle boundary before, never drag a domain mid-cycle** —
