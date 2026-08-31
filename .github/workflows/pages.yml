@@ -1,0 +1,80 @@
+name: Pages
+
+# Publishes the browser demo to https://karpeleslab.github.io/rsemu/ on every
+# push to master. The repository's Pages source is already set to "workflow",
+# so this is the only thing that deploys it.
+#
+# The demo is deliberately the NON-threaded build. Threaded wasm needs
+# SharedArrayBuffer, which needs COOP/COEP headers, which GitHub Pages cannot
+# send — so the target that works here is the one CI already gates on as a
+# first-class configuration rather than a fallback (ROADMAP.md §11).
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel a deployment in flight: a half-replaced site is worse than a
+# slightly stale one. Queue instead.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build the demo
+    runs-on: ubuntu-latest
+    # Deploying needs the Pages environment, which a fork does not have.
+    if: github.repository == 'KarpelesLab/rsemu'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+
+      # The lib is rlib-only so native builds stay lean; the cdylib is produced
+      # on demand. `demo` is `wasm` plus the machines the page offers.
+      - name: build the cdylib
+        run: |
+          cargo rustc --crate-type cdylib --target wasm32-unknown-unknown \
+            --no-default-features --features demo --release
+
+      - name: assemble the site
+        # Only what the page needs. check.mjs is a test harness and README.md is
+        # developer documentation; neither belongs on the published site.
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          cp web/index.html web/app.js web/rsemu.js _site/
+          cp target/wasm32-unknown-unknown/release/rsemu.wasm _site/
+          ls -l _site
+
+      - name: check the site before publishing it
+        # Against the exact artifact being deployed, not a rebuild: instantiates
+        # the module, checks every export the glue calls exists, boots a machine,
+        # runs frames, and asserts save/restore hash equality. A broken page
+        # fails here rather than in someone's browser.
+        run: node web/check.mjs _site/rsemu.wasm
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+  deploy:
+    name: deploy
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
