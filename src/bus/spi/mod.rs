@@ -347,6 +347,74 @@ pub trait SpiSlave: Send + Sync + fmt::Debug {
     fn peek(&self) -> u32 {
         u32::MAX
     }
+
+    /// After how many bits this part turns the data line around, if it does.
+    ///
+    /// Plenty of parts put a command in the first half of a word and answer in
+    /// the second half of *the same* word rather than the next one — the
+    /// ST7272A's read frame is `R A6..A0 D7..D0` with the master driving the
+    /// first eight bits and the panel the last eight (datasheet §7.1, "Read
+    /// Mode"). A word-level seam that could not express that would force every
+    /// such device to invent its own bit handling, which is exactly what
+    /// [`Shifter`] exists to prevent.
+    ///
+    /// `None`, the default, is an ordinary full-duplex part whose outgoing word
+    /// is fixed before the transfer begins.
+    ///
+    /// **MSB-first only.** A turnaround part numbers its frame from the most
+    /// significant bit by construction; [`partial`](SpiSlave::partial) is not
+    /// called for an LSB-first format.
+    fn turnaround(&self) -> Option<u8> {
+        None
+    }
+
+    /// The first `bits` of a word have arrived; load the rest of the outgoing
+    /// one if this part answers mid-word.
+    ///
+    /// `received` holds those bits right-aligned. Return the word whose low
+    /// `format().bits - bits` bits should be driven from here on, or `None` to
+    /// leave the outgoing word alone. Called on every sampling edge, so an
+    /// implementation looks at `bits` first and usually says nothing.
+    ///
+    /// **Must have no side effect a repeat would change**: the transactional
+    /// and wired links call it at different moments, and the two must agree.
+    fn partial(&self, bits: u8, received: u32) -> Option<u32> {
+        let _ = (bits, received);
+        None
+    }
+}
+
+/// One word through `slave`, honouring a mid-word turnaround.
+///
+/// The single place [`SpiSlave::turnaround`] is interpreted for a link that
+/// does not clock individual bits, so that [`SpiBus::transfer`] and
+/// [`SlavePins`] cannot drift apart about what a read frame returns.
+pub fn exchange(slave: &dyn SpiSlave, mosi: u32) -> u32 {
+    let format = slave.format();
+    let turn = match (slave.turnaround(), format.order) {
+        (Some(n), BitOrder::MsbFirst) if n > 0 && n < format.bits => Some(n),
+        _ => None,
+    };
+    // Before the transfer, because the answer is decoded from the bits that
+    // arrived first — which on the wire is exactly when it happens.
+    let spliced = turn.and_then(|n| {
+        let remaining = format.bits - n;
+        slave
+            .partial(n, mosi >> remaining)
+            .map(|word| (remaining, word))
+    });
+    let presented = format.truncate(slave.transfer(mosi));
+    match spliced {
+        Some((remaining, word)) => {
+            let mask = if remaining >= 32 {
+                u32::MAX
+            } else {
+                (1u32 << remaining) - 1
+            };
+            (presented & !mask) | (word & mask)
+        }
+        None => presented,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +483,40 @@ impl fmt::Display for Link {
 // The fabric
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Where this module sits in the lock ladder
+// ---------------------------------------------------------------------------
+
+/// The rank an [`SpiBus`]'s own routing state takes.
+///
+/// **Not [`LockRank::BUS`]**, and the reason is worth writing down because the
+/// name says otherwise. A CPU core holds its execution state across a guest
+/// access — the RISC-V hart's session mutex is itself `LockRank::BUS` — so by
+/// the time an MMIO write reaches a device, `BUS` is *already held*. A fabric
+/// that also took `BUS` would be a lock-order violation on the first register
+/// write, which is exactly what the ladder is for.
+///
+/// So the SPI fabric sits in the band between [`LockRank::BUS`] and
+/// [`LockRank::DEVICE`], which is what [`LockRank::new`] exists for. The order
+/// a transfer actually travels is:
+///
+/// ```text
+///   CPU session (BUS 0x4000)
+///     → SpiBus routing      (0x4400, here)
+///       → SlavePins shifter (0x4800, SHIFTER_RANK)
+///         → the slave's own state (DEVICE 0x5000)
+///           → its output wires     (WIRE 0x6000)
+/// ```
+pub const FABRIC_RANK: LockRank = LockRank::new(0x4400);
+
+/// The rank a [`SlavePins`] shift register takes.
+///
+/// Below the device's own state, because the shifter lock is deliberately held
+/// across the call into the slave: reassembling a word and handing it over is
+/// one step, and dropping the lock in the middle would let a second edge
+/// interleave. See [`FABRIC_RANK`] for the whole ladder.
+pub const SHIFTER_RANK: LockRank = LockRank::new(0x4800);
+
 /// How many chip selects one bus routes.
 ///
 /// Eight, because a controller's chip-select register is conventionally a byte
@@ -455,7 +557,7 @@ impl SpiBus {
     pub fn new() -> SpiBus {
         SpiBus {
             // `[None; N]` needs Copy, which `Option<Arc<_>>` is not.
-            slaves: Mutex::with_rank(LockRank::BUS, Default::default()),
+            slaves: Mutex::with_rank(FABRIC_RANK, Default::default()),
             active: AtomicU32::new(NO_SELECTION),
         }
     }
@@ -576,7 +678,7 @@ impl SpiBus {
         };
         // Outside the lock: the slave may remap, drive a wire or reach a
         // sibling from inside `transfer`.
-        slave.transfer(word)
+        exchange(&*slave, word)
     }
 
     /// What the selected slave would return, without transferring anything.
@@ -686,8 +788,20 @@ pub mod buses {
 /// What a [`Shifter`] did with an edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shifted {
-    /// Nothing yet: the word is still assembling.
-    Partial,
+    /// A bit was captured and the word is still assembling.
+    ///
+    /// Carried rather than bare so a caller can offer them to
+    /// [`SpiSlave::partial`], which is how a part that turns the data line
+    /// around mid-word gets to answer in the frame that asked.
+    Partial {
+        /// How many bits of the word have arrived.
+        bits: u8,
+        /// Those bits, right-aligned.
+        received: u32,
+    },
+    /// The clock moved, but on the edge this mode changes data rather than
+    /// samples it. Nothing was captured.
+    Edge,
     /// A whole word came in, and this is what went out in exchange.
     Word {
         /// The word received on MOSI.
@@ -861,7 +975,7 @@ impl Shifter {
         if !self.format.mode.samples_on(level) {
             // The changing edge. Nothing is captured; MISO has already been
             // presented for the bit about to be sampled.
-            return Shifted::Partial;
+            return Shifted::Edge;
         }
         // Capture MOSI.
         match self.format.order {
@@ -874,7 +988,10 @@ impl Shifter {
         }
         self.count += 1;
         if self.count < self.format.bits {
-            return Shifted::Partial;
+            return Shifted::Partial {
+                bits: self.count,
+                received: self.rx,
+            };
         }
         let mosi = self.format.truncate(self.rx);
         let miso = self.tx;
@@ -957,10 +1074,15 @@ pub mod pin {
 ///
 /// # Locking
 ///
-/// The shifter is behind a [`LockRank::DEVICE`] mutex, and the outward call
-/// into the slave happens *after* it is released, per the re-entrancy contract
-/// in [`crate::core::device`]. MISO is republished from outside the critical
-/// section too.
+/// The shifter takes [`SHIFTER_RANK`], which sits between [`LockRank::BUS`] and
+/// [`LockRank::DEVICE`]; that constant's docs give the whole ladder and why
+/// neither of the two named ranks would do. The lock is held across the call
+/// into the slave on purpose — reassembling a word and handing it over is one
+/// step — so the slave's own state must rank *below* it, which `DEVICE` does.
+///
+/// The chip-select path releases the shifter before calling the slave, because
+/// `select` is where a part commits a command and may reach further
+/// ([`crate::core::device`], the re-entrancy contract).
 pub struct SlavePins {
     slave: Arc<dyn SpiSlave>,
     shifter: Mutex<Shifter>,
@@ -968,6 +1090,15 @@ pub struct SlavePins {
     miso: Mutex<Option<WireSource>>,
     /// The level MISO is being held at. An atomic so a debug read is free.
     miso_level: AtomicBool,
+    /// Every input pin handed out by [`SlavePins::sink`].
+    ///
+    /// **A net holds only a weak reference to its sinks** (`core::device`),
+    /// which is what stops an IRQ/ack loop leaking — so a sink nobody else
+    /// holds is dropped the instant it is handed over, and the wire silently
+    /// delivers to nothing. Keeping them here is the strong half of that
+    /// arrangement, and the device owning its own pins is exactly what §4.3
+    /// intends.
+    pins: Mutex<Vec<Arc<PinSink>>>,
 }
 
 impl fmt::Debug for SlavePins {
@@ -989,9 +1120,10 @@ impl SlavePins {
         let format = slave.format();
         SlavePins {
             slave,
-            shifter: Mutex::with_rank(LockRank::DEVICE, Shifter::new(format)),
+            shifter: Mutex::with_rank(SHIFTER_RANK, Shifter::new(format)),
             miso: Mutex::with_rank(LockRank::WIRE, None),
             miso_level: AtomicBool::new(true),
+            pins: Mutex::with_rank(LockRank::WIRE, Vec::new()),
         }
     }
 
@@ -1087,17 +1219,37 @@ impl SlavePins {
                 slave.peek()
             })
         };
-        let _ = shifted;
+        if let Shifted::Partial { bits, received } = shifted {
+            // Each shifter lock is its own statement, deliberately. A guard
+            // taken in an `if` condition lives to the end of the whole `if`, so
+            // folding these into one `&&` chain re-enters a `LockRank::BUS`
+            // mutex while still holding it — which the ladder catches, and
+            // which would be a deadlock on a threaded backend.
+            let msb_first = self.shifter.lock().format().order == BitOrder::MsbFirst;
+            if msb_first && self.slave.turnaround() == Some(bits) {
+                // Outside the shifter lock: a part answering mid-word may reach
+                // its own registers, and this is the moment it learns the
+                // address.
+                if let Some(word) = self.slave.partial(bits, received) {
+                    self.shifter.lock().preload(word);
+                }
+            }
+        }
         self.publish_miso();
     }
 
     /// A sink for one input pin, for [`crate::core::device::Device::sink`].
+    ///
+    /// The returned pin is **also kept here**, because the net that receives it
+    /// holds only a weak reference; see the field's own note.
     #[must_use]
     pub fn sink(self: &Arc<Self>, line: u32) -> Arc<dyn WireSink> {
-        Arc::new(PinSink {
+        let pin = Arc::new(PinSink {
             pins: Arc::clone(self),
             line,
-        }) as Arc<dyn WireSink>
+        });
+        self.pins.lock().push(Arc::clone(&pin));
+        pin as Arc<dyn WireSink>
     }
 
     /// Reset to power-on: nothing selected, SCK idle, no word in flight.

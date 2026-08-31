@@ -11,7 +11,7 @@
 //!
 //! A real SoC's controller is a thin register wrapper over the same machinery:
 //! implement its register block, drive [`SpiBus::transfer`] or the wires, and
-//! reuse [`Shifter`] for the bit level.
+//! reuse [`super::Shifter`] for the bit level.
 //!
 //! # Register map
 //!
@@ -45,7 +45,7 @@
 //!
 //! A transfer's effect lands when it *finishes*, not when `DATA` is written.
 //! That is why the slave is called from
-//! [`Device::advance_to`](crate::core::device::Device::advance_to) rather than
+//! [`Device::advance_to`] rather than
 //! from the write handler.
 
 use alloc::boxed::Box;
@@ -157,6 +157,9 @@ struct Shared {
     miso: AtomicBool,
     /// The output pins, connected at realize time.
     pins: Mutex<Pins>,
+    /// The MISO input pin, kept alive here because the net that receives it
+    /// holds only a weak reference (`core::device`, §4.3's weak edge).
+    miso_pin: Mutex<Option<Arc<MisoSink>>>,
     /// The catch-up handle the register block syncs through.
     lazy: Mutex<Option<LazyHandle>>,
 }
@@ -348,6 +351,7 @@ impl SpiController {
             next_event: AtomicU64::new(NO_EVENT),
             miso: AtomicBool::new(true),
             pins: Mutex::with_rank(LockRank::WIRE, Pins::default()),
+            miso_pin: Mutex::with_rank(LockRank::WIRE, None),
             lazy: Mutex::with_rank(LockRank::WIRE, None),
         });
         let port = Arc::new(ControllerPort {
@@ -988,10 +992,16 @@ impl Device for SpiController {
     }
 
     fn sink(&self, port: &str, _sources: &[WireId]) -> Option<SinkPin> {
-        (port == pin::MISO).then(|| SinkPin {
-            sink: Arc::new(MisoSink {
-                shared: Arc::clone(&self.shared),
-            }) as Arc<dyn WireSink>,
+        if port != pin::MISO {
+            return None;
+        }
+        let pin = Arc::new(MisoSink {
+            shared: Arc::clone(&self.shared),
+        });
+        // Kept, because a net refers to its sinks weakly.
+        *self.shared.miso_pin.lock() = Some(Arc::clone(&pin));
+        Some(SinkPin {
+            sink: pin as Arc<dyn WireSink>,
             line: pin::MISO_LINE,
         })
     }
