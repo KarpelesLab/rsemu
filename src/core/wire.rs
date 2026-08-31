@@ -71,10 +71,13 @@
 //! combinators here are plain structs rather than `impl Device`, and snapshots
 //! are exchanged as `Vec<(WireId, Level)>` rather than through a `StateWriter`.
 //! Both are mechanical to retrofit; the state each object holds is already
-//! separated from its diagnostics. Nothing here names `std::sync` — the only
-//! primitives used are `core::sync::atomic`, which every target has
-//! (invariant 4).
+//! separated from its diagnostics. Nothing here names `std::sync` — the wires
+//! themselves use only `core::sync::atomic`, which every target has
+//! (invariant 4), and the one lock in this module ([`IntAckHandlers`], a list
+//! written at realize time and read on an interrupt) is a leaf-ranked
+//! `core::sync::Mutex`.
 
+use crate::core::sync::Mutex;
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -321,17 +324,281 @@ pub trait WireSink: Send + Sync {
 /// The core knows nothing about 8259As or GICs: this is a bus concept, like
 /// [`WireSink`] itself.
 pub trait IntAck: Send + Sync + fmt::Debug {
-    /// The CPU has taken the interrupt. Report the vector, and apply whatever
-    /// the acknowledge cycle changes inside the controller.
+    /// The CPU has taken the interrupt and is running its acknowledge cycle.
+    /// Report what this controller drives back, and apply whatever the cycle
+    /// changes inside it.
+    ///
+    /// `cycle` is what the processor puts on the bus while it asks — a 68000
+    /// presents the interrupt level on A3-A1, an 8086 presents nothing at all
+    /// — so a controller can tell "you, at level 5" from "you, whoever you
+    /// are". Answer [`IntAckResponse::Declined`] when the cycle is not this
+    /// controller's, which is not the same as being asked and having no vector
+    /// to give ([`IntAckResponse::Autovector`]); see [`IntAckResponse`].
     ///
     /// Called from the CPU's execution path with no device lock held on the
     /// CPU's side, so an implementation is free to take its own. It runs at
-    /// most once per interrupt taken, and it must be prepared to be called when
-    /// nothing is pending any more — a request can go away between the moment
-    /// the CPU samples the pin and the moment it acknowledges, and every real
-    /// controller answers that with a defined vector (the 8259A's spurious
-    /// `IR7`).
-    fn acknowledge(&self) -> u32;
+    /// most once per interrupt taken *per controller on the net*, and it must
+    /// be prepared to be called when nothing is pending any more — a request
+    /// can go away between the moment the CPU samples the pin and the moment
+    /// it acknowledges, and every real controller answers that with a defined
+    /// vector (the 8259A's spurious `IR7`).
+    fn acknowledge(&self, cycle: IntAckCycle) -> IntAckResponse;
+}
+
+/// Which acknowledge handshake a processor runs — the shape of the cycle, not
+/// the identity of the CPU.
+///
+/// An extensible enumeration rather than a Rust `enum` (CLAUDE.md, "type
+/// conventions") on purpose: a controller normally asks
+/// [`IntAckCycle::level`] and never looks at the kind at all, and the day a
+/// fourth processor family arrives with a fifth thing to present, no
+/// implementor of [`IntAck`] should have to be edited to keep compiling.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IntAckKind(pub u16);
+
+impl IntAckKind {
+    /// The cycle presents nothing: "your request was taken, name your vector".
+    ///
+    /// The 8086's `INTA` pair and the 8259A that answers them. A cascade is
+    /// still expressible — one controller delegating to another is a property
+    /// of the wiring, not of the cycle.
+    pub const VECTOR: IntAckKind = IntAckKind(0);
+    /// The cycle presents a **priority level**, in [`IntAckCycle::level`].
+    ///
+    /// The 68000 drives the level being acknowledged on A3-A1 in CPU space,
+    /// and every controller on the net decides whether it is the one being
+    /// asked.
+    pub const LEVEL: IntAckKind = IntAckKind(1);
+    /// The interrupting device drives a **byte on the data bus**, and the CPU
+    /// makes of it what its current mode says.
+    ///
+    /// The Z80: mode 2 combines the byte with `I` to address a vector table,
+    /// mode 0 executes it as an opcode, and mode 1 ignores it entirely. The
+    /// mode rides in [`IntAckCycle::mode`], because a daisy-chained peripheral
+    /// answering in a machine running mode 1 is answering into the void and is
+    /// entitled to know.
+    pub const DATA_BUS: IntAckKind = IntAckKind(2);
+}
+
+/// What an acknowledge cycle presents to the controllers on the net.
+///
+/// One word: a [`kind`](IntAckCycle::kind) and a detail the kind interprets.
+/// The typed accessors are the interface — [`level`](IntAckCycle::level) is
+/// `None` on a machine whose acknowledge presents no level, which is exactly
+/// the distinction a bare integer argument could not make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IntAckCycle {
+    kind: IntAckKind,
+    detail: u16,
+}
+
+impl IntAckCycle {
+    /// A cycle of `kind`, carrying that kind's detail word.
+    ///
+    /// Prefer the named constructors; this is the escape hatch for a kind
+    /// added after this file was written.
+    #[inline]
+    pub const fn new(kind: IntAckKind, detail: u16) -> IntAckCycle {
+        IntAckCycle { kind, detail }
+    }
+
+    /// An [`IntAckKind::VECTOR`] cycle: nothing presented, answer with a
+    /// vector.
+    #[inline]
+    pub const fn vector_only() -> IntAckCycle {
+        IntAckCycle::new(IntAckKind::VECTOR, 0)
+    }
+
+    /// An [`IntAckKind::LEVEL`] cycle acknowledging `level`.
+    #[inline]
+    pub const fn at_level(level: u8) -> IntAckCycle {
+        IntAckCycle::new(IntAckKind::LEVEL, level as u16)
+    }
+
+    /// An [`IntAckKind::DATA_BUS`] cycle run by a CPU in interrupt `mode`.
+    #[inline]
+    pub const fn data_bus(mode: u8) -> IntAckCycle {
+        IntAckCycle::new(IntAckKind::DATA_BUS, mode as u16)
+    }
+
+    /// Which handshake this is.
+    #[inline]
+    pub const fn kind(self) -> IntAckKind {
+        self.kind
+    }
+
+    /// The raw detail word, for a kind this build does not name.
+    #[inline]
+    pub const fn detail(self) -> u16 {
+        self.detail
+    }
+
+    /// The priority level being acknowledged, or `None` when the cycle
+    /// presents none.
+    ///
+    /// A controller wired to one `IPL` encoding compares this with its own and
+    /// [declines](IntAckResponse::Declined) when they differ.
+    #[inline]
+    pub const fn level(self) -> Option<u8> {
+        match self.kind {
+            IntAckKind::LEVEL => Some(self.detail as u8),
+            _ => None,
+        }
+    }
+
+    /// The interrupt mode the CPU will interpret the answer in, or `None` when
+    /// the cycle carries no mode.
+    #[inline]
+    pub const fn mode(self) -> Option<u8> {
+        match self.kind {
+            IntAckKind::DATA_BUS => Some(self.detail as u8),
+            _ => None,
+        }
+    }
+}
+
+/// What a controller drives back during an acknowledge cycle.
+///
+/// A real `enum`, and this is the case CLAUDE.md means by "exhaustiveness is
+/// genuinely wanted": the outcomes are what *terminates a bus cycle*, every
+/// CPU has to do something different with each of them, and there is no
+/// sensible fallback arm — a fourth outcome must be a compile error in the
+/// three cores rather than silently take some other branch. The extensible
+/// half of the seam is [`IntAckKind`], on the other side of the call, where
+/// the implementors are many and the additions happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IntAckResponse {
+    /// Not mine: this controller is not the one being asked, and drives
+    /// nothing. The cycle passes to the next controller on the net.
+    ///
+    /// A 68000 controller answers this when the level on A3-A1 is not its own.
+    Declined,
+    /// Mine, but I have no vector: the CPU must synthesise one.
+    ///
+    /// The 68000's `VPA`, which selects `AUTOVECTOR_BASE + level`. This
+    /// **terminates** the cycle — a controller that asserts `VPA` has answered,
+    /// and the controllers behind it never see the acknowledge.
+    Autovector,
+    /// Mine, and here is the vector.
+    ///
+    /// A vector number for a 68000 or an x86, the byte on the data bus for a
+    /// Z80. Widened to `u32` for a controller whose answer indexes something
+    /// larger, such as a GIC's `IAR`.
+    Vector(u32),
+}
+
+impl IntAckResponse {
+    /// The vector supplied, if one was.
+    #[inline]
+    pub const fn vector(self) -> Option<u32> {
+        match self {
+            IntAckResponse::Vector(vector) => Some(vector),
+            _ => None,
+        }
+    }
+
+    /// Whether this controller took the cycle, by any answer.
+    #[inline]
+    pub const fn answered(self) -> bool {
+        !matches!(self, IntAckResponse::Declined)
+    }
+}
+
+/// The controllers that answer one processor's acknowledge cycle, in the order
+/// they were attached.
+///
+/// A CPU input pin is a net, and a machine can have **several** controllers
+/// answering one processor: two 68000 interrupt controllers on different `IPL`
+/// pins, or a Z80 daisy chain. So this is a list, not a slot, and an
+/// acknowledge is offered to each in turn until one does not
+/// [decline](IntAckResponse::Declined) — which is what the priority daisy chain
+/// does in hardware, with attach order standing in for physical order.
+/// Deterministic, because the realizer attaches in machine-file order
+/// (CLAUDE.md, "determinism").
+///
+/// References are [`Weak`], always: the machine owns devices and a wire merely
+/// refers to them (§4.3's weak edge), so a CPU that kept its controller alive
+/// would close a cycle nothing could drop. A dead one is skipped.
+///
+/// The lock is a leaf, and is **released before each outward call** — the
+/// re-entrancy contract forbids holding one across a call into another device,
+/// and a controller answering an acknowledge drops its own request line, which
+/// lands straight back on this CPU's pin.
+#[derive(Debug, Default)]
+pub struct IntAckHandlers {
+    handlers: Mutex<Vec<Weak<dyn IntAck>>>,
+}
+
+impl IntAckHandlers {
+    /// An empty list: nothing answers, so every cycle is declined.
+    #[must_use]
+    pub const fn new() -> IntAckHandlers {
+        IntAckHandlers {
+            handlers: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Add a controller, at the end of the order.
+    ///
+    /// Attaching the same controller twice is a no-op: a 68000 controller that
+    /// encodes level 5 drives `IPL0` and `IPL2`, so the realizer offers it on
+    /// both nets, and it must not be asked — or answer — twice.
+    pub fn attach(&self, ack: Weak<dyn IntAck>) {
+        let mut handlers = self.handlers.lock();
+        if handlers.iter().any(|existing| Weak::ptr_eq(existing, &ack)) {
+            return;
+        }
+        handlers.push(ack);
+    }
+
+    /// Whether nothing at all answers.
+    ///
+    /// A CPU uses this to tell "the board has vectoring controllers, and none
+    /// of them claimed this cycle" from "this board has none, so the answer is
+    /// whatever its address decode does".
+    pub fn is_empty(&self) -> bool {
+        self.handlers.lock().is_empty()
+    }
+
+    /// How many controllers are attached, dead ones included.
+    pub fn len(&self) -> usize {
+        self.handlers.lock().len()
+    }
+
+    /// Forget every controller, as re-plugging a wire does.
+    pub fn clear(&self) {
+        self.handlers.lock().clear();
+    }
+
+    /// Run `cycle` past each controller until one answers.
+    ///
+    /// [`IntAckResponse::Declined`] if none does, which is also the answer for
+    /// an empty list. What the CPU makes of that is the CPU's business: a
+    /// 68000 board with no controller on the net autovectors, because its
+    /// address decode is what asserts `VPA`.
+    pub fn run(&self, cycle: IntAckCycle) -> IntAckResponse {
+        let mut next = 0;
+        loop {
+            // Cloned out under the lock and asked outside it, one at a time:
+            // no allocation on the interrupt path, and no lock held across the
+            // call into the controller.
+            let handler = {
+                let handlers = self.handlers.lock();
+                match handlers.get(next) {
+                    Some(handler) => handler.clone(),
+                    None => return IntAckResponse::Declined,
+                }
+            };
+            next += 1;
+            if let Some(ack) = handler.upgrade() {
+                let response = ack.acknowledge(cycle);
+                if response.answered() {
+                    return response;
+                }
+            }
+        }
+    }
 }
 
 /// The data half of a DMA request line.
@@ -2010,5 +2277,150 @@ mod tests {
         assert!(port.lower());
         assert_eq!(port.level(), Level::Low);
         assert!(Arc::ptr_eq(port.wire(), &wire));
+    }
+    // -----------------------------------------------------------------------
+    // The acknowledge cycle
+    // -----------------------------------------------------------------------
+
+    /// A controller that claims one level, or every cycle when it has no level
+    /// of its own — the two shapes a real one comes in.
+    #[derive(Debug)]
+    struct Claiming {
+        level: Option<u8>,
+        answer: IntAckResponse,
+        asked: AtomicUsize,
+    }
+
+    impl Claiming {
+        fn new(level: Option<u8>, answer: IntAckResponse) -> Arc<Claiming> {
+            Arc::new(Claiming {
+                level,
+                answer,
+                asked: AtomicUsize::new(0),
+            })
+        }
+
+        fn asked(&self) -> usize {
+            self.asked.load(SeqCst)
+        }
+    }
+
+    impl IntAck for Claiming {
+        fn acknowledge(&self, cycle: IntAckCycle) -> IntAckResponse {
+            self.asked.fetch_add(1, SeqCst);
+            match self.level {
+                Some(level) if cycle.level() != Some(level) => IntAckResponse::Declined,
+                _ => self.answer,
+            }
+        }
+    }
+
+    #[test]
+    fn a_cycle_carries_only_what_its_kind_presents() {
+        let level = IntAckCycle::at_level(5);
+        assert_eq!(level.kind(), IntAckKind::LEVEL);
+        assert_eq!(level.level(), Some(5));
+        assert_eq!(level.mode(), None);
+
+        // The distinction a bare integer could not make: "no level" is not
+        // "level zero".
+        let plain = IntAckCycle::vector_only();
+        assert_eq!(plain.kind(), IntAckKind::VECTOR);
+        assert_eq!(plain.level(), None);
+        assert_ne!(plain, IntAckCycle::at_level(0));
+
+        let z80 = IntAckCycle::data_bus(2);
+        assert_eq!(z80.mode(), Some(2));
+        assert_eq!(z80.level(), None);
+        assert_eq!(z80.detail(), 2);
+    }
+
+    #[test]
+    fn declining_passes_the_cycle_on_and_answering_ends_it() {
+        let handlers = IntAckHandlers::new();
+        assert!(handlers.is_empty());
+        assert_eq!(
+            handlers.run(IntAckCycle::at_level(1)),
+            IntAckResponse::Declined,
+            "nothing attached declines"
+        );
+
+        let low = Claiming::new(Some(2), IntAckResponse::Vector(80));
+        let high = Claiming::new(Some(5), IntAckResponse::Vector(96));
+        handlers.attach(Arc::downgrade(&low) as Weak<dyn IntAck>);
+        handlers.attach(Arc::downgrade(&high) as Weak<dyn IntAck>);
+        assert_eq!(handlers.len(), 2);
+
+        assert_eq!(
+            handlers.run(IntAckCycle::at_level(5)),
+            IntAckResponse::Vector(96)
+        );
+        assert_eq!(low.asked(), 1, "asked, and declined");
+        assert_eq!(high.asked(), 1);
+
+        assert_eq!(
+            handlers.run(IntAckCycle::at_level(2)),
+            IntAckResponse::Vector(80)
+        );
+        assert_eq!(low.asked(), 2);
+        assert_eq!(high.asked(), 1, "a cycle that was taken is not passed on");
+
+        // `VPA` is an answer, not a decline: it ends the cycle too.
+        let vpa = Claiming::new(Some(3), IntAckResponse::Autovector);
+        let behind = Claiming::new(None, IntAckResponse::Vector(112));
+        let chain = IntAckHandlers::new();
+        chain.attach(Arc::downgrade(&vpa) as Weak<dyn IntAck>);
+        chain.attach(Arc::downgrade(&behind) as Weak<dyn IntAck>);
+        assert_eq!(
+            chain.run(IntAckCycle::at_level(3)),
+            IntAckResponse::Autovector
+        );
+        assert_eq!(behind.asked(), 0);
+        // And when the first one declines, the one behind it answers whatever
+        // level it is asked at.
+        assert_eq!(
+            chain.run(IntAckCycle::at_level(4)),
+            IntAckResponse::Vector(112)
+        );
+        assert_eq!(behind.asked(), 1);
+    }
+
+    #[test]
+    fn the_same_controller_offered_twice_is_kept_once() {
+        let handlers = IntAckHandlers::new();
+        let pic = Claiming::new(None, IntAckResponse::Vector(8));
+        handlers.attach(Arc::downgrade(&pic) as Weak<dyn IntAck>);
+        handlers.attach(Arc::downgrade(&pic) as Weak<dyn IntAck>);
+        assert_eq!(handlers.len(), 1, "one controller, two nets");
+        assert_eq!(
+            handlers.run(IntAckCycle::vector_only()),
+            IntAckResponse::Vector(8)
+        );
+        assert_eq!(pic.asked(), 1);
+    }
+
+    #[test]
+    fn a_controller_the_machine_has_dropped_is_skipped() {
+        let handlers = IntAckHandlers::new();
+        let gone = Claiming::new(None, IntAckResponse::Vector(1));
+        let live = Claiming::new(None, IntAckResponse::Vector(2));
+        handlers.attach(Arc::downgrade(&gone) as Weak<dyn IntAck>);
+        handlers.attach(Arc::downgrade(&live) as Weak<dyn IntAck>);
+        drop(gone);
+        assert_eq!(
+            handlers.run(IntAckCycle::vector_only()),
+            IntAckResponse::Vector(2),
+            "the weak edge is the point: a dead controller answers nothing"
+        );
+        handlers.clear();
+        assert!(handlers.is_empty());
+    }
+
+    #[test]
+    fn a_response_reports_what_it_supplied() {
+        assert_eq!(IntAckResponse::Vector(0x40).vector(), Some(0x40));
+        assert_eq!(IntAckResponse::Autovector.vector(), None);
+        assert!(IntAckResponse::Autovector.answered());
+        assert!(!IntAckResponse::Declined.answered());
     }
 }

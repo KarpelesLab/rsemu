@@ -1089,24 +1089,46 @@ fn properties_reach_the_configuration() {
 /// A peripheral that answers the acknowledge cycle, the way a Z80 PIO or CTC
 /// does: it drives `INT`, and when the CPU acknowledges it puts its programmed
 /// vector on the data bus and counts the service.
+///
+/// It also records the interrupt mode the cycle was run in. A real peripheral
+/// cannot see the mode — nothing on the bus carries it — but the byte it drives
+/// means three different things depending on it, so the seam presents it and a
+/// model is free to use it (a daisy chain in mode 1, for instance, is answering
+/// into the void).
 #[derive(Debug)]
 struct Peripheral {
     vector: u8,
     acknowledged: crate::core::sync::AtomicU32,
+    mode: crate::core::sync::AtomicU32,
+}
+
+impl Peripheral {
+    fn new(vector: u8) -> Arc<Peripheral> {
+        Arc::new(Peripheral {
+            vector,
+            acknowledged: crate::core::sync::AtomicU32::new(0),
+            mode: crate::core::sync::AtomicU32::new(u32::MAX),
+        })
+    }
 }
 
 impl crate::core::wire::IntAck for Peripheral {
-    fn acknowledge(&self) -> u32 {
-        self.acknowledged
-            .fetch_add(1, crate::core::sync::Ordering::Relaxed);
-        u32::from(self.vector)
+    fn acknowledge(
+        &self,
+        cycle: crate::core::wire::IntAckCycle,
+    ) -> crate::core::wire::IntAckResponse {
+        use crate::core::sync::Ordering::Relaxed;
+        self.acknowledged.fetch_add(1, Relaxed);
+        self.mode
+            .store(cycle.mode().map_or(u32::MAX, u32::from), Relaxed);
+        crate::core::wire::IntAckResponse::Vector(u32::from(self.vector))
     }
 }
 
 #[test]
 fn mode_two_takes_its_vector_from_the_device_that_answers_the_acknowledge() {
     use crate::core::device::Device;
-    use crate::core::sync::{AtomicU32, Ordering};
+    use crate::core::sync::Ordering;
     use crate::core::wire::IntAck;
 
     let m = Machine::new();
@@ -1117,10 +1139,7 @@ fn mode_two_takes_its_vector_from_the_device_that_answers_the_acknowledge() {
     m.load(0x2000, &[0xed, 0x4d]); // RETI
     m.load(0x0100, &[0x00]); // NOP
 
-    let device: Arc<Peripheral> = Arc::new(Peripheral {
-        vector: 0x0e,
-        acknowledged: AtomicU32::new(0),
-    });
+    let device = Peripheral::new(0x0e);
     let weak: alloc::sync::Weak<dyn IntAck> = Arc::downgrade(&device) as _;
     m.cpu.attach_int_ack("int", weak);
 
@@ -1141,6 +1160,51 @@ fn mode_two_takes_its_vector_from_the_device_that_answers_the_acknowledge() {
         m.cpu.reg(Reg::Pc),
         0x2000,
         "the vector the device drove is what the CPU jumped through"
+    );
+    assert_eq!(
+        device.mode.load(Ordering::Relaxed),
+        2,
+        "and the cycle told the device which mode it was answering into"
+    );
+}
+
+/// A daisy chain: the peripheral nearest the CPU on `IEI`/`IEO` answers, and
+/// the one behind it never sees the cycle. Attach order is chain order.
+#[test]
+fn the_first_peripheral_in_the_chain_that_answers_takes_the_acknowledge() {
+    use crate::core::device::Device;
+    use crate::core::sync::Ordering;
+    use crate::core::wire::IntAck;
+
+    let m = Machine::new();
+    m.load(0x800e, &[0x00, 0x20]);
+    m.load(0x2000, &[0xed, 0x4d]); // RETI
+    m.load(0x0100, &[0x00]); // NOP
+
+    let near = Peripheral::new(0x0e);
+    let far = Peripheral::new(0x20);
+    for device in [&near, &far] {
+        let weak: alloc::sync::Weak<dyn IntAck> = Arc::downgrade(device) as _;
+        m.cpu.attach_int_ack("int", weak);
+    }
+
+    m.start(0x0100);
+    m.cpu.set_reg(Reg::I, 0x80);
+    m.cpu.set_interrupt_mode(2).expect("mode 2 exists");
+    m.cpu.set_iff(true, true);
+    m.cpu.set_int(true);
+    m.cpu.step();
+
+    assert_eq!(
+        m.cpu.reg(Reg::Pc),
+        0x2000,
+        "the nearest peripheral's vector"
+    );
+    assert_eq!(near.acknowledged.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        far.acknowledged.load(Ordering::Relaxed),
+        0,
+        "an answered acknowledge is not passed down the chain"
     );
 }
 

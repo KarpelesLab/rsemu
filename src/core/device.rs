@@ -449,7 +449,11 @@ pub trait Device: Send + Sync + fmt::Debug {
     /// controller alive would close a cycle nothing could drop.
     ///
     /// Called once per driver on the net, before reset and before the realize
-    /// sweep.
+    /// sweep — so a device may be handed **several**, and must keep them all:
+    /// two 68000 controllers on different `IPL` pins are two calls, and one
+    /// controller driving two pins of the same encoding is two calls naming the
+    /// same object. [`IntAckHandlers`](crate::core::wire::IntAckHandlers) is
+    /// that list, ready made.
     fn attach_int_ack(&self, _port: &str, _ack: Weak<dyn IntAck>) {}
 
     /// The DMA transfer interface this device offers on output pin `port`.

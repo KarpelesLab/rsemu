@@ -152,7 +152,9 @@ use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{self, AtomicBool, AtomicU8, AtomicU16, AtomicU32, LockRank, Ordering};
 use crate::core::value::Width;
-use crate::core::wire::{FanIn, IntAck, Level, Resolve, WireId, WireSink};
+use crate::core::wire::{
+    FanIn, IntAck, IntAckCycle, IntAckHandlers, IntAckResponse, Level, Resolve, WireId, WireSink,
+};
 
 use exec::{Exec, State};
 
@@ -518,19 +520,20 @@ pub(crate) struct Lines {
     /// access this very core issued — and reaching for the session lock there
     /// would re-enter the core's own critical section (`ROADMAP.md` §4.7).
     reset: AtomicBool,
-    /// What answers the interrupt-acknowledge cycle, if a controller does.
+    /// What answers the interrupt-acknowledge cycle, if any controller does.
     ///
-    /// Weak, and behind its own leaf lock: the machine owns both devices, and a
-    /// CPU that kept its controller alive would close a cycle nothing could
-    /// drop (§4.3). Taken and released *before* `acknowledge` is called, so the
-    /// controller is free to take its own.
+    /// A **list**, not a slot, and not one slot per `IPL` pin either: a 68000
+    /// broadcasts the level it is acknowledging on A3-A1 and every controller
+    /// in CPU space decides for itself whether it is the one being asked. So
+    /// the cycle goes to each attached controller in turn, carrying the level
+    /// ([`IntAckCycle::at_level`]), until one stops declining — which is how a
+    /// board with two vectoring controllers on different `IPL` pins works, and
+    /// what could not be said before the cycle carried an argument.
     ///
-    /// **One slot, not one per level**, and that is a limitation rather than a
-    /// design: [`IntAck::acknowledge`] carries no argument, so a controller
-    /// cannot be told which level is being acknowledged and a board with two
-    /// vectoring controllers on different `IPL` pins cannot be expressed. The
-    /// 68000 is the first core to want that; see `docs/`.
-    ack: sync::Mutex<Option<Weak<dyn IntAck>>>,
+    /// Weak references, behind a leaf lock released before each outward call:
+    /// the machine owns the devices, a wire merely refers to them (§4.3), and
+    /// a controller answering is free to take its own locks.
+    acks: IntAckHandlers,
 }
 
 impl Default for Lines {
@@ -543,7 +546,7 @@ impl Default for Lines {
             level_seven: AtomicBool::new(false),
             resets: AtomicU32::new(0),
             reset: AtomicBool::new(false),
-            ack: sync::Mutex::new(None),
+            acks: IntAckHandlers::new(),
         }
     }
 }
@@ -589,30 +592,41 @@ impl Lines {
         self.reset.swap(false, Ordering::AcqRel)
     }
 
-    /// Install what answers the interrupt-acknowledge cycle.
+    /// Add a controller to those that answer the interrupt-acknowledge cycle.
     fn attach_ack(&self, ack: Weak<dyn IntAck>) {
-        *self.ack.lock() = Some(ack);
+        self.acks.attach(ack);
     }
 
-    /// Run the acknowledge cycle: the vector a controller supplies, or `None`
-    /// for the autovector.
+    /// Run the acknowledge cycle for `level`: the vector a controller supplies,
+    /// or `None` for the autovector.
     ///
-    /// A controller that answers offers an [`IntAck`]; one that asserts `VPA`
-    /// offers none, and `None` is what the caller turns into
-    /// `AUTOVECTOR_BASE + level`. An armed
-    /// [`set_interrupt_vector`](M68k::set_interrupt_vector) is checked first,
-    /// so a test or a host driving the core by hand still works.
+    /// The three things a 68000 acknowledge cycle can end in, and what each
+    /// means here:
     ///
-    /// The lock is released before the outward call: the re-entrancy contract
+    /// - a controller drives a vector number and `DTACK`
+    ///   ([`IntAckResponse::Vector`]) — that vector;
+    /// - a controller recognises the level and asserts `VPA`
+    ///   ([`IntAckResponse::Autovector`]) — `None`, and the controllers behind
+    ///   it are never asked, because the cycle is over;
+    /// - nobody claims the level ([`IntAckResponse::Declined`]) — also `None`.
+    ///   Hardware would leave the cycle to be terminated by the board, whose
+    ///   address decode asserts `VPA` on most 68000 machines and `BERR` (hence
+    ///   [`vector::SPURIOUS`]) on the rest. The board's decode is not modelled,
+    ///   and autovectoring is what the common one does.
+    ///
+    /// An armed [`set_interrupt_vector`](M68k::set_interrupt_vector) is checked
+    /// first, so a test or a host driving the core by hand still works.
+    ///
+    /// No lock is held across the outward call: the re-entrancy contract
     /// forbids holding one across a call into another device (§4.7).
-    pub(crate) fn acknowledge(&self) -> Option<u8> {
+    pub(crate) fn acknowledge(&self, level: u8) -> Option<u8> {
         if let Some(armed) = self.take_vector() {
             return Some(armed);
         }
-        let handler = self.ack.lock().clone();
-        handler
-            .and_then(|weak| weak.upgrade())
-            .map(|ack| ack.acknowledge() as u8)
+        match self.acks.run(IntAckCycle::at_level(level)) {
+            IntAckResponse::Vector(vector) => Some(vector as u8),
+            IntAckResponse::Autovector | IntAckResponse::Declined => None,
+        }
     }
 
     pub(crate) fn pulse_reset(&self) {
@@ -1127,11 +1141,12 @@ impl Device for M68k {
     }
 
     fn attach_int_ack(&self, port: &str, ack: Weak<dyn IntAck>) {
-        // Any `IPL` pin: a 68000's acknowledge cycle puts the *level* on
-        // A3-A1 and a device decides whether it is the one being asked, so the
-        // handler does not belong to one line. `IntAck::acknowledge` takes no
-        // argument, though, so only one controller on this core can vector —
-        // see [`Lines::acknowledge`].
+        // Any `IPL` pin, and every controller offered on one is kept: a 68000's
+        // acknowledge cycle puts the *level* on A3-A1 and each device in CPU
+        // space decides whether it is the one being asked, so a handler belongs
+        // to the processor rather than to one line. A controller encoding level
+        // 5 drives `ipl0` and `ipl2` and is offered twice; `IntAckHandlers`
+        // keeps it once. See [`Lines::acknowledge`].
         if matches!(port, "ipl0" | "ipl1" | "ipl2") {
             self.lines.attach_ack(ack);
         }

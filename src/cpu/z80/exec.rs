@@ -389,7 +389,7 @@ impl<'a> Exec<'a> {
         // moves the request from pending to in service while it is there. With
         // nothing attached the latched byte is the answer, which is what a
         // machine with one fixed source sets once.
-        let value = self.lines.acknowledge();
+        let value = self.lines.acknowledge(self.state.im);
         let addr = self.state.regs.pc;
         self.latch = refresh;
         self.log(BusCycle {
