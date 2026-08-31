@@ -90,6 +90,21 @@ machine-apple1 = ["cpu-mos6502", "dev-apple1"]
 # no dependencies and is `no_std + alloc`.
 cpu-riscv = []
 
+# The WDC 65xx peripherals (src/dev/wdc): the W65C51N ACIA as a character
+# device, the W65C22 VIA with both ports and both timers, and the 32 KiB
+# program EEPROM socket a 6502 breadboard computer boots from — plus
+# RSMON/serial, rsemu's own monitor for it. `no_std + alloc` and
+# dependency-free. Uses the character-device seam in `host::chardev`, which is
+# `no_std` too; only its terminal backend needs `std`.
+dev-wdc = []
+
+# Ben Eater's 6502 breadboard computer as a machine
+# (machines/beneater-6502.machine plus the classes it names): a 6502 at 1 MHz,
+# 16 KiB of RAM, a serial console on the ACIA, a VIA, and 32 KiB of ROM.
+# `rsemu run beneater-6502` boots a monitor over the terminal. Adds no
+# dependencies.
+machine-beneater = ["cpu-mos6502", "dev-wdc"]
+
 # The MOS 6502 core (src/cpu/mos6502): a cycle-accurate interpreter with every
 # documented and undocumented opcode, a disassembler generated from the same
 # table, and the RP2A03 (NES) variant selected by a construction property. Adds

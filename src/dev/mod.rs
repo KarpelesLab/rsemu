@@ -15,6 +15,7 @@
 //! | [`apu`] | `dev-nes-apu` | the RP2A03 audio half: channels, frame counter, DMC |
 //! | [`cart`] | `dev-nes-cart` | cartridge images and the mappers that decode them |
 //! | [`ppu`] | `dev-nes-ppu` | the RP2C02 picture unit: the per-dot pipeline |
+//! | [`wdc`] | `dev-wdc` | the W65C51N ACIA and W65C22 VIA, and a 6502 board's ROM |
 //!
 //! Most of `dev/` is `no_std + alloc`. The two documented exceptions —
 //! `dev/blk/*` and `dev/net/*`, which are `std` because `fstool` and `pktkit`
@@ -35,3 +36,7 @@ pub mod cart;
 #[cfg(feature = "dev-nes-ppu")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-ppu")))]
 pub mod ppu;
+
+#[cfg(feature = "dev-wdc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-wdc")))]
+pub mod wdc;
