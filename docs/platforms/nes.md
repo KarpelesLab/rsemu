@@ -39,6 +39,42 @@ Karpelès) and its PPU/APU lineage derives from Michael Fogleman's MIT-licensed
 NES emulator. Both are permissive, so the port is clean — **carry Fogleman's
 copyright notice into any file derived from that code.**
 
+## Regional variants — three machines, not one
+
+Verified against NESdev's [Cycle reference chart](https://www.nesdev.org/wiki/Cycle_reference_chart).
+Each is a separate `.machine` file; the differences are far more than a
+frequency.
+
+| | NTSC (2C02) | PAL (2C07) | Dendy (UA6538) |
+| --- | --- | --- | --- |
+| Master clock | 236250000/11 Hz | 26.6017125 MHz = 53203425/2 Hz | like PAL |
+| CPU divider | ÷12 | ÷16 | ÷15 |
+| Master clocks per PPU dot | 4 | 5 | 5 |
+| PPU dots per CPU cycle | 3 | **3.2** | 3 |
+| Scanlines per frame | 262 | 312 | 312 |
+| Odd-frame dot skip | yes | **no** | no |
+| Picture height | 240 | 239 | 239 |
+| Post-render blanking | 1 line | 1 line | **51 lines** |
+| VBlank after NMI | 20 lines | 70 lines | like NTSC |
+| APU frame counter | 60 Hz | 50 Hz | 59 Hz |
+| Frame rate | 60.0988 Hz | 50.0070 Hz | like PAL |
+
+Two of these numbers are worth pausing on, because the framework was designed
+for exactly them (`ROADMAP.md` §4.2):
+
+- **Neither master clock is an integer number of hertz.** NTSC is 236.25 MHz ÷
+  11 by definition; PAL is 26.6017125 MHz by definition. This is why frequency
+  literals in the DSL are *rational*, and why writing `21477272 Hz` would be
+  wrong rather than merely imprecise.
+- **PAL runs 3.2 PPU dots per CPU cycle** — 16:5, not an integer. Nintendo kept
+  the Johnson counter's even period and divided by 16 rather than 15. An
+  emulator that counts CPU cycles cannot represent that ratio exactly and must
+  fudge it; counting *master ticks* makes it exact by construction, because both
+  domains descend from one crystal. Dendy is the counterexample that proves the
+  point: same crystal, ÷15, and the ratio returns to a clean 3.
+  **Never introduce a "dots per CPU cycle" constant** — derive from the
+  dividers, or PAL is wrong the moment someone writes `3`.
+
 ## Validation
 
 `nestest` trace comparison, blargg's test ROMs, and AccuracyCoin. Licences and
