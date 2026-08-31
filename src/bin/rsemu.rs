@@ -11,8 +11,12 @@
 
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rsemu::core::clock::GlobalTime;
+use rsemu::host::chardev::{CharDevice, CharPort, ports};
+use rsemu::host::terminal::Terminal;
 use rsemu::machine::{Machine, catalog};
 
 const USAGE: &str = "\
@@ -36,7 +40,11 @@ RUN OPTIONS:
     --media <n>=<file>  Bind any media slot by name
     -p <name>=<value>   Override a `param` declared in the machine file
     --for <duration>    How much virtual time to run, as `1s`, `500ms`, `2m`
-                        (default 1s)
+                        (default 1s, or forever with a console attached)
+    --console <name>    Attach this terminal to a named character port. A
+                        machine that opens exactly one is picked up on its own,
+                        so `rsemu run apple1` is interactive already
+    --headless          Do not attach a terminal, whatever the machine opened
     -q, --quiet         Only print the summary
 
 OPTIONS:
@@ -102,7 +110,10 @@ fn machines() -> ExitCode {
                 .iter()
                 .map(|s| format!("--{s} <file>"))
                 .collect();
-            println!("{:<12} needs {}", "", slots.join(", "));
+            // "media", not "needs": a slot with no default is an error naming
+            // itself when the machine is built, and `apple1` binds its own
+            // monitor ROM when nothing else does.
+            println!("{:<12} media {}", "", slots.join(", "));
         }
     }
     ExitCode::SUCCESS
@@ -172,6 +183,13 @@ struct RunArgs {
     media: Vec<(String, String)>,
     params: Vec<(String, String)>,
     span: GlobalTime,
+    /// Whether `--for` was given. Without it an interactive machine runs until
+    /// the user stops it, and a headless one runs for a second.
+    span_given: bool,
+    /// The character port to attach this terminal to, if the user named one.
+    console: Option<String>,
+    /// Whether the user asked for no terminal at all.
+    headless: bool,
     quiet: bool,
 }
 
@@ -195,6 +213,15 @@ fn run(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
+    }
+
+    // A machine that wants a `rom` and was given none gets rsemu's own Apple 1
+    // monitor, so `rsemu run apple1` works with no arguments and no ROM of
+    // unclear provenance. Media nothing asked for is ignored, so this cannot
+    // affect any other machine.
+    #[cfg(feature = "dev-apple1")]
+    if !images.iter().any(|(slot, _)| slot == "rom") {
+        images.push((String::from("rom"), rsemu::dev::apple1::RSMON.to_vec()));
     }
 
     // A path wins over a catalog name, so a user editing a copy of a shipped
@@ -235,6 +262,18 @@ fn run(args: &[String]) -> ExitCode {
     if !parsed.quiet {
         describe_machine(&machine);
     }
+
+    // A machine that opened a character port has a console; attach this
+    // terminal to it and hand the keyboard over.
+    match console_port(&parsed) {
+        Err(e) => {
+            eprintln!("rsemu: {e}");
+            return ExitCode::from(2);
+        }
+        Ok(Some(port)) => return interact(&mut machine, &port, &parsed),
+        Ok(None) => {}
+    }
+
     if let Err(e) = machine.run_for(parsed.span) {
         eprintln!("rsemu: {e}");
         summarise(&machine);
@@ -242,6 +281,133 @@ fn run(args: &[String]) -> ExitCode {
     }
     summarise(&machine);
     ExitCode::SUCCESS
+}
+
+/// Which character port this terminal should attach to, if any.
+///
+/// The machine has already been built, so every port its devices asked for is
+/// open. One is unambiguous; several need `--console` to choose between them,
+/// because guessing would put the keyboard on the wrong machine.
+fn console_port(args: &RunArgs) -> Result<Option<Arc<CharPort>>, String> {
+    if args.headless {
+        return Ok(None);
+    }
+    if let Some(name) = &args.console {
+        return ports::get(name).map(Some).ok_or_else(|| {
+            format!(
+                "no character port named `{name}`; this machine opened {}",
+                list(&ports::names())
+            )
+        });
+    }
+    let names = ports::names();
+    match names.len() {
+        0 => Ok(None),
+        1 => Ok(ports::get(&names[0])),
+        _ => Err(format!(
+            "this machine has {} character ports ({}); pick one with --console, or --headless",
+            names.len(),
+            list(&names)
+        )),
+    }
+}
+
+/// `a`, `b` and `c`, or "none".
+fn list(names: &[String]) -> String {
+    if names.is_empty() {
+        return String::from("none");
+    }
+    names
+        .iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<String>>()
+        .join(", ")
+}
+
+/// How much virtual time to advance between two visits to the terminal.
+///
+/// Ten milliseconds: short enough that a keystroke is picked up before the eye
+/// notices, long enough that the scheduler is not the bottleneck.
+const SLICE: GlobalTime = GlobalTime::from_nanos(10_000_000);
+
+/// How many quiet slices after end-of-input before a piped session gives up.
+///
+/// Two virtual seconds: long enough for a paced 60-character-a-second display
+/// to finish a screenful it was still emitting when the script ran out.
+const IDLE_SLICES: u32 = 200;
+
+/// Run the machine with the terminal attached, until the user stops it.
+///
+/// Virtual time is held to real time by sleeping off whatever the slice did not
+/// use. Nothing below `host/` reads a clock (`CLAUDE.md`); this is `host/`'s
+/// job, and it is why an Apple 1 here feels like an Apple 1 rather than
+/// finishing a screenful of output before the terminal has drawn a line.
+fn interact(machine: &mut Machine, port: &CharPort, args: &RunArgs) -> ExitCode {
+    let term = Terminal::open();
+    if !args.quiet {
+        if term.is_raw() {
+            eprintln!("  console attached — Ctrl-C to stop\n");
+        } else {
+            eprintln!(
+                "  console attached, cooked mode — stdin could not be put in raw mode.\n  \
+                 On a terminal that means input arrives a line at a time and is\n  \
+                 echoed twice, once by the host and once by the guest.\n"
+            );
+        }
+    }
+
+    let deadline = args
+        .span_given
+        .then(|| machine.now().saturating_add(args.span));
+    let started = Instant::now();
+    let mut elapsed = GlobalTime::ZERO;
+    let mut idle = 0u32;
+
+    let status = loop {
+        if term.interrupted() {
+            break ExitCode::SUCCESS;
+        }
+        if deadline.is_some_and(|d| machine.now() >= d) {
+            break ExitCode::SUCCESS;
+        }
+        let mut moved = term.pump(port);
+        if let Err(e) = machine.run_until(machine.now().saturating_add(SLICE)) {
+            eprintln!("\r\nrsemu: {e}");
+            break ExitCode::FAILURE;
+        }
+        moved += term.pump(port);
+
+        // A script on stdin has an end; a person does not. Once the input is
+        // exhausted *and* the machine has gone quiet, there is nobody left to
+        // wait for, so `printf … | rsemu run apple1` finishes rather than
+        // hanging on a machine that will never be typed at again.
+        if term.at_eof() && moved == 0 {
+            idle += 1;
+            if idle >= IDLE_SLICES {
+                break ExitCode::SUCCESS;
+            }
+        } else {
+            idle = 0;
+        }
+
+        // Hold virtual time to real time. A slice that took longer than its
+        // own span to simulate simply does not sleep, and the machine runs
+        // slow rather than jumping.
+        elapsed = elapsed.saturating_add(SLICE);
+        let target = Duration::from_nanos(elapsed.as_nanos());
+        if let Some(wait) = target.checked_sub(started.elapsed()) {
+            std::thread::sleep(wait);
+        }
+    };
+
+    // Restore the terminal before anything else is printed on it.
+    term.flush();
+    drop(term);
+    if !args.quiet {
+        println!();
+        summarise(machine);
+    }
+    status
 }
 
 /// A machine description by path, or by catalog name.
@@ -273,6 +439,9 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         // short enough that a broken one does not hang a terminal. There is no
         // "until the user quits" yet — that needs the host window (phase 3).
         span: GlobalTime::from_nanos(1_000_000_000),
+        span_given: false,
+        console: None,
+        headless: false,
         quiet: false,
     };
     let mut i = 0;
@@ -311,7 +480,10 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
                 // The timeline is in 2^-64-second units and durations are in
                 // picoseconds; nanoseconds is the unit both agree on.
                 out.span = GlobalTime::from_nanos(d.as_picos() / 1_000);
+                out.span_given = true;
             }
+            "--console" => out.console = Some(value(arg)?),
+            "--headless" => out.headless = true,
             "-q" | "--quiet" => out.quiet = true,
             other if other.starts_with('-') => {
                 return Err(format!("unknown option `{other}`"));

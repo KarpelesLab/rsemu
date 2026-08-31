@@ -1,0 +1,92 @@
+# The Apple 1 (1976) — a 6502, some RAM, one PIA, and a monitor ROM.
+#
+#   rsemu run apple1                    # rsemu's own monitor, RSMON
+#   rsemu run apple1 --rom wozmon.bin   # or the Woz Monitor, if you have it
+#
+# The smallest complete machine rsemu ships, and the first one you can type at.
+# There is no video timing here and no sound at all: the whole of the machine's
+# I/O is four registers of an MC6821, with a keyboard on one port and a 40x24
+# character terminal on the other.
+#
+# Sources: the MC6821 data sheet for the register model; Applefritter's "Apple I
+# Replica Creation" chapter 7, table 7.5, for what the four addresses are on
+# this board and for the display's DA/RDA handshake; the Apple 1's published
+# clock derivation for the oscillator below. `docs/platforms/apple1.md` has the
+# long form and the citations.
+
+machine "apple1" {
+  # The machine shipped with 4 KiB at $0000 and took 8 KiB. `-p ram=8K`.
+  param ram = 4K
+
+  # Which character port the keyboard and display attach to, so that two of
+  # these can run in one process without typing at each other (`-p console=b`).
+  param console = "console"
+
+  # Whether the display runs at its real rate. `-p pace=false` releases every
+  # character on the store instruction, which is what a test wants and what a
+  # person waiting for a memory dump to scroll past might too.
+  param pace = true
+
+  # 14.31818 MHz, and it is exactly four times the NTSC colour burst — which is
+  # 315/88 MHz, so the crystal is 315/22 MHz and genuinely not an integer number
+  # of hertz. Writing 14318182 Hz here would be a rounding error nailed into the
+  # timeline (ROADMAP.md §4.2), so the literal stays rational.
+  osc master = 315000000/22 Hz
+
+  # The terminal section takes one character per video field, which is about
+  # sixty a second, and that pace is a large part of what using the machine felt
+  # like. It is deliberately *not* derived from `master`: the video section is
+  # timed off the same crystal, but the exact divisor is not something this
+  # file's sources state, and inventing a plausible one would be a worse lie
+  # than an honest second tree. Cross-tree conversion is fixed-point and exact
+  # to the timeline's resolution (ROADMAP.md §4.2); an intra-tree ratio would
+  # have been exact to the cycle, and would have been wrong.
+  osc video = 60 Hz
+
+  # A 6502 drives sixteen address lines, and this board decodes very few of
+  # them. Nothing answers most of the space, and there is no bus-error line for
+  # it to answer with: an address nobody drives leaves the last value on the
+  # wire.
+  space cpubus { width = 16, unassigned = open-bus }
+
+  object wram "ram" { size = ram }
+
+  object cpu "cpu.mos6502" {
+    # 14.31818 MHz / 14 = 45/44 MHz = 1022727.27… Hz, the 1.023 MHz the machine
+    # is always quoted at. Exact, because the ratio is an integer divisor of the
+    # crystal rather than a decimal.
+    clock   = master / 14
+    space   = cpubus
+    engine  = "interp"
+    # A real MOS 6502, BCD adder included — this is not the NES's RP2A03.
+    decimal = true
+  }
+
+  # The keyboard and the display, both of them one MC6821. Its clock is the
+  # display's character rate: one tick releases at most one character, which is
+  # what makes a guest polling bit 7 of $D012 wait as long as it should.
+  object pia "apple1.pia" {
+    clock = video
+    port  = console
+    paced = pace
+  }
+
+  # Two 256x4 PROMs' worth of monitor, holding the 6502's vectors as well, which
+  # is why the machine boots at all. `rom` names a media slot rather than a
+  # file: whoever runs the machine binds the bytes (`--rom wozmon.bin`), and
+  # nothing below host/ opens a file.
+  object rom "apple1.rom" { rom = "rom" }
+
+  # -- the memory map --------------------------------------------------------
+  map cpubus 0x0000 size ram   = wram
+  # The PIA's CS0 is A4 and its register selects are A0 and A1, so within the
+  # sixteen bytes at $D010 the four registers answer four times over. (The board
+  # repeats them all through $Dxxx as well; the rest of the page is left on the
+  # open bus, which reads the same as an unclaimed address either way.)
+  map cpubus 0xd010 size 0x10  = mirror(pia)
+  map cpubus 0xff00 size 0x100 = rom
+
+  # Not here, and deliberately: the cassette interface at $C100, and the Apple
+  # BASIC ROM at $E000. Neither is on the board — both are expansion cards — and
+  # neither is needed to boot a monitor and type at it.
+}
