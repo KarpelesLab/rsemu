@@ -9,6 +9,7 @@
 //! | Core | Feature | State |
 //! | --- | --- | --- |
 //! | `mos6502` | `cpu-mos6502` | cycle-accurate interpreter, illegal opcodes, disassembler |
+//! | `z80` | `cpu-z80` | cycle-accurate interpreter, every prefix page, MEMPTR, separate I/O space |
 //!
 //! Every core ships an interpreter first; the IR frontend comes later and is
 //! differentially tested against it forever. **The interpreter is the oracle.**
@@ -20,3 +21,7 @@ pub mod mos6502;
 #[cfg(feature = "cpu-arm")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm")))]
 pub mod arm;
+
+#[cfg(feature = "cpu-z80")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-z80")))]
+pub mod z80;
