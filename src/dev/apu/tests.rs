@@ -529,6 +529,26 @@ fn a_4015_enable_holds_the_next_fetch_off_for_three_cycles() {
 }
 
 #[test]
+fn two_fetches_cannot_be_back_to_back() {
+    // "The DMA cannot occur within 2 cycles of a previous DMC DMA"
+    // (AccuracyCoin, "Implicit DMA Abort" subtest 4).
+    let apu = apu();
+    apu.write(0x12, 0x00);
+    apu.write(0x13, 0x0f); // long enough to keep asking
+    apu.advance(100);
+    apu.write(0x15, 0x10);
+    let first = apu.dma_request().expect("a load fetch is scheduled");
+    assert!(apu.dma_complete(first.serial, 0x55));
+    // Run the output unit until the buffer empties and the reload is asked for.
+    apu.advance(8 * 428);
+    let next = apu.dma_request().expect("the reader wants the next byte");
+    assert!(
+        next.not_before > first.at,
+        "the fetch that follows one cannot halt on top of it"
+    );
+}
+
+#[test]
 fn the_memory_reader_wraps_from_ffff_to_8000() {
     let apu = apu();
     apu.write(0x12, 0xFF); // $C000 + 255 * 64 = $FFC0

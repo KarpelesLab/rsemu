@@ -21,7 +21,7 @@
 #
 # ---------------------------------------------------------------------------
 # 2026-08-31: 130 of 141 pass, 11 fail.
-# 2026-09-01: 138 of 141 pass, 3 fail.
+# 2026-09-01: 139 of 141 pass, 2 fail.
 # ---------------------------------------------------------------------------
 #
 # The measurement before this one read "81 of 125", through a stale copy of the
@@ -70,13 +70,26 @@
 # cycles ("no-operation cycles are allowed to overlap with each other and with
 # access cycles, allowing cycles to be saved" — NESdev, DMA).
 #
-# The `$4015` enable latch *is* modelled now, and it closed "Delta Modulation
-# Channel": a fetch the timer schedules while an enabling `$4015` write is still
-# settling is ready but may not halt until three CPU cycles after that write.
-# Three is the ROM's own figure and it is measured three times over — subtests
-# L, M and N write `$4015` two, one and zero cycles before the timer reaches
-# zero and demand one, two and three cycles of delay — and both two and four
-# fail all three.
+# What *is* modelled now, and what closed "Delta Modulation Channel" and
+# "Implicit DMA Abort":
+#
+#   * the `$4015` enable latch. A fetch the timer schedules while an enabling
+#     `$4015` write is still settling is ready but may not halt until three CPU
+#     cycles after that write. Three is the ROM's own figure and it is measured
+#     three times over — subtests L, M and N of the DMC test write `$4015` two,
+#     one and zero cycles before the timer reaches zero and demand one, two and
+#     three cycles of delay — and both two and four fail all three.
+#   * the memory reader's counter settles a cycle *after* the byte arrives, so a
+#     sample buffer that empties before it does schedules an ordinary four-cycle
+#     fetch, one that empties within two cycles after it gets the one-cycle
+#     aborted DMA, and one later than that gets nothing. That three-band shape
+#     is "Implicit DMA Abort"'s three sixteen-entry keys.
+#   * "the DMA cannot occur within 2 cycles of a previous DMC DMA" — the ROM's
+#     own words for that test's fourth subtest. Without the gap a reload halts
+#     on the very next cycle, a get, and costs three cycles instead of four.
+#
+# Our profile is the one the ROM calls "Implicit Abort Behavior 1" (its
+# post-1990 CPU key set), which is consistent with targeting an RP2A03G.
 
 77                # $0477 "DMC DMA + OAM DMA" code 2: the thirty-two entry
                   # answer key sweeps a DMC fetch across the start and the end
@@ -86,17 +99,6 @@
                   # 1-cycle (second-to-last put) and 3-cycle (last put)
                   # end-of-transfer cases cannot be produced at all, because the
                   # job cannot outlive `state.oam`.
-78                # $0478 "Implicit DMA Abort" code 2: the same aborted DMA that
-                  # "Explicit DMA Abort" now passes, reached by letting a
-                  # one-byte non-looping sample end of its own accord rather
-                  # than by writing `$4015`. Measured, our three sixteen-entry
-                  # arrays are each shifted two positions early against the
-                  # ROM's keys, so the abort fires two CPU cycles before
-                  # hardware's — the implicit stop is recorded when the fetch
-                  # completes, and that is evidently not the cycle the channel
-                  # stops on. The explicit path is right; this one is not, and
-                  # guessing an offset to make it line up would be fitting a
-                  # constant to a test rather than modelling the chip.
 
 # ---------------------------------------------------------------------------
 # B. The 2A03's internal block does not answer a DMA aimed at somebody else
