@@ -962,12 +962,18 @@ impl Hcd {
         {
             let mut regs = self.regs.lock();
             let ticks = regs.ticks;
+            // `USBMODE.CM` is write-once **after a reset**, so a reset is
+            // what re-arms it — it is not preserved. That reading is the
+            // literal one, and it is also the only one under which the
+            // DigiColor firmware's role switch works: that firmware is a host
+            // for mass storage and PictBridge and a *device* for the printer
+            // it presents, and its `EHCI_Host_Reset` asserts `HCReset`
+            // (docs/buses/usb.md, step 2) **before** it selects the role and
+            // reads it back (step 3). A model that carried the old role across
+            // the reset would refuse the new one as a second write, and the
+            // read-back the firmware spins on would return the wrong mode.
             *regs = Regs {
                 ticks,
-                // A reset does not un-choose the role: on a dual-role part
-                // `USBMODE` survives `HCRESET`, which is why firmware writes it
-                // first and resets afterwards.
-                usbmode: regs.usbmode,
                 ..Regs::reset(self.params.ports, self.params.dual_role)
             };
             self.publish(&regs);

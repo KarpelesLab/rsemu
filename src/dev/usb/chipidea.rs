@@ -66,17 +66,96 @@
 //! facing the other way — and pretending otherwise by half-implementing the
 //! endpoint registers would produce a device that looks like it works.
 //!
-//! # Sources
+//! # The firmware's initialisation handshake
 //!
-//! The register layout and the `ID`/`HWxxx`/`DCCPARAMS` field definitions are
-//! the ChipIdea (formerly ARC) USB-HS core's, as published in the USB chapters
-//! of freely available SoC reference manuals for parts that license it. The
-//! host half is EHCI 1.0. The `0xfa05` identification value is the CX92755's,
-//! from first-party reverse engineering of the owner's own hardware, and it is
-//! a **property** rather than a constant because it belongs to the SoC. It is
-//! also self-consistent with the published `ID` field format, which is a useful
-//! check: `0xfa05` is `ID = 5` in bits 5:0 with `NID = 0x3a` in bits 13:8, and
-//! `0x3a` is the six-bit one's complement of `5`.
+//! `docs/buses/usb.md` records the `EHCI_Host_Reset` → `EHCI_Init` flow the
+//! DigiColor firmware performs. Steps 1 to 4 are this file's; 5 to 7 are the
+//! generic controller's, and are where they belong.
+//!
+//! | Step | What the firmware does | What answers it |
+//! | --- | --- | --- |
+//! | 1 | poll `USBSTS.HCHalted` until halted | `HCHalted` is set out of reset, and thereafter is exactly `!RunStop` |
+//! | 2 | assert `USBCMD.HCReset`, poll until it **self-clears** | the write never reaches `USBCMD`; it runs a reset and the register reads back with the bit clear |
+//! | 3 | select host mode through `USBMODE`, then **read it back** | `CM` is write-once *after a reset*, and step 2's reset is what re-armed it, so the write takes and the read-back answers |
+//! | 4 | read `ID` and check `(ID & 0xFFFF) == 0xFA05` | the `id` property, defaulting to [`CX92755_ID`] |
+//!
+//! Step 3 is the one worth dwelling on. `CM` being write-once means a model
+//! has to decide what a controller reset does to it, and the two readings are
+//! not equivalent: **re-arming** is what makes the documented order work, and
+//! it is also what makes a *role switch* work — this firmware is a host for
+//! mass storage and PictBridge and a device for the printer it presents, so it
+//! changes role. Carrying the old role across `HCReset` would make step 3's
+//! read-back return the previous mode and hang the firmware on its own check.
+//! [`Hcd::reset`](super::ehci::Hcd::reset) therefore re-arms it, and
+//! `a_reset_re_arms_the_role_select_so_a_switch_works` is the test that keeps
+//! it that way.
+//!
+//! Steps 1 and 2 are the ones a stub already satisfied — the note in
+//! `docs/buses/usb.md` records that self-clearing `HCReset` and reporting
+//! `HCHalted = !RunStop` was enough to get the real firmware past the spin it
+//! was stuck on. **That is the trap**: this firmware treats USB host as
+//! optional and degrades rather than failing, so those two bits alone look
+//! like a clean boot. Step 4 succeeding is the first thing that changes its
+//! behaviour, and the first thing that can regress it.
+//!
+//! # Sources, and which one wins
+//!
+//! Two sources, and they are not equal:
+//!
+//! * **First-party reverse engineering of the CX92755-class firmware**, in
+//!   `docs/buses/usb.md`. No public datasheet for this block is available, so
+//!   for this part those notes *are* the specification. They fix the `+0x140`
+//!   operational offset, the `ID` magic and the check that reads it, the four
+//!   registers the reset handshake touches (`USBCMD` `+0x140`, `USBSTS`
+//!   `+0x144`, `USBINTR` `+0x148`, `USBMODE` `+0x1a8`), the seven-step flow,
+//!   and both roles the firmware uses.
+//! * **The published ChipIdea/ARC USB-HS core layout**, from the USB chapters
+//!   of freely available SoC reference manuals for parts that license it. This
+//!   is the general core, and it is where everything the reverse engineering
+//!   did not need comes from: the capability block at `+0x100` with
+//!   `CAPLENGTH` reading `0x40`, `DCIVERSION`/`DCCPARAMS` at `+0x120`/`+0x124`,
+//!   `OTGSC` at `+0x1a4`, `BURSTSIZE`/`TXFILLTUNING`/`TTCTRL`/`ULPI_VIEWPORT`,
+//!   the `HWxxx` block below `+0x100`, and the `ID`/`NID`/`REVISION` field
+//!   format.
+//!
+//! **Where the two disagree, the part wins**, because the part is what this
+//! board has. They do not currently disagree: every offset the reverse
+//! engineering fixes is exactly where the published layout puts it, which is
+//! itself worth recording — it is evidence that this really is a stock core
+//! and that the rest of the published map is a reasonable thing to build on.
+//!
+//! Two things are inferred rather than confirmed, and are flagged here so that
+//! a future contradiction is recognised as one rather than absorbed:
+//!
+//! * **`CAPLENGTH = 0x40` and the capability block at `+0x100`.** The reverse
+//!   engineering fixes `+0x140` for the operational registers but does not say
+//!   how the block gets there, and the firmware's flow never reads
+//!   `CAPLENGTH` — it evidently hard-codes the offset, as firmware for a known
+//!   part does. `0x100 + 0x40` is the published arrangement and reproduces the
+//!   one number that *is* confirmed, so it is what this file implements.
+//! * **`REVISION` in `ID` bits 23:16.** The firmware masks `ID` with `0xFFFF`,
+//!   so the upper half is unconstrained; the `id` property is therefore the
+//!   whole 32-bit register value and defaults to `0xfa05` exactly, with the
+//!   revision reading zero. A board that knows its silicon revision puts it in
+//!   the property.
+//!
+//! The `0xfa05` value is self-consistent with the published field format,
+//! which is a useful cross-check on a magic number: it is `ID = 5` in bits 5:0
+//! with `NID = 0x3a` in bits 13:8, and `0x3a` is the six-bit one's complement
+//! of `5`. `the_identification_register_is_the_cx92755s` asserts that
+//! relationship rather than only the constant.
+//!
+//! # What is *not* in the recorded flow, and matters
+//!
+//! The reverse-engineered flow covers reset, role selection, detection,
+//! allocation, schedule construction and interrupt enable. It does not mention
+//! `CONFIGFLAG` or `PORTSC`. EHCI 1.0 §4.2 leaves every root port owned by a
+//! companion controller until `CONFIGFLAG` is written, and this model obeys
+//! that — so if the firmware genuinely never writes it, nothing will enumerate
+//! and the cause will be a port that was never claimed rather than anything in
+//! the schedule walker. That is the first thing to check when this block is
+//! wired to a real image, and it is not something to pre-emptively paper over
+//! by defaulting `CONFIGFLAG` to one.
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
@@ -756,6 +835,138 @@ mod tests {
                 .is_err(),
             "USBSTS is write-1-to-clear; a debugger must not acknowledge an interrupt"
         );
+    }
+
+    // Offsets the firmware's reset handshake touches, spelled as
+    // `docs/buses/usb.md` spells them rather than derived, so that a change to
+    // `OPERATIONAL_BASE` shows up here as a failure rather than as agreement.
+    const FW_USBCMD: u64 = 0x140;
+    const FW_USBSTS: u64 = 0x144;
+    const FW_USBINTR: u64 = 0x148;
+    const FW_USBMODE: u64 = 0x1a8;
+
+    /// `USBCMD` bit 0.
+    const RUN_STOP: u32 = 1 << 0;
+    /// `USBCMD` bit 1.
+    const HC_RESET: u32 = 1 << 1;
+    /// `USBSTS` bit 12.
+    const HC_HALTED: u32 = 1 << 12;
+
+    /// The `EHCI_Host_Reset` to `EHCI_Init` handshake of
+    /// `docs/buses/usb.md`, steps 1 to 4, in the documented order.
+    ///
+    /// Steps 5 to 7 — allocating buffer pools, building the schedules and
+    /// enabling interrupts — are the generic EHCI's, and are tested there.
+    #[test]
+    fn the_firmwares_reset_handshake_completes_in_the_documented_order() {
+        let device = build();
+        assert_eq!(FW_USBMODE, REG_USBMODE);
+        assert_eq!(FW_USBCMD, OPERATIONAL_BASE);
+
+        // Step 1: poll `USBSTS.HCHalted` until the controller is halted. It is
+        // halted out of reset, so the spin exits on its first read — and that
+        // spin is the one the real firmware was recorded stuck on.
+        assert_ne!(
+            read32(&device, FW_USBSTS) & HC_HALTED,
+            0,
+            "step 1: a controller out of reset is halted"
+        );
+
+        // Step 2: assert `USBCMD.HCReset` and poll until it self-clears.
+        write32(&device, FW_USBCMD, HC_RESET);
+        assert_eq!(
+            read32(&device, FW_USBCMD) & HC_RESET,
+            0,
+            "step 2: HCReset self-clears"
+        );
+        assert_ne!(
+            read32(&device, FW_USBSTS) & HC_HALTED,
+            0,
+            "step 2: and the reset leaves the controller halted"
+        );
+
+        // Step 3: select host mode through `USBMODE`, then read it back. The
+        // read-back is what the firmware checks, so it has to answer — and it
+        // has to answer *after* the reset of step 2, which is why a reset
+        // re-arms the write-once field rather than preserving it.
+        write32(&device, FW_USBMODE, super::super::ehci::MODE_HOST);
+        assert_eq!(
+            read32(&device, FW_USBMODE) & 0x3,
+            super::super::ehci::MODE_HOST,
+            "step 3: the role select reads back what was written"
+        );
+
+        // Step 4: read `ID` to detect the controller. This is the firmware's
+        // test verbatim, and the first thing whose success changes what that
+        // firmware does — it treats USB host as optional and degrades, so
+        // detection failing looks like a clean boot.
+        assert_eq!(
+            read32(&device, REG_ID) & 0xffff,
+            0xfa05,
+            "step 4: (ID & 0xFFFF) == 0xFA05"
+        );
+
+        // Step 7's register is where the documented flow ends, and it is an
+        // ordinary EHCI one at an ordinary offset.
+        write32(&device, FW_USBINTR, 0x3f);
+        assert_eq!(read32(&device, FW_USBINTR), 0x3f);
+    }
+
+    /// The property a stub already had, and which the firmware's step-1 spin
+    /// depends on: `HCHalted` is the complement of `RunStop`.
+    #[test]
+    fn hchalted_is_the_complement_of_runstop() {
+        let device = build();
+        write32(&device, FW_USBMODE, super::super::ehci::MODE_HOST);
+        assert_ne!(read32(&device, FW_USBSTS) & HC_HALTED, 0);
+        write32(&device, FW_USBCMD, RUN_STOP);
+        assert_eq!(read32(&device, FW_USBSTS) & HC_HALTED, 0);
+        write32(&device, FW_USBCMD, 0);
+        assert_ne!(read32(&device, FW_USBSTS) & HC_HALTED, 0);
+    }
+
+    /// This firmware uses **both** roles — host for mass storage and
+    /// PictBridge, device for the printer it presents to a PC — so switching
+    /// between them has to work.
+    ///
+    /// `USBMODE.CM` is write-once *after a reset*, and the reset is what
+    /// re-arms it. A model that carried the old role across `HCReset` would
+    /// refuse the new one and hang the read-back of step 3.
+    #[test]
+    fn a_reset_re_arms_the_role_select_so_a_switch_works() {
+        let device = build();
+        write32(&device, FW_USBMODE, super::super::ehci::MODE_HOST);
+        assert_eq!(
+            read32(&device, FW_USBMODE) & 0x3,
+            super::super::ehci::MODE_HOST
+        );
+
+        write32(&device, FW_USBCMD, HC_RESET);
+        assert_eq!(
+            read32(&device, FW_USBMODE) & 0x3,
+            super::super::ehci::MODE_IDLE,
+            "HCReset re-arms the write-once role select"
+        );
+
+        write32(&device, FW_USBMODE, super::super::ehci::MODE_DEVICE);
+        assert_eq!(
+            read32(&device, FW_USBMODE) & 0x3,
+            super::super::ehci::MODE_DEVICE,
+            "so the read-back the firmware spins on returns the new role"
+        );
+    }
+
+    /// The block base is where `ID` is, **not** where `USBCMD` is.
+    ///
+    /// Worth an assertion because `docs/buses/usb.md` heads its address table
+    /// "operational registers" against the block base, and a board that read
+    /// that as "map the aperture at the operational registers" would map its
+    /// window 0x140 bytes too high and find nothing.
+    #[test]
+    fn the_block_base_is_the_id_register_not_the_operational_ones() {
+        let device = build();
+        assert_eq!(read32(&device, 0) & 0xffff, 0xfa05);
+        assert_eq!(OPERATIONAL_BASE, 0x140);
     }
 
     #[test]
