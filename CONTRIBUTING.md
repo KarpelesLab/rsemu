@@ -99,6 +99,10 @@ by someone who was not in the room.
 
 ## 3. Everything else
 
+- **Commit messages are Conventional Commits** — `feat(cpu-arm): …`,
+  `fix(space): …`, `docs: …`, with `!` for a breaking change. Release-plz reads
+  the prefix to build the changelog and choose the version bump, so a fix
+  labelled `chore:` ships silently. Full rules in [`CLAUDE.md`](CLAUDE.md).
 - Read [`CLAUDE.md`](CLAUDE.md) for the design rules (crate shape, `no_std`, the
   `sync` seam, determinism, error handling, testing) and
   [`ROADMAP.md`](ROADMAP.md) for the architecture and phase order.
