@@ -31,6 +31,14 @@ std = []
 # The `rsemu` binary. Needs `std`.
 cli = ["std"]
 
+# The gdbstub (src/host/gdb): the GDB remote serial protocol over TCP —
+# registers, memory, breakpoints and write watchpoints, a machine's CPUs as GDB
+# threads, and `qXfer:features:read` target descriptions generated from each
+# core's register map, which is what lets gdb debug an architecture it was never
+# compiled to know about. Hand-rolled TCP and packet parsing on `std::net`; no
+# external crates. Needs `std`, and a CPU feature to have anything to debug.
+gdb = ["std"]
+
 # NES cartridges (src/dev/cart): iNES and NES 2.0 image parsing, the
 # `Cartridge` type, and NROM (iNES mapper 0) as a device that maps PRG ROM,
 # CHR ROM/RAM and the nametable mirroring into `core::space`. `no_std + alloc`

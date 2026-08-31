@@ -23,9 +23,11 @@
 //! terminal through [`host::chardev`], the character-stream seam a 16550 will
 //! use next.
 //!
+//! With `gdb`, `host::gdb` speaks the GDB remote serial protocol over TCP, so
+//! `rsemu debug apple1 --gdb :1234` is a guest a debugger can step through.
+//!
 //! Not yet: the NES PPU and APU as machine objects, so nothing is displayed or
-//! heard; the IR and JIT; and the rest of the host layer (window, audio,
-//! gdbstub).
+//! heard; the IR and JIT; and the rest of the host layer (window, audio).
 //!
 //! # `no_std`
 //!
@@ -66,6 +68,9 @@ pub fn build_info() -> alloc::string::String {
     }
     if cfg!(feature = "cli") {
         features.push("cli");
+    }
+    if cfg!(feature = "gdb") {
+        features.push("gdb");
     }
     if cfg!(feature = "wasm") {
         features.push("wasm");
