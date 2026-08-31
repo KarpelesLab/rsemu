@@ -372,6 +372,44 @@ fn writing_tima_inside_the_reload_window_cancels_the_reload() {
     assert_eq!(timer.tima(), 0x11, "the write won, not TMA");
 }
 
+/// The four clocks after `TIMA` wraps are not one window but two things: the
+/// *delay*, during which a write to `TIMA` cancels the reload, and the single
+/// clock on which the reload actually happens, on which `TIMA` is being driven
+/// from `TMA` and a write to it loses (Pan Docs, *Timer Obscure Behaviour*).
+#[test]
+fn a_tima_write_on_the_reload_clock_itself_is_ignored() {
+    let timer = GbTimer::new();
+    timer.write_register(2, 0x37); // TMA
+    timer.write_register(1, 0xff); // TIMA
+    timer.write_register(3, 0x05); // enabled, bit 3
+    timer.advance_by(20); // the overflow at 16, then the reload at 20
+    assert_eq!(timer.tima(), 0x37, "the reload has just happened");
+    timer.write_register(1, 0x11);
+    assert_eq!(timer.tima(), 0x37, "and the write on that clock is ignored");
+    // One clock later it is an ordinary write again.
+    timer.advance_by(1);
+    timer.write_register(1, 0x11);
+    assert_eq!(timer.tima(), 0x11);
+}
+
+/// And a write to `TMA` on that clock lands in `TIMA` as well, because what the
+/// reload copies is whatever `TMA` holds when it happens.
+#[test]
+fn a_tma_write_on_the_reload_clock_is_what_gets_loaded() {
+    let timer = GbTimer::new();
+    timer.write_register(2, 0x37);
+    timer.write_register(1, 0xff);
+    timer.write_register(3, 0x05);
+    timer.advance_by(20);
+    assert_eq!(timer.tima(), 0x37);
+    timer.write_register(2, 0x42);
+    assert_eq!(timer.tima(), 0x42, "TIMA followed TMA");
+    // One clock later `TMA` is an ordinary register again.
+    timer.advance_by(1);
+    timer.write_register(2, 0x99);
+    assert_eq!(timer.tima(), 0x42, "TIMA is left where it was");
+}
+
 #[test]
 fn the_next_event_is_never_in_the_past_and_never_further_than_a_div_step() {
     // What makes a mid-quantum read correct: between two of this device's own

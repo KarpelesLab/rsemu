@@ -130,7 +130,7 @@ const fn selected_bit(tac: u8) -> u16 {
 }
 
 /// Everything under the lock.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct Regs {
     /// The 16-bit counter. `DIV` is its high byte.
     counter: u16,
@@ -143,6 +143,28 @@ struct Regs {
     apu_edge: bool,
     /// Clocks left in the overflow reload window, or zero when none is pending.
     reload: u8,
+    /// The tick the last reload from `TMA` actually happened on.
+    ///
+    /// [`u64::MAX`] when none ever has. This is what makes "the reload cycle"
+    /// nameable from the register block: on that one machine cycle the `TMA`
+    /// output is being driven onto `TIMA`, so a write to `TIMA` loses and a
+    /// write to `TMA` lands in both (Pan Docs, *Timer Obscure Behaviour*).
+    reload_tick: u64,
+}
+
+impl Default for Regs {
+    fn default() -> Regs {
+        Regs {
+            counter: 0,
+            tima: 0,
+            tma: 0,
+            tac: 0,
+            edge: false,
+            apu_edge: false,
+            reload: 0,
+            reload_tick: u64::MAX,
+        }
+    }
 }
 
 impl Regs {
@@ -259,6 +281,7 @@ impl Shared {
                 regs.reload -= 1;
                 if regs.reload == 0 {
                     regs.tima = regs.tma;
+                    regs.reload_tick = now;
                     irq = true;
                 }
             }
@@ -444,11 +467,11 @@ impl GbTimer {
 
     /// Write one register by index, 0-3, without catching up — for a test.
     pub fn write_register(&self, index: u8, value: u8) {
+        let now = self.shared.tick.load(Ordering::Relaxed);
         let irq = {
             let mut regs = self.shared.regs.lock();
-            let out = write_reg(&mut regs, index, value);
-            self.shared
-                .publish(&regs, self.shared.tick.load(Ordering::Relaxed));
+            let out = write_reg(&mut regs, index, value, now);
+            self.shared.publish(&regs, now);
             out
         };
         self.shared.drive(irq, 0);
@@ -470,7 +493,16 @@ fn read_reg(regs: &Regs, index: u8) -> u8 {
 
 /// Returns whether the write itself made `TIMA` overflow — which a `DIV` write
 /// or a `TAC` change genuinely can, through the falling-edge detector.
-fn write_reg(regs: &mut Regs, index: u8, value: u8) -> bool {
+///
+/// `now` is the tick the write is being made on, which is what separates the
+/// two halves of the overflow: the four clocks of *delay* after `TIMA` wrapped,
+/// and the one clock on which the reload from `TMA` actually happens.
+fn write_reg(regs: &mut Regs, index: u8, value: u8, now: u64) -> bool {
+    // The reload is a load from `TMA` onto `TIMA`, and on the clock it happens
+    // that path owns the register. Pan Docs, *Timer Obscure Behaviour*: a write
+    // to `TIMA` on that clock is ignored, and a write to `TMA` on it lands in
+    // `TIMA` too.
+    let reloading = now == regs.reload_tick;
     match index & 3 {
         0 => {
             // Any value resets all sixteen bits, not just the visible byte.
@@ -478,17 +510,19 @@ fn write_reg(regs: &mut Regs, index: u8, value: u8) -> bool {
             regs.settle_edge()
         }
         1 => {
-            // A write inside the reload window cancels the reload, and `TIMA`
-            // keeps the written value instead of `TMA`.
-            regs.tima = value;
-            regs.reload = 0;
+            if !reloading {
+                // A write inside the *delay* cancels the reload, and the
+                // interrupt with it: `TIMA` keeps the written value.
+                regs.tima = value;
+                regs.reload = 0;
+            }
             false
         }
         2 => {
             regs.tma = value;
-            // A write during the reload *cycle* is what gets loaded, because
-            // the reload reads `TMA` when it happens rather than when the
-            // overflow did.
+            if reloading {
+                regs.tima = value;
+            }
             false
         }
         _ => {
@@ -531,11 +565,11 @@ impl MemOps for TimerPort {
             return Err(BusError::BadAccess);
         }
         self.shared.sync(attrs);
+        let now = self.shared.tick.load(Ordering::Relaxed);
         let irq = {
             let mut regs = self.shared.regs.lock();
-            let out = write_reg(&mut regs, offset as u8, *value);
-            self.shared
-                .publish(&regs, self.shared.tick.load(Ordering::Relaxed));
+            let out = write_reg(&mut regs, offset as u8, *value, now);
+            self.shared.publish(&regs, now);
             out
         };
         // The re-entrancy contract: act outward only once the lock is released.
@@ -554,7 +588,7 @@ impl MemOps for TimerPort {
 /// The `gb.timer` device class.
 pub static CLASS: DeviceClass = DeviceClass {
     name: "gb.timer",
-    version: 1,
+    version: 2,
     summary: "Game Boy divider and timer ($FF04-$FF07), including the 512 Hz APU clock",
     properties: &[],
     construct: |props| Ok(Box::new(GbTimer::from_props(props)?) as Box<dyn Device>),
@@ -629,6 +663,7 @@ impl Device for GbTimer {
         w.write_bool(regs.edge)?;
         w.write_bool(regs.apu_edge)?;
         w.write_u8(regs.reload)?;
+        w.write_u64(regs.reload_tick)?;
         w.write_u64(self.shared.tick.load(Ordering::Relaxed))?;
         Ok(())
     }
@@ -642,6 +677,7 @@ impl Device for GbTimer {
             edge: r.read_bool()?,
             apu_edge: r.read_bool()?,
             reload: r.read_u8()?,
+            reload_tick: r.read_u64()?,
         };
         let tick = r.read_u64()?;
         let mut slot = self.shared.regs.lock();
