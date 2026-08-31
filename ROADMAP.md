@@ -982,7 +982,67 @@ Each core is a feature. The order below is chosen so that each one proves a
 | **RISC-V rv64gc** (+ rv32) | MMU + software TLB, privilege levels, atomics, FPU, and the IR/JIT path. Smallest ISA that boots real Linux | 5 |
 | **x86**: i386 → x86-64 (real/protected/long mode, SSE) | The hard one: segmentation, variable-length decode, self-modifying code, paging quirks | 6 |
 | **ARM**: ARMv7-A, ARMv8-A AArch64 | Second major JIT frontend; validates IR generality | 6–8 |
+| **ARMv7E-M** (Cortex-M4/M7) | Thumb-2 only, a wholly different exception model; see §6.1 | planned |
 | Later: 68000, MIPS, PowerPC, SuperH, 8080, 65816, V850 | Breadth; each is a weekend once the IR is stable | post-8 |
+
+### 6.1 ARM: one module or several?
+
+Planned, not built. **ARMv7E-M gets its own module, `src/cpu/armv7m/`, beside
+`src/cpu/arm/` rather than inside it** — and that is a different answer from the
+one the 6502 got, for a reason worth stating.
+
+The 6502's three parts share one architectural model: NMOS, RP2A03 and W65C02S
+differ in about a tenth of the instruction table and in nothing else, so
+`Variant` as a construction property was right and one table macro serves all
+three. ARMv5TE and ARMv7E-M do not share a model:
+
+| | ARMv5TE | ARMv7E-M |
+| --- | --- | --- |
+| A32 (ARM state) | the bulk of the core | **does not exist** |
+| T32 (32-bit Thumb-2) | does not exist | the bulk of the core |
+| Conditional execution | a field in every A32 instruction | `IT` blocks |
+| Privilege / modes | seven modes, banked registers, SPSR | Handler/Thread, MSP/PSP, no banking |
+| Exception entry | mode switch, banked LR, vector *instructions* | automatic register stacking, `EXC_RETURN`, vector *addresses* |
+| Interrupt controller | external, whatever the SoC provides | NVIC, architecturally specified |
+| System registers | CP15 coprocessor | memory-mapped SCB / SysTick / MPU |
+
+A `Variant` flag across that is `#[cfg]` wearing a different hat: nearly every
+function would branch on it, and a Cortex-M build would link ~1,900 lines of A32
+decode it can never execute. That breaks the crate-shape rule (§3) directly — a
+NES build links a 6502 and nothing else, and a Cortex-M build should link no
+ARM state.
+
+**What is genuinely shared, and when to factor it.** The barrel shifter and its
+flag rules, the DSP (E) semantics (`QADD`, `SMLAxy`, `SMUAD`, the SIMD
+add/sub family), and the 16-bit Thumb-1 encodings, which ARMv7-M inherits
+almost wholesale. Perhaps a third of the work.
+
+**Do not extract that up front.** Factoring shared code out of one
+implementation, before the second exists to disagree with it, is guessing at
+the seam — and the guess is usually wrong in the direction that hurts. Build
+`armv7m` standalone, let the duplication become real and visible, then extract
+against two working consumers. The cost of waiting is some duplicated
+arithmetic for one release; the cost of guessing is an abstraction both cores
+have to fight.
+
+**Conformance is the open problem.** There is no `SingleStepTests` corpus for
+ARMv7-M, and Arm's own architecture validation suite is not public — so the
+approach that produced trustworthy numbers for the other five cores is
+unavailable. Three substitutes, in descending order of what they prove:
+
+1. **Differential against our own ARMv5TE core on the shared Thumb-1 subset.**
+   That core passes 2,200,000 corpus vectors, which makes it a real oracle for
+   the overlap rather than a peer opinion. This is the one worth building.
+2. **Built test binaries.** `clang` targets `thumbv7em-none-eabi` directly, so a
+   corpus can be assembled the way `riscv-tests` is — a small ELF per feature
+   signalling pass or fail. Covers T32 and the exception model, which (1) cannot.
+3. **Real firmware.** Booting a CMSIS or Zephyr image proves integration, not
+   correctness, but it finds the things unit tests never do.
+
+Absent (1) and (2), an ARMv7E-M core would be self-validated, and §0 is explicit
+that a core with no suite is untested rather than done. Plan for the corpus
+before the core.
+
 
 Every core provides both an **interpreter** and (from phase 5 onward) an **IR
 frontend**, and the two are differentially tested against each other forever.
