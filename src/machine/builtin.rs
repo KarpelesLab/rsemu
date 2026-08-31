@@ -177,9 +177,9 @@ pub fn schemas() -> Vec<ClassSchema> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::string::ToString;
     use crate::core::props::Value;
     use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
+    use alloc::string::ToString;
 
     fn ram(size: u64) -> Ram {
         Ram::new(&Props::new().with("size", Value::Size(size))).expect("a size is all it takes")

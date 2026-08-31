@@ -49,26 +49,35 @@ machine "nes-ntsc" {
   # -- the PPU bus -----------------------------------------------------------
   map ppubus 0x0000 size 0x2000 = cart.chr       # the two pattern tables
 
-  # TODO(ppu, apu): the objects below are what this file is missing. They land
-  # with `dev-nes-ppu` and `dev-nes-apu` growing their connection surfaces:
+  # TODO(ppu, apu): the block below is what this file is still missing. Both
+  # classes exist and both publish regions and pins — `rsemu describe nes.ppu`
+  # will show you — so this is written against their real surface and is meant
+  # to be uncommented rather than rewritten.
   #
-  #   object ppu "nes.ppu" { clock = master / 4, space = ppubus }
-  #   object apu "nes.apu" { clock = master / 12, space = cpubus }
-  #   object ciram "ram"   { size = 2K }
-  #   object pad1 "nes.controller" { }
+  #   object ppu "nes.ppu" { clock = master / 4, space = ppubus, region = "ntsc" }
+  #   object apu "nes.apu" { clock = master / 12, region = "ntsc" }
   #
-  #   map cpubus 0x2000 size 0x2000 = mirror(ppu.regs)   # 8 registers, x1024
-  #   map cpubus 0x4000 size 0x0018 = apu.regs           # $4014 is OAM DMA
-  #   map cpubus 0x4016 size 0x0002 = pad.regs
-  #   map ppubus 0x2000 size 0x1000 = cart.nametables    # CIRAM through the
-  #   map ppubus 0x3000 size 0x0f00 = cart.nametables    #   cartridge's wiring
-  #   map ppubus 0x3f00 size 0x0100 = mirror(ppu.palette)
+  #   map cpubus 0x2000 size 0x2000 = ppu.regs      # 8 registers, mirrored x1024
+  #   map cpubus 0x4000 size 0x0014 = apu.channels  # $4000-$4013
+  #   map cpubus 0x4015 size 0x0001 = apu.status    # $4014 is OAM DMA, not the APU's
+  #   map cpubus 0x4017 size 0x0001 = apu.frame     # $4016 is the controller port
   #
   #   wire ppu.nmi  -> cpu.nmi
-  #   wire apu.irq  -> cpu.irq                           # wired-OR with...
-  #   wire cart.irq -> cpu.irq                           # ...the cartridge
+  #   wire apu.irq  -> cpu.irq                      # wired-OR with the cartridge's
   #
-  # The nametable mapping is the cartridge's to publish, not this file's: which
-  # 1 KiB of CIRAM answers where is decided by how the board ties CIRAM A10,
-  # and that is a property of the cartridge in the slot rather than of the NES.
+  # What blocks it: the PPU and the APU are lazily advanced — they hold their
+  # own tick and are caught up by whoever reads them (ROADMAP.md §4.2) — and no
+  # class can yet *declare* that to the realizer, so a mapped PPU would never
+  # advance and $2002 would report VBlank clear forever. That is a worse machine
+  # than this one, where the open bus at least reads as ones. See
+  # `machine::catalog::bindings`.
+  #
+  # Two more devices do not exist at all yet: OAM DMA at $4014 (a CPU-side
+  # stall, not a PPU register) and the controller ports at $4016/$4017.
+  #
+  # Nametables are the cartridge's to publish, not this file's: which 1 KiB of
+  # CIRAM answers where is decided by how the board ties CIRAM A10, and that is
+  # a property of the cartridge in the slot rather than of the console. The
+  # console owns the 2 KiB, though, so the two have to meet somewhere the DSL
+  # can express — an unsolved piece of `nes.nrom`.
 }

@@ -106,10 +106,31 @@ pub fn registry() -> Result<Registry> {
     crate::cpu::mos6502::register(&mut reg)?;
     #[cfg(feature = "dev-nes-cart")]
     crate::dev::cart::nrom::register(&mut reg)?;
+    #[cfg(feature = "dev-nes-ppu")]
+    crate::dev::ppu::register(&mut reg)?;
+    #[cfg(feature = "dev-nes-apu")]
+    crate::dev::apu::register(&mut reg)?;
     Ok(reg)
 }
 
 /// Every class that takes part in the memory map and the wire graph.
+///
+/// # Why the NES PPU and APU are registered but not bound
+///
+/// Both are **lazily advanced** (`ROADMAP.md` §4.2): they hold their own tick
+/// and are caught up by whoever accesses them, through
+/// [`LazyHandle`](crate::core::sched::LazyHandle). Nothing declares that to
+/// this layer — `core::device` has no "I advance myself" for a class to say
+/// and `Instance` has no route to a `LazyDevice` — so a bound PPU would be
+/// mapped, wired, and then never advanced, and `$2002` would report VBlank
+/// clear forever. That is a worse machine than one with no PPU at all, where
+/// the open bus at least reads as ones.
+///
+/// So they stay in the [`registry`] — `rsemu devices` and `rsemu describe`
+/// tell the truth about this build — and out of here until a class can declare
+/// itself lazily advanced. When it can, these are two lines, and
+/// `machines/nes-ntsc.machine` has the objects, maps and wires written out in
+/// its closing comment ready to be uncommented.
 ///
 /// # Errors
 ///
