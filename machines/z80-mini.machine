@@ -1,0 +1,94 @@
+# z80-mini - the smallest Z80 board with a port bus.
+#
+#   rsemu run z80-mini --media firmware=fw.bin
+#   rsemu run z80-mini -p rom=16K -p ram=48K --media firmware=fw.bin
+#
+# A CP/M-shaped memory map without CP/M: ROM at zero holding the reset vector
+# and the restart page, RAM above it, and - the part that matters - a **second
+# address space** for the 64 KiB of ports `IN` and `OUT` reach. It models no
+# product. It exists so that `cpu.z80` has somewhere to run inside a machine
+# file, and so the I/O space has a board that actually exercises it.
+#
+# ---------------------------------------------------------------------------
+# Why `iospace` is a string and `space` is not
+# ---------------------------------------------------------------------------
+#
+# A Z80 has two address spaces, not one window into one space: the chip drives
+# `/IORQ` where it would drive `/MREQ`, and a board decodes the two
+# differently. rsemu's `space =` is structural and there is exactly one of it
+# per object, so the second space is named by an ordinary string property and
+# resolved with `BindCtx::space_named`. The same shape `cpu.x86` uses, for the
+# same reason, and the reason both cores accept `iospace = ""` (or omit it):
+# a machine with no ports is a machine where `IN` reads the floating bus.
+#
+# ---------------------------------------------------------------------------
+# The ports on this board
+# ---------------------------------------------------------------------------
+#
+# One 256-byte scratch region, mirrored across the whole port space because
+# nothing here decodes the high address byte - which is what a small Z80 board
+# with one 74LS138 does, and why `IN A,(n)` and `IN r,(C)` reach the same
+# register on a real one. A board with real peripherals replaces this object
+# with them at the offsets its decoder gives them.
+#
+# There is no interrupt controller, so `cpu.int`, `cpu.nmi` and `cpu.reset` are
+# unwired. Mode 2 needs a device that answers the acknowledge cycle with a
+# vector byte - `core::wire`'s `IntAck` - and this board has none to wire.
+
+machine "z80-mini" {
+  # How much ROM is at zero. The Z80 resets to 0x0000, and the eight `RST`
+  # targets and the NMI vector at 0x0066 all live in the first page, so this is
+  # the one region whose base is not a parameter.
+  param rom = 16K
+
+  # How much RAM, and where. 0x4000 is the usual place for a 16 KiB ROM's
+  # successor; a board with a different ROM moves it.
+  param ram-base = 0x4000
+  param ram      = 32K
+
+  # -- the crystal -----------------------------------------------------------
+  #
+  # 3.5 MHz: a plain Z80A-era clock. One oscillator, so every ratio on this
+  # board is exact (ROADMAP.md 4.2).
+  osc clk = 3500000 Hz
+
+  # -- the two buses ---------------------------------------------------------
+  #
+  # `unassigned = open-bus` on both, because a Z80 has **no bus-error input**:
+  # a read nothing answers leaves the data pins floating and the chip latches
+  # whatever was there. Faulting would model an exception the hardware cannot
+  # take. `cpu.z80`'s `floating-bus` property says what a float reads as.
+  space mem  { width = 16, unassigned = open-bus }
+  space port { width = 16, unassigned = open-bus }
+
+  # -- the core --------------------------------------------------------------
+  object cpu "cpu.z80" {
+    clock        = clk
+    space        = mem
+    iospace      = "port"
+    engine       = "interp"
+    cmos         = false
+    floating-bus = 0xff
+  }
+
+  # -- memory ----------------------------------------------------------------
+  #
+  # `image` names a media slot: whoever runs the machine binds the bytes
+  # (`--media firmware=fw.bin`), and nothing below host/ opens a file.
+  object boot "rom" { size = rom, image = "firmware" }
+
+  object dram "ram" { size = ram }
+
+  # The port scratch. Plain memory, so a firmware's `OUT (n),A` is readable
+  # afterwards and a test can say the write reached the *port* space rather
+  # than the memory one.
+  object io "ram" { size = 256 }
+
+  # -- the maps --------------------------------------------------------------
+  map mem  0x0000   size rom = boot   # reset vector, the RSTs, the NMI vector
+  map mem  ram-base size ram = dram
+
+  # Mirrored across all 64 KiB: nothing on this board decodes A8-A15 of a port
+  # address, which is what `mirror()` says and what a one-decoder board does.
+  map port 0x0000 size 64K = mirror(io)
+}

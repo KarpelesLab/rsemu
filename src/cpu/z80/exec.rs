@@ -98,6 +98,15 @@ pub(super) struct State {
     pub last_fault: u16,
     /// The bus activity of the most recent step.
     pub trace: CycleLog,
+    /// T-states owed to the next scheduler budget.
+    ///
+    /// A Z80 cannot be stopped mid-instruction, so a budget that runs out
+    /// part-way through one is overshot. The scheduler refuses a `Consumed`
+    /// larger than the budget it handed out — rightly, since that would put
+    /// the domain ahead of the timeline — so the overshoot is carried here and
+    /// charged against the next budget instead. Architectural, because a
+    /// restored machine that forgot its debt runs one instruction free.
+    pub debt: u64,
 }
 
 impl State {
@@ -117,6 +126,7 @@ impl State {
             faults: 0,
             last_fault: 0,
             trace: CycleLog::new(),
+            debt: 0,
         }
     }
 }
@@ -373,7 +383,13 @@ impl<'a> Exec<'a> {
         let r = self.state.regs.r;
         self.state.regs.r = (r & 0x80) | (r.wrapping_add(1) & 0x7f);
         self.charge(7);
-        let value = self.lines.vector();
+        // The device that asked for the interrupt puts the byte on the data
+        // bus during this cycle: the mode 2 vector low byte, or in mode 0 the
+        // opcode — historically an `RST`. Whatever drives `INT` answers, and
+        // moves the request from pending to in service while it is there. With
+        // nothing attached the latched byte is the answer, which is what a
+        // machine with one fixed source sets once.
+        let value = self.lines.acknowledge();
         let addr = self.state.regs.pc;
         self.latch = refresh;
         self.log(BusCycle {

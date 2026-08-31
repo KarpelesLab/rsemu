@@ -249,6 +249,16 @@ cpu-arm-v7m = []
 # dependencies and is `no_std + alloc`.
 cpu-z80 = []
 
+# The `z80-mini` board (machines/z80-mini.machine plus the classes it names):
+# ROM at the reset vector, RAM above it, and a **second address space** for the
+# 64 KiB of ports `IN` and `OUT` reach -- the thing a Z80 has and no
+# memory-mapped core in this crate does. It models no product; it exists so
+# `cpu.z80` has somewhere to run inside a machine file and so the I/O space has
+# a board that exercises it. No interrupt controller: mode 2 needs a device that
+# answers the acknowledge cycle, and there is none to wire yet. Adds no
+# dependencies.
+machine-z80-mini = ["cpu-z80"]
+
 # The Sharp SM83 core (src/cpu/sm83): the Game Boy's processor, an M-cycle
 # accurate interpreter with all 256 base and 256 $CB encodings, the eleven
 # unimplemented opcodes modelled as the lock-up they are, the HALT bug, EI's

@@ -199,6 +199,21 @@ pub static PC_AT: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/pc-at.machine"),
 };
 
+/// A minimal Z80 board, when this build has a Z80.
+///
+/// A synthetic board rather than a product: ROM at the reset vector, RAM above
+/// it, and a second address space for the 64 KiB of ports `IN` and `OUT` reach.
+/// It is where the Z80's separate I/O space is actually exercised through a
+/// machine file. The `firmware` slot takes whatever should be at `0x0000`.
+#[cfg(feature = "machine-z80-mini")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-z80-mini")))]
+pub static Z80_MINI: CatalogEntry = CatalogEntry {
+    name: "z80-mini",
+    summary: "a minimal Z80 board: ROM, RAM, and the separate 64 KiB port space IN and OUT reach",
+    media: &["firmware"],
+    source: include_str!("../../machines/z80-mini.machine"),
+};
+
 /// Every machine this build can realize, in catalog order.
 // One `#[cfg]`-gated push per shipped machine, which is what the lint is
 // complaining about: a `vec![]` literal cannot carry an attribute on one of its
@@ -226,6 +241,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&RISCV_VIRT);
     #[cfg(feature = "machine-spi-panel")]
     out.push(&SPI_PANEL);
+    #[cfg(feature = "machine-z80-mini")]
+    out.push(&Z80_MINI);
     out
 }
 
@@ -1033,6 +1050,11 @@ mod tests {
             // `tests/arm926_board.rs` supplies the one that does something.
             #[cfg(feature = "machine-arm926")]
             ("arm926", "firmware") => &[0xfe, 0xff, 0xff, 0xea],
+            // `JR -2` — the Z80 branch-to-self, which is the whole two-byte
+            // program needed to prove the board realizes and the core fetches.
+            // `tests/z80_mini_board.rs` supplies the one that does something.
+            #[cfg(feature = "machine-z80-mini")]
+            ("z80-mini", "firmware") => &[0x18, 0xfe],
             // No firmware is shipped for the PC and none ever will be, so what
             // this board gets is the right *shape*: a socket-sized image of
             // zeroes, which realizes and executes open bus. `tests/pc_at_board`
