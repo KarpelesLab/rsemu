@@ -264,6 +264,17 @@ pub struct Engine {
     /// Chris Siebert). A frame that takes rendering away before dot 339 comes
     /// back with every unit already halted, which draws every sprite as though
     /// its X were zero.
+    /// The secondary-OAM address the sprite unit is standing on.
+    ///
+    /// Not the same thing as the evaluation write cursor: it follows whichever
+    /// phase of the scanline is using secondary OAM, and it is what seeds the
+    /// OAM corruption when rendering is switched off mid-line.
+    pub(crate) sec_addr: u8,
+    /// A row of OAM waiting to be corrupted, and which row.
+    ///
+    /// Set when rendering is taken away mid-line; consumed on the first dot
+    /// with rendering back on. See [`Engine::corrupt_oam`].
+    pub(crate) corrupt_row: Option<u8>,
     pub(crate) sprite_halted: u8,
     pub(crate) sprite_active: u8,
     pub(crate) sprite_zero_active: bool,
@@ -381,6 +392,8 @@ impl Engine {
             sprite_pat_hi: [0; 8],
             sprite_attr: [0; 8],
             sprite_x: [0; 8],
+            sec_addr: 0,
+            corrupt_row: None,
             sprite_halted: 0,
             sprite_active: 0,
             sprite_zero_active: false,
@@ -883,6 +896,62 @@ impl Engine {
         }
     }
 
+    /// Where the sprite unit's secondary-OAM pointer is standing.
+    ///
+    /// Three phases, three answers: the clear walks 0-31 two dots at a time,
+    /// evaluation uses its write cursor rounded *up* to a multiple of four, and
+    /// the fetch slots step through the eight-dot cadence. Outside those it
+    /// sits at zero.
+    fn secondary_addr(&self, dot: u16) -> u8 {
+        match dot {
+            1..=64 => ((dot - 1) / 2) as u8,
+            65..=256 => (self.eval_sec.wrapping_add(3)) & 0x1c,
+            257..=320 => {
+                let slot = ((dot - 257) / 8) as u8;
+                let byte = ((dot - 257) % 8).min(3) as u8;
+                (slot * 4 + byte) & 31
+            }
+            _ => 0,
+        }
+    }
+
+    /// The row copy that a mid-frame rendering change leaves behind.
+    ///
+    /// Changing the OAM address while the PPU is accessing OAM corrupts the row
+    /// it moves to: the old row is copied over the new one. Switching rendering
+    /// *off* mid-line hands the address back from the sprite unit to `OAMADDR`
+    /// and freezes wherever the sprite unit had got to; switching it back on
+    /// hands it the other way, and on a 2C02G that second handover reliably
+    /// copies OAM row 0 over the row the sprite unit was standing on (NESdev
+    /// wiki, *Errata*: "on C, E, G and H PPUs, when rendering begins
+    /// automatically on pre-render dot 0, the address changes from OAM1ADDR to
+    /// OAM2ADDR mid-access and reliably copies the OAM1ADDR row to the OAM2ADDR
+    /// row, regardless of alignment").
+    ///
+    /// Identical rows corrupt nothing, which the errata is explicit about and
+    /// which is what makes the ordinary case — rendering enabled in vblank with
+    /// the pointer at zero — silent.
+    fn corrupt_oam(&mut self) {
+        let Some(row) = self.corrupt_row.take() else {
+            return;
+        };
+        // The row the address is handed *to* takes a copy of the row it was
+        // handed *from*: `OAM1ADDR` is `OAMADDR`, `OAM2ADDR` is where the
+        // sprite unit was standing. Identical rows corrupt nothing, which is
+        // what makes the ordinary case — a frame starting with `OAMADDR` at
+        // zero and the pointer at zero — silent.
+        let dst = usize::from(row & 31) * 8;
+        let src = usize::from(self.oam_addr & 0xf8);
+        if dst == src {
+            return;
+        }
+        for i in 0..8 {
+            let byte = self.oam[(src + i) & 0xff];
+            self.write_oam(((dst + i) & 0xff) as u8, byte);
+        }
+        self.secondary_oam[usize::from(row & 31)] = self.secondary_oam[0];
+    }
+
     /// What `$2004` reads back while the sprite unit owns OAM.
     ///
     /// `OAMADDR` is not the answer during rendering. The sprite unit is driving
@@ -1104,7 +1173,15 @@ impl Engine {
         if self.mask_delay > 0 {
             self.mask_delay -= 1;
             if self.mask_delay == 0 {
+                let was = self.rendering_enabled();
                 self.mask = self.mask_pending;
+                if was && !self.rendering_enabled() && self.render_line() {
+                    // The sprite unit hands the OAM address back mid-access,
+                    // and where it had got to is the seed for the row copy that
+                    // happens when rendering comes back — see
+                    // [`Engine::corrupt_oam`].
+                    self.corrupt_row = Some(self.sec_addr);
+                }
             }
         }
         let scanline = self.scanline;
@@ -1140,14 +1217,16 @@ impl Engine {
             self.suppress_vblank_set = false;
         }
 
-        // The OAMADDR-at-rendering-start corruption: if OAMADDR is 8 or more
-        // when rendering begins, the eight bytes at `OAMADDR & $F8` are copied
-        // over OAM's first eight ([NESdev PPU registers], OAMADDR).
-        if pre_render && dot == 0 && rendering && self.oam_addr >= 8 {
-            let src = usize::from(self.oam_addr & 0xf8);
-            for i in 0..8 {
-                self.oam[i] = self.oam[(src + i) & 0xff];
-            }
+        // The OAM address changes hands at the top of the rendering region
+        // every frame, whether or not anything switched rendering off — and
+        // hands over to secondary-OAM address zero, so it is silent unless
+        // `OAMADDR` is pointing at some other row.
+        if pre_render && dot == 0 && rendering && self.corrupt_row.is_none() {
+            self.corrupt_row = Some(0);
+        }
+        // The row copy itself, on the first dot rendering is back on for.
+        if rendering && (visible || pre_render) {
+            self.corrupt_oam();
         }
 
         if rendering && (visible || pre_render) {
@@ -1203,6 +1282,7 @@ impl Engine {
         }
 
         // -- sprites --
+        self.sec_addr = self.secondary_addr(dot);
         if (1..=256).contains(&dot) {
             self.sprite_arm();
         }
@@ -1603,6 +1683,9 @@ impl Engine {
         // keeps the layout the previous chunk version wrote.
         w.write_bool(self.nmi_out)?;
         w.write_u8(self.sprite_halted)?;
+        w.write_u8(self.sec_addr)?;
+        w.write_bool(self.corrupt_row.is_some())?;
+        w.write_u8(self.corrupt_row.unwrap_or(0))?;
         w.write_u8(self.mask_pending)?;
         w.write_u8(self.mask_delay)?;
         w.write_bool(self.warmup)?;
@@ -1672,6 +1755,10 @@ impl Engine {
         self.suppress_nmi = r.read_bool()?;
         self.nmi_out = r.read_bool()?;
         self.sprite_halted = r.read_u8()?;
+        self.sec_addr = r.read_u8()?;
+        let pending = r.read_bool()?;
+        let row = r.read_u8()?;
+        self.corrupt_row = pending.then_some(row);
         self.mask_pending = r.read_u8()?;
         self.mask_delay = r.read_u8()?;
         self.warmup = r.read_bool()?;

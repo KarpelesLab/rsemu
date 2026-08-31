@@ -1077,6 +1077,45 @@ fn oam_dma_bytes_go_through_the_2004_path() {
 }
 
 #[test]
+fn switching_rendering_off_mid_line_corrupts_the_row_it_comes_back_on() {
+    // The other half of the same handover. Rendering goes away while the sprite
+    // unit is standing somewhere in secondary OAM; the address goes back to
+    // `OAMADDR`, and when rendering returns it is handed over again — copying
+    // `OAMADDR`'s row over the row the unit had reached (NESdev, *Errata*).
+    let (ppu, _, _) = new_ppu();
+    for index in 0..64u8 {
+        ppu.poke_oam(index, 0xa0 | (index & 0x0f));
+    }
+    ppu.write_register(OAMADDR, 0);
+    enable_rendering(&ppu);
+    // Somewhere inside the secondary-OAM clear, so the pointer is not zero.
+    seek(&ppu, 10, 40);
+    ppu.advance_by(1);
+
+    // The real write path, because the handover is armed where the delayed
+    // `$2001` write finally commits.
+    ppu.write_register(PPUMASK, 0);
+    ppu.advance_by(4);
+    let row = ppu
+        .with_engine(|e| e.corrupt_row)
+        .expect("armed on the way down");
+    assert_ne!(row, 0, "the unit was standing somewhere real");
+    ppu.write_register(
+        PPUMASK,
+        MASK_BG | MASK_SPRITE | MASK_BG_LEFT | MASK_SPRITE_LEFT,
+    );
+    ppu.advance_by(4);
+
+    for i in 0..8u8 {
+        assert_eq!(
+            ppu.peek_oam(row * 8 + i),
+            ppu.peek_oam(i),
+            "row {row}, byte {i}: OAMADDR's row should have been copied here"
+        );
+    }
+}
+
+#[test]
 fn a_high_oamaddr_corrupts_the_first_eight_oam_bytes_at_rendering_start() {
     // NESdev PPU registers, OAMADDR: "if OAMADDR is not less than eight when
     // rendering begins, the eight bytes starting at OAMADDR & $F8 are copied to

@@ -19,7 +19,7 @@
 #     they can never appear here.
 #
 # ---------------------------------------------------------------------------
-# Measured 2026-08-31 against the pinned ROM: 126 of 141 pass, 15 fail.
+# Measured 2026-08-31 against the pinned ROM: 127 of 141 pass, 14 fail.
 # ---------------------------------------------------------------------------
 #
 # The earlier "81 of 125" was measured through a stale copy of the ROM's
@@ -123,9 +123,6 @@
 # $2004 that the engine does not implement yet. Each is a piece of work in
 # src/dev/ppu, not a seam.
 
-7b                # $047B "OAM Corruption" code 2: the documented corruption
-                  # that copies OAM row 0 over another row when rendering is
-                  # switched off mid-frame is not modelled.
 
 # ---------------------------------------------------------------------------
 # E. APU frame counter, and get/put phase
