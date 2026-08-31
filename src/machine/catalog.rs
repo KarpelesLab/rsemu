@@ -180,6 +180,25 @@ pub static ARM926: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/arm926.machine"),
 };
 
+/// The PC/AT, when this build has an x86 core and the board's chips.
+///
+/// Held out of the catalog until now for one reason: `cpu.i8086` was registered
+/// but not bound, so a machine file could not hand it an address space or wire
+/// an interrupt to it. It can, so the board is here.
+///
+/// **No firmware is shipped and none will be.** The `bios` slot takes an image
+/// the user supplies; `vgabios` and `floppy` likewise. A PC with no BIOS is a
+/// board that realizes and executes open bus, which is a useful thing to be
+/// able to look at and not a machine that boots.
+#[cfg(feature = "machine-pc-at")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-pc-at")))]
+pub static PC_AT: CatalogEntry = CatalogEntry {
+    name: "pc-at",
+    summary: "IBM PC/AT-class board: x86, two 8259As, 8254, MC146818, 8042, 8237s, VGA, floppy",
+    media: &["bios", "vgabios", "floppy"],
+    source: include_str!("../../machines/pc-at.machine"),
+};
+
 /// Every machine this build can realize, in catalog order.
 // One `#[cfg]`-gated push per shipped machine, which is what the lint is
 // complaining about: a `vec![]` literal cannot carry an attribute on one of its
@@ -197,6 +216,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&BENEATER_6502);
     #[cfg(feature = "machine-gameboy")]
     out.push(&GAMEBOY);
+    #[cfg(feature = "machine-pc-at")]
+    out.push(&PC_AT);
     #[cfg(feature = "machine-nes")]
     out.push(&NES_NTSC);
     #[cfg(feature = "machine-nes")]
@@ -268,16 +289,6 @@ pub fn registry() -> Result<Registry> {
 
 /// Every class that takes part in the memory map and the wire graph.
 ///
-/// # The x86 core is registered but not bound
-///
-/// `cpu.i8086` appears in [`registry`] and not here, which is the one asymmetry
-/// in this file. The core has a `DeviceClass` and can be constructed, but no
-/// `Instance` impl, no `bind`, no input pins and no `schema` — so a machine
-/// file cannot hand it an address space or wire an interrupt to it, and
-/// `machines/pc-at.machine` is therefore shipped as data and checked by
-/// `dev::pc`'s own tests rather than listed in [`machines`]. The direction the
-/// agreement test checks — bound implies registered — still holds.
-///
 /// # The PPU and the APU
 ///
 /// Both are **lazily advanced** (`ROADMAP.md` §4.2): they hold their own tick
@@ -326,6 +337,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::riscv::bind(&mut b)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::bind(&mut b)?;
+    #[cfg(feature = "cpu-x86")]
+    crate::cpu::x86::bind(&mut b)?;
     #[cfg(feature = "dev-pc")]
     crate::dev::pc::bind(&mut b)?;
     #[cfg(feature = "bus-spi")]
@@ -386,6 +399,10 @@ pub fn classes() -> ClassTable {
     table.insert(crate::bus::spi::controller::schema());
     #[cfg(feature = "dev-st7272a")]
     for schema in crate::dev::sitronix::schemas() {
+        table.insert(schema);
+    }
+    #[cfg(feature = "cpu-x86")]
+    for schema in crate::cpu::x86::schemas() {
         table.insert(schema);
     }
     #[cfg(feature = "dev-pc")]
@@ -1011,8 +1028,41 @@ mod tests {
             // time by `dev::lcd::demo`, so it needs no toolchain either.
             #[cfg(feature = "machine-spi-panel")]
             ("spi-panel", "firmware") => crate::dev::lcd::demo::PANEL_DEMO,
+            // `B .` — the ARM branch-to-self, which is the whole four-byte
+            // program needed to prove the board realizes and the core fetches.
+            // `tests/arm926_board.rs` supplies the one that does something.
+            #[cfg(feature = "machine-arm926")]
+            ("arm926", "firmware") => &[0xfe, 0xff, 0xff, 0xea],
+            // No firmware is shipped for the PC and none ever will be, so what
+            // this board gets is the right *shape*: a socket-sized image of
+            // zeroes, which realizes and executes open bus. `tests/pc_at_board`
+            // is where the board is actually exercised.
+            #[cfg(feature = "machine-pc-at")]
+            ("pc-at", "bios") => blank(128 * 1024),
+            #[cfg(feature = "machine-pc-at")]
+            ("pc-at", "vgabios") => blank(32 * 1024),
+            #[cfg(feature = "machine-pc-at")]
+            ("pc-at", "floppy") => blank(1_474_560),
             (m, other) => panic!("no fixture for `{m}`'s media slot `{other}`"),
         }
+    }
+
+    /// A run of zeroes of a given length, leaked once per length asked for.
+    ///
+    /// A media fixture has to outlive the machine that binds it, and the sizes
+    /// wanted here are a socket's, not a constant's — so the array cannot be a
+    /// `static`. Leaking a handful of buffers in a test process is the honest
+    /// trade against threading a lifetime through the whole fixture table.
+    #[cfg(feature = "machine-pc-at")]
+    fn blank(len: usize) -> &'static [u8] {
+        use std::collections::BTreeMap;
+        use std::sync::{Mutex, OnceLock};
+        static CACHE: OnceLock<Mutex<BTreeMap<usize, &'static [u8]>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .entry(len)
+            .or_insert_with(|| alloc::vec![0u8; len].leak())
     }
 
     /// The smallest legal Game Boy image: two 16 KiB banks, a correct header

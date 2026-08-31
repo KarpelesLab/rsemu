@@ -155,43 +155,58 @@ mod tests {
     use crate::machine::ResolveOptions;
     use crate::machine::resolve_file;
     #[cfg(all(feature = "dev-pc-video", feature = "dev-pc-floppy"))]
-    use crate::machine::validate::{ClassSchema, PortDir, PropSchema, ValidateOptions, validate};
+    use crate::machine::validate::{ClassSchema, ValidateOptions, validate};
+    // Only the fallback schema below writes these out by hand; with the core
+    // compiled in it publishes its own.
+    #[cfg(all(
+        feature = "dev-pc-video",
+        feature = "dev-pc-floppy",
+        not(feature = "cpu-x86")
+    ))]
+    use crate::machine::validate::{PortDir, PropSchema};
     use alloc::string::ToString;
 
-    /// What the PC board needs from the x86 core, written here because the core
-    /// does not publish a schema of its own yet.
+    /// What the PC board needs from the x86 core.
     ///
-    /// This is a **specification handed to whoever owns `src/cpu/x86`**, not a
-    /// permanent home. `cpu.i8086` is registered but not *bound*: it has no
-    /// `Instance` impl, no `bind`, no input pins and no `schema`, so a machine
-    /// file cannot give it an address space or wire an interrupt to it, and
-    /// `machine-pc-at` cannot be added to the catalog until it does. The list
-    /// below is exactly what has to appear for that to happen — and asserting
-    /// the machine file against it here means the board is checked today rather
-    /// than after the core catches up.
+    /// This used to be a specification written here because `cpu.i8086` was
+    /// registered but not *bound* — no `Instance` impl, no `bind`, no input
+    /// pins and no `schema` — so a machine file could not give it an address
+    /// space or wire an interrupt to it, and the board could not go in the
+    /// catalog. The core has that surface now, so this asks the core for its
+    /// own schema instead: one description, and no second copy to drift.
+    ///
+    /// The board still validates against it here, because a chipset test that
+    /// checks its own machine file is worth having whether or not a CPU feature
+    /// is enabled.
     #[cfg(all(feature = "dev-pc-video", feature = "dev-pc-floppy"))]
     fn x86_schema() -> ClassSchema {
-        ClassSchema::new("cpu.i8086")
-            .prop(PropSchema::new("model", crate::core::props::ValueKind::Str))
-            .prop(PropSchema::new(
-                "engine",
-                crate::core::props::ValueKind::Str,
-            ))
-            // The second address space. `space =` is structural and there is
-            // only one of it, so the I/O space is named by an ordinary string
-            // property and looked up with `BindCtx::space_named`.
-            .prop(PropSchema::new(
-                "iospace",
-                crate::core::props::ValueKind::Str,
-            ))
-            .port("intr", PortDir::In)
-            .port("nmi", PortDir::In)
-            .port("reset", PortDir::In)
-            // Not a CPU pin on a real 386 — the gate is in the chipset, between
-            // the CPU and the bus. Modelled as a CPU input because this core
-            // does its own address wrapping, and the gate is exactly a
-            // suppression of that wrap.
-            .port("a20", PortDir::In)
+        #[cfg(feature = "cpu-x86")]
+        {
+            crate::cpu::x86::schemas()
+                .into_iter()
+                .find(|s| s.class == "cpu.i8086")
+                .expect("the core publishes both of its class names")
+        }
+        // Without the core compiled in there is nothing to ask, and the board
+        // still has to validate: the memory map and the wire graph are the
+        // chipset's, not the processor's.
+        #[cfg(not(feature = "cpu-x86"))]
+        {
+            ClassSchema::new("cpu.i8086")
+                .prop(PropSchema::new("model", crate::core::props::ValueKind::Str))
+                .prop(PropSchema::new(
+                    "engine",
+                    crate::core::props::ValueKind::Str,
+                ))
+                .prop(PropSchema::new(
+                    "iospace",
+                    crate::core::props::ValueKind::Str,
+                ))
+                .port("intr", PortDir::In)
+                .port("nmi", PortDir::In)
+                .port("reset", PortDir::In)
+                .port("a20", PortDir::In)
+        }
     }
 
     #[cfg(all(feature = "dev-pc-video", feature = "dev-pc-floppy"))]

@@ -835,12 +835,105 @@ fn registers_are_reachable_by_name() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_core_with_no_address_space_refuses_to_realize() {
+fn realize_does_nothing_outward_because_the_space_has_not_arrived_yet() {
+    // The check that a core has an address space used to live in `realize`. It
+    // cannot: the realizer runs `realize` for every device *before* it binds
+    // any of them, so a core that refused here would refuse every machine. The
+    // check is in `Instance::bind`, and
+    // `binding_a_core_with_no_address_space_is_a_machine_error` covers it.
     let cpu = X86::new(Config::default());
     let mut deferred = Deferred::new();
     let mut ctx = RealizeCtx::new("/cpu0", RequesterId::ANONYMOUS, &mut deferred);
-    let err = cpu.realize(&mut ctx).expect_err("no space attached");
-    assert!(alloc::format!("{err}").contains("address space"));
+    assert!(cpu.realize(&mut ctx).is_ok());
+}
+
+/// A `BuildOptions` that knows about this core and the built-in classes, and
+/// nothing else.
+fn options_with_the_core() -> (crate::core::Registry, crate::machine::BuildOptions) {
+    let mut options = crate::machine::BuildOptions::new();
+    for schema in super::schemas() {
+        options.classes.insert(schema);
+    }
+    for schema in crate::machine::builtin::schemas() {
+        options.classes.insert(schema);
+    }
+    super::bind(&mut options.bindings).expect("nothing else claims these names");
+    crate::machine::builtin::bind(&mut options.bindings).expect("ram and rom");
+
+    let mut registry = crate::core::Registry::new();
+    crate::machine::builtin::register(&mut registry).expect("ram and rom");
+    super::register(&mut registry).expect("nothing else claims these names");
+    (registry, options)
+}
+
+#[test]
+fn binding_a_core_with_no_address_space_is_a_machine_error() {
+    // Through the machine layer, because that is the only thing that can build
+    // a `BindCtx` — and it is the path a user's typo actually takes.
+    let (registry, options) = options_with_the_core();
+    let text = "machine \"m\" {\n  osc x = 1000000 Hz\n  space mem { width = 32 }\n  \
+                object dram \"ram\" { size = 4K }\n  object cpu \"cpu.x86\" { clock = x }\n  \
+                map mem 0 size 4K = dram\n}\n";
+    let err = crate::machine::build("t.machine", text, &registry, &options)
+        .expect_err("a core with no `space =` cannot fetch");
+    let text = alloc::format!("{err}");
+    assert!(text.contains("address space"), "{text}");
+}
+
+#[test]
+fn an_iospace_that_names_nothing_is_a_machine_error() {
+    let (registry, options) = options_with_the_core();
+    let text = "machine \"m\" {\n  osc x = 1000000 Hz\n  space mem { width = 32 }\n  \
+                object dram \"ram\" { size = 4K }\n  \
+                object cpu \"cpu.x86\" { clock = x, space = mem, iospace = \"ports\" }\n  \
+                map mem 0 size 4K = dram\n}\n";
+    let err = crate::machine::build("t.machine", text, &registry, &options)
+        .expect_err("there is no space called `ports`");
+    let text = alloc::format!("{err}");
+    assert!(text.contains("ports"), "{text}");
+}
+
+#[test]
+fn a_machine_file_names_the_core_gives_it_two_spaces_and_it_runs() {
+    // The whole point of the exercise: `cpu.x86` in a `.machine` file, with a
+    // separate I/O space, executing an `OUT` that lands in it.
+    let (registry, mut options) = options_with_the_core();
+    //   mov al, 0x5a ; out 0x42, al ; hlt
+    options
+        .realize
+        .media
+        .insert("firmware", alloc::vec![0xb0u8, 0x5a, 0xe6, 0x42, 0xf4]);
+    let text = "machine \"m\" {\n  osc x = 4772726 Hz\n  \
+                space mem  { width = 20 }\n  space port { width = 16 }\n  \
+                object cpu \"cpu.x86\" \
+                { clock = x, space = mem, iospace = \"port\", variant = \"8088\" }\n  \
+                object ram \"ram\" { size = 64K }\n  \
+                object boot \"rom\" { size = 16, image = \"firmware\" }\n  \
+                object io \"ram\" { size = 64K }\n  \
+                map mem  0x00000 size 64K = ram\n  \
+                map mem  0xffff0 size 16  = boot\n  \
+                map port 0 size 64K = io\n}\n";
+    let mut machine = match crate::machine::build("t.machine", text, &registry, &options) {
+        Ok(m) => m,
+        Err(e) => panic!("the board does not realize: {e}"),
+    };
+    // Five microseconds at 4.77 MHz is about two dozen clocks, which is the
+    // reset sequence plus three instructions with room to spare. A span rather
+    // than a step count, because the scheduler hands out budgets.
+    machine
+        .run_for(crate::core::clock::GlobalTime::from_nanos(500_000))
+        .expect("it runs");
+    let port = machine.space("port").expect("the I/O space");
+    assert_eq!(
+        port.read(
+            0x42,
+            crate::core::value::Width::U8,
+            crate::core::space::MemAttrs::DEFAULT,
+        )
+        .expect("a port"),
+        0x5a,
+        "the `OUT` did not reach the space `iospace` names"
+    );
 }
 
 #[test]
@@ -2911,4 +3004,98 @@ fn a_bit_test_on_memory_with_a_register_offset_reaches_outside_the_operand() {
     let steps = pc.run(5);
     assert!(steps < 5);
     assert_eq!(pc.regs().eax & 0xff, 1, "bit 32 wrapped to bit 0");
+}
+
+// ---------------------------------------------------------------------------
+// The A20 gate
+// ---------------------------------------------------------------------------
+
+/// Point the core back at `at::CODE0` without disturbing anything else.
+fn rewind(pc: &Pc) {
+    let mut regs = pc.cpu.regs();
+    regs.eip = at::CODE0;
+    pc.cpu.set_regs(regs);
+}
+
+#[test]
+fn the_a20_gate_masks_address_bit_twenty_and_nothing_else() {
+    // Not a processor feature on real silicon — the gate is in the chipset —
+    // but this core does its own address wrapping and the gate is exactly a
+    // suppression of it, so it is an input pin here. See `Lines::a20_mask`.
+    let pc = pc386();
+    pc.start_protected();
+    pc.write(0x0000_0010, &[0x5a]);
+    pc.write(0x0010_0010, &[0xa5]);
+
+    // mov al, [0x00100010]
+    pc.write(at::CODE0, &[0xa0, 0x10, 0x00, 0x10, 0x00]);
+    assert!(pc.cpu.a20_open(), "a core with no gate wired has bit 20");
+    pc.cpu.step();
+    assert_eq!(pc.regs().eax & 0xff, 0xa5, "the megabyte above");
+
+    pc.cpu.set_a20(false);
+    rewind(&pc);
+    pc.cpu.step();
+    assert_eq!(
+        pc.regs().eax & 0xff,
+        0x5a,
+        "with the gate shut, bit 20 never reaches memory"
+    );
+
+    // And only bit 20: an address a *second* megabyte up still gets there.
+    pc.write(0x0020_0010, &[0x3c]);
+    pc.write(at::CODE0, &[0xa0, 0x10, 0x00, 0x20, 0x00]);
+    rewind(&pc);
+    pc.cpu.step();
+    assert_eq!(pc.regs().eax & 0xff, 0x3c);
+}
+
+#[test]
+fn wiring_an_a20_pin_shuts_the_gate_because_a_fresh_net_sits_low() {
+    use crate::core::wire::{Level, Wire, WireId};
+
+    let pc = pc386();
+    assert!(pc.cpu.a20_open(), "nothing has wired a gate");
+
+    let src = WireId(1);
+    let pin = pc.cpu.sink("a20", &[src]).expect("an a20 pin");
+    assert!(
+        !pc.cpu.a20_open(),
+        "a board that has a gate starts with it shut, which is what its net \
+         sitting low means and what an AT does"
+    );
+    let wire = Wire::builder()
+        .source(src)
+        .sink_weak(Arc::downgrade(&pin.sink), pin.line)
+        .build();
+    wire.set(src, Level::High);
+    assert!(pc.cpu.a20_open());
+    wire.set(src, Level::Low);
+    assert!(!pc.cpu.a20_open());
+
+    // And a cold reset leaves it where the board's own wiring puts it, rather
+    // than where a board with no gate would be.
+    Device::reset(&*pc.cpu, ResetKind::Cold);
+    assert!(!pc.cpu.a20_open());
+}
+
+#[test]
+fn the_scheduler_budget_is_never_overshot_and_the_debt_is_paid_back() {
+    let pc = pc386();
+    pc.start_protected();
+    // A tight loop of one-byte increments, so every budget lands mid-something.
+    pc.write(at::CODE0, &[0x40, 0x40, 0x40, 0xeb, 0xfb]);
+    let before = pc.cpu.cycles();
+    let mut total = 0u64;
+    for _ in 0..64 {
+        let used = pc.cpu.run_budget(1);
+        assert!(used <= 1, "a budget of one tick reported {used}");
+        total += used;
+    }
+    assert_eq!(total, 64, "every tick of every budget was granted and used");
+    assert_eq!(
+        pc.cpu.cycles() - before,
+        total + pc.cpu.cycle_debt(),
+        "clocks executed but not yet reported are exactly the debt"
+    );
 }

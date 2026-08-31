@@ -160,20 +160,23 @@ mod firmware;
 mod conformance;
 
 use alloc::boxed::Box;
-use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::string::{String, ToString};
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::core::device::{Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind};
+use crate::core::device::{
+    Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
+};
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
+use crate::core::sched::{Budget, Consumed};
 use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{self, AtomicBool, AtomicU32, LockRank, Ordering};
 use crate::core::value::Width;
-use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink};
+use crate::core::wire::{FanIn, IntAck, Level, Resolve, WireId, WireSink};
 
 use exec::{Exec, State};
 
@@ -1040,7 +1043,7 @@ pub enum Interrupt {
 /// a panic under `single`. The re-entrancy contract says mutate your own state
 /// in a short critical section and act outward afterwards; a pin that is one
 /// atomic store needs no critical section at all (`ROADMAP.md` §4.7).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Lines {
     /// `INTR` is level-sensitive: it is taken whenever it is asserted and `IF`
     /// is set.
@@ -1058,6 +1061,60 @@ pub(crate) struct Lines {
     /// NMI is edge-sensitive: a rising edge sets this latch, which stays set
     /// until the interrupt is serviced, however long that takes.
     nmi_latch: AtomicBool,
+    /// A reset asked for by the `reset` pin, latched until the next step folds
+    /// it into the execution state.
+    ///
+    /// A latch rather than a write into `State::reset_pending`, because a wire
+    /// is driven from inside whatever device changed it — a `RESET` written to
+    /// port `0x92` arrives from inside an `OUT` this very core issued — and
+    /// reaching for the session lock there would re-enter the core's own
+    /// critical section (`ROADMAP.md` §4.7).
+    reset: AtomicBool,
+    /// The mask a physical address is `AND`ed with on its way to the bus:
+    /// either all ones, or all ones with bit 20 clear.
+    ///
+    /// The A20 gate is not a processor feature and this file says so in its
+    /// module documentation: on a real PC the gate sits in the chipset, between
+    /// the CPU and memory. rsemu has no device between an initiator and its
+    /// address space to put it in, and the gate is *exactly* a suppression of
+    /// the address wrap this core does for itself, so it is modelled here as an
+    /// input pin (`a20`) and one mask.
+    ///
+    /// All ones until something drives that pin, so a machine that wires no
+    /// gate behaves as it always did rather than losing its odd megabytes to a
+    /// chip it does not have.
+    a20_mask: AtomicU32,
+    /// Whether an `a20` pin exists at all.
+    ///
+    /// The distinction the mask alone cannot make: a board with no gate has
+    /// bit 20 permanently connected, while a board that wires one starts with
+    /// it **shut**, because a fresh net sits low and low is what a closed gate
+    /// looks like. Getting that backwards makes a cold-booted AT disagree with
+    /// the same AT restored from a snapshot, since the wire's own state is
+    /// replayed on load either way.
+    a20_wired: AtomicBool,
+    /// What answers the `INTR` acknowledge cycle, if a controller drives it.
+    ///
+    /// Weak, and behind its own leaf lock: the machine owns both devices, and a
+    /// CPU that kept its PIC alive would close a cycle nothing could drop
+    /// (`ROADMAP.md` §4.3). Taken and released *before* `acknowledge` is
+    /// called, so the controller is free to take its own locks.
+    ack: sync::Mutex<Option<Weak<dyn IntAck>>>,
+}
+
+impl Default for Lines {
+    fn default() -> Lines {
+        Lines {
+            intr: AtomicBool::new(false),
+            intr_vector: AtomicU32::new(0),
+            nmi_level: AtomicBool::new(false),
+            nmi_latch: AtomicBool::new(false),
+            reset: AtomicBool::new(false),
+            a20_mask: AtomicU32::new(u32::MAX),
+            a20_wired: AtomicBool::new(false),
+            ack: sync::Mutex::new(None),
+        }
+    }
 }
 
 impl Lines {
@@ -1102,6 +1159,61 @@ impl Lines {
         self.nmi_latch.store(false, Ordering::Release);
     }
 
+    /// Latch a reset request. Cleared by whoever folds it into the state.
+    fn request_reset(&self) {
+        self.reset.store(true, Ordering::Release);
+    }
+
+    /// Consume the latch, reporting whether a reset was owed.
+    fn take_reset_request(&self) -> bool {
+        self.reset.swap(false, Ordering::AcqRel)
+    }
+
+    /// Open or close the A20 gate. `open` is the logical level of the pin.
+    fn set_a20(&self, open: bool) {
+        let mask = if open { u32::MAX } else { !(1u32 << 20) };
+        self.a20_mask.store(mask, Ordering::Release);
+    }
+
+    /// The mask a physical address is `AND`ed with on its way to the bus.
+    pub(crate) fn a20_mask(&self) -> u32 {
+        self.a20_mask.load(Ordering::Relaxed)
+    }
+
+    /// Note that a gate has been wired, and shut it: a fresh net sits low.
+    fn wire_a20(&self) {
+        self.a20_wired.store(true, Ordering::Release);
+        self.set_a20(false);
+    }
+
+    /// The level a reset leaves the gate at: open if there is no gate.
+    fn a20_at_reset(&self) -> bool {
+        !self.a20_wired.load(Ordering::Acquire)
+    }
+
+    /// Install what answers the acknowledge cycle on `INTR`.
+    fn attach_ack(&self, ack: Weak<dyn IntAck>) {
+        *self.ack.lock() = Some(ack);
+    }
+
+    /// Run the acknowledge cycle and report the vector.
+    ///
+    /// A controller on the net answers it — and moves the request from pending
+    /// to in service while it is there, which is the half of the handshake a
+    /// latched vector byte cannot do. With nothing attached the latched byte is
+    /// the answer, which is what a test driving the pin by hand sets.
+    ///
+    /// The lock is released before the outward call: the re-entrancy contract
+    /// forbids holding one across a call into another device (§4.7), and a PIC
+    /// answering an acknowledge takes its own.
+    pub(crate) fn acknowledge(&self) -> u8 {
+        let handler = self.ack.lock().clone();
+        match handler.and_then(|weak| weak.upgrade()) {
+            Some(ack) => ack.acknowledge() as u8,
+            None => self.intr_vector(),
+        }
+    }
+
     fn snapshot(&self) -> (bool, bool, bool, u8) {
         (
             self.intr_asserted(),
@@ -1144,8 +1256,33 @@ struct Session {
 #[derive(Debug)]
 pub struct X86 {
     cfg: Config,
-    lines: Lines,
+    /// Which of the two class names built this instance.
+    ///
+    /// The same core answers to `cpu.x86` and `cpu.i8086`, and a snapshot chunk
+    /// is keyed by path but *carries* the class name (`ROADMAP.md` §4.5), so
+    /// reporting the one the machine file actually named is the difference
+    /// between a snapshot that describes the machine and one that describes a
+    /// machine it could have been.
+    class: &'static DeviceClass,
+    lines: Arc<Lines>,
+    /// This core's identity in `MemAttrs::requester`, assigned at bind time.
+    ///
+    /// Separate from [`Config::requester`] because a machine file names no
+    /// requester: the machine layer allocates one per initiator and hands it
+    /// over in [`Instance::bind`](crate::machine::Instance::bind), which is
+    /// after `new` (§4.4).
+    requester: AtomicU32,
+    /// The name of the address space `IN` and `OUT` reach, from the `iospace`
+    /// property. Resolved in `bind`, because spaces do not exist before then.
+    iospace: String,
     session: sync::Mutex<Session>,
+    /// The strong end of every pin this core has handed to a wire.
+    ///
+    /// A net holds its sinks weakly — the machine owns devices and a wire
+    /// merely refers to them (§4.3) — so a pin nothing else kept alive would
+    /// die on the way out of [`Device::sink`] and the wire would silently
+    /// deliver to nothing.
+    pins: sync::Mutex<Vec<(String, Arc<InputPin>)>>,
 }
 
 impl X86 {
@@ -1158,7 +1295,10 @@ impl X86 {
     pub fn new(cfg: Config) -> X86 {
         X86 {
             cfg,
-            lines: Lines::default(),
+            class: &CLASS,
+            lines: Arc::new(Lines::default()),
+            requester: AtomicU32::new(cfg.requester.0),
+            iospace: String::new(),
             session: sync::Mutex::with_rank(
                 LockRank::BUS,
                 Session {
@@ -1167,6 +1307,7 @@ impl X86 {
                     io: None,
                 },
             ),
+            pins: sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1201,17 +1342,72 @@ impl X86 {
                 .ok_or_else(|| Error::Property(alloc::format!("unknown x86 model `{name}`")))?,
             None => Variant::from_name(variant).expect("the enum listed above"),
         };
+        // Accepted and ignored: there is one engine until phase 5, and a
+        // machine file that names it should not need editing when the second
+        // one lands.
+        let _engine = r.or_enum("engine", "interp", &["interp"])?;
+        // `space =` is structural and there is exactly one of it, so the
+        // *second* address space is named by an ordinary string property and
+        // looked up with `BindCtx::space_named`.
+        let iospace = r.optional_str("iospace")?.unwrap_or("").to_string();
         r.finish()?;
-        Ok(X86::new(Config {
+        let mut cpu = X86::new(Config {
             variant,
             requester: RequesterId::ANONYMOUS,
-        }))
+        });
+        cpu.iospace = iospace;
+        Ok(cpu)
     }
 
-    /// This core's configuration.
+    /// The same core under the other class name.
+    ///
+    /// [`I8086_CLASS`]'s constructor calls this, so an instance a machine file
+    /// declared as `cpu.i8086` reports that class rather than `cpu.x86` — which
+    /// the realizer checks, and which a snapshot chunk carries. Public because
+    /// anything assembling its own [`Bindings`](crate::machine::Bindings) has
+    /// to be able to build the same thing the catalog does.
+    #[must_use]
+    pub fn as_i8086(mut self) -> X86 {
+        self.class = &I8086_CLASS;
+        self
+    }
+
+    /// Which address space `IN` and `OUT` reach, by name, or `""` for none.
+    #[must_use]
+    pub fn io_space_name(&self) -> &str {
+        &self.iospace
+    }
+
+    /// This core's configuration, with the bind-time requester folded in.
     #[must_use]
     pub fn config(&self) -> Config {
-        self.cfg
+        Config {
+            requester: RequesterId(self.requester.load(Ordering::Relaxed)),
+            ..self.cfg
+        }
+    }
+
+    /// Give the core the identity its accesses travel under.
+    ///
+    /// The machine layer calls this from `bind`; a crate driving the core
+    /// directly usually sets [`Config::requester`] at construction instead.
+    pub fn set_requester(&self, id: RequesterId) {
+        self.requester.store(id.0, Ordering::Relaxed);
+    }
+
+    /// Whether the A20 gate is open — that is, whether address bit 20 reaches
+    /// memory.
+    ///
+    /// Open unless something drives the `a20` pin low. See [`Lines::a20_mask`]
+    /// for why a chipset signal is a CPU input here.
+    #[must_use]
+    pub fn a20_open(&self) -> bool {
+        self.lines.a20_mask() == u32::MAX
+    }
+
+    /// Drive the A20 gate directly, for a caller with no wire.
+    pub fn set_a20(&self, open: bool) {
+        self.lines.set_a20(open);
     }
 
     /// Give the core the memory space it executes from.
@@ -1457,19 +1653,48 @@ impl X86 {
         self.session.lock().state.reset_pending = true;
     }
 
+    /// Whether the `reset` pin has latched a request the core has not run yet.
+    ///
+    /// Distinct from [`reset_pending`](X86::reset_pending), which is the
+    /// *execution state*: the pin's latch lives outside the execution lock and
+    /// is folded into that state by the next [`step`](X86::step). A board test
+    /// watching a `RESET` pulse arrive is watching this one.
+    #[must_use]
+    pub fn reset_requested(&self) -> bool {
+        self.lines.reset.load(Ordering::Acquire)
+    }
+
+    /// Run the `INTR` acknowledge cycle now and report the vector.
+    ///
+    /// This is exactly what the core does when it takes a maskable interrupt,
+    /// exposed because it is the half of the handshake nothing else can
+    /// observe: whatever drives `INTR` answers with a vector *and* moves the
+    /// request from pending to in service. It has side effects on that
+    /// controller, so it is for a monitor or a test standing in for the
+    /// processor, not for polling.
+    pub fn acknowledge(&self) -> u8 {
+        self.lines.acknowledge()
+    }
+
     /// Execute one reset sequence, interrupt sequence, or instruction.
     ///
     /// Returns the clock cycles charged: zero if the core is halted with no
     /// interrupt pending, or has no address space, which the caller must treat
     /// as "stop", not "retry".
     pub fn step(&self) -> u64 {
+        let reset = self.lines.take_reset_request();
+        let cfg = self.config();
         let mut session = self.session.lock();
         let Session { state, memory, io } = &mut *session;
+        // The `reset` pin latches outside the lock; this is where the latch
+        // becomes execution state, and it happens before the step so a pulse is
+        // honoured at the very next instruction boundary.
+        state.reset_pending |= reset;
         let Some(memory) = memory.clone() else {
             return 0;
         };
         let io = io.clone();
-        Exec::new(state, &memory, io.as_deref(), &self.cfg, &self.lines).step()
+        Exec::new(state, &memory, io.as_deref(), &cfg, &self.lines).step()
     }
 
     /// Execute until at least `budget` cycles have been charged.
@@ -1478,6 +1703,9 @@ impl X86 {
     /// instruction — an 8086 cannot be stopped mid-instruction, and pretending
     /// otherwise is how a scheduler ends up with a CPU in an impossible state.
     /// Stops early if the core halts.
+    ///
+    /// [`run_budget`](X86::run_budget) is the same loop with the overshoot
+    /// carried forward instead, which is what the scheduler needs.
     pub fn run(&self, budget: u64) -> u64 {
         let mut used = 0;
         while used < budget {
@@ -1488,6 +1716,47 @@ impl X86 {
             used += n;
         }
         used
+    }
+
+    /// Execute for at most `ticks`, carrying any overshoot into the next call.
+    ///
+    /// The scheduler hands out a budget and refuses a report larger than it, so
+    /// the instruction that ran past the end is paid for by the *following*
+    /// budget through `State::debt` — which keeps the core's cycle count exact
+    /// while never letting its clock domain run ahead of the timeline.
+    ///
+    /// A halted core, one that has shut down on a triple fault, or one with no
+    /// address space consumes only the debt it owed plus whatever it managed.
+    pub fn run_budget(&self, ticks: u64) -> u64 {
+        let owed = self.session.lock().state.debt;
+        if owed >= ticks {
+            // The last instruction was longer than this whole budget: charge
+            // the budget against the debt and execute nothing.
+            self.session.lock().state.debt = owed - ticks;
+            return ticks;
+        }
+        let allowance = ticks - owed;
+        let mut used = 0u64;
+        while used < allowance {
+            let n = self.step();
+            if n == 0 {
+                // Halted with nothing pending, shut down, or no address space.
+                // Either way retrying would spin — but the budget is still
+                // consumed, or the scheduler never advances past a `HLT`
+                // waiting for the timer that would wake it.
+                self.session.lock().state.debt = 0;
+                return ticks;
+            }
+            used += n;
+        }
+        self.session.lock().state.debt = used - allowance;
+        ticks
+    }
+
+    /// Clocks owed to the next budget — see [`run_budget`](X86::run_budget).
+    #[must_use]
+    pub fn cycle_debt(&self) -> u64 {
+        self.session.lock().state.debt
     }
 
     /// Disassemble `count` instructions starting at the current `CS:EIP`,
@@ -1541,7 +1810,8 @@ impl X86 {
 /// older class name working with its own default.
 pub static CLASS: DeviceClass = DeviceClass {
     name: "cpu.x86",
-    version: 2,
+    // 3: the chunk gained the scheduler debt and the A20 level.
+    version: 3,
     summary: "Intel x86 CPU core: 8086/8088 real mode, or 80386/80486 with protection and paging",
     properties: &[
         PropertySpec {
@@ -1555,6 +1825,18 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Str,
             required: false,
             summary: "accepted as a synonym for \"variant\", which this class used to be called",
+        },
+        PropertySpec {
+            name: "engine",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "which execution engine; only `interp` exists until phase 5",
+        },
+        PropertySpec {
+            name: "iospace",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "the name of the separate address space IN and OUT reach",
         },
     ],
     construct: |props| {
@@ -1571,10 +1853,14 @@ pub static CLASS: DeviceClass = DeviceClass {
 /// core keeps meaning what it meant. A build links one core either way.
 pub static I8086_CLASS: DeviceClass = DeviceClass {
     name: "cpu.i8086",
-    version: 2,
+    version: 3,
     summary: "Intel 8086 / 8088 16-bit CPU core, real mode, hardware-checked interpreter",
     properties: CLASS.properties,
-    construct: |props| Ok(Box::new(X86::from_props_defaulting(props, Variant::I8088)?)),
+    construct: |props| {
+        Ok(Box::new(
+            X86::from_props_defaulting(props, Variant::I8088)?.as_i8086(),
+        ))
+    },
 };
 
 /// Add this core's classes to a registry.
@@ -1593,17 +1879,52 @@ pub fn register(reg: &mut Registry) -> Result<()> {
 
 impl Device for X86 {
     fn class(&self) -> &'static DeviceClass {
-        &CLASS
+        self.class
     }
 
-    fn realize(&self, ctx: &mut RealizeCtx<'_>) -> Result<()> {
-        // A CPU with no address space cannot fetch, and failing here is the
-        // difference between a config error and a machine that runs zero
-        // instructions and says nothing.
-        if self.session.lock().memory.is_none() {
-            return Err(ctx.error("no memory address space attached to this core"));
-        }
+    fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
+        // Nothing outward. A CPU with no address space cannot fetch, but
+        // realize runs *before* the machine binds one — that check belongs to
+        // `Instance::bind`, which is where the space arrives.
         Ok(())
+    }
+
+    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        // The fan-in can only be built now: it is told its sources at
+        // construction and no `WireId` existed when this core was made. It is
+        // not decoration on this board — `A20` and `RESET` each have two
+        // drivers on an AT, the keyboard controller and the chipset's fast
+        // port, and a pin that only remembered "somebody said high" would drop
+        // the line when either of them said low.
+        let which = match port {
+            "intr" => Input::Intr,
+            "nmi" => Input::Nmi,
+            "reset" => Input::Reset,
+            "a20" => Input::A20,
+            _ => return None,
+        };
+        if which == Input::A20 {
+            self.lines.wire_a20();
+        }
+        let pin = Arc::new(InputPin::new(Arc::clone(&self.lines), which, sources));
+        self.pins.lock().push((port.to_string(), Arc::clone(&pin)));
+        Some(SinkPin { sink: pin, line: 0 })
+    }
+
+    fn attach_int_ack(&self, port: &str, ack: Weak<dyn IntAck>) {
+        // Only `INTR` has an acknowledge cycle: `NMI` is vectored through entry
+        // 2 by the architecture and nothing drives a vector for it.
+        if port == "intr" {
+            self.lines.attach_ack(ack);
+        }
+    }
+
+    fn is_runnable(&self) -> bool {
+        true
+    }
+
+    fn run(&self, budget: Budget) -> Consumed {
+        Consumed::new(self.run_budget(budget.ticks))
     }
 
     fn reset(&self, kind: ResetKind) {
@@ -1622,12 +1943,18 @@ impl Device for X86 {
         drop(session);
         if kind == ResetKind::Cold {
             self.lines.restore((false, false, false, 0));
+            // A board with a gate comes back with it shut, which is what its
+            // net sitting low means and what an AT does; a board with no gate
+            // has bit 20 permanently connected.
+            self.lines.set_a20(self.lines.a20_at_reset());
         } else {
             // The input *levels* belong to whatever drives them, not to the
             // CPU — clearing them here would make a reset lie about the
             // machine. The edge latch is internal, so it goes.
             self.lines.clear_nmi_latch();
         }
+        // The sequence the machine just asked for is the one the pin owed.
+        self.lines.take_reset_request();
     }
 
     /// The snapshot layout.
@@ -1645,7 +1972,16 @@ impl Device for X86 {
     /// The translation-lookaside buffer is **not** written: it is a cache of
     /// the page tables and is rebuilt on demand.
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
-        let state = self.session.lock().state;
+        // Fold the `reset` pin's latch in first. It is not a field of its own
+        // in the chunk: `reset_pending` is where it was always going, and a
+        // snapshot taken between an assertion and the next step would otherwise
+        // lose the reset entirely.
+        let reset = self.lines.take_reset_request();
+        let state = {
+            let mut session = self.session.lock();
+            session.state.reset_pending |= reset;
+            session.state
+        };
         for reg in Reg::ALL {
             w.write_u32(reg.get(&state.regs))?;
         }
@@ -1688,11 +2024,16 @@ impl Device for X86 {
         for byte in queue {
             w.write_u8(byte)?;
         }
+        w.write_u64(state.debt)?;
         let (intr, nmi_level, nmi_latch, vector) = self.lines.snapshot();
         w.write_bool(intr)?;
         w.write_bool(nmi_level)?;
         w.write_bool(nmi_latch)?;
         w.write_u8(vector)?;
+        // The A20 gate is an input level, and a restored machine whose gate was
+        // closed must still have it closed — the chipset that drives it is not
+        // going to announce again until the next realize sweep.
+        w.write_bool(self.a20_open())?;
         Ok(())
     }
 
@@ -1762,10 +2103,12 @@ impl Device for X86 {
                 self.cfg.variant.queue_bytes()
             ))
         })?;
+        state.debt = r.read_u64()?;
         let intr = r.read_bool()?;
         let nmi_level = r.read_bool()?;
         let nmi_latch = r.read_bool()?;
         let vector = r.read_u8()?;
+        let a20 = r.read_bool()?;
         // The translation-lookaside buffer is derived, so it is not in the
         // snapshot and starts empty — which is correct rather than merely
         // convenient, because the page tables it would cache have just been
@@ -1773,13 +2116,164 @@ impl Device for X86 {
         state.tlb.flush();
         self.session.lock().state = state;
         self.lines.restore((intr, nmi_level, nmi_latch, vector));
+        self.lines.set_a20(a20);
         Ok(())
     }
 }
 
 impl Initiator for X86 {
     fn requester(&self) -> RequesterId {
-        self.cfg.requester
+        RequesterId(self.requester.load(Ordering::Relaxed))
+    }
+}
+
+/// The machine layer's half: a core needs its two address spaces, and this is
+/// where the machine gives it them.
+///
+/// `space =` is structural and there is exactly one of it, so the **I/O** space
+/// is named by the `iospace` string property and looked up by name. That is not
+/// a workaround: a machine with two x86 cores sharing one port space and
+/// separate memory is a real configuration, and naming the second space keeps
+/// it expressible.
+impl crate::machine::Instance for X86 {
+    fn bind(&self, ctx: &crate::machine::BindCtx<'_>) -> Result<()> {
+        let memory = ctx.space().ok_or_else(|| Error::Config {
+            at: ctx.path().to_string(),
+            message: String::from("an x86 needs an address space to fetch from (`space = mem`)"),
+        })?;
+        self.attach_space(Arc::clone(memory));
+        if !self.iospace.is_empty() {
+            let io = ctx
+                .space_named(&self.iospace)
+                .ok_or_else(|| Error::Config {
+                    at: ctx.path().to_string(),
+                    message: alloc::format!(
+                        "`iospace = \"{}\"` names no address space in this machine",
+                        self.iospace
+                    ),
+                })?;
+            self.attach_io_space(Arc::clone(io));
+        }
+        self.set_requester(ctx.requester());
+        Ok(())
+    }
+}
+
+/// Bind [`CLASS`] and [`I8086_CLASS`] into the machine graph.
+///
+/// # Errors
+///
+/// If either class name is already bound.
+pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
+    bindings.bind(CLASS.name, |props| {
+        Ok(Arc::new(X86::from_props_defaulting(
+            props,
+            Variant::I80486,
+        )?))
+    })?;
+    bindings.bind(I8086_CLASS.name, |props| {
+        Ok(Arc::new(
+            X86::from_props_defaulting(props, Variant::I8088)?.as_i8086(),
+        ))
+    })
+}
+
+/// What the validator should know about both class names.
+#[must_use]
+pub fn schemas() -> Vec<crate::machine::validate::ClassSchema> {
+    alloc::vec![schema_for(CLASS.name), schema_for(I8086_CLASS.name)]
+}
+
+/// One class's schema. The two differ only in the name and in what
+/// "unspecified" means for `variant`, which the validator does not police.
+fn schema_for(name: &'static str) -> crate::machine::validate::ClassSchema {
+    use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
+    ClassSchema::new(name)
+        .prop(PropSchema::new("variant", ValueKind::Str).values(Variant::NAMES))
+        .prop(PropSchema::new("model", ValueKind::Str).values(Variant::NAMES))
+        .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
+        .prop(PropSchema::new("iospace", ValueKind::Str))
+        // Inputs only: the outputs a real part has — `M/IO`, `LOCK`, the
+        // `INTA` strobes — are the address space's business or the acknowledge
+        // cycle's, not a wire's.
+        .port("intr", PortDir::In)
+        .port("nmi", PortDir::In)
+        .port("reset", PortDir::In)
+        // Not a processor pin on real silicon: the gate is in the chipset,
+        // between the CPU and the bus. It is an input here because this core
+        // does its own address wrapping and the gate is exactly a suppression
+        // of that wrap — see [`Lines::a20_mask`].
+        .port("a20", PortDir::In)
+}
+
+/// Which input a [`InputPin`] drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Input {
+    /// `INTR`, level-sensitive and gated by `IF`.
+    Intr,
+    /// `NMI`, edge-sensitive.
+    Nmi,
+    /// `RESET`, latched on assertion.
+    Reset,
+    /// The A20 gate: high opens it, low masks address bit 20.
+    A20,
+}
+
+/// One of the core's input pins, as something a [`Wire`] can drive.
+///
+/// The pin keeps a handle on the core's *input latches*, not on the core: the
+/// core owns the pin — something must, since a net holds only a weak reference
+/// to its sinks — and a pin that owned the core back would be a cycle the
+/// machine could never drop.
+///
+/// Every pin wire-ORs its sources. On an AT that is load-bearing rather than
+/// defensive: `A20` and `RESET` each have two drivers, the keyboard controller
+/// and the chipset's fast port, and either releasing must not drop a line the
+/// other is holding.
+///
+/// [`Wire`]: crate::core::wire::Wire
+#[derive(Debug)]
+pub struct InputPin {
+    lines: Arc<Lines>,
+    which: Input,
+    inputs: FanIn,
+    resolve: Resolve,
+}
+
+impl InputPin {
+    fn new(lines: Arc<Lines>, which: Input, sources: &[WireId]) -> InputPin {
+        InputPin {
+            lines,
+            which,
+            inputs: FanIn::new(sources),
+            resolve: Resolve::Or,
+        }
+    }
+
+    /// The per-source levels currently seen.
+    #[must_use]
+    pub fn inputs(&self) -> &FanIn {
+        &self.inputs
+    }
+}
+
+impl WireSink for InputPin {
+    fn set_level(&self, src: WireId, _line: u32, level: Level) {
+        self.inputs.set(src, level);
+        let asserted = self.inputs.resolve(self.resolve).is_high();
+        match self.which {
+            Input::Intr => self.lines.set_intr(asserted),
+            Input::Nmi => self.lines.set_nmi(asserted),
+            // Latch on assertion rather than on release: a machine holding its
+            // reset button down should still come up, instead of waiting for a
+            // release nobody modelled.
+            Input::Reset => {
+                if asserted {
+                    self.lines.request_reset();
+                }
+            }
+            Input::A20 => self.lines.set_a20(asserted),
+        }
     }
 }
 
@@ -1794,7 +2288,7 @@ impl Initiator for X86 {
 /// [`Wire`]: crate::core::wire::Wire
 #[derive(Debug)]
 pub struct InterruptPin {
-    cpu: Arc<X86>,
+    lines: Arc<Lines>,
     which: Interrupt,
     inputs: FanIn,
     resolve: Resolve,
@@ -1805,10 +2299,14 @@ impl InterruptPin {
     ///
     /// Wire-OR by default: any source asserting asserts the pin, which is how
     /// an open-collector interrupt line behaves.
+    ///
+    /// The pin holds the core's input latches rather than the core, for the
+    /// reason [`InputPin`] gives: the core owns the pin, and owning it back
+    /// would close a cycle the machine could never drop.
     #[must_use]
     pub fn new(cpu: Arc<X86>, which: Interrupt, sources: &[WireId]) -> InterruptPin {
         InterruptPin {
-            cpu,
+            lines: Arc::clone(&cpu.lines),
             which,
             inputs: FanIn::new(sources),
             resolve: Resolve::Or,
@@ -1840,8 +2338,8 @@ impl WireSink for InterruptPin {
         self.inputs.set(src, level);
         let asserted = self.inputs.resolve(self.resolve).is_high();
         match self.which {
-            Interrupt::Intr => self.cpu.set_intr(asserted),
-            Interrupt::Nmi => self.cpu.set_nmi(asserted),
+            Interrupt::Intr => self.lines.set_intr(asserted),
+            Interrupt::Nmi => self.lines.set_nmi(asserted),
         }
     }
 }
