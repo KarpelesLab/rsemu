@@ -406,10 +406,17 @@ const MOONEYE_LEDGER: &[(&str, &str)] = &[
         "ppu/intr_2_mode0_timing_sprites.gb",
         "the mode-3 object penalty is Pan Docs' documented approximation — \
          six dots each and up to five more for the first object in a \
-         background tile — rather than a fetcher simulation. This ROM \
-         tabulates 34 object configurations against the machine cycle mode \
-         0 arrives on, and the approximation is right on average and wrong \
-         per case.",
+         background tile — rather than a fetcher simulation. The ROM \
+         tabulates 34 object configurations against the machine cycle mode 0 \
+         arrives on, and the split is informative: its whole *count* column \
+         — one to ten objects at x=0, costing 2 4 5 7 8 10 11 13 14 16 \
+         machine cycles — comes out exactly right, so the eleven-and-six \
+         rule and the phase are both right. Its *alignment* column does not: \
+         ten objects at an x of 1, 5, 6 or 7 modulo 8 want a first-object \
+         penalty this formula does not produce — 11, and at least 7, against \
+         the 10 and 6 it gives. Four residues out of eight is a fetcher, not \
+         a constant, and guessing one to make the table line up is the fit \
+         `ROADMAP.md` §0 forbids.",
     ),
     (
         "ppu/lcdon_timing-GS.gb",
