@@ -27,7 +27,7 @@
 use alloc::vec::Vec;
 use core::fmt;
 
-use super::isa::{self, Arg, Class, Fields, ModRm, Op, Rep, seg};
+use super::isa::{self, Arg, Class, Fields, Gen, ModRm, Op, Rep, seg};
 
 /// The 8-bit register names, in ModRM `reg` order.
 pub const REG8: [&str; 8] = ["al", "cl", "dl", "bl", "ah", "ch", "dh", "bh"];
@@ -35,11 +35,24 @@ pub const REG8: [&str; 8] = ["al", "cl", "dl", "bl", "ah", "ch", "dh", "bh"];
 /// The 16-bit register names, in ModRM `reg` order.
 pub const REG16: [&str; 8] = ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di"];
 
-/// The address expression each `rm` value selects, for `md != 3`.
+/// The 32-bit register names, in the same order.
+pub const REG32: [&str; 8] = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"];
+
+/// The address expression each `rm` value selects, for `md != 3`, with a
+/// 16-bit address size.
 ///
 /// `rm == 6` is the odd one out: with `md == 0` it is a direct 16-bit address
 /// instead, which is why the entry here is only reached for `md` of 1 or 2.
 const RM_TERMS: [&str; 8] = ["bx+si", "bx+di", "bp+si", "bp+di", "si", "di", "bp", "bx"];
+
+/// The register names at a width of 1, 2 or 4 bytes.
+const fn regs_for(size: u8) -> [&'static str; 8] {
+    match size {
+        1 => REG8,
+        2 => REG16,
+        _ => REG32,
+    }
+}
 
 /// How long an instruction this type keeps the raw bytes of.
 ///
@@ -57,7 +70,7 @@ pub struct Disassembled {
     /// Code segment the instruction was decoded in.
     pub cs: u16,
     /// Offset the instruction starts at.
-    pub ip: u16,
+    pub ip: u32,
     /// Everything the decoder extracted, including the resolved table row.
     pub fields: Fields,
     /// The raw bytes, up to [`MAX_KEPT_BYTES`].
@@ -75,12 +88,17 @@ pub struct Disassembled {
 impl Disassembled {
     /// The offset of the instruction that follows this one.
     ///
-    /// Guest arithmetic wraps: an instruction that ends at `0xffff` is
-    /// followed by one at `0x0000` in the same segment, which is what the
-    /// 8086's instruction pointer does.
+    /// Guest arithmetic wraps, at the operand size: an instruction that ends
+    /// at `0xffff` in a 16-bit code segment is followed by one at `0x0000`,
+    /// which is what the instruction pointer does.
     #[must_use]
-    pub const fn next_ip(&self) -> u16 {
-        self.ip.wrapping_add(self.len as u16)
+    pub const fn next_ip(&self) -> u32 {
+        let next = self.ip.wrapping_add(self.len as u32);
+        if self.fields.opsize == 2 {
+            (self.ip & 0xffff_0000) | (next & 0xffff)
+        } else {
+            next
+        }
     }
 
     /// The offset a relative jump or call would transfer to.
@@ -88,9 +106,16 @@ impl Disassembled {
     /// `None` for every other instruction — an indirect transfer's target
     /// depends on state a static disassembler does not have.
     #[must_use]
-    pub const fn branch_target(&self) -> Option<u16> {
+    pub const fn branch_target(&self) -> Option<u32> {
         match (self.fields.insn.dst, self.fields.insn.src) {
-            (Arg::Jb | Arg::Jv, _) => Some(self.next_ip().wrapping_add(self.fields.imm as u16)),
+            (Arg::Jb | Arg::Jv, _) => {
+                let target = self.next_ip().wrapping_add(self.fields.imm);
+                Some(if self.fields.opsize == 2 {
+                    target & 0xffff
+                } else {
+                    target
+                })
+            }
             _ => None,
         }
     }
@@ -115,9 +140,14 @@ const fn fixes_size(arg: Arg) -> bool {
         arg,
         Arg::Gb
             | Arg::Gv
+            | Arg::Gw
             | Arg::Sw
             | Arg::Rb
             | Arg::Rv
+            | Arg::Rd
+            | Arg::Cd
+            | Arg::Dd
+            | Arg::Td
             | Arg::Sr
             | Arg::Al
             | Arg::Ax
@@ -138,11 +168,7 @@ impl fmt::Display for Disassembled {
             // The two repeat prefixes share an encoding with `REPE`/`REPNE`;
             // which name reads better depends on the instruction, so the
             // comparing forms get the conditional spelling.
-            Some(Rep::While)
-                if matches!(insn.op, Op::CMPSB | Op::CMPSW | Op::SCASB | Op::SCASW) =>
-            {
-                f.write_str("repe ")?;
-            }
+            Some(Rep::While) if insn.op.repeat_tests_zf() => f.write_str("repe ")?,
             Some(Rep::While) => f.write_str("rep ")?,
             Some(Rep::WhileNot) => f.write_str("repne ")?,
             None => {}
@@ -156,32 +182,78 @@ impl fmt::Display for Disassembled {
             write!(f, "{}: ", seg::name(sr))?;
         }
 
-        f.write_str(insn.op.mnemonic())?;
+        f.write_str(self.mnemonic())?;
 
         let show_size = self.needs_size_hint();
         let mut first = true;
-        for arg in [insn.dst, insn.src] {
+        // The immediates are consumed in operand order, exactly as the decoder
+        // filled them: `enter 0x10, 0x0` has two, and printing both from the
+        // first slot is how a listing quietly lies about the second.
+        let mut slot = 0u8;
+        for arg in [insn.dst, insn.src, insn.aux] {
             if arg == Arg::None {
                 continue;
             }
+            let imm = if arg == Arg::Ap {
+                slot = 2;
+                fields.imm
+            } else if arg.immediate_bytes(fields.opsize, fields.addrsize) > 0 {
+                if slot == 0 {
+                    slot = 1;
+                    fields.imm
+                } else {
+                    slot = 2;
+                    fields.imm2
+                }
+            } else {
+                fields.imm
+            };
             f.write_str(if first { " " } else { ", " })?;
             first = false;
-            self.write_arg(f, arg, show_size)?;
+            self.write_arg(f, arg, show_size, imm)?;
         }
         Ok(())
     }
 }
 
 impl Disassembled {
+    /// The mnemonic to print, which is not always [`Op::mnemonic`].
+    ///
+    /// A handful of operations are spelled differently at a 32-bit operand
+    /// size — `cwd` becomes `cdq`, `movsw` becomes `movsd`, `iret` becomes
+    /// `iretd` — because Intel gave the wide forms their own names even though
+    /// they share an opcode. Printing `movsw` for `66 a5` would be a listing
+    /// that no assembler would accept back.
+    fn mnemonic(&self) -> &'static str {
+        let wide = self.fields.opsize == 4;
+        match (self.fields.insn.op, wide) {
+            (Op::CBW, true) => "cwde",
+            (Op::CWD, true) => "cdq",
+            (Op::IRET, true) => "iretd",
+            (Op::PUSHA, true) => "pushad",
+            (Op::POPA, true) => "popad",
+            (Op::PUSHF, true) => "pushfd",
+            (Op::POPF, true) => "popfd",
+            (Op::MOVSW, true) => "movsd",
+            (Op::CMPSW, true) => "cmpsd",
+            (Op::STOSW, true) => "stosd",
+            (Op::LODSW, true) => "lodsd",
+            (Op::SCASW, true) => "scasd",
+            (Op::INSW, true) => "insd",
+            (Op::OUTSW, true) => "outsd",
+            (op, _) => op.mnemonic(),
+        }
+    }
+
     /// Whether either operand reaches memory through a ModRM byte or a direct
     /// offset.
     fn has_memory_operand(&self) -> bool {
         let insn = self.fields.insn;
         let modrm_mem = matches!(self.fields.modrm, Some(m) if !m.is_register());
-        for arg in [insn.dst, insn.src] {
+        for arg in [insn.dst, insn.src, insn.aux] {
             match arg {
-                Arg::Eb | Arg::Ev if modrm_mem => return true,
-                Arg::M | Arg::Mp => return true,
+                Arg::Eb | Arg::Ev | Arg::Ew if modrm_mem => return true,
+                Arg::M | Arg::Mp | Arg::Ms => return true,
                 Arg::Ob | Arg::Ov | Arg::Xb | Arg::Xv | Arg::Yb | Arg::Yv => return true,
                 _ => {}
             }
@@ -205,109 +277,199 @@ impl Disassembled {
         !fixes_size(insn.dst) && !fixes_size(insn.src)
     }
 
-    fn write_arg(&self, f: &mut fmt::Formatter<'_>, arg: Arg, show_size: bool) -> fmt::Result {
+    fn write_arg(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        arg: Arg,
+        show_size: bool,
+        imm: u32,
+    ) -> fmt::Result {
         let fields = &self.fields;
+        let osz = fields.opsize;
         match arg {
             Arg::None => Ok(()),
-            Arg::Eb | Arg::Ev => {
+            Arg::Eb | Arg::Ev | Arg::Ew => {
+                let size = match arg {
+                    Arg::Eb => 1,
+                    Arg::Ew => 2,
+                    _ => osz,
+                };
                 let modrm = fields.modrm.unwrap_or(ModRm::new(0));
                 if modrm.is_register() {
-                    let names = if arg == Arg::Eb { REG8 } else { REG16 };
-                    f.write_str(names[modrm.rm as usize])
+                    f.write_str(regs_for(size)[modrm.rm as usize])
                 } else {
-                    self.write_mem(f, modrm, arg == Arg::Eb, show_size)
+                    self.write_mem(f, modrm, size, show_size)
                 }
             }
-            Arg::M | Arg::Mp => {
+            Arg::M | Arg::Mp | Arg::Ms => {
                 let modrm = fields.modrm.unwrap_or(ModRm::new(0));
                 if modrm.is_register() {
                     // `LEA reg, reg` and the register forms of `LES`/`LDS` are
                     // undefined encodings; printing the register is more use
                     // than refusing to print anything.
-                    f.write_str(REG16[modrm.rm as usize])
+                    f.write_str(regs_for(osz)[modrm.rm as usize])
                 } else {
-                    self.write_mem(f, modrm, false, false)
+                    self.write_mem(f, modrm, 0, false)
                 }
             }
             Arg::Gb => f.write_str(REG8[fields.modrm.map_or(0, |m| m.reg) as usize]),
-            Arg::Gv => f.write_str(REG16[fields.modrm.map_or(0, |m| m.reg) as usize]),
-            Arg::Sw => f.write_str(seg::name(fields.modrm.map_or(0, |m| m.reg))),
-            Arg::Ib => write!(f, "{:#x}", fields.imm as u8),
-            Arg::Iv | Arg::Ibs => write!(f, "{:#x}", fields.imm16()),
+            Arg::Gw => f.write_str(REG16[fields.modrm.map_or(0, |m| m.reg) as usize]),
+            Arg::Gv => f.write_str(regs_for(osz)[fields.modrm.map_or(0, |m| m.reg) as usize]),
+            Arg::Rd => f.write_str(REG32[fields.modrm.map_or(0, |m| m.rm) as usize]),
+            Arg::Cd => write!(f, "cr{}", fields.modrm.map_or(0, |m| m.reg)),
+            Arg::Dd => write!(f, "dr{}", fields.modrm.map_or(0, |m| m.reg)),
+            Arg::Td => write!(f, "tr{}", fields.modrm.map_or(0, |m| m.reg)),
+            Arg::Sw => {
+                let index = fields.modrm.map_or(0, |m| m.reg);
+                let index = if matches!(fields.map, Gen::I8086) {
+                    index & 3
+                } else {
+                    index
+                };
+                f.write_str(seg::name(index))
+            }
+            Arg::Ib => write!(f, "{:#x}", imm as u8),
+            Arg::Iw => write!(f, "{:#x}", imm as u16),
+            Arg::Iv | Arg::Ibs => {
+                write!(f, "{:#x}", if osz == 2 { imm & 0xffff } else { imm })
+            }
             Arg::Jb | Arg::Jv => {
                 let target = self.branch_target().unwrap_or(0);
                 write!(f, "{target:#x}")
             }
-            Arg::Ap => write!(f, "{:#x}:{:#x}", fields.imm_seg(), fields.imm16()),
+            Arg::Ap => write!(f, "{:#x}:{:#x}", fields.imm_seg(), imm),
             Arg::Ob | Arg::Ov => {
                 if show_size {
-                    f.write_str(if arg == Arg::Ob { "byte " } else { "word " })?;
+                    f.write_str(size_hint(if arg == Arg::Ob { 1 } else { osz }))?;
                 }
-                write!(
-                    f,
-                    "[{}:{:#x}]",
-                    seg::name(fields.segment(seg::DS)),
-                    fields.imm16()
-                )
+                write!(f, "[{}:{:#x}]", seg::name(fields.segment(seg::DS)), imm)
             }
             Arg::Rb => f.write_str(REG8[(fields.opcode & 7) as usize]),
-            Arg::Rv => f.write_str(REG16[(fields.opcode & 7) as usize]),
-            Arg::Sr => f.write_str(seg::name((fields.opcode >> 3) & 3)),
+            Arg::Rv => f.write_str(regs_for(osz)[(fields.opcode & 7) as usize]),
+            Arg::Sr => f.write_str(seg::name((fields.opcode >> 3) & 7)),
             Arg::One => f.write_str("1"),
             Arg::Cl => f.write_str("cl"),
             Arg::Dx => f.write_str("dx"),
             Arg::Al => f.write_str("al"),
-            Arg::Ax => f.write_str("ax"),
+            Arg::Ax => f.write_str(regs_for(osz)[0]),
             // The string operands are implicit, and their width is already in
             // the mnemonic; showing the pointer is what makes an override
             // visible.
-            Arg::Xb | Arg::Xv => write!(f, "[{}:si]", seg::name(fields.segment(seg::DS))),
-            Arg::Yb | Arg::Yv => f.write_str("[es:di]"),
+            Arg::Xb | Arg::Xv => write!(
+                f,
+                "[{}:{}]",
+                seg::name(fields.segment(seg::DS)),
+                if fields.addrsize == 2 { "si" } else { "esi" }
+            ),
+            Arg::Yb | Arg::Yv => write!(
+                f,
+                "[es:{}]",
+                if fields.addrsize == 2 { "di" } else { "edi" }
+            ),
         }
     }
 
+    /// One memory operand, in the address size the prefixes selected.
+    ///
+    /// `size` is the *operand* width for the `byte`/`word`/`dword` hint, and
+    /// zero where no hint is wanted.
     fn write_mem(
         &self,
         f: &mut fmt::Formatter<'_>,
         modrm: ModRm,
-        byte: bool,
+        size: u8,
         show_size: bool,
     ) -> fmt::Result {
-        if show_size {
-            f.write_str(if byte { "byte " } else { "word " })?;
+        if show_size && size != 0 {
+            f.write_str(size_hint(size))?;
         }
-        let sr = self.fields.segment(modrm.default_segment());
+        let sr = self.fields.mem_segment();
         write!(f, "[{}:", seg::name(sr))?;
         let disp = self.fields.disp;
-        if modrm.md == 0 && modrm.rm == 6 {
-            write!(f, "{disp:#x}]")
-        } else {
-            f.write_str(RM_TERMS[modrm.rm as usize])?;
-            if disp != 0 {
-                // A displacement is signed; printing `bp-0x2` rather than
-                // `bp+0xfffe` is the difference between a listing that reads
-                // and one that has to be decoded again by eye.
-                let signed = disp as i16;
-                if signed < 0 {
-                    write!(f, "-{:#x}", signed.unsigned_abs())?;
-                } else {
-                    write!(f, "+{signed:#x}")?;
-                }
+        if self.fields.addrsize == 2 {
+            if modrm.md == 0 && modrm.rm == 6 {
+                return write!(f, "{:#x}]", disp as u16);
             }
-            f.write_str("]")
+            f.write_str(RM_TERMS[modrm.rm as usize])?;
+            write_disp(f, disp)?;
+            return f.write_str("]");
         }
+
+        // The 32-bit forms: a base, an optional scaled index, and a
+        // displacement, any of which may be absent.
+        let mut wrote = false;
+        if modrm.rm == 4 {
+            let sib = self.fields.sib.unwrap_or(isa::Sib::new(0));
+            if !(sib.base == 5 && modrm.md == 0) {
+                f.write_str(REG32[sib.base as usize])?;
+                wrote = true;
+            }
+            if sib.has_index() {
+                if wrote {
+                    f.write_str("+")?;
+                }
+                f.write_str(REG32[sib.index as usize])?;
+                if sib.scale != 0 {
+                    write!(f, "*{}", 1u32 << sib.scale)?;
+                }
+                wrote = true;
+            }
+        } else if !(modrm.rm == 5 && modrm.md == 0) {
+            f.write_str(REG32[modrm.rm as usize])?;
+            wrote = true;
+        }
+        if wrote {
+            write_disp(f, disp)?;
+        } else {
+            write!(f, "{:#x}", disp as u32)?;
+        }
+        f.write_str("]")
     }
 }
 
-/// Disassemble one instruction from a byte slice.
+/// The `byte`/`word`/`dword` prefix for an operand of a given width.
+const fn size_hint(size: u8) -> &'static str {
+    match size {
+        1 => "byte ",
+        2 => "word ",
+        _ => "dword ",
+    }
+}
+
+/// A signed displacement, printed the way a listing reads.
+///
+/// `bp-0x2` rather than `bp+0xfffe` is the difference between a listing that
+/// reads and one that has to be decoded again by eye.
+fn write_disp(f: &mut fmt::Formatter<'_>, disp: i32) -> fmt::Result {
+    if disp == 0 {
+        return Ok(());
+    }
+    if disp < 0 {
+        write!(f, "-{:#x}", disp.unsigned_abs())
+    } else {
+        write!(f, "+{disp:#x}")
+    }
+}
+
+/// Disassemble one 8086 instruction from a byte slice.
 ///
 /// `cs:ip` is where the instruction lives, which is what makes a relative
 /// jump's target printable.
 #[must_use]
 pub fn disassemble(cs: u16, ip: u16, bytes: &[u8]) -> Disassembled {
+    disassemble_as(Gen::I8086, false, cs, u32::from(ip), bytes)
+}
+
+/// Disassemble one instruction from a byte slice, on a named opcode map.
+///
+/// `bits32` is the code segment's `D` bit: it selects the default operand and
+/// address sizes, exactly as it does for the interpreter, and it is why the
+/// same bytes disassemble differently in a 16-bit and a 32-bit segment.
+#[must_use]
+pub fn disassemble_as(map: Gen, bits32: bool, cs: u16, ip: u32, bytes: &[u8]) -> Disassembled {
     let mut at = 0usize;
     let mut kept = [0u8; MAX_KEPT_BYTES];
-    let fields = isa::decode_stream(&mut || {
+    let fields = isa::decode_stream_as(map, bits32, &mut || {
         let b = bytes.get(at).copied();
         if let Some(b) = b
             && at < MAX_KEPT_BYTES
@@ -327,7 +489,7 @@ pub fn disassemble(cs: u16, ip: u16, bytes: &[u8]) -> Disassembled {
     }
 }
 
-/// Disassemble one instruction by reading guest memory through `read`.
+/// Disassemble one 8086 instruction by reading guest memory through `read`.
 ///
 /// `read` takes a 20-bit physical address and returns `None` where nothing is
 /// readable. Addresses are computed with the 8086's segment arithmetic,
@@ -350,6 +512,46 @@ pub fn disassemble_at(cs: u16, ip: u16, mut read: impl FnMut(u32) -> Option<u8>)
     });
     Disassembled {
         cs,
+        ip: u32::from(ip),
+        fields,
+        bytes: kept,
+        len: fields.len,
+        truncated: fields.truncated,
+    }
+}
+
+/// Disassemble one instruction by reading through `read`, on a named map.
+///
+/// `read` is given the **offset within the code segment**, not a physical
+/// address: on a 386 the base comes from the cached descriptor and only the
+/// caller knows it.
+#[must_use]
+pub fn disassemble_at_as(
+    map: Gen,
+    bits32: bool,
+    cs: u16,
+    ip: u32,
+    mut read: impl FnMut(u32) -> Option<u8>,
+) -> Disassembled {
+    let mut offset = 0u32;
+    let mut kept = [0u8; MAX_KEPT_BYTES];
+    let fields = isa::decode_stream_as(map, bits32, &mut || {
+        let at = if bits32 {
+            ip.wrapping_add(offset)
+        } else {
+            (ip & 0xffff_0000) | u32::from((ip as u16).wrapping_add(offset as u16))
+        };
+        let b = read(at);
+        if let Some(b) = b
+            && (offset as usize) < MAX_KEPT_BYTES
+        {
+            kept[offset as usize] = b;
+        }
+        offset = offset.wrapping_add(1);
+        b
+    });
+    Disassembled {
+        cs,
         ip,
         fields,
         bytes: kept,
@@ -358,7 +560,7 @@ pub fn disassemble_at(cs: u16, ip: u16, mut read: impl FnMut(u32) -> Option<u8>)
     }
 }
 
-/// Disassemble `count` consecutive instructions starting at `cs:ip`.
+/// Disassemble `count` consecutive 8086 instructions starting at `cs:ip`.
 ///
 /// Stops early if an instruction cannot be read in full, because everything
 /// after it would be decoded from the wrong offset.
@@ -373,6 +575,30 @@ pub fn disassemble_run(
     let mut ip = ip;
     for _ in 0..count {
         let d = disassemble_at(cs, ip, &mut read);
+        let truncated = d.truncated;
+        ip = d.next_ip() as u16;
+        out.push(d);
+        if truncated {
+            break;
+        }
+    }
+    out
+}
+
+/// Disassemble `count` consecutive instructions on a named map.
+#[must_use]
+pub fn disassemble_run_as(
+    map: Gen,
+    bits32: bool,
+    cs: u16,
+    ip: u32,
+    count: usize,
+    mut read: impl FnMut(u32) -> Option<u8>,
+) -> Vec<Disassembled> {
+    let mut out = Vec::with_capacity(count);
+    let mut ip = ip;
+    for _ in 0..count {
+        let d = disassemble_at_as(map, bits32, cs, ip, &mut read);
         let truncated = d.truncated;
         ip = d.next_ip();
         out.push(d);

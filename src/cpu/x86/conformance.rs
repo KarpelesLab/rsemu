@@ -58,18 +58,35 @@
 //!
 //! # The measurement
 //!
-//! At the commit that added this file, with `RSEMU_8088_BUS=1` and the whole
+//! The corpus is run **twice**, because one core now covers four parts.
+//!
+//! As the 8088 it was captured from, with `RSEMU_8088_BUS=1` and the whole
 //! `v2` corpus — 323 opcode files, 3 007 000 vectors:
 //!
 //! ```text
-//! conformance: 2974160 of 3007000 vectors passed across 323 opcode files
-//!              (registers, memory and the operand bus trace)
+//! conformance (8088): 2974160 of 3007000 vectors passed across 323 opcode
+//!                     files (registers, memory and the operand bus trace)
 //! ```
 //!
 //! Every failure is in the same place: the flags Intel documents as
 //! *undefined* after `IMUL`, `DIV` and `IDIV`. All 317 other opcode files pass
 //! every vector, flags included. [`KNOWN_FAILURES`] is the ledger
 //! `ROADMAP.md` §0 asks for, annotated with what is missing and why.
+//!
+//! And as an **80386**, in real mode, on the same vectors:
+//!
+//! ```text
+//! conformance (80386): 2650981 of 3007000 vectors passed across 323 opcode
+//!                      files (registers, memory and the operand bus trace)
+//! ```
+//!
+//! There is no hardware corpus for a 386, so this is the closest honest
+//! substitute for one: the 8088's vectors replayed on the later part, with
+//! every disagreement traced to a documented difference between them rather
+//! than waved away. [`DIFFERENCES_386`] is that list — six categories, 68
+//! opcode files — and an opcode failing outside it fails the test. What the
+//! second run gates is the 16-bit real-mode path of the 32-bit core, which is
+//! where a firmware image spends its first few million instructions.
 //!
 //! # Why the JSON parser is in here
 //!
@@ -89,7 +106,7 @@ use crate::core::space::{
 };
 use crate::core::sync::{self, LockRank};
 
-use super::{Config, I8086, Reg, Regs};
+use super::{Config, Reg, Regs, X86};
 
 /// Opcodes this core does not yet match, with the reason and the count at the
 /// commit that measured it.
@@ -582,7 +599,7 @@ struct Failure {
 /// Apply one `"name": value` pair from the corpus to a register file.
 fn apply_reg(regs: &mut Regs, name: &str, value: u16) {
     let reg = Reg::from_name(name).unwrap_or_else(|| panic!("unknown register `{name}`"));
-    reg.set(regs, value);
+    reg.set(regs, u32::from(value));
 }
 
 /// The corpus's register order, for a readable diff.
@@ -604,11 +621,23 @@ fn run_file(path: &Path, cfg: Config, check_bus: bool) -> (usize, Vec<Failure>) 
     let memory = alloc::sync::Arc::new(VectorBus::new(0x10_0000, false));
     let ports = alloc::sync::Arc::new(VectorBus::new(0x1_0000, true));
 
-    let mem_space = AddressSpace::new("mem", 20).with_unassigned(UnassignedPolicy::FAULT);
+    // A 386 addresses thirty-two bits and does **not** wrap at 1 MiB, so the
+    // same megabyte is mapped a second time at `0x100000` when the part under
+    // test is a 386. That is what an A20 gate held open does, and it makes the
+    // 386 and the 8088 agree about every vector whose only difference is the
+    // wrap — which is the point of running the corpus twice.
+    let bits = if cfg.variant.is_32bit() { 21 } else { 20 };
+    let mem_space = AddressSpace::new("mem", bits).with_unassigned(UnassignedPolicy::FAULT);
     mem_space
         .topology()
         .map(Region::io("ram", 0x10_0000, memory.clone()), 0)
         .expect("1 MiB fits in 20 bits");
+    if cfg.variant.is_32bit() {
+        mem_space
+            .topology()
+            .map(Region::io("alias", 0x10_0000, memory.clone()), 0x10_0000)
+            .expect("the second megabyte fits in 21 bits");
+    }
     let io_space = AddressSpace::new("io", 16).with_unassigned(UnassignedPolicy::FAULT);
     io_space
         .topology()
@@ -628,16 +657,36 @@ fn run_file(path: &Path, cfg: Config, check_bus: bool) -> (usize, Vec<Failure>) 
         memory.reset(&vector.initial.ram);
         ports.reset(&[]);
 
-        let cpu = I8086::new(cfg);
+        let cpu = X86::new(cfg);
         cpu.attach_space(mem_space.clone());
         cpu.attach_io_space(io_space.clone());
-        let initial = regs_from(Regs::new(), &vector.initial.regs);
+        let mut initial = regs_from(Regs::new(), &vector.initial.regs);
+        // The 8088 hard-wires the top nibble of the flags word to ones; a 386
+        // gave bits 12-14 to `IOPL` and `NT` and reads bit 15 as zero. The
+        // corpus records the 8088's word, so on a 386 both the initial and the
+        // expected value are put through that part's own rule — otherwise
+        // every single vector would "fail" on a bit neither processor lets
+        // software set.
+        if cfg.variant.is_32bit() {
+            initial.eflags = Regs::normalise_flags(cfg.variant, initial.eflags);
+        }
         {
             // The vectors start mid-program: no reset sequence, and the
             // interrupt lines are not modelled by the corpus at all.
             let mut session = cpu.session.lock();
             session.state.reset_pending = false;
             session.state.regs = initial;
+            // A 386 resets with `CS` based at the top of the address space and
+            // keeps a cached base per segment; the corpus speaks only
+            // selectors, so the caches are put where real mode would have left
+            // them.
+            for index in 0..super::isa::seg::COUNT as u8 {
+                let selector = session.state.regs.segment(index);
+                let entry = session.state.sys.seg_mut(index);
+                entry.selector = selector;
+                entry.base = u32::from(selector) << 4;
+                entry.limit = 0xffff;
+            }
         }
         cpu.set_prefetch_queue(&vector.initial.queue)
             .expect("the corpus never over-fills the queue");
@@ -648,7 +697,10 @@ fn run_file(path: &Path, cfg: Config, check_bus: bool) -> (usize, Vec<Failure>) 
 
         let mut detail = String::new();
         let got = cpu.regs();
-        let want = regs_from(initial, &vector.expected.regs);
+        let mut want = regs_from(initial, &vector.expected.regs);
+        if cfg.variant.is_32bit() {
+            want.eflags = Regs::normalise_flags(cfg.variant, want.eflags);
+        }
         if got != want {
             detail.push_str(&format!("  regs want {want}\n       got  {got}\n"));
             for reg in Reg::ALL {
@@ -757,12 +809,187 @@ fn strip_prefetch(got: Vec<Access>, want: &[Access]) -> Vec<Access> {
     out
 }
 
+/// Where the 80386 is documented to disagree with the 8088 on an encoding the
+/// corpus covers.
+///
+/// Not a known-failures ledger in the sense [`KNOWN_FAILURES`] is: nothing
+/// here is a gap to be closed, and closing any of it would make the core
+/// *less* like a 386. What it is instead is the complete list of places the
+/// two parts differ on the same bytes, each one traced to a statement in the
+/// *80386 Programmer's Reference Manual* — six categories, and every opcode
+/// the measurement flags falls into one of them. An opcode failing outside
+/// this list is a real defect and fails the test.
+///
+/// The six, with the manual's reason:
+///
+/// 1. **Reassigned encodings.** The 80186 spent the sixteen jump aliases at
+///    `60`-`6F` on `PUSHA` through `OUTSW`, `C0`/`C1` on the immediate shifts
+///    and `C8`/`C9` on `ENTER`/`LEAVE`; and the group extensions the 8086 let
+///    fall through the decode (`8F /1`-`7`, `C6`/`C7 /1`-`7`, `FF /7`) became
+///    invalid. Different instructions, so different results.
+/// 2. **The flags register's top nibble.** An 8086 hard-wires bits 12-15 to
+///    one; a 386 gave 12 and 13 to `IOPL` and 14 to `NT`, and reads 15 as
+///    zero. Anything that stores or restores the whole word disagrees.
+/// 3. **`PUSH SP`.** The 8086 decrements first and pushes the decremented
+///    value; the 80286 and later push the value the instruction started with.
+/// 4. **The shift count.** An 8086 uses the whole of `CL`; every later part
+///    masks it to five bits, so a count of 32 shifts thirty-two times on one
+///    and not at all on the other.
+/// 5. **The divide error's return address, and the undefined flags after a
+///    multiply or divide.** `#DE` is a fault on a 386 and pushes the address
+///    of the faulting instruction; on an 8086 it pushes the next one. The
+///    flag residue is the gap [`KNOWN_FAILURES`] already records.
+/// 6. **An operand that crosses the top of a segment.** The 8086 wraps the
+///    offset within the segment; a 386 checks the limit and raises `#GP(0)`.
+///    Every one of the single-vector entries below is this, and each was
+///    inspected individually rather than assumed.
+const DIFFERENCES_386: &[(&str, &str)] = &[
+    // 1. Encodings the 80186 and 80386 reassigned.
+    ("60", "PUSHA, not an alias of JO"),
+    ("61", "POPA, not an alias of JNO"),
+    ("62", "BOUND, not an alias of JB"),
+    ("63", "ARPL, not an alias of JNB"),
+    ("64", "the FS segment-override prefix, not an alias of JZ"),
+    ("65", "the GS segment-override prefix, not an alias of JNZ"),
+    ("66", "the operand-size prefix, not an alias of JBE"),
+    ("67", "the address-size prefix, not an alias of JA"),
+    ("68", "PUSH imm16/32, not an alias of JS"),
+    ("69", "IMUL r,r/m,imm, not an alias of JNS"),
+    ("6A", "PUSH imm8, not an alias of JP"),
+    ("6B", "IMUL r,r/m,imm8, not an alias of JNP"),
+    ("6C", "INSB, not an alias of JL"),
+    ("6D", "INSW, not an alias of JGE"),
+    ("6E", "OUTSB, not an alias of JLE"),
+    ("6F", "OUTSW, not an alias of JG"),
+    (
+        "C0",
+        "the byte shift group with an immediate count, not a second RET",
+    ),
+    (
+        "C1",
+        "the word shift group with an immediate count, not a second RET",
+    ),
+    ("C8", "ENTER, not a second RETF"),
+    ("C9", "LEAVE, not a second RETF"),
+    (
+        "C6",
+        "MOV imm with a non-zero extension is invalid on a 386",
+    ),
+    (
+        "C7",
+        "MOV imm with a non-zero extension is invalid on a 386",
+    ),
+    ("FF.7", "the second PUSH entry is invalid on a 386"),
+    (
+        "8C",
+        "a 386 decodes all three bits of the segment field: FS, GS, #UD",
+    ),
+    (
+        "8E",
+        "a 386 decodes all three bits of the segment field: FS, GS, #UD",
+    ),
+    // 2. The flags register's top nibble.
+    ("9C", "PUSHF stores IOPL and NT where an 8086 stores ones"),
+    ("9D", "POPF loads IOPL and NT where an 8086 forces ones"),
+    ("CC", "INT3 pushes a flags word with IOPL and NT in it"),
+    ("CD", "INT n pushes a flags word with IOPL and NT in it"),
+    ("CE", "INTO pushes a flags word with IOPL and NT in it"),
+    ("CF", "IRET restores IOPL and NT where an 8086 forces ones"),
+    // 3. PUSH SP.
+    (
+        "54",
+        "PUSH SP stores the value before the decrement from the 286 on",
+    ),
+    ("FF.6", "the same, through the indirect PUSH"),
+    // 4. The shift count mask.
+    ("D2.0", "ROL by CL: the count is masked to five bits"),
+    ("D2.1", "ROR by CL: the count is masked to five bits"),
+    ("D2.2", "RCL by CL: the count is masked to five bits"),
+    ("D2.3", "RCR by CL: the count is masked to five bits"),
+    ("D2.4", "SHL by CL: the count is masked to five bits"),
+    ("D2.5", "SHR by CL: the count is masked to five bits"),
+    ("D2.6", "SETMO by CL: undocumented, and the count is masked"),
+    ("D2.7", "SAR by CL: the count is masked to five bits"),
+    ("D3.0", "ROL by CL, word: the count is masked to five bits"),
+    ("D3.1", "ROR by CL, word: the count is masked to five bits"),
+    ("D3.2", "RCL by CL, word: the count is masked to five bits"),
+    ("D3.3", "RCR by CL, word: the count is masked to five bits"),
+    ("D3.4", "SHL by CL, word: the count is masked to five bits"),
+    ("D3.5", "SHR by CL, word: the count is masked to five bits"),
+    (
+        "D3.6",
+        "SETMO by CL, word: undocumented, and the count is masked",
+    ),
+    ("D3.7", "SAR by CL, word: the count is masked to five bits"),
+    // 5. The divide error, and the flags it leaves.
+    (
+        "D4",
+        "AAM 0 faults, and #DE is a fault on a 386: it pushes the AAM",
+    ),
+    ("F6.5", "IMUL's undefined flags; see KNOWN_FAILURES"),
+    (
+        "F6.6",
+        "DIV's undefined flags, and #DE pushes the faulting address",
+    ),
+    (
+        "F6.7",
+        "IDIV's undefined flags, and the REP-negates quirk is 8086-only",
+    ),
+    ("F7.5", "IMUL's undefined flags; see KNOWN_FAILURES"),
+    (
+        "F7.6",
+        "DIV's undefined flags, and #DE pushes the faulting address",
+    ),
+    (
+        "F7.7",
+        "IDIV's undefined flags, and the REP-negates quirk is 8086-only",
+    ),
+    // 6. An operand that crosses the top of a segment.
+    (
+        "07",
+        "POP ES with SP at 0xffff: the stack access straddles the limit",
+    ),
+    ("0E", "PUSH CS with SP at 0x0001: the same, downward"),
+    ("5A", "POP DX with SP at 0xffff"),
+    ("81.6", "XOR word at offset 0xffff"),
+    ("A5", "REP MOVSW stepping DI past 0xffff"),
+    ("A7", "REPNE CMPSW stepping an index past 0xffff"),
+    ("AB", "REP STOSW stepping DI past 0xffff"),
+    ("AD", "REP LODSW stepping SI past 0xffff"),
+    ("C5", "LDS reading a far pointer that straddles the limit"),
+    ("FF.0", "INC on a word at offset 0xffff"),
+    ("FF.3", "CALLF pushing across the top of the stack segment"),
+    (
+        "EF",
+        "OUT DX,AX with DX at 0xffff: an 8088 drives two byte cycles and the \
+         second wraps to port 0, while a 32-bit part drives one word cycle \
+         that runs off the top of the I/O space",
+    ),
+];
+
 /// Run the whole corpus, or explain why it did not.
 ///
 /// Not `#[ignore]`d: a skipped test that says nothing is how a suite quietly
 /// stops running. This one prints the command that would have run it.
 #[test]
 fn single_step_tests() {
+    run_corpus(Config::I8088, KNOWN_FAILURES);
+}
+
+/// The same corpus against the **80386** map, in real mode.
+///
+/// There is no hardware corpus for a 386, and this is the closest honest
+/// substitute: the 8088's own vectors, replayed on the later part, with every
+/// place the two are documented to differ listed in [`DIFFERENCES_386`] rather
+/// than waved away. What it gates is the 16-bit real-mode path of the 32-bit
+/// core — the path a firmware image spends its first few million instructions
+/// in — against silicon, one opcode at a time.
+#[test]
+fn single_step_tests_on_a_386() {
+    run_corpus(Config::I80386, DIFFERENCES_386);
+}
+
+fn run_corpus(cfg: Config, ledger: &[(&str, &str)]) {
     let Ok(dir) = std::env::var("RSEMU_8088_DIR") else {
         println!(
             "conformance: set RSEMU_8088_DIR to a decompressed SingleStepTests/8088 \
@@ -801,7 +1028,7 @@ fn single_step_tests() {
         {
             continue;
         }
-        let (ran, failures) = run_file(&dir.join(format!("{name}.json")), Config::I8088, check_bus);
+        let (ran, failures) = run_file(&dir.join(format!("{name}.json")), cfg, check_bus);
         files += 1;
         total += ran;
         if !failures.is_empty() {
@@ -817,7 +1044,8 @@ fn single_step_tests() {
     }
 
     println!(
-        "conformance: {} of {total} vectors passed across {files} opcode files{}",
+        "conformance ({}): {} of {total} vectors passed across {files} opcode files{}",
+        cfg.variant,
         total - total_failures,
         if check_bus {
             " (registers, memory and the operand bus trace)"
@@ -825,15 +1053,14 @@ fn single_step_tests() {
             " (registers and memory; set RSEMU_8088_BUS=1 to add the bus trace)"
         }
     );
-    let expected: Vec<&str> = KNOWN_FAILURES.iter().map(|(name, _)| *name).collect();
+    let expected: Vec<&str> = ledger.iter().map(|(name, _)| *name).collect();
     let (known, unexpected): (Vec<_>, Vec<_>) = failed
         .iter()
         .partition(|(name, _)| expected.contains(&name.as_str()));
     if !known.is_empty() {
         let counted: usize = known.iter().map(|(_, n)| *n).sum();
         println!(
-            "conformance: {counted} of those are the known undefined-flag gap on \
-             {} opcode(s); see KNOWN_FAILURES",
+            "conformance: {counted} of those are in the ledger, on {} opcode(s)",
             known.len()
         );
     }

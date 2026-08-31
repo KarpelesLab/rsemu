@@ -456,51 +456,59 @@ pub static RISCV: Arch = Arch {
 
 // -- Intel 8086 -------------------------------------------------------------
 
-/// `src/cpu/x86/mod.rs`'s `save` walks `Reg::ALL`: `ax cx dx bx sp bp si di es
-/// cs ss ds ip flags`, every one a `u16`.
+/// `src/cpu/x86/mod.rs`'s `save` walks `Reg::ALL`: `eax ecx edx ebx esp ebp
+/// esi edi eip eflags cs ss ds es fs gs`, every one a `u32`.
+///
+/// That is **gdb's own i386 core ordering**, and the x86 core's `save` was
+/// written to match it: the first sixty-four bytes of a saved core are the
+/// `g` packet's register block, so these offsets are the identity map rather
+/// than a translation that could drift.
 #[cfg(feature = "cpu-x86")]
 static I8086_REGS: &[RegDesc] = &[
-    RegDesc::int("ax", 2, 0),
-    RegDesc::int("cx", 2, 2),
-    RegDesc::int("dx", 2, 4),
-    RegDesc::int("bx", 2, 6),
+    RegDesc::int("eax", 4, 0),
+    RegDesc::int("ecx", 4, 4),
+    RegDesc::int("edx", 4, 8),
+    RegDesc::int("ebx", 4, 12),
     RegDesc {
-        name: "sp",
-        bytes: 2,
-        offset: 8,
+        name: "esp",
+        bytes: 4,
+        offset: 16,
         ty: RegType::DataPtr,
     },
-    RegDesc::int("bp", 2, 10),
-    RegDesc::int("si", 2, 12),
-    RegDesc::int("di", 2, 14),
-    RegDesc::int("es", 2, 16),
-    RegDesc::int("cs", 2, 18),
-    RegDesc::int("ss", 2, 20),
-    RegDesc::int("ds", 2, 22),
+    RegDesc::int("ebp", 4, 20),
+    RegDesc::int("esi", 4, 24),
+    RegDesc::int("edi", 4, 28),
     RegDesc {
-        name: "ip",
-        bytes: 2,
-        offset: 24,
+        name: "eip",
+        bytes: 4,
+        offset: 32,
         ty: RegType::CodePtr,
     },
-    RegDesc::int("flags", 2, 26),
+    RegDesc::int("eflags", 4, 36),
+    RegDesc::int("cs", 4, 40),
+    RegDesc::int("ss", 4, 44),
+    RegDesc::int("ds", 4, 48),
+    RegDesc::int("es", 4, 52),
+    RegDesc::int("fs", 4, 56),
+    RegDesc::int("gs", 4, 60),
 ];
 
-/// The Intel 8086/8088 in real mode.
+/// The Intel x86 core: 8086 through 80486.
 ///
-/// No `<architecture>`: GDB's `i8086` gdbarch expects the i386 register
-/// numbering and a 32-bit `g` packet, and telling it "i8086" while sending this
-/// layout would make it read the wrong halves of the wrong registers.
+/// No `<architecture>`: gdb's `i386` gdbarch expects the x87 register block
+/// after the core sixteen, and claiming the architecture without supplying it
+/// would make gdb read the wrong halves of the wrong registers. The custom
+/// feature name gives it the sixteen it can use and nothing it cannot.
 #[cfg(feature = "cpu-x86")]
 pub static I8086: Arch = Arch {
     class: &crate::cpu::x86::CLASS,
-    verified_version: 1,
-    feature: "org.rsemu.i8086",
+    verified_version: 2,
+    feature: "org.rsemu.i386",
     architecture: None,
     regs: I8086_REGS,
-    pc: 12,
+    pc: 8,
     retire: Some(RetireCounter {
-        offset: 28,
+        offset: 64,
         bytes: 8,
     }),
 };

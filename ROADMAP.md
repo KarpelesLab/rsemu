@@ -30,7 +30,13 @@ something a person can actually run (§2).
 > Z80 **1,604,000/1,604,000** plus `zexall` 67/67, RISC-V RV64GC **409/409**,
 > 8086/8088 **2,974,160/3,007,000** (the gap is one microcode residue in the
 > undefined flags after `IMUL`/`DIV`), and ARMv5TE (no usable public corpus for
-> v5 — see §12).
+> v5 — see §12). The x86 core now also covers the **80386 and 80486** —
+> protected mode, paging, privilege levels, gates and task switching — and
+> replays the same 8088 corpus as a 386 at **2,650,981/3,007,000**, where every
+> disagreement is traced to a documented difference between the parts. A real
+> PC firmware image resets, enters protected mode and runs tens of millions of
+> 32-bit instructions on it, stopping only when it waits for a timer no machine
+> has supplied yet.
 >
 > **Three machines that run**: `nes-ntsc` and `nes-pal` — AccuracyCoin boots,
 > raises NMI and draws its menu — and `apple1`, which is interactive over a

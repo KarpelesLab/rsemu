@@ -11,7 +11,7 @@
 //! | `mos6502` | `cpu-mos6502` | cycle-accurate interpreter, illegal opcodes, disassembler |
 //! | `z80` | `cpu-z80` | cycle-accurate interpreter, every prefix page, MEMPTR, separate I/O space |
 
-//! | `x86` | `cpu-x86` | Intel 8086/8088, real mode, hardware-checked against `SingleStepTests/8088` |
+//! | `x86` | `cpu-x86` | Intel 8086/8088 real mode and 80386/80486 protected mode with paging, hardware-checked against `SingleStepTests/8088` |
 
 //! | `riscv` | `cpu-riscv` | RV64GC/RV32 interpreter, privileged modes, Sv39, software IEEE-754 |
 
