@@ -17,6 +17,14 @@ keywords      = ["emulator", "emulation", "virtualization", "no_std"]
 categories    = ["emulators", "no-std", "virtualization"]
 exclude       = ["/docs/local", "/.github"]
 
+[dependencies]
+# PNG and APNG encoding for `host::display::png`: headless frame capture for CI,
+# the docs' screenshots, and the frame-hash regression. First-party (Karpelès
+# Lab, MIT) and pure Rust; `default-features = false` drops `oxideav-core`, so
+# the whole added tree is this crate plus `compcol` — already permitted
+# (CLAUDE.md). Optional, so the default `cargo tree` is still only `rsemu`.
+oxideav-png = { version = "0.1", default-features = false, optional = true }
+
 [features]
 # The emulation core is always compiled and never feature-gated. Everything
 # else is one feature per component, so a NES build links a 6502 and nothing
@@ -30,6 +38,17 @@ std = []
 
 # The `rsemu` binary. Needs `std`.
 cli = ["std"]
+
+# Headless capture in `host::display::png`: a scanout surface as a PNG, and a
+# sequence of them as an APNG. Adds `oxideav-png` (and, through it, `compcol`)
+# — the only dependency any feature of this crate pulls. Needs `std`.
+display-png = ["std", "dep:oxideav-png"]
+
+# The browser demo (web/): the wasm exports the page calls, plus the machines it
+# offers — an NTSC NES with a picture, and an Apple 1 on a terminal. This is the
+# feature set `web/README.md` builds; plain `wasm` stays minimal so the CI wasm
+# job keeps checking the boundary rather than the catalog.
+demo = ["wasm", "machine-nes", "dev-nes-ppu", "dev-nes-apu", "machine-apple1"]
 
 # NES cartridges (src/dev/cart): iNES and NES 2.0 image parsing, the
 # `Cartridge` type, and NROM (iNES mapper 0) as a device that maps PRG ROM,

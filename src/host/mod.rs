@@ -9,6 +9,7 @@
 //! | --- | --- | --- |
 //! | [`chardev`] | no | the character-stream seam: a byte pipe a device model can hold |
 //! | [`terminal`] | yes | that seam, driven by the process's own stdin and stdout |
+//! | [`display`] | no | the scanout seam: a guest surface, converted to host pixels |
 //!
 //! # Why the trait is not itself `std`
 //!
@@ -20,6 +21,7 @@
 //! what a deterministic test or a wasm embedder wants.
 
 pub mod chardev;
+pub mod display;
 
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]

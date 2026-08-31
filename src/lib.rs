@@ -23,9 +23,14 @@
 //! terminal through [`host::chardev`], the character-stream seam a 16550 will
 //! use next.
 //!
-//! Not yet: the NES PPU and APU as machine objects, so nothing is displayed or
-//! heard; the IR and JIT; and the rest of the host layer (window, audio,
-//! gdbstub).
+//! The picture comes out through [`host::display`], the scanout seam: a device
+//! emits whatever the silicon does — the 2C02 emits a palette index, not a
+//! colour — and the host converts it, captures it as a PNG (`display-png`), or
+//! hands it to a canvas. `web/` is the browser demo that does the last of those,
+//! from the `demo` feature.
+//!
+//! Not yet: audio anywhere but inside the APU; a native window; the IR and JIT;
+//! and the rest of the host layer (gdbstub, VNC, the monitor).
 //!
 //! # `no_std`
 //!
