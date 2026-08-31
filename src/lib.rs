@@ -13,10 +13,12 @@
 //! front end ([`machine`]).
 //!
 //! The first CPU core is in: `cpu::mos6502`, a cycle-accurate 6502 interpreter
-//! behind the `cpu-mos6502` feature (enable it to see [`cpu`]).
+//! behind the `cpu-mos6502` feature (enable it to see [`cpu`]). With
+//! `machine-nes`, [`machine::catalog`] ships a NES that a real cartridge boots
+//! on: `rsemu run nes-ntsc --cart smb.nes`.
 //!
-//! Not yet: the DSL resolver/validator/realizer, and the machine assembly
-//! layer that hands a realizing device its address spaces, clocks and wires.
+//! Not yet: the NES PPU and APU as machine objects, so nothing is displayed or
+//! heard; the IR and JIT; and the host layer (window, audio, gdbstub).
 //!
 //! # `no_std`
 //!
@@ -59,6 +61,21 @@ pub fn build_info() -> alloc::string::String {
     }
     if cfg!(feature = "wasm") {
         features.push("wasm");
+    }
+    if cfg!(feature = "cpu-mos6502") {
+        features.push("cpu-mos6502");
+    }
+    if cfg!(feature = "dev-nes-cart") {
+        features.push("dev-nes-cart");
+    }
+    if cfg!(feature = "dev-nes-ppu") {
+        features.push("dev-nes-ppu");
+    }
+    if cfg!(feature = "dev-nes-apu") {
+        features.push("dev-nes-apu");
+    }
+    if cfg!(feature = "machine-nes") {
+        features.push("machine-nes");
     }
 
     let mut s = String::from("rsemu ");

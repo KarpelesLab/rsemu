@@ -2253,7 +2253,9 @@ fn value_expr(value: &Value, span: Span) -> Option<Expr> {
                 NumUnit::Duration(crate::machine::lexer::DurationUnit::Nanos),
             )
         }
-        Value::List(_) | Value::Map(_) | Value::Link(_) => None,
+        // Media is bound at realize time and has no literal form at all, so
+        // it can never come back out as one.
+        Value::List(_) | Value::Map(_) | Value::Link(_) | Value::Media(_) => None,
     }
 }
 

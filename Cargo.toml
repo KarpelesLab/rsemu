@@ -62,6 +62,12 @@ wasm = ["std"]
 # PPU conformance work against. `no_std + alloc`, no dependencies.
 dev-nes-ppu = []
 
+# The NTSC NES as a machine (machines/nes-ntsc.machine plus the classes it
+# names). A machine is a feature set (ROADMAP.md §3), so this is the feature
+# that makes `rsemu machines` list a NES and `rsemu run nes-ntsc --cart x.nes`
+# work. Adds no dependencies; it is the components plus one data file.
+machine-nes = ["cpu-mos6502", "dev-nes-cart"]
+
 # The MOS 6502 core (src/cpu/mos6502): a cycle-accurate interpreter with every
 # documented and undocumented opcode, a disassembler generated from the same
 # table, and the RP2A03 (NES) variant selected by a construction property. Adds

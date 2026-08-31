@@ -99,6 +99,15 @@ pub(super) struct State {
     pub faults: u64,
     /// Address of the most recent refused access.
     pub last_fault: u16,
+    /// Cycles already executed past the last budget, owed to the next one.
+    ///
+    /// A 6502 cannot be stopped mid-instruction, so a budget that runs out in
+    /// the middle of one is overrun by up to seven cycles. The scheduler treats
+    /// an overrun as fatal (`core::sched`), and rightly — so the overshoot is
+    /// carried here and deducted from the following budget instead. It is
+    /// architectural in the only sense that matters: a snapshot that dropped it
+    /// would resume a few cycles ahead of where it was saved.
+    pub debt: u64,
 }
 
 impl State {
@@ -113,6 +122,7 @@ impl State {
             open_bus: 0,
             faults: 0,
             last_fault: 0,
+            debt: 0,
         }
     }
 }

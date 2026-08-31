@@ -17,6 +17,7 @@ use crate::core::space::{
 use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
 use crate::core::sync::{self, LockRank};
 use crate::core::value::Width;
+use crate::core::wire::{Wire, WireSource};
 
 use super::*;
 
@@ -1207,14 +1208,16 @@ fn construction_from_properties_validates_what_it_is_given() {
 }
 
 #[test]
-fn realize_refuses_a_core_with_nowhere_to_fetch_from() {
+fn realize_does_nothing_outward_and_bind_is_what_needs_a_space() {
+    // Realize runs before the machine hands anything out, so it cannot check
+    // for an address space — the check belongs where the space arrives. A CPU
+    // with nowhere to fetch from is still a config error, just one instant
+    // later (`ROADMAP.md` §4.4).
     let cpu = Mos6502::new(Config::default());
     let mut deferred = crate::core::device::Deferred::new();
     let mut ctx = RealizeCtx::new("cpu", RequesterId::ANONYMOUS, &mut deferred);
-    assert!(cpu.realize(&mut ctx).is_err());
-
-    let h = Harness::with_config(Config::default());
-    assert!(h.cpu.realize(&mut ctx).is_ok());
+    assert!(cpu.realize(&mut ctx).is_ok());
+    assert!(cpu.space().is_none(), "realize attaches nothing");
 }
 
 #[test]
@@ -1289,4 +1292,147 @@ fn a_short_program_runs_to_a_known_state() {
     // 2+2+2 setup, two full loops at 2+2+3, a last one at 2+2+2 where the
     // branch is not taken, 4 for the store, and 11 for the JAM.
     assert_eq!(used, 41);
+}
+
+// ---------------------------------------------------------------------------
+// The machine-layer connection surface
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_device_publishes_its_three_input_pins() {
+    let h = Harness::running(&[]);
+    let src = WireId::new(1);
+    let device: &dyn Device = h.cpu.as_ref();
+    for port in ["irq", "nmi", "reset"] {
+        assert!(device.sink(port, &[src]).is_some(), "no `{port}` pin");
+    }
+    assert!(device.sink("rdy", &[src]).is_none(), "a pin nobody models");
+    // A 6502 drives no line this core models, so every port is input-only.
+    let net = Wire::builder().sources(&[src]).build_shared();
+    assert!(
+        device.connect("irq", WireSource::new(net, src)).is_err(),
+        "an input pin cannot be a wire's source"
+    );
+    assert!(device.is_runnable(), "a cpu takes execution budgets");
+}
+
+#[test]
+fn a_wire_driven_through_the_sink_reaches_the_interrupt_latches() {
+    let h = Harness::running(&[]);
+    let apu = WireId::new(1);
+    let cart = WireId::new(2);
+    let device: &dyn Device = h.cpu.as_ref();
+
+    // Two sources on one net, as the NES's IRQ line really has: the APU and
+    // the cartridge, wire-ORed.
+    let pin = device.sink("irq", &[apu, cart]).expect("an irq pin");
+    pin.sink.set_level(apu, pin.line, Level::High);
+    assert!(h.cpu.irq_asserted());
+    pin.sink.set_level(cart, pin.line, Level::High);
+    pin.sink.set_level(apu, pin.line, Level::Low);
+    assert!(h.cpu.irq_asserted(), "the cartridge still holds the line");
+    pin.sink.set_level(cart, pin.line, Level::Low);
+    assert!(!h.cpu.irq_asserted());
+
+    // NMI is edge-sensitive: the latch survives the level going away.
+    let nmi = device.sink("nmi", &[apu]).expect("an nmi pin");
+    nmi.sink.set_level(apu, nmi.line, Level::High);
+    nmi.sink.set_level(apu, nmi.line, Level::Low);
+    assert!(h.cpu.nmi_pending(), "a high-going edge latches");
+}
+
+#[test]
+fn the_reset_pin_restarts_a_jammed_core() {
+    // A `JAM` freezes the CPU until reset, and `/RES` is the only way out —
+    // which is why the pin cannot reach for the execution lock: the core may
+    // be inside a bus access when the line moves.
+    let h = Harness::running(&[0x02]);
+    h.cpu.run(100);
+    assert!(h.cpu.is_halted());
+    assert_eq!(h.cpu.run(100), 0, "a jammed core consumes nothing");
+
+    let button = WireId::new(1);
+    let device: &dyn Device = h.cpu.as_ref();
+    let pin = device.sink("reset", &[button]).expect("a reset pin");
+    pin.sink.set_level(button, pin.line, Level::High);
+    // A signal, not a method call: the sequence runs on the next step, which
+    // is when the CPU can read the vector.
+    assert!(h.cpu.is_halted(), "nothing has executed yet");
+    h.cpu.step();
+    assert!(!h.cpu.is_halted(), "the reset sequence un-jammed it");
+    assert_eq!(h.cpu.regs().pc, 0xc000, "and it fetched the vector");
+}
+
+#[test]
+fn a_budget_is_never_overrun_and_never_loses_a_cycle() {
+    // The scheduler treats an overrun as fatal, and a 6502 cannot stop
+    // mid-instruction — so `run_budget` reports the budget and carries the
+    // overshoot. Over many budgets the two counts must stay in step.
+    let program = [0xea; 8]; // NOPs, two cycles each
+    let h = Harness::running(&program);
+    let start = h.cpu.cycles(); // the reset sequence already ran
+    let mut granted = 0u64;
+    for _ in 0..100 {
+        // Three is not a multiple of two, so every other budget ends inside an
+        // instruction — the case the debt exists for.
+        let used = h.cpu.run_budget(3);
+        assert_eq!(used, 3, "a running core consumes its budget in full");
+        granted += used;
+    }
+    assert_eq!(granted, 300);
+    // The core executed whole instructions, so its own count is the budget
+    // total plus whatever it currently owes.
+    assert_eq!(h.cpu.cycles() - start - h.cpu.cycle_debt(), granted);
+    assert!(h.cpu.cycle_debt() <= 7);
+}
+
+#[test]
+fn a_halted_core_reports_what_it_actually_used() {
+    let h = Harness::running(&[0x02]); // JAM: eleven cycles, then nothing
+    let used = h.cpu.run_budget(1000);
+    assert!(h.cpu.is_halted());
+    assert_eq!(used, 11, "a halted core must not claim the whole budget");
+    assert_eq!(h.cpu.run_budget(1000), 0, "and nothing after that");
+}
+
+#[test]
+fn the_cycle_debt_survives_a_snapshot() -> Result<()> {
+    let h = Harness::running(&[0xea; 4]);
+    h.cpu.run_budget(3);
+    let debt = h.cpu.cycle_debt();
+    assert_eq!(
+        debt, 1,
+        "a two-cycle NOP overshoots a three-cycle budget by one"
+    );
+
+    let mut shape = MachineShape::new();
+    shape.add_device("cpu", CLASS.name)?;
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("cpu", CLASS.name, CLASS.version)?;
+        h.cpu.save(&mut chunk)?;
+    }
+    let bytes = w.to_vec()?;
+
+    let other = Harness::running(&[]);
+    let reader = StateReader::new(&bytes)?;
+    let chunk = reader.load("cpu", CLASS.name, CLASS.version, &Migrations::new())?;
+    other.cpu.load(&mut chunk.reader())?;
+    // Dropping it would resume a cycle ahead of where the save was taken,
+    // which is the kind of drift a replay cannot survive.
+    assert_eq!(other.cpu.cycle_debt(), debt);
+    Ok(())
+}
+
+#[test]
+fn properties_carry_the_nes_variant_and_the_dsl_spelling() {
+    let props = Props::new().with("decimal", false).with("engine", "interp");
+    let cpu = Mos6502::from_props(&props).expect("the NES's RP2A03");
+    assert!(!cpu.config().decimal);
+    assert_eq!(cpu.config().magic, 0xee);
+
+    // An engine that does not exist yet is a config error, not a silent
+    // fallback to the interpreter.
+    let props = Props::new().with("engine", "jit");
+    assert!(Mos6502::from_props(&props).is_err());
 }

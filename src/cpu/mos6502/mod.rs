@@ -75,13 +75,16 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::core::device::{Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind};
+use crate::core::device::{
+    Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
+};
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
+use crate::core::sched::{Budget, Consumed};
 use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::core::sync::{self, AtomicBool, LockRank, Ordering};
+use crate::core::sync::{self, AtomicBool, AtomicU32, LockRank, Ordering};
 use crate::core::value::Width;
 use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink};
 
@@ -336,6 +339,14 @@ pub(crate) struct Lines {
     /// NMI is edge-sensitive: a high-going edge sets this latch, which stays
     /// set until the interrupt is serviced, however long that takes.
     nmi_latch: AtomicBool,
+    /// A `/RES` assertion nobody has acted on yet.
+    ///
+    /// An atomic rather than `State::reset_pending` for the same reason the
+    /// interrupt pins are: the line can be driven from inside a write the CPU
+    /// itself issued, and reaching for the execution lock from there would
+    /// deadlock. [`Mos6502::step`] moves it into the execution state on its
+    /// way past.
+    reset_req: AtomicBool,
 }
 
 impl Lines {
@@ -369,18 +380,30 @@ impl Lines {
         self.nmi_latch.store(false, Ordering::Release);
     }
 
-    fn snapshot(&self) -> (bool, bool, bool) {
+    /// Latch a reset request. Idempotent: two pulses are one reset.
+    fn request_reset(&self) {
+        self.reset_req.store(true, Ordering::Release);
+    }
+
+    /// Consume the reset request, reporting whether there was one.
+    fn take_reset_request(&self) -> bool {
+        self.reset_req.swap(false, Ordering::AcqRel)
+    }
+
+    fn snapshot(&self) -> (bool, bool, bool, bool) {
         (
             self.irq_asserted(),
             self.nmi_level.load(Ordering::Acquire),
             self.nmi_pending(),
+            self.reset_req.load(Ordering::Acquire),
         )
     }
 
-    fn restore(&self, (irq, level, latch): (bool, bool, bool)) {
+    fn restore(&self, (irq, level, latch, reset): (bool, bool, bool, bool)) {
         self.irq.store(irq, Ordering::Release);
         self.nmi_level.store(level, Ordering::Release);
         self.nmi_latch.store(latch, Ordering::Release);
+        self.reset_req.store(reset, Ordering::Release);
     }
 }
 
@@ -408,8 +431,30 @@ struct Session {
 #[derive(Debug)]
 pub struct Mos6502 {
     cfg: Config,
-    lines: Lines,
+    lines: Arc<Lines>,
     session: sync::Mutex<Session>,
+    /// This core's identity in `MemAttrs::requester`.
+    ///
+    /// Separate from [`Config`] because the machine layer assigns it at bind
+    /// time, long after construction, and every method a device has takes
+    /// `&self`.
+    requester: AtomicU32,
+    /// The wire sinks handed out by [`Device::sink`], kept alive here.
+    ///
+    /// A net holds only a *weak* reference to a sink (`core::device`), so
+    /// something has to own the strong one, and it has to be the device — a
+    /// pin owned by the net would be an ownership cycle through the wire.
+    /// These hold an `Arc<Lines>` rather than an `Arc<Mos6502>` for exactly
+    /// that reason.
+    pins: sync::Mutex<Pins>,
+}
+
+/// The sinks this core has published, one per input pin.
+#[derive(Debug, Default)]
+struct Pins {
+    irq: Option<Arc<InterruptPin>>,
+    nmi: Option<Arc<InterruptPin>>,
+    reset: Option<Arc<ResetPin>>,
 }
 
 impl Mos6502 {
@@ -423,7 +468,7 @@ impl Mos6502 {
     pub fn new(cfg: Config) -> Mos6502 {
         Mos6502 {
             cfg,
-            lines: Lines::default(),
+            lines: Arc::new(Lines::default()),
             session: sync::Mutex::with_rank(
                 LockRank::BUS,
                 Session {
@@ -431,7 +476,29 @@ impl Mos6502 {
                     space: None,
                 },
             ),
+            requester: AtomicU32::new(cfg.requester.0),
+            pins: sync::Mutex::new(Pins::default()),
         }
+    }
+
+    /// The configuration as it stands, with the bind-time requester id folded
+    /// in.
+    ///
+    /// One relaxed load per instruction, which is nothing next to the seven
+    /// bus accesses around it, and it keeps the id out of the execution lock.
+    fn effective_config(&self) -> Config {
+        Config {
+            requester: RequesterId(self.requester.load(Ordering::Relaxed)),
+            ..self.cfg
+        }
+    }
+
+    /// Set the id accesses this core initiates carry.
+    ///
+    /// The machine layer calls this from `bind`; a caller wiring a core up by
+    /// hand can call it directly or put the id in [`Config`].
+    pub fn set_requester(&self, id: RequesterId) {
+        self.requester.store(id.0, Ordering::Relaxed);
     }
 
     /// Build one from machine-description properties.
@@ -445,6 +512,11 @@ impl Mos6502 {
         let mut r = props.reader();
         let decimal = r.or("decimal", true)?;
         let magic = r.or_range("magic", 0xeeu64, 0..=0xff)?;
+        // Accepted, and for now only one value is: `ROADMAP.md` §5's example
+        // writes `engine = "interp"`, and the IR frontend is phase 5. Rejecting
+        // the spelling the language documents would be the wrong half to be
+        // strict about.
+        let _ = r.or_enum("engine", "interp", &["interp"])?;
         r.finish()?;
         Ok(Mos6502::new(Config {
             decimal,
@@ -590,12 +662,21 @@ impl Mos6502 {
     /// Returns the bus cycles charged: zero if the core is halted or has no
     /// address space, which the caller must treat as "stop", not "retry".
     pub fn step(&self) -> u64 {
+        let cfg = self.effective_config();
         let mut session = self.session.lock();
         let Session { state, space } = &mut *session;
+        // A `/RES` assertion is latched outside the lock; this is where it
+        // becomes execution state. A jammed core wakes up, which is what the
+        // pin is for.
+        if self.lines.take_reset_request() {
+            state.reset_pending = true;
+            state.halted = false;
+            state.pending = None;
+        }
         let Some(space) = space.clone() else {
             return 0;
         };
-        Exec::new(state, &space, &self.cfg, &self.lines).step()
+        Exec::new(state, &space, &cfg, &self.lines).step()
     }
 
     /// Execute until at least `budget` cycles have been charged.
@@ -614,6 +695,53 @@ impl Mos6502 {
             used += n;
         }
         used
+    }
+
+    /// Run a scheduler budget of `ticks` cycles, reporting exactly how many
+    /// were consumed — never more.
+    ///
+    /// A 6502 cannot be stopped mid-instruction, so the last instruction of a
+    /// budget usually runs past its end. The scheduler treats an overrun as
+    /// fatal, and rightly: the overrun has already executed past an event that
+    /// should have stopped it. So the overshoot is *carried* — deducted from
+    /// the next budget through `State::debt` — which keeps the core's cycle
+    /// count and the domain's tick count in step over any number of quanta
+    /// while never letting a single one overrun.
+    ///
+    /// A halted core consumes only the debt it owed plus whatever it managed,
+    /// which is how the scheduler sees a `JAM` rather than spinning on it.
+    pub fn run_budget(&self, ticks: u64) -> u64 {
+        let owed = self.session.lock().state.debt;
+        if owed >= ticks {
+            // The last instruction was longer than this whole budget: charge
+            // the budget against the debt and execute nothing.
+            self.session.lock().state.debt = owed - ticks;
+            return ticks;
+        }
+        let allowance = ticks - owed;
+        let mut used = 0u64;
+        while used < allowance {
+            let n = self.step();
+            if n == 0 {
+                // Halted, or no address space. Either way, stop — retrying
+                // would spin.
+                break;
+            }
+            used += n;
+        }
+        if used >= allowance {
+            self.session.lock().state.debt = used - allowance;
+            ticks
+        } else {
+            self.session.lock().state.debt = 0;
+            owed + used
+        }
+    }
+
+    /// Cycles owed to the next budget — see [`run_budget`](Mos6502::run_budget).
+    #[must_use]
+    pub fn cycle_debt(&self) -> u64 {
+        self.session.lock().state.debt
     }
 
     /// Disassemble `count` instructions starting at `pc`, reading guest memory
@@ -639,7 +767,9 @@ impl Mos6502 {
 /// The `cpu.mos6502` device class.
 pub static CLASS: DeviceClass = DeviceClass {
     name: "cpu.mos6502",
-    version: 1,
+    // v2 added the cycle debt `run_budget` carries between quanta and the
+    // latched `/RES` request; v1 snapshots predate any released build.
+    version: 2,
     summary: "MOS 6502 / Ricoh RP2A03 8-bit CPU core, cycle-accurate interpreter",
     properties: &[
         PropertySpec {
@@ -653,6 +783,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Uint,
             required: false,
             summary: "the analog constant ANE and LXA OR into the accumulator (default 0xee)",
+        },
+        PropertySpec {
+            name: "engine",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "which execution engine; only `interp` exists until phase 5",
         },
     ],
     construct: |props| Ok(Box::new(Mos6502::from_props(props)?)),
@@ -676,14 +812,56 @@ impl Device for Mos6502 {
         &CLASS
     }
 
-    fn realize(&self, ctx: &mut RealizeCtx<'_>) -> Result<()> {
-        // A CPU with no address space cannot fetch, and failing here is the
-        // difference between a config error and a machine that runs zero
-        // instructions and says nothing.
-        if self.session.lock().space.is_none() {
-            return Err(ctx.error("no address space attached to this core"));
-        }
+    fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
+        // Nothing outward. A CPU with no address space cannot fetch, but
+        // realize runs *before* the machine binds one — that check belongs to
+        // `Instance::bind`, which is where the space arrives.
         Ok(())
+    }
+
+    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        // The fan-in can only be built now: it is told its sources at
+        // construction and no `WireId` existed when this core was made.
+        //
+        // Every pin is named the way the package names it, minus the bar:
+        // `/IRQ` is asserted low on real silicon, and inverting a level
+        // belongs to whatever models the wire, not to the core.
+        let mut pins = self.pins.lock();
+        let sink: Arc<dyn WireSink> = match port {
+            "irq" => {
+                let pin = Arc::new(InterruptPin::from_lines(
+                    Arc::clone(&self.lines),
+                    Interrupt::Irq,
+                    sources,
+                ));
+                pins.irq = Some(Arc::clone(&pin));
+                pin
+            }
+            "nmi" => {
+                let pin = Arc::new(InterruptPin::from_lines(
+                    Arc::clone(&self.lines),
+                    Interrupt::Nmi,
+                    sources,
+                ));
+                pins.nmi = Some(Arc::clone(&pin));
+                pin
+            }
+            "reset" => {
+                let pin = Arc::new(ResetPin::new(Arc::clone(&self.lines), sources));
+                pins.reset = Some(Arc::clone(&pin));
+                pin
+            }
+            _ => return None,
+        };
+        Some(SinkPin { sink, line: 0 })
+    }
+
+    fn is_runnable(&self) -> bool {
+        true
+    }
+
+    fn run(&self, budget: Budget) -> Consumed {
+        Consumed::new(self.run_budget(budget.ticks))
     }
 
     fn reset(&self, kind: ResetKind) {
@@ -702,7 +880,7 @@ impl Device for Mos6502 {
         }
         drop(session);
         if kind == ResetKind::Cold {
-            self.lines.restore((false, false, false));
+            self.lines.restore((false, false, false, false));
         } else {
             // The input *levels* belong to whatever drives them, not to the
             // CPU — clearing them here would make a reset lie about the
@@ -730,10 +908,12 @@ impl Device for Mos6502 {
         w.write_u8(state.open_bus)?;
         w.write_u64(state.faults)?;
         w.write_u16(state.last_fault)?;
-        let (irq, nmi_level, nmi_latch) = self.lines.snapshot();
+        w.write_u64(state.debt)?;
+        let (irq, nmi_level, nmi_latch, reset_req) = self.lines.snapshot();
         w.write_bool(irq)?;
         w.write_bool(nmi_level)?;
         w.write_bool(nmi_latch)?;
+        w.write_bool(reset_req)?;
         Ok(())
     }
 
@@ -761,19 +941,65 @@ impl Device for Mos6502 {
         state.open_bus = r.read_u8()?;
         state.faults = r.read_u64()?;
         state.last_fault = r.read_u16()?;
+        state.debt = r.read_u64()?;
         let irq = r.read_bool()?;
         let nmi_level = r.read_bool()?;
         let nmi_latch = r.read_bool()?;
+        let reset_req = r.read_bool()?;
         self.session.lock().state = state;
-        self.lines.restore((irq, nmi_level, nmi_latch));
+        self.lines.restore((irq, nmi_level, nmi_latch, reset_req));
         Ok(())
     }
 }
 
 impl Initiator for Mos6502 {
     fn requester(&self) -> RequesterId {
-        self.cfg.requester
+        RequesterId(self.requester.load(Ordering::Relaxed))
     }
+}
+
+/// The machine layer's half: a 6502 needs an address space, and this is where
+/// the machine gives it one.
+impl crate::machine::Instance for Mos6502 {
+    fn bind(&self, ctx: &crate::machine::BindCtx<'_>) -> Result<()> {
+        // A CPU with no address space cannot fetch, and a machine that runs
+        // zero instructions and says nothing is the worst of both worlds.
+        let space = ctx.space().ok_or_else(|| Error::Config {
+            at: alloc::string::String::from(ctx.path()),
+            message: alloc::string::String::from(
+                "a 6502 needs an address space to fetch from (`space = cpubus`)",
+            ),
+        })?;
+        self.attach_space(Arc::clone(space));
+        self.set_requester(ctx.requester());
+        Ok(())
+    }
+}
+
+/// Bind [`CLASS`] into the machine graph.
+///
+/// # Errors
+///
+/// If the class name is already bound.
+pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
+    bindings.bind(CLASS.name, |props| {
+        Ok(Arc::new(Mos6502::from_props(props)?))
+    })
+}
+
+/// What the validator should know about `cpu.mos6502`.
+#[must_use]
+pub fn schema() -> crate::machine::validate::ClassSchema {
+    use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
+    ClassSchema::new(CLASS.name)
+        .prop(PropSchema::new("decimal", ValueKind::Bool))
+        .prop(PropSchema::new("magic", ValueKind::Uint).range(0, 0xff))
+        .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
+        // Inputs only: a 6502 drives no line this core models. `/SYNC` and
+        // `R/W` are real pins, but nothing yet listens to either.
+        .port("irq", PortDir::In)
+        .port("nmi", PortDir::In)
+        .port("reset", PortDir::In)
 }
 
 /// One of the CPU's two interrupt inputs, as something a [`Wire`] can drive.
@@ -787,7 +1013,7 @@ impl Initiator for Mos6502 {
 /// [`Wire`]: crate::core::wire::Wire
 #[derive(Debug)]
 pub struct InterruptPin {
-    cpu: Arc<Mos6502>,
+    lines: Arc<Lines>,
     which: Interrupt,
     inputs: FanIn,
     resolve: Resolve,
@@ -798,10 +1024,20 @@ impl InterruptPin {
     ///
     /// Wire-OR by default: any source asserting asserts the pin, which is how
     /// an open-collector interrupt line behaves.
+    ///
+    /// The pin keeps a handle on the core's *input latches*, not on the core:
+    /// the core owns the pin (something must, since a net holds only a weak
+    /// reference to its sinks), and a pin that owned the core back would be a
+    /// cycle the machine could never drop.
     #[must_use]
     pub fn new(cpu: Arc<Mos6502>, which: Interrupt, sources: &[WireId]) -> InterruptPin {
+        InterruptPin::from_lines(Arc::clone(&cpu.lines), which, sources)
+    }
+
+    /// The same, given the latches directly.
+    fn from_lines(lines: Arc<Lines>, which: Interrupt, sources: &[WireId]) -> InterruptPin {
         InterruptPin {
-            cpu,
+            lines,
             which,
             inputs: FanIn::new(sources),
             resolve: Resolve::Or,
@@ -833,8 +1069,63 @@ impl WireSink for InterruptPin {
         self.inputs.set(src, level);
         let asserted = self.inputs.resolve(self.resolve).is_high();
         match self.which {
-            Interrupt::Irq => self.cpu.set_irq(asserted),
-            Interrupt::Nmi => self.cpu.set_nmi(asserted),
+            Interrupt::Irq => self.lines.set_irq(asserted),
+            Interrupt::Nmi => self.lines.set_nmi(asserted),
+        }
+    }
+}
+
+/// The core's `/RES` input, as something a [`Wire`] can drive.
+///
+/// Separate from [`InterruptPin`] because a reset is not an interrupt: it has
+/// no vector to poll for, no mask, and it un-jams a core that a `JAM` opcode
+/// froze. Asserting the line latches a request; the sequence itself runs on the
+/// next [`step`](Mos6502::step), because that is when the CPU can read the
+/// reset vector — a reset is a signal, not a method call.
+///
+/// Wire-OR, like the interrupt pins: any source holding the line asserts it.
+///
+/// [`Wire`]: crate::core::wire::Wire
+#[derive(Debug)]
+pub struct ResetPin {
+    lines: Arc<Lines>,
+    inputs: FanIn,
+    resolve: Resolve,
+}
+
+impl ResetPin {
+    /// Connect the `/RES` pin of `cpu` to a net driven by `sources`.
+    #[must_use]
+    pub fn new_for(cpu: Arc<Mos6502>, sources: &[WireId]) -> ResetPin {
+        ResetPin::new(Arc::clone(&cpu.lines), sources)
+    }
+
+    fn new(lines: Arc<Lines>, sources: &[WireId]) -> ResetPin {
+        ResetPin {
+            lines,
+            inputs: FanIn::new(sources),
+            resolve: Resolve::Or,
+        }
+    }
+
+    /// The per-source levels currently seen.
+    #[must_use]
+    pub fn inputs(&self) -> &FanIn {
+        &self.inputs
+    }
+}
+
+impl WireSink for ResetPin {
+    fn set_level(&self, src: WireId, _line: u32, level: Level) {
+        self.inputs.set(src, level);
+        // Latch on assertion rather than on release. A real 6502 samples `/RES`
+        // and begins its sequence once the line goes back high, but the
+        // difference is invisible to a guest — nothing executes while the line
+        // is held — and latching on the edge that *arrives* means a machine
+        // whose reset button is still down still comes up, instead of waiting
+        // for a release nobody modelled.
+        if self.inputs.resolve(self.resolve).is_high() {
+            self.lines.request_reset();
         }
     }
 }
