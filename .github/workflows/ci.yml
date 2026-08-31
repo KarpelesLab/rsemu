@@ -146,6 +146,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      # The browser demo is a Vue 3 + Vite application, and check.mjs is gated
+      # on the *built* site as well as on the module, so this job needs node.
+      # Only wasm32-unknown-unknown builds a page.
+      - uses: actions/setup-node@v4
+        if: matrix.target == 'wasm32-unknown-unknown'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       # wasm rots faster than anything else, so every wasm target is built on
       # every commit from the first one (ROADMAP.md §11).
       - name: build library
@@ -193,13 +202,36 @@ jobs:
         run: |
           cargo rustc --crate-type cdylib --target wasm32-unknown-unknown \
             --no-default-features --features demo --release
-      - name: browser harness against the real module
+      # `npm ci`, not `npm install`: the lockfile is committed and it is the
+      # build's input. The licence gate runs here too, because a copyleft
+      # package arriving transitively would end up inside the bundle that
+      # ships (CLAUDE.md's provenance rule does not stop at the language
+      # boundary).
+      - name: install the site's dependencies
+        if: matrix.target == 'wasm32-unknown-unknown'
+        run: npm ci
+        working-directory: web
+      - name: check bundled licences
+        if: matrix.target == 'wasm32-unknown-unknown'
+        run: npm run licenses
+        working-directory: web
+      - name: build the site
+        if: matrix.target == 'wasm32-unknown-unknown'
+        # public/ is copied verbatim by Vite, so the wasm reaches dist/ whole:
+        # not hashed, not inlined, not transformed.
+        run: |
+          set -euo pipefail
+          cp target/wasm32-unknown-unknown/release/rsemu.wasm web/public/rsemu.wasm
+          npm run build --prefix web
+      - name: browser harness against the real module and the real site
         if: matrix.target == 'wasm32-unknown-unknown'
         # Instantiates the module and drives it: exports vs. what the glue
-        # calls, zero imports, every element id present in the markup, boot,
-        # frames, and save/restore hash equality. Not a DOM test -- nothing
-        # here has a browser -- but it catches every drift that is not one.
-        run: node web/check.mjs
+        # calls, zero imports, the built bundle still calling every one of them
+        # and referencing only relative assets that exist, boot, frames,
+        # save/restore hash equality, and the page's own frame loop under a
+        # stub canvas. Not a DOM test -- nothing here has a browser -- but it
+        # catches every drift that is not one.
+        run: node web/check.mjs web/dist/rsemu.wasm --site web/dist
       - uses: actions/upload-artifact@v5
         if: matrix.target == 'wasm32-unknown-unknown'
         with:
