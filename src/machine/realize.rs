@@ -1099,6 +1099,20 @@ impl<'a> Realizer<'a> {
                     // contract `Device::sink` has.
                     drop(ack);
                 }
+                // The data half of a DMA request line, by the same route: the
+                // peripheral drives `DRQ`, and the controller on the other end
+                // of that net is what moves its bytes.
+                if let Some(peer) = instance.dma_peripheral(port) {
+                    let weak = Arc::downgrade(&peer);
+                    for sink_pin in receivers.iter().copied() {
+                        let (sink_object, sink_port) = pins.pin(sink_pin);
+                        let sink_built = self.device(sink_object, "wire")?;
+                        if let Some(sink_instance) = sink_built.instance.as_ref() {
+                            sink_instance.attach_dma_peripheral(sink_port, Weak::clone(&weak));
+                        }
+                    }
+                    drop(peer);
+                }
                 refs.push(PinRef {
                     device: object.0 as usize,
                     port: port.to_string(),

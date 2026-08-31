@@ -38,7 +38,7 @@ use crate::core::props::{Props, ValueKind};
 use crate::core::sched::{Budget, Consumed, LazyHandle};
 use crate::core::space::{RegionRef, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter};
-use crate::core::wire::{IntAck, WireId, WireSink, WireSource};
+use crate::core::wire::{DmaPeripheral, IntAck, WireId, WireSink, WireSource};
 
 /// How deep a reset goes.
 ///
@@ -237,6 +237,23 @@ pub trait Device: Send + Sync + fmt::Debug {
     /// Called once per driver on the net, before reset and before the realize
     /// sweep.
     fn attach_int_ack(&self, _port: &str, _ack: Weak<dyn IntAck>) {}
+
+    /// The DMA transfer interface this device offers on output pin `port`.
+    ///
+    /// A peripheral that raises `DRQ` returns one here; the realizer hands it
+    /// to the controller that is the sink on that net. As with
+    /// [`int_ack`](Device::int_ack), **the device must own the `Arc`** — what
+    /// reaches the controller is a `Weak`.
+    fn dma_peripheral(&self, _port: &str) -> Option<Arc<dyn DmaPeripheral>> {
+        None
+    }
+
+    /// Told which peripheral raises `DRQ` on input pin `port`.
+    ///
+    /// A DMA controller keeps this and moves bytes through it when the channel
+    /// is unmasked and the request arrives. Weak, for the same reason
+    /// [`attach_int_ack`](Device::attach_int_ack) is.
+    fn attach_dma_peripheral(&self, _port: &str, _peer: Weak<dyn DmaPeripheral>) {}
 
     /// Announce the level `port` idles at — the realize sweep (§4.3).
     ///

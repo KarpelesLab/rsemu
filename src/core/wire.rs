@@ -334,6 +334,44 @@ pub trait IntAck: Send + Sync + fmt::Debug {
     fn acknowledge(&self) -> u32;
 }
 
+/// The data half of a DMA request line.
+///
+/// `DRQ` is a wire and carries a level, but the transfer that level asks for
+/// moves *bytes* between the controller and the peripheral, over `DACK` and
+/// `IOR`/`IOW` — and a wire cannot carry a byte. So the peripheral offers this
+/// on its `DRQ` pin with `Device::dma_peripheral`, and the controller, which is
+/// the sink on that net, is handed it by the realizer.
+///
+/// The same shape as [`IntAck`] and for the same reason: the interesting half
+/// of the transaction travels in the opposite direction to the level, and a
+/// device handle is not something the machine layer can hand out. The
+/// controller keeps a [`Weak`], because the machine owns devices.
+///
+/// One byte at a time, deliberately. An 8237 in single-transfer mode really
+/// does give the bus back between bytes, and how long a burst runs is the
+/// controller's decision — an interface shaped "hand me your whole buffer"
+/// would put the transfer mode in the peripheral, which is the one place it is
+/// not.
+pub trait DmaPeripheral: Send + Sync + fmt::Debug {
+    /// Take one byte *from* the peripheral, for a device-to-memory transfer.
+    ///
+    /// `terminal` is true on the byte the controller's count expires on, which
+    /// is the `TC`/`EOP` pulse the peripheral uses to end its own operation.
+    fn dma_read(&self, terminal: bool) -> u8;
+
+    /// Give one byte *to* the peripheral, for a memory-to-device transfer.
+    fn dma_write(&self, byte: u8, terminal: bool);
+
+    /// Whether the peripheral still wants service.
+    ///
+    /// A controller checks this between bytes of a burst: a peripheral whose
+    /// FIFO has drained drops `DRQ` in hardware, and this is that drop seen
+    /// from the controller's side without waiting for a wire to propagate.
+    fn dma_ready(&self) -> bool {
+        true
+    }
+}
+
 /// Per-source level state: the bookkeeping that makes wired-OR possible.
 ///
 /// A sink with several drivers keeps one of these, updates it from
