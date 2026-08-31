@@ -66,9 +66,26 @@ pub struct CatalogEntry {
 #[cfg_attr(docsrs, doc(cfg(feature = "machine-nes")))]
 pub static NES_NTSC: CatalogEntry = CatalogEntry {
     name: "nes-ntsc",
-    summary: "Nintendo Entertainment System / Famicom, NTSC (PPU and APU pending)",
+    summary: "Nintendo Entertainment System / Famicom, NTSC (RP2C02 at 60 Hz)",
     media: &["cart"],
     source: include_str!("../../machines/nes-ntsc.machine"),
+};
+
+/// The PAL NES: the same board with a different crystal and different
+/// dividers.
+///
+/// Its own file rather than a parameter of the NTSC one. The region changes the
+/// oscillator, both clock dividers and the PPU's frame geometry at once, and
+/// §4.2 makes the oscillator topology part of the machine's identity — a
+/// snapshot records it, and two machines that differ in it are not the same
+/// machine wearing a flag.
+#[cfg(feature = "machine-nes")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-nes")))]
+pub static NES_PAL: CatalogEntry = CatalogEntry {
+    name: "nes-pal",
+    summary: "Nintendo Entertainment System, PAL (RP2C07 at 50 Hz, 312 scanlines)",
+    media: &["cart"],
+    source: include_str!("../../machines/nes-pal.machine"),
 };
 
 /// Every machine this build can realize, in catalog order.
@@ -82,6 +99,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     let mut out: Vec<&'static CatalogEntry> = Vec::new();
     #[cfg(feature = "machine-nes")]
     out.push(&NES_NTSC);
+    #[cfg(feature = "machine-nes")]
+    out.push(&NES_PAL);
     out
 }
 
@@ -115,22 +134,19 @@ pub fn registry() -> Result<Registry> {
 
 /// Every class that takes part in the memory map and the wire graph.
 ///
-/// # Why the NES PPU and APU are registered but not bound
+/// # The PPU and the APU
 ///
 /// Both are **lazily advanced** (`ROADMAP.md` §4.2): they hold their own tick
 /// and are caught up by whoever accesses them, through
-/// [`LazyHandle`](crate::core::sched::LazyHandle). Nothing declares that to
-/// this layer — `core::device` has no "I advance myself" for a class to say
-/// and `Instance` has no route to a `LazyDevice` — so a bound PPU would be
-/// mapped, wired, and then never advanced, and `$2002` would report VBlank
-/// clear forever. That is a worse machine than one with no PPU at all, where
-/// the open bus at least reads as ones.
+/// [`LazyHandle`](crate::core::sched::LazyHandle). They were kept out of this
+/// table until a class could *declare* that, because a PPU that is mapped and
+/// wired and then never advanced reports VBlank clear forever — a worse machine
+/// than one with no PPU at all, where the open bus at least reads as ones.
 ///
-/// So they stay in the [`registry`] — `rsemu devices` and `rsemu describe`
-/// tell the truth about this build — and out of here until a class can declare
-/// itself lazily advanced. When it can, these are two lines, and
-/// `machines/nes-ntsc.machine` has the objects, maps and wires written out in
-/// its closing comment ready to be uncommented.
+/// [`Device::is_lazy`](crate::core::Device::is_lazy) is that declaration, and
+/// [`realize`](mod@crate::machine::realize) registers such a device on its clock
+/// domain and hands it back the handle its own `MemOps` syncs through. So they
+/// are bound.
 ///
 /// # Errors
 ///
@@ -142,6 +158,10 @@ pub fn bindings() -> Result<Bindings> {
     crate::cpu::mos6502::bind(&mut b)?;
     #[cfg(feature = "dev-nes-cart")]
     crate::dev::cart::nrom::bind(&mut b)?;
+    #[cfg(feature = "dev-nes-ppu")]
+    crate::dev::ppu::bind(&mut b)?;
+    #[cfg(feature = "dev-nes-apu")]
+    crate::dev::apu::bind(&mut b)?;
     Ok(b)
 }
 
@@ -156,6 +176,10 @@ pub fn classes() -> ClassTable {
     table.insert(crate::cpu::mos6502::schema());
     #[cfg(feature = "dev-nes-cart")]
     table.insert(crate::dev::cart::nrom::schema());
+    #[cfg(feature = "dev-nes-ppu")]
+    table.insert(crate::dev::ppu::schema());
+    #[cfg(feature = "dev-nes-apu")]
+    table.insert(crate::dev::apu::schema());
     table
 }
 
@@ -520,6 +544,73 @@ mod tests {
             "bus fault at ${:04x} after {} cycles",
             after.last_fault, after.cycles
         );
+
+        // -- and now the part the PPU makes possible -----------------------
+        //
+        // Two seconds of virtual time is far more than any NES ROM's init
+        // needs: AccuracyCoin runs its whole first page of CPU tests and draws
+        // its menu well inside one.
+        for _ in 0..120 {
+            machine.run_for(frame).expect("the machine runs");
+        }
+        let after = cpu_state(&machine, "cpu");
+        let ppu_domain = machine
+            .device("ppu")
+            .and_then(crate::machine::machine::DeviceEntry::domain)
+            .expect("the ppu has a clock domain");
+        let dots = machine.clocks().ticks(ppu_domain).expect("a dot count");
+        let ticks = machine.clocks().ticks(domain).expect("a tick count");
+        println!(
+            "  after 121 frames: {} PPU dots, {}\n  \
+             {} tiles written to the first nametable",
+            dots,
+            regs_line(&after),
+            nametable_tiles(&machine)
+        );
+
+        // Exactly three dots per CPU cycle, forever, by construction: both
+        // counters descend from one crystal (`ROADMAP.md` §4.2). If this ever
+        // drifts the split-screen effects in half the NES library break.
+        assert_eq!(dots, ticks * 3, "the dot clock is not three times the CPU");
+        assert_eq!(after.faults, 0, "bus fault at ${:04x}", after.last_fault);
+        assert!(
+            !after.halted,
+            "a JAM opcode froze the core at ${:04x}",
+            after.pc
+        );
+
+        // The ROM has finished its init, run its tests and drawn a screen.
+        // Reaching this needs `$2002` to report vblank at the dot it is read
+        // on, `$2006`/`$2007` to reach the nametables through the PPU's own
+        // bus, and the NMI to arrive: an unadvanced PPU parks the wait loop at
+        // the top of the reset path with a blank screen behind it.
+        let tiles = nametable_tiles(&machine);
+        assert!(
+            tiles > 64,
+            "only {tiles} non-blank tiles in the first nametable; the ROM never \
+             drew anything"
+        );
+    }
+
+    /// How many of the first nametable's 960 tiles are not the blank one.
+    ///
+    /// Read through the PPU's own address space with debug attributes, so
+    /// counting them disturbs nothing.
+    #[cfg(all(feature = "machine-nes", feature = "std"))]
+    fn nametable_tiles(machine: &Machine) -> usize {
+        use crate::core::space::MemAttrs;
+        use crate::core::value::Width;
+        let space = machine.space("ppubus").expect("ppubus");
+        (0..960u64)
+            .filter(|i| {
+                let tile = space
+                    .read(0x2000 + i, Width::U8, MemAttrs::DEBUG)
+                    .unwrap_or(0);
+                // `$24` is the blank tile in most ASCII-ish NES tile sets, and
+                // `$00` is an unwritten nametable.
+                tile != 0x24 && tile != 0x00
+            })
+            .count()
     }
 
     #[cfg(feature = "cpu-mos6502")]
@@ -533,6 +624,147 @@ mod tests {
             s.s,
             s.pc
         )
+    }
+
+    /// The whole point of the exercise: vblank is reported and the NMI fires.
+    ///
+    /// No corpus and no environment variable — the cartridge is generated here,
+    /// so this runs on every `cargo test` and is the regression gate for
+    /// sync-on-access end to end (`ROADMAP.md` §4.2). It proves three separate
+    /// things, and each of them was broken before the PPU could declare itself
+    /// lazily advanced:
+    ///
+    /// 1. **`$2002` reports vblank.** The ROM does what every NES game's init
+    ///    does — polls `$2002` until bit 7 goes high, twice. With an unadvanced
+    ///    PPU that loop never ends; with an unmapped one it falls straight
+    ///    through on open bus, which looks like success and is not.
+    /// 2. **The chip advances with nobody looking at it.** After enabling the
+    ///    NMI the ROM sits in `JMP *` and touches no PPU register ever again.
+    ///    Sync-on-access alone would leave it there forever.
+    /// 3. **The NMI lands once per frame.** Not twice, which is what a level
+    ///    re-announced at every catch-up boundary would produce, and not never.
+    #[cfg(feature = "machine-nes")]
+    #[test]
+    fn vblank_is_reported_and_the_nmi_fires_once_a_frame() {
+        let image = nmi_rom();
+        let mut machine = build_catalog("nes-ntsc", &[("cart", &image)]).expect("a cart");
+        // Six frames of virtual time. The first is spent in the warm-up
+        // lockout, so `$2000` is only accepted from the second.
+        let frame = crate::core::clock::GlobalTime::from_nanos(16_639_267);
+        for _ in 0..6 {
+            machine.run_for(frame).expect("runs");
+        }
+
+        assert_eq!(
+            peek(&machine, 0x0001),
+            1,
+            "the vblank wait loop never ended"
+        );
+        let nmis = peek(&machine, 0x0000);
+        // Frame 0 is the lockout and frame 1 is where the wait loop ends, so
+        // four are certain and six are the ceiling.
+        assert!(
+            (4..=6).contains(&nmis),
+            "{nmis} NMIs in six frames; one per vblank is the answer"
+        );
+
+        // Another three frames: exactly three more.
+        for _ in 0..3 {
+            machine.run_for(frame).expect("runs");
+        }
+        assert_eq!(peek(&machine, 0x0000), nmis + 3);
+    }
+
+    /// A debug access advances nothing (`ROADMAP.md` §15, invariant 5).
+    ///
+    /// The catch-up hook sits at the top of the PPU's own `MemOps::read`, which
+    /// is exactly where it would be easiest to move the chip's clock on a
+    /// monitor read. It must not.
+    #[cfg(feature = "machine-nes")]
+    #[test]
+    fn a_debug_read_of_2002_advances_no_clock() {
+        use crate::core::space::MemAttrs;
+        use crate::core::value::Width;
+
+        let mut machine = build_catalog("nes-ntsc", &[("cart", MINIMAL_NROM)]).expect("a cart");
+        machine
+            .run_for(crate::core::clock::GlobalTime::from_nanos(1_000_000))
+            .expect("runs");
+        // Catch-up did happen: the chip is standing exactly on its domain's
+        // tick. Without that this test would pass vacuously.
+        let domain = machine
+            .device("ppu")
+            .and_then(crate::machine::machine::DeviceEntry::domain)
+            .expect("the ppu has a clock domain");
+        let before = ppu_dots(&machine);
+        assert_eq!(before, machine.clocks().ticks(domain).expect("ticks"));
+        assert!(before > 0);
+
+        for _ in 0..64 {
+            let _ = peek(&machine, 0x2002);
+        }
+        assert_eq!(
+            ppu_dots(&machine),
+            before,
+            "a debug read moved the dot clock"
+        );
+
+        // A debug *write* to a port with side effects is refused outright,
+        // which is the same invariant seen from the other side.
+        assert!(
+            machine
+                .space("cpubus")
+                .expect("cpubus")
+                .write(0x2000, Width::U8, 0x80, MemAttrs::DEBUG)
+                .is_err()
+        );
+        assert_eq!(ppu_dots(&machine), before);
+    }
+
+    /// The PPU's dot counter, out of its snapshot chunk.
+    #[cfg(feature = "machine-nes")]
+    fn ppu_dots(machine: &Machine) -> u64 {
+        use crate::core::state::{Migrations, Source, StateReader};
+        let class = &crate::dev::ppu::NES_PPU_CLASS;
+        let bytes = machine.save().expect("a machine saves");
+        let reader = StateReader::new(&bytes).expect("well formed");
+        let chunk = reader
+            .load("ppu", class.name, class.version, &Migrations::new())
+            .expect("a chunk per device");
+        chunk.reader().read_u64().expect("dots come first")
+    }
+
+    /// A cartridge whose init waits for two vblanks, enables the NMI and then
+    /// does nothing at all — the shape of every NES game's reset path.
+    ///
+    /// `$00` counts NMIs and `$01` counts completions of the wait loop.
+    #[cfg(feature = "machine-nes")]
+    fn nmi_rom() -> alloc::vec::Vec<u8> {
+        let mut image = alloc::vec![0u8; 16 + 16384 + 8192];
+        image[..4].copy_from_slice(b"NES\x1a");
+        image[4] = 1; // 16 KiB of PRG, which answers at $8000 and at $C000
+        image[5] = 1; // 8 KiB of CHR
+        let prg = &mut image[16..16 + 16384];
+        let code: &[u8] = &[
+            0x78, // $C000  SEI
+            0xad, 0x02, 0x20, // $C001  LDA $2002   reset the address latch
+            0xad, 0x02, 0x20, // $C004  LDA $2002
+            0x10, 0xfb, //       $C007  BPL $C004   wait for vblank
+            0xad, 0x02, 0x20, // $C009  LDA $2002
+            0x10, 0xfb, //       $C00C  BPL $C009   and again
+            0xee, 0x01, 0x00, // $C00E  INC $0001   the wait loop ended
+            0xa9, 0x80, //       $C011  LDA #$80
+            0x8d, 0x00, 0x20, // $C013  STA $2000   enable the NMI
+            0x4c, 0x16, 0xc0, // $C016  JMP $C016   and never look again
+        ];
+        prg[..code.len()].copy_from_slice(code);
+        // The handler, at $C020: count it and return. It deliberately does not
+        // read $2002 — the request stays asserted for the whole of vblank, and
+        // the CPU's edge latch is what must keep that from firing twice.
+        prg[0x20..0x23].copy_from_slice(&[0xe6, 0x00, 0x40]); // INC $00 ; RTI
+        // NMI $C020, RESET $C000, IRQ $C020.
+        prg[0x3ffa..0x4000].copy_from_slice(&[0x20, 0xc0, 0x00, 0xc0, 0x20, 0xc0]);
+        image
     }
 
     /// Something plausible to bind to a media slot, so the catalog can be

@@ -1,0 +1,63 @@
+# The PAL Nintendo Entertainment System.
+#
+#   rsemu run nes-pal --cart smb.nes
+#
+# The same board as `nes-ntsc` with a different crystal and different dividers,
+# and therefore its own file rather than a flag on that one: the oscillator
+# topology is part of a machine's identity and is recorded in its snapshots
+# (ROADMAP.md §4.2), so these are two machines and not one machine with a mode.
+#
+# Sources: NESdev wiki, "Cycle reference chart" — the 2C07 column gives the
+# 26.6017125 MHz crystal, the CPU ÷16 and dot ÷5 dividers, 312 scanlines and 70
+# vblank lines, and notes that Nintendo kept the Johnson counter's even period
+# rather than dividing by 15 to preserve the 3:1 ratio.
+
+machine "nes-pal" {
+  # 26.6017125 MHz exactly, which is 53203425/2 Hz. Like NTSC's it is not an
+  # integer number of hertz — and like NTSC's it does not need to be, because
+  # nothing a game can observe depends on the absolute frequency.
+  osc master = 53203425/2 Hz
+
+  space cpubus { width = 16, unassigned = open-bus }
+  space ppubus { width = 14, unassigned = open-bus }
+
+  object wram  "ram" { size = 2K }
+  object ciram "ram" { size = 2K }
+
+  object cpu "cpu.mos6502" {
+    clock  = master / 16
+    space  = cpubus
+    engine = "interp"
+    decimal = false
+  }
+
+  # 16 and 5: the PAL CPU cycle is 3.2 dots, which is not an integer and is
+  # *still exact*, because the forest counts master ticks rather than CPU
+  # cycles. That is the case the oscillator forest was designed around — a ratio
+  # routed through absolute time would have thrown the exactness away.
+  object ppu "nes.ppu" { clock = master / 5, space = ppubus, region = "pal" }
+
+  object apu "nes.apu" { clock = master / 16, region = "pal" }
+
+  object cart "nes.nrom" { rom = "cart" }
+
+  # -- the CPU bus -----------------------------------------------------------
+  map cpubus 0x0000 size 0x2000 = mirror(wram)
+  map cpubus 0x2000 size 0x2000 = ppu.regs
+  map cpubus 0x4000 size 0x0014 = apu.channels
+  map cpubus 0x4015 size 0x0001 = apu.status
+  map cpubus 0x4017 size 0x0001 = apu.frame
+  map cpubus 0x8000 size 0x8000 = cart.prg
+
+  # -- the PPU bus -----------------------------------------------------------
+  map ppubus 0x0000 size 0x2000 = cart.chr
+  map ppubus 0x2000 size 0x1000 = mirror(ciram)
+  map ppubus 0x3000 size 0x0f00 = mirror(ciram)
+
+  # -- interrupts ------------------------------------------------------------
+  wire ppu.nmi -> cpu.nmi
+  wire apu.irq -> cpu.irq
+
+  # The same three gaps `nes-ntsc.machine` documents at its foot: fixed vertical
+  # nametable mirroring, no OAM DMA at $4014, and no controller ports.
+}

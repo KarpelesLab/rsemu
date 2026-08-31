@@ -71,9 +71,12 @@
 //!   [`LazyHandle`](crate::core::sched::LazyHandle): a shared handle to one
 //!   lazily-advanced device that catches it up without taking any
 //!   scheduler-ranked lock — `LockRank::SCHED` is *above* `LockRank::BUS`, so
-//!   an access that reached back for one would invert the ladder. Nothing here
-//!   registers a lazy device yet, because no device class declares itself one;
-//!   when the PPU does, this layer clones the handle onto its mapping.
+//!   an access that reached back for one would invert the ladder. A class says
+//!   so with [`Device::is_lazy`], and the realizer registers it on its clock
+//!   domain and hands the handle straight back to the device through
+//!   [`Device::attach_lazy`] — the device syncs at the top of its own read and
+//!   write paths, because it is the only thing that knows which of its
+//!   registers are sampled and it may publish several windows into one space.
 //! * **A deferred action carries no context.** `Deferred`'s payload is
 //!   `FnOnce() + Send` with no arguments, so an action can only touch what it
 //!   captured — and it cannot capture the machine, which owns the queue. It
@@ -104,7 +107,9 @@ use crate::core::space::{
 use crate::core::state::MachineShape;
 use crate::core::value::Endian;
 use crate::core::wire::{Wire, WireId, WireIdAllocator, WireSource};
-use crate::machine::machine::{DeviceEntry, Machine, MachineParts, Net, PinRef, RunAdapter};
+use crate::machine::machine::{
+    DeviceEntry, LazyAdapter, Machine, MachineParts, Net, PinRef, RunAdapter,
+};
 use crate::machine::resolver::{
     Clock, ClockParent, MapTarget, Mapping, ObjectId, Resolved, SpaceId,
 };
@@ -486,7 +491,7 @@ impl<'a> Realizer<'a> {
             core::mem::take(&mut self.forest),
             self.options.scheduler.clone(),
         );
-        let devices = self.register_runnables(&mut sched)?;
+        let devices = self.register_with_scheduler(&mut sched)?;
 
         let mut machine = Machine::assemble(MachineParts {
             name: self.machine.name.clone(),
@@ -779,13 +784,23 @@ impl<'a> Realizer<'a> {
         Ok(())
     }
 
-    /// Hand every runnable device to the scheduler and produce the machine's
-    /// device table.
+    /// Hand every runnable device — and every lazily-advanced one — to the
+    /// scheduler, and produce the machine's device table.
     ///
     /// Borrows rather than consumes `self.built`: a failure here still has to
     /// be able to unrealize what was realized, and a device table that has been
     /// moved out cannot be walked back.
-    fn register_runnables(&self, sched: &mut Scheduler) -> Result<Vec<DeviceEntry>> {
+    ///
+    /// # Lazily advanced devices (§4.2)
+    ///
+    /// A class that says [`Device::is_lazy`] is registered on its clock domain
+    /// and handed the [`LazyHandle`](crate::core::sched::LazyHandle) back, so
+    /// that its own `MemOps::read` can catch it up. The handle rather than a
+    /// wrapper around the region, for two reasons: a device knows which of its
+    /// registers are sampled and which are not, and a `map` statement may name
+    /// several windows of one device (the APU names three), which a per-mapping
+    /// wrapper would have to reproduce and keep in step.
+    fn register_with_scheduler(&self, sched: &mut Scheduler) -> Result<Vec<DeviceEntry>> {
         let mut out = Vec::with_capacity(self.built.len());
         for built in &self.built {
             let mut runnable = None;
@@ -802,6 +817,25 @@ impl<'a> Realizer<'a> {
                     sched.add_runnable(domain, Box::new(RunAdapter::new(Arc::clone(instance)))),
                 );
             }
+            let mut lazy = None;
+            if built.device.is_lazy() {
+                let domain = built.domain.ok_or_else(|| {
+                    config(
+                        built.path.clone(),
+                        "a device that is advanced on access needs a clock domain: its tick is \
+                         counted in one, and catch-up has no target without it",
+                    )
+                })?;
+                let id = sched.add_lazy_device(
+                    domain,
+                    Box::new(LazyAdapter::new(Arc::clone(&built.device))),
+                );
+                let handle = sched
+                    .lazy_handle(id)
+                    .map_err(|e| config(built.path.clone(), e.to_string()))?;
+                built.device.attach_lazy(handle);
+                lazy = Some(id);
+            }
             out.push(DeviceEntry {
                 path: built.path.clone(),
                 class: built.class,
@@ -811,6 +845,7 @@ impl<'a> Realizer<'a> {
                 space: built.space,
                 requester: built.requester,
                 runnable,
+                lazy,
             });
         }
         Ok(out)

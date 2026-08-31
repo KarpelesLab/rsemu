@@ -5,9 +5,14 @@
 # Sources: NESdev wiki, "Cycle reference chart" (master clock and the divisors),
 # "CPU memory map" and "PPU memory map" (the decoding below), "NROM".
 #
-# INCOMPLETE. The PPU and APU objects are not here yet — see the TODO at the
-# bottom — so $2000-$401F is unassigned and reads as open bus. A cartridge
-# boots, fetches its reset vector and executes; a game does not yet display.
+# The PPU and the APU are here, mapped and wired. Both are *lazily advanced*
+# (ROADMAP.md §4.2): they hold their own tick and are caught up before any
+# access is dispatched to them, and the run loop stops the CPU at the PPU's own
+# next event so the NMI lands on the dot that raised it rather than whenever the
+# CPU next happens to read $2002.
+#
+# Still missing, and listed at the bottom: OAM DMA at $4014, the controller
+# ports at $4016/$4017, and per-cartridge nametable mirroring.
 
 machine "nes-ntsc" {
   # One crystal, so every domain below is exactly related to every other: the
@@ -28,6 +33,11 @@ machine "nes-ntsc" {
   # decoded, so it answers four times over $0000-$1FFF.
   object wram "ram" { size = 2K }
 
+  # The console's 2 KiB of nametable RAM (CIRAM). It is on the console's board,
+  # not on the cartridge — the cartridge only decides which 1 KiB answers where,
+  # by tying CIRAM A10 one way or the other. See the note at the bottom.
+  object ciram "ram" { size = 2K }
+
   object cpu "cpu.mos6502" {
     clock  = master / 12
     space  = cpubus
@@ -37,6 +47,15 @@ machine "nes-ntsc" {
     decimal = false
   }
 
+  # Master ÷ 4 is the dot clock, which is master ÷ 12 ÷ 3 — the exact 3:1 the
+  # whole oscillator forest exists to preserve. `space = ppubus` is what the
+  # chip fetches patterns and nametables through; it is a bus master, not just
+  # a responder.
+  object ppu "nes.ppu" { clock = master / 4, space = ppubus, region = "ntsc" }
+
+  # The audio half of the RP2A03: the same die as the CPU, so the same domain.
+  object apu "nes.apu" { clock = master / 12, region = "ntsc" }
+
   # The cartridge. `rom` names a media slot rather than a file: the machine
   # description says which slot, and whoever runs the machine binds the bytes
   # (`--cart smb.nes`). Nothing below host/ opens a file.
@@ -44,40 +63,37 @@ machine "nes-ntsc" {
 
   # -- the CPU bus -----------------------------------------------------------
   map cpubus 0x0000 size 0x2000 = mirror(wram)   # 2K, mirrored 4x
+  map cpubus 0x2000 size 0x2000 = ppu.regs       # 8 registers, mirrored x1024
+  map cpubus 0x4000 size 0x0014 = apu.channels   # $4000-$4013
+  map cpubus 0x4015 size 0x0001 = apu.status     # $4014 is OAM DMA, not the APU's
+  map cpubus 0x4017 size 0x0001 = apu.frame      # $4016 is the controller port
   map cpubus 0x8000 size 0x8000 = cart.prg       # NROM-128 repeats itself here
 
   # -- the PPU bus -----------------------------------------------------------
   map ppubus 0x0000 size 0x2000 = cart.chr       # the two pattern tables
+  map ppubus 0x2000 size 0x1000 = mirror(ciram)  # nametables — see below
+  map ppubus 0x3000 size 0x0f00 = mirror(ciram)  # and their $3000 mirror
 
-  # TODO(ppu, apu): the block below is what this file is still missing. Both
-  # classes exist and both publish regions and pins — `rsemu describe nes.ppu`
-  # will show you — so this is written against their real surface and is meant
-  # to be uncommented rather than rewritten.
+  # -- interrupts ------------------------------------------------------------
+  # Driven high when requested, not low: nets idle low and inverting the
+  # active-low /NMI pin would be a `wire.not` device's job (ROADMAP.md §4.3).
+  wire ppu.nmi -> cpu.nmi
+  # Wired-OR with the cartridge's IRQ when a mapper that has one turns up; the
+  # net carries per-source levels for exactly that reason.
+  wire apu.irq -> cpu.irq
+
+  # TODO(nametables): the two `mirror(ciram)` lines above are hard-coded
+  # **vertical** mirroring — CIRAM A10 = PPU A10, so $2000/$2800 are one screen
+  # and $2400/$2C00 the other. Real hardware decides it at the cartridge
+  # connector, and `nes.nrom` already knows which way: it reads the bit out of
+  # the iNES header and `Nrom::install` builds the right four 1 KiB aliases. It
+  # just publishes no `nametables` region for a `map` statement to name, so a
+  # described machine cannot ask it. Until it does, a horizontally-mirrored
+  # cartridge scrolls the wrong way across the seam. Everything else — the
+  # nametable writes, the fetches, the picture — is unaffected.
   #
-  #   object ppu "nes.ppu" { clock = master / 4, space = ppubus, region = "ntsc" }
-  #   object apu "nes.apu" { clock = master / 12, region = "ntsc" }
-  #
-  #   map cpubus 0x2000 size 0x2000 = ppu.regs      # 8 registers, mirrored x1024
-  #   map cpubus 0x4000 size 0x0014 = apu.channels  # $4000-$4013
-  #   map cpubus 0x4015 size 0x0001 = apu.status    # $4014 is OAM DMA, not the APU's
-  #   map cpubus 0x4017 size 0x0001 = apu.frame     # $4016 is the controller port
-  #
-  #   wire ppu.nmi  -> cpu.nmi
-  #   wire apu.irq  -> cpu.irq                      # wired-OR with the cartridge's
-  #
-  # What blocks it: the PPU and the APU are lazily advanced — they hold their
-  # own tick and are caught up by whoever reads them (ROADMAP.md §4.2) — and no
-  # class can yet *declare* that to the realizer, so a mapped PPU would never
-  # advance and $2002 would report VBlank clear forever. That is a worse machine
-  # than this one, where the open bus at least reads as ones. See
-  # `machine::catalog::bindings`.
-  #
-  # Two more devices do not exist at all yet: OAM DMA at $4014 (a CPU-side
-  # stall, not a PPU register) and the controller ports at $4016/$4017.
-  #
-  # Nametables are the cartridge's to publish, not this file's: which 1 KiB of
-  # CIRAM answers where is decided by how the board ties CIRAM A10, and that is
-  # a property of the cartridge in the slot rather than of the console. The
-  # console owns the 2 KiB, though, so the two have to meet somewhere the DSL
-  # can express — an unsolved piece of `nes.nrom`.
+  # TODO(dma, input): two devices do not exist at all yet. OAM DMA at $4014 is
+  # a CPU-side stall that copies a page into $2004, so sprites stay blank
+  # without it; the controller ports at $4016/$4017 read open bus, which most
+  # software reads as "no buttons held" rather than hanging.
 }

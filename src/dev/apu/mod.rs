@@ -94,13 +94,15 @@ use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKi
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
+use crate::core::sched::{AccessKind, LazyHandle};
 use crate::core::space::{
     AccessConstraints, MemAttrs, MemOps, MemResult, Region as MmioRegion, RegionRef,
 };
 use crate::core::state::{ChunkReader, ChunkWriter};
-use crate::core::sync::{AtomicU8, LockRank, Mutex, Ordering};
+use crate::core::sync::{AtomicU8, AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{Level, WireSource};
+use crate::machine::realize::{BindCtx, Instance};
 
 pub use dmc::{DmaKind, DmaRequest};
 pub use frame::{Mode, Region};
@@ -392,6 +394,17 @@ struct ApuState {
     /// and so a monitor can report it. The machine assembly layer will set it
     /// from `RealizeCtx` once that layer can hand out the forest.
     domain: Mutex<Option<DomainId>>,
+    /// The catch-up handle the machine layer attaches at realize time (§4.2).
+    ///
+    /// Its own leaf-ranked lock, read at the top of every guest access and
+    /// released before anything else is taken.
+    lazy: Mutex<Option<LazyHandle>>,
+    /// [`Core::ticks`], republished on every release of the core lock.
+    ///
+    /// The scheduler asks a lazily-advanced device where it is while holding
+    /// its slot at [`LockRank::LEAF`], the rank nothing nests under, so
+    /// [`Device::current_tick`] may not take a lock of its own.
+    ticks: AtomicU64,
     region: Region,
     halt_ultrasonic: bool,
 }
@@ -429,7 +442,11 @@ impl ApuState {
     }
 
     fn write(&self, index: u8, value: u8) {
-        self.core.lock().write(index, value);
+        {
+            let mut core = self.core.lock();
+            core.write(index, value);
+            self.publish(&core);
+        }
         self.refresh_irq();
     }
 
@@ -443,6 +460,32 @@ impl ApuState {
             self.refresh_irq();
         }
         value
+    }
+
+    /// Republish what the lock-free lazy surface reads.
+    fn publish(&self, core: &Core) {
+        self.ticks.store(core.ticks, Ordering::Relaxed);
+    }
+
+    /// Catch this chip up before an access is dispatched to it (§4.2).
+    ///
+    /// `$4015` is the register this exists for: the frame interrupt flag it
+    /// reports and clears is set at a known cycle, and a read that sampled a
+    /// stale APU would see the flag a whole quantum late.
+    ///
+    /// No lock of this device is held while the scheduler calls back into
+    /// [`Apu::advance_to`]. A debug access advances nothing (invariant 5).
+    fn sync(&self, attrs: MemAttrs) {
+        let handle = self.lazy.lock().clone();
+        let Some(handle) = handle else {
+            return;
+        };
+        let kind = if attrs.debug {
+            AccessKind::Debug
+        } else {
+            AccessKind::Guest
+        };
+        let _ = handle.sync(kind);
     }
 }
 
@@ -484,6 +527,8 @@ impl Apu {
             irq: Mutex::with_rank(LockRank::WIRE, None),
             open_bus: AtomicU8::new(0),
             domain: Mutex::with_rank(LockRank::LEAF, None),
+            lazy: Mutex::new(None),
+            ticks: AtomicU64::new(0),
             region,
             halt_ultrasonic,
         });
@@ -591,6 +636,7 @@ impl Apu {
             for _ in 0..cycles {
                 core.tick();
             }
+            self.state.publish(&core);
         }
         self.refresh_irq();
     }
@@ -606,8 +652,18 @@ impl Apu {
             while core.ticks < tick {
                 core.tick();
             }
+            self.state.publish(&core);
         }
         self.refresh_irq();
+    }
+
+    /// Connect the catch-up handle the register windows sync through (§4.2).
+    ///
+    /// The machine layer calls this from realize; a caller assembling a NES by
+    /// hand registers the chip with `Scheduler::add_lazy_device` and passes the
+    /// handle here.
+    pub fn attach_lazy(&self, handle: LazyHandle) {
+        *self.state.lazy.lock() = Some(handle);
     }
 
     // -- Registers ----------------------------------------------------------
@@ -791,6 +847,8 @@ impl MemOps for ApuPort {
         let index = self
             .index(offset)
             .ok_or(crate::core::error::BusError::BadAccess)?;
+        // First, and outside every lock this device owns.
+        self.state.sync(attrs);
         *byte = self.state.read_with(index, attrs.debug);
         Ok(())
     }
@@ -807,6 +865,7 @@ impl MemOps for ApuPort {
             // monitor has to go through the device's own API to say it meant it.
             return Ok(());
         }
+        self.state.sync(attrs);
         self.state.write(index, *value);
         Ok(())
     }
@@ -822,11 +881,10 @@ impl Device for Apu {
     }
 
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
-        // Nothing outward yet: the machine assembly layer that hands a device
-        // its address space, its clock domain and its wires is still being
-        // built (`core::mod` says so). Until it exists a board wires the APU up
-        // through `regions`, `connect_irq` and `advance_to`, which is exactly
-        // what realize will do once it can.
+        // Nothing outward. The APU maps no region of its own — a `map`
+        // statement names one of its three windows — drives its IRQ line only
+        // when a flag moves, and is handed its clock domain at bind time. The
+        // realize sweep announces the idle level through `announce`.
         Ok(())
     }
 
@@ -836,6 +894,9 @@ impl Device for Apu {
             let region = self.state.region;
             let halt = self.state.halt_ultrasonic;
             core.reset(kind, region, halt);
+            // A cold reset puts the cycle counter back to zero, and the
+            // lock-free copy of it is derived state.
+            self.state.publish(&core);
         }
         self.refresh_irq();
     }
@@ -845,7 +906,11 @@ impl Device for Apu {
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
-        self.state.core.lock().load(r)?;
+        {
+            let mut core = self.state.core.lock();
+            core.load(r)?;
+            self.state.publish(&core);
+        }
         self.refresh_irq();
         Ok(())
     }
@@ -892,6 +957,84 @@ impl Device for Apu {
             self.refresh_irq();
         }
     }
+
+    // -- lazily advanced (`ROADMAP.md` §4.2) ---------------------------------
+
+    /// Yes, for `$4015`: the frame interrupt flag it reports is set at a known
+    /// cycle and cleared by the read itself, so a stale APU reports it late and
+    /// clears one the CPU never saw.
+    fn is_lazy(&self) -> bool {
+        true
+    }
+
+    /// CPU cycles executed, read from the atomic rather than the core: the
+    /// scheduler asks this with its slot held at `LockRank::LEAF`.
+    fn current_tick(&self) -> u64 {
+        self.state.ticks.load(Ordering::Relaxed)
+    }
+
+    fn advance_to(&self, tick: u64) {
+        Apu::advance_to(self, tick);
+    }
+
+    /// None: the APU has no dot grid to stop on.
+    ///
+    /// Its frame counter does fire at four known cycles per sequence, and
+    /// naming them here would let a run loop stop the CPU on the cycle the
+    /// frame IRQ is raised rather than at the end of the quantum containing it.
+    /// That wants the counter's next step exposed from `frame.rs` as a plain
+    /// number, which it is not yet; until then catch-up runs to the present and
+    /// the IRQ lands at the granularity of whatever else bounds the quantum —
+    /// on a NES, the PPU's next scanline.
+    fn next_event_tick(&self) -> Option<u64> {
+        None
+    }
+
+    fn attach_lazy(&self, handle: LazyHandle) {
+        Apu::attach_lazy(self, handle);
+    }
+}
+
+/// The machine layer's half: the APU takes a clock domain and nothing else.
+///
+/// It has no address space of its own — it is not a bus master; the DMC's
+/// sample fetch is a CPU stall performed by the CPU (`ROADMAP.md` §4.4's
+/// `Initiator`, when `$4014`-style DMA lands) — so `bind` records the domain
+/// and stops.
+impl Instance for Apu {
+    fn bind(&self, ctx: &BindCtx<'_>) -> Result<()> {
+        if let Some(domain) = ctx.domain() {
+            self.attach_clock(domain);
+        }
+        Ok(())
+    }
+}
+
+/// Bind [`APU_CLASS`] into the machine graph.
+///
+/// # Errors
+///
+/// [`Error::Config`] if the class name is already bound.
+pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
+    bindings.bind(APU_CLASS.name, |props| Ok(Arc::new(Apu::new(props)?)))
+}
+
+/// What the validator should know about `nes.apu`.
+#[must_use]
+pub fn schema() -> crate::machine::validate::ClassSchema {
+    use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
+    let mut schema = ClassSchema::new(APU_CLASS.name)
+        .prop(PropSchema::new("region", ValueKind::Str).values(Region::NAMES))
+        .prop(PropSchema::new("sample-buffer", ValueKind::Uint))
+        .prop(PropSchema::new("halt-ultrasonic", ValueKind::Bool))
+        .prop(PropSchema::new("put-phase", ValueKind::Uint).range(0, 1))
+        .port(IRQ_PIN, PortDir::Out);
+    // Derived from the one window table, so a machine file and the validator
+    // can never disagree about which apertures exist.
+    for window in WINDOWS {
+        schema = schema.region(window.name);
+    }
+    schema
 }
 
 /// The properties [`APU_CLASS`] accepts.
