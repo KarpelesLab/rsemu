@@ -48,12 +48,31 @@
 
 use core::fmt;
 
+/// Which opcode map a part decodes with.
+///
+/// x86 generations are close to a superset chain, but the *primary* map is not
+/// quite one: the 80186 reclaimed sixteen encodings the 8086 left as aliases
+/// of the conditional jumps, `0F` stopped being `POP CS` and became the
+/// two-byte escape, and `C0`/`C1`/`C8`/`C9` stopped aliasing the `RET` forms.
+/// Those are real differences, not extensions, so they get their own map
+/// rather than being flattened into one (CLAUDE.md: "where a real difference
+/// is not a superset, model it honestly").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Gen {
+    /// The 8086/8088 map: no two-byte escape, sixteen jump aliases at
+    /// `60`-`6F`, `0F` is `POP CS`.
+    I8086,
+    /// The 80186-through-80486 map, plus the two-byte `0F` page.
+    I386,
+}
+
 /// How an operand is encoded, in the notation of Intel's opcode maps.
 ///
 /// The letter is the addressing method and the suffix is the operand size:
-/// `b` is a byte, `v` is a word (16 bits — this core has no 32-bit operand
-/// size). Keeping the manual's vocabulary means a row can be checked against
-/// the manual without translation.
+/// `b` is a byte, `w` is always sixteen bits, and `v` is "whatever the
+/// effective operand size is" — sixteen bits on an 8086 and on a 386 with no
+/// `66` prefix, thirty-two with one. Keeping the manual's vocabulary means a
+/// row can be checked against the manual without translation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Arg {
@@ -61,72 +80,96 @@ pub enum Arg {
     None,
     /// ModRM r/m, byte.
     Eb,
-    /// ModRM r/m, word.
+    /// ModRM r/m, operand size.
     Ev,
+    /// ModRM r/m, always sixteen bits (`LLDT`, `LTR`, `VERR`, `LAR`, `MOVZX`).
+    Ew,
     /// ModRM `reg`, byte register.
     Gb,
-    /// ModRM `reg`, word register.
+    /// ModRM `reg`, register at the operand size.
     Gv,
-    /// ModRM `reg`, segment register (only the low two bits are decoded — the
-    /// 8086 does not check the third, which is why `8C`/`8E` accept a `reg`
-    /// of 4-7 and alias down).
+    /// ModRM `reg`, always a sixteen-bit register (`ARPL`).
+    Gw,
+    /// ModRM `reg`, segment register. On an 8086 only the low two bits are
+    /// decoded, which is why `8C`/`8E` accept a `reg` of 4-7 and alias down;
+    /// a 386 decodes all three and rejects 6 and 7.
     Sw,
-    /// ModRM r/m as an *address*, never a register: `LEA`.
+    /// ModRM r/m as an *address*, never a register: `LEA`, `BOUND`, `INVLPG`.
     M,
     /// ModRM r/m as a far pointer in memory, `offset:segment`: `LES`, `LDS`,
-    /// and the indirect far `CALL`/`JMP`.
+    /// `LSS`, `LFS`, `LGS` and the indirect far `CALL`/`JMP`.
     Mp,
+    /// ModRM r/m as a pseudo-descriptor in memory, `limit16:base32`:
+    /// `LGDT`, `LIDT`, `SGDT`, `SIDT`.
+    Ms,
+    /// ModRM r/m constrained to a register, thirty-two bits: the other half of
+    /// `MOV CR0,r32`. The mode field is ignored — a 386 treats `mod` as `11`
+    /// whatever it holds.
+    Rd,
+    /// A control register named by the ModRM `reg` field.
+    Cd,
+    /// A debug register named by the ModRM `reg` field.
+    Dd,
+    /// A test register named by the ModRM `reg` field.
+    Td,
     /// Immediate byte.
     Ib,
-    /// Immediate word.
+    /// Immediate word, always sixteen bits (`ENTER`, `RET imm16`).
+    Iw,
+    /// Immediate at the operand size.
     Iv,
-    /// Immediate byte, sign-extended to a word (`83 /n`).
+    /// Immediate byte, sign-extended to the operand size (`83 /n`, `6A`).
     Ibs,
     /// Byte displacement relative to the end of the instruction.
     Jb,
-    /// Word displacement relative to the end of the instruction.
+    /// Displacement at the operand size, relative to the end of the
+    /// instruction.
     Jv,
-    /// Immediate far pointer, `offset:segment`, four bytes.
+    /// Immediate far pointer, `offset:segment` — four bytes with a sixteen-bit
+    /// operand size, six with a thirty-two-bit one.
     Ap,
-    /// Direct memory offset, byte (`A0`/`A2`) — a 16-bit offset with no ModRM.
+    /// Direct memory offset, byte (`A0`/`A2`) — the offset is at the *address*
+    /// size and there is no ModRM byte.
     Ob,
-    /// Direct memory offset, word (`A1`/`A3`).
+    /// Direct memory offset at the operand size (`A1`/`A3`).
     Ov,
     /// Byte register selected by the low three bits of the opcode.
     Rb,
-    /// Word register selected by the low three bits of the opcode.
+    /// Register at the operand size, selected by the low three bits of the
+    /// opcode.
     Rv,
-    /// Segment register selected by bits 3-4 of the opcode (`PUSH ES`, and the
-    /// segment-override prefixes).
+    /// Segment register selected by bits 3-5 of the opcode (`PUSH ES`, the
+    /// segment-override prefixes, and `0F A0` / `0F A8` for `FS` and `GS`).
     Sr,
     /// The literal 1, as the count of a single-bit shift.
     One,
     /// `CL`, as a shift count.
     Cl,
-    /// `DX`, as an I/O port number.
+    /// `DX`, as an I/O port number. Carries no operand width of its own: the
+    /// width of an `IN`/`OUT` comes from its accumulator operand.
     Dx,
     /// `AL`.
     Al,
-    /// `AX`.
+    /// The accumulator at the operand size: `AX` or `EAX`.
     Ax,
     /// String source `DS:SI`, byte.
     Xb,
-    /// String source `DS:SI`, word.
+    /// String source `DS:SI`, at the operand size.
     Xv,
     /// String destination `ES:DI`, byte.
     Yb,
-    /// String destination `ES:DI`, word.
+    /// String destination `ES:DI`, at the operand size.
     Yv,
 }
 
 impl Arg {
-    /// Whether this operand is one byte wide.
+    /// How wide this operand is, in bytes, given an effective operand size.
     ///
     /// `None` is neither, so the answer is an [`Option`]: an instruction whose
     /// operands are all `None` (`CBW`, `HLT`) has no operand width and asking
     /// for one is a decoder bug rather than a default.
     #[must_use]
-    pub const fn width_bytes(self) -> Option<u8> {
+    pub const fn width_bytes(self, osz: u8) -> Option<u8> {
         match self {
             Arg::Eb
             | Arg::Gb
@@ -139,20 +182,19 @@ impl Arg {
             | Arg::Jb
             | Arg::One
             | Arg::Cl => Some(1),
+            Arg::Ew | Arg::Gw | Arg::Iw | Arg::Sw | Arg::Sr => Some(2),
+            Arg::Cd | Arg::Dd | Arg::Td | Arg::Rd => Some(4),
             Arg::Ev
             | Arg::Gv
-            | Arg::Sw
             | Arg::Iv
             | Arg::Ibs
             | Arg::Ov
             | Arg::Rv
-            | Arg::Sr
             | Arg::Ax
             | Arg::Xv
             | Arg::Yv
-            | Arg::Jv
-            | Arg::Dx => Some(2),
-            Arg::None | Arg::M | Arg::Mp | Arg::Ap => None,
+            | Arg::Jv => Some(osz),
+            Arg::None | Arg::M | Arg::Mp | Arg::Ms | Arg::Ap | Arg::Dx => None,
         }
     }
 
@@ -161,17 +203,36 @@ impl Arg {
     pub const fn needs_modrm(self) -> bool {
         matches!(
             self,
-            Arg::Eb | Arg::Ev | Arg::Gb | Arg::Gv | Arg::Sw | Arg::M | Arg::Mp
+            Arg::Eb
+                | Arg::Ev
+                | Arg::Ew
+                | Arg::Gb
+                | Arg::Gv
+                | Arg::Gw
+                | Arg::Sw
+                | Arg::M
+                | Arg::Mp
+                | Arg::Ms
+                | Arg::Rd
+                | Arg::Cd
+                | Arg::Dd
+                | Arg::Td
         )
     }
 
-    /// How many immediate bytes follow the displacement for this operand.
+    /// How many immediate bytes follow the displacement for this operand,
+    /// given the effective operand and address sizes.
     #[must_use]
-    pub const fn immediate_bytes(self) -> u8 {
+    pub const fn immediate_bytes(self, osz: u8, asz: u8) -> u8 {
         match self {
             Arg::Ib | Arg::Ibs | Arg::Jb => 1,
-            Arg::Iv | Arg::Jv | Arg::Ob | Arg::Ov => 2,
-            Arg::Ap => 4,
+            Arg::Iw => 2,
+            Arg::Iv | Arg::Jv => osz,
+            // A `moffs` is an *address*, so it is the address size that
+            // decides how many bytes follow — `67 A1` reads a 32-bit offset
+            // even with a 16-bit operand size.
+            Arg::Ob | Arg::Ov => asz,
+            Arg::Ap => osz + 2,
             _ => 0,
         }
     }
@@ -239,6 +300,15 @@ pub enum Grp {
     Misc,
     /// `C6`/`C7`: `MOV` immediate. `reg` is ignored, exactly as in [`Grp::Pop`].
     MovImm,
+    /// `0F 00`: `SLDT`, `STR`, `LLDT`, `LTR`, `VERR`, `VERW`. The protection
+    /// group Intel numbers 6.
+    Grp6,
+    /// `0F 01`: `SGDT`, `SIDT`, `LGDT`, `LIDT`, `SMSW`, `LMSW`, `INVLPG` —
+    /// Intel's group 7.
+    Grp7,
+    /// `0F BA`: the bit-test group, `BT`/`BTS`/`BTR`/`BTC` with an immediate
+    /// bit number. Intel's group 8; extensions 0-3 are undefined.
+    Grp8,
 }
 
 /// Declare the operation enum, its mnemonics and its summaries in one list.
@@ -423,6 +493,70 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("XCHG", "xchg"),
     ("XLAT", "xlat"),
     ("XOR", "xor"),
+    // The 80186 through 80486 additions.
+    ("ARPL", "arpl"),
+    ("BOUND", "bound"),
+    ("BSF", "bsf"),
+    ("BSR", "bsr"),
+    ("BSWAP", "bswap"),
+    ("BT", "bt"),
+    ("BTC", "btc"),
+    ("BTR", "btr"),
+    ("BTS", "bts"),
+    ("CLTS", "clts"),
+    ("CMPXCHG", "cmpxchg"),
+    ("CPUID", "cpuid"),
+    ("ENTER", "enter"),
+    ("ICEBP", "icebp"),
+    ("INSB", "insb"),
+    ("INSW", "insw"),
+    ("INVD", "invd"),
+    ("INVLPG", "invlpg"),
+    ("LAR", "lar"),
+    ("LEAVE", "leave"),
+    ("LFS", "lfs"),
+    ("LGDT", "lgdt"),
+    ("LGS", "lgs"),
+    ("LIDT", "lidt"),
+    ("LLDT", "lldt"),
+    ("LMSW", "lmsw"),
+    ("LSL", "lsl"),
+    ("LSS", "lss"),
+    ("LTR", "ltr"),
+    ("MOVSX", "movsx"),
+    ("MOVZX", "movzx"),
+    ("OUTSB", "outsb"),
+    ("OUTSW", "outsw"),
+    ("POPA", "popa"),
+    ("PUSHA", "pusha"),
+    ("SETA", "seta"),
+    ("SETB", "setb"),
+    ("SETBE", "setbe"),
+    ("SETG", "setg"),
+    ("SETGE", "setge"),
+    ("SETL", "setl"),
+    ("SETLE", "setle"),
+    ("SETNB", "setnb"),
+    ("SETNO", "setno"),
+    ("SETNP", "setnp"),
+    ("SETNS", "setns"),
+    ("SETNZ", "setnz"),
+    ("SETO", "seto"),
+    ("SETP", "setp"),
+    ("SETS", "sets"),
+    ("SETZ", "setz"),
+    ("SGDT", "sgdt"),
+    ("SHLD", "shld"),
+    ("SHRD", "shrd"),
+    ("SIDT", "sidt"),
+    ("SLDT", "sldt"),
+    ("SMSW", "smsw"),
+    ("STR", "str"),
+    ("UD", "ud"),
+    ("VERR", "verr"),
+    ("VERW", "verw"),
+    ("WBINVD", "wbinvd"),
+    ("XADD", "xadd"),
 ];
 
 define_ops! {
@@ -529,6 +663,77 @@ define_ops! {
     XCHG = "exchange two operands",
     XLAT = "load AL from the table at DS:BX indexed by AL",
     XOR = "bitwise exclusive OR",
+
+    // ---- 80186 --------------------------------------------------------
+    BOUND = "check an array index against a pair of bounds, or raise #BR",
+    ENTER = "make a stack frame, copying the enclosing frames' pointers",
+    INSB = "read a byte from the port in DX to ES:DI",
+    INSW = "read a word or dword from the port in DX to ES:DI",
+    LEAVE = "unmake the stack frame ENTER made",
+    OUTSB = "write the byte at DS:SI to the port in DX",
+    OUTSW = "write the word or dword at DS:SI to the port in DX",
+    POPA = "pop the eight general registers, discarding the saved SP",
+    PUSHA = "push the eight general registers",
+
+    // ---- 80286: protection --------------------------------------------
+    ARPL = "raise a selector's requested privilege level to the caller's",
+    CLTS = "clear the task-switched flag in CR0",
+    LAR = "load a descriptor's access rights, if the selector is visible",
+    LGDT = "load the global descriptor table register",
+    LIDT = "load the interrupt descriptor table register",
+    LLDT = "load the local descriptor table register",
+    LMSW = "load the low sixteen bits of CR0 (the 286's machine status word)",
+    LSL = "load a descriptor's segment limit, if the selector is visible",
+    LTR = "load the task register",
+    SGDT = "store the global descriptor table register",
+    SIDT = "store the interrupt descriptor table register",
+    SLDT = "store the local descriptor table register's selector",
+    SMSW = "store the low sixteen bits of CR0",
+    STR = "store the task register's selector",
+    VERR = "set ZF if a segment is readable from the current privilege level",
+    VERW = "set ZF if a segment is writable from the current privilege level",
+
+    // ---- 80386 ---------------------------------------------------------
+    BSF = "scan for the least significant set bit",
+    BSR = "scan for the most significant set bit",
+    BT = "copy one bit of the operand into the carry flag",
+    BTC = "copy one bit into the carry flag and complement it",
+    BTR = "copy one bit into the carry flag and clear it",
+    BTS = "copy one bit into the carry flag and set it",
+    ICEBP = "undocumented: interrupt 1, the in-circuit emulator breakpoint",
+    LFS = "load a far pointer into FS and a register",
+    LGS = "load a far pointer into GS and a register",
+    LSS = "load a far pointer into SS and a register",
+    MOVSX = "move with sign extension",
+    MOVZX = "move with zero extension",
+    SETA = "set the operand to 1 if above (unsigned greater), else 0",
+    SETB = "set the operand to 1 if below (carry set), else 0",
+    SETBE = "set the operand to 1 if below or equal, else 0",
+    SETG = "set the operand to 1 if greater (signed), else 0",
+    SETGE = "set the operand to 1 if greater or equal (signed), else 0",
+    SETL = "set the operand to 1 if less (signed), else 0",
+    SETLE = "set the operand to 1 if less or equal (signed), else 0",
+    SETNB = "set the operand to 1 if not below (carry clear), else 0",
+    SETNO = "set the operand to 1 if the overflow flag is clear, else 0",
+    SETNP = "set the operand to 1 if parity odd, else 0",
+    SETNS = "set the operand to 1 if the sign flag is clear, else 0",
+    SETNZ = "set the operand to 1 if not equal, else 0",
+    SETO = "set the operand to 1 if the overflow flag is set, else 0",
+    SETP = "set the operand to 1 if parity even, else 0",
+    SETS = "set the operand to 1 if the sign flag is set, else 0",
+    SETZ = "set the operand to 1 if equal, else 0",
+    SHLD = "shift left, filling from a second operand",
+    SHRD = "shift right, filling from a second operand",
+    UD = "undefined encoding: raises an invalid-opcode exception",
+
+    // ---- 80486 ---------------------------------------------------------
+    BSWAP = "reverse the byte order of a 32-bit register",
+    CMPXCHG = "compare with the accumulator and exchange",
+    CPUID = "report the processor's identity and features",
+    INVD = "invalidate the caches without writing them back",
+    INVLPG = "invalidate one page's translation-lookaside-buffer entry",
+    WBINVD = "write the caches back and invalidate them",
+    XADD = "exchange, then add",
 }
 
 impl Op {
@@ -536,6 +741,37 @@ impl Op {
     #[must_use]
     pub const fn mnemonic(self) -> &'static str {
         MNEMONICS[self as usize]
+    }
+
+    /// The condition this operation tests, numbered as the opcode map numbers
+    /// them: 0 is overflow, 4 is zero, 12 is signed-less, and so on.
+    ///
+    /// One mapping serves the sixteen conditional jumps in both their short
+    /// (`70`+cc) and near (`0F 80`+cc) forms and the sixteen `SETcc`
+    /// encodings, which is the point — the condition is a property of the
+    /// operation, and evaluating it belongs in exactly one place.
+    #[must_use]
+    pub const fn condition_code(self) -> Option<u8> {
+        let cc = match self {
+            Op::JO | Op::SETO => 0,
+            Op::JNO | Op::SETNO => 1,
+            Op::JB | Op::SETB => 2,
+            Op::JNB | Op::SETNB => 3,
+            Op::JZ | Op::SETZ => 4,
+            Op::JNZ | Op::SETNZ => 5,
+            Op::JBE | Op::SETBE => 6,
+            Op::JA | Op::SETA => 7,
+            Op::JS | Op::SETS => 8,
+            Op::JNS | Op::SETNS => 9,
+            Op::JP | Op::SETP => 10,
+            Op::JNP | Op::SETNP => 11,
+            Op::JL | Op::SETL => 12,
+            Op::JGE | Op::SETGE => 13,
+            Op::JLE | Op::SETLE => 14,
+            Op::JG | Op::SETG => 15,
+            _ => return None,
+        };
+        Some(cc)
     }
 
     /// Whether this operation is a conditional jump, and therefore reads a
@@ -563,8 +799,17 @@ impl Op {
         )
     }
 
-    /// Whether this operation is one of the five string primitives, and so may
+    /// Whether this operation is a `SETcc`.
+    #[must_use]
+    pub const fn is_setcc(self) -> bool {
+        self.condition_code().is_some() && !self.is_conditional_jump()
+    }
+
+    /// Whether this operation is one of the string primitives, and so may
     /// carry a `REP` prefix.
+    ///
+    /// The 80186's `INS` and `OUTS` join the 8086's five: they move between a
+    /// port and `ES:DI` or `DS:SI` and take the same repeat prefix.
     #[must_use]
     pub const fn is_string(self) -> bool {
         matches!(
@@ -579,7 +824,18 @@ impl Op {
                 | Op::LODSW
                 | Op::SCASB
                 | Op::SCASW
+                | Op::INSB
+                | Op::INSW
+                | Op::OUTSB
+                | Op::OUTSW
         )
+    }
+
+    /// Whether a `REP` prefix on this operation stops on a flag as well as on
+    /// a zero count.
+    #[must_use]
+    pub const fn repeat_tests_zf(self) -> bool {
+        matches!(self, Op::CMPSB | Op::CMPSW | Op::SCASB | Op::SCASW)
     }
 
     /// Internal execution clocks, excluding every bus transfer.
@@ -634,6 +890,36 @@ impl Op {
             Op::IN | Op::OUT => 6,
             Op::ESC => 2,
             Op::HLT => 2,
+            // The 186-and-later additions. These are the 80386 manual's
+            // figures less their bus transfers, on the same principle as the
+            // 8086 rows above: a 386 runs everything else here in two to nine
+            // clocks, well inside the noise of a model that does not simulate
+            // the pipeline.
+            Op::PUSHA | Op::POPA => 18,
+            Op::ENTER => 10,
+            Op::LEAVE => 4,
+            Op::BOUND => 10,
+            Op::ARPL => 20,
+            Op::LAR | Op::LSL => 15,
+            Op::VERR | Op::VERW => 10,
+            Op::LGDT | Op::LIDT | Op::LLDT | Op::LTR => 11,
+            Op::SGDT | Op::SIDT | Op::SLDT | Op::STR | Op::SMSW => 2,
+            Op::LMSW => 10,
+            Op::CLTS => 5,
+            Op::BSF | Op::BSR => 10,
+            Op::BT => 3,
+            Op::BTS | Op::BTR | Op::BTC => 6,
+            Op::SHLD | Op::SHRD => 3,
+            Op::MOVZX | Op::MOVSX => 3,
+            Op::CPUID => 14,
+            Op::INVD | Op::WBINVD => 4,
+            Op::INVLPG => 12,
+            Op::CMPXCHG | Op::XADD => 6,
+            Op::BSWAP => 1,
+            Op::INSB | Op::INSW | Op::OUTSB | Op::OUTSW => 9,
+            // An undefined encoding costs nothing: it raises #UD instead of
+            // executing, and the exception sequence charges its own clocks.
+            Op::UD => 0,
             // Everything else is a two-to-four clock ALU or move operation;
             // the difference is inside the noise of a model that does not
             // simulate the prefetch queue's timing.
@@ -658,6 +944,11 @@ pub struct Insn {
     pub dst: Arg,
     /// The source operand, or [`Arg::None`].
     pub src: Arg,
+    /// The third operand, or [`Arg::None`].
+    ///
+    /// Four 386-era encodings need one: `IMUL r,r/m,imm`, `SHLD`/`SHRD` and
+    /// `ENTER`. Nothing on an 8086 does, which is why it defaults away.
+    pub aux: Arg,
     /// Which opcode-extension group this belongs to.
     pub group: Grp,
     /// How well documented the encoding is.
@@ -670,27 +961,38 @@ impl Insn {
             op,
             dst,
             src,
+            aux: Arg::None,
             group,
             class,
         }
     }
 
+    /// The same row with a third operand.
+    const fn with_aux(mut self, aux: Arg) -> Insn {
+        self.aux = aux;
+        self
+    }
+
     /// Whether decoding needs a ModRM byte.
     #[must_use]
     pub const fn needs_modrm(self) -> bool {
-        !matches!(self.group, Grp::None) || self.dst.needs_modrm() || self.src.needs_modrm()
+        !matches!(self.group, Grp::None)
+            || self.dst.needs_modrm()
+            || self.src.needs_modrm()
+            || self.aux.needs_modrm()
     }
 
-    /// The operand width in bytes, where the encoding fixes one.
+    /// The operand width in bytes, where the encoding fixes one, given an
+    /// effective operand size.
     ///
     /// Taken from the destination first and the source second, because
     /// `MOV Ev,Ibs`-shaped rows carry the width on the destination while
     /// `PUSH Ib`-shaped ones carry it on the source.
     #[must_use]
-    pub const fn width_bytes(self) -> Option<u8> {
-        match self.dst.width_bytes() {
+    pub const fn width_bytes(self, osz: u8) -> Option<u8> {
+        match self.dst.width_bytes(osz) {
             Some(w) => Some(w),
-            None => self.src.width_bytes(),
+            None => self.src.width_bytes(osz),
         }
     }
 
@@ -701,38 +1003,42 @@ impl Insn {
     }
 }
 
-/// Build [`TABLE`] and [`LISTED`] from one list of rows.
+/// The row an opcode map holds where nothing is assigned.
 ///
-/// Every one of the 256 encodings is written out; `LISTED` records which, so a
-/// test can prove the matrix is complete rather than trusting that it is.
-macro_rules! primary {
-    ($($opcode:literal $op:ident $dst:ident $src:ident $group:ident $class:ident;)*) => {
-        /// The primary decode table: one row per opcode byte, and — with the
-        /// group tables below — the only description of the instruction set in
-        /// the crate.
-        pub static TABLE: [Insn; 256] = {
-            // The array must be initialised before it can be indexed in a
-            // const block; every entry is then overwritten below, which
-            // `LISTED` proves.
-            let mut t =
-                [Insn::new(Op::NOP, Arg::None, Arg::None, Grp::None, Class::Undefined); 256];
-            $(t[$opcode as usize] =
-                Insn::new(Op::$op, Arg::$dst, Arg::$src, Grp::$group, Class::$class);)*
-            t
-        };
+/// On the 8086 map this should never survive: every one of the 256 encodings
+/// does *something* on that part, and `LISTED` proves each is written out. On
+/// the 386 maps it is the real answer for an unassigned encoding, which raises
+/// an invalid-opcode exception.
+const UNASSIGNED: Insn = Insn::new(Op::UD, Arg::None, Arg::None, Grp::None, Class::Undefined);
 
-        /// Which opcodes the table above actually assigns. Test scaffolding
-        /// with a real job: an unassigned entry would silently decode as a
-        /// plausible-looking `NOP`.
-        pub static LISTED: [bool; 256] = {
-            let mut t = [false; 256];
-            $(t[$opcode as usize] = true;)*
-            t
-        };
-    };
+/// Build one opcode map from a list of rows, together with the array recording
+/// which entries the list actually assigns.
+///
+/// Test scaffolding with a real job on the 8086 map, where an omission would
+/// silently decode as a plausible-looking undefined row rather than fail.
+/// Rows read `opcode mnemonic dst src [+aux] group class;` — the same order
+/// the instruction-set summary prints them in.
+macro_rules! opmap {
+    (
+        base $base:expr;
+        $($opcode:literal $op:ident $dst:ident $src:ident $(+ $aux:ident)? $group:ident $class:ident;)*
+    ) => {{
+        let mut t: [Insn; 256] = $base;
+        let mut listed = [false; 256];
+        $(
+            t[$opcode as usize] =
+                Insn::new(Op::$op, Arg::$dst, Arg::$src, Grp::$group, Class::$class)
+                $(.with_aux(Arg::$aux))?;
+            listed[$opcode as usize] = true;
+        )*
+        (t, listed)
+    }};
 }
 
-primary! {
+/// The 8086/8088 primary map and its coverage record, built together so the
+/// two cannot disagree.
+const PRIMARY_8086: ([Insn; 256], [bool; 256]) = opmap! {
+    base [UNASSIGNED; 256];
     0x00 ADD  Eb   Gb   None   Documented;
     0x01 ADD  Ev   Gv   None   Documented;
     0x02 ADD  Gb   Eb   None   Documented;
@@ -943,18 +1249,20 @@ primary! {
     0xbf MOV  Rv   Iv   None   Documented;
 
     // C0/C1 and C8/C9 are the near and far RET encodings again: bit 3 of the
-    // opcode is not decoded.
-    0xc0 RET  Iv   None None   Alias;
+    // opcode is not decoded. The immediate is `Iw` rather than `Iv` because
+    // the byte count `RET` adds to the stack pointer is sixteen bits on every
+    // part in the family, whatever the operand size is.
+    0xc0 RET  Iw   None None   Alias;
     0xc1 RET  None None None   Alias;
-    0xc2 RET  Iv   None None   Documented;
+    0xc2 RET  Iw   None None   Documented;
     0xc3 RET  None None None   Documented;
     0xc4 LES  Gv   Mp   None   Documented;
     0xc5 LDS  Gv   Mp   None   Documented;
     0xc6 MOV  Eb   Ib   MovImm Documented;
     0xc7 MOV  Ev   Iv   MovImm Documented;
-    0xc8 RETF Iv   None None   Alias;
+    0xc8 RETF Iw   None None   Alias;
     0xc9 RETF None None None   Alias;
-    0xca RETF Iv   None None   Documented;
+    0xca RETF Iw   None None   Documented;
     0xcb RETF None None None   Documented;
     0xcc INT3 None None None   Documented;
     0xcd INT  Ib   None None   Documented;
@@ -1012,7 +1320,178 @@ primary! {
     0xfd STD   None None None  Documented;
     0xfe INC   Eb   None IncDec Documented;
     0xff INC   Ev   None Misc   Documented;
-}
+};
+
+/// The 8086/8088 primary decode table: one row per opcode byte, and — with the
+/// group tables below — the only description of that part's instruction set in
+/// the crate.
+pub static TABLE: [Insn; 256] = PRIMARY_8086.0;
+
+/// Which opcodes [`TABLE`] actually assigns. All 256 of them: the 8086 has no
+/// invalid-opcode exception, so every encoding does something and every one is
+/// written out.
+pub static LISTED: [bool; 256] = PRIMARY_8086.1;
+
+/// The 80186-through-80486 primary map, as a delta on the 8086's.
+///
+/// Everything not listed here is unchanged from [`TABLE`] — which is the
+/// honest shape, because that is what the parts are: one map with sixteen
+/// encodings reclaimed, four aliases spent on new instructions, four prefixes
+/// added, and `0F` turned into an escape.
+const PRIMARY_386: ([Insn; 256], [bool; 256]) = opmap! {
+    base PRIMARY_8086.0;
+
+    // `POP CS` became the two-byte escape on the 80286. The row is a marker:
+    // `decode_stream` never executes it, it switches maps on seeing the byte.
+    0x0f ESC   None None None   Escape;
+
+    // 60-6F stopped aliasing the conditional jumps on the 80186.
+    0x60 PUSHA None None None   Documented;
+    0x61 POPA  None None None   Documented;
+    0x62 BOUND Gv   M    None   Documented;
+    0x63 ARPL  Ew   Gw   None   Documented;
+    0x64 SEG   None None None   Prefix;
+    0x65 SEG   None None None   Prefix;
+    0x66 SEG   None None None   Prefix;
+    0x67 SEG   None None None   Prefix;
+    0x68 PUSH  Iv   None None   Documented;
+    0x69 IMUL  Gv   Ev  +Iv     None   Documented;
+    0x6a PUSH  Ibs  None None   Documented;
+    0x6b IMUL  Gv   Ev  +Ibs    None   Documented;
+    0x6c INSB  Yb   Dx   None   Documented;
+    0x6d INSW  Yv   Dx   None   Documented;
+    0x6e OUTSB Dx   Xb   None   Documented;
+    0x6f OUTSW Dx   Xv   None   Documented;
+
+    // `MOV Sreg,r/m` reads sixteen bits whatever the operand size is, and a
+    // 386 decodes all three bits of `reg` rather than two.
+    0x8e MOV   Sw   Ew   None   Documented;
+
+    // The shift group gained an immediate count, and C8/C9 the frame
+    // instructions, so none of the four is an alias any more.
+    0xc0 ROL   Eb   Ib   Shift  Documented;
+    0xc1 ROL   Ev   Ib   Shift  Documented;
+    0xc8 ENTER Iw   Ib   None   Documented;
+    0xc9 LEAVE None None None   Documented;
+
+    // `F1` is the in-circuit-emulator breakpoint, interrupt 1. Undocumented
+    // by Intel, implemented by every part from the 386 on, and used by
+    // debuggers precisely because it is one byte and not `CC`.
+    0xf1 ICEBP None None None   Undocumented;
+};
+
+/// The 80186-through-80486 primary decode table.
+pub static TABLE_386: [Insn; 256] = PRIMARY_386.0;
+
+/// Which opcodes [`TABLE_386`] changes from the 8086's map. Not coverage —
+/// the 386 map inherits the rest — but a checkable statement of the delta.
+pub static CHANGED_386: [bool; 256] = PRIMARY_386.1;
+
+/// The two-byte (`0F`) opcode map.
+///
+/// Everything the 80286 and 80386 added that would not fit in the primary map:
+/// the protection instructions, the near conditional jumps, `SETcc`, the bit
+/// instructions, the double shifts, `MOVZX`/`MOVSX`, the control- and
+/// debug-register moves, and the 80486's cache and atomic additions.
+/// Unassigned rows are [`Op::UD`], which is the truth: on a 386 an unassigned
+/// two-byte encoding raises an invalid-opcode exception.
+const SECONDARY: ([Insn; 256], [bool; 256]) = opmap! {
+    base [UNASSIGNED; 256];
+
+    0x00 SLDT  Ew   None Grp6   Documented;
+    0x01 SGDT  Ms   None Grp7   Documented;
+    0x02 LAR   Gv   Ev   None   Documented;
+    0x03 LSL   Gv   Ev   None   Documented;
+    0x06 CLTS  None None None   Documented;
+    0x08 INVD  None None None   Documented;
+    0x09 WBINVD None None None  Documented;
+
+    0x20 MOV   Rd   Cd   None   Documented;
+    0x21 MOV   Rd   Dd   None   Documented;
+    0x22 MOV   Cd   Rd   None   Documented;
+    0x23 MOV   Dd   Rd   None   Documented;
+    0x24 MOV   Rd   Td   None   Documented;
+    0x26 MOV   Td   Rd   None   Documented;
+
+    0x80 JO    Jv   None None   Documented;
+    0x81 JNO   Jv   None None   Documented;
+    0x82 JB    Jv   None None   Documented;
+    0x83 JNB   Jv   None None   Documented;
+    0x84 JZ    Jv   None None   Documented;
+    0x85 JNZ   Jv   None None   Documented;
+    0x86 JBE   Jv   None None   Documented;
+    0x87 JA    Jv   None None   Documented;
+    0x88 JS    Jv   None None   Documented;
+    0x89 JNS   Jv   None None   Documented;
+    0x8a JP    Jv   None None   Documented;
+    0x8b JNP   Jv   None None   Documented;
+    0x8c JL    Jv   None None   Documented;
+    0x8d JGE   Jv   None None   Documented;
+    0x8e JLE   Jv   None None   Documented;
+    0x8f JG    Jv   None None   Documented;
+
+    0x90 SETO  Eb   None None   Documented;
+    0x91 SETNO Eb   None None   Documented;
+    0x92 SETB  Eb   None None   Documented;
+    0x93 SETNB Eb   None None   Documented;
+    0x94 SETZ  Eb   None None   Documented;
+    0x95 SETNZ Eb   None None   Documented;
+    0x96 SETBE Eb   None None   Documented;
+    0x97 SETA  Eb   None None   Documented;
+    0x98 SETS  Eb   None None   Documented;
+    0x99 SETNS Eb   None None   Documented;
+    0x9a SETP  Eb   None None   Documented;
+    0x9b SETNP Eb   None None   Documented;
+    0x9c SETL  Eb   None None   Documented;
+    0x9d SETGE Eb   None None   Documented;
+    0x9e SETLE Eb   None None   Documented;
+    0x9f SETG  Eb   None None   Documented;
+
+    0xa0 PUSH  Sr   None None   Documented;
+    0xa1 POP   Sr   None None   Documented;
+    0xa2 CPUID None None None   Documented;
+    0xa3 BT    Ev   Gv   None   Documented;
+    0xa4 SHLD  Ev   Gv  +Ib     None   Documented;
+    0xa5 SHLD  Ev   Gv  +Cl     None   Documented;
+    0xa8 PUSH  Sr   None None   Documented;
+    0xa9 POP   Sr   None None   Documented;
+    0xab BTS   Ev   Gv   None   Documented;
+    0xac SHRD  Ev   Gv  +Ib     None   Documented;
+    0xad SHRD  Ev   Gv  +Cl     None   Documented;
+    0xaf IMUL  Gv   Ev   None   Documented;
+
+    0xb0 CMPXCHG Eb Gb   None   Documented;
+    0xb1 CMPXCHG Ev Gv   None   Documented;
+    0xb2 LSS   Gv   Mp   None   Documented;
+    0xb3 BTR   Ev   Gv   None   Documented;
+    0xb4 LFS   Gv   Mp   None   Documented;
+    0xb5 LGS   Gv   Mp   None   Documented;
+    0xb6 MOVZX Gv   Eb   None   Documented;
+    0xb7 MOVZX Gv   Ew   None   Documented;
+    0xba BT    Ev   Ib   Grp8   Documented;
+    0xbb BTC   Ev   Gv   None   Documented;
+    0xbc BSF   Gv   Ev   None   Documented;
+    0xbd BSR   Gv   Ev   None   Documented;
+    0xbe MOVSX Gv   Eb   None   Documented;
+    0xbf MOVSX Gv   Ew   None   Documented;
+
+    0xc0 XADD  Eb   Gb   None   Documented;
+    0xc1 XADD  Ev   Gv   None   Documented;
+    0xc8 BSWAP Rv   None None   Documented;
+    0xc9 BSWAP Rv   None None   Documented;
+    0xca BSWAP Rv   None None   Documented;
+    0xcb BSWAP Rv   None None   Documented;
+    0xcc BSWAP Rv   None None   Documented;
+    0xcd BSWAP Rv   None None   Documented;
+    0xce BSWAP Rv   None None   Documented;
+    0xcf BSWAP Rv   None None   Documented;
+};
+
+/// The two-byte (`0F`) decode table.
+pub static TABLE_0F: [Insn; 256] = SECONDARY.0;
+
+/// Which two-byte encodings are assigned. The rest raise `#UD`.
+pub static LISTED_0F: [bool; 256] = SECONDARY.1;
 
 /// `80`-`83`: the ModRM `reg` field picks one of the eight ALU operations.
 ///
@@ -1110,7 +1589,66 @@ pub static GROUP_INCDEC: [Insn; 8] = [
     Insn::new(Op::PUSH, Arg::Ev, Arg::None, Grp::None, Class::Undefined),
 ];
 
-/// Decode one opcode byte.
+/// `FF` on a 386: extension 7 is not a second `PUSH` but an invalid encoding.
+static GROUP_MISC_386: [Insn; 8] = {
+    let mut t = GROUP_MISC;
+    t[7] = UNASSIGNED;
+    t
+};
+
+/// `FE` on a 386: only the byte increment and decrement are assigned.
+static GROUP_INCDEC_386: [Insn; 8] = {
+    let mut t = [UNASSIGNED; 8];
+    t[0] = GROUP_INCDEC[0];
+    t[1] = GROUP_INCDEC[1];
+    t
+};
+
+/// `0F 00`: Intel's group 6, the descriptor-table and segment-check
+/// instructions that do not need a memory pseudo-descriptor.
+///
+/// Every one of these takes an `r/m16` — a selector — whatever the operand
+/// size is. Extensions 6 and 7 are unassigned.
+pub static GROUP6: [Insn; 8] = [
+    Insn::new(Op::SLDT, Arg::Ew, Arg::None, Grp::None, Class::Documented),
+    Insn::new(Op::STR, Arg::Ew, Arg::None, Grp::None, Class::Documented),
+    Insn::new(Op::LLDT, Arg::Ew, Arg::None, Grp::None, Class::Documented),
+    Insn::new(Op::LTR, Arg::Ew, Arg::None, Grp::None, Class::Documented),
+    Insn::new(Op::VERR, Arg::Ew, Arg::None, Grp::None, Class::Documented),
+    Insn::new(Op::VERW, Arg::Ew, Arg::None, Grp::None, Class::Documented),
+    UNASSIGNED,
+    UNASSIGNED,
+];
+
+/// `0F 01`: Intel's group 7 — the descriptor table registers, the machine
+/// status word, and (on the 80486) `INVLPG`.
+pub static GROUP7: [Insn; 8] = [
+    Insn::new(Op::SGDT, Arg::Ms, Arg::None, Grp::None, Class::Documented),
+    Insn::new(Op::SIDT, Arg::Ms, Arg::None, Grp::None, Class::Documented),
+    Insn::new(Op::LGDT, Arg::Ms, Arg::None, Grp::None, Class::Documented),
+    Insn::new(Op::LIDT, Arg::Ms, Arg::None, Grp::None, Class::Documented),
+    Insn::new(Op::SMSW, Arg::Ew, Arg::None, Grp::None, Class::Documented),
+    UNASSIGNED,
+    Insn::new(Op::LMSW, Arg::Ew, Arg::None, Grp::None, Class::Documented),
+    Insn::new(Op::INVLPG, Arg::M, Arg::None, Grp::None, Class::Documented),
+];
+
+/// `0F BA`: Intel's group 8, the bit tests with an immediate bit number.
+///
+/// Extensions 0-3 are unassigned, which is why the group exists at all: the
+/// bit number would otherwise have nowhere to go.
+pub static GROUP8: [Insn; 8] = [
+    UNASSIGNED,
+    UNASSIGNED,
+    UNASSIGNED,
+    UNASSIGNED,
+    Insn::new(Op::BT, Arg::Ev, Arg::Ib, Grp::None, Class::Documented),
+    Insn::new(Op::BTS, Arg::Ev, Arg::Ib, Grp::None, Class::Documented),
+    Insn::new(Op::BTR, Arg::Ev, Arg::Ib, Grp::None, Class::Documented),
+    Insn::new(Op::BTC, Arg::Ev, Arg::Ib, Grp::None, Class::Documented),
+];
+
+/// Decode one primary-map opcode byte on the 8086.
 ///
 /// Total: all 256 encodings are described, prefixes and undocumented ones
 /// included, so decoding never fails. Rows whose [`Insn::group`] is not
@@ -1121,6 +1659,23 @@ pub const fn decode(opcode: u8) -> Insn {
     TABLE[opcode as usize]
 }
 
+/// Decode one primary-map opcode byte on the named generation.
+#[inline]
+#[must_use]
+pub const fn decode_as(map: Gen, opcode: u8) -> Insn {
+    match map {
+        Gen::I8086 => TABLE[opcode as usize],
+        Gen::I386 => TABLE_386[opcode as usize],
+    }
+}
+
+/// Decode one two-byte (`0F`-prefixed) opcode byte.
+#[inline]
+#[must_use]
+pub const fn decode_0f(opcode: u8) -> Insn {
+    TABLE_0F[opcode as usize]
+}
+
 /// Apply an opcode-extension group, given the ModRM `reg` field.
 ///
 /// A no-op for the great majority of encodings, which is why the interpreter
@@ -1128,26 +1683,62 @@ pub const fn decode(opcode: u8) -> Insn {
 #[inline]
 #[must_use]
 pub const fn resolve(insn: Insn, reg: u8) -> Insn {
-    let reg = (reg & 7) as usize;
+    resolve_as(Gen::I8086, insn, reg)
+}
+
+/// Apply an opcode-extension group on the named generation.
+///
+/// The generation matters for four groups. `8F` (`POP`) and `C6`/`C7` (`MOV`
+/// immediate) do not decode the extension at all on an 8086 — every value is
+/// the same instruction — while the 80386 Programmer's Reference Manual lists
+/// extensions 1-7 of both as invalid. `FE` and `FF` likewise lost the
+/// extensions the 8086 left to fall through the group decode.
+#[inline]
+#[must_use]
+pub const fn resolve_as(map: Gen, insn: Insn, reg: u8) -> Insn {
+    let idx = (reg & 7) as usize;
+    let strict = matches!(map, Gen::I386);
     match insn.group {
-        Grp::None | Grp::Pop | Grp::MovImm => insn,
+        Grp::None => insn,
+        Grp::Pop | Grp::MovImm => {
+            if strict && idx != 0 {
+                UNASSIGNED
+            } else {
+                insn
+            }
+        }
         Grp::Alu => Insn {
-            op: GROUP_ALU[reg],
+            op: GROUP_ALU[idx],
             ..insn
         },
         Grp::Shift => Insn {
-            op: GROUP_SHIFT[reg],
+            op: GROUP_SHIFT[idx],
             ..insn
         },
-        Grp::IncDec => GROUP_INCDEC[reg],
-        Grp::Unary => {
-            if matches!(insn.dst, Arg::Eb) {
-                GROUP_UNARY8[reg]
+        Grp::IncDec => {
+            if strict {
+                GROUP_INCDEC_386[idx]
             } else {
-                GROUP_UNARY16[reg]
+                GROUP_INCDEC[idx]
             }
         }
-        Grp::Misc => GROUP_MISC[reg],
+        Grp::Unary => {
+            if matches!(insn.dst, Arg::Eb) {
+                GROUP_UNARY8[idx]
+            } else {
+                GROUP_UNARY16[idx]
+            }
+        }
+        Grp::Misc => {
+            if strict {
+                GROUP_MISC_386[idx]
+            } else {
+                GROUP_MISC[idx]
+            }
+        }
+        Grp::Grp6 => GROUP6[idx],
+        Grp::Grp7 => GROUP7[idx],
+        Grp::Grp8 => GROUP8[idx],
     }
 }
 
@@ -1199,16 +1790,65 @@ pub mod seg {
     pub const SS: u8 = 2;
     /// Data segment.
     pub const DS: u8 = 3;
+    /// The 80386's first extra segment, with no implicit use at all.
+    pub const FS: u8 = 4;
+    /// The 80386's second extra segment.
+    pub const GS: u8 = 5;
+
+    /// How many segment registers the architecture has. Four on an 8086, six
+    /// from the 386 on.
+    pub const COUNT: usize = 6;
 
     /// The register's name, lower case.
     #[must_use]
     pub const fn name(sr: u8) -> &'static str {
-        match sr & 3 {
+        match sr {
             ES => "es",
             CS => "cs",
             SS => "ss",
-            _ => "ds",
+            DS => "ds",
+            FS => "fs",
+            _ => "gs",
         }
+    }
+}
+
+/// A decoded SIB (scale-index-base) byte.
+///
+/// The 80386 added it to make the addressing modes orthogonal: any register
+/// as a base, any register but `ESP` as an index, and a shift of 0-3 on the
+/// index. It appears only with a 32-bit address size and only when the ModRM
+/// `rm` field is 4, which is exactly the encoding the 16-bit modes spent on
+/// `[SI]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Sib {
+    /// The index's left shift, 0 to 3.
+    pub scale: u8,
+    /// The index register, or 4 for "no index" — `ESP` cannot be an index,
+    /// and that is the encoding spent on saying so.
+    pub index: u8,
+    /// The base register. A base of 5 with a ModRM mode of 0 means "no base,
+    /// a 32-bit displacement instead".
+    pub base: u8,
+}
+
+impl Sib {
+    /// Split a raw SIB byte.
+    #[inline]
+    #[must_use]
+    pub const fn new(byte: u8) -> Sib {
+        Sib {
+            scale: byte >> 6,
+            index: (byte >> 3) & 7,
+            base: byte & 7,
+        }
+    }
+
+    /// Whether this SIB contributes an index term at all.
+    #[inline]
+    #[must_use]
+    pub const fn has_index(self) -> bool {
+        self.index != 4
     }
 }
 
@@ -1216,7 +1856,9 @@ pub mod seg {
 ///
 /// The 8086 has no SIB byte and no 32-bit addressing: `rm` selects one of
 /// eight fixed register combinations, and `md` says how much displacement
-/// follows.
+/// follows. With a 32-bit address size the same three fields mean something
+/// else, which is why the two interpretations are separate methods rather
+/// than one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ModRm {
     /// The mode field, bits 6-7. `3` means the operand is a register.
@@ -1246,7 +1888,7 @@ impl ModRm {
         self.md == 3
     }
 
-    /// How many displacement bytes follow.
+    /// How many displacement bytes follow, with a **16-bit** address size.
     ///
     /// The `md == 0, rm == 6` case is the special one: there is no `[BP]` with
     /// no displacement, because that encoding was spent on the direct 16-bit
@@ -1262,7 +1904,8 @@ impl ModRm {
         }
     }
 
-    /// The segment the address defaults to, before any override.
+    /// The segment the address defaults to with a **16-bit** address size,
+    /// before any override.
     ///
     /// Stack segment whenever `BP` is one of the address terms, data segment
     /// otherwise — the rule that makes `[BP]` reach a local variable and
@@ -1273,6 +1916,49 @@ impl ModRm {
         match (self.md, self.rm) {
             (0, 6) => seg::DS,
             (_, 2 | 3 | 6) => seg::SS,
+            _ => seg::DS,
+        }
+    }
+
+    /// How many displacement bytes follow, with a **32-bit** address size.
+    ///
+    /// `md == 0, rm == 5` is the direct 32-bit address, the mirror of the
+    /// 16-bit `rm == 6` case; and a SIB whose base is 5 with `md == 0` says
+    /// the same thing about the base register.
+    #[must_use]
+    pub const fn disp_bytes32(self, sib: Option<Sib>) -> u8 {
+        match self.md {
+            1 => 1,
+            2 => 4,
+            0 => match (self.rm, sib) {
+                (5, _) => 4,
+                (4, Some(s)) if s.base == 5 => 4,
+                _ => 0,
+            },
+            _ => 0,
+        }
+    }
+
+    /// The segment the address defaults to with a **32-bit** address size.
+    ///
+    /// The rule moved with the addressing modes: it is the *base* register
+    /// that decides, and only `ESP` and `EBP` select `SS`. An index of `EBP`
+    /// does not — `[eax+ebp*4]` is in `DS`, which surprises people who learnt
+    /// the 16-bit rule.
+    #[must_use]
+    pub const fn default_segment32(self, sib: Option<Sib>) -> u8 {
+        match (self.md, self.rm, sib) {
+            // No base register at all: the two direct-address encodings.
+            (0, 5, _) => seg::DS,
+            (0, 4, Some(s)) if s.base == 5 => seg::DS,
+            (_, 4, Some(s)) => {
+                if s.base == 4 || s.base == 5 {
+                    seg::SS
+                } else {
+                    seg::DS
+                }
+            }
+            (_, 5, _) => seg::SS,
             _ => seg::DS,
         }
     }
@@ -1293,22 +1979,42 @@ pub enum Rep {
 /// disassembler, so the two cannot disagree about where an instruction ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fields {
+    /// Which opcode map this was decoded from.
+    pub map: Gen,
     /// The segment register a prefix selected, if any.
     pub seg_override: Option<u8>,
     /// The repeat prefix, if any.
     pub rep: Option<Rep>,
     /// Whether a `LOCK` prefix was seen.
     pub lock: bool,
-    /// The opcode byte, after all prefixes.
+    /// Whether the opcode came from the two-byte (`0F`) map.
+    pub two_byte: bool,
+    /// The effective operand size in bytes: 2 or 4.
+    ///
+    /// The segment's `D` bit picks the default and a `66` prefix flips it, so
+    /// this is already the answer rather than the prefix.
+    pub opsize: u8,
+    /// The effective address size in bytes: 2 or 4. `67` flips it.
+    pub addrsize: u8,
+    /// The opcode byte, after all prefixes and after the `0F` escape.
     pub opcode: u8,
-    /// The table row, already passed through [`resolve`].
+    /// The table row, already passed through [`resolve_as`].
     pub insn: Insn,
     /// The ModRM byte, where the encoding has one.
     pub modrm: Option<ModRm>,
-    /// The displacement, sign-extended to 16 bits.
-    pub disp: u16,
-    /// The immediate, or the far pointer's `offset | segment << 16`.
+    /// The SIB byte, where a 32-bit address form has one.
+    pub sib: Option<Sib>,
+    /// The displacement, sign-extended.
+    pub disp: i32,
+    /// The segment a memory operand defaults to, before any override — the
+    /// address size and the SIB base both feed into it, so it is decided here
+    /// rather than at every point of use.
+    pub mem_seg: u8,
+    /// The first immediate the encoding carries, or a far pointer's offset.
     pub imm: u32,
+    /// The second immediate — `ENTER`'s nesting level, or a far pointer's
+    /// segment. Zero when the encoding has only one.
+    pub imm2: u32,
     /// Total length in bytes, prefixes included.
     pub len: u8,
     /// Whether the stream ran out before the instruction was complete.
@@ -1324,11 +2030,22 @@ impl Fields {
         self.imm as u16
     }
 
+    /// The immediate masked to the effective operand size.
+    #[inline]
+    #[must_use]
+    pub const fn imm_sized(&self) -> u32 {
+        if self.opsize == 2 {
+            self.imm & 0xffff
+        } else {
+            self.imm
+        }
+    }
+
     /// The segment half of a far-pointer immediate (`Ap`).
     #[inline]
     #[must_use]
     pub const fn imm_seg(&self) -> u16 {
-        (self.imm >> 16) as u16
+        self.imm2 as u16
     }
 
     /// The segment this instruction's memory operand uses.
@@ -1338,6 +2055,30 @@ impl Fields {
         match self.seg_override {
             Some(sr) => sr,
             None => default,
+        }
+    }
+
+    /// The segment this instruction's ModRM memory operand actually uses,
+    /// override included.
+    #[inline]
+    #[must_use]
+    pub const fn mem_segment(&self) -> u8 {
+        self.segment(self.mem_seg)
+    }
+
+    /// Whether the r/m operand names a register rather than memory.
+    ///
+    /// True for the control-, debug- and test-register moves whatever their
+    /// mode field holds: a 386 ignores it there.
+    #[inline]
+    #[must_use]
+    pub const fn rm_is_register(&self) -> bool {
+        if matches!(self.insn.dst, Arg::Rd) || matches!(self.insn.src, Arg::Rd) {
+            return true;
+        }
+        match self.modrm {
+            Some(m) => m.is_register(),
+            None => false,
         }
     }
 }
@@ -1362,15 +2103,37 @@ pub const MAX_PREFIXES: u8 = 15;
 /// which is what the 8086 does because each prefix simply latches into the
 /// same field.
 pub fn decode_stream(next: &mut dyn FnMut() -> Option<u8>) -> Fields {
+    decode_stream_as(Gen::I8086, false, next)
+}
+
+/// Decode one instruction from a byte stream on the named generation.
+///
+/// `default32` is the code segment's `D` bit: it selects the *default*
+/// operand and address sizes, which the `66` and `67` prefixes then flip
+/// individually. On an 8086 it is meaningless and ignored — there is one size
+/// and no prefix to change it.
+///
+/// See [`decode_stream`] for what `next` and [`Fields::truncated`] mean.
+#[allow(clippy::too_many_lines)]
+pub fn decode_stream_as(map: Gen, default32: bool, next: &mut dyn FnMut() -> Option<u8>) -> Fields {
+    let wide = matches!(map, Gen::I386) && default32;
+    let base_size = if wide { 4 } else { 2 };
     let mut f = Fields {
+        map,
         seg_override: None,
         rep: None,
         lock: false,
+        two_byte: false,
+        opsize: base_size,
+        addrsize: base_size,
         opcode: 0x90,
-        insn: decode(0x90),
+        insn: decode_as(map, 0x90),
         modrm: None,
+        sib: None,
         disp: 0,
+        mem_seg: seg::DS,
         imm: 0,
+        imm2: 0,
         len: 0,
         truncated: false,
     };
@@ -1388,20 +2151,35 @@ pub fn decode_stream(next: &mut dyn FnMut() -> Option<u8>) -> Fields {
         }
     };
 
-    // Prefixes.
+    // Prefixes. They accumulate rather than replace: each one latches into
+    // its own field, so the last segment override wins and `66 66` is the
+    // same as one `66` — a toggle would be wrong, because the prefix selects
+    // "the non-default size" rather than inverting a bit.
     let mut prefixes = 0u8;
     let opcode = loop {
         let byte = take(&mut f);
         if f.truncated {
             return f;
         }
-        let row = decode(byte);
+        let row = decode_as(map, byte);
         if !row.is_prefix() || prefixes >= MAX_PREFIXES {
             break byte;
         }
         prefixes += 1;
         match row.op {
-            Op::SEG => f.seg_override = Some((byte >> 3) & 3),
+            // The prefix byte itself names the register: `(byte >> 3) & 7`
+            // works for `26`/`2E`/`36`/`3E` but collides for `64` and `65`,
+            // whose bit 3 is part of the opcode rather than the field.
+            Op::SEG => match byte {
+                0x26 => f.seg_override = Some(seg::ES),
+                0x2e => f.seg_override = Some(seg::CS),
+                0x36 => f.seg_override = Some(seg::SS),
+                0x3e => f.seg_override = Some(seg::DS),
+                0x64 => f.seg_override = Some(seg::FS),
+                0x65 => f.seg_override = Some(seg::GS),
+                0x66 => f.opsize = if wide { 2 } else { 4 },
+                _ => f.addrsize = if wide { 2 } else { 4 },
+            },
             Op::LOCK => f.lock = true,
             Op::REP => f.rep = Some(Rep::While),
             Op::REPNE => f.rep = Some(Rep::WhileNot),
@@ -1410,43 +2188,127 @@ pub fn decode_stream(next: &mut dyn FnMut() -> Option<u8>) -> Fields {
         }
     };
 
-    f.opcode = opcode;
-    let mut insn = decode(opcode);
+    // `0F` is `POP CS` on an 8086 and the escape to the second map from the
+    // 80286 on, which is why the generation has to be known before the byte
+    // can be looked up at all.
+    let mut insn;
+    if matches!(map, Gen::I386) && opcode == 0x0f {
+        f.two_byte = true;
+        let second = take(&mut f);
+        if f.truncated {
+            return f;
+        }
+        f.opcode = second;
+        insn = decode_0f(second);
+    } else {
+        f.opcode = opcode;
+        insn = decode_as(map, opcode);
+    }
 
     if insn.needs_modrm() {
         let byte = take(&mut f);
         let modrm = ModRm::new(byte);
         f.modrm = Some(modrm);
-        insn = resolve(insn, modrm.reg);
-        let n = modrm.disp_bytes();
-        if n > 0 {
-            let lo = take(&mut f);
-            f.disp = if n == 1 {
-                // An 8-bit displacement is signed, and it is added in 16-bit
-                // arithmetic, so it is sign-extended here rather than at the
-                // point of use.
-                lo as i8 as u16
-            } else {
-                let hi = take(&mut f);
-                u16::from(lo) | (u16::from(hi) << 8)
-            };
+        insn = resolve_as(map, insn, modrm.reg);
+        // The control-, debug- and test-register moves ignore the mode field
+        // entirely: there is no memory form, so there is no displacement
+        // however the two top bits are encoded.
+        let register_only = matches!(insn.dst, Arg::Rd | Arg::Cd | Arg::Dd | Arg::Td)
+            || matches!(insn.src, Arg::Rd);
+        if register_only {
+            f.mem_seg = seg::DS;
+        } else if f.addrsize == 2 {
+            f.mem_seg = modrm.default_segment();
+            match modrm.disp_bytes() {
+                1 => {
+                    // An 8-bit displacement is signed, and it is added in the
+                    // address size's arithmetic, so it is sign-extended here
+                    // rather than at every point of use.
+                    let lo = take(&mut f);
+                    f.disp = i32::from(lo as i8);
+                }
+                2 => {
+                    let lo = take(&mut f);
+                    let hi = take(&mut f);
+                    let value = u16::from(lo) | (u16::from(hi) << 8);
+                    // Sign-extended as a 16-bit quantity: the displacement is
+                    // added modulo 65536, so `0xfffe` really is minus two.
+                    f.disp = i32::from(value as i16);
+                }
+                _ => {}
+            }
+        } else {
+            if !modrm.is_register() && modrm.rm == 4 {
+                let byte = take(&mut f);
+                f.sib = Some(Sib::new(byte));
+            }
+            f.mem_seg = modrm.default_segment32(f.sib);
+            match modrm.disp_bytes32(f.sib) {
+                1 => {
+                    let lo = take(&mut f);
+                    f.disp = i32::from(lo as i8);
+                }
+                4 => {
+                    let mut value = 0u32;
+                    for i in 0..4 {
+                        let byte = take(&mut f);
+                        value |= u32::from(byte) << (8 * i);
+                    }
+                    f.disp = value as i32;
+                }
+                _ => {}
+            }
         }
+    } else if matches!(insn.dst, Arg::Ob | Arg::Ov) || matches!(insn.src, Arg::Ob | Arg::Ov) {
+        // The direct-offset moves have no ModRM byte; their address is the
+        // immediate, and it is always in the data segment unless overridden.
+        f.mem_seg = seg::DS;
     }
     f.insn = insn;
 
-    let imm_bytes = insn.dst.immediate_bytes() + insn.src.immediate_bytes();
-    let mut imm: u32 = 0;
-    for i in 0..imm_bytes {
-        let byte = take(&mut f);
-        imm |= u32::from(byte) << (8 * u32::from(i));
+    let osz = f.opsize;
+    let asz = f.addrsize;
+    let mut read = |f: &mut Fields, n: u8| -> u32 {
+        let mut value = 0u32;
+        for i in 0..n {
+            let byte = take(f);
+            value |= u32::from(byte) << (8 * u32::from(i));
+        }
+        value
+    };
+    let mut slot = 0u8;
+    for arg in [insn.dst, insn.src, insn.aux] {
+        if arg == Arg::Ap {
+            // A far-pointer immediate is an offset at the operand size
+            // followed by a two-byte selector, not one number.
+            let offset = read(&mut f, osz);
+            let selector = read(&mut f, 2);
+            f.imm = offset;
+            f.imm2 = selector;
+            slot = 2;
+            continue;
+        }
+        let n = arg.immediate_bytes(osz, asz);
+        if n == 0 {
+            continue;
+        }
+        let mut value = read(&mut f, n);
+        // `83 /n`, `6A`, and every short relative branch sign-extend their
+        // byte before use; doing it here keeps every consumer from repeating
+        // the cast, and makes a backward jump come out as an addition.
+        if matches!(arg, Arg::Ibs | Arg::Jb) {
+            value = (value as u8 as i8) as u32;
+        } else if arg == Arg::Jv && osz == 2 {
+            value &= 0xffff;
+        }
+        if slot == 0 {
+            f.imm = value;
+            slot = 1;
+        } else {
+            f.imm2 = value;
+            slot = 2;
+        }
     }
-    // `83 /n` and every short relative branch sign-extend their byte to a
-    // word before use; doing it here keeps every consumer from repeating the
-    // cast, and makes a backward jump come out as an addition.
-    if insn.src == Arg::Ibs || insn.dst == Arg::Ibs || insn.dst == Arg::Jb {
-        imm = u32::from(imm as u8 as i8 as u16);
-    }
-    f.imm = imm;
     f
 }
 
@@ -1494,10 +2356,15 @@ mod tests {
         // feature. The group tables count as reachable.
         let reachable = |op: Op| {
             TABLE.iter().any(|i| i.op == op)
+                || TABLE_386.iter().any(|i| i.op == op)
+                || TABLE_0F.iter().any(|i| i.op == op)
                 || GROUP_ALU.contains(&op)
                 || GROUP_SHIFT.contains(&op)
                 || GROUP_UNARY8.iter().any(|i| i.op == op)
                 || GROUP_MISC.iter().any(|i| i.op == op)
+                || GROUP6.iter().any(|i| i.op == op)
+                || GROUP7.iter().any(|i| i.op == op)
+                || GROUP8.iter().any(|i| i.op == op)
         };
         for op in Op::ALL {
             assert!(reachable(*op), "{op:?} is declared but unreachable");
@@ -1546,12 +2413,16 @@ mod tests {
 
     #[test]
     fn operand_widths_follow_the_encoding() {
-        assert_eq!(decode(0x00).width_bytes(), Some(1));
-        assert_eq!(decode(0x01).width_bytes(), Some(2));
-        assert_eq!(decode(0xa4).width_bytes(), Some(1)); // movsb
-        assert_eq!(decode(0xa5).width_bytes(), Some(2)); // movsw
-        assert_eq!(decode(0x83).width_bytes(), Some(2)); // Ev,Ibs
-        assert_eq!(decode(0xf4).width_bytes(), None); // hlt
+        assert_eq!(decode(0x00).width_bytes(2), Some(1));
+        assert_eq!(decode(0x01).width_bytes(2), Some(2));
+        assert_eq!(decode(0xa4).width_bytes(2), Some(1)); // movsb
+        assert_eq!(decode(0xa5).width_bytes(2), Some(2)); // movsw
+        assert_eq!(decode(0x83).width_bytes(2), Some(2)); // Ev,Ibs
+        assert_eq!(decode(0xf4).width_bytes(2), None); // hlt
+        // The same rows with a 32-bit operand size.
+        assert_eq!(decode(0x01).width_bytes(4), Some(4));
+        assert_eq!(decode(0xa5).width_bytes(4), Some(4));
+        assert_eq!(decode(0x00).width_bytes(4), Some(1));
     }
 
     #[test]
@@ -1615,7 +2486,7 @@ mod tests {
     fn displacements_are_sign_extended_at_decode_time() {
         // add [bp-1], al — the 8-bit displacement is signed.
         let f = decode_bytes(&[0x00, 0x46, 0xff]);
-        assert_eq!(f.disp, 0xffff);
+        assert_eq!(f.disp, -1);
         // 83 /0 ib likewise sign-extends its immediate to a word.
         let f = decode_bytes(&[0x83, 0xc0, 0xfe]);
         assert_eq!(f.imm16(), 0xfffe);

@@ -264,11 +264,18 @@ dev-gb = []
 # a machine that is not NES-shaped, on the same core. Adds no dependencies.
 machine-gameboy = ["cpu-sm83", "dev-gb"]
 
-# The Intel 8086/8088 core (src/cpu/x86): a real-mode interpreter with every
-# documented and undocumented encoding, segment:offset addressing that wraps at
-# 1 MiB, a separate I/O address space, the prefetch queue, and a disassembler
-# generated from the same table. Gated against SingleStepTests/8088, a corpus
-# captured from real silicon. Adds no dependencies and is `no_std + alloc`.
+# The Intel x86 core (src/cpu/x86): one interpreter covering the 8086, the
+# 8088, the 80386 and the 80486, chosen by a construction property rather than
+# a build flag. Real mode with every documented and undocumented 8086 encoding
+# and the segment:offset wrap at 1 MiB; and, on the 32-bit parts, protected
+# mode with the descriptor tables and the hidden descriptor caches, privilege
+# levels, call/interrupt/trap/task gates, the task state segment and task
+# switching, two-level paging with a translation-lookaside buffer and page
+# faults, the full exception model including the double fault, the two-byte
+# `0F` opcode page, and CPUID. A separate I/O address space, the prefetch
+# queue, and a disassembler generated from the same tables. Gated against
+# SingleStepTests/8088 — a corpus captured from real silicon — run both as an
+# 8088 and as a 386. Adds no dependencies and is `no_std + alloc`.
 cpu-x86 = []
 
 # The chips an IBM PC/AT-class board is built from (src/dev/pc): two 8259A

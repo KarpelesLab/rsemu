@@ -26,7 +26,7 @@ something a person can actually run (§2).
 > to two of the six sanctioned sites (`core::sync`'s `single` backend and the
 > wasm C ABI).
 >
-> **Eight CPU cores.** Where a public corpus exists the number is measured, not
+> **Nine CPU cores.** Where a public corpus exists the number is measured, not
 > asserted: MOS 6502 **2,560,000/2,560,000** with full bus traces, W65C02S
 > **2,530,025/2,540,000**, Z80 **1,604,000/1,604,000** plus `zexall` 67/67,
 > RISC-V RV64GC **409/409**, 8086/8088 **2,974,160/3,007,000** (the gap is one
@@ -36,6 +36,17 @@ something a person can actually run (§2).
 > is differentially tested against our own ARMv5TE across all 65,536 halfwords,
 > 83,597 identical and 13,683 divergences *asserted* rather than skipped; SM83
 > runs blargg and mooneye.
+>
+> The x86 core now also covers the **80386 and 80486** — protected mode, the
+> descriptor tables and their hidden caches, privilege levels, gates, task
+> switching, two-level paging and the full exception model — selected by a
+> construction property rather than a build flag. There is no hardware corpus
+> for a 386, so the 8088's is replayed on one at **2,650,981/3,007,000**, with
+> every disagreement traced to a documented difference between the parts and an
+> opcode failing outside that list failing the test. A real PC firmware image
+> resets from `0xfffffff0`, enters protected mode and runs a hundred million
+> 32-bit instructions with no unexpected exception, stopping only where it waits
+> on a timer no machine has supplied yet.
 >
 > **Six machines that run**, plus a seventh that does not yet. `nes-ntsc` and
 > `nes-pal` — AccuracyCoin boots, raises NMI and draws its menu; `gameboy`;
