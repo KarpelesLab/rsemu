@@ -11,9 +11,9 @@
 # next event so the NMI lands on the dot that raised it rather than whenever the
 # CPU next happens to read $2002.
 #
-# So are OAM DMA, the controller port and cartridge-driven nametable mirroring.
-# One gap is left and it is named at the bottom: the CPU halt OAM DMA should
-# cost.
+# So are the DMA unit, the controller port and cartridge-driven nametable
+# mirroring. The DMA unit drives /RDY, so a sprite copy or a DMC sample fetch
+# really does halt the CPU and take the bus a cycle at a time.
 
 machine "nes-ntsc" {
   # One crystal, so every domain below is exactly related to every other: the
@@ -38,6 +38,9 @@ machine "nes-ntsc" {
     clock  = master / 12
     space  = cpubus
     engine = "interp"
+    # The DMA unit drives /RDY: a sprite copy or a DMC sample fetch halts this
+    # core mid-instruction and takes the bus for a cycle at a time.
+    rdy    = dma
     # The Ricoh RP2A03 is a 6502 with the BCD adder removed. The D flag still
     # exists and SED/CLD/PHP still see it; ADC and SBC ignore it.
     decimal = false
@@ -61,16 +64,17 @@ machine "nes-ntsc" {
   # through (src/dev/nes/input.rs); the default is what a front end opens.
   object ports "nes.ports" { pads = "nes-pads" }
 
-  # The sprite DMA unit. It masters the CPU bus — a write to $4014 reads 256
-  # bytes and writes each to $2004 — so it declares the space it drives, the
-  # same way the PPU declares the one it fetches through.
-  object dma "nes.oamdma" { space = cpubus }
+  # The RP2A03's DMA unit — both of them, because the die has one arbiter. A
+  # write to $4014 copies 256 bytes into OAM through $2004; the DMC's sample
+  # fetch shares the same /RDY line, the same get/put cadence and the same
+  # precedence rule, so it is declared here rather than modelled twice.
+  object dma "nes.oamdma" { space = cpubus, dmc = apu }
 
   # -- the CPU bus -----------------------------------------------------------
   map cpubus 0x0000 size 0x2000 = mirror(wram)   # 2K, mirrored 4x
   map cpubus 0x2000 size 0x2000 = ppu.regs       # 8 registers, mirrored x1024
   map cpubus 0x4000 size 0x0014 = apu.channels   # $4000-$4013
-  map cpubus 0x4014 size 0x0001 = dma.port       # sprite DMA, not the APU's
+  map cpubus 0x4014 size 0x0001 = dma.port       # OAM DMA, not an APU register
   map cpubus 0x4015 size 0x0001 = apu.status
   map cpubus 0x4016 size 0x0001 = ports.port1    # controller 1
   # $4017 is two registers on one address: the APU frame counter on a write and
@@ -98,11 +102,4 @@ machine "nes-ntsc" {
   # net carries per-source levels for exactly that reason.
   wire apu.irq -> cpu.irq
 
-  # TODO(dma): the *transfer* at $4014 is complete — 256 bytes read and written
-  # through this bus, so OAM ends up correct and OAMADDR advances the way the
-  # hardware makes it. What is missing is the **CPU halt**: 513 cycles, 514 if
-  # the write lands on an odd cycle. Stalling the core needs a seam `cpu.mos6502`
-  # does not have (real hardware pulls /RDY low), so `nes.oamdma` records what it
-  # is owed in `OamDma::stall_owed` and nothing drains it. Sprites are right;
-  # anything timing a DMA is 513 cycles fast.
 }

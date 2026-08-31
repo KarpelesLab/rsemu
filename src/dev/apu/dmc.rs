@@ -68,6 +68,8 @@ pub struct DmaRequest {
     pub addr: u16,
     /// Identifies this request for the lifetime of the machine.
     pub serial: u64,
+    /// The CPU cycle the fetch was scheduled on.
+    pub at: u64,
 }
 
 /// A scheduled but unserviced fetch.
@@ -75,6 +77,13 @@ pub struct DmaRequest {
 struct Pending {
     kind: DmaKind,
     serial: u64,
+    /// The CPU cycle the fetch was scheduled on.
+    ///
+    /// The DMA unit needs it: a *load* fetch does not halt the CPU until the
+    /// get cycle of the second APU cycle after the write that scheduled it —
+    /// the third or fourth CPU cycle, depending on the phase the write landed
+    /// on (NESdev wiki, "DMA").
+    at: u64,
 }
 
 /// The delta modulation channel: memory reader, sample buffer, timer, output
@@ -234,12 +243,12 @@ impl Dmc {
     /// has not yet performed. Setting it restarts the sample only if the
     /// counter is already zero, and schedules a *load* fetch if the buffer is
     /// empty.
-    pub fn set_enabled(&mut self, enabled: bool) {
+    pub fn set_enabled(&mut self, enabled: bool, now: u64) {
         if enabled {
             if self.bytes_remaining == 0 {
                 self.restart();
             }
-            self.schedule(DmaKind::Load);
+            self.schedule(DmaKind::Load, now);
         } else {
             self.bytes_remaining = 0;
             self.dma = None;
@@ -250,11 +259,12 @@ impl Dmc {
     ///
     /// The wiki's condition verbatim: any time the sample buffer is empty and
     /// bytes remaining is not zero.
-    fn schedule(&mut self, kind: DmaKind) {
+    fn schedule(&mut self, kind: DmaKind, now: u64) {
         if self.dma.is_none() && self.buffer.is_none() && self.bytes_remaining > 0 {
             self.dma = Some(Pending {
                 kind,
                 serial: self.next_serial,
+                at: now,
             });
             self.next_serial = self.next_serial.wrapping_add(1);
         }
@@ -266,6 +276,7 @@ impl Dmc {
             kind: p.kind,
             addr: self.cur_addr,
             serial: p.serial,
+            at: p.at,
         })
     }
 
@@ -305,17 +316,17 @@ impl Dmc {
     }
 
     /// Clock the timer. Called once per APU cycle.
-    pub fn tick_timer(&mut self) {
+    pub fn tick_timer(&mut self, now: u64) {
         if self.timer == 0 {
             self.timer = self.reload();
-            self.clock_output();
+            self.clock_output(now);
         } else {
             self.timer -= 1;
         }
     }
 
     /// One output-unit clock: adjust the level, shift, count the bit.
-    fn clock_output(&mut self) {
+    fn clock_output(&mut self, now: u64) {
         if !self.silence {
             if self.shift & 1 != 0 {
                 if self.output <= 125 {
@@ -338,7 +349,7 @@ impl Dmc {
             }
             // Emptying the buffer is exactly the condition that schedules the
             // next fetch, and it is a reload rather than a load.
-            self.schedule(DmaKind::Reload);
+            self.schedule(DmaKind::Reload, now);
         }
     }
 
@@ -395,7 +406,10 @@ impl Dmc {
                 w.write_u64(0)?;
             }
         }
-        w.write_u64(self.next_serial)
+        w.write_u64(self.next_serial)?;
+        // Appended: the cycle a pending fetch was scheduled on, which decides
+        // the phase it may halt the CPU on.
+        w.write_u64(self.dma.map_or(0, |p| p.at))
     }
 
     /// Restore what [`Dmc::save`] wrote.
@@ -418,18 +432,24 @@ impl Dmc {
         self.irq = r.read_bool()?;
         let kind = r.read_u8()?;
         let serial = r.read_u64()?;
+        self.next_serial = r.read_u64()?;
+        // v2 appended the cycle a pending fetch was scheduled on. A v1 chunk
+        // has no such field; zero is the right restore, because a fetch whose
+        // schedule cycle is already past halts on the next legal phase.
+        let at = r.read_u64().unwrap_or(0);
         self.dma = match kind {
             1 => Some(Pending {
                 kind: DmaKind::Load,
                 serial,
+                at,
             }),
             2 => Some(Pending {
                 kind: DmaKind::Reload,
                 serial,
+                at,
             }),
             _ => None,
         };
-        self.next_serial = r.read_u64()?;
         Ok(())
     }
 }

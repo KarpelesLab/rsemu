@@ -220,7 +220,7 @@ impl Core {
             self.pulse1.tick_timer();
             self.pulse2.tick_timer();
             self.noise.tick_timer();
-            self.dmc.tick_timer();
+            self.dmc.tick_timer(now);
             let sample = self.mix();
             self.samples.push(sample);
         }
@@ -281,7 +281,7 @@ impl Core {
             reg::DMC_LOAD => self.dmc.write_output(value),
             reg::DMC_ADDR => self.dmc.write_address(value),
             reg::DMC_LEN => self.dmc.write_length(value),
-            reg::STATUS => self.write_status(value),
+            reg::STATUS => self.write_status(value, self.ticks),
             reg::FRAME => self.frame.write(value, self.on_put_cycle()),
             // $4009, $400D and $4014/$4016 are not APU registers. The first two
             // are unimplemented on the chip; the last two belong to the PPU's
@@ -291,13 +291,13 @@ impl Core {
     }
 
     /// `$4015` write: `---D NT21`.
-    fn write_status(&mut self, value: u8) {
+    fn write_status(&mut self, value: u8, now: u64) {
         self.pulse1.length.set_enabled(value & 0x01 != 0);
         self.pulse2.length.set_enabled(value & 0x02 != 0);
         self.triangle.length.set_enabled(value & 0x04 != 0);
         self.noise.length.set_enabled(value & 0x08 != 0);
         self.dmc.clear_irq();
-        self.dmc.set_enabled(value & 0x10 != 0);
+        self.dmc.set_enabled(value & 0x10 != 0, now);
     }
 
     /// `$4015` read: `IF-D NT21`, with bit 5 from the open bus.
@@ -338,7 +338,7 @@ impl Core {
                 // A reset is documented as a $4015 write of $00 plus a handful
                 // of chip-specific effects; $4017 is left alone
                 // (NESdev CPU power up state).
-                self.write_status(0x00);
+                self.write_status(0x00, self.ticks);
                 self.frame.reset_warm();
                 self.dmc.reset_warm();
                 self.triangle.reset_phase();
@@ -858,9 +858,70 @@ impl MemOps for ApuPort {
     }
 }
 
+/// The name a DMA unit asks [`Device::interface`] for to reach the DMC.
+pub const DMC_FETCH: &str = "nes.dmc-fetch";
+
+/// The DMC's sample fetch, as the chip's cycle-stealing DMA unit sees it.
+///
+/// The DMC and the OAM DMA unit are the same arbiter on the RP2A03 die: one
+/// `/RDY` line, one get/put cadence, one precedence rule between them. So the
+/// unit that runs OAM DMA runs this too, and it reaches the channel through
+/// here rather than by owning it. Handed over by
+/// [`Device::interface`]`(`[`DMC_FETCH`]`)`.
+#[derive(Debug)]
+pub struct DmcFetch {
+    state: Arc<ApuState>,
+}
+
+impl DmcFetch {
+    /// Catch the APU up to the cycle the arbiter is standing on.
+    ///
+    /// Called once per CPU cycle from inside the arbiter, which runs inside the
+    /// core's own cycle loop — so the core's published position is live and the
+    /// APU lands on exactly this cycle (`core::sched::TickCursor`).
+    pub fn sync(&self) {
+        self.state.sync(MemAttrs::DEFAULT);
+    }
+
+    /// The fetch the DMC wants, if it wants one.
+    #[must_use]
+    pub fn request(&self) -> Option<DmaRequest> {
+        self.state.core.lock().dmc.dma_request()
+    }
+
+    /// Whether the request identified by `serial` is still outstanding.
+    ///
+    /// False once playback has stopped, which is how an arbiter that has
+    /// already halted the CPU learns it is servicing an aborted DMA.
+    #[must_use]
+    pub fn is_pending(&self, serial: u64) -> bool {
+        self.state.core.lock().dmc.dma_is_pending(serial)
+    }
+
+    /// Hand the DMC the byte the arbiter fetched.
+    ///
+    /// Returns false if the request was withdrawn before the get cycle, in
+    /// which case nothing changed and the byte is discarded.
+    pub fn complete(&self, serial: u64, byte: u8) -> bool {
+        let accepted = self.state.core.lock().dmc.dma_complete(serial, byte);
+        if accepted {
+            self.state.refresh_irq();
+        }
+        accepted
+    }
+}
+
 impl Device for Apu {
     fn class(&self) -> &'static DeviceClass {
         &APU_CLASS
+    }
+
+    fn interface(&self, name: &str) -> Option<Arc<dyn core::any::Any + Send + Sync>> {
+        (name == DMC_FETCH).then(|| {
+            Arc::new(DmcFetch {
+                state: Arc::clone(&self.state),
+            }) as Arc<dyn core::any::Any + Send + Sync>
+        })
     }
 
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {

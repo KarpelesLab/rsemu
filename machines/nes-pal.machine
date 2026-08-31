@@ -27,6 +27,9 @@ machine "nes-pal" {
     clock  = master / 16
     space  = cpubus
     engine = "interp"
+    # The DMA unit drives /RDY: a sprite copy or a DMC sample fetch halts this
+    # core mid-instruction and takes the bus for a cycle at a time.
+    rdy    = dma
     decimal = false
   }
 
@@ -40,7 +43,11 @@ machine "nes-pal" {
 
   object cart "nes.nrom" { rom = "cart" }
   object ports "nes.ports" { pads = "nes-pads" }
-  object dma "nes.oamdma" { space = cpubus }
+  # The RP2A03's DMA unit — both of them, because the die has one arbiter. A
+  # write to $4014 copies 256 bytes into OAM through $2004; the DMC's sample
+  # fetch shares the same /RDY line, the same get/put cadence and the same
+  # precedence rule, so it is declared here rather than modelled twice.
+  object dma "nes.oamdma" { space = cpubus, dmc = apu }
 
   # -- the CPU bus -----------------------------------------------------------
   map cpubus 0x0000 size 0x2000 = mirror(wram)

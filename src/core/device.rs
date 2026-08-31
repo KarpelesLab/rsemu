@@ -31,6 +31,7 @@ use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::any::Any;
 use core::fmt;
 
 use crate::core::error::{Error, Result};
@@ -244,6 +245,24 @@ pub trait Device: Send + Sync + fmt::Debug {
     /// mutability.
     fn run(&self, _budget: Budget) -> Consumed {
         Consumed::default()
+    }
+
+    /// A named seam onto this device, for a link the other three cannot carry.
+    ///
+    /// Nearly every connection between two devices is a **region**, a **wire**
+    /// or a **clock domain**, and those stay the way to do it. A few are none
+    /// of the three: the RP2A03's DMC hands its sample fetch to the same
+    /// cycle-stealing arbiter that runs OAM DMA, and neither an address nor a
+    /// level can express "fetch this byte and give it back to me".
+    ///
+    /// So a device may publish a named handle, and a sibling that the machine
+    /// file linked to it asks for the name it understands and downcasts. The
+    /// name is the contract: it belongs to the pair, not to the core, and a
+    /// device that does not recognise it answers `None`. `Any` rather than a
+    /// trait object because `core::device` must not learn what a DMC is.
+    fn interface(&self, name: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+        let _ = name;
+        None
     }
 
     /// This device's `/RDY`-style arbiter, if it has one to offer.

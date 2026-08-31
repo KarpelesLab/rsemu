@@ -19,7 +19,7 @@
 #     they can never appear here.
 #
 # ---------------------------------------------------------------------------
-# Measured 2026-08-31 against the pinned ROM: 91 of 141 pass, 50 fail.
+# Measured 2026-08-31 against the pinned ROM: 101 of 141 pass, 40 fail.
 # ---------------------------------------------------------------------------
 #
 # The earlier "81 of 125" was measured through a stale copy of the ROM's
@@ -36,9 +36,16 @@
 #
 # Five causes account for all 44:
 #
-#   A. No /RDY on cpu.mos6502, so no DMA can halt the CPU.
-#   B. No DMC DMA at all — the APU's sample fetch is a CPU-side stall that
-#      needs (A) first.
+#   A. [FIXED] No /RDY on cpu.mos6502. `core::device::CycleGate` is the seam;
+#      `nes.oamdma` is now the RP2A03's whole DMA unit and drives it, so a
+#      sprite copy really halts the core for 513 or 514 cycles and the halt and
+#      alignment cycles repeat the core's own read on the bus where devices can
+#      see it. That alone closed ten tests, four of them on the sprite page:
+#      every "Clockslide" the ROM writes is calibrated against the stall.
+#   B. DMC DMA exists now — the same unit runs it, on the halt/dummy/alignment
+#      /get shape the wiki documents — but its *phase* is not right yet: the
+#      ROM reports "the DMA occurred on the wrong CPU cycle" rather than "there
+#      is no DMA", which is a different and much smaller problem.
 #   C. [FIXED] No CPU-side open-bus data latch. `unassigned = open-bus` really
 #      is open bus now: `MemAttrs::bus` carries the master's last driven byte,
 #      the space answers an unmapped read with it, and `$4014`, `$4016`/`$4017`
@@ -83,14 +90,8 @@
 
 6c                # $046C "DMA + Open Bus" code 1: LDA $4000 reads back $00
                   # rather than floating. Needs (C) as well as the DMC DMA.
-4c                # $044C "DMA + $2007 Read" code 2: the DMC DMA was on the
-                  # wrong cycle, or its halt cycles did not read $2007.
-4f                # $044F "DMA + $2007 Write" code 1: its own prerequisite,
-                  # $044C above, did not pass.
 5d                # $045D "DMA + $4015 Read" code 2: the halt cycles did not
                   # read $4015 and so did not clear the frame IRQ flag.
-5e                # $045E "DMA + $4016 Read" code 1: the halt cycles did not
-                  # read $4016, so the controller was not clocked by the DMA.
 6b                # $046B "DMC DMA Bus Conflicts" code 2: no DMC DMA, so no bus
                   # conflict with the APU registers to emulate.
 77                # $0477 "DMC DMA + OAM DMA" code 1: DMC DMA timing. There is
@@ -139,9 +140,6 @@
 55                # $0455 "NMI at VBlank end" code 1: the NMI was disabled too
                   # early or occurred too late.
 56                # $0456 "NMI disabled at VBlank" code 1: as above.
-57                # $0457 "Sprite 0 Hit behavior" code E: the hit flag was set
-                  # too early. Codes 1 through D — every behavioural case,
-                  # masks, edges and transparency — pass; only the dot is wrong.
 
 # ---------------------------------------------------------------------------
 # D2. PPU sprite-evaluation quirks not modelled
@@ -151,12 +149,6 @@
 # $2004 that the engine does not implement yet. Each is a piece of work in
 # src/dev/ppu, not a seam.
 
-58                # $0458 "Arbitrary Sprite zero" code 2: the first sprite
-                  # *processed* on a scanline is the one that can produce a
-                  # sprite-zero hit, not OAM entry 0.
-5a                # $045A "Misaligned OAM behavior" code 1: a non-zero OAMADDR
-                  # at the start of a scanline must stay misaligned through
-                  # evaluation and still be able to hit.
 5b                # $045B "Address $2004 behavior" code 4: a read of $2004
                   # during dots 1-64 of a visible scanline with rendering on
                   # must return $FF, because secondary OAM is being cleared.
@@ -204,16 +196,8 @@
 88                # $0488 "DMA + $2002 Read" code 2: the DMC DMA's halt and
                   # alignment cycles must read $2002. Cause (A)/(B): no /RDY,
                   # no DMC DMA.
-86                # $0486 "Rendering Flag Behavior" code 2: what $2002 bit 6 and
-                  # the rendering enable do across the pre-render line, at dot
-                  # resolution. Cause (D).
-8a                # $048A "$2007 read w/ rendering" code 2: a $2007 read while
-                  # rendering does the two-increment v bump instead of the
-                  # buffered read. Not modelled.
 8d                # $048D "$2002 flag timing" code 1: the sprite-0/overflow
                   # flags must clear on an exact dot. Cause (D).
-89                # $0489 "Suddenly Resize Sprite" code 2: changing $2000 sprite
-                  # height mid-scanline, which the evaluator does not see.
 80                # $0480 "INC $4014" code 1: a read-modify-write on $4014 does
                   # the write twice and so starts two OAM DMAs. Cause (A).
 83                # $0483 "Stale BG Shift Registers" code 3: the background
@@ -223,8 +207,6 @@
                   # eight sprite shifters.
 87                # $0487 "BG Serial In" code 2: the serial input to the
                   # background shifters. Same missing pipeline.
-84                # $0484 "Sprites On Scanline 0" code 2: sprite evaluation on
-                  # the first visible scanline. Cause (D2).
 8c                # $048C "$2004 Stress Test" code 2: $2004 accesses on every
                   # dot of a rendered scanline. Needs (D) and (D2).
 8e                # $048E "$2007 Stress Test" code 2: the same for $2007 and the
