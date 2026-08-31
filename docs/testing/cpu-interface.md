@@ -3,7 +3,8 @@
 The conformance harness was written before the core existed, against the
 smallest interface that can drive all three suites. This page is the contract in
 prose; [`tests/conformance/cpu.rs`](../../tests/conformance/cpu.rs) is the same
-thing in Rust, and it is the file to edit when the core lands.
+thing in Rust, and its `adapter` module is where `rsemu::cpu::mos6502` is bound
+to it.
 
 Four methods, one of them optional. Nothing a runner can work out for itself —
 elapsed cycles, instruction bytes, disassembly text — is in the trait.
@@ -123,24 +124,48 @@ is shared between them, so `Send` is enough — `Sync` is not required.
 
 ## Wiring it up
 
-`new_cpu` currently reads:
-
-```rust
-pub(crate) fn new_cpu(variant: Variant) -> Option<Box<dyn Cpu6502>> {
-    let _ = variant;
-    None
-}
-```
-
-Replace it with a `Some(Box::new(Adapter::new(variant)))` and put a small
-`Adapter` in the same file forwarding the four methods. Nothing else in the
-harness changes.
+`new_cpu` is bound to `rsemu::cpu::mos6502` under `#[cfg(feature =
+"cpu-mos6502")]`; the adapter is the `adapter` module in the same file.
 
 The adapter stays in the test tree on purpose. The shape the corpus wants — a
 `&mut dyn Bus6502` and a whole instruction per call — is a *testing* shape, not
-the shape the scheduler will drive the core with. Putting it in `src/` would be
+the shape the scheduler drives the core with. Putting it in `src/` would be
 letting the tests design the core, which is how a core ends up with an API that
 only its tests use.
+
+Bridging the two shapes is not four forwarding calls, and the reason is a
+lifetime. The core reaches memory through an `AddressSpace` built from
+`Arc<dyn MemOps>` — shared, `Send + Sync`, `'static` — while the runner hands
+over a `&mut dyn Bus6502` that lives for one `step`. There is no safe way to
+put that borrow inside the `'static` `Arc`, and `unsafe` is not available: the
+six sanctioned sites are listed in `CLAUDE.md` and a test harness is not one of
+them. So the borrow stays where it is and the *core* moves — it runs on its own
+thread, and every access it makes becomes a message the calling thread services
+against the borrowed bus. One channel round trip per read; writes ride the
+channel's ordering and need no reply.
+
+Two consequences worth knowing:
+
+* **`set_regs` really does have to discard microarchitectural state.** One core
+  serves all 10 000 vectors of an opcode file, so the `JAM` in the first vector
+  of `02.json` freezes it for the other 9 999 unless the adapter clears the
+  halt. A jammed 6502 is cleared by exactly one thing, and it is not a method
+  call, so the adapter runs a real reset sequence with the proxy detached.
+* **The power-on reset is consumed at start-up**, the same way, so the core is
+  at a genuine instruction boundary with nothing pending before the first
+  vector — which is what `set_regs` promises and what the corpus assumes.
+
+## Skips that are allowed to be skips
+
+A suite may skip because the gate is closed, because the corpus was not
+fetched, or because this build does not include the component. It may **not**
+skip because the harness was never wired up: `cpu::require_cpu` and
+`machine::require_nes` assert in that case, and
+`every_seam_this_build_can_bind_is_bound` fails on a plain `cargo test
+--all-features` without any corpus at all. `nestest` spent months reporting
+`SKIP … no 6502 core is bound in tests/conformance/cpu.rs` — green, and
+measuring nothing — which is the failure mode that rule exists to make
+impossible.
 
 ## Checking your work before the real core exists
 

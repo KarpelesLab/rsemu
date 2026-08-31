@@ -199,6 +199,39 @@ impl Cpu6502 for LyingCycleCount {
     }
 }
 
+/// A flat 64 KiB of RAM with no trace and no guards.
+///
+/// The other direction from the mocks above: a real bus for a real core,
+/// small enough that the seam check in `main.rs` can prove a bound adapter
+/// actually executes an instruction without dragging in a corpus.
+#[derive(Debug)]
+pub(crate) struct RamBus {
+    mem: Vec<u8>,
+}
+
+impl RamBus {
+    /// A zeroed bus with `bytes` poked into it.
+    pub(crate) fn with(bytes: &[(u16, u8)]) -> RamBus {
+        let mut bus = RamBus {
+            mem: vec![0; 0x1_0000],
+        };
+        for &(addr, value) in bytes {
+            bus.mem[usize::from(addr)] = value;
+        }
+        bus
+    }
+}
+
+impl Bus6502 for RamBus {
+    fn read(&mut self, addr: u16) -> u8 {
+        self.mem[usize::from(addr)]
+    }
+
+    fn write(&mut self, addr: u16, value: u8) {
+        self.mem[usize::from(addr)] = value;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

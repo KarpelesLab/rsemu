@@ -125,6 +125,17 @@ pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 /// Why a suite did not run. Every arm is a skip, never a failure.
+///
+/// **There is deliberately no arm for "the harness was never wired up."** That
+/// was the shape `nestest` hid in for months: `SKIP nestest: no 6502 core is
+/// bound in tests/conformance/cpu.rs`, printed next to a genuine
+/// missing-corpus skip, indistinguishable from it at a glance, and green.
+/// A skip may only ever mean something about the *environment* — the gate is
+/// closed, the corpus was not fetched, this build does not include the
+/// component. A seam that a build does contain the component for and still
+/// cannot bind is a defect in `tests/conformance/`, and the functions that
+/// bind seams assert rather than returning a `Skip` (`cpu::require_cpu`,
+/// `machine::require_nes`).
 #[derive(Debug)]
 pub(crate) enum Skip {
     /// The gate env var is not set.
@@ -136,10 +147,18 @@ pub(crate) enum Skip {
         /// The command that would fetch it.
         fetch: &'static str,
     },
-    /// The corpus is present but no CPU core exists to drive it.
-    NoCpu,
-    /// The corpus is present but no NES machine exists to run it.
-    NoMachine,
+    /// The component the suite needs is not compiled into this build.
+    ///
+    /// A fact about the feature set, not about the harness: `cargo test` with
+    /// default features links no 6502 and no NES, and a suite that needs one
+    /// has nothing to measure. `--all-features` — which CI runs — makes this
+    /// arm unreachable, so it can never hide an unwired seam.
+    NotBuilt {
+        /// What is missing, in prose.
+        component: &'static str,
+        /// The Cargo features that would supply it, as `--features` takes them.
+        feature: &'static str,
+    },
 }
 
 impl Skip {
@@ -153,13 +172,9 @@ impl Skip {
                 println!("SKIP {suite}: corpus not found at {}", path.display());
                 println!("      fetch it with: {fetch}");
             }
-            Skip::NoCpu => {
-                println!("SKIP {suite}: no 6502 core is bound in tests/conformance/cpu.rs");
-                println!("      see docs/testing/cpu-interface.md");
-            }
-            Skip::NoMachine => {
-                println!("SKIP {suite}: no NES machine is bound in tests/conformance/machine.rs");
-                println!("      see docs/testing/accuracycoin.md");
+            Skip::NotBuilt { component, feature } => {
+                println!("SKIP {suite}: this build cannot provide {component}");
+                println!("      rebuild with: cargo test --features {feature}");
             }
         }
     }
