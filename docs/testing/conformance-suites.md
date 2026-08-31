@@ -49,6 +49,9 @@ anything**; this table records a point in time.
 | [Ben Eater's Wozmon port](https://eater.net/6502) (`wozmon.s`, `wozmon.bin`) | The same monitor on a 65C51 ACIA | **CC-BY** ✅ — eater.net/6502 releases all video code under Creative Commons Attribution | Yes, **with attribution**: credit Ben Eater, name the licence, note any modification |
 | [AccuracyCoin](https://github.com/100thCoin/AccuracyCoin) | 141 NES accuracy tests on one NROM cart, with per-test error codes | **MIT** ✅ (© 2025 Chris Siebert — verified upstream; the copy in `../gones` predates the licence file) | Yes, with attribution |
 | `zexall` / `zexdoc` | Z80 exerciser | Verify before use ⚠️ | Verify first |
+| [ZEXALL-SMS](https://www.smspower.org/Homebrew/ZEXALL-SMS) | The same exerciser on a Master System, reporting through the SDSC debug console at `$FC`/`$FD` — the only SMS test ROM that reports as *text* rather than by drawing | **GPL-2.0** ⛔ (the licence file ships inside the archive) | **No.** Download and run only |
+| [SMS VDP Test](https://www.smspower.org/Homebrew/SMSVDPTest-SMS) (FluBBa) | Master System VDP registers, latches, collision, interrupt timing | No licence file ⛔ | **No** — and not automatable either: it reports on screen only, with no documented pass/fail location |
+| [SMS Test Suite](https://github.com/sverx/SMSTestSuite) (sverx) | Master System video patterns, pads, paddle, BIOS checksums | No licence file ⛔ | **No** — and it needs buttons pressed, so it is a manual suite |
 
 The MIT-licensed SingleStepTests corpora are the ones we could legitimately
 vendor — and they are also the most valuable, since they test at bus-cycle

@@ -149,6 +149,35 @@ pub static GAMEBOY: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/gameboy.machine"),
 };
 
+/// The NTSC Master System, when this build has a Z80 and the console's chips.
+///
+/// The other half of phase 4's genericity proof (`ROADMAP.md` §13): a Z80 with
+/// a **separate I/O address space**, a VDP and control pads that live in it
+/// rather than in memory, and one address that is the sound chip on a write and
+/// the VDP's counters on a read.
+#[cfg(feature = "machine-sms")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-sms")))]
+pub static SMS_NTSC: CatalogEntry = CatalogEntry {
+    name: "sms-ntsc",
+    summary: "Sega Master System (NTSC): Z80 at 3.58 MHz, 315-5124 VDP, SN76489, 262 lines",
+    media: &["cart"],
+    source: include_str!("../../machines/sms-ntsc.machine"),
+};
+
+/// The PAL Master System.
+///
+/// A second file rather than a parameter, for the same reason `nes-pal` is: the
+/// region changes the oscillator *and* the frame — 313 lines against 262 — and
+/// `ROADMAP.md` §4.2 makes that part of the machine's identity.
+#[cfg(feature = "machine-sms")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-sms")))]
+pub static SMS_PAL: CatalogEntry = CatalogEntry {
+    name: "sms-pal",
+    summary: "Sega Master System (PAL): Z80 at 3.55 MHz, 315-5246 VDP, SN76489, 313 lines",
+    media: &["cart"],
+    source: include_str!("../../machines/sms-pal.machine"),
+};
+
 /// The `spi-panel` board, when this build has a hart, the SPI bus and the
 /// display devices.
 ///
@@ -259,6 +288,10 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&NES_PAL);
     #[cfg(feature = "machine-riscv-virt")]
     out.push(&RISCV_VIRT);
+    #[cfg(feature = "machine-sms")]
+    out.push(&SMS_NTSC);
+    #[cfg(feature = "machine-sms")]
+    out.push(&SMS_PAL);
     #[cfg(feature = "machine-spi-panel")]
     out.push(&SPI_PANEL);
     #[cfg(feature = "machine-z80-mini")]
@@ -289,6 +322,8 @@ pub fn registry() -> Result<Registry> {
     crate::cpu::sm83::register(&mut reg)?;
     #[cfg(feature = "dev-gb")]
     crate::dev::gb::register(&mut reg)?;
+    #[cfg(feature = "dev-sms")]
+    crate::dev::sms::register(&mut reg)?;
     #[cfg(feature = "dev-nes-cart")]
     crate::dev::cart::nrom::register(&mut reg)?;
     #[cfg(feature = "dev-nes-io")]
@@ -354,6 +389,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::cpu::sm83::bind(&mut b)?;
     #[cfg(feature = "dev-gb")]
     crate::dev::gb::bind(&mut b)?;
+    #[cfg(feature = "dev-sms")]
+    crate::dev::sms::bind(&mut b)?;
     #[cfg(feature = "dev-nes-cart")]
     crate::dev::cart::nrom::bind(&mut b)?;
     #[cfg(feature = "dev-nes-io")]
@@ -404,6 +441,10 @@ pub fn classes() -> ClassTable {
     table.insert(crate::cpu::sm83::schema());
     #[cfg(feature = "dev-gb")]
     for schema in crate::dev::gb::schemas() {
+        table.insert(schema);
+    }
+    #[cfg(feature = "dev-sms")]
+    for schema in crate::dev::sms::schemas() {
         table.insert(schema);
     }
     #[cfg(feature = "dev-nes-cart")]

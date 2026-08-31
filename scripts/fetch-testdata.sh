@@ -51,6 +51,20 @@ readonly OPENSBI_DEB="https://deb.debian.org/debian/pool/main/o/opensbi/opensbi_
 readonly OPENSBI_DEB_SHA="dc4a43bd21a0ca11771ed8b19ee6fa8476d1d0f4976bd0b27c0357c699d27e1e"
 readonly OPENSBI_MEMBER="./usr/lib/riscv64-linux-gnu/opensbi/generic/fw_jump.bin"
 
+# ZEXALL-SMS: Maxim's port of Frank Cringle's Z80 instruction exerciser to the
+# Master System, hosted by SMS Power!. It is the only Master System test ROM
+# that reports its result as *text* -- through the SDSC debug console at
+# $FC/$FD -- rather than by drawing on the screen, which is what makes a
+# headless conformance run possible at all (src/dev/sms/conformance.rs).
+#
+# GPL-2.0; the licence file ships inside the archive. FETCH-ONLY: running it as
+# an emulated guest is ordinary use, committing it here would be redistribution
+# under its terms (ROADMAP.md 1).
+readonly SMS_ZEXALL_URL="https://www.smspower.org/uploads/Homebrew/ZEXALL-SMS-0.20.zip"
+readonly SMS_ZEXALL_SHA="acf1b84561523e0410ae01e507c3ddf8932025d92deae34e67d93922739318e2"
+readonly SMS_ZEXDOC_ROM_SHA="684cab8d256d474fdd34fc21ef942c4767cb355cbc47588926cd49ef4375ef30"
+readonly SMS_ZEXALL_ROM_SHA="25e205207745781a556003a800e60d9ec52330fb1cec1639dcf554a06e622e66"
+
 # A riscv64 Linux kernel, to boot on top of that firmware. The Debian
 # installer's, because it is a bare `Image` with an EFI stub rather than a
 # distribution package that has to be unpacked, and because it is rebuilt
@@ -96,6 +110,22 @@ download() {
 	tmp="${dest}.part"
 	mkdir -p "$(dirname -- "$dest")"
 	curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+		--output "$tmp" "$url" || { rm -f "$tmp"; die "could not download $url"; }
+	mv -f "$tmp" "$dest"
+}
+
+# download_browser <url> <dest>. As `download`, with a browser user agent.
+#
+# smspower.org sits behind a bot filter that answers curl's default agent with
+# 403. Sending a browser string circumvents nothing -- the files are public
+# downloads linked from the site's own pages -- it is the difference between a
+# fetch that works and one that reports a mystery failure.
+download_browser() {
+	local url="$1" dest="$2" tmp
+	tmp="${dest}.part"
+	mkdir -p "$(dirname -- "$dest")"
+	curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+		--user-agent 'Mozilla/5.0' \
 		--output "$tmp" "$url" || { rm -f "$tmp"; die "could not download $url"; }
 	mv -f "$tmp" "$dest"
 }
@@ -338,6 +368,54 @@ Consumed by RSEMU_GB_MOONEYE_DIR in src/dev/gb/conformance.rs."
 	note "      RSEMU_CONFORMANCE=1 RSEMU_GB_BLARGG_DIR=${DEST_ROOT}/gb-blargg \\"
 	note "      RSEMU_GB_MOONEYE_DIR=${DEST_ROOT}/gb-mooneye \\"
 	note "      cargo test --release --all-features -- --nocapture conformance"
+}
+
+fetch_sms() {
+	need curl
+	need unzip
+	local dest="${DEST_ROOT}/sms-zexall"
+	local zip="${DEST_ROOT}/ZEXALL-SMS-0.20.zip"
+
+	if [ "$FORCE" = 0 ] && [ -f "${dest}/zexdoc.sms" ] \
+		&& [ "$(sha256_of "${dest}/zexdoc.sms")" = "$SMS_ZEXDOC_ROM_SHA" ]; then
+		ok "sms-zexall already present and verified"
+	else
+		note "  downloading ZEXALL-SMS 0.20 ..."
+		download_browser "$SMS_ZEXALL_URL" "$zip"
+		verify "$zip" "$SMS_ZEXALL_SHA" advisory
+		mkdir -p "$dest"
+		unzip -q -o -j "$zip" 'zexall.sms' 'zexdoc.sms' 'LICENSE' 'README.md' -d "$dest"
+		rm -f "$zip"
+		verify "${dest}/zexdoc.sms" "$SMS_ZEXDOC_ROM_SHA" advisory
+		verify "${dest}/zexall.sms" "$SMS_ZEXALL_ROM_SHA" advisory
+		ok "sms-zexall: zexdoc.sms and zexall.sms"
+	fi
+
+	write_notice "$dest" "ZEXALL-SMS 0.20
+Frank Cringle's Z80 instruction exerciser, ported to CP/M and the Spectrum by
+J.G.Harston, to the Master System by Brett K, corrected and re-ordered by Maxim,
+and given SDSC-debug-console output by Eric R. Quinn.
+via https://www.smspower.org/Homebrew/ZEXALL-SMS
+
+Licence: GPL-2.0 (LICENSE ships in the archive and is copied here). FETCH AND
+RUN ONLY -- do not commit these ROMs, do not vendor them, do not attach them to
+a release. Running one as an emulated guest is ordinary use; redistributing it
+is not ours to do.
+
+zexdoc.sms tests only the documented flag behaviour; zexall.sms tests the
+undocumented bits 3 and 5 as well. Both are 64 KiB and use Sega's standard
+mapper, so a run exercises the bank switching too.
+
+BE PATIENT. The tests are ordered fastest-first and the longest single test is
+well over an hour of emulated time. RSEMU_SMS_FRAMES bounds the run, and a
+truncated run is reported as truncated rather than as a pass.
+
+Consumed by RSEMU_SMS_ZEXALL_DIR in src/dev/sms/conformance.rs."
+
+	note ""
+	note "  Then:"
+	note "      RSEMU_CONFORMANCE=1 RSEMU_SMS_ZEXALL_DIR=${dest} \\"
+	note "      cargo test --release --all-features -- --nocapture sms::conformance"
 }
 
 fetch_wozmon() {
@@ -609,6 +687,7 @@ Suites:
   nestest        nestest.nes + nestest.log     (licence unclear, FETCH-ONLY)
   accuracycoin   AccuracyCoin.nes + README     (MIT, (c) 2025 Chris Siebert)
   gameboy        blargg GB + mooneye acceptance (mixed; see the notices)
+  sms            ZEXALL-SMS, the Z80 exerciser  (GPL-2.0, FETCH-ONLY)
   wozmon         the Apple 1 monitor           (licence unclear, BRING YOUR OWN)
   opensbi        RISC-V firmware for riscv-virt (BSD-2-Clause, redistributable)
   edk2           UEFI for riscv-virt, copied from the local qemu firmware
@@ -644,7 +723,7 @@ list_present() {
 		return 0
 	fi
 	local suite
-	for suite in sst-65x02 nestest accuracycoin gb-blargg gb-mooneye apple1 riscv; do
+	for suite in sst-65x02 nestest accuracycoin gb-blargg gb-mooneye sms-zexall apple1 riscv; do
 		if [ -d "${DEST_ROOT}/${suite}" ]; then
 			printf '  %-14s %s\n' "$suite" \
 				"$(du -sh "${DEST_ROOT}/${suite}" 2>/dev/null | cut -f1) present"
@@ -662,7 +741,7 @@ SUITES=()
 
 while [ $# -gt 0 ]; do
 	case "$1" in
-		--all) SUITES=(sst-65x02 nestest accuracycoin gameboy opensbi) ;;
+		--all) SUITES=(sst-65x02 nestest accuracycoin gameboy sms opensbi) ;;
 		--force) FORCE=1 ;;
 		--variant) SST_VARIANT="${2:?--variant needs a value}"; shift ;;
 		--opcodes) SST_OPCODES="${2:?--opcodes needs a value}"; shift ;;
@@ -675,7 +754,7 @@ while [ $# -gt 0 ]; do
 	shift
 done
 
-[ ${#SUITES[@]} -eq 0 ] && SUITES=(sst-65x02 nestest accuracycoin gameboy opensbi)
+[ ${#SUITES[@]} -eq 0 ] && SUITES=(sst-65x02 nestest accuracycoin gameboy sms opensbi)
 
 mkdir -p "$DEST_ROOT"
 # Belt and braces: even if the repository .gitignore is edited, nothing under
@@ -692,6 +771,7 @@ for suite in "${SUITES[@]}"; do
 		nestest) fetch_nestest ;;
 		accuracycoin|coin) fetch_accuracycoin ;;
 		gameboy|gb) fetch_gameboy ;;
+		sms|mastersystem) fetch_sms ;;
 		wozmon|apple1) fetch_wozmon ;;
 		opensbi|riscv) fetch_opensbi ;;
 		edk2|uefi) fetch_edk2 ;;
