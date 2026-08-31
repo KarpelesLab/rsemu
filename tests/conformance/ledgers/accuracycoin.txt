@@ -19,7 +19,7 @@
 #     they can never appear here.
 #
 # ---------------------------------------------------------------------------
-# Measured 2026-08-31 against the pinned ROM: 127 of 141 pass, 14 fail.
+# Measured 2026-08-31 against the pinned ROM: 128 of 141 pass, 13 fail.
 # ---------------------------------------------------------------------------
 #
 # The earlier "81 of 125" was measured through a stale copy of the ROM's
@@ -81,8 +81,6 @@
 # Every test on the ROM's "APU Registers and DMA tests" page is about where that
 # fetch lands relative to a CPU access, so all of them report the same thing.
 
-6b                # $046B "DMC DMA Bus Conflicts" code 2: no DMC DMA, so no bus
-                  # conflict with the APU registers to emulate.
 77                # $0477 "DMC DMA + OAM DMA" code 1: DMC DMA timing. There is
                   # no DMC DMA to overlap the OAM one with.
 79                # $0479 "Explicit DMA Abort" code 1: as above.

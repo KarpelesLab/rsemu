@@ -340,6 +340,13 @@ pub(crate) fn run(machine: &mut dyn NesMachine) -> Report {
             }
             machine.run_frames(1);
         }
+        if let Some(addr) = watch {
+            println!(
+                "\n${addr:04X} at the end of the pass: {:?}",
+                decode(machine.peek(addr))
+            );
+            dump(machine, "results page", RESULTS_BASE..=RESULTS_BASE + 0xff);
+        }
         if let RunStatus::TimedOut { completed } = &mut status {
             *completed = machine.peek(ADDR_TALLY);
             if let Some(cpu) = machine.cpu_state() {

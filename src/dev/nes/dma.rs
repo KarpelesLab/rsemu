@@ -504,29 +504,37 @@ impl Gate {
 
     /// One DMA read, including the 2A03's partial-decode bus conflict.
     ///
-    /// The chip decodes its own `$4000`-`$401F` block from bits 4-0 of *this*
-    /// address and bits 15-5 of the address the halted core is still driving.
-    /// So a DMA get made while the core sits on that block reads two devices at
-    /// once — with every side effect that implies — and the bus carries the
-    /// wired-AND of what they drive (NESdev wiki, "DMA").
+    /// **Three address buses, not one.** The 6502 core drives one, the DMA
+    /// drives another, and the chip decodes its own `$4000`-`$401F` block from
+    /// bits 4-0 of the *DMA's* and bits 15-5 of the *core's* (NESdev wiki,
+    /// "DMA"). So a DMA read made while the core sits on that block also
+    /// activates the register at `$4000 | (addr & $1F)`, with every side effect
+    /// that implies — clearing the frame interrupt flag, clocking a controller
+    /// — and the wires then carry that register's driven bits over the DMA's
+    /// own byte in the bits it leaves floating. The controller ports drive only
+    /// bits 4-0, so a conflicting read of `$4016` comes back as the sample
+    /// byte's top three bits with the controller's in the bottom.
+    ///
+    /// Not a wired-AND: a register that drives nothing — `$4015`, which is
+    /// internal, and the whole write-only stretch below it — leaves the DMA's
+    /// byte alone rather than erasing it.
+    ///
+    /// The **other** half of the same decode is not modelled yet: a DMA read of
+    /// an address inside the block while the core is *outside* it should reach
+    /// nothing at all, since the block is on the 2A03 die and there is no
+    /// external responder behind it. "APU Register Activation" code 4 is
+    /// exactly that, and the ledger says why it is still open.
     fn read_with_conflict(&self, bus: &AddressSpace, attrs: MemAttrs, addr: u64, held: u64) -> u8 {
-        let byte = bus.read(addr, Width::U8, attrs).unwrap_or(0) as u8;
+        let external = bus.read(addr, Width::U8, attrs).unwrap_or(0) as u8;
         if held & INTERNAL_MASK != INTERNAL_BASE {
-            return byte;
+            return external;
         }
         let alias = INTERNAL_BASE | (addr & 0x1f);
-        if alias == addr {
-            // The DMA is already reading that register: one responder, nothing
-            // to conflict with.
-            return byte;
-        }
-        // Only a register that actually *drives* the wires conflicts. Most of
-        // the block does not — nothing in the console decodes a read of
-        // `$4000`-`$4014` — and a second responder that drives nothing would
-        // otherwise wire-AND the DMA's own byte away to zero.
-        match bus.read_driven(alias, Width::U8, attrs) {
-            Ok((other, true)) => byte & other as u8,
-            _ => byte,
+        // The register is handed the DMA's byte as its bus value, so whatever
+        // it does not drive floats through.
+        match bus.read_driven(alias, Width::U8, attrs.with_bus(external)) {
+            Ok((v, true)) => v as u8,
+            _ => external,
         }
     }
 }
