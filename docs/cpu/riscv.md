@@ -17,6 +17,14 @@ why it is the first architecture to get the IR/JIT treatment.
 Volume 2 is the one that matters for booting Linux: privilege transitions, trap
 delegation (`medeleg`/`mideleg`), the CSR map, and Sv39 page-table walks.
 
+Read the `satp` field widths off Volume 2's figure rather than from memory.
+`MODE` is bits 63:60, `ASID` 59:44 and `PPN` **43:0** — 44 bits, not 52. This
+core implements all sixteen `ASID` bits, so a guest that probes the width the
+specification's way (write all ones, read back what stuck) is told sixteen, and
+a `PPN` mask one hex digit too wide would then move the root page table out
+from under it. `docs/platforms/riscv-virt.md` records what that looked like
+from the guest's side.
+
 ## Firmware
 
 | Source | Notes |

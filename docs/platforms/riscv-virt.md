@@ -77,3 +77,59 @@ $ RSEMU_RISCV_FIRMWARE=$TD/fw_jump.bin \
 The variable store is RAM rather than CFI flash, so UEFI variables are readable
 but not durably writable. That is a missing device (`dev/flash/cfi`), not a
 missing mechanism.
+
+## How far each guest gets
+
+Written down rather than rounded up, because a precisely located stopping point
+is the only kind that is useful.
+
+**Linux 6.12 (Debian riscv64 installer kernel)** runs its whole boot: every
+initcall, the driver model, and the console handover off the SBI earlycon onto
+this board's own 16550A —
+
+```
+[  110.961106] 10000000.serial: ttyS0 at MMIO 0x10000000 (irq = 12, base_baud = 115200) is a 16550A
+[  110.969106] printk: legacy console [ttyS0] enabled
+[  110.975106] printk: legacy bootconsole [sbi0] disabled
+```
+
+— and then panics in `prepare_namespace` because nothing supplied a root
+filesystem. That is the correct end of a kernel booted with neither an initrd
+nor a disk driver: the Debian installer kernel builds `virtio_mmio` as a
+module, so the `virtio.blk` in this machine file is never claimed. Staging a
+rootfs is the next step, and it is a fixture problem rather than a machine one.
+
+Two observations from that run that are ours, not the kernel's:
+
+- `jitterentropy` trips the soft-lockup watchdog during `jent_entropy_init`
+  (`BUG: soft lockup - CPU#0 stuck for 22s!`, and again at 44s). Virtual time
+  here is derived from bus accesses, and jitterentropy's calibration loop makes
+  a great many of them; the kernel warns, taints itself `[L]=SOFTLOCKUP`, and
+  carries on.
+- Time is virtual throughout, so the timestamps above measure emulated seconds,
+  not patience.
+
+**Its ASID probe found a real bug in our `satp`.** An early initcall discovers
+`ASIDLEN` the way the privileged specification suggests — write all ones to
+`satp.ASID`, read back which bits stick:
+
+```asm
+csrr  a1, satp          # keep MODE and PPN
+lui   a5, 65535
+slli  a5, a5, 32        # 0xffff << 44 -- the ASID field
+or    a5, a5, a1
+csrw  satp, a5
+csrr  a4, satp          # this fetch is the one that used to fault
+```
+
+`satp.PPN` is 44 bits under Sv39 and `ASID` sits directly on top of it. Masking
+`PPN` any wider folds ASID bits into the root page table's address, so the
+instant that `csrw` retired the whole address space moved and the *next* fetch
+took an instruction access fault — as did the fetch of the trap handler, and so
+on forever. The guest stayed live, ping-ponging through OpenSBI's M-mode trap
+entry on the timer, which is what made it look like an SBI problem. It was not:
+every SBI call in the trace is a well-formed `sbi_set_timer` (EID `0x54494d45`,
+FID 0) being answered correctly. With the field masked to its real width the
+kernel prints `ASID allocator using 16 bits (65536 entries)` and carries on.
+
+**EDK2/UEFI** reaches the end of the DXE dispatcher.
