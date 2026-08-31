@@ -20,6 +20,7 @@ use crate::core::error::Result;
 use crate::core::props::Props;
 use crate::core::space::{AddressSpace, RamStore, Region};
 use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
+use crate::core::sync::{AtomicU64, Ordering};
 
 use super::csr::{Extensions, Priv, cause, irq, num, status};
 use super::isa::Xlen;
@@ -1155,4 +1156,51 @@ fn a_hart_with_no_address_space_reports_no_progress() {
         0,
         "a caller must treat this as stop, not retry"
     );
+}
+
+/// `csrr a0, time` — CSRRS with `rs1 = x0`, so it reads without writing.
+const CSRR_A0_TIME: u32 = 0xc010_2573;
+
+#[test]
+fn the_time_csr_follows_an_attached_platform_timer() {
+    let h = Harness::rv64i(&[CSRR_A0_TIME, CSRR_A0_TIME]);
+    let timer = Arc::new(AtomicU64::new(0x1234_5678));
+    h.hart.attach_time(Arc::clone(&timer));
+
+    h.hart.step();
+    assert_eq!(
+        h.hart.x(10),
+        0x1234_5678,
+        "`time` must report the platform timer, not the hart's own field"
+    );
+
+    // The whole point: it keeps up. A guest that read a frozen `time` would
+    // compute every deadline as already past and live-lock on its own timer.
+    timer.store(0x1234_9999, Ordering::Relaxed);
+    h.hart.step();
+    assert_eq!(h.hart.x(10), 0x1234_9999);
+}
+
+#[test]
+fn an_attached_timer_survives_reset() {
+    // Wiring, not guest state. A reset re-runs the reset sequence; it does not
+    // unplug the CLINT, so `time` must still track it afterwards.
+    let h = Harness::rv64i(&[CSRR_A0_TIME]);
+    let timer = Arc::new(AtomicU64::new(7));
+    h.hart.attach_time(Arc::clone(&timer));
+
+    h.hart.reset(ResetKind::Cold);
+    timer.store(99, Ordering::Relaxed);
+    h.hart.step();
+    assert_eq!(h.hart.x(10), 99, "reset must not detach the platform timer");
+}
+
+#[test]
+fn set_time_still_works_without_a_clint() {
+    // A machine with no CLINT has no cell to attach, and `set_time` remains
+    // how it supplies the value.
+    let h = Harness::rv64i(&[CSRR_A0_TIME]);
+    h.hart.set_time(0x4242);
+    h.hart.step();
+    assert_eq!(h.hart.x(10), 0x4242);
 }

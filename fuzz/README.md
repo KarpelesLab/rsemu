@@ -202,3 +202,14 @@ Next in line, as the code lands: the disk-image parsers (§7.1), every MMIO
 register surface (§4.1), and the JSON projection of the machine language once
 `rsemu convert` exists — the JSON side is a second parser for the same AST and
 inherits the same obligations.
+
+## When CI runs this
+
+Not on every commit. `.github/workflows/fuzz.yml` runs the sixty-second smoke
+daily and on manual dispatch, because what that budget actually detects is a
+target that stopped compiling against a changed API — a property of the tree
+rather than of one commit. **Run it by hand from the Actions tab, or locally
+with the command above, before merging a change to a fuzzed surface**: the
+`.machine` parser, a disk-image parser, or an MMIO register block. The daily
+run is drift detection; the real campaign is still the command at the top of
+this file.

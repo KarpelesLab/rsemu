@@ -1,0 +1,64 @@
+name: Fuzz
+
+# Not on push. This is drift detection, not a merge gate: sixty seconds a
+# target finds nothing a real campaign would (fuzz/README.md has that command),
+# and what it actually catches is a target that stopped compiling against a
+# changed API. That is a property of the tree, not of an individual commit, so
+# once a day answers it just as well as thirty times a day — and it does not
+# spend a nightly toolchain install and a cargo-fuzz build on every push.
+#
+# Run it by hand from the Actions tab before merging anything that changes a
+# fuzzed surface: the `.machine` parser, a disk-image parser, or an MMIO device.
+on:
+  schedule:
+    # 04:17 UTC daily. Off the hour on purpose — GitHub's scheduled runners are
+    # busiest exactly on it, and a queued job here delays nothing.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: fuzz
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: fuzz smoke (nightly)
+    runs-on: ubuntu-latest
+    # Nightly by necessity: cargo-fuzz requires it.
+    #
+    # No `continue-on-error` here, unlike when this job lived in CI. There it
+    # had to be advisory because a nightly regression outside our control must
+    # never block a merge; on a schedule it can block nothing, so it is allowed
+    # to go red and actually be noticed. If nightly churn makes it noisy rather
+    # than informative, make it advisory again — but then it needs a different
+    # way to be seen, because a green-when-broken drift detector detects
+    # nothing.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: build targets
+        run: cargo fuzz build
+      - name: smoke each target
+        # The committed corpus is passed read-only as a second input so a run
+        # never rewrites the curated seeds.
+        run: |
+          set -euxo pipefail
+          for t in machine_parser state_decoder state_roundtrip; do
+            mkdir -p "/tmp/corpus-$t"
+            cargo fuzz run "$t" "/tmp/corpus-$t" "fuzz/corpus/$t" -- \
+              -max_total_time=60 -timeout=10
+          done
+      - uses: actions/upload-artifact@v5
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

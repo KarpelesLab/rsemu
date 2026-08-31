@@ -101,7 +101,7 @@ use crate::core::registry::Registry;
 use crate::core::sched::{Budget, Consumed};
 use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::core::sync::{self, AtomicU32, LockRank, Ordering};
+use crate::core::sync::{self, AtomicU32, AtomicU64, LockRank, Ordering};
 use crate::core::value::Width;
 use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink};
 
@@ -279,6 +279,10 @@ struct Session {
     /// (`ROADMAP.md` §4.5).
     tlb: Tlb,
     space: Option<Arc<AddressSpace>>,
+    /// The platform timer, when a machine has one. Wiring rather than guest
+    /// state, so it lives here beside `space` instead of in `state`: `reset`
+    /// replaces `state`, and a reset must not unplug the clock.
+    time_src: Option<Arc<AtomicU64>>,
 }
 
 /// One RISC-V hart.
@@ -333,6 +337,7 @@ impl Hart {
                     state: State::new(&cfg),
                     tlb: Tlb::new(),
                     space: None,
+                    time_src: None,
                 },
             ),
             requester: AtomicU32::new(cfg.requester.0),
@@ -559,11 +564,35 @@ impl Hart {
 
     /// Set the value the `time` CSR reports.
     ///
-    /// The platform timer belongs to a CLINT, not to the hart, so until one
-    /// exists this is how a machine supplies it. Nothing in the core reads a
+    /// The platform timer belongs to a CLINT, not to the hart, so a machine
+    /// without one supplies the value this way. Nothing in the core reads a
     /// host clock (`ROADMAP.md` §0).
+    ///
+    /// A hart with a timer attached through [`attach_time`](Hart::attach_time)
+    /// overwrites this on its next step, which is the intended precedence:
+    /// the CLINT owns `mtime` whenever there is a CLINT.
     pub fn set_time(&self, now: u64) {
         self.session.lock().state.csrs.mtime = now;
+    }
+
+    /// Attach the platform timer the `time` CSR reads.
+    ///
+    /// `time` is architecturally a *view of the platform timer*, not a counter
+    /// the hart owns: Volume II defines it as a read-only shadow of the memory
+    /// mapped `mtime`, which belongs to the CLINT. Handing the hart the same
+    /// cell the CLINT publishes is what makes the two agree.
+    ///
+    /// Without this, `time` reads whatever [`set_time`](Hart::set_time) last
+    /// left — zero, in a machine that never calls it. That is not a small
+    /// inaccuracy: an operating system computes its next deadline as
+    /// `time + delta`, the CLINT's `mtime` is already past it, the timer
+    /// interrupt fires immediately, and the guest live-locks reprogramming a
+    /// timer that is always expired.
+    ///
+    /// The value is sampled once per [`step`](Hart::step), which is as often
+    /// as a guest can observe it: reading `time` takes an instruction.
+    pub fn attach_time(&self, timer: Arc<AtomicU64>) {
+        self.session.lock().time_src = Some(timer);
     }
 
     /// Execute one instruction, one trap entry, or one stalled `WFI` cycle.
@@ -578,7 +607,17 @@ impl Hart {
             session.state = State::new(&cfg);
             session.tlb.flush();
         }
-        let Session { state, tlb, space } = &mut *session;
+        let Session {
+            state,
+            tlb,
+            space,
+            time_src,
+        } = &mut *session;
+        if let Some(timer) = time_src {
+            // Relaxed: `mtime` is a standalone counter, and nothing else the
+            // CLINT publishes is ordered against it.
+            state.csrs.mtime = timer.load(Ordering::Relaxed);
+        }
         let Some(space) = space.clone() else {
             return 0;
         };

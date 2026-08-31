@@ -117,6 +117,22 @@ pub static BENEATER_6502: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/beneater-6502.machine"),
 };
 
+/// The RISC-V `virt` board, when this build has a hart and the board's chips.
+///
+/// The first machine rsemu boots real system software on. The `firmware` slot
+/// takes whatever should be at `0x80000000`: a bare-metal image, or OpenSBI,
+/// or OpenSBI with a kernel payload attached. The device tree the guest is
+/// handed is generated from the realized machine rather than shipped
+/// (`docs/platforms/riscv-virt.md`).
+#[cfg(feature = "machine-riscv-virt")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-riscv-virt")))]
+pub static RISCV_VIRT: CatalogEntry = CatalogEntry {
+    name: "riscv-virt",
+    summary: "RISC-V `virt`: RV64GC hart, CLINT, PLIC, 16550, virtio-MMIO, generated DTB",
+    media: &["firmware"],
+    source: include_str!("../../machines/riscv-virt.machine"),
+};
+
 /// Every machine this build can realize, in catalog order.
 // One `#[cfg]`-gated push per shipped machine, which is what the lint is
 // complaining about: a `vec![]` literal cannot carry an attribute on one of its
@@ -134,6 +150,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&NES_NTSC);
     #[cfg(feature = "machine-nes")]
     out.push(&NES_PAL);
+    #[cfg(feature = "machine-riscv-virt")]
+    out.push(&RISCV_VIRT);
     out
 }
 
@@ -166,6 +184,10 @@ pub fn registry() -> Result<Registry> {
     crate::dev::apu::register(&mut reg)?;
     #[cfg(feature = "dev-apple1")]
     crate::dev::apple1::register(&mut reg)?;
+    #[cfg(feature = "cpu-riscv")]
+    crate::cpu::riscv::register(&mut reg)?;
+    #[cfg(feature = "dev-riscv")]
+    crate::dev::riscv::register(&mut reg)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::register(&mut reg)?;
     Ok(reg)
@@ -205,6 +227,10 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::apu::bind(&mut b)?;
     #[cfg(feature = "dev-apple1")]
     crate::dev::apple1::bind(&mut b)?;
+    #[cfg(feature = "cpu-riscv")]
+    crate::cpu::riscv::bind(&mut b)?;
+    #[cfg(feature = "dev-riscv")]
+    crate::dev::riscv::bind(&mut b)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::bind(&mut b)?;
     Ok(b)
@@ -231,6 +257,12 @@ pub fn classes() -> ClassTable {
     table.insert(crate::dev::apu::schema());
     #[cfg(feature = "dev-apple1")]
     for schema in crate::dev::apple1::schemas() {
+        table.insert(schema);
+    }
+    #[cfg(feature = "cpu-riscv")]
+    table.insert(crate::cpu::riscv::schema());
+    #[cfg(feature = "dev-riscv")]
+    for schema in crate::dev::riscv::schemas() {
         table.insert(schema);
     }
     #[cfg(feature = "dev-wdc")]
@@ -837,6 +869,12 @@ mod tests {
             ("apple1", "rom") => crate::dev::apple1::RSMON,
             #[cfg(feature = "machine-beneater")]
             ("beneater-6502", "rom") => crate::dev::wdc::RSMON_IMAGE,
+            // A firmware image that fits in eight bytes: `wfi` then a branch
+            // back to it, so the catalog's "every shipped machine realizes"
+            // check needs no download and no toolchain. `dev::riscv::tests`
+            // supplies the programs that actually do something.
+            #[cfg(feature = "machine-riscv-virt")]
+            ("riscv-virt", "firmware") => &[0x73, 0x00, 0x50, 0x10, 0x6f, 0xf0, 0xdf, 0xff],
             (m, other) => panic!("no fixture for `{m}`'s media slot `{other}`"),
         }
     }

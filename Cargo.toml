@@ -161,6 +161,22 @@ cpu-mos6502 = []
 # Adds no dependencies and is `no_std + alloc`.
 cpu-arm-aprofile = []
 
+# The RISC-V `virt` board's chips (src/dev/riscv): the CLINT, the PLIC, a 16550
+# UART on the character-device seam, a system controller, virtio-MMIO with block
+# and entropy devices, and a **device tree generator** that emits the DTB from
+# the realized machine graph rather than from a file somebody wrote by hand.
+# `no_std + alloc`, no `unsafe`, no dependencies. Written from the RISC-V
+# privileged/PLIC/ACLINT specifications, the PC16550D data sheet, OASIS VIRTIO
+# 1.2 and the Devicetree Specification.
+dev-riscv = []
+
+# The RISC-V `virt` board as a machine (machines/riscv-virt.machine plus the
+# classes it names): the first machine rsemu can boot real system software on.
+# `rsemu run riscv-virt --firmware fw.bin` loads an image at 0x80000000, hands
+# it a generated device tree in a1 and the hart id in a0, and puts its console
+# on the terminal. Adds no dependencies.
+machine-riscv-virt = ["cpu-riscv", "dev-riscv"]
+
 # The ARMv7E-M core (src/cpu/arm/v7m): a Cortex-M4/M7-class interpreter —
 # the whole T32 instruction set in both encoding widths, `IT` blocks, the DSP
 # (E) extension (SIMD add/sub, saturating arithmetic, the half-word and dual
