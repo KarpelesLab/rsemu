@@ -33,6 +33,14 @@
 //! DMC reload  as above, but it starts trying on a put            3 or 4
 //! ```
 //!
+//! Only the *get* is an access. The halt, the dummy and the alignment do
+//! nothing on the bus, so they are allowed to overlap each other and any access
+//! another transfer is making — "allowing cycles to be saved" (NESdev, DMA).
+//! That is why a DMC fetch landing inside a sprite copy costs the copy two
+//! cycles rather than four: the halt and dummy pass straight over the copy's
+//! own get and put, the DMC takes the next get, and the copy needs one
+//! alignment cycle to get back on its phase. See [`Job::noop`].
+//!
 //! A *load* fetch — one a `$4015` write scheduled — starts trying to halt on
 //! the get cycle of the second APU cycle after that write, which is the third
 //! or fourth CPU cycle after it. A *reload* — one the output unit scheduled by
@@ -77,8 +85,9 @@ const CLASS_NAME: &str = "nes.oamdma";
 /// The snapshot chunk version. Bump with the encoding, never on its own.
 ///
 /// v2 carries the live transfer: v1 could not, because a transfer took no time
-/// and so could never be caught half done.
-const STATE_VERSION: u32 = 2;
+/// and so could never be caught half done. v3 replaced a DMC fetch's single
+/// `dummy` flag with the count of no-operation cycles it still owes.
+const STATE_VERSION: u32 = 3;
 
 /// The name of the region that decodes `$4014`.
 pub const PORT: &str = "port";
@@ -124,8 +133,23 @@ struct Oam {
 struct Job {
     serial: u64,
     addr: u16,
-    /// The dummy cycle the wiki says always follows the halt.
-    dummy: bool,
+    /// No-operation cycles still owed before the fetch may take a get.
+    ///
+    /// A DMC fetch is *halt, dummy, [alignment], get*, and only the get is an
+    /// access. The halt and the dummy do nothing on the bus, so they are
+    /// allowed to **overlap** whatever else is using it: "no-operation cycles
+    /// are allowed to overlap with each other and with access cycles, allowing
+    /// cycles to be saved" (NESdev, DMA). A sprite copy already in progress
+    /// therefore carries on straight through them, which is why a DMC fetch
+    /// landing inside an OAM DMA costs it only two cycles - the get it steals
+    /// and the alignment the copy needs afterwards.
+    ///
+    /// Two when the fetch joins a core the sprite copy has already halted, and
+    /// one when the fetch's own halt cycle was the CPU read that has just been
+    /// stretched - including the case where that read is the sprite copy's halt
+    /// as well, because then "both halt cycles happen at the same time"
+    /// (AccuracyCoin.asm, MIT, (c) 2025 Chris Siebert).
+    noop: u8,
 }
 
 /// What one `arbitrate` call has to tell the DMC afterwards.
@@ -317,7 +341,8 @@ impl Shared {
                     state.job = Some(Job {
                         serial: r.serial,
                         addr: r.addr,
-                        dummy: true,
+                        // The stretched read was the halt; the dummy is left.
+                        noop: 1,
                     });
                 }
             }
@@ -329,23 +354,27 @@ impl Shared {
             state.job = Some(Job {
                 serial: r.serial,
                 addr: r.addr,
-                dummy: false,
+                // Halt and dummy both still to come, and both overlap the
+                // sprite copy rather than displacing it.
+                noop: 2,
             });
         }
 
         let next = cycle + 1;
         let get = is_get(next, phase);
 
-        // The dummy cycle the wiki says always follows a DMC halt.
-        if let Some(job) = &mut state.job
-            && job.dummy
-        {
-            job.dummy = false;
-            return Act::Hold;
+        // The halt and dummy cycles do nothing on the bus, so they fall through
+        // to the sprite copy rather than displacing it - see [`Job::noop`].
+        let mut fetch = None;
+        if let Some(job) = &mut state.job {
+            if job.noop > 0 {
+                job.noop -= 1;
+            } else if get {
+                // The DMC takes precedence over the sprite copy on a get.
+                fetch = state.job.take();
+            }
         }
-
-        // The DMC takes precedence over the sprite copy.
-        if get && let Some(job) = state.job.take() {
+        if let Some(job) = fetch {
             return Act::DmcRead(job.addr, job.serial);
         }
 
@@ -367,7 +396,8 @@ impl Shared {
         }
 
         if state.job.is_some() {
-            // A fetch waiting for its get, on a put.
+            // A fetch still counting off its no-op cycles, or waiting for its
+            // get on a put.
             return Act::Hold;
         }
 
@@ -710,13 +740,13 @@ impl Device for OamDma {
                 w.write_bool(true)?;
                 w.write_u64(job.serial)?;
                 w.write_u16(job.addr)?;
-                w.write_bool(job.dummy)
+                w.write_u8(job.noop)
             }
             None => {
                 w.write_bool(false)?;
                 w.write_u64(0)?;
                 w.write_u16(0)?;
-                w.write_bool(false)
+                w.write_u8(0)
             }
         }
     }
@@ -733,7 +763,7 @@ impl Device for OamDma {
         let has_job = r.read_bool()?;
         let serial = r.read_u64()?;
         let addr = r.read_u16()?;
-        let dummy = r.read_bool()?;
+        let noop = r.read_u8()?;
 
         let mut state = self.shared.state.lock();
         state.page = page;
@@ -744,11 +774,7 @@ impl Device for OamDma {
             latch: latched.then_some(latch),
         });
         state.halted = halted;
-        state.job = has_job.then_some(Job {
-            serial,
-            addr,
-            dummy,
-        });
+        state.job = has_job.then_some(Job { serial, addr, noop });
         Ok(())
     }
 
@@ -1208,6 +1234,43 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn a_dmc_fetch_inside_a_sprite_copy_costs_it_only_two_cycles() {
+        // "No-operation cycles are allowed to overlap with each other and with
+        // access cycles, allowing cycles to be saved" (NESdev, DMA). A DMC
+        // fetch's halt and dummy do nothing on the bus, so a sprite copy runs
+        // straight through them; what it loses is the get the DMC takes and the
+        // alignment cycle it then needs to get back on its own phase.
+        // AccuracyCoin's "DMC DMA + OAM DMA" sweeps the two across each other a
+        // cycle at a time and its answer key is full of twos.
+        let run = |with_dmc: bool| -> u64 {
+            let (b, apu) = dmc_bus();
+            apu.write(0x10, 0x0f); // no looping, fastest rate
+            apu.write(0x12, 0xb5); // the sample at $ED40
+            apu.write(0x13, 0x00); // one byte, so there is exactly one fetch
+            wr(&b.space, 0x4014, 0x00);
+            let gate = b.dma.gate();
+            let from = apu.ticks();
+            let mut cycle = from;
+            while b.dma.transfers() == 0 {
+                if with_dmc && cycle == from + 100 {
+                    apu.advance_to(cycle);
+                    apu.write(0x15, 0x10);
+                }
+                apu.advance_to(cycle);
+                gate.arbitrate(cycle, 0x8000, 0x40, false);
+                cycle += 1;
+                assert!(cycle < from + 1000, "the sprite copy never finished");
+            }
+            cycle - from
+        };
+        assert_eq!(
+            run(true) - run(false),
+            2,
+            "a fetch inside a copy costs two cycles, not its own four"
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@
 #
 # ---------------------------------------------------------------------------
 # 2026-08-31: 130 of 141 pass, 11 fail.
-# 2026-09-01: 139 of 141 pass, 2 fail.
+# 2026-09-01: 140 of 141 pass, 1 fails.
 # ---------------------------------------------------------------------------
 #
 # The measurement before this one read "81 of 125", through a stale copy of the
@@ -60,17 +60,21 @@
 # the ROM reported, what it measures, and what specifically is missing.
 
 # ---------------------------------------------------------------------------
-# A. The DMC's choreography against the OAM DMA
+# A. The DMC's choreography against the OAM DMA — closed
 # ---------------------------------------------------------------------------
 #
-# The arbiter runs both DMAs and gets each right on its own. What it does not
-# model is the *phase machine* the DMC runs while the OAM DMA is also using the
-# bus: `Job` carries a single `dummy` flag rather than a Halt -> Dummy ->
-# [Align] -> Get sequence whose no-op phases are allowed to overlap OAM access
-# cycles ("no-operation cycles are allowed to overlap with each other and with
-# access cycles, allowing cycles to be saved" — NESdev, DMA).
+# A DMC fetch is halt, dummy, [alignment], get, and only the get is an access.
+# The rest do nothing on the bus and are therefore allowed to **overlap** an
+# access another transfer is making — "no-operation cycles are allowed to
+# overlap with each other and with access cycles, allowing cycles to be saved"
+# (NESdev, DMA) — so a sprite copy runs straight through them and loses only the
+# get the DMC takes and the alignment it then needs. `Job` carried a single
+# `dummy` flag and stopped the copy on it; it now carries the count of no-op
+# cycles still owed, two for a fetch joining a core the copy has already halted
+# and one where the stretched read was the fetch's own halt. That is
+# "DMC DMA + OAM DMA", both of its thirty-two-entry sweeps.
 #
-# What *is* modelled now, and what closed "Delta Modulation Channel" and
+# Also modelled, and what closed "Delta Modulation Channel" and
 # "Implicit DMA Abort":
 #
 #   * the `$4015` enable latch. A fetch the timer schedules while an enabling
@@ -91,14 +95,6 @@
 # Our profile is the one the ROM calls "Implicit Abort Behavior 1" (its
 # post-1990 CPU key set), which is consistent with targeting an RP2A03G.
 
-77                # $0477 "DMC DMA + OAM DMA" code 2: the thirty-two entry
-                  # answer key sweeps a DMC fetch across the start and the end
-                  # of an OAM transfer, one cycle per entry. A fetch that joins
-                  # an already-halted core starts at its *get* here instead of
-                  # at its halt cycle, so it lands two cycles early; and the
-                  # 1-cycle (second-to-last put) and 3-cycle (last put)
-                  # end-of-transfer cases cannot be produced at all, because the
-                  # job cannot outlive `state.oam`.
 
 # ---------------------------------------------------------------------------
 # B. The 2A03's internal block does not answer a DMA aimed at somebody else
