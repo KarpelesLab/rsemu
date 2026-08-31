@@ -9,6 +9,7 @@
 //! | Core | Feature | State |
 //! | --- | --- | --- |
 //! | `mos6502` | `cpu-mos6502` | cycle-accurate interpreter, illegal opcodes, disassembler |
+//! | `x86` | `cpu-x86` | Intel 8086/8088, real mode, hardware-checked against `SingleStepTests/8088` |
 //!
 //! Every core ships an interpreter first; the IR frontend comes later and is
 //! differentially tested against it forever. **The interpreter is the oracle.**
@@ -16,3 +17,7 @@
 #[cfg(feature = "cpu-mos6502")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-mos6502")))]
 pub mod mos6502;
+
+#[cfg(feature = "cpu-x86")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-x86")))]
+pub mod x86;
