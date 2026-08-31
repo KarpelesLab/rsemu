@@ -93,25 +93,13 @@ machine "beneater-6502" {
     engine  = "interp"
     decimal = true
 
-    # ---- the part is a W65C02S, and this line is waiting on the core --------
-    #
-    #   variant = "w65c02s"
-    #
     # The kit ships the CMOS part, and the difference is not cosmetic: Ben
     # Eater's own `wozmon.bin` contains `3A` (`DEC A`) at $FFF5, inside a
     # `LDA #$FF / DEC A / BNE -3` delay loop. An NMOS 6502 decodes $3A as an
     # undocumented `NOP`, so A never changes, Z never sets, and that loop spins
     # forever — his image cannot boot on an NMOS core, and the failure looks
     # like a hang rather than like an illegal instruction.
-    #
-    # `cpu.mos6502` has no `variant` property yet; a separate change is adding
-    # one. Until it lands the line above stays commented, because a machine file
-    # that names a property the validator does not know fails to realize and
-    # takes the whole catalog with it. Both monitors rsemu ships for this board
-    # are deliberately NMOS-clean, so everything here runs today.
-    #
-    # When the property exists: uncomment, and the env-gated test in
-    # `src/dev/wdc/tests.rs` that runs Eater's image starts passing.
+    variant = "65c02"
   }
 
   # The serial port. Its clock is the character rate, not the bit rate: the

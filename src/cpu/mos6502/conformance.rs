@@ -14,12 +14,15 @@
 //! gated on an environment variable naming a directory of `NN.json` files:
 //!
 //! ```text
-//! git clone --depth 1 https://github.com/SingleStepTests/65x02 /tmp/65x02
+//! git clone --depth 1 --filter=blob:none --sparse \
+//!     https://github.com/SingleStepTests/65x02 /tmp/65x02
+//! git -C /tmp/65x02 sparse-checkout set --no-cone /6502 /wdc65c02 /LICENSE
 //! RSEMU_65X02_DIR=/tmp/65x02/6502/v1 cargo test --all-features conformance -- --nocapture
 //! ```
 //!
-//! Point it at `6502/v1` for a part with decimal mode, or `nes6502/v1` for the
-//! RP2A03; the runner picks the configuration from the directory name.
+//! Point it at `6502/v1` for a part with decimal mode, `nes6502/v1` for the
+//! RP2A03, or `wdc65c02/v1` for the CMOS part; the runner picks the
+//! configuration from the directory name, so one test covers all three.
 //!
 //! Without the variable the test prints why it did nothing and passes, so
 //! `cargo test` stays hermetic and offline.
@@ -27,16 +30,39 @@
 //! # The ledger
 //!
 //! `ROADMAP.md` §0 asks every core to ship a known-failures ledger that only
-//! ever shrinks. This one is **empty**: at the commit that added this file,
-//! all 256 opcode files of `6502/v1` passed all 10 000 vectors each —
-//! registers, memory *and* the full bus trace, 2 560 000 vectors — and the
-//! decimal-sensitive subset of `nes6502/v1` passed against
-//! [`Config::RP2A03`]. Anything that fails later is a regression, not a known
-//! gap, and belongs in a fix rather than in a list.
+//! ever shrinks.
+//!
+//! **NMOS — empty.** All 256 opcode files of `6502/v1` pass all 10 000 vectors
+//! each: registers, memory *and* the full bus trace, 2 560 000 vectors. The
+//! decimal-sensitive subset of `nes6502/v1` passes against [`Config::RP2A03`].
+//!
+//! **CMOS — two entries, both in the corpus rather than here.** 254 of the 256
+//! `wdc65c02/v1` files pass 10 000 of 10 000 (`cb.json` and `db.json` are
+//! empty upstream: `WAI` and `STP` are "incompatible with this style of
+//! testing", so they are covered by the hand-written tests next door instead).
+//! What fails is the *decimal-mode half* of `69.json` and `e9.json` —
+//! `ADC #` and `SBC #` — and only in the address of one dummy read:
+//!
+//! - Every other addressing mode spends the CMOS decimal-correction cycle
+//!   re-reading the operand's effective address, which is what this
+//!   implementation does everywhere, immediate included (there the operand is
+//!   the byte after the opcode).
+//! - The corpus instead expects a *constant* address — `$007f` for every
+//!   `ADC #` vector and `$0000` for every `SBC #` vector, whatever the
+//!   registers or the program counter. That is the signature of an
+//!   uninitialised effective-address latch in the generator, not of hardware:
+//!   on a real part those latches hold whatever the *previous* instruction put
+//!   there, so the address is genuinely indeterminate and no constant can be
+//!   right. The corpus README invites exactly this report.
+//!
+//! Registers, memory and cycle *count* match on those vectors; only that one
+//! address differs. Recorded here rather than papered over, because a ledger
+//! that hides a disagreement is worse than one that names it.
 //!
 //! Not covered by the corpus, and therefore only by the hand-written tests
-//! next door: the RESET sequence, IRQ, NMI, and the BRK/IRQ/NMI hijack. The
-//! vectors start mid-program with the interrupt lines idle.
+//! next door: the RESET sequence, IRQ, NMI, the BRK/IRQ/NMI hijack, and the
+//! CMOS `WAI`/`STP`. The vectors start mid-program with the interrupt lines
+//! idle.
 //!
 //! # Why the JSON parser is in here
 //!
@@ -380,6 +406,46 @@ fn run_file(path: &Path, cfg: Config) -> Vec<Failure> {
     failures
 }
 
+/// One entry in the known-failures ledger.
+///
+/// `ROADMAP.md` §0: a core ships a ledger that only ever *shrinks*, so an entry
+/// is a ceiling rather than an expectation. Fewer failures than recorded is
+/// fine and says so; more is a regression and fails the run.
+struct Known {
+    /// Which part the entry applies to, as it appears in the corpus path.
+    corpus: &'static str,
+    /// The opcode file.
+    opcode: u8,
+    /// The most vectors that may fail.
+    at_most: usize,
+    /// Why this is the corpus's disagreement and not ours.
+    reason: &'static str,
+}
+
+/// The whole ledger. Two entries, both in the CMOS corpus, both the same bug.
+///
+/// See this module's header for the long form: the corpus expects the decimal
+/// correction cycle of `ADC #`/`SBC #` to read a *constant* address, the same
+/// one for all 10 000 vectors of the file regardless of registers or PC. A real
+/// effective-address latch holds whatever the previous instruction left in it,
+/// so no constant can be right; this core re-reads the operand, which is what
+/// it does in every other addressing mode and what the corpus itself expects
+/// there.
+static LEDGER: &[Known] = &[
+    Known {
+        corpus: "wdc65c02",
+        opcode: 0x69,
+        at_most: 4975,
+        reason: "corpus expects a fixed $007f for the ADC # decimal cycle",
+    },
+    Known {
+        corpus: "wdc65c02",
+        opcode: 0xe9,
+        at_most: 5000,
+        reason: "corpus expects a fixed $0000 for the SBC # decimal cycle",
+    },
+];
+
 /// Run the whole corpus, or explain why it did not.
 ///
 /// Not `#[ignore]`d: a skipped test that says nothing is how a suite quietly
@@ -389,24 +455,31 @@ fn single_step_tests() {
     let Ok(dir) = std::env::var("RSEMU_65X02_DIR") else {
         println!(
             "conformance: set RSEMU_65X02_DIR to a SingleStepTests/65x02 \
-             directory (6502/v1 or nes6502/v1) to run 10 000 vectors per opcode"
+             directory (6502/v1, nes6502/v1 or wdc65c02/v1) to run 10 000 \
+             vectors per opcode"
         );
         return;
     };
     let dir = Path::new(&dir);
-    // The NES's core has no decimal mode, and the corpus has a directory per
-    // part; picking the configuration from the path is what makes both
-    // runnable from one test.
-    let cfg = if dir.to_string_lossy().contains("nes") {
+    // The corpus has a directory per part, so picking the configuration from
+    // the path is what makes all three runnable from one test.
+    let path = dir.to_string_lossy();
+    let cfg = if path.contains("nes") {
         Config::RP2A03
+    } else if path.contains("65c02") {
+        Config::W65C02S
     } else {
         Config::NMOS_6502
     };
+    println!("conformance: {} as {}", dir.display(), cfg.variant);
+
+    let ledger: Vec<&Known> = LEDGER.iter().filter(|k| path.contains(k.corpus)).collect();
 
     let only = std::env::var("RSEMU_65X02_OPCODES").ok();
     let mut ran = 0usize;
-    let mut failed_opcodes = Vec::new();
+    let mut unexpected = Vec::new();
     let mut total_failures = 0usize;
+    let mut ledgered = 0usize;
 
     for opcode in 0..=255u8 {
         let name = format!("{opcode:02x}");
@@ -416,30 +489,50 @@ fn single_step_tests() {
             continue;
         }
         let path = dir.join(format!("{name}.json"));
-        if !path.exists() {
+        // Missing, or present but empty: upstream ships zero-byte `cb.json`
+        // and `db.json` because `WAI` and `STP` cannot be expressed as a
+        // single-instruction vector. Not a gap in the run.
+        if !path.exists() || std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
             continue;
         }
         let failures = run_file(&path, cfg);
         ran += 1;
         if !failures.is_empty() {
             total_failures += failures.len();
-            failed_opcodes.push((name.clone(), failures.len()));
-            let insn = super::isa::decode(opcode);
-            println!(
-                "{name} {} {} — {} of 10000 vectors failed; first is `{}`:\n{}",
-                insn.op.mnemonic(),
-                insn.mode.name(),
-                failures.len(),
-                failures[0].name,
-                failures[0].detail
-            );
+            let insn = super::isa::decode_as(cfg.variant, opcode);
+            match ledger.iter().find(|k| k.opcode == opcode) {
+                Some(known) if failures.len() <= known.at_most => {
+                    ledgered += failures.len();
+                    println!(
+                        "{name} {} {} — {} of 10000 known-bad (ceiling {}): {}",
+                        insn.op.mnemonic(),
+                        insn.mode.name(),
+                        failures.len(),
+                        known.at_most,
+                        known.reason
+                    );
+                }
+                _ => {
+                    unexpected.push((name.clone(), failures.len()));
+                    println!(
+                        "{name} {} {} — {} of 10000 vectors failed; first is `{}`:\n{}",
+                        insn.op.mnemonic(),
+                        insn.mode.name(),
+                        failures.len(),
+                        failures[0].name,
+                        failures[0].detail
+                    );
+                }
+            }
         }
     }
 
     assert!(ran > 0, "no NN.json files under {}", dir.display());
-    println!("conformance: {ran} opcode files, {total_failures} failing vectors");
-    assert!(
-        failed_opcodes.is_empty(),
-        "failing opcodes: {failed_opcodes:?}"
+    let vectors = ran * 10_000;
+    println!(
+        "conformance: {ran} opcode files, {} of {vectors} vectors passed \
+         ({ledgered} known-bad in the ledger)",
+        vectors - total_failures
     );
+    assert!(unexpected.is_empty(), "failing opcodes: {unexpected:?}");
 }

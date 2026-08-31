@@ -1436,3 +1436,574 @@ fn properties_carry_the_nes_variant_and_the_dsl_spelling() {
     let props = Props::new().with("engine", "jit");
     assert!(Mos6502::from_props(&props).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// The W65C02S
+//
+// The bus behaviour of every CMOS encoding is measured against
+// SingleStepTests/65x02's `wdc65c02` corpus next door, which is where the
+// double reads and the shortened indexed shifts are actually proved. What
+// lives here is what that corpus cannot express: the interrupt lines, the
+// reset sequence, `WAI`, `STP`, and the fact that the whole thing is a
+// construction property rather than a build flag.
+// ---------------------------------------------------------------------------
+
+/// A CMOS core at `$c000` with `program` loaded there.
+fn cmos(program: &[u8]) -> Harness {
+    Harness::running_with(Config::W65C02S, program)
+}
+
+#[test]
+fn the_variant_is_a_construction_property_and_changes_the_decode() {
+    // The same byte, two parts, two instructions — and no `#[cfg]` anywhere
+    // near it: both cores exist in one build and one test.
+    let nmos = Harness::running(&[0xa9, 0x01, 0x3a]);
+    nmos.step();
+    nmos.step();
+    assert_eq!(nmos.regs().a, 0x01, "$3a is a one-byte NOP on an NMOS part");
+
+    let wdc = cmos(&[0xa9, 0x01, 0x3a]);
+    wdc.step();
+    wdc.step();
+    assert_eq!(wdc.regs().a, 0x00, "and DEC A on the CMOS one");
+    assert!(wdc.regs().flag(flags::Z));
+}
+
+#[test]
+fn inc_a_and_dec_a_cost_two_cycles_and_touch_no_memory() {
+    let h = cmos(&[0x1a, 0x3a]);
+    h.set_regs(|r| r.a = 0x7f);
+    // The dummy read of the byte after the opcode, which PC does not advance
+    // over: exactly the shape of every other implied instruction.
+    assert_eq!(h.trace(), [Cycle::r(0xc000, 0x1a), Cycle::r(0xc001, 0x3a)]);
+    assert_eq!(h.regs().a, 0x80);
+    assert!(h.regs().flag(flags::N), "0x7f + 1 is negative");
+    h.step();
+    assert_eq!(h.regs().a, 0x7f);
+    assert!(!h.regs().flag(flags::N));
+    // Neither touches carry, which is what separates them from ADC/SBC.
+    assert!(!h.regs().flag(flags::C));
+}
+
+#[test]
+fn a_read_modify_write_reads_twice_instead_of_writing_twice() {
+    // The single most load-bearing difference on the bus, and the reason NMOS
+    // mapper tricks do not port to a CMOS board.
+    let nmos = Harness::running(&[0xee, 0x00, 0x02]);
+    nmos.bus.poke(0x0200, &[0x41]);
+    assert_eq!(
+        nmos.trace(),
+        [
+            Cycle::r(0xc000, 0xee),
+            Cycle::r(0xc001, 0x00),
+            Cycle::r(0xc002, 0x02),
+            Cycle::r(0x0200, 0x41),
+            Cycle::w(0x0200, 0x41),
+            Cycle::w(0x0200, 0x42),
+        ]
+    );
+
+    let wdc = cmos(&[0xee, 0x00, 0x02]);
+    wdc.bus.poke(0x0200, &[0x41]);
+    assert_eq!(
+        wdc.trace(),
+        [
+            Cycle::r(0xc000, 0xee),
+            Cycle::r(0xc001, 0x00),
+            Cycle::r(0xc002, 0x02),
+            Cycle::r(0x0200, 0x41),
+            Cycle::r(0x0200, 0x41),
+            Cycle::w(0x0200, 0x42),
+        ]
+    );
+    assert_eq!(wdc.bus.peek(0x0200), 0x42);
+}
+
+#[test]
+fn an_indexed_write_re_reads_the_operand_instead_of_the_unfixed_address() {
+    // `STA $20ff,X` with X = 1 lands at $2100. The NMOS part reads $2000 on the
+    // way — which is what makes it dangerous next to memory-mapped hardware —
+    // and the CMOS one reads its own last operand byte instead.
+    let nmos = Harness::running(&[0x9d, 0xff, 0x20]);
+    nmos.set_regs(|r| {
+        r.a = 0x5a;
+        r.x = 0x01;
+    });
+    assert_eq!(nmos.trace()[3], Cycle::r(0x2000, 0x00));
+
+    let wdc = cmos(&[0x9d, 0xff, 0x20]);
+    wdc.set_regs(|r| {
+        r.a = 0x5a;
+        r.x = 0x01;
+    });
+    let trace = wdc.trace();
+    assert_eq!(trace[3], Cycle::r(0xc002, 0x20), "the high operand byte");
+    assert_eq!(trace[4], Cycle::w(0x2100, 0x5a));
+    assert_eq!(trace.len(), 5);
+}
+
+#[test]
+fn jmp_indirect_no_longer_wraps_but_still_makes_the_wrong_access() {
+    // The bug is fixed by *adding a cycle*: the CMOS part reads the same wrong
+    // address the NMOS one stopped at, then reads the right one and uses that.
+    let h = cmos(&[0x6c, 0xff, 0x02]);
+    h.bus.poke(0x02ff, &[0x34]);
+    h.bus.poke(0x0200, &[0xbb]);
+    h.bus.poke(0x0300, &[0x12]);
+    assert_eq!(
+        h.trace(),
+        [
+            Cycle::r(0xc000, 0x6c),
+            Cycle::r(0xc001, 0xff),
+            Cycle::r(0xc002, 0x02),
+            Cycle::r(0x02ff, 0x34),
+            Cycle::r(0x0200, 0xbb),
+            Cycle::r(0x0300, 0x12),
+        ]
+    );
+    assert_eq!(h.regs().pc, 0x1234, "and $0300 wins, not $0200");
+}
+
+#[test]
+fn the_new_addressing_modes_reach_the_right_byte() {
+    // `LDA ($40)` — page-zero indirect, the mode the NMOS ALU group never had.
+    let h = cmos(&[0xb2, 0x40]);
+    h.bus.poke(0x0040, &[0x00, 0x03]);
+    h.bus.poke(0x0300, &[0x77]);
+    assert_eq!(
+        h.trace(),
+        [
+            Cycle::r(0xc000, 0xb2),
+            Cycle::r(0xc001, 0x40),
+            Cycle::r(0x0040, 0x00),
+            Cycle::r(0x0041, 0x03),
+            Cycle::r(0x0300, 0x77),
+        ]
+    );
+    assert_eq!(h.regs().a, 0x77);
+
+    // And its pointer wraps inside page zero, like every other zero-page mode.
+    let h = cmos(&[0xb2, 0xff]);
+    h.bus.poke(0x00ff, &[0x00]);
+    h.bus.poke(0x0000, &[0x04]);
+    h.bus.poke(0x0400, &[0x99]);
+    h.step();
+    assert_eq!(h.regs().a, 0x99);
+
+    // `JMP ($1200,X)`, whose fix-up cycle re-reads the *first* operand byte.
+    let h = cmos(&[0x7c, 0x00, 0x12]);
+    h.set_regs(|r| r.x = 0x04);
+    h.bus.poke(0x1204, &[0xcd, 0xab]);
+    let trace = h.trace();
+    assert_eq!(trace[3], Cycle::r(0xc001, 0x00));
+    assert_eq!(h.regs().pc, 0xabcd);
+    assert_eq!(trace.len(), 6);
+}
+
+#[test]
+fn stz_stores_a_zero_nobody_had_to_load() {
+    let h = cmos(&[0x9c, 0x34, 0x12]);
+    h.set_regs(|r| {
+        r.a = 0xff;
+        r.x = 0xff;
+        r.y = 0xff;
+    });
+    h.bus.poke(0x1234, &[0xff]);
+    h.step();
+    assert_eq!(h.bus.peek(0x1234), 0x00);
+    // No register was disturbed, which is the entire point of the instruction.
+    assert_eq!((h.regs().a, h.regs().x, h.regs().y), (0xff, 0xff, 0xff));
+}
+
+#[test]
+fn trb_and_tsb_report_the_old_bits_in_z_alone() {
+    // TSB sets the bits A selects; TRB clears them. Z says whether any of them
+    // were already set — and N and V are left alone, which is what separates
+    // these from BIT.
+    let h = cmos(&[0x0c, 0x00, 0x02, 0x1c, 0x00, 0x02]);
+    h.bus.poke(0x0200, &[0x0f]);
+    h.set_regs(|r| {
+        r.a = 0x30;
+        r.p = flags::U | flags::N | flags::V;
+    });
+    h.step();
+    assert_eq!(h.bus.peek(0x0200), 0x3f, "TSB set both");
+    assert!(h.regs().flag(flags::Z), "neither was set before");
+    assert!(h.regs().flag(flags::N), "N is untouched");
+    assert!(h.regs().flag(flags::V), "so is V");
+
+    h.step();
+    assert_eq!(h.bus.peek(0x0200), 0x0f, "TRB cleared them again");
+    assert!(!h.regs().flag(flags::Z), "and this time they were set");
+}
+
+#[test]
+fn bit_immediate_moves_z_and_nothing_else() {
+    let h = cmos(&[0x89, 0xc0, 0x24, 0x40]);
+    h.bus.poke(0x0040, &[0xc0]);
+    h.set_regs(|r| {
+        r.a = 0x0f;
+        r.p = flags::U;
+    });
+    assert_eq!(h.trace().len(), 2, "two cycles, no memory");
+    assert!(h.regs().flag(flags::Z), "$0f AND $c0 is zero");
+    assert!(!h.regs().flag(flags::N), "N did not come from the operand");
+    assert!(!h.regs().flag(flags::V), "nor V");
+
+    // The memory forms still do take N and V from the operand's top two bits.
+    h.step();
+    assert!(h.regs().flag(flags::N));
+    assert!(h.regs().flag(flags::V));
+}
+
+#[test]
+fn the_bit_group_sets_clears_and_branches_on_one_bit() {
+    // SMB3 $40 / RMB3 $40, then BBR3 and BBS3 over the same byte.
+    let h = cmos(&[0xb7, 0x40, 0x37, 0x40]);
+    h.bus.poke(0x0040, &[0x00]);
+    h.set_regs(|r| r.p = flags::U | flags::N | flags::Z | flags::C);
+    let before = h.regs().p;
+    h.step();
+    assert_eq!(h.bus.peek(0x0040), 0x08, "SMB3 set bit 3");
+    assert_eq!(h.regs().p, before, "and touched no flag at all");
+    h.step();
+    assert_eq!(h.bus.peek(0x0040), 0x00, "RMB3 cleared it");
+
+    // BBR3 $40,+2 with bit 3 clear: taken, six cycles, and the page-zero byte
+    // is read twice on the way.
+    let h = cmos(&[0x3f, 0x40, 0x02]);
+    h.bus.poke(0x0040, &[0x00]);
+    assert_eq!(
+        h.trace(),
+        [
+            Cycle::r(0xc000, 0x3f),
+            Cycle::r(0xc001, 0x40),
+            Cycle::r(0x0040, 0x00),
+            Cycle::r(0x0040, 0x00),
+            Cycle::r(0xc002, 0x02),
+            Cycle::r(0xc003, 0x00),
+        ]
+    );
+    assert_eq!(h.regs().pc, 0xc005);
+
+    // The same encoding with the bit set: not taken, five cycles, three bytes.
+    let h = cmos(&[0x3f, 0x40, 0x02]);
+    h.bus.poke(0x0040, &[0x08]);
+    assert_eq!(h.trace().len(), 5);
+    assert_eq!(h.regs().pc, 0xc003);
+}
+
+#[test]
+fn decimal_arithmetic_costs_a_cycle_and_gets_its_flags_right() {
+    // $99 + $01 in BCD is $00 with a carry. The NMOS part leaves Z describing
+    // the *binary* sum and N describing an intermediate; the CMOS part latches
+    // both after the correction, so they describe the answer.
+    let nmos = Harness::running(&[0xf8, 0x18, 0xa9, 0x99, 0x69, 0x01]);
+    for _ in 0..3 {
+        nmos.step();
+    }
+    let trace = nmos.trace();
+    assert_eq!(trace.len(), 2, "no correction cycle on an NMOS part");
+    assert_eq!(nmos.regs().a, 0x00);
+    assert!(nmos.regs().flag(flags::C));
+    assert!(!nmos.regs().flag(flags::Z), "binary $99 + $01 is $9a");
+
+    let wdc = cmos(&[0xf8, 0x18, 0xa9, 0x99, 0x69, 0x01]);
+    for _ in 0..3 {
+        wdc.step();
+    }
+    let trace = wdc.trace();
+    assert_eq!(trace.len(), 3, "the correction cycle is on the bus");
+    assert_eq!(trace[2], Cycle::r(0xc005, 0x01), "re-reading the operand");
+    assert_eq!(wdc.regs().a, 0x00);
+    assert!(wdc.regs().flag(flags::C));
+    assert!(wdc.regs().flag(flags::Z), "and Z describes the answer");
+}
+
+#[test]
+fn decimal_subtraction_disagrees_with_the_nmos_part_on_invalid_bcd() {
+    // $10 - $fc with carry set. `$fc` is not a BCD pair, so the two parts'
+    // different correction orders become visible: the NMOS nibble-at-a-time
+    // path gives $be, the CMOS correct-the-difference path gives $ae.
+    let program = [0xf8, 0x38, 0xa9, 0x10, 0xe9, 0xfc];
+    let nmos = Harness::running(&program);
+    for _ in 0..4 {
+        nmos.step();
+    }
+    assert_eq!(nmos.regs().a, 0xbe);
+
+    let wdc = cmos(&program);
+    for _ in 0..4 {
+        wdc.step();
+    }
+    assert_eq!(wdc.regs().a, 0xae);
+    assert!(wdc.regs().flag(flags::N), "N from the corrected value");
+}
+
+#[test]
+fn an_interrupt_clears_the_decimal_flag_on_the_cmos_part() {
+    // The reason a CMOS handler no longer has to open with CLD. The *pushed*
+    // byte still carries the old D — the flag is cleared after the push.
+    let h = cmos(&[0xf8, 0x00, 0x00]);
+    h.bus.poke(0xfffe, &[0x00, 0xd0]);
+    h.step();
+    assert!(h.regs().flag(flags::D));
+    let s_before = h.regs().s;
+    h.step();
+    assert_eq!(h.regs().pc, 0xd000);
+    assert!(!h.regs().flag(flags::D), "D is clear inside the handler");
+    // PCH, PCL, then P: the status byte is two below where S started.
+    let pushed = h.bus.peek(0x0100 | u16::from(s_before.wrapping_sub(2)));
+    assert_ne!(pushed & flags::D, 0, "but the stacked copy still has it");
+    assert_ne!(pushed & flags::B, 0, "and B, because this was a BRK");
+
+    // The NMOS part leaves D exactly where it was, which is the bug.
+    let n = Harness::running(&[0xf8, 0x00, 0x00]);
+    n.bus.poke(0xfffe, &[0x00, 0xd0]);
+    n.step();
+    n.step();
+    assert!(n.regs().flag(flags::D));
+}
+
+#[test]
+fn a_cmos_reset_clears_decimal_mode_too() {
+    let h = Harness::with_config(Config::W65C02S);
+    h.bus.poke(0xfffc, &[0x00, 0xc0]);
+    h.cpu.set_regs(Regs {
+        p: flags::U | flags::D,
+        ..Regs::new()
+    });
+    h.step();
+    assert!(!h.cpu.regs().flag(flags::D));
+    assert!(
+        h.cpu.regs().flag(flags::I),
+        "and sets I, as every part does"
+    );
+}
+
+#[test]
+fn stp_halts_the_core_until_reset() {
+    // Three cycles, then nothing — not even the jammed bus pattern a `JAM`
+    // leaves behind, because a stopped oscillator has no cycles to spend.
+    let h = cmos(&[0xdb]);
+    assert_eq!(
+        h.trace(),
+        [
+            Cycle::r(0xc000, 0xdb),
+            Cycle::r(0xc001, 0x00),
+            Cycle::r(0xc001, 0x00),
+        ]
+    );
+    assert!(h.cpu.is_halted());
+    assert_eq!(h.step(), 0, "and it stays stopped");
+    assert!(h.bus.take_log().is_empty());
+
+    // An interrupt does not wake it; only a reset does.
+    h.cpu.pulse_nmi();
+    assert_eq!(h.step(), 0);
+    h.cpu.request_reset();
+    assert_eq!(h.step(), 7);
+    assert!(!h.cpu.is_halted());
+}
+
+#[test]
+fn wai_stalls_without_a_bus_access_and_any_interrupt_releases_it() {
+    let h = cmos(&[0xcb, 0xe8]);
+    assert_eq!(h.trace().len(), 3, "WAI itself is three cycles");
+    assert!(h.cpu.is_waiting());
+    assert!(!h.cpu.is_halted(), "stalled is not halted");
+
+    // Time passes and the bus stays quiet: a WAIing part holds RDY low rather
+    // than fetching, and a scheduler that saw zero cycles would call the
+    // machine dead instead of merely idle.
+    let before = h.cpu.cycles();
+    assert_eq!(h.step(), 1);
+    assert_eq!(h.step(), 1);
+    assert_eq!(h.cpu.cycles(), before + 2);
+    assert!(h.bus.take_log().is_empty());
+
+    // IRQ releases it even though I is set — what the mask decides is whether
+    // the handler runs, not whether the part wakes up.
+    h.set_regs(|r| r.p |= flags::I);
+    h.cpu.set_irq(true);
+    h.step();
+    assert!(!h.cpu.is_waiting());
+    assert_eq!(h.cpu.pending_interrupt(), None, "masked, so no handler");
+    assert_eq!(h.regs().x, 0x01, "execution resumed at the INX");
+}
+
+#[test]
+fn wai_takes_the_interrupt_when_it_is_not_masked() {
+    let h = cmos(&[0xcb, 0xe8]);
+    h.bus.poke(0xfffe, &[0x00, 0xd0]);
+    h.set_regs(|r| r.p &= !flags::I);
+    h.step();
+    assert!(h.cpu.is_waiting());
+    h.cpu.set_irq(true);
+    // Waking and taking the interrupt are one step: the stall ends where the
+    // sequence begins, which is the whole reason to use `WAI` over a poll loop.
+    assert_eq!(h.step(), 7, "the interrupt sequence, not a stall cycle");
+    assert!(!h.cpu.is_waiting());
+    assert_eq!(h.regs().pc, 0xd000);
+
+    // And a reset releases a WAI as surely as it does an STP.
+    let h = cmos(&[0xcb]);
+    h.step();
+    assert!(h.cpu.is_waiting());
+    h.cpu.request_reset();
+    h.step();
+    assert!(!h.cpu.is_waiting());
+}
+
+#[test]
+fn the_cmos_one_cycle_nops_really_do_take_one_cycle() {
+    // $x3 and $xB are one byte and one bus cycle — the only instructions in
+    // this family that finish inside their own opcode fetch.
+    let h = cmos(&[0x03, 0x0b, 0x5c, 0x34, 0x12]);
+    assert_eq!(h.trace(), [Cycle::r(0xc000, 0x03)]);
+    assert_eq!(h.regs().pc, 0xc001);
+    assert_eq!(h.trace(), [Cycle::r(0xc001, 0x0b)]);
+
+    // $5c is three bytes and four cycles, the fourth spent re-reading the last
+    // operand byte. Nothing at $1234 is touched.
+    assert_eq!(
+        h.trace(),
+        [
+            Cycle::r(0xc002, 0x5c),
+            Cycle::r(0xc003, 0x34),
+            Cycle::r(0xc004, 0x12),
+            Cycle::r(0xc004, 0x12),
+        ]
+    );
+    assert_eq!(h.regs().pc, 0xc005);
+}
+
+#[test]
+fn bra_is_a_branch_that_is_always_taken() {
+    let h = cmos(&[0x80, 0x02]);
+    h.set_regs(|r| r.p = flags::U | flags::Z | flags::N | flags::C | flags::V);
+    assert_eq!(h.trace().len(), 3, "three cycles, no page cross");
+    assert_eq!(h.regs().pc, 0xc004, "and no flag could have stopped it");
+}
+
+#[test]
+fn the_stack_gains_x_and_y() {
+    let h = cmos(&[0xda, 0x5a, 0xfa, 0x7a]);
+    h.set_regs(|r| {
+        r.x = 0x11;
+        r.y = 0x22;
+    });
+    let s = h.regs().s;
+    h.step();
+    h.step();
+    assert_eq!(h.bus.peek(0x0100 | u16::from(s)), 0x11);
+    assert_eq!(h.bus.peek(0x0100 | u16::from(s.wrapping_sub(1))), 0x22);
+    h.set_regs(|r| {
+        r.x = 0;
+        r.y = 0;
+    });
+    h.step(); // PLX pulls what PHY pushed
+    assert_eq!(h.regs().x, 0x22);
+    assert!(!h.regs().flag(flags::N));
+    h.step(); // PLY pulls what PHX pushed
+    assert_eq!(h.regs().y, 0x11);
+    assert_eq!(h.regs().s, s, "and the stack is back where it started");
+}
+
+#[test]
+fn the_cmos_disassembler_spells_the_new_modes() {
+    use super::disasm::{disassemble, disassemble_as};
+    let cases: &[(&[u8], &str)] = &[
+        (&[0x3a], "DEC A"),
+        (&[0x1a], "INC A"),
+        (&[0x80, 0x05], "BRA $c007"),
+        (&[0xb2, 0x40], "LDA ($40)"),
+        (&[0x7c, 0x34, 0x12], "JMP ($1234,X)"),
+        (&[0x9c, 0x34, 0x12], "STZ $1234"),
+        (&[0x04, 0x40], "TSB $40"),
+        (&[0x14, 0x40], "TRB $40"),
+        (&[0x89, 0x42], "BIT #$42"),
+        (&[0x3c, 0x34, 0x12], "BIT $1234,X"),
+        (&[0xda], "PHX"),
+        (&[0x7a], "PLY"),
+        (&[0x27, 0x40], "RMB2 $40"),
+        (&[0xb7, 0x40], "SMB3 $40"),
+        (&[0x8f, 0x40, 0x05], "BBS0 $40,$c008"),
+        (&[0x0f, 0x40, 0xfb], "BBR0 $40,$bffe"),
+        (&[0xcb], "WAI"),
+        (&[0xdb], "STP"),
+        (&[0x03], "NOP"),
+        (&[0x5c, 0x34, 0x12], "NOP $1234"),
+    ];
+    for (bytes, want) in cases {
+        let d = disassemble_as(Variant::Wdc65C02, 0xc000, bytes);
+        assert_eq!(alloc::format!("{d}"), *want);
+        assert_eq!(usize::from(d.len), bytes.len(), "{want}");
+        assert!(!d.is_undocumented(), "{want} is a documented CMOS encoding");
+    }
+    // And the disassembler follows the core it belongs to, so a listing of the
+    // same bytes is not the same listing.
+    assert_eq!(alloc::format!("{}", disassemble(0xc000, &[0x3a])), "NOP");
+}
+
+#[test]
+fn a_core_disassembles_with_its_own_variant() {
+    let h = cmos(&[0x3a, 0x80, 0xfd]);
+    let listing = h.cpu.disassemble(0xc000, 2);
+    assert_eq!(alloc::format!("{}", listing[0]), "DEC A");
+    assert_eq!(alloc::format!("{}", listing[1]), "BRA $c000");
+}
+
+#[test]
+fn properties_name_the_part_and_default_its_adder() {
+    let props = Props::new().with("variant", "65c02");
+    let cpu = Mos6502::from_props(&props).expect("a W65C02S");
+    assert_eq!(cpu.config().variant, Variant::Wdc65C02);
+    assert!(cpu.config().decimal, "the CMOS part has a BCD adder");
+
+    // The NES's part defaults its own adder off, so a machine file naming the
+    // variant need not also remember to say `decimal = false`.
+    let props = Props::new().with("variant", "2a03");
+    let cpu = Mos6502::from_props(&props).expect("an RP2A03");
+    assert_eq!(cpu.config().variant, Variant::Ricoh2A03);
+    assert!(!cpu.config().decimal);
+    // ... but it stays independently settable, because a test may want to ask
+    // what the missing adder would have done.
+    let props = Props::new().with("variant", "2a03").with("decimal", true);
+    assert!(
+        Mos6502::from_props(&props)
+            .expect("still valid")
+            .config()
+            .decimal
+    );
+
+    // A part nobody has implemented is a config error, not a silent 6502.
+    let props = Props::new().with("variant", "65816");
+    assert!(Mos6502::from_props(&props).is_err());
+}
+
+#[test]
+fn a_wai_survives_a_snapshot() -> Result<()> {
+    let h = cmos(&[0xcb]);
+    h.step();
+    assert!(h.cpu.is_waiting());
+
+    let mut shape = MachineShape::new();
+    shape.add_device("cpu", CLASS.name)?;
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("cpu", CLASS.name, CLASS.version)?;
+        h.cpu.save(&mut chunk)?;
+    }
+    let bytes = w.to_vec()?;
+
+    let other = Harness::running_with(Config::W65C02S, &[]);
+    let reader = StateReader::new(&bytes)?;
+    let chunk = reader.load("cpu", CLASS.name, CLASS.version, &Migrations::new())?;
+    other.cpu.load(&mut chunk.reader())?;
+    // A restore that dropped this would resume by executing whatever the WAI
+    // was waiting in front of, which is not where the machine was.
+    assert!(other.cpu.is_waiting());
+    assert_eq!(other.cpu.regs(), h.cpu.regs());
+    Ok(())
+}

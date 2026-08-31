@@ -16,7 +16,7 @@
 
 use core::fmt;
 
-use super::isa::{Class, Insn, Mode, decode};
+use super::isa::{Class, Insn, Mode, Variant, decode_as};
 
 /// One decoded instruction at a known address.
 ///
@@ -49,19 +49,26 @@ impl Disassembled {
         (self.operand[0] as u16) | ((self.operand[1] as u16) << 8)
     }
 
-    /// The address a [`Mode::Relative`] branch would jump to.
+    /// The address a branch would jump to.
     ///
     /// The displacement is signed and counts from the *next* instruction, so
-    /// this is `pc + 2 + offset`. Returns `None` for every other mode.
+    /// this is `pc + len + offset`. `BBR`/`BBS` carry theirs in the second
+    /// operand byte, after the page-zero address. Returns `None` for every
+    /// non-branching mode.
     #[must_use]
     pub const fn branch_target(&self) -> Option<u16> {
+        // Guest arithmetic wraps: a branch near $ffff wraps to page zero, and
+        // that is the address the CPU jumps to.
         match self.insn.mode {
-            // Guest arithmetic wraps: a branch near $ffff wraps to page zero,
-            // and that is the address the CPU jumps to.
             Mode::Relative => Some(
                 self.pc
                     .wrapping_add(2)
                     .wrapping_add(self.operand[0] as i8 as u16),
+            ),
+            Mode::ZeroPageRelative => Some(
+                self.pc
+                    .wrapping_add(3)
+                    .wrapping_add(self.operand[1] as i8 as u16),
             ),
             _ => None,
         }
@@ -75,7 +82,7 @@ impl Disassembled {
     #[must_use]
     pub const fn static_target(&self) -> Option<u16> {
         match self.insn.mode {
-            Mode::ZeroPage => Some(self.operand[0] as u16),
+            Mode::ZeroPage | Mode::ZeroPageRelative => Some(self.operand[0] as u16),
             Mode::Absolute => Some(self.word()),
             Mode::Relative => self.branch_target(),
             _ => None,
@@ -98,7 +105,7 @@ impl fmt::Display for Disassembled {
         f.write_str(self.insn.op.mnemonic())?;
         let lo = self.operand[0];
         match self.insn.mode {
-            Mode::Implied | Mode::Break => Ok(()),
+            Mode::Implied | Mode::Single | Mode::Break => Ok(()),
             Mode::Accumulator => f.write_str(" A"),
             Mode::Immediate => write!(f, " #${lo:02x}"),
             Mode::ZeroPage => write!(f, " ${lo:02x}"),
@@ -110,6 +117,16 @@ impl fmt::Display for Disassembled {
             Mode::Indirect => write!(f, " (${:04x})", self.word()),
             Mode::IndirectX => write!(f, " (${lo:02x},X)"),
             Mode::IndirectY => write!(f, " (${lo:02x}),Y"),
+            Mode::ZeroPageIndirect => write!(f, " (${lo:02x})"),
+            Mode::AbsoluteIndirectX => write!(f, " (${:04x},X)", self.word()),
+            // The page-zero byte first, then the branch target — the order the
+            // WDC datasheet writes them and the order an assembler accepts.
+            Mode::ZeroPageRelative => write!(
+                f,
+                " ${lo:02x},${:04x}",
+                self.branch_target()
+                    .expect("zero-page relative has a target")
+            ),
             // A branch is far more useful as a target than as a displacement,
             // which is why the raw byte is kept in `operand` for anyone who
             // wants it.
@@ -122,15 +139,26 @@ impl fmt::Display for Disassembled {
     }
 }
 
-/// Decode the instruction at `pc` from `bytes`, which start at `pc`.
+/// Decode the instruction at `pc` from `bytes`, as an NMOS 6502 sees it.
 ///
 /// Never fails: all 256 encodings are defined. A buffer too short for the
 /// operand yields a decode with zeroed operand bytes and
 /// [`Disassembled::truncated`] set.
 #[must_use]
 pub fn disassemble(pc: u16, bytes: &[u8]) -> Disassembled {
+    disassemble_as(Variant::Nmos6502, pc, bytes)
+}
+
+/// Decode the instruction at `pc` from `bytes`, as `variant` sees it.
+///
+/// The variant is not decoration: `$3a` is a one-byte NOP on the NMOS part and
+/// `DEC A` on the CMOS one, so a listing produced with the wrong table
+/// desynchronises after the first such byte and everything below it is
+/// nonsense.
+#[must_use]
+pub fn disassemble_as(variant: Variant, pc: u16, bytes: &[u8]) -> Disassembled {
     let opcode = bytes.first().copied().unwrap_or(0);
-    let insn = decode(opcode);
+    let insn = decode_as(variant, opcode);
     let len = insn.bytes() as usize;
     let mut operand = [0u8; 2];
     let mut truncated = bytes.len() < len;
@@ -159,6 +187,16 @@ pub fn disassemble(pc: u16, bytes: &[u8]) -> Disassembled {
 pub fn disassemble_run(
     pc: u16,
     count: usize,
+    fetch: impl FnMut(u16) -> Option<u8>,
+) -> alloc::vec::Vec<Disassembled> {
+    disassemble_run_as(Variant::Nmos6502, pc, count, fetch)
+}
+
+/// The same, decoding as `variant` sees it.
+pub fn disassemble_run_as(
+    variant: Variant,
+    pc: u16,
+    count: usize,
     mut fetch: impl FnMut(u16) -> Option<u8>,
 ) -> alloc::vec::Vec<Disassembled> {
     let mut out = alloc::vec::Vec::with_capacity(count);
@@ -180,7 +218,7 @@ pub fn disassemble_run(
         if got == 0 {
             break;
         }
-        let d = disassemble(at, &window[..got]);
+        let d = disassemble_as(variant, at, &window[..got]);
         at = at.wrapping_add(u16::from(d.len));
         out.push(d);
         if got < 3 && d.truncated {
@@ -192,6 +230,7 @@ pub fn disassemble_run(
 
 #[cfg(test)]
 mod tests {
+    use super::super::isa::decode;
     use super::*;
     use alloc::format;
     use alloc::string::String;
