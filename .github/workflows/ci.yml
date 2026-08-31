@@ -100,11 +100,19 @@ jobs:
       # sibling feature passes --all-features forever and breaks for the first
       # user who picks a narrow set. Build each feature alone.
       - name: each feature in isolation
+        # Enumerated from the manifest rather than listed here: a hand-written
+        # list silently stops covering the feature added after it was written,
+        # which is exactly the feature most likely to have the bug.
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           cargo build --no-default-features
-          for f in std cli wasm; do
+          feats=$(cargo metadata --no-deps --format-version 1 | python3 -c \
+            "import json,sys; print(' '.join(sorted(f for f in json.load(sys.stdin)['packages'][0]['features'] if f != 'default')))")
+          echo "sweeping: $feats"
+          for f in $feats; do
+            echo "::group::$f"
             cargo build --no-default-features --features "$f"
+            echo "::endgroup::"
           done
 
   deps:
@@ -177,6 +185,21 @@ jobs:
           if missing:
               sys.exit(f'missing exports: {sorted(missing)}')
           PY
+      # The demo is the only configuration the browser page actually loads, and
+      # `wasm` alone does not exercise it. Built after the ABI check above so
+      # that check keeps testing the minimal module, not this one.
+      - name: build the demo cdylib
+        if: matrix.target == 'wasm32-unknown-unknown'
+        run: |
+          cargo rustc --crate-type cdylib --target wasm32-unknown-unknown \
+            --no-default-features --features demo --release
+      - name: browser harness against the real module
+        if: matrix.target == 'wasm32-unknown-unknown'
+        # Instantiates the module and drives it: exports vs. what the glue
+        # calls, zero imports, every element id present in the markup, boot,
+        # frames, and save/restore hash equality. Not a DOM test -- nothing
+        # here has a browser -- but it catches every drift that is not one.
+        run: node web/check.mjs
       - uses: actions/upload-artifact@v5
         if: matrix.target == 'wasm32-unknown-unknown'
         with:
