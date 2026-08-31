@@ -62,19 +62,20 @@
 //!   again. Spaces are therefore mapped *before* they are handed out, and a
 //!   post-realize retopology (a BAR move, hot-plug) needs the space behind a
 //!   `core::sync::RwLock`, or `map`/`unmap`/`remap` need to take `&self`.
-//! * **Catch-up cannot reach the scheduler.** `Scheduler::sync_for_access`
-//!   takes `&mut self`, but the access path that must call it —
-//!   `MemOps::read` — has `&self`. Sync-on-access (§4.2) is therefore not
-//!   wired here: it needs the scheduler behind a lock ranked
-//!   `LockRank::SCHED`.
+//! * **Catch-up reaches a device, not the scheduler.** Sync-on-access (§4.2)
+//!   has to fire from `MemOps::read`, which has `&self` and runs with the bus
+//!   lock held. `core::sched` answers that with
+//!   [`LazyHandle`](crate::core::sched::LazyHandle): a shared handle to one
+//!   lazily-advanced device that catches it up without taking any
+//!   scheduler-ranked lock — `LockRank::SCHED` is *above* `LockRank::BUS`, so
+//!   an access that reached back for one would invert the ladder. Nothing here
+//!   registers a lazy device yet, because no device class declares itself one;
+//!   when the PPU does, this layer clones the handle onto its mapping.
 //! * **A deferred action carries no context.** `Deferred`'s payload is
 //!   `FnOnce() + Send` with no arguments, so an action can only touch what it
 //!   captured — and it cannot capture the machine, which owns the queue. It
 //!   works for a device acting on its own state; a deferred remap needs the
 //!   drain to pass something in.
-//! * **The scheduler's event queue is not enumerable**, so §4.5's "the
-//!   scheduler is architectural state" cannot be honoured from outside
-//!   `core::sched`. See [`Machine::save`].
 //! * **Realize-time errors lose the caret.** [`Resolved`] carries a span on
 //!   every node, but realize returns [`Error`], not a `Diagnostic`, so the
 //!   `file:line:col` §5 promises "always" stops at validate. The spans are
@@ -429,7 +430,6 @@ struct Realizer<'a> {
     options: &'a RealizeOptions,
     spaces: Vec<(String, AddressSpace)>,
     forest: ClockForest,
-    domains: Vec<DomainId>,
     /// The domain each object was given, indexed like `Resolved::objects`.
     assigned: Vec<Option<DomainId>>,
     built: Vec<Built>,
@@ -454,7 +454,6 @@ impl<'a> Realizer<'a> {
             options,
             spaces: Vec::new(),
             forest: ClockForest::new(),
-            domains: Vec::new(),
             assigned: Vec::new(),
             built: Vec::new(),
             realized: 0,
@@ -500,7 +499,6 @@ impl<'a> Realizer<'a> {
             spaces: shared,
             sched,
             devices,
-            domains: core::mem::take(&mut self.domains),
             nets,
             sweep,
             shape: core::mem::take(&mut self.shape),
@@ -573,7 +571,6 @@ impl<'a> Realizer<'a> {
                 )
             })?;
             let root = self.forest.add_oscillator(&osc.name, hz)?;
-            self.domains.push(root);
             osc_roots.push(root);
         }
 
@@ -614,7 +611,6 @@ impl<'a> Realizer<'a> {
                 let id = self
                     .forest
                     .add_domain(&object.name, parent, clock.mul, clock.div)?;
-                self.domains.push(id);
                 assigned[i] = Some(id);
                 progress = true;
             }
@@ -2065,6 +2061,44 @@ machine "toy" {
         assert_eq!(r.read_u64().expect("units"), 1_000, "1 ms of master ticks");
 
         assert!(reader.find(crate::machine::machine::WIRE_PATH).is_some());
+        assert!(reader.find(crate::machine::machine::SCHED_PATH).is_some());
+    }
+
+    #[test]
+    fn a_snapshot_carries_the_scheduler_and_the_events_it_was_holding() {
+        // §4.5: the scheduler is architectural state. Before it was in the
+        // snapshot, a restored machine came back at virtual time zero with an
+        // empty queue, and a pending timer simply never fired again.
+        let mut machine = toy();
+        // The timer runs at 125 kHz, so this is 8 ms out — still pending after
+        // the millisecond below, which is the case that matters.
+        machine.schedule_after_ticks("timer", 1_000, 7).unwrap();
+        machine.run_for(a_millisecond()).expect("runs");
+        assert_eq!(timer_reg(&machine, 0), 0, "not due yet");
+
+        let saved = machine.save().expect("saves");
+        let now = machine.now();
+        assert!(now > crate::core::clock::GlobalTime::ZERO);
+
+        let mut restored = toy();
+        restored.load(&saved).expect("loads");
+        assert_eq!(
+            restored.now(),
+            now,
+            "virtual time is state, not a fresh start"
+        );
+
+        // Run both machines past the deadline. The restored one fires the event
+        // it was saved holding, at the same instant, and ends in the same state.
+        let deadline = crate::core::clock::GlobalTime::from_nanos(20_000_000);
+        machine.run_until(deadline).expect("runs");
+        restored.run_until(deadline).expect("runs");
+        assert_eq!(timer_reg(&machine, 0), 1, "the saved machine fired it");
+        assert_eq!(timer_reg(&restored, 0), 1, "and so did the restored one");
+        assert_eq!(
+            restored.state_hash().expect("hashes"),
+            machine.state_hash().expect("hashes")
+        );
     }
 
     #[test]

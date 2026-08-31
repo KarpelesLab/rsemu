@@ -36,16 +36,18 @@
 //! # Snapshots
 //!
 //! [`Machine::save`] writes one chunk per device keyed by instance path, plus
-//! two chunks of machine-level state: [`CLOCK_PATH`] for the oscillator forest
-//! and [`WIRE_PATH`] for the levels every wire source is driving. Both begin
+//! three chunks of machine-level state: [`CLOCK_PATH`] for the oscillator
+//! forest, [`SCHED_PATH`] for virtual time and the event queue, and
+//! [`WIRE_PATH`] for the levels every wire source is driving. All three begin
 //! with `/`, which no object name can, so they can never collide with a device.
 //!
-//! What is **not** in the snapshot, and should be: the scheduler's event queue
-//! and its virtual-time front. §4.5 is explicit that both are architectural
-//! state, and they are — but `core::sched` exposes no way to enumerate queued
-//! events or to restore `now`, so this layer cannot write what it cannot read
-//! back. See the module docs of [`realize`](mod@crate::machine::realize) for the
-//! full list of seams this turned up.
+//! The scheduler chunk is there because §4.5 says the scheduler *is*
+//! architectural state: the pending events, the front of virtual time and the
+//! tie-break sequence counter all have to survive a load, or a restored timer
+//! comes back a whole period from firing instead of the forty cycles it was
+//! actually at. It is written after the clocks and read back after them too,
+//! since the positions it republishes to lazily-advanced devices are derived
+//! from the forest's tick counters.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -58,8 +60,8 @@ use crate::core::clock::{ClockForest, DomainId, GlobalTime};
 use crate::core::device::{Deferred, Device, DeviceClass, ResetKind};
 use crate::core::error::{Error, Result};
 use crate::core::sched::{
-    Budget, Consumed, EventId, EventTarget, HostClock, QuantumReport, Runnable, RunnableId,
-    Scheduler,
+    Budget, Consumed, Event, EventId, EventTarget, HostClock, QuantumReport, Runnable, RunnableId,
+    Scheduler, SchedulerSnapshot,
 };
 use crate::core::space::{AddressSpace, RequesterId};
 use crate::core::state::{MachineShape, Migrations, Sink, Source, StateReader, StateWriter};
@@ -77,6 +79,12 @@ pub const WIRE_PATH: &str = "/wires";
 
 /// The class name recorded on the [`WIRE_PATH`] chunk.
 pub const WIRE_CLASS: &str = "machine.wires";
+
+/// The snapshot chunk holding the scheduler: virtual time and the event queue.
+pub const SCHED_PATH: &str = "/sched";
+
+/// The class name recorded on the [`SCHED_PATH`] chunk.
+pub const SCHED_CLASS: &str = "machine.sched";
 
 /// The version of the machine-level chunks written by this build.
 pub const MACHINE_STATE_VERSION: u32 = 1;
@@ -230,12 +238,6 @@ pub struct Machine {
     sched: Scheduler,
     devices: Vec<DeviceEntry>,
     by_path: BTreeMap<String, usize>,
-    /// Every domain the realizer created, in creation order.
-    ///
-    /// Kept because `ClockForest` counts its domains but does not enumerate
-    /// them, and `DomainId` is opaque — so the only way to save a forest's tick
-    /// counters is to have remembered the handles.
-    domains: Vec<DomainId>,
     nets: Vec<Net>,
     sweep: Vec<PinRef>,
     shape: MachineShape,
@@ -252,7 +254,6 @@ pub(crate) struct MachineParts {
     pub(crate) spaces: Vec<(String, Arc<AddressSpace>)>,
     pub(crate) sched: Scheduler,
     pub(crate) devices: Vec<DeviceEntry>,
-    pub(crate) domains: Vec<DomainId>,
     pub(crate) nets: Vec<Net>,
     pub(crate) sweep: Vec<PinRef>,
     pub(crate) shape: MachineShape,
@@ -279,7 +280,6 @@ impl Machine {
             sched: parts.sched,
             devices: parts.devices,
             by_path,
-            domains: parts.domains,
             nets: parts.nets,
             sweep: parts.sweep,
             shape: parts.shape,
@@ -521,7 +521,7 @@ impl Machine {
     // -----------------------------------------------------------------
 
     /// Serialize the whole machine: one chunk per device, keyed by instance
-    /// path, plus the clock forest and the wire levels (§4.5).
+    /// path, plus the clock forest, the scheduler and the wire levels (§4.5).
     ///
     /// # Errors
     ///
@@ -534,7 +534,11 @@ impl Machine {
         }
         {
             let mut chunk = w.chunk(CLOCK_PATH, CLOCK_CLASS, MACHINE_STATE_VERSION)?;
-            save_clocks(self.sched.forest(), &self.domains, &mut chunk)?;
+            save_clocks(self.sched.forest(), &mut chunk)?;
+        }
+        {
+            let mut chunk = w.chunk(SCHED_PATH, SCHED_CLASS, MACHINE_STATE_VERSION)?;
+            save_sched(&self.sched, &mut chunk)?;
         }
         {
             let mut chunk = w.chunk(WIRE_PATH, WIRE_CLASS, MACHINE_STATE_VERSION)?;
@@ -579,7 +583,12 @@ impl Machine {
             entry.device.load(&mut r)?;
         }
         let clocks = reader.load(CLOCK_PATH, CLOCK_CLASS, MACHINE_STATE_VERSION, migrations)?;
-        load_clocks(self.sched.forest_mut(), &self.domains, &mut clocks.reader())?;
+        load_clocks(self.sched.forest_mut(), &mut clocks.reader())?;
+        // After the clocks: the scheduler's restore republishes every lazily
+        // advanced device's domain position, which is only right once the tick
+        // counters those positions come from are back.
+        let sched = reader.load(SCHED_PATH, SCHED_CLASS, MACHINE_STATE_VERSION, migrations)?;
+        load_sched(&mut self.sched, &mut sched.reader())?;
         let wires = reader.load(WIRE_PATH, WIRE_CLASS, MACHINE_STATE_VERSION, migrations)?;
         load_wires(&self.nets, &mut wires.reader())?;
         self.deferred.drain();
@@ -621,25 +630,27 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 ///
 /// The tick counters are the authoritative architectural state (§4.2); the
 /// global timeline is derived from them and is recomputed on restore.
-fn save_clocks(forest: &ClockForest, domains: &[DomainId], sink: &mut impl Sink) -> Result<()> {
+///
+/// Both sequences come from the forest's own enumeration, in creation order, so
+/// the writer and the reader agree without either of them having to have kept a
+/// list of handles.
+fn save_clocks(forest: &ClockForest, sink: &mut impl Sink) -> Result<()> {
     let oscillators: Vec<_> = forest.oscillators().collect();
     sink.write_seq_len(oscillators.len() as u64)?;
     for osc in oscillators {
         sink.write_u64(forest.unit_position(osc)?)?;
     }
+    let domains: Vec<_> = forest.domains().collect();
     sink.write_seq_len(domains.len() as u64)?;
     for id in domains {
-        sink.write_u64(forest.ticks(*id)?)?;
+        sink.write_u64(forest.ticks(id)?)?;
     }
     Ok(())
 }
 
 /// Restore what [`save_clocks`] wrote.
-fn load_clocks<'a>(
-    forest: &mut ClockForest,
-    domains: &[DomainId],
-    src: &mut impl Source<'a>,
-) -> Result<()> {
+fn load_clocks<'a>(forest: &mut ClockForest, src: &mut impl Source<'a>) -> Result<()> {
+    let domains: Vec<_> = forest.domains().collect();
     let count = src.read_seq_len(8)? as usize;
     let oscillators: Vec<_> = forest.oscillators().collect();
     if count != oscillators.len() {
@@ -661,8 +672,58 @@ fn load_clocks<'a>(
         )));
     }
     for id in domains {
-        forest.restore_ticks(*id, src.read_u64()?)?;
+        forest.restore_ticks(id, src.read_u64()?)?;
     }
+    Ok(())
+}
+
+/// Write the scheduler's own architectural state (§4.5).
+///
+/// Virtual time, every pending event in fire order, the tie-break sequence
+/// counter and the round-robin cursor. Re-deriving the queue by asking devices
+/// to re-register would lose sub-tick phase — a timer 40 cycles from firing
+/// would come back a whole period from firing — so the queue is written
+/// verbatim.
+fn save_sched(sched: &Scheduler, sink: &mut impl Sink) -> Result<()> {
+    let snapshot = sched.snapshot();
+    sink.write_u128(snapshot.now.raw())?;
+    sink.write_u64(snapshot.next_seq)?;
+    sink.write_u64(snapshot.cursor as u64)?;
+    sink.write_seq_len(snapshot.events.len() as u64)?;
+    for event in &snapshot.events {
+        sink.write_u128(event.time.raw())?;
+        sink.write_u64(event.id.seq())?;
+        sink.write_u32(event.target.0)?;
+        sink.write_u64(event.token)?;
+    }
+    Ok(())
+}
+
+/// Restore what [`save_sched`] wrote.
+fn load_sched<'a>(sched: &mut Scheduler, src: &mut impl Source<'a>) -> Result<()> {
+    let now = GlobalTime::from_raw(src.read_u128()?);
+    let next_seq = src.read_u64()?;
+    let cursor = usize::try_from(src.read_u64()?)
+        .map_err(|_| Error::State(String::from("scheduler cursor does not fit this host")))?;
+    // Sixteen bytes of instant, eight of sequence, four of target, eight of
+    // token: an event cannot encode in fewer, so a corrupt count is caught
+    // before anything is reserved.
+    let count = src.read_seq_len(36)? as usize;
+    let mut events = Vec::with_capacity(count.min(src.remaining()));
+    for _ in 0..count {
+        events.push(Event {
+            time: GlobalTime::from_raw(src.read_u128()?),
+            id: EventId::from_seq(src.read_u64()?),
+            target: EventTarget(src.read_u32()?),
+            token: src.read_u64()?,
+        });
+    }
+    sched.restore(&SchedulerSnapshot {
+        now,
+        next_seq,
+        cursor,
+        events,
+    })?;
     Ok(())
 }
 
