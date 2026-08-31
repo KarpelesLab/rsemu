@@ -910,7 +910,7 @@ impl Pit8254 {
     ///
     /// # Errors
     ///
-    /// [`Error::Property`](crate::core::Error::Property) if a property this
+    /// [`Error::Property`] if a property this
     /// class does not know was given.
     pub fn new(props: &Props) -> Result<Pit8254> {
         props.reader().finish()?;
@@ -1196,7 +1196,7 @@ fn unknown_pin(port: &str) -> Error {
 ///
 /// # Errors
 ///
-/// [`Error::Config`](crate::core::Error::Config) if the name is claimed.
+/// [`Error::Config`] if the name is claimed.
 pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     registry.add(&CLASS)
 }
@@ -1205,7 +1205,7 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
 ///
 /// # Errors
 ///
-/// [`Error::Config`](crate::core::Error::Config) if the class is bound twice.
+/// [`Error::Config`] if the class is bound twice.
 pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     bindings.bind(CLASS_NAME, |props| Ok(Arc::new(Pit8254::new(props)?)))
 }

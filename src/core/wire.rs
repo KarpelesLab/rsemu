@@ -312,9 +312,9 @@ pub trait WireSink: Send + Sync {
 /// bookkeeping wrong.
 ///
 /// So the acknowledge travels with the net rather than through a device handle:
-/// the driving device offers one with [`Device::int_ack`], the realizer hands
-/// it to every sink on that net with [`Device::attach_int_ack`], and the sink
-/// keeps a [`Weak`](alloc::sync::Weak) reference — the machine owns devices and
+/// the driving device offers one with [`Device::int_ack`](crate::core::device::Device::int_ack), the realizer hands
+/// it to every sink on that net with [`Device::attach_int_ack`](crate::core::device::Device::attach_int_ack), and the sink
+/// keeps a [`Weak`] reference — the machine owns devices and
 /// a wire merely refers to them (§4.3's weak edge), so a CPU holding its
 /// controller alive would be a cycle nothing could drop.
 ///
@@ -339,7 +339,7 @@ pub trait IntAck: Send + Sync + fmt::Debug {
 /// `DRQ` is a wire and carries a level, but the transfer that level asks for
 /// moves *bytes* between the controller and the peripheral, over `DACK` and
 /// `IOR`/`IOW` — and a wire cannot carry a byte. So the peripheral offers this
-/// on its `DRQ` pin with `Device::dma_peripheral`, and the controller, which is
+/// on its `DRQ` pin with [`Device::dma_peripheral`](crate::core::Device::dma_peripheral), and the controller, which is
 /// the sink on that net, is handed it by the realizer.
 ///
 /// The same shape as [`IntAck`] and for the same reason: the interesting half

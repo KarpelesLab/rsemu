@@ -1034,8 +1034,11 @@ impl<'a> Realizer<'a> {
             }
             let source_ids: Vec<WireId> = sources.iter().map(|p| ids[*p]).collect();
             let mut builder = Wire::builder().sources(&source_ids);
-            let receivers: Vec<usize> =
-                group.iter().copied().filter(|p| pins.receives[*p]).collect();
+            let receivers: Vec<usize> = group
+                .iter()
+                .copied()
+                .filter(|p| pins.receives[*p])
+                .collect();
             for pin in receivers.iter().copied() {
                 let (object, port) = pins.pin(pin);
                 let built = self.device(object, "wire")?;

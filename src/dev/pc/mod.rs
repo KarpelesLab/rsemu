@@ -150,8 +150,12 @@ pub const PC_AT: &str = include_str!("../../../machines/pc-at.machine");
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(feature = "dev-pc-video", feature = "dev-pc-floppy"))]
+    use crate::machine::ClassTable;
+    use crate::machine::ResolveOptions;
+    use crate::machine::resolve_file;
+    #[cfg(all(feature = "dev-pc-video", feature = "dev-pc-floppy"))]
     use crate::machine::validate::{ClassSchema, PortDir, PropSchema, ValidateOptions, validate};
-    use crate::machine::{ClassTable, ResolveOptions, resolve_file};
     use alloc::string::ToString;
 
     /// What the PC board needs from the x86 core, written here because the core
@@ -165,10 +169,14 @@ mod tests {
     /// below is exactly what has to appear for that to happen — and asserting
     /// the machine file against it here means the board is checked today rather
     /// than after the core catches up.
+    #[cfg(all(feature = "dev-pc-video", feature = "dev-pc-floppy"))]
     fn x86_schema() -> ClassSchema {
         ClassSchema::new("cpu.i8086")
             .prop(PropSchema::new("model", crate::core::props::ValueKind::Str))
-            .prop(PropSchema::new("engine", crate::core::props::ValueKind::Str))
+            .prop(PropSchema::new(
+                "engine",
+                crate::core::props::ValueKind::Str,
+            ))
             // The second address space. `space =` is structural and there is
             // only one of it, so the I/O space is named by an ordinary string
             // property and looked up with `BindCtx::space_named`.
@@ -186,6 +194,7 @@ mod tests {
             .port("a20", PortDir::In)
     }
 
+    #[cfg(all(feature = "dev-pc-video", feature = "dev-pc-floppy"))]
     fn classes() -> ClassTable {
         let mut table = ClassTable::new();
         for schema in crate::machine::builtin::schemas() {
@@ -222,6 +231,10 @@ mod tests {
         assert_eq!(resolved.spaces.len(), 2, "memory and I/O are separate");
     }
 
+    // The board names a display and a floppy controller, so it can only be
+    // checked against a build that has them. A `dev-pc`-only build still parses
+    // it — the test above — which is the half that does not depend on features.
+    #[cfg(all(feature = "dev-pc-video", feature = "dev-pc-floppy"))]
     #[test]
     fn the_board_validates_against_this_builds_classes() {
         // Everything the board names exists, every property is one its class

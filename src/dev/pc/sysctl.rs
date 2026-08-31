@@ -1,4 +1,5 @@
-//! The AT's two system control ports: 0x61 (port B) and 0x92 (port A).
+//! The AT's system control ports — 0x61 (port B) and 0x92 (port A) — and the
+//! chipset reset control register at 0xcf9.
 //!
 //! # Sources
 //!
@@ -10,6 +11,12 @@
 //!   the bit-level read/write behaviour the board, not a data sheet, defines.
 //! * The PS/2 and later AT chipset convention for port 0x92 ("System Control
 //!   Port A"): bit 0 fast reset, bit 1 A20 gate.
+//! * Intel PIIX-family and ICH-family data sheets, the *Reset Control* register
+//!   at I/O address 0xcf9: bit 1 `SYS_RST` selects the kind of reset, bit 2
+//!   `RST_CPU` triggers it on a low-to-high transition, and on the later parts
+//!   bit 3 `FULL_RST` asks for a power cycle rather than a reset. Ralf Brown's
+//!   Interrupt List, ports section, entry 0CF9 says the same from the
+//!   firmware's side.
 //!
 //! No emulator source was consulted (`CLAUDE.md`, provenance).
 //!
@@ -25,10 +32,19 @@
 //! answer an address it does not decode, and would put the A20 gate in two
 //! places at once when the board's A20 is the wired-OR of both paths.
 //!
-//! Two ports thirty-one addresses apart are two regions, not one window with a
-//! hole in it, so a machine file maps [`region("portb")`](Device::region) at
-//! 0x61 and [`region("porta")`](Device::region) at 0x92. `""` is port B,
-//! because it is the one every AT has.
+//! Port 0xcf9 is that same argument one chipset generation later. It is a latch
+//! in the south bridge rather than a register of any chip a machine file
+//! instantiates, and its whole job is to pull the reset pin port 0x92 bit 0
+//! already pulls. It belongs here for exactly the reason the other two do, and
+//! keeping it here leaves the board's reset the wired-OR of every path to it
+//! instead of something two devices each believe they own. Two ways to reboot a
+//! PC becoming three is a fact about PC chipsets, not a modelling choice.
+//!
+//! Three ports scattered across the I/O map are three regions, not one window
+//! with holes in it, so a machine file maps
+//! [`region("portb")`](Device::region) at 0x61, `region("porta")` at 0x92 and
+//! `region("resetctl")` at 0xcf9. `""` is port B, because it is the one every
+//! AT has.
 //!
 //! # Port B, 0x61
 //!
@@ -80,6 +96,27 @@
 //! / `out 0x92,al`), and a bit 0 that read back set would reset the machine on
 //! the way past.
 //!
+//! # Reset control, 0xcf9
+//!
+//! ```text
+//!   bit 3  FULL_RST   latched, reads back; a power cycle rather than a reset
+//!   bit 2  RST_CPU    a 0->1 write transition pulses `reset`; reads back clear
+//!   bit 1  SYS_RST    latched, reads back; clear is a soft reset, set a full one
+//! ```
+//!
+//! Bit 2 is the trigger and the other two are the modifiers it acts on, which
+//! is why firmware writes 0x02 and then 0x06 rather than 0x06 twice: the reset
+//! happens on the transition of bit 2, so a write that leaves it already set
+//! asks for nothing new. Bit 2 reads back clear for the same reason port 0x92
+//! bit 0 does — a read-modify-write that saw it set would reset the machine on
+//! the way past — and the level it was last written with is remembered, so the
+//! next write can be told to be a transition rather than a repeat.
+//!
+//! Nothing here distinguishes a soft reset from a full one or from a power
+//! cycle. `SYS_RST` and `FULL_RST` are latched and read back so firmware sees
+//! what it wrote, but rsemu has one kind of reset on this pin, and a second
+//! would mean inventing a power-cycle path the machine does not have.
+//!
 //! # No `speaker` property
 //!
 //! There is deliberately none. The only named-signal seam in the tree is
@@ -112,12 +149,14 @@ use crate::machine::validate::ClassSchema;
 pub const CLASS_NAME: &str = "pc.sysctl";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+///
+/// 2 appended the 0xcf9 latch and bit 2's remembered level to the chunk.
+const STATE_VERSION: u32 = 2;
 
 /// How much address space each port answers.
 ///
-/// One byte each. The two are thirty-one addresses apart, so they are separate
-/// regions rather than one window — see the module docs.
+/// One byte each. The three are scattered across the I/O map, so they are
+/// separate regions rather than one window — see the module docs.
 pub const REGISTER_WINDOW_LEN: u64 = 1;
 
 // -- port B (0x61) ----------------------------------------------------------
@@ -150,6 +189,19 @@ const A_FAST_RESET: u8 = 0x01;
 /// The fast A20 gate, driven out on the `a20` pin.
 const A_GATE_A20: u8 = 0x02;
 
+// -- reset control (0xcf9) --------------------------------------------------
+
+/// `SYS_RST`: clear asks for a soft reset, set for a full one. Latched.
+const C_SYS_RST: u8 = 0x02;
+/// `RST_CPU`: the trigger. A write taking it from clear to set pulses `reset`.
+const C_RST_CPU: u8 = 0x04;
+/// `FULL_RST`: on the later chipsets, a power cycle rather than a reset.
+/// Latched and read back; the module docs say why it changes nothing else.
+const C_FULL_RST: u8 = 0x08;
+/// The two bits a write latches. Bit 2 is edge-sensitive and reads back clear,
+/// and the rest of the byte lands nowhere.
+const C_LATCH_MASK: u8 = C_SYS_RST | C_FULL_RST;
+
 // -- input pins -------------------------------------------------------------
 
 /// The line number [`Device::sink`] hands out for the `refresh` input.
@@ -180,6 +232,11 @@ struct State {
     refresh_in: bool,
     /// The last level seen on the `timer2` pin, which port B bit 5 reports.
     timer2_in: bool,
+    /// The 0xcf9 write latch, bits 1 and 3 only. Bit 2 is never in here.
+    reset_ctl: u8,
+    /// The level bit 2 was last written with, so the next write can be told to
+    /// be a transition rather than a repeat.
+    rst_cpu: bool,
 }
 
 /// The latches, and the three pins they drive.
@@ -263,6 +320,21 @@ impl Registers {
         self.state.lock().port_a
     }
 
+    /// Pulse the CPU reset line, if it is connected.
+    ///
+    /// A pulse, not a level: holding reset would need somebody to release it,
+    /// and nothing on the board does. Both paths to a reset — port 0x92 bit 0
+    /// and 0xcf9 bit 2 — come through here, because the board has one reset pin
+    /// and the net resolves the rest.
+    ///
+    /// Never called with the state lock held.
+    fn pulse_reset(&self) {
+        let out = self.reset.lock().clone();
+        if let Some(out) = out {
+            out.pulse(Level::High);
+        }
+    }
+
     /// Latch a port A write, move A20, and pulse reset if asked.
     fn write_a(&self, value: u8) {
         let (a20, fast_reset) = {
@@ -278,12 +350,30 @@ impl Registers {
         // device's own `reset` through the machine's reset tree.
         drive(&self.a20, a20);
         if fast_reset {
-            // A pulse, not a level. Holding reset would need somebody to
-            // release it, and nothing on the board does.
-            let out = self.reset.lock().clone();
-            if let Some(out) = out {
-                out.pulse(Level::High);
-            }
+            self.pulse_reset();
+        }
+    }
+
+    /// The reset control register as a read produces it. Bit 2 is never set —
+    /// module docs.
+    fn read_c(&self) -> u8 {
+        self.state.lock().reset_ctl
+    }
+
+    /// Latch a 0xcf9 write, and pulse reset on bit 2's low-to-high transition.
+    fn write_c(&self, value: u8) {
+        let trigger = {
+            let mut s = self.state.lock();
+            s.reset_ctl = value & C_LATCH_MASK;
+            let armed = value & C_RST_CPU != 0;
+            // The reset is on the transition, which is why firmware writes 0x02
+            // and then 0x06: a write leaving bit 2 set asks for nothing new.
+            let trigger = armed && !s.rst_cpu;
+            s.rst_cpu = armed;
+            trigger
+        };
+        if trigger {
+            self.pulse_reset();
         }
     }
 
@@ -324,14 +414,18 @@ struct PortB(Arc<Registers>);
 #[derive(Debug)]
 struct PortA(Arc<Registers>);
 
-/// An 8-bit port on an 8-bit bus. Both ports are one byte at one address, so a
-/// wider access is a decode this board never performs.
+/// Port 0xcf9, as something an address space can dispatch to.
+#[derive(Debug)]
+struct ResetCtl(Arc<Registers>);
+
+/// An 8-bit port on an 8-bit bus. Every port here is one byte at one address,
+/// so a wider access is a decode this board never performs.
 fn byte_port() -> AccessConstraints {
     AccessConstraints::word(Width::U8, Endian::Little)
 }
 
-/// Both ports are one byte at one address, so anything else is a decode this
-/// board never performs.
+/// Every port here is one byte at one address, so anything else is a decode
+/// this board never performs.
 fn only_byte_zero(offset: u64, len: usize) -> MemResult {
     if offset == 0 && len == 1 {
         Ok(())
@@ -389,6 +483,33 @@ impl MemOps for PortA {
     }
 }
 
+impl MemOps for ResetCtl {
+    fn read(&self, offset: u64, dst: &mut [u8], _attrs: MemAttrs) -> MemResult {
+        only_byte_zero(offset, dst.len())?;
+        // No `debug` branch: the read hands back the latches and arms nothing,
+        // so a debugger's window can poll it as often as it likes.
+        dst[0] = self.0.read_c();
+        Ok(())
+    }
+
+    fn write(&self, offset: u64, src: &[u8], attrs: MemAttrs) -> MemResult {
+        only_byte_zero(offset, src.len())?;
+        if attrs.debug {
+            // A debug write of bit 2 would reboot the machine somebody is
+            // debugging, and one that only latched bits 1 and 3 would still
+            // move bit 2's remembered level, swallowing the guest's own
+            // transition or manufacturing one.
+            return Err(BusError::BadAccess);
+        }
+        self.0.write_c(src[0]);
+        Ok(())
+    }
+
+    fn constraints(&self) -> AccessConstraints {
+        byte_port()
+    }
+}
+
 /// One of the two input pins, with the fan-in that makes a shared net correct.
 #[derive(Debug)]
 struct InputPin {
@@ -418,6 +539,7 @@ pub struct SysCtl {
     regs: Arc<Registers>,
     port_b: RegionRef,
     port_a: RegionRef,
+    reset_ctl: RegionRef,
     /// The sinks handed out by [`Device::sink`], kept alive here: a net holds
     /// only a weak reference to a sink, so the device owns the strong one.
     pins: Mutex<Vec<Arc<InputPin>>>,
@@ -454,10 +576,16 @@ impl SysCtl {
             REGISTER_WINDOW_LEN,
             Arc::new(PortA(Arc::clone(&regs))) as Arc<dyn MemOps>,
         ));
+        let reset_ctl: RegionRef = Arc::new(Region::io(
+            "pc.sysctl.resetctl",
+            REGISTER_WINDOW_LEN,
+            Arc::new(ResetCtl(Arc::clone(&regs))) as Arc<dyn MemOps>,
+        ));
         SysCtl {
             regs,
             port_b,
             port_a,
+            reset_ctl,
             pins: Mutex::with_rank(LockRank::LEAF, Vec::new()),
         }
     }
@@ -484,7 +612,7 @@ impl SysCtl {
 pub static CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
     version: STATE_VERSION,
-    summary: "the AT system control ports: speaker gate, refresh toggle, A20 and fast reset",
+    summary: "the AT system control ports: speaker gate, refresh toggle, A20 and the reset paths",
     properties: &[],
     construct: |props| Ok(Box::new(SysCtl::new(props)?)),
 };
@@ -524,6 +652,7 @@ impl Device for SysCtl {
             // file that maps only a speaker gate wants.
             "" | "portb" => Some(Arc::clone(&self.port_b)),
             "porta" => Some(Arc::clone(&self.port_a)),
+            "resetctl" => Some(Arc::clone(&self.reset_ctl)),
             _ => None,
         }
     }
@@ -577,7 +706,12 @@ impl Device for SysCtl {
         // the machine's topology, but whether the refresh pin was last seen
         // high decides whether the next notification is an edge.
         w.write_bool(s.refresh_in)?;
-        w.write_bool(s.timer2_in)
+        w.write_bool(s.timer2_in)?;
+        w.write_u8(s.reset_ctl)?;
+        // Bit 2's remembered level, for the reason the input levels are saved:
+        // whether the next write is a transition depends on it, and a snapshot
+        // that dropped it would turn a repeated 0x06 into a reboot.
+        w.write_bool(s.rst_cpu)
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -589,6 +723,8 @@ impl Device for SysCtl {
             refresh_toggle: r.read_bool()?,
             refresh_in: r.read_bool()?,
             timer2_in: r.read_bool()?,
+            reset_ctl: r.read_u8()? & C_LATCH_MASK,
+            rst_cpu: r.read_bool()?,
         };
         *self.regs.state.lock() = state;
         // The gate and A20 are levels the rest of the machine has to agree
@@ -627,6 +763,7 @@ pub fn schema() -> ClassSchema {
         .region("")
         .region("portb")
         .region("porta")
+        .region("resetctl")
         .port("refresh", PortDir::In)
         .port("timer2", PortDir::In)
         .port("gate2", PortDir::Out)
@@ -715,6 +852,7 @@ mod tests {
     fn ops(dev: &SysCtl, region: &str) -> Arc<dyn MemOps> {
         match region {
             "porta" => Arc::new(PortA(Arc::clone(&dev.regs))) as Arc<dyn MemOps>,
+            "resetctl" => Arc::new(ResetCtl(Arc::clone(&dev.regs))) as Arc<dyn MemOps>,
             _ => Arc::new(PortB(Arc::clone(&dev.regs))) as Arc<dyn MemOps>,
         }
     }
@@ -791,6 +929,91 @@ mod tests {
     }
 
     #[test]
+    fn reset_control_pulses_on_bit_2s_transition_and_not_on_a_repeat() {
+        // Firmware writes 0x02 and then 0x06 for exactly this reason.
+        let dev = SysCtl::default_device();
+        let reset = watch(&dev, "reset");
+
+        poke(&dev, "resetctl", C_SYS_RST);
+        assert_eq!(reset.rises(), 0, "arming the kind of reset is not a reset");
+
+        poke(&dev, "resetctl", C_SYS_RST | C_RST_CPU);
+        assert_eq!(reset.rises(), 1);
+        assert!(!reset.high(), "a pulse, not a level");
+
+        poke(&dev, "resetctl", C_SYS_RST | C_RST_CPU);
+        assert_eq!(
+            reset.rises(),
+            1,
+            "a write that leaves bit 2 set is not an edge"
+        );
+
+        // Dropping bit 2 and raising it again is a second transition.
+        poke(&dev, "resetctl", C_SYS_RST);
+        assert_eq!(reset.rises(), 1);
+        poke(&dev, "resetctl", C_SYS_RST | C_RST_CPU);
+        assert_eq!(reset.rises(), 2);
+    }
+
+    #[test]
+    fn reset_control_reaches_the_same_reset_pin_as_port_a() {
+        // The board has one reset pin and three ways to pull it; that is a fact
+        // about PC chipsets, and the net resolves the rest.
+        let dev = SysCtl::default_device();
+        let reset = watch(&dev, "reset");
+        poke(&dev, "porta", A_FAST_RESET);
+        assert_eq!(reset.rises(), 1);
+        poke(&dev, "resetctl", C_RST_CPU);
+        assert_eq!(reset.rises(), 2);
+    }
+
+    #[test]
+    fn reset_control_bit_2_reads_back_clear_and_the_others_read_back() {
+        let dev = SysCtl::default_device();
+        assert_eq!(peek(&dev, "resetctl"), 0, "clear at power-on");
+
+        poke(&dev, "resetctl", C_SYS_RST | C_RST_CPU | C_FULL_RST);
+        // Bit 2 reads back clear, or the read-modify-write a firmware routine
+        // performs would reboot the machine on its way past.
+        assert_eq!(peek(&dev, "resetctl"), C_SYS_RST | C_FULL_RST);
+
+        poke(&dev, "resetctl", C_FULL_RST);
+        assert_eq!(peek(&dev, "resetctl"), C_FULL_RST);
+
+        // The bits outside the register land nowhere.
+        poke(&dev, "resetctl", 0xf0 | C_SYS_RST);
+        assert_eq!(peek(&dev, "resetctl"), C_SYS_RST);
+    }
+
+    #[test]
+    fn a_debug_access_of_the_reset_control_register_neither_reboots_nor_arms() {
+        let dev = SysCtl::default_device();
+        let reset = watch(&dev, "reset");
+        poke(&dev, "resetctl", C_SYS_RST);
+        let before = peek(&dev, "resetctl");
+
+        let mut byte = [0u8; 1];
+        for _ in 0..3 {
+            ops(&dev, "resetctl")
+                .read(0, &mut byte, MemAttrs::DEBUG)
+                .expect("a debug read is legal");
+            assert_eq!(byte[0], before, "and it moved nothing");
+        }
+
+        assert!(
+            ops(&dev, "resetctl")
+                .write(0, &[C_SYS_RST | C_RST_CPU], MemAttrs::DEBUG)
+                .is_err()
+        );
+        assert_eq!(reset.rises(), 0, "nothing was rebooted");
+        assert_eq!(peek(&dev, "resetctl"), before, "and nothing was latched");
+        // The refused write did not remember bit 2 either, so the guest's own
+        // transition is still a transition.
+        poke(&dev, "resetctl", C_SYS_RST | C_RST_CPU);
+        assert_eq!(reset.rises(), 1);
+    }
+
+    #[test]
     fn writing_the_enable_bits_clears_the_check_status_bits() {
         // The AT has no acknowledge register: this write *is* how a parity NMI
         // handler stops being re-entered.
@@ -847,7 +1070,7 @@ mod tests {
     #[test]
     fn an_access_that_is_not_a_single_byte_at_offset_zero_is_refused() {
         let dev = SysCtl::default_device();
-        for region in ["portb", "porta"] {
+        for region in ["portb", "porta", "resetctl"] {
             let ops = ops(&dev, region);
             assert!(ops.read(0, &mut [0u8; 2], MemAttrs::DEFAULT).is_err());
             assert!(ops.read(1, &mut [0u8; 1], MemAttrs::DEFAULT).is_err());
@@ -918,6 +1141,9 @@ mod tests {
         let timer2 = feed(&saved, "timer2");
         poke(&saved, "portb", B_GATE2 | B_SPEAKER | B_IOCHK_ENABLE);
         poke(&saved, "porta", A_GATE_A20 | 0x40);
+        // Bit 2 set as well, so the remembered trigger level is true on the far
+        // side and a snapshot that dropped it would reboot on the next 0x06.
+        poke(&saved, "resetctl", C_SYS_RST | C_RST_CPU | C_FULL_RST);
         saved.raise_parity_check();
         // An odd number of edges, so the toggle is set and the pin is high:
         // the two are independent and a snapshot that conflated them would
@@ -929,6 +1155,7 @@ mod tests {
         let restored = SysCtl::default_device();
         let gate2 = watch(&restored, "gate2");
         let a20 = watch(&restored, "a20");
+        let reset = watch(&restored, "reset");
         let reader = StateReader::new(&image).unwrap();
         let chunk = reader
             .load("sysctl", CLASS.name, CLASS.version, &Migrations::new())
@@ -937,6 +1164,7 @@ mod tests {
 
         assert_eq!(peek(&restored, "portb"), peek(&saved, "portb"));
         assert_eq!(peek(&restored, "porta"), peek(&saved, "porta"));
+        assert_eq!(peek(&restored, "resetctl"), peek(&saved, "resetctl"));
         assert!(gate2.high(), "the levels were re-driven on load");
         assert!(a20.high());
         // The remembered refresh level came back, so the next notification of
@@ -946,6 +1174,16 @@ mod tests {
         assert_eq!(
             peek(&restored, "portb") & B_REFRESH,
             peek(&saved, "portb") & B_REFRESH
+        );
+
+        // Bit 2's remembered level came back, so the same write is still not a
+        // transition. The latched bits are unchanged by it, so the image is
+        // still the one that was saved.
+        poke(&restored, "resetctl", C_SYS_RST | C_RST_CPU | C_FULL_RST);
+        assert_eq!(
+            reset.rises(),
+            0,
+            "a repeat is not an edge, even after a load"
         );
 
         assert_eq!(save_image(&restored), image, "byte-identical");

@@ -243,7 +243,16 @@ machine "pc-at" {
   map port 0x0061 size 0x0001 = sysctl.portb   # speaker, timer 2 out, refresh
   map port 0x0064 size 0x0001 = kbc.cmd        # 8042 status and command
   map port 0x0070 size 0x0002 = cmos.regs      # RTC index (with the NMI mask)
-  map port 0x0080 size 0x0010 = dma1.pages     # the DMA page latches
+  # The page latches. On a real AT these are one file of 74LS612-style latches
+  # serving both controllers, and the offsets are not in channel order — 0x87 is
+  # channel 0, 0x81 is channel 2, 0x8b is channel 5. rsemu gives each controller
+  # its own latch file and hands it the half that holds its own channels'
+  # bytes, which is why the second one is aliased at offset 8: no page byte is
+  # ever read by a controller that does not own that channel, so splitting the
+  # file changes nothing observable and saves inventing a third device for
+  # sixteen bytes of latch.
+  map port 0x0080 size 0x0008 = alias(dma1.pages, 0)   # channels 0-3, and 0x80
+  map port 0x0088 size 0x0008 = alias(dma2.pages, 8)   # channels 5-7
   map port 0x0092 size 0x0001 = sysctl.porta   # fast A20 and fast reset
   map port 0x00a0 size 0x0002 = pic2.regs      # slave 8259A
   map port 0x00c0 size 0x0020 = dma2.regs      # DMA 2, channels 4-7, at 2x
@@ -255,6 +264,11 @@ machine "pc-at" {
   map port 0x03f0 size 0x0008 = fdc.regs       # uPD765A
   map port 0x04d0 size 0x0001 = pic1.elcr      # edge/level control, master
   map port 0x04d1 size 0x0001 = pic2.elcr      # edge/level control, slave
+
+  # The chipset's own reset control register, and the third way to reboot a PC.
+  # Firmware writes 0x02 then 0x06 here — the reset happens on bit 2's rising
+  # edge — and it is the fastest of the three, which is why it exists at all.
+  map port 0x0cf9 size 0x0001 = sysctl.resetctl
 
   # -- the wires --------------------------------------------------------------
   #

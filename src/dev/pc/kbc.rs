@@ -922,7 +922,7 @@ impl Kbc8042 {
     ///
     /// # Errors
     ///
-    /// [`Error::Property`](crate::core::Error::Property) if a property is of
+    /// [`Error::Property`] if a property is of
     /// the wrong kind, or if one this class does not know was given.
     pub fn new(props: &Props) -> Result<Kbc8042> {
         let mut r = props.reader();
@@ -1195,7 +1195,7 @@ impl Instance for Kbc8042 {}
 ///
 /// # Errors
 ///
-/// [`Error::Config`](crate::core::Error::Config) if the name is claimed.
+/// [`Error::Config`] if the name is claimed.
 pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     registry.add(&CLASS)
 }
@@ -1204,7 +1204,7 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
 ///
 /// # Errors
 ///
-/// [`Error::Config`](crate::core::Error::Config) if the class is bound twice.
+/// [`Error::Config`] if the class is bound twice.
 pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     bindings.bind(CLASS_NAME, |props| Ok(Arc::new(Kbc8042::new(props)?)))
 }

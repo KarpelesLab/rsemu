@@ -75,12 +75,32 @@ Both are generic mechanisms in `core::wire`, not PC special cases
 Both attach along a net: the driver offers, the sink is handed a `Weak`. They
 exist because `BindCtx` cannot reach a sibling device's handle — see below.
 
-## What is known to be missing
+## What a real firmware binary asks for
 
-Measured against a real firmware binary, by scanning it for the immediate
-operands of its I/O instructions. That is a mechanical observation of an opaque
-binary — the same class of thing as watching which addresses a program puts on a
-bus — and no source was read.
+Measured black-box against one, two ways: scanning it for the immediate operands
+of its I/O instructions, and reading its diagnostic strings. Both are mechanical
+observations of an opaque file — the same class of thing as watching which
+addresses a program puts on a bus, or reading what a program prints. **No source
+was read**, and none may be: the common x86 firmwares are LGPL.
+
+The ports it touches, in descending order of how often: the **RTC and CMOS** by a
+wide margin, then the **8042**, the **8259A** pair, the **8254**, the **8237**
+pair with their page latches, port **0x92**, the **ELCR** at 0x4d0/0x4d1, the
+floppy controller at 0x3f0-0x3f7, PCI configuration at 0xcf8/0xcfc, the reset
+control port at 0xcf9, and a paravirtual configuration channel at 0x510/0x511.
+
+Its own error messages say which of those it can do without. It reports finding
+that channel rather than requiring it; it has a path for "no PCI VGA devices
+found" and one for "no APIC"; it scans 0xc0000 for a **legacy option ROM**,
+which is exactly what this board offers; and it warns rather than stops when it
+cannot find a host bridge to unlock RAM for shadowing. Three of its checks are
+against this board's 8042 — a self test that must answer 0x55, an interface test
+that must answer 0x00, and a keyboard self test that must answer 0xaa — and
+`pc.kbc` answers all three.
+
+So the missing pieces below are ranked by that evidence, not by guesswork.
+
+## What is known to be missing
 
 - **The CPU is not bound into the machine graph.** `cpu.i8086` is registered but
   has no `Instance` impl, no `bind`, no input pins and no `schema`, so a machine
@@ -94,9 +114,10 @@ bus — and no source was read.
   mapped there the reads return ones and the probe should conclude there is no
   PCI — but that is a claim to test, not to assume.
 - **`0x510`/`0x511`.** A firmware built for another emulator reads its whole
-  configuration — memory map, boot order, ACPI tables — from a paravirtual
-  interface at those ports, falling back to CMOS when the signature is absent.
-  How far the fallback goes is unmeasured.
+  configuration — memory map, boot order, SMBIOS and ACPI tables — from a
+  paravirtual interface at those ports. Its strings show it *detects* the
+  interface rather than requiring it, so the fallback path exists; how far it
+  goes is unmeasured, and measuring it needs the 386 core.
 - **`0xcf9`**, the chipset reset control port, is not modelled.
 - **A video BIOS needs a real VGA**, not a text-mode CRTC: setting even mode 3
   writes the sequencer, the graphics controller, the attribute controller and

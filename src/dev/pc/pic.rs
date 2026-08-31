@@ -66,7 +66,7 @@
 //! slave. It is a per-line override of ICW1's LTIM, and it exists because LTIM
 //! is one bit for all eight inputs while a machine with PCI needs the timer
 //! edge-triggered and a shared PCI line level-triggered at the same time. See
-//! [`Elcr`]. Firmware that configures PCI interrupts programs it, and a chip
+//! `Elcr`. Firmware that configures PCI interrupts programs it, and a chip
 //! that ignored it would mis-trigger every shared interrupt afterwards.
 
 use alloc::boxed::Box;
@@ -253,7 +253,7 @@ struct State {
     /// one, and saved for the same reason.
     pin_level: u8,
     /// The edge/level control register: a set bit makes that line
-    /// level-triggered. **Not part of the 8259A** — see [`Elcr`].
+    /// level-triggered. **Not part of the 8259A** — see `Elcr`.
     elcr: u8,
     /// Whether the ELCR has ever been written.
     ///
@@ -803,7 +803,7 @@ impl Pic8259 {
     ///
     /// # Errors
     ///
-    /// [`Error::Property`](crate::core::Error::Property) if `mode` is not one
+    /// [`Error::Property`] if `mode` is not one
     /// of `master`, `slave` or `single`, or if a property this class does not
     /// know was given.
     pub fn new(props: &Props) -> Result<Pic8259> {
@@ -1048,7 +1048,7 @@ impl Instance for Pic8259 {}
 ///
 /// # Errors
 ///
-/// [`Error::Config`](crate::core::Error::Config) if the name is claimed.
+/// [`Error::Config`] if the name is claimed.
 pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     registry.add(&CLASS)
 }
@@ -1057,7 +1057,7 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
 ///
 /// # Errors
 ///
-/// [`Error::Config`](crate::core::Error::Config) if the class is bound twice.
+/// [`Error::Config`] if the class is bound twice.
 pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     bindings.bind(CLASS_NAME, |props| Ok(Arc::new(Pic8259::new(props)?)))
 }
