@@ -93,7 +93,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::core::device::{
-    Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
+    Device, DeviceClass, ExportId, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
 };
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
@@ -298,6 +298,11 @@ struct Session {
 #[derive(Debug)]
 pub struct Hart {
     cfg: Config,
+    /// The instance named by `timer = …`, if a machine file named one. Held as
+    /// a path rather than a handle because two-phase construction forbids
+    /// reaching a sibling from `new`; it is resolved at bind, through
+    /// [`BindCtx::export_cell`](crate::machine::BindCtx::export_cell).
+    timer: Option<String>,
     lines: Arc<Lines>,
     session: sync::Mutex<Session>,
     /// This hart's identity in `MemAttrs::requester`, assigned at bind time.
@@ -330,6 +335,7 @@ impl Hart {
             cfg.ext.f = true;
         }
         Hart {
+            timer: None,
             lines: Arc::new(Lines::default()),
             session: sync::Mutex::with_rank(
                 LockRank::BUS,
@@ -369,6 +375,9 @@ impl Hart {
         // Accepted, and for now only one value is: `ROADMAP.md` §5's example
         // writes `engine = "interp"`, and the IR frontend is phase 5.
         let _ = r.or_enum("engine", "interp", &["interp"])?;
+        // Validated here, resolved at bind: `new` allocates and checks, and
+        // performs no outward action at all (`ROADMAP.md` §4.4).
+        let timer = r.optional_link("timer")?.map(|l| String::from(l.as_str()));
         r.finish()?;
 
         let mut ext = Extensions {
@@ -402,7 +411,7 @@ impl Hart {
                 }
             }
         }
-        Ok(Hart::new(Config {
+        let mut hart = Hart::new(Config {
             xlen,
             ext,
             hartid,
@@ -410,7 +419,9 @@ impl Hart {
             pmp_count: pmp_count as usize,
             misaligned,
             requester: RequesterId::ANONYMOUS,
-        }))
+        });
+        hart.timer = timer;
+        Ok(hart)
     }
 
     /// This hart's configuration.
@@ -760,6 +771,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "which execution engine; only `interp` exists until phase 5",
         },
+        PropertySpec {
+            name: "timer",
+            kind: ValueKind::Link,
+            required: false,
+            summary: "the object whose platform timer the `time` CSR reads (`timer = clint`)",
+        },
     ],
     construct: |props| Ok(Box::new(Hart::from_props(props)?)),
 };
@@ -999,6 +1016,14 @@ impl crate::machine::Instance for Hart {
         })?;
         self.attach_space(Arc::clone(space));
         self.set_requester(ctx.requester());
+        // `time` is a view of the platform timer, and the platform timer is
+        // somebody else's device. A board that names one gets a `time` CSR that
+        // agrees with the CLINT's `mtime`; a board that names none keeps
+        // whatever `set_time` last left, which is what a machine with no timer
+        // at all wants.
+        if let Some(path) = &self.timer {
+            self.attach_time(ctx.export_cell(path, ExportId::TIMEBASE)?);
+        }
         Ok(())
     }
 }
@@ -1026,6 +1051,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("supervisor", ValueKind::Bool))
         .prop(PropSchema::new("user", ValueKind::Bool))
         .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
+        .prop(PropSchema::new("timer", ValueKind::Link))
         // Inputs only: a hart drives no line this core models.
         .port("meip", PortDir::In)
         .port("mtip", PortDir::In)

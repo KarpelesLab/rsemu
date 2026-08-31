@@ -34,36 +34,26 @@
 //! its next comparator fires on so the run loop stops the harts there rather
 //! than thousands of cycles past it.
 //!
-//! # Known gap: the hart's `time` CSR is not wired to this counter
+//! # The hart's `time` CSR reads this counter
 //!
-//! `mtime` here is correct, and everything that reads it *through the register
-//! block* — a guest polling `0xbff8`, OpenSBI's `aclint-mtimer` driver, the
-//! comparators — sees it. What does **not** see it is the hart's own `time`
-//! CSR (`0xc01`), which `rdtime` reads: `cpu::riscv` holds that value in its
-//! CSR file and advances it only through
-//! [`Hart::set_time`](crate::cpu::riscv::Hart::set_time), which its own
-//! documentation calls a stand-in "until a CLINT exists". Nothing in a realized
-//! machine calls it, so `rdtime` reads zero forever.
+//! `time` (`0xc01`, what `rdtime` returns) is architecturally a read-only view
+//! of the memory-mapped `mtime` that lives here, not a counter the hart owns.
+//! So this block publishes `mtime` as
+//! [`ExportId::TIMEBASE`](crate::core::device::ExportId::TIMEBASE) and a hart
+//! that names it — `timer = clint` in the machine file — holds the same cell.
 //!
-//! That is not a hypothetical. An operating system that takes its clocksource
-//! from `rdtime` computes every timer deadline as `0 + delta`, which `mtime`
-//! has already passed, so it takes a timer interrupt immediately, reprograms
-//! the timer, and never advances — a live-lock with a full console log up to
-//! the point the clocksource is first used. See `src/dev/riscv/tests.rs`.
+//! That wiring was missing until the [`Device::export`] seam existed, and the
+//! symptom was not subtle: an operating system taking its clocksource from
+//! `rdtime` computes every deadline as `0 + delta`, which `mtime` is already
+//! past, so it takes a timer interrupt immediately, reprograms the comparator,
+//! and never advances. A live-lock with a complete console log up to the point
+//! the clocksource is first used. `src/dev/riscv/tests.rs` boots a kernel far
+//! enough to have shown it.
 //!
-//! Both halves of the fix now exist and are untested only in combination:
-//! [`Clint::mtime_cell`] publishes the live value, and
-//! `Hart::attach_time(Arc<AtomicU64>)` makes the `time` CSR read it. What is
-//! still missing is the *wiring* — nothing in a realized machine hands one to
-//! the other, because `BindCtx` cannot reach a sibling device's handle.
-//!
-//! That gap is not this board's. It is the third place the same thing has been
-//! wanted: `host::gdb` needs a route from a `dyn Device` to a core's registers,
-//! `host::display` needs one to the PPU's frame buffer, and this needs one to
-//! the CLINT's timer. Each has worked around it differently. The seam belongs
-//! in `core::device`, and with three consumers there is finally enough evidence
-//! to design it rather than guess (`ROADMAP.md` §4.4). This module deliberately
-//! does not reach into `cpu/` to paper over it.
+//! [`Clint::mtime_cell`] is still the direct route, for a hand-wired machine
+//! and for tests. [`Hart::set_time`](crate::cpu::riscv::Hart::set_time) remains
+//! for a board with no CLINT at all; a hart with a timer attached overwrites it
+//! on the next step, which is the right precedence.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -72,7 +62,9 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
+use crate::core::device::{
+    Device, DeviceClass, Export, ExportId, PropertySpec, RealizeCtx, ResetKind,
+};
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::sched::{AccessKind, LazyHandle};
@@ -605,6 +597,15 @@ impl Device for Clint {
 
     fn region(&self, name: &str) -> Option<RegionRef> {
         matches!(name, "" | "regs").then(|| Arc::clone(&self.region))
+    }
+
+    /// Publish `mtime` as the platform timebase.
+    ///
+    /// The cell is allocated in [`Clint::with_harts`] and never replaced, so
+    /// this is answerable from construction and a hart holding it keeps
+    /// holding it across a reset — the handle is wiring, not guest state.
+    fn export(&self, which: ExportId) -> Option<Export> {
+        (which == ExportId::TIMEBASE).then(|| Export::Cell(self.mtime_cell()))
     }
 
     fn connect(&self, port: &str, source: WireSource) -> Result<()> {
