@@ -1062,7 +1062,7 @@ mod tests {
         match (machine, slot) {
             // Two machines take a slot called `cart` and they are not the same
             // kind of cartridge at all, which is why this is keyed by both.
-            #[cfg(all(feature = "machine-gameboy", feature = "std"))]
+            #[cfg(feature = "machine-gameboy")]
             ("gameboy", "cart") => minimal_gb(),
             (_, "cart") => MINIMAL_NROM,
             // Each board's default monitor: rsemu's own, committed precisely so
@@ -1114,11 +1114,11 @@ mod tests {
             // this board gets is the right *shape*: a socket-sized image of
             // zeroes, which realizes and executes open bus. `tests/pc_at_board`
             // is where the board is actually exercised.
-            #[cfg(all(feature = "machine-pc-at", feature = "std"))]
+            #[cfg(feature = "machine-pc-at")]
             ("pc-at", "bios") => blank(128 * 1024),
-            #[cfg(all(feature = "machine-pc-at", feature = "std"))]
+            #[cfg(feature = "machine-pc-at")]
             ("pc-at", "vgabios") => blank(32 * 1024),
-            #[cfg(all(feature = "machine-pc-at", feature = "std"))]
+            #[cfg(feature = "machine-pc-at")]
             ("pc-at", "floppy") => blank(1_474_560),
             (m, other) => panic!("no fixture for `{m}`'s media slot `{other}`"),
         }
@@ -1130,7 +1130,7 @@ mod tests {
     /// wanted here are a socket's, not a constant's — so the array cannot be a
     /// `static`. Leaking a handful of buffers in a test process is the honest
     /// trade against threading a lifetime through the whole fixture table.
-    #[cfg(all(feature = "machine-pc-at", feature = "std"))]
+    #[cfg(feature = "machine-pc-at")]
     fn blank(len: usize) -> &'static [u8] {
         use crate::core::sync::Global;
         use alloc::collections::BTreeMap;
@@ -1151,13 +1151,23 @@ mod tests {
     /// The smallest legal Game Boy image: two 16 KiB banks, a correct header
     /// checksum, and a one-instruction program (`JR -2`, the smallest program
     /// that neither ends nor wanders). Generated, never vendored.
-    #[cfg(all(feature = "machine-gameboy", feature = "std"))]
+    #[cfg(feature = "machine-gameboy")]
     fn minimal_gb() -> &'static [u8] {
-        // A `OnceLock` rather than a `static` array because the header checksum
-        // is computed over the image, and the generator is where that lives.
-        use std::sync::OnceLock;
-        static IMAGE: OnceLock<Vec<u8>> = OnceLock::new();
-        IMAGE.get_or_init(|| crate::dev::gb::cart::synthetic_image(2, 0x00, 0x00, &[0x18, 0xfe]))
+        use crate::core::sync::Global;
+
+        // Built once and leaked rather than written out as a `static` array,
+        // because the header checksum is computed over the image and the
+        // generator is where that lives. `Global` for the same reason as
+        // `blank` below.
+        static IMAGE: Global<Option<&'static [u8]>> = Global::new(None);
+        let mut slot = IMAGE.lock();
+        if let Some(image) = *slot {
+            return image;
+        }
+        let image: &'static [u8] =
+            crate::dev::gb::cart::synthetic_image(2, 0x00, 0x00, &[0x18, 0xfe]).leak();
+        *slot = Some(image);
+        image
     }
 
     /// The smallest legal NROM image: an iNES header, 16 KiB of PRG, 8 KiB of
