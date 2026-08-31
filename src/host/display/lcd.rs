@@ -104,7 +104,7 @@ pub mod capture {
     use super::{Arc, LcdScanout, Scanout, String, Vec};
     use crate::core::error::Result;
     use crate::core::props::Props;
-    use crate::core::sync::{LockRank, Mutex};
+    use crate::core::sync::{Global, LockRank};
     use crate::dev::lcd::scanout::{SCANOUT_CLASS, set_frame_rate};
     use crate::machine::realize::Instance;
     use crate::machine::{Bindings, BuildOptions, Machine};
@@ -114,7 +114,7 @@ pub mod capture {
     ///
     /// The path is kept because the frame rate is resolved from the machine's
     /// clock forest afterwards, and the forest is indexed by device.
-    static CONSTRUCTED: Mutex<Vec<Arc<Scanout>>> = Mutex::with_rank(LockRank::LEAF, Vec::new());
+    static CONSTRUCTED: Global<Vec<Arc<Scanout>>> = Global::with_rank(LockRank::LEAF, Vec::new());
 
     /// Construct an engine and keep a reference to it.
     fn construct(props: &Props) -> Result<Arc<dyn Instance>> {

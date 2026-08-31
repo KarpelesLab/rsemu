@@ -2700,4 +2700,81 @@ mod tests {
             "every key must have been incremented once per thread"
         );
     }
+
+    /// The rule that makes [`Global`] worth having: **if it lives in a
+    /// `static`, it is a `Global`.**
+    ///
+    /// Checked by reading the crate's own source, because review is what let
+    /// eleven of these through. A `static` holding a [`Mutex`] or an [`RwLock`]
+    /// is not a style preference: on the `single` backend those report
+    /// contention as a deadlock, so the first `cargo test` that happens to
+    /// schedule two tests over the same table fails somewhere unrelated. A grep
+    /// is a crude instrument, but it fails on the line that caused it, which is
+    /// the property that matters.
+    #[test]
+    fn no_static_in_this_crate_holds_a_lock_meant_for_machine_state() {
+        use alloc::format;
+        use alloc::string::String;
+        use std::path::Path;
+
+        /// The type in `static NAME: TYPE`, or `None` if this is not one.
+        fn declared_type(line: &str) -> Option<&str> {
+            let line = line.trim_start();
+            if line.starts_with("//") {
+                return None;
+            }
+            let rest = ["pub ", "pub(crate) ", "pub(super) ", "pub(in crate) "]
+                .iter()
+                .find_map(|vis| line.strip_prefix(vis))
+                .unwrap_or(line);
+            let rest = rest.strip_prefix("static ")?;
+            // The type runs from the colon to the initialiser, which may be on
+            // a later line — the caller hands us a small window for that.
+            let (_, ty) = rest.split_once(':')?;
+            Some(ty.split('=').next().unwrap_or(ty))
+        }
+
+        fn scan(dir: &Path, found: &mut Vec<String>) {
+            let entries = std::fs::read_dir(dir).expect("the crate's own source is readable");
+            for entry in entries {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    scan(&path, found);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("a readable source file");
+                let lines: Vec<&str> = text.lines().collect();
+                for (at, line) in lines.iter().enumerate() {
+                    if declared_type(line).is_none() {
+                        continue;
+                    }
+                    // Three lines, so a declaration whose type wrapped onto the
+                    // next one is still seen whole.
+                    let window = lines[at..lines.len().min(at + 3)].join(" ");
+                    let Some(ty) = declared_type(&window) else {
+                        continue;
+                    };
+                    if ty.contains("Mutex<") || ty.contains("RwLock<") {
+                        found.push(format!("{}:{}:{}", path.display(), at + 1, line.trim()));
+                    }
+                }
+            }
+        }
+
+        let mut found = Vec::new();
+        scan(
+            Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+            &mut found,
+        );
+        assert!(
+            found.is_empty(),
+            "a `static` may not hold a lock meant for machine state; use \
+             `core::sync::Global`, which waits for another thread instead of \
+             reporting it as a deadlock:\n  {}",
+            found.join("\n  ")
+        );
+    }
 }

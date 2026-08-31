@@ -69,7 +69,7 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use crate::core::sync::{LockRank, Mutex};
+use crate::core::sync::{Global, LockRank};
 
 /// Length in bytes of the string [`rsemu_version_ptr`] points at.
 ///
@@ -188,7 +188,12 @@ impl State {
     }
 }
 
-static STATE: Mutex<State> = Mutex::with_rank(LockRank::MACHINE, State::new());
+/// The module's one machine slot.
+///
+/// [`Global`] rather than `Mutex`: this is a `static`, so it is reachable from
+/// every thread in the process — one Web Worker per hart on a threaded wasm
+/// build, and the test harness's threads in the unit tests below (`core::sync`).
+static STATE: Global<State> = Global::with_rank(LockRank::MACHINE, State::new());
 
 /// Run `f` against the module state.
 fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> R {

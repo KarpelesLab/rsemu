@@ -112,6 +112,12 @@ use core::fmt;
 /// `clear` lands between another's build and its `take`, and the failure looks
 /// like a bug in the emulator rather than in the harness.
 ///
+/// This is about *interference*, not about soundness: the capture table is a
+/// [`Global`](crate::core::sync::Global), so concurrent access is defined and
+/// merely wrong-answered. Serialising it is what makes the answer right, and
+/// it does not substitute for the table having the correct lock — which was
+/// the whole point of the bug that produced `Global`.
+///
 /// [`LockRank::UNCHECKED`] because it is not part of the machine's lock order
 /// at all: it is deliberately held across everything, which is what any other
 /// rank would forbid.
@@ -120,8 +126,8 @@ use core::fmt;
 // serialise.
 #[cfg(test)]
 #[allow(dead_code)]
-pub(crate) static PROCESS_WIDE: crate::core::sync::Mutex<()> =
-    crate::core::sync::Mutex::with_rank(crate::core::sync::LockRank::UNCHECKED, ());
+pub(crate) static PROCESS_WIDE: crate::core::sync::Global<()> =
+    crate::core::sync::Global::with_rank(crate::core::sync::LockRank::UNCHECKED, ());
 
 // ---------------------------------------------------------------------------
 // Pixel formats

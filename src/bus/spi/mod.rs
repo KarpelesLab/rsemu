@@ -739,12 +739,13 @@ pub mod buses {
     use alloc::sync::Arc;
     use alloc::vec::Vec;
 
-    use crate::core::sync::{LockRank, Mutex};
+    use crate::core::sync::{Global, LockRank};
 
     /// Name to bus. `BTreeMap`, so listing is in name order rather than hash
-    /// order (`CLAUDE.md`, determinism).
-    static TABLE: Mutex<BTreeMap<String, Arc<SpiBus>>> =
-        Mutex::with_rank(LockRank::LEAF, BTreeMap::new());
+    /// order (`CLAUDE.md`, determinism); [`Global`] because a `static` is
+    /// reachable from every thread in the process (`core::sync`).
+    static TABLE: Global<BTreeMap<String, Arc<SpiBus>>> =
+        Global::with_rank(LockRank::LEAF, BTreeMap::new());
 
     /// The bus called `name`, creating it if this is the first mention.
     ///

@@ -171,7 +171,9 @@ impl Pad {
 ///
 /// See the [module docs](self) for why a name is the only thing that can travel
 /// from a machine description into a device constructor, and
-/// [`crate::host::chardev::ports`] for the same pattern applied to a terminal.
+/// [`crate::host::chardev::ports`] for the same pattern applied to a terminal —
+/// including why a `static` table's lock is a
+/// [`Global`](crate::core::sync::Global) rather than a `Mutex`.
 pub mod pads {
     use super::Pad;
     use alloc::collections::BTreeMap;
@@ -179,12 +181,13 @@ pub mod pads {
     use alloc::sync::Arc;
     use alloc::vec::Vec;
 
-    use crate::core::sync::{LockRank, Mutex};
+    use crate::core::sync::{Global, LockRank};
 
     /// Name to pad. `BTreeMap`, so listing is in name order rather than hash
-    /// order (`CLAUDE.md`, determinism).
-    static TABLE: Mutex<BTreeMap<String, Arc<Pad>>> =
-        Mutex::with_rank(LockRank::LEAF, BTreeMap::new());
+    /// order (`CLAUDE.md`, determinism); [`Global`] because a `static` is
+    /// reachable from every thread in the process (`core::sync`).
+    static TABLE: Global<BTreeMap<String, Arc<Pad>>> =
+        Global::with_rank(LockRank::LEAF, BTreeMap::new());
 
     /// The pad port called `name`, creating it if this is the first mention.
     ///

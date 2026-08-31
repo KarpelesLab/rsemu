@@ -1132,14 +1132,20 @@ mod tests {
     /// trade against threading a lifetime through the whole fixture table.
     #[cfg(all(feature = "machine-pc-at", feature = "std"))]
     fn blank(len: usize) -> &'static [u8] {
-        use std::collections::BTreeMap;
-        use std::sync::{Mutex, OnceLock};
-        static CACHE: OnceLock<Mutex<BTreeMap<usize, &'static [u8]>>> = OnceLock::new();
-        let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
-        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
-        cache
-            .entry(len)
-            .or_insert_with(|| alloc::vec![0u8; len].leak())
+        use crate::core::sync::Global;
+        use alloc::collections::BTreeMap;
+
+        // `Global`, not `Mutex`: this is a `static`, so libtest's threads reach
+        // it as readily as one machine build does (`core::sync`). It also keeps
+        // `std::sync` out of `machine/`, which CLAUDE.md forbids outright.
+        static CACHE: Global<BTreeMap<usize, &'static [u8]>> = Global::new(BTreeMap::new());
+        let mut cache = CACHE.lock();
+        if let Some(image) = cache.get(&len).copied() {
+            return image;
+        }
+        let image: &'static [u8] = alloc::vec![0u8; len].leak();
+        cache.insert(len, image);
+        image
     }
 
     /// The smallest legal Game Boy image: two 16 KiB banks, a correct header
