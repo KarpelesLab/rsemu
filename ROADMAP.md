@@ -378,6 +378,31 @@ Bank switching must be rebase-shaped, which means `Alias` holds its `offset` in
 an atomic cell rather than as a frozen enum payload. Design this in phase 1;
 phase 3 depends on it.
 
+**Topology is reached through a guard, not `&mut self`.** The first
+implementation took `&mut self` for `map`/`unmap`/`remap`, which made the
+rebase/retopology split borrow-checker enforced — and also made §4.7's BAR
+write from inside an MMIO handler *impossible*, because a space shared with
+devices can never be borrowed mutably again. So the mutable half sits behind one
+`core::sync` lock at `TOPOLOGY`, with `SpaceView` (read guard, carries `rebase`)
+and `TopologyGuard` (write guard, the only route to `map`/`unmap`/`remap`).
+The distinction survives; the impossibility does not.
+
+Two consequences that must be designed around rather than discovered:
+
+- **The access path takes the lock non-blocking.** `TOPOLOGY` sits above `BUS`,
+  and a CPU holds `BUS` across every access, so a blocking read guard there
+  would close a deadlock cycle — a retopology may take `BUS` locks *underneath*
+  `TOPOLOGY`. An access that meets a retopology in flight therefore returns
+  `BusError::Retry`. **Known hazard:** a 6502 has no bus-retry input; it returns
+  the open-bus latch and counts a fault. So until the §4.7 safe-point protocol
+  exists, a retopology racing a guest access silently yields open bus rather
+  than stalling. Safe-points are what make this unreachable, and they are not
+  built yet.
+- **A cross-space retopology is two steps, not one.** Two guards at the same
+  rank cannot be held together, so mapping a cartridge into the CPU and PPU
+  spaces is sequential and non-atomic. The alternative — a rank per space —
+  would mean no ladder at all.
+
 **A BAR *address* change is not a rebase** — an earlier revision of this table
 said it was, and that was wrong. Moving a mapping changes the addresses in the
 sorted flat view and invalidates every cache keyed on the old address, so it is
@@ -659,6 +684,15 @@ being theoretical.
 - **Composition.** Devices own child devices. A `pc.q35` device instantiates its
   own chipset children; the config only names the top level unless it wants to
   reach in.
+- **The connection surface is on `Device` itself** — `region`, `sink`,
+  `connect`, `announce`, `combinational`, `is_runnable`, `run`, `event`, all
+  defaulted. It cannot be a second trait beside it: there is no route from a
+  `dyn Device` to another trait object without `Any` in the supertrait chain,
+  and the machine layer's first attempt cost a second registration table that
+  nothing kept in step with the registry. Defaults are chosen so silence is
+  safe — in particular a device is **sequential** until it says otherwise,
+  because claiming to be combinational when you are not turns a legitimate
+  IRQ/ack handshake into a machine the resolver rejects.
 - **Property system** (`core::props`): a small dynamic `Value` — int, uint,
   bool, string, size (`512M`), address, duration, list, map, and **link**
   (a reference to another object) — with typed extraction and precise error
