@@ -934,12 +934,18 @@ fn blx_immediate_always_lands_in_thumb() {
 
 #[test]
 fn a_data_processing_write_to_the_pc_is_a_plain_branch() {
-    // MOV pc, r0 — ARMv5 ignores bit 0 here rather than interworking.
+    // MOV pc, r0. ARMv5 does not interwork here, and A4.1.35's pseudocode
+    // writes the value to R15 unmasked: the low bits are dropped by the fetch,
+    // not by the register, which is observable because R15 keeps them.
     let h = running(&[0xe1a0_f000]);
     h.cpu.set_reg(0, 0x2001);
     h.step();
-    assert_eq!(h.cpu.pc(), 0x2000);
+    assert_eq!(h.cpu.pc(), 0x2001);
     assert!(!h.cpu.is_thumb());
+    // The instruction actually executed is the one at the aligned address.
+    h.program(0x2000, &[0xe3a0_0042]);
+    h.step();
+    assert_eq!(h.cpu.reg(0), 0x42);
 }
 
 // ---------------------------------------------------------------------------
@@ -1096,12 +1102,32 @@ fn mrs_and_msr_move_the_status_register() {
 }
 
 #[test]
-fn msr_cannot_change_the_thumb_bit() {
-    // MSR CPSR_c, r1 with T set in the source.
+fn msr_writes_the_thumb_bit_like_any_other_control_bit() {
+    // MSR CPSR_c, r1 with T set in the source. The architecture tells
+    // *programmers* not to do this and calls the result UNPREDICTABLE, but
+    // A4.1.39's pseudocode assigns `CPSR[7:0] = operand[7:0]` wholesale and
+    // hardware takes the write. Filtering it out would be the emulator
+    // overriding what the guest asked for.
     let h = running(&[0xe121_f001]);
     h.cpu.set_reg(1, u32::from(Mode::SYSTEM.0) | psr::T);
     h.step();
-    assert!(!h.cpu.is_thumb(), "the T bit is not MSR's to change");
+    assert!(h.cpu.is_thumb());
+}
+
+#[test]
+fn the_cpsr_mode_field_cannot_lose_its_top_bit() {
+    // MSR CPSR_c, r1 asking for a 26-bit mode. M[4] separates the 26-bit modes
+    // from the 32-bit ones and no ARMv5 part implements the former, so it
+    // reads as one whatever is written.
+    let h = running(&[0xe121_f001]);
+    h.cpu.set_reg(1, 0x0a);
+    h.step();
+    assert_eq!(h.cpu.cpsr() & psr::MODE, 0x1a);
+    // An SPSR has no such constraint.
+    let mut regs = h.regs();
+    regs.write_cpsr(u32::from(Mode::ABORT.0));
+    regs.set_spsr(0x0a);
+    assert_eq!(regs.spsr(), Some(0x0a));
 }
 
 #[test]
@@ -1448,7 +1474,16 @@ fn a_thumb_swi_saves_the_halfword_return_address() {
 
 #[test]
 fn an_undefined_thumb_encoding_is_still_undefined() {
-    // 1101 1110 is architecturally undefined.
+    // `1101 1110` - a conditional branch with cond == 0b1110 - is
+    // architecturally UNDEFINED (ARM ARM A6.1, A7.1.14); `1101 1111` is SWI,
+    // and the architecture reserves the encoding precisely so it can be
+    // trapped.
+    //
+    // `SingleStepTests/ARM7TDMI` gets this wrong and treats cond 0b1110 as an
+    // unconditional branch, so every vector in its `thumb_undefined_bcc` file
+    // is invalid (upstream issue #2, and nba-emu/NanoBoyAdvance#395 against
+    // the emulator they were generated from). The manual wins; the file is
+    // excluded by name in `super::conformance::REJECTED_FILES`.
     let h = running_thumb(&[0xde00]);
     h.step();
     assert_eq!(h.cpu.mode(), Mode::UNDEFINED);
@@ -2066,4 +2101,148 @@ fn run_stops_after_the_instruction_that_crosses_the_budget() {
     let used = h.cpu.run(2);
     assert_eq!(used, 2, "two one-cycle instructions");
     assert_eq!(h.cpu.reg(0), 2);
+}
+
+// ---------------------------------------------------------------------------
+// What the ARM7TDMI corpus taught us
+// ---------------------------------------------------------------------------
+//
+// Every test below locks in a behaviour that `SingleStepTests/ARM7TDMI`
+// measured and that the manual leaves UNPREDICTABLE or implementation-defined.
+// They are regression tests for findings rather than restatements of the
+// architecture, and each one says which case it pins down.
+
+#[test]
+fn a_register_controlled_shift_reads_r15_ahead_for_rn_but_not_for_rs() {
+    // The extra internal cycle a register-controlled shift costs puts `R15`
+    // twelve ahead for the operands — but `Rs` is read in the first cycle,
+    // before that, so it still reads eight ahead.
+    //
+    // SUB r0, pc, r2, LSL r3
+    let h = running(&[0xe04f_0312]);
+    h.cpu.set_reg(2, 0);
+    h.cpu.set_reg(3, 0);
+    h.step();
+    assert_eq!(h.cpu.reg(0), 0x1000 + 12, "Rn reads pc + 12");
+
+    // MOV r0, r1, LSL pc — the shift amount comes from R15.
+    let h = running(&[0xe1a0_0f11]);
+    h.cpu.set_reg(1, 1);
+    h.step();
+    // 0x1008 & 0xff is 8, so the shift is by eight; pc + 12 would give twelve.
+    assert_eq!(h.cpu.reg(0), 1 << 8, "Rs reads pc + 8");
+}
+
+#[test]
+fn a_multiply_reads_r15_twelve_ahead_and_branches_when_it_writes_it() {
+    // MLA r0, r1, r2, pc — the addend is R15, and a multiply spends internal
+    // cycles before latching its operands.
+    let h = running(&[0xe020_f291]);
+    h.cpu.set_reg(1, 0);
+    h.cpu.set_reg(2, 0);
+    h.step();
+    assert_eq!(h.cpu.reg(0), 0x1000 + 12);
+
+    // MUL pc, r1, r2 — writing R15 flushes here, unlike MRS below.
+    let h = running(&[0xe00f_0291]);
+    h.cpu.set_reg(1, 0x300);
+    h.cpu.set_reg(2, 2);
+    h.step();
+    assert_eq!(h.cpu.pc(), 0x600, "the product became the PC");
+}
+
+#[test]
+fn mrs_into_r15_writes_the_pipelined_register_without_flushing() {
+    // MRS pc, CPSR. Every other write to R15 flushes the prefetch queue; this
+    // one does not, so the value lands in the pipelined R15 and the ordinary
+    // end-of-instruction advance still applies.
+    let h = running(&[0xe10f_f000]);
+    h.cpu.set_cpsr(u32::from(Mode::SYSTEM.0));
+    h.step();
+    let cpsr = u32::from(Mode::SYSTEM.0);
+    assert_eq!(h.cpu.pc(), cpsr.wrapping_add(4).wrapping_sub(8));
+}
+
+#[test]
+fn swp_reads_r15_twelve_ahead_like_a_multiply() {
+    // SWP r0, pc, [pc] — both the address and the stored value come from R15,
+    // and SWP has an internal cycle, so both read twelve ahead.
+    let h = running(&[0xe10f_009f]);
+    h.step();
+    assert_eq!(h.peek(0x1000 + 12), 0x1000 + 12);
+}
+
+#[test]
+fn an_unaligned_halfword_load_rotates_and_a_signed_one_becomes_a_byte() {
+    // LDRH r0, [r1] ; LDRSH r2, [r1]
+    let h = running(&[0xe1d1_00b0, 0xe1d1_20f0]);
+    h.poke(0x2000, 0x0000_8f2e);
+    h.cpu.set_reg(1, 0x2001);
+    h.step();
+    assert_eq!(h.cpu.reg(0), 0x2e00_008f, "rotated right by eight");
+    h.step();
+    assert_eq!(
+        h.cpu.reg(2),
+        0xffff_ff8f,
+        "an odd LDRSH sign-extends the byte, not the halfword"
+    );
+}
+
+#[test]
+fn a_post_indexed_halfword_access_with_w_set_is_not_undefined() {
+    // LDRH r0, [r1], #0 with the redundant W bit set. ARMv5 calls it
+    // UNPREDICTABLE; hardware ignores the bit and performs the access, and
+    // trapping it would break code that runs on real silicon.
+    let h = running(&[0xe0f1_00b0]);
+    h.poke(0x2000, 0x0000_1234);
+    h.cpu.set_reg(1, 0x2000);
+    h.step();
+    assert_eq!(h.cpu.reg(0), 0x1234);
+    assert_ne!(h.cpu.mode(), Mode::UNDEFINED);
+}
+
+#[test]
+fn the_s_bit_sends_a_block_transfer_writeback_to_the_user_bank() {
+    // LDMDB r13!, {r0}^ in IRQ mode: the base is *read* from IRQ's r13 and
+    // *written back* to the User one. Combining S with writeback is
+    // UNPREDICTABLE (ARM ARM A5.4.6); this is what an ARM7TDMI does.
+    let h = running(&[0xe97d_0001]);
+    h.cpu.set_cpsr(u32::from(Mode::SYSTEM.0));
+    h.cpu.set_reg(13, 0x1111_1111);
+    h.cpu.set_cpsr(u32::from(Mode::IRQ.0));
+    h.cpu.set_reg(13, 0x2004);
+    h.poke(0x2000, 0xabcd);
+    h.step();
+    assert_eq!(h.cpu.reg(0), 0xabcd, "read through IRQ's base");
+    assert_eq!(h.cpu.reg(13), 0x2004, "IRQ's base is untouched");
+    assert_eq!(
+        h.regs().reg_in_mode(Mode::USER, 13),
+        0x2000,
+        "the writeback landed in the User bank"
+    );
+}
+
+#[test]
+fn storing_the_pc_halves_its_offset_in_thumb() {
+    // An empty Thumb register list is UNPREDICTABLE; an ARM7TDMI stores R15
+    // and moves the base by 0x40. The offset is one pipeline depth of
+    // instructions, so it is +6 in Thumb where it is +12 in ARM.
+    let h = Harness::with_config(Config::ARM7TDMI);
+    h.program_thumb(0x1000, &[0xc300]); // STMIA r3!, {}
+    h.boot(0x1000);
+    h.cpu.set_cpsr(u32::from(Mode::SYSTEM.0) | psr::T);
+    h.cpu.set_reg(3, 0x2000);
+    h.step();
+    assert_eq!(h.peek(0x2000), 0x1000 + 6);
+    assert_eq!(h.cpu.reg(3), 0x2040);
+}
+
+#[test]
+fn a_block_transfer_forces_its_base_word_aligned_without_rotating() {
+    // Unlike LDR, LDM drops bits [1:0] of the address and does not rotate.
+    let h = running(&[0xe890_0002]); // LDMIA r0, {r1}
+    h.poke(0x2000, 0x1122_3344);
+    h.cpu.set_reg(0, 0x2002);
+    h.step();
+    assert_eq!(h.cpu.reg(1), 0x1122_3344);
 }

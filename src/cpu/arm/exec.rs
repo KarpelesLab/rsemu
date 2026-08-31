@@ -331,9 +331,34 @@ impl<'a> Exec<'a> {
         }
     }
 
+    /// Write a register, treating `R15` as a branch.
+    ///
+    /// Writing `R15` from an instruction that is not a branch is
+    /// UNPREDICTABLE, so the question is which legal answer to give. Measured
+    /// against the corpus, an ARM7TDMI flushes the prefetch queue for every
+    /// such write — `MUL`, `SWP`, a base writeback — with exactly one
+    /// exception, [`Exec::write_pc_without_flush`], which `MRS` uses.
     #[inline]
     fn set_reg(&mut self, index: u8, value: u32) {
+        if index & 0xf == 15 {
+            self.branch_to(value);
+            return;
+        }
         self.state.regs.r[(index & 0xf) as usize] = value;
+    }
+
+    /// The one write to `R15` that does *not* flush the prefetch queue.
+    ///
+    /// `MRS Rd, <psr>` with `Rd == R15` is UNPREDICTABLE, and an ARM7TDMI
+    /// answers it differently from every other write to `R15`: the value lands
+    /// in the *pipelined* `R15`, nothing is flushed, and the ordinary
+    /// end-of-instruction advance still happens, so execution continues at
+    /// `value + 4` in pipelined terms. Measured; there is no rule in the
+    /// manual to derive it from.
+    fn write_pc_without_flush(&mut self, value: u32) {
+        let ahead = if self.flag(psr::T) { 4 } else { 8 };
+        self.state.regs.r[15] = value.wrapping_add(4).wrapping_sub(ahead);
+        self.branched = true;
     }
 
     /// The value a store of `R15` writes.
@@ -344,8 +369,18 @@ impl<'a> Exec<'a> {
     /// rather than a constant (ARM ARM A4.1.99's note).
     fn store_value(&self, index: u8) -> u32 {
         if index & 0xf == 15 {
-            self.insn_addr
-                .wrapping_add(u32::from(self.cfg.store_pc_offset))
+            // The offset is "pipeline depth in instructions × instruction
+            // width", so it halves in Thumb: an ARM7TDMI stores `PC + 12` in
+            // ARM state and `PC + 6` in Thumb, an ARM926EJ-S `PC + 8` and
+            // `PC + 4`. Measured against the corpus's empty-register-list
+            // vectors, which are the only ones that store `R15` in Thumb.
+            let offset = u32::from(self.cfg.store_pc_offset);
+            let offset = if self.flag(psr::T) {
+                offset / 2
+            } else {
+                offset
+            };
+            self.insn_addr.wrapping_add(offset)
         } else {
             self.reg(index)
         }
@@ -356,8 +391,17 @@ impl<'a> Exec<'a> {
     /// ARMv5 data-processing writes to `R15` do *not* interwork: the low bits
     /// are ignored and the core stays in whichever state it was in.
     fn branch_to(&mut self, target: u32) {
-        let mask = if self.flag(psr::T) { !1 } else { !3 };
-        self.state.regs.r[15] = target & mask;
+        // The manual's pseudocode writes the value to `R15` *unmasked* for an
+        // ARM data-processing branch (ARM ARM A4.1.35's `Rd = shifter_operand`
+        // with `Rd == R15`) and masks only bit 0 in Thumb (A7.1.6). The low
+        // address bits are dropped by the fetch, not by the register — an
+        // ARMv4T part observably keeps bit 1 in `R15` here — so masking them
+        // away at the write is wrong, however tidy it looks.
+        self.state.regs.r[15] = if self.flag(psr::T) {
+            target & !1
+        } else {
+            target
+        };
         self.branched = true;
         self.cycle(2);
     }
@@ -369,7 +413,11 @@ impl<'a> Exec<'a> {
     fn branch_exchange(&mut self, target: u32) {
         let thumb = target & 1 != 0;
         self.set_flag(psr::T, thumb);
-        self.state.regs.r[15] = if thumb { target & !1 } else { target & !3 };
+        // `PC = Rm AND 0xFFFFFFFE` in both states — the pseudocode masks bit 0
+        // and nothing else. Branching to a non-word-aligned ARM address is
+        // UNPREDICTABLE, but the value that lands in `R15` is still the one
+        // the manual writes there.
+        self.state.regs.r[15] = target & !1;
         self.branched = true;
         self.cycle(2);
     }
@@ -384,8 +432,11 @@ impl<'a> Exec<'a> {
         if let Some(spsr) = self.state.regs.spsr() {
             self.state.regs.write_cpsr(spsr);
         }
-        let mask = if self.flag(psr::T) { !1 } else { !3 };
-        self.state.regs.r[15] = target & mask;
+        self.state.regs.r[15] = if self.flag(psr::T) {
+            target & !1
+        } else {
+            target
+        };
         self.branched = true;
         self.cycle(2);
     }
@@ -545,8 +596,45 @@ impl<'a> Exec<'a> {
         Ok(value.rotate_right((va & 3) * 8))
     }
 
+    /// A halfword load, with the rotate an ARM7TDMI applies to an odd address.
+    ///
+    /// ARMv5 calls an unaligned `LDRH` UNPREDICTABLE (ARM ARM A4.1.21). The
+    /// hardware answer is the same one it gives an unaligned `LDR`: the bus
+    /// access is aligned and the value comes back rotated so the addressed
+    /// byte lands in the low lane. Measured against the corpus.
+    fn load_half_rotated(&mut self, va: u32, privileged: bool) -> Ex<u32> {
+        if self.cfg.alignment_faults {
+            self.check_alignment(va, Width::U16, AccessKind::Read)?;
+        }
+        let value = self.load(va & !1, Width::U16, privileged)?;
+        Ok(value.rotate_right((va & 1) * 8))
+    }
+
+    /// A signed halfword load.
+    ///
+    /// At an odd address an ARM7TDMI sign-extends the *byte* rather than the
+    /// halfword — `LDRSH` degenerates into `LDRSB` — which is one of the
+    /// better known consequences of ARMv5 leaving the case UNPREDICTABLE
+    /// (ARM ARM A4.1.22). The access on the bus is still a halfword.
+    fn load_signed_half(&mut self, va: u32, privileged: bool) -> Ex<u32> {
+        if self.cfg.alignment_faults {
+            self.check_alignment(va, Width::U16, AccessKind::Read)?;
+        }
+        let value = self.load(va & !1, Width::U16, privileged)?;
+        Ok(if va & 1 != 0 {
+            i32::from((value >> 8) as u8 as i8) as u32
+        } else {
+            i32::from(value as u16 as i16) as u32
+        })
+    }
+
     /// An instruction fetch.
     fn fetch(&mut self, va: u32, width: Width) -> Ex<u32> {
+        // A fetch never presents the low address bits: an ARM core reads the
+        // word containing `R15` and a Thumb core the halfword. This is where
+        // an unaligned `R15` stops mattering, which is why the PC-writing
+        // helpers above are free to keep the bits the manual keeps.
+        let va = va & !(width.bytes() as u32 - 1);
         let pa = self.translate(va, AccessKind::Fetch, self.privileged())?;
         self.cycle(1);
         match self.space.read(u64::from(pa), width, self.attrs) {
@@ -662,7 +750,14 @@ impl<'a> Exec<'a> {
                 match shift {
                     Shift::Imm { ty, amount } => Exec::shift_immediate(ty, value, amount, carry_in),
                     Shift::Reg { ty, rs } => {
-                        let amount = self.reg_plus(rs, extra);
+                        // `Rs` is read in the instruction's *first* cycle,
+                        // before the extra internal cycle a register-controlled
+                        // shift costs, so `R15` here still reads as the
+                        // instruction plus eight — while `Rn` and `Rm`, read
+                        // one cycle later, read plus twelve. Measured against
+                        // `SingleStepTests/ARM7TDMI`, which is the only
+                        // authority available for an UNPREDICTABLE case.
+                        let amount = self.reg(rs);
                         Exec::shift_register(ty, value, amount, carry_in)
                     }
                 }
@@ -832,9 +927,19 @@ impl<'a> Exec<'a> {
                     return Ok(());
                 }
                 if rd & 0xf == 15 {
-                    if s {
+                    if s && self.state.regs.spsr().is_some() {
                         self.return_from_exception(result);
                     } else {
+                        // `S` with `Rd == R15` in User or System mode has no
+                        // `SPSR` to restore and the architecture calls it
+                        // UNPREDICTABLE. An ARM7TDMI sets the flags from the
+                        // result as an ordinary `S` would and branches, which
+                        // is both measurable and the more useful of the two
+                        // readings — silently swallowing the flag update is
+                        // the alternative.
+                        if s {
+                            self.commit_flags(result, c, v);
+                        }
                         self.branch_to(result);
                     }
                 } else {
@@ -851,7 +956,11 @@ impl<'a> Exec<'a> {
                 } else {
                     self.state.regs.cpsr
                 };
-                self.set_reg(rd, value);
+                if rd & 0xf == 15 {
+                    self.write_pc_without_flush(value);
+                } else {
+                    self.set_reg(rd, value);
+                }
                 Ok(())
             }
             Insn::Msr {
@@ -917,19 +1026,30 @@ impl<'a> Exec<'a> {
                 rm,
                 rs,
             } => {
-                let a = self.reg(rm);
-                let b = self.reg(rs);
+                // A multiply spends internal cycles before its operands are
+                // latched, so `R15` reads as the instruction plus twelve here
+                // just as it does under a register-controlled shift. Using
+                // `R15` at all is UNPREDICTABLE; this is what an ARM7TDMI
+                // does, measured against the corpus.
+                let a = self.reg_plus(rm, 4);
+                let b = self.reg_plus(rs, 4);
                 self.cycle(Exec::multiply_cycles(b, true));
                 let mut result = a.wrapping_mul(b);
                 if accumulate {
                     self.cycle(1);
-                    result = result.wrapping_add(self.reg(rn));
+                    result = result.wrapping_add(self.reg_plus(rn, 4));
                 }
-                self.set_reg(rd, result);
                 if s {
                     // `C` is unaffected in ARMv5 and above (ARM ARM A4.1.40);
                     // only ARMv4 destroyed it.
                     self.set_nz(result);
+                }
+                // Unlike `MRS`, a multiply into `R15` flushes: the corpus
+                // shows the refill.
+                if rd & 0xf == 15 {
+                    self.branch_to(result);
+                } else {
+                    self.set_reg(rd, result);
                 }
                 Ok(())
             }
@@ -942,8 +1062,8 @@ impl<'a> Exec<'a> {
                 rm,
                 rs,
             } => {
-                let a = self.reg(rm);
-                let b = self.reg(rs);
+                let a = self.reg_plus(rm, 4);
+                let b = self.reg_plus(rs, 4);
                 self.cycle(Exec::multiply_cycles(b, signed) + 1);
                 let product = if signed {
                     (i64::from(a as i32).wrapping_mul(i64::from(b as i32))) as u64
@@ -952,13 +1072,22 @@ impl<'a> Exec<'a> {
                 };
                 let result = if accumulate {
                     self.cycle(1);
-                    let acc = (u64::from(self.reg(rdhi)) << 32) | u64::from(self.reg(rdlo));
+                    let acc = (u64::from(self.reg_plus(rdhi, 4)) << 32)
+                        | u64::from(self.reg_plus(rdlo, 4));
                     product.wrapping_add(acc)
                 } else {
                     product
                 };
-                self.set_reg(rdlo, result as u32);
-                self.set_reg(rdhi, (result >> 32) as u32);
+                if rdlo & 0xf == 15 {
+                    self.branch_to(result as u32);
+                } else {
+                    self.set_reg(rdlo, result as u32);
+                }
+                if rdhi & 0xf == 15 {
+                    self.branch_to((result >> 32) as u32);
+                } else {
+                    self.set_reg(rdhi, (result >> 32) as u32);
+                }
                 if s {
                     self.set_flag(psr::N, result & 0x8000_0000_0000_0000 != 0);
                     self.set_flag(psr::Z, result == 0);
@@ -1022,14 +1151,18 @@ impl<'a> Exec<'a> {
                 list,
             } => self.block_transfer(load, before, up, user, writeback, rn, list),
             Insn::Swap { byte, rd, rn, rm } => {
-                let addr = self.reg(rn);
+                // `SWP` spends an internal cycle between its read and its
+                // write, so `R15` reads as the instruction plus twelve here
+                // too — the same rule as a multiply or a register-controlled
+                // shift. Using `R15` at all is UNPREDICTABLE.
+                let addr = self.reg_plus(rn, 4);
                 let privileged = self.privileged();
                 let value = if byte {
                     self.load(addr, Width::U8, privileged)?
                 } else {
                     self.load_word_rotated(addr, privileged)?
                 };
-                let source = self.reg(rm);
+                let source = self.reg_plus(rm, 4);
                 if byte {
                     self.store(addr, Width::U8, source & 0xff, privileged)?;
                 } else {
@@ -1159,10 +1292,13 @@ impl<'a> Exec<'a> {
         if !self.privileged() {
             byte_mask &= 0xff00_0000;
         }
-        let mut new = (self.state.regs.cpsr & !byte_mask) | (value & byte_mask);
-        // Changing the T bit with MSR is UNPREDICTABLE; preserving it is the
-        // choice that cannot silently corrupt the instruction stream.
-        new = (new & !psr::T) | (self.state.regs.cpsr & psr::T);
+        // The T bit is written like any other bit of the control byte. The
+        // architecture warns programmers not to change it this way and calls
+        // the result UNPREDICTABLE, but A4.1.39's pseudocode still assigns
+        // `CPSR[7:0] = operand[7:0]` wholesale, and hardware takes the write.
+        // Filtering it out would be the emulator silently overriding what the
+        // guest asked for, which is the worse failure of the two.
+        let new = (self.state.regs.cpsr & !byte_mask) | (value & byte_mask);
         self.state.regs.write_cpsr(new);
     }
 
@@ -1332,7 +1468,7 @@ impl<'a> Exec<'a> {
                 self.store(address & !1, Width::U16, value & 0xffff, privileged)?;
             }
             ExtraOp::Ldrh => {
-                let value = self.load(address & !1, Width::U16, privileged)?;
+                let value = self.load_half_rotated(address, privileged)?;
                 self.cycle(1);
                 self.finish_extra_load(index, rn, adjusted, rd, value);
                 return Ok(());
@@ -1345,9 +1481,8 @@ impl<'a> Exec<'a> {
                 return Ok(());
             }
             ExtraOp::Ldrsh => {
-                let value = self.load(address & !1, Width::U16, privileged)?;
+                let value = self.load_signed_half(address, privileged)?;
                 self.cycle(1);
-                let value = i32::from(value as u16 as i16) as u32;
                 self.finish_extra_load(index, rn, adjusted, rd, value);
                 return Ok(());
             }
@@ -1392,7 +1527,11 @@ impl<'a> Exec<'a> {
             self.set_reg(rn, adjusted);
         }
         if rd & 0xf == 15 {
-            self.branch_exchange(value);
+            // Not an interworking branch: ARMv5 made *word* loads into `R15`
+            // interwork (ARM ARM A4.1.23), and a halfword or signed byte
+            // cannot carry an address, so the case stays UNPREDICTABLE and the
+            // hardware simply branches. The corpus agrees.
+            self.branch_to(value);
         } else {
             self.set_reg(rd, value);
         }
@@ -1441,15 +1580,21 @@ impl<'a> Exec<'a> {
         if load && writeback {
             // Writeback before the loads, so a list containing the base ends
             // up holding the loaded value rather than the new base.
-            self.set_reg(rn, writeback_value);
+            self.write_base(rn, writeback_value, user_bank);
         }
+        // Whether the base writeback has already overwritten `R15`. If it
+        // has, a store of `R15` writes what the register now *holds* — the new
+        // base — rather than the pipelined `PC + 12` that an untouched `R15`
+        // would contribute.
+        let mut pc_overwritten = false;
         if !load && writeback {
             // For a store, the base is written back after the first transfer
             // unless it is the lowest register in the list — that is the one
             // case where hardware stores the original value.
             let lowest = effective_list.trailing_zeros();
             if effective_list & (1 << (rn & 0xf)) != 0 && u32::from(rn & 0xf) != lowest {
-                self.set_reg(rn, writeback_value);
+                self.write_base(rn, writeback_value, user_bank);
+                pc_overwritten = rn & 0xf == 15;
             }
         }
 
@@ -1458,8 +1603,12 @@ impl<'a> Exec<'a> {
             if effective_list & (1 << index) == 0 {
                 continue;
             }
+            // The base of a block transfer is forced word-aligned: bits
+            // [1:0] are ignored on the bus and, unlike `LDR`, no rotation is
+            // applied (ARM ARM A5.4.1).
+            let word = address & !3;
             if load {
-                let value = self.load(address, Width::U32, privileged)?;
+                let value = self.load(word, Width::U32, privileged)?;
                 if user_bank {
                     self.state.regs.set_reg_in_mode(Mode::USER, index, value);
                 } else if index == 15 {
@@ -1473,12 +1622,21 @@ impl<'a> Exec<'a> {
                     self.set_reg(index, value);
                 }
             } else {
-                let value = if user_bank {
+                // `R15` is not a banked register, so the `S` bit's
+                // redirection does not apply to it — and the
+                // implementation-defined store-of-`R15` offset still does.
+                let value = if index == 15 {
+                    if pc_overwritten {
+                        self.reg(15)
+                    } else {
+                        self.store_value(index)
+                    }
+                } else if user_bank {
                     self.state.regs.reg_in_mode(Mode::USER, index)
                 } else {
-                    self.store_value(index)
+                    self.reg(index)
                 };
-                self.store(address, Width::U32, value, privileged)?;
+                self.store(word, Width::U32, value, privileged)?;
             }
             address = address.wrapping_add(4);
         }
@@ -1486,9 +1644,27 @@ impl<'a> Exec<'a> {
             self.cycle(1);
         }
         if !load && writeback {
-            self.set_reg(rn, writeback_value);
+            self.write_base(rn, writeback_value, user_bank);
         }
         Ok(())
+    }
+
+    /// Write a block transfer's base register back.
+    ///
+    /// With the `S` bit set and `R15` absent from the list, the base is *read*
+    /// from the current mode's bank but *written back* to the User one — as if
+    /// the S bit forced the register file's write port over and left the read
+    /// port alone. Combining `S` with writeback is UNPREDICTABLE (ARM ARM
+    /// A5.4.6); this is what an ARM7TDMI does, and every one of the corpus's
+    /// vectors for the case agrees.
+    fn write_base(&mut self, rn: u8, value: u32, user_bank: bool) {
+        // `R15` has no User bank to redirect to, and writing it is a branch
+        // however it was reached.
+        if user_bank && rn & 0xf != 15 {
+            self.state.regs.set_reg_in_mode(Mode::USER, rn, value);
+        } else {
+            self.set_reg(rn, value);
+        }
     }
 
     // -----------------------------------------------------------------
@@ -1913,15 +2089,12 @@ impl<'a> Exec<'a> {
             let value = match op {
                 MemRegOp::Ldr => self.load_word_rotated(address, privileged)?,
                 MemRegOp::Ldrb => self.load(address, Width::U8, privileged)?,
-                MemRegOp::Ldrh => self.load(address & !1, Width::U16, privileged)?,
+                MemRegOp::Ldrh => self.load_half_rotated(address, privileged)?,
                 MemRegOp::Ldrsb => {
                     let v = self.load(address, Width::U8, privileged)?;
                     i32::from(v as u8 as i8) as u32
                 }
-                _ => {
-                    let v = self.load(address & !1, Width::U16, privileged)?;
-                    i32::from(v as u16 as i16) as u32
-                }
+                _ => self.load_signed_half(address, privileged)?,
             };
             self.cycle(1);
             self.set_reg(rd, value);
@@ -1944,7 +2117,7 @@ impl<'a> Exec<'a> {
         if load {
             let value = match size {
                 MemSize::Byte => self.load(address, Width::U8, privileged)?,
-                MemSize::Half => self.load(address & !1, Width::U16, privileged)?,
+                MemSize::Half => self.load_half_rotated(address, privileged)?,
                 MemSize::Word => self.load_word_rotated(address, privileged)?,
             };
             self.cycle(1);

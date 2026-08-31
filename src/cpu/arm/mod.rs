@@ -361,7 +361,14 @@ impl Regs {
     /// bare assignment to [`Regs::cpsr`] would change the mode field without
     /// moving the registers, which is the classic way to corrupt a stack
     /// pointer.
+    ///
+    /// `M[4]` — bit 4 of the mode field — is forced set. It is the bit that
+    /// distinguishes the 26-bit modes from the 32-bit ones, and no ARMv5 part
+    /// implements the 26-bit modes, so on real hardware it reads as one and
+    /// cannot be cleared. An `SPSR` has no such constraint, which is why this
+    /// is here and not in [`Regs::set_spsr`].
     pub const fn write_cpsr(&mut self, value: u32) {
+        let value = value | 0x10;
         self.set_mode(Mode((value & psr::MODE) as u8));
         self.cpsr = value;
     }
