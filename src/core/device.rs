@@ -35,7 +35,7 @@ use core::fmt;
 
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
-use crate::core::sched::{Budget, Consumed};
+use crate::core::sched::{Budget, Consumed, LazyHandle};
 use crate::core::space::{RegionRef, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter};
 use crate::core::wire::{WireId, WireSink, WireSource};
@@ -251,6 +251,86 @@ pub trait Device: Send + Sync + fmt::Debug {
     /// Outward actions — driving a wire, starting a burst — go on `deferred`,
     /// which the caller drains the moment this returns (§4.7).
     fn event(&self, _token: u64, _deferred: &mut Deferred) {}
+
+    // ---------------------------------------------------------------------
+    // Lazily advanced devices — sync-on-access (`ROADMAP.md` §4.2).
+    //
+    // The queue handles *scheduled* behaviour; it cannot handle *sampled*
+    // behaviour. A 6502 reads `$2002` at an arbitrary cycle and the PPU has to
+    // be at exactly that dot. So a device may declare that it holds its own
+    // tick and is caught up before it is touched, and the machine layer
+    // registers it with the scheduler on its clock domain.
+    //
+    // Every method here takes `&self`, like the rest of the surface: a device
+    // is shared and its state lives behind interior mutability. The scheduler's
+    // `LazyDevice` takes `&mut self` instead, and the machine layer adapts
+    // between the two — which is also where the `&mut` exclusivity that makes
+    // `advance_to` non-re-entrant comes from.
+    //
+    // # What an implementation must guarantee
+    //
+    // [`current_tick`](Device::current_tick) and
+    // [`next_event_tick`](Device::next_event_tick) are called with the
+    // scheduler's slot lock held, at
+    // [`LockRank::LEAF`](crate::core::sync::LockRank::LEAF) — the rank nothing
+    // nests under. **Neither may take a lock**: publish the two numbers into
+    // atomics as the device advances. `advance_to` is called with no lock held
+    // at all, so it is free to take its own and to reach its own bus.
+    // ---------------------------------------------------------------------
+
+    /// Whether this device advances only when somebody looks at it.
+    ///
+    /// A device that says yes needs a clock domain, and realize refuses one
+    /// without — its tick is counted in that domain and catch-up has no target
+    /// otherwise.
+    fn is_lazy(&self) -> bool {
+        false
+    }
+
+    /// The tick, in the device's own clock domain, that it has simulated up to.
+    ///
+    /// Must not take a lock — see the note above.
+    fn current_tick(&self) -> u64 {
+        0
+    }
+
+    /// Simulate forward until [`current_tick`](Device::current_tick) reaches
+    /// `tick`.
+    ///
+    /// Never called with a tick in the past, and never with any lock held, so
+    /// an implementation may take its own state lock and reach its own bus.
+    /// Running backwards is a no-op, not an error.
+    fn advance_to(&self, tick: u64) {
+        let _ = tick;
+    }
+
+    /// The device's own next internal event, if it has one.
+    ///
+    /// Catch-up never crosses it: past that tick the device's behaviour
+    /// changes, and simulating through it in one step would compute the wrong
+    /// answer. It is also what the machine layer bounds a quantum by, so that a
+    /// CPU is not let run thousands of cycles past the dot an NMI was raised
+    /// on. `None` means "nothing pending" and catch-up runs to the present.
+    ///
+    /// **Must be strictly greater than [`current_tick`](Device::current_tick)**
+    /// or catch-up makes no progress and the device stalls where it stands.
+    /// Must not take a lock — see the note above.
+    fn next_event_tick(&self) -> Option<u64> {
+        None
+    }
+
+    /// Told the handle that catches this device up.
+    ///
+    /// This is how sync-on-access reaches the code that answers an access:
+    /// `MemOps::read` takes `&self` and runs several frames below whoever owns
+    /// the scheduler, so the device keeps the handle and calls
+    /// [`LazyHandle::sync`] at the top of its own read and write paths. Called
+    /// once, by the machine layer, after the device is registered.
+    ///
+    /// A device that is not lazy never gets one.
+    fn attach_lazy(&self, handle: LazyHandle) {
+        let _ = handle;
+    }
 }
 
 /// A device that performs its own accesses: DMA engines, bus masters, host

@@ -1128,6 +1128,16 @@ impl LazySlot {
         Ok(to)
     }
 
+    /// The device's own next event, if it has one and it is registered.
+    ///
+    /// Like [`LazySlot::current_tick`] this asks the device under the slot's
+    /// leaf lock, which is why [`LazyDevice::next_event_tick`] may not take one
+    /// of its own.
+    fn next_event_tick(&self) -> Option<u64> {
+        let state = self.state.lock();
+        state.device.as_ref().and_then(|d| d.next_event_tick())
+    }
+
     /// Where the device has simulated up to, advancing nothing.
     fn current_tick(&self, id: LazyId) -> SchedResult<u64> {
         let state = self.state.lock();
@@ -1552,6 +1562,68 @@ impl Scheduler {
             .get(id.index())
             .ok_or(SchedError::UnknownLazyDevice(id))?
             .sync_to_tick(id, tick)
+    }
+
+    /// Catches every lazily-advanced device up to the present.
+    ///
+    /// The other half of sync-on-access, and the half without which a mapped
+    /// PPU is worse than no PPU: a device nobody reads still has to reach the
+    /// dot it is standing on, or it never raises the NMI that the game is
+    /// waiting for. A run loop calls this at every quantum boundary.
+    ///
+    /// Each device is advanced repeatedly until it reaches the present or stops
+    /// making progress, because a single [`LazyHandle::sync`] stops at the
+    /// device's own next event and a quantum may contain several of them.
+    ///
+    /// # Errors
+    ///
+    /// [`SchedError::Clock`] for a domain the forest does not know,
+    /// [`SchedError::LazyDeviceBusy`] if catch-up is already running further up
+    /// the stack, or [`SchedError::NonMonotonicDevice`].
+    pub fn sync_lazy_devices(&self) -> SchedResult<()> {
+        for (index, slot) in self.lazy.iter().enumerate() {
+            let id = LazyId(index as u32);
+            let present = self.forest.ticks(slot.domain)?;
+            let mut last = None;
+            loop {
+                let at = slot.sync(id, Some(present), AccessKind::Guest)?;
+                if at >= present || Some(at) == last {
+                    break;
+                }
+                last = Some(at);
+            }
+        }
+        Ok(())
+    }
+
+    /// The earliest instant at which some lazily-advanced device's own next
+    /// event falls, if any device has one.
+    ///
+    /// What a run loop bounds its next quantum by. Without it a CPU handed a
+    /// 10 000-cycle budget runs thousands of cycles past the dot the PPU raised
+    /// vblank on, and the NMI lands that late — the scheduled half of §4.2,
+    /// where [`LazyHandle::sync`] is the sampled half.
+    ///
+    /// A device whose next event has already gone by is not reported: the
+    /// caller cannot un-run the cycles that passed it, and clamping a quantum
+    /// to an instant that is not in the future would stall the machine instead.
+    pub fn lazy_deadline(&self) -> Option<GlobalTime> {
+        let mut best: Option<GlobalTime> = None;
+        for slot in &self.lazy {
+            let Some(tick) = slot.next_event_tick() else {
+                continue;
+            };
+            let Ok(at) = self.forest.global_time_of_tick(slot.domain, tick) else {
+                continue;
+            };
+            if at <= self.now {
+                continue;
+            }
+            if best.is_none_or(|b| at < b) {
+                best = Some(at);
+            }
+        }
+        best
     }
 
     /// Publishes every lazy device's domain position, for the handles.
@@ -2415,6 +2487,101 @@ mod tests {
         // Catch-up does not take it. In a debug build the ladder is live, so
         // anything at or below `BUS` would panic here rather than pass.
         assert_eq!(handle.sync(AccessKind::Guest).unwrap(), dot);
+    }
+
+    #[test]
+    fn a_device_nobody_reads_is_still_caught_up_at_the_quantum_boundary() {
+        // The other half of sync-on-access, and the reason a bound-but-never-
+        // advanced PPU is worse than no PPU: a game whose main loop spins on a
+        // flag its NMI handler sets never touches a PPU register, so nothing
+        // would ever drag the chip to the dot that raises vblank.
+        let (mut sched, cpu, ppu) = nes_scheduler();
+        sched.add_runnable(cpu, Box::new(Cpu::default()));
+        let dev = sched.add_lazy_device(ppu, Box::new(Ppu::default()));
+        let handle = sched.lazy_handle(dev).expect("a handle");
+
+        sched.run_quantum().unwrap();
+        assert_eq!(handle.current_tick().unwrap(), 0, "nothing looked at it");
+
+        sched.sync_lazy_devices().unwrap();
+        let dot = sched.forest().ticks(ppu).unwrap();
+        assert_eq!(handle.current_tick().unwrap(), dot);
+        assert_eq!(dot, sched.forest().ticks(cpu).unwrap() * 3);
+    }
+
+    #[test]
+    fn catch_up_crosses_a_run_of_internal_events_one_at_a_time() {
+        // A single `sync` stops at the device's own next event. A quantum may
+        // contain many of them — a PPU stopping at every scanline crosses 15 in
+        // a millisecond — so reaching the present takes a loop, and
+        // `sync_lazy_devices` is where it lives.
+        let (mut sched, cpu, ppu) = nes_scheduler();
+        sched.add_runnable(cpu, Box::new(Cpu::default()));
+        let dev = sched.add_lazy_device(
+            ppu,
+            Box::new(Ppu {
+                // Never more than 100 dots at a time.
+                next_event: Some(100),
+                ..Ppu::default()
+            }),
+        );
+        let handle = sched.lazy_handle(dev).expect("a handle");
+        sched.run_quantum().unwrap();
+
+        // One sync alone stops at the declared event and goes no further.
+        assert_eq!(handle.sync(AccessKind::Guest).unwrap(), 100);
+        // The scheduler's own pass reaches the present anyway. (This stand-in
+        // device never moves its event, so the loop's second guard — no
+        // progress — is what ends it; a real device advances its event, which
+        // is why `Device::next_event_tick` documents that it must.)
+        sched.sync_lazy_devices().unwrap();
+        assert_eq!(handle.current_tick().unwrap(), 100);
+    }
+
+    #[test]
+    fn a_quantum_can_be_bounded_by_a_lazy_devices_own_event() {
+        let (mut sched, cpu, ppu) = nes_scheduler();
+        sched.add_runnable(cpu, Box::new(Cpu::default()));
+
+        // Nothing lazy: nothing to bound a quantum by.
+        assert_eq!(sched.lazy_deadline(), None);
+
+        // A device with no event of its own likewise reports none.
+        let plain = sched.add_lazy_device(ppu, Box::new(Ppu::default()));
+        assert_eq!(sched.lazy_deadline(), None);
+        let _ = plain;
+
+        // One with an event names the instant that dot falls on, which is
+        // exactly where a run loop must stop the CPU: past it the NMI has been
+        // raised and the CPU has already run through it.
+        let dot = 4_000u64;
+        sched.add_lazy_device(
+            ppu,
+            Box::new(Ppu {
+                next_event: Some(dot),
+                ..Ppu::default()
+            }),
+        );
+        let at = sched.lazy_deadline().expect("a deadline");
+        assert_eq!(at, sched.forest().global_time_of_tick(ppu, dot).unwrap());
+
+        // Running to it leaves the CPU one dot-worth of rounding short of the
+        // event and never past it, so catch-up lands the device *on* the dot.
+        sched.run_until(at).unwrap();
+        sched.sync_lazy_devices().unwrap();
+        assert!(sched.forest().ticks(ppu).unwrap() <= dot);
+
+        // And an event already behind virtual time is not reported: clamping a
+        // quantum to an instant the machine is standing on would stall it.
+        while sched.lazy_deadline().is_some() {
+            let at = sched.lazy_deadline().expect("checked");
+            if at <= sched.now() {
+                break;
+            }
+            sched.run_until(at).unwrap();
+            sched.run_quantum().unwrap();
+        }
+        assert_eq!(sched.lazy_deadline(), None);
     }
 
     /// A device that reads its own registers as it simulates — the one way a

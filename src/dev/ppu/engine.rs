@@ -1104,6 +1104,61 @@ impl Engine {
         }
     }
 
+    /// The next dot count at which this chip's outputs can change on their own
+    /// — the catch-up bound of `ROADMAP.md` §4.2.
+    ///
+    /// Two kinds of instant, and the smaller one wins:
+    ///
+    /// * **The vblank edges.** `/NMI` is raised
+    ///   [`Geometry::nmi_announce_dots`] after the flag is set at
+    ///   (`vblank_scanline`, 1) and dropped when the flag is cleared at
+    ///   (`pre_render_scanline`, 1). Those are the only dots at which the chip
+    ///   drives a wire without anybody having touched it, so a run loop that
+    ///   stops there delivers the NMI on the cycle it happened rather than
+    ///   whenever the CPU next looks.
+    /// * **The next scanline**, as a ceiling. Everything else the CPU can
+    ///   sample — sprite 0 hit, sprite overflow, the pixel being drawn — moves
+    ///   inside a line, so stopping at every line boundary bounds how stale a
+    ///   `$2002` read taken mid-quantum can be. Stopping *more* often is never
+    ///   wrong: catch-up is a floor on precision, never a ceiling.
+    ///
+    /// The result is always at least [`Geometry::nmi_announce_dots`] + 1 dots
+    /// ahead — one CPU cycle, rounded up, plus one. Two reasons, and both
+    /// matter: catch-up that returns a tick the device is already standing on
+    /// makes no progress, and a clock tree may sit up to one driving-domain
+    /// tick behind virtual time (`core::sched`), so a nearer answer would name
+    /// an instant already in the past and be discarded.
+    pub fn next_event_dot(&self) -> u64 {
+        let lead = self.geom.nmi_announce_dots + 1;
+        let floor = self.dots + lead;
+        // Distance from here to (`scanline`, `dot`) on this line or the next.
+        let ahead = |line: u16, at: u16| -> u64 {
+            let here = u64::from(self.scanline) * DOTS_PER_SCANLINE as u64 + u64::from(self.dot);
+            let there = u64::from(line) * DOTS_PER_SCANLINE as u64 + u64::from(at);
+            let frame = self.geom.dots_per_frame;
+            self.dots + (there + frame - here) % frame
+        };
+        // `run_to(target)` has executed every dot below `target`, so the dot
+        // that *does* the thing is one less than the target that includes it.
+        let vblank_nmi = ahead(
+            self.geom.vblank_scanline,
+            1 + self.geom.nmi_announce_dots as u16,
+        );
+        let vblank_clear = ahead(self.geom.pre_render_scanline, 2);
+        // The line boundary is the ceiling and must always be eligible, so a
+        // boundary inside the lead is skipped to the one after it — a scanline
+        // is 341 dots, which is far more than any lead.
+        let mut next_line = self.dots + u64::from(DOTS_PER_SCANLINE - self.dot);
+        if next_line < floor {
+            next_line += u64::from(DOTS_PER_SCANLINE);
+        }
+        [vblank_nmi, vblank_clear, next_line]
+            .into_iter()
+            .filter(|t| *t >= floor)
+            .min()
+            .unwrap_or(next_line)
+    }
+
     /// Run dots until `target` total dots have executed, or until the NMI
     /// request leaves `entry`.
     ///

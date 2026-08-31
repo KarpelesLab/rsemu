@@ -1085,12 +1085,18 @@ fn a_misaligned_oamaddr_reinterprets_oam_bytes() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn realize_fails_without_a_bus() {
+fn realize_no_longer_demands_a_bus_of_its_own() {
+    // The check used to live here, which is the right place for a hand-wired
+    // machine and the wrong one for a described one: the realizer hands a
+    // device its address space at *bind* time, after every region is mapped, so
+    // a DSL-built PPU has no bus yet when `realize` runs. `Instance::bind` is
+    // where a missing `space =` is now reported — see
+    // `machine::tests::a_ppu_without_an_address_space_is_refused`.
     let ppu = NesPpu::new(&Props::new()).unwrap();
     let mut deferred = Deferred::new();
     let mut ctx = RealizeCtx::new("ppu", RequesterId(1), &mut deferred);
-    let err = ppu.realize(&mut ctx).unwrap_err().to_string();
-    assert!(err.contains("attach_bus"), "{err}");
+    ppu.realize(&mut ctx)
+        .expect("realize is about the wire, not the bus");
 }
 
 #[test]
@@ -1670,4 +1676,124 @@ fn the_class_constructs_through_the_registry_with_a_region() {
         "`rsemu describe nes.ppu` must list it"
     );
     assert!(Device::region(device.as_ref(), "").is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Lazily advanced (`ROADMAP.md` §4.2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_next_event_is_always_far_enough_ahead_to_be_reachable() {
+    // Two things depend on this bound, and both fail silently without it:
+    // catch-up that returns the tick a device already stands on makes no
+    // progress, and a clock tree may sit up to one driving-domain tick behind
+    // virtual time, so a nearer answer names an instant already in the past and
+    // a run loop discards it.
+    for region in [Region::Ntsc, Region::Pal, Region::Dendy] {
+        let (ppu, _, _) = new_ppu_in(region);
+        let lead = ppu.geometry().nmi_announce_dots + 1;
+        // Two scanlines is the ceiling: the next line boundary, or the one
+        // after it when the first is inside the lead.
+        let ceiling = 2 * u64::from(DOTS_PER_SCANLINE) + lead;
+        // A frame and a bit, one dot at a time.
+        for _ in 0..(ppu.geometry().dots_per_frame + 500) {
+            let next = ppu.next_event_dot();
+            let ahead = next - ppu.dots();
+            assert!(
+                ahead >= lead,
+                "{region}: next event {next} is only {ahead} dots past {}",
+                ppu.dots()
+            );
+            assert!(
+                ahead <= ceiling,
+                "{region}: next event {next} is {ahead} dots away; a mid-quantum \
+                 $2002 read would be that stale"
+            );
+            ppu.advance_by(1);
+        }
+    }
+}
+
+#[test]
+fn stopping_at_every_next_event_still_reaches_the_nmi_on_its_own_dot() {
+    // What a run loop does: advance only as far as the chip's own next event,
+    // and never past it. The vblank request must still be raised on the dot it
+    // is raised on when the same span is run in one go.
+    let (ppu, _, _) = new_ppu();
+    let nmi = with_nmi(&ppu);
+    ppu.write_register(regs::PPUCTRL, CTRL_NMI);
+    let geom = ppu.geometry();
+    let target = geom.dots_per_frame;
+    let mut first_high = None;
+    while ppu.dots() < target {
+        let next = ppu.next_event_dot().min(target);
+        ppu.advance_to(next);
+        if first_high.is_none() && nmi.levels.lock().iter().any(|l| *l) {
+            first_high = Some(ppu.dots());
+        }
+    }
+    let at = first_high.expect("the NMI never asserted in a frame");
+    // The flag is set by the dot at (vblank_scanline, 1) and the request
+    // reaches the wire `nmi_announce_dots` later — one CPU cycle, rounded up.
+    let flag_dot = u64::from(geom.vblank_scanline) * u64::from(DOTS_PER_SCANLINE) + 1;
+    assert!(
+        (flag_dot + geom.nmi_announce_dots..=flag_dot + geom.nmi_announce_dots + 8).contains(&at),
+        "the request reached the wire at dot {at}, not just after {flag_dot}"
+    );
+}
+
+#[test]
+fn the_lock_free_position_tracks_the_engine() {
+    // `Device::current_tick` and `Device::next_event_tick` are asked with the
+    // scheduler's slot held at `LockRank::LEAF`, which nothing nests under, so
+    // they read atomics rather than the engine. Those atomics are derived state
+    // and every path that moves the engine has to republish them.
+    let (ppu, _, _) = new_ppu();
+    let device: &dyn Device = &ppu;
+    assert!(device.is_lazy());
+    assert_eq!(device.current_tick(), 0);
+
+    ppu.advance_by(1000);
+    assert_eq!(device.current_tick(), ppu.dots());
+    assert_eq!(device.next_event_tick(), Some(ppu.next_event_dot()));
+
+    // A register write moves neither, but it can change what the next event
+    // *is* — `$2000` decides whether vblank will raise the request at all.
+    ppu.write_register(regs::PPUCTRL, CTRL_NMI);
+    assert_eq!(device.current_tick(), ppu.dots());
+
+    // And a reset puts both back where a cold machine's are.
+    Device::reset(&ppu, ResetKind::Cold);
+    assert_eq!(device.current_tick(), 0);
+    assert_eq!(device.current_tick(), ppu.dots());
+}
+
+#[test]
+fn a_snapshot_restores_the_lock_free_position_too() {
+    let (ppu, _, _) = new_ppu();
+    ppu.advance_by(12_345);
+    let mut w = StateWriter::new(MachineShape::new());
+    {
+        let mut chunk = w
+            .chunk("ppu", NES_PPU_CLASS.name, NES_PPU_CLASS.version)
+            .expect("a chunk");
+        Device::save(&ppu, &mut chunk).expect("saves");
+    }
+    let bytes = w.to_vec().expect("serializes");
+
+    let (restored, _, _) = new_ppu();
+    let reader = StateReader::new(&bytes).expect("well formed");
+    let chunk = reader
+        .load(
+            "ppu",
+            NES_PPU_CLASS.name,
+            NES_PPU_CLASS.version,
+            &Migrations::new(),
+        )
+        .expect("the chunk is there");
+    Device::load(&restored, &mut chunk.reader()).expect("loads");
+
+    let device: &dyn Device = &restored;
+    assert_eq!(device.current_tick(), 12_345);
+    assert_eq!(device.next_event_tick(), Some(restored.next_event_dot()));
 }

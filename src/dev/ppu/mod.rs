@@ -57,10 +57,14 @@
 //!
 //! # Wiring a machine
 //!
-//! Until `RealizeCtx` grows accessors for spaces, wires and clocks (`ROADMAP.md`
-//! §4.4), the connections are made with the `attach_*` methods below. They are
-//! pure stores — nothing observable happens before
-//! [`realize`](Device::realize), which is where the missing ones are reported.
+//! A described machine needs none of this: `machines/nes-ntsc.machine` names
+//! the object, maps `ppu.regs` at `$2000`, gives it `space = ppubus` and wires
+//! `ppu.nmi -> cpu.nmi`, and the realizer does the rest through
+//! [`Instance::bind`] and [`Device::attach_lazy`].
+//!
+//! Assembling one by hand — which is what the tests and this example do — means
+//! calling the `attach_*` methods below. They are pure stores: nothing
+//! observable happens before [`realize`](Device::realize).
 //!
 //! ```
 //! use std::sync::Arc;
@@ -100,9 +104,29 @@
 //! # Time
 //!
 //! The PPU is a **lazily advanced** device (`ROADMAP.md` §4.2): it holds a dot
-//! counter and the machine calls [`NesPpu::advance_to`] before dispatching any
-//! access to it. Without that, every `$2002` read is thousands of dots stale and
-//! the split-screen status bar in nearly every NES game is wrong.
+//! counter, and it is caught up before any access is dispatched to it. Without
+//! that, every `$2002` read is thousands of dots stale and the split-screen
+//! status bar in nearly every NES game is wrong.
+//!
+//! [`Device::is_lazy`] is how it says so, and the machine layer answers with a
+//! [`LazyHandle`] through [`NesPpu::attach_lazy`]. The handle is what makes the
+//! catch-up reachable at all: it fires from inside [`PpuPort::read`], which
+//! takes `&self` and runs several frames below whoever owns the scheduler.
+//! Two halves, and both are needed:
+//!
+//! * **Sampled** — the port syncs before it answers, so a `$2002` read lands on
+//!   the dot it really happened on.
+//! * **Scheduled** — the run loop bounds each quantum by
+//!   [`Engine::next_event_dot`] and catches the chip up there, so vblank is
+//!   raised on its own dot even though the CPU is spinning on a RAM flag and
+//!   will not touch a PPU register until the NMI arrives.
+//!
+//! Two consequences for anyone extending this module. [`Device::current_tick`]
+//! and [`Device::next_event_tick`] are asked with the scheduler's slot held at
+//! [`LockRank::LEAF`], so they read atomics and **must not take the engine
+//! lock**; every critical section that moves the engine republishes them. And
+//! the engine lock is ranked between `BUS` and `DEVICE` — see
+//! [`ENGINE_LOCK_RANK`], which is where the whole squeeze is written out.
 //!
 //! # OAM DMA
 //!
@@ -128,13 +152,15 @@ use crate::core::clock::{ClockForest, ClockResult, DomainId};
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
 use crate::core::error::{BusError, Result};
 use crate::core::props::{Props, ValueKind};
+use crate::core::sched::{AccessKind, LazyHandle};
 use crate::core::space::{
     AccessConstraints, AddressSpace, MemAttrs, MemOps, MemResult, Region as MmioRegion, RegionRef,
 };
 use crate::core::state::{ChunkReader, ChunkWriter};
-use crate::core::sync::{LockRank, Mutex};
+use crate::core::sync::{AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::Width;
 use crate::core::wire::{Level, WireSource};
+use crate::machine::realize::{BindCtx, Instance};
 
 pub use engine::{
     DEFAULT_DECAY_DOTS, DOTS_PER_FRAME, DOTS_PER_SCANLINE, Engine, EvalPhase, FRAMEBUFFER_LEN,
@@ -198,18 +224,50 @@ pub fn add_clock_domain(
 // Shared state
 // ---------------------------------------------------------------------------
 
+/// Where the engine lock sits in the ladder: **between**
+/// [`LockRank::BUS`] and [`LockRank::DEVICE`].
+///
+/// Not one of `core::sync`'s named ranks, and the reason is the whole of §4.2's
+/// catch-up made concrete. The PPU is squeezed from both ends:
+///
+/// * It is reached **from under a `BUS`-ranked lock**. Sync-on-access fires
+///   from inside `MemOps::read`, and the 6502 holds its own execution state at
+///   `LockRank::BUS` across every access it issues. `BUS` again here would be
+///   `BUS <= BUS` and the debug order check would fire on the first `$2002`
+///   read of the first game — correctly, because on a threaded backend two bus
+///   masters at one rank is a cycle waiting to happen.
+/// * It is held **across CHR fetches into the cartridge**, which take
+///   `DEVICE`-ranked locks of their own. The PPU is a bus master, so `DEVICE`
+///   would make every pattern fetch a violation the other way.
+///
+/// So it goes between them, in the gap the named ranks were spaced `0x1000`
+/// apart to leave. Nothing else claims this rank, and the invariant is the
+/// ordinary one: a lock taken while it is held must rank above it.
+pub const ENGINE_LOCK_RANK: LockRank = LockRank::new(0x4800);
+
 /// What the device and its memory port both hold.
 struct Shared {
-    /// The dot engine.
-    ///
-    /// Ranked [`LockRank::BUS`] rather than [`LockRank::DEVICE`] because the PPU
-    /// is a bus master: it holds this across CHR fetches into the cartridge,
-    /// which take a device lock of their own. A rank at `DEVICE` would make
-    /// every pattern fetch a rank violation.
+    /// The dot engine. See [`ENGINE_LOCK_RANK`].
     engine: Mutex<Engine>,
     /// The NMI request line and the clock domain. Taken *after* `engine` and
     /// never held across the outward `set`.
     links: Mutex<Links>,
+    /// The catch-up handle the machine layer hands over at realize time.
+    ///
+    /// Its own leaf-ranked lock rather than a field of `links`: it is read at
+    /// the top of every guest access, and `links` is `WIRE`-ranked, which the
+    /// engine lock would then be unable to nest under.
+    lazy: Mutex<Option<LazyHandle>>,
+    /// [`Engine::dots`], republished on every release of the engine lock.
+    ///
+    /// The scheduler asks a lazily-advanced device where it is *while holding
+    /// its slot at [`LockRank::LEAF`]* — the rank nothing nests under — so
+    /// [`Device::current_tick`] may not take a lock. An atomic is the answer,
+    /// and it is the better one anyway: this is the hot path.
+    dots: AtomicU64,
+    /// [`Engine::next_event_dot`], republished alongside [`Shared::dots`] and
+    /// read under the same constraint.
+    next_event: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -228,10 +286,23 @@ impl Shared {
         let (result, nmi) = {
             let mut engine = self.engine.lock();
             let result = f(&mut engine);
+            self.publish(&engine);
             (result, engine.nmi_active())
         };
         self.drive_nmi(nmi);
         result
+    }
+
+    /// Republish what the lock-free lazy surface reads.
+    ///
+    /// Called from inside every critical section that can move the dot counter
+    /// or change what the chip's next self-driven event is — which is every one
+    /// that takes the engine mutably, since `$2000` alone decides whether the
+    /// vblank flag will raise `/NMI`.
+    fn publish(&self, engine: &Engine) {
+        self.dots.store(engine.dots, Ordering::Relaxed);
+        self.next_event
+            .store(engine.next_event_dot(), Ordering::Relaxed);
     }
 
     fn drive_nmi(&self, active: bool) {
@@ -243,6 +314,32 @@ impl Shared {
         if let Some(source) = source {
             source.set(Level::from_bool(active));
         }
+    }
+
+    /// Catch this chip up before an access is dispatched to it (§4.2).
+    ///
+    /// Takes no lock of its own beyond the handle's leaf, and holds none while
+    /// the scheduler calls back into [`NesPpu::advance_to`] — which is what
+    /// lets that call take the engine lock, reach the cartridge for a pattern
+    /// fetch, and drive `/NMI`, all from inside a CPU access that is already
+    /// holding the 6502's own `BUS`-ranked lock.
+    ///
+    /// A debug access advances nothing (`ROADMAP.md` §15, invariant 5).
+    fn sync(&self, attrs: MemAttrs) {
+        let handle = self.lazy.lock().clone();
+        let Some(handle) = handle else {
+            return;
+        };
+        let kind = if attrs.debug {
+            AccessKind::Debug
+        } else {
+            AccessKind::Guest
+        };
+        // A refusal means catch-up for this chip is already running further up
+        // the stack — the PPU reading its own registers through its own bus,
+        // which no NES does. The access still has to be answered, and answering
+        // it from where the chip stands is the only defined thing to do.
+        let _ = handle.sync(kind);
     }
 }
 
@@ -290,9 +387,14 @@ impl NesPpu {
         let region = Region::from_name(name).ok_or_else(|| {
             crate::core::Error::Property(alloc::format!("unknown `region` `{name}`"))
         })?;
+        let engine = Engine::new(region, warmup, decay);
+        let next_event = engine.next_event_dot();
         let shared = Arc::new(Shared {
-            engine: Mutex::with_rank(LockRank::BUS, Engine::new(region, warmup, decay)),
+            engine: Mutex::with_rank(ENGINE_LOCK_RANK, engine),
             links: Mutex::with_rank(LockRank::WIRE, Links::default()),
+            lazy: Mutex::new(None),
+            dots: AtomicU64::new(0),
+            next_event: AtomicU64::new(next_event),
         });
         let regs = Arc::new(MmioRegion::io(
             "nes.ppu.regs",
@@ -344,6 +446,23 @@ impl NesPpu {
         self.shared.links.lock().clock
     }
 
+    /// Connect the catch-up handle the register block syncs through (§4.2).
+    ///
+    /// The machine layer calls this from realize; a caller wiring a NES by hand
+    /// registers the chip with `Scheduler::add_lazy_device` and passes the
+    /// handle here. Without one the register block answers from wherever the
+    /// chip happens to be standing, which is why the machine layer never
+    /// leaves it unset.
+    pub fn attach_lazy(&self, handle: LazyHandle) {
+        *self.shared.lazy.lock() = Some(handle);
+    }
+
+    /// The dot the chip's own next self-driven event falls on — the catch-up
+    /// bound of §4.2, and what a run loop clamps its quantum by.
+    pub fn next_event_dot(&self) -> u64 {
+        self.shared.next_event.load(Ordering::Relaxed)
+    }
+
     /// The CPU-facing register block, ready to be wrapped in a
     /// [`Region::io`](crate::core::space::Region::io) of
     /// [`REGISTER_WINDOW_LEN`] bytes at [`REGISTER_BASE`].
@@ -386,6 +505,7 @@ impl NesPpu {
                 let mut engine = self.shared.engine.lock();
                 let entry = engine.nmi_active();
                 let reached = engine.run_to(target, entry);
+                self.shared.publish(&engine);
                 (reached, engine.nmi_active())
             };
             // Outside the lock, every time the request level moved — a long
@@ -532,13 +652,16 @@ impl Device for NesPpu {
         &NES_PPU_CLASS
     }
 
-    fn realize(&self, ctx: &mut RealizeCtx<'_>) -> Result<()> {
-        if self.shared.engine.lock().bus.is_none() {
-            return Err(ctx.error(
-                "no PPU address space attached: call attach_bus with the $0000-$3FFF space \
-                 the cartridge provides",
-            ));
-        }
+    /// # Why the PPU bus is not required here
+    ///
+    /// It used to be, and for a hand-wired machine that was the right place.
+    /// The machine layer hands a device its address space at *bind* time, which
+    /// runs after realize — a device may read through its space from `bind`,
+    /// and every region has to be mapped before that is true — so a
+    /// DSL-described PPU has no bus yet at this point. The check moved to
+    /// [`Instance::bind`], which is where the machine layer is in a position to
+    /// supply one and therefore where its absence is a real error.
+    fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
         // Realize must leave every wire driving what its state implies, or a
         // freshly built machine comes up with the interrupt line wrong
         // (`ROADMAP.md` §4.3).
@@ -567,9 +690,16 @@ impl Device for NesPpu {
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
-        let result = { self.shared.engine.lock().load(r) };
+        let (result, nmi) = {
+            let mut engine = self.shared.engine.lock();
+            let result = engine.load(r);
+            // The dot counter and the next event both came from the snapshot;
+            // the lock-free copies of them are derived state and have to follow.
+            self.shared.publish(&engine);
+            let nmi = engine.nmi_active();
+            (result, nmi)
+        };
         // The restored state implies an NMI level that nothing has announced.
-        let nmi = self.shared.engine.lock().nmi_active();
         self.shared.drive_nmi(nmi);
         result
     }
@@ -614,6 +744,82 @@ impl Device for NesPpu {
             self.shared.drive_nmi(nmi);
         }
     }
+
+    // -- lazily advanced (`ROADMAP.md` §4.2) ---------------------------------
+
+    /// Yes. The whole reason sync-on-access exists.
+    ///
+    /// Running the chip dot by dot in lockstep with the CPU would be far more
+    /// expensive than running it in bursts, but a `$2002` read has to see the
+    /// state at exactly the dot it happened on — sprite 0 and the vblank race
+    /// included. So the chip keeps its own dot counter and whoever touches it
+    /// catches it up first.
+    fn is_lazy(&self) -> bool {
+        true
+    }
+
+    /// Dots executed, read from the atomic rather than the engine: the
+    /// scheduler asks this with its slot held at `LockRank::LEAF`.
+    fn current_tick(&self) -> u64 {
+        self.shared.dots.load(Ordering::Relaxed)
+    }
+
+    fn advance_to(&self, tick: u64) {
+        NesPpu::advance_to(self, tick);
+    }
+
+    /// See [`Engine::next_event_dot`]: the vblank edges, floored at the next
+    /// scanline so a mid-quantum `$2002` read is never more than a line stale.
+    fn next_event_tick(&self) -> Option<u64> {
+        Some(self.shared.next_event.load(Ordering::Relaxed))
+    }
+
+    fn attach_lazy(&self, handle: LazyHandle) {
+        NesPpu::attach_lazy(self, handle);
+    }
+}
+
+/// The machine layer's half: the PPU takes a clock domain and an address space
+/// of its own, neither of which `Device` has a way to be told about.
+impl Instance for NesPpu {
+    fn bind(&self, ctx: &BindCtx<'_>) -> Result<()> {
+        let space = ctx.space().ok_or_else(|| crate::core::Error::Config {
+            at: alloc::string::String::from(ctx.path()),
+            message: alloc::string::String::from(
+                "the PPU needs an address space of its own: add `space = ppubus` to the object \
+                 and map the cartridge's pattern tables and the console's nametables into it",
+            ),
+        })?;
+        self.attach_bus(Arc::clone(space));
+        if let Some(domain) = ctx.domain() {
+            self.attach_clock(domain);
+        }
+        Ok(())
+    }
+}
+
+/// Bind [`NES_PPU_CLASS`] into the machine graph.
+///
+/// # Errors
+///
+/// [`crate::Error::Config`] if the class name is already bound.
+pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
+    bindings.bind(NES_PPU_CLASS.name, |props| {
+        Ok(Arc::new(NesPpu::new(props)?))
+    })
+}
+
+/// What the validator should know about `nes.ppu`.
+#[must_use]
+pub fn schema() -> crate::machine::validate::ClassSchema {
+    use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
+    ClassSchema::new(NES_PPU_CLASS.name)
+        .prop(PropSchema::new("region", ValueKind::Str).values(Region::NAMES))
+        .prop(PropSchema::new("warmup", ValueKind::Bool))
+        .prop(PropSchema::new("open-bus-decay-dots", ValueKind::Uint))
+        // One output and no inputs: nothing on a NES drives a pin of the PPU.
+        .port(NMI_PIN, PortDir::Out)
+        .region(REGISTER_REGION)
 }
 
 // ---------------------------------------------------------------------------
@@ -625,10 +831,17 @@ impl Device for NesPpu {
 /// Byte accesses only, and no bulk transfers: the ports have side effects, so a
 /// four-byte read would pop the `$2007` buffer four times. Mirroring is `& 7`.
 ///
-/// **This port does not advance time.** The machine calls
-/// [`NesPpu::advance_to`] first (`ROADMAP.md` §4.2); a port that caught up by
-/// itself would need the scheduler's current time, which is not something a
-/// [`MemOps`] implementation is handed.
+/// **This port advances the chip before it answers** (`ROADMAP.md` §4.2). The
+/// [`LazyHandle`] the machine layer attaches at realize time is what makes that
+/// reachable: `read` takes `&self` and runs several frames below whoever owns
+/// the scheduler, so there is no route back to it — the handle is the route.
+/// Catch-up runs with no lock of this device held, and only then is the engine
+/// locked to answer, which is why a pattern fetch during catch-up cannot meet
+/// the access that triggered it.
+///
+/// A `MemAttrs::debug` access advances nothing at all: a monitor reading
+/// `$2002` must not move the chip's clock any more than it may clear the vblank
+/// flag (invariant 5).
 pub struct PpuPort {
     shared: Arc<Shared>,
 }
@@ -644,6 +857,8 @@ impl MemOps for PpuPort {
         let [byte] = dst else {
             return Err(BusError::BadAccess);
         };
+        // First, and outside every lock this device owns.
+        self.shared.sync(attrs);
         let index = (offset & 7) as u8;
         *byte = self
             .shared
@@ -660,6 +875,10 @@ impl MemOps for PpuPort {
             // core can make safe, so it is refused rather than guessed at.
             return Err(BusError::BadAccess);
         }
+        // A write is as time-sensitive as a read: `$2000` written one dot
+        // either side of the vblank flag decides whether this frame's NMI
+        // happens at all.
+        self.shared.sync(attrs);
         let index = (offset & 7) as u8;
         self.shared.with_engine(|e| e.write_register(index, *value));
         Ok(())

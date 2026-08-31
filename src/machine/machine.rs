@@ -18,9 +18,16 @@
 //! ```text
 //! run_quantum ─► Scheduler::run_quantum ─► Runnable::run per CPU (budgeted)
 //!                                       └► events that came due
+//!                    ─► Scheduler::sync_lazy_devices  (catch-up, §4.2)
 //!                    ─► Instance::event per fired event
 //!                    ─► Deferred::drain  after every handler
 //! ```
+//!
+//! A quantum is bounded by the next event a **lazily advanced** device has of
+//! its own, and every such device is caught up at the boundary. That is the
+//! *scheduled* half of §4.2's sync-on-access; the *sampled* half fires from
+//! inside the device's own `MemOps::read`, through a
+//! [`LazyHandle`](crate::core::sched::LazyHandle) the realizer hands it.
 //!
 //! Only [`ThreadingMode::Deterministic`](crate::core::sched::ThreadingMode) is
 //! driven here, which is the mode §4.2 requires for record/replay and for the
@@ -60,8 +67,8 @@ use crate::core::clock::{ClockForest, DomainId, GlobalTime};
 use crate::core::device::{Deferred, Device, DeviceClass, ResetKind};
 use crate::core::error::{Error, Result};
 use crate::core::sched::{
-    Budget, Consumed, Event, EventId, EventTarget, HostClock, QuantumReport, Runnable, RunnableId,
-    Scheduler, SchedulerSnapshot,
+    Budget, Consumed, Event, EventId, EventTarget, HostClock, LazyDevice, LazyId, QuantumReport,
+    Runnable, RunnableId, Scheduler, SchedulerSnapshot,
 };
 use crate::core::space::{AddressSpace, RequesterId};
 use crate::core::state::{MachineShape, Migrations, Sink, Source, StateReader, StateWriter};
@@ -125,6 +132,7 @@ pub struct DeviceEntry {
     pub(crate) space: Option<usize>,
     pub(crate) requester: RequesterId,
     pub(crate) runnable: Option<RunnableId>,
+    pub(crate) lazy: Option<LazyId>,
 }
 
 impl DeviceEntry {
@@ -168,6 +176,11 @@ impl DeviceEntry {
     /// Its scheduler handle, if it takes execution budgets.
     pub fn runnable(&self) -> Option<RunnableId> {
         self.runnable
+    }
+
+    /// Its catch-up handle, if it declared itself lazily advanced (§4.2).
+    pub fn lazy(&self) -> Option<LazyId> {
+        self.lazy
     }
 }
 
@@ -223,6 +236,46 @@ impl RunAdapter {
 impl Runnable for RunAdapter {
     fn run(&mut self, budget: Budget) -> Consumed {
         self.inner.run(budget)
+    }
+}
+
+/// The [`LazyDevice`] the scheduler sees, wrapping the device the machine owns.
+///
+/// The same shim as [`RunAdapter`] and for the same reason: a `Device` declares
+/// itself lazily advanced through `&self` methods, because a device is shared
+/// and holds its state behind interior mutability, while
+/// [`LazyDevice::advance_to`] takes `&mut self`. Forwarding through an `Arc` is
+/// what satisfies both.
+///
+/// The `&mut` is not wasted. The scheduler takes the box *out* of its slot for
+/// the duration of the call (`core::sched`), so the exclusive borrow is what
+/// makes a device that re-enters its own catch-up get
+/// [`SchedError::LazyDeviceBusy`](crate::core::sched::SchedError::LazyDeviceBusy)
+/// rather than a deadlock.
+pub(crate) struct LazyAdapter {
+    inner: Arc<dyn Device>,
+}
+
+impl LazyAdapter {
+    /// Wrap `inner` so the scheduler can catch it up.
+    pub(crate) fn new(inner: Arc<dyn Device>) -> LazyAdapter {
+        LazyAdapter { inner }
+    }
+}
+
+impl LazyDevice for LazyAdapter {
+    fn current_tick(&self) -> u64 {
+        self.inner.current_tick()
+    }
+
+    fn advance_to(&mut self, tick: u64) {
+        // `&self` on the device side: `&mut self` here is the scheduler's
+        // exclusivity, not the device's.
+        self.inner.advance_to(tick);
+    }
+
+    fn next_event_tick(&self) -> Option<u64> {
+        self.inner.next_event_tick()
     }
 }
 
@@ -412,9 +465,33 @@ impl Machine {
     /// Whatever the scheduler refuses — an overrun budget, an unimplemented
     /// threading mode — or an event addressed to a device that does not exist.
     pub fn run_quantum(&mut self) -> Result<QuantumReport> {
-        let report = self.sched.run_quantum()?;
+        let limit = self.quantum_limit(GlobalTime::MAX);
+        let report = self.sched.run_quantum_until(limit)?;
+        self.sched.sync_lazy_devices()?;
         self.dispatch(&report)?;
         Ok(report)
+    }
+
+    /// How far the next quantum may run: the caller's deadline, or the next
+    /// instant a lazily-advanced device has an event of its own, whichever
+    /// comes first (§4.2).
+    ///
+    /// This is the *scheduled* half of sync-on-access. Catch-up on access makes
+    /// a `$2002` read see the dot it happened on, but nothing makes the PPU
+    /// reach the dot it raises vblank on while the CPU is busy elsewhere — and
+    /// a game whose main loop spins on a flag its NMI handler sets touches no
+    /// PPU register at all. Stopping the CPU at the PPU's own next event, and
+    /// catching the PPU up there, is what turns "advanced when read" into
+    /// "advanced".
+    ///
+    /// A deadline that has already gone by is not reported by
+    /// [`Scheduler::lazy_deadline`], so this never clamps a quantum to an
+    /// instant the machine is already standing on — which would stall it.
+    fn quantum_limit(&self, deadline: GlobalTime) -> GlobalTime {
+        match self.sched.lazy_deadline() {
+            Some(at) if at < deadline => at,
+            _ => deadline,
+        }
     }
 
     /// Run until virtual time reaches `deadline`.
@@ -430,7 +507,12 @@ impl Machine {
     pub fn run_until(&mut self, deadline: GlobalTime) -> Result<()> {
         while self.sched.now() < deadline {
             let before = self.sched.now();
-            let report = self.sched.run_quantum_until(deadline)?;
+            let limit = self.quantum_limit(deadline);
+            let report = self.sched.run_quantum_until(limit)?;
+            // Before the events are dispatched: a handler that reads a lazily
+            // advanced device must see it standing on the instant that fired,
+            // not on the one the previous quantum ended at.
+            self.sched.sync_lazy_devices()?;
             self.dispatch(&report)?;
             if self.sched.now() <= before {
                 // A quantum always ends at `min(now + quantum, deadline, next

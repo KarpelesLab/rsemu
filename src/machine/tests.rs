@@ -566,3 +566,50 @@ fn generated_garbage_never_panics_in_the_resolver_either() {
         }
     }
 }
+
+/// A PPU with no address space of its own is refused, by name.
+///
+/// The check used to live in `Device::realize`, which cannot see one: the
+/// realizer maps every region first and hands a device its space at *bind*
+/// time, so a described PPU has no bus yet when realize runs. Moving it to
+/// `Instance::bind` is what makes this message reachable at all — a PPU with no
+/// pattern tables would otherwise come up rendering the open bus.
+#[cfg(all(feature = "dev-nes-ppu", feature = "cpu-mos6502"))]
+#[test]
+fn a_ppu_without_an_address_space_is_refused() {
+    const TEXT: &str = r#"machine "headless" {
+  osc master = 236250000/11 Hz
+  space cpubus { width = 16, unassigned = open-bus }
+  object ppu "nes.ppu" { clock = master / 4 }
+  map cpubus 0x2000 size 0x2000 = ppu.regs
+}"#;
+    let err = build_text("headless.machine", TEXT).expect_err("a PPU with no bus is not a machine");
+    assert!(err.contains("ppu"), "{err}");
+    assert!(err.contains("space = ppubus"), "{err}");
+}
+
+/// A device that declares itself lazily advanced needs a clock domain.
+///
+/// Its tick is counted in one, so catch-up has no target without it — and the
+/// failure without the check is silence, which is the worst kind.
+#[cfg(all(feature = "dev-nes-ppu", feature = "cpu-mos6502"))]
+#[test]
+fn a_lazily_advanced_device_without_a_clock_is_refused() {
+    const TEXT: &str = r#"machine "unclocked" {
+  osc master = 236250000/11 Hz
+  space cpubus { width = 16, unassigned = open-bus }
+  space ppubus { width = 14, unassigned = open-bus }
+  object ppu "nes.ppu" { space = ppubus }
+  map cpubus 0x2000 size 0x2000 = ppu.regs
+}"#;
+    let err = build_text("unclocked.machine", TEXT).expect_err("catch-up needs a domain");
+    assert!(err.contains("advanced on access"), "{err}");
+}
+
+/// Build `text` with this build's registry, bindings and class table.
+#[cfg(all(feature = "dev-nes-ppu", feature = "cpu-mos6502"))]
+fn build_text(name: &str, text: &str) -> Result<crate::machine::Machine, String> {
+    let options = crate::machine::catalog::build_options().expect("this build's classes");
+    let registry = crate::machine::catalog::registry().expect("this build's registry");
+    crate::machine::build(name, text, &registry, &options).map_err(|e| e.to_string())
+}
