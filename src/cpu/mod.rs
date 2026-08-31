@@ -12,6 +12,8 @@
 //! | `z80` | `cpu-z80` | cycle-accurate interpreter, every prefix page, MEMPTR, separate I/O space |
 
 //! | `x86` | `cpu-x86` | Intel 8086/8088, real mode, hardware-checked against `SingleStepTests/8088` |
+
+//! | `riscv` | `cpu-riscv` | RV64GC/RV32 interpreter, privileged modes, Sv39, software IEEE-754 |
 //!
 //! Every core ships an interpreter first; the IR frontend comes later and is
 //! differentially tested against it forever. **The interpreter is the oracle.**
@@ -31,3 +33,7 @@ pub mod z80;
 #[cfg(feature = "cpu-x86")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-x86")))]
 pub mod x86;
+
+#[cfg(feature = "cpu-riscv")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-riscv")))]
+pub mod riscv;

@@ -81,6 +81,15 @@ dev-apple1 = []
 # dependencies.
 machine-apple1 = ["cpu-mos6502", "dev-apple1"]
 
+# The RISC-V core (src/cpu/riscv): an RV64GC interpreter — RV64I/RV32I with
+# M, A, F, D, Zicsr, Zifencei and C — plus the machine/supervisor/user
+# privileged architecture, Sv39/Sv32 paging with a software TLB, and PMP. The
+# `F`/`D` extensions are implemented in **software** IEEE-754 (`ROADMAP.md`
+# §9.1), so guest floating point is bit-reproducible across hosts. RV32 is a
+# construction property rather than a build flag, so one build runs both. Adds
+# no dependencies and is `no_std + alloc`.
+cpu-riscv = []
+
 # The MOS 6502 core (src/cpu/mos6502): a cycle-accurate interpreter with every
 # documented and undocumented opcode, a disassembler generated from the same
 # table, and the RP2A03 (NES) variant selected by a construction property. Adds
