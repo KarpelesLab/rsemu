@@ -1,6 +1,6 @@
 //! AccuracyCoin — the final phase-3 gate, read out of RAM with no screen.
 //!
-//! 125 accuracy tests (plus 5 "DRAW" pages that only print information) on one
+//! 141 accuracy tests (plus 5 "DRAW" pages that only print information) on one
 //! NROM cartridge, MIT, © 2025 Chris Siebert,
 //! <https://github.com/100thCoin/AccuracyCoin>.
 //!
@@ -24,9 +24,10 @@
 //!   `0` not run, `1` PASS, `2` FAIL, `3` in progress. On a failure the error
 //!   code is `byte >> 2`, and it is the number printed on screen after "FAIL" —
 //!   the README's per-section tables list what each one means.
-//! * **Five tests store their result on page 3 instead** (`$03FB-$03FF`). Those
-//!   are the "DRAW" pages, which display information and assert nothing; the
-//!   ROM's own run-all loop skips them, and so does this runner.
+//! * **Five tests store their result on page 3 instead** — all of them into the
+//!   one byte `result_DrawTest = $03FF`. Those are the "DRAW" pages, which
+//!   display information and assert nothing; the ROM's own run-all loop skips
+//!   them, and so does this runner.
 //! * **`$0035` is the "running all tests" flag.** The engine sets it to 1 for
 //!   the duration of a run-everything pass and clears it at the end — which is
 //!   the completion signal a headless runner needs, and much better than
@@ -311,24 +312,26 @@ mod tests {
 
     #[test]
     fn the_table_matches_what_the_rom_documents() {
-        // The README says 125 tests plus 5 "DRAW" pages. If the table ever
-        // drifts from that, the runner is checking the wrong bytes — which is
-        // worse than not running at all.
-        assert_eq!(TESTS.len(), 130);
+        // 141 tests that assert plus 5 "DRAW" pages. If the table ever drifts
+        // from the ROM, the runner is checking the wrong bytes — which is worse
+        // than not running at all.
+        assert_eq!(TESTS.len(), 146);
         assert_eq!(TESTS.iter().filter(|t| t.is_draw()).count(), 5);
-        assert_eq!(TESTS.iter().filter(|t| !t.is_draw()).count(), 125);
+        assert_eq!(TESTS.iter().filter(|t| !t.is_draw()).count(), 141);
     }
 
     #[test]
     fn every_result_address_is_distinct_and_on_a_page_the_rom_uses() {
-        let mut seen: Vec<u16> = TESTS.iter().map(|t| t.result).collect();
+        // The DRAW pages share one byte — `result_DrawTest` — because none of
+        // them writes a verdict; the tests that assert must not.
+        let mut seen: Vec<u16> = TESTS.iter().filter(|t| !t.is_draw()).map(|t| t.result).collect();
         seen.sort_unstable();
         let before = seen.len();
         seen.dedup();
         assert_eq!(seen.len(), before, "two tests share a result address");
         for t in &TESTS {
             assert!(
-                (0x03fb..=0x03ff).contains(&t.result) || (0x0400..=0x04ff).contains(&t.result),
+                t.result == 0x03ff || (0x0400..=0x04ff).contains(&t.result),
                 "{} has result address ${:04X}, which is neither page",
                 t.name,
                 t.result
@@ -346,7 +349,7 @@ mod tests {
         assert_eq!(
             draw,
             [
-                "Print magic values",
+                "PPU Reset Flag",
                 "CPU RAM",
                 "CPU Registers",
                 "PPU RAM",
@@ -468,10 +471,10 @@ mod tests {
         let mut machine = FakeCoin::default();
         let report = run(&mut machine);
         assert_eq!(report.status, RunStatus::Complete);
-        assert_eq!(report.results.len(), 125);
-        assert_eq!(report.passed(), 125);
+        assert_eq!(report.results.len(), 141);
+        assert_eq!(report.passed(), 141);
         assert!(report.failed().is_empty());
-        assert!(report.describe().contains("125 of 125 tests passed"));
+        assert!(report.describe().contains("141 of 141 tests passed"));
     }
 
     #[test]
@@ -484,7 +487,7 @@ mod tests {
         let report = run(&mut machine);
         assert_eq!(report.status, RunStatus::Complete);
         assert_eq!(report.passed(), 0);
-        assert_eq!(report.failed().len(), 125);
+        assert_eq!(report.failed().len(), 141);
         assert!(report.failed().iter().all(|(_, code)| *code == 3));
         assert!(report.describe().contains("FAIL 3"));
     }
@@ -503,7 +506,7 @@ mod tests {
             }
         );
         // A partly-built machine still gets a per-test report, all "not run".
-        assert_eq!(report.not_run().len(), 125);
+        assert_eq!(report.not_run().len(), 141);
     }
 
     #[test]

@@ -19,8 +19,15 @@
 #     they can never appear here.
 #
 # ---------------------------------------------------------------------------
-# First measurement: 2026-08-31. 81 of 125 pass, 41 fail, 3 never run.
+# Measured 2026-08-31 against the pinned ROM: 85 of 141 pass, 56 fail.
 # ---------------------------------------------------------------------------
+#
+# The earlier "81 of 125" was measured through a stale copy of the ROM's
+# `TestPages:` table. The pinned ROM carries 146 menu entries — 141 that assert
+# and 5 DRAW pages sharing `result_DrawTest` — and the old table named three
+# addresses ($0402, $0418, $0464) that ROM never writes while omitting nineteen
+# tests it does run. `accuracycoin_tests.rs` has been regenerated from the ROM;
+# of the nineteen recovered tests four already pass and fifteen are below.
 #
 # Every entry below names a subsystem rsemu has not built yet, and each one is
 # traced to the specific error code the ROM reported and the line in the ROM's
@@ -188,25 +195,47 @@
                   # interrupts per instruction, not per cycle.
 63                # $0463 "NMI Overlap IRQ" code 1: the same hijacking, for IRQ.
 
+
 # ---------------------------------------------------------------------------
-# F. Never run — three of them are not tests
+# G. Recovered by regenerating the table — measured for the first time
 # ---------------------------------------------------------------------------
 #
-# These come back `NotRun` because the ROM never writes their result byte. Two
-# were withdrawn by the author and one is a DRAW page whose result byte happens
-# to sit on page 4 instead of page 3, so the runner's page-3 rule does not catch
-# it. They are ledgered rather than fixed because there is nothing to fix here;
-# the right repair is in accuracycoin_tests.rs, and it belongs with whoever next
-# re-reads the ROM's `TestPages:` table against a new release.
+# Nineteen tests the stale table omitted. Four pass ("CHR ROM is not writable",
+# "Attributes As Tiles", "t Register Quirks", "Branch Dummy Reads"); these
+# fifteen do not. Each entry names the error code the ROM reported and the
+# subsystem it belongs to, from the README's own tables.
 
-02                # $0402 "Unofficial Instructions": listed under "Removed
-                  # Tests" in the ROM's README — withdrawn once every non-NOP
-                  # unofficial opcode got its own test. The slot remains, the
-                  # test does not.
-64                # $0464 "RMW $2007 Extra Write": also withdrawn ("removed due
-                  # to several revision G PPUs failing this test").
-18                # $0418 "PPU Reset Flag": a DRAW page — the README titles it
-                  # "DRAW PPU Reset Flag" — that prints a sentence and asserts
-                  # nothing. Its result byte is on page 4 rather than page 3, so
-                  # `Test::is_draw` does not exclude it the way it does the
-                  # other five.
+88                # $0488 "DMA + $2002 Read" code 2: the DMC DMA's halt and
+                  # alignment cycles must read $2002. Cause (A)/(B): no /RDY,
+                  # no DMC DMA.
+86                # $0486 "Rendering Flag Behavior" code 2: what $2002 bit 6 and
+                  # the rendering enable do across the pre-render line, at dot
+                  # resolution. Cause (D).
+8a                # $048A "$2007 read w/ rendering" code 2: a $2007 read while
+                  # rendering does the two-increment v bump instead of the
+                  # buffered read. Not modelled.
+8d                # $048D "$2002 flag timing" code 1: the sprite-0/overflow
+                  # flags must clear on an exact dot. Cause (D).
+89                # $0489 "Suddenly Resize Sprite" code 2: changing $2000 sprite
+                  # height mid-scanline, which the evaluator does not see.
+80                # $0480 "INC $4014" code 1: a read-modify-write on $4014 does
+                  # the write twice and so starts two OAM DMAs. Cause (A).
+83                # $0483 "Stale BG Shift Registers" code 3: the background
+                  # shift registers keep their contents when rendering is
+                  # switched off; rsemu's engine has no shift registers.
+8f                # $048F "Stale Sprite Shift Regs" code 3: as above, for the
+                  # eight sprite shifters.
+87                # $0487 "BG Serial In" code 2: the serial input to the
+                  # background shifters. Same missing pipeline.
+84                # $0484 "Sprites On Scanline 0" code 2: sprite evaluation on
+                  # the first visible scanline. Cause (D2).
+8c                # $048C "$2004 Stress Test" code 2: $2004 accesses on every
+                  # dot of a rendered scanline. Needs (D) and (D2).
+8e                # $048E "$2007 Stress Test" code 2: the same for $2007 and the
+                  # v register's during-render increments.
+91                # $0491 "ALE + Read" code 2: the PPU's address-latch-enable
+                  # behaviour on the pattern bus. Not modelled.
+92                # $0492 "Hybrid Addresses" code 2: the same bus, mixing a
+                  # nametable and a pattern fetch. Not modelled.
+90                # $0490 "Internal Data Bus" code 1: the CPU-side open-bus data
+                  # latch. Cause (C).
