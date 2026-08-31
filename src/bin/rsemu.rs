@@ -36,6 +36,9 @@ RUN OPTIONS:
     <machine>           A path to a .machine file, or a name from `rsemu machines`
     --cart <file>       Bind the `cart` media slot (a NES cartridge)
     --rom <file>        Bind the `rom` media slot
+    --monitor <name>    Bind the `rom` slot to one of rsemu's own monitor
+                        images instead of a file: `rsmon` (the default, ours,
+                        MIT) or `wozmon` (the 1976 Woz Monitor, public domain)
     --disk <file>       Bind the `disk` media slot
     --media <n>=<file>  Bind any media slot by name
     -p <name>=<value>   Override a `param` declared in the machine file
@@ -181,6 +184,8 @@ struct RunArgs {
     machine: String,
     /// Media slot to file path, in the order they were given.
     media: Vec<(String, String)>,
+    /// A built-in monitor image for the `rom` slot, if the user named one.
+    monitor: Option<String>,
     params: Vec<(String, String)>,
     span: GlobalTime,
     /// Whether `--for` was given. Without it an interactive machine runs until
@@ -215,13 +220,19 @@ fn run(args: &[String]) -> ExitCode {
         }
     }
 
-    // A machine that wants a `rom` and was given none gets rsemu's own Apple 1
-    // monitor, so `rsemu run apple1` works with no arguments and no ROM of
-    // unclear provenance. Media nothing asked for is ignored, so this cannot
-    // affect any other machine.
-    #[cfg(feature = "dev-apple1")]
+    // A machine that wants a `rom` and was given no file gets a built-in one,
+    // so `rsemu run apple1` and `rsemu run beneater-6502` work with no
+    // arguments and no image of unclear provenance. Media nothing asked for is
+    // ignored, so a machine with no `rom` slot is unaffected.
     if !images.iter().any(|(slot, _)| slot == "rom") {
-        images.push((String::from("rom"), rsemu::dev::apple1::RSMON.to_vec()));
+        match builtin_rom(parsed.monitor.as_deref(), &parsed.machine) {
+            Ok(Some(image)) => images.push((String::from("rom"), image)),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("rsemu: {e}");
+                return ExitCode::from(2);
+            }
+        }
     }
 
     // A path wins over a catalog name, so a user editing a copy of a shipped
@@ -430,10 +441,52 @@ fn load_description(what: &str) -> Result<(String, String), String> {
     ))
 }
 
+/// The monitor image to bind to an unfilled `rom` slot.
+///
+/// `--monitor` names one explicitly; without it each board gets its own
+/// default, which is always rsemu's own (`ROADMAP.md` §1 — the machine has to
+/// demonstrate itself with nothing whose licence anyone has to think about).
+/// `Ok(None)` means this build has no image to offer, which is not an error:
+/// the machine may not want a `rom` slot at all.
+fn builtin_rom(monitor: Option<&str>, machine: &str) -> Result<Option<Vec<u8>>, String> {
+    // The Woz Monitor is only ported to one of these boards, so `wozmon` is
+    // answered from the module that has it rather than per machine.
+    #[cfg(feature = "dev-wdc")]
+    if monitor == Some("wozmon") {
+        return Ok(Some(rsemu::dev::wdc::WOZMON_IMAGE.to_vec()));
+    }
+    if let Some(name) = monitor
+        && name != "rsmon"
+    {
+        return Err(format!(
+            "--monitor {name}: this build has `rsmon`{}",
+            if cfg!(feature = "dev-wdc") {
+                " and `wozmon`"
+            } else {
+                ""
+            }
+        ));
+    }
+    let stem = machine
+        .rsplit('/')
+        .next()
+        .unwrap_or(machine)
+        .strip_suffix(".machine")
+        .unwrap_or_else(|| machine.rsplit('/').next().unwrap_or(machine));
+    match stem {
+        #[cfg(feature = "dev-wdc")]
+        "beneater-6502" => Ok(Some(rsemu::dev::wdc::RSMON_IMAGE.to_vec())),
+        #[cfg(feature = "dev-apple1")]
+        "apple1" => Ok(Some(rsemu::dev::apple1::RSMON.to_vec())),
+        _ => Ok(None),
+    }
+}
+
 fn parse_run(args: &[String]) -> Result<RunArgs, String> {
     let mut out = RunArgs {
         machine: String::new(),
         media: Vec::new(),
+        monitor: None,
         params: Vec::new(),
         // One second of virtual time: long enough to prove a machine runs,
         // short enough that a broken one does not hang a terminal. There is no
@@ -482,6 +535,7 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
                 out.span = GlobalTime::from_nanos(d.as_picos() / 1_000);
                 out.span_given = true;
             }
+            "--monitor" => out.monitor = Some(value(arg)?),
             "--console" => out.console = Some(value(arg)?),
             "--headless" => out.headless = true,
             "-q" | "--quiet" => out.quiet = true,

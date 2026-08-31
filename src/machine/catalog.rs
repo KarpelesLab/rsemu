@@ -102,6 +102,21 @@ pub static APPLE1: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/apple1.machine"),
 };
 
+/// Ben Eater's 6502 breadboard computer, when this build has a 6502 and the
+/// board's chips.
+///
+/// The `rom` slot has a default: `rsemu run beneater-6502` with no `--rom`
+/// binds [`RSMON_IMAGE`](crate::dev::wdc::RSMON_IMAGE), rsemu's own monitor,
+/// and `--monitor wozmon` binds the 1976 Woz Monitor instead.
+#[cfg(feature = "machine-beneater")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-beneater")))]
+pub static BENEATER_6502: CatalogEntry = CatalogEntry {
+    name: "beneater-6502",
+    summary: "Ben Eater's 6502 breadboard computer: 1 MHz, 16K RAM, 65C51 serial, 65C22",
+    media: &["rom"],
+    source: include_str!("../../machines/beneater-6502.machine"),
+};
+
 /// Every machine this build can realize, in catalog order.
 // One `#[cfg]`-gated push per shipped machine, which is what the lint is
 // complaining about: a `vec![]` literal cannot carry an attribute on one of its
@@ -113,6 +128,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     let mut out: Vec<&'static CatalogEntry> = Vec::new();
     #[cfg(feature = "machine-apple1")]
     out.push(&APPLE1);
+    #[cfg(feature = "machine-beneater")]
+    out.push(&BENEATER_6502);
     #[cfg(feature = "machine-nes")]
     out.push(&NES_NTSC);
     #[cfg(feature = "machine-nes")]
@@ -141,12 +158,16 @@ pub fn registry() -> Result<Registry> {
     crate::cpu::mos6502::register(&mut reg)?;
     #[cfg(feature = "dev-nes-cart")]
     crate::dev::cart::nrom::register(&mut reg)?;
+    #[cfg(feature = "dev-nes-io")]
+    crate::dev::nes::register(&mut reg)?;
     #[cfg(feature = "dev-nes-ppu")]
     crate::dev::ppu::register(&mut reg)?;
     #[cfg(feature = "dev-nes-apu")]
     crate::dev::apu::register(&mut reg)?;
     #[cfg(feature = "dev-apple1")]
     crate::dev::apple1::register(&mut reg)?;
+    #[cfg(feature = "dev-wdc")]
+    crate::dev::wdc::register(&mut reg)?;
     Ok(reg)
 }
 
@@ -176,12 +197,16 @@ pub fn bindings() -> Result<Bindings> {
     crate::cpu::mos6502::bind(&mut b)?;
     #[cfg(feature = "dev-nes-cart")]
     crate::dev::cart::nrom::bind(&mut b)?;
+    #[cfg(feature = "dev-nes-io")]
+    crate::dev::nes::bind(&mut b)?;
     #[cfg(feature = "dev-nes-ppu")]
     crate::dev::ppu::bind(&mut b)?;
     #[cfg(feature = "dev-nes-apu")]
     crate::dev::apu::bind(&mut b)?;
     #[cfg(feature = "dev-apple1")]
     crate::dev::apple1::bind(&mut b)?;
+    #[cfg(feature = "dev-wdc")]
+    crate::dev::wdc::bind(&mut b)?;
     Ok(b)
 }
 
@@ -196,12 +221,20 @@ pub fn classes() -> ClassTable {
     table.insert(crate::cpu::mos6502::schema());
     #[cfg(feature = "dev-nes-cart")]
     table.insert(crate::dev::cart::nrom::schema());
+    #[cfg(feature = "dev-nes-io")]
+    for schema in crate::dev::nes::schemas() {
+        table.insert(schema);
+    }
     #[cfg(feature = "dev-nes-ppu")]
     table.insert(crate::dev::ppu::schema());
     #[cfg(feature = "dev-nes-apu")]
     table.insert(crate::dev::apu::schema());
     #[cfg(feature = "dev-apple1")]
     for schema in crate::dev::apple1::schemas() {
+        table.insert(schema);
+    }
+    #[cfg(feature = "dev-wdc")]
+    for schema in crate::dev::wdc::schemas() {
         table.insert(schema);
     }
     table
@@ -294,7 +327,7 @@ mod tests {
             let media: Vec<(&str, &[u8])> = entry
                 .media
                 .iter()
-                .map(|slot| (*slot, fixture(slot)))
+                .map(|slot| (*slot, fixture(entry.name, slot)))
                 .collect();
             match build_catalog(entry.name, &media) {
                 Ok(machine) => assert_eq!(machine.name(), entry.name),
@@ -793,15 +826,18 @@ mod tests {
 
     /// Something plausible to bind to a media slot, so the catalog can be
     /// realized without a corpus.
-    fn fixture(slot: &str) -> &'static [u8] {
-        match slot {
-            "cart" => MINIMAL_NROM,
-            // The Apple 1's default: rsemu's own monitor, which is committed
-            // precisely so that this needs no download and no licence
-            // question.
+    fn fixture(machine: &str, slot: &str) -> &'static [u8] {
+        match (machine, slot) {
+            (_, "cart") => MINIMAL_NROM,
+            // Each board's default monitor: rsemu's own, committed precisely so
+            // that this needs no download and no licence question. The two are
+            // different sizes — a 256-byte PROM socket against a 32 KiB EEPROM
+            // — so the slot name alone does not decide it.
             #[cfg(feature = "machine-apple1")]
-            "rom" => crate::dev::apple1::RSMON,
-            other => panic!("no fixture for media slot `{other}`"),
+            ("apple1", "rom") => crate::dev::apple1::RSMON,
+            #[cfg(feature = "machine-beneater")]
+            ("beneater-6502", "rom") => crate::dev::wdc::RSMON_IMAGE,
+            (m, other) => panic!("no fixture for `{m}`'s media slot `{other}`"),
         }
     }
 

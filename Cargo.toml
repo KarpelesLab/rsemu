@@ -1,6 +1,6 @@
 [package]
 name          = "rsemu"
-version       = "0.0.0"
+version       = "0.0.1"
 edition       = "2024"
 # Edition 2024 stabilised in 1.85; 1.88 is the floor we hold to, for let-chains
 # and to match the sibling crates (compcol, purecrypto) so the whole family
@@ -75,6 +75,12 @@ dev-nes-apu = []
 #       --no-default-features --features wasm --release
 wasm = ["std"]
 
+# The NES console's own I/O (src/dev/nes): the two controller ports at
+# $4016/$4017 with the OUT0 latch and their 8-bit shift registers, and the OAM
+# DMA unit at $4014. Neither belongs to the CPU, the PPU, the APU or the
+# cartridge, so neither is gated with them. `no_std + alloc`, no dependencies.
+dev-nes-io = []
+
 # The NES / Famicom picture processing unit (RP2C02): the per-dot rendering
 # pipeline, $2000-$2007 with their quirks, the two-phase sprite evaluation and
 # NMI generation. `machine-nes` will require it; on its own it is enough to run
@@ -85,7 +91,7 @@ dev-nes-ppu = []
 # names). A machine is a feature set (ROADMAP.md §3), so this is the feature
 # that makes `rsemu machines` list a NES and `rsemu run nes-ntsc --cart x.nes`
 # work. Adds no dependencies; it is the components plus one data file.
-machine-nes = ["cpu-mos6502", "dev-nes-cart"]
+machine-nes = ["cpu-mos6502", "dev-nes-cart", "dev-nes-io"]
 
 # The Apple 1's chips (src/dev/apple1): the MC6821 PIA as that board wires it —
 # keyboard on port A, a 40x24 character terminal on port B — the 256-byte
@@ -108,6 +114,21 @@ machine-apple1 = ["cpu-mos6502", "dev-apple1"]
 # construction property rather than a build flag, so one build runs both. Adds
 # no dependencies and is `no_std + alloc`.
 cpu-riscv = []
+
+# The WDC 65xx peripherals (src/dev/wdc): the W65C51N ACIA as a character
+# device, the W65C22 VIA with both ports and both timers, and the 32 KiB
+# program EEPROM socket a 6502 breadboard computer boots from — plus
+# RSMON/serial, rsemu's own monitor for it. `no_std + alloc` and
+# dependency-free. Uses the character-device seam in `host::chardev`, which is
+# `no_std` too; only its terminal backend needs `std`.
+dev-wdc = []
+
+# Ben Eater's 6502 breadboard computer as a machine
+# (machines/beneater-6502.machine plus the classes it names): a 6502 at 1 MHz,
+# 16 KiB of RAM, a serial console on the ACIA, a VIA, and 32 KiB of ROM.
+# `rsemu run beneater-6502` boots a monitor over the terminal. Adds no
+# dependencies.
+machine-beneater = ["cpu-mos6502", "dev-wdc"]
 
 # The MOS 6502 core (src/cpu/mos6502): a cycle-accurate interpreter with every
 # documented and undocumented opcode, a disassembler generated from the same
@@ -138,6 +159,16 @@ cpu-z80 = []
 # generated from the same table. Gated against SingleStepTests/8088, a corpus
 # captured from real silicon. Adds no dependencies and is `no_std + alloc`.
 cpu-x86 = []
+
+# The Motorola MC68000 core (src/cpu/m68k): an interpreter that models the
+# two-word prefetch queue explicitly, charges four cycles per bus access rather
+# than reading a per-instruction table, implements the supervisor/user split
+# with both stack pointers, and takes every 68000 exception with the right
+# stack frame — including the fourteen-byte group-0 frame an address error
+# pushes. Ships a disassembler generated from the same instruction description.
+# The plain 68000 of the Amiga, Atari ST, Mega Drive and early Macs; not the
+# 010 or the 020. Adds no dependencies and is `no_std + alloc`.
+cpu-m68k = []
 
 [lib]
 name = "rsemu"
