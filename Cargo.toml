@@ -164,6 +164,19 @@ machine-beneater = ["cpu-mos6502", "dev-wdc"]
 # gets the bit-level front end free. `no_std + alloc`, no dependencies.
 bus-spi = []
 
+# The USB bus (src/bus/usb): the fabric, the device seam, descriptors and the
+# default control pipe. **Controller-agnostic**, which is the whole point
+# (docs/buses/usb.md): a device model is written against transactions — SETUP,
+# IN, OUT — and every one of the four transfer types is a sequence of those, so
+# the same model answers an EHCI today and a UHCI or an xHCI later with no
+# change. Covers addressing and enumeration (USB 2.0 §9.4's eleven standard
+# requests, including SET_ADDRESS's deferred effect), descriptors (§9.6),
+# endpoints, halt conditions, the three speeds and a port model with connect and
+# enable. Hubs and split transactions are deliberately absent and the module says
+# so. `no_std + alloc`, no dependencies.
+bus-usb = []
+
+
 # The Sitronix ST7272A (src/dev/sitronix): a 320RGBx240 dual-gate TFT panel
 # driver, configured over 3-wire SPI. Its **SPI carries registers only** —
 # power, gamma, contrast, brightness, scan direction, standby — while pixels
