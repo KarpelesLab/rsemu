@@ -1,6 +1,6 @@
 [package]
 name          = "rsemu"
-version       = "0.0.1"
+version       = "0.0.2"
 edition       = "2024"
 # Edition 2024 stabilised in 1.85; 1.88 is the floor we hold to, for let-chains
 # and to match the sibling crates (compcol, purecrypto) so the whole family
