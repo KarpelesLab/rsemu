@@ -41,6 +41,14 @@ RUN OPTIONS:
                         images instead of a file: `rsmon` (the default, ours,
                         MIT) or `wozmon` (the 1976 Woz Monitor, public domain)
     --disk <file>       Bind the `disk` media slot
+    --bios <file>       Bind the `bios` media slot: a PC's system firmware.
+                        rsemu ships none — point this at your own copy, the
+                        way you would point qemu at one. Running a firmware
+                        binary as a guest is ordinary use whatever its licence;
+                        redistributing it is not, which is why there is a flag
+                        here and no file in the repository
+    --vgabios <file>    Bind the `vgabios` media slot: a video option ROM
+    --floppy <file>     Bind the `floppy` media slot: a raw diskette image
     --media <n>=<file>  Bind any media slot by name
     -p <name>=<value>   Override a `param` declared in the machine file
     --for <duration>    How much virtual time to run, as `1s`, `500ms`, `2m`
@@ -636,7 +644,11 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
                 .ok_or_else(|| format!("{name} needs a value"))
         };
         match arg {
-            "--cart" | "--rom" | "--disk" => {
+            // One arm, because every one of these is `--<slot> <file>` and a
+            // list is easier to extend than a match with a line each. They
+            // exist at all because `--media bios=…` is correct and nobody
+            // types it.
+            "--cart" | "--rom" | "--disk" | "--bios" | "--vgabios" | "--floppy" => {
                 let slot = arg.trim_start_matches('-').to_string();
                 let path = value(arg)?;
                 out.media.push((slot, path));

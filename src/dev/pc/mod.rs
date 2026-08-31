@@ -140,3 +140,111 @@ pub fn schemas() -> Vec<ClassSchema> {
     out.push(fdc::schema());
     out
 }
+
+/// The machine description this chipset was written for, compiled in so that a
+/// build which can realize it always ships one that parses.
+///
+/// It is data, not code: a user copies `machines/pc-at.machine` and edits it.
+pub const PC_AT: &str = include_str!("../../../machines/pc-at.machine");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::machine::validate::{ClassSchema, PortDir, PropSchema, ValidateOptions, validate};
+    use crate::machine::{ClassTable, ResolveOptions, resolve_file};
+    use alloc::string::ToString;
+
+    /// What the PC board needs from the x86 core, written here because the core
+    /// does not publish a schema of its own yet.
+    ///
+    /// This is a **specification handed to whoever owns `src/cpu/x86`**, not a
+    /// permanent home. `cpu.i8086` is registered but not *bound*: it has no
+    /// `Instance` impl, no `bind`, no input pins and no `schema`, so a machine
+    /// file cannot give it an address space or wire an interrupt to it, and
+    /// `machine-pc-at` cannot be added to the catalog until it does. The list
+    /// below is exactly what has to appear for that to happen — and asserting
+    /// the machine file against it here means the board is checked today rather
+    /// than after the core catches up.
+    fn x86_schema() -> ClassSchema {
+        ClassSchema::new("cpu.i8086")
+            .prop(PropSchema::new("model", crate::core::props::ValueKind::Str))
+            .prop(PropSchema::new("engine", crate::core::props::ValueKind::Str))
+            // The second address space. `space =` is structural and there is
+            // only one of it, so the I/O space is named by an ordinary string
+            // property and looked up with `BindCtx::space_named`.
+            .prop(PropSchema::new(
+                "iospace",
+                crate::core::props::ValueKind::Str,
+            ))
+            .port("intr", PortDir::In)
+            .port("nmi", PortDir::In)
+            .port("reset", PortDir::In)
+            // Not a CPU pin on a real 386 — the gate is in the chipset, between
+            // the CPU and the bus. Modelled as a CPU input because this core
+            // does its own address wrapping, and the gate is exactly a
+            // suppression of that wrap.
+            .port("a20", PortDir::In)
+    }
+
+    fn classes() -> ClassTable {
+        let mut table = ClassTable::new();
+        for schema in crate::machine::builtin::schemas() {
+            table.insert(schema);
+        }
+        for schema in schemas() {
+            table.insert(schema);
+        }
+        table.insert(x86_schema());
+        table
+    }
+
+    #[test]
+    fn the_board_parses_and_resolves() {
+        let resolved = match resolve_file("pc-at.machine", PC_AT, &ResolveOptions::new()) {
+            Ok(r) => r,
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(resolved.name, "pc-at");
+        // Five crystals, because the board has five cans and they are five
+        // trees rather than dividers off one (`ROADMAP.md` §4.2).
+        assert_eq!(resolved.oscillators.len(), 5);
+        // The 8254's input is not an integer number of hertz, which is the
+        // whole reason the language takes rational frequency literals. Written
+        // 105000000/88 because that is 14.31818 MHz over 12 and how the board
+        // derives it; stored reduced, as 13125000/11.
+        let pit = resolved
+            .oscillators
+            .iter()
+            .find(|o| o.name == "pit")
+            .expect("the timer's crystal");
+        assert_eq!(pit.hz.denominator(), 11);
+        assert_eq!(pit.hz.numerator(), 13125000);
+        assert_eq!(resolved.spaces.len(), 2, "memory and I/O are separate");
+    }
+
+    #[test]
+    fn the_board_validates_against_this_builds_classes() {
+        // Everything the board names exists, every property is one its class
+        // accepts, every `map` names a region the device publishes, and every
+        // `wire` names a pin — with the x86 core's side of it stubbed above.
+        let resolved =
+            resolve_file("pc-at.machine", PC_AT, &ResolveOptions::new()).expect("it resolves");
+        if let Err(d) = validate(&resolved, &classes(), &ValidateOptions::new()) {
+            panic!("{}", d.message);
+        }
+    }
+
+    #[test]
+    fn the_firmware_slots_are_the_only_media_the_board_needs() {
+        let resolved =
+            resolve_file("pc-at.machine", PC_AT, &ResolveOptions::new()).expect("it resolves");
+        let mut slots: alloc::vec::Vec<alloc::string::String> = resolved
+            .objects
+            .iter()
+            .filter_map(|o| o.props.get("image"))
+            .filter_map(|v| v.as_str().map(ToString::to_string))
+            .collect();
+        slots.sort();
+        assert_eq!(slots, ["bios", "floppy", "vgabios"]);
+    }
+}

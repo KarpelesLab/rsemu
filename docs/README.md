@@ -60,6 +60,7 @@ the question never arises.
 | [`platforms/game-boy.md`](platforms/game-boy.md) | Game Boy, Game Boy Color |
 | [`platforms/master-system.md`](platforms/master-system.md) | Sega Master System, Game Gear |
 | [`platforms/ibm-pc.md`](platforms/ibm-pc.md) | IBM PC/AT and modern PC chipsets |
+| [`platforms/pc-at.md`](platforms/pc-at.md) | The `pc-at` machine rsemu builds, its firmware slots, and what is missing |
 | [`platforms/riscv-virt.md`](platforms/riscv-virt.md) | The RISC-V `virt` board |
 
 ### Buses

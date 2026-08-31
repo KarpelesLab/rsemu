@@ -1,0 +1,290 @@
+# An IBM PC/AT-class machine — the board, not the firmware.
+#
+#   rsemu run pc-at --bios /usr/share/qemu/bios.bin
+#   rsemu run pc-at --bios bios.bin --media vgabios=vgabios.bin --media floppy=boot.img
+#
+# **rsemu ships no BIOS and never will.** A PC's firmware is somebody's
+# copyrighted binary, and vendoring one would be redistribution; so the machine
+# takes it through a media slot, exactly as `riscv-virt` takes its firmware, and
+# the user points at their own copy. Running a binary as an emulated guest is
+# ordinary use whatever its licence; shipping it is not (ROADMAP.md §1).
+#
+# That is also why nothing below assumes *which* firmware. The board is the AT's
+# and the addresses are the AT's, and any firmware written for that board will
+# find what it expects — or will say what is missing, which is the more useful
+# outcome while this machine is being brought up.
+#
+# # Sources
+#
+# The IBM Personal Computer AT Technical Reference (1984) for the board: which
+# chip answers which port, which IRQ each device lands on, and the memory map.
+# The Intel data sheets for the 8259A, 8254, 8237A and 8042; the Motorola
+# MC146818 and MC6845 data sheets; the NEC uPD765A data sheet; Ralf Brown's
+# Interrupt List for the ports the data sheets leave to the board. No emulator
+# source was consulted for any of it.
+
+machine "pc-at" {
+  # -- what the user can change -----------------------------------------------
+
+  # Base memory: the 640 KiB below the video hole. Not a parameter anybody
+  # should want to change, but the RTC has to be told the same number and this
+  # is how it gets told once.
+  param basemem = 640K
+
+  # Memory above 1 MiB. Zero is a legitimate machine — an AT with 1 MiB fitted.
+  param extmem = 15M
+
+  # The system BIOS window. 128 KiB at 0xe0000 is what an AT-class board with a
+  # modern firmware decodes; a 64 KiB image sits in the top half of it and a
+  # 128 KiB image fills it, because `pc.rom` aligns a short image against the
+  # top where the reset vector is.
+  param biosbase = 0xe0000
+  param biossize = 128K
+
+  # The video option ROM window. 64 KiB at 0xc0000, which is where firmware
+  # starts its scan for a `0x55 0xaa` signature.
+  param vgabase  = 0xc0000
+  param vgasize  = 64K
+
+  # Which host character port the keyboard's scan codes arrive on, so two of
+  # these can run in one process without typing at each other.
+  param keyboard = "keyboard"
+
+  # The date and time the RTC starts at. A device may never read the host
+  # clock (CLAUDE.md, determinism): rsemu has no record/replay seam for it, and
+  # a machine that drew from one would not be reproducible. So it is declared,
+  # and two runs of this file see the same Tuesday.
+  param time = "2026-01-01T00:00:00"
+
+  # -- crystals ---------------------------------------------------------------
+  #
+  # Five, because the board has five, and they are five separate trees rather
+  # than dividers off one because they are five separate cans (ROADMAP.md §4.2).
+  # Only the ratios *within* a tree are guest-visible; the absolute frequencies
+  # set the wall-clock rate and nothing architectural.
+
+  # The CPU. 25 MHz is a 386DX of the period. Nothing depends on the number.
+  osc cpu = 25000000 Hz
+
+  # The 8254's input, and the most consequential number on the board: it is
+  # 14.31818 MHz / 12 = 105/88 MHz exactly, and it is *not an integer number of
+  # hertz*, which is precisely why the language takes rational literals. Every
+  # DOS timing loop ever written is calibrated against it.
+  osc pit = 105000000/88 Hz
+
+  # The RTC's watch crystal. 32.768 kHz is 2^15, which is why the periodic
+  # interrupt rates are all powers of two.
+  osc rtc = 32768 Hz
+
+  # The VGA's 25.175 MHz dot clock, divided by 9 for the 9-pixel character cell
+  # of the 720x400 text mode. The video device counts character clocks.
+  osc dot = 25175000 Hz
+
+  # The floppy controller's data separator. Nothing here divides by it; the
+  # controller completes its operations without modelling their duration, and
+  # says so in its own documentation.
+  osc fdd = 1000000 Hz
+
+  # -- address spaces ---------------------------------------------------------
+
+  # 32 bits, because this board is meant for a 386. A real-mode-only core
+  # simply never drives an address above 0x10ffff, and this costs it nothing.
+  #
+  # `unassigned = open-bus`: an unmapped read returns ones. That is what an ISA
+  # bus with nothing driving it does, and firmware **depends** on it — sizing
+  # memory, scanning for option ROMs and probing for adapters all work by
+  # reading a hole and recognising 0xff. `fault` would be a more honest default
+  # for a machine we were debugging, and the wrong model of this one.
+  space mem { width = 32, unassigned = open-bus }
+
+  # The separate I/O space the 8086 family drives with its own status lines. 16
+  # bits, though an AT decodes only ten and every port below therefore aliases
+  # every 0x400 — an alias nothing uses, so it is not modelled and this is the
+  # comment saying so.
+  space port { width = 16, unassigned = open-bus }
+
+  # -- the processor ----------------------------------------------------------
+  #
+  # `iospace` names the second space, because `space =` is structural and there
+  # is only one of it. A core with no I/O space reads ones and discards writes,
+  # which is what an unpopulated bus does — and would make every chip below
+  # invisible, so it is named explicitly rather than defaulted.
+  object cpu0 "cpu.i8086" {
+    clock   = cpu
+    space   = mem
+    iospace = "port"
+    engine  = "interp"
+  }
+
+  # -- memory -----------------------------------------------------------------
+  #
+  # Declared before anything that writes into memory, because `Machine::reset`
+  # runs devices in declaration order and a cold reset zeroes RAM.
+  #
+  # Two objects, not one, because there is a hole between them: 0xa0000-0xfffff
+  # is video memory, option ROMs and the system BIOS. A single 16 MiB region
+  # would sit under all of them and the priority rules would decide the machine
+  # by accident.
+  object ram_low  "ram" { size = basemem }
+  object ram_high "ram" { size = extmem }
+
+  # -- interrupts -------------------------------------------------------------
+  #
+  # Two 8259As. The slave's INT output drives the master's IR2, which is what
+  # makes IRQ8-15 exist at all, and the acknowledge cycle follows the same net
+  # backwards: `core::wire`'s `IntAck` is how the master asks the slave for the
+  # vector during the second INTA pulse, and how the CPU asks the master.
+  #
+  # The vector bases are the AT's: 0x08 for IRQ0-7 and 0x70 for IRQ8-15. They
+  # are not written here — firmware programs them through ICW2, and a machine
+  # file that pre-set them would be describing software.
+  object pic1 "pc.pic" { mode = "master" }
+  object pic2 "pc.pic" { mode = "slave" }
+
+  # -- the timer --------------------------------------------------------------
+  #
+  # Counter 0 is the system tick on IRQ0, counter 1 drove DRAM refresh, and
+  # counter 2 is gated by port 0x61 and drives the speaker — and its output is
+  # readable back in bit 5 of that same port, which is how firmware calibrates
+  # a delay loop without a reference clock.
+  object pit0 "pc.pit" { clock = pit }
+
+  # -- the real-time clock and CMOS -------------------------------------------
+  #
+  # The memory sizes are written here as well as being the `ram` objects' sizes,
+  # because a device cannot read the machine's memory map — `BindCtx` carries a
+  # space but not a picture of what is in it. That is a seam to close, not a
+  # design: the RISC-V board's device tree generator solves the same problem by
+  # reading the realized machine, and a PC's CMOS is the same question asked in
+  # 1984.
+  object cmos "pc.rtc" {
+    clock   = rtc
+    time    = time
+    basemem = basemem
+    extmem  = extmem
+  }
+
+  # -- the keyboard controller ------------------------------------------------
+  #
+  # An 8042, which is a microcontroller with its own firmware; what is modelled
+  # is the interface, not the program. It owns the A20 gate and the system reset
+  # line, which is why leaving protected mode goes through a keyboard chip.
+  object kbc "pc.kbc" { port = keyboard }
+
+  # -- the system control ports -----------------------------------------------
+  #
+  # Not a chip: latches and gates on the board. Port B at 0x61 gates the timer's
+  # counter 2 and reads its output back; port A at 0x92 is the chipset's fast
+  # path to A20 and reset, which is why both signals have two drivers.
+  object sysctl "pc.sysctl" {}
+
+  # -- DMA --------------------------------------------------------------------
+  #
+  # Two 8237As. The first moves bytes on channels 0-3; the second moves words on
+  # channels 4-7 and its channel 4 is the cascade the first hangs off. Both are
+  # bus masters, so both declare the space their transfers traverse
+  # (ROADMAP.md §4.4).
+  object dma1 "pc.dma" { space = mem, mode = "byte", base = 0 }
+  object dma2 "pc.dma" { space = mem, mode = "word", base = 4 }
+
+  # -- video ------------------------------------------------------------------
+  #
+  # A CRTC, a character buffer and a character generator. Text mode only, which
+  # is what reaches a prompt; the picture comes out through the `host::display`
+  # scanout seam, so `--screenshot` and the browser see what the guest drew.
+  object vga "pc.video" { clock = dot / 9 }
+
+  # -- the floppy controller --------------------------------------------------
+  #
+  # The `floppy` media slot is optional: a machine with no disk in the drive is
+  # an ordinary machine, and the controller reports "not ready" rather than
+  # faulting.
+  object fdc "pc.fdc" { clock = fdd, image = "floppy" }
+
+  # -- firmware ---------------------------------------------------------------
+  #
+  # Both sockets take a user-supplied image and neither ships with one. `align`
+  # is the difference that matters: the system BIOS sits against the *top* of
+  # its socket because that is where the reset vector is, and the video option
+  # ROM against the *bottom* because that is where the scan for `0x55 0xaa`
+  # looks.
+  object bios   "pc.rom" { image = "bios",    size = biossize, align = "top" }
+  object vgarom "pc.rom" { image = "vgabios", size = vgasize,  align = "bottom" }
+
+  # -- the memory map ---------------------------------------------------------
+  #
+  # 0x00000  base RAM, up to the video hole
+  # 0xa0000  video memory
+  # 0xc0000  the video option ROM
+  # 0xe0000  the system BIOS
+  # 0x100000 extended memory
+  # 0xfffe0000 the system BIOS again — see below
+  map mem 0x00000000 size basemem  = ram_low
+  map mem 0x000b8000 size 0x8000   = vga.vram      # the colour text page
+  map mem vgabase    size vgasize  = vgarom
+  map mem biosbase   size biossize = bios
+  map mem 0x00100000 size extmem   = ram_high
+
+  # The same ROM chip, decoded a second time at the top of the 32-bit address
+  # space. A 386 fetches its first instruction from 0xfffffff0 with CS's hidden
+  # base still pointing there, and only reaches 0x000f0000 once firmware has
+  # made its first far jump. Both windows are one chip, which is why the region
+  # is named twice rather than duplicated.
+  map mem 0x100000000 - biossize size biossize = bios
+
+  # -- the I/O map ------------------------------------------------------------
+  #
+  # The AT's, and written once. Each device below knows only offsets within its
+  # own block.
+  map port 0x0000 size 0x0010 = dma1.regs      # DMA 1, channels 0-3
+  map port 0x0020 size 0x0002 = pic1.regs      # master 8259A
+  map port 0x0040 size 0x0004 = pit0.regs      # 8254
+  map port 0x0060 size 0x0001 = kbc.data       # 8042 data
+  map port 0x0061 size 0x0001 = sysctl.portb   # speaker, timer 2 out, refresh
+  map port 0x0064 size 0x0001 = kbc.cmd        # 8042 status and command
+  map port 0x0070 size 0x0002 = cmos.regs      # RTC index (with the NMI mask)
+  map port 0x0080 size 0x0010 = dma1.pages     # the DMA page latches
+  map port 0x0092 size 0x0001 = sysctl.porta   # fast A20 and fast reset
+  map port 0x00a0 size 0x0002 = pic2.regs      # slave 8259A
+  map port 0x00c0 size 0x0020 = dma2.regs      # DMA 2, channels 4-7, at 2x
+  map port 0x03b4 size 0x0002 = vga.crtc       # the CRTC, monochrome address
+  map port 0x03c0 size 0x0010 = vga.vga        # sequencer, DAC, attribute...
+  map port 0x03d4 size 0x0002 = vga.crtc       # ...and its colour address
+  map port 0x03d8 size 0x0002 = vga.mode       # CGA mode and colour select
+  map port 0x03da size 0x0001 = vga.status     # retrace, and the AC flip-flop
+  map port 0x03f0 size 0x0008 = fdc.regs       # uPD765A
+  map port 0x04d0 size 0x0001 = pic1.elcr      # edge/level control, master
+  map port 0x04d1 size 0x0001 = pic2.elcr      # edge/level control, slave
+
+  # -- the wires --------------------------------------------------------------
+  #
+  # The interrupt tree. The slave cascades onto the master's IR2 and the master
+  # drives the CPU; the acknowledge travels back down the same two nets.
+  wire pic1.int    -> cpu0.intr
+  wire pic2.int    -> pic1.ir2
+
+  wire pit0.out0   -> pic1.ir0    # the system tick
+  wire kbc.irq1    -> pic1.ir1    # a key was pressed
+  wire fdc.irq     -> pic1.ir6    # the floppy controller
+  wire cmos.irq    -> pic2.ir0    # IRQ8, the RTC
+  wire kbc.irq12   -> pic2.ir4    # IRQ12, the auxiliary device
+
+  # The timer's counter 2 and the board's port B: software gates the counter
+  # through bit 0 and reads its output back in bit 5. Counter 1's output is the
+  # refresh toggle in bit 4.
+  wire sysctl.gate2 -> pit0.gate2
+  wire pit0.out2    -> sysctl.timer2
+  wire pit0.out1    -> sysctl.refresh
+
+  # A20 and reset each have two drivers — the keyboard controller and the
+  # chipset's fast port — which is exactly the wired-OR a net with two sources
+  # exists for (ROADMAP.md §4.3).
+  wire kbc.a20      -> cpu0.a20
+  wire sysctl.a20   -> cpu0.a20
+  wire kbc.reset    -> cpu0.reset
+  wire sysctl.reset -> cpu0.reset
+
+  # The floppy controller's DMA request lands on channel 2. The bytes travel
+  # the same net in the other direction, through `core::wire`'s `DmaPeripheral`.
+  wire fdc.drq      -> dma1.dreq2
+}

@@ -33,22 +33,33 @@
 //! nothing at all — which is exactly what firmware that probes for shadow RAM
 //! expects to find when there is none.
 //!
-//! # The image, the socket, and the reset vector
+//! # The image, the socket, and which end it sits at
 //!
-//! A socket has a fixed size, set by `size`, and the image is placed at its
-//! **end**:
+//! A socket has a fixed size, set by `size`, and `align` says which end a
+//! shorter image lands at. The two answers are not a preference — they are two
+//! different kinds of ROM:
 //!
 //! ```text
-//!   size = 128K, image = 128K   ->  the whole socket
-//!   size = 128K, image =  64K   ->  0x00000-0x0ffff erased, 0x10000-0x1ffff image
+//!   align = "top"     size = 128K, image = 64K
+//!       0x00000-0x0ffff erased, 0x10000-0x1ffff image
+//!   align = "bottom"  size = 64K,  image = 38K
+//!       0x00000-0x097ff image, 0x09800-0x0ffff erased
 //! ```
 //!
-//! Right-justified because that is what the hardware fact is: an x86 starts
-//! executing at the **top** of its address space (`0xffff:0x0000` on an 8086,
-//! `0xfffffff0` on a 386), so whatever is in the last bytes of the socket is
-//! what runs first. A 64 KiB image in a 128 KiB window that was left-justified
-//! would put erased bytes under the reset vector, and the machine would execute
-//! `0xff` — `INC BYTE PTR [BX+DI]` — forever, with nothing to say why.
+//! **The system BIOS is top-aligned**, because an x86 starts executing at the
+//! *top* of its address space (`0xffff:0x0000` on an 8086, `0xfffffff0` on a
+//! 386): whatever is in the last bytes of the socket is what runs first. A 64
+//! KiB image bottom-aligned in a 128 KiB window would put erased bytes under
+//! the reset vector, and the machine would execute `0xff` — `INC BYTE PTR
+//! [BX+DI]` — forever, with nothing to say why.
+//!
+//! **An option ROM is bottom-aligned**, because firmware finds one by scanning
+//! for the `0x55 0xaa` signature on a 2 KiB boundary and then trusting the
+//! length byte that follows it. A video BIOS top-aligned in its window would
+//! put that signature somewhere the scan never looks.
+//!
+//! `top` is the default, because getting the *system* BIOS wrong is the failure
+//! with no diagnostic.
 //!
 //! The machine file then maps the socket wherever the board decodes it, and may
 //! map it **twice**: a 386 fetches its first instruction from `0xfffffff0`,
@@ -88,6 +99,15 @@ const DEFAULT_SIZE: u64 = 128 * 1024;
 /// takes the host down.
 const MAX_SIZE: u64 = 16 * 1024 * 1024;
 
+/// Which end of the socket a short image sits at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Align {
+    /// Against the top, under the reset vector. What a system BIOS needs.
+    Top,
+    /// Against the bottom, where an option-ROM scan looks for `0x55 0xaa`.
+    Bottom,
+}
+
 /// A firmware ROM socket.
 #[derive(Debug)]
 pub struct FirmwareRom {
@@ -110,8 +130,14 @@ impl FirmwareRom {
         let mut r = props.reader();
         let image = r.require_media("image")?.to_bytes();
         let size = r.or_size("size", DEFAULT_SIZE)?;
+        let align = r.or_enum("align", "top", &["top", "bottom"])?;
+        let align = if align == "bottom" {
+            Align::Bottom
+        } else {
+            Align::Top
+        };
         r.finish()?;
-        FirmwareRom::from_image(&image, size)
+        FirmwareRom::from_image(&image, size, align)
     }
 
     /// Build one from bytes directly.
@@ -120,7 +146,7 @@ impl FirmwareRom {
     ///
     /// [`Error::Property`] if `size` is zero or implausibly large, or if the
     /// image does not fit.
-    pub fn from_image(image: &[u8], size: u64) -> Result<FirmwareRom> {
+    pub fn from_image(image: &[u8], size: u64, align: Align) -> Result<FirmwareRom> {
         if size == 0 || size > MAX_SIZE {
             return Err(Error::Property(format!(
                 "property `size`: a firmware socket holds between 1 and {MAX_SIZE} bytes, not \
@@ -134,11 +160,16 @@ impl FirmwareRom {
                  object a larger `size`, and map it over a larger window"
             )));
         }
-        // Right-justified: an x86 fetches its first instruction from the top of
-        // the socket, so a short image must end where the reset vector is.
         let mut bytes = alloc::vec![ERASED; size as usize];
-        let at = (size - len) as usize;
-        bytes[at..].copy_from_slice(image);
+        let at = match align {
+            // An x86 fetches its first instruction from the top of the socket,
+            // so a short system BIOS must end where the reset vector is.
+            Align::Top => (size - len) as usize,
+            // An option ROM is found by a scan for `0x55 0xaa` from the bottom
+            // of its window upward, so it must start there.
+            Align::Bottom => 0,
+        };
+        bytes[at..at + len as usize].copy_from_slice(image);
         let store = Arc::new(RomStore::new(bytes));
         let region: RegionRef = Arc::new(Region::rom(
             CLASS_NAME,
@@ -199,6 +230,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "how many bytes the socket decodes (default 128K)",
         },
+        PropertySpec {
+            name: "align",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "\"top\" for a system BIOS under the reset vector, \"bottom\" for an option ROM",
+        },
     ],
     construct: |props| Ok(Box::new(FirmwareRom::new(props)?)),
 };
@@ -255,6 +292,7 @@ pub fn schema() -> ClassSchema {
     ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("image", ValueKind::Media).required())
         .prop(PropSchema::new("size", ValueKind::Size))
+        .prop(PropSchema::new("align", ValueKind::Str).values(&["top", "bottom"]))
         .region("")
         .region("rom")
 }
@@ -276,7 +314,7 @@ mod tests {
     #[test]
     fn a_full_image_fills_the_socket() {
         let image: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
-        let rom = FirmwareRom::from_image(&image, 256).expect("it fits exactly");
+        let rom = FirmwareRom::from_image(&image, 256, Align::Top).expect("it fits exactly");
         assert_eq!(socket_bytes(&rom), image);
         assert_eq!(rom.image_len(), 256);
     }
@@ -287,15 +325,26 @@ mod tests {
         // of the socket, so a 16-byte image in a 64-byte socket must end at
         // offset 63 and not at offset 15.
         let image = [0xeau8; 16];
-        let rom = FirmwareRom::from_image(&image, 64).expect("it fits");
+        let rom = FirmwareRom::from_image(&image, 64, Align::Top).expect("it fits");
         let bytes = socket_bytes(&rom);
         assert_eq!(&bytes[..48], &[ERASED; 48], "the unprogrammed half");
         assert_eq!(&bytes[48..], &image, "the image, ending at the top");
     }
 
     #[test]
+    fn a_bottom_aligned_image_starts_where_an_option_rom_scan_looks() {
+        // A video BIOS is found by a scan for `0x55 0xaa` from the bottom of
+        // its window; top-aligning one would hide the signature.
+        let image = [0x55u8, 0xaa, 0x4c];
+        let rom = FirmwareRom::from_image(&image, 64, Align::Bottom).expect("it fits");
+        let bytes = socket_bytes(&rom);
+        assert_eq!(&bytes[..3], &image, "the signature is at the bottom");
+        assert_eq!(&bytes[3..], &[ERASED; 61], "the rest is unprogrammed");
+    }
+
+    #[test]
     fn an_image_larger_than_the_socket_is_refused_by_name() {
-        let e = FirmwareRom::from_image(&[0u8; 128], 64)
+        let e = FirmwareRom::from_image(&[0u8; 128], 64, Align::Top)
             .expect_err("128 bytes do not fit in 64")
             .to_string();
         assert!(e.contains("image"), "{e}");
@@ -304,7 +353,7 @@ mod tests {
 
     #[test]
     fn an_implausible_socket_is_refused_by_name() {
-        let e = FirmwareRom::from_image(&[], 1 << 40)
+        let e = FirmwareRom::from_image(&[], 1 << 40, Align::Top)
             .expect_err("a terabyte of ROM")
             .to_string();
         assert!(e.contains("size"), "{e}");
@@ -316,7 +365,7 @@ mod tests {
         // reads it back. On a board with no shadow control the write does
         // nothing and the read still returns the ROM — a bus fault here would
         // send that probe down a path no real machine takes.
-        let rom = FirmwareRom::from_image(&[0x55, 0xaa], 2).expect("it fits");
+        let rom = FirmwareRom::from_image(&[0x55, 0xaa], 2, Align::Top).expect("it fits");
         let space = AddressSpace::new("mem", 20);
         space
             .topology()
