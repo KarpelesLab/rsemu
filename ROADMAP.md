@@ -982,6 +982,7 @@ Each core is a feature. The order below is chosen so that each one proves a
 | **RISC-V rv64gc** (+ rv32) | MMU + software TLB, privilege levels, atomics, FPU, and the IR/JIT path. Smallest ISA that boots real Linux | 5 |
 | **x86**: i386 → x86-64 (real/protected/long mode, SSE) | The hard one: segmentation, variable-length decode, self-modifying code, paging quirks | 6 |
 | **ARM**: ARMv7-A, ARMv8-A AArch64 | Second major JIT frontend; validates IR generality | 6–8 |
+| **ARMv6Z** (ARM1176JZF-S) | Additive over v5TE: media SIMD, LDREX/STREX, VMSAv6, TrustZone. Raspberry Pi 1 / Zero; see §6.1 | planned |
 | **ARMv7E-M** (Cortex-M4/M7) | Thumb-2 only, a wholly different exception model; see §6.1 | planned |
 | Later: 68000, MIPS, PowerPC, SuperH, 8080, 65816, V850 | Breadth; each is a weekend once the IR is stable | post-8 |
 
@@ -1012,22 +1013,144 @@ decode it can never execute. That breaks the crate-shape rule (§3) directly —
 NES build links a 6502 and nothing else, and a Cortex-M build should link no
 ARM state.
 
-**The target layout.** `arm/` becomes the family, not one member of it:
+**The target layout.** `arm/` becomes the family, and the cut is **by profile,
+not by version**:
 
 ```
 src/cpu/arm/
   mod.rs       — family types and re-exports; always compiles, links nothing
-  common/      — shifter, flag rules, DSP semantics, Thumb-1 decode  (LATER)
-  v5te/        — ARMv5TE: A32 + Thumb, seven modes, CP15       (cpu-arm-v5te)
-  v7m/         — ARMv7E-M: Thumb-2, Handler/Thread, NVIC        (cpu-arm-v7m)
+  common/      — shifter, flag rules, DSP semantics, Thumb-1        (LATER)
+  aprofile/    — A32 + Thumb, banked modes, CP15, an MMU
+                 Arch::{V5TE, V6, V6Z, V7A}                  (cpu-arm-aprofile)
+  v7m/         — Thumb-2 only, Handler/Thread, NVIC              (cpu-arm-v7m)
 ```
 
-Each variant is its own feature, so a Cortex-M build still links no A32 and the
-crate-shape rule (§3) holds. Moving ARMv5TE down into `v5te/` is a **pure
-relocation** — no code changes, no extraction, no guessing — and it is worth
-doing as soon as there is a second member to make room for. Keep `pub use`
-shims at `cpu::arm::*` for one release so a downstream crate importing
-`rsemu::cpu::arm::{Arm, Config}` does not break on a directory move.
+An earlier revision of this section put ARMv5TE in a `v5te/` directory. That was
+wrong the moment ARMv6 entered the plan, and the correction is worth recording
+rather than quietly applying: **ARMv6 is additive over ARMv5TE, while ARMv7E-M
+is a different machine.** Counting major areas, v6 shares all ten of v5TE's —
+A32 plus Thumb, seven banked modes, CPSR/SPSR, CP15, the exception model, the
+shifter, the DSP extensions, the multiply family, `LDM`/`STM` with the S-bit,
+condition codes on every instruction — and adds ten of its own. v7E-M shares
+none of those first ten.
+
+So v5TE, v6, v6Z and later v7-A belong in **one core with an `Arch`
+construction property**, exactly as the 6502's three parts do, because the
+alternative is three near-copies drifting apart. A directory named `v5te/` that
+also implements v6 and v7-A would be lying, so the directory is named for the
+profile.
+
+**ARM1176JZF-S (ARMv6Z)** is the concrete target, and the ten additions are:
+the SIMD media instructions (`UADD8`, `SADD16`, `USAT`/`SSAT`, `SEL`, `PKHBT`/
+`PKHTB`, `USAD8`), `REV`/`REV16`/`REVSH` and the extend-with-rotate family,
+`LDREX`/`STREX` (with the v6K byte/halfword/doubleword forms and `CLREX`),
+`CPS` and `SETEND`, architectural unaligned access under `SCTLR.U`/`A`, the
+**VMSAv6 MMU** — supersections, ASIDs, TEX remap, and a genuinely different
+descriptor format from v5's — `WFI`/`WFE`/`SEV`/`YIELD` as real instructions
+rather than hints, **TrustZone** (the `Z`: Monitor mode, and secure/non-secure
+banking of much of CP15), **VFPv2** (the `F`), and Jazelle (the `J`, trivial on
+real silicon and fine to stub as such — say so).
+
+The MMU and TrustZone are the substantial parts; the instruction additions sit
+in existing encoding gaps and are mostly mechanical. The natural machine to aim
+at is the **Raspberry Pi 1 / Zero (BCM2835)** — a PL011 UART, the system timer,
+the mailbox and GPIO — which is to ARMv6 what `virt` is to RISC-V: a real board
+with real firmware to boot rather than a synthetic one.
+
+**Conformance.** No `SingleStepTests` corpus for ARMv6 either, so the same three
+substitutes as §6.1's v7-M discussion apply, with one addition that is stronger
+here: **our own ARMv5TE core is a near-complete oracle**, because v6 is a
+superset. Every v5TE instruction must behave identically unless the architecture
+says otherwise, and the divergences are enumerable (unaligned access, `SWP`
+deprecated in favour of `LDREX`/`STREX`, the CP15 register map). Differential
+testing against a core that passes 2,200,000 corpus vectors covers far more of
+ARMv6 than it does of ARMv7E-M. The ARM7TDMI corpus also still validates the
+shared v4T subset directly.
+
+### 6.1.1 Planning for many variants: an extension lattice, not a version ladder
+
+We will implement a lot of ARM. That changes the design, and the change is worth
+stating before the second core lands rather than after the fifth.
+
+**ARM versions are not a linear chain, and `if version >= V6` is a bug.** The
+architecture is a lattice of *optional extensions* that appear, become
+mandatory, and occasionally disappear along paths that do not nest:
+
+- **Thumb (T)** is optional in v4, mandatory from v6.
+- **DSP (E)** arrives in v5TE, but plain ARMv5 (ARM9TDMI) does not have it —
+  so a v5 part can lack what an earlier-numbered part with an extension has.
+- **Jazelle (J)**, **Security/TrustZone (Z)**, **VFP (F)**, **NEON**,
+  **hardware divide**, **LPAE**, **Virtualization (H)** and **multiprocessing
+  (MP)** are each independently present or absent within a single version.
+  ARM1176JZF-S has Z and VFPv2; ARM1136J-S has neither, and both are ARMv6.
+- **Thumb-2** appears in v6T2 — *after* v6 and v6K, which lack it.
+- The **M profile** has Thumb-2 but no A32 at all, so it is not "v7 minus
+  things"; it is a different branch of the lattice entirely.
+
+Encoding a lattice as an ordered enum forces every decode site to hard-code the
+part number it was thinking of, and the bug surfaces as an instruction that
+silently exists on a core that never had it. So:
+
+```rust
+pub struct Arch {
+    profile: Profile,        // A | R | M
+    version: Version,        // V4, V4T, V5TE, V6, V6K, V6T2, V7, V8 …
+    ext:     Extensions,     // independently selectable, below
+    mem:     MemModel,       // None | VMSAv5 | VMSAv6 | VMSAv7{lpae} | PMSA{v6,v7,v8}
+}
+
+pub struct Extensions {
+    pub thumb: bool, pub thumb2: bool, pub dsp: bool, pub media: bool,
+    pub jazelle: bool, pub security: bool, pub virt: bool,
+    pub vfp: Option<VfpVersion>, pub neon: bool,
+    pub idiv_thumb: bool, pub idiv_arm: bool, pub mp: bool, pub excl: ExclKind,
+}
+```
+
+This is not a new idea in this crate: **`cpu/riscv` already does exactly this**,
+with a `Config` carrying independently selectable `m`/`a`/`f`/`d`/`c`/`s`/`u`
+rather than an "RV64GC or not" flag. ARM's need is stronger, not weaker.
+
+**Named presets are the public surface.** Nobody should assemble an
+`Extensions` by hand to get a real chip; the constants carry the part numbers,
+and a machine file names one:
+
+```rust
+Arch::ARM7TDMI      // v4T:   thumb
+Arch::ARM926EJ_S    // v5TE:  thumb dsp jazelle,           VMSAv5
+Arch::ARM1136J_S    // v6:    …media,                      VMSAv6
+Arch::ARM1176JZF_S  // v6Z:   …security vfp(V2),           VMSAv6   ← Pi 1 / Zero
+Arch::CORTEX_A8     // v7-A:  …thumb2 neon vfp(V3) idiv_t, VMSAv7
+Arch::CORTEX_R5     // v7-R:  …                            PMSAv7
+Arch::CORTEX_M0     // v6-M:  thumb2(subset),              PMSAv6
+Arch::CORTEX_M4F    // v7E-M: thumb2 dsp vfp(V4-SP),       PMSAv7
+```
+
+Adding a part is then a `const` and its conformance evidence, not a module.
+
+**Decode is gated per entry, not per core.** §6's rule is that instruction
+tables are generated from a declarative description in the same file; each entry
+gains a *requirement* — the extension set it needs — and the generator emits a
+table filtered against the configured `Arch` at construction time. An
+instruction that is absent must trap as UNDEFINED, exactly as the silicon does;
+"we decoded it anyway because the core supports v7" is a conformance failure and
+also the way real guests probe for features. Because the requirement lives
+beside the semantics, adding an extension cannot silently light it up on parts
+that never had it, and the disassembler the same generator emits stays honest
+about which core it is disassembling for.
+
+**Where the profiles split.** Extensions handle variation *within* a profile.
+The A/R and M profiles differ in the parts an extension flag cannot express —
+register banking versus a stack-pointer pair, CP15 versus a memory-mapped SCB,
+CPSR versus xPSR, an eight-entry vector table versus a relocatable NVIC vector
+array — so those stay separate cores (`aprofile/`, `v7m/`) sharing `common/`.
+A/R and M is one boundary, and one is the number we should be prepared to
+defend; a third appears only if AArch64 lands, which shares even less.
+
+**The order to build in**, each step reusing the last rather than copying it:
+v5TE (done) → v6/v6K → v6Z (ARM1176JZF-S, the Raspberry Pi target) → v6T2 and
+v7-A. VFP and NEON ride on §9.1's soft-float, which already exists for RISC-V's
+`f`/`d` and is the reason none of this needs a host FPU.
 
 **What is genuinely shared, and when to factor it.** The barrel shifter and its
 flag rules, the DSP (E) semantics (`QADD`, `SMLAxy`, `SMUAD`, the SIMD
