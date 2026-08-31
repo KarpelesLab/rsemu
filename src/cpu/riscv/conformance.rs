@@ -57,9 +57,23 @@
 //! One upstream binary is deliberately not built: `rv32ud-p-move` is written
 //! in RV64 assembly and upstream's makefiles do not build it for RV32 either.
 //!
-//! `riscv-arch-test` via RISCOF is the fuller suite. It is noted and not taken
-//! on: it is a Python toolchain rather than a corpus, and it belongs behind
-//! the same env-var gate when it lands.
+//! # The other suite
+//!
+//! `riscv-arch-test` — the official architectural certification tests, and the
+//! one `ROADMAP.md` §13 names on the phase-5 gate — is **not** here. It lives
+//! in `tests/conformance/riscv.rs`, because it needs two things this file does
+//! not have: a corpus that is built rather than downloaded
+//! (`scripts/fetch-testdata.sh riscv-arch-test`), and a known-failures ledger,
+//! which is a committed file under `tests/conformance/ledgers/`.
+//!
+//! The two suites measure different things and both are worth running. This
+//! one is *self-checking*: each binary decides whether it passed and says so
+//! through `tohost`, so a wrong result is caught by assembly upstream wrote
+//! and rsemu only has to agree. `riscv-arch-test` is *signature-diffed*: each
+//! test records every result it computed and conformance means matching a
+//! reference model byte for byte, so a wrong result nobody thought to assert
+//! on is caught anyway. The `-v-` half of this corpus, which runs every
+//! instruction test under Sv39 in supervisor mode, has no counterpart there.
 
 use alloc::format;
 use alloc::string::{String, ToString};

@@ -145,6 +145,72 @@ means what it means.
 machine exists the runner reports each test as "never ran", which is a useful
 progress meter rather than a single red light.
 
+## Gate 4 — riscv-arch-test
+
+BSD-3-Clause, © RISC-V International,
+<https://github.com/riscv-non-isa/riscv-arch-test>, pinned at tag 3.9.1. The
+official architectural certification tests: each one exercises an instruction
+across generated corner cases and writes every result into a **signature**
+region, and conformance means our signature equals a reference model's, byte
+for byte.
+
+```sh
+scripts/fetch-testdata.sh riscv-arch-test
+RSEMU_CONFORMANCE=1 cargo test --release --all-features \
+    --test conformance -- --nocapture riscv
+```
+
+This suite is **built, not downloaded** — upstream ships assembly — so the
+fetch script needs `clang` and a RISC-V linker (`lld`, or the `rust-lld` that
+comes with rustup) and takes a few minutes. That is why it is not in `--all`.
+What lands in `testdata/riscv-arch-test` is one linked ELF per test plus the
+reference signature for it, so running the suite afterwards needs neither a
+toolchain nor a reference model.
+
+Upstream drives all of this with RISCOF (and, after 3.9.1, a successor
+framework built on Python, Ruby, `uv` and a UDB gem). **Neither is used.** The
+two things they do are done here instead:
+
+* *test selection* — each test's `RVTEST_CASE(...)` macro carries an ISA
+  regular expression and a few named DUT parameters; `arch_test_defines` in
+  `scripts/fetch-testdata.sh` evaluates them against the ISA string rsemu's
+  hart advertises, and the winning case's `def X=Y` clauses become `-D` flags.
+* *the reference* — the [Sail RISC-V model](https://github.com/riscv/sail-riscv)
+  (BSD-2-Clause), run as a downloaded binary with `--test-signature`, and
+  configured by `scripts/riscv-arch-test/sail-config.json` to describe the same
+  hart rsemu does. Sail is run, never read.
+
+`scripts/riscv-arch-test/` holds the four inputs that are ours: `model_test.h`
+(the device-under-test macros the suite asks every implementer to write),
+`link.ld`, and the two reference-model configuration overrides.
+
+**Configure the model to match the hart, or the answer is meaningless.** The
+first run of this suite had three failures — `rv64-privilege/ecall`,
+`rv64-privilege/ebreak` and `rv64-C/cebreak-01` — that turned out to be one bit
+in `misa`: Sail's default configuration enables the hypervisor extension, and the suite's
+own trap handler stores a wider trap signature when `misa.H` is set. Nothing
+was wrong with rsemu. `sail-config.json` records that, and the ledger's header
+says to reach for the configuration before reaching for the ledger.
+
+Useful knobs:
+
+| Variable | Effect |
+| --- | --- |
+| `RSEMU_ARCH_TEST_ONLY=rv64-I/add,privilege` | run only the tests whose name contains one of these |
+| `RSEMU_TESTDATA=/path` | corpus root (default `<repo>/testdata`) |
+
+The report in `target/conformance/riscv-arch-test.txt` names every differing
+signature word by index and by byte offset from `begin_signature`, which points
+straight at the store that produced it.
+
+**181 of 181** as of 2026-09-01, over 94 152 signature words and 475 424
+retired instructions, with an empty ledger. The runner prints those last two
+numbers and asserts they are non-zero: a ratio on its own cannot tell a clean
+run from a run that measured nothing, which is the mistake this directory has
+already made once.
+
+**Gate (`ROADMAP.md` §13):** phase 5, alongside booting Linux on `riscv-virt`.
+
 ## The known-failures ledger
 
 Each suite has a ledger under
@@ -159,18 +225,30 @@ Without the second half a ledger quietly becomes a list of things that used to
 be broken, and nobody can tell which entries are load-bearing.
 
 Format — one entry per line, `#` starts a comment, and the `# why` note is
-mandatory:
+mandatory. Suites whose unit is an opcode are keyed by one:
 
 ```text
 8b                # ANE #imm: unstable, depends on an analog magic constant
 ab :: ab 5c 21    # one specific vector, by its upstream name
 ```
 
-Staleness is only checked for tests that actually ran, so narrowing a run with
-`RSEMU_SST_OPCODES` does not condemn the rest of the file.
+and suites whose unit is a named test are keyed by its name:
 
-All three ledgers start empty. That is the strictest state and the right one for
-a core nobody has measured yet.
+```text
+rv64-I/add-01     # why
+```
+
+`LEDGERS` in [`tests/conformance/main.rs`](../../tests/conformance/main.rs)
+says which parser each file uses, and `every_ledger_parses` asserts that the
+table and the directory listing agree in both directions — so a ledger file no
+suite reads cannot sit there looking load-bearing.
+
+Staleness is only checked for tests that actually ran, so narrowing a run with
+`RSEMU_SST_OPCODES` or `RSEMU_ARCH_TEST_ONLY` does not condemn the rest of the
+file.
+
+Every ledger is empty today. That is the strictest state, and it is the state
+to keep them in: an entry is an admission, not a checkbox.
 
 ## What the harness needs from a CPU and a machine
 

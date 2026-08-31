@@ -1817,7 +1817,7 @@ The credibility of the whole project. Each core lands *with* its suite.
 | NES, whole machine | `AccuracyCoin` (MIT, §1) — a *machine* gate, not a CPU one; see the bring-up order below |
 | Z80 / SM83 | `zexall`/`zexdoc`, SingleStepTests z80 (MIT), `Gekkio/mooneye-test-suite` acceptance (MIT — **not** `mooneye-gb`, which is the emulator, not the suite), blargg GB suites |
 | x86 | `test386.asm`, SingleStepTests 8088/80286/80386, then real-OS boots: FreeDOS → Win 3.11 → Win 95 → Linux → Win XP |
-| RISC-V | `riscv-tests`, `riscv-arch-test` via RISCOF, Linux boot on `virt` |
+| RISC-V | `riscv-tests`, `riscv-arch-test` against the Sail model, Linux boot on `virt` |
 | ARM | SingleStepTests ARM7TDMI, Linux boot on `virt` |
 | Framework | Snapshot round-trip identity per device; replay determinism; region-priority/alias unit matrix; DSL parser corpus incl. error-message goldens |
 | Threading | Identical state hash under `single` / `native-std` / `wasm-atomics`; safe-point protocol under stress; ranked-lock-order assertions; guest-atomics conformance per frontend (a TSO guest on a weakly-ordered host is the case that finds the bugs) |

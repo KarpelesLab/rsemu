@@ -70,6 +70,7 @@ quietly leaving the impression of a number.
 | WDC 65C02S | SingleStepTests 65x02 | **2,530,025 / 2,540,000** |
 | Zilog Z80 | SingleStepTests z80, zexall | **1,604,000 / 1,604,000**, 67/67; **77/77** again inside a Master System |
 | RISC-V RV64GC | riscv-tests | **409 / 409** |
+| RISC-V RV64GC | riscv-arch-test 3.9.1, signatures diffed against the Sail model | **181 / 181** — I, M, A, F, D, C, Zifencei, privilege. Which extension suites are *not* run, and why, is listed in [`docs/testing/README.md`](docs/testing/README.md) |
 | Intel 8086/8088 | SingleStepTests 8088 | **2,974,160 / 3,007,000** |
 | Motorola 68000 | SingleStepTests 680x0 | runner in-tree; fetch the corpus to reproduce |
 | Sharp SM83 (Game Boy) | blargg, mooneye | `cpu_instrs` 11/11; mooneye acceptance 22/66 |

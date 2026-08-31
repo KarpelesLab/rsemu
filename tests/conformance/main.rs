@@ -78,6 +78,7 @@ mod ledger;
 mod machine;
 mod mock;
 mod nestest;
+mod riscv;
 mod sst;
 
 use std::fmt::Write as _;
@@ -456,8 +457,286 @@ fn page_key(result_addr: u16) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Gate 4 — riscv-arch-test
+// ---------------------------------------------------------------------------
+
+/// The official RISC-V architectural certification tests, signature-diffed
+/// against the Sail reference model. `tests/conformance/riscv.rs` has the long
+/// form, including which extension directories are deliberately not run.
+#[test]
+fn riscv_arch_test() {
+    let suite = "riscv-arch-test";
+    let fetch = "scripts/fetch-testdata.sh riscv-arch-test";
+    let root = gated!(
+        suite,
+        harness::require(harness::testdata_root().join("riscv-arch-test"), fetch)
+    );
+
+    // The corpus records what it was built from and for. Printing it is not
+    // decoration: a signature diff against a reference generated for a
+    // differently configured hart is a wrong answer, not a failure, and these
+    // three lines are what makes that visible in a log.
+    for (file, label) in [
+        ("version.txt", "suite"),
+        ("isa.txt", "built for ISA"),
+        ("reference.txt", "reference model"),
+    ] {
+        if let Ok(text) = std::fs::read_to_string(root.join(file)) {
+            println!("{suite}: {label}: {}", text.trim());
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string(root.join("skipped.txt")) {
+        let n = text.lines().filter(|l| !l.trim().is_empty()).count();
+        println!("{suite}: {n} test(s) not built — this hart's ISA excludes them");
+    }
+    // Not the same thing at all, and this is the line that keeps them apart.
+    // A test the ISA selector excluded is a fact about the hart; a test that
+    // would not build or whose reference would not generate is a hole in the
+    // measurement, and it shrinks the denominator without shrinking the ratio.
+    match std::fs::read_to_string(root.join("notbuilt.txt")) {
+        Ok(text) => {
+            let broken: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            if !broken.is_empty() {
+                println!(
+                    "{suite}: WARNING — {} test(s) could not be built or referenced and are \
+                     absent from this run:",
+                    broken.len()
+                );
+                for line in broken.iter().take(10) {
+                    println!("      {line}");
+                }
+                println!("      see {}", root.join("notbuilt.txt").display());
+            }
+        }
+        Err(_) => println!(
+            "{suite}: note: no notbuilt.txt — this corpus predates the fetch script \
+             recording which tests it could not build"
+        ),
+    }
+
+    // The directory exists, so a listing that fails is a broken corpus rather
+    // than an absent one, and skipping on it would measure nothing.
+    let mut tests = match riscv::collect(&root) {
+        Ok(tests) => tests,
+        Err(e) => panic!("{} exists but cannot be listed: {e}", root.display()),
+    };
+    assert!(
+        !tests.is_empty(),
+        "{} exists but holds no built test images — the fetch was incomplete.\n\
+         Re-run: {fetch}",
+        root.display()
+    );
+
+    if let Ok(only) = std::env::var("RSEMU_ARCH_TEST_ONLY") {
+        tests.retain(|t| only.split(',').any(|f| t.name.contains(f.trim())));
+        println!(
+            "note: RSEMU_ARCH_TEST_ONLY narrowed the run to {} test(s)",
+            tests.len()
+        );
+        assert!(
+            !tests.is_empty(),
+            "RSEMU_ARCH_TEST_ONLY matched no test under {}",
+            root.display()
+        );
+    }
+
+    // A test image with no reference beside it cannot be judged, and dropping
+    // it would silently shrink the denominator — which is the whole failure
+    // mode this directory exists to prevent.
+    let orphans: Vec<&str> = tests
+        .iter()
+        .filter(|t| !t.reference.exists())
+        .map(|t| t.name.as_str())
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "{} test image(s) have no reference signature ({} ...).\n\
+         The corpus is half-generated. Re-run: {fetch} --force",
+        orphans.len(),
+        orphans[..orphans.len().min(5)].join(", ")
+    );
+
+    let runner = match riscv::require_runner() {
+        Ok(runner) => runner,
+        Err(skip) => {
+            // No hart in this build — but the corpus is here, so prove it is
+            // intact and that the reference format is understood. A fetch that
+            // produced truncated signatures should not wait for a
+            // feature-enabled build to be discovered.
+            let first = &tests[0];
+            match harness::read(&first.reference)
+                .map(|bytes| riscv::parse_signature(&String::from_utf8_lossy(&bytes)))
+            {
+                Ok(Ok(sig)) => println!(
+                    "note: corpus is readable — {} has a {}-word reference signature",
+                    first.name,
+                    sig.len()
+                ),
+                Ok(Err(e)) => panic!("{}: {e}", first.reference.display()),
+                Err(e) => panic!("cannot read the corpus: {e}"),
+            }
+            skip.report(suite);
+            return;
+        }
+    };
+
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(tests.len());
+    println!(
+        "{suite}: {} test image(s) across {threads} thread(s)",
+        tests.len()
+    );
+
+    let ran: Vec<String> = tests.iter().map(|t| t.name.clone()).collect();
+    let queue = Mutex::new(tests);
+    let failures: Mutex<Vec<riscv::Failure>> = Mutex::new(Vec::new());
+    let passed = Mutex::new(0usize);
+    let effort = Mutex::new(riscv::Effort::default());
+
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let Some(test) = queue.lock().unwrap().pop() else {
+                        break;
+                    };
+                    let (failure, one) = run_one_arch_test(runner.as_ref(), &test);
+                    effort.lock().unwrap().add(one);
+                    match failure {
+                        Some(f) => failures.lock().unwrap().push(f),
+                        None => *passed.lock().unwrap() += 1,
+                    }
+                }
+            });
+        }
+    });
+
+    let mut failures = failures.into_inner().unwrap();
+    failures.sort_by(|a, b| a.test.cmp(&b.test));
+    let passed = passed.into_inner().unwrap();
+    let total = passed + failures.len();
+    // "0 of 0 passed" is the last shape a vacuous pass can take: the images
+    // were found, listed and matched to references, and not one ran.
+    assert!(total > 0, "{suite}: no test image ran");
+    let effort = effort.into_inner().unwrap();
+    // The second half of that. Every test could have halted immediately with
+    // an empty signature and still reported 181 of 181; these two numbers are
+    // what say otherwise, so they are asserted rather than merely printed.
+    assert!(
+        effort.words > 0 && effort.instret > 0,
+        "{suite}: {total} test(s) ran but compared {} signature word(s) \
+         across {} retired instruction(s)",
+        effort.words,
+        effort.instret
+    );
+
+    let headline = format!(
+        "{suite}: {passed}/{total} signatures match the reference \
+         ({} signature words, {} guest instructions)",
+        effort.words, effort.instret
+    );
+    let mut body = format!("{headline}\n\n");
+    for f in &failures {
+        let _ = writeln!(body, "{f}");
+    }
+    println!("{headline}");
+    for f in &failures {
+        println!("  FAIL {f}");
+    }
+    harness::write_report("riscv-arch-test.txt", &body);
+
+    let path = ledger_path(suite);
+    let ledger = match ledger::NamedLedger::load(&path) {
+        Ok(l) => l,
+        Err(e) => panic!("{}: {e}", path.display()),
+    };
+    let names: Vec<String> = failures.iter().map(|f| f.test.clone()).collect();
+    let verdict = ledger::judge_named(&ledger, &ran, &names);
+    if verdict.excused > 0 {
+        println!(
+            "  {} failure(s) excused by {}",
+            verdict.excused,
+            path.display()
+        );
+    }
+    assert!(verdict.is_ok(), "\n{}", verdict.describe(&ledger));
+}
+
+/// Run one image and turn anything but a matching signature into a [`Failure`].
+fn run_one_arch_test(
+    runner: &dyn riscv::Runner,
+    test: &riscv::Test,
+) -> (Option<riscv::Failure>, riscv::Effort) {
+    let mut effort = riscv::Effort::default();
+    let fail = |reason: String| {
+        Some(riscv::Failure {
+            test: test.name.clone(),
+            reason,
+        })
+    };
+    let image = match harness::read(&test.elf) {
+        Ok(image) => image,
+        Err(e) => return (fail(e), effort),
+    };
+    let reference = match harness::read(&test.reference) {
+        Ok(bytes) => match riscv::parse_signature(&String::from_utf8_lossy(&bytes)) {
+            Ok(sig) => sig,
+            Err(e) => return (fail(format!("{}: {e}", test.reference.display())), effort),
+        },
+        Err(e) => return (fail(e), effort),
+    };
+
+    let (layout, outcome) = runner.run(&image, riscv::STEP_LIMIT);
+    let failure = match outcome {
+        riscv::Outcome::Halted {
+            signature,
+            instret: retired,
+        } => {
+            effort.instret = retired;
+            effort.words = signature.len() as u64;
+            // The image's own address for the signature, so a differing word
+            // can be turned into an address and looked up in a disassembly of
+            // the test without recomputing anything.
+            let at = layout.map_or(String::new(), |l| {
+                format!("begin_signature {:#x}: ", l.begin_signature)
+            });
+            riscv::compare(&signature, &reference).and_then(|why| fail(format!("{at}{why}")))
+        }
+        riscv::Outcome::Timeout {
+            pc,
+            mcause,
+            mepc,
+            mtval,
+        } => fail(format!(
+            "no result after {} instructions, pc {pc:#x} \
+             (mcause {mcause:#x} mepc {mepc:#x} mtval {mtval:#x})",
+            riscv::STEP_LIMIT
+        )),
+        riscv::Outcome::BadImage(why) => fail(format!("not a usable test image: {why}")),
+    };
+    (failure, effort)
+}
+
+// ---------------------------------------------------------------------------
 // Always-on checks
 // ---------------------------------------------------------------------------
+
+/// Which parser reads each committed ledger.
+///
+/// A table rather than a guess, because the two ledger formats look alike from
+/// a distance and a file read by the wrong parser either fails loudly (good) or
+/// parses to nothing (not good). [`every_ledger_parses`] asserts that this
+/// table and the directory listing agree in both directions, so a ledger no
+/// suite reads cannot sit there looking load-bearing.
+const LEDGERS: &[(&str, bool)] = &[
+    // (file stem, keyed by test name rather than by opcode)
+    ("accuracycoin", false),
+    ("riscv-arch-test", true),
+    ("sst-6502", false),
+    ("sst-nes6502", false),
+];
 
 /// The ledgers must parse even when nothing runs.
 ///
@@ -467,16 +746,37 @@ fn page_key(result_addr: u16) -> u8 {
 fn every_ledger_parses() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/conformance/ledgers");
     let entries = std::fs::read_dir(&dir).expect("the ledger directory is committed");
-    let mut checked = 0;
+    let mut found: Vec<String> = Vec::new();
     for entry in entries {
         let path = entry.unwrap().path();
         if path.extension().and_then(|e| e.to_str()) != Some("txt") {
             continue;
         }
-        ledger::Ledger::load(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        checked += 1;
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let named = match LEDGERS.iter().find(|(name, _)| *name == stem) {
+            Some((_, named)) => *named,
+            None => panic!(
+                "{} is not in main.rs's LEDGERS table, so no suite reads it. \
+                 Add it there or delete the file.",
+                path.display()
+            ),
+        };
+        if named {
+            ledger::NamedLedger::load(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        } else {
+            ledger::Ledger::load(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        }
+        found.push(stem);
     }
-    assert!(checked >= 3, "expected a ledger per suite, found {checked}");
+    found.sort();
+    let expected: Vec<&str> = LEDGERS.iter().map(|(name, _)| *name).collect();
+    assert_eq!(
+        found, expected,
+        "the ledger directory and main.rs's LEDGERS table disagree"
+    );
 }
 
 /// Every seam this build *can* bind **is** bound.
@@ -516,6 +816,29 @@ fn every_seam_this_build_can_bind_is_bound() {
         println!(
             "note: this build cannot drive a 6502 ({} not all on)",
             cpu::CPU_FEATURES
+        );
+    }
+
+    if riscv::cpu_is_built() {
+        assert!(
+            riscv::have_cpu(),
+            "`{}` are on but tests/conformance/riscv.rs binds no hart",
+            riscv::CPU_FEATURES
+        );
+        // Same standard as the 6502 above: bound is not enough, it has to
+        // execute. `addi a0, x0, 42` then `addi a0, a0, -1`, so a core that
+        // ran zero instructions and a core that ran one are told apart too.
+        let runner = riscv::new_runner().expect("just checked");
+        let code: Vec<u8> = [0x02a0_0513u32, 0xfff5_0513u32]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        assert_eq!(runner.probe(&code, 1, 10), 42);
+        assert_eq!(runner.probe(&code, 2, 10), 41);
+    } else {
+        println!(
+            "note: this build cannot drive a RISC-V hart ({} not all on)",
+            riscv::CPU_FEATURES
         );
     }
 
