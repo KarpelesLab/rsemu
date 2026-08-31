@@ -49,6 +49,7 @@
 //! Gekkio's *Game Boy: Complete Technical Reference*. No emulator source was
 //! consulted.
 
+use crate::core::sched::TickCursor;
 use crate::core::space::{AddressSpace, MemAttrs};
 use crate::core::value::Width;
 
@@ -167,6 +168,8 @@ pub(super) struct Exec<'a> {
     space: &'a AddressSpace,
     lines: &'a Lines,
     attrs: MemAttrs,
+    /// Where to publish the cycle counter as the step runs, if anyone asked.
+    cursor: Option<&'a TickCursor>,
     /// Cycles this step has charged.
     used: u64,
 }
@@ -184,8 +187,15 @@ impl<'a> Exec<'a> {
             space,
             lines,
             attrs: MemAttrs::DEFAULT.with_requester(cfg.requester),
+            cursor: None,
             used: 0,
         }
+    }
+
+    /// Publish each machine cycle to `cursor` as it is charged.
+    pub(super) fn with_cursor(mut self, cursor: Option<&'a TickCursor>) -> Exec<'a> {
+        self.cursor = cursor;
+        self
     }
 
     /// Run one instruction, one interrupt dispatch, or one idle cycle.
@@ -246,9 +256,22 @@ impl<'a> Exec<'a> {
     // -----------------------------------------------------------------
 
     /// Charge one machine cycle.
+    ///
+    /// The counter moves *before* the access, and the published value is
+    /// therefore the number of the cycle the access falls in rather than the one
+    /// before it. That is the right end of the M-cycle: the SM83 puts the
+    /// address out over the first half and latches the data at the end, so a
+    /// device answering this access has to have run to the boundary this cycle
+    /// closes (Gekkio, *Game Boy: Complete Technical Reference*, §"Memory
+    /// access timing"). Publishing the boundary it *opened* would put every
+    /// read four dots early, which is a whole PPU dot-quartet and shows up
+    /// directly in Gekkio's `intr_2_mode0_timing` group.
     fn tick(&mut self) {
         self.used += 1;
         self.state.cycles = self.state.cycles.wrapping_add(1);
+        if let Some(cursor) = self.cursor {
+            cursor.set(self.state.cycles);
+        }
     }
 
     /// One machine cycle in which the chip does something internal rather than

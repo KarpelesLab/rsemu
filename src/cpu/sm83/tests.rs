@@ -873,3 +873,103 @@ fn disassembly_of_live_memory_uses_debug_attributes() {
     assert_eq!(alloc::format!("{}", out[0]), "LD HL,$1234");
     assert_eq!(alloc::format!("{}", out[1]), "NOP");
 }
+
+// ---------------------------------------------------------------------------
+// The tick cursor
+// ---------------------------------------------------------------------------
+
+/// A device sampled from inside an instruction has to see the cycle the access
+/// really happened on, which means the core must publish its counter as it runs
+/// rather than only when it returns (`ROADMAP.md` §4.2). The value is read *by*
+/// the access, so what matters is that it has already moved when the bus
+/// operation is issued — hence the read below happens through a region that
+/// records the cursor at the moment it answers.
+#[test]
+fn every_machine_cycle_is_published_before_its_bus_access() {
+    use crate::core::sched::TickCursor;
+    use crate::core::space::{AccessConstraints, MemOps, MemResult, Region as MmioRegion};
+    use crate::core::sync::Mutex;
+    use core::fmt;
+
+    struct Watcher {
+        cursor: TickCursor,
+        seen: Mutex<Vec<u64>>,
+    }
+    impl fmt::Debug for Watcher {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Watcher").finish_non_exhaustive()
+        }
+    }
+    impl MemOps for Watcher {
+        fn read(&self, _offset: u64, dst: &mut [u8], _attrs: MemAttrs) -> MemResult {
+            self.seen.lock().push(self.cursor.get());
+            dst[0] = 0x00;
+            Ok(())
+        }
+        fn write(&self, _offset: u64, _src: &[u8], _attrs: MemAttrs) -> MemResult {
+            self.seen.lock().push(self.cursor.get());
+            Ok(())
+        }
+        fn constraints(&self) -> AccessConstraints {
+            AccessConstraints::IO.with_widths(Width::U8, Width::U8)
+        }
+    }
+
+    let cursor = TickCursor::new();
+    let watcher = Arc::new(Watcher {
+        cursor: cursor.clone(),
+        seen: Mutex::new(Vec::new()),
+    });
+
+    let ram = Arc::new(RamStore::new(0x1_0000));
+    // `LD A,($C000)`: fetch, two immediate bytes, then the read.
+    for (i, b) in [0xfa_u8, 0x00, 0xc0].iter().enumerate() {
+        ram.write_u8(0x0100 + i as u64, *b).expect("in range");
+    }
+    let space = AddressSpace::new("cpu", 16);
+    space
+        .topology()
+        .map(Region::ram("ram", Arc::clone(&ram)), 0)
+        .expect("maps");
+    space
+        .topology()
+        .map(
+            Arc::new(MmioRegion::io(
+                "watch",
+                1,
+                Arc::clone(&watcher) as Arc<dyn MemOps>,
+            )),
+            0xc000,
+        )
+        .expect("maps");
+
+    let cpu = Sm83::new(Config::default());
+    cpu.attach_space(Arc::new(space));
+    Device::reset(&cpu, ResetKind::Cold);
+    cpu.attach_cursor(cursor.clone());
+
+    assert_eq!(cpu.step(), 4, "LD A,(nn) is four machine cycles");
+    // The watched region answers the fourth of them, and the counter has
+    // already reached 4 by the time it does.
+    assert_eq!(&*watcher.seen.lock(), &[4]);
+    assert_eq!(cursor.get(), 4, "and it is left where the step ended");
+}
+
+/// The counter is ticks-since-power-on, not an offset into a budget: a core that
+/// overran one budget carries the overshoot as debt, and the scheduler relies on
+/// the cursor still reporting the truth.
+#[test]
+fn the_cursor_is_free_running_across_budgets() {
+    use crate::core::sched::TickCursor;
+
+    let cursor = TickCursor::new();
+    // Four `NOP`s and a `JR -2`, so the core never runs out of work.
+    let (cpu, _ram) = cpu_with(&[0x00, 0x00, 0x00, 0x00, 0x18, 0xfe]);
+    cpu.attach_cursor(cursor.clone());
+    assert_eq!(cpu.run_budget(3), 3);
+    assert_eq!(cursor.get(), cpu.cycles());
+    let before = cursor.get();
+    cpu.run_budget(3);
+    assert!(cursor.get() > before, "the counter never restarts");
+    assert_eq!(cursor.get(), cpu.cycles());
+}

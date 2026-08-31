@@ -44,10 +44,12 @@
 //! tick is one of the 4 194 304 clocks a second, four to a CPU machine cycle.
 //! [`GbTimer::next_event_tick`] reports the next tick at which anything a
 //! program can *see* changes: the next `DIV` increment, the next `TIMA`
-//! increment, the end of the overflow reload delay. Bounding the scheduler's
-//! quantum by that is what makes a mid-quantum `TIMA` read correct — not because
-//! the device is caught up to the exact cycle, but because between two of its
-//! own events there is nothing to catch up *to*.
+//! increment, the end of the overflow reload delay. That is what the scheduler
+//! bounds catch-up by — and, since the SM83 publishes its machine cycle as it
+//! runs (`core::sched::TickCursor`), it is also what decides the cycle inside
+//! an instruction at which this device is dragged forward. A `TIMA` read lands
+//! on the cycle it was really made on, which is what Gekkio's whole timer group
+//! measures.
 //!
 //! # Sources
 //!
@@ -207,8 +209,10 @@ impl Shared {
     /// next `TIMA` increment, and the end of an overflow's reload window. What
     /// this buys is not precision for its own sake — it is that between two
     /// consecutive events *nothing changes*, so a read that lands in the gap is
-    /// correct even though the device has not been advanced to the exact tick
-    /// (`ROADMAP.md` §4.2's known intra-quantum staleness).
+    /// correct even though the device has not been advanced to the exact tick.
+    /// It is also the deadline a running core's [`TickCursor`](crate::core::sched::TickCursor) watches, which is
+    /// how the timer's own interrupt lands on the cycle it is due on rather than
+    /// at the end of the quantum.
     fn compute_next_event(&self, regs: &Regs, now: u64) -> u64 {
         // `DIV` steps every 256 clocks.
         let to_div = 256 - u64::from(regs.counter & 0xff);

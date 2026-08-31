@@ -99,7 +99,7 @@ use crate::core::device::{
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
-use crate::core::sched::{Budget, Consumed};
+use crate::core::sched::{Budget, Consumed, TickCursor};
 use crate::core::space::{
     AccessConstraints, AddressSpace, MemAttrs, MemOps, MemResult, Region as MmioRegion, RegionRef,
     RequesterId,
@@ -550,6 +550,8 @@ impl Lines {
 struct Session {
     state: State,
     space: Option<Arc<AddressSpace>>,
+    /// Where to publish this core's cycle counter as it runs, if anyone asked.
+    cursor: Option<TickCursor>,
 }
 
 /// A Sharp SM83 core.
@@ -623,6 +625,7 @@ impl Sm83 {
                 Session {
                     state: State::new(),
                     space: None,
+                    cursor: None,
                 },
             ),
             requester: AtomicU32::new(cfg.requester.0),
@@ -681,6 +684,21 @@ impl Sm83 {
     #[must_use]
     pub fn space(&self) -> Option<Arc<AddressSpace>> {
         self.session.lock().space.clone()
+    }
+
+    /// Publish this core's machine-cycle counter here as it executes.
+    ///
+    /// What makes a lazily-advanced device sampled from inside an instruction
+    /// see the cycle the access really happened on rather than the one the
+    /// quantum began at (`ROADMAP.md` §4.2 and
+    /// [`TickCursor`](crate::core::sched::TickCursor)). On a Game Boy that is
+    /// the whole of `instr_timing` and most of Gekkio's timer group: every one
+    /// of them measures a device against single instructions, so a bias of a
+    /// few cycles is exactly what they are built to detect.
+    ///
+    /// The machine layer calls this for every runnable device.
+    pub fn attach_cursor(&self, cursor: TickCursor) {
+        self.session.lock().cursor = Some(cursor);
     }
 
     /// The register file.
@@ -814,11 +832,17 @@ impl Sm83 {
                 session.state.regs = Regs::post_boot_dmg();
             }
         }
-        let Session { state, space } = &mut *session;
+        let Session {
+            state,
+            space,
+            cursor,
+        } = &mut *session;
         let Some(space) = space.clone() else {
             return 0;
         };
-        Exec::new(state, &space, &cfg, &self.lines).step()
+        Exec::new(state, &space, &cfg, &self.lines)
+            .with_cursor(cursor.as_ref())
+            .step()
     }
 
     /// Execute until at least `budget` machine cycles have been charged.
@@ -857,10 +881,12 @@ impl Sm83 {
     ///   every quantum boundary, and the only disagreement inside a quantum is
     ///   the few cycles of the instruction in flight.
     ///
-    /// So the overshoot is carried. The residual error — a device is stale by
-    /// however far into the current quantum the access falls — is the
-    /// intra-quantum staleness `ROADMAP.md` §4.2 records as outstanding, and it
-    /// is what the ledger in `dev::gb::conformance` points at.
+    /// So the overshoot is carried, and it costs nothing: the scheduler anchors
+    /// a [`TickCursor`]'s conversion to the *forest's* position for this
+    /// domain rather than to what the cursor reads, so the debt cancels and a
+    /// device sampled mid-instruction still lands on the cycle the access
+    /// really happened on. That used to be the residual the ledger in
+    /// `dev::gb::conformance` pointed at; the ledger is now empty.
     pub fn run_budget(&self, ticks: u64) -> u64 {
         let owed = self.session.lock().state.debt;
         if owed >= ticks {
@@ -1034,6 +1060,10 @@ impl Device for Sm83 {
 
     fn is_runnable(&self) -> bool {
         true
+    }
+
+    fn attach_cursor(&self, cursor: TickCursor) {
+        Sm83::attach_cursor(self, cursor);
     }
 
     fn run(&self, budget: Budget) -> Consumed {

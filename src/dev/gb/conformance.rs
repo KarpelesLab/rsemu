@@ -263,23 +263,26 @@ fn run(machine: &mut Machine, limit_frames: u64, mut stop: impl FnMut(&Machine) 
 /// The known-failures ledger for the whole-machine blargg run.
 ///
 /// `ROADMAP.md` §0 asks every core to ship a ledger that *only ever shrinks*,
-/// and this is it. One entry, and the reason is not a Game Boy bug:
+/// and this is it. It is **empty**, and the entry that used to be here is worth
+/// recording because of how it went:
 ///
-/// **`instr_timing`** passes 12/12 against the SM83 on its own
+/// **`instr_timing`** passed 12/12 against the SM83 on its own
 /// (`cpu::sm83::conformance`), where the timer is advanced in step with the
-/// processor. On the assembled machine it fails, and the cause is the
-/// intra-quantum staleness `ROADMAP.md` §4.2 already records as outstanding: a
-/// [`LazyHandle`](crate::core::sched::LazyHandle) catches a device up to the
-/// tick the *scheduler* last published, which is the start of the current
-/// quantum, and an instruction cannot be stopped part-way, so a CPU overruns
-/// each quantum by up to five machine cycles and reads a timer that is that far
-/// behind. `instr_timing` measures the timer against single instructions, so a
-/// bias of a few cycles is exactly what it detects.
+/// processor, and failed on the assembled machine. The cause was the
+/// intra-quantum staleness `ROADMAP.md` §4.2 used to record as outstanding: a
+/// [`LazyHandle`](crate::core::sched::LazyHandle) caught a device up only to
+/// the tick the *scheduler* had published, which is the start of the current
+/// quantum, so an instruction reading the timer read one that was up to five
+/// machine cycles behind. `instr_timing` measures the timer against single
+/// instructions, which is exactly that bias.
 ///
-/// Fixing it means letting a runnable report progress *as* it runs — a change to
-/// `core::sched::Runnable`, which phase 4 is explicitly not the place to make.
-/// The entry comes out when that lands.
-const BLARGG_LEDGER: &[&str] = &["instr_timing.gb"];
+/// [`TickCursor`](crate::core::sched::TickCursor) closed it: the SM83 now
+/// publishes its machine-cycle counter as it executes
+/// ([`Sm83::attach_cursor`](crate::cpu::sm83::Sm83::attach_cursor)) and every
+/// lazily-advanced device is converted onto that cycle through the oscillator
+/// tree they share. The entry came out when that landed, and nothing has gone
+/// back in.
+const BLARGG_LEDGER: &[&str] = &[];
 
 #[test]
 fn blargg_on_the_shipped_machine() {
