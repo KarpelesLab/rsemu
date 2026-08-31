@@ -682,28 +682,70 @@ fn the_reset_pin_latches_and_the_next_step_runs_the_sequence() {
     assert_eq!(regs.ipl_mask(), 7);
 }
 
-/// A controller that answers the acknowledge cycle with a vector, the way a
-/// 68000 peripheral that does *not* assert `VPA` does.
+/// A controller on one `IPL` encoding, the way a real 68000 peripheral sits in
+/// CPU space: it compares the level the acknowledge cycle presents on A3-A1
+/// with its own and answers only its own, declining every other.
+///
+/// `answer` is what it drives once it is the one being asked — a vector and
+/// `DTACK`, or `VPA` for a controller that has nothing to supply.
 #[derive(Debug)]
-struct Vectoring {
-    vector: u8,
-    acknowledged: crate::core::sync::AtomicU32,
+struct Controller {
+    level: u8,
+    answer: crate::core::wire::IntAckResponse,
+    asked: crate::core::sync::AtomicU32,
 }
 
-impl crate::core::wire::IntAck for Vectoring {
-    fn acknowledge(&self) -> u32 {
-        self.acknowledged
+impl Controller {
+    /// A controller on `level` that drives `vector`.
+    fn vectoring(level: u8, vector: u8) -> Arc<Controller> {
+        Arc::new(Controller {
+            level,
+            answer: crate::core::wire::IntAckResponse::Vector(u32::from(vector)),
+            asked: crate::core::sync::AtomicU32::new(0),
+        })
+    }
+
+    /// A controller on `level` that asserts `VPA` instead.
+    fn autovectoring(level: u8) -> Arc<Controller> {
+        Arc::new(Controller {
+            level,
+            answer: crate::core::wire::IntAckResponse::Autovector,
+            asked: crate::core::sync::AtomicU32::new(0),
+        })
+    }
+
+    /// How many acknowledge cycles have reached this controller, declined ones
+    /// included — a cycle another controller took never gets here at all.
+    fn asked(&self) -> u32 {
+        self.asked.load(crate::core::sync::Ordering::Relaxed)
+    }
+
+    /// Hang this controller off `port`, keeping the `Arc` alive in the caller:
+    /// the net holds it weakly.
+    fn attach(self: &Arc<Self>, cpu: &M68k, port: &str) {
+        use crate::core::device::Device;
+        let weak: alloc::sync::Weak<dyn crate::core::wire::IntAck> = Arc::downgrade(self) as _;
+        cpu.attach_int_ack(port, weak);
+    }
+}
+
+impl crate::core::wire::IntAck for Controller {
+    fn acknowledge(
+        &self,
+        cycle: crate::core::wire::IntAckCycle,
+    ) -> crate::core::wire::IntAckResponse {
+        self.asked
             .fetch_add(1, crate::core::sync::Ordering::Relaxed);
-        u32::from(self.vector)
+        if cycle.level() == Some(self.level) {
+            self.answer
+        } else {
+            crate::core::wire::IntAckResponse::Declined
+        }
     }
 }
 
 #[test]
 fn a_controller_that_answers_the_acknowledge_vectors_and_one_that_does_not_autovectors() {
-    use crate::core::device::Device;
-    use crate::core::sync::{AtomicU32, Ordering};
-    use crate::core::wire::IntAck;
-
     // Autovector first: nothing attached, so the level picks the vector.
     let board = Board::new();
     board.boot(&[0x4e71, 0x4e71]);
@@ -727,24 +769,128 @@ fn a_controller_that_answers_the_acknowledge_vectors_and_one_that_does_not_autov
     let mut regs = board.cpu.regs();
     regs.sr = (regs.sr & !flags::IPL) | (1 << 8);
     board.cpu.set_regs(regs);
-    let device: Arc<Vectoring> = Arc::new(Vectoring {
-        vector: 64,
-        acknowledged: AtomicU32::new(0),
-    });
-    let weak: alloc::sync::Weak<dyn IntAck> = Arc::downgrade(&device) as _;
-    board.cpu.attach_int_ack("ipl2", weak);
+    let device = Controller::vectoring(5, 64);
+    device.attach(&board.cpu, "ipl2");
     board.cpu.set_ipl(5);
     board.cpu.step();
-    assert_eq!(
-        device.acknowledged.load(Ordering::Relaxed),
-        1,
-        "the CPU must run the acknowledge cycle"
-    );
+    assert_eq!(device.asked(), 1, "the CPU must run the acknowledge cycle");
     assert_eq!(
         board.cpu.regs().pc,
         0x0900,
         "and take the vector the controller drove, not the autovector"
     );
+}
+
+/// The gap this seam was reshaped to close: a 68000 puts the level being
+/// acknowledged on A3-A1, so a board may carry **two** vectoring controllers on
+/// different `IPL` pins and each answers only its own level. With an
+/// acknowledge that carried no argument, whichever controller was attached
+/// second silently answered for both.
+#[test]
+fn two_vectoring_controllers_on_different_ipl_pins_each_answer_their_own_level() {
+    let board = Board::new();
+    // Two RTEs at $400: each handler returns to the next one.
+    board.boot(&[0x4e73, 0x4e73]);
+    board.poke_long(80 * 4, 0x0a00); // the level-2 controller's vector
+    board.poke_long(96 * 4, 0x0b00); // the level-5 controller's vector
+    board.poke_word(0xa00, 0x4e71);
+    board.poke_word(0xb00, 0x4e71);
+
+    // `ipl1` alone encodes level 2, `ipl2` alone encodes level 4 — but the
+    // level a controller claims is its own business, and this one claims 5.
+    let low = Controller::vectoring(2, 80);
+    let high = Controller::vectoring(5, 96);
+    low.attach(&board.cpu, "ipl1");
+    high.attach(&board.cpu, "ipl2");
+
+    let mut regs = board.cpu.regs();
+    regs.sr = (regs.sr & !flags::IPL) | (1 << 8);
+    board.cpu.set_regs(regs);
+    board.cpu.set_ipl(5);
+    board.cpu.step();
+    assert_eq!(
+        board.cpu.regs().pc,
+        0x0b00,
+        "level 5 is the second controller's, and it supplies vector 96"
+    );
+    assert_eq!(low.asked(), 1, "the first controller saw the cycle");
+    assert_eq!(high.asked(), 1, "and declining passed it to the second");
+
+    // And the other way round, which is the half that could not be expressed:
+    // the same processor, a different level, the *other* controller's vector.
+    let mut regs = board.cpu.regs();
+    regs.sr = (regs.sr & !flags::IPL) | (1 << 8);
+    board.cpu.set_regs(regs);
+    board.cpu.set_ipl(2);
+    board.cpu.step();
+    assert_eq!(
+        board.cpu.regs().pc,
+        0x0a00,
+        "level 2 is the first controller's, and it supplies vector 80"
+    );
+    assert_eq!(low.asked(), 2);
+    assert_eq!(
+        high.asked(),
+        1,
+        "a cycle the first controller took never reaches the second"
+    );
+}
+
+/// Being asked and having nothing to supply is not the same as not being asked:
+/// the first is `VPA` and terminates the cycle, the second passes it on.
+#[test]
+fn a_controller_that_asserts_vpa_takes_the_cycle_and_the_one_behind_it_never_sees_it() {
+    let board = Board::new();
+    board.boot(&[0x4e71, 0x4e71]);
+    board.poke_long(u64::from(vector::AUTOVECTOR_BASE + 4) * 4, 0x0c00);
+    board.poke_long(112 * 4, 0x0d00);
+    board.poke_word(0xc00, 0x4e71);
+    board.poke_word(0xd00, 0x4e71);
+
+    // Both are on level 4. The first asserts `VPA`; the second would drive a
+    // vector, and must never be given the chance.
+    let vpa = Controller::autovectoring(4);
+    let vectoring = Controller::vectoring(4, 112);
+    vpa.attach(&board.cpu, "ipl2");
+    vectoring.attach(&board.cpu, "ipl2");
+
+    let mut regs = board.cpu.regs();
+    regs.sr = (regs.sr & !flags::IPL) | (1 << 8);
+    board.cpu.set_regs(regs);
+    board.cpu.set_ipl(4);
+    board.cpu.step();
+    assert_eq!(
+        board.cpu.regs().pc,
+        0x0c00,
+        "`VPA` answers the cycle, and the autovector for level 4 is taken"
+    );
+    assert_eq!(vpa.asked(), 1);
+    assert_eq!(
+        vectoring.asked(),
+        0,
+        "the cycle was over: an answered acknowledge is not passed on"
+    );
+}
+
+/// The same controller offered on two `IPL` pins — which is how level 5 is
+/// encoded — is one controller, asked once.
+#[test]
+fn a_controller_wired_to_two_ipl_pins_answers_one_acknowledge() {
+    let board = Board::new();
+    board.boot(&[0x4e71, 0x4e71]);
+    board.poke_long(96 * 4, 0x0b00);
+    board.poke_word(0xb00, 0x4e71);
+    let device = Controller::vectoring(5, 96);
+    device.attach(&board.cpu, "ipl0");
+    device.attach(&board.cpu, "ipl2");
+
+    let mut regs = board.cpu.regs();
+    regs.sr = (regs.sr & !flags::IPL) | (1 << 8);
+    board.cpu.set_regs(regs);
+    board.cpu.set_ipl(5);
+    board.cpu.step();
+    assert_eq!(board.cpu.regs().pc, 0x0b00);
+    assert_eq!(device.asked(), 1, "offered twice, kept once");
 }
 
 #[test]

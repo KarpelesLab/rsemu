@@ -693,10 +693,15 @@ impl<'a> Exec<'a> {
     /// caller arms one by hand. Either way the vector is *consumed*: the next
     /// acknowledge autovectors again unless something answers again, which is
     /// what asserting `VPA` means and what most 68000 boards do.
+    ///
+    /// What A3-A1 would carry does reach the controllers, though, as
+    /// [`IntAckCycle::at_level`](crate::core::wire::IntAckCycle::at_level): the
+    /// level is the whole reason several controllers can share one processor,
+    /// since each one compares it with its own and declines the rest.
     fn take_interrupt(&mut self, level: u8) {
         let vector = self
             .lines
-            .acknowledge()
+            .acknowledge(level)
             .unwrap_or(vector::AUTOVECTOR_BASE.wrapping_add(level));
         let pc = self.state.pc;
         let sr = self.state.sr;

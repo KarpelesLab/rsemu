@@ -82,7 +82,9 @@ use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region,
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
 use crate::core::value::{Endian, Width};
-use crate::core::wire::{FanIn, IntAck, Level, Resolve, WireId, WireSink, WireSource};
+use crate::core::wire::{
+    FanIn, IntAck, IntAckCycle, IntAckResponse, Level, Resolve, WireId, WireSink, WireSource,
+};
 use crate::machine::realize::Instance;
 use crate::machine::validate::ClassSchema;
 
@@ -731,7 +733,12 @@ impl Registers {
 }
 
 impl IntAck for Registers {
-    fn acknowledge(&self) -> u32 {
+    /// An 8259A answers any acknowledge cycle that reaches it: the part has no
+    /// notion of the priority level a 68000 would present, and on the bus it
+    /// was designed for nothing is presented at all. So `cycle` is not
+    /// inspected — it is only handed on to a slave, because the second `INTA`
+    /// pulse is the same cycle.
+    fn acknowledge(&self, cycle: IntAckCycle) -> IntAckResponse {
         let (vector, delegate) = {
             let mut state = self.state.lock();
             match self.take_request(&mut state) {
@@ -750,16 +757,22 @@ impl IntAck for Registers {
             }
         };
         // Outside the lock, because the slave's acknowledge drops its own `INT`
-        // and that lands straight back on this chip's IR pin.
-        let vector = match delegate.as_ref().and_then(Weak::upgrade) {
-            Some(slave) => slave.acknowledge(),
-            // A cascade level with no slave behind it: the master answers for
-            // itself. That is a machine wired with an ICW3 bit the board does
-            // not have, not something to panic over.
-            None => vector,
-        };
+        // and that lands straight back on this chip's IR pin. The second `INTA`
+        // pulse is this same cycle: whatever the slave drives is the answer,
+        // passed back unchanged.
+        //
+        // The master answers for itself when there is no slave to ask, or when
+        // whatever is wired where a slave belongs declines — an 8259A never
+        // does. A cascade level with nothing behind it is a machine wired with
+        // an ICW3 bit the board does not have, not something to panic over.
+        let response = delegate
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map(|slave| slave.acknowledge(cycle))
+            .filter(|response| response.answered())
+            .unwrap_or(IntAckResponse::Vector(vector));
         self.refresh();
-        vector
+        response
     }
 }
 
@@ -1202,7 +1215,11 @@ mod tests {
         }
 
         fn ack(&self) -> u32 {
-            self.pic.regs.acknowledge()
+            self.pic
+                .regs
+                .acknowledge(IntAckCycle::vector_only())
+                .vector()
+                .expect("an 8259A answers every acknowledge, spuriously if need be")
         }
 
         /// The ELCR's `MemOps`. A second `Elcr` over the same `Registers` is

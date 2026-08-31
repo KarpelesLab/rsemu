@@ -176,7 +176,9 @@ use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{self, AtomicBool, AtomicU32, LockRank, Ordering};
 use crate::core::value::Width;
-use crate::core::wire::{FanIn, IntAck, Level, Resolve, WireId, WireSink};
+use crate::core::wire::{
+    FanIn, IntAck, IntAckCycle, IntAckHandlers, IntAckResponse, Level, Resolve, WireId, WireSink,
+};
 
 use exec::{Exec, State};
 
@@ -1095,11 +1097,17 @@ pub(crate) struct Lines {
     a20_wired: AtomicBool,
     /// What answers the `INTR` acknowledge cycle, if a controller drives it.
     ///
-    /// Weak, and behind its own leaf lock: the machine owns both devices, and a
-    /// CPU that kept its PIC alive would close a cycle nothing could drop
-    /// (`ROADMAP.md` §4.3). Taken and released *before* `acknowledge` is
-    /// called, so the controller is free to take its own locks.
-    ack: sync::Mutex<Option<Weak<dyn IntAck>>>,
+    /// An AT has exactly one controller here — the slave 8259A hangs off the
+    /// master's `IR2`, not off `INTR`, and the master delegates to it inside
+    /// its own acknowledge — but the seam is a list all the same, so a board
+    /// with two controllers wired to one `INTR` net is expressible rather than
+    /// silently mis-served.
+    ///
+    /// Weak references, behind a leaf lock released before each outward call:
+    /// the machine owns both devices, a CPU that kept its PIC alive would close
+    /// a cycle nothing could drop (`ROADMAP.md` §4.3), and the controller is
+    /// free to take its own locks.
+    acks: IntAckHandlers,
 }
 
 impl Default for Lines {
@@ -1112,7 +1120,7 @@ impl Default for Lines {
             reset: AtomicBool::new(false),
             a20_mask: AtomicU32::new(u32::MAX),
             a20_wired: AtomicBool::new(false),
-            ack: sync::Mutex::new(None),
+            acks: IntAckHandlers::new(),
         }
     }
 }
@@ -1191,9 +1199,9 @@ impl Lines {
         !self.a20_wired.load(Ordering::Acquire)
     }
 
-    /// Install what answers the acknowledge cycle on `INTR`.
+    /// Add a controller to those that answer the acknowledge cycle on `INTR`.
     fn attach_ack(&self, ack: Weak<dyn IntAck>) {
-        *self.ack.lock() = Some(ack);
+        self.acks.attach(ack);
     }
 
     /// Run the acknowledge cycle and report the vector.
@@ -1203,14 +1211,19 @@ impl Lines {
     /// latched vector byte cannot do. With nothing attached the latched byte is
     /// the answer, which is what a test driving the pin by hand sets.
     ///
-    /// The lock is released before the outward call: the re-entrancy contract
+    /// The cycle presents nothing — an 8086 puts no level on the bus, it just
+    /// strobes `INTA` twice — so it is an [`IntAckCycle::vector_only`], and a
+    /// controller that answers at all answers with a vector.
+    ///
+    /// No lock is held across the outward call: the re-entrancy contract
     /// forbids holding one across a call into another device (§4.7), and a PIC
     /// answering an acknowledge takes its own.
     pub(crate) fn acknowledge(&self) -> u8 {
-        let handler = self.ack.lock().clone();
-        match handler.and_then(|weak| weak.upgrade()) {
-            Some(ack) => ack.acknowledge() as u8,
-            None => self.intr_vector(),
+        match self.acks.run(IntAckCycle::vector_only()) {
+            IntAckResponse::Vector(vector) => vector as u8,
+            // No autovector on an x86: a cycle nobody terminates reads the
+            // floating bus, which is what the latched byte models.
+            IntAckResponse::Autovector | IntAckResponse::Declined => self.intr_vector(),
         }
     }
 

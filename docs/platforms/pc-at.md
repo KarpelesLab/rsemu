@@ -67,7 +67,10 @@ Both are generic mechanisms in `core::wire`, not PC special cases
   an 8259A never learns its request was taken, so it cannot move it from pending
   to in-service and end-of-interrupt has nothing to clear. It is also how the
   master asks the *slave* for the vector during the second INTA pulse, since the
-  slave's `INT` and the master's `IR2` are one net.
+  slave's `INT` and the master's `IR2` are one net — the same cycle, handed on.
+  The cycle carries what the processor presents while it asks (nothing, on an
+  8086; the interrupt level, on a 68000) and a controller may decline one that
+  is not its own, which is what lets several controllers share one processor.
 - **`DmaPeripheral`** — the data half of a DMA request line. `DRQ` carries a
   level, but the transfer it asks for moves bytes over `DACK` and `IOR`/`IOW`.
   Without it an 8237 can be programmed and can never transfer.

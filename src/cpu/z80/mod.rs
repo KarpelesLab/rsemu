@@ -107,7 +107,9 @@ use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{self, AtomicBool, AtomicU8, AtomicU32, LockRank, Ordering};
 use crate::core::value::Width;
-use crate::core::wire::{FanIn, IntAck, Level, Resolve, WireId, WireSink};
+use crate::core::wire::{
+    FanIn, IntAck, IntAckCycle, IntAckHandlers, IntAckResponse, Level, Resolve, WireId, WireSink,
+};
 
 use exec::{Exec, State};
 
@@ -647,13 +649,19 @@ pub(crate) struct Lines {
     /// access this very core issued — and reaching for the session lock there
     /// would re-enter the core's own critical section (`ROADMAP.md` §4.7).
     reset: AtomicBool,
-    /// What answers the acknowledge cycle, if a device on the `INT` net does.
+    /// What answers the acknowledge cycle, if devices on the `INT` net do.
     ///
-    /// Weak, and behind its own leaf lock: the machine owns both devices, and a
-    /// CPU that kept its peripheral alive would close a cycle nothing could
-    /// drop (§4.3). Taken and released *before* `acknowledge` is called, so the
-    /// peripheral is free to take its own.
-    ack: sync::Mutex<Option<Weak<dyn IntAck>>>,
+    /// A list, because a Z80 machine's peripherals sit in a **daisy chain**:
+    /// `IEI`/`IEO` gives them a priority order, and the acknowledge belongs to
+    /// the highest-priority one that has something pending. Attach order stands
+    /// in for chain order, and a peripheral with nothing to say declines
+    /// ([`IntAckResponse::Declined`]) and passes the cycle down the chain.
+    ///
+    /// Weak references, behind a leaf lock released before each outward call:
+    /// the machine owns both devices, a CPU that kept its peripheral alive
+    /// would close a cycle nothing could drop (§4.3), and the peripheral is
+    /// free to take its own locks.
+    acks: IntAckHandlers,
 }
 
 impl Default for Lines {
@@ -666,7 +674,7 @@ impl Default for Lines {
             // `RST 38` — the historical default a machine gets for free.
             vector: AtomicU8::new(0xff),
             reset: AtomicBool::new(false),
-            ack: sync::Mutex::new(None),
+            acks: IntAckHandlers::new(),
         }
     }
 }
@@ -719,20 +727,29 @@ impl Lines {
         self.reset.swap(false, Ordering::AcqRel)
     }
 
-    /// Install what answers the acknowledge cycle on `INT`.
+    /// Add a device to those that answer the acknowledge cycle on `INT`.
     fn attach_ack(&self, ack: Weak<dyn IntAck>) {
-        *self.ack.lock() = Some(ack);
+        self.acks.attach(ack);
     }
 
-    /// Run the acknowledge cycle and report the byte the device drove.
+    /// Run the acknowledge cycle in interrupt mode `mode` and report the byte
+    /// the device drove.
     ///
-    /// The lock is released before the outward call: the re-entrancy contract
+    /// The mode travels with the cycle: what the CPU does with the byte is
+    /// wholly different in modes 0, 1 and 2, and a peripheral is entitled to
+    /// know which it is answering into. With nothing attached — or nothing that
+    /// claims the chain — the latched byte is the answer, which is what a
+    /// machine with one fixed source sets once and what an idle bus with
+    /// pull-ups reads as.
+    ///
+    /// No lock is held across the outward call: the re-entrancy contract
     /// forbids holding one across a call into another device (§4.7).
-    pub(crate) fn acknowledge(&self) -> u8 {
-        let handler = self.ack.lock().clone();
-        match handler.and_then(|weak| weak.upgrade()) {
-            Some(ack) => ack.acknowledge() as u8,
-            None => self.vector(),
+    pub(crate) fn acknowledge(&self, mode: u8) -> u8 {
+        match self.acks.run(IntAckCycle::data_bus(mode)) {
+            IntAckResponse::Vector(byte) => byte as u8,
+            // A Z80 has no `VPA`: a cycle nobody drives leaves the data pins
+            // floating, and the latch is what models that floating bus.
+            IntAckResponse::Autovector | IntAckResponse::Declined => self.vector(),
         }
     }
 
