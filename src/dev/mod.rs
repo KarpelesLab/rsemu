@@ -17,6 +17,8 @@
 //! | [`nes`] | `dev-nes-io` | the console's own I/O: controller ports, OAM DMA |
 //! | [`pc`] | `dev-pc` | an IBM PC/AT board's chips: 8259A, 8254, 8042, MC146818, 8237A, the firmware socket |
 //! | [`ppu`] | `dev-nes-ppu` | the RP2C02 picture unit: the per-dot pipeline |
+//! | [`lcd`] | `dev-lcdc` | a generic RGB scanout engine: framebuffer in, `Scanout` out |
+//! | [`sitronix`] | `dev-st7272a` | the ST7272A TFT panel driver: SPI register configuration, no pixel path |
 //! | [`riscv`] | `dev-riscv` | the RISC-V `virt` board: CLINT, PLIC, 16550, virtio, and the device tree generator |
 //! | [`wdc`] | `dev-wdc` | the W65C51N ACIA and W65C22 VIA, and a 6502 board's ROM |
 //!
@@ -51,6 +53,14 @@ pub mod pc;
 #[cfg(feature = "dev-nes-ppu")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-ppu")))]
 pub mod ppu;
+
+#[cfg(feature = "dev-lcdc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-lcdc")))]
+pub mod lcd;
+
+#[cfg(feature = "dev-st7272a")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-st7272a")))]
+pub mod sitronix;
 
 #[cfg(feature = "dev-riscv")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-riscv")))]

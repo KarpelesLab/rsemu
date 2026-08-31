@@ -23,7 +23,8 @@
 //! ```
 //!
 //! The device side is one small adapter per display device
-//! ([`nes::NesScanout`] is the first); the host side never learns which machine
+//! ([`nes::NesScanout`] is the first, [`lcd::LcdScanout`] the second); the host
+//! side never learns which machine
 //! it is looking at. A Game Boy's LCD, a VGA card and a virtio-gpu each add an
 //! adapter and nothing else changes.
 //!
@@ -78,6 +79,10 @@
 //! buffer is actually indexed.
 
 pub mod palette;
+
+#[cfg(feature = "dev-lcdc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-lcdc")))]
+pub mod lcd;
 
 #[cfg(feature = "dev-nes-ppu")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-ppu")))]

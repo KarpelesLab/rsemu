@@ -138,6 +138,46 @@ dev-wdc = []
 # dependencies.
 machine-beneater = ["cpu-mos6502", "dev-wdc"]
 
+# The SPI bus (src/bus/spi): the fabric, the peripheral seam, and a generic
+# memory-mapped controller. Models the link **both ways** and makes the choice a
+# machine-description property rather than an accident (docs/buses/low-speed.md):
+# `transactional` hands a whole word to the slave in one call, `wired` drives
+# SCK/MOSI/CS as real wires one edge per half bit period on the scheduler, which
+# is what guest firmware that bit-bangs the same pins through GPIO needs. Covers
+# the four CPOL/CPHA modes, 1-32 bit words, MSB/LSB first, eight chip selects and
+# genuine full duplex. A peripheral implements the word-level `SpiSlave` once and
+# gets the bit-level front end free. `no_std + alloc`, no dependencies.
+bus-spi = []
+
+# The Sitronix ST7272A (src/dev/sitronix): a 320RGBx240 dual-gate TFT panel
+# driver, configured over 3-wire SPI. Its **SPI carries registers only** —
+# power, gamma, contrast, brightness, scan direction, standby — while pixels
+# arrive on a separate parallel-RGB input, which is what makes it unlike an
+# ST7735 or ST7789 and why this device has no framebuffer and no scanout. The
+# full register map of datasheet v0.5 §8.1, VSYNC-latched command shadowing
+# (§7.1(c)), the BIST patterns (§12.1), and the colour pipeline of §8.2.2-§8.2.7
+# so a firmware that dims the panel produces a dimmer picture. Needs `bus-spi`.
+dev-st7272a = ["bus-spi"]
+
+# A generic RGB scanout engine (src/dev/lcd): the half of a display path that
+# owns *where the pixels are* — a framebuffer base in an address space, a
+# geometry, a pixel format, a stride, and a frame period derived from a clock
+# domain — reading guest memory directly and presenting `host::display::Scanout`.
+# The parallel-RGB link itself is deliberately **not** modelled: no guest can
+# observe a pixel clock or a DE edge, so it is three numbers rather than a bus.
+# A real SoC's display controller is a thin register wrapper over this engine.
+# `no_std + alloc`, no dependencies.
+dev-lcdc = []
+
+# The `spi-panel` board (machines/spi-panel.machine plus the classes it names):
+# an RV32 hart, RAM holding a framebuffer, an SPI controller, a Sitronix ST7272A
+# on the far end of it, and a scanout engine that turns the framebuffer into a
+# picture. It models no product — it exists so the SPI bus and the display
+# devices have somewhere real to run, and so `rsemu run spi-panel` draws
+# something. The machine file writes down which SPI modelling style it uses, and
+# `-p link=transactional` switches it. Adds no dependencies.
+machine-spi-panel = ["cpu-riscv", "bus-spi", "dev-st7272a", "dev-lcdc"]
+
 # The MOS 6502 core (src/cpu/mos6502): a cycle-accurate interpreter with every
 # documented and undocumented opcode, a disassembler generated from the same
 # table, and the RP2A03 (NES) variant selected by a construction property. Adds

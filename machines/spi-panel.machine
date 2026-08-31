@@ -1,0 +1,212 @@
+# spi-panel — a minimal SoC-shaped board with an SPI display.
+#
+#   rsemu run spi-panel --media firmware=fw.bin
+#   rsemu run spi-panel --media firmware=fw.bin -p link=transactional
+#
+# The smallest machine that exercises a whole display path: a hart, some RAM
+# holding a framebuffer, an SPI controller, a Sitronix ST7272A panel on the far
+# end of it, and a scanout engine that reads the framebuffer and hands a host a
+# picture. It models no product. It exists so that the SPI bus and the display
+# devices have somewhere real to run, and so that `rsemu run` can draw something.
+#
+# ---------------------------------------------------------------------------
+# The one decision this file is written to make explicit
+# ---------------------------------------------------------------------------
+#
+# `docs/buses/low-speed.md` asks for it by name: SPI is a timing protocol on
+# wires, most emulators model it transactionally, that is much faster and
+# usually fine — and some guest firmware bit-bangs the lines through GPIO and
+# will notice. So the choice is a parameter, and the default is written down
+# rather than inherited.
+#
+#   link = "wired"          the default here. The controller drives SCK, MOSI
+#                           and CS as real wires, one edge per half bit period,
+#                           paced by the scheduler. Slower, and what firmware
+#                           that also pokes the pins itself requires. This board
+#                           defaults to it because it is the path most worth
+#                           having under test.
+#
+#   link = "transactional"  one call per sixteen-bit word straight to the panel,
+#                           no wires moved. The ordinary fast model.
+#
+# **A transfer costs the same virtual time either way** — `bits x 2 x (CLKDIV+1)`
+# ticks of `sysclk` — so firmware that polls the controller's BUSY flag sees the
+# same timing under both. What differs is only whether the individual edges
+# exist for anything else to watch.
+#
+# Both attachments are declared below, because a `.machine` file is static and a
+# `param` chooses a property rather than whether a statement exists. Whichever
+# the controller is not using simply sits idle: in `transactional` the wires
+# rest at their idle levels, and in `wired` nothing ever drives the named bus.
+#
+# ---------------------------------------------------------------------------
+# What is modelled, and what is not
+# ---------------------------------------------------------------------------
+#
+# The **ST7272A's SPI carries registers only** — brightness, contrast, gamma,
+# scan direction, power sequencing. It holds no framebuffer; its datasheet's
+# block diagram (§5) has no frame memory in it and its whole register map (§8.1)
+# has no memory-write command. Pixels reach a real panel over a separate
+# parallel-RGB link. `src/dev/sitronix/st7272a.rs` sets out that evidence.
+#
+# That link is **not modelled**, deliberately: no guest can observe a pixel
+# clock, a DE edge or an HSYNC. So `lcd.scanout` reads the framebuffer straight
+# out of `mem` and presents it, and "parallel RGB" is a geometry, a pixel format
+# and a frame period rather than a bus. See `src/dev/lcd/scanout.rs`.
+#
+# The two devices are consequently **independent today**: the panel records its
+# parameters and can apply them to a pixel, but nothing hands it the scanout
+# engine's pixels, because one device reaching another's typed handle is a
+# `core::device` seam that does not exist yet. When it lands, the engine calls
+# `St7272a::apply` and a firmware that dims the panel over SPI produces a dimmer
+# PNG. Until then, writing brightness is checked by the panel's own tests and is
+# not visible in the picture, and this file would rather say so.
+
+machine "spi-panel" {
+  # Which modelling style the SPI link uses. See the note above; this is the
+  # decision `docs/buses/low-speed.md` asks not to make by accident.
+  param link = "wired"
+
+  # Which named SPI bus the controller and the panel meet on, so that two of
+  # these can run in one process without talking over each other
+  # (`-p spibus=b`). The same reason `riscv-virt` parameterises its console: the
+  # rendezvous table in `bus::spi::buses` is process-wide until `core::bus`
+  # exists.
+  param spibus = "spi0"
+
+  # How much RAM the board has. The framebuffer lives at the bottom of it.
+  param ram = 4M
+
+  # Where the framebuffer starts. A property rather than a constant, because a
+  # guest normally programs the controller's BASE register and this is only the
+  # value it comes out of reset with.
+  param fb = 0x10000000
+
+  # The panel's geometry. The ST7272A of the datasheet is 320RGB x 240 (§2), and
+  # a board pairing the driver with another panel changes it here.
+  param width  = 320
+  param height = 240
+
+  # -- crystals --------------------------------------------------------------
+  #
+  # Two, because the board has two: a system clock the hart and the SPI
+  # controller run from, and a pixel clock for the display. They are separate
+  # oscillator trees, which is the physical truth — a display dot clock is its
+  # own can, and no correct program can depend on its phase against the CPU
+  # (ROADMAP.md §4.2).
+  osc sysclk = 100000000 Hz
+
+  # 6 MHz is the ST7272A's *typical* DCLK for the parallel 24-bit interface
+  # (datasheet §7.3.4: Fclk min 5, typ 6, max 8 MHz). With the same table's
+  # typical periods — Th = 371 DCLK, Tv = 260 HSYNC — one frame is 96,460 ticks,
+  # which is 16.077 ms, or 62.2 frames a second. Not 60: the real number, from
+  # the real table, arrived at by exact integer arithmetic.
+  osc dclk = 6000000 Hz
+
+  # -- the bus ---------------------------------------------------------------
+  #
+  # One flat 32-bit space. `unassigned` is left at its default of `fault`, so an
+  # access to a hole is an access fault the guest can see rather than a
+  # plausible-looking zero — which hides our memory-map bugs as well as the
+  # guest's.
+  space mem { width = 32 }
+
+  # -- the hart --------------------------------------------------------------
+  #
+  # RV32IMA, which is enough to run a firmware image and nothing more. There is
+  # no interrupt controller on this board and nothing raises one: the display
+  # path here is entirely polled.
+  object cpu "cpu.riscv" {
+    clock  = sysclk
+    space  = mem
+    engine = "interp"
+    xlen   = "rv32"
+    isa    = "ima"
+    hartid = 0
+    reset  = 0x00000000
+  }
+
+  # -- memory ----------------------------------------------------------------
+  #
+  # 64 KiB of firmware ROM at zero, which is where the hart starts. `image`
+  # names a media slot: whoever runs the machine binds the bytes
+  # (`--media firmware=fw.bin`), and nothing below host/ opens a file.
+  object fw "rom" { size = 64K, image = "firmware" }
+
+  object dram "ram" { size = ram }
+
+  # -- the SPI controller ----------------------------------------------------
+  #
+  # Clocked from the system clock, so a transfer's duration is counted in the
+  # same ticks the hart's instructions are. One chip select, for the panel.
+  object spi "spi.controller" {
+    clock        = sysclk
+    link         = link
+    bus          = spibus
+    chip-selects = 1
+  }
+
+  # -- the panel -------------------------------------------------------------
+  #
+  # On the pixel clock, because its one piece of timed behaviour is the command
+  # latch: datasheet §7.1(c), "commands are established by the VSYNC signal", so
+  # a write lands in a shadow bank and the panel adopts it at the next frame
+  # boundary. `htotal` and `vtotal` are §7.3.4's typicals, and their product is
+  # where that boundary falls.
+  object panel "sitronix.st7272a" {
+    clock  = dclk
+    width  = width
+    height = height
+    htotal = 371
+    vtotal = 260
+    bus    = spibus
+    cs     = 0
+  }
+
+  # -- the display controller ------------------------------------------------
+  #
+  # A bus master: it reads the framebuffer out of `mem` itself, so it declares
+  # the space DMA traverses (ROADMAP.md §4.4). Same clock and same totals as the
+  # panel, because on a real board the controller *is* what generates the
+  # panel's pixel clock and sync — it is the same timing seen from the other end.
+  #
+  # This register block is rsemu's own generic one, not any SoC's. A specific
+  # SoC's display controller is a thin wrapper over the same engine.
+  object lcdc "lcd.scanout" {
+    clock  = dclk
+    space  = mem
+    width  = width
+    height = height
+    htotal = 371
+    vtotal = 260
+    base   = fb
+    format = "rgb888"
+  }
+
+  # -- the memory map --------------------------------------------------------
+  map mem 0x00000000 size 64K  = fw     # reset vector and firmware
+  map mem 0x10000000 size ram  = dram   # RAM, framebuffer at the bottom
+  # Both register blocks are smaller than their window and neither decodes the
+  # address bits above its own, so each answers over and over through it — which
+  # is what a peripheral on a coarsely decoded SoC bus does, and what `mirror()`
+  # says.
+  map mem 0xf0000000 size 4K   = mirror(spi)   # 6 registers, 170 times over
+  map mem 0xf0001000 size 4K   = mirror(lcdc)  # 8 registers, 128 times over
+
+  # -- the SPI wires ---------------------------------------------------------
+  #
+  # Used when `link = "wired"`, idle otherwise. `SDA` is one bidirectional pin
+  # on the real part; it is split into `mosi` and `miso` here because an rsemu
+  # wire has fixed drivers and cannot be tri-stated, and a 3-wire controller
+  # ties the two together outside the chip.
+  wire spi.sck    -> panel.sck
+  wire spi.mosi   -> panel.mosi
+  wire spi.cs0    -> panel.cs
+  wire panel.miso -> spi.miso
+
+  # Not wired, and deliberately: the panel's `grb`, `disp` and `bist_en` pins.
+  # This board ties GRB and DISP high and BIST_EN low, which is what an unwired
+  # control pin already means (see `src/dev/sitronix/st7272a.rs`), so naming
+  # them here would add three nets that never change. Firmware turns the display
+  # on through register 10h instead, which is the interesting path.
+}

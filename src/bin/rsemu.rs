@@ -261,6 +261,15 @@ fn run(args: &[String]) -> ExitCode {
         }
     }
 
+    // Same for a `firmware` slot. `spi-panel` is a demonstration board rather
+    // than a product, so `rsemu run spi-panel` with no arguments draws its own
+    // test picture instead of executing an empty ROM.
+    if !images.iter().any(|(slot, _)| slot == "firmware")
+        && let Some(image) = builtin_firmware(&parsed.machine)
+    {
+        images.push((String::from("firmware"), image));
+    }
+
     // A path wins over a catalog name, so a user editing a copy of a shipped
     // file gets their copy.
     let (name, source) = match load_description(&parsed.machine) {
@@ -687,6 +696,27 @@ fn load_description(what: &str) -> Result<(String, String), String> {
 /// demonstrate itself with nothing whose licence anyone has to think about).
 /// `Ok(None)` means this build has no image to offer, which is not an error:
 /// the machine may not want a `rom` slot at all.
+/// The image a machine's `firmware` slot falls back to, if it has one.
+///
+/// Unlike [`builtin_rom`] there is no monitor to choose between: this is one
+/// board's own demonstration program.
+fn builtin_firmware(machine: &str) -> Option<Vec<u8>> {
+    let stem = machine
+        .rsplit('/')
+        .next()
+        .unwrap_or(machine)
+        .strip_suffix(".machine")
+        .unwrap_or_else(|| machine.rsplit('/').next().unwrap_or(machine));
+    match stem {
+        #[cfg(feature = "machine-spi-panel")]
+        "spi-panel" => Some(rsemu::dev::lcd::demo::PANEL_DEMO.to_vec()),
+        _ => {
+            let _ = stem;
+            None
+        }
+    }
+}
+
 fn builtin_rom(monitor: Option<&str>, machine: &str) -> Result<Option<Vec<u8>>, String> {
     // The Woz Monitor is only ported to one of these boards, so `wozmon` is
     // answered from the module that has it rather than per machine.

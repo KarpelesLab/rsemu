@@ -45,6 +45,7 @@
 
 extern crate alloc;
 
+pub mod bus;
 pub mod core;
 pub mod cpu;
 pub mod dev;

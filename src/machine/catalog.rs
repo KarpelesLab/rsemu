@@ -146,6 +146,22 @@ pub static GAMEBOY: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/gameboy.machine"),
 };
 
+/// The `spi-panel` board, when this build has a hart, the SPI bus and the
+/// display devices.
+///
+/// A synthetic board rather than a product: the smallest machine that exercises
+/// a whole display path, and the place the SPI bus and the ST7272A are actually
+/// run. The `firmware` slot takes whatever should be at `0x00000000`, where the
+/// hart resets to.
+#[cfg(feature = "machine-spi-panel")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-spi-panel")))]
+pub static SPI_PANEL: CatalogEntry = CatalogEntry {
+    name: "spi-panel",
+    summary: "a minimal SoC-shaped board: RV32, SPI, a Sitronix ST7272A panel and a scanout engine",
+    media: &["firmware"],
+    source: include_str!("../../machines/spi-panel.machine"),
+};
+
 /// Every machine this build can realize, in catalog order.
 // One `#[cfg]`-gated push per shipped machine, which is what the lint is
 // complaining about: a `vec![]` literal cannot carry an attribute on one of its
@@ -167,6 +183,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&NES_PAL);
     #[cfg(feature = "machine-riscv-virt")]
     out.push(&RISCV_VIRT);
+    #[cfg(feature = "machine-spi-panel")]
+    out.push(&SPI_PANEL);
     out
 }
 
@@ -213,6 +231,12 @@ pub fn registry() -> Result<Registry> {
     crate::cpu::x86::register(&mut reg)?;
     #[cfg(feature = "dev-pc")]
     crate::dev::pc::register(&mut reg)?;
+    #[cfg(feature = "bus-spi")]
+    crate::bus::spi::controller::register(&mut reg)?;
+    #[cfg(feature = "dev-st7272a")]
+    crate::dev::sitronix::register(&mut reg)?;
+    #[cfg(feature = "dev-lcdc")]
+    crate::dev::lcd::register(&mut reg)?;
     Ok(reg)
 }
 
@@ -272,6 +296,12 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::wdc::bind(&mut b)?;
     #[cfg(feature = "dev-pc")]
     crate::dev::pc::bind(&mut b)?;
+    #[cfg(feature = "bus-spi")]
+    crate::bus::spi::controller::bind(&mut b)?;
+    #[cfg(feature = "dev-st7272a")]
+    crate::dev::sitronix::bind(&mut b)?;
+    #[cfg(feature = "dev-lcdc")]
+    crate::dev::lcd::bind(&mut b)?;
     Ok(b)
 }
 
@@ -314,8 +344,18 @@ pub fn classes() -> ClassTable {
     for schema in crate::dev::wdc::schemas() {
         table.insert(schema);
     }
+    #[cfg(feature = "bus-spi")]
+    table.insert(crate::bus::spi::controller::schema());
+    #[cfg(feature = "dev-st7272a")]
+    for schema in crate::dev::sitronix::schemas() {
+        table.insert(schema);
+    }
     #[cfg(feature = "dev-pc")]
     for schema in crate::dev::pc::schemas() {
+        table.insert(schema);
+    }
+    #[cfg(feature = "dev-lcdc")]
+    for schema in crate::dev::lcd::schemas() {
         table.insert(schema);
     }
     table
@@ -928,6 +968,11 @@ mod tests {
             // supplies the programs that actually do something.
             #[cfg(feature = "machine-riscv-virt")]
             ("riscv-virt", "firmware") => &[0x73, 0x00, 0x50, 0x10, 0x6f, 0xf0, 0xdf, 0xff],
+            // The board's own demo: it configures the panel over SPI, paints a
+            // gradient and enables the scanout engine. Assembled at compile
+            // time by `dev::lcd::demo`, so it needs no toolchain either.
+            #[cfg(feature = "machine-spi-panel")]
+            ("spi-panel", "firmware") => crate::dev::lcd::demo::PANEL_DEMO,
             (m, other) => panic!("no fixture for `{m}`'s media slot `{other}`"),
         }
     }
