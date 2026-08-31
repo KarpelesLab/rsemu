@@ -719,6 +719,48 @@ fn the_virtio_block_device_is_discoverable_and_serves_a_read() {
 // firmware fetched at test time
 // ---------------------------------------------------------------------------
 
+/// Splice one more image into a machine source: a `riscv.loader` at `addr`,
+/// and — when `addr` falls outside DRAM — the RAM to hold it.
+///
+/// The shipped board has exactly one firmware image because that is what a
+/// board *is*. A supervisor-mode payload is a second one, and staging it is a
+/// property of the experiment rather than of the machine, so it is spliced in
+/// here instead of becoming a media slot every `rsemu run riscv-virt` would
+/// have to bind. Two shapes have been wanted:
+///
+/// * a Linux `Image` at `0x80200000`, which is where OpenSBI's `fw_jump` hands
+///   control on, and which is inside DRAM;
+/// * a UEFI firmware volume at `0x20000000`, which is not — on a real `virt`
+///   board that window is NOR flash, and the closest thing this board can
+///   offer is RAM, which reads identically and differs only in that a CFI
+///   erase-and-program sequence lands in it as plain data.
+///
+/// Appended last, deliberately: `Machine::reset` runs devices in declaration
+/// order and a cold reset clears RAM, so a loader declared before the region it
+/// writes into would have its image erased by the reset that ends realize.
+#[cfg(feature = "std")]
+fn with_payload(source: &str, index: usize, slot: &str, addr: u64, len: u64) -> String {
+    let end = source
+        .rfind('}')
+        .expect("a machine description ends with a brace");
+    let mut out = String::from(&source[..end]);
+    if addr < DRAM {
+        // Round up to a megabyte so the map statement is readable and a
+        // firmware volume that expects its whole aperture finds one.
+        let size = len.next_multiple_of(0x10_0000).max(0x10_0000);
+        out.push_str(&alloc::format!(
+            "\n  object staging{index} \"ram\" {{ size = {size} }}\n  map mem {addr:#x} size \
+             {size:#x} = staging{index}\n"
+        ));
+    }
+    out.push_str(&alloc::format!(
+        "\n  object payload{index} \"riscv.loader\" {{\n    space = mem\n    image = \
+         \"{slot}\"\n    addr  = {addr:#x}\n  }}\n"
+    ));
+    out.push_str(&source[end..]);
+    out
+}
+
 /// Boot whatever `RSEMU_RISCV_FIRMWARE` points at and report what it printed.
 ///
 /// Skipped, cleanly, when the variable is unset — which is every ordinary
@@ -728,6 +770,13 @@ fn the_virtio_block_device_is_discoverable_and_serves_a_read() {
 /// fixture whose licence has not been checked, and this one is fetched even
 /// though its licence is fine, because the rule is about the repository rather
 /// than about any one file.
+///
+/// `RSEMU_RISCV_PAYLOAD` stages further images, as a comma-separated list of
+/// `addr:path`. That is how a supervisor-mode guest is booted: `fw_jump.bin` as
+/// the firmware, and a Linux `Image` at `0x80200000` — where OpenSBI hands
+/// control on — as the payload. An address outside DRAM gets RAM spliced in
+/// under it, which is how a UEFI build meant for the board's NOR flash is
+/// staged.
 #[cfg(feature = "std")]
 #[test]
 fn firmware_from_the_environment_reaches_its_console() {
@@ -741,11 +790,27 @@ fn firmware_from_the_environment_reaches_its_console() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2_000_000);
+    let spec = std::env::var("RSEMU_RISCV_PAYLOAD").unwrap_or_default();
+    let payloads: Vec<(u64, Vec<u8>)> = spec
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|item| {
+            let (addr, path) = item
+                .split_once(':')
+                .unwrap_or_else(|| panic!("`{item}` is not `addr:path`"));
+            let addr = u64::from_str_radix(addr.trim().trim_start_matches("0x"), 16)
+                .unwrap_or_else(|e| panic!("`{addr}` is not a hexadecimal address: {e}"));
+            let bytes =
+                std::fs::read(path.trim()).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+            eprintln!("payload {addr:#x}: {path} ({} bytes)", bytes.len());
+            (addr, bytes)
+        })
+        .collect();
 
     let console_name = String::from("test.riscv.console.firmware");
     let power_name = String::from("test.riscv.power.firmware");
     let entry = catalog::machine("riscv-virt").expect("shipped");
-    let options = catalog::build_options()
+    let mut options = catalog::build_options()
         .expect("catalog")
         .with_media("firmware", image.as_slice())
         .with_param("console", console_name.clone())
@@ -756,9 +821,15 @@ fn firmware_from_the_environment_reaches_its_console() {
             std::env::var("RSEMU_RISCV_BOOTARGS")
                 .unwrap_or_else(|_| String::from("console=ttyS0 earlycon=sbi")),
         );
+    let mut source = String::from(entry.source);
+    for (i, (addr, bytes)) in payloads.iter().enumerate() {
+        let slot = alloc::format!("payload{i}");
+        source = with_payload(&source, i, &slot, *addr, bytes.len() as u64);
+        options.realize.media.insert(slot, bytes.as_slice());
+    }
     let machine = crate::machine::build(
         entry.name,
-        entry.source,
+        &source,
         &catalog::registry().expect("catalog"),
         &options,
     )

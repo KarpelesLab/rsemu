@@ -33,3 +33,47 @@ hidden convention to reverse-engineer.
   are the ABI between them.
 - Networking comes from `pktkit` behind virtio-net; storage from `fstool`
   behind virtio-blk. Neither needs board-specific code.
+- The hart's `time` CSR reads the CLINT's `mtime`, through `timer = clint` in
+  the machine file. `time` is architecturally a *view* of the platform timer,
+  not a counter the hart owns, and before that line existed `rdtime` read zero
+  — which every kernel that takes its clocksource from it turns into an
+  immediately-expired deadline and a live-lock. The wiring is
+  [`Device::export`](../../src/core/device.rs), and it is named explicitly
+  rather than searched for.
+
+## Booting something real
+
+Everything below is fetched, never committed
+(`scripts/fetch-testdata.sh riscv linux`), and gated behind environment
+variables so an ordinary `cargo test` skips it.
+
+```console
+$ export TD=testdata/riscv
+$ RSEMU_RISCV_FIRMWARE=$TD/fw_jump.bin \
+  RSEMU_RISCV_PAYLOAD=0x80200000:$TD/linux \
+  RSEMU_RISCV_RAM=1G RSEMU_RISCV_QUANTA=8000000 \
+  cargo test --release --all-features firmware_from_the --lib -- --nocapture
+```
+
+OpenSBI's `fw_jump` runs at `0x80000000` and hands control to `0x80200000` in
+S-mode, which is where a RISC-V `Image` expects to be.
+
+**UEFI** works too, with one splice. `edk2-riscv-code.fd` from EDK2's
+`OvmfPkg/RiscVVirt` (BSD-2-Clause-Patent) is built for the board's NOR flash at
+`0x20000000`, and `fw_jump`'s hand-off address is fixed at build time, so an
+eight-byte trampoline at `0x80200000` bridges the two — `lui t0, 0x20000` then
+`jr t0`, which leaves `a0` (hart id) and `a1` (device tree) exactly as OpenSBI
+set them. The payload list stages RAM under any address outside DRAM, so the
+flash windows come up as plain memory:
+
+```console
+$ printf '\xb7\x02\x00\x20\x67\x80\x02\x00' > $TD/tramp.bin
+$ RSEMU_RISCV_FIRMWARE=$TD/fw_jump.bin \
+  RSEMU_RISCV_PAYLOAD="0x80200000:$TD/tramp.bin,0x20000000:$TD/edk2-riscv-code.fd,0x22000000:$TD/edk2-riscv-vars.fd" \
+  RSEMU_RISCV_RAM=512M RSEMU_RISCV_QUANTA=3000000 \
+  cargo test --release --all-features firmware_from_the --lib -- --nocapture
+```
+
+The variable store is RAM rather than CFI flash, so UEFI variables are readable
+but not durably writable. That is a missing device (`dev/flash/cfi`), not a
+missing mechanism.

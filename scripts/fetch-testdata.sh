@@ -51,6 +51,16 @@ readonly OPENSBI_DEB="https://deb.debian.org/debian/pool/main/o/opensbi/opensbi_
 readonly OPENSBI_DEB_SHA="dc4a43bd21a0ca11771ed8b19ee6fa8476d1d0f4976bd0b27c0357c699d27e1e"
 readonly OPENSBI_MEMBER="./usr/lib/riscv64-linux-gnu/opensbi/generic/fw_jump.bin"
 
+# A riscv64 Linux kernel, to boot on top of that firmware. The Debian
+# installer's, because it is a bare `Image` with an EFI stub rather than a
+# distribution package that has to be unpacked, and because it is rebuilt
+# rarely enough to be a stable target.
+#
+# GPL-2.0. FETCH-ONLY, and that is the whole point of this script: running a
+# GPL kernel as an emulated guest is ordinary use, while committing it here
+# would be redistribution under its terms (ROADMAP.md §1).
+readonly LINUX_IMAGE_URL="https://deb.debian.org/debian/dists/trixie/main/installer-riscv64/current/images/netboot/debian-installer/riscv64/linux"
+
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
@@ -392,6 +402,58 @@ opensbi_hint() {
 	note "      rsemu run riscv-virt --media firmware=$1"
 }
 
+linux_notice() {
+	local dir="$1" text="$2"
+	mkdir -p "$dir"
+	printf '%s\n' "$text" >"${dir}/PROVENANCE-linux.txt"
+}
+
+fetch_linux() {
+	need curl
+	local dest="${DEST_ROOT}/riscv"
+	local target="${dest}/linux"
+	mkdir -p "$dest"
+
+	if [ "$FORCE" = 0 ] && [ -s "$target" ]; then
+		ok "linux already present ($(wc -c <"$target" | tr -d ' ') bytes)"
+	else
+		note "  downloading linux (about 30 MiB) ..."
+		download "$LINUX_IMAGE_URL" "$target"
+	fi
+
+	# No checksum: Debian rebuilds the installer kernel and pinning one would
+	# make this script fail every point release. The header is the check that
+	# matters anyway — a RISC-V `Image` carries "RISCV" at offset 0x30 and
+	# "RSC\x05" at 0x38 (the boot-image header in Documentation/riscv), which
+	# an HTML error page does not.
+	local magic
+	magic="$(dd if="$target" bs=1 skip=48 count=5 2>/dev/null || true)"
+	if [ "$magic" != "RISCV" ]; then
+		rm -f "$target"
+		die "that is not a RISC-V Linux Image: no RISCV magic at offset 0x30"
+	fi
+	ok "linux ($(wc -c <"$target" | tr -d ' ') bytes)"
+	# A separate file: this directory already holds OpenSBI's notice, and the
+	# two licences are not the same one.
+	linux_notice "$dest" "Debian installer riscv64 kernel
+${LINUX_IMAGE_URL}
+
+Licence: GPL-2.0. FETCH-ONLY — running it as an emulated guest is ordinary
+use; committing it to this repository would be redistribution under its terms
+(ROADMAP.md section 1).
+
+A flat RISC-V \`Image\` with an EFI stub, loaded at 0x80200000, which is where
+OpenSBI's fw_jump hands control on in S-mode.
+
+Consumed by RSEMU_RISCV_PAYLOAD in src/dev/riscv/tests.rs."
+	note ""
+	note "  Boot it:"
+	note "      RSEMU_RISCV_FIRMWARE=${dest}/fw_jump.bin \\"
+	note "      RSEMU_RISCV_PAYLOAD=0x80200000:${target} \\"
+	note "      RSEMU_RISCV_RAM=1G RSEMU_RISCV_QUANTA=4000000 \\"
+	note "          cargo test --release --all-features firmware_from_the --lib -- --nocapture"
+}
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -406,10 +468,12 @@ Suites:
   accuracycoin   AccuracyCoin.nes + README     (MIT, (c) 2025 Chris Siebert)
   wozmon         the Apple 1 monitor           (licence unclear, BRING YOUR OWN)
   opensbi        RISC-V firmware for riscv-virt (BSD-2-Clause, redistributable)
+  linux          riscv64 Linux Image to boot on it (GPL-2.0, FETCH-ONLY)
 
 Options:
   --all               fetch every suite (the default when none is named).
-                      Excludes wozmon, which has no source to fetch from.
+                      Excludes wozmon, which has no source to fetch from,
+                      and linux, which is 30 MiB nothing else needs.
   --force             re-fetch even if a verified copy is present
   --wozmon-url URL    wozmon only: where to fetch a 256-byte monitor image
                       from. There is no default and there will not be one;
@@ -484,6 +548,7 @@ for suite in "${SUITES[@]}"; do
 		accuracycoin|coin) fetch_accuracycoin ;;
 		wozmon|apple1) fetch_wozmon ;;
 		opensbi|riscv) fetch_opensbi ;;
+		linux|kernel) fetch_linux ;;
 		*) die "unknown suite $suite (try --help)" ;;
 	esac
 done
