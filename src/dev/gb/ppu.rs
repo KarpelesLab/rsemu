@@ -126,6 +126,30 @@ pub const OAM_SCAN_DOTS: u64 = 80;
 /// The shortest mode 3 can be: no scroll, no window, no objects.
 pub const MODE3_MIN_DOTS: u64 = 172;
 
+/// How far the mode the *CPU* can see lags the one the controller is in.
+///
+/// One machine cycle. The controller's own mode signal drives the `STAT`
+/// interrupt conditions and the fetcher; what reaches `STAT`'s mode bits and the
+/// video/object memory gates is that signal registered, so it arrives four dots
+/// later. Both halves are measured, and they disagree by exactly this:
+///
+/// * `intr_2_0_timing` times the mode-2 `STAT` interrupt against the mode-0
+///   `STAT` interrupt and puts them 63 machine cycles apart, which is
+///   `(80 + 172) / 4` — the *unlagged* boundaries.
+/// * `intr_2_mode3_timing`, `intr_2_mode0_timing` and `intr_2_oam_ok_timing`
+///   time the same mode-2 interrupt against a **read** — of `STAT`'s mode bits
+///   in the first two, of object memory in the third — and put the change one
+///   machine cycle later than that.
+///
+/// Reading the mode bits and reading object memory give the same answer, which
+/// is what says the lag is one registered signal rather than a quirk of the
+/// `STAT` register: the gate and the register are downstream of the same latch.
+/// `hblank_ly_scx_timing` then pins `LY` as *not* lagging — it times the mode-0
+/// interrupt against an `LY` read and the unlagged numbers are the ones that
+/// fit — so this is the mode signal alone and not a general skew between the two
+/// chips.
+pub const MODE_VISIBLE_LAG: u64 = 4;
+
 /// How many bytes of video RAM the console has.
 pub const VRAM_LEN: u64 = 0x2000;
 
@@ -292,6 +316,17 @@ struct Engine {
     window_line: u8,
     /// Whether the window has been drawn on this frame yet.
     window_active: bool,
+    /// The latched output of the `LY == LYC` comparator.
+    ///
+    /// Latched rather than computed, because the comparator is *clocked* and
+    /// the clock stops with the LCD. Gekkio's `stat_lyc_onoff` is about nothing
+    /// else: switch the controller off and the bit keeps whatever it last held,
+    /// writes to `LYC` do not disturb it, and switching the controller back on
+    /// is what runs the comparison again. Computing it would reset the bit to
+    /// the comparison against a stopped `LY`, which reads back wrong and — worse
+    /// — moves the `STAT` line, so the CPU's edge detector invents an interrupt
+    /// that hardware does not raise.
+    lyc_match: bool,
 
     /// Bytes of the OAM transfer still to copy, or zero when idle.
     dma_remaining: u64,
@@ -351,6 +386,9 @@ impl Engine {
             mode3_len: MODE3_MIN_DOTS,
             window_line: 0,
             window_active: false,
+            // `LY` and `LYC` both start at zero, so the comparator's latch
+            // starts where running it once would leave it.
+            lyc_match: true,
             dma_remaining: 0,
             dma_next_dot: 0,
             dma_page: 0,
@@ -387,18 +425,53 @@ impl Engine {
     }
 
     /// Which mode the controller is in right now.
+    ///
+    /// The controller's own signal, which is what drives the `STAT` interrupt
+    /// conditions. What a program *reads* is [`visible_mode`](Engine::visible_mode),
+    /// one machine cycle behind.
     fn mode(&self) -> Mode {
         if !self.lcd_on() {
             // With the LCD off the controller reports mode 0 and nothing is
             // blocked (Pan Docs, *LCDC*).
             return Mode::HBlank;
         }
-        if self.ly >= VBLANK_LINE {
+        Engine::mode_at(self.ly, self.dot, self.mode3_len)
+    }
+
+    /// The mode a program sees: in `STAT`'s bottom two bits, and in whether
+    /// video and object memory answer.
+    ///
+    /// [`MODE_VISIBLE_LAG`] behind [`mode`](Engine::mode), which is measured
+    /// rather than assumed — see that constant.
+    fn visible_mode(&self) -> Mode {
+        if !self.lcd_on() {
+            return Mode::HBlank;
+        }
+        let (ly, dot) = if self.dot >= MODE_VISIBLE_LAG {
+            (self.ly, self.dot - MODE_VISIBLE_LAG)
+        } else {
+            // Borrowing into the previous line. Its mode-3 length is not known
+            // any more, but the only dots reachable here are its last four, and
+            // hardware's mode 3 never runs past dot 369, so they are mode 0
+            // whatever it was.
+            let ly = if self.ly == 0 {
+                (LINES_PER_FRAME - 1) as u8
+            } else {
+                self.ly - 1
+            };
+            (ly, self.dot + DOTS_PER_LINE - MODE_VISIBLE_LAG)
+        };
+        Engine::mode_at(ly, dot, self.mode3_len)
+    }
+
+    /// The mode at a position, with the LCD known to be on.
+    fn mode_at(ly: u8, dot: u64, mode3_len: u64) -> Mode {
+        if ly >= VBLANK_LINE {
             return Mode::VBlank;
         }
-        if self.dot < OAM_SCAN_DOTS {
+        if dot < OAM_SCAN_DOTS {
             Mode::OamScan
-        } else if self.dot < OAM_SCAN_DOTS + self.mode3_len {
+        } else if dot < OAM_SCAN_DOTS + mode3_len {
             Mode::Drawing
         } else {
             Mode::HBlank
@@ -423,7 +496,17 @@ impl Engine {
     }
 
     fn lyc_equal(&self) -> bool {
-        self.lcd_on() && self.visible_ly() == self.lyc
+        self.lyc_match
+    }
+
+    /// Run the comparator, if its clock is running.
+    ///
+    /// Called on every dot and after anything that can change either input.
+    /// With the LCD off it does nothing at all, which is the whole point.
+    fn update_lyc(&mut self) {
+        if self.lcd_on() {
+            self.lyc_match = self.visible_ly() == self.lyc;
+        }
     }
 
     /// `STAT` as the guest reads it: the stored enables, the coincidence flag,
@@ -431,7 +514,7 @@ impl Engine {
     fn read_stat(&self) -> u8 {
         0x80 | (self.stat & stat::WRITABLE)
             | if self.lyc_equal() { stat::LYC_EQUAL } else { 0 }
-            | self.mode().bits()
+            | self.visible_mode().bits()
     }
 
     /// Whether the status interrupt line is asserted.
@@ -439,17 +522,38 @@ impl Engine {
     /// The OR of every enabled condition — a *level*, which is what gives STAT
     /// blocking for free once the CPU's pin edge-detects it.
     fn stat_line(&self) -> bool {
+        let s = self.stat;
+        // The coincidence condition survives the controller being switched off,
+        // because the latch that feeds it does — and that is load-bearing rather
+        // than pedantic. Gekkio's `stat_lyc_onoff` round 2 switches the LCD off
+        // with the bit set, changes `LYC` so that switching it back on leaves
+        // the comparison unchanged, and requires that **no** interrupt is
+        // raised. Dropping the line while the controller is off and raising it
+        // again on the way back would be a rising edge, and the CPU's pin would
+        // latch an interrupt hardware never raises.
+        if s & stat::LYC_INT != 0 && self.lyc_match {
+            return true;
+        }
         if !self.lcd_on() {
             return false;
         }
-        let s = self.stat;
-        (s & stat::LYC_INT != 0 && self.lyc_equal())
-            || match self.mode() {
-                Mode::HBlank => s & stat::HBLANK_INT != 0,
-                Mode::VBlank => s & stat::VBLANK_INT != 0,
-                Mode::OamScan => s & stat::OAM_INT != 0,
-                Mode::Drawing => false,
+        match self.mode() {
+            Mode::HBlank => s & stat::HBLANK_INT != 0,
+            // Entering vertical blanking asserts the *object scan* condition as
+            // well as the vertical one, and at the same instant: line 144 has a
+            // line start like any other, and what the mode-2 condition is
+            // wired to is the line start rather than the scan itself. Gekkio's
+            // `vblank_stat_intr` measures the two against `DIV` and finds them
+            // simultaneous, which is what "as well as" has to mean.
+            Mode::VBlank => {
+                s & stat::VBLANK_INT != 0
+                    || (s & stat::OAM_INT != 0
+                        && self.ly == VBLANK_LINE
+                        && self.dot < OAM_SCAN_DOTS)
             }
+            Mode::OamScan => s & stat::OAM_INT != 0,
+            Mode::Drawing => false,
+        }
     }
 
     /// Whether the vertical-blank line is asserted.
@@ -458,11 +562,11 @@ impl Engine {
     }
 
     fn vram_readable(&self) -> bool {
-        self.mode() != Mode::Drawing
+        self.visible_mode() != Mode::Drawing
     }
 
     fn oam_readable(&self) -> bool {
-        !matches!(self.mode(), Mode::Drawing | Mode::OamScan) && !self.dma_blocking()
+        !matches!(self.visible_mode(), Mode::Drawing | Mode::OamScan) && !self.dma_blocking()
     }
 
     // -- mode 3's length ----------------------------------------------------
@@ -680,11 +784,20 @@ impl Engine {
     // -- the dot pipeline ---------------------------------------------------
 
     /// Advance one dot, returning whether a frame just ended.
+    ///
+    /// The comparator runs on every one of them: its clock is this one.
     fn step_dot(&mut self) -> bool {
         self.dots += 1;
         if !self.lcd_on() {
             return false;
         }
+        let ended = self.step_position();
+        self.update_lyc();
+        ended
+    }
+
+    /// The dot pipeline proper, without the comparator.
+    fn step_position(&mut self) -> bool {
         let entering_mode3 = self.ly < VBLANK_LINE && self.dot == OAM_SCAN_DOTS - 1;
         self.dot += 1;
         if entering_mode3 {
@@ -719,19 +832,45 @@ impl Engine {
         if !self.lcd_on() {
             return None;
         }
-        let candidates: [u64; 4] = if self.ly < VBLANK_LINE {
+        // Both the controller's own boundaries and the lagged ones a program
+        // reads: between two consecutive events nothing observable changes, and
+        // the register bits are as observable as the interrupt line.
+        let candidates: [u64; 7] = if self.ly < VBLANK_LINE {
             [
+                MODE_VISIBLE_LAG,
                 OAM_SCAN_DOTS,
+                OAM_SCAN_DOTS + MODE_VISIBLE_LAG,
                 OAM_SCAN_DOTS + self.mode3_len,
+                OAM_SCAN_DOTS + self.mode3_len + MODE_VISIBLE_LAG,
+                DOTS_PER_LINE,
+                DOTS_PER_LINE,
+            ]
+        } else if self.ly == VBLANK_LINE {
+            // The object-scan condition holds over the first 80 dots of line
+            // 144 too, and it falling is something a program can see.
+            [
+                MODE_VISIBLE_LAG,
+                OAM_SCAN_DOTS,
+                DOTS_PER_LINE,
+                DOTS_PER_LINE,
+                DOTS_PER_LINE,
                 DOTS_PER_LINE,
                 DOTS_PER_LINE,
             ]
         } else if self.ly == 153 {
             // Line 153's `LY` changes from 153 to 0 four dots in, and a program
             // can see that.
-            [4, DOTS_PER_LINE, DOTS_PER_LINE, DOTS_PER_LINE]
+            [
+                4,
+                DOTS_PER_LINE,
+                DOTS_PER_LINE,
+                DOTS_PER_LINE,
+                DOTS_PER_LINE,
+                DOTS_PER_LINE,
+                DOTS_PER_LINE,
+            ]
         } else {
-            [DOTS_PER_LINE; 4]
+            [DOTS_PER_LINE; 7]
         };
         candidates
             .into_iter()
@@ -782,6 +921,9 @@ impl Engine {
                     self.dot = 0;
                     self.mode3_len = self.compute_mode3();
                 }
+                // Switching the controller on starts the comparison clock, and
+                // switching it off stops it with the latch where it stands.
+                self.update_lyc();
             }
             0x01 => self.stat = value & stat::WRITABLE,
             0x02 => self.scy = value,
@@ -789,7 +931,10 @@ impl Engine {
             // `LY` is read-only. A write is ignored rather than faulting: the
             // register is simply not connected to the bus in that direction.
             0x04 => {}
-            0x05 => self.lyc = value,
+            0x05 => {
+                self.lyc = value;
+                self.update_lyc();
+            }
             0x06 => {
                 self.dma_source = value;
                 return Some(value);
@@ -1447,6 +1592,7 @@ impl Device for GbPpu {
             w.write_u8(byte)?;
         }
         w.write_bool(engine.window_active)?;
+        w.write_bool(engine.lyc_match)?;
         w.write_u64(engine.dot)?;
         w.write_u64(engine.dots)?;
         w.write_u64(engine.frame)?;
@@ -1490,6 +1636,7 @@ impl Device for GbPpu {
             engine.window_line = r.read_u8()?;
             engine.dma_page = r.read_u8()?;
             engine.window_active = r.read_bool()?;
+            engine.lyc_match = r.read_bool()?;
             engine.dot = r.read_u64()?;
             engine.dots = r.read_u64()?;
             engine.frame = r.read_u64()?;

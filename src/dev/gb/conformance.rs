@@ -191,6 +191,14 @@ fn serial_transcript(machine: &Machine) -> Option<String> {
 /// Read out of its chunk for the same reason as everything else here. The
 /// framebuffer is the first three length-prefixed byte arrays; the frame counter
 /// follows the register bytes.
+///
+/// **This walk moves with `gb.ppu`'s chunk layout**, and it fails quietly if it
+/// does not: a `u64` read off the wrong offset still succeeds and returns a
+/// number, the runner then thinks its frame budget is exhausted, and every ROM
+/// reports "no verdict" while the machine is in fact perfectly healthy. That is
+/// exactly what happened once. `the_harness_reads_the_register_file_and_the_
+/// frame_counter` now checks the number rather than its existence, so the next
+/// layout change fails a test instead of a suite.
 fn frames(machine: &Machine) -> Option<u64> {
     let data = chunk_of(machine, "ppu")?;
     let mut r = crate::core::state::ChunkReader::new(&data);
@@ -201,6 +209,7 @@ fn frames(machine: &Machine) -> Option<u64> {
         r.read_u8().ok()?;
     }
     let _window_active = r.read_bool().ok()?;
+    let _lyc_match = r.read_bool().ok()?;
     let _dot = r.read_u64().ok()?;
     let _dots = r.read_u64().ok()?;
     r.read_u64().ok()
@@ -501,8 +510,17 @@ fn the_harness_reads_the_register_file_and_the_frame_counter() {
         verdict_registers(m) == Some(MOONEYE_PASS)
     });
     assert!(done, "the register pattern was never seen");
-    // And the LCD really did run while that happened.
-    assert!(frames(&machine).is_some(), "the frame counter decodes");
+    // And the LCD really did run while that happened. The *value* matters, not
+    // just that a `u64` came out: reading the counter off the wrong offset of a
+    // changed chunk still decodes, and the failure it causes looks like every
+    // ROM hanging rather than like a broken runner. Four frames were budgeted
+    // and the pattern is set in the first few hundred cycles, so the counter is
+    // small and non-negative — a misread lands nowhere near that.
+    let frames = frames(&machine).expect("the frame counter decodes");
+    assert!(
+        frames <= 4,
+        "the frame counter reads {frames} after at most four frames —          `frames()` is walking the wrong offset of the `gb.ppu` chunk"
+    );
 }
 
 #[test]

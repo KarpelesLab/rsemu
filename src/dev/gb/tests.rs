@@ -551,8 +551,14 @@ fn video_ram_reads_as_ff_during_mode_three_and_not_otherwise() {
     ops.read(0, &mut byte, MemAttrs::DEFAULT).expect("answers");
     assert_eq!(byte[0], 0x5a);
 
+    // The gate follows the mode the CPU sees, which is `MODE_VISIBLE_LAG`
+    // behind the one the controller is in — so mode 3 blocks video memory four
+    // dots after the controller enters it.
     ppu.advance_by(ppu::OAM_SCAN_DOTS);
     assert_eq!(ppu.mode(), Mode::Drawing);
+    ops.read(0, &mut byte, MemAttrs::DEFAULT).expect("answers");
+    assert_eq!(byte[0], 0x5a, "not blocked for another machine cycle");
+    ppu.advance_by(ppu::MODE_VISIBLE_LAG);
     ops.read(0, &mut byte, MemAttrs::DEFAULT).expect("answers");
     assert_eq!(byte[0], 0xff, "blocked");
     // A write is dropped rather than faulting: the write really does go nowhere.
@@ -573,12 +579,53 @@ fn object_memory_is_blocked_during_both_the_scan_and_the_drawing() {
     let ops = io(&region);
     let mut byte = [0u8; 1];
     assert_eq!(ppu.mode(), Mode::OamScan);
+    // One machine cycle behind the controller, so the gate closes four dots in.
+    ppu.advance_by(ppu::MODE_VISIBLE_LAG);
     ops.read(0, &mut byte, MemAttrs::DEFAULT).expect("answers");
     assert_eq!(byte[0], 0xff);
     ppu.advance_by(ppu::OAM_SCAN_DOTS + ppu::MODE3_MIN_DOTS);
     assert_eq!(ppu.mode(), Mode::HBlank);
     ops.read(0, &mut byte, MemAttrs::DEFAULT).expect("answers");
     assert_eq!(byte[0], 0x5a);
+}
+
+/// The mode the CPU reads and the mode the controller is in are four dots
+/// apart, and the gates follow the one the CPU reads.
+///
+/// Measured rather than assumed — `ppu::MODE_VISIBLE_LAG` carries the argument
+/// and the Gekkio tests that pin each end of it.
+#[test]
+fn the_mode_a_program_reads_is_one_machine_cycle_behind_the_controllers() {
+    let ppu = lcd(0);
+    let oam = Device::region(&ppu, ppu::OAM_REGION).expect("OAM");
+    let oam = io(&oam);
+    let mut byte = [0u8; 1];
+    let read_mode = |ppu: &GbPpu| ppu.read_register(0x01) & 3;
+
+    // Dot 0 of line 0: the controller has entered the object scan, and what a
+    // program reads is still the vertical blanking it just left.
+    assert_eq!(ppu.mode(), Mode::OamScan);
+    assert_eq!(read_mode(&ppu), Mode::VBlank.bits());
+    oam.read(0, &mut byte, MemAttrs::DEFAULT).expect("answers");
+    assert_eq!(byte[0], 0x00, "and object memory still answers");
+
+    ppu.advance_by(ppu::MODE_VISIBLE_LAG);
+    assert_eq!(read_mode(&ppu), Mode::OamScan.bits());
+    oam.read(0, &mut byte, MemAttrs::DEFAULT).expect("answers");
+    assert_eq!(byte[0], 0xff, "the gate follows the mode the program reads");
+
+    // And the same four dots at the other two boundaries of the line.
+    ppu.advance_by(ppu::OAM_SCAN_DOTS - ppu::MODE_VISIBLE_LAG);
+    assert_eq!(ppu.mode(), Mode::Drawing);
+    assert_eq!(read_mode(&ppu), Mode::OamScan.bits());
+    ppu.advance_by(ppu::MODE_VISIBLE_LAG);
+    assert_eq!(read_mode(&ppu), Mode::Drawing.bits());
+
+    ppu.advance_by(ppu::MODE3_MIN_DOTS - ppu::MODE_VISIBLE_LAG);
+    assert_eq!(ppu.mode(), Mode::HBlank);
+    assert_eq!(read_mode(&ppu), Mode::Drawing.bits());
+    ppu.advance_by(ppu::MODE_VISIBLE_LAG);
+    assert_eq!(read_mode(&ppu), Mode::HBlank.bits());
 }
 
 #[test]
@@ -606,6 +653,7 @@ fn the_stat_line_is_the_or_of_whatever_is_enabled() {
     // With only the mode-0 interrupt enabled the line follows H-blank.
     let ppu = lcd(stat::HBLANK_INT);
     assert_eq!(ppu.mode(), Mode::OamScan);
+    ppu.advance_by(ppu::MODE_VISIBLE_LAG);
     assert_eq!(ppu.read_register(0x01) & 3, 2);
     ppu.advance_by(ppu::OAM_SCAN_DOTS + ppu::MODE3_MIN_DOTS);
     assert_eq!(ppu.read_register(0x01) & 3, 0);
