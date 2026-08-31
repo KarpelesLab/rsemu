@@ -205,6 +205,36 @@ Roadmap §1 has the long form. When in doubt, ask **before** reading.
 - Guest addresses are computed in the guest's width, then widened. Widening
   first and masking later hides wrap bugs.
 
+## Commit messages
+
+Release-plz builds the changelog and picks the version bump from these, so the
+prefix is machine-read, not decoration. **Conventional Commits**, matching the
+sibling crates:
+
+```
+feat(cpu-arm): Thumb interworking and the v5 DSP extensions
+fix(space): reject a rebase that slides off its target
+docs: record why PAL needs its own machine file
+test(z80): assert MEMPTR through BIT n,(HL)
+chore: bump the fuzz corpus
+```
+
+- **Types**: `feat` (new capability), `fix` (defect), `docs`, `test`, `refactor`,
+  `perf`, `build`, `ci`, `chore`. Anything else is invisible to the changelog.
+- **Scope** is the subsystem, in parentheses: a core module (`space`, `clock`,
+  `sched`, `wire`, `device`, `props`, `state`, `sync`, `registry`), `machine`, a
+  CPU (`cpu-6502`, `cpu-arm`, …), a device (`dev-ppu`, `dev-apu`, `dev-cart`),
+  or `wasm`. Optional, but a changelog line without one rarely says enough.
+- **Breaking changes take `!`** — `feat(space)!: topology moves behind a guard`.
+  Pre-1.0 that is a minor bump, not a major one, which is exactly why it must be
+  marked: nothing else distinguishes it.
+- The subject is a sentence fragment in the imperative, lower case after the
+  colon, no trailing period. The body explains *why*, as always.
+- `chore: release vX.Y.Z` belongs to release-plz. Don't write it by hand.
+
+The version bump follows: `feat` → minor, `fix` → patch, `!` → major (minor
+while pre-1.0). A defect fixed under a `chore:` prefix ships silently.
+
 ## Style
 
 - Comments explain *why*. Match the surrounding density.
