@@ -45,6 +45,7 @@ anything**; this table records a point in time.
 | [retrio/gb-test-roms](https://github.com/retrio/gb-test-roms) (blargg) | Game Boy CPU, timing, sound | **No licence file** ⛔ | **No.** Provenance unclear — run only |
 | blargg's NES test ROMs | NES CPU, PPU, APU | Freely circulated, licence unclear ⛔ | **No.** Run only |
 | `nestest` + reference log | 6502 trace comparison — the fastest way to first-boot a 6502 | Licence unclear ⛔ | **No.** Run only |
+| Woz Monitor (Apple-1 Operation Manual, 1976) | The Apple 1's 256-byte monitor | **Public domain** ✅ — published pre-1978 with no copyright notice; see [`../platforms/apple1.md`](../platforms/apple1.md) for the determination and its evidence | Yes. But take it from the 1976 manual, not from a later adaptation |
 | [AccuracyCoin](https://github.com/100thCoin/AccuracyCoin) | 125 NES accuracy tests on one NROM cart, with per-test error codes | **MIT** ✅ (© 2025 Chris Siebert — verified upstream; the copy in `../gones` predates the licence file) | Yes, with attribution |
 | `zexall` / `zexdoc` | Z80 exerciser | Verify before use ⚠️ | Verify first |
 
