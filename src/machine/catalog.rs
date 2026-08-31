@@ -214,6 +214,21 @@ pub static Z80_MINI: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/z80-mini.machine"),
 };
 
+/// A minimal MC68000 board, when this build has a 68000.
+///
+/// A synthetic board rather than a product: a big-endian 24-bit space, ROM at
+/// zero holding the exception vector table, and RAM above it. The `firmware`
+/// slot takes whatever should be at `0x000000` — whose first two longwords are
+/// the reset stack pointer and the reset program counter.
+#[cfg(feature = "machine-m68k-mini")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-m68k-mini")))]
+pub static M68K_MINI: CatalogEntry = CatalogEntry {
+    name: "m68k-mini",
+    summary: "a minimal MC68000 board: 8 MHz, a big-endian 24-bit space, ROM at the vectors, RAM",
+    media: &["firmware"],
+    source: include_str!("../../machines/m68k-mini.machine"),
+};
+
 /// Every machine this build can realize, in catalog order.
 // One `#[cfg]`-gated push per shipped machine, which is what the lint is
 // complaining about: a `vec![]` literal cannot carry an attribute on one of its
@@ -231,6 +246,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&BENEATER_6502);
     #[cfg(feature = "machine-gameboy")]
     out.push(&GAMEBOY);
+    #[cfg(feature = "machine-m68k-mini")]
+    out.push(&M68K_MINI);
     #[cfg(feature = "machine-pc-at")]
     out.push(&PC_AT);
     #[cfg(feature = "machine-nes")]
@@ -1055,6 +1072,17 @@ mod tests {
             // `tests/z80_mini_board.rs` supplies the one that does something.
             #[cfg(feature = "machine-z80-mini")]
             ("z80-mini", "firmware") => &[0x18, 0xfe],
+            // The two longwords a 68000 fetches out of reset — a stack pointer
+            // at the top of the board's RAM and a program counter at $000008 —
+            // followed by `BRA .-0`, the two-byte branch to itself. Everything
+            // needed to prove the board realizes and the core fetches; the
+            // program that does something is in `tests/m68k_mini_board.rs`.
+            #[cfg(feature = "machine-m68k-mini")]
+            ("m68k-mini", "firmware") => &[
+                0x00, 0x20, 0x00, 0x00, // SSP = $00200000
+                0x00, 0x00, 0x00, 0x08, // PC  = $00000008
+                0x60, 0xfe, // BRA .
+            ],
             // No firmware is shipped for the PC and none ever will be, so what
             // this board gets is the right *shape*: a socket-sized image of
             // zeroes, which realizes and executes open bus. `tests/pc_at_board`

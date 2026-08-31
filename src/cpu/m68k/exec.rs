@@ -103,6 +103,15 @@ pub(super) struct State {
     pub faults: u64,
     /// Address of the most recent refused access.
     pub last_fault: u32,
+    /// Clocks owed to the next scheduler budget.
+    ///
+    /// A 68000 cannot be stopped mid-instruction, so a budget that runs out
+    /// part-way through one is overshot. The scheduler refuses a `Consumed`
+    /// larger than the budget it handed out — rightly, since that would put
+    /// the domain ahead of the timeline — so the overshoot is carried here and
+    /// charged against the next budget instead. Architectural, because a
+    /// restored machine that forgot its debt runs one instruction free.
+    pub debt: u64,
 }
 
 impl State {
@@ -123,6 +132,7 @@ impl State {
             reset_pending: true,
             faults: 0,
             last_fault: 0,
+            debt: 0,
         }
     }
 
@@ -676,14 +686,17 @@ impl<'a> Exec<'a> {
     /// cycle's four clocks (the published time is 44 cycles, five reads and
     /// three writes: the fifth read is the acknowledge) but does not put it on
     /// the bus, because CPU space is a function code and `MemAttrs` does not
-    /// carry one. A controller therefore supplies its vector through
-    /// [`M68k::set_interrupt_vector`](super::M68k::set_interrupt_vector)
-    /// instead of answering an access, and the vector is *consumed*, so the
-    /// next acknowledge autovectors again unless the controller arms another.
+    /// carry one. A controller therefore answers through `core::wire`'s
+    /// [`IntAck`](crate::core::wire::IntAck) if one is attached to an `IPL`
+    /// net, or through
+    /// [`M68k::set_interrupt_vector`](super::M68k::set_interrupt_vector) if a
+    /// caller arms one by hand. Either way the vector is *consumed*: the next
+    /// acknowledge autovectors again unless something answers again, which is
+    /// what asserting `VPA` means and what most 68000 boards do.
     fn take_interrupt(&mut self, level: u8) {
         let vector = self
             .lines
-            .take_vector()
+            .acknowledge()
             .unwrap_or(vector::AUTOVECTOR_BASE.wrapping_add(level));
         let pc = self.state.pc;
         let sr = self.state.sr;

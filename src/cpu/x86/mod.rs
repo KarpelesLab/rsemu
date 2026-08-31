@@ -1398,8 +1398,14 @@ impl X86 {
     /// Whether the A20 gate is open — that is, whether address bit 20 reaches
     /// memory.
     ///
-    /// Open unless something drives the `a20` pin low. See [`Lines::a20_mask`]
-    /// for why a chipset signal is a CPU input here.
+    /// Open unless something drives the `a20` pin low. A board with no gate
+    /// wired has bit 20 permanently connected; a board that wires one starts
+    /// with it shut, because that is what its net sitting low means.
+    ///
+    /// The gate is not a processor feature on real silicon — it sits in the
+    /// chipset, between the CPU and the bus — but rsemu has no device between
+    /// an initiator and its address space, and the gate is exactly a
+    /// suppression of the address wrap this core does for itself.
     #[must_use]
     pub fn a20_open(&self) -> bool {
         self.lines.a20_mask() == u32::MAX

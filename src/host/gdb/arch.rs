@@ -338,7 +338,7 @@ static Z80_REGS: &[RegDesc] = &[
 #[cfg(feature = "cpu-z80")]
 pub static Z80: Arch = Arch {
     class: &crate::cpu::z80::CLASS,
-    verified_version: 1,
+    verified_version: 2,
     feature: "org.rsemu.z80",
     architecture: None,
     regs: Z80_REGS,
@@ -384,7 +384,7 @@ const fn arm_regs() -> [RegDesc; 17] {
 #[cfg(feature = "cpu-arm-aprofile")]
 pub static ARM: Arch = Arch {
     class: &crate::cpu::arm::aprofile::CLASS,
-    verified_version: 1,
+    verified_version: 2,
     feature: "org.rsemu.arm",
     architecture: Some("arm"),
     regs: &ARM_REGS,
@@ -502,7 +502,7 @@ static I8086_REGS: &[RegDesc] = &[
 #[cfg(feature = "cpu-x86")]
 pub static I8086: Arch = Arch {
     class: &crate::cpu::x86::CLASS,
-    verified_version: 2,
+    verified_version: 3,
     feature: "org.rsemu.i386",
     architecture: None,
     regs: I8086_REGS,

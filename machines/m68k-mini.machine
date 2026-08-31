@@ -1,0 +1,90 @@
+# m68k-mini - the smallest MC68000 board.
+#
+#   rsemu run m68k-mini --media firmware=fw.bin
+#   rsemu run m68k-mini -p ram=1M --media firmware=fw.bin
+#
+# ROM at zero holding the two longwords a 68000 fetches out of reset - the
+# initial supervisor stack pointer and the initial program counter - then the
+# 254 remaining exception vectors, then code. RAM above it. It models no
+# product. It exists so `cpu.m68k` has somewhere to run inside a machine file.
+#
+# ---------------------------------------------------------------------------
+# Big-endian, and it is the board's job to say so
+# ---------------------------------------------------------------------------
+#
+# A 68000 reads a word high byte first. rsemu carries byte order **per region**
+# rather than per initiator (ROADMAP.md 4.1: "a big-endian device on a
+# little-endian bus is normal, not exotic"), which is the right model - it is
+# what lets a 68000 and a little-endian core share one RAM region through two
+# spaces - but it means nothing checks that a machine put a 68000 on a
+# little-endian map. Get it wrong and every word is byte-swapped and the reset
+# vector points somewhere absurd. So this file declares `endian = "big"` on the
+# space, and a board that copies it should keep that line.
+#
+# ---------------------------------------------------------------------------
+# The interrupt pins are a level, not a line
+# ---------------------------------------------------------------------------
+#
+# `cpu.ipl0`, `cpu.ipl1` and `cpu.ipl2` carry an encoded **priority level**, 0
+# to 7, rather than three independent requests: a device wired to `ipl2` alone
+# asks for level 4, and a board with a priority encoder drives all three. That
+# is why this core has three input ports where a 6502 has one, and why they all
+# reach one sink inside the core - no one of them can be resolved alone.
+#
+# Nothing on this board raises an interrupt, so none of them is wired. A device
+# that wants a *vectored* interrupt rather than the autovector answers the
+# acknowledge cycle through `core::wire`'s `IntAck`; one that asserts `VPA`
+# simply does not, and the core takes `AUTOVECTOR_BASE + level`.
+
+machine "m68k-mini" {
+  # How much ROM is at zero. The first 1 KiB of it is the exception vector
+  # table, which the architecture fixes at address zero on a 68000 - so this is
+  # the one region whose base is not a parameter.
+  param rom = 64K
+
+  # Where RAM starts and how much there is.
+  param ram-base = 0x00100000
+  param ram      = 1M
+
+  # -- the crystal -----------------------------------------------------------
+  #
+  # 8 MHz: a plain MC68000P8. One oscillator, so every ratio on this board is
+  # exact (ROADMAP.md 4.2).
+  osc clk = 8000000 Hz
+
+  # -- the bus ---------------------------------------------------------------
+  #
+  # 24 bits, because a 68000 has 23 address pins and A0 is implied by the two
+  # data strobes: the chip drives a 16-megabyte space and the top byte of a
+  # 32-bit address never leaves the package.
+  #
+  # `unassigned` is left at its default of `fault`, so an access to a hole is a
+  # bus error the guest can see. A 68000 does have `BERR`, unlike a Z80, which
+  # is what makes that the honest setting here.
+  space mem { width = 24, endian = "big" }
+
+  # -- the core --------------------------------------------------------------
+  object cpu "cpu.m68k" {
+    clock  = clk
+    space  = mem
+    engine = "interp"
+  }
+
+  # -- memory ----------------------------------------------------------------
+  #
+  # `image` names a media slot: whoever runs the machine binds the bytes
+  # (`--media firmware=fw.bin`), and nothing below host/ opens a file. The first
+  # eight bytes of that image are the reset stack pointer and the reset PC.
+  object boot "rom" { size = rom, image = "firmware" }
+
+  object dram "ram" { size = ram }
+
+  # -- the memory map --------------------------------------------------------
+  #
+  # Both regions are big-endian, matching the space. `map` carries its own
+  # `endian`, and a region that disagrees with its space is exactly how a
+  # big-endian peripheral on a little-endian bus is modelled - which is a
+  # feature everywhere except here, where it would silently byte-swap the world.
+  map mem 0x000000  size rom = boot   { endian = "big" }
+  map mem ram-base  size ram = dram   { endian = "big" }
+}
