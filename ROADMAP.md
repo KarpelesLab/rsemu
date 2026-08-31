@@ -1775,6 +1775,30 @@ replays bit-identically under a native debugger. That is a genuinely unusual
 property and it falls straight out of §0 — but only if nothing in `core/` ever
 reads the host clock (§15).
 
+**It is not true yet, and the reason is worth stating rather than discovering.**
+`Machine::run_for` is **not additive**: running for a span, and running for the
+same span in pieces, reach *different* states.
+`Scheduler::run_quantum_deterministic` picks
+`target = min(now + quantum, limit, next_event)`, so an intermediate deadline
+**truncates a quantum**, and that truncation is a scheduling boundary the single
+span never had. The browser advances frame by frame; `rsemu run --for` advances
+one span; so today they diverge by construction.
+
+`tests/run_for_additive.rs` measures it rather than asserting it from theory,
+and the measurement is more specific than the argument: two pieces and ten
+pieces reach the *same* hash as each other, and a different one from the whole.
+So it is not that more boundaries drift further — **any** intermediate deadline
+differs from none, and past that the split shape stops mattering. Each split is
+also perfectly reproducible, so this is a boundary-placement effect and not a
+determinism failure.
+
+Two ways to make the claim true, and they are not equivalent: make `run_for`
+additive by making a truncated quantum indistinguishable from an untruncated
+one, which is a real scheduler change; or define the comparison to require the
+same stepping on both sides, which is weaker but honest and costs nothing. The
+first is the one §11.6 is actually promising. Until one of them lands, the
+characterisation test is what stops this being rediscovered.
+
 ### 11.7 Deliverable
 
 A static browser demo page — the `fstool` `web/` + GitHub Pages pattern —
