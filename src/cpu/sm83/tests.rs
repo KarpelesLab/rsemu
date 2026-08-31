@@ -591,10 +591,10 @@ fn reti_enables_interrupts_immediately() {
 }
 
 #[test]
-fn the_vector_is_chosen_after_the_pushes_so_a_stack_on_ffff_changes_it() {
-    // Gekkio's `ie_push`. `IE` lives at `$FFFF`, so a stack pointer of `$0000`
-    // pushes the high byte of `PC` straight over it. What is enabled *after*
-    // that write is what decides the vector.
+fn the_vector_is_chosen_after_the_high_byte_push_so_a_stack_on_0000_changes_it() {
+    // Gekkio's `ie_push`, round 1. `IE` lives at `$FFFF`, so a stack pointer of
+    // `$0000` pushes the high byte of `PC` straight over it. What is enabled
+    // *after* that write is what decides the vector.
     let ram = Arc::new(RamStore::new(0x1_0000));
     ram.write_u8(0x0100, 0x00).unwrap(); // NOP, never reached
     let space = AddressSpace::new("cpu", 16);
@@ -632,6 +632,48 @@ fn the_vector_is_chosen_after_the_pushes_so_a_stack_on_ffff_changes_it() {
         "the re-read of IE after the push chose the vector"
     );
     assert_eq!(cpu.interrupt_enable(), 0x01, "the push overwrote IE");
+}
+
+/// The other half of `ie_push`, and the half that says *where* in the sequence
+/// the sample happens: with `SP` one byte higher it is the **low** byte push
+/// that lands on `IE`, and by then the decision has been made.
+///
+/// Without this the two behaviours are indistinguishable, and an implementation
+/// that samples after both pushes passes the test above and fails hardware.
+#[test]
+fn a_stack_on_0001_pushes_over_ie_too_late_to_change_the_vector() {
+    let ram = Arc::new(RamStore::new(0x1_0000));
+    let space = Arc::new(AddressSpace::new("cpu", 16));
+    space
+        .topology()
+        .map(Region::ram("ram", Arc::clone(&ram)), 0)
+        .expect("maps");
+    let cpu = Arc::new(Sm83::new(Config::default()));
+    cpu.attach_space(Arc::clone(&space));
+    Device::reset(cpu.as_ref(), ResetKind::Cold);
+    space
+        .topology()
+        .map(
+            Device::region(cpu.as_ref(), super::IE_REGION).expect("IE"),
+            super::IE_ADDRESS,
+        )
+        .expect("maps");
+    let mut regs = Regs::post_boot_dmg();
+    // The high byte goes to `$0000` and the low byte to `$FFFF`, so `IE`
+    // becomes `$00` — after the vector has already been chosen.
+    regs.pc = 0x0100;
+    regs.sp = 0x0001;
+    cpu.set_regs(regs);
+    cpu.set_ime(true);
+    cpu.set_interrupt_enable(0x1f);
+    cpu.request_interrupt(interrupt::JOYPAD);
+    step(&cpu);
+    assert_eq!(
+        cpu.regs().pc,
+        0x0060,
+        "the joypad vector was taken despite IE being cleared by the push"
+    );
+    assert_eq!(cpu.interrupt_enable(), 0x00, "the push still overwrote IE");
 }
 
 fn space_of(cpu: &Sm83) -> Arc<AddressSpace> {

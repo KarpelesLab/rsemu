@@ -376,11 +376,18 @@ impl<'a> Exec<'a> {
     /// The five-cycle dispatch sequence (Pan Docs, *Interrupts*).
     ///
     /// Two internal cycles, the two pushes, and the cycle that loads `PC`. The
-    /// order matters and is not cosmetic: **the vector is decided after the
-    /// pushes**, from a fresh read of `IE & IF`, so a stack that has walked down
-    /// onto `$FFFF` overwrites `IE` with the byte it just pushed and changes —
-    /// or removes — the interrupt being taken. `$0000` is where the chip goes
-    /// when the re-read finds nothing.
+    /// order matters and is not cosmetic: **`IE & IF` is sampled between the two
+    /// pushes**, not before them and not after both. A stack that has walked
+    /// down onto `$FFFF` therefore has its high-byte push land on `IE` in time
+    /// to change — or remove — the interrupt being taken, while a stack one byte
+    /// higher, whose *low*-byte push lands there, is too late to. `$0000` is
+    /// where the chip goes when the sample finds nothing.
+    ///
+    /// That asymmetry is what Gekkio's `acceptance/interrupts/ie_push` measures,
+    /// round 1 against round 3, and it is reported verified on every model of
+    /// the family. It is also the only thing that distinguishes the read
+    /// happening in the M-cycle between the two writes from it happening after
+    /// them, which is why the test exists.
     fn dispatch_interrupt(&mut self) {
         self.state.ime = false;
         self.state.ei_pending = false;
@@ -388,8 +395,8 @@ impl<'a> Exec<'a> {
         self.idle(); // dispatch cycle 2: still nothing
         let pc = self.state.regs.pc;
         self.push8((pc >> 8) as u8);
-        self.push8(pc as u8);
         let pending = self.pending();
+        self.push8(pc as u8);
         let target = if pending == 0 {
             0x0000
         } else {
