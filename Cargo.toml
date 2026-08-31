@@ -176,6 +176,46 @@ bus-spi = []
 # so. `no_std + alloc`, no dependencies.
 bus-usb = []
 
+# A generic EHCI host controller (src/dev/usb/ehci.rs): the EHCI 1.0 capability
+# and operational register file, and — the part that matters — the **schedule
+# walker**. A driver builds queue heads and queue element transfer descriptors
+# in guest RAM, hands over ASYNCLISTADDR and PERIODICLISTBASE, and the
+# controller DMA-walks them as a bus master with its own `MemAttrs::requester`,
+# moving bytes between guest memory and USB devices and raising a level
+# interrupt when a descriptor with IOC retires. Control and bulk on the
+# asynchronous list, interrupt on the periodic one with its microframe S-mask;
+# short packets, the alternate-next pointer, data toggles, STALL-to-halt, the
+# async-advance doorbell, and the port-owner handover that is how a high-speed-
+# only controller honestly refuses a full-speed device. **Every loop over a
+# guest-built list is bounded**, and `fuzz/fuzz_targets/usb_ehci.rs` is why.
+# Isochronous nodes are followed and not executed, and the module says so.
+# Written from the freely available EHCI 1.0 specification; the Linux USB stack
+# is GPLv2 and was not opened (ROADMAP.md §1). Needs `bus-usb`.
+dev-usb-ehci = ["bus-usb"]
+
+# The ChipIdea/ARC dual-role USB controller (src/dev/usb/chipidea.rs): a **thin
+# wrapper** over `dev-usb-ehci`, and thin is the claim being made — it contains
+# no schedule walker, no qTD decoding and no DMA, only a register map. What
+# distinguishes the block is an ID register whose format makes the CX92755's
+# 0xFA05 fall out of ID=5, the capability registers at +0x100 with CAPLENGTH
+# 0x40 so the operational ones sit at **+0x140**, the device-controller
+# capability registers, and a USBMODE role select. Host mode is complete;
+# device mode is modelled far enough to satisfy firmware that selects it (the
+# host schedule stops) and no further. The addresses are machine-file
+# properties, never constants: this is one SoC's placement of a reusable core.
+# Needs `dev-usb-ehci`.
+dev-usb-chipidea = ["dev-usb-ehci"]
+
+# A USB HID boot-protocol mouse (src/dev/usb/hid.rs): the smallest honest device
+# that proves the whole stack — it enumerates, it answers the eleven standard
+# requests through the shared control pipe, it returns a HID report descriptor,
+# and it delivers three-byte reports on an interrupt IN endpoint that a host
+# controller polls once a millisecond. **High speed**, deliberately: EHCI cannot
+# drive a full- or low-speed device without a transaction translator, and this
+# tree has no hub, so a device that claimed to be low speed would be a device
+# that never enumerated. Written from USB 2.0 §9, HID 1.11 and the HID Usage
+# Tables. Needs `bus-usb`.
+dev-usb-hid = ["bus-usb"]
 
 # The Sitronix ST7272A (src/dev/sitronix): a 320RGBx240 dual-gate TFT panel
 # driver, configured over 3-wire SPI. Its **SPI carries registers only** —

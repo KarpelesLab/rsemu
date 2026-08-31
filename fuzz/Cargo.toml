@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std", "dev-flash-cfi"]
+features         = ["std", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-hid"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -70,6 +70,16 @@ bench = false
 [[bin]]
 name  = "flash_cfi"
 path  = "fuzz_targets/flash_cfi.rs"
+test  = false
+doc   = false
+bench = false
+
+# The other MMIO surface with an invariant a guest must not be able to break:
+# every walk over a linked list the *guest* built has to terminate (CLAUDE.md,
+# "Testing", and ROADMAP.md §12). An unbounded walk shows up here as a timeout.
+[[bin]]
+name  = "usb_ehci"
+path  = "fuzz_targets/usb_ehci.rs"
 test  = false
 doc   = false
 bench = false
