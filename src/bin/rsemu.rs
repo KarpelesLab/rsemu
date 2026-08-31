@@ -27,6 +27,7 @@ USAGE:
 
 COMMANDS:
     run <machine>       Run a machine description
+    debug <machine>     Run it under a debugger, stopped, on :1234
     machines            List machines this build can emulate
     devices             List registered device classes
     describe <class>    Show a device class: properties, defaults, buses
@@ -45,6 +46,11 @@ RUN OPTIONS:
                         machine that opens exactly one is picked up on its own,
                         so `rsemu run apple1` is interactive already
     --headless          Do not attach a terminal, whatever the machine opened
+    --gdb <addr>        Listen for GDB on <addr> and hold the machine stopped
+                        until it attaches. `1234`, `:1234` and `host:1234` all
+                        work; a bare port binds the loopback interface only,
+                        because the far end can read and write all of guest
+                        memory. `rsemu debug` implies `--gdb :1234`
     -q, --quiet         Only print the summary
 
 OPTIONS:
@@ -74,6 +80,8 @@ fn main() -> ExitCode {
         "devices" => devices(),
         "describe" => describe(args.get(1).map(String::as_str)),
         "run" => run(&args[1..]),
+        #[cfg(feature = "gdb")]
+        "debug" => debug(&args[1..]),
         "convert" => {
             eprintln!(
                 "rsemu: {}",
@@ -191,6 +199,9 @@ struct RunArgs {
     /// Whether the user asked for no terminal at all.
     headless: bool,
     quiet: bool,
+    /// Where to listen for a debugger, if `--gdb` was given.
+    #[cfg(feature = "gdb")]
+    gdb: Option<String>,
 }
 
 fn run(args: &[String]) -> ExitCode {
@@ -263,6 +274,20 @@ fn run(args: &[String]) -> ExitCode {
         describe_machine(&machine);
     }
 
+    // A debugger, if one was asked for, owns when the machine advances — so it
+    // is checked before the console loop, which would otherwise own that.
+    #[cfg(feature = "gdb")]
+    if let Some(addr) = parsed.gdb.clone() {
+        let port = match console_port(&parsed) {
+            Ok(port) => port,
+            Err(e) => {
+                eprintln!("rsemu: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        return debug_session(&mut machine, &addr, port.as_ref(), &parsed);
+    }
+
     // A machine that opened a character port has a console; attach this
     // terminal to it and hand the keyboard over.
     match console_port(&parsed) {
@@ -281,6 +306,108 @@ fn run(args: &[String]) -> ExitCode {
     }
     summarise(&machine);
     ExitCode::SUCCESS
+}
+
+/// `rsemu debug <machine>`: `run` with a debugger attached (`ROADMAP.md` §2).
+///
+/// The only difference from `run --gdb` is the default: `debug` with no
+/// `--gdb` listens on `:1234`, which is the port every GDB user already has in
+/// their fingers.
+#[cfg(feature = "gdb")]
+fn debug(args: &[String]) -> ExitCode {
+    let mut args = args.to_vec();
+    if !args.iter().any(|a| a == "--gdb") {
+        args.push(String::from("--gdb"));
+        args.push(String::from(":1234"));
+    }
+    run(&args)
+}
+
+/// Run a machine with the gdbstub in charge of when it advances.
+///
+/// The machine is held stopped until a debugger attaches, so `target remote`
+/// lands on the reset vector rather than wherever a free-running guest had got
+/// to. A console, if the machine opened one, is pumped between session turns —
+/// so a guest can be typed at and stepped through at the same time.
+#[cfg(feature = "gdb")]
+fn debug_session(
+    machine: &mut Machine,
+    addr: &str,
+    port: Option<&Arc<CharPort>>,
+    args: &RunArgs,
+) -> ExitCode {
+    use rsemu::host::gdb::{ExitReason, GdbServer};
+
+    let mut server = match GdbServer::bind(addr) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("rsemu: cannot listen on `{addr}`: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if !args.quiet {
+        match server.local_addr() {
+            Ok(bound) => eprintln!("  gdbstub listening on {bound} — the machine is stopped"),
+            Err(_) => eprintln!("  gdbstub listening — the machine is stopped"),
+        }
+        eprintln!("  attach with: gdb -ex 'target remote {addr}'");
+        // Which devices became GDB threads, and — the hour-saving part — which
+        // of them upstream GDB has no architecture for. A target description
+        // tells GDB what the registers *are*; it still needs a gdbarch to know
+        // what the machine *is*, and for a 6502 it has none. It says
+        // "Architecture rejected target-supplied description", falls back to its
+        // own register layout, and `target remote` then fails outright. That is
+        // a property of GDB, not of this stub, and reading it here beats
+        // discovering it from that message.
+        let mut thread = 0u32;
+        for entry in machine.devices() {
+            let Some(arch) = rsemu::host::gdb::arch::for_class(entry.class().name) else {
+                continue;
+            };
+            thread += 1;
+            match arch.architecture {
+                Some(name) => eprintln!(
+                    "  thread {thread}: {} ({}), gdb architecture `{name}`",
+                    entry.path(),
+                    entry.class().name
+                ),
+                None => eprintln!(
+                    "  thread {thread}: {} ({}) — upstream gdb has no architecture for\n    \
+                     this core, so it rejects the target description and `target remote`\n    \
+                     fails. The protocol is served in full to any client that reads the\n    \
+                     description rather than insisting on a gdbarch.",
+                    entry.path(),
+                    entry.class().name
+                ),
+            }
+        }
+        eprintln!();
+    }
+
+    let terminal = port.map(|_| Terminal::open());
+    let status = match rsemu::host::gdb::serve(machine, &mut server, |_| {
+        if let (Some(term), Some(port)) = (terminal.as_ref(), port) {
+            term.pump(port);
+            if term.interrupted() {
+                return false;
+            }
+        }
+        true
+    }) {
+        Ok(ExitReason::Killed | ExitReason::Stopped) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("rsemu: {e}");
+            ExitCode::FAILURE
+        }
+    };
+    if let Some(term) = terminal {
+        term.flush();
+    }
+    if !args.quiet {
+        println!();
+        summarise(machine);
+    }
+    status
 }
 
 /// Which character port this terminal should attach to, if any.
@@ -443,6 +570,8 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         console: None,
         headless: false,
         quiet: false,
+        #[cfg(feature = "gdb")]
+        gdb: None,
     };
     let mut i = 0;
     while i < args.len() {
@@ -482,6 +611,8 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
                 out.span = GlobalTime::from_nanos(d.as_picos() / 1_000);
                 out.span_given = true;
             }
+            #[cfg(feature = "gdb")]
+            "--gdb" => out.gdb = Some(value(arg)?),
             "--console" => out.console = Some(value(arg)?),
             "--headless" => out.headless = true,
             "-q" | "--quiet" => out.quiet = true,

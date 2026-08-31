@@ -9,6 +9,7 @@
 //! | --- | --- | --- |
 //! | [`chardev`] | no | the character-stream seam: a byte pipe a device model can hold |
 //! | [`terminal`] | yes | that seam, driven by the process's own stdin and stdout |
+//! | `gdb` | yes | the GDB remote serial protocol over TCP (§8) |
 //!
 //! # Why the trait is not itself `std`
 //!
@@ -24,3 +25,7 @@ pub mod chardev;
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub mod terminal;
+
+#[cfg(feature = "gdb")]
+#[cfg_attr(docsrs, doc(cfg(feature = "gdb")))]
+pub mod gdb;
