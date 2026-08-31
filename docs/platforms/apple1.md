@@ -91,13 +91,30 @@ engineers, not advice from a lawyer. It is recorded as the project's
 determination, with its evidence, so that it can be re-examined rather than
 inherited as folklore.
 
-**What this does *not* cover.** Later adaptations are separate works. Ben
-Eater's well-known port to a 65C51 ACIA
-([gist](https://gist.github.com/beneater/8136c8b7f2fd95ccdd4562a498758217))
-carries no licence, no copyright line and no attribution; whatever originality
-his changes contain is his, unlicensed. So: **take the original listing from
-the 1976 manual, not somebody's adaptation of it.** The same goes for any
-modernised or relocated variant.
+**Later adaptations are separate works, and their own licence governs.** Ben
+Eater's well-known port to a 65C51 ACIA is the case in point. The
+[gist](https://gist.github.com/beneater/8136c8b7f2fd95ccdd4562a498758217)
+itself carries no licence header — but the page that publishes it,
+<https://eater.net/6502>, states that **all code used in his videos is released
+under Creative Commons Attribution (CC-BY)**, and lists `wozmon.s` and a
+prebuilt `wozmon.bin` among them.
+
+CC-BY is permissive and redistributable alongside MIT **provided attribution
+travels with it**: credit Ben Eater, name the licence, and say the file was
+modified if it was. Creative Commons themselves advise against CC licences for
+software, but that is advice about fitness, not a defect in the grant — it is a
+valid permission and we may rely on it.
+
+> **Provenance of this determination:** the licence statement was read on
+> `eater.net/6502` by the project owner. It could not be verified from a
+> terminal here — the site is a client-rendered app and every path returns the
+> same shell, so `curl` sees neither the licence text nor the linked assets.
+> Anyone re-checking should open the page in a browser rather than expect to
+> reproduce it with `curl`.
+
+So both layers are usable: the 1976 listing is public domain, and Eater's
+modifications are CC-BY. Attribution is required for the latter and costs
+nothing.
 
 ## rsemu's own monitor
 
