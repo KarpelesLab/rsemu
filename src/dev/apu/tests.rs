@@ -571,21 +571,25 @@ fn a_looping_sample_restarts_instead_of_raising_an_irq() {
 }
 
 #[test]
-fn stopping_playback_withdraws_a_scheduled_fetch() {
-    // The "aborted DMA" hook: the CPU has latched a request and the sample is
-    // stopped before its get cycle. NESdev DMA, Bugs.
+fn stopping_playback_leaves_a_scheduled_fetch_alone() {
+    // A `$4015` write that stops playback does **not** cancel a fetch that is
+    // already scheduled: the CPU has been told to halt and the DMA runs its
+    // full length. AccuracyCoin's "Explicit DMA Abort" measures exactly that —
+    // a stop landing while the fetch is in flight still costs the core three or
+    // four cycles, and only a stop landing in the APU cycle *before* the fetch
+    // would have been scheduled produces the one-cycle aborted DMA.
     let apu = apu();
     apu.write(0x13, 0x00);
     apu.write(0x15, 0x10);
     let request = apu.dma_request().unwrap();
     assert!(apu.dma_is_pending(request.serial));
     apu.write(0x15, 0x00);
-    assert!(!apu.dma_is_pending(request.serial));
-    assert!(apu.dma_request().is_none());
     assert!(
-        !apu.dma_complete(request.serial, 0x42),
-        "a withdrawn fetch must be rejected, not applied"
+        apu.dma_is_pending(request.serial),
+        "the fetch still happens"
     );
+    assert!(apu.dma_complete(request.serial, 0x42));
+    assert!(apu.dma_request().is_none(), "and nothing follows it");
 }
 
 #[test]

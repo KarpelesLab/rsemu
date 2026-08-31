@@ -409,6 +409,15 @@ pub enum Arbitration {
     /// how a DMA's halt and alignment cycles clock a NES controller port or
     /// advance `$2007`.
     Hold,
+    /// The arbiter held the core for the cycle it has just charged and is
+    /// letting go now.
+    ///
+    /// The difference from [`Arbitration::Release`] is one cycle: the read the
+    /// core just made was a *halt* cycle, so it has to make it again, and the
+    /// core loses exactly one cycle and no more. A DMA that is scheduled and
+    /// then withdrawn before it can do anything — the NES's aborted DMC fetch —
+    /// costs precisely this.
+    Halted,
     /// The arbiter drove the bus this cycle, leaving this byte on it. The core
     /// charges a cycle, makes no access of its own, and takes the byte into its
     /// own data-bus latch — a DMA cycle is a bus cycle, and the next open-bus

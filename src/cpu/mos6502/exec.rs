@@ -395,6 +395,13 @@ impl<'a> Exec<'a> {
             let bus = self.state.open_bus;
             match gate.arbitrate(self.state.cycles, u64::from(addr), bus, false) {
                 Arbitration::Release => break,
+                Arbitration::Halted => {
+                    // Held for one cycle and let go: the read just made was the
+                    // halt cycle, so it is made again below and nothing else
+                    // happens.
+                    held = true;
+                    break;
+                }
                 Arbitration::Hold => {
                     held = true;
                     value = self.cycle_read(addr);

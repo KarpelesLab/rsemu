@@ -728,7 +728,8 @@ impl Apu {
     /// Returns false if the request was withdrawn before the get cycle, in
     /// which case nothing changed and the byte is discarded.
     pub fn dma_complete(&self, serial: u64, byte: u8) -> bool {
-        let accepted = self.state.core.lock().dmc.dma_complete(serial, byte);
+        let now = self.state.core.lock().ticks;
+        let accepted = self.state.core.lock().dmc.dma_complete(serial, byte, now);
         if accepted {
             self.refresh_irq();
         }
@@ -931,12 +932,18 @@ impl DmcFetch {
         self.state.core.lock().dmc.dma_is_pending(serial)
     }
 
+    /// Forget a request the arbiter refused to take up.
+    pub fn withdraw(&self, serial: u64) {
+        self.state.core.lock().dmc.dma_withdraw(serial);
+    }
+
     /// Hand the DMC the byte the arbiter fetched.
     ///
     /// Returns false if the request was withdrawn before the get cycle, in
     /// which case nothing changed and the byte is discarded.
     pub fn complete(&self, serial: u64, byte: u8) -> bool {
-        let accepted = self.state.core.lock().dmc.dma_complete(serial, byte);
+        let now = self.state.core.lock().ticks;
+        let accepted = self.state.core.lock().dmc.dma_complete(serial, byte, now);
         if accepted {
             self.state.refresh_irq();
         }

@@ -19,7 +19,7 @@
 #     they can never appear here.
 #
 # ---------------------------------------------------------------------------
-# Measured 2026-08-31 against the pinned ROM: 129 of 141 pass, 12 fail.
+# Measured 2026-08-31 against the pinned ROM: 130 of 141 pass, 11 fail.
 # ---------------------------------------------------------------------------
 #
 # The earlier "81 of 125" was measured through a stale copy of the ROM's
@@ -83,7 +83,6 @@
 
 77                # $0477 "DMC DMA + OAM DMA" code 1: DMC DMA timing. There is
                   # no DMC DMA to overlap the OAM one with.
-79                # $0479 "Explicit DMA Abort" code 1: as above.
 78                # $0478 "Implicit DMA Abort" code 1: as above.
 5c                # $045C "APU Register Activation" code 1: the ROM says
                   # outright that a series of prerequisites failed — CPU and PPU

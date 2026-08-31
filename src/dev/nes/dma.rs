@@ -125,12 +125,21 @@ struct Job {
     dummy: bool,
 }
 
+/// What one `arbitrate` call has to tell the DMC afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Aftermath {
+    /// A request the unit refused to take up, which the channel must forget.
+    withdraw: Option<u64>,
+}
+
 /// What one arbitrated cycle does to the bus, decided under the lock and
 /// performed outside it (`CLAUDE.md`, re-entrancy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Act {
     /// Release the core.
     Release,
+    /// Release it, but the read it just made was a halt cycle.
+    Halted,
     /// Hold it without driving the bus: its own read repeats, visibly.
     Hold,
     /// Read a sprite byte from this address.
@@ -214,6 +223,8 @@ struct Ready {
     addr: u16,
     /// The first cycle the unit may start trying to halt on.
     start: u64,
+    /// Whether this is the one-cycle abort rather than a real fetch.
+    abort: bool,
 }
 
 impl Shared {
@@ -255,7 +266,14 @@ impl Shared {
     ///
     /// Split from performing it: the decision needs the lock and the access
     /// must not hold it.
-    fn decide(&self, cycle: u64, write: bool, request: Option<Ready>, alive: Option<bool>) -> Act {
+    fn decide(
+        &self,
+        cycle: u64,
+        write: bool,
+        request: Option<Ready>,
+        alive: Option<bool>,
+        after: &mut Aftermath,
+    ) -> Act {
         let mut state = self.state.lock();
         let phase = state.phase;
 
@@ -273,20 +291,35 @@ impl Shared {
             }
             if write {
                 // `/RDY` is only honoured on a read: the unit waits and tries
-                // again next cycle.
+                // again next cycle — except an abort, which simply does not
+                // happen ("if the halt is delayed due to a write cycle, the
+                // aborted DMA doesn't occur at all").
+                if let Some(r) = ready.filter(|r| r.abort) {
+                    after.withdraw = Some(r.serial);
+                }
                 return Act::Release;
             }
             // The read that just happened was the halt cycle.
             state.halted = true;
             if let Some(r) = ready {
-                state.job = Some(Job {
-                    serial: r.serial,
-                    addr: r.addr,
-                    dummy: true,
-                });
+                if r.abort {
+                    // One cycle of `/RDY` low and nothing else: no dummy, no
+                    // fetch, and the channel forgets the request.
+                    after.withdraw = Some(r.serial);
+                    if state.oam.is_none() {
+                        state.halted = false;
+                        return Act::Halted;
+                    }
+                } else {
+                    state.job = Some(Job {
+                        serial: r.serial,
+                        addr: r.addr,
+                        dummy: true,
+                    });
+                }
             }
         } else if state.job.is_none()
-            && let Some(r) = ready
+            && let Some(r) = ready.filter(|r| !r.abort)
         {
             // A fetch scheduled while the core was already held for the sprite
             // copy joins that halt rather than starting its own.
@@ -482,7 +515,7 @@ impl Gate {
         };
         let attrs = attrs.with_bus(data);
         match act {
-            Act::Release | Act::Hold => data,
+            Act::Release | Act::Halted | Act::Hold => data,
             Act::OamRead(addr) => {
                 let byte = self.read_with_conflict(&space, attrs, addr, held);
                 self.shared.latch_oam(byte);
@@ -556,8 +589,11 @@ impl CycleGate for Gate {
                     // or fourth CPU cycle. A reload starts on the next put.
                     start: match r.kind {
                         DmaKind::Load => phase_at_or_after(r.at + 3, phase, true),
-                        DmaKind::Reload => phase_at_or_after(r.at + 1, phase, false),
+                        DmaKind::Reload | DmaKind::Abort => {
+                            phase_at_or_after(r.at + 1, phase, false)
+                        }
                     },
+                    abort: r.kind == DmaKind::Abort,
                 });
                 let alive = self.shared.job_serial().map(|s| dmc.is_pending(s));
                 (request, alive)
@@ -565,10 +601,15 @@ impl CycleGate for Gate {
             None => (None, None),
         };
 
-        let act = self.shared.decide(cycle, write, request, alive);
+        let mut after = Aftermath::default();
+        let act = self.shared.decide(cycle, write, request, alive, &mut after);
+        if let (Some(serial), Some(dmc)) = (after.withdraw, dmc.as_ref()) {
+            dmc.withdraw(serial);
+        }
         let data = self.perform(act, held, bus, dmc.as_ref());
         match act {
             Act::Release => Arbitration::Release,
+            Act::Halted => Arbitration::Halted,
             Act::Hold => Arbitration::Hold,
             _ => Arbitration::Steal(data),
         }
@@ -951,6 +992,50 @@ mod tests {
                 "an alignment cycle only when the first get is a cycle further off"
             );
         }
+    }
+
+    #[test]
+    fn a_fetch_withdrawn_just_before_its_halt_costs_exactly_one_cycle() {
+        // Playback stopped in the APU cycle before a reload would have been
+        // scheduled: "the DMA starts, but is aborted after a single cycle"
+        // (NESdev, "DMA"). One cycle, not three — and not none, which is what a
+        // model that simply deletes the request produces.
+        let (b, apu) = dmc_bus();
+        apu.write(0x10, 0x4f); // loop, fastest rate
+        apu.write(0x12, 0xb5);
+        apu.write(0x13, 0x00); // one byte
+        apu.write(0x15, 0x10);
+
+        // The load fetch and the first reload, so the cadence is established.
+        let acts = poll_loop(&b, &apu, apu.ticks() + 1, 500);
+        let first_reload = acts
+            .iter()
+            .map(|(c, _)| *c)
+            .nth(2)
+            .expect("a load and then a reload");
+
+        // Stop playback two cycles before the next reload's halt, which lands
+        // one sample period later.
+        let gate = b.dma.gate();
+        let next = first_reload + 432;
+        let mut out = Vec::new();
+        for cycle in acts.last().expect("acts").0 + 1..next + 8 {
+            apu.advance_to(cycle);
+            if cycle == next - 2 {
+                apu.write(0x15, 0x00);
+            }
+            let a = gate.arbitrate(cycle, 0x8000, 0x40, false);
+            if a != Arbitration::Release {
+                out.push((cycle, a));
+            }
+        }
+        assert_eq!(
+            out.len(),
+            1,
+            "one cycle and no more, at {:?}",
+            out.iter().map(|(c, _)| *c).collect::<Vec<_>>()
+        );
+        assert_eq!(out[0].1, Arbitration::Halted);
     }
 
     #[test]
