@@ -849,6 +849,23 @@ impl ClockForest {
         (0..self.oscillators.len() as u32).map(OscillatorId)
     }
 
+    /// Every domain in the forest, in creation order.
+    ///
+    /// Handles are opaque and a forest is built by whoever holds it, so without
+    /// this the only way to reach a domain's tick counter — the authoritative
+    /// architectural state of `ROADMAP.md` §4.2, and part of every snapshot —
+    /// was to have remembered each [`DomainId`] as it was created. A snapshot
+    /// writer should be able to ask the forest what it contains, and the order
+    /// is creation order so the answer is the same on both sides of a
+    /// save/load.
+    ///
+    /// Roots come first within each tree only in the sense that an oscillator's
+    /// root domain is created by [`ClockForest::add_oscillator`]; the sequence
+    /// as a whole is simply the order the forest was built in.
+    pub fn domains(&self) -> impl Iterator<Item = DomainId> + '_ {
+        (0..self.domains.len() as u32).map(DomainId)
+    }
+
     /// Whether an oscillator still drives its own tree.
     ///
     /// An oscillator that has been locked into another one's tree

@@ -25,11 +25,37 @@
 //!   stale, and the split-screen status bar in nearly every NES game is wrong.
 //!   Catch-up is bounded by the device's own next scheduled event, so it never
 //!   simulates past a point where its behaviour would change, and a debug access
-//!   ([`AccessKind::Debug`]) advances nothing at all.
+//!   ([`AccessKind::Debug`]) advances nothing at all. The trigger is a
+//!   [`LazyHandle`] — see below.
+//! * **Snapshots.** The scheduler is architectural state, not a cache
+//!   (`ROADMAP.md` §4.5): [`Scheduler::snapshot`] and [`Scheduler::restore`]
+//!   carry the pending events, virtual time, the tie-break counter and the
+//!   round-robin cursor across a save/load, so a restored timer is the same
+//!   number of ticks from firing as the saved one was.
 //! * **Threading modes and rate control**, selected per machine. Only
 //!   [`ThreadingMode::Deterministic`] is implemented here; the others are
 //!   named, have their extension points marked, and return an error rather than
 //!   pretending.
+//!
+//! # Catch-up and the lock ladder
+//!
+//! Sync-on-access has to fire from inside `MemOps::read`, which takes `&self`
+//! and runs with the bus's own lock held, well below the loop that owns the
+//! scheduler. That rules out reaching back for a scheduler-ranked lock:
+//! [`LockRank::SCHED`](crate::core::sync::LockRank::SCHED) is *above*
+//! [`LockRank::BUS`](crate::core::sync::LockRank::BUS), so an access that
+//! acquired one would invert the ladder, and two CPUs doing it on two buses is a
+//! deadlock rather than a style violation.
+//!
+//! So catch-up never takes a scheduler lock. Each lazily-advanced device sits in
+//! its own slot behind a leaf-ranked lock that is held across a move and nothing
+//! else — the device is taken *out* of the slot, the guard is dropped, and only
+//! then is [`LazyDevice::advance_to`] called, so the device is free to touch its
+//! own bus and its own state while nothing is held. A [`LazyHandle`] is a shared
+//! reference to one such slot, handed to the access path when the machine is
+//! built. The one thing the slot needs from the clock forest — where the
+//! device's domain has got to — is published into it every time the scheduler
+//! advances virtual time.
 //!
 //! # What this module may not do
 //!
@@ -64,11 +90,13 @@
 use alloc::boxed::Box;
 use alloc::collections::{BTreeSet, BinaryHeap};
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cmp::{Ordering, Reverse};
 use core::fmt;
 
 use crate::core::clock::{ClockError, ClockForest, DomainId, GlobalTime, OscillatorId};
+use crate::core::sync::Mutex;
 
 // ---------------------------------------------------------------------------
 // errors
@@ -106,10 +134,27 @@ pub enum SchedError {
         /// Where it claimed to be afterwards.
         to: u64,
     },
+    /// A lazily-advanced device is already being advanced further up the stack.
+    ///
+    /// Catch-up takes the device out of its slot for the duration of
+    /// [`LazyDevice::advance_to`], precisely so that no lock is held across
+    /// that call (`ROADMAP.md` §4.7's re-entrancy contract). A second catch-up
+    /// reaching the same device while the first is still running — a device
+    /// that reads its own registers as it simulates — therefore finds the slot
+    /// empty. Reporting it beats both alternatives: recursing would need two
+    /// mutable borrows of one device, and waiting would be a deadlock.
+    ///
+    /// Under [`ThreadingMode::Deterministic`] — the only mode implemented — one
+    /// thread runs everything, so this can only mean re-entrancy. A parallel
+    /// mode would also reach it when two CPUs touch one device at the same
+    /// instant, which wants that mode's rendezvous rather than a spin here.
+    LazyDeviceBusy(LazyId),
     /// The threading mode is recognised but not implemented in this build.
     ModeUnimplemented(ThreadingMode),
     /// Rate control needs a host clock and none was injected.
     NoHostClock,
+    /// A snapshot could not be restored into this scheduler.
+    InvalidSnapshot(&'static str),
 }
 
 impl fmt::Display for SchedError {
@@ -132,10 +177,16 @@ impl fmt::Display for SchedError {
                 "lazy device #{} went backwards, from tick {from} to {to}",
                 device.0
             ),
+            SchedError::LazyDeviceBusy(id) => write!(
+                f,
+                "lazy device #{} is already being advanced further up the stack",
+                id.0
+            ),
             SchedError::ModeUnimplemented(m) => {
                 write!(f, "threading mode `{m}` is not implemented in this build")
             }
             SchedError::NoHostClock => f.write_str("rate control needs an injected host clock"),
+            SchedError::InvalidSnapshot(why) => write!(f, "invalid scheduler snapshot: {why}"),
         }
     }
 }
@@ -182,6 +233,19 @@ impl EventId {
     #[inline]
     pub const fn seq(self) -> u64 {
         self.0
+    }
+
+    /// Rebuilds a handle from a sequence number.
+    ///
+    /// For snapshot restore, and for nothing else: an event's identity *is* its
+    /// tie-break, so a queue rebuilt from a snapshot has to carry the numbers it
+    /// was saved with or two events at one instant swap places
+    /// (`ROADMAP.md` §4.5). Minting a number here for a *fresh* event would
+    /// collide with the queue's own counter; that is what
+    /// [`EventQueue::schedule`] is for.
+    #[inline]
+    pub const fn from_seq(seq: u64) -> EventId {
+        EventId(seq)
     }
 }
 
@@ -448,6 +512,102 @@ impl EventQueue {
         }
     }
 
+    /// The sequence number the next posted event will carry.
+    ///
+    /// Snapshot state, not a diagnostic. The number is the tie-break, so a
+    /// restored queue that started counting again from zero would order events
+    /// posted after the restore *before* the ones it restored — and two events
+    /// at the same instant would fire in the wrong order for the rest of the
+    /// run (`ROADMAP.md` §4.5).
+    #[inline]
+    pub const fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// Every live event, in the exact order it will fire.
+    ///
+    /// The queue is a wheel plus two heaps, so its internal layout is a
+    /// function of the history of `advance_to` calls rather than of the events
+    /// alone; enumerating it in `(time, sequence)` order — the same total order
+    /// [`EventQueue::pop_due`] uses — is what makes the output a function of
+    /// the queue's *contents* and therefore reproducible.
+    ///
+    /// Cancelled entries are omitted. A tombstone is bookkeeping for a queue
+    /// that cannot delete from the middle of a wheel, not architectural state:
+    /// an event that will never fire has no observable consequence, and
+    /// cancelling its id again after a restore is harmless.
+    pub fn events(&self) -> Vec<Event> {
+        let mut out = Vec::with_capacity(self.len());
+        let live = |e: &Event| !self.cancelled.contains(&e.id.0);
+        out.extend(
+            self.due
+                .iter()
+                .map(|Reverse(e)| e)
+                .filter(|e| live(e))
+                .cloned(),
+        );
+        out.extend(self.near.iter().flatten().filter(|e| live(e)).cloned());
+        out.extend(
+            self.far
+                .iter()
+                .map(|Reverse(e)| e)
+                .filter(|e| live(e))
+                .cloned(),
+        );
+        // Ids are unique, so `(time, seq)` is a total order and the sort needs
+        // no stability to be deterministic.
+        out.sort_unstable();
+        out
+    }
+
+    /// Replaces the queue's whole contents and position.
+    ///
+    /// The inverse of [`EventQueue::events`] plus [`EventQueue::next_seq`]:
+    /// restoring both is what makes a save/load round-trip fire the same events
+    /// at the same instants in the same order. Re-deriving the queue by asking
+    /// devices to re-register instead would lose sub-tick phase, and every
+    /// timer would then fail its own round-trip test (`ROADMAP.md` §4.5).
+    ///
+    /// Events whose instant is already past are kept, not dropped: they fire at
+    /// the next [`EventQueue::pop_due`], exactly as they would have without the
+    /// save.
+    ///
+    /// # Errors
+    ///
+    /// [`SchedError::InvalidSnapshot`] if two events share a sequence number,
+    /// or if any is at or above `next_seq` — either would let a later event
+    /// win a tie against an earlier one.
+    pub fn restore(&mut self, now: GlobalTime, next_seq: u64, events: &[Event]) -> SchedResult<()> {
+        let mut seen = BTreeSet::new();
+        for e in events {
+            if e.id.0 >= next_seq {
+                return Err(SchedError::InvalidSnapshot(
+                    "an event's sequence number is not below the next sequence number",
+                ));
+            }
+            if !seen.insert(e.id.0) {
+                return Err(SchedError::InvalidSnapshot(
+                    "two events share a sequence number",
+                ));
+            }
+        }
+
+        for bucket in &mut self.near {
+            bucket.clear();
+        }
+        self.level_len = [0; WHEEL_LEVELS];
+        self.far.clear();
+        self.due.clear();
+        self.cancelled.clear();
+        self.now = now;
+        self.now_granule = now.raw() >> self.granule_shift;
+        self.next_seq = next_seq;
+        for e in events {
+            self.push_entry(e.clone());
+        }
+        Ok(())
+    }
+
     /// The number of queued events, cancelled-but-not-yet-reached ones included.
     pub fn len(&self) -> usize {
         let near: usize = self.level_len.iter().sum();
@@ -586,8 +746,11 @@ pub trait Runnable: Send + Sync {
 ///
 /// The PPU is the motivating case: it is far cheaper to run it in bursts than
 /// dot by dot, but a CPU read of a status register has to see the state at
-/// exactly that dot. So the device keeps its own tick, and the address space
-/// calls [`Scheduler::sync_for_access`] before dispatching an access to it.
+/// exactly that dot. So the device keeps its own tick, and the access path
+/// catches it up before dispatching an access to it — through a
+/// [`LazyHandle`], which is reachable from a `&self` memory operation, or
+/// through [`Scheduler::sync_for_access`] where the scheduler itself is in
+/// hand.
 pub trait LazyDevice: Send + Sync {
     /// The tick, in the device's own clock domain, that it has simulated up to.
     fn current_tick(&self) -> u64;
@@ -608,9 +771,11 @@ pub trait LazyDevice: Send + Sync {
 /// Why a device is being accessed.
 ///
 /// A debug access must not change anything — not a FIFO, not a status bit, and
-/// not the clock (`ROADMAP.md` §15, invariant 5). Mapping this onto
-/// `MemAttrs::debug` is the address space's job; `MemAttrs` does not exist yet,
-/// so the scheduler takes the distinction directly.
+/// not the clock (`ROADMAP.md` §15, invariant 5). Mapping
+/// [`MemAttrs::debug`](crate::core::space::MemAttrs) onto this is the access
+/// path's job: the scheduler takes the distinction directly rather than
+/// depending on the address space, so that `core::sched` stays independent of
+/// `core::space`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AccessKind {
     /// A guest access. The device is caught up first.
@@ -842,18 +1007,266 @@ impl fmt::Debug for RunnableSlot {
     }
 }
 
+/// What a lazy slot protects: the device, and where its domain has got to.
+struct LazyState {
+    device: Option<Box<dyn LazyDevice>>,
+    /// The tick of the slot's domain the scheduler last published.
+    ///
+    /// Catch-up reached from inside a memory access cannot read the clock
+    /// forest — the forest belongs to whoever is driving the run loop — so the
+    /// scheduler pushes each domain's position here whenever it advances time.
+    present: u64,
+}
+
+/// One registered lazily-advanced device.
+///
+/// Behind an `Arc` so a [`LazyHandle`] can reach it from an access path that has
+/// no route back to the scheduler, and behind a [`Mutex`] at the default
+/// [`LockRank::LEAF`](crate::core::sync::LockRank::LEAF) because **nothing is
+/// ever acquired while it is held**: catch-up takes the device *out* of the
+/// slot, drops the guard, and only then calls
+/// [`LazyDevice::advance_to`] — which is free to touch its own bus, its own
+/// state lock, or a wire. A leaf that is only ever held across a `take` and a
+/// put-back nests under every rank in the ladder, which is exactly what an
+/// access already holding `BUS` needs.
 struct LazySlot {
     domain: DomainId,
-    inner: Option<Box<dyn LazyDevice>>,
+    state: Mutex<LazyState>,
 }
 
 impl fmt::Debug for LazySlot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LazySlot")
-            .field("domain", &self.domain)
-            .field("registered", &self.inner.is_some())
-            .finish()
+        let mut s = f.debug_struct("LazySlot");
+        s.field("domain", &self.domain);
+        match self.state.try_lock() {
+            Some(state) => s
+                .field("registered", &state.device.is_some())
+                .field("present", &state.present)
+                .finish(),
+            None => s.field("state", &"<in use>").finish(),
+        }
     }
+}
+
+impl LazySlot {
+    /// Records where the slot's domain has got to.
+    fn publish(&self, present: u64) {
+        self.state.lock().present = present;
+    }
+
+    /// Brings the device up to date, from `present` or from the last published
+    /// position.
+    ///
+    /// The critical section covers reading the device's position and taking
+    /// ownership of it, and stops there. `advance_to` runs with the device held
+    /// exclusively by value and no lock held at all, which is `ROADMAP.md`
+    /// §4.7's re-entrancy contract satisfied by construction rather than by
+    /// good intentions.
+    fn sync(&self, id: LazyId, present: Option<u64>, kind: AccessKind) -> SchedResult<u64> {
+        let (mut device, from, target) = {
+            let mut state = self.state.lock();
+            if let Some(p) = present {
+                state.present = p;
+            }
+            let target = state.present;
+            let device = state
+                .device
+                .as_ref()
+                .ok_or(SchedError::LazyDeviceBusy(id))?;
+            let from = device.current_tick();
+            if kind == AccessKind::Debug {
+                return Ok(from);
+            }
+            // Never past the device's own next event: beyond that tick its
+            // behaviour changes, and simulating through it in one step would
+            // compute the wrong answer.
+            let target = target.min(device.next_event_tick().unwrap_or(u64::MAX));
+            if target <= from {
+                return Ok(from);
+            }
+            let device = state.device.take().expect("borrowed successfully above");
+            (device, from, target)
+        };
+        device.advance_to(target);
+        let to = device.current_tick();
+        self.state.lock().device = Some(device);
+        if to < from {
+            return Err(SchedError::NonMonotonicDevice {
+                device: id,
+                from,
+                to,
+            });
+        }
+        Ok(to)
+    }
+
+    /// Puts the device on a specific tick of its own domain.
+    fn sync_to_tick(&self, id: LazyId, tick: u64) -> SchedResult<u64> {
+        let (mut device, from) = {
+            let mut state = self.state.lock();
+            let device = state
+                .device
+                .as_ref()
+                .ok_or(SchedError::LazyDeviceBusy(id))?;
+            let from = device.current_tick();
+            if tick <= from {
+                return Ok(from);
+            }
+            let device = state.device.take().expect("borrowed successfully above");
+            (device, from)
+        };
+        device.advance_to(tick);
+        let to = device.current_tick();
+        self.state.lock().device = Some(device);
+        if to < from {
+            return Err(SchedError::NonMonotonicDevice {
+                device: id,
+                from,
+                to,
+            });
+        }
+        Ok(to)
+    }
+
+    /// Where the device has simulated up to, advancing nothing.
+    fn current_tick(&self, id: LazyId) -> SchedResult<u64> {
+        let state = self.state.lock();
+        state
+            .device
+            .as_ref()
+            .map(|d| d.current_tick())
+            .ok_or(SchedError::LazyDeviceBusy(id))
+    }
+}
+
+/// A shared handle to one lazily-advanced device: sync-on-access from a path
+/// that cannot reach the scheduler.
+///
+/// This is what makes `ROADMAP.md` §4.2's sync-on-access implementable. The
+/// path that must trigger catch-up is `MemOps::read`, which takes `&self` and
+/// runs with the bus's own lock held, several frames below the run loop that
+/// owns the scheduler. A handle is cloned to the mapping when the machine is
+/// realized, and thereafter the access path calls [`LazyHandle::sync`] with no
+/// borrow of, and no lock shared with, the scheduler.
+///
+/// # Lock order
+///
+/// [`LockRank::SCHED`](crate::core::sync::LockRank::SCHED) sits **above**
+/// [`LockRank::BUS`](crate::core::sync::LockRank::BUS): a bus access that
+/// reached back for a scheduler-ranked lock would invert the ladder, and two
+/// CPUs doing it on different buses is a textbook deadlock. So nothing on this
+/// path takes one. The only lock involved is the slot's own leaf, held across a
+/// move and nothing else.
+///
+/// # What it is not
+///
+/// The tick it catches up to is the one the scheduler last published, which it
+/// does every time it advances virtual time. Within a quantum a runnable's own
+/// progress is not yet in the clock forest — the forest is advanced from the
+/// runnable's report, after it returns — so a handle used from inside a
+/// runnable's execution sees that runnable's position at the start of the
+/// quantum. Bounding the quantum by the next event is what keeps that honest;
+/// resolving it properly means letting a runnable report progress *as* it runs,
+/// which is a change to [`Runnable`] and not to this type.
+#[derive(Debug, Clone)]
+pub struct LazyHandle {
+    id: LazyId,
+    slot: Arc<LazySlot>,
+}
+
+impl LazyHandle {
+    /// The device's handle in its scheduler.
+    #[inline]
+    pub const fn id(&self) -> LazyId {
+        self.id
+    }
+
+    /// The clock domain the device is counted in.
+    #[inline]
+    pub fn domain(&self) -> DomainId {
+        self.slot.domain
+    }
+
+    /// Brings the device up to date before an access, and returns the tick it
+    /// is now at.
+    ///
+    /// [`AccessKind::Debug`] advances nothing — a debugger read must not move a
+    /// device's clock any more than it may pop a FIFO (`ROADMAP.md` §15,
+    /// invariant 5).
+    ///
+    /// # Errors
+    ///
+    /// [`SchedError::LazyDeviceBusy`] if catch-up for this device is already
+    /// running further up the stack, or [`SchedError::NonMonotonicDevice`] if
+    /// the device reports going backwards.
+    pub fn sync(&self, kind: AccessKind) -> SchedResult<u64> {
+        self.slot.sync(self.id, None, kind)
+    }
+
+    /// Advances the device to a specific tick of its own domain.
+    ///
+    /// What an event dispatcher calls when delivering a device its own
+    /// scheduled event; see [`Scheduler::sync_to_tick`].
+    ///
+    /// # Errors
+    ///
+    /// As [`LazyHandle::sync`].
+    pub fn sync_to_tick(&self, tick: u64) -> SchedResult<u64> {
+        self.slot.sync_to_tick(self.id, tick)
+    }
+
+    /// The tick the device has simulated up to, advancing nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`SchedError::LazyDeviceBusy`] if catch-up is running further up the
+    /// stack, in which case the device's position is in flight and there is no
+    /// answer to give.
+    pub fn current_tick(&self) -> SchedResult<u64> {
+        self.slot.current_tick(self.id)
+    }
+
+    /// The tick of the device's domain the scheduler last published — the
+    /// target the next [`LazyHandle::sync`] will aim for.
+    pub fn present_tick(&self) -> u64 {
+        self.slot.state.lock().present
+    }
+}
+
+/// Everything about a [`Scheduler`] that a snapshot has to carry
+/// (`ROADMAP.md` §4.5).
+///
+/// The scheduler *is* architectural state. Re-deriving the queue after a load
+/// by asking devices to re-register their events loses sub-tick phase — a timer
+/// that was 40 cycles from firing comes back a whole period from firing — and
+/// every timer then fails its own round-trip test. So the queue is enumerated
+/// and rebuilt verbatim, sequence numbers included.
+///
+/// # What is here, and why each piece
+///
+/// * `now` — the front of virtual time. Without it a restored machine starts at
+///   instant zero and every absolute deadline in the queue is already past.
+/// * `events` — the pending events, in fire order.
+/// * `next_seq` — the tie-break counter. Events posted after a restore must
+///   lose ties against events restored from before it, which they only do if
+///   the counter continues rather than restarts.
+/// * `cursor` — where the round-robin resumes. It decides which CPU runs first
+///   in the next quantum, so two machines that differ only in this diverge.
+///
+/// What is deliberately absent is the clock forest, which the layer above saves
+/// (its tick counters are the authoritative time state and are shared with
+/// devices), and the rate controller, which is anchored to a host clock and is
+/// therefore host state rather than guest state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerSnapshot {
+    /// The virtual instant the scheduler was at.
+    pub now: GlobalTime,
+    /// The sequence number the next posted event will carry.
+    pub next_seq: u64,
+    /// Where the round-robin resumes, as an index into the runnables.
+    pub cursor: usize,
+    /// Every pending event, in the order it will fire.
+    pub events: Vec<Event>,
 }
 
 /// What one round of the round-robin did.
@@ -880,7 +1293,7 @@ pub struct Scheduler {
     now: GlobalTime,
     config: SchedulerConfig,
     runnables: Vec<RunnableSlot>,
-    lazy: Vec<LazySlot>,
+    lazy: Vec<Arc<LazySlot>>,
     /// Where the round-robin starts next round, so no runnable is permanently
     /// first.
     cursor: usize,
@@ -972,11 +1385,52 @@ impl Scheduler {
     /// Registers a lazily-advanced device clocked by `domain`.
     pub fn add_lazy_device(&mut self, domain: DomainId, device: Box<dyn LazyDevice>) -> LazyId {
         let id = LazyId(self.lazy.len() as u32);
-        self.lazy.push(LazySlot {
+        // An unknown domain is reported by the first sync rather than here,
+        // which keeps this call infallible; zero is the honest starting
+        // position either way, since nothing has been simulated yet.
+        let present = self.forest.ticks(domain).unwrap_or(0);
+        self.lazy.push(Arc::new(LazySlot {
             domain,
-            inner: Some(device),
-        });
+            state: Mutex::new(LazyState {
+                device: Some(device),
+                present,
+            }),
+        }));
         id
+    }
+
+    /// A shared handle to a registered lazily-advanced device.
+    ///
+    /// The machine layer clones one of these onto every mapping that routes to
+    /// the device, so `MemOps::read` can catch it up through `&self` without a
+    /// route back to the scheduler and without taking a scheduler-ranked lock.
+    /// See [`LazyHandle`] for why that matters.
+    ///
+    /// # Errors
+    ///
+    /// [`SchedError::UnknownLazyDevice`] if the handle is not from this
+    /// scheduler.
+    pub fn lazy_handle(&self, id: LazyId) -> SchedResult<LazyHandle> {
+        self.lazy
+            .get(id.index())
+            .map(|slot| LazyHandle {
+                id,
+                slot: Arc::clone(slot),
+            })
+            .ok_or(SchedError::UnknownLazyDevice(id))
+    }
+
+    /// The clock domain a lazily-advanced device is registered in.
+    ///
+    /// # Errors
+    ///
+    /// [`SchedError::UnknownLazyDevice`] if the handle is not from this
+    /// scheduler.
+    pub fn lazy_domain(&self, id: LazyId) -> SchedResult<DomainId> {
+        self.lazy
+            .get(id.index())
+            .map(|slot| slot.domain)
+            .ok_or(SchedError::UnknownLazyDevice(id))
     }
 
     /// The clock domain a runnable is registered in.
@@ -1056,21 +1510,26 @@ impl Scheduler {
     ///
     /// [`AccessKind::Debug`] advances nothing.
     ///
+    /// Takes `&self`, not `&mut self`: the caller is `MemOps::read`, which has
+    /// a shared borrow and is several frames below whoever owns the scheduler.
+    /// A device reached from inside a *running* quantum has no route back here
+    /// at all and uses a [`LazyHandle`] instead; this method is the same
+    /// operation for a caller that does hold the scheduler — a monitor, a
+    /// dispatcher between quanta, a test — and it reads the forest directly, so
+    /// it is exact even if virtual time moved since the last publish.
+    ///
     /// # Errors
     ///
-    /// [`SchedError::UnknownLazyDevice`], [`SchedError::Clock`], or
-    /// [`SchedError::NonMonotonicDevice`] if the device reports going backwards.
-    pub fn sync_for_access(&mut self, id: LazyId, kind: AccessKind) -> SchedResult<u64> {
+    /// [`SchedError::UnknownLazyDevice`], [`SchedError::Clock`],
+    /// [`SchedError::LazyDeviceBusy`], or [`SchedError::NonMonotonicDevice`] if
+    /// the device reports going backwards.
+    pub fn sync_for_access(&self, id: LazyId, kind: AccessKind) -> SchedResult<u64> {
         let slot = self
             .lazy
-            .get_mut(id.index())
+            .get(id.index())
             .ok_or(SchedError::UnknownLazyDevice(id))?;
-        let domain = slot.domain;
-        let mut device = slot.inner.take().ok_or(SchedError::UnknownLazyDevice(id))?;
-
-        let result = self.catch_up(id, domain, kind, device.as_mut());
-        self.lazy[id.index()].inner = Some(device);
-        result
+        let present = self.forest.ticks(slot.domain)?;
+        slot.sync(id, Some(present), kind)
     }
 
     /// Advances a lazily-advanced device to a specific tick of its own domain.
@@ -1085,60 +1544,29 @@ impl Scheduler {
     ///
     /// # Errors
     ///
-    /// [`SchedError::UnknownLazyDevice`], or [`SchedError::NonMonotonicDevice`]
-    /// if the device reports going backwards.
-    pub fn sync_to_tick(&mut self, id: LazyId, tick: u64) -> SchedResult<u64> {
-        let slot = self
-            .lazy
-            .get_mut(id.index())
-            .ok_or(SchedError::UnknownLazyDevice(id))?;
-        let device = slot
-            .inner
-            .as_mut()
-            .ok_or(SchedError::UnknownLazyDevice(id))?;
-        let from = device.current_tick();
-        if tick <= from {
-            return Ok(from);
-        }
-        device.advance_to(tick);
-        let to = device.current_tick();
-        if to < from {
-            return Err(SchedError::NonMonotonicDevice {
-                device: id,
-                from,
-                to,
-            });
-        }
-        Ok(to)
+    /// [`SchedError::UnknownLazyDevice`], [`SchedError::LazyDeviceBusy`], or
+    /// [`SchedError::NonMonotonicDevice`] if the device reports going
+    /// backwards.
+    pub fn sync_to_tick(&self, id: LazyId, tick: u64) -> SchedResult<u64> {
+        self.lazy
+            .get(id.index())
+            .ok_or(SchedError::UnknownLazyDevice(id))?
+            .sync_to_tick(id, tick)
     }
 
-    fn catch_up(
-        &mut self,
-        id: LazyId,
-        domain: DomainId,
-        kind: AccessKind,
-        device: &mut dyn LazyDevice,
-    ) -> SchedResult<u64> {
-        let from = device.current_tick();
-        if kind == AccessKind::Debug {
-            return Ok(from);
+    /// Publishes every lazy device's domain position, for the handles.
+    ///
+    /// Called after each advance of virtual time. Cheap — there are as many
+    /// slots as there are lazily-advanced devices, which is a handful — and
+    /// recomputed rather than tracked incrementally, because a guest write that
+    /// re-rates or gates a domain moves its tick counter without anything
+    /// having advanced.
+    fn publish_lazy_positions(&self) {
+        for slot in &self.lazy {
+            if let Ok(present) = self.forest.ticks(slot.domain) {
+                slot.publish(present);
+            }
         }
-        let present = self.forest.ticks(domain)?;
-        let bound = device.next_event_tick().unwrap_or(u64::MAX);
-        let target = present.min(bound);
-        if target <= from {
-            return Ok(from);
-        }
-        device.advance_to(target);
-        let to = device.current_tick();
-        if to < from {
-            return Err(SchedError::NonMonotonicDevice {
-                device: id,
-                from,
-                to,
-            });
-        }
-        Ok(to)
     }
 
     // -- running ------------------------------------------------------------
@@ -1248,6 +1676,9 @@ impl Scheduler {
         self.advance_undriven_trees(target)?;
 
         self.now = target;
+        // Before the events are popped, so a handler reached through a handle
+        // sees the position the event fired at rather than the previous one.
+        self.publish_lazy_positions();
         let mut fired = Vec::new();
         while let Some(e) = self.queue.pop_due(self.now) {
             fired.push(e);
@@ -1267,6 +1698,7 @@ impl Scheduler {
         }
         self.advance_undriven_trees(to)?;
         self.now = to;
+        self.publish_lazy_positions();
         Ok(())
     }
 
@@ -1341,6 +1773,57 @@ impl Scheduler {
     #[inline]
     pub fn rate_controller_mut(&mut self) -> &mut RateController {
         &mut self.rate
+    }
+
+    // -- snapshots ----------------------------------------------------------
+
+    /// Everything a snapshot has to carry about this scheduler (§4.5).
+    ///
+    /// See [`SchedulerSnapshot`] for what is in it and what is deliberately
+    /// not.
+    pub fn snapshot(&self) -> SchedulerSnapshot {
+        SchedulerSnapshot {
+            now: self.now,
+            next_seq: self.queue.next_seq(),
+            cursor: self.cursor,
+            events: self.queue.events(),
+        }
+    }
+
+    /// Restores what [`Scheduler::snapshot`] returned.
+    ///
+    /// The queue is replaced wholesale, virtual time is set to the saved
+    /// instant, and the tie-break counter resumes where it left off — so the
+    /// restored machine fires exactly the events the saved one would have, at
+    /// exactly the same instants, in exactly the same order.
+    ///
+    /// Rate control re-anchors if a host clock is present: virtual time has
+    /// just jumped, and an anchor from before the jump would have the machine
+    /// either sprint or stall for however far it moved. Pacing is not guest
+    /// state, so this is a re-anchoring rather than a restore.
+    ///
+    /// # Errors
+    ///
+    /// [`SchedError::InvalidSnapshot`] if the round-robin cursor does not name
+    /// a registered runnable, or if the event set is not internally consistent
+    /// — see [`EventQueue::restore`].
+    pub fn restore(&mut self, snapshot: &SchedulerSnapshot) -> SchedResult<()> {
+        let count = self.runnables.len();
+        if (count == 0 && snapshot.cursor != 0) || (count > 0 && snapshot.cursor >= count) {
+            return Err(SchedError::InvalidSnapshot(
+                "the round-robin cursor does not name a registered runnable",
+            ));
+        }
+        self.queue
+            .restore(snapshot.now, snapshot.next_seq, &snapshot.events)?;
+        self.now = snapshot.now;
+        self.cursor = snapshot.cursor;
+        self.publish_lazy_positions();
+        if let Some(clock) = self.host_clock.as_ref() {
+            let host_nanos = clock.monotonic_nanos();
+            self.rate.reset(host_nanos, self.now);
+        }
+        Ok(())
     }
 }
 
@@ -1811,9 +2294,199 @@ mod tests {
         assert_eq!(sched.sync_to_tick(dev, dot - 10).unwrap(), dot);
     }
 
+    // -- catch-up from an access path ---------------------------------------
+
+    /// A CPU that reads a lazily-advanced device from inside its own execution
+    /// — an MMIO read in miniature. It holds a [`LazyHandle`] and nothing else:
+    /// no borrow of the scheduler, which is what the real path cannot have.
+    struct SyncingCpu {
+        handle: LazyHandle,
+        seen: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl Runnable for SyncingCpu {
+        fn run(&mut self, budget: Budget) -> Consumed {
+            let at = self.handle.sync(AccessKind::Guest).expect("catch-up");
+            self.seen.lock().push(at);
+            Consumed::new(budget.ticks)
+        }
+    }
+
+    #[test]
+    fn a_device_is_caught_up_from_inside_a_running_cpu() {
+        // The whole point of §4.2's sync-on-access: the trigger is a memory
+        // access several frames below the run loop, with no way back to the
+        // scheduler. A handle is that way.
+        let (mut sched, cpu, ppu) = nes_scheduler();
+        let dev = sched.add_lazy_device(ppu, Box::new(Ppu::default()));
+        let handle = sched.lazy_handle(dev).expect("a handle");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        sched.add_runnable(
+            cpu,
+            Box::new(SyncingCpu {
+                handle,
+                seen: Arc::clone(&seen),
+            }),
+        );
+
+        sched.run_quantum().unwrap();
+        let after_one = sched.forest().ticks(cpu).unwrap();
+        assert!(after_one > 1_000);
+        sched.run_quantum().unwrap();
+
+        let seen = seen.lock().clone();
+        assert_eq!(seen[0], 0, "nothing has run before the first quantum");
+        // The read in the second quantum sees the dot the CPU had reached, at
+        // three dots per cycle, arrived at without one absolute-time
+        // conversion. A runnable's progress *within* the quantum it is
+        // currently in is not in the clock forest yet — the forest is advanced
+        // from its report, after it returns — so this is the position at the
+        // quantum boundary. See `LazyHandle`.
+        assert_eq!(seen[1], after_one * 3);
+    }
+
+    /// A device with something observable to be wrong about: a flag that goes
+    /// up at a known dot, which a stale device would report the wrong side of.
+    #[derive(Debug)]
+    struct FlagPpu {
+        tick: u64,
+        flag_at: u64,
+        flag: Arc<Mutex<bool>>,
+    }
+
+    impl LazyDevice for FlagPpu {
+        fn current_tick(&self) -> u64 {
+            self.tick
+        }
+        fn advance_to(&mut self, tick: u64) {
+            self.tick = tick;
+            if tick >= self.flag_at {
+                *self.flag.lock() = true;
+            }
+        }
+    }
+
+    #[test]
+    fn an_access_reads_the_value_the_device_had_at_that_very_tick() {
+        // One quantum is about 1 790 NES CPU cycles, so 5 370 dots.
+        for (flag_at, expected) in [(100u64, true), (1_000_000u64, false)] {
+            let (mut sched, cpu, ppu) = nes_scheduler();
+            let flag = Arc::new(Mutex::new(false));
+            let dev = sched.add_lazy_device(
+                ppu,
+                Box::new(FlagPpu {
+                    tick: 0,
+                    flag_at,
+                    flag: Arc::clone(&flag),
+                }),
+            );
+            let handle = sched.lazy_handle(dev).expect("a handle");
+            sched.add_runnable(cpu, Box::new(Cpu::default()));
+            sched.run_quantum().unwrap();
+
+            // Stale until somebody looks: that is what makes it cheap.
+            assert!(!*flag.lock(), "at {flag_at}");
+            handle.sync(AccessKind::Guest).expect("catch-up");
+            assert_eq!(*flag.lock(), expected, "at {flag_at}");
+        }
+    }
+
+    #[test]
+    fn catch_up_takes_nothing_a_bus_access_may_not_nest_under() {
+        use crate::core::sync::{self, LockRank};
+
+        let (mut sched, cpu, ppu) = nes_scheduler();
+        let dev = sched.add_lazy_device(ppu, Box::new(Ppu::default()));
+        let handle = sched.lazy_handle(dev).expect("a handle");
+        sched.add_runnable(cpu, Box::new(Cpu::default()));
+        sched.run_quantum().unwrap();
+        let dot = sched.forest().ticks(ppu).unwrap();
+
+        // An MMIO read holds the bus fabric's lock. `LockRank::SCHED` is above
+        // `LockRank::BUS`, so reaching back for the scheduler from here is a
+        // ladder inversion — and a deadlock the moment two CPUs on two buses do
+        // it at once.
+        let _bus = LockRank::BUS.enter();
+        assert_eq!(
+            sync::violates_lock_order(LockRank::SCHED),
+            cfg!(debug_assertions),
+            "the inversion this design exists to avoid"
+        );
+        // Catch-up does not take it. In a debug build the ladder is live, so
+        // anything at or below `BUS` would panic here rather than pass.
+        assert_eq!(handle.sync(AccessKind::Guest).unwrap(), dot);
+    }
+
+    /// A device that reads its own registers as it simulates — the one way a
+    /// catch-up can re-enter itself.
+    #[derive(Debug)]
+    struct SelfReadingPpu {
+        tick: u64,
+        me: Arc<Mutex<Option<LazyHandle>>>,
+        saw: Arc<Mutex<Option<SchedError>>>,
+    }
+
+    impl LazyDevice for SelfReadingPpu {
+        fn current_tick(&self) -> u64 {
+            self.tick
+        }
+        fn advance_to(&mut self, tick: u64) {
+            let me = self.me.lock().clone();
+            if let Some(handle) = me {
+                *self.saw.lock() = handle.sync(AccessKind::Guest).err();
+            }
+            self.tick = tick;
+        }
+    }
+
+    #[test]
+    fn a_re_entrant_catch_up_is_reported_rather_than_deadlocked() {
+        let (mut sched, cpu, ppu) = nes_scheduler();
+        let me = Arc::new(Mutex::new(None));
+        let saw = Arc::new(Mutex::new(None));
+        let dev = sched.add_lazy_device(
+            ppu,
+            Box::new(SelfReadingPpu {
+                tick: 0,
+                me: Arc::clone(&me),
+                saw: Arc::clone(&saw),
+            }),
+        );
+        *me.lock() = Some(sched.lazy_handle(dev).expect("a handle"));
+        sched.add_runnable(cpu, Box::new(Cpu::default()));
+        sched.run_quantum().unwrap();
+
+        // The outer catch-up succeeds; the inner one finds the device in flight
+        // and says so. Waiting would be a deadlock and recursing would need two
+        // mutable borrows of one device, so this is the only honest answer.
+        assert!(sched.sync_for_access(dev, AccessKind::Guest).unwrap() > 0);
+        assert_eq!(*saw.lock(), Some(SchedError::LazyDeviceBusy(dev)));
+    }
+
+    #[test]
+    fn a_handle_and_the_scheduler_reach_the_same_device() {
+        let (mut sched, cpu, ppu) = nes_scheduler();
+        let dev = sched.add_lazy_device(ppu, Box::new(Ppu::default()));
+        let handle = sched.lazy_handle(dev).expect("a handle");
+        assert_eq!(handle.id(), dev);
+        assert_eq!(handle.domain(), ppu);
+        assert_eq!(sched.lazy_domain(dev).unwrap(), ppu);
+
+        sched.add_runnable(cpu, Box::new(Cpu::default()));
+        sched.run_quantum().unwrap();
+        let through_the_scheduler = sched.sync_for_access(dev, AccessKind::Guest).unwrap();
+        assert_eq!(handle.current_tick().unwrap(), through_the_scheduler);
+        assert_eq!(handle.present_tick(), through_the_scheduler);
+        // And a second sync through either route is a no-op.
+        assert_eq!(
+            handle.sync(AccessKind::Guest).unwrap(),
+            through_the_scheduler
+        );
+    }
+
     #[test]
     fn unknown_handles_are_errors_not_panics() {
-        let (mut sched, _cpu, _ppu) = nes_scheduler();
+        let (sched, _cpu, _ppu) = nes_scheduler();
         let bogus_device = LazyId(7);
         assert_eq!(
             sched
@@ -1874,6 +2547,209 @@ mod tests {
         let mut sched = Scheduler::new(forest, SchedulerConfig::default());
         sched.run_until(t(5_000_000_000)).unwrap();
         assert_eq!(sched.now(), t(5_000_000_000));
+    }
+
+    // -- snapshots ----------------------------------------------------------
+
+    #[test]
+    fn a_queue_round_trips_through_enumeration_and_restore() {
+        let mut q = EventQueue::default();
+        let mut rng = 0xfeed_face_u64;
+        for i in 0..300u64 {
+            rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            // Every level of the wheel, the far heap, and a pile of ties.
+            let when = t(((rng >> 41) % 2_000_000_000) / 1_000 * 1_000);
+            q.schedule(when, EventTarget((i % 5) as u32), i);
+        }
+        let cancelled = q.schedule(t(10), EventTarget(9), 999);
+        q.cancel(cancelled);
+        // Part way through, so the wheel has cascaded and the layout is no
+        // longer the one insertion produced.
+        q.advance_to(t(400_000_000));
+
+        let events = q.events();
+        let next_seq = q.next_seq();
+        assert!(
+            events.iter().all(|e| e.token != 999),
+            "a cancelled event is not state"
+        );
+        assert!(events.windows(2).all(|w| w[0] < w[1]), "in fire order");
+
+        let mut restored = EventQueue::new(DEFAULT_GRANULE_SHIFT);
+        restored.restore(q.now(), next_seq, &events).unwrap();
+        assert_eq!(restored.now(), q.now());
+        assert_eq!(restored.next_seq(), next_seq);
+        assert_eq!(restored.next_deadline(), q.next_deadline());
+
+        // The claim that matters: what is left fires identically.
+        let a = drain(&mut q, t(4_000_000_000));
+        let b = drain(&mut restored, t(4_000_000_000));
+        assert!(!a.is_empty());
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn an_event_already_due_survives_a_restore_and_still_fires() {
+        // Restoring must not quietly drop what a save caught in flight.
+        let mut q = EventQueue::default();
+        q.advance_to(t(1_000));
+        q.schedule(t(10), EventTarget(0), 7);
+        let events = q.events();
+        let mut restored = EventQueue::default();
+        restored.restore(t(1_000), q.next_seq(), &events).unwrap();
+        assert_eq!(drain(&mut restored, t(1_000)), alloc::vec![(7, 0)]);
+    }
+
+    #[test]
+    fn an_inconsistent_event_set_is_refused_rather_than_loaded() {
+        let mut q = EventQueue::default();
+        let event = |seq: u64| Event {
+            time: t(100),
+            id: EventId::from_seq(seq),
+            target: EventTarget(0),
+            token: seq,
+        };
+        // A sequence number the counter has not reached: the next event posted
+        // would collide with it and the two would tie on identity.
+        assert_eq!(
+            q.restore(t(0), 3, &[event(3)]).unwrap_err(),
+            SchedError::InvalidSnapshot(
+                "an event's sequence number is not below the next sequence number"
+            )
+        );
+        assert_eq!(
+            q.restore(t(0), 9, &[event(1), event(1)]).unwrap_err(),
+            SchedError::InvalidSnapshot("two events share a sequence number")
+        );
+    }
+
+    #[test]
+    fn a_saved_scheduler_fires_the_same_events_at_the_same_instants() {
+        let mut saved = nes_scheduler().0;
+        let (_, cpu, ppu) = nes_scheduler();
+        saved.add_runnable(cpu, Box::new(Cpu::default()));
+        for i in 0..40u64 {
+            saved
+                .schedule_after_ticks(ppu, 700 + i * 41, EventTarget(2), i)
+                .unwrap();
+        }
+
+        // Run part way, so the queue is mid-flight rather than pristine.
+        for _ in 0..6 {
+            saved.run_quantum().unwrap();
+        }
+        let snapshot = saved.snapshot();
+        assert!(!snapshot.events.is_empty(), "events still pending");
+
+        // The layer above saves the clock forest separately — its tick counters
+        // are the authoritative time state — so the restore starts from those
+        // and adds the scheduler's own.
+        let mut restored = Scheduler::new(saved.forest().clone(), SchedulerConfig::default());
+        restored.add_runnable(cpu, Box::new(Cpu::default()));
+        assert_eq!(restored.now(), GlobalTime::ZERO);
+        restored.restore(&snapshot).unwrap();
+        assert_eq!(restored.now(), saved.now());
+
+        let history = |sched: &mut Scheduler| {
+            let mut out = Vec::new();
+            for _ in 0..40 {
+                let report = sched.run_quantum().unwrap();
+                for e in report.fired {
+                    out.push((e.time.raw(), e.id.seq(), e.token));
+                }
+            }
+            out
+        };
+        let a = history(&mut saved);
+        let b = history(&mut restored);
+        assert!(
+            a.len() > 20,
+            "the run must actually fire things: {}",
+            a.len()
+        );
+        assert_eq!(a, b);
+        assert_eq!(saved.now(), restored.now());
+    }
+
+    #[test]
+    fn ties_still_break_by_sequence_after_a_restore() {
+        let (mut sched, _cpu, _ppu) = nes_scheduler();
+        sched.schedule_at(t(1_000), EventTarget(0), 10);
+        sched.schedule_at(t(1_000), EventTarget(0), 11);
+        let snapshot = sched.snapshot();
+
+        let mut restored = Scheduler::new(sched.forest().clone(), SchedulerConfig::default());
+        restored.restore(&snapshot).unwrap();
+        // An event posted after the restore is *later* than both, and must lose
+        // the tie to them. It only does if the sequence counter carried over.
+        restored.schedule_at(t(1_000), EventTarget(0), 12);
+
+        let report = restored.run_quantum().unwrap();
+        let tokens: Vec<u64> = report.fired.iter().map(|e| e.token).collect();
+        assert_eq!(tokens, alloc::vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn the_round_robin_resumes_where_it_stopped() {
+        let forest = || {
+            let mut f = ClockForest::new();
+            let root = f
+                .add_oscillator("xtal", Rational::integer(1_000_000))
+                .unwrap();
+            let a = f.add_domain("a", root, 1, 1).unwrap();
+            let b = f.add_domain("b", root, 1, 1).unwrap();
+            let c = f.add_domain("c", root, 1, 1).unwrap();
+            (f, a, b, c)
+        };
+        let (f, a, b, c) = forest();
+        let mut sched = Scheduler::new(f, SchedulerConfig::default());
+        for domain in [a, b, c] {
+            sched.add_runnable(domain, Box::new(Cpu::default()));
+        }
+        sched.run_quantum().unwrap();
+        let snapshot = sched.snapshot();
+        assert_eq!(snapshot.cursor, 1);
+
+        let mut restored = Scheduler::new(sched.forest().clone(), SchedulerConfig::default());
+        for domain in [a, b, c] {
+            restored.add_runnable(domain, Box::new(Cpu::default()));
+        }
+        restored.restore(&snapshot).unwrap();
+
+        // Which runnable goes first is guest-visible the moment two of them
+        // touch the same device, so it is state, not scheduling policy.
+        let order = |sched: &mut Scheduler| {
+            sched
+                .run_quantum()
+                .unwrap()
+                .consumed
+                .iter()
+                .map(|(id, _)| id.index())
+                .collect::<Vec<_>>()
+        };
+        let from_the_saved = order(&mut sched);
+        let from_the_restored = order(&mut restored);
+        assert_eq!(from_the_restored, alloc::vec![1, 2, 0]);
+        assert_eq!(from_the_saved, from_the_restored);
+    }
+
+    #[test]
+    fn a_snapshot_that_does_not_fit_this_machine_is_refused() {
+        let (mut sched, cpu, _ppu) = nes_scheduler();
+        sched.add_runnable(cpu, Box::new(Cpu::default()));
+        let mut snapshot = sched.snapshot();
+        snapshot.cursor = 4;
+        assert_eq!(
+            sched.restore(&snapshot).unwrap_err(),
+            SchedError::InvalidSnapshot(
+                "the round-robin cursor does not name a registered runnable"
+            )
+        );
+        // And a machine with nothing to run has nowhere for a cursor to point.
+        let (mut empty, _cpu, _ppu) = nes_scheduler();
+        let mut snapshot = empty.snapshot();
+        snapshot.cursor = 1;
+        assert!(empty.restore(&snapshot).is_err());
     }
 
     // -- rate control -------------------------------------------------------
