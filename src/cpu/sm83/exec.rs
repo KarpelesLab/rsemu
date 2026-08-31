@@ -49,6 +49,7 @@
 //! Gekkio's *Game Boy: Complete Technical Reference*. No emulator source was
 //! consulted.
 
+use crate::core::sched::TickCursor;
 use crate::core::space::{AddressSpace, MemAttrs};
 use crate::core::value::Width;
 
@@ -167,6 +168,8 @@ pub(super) struct Exec<'a> {
     space: &'a AddressSpace,
     lines: &'a Lines,
     attrs: MemAttrs,
+    /// Where to publish the cycle counter as the step runs, if anyone asked.
+    cursor: Option<&'a TickCursor>,
     /// Cycles this step has charged.
     used: u64,
 }
@@ -184,8 +187,15 @@ impl<'a> Exec<'a> {
             space,
             lines,
             attrs: MemAttrs::DEFAULT.with_requester(cfg.requester),
+            cursor: None,
             used: 0,
         }
+    }
+
+    /// Publish each machine cycle to `cursor` as it is charged.
+    pub(super) fn with_cursor(mut self, cursor: Option<&'a TickCursor>) -> Exec<'a> {
+        self.cursor = cursor;
+        self
     }
 
     /// Run one instruction, one interrupt dispatch, or one idle cycle.
@@ -246,9 +256,22 @@ impl<'a> Exec<'a> {
     // -----------------------------------------------------------------
 
     /// Charge one machine cycle.
+    ///
+    /// The counter moves *before* the access, and the published value is
+    /// therefore the number of the cycle the access falls in rather than the one
+    /// before it. That is the right end of the M-cycle: the SM83 puts the
+    /// address out over the first half and latches the data at the end, so a
+    /// device answering this access has to have run to the boundary this cycle
+    /// closes (Gekkio, *Game Boy: Complete Technical Reference*, §"Memory
+    /// access timing"). Publishing the boundary it *opened* would put every
+    /// read four dots early, which is a whole PPU dot-quartet and shows up
+    /// directly in Gekkio's `intr_2_mode0_timing` group.
     fn tick(&mut self) {
         self.used += 1;
         self.state.cycles = self.state.cycles.wrapping_add(1);
+        if let Some(cursor) = self.cursor {
+            cursor.set(self.state.cycles);
+        }
     }
 
     /// One machine cycle in which the chip does something internal rather than
@@ -353,11 +376,18 @@ impl<'a> Exec<'a> {
     /// The five-cycle dispatch sequence (Pan Docs, *Interrupts*).
     ///
     /// Two internal cycles, the two pushes, and the cycle that loads `PC`. The
-    /// order matters and is not cosmetic: **the vector is decided after the
-    /// pushes**, from a fresh read of `IE & IF`, so a stack that has walked down
-    /// onto `$FFFF` overwrites `IE` with the byte it just pushed and changes —
-    /// or removes — the interrupt being taken. `$0000` is where the chip goes
-    /// when the re-read finds nothing.
+    /// order matters and is not cosmetic: **`IE & IF` is sampled between the two
+    /// pushes**, not before them and not after both. A stack that has walked
+    /// down onto `$FFFF` therefore has its high-byte push land on `IE` in time
+    /// to change — or remove — the interrupt being taken, while a stack one byte
+    /// higher, whose *low*-byte push lands there, is too late to. `$0000` is
+    /// where the chip goes when the sample finds nothing.
+    ///
+    /// That asymmetry is what Gekkio's `acceptance/interrupts/ie_push` measures,
+    /// round 1 against round 3, and it is reported verified on every model of
+    /// the family. It is also the only thing that distinguishes the read
+    /// happening in the M-cycle between the two writes from it happening after
+    /// them, which is why the test exists.
     fn dispatch_interrupt(&mut self) {
         self.state.ime = false;
         self.state.ei_pending = false;
@@ -365,8 +395,8 @@ impl<'a> Exec<'a> {
         self.idle(); // dispatch cycle 2: still nothing
         let pc = self.state.regs.pc;
         self.push8((pc >> 8) as u8);
-        self.push8(pc as u8);
         let pending = self.pending();
+        self.push8(pc as u8);
         let target = if pending == 0 {
             0x0000
         } else {

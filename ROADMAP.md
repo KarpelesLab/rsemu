@@ -35,7 +35,9 @@ something a person can actually run (§2).
 > no public v5 corpus and leans on the ARM7TDMI v4T subset (§12); **ARMv7E-M**
 > is differentially tested against our own ARMv5TE across all 65,536 halfwords,
 > 83,597 identical and 13,683 divergences *asserted* rather than skipped; SM83
-> runs blargg and mooneye.
+> passes blargg's `cpu_instrs` and `instr_timing` **12/12** on the assembled
+> machine and Gekkio's acceptance suite **59/66**, with the other seven
+> ledgered and argued (three of them need a boot ROM we cannot ship).
 >
 > The x86 core now also covers the **80386 and 80486** — protected mode, the
 > descriptor tables and their hidden caches, privilege levels, gates, task
@@ -803,7 +805,12 @@ snapshot header, since queued deadlines are meaningless without it.
   `Device::sampled_every_cycle` and is caught up on every cycle rather than
   every quantum. It is what made AccuracyCoin's cycle-exact `/RDY` and DMA
   tests measurable at all. The Game Boy numbers above predate it and are the
-  record of what the limitation cost, not of a limitation that still stands.
+  record of what the limitation cost, not of a limitation that still stands:
+  teaching the SM83 to publish its machine cycle took it from **22/66 to
+  34/66** on its own and emptied the blargg ledger, and the defects that fix
+  then made visible — an OAM transfer's two-cycle start delay, the machine
+  cycle by which `STAT`'s mode bits lag the controller's own — took it to
+  **59/66**, with the remaining seven argued in `dev::gb::conformance`.
 - **A budget rarely lands on a tick boundary, and that has to be decided.** An
   event at PPU dot 82181 falls two-thirds of the way through a CPU cycle. The
   rule: **stop at the cycle boundary before, never drag a domain mid-cycle** —

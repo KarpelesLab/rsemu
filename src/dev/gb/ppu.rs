@@ -67,11 +67,28 @@
 //!   `STAT` interrupt produces — work correctly, because the interrupt fires
 //!   before the next line is drawn.
 //! * **The mode-3 penalty for objects** is Pan Docs' documented approximation,
-//!   not a fetcher simulation.
+//!   not a fetcher simulation. Right on average and wrong per case, which is
+//!   what `ppu/intr_2_mode0_timing_sprites` measures.
 //! * **`STAT`'s DMG write bug** — writing `STAT` briefly reads all conditions as
 //!   true and can raise a spurious interrupt.
-//! * **The first frame after the LCD is switched on** is a normal frame here;
-//!   on hardware it is shorter and mode 0 is reported for its first line.
+//! * **The first line after the LCD is switched on** is modelled to the machine
+//!   cycle ([`LCD_ON_SKIP`], and the scan reporting mode 0) but not below it:
+//!   hardware comes up two *dots* into the line, and this timeline is
+//!   quantised to the CPU's machine cycle.
+//!
+//! # What is modelled and was not obvious
+//!
+//! * **The mode a program reads lags the controller's own by a machine cycle**
+//!   ([`MODE_VISIBLE_LAG`]). The `STAT` interrupt conditions come off the
+//!   controller's; `STAT`'s mode bits and the two memory gates come off it
+//!   registered.
+//! * **The `LY == LYC` comparator is a latch with a clock**, and the clock stops
+//!   with the LCD.
+//! * **Entering vertical blanking asserts the object-scan condition too**, at
+//!   the same instant as the vertical one.
+//! * **An OAM transfer starts two machine cycles after the write** and holds the
+//!   bus for its hundred and sixty ([`DMA_START_DELAY`]), and its source address
+//!   is decoded with fifteen bits, so pages above `$DF` read work RAM.
 //!
 //! # Sources
 //!
@@ -126,6 +143,41 @@ pub const OAM_SCAN_DOTS: u64 = 80;
 /// The shortest mode 3 can be: no scroll, no window, no objects.
 pub const MODE3_MIN_DOTS: u64 = 172;
 
+/// How far the mode the *CPU* can see lags the one the controller is in.
+///
+/// One machine cycle. The controller's own mode signal drives the `STAT`
+/// interrupt conditions and the fetcher; what reaches `STAT`'s mode bits and the
+/// video/object memory gates is that signal registered, so it arrives four dots
+/// later. Both halves are measured, and they disagree by exactly this:
+///
+/// * `intr_2_0_timing` times the mode-2 `STAT` interrupt against the mode-0
+///   `STAT` interrupt and puts them 63 machine cycles apart, which is
+///   `(80 + 172) / 4` — the *unlagged* boundaries.
+/// * `intr_2_mode3_timing`, `intr_2_mode0_timing` and `intr_2_oam_ok_timing`
+///   time the same mode-2 interrupt against a **read** — of `STAT`'s mode bits
+///   in the first two, of object memory in the third — and put the change one
+///   machine cycle later than that.
+///
+/// Reading the mode bits and reading object memory give the same answer, which
+/// is what says the lag is one registered signal rather than a quirk of the
+/// `STAT` register: the gate and the register are downstream of the same latch.
+/// `hblank_ly_scx_timing` then pins `LY` as *not* lagging — it times the mode-0
+/// interrupt against an `LY` read and the unlagged numbers are the ones that
+/// fit — so this is the mode signal alone and not a general skew between the two
+/// chips.
+pub const MODE_VISIBLE_LAG: u64 = 4;
+
+/// How far into line 0 the controller is when the LCD is switched on.
+///
+/// It does not start the line from the beginning. Gekkio's `lcdon_timing`
+/// tabulates `LY` against the machine cycle the enabling write was made on and
+/// puts the increment to `LY = 1` on cycle 113 rather than 114, so the first
+/// line is four dots short of the 456 every other line takes — the controller
+/// comes up already inside it. (Its header calls this "the PPU is late by 2
+/// T-cycles"; two dots is finer than the CPU can sample, and four is what the
+/// measurement resolves to.)
+pub const LCD_ON_SKIP: u64 = 4;
+
 /// How many bytes of video RAM the console has.
 pub const VRAM_LEN: u64 = 0x2000;
 
@@ -165,6 +217,26 @@ pub const DMA_BYTES: u64 = 160;
 
 /// How many crystal periods each of those machine cycles is.
 const CLOCKS_PER_MCYCLE: u64 = 4;
+
+/// How many machine cycles pass between the write to `$FF46` and the first byte
+/// of the transfer.
+///
+/// Two, and it is observable rather than an implementation detail. Gekkio's
+/// `oam_dma_start` states the sequence a DMG runs and reports it verified on
+/// every model of the family:
+///
+/// ```text
+///   M = 0   the write to $FF46 happens
+///   M = 1   nothing yet — OAM is still accessible
+///   M = 2   the transfer starts, and OAM reads return $FF
+/// ```
+///
+/// Which makes the blocked window `[W+2, W+161]` for a write on cycle `W`, and
+/// that pair of numbers is what half of Gekkio's instruction-timing group is
+/// built on: each of them aligns a memory access against the *end* of a
+/// transfer, so an emulator whose window is two cycles early fails all of them
+/// and one whose window is the wrong length fails half.
+pub const DMA_START_DELAY: u64 = 2;
 
 /// The four LCD modes, in the order a drawn line visits them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -272,6 +344,25 @@ struct Engine {
     window_line: u8,
     /// Whether the window has been drawn on this frame yet.
     window_active: bool,
+    /// Whether the controller is still inside the first object scan after the
+    /// LCD was switched on.
+    ///
+    /// That period is reported as mode **0**, not mode 2, and it does not block
+    /// object memory: Gekkio's `lcdon_timing` reads `$80`/`$84` from `STAT` and
+    /// `$00` from object memory throughout it, and its header states the rule —
+    /// "line 0 starts with mode 0 and goes straight to mode 3".
+    first_scan_after_on: bool,
+    /// The latched output of the `LY == LYC` comparator.
+    ///
+    /// Latched rather than computed, because the comparator is *clocked* and
+    /// the clock stops with the LCD. Gekkio's `stat_lyc_onoff` is about nothing
+    /// else: switch the controller off and the bit keeps whatever it last held,
+    /// writes to `LYC` do not disturb it, and switching the controller back on
+    /// is what runs the comparison again. Computing it would reset the bit to
+    /// the comparison against a stopped `LY`, which reads back wrong and — worse
+    /// — moves the `STAT` line, so the CPU's edge detector invents an interrupt
+    /// that hardware does not raise.
+    lyc_match: bool,
 
     /// Bytes of the OAM transfer still to copy, or zero when idle.
     dma_remaining: u64,
@@ -279,6 +370,18 @@ struct Engine {
     dma_next_dot: u64,
     /// The high byte of the address the transfer is reading from.
     dma_page: u8,
+    /// The first dot at which object memory is blocked by a transfer.
+    ///
+    /// [`u64::MAX`] when none has ever run. Not simply the current transfer's
+    /// start, because a write to `$FF46` while one is already running does not
+    /// stop it (`oam_dma_restart`): the old transfer keeps the bus for the two
+    /// cycles before the new one takes over, so the blocked window is
+    /// continuous across the restart and this stays where the *first* of them
+    /// put it.
+    dma_block_from: u64,
+    /// The last dot at which it is blocked: the dot the transfer's final byte
+    /// moves on, which is still a blocked cycle.
+    dma_block_until: u64,
 }
 
 impl fmt::Debug for Engine {
@@ -319,10 +422,39 @@ impl Engine {
             mode3_len: MODE3_MIN_DOTS,
             window_line: 0,
             window_active: false,
+            first_scan_after_on: false,
+            // `LY` and `LYC` both start at zero, so the comparator's latch
+            // starts where running it once would leave it.
+            lyc_match: true,
             dma_remaining: 0,
             dma_next_dot: 0,
             dma_page: 0,
+            dma_block_from: u64::MAX,
+            dma_block_until: 0,
         }
+    }
+
+    /// Start — or restart — an OAM transfer from page `page`.
+    ///
+    /// Called with `dots` standing on the cycle the write to `$FF46` was made
+    /// on, which is what the two-cycle delay is measured from.
+    fn arm_dma(&mut self, page: u8) {
+        let start = self.dots + DMA_START_DELAY * CLOCKS_PER_MCYCLE;
+        // A restart keeps the window open from wherever the transfer it is
+        // displacing opened it: that one holds the bus until this one starts,
+        // so there is no readable cycle in between.
+        if !self.dma_blocking() {
+            self.dma_block_from = start;
+        }
+        self.dma_block_until = start + (DMA_BYTES - 1) * CLOCKS_PER_MCYCLE;
+        self.dma_page = page;
+        self.dma_remaining = DMA_BYTES;
+        self.dma_next_dot = start;
+    }
+
+    /// Whether a transfer owns the bus on the dot the controller stands on.
+    fn dma_blocking(&self) -> bool {
+        self.dots >= self.dma_block_from && self.dots <= self.dma_block_until
     }
 
     fn lcd_on(&self) -> bool {
@@ -330,18 +462,58 @@ impl Engine {
     }
 
     /// Which mode the controller is in right now.
+    ///
+    /// The controller's own signal, which is what drives the `STAT` interrupt
+    /// conditions. What a program *reads* is [`visible_mode`](Engine::visible_mode),
+    /// one machine cycle behind.
     fn mode(&self) -> Mode {
         if !self.lcd_on() {
             // With the LCD off the controller reports mode 0 and nothing is
             // blocked (Pan Docs, *LCDC*).
             return Mode::HBlank;
         }
-        if self.ly >= VBLANK_LINE {
+        Engine::mode_at(self.ly, self.dot, self.mode3_len)
+    }
+
+    /// The mode a program sees: in `STAT`'s bottom two bits, and in whether
+    /// video and object memory answer.
+    ///
+    /// [`MODE_VISIBLE_LAG`] behind [`mode`](Engine::mode), which is measured
+    /// rather than assumed — see that constant.
+    fn visible_mode(&self) -> Mode {
+        if !self.lcd_on() {
+            return Mode::HBlank;
+        }
+        if self.first_scan_after_on {
+            // Straight from mode 0 into mode 3: the scan happens, and the
+            // controller does not report it or shut anything out for it.
+            return Mode::HBlank;
+        }
+        let (ly, dot) = if self.dot >= MODE_VISIBLE_LAG {
+            (self.ly, self.dot - MODE_VISIBLE_LAG)
+        } else {
+            // Borrowing into the previous line. Its mode-3 length is not known
+            // any more, but the only dots reachable here are its last four, and
+            // hardware's mode 3 never runs past dot 369, so they are mode 0
+            // whatever it was.
+            let ly = if self.ly == 0 {
+                (LINES_PER_FRAME - 1) as u8
+            } else {
+                self.ly - 1
+            };
+            (ly, self.dot + DOTS_PER_LINE - MODE_VISIBLE_LAG)
+        };
+        Engine::mode_at(ly, dot, self.mode3_len)
+    }
+
+    /// The mode at a position, with the LCD known to be on.
+    fn mode_at(ly: u8, dot: u64, mode3_len: u64) -> Mode {
+        if ly >= VBLANK_LINE {
             return Mode::VBlank;
         }
-        if self.dot < OAM_SCAN_DOTS {
+        if dot < OAM_SCAN_DOTS {
             Mode::OamScan
-        } else if self.dot < OAM_SCAN_DOTS + self.mode3_len {
+        } else if dot < OAM_SCAN_DOTS + mode3_len {
             Mode::Drawing
         } else {
             Mode::HBlank
@@ -366,7 +538,17 @@ impl Engine {
     }
 
     fn lyc_equal(&self) -> bool {
-        self.lcd_on() && self.visible_ly() == self.lyc
+        self.lyc_match
+    }
+
+    /// Run the comparator, if its clock is running.
+    ///
+    /// Called on every dot and after anything that can change either input.
+    /// With the LCD off it does nothing at all, which is the whole point.
+    fn update_lyc(&mut self) {
+        if self.lcd_on() {
+            self.lyc_match = self.visible_ly() == self.lyc;
+        }
     }
 
     /// `STAT` as the guest reads it: the stored enables, the coincidence flag,
@@ -374,7 +556,7 @@ impl Engine {
     fn read_stat(&self) -> u8 {
         0x80 | (self.stat & stat::WRITABLE)
             | if self.lyc_equal() { stat::LYC_EQUAL } else { 0 }
-            | self.mode().bits()
+            | self.visible_mode().bits()
     }
 
     /// Whether the status interrupt line is asserted.
@@ -382,17 +564,38 @@ impl Engine {
     /// The OR of every enabled condition — a *level*, which is what gives STAT
     /// blocking for free once the CPU's pin edge-detects it.
     fn stat_line(&self) -> bool {
+        let s = self.stat;
+        // The coincidence condition survives the controller being switched off,
+        // because the latch that feeds it does — and that is load-bearing rather
+        // than pedantic. Gekkio's `stat_lyc_onoff` round 2 switches the LCD off
+        // with the bit set, changes `LYC` so that switching it back on leaves
+        // the comparison unchanged, and requires that **no** interrupt is
+        // raised. Dropping the line while the controller is off and raising it
+        // again on the way back would be a rising edge, and the CPU's pin would
+        // latch an interrupt hardware never raises.
+        if s & stat::LYC_INT != 0 && self.lyc_match {
+            return true;
+        }
         if !self.lcd_on() {
             return false;
         }
-        let s = self.stat;
-        (s & stat::LYC_INT != 0 && self.lyc_equal())
-            || match self.mode() {
-                Mode::HBlank => s & stat::HBLANK_INT != 0,
-                Mode::VBlank => s & stat::VBLANK_INT != 0,
-                Mode::OamScan => s & stat::OAM_INT != 0,
-                Mode::Drawing => false,
+        match self.mode() {
+            Mode::HBlank => s & stat::HBLANK_INT != 0,
+            // Entering vertical blanking asserts the *object scan* condition as
+            // well as the vertical one, and at the same instant: line 144 has a
+            // line start like any other, and what the mode-2 condition is
+            // wired to is the line start rather than the scan itself. Gekkio's
+            // `vblank_stat_intr` measures the two against `DIV` and finds them
+            // simultaneous, which is what "as well as" has to mean.
+            Mode::VBlank => {
+                s & stat::VBLANK_INT != 0
+                    || (s & stat::OAM_INT != 0
+                        && self.ly == VBLANK_LINE
+                        && self.dot < OAM_SCAN_DOTS)
             }
+            Mode::OamScan => s & stat::OAM_INT != 0,
+            Mode::Drawing => false,
+        }
     }
 
     /// Whether the vertical-blank line is asserted.
@@ -401,11 +604,11 @@ impl Engine {
     }
 
     fn vram_readable(&self) -> bool {
-        self.mode() != Mode::Drawing
+        self.visible_mode() != Mode::Drawing
     }
 
     fn oam_readable(&self) -> bool {
-        !matches!(self.mode(), Mode::Drawing | Mode::OamScan) && self.dma_remaining == 0
+        !matches!(self.visible_mode(), Mode::Drawing | Mode::OamScan) && !self.dma_blocking()
     }
 
     // -- mode 3's length ----------------------------------------------------
@@ -623,11 +826,26 @@ impl Engine {
     // -- the dot pipeline ---------------------------------------------------
 
     /// Advance one dot, returning whether a frame just ended.
+    ///
+    /// The comparator runs on every one of them: its clock is this one.
     fn step_dot(&mut self) -> bool {
         self.dots += 1;
         if !self.lcd_on() {
             return false;
         }
+        let ended = self.step_position();
+        // Cleared at the boundary a *program* sees, not the controller's: what
+        // the flag suppresses is the reported mode, so it has to hold until the
+        // reported mode becomes 3.
+        if self.first_scan_after_on && self.dot >= OAM_SCAN_DOTS + MODE_VISIBLE_LAG {
+            self.first_scan_after_on = false;
+        }
+        self.update_lyc();
+        ended
+    }
+
+    /// The dot pipeline proper, without the comparator.
+    fn step_position(&mut self) -> bool {
         let entering_mode3 = self.ly < VBLANK_LINE && self.dot == OAM_SCAN_DOTS - 1;
         self.dot += 1;
         if entering_mode3 {
@@ -662,19 +880,45 @@ impl Engine {
         if !self.lcd_on() {
             return None;
         }
-        let candidates: [u64; 4] = if self.ly < VBLANK_LINE {
+        // Both the controller's own boundaries and the lagged ones a program
+        // reads: between two consecutive events nothing observable changes, and
+        // the register bits are as observable as the interrupt line.
+        let candidates: [u64; 7] = if self.ly < VBLANK_LINE {
             [
+                MODE_VISIBLE_LAG,
                 OAM_SCAN_DOTS,
+                OAM_SCAN_DOTS + MODE_VISIBLE_LAG,
                 OAM_SCAN_DOTS + self.mode3_len,
+                OAM_SCAN_DOTS + self.mode3_len + MODE_VISIBLE_LAG,
+                DOTS_PER_LINE,
+                DOTS_PER_LINE,
+            ]
+        } else if self.ly == VBLANK_LINE {
+            // The object-scan condition holds over the first 80 dots of line
+            // 144 too, and it falling is something a program can see.
+            [
+                MODE_VISIBLE_LAG,
+                OAM_SCAN_DOTS,
+                DOTS_PER_LINE,
+                DOTS_PER_LINE,
+                DOTS_PER_LINE,
                 DOTS_PER_LINE,
                 DOTS_PER_LINE,
             ]
         } else if self.ly == 153 {
             // Line 153's `LY` changes from 153 to 0 four dots in, and a program
             // can see that.
-            [4, DOTS_PER_LINE, DOTS_PER_LINE, DOTS_PER_LINE]
+            [
+                4,
+                DOTS_PER_LINE,
+                DOTS_PER_LINE,
+                DOTS_PER_LINE,
+                DOTS_PER_LINE,
+                DOTS_PER_LINE,
+                DOTS_PER_LINE,
+            ]
         } else {
-            [DOTS_PER_LINE; 4]
+            [DOTS_PER_LINE; 7]
         };
         candidates
             .into_iter()
@@ -722,9 +966,14 @@ impl Engine {
                     self.window_active = false;
                 } else if !was_on && now_on {
                     self.ly = 0;
-                    self.dot = 0;
+                    // Not from the beginning of the line — see `LCD_ON_SKIP`.
+                    self.dot = LCD_ON_SKIP;
+                    self.first_scan_after_on = true;
                     self.mode3_len = self.compute_mode3();
                 }
+                // Switching the controller on starts the comparison clock, and
+                // switching it off stops it with the latch where it stands.
+                self.update_lyc();
             }
             0x01 => self.stat = value & stat::WRITABLE,
             0x02 => self.scy = value,
@@ -732,7 +981,10 @@ impl Engine {
             // `LY` is read-only. A write is ignored rather than faulting: the
             // register is simply not connected to the bus in that direction.
             0x04 => {}
-            0x05 => self.lyc = value,
+            0x05 => {
+                self.lyc = value;
+                self.update_lyc();
+            }
             0x06 => {
                 self.dma_source = value;
                 return Some(value);
@@ -746,6 +998,22 @@ impl Engine {
         }
         None
     }
+}
+
+/// Where the `index`-th byte of a transfer from `page` is read from.
+///
+/// Pan Docs, *OAM DMA Transfer*, documents the source as `$XX00-$XX9F` with
+/// `XX` from `$00` to `$DF`, and stops there. A DMG answers pages above `$DF`
+/// anyway, and it answers them out of work RAM: the transfer's address is
+/// decoded with fifteen bits, so `$E000-$FFFF` selects the same 8 KiB that
+/// `$C000-$DFFF` does — the echo, extended over the whole quarter rather than
+/// stopping at `$FDFF` the way the CPU's own decode does.
+///
+/// Gekkio's `oam_dma/sources` measures exactly that: it fills `$DE00` and
+/// `$DF00`, transfers from pages `$FE` and `$FF`, and expects those bytes.
+fn dma_source_address(page: u8, index: u64) -> u64 {
+    let addr = (u64::from(page) << 8) | index;
+    if addr >= 0xe000 { addr - 0x2000 } else { addr }
 }
 
 /// One entry of the object attribute table, as the scan produced it.
@@ -1043,11 +1311,7 @@ impl GbPpu {
     /// A write to `$FF46` while a transfer is already running restarts it, which
     /// is what hardware does and what `oam_dma_restart` tests.
     fn start_dma(&self, page: u8) {
-        let mut engine = self.shared.engine.lock();
-        engine.dma_page = page;
-        engine.dma_remaining = DMA_BYTES;
-        // The first byte moves one machine cycle after the write.
-        engine.dma_next_dot = engine.dots + CLOCKS_PER_MCYCLE;
+        self.shared.engine.lock().arm_dma(page);
     }
 
     /// Run the controller until `target` dots have elapsed in total.
@@ -1109,7 +1373,7 @@ impl GbPpu {
         let mut out = Vec::with_capacity(count as usize);
         for i in 0..count {
             let index = first + i;
-            let addr = (u64::from(page) << 8) | index;
+            let addr = dma_source_address(page, index);
             let byte = if (VRAM_BASE..VRAM_BASE + VRAM_LEN).contains(&addr) {
                 self.shared.engine.lock().vram[(addr - VRAM_BASE) as usize]
             } else {
@@ -1269,10 +1533,7 @@ impl MemOps for LcdPort {
             .shared
             .with_engine(|e| e.write_register(offset as u8, *value));
         if let Some(page) = page {
-            let mut engine = self.shared.engine.lock();
-            engine.dma_page = page;
-            engine.dma_remaining = DMA_BYTES;
-            engine.dma_next_dot = engine.dots + CLOCKS_PER_MCYCLE;
+            self.shared.engine.lock().arm_dma(page);
         }
         Ok(())
     }
@@ -1289,7 +1550,7 @@ impl MemOps for LcdPort {
 /// The `gb.ppu` device class.
 pub static CLASS: DeviceClass = DeviceClass {
     name: "gb.ppu",
-    version: 1,
+    version: 3,
     summary: "Game Boy LCD controller: VRAM, OAM, $FF40-$FF4B, OAM DMA",
     properties: &[],
     construct: |props| Ok(Box::new(GbPpu::from_props(props)?) as Box<dyn Device>),
@@ -1369,8 +1630,23 @@ impl Device for GbPpu {
         }
     }
 
+    /// Back to power-on, **without rewinding the clock**.
+    ///
+    /// `Machine::reset` resets devices; it does not rewind clock domains, and
+    /// this device's tick *is* its domain's position rather than state of its
+    /// own. Zeroing it would leave the controller claiming dot 0 while the
+    /// forest stands wherever it stands, and the next catch-up would be asked
+    /// to walk every dot since power-on in one call — a hang on a mid-run
+    /// reset, and invisible to any test that only resets a fresh machine.
+    ///
+    /// So the frame restarts — `LY`, the dot within the line, the registers —
+    /// and the tick does not.
     fn reset(&self, _kind: ResetKind) {
-        self.shared.with_engine(|e| *e = Engine::new());
+        self.shared.with_engine(|e| {
+            let dots = e.dots;
+            *e = Engine::new();
+            e.dots = dots;
+        });
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
@@ -1397,12 +1673,20 @@ impl Device for GbPpu {
             w.write_u8(byte)?;
         }
         w.write_bool(engine.window_active)?;
+        w.write_bool(engine.lyc_match)?;
         w.write_u64(engine.dot)?;
         w.write_u64(engine.dots)?;
         w.write_u64(engine.frame)?;
         w.write_u64(engine.mode3_len)?;
         w.write_u64(engine.dma_remaining)?;
         w.write_u64(engine.dma_next_dot)?;
+        w.write_u64(engine.dma_block_from)?;
+        w.write_u64(engine.dma_block_until)?;
+        // Appended rather than written beside `window_active`, where it
+        // belongs: `dev::gb::conformance` walks this chunk by hand as far as
+        // the frame counter, and a field inserted before that silently breaks
+        // the runner rather than a test.
+        w.write_bool(engine.first_scan_after_on)?;
         Ok(())
     }
 
@@ -1438,12 +1722,16 @@ impl Device for GbPpu {
             engine.window_line = r.read_u8()?;
             engine.dma_page = r.read_u8()?;
             engine.window_active = r.read_bool()?;
+            engine.lyc_match = r.read_bool()?;
             engine.dot = r.read_u64()?;
             engine.dots = r.read_u64()?;
             engine.frame = r.read_u64()?;
             engine.mode3_len = r.read_u64()?;
             engine.dma_remaining = r.read_u64()?;
             engine.dma_next_dot = r.read_u64()?;
+            engine.dma_block_from = r.read_u64()?;
+            engine.dma_block_until = r.read_u64()?;
+            engine.first_scan_after_on = r.read_bool()?;
             // The dot counter and the next event both came from the snapshot;
             // the lock-free copies of them are derived state and must follow.
             self.shared.publish(&engine);

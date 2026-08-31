@@ -465,7 +465,7 @@ struct Shared {
 }
 
 /// The mapper's registers, and the RTC.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct Banks {
     /// The low bank register: five bits on MBC1, seven on MBC3, eight on MBC5.
     bank_low: u16,
@@ -484,6 +484,32 @@ struct Banks {
     rtc_latched: Rtc,
     /// Ticks of the RTC crystal not yet accounted to a whole second.
     rtc_residual: u64,
+}
+
+impl Default for Banks {
+    /// Power-on: **bank 1** at `$4000`, and everything else zero.
+    ///
+    /// One is not a convenience. No boot ROM writes a mapper register, so a
+    /// cartridge's own entry point at `$0100` runs with whatever the controller
+    /// came up holding, and every commercial image expects to be able to call
+    /// straight into bank 1 from there — Gekkio's `oam_dma/sources-GS` does it
+    /// in its third instruction. MBC1, MBC2 and MBC3 reach bank 1 anyway
+    /// through their "a written zero reads as one" rule, so this only shows on
+    /// **MBC5**, which is the one controller where a written zero really does
+    /// select bank 0 (Pan Docs, *MBC5*) and where the rule therefore cannot
+    /// stand in for the power-on value.
+    fn default() -> Banks {
+        Banks {
+            bank_low: 1,
+            bank_high: 0,
+            advanced: false,
+            rtc_select: 0,
+            latch_state: 0,
+            rtc: Rtc::default(),
+            rtc_latched: Rtc::default(),
+            rtc_residual: 0,
+        }
+    }
 }
 
 impl Shared {
@@ -528,10 +554,10 @@ impl Shared {
                 (0, u64::from(low) & mask)
             }
             // MBC5 is the first controller where bank 0 really means bank 0.
-            Mapper::Mbc5 => {
-                let bank = (u64::from(banks.bank_high & 1) << 8) | u64::from(banks.bank_low & 0xff);
-                (0, bank & mask)
-            }
+            // Both halves of the number live in `bank_low` — the `$3000`
+            // register writes its bit 8 — because `bank_high` is MBC5's *RAM*
+            // bank and has nothing to do with the ROM.
+            Mapper::Mbc5 => (0, u64::from(banks.bank_low & 0x1ff) & mask),
         };
         self.rom0_base.store(rom0 * ROM_BANK, Ordering::Relaxed);
         self.rom1_base.store(rom1 * ROM_BANK, Ordering::Relaxed);

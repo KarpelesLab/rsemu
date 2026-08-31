@@ -191,6 +191,14 @@ fn serial_transcript(machine: &Machine) -> Option<String> {
 /// Read out of its chunk for the same reason as everything else here. The
 /// framebuffer is the first three length-prefixed byte arrays; the frame counter
 /// follows the register bytes.
+///
+/// **This walk moves with `gb.ppu`'s chunk layout**, and it fails quietly if it
+/// does not: a `u64` read off the wrong offset still succeeds and returns a
+/// number, the runner then thinks its frame budget is exhausted, and every ROM
+/// reports "no verdict" while the machine is in fact perfectly healthy. That is
+/// exactly what happened once. `the_harness_reads_the_register_file_and_the_
+/// frame_counter` now checks the number rather than its existence, so the next
+/// layout change fails a test instead of a suite.
 fn frames(machine: &Machine) -> Option<u64> {
     let data = chunk_of(machine, "ppu")?;
     let mut r = crate::core::state::ChunkReader::new(&data);
@@ -201,6 +209,7 @@ fn frames(machine: &Machine) -> Option<u64> {
         r.read_u8().ok()?;
     }
     let _window_active = r.read_bool().ok()?;
+    let _lyc_match = r.read_bool().ok()?;
     let _dot = r.read_u64().ok()?;
     let _dots = r.read_u64().ok()?;
     r.read_u64().ok()
@@ -263,23 +272,26 @@ fn run(machine: &mut Machine, limit_frames: u64, mut stop: impl FnMut(&Machine) 
 /// The known-failures ledger for the whole-machine blargg run.
 ///
 /// `ROADMAP.md` §0 asks every core to ship a ledger that *only ever shrinks*,
-/// and this is it. One entry, and the reason is not a Game Boy bug:
+/// and this is it. It is **empty**, and the entry that used to be here is worth
+/// recording because of how it went:
 ///
-/// **`instr_timing`** passes 12/12 against the SM83 on its own
+/// **`instr_timing`** passed 12/12 against the SM83 on its own
 /// (`cpu::sm83::conformance`), where the timer is advanced in step with the
-/// processor. On the assembled machine it fails, and the cause is the
-/// intra-quantum staleness `ROADMAP.md` §4.2 already records as outstanding: a
-/// [`LazyHandle`](crate::core::sched::LazyHandle) catches a device up to the
-/// tick the *scheduler* last published, which is the start of the current
-/// quantum, and an instruction cannot be stopped part-way, so a CPU overruns
-/// each quantum by up to five machine cycles and reads a timer that is that far
-/// behind. `instr_timing` measures the timer against single instructions, so a
-/// bias of a few cycles is exactly what it detects.
+/// processor, and failed on the assembled machine. The cause was the
+/// intra-quantum staleness `ROADMAP.md` §4.2 used to record as outstanding: a
+/// [`LazyHandle`](crate::core::sched::LazyHandle) caught a device up only to
+/// the tick the *scheduler* had published, which is the start of the current
+/// quantum, so an instruction reading the timer read one that was up to five
+/// machine cycles behind. `instr_timing` measures the timer against single
+/// instructions, which is exactly that bias.
 ///
-/// Fixing it means letting a runnable report progress *as* it runs — a change to
-/// `core::sched::Runnable`, which phase 4 is explicitly not the place to make.
-/// The entry comes out when that lands.
-const BLARGG_LEDGER: &[&str] = &["instr_timing.gb"];
+/// [`TickCursor`](crate::core::sched::TickCursor) closed it: the SM83 now
+/// publishes its machine-cycle counter as it executes
+/// ([`Sm83::attach_cursor`](crate::cpu::sm83::Sm83::attach_cursor)) and every
+/// lazily-advanced device is converted onto that cycle through the oscillator
+/// tree they share. The entry came out when that landed, and nothing has gone
+/// back in.
+const BLARGG_LEDGER: &[&str] = &[];
 
 #[test]
 fn blargg_on_the_shipped_machine() {
@@ -330,7 +342,7 @@ fn blargg_on_the_shipped_machine() {
             }
         } else {
             println!(
-                "  ???? {name}: no verdict in {limit} frames ({})",
+                "???? {name}: no verdict in {limit} frames ({})",
                 text.trim().replace('\n', " / ")
             );
             failures.push(name);
@@ -358,6 +370,91 @@ const MOONEYE_PASS: [u8; 6] = [3, 5, 8, 13, 21, 34];
 
 /// The pattern it sets on failure: `$42` in all six.
 const MOONEYE_FAIL: [u8; 6] = [0x42; 6];
+
+/// The known-failures ledger for Gekkio's acceptance suite, with the reason for
+/// each one.
+///
+/// `ROADMAP.md` §0 asks for a ledger that **only ever shrinks**, and for the
+/// reason to be stated rather than implied. Anything failing that is *not* here
+/// fails the test, so a regression in a passing ROM is a build break while the
+/// seven below stay measured rather than hidden.
+///
+/// Three of them are the same fact: rsemu ships no boot ROM, because the DMG's
+/// is 256 bytes of Nintendo's copyrighted code and vendoring it is not ours to
+/// do (`ROADMAP.md` §1). Post-boot register values substitute, and these three
+/// measure things a *table* of post-boot values cannot carry.
+const MOONEYE_LEDGER: &[(&str, &str)] = &[
+    (
+        "boot_div-dmgABCmgb.gb",
+        "no boot ROM: the divider's visible byte is documented as $AB at \
+         handover and its low byte is not documented anywhere, so it starts \
+         at zero rather than guessed at. This ROM measures the low byte.",
+    ),
+    (
+        "boot_hwio-dmgABCmgb.gb",
+        "no boot ROM: this compares the whole I/O page against what a real \
+         boot ROM leaves behind, including registers whose handover values \
+         are not documented.",
+    ),
+    (
+        "serial/boot_sclk_align-dmgABCmgb.gb",
+        "no boot ROM: this measures the serial shift clock's phase against \
+         the divider at handover, which is a consequence of how long the \
+         boot ROM ran rather than a value anything publishes.",
+    ),
+    (
+        "ppu/intr_2_mode0_timing_sprites.gb",
+        "the mode-3 object penalty is Pan Docs' documented approximation — \
+         six dots each and up to five more for the first object in a \
+         background tile — rather than a fetcher simulation. The ROM \
+         tabulates 34 object configurations against the machine cycle mode 0 \
+         arrives on, and the split is informative: its whole *count* column \
+         — one to ten objects at x=0, costing 2 4 5 7 8 10 11 13 14 16 \
+         machine cycles — comes out exactly right, so the eleven-and-six \
+         rule and the phase are both right. Its *alignment* column does not: \
+         ten objects at an x of 1, 5, 6 or 7 modulo 8 want a first-object \
+         penalty this formula does not produce — 11, and at least 7, against \
+         the 10 and 6 it gives. Four residues out of eight is a fetcher, not \
+         a constant, and guessing one to make the table line up is the fit \
+         `ROADMAP.md` §0 forbids.",
+    ),
+    (
+        "ppu/lcdon_timing-GS.gb",
+        "the first line after the LCD is switched on is modelled to the \
+         machine cycle (`ppu::LCD_ON_SKIP`, and the scan reporting mode 0), \
+         which is what `stat_lyc_onoff` needs and what this ROM's LY column \
+         says. Its STAT and memory-gate columns disagree with each other by \
+         one machine cycle unless the controller comes up on a *half*-cycle \
+         boundary — its own header says the PPU is late by 2 T-cycles — and \
+         this timeline is quantised to the CPU's machine cycle.",
+    ),
+    (
+        "ppu/lcdon_write_timing-GS.gb",
+        "the same 2-T-cycle phase as `lcdon_timing`.",
+    ),
+    (
+        "timer/rapid_toggle.gb",
+        "one missing increment out of sixteen. The ROM starts and stops the \
+         timer every 17 machine cycles and counts on the falling edges that \
+         produces; ours takes the interrupt one instruction later than \
+         hardware (`BC` = $FFD8 against $FFD9). Traced to iteration 29 of \
+         its loop, where the enabling write lands exactly on the divider \
+         bit's falling edge: four clocks earlier and the edge falls inside \
+         the window the timer is enabled for, which is the increment we do \
+         not make. Whether the write should see the counter four clocks \
+         earlier is a question about the whole write path, and fitting the \
+         offset would defeat the rest of the group rather than pass this \
+         one.",
+    ),
+];
+
+/// Whether `name` is on the ledger, and why.
+fn ledgered(name: &str) -> Option<&'static str> {
+    MOONEYE_LEDGER
+        .iter()
+        .find(|(rom, _)| name.ends_with(rom))
+        .map(|(_, why)| *why)
+}
 
 /// Which of Gekkio's ROMs target a DMG at all.
 ///
@@ -394,7 +491,16 @@ fn mooneye_acceptance_on_the_shipped_machine() {
     }
     let limit = frame_limit();
     let mut passed = 0usize;
+    let mut ledger_hits = 0usize;
     let mut failed = Vec::new();
+    let record =
+        |name: String, failed: &mut Vec<String>, ledger_hits: &mut usize| match ledgered(&name) {
+            Some(why) => {
+                *ledger_hits += 1;
+                println!("  LDGR {name}: {why}");
+            }
+            None => failed.push(name),
+        };
     for rom in &roms {
         let name = label(&dir, rom);
         let Ok(bytes) = std::fs::read(rom) else {
@@ -422,16 +528,18 @@ fn mooneye_acceptance_on_the_shipped_machine() {
                 println!("  pass {name}");
             }
             Some(MOONEYE_FAIL) => {
-                println!("  FAIL {name}");
-                failed.push(name);
+                if ledgered(&name).is_none() {
+                    println!("  FAIL {name}");
+                }
+                record(name, &mut failed, &mut ledger_hits);
             }
             Some(regs) => {
                 println!(
-                    "  TIME {name}: no verdict in {limit} frames \
+                    "  TIME {name}: no verdict in {limit} frames  \
                      (B={:02x} C={:02x} D={:02x} E={:02x} H={:02x} L={:02x})",
                     regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]
                 );
-                failed.push(name);
+                record(name, &mut failed, &mut ledger_hits);
             }
             None => {
                 println!("  ???? {name}: could not read the register file");
@@ -440,14 +548,18 @@ fn mooneye_acceptance_on_the_shipped_machine() {
         }
     }
     println!(
-        "mooneye acceptance (DMG subset): {passed}/{} ROMs passed",
+        "mooneye acceptance (DMG subset): {passed}/{} ROMs passed, {ledger_hits} ledgered",
         roms.len()
     );
-    println!("  {} still failing", failed.len());
-    // Not an assertion, deliberately. `ROADMAP.md` §0 asks for a *measured*
-    // number and a ledger that only shrinks; the suite covers behaviours this
-    // machine does not claim (the pixel FIFO above all), and asserting on it
-    // would make the number a pass/fail rather than a measurement.
+    // The number is the measurement `ROADMAP.md` §0 asks for; the assertion is
+    // the ledger it also asks for. Only *unexplained* failures fail the test,
+    // so the seven arguments in `MOONEYE_LEDGER` stay visible rather than
+    // hidden, and a ROM that stops passing is a build break.
+    assert!(
+        failed.is_empty(),
+        "mooneye failures with no ledger entry: {}",
+        failed.join(", ")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -498,8 +610,17 @@ fn the_harness_reads_the_register_file_and_the_frame_counter() {
         verdict_registers(m) == Some(MOONEYE_PASS)
     });
     assert!(done, "the register pattern was never seen");
-    // And the LCD really did run while that happened.
-    assert!(frames(&machine).is_some(), "the frame counter decodes");
+    // And the LCD really did run while that happened. The *value* matters, not
+    // just that a `u64` came out: reading the counter off the wrong offset of a
+    // changed chunk still decodes, and the failure it causes looks like every
+    // ROM hanging rather than like a broken runner. Four frames were budgeted
+    // and the pattern is set in the first few hundred cycles, so the counter is
+    // small and non-negative — a misread lands nowhere near that.
+    let frames = frames(&machine).expect("the frame counter decodes");
+    assert!(
+        frames <= 4,
+        "the frame counter reads {frames} after at most four frames —          `frames()` is walking the wrong offset of the `gb.ppu` chunk"
+    );
 }
 
 #[test]

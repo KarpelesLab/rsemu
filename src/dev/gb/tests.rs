@@ -372,6 +372,44 @@ fn writing_tima_inside_the_reload_window_cancels_the_reload() {
     assert_eq!(timer.tima(), 0x11, "the write won, not TMA");
 }
 
+/// The four clocks after `TIMA` wraps are not one window but two things: the
+/// *delay*, during which a write to `TIMA` cancels the reload, and the single
+/// clock on which the reload actually happens, on which `TIMA` is being driven
+/// from `TMA` and a write to it loses (Pan Docs, *Timer Obscure Behaviour*).
+#[test]
+fn a_tima_write_on_the_reload_clock_itself_is_ignored() {
+    let timer = GbTimer::new();
+    timer.write_register(2, 0x37); // TMA
+    timer.write_register(1, 0xff); // TIMA
+    timer.write_register(3, 0x05); // enabled, bit 3
+    timer.advance_by(20); // the overflow at 16, then the reload at 20
+    assert_eq!(timer.tima(), 0x37, "the reload has just happened");
+    timer.write_register(1, 0x11);
+    assert_eq!(timer.tima(), 0x37, "and the write on that clock is ignored");
+    // One clock later it is an ordinary write again.
+    timer.advance_by(1);
+    timer.write_register(1, 0x11);
+    assert_eq!(timer.tima(), 0x11);
+}
+
+/// And a write to `TMA` on that clock lands in `TIMA` as well, because what the
+/// reload copies is whatever `TMA` holds when it happens.
+#[test]
+fn a_tma_write_on_the_reload_clock_is_what_gets_loaded() {
+    let timer = GbTimer::new();
+    timer.write_register(2, 0x37);
+    timer.write_register(1, 0xff);
+    timer.write_register(3, 0x05);
+    timer.advance_by(20);
+    assert_eq!(timer.tima(), 0x37);
+    timer.write_register(2, 0x42);
+    assert_eq!(timer.tima(), 0x42, "TIMA followed TMA");
+    // One clock later `TMA` is an ordinary register again.
+    timer.advance_by(1);
+    timer.write_register(2, 0x99);
+    assert_eq!(timer.tima(), 0x42, "TIMA is left where it was");
+}
+
 #[test]
 fn the_next_event_is_never_in_the_past_and_never_further_than_a_div_step() {
     // What makes a mid-quantum read correct: between two of this device's own
@@ -513,8 +551,14 @@ fn video_ram_reads_as_ff_during_mode_three_and_not_otherwise() {
     ops.read(0, &mut byte, MemAttrs::DEFAULT).expect("answers");
     assert_eq!(byte[0], 0x5a);
 
+    // The gate follows the mode the CPU sees, which is `MODE_VISIBLE_LAG`
+    // behind the one the controller is in — so mode 3 blocks video memory four
+    // dots after the controller enters it.
     ppu.advance_by(ppu::OAM_SCAN_DOTS);
     assert_eq!(ppu.mode(), Mode::Drawing);
+    ops.read(0, &mut byte, MemAttrs::DEFAULT).expect("answers");
+    assert_eq!(byte[0], 0x5a, "not blocked for another machine cycle");
+    ppu.advance_by(ppu::MODE_VISIBLE_LAG);
     ops.read(0, &mut byte, MemAttrs::DEFAULT).expect("answers");
     assert_eq!(byte[0], 0xff, "blocked");
     // A write is dropped rather than faulting: the write really does go nowhere.
@@ -535,12 +579,53 @@ fn object_memory_is_blocked_during_both_the_scan_and_the_drawing() {
     let ops = io(&region);
     let mut byte = [0u8; 1];
     assert_eq!(ppu.mode(), Mode::OamScan);
+    // One machine cycle behind the controller, so the gate closes four dots in.
+    ppu.advance_by(ppu::MODE_VISIBLE_LAG);
     ops.read(0, &mut byte, MemAttrs::DEFAULT).expect("answers");
     assert_eq!(byte[0], 0xff);
     ppu.advance_by(ppu::OAM_SCAN_DOTS + ppu::MODE3_MIN_DOTS);
     assert_eq!(ppu.mode(), Mode::HBlank);
     ops.read(0, &mut byte, MemAttrs::DEFAULT).expect("answers");
     assert_eq!(byte[0], 0x5a);
+}
+
+/// The mode the CPU reads and the mode the controller is in are four dots
+/// apart, and the gates follow the one the CPU reads.
+///
+/// Measured rather than assumed — `ppu::MODE_VISIBLE_LAG` carries the argument
+/// and the Gekkio tests that pin each end of it.
+#[test]
+fn the_mode_a_program_reads_is_one_machine_cycle_behind_the_controllers() {
+    let ppu = lcd(0);
+    let oam = Device::region(&ppu, ppu::OAM_REGION).expect("OAM");
+    let oam = io(&oam);
+    let mut byte = [0u8; 1];
+    let read_mode = |ppu: &GbPpu| ppu.read_register(0x01) & 3;
+
+    // Dot 0 of line 0: the controller has entered the object scan, and what a
+    // program reads is still the vertical blanking it just left.
+    assert_eq!(ppu.mode(), Mode::OamScan);
+    assert_eq!(read_mode(&ppu), Mode::VBlank.bits());
+    oam.read(0, &mut byte, MemAttrs::DEFAULT).expect("answers");
+    assert_eq!(byte[0], 0x00, "and object memory still answers");
+
+    ppu.advance_by(ppu::MODE_VISIBLE_LAG);
+    assert_eq!(read_mode(&ppu), Mode::OamScan.bits());
+    oam.read(0, &mut byte, MemAttrs::DEFAULT).expect("answers");
+    assert_eq!(byte[0], 0xff, "the gate follows the mode the program reads");
+
+    // And the same four dots at the other two boundaries of the line.
+    ppu.advance_by(ppu::OAM_SCAN_DOTS - ppu::MODE_VISIBLE_LAG);
+    assert_eq!(ppu.mode(), Mode::Drawing);
+    assert_eq!(read_mode(&ppu), Mode::OamScan.bits());
+    ppu.advance_by(ppu::MODE_VISIBLE_LAG);
+    assert_eq!(read_mode(&ppu), Mode::Drawing.bits());
+
+    ppu.advance_by(ppu::MODE3_MIN_DOTS - ppu::MODE_VISIBLE_LAG);
+    assert_eq!(ppu.mode(), Mode::HBlank);
+    assert_eq!(read_mode(&ppu), Mode::Drawing.bits());
+    ppu.advance_by(ppu::MODE_VISIBLE_LAG);
+    assert_eq!(read_mode(&ppu), Mode::HBlank.bits());
 }
 
 #[test]
@@ -568,6 +653,7 @@ fn the_stat_line_is_the_or_of_whatever_is_enabled() {
     // With only the mode-0 interrupt enabled the line follows H-blank.
     let ppu = lcd(stat::HBLANK_INT);
     assert_eq!(ppu.mode(), Mode::OamScan);
+    ppu.advance_by(ppu::MODE_VISIBLE_LAG);
     assert_eq!(ppu.read_register(0x01) & 3, 2);
     ppu.advance_by(ppu::OAM_SCAN_DOTS + ppu::MODE3_MIN_DOTS);
     assert_eq!(ppu.read_register(0x01) & 3, 0);
@@ -650,16 +736,117 @@ fn an_oam_transfer_copies_a_page_over_160_machine_cycles() {
 
     ppu.write_register(0x06, 0xc0);
     assert_eq!(ppu.read_register(0x06), 0xc0, "the register reads back");
-    // Nothing has moved yet: the first byte goes one machine cycle later.
-    assert_eq!(ppu.peek_oam(5), 0);
-    ppu.advance_by(4 * 6);
-    assert_eq!(ppu.peek_oam(5), 5, "six machine cycles, six bytes");
+    // Two machine cycles pass before the transfer starts — Gekkio's
+    // `oam_dma_start`, and `ppu::DMA_START_DELAY`. So after one, nothing.
+    ppu.advance_by(4);
+    assert_eq!(
+        ppu.peek_oam(0),
+        0,
+        "the cycle after the write moves nothing"
+    );
+    ppu.advance_by(4);
+    assert_eq!(ppu.peek_oam(0), 0, "and the first byte moves on the second");
+    // `peek_oam` looks past the blocking, so read the byte the transfer put
+    // there rather than the `$FF` a guest would see.
+    ppu.advance_by(4 * 5);
+    assert_eq!(ppu.peek_oam(5), 5, "five more cycles, five more bytes");
     assert_eq!(ppu.peek_oam(6), 0, "and not one more");
     ppu.advance_by(4 * 154);
     assert_eq!(ppu.peek_oam(159), 159);
     // And it stops there rather than running off the end of OAM.
     ppu.advance_by(4 * 160);
     assert_eq!(ppu.peek_oam(159), 159);
+}
+
+/// The window in which object memory answers `$FF` is `[W+2, W+161]` for a
+/// write on machine cycle `W` — the two-cycle start delay, then one cycle per
+/// byte, with the cycle the last byte moves on still blocked.
+///
+/// Gekkio's `oam_dma_timing` is exactly this assertion: it aligns one read on
+/// `W+161` and expects `$FF`, and another on `W+162` and expects the byte.
+#[test]
+fn object_memory_is_blocked_for_the_transfers_hundred_and_sixty_cycles() {
+    use crate::core::space::{AddressSpace, RamStore, Region};
+
+    let ppu = GbPpu::new();
+    let space = Arc::new(AddressSpace::new("cpubus", 16));
+    let ram = Arc::new(RamStore::new(0x10000));
+    for i in 0..160u64 {
+        ram.write_u8(0xc000 + i, 0x42).expect("in range");
+    }
+    space
+        .topology()
+        .map(Region::ram("ram", ram), 0)
+        .expect("maps");
+    ppu.attach_space(space);
+    let oam = Device::region(&ppu, super::ppu::OAM_REGION).expect("the region");
+    let oam = io(&oam);
+    let read = || {
+        let mut byte = [0u8];
+        oam.read(0, &mut byte, MemAttrs::DEFAULT).expect("answers");
+        byte[0]
+    };
+
+    // Switch the LCD off, so mode 0 is reported and only the transfer can
+    // block. Gekkio's own ROM does the same thing for the same reason.
+    ppu.write_register(0x00, 0);
+    ppu.write_register(0x06, 0xc0);
+    assert_eq!(read(), 0x00, "the write cycle itself is not blocked");
+    ppu.advance_by(4);
+    assert_eq!(read(), 0x00, "nor the one after it");
+    ppu.advance_by(4);
+    assert_eq!(read(), 0xff, "the transfer has the bus from W+2");
+    // On to the cycle the last byte moves on, W+161.
+    ppu.advance_by(4 * 159);
+    assert_eq!(read(), 0xff, "still blocked on the last byte's cycle");
+    ppu.advance_by(4);
+    assert_eq!(read(), 0x42, "and readable on the next");
+}
+
+/// A write to `$FF46` while a transfer is running does not stop it: the old one
+/// keeps the bus for the two cycles before the new one takes over, so object
+/// memory never becomes readable in between (Gekkio, `oam_dma_restart`).
+#[test]
+fn restarting_a_transfer_leaves_no_readable_cycle_in_between() {
+    use crate::core::space::{AddressSpace, RamStore, Region};
+
+    let ppu = GbPpu::new();
+    let space = Arc::new(AddressSpace::new("cpubus", 16));
+    let ram = Arc::new(RamStore::new(0x10000));
+    for i in 0..160u64 {
+        ram.write_u8(0xc000 + i, 0x42).expect("in range");
+    }
+    space
+        .topology()
+        .map(Region::ram("ram", ram), 0)
+        .expect("maps");
+    ppu.attach_space(space);
+    let oam = Device::region(&ppu, super::ppu::OAM_REGION).expect("the region");
+    let oam = io(&oam);
+    let read = || {
+        let mut byte = [0u8];
+        oam.read(0, &mut byte, MemAttrs::DEFAULT).expect("answers");
+        byte[0]
+    };
+
+    ppu.write_register(0x00, 0);
+    ppu.write_register(0x06, 0xc0);
+    // Ten cycles in, so the first transfer is well under way.
+    ppu.advance_by(4 * 10);
+    assert_eq!(read(), 0xff);
+    ppu.write_register(0x06, 0xc0);
+    // The two cycles that belong to the transfer being displaced.
+    assert_eq!(read(), 0xff, "the restart cycle itself");
+    ppu.advance_by(4);
+    assert_eq!(read(), 0xff, "and the one after it");
+    ppu.advance_by(4);
+    assert_eq!(read(), 0xff, "then the new transfer, for its full 160");
+    // The new transfer's last byte lands 159 cycles after it started, which is
+    // 161 after the restart — ten cycles later than the first one would have.
+    ppu.advance_by(4 * 159);
+    assert_eq!(read(), 0xff, "the last byte's cycle is still blocked");
+    ppu.advance_by(4);
+    assert_eq!(read(), 0x42);
 }
 
 #[test]
@@ -925,4 +1112,165 @@ fn every_device_resets_to_a_documented_state() {
         device.reset(ResetKind::Warm);
         device.reset(ResetKind::Bus);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reset does not rewind a clock domain
+// ---------------------------------------------------------------------------
+
+/// A lazily-advanced device's tick is the **clock domain's** position, not
+/// state of its own, and `Machine::reset` resets devices without rewinding
+/// domains. A device that zeroes its tick therefore claims to be at the
+/// beginning of time while the forest stands wherever it stands, and the very
+/// next catch-up is asked to simulate every tick since power-on in one call —
+/// a hang on a mid-run reset, and a wildly wrong frame if it survives.
+///
+/// The nasty part is that it is invisible to a test that resets a *fresh*
+/// device, because there the domain really is at zero. So this one advances
+/// first, and it covers every lazily-advanced device on the console rather
+/// than the one the bug was found in.
+#[test]
+fn resetting_a_running_device_leaves_its_clock_where_the_domain_put_it() {
+    fn check<D: Device>(device: &D, name: &str, advance: u64) {
+        // `advance_to` is the catch-up entry point the scheduler uses.
+        Device::advance_to(device, advance);
+        let before = Device::current_tick(device);
+        assert_eq!(before, advance, "{name}: did not advance");
+        Device::reset(device, ResetKind::Cold);
+        assert_eq!(
+            Device::current_tick(device),
+            before,
+            "{name}: reset rewound the clock domain"
+        );
+        // And the device's own next event is still in the future, so catch-up
+        // makes progress rather than stalling or replaying.
+        if let Some(next) = Device::next_event_tick(device) {
+            assert!(
+                next > before,
+                "{name}: the next event is at {next}, not after {before}"
+            );
+        }
+    }
+
+    check(&GbPpu::new(), "gb.ppu", 12_345);
+    check(&GbTimer::new(), "gb.timer", 12_345);
+    check(&GbSerial::new(), "gb.serial", 12_345);
+    check(&GbApu::new(), "gb.apu", 12_345);
+    // $10 is MBC3 with a real-time clock, which is what makes the cartridge
+    // lazily advanced at all.
+    let cart = GbCart::new(
+        Cartridge::parse(synthetic_image(2, 0x10, 0x02, &[0x00])).expect("a valid image"),
+    );
+    check(&cart, "gb.cart", 12_345);
+}
+
+/// No boot ROM writes a mapper register, so a cartridge's entry point at
+/// `$0100` runs with whatever the controller came up holding — and every image
+/// expects bank 1 at `$4000` there. MBC1, MBC2 and MBC3 get it from their
+/// "a written zero reads as one" rule; MBC5 has no such rule, so the power-on
+/// value has to be right on its own.
+#[test]
+fn a_cartridge_powers_on_with_bank_one_at_4000_even_on_mbc5() {
+    // $19 is MBC5 with no RAM; $02 in $0148 is four banks.
+    let mut rom = synthetic_image(4, 0x19, 0x00, &[0x00]);
+    // A byte per bank, at the same offset within each.
+    for bank in 0..4usize {
+        rom[bank * 0x4000 + 0x0200] = 0xb0 + bank as u8;
+    }
+    let cart = GbCart::new(Cartridge::parse(rom).expect("a valid image"));
+    let region = Device::region(&cart, super::cart::ROM_REGION).expect("the ROM window");
+    let ops = io(&region);
+    let read = |addr: u64| {
+        let mut byte = [0u8; 1];
+        ops.read(addr, &mut byte, MemAttrs::DEFAULT)
+            .expect("answers");
+        byte[0]
+    };
+
+    assert_eq!(read(0x0200), 0xb0, "bank 0 is at $0000");
+    assert_eq!(read(0x4200), 0xb1, "and bank 1 at $4000 before any write");
+
+    // The bank number is split across two registers, and both halves live in
+    // the ROM one: `bank_high` is MBC5's *RAM* bank and must not leak into it.
+    ops.write(0x2000, &[0x03], MemAttrs::DEFAULT).expect("ok");
+    assert_eq!(read(0x4200), 0xb3);
+    ops.write(0x4000, &[0x0f], MemAttrs::DEFAULT).expect("ok");
+    assert_eq!(
+        read(0x4200),
+        0xb3,
+        "the RAM bank does not move the ROM bank"
+    );
+    // And zero really means zero on this controller.
+    ops.write(0x2000, &[0x00], MemAttrs::DEFAULT).expect("ok");
+    assert_eq!(read(0x4200), 0xb0);
+}
+
+/// Pan Docs documents an OAM transfer's source as `$XX00-$XX9F` with `XX` up to
+/// `$DF` and stops there. A DMG answers higher pages out of work RAM, because
+/// the transfer's address is decoded with fifteen bits — the echo, extended
+/// over the whole quarter rather than stopping at `$FDFF` the way the CPU's own
+/// decode does (Gekkio, `oam_dma/sources`).
+#[test]
+fn a_transfer_from_above_dfff_reads_work_ram() {
+    use crate::core::space::{AddressSpace, RamStore, Region};
+
+    let ppu = GbPpu::new();
+    let space = Arc::new(AddressSpace::new("cpubus", 16));
+    let ram = Arc::new(RamStore::new(0x2000));
+    for i in 0..0xa0u64 {
+        // $DE00 + i, which is offset $1E00 + i within the 8 KiB.
+        ram.write_u8(0x1e00 + i, 0x40 + i as u8).expect("in range");
+    }
+    space
+        .topology()
+        .map(Region::ram("wram", ram), 0xc000)
+        .expect("maps");
+    ppu.attach_space(space);
+
+    // Page $FE, which is $DE with the fifteenth bit decoded away.
+    ppu.write_register(0x00, 0); // LCD off, so only the transfer blocks
+    ppu.write_register(0x06, 0xfe);
+    ppu.advance_by(4 * 162);
+    assert_eq!(ppu.peek_oam(0), 0x40);
+    assert_eq!(ppu.peek_oam(0x9f), 0x40 + 0x9f);
+}
+
+/// Switching the LCD on does not start line 0 from its beginning, and the scan
+/// it lands in the middle of is reported as mode **0** rather than mode 2 —
+/// "line 0 starts with mode 0 and goes straight to mode 3" (Gekkio,
+/// `ppu/lcdon_timing`). Object memory is not shut out for it either.
+#[test]
+fn switching_the_lcd_on_lands_part_way_into_a_scan_that_reports_mode_zero() {
+    let ppu = lcd(0);
+    let oam = Device::region(&ppu, ppu::OAM_REGION).expect("OAM");
+    let oam = io(&oam);
+    let mut byte = [0u8; 1];
+    let read_mode = |ppu: &GbPpu| ppu.read_register(0x01) & 3;
+
+    ppu.write_register(0x00, 0);
+    ppu.advance_by(1000);
+    ppu.write_register(0x00, lcdc::LCD_ENABLE);
+
+    assert_eq!(
+        ppu.position(),
+        (0, ppu::LCD_ON_SKIP),
+        "already inside line 0"
+    );
+    assert_eq!(read_mode(&ppu), Mode::HBlank.bits(), "mode 0, not mode 2");
+    oam.read(0, &mut byte, MemAttrs::DEFAULT).expect("answers");
+    assert_eq!(byte[0], 0x00, "and object memory is not shut out");
+
+    // Straight into mode 3: the reported mode never shows 2, so the
+    // suppression holds right up to the machine cycle mode 3 appears on.
+    ppu.advance_by(ppu::OAM_SCAN_DOTS - ppu::LCD_ON_SKIP);
+    assert_eq!(read_mode(&ppu), Mode::HBlank.bits());
+    ppu.advance_by(ppu::MODE_VISIBLE_LAG);
+    assert_eq!(read_mode(&ppu), Mode::Drawing.bits());
+
+    // And the line is four dots short, so `LY` moves one machine cycle early.
+    ppu.advance_by(ppu::DOTS_PER_LINE - ppu::OAM_SCAN_DOTS - ppu::MODE_VISIBLE_LAG);
+    assert_eq!(ppu.position().0, 1, "line 0 ran 452 dots, not 456");
+    // Every line after it is normal again.
+    ppu.advance_by(ppu::MODE_VISIBLE_LAG);
+    assert_eq!(read_mode(&ppu), Mode::OamScan.bits());
 }
