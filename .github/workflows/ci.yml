@@ -65,6 +65,16 @@ jobs:
       - run: cargo test --all-features
       # The default build is what users get; it must stand on its own.
       - run: cargo test
+      # The frame-time benchmark is a measurement, never a gate: a shared
+      # runner's timings are noise, and a perf threshold checked here would be
+      # a flake generator. What *is* checked is that the harness still runs and
+      # that its guests still reach the state hashes tests/goldens records —
+      # a benchmark whose guest quietly stopped working looks like a speedup.
+      # `--smoke` makes that a couple of seconds. One OS is enough; the numbers
+      # are not the artefact.
+      - name: frame-time benchmark harness
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo bench --all-features --bench frame_time -- --smoke
 
   msrv:
     name: MSRV (1.88)

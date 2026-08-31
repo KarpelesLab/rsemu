@@ -374,6 +374,16 @@ cpu-m68k = []
 # to wire. Adds no dependencies.
 machine-m68k-mini = ["cpu-m68k"]
 
+[[bench]]
+# The frame-time benchmark (ROADMAP.md §13's phase-3 gate). `harness = false`
+# because libtest's bench harness is nightly-only and this project is stable,
+# and because the gate wants a *percentile* rather than the mean libtest would
+# print: a `main` that times its own loop is both shorter and closer to what is
+# being asked for. No `criterion` — the dependency policy is absolute (§0), and
+# it would be the crate's only non-first-party edge.
+name    = "frame_time"
+harness = false
+
 [lib]
 name = "rsemu"
 path = "src/lib.rs"
