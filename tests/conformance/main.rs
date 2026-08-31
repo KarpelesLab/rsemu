@@ -1,8 +1,7 @@
 //! The conformance harness: the suites that measure whether a core is right.
 //!
 //! `ROADMAP.md` §0 — accuracy is measured, never asserted. §12 lists what
-//! measures it and §13 makes three of those a phase-3 gate. This binary is the
-//! part of that which does not depend on any particular core existing yet.
+//! measures it and §13 makes three of those a phase-3 gate.
 //!
 //! # Bring-up order
 //!
@@ -20,6 +19,30 @@
 //!    running together at the right clock alignments. Its runner reports per
 //!    test so it is useful long before all of that exists.
 //!
+//! # Why SingleStepTests is run twice
+//!
+//! `src/cpu/mos6502/conformance.rs` runs the same corpus against the same core
+//! behind `RSEMU_65X02_DIR`, and keeping both was a decision rather than an
+//! oversight. They are not the same measurement:
+//!
+//! * The in-crate runner compares the final RAM cells the vector **lists**;
+//!   this one compares the whole 64 KiB, so a write to an address no vector
+//!   mentions fails here and passes there.
+//! * Only this one can cross-check the core's *claimed* cycle count against
+//!   the number of bus accesses it actually made — the in-crate runner drives
+//!   the interpreter directly and has no second number to disagree with.
+//! * They reach the core by different routes. The in-crate runner builds a
+//!   fresh `Mos6502` per vector and sets execution state through a private
+//!   field; this one drives one long-lived core through the public API only,
+//!   which is how a machine drives it. That difference is not academic: it is
+//!   what turned up `JAM` latching `halted` across vectors when the seam was
+//!   first wired.
+//! * The ledger discipline `ROADMAP.md` §0 asks for lives here
+//!   (`ledgers/sst-nes6502.txt`), keyed per vector.
+//!
+//! Four and a half seconds for 2 560 000 vectors on a 32-thread machine. The
+//! duplication is cheap and it is not really duplication.
+//!
 //! # Running
 //!
 //! ```text
@@ -27,17 +50,24 @@
 //! RSEMU_CONFORMANCE=1 cargo test --test conformance -- --nocapture
 //! ```
 //!
-//! Without `RSEMU_CONFORMANCE=1`, or without a corpus, or without a core, every
-//! suite prints why it is skipping and passes. `cargo test` offline stays green
-//! — that is a rule (`CLAUDE.md`, Testing), not a convenience.
+//! Without `RSEMU_CONFORMANCE=1`, or without a corpus, or in a build whose
+//! feature set excludes the component a suite needs, that suite prints why it
+//! is skipping and passes. `cargo test` offline stays green — that is a rule
+//! (`CLAUDE.md`, Testing), not a convenience.
+//!
+//! What is **not** a skip is a seam nobody wired up.
+//! [`every_seam_this_build_can_bind_is_bound`] fails on a plain `cargo test
+//! --all-features`, with no gate and no corpus, if a component this build
+//! contains has no adapter in `cpu.rs` or `machine.rs`. `nestest` spent months
+//! printing `SKIP … no 6502 core is bound`, indistinguishable at a glance from
+//! a corpus that had not been fetched, and passing while measuring nothing.
 //!
 //! See `docs/testing/README.md`.
 
-// The CPU-facing interface is defined before its implementation exists, which
-// is the whole point of this harness: the 6502 author codes against it. Until a
-// core is bound in `cpu.rs`, most of it is legitimately unreferenced, and the
-// alternative — deleting the parts nothing calls yet — is how a harness ends up
-// designed by whatever happened to be written first.
+// Parts of the CPU-facing contract are exercised only by the runners' own
+// tests, or only by a build with a different feature set. Deleting whatever is
+// unreferenced today is how a harness ends up designed by whatever happened to
+// be written first.
 #![allow(dead_code)]
 
 mod accuracycoin;
@@ -89,43 +119,53 @@ fn run_sst(variant: cpu::Variant, suite: &str) {
         harness::require(sst::corpus_dir(&harness::testdata_root(), variant), fetch)
     );
 
+    // The directory exists — `require` just said so — so a listing that fails
+    // is a broken corpus or a broken filesystem, not an absent one. Skipping
+    // on it would be a pass that measured nothing.
     let mut files = match sst::opcode_files(&dir) {
         Ok(files) => files,
-        Err(e) => {
-            println!("SKIP {suite}: cannot list {}: {e}", dir.display());
-            return;
-        }
+        Err(e) => panic!("{} exists but cannot be listed: {e}", dir.display()),
     };
+    assert!(
+        !files.is_empty(),
+        "{} exists but holds no NN.json opcode files — the fetch was incomplete.\n\
+         Re-run: {fetch}",
+        dir.display()
+    );
     if let Some(only) = sst::opcode_filter() {
         files.retain(|(op, _)| only.contains(op));
         println!(
             "note: RSEMU_SST_OPCODES narrowed the run to {} opcode(s)",
             files.len()
         );
-    }
-    if files.is_empty() {
-        println!("SKIP {suite}: no opcode files under {}", dir.display());
-        println!("      fetch it with: {fetch}");
-        return;
+        assert!(
+            !files.is_empty(),
+            "RSEMU_SST_OPCODES matched no opcode file under {}",
+            dir.display()
+        );
     }
 
-    if !cpu::have_cpu() {
-        // No core yet — but the corpus is here, so at least prove it is intact
-        // and that the parser understands it. A fetch that silently produced
-        // half a file should not wait for the core to be discovered.
-        let (opcode, path) = &files[0];
-        match harness::read(path).map(|bytes| sst::parse_vectors(&bytes)) {
-            Ok(Ok(vectors)) => println!(
-                "note: corpus is readable — opcode {opcode:02x} parsed {} vectors from {}",
-                vectors.len(),
-                path.display()
-            ),
-            Ok(Err(e)) => panic!("corpus at {} is malformed: {e}", path.display()),
-            Err(e) => panic!("cannot read the corpus: {e}"),
+    let first_core = match cpu::require_cpu(variant) {
+        Ok(core) => core,
+        Err(skip) => {
+            // No core in this build — but the corpus is here, so at least
+            // prove it is intact and that the parser understands it. A fetch
+            // that silently produced half a file should not wait for a
+            // feature-enabled build to discover it.
+            let (opcode, path) = &files[0];
+            match harness::read(path).map(|bytes| sst::parse_vectors(&bytes)) {
+                Ok(Ok(vectors)) => println!(
+                    "note: corpus is readable — opcode {opcode:02x} parsed {} vectors from {}",
+                    vectors.len(),
+                    path.display()
+                ),
+                Ok(Err(e)) => panic!("corpus at {} is malformed: {e}", path.display()),
+                Err(e) => panic!("cannot read the corpus: {e}"),
+            }
+            skip.report(suite);
+            return;
         }
-        Skip::NoCpu.report(suite);
-        return;
-    }
+    };
 
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -140,11 +180,17 @@ fn run_sst(variant: cpu::Variant, suite: &str) {
     let queue = Mutex::new(files);
     let reports: Mutex<Vec<sst::OpcodeReport>> = Mutex::new(Vec::new());
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    // The core `require_cpu` already built goes to whichever worker asks first;
+    // the rest build their own. Nothing is shared between them.
+    let spare = Mutex::new(Some(first_core));
 
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
-                let mut core = cpu::new_cpu(variant).expect("have_cpu() said a core was available");
+                let mut core = match spare.lock().unwrap().take() {
+                    Some(core) => core,
+                    None => cpu::new_cpu(variant).expect("require_cpu proved a core exists"),
+                };
                 loop {
                     let Some((opcode, path)) = queue.lock().unwrap().pop() else {
                         break;
@@ -188,6 +234,13 @@ fn run_sst(variant: cpu::Variant, suite: &str) {
 fn summarise_sst(suite: &str, reports: &[sst::OpcodeReport], ran: &[u8]) {
     let total: usize = reports.iter().map(|r| r.total).sum();
     let failed: usize = reports.iter().map(|r| r.failed.len()).sum();
+    // "0/0 vectors passed" is the last shape a vacuous pass can take here: the
+    // files were found, listed and parsed, and every one of them was empty.
+    assert!(
+        total > 0,
+        "{suite}: {} opcode file(s) ran but not one vector — the corpus is empty",
+        reports.len()
+    );
     println!("{suite}: {}/{total} vectors passed", total - failed);
 
     let mut body = String::new();
@@ -260,6 +313,11 @@ fn nestest_trace() {
         Ok(log) => log,
         Err(e) => panic!("{e}"),
     };
+    assert!(
+        !log.is_empty(),
+        "{} parsed to zero instructions",
+        log_path.display()
+    );
     println!("{suite}: reference log has {} instructions", log.len());
 
     let image = match harness::read(&rom_path) {
@@ -293,10 +351,7 @@ fn nestest_trace() {
     );
     println!("  ROM and log agree at the entry point");
 
-    let Some(mut core) = cpu::new_cpu(cpu::Variant::Ricoh2A03) else {
-        Skip::NoCpu.report(suite);
-        return;
-    };
+    let mut core = gated!(suite, cpu::require_cpu(cpu::Variant::Ricoh2A03));
 
     let strict = harness::flag("RSEMU_NESTEST_DISASM");
     let report = nestest::compare(core.as_mut(), &mut bus, &log, strict);
@@ -357,10 +412,7 @@ fn accuracycoin_whole_machine() {
         Err(e) => panic!("{e}"),
     };
 
-    let Some(mut nes) = machine::new_nes(&image) else {
-        Skip::NoMachine.report(suite);
-        return;
-    };
+    let mut nes = gated!(suite, machine::require_nes(&image));
 
     let report = accuracycoin::run(nes.as_mut());
     let described = report.describe();
@@ -427,6 +479,65 @@ fn every_ledger_parses() {
     assert!(checked >= 3, "expected a ledger per suite, found {checked}");
 }
 
+/// Every seam this build *can* bind **is** bound.
+///
+/// The check that makes an unwired harness impossible to mistake for a
+/// fetch-nothing one. It needs no gate, no corpus and no environment: whether
+/// a component is compiled in is a build fact, and whether the adapter for it
+/// exists is a fact about this directory. `nestest` reported `SKIP` for months
+/// because those two facts were reported through the same channel; here they
+/// are not, and a plain `cargo test --all-features` fails the day someone
+/// removes an adapter.
+///
+/// It deliberately does not look at `RSEMU_CONFORMANCE`. A seam that is broken
+/// should fail on the developer's laptop, not only on the machine that has the
+/// corpora.
+#[test]
+fn every_seam_this_build_can_bind_is_bound() {
+    if cpu::cpu_is_built() {
+        assert!(
+            cpu::have_cpu(),
+            "`{}` are on but tests/conformance/cpu.rs binds no core",
+            cpu::CPU_FEATURES
+        );
+        // Not just constructible: it has to execute. A core that is bound but
+        // wired to nothing would still report a green skip-free run of zero.
+        let mut core = cpu::new_cpu(cpu::Variant::Ricoh2A03).expect("just checked");
+        let mut bus = mock::RamBus::with(&[(0x0200, 0xa9), (0x0201, 0x42)]);
+        core.set_regs(cpu::Regs {
+            pc: 0x0200,
+            s: 0xfd,
+            p: 0x24,
+            ..cpu::Regs::default()
+        });
+        let cycles = core.step(&mut bus);
+        assert_eq!((cycles, core.regs().a, core.regs().pc), (2, 0x42, 0x0202));
+    } else {
+        println!(
+            "note: this build cannot drive a 6502 ({} not all on)",
+            cpu::CPU_FEATURES
+        );
+    }
+
+    if machine::machine_is_built() {
+        let rom = machine::blank_nrom();
+        match machine::new_nes(&rom) {
+            Ok(mut nes) => {
+                nes.run_frames(1);
+            }
+            Err(e) => panic!(
+                "`{}` are on but no NES could be built: {e}",
+                machine::MACHINE_FEATURES
+            ),
+        }
+    } else {
+        println!(
+            "note: this build cannot run a NES ({} not all on)",
+            machine::MACHINE_FEATURES
+        );
+    }
+}
+
 /// Corpora must never be committed. This is a licensing rule before it is a
 /// size one, so it gets an assertion rather than a note in a README.
 #[test]
@@ -437,9 +548,23 @@ fn no_corpus_is_committed() {
         .arg(root)
         .args(["ls-files", "--", "testdata"])
         .output();
-    let Ok(output) = output else {
-        println!("note: git is unavailable, skipping the committed-corpus check");
-        return;
+    // A git that ran and *failed* has an empty stdout, which would otherwise
+    // read as "nothing is tracked" — a pass that checked nothing. Both that
+    // and a git that would not run at all are reported as what they are.
+    let output = match output {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            println!(
+                "note: `git ls-files` exited {}, skipping the committed-corpus check: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            return;
+        }
+        Err(e) => {
+            println!("note: git is unavailable ({e}), skipping the committed-corpus check");
+            return;
+        }
     };
     let tracked = String::from_utf8_lossy(&output.stdout);
     assert!(

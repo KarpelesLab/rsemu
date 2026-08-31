@@ -74,32 +74,94 @@ pub(crate) mod buttons {
     pub(crate) const NONE: u8 = 0x00;
 }
 
-/// Build a machine from an iNES image, or `None` if this build has no NES.
+/// The Cargo features that let this harness run a NES.
 ///
-/// `nes-ntsc` out of the shipped catalog with `rom` bound to the image — the
+/// `std` for the same reason [`crate::cpu::CPU_FEATURES`] needs it: this binary
+/// creates threads, and without `std` the crate's `core::sync` selects a
+/// backend that is single-threaded by construction.
+pub(crate) const MACHINE_FEATURES: &str = "machine-nes,std";
+
+/// Are those features on for this build?
+pub(crate) fn machine_is_built() -> bool {
+    cfg!(all(feature = "machine-nes", feature = "std"))
+}
+
+/// Build a machine from an iNES image, or say why not.
+///
+/// `nes-ntsc` out of the shipped catalog with `cart` bound to the image — the
 /// same thing `rsemu run nes-ntsc --cart AccuracyCoin.nes` builds, with no
-/// hand-wiring and no test-only topology. If it does not realize, the runner
-/// wants to know why, so the error is printed rather than swallowed.
-#[cfg(feature = "machine-nes")]
-pub(crate) fn new_nes(rom: &[u8]) -> Option<Box<dyn NesMachine>> {
+/// hand-wiring and no test-only topology.
+#[cfg(all(feature = "machine-nes", feature = "std"))]
+pub(crate) fn new_nes(rom: &[u8]) -> Result<Box<dyn NesMachine>, String> {
     match Nes::new(rom) {
-        Ok(nes) => Some(Box::new(nes)),
+        Ok(nes) => Ok(Box::new(nes)),
+        Err(e) => Err(format!("nes-ntsc did not realize: {e}")),
+    }
+}
+
+/// No NES this harness can drive in this build.
+#[cfg(not(all(feature = "machine-nes", feature = "std")))]
+pub(crate) fn new_nes(rom: &[u8]) -> Result<Box<dyn NesMachine>, String> {
+    let _ = rom;
+    Err(format!(
+        "this build does not have all of {MACHINE_FEATURES}"
+    ))
+}
+
+/// A machine, or the *reason* there is none — and only one reason is allowed.
+///
+/// The counterpart of [`crate::cpu::require_cpu`], for the same reason. "This
+/// build has no NES" is a skip. "This build has a NES and it would not build"
+/// is a defect, and it is asserted rather than printed — a whole-machine suite
+/// that silently measures nothing is the failure mode this whole change exists
+/// to remove. That assertion is not hypothetical: it is what caught
+/// `machine-nes` not implying `dev-nes-ppu`, so `nes-ntsc` compiled and then
+/// refused to realize for anyone who picked that feature alone.
+///
+/// # Panics
+///
+/// If a NES is compiled in and the machine will not realize.
+pub(crate) fn require_nes(rom: &[u8]) -> Result<Box<dyn NesMachine>, crate::harness::Skip> {
+    match new_nes(rom) {
+        Ok(nes) => Ok(nes),
         Err(e) => {
-            println!("note: nes-ntsc did not realize: {e}");
-            None
+            assert!(
+                !machine_is_built(),
+                "`{MACHINE_FEATURES}` are on but no NES could be built, so the \
+                 whole-machine suite would skip and pass while measuring nothing: {e}"
+            );
+            Err(crate::harness::Skip::NotBuilt {
+                component: "a NES machine",
+                feature: MACHINE_FEATURES,
+            })
         }
     }
 }
 
-/// No NES in this build.
-#[cfg(not(feature = "machine-nes"))]
-pub(crate) fn new_nes(rom: &[u8]) -> Option<Box<dyn NesMachine>> {
-    let _ = rom;
-    None
+/// A zeroed NROM-128 cartridge whose reset vector points at `$C000`.
+///
+/// Not a corpus and not a fixture on disk: 24 KiB generated here, so the seam
+/// check in `main.rs` can prove `nes-ntsc` still realizes without the gate
+/// being open or `AccuracyCoin.nes` having been fetched.
+pub(crate) fn blank_nrom() -> Vec<u8> {
+    let mut image = vec![0u8; 16 + 16 * 1024 + 8 * 1024];
+    image[0..4].copy_from_slice(b"NES\x1a");
+    image[4] = 1; // one 16 KiB PRG bank
+    image[5] = 1; // one 8 KiB CHR bank
+    // `JMP $C000` at the start of the bank, and every vector pointing at it.
+    let prg = 16;
+    image[prg] = 0x4c;
+    image[prg + 1] = 0x00;
+    image[prg + 2] = 0xc0;
+    for slot in [0x3ffa, 0x3ffc, 0x3ffe] {
+        image[prg + slot] = 0x00;
+        image[prg + slot + 1] = 0xc0;
+    }
+    image
 }
 
 /// A realized `nes-ntsc`, driven by whole frames.
-#[cfg(feature = "machine-nes")]
+#[cfg(all(feature = "machine-nes", feature = "std"))]
 struct Nes {
     machine: rsemu::machine::Machine,
     /// The host end of the controller seam. Buttons are a *level*: whatever is
@@ -107,7 +169,7 @@ struct Nes {
     pads: std::sync::Arc<rsemu::dev::nes::Pad>,
 }
 
-#[cfg(feature = "machine-nes")]
+#[cfg(all(feature = "machine-nes", feature = "std"))]
 impl Nes {
     /// One NTSC frame, in nanoseconds.
     ///
@@ -126,7 +188,7 @@ impl Nes {
     }
 }
 
-#[cfg(feature = "machine-nes")]
+#[cfg(all(feature = "machine-nes", feature = "std"))]
 impl NesMachine for Nes {
     fn run_frames(&mut self, frames: u32) {
         let span = rsemu::core::clock::GlobalTime::from_nanos(Self::FRAME_NS);

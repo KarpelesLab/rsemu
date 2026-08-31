@@ -108,6 +108,16 @@ Not compared by default:
 * **The disassembly column.** It is Nintendulator's formatting convention, not
   something the hardware specifies. `RSEMU_NESTEST_DISASM=1` turns it on once the
   core has a disassembler and you want to match the text exactly.
+
+  **rsemu's does not, deliberately, and strict mode therefore fails on line 1.**
+  Of the 8 991 lines, 5 370 differ: 5 344 in presentation only (lower-case hex,
+  Nintendulator's leading `*` on undocumented encodings, and its resolved-operand
+  annotations such as `STX $00 = 00` — which are execution results a
+  disassembler cannot produce), 21 in `ISC` against `ISB`, and 5 in `USBC`
+  against `*SBC` for `$eb`. None differ in mnemonic plus addressing mode. The
+  flag stays as an exact-text check for a core that has chosen that convention;
+  rsemu has not, and contorting `cpu::mos6502::disasm` to match one tracer's
+  output would be the wrong trade.
 * **The `PPU:` columns.** They need a PPU; this bus has none.
 
 Afterwards the runner reads `$02` and `$03`, where the ROM leaves result codes
