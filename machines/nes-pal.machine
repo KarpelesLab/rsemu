@@ -21,8 +21,7 @@ machine "nes-pal" {
   space cpubus { width = 16, unassigned = open-bus }
   space ppubus { width = 14, unassigned = open-bus }
 
-  object wram  "ram" { size = 2K }
-  object ciram "ram" { size = 2K }
+  object wram "ram" { size = 2K }
 
   object cpu "cpu.mos6502" {
     clock  = master / 16
@@ -40,24 +39,30 @@ machine "nes-pal" {
   object apu "nes.apu" { clock = master / 16, region = "pal" }
 
   object cart "nes.nrom" { rom = "cart" }
+  object ports "nes.ports" { pads = "nes-pads" }
+  object dma "nes.oamdma" { space = cpubus }
 
   # -- the CPU bus -----------------------------------------------------------
   map cpubus 0x0000 size 0x2000 = mirror(wram)
   map cpubus 0x2000 size 0x2000 = ppu.regs
   map cpubus 0x4000 size 0x0014 = apu.channels
+  map cpubus 0x4014 size 0x0001 = dma.port
   map cpubus 0x4015 size 0x0001 = apu.status
+  map cpubus 0x4016 size 0x0001 = ports.port1
+  # $4017 goes to the APU for the reason nes-ntsc.machine spells out: one
+  # address, two registers, and the frame counter is the half worth having.
   map cpubus 0x4017 size 0x0001 = apu.frame
   map cpubus 0x8000 size 0x8000 = cart.prg
 
   # -- the PPU bus -----------------------------------------------------------
   map ppubus 0x0000 size 0x2000 = cart.chr
-  map ppubus 0x2000 size 0x1000 = mirror(ciram)
-  map ppubus 0x3000 size 0x0f00 = mirror(ciram)
+  map ppubus 0x2000 size 0x1000 = cart.nametables
+  map ppubus 0x3000 size 0x0f00 = cart.nametables
 
   # -- interrupts ------------------------------------------------------------
   wire ppu.nmi -> cpu.nmi
   wire apu.irq -> cpu.irq
 
-  # The same three gaps `nes-ntsc.machine` documents at its foot: fixed vertical
-  # nametable mirroring, no OAM DMA at $4014, and no controller ports.
+  # The same one gap `nes-ntsc.machine` documents at its foot: OAM DMA copies
+  # correctly but does not halt the CPU, because `cpu.mos6502` has no /RDY.
 }

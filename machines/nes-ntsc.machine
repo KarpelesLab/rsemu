@@ -11,8 +11,9 @@
 # next event so the NMI lands on the dot that raised it rather than whenever the
 # CPU next happens to read $2002.
 #
-# Still missing, and listed at the bottom: OAM DMA at $4014, the controller
-# ports at $4016/$4017, and per-cartridge nametable mirroring.
+# So are OAM DMA, the controller port and cartridge-driven nametable mirroring.
+# One gap is left and it is named at the bottom: the CPU halt OAM DMA should
+# cost.
 
 machine "nes-ntsc" {
   # One crystal, so every domain below is exactly related to every other: the
@@ -32,11 +33,6 @@ machine "nes-ntsc" {
   # 2 KiB on the console's board. Two more address lines than it needs are
   # decoded, so it answers four times over $0000-$1FFF.
   object wram "ram" { size = 2K }
-
-  # The console's 2 KiB of nametable RAM (CIRAM). It is on the console's board,
-  # not on the cartridge — the cartridge only decides which 1 KiB answers where,
-  # by tying CIRAM A10 one way or the other. See the note at the bottom.
-  object ciram "ram" { size = 2K }
 
   object cpu "cpu.mos6502" {
     clock  = master / 12
@@ -61,18 +57,38 @@ machine "nes-ntsc" {
   # (`--cart smb.nes`). Nothing below host/ opens a file.
   object cart "nes.nrom" { rom = "cart" }
 
+  # The two controller ports. `pads` names the host seam buttons arrive
+  # through (src/dev/nes/input.rs); the default is what a front end opens.
+  object ports "nes.ports" { pads = "nes-pads" }
+
+  # The sprite DMA unit. It masters the CPU bus — a write to $4014 reads 256
+  # bytes and writes each to $2004 — so it declares the space it drives, the
+  # same way the PPU declares the one it fetches through.
+  object dma "nes.oamdma" { space = cpubus }
+
   # -- the CPU bus -----------------------------------------------------------
   map cpubus 0x0000 size 0x2000 = mirror(wram)   # 2K, mirrored 4x
   map cpubus 0x2000 size 0x2000 = ppu.regs       # 8 registers, mirrored x1024
   map cpubus 0x4000 size 0x0014 = apu.channels   # $4000-$4013
-  map cpubus 0x4015 size 0x0001 = apu.status     # $4014 is OAM DMA, not the APU's
-  map cpubus 0x4017 size 0x0001 = apu.frame      # $4016 is the controller port
+  map cpubus 0x4014 size 0x0001 = dma.port       # sprite DMA, not the APU's
+  map cpubus 0x4015 size 0x0001 = apu.status
+  map cpubus 0x4016 size 0x0001 = ports.port1    # controller 1
+  # $4017 is two registers on one address: the APU frame counter on a write and
+  # controller 2 on a read. A mapping routes both halves of an access to one
+  # device, so this is a choice, and the frame counter wins — its IRQ drives
+  # game logic, where a missing player two loses only player two. `ports.port2`
+  # exists for a machine that would rather have it the other way.
+  map cpubus 0x4017 size 0x0001 = apu.frame
   map cpubus 0x8000 size 0x8000 = cart.prg       # NROM-128 repeats itself here
 
   # -- the PPU bus -----------------------------------------------------------
-  map ppubus 0x0000 size 0x2000 = cart.chr       # the two pattern tables
-  map ppubus 0x2000 size 0x1000 = mirror(ciram)  # nametables — see below
-  map ppubus 0x3000 size 0x0f00 = mirror(ciram)  # and their $3000 mirror
+  map ppubus 0x0000 size 0x2000 = cart.chr        # the two pattern tables
+  # The nametables come from the *cartridge*, which is where the arrangement is
+  # decided: `nes.nrom` reads it out of the iNES header and publishes four 1 KiB
+  # windows onto the console's CIRAM already wired that way. A machine file that
+  # spelled the mirroring itself would be wrong for half the library.
+  map ppubus 0x2000 size 0x1000 = cart.nametables
+  map ppubus 0x3000 size 0x0f00 = cart.nametables # and their $3000 mirror
 
   # -- interrupts ------------------------------------------------------------
   # Driven high when requested, not low: nets idle low and inverting the
@@ -82,18 +98,11 @@ machine "nes-ntsc" {
   # net carries per-source levels for exactly that reason.
   wire apu.irq -> cpu.irq
 
-  # TODO(nametables): the two `mirror(ciram)` lines above are hard-coded
-  # **vertical** mirroring — CIRAM A10 = PPU A10, so $2000/$2800 are one screen
-  # and $2400/$2C00 the other. Real hardware decides it at the cartridge
-  # connector, and `nes.nrom` already knows which way: it reads the bit out of
-  # the iNES header and `Nrom::install` builds the right four 1 KiB aliases. It
-  # just publishes no `nametables` region for a `map` statement to name, so a
-  # described machine cannot ask it. Until it does, a horizontally-mirrored
-  # cartridge scrolls the wrong way across the seam. Everything else — the
-  # nametable writes, the fetches, the picture — is unaffected.
-  #
-  # TODO(dma, input): two devices do not exist at all yet. OAM DMA at $4014 is
-  # a CPU-side stall that copies a page into $2004, so sprites stay blank
-  # without it; the controller ports at $4016/$4017 read open bus, which most
-  # software reads as "no buttons held" rather than hanging.
+  # TODO(dma): the *transfer* at $4014 is complete — 256 bytes read and written
+  # through this bus, so OAM ends up correct and OAMADDR advances the way the
+  # hardware makes it. What is missing is the **CPU halt**: 513 cycles, 514 if
+  # the write lands on an odd cycle. Stalling the core needs a seam `cpu.mos6502`
+  # does not have (real hardware pulls /RDY low), so `nes.oamdma` records what it
+  # is owed in `OamDma::stall_owed` and nothing drains it. Sprites are right;
+  # anything timing a DMA is 513 cycles fast.
 }

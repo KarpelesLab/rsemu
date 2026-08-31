@@ -30,13 +30,27 @@
 //! The result is that a guest read of `$FFFC` costs a table lookup and a memcpy,
 //! with no virtual call anywhere on the path.
 //!
-//! # CIRAM belongs to the console
+//! # CIRAM: the console's RAM, the cartridge's wiring
 //!
 //! The 2 KiB of nametable RAM is on the console's board, not on the cartridge;
 //! the cartridge only drives one of its address lines (and, for a four-screen
-//! board, supplies 2 KiB of its own alongside it). So [`Nrom::install`] takes
-//! the CIRAM store as a parameter rather than allocating one, and the four-screen
-//! VRAM — which *is* cartridge state — is owned and snapshotted here.
+//! board, supplies 2 KiB of its own alongside it). The *arrangement*, though,
+//! is entirely the cartridge's — it is a solder pad on the board — and it is
+//! recorded in byte 6 of the iNES header.
+//!
+//! Which is why the board holds the store. A machine description reaches an
+//! aperture through [`Device::region`], which is answered while the memory map
+//! is being built — before `Instance::bind`, and long before any device has
+//! been told about any other. There is no moment at which the cartridge could
+//! be handed the console object's RAM and still publish a region named by a
+//! `map` statement. So the choice is between the board owning 2 KiB that
+//! belongs to the console, and every `.machine` file hard-coding a mirroring
+//! the cartridge already knows — and the second is a bug in every horizontally
+//! mirrored game.
+//!
+//! [`Nrom::ciram`] hands the store back out, [`Nrom::save`](Device::save)
+//! carries it, and the four-screen VRAM — which *is* cartridge state — sits
+//! beside it.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -85,7 +99,11 @@ const CPU_SPACE_LEN: u64 = 0x1_0000;
 const PPU_SPACE_LEN: u64 = 0x4000;
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+///
+/// Version 2 added CIRAM to the chunk: the board now holds the console's
+/// nametable RAM so that it can publish a wired-up `nametables` region, and a
+/// store the device owns is a store the device snapshots.
+const STATE_VERSION: u32 = 2;
 
 /// The class name a machine description would use.
 const CLASS_NAME: &str = "nes.nrom";
@@ -118,11 +136,17 @@ pub struct Nrom {
     chr_window: RegionRef,
     /// `$6000-$7FFF`, if the board has any work RAM.
     work_ram_window: Option<RegionRef>,
-    /// The extra 2 KiB a four-screen board carries. Cartridge state, unlike
-    /// CIRAM.
+    /// The extra 2 KiB a four-screen board carries. Genuinely cartridge state.
     vram: Option<Arc<RamStore>>,
     /// That same VRAM as a mappable region, so a machine file can place it.
     vram_region: Option<RegionRef>,
+    /// The console's 2 KiB of nametable RAM. See the [module docs](self) for
+    /// why the board holds it.
+    ciram: Arc<RamStore>,
+    /// `$2000-$2FFF`: four 1 KiB windows onto [`Nrom::ciram`] (and, on a
+    /// four-screen board, onto [`Nrom::vram`]), wired the way this cartridge
+    /// wires CIRAM A10.
+    nametables: RegionRef,
 }
 
 impl Nrom {
@@ -195,6 +219,12 @@ impl Nrom {
             .as_ref()
             .map(|v| Arc::new(Region::ram("nes.nrom.vram", Arc::clone(v))) as RegionRef);
 
+        // Built here rather than in `Device::region`, for the reason every
+        // other window is: two `map` statements naming one aperture must get
+        // one region, or the machine has two identities for one piece of RAM.
+        let ciram = Arc::new(RamStore::new(CIRAM_LEN));
+        let nametables = Arc::new(nametables(cart.mirroring(), &ciram, vram.as_ref())?);
+
         Ok(Nrom {
             cart,
             prg_window,
@@ -202,6 +232,8 @@ impl Nrom {
             work_ram_window,
             vram,
             vram_region,
+            ciram,
+            nametables,
         })
     }
 
@@ -247,25 +279,30 @@ impl Nrom {
         self.vram.as_ref()
     }
 
+    /// The console's 2 KiB of nametable RAM, which this board wires and holds.
+    ///
+    /// See the [module docs](self): the RAM is the console's, but the *wiring*
+    /// is the cartridge's, and a region cannot be published without both.
+    #[must_use]
+    pub const fn ciram(&self) -> &Arc<RamStore> {
+        &self.ciram
+    }
+
     /// Map the board into a CPU space and a PPU space. **Retopology.**
     ///
-    /// `ciram` is the console's 2 KiB of nametable RAM, which the cartridge
-    /// wires but does not own — see the [module docs](self).
+    /// Everything the board decodes, including the four nametable windows onto
+    /// [`Nrom::ciram`] — see the [module docs](self).
     ///
     /// This is what [`Device::realize`] will call once `RealizeCtx` can hand a
     /// device its address spaces; until then it is the seam a machine builder
-    /// uses directly.
+    /// uses directly. A machine described in the DSL does not need it: it names
+    /// `cart.prg`, `cart.chr` and `cart.nametables` in `map` statements.
     ///
     /// # Errors
     ///
-    /// [`Error::Config`] if either space is too small to be a NES bus, if
-    /// `ciram` is under 2 KiB, or if a mapping does not fit.
-    pub fn install(
-        &self,
-        cpu: &AddressSpace,
-        ppu: &AddressSpace,
-        ciram: &Arc<RamStore>,
-    ) -> Result<CartMappings> {
+    /// [`Error::Config`] if either space is too small to be a NES bus, or if a
+    /// mapping does not fit.
+    pub fn install(&self, cpu: &AddressSpace, ppu: &AddressSpace) -> Result<CartMappings> {
         if cpu.size() < CPU_SPACE_LEN {
             return Err(config(format!(
                 "CPU space `{}` is {:#x} bytes; a 6502 bus is {CPU_SPACE_LEN:#x}",
@@ -280,16 +317,10 @@ impl Nrom {
                 ppu.size()
             )));
         }
-        if ciram.len() < CIRAM_LEN {
-            return Err(config(format!(
-                "CIRAM is {:#x} bytes; the console has {CIRAM_LEN:#x}",
-                ciram.len()
-            )));
-        }
 
         // Build every region before mapping any of them, so a failure leaves
         // the spaces untouched rather than half-populated.
-        let nametables = Arc::new(self.nametables(ciram)?);
+        let nametables = Arc::clone(&self.nametables);
         let nametable_mirror = Arc::new(Region::alias(
             "nes.nrom.nametables-mirror",
             nametables.clone(),
@@ -352,56 +383,63 @@ impl Nrom {
         Ok(())
     }
 
-    /// The `$2000-$2FFF` container: four 1 KiB windows onto CIRAM, wired the
-    /// way the board wires CIRAM A10.
-    fn nametables(&self, ciram: &Arc<RamStore>) -> Result<Region> {
-        let console = Arc::new(Region::ram("nes.ciram", ciram.clone()));
-        let cart_vram = self
-            .vram
-            .as_ref()
-            .map(|v| Arc::new(Region::ram("nes.nrom.vram", v.clone())));
-
-        let mut children = Vec::with_capacity(4);
-        for (slot, bank) in self.cart.mirroring().banks().into_iter().enumerate() {
-            let (target, index) = if bank < 2 {
-                (&console, u64::from(bank))
-            } else {
-                let vram = cart_vram.as_ref().ok_or_else(|| {
-                    config(String::from(
-                        "four-screen mirroring needs cartridge VRAM, which this board has none of",
-                    ))
-                })?;
-                (vram, u64::from(bank) - 2)
-            };
-            let name = match slot {
-                0 => "nes.nrom.nt0",
-                1 => "nes.nrom.nt1",
-                2 => "nes.nrom.nt2",
-                _ => "nes.nrom.nt3",
-            };
-            let window =
-                Region::alias(name, target.clone(), index * NAMETABLE_SIZE, NAMETABLE_SIZE)?;
-            children.push(Mapping::new(window, slot as u64 * NAMETABLE_SIZE));
-        }
-        Ok(Region::container(
-            "nes.nrom.nametables",
-            NAMETABLE_WINDOW,
-            children,
-        ))
-    }
-
     /// Every store this device owns that a snapshot has to carry, in a fixed
     /// order.
     ///
     /// Fixed order because it is the wire format: work RAM, then CHR RAM, then
-    /// four-screen VRAM, each length-prefixed and each possibly absent.
-    fn mutable_stores(&self) -> [Option<&Arc<RamStore>>; 3] {
+    /// four-screen VRAM, then CIRAM, each length-prefixed and each possibly
+    /// absent. CIRAM is never absent, but it is encoded the same way as the
+    /// rest so that the reader stays one loop.
+    fn mutable_stores(&self) -> [Option<&Arc<RamStore>>; 4] {
         [
             self.cart.work_ram(),
             self.cart.chr().as_ram(),
             self.vram.as_ref(),
+            Some(&self.ciram),
         ]
     }
+}
+
+/// The `$2000-$2FFF` container: four 1 KiB windows onto CIRAM, wired the way
+/// the board wires CIRAM A10.
+///
+/// A free function rather than a method because it runs inside [`Nrom::new`],
+/// before there is an `Nrom` to call it on — the region has to exist by the
+/// time a `map` statement asks for it (see the [module docs](self)).
+fn nametables(
+    mirroring: super::ines::Mirroring,
+    ciram: &Arc<RamStore>,
+    vram: Option<&Arc<RamStore>>,
+) -> Result<Region> {
+    let console = Arc::new(Region::ram("nes.ciram", ciram.clone()));
+    let cart_vram = vram.map(|v| Arc::new(Region::ram("nes.nrom.vram", v.clone())));
+
+    let mut children = Vec::with_capacity(4);
+    for (slot, bank) in mirroring.banks().into_iter().enumerate() {
+        let (target, index) = if bank < 2 {
+            (&console, u64::from(bank))
+        } else {
+            let vram = cart_vram.as_ref().ok_or_else(|| {
+                config(String::from(
+                    "four-screen mirroring needs cartridge VRAM, which this board has none of",
+                ))
+            })?;
+            (vram, u64::from(bank) - 2)
+        };
+        let name = match slot {
+            0 => "nes.nrom.nt0",
+            1 => "nes.nrom.nt1",
+            2 => "nes.nrom.nt2",
+            _ => "nes.nrom.nt3",
+        };
+        let window = Region::alias(name, target.clone(), index * NAMETABLE_SIZE, NAMETABLE_SIZE)?;
+        children.push(Mapping::new(window, slot as u64 * NAMETABLE_SIZE));
+    }
+    Ok(Region::container(
+        "nes.nrom.nametables",
+        NAMETABLE_WINDOW,
+        children,
+    ))
 }
 
 /// Reject a ROM or RAM size an NROM board could not present in `window`.
@@ -495,6 +533,11 @@ impl Device for Nrom {
             "chr" => Some(Arc::clone(&self.chr_window)),
             "work" => self.work_ram_window.clone(),
             "vram" => self.vram_region.clone(),
+            // The whole point of the exercise: `$2000-$2FFF` already wired for
+            // *this* cartridge's mirroring, so a machine file asks the board
+            // which way the pads are cut instead of guessing. Map it twice —
+            // at `$2000` and again, clipped to `$0F00`, at `$3000`.
+            "nametables" => Some(Arc::clone(&self.nametables)),
             _ => None,
         }
     }
@@ -513,6 +556,7 @@ impl Device for Nrom {
         if let Some(vram) = &self.vram {
             let _ = vram.fill(0, vram.len(), 0);
         }
+        let _ = self.ciram.fill(0, self.ciram.len(), 0);
         if let Some(work) = self.cart.work_ram() {
             // Battery-backed RAM survives a power cycle. That is the entire
             // point of the battery.
@@ -540,7 +584,7 @@ impl Device for Nrom {
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
         for (i, store) in self.mutable_stores().into_iter().enumerate() {
-            let name = ["work RAM", "CHR RAM", "four-screen VRAM"][i];
+            let name = ["work RAM", "CHR RAM", "four-screen VRAM", "CIRAM"][i];
             let present = r.read_bool()?;
             match (present, store) {
                 (false, None) => {}
@@ -599,6 +643,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .region("chr")
         .region("work")
         .region("vram")
+        .region("nametables")
 }
 
 #[cfg(test)]
@@ -639,14 +684,12 @@ mod tests {
     struct Bus {
         cpu: AddressSpace,
         ppu: AddressSpace,
-        ciram: Arc<RamStore>,
     }
 
     fn bus() -> Bus {
         Bus {
             cpu: AddressSpace::new("cpu", 16),
             ppu: AddressSpace::new("ppu", 14),
-            ciram: Arc::new(RamStore::new(CIRAM_LEN)),
         }
     }
 
@@ -666,7 +709,7 @@ mod tests {
     fn sixteen_kib_of_prg_answers_in_both_banks() {
         let nrom = board(1, 1, 0);
         let b = bus();
-        nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
+        nrom.install(&b.cpu, &b.ppu).expect("installs");
 
         for offset in [0u64, 1, 0x1234, 0x3ffc, 0x3fff] {
             let low = rd(&b.cpu, PRG_BASE + offset);
@@ -692,7 +735,7 @@ mod tests {
     fn thirty_two_kib_of_prg_is_contiguous() {
         let nrom = board(2, 1, 0);
         let b = bus();
-        nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
+        nrom.install(&b.cpu, &b.ppu).expect("installs");
 
         for offset in [0u64, 0x3fff, 0x4000, 0x7fff] {
             let want = ((offset >> 8) as u8) ^ (offset as u8);
@@ -706,7 +749,7 @@ mod tests {
     fn prg_rom_ignores_writes() {
         let nrom = board(2, 1, 0);
         let b = bus();
-        nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
+        nrom.install(&b.cpu, &b.ppu).expect("installs");
         let before = rd(&b.cpu, 0x8000);
         wr(&b.cpu, 0x8000, before.wrapping_add(1));
         assert_eq!(rd(&b.cpu, 0x8000), before, "a mask ROM swallows writes");
@@ -716,7 +759,7 @@ mod tests {
     fn chr_rom_is_readable_and_chr_ram_is_writable() {
         let nrom = board(1, 1, 0);
         let b = bus();
-        nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
+        nrom.install(&b.cpu, &b.ppu).expect("installs");
         for offset in [0u64, 0x1000, 0x1fff] {
             let want = !(((offset >> 8) as u8) ^ (offset as u8));
             assert_eq!(rd(&b.ppu, CHR_BASE + offset), want, "chr {offset:#06x}");
@@ -727,7 +770,7 @@ mod tests {
         // A CHR-RAM cartridge (CHR size 0) is.
         let nrom = board(1, 0, 0);
         let b = bus();
-        nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
+        nrom.install(&b.cpu, &b.ppu).expect("installs");
         assert!(nrom.cartridge().chr().is_ram());
         wr(&b.ppu, 0x0100, 0x99);
         assert_eq!(rd(&b.ppu, 0x0100), 0x99);
@@ -737,7 +780,7 @@ mod tests {
     fn work_ram_is_mapped_and_mirrored() {
         let nrom = board(1, 1, 0);
         let b = bus();
-        nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
+        nrom.install(&b.cpu, &b.ppu).expect("installs");
         wr(&b.cpu, 0x6000, 0x42);
         assert_eq!(rd(&b.cpu, 0x6000), 0x42);
         // 8 KiB of RAM in an 8 KiB window: no mirroring, but the far end works.
@@ -760,7 +803,7 @@ mod tests {
         assert!(cart.work_ram().is_none());
         let nrom = Nrom::new(cart).expect("board");
         let b = bus();
-        let m = nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
+        let m = nrom.install(&b.cpu, &b.ppu).expect("installs");
         assert_eq!(m.cpu.len(), 1, "only the PRG window");
         assert!(b.cpu.locate(0x6000).is_none(), "$6000 is open bus");
     }
@@ -771,7 +814,7 @@ mod tests {
     /// what all four slots read back as, which is the mirroring made visible.
     fn nametable_pattern(nrom: &Nrom) -> [[u8; 4]; 4] {
         let b = bus();
-        nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
+        nrom.install(&b.cpu, &b.ppu).expect("installs");
         let mut out = [[0u8; 4]; 4];
         for (written, row) in out.iter_mut().enumerate() {
             // Clear, then mark one slot, so each row is independent.
@@ -819,6 +862,51 @@ mod tests {
         }
     }
 
+    /// The published `nametables` region is the wiring, not a bare 4 KiB.
+    ///
+    /// This is the region a `.machine` file names, and the whole reason it
+    /// exists: mapping it puts *this cartridge's* arrangement on the PPU bus,
+    /// where `mirror(ciram)` in the machine file put whichever one its author
+    /// happened to write down.
+    #[test]
+    fn the_published_nametable_region_carries_the_cartridge_wiring() {
+        for (flags6, want_slot1_of_slot0) in [(0x00u8, true), (0x01, false)] {
+            let nrom = board(1, 1, flags6);
+            let region = nrom
+                .region("nametables")
+                .expect("the board publishes its nametables");
+            assert_eq!(region.len(), NAMETABLE_WINDOW);
+
+            // Map it exactly as a machine file does — once at $2000 and again,
+            // clipped, at $3000 — and check the arrangement through the space.
+            let b = bus();
+            {
+                let mut topo = b.ppu.topology();
+                topo.map(Arc::clone(&region), NAMETABLE_BASE).expect("maps");
+                topo.map(
+                    Arc::new(
+                        Region::alias("mirror", region, 0, NAMETABLE_MIRROR_WINDOW).expect("clips"),
+                    ),
+                    NAMETABLE_MIRROR_BASE,
+                )
+                .expect("maps");
+            }
+            wr(&b.ppu, 0x2000, 0x5a);
+            assert_eq!(
+                rd(&b.ppu, 0x2400) == 0x5a,
+                want_slot1_of_slot0,
+                "{flags6:#04x}"
+            );
+            assert_eq!(
+                rd(&b.ppu, 0x2800) == 0x5a,
+                !want_slot1_of_slot0,
+                "{flags6:#04x}"
+            );
+            // And the $3000 alias is the same storage.
+            assert_eq!(rd(&b.ppu, 0x3000), 0x5a);
+        }
+    }
+
     #[test]
     fn the_two_ciram_banks_are_distinct_storage() {
         // No iNES header can name the single-screen arrangements — no mapper-0
@@ -830,20 +918,20 @@ mod tests {
 
         let nrom = board(1, 1, 0x00);
         let b = bus();
-        nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
+        nrom.install(&b.cpu, &b.ppu).expect("installs");
         // Horizontal, so slot 0 is CIRAM bank 0 and slot 2 is bank 1: the two
         // banks are genuinely distinct storage.
         wr(&b.ppu, 0x2000, 0x11);
         wr(&b.ppu, 0x2800, 0x22);
-        assert_eq!(b.ciram.read_u8(0).expect("in range"), 0x11);
-        assert_eq!(b.ciram.read_u8(0x400).expect("in range"), 0x22);
+        assert_eq!(nrom.ciram().read_u8(0).expect("in range"), 0x11);
+        assert_eq!(nrom.ciram().read_u8(0x400).expect("in range"), 0x22);
     }
 
     #[test]
     fn the_nametables_appear_again_at_3000() {
         let nrom = board(1, 1, 0x01);
         let b = bus();
-        nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
+        nrom.install(&b.cpu, &b.ppu).expect("installs");
         wr(&b.ppu, 0x2000, 0x5a);
         assert_eq!(rd(&b.ppu, 0x3000), 0x5a);
         wr(&b.ppu, 0x3eff, 0xa5);
@@ -856,7 +944,7 @@ mod tests {
     fn uninstall_puts_the_spaces_back() {
         let nrom = board(1, 1, 0);
         let b = bus();
-        let m = nrom.install(&b.cpu, &b.ppu, &b.ciram).expect("installs");
+        let m = nrom.install(&b.cpu, &b.ppu).expect("installs");
         assert!(b.cpu.locate(0x8000).is_some());
         nrom.uninstall(&b.cpu, &b.ppu, &m).expect("unmaps");
         assert!(b.cpu.locate(0x8000).is_none());
@@ -904,16 +992,11 @@ mod tests {
         let nrom = board(1, 1, 0);
         let cpu = AddressSpace::new("cpu", 15);
         let ppu = AddressSpace::new("ppu", 14);
-        let ciram = Arc::new(RamStore::new(CIRAM_LEN));
-        assert!(nrom.install(&cpu, &ppu, &ciram).is_err());
+        assert!(nrom.install(&cpu, &ppu).is_err());
 
         let cpu = AddressSpace::new("cpu", 16);
         let ppu = AddressSpace::new("ppu", 13);
-        assert!(nrom.install(&cpu, &ppu, &ciram).is_err());
-
-        let ppu = AddressSpace::new("ppu", 14);
-        let small = Arc::new(RamStore::new(1024));
-        assert!(nrom.install(&cpu, &ppu, &small).is_err());
+        assert!(nrom.install(&cpu, &ppu).is_err());
     }
 
     #[test]
@@ -1075,8 +1158,9 @@ mod tests {
             .chunk("cart", CLASS_NAME, STATE_VERSION)
             .expect("one chunk");
         nrom.save(&mut chunk).expect("saves");
-        // 8 KiB of work RAM + a length prefix + three presence bytes.
-        assert_eq!(chunk.len(), 8192 + 8 + 3);
+        // 8 KiB of work RAM and 2 KiB of CIRAM, each with a length prefix,
+        // plus four presence bytes. No ROM.
+        assert_eq!(chunk.len(), 8192 + 8 + 2048 + 8 + 4);
     }
 
     #[test]

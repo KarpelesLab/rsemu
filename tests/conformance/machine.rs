@@ -63,13 +63,76 @@ pub(crate) mod buttons {
 
 /// Build a machine from an iNES image, or `None` if this build has no NES.
 ///
-/// # Wiring up a real machine
-///
-/// When the NES board lands, this becomes a call into the `.machine` loader
-/// with the cartridge substituted, plus a small adapter implementing the three
-/// methods above. Everything else in the AccuracyCoin runner is already written
-/// against them.
+/// `nes-ntsc` out of the shipped catalog with `rom` bound to the image — the
+/// same thing `rsemu run nes-ntsc --cart AccuracyCoin.nes` builds, with no
+/// hand-wiring and no test-only topology. If it does not realize, the runner
+/// wants to know why, so the error is printed rather than swallowed.
+#[cfg(feature = "machine-nes")]
+pub(crate) fn new_nes(rom: &[u8]) -> Option<Box<dyn NesMachine>> {
+    match Nes::new(rom) {
+        Ok(nes) => Some(Box::new(nes)),
+        Err(e) => {
+            println!("note: nes-ntsc did not realize: {e}");
+            None
+        }
+    }
+}
+
+/// No NES in this build.
+#[cfg(not(feature = "machine-nes"))]
 pub(crate) fn new_nes(rom: &[u8]) -> Option<Box<dyn NesMachine>> {
     let _ = rom;
     None
+}
+
+/// A realized `nes-ntsc`, driven by whole frames.
+#[cfg(feature = "machine-nes")]
+struct Nes {
+    machine: rsemu::machine::Machine,
+    /// The host end of the controller seam. Buttons are a *level*: whatever is
+    /// set here is what the console latches the next time the ROM strobes.
+    pads: std::sync::Arc<rsemu::dev::nes::Pad>,
+}
+
+#[cfg(feature = "machine-nes")]
+impl Nes {
+    /// One NTSC frame, in nanoseconds.
+    ///
+    /// 341 x 262 dots minus the odd-frame skip, at 236250000/11 / 4 Hz — which
+    /// is 60.0988 Hz. The machine's own clocks are exact; this number only has
+    /// to be long enough that every frame contains exactly one vertical blank,
+    /// and the run loop stops on the PPU's own events regardless.
+    const FRAME_NS: u64 = 16_639_267;
+
+    fn new(rom: &[u8]) -> Result<Nes, rsemu::Error> {
+        let machine = rsemu::machine::catalog::build_catalog("nes-ntsc", &[("cart", rom)])?;
+        Ok(Nes {
+            pads: rsemu::dev::nes::pads::open(rsemu::dev::nes::DEFAULT_PAD_PORT),
+            machine,
+        })
+    }
+}
+
+#[cfg(feature = "machine-nes")]
+impl NesMachine for Nes {
+    fn run_frames(&mut self, frames: u32) {
+        let span = rsemu::core::clock::GlobalTime::from_nanos(Self::FRAME_NS);
+        for _ in 0..frames {
+            self.machine.run_for(span).expect("the machine runs");
+        }
+    }
+
+    fn set_controller1(&mut self, buttons: u8) {
+        self.pads.set(0, buttons);
+    }
+
+    fn peek(&self, addr: u16) -> u8 {
+        use rsemu::core::space::MemAttrs;
+        use rsemu::core::value::Width;
+        self.machine
+            .space("cpubus")
+            .expect("cpubus")
+            .read(u64::from(addr), Width::U8, MemAttrs::DEBUG)
+            .expect("the open-bus policy answers everything") as u8
+    }
 }

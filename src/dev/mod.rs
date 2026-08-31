@@ -14,6 +14,7 @@
 //! | [`apple1`] | `dev-apple1` | the Apple 1's MC6821, its monitor ROM socket, and RSMON |
 //! | [`apu`] | `dev-nes-apu` | the RP2A03 audio half: channels, frame counter, DMC |
 //! | [`cart`] | `dev-nes-cart` | cartridge images and the mappers that decode them |
+//! | [`nes`] | `dev-nes-io` | the console's own I/O: controller ports, OAM DMA |
 //! | [`ppu`] | `dev-nes-ppu` | the RP2C02 picture unit: the per-dot pipeline |
 //! | [`wdc`] | `dev-wdc` | the W65C51N ACIA and W65C22 VIA, and a 6502 board's ROM |
 //!
@@ -32,6 +33,10 @@ pub mod apu;
 #[cfg(feature = "dev-nes-cart")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-cart")))]
 pub mod cart;
+
+#[cfg(feature = "dev-nes-io")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-io")))]
+pub mod nes;
 
 #[cfg(feature = "dev-nes-ppu")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-ppu")))]

@@ -158,6 +158,8 @@ pub fn registry() -> Result<Registry> {
     crate::cpu::mos6502::register(&mut reg)?;
     #[cfg(feature = "dev-nes-cart")]
     crate::dev::cart::nrom::register(&mut reg)?;
+    #[cfg(feature = "dev-nes-io")]
+    crate::dev::nes::register(&mut reg)?;
     #[cfg(feature = "dev-nes-ppu")]
     crate::dev::ppu::register(&mut reg)?;
     #[cfg(feature = "dev-nes-apu")]
@@ -195,6 +197,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::cpu::mos6502::bind(&mut b)?;
     #[cfg(feature = "dev-nes-cart")]
     crate::dev::cart::nrom::bind(&mut b)?;
+    #[cfg(feature = "dev-nes-io")]
+    crate::dev::nes::bind(&mut b)?;
     #[cfg(feature = "dev-nes-ppu")]
     crate::dev::ppu::bind(&mut b)?;
     #[cfg(feature = "dev-nes-apu")]
@@ -217,6 +221,10 @@ pub fn classes() -> ClassTable {
     table.insert(crate::cpu::mos6502::schema());
     #[cfg(feature = "dev-nes-cart")]
     table.insert(crate::dev::cart::nrom::schema());
+    #[cfg(feature = "dev-nes-io")]
+    for schema in crate::dev::nes::schemas() {
+        table.insert(schema);
+    }
     #[cfg(feature = "dev-nes-ppu")]
     table.insert(crate::dev::ppu::schema());
     #[cfg(feature = "dev-nes-apu")]

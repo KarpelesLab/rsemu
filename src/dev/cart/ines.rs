@@ -1356,7 +1356,12 @@ mod tests {
         assert_eq!(h.mapper, 0, "AccuracyCoin is an NROM cart");
         assert_eq!(h.prg_rom_len, 32768);
         assert_eq!(h.chr_rom_len, 8192);
-        assert_eq!(h.mirroring, Mirroring::Vertical);
+        // Byte 6 bit 0 clear is *horizontal* mirroring — "horizontal
+        // arrangement" of the nametables, CIRAM A10 tied to PPU A11 (NESdev,
+        // "INES", Flags 6). AccuracyCoin's header byte 6 is $00, so this is
+        // the case the naming trips everyone on: a vertical *arrangement* of
+        // the mirrors is horizontal mirroring and vice versa.
+        assert_eq!(h.mirroring, Mirroring::Horizontal);
         assert!(!h.battery);
         assert!(!h.trainer);
         assert_eq!(h.image_len, 16 + 32768 + 8192);
