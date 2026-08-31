@@ -15,6 +15,43 @@ and the one that forced the `host::chardev` seam a UART will later reuse.
 | *Apple I Replica Creation*, ch. 7 tbl. 7.5 | What the four addresses are on this board, and the `DA`/`RDA` handshake |
 | [Ken Shirriff, Apple 1 shift-register memory](https://www.righto.com/) | Why the display runs at ~60 characters/second |
 
+## What the manual pins down
+
+Now that the manual is usable as a primary source, these come from it directly
+rather than from inference:
+
+| | |
+| --- | --- |
+| CPU | MOS Technology 6502, **1.023 MHz** clock, **0.960 MHz** effective "including refresh waits" |
+| Video | 40 characters/line, 24 lines, automatic scrolling; 15734 Hz line rate, **60.05 Hz** frame rate; 5×7 character matrix |
+| Display memory | dynamic shift registers, 1K × 7 |
+| RAM | 4 KiB supplied, 8 KiB on-board capacity (4096/2104 dynamic) |
+
+And the PIA, quoted from its "PIA Internal Registers" table:
+
+- `$D010` **KBD** — "High order bit equals 1."
+- `$D011` **KBD CR** — "High order bit indicates 'key ready'. Reading key
+  clears flag. Rising edge of KBD sets flag."
+- `$D012` **DSP** — "Lower seven bits are data output, high order bit is
+  'display ready' input."
+- `$D013` **DSP CR**
+
+**One polarity worth pinning down, because the prose and the code appear to
+disagree.** The manual's prose reads as though 1 means ready. Its own object
+code says otherwise, and the object code wins: `ECHO` at `$FFEF` is
+
+```
+FFEF:  2C 12 D0     BIT $D012
+FFF2:  30 FB        BMI $FFEF     ; $30 is BMI, not $10 BPL
+FFF4:  8D 12 D0     STA $D012
+```
+
+`BMI` loops **while bit 7 is set**, so **set means busy** and the routine
+proceeds when it clears. rsemu implements that, and the disagreement is
+recorded here rather than left for the next reader to rediscover — the scanned
+prose at this point is OCR-damaged (a character is missing from the
+parenthetical), which is very likely the whole explanation.
+
 ## The clock
 
 The manual states it directly: a 6502 at **1.023 MHz**, with an *effective*
