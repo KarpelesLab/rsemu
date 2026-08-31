@@ -57,6 +57,10 @@ RUN OPTIONS:
                         machine that opens exactly one is picked up on its own,
                         so `rsemu run apple1` is interactive already
     --headless          Do not attach a terminal, whatever the machine opened
+    --screenshot <file> Write the machine's display to a PNG when the run ends.
+                        Needs a build with `display-png` and a machine with a
+                        display; a machine with neither says so rather than
+                        writing nothing
     --gdb <addr>        Listen for GDB on <addr> and hold the machine stopped
                         until it attaches. `1234`, `:1234` and `host:1234` all
                         work; a bare port binds the loopback interface only,
@@ -211,6 +215,9 @@ struct RunArgs {
     console: Option<String>,
     /// Whether the user asked for no terminal at all.
     headless: bool,
+    /// Where to write a PNG of the display when the run ends, if `--screenshot`
+    /// was given.
+    screenshot: Option<String>,
     quiet: bool,
     /// Where to listen for a debugger, if `--gdb` was given.
     #[cfg(feature = "gdb")]
@@ -278,6 +285,14 @@ fn run(args: &[String]) -> ExitCode {
         options = options.with_param(key.clone(), value.clone());
     }
 
+    // A host gets a typed handle on a display device at the one moment the
+    // concrete type exists: construction. Installed unconditionally rather than
+    // only under `--screenshot`, so that asking for a screenshot after the fact
+    // is never the thing that changes how the machine was built.
+    if let Err(e) = install_capture(&mut options) {
+        return fail(&e);
+    }
+
     let registry = match catalog::registry() {
         Ok(r) => r,
         Err(e) => return fail(&e),
@@ -321,10 +336,94 @@ fn run(args: &[String]) -> ExitCode {
     if let Err(e) = machine.run_for(parsed.span) {
         eprintln!("rsemu: {e}");
         summarise(&machine);
+        write_screenshot(&parsed);
         return ExitCode::FAILURE;
     }
     summarise(&machine);
+    if !write_screenshot(&parsed) {
+        return ExitCode::FAILURE;
+    }
     ExitCode::SUCCESS
+}
+
+/// Wrap the machine's bindings so a display device hands the host a handle.
+///
+/// One arm per device family that publishes a scanout, exactly like the
+/// registration lists in `machine::catalog`: a family that is not named here is
+/// not in the build, and that is visible by reading the code.
+#[allow(unused_variables, unused_mut)]
+fn install_capture(options: &mut rsemu::machine::BuildOptions) -> rsemu::Result<()> {
+    #[cfg(feature = "dev-nes-ppu")]
+    rsemu::host::display::nes::capture::install(options)?;
+    #[cfg(feature = "dev-pc-video")]
+    rsemu::host::display::pc::capture::install(options)?;
+    Ok(())
+}
+
+/// The display of the machine just built, if it has one this build can see.
+#[allow(unused_mut)]
+fn take_scanout() -> Option<Box<dyn rsemu::host::display::Scanout>> {
+    #[cfg(feature = "dev-pc-video")]
+    if let Some(s) = rsemu::host::display::pc::capture::take() {
+        return Some(Box::new(s));
+    }
+    #[cfg(feature = "dev-nes-ppu")]
+    if let Some(s) = rsemu::host::display::nes::capture::take() {
+        return Some(Box::new(s));
+    }
+    None
+}
+
+/// Write `--screenshot`'s PNG, reporting whether the run should still count as
+/// a success.
+///
+/// Returns true when nothing was asked for. A `--screenshot` that could not be
+/// honoured is an error rather than a silence: the user asked for a file and
+/// there has to be one, or a reason.
+fn write_screenshot(args: &RunArgs) -> bool {
+    let Some(path) = args.screenshot.as_deref() else {
+        return true;
+    };
+    #[cfg(not(feature = "display-png"))]
+    {
+        let _ = path;
+        eprintln!("rsemu: --screenshot needs a build with the `display-png` feature");
+        false
+    }
+    #[cfg(feature = "display-png")]
+    {
+        use rsemu::host::display::{Surface, png};
+        let Some(scanout) = take_scanout() else {
+            eprintln!("rsemu: --screenshot: this machine has no display");
+            return false;
+        };
+        let mut surface = Surface::for_scanout(scanout.as_ref());
+        scanout.capture(&mut surface);
+        let bytes = match png::encode(&surface) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("rsemu: --screenshot: {e}");
+                return false;
+            }
+        };
+        match std::fs::write(path, &bytes) {
+            Ok(()) => {
+                if !args.quiet {
+                    println!(
+                        "screenshot  {path} ({}x{}, {} bytes)",
+                        surface.width(),
+                        surface.height(),
+                        bytes.len()
+                    );
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!("rsemu: cannot write {path}: {e}");
+                false
+            }
+        }
+    }
 }
 
 /// `rsemu debug <machine>`: `run` with a debugger attached (`ROADMAP.md` §2).
@@ -621,6 +720,7 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
     let mut out = RunArgs {
         machine: String::new(),
         media: Vec::new(),
+        screenshot: None,
         monitor: None,
         params: Vec::new(),
         // One second of virtual time: long enough to prove a machine runs,
@@ -681,6 +781,7 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             "--gdb" => out.gdb = Some(value(arg)?),
             "--console" => out.console = Some(value(arg)?),
             "--headless" => out.headless = true,
+            "--screenshot" => out.screenshot = Some(value(arg)?),
             "-q" | "--quiet" => out.quiet = true,
             other if other.starts_with('-') => {
                 return Err(format!("unknown option `{other}`"));

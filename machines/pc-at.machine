@@ -76,9 +76,14 @@ machine "pc-at" {
   # interrupt rates are all powers of two.
   osc rtc = 32768 Hz
 
-  # The VGA's 25.175 MHz dot clock, divided by 9 for the 9-pixel character cell
-  # of the 720x400 text mode. The video device counts character clocks.
-  osc dot = 25175000 Hz
+  # The VGA's dot clock. A real card has **two** cans — 25.175 MHz for the
+  # 640x480 modes and 28.322 MHz for the 720x400 text mode — and the
+  # miscellaneous output register's clock-select bits choose between them at
+  # runtime. A clock domain has one parent, so the board wires the device to the
+  # text-mode crystal, which is what it comes out of reset selecting and the
+  # only one that matters until a graphics mode exists. Divided by 9 for the
+  # nine-pixel character cell; the device counts character clocks.
+  osc dot = 28322000 Hz
 
   # The floppy controller's data separator. Nothing here divides by it; the
   # controller completes its operations without modelling their duration, and
@@ -192,7 +197,12 @@ machine "pc-at" {
   # A CRTC, a character buffer and a character generator. Text mode only, which
   # is what reaches a prompt; the picture comes out through the `host::display`
   # scanout seam, so `--screenshot` and the browser see what the guest drew.
-  object vga "pc.video" { clock = dot / 9 }
+  # `dot-clock` says the same number the domain above does, and has to: the
+  # device derives its frame period from its own registers and needs the
+  # crystal's rate to do it, and `BindCtx` carries a clock domain but not the
+  # forest's picture of what that domain is rated at. Written twice, like the
+  # RTC's memory sizes and for the same reason — a seam to close, not a design.
+  object vga "pc.video" { clock = dot / 9, dot-clock = 28322000 }
 
   # -- the floppy controller --------------------------------------------------
   #
@@ -256,9 +266,12 @@ machine "pc-at" {
   map port 0x0092 size 0x0001 = sysctl.porta   # fast A20 and fast reset
   map port 0x00a0 size 0x0002 = pic2.regs      # slave 8259A
   map port 0x00c0 size 0x0020 = dma2.regs      # DMA 2, channels 4-7, at 2x
-  map port 0x03b4 size 0x0002 = vga.crtc       # the CRTC, monochrome address
+  map port 0x03b4 size 0x0002 = vga.crtc-mono  # the CRTC, monochrome address
   map port 0x03c0 size 0x0010 = vga.vga        # sequencer, DAC, attribute...
-  map port 0x03d4 size 0x0002 = vga.crtc       # ...and its colour address
+  map port 0x03d4 size 0x0002 = vga.crtc-colour # ...and its colour address,
+                                              # and which of the two answers is
+                                              # the miscellaneous output
+                                              # register's bit 0, not the board
   map port 0x03d8 size 0x0002 = vga.mode       # CGA mode and colour select
   map port 0x03da size 0x0001 = vga.status     # retrace, and the AC flip-flop
   map port 0x03f0 size 0x0008 = fdc.regs       # uPD765A
