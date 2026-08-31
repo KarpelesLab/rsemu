@@ -14,6 +14,12 @@ controllers come from [`fstool`](https://github.com/KarpelesLab/fstool) — see
 | SCSI | [T10](https://www.t10.org/) — SPC (primary commands), SBC (block commands) | Drafts free |
 | SD / MMC | SD Association simplified specifications | sdcard.org **[browser]** — the *simplified* specs are free |
 | virtio-blk | [`virtio.md`](virtio.md) | Free |
+| Parallel NOR flash (CFI) | JEDEC **JESD68.01** (Common Flash Interface) and **JEP137B**; the Intel StrataFlash P30 datasheet for the Intel/Sharp command set, the Spansion/Cypress S29GL datasheets for the AMD one | **Free** — jedec.org registration; the datasheets are open downloads |
+
+NOR flash is here rather than under devices because it is a *transport* too:
+the guest sees a memory window with a command protocol on it, not a controller
+with a queue, which is why `dev/flash/cfi` is not on `fstool::BlockDevice` and
+takes a plain media slot instead.
 
 NVMe and virtio-blk are both freely specified and much simpler to implement
 correctly than ATA. Prefer them for new machines; implement ATA because legacy

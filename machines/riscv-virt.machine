@@ -43,6 +43,12 @@ machine "riscv-virt" {
   # (`-p storage=64M`, or add `image = "disk"` to the object below).
   param storage = 16M
 
+  # How big each of the two NOR flash banks is. Two, because that is how a
+  # board that boots UEFI is wired: one holds the firmware and one holds the
+  # variable store, and the second has to be writable for the firmware to keep
+  # anything. See the `flash.cfi` objects below.
+  param flash = 32M
+
   # -- crystals --------------------------------------------------------------
   #
   # Three, because the board has three. RISC-V defines no instruction timing at
@@ -147,6 +153,44 @@ machine "riscv-virt" {
     seed = 1
   }
 
+  # -- NOR flash -------------------------------------------------------------
+  #
+  # Two banks of parallel NOR, which is what makes a UEFI build able to *keep*
+  # a variable rather than merely read one. RAM at these addresses gets a
+  # firmware as far as the DXE dispatcher and no further: EDK2's
+  # `VirtNorFlashDxe` will not install `gEfiVariableWriteArchProtocolGuid`
+  # against memory, because fault-tolerant write needs erase-and-program
+  # semantics that memory cannot provide (docs/platforms/riscv-virt.md).
+  #
+  # Each bank is two x16 parts on the 32-bit bus, which is how boards actually
+  # wire them and what the driver above assumes: it writes every command into
+  # both halves of a word and folds the two status registers back together.
+  # 256 KiB erase blocks, which is the granularity the variable store, the
+  # fault-tolerant-write working block and its spare are each laid out in.
+  #
+  # The guest finds them the same way it finds everything else here — the
+  # generated device tree gets a `cfi-flash` node per bank, with the address
+  # and size read back out of the `map` statements below.
+  #
+  #   rsemu run riscv-virt --media flash0=edk2-riscv-code.fd \
+  #                        --media flash1=edk2-riscv-vars.fd
+  #
+  # `flash0` is `readonly`: the bank a board boots from has `WP#` tied low, and
+  # firmware that is not meant to be guest-updatable should be refused rather
+  # than silently corrupted. `flash1` is not, and is the whole point.
+  object flash0 "flash.cfi" {
+    size     = flash
+    image    = "flash0"
+    block    = 256K
+    readonly = true
+  }
+
+  object flash1 "flash.cfi" {
+    size  = flash
+    image = "flash1"
+    block = 256K
+  }
+
   # -- the reset vector and the device tree ----------------------------------
   #
   # Five instructions at 0x1000 and, just below them, a device tree generated
@@ -173,6 +217,8 @@ machine "riscv-virt" {
   map mem 0x10000000 size 0x00000100 = uart   # eight registers, sixteen times
   map mem 0x10001000 size 0x00001000 = blk
   map mem 0x10002000 size 0x00001000 = rng
+  map mem 0x20000000 size flash      = flash0  # NOR: the firmware bank
+  map mem 0x22000000 size flash      = flash1  # NOR: the variable store
   map mem 0x80000000 size ram        = dram
 
   # -- interrupts ------------------------------------------------------------

@@ -34,8 +34,16 @@
 //!   0x0c00_0000  PLIC
 //!   0x1000_0000  16550 UART
 //!   0x1000_1000  virtio-mmio, one 4 KiB window each
+//!   0x2000_0000  NOR flash bank 0: the firmware
+//!   0x2200_0000  NOR flash bank 1: the UEFI variable store
 //!   0x8000_0000  DRAM
 //! ```
+//!
+//! The two flash banks are [`crate::dev::flash::cfi`] rather than anything in
+//! this module: a CFI part is not a RISC-V device, and the board simply maps
+//! two of them. What *is* board-specific is that they appear in the generated
+//! tree as `cfi-flash` nodes, which is how a UEFI build finds its variable
+//! store.
 //!
 //! # How far it boots
 //!
@@ -51,6 +59,14 @@
 //!   device tree: it finds the timer as `aclint-mtimer @ 10000000Hz`, the
 //!   console as `uart8250`, both `syscon-poweroff` and `syscon-reboot`, builds
 //!   its domain from our memory map, and jumps to `0x80200000` in S-mode.
+//! * **EDK2/UEFI** (`OvmfPkg/RiscVVirt`, BSD-2-Clause-Patent) boots out of the
+//!   two NOR banks to `UEFI Interactive Shell v2.2` at a `Shell>` prompt:
+//!   `gEfiVariableWriteArchProtocolGuid` installs against the flash, the DXE
+//!   dispatcher completes, and BDS enumerates its boot options. A variable
+//!   written in one run is in the store the next — the append-only variable log
+//!   continues where the previous run left it rather than restarting, which is
+//!   only possible on a part where a program clears bits and an erase costs a
+//!   block. `docs/platforms/riscv-virt.md` has the numbers.
 //! * **Linux** (a 6.12 `riscv64` Image behind OpenSBI) enters, parses the tree
 //!   — `Hardware name: rsemu riscv-virt (DT)` — sets up memory, the RISC-V
 //!   INTC, the SBI IPI and timer extensions and a 10 MHz clocksource, and

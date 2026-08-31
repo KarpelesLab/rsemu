@@ -55,11 +55,13 @@ something a person can actually run (§2).
 > interactive over a terminal; and `riscv-virt`, which is the one that boots
 > real system software: **OpenSBI 1.6 completely**, on a device tree generated
 > from the realized machine rather than shipped, then **Linux 6.12 as far as
-> `asids_init`** and **EDK2 to the end of the DXE dispatcher**. Where each stops
-> is written down, not rounded up. `pc-at` — a complete PC/AT chipset with a
-> user-supplied BIOS path — is now **in the catalog**: every CPU core in the
-> tree is bindable from a `.machine` file, so the asymmetry that held it out is
-> gone.
+> `asids_init`** and **EDK2 all the way to a UEFI shell prompt**, out of two CFI
+> NOR flash banks the board maps and the generated tree describes — the variable
+> store is real flash, so a variable written in one run is there in the next.
+> Where each stops is written down, not rounded up. `pc-at` — a complete PC/AT
+> chipset with a user-supplied BIOS path — is now **in the catalog**: every CPU
+> core in the tree is bindable from a `.machine` file, so the asymmetry that
+> held it out is gone.
 >
 > That 141 is itself a finding. The conformance table described an *older* ROM
 > release: it listed three tests the pinned ROM never writes and omitted

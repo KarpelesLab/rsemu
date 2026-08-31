@@ -49,6 +49,10 @@ RUN OPTIONS:
                         here and no file in the repository
     --vgabios <file>    Bind the `vgabios` media slot: a video option ROM
     --floppy <file>     Bind the `floppy` media slot: a raw diskette image
+    --flash0 <file>     Bind the `flash0` media slot: a NOR flash bank's
+                        contents. `riscv-virt` boots UEFI out of it.
+    --flash1 <file>     Bind the `flash1` media slot: the second NOR bank,
+                        which is where UEFI keeps its variables.
     --media <n>=<file>  Bind any media slot by name
     -p <name>=<value>   Override a `param` declared in the machine file
     --for <duration>    How much virtual time to run, as `1s`, `500ms`, `2m`
@@ -268,6 +272,17 @@ fn run(args: &[String]) -> ExitCode {
         && let Some(image) = builtin_firmware(&parsed.machine)
     {
         images.push((String::from("firmware"), image));
+    }
+
+    // And for the NOR flash banks a `riscv-virt` has: nothing bound means a
+    // board with blank parts on it, which is what a factory ships and what a
+    // UEFI build will format for itself. Naming the slots explicitly on every
+    // run to say "empty" would be ceremony, and an unbound slot is an error by
+    // design (`machine::realize`).
+    for slot in ["flash0", "flash1"] {
+        if !images.iter().any(|(bound, _)| bound == slot) {
+            images.push((String::from(slot), Vec::new()));
+        }
     }
 
     // A path wins over a catalog name, so a user editing a copy of a shipped
@@ -783,7 +798,8 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             // list is easier to extend than a match with a line each. They
             // exist at all because `--media bios=…` is correct and nobody
             // types it.
-            "--cart" | "--rom" | "--disk" | "--bios" | "--vgabios" | "--floppy" => {
+            "--cart" | "--rom" | "--disk" | "--bios" | "--vgabios" | "--floppy" | "--flash0"
+            | "--flash1" => {
                 let slot = arg.trim_start_matches('-').to_string();
                 let path = value(arg)?;
                 out.media.push((slot, path));

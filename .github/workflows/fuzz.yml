@@ -51,7 +51,7 @@ jobs:
         # never rewrites the curated seeds.
         run: |
           set -euxo pipefail
-          for t in machine_parser state_decoder state_roundtrip; do
+          for t in machine_parser state_decoder state_roundtrip flash_cfi; do
             mkdir -p "/tmp/corpus-$t"
             cargo fuzz run "$t" "/tmp/corpus-$t" "fuzz/corpus/$t" -- \
               -max_total_time=60 -timeout=10

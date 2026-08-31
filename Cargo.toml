@@ -224,12 +224,28 @@ machine-arm926 = ["cpu-arm-aprofile"]
 # 1.2 and the Devicetree Specification.
 dev-riscv = []
 
+# Parallel NOR flash (src/dev/flash/cfi): the Common Flash Interface query
+# structure and the Intel/Sharp extended command set (CFI id 0x0001) -- status
+# register, word program, the 0xe8 write buffer, block erase and the block lock
+# bits -- with the semantics that make flash *flash*: a program can only clear
+# bits, an erase costs a whole block, blocks may differ in size, and a read
+# during a command answers with status rather than data. Models an interleaved
+# bus honestly, so the two x16 parts a board hangs on 32 bits each have their
+# own state machine. The backing store is a media slot, not `fstool`: the
+# contents are a flat image, and a disk-image crate would drag `std` into a
+# `no_std` device for nothing. Written from JEDEC JESD68.01 and the Intel
+# StrataFlash P30 datasheet. `no_std + alloc`, no dependencies.
+#
+# This is the device a UEFI build needs to *keep* a variable: the write path is
+# what installs `gEfiVariableWriteArchProtocolGuid`, and RAM cannot provide it.
+dev-flash-cfi = []
+
 # The RISC-V `virt` board as a machine (machines/riscv-virt.machine plus the
 # classes it names): the first machine rsemu can boot real system software on.
 # `rsemu run riscv-virt --firmware fw.bin` loads an image at 0x80000000, hands
 # it a generated device tree in a1 and the hart id in a0, and puts its console
 # on the terminal. Adds no dependencies.
-machine-riscv-virt = ["cpu-riscv", "dev-riscv"]
+machine-riscv-virt = ["cpu-riscv", "dev-riscv", "dev-flash-cfi"]
 
 # The ARMv7E-M core (src/cpu/arm/v7m): a Cortex-M4/M7-class interpreter —
 # the whole T32 instruction set in both encoding widths, `IT` blocks, the DSP

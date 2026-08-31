@@ -486,6 +486,70 @@ linux_notice() {
 	printf '%s\n' "$text" >"${dir}/PROVENANCE-linux.txt"
 }
 
+# The EDK2 RISC-V build. Not downloaded: it ships in the distribution's `qemu`
+# firmware package as `/usr/share/qemu/edk2-riscv-{code,vars}.fd`, and copying the
+# file already on the machine beats guessing at a mirror URL. BSD-2-Clause-Patent,
+# so it may be read as well as run; it is still not committed, because the rule
+# is about the repository rather than about any one file.
+fetch_edk2() {
+	local dest="${DEST_ROOT}/riscv"
+	local src="${RSEMU_EDK2_DIR:-/usr/share/qemu}"
+	mkdir -p "$dest"
+
+	if [ ! -r "${src}/edk2-riscv-code.fd" ]; then
+		note "  no edk2-riscv-code.fd under ${src}"
+		note "  install your distribution's qemu firmware package (Debian:"
+		note "  qemu-efi-riscv64; elsewhere it comes with edk2/ovmf), or set"
+		note "  RSEMU_EDK2_DIR to wherever the two .fd files are."
+		return 0
+	fi
+
+	cp -f "${src}/edk2-riscv-code.fd" "${dest}/edk2-riscv-code.fd"
+	# The variable store is copied rather than used in place because the whole
+	# point of it is that the guest *writes* to it, and a run that scribbled on
+	# the system's copy would be a surprise.
+	cp -f "${src}/edk2-riscv-vars.fd" "${dest}/edk2-riscv-vars.fd"
+	chmod u+w "${dest}/edk2-riscv-vars.fd"
+
+	# Eight bytes bridging OpenSBI's compiled-in hand-off address to the flash
+	# base: `lui t0, 0x20000` then `jr t0`, which leaves a0 and a1 alone. The
+	# flash itself needs no trampoline; `fw_jump` does.
+	printf '\xb7\x02\x00\x20\x67\x80\x02\x00' >"${dest}/tramp.bin"
+
+	ok "edk2-riscv-code.fd ($(wc -c <"${dest}/edk2-riscv-code.fd" | tr -d ' ') bytes)"
+	ok "edk2-riscv-vars.fd ($(wc -c <"${dest}/edk2-riscv-vars.fd" | tr -d ' ') bytes)"
+	edk2_notice "$dest" "$src"
+	edk2_hint "$dest"
+}
+
+edk2_notice() {
+	# Its own file rather than PROVENANCE.txt, which the OpenSBI fetch owns:
+	# both land in testdata/riscv and neither should erase the other.
+	printf '%s\n' "EDK II for RISC-V (OvmfPkg/RiscVVirt), copied from ${2}
+https://github.com/tianocore/edk2
+
+Licence: BSD-2-Clause-Patent. Permissive, so it may be read as well as run.
+Copied from the local qemu firmware package rather than downloaded; nothing
+here is committed.
+
+Consumed by RSEMU_RISCV_FLASH0 and RSEMU_RISCV_FLASH1 in src/dev/riscv/tests.rs.
+docs/platforms/riscv-virt.md has the whole command line and says where it gets
+to." >"${1}/PROVENANCE-edk2.txt"
+}
+
+edk2_hint() {
+	local dest="$1"
+	note ""
+	note "  boot it with:"
+	note "      RSEMU_RISCV_FIRMWARE=${dest}/fw_jump.bin \\"
+	note "      RSEMU_RISCV_PAYLOAD=0x80200000:${dest}/tramp.bin \\"
+	note "      RSEMU_RISCV_FLASH0=${dest}/edk2-riscv-code.fd \\"
+	note "      RSEMU_RISCV_FLASH1=${dest}/edk2-riscv-vars.fd \\"
+	note "      RSEMU_RISCV_FLASH1_OUT=${dest}/edk2-riscv-vars.fd \\"
+	note "      RSEMU_RISCV_RAM=512M RSEMU_RISCV_QUANTA=6000000 \\"
+	note "          cargo test --release --all-features firmware_from_the --lib -- --nocapture"
+}
+
 fetch_linux() {
 	need curl
 	local dest="${DEST_ROOT}/riscv"
@@ -547,6 +611,8 @@ Suites:
   gameboy        blargg GB + mooneye acceptance (mixed; see the notices)
   wozmon         the Apple 1 monitor           (licence unclear, BRING YOUR OWN)
   opensbi        RISC-V firmware for riscv-virt (BSD-2-Clause, redistributable)
+  edk2           UEFI for riscv-virt, copied from the local qemu firmware
+                 package (BSD-2-Clause-Patent; nothing to download)
   linux          riscv64 Linux Image to boot on it (GPL-2.0, FETCH-ONLY)
 
 Options:
@@ -628,6 +694,7 @@ for suite in "${SUITES[@]}"; do
 		gameboy|gb) fetch_gameboy ;;
 		wozmon|apple1) fetch_wozmon ;;
 		opensbi|riscv) fetch_opensbi ;;
+		edk2|uefi) fetch_edk2 ;;
 		linux|kernel) fetch_linux ;;
 		*) die "unknown suite $suite (try --help)" ;;
 	esac
