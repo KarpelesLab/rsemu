@@ -96,6 +96,7 @@ use crate::core::device::{
     Device, DeviceClass, ExportId, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
 };
 use crate::core::error::{Error, Result};
+use crate::core::exec::{Exit, ExitMask, ExitingCore, Run};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
 use crate::core::sched::{Budget, Consumed};
@@ -305,6 +306,15 @@ pub struct Hart {
     timer: Option<String>,
     lines: Arc<Lines>,
     session: sync::Mutex<Session>,
+    /// Which architectural traps leave the hart instead of vectoring into the
+    /// guest ([`ExitMask`]).
+    ///
+    /// An atomic rather than a field of [`Config`] because a consumer changes
+    /// it *while the hart runs* — a level-3 run loop arms it once, a debugger
+    /// adds `BREAKPOINT` and takes it away again — and because it must survive
+    /// a reset, which replaces the whole execution state. It is deliberately
+    /// not in the snapshot: see [`ExitingCore::set_exit_mask`].
+    exits: AtomicU32,
     /// This hart's identity in `MemAttrs::requester`, assigned at bind time.
     requester: AtomicU32,
     /// The wire sinks handed out by [`Device::sink`], kept alive here — a net
@@ -346,6 +356,7 @@ impl Hart {
                     time_src: None,
                 },
             ),
+            exits: AtomicU32::new(ExitMask::NONE.bits()),
             requester: AtomicU32::new(cfg.requester.0),
             pins: sync::Mutex::new(Pins::default()),
             cfg,
@@ -612,7 +623,17 @@ impl Hart {
     /// always make progress, and a stalled hart is visible through
     /// [`is_waiting`](Hart::is_waiting) rather than through a zero return.
     pub fn step(&self) -> u64 {
+        self.step_to_exit().0
+    }
+
+    /// Execute one instruction, reporting an [`Exit`] if it produced one.
+    ///
+    /// The single-step half of [`ExitingCore::run_to_exit`]; `step` is this
+    /// with the exit discarded, which is exactly right for a level-1 machine
+    /// where the mask is empty and there is never one.
+    pub fn step_to_exit(&self) -> (u64, Option<Exit>) {
         let cfg = self.effective_config();
+        let exits = self.exit_mask();
         let mut session = self.session.lock();
         if self.lines.take_reset_request() {
             session.state = State::new(&cfg);
@@ -630,9 +651,11 @@ impl Hart {
             state.csrs.mtime = timer.load(Ordering::Relaxed);
         }
         let Some(space) = space.clone() else {
-            return 0;
+            return (0, None);
         };
-        Exec::new(state, tlb, &space, &cfg, &self.lines).step()
+        let mut exec = Exec::new(state, tlb, &space, &cfg, &self.lines, exits);
+        let used = exec.step();
+        (used, exec.take_exit())
     }
 
     /// Execute until at least `budget` accesses have been charged.
@@ -686,6 +709,47 @@ impl Hart {
     #[must_use]
     pub fn cycle_debt(&self) -> u64 {
         self.session.lock().state.debt
+    }
+
+    /// Run until the budget is exhausted or an armed trap leaves the hart.
+    ///
+    /// The level-3 run loop (`ROADMAP.md` §2.1). Scheduler debt is paid down
+    /// exactly as [`run_budget`](Hart::run_budget) pays it, so a hart can be
+    /// driven this way and by the machine scheduler without two tick
+    /// accountings — and an exit reports only what it really consumed, because
+    /// the caller resumes it rather than the scheduler.
+    pub fn run_to_exit_ticks(&self, ticks: u64) -> Run {
+        let owed = self.session.lock().state.debt;
+        if owed >= ticks {
+            self.session.lock().state.debt = owed - ticks;
+            return Run::completed(Consumed::new(ticks));
+        }
+        let allowance = ticks - owed;
+        let mut used = 0u64;
+        while used < allowance {
+            let (n, exit) = self.step_to_exit();
+            if n == 0 {
+                break;
+            }
+            used += n;
+            if let Some(exit) = exit {
+                // An exit ends the quantum early. The instruction that exited
+                // may still have overrun the budget, so the overshoot is
+                // carried exactly as `run_budget` carries it: over any number
+                // of quanta the reported ticks and the executed accesses stay
+                // in step, and no single quantum ever overruns.
+                let total = owed + used;
+                self.session.lock().state.debt = total.saturating_sub(ticks);
+                return Run::exited(Consumed::new(total.min(ticks)), exit);
+            }
+        }
+        if used >= allowance {
+            self.session.lock().state.debt = used - allowance;
+            Run::completed(Consumed::new(ticks))
+        } else {
+            self.session.lock().state.debt = 0;
+            Run::completed(Consumed::new(owed + used))
+        }
     }
 
     /// Disassemble `count` instructions starting at `pc`, reading guest memory
@@ -996,6 +1060,44 @@ impl Device for Hart {
         drop(session);
         self.lines.set_all_pending(pending);
         Ok(())
+    }
+}
+
+/// The level-3 seam (`ROADMAP.md` §2.1): a hart that can stop *at* an `ecall`
+/// and hand control out rather than vectoring to a guest handler.
+///
+/// Arming [`ExitMask::USER`] is what turns this core from a machine's CPU into
+/// a `qemu-user`-shaped one. Nothing else about the hart changes: the same
+/// interpreter, the same address space, the same snapshot.
+impl ExitingCore for Hart {
+    fn exit_mask(&self) -> ExitMask {
+        // Relaxed: the mask is configuration, and a change to it is ordered
+        // against nothing but the next instruction fetch.
+        ExitMask::from_bits(self.exits.load(Ordering::Relaxed))
+    }
+
+    fn set_exit_mask(&self, mask: ExitMask) {
+        self.exits.store(mask.bits(), Ordering::Relaxed);
+    }
+
+    fn run_to_exit(&self, budget: Budget) -> Run {
+        self.run_to_exit_ticks(budget.ticks)
+    }
+
+    fn pc(&self) -> u64 {
+        Hart::pc(self)
+    }
+
+    fn set_pc(&self, pc: u64) {
+        Hart::set_pc(self, pc);
+    }
+
+    fn sp(&self) -> u64 {
+        self.x(2)
+    }
+
+    fn set_sp(&self, sp: u64) {
+        self.set_x(2, sp);
     }
 }
 

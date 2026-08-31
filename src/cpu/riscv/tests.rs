@@ -1204,3 +1204,116 @@ fn set_time_still_works_without_a_clint() {
     h.hart.step();
     assert_eq!(h.hart.x(10), 0x4242);
 }
+
+// ---------------------------------------------------------------------------
+// The syscall-exit seam (`core::exec`, ROADMAP.md §2.1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unmasked_hart_vectors_its_traps_exactly_as_before() {
+    // The seam is opt-in and the default is the behaviour every machine in
+    // `machines/` depends on. This is the regression that says so.
+    use crate::core::exec::{ExitMask, ExitingCore};
+
+    let h = Harness::rv64i(&[ECALL]);
+    assert_eq!(h.hart.exit_mask(), ExitMask::NONE);
+    // One step: the `ecall` executes and takes its trap. Running further would
+    // vector into unmapped memory and overwrite `mcause` with the fault that
+    // followed, which says nothing about the seam.
+    let (_, exit) = h.hart.step_to_exit();
+    assert!(exit.is_none());
+    assert_eq!(h.hart.csrs().mcause, cause::ECALL_M);
+}
+
+#[test]
+fn a_masked_ecall_leaves_the_hart_instead_of_vectoring() {
+    use crate::core::exec::{Access, ExitMask, ExitReason, ExitingCore};
+
+    let h = Harness::rv64i(&[addi(10, 0, 7), ECALL, addi(10, 0, 9)]);
+    h.hart.set_exit_mask(ExitMask::USER);
+    let run = h.hart.run_to_exit_ticks(64);
+    let exit = run.exit.expect("the ecall exits");
+
+    assert_eq!(exit.reason, ExitReason::SYSCALL);
+    assert_eq!(exit.pc, BASE + 4, "the exit names the ecall itself");
+    assert_eq!(exit.len, 4);
+    assert_eq!(exit.detail, cause::ECALL_M);
+    assert_eq!(exit.access, Access::None);
+    assert_eq!(h.hart.x(10), 7, "the instruction before it ran");
+    assert_eq!(
+        h.hart.pc(),
+        BASE + 8,
+        "a syscall resumes past the instruction"
+    );
+    assert_eq!(
+        h.hart.csrs().mcause,
+        0,
+        "nothing vectored, so no cause was written"
+    );
+
+    // Resuming continues the program, with no fixup at all.
+    h.hart.run_to_exit_ticks(16);
+    assert_eq!(h.hart.x(10), 9);
+}
+
+#[test]
+fn a_masked_fault_reports_its_address_and_its_direction() {
+    use crate::core::exec::{Access, ExitMask, ExitReason, ExitingCore};
+
+    // `sd x0, 0(x0)` — a store to an address this harness has no RAM at.
+    let sd = s(0x23, 3, 0, 0, 0);
+    let h = Harness::rv64i(&[sd]);
+    h.hart.set_exit_mask(ExitMask::USER);
+    let exit = h
+        .hart
+        .run_to_exit_ticks(64)
+        .exit
+        .expect("the store faults out");
+
+    assert_eq!(exit.reason, ExitReason::FAULT);
+    assert_eq!(exit.access, Access::Write, "a consumer needs the direction");
+    assert_eq!(exit.address, 0);
+    assert_eq!(
+        h.hart.pc(),
+        BASE,
+        "a fault resumes *at* the instruction, so mapping a page and \
+         carrying on works"
+    );
+}
+
+#[test]
+fn a_masked_ebreak_stops_on_the_breakpoint() {
+    use crate::core::exec::{ExitMask, ExitReason, ExitingCore};
+
+    let h = Harness::rv64i(&[EBREAK]);
+    h.hart
+        .set_exit_mask(ExitMask::NONE.with(ExitReason::BREAKPOINT));
+    let exit = h.hart.run_to_exit_ticks(16).exit.expect("ebreak exits");
+    assert_eq!(exit.reason, ExitReason::BREAKPOINT);
+    assert_eq!(exit.pc, BASE);
+    assert_eq!(h.hart.pc(), BASE, "a debugger reports where it stopped");
+}
+
+#[test]
+fn the_exit_mask_survives_a_reset_because_it_is_not_guest_state() {
+    use crate::core::exec::{ExitMask, ExitingCore};
+
+    let h = Harness::rv64i(&[ECALL]);
+    h.hart.set_exit_mask(ExitMask::USER);
+    h.hart.reset(ResetKind::Cold);
+    assert_eq!(
+        h.hart.exit_mask(),
+        ExitMask::USER,
+        "the consumer that armed the mask is still there after a reset"
+    );
+}
+
+#[test]
+fn the_stack_pointer_is_on_the_seam_because_starting_a_thread_needs_it() {
+    use crate::core::exec::ExitingCore;
+
+    let h = Harness::rv64i(&[]);
+    ExitingCore::set_sp(&h.hart, 0x1234);
+    assert_eq!(ExitingCore::sp(&h.hart), 0x1234);
+    assert_eq!(h.hart.x(2), 0x1234, "which is `sp` and nothing else");
+}

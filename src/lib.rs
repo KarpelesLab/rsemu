@@ -32,6 +32,13 @@
 //! With `gdb`, [`host::gdb`] speaks the GDB remote serial protocol over TCP, so
 //! `rsemu debug apple1 --gdb :1234` is a guest a debugger can step through.
 //!
+//! With `usermode`, [`usermode`] is level-3 execution: a program runs with **no
+//! guest kernel under it**, its `ecall` leaves the core through
+//! [`core::exec`], and something in Rust services it. rsemu supplies the
+//! machine half — the exit, a memory map with no devices in it, a scheduling
+//! contract for guest threads, and the record/replay funnel; the syscall
+//! kernel is a downstream crate's (`ROADMAP.md` §2.1).
+//!
 //! Not yet: audio anywhere but inside the APU; a native window; the IR and JIT;
 //! and the rest of the host layer (VNC, an interactive monitor console).
 //!
@@ -51,6 +58,10 @@ pub mod cpu;
 pub mod dev;
 pub mod host;
 pub mod machine;
+
+#[cfg(feature = "usermode")]
+#[cfg_attr(docsrs, doc(cfg(feature = "usermode")))]
+pub mod usermode;
 
 #[cfg(feature = "wasm")]
 #[cfg_attr(docsrs, doc(cfg(feature = "wasm")))]
@@ -114,6 +125,9 @@ pub fn build_info() -> alloc::string::String {
     }
     if cfg!(feature = "machine-pc-at") {
         features.push("machine-pc-at");
+    }
+    if cfg!(feature = "usermode") {
+        features.push("usermode");
     }
 
     let mut s = String::from("rsemu ");

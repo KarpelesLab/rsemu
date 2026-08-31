@@ -709,6 +709,23 @@ pub struct Budget {
     pub ticks: u64,
 }
 
+impl Budget {
+    /// A budget of `ticks` with no deadline.
+    ///
+    /// The level-3 form (`ROADMAP.md` §2.1): a guest thread's quantum is a
+    /// count of executed ticks, because that is the currency that is the same
+    /// on every host. There is no virtual instant to stop at, because a level-3
+    /// run has no devices to keep an appointment with — so `until` is
+    /// [`GlobalTime::MAX`] and `ticks` is the only limit that binds.
+    #[must_use]
+    pub const fn of(ticks: u64) -> Budget {
+        Budget {
+            until: GlobalTime::MAX,
+            ticks,
+        }
+    }
+}
+
 /// What a runnable actually did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Consumed {
