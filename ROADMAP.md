@@ -364,50 +364,71 @@ not: a core must be able to **exit on a syscall instruction** rather than
 vectoring internally. That is the same shape an accel backend needs for a VM
 exit (§10), so the two should share a seam rather than grow two.
 
-### 2.1 The nixvm merge
+### 2.1 nixvm, and where the line falls
 
 Level 3 is not speculative: `KarpelesLab/nixvm` implements it, is **MIT and
-first-party**, and is being retired into this crate. It is a gVisor-style
-sandbox with no guest kernel — a Rust syscall kernel, ELF loading (static,
-static-PIE and dynamic, with a real `ld-musl` booting stock Alpine),
-multi-process and multi-threaded scheduling on a worker pool, an in-VM network
-stack, several filesystem backends, and KVM and HVF acceleration. Node.js runs
-on it, on the interpreter and on hardware. It boots Alpine in a browser.
+first-party**, and boots stock Alpine under a real `ld-musl` with Node.js
+running on it, on an interpreter and on KVM, natively and in a browser.
 
-**What transfers directly**: the syscall kernel, the Linux ABI types, the ELF
-loader, the filesystem backends (procfs, passthrough, an overlay), the process
-and signal model, the network stack, and the sandbox policy.
+The question is not whether to share that work but **which crate owns which
+half**, and there is a clean test: *is it hardware?*
 
-**What is a convergence question rather than a copy** — and must be answered
-before any code moves, because getting it wrong leaves the crate with two of
-everything:
+| | belongs in | because |
+| --- | --- | --- |
+| CPU cores, decode, soft-float | **rsemu** | it is silicon |
+| memory, address spaces, snapshots | **rsemu** | it is silicon |
+| KVM / HVF backends | **rsemu** | it is how silicon runs faster (§10) |
+| the syscall-exit seam | **rsemu** | it is a property of a core |
+| the Linux syscall kernel | **nixvm** | Linux is not hardware |
+| filesystems, `procfs`, passthrough | **nixvm** | ditto |
+| process and thread model, signals | **nixvm** | ditto |
+| the network stack, the sandbox policy | **nixvm** | ditto |
+| the ELF loader | **nixvm** | a loader is an OS's job |
 
-- **CPU cores.** nixvm carries its own aarch64 and x86-64 interpreters; rsemu
-  has `cpu/x86` (through i486) and `cpu/arm` (ARMv5TE, ARMv7E-M). These must
-  become *one* set. nixvm's **aarch64 is a core rsemu does not have**, and its
-  x86-64 goes beyond ours; both are gains, but they arrive as an A-profile and
-  an x86 core in rsemu's shape, gated by rsemu's features, not as a parallel
-  `vcpu/` tree.
-- **Soft-float.** nixvm's is dependency-free and models true 80-bit x87
-  extended precision and SSE `MXCSR` directed rounding with IEEE exception
-  flags, validated bit-for-bit against native arithmetic and against real
-  hardware through KVM. That is exactly what §9.1 specifies and it should
-  become §9.1's implementation rather than a second one.
-- **KVM and HVF.** These are §10's accel backends arriving early. nixvm's four
-  `unsafe` sites map onto rsemu's six sanctioned ones — KVM and HVF onto the
-  raw-syscall accel backends, its page-aligned guest-RAM allocation onto the
-  RAM host-pointer fast path, and its `*at(2)` passthrough onto `ffi`. **No
-  seventh site is created**, and any change to that must be a design review
-  rather than a merge artefact.
+So **nixvm depends on rsemu** rather than being absorbed into it. rsemu supplies
+the machine; nixvm supplies the kernel. An emulator framework that grew a
+`procfs` would have lost track of what it is, and `no_std` under `core/` and
+§0's dependency policy both get harder to hold for nothing gained.
 
-**What must not transfer**: `ureq`. §0's dependency policy is absolute and
-`ureq` is not on the permitted list, so nixvm's `fetch` feature is dropped or
-re-implemented over the sanctioned stack. `fstool` and `compcol` are already
-permitted and come across unchanged.
+This is also the strongest available test of §2's claim that *"embedding rsemu
+into someone else's application is a supported use, not a fork"*. A downstream
+consumer that needs cores, memory, a syscall exit and accel — and needs them
+through the public API, from another crate — will find every place that surface
+is not actually usable. That is worth more to rsemu than the code would be.
+
+**What moves into rsemu**, because it is hardware and we do not have it:
+
+- **aarch64.** nixvm has a working interpreter; rsemu has ARMv5TE and ARMv7E-M
+  and no A64 at all. It arrives as an rsemu core in rsemu's shape — under
+  `cpu/arm/`, gated by an rsemu feature — not as a parallel `vcpu/` tree.
+- **x86-64 long mode**, which goes beyond our i486 and is phase 6b's deliverable
+  arriving early.
+- **The soft-float**, which models true 80-bit x87 extended precision and SSE
+  `MXCSR` directed rounding with IEEE exception flags, validated bit-for-bit
+  against native arithmetic and against real hardware through KVM. That is what
+  §9.1 specifies, and it should *be* §9.1's implementation rather than a second
+  one.
+- **KVM and HVF**, which are §10's backends. nixvm's four `unsafe` sites map
+  onto rsemu's six sanctioned ones — KVM and HVF onto the raw-syscall accel
+  backends, page-aligned guest-RAM allocation onto the RAM host-pointer fast
+  path, `*at(2)` passthrough onto `ffi`, and that last one stays in nixvm
+  anyway. **No seventh site is created**, and any change to that is a design
+  review rather than a merge artefact.
+
+**What rsemu must expose for this to work** is the real deliverable of phase 5b:
+a core that can exit at a syscall instruction, a level-3 execution mode with a
+memory map and no devices, and enough of a scheduling contract that a guest
+thread is something the framework can drive. All public, all documented, all
+stable enough for another crate to build on.
+
+**Sequencing.** nixvm cannot drop its own interpreters until rsemu's cores
+cover what it needs, so the dependency starts partial and deepens: first the
+seam and one architecture, then aarch64 and x86-64 as they land, then accel.
+Nothing is deleted from nixvm until its replacement passes nixvm's own tests.
 
 **Provenance still applies.** nixvm being ours removes the licence question
 about *its* code, not about anything it absorbed. §1's attribution audit runs
-over it before the merge, exactly as it did for `../gones`.
+over anything that moves, exactly as it did for `../gones`.
 
 ### The machine catalog
 
@@ -433,7 +454,7 @@ The phase plan (§13) is ordered so that value lands long before the framework i
 | Phase 3 | play NES games, with save states and a debugger |
 | Phase 4 | play Game Boy and Master System games on the same binary |
 | Phase 5 | boot a RISC-V Linux to a shell and debug the kernel over gdb |
-| Phase 5b | sandbox an untrusted build — `npm install`, a CI job — with no guest kernel and a millisecond start |
+| Phase 5b | sandbox an untrusted build with no guest kernel and a millisecond start — through `nixvm`, which builds on this crate |
 | Phase 6 | run a PC — DOS, Win95, Linux, XP — with disks, USB and networking |
 | Phase 7 | run that PC at near-native speed under KVM |
 | Phase 9 | drive all of it over VNC, record and replay sessions, embed it in something else |
@@ -1900,36 +1921,41 @@ green; interpreter-vs-JIT differential clean over a randomized corpus;
 ≥ 100 MIPS single-core on the dev machine; save/restore works *across* an
 engine switch.
 
-### Phase 5b — User-mode execution and the nixvm merge
+### Phase 5b — User-mode execution: the seam nixvm builds on
 
-Level 3 of §2's three (`qemu-user`/gVisor-shaped), and the retirement of
-`KarpelesLab/nixvm` into this crate. Sequenced after phase 5 because it wants
-the same soft-float and the same accel seam, and before phase 6 because a
-sandbox that runs `npm install` is shippable value that does not depend on
-booting Windows.
+Level 3 of §2's three (`qemu-user`/gVisor-shaped). rsemu builds the **machine**
+half; `KarpelesLab/nixvm` builds the kernel half and depends on this crate for
+the rest (§2.1). Sequenced after phase 5 because it wants the same soft-float
+and accel seam, and before phase 6 because a sandbox that runs `npm install` is
+shippable value that does not depend on booting Windows.
 
-The framework work is small and the payload is large, which is the right shape:
+rsemu's deliverable is small, and every piece of it is **public API another
+crate builds on** — that is the difference between this and an internal
+refactor:
 
-- **A syscall exit on the CPU seam.** A core must be able to stop *at* an
-  `ecall`/`syscall`/`svc` and hand control out, rather than vectoring to a
-  guest handler. Shared with §10's VM-exit path rather than built twice.
-- **An emulated-kernel seam**, the level-3 analogue of a machine: a memory map
-  with no devices in it, plus an object that services syscalls. It is not a
-  `Device` and it is not on a bus.
-- **A process and thread model** the scheduler can drive, so that §4.2's rules
-  about who owns time still hold when the thing being scheduled is a guest
-  thread rather than a CPU.
-- Then the merge itself: kernel, ABI, loader, filesystems, network, sandbox.
+- **A syscall exit on the CPU seam.** A core stops *at* an `ecall`/`syscall`/
+  `svc` and hands control out rather than vectoring to a guest handler. Shared
+  with §10's VM-exit path rather than built twice.
+- **A level-3 execution mode**: a memory map with no devices in it. Not a
+  `Device`, not on a bus — nothing in the guest can address it.
+- **A scheduling contract for guest threads**, so §4.2's rules about who owns
+  time still hold when the scheduled thing is a thread rather than a CPU.
+- Then the hardware nixvm currently carries and rsemu lacks: **aarch64**,
+  **x86-64 long mode**, the **soft-float** (§9.1), and **KVM/HVF** (§10).
 
-**Gate:** a stock Alpine `busybox sh` runs interactively from a rootfs image on
-at least two guest architectures; `node -e` executes real JavaScript to
-completion and exits cleanly; the same program produces identical output under
-the interpreter and under KVM; a snapshot taken mid-process restores and
-continues; and it runs in the browser, since the whole point of a portable
-syscall kernel is that it has no OS underneath it. The determinism rules hold
-throughout — a syscall's result crossing into the guest is exactly §0's
-"non-deterministic input crossing into the machine", so it goes through the
-record/replay seam or it is a determinism bug.
+**Gate:** rsemu's half is proven by a tiny in-tree guest — a hand-assembled
+static program that writes to fd 1 and exits, on at least one architecture,
+with no toolchain and no corpus. The *product* gate is nixvm's and is quoted
+here so the two do not drift: a stock Alpine `busybox sh` interactive on two
+guest architectures, `node -e` completing and exiting cleanly, identical output
+under interpreter and KVM, a snapshot restoring mid-process, and the whole
+thing running in a browser.
+
+The determinism rules hold throughout. A syscall's result crossing into the
+guest is exactly §0's *"non-deterministic input crossing into the machine"*, so
+it goes through the record/replay seam or it is a determinism bug — and that
+has to be designed in from the seam rather than retrofitted across a syscall
+kernel later.
 
 **Note what this phase does *not* need**: no interrupt controller, no timer
 chip, no block device, no firmware. That is what makes it cheap, and it is also
