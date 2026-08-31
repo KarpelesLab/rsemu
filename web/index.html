@@ -1,63 +1,105 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>rsemu (wasm)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rsemu — in the browser</title>
 <style>
   :root { color-scheme: light dark; }
-  body { font: 14px/1.5 system-ui, sans-serif; margin: 3rem auto; max-width: 42rem; padding: 0 1rem; }
-  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  pre { background: color-mix(in srgb, currentColor 8%, transparent); padding: .75rem 1rem; border-radius: 6px; overflow-x: auto; }
+  body {
+    font: 14px/1.5 system-ui, sans-serif;
+    margin: 2rem auto; max-width: 46rem; padding: 0 1rem;
+  }
+  h1 { font-size: 1.4rem; margin-bottom: .25rem; }
+  code, pre, #build, #stats { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .muted { opacity: .7; }
+  .row { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin: .5rem 0; }
+  select, button, input[type=file] { font: inherit; }
+  button { padding: .3rem .8rem; }
+  button:disabled { opacity: .45; }
+  #status { min-height: 1.5em; }
   .err { color: #c00; }
+  #screen {
+    /* 256x240 of guest pixels, tripled and left hard-edged: a NES picture is
+       not a photograph and smoothing it is a lie about the hardware. */
+    width: min(100%, 768px); aspect-ratio: 256 / 240;
+    image-rendering: pixelated;
+    background: #000; border-radius: 4px;
+  }
+  #console {
+    background: #111; color: #cfc; padding: .75rem 1rem; border-radius: 4px;
+    height: 18rem; overflow-y: auto; white-space: pre-wrap; margin: 0;
+  }
+  #stats { font-size: 12px; opacity: .75; min-height: 1.5em; }
+  fieldset { border: 1px solid color-mix(in srgb, currentColor 25%, transparent); border-radius: 6px; }
+  legend { padding: 0 .4rem; }
+  kbd {
+    font: 12px ui-monospace, monospace; border: 1px solid currentColor;
+    border-radius: 3px; padding: 0 .3em; opacity: .8;
+  }
 </style>
 
-<h1>rsemu — WebAssembly build</h1>
-<p>
-  Nothing is emulated yet; see <code>ROADMAP.md</code> for the phase plan. This
-  page exists so the wasm target is loaded and exercised from the first commit
-  rather than only compiled — a target that is built but never run is a target
-  that quietly stops working.
+<h1>rsemu in the browser</h1>
+<p class="muted">
+  A whole emulated machine, client-side. Nothing is uploaded: the ROM you pick
+  is read by the page, and a save state is a file this tab writes.
+  <span id="build">loading…</span>
 </p>
 
-<pre id="out">loading…</pre>
+<fieldset>
+  <legend>machine</legend>
+  <div class="row">
+    <label for="machine">Machine</label>
+    <select id="machine"></select>
+    <button id="boot" disabled>Boot</button>
+  </div>
+  <div class="row">
+    <input type="file" id="rom" accept=".nes,.bin,.rom,application/octet-stream" disabled>
+    <span class="muted" id="rom-label"></span>
+  </div>
+  <div class="row">
+    <button id="reset" disabled>Reset</button>
+    <button id="pause" disabled>Pause</button>
+    <button id="save-state" disabled>Save state</button>
+    <label class="muted">Load state <input type="file" id="load-state" disabled></label>
+  </div>
+  <div id="status">…</div>
+</fieldset>
 
-<script type="module">
-  const out = document.getElementById("out");
-  const log = (s, cls) => {
-    const line = document.createElement("div");
-    if (cls) line.className = cls;
-    line.textContent = s;
-    out.append(line);
-  };
+<div id="screen-box" hidden>
+  <canvas id="screen" width="256" height="240"></canvas>
+  <div id="stats"></div>
+  <p class="muted" id="keys" hidden>
+    Controller 1: <kbd>Z</kbd> A, <kbd>X</kbd> B, <kbd>Enter</kbd> Start,
+    <kbd>Shift</kbd> Select, arrows for the d-pad. They reach the console's
+    controller port at <code>$4016</code>, which samples them whenever the game
+    strobes it — a level, not an event, which is what makes a recorded session
+    replayable.
+  </p>
+</div>
 
-  try {
-    out.textContent = "";
+<div id="console-box" hidden>
+  <pre id="console" tabindex="0"></pre>
+  <p class="muted">Click the pane and type — the keyboard is wired straight to the machine.</p>
+</div>
 
-    // No wasm-bindgen: the module is instantiated directly and its exported
-    // memory is read by hand. The whole boundary is three functions.
-    const { instance } = await WebAssembly.instantiateStreaming(
-      fetch("./rsemu.wasm"),
-      {},
-    );
-    const { memory, rsemu_version_ptr, rsemu_version_len, rsemu_echo } =
-      instance.exports;
+<h2>What this is</h2>
+<p>
+  The same emulator that runs natively, built for
+  <code>wasm32-unknown-unknown</code> and driven from
+  <code>requestAnimationFrame</code>. No <code>wasm-bindgen</code>: the module
+  exports plain C functions and <code>rsemu.js</code> is the entire glue.
+</p>
+<p>
+  This page deliberately does <em>not</em> need cross-origin isolation. The
+  threaded configuration needs <code>SharedArrayBuffer</code> and therefore
+  COOP/COEP, which is often unavailable — so the non-threaded path is a
+  supported target rather than a fallback, and it is the one shipped here
+  (<code>ROADMAP.md</code> §11.3).
+</p>
+<p class="muted">
+  Virtual time is computed inside the emulator, never read from the host clock,
+  so a run here produces the same state hash as the same run under a native
+  debugger (<code>ROADMAP.md</code> §11.6). The hash is on screen; compare it
+  with what <code>rsemu run</code> prints.
+</p>
 
-    const bytes = new Uint8Array(
-      memory.buffer,
-      rsemu_version_ptr(),
-      rsemu_version_len(),
-    );
-    log(new TextDecoder().decode(bytes));
-
-    // Round-trip an argument, so a module that loads but does not actually run
-    // is distinguishable from one that works.
-    const sent = 0xdeadbeef;
-    const got = rsemu_echo(sent) >>> 0;
-    log(`echo(0x${sent.toString(16)}) -> 0x${got.toString(16)}` +
-        (got === sent ? "  ok" : "  MISMATCH"), got === sent ? null : "err");
-
-    log(`shared memory: ${memory.buffer instanceof SharedArrayBuffer}` +
-        `  (cross-origin isolated: ${self.crossOriginIsolated})`);
-  } catch (e) {
-    log(String(e), "err");
-    log("Serve this directory over HTTP — file:// cannot fetch the module.");
-  }
-</script>
+<script type="module" src="./app.js"></script>
