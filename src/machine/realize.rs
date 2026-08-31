@@ -96,7 +96,11 @@ use alloc::vec::Vec;
 
 use crate::core::clock::{ClockForest, DomainId, Rational as ClockRational};
 pub use crate::core::device::SinkPin;
-use crate::core::device::{Deferred, Device, DeviceClass, Export, ExportId, RealizeCtx, ResetKind};
+use core::any::Any;
+
+use crate::core::device::{
+    CycleGate, Deferred, Device, DeviceClass, Export, ExportId, RealizeCtx, ResetKind,
+};
 use crate::core::error::{Error, Result};
 use crate::core::props::{Media, Props, Value, ValueKind};
 use crate::core::registry::Registry;
@@ -230,23 +234,53 @@ impl<'a> BindCtx<'a> {
         })
     }
 
-    /// Another device in this machine, by the name the file declared it under.
+    /// The cycle arbiter `path` publishes as `which`.
     ///
-    /// What a property that *links* two devices resolves through — a CPU whose
-    /// `/RDY` a DMA unit drives, say. Every instance exists before any of them
-    /// is bound, so the order two linked devices appear in the file does not
-    /// matter.
+    /// # Errors
     ///
-    /// Deliberately narrow: it hands back the neighbour's `Instance`, and the
-    /// only way to get anything out of it is through a method the `Device`
-    /// trait already publishes. A device cannot reach for a sibling's concrete
-    /// type, which is what keeps `machine/` from growing a dependency on every
-    /// device that has ever wanted a friend.
-    pub fn peer(&self, name: &str) -> Option<&'a Arc<dyn Instance>> {
-        self.peers
-            .iter()
-            .find(|b| b.path == name)
-            .and_then(|b| b.instance.as_ref())
+    /// As [`export`](BindCtx::export), plus a handle of the wrong shape.
+    pub fn export_gate(&self, path: &str, which: ExportId) -> Result<Arc<dyn CycleGate>> {
+        let export = self.export(path, which)?;
+        export.gate().cloned().ok_or_else(|| {
+            config(
+                self.path,
+                format!(
+                    "`{path}` publishes its {which} as {}, which is not a cycle gate",
+                    export.shape()
+                ),
+            )
+        })
+    }
+
+    /// The opaque handle `path` publishes as `which`, downcast to `T`.
+    ///
+    /// The escape hatch for a handle whose type is a contract between two
+    /// device classes rather than `core`'s business. A wrong `T` is a
+    /// configuration error naming both sides, not a panic — the machine file
+    /// linked two devices that do not understand each other, and that is a
+    /// thing a person can fix.
+    ///
+    /// # Errors
+    ///
+    /// As [`export`](BindCtx::export), plus a handle of the wrong shape or a
+    /// payload that is not a `T`.
+    pub fn export_as<T: Any + Send + Sync>(&self, path: &str, which: ExportId) -> Result<Arc<T>> {
+        let export = self.export(path, which)?;
+        let Some(handle) = export.opaque() else {
+            return Err(config(
+                self.path,
+                format!(
+                    "`{path}` publishes its {which} as {}, which is not an opaque handle",
+                    export.shape()
+                ),
+            ));
+        };
+        Arc::clone(handle).downcast::<T>().map_err(|_| {
+            config(
+                self.path,
+                format!("`{path}`'s {which} is not the type this device expects"),
+            )
+        })
     }
 }
 
@@ -2935,6 +2969,52 @@ machine "exports" {
         for want in ["cpu", "wram", "test.ram", "timebase"] {
             assert!(text.contains(want), "{want} missing from {text}");
         }
+    }
+
+    /// The three shapes share one id space and one method, so asking for the
+    /// wrong one has to be a configuration error naming both sides rather than
+    /// a panic or a silent `None`. A machine file that links two devices which
+    /// do not understand each other is a thing a person can fix.
+    #[test]
+    fn asking_for_the_wrong_shape_says_which_shape_it_is() {
+        let cell: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let export = Export::Cell(Arc::clone(&cell));
+
+        assert!(export.cell().is_some());
+        assert!(export.gate().is_none(), "a cell is not a gate");
+        assert!(export.opaque().is_none(), "a cell is not an opaque handle");
+        assert_eq!(export.shape(), "a 64-bit cell");
+
+        let opaque = Export::Opaque(Arc::new(7u32));
+        assert!(opaque.cell().is_none());
+        assert_eq!(opaque.shape(), "an opaque handle");
+        assert!(
+            Arc::clone(opaque.opaque().expect("opaque"))
+                .downcast::<u32>()
+                .is_ok(),
+            "the payload survives the round trip"
+        );
+        assert!(
+            Arc::clone(opaque.opaque().expect("opaque"))
+                .downcast::<u8>()
+                .is_err(),
+            "and the wrong type is refused rather than reinterpreted"
+        );
+    }
+
+    /// Every id this crate defines names itself, so an error can say what was
+    /// asked for instead of printing a bare number. An embedder's own ids
+    /// (`0x8000` and above) legitimately do not.
+    #[test]
+    fn every_crate_export_id_names_itself() {
+        for id in [
+            ExportId::TIMEBASE,
+            ExportId::CYCLE_GATE,
+            ExportId::DMC_FETCH,
+        ] {
+            assert!(id.name().is_some(), "{id:?} has no name");
+        }
+        assert!(ExportId(0x8000).name().is_none(), "an embedder's id");
     }
 
     #[test]

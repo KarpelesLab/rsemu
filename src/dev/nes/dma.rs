@@ -54,7 +54,8 @@ use alloc::sync::{Arc, Weak};
 use core::fmt;
 
 use crate::core::device::{
-    Arbitration, CycleGate, Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind,
+    Arbitration, CycleGate, Device, DeviceClass, Export, ExportId, PropertySpec, RealizeCtx,
+    ResetKind,
 };
 use crate::core::error::{BusError, Result};
 use crate::core::props::{Props, ValueKind};
@@ -65,7 +66,7 @@ use crate::core::space::{
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
 use crate::core::value::{Endian, Width};
-use crate::dev::apu::{DMC_FETCH, DmaKind, DmcFetch};
+use crate::dev::apu::{DmaKind, DmcFetch};
 use crate::machine::realize::{BindCtx, Instance};
 
 /// The class name a machine description would use.
@@ -664,8 +665,8 @@ impl Device for OamDma {
         Ok(())
     }
 
-    fn cycle_gate(&self) -> Option<Arc<dyn CycleGate>> {
-        Some(self.gate())
+    fn export(&self, which: ExportId) -> Option<Export> {
+        (which == ExportId::CYCLE_GATE).then(|| Export::Gate(self.gate()))
     }
 
     fn reset(&self, _kind: ResetKind) {
@@ -774,20 +775,7 @@ impl Instance for OamDma {
 
         let wanted = self.dmc_link.lock().clone();
         if let Some(name) = wanted {
-            let peer = ctx.peer(&name).ok_or_else(|| crate::core::Error::Config {
-                at: String::from(ctx.path()),
-                message: alloc::format!("`dmc = {name}` names no object in this machine"),
-            })?;
-            let fetch = peer
-                .interface(DMC_FETCH)
-                .and_then(|any| any.downcast::<DmcFetch>().ok())
-                .ok_or_else(|| crate::core::Error::Config {
-                    at: String::from(ctx.path()),
-                    message: alloc::format!(
-                        "`dmc = {name}` names a device with no DMC to fetch for"
-                    ),
-                })?;
-            self.attach_dmc(fetch);
+            self.attach_dmc(ctx.export_as::<DmcFetch>(&name, ExportId::DMC_FETCH)?);
         }
         Ok(())
     }
@@ -1183,8 +1171,9 @@ mod tests {
                 .expect("maps");
         }
         let fetch = apu
-            .interface(DMC_FETCH)
-            .and_then(|any| any.downcast::<DmcFetch>().ok())
+            .export(ExportId::DMC_FETCH)
+            .and_then(|e| e.opaque().cloned())
+            .and_then(|h| h.downcast::<DmcFetch>().ok())
             .expect("the APU offers its DMC");
         b.dma.attach_dmc(fetch);
         (b, apu)

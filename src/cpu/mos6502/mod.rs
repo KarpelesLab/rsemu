@@ -110,7 +110,8 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::core::device::{
-    CycleGate, Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
+    CycleGate, Device, DeviceClass, ExportId, Initiator, PropertySpec, RealizeCtx, ResetKind,
+    SinkPin,
 };
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
@@ -1153,17 +1154,7 @@ impl crate::machine::Instance for Mos6502 {
 
         let wanted = self.links.lock().rdy_link.clone();
         if let Some(name) = wanted {
-            let peer = ctx.peer(&name).ok_or_else(|| Error::Config {
-                at: alloc::string::String::from(ctx.path()),
-                message: alloc::format!("`rdy = {name}` names no object in this machine"),
-            })?;
-            let gate = peer.cycle_gate().ok_or_else(|| Error::Config {
-                at: alloc::string::String::from(ctx.path()),
-                message: alloc::format!(
-                    "`rdy = {name}` names a device that cannot halt a core: it drives no /RDY"
-                ),
-            })?;
-            self.attach_rdy(gate);
+            self.attach_rdy(ctx.export_gate(&name, ExportId::CYCLE_GATE)?);
         }
         Ok(())
     }

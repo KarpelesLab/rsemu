@@ -166,6 +166,22 @@ impl ExportId {
     /// carries an access, neither of which is a shared counter.
     pub const TIMEBASE: ExportId = ExportId(1);
 
+    /// The publisher's `/RDY`-style cycle arbiter. Transported as
+    /// [`Export::Gate`].
+    ///
+    /// How a cycle-stealing DMA unit reaches the core it halts without either
+    /// naming the other's type. The RP2A03's is the motivating case: OAM DMA
+    /// and the DMC's sample fetch are one arbiter, and what it does to the bus
+    /// on each stolen cycle is guest-visible.
+    pub const CYCLE_GATE: ExportId = ExportId(2);
+
+    /// The APU's DMC sample-fetch seam. Transported as [`Export::Opaque`].
+    ///
+    /// A contract between two device classes that `core` deliberately does not
+    /// learn the type of — the id is named here so an error message can say
+    /// what was asked for, and nothing more.
+    pub const DMC_FETCH: ExportId = ExportId(3);
+
     /// The name this id is known by, for an error message.
     ///
     /// `None` for an id nothing in this crate defines, which an embedder's own
@@ -174,6 +190,8 @@ impl ExportId {
     pub fn name(self) -> Option<&'static str> {
         match self {
             ExportId::TIMEBASE => Some("timebase"),
+            ExportId::CYCLE_GATE => Some("cycle gate"),
+            ExportId::DMC_FETCH => Some("DMC sample fetch"),
             _ => None,
         }
     }
@@ -238,14 +256,49 @@ pub enum Export {
     /// write RISC-V's `mtime` backwards, and a shape promising monotonicity
     /// would be lying about the one case it exists for.
     Cell(Arc<AtomicU64>),
+
+    /// A cycle arbiter, for a publisher that can halt a core between bus
+    /// cycles. Typed, because [`CycleGate`] is `core`'s own trait.
+    Gate(Arc<dyn CycleGate>),
+
+    /// A handle whose type is a contract between the two device classes and
+    /// not `core`'s business.
+    ///
+    /// The escape hatch, and deliberately the least convenient of the three:
+    /// the consumer downcasts through
+    /// [`BindCtx::export_as`](crate::machine::BindCtx::export_as), and a
+    /// mismatch is a configuration error naming both sides. Reach for it only
+    /// when the handle's type genuinely cannot live in `core` — the RP2A03's
+    /// DMC sample fetch is the case it exists for. A shape that turns up twice
+    /// should become a variant of its own instead.
+    Opaque(Arc<dyn Any + Send + Sync>),
 }
 
 impl Export {
-    /// The cell, if this handle is one.
+    /// The cycle arbiter, if that is the shape this handle came back in.
+    #[must_use]
+    pub fn gate(&self) -> Option<&Arc<dyn CycleGate>> {
+        match self {
+            Export::Gate(g) => Some(g),
+            _ => None,
+        }
+    }
+
+    /// The opaque handle, if that is the shape this handle came back in.
+    #[must_use]
+    pub fn opaque(&self) -> Option<&Arc<dyn Any + Send + Sync>> {
+        match self {
+            Export::Opaque(h) => Some(h),
+            _ => None,
+        }
+    }
+
+    /// The cell, if that is the shape this handle came back in.
     #[must_use]
     pub fn cell(&self) -> Option<&Arc<AtomicU64>> {
         match self {
             Export::Cell(cell) => Some(cell),
+            _ => None,
         }
     }
 
@@ -254,6 +307,8 @@ impl Export {
     pub fn shape(&self) -> &'static str {
         match self {
             Export::Cell(_) => "a 64-bit cell",
+            Export::Gate(_) => "a cycle gate",
+            Export::Opaque(_) => "an opaque handle",
         }
     }
 }
@@ -342,6 +397,14 @@ pub trait Device: Send + Sync + fmt::Debug {
     /// its address space rather than inside its architectural state gets that
     /// right by construction; one that keeps it in the state it replaces on
     /// reset silently unplugs itself the first time the machine reboots.
+    ///
+    /// This is the **only** route from one device to another's handle. Nearly
+    /// every connection between two devices is a region, a wire or a clock
+    /// domain, and those stay the way to do it; this covers the few that are
+    /// none of the three — a shared counter, a cycle arbiter, a sample fetch.
+    /// There were briefly three separate mechanisms for that job and they have
+    /// been merged into this one, so a fourth is a design review rather than a
+    /// commit.
     ///
     /// Defaults to publishing nothing.
     fn export(&self, _which: ExportId) -> Option<Export> {
@@ -438,33 +501,6 @@ pub trait Device: Send + Sync + fmt::Debug {
     /// mutability.
     fn run(&self, _budget: Budget) -> Consumed {
         Consumed::default()
-    }
-
-    /// A named seam onto this device, for a link the other three cannot carry.
-    ///
-    /// Nearly every connection between two devices is a **region**, a **wire**
-    /// or a **clock domain**, and those stay the way to do it. A few are none
-    /// of the three: the RP2A03's DMC hands its sample fetch to the same
-    /// cycle-stealing arbiter that runs OAM DMA, and neither an address nor a
-    /// level can express "fetch this byte and give it back to me".
-    ///
-    /// So a device may publish a named handle, and a sibling that the machine
-    /// file linked to it asks for the name it understands and downcasts. The
-    /// name is the contract: it belongs to the pair, not to the core, and a
-    /// device that does not recognise it answers `None`. `Any` rather than a
-    /// trait object because `core::device` must not learn what a DMC is.
-    fn interface(&self, name: &str) -> Option<Arc<dyn Any + Send + Sync>> {
-        let _ = name;
-        None
-    }
-
-    /// This device's `/RDY`-style arbiter, if it has one to offer.
-    ///
-    /// How a machine wires one device's cycle-stealing DMA to another device's
-    /// halt input without either of them naming the other's type: the core
-    /// resolves a link to the DMA unit and asks it for this.
-    fn cycle_gate(&self) -> Option<Arc<dyn CycleGate>> {
-        None
     }
 
     /// Told where to publish its own tick counter as it runs.

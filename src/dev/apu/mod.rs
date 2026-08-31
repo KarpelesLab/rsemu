@@ -90,7 +90,9 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::core::clock::DomainId;
-use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
+use crate::core::device::{
+    Device, DeviceClass, Export, ExportId, PropertySpec, RealizeCtx, ResetKind,
+};
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
@@ -892,16 +894,14 @@ impl MemOps for ApuPort {
     }
 }
 
-/// The name a DMA unit asks [`Device::interface`] for to reach the DMC.
-pub const DMC_FETCH: &str = "nes.dmc-fetch";
-
 /// The DMC's sample fetch, as the chip's cycle-stealing DMA unit sees it.
 ///
 /// The DMC and the OAM DMA unit are the same arbiter on the RP2A03 die: one
 /// `/RDY` line, one get/put cadence, one precedence rule between them. So the
 /// unit that runs OAM DMA runs this too, and it reaches the channel through
 /// here rather than by owning it. Handed over by
-/// [`Device::interface`]`(`[`DMC_FETCH`]`)`.
+/// [`Device::export`]`(`[`ExportId::DMC_FETCH`]`)`, as an
+/// [`Export::Opaque`] the consumer downcasts.
 #[derive(Debug)]
 pub struct DmcFetch {
     state: Arc<ApuState>,
@@ -956,11 +956,11 @@ impl Device for Apu {
         &APU_CLASS
     }
 
-    fn interface(&self, name: &str) -> Option<Arc<dyn core::any::Any + Send + Sync>> {
-        (name == DMC_FETCH).then(|| {
-            Arc::new(DmcFetch {
+    fn export(&self, which: ExportId) -> Option<Export> {
+        (which == ExportId::DMC_FETCH).then(|| {
+            Export::Opaque(Arc::new(DmcFetch {
                 state: Arc::clone(&self.state),
-            }) as Arc<dyn core::any::Any + Send + Sync>
+            }))
         })
     }
 

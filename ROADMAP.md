@@ -77,7 +77,10 @@ something a person can actually run (§2).
 > seam** with a browser build at <https://karpeleslab.github.io/rsemu/>, and a
 > **typed export seam** (§4.4) so one device can hand another a handle — the
 > thing that had blocked the CLINT, and the reason Linux now gets a working
-> `time` CSR.
+> `time` CSR. Three mechanisms for that job appeared independently within a day
+> of each other and have been merged into one: `Device::export` carries a
+> shared counter, a cycle arbiter, or an opaque pair-private handle, over a
+> single id space. A fourth is a design review, not a commit.
 >
 > Ordering deviated from the plan deliberately, and it was the right call.
 > ARM was pulled forward for a downstream crate; Z80, x86, RISC-V, m68k and SM83
