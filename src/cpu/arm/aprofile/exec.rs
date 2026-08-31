@@ -180,6 +180,15 @@ pub(super) struct State {
     pub last_swi: u32,
     /// The comment field of the last `BKPT` executed.
     pub last_bkpt: u16,
+    /// Cycles owed to the next scheduler budget.
+    ///
+    /// An ARM cannot be stopped mid-instruction, so a budget that runs out
+    /// part-way through one is overshot. The scheduler refuses a `Consumed`
+    /// larger than the budget it handed out — rightly, since that would put
+    /// the domain ahead of the timeline — so the overshoot is carried here and
+    /// charged against the next budget instead. Architectural state, because a
+    /// restored machine that forgot its debt runs one instruction free.
+    pub debt: u64,
 }
 
 impl State {
@@ -194,6 +203,7 @@ impl State {
             last_fault: 0,
             last_swi: 0,
             last_bkpt: 0,
+            debt: 0,
         }
     }
 }

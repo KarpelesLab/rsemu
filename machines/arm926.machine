@@ -1,0 +1,114 @@
+# arm926 - a bare ARM926EJ-S SoC skeleton.
+#
+#   rsemu run arm926 --media firmware=fw.bin
+#   rsemu run arm926 -p periph=0xf0000000 -p ram=64M --media firmware=fw.bin
+#
+# The smallest machine that puts an ARMv5TE core somewhere real: a boot ROM at
+# the reset vector, DRAM, and one peripheral aperture. It models no product. It
+# exists so that `cpu.arm` has somewhere to run inside a `.machine` file, and so
+# that a downstream SoC - the immediate one being a Conexant DigiColor
+# CX92755-class part, whose peripherals sit at 0xf0000000 - can start from a
+# file it copies and edits rather than from nothing.
+#
+# ---------------------------------------------------------------------------
+# Every address is a parameter, and that is the point
+# ---------------------------------------------------------------------------
+#
+# An ARM9 SoC's memory map is the SoC's, not the architecture's: two parts with
+# the same core put their DRAM and their registers in entirely different places.
+# So nothing here is a constant except the one address the *architecture* fixes
+# - the exception vector base, which is 0x00000000 out of reset unless VINITHI
+# is tied high - and that is why the boot ROM is mapped there.
+#
+# ---------------------------------------------------------------------------
+# What this board does not have: CP15
+# ---------------------------------------------------------------------------
+#
+# The MMU, the caches and the tightly-coupled memories are **not** in the core
+# (`src/cpu/arm/aprofile/cp.rs`): they differ between SoCs built on the same
+# ARM926EJ-S macrocell, so the core exposes `cp::Coprocessor` and `cp::Mmu`
+# traits and a downstream crate supplies its own. With none supplied the core
+# uses `FlatMmu`, an identity map with no translation and no protection, which
+# is what an ARM926EJ-S looks like before its firmware turns the MMU on.
+#
+# There is currently **no way to name a coprocessor from a machine file** - that
+# would need the typed export seam (ROADMAP.md 4.4) to carry a `dyn
+# Coprocessor`, which it does not. So a board whose firmware programs CP15 has
+# to be assembled in Rust today, and this file says so rather than pretending an
+# `mmu = ...` property exists.
+
+machine "arm926" {
+  # -- the map ---------------------------------------------------------------
+
+  # How big the boot ROM is. It is mapped at zero because that is where the
+  # architecture puts the exception vectors, so the first word of the firmware
+  # image is the reset branch.
+  param rom = 1M
+
+  # Where DRAM starts and how much there is.
+  param ram-base = 0x02000000
+  param ram      = 16M
+
+  # The peripheral aperture: where a SoC's register blocks live, and how much
+  # address space they get. 0xf0000000 is the CX92755's, which is the reason
+  # that is the default rather than a round number chosen for looks.
+  param periph      = 0xf0000000
+  param periph-size = 64K
+
+  # -- the crystal -----------------------------------------------------------
+  #
+  # One oscillator: everything on this board descends from the same can, so
+  # every ratio below is exact (ROADMAP.md 4.2). A real SoC has several - a
+  # reference crystal and a PLL per subsystem - and a board file that models one
+  # declares them here.
+  osc sysclk = 200000000 Hz
+
+  # -- the bus ---------------------------------------------------------------
+  #
+  # One flat 32-bit space. `unassigned` is left at its default of `fault`, so an
+  # access to a hole raises an external abort the guest can see rather than a
+  # plausible-looking zero. An ARM *does* have a bus-error input, unlike a 6502,
+  # so this is the honest setting rather than an aspirational one.
+  space mem { width = 32 }
+
+  # -- the core --------------------------------------------------------------
+  #
+  # `store-pc-offset = 8` and low vectors are the ARM926EJ-S defaults; they are
+  # written out because a board with VINITHI tied high changes the second one,
+  # and the file should show where.
+  object cpu "cpu.arm" {
+    clock            = sysclk
+    space            = mem
+    engine           = "interp"
+    big-endian       = false
+    high-vectors     = false
+    alignment-faults = false
+    store-pc-offset  = 8
+  }
+
+  # -- memory ----------------------------------------------------------------
+  #
+  # `image` names a media slot: whoever runs the machine binds the bytes
+  # (`--media firmware=fw.bin`), and nothing below host/ opens a file.
+  object boot "rom" { size = rom, image = "firmware" }
+
+  object dram "ram" { size = ram }
+
+  # The peripheral aperture, backed by plain memory. A SoC file replaces this
+  # one object with its own register blocks at their own offsets; until then it
+  # is a window firmware can write to and a test can read back, which is what
+  # makes this board provable rather than decorative.
+  object regs "ram" { size = periph-size }
+
+  # -- the memory map --------------------------------------------------------
+  map mem 0x00000000  size rom         = boot    # vectors, then the firmware
+  map mem ram-base    size ram         = dram
+  map mem periph      size periph-size = regs
+
+  # -- the wires -------------------------------------------------------------
+  #
+  # None, deliberately. `cpu.irq`, `cpu.fiq` and `cpu.reset` are input pins this
+  # core has, and a SoC file wires its interrupt controller to the first two and
+  # its watchdog to the third. This board has no interrupt controller to wire,
+  # and a net with no driver would be three lines saying nothing.
+}

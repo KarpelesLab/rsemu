@@ -162,6 +162,24 @@ pub static SPI_PANEL: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/spi-panel.machine"),
 };
 
+/// A bare ARM926EJ-S SoC skeleton, when this build has an A-profile core.
+///
+/// A synthetic board rather than a product: a boot ROM at the reset vector,
+/// DRAM, and one peripheral aperture, with every address a parameter because an
+/// ARM9 SoC's memory map belongs to the SoC and not to the architecture. It is
+/// the starting point a downstream part copies and edits — the immediate one
+/// being a Conexant DigiColor CX92755-class SoC, whose peripherals sit at
+/// `0xf0000000`. The `firmware` slot takes whatever should be at `0x00000000`,
+/// where the core resets to.
+#[cfg(feature = "machine-arm926")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-arm926")))]
+pub static ARM926: CatalogEntry = CatalogEntry {
+    name: "arm926",
+    summary: "a bare ARM926EJ-S SoC skeleton: ARMv5TE core, boot ROM, DRAM, one peripheral window",
+    media: &["firmware"],
+    source: include_str!("../../machines/arm926.machine"),
+};
+
 /// Every machine this build can realize, in catalog order.
 // One `#[cfg]`-gated push per shipped machine, which is what the lint is
 // complaining about: a `vec![]` literal cannot carry an attribute on one of its
@@ -173,6 +191,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     let mut out: Vec<&'static CatalogEntry> = Vec::new();
     #[cfg(feature = "machine-apple1")]
     out.push(&APPLE1);
+    #[cfg(feature = "machine-arm926")]
+    out.push(&ARM926);
     #[cfg(feature = "machine-beneater")]
     out.push(&BENEATER_6502);
     #[cfg(feature = "machine-gameboy")]
@@ -221,6 +241,12 @@ pub fn registry() -> Result<Registry> {
     crate::dev::apu::register(&mut reg)?;
     #[cfg(feature = "dev-apple1")]
     crate::dev::apple1::register(&mut reg)?;
+    #[cfg(feature = "cpu-arm-aprofile")]
+    crate::cpu::arm::aprofile::register(&mut reg)?;
+    #[cfg(feature = "cpu-z80")]
+    crate::cpu::z80::register(&mut reg)?;
+    #[cfg(feature = "cpu-m68k")]
+    crate::cpu::m68k::register(&mut reg)?;
     #[cfg(feature = "cpu-riscv")]
     crate::cpu::riscv::register(&mut reg)?;
     #[cfg(feature = "dev-riscv")]
@@ -288,6 +314,12 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::apu::bind(&mut b)?;
     #[cfg(feature = "dev-apple1")]
     crate::dev::apple1::bind(&mut b)?;
+    #[cfg(feature = "cpu-arm-aprofile")]
+    crate::cpu::arm::aprofile::bind(&mut b)?;
+    #[cfg(feature = "cpu-z80")]
+    crate::cpu::z80::bind(&mut b)?;
+    #[cfg(feature = "cpu-m68k")]
+    crate::cpu::m68k::bind(&mut b)?;
     #[cfg(feature = "cpu-riscv")]
     crate::cpu::riscv::bind(&mut b)?;
     #[cfg(feature = "dev-riscv")]
@@ -334,6 +366,12 @@ pub fn classes() -> ClassTable {
     for schema in crate::dev::apple1::schemas() {
         table.insert(schema);
     }
+    #[cfg(feature = "cpu-arm-aprofile")]
+    table.insert(crate::cpu::arm::aprofile::schema());
+    #[cfg(feature = "cpu-z80")]
+    table.insert(crate::cpu::z80::schema());
+    #[cfg(feature = "cpu-m68k")]
+    table.insert(crate::cpu::m68k::schema());
     #[cfg(feature = "cpu-riscv")]
     table.insert(crate::cpu::riscv::schema());
     #[cfg(feature = "dev-riscv")]

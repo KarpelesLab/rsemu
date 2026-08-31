@@ -89,18 +89,21 @@ mod tests;
 mod conformance;
 
 use alloc::boxed::Box;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::core::device::{Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind};
+use crate::core::device::{
+    Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
+};
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
 use crate::core::sched::{Budget, Consumed};
 use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::core::sync::{self, AtomicBool, LockRank, Ordering};
+use crate::core::sync::{self, AtomicBool, AtomicU32, LockRank, Ordering};
 use crate::core::value::Endian;
 use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink};
 
@@ -576,9 +579,18 @@ impl Default for Config {
 /// `single`. Both ARM interrupt inputs are level-sensitive, so there is no
 /// edge latch to keep either (`ROADMAP.md` §4.7).
 #[derive(Debug, Default)]
-struct Lines {
+pub(crate) struct Lines {
     irq: AtomicBool,
     fiq: AtomicBool,
+    /// A reset asked for by the `reset` pin, latched until the next step folds
+    /// it into the execution state.
+    ///
+    /// A latch rather than a direct write to `State::reset_pending`, because a
+    /// wire is driven from inside whatever device changed it — often from
+    /// inside an access this very core issued — and reaching for the session
+    /// lock there would re-enter the core's own critical section
+    /// (`ROADMAP.md` §4.7).
+    reset: AtomicBool,
 }
 
 impl Lines {
@@ -592,6 +604,16 @@ impl Lines {
     fn restore(&self, (irq, fiq): (bool, bool)) {
         self.irq.store(irq, Ordering::Release);
         self.fiq.store(fiq, Ordering::Release);
+    }
+
+    /// Latch a reset request. Cleared by whoever folds it into the state.
+    fn request_reset(&self) {
+        self.reset.store(true, Ordering::Release);
+    }
+
+    /// Consume the latch, reporting whether one was owed.
+    fn take_reset_request(&self) -> bool {
+        self.reset.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -646,8 +668,30 @@ impl fmt::Debug for Session {
 #[derive(Debug)]
 pub struct Arm {
     cfg: Config,
-    lines: Lines,
+    lines: Arc<Lines>,
+    /// This core's identity in `MemAttrs::requester`, assigned at bind time.
+    ///
+    /// Separate from [`Config::requester`] because a machine file names no
+    /// requester: the machine layer allocates one per initiator and hands it
+    /// over in [`Instance::bind`](crate::machine::Instance::bind), which is
+    /// after `new` (`ROADMAP.md` §4.4).
+    requester: AtomicU32,
     session: sync::Mutex<Session>,
+    /// The strong end of every pin this core has handed to a wire.
+    ///
+    /// A net holds its sinks weakly — the machine owns devices and a wire
+    /// merely refers to them (§4.3) — so a pin nothing else kept alive would
+    /// die on the way out of [`Device::sink`] and the wire would silently
+    /// deliver to nothing.
+    pins: sync::Mutex<Pins>,
+}
+
+/// The pins [`Device::sink`] has built, kept alive by the core that owns them.
+#[derive(Debug, Default)]
+struct Pins {
+    irq: Option<Arc<InterruptPin>>,
+    fiq: Option<Arc<InterruptPin>>,
+    reset: Option<Arc<ResetPin>>,
 }
 
 impl Arm {
@@ -662,7 +706,8 @@ impl Arm {
     pub fn new(cfg: Config) -> Arm {
         Arm {
             cfg,
-            lines: Lines::default(),
+            lines: Arc::new(Lines::default()),
+            requester: AtomicU32::new(cfg.requester.0),
             session: sync::Mutex::with_rank(
                 LockRank::BUS,
                 Session {
@@ -674,6 +719,7 @@ impl Arm {
                     coprocessors: [const { None }; 16],
                 },
             ),
+            pins: sync::Mutex::new(Pins::default()),
         }
     }
 
@@ -690,6 +736,10 @@ impl Arm {
         let high_vectors = r.or("high-vectors", false)?;
         let alignment_faults = r.or("alignment-faults", false)?;
         let store_pc_offset = r.or_range("store-pc-offset", 8u64, 8..=12)?;
+        // Accepted and ignored: there is one engine until phase 5, and a
+        // machine file that names it should not have to be edited when the
+        // second one lands.
+        let _engine = r.or_enum("engine", "interp", &["interp"])?;
         r.finish()?;
         if store_pc_offset != 8 && store_pc_offset != 12 {
             return Err(Error::Property(
@@ -709,10 +759,21 @@ impl Arm {
         }))
     }
 
-    /// This core's configuration.
+    /// This core's configuration, with the bind-time requester folded in.
     #[must_use]
     pub fn config(&self) -> Config {
-        self.cfg
+        Config {
+            requester: RequesterId(self.requester.load(Ordering::Relaxed)),
+            ..self.cfg
+        }
+    }
+
+    /// Give the core the identity its accesses travel under.
+    ///
+    /// The machine layer calls this from `bind`; a crate driving the core
+    /// directly usually sets [`Config::requester`] at construction instead.
+    pub fn set_requester(&self, id: RequesterId) {
+        self.requester.store(id.0, Ordering::Relaxed);
     }
 
     /// Give the core the address space it executes from.
@@ -909,6 +970,8 @@ impl Arm {
     /// interrupt returns one cycle per call and keeps waiting.
     pub fn step(&self) -> u64 {
         let (irq, fiq) = self.lines.snapshot();
+        let reset = self.lines.take_reset_request();
+        let cfg = self.config();
         let mut session = self.session.lock();
         let Session {
             state,
@@ -916,11 +979,15 @@ impl Arm {
             mmu,
             coprocessors,
         } = &mut *session;
+        // The `reset` pin latches outside the lock; this is where the latch
+        // becomes execution state, and it must happen before the step so an
+        // assertion is honoured by the very next instruction boundary.
+        state.reset_pending |= reset;
         let Some(space) = space.clone() else {
             return 0;
         };
         let mmu = Arc::clone(mmu);
-        Exec::new(state, &space, mmu.as_ref(), coprocessors, &self.cfg).step(irq, fiq)
+        Exec::new(state, &space, mmu.as_ref(), coprocessors, &cfg).step(irq, fiq)
     }
 
     /// Execute until at least `budget` cycles have been charged.
@@ -928,6 +995,9 @@ impl Arm {
     /// Returns the cycles actually used, which overshoots by at most one
     /// instruction — an ARM cannot be stopped mid-instruction, and pretending
     /// otherwise is how a scheduler ends up with a CPU in an impossible state.
+    ///
+    /// [`run_budget`](Arm::run_budget) is the same loop with the overshoot
+    /// carried forward instead, which is what the scheduler needs.
     pub fn run(&self, budget: u64) -> u64 {
         let mut used = 0;
         while used < budget {
@@ -938,6 +1008,48 @@ impl Arm {
             used += n;
         }
         used
+    }
+
+    /// Execute for at most `ticks`, carrying any overshoot into the next call.
+    ///
+    /// The scheduler hands out a budget and refuses a report larger than it, so
+    /// the instruction that ran past the end is paid for by the *following*
+    /// budget through `State::debt` — which keeps the core's cycle count exact
+    /// while never letting its clock domain run ahead of the timeline.
+    ///
+    /// A halted core, or one with no address space, consumes only the debt it
+    /// owed plus whatever it managed.
+    pub fn run_budget(&self, ticks: u64) -> u64 {
+        let owed = self.session.lock().state.debt;
+        if owed >= ticks {
+            // The last instruction was longer than this whole budget: charge
+            // the budget against the debt and execute nothing.
+            self.session.lock().state.debt = owed - ticks;
+            return ticks;
+        }
+        let allowance = ticks - owed;
+        let mut used = 0u64;
+        while used < allowance {
+            let n = self.step();
+            if n == 0 {
+                // No address space. Stop — retrying would spin.
+                break;
+            }
+            used += n;
+        }
+        if used >= allowance {
+            self.session.lock().state.debt = used - allowance;
+            ticks
+        } else {
+            self.session.lock().state.debt = 0;
+            owed + used
+        }
+    }
+
+    /// Cycles owed to the next budget — see [`run_budget`](Arm::run_budget).
+    #[must_use]
+    pub fn cycle_debt(&self) -> u64 {
+        self.session.lock().state.debt
     }
 
     /// Disassemble `count` instructions starting at `addr`, reading guest
@@ -964,7 +1076,9 @@ impl Arm {
 /// The `cpu.arm` device class.
 pub static CLASS: DeviceClass = DeviceClass {
     name: "cpu.arm",
-    version: 1,
+    // 2: the chunk gained the scheduler debt, without which a restored core
+    // runs one instruction free.
+    version: 2,
     summary: "ARMv5TE (ARM926EJ-S class) 32-bit CPU core with Thumb and the DSP extensions",
     properties: &[
         PropertySpec {
@@ -991,6 +1105,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "what a store of R15 writes: the instruction plus 8 or plus 12",
         },
+        PropertySpec {
+            name: "engine",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "which execution engine; only `interp` exists until phase 5",
+        },
     ],
     construct: |props| Ok(Box::new(Arm::from_props(props)?)),
 };
@@ -1013,13 +1133,10 @@ impl Device for Arm {
         &CLASS
     }
 
-    fn realize(&self, ctx: &mut RealizeCtx<'_>) -> Result<()> {
-        // A CPU with no address space cannot fetch, and failing here is the
-        // difference between a config error and a machine that runs zero
-        // instructions and says nothing.
-        if self.session.lock().space.is_none() {
-            return Err(ctx.error("no address space attached to this core"));
-        }
+    fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
+        // Nothing outward. A CPU with no address space cannot fetch, but
+        // realize runs *before* the machine binds one — that check belongs to
+        // `Instance::bind`, which is where the space arrives.
         Ok(())
     }
 
@@ -1040,10 +1157,22 @@ impl Device for Arm {
             // start may assume they are idle.
             self.lines.restore((false, false));
         }
+        // The latch is internal bookkeeping either way: the sequence the
+        // machine just asked for is the one it owed.
+        self.lines.take_reset_request();
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
-        let state = self.session.lock().state;
+        // Fold the pin's latch in first. It is not a separate field in the
+        // chunk: `reset_pending` is where it was always going, and a snapshot
+        // taken between an assertion and the next step would otherwise lose
+        // the reset entirely.
+        let reset = self.lines.take_reset_request();
+        let state = {
+            let mut session = self.session.lock();
+            session.state.reset_pending |= reset;
+            session.state
+        };
         for value in state.regs.r {
             w.write_u32(value)?;
         }
@@ -1067,6 +1196,7 @@ impl Device for Arm {
         w.write_u32(state.last_fault)?;
         w.write_u32(state.last_swi)?;
         w.write_u16(state.last_bkpt)?;
+        w.write_u64(state.debt)?;
         let (irq, fiq) = self.lines.snapshot();
         w.write_bool(irq)?;
         w.write_bool(fiq)?;
@@ -1098,6 +1228,7 @@ impl Device for Arm {
         state.last_fault = r.read_u32()?;
         state.last_swi = r.read_u32()?;
         state.last_bkpt = r.read_u16()?;
+        state.debt = r.read_u64()?;
         let irq = r.read_bool()?;
         let fiq = r.read_bool()?;
         self.session.lock().state = state;
@@ -1105,19 +1236,109 @@ impl Device for Arm {
         Ok(())
     }
 
+    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        // The fan-in can only be built now: it is told its sources at
+        // construction and no `WireId` existed when this core was made.
+        //
+        // Every pin is named the way the package names it, minus the bar:
+        // `nIRQ` and `nFIQ` are asserted low on real silicon, and inverting a
+        // level belongs to whatever models the wire, not to the core.
+        let mut pins = self.pins.lock();
+        let sink: Arc<dyn WireSink> = match port {
+            "irq" => {
+                let pin = Arc::new(InterruptPin::from_lines(
+                    Arc::clone(&self.lines),
+                    Interrupt::Irq,
+                    sources,
+                ));
+                pins.irq = Some(Arc::clone(&pin));
+                pin
+            }
+            "fiq" => {
+                let pin = Arc::new(InterruptPin::from_lines(
+                    Arc::clone(&self.lines),
+                    Interrupt::Fiq,
+                    sources,
+                ));
+                pins.fiq = Some(Arc::clone(&pin));
+                pin
+            }
+            "reset" => {
+                let pin = Arc::new(ResetPin::new(Arc::clone(&self.lines), sources));
+                pins.reset = Some(Arc::clone(&pin));
+                pin
+            }
+            _ => return None,
+        };
+        Some(SinkPin { sink, line: 0 })
+    }
+
     fn is_runnable(&self) -> bool {
         true
     }
 
     fn run(&self, budget: Budget) -> Consumed {
-        Consumed::new(self.run(budget.ticks))
+        Consumed::new(self.run_budget(budget.ticks))
     }
 }
 
 impl Initiator for Arm {
     fn requester(&self) -> RequesterId {
-        self.cfg.requester
+        RequesterId(self.requester.load(Ordering::Relaxed))
     }
+}
+
+/// The machine layer's half: a core needs an address space, and this is where
+/// the machine gives it one.
+///
+/// **No CP15 arrives here, deliberately.** The MMU, the caches and the TCMs
+/// belong to the SoC rather than to the architecture (see [`cp`]), so a machine
+/// file gets the [`FlatMmu`] identity map and a downstream crate that models a
+/// real SoC calls [`Arm::attach_mmu`] and [`Arm::attach_coprocessor`] itself.
+/// Reaching a `dyn Coprocessor` from a `.machine` file would need the export
+/// seam (`ROADMAP.md` §4.4) to carry one, which it does not yet; until it does,
+/// a board whose firmware programs CP15 has to be assembled in Rust.
+impl crate::machine::Instance for Arm {
+    fn bind(&self, ctx: &crate::machine::BindCtx<'_>) -> Result<()> {
+        // A CPU with no address space cannot fetch, and a machine that runs
+        // zero instructions and says nothing is the worst of both worlds.
+        let space = ctx.space().ok_or_else(|| Error::Config {
+            at: ctx.path().to_string(),
+            message: String::from(
+                "an ARM core needs an address space to fetch from (`space = mem`)",
+            ),
+        })?;
+        self.attach_space(Arc::clone(space));
+        self.set_requester(ctx.requester());
+        Ok(())
+    }
+}
+
+/// Bind [`CLASS`] into the machine graph.
+///
+/// # Errors
+///
+/// If the class name is already bound.
+pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
+    bindings.bind(CLASS.name, |props| Ok(Arc::new(Arm::from_props(props)?)))
+}
+
+/// What the validator should know about `cpu.arm`.
+#[must_use]
+pub fn schema() -> crate::machine::validate::ClassSchema {
+    use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
+    ClassSchema::new(CLASS.name)
+        .prop(PropSchema::new("big-endian", ValueKind::Bool))
+        .prop(PropSchema::new("high-vectors", ValueKind::Bool))
+        .prop(PropSchema::new("alignment-faults", ValueKind::Bool))
+        .prop(PropSchema::new("store-pc-offset", ValueKind::Uint).range(8, 12))
+        .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
+        // Inputs only: an ARM926EJ-S drives nothing this core models. The
+        // bus-facing outputs a real part has -- `nMREQ`, `nRW`, `nWAIT` -- are
+        // the address space's business, not a wire's.
+        .port("irq", PortDir::In)
+        .port("fiq", PortDir::In)
+        .port("reset", PortDir::In)
 }
 
 /// One of the core's two interrupt inputs, as something a [`Wire`] can drive.
@@ -1131,7 +1352,7 @@ impl Initiator for Arm {
 /// [`Wire`]: crate::core::wire::Wire
 #[derive(Debug)]
 pub struct InterruptPin {
-    cpu: Arc<Arm>,
+    lines: Arc<Lines>,
     which: Interrupt,
     inputs: FanIn,
     resolve: Resolve,
@@ -1139,10 +1360,20 @@ pub struct InterruptPin {
 
 impl InterruptPin {
     /// Connect `which` input of `cpu` to a net driven by `sources`.
+    ///
+    /// The pin keeps a handle on the core's *input latches*, not on the core:
+    /// the core owns the pin — something must, since a net holds only a weak
+    /// reference to its sinks — and a pin that owned the core back would be a
+    /// cycle the machine could never drop.
     #[must_use]
     pub fn new(cpu: Arc<Arm>, which: Interrupt, sources: &[WireId]) -> InterruptPin {
+        InterruptPin::from_lines(Arc::clone(&cpu.lines), which, sources)
+    }
+
+    /// The same, given the latches directly.
+    fn from_lines(lines: Arc<Lines>, which: Interrupt, sources: &[WireId]) -> InterruptPin {
         InterruptPin {
-            cpu,
+            lines,
             which,
             inputs: FanIn::new(sources),
             resolve: Resolve::Or,
@@ -1174,8 +1405,58 @@ impl WireSink for InterruptPin {
         self.inputs.set(src, level);
         let asserted = self.inputs.resolve(self.resolve).is_high();
         match self.which {
-            Interrupt::Irq => self.cpu.set_irq(asserted),
-            Interrupt::Fiq => self.cpu.set_fiq(asserted),
+            Interrupt::Irq => self.lines.irq.store(asserted, Ordering::Release),
+            Interrupt::Fiq => self.lines.fiq.store(asserted, Ordering::Release),
+        }
+    }
+}
+
+/// The core's reset input, as something a [`Wire`] can drive.
+///
+/// Separate from [`InterruptPin`] because a reset is not an interrupt: it has
+/// no mask, no banked link register and no vector of its own beyond address
+/// zero. Asserting the line latches a request; the sequence itself runs on the
+/// next [`Arm::step`], which is when the core can fetch from the vector.
+///
+/// [`Wire`]: crate::core::wire::Wire
+#[derive(Debug)]
+pub struct ResetPin {
+    lines: Arc<Lines>,
+    inputs: FanIn,
+    resolve: Resolve,
+}
+
+impl ResetPin {
+    /// Connect `cpu`'s reset pin to a net driven by `sources`.
+    #[must_use]
+    pub fn new_for(cpu: Arc<Arm>, sources: &[WireId]) -> ResetPin {
+        ResetPin::new(Arc::clone(&cpu.lines), sources)
+    }
+
+    /// The same, given the latches directly.
+    fn new(lines: Arc<Lines>, sources: &[WireId]) -> ResetPin {
+        ResetPin {
+            lines,
+            inputs: FanIn::new(sources),
+            resolve: Resolve::Or,
+        }
+    }
+
+    /// The per-source levels currently seen.
+    #[must_use]
+    pub fn inputs(&self) -> &FanIn {
+        &self.inputs
+    }
+}
+
+impl WireSink for ResetPin {
+    fn set_level(&self, src: WireId, _line: u32, level: Level) {
+        self.inputs.set(src, level);
+        // Latch on assertion rather than on release: a machine whose reset
+        // button is still held should still come up, instead of waiting for a
+        // release nobody modelled.
+        if self.inputs.resolve(self.resolve).is_high() {
+            self.lines.request_reset();
         }
     }
 }

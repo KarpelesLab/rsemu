@@ -201,6 +201,16 @@ cpu-mos6502 = []
 # Adds no dependencies and is `no_std + alloc`.
 cpu-arm-aprofile = []
 
+# The `arm926` board (machines/arm926.machine plus the classes it names): a bare
+# ARM926EJ-S SoC skeleton -- an ARMv5TE core, a boot ROM at the reset vector,
+# DRAM, and one peripheral aperture, with every address a `param` because an ARM9
+# SoC's memory map belongs to the SoC rather than to the architecture. It models
+# no product; it exists so `cpu.arm` has somewhere to run inside a machine file,
+# and so a downstream SoC starts from a file it copies rather than from nothing.
+# No CP15: the core's coprocessor seam is a Rust trait and a machine file cannot
+# yet name one, so the board runs on the flat identity map. Adds no dependencies.
+machine-arm926 = ["cpu-arm-aprofile"]
+
 # The RISC-V `virt` board's chips (src/dev/riscv): the CLINT, the PLIC, a 16550
 # UART on the character-device seam, a system controller, virtio-MMIO with block
 # and entropy devices, and a **device tree generator** that emits the DTB from
