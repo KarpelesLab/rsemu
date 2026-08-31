@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std"]
+features         = ["std", "dev-flash-cfi"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -61,6 +61,15 @@ bench = false
 [[bin]]
 name  = "state_roundtrip"
 path  = "fuzz_targets/state_roundtrip.rs"
+test  = false
+doc   = false
+bench = false
+
+# The one MMIO surface with an invariant a guest must not be able to break:
+# a program can only clear bits (CLAUDE.md, "Testing").
+[[bin]]
+name  = "flash_cfi"
+path  = "fuzz_targets/flash_cfi.rs"
 test  = false
 doc   = false
 bench = false

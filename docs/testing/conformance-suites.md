@@ -40,7 +40,7 @@ anything**; this table records a point in time.
 | [riscv-arch-test](https://github.com/riscv-non-isa/riscv-arch-test) | RISC-V architectural compliance, driven by [RISCOF](https://github.com/riscv-software-src/riscof) | Not auto-detected — **check the in-tree licence** ⚠️ | Verify first |
 | [barotto/test386.asm](https://github.com/barotto/test386.asm) | 80386 CPU test ROM | **GPL-3.0** ⛔ | **No.** Download and run only |
 | [OpenSBI](https://github.com/riscv-software-src/opensbi) | RISC-V M-mode firmware | **BSD-2-Clause** ✅ | Yes — readable *and* usable |
-| [EDK II / OVMF](https://github.com/tianocore/edk2) | UEFI firmware | BSD-2-Clause-Patent ✅ | Readable; fetched as a prebuilt rather than vendored (building it needs a C toolchain) |
+| [EDK II / OVMF](https://github.com/tianocore/edk2) | UEFI firmware | BSD-2-Clause-Patent ✅ | Readable; taken as a prebuilt rather than vendored (building it needs a C toolchain). `scripts/fetch-testdata.sh edk2` copies the RISC-V build out of the local `qemu` firmware package |
 | [kvm-unit-tests](https://gitlab.com/kvm-unit-tests/kvm-unit-tests) | Atomics, barriers, interrupt controllers — the parallel-execution stress suite | **GPL-2.0** ⛔ | **No.** Download and run only |
 | [retrio/gb-test-roms](https://github.com/retrio/gb-test-roms) (blargg) | Game Boy CPU, timing, sound | **No licence file** ⛔ | **No.** Provenance unclear — run only |
 | blargg's NES test ROMs | NES CPU, PPU, APU | Freely circulated, licence unclear ⛔ | **No.** Run only |

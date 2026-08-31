@@ -128,8 +128,11 @@ pub static BENEATER_6502: CatalogEntry = CatalogEntry {
 #[cfg_attr(docsrs, doc(cfg(feature = "machine-riscv-virt")))]
 pub static RISCV_VIRT: CatalogEntry = CatalogEntry {
     name: "riscv-virt",
-    summary: "RISC-V `virt`: RV64GC hart, CLINT, PLIC, 16550, virtio-MMIO, generated DTB",
-    media: &["firmware"],
+    summary: "RISC-V `virt`: RV64GC hart, CLINT, PLIC, 16550, virtio-MMIO, NOR flash, DTB",
+    // The two NOR banks are listed because they are what a UEFI build needs,
+    // not because the board will not come up without them: unbound means a
+    // board with blank parts on it, and `rsemu run` binds them empty.
+    media: &["firmware", "flash0", "flash1"],
     source: include_str!("../../machines/riscv-virt.machine"),
 };
 
@@ -306,6 +309,8 @@ pub fn registry() -> Result<Registry> {
     crate::cpu::riscv::register(&mut reg)?;
     #[cfg(feature = "dev-riscv")]
     crate::dev::riscv::register(&mut reg)?;
+    #[cfg(feature = "dev-flash-cfi")]
+    crate::dev::flash::register(&mut reg)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::register(&mut reg)?;
     #[cfg(feature = "cpu-x86")]
@@ -369,6 +374,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::cpu::riscv::bind(&mut b)?;
     #[cfg(feature = "dev-riscv")]
     crate::dev::riscv::bind(&mut b)?;
+    #[cfg(feature = "dev-flash-cfi")]
+    crate::dev::flash::bind(&mut b)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::bind(&mut b)?;
     #[cfg(feature = "cpu-x86")]
@@ -423,6 +430,10 @@ pub fn classes() -> ClassTable {
     table.insert(crate::cpu::riscv::schema());
     #[cfg(feature = "dev-riscv")]
     for schema in crate::dev::riscv::schemas() {
+        table.insert(schema);
+    }
+    #[cfg(feature = "dev-flash-cfi")]
+    for schema in crate::dev::flash::schemas() {
         table.insert(schema);
     }
     #[cfg(feature = "dev-wdc")]
@@ -1068,6 +1079,11 @@ mod tests {
             // supplies the programs that actually do something.
             #[cfg(feature = "machine-riscv-virt")]
             ("riscv-virt", "firmware") => &[0x73, 0x00, 0x50, 0x10, 0x6f, 0xf0, 0xdf, 0xff],
+            // Both NOR banks come up erased when nothing is put in them, which
+            // is a board with blank parts soldered on — the state a factory
+            // ships and the state a UEFI build initialises for itself.
+            #[cfg(feature = "machine-riscv-virt")]
+            ("riscv-virt", "flash0" | "flash1") => &[],
             // The board's own demo: it configures the panel over SPI, paints a
             // gradient and enables the scanout engine. Assembled at compile
             // time by `dev::lcd::demo`, so it needs no toolchain either.

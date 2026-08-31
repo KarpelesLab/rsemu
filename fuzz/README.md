@@ -30,6 +30,7 @@ See [The phase-2 gate](#the-phase-2-gate) for the exact command.
 | `machine_parser`  | `machine::lexer` → `machine::parser` → `Diagnostic::render`, plus constant folding | never panics |
 | `state_decoder`   | `core::state::StateReader` over arbitrary bytes     | never panics; canonical encoding |
 | `state_roundtrip` | `StateWriter` → `StateReader`, structured input     | writer/reader are inverses |
+| `flash_cfi`       | `dev::flash::cfi` — the NOR flash MMIO surface and its snapshot chunk | a program only ever clears bits |
 
 ### `machine_parser`
 
@@ -75,6 +76,21 @@ that emitting the same state twice is byte-identical, which is what
 
 Structured input is decoded by hand (`Gen`) rather than through `arbitrary`'s
 derive, so a dependency bump cannot silently reinterpret every committed seed.
+
+### `flash_cfi`
+
+The first per-device target, and the reason `CLAUDE.md` asks for one on every
+MMIO surface. A NOR flash has an invariant no guest may break however it drives
+the bus: **a program can only clear bits**, and the only thing that puts one
+back is an erase, which takes a whole block to `0xff`. The target replays a
+fuzzer-chosen command sequence and, after every bus cycle, asserts that each
+byte of the array either did not change, lost bits, or became exactly `0xff`.
+No unit test can rule that out across an arbitrary command sequence; this can.
+
+It also checks that a debug read answers without moving the state machine, that
+a reset clears the command state and not the contents, that a save/load round
+trip reproduces the bytes exactly — including a half-issued erase or a staged
+write buffer — and that the chunk decoder survives arbitrary bytes.
 
 ## Setup (one-time)
 

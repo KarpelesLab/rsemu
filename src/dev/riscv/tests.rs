@@ -278,6 +278,8 @@ fn board(tag: &str, firmware: &[u8]) -> Board {
     let options = catalog::build_options()
         .expect("the catalog agrees with itself")
         .with_media("firmware", firmware)
+        .with_media("flash0", &[][..])
+        .with_media("flash1", &[][..])
         .with_param("console", console_name.clone())
         .with_param("power", power_name.clone())
         // Enough for the programs here, and small enough that the cold reset
@@ -395,6 +397,8 @@ fn every_address_in_the_tree_came_from_the_memory_map() {
     let options = catalog::build_options()
         .unwrap()
         .with_media("firmware", &[][..])
+        .with_media("flash0", &[][..])
+        .with_media("flash1", &[][..])
         .with_param("console", "test.riscv.console.moved")
         .with_param("power", "test.riscv.power.moved")
         .with_param("ram", "8M");
@@ -413,6 +417,30 @@ fn every_address_in_the_tree_came_from_the_memory_map() {
     let tree = super::dt::describe(&b2.device_tree()).expect("it parses");
     assert!(tree.contains("serial@10004000"), "{tree}");
     assert!(!tree.contains("serial@10000000"), "{tree}");
+}
+
+#[test]
+fn the_nor_banks_appear_as_cfi_flash_nodes() {
+    // This is how a UEFI build finds its variable store: EDK2's
+    // `FdtNorFlashQemuLib` walks every `cfi-flash` node, skips the bank that
+    // overlaps its own firmware volume, and makes the next one
+    // `PcdFlashNvStorageVariableBase`. No node, no variable write, and the DXE
+    // dispatcher asserts with 47 drivers still waiting on the protocol.
+    let b = board("dtb-flash", &[]);
+    let tree = super::dt::describe(&b.device_tree()).expect("it parses");
+    assert!(tree.contains("flash@20000000"), "{tree}");
+    assert!(tree.contains("flash@22000000"), "{tree}");
+    // `describe` prints property sizes rather than values, so the compatible
+    // string is checked in the blob itself — it is the exact byte sequence
+    // EDK2's `FindCompatibleNode` looks for.
+    let dtb = b.device_tree();
+    assert!(
+        dtb.windows(10).any(|w| w == b"cfi-flash\0"),
+        "no `cfi-flash` compatible string in the tree"
+    );
+    // Four bytes, because the bank is two x16 parts side by side. A driver
+    // that read 2 here would send each command to one of them.
+    assert_eq!(prop_u32(&dtb, "flash@22000000", "bank-width"), Some(4));
 }
 
 #[test]
@@ -550,6 +578,8 @@ fn a_hart_with_no_timer_named_reads_zero() {
     let options = catalog::build_options()
         .unwrap()
         .with_media("firmware", rdtime_loop().bytes().as_slice())
+        .with_media("flash0", &[][..])
+        .with_media("flash1", &[][..])
         .with_param("console", "test.riscv.console.untimed")
         .with_param("power", "test.riscv.power.untimed")
         .with_param("ram", "8M");
@@ -580,6 +610,8 @@ fn naming_a_timer_that_publishes_none_says_so() {
     let options = catalog::build_options()
         .unwrap()
         .with_media("firmware", &[][..])
+        .with_media("flash0", &[][..])
+        .with_media("flash1", &[][..])
         .with_param("console", "test.riscv.console.mistimed")
         .with_param("power", "test.riscv.power.mistimed")
         .with_param("ram", "8M");
@@ -775,8 +807,18 @@ fn with_payload(source: &str, index: usize, slot: &str, addr: u64, len: u64) -> 
 /// `addr:path`. That is how a supervisor-mode guest is booted: `fw_jump.bin` as
 /// the firmware, and a Linux `Image` at `0x80200000` — where OpenSBI hands
 /// control on — as the payload. An address outside DRAM gets RAM spliced in
-/// under it, which is how a UEFI build meant for the board's NOR flash is
-/// staged.
+/// under it.
+///
+/// `RSEMU_RISCV_STOP_AT` ends the run as soon as the guest has printed that
+/// string, rather than at the quantum budget: firmware that reaches a prompt
+/// never stops on its own.
+///
+/// `RSEMU_RISCV_FLASH0` and `RSEMU_RISCV_FLASH1` bind the board's two NOR
+/// banks, which is how a UEFI build is booted: the code image goes in bank 0
+/// and the variable store in bank 1. `RSEMU_RISCV_FLASH1_OUT` writes bank 1
+/// back out when the run ends, so pointing `FLASH1` at that same file on the
+/// next run is a reboot — and a variable written in one run is there in the
+/// next, which is the whole reason the flash is a device rather than memory.
 #[cfg(feature = "std")]
 #[test]
 fn firmware_from_the_environment_reaches_its_console() {
@@ -807,12 +849,30 @@ fn firmware_from_the_environment_reaches_its_console() {
         })
         .collect();
 
+    // The two NOR banks. Empty is a board with blank parts on it, which is
+    // what the non-UEFI runs want.
+    let bank = |var: &str| -> Vec<u8> {
+        std::env::var(var).map_or_else(
+            |_| Vec::new(),
+            |path| {
+                let bytes =
+                    std::fs::read(&path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+                eprintln!("{var}: {path} ({} bytes)", bytes.len());
+                bytes
+            },
+        )
+    };
+    let flash0 = bank("RSEMU_RISCV_FLASH0");
+    let flash1 = bank("RSEMU_RISCV_FLASH1");
+
     let console_name = String::from("test.riscv.console.firmware");
     let power_name = String::from("test.riscv.power.firmware");
     let entry = catalog::machine("riscv-virt").expect("shipped");
     let mut options = catalog::build_options()
         .expect("catalog")
         .with_media("firmware", image.as_slice())
+        .with_media("flash0", flash0.as_slice())
+        .with_media("flash1", flash1.as_slice())
         .with_param("console", console_name.clone())
         .with_param("power", power_name.clone())
         .with_param("ram", ram)
@@ -844,7 +904,14 @@ fn firmware_from_the_environment_reaches_its_console() {
     // under an interpreter, and a run that prints nothing until it finishes is
     // a run nobody can tell apart from a hang.
     use std::io::Write as _;
+    // `RSEMU_RISCV_STOP_AT` ends the run at the first line containing it. A
+    // firmware that reaches a prompt does not stop by itself, and a run that
+    // then burns its whole quantum budget idling is a run that takes minutes
+    // to say what it already said — and, worse, one whose flash never gets
+    // written back out.
+    let stop_at = std::env::var("RSEMU_RISCV_STOP_AT").unwrap_or_default();
     let mut printed = 0usize;
+    let mut seen = String::new();
     eprintln!("--- guest console ---");
     for _ in 0..quanta {
         if b.power.peek().is_some() {
@@ -856,11 +923,41 @@ fn firmware_from_the_environment_reaches_its_console() {
             printed += out.len();
             eprint!("{out}");
             let _ = std::io::stderr().flush();
+            if !stop_at.is_empty() {
+                seen.push_str(&out);
+                if seen.contains(&stop_at) {
+                    eprintln!("\n(stopping: the guest printed `{stop_at}`)");
+                    break;
+                }
+                // Keep only enough tail to span a marker that arrives split
+                // across two quanta.
+                if seen.len() > 4 * stop_at.len() {
+                    seen.drain(..seen.len() - 2 * stop_at.len());
+                }
+            }
         }
     }
     let tail = b.output();
     printed += tail.len();
     eprintln!("{tail}\n--------------------- {printed} byte(s)");
+
+    // Write the variable bank back out, if asked. Read with `MemAttrs::DEBUG`
+    // through the ordinary address space: the flash honours the debug flag by
+    // answering with its contents whatever its command state machine is doing,
+    // which is exactly what a snapshot of the array wants and exactly what
+    // invariant 5 is for. Nothing here knows the concrete device type.
+    if let Ok(out) = std::env::var("RSEMU_RISCV_FLASH1_OUT") {
+        let len = flash1.len().max(1);
+        let mut bytes = alloc::vec![0u8; len];
+        b.machine
+            .space("mem")
+            .expect("the board has one space")
+            .read_bytes(0x2200_0000, &mut bytes, crate::core::space::MemAttrs::DEBUG)
+            .expect("the variable bank is mapped");
+        std::fs::write(&out, &bytes).unwrap_or_else(|e| panic!("cannot write {out}: {e}"));
+        eprintln!("wrote {} byte(s) of flash1 to {out}", bytes.len());
+    }
+
     assert!(
         printed > 0,
         "the firmware printed nothing in {quanta} quanta"

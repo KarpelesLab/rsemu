@@ -95,9 +95,11 @@ completely on a device tree **generated from the realized machine** — addresse
 from the actual mappings, interrupt numbers from the wire graph — and Linux
 6.12 riscv64 boots all the way to `prepare_namespace`, running every initcall
 and moving its console off the SBI earlycon onto our own 16550A before it
-panics for want of a root filesystem nobody gave it. EDK2/UEFI reaches the end
-of the DXE dispatcher. Neither reaches a shell yet; where each stops is written
-down in `docs/platforms/riscv-virt.md` rather than rounded up.
+panics for want of a root filesystem nobody gave it. **EDK2/UEFI boots to its
+shell** — `UEFI Interactive Shell v2.2`, at a `Shell>` prompt — out of two CFI
+NOR flash banks the board maps and the generated device tree describes, and a
+variable written in one run is read back in the next. Where each stops is
+written down in `docs/platforms/riscv-virt.md` rather than rounded up.
 
 A seventh, `pc-at`, is a complete IBM PC/AT chipset — cascaded 8259As, 8254,
 MC146818, 8042, two 8237As, MC6845/VGA text mode, µPD765A — with a
