@@ -55,6 +55,7 @@ the question never arises.
 ### Machines
 | | |
 | --- | --- |
+| [`platforms/apple1.md`](platforms/apple1.md) | Apple 1: the MC6821, the clock, and the monitor-ROM licence question |
 | [`platforms/nes.md`](platforms/nes.md) | NES / Famicom |
 | [`platforms/game-boy.md`](platforms/game-boy.md) | Game Boy, Game Boy Color |
 | [`platforms/master-system.md`](platforms/master-system.md) | Sega Master System, Game Gear |

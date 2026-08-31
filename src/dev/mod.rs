@@ -11,6 +11,7 @@
 //!
 //! | Module | Feature | Covers |
 //! | --- | --- | --- |
+//! | [`apple1`] | `dev-apple1` | the Apple 1's MC6821, its monitor ROM socket, and RSMON |
 //! | [`apu`] | `dev-nes-apu` | the RP2A03 audio half: channels, frame counter, DMC |
 //! | [`cart`] | `dev-nes-cart` | cartridge images and the mappers that decode them |
 //! | [`ppu`] | `dev-nes-ppu` | the RP2C02 picture unit: the per-dot pipeline |
@@ -18,6 +19,10 @@
 //! Most of `dev/` is `no_std + alloc`. The two documented exceptions —
 //! `dev/blk/*` and `dev/net/*`, which are `std` because `fstool` and `pktkit`
 //! are — do not exist yet.
+
+#[cfg(feature = "dev-apple1")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-apple1")))]
+pub mod apple1;
 
 #[cfg(feature = "dev-nes-apu")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-apu")))]

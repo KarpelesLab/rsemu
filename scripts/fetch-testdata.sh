@@ -240,6 +240,82 @@ that file says what they mean.
 Consumed by tests/conformance/accuracycoin.rs."
 }
 
+fetch_wozmon() {
+	local dest="${DEST_ROOT}/apple1"
+	local target="${dest}/wozmon.bin"
+
+	if [ "$FORCE" = 0 ] && [ -s "$target" ]; then
+		ok "wozmon.bin already present ($(wc -c <"$target" | tr -d ' ') bytes)"
+		wozmon_notice "$dest"
+		return 0
+	fi
+
+	# No default URL, and that is the point. The Woz Monitor's copyright status
+	# is not clear — it has been passed around for decades, which is not a
+	# licence — and there is no canonical, licence-stated download to hard-code.
+	# rsemu will not pick a stranger's mirror on the user's behalf. Everything
+	# rsemu ships works without this: `rsemu run apple1` boots RSMON, which is
+	# ours and MIT (src/dev/apple1/monitor.rs).
+	if [ -z "$WOZMON_URL" ]; then
+		warn "no source for wozmon.bin, and this script will not guess one"
+		note ""
+		note "  The Woz Monitor's copyright status is unclear, so rsemu neither ships it"
+		note "  nor picks a mirror for you. If you have a copy you may use, either:"
+		note ""
+		note "      cp /path/to/wozmon.bin ${target}"
+		note "      scripts/fetch-testdata.sh --wozmon-url <url> wozmon"
+		note ""
+		note "  A 256-byte image whose last six bytes are the 6502's vectors is what"
+		note "  the machine wants. Then:"
+		note ""
+		note "      RSEMU_APPLE1_ROM=${target} cargo test --all-features woz"
+		note "      rsemu run apple1 --rom ${target}"
+		note ""
+		note "  docs/platforms/apple1.md has the long form."
+		return 0
+	fi
+
+	need curl
+	note "  downloading wozmon.bin from ${WOZMON_URL} ..."
+	download "$WOZMON_URL" "$target"
+
+	# No checksum to check against, so check the shape instead: 256 bytes, and a
+	# reset vector that points into the page the ROM is decoded at. That catches
+	# an HTML error page, an Intel-hex file, and a 4 KiB BASIC image, which are
+	# the three things people actually end up with.
+	local size
+	size="$(wc -c <"$target" | tr -d ' ')"
+	if [ "$size" -ne 256 ]; then
+		rm -f "$target"
+		die "that is ${size} bytes; the Apple 1's monitor socket holds 256"
+	fi
+	local vector
+	vector="$(od -An -tx1 -j 252 -N 2 "$target" | tr -d ' \n')"
+	case "$vector" in
+		??ff) ok "wozmon.bin (256 bytes, reset vector \$FF${vector%ff})" ;;
+		*)
+			rm -f "$target"
+			die "the reset vector at \$FFFC is \$${vector} — that is not an Apple 1 monitor ROM"
+			;;
+	esac
+	wozmon_notice "$dest"
+}
+
+wozmon_notice() {
+	write_notice "$1" "wozmon.bin — the Apple 1 monitor
+Steve Wozniak, 1976. Source: whatever you pointed --wozmon-url at.
+
+Licence: UNCLEAR. FETCH AND RUN ONLY — do not commit it, do not vendor it, do
+not attach it to a release. Running it as an emulated guest is ordinary use;
+redistributing it is not ours to do. This is the same rule nestest is under.
+
+rsemu does not need it: \`rsemu run apple1\` boots RSMON, rsemu's own monitor,
+which is MIT and committed (src/dev/apple1/monitor.rs).
+
+Consumed by RSEMU_APPLE1_ROM in src/dev/apple1/tests.rs, and by
+\`rsemu run apple1 --rom …\`."
+}
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -252,10 +328,15 @@ Suites:
   sst-65x02      SingleStepTests 6502 vectors  (MIT, redistributable)
   nestest        nestest.nes + nestest.log     (licence unclear, FETCH-ONLY)
   accuracycoin   AccuracyCoin.nes + README     (MIT, (c) 2025 Chris Siebert)
+  wozmon         the Apple 1 monitor           (licence unclear, BRING YOUR OWN)
 
 Options:
-  --all               fetch every suite (the default when none is named)
+  --all               fetch every suite (the default when none is named).
+                      Excludes wozmon, which has no source to fetch from.
   --force             re-fetch even if a verified copy is present
+  --wozmon-url URL    wozmon only: where to fetch a 256-byte monitor image
+                      from. There is no default and there will not be one;
+                      see docs/platforms/apple1.md.
   --variant V         sst-65x02 only: nes6502 (default), 6502, or all
   --opcodes LIST      sst-65x02 only: fetch just these opcode files,
                       e.g. --opcodes a9,ad,b1. Pairs with RSEMU_SST_OPCODES.
@@ -277,7 +358,7 @@ list_present() {
 		return 0
 	fi
 	local suite
-	for suite in sst-65x02 nestest accuracycoin; do
+	for suite in sst-65x02 nestest accuracycoin apple1; do
 		if [ -d "${DEST_ROOT}/${suite}" ]; then
 			printf '  %-14s %s\n' "$suite" \
 				"$(du -sh "${DEST_ROOT}/${suite}" 2>/dev/null | cut -f1) present"
@@ -290,6 +371,7 @@ list_present() {
 FORCE=0
 SST_VARIANT="nes6502"
 SST_OPCODES=""
+WOZMON_URL="${RSEMU_WOZMON_URL:-}"
 SUITES=()
 
 while [ $# -gt 0 ]; do
@@ -298,6 +380,7 @@ while [ $# -gt 0 ]; do
 		--force) FORCE=1 ;;
 		--variant) SST_VARIANT="${2:?--variant needs a value}"; shift ;;
 		--opcodes) SST_OPCODES="${2:?--opcodes needs a value}"; shift ;;
+		--wozmon-url) WOZMON_URL="${2:?--wozmon-url needs a value}"; shift ;;
 		--list) list_present; exit 0 ;;
 		-h|--help) usage; exit 0 ;;
 		-*) die "unknown option $1 (try --help)" ;;
@@ -322,6 +405,7 @@ for suite in "${SUITES[@]}"; do
 		sst-65x02|sst) fetch_sst ;;
 		nestest) fetch_nestest ;;
 		accuracycoin|coin) fetch_accuracycoin ;;
+		wozmon|apple1) fetch_wozmon ;;
 		*) die "unknown suite $suite (try --help)" ;;
 	esac
 done

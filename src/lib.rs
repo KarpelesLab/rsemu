@@ -17,8 +17,15 @@
 //! `machine-nes`, [`machine::catalog`] ships a NES that a real cartridge boots
 //! on: `rsemu run nes-ntsc --cart smb.nes`.
 //!
+//! With `machine-apple1`, [`machine::catalog`] also ships an Apple 1 — a 6502,
+//! 4 KiB of RAM, an MC6821 and a 256-byte monitor ROM — which is the first
+//! machine a person can actually type at: `rsemu run apple1`. It reaches the
+//! terminal through [`host::chardev`], the character-stream seam a 16550 will
+//! use next.
+//!
 //! Not yet: the NES PPU and APU as machine objects, so nothing is displayed or
-//! heard; the IR and JIT; and the host layer (window, audio, gdbstub).
+//! heard; the IR and JIT; and the rest of the host layer (window, audio,
+//! gdbstub).
 //!
 //! # `no_std`
 //!
@@ -33,6 +40,7 @@ extern crate alloc;
 pub mod core;
 pub mod cpu;
 pub mod dev;
+pub mod host;
 pub mod machine;
 
 #[cfg(feature = "wasm")]
@@ -76,6 +84,12 @@ pub fn build_info() -> alloc::string::String {
     }
     if cfg!(feature = "machine-nes") {
         features.push("machine-nes");
+    }
+    if cfg!(feature = "dev-apple1") {
+        features.push("dev-apple1");
+    }
+    if cfg!(feature = "machine-apple1") {
+        features.push("machine-apple1");
     }
 
     let mut s = String::from("rsemu ");

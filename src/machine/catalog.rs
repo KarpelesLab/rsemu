@@ -71,6 +71,20 @@ pub static NES_NTSC: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/nes-ntsc.machine"),
 };
 
+/// The Apple 1, when this build has a 6502 and the board's chips.
+///
+/// The `rom` slot has a default nothing else does: `rsemu run apple1` with no
+/// `--rom` binds [`RSMON`](crate::dev::apple1::RSMON), rsemu's own monitor, so
+/// the machine demonstrates itself without a ROM of unclear provenance.
+#[cfg(feature = "machine-apple1")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-apple1")))]
+pub static APPLE1: CatalogEntry = CatalogEntry {
+    name: "apple1",
+    summary: "Apple 1 (1976): 6502, 4K RAM, MC6821 keyboard and display",
+    media: &["rom"],
+    source: include_str!("../../machines/apple1.machine"),
+};
+
 /// Every machine this build can realize, in catalog order.
 // One `#[cfg]`-gated push per shipped machine, which is what the lint is
 // complaining about: a `vec![]` literal cannot carry an attribute on one of its
@@ -80,6 +94,8 @@ pub static NES_NTSC: CatalogEntry = CatalogEntry {
 #[must_use]
 pub fn machines() -> Vec<&'static CatalogEntry> {
     let mut out: Vec<&'static CatalogEntry> = Vec::new();
+    #[cfg(feature = "machine-apple1")]
+    out.push(&APPLE1);
     #[cfg(feature = "machine-nes")]
     out.push(&NES_NTSC);
     out
@@ -110,6 +126,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::ppu::register(&mut reg)?;
     #[cfg(feature = "dev-nes-apu")]
     crate::dev::apu::register(&mut reg)?;
+    #[cfg(feature = "dev-apple1")]
+    crate::dev::apple1::register(&mut reg)?;
     Ok(reg)
 }
 
@@ -142,6 +160,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::cpu::mos6502::bind(&mut b)?;
     #[cfg(feature = "dev-nes-cart")]
     crate::dev::cart::nrom::bind(&mut b)?;
+    #[cfg(feature = "dev-apple1")]
+    crate::dev::apple1::bind(&mut b)?;
     Ok(b)
 }
 
@@ -156,6 +176,10 @@ pub fn classes() -> ClassTable {
     table.insert(crate::cpu::mos6502::schema());
     #[cfg(feature = "dev-nes-cart")]
     table.insert(crate::dev::cart::nrom::schema());
+    #[cfg(feature = "dev-apple1")]
+    for schema in crate::dev::apple1::schemas() {
+        table.insert(schema);
+    }
     table
 }
 
@@ -538,8 +562,15 @@ mod tests {
     /// Something plausible to bind to a media slot, so the catalog can be
     /// realized without a corpus.
     fn fixture(slot: &str) -> &'static [u8] {
-        assert_eq!(slot, "cart", "no fixture for media slot `{slot}`");
-        MINIMAL_NROM
+        match slot {
+            "cart" => MINIMAL_NROM,
+            // The Apple 1's default: rsemu's own monitor, which is committed
+            // precisely so that this needs no download and no licence
+            // question.
+            #[cfg(feature = "machine-apple1")]
+            "rom" => crate::dev::apple1::RSMON,
+            other => panic!("no fixture for media slot `{other}`"),
+        }
     }
 
     /// The smallest legal NROM image: an iNES header, 16 KiB of PRG, 8 KiB of
