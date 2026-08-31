@@ -81,6 +81,31 @@ pub const DEFAULT_DECAY_DOTS: u64 = 3_221_591;
 /// which is this counter started at the dot the write lands on.
 const MASK_WRITE_DELAY_DOTS: u8 = 3;
 
+/// [`Engine::data_sm`]'s value the moment a `$2007` read is answered.
+///
+/// The engine is caught up to the dot **after** the CPU's read cycle — the 6502
+/// publishes its cycle counter at the top of the cycle and latches the data bus
+/// at the end of it, so the three dots the cycle occupied have all run by the
+/// time the port answers. That dot is therefore the one M2 falls on, ALE is two
+/// PPU cycles later and Read two after that: counting down one per dot from
+/// here puts ALE at [`DATA_SM_ALE`] and the read at zero, four dots after the
+/// access ends. (AccuracyCoin.asm's "PPU DATA State Machine" timing table, MIT,
+/// (c) 2025 Chris Siebert.)
+const DATA_SM_START: u8 = 5;
+
+/// [`Engine::data_sm`] on the dot the state machine raises ALE.
+const DATA_SM_ALE: u8 = 2;
+
+/// Dots between the `$2006` write that loads `v` and `v` reaching the address
+/// bus.
+///
+/// The same two PPU cycles the `$2007` state machine takes to get from M2
+/// falling to its first output: the CPU's write is captured asynchronously and
+/// only moves on a PPU clock edge, so `t` reaches `v` at *t2*, not during the
+/// CPU's cycle. Counted down one per dot from here, so the load lands on the
+/// second dot after the access — see [`Engine::v_delay`].
+const ADDR_WRITE_DELAY_DOTS: u8 = 3;
+
 /// One framebuffer entry: a palette index plus the colour-emphasis bits that
 /// were in force when it was drawn.
 ///
@@ -150,6 +175,52 @@ impl EvalPhase {
 }
 
 // ---------------------------------------------------------------------------
+// The memory cadence
+// ---------------------------------------------------------------------------
+
+/// Which half of a two-dot PPU memory access a dot is.
+///
+/// A 2C02 access takes **two** dots, because the chip multiplexes the low eight
+/// address bits onto the same pins it reads data back on: the first dot drives
+/// the address and strobes ALE, which opens an octal latch *on the board* and
+/// holds those eight bits; the second dot performs the read, composing the
+/// address from the six address-only pins as they stand on that dot and the
+/// eight bits the latch is holding. That split is directly observable — see
+/// [`Engine::ale_latch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Drive the address, strobe ALE.
+    Ale,
+    /// Read, from the top six pins plus the octal latch.
+    Read,
+}
+
+/// What the render pipeline is fetching on a given pair of dots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchOp {
+    /// The background nametable byte.
+    Nt,
+    /// The attribute byte for the tile being fetched.
+    At,
+    /// The background pattern's low bitplane.
+    BgLo,
+    /// The background pattern's high bitplane.
+    BgHi,
+    /// One of the two garbage nametable fetches inside a sprite slot.
+    ///
+    /// The sprite fetches do **not** read the attribute table: the slot is two
+    /// nametable fetches followed by the two pattern planes ("Sprite fetch
+    /// should not be performing attribute table fetches, rather it should
+    /// perform two nametable fetches in a row" — AccuracyCoin.asm, MIT, (c)
+    /// 2025 Chris Siebert).
+    SpNt,
+    /// A sprite pattern's low bitplane, for slot `.0`.
+    SpLo(u8),
+    /// A sprite pattern's high bitplane, for slot `.0`.
+    SpHi(u8),
+}
+
+// ---------------------------------------------------------------------------
 // The engine
 // ---------------------------------------------------------------------------
 
@@ -195,6 +266,45 @@ pub struct Engine {
     /// Last value seen on the PPU's own address bus, returned when a CHR fetch
     /// faults. The PPU bus floats too; this is its equivalent of open bus.
     pub(crate) bus_latch: u8,
+    /// The **octal address latch**: the low eight bits of the PPU's address
+    /// bus, held outside the chip.
+    ///
+    /// The 2C02 has fourteen address bits and eight data pins, and the low
+    /// eight of the address share those eight pins. An access is therefore two
+    /// dots: on the first, ALE is strobed and the low eight bits are captured
+    /// into a 74-series octal latch on the cartridge board; on the second, the
+    /// chip drives only the top six and reads, so the address that actually
+    /// reaches memory is *the top six as they stand on the read dot* composed
+    /// with *the eight bits the latch captured on the ALE dot*.
+    ///
+    /// Keeping the two halves apart is the entire subject of AccuracyCoin's
+    /// "ALE + Read" and "Hybrid Addresses" tests: a `$2006` write landing
+    /// between the two dots changes the top six and not the low eight, and the
+    /// read goes to an address the chip never emitted.
+    pub(crate) ale_latch: u8,
+    /// `$2007`'s access state machine: dots left before its next phase, or 0.
+    ///
+    /// A `$2007` read does not fetch during the CPU's cycle. The read only
+    /// *starts* a five-stage latch chain clocked off the PPU clock, which
+    /// raises ALE two PPU cycles after M2 falls and Read two cycles after that
+    /// — so the read buffer is filled four PPU cycles after the CPU access
+    /// ends, in the middle of whatever the render pipeline is doing
+    /// (AccuracyCoin.asm's "PPU DATA State Machine", MIT, (c) 2025 Chris
+    /// Siebert). Counted down one per dot from [`DATA_SM_START`].
+    pub(crate) data_sm: u8,
+    /// The address the pending `$2007` access captured.
+    pub(crate) data_sm_addr: u16,
+    /// The `v` a second `$2006` write has loaded but not yet delivered.
+    pub(crate) v_pending: u16,
+    /// Dots left before [`Engine::v_pending`] becomes `v`.
+    ///
+    /// AccuracyCoin's "Hybrid Addresses" is the whole reason this is not
+    /// immediate: it lands a `$2006` write between the two dots of a nametable
+    /// fetch, so the top six address bits come from the *new* `v` and the low
+    /// eight from the octal latch the *old* one strobed. That is only possible
+    /// if `v` arrives on a dot boundary of the PPU's own clock rather than at
+    /// the end of the CPU's write cycle. See [`ADDR_WRITE_DELAY_DOTS`].
+    pub(crate) v_delay: u8,
 
     // -- memories -----------------------------------------------------------
     pub(crate) oam: [u8; 256],
@@ -369,6 +479,11 @@ impl Engine {
             read_buffer: 0,
             latch: IoLatch::new(decay_dots),
             bus_latch: 0,
+            ale_latch: 0,
+            data_sm: 0,
+            data_sm_addr: 0,
+            v_pending: 0,
+            v_delay: 0,
             oam: [0; 256],
             secondary_oam: [0xff; 32],
             palette: [0; 32],
@@ -453,6 +568,9 @@ impl Engine {
         self.read_buffer = 0;
         self.latch = IoLatch::new(ttl);
         self.bus_latch = 0;
+        self.ale_latch = 0;
+        self.data_sm = 0;
+        self.data_sm_addr = 0;
         self.oam = [0; 256];
         self.secondary_oam = [0xff; 32];
         self.palette = [0; 32];
@@ -481,6 +599,10 @@ impl Engine {
     }
 
     fn reset_pipelines(&mut self) {
+        self.data_sm = 0;
+        self.data_sm_addr = 0;
+        self.v_pending = 0;
+        self.v_delay = 0;
         self.nt_latch = 0;
         self.at_latch = 0;
         self.bg_lo_latch = 0;
@@ -680,20 +802,204 @@ impl Engine {
         self.v = (self.v & !0x7be0) | (self.t & 0x7be0);
     }
 
-    // -- background fetches -------------------------------------------------
+    // -- the two-dot memory cadence -----------------------------------------
 
-    fn fetch_nametable(&mut self) {
-        let addr = 0x2000 | (self.v & 0x0fff);
-        self.nt_latch = self.bus_read(addr, MemAttrs::DEFAULT);
+    /// The ALE half of an access: drive `addr` and strobe the octal latch.
+    ///
+    /// Only the low eight bits are captured. The top six are driven afresh on
+    /// every dot and are *not* state — which is exactly why they can come from
+    /// a different address than the low eight. See [`Engine::ale_latch`].
+    fn ale(&mut self, addr: u16) {
+        self.ale_latch = addr as u8;
     }
 
-    fn fetch_attribute(&mut self) {
-        let addr = 0x23c0 | (self.v & 0x0c00) | ((self.v >> 4) & 0x38) | ((self.v >> 2) & 0x07);
-        let byte = self.bus_read(addr, MemAttrs::DEFAULT);
-        // Bit 1 of coarse Y picks the row of the 2x2 quadrant grid, bit 1 of
-        // coarse X the column.
-        let shift = ((self.v >> 4) & 4) | (self.v & 2);
-        self.at_latch = (byte >> shift) & 3;
+    /// The read half: top six bits from `addr` as it stands *now*, low eight
+    /// from the octal latch.
+    fn read_dot(&mut self, addr: u16) -> u8 {
+        let full = (addr & 0x3f00) | u16::from(self.ale_latch);
+        self.bus_read(full, MemAttrs::DEFAULT)
+    }
+
+    /// Which access the render pipeline is performing on `dot`, and which half.
+    ///
+    /// Every dot of a rendered scanline is one or the other — "every single PPU
+    /// cycle is either setting up the address + latch, or reading from memory"
+    /// (AccuracyCoin.asm, MIT, (c) 2025 Chris Siebert). Dots 1-256 and 321-336
+    /// are the background's four fetches; 257-320 are eight sprite slots, each
+    /// two *nametable* fetches and two pattern fetches; 337-340 is a further
+    /// pair of nametable fetches; dot 0 re-drives the pattern address register.
+    fn cadence_op(&self, dot: u16) -> Option<(Phase, FetchOp)> {
+        match dot {
+            0 => Some((Phase::Ale, FetchOp::BgHi)),
+            1..=256 | 321..=336 => Some(match dot % 8 {
+                1 => (Phase::Ale, FetchOp::Nt),
+                2 => (Phase::Read, FetchOp::Nt),
+                3 => (Phase::Ale, FetchOp::At),
+                4 => (Phase::Read, FetchOp::At),
+                5 => (Phase::Ale, FetchOp::BgLo),
+                6 => (Phase::Read, FetchOp::BgLo),
+                7 => (Phase::Ale, FetchOp::BgHi),
+                _ => (Phase::Read, FetchOp::BgHi),
+            }),
+            257..=320 => {
+                let slot = ((dot - 257) / 8) as u8;
+                Some(match (dot - 257) % 8 {
+                    0 => (Phase::Ale, FetchOp::SpNt),
+                    1 => (Phase::Read, FetchOp::SpNt),
+                    2 => (Phase::Ale, FetchOp::SpNt),
+                    3 => (Phase::Read, FetchOp::SpNt),
+                    4 => (Phase::Ale, FetchOp::SpLo(slot)),
+                    5 => (Phase::Read, FetchOp::SpLo(slot)),
+                    6 => (Phase::Ale, FetchOp::SpHi(slot)),
+                    _ => (Phase::Read, FetchOp::SpHi(slot)),
+                })
+            }
+            337 | 339 => Some((Phase::Ale, FetchOp::Nt)),
+            338 | 340 => Some((Phase::Read, FetchOp::Nt)),
+            _ => None,
+        }
+    }
+
+    /// The address the pipeline wants for `op`, evaluated against `v` *now*.
+    fn cadence_addr(&self, op: FetchOp, scanline: u16) -> u16 {
+        match op {
+            FetchOp::Nt | FetchOp::SpNt => 0x2000 | (self.v & 0x0fff),
+            FetchOp::At => {
+                0x23c0 | (self.v & 0x0c00) | ((self.v >> 4) & 0x38) | ((self.v >> 2) & 0x07)
+            }
+            FetchOp::BgLo => self.pattern_addr(false),
+            FetchOp::BgHi => self.pattern_addr(true),
+            FetchOp::SpLo(_) => self.sprite_pattern_addr(scanline, false),
+            FetchOp::SpHi(_) => self.sprite_pattern_addr(scanline, true),
+        }
+    }
+
+    /// File a byte the read half just produced into the latch that wanted it.
+    fn cadence_store(&mut self, op: FetchOp, byte: u8) {
+        match op {
+            FetchOp::Nt | FetchOp::SpNt => self.nt_latch = byte,
+            FetchOp::At => {
+                // Bit 1 of coarse Y picks the row of the 2x2 quadrant grid, bit
+                // 1 of coarse X the column.
+                let shift = ((self.v >> 4) & 4) | (self.v & 2);
+                self.at_latch = (byte >> shift) & 3;
+            }
+            FetchOp::BgLo => self.bg_lo_latch = byte,
+            FetchOp::BgHi => self.bg_hi_latch = byte,
+            FetchOp::SpLo(slot) => {
+                let byte = if self.sp_attr_latch & SPRITE_FLIP_X != 0 {
+                    byte.reverse_bits()
+                } else {
+                    byte
+                };
+                self.sprite_pat_lo[usize::from(slot)] = byte;
+            }
+            FetchOp::SpHi(slot) => {
+                let byte = if self.sp_attr_latch & SPRITE_FLIP_X != 0 {
+                    byte.reverse_bits()
+                } else {
+                    byte
+                };
+                self.sprite_pat_hi[usize::from(slot)] = byte;
+            }
+        }
+    }
+
+    /// Step `$2007`'s state machine by one dot and say what it is doing.
+    fn data_sm_dot(&mut self) -> Option<Phase> {
+        if self.data_sm == 0 {
+            return None;
+        }
+        self.data_sm -= 1;
+        match self.data_sm {
+            DATA_SM_ALE => Some(Phase::Ale),
+            0 => Some(Phase::Read),
+            _ => None,
+        }
+    }
+
+    /// One dot of the PPU's memory bus: the render cadence and `$2007`'s state
+    /// machine, which contend for one set of pins.
+    ///
+    /// `cadence` is `None` when nothing is rendering, which is the ordinary
+    /// case for a `$2007` read and the only one where the state machine gets
+    /// the bus to itself. When both want it the arbitration is the ROM's, and
+    /// every branch below cites which line of its commentary it comes from
+    /// (AccuracyCoin.asm, MIT, (c) 2025 Chris Siebert).
+    fn memory_dot(&mut self, cadence: Option<(Phase, FetchOp)>, scanline: u16) {
+        let sm = self.data_sm_dot();
+        match (cadence, sm) {
+            (None, None) => {}
+            // The pipeline alone.
+            (Some((Phase::Ale, op)), None) => {
+                let addr = self.cadence_addr(op, scanline);
+                self.ale(addr);
+            }
+            (Some((Phase::Read, op)), None) => {
+                let addr = self.cadence_addr(op, scanline);
+                let byte = self.read_dot(addr);
+                self.cadence_store(op, byte);
+            }
+            // The state machine alone.
+            (None, Some(Phase::Ale)) => {
+                let addr = self.data_sm_addr;
+                self.ale(addr);
+            }
+            (None, Some(Phase::Read)) => {
+                let addr = self.data_sm_addr;
+                self.read_buffer = self.read_dot(addr);
+            }
+            // Both want ALE: "the background fetch takes priority, so the
+            // address bus + latch are set up using the address for the
+            // nametable read".
+            (Some((Phase::Ale, op)), Some(Phase::Ale)) => {
+                let addr = self.cadence_addr(op, scanline);
+                self.ale(addr);
+            }
+            // ALE and Read together: the octal latch is transparent while the
+            // pins are carrying data, so it does *not* take the address the
+            // pipeline is driving — "notably, the octal latch is still $FF ...
+            // I'm not sure why it wasn't updated to $03, but that's how it
+            // appears to work out when both ALE and Read are set". The read
+            // therefore goes to the pipeline's top six bits over the *stale*
+            // low eight, and the byte that comes back is what the latch
+            // settles on.
+            (Some((Phase::Ale, op)), Some(Phase::Read)) => {
+                let addr = self.cadence_addr(op, scanline);
+                let byte = self.read_dot(addr);
+                self.read_buffer = byte;
+                self.ale_latch = byte;
+            }
+            // The pipeline reads while the state machine strobes ALE. The read
+            // is one of the ones the ROM marks unstable and does not check; the
+            // latch it leaves behind is the state machine's.
+            (Some((Phase::Read, op)), Some(Phase::Ale)) => {
+                let addr = self.cadence_addr(op, scanline);
+                let byte = self.read_dot(addr);
+                self.cadence_store(op, byte);
+                let addr = self.data_sm_addr;
+                self.ale(addr);
+            }
+            // "The Read line is synced between the read cadence and the state
+            // machine, so the value read from the attribute table will also go
+            // into the Read Buffer." One read, two destinations.
+            (Some((Phase::Read, op)), Some(Phase::Read)) => {
+                let addr = self.cadence_addr(op, scanline);
+                let byte = self.read_dot(addr);
+                self.cadence_store(op, byte);
+                self.read_buffer = byte;
+            }
+        }
+        // `v` moves at the *end* of the access, not during the CPU's cycle.
+        // AccuracyCoin's "$2007 Stress Test" pins this down: its answer key
+        // sweeps one `$2007` read across a whole scanline and reads back a
+        // clean run of nametable bytes, which is only possible if the read the
+        // state machine performs happens *before* the increment its own access
+        // causes — otherwise every sample past the first would be a tile
+        // further along than the key says.
+        if sm == Some(Phase::Read) {
+            self.increment_data_address();
+        }
     }
 
     fn pattern_addr(&self, high: bool) -> u16 {
@@ -704,16 +1010,6 @@ impl Engine {
         };
         let fine_y = (self.v >> 12) & 7;
         base | (u16::from(self.nt_latch) << 4) | fine_y | if high { 8 } else { 0 }
-    }
-
-    fn fetch_pattern_low(&mut self) {
-        let addr = self.pattern_addr(false);
-        self.bg_lo_latch = self.bus_read(addr, MemAttrs::DEFAULT);
-    }
-
-    fn fetch_pattern_high(&mut self) {
-        let addr = self.pattern_addr(true);
-        self.bg_hi_latch = self.bus_read(addr, MemAttrs::DEFAULT);
     }
 
     fn shift_background(&mut self) {
@@ -990,14 +1286,17 @@ impl Engine {
         })
     }
 
-    /// Dots 257-320: eight 8-dot slots that read secondary OAM and fetch the
-    /// two pattern planes for the next scanline.
+    /// Dots 257-320: the four secondary-OAM reads at the head of each of the
+    /// eight sprite slots.
     ///
-    /// Every slot fetches, including the ones no sprite was found for — the
-    /// dummy fetches are what a scanline-counting mapper watches the A12 line
-    /// for, so skipping them would silently break MMC3 IRQ timing later. Only
-    /// the slots that hold a real sprite are drawn.
-    fn sprite_fetch_dot(&mut self, dot: u16, scanline: u16) {
+    /// The slot's two pattern fetches are the memory cadence's
+    /// ([`Engine::cadence_op`]) and land on dots 4-7 of the slot, by which time
+    /// all four bytes below have been latched. Every slot fetches, including
+    /// the ones no sprite was found for — the dummy fetches are what a
+    /// scanline-counting mapper watches the A12 line for, so skipping them
+    /// would silently break MMC3 IRQ timing later. Only the slots that hold a
+    /// real sprite are drawn.
+    fn sprite_fetch_dot(&mut self, dot: u16) {
         let slot = usize::from((dot - 257) / 8);
         let base = slot * 4;
         match (dot - 257) % 8 {
@@ -1008,22 +1307,6 @@ impl Engine {
                 self.sprite_attr[slot] = self.sp_attr_latch;
             }
             3 => self.sprite_x[slot] = self.secondary_oam[base + 3],
-            5 => {
-                let addr = self.sprite_pattern_addr(scanline, false);
-                let mut byte = self.bus_read(addr, MemAttrs::DEFAULT);
-                if self.sp_attr_latch & SPRITE_FLIP_X != 0 {
-                    byte = byte.reverse_bits();
-                }
-                self.sprite_pat_lo[slot] = byte;
-            }
-            7 => {
-                let addr = self.sprite_pattern_addr(scanline, true);
-                let mut byte = self.bus_read(addr, MemAttrs::DEFAULT);
-                if self.sp_attr_latch & SPRITE_FLIP_X != 0 {
-                    byte = byte.reverse_bits();
-                }
-                self.sprite_pat_hi[slot] = byte;
-            }
             _ => {}
         }
     }
@@ -1184,6 +1467,14 @@ impl Engine {
                 }
             }
         }
+        // A `$2006` write reaches `v` on a PPU clock edge, not at the end of
+        // the CPU's cycle — see [`ADDR_WRITE_DELAY_DOTS`].
+        if self.v_delay > 0 {
+            self.v_delay -= 1;
+            if self.v_delay == 0 {
+                self.v = self.v_pending;
+            }
+        }
         let scanline = self.scanline;
         let dot = self.dot;
         let rendering = self.rendering_enabled();
@@ -1231,6 +1522,10 @@ impl Engine {
 
         if rendering && (visible || pre_render) {
             self.render_dot(scanline, dot, visible, pre_render);
+        } else {
+            // Nothing is driving the pipeline's half of the bus, so `$2007`'s
+            // state machine has it to itself — the ordinary case.
+            self.memory_dot(None, scanline);
         }
 
         if visible && (1..=256).contains(&dot) {
@@ -1254,17 +1549,14 @@ impl Engine {
         if dot % 8 == 1 && ((9..=257).contains(&dot) || dot == 329 || dot == 337) {
             self.reload_shifters();
         }
-        if (1..=256).contains(&dot) || (321..=336).contains(&dot) {
-            match dot % 8 {
-                1 => self.fetch_nametable(),
-                3 => self.fetch_attribute(),
-                5 => self.fetch_pattern_low(),
-                7 => self.fetch_pattern_high(),
-                // Coarse X moves at dots 8, 16, ... 256, 328 and 336
-                // (NESdev PPU scrolling).
-                0 => self.increment_coarse_x(),
-                _ => {}
-            }
+        // The memory bus, before anything that moves `v`: the dot-257 fetch
+        // reads through the *old* `v`, one dot before the horizontal reset.
+        self.memory_dot(self.cadence_op(dot), scanline);
+        // Coarse X moves at dots 8, 16, ... 256, 328 and 336 (NESdev PPU
+        // scrolling) — after the read on that dot, which is the high bitplane
+        // of the tile the increment is finishing.
+        if dot % 8 == 0 && ((8..=256).contains(&dot) || dot == 328 || dot == 336) {
+            self.increment_coarse_x();
         }
         if dot == 256 {
             self.increment_y();
@@ -1274,11 +1566,6 @@ impl Engine {
         }
         if pre_render && (280..=304).contains(&dot) {
             self.copy_vertical();
-        }
-        // Two more nametable fetches nobody has found a use for, but which a
-        // mapper counting A12 edges still sees.
-        if dot == 338 || dot == 340 {
-            self.fetch_nametable();
         }
 
         // -- sprites --
@@ -1306,7 +1593,7 @@ impl Engine {
             // OAMADDR is held at zero throughout the sprite fetches
             // ([NESdev PPU registers], OAMADDR).
             self.oam_addr = 0;
-            self.sprite_fetch_dot(dot, scanline);
+            self.sprite_fetch_dot(dot);
         }
     }
 
@@ -1502,20 +1789,38 @@ impl Engine {
             }
             let value = (self.open_bus(debug) & 0xc0) | entry;
             if !debug {
-                self.read_buffer = self.bus_read(addr & 0x2fff, attrs);
+                // Palette RAM is inside the chip, so the *value* is immediate;
+                // the buffer still gets whatever is under the mirror, and it
+                // gets it through the ordinary two-dot access.
+                self.start_data_fetch(addr & 0x2fff, attrs);
                 self.latch.refresh(now, value, 0x3f);
-                self.increment_data_address();
             }
             value
         } else {
             let value = self.read_buffer;
             if !debug {
-                self.read_buffer = self.bus_read(addr, attrs);
+                self.start_data_fetch(addr, attrs);
                 self.latch.refresh(now, value, 0xff);
-                self.increment_data_address();
             }
             value
         }
+    }
+
+    /// Arm the `$2007` state machine to fill the read buffer from `addr`.
+    ///
+    /// The fetch happens four PPU cycles after the CPU's read cycle ends, not
+    /// during it — see [`DATA_SM_START`]. A second `$2007` read arriving before
+    /// the first has fired is not something hardware can produce (the shortest
+    /// `$2007` read is four CPU cycles, twelve dots), so the stale one is just
+    /// completed against its own address rather than modelled.
+    fn start_data_fetch(&mut self, addr: u16, attrs: MemAttrs) {
+        if self.data_sm != 0 {
+            let stale = self.data_sm_addr;
+            self.read_buffer = self.bus_read(stale, attrs);
+            self.increment_data_address();
+        }
+        self.data_sm = DATA_SM_START;
+        self.data_sm_addr = addr;
     }
 
     /// `$2007` moves `v` by 1 or 32 — except while rendering, where it shares
@@ -1581,7 +1886,8 @@ impl Engine {
                 if self.warm() {
                     if self.w {
                         self.t = (self.t & 0xff00) | u16::from(value);
-                        self.v = self.t;
+                        self.v_pending = self.t;
+                        self.v_delay = ADDR_WRITE_DELAY_DOTS;
                     } else {
                         // Bit 14 is cleared by the high write; `t` is 15 bits
                         // but only 14 reach the bus.
@@ -1701,6 +2007,12 @@ impl Engine {
         w.write_u8(self.mask_pending)?;
         w.write_u8(self.mask_delay)?;
         w.write_bool(self.warmup)?;
+        // v3: the board's octal address latch and `$2007`'s state machine.
+        w.write_u8(self.ale_latch)?;
+        w.write_u8(self.data_sm)?;
+        w.write_u16(self.data_sm_addr)?;
+        w.write_u16(self.v_pending)?;
+        w.write_u8(self.v_delay)?;
 
         w.write_seq_len(self.fb.len() as u64)?;
         for pixel in self.fb.iter() {
@@ -1774,6 +2086,11 @@ impl Engine {
         self.mask_pending = r.read_u8()?;
         self.mask_delay = r.read_u8()?;
         self.warmup = r.read_bool()?;
+        self.ale_latch = r.read_u8()?;
+        self.data_sm = r.read_u8()?;
+        self.data_sm_addr = r.read_u16()?;
+        self.v_pending = r.read_u16()?;
+        self.v_delay = r.read_u8()?;
 
         let len = r.read_seq_len(2)? as usize;
         if len != FRAMEBUFFER_LEN {

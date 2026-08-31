@@ -21,6 +21,7 @@
 #
 # ---------------------------------------------------------------------------
 # 2026-08-31: 130 of 141 pass, 11 fail.
+# 2026-09-01: 133 of 141 pass, 8 fail — the PPU address bus closed three.
 # ---------------------------------------------------------------------------
 #
 # The measurement before this one read "81 of 125", through a stale copy of the
@@ -127,17 +128,17 @@
                   # its own documentation.
 
 # ---------------------------------------------------------------------------
-# C. The PPU has no address bus of its own
+# C. The PPU's own address bus
 # ---------------------------------------------------------------------------
 #
-# A 2C02 memory access takes **two** dots: the first drives the address and
-# strobes ALE into an external octal latch, the second performs the read. The
-# engine fetches in one dot and keeps only a data latch, so there is no place
-# for the low eight address bits to be held independently of the high six — and
-# that latch is the entire subject of these four tests. They also want the two
-# garbage nametable fetches inside the sprite-fetch window, the dot-337-340
-# pair, and a `$2007` read buffer filled four dots after the CPU's read ends
-# rather than during it.
+# The 2C02's two-dot access — ALE into the board's octal latch, then the read
+# composed from the top six pins *as they stand on the read dot* and the eight
+# bits the latch is holding — is modelled now, and with it the `$2007` state
+# machine (ALE two PPU cycles after M2 falls, Read two after that), the two
+# garbage nametable fetches inside each sprite slot, the dot-337-340 pair, and
+# the `$2006` write's own two-cycle path to `v`. "$2007 Stress Test",
+# "ALE + Read" and "Hybrid Addresses" all pass. What is left in this group is
+# not about the address bus at all:
 
 8c                # $048C "$2004 Stress Test" code 2: 341 samples, one per dot
                   # of a rendered scanline. The three phases of the OAM read bus
@@ -145,21 +146,6 @@
                   # post-overflow phase alternating the primary read with
                   # secondary OAM every other dot, which the evaluator does not
                   # do.
-8e                # $048E "$2007 Stress Test" code 2: 341 samples again, and the
-                  # ROM lists the four mistakes it is looking for — the read
-                  # buffer filled four PPU cycles after the read ends, two
-                  # nametable fetches in a row during the sprite fetches, the
-                  # same at dots 337-340, and the dummy fetch at dot 257 using
-                  # the *old* `v`. All four need the two-dot access.
-91                # $0491 "ALE + Read" code 2: a `$2007` read whose ALE dot
-                  # collides with a background fetch's read dot. The PPU's
-                  # address register wants `$0F03`, the octal latch still holds
-                  # `$C7` from the previous access, and the read goes to `$0FFF`
-                  # — an address the chip never emitted. Needs the latch.
-92                # $0492 "Hybrid Addresses" code 2: the same latch from the
-                  # other side. A `$2006` write landing on the second dot of a
-                  # fetch composes the high six bits from the *new* `v` and the
-                  # low eight from the latch, reading `$2F19`.
 
 # ---------------------------------------------------------------------------
 # D. Three single-dot questions in the render pipeline

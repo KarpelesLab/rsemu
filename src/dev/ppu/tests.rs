@@ -55,6 +55,17 @@ fn new_ppu_in(region: Region) -> (NesPpu, Arc<RamStore>, Arc<RamStore>) {
     (ppu, chr, nt)
 }
 
+/// Let a register access finish the way a real one does.
+///
+/// A `$2007` read and a `$2006` write are both two-dot-cadence events now — the
+/// read buffer fills four dots after the access and `v` arrives two dots after
+/// it — and the shortest instruction that touches a PPU register takes four CPU
+/// cycles, twelve dots. Tests that assert the *settled* result therefore have
+/// to let those twelve dots run, exactly as the guest does.
+fn settle(ppu: &NesPpu) {
+    ppu.advance_by(12);
+}
+
 /// Put the PPU at `(scanline, dot)` — the position of the dot about to run.
 fn seek(ppu: &NesPpu, scanline: u16, dot: u16) {
     ppu.with_engine(|e| {
@@ -334,11 +345,85 @@ fn the_2007_read_buffer_delays_by_one_access() {
     nt.write_u8(0x000, 0x11).unwrap();
     nt.write_u8(0x001, 0x22).unwrap();
     ppu.write_register(PPUADDR, 0x20);
+    settle(&ppu);
     ppu.write_register(PPUADDR, 0x00);
+    settle(&ppu);
     let dummy = ppu.read_register(PPUDATA);
+    settle(&ppu);
     assert_eq!(dummy, 0x00, "the first read returns the stale buffer");
     assert_eq!(ppu.read_register(PPUDATA), 0x11);
+    settle(&ppu);
     assert_eq!(ppu.read_register(PPUDATA), 0x22);
+}
+
+#[test]
+fn a_2007_read_fills_the_buffer_four_dots_after_the_access() {
+    // The read does not fetch during the CPU's cycle: it starts a latch chain
+    // clocked off the PPU, which raises ALE two PPU cycles after M2 falls and
+    // Read two after that (AccuracyCoin.asm's "PPU DATA State Machine").
+    let (ppu, _, nt) = new_ppu();
+    nt.write_u8(0x000, 0x11).unwrap();
+    ppu.write_register(PPUADDR, 0x20);
+    settle(&ppu);
+    ppu.write_register(PPUADDR, 0x00);
+    settle(&ppu);
+    ppu.read_register(PPUDATA);
+    ppu.advance_by(4);
+    assert_eq!(
+        ppu.with_engine(|e| e.read_buffer),
+        0x00,
+        "the dot ALE landed on and the one after it have run; Read has not"
+    );
+    ppu.advance_by(1);
+    assert_eq!(ppu.with_engine(|e| e.read_buffer), 0x11);
+}
+
+#[test]
+fn a_2006_write_reaches_v_two_dots_after_the_access() {
+    // Same two PPU cycles, on the write path: `t` reaches `v` at *t2*, not at
+    // the end of the CPU's cycle.
+    let (ppu, _, _) = new_ppu();
+    ppu.write_register(PPUADDR, 0x2c);
+    settle(&ppu);
+    ppu.write_register(PPUADDR, 0x19);
+    ppu.advance_by(2);
+    assert_eq!(
+        ppu.with_engine(|e| e.v),
+        0x0000,
+        "not during the CPU's cycle, and not on the dot after it"
+    );
+    ppu.advance_by(1);
+    assert_eq!(ppu.with_engine(|e| e.v), 0x2c19);
+}
+
+#[test]
+fn a_2006_write_between_a_fetch_s_two_dots_makes_a_hybrid_address() {
+    // The 2C02 multiplexes the low eight address bits onto its data pins, so a
+    // fetch is ALE then Read and the low eight live in an octal latch on the
+    // board in between. Move `v` across that gap and the read goes to an
+    // address the chip never emitted: top six from the new `v`, low eight from
+    // the latch the old one strobed. AccuracyCoin's "Hybrid Addresses".
+    let (ppu, _, nt) = new_ppu();
+    nt.write_u8(0xc19, 0xa5).unwrap();
+    ppu.with_engine(|e| {
+        e.mask = MASK_BG;
+        // Coarse X $18; the dot-8 increment carries it to $19, which is what
+        // dot 9 latches — out of nametable $2800, not $2C00.
+        e.v = 0x0818;
+    });
+    seek(&ppu, 0, 8);
+    ppu.write_register(PPUADDR, 0x2c);
+    ppu.with_engine(|e| e.w = true);
+    ppu.write_register(PPUADDR, 0x00);
+    // Dot 8 finishes the previous fetch, dot 9 strobes ALE with the *old* `v`,
+    // and `v` arrives in time for dot 10's read.
+    ppu.advance_by(3);
+    assert_eq!(ppu.with_engine(|e| e.v), 0x2c00);
+    assert_eq!(
+        ppu.with_engine(|e| e.nt_latch),
+        0xa5,
+        "read $2C19: $2C from the new v, $19 from the octal latch"
+    );
 }
 
 #[test]
@@ -349,11 +434,16 @@ fn a_palette_read_is_not_buffered_but_still_fills_the_buffer() {
     nt.write_u8(0xf01, 0x5a).unwrap();
     ppu.poke_palette(0x3f01, 0x21);
     ppu.write_register(PPUADDR, 0x3f);
+    settle(&ppu);
     ppu.write_register(PPUADDR, 0x01);
+    settle(&ppu);
     assert_eq!(ppu.read_register(PPUDATA) & 0x3f, 0x21);
+    settle(&ppu);
     // The next read comes out of the buffer the palette read loaded.
     ppu.write_register(PPUADDR, 0x20);
+    settle(&ppu);
     ppu.write_register(PPUADDR, 0x00);
+    settle(&ppu);
     assert_eq!(ppu.read_register(PPUDATA), 0x5a);
 }
 
@@ -381,7 +471,9 @@ fn the_write_toggle_is_shared_and_2002_clears_it() {
     assert!(!ppu.with_engine(|e| e.w));
     // So this is treated as another *first* write, not the low byte.
     ppu.write_register(PPUADDR, 0x2c);
+    settle(&ppu);
     ppu.write_register(PPUADDR, 0x00);
+    settle(&ppu);
     assert_eq!(ppu.with_engine(|e| e.v), 0x2c00);
 }
 
@@ -447,7 +539,9 @@ fn a_debug_read_of_2007_does_not_advance_the_address() {
     let (ppu, _, nt) = new_ppu();
     nt.write_u8(0, 0x77).unwrap();
     ppu.write_register(PPUADDR, 0x20);
+    settle(&ppu);
     ppu.write_register(PPUADDR, 0x00);
+    settle(&ppu);
     let port = ppu.port();
     let mut byte = [0u8; 1];
     port.read(7, &mut byte, MemAttrs::DEBUG).unwrap();
@@ -520,9 +614,12 @@ fn a_palette_read_reports_the_top_two_bits_as_open_bus() {
     ppu.poke_palette(0x3f00, 0x0f);
     set_mask(&ppu, 0xc0); // charges the latch with $C0
     ppu.write_register(PPUADDR, 0x3f);
+    settle(&ppu);
     ppu.write_register(PPUADDR, 0x00);
+    settle(&ppu);
     // $2006 writes recharged the latch with the last written byte, $00.
     ppu.write_register(PPUSTATUS, 0xc0); // read-only port: latch only
+    settle(&ppu);
     assert_eq!(ppu.read_register(PPUDATA), 0xc0 | 0x0f);
 }
 
