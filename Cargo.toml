@@ -138,6 +138,17 @@ dev-wdc = []
 # dependencies.
 machine-beneater = ["cpu-mos6502", "dev-wdc"]
 
+# The SPI bus (src/bus/spi): the fabric, the peripheral seam, and a generic
+# memory-mapped controller. Models the link **both ways** and makes the choice a
+# machine-description property rather than an accident (docs/buses/low-speed.md):
+# `transactional` hands a whole word to the slave in one call, `wired` drives
+# SCK/MOSI/CS as real wires one edge per half bit period on the scheduler, which
+# is what guest firmware that bit-bangs the same pins through GPIO needs. Covers
+# the four CPOL/CPHA modes, 1-32 bit words, MSB/LSB first, eight chip selects and
+# genuine full duplex. A peripheral implements the word-level `SpiSlave` once and
+# gets the bit-level front end free. `no_std + alloc`, no dependencies.
+bus-spi = []
+
 # The MOS 6502 core (src/cpu/mos6502): a cycle-accurate interpreter with every
 # documented and undocumented opcode, a disassembler generated from the same
 # table, and the RP2A03 (NES) variant selected by a construction property. Adds
