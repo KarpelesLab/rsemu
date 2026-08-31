@@ -1,0 +1,166 @@
+# Ben Eater's 6502 breadboard computer — a 6502, an SRAM, an EEPROM, an ACIA
+# and a VIA, decoded by one quad NAND gate.
+#
+#   rsemu run beneater-6502                 # rsemu's own monitor, RSMON/serial
+#   rsemu run beneater-6502 --rom mine.bin  # or your own 32 KiB image
+#
+# The second machine rsemu ships that a person can type at, and the first one
+# where the console is a *serial port* rather than a keyboard and a display.
+#
+# ---------------------------------------------------------------------------
+# What was verified, and from where
+# ---------------------------------------------------------------------------
+#
+# The memory map below is the published address decoding of that board, not a
+# guess. Written out as chip-select equations, which is what the NAND gate
+# actually computes:
+#
+#   ROM  /CE = A15                      -> $8000-$FFFF, all 32 KiB reachable
+#   RAM  /CE = A15, /OE = A14           -> $0000-$3FFF, 16 KiB of a 32 KiB part
+#   VIA  CS1 = A13, /CS2 = !A15 & A14   -> $6000-$7FFF
+#   ACIA CS0 = !A13, /CS1 = !A15 & A14  -> $4000-$5FFF
+#
+# The ACIA is the later addition and reuses the one spare gate in the original
+# decoder to invert A13, which is why it lands on the *other* half of the I/O
+# window from the VIA and covers a whole 8 KiB. Ben Eater's own listings equate
+# it at $5000 and the VIA at $6000, and both of those are inside the windows
+# above; this file maps the windows, so both spellings work.
+#
+# Neither peripheral decodes more than its own register-select lines — RS0/RS1
+# on the ACIA, RS0-RS3 on the VIA — so each answers over and over throughout
+# its window, which is what `mirror()` says below.
+#
+# Verified against: the published Ben Eater 6502 kit schematics as transcribed
+# in the community write-ups of that build (github.com/meffie/6502, which
+# quotes each chip-select equation, and mike42.me's serial-port write-up for
+# the ACIA gate). Register layouts are from the WDC data sheets, cited by table
+# number in `src/dev/wdc/acia.rs` and `src/dev/wdc/via.rs`.
+#
+# ---------------------------------------------------------------------------
+
+machine "beneater-6502" {
+  # The board has a 32 KiB 62256, and A14 goes to its output enable rather than
+  # to an address pin, so only the low half is ever selected. `-p ram=...` to
+  # change the part; the mapping below is what the decoder allows through.
+  param ram = 32K
+
+  # Which character port the serial line attaches to, so that two of these can
+  # run in one process without typing at each other (`-p console=b`).
+  param console = "console"
+
+  # Whether the serial line runs at its real rate. `-p pace=false` sends every
+  # byte on the store instruction, which is what a test wants.
+  param pace = true
+
+  # Model the W65C51N's transmit erratum: on real WDC silicon the TDRE status
+  # bit is permanently set, so a polling loop never waits and characters are
+  # lost. Off by default — see `src/dev/wdc/acia.rs` for which behaviour is
+  # which and why the *correct* one is the default.
+  param acia_erratum = false
+
+  # -- the two crystals ------------------------------------------------------
+  #
+  # 1 MHz, and it is an integer. Say so, because this is the exception that
+  # shows the rational frequency literal elsewhere is not ceremony: the NES's
+  # master is 236250000/11 Hz and the Apple 1's is 315000000/22 Hz, and writing
+  # either as a whole number of hertz would nail a rounding error into the
+  # timeline (ROADMAP.md §4.2). Here the can really does say 1.000 MHz, so the
+  # literal really is 1000000, and nothing is lost.
+  osc phi2 = 1000000 Hz
+
+  # The ACIA has a crystal of its own — 1.8432 MHz, the standard baud-rate can,
+  # and the frequency the W65C51N data sheet names for XTLI. It is a second
+  # oscillator and not a divisor of the first, which is the physical truth: two
+  # cans on one breadboard have independent tolerances and an arbitrary
+  # power-on phase, so no correct program can depend on their relationship
+  # (ROADMAP.md §4.2).
+  osc baud = 1843200 Hz
+
+  # -- the bus ---------------------------------------------------------------
+  #
+  # A 6502 drives sixteen address lines and this board decodes four of them.
+  # Nothing answers $4000-$5FFF's odd corners or anything the NAND gate leaves
+  # out, and there is no bus-error line for it to answer with: an address
+  # nobody drives leaves the last value on the wire.
+  space cpubus { width = 16, unassigned = open-bus }
+
+  object sram "ram" { size = ram }
+
+  object cpu "cpu.mos6502" {
+    # Straight off the can: one φ2 per crystal cycle, no divider.
+    clock   = phi2
+    space   = cpubus
+    engine  = "interp"
+    decimal = true
+
+    # ---- the part is a W65C02S, and this line is waiting on the core --------
+    #
+    #   variant = "w65c02s"
+    #
+    # The kit ships the CMOS part, and the difference is not cosmetic: Ben
+    # Eater's own `wozmon.bin` contains `3A` (`DEC A`) at $FFF5, inside a
+    # `LDA #$FF / DEC A / BNE -3` delay loop. An NMOS 6502 decodes $3A as an
+    # undocumented `NOP`, so A never changes, Z never sets, and that loop spins
+    # forever — his image cannot boot on an NMOS core, and the failure looks
+    # like a hang rather than like an illegal instruction.
+    #
+    # `cpu.mos6502` has no `variant` property yet; a separate change is adding
+    # one. Until it lands the line above stays commented, because a machine file
+    # that names a property the validator does not know fails to realize and
+    # takes the whole catalog with it. Both monitors rsemu ships for this board
+    # are deliberately NMOS-clean, so everything here runs today.
+    #
+    # When the property exists: uncomment, and the env-gated test in
+    # `src/dev/wdc/tests.rs` that runs Eater's image starts passing.
+  }
+
+  # The serial port. Its clock is the character rate, not the bit rate: the
+  # chip divides its crystal by 96 for 19200 baud (1843200 / 19200), and 8-N-1
+  # is ten bit times per character, so a character is 960 crystal cycles and
+  # the rate is 1920 a second. Exact, because 960 divides the crystal — this is
+  # a ratio *within* the ACIA's own oscillator tree, which is where exactness is
+  # meaningful (ROADMAP.md §4.2).
+  #
+  # The rate is set here rather than derived from the guest's write to the
+  # control register: re-rating a clock domain from a register write is a
+  # `core::clock` feature nothing has needed yet, and this file at least says
+  # so out loud. A guest that programs a different baud rate is believed about
+  # the register and not about the wire.
+  object acia "wdc.w65c51n" {
+    clock   = baud / 960
+    port    = console
+    paced   = pace
+    erratum = acia_erratum
+  }
+
+  # The VIA counts φ2 in both its timers, so it belongs to the CPU's tree and
+  # its relationship to the CPU is exact: a timer loaded with N expires N+1 CPU
+  # cycles later, forever, which is the whole reason a program uses one.
+  object via "wdc.w65c22" { clock = phi2 }
+
+  # 32 KiB of EEPROM holding the program and the 6502's vectors, which is why
+  # the machine boots at all. `rom` names a media slot rather than a file:
+  # whoever runs the machine binds the bytes (`--rom mine.bin`), and nothing
+  # below host/ opens a file.
+  object rom "beneater.rom" { rom = "rom" }
+
+  # -- the memory map --------------------------------------------------------
+  #
+  # 16 KiB, because A14 is the RAM's output enable. The other half of the chip
+  # is on the breadboard and unreachable, which is a fact about the board and
+  # not a limit of this file.
+  map cpubus 0x0000 size 0x4000 = sram
+  map cpubus 0x4000 size 0x2000 = mirror(acia)   # 4 registers, 2048 times over
+  map cpubus 0x6000 size 0x2000 = mirror(via)    # 16 registers, 512 times over
+  map cpubus 0x8000 size 0x8000 = rom
+
+  # Both peripherals have an open-drain IRQB tied to the 6502's IRQB, so this is
+  # a wired-OR: the core takes an active-high request and the net resolves the
+  # fan-in (ROADMAP.md §4.3).
+  wire acia.irq -> cpu.irq
+  wire via.irq  -> cpu.irq
+
+  # Not here, and deliberately: the HD44780 character LCD on the VIA's port
+  # headers, and the NMI button. Neither is needed to boot a monitor and type
+  # at it, and the LCD is a device model rather than a wire.
+}
