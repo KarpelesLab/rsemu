@@ -13,6 +13,17 @@
 //! read-modify-write's write-back of the *old* value is how several mapper
 //! tricks work.
 //!
+//! # Two parts through one interpreter
+//!
+//! [`Config::variant`](super::Config::variant) picks the opcode matrix, and
+//! `Exec::cmos` gates the dozen places where the W65C02S's *bus* differs from
+//! the NMOS part's: the double read in a read-modify-write, the address of an
+//! index fix-up, the sixth cycle of `JMP (abs)`, the decimal correction cycle,
+//! and the D flag on entering an interrupt. They are gated where they happen
+//! rather than collected into a second interpreter, because everything else —
+//! the cycle accounting, the interrupt sampling, the stack, the branches — is
+//! the same machine and duplicating it would be duplicating the bugs too.
+//!
 //! # Interrupt sampling
 //!
 //! NESdev's *CPU interrupts* page is precise about when the lines are looked
@@ -45,7 +56,7 @@
 use crate::core::space::{AddressSpace, MemAttrs};
 use crate::core::value::Width;
 
-use super::isa::{Access, Insn, Mode, Op, decode};
+use super::isa::{Access, BitOp, Insn, Mode, Op, decode_as};
 use super::{Config, Interrupt, Lines, Regs, flags};
 
 /// Where the interrupt sequence was entered from.
@@ -83,8 +94,13 @@ pub(super) struct State {
     pub regs: Regs,
     /// Bus cycles executed since power-on.
     pub cycles: u64,
-    /// Set by `JAM`: the CPU is frozen until reset.
+    /// Set by `JAM` on the NMOS part and by `STP` on the CMOS one: the CPU is
+    /// frozen until reset.
     pub halted: bool,
+    /// Set by the CMOS `WAI`: the part has stopped and is waiting for an
+    /// interrupt line, which is not the same as halted — any interrupt
+    /// releases it, and `/RES` is not required.
+    pub waiting: bool,
     /// A reset was requested and its 7-cycle sequence has not run yet.
     pub reset_pending: bool,
     /// What the last poll latched, serviced before the next instruction.
@@ -117,6 +133,7 @@ impl State {
             regs: Regs::new(),
             cycles: 0,
             halted: false,
+            waiting: false,
             reset_pending: true,
             pending: None,
             open_bus: 0,
@@ -137,6 +154,10 @@ pub(super) struct Exec<'a> {
     cfg: &'a Config,
     lines: &'a Lines,
     attrs: MemAttrs,
+    /// Whether this is the CMOS part. Read on nearly every cycle, so it is
+    /// hoisted out of [`Config`] once per instruction rather than matched on a
+    /// variant each time.
+    cmos: bool,
     /// Cycles into the current instruction. Cycle 0 is the opcode fetch, whose
     /// poll belonged to the previous instruction.
     icycle: u32,
@@ -164,6 +185,7 @@ impl<'a> Exec<'a> {
             cfg,
             lines,
             attrs,
+            cmos: cfg.variant.is_cmos(),
             icycle: 0,
             skip_poll: false,
             polling: true,
@@ -180,6 +202,11 @@ impl<'a> Exec<'a> {
             self.reset_sequence();
         } else if self.state.halted {
             return 0;
+        } else if self.state.waiting && !self.wake() {
+            // `WAI` stops the part with RDY low: no bus cycle is initiated, but
+            // time still passes, and a scheduler that saw zero cycles would
+            // treat the machine as dead instead of merely idle.
+            self.stall();
         } else if let Some(kind) = self.state.pending.take() {
             self.polling = false;
             let source = match kind {
@@ -214,6 +241,42 @@ impl<'a> Exec<'a> {
         self.icycle += 1;
         self.used += 1;
         self.state.cycles = self.state.cycles.wrapping_add(1);
+    }
+
+    /// Charge a cycle that makes no bus access.
+    ///
+    /// The only one in this interpreter, and it exists because a `WAI`ing
+    /// W65C02S really does stop driving the bus without stopping the clock.
+    /// Nothing else may use it: a cycle that is not an access is a cycle a
+    /// device cannot see, which is exactly what the rest of this file is built
+    /// to avoid.
+    fn stall(&mut self) {
+        self.icycle += 1;
+        self.used += 1;
+        self.state.cycles = self.state.cycles.wrapping_add(1);
+    }
+
+    /// Whether an interrupt line has released a `WAI`, latching what to do next.
+    ///
+    /// The W65C02S wakes on IRQ **even when I masks it** (datasheet, `WAI`):
+    /// what the mask decides is whether the handler runs or execution simply
+    /// continues at the instruction after the `WAI`. A reset does not come
+    /// through here — it is checked before this, and clears the flag itself.
+    fn wake(&mut self) -> bool {
+        let nmi = self.lines.nmi_pending();
+        let irq = self.lines.irq_asserted();
+        if !nmi && !irq {
+            return false;
+        }
+        self.state.waiting = false;
+        self.state.pending = if nmi {
+            Some(Interrupt::Nmi)
+        } else if !self.flag(flags::I) {
+            Some(Interrupt::Irq)
+        } else {
+            None
+        };
+        true
     }
 
     /// Latch what the interrupt lines say right now.
@@ -352,6 +415,13 @@ impl<'a> Exec<'a> {
         };
         self.push(pushed);
         self.set_flag(flags::I, true);
+        if self.cmos {
+            // The CMOS part clears D on entering an interrupt, so a handler no
+            // longer has to open with CLD to be safe (W65C02S datasheet). The
+            // *pushed* byte still carries the old D, which is why this happens
+            // after the push and not before.
+            self.set_flag(flags::D, false);
+        }
 
         let lo = self.read(vector);
         let hi = self.read(vector.wrapping_add(1));
@@ -366,6 +436,7 @@ impl<'a> Exec<'a> {
         self.polling = false;
         self.state.reset_pending = false;
         self.state.halted = false;
+        self.state.waiting = false;
         self.state.pending = None;
         let pc = self.state.regs.pc;
         self.read(pc);
@@ -375,6 +446,11 @@ impl<'a> Exec<'a> {
             self.state.regs.s = self.state.regs.s.wrapping_sub(1);
         }
         self.state.regs.p |= flags::U | flags::I;
+        if self.cmos {
+            // Reset clears D on the CMOS part too; on the NMOS one D comes up
+            // undefined and software is expected to CLD.
+            self.state.regs.p &= !flags::D;
+        }
         let lo = self.read(RESET_VECTOR);
         let hi = self.read(RESET_VECTOR.wrapping_add(1));
         self.state.regs.pc = u16::from(lo) | (u16::from(hi) << 8);
@@ -386,7 +462,16 @@ impl<'a> Exec<'a> {
 
     fn instruction(&mut self) {
         let opcode = self.fetch();
-        let insn = decode(opcode);
+        let insn = decode_as(self.cfg.variant, opcode);
+        if let Some(bit) = insn.op.bit_op() {
+            // RMB/SMB are ordinary read-modify-writes and fall through to
+            // `operate`; BBR/BBS are branches with a memory test in front and
+            // need their own sequence.
+            if matches!(bit, BitOp::BranchClear(_) | BitOp::BranchSet(_)) {
+                self.bit_branch(bit);
+                return;
+            }
+        }
         match insn.op {
             Op::BRK => {
                 // The signature byte is fetched and discarded; PC advances
@@ -398,29 +483,42 @@ impl<'a> Exec<'a> {
             Op::JSR => self.jsr(),
             Op::RTS => self.rts(),
             Op::RTI => self.rti(),
-            Op::PHA | Op::PHP => self.push_insn(insn.op),
-            Op::PLA | Op::PLP => self.pull_insn(insn.op),
+            Op::PHA | Op::PHP | Op::PHX | Op::PHY => self.push_insn(insn.op),
+            Op::PLA | Op::PLP | Op::PLX | Op::PLY => self.pull_insn(insn.op),
             Op::JMP => self.jmp(insn.mode),
             Op::JAM => self.jam(),
-            Op::BPL | Op::BMI | Op::BVC | Op::BVS | Op::BCC | Op::BCS | Op::BNE | Op::BEQ => {
-                self.branch(insn.op);
-            }
+            Op::STP => self.stp(),
+            Op::WAI => self.wai(),
+            op if op.is_branch() => self.branch(op),
             _ => self.operate(insn),
         }
     }
 
     /// The generic path: resolve the operand, then act on it.
     fn operate(&mut self, insn: Insn) {
-        let loc = self.resolve(insn.mode, insn.access);
+        let loc = self.resolve(insn);
         match insn.access {
-            Access::None => self.implied(insn.op, insn.mode),
+            Access::None => self.implied(insn),
             Access::Read => {
                 let value = if insn.mode == Mode::Immediate {
                     loc.immediate
                 } else {
                     self.read(loc.addr)
                 };
-                self.read_op(insn.op, value);
+                if self.cmos && matches!(insn.op, Op::ADC | Op::SBC) && self.decimal() {
+                    // Decimal ADC and SBC cost one more cycle on the CMOS part,
+                    // which is the price of the corrected N and Z (W65C02S
+                    // datasheet, table 7-1 note). It is spent re-reading the
+                    // operand; for an immediate that is the byte after the
+                    // opcode, the last one the instruction fetched.
+                    let at = if insn.mode == Mode::Immediate {
+                        self.state.regs.pc.wrapping_sub(1)
+                    } else {
+                        loc.addr
+                    };
+                    self.read(at);
+                }
+                self.read_op(insn, value);
             }
             Access::Write => {
                 let (addr, value) = self.write_op(insn.op, loc);
@@ -428,10 +526,16 @@ impl<'a> Exec<'a> {
             }
             Access::Modify => {
                 let old = self.read(loc.addr);
-                // The NMOS part writes the unmodified byte back before the
-                // real write. Two writes, both on the bus, and the first one
-                // is what makes `INC $2002`-style tricks work.
-                self.write(loc.addr, old);
+                if self.cmos {
+                    // Where the NMOS part writes the unmodified byte back, the
+                    // CMOS one reads the address a second time. Both are on the
+                    // bus and both are load-bearing: the NMOS double write is
+                    // what makes `INC $2002` tricks work, and the CMOS double
+                    // read is why they do not port.
+                    self.read(loc.addr);
+                } else {
+                    self.write(loc.addr, old);
+                }
                 let new = self.modify_op(insn.op, old);
                 self.write(loc.addr, new);
             }
@@ -442,9 +546,12 @@ impl<'a> Exec<'a> {
     // Addressing
     // -----------------------------------------------------------------
 
-    fn resolve(&mut self, mode: Mode, access: Access) -> Located {
+    fn resolve(&mut self, insn: Insn) -> Located {
+        let mode = insn.mode;
         let mut out = Located::default();
         match mode {
+            // One byte, one cycle: the opcode fetch was the whole instruction.
+            Mode::Single => {}
             Mode::Implied | Mode::Accumulator => {
                 // The dummy read of the byte after the opcode, which PC does
                 // not advance over.
@@ -484,7 +591,16 @@ impl<'a> Exec<'a> {
                     self.state.regs.y
                 };
                 out.base_hi = hi;
-                out.addr = self.index(base, index, access, &mut out.crossed);
+                out.addr = self.index(base, index, insn, &mut out.crossed);
+            }
+            Mode::ZeroPageIndirect => {
+                // The CMOS addition the NMOS ALU group never had: a page-zero
+                // pointer with no index at either end.
+                let ptr = self.fetch();
+                let lo = self.read(u16::from(ptr));
+                let hi = self.read(u16::from(ptr.wrapping_add(1)));
+                out.base_hi = hi;
+                out.addr = u16::from(lo) | (u16::from(hi) << 8);
             }
             Mode::IndirectX => {
                 let ptr = self.fetch();
@@ -502,9 +618,13 @@ impl<'a> Exec<'a> {
                 let hi = self.read(u16::from(ptr.wrapping_add(1)));
                 let base = u16::from(lo) | (u16::from(hi) << 8);
                 out.base_hi = hi;
-                out.addr = self.index(base, self.state.regs.y, access, &mut out.crossed);
+                out.addr = self.index(base, self.state.regs.y, insn, &mut out.crossed);
             }
-            Mode::Relative | Mode::Indirect | Mode::Break => {
+            Mode::Relative
+            | Mode::Indirect
+            | Mode::AbsoluteIndirectX
+            | Mode::ZeroPageRelative
+            | Mode::Break => {
                 debug_assert!(false, "{mode:?} is resolved by its own handler");
             }
         }
@@ -518,14 +638,32 @@ impl<'a> Exec<'a> {
     /// cycle. A *read* pays only when the carry happens; a write or a
     /// read-modify-write always spends the cycle, because the CPU cannot know
     /// in advance whether it will need it and must not write to the unfixed
-    /// address. The dummy access lands on that unfixed address, which is why
-    /// `STA $20ff,X` touches `$2000`-page hardware.
-    fn index(&mut self, base: u16, index: u8, access: Access, crossed: &mut bool) -> u16 {
+    /// address. On the NMOS part the dummy access lands on that unfixed
+    /// address, which is why `STA $20ff,X` touches `$2000`-page hardware; the
+    /// CMOS part re-reads its own last operand byte instead, and pays the cycle
+    /// in fewer cases.
+    fn index(&mut self, base: u16, index: u8, insn: Insn, crossed: &mut bool) -> u16 {
         let addr = base.wrapping_add(u16::from(index));
         *crossed = (addr & 0xff00) != (base & 0xff00);
-        if *crossed || access != Access::Read {
-            let unfixed = (base & 0xff00) | (addr & 0x00ff);
-            self.read(unfixed);
+        let always = match insn.access {
+            Access::Read | Access::None => false,
+            Access::Write => true,
+            // The CMOS part shortened the indexed shifts to six cycles when the
+            // index does not carry, but left INC and DEC at seven (W65C02S
+            // datasheet, table 7-1). The NMOS part always spends the cycle.
+            Access::Modify => !self.cmos || matches!(insn.op, Op::INC | Op::DEC),
+        };
+        if *crossed || always {
+            let at = if self.cmos {
+                // The CMOS part re-reads the instruction's last operand byte
+                // rather than driving the unfixed address, which is why
+                // `STA $20ff,X` no longer pokes `$2000`-page hardware on its
+                // way past. PC is already sitting after the operands.
+                self.state.regs.pc.wrapping_sub(1)
+            } else {
+                (base & 0xff00) | (addr & 0x00ff)
+            };
+            self.read(at);
         }
         addr
     }
@@ -535,7 +673,8 @@ impl<'a> Exec<'a> {
     // -----------------------------------------------------------------
 
     /// Implied and accumulator-mode instructions, after their dummy read.
-    fn implied(&mut self, op: Op, mode: Mode) {
+    fn implied(&mut self, insn: Insn) {
+        let (op, mode) = (insn.op, insn.mode);
         let regs = self.state.regs;
         match op {
             Op::CLC => self.set_flag(flags::C, false),
@@ -590,7 +729,27 @@ impl<'a> Exec<'a> {
             // The one transfer that sets no flags, because S is not a data
             // register.
             Op::TXS => self.state.regs.s = regs.x,
-            Op::NOP => {}
+            // The CMOS three-byte NOPs ($5c, $dc, $fc) spend a fourth cycle
+            // re-reading their last operand byte; the one-byte, one-cycle ones
+            // ($x3, $xB) spend nothing at all, and `NOP` proper is the two
+            // cycles `resolve` already charged.
+            Op::NOP => {
+                if mode == Mode::Absolute {
+                    let at = self.state.regs.pc.wrapping_sub(1);
+                    self.read(at);
+                }
+            }
+            // CMOS only: the accumulator finally gets the increment and the
+            // decrement the index registers always had.
+            Op::INC | Op::DEC if mode == Mode::Accumulator => {
+                let v = if op == Op::INC {
+                    regs.a.wrapping_add(1)
+                } else {
+                    regs.a.wrapping_sub(1)
+                };
+                self.state.regs.a = v;
+                self.set_nz(v);
+            }
             Op::ASL | Op::LSR | Op::ROL | Op::ROR => {
                 debug_assert_eq!(mode, Mode::Accumulator);
                 let v = self.shift(op, regs.a);
@@ -601,7 +760,8 @@ impl<'a> Exec<'a> {
     }
 
     /// Instructions that read one byte.
-    fn read_op(&mut self, op: Op, value: u8) {
+    fn read_op(&mut self, insn: Insn, value: u8) {
+        let op = insn.op;
         let a = self.state.regs.a;
         match op {
             Op::LDA => {
@@ -651,8 +811,14 @@ impl<'a> Exec<'a> {
                 // Z from the AND, but N and V straight out of the operand's
                 // top two bits — the only instruction that does this.
                 self.set_flag(flags::Z, a & value == 0);
-                self.set_flag(flags::N, value & 0x80 != 0);
-                self.set_flag(flags::V, value & 0x40 != 0);
+                // Except in the CMOS immediate form, which touches Z alone:
+                // there is no memory byte whose top two bits could reach N and
+                // V, and BIT # exists to test a mask without disturbing them
+                // (W65C02S datasheet).
+                if insn.mode != Mode::Immediate {
+                    self.set_flag(flags::N, value & 0x80 != 0);
+                    self.set_flag(flags::V, value & 0x40 != 0);
+                }
             }
             Op::NOP => {}
             Op::ANC => {
@@ -715,6 +881,7 @@ impl<'a> Exec<'a> {
             Op::STA => (loc.addr, regs.a),
             Op::STX => (loc.addr, regs.x),
             Op::STY => (loc.addr, regs.y),
+            Op::STZ => (loc.addr, 0),
             Op::SAX => (loc.addr, regs.a & regs.x),
             Op::SHA => self.unstable_store(regs.a & regs.x, loc),
             Op::SHX => self.unstable_store(regs.x, loc),
@@ -752,6 +919,18 @@ impl<'a> Exec<'a> {
 
     /// Read-modify-write instructions, given the byte just read.
     fn modify_op(&mut self, op: Op, value: u8) -> u8 {
+        if let Some(bit) = op.bit_op() {
+            // `RMB<n>` and `SMB<n>` set or clear one bit and touch no flag at
+            // all — the only read-modify-writes in the family that do not.
+            return match bit {
+                BitOp::Reset(_) => value & !bit.mask(),
+                BitOp::Set(_) => value | bit.mask(),
+                other => {
+                    debug_assert!(false, "{other:?} branches, it does not modify");
+                    value
+                }
+            };
+        }
         match op {
             Op::ASL | Op::LSR | Op::ROL | Op::ROR => self.shift(op, value),
             Op::INC => {
@@ -763,6 +942,15 @@ impl<'a> Exec<'a> {
                 let v = value.wrapping_sub(1);
                 self.set_nz(v);
                 v
+            }
+            // `TSB` and `TRB` set or clear the bits the accumulator selects and
+            // report, in Z alone, whether any of them were already set. Not a
+            // `BIT`: N and V are untouched, because the test is of the mask
+            // rather than of the byte (W65C02S datasheet).
+            Op::TSB | Op::TRB => {
+                let a = self.state.regs.a;
+                self.set_flag(flags::Z, a & value == 0);
+                if op == Op::TSB { value | a } else { value & !a }
             }
             // The combined ones: shift the memory operand, then fold it into
             // the accumulator. Both halves set their own flags, the second
@@ -860,7 +1048,15 @@ impl<'a> Exec<'a> {
                 sum += 0x60;
             }
             self.set_flag(flags::C, sum >= 0x100);
-            self.state.regs.a = sum as u8;
+            let result = sum as u8;
+            self.state.regs.a = result;
+            if self.cmos {
+                // The CMOS adder latches its flags after the decimal
+                // correction, so N and Z describe the answer instead of an
+                // intermediate the NMOS part happened to expose. V still comes
+                // out of the binary adder, which is what it always measured.
+                self.set_nz(result);
+            }
         } else {
             let result = binary as u8;
             self.set_flag(flags::C, binary > 0xff);
@@ -888,7 +1084,27 @@ impl<'a> Exec<'a> {
         self.set_flag(flags::V, ((a ^ m) & (a ^ result) & 0x80) != 0);
         self.set_nz(result);
 
-        self.state.regs.a = if self.decimal() {
+        if !self.decimal() {
+            self.state.regs.a = result;
+            return;
+        }
+
+        let corrected = if self.cmos {
+            // The CMOS subtractor takes the binary difference and applies both
+            // corrections to *it*, rather than correcting nibble by nibble on
+            // the way. The two agree on every valid BCD pair and disagree on
+            // the rest — `$10 - $fc` is `$ae` here and `$be` on an NMOS part
+            // (Clark, "Decimal mode in the 6502", the 65C02 sequences).
+            let low = i32::from(a & 0x0f) - i32::from(m & 0x0f) - borrow;
+            let mut out = binary;
+            if out < 0 {
+                out -= 0x60;
+            }
+            if low < 0 {
+                out -= 0x06;
+            }
+            out as u8
+        } else {
             let mut low = i32::from(a & 0x0f) - i32::from(m & 0x0f) - borrow;
             if low < 0 {
                 low = ((low - 0x06) & 0x0f) - 0x10;
@@ -898,9 +1114,12 @@ impl<'a> Exec<'a> {
                 sum -= 0x60;
             }
             sum as u8
-        } else {
-            result
         };
+        self.state.regs.a = corrected;
+        if self.cmos {
+            // As with ADC: the corrected value is what reaches the flag logic.
+            self.set_nz(corrected);
+        }
     }
 
     /// Compare a register against memory: a subtract that keeps only flags.
@@ -969,6 +1188,9 @@ impl<'a> Exec<'a> {
             Op::BCS => self.flag(flags::C),
             Op::BNE => !self.flag(flags::Z),
             Op::BEQ => self.flag(flags::Z),
+            // CMOS only, and the reason it exists: a relative JMP that costs
+            // three cycles and two bytes instead of three and three.
+            Op::BRA => true,
             other => {
                 debug_assert!(false, "{other:?} is not a branch");
                 false
@@ -997,6 +1219,66 @@ impl<'a> Exec<'a> {
         self.state.regs.pc = target;
     }
 
+    /// `BBR<n>` and `BBS<n>`: test one bit of a page-zero byte, then branch.
+    ///
+    /// Five cycles, six when taken, seven when the branch also crosses a page.
+    /// The page-zero byte is read *twice* — these share the read-modify-write
+    /// datapath even though they write nothing back — and the page-cross fix-up
+    /// repeats the read at PC rather than reaching for the half-fixed address
+    /// an ordinary branch drives. Both are on the bus (W65C02S datasheet).
+    fn bit_branch(&mut self, bit: BitOp) {
+        let zp = u16::from(self.fetch());
+        let value = self.read(zp);
+        self.read(zp);
+        let offset = self.fetch();
+        let taken = match bit {
+            BitOp::BranchClear(_) => value & bit.mask() == 0,
+            BitOp::BranchSet(_) => value & bit.mask() != 0,
+            other => {
+                debug_assert!(false, "{other:?} modifies, it does not branch");
+                false
+            }
+        };
+        if !taken {
+            return;
+        }
+        self.skip_poll = true;
+        let pc = self.state.regs.pc;
+        self.read(pc);
+        let target = pc.wrapping_add(offset as i8 as u16);
+        if (target & 0xff00) != (pc & 0xff00) {
+            self.read(pc);
+        }
+        self.state.regs.pc = target;
+    }
+
+    /// `STP`: stop the oscillator until `/RES`.
+    ///
+    /// Three cycles, then nothing at all — not even the jammed bus pattern a
+    /// `JAM` leaves behind, because a stopped clock has no cycles to spend. The
+    /// caller has to notice [`State::halted`]; only a reset clears it.
+    fn stp(&mut self) {
+        let pc = self.state.regs.pc;
+        self.read(pc);
+        self.read(pc);
+        self.state.halted = true;
+    }
+
+    /// `WAI`: stop until an interrupt line moves.
+    ///
+    /// Three cycles, then the part stalls with RDY low. Unlike `STP` this is
+    /// not a halt: any interrupt releases it, and whether the handler then runs
+    /// is the I flag's business rather than the instruction's — see
+    /// [`Exec::wake`]. The point of it is to answer an interrupt in a bounded
+    /// number of cycles instead of whenever the current instruction happens to
+    /// finish (W65C02S datasheet).
+    fn wai(&mut self) {
+        let pc = self.state.regs.pc;
+        self.read(pc);
+        self.read(pc);
+        self.state.waiting = true;
+    }
+
     fn jmp(&mut self, mode: Mode) {
         let lo = self.fetch();
         let hi = self.fetch();
@@ -1010,6 +1292,26 @@ impl<'a> Exec<'a> {
                 // $1000. Faithfully reproduced — software depends on it.
                 let wrapped = (ptr & 0xff00) | u16::from((ptr as u8).wrapping_add(1));
                 let target_hi = self.read(wrapped);
+                if self.cmos {
+                    // The CMOS part makes the same wrong access and then spends
+                    // a sixth cycle reading the right one, which is how the bug
+                    // got fixed without the addressing hardware learning to
+                    // carry: the second read wins.
+                    let fixed = self.read(ptr.wrapping_add(1));
+                    u16::from(target_lo) | (u16::from(fixed) << 8)
+                } else {
+                    u16::from(target_lo) | (u16::from(target_hi) << 8)
+                }
+            }
+            Mode::AbsoluteIndirectX => {
+                // The fix-up cycle re-reads the *first* operand byte, not the
+                // last one every other indexed mode goes back to. PC is sitting
+                // after both operands.
+                let at = self.state.regs.pc.wrapping_sub(2);
+                self.read(at);
+                let at = ptr.wrapping_add(u16::from(self.state.regs.x));
+                let target_lo = self.read(at);
+                let target_hi = self.read(at.wrapping_add(1));
                 u16::from(target_lo) | (u16::from(target_hi) << 8)
             }
             other => {
@@ -1062,6 +1364,8 @@ impl<'a> Exec<'a> {
         self.read(pc);
         let value = match op {
             Op::PHA => self.state.regs.a,
+            Op::PHX => self.state.regs.x,
+            Op::PHY => self.state.regs.y,
             _ => self.state.regs.p | flags::B | flags::U,
         };
         self.push(value);
@@ -1075,6 +1379,14 @@ impl<'a> Exec<'a> {
         match op {
             Op::PLA => {
                 self.state.regs.a = value;
+                self.set_nz(value);
+            }
+            Op::PLX => {
+                self.state.regs.x = value;
+                self.set_nz(value);
+            }
+            Op::PLY => {
+                self.state.regs.y = value;
                 self.set_nz(value);
             }
             // Like CLI and SEI, this lands after the final cycle's poll, so a

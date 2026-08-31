@@ -1,9 +1,40 @@
 //! The MOS 6502 and its relatives — a cycle-accurate interpreter.
 //!
-//! Covers the NMOS 6502 and the Ricoh RP2A03/RP2A07 in the NES, which is the
-//! same core with decimal mode disabled. All 256 opcodes are implemented,
-//! undocumented ones included, because real software depends on them
-//! (`docs/cpu/6502.md`).
+//! Covers three parts, chosen by [`Config::variant`] rather than by a build
+//! flag, because one binary has to be able to run a NES and an Apple 1 and a
+//! breadboard 65C02 at once:
+//!
+//! | [`Variant`] | Part | What is different |
+//! | --- | --- | --- |
+//! | `Nmos6502` | MOS 6502 | The baseline, undocumented opcodes included |
+//! | `Ricoh2A03` | Ricoh RP2A03/RP2A07 (NES) | The same die with the BCD adder removed |
+//! | `Wdc65C02` | WDC W65C02S | The CMOS successor: a different opcode matrix and a different bus |
+//!
+//! All 256 opcodes are implemented on both matrices — the undocumented NMOS
+//! ones because real software depends on them, and the CMOS leftovers because
+//! WDC specified them (`docs/cpu/6502.md`).
+//!
+//! # What the CMOS part changes
+//!
+//! More than the new instructions people remember it for. `BRA`, `PHX`/`PHY`/
+//! `PLX`/`PLY`, `STZ`, `TRB`/`TSB`, `INC A`/`DEC A` and the Rockwell bit group
+//! (`RMB`/`SMB`/`BBR`/`BBS`) are the visible half; the rest is bus-visible and
+//! catches emulators out:
+//!
+//! - a read-modify-write does a **double read**, not the NMOS double write;
+//! - the index fix-up cycle re-reads the instruction's last operand byte
+//!   instead of driving the unfixed address, so `STA $20ff,X` no longer pokes
+//!   `$2000`-page hardware on its way past;
+//! - `JMP ($xxff)` no longer wraps inside the page, at the cost of a cycle;
+//! - decimal `ADC`/`SBC` cost a cycle and set **N** and **Z** correctly, and
+//!   `SBC` disagrees with the NMOS part on operands that are not valid BCD;
+//! - an interrupt clears **D**;
+//! - every unused encoding is a NOP of a *specified* length — `$5c` is three
+//!   bytes and four cycles, `$03` is one byte and **one** cycle.
+//!
+//! `WAI` and `STP` are implemented: `STP` halts like a `JAM` and only `/RES`
+//! clears it; `WAI` stalls the part, charging a cycle at a time without a bus
+//! access, until an interrupt line moves.
 //!
 //! # What "cycle-accurate" means here
 //!
@@ -65,9 +96,12 @@ pub mod isa;
 mod tests;
 
 // The conformance runner reads a downloaded corpus off the filesystem, so it
-// exists only where there is one (`ROADMAP.md` §12).
+// exists only where there is one (`ROADMAP.md` §12). Same for the Wozmon
+// acceptance test, which needs a third-party ROM this repository does not ship.
 #[cfg(all(test, feature = "std"))]
 mod conformance;
+#[cfg(all(test, feature = "std"))]
+mod wozmon;
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -89,6 +123,7 @@ use crate::core::value::Width;
 use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink};
 
 use exec::{Exec, State};
+pub use isa::Variant;
 
 /// The processor status bits.
 ///
@@ -268,6 +303,13 @@ pub enum Interrupt {
 /// two values (`docs/cpu/6502.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
+    /// Which member of the family this is.
+    ///
+    /// Selects the opcode matrix and the handful of bus and arithmetic
+    /// behaviours the CMOS part changed. Orthogonal to
+    /// [`decimal`](Config::decimal) on purpose: "has a BCD adder" and "is a
+    /// W65C02S" are different facts, and the RP2A03 is the case that proves it.
+    pub variant: Variant,
     /// Whether the part implements decimal mode.
     ///
     /// True on a MOS 6502; **false on the NES's RP2A03**, whose BCD adder was
@@ -289,6 +331,7 @@ pub struct Config {
 impl Config {
     /// A plain NMOS 6502: decimal mode present.
     pub const NMOS_6502: Config = Config {
+        variant: Variant::Nmos6502,
         decimal: true,
         magic: 0xee,
         requester: RequesterId::ANONYMOUS,
@@ -296,9 +339,26 @@ impl Config {
 
     /// The Ricoh RP2A03 in the NES: the same core without decimal mode.
     pub const RP2A03: Config = Config {
+        variant: Variant::Ricoh2A03,
         decimal: false,
         ..Config::NMOS_6502
     };
+
+    /// The WDC W65C02S: the CMOS part, decimal mode present and *correct*.
+    ///
+    /// `magic` is carried along but means nothing here — the unstable opcodes
+    /// it feeds do not exist on this part.
+    pub const W65C02S: Config = Config {
+        variant: Variant::Wdc65C02,
+        ..Config::NMOS_6502
+    };
+
+    /// Same configuration, as a different part.
+    #[must_use]
+    pub const fn with_variant(mut self, variant: Variant) -> Self {
+        self.variant = variant;
+        self
+    }
 
     /// Same configuration, with a different requester id.
     #[must_use]
@@ -510,7 +570,12 @@ impl Mos6502 {
     /// silently ignored is an afternoon lost.
     pub fn from_props(props: &Props) -> Result<Mos6502> {
         let mut r = props.reader();
-        let decimal = r.or("decimal", true)?;
+        let variant = r.or_enum("variant", "6502", &["6502", "2a03", "65c02"])?;
+        let variant = Variant::from_name(variant).expect("the enum listed above");
+        // Decimal mode defaults from the part — the RP2A03 has no BCD adder —
+        // but stays independently settable, because a board can be wrong about
+        // its own chip and a test wants to say so.
+        let decimal = r.or("decimal", variant != Variant::Ricoh2A03)?;
         let magic = r.or_range("magic", 0xeeu64, 0..=0xff)?;
         // Accepted, and for now only one value is: `ROADMAP.md` §5's example
         // writes `engine = "interp"`, and the IR frontend is phase 5. Rejecting
@@ -519,6 +584,7 @@ impl Mos6502 {
         let _ = r.or_enum("engine", "interp", &["interp"])?;
         r.finish()?;
         Ok(Mos6502::new(Config {
+            variant,
             decimal,
             magic: magic as u8,
             requester: RequesterId::ANONYMOUS,
@@ -575,14 +641,26 @@ impl Mos6502 {
         self.session.lock().state.cycles
     }
 
-    /// Whether a `JAM` opcode has frozen the core.
+    /// Whether a `JAM` (NMOS) or `STP` (CMOS) opcode has frozen the core.
     ///
-    /// A jammed 6502 stops fetching until reset. [`step`](Mos6502::step)
-    /// returns zero cycles once this is true, so a scheduler must notice it
-    /// rather than spin.
+    /// A jammed 6502 stops fetching and a stopped W65C02S stops its oscillator;
+    /// either way [`step`](Mos6502::step) returns zero cycles once this is
+    /// true, so a scheduler must notice it rather than spin. Only a reset
+    /// clears it.
     #[must_use]
     pub fn is_halted(&self) -> bool {
         self.session.lock().state.halted
+    }
+
+    /// Whether a CMOS `WAI` has stalled the core.
+    ///
+    /// Not the same as halted: the part is still clocked, [`step`](Mos6502::step)
+    /// keeps charging one cycle at a time, and any interrupt — or a reset —
+    /// releases it. Always false on an NMOS part, which has no such
+    /// instruction.
+    #[must_use]
+    pub fn is_waiting(&self) -> bool {
+        self.session.lock().state.waiting
     }
 
     /// Whether a reset sequence is still owed.
@@ -671,6 +749,7 @@ impl Mos6502 {
         if self.lines.take_reset_request() {
             state.reset_pending = true;
             state.halted = false;
+            state.waiting = false;
             state.pending = None;
         }
         let Some(space) = space.clone() else {
@@ -755,7 +834,7 @@ impl Mos6502 {
         let Some(space) = self.space() else {
             return Vec::new();
         };
-        disasm::disassemble_run(pc, count, |addr| {
+        disasm::disassemble_run_as(self.cfg.variant, pc, count, |addr| {
             space
                 .read(u64::from(addr), Width::U8, MemAttrs::DEBUG)
                 .ok()
@@ -767,11 +846,18 @@ impl Mos6502 {
 /// The `cpu.mos6502` device class.
 pub static CLASS: DeviceClass = DeviceClass {
     name: "cpu.mos6502",
-    // v2 added the cycle debt `run_budget` carries between quanta and the
-    // latched `/RES` request; v1 snapshots predate any released build.
-    version: 2,
-    summary: "MOS 6502 / Ricoh RP2A03 8-bit CPU core, cycle-accurate interpreter",
+    // v3 added the CMOS `WAI` stall flag; v2 added the cycle debt
+    // `run_budget` carries between quanta and the latched `/RES` request; v1
+    // snapshots predate any released build.
+    version: 3,
+    summary: "MOS 6502 / RP2A03 / W65C02S 8-bit CPU core, cycle-accurate interpreter",
     properties: &[
+        PropertySpec {
+            name: "variant",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "which part: `6502` (default), `2a03` for the NES, or `65c02`",
+        },
         PropertySpec {
             name: "decimal",
             kind: ValueKind::Bool,
@@ -876,6 +962,7 @@ impl Device for Mos6502 {
             // values, and only the sequence's own effects apply.
             session.state.reset_pending = true;
             session.state.halted = false;
+            session.state.waiting = false;
             session.state.pending = None;
         }
         drop(session);
@@ -914,6 +1001,10 @@ impl Device for Mos6502 {
         w.write_bool(nmi_level)?;
         w.write_bool(nmi_latch)?;
         w.write_bool(reset_req)?;
+        // Appended in v3 rather than slotted in beside `halted`, so that the
+        // prefix of this chunk keeps the layout v2 wrote and anything reading
+        // it field by field still lines up.
+        w.write_bool(state.waiting)?;
         Ok(())
     }
 
@@ -946,6 +1037,7 @@ impl Device for Mos6502 {
         let nmi_level = r.read_bool()?;
         let nmi_latch = r.read_bool()?;
         let reset_req = r.read_bool()?;
+        state.waiting = r.read_bool()?;
         self.session.lock().state = state;
         self.lines.restore((irq, nmi_level, nmi_latch, reset_req));
         Ok(())
@@ -992,6 +1084,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 pub fn schema() -> crate::machine::validate::ClassSchema {
     use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
     ClassSchema::new(CLASS.name)
+        .prop(PropSchema::new("variant", ValueKind::Str).values(&["6502", "2a03", "65c02"]))
         .prop(PropSchema::new("decimal", ValueKind::Bool))
         .prop(PropSchema::new("magic", ValueKind::Uint).range(0, 0xff))
         .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
@@ -1136,10 +1229,16 @@ impl WireSink for ResetPin {
 /// implements.
 #[must_use]
 pub fn describe_isa() -> String {
+    describe_isa_for(Variant::Nmos6502)
+}
+
+/// The same, for whichever part is asked about.
+#[must_use]
+pub fn describe_isa_for(variant: Variant) -> String {
     use core::fmt::Write as _;
     let mut out = String::new();
     for opcode in 0..=255u8 {
-        let insn = isa::decode(opcode);
+        let insn = isa::decode_as(variant, opcode);
         let mark = match insn.class {
             isa::Class::Documented => ' ',
             isa::Class::Undocumented => '*',
