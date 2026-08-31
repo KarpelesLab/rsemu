@@ -103,7 +103,13 @@ dev-nes-ppu = []
 # names). A machine is a feature set (ROADMAP.md §3), so this is the feature
 # that makes `rsemu machines` list a NES and `rsemu run nes-ntsc --cart x.nes`
 # work. Adds no dependencies; it is the components plus one data file.
-machine-nes = ["cpu-mos6502", "dev-nes-cart", "dev-nes-io"]
+#
+# `dev-nes-ppu` is not optional here even though a headless CPU-only NES is a
+# coherent idea: machines/nes-ntsc.machine names `nes.ppu`, so without it the
+# machine does not realize at all — `unknown device class` at build time, not a
+# picture-less console. The feature sweep only `cargo check`s, so a build that
+# compiled and then failed the moment anyone ran it went unnoticed.
+machine-nes = ["cpu-mos6502", "dev-nes-cart", "dev-nes-io", "dev-nes-ppu"]
 
 # The Apple 1's chips (src/dev/apple1): the MC6821 PIA as that board wires it —
 # keyboard on port A, a 40x24 character terminal on port B — the 256-byte
