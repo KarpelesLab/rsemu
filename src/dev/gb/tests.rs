@@ -650,16 +650,117 @@ fn an_oam_transfer_copies_a_page_over_160_machine_cycles() {
 
     ppu.write_register(0x06, 0xc0);
     assert_eq!(ppu.read_register(0x06), 0xc0, "the register reads back");
-    // Nothing has moved yet: the first byte goes one machine cycle later.
-    assert_eq!(ppu.peek_oam(5), 0);
-    ppu.advance_by(4 * 6);
-    assert_eq!(ppu.peek_oam(5), 5, "six machine cycles, six bytes");
+    // Two machine cycles pass before the transfer starts — Gekkio's
+    // `oam_dma_start`, and `ppu::DMA_START_DELAY`. So after one, nothing.
+    ppu.advance_by(4);
+    assert_eq!(
+        ppu.peek_oam(0),
+        0,
+        "the cycle after the write moves nothing"
+    );
+    ppu.advance_by(4);
+    assert_eq!(ppu.peek_oam(0), 0, "and the first byte moves on the second");
+    // `peek_oam` looks past the blocking, so read the byte the transfer put
+    // there rather than the `$FF` a guest would see.
+    ppu.advance_by(4 * 5);
+    assert_eq!(ppu.peek_oam(5), 5, "five more cycles, five more bytes");
     assert_eq!(ppu.peek_oam(6), 0, "and not one more");
     ppu.advance_by(4 * 154);
     assert_eq!(ppu.peek_oam(159), 159);
     // And it stops there rather than running off the end of OAM.
     ppu.advance_by(4 * 160);
     assert_eq!(ppu.peek_oam(159), 159);
+}
+
+/// The window in which object memory answers `$FF` is `[W+2, W+161]` for a
+/// write on machine cycle `W` — the two-cycle start delay, then one cycle per
+/// byte, with the cycle the last byte moves on still blocked.
+///
+/// Gekkio's `oam_dma_timing` is exactly this assertion: it aligns one read on
+/// `W+161` and expects `$FF`, and another on `W+162` and expects the byte.
+#[test]
+fn object_memory_is_blocked_for_the_transfers_hundred_and_sixty_cycles() {
+    use crate::core::space::{AddressSpace, RamStore, Region};
+
+    let ppu = GbPpu::new();
+    let space = Arc::new(AddressSpace::new("cpubus", 16));
+    let ram = Arc::new(RamStore::new(0x10000));
+    for i in 0..160u64 {
+        ram.write_u8(0xc000 + i, 0x42).expect("in range");
+    }
+    space
+        .topology()
+        .map(Region::ram("ram", ram), 0)
+        .expect("maps");
+    ppu.attach_space(space);
+    let oam = Device::region(&ppu, super::ppu::OAM_REGION).expect("the region");
+    let oam = io(&oam);
+    let read = || {
+        let mut byte = [0u8];
+        oam.read(0, &mut byte, MemAttrs::DEFAULT).expect("answers");
+        byte[0]
+    };
+
+    // Switch the LCD off, so mode 0 is reported and only the transfer can
+    // block. Gekkio's own ROM does the same thing for the same reason.
+    ppu.write_register(0x00, 0);
+    ppu.write_register(0x06, 0xc0);
+    assert_eq!(read(), 0x00, "the write cycle itself is not blocked");
+    ppu.advance_by(4);
+    assert_eq!(read(), 0x00, "nor the one after it");
+    ppu.advance_by(4);
+    assert_eq!(read(), 0xff, "the transfer has the bus from W+2");
+    // On to the cycle the last byte moves on, W+161.
+    ppu.advance_by(4 * 159);
+    assert_eq!(read(), 0xff, "still blocked on the last byte's cycle");
+    ppu.advance_by(4);
+    assert_eq!(read(), 0x42, "and readable on the next");
+}
+
+/// A write to `$FF46` while a transfer is running does not stop it: the old one
+/// keeps the bus for the two cycles before the new one takes over, so object
+/// memory never becomes readable in between (Gekkio, `oam_dma_restart`).
+#[test]
+fn restarting_a_transfer_leaves_no_readable_cycle_in_between() {
+    use crate::core::space::{AddressSpace, RamStore, Region};
+
+    let ppu = GbPpu::new();
+    let space = Arc::new(AddressSpace::new("cpubus", 16));
+    let ram = Arc::new(RamStore::new(0x10000));
+    for i in 0..160u64 {
+        ram.write_u8(0xc000 + i, 0x42).expect("in range");
+    }
+    space
+        .topology()
+        .map(Region::ram("ram", ram), 0)
+        .expect("maps");
+    ppu.attach_space(space);
+    let oam = Device::region(&ppu, super::ppu::OAM_REGION).expect("the region");
+    let oam = io(&oam);
+    let read = || {
+        let mut byte = [0u8];
+        oam.read(0, &mut byte, MemAttrs::DEFAULT).expect("answers");
+        byte[0]
+    };
+
+    ppu.write_register(0x00, 0);
+    ppu.write_register(0x06, 0xc0);
+    // Ten cycles in, so the first transfer is well under way.
+    ppu.advance_by(4 * 10);
+    assert_eq!(read(), 0xff);
+    ppu.write_register(0x06, 0xc0);
+    // The two cycles that belong to the transfer being displaced.
+    assert_eq!(read(), 0xff, "the restart cycle itself");
+    ppu.advance_by(4);
+    assert_eq!(read(), 0xff, "and the one after it");
+    ppu.advance_by(4);
+    assert_eq!(read(), 0xff, "then the new transfer, for its full 160");
+    // The new transfer's last byte lands 159 cycles after it started, which is
+    // 161 after the restart — ten cycles later than the first one would have.
+    ppu.advance_by(4 * 159);
+    assert_eq!(read(), 0xff, "the last byte's cycle is still blocked");
+    ppu.advance_by(4);
+    assert_eq!(read(), 0x42);
 }
 
 #[test]

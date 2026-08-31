@@ -166,6 +166,26 @@ pub const DMA_BYTES: u64 = 160;
 /// How many crystal periods each of those machine cycles is.
 const CLOCKS_PER_MCYCLE: u64 = 4;
 
+/// How many machine cycles pass between the write to `$FF46` and the first byte
+/// of the transfer.
+///
+/// Two, and it is observable rather than an implementation detail. Gekkio's
+/// `oam_dma_start` states the sequence a DMG runs and reports it verified on
+/// every model of the family:
+///
+/// ```text
+///   M = 0   the write to $FF46 happens
+///   M = 1   nothing yet — OAM is still accessible
+///   M = 2   the transfer starts, and OAM reads return $FF
+/// ```
+///
+/// Which makes the blocked window `[W+2, W+161]` for a write on cycle `W`, and
+/// that pair of numbers is what half of Gekkio's instruction-timing group is
+/// built on: each of them aligns a memory access against the *end* of a
+/// transfer, so an emulator whose window is two cycles early fails all of them
+/// and one whose window is the wrong length fails half.
+const DMA_START_DELAY: u64 = 2;
+
 /// The four LCD modes, in the order a drawn line visits them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Mode {
@@ -279,6 +299,18 @@ struct Engine {
     dma_next_dot: u64,
     /// The high byte of the address the transfer is reading from.
     dma_page: u8,
+    /// The first dot at which object memory is blocked by a transfer.
+    ///
+    /// [`u64::MAX`] when none has ever run. Not simply the current transfer's
+    /// start, because a write to `$FF46` while one is already running does not
+    /// stop it (`oam_dma_restart`): the old transfer keeps the bus for the two
+    /// cycles before the new one takes over, so the blocked window is
+    /// continuous across the restart and this stays where the *first* of them
+    /// put it.
+    dma_block_from: u64,
+    /// The last dot at which it is blocked: the dot the transfer's final byte
+    /// moves on, which is still a blocked cycle.
+    dma_block_until: u64,
 }
 
 impl fmt::Debug for Engine {
@@ -322,7 +354,32 @@ impl Engine {
             dma_remaining: 0,
             dma_next_dot: 0,
             dma_page: 0,
+            dma_block_from: u64::MAX,
+            dma_block_until: 0,
         }
+    }
+
+    /// Start — or restart — an OAM transfer from page `page`.
+    ///
+    /// Called with `dots` standing on the cycle the write to `$FF46` was made
+    /// on, which is what the two-cycle delay is measured from.
+    fn arm_dma(&mut self, page: u8) {
+        let start = self.dots + DMA_START_DELAY * CLOCKS_PER_MCYCLE;
+        // A restart keeps the window open from wherever the transfer it is
+        // displacing opened it: that one holds the bus until this one starts,
+        // so there is no readable cycle in between.
+        if !self.dma_blocking() {
+            self.dma_block_from = start;
+        }
+        self.dma_block_until = start + (DMA_BYTES - 1) * CLOCKS_PER_MCYCLE;
+        self.dma_page = page;
+        self.dma_remaining = DMA_BYTES;
+        self.dma_next_dot = start;
+    }
+
+    /// Whether a transfer owns the bus on the dot the controller stands on.
+    fn dma_blocking(&self) -> bool {
+        self.dots >= self.dma_block_from && self.dots <= self.dma_block_until
     }
 
     fn lcd_on(&self) -> bool {
@@ -405,7 +462,7 @@ impl Engine {
     }
 
     fn oam_readable(&self) -> bool {
-        !matches!(self.mode(), Mode::Drawing | Mode::OamScan) && self.dma_remaining == 0
+        !matches!(self.mode(), Mode::Drawing | Mode::OamScan) && !self.dma_blocking()
     }
 
     // -- mode 3's length ----------------------------------------------------
@@ -1043,11 +1100,7 @@ impl GbPpu {
     /// A write to `$FF46` while a transfer is already running restarts it, which
     /// is what hardware does and what `oam_dma_restart` tests.
     fn start_dma(&self, page: u8) {
-        let mut engine = self.shared.engine.lock();
-        engine.dma_page = page;
-        engine.dma_remaining = DMA_BYTES;
-        // The first byte moves one machine cycle after the write.
-        engine.dma_next_dot = engine.dots + CLOCKS_PER_MCYCLE;
+        self.shared.engine.lock().arm_dma(page);
     }
 
     /// Run the controller until `target` dots have elapsed in total.
@@ -1269,10 +1322,7 @@ impl MemOps for LcdPort {
             .shared
             .with_engine(|e| e.write_register(offset as u8, *value));
         if let Some(page) = page {
-            let mut engine = self.shared.engine.lock();
-            engine.dma_page = page;
-            engine.dma_remaining = DMA_BYTES;
-            engine.dma_next_dot = engine.dots + CLOCKS_PER_MCYCLE;
+            self.shared.engine.lock().arm_dma(page);
         }
         Ok(())
     }
@@ -1289,7 +1339,7 @@ impl MemOps for LcdPort {
 /// The `gb.ppu` device class.
 pub static CLASS: DeviceClass = DeviceClass {
     name: "gb.ppu",
-    version: 1,
+    version: 2,
     summary: "Game Boy LCD controller: VRAM, OAM, $FF40-$FF4B, OAM DMA",
     properties: &[],
     construct: |props| Ok(Box::new(GbPpu::from_props(props)?) as Box<dyn Device>),
@@ -1403,6 +1453,8 @@ impl Device for GbPpu {
         w.write_u64(engine.mode3_len)?;
         w.write_u64(engine.dma_remaining)?;
         w.write_u64(engine.dma_next_dot)?;
+        w.write_u64(engine.dma_block_from)?;
+        w.write_u64(engine.dma_block_until)?;
         Ok(())
     }
 
@@ -1444,6 +1496,8 @@ impl Device for GbPpu {
             engine.mode3_len = r.read_u64()?;
             engine.dma_remaining = r.read_u64()?;
             engine.dma_next_dot = r.read_u64()?;
+            engine.dma_block_from = r.read_u64()?;
+            engine.dma_block_until = r.read_u64()?;
             // The dot counter and the next event both came from the snapshot;
             // the lock-free copies of them are derived state and must follow.
             self.shared.publish(&engine);
