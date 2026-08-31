@@ -175,6 +175,13 @@ pub(super) struct Exec<'a> {
     cursor: Option<&'a TickCursor>,
     /// The `/RDY` arbiter, if the board has one.
     rdy: Option<&'a dyn CycleGate>,
+    /// Whether the most recent read cycle was one the arbiter held.
+    ///
+    /// Only the unstable stores care, and they care a great deal: `SHA`,
+    /// `SHX`, `SHY` and `TAS` compute what they write out of the addressing
+    /// hardware, and holding the core over the index fix-up leaves the AND
+    /// with the high byte out of it entirely.
+    held_read: bool,
 }
 
 impl<'a> Exec<'a> {
@@ -199,6 +206,7 @@ impl<'a> Exec<'a> {
             used: 0,
             cursor: None,
             rdy: None,
+            held_read: false,
         }
     }
 
@@ -357,6 +365,7 @@ impl<'a> Exec<'a> {
     /// the instruction uses (NESdev wiki, "DMA").
     fn read(&mut self, addr: u16) -> u8 {
         let mut value = self.cycle_read(addr);
+        self.held_read = false;
         let Some(gate) = self.rdy else {
             return value;
         };
@@ -383,6 +392,7 @@ impl<'a> Exec<'a> {
             // "When DMA completes, the CPU performs the read it attempted when
             // halted" — the one whose value the instruction goes on to use.
             value = self.cycle_read(addr);
+            self.held_read = true;
         }
         value
     }
@@ -1029,8 +1039,24 @@ impl<'a> Exec<'a> {
     /// the bus while the high address byte is being driven, so it wins. This
     /// is the behaviour `SingleStepTests/65x02` expects
     /// (`docs/cpu/6502.md`).
+    ///
+    /// **Unless `/RDY` went low over the index fix-up**, in which case the AND
+    /// does not happen at all and the register is stored unmodified. NESdev's
+    /// *Programming with unofficial opcodes* says so for `SHX`/`SHY` — "unless
+    /// interrupted by DMC DMA on the 4th clock (i.e. RDY goes low between
+    /// fetching the high byte of the address and the dummy read), data written
+    /// is ANDed with (high byte of literal address + 1)" — and AccuracyCoin's
+    /// SH\* tests measure the same thing for `SHA` and `TAS`, which NESdev
+    /// documents no formula for at all (`AccuracyCoin.asm`, MIT, © 2025 Chris
+    /// Siebert: the SH\* expectation tables, whose comment on the `/RDY` case
+    /// is "H isn't part of the equation anymore"). The *address* still carries
+    /// the AND on a page cross, whatever `/RDY` did.
     fn unstable_store(&mut self, reg: u8, loc: Located) -> (u16, u8) {
-        let value = reg & loc.base_hi.wrapping_add(1);
+        let value = if self.held_read {
+            reg
+        } else {
+            reg & loc.base_hi.wrapping_add(1)
+        };
         let addr = if loc.crossed {
             (u16::from(value) << 8) | (loc.addr & 0x00ff)
         } else {

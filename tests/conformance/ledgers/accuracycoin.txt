@@ -19,7 +19,7 @@
 #     they can never appear here.
 #
 # ---------------------------------------------------------------------------
-# Measured 2026-08-31 against the pinned ROM: 113 of 141 pass, 28 fail.
+# Measured 2026-08-31 against the pinned ROM: 118 of 141 pass, 23 fail.
 # ---------------------------------------------------------------------------
 #
 # The earlier "81 of 125" was measured through a stale copy of the ROM's
@@ -71,13 +71,6 @@
 # and no hook to be handed them. src/dev/nes/dma.rs names the two shapes the
 # seam could take. Everything here is that one missing line.
 
-46                # $0446 "$93 SHA indirect,Y" code 7: with /RDY low 2 cycles
-                  # before the write, the target address is wrong. Codes 0-6 —
-                  # the instruction itself — all pass.
-47                # $0447 "$9F SHA absolute,Y", the same code 7, the same /RDY.
-48                # $0448 "$9B SHS absolute,Y", the same code 7, the same /RDY.
-49                # $0449 "$9C SHY absolute,X", the same code 7, the same /RDY.
-4a                # $044A "$9E SHX absolute,Y", the same code 7, the same /RDY.
 
 # ---------------------------------------------------------------------------
 # B. No DMC DMA
