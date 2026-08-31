@@ -122,12 +122,13 @@ pub mod signals {
     use alloc::sync::Arc;
     use alloc::vec::Vec;
 
-    use crate::core::sync::{LockRank, Mutex};
+    use crate::core::sync::{Global, LockRank};
 
     /// Name to signal, in name order rather than hash order (`CLAUDE.md`,
-    /// determinism).
-    static TABLE: Mutex<BTreeMap<String, Arc<Signal>>> =
-        Mutex::with_rank(LockRank::LEAF, BTreeMap::new());
+    /// determinism); [`Global`] because a `static` is reachable from every
+    /// thread in the process (`core::sync`).
+    static TABLE: Global<BTreeMap<String, Arc<Signal>>> =
+        Global::with_rank(LockRank::LEAF, BTreeMap::new());
 
     /// The signal called `name`, creating it if this is the first mention.
     #[must_use]

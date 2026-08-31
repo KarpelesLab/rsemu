@@ -473,10 +473,10 @@ fn props(pairs: &[(&str, Value)]) -> Props {
 /// A transactional controller on a bus nobody else can reach.
 ///
 /// Deliberately **not** through [`buses`]: `cargo test` runs tests in parallel
-/// threads of one process, and a `--no-default-features` build uses the
-/// `single` sync backend, whose locks are single-threaded by construction. A
-/// process-wide table shared between parallel tests would be a harness bug
-/// reported as an emulator one.
+/// threads of one process, and two tests sharing one named bus would interfere
+/// on the *bus*, which no lock can fix. (The table itself is safe to reach from
+/// several threads — it is a [`Global`](crate::core::sync::Global) — but that
+/// makes concurrent access defined, not correct.)
 fn transactional(bus: &Arc<SpiBus>) -> SpiController {
     SpiController::with_bus(Link::Transactional, Some(Arc::clone(bus)), 1)
 }

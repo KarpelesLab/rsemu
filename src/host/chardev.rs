@@ -47,6 +47,13 @@
 //! one for media, `ports` collapses into it and the `port` property keeps
 //! meaning exactly what it means today. Until then, give ports distinct names
 //! per machine — a test that wants isolation should use its own name.
+//!
+//! Being process-wide, the table's lock is a
+//! [`Global`](crate::core::sync::Global) and not a `Mutex`: a `static` is
+//! reachable from every thread in the process, so two libtest threads opening
+//! ports at the same time is ordinary rather than a deadlock. Two names still
+//! mean two ports; what `Global` fixes is the *table*, not the sharing the
+//! table exists to do.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -258,12 +265,13 @@ pub mod ports {
     use alloc::sync::Arc;
     use alloc::vec::Vec;
 
-    use crate::core::sync::{LockRank, Mutex};
+    use crate::core::sync::{Global, LockRank};
 
     /// Name to port. `BTreeMap`, so listing is in name order rather than hash
-    /// order (`CLAUDE.md`, determinism).
-    static TABLE: Mutex<BTreeMap<String, Arc<CharPort>>> =
-        Mutex::with_rank(LockRank::LEAF, BTreeMap::new());
+    /// order (`CLAUDE.md`, determinism); [`Global`] because a `static` is
+    /// reachable from every thread in the process (`core::sync`).
+    static TABLE: Global<BTreeMap<String, Arc<CharPort>>> =
+        Global::with_rank(LockRank::LEAF, BTreeMap::new());
 
     /// The port called `name`, creating it if this is the first mention.
     ///

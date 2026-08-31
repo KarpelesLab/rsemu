@@ -128,9 +128,12 @@ These are decided. Do not relitigate them mid-implementation.
   `#[allow(unsafe_code)]` + a `// SAFETY:` comment: the RAM host-pointer fast
   path, the JIT code buffer (W^X `mmap`/`mprotect`), the raw-syscall accel
   backends (KVM ioctls), the C ABI module, the **`core::sync` `single` backend**
-  (its lock is an `UnsafeCell` with a `Sync` impl justified by that backend being
-  single-threaded by construction — `RefCell` is *not* `Sync`, so there is no
-  safe way to satisfy the `Send + Sync` bound), and **per-CPU execution state**
+  (its lock is an `UnsafeCell` with a hand-written `Sync` impl — `RefCell` is
+  *not* `Sync`, so there is no safe way to satisfy the `Send + Sync` bound; the
+  impl is justified by the lock's own atomic claim/release pair, **not** by the
+  backend being single-threaded, because `cargo test` runs a `no_std` build's
+  tests on parallel harness threads and a `static` is reachable from all of
+  them), and **per-CPU execution state**
   (the register file lives behind an `UnsafeCell` guarded by an
   exclusive-execution token from the scheduler; a lock per instruction cannot
   reach the phase-5 throughput gate). Everything else is safe Rust. **Six is the
@@ -917,7 +920,7 @@ four compile-time backends selected by target and feature:
 | `native-std` | `std::sync` + `std::thread` | ordinary hosted builds |
 | `native-raw` | futex / `WaitOnAddress` by raw syscall | libc-free (`fullrust`) and `no_std` hosted builds |
 | `wasm-atomics` | shared linear memory + `Atomics.wait`/`notify` in Web Workers | `wasm32-*` with the threads proposal |
-| `single` | locks compile to borrow-checked no-ops; the pool runs jobs inline | no-threads wasm, bare metal, and the deterministic test runner |
+| `single` | locks exclude atomically but report waiting as the deadlock it is; the pool runs jobs inline | no-threads wasm, bare metal, and the deterministic test runner |
 
 Because the API is identical across all four, a device is written once and works
 on every target. `single` is not a degraded mode to be tolerated — it is the
@@ -976,6 +979,16 @@ requester waits on the pool's barrier.
   error, not a deadlock under `native-std` and a panic under `single`.
 - A ranked lock order is documented in `core::sync` and asserted in debug
   builds; hot paths use atomics rather than locks.
+- **A `static` is not machine state.** `single` treats an acquisition that would
+  block as a deadlock, which is right for a device register and wrong for a
+  process-wide table: a `static` is reachable from every thread in the process,
+  the test harness's included, so contention on it is legitimate and must be
+  waited out. `core::sync::Global` is the lock for that, and a test in
+  `core::sync` reads the crate's source to keep `Mutex` and `RwLock` out of
+  `static`s. The tables that need it — the character-port, pad-port, SPI-bus,
+  power-signal and device-tree registries, and the scanout capture slots — are
+  named seams awaiting a host-object table on `RealizeOptions`; `Global` makes
+  them sound, not permanent.
 - In `deterministic` threading mode, guest CPUs are serialized, but background
   work is still permitted — it just must deliver results through the event queue
   at a virtual time computed from the guest clock, never from the host's.

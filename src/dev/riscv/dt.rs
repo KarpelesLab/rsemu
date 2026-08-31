@@ -56,7 +56,7 @@ use alloc::vec::Vec;
 
 use crate::core::error::{Error, Result};
 use crate::core::space::{AddressSpace, RegionKind, RegionRef};
-use crate::core::sync::{LockRank, Mutex};
+use crate::core::sync::{Global, LockRank};
 use crate::core::wire::WireId;
 
 use super::fdt::FdtWriter;
@@ -195,8 +195,9 @@ struct Entry {
 }
 
 /// Region identity to describer. See the module docs for why this is a
-/// process-wide table and what replaces it.
-static TABLE: Mutex<Vec<Entry>> = Mutex::with_rank(LockRank::LEAF, Vec::new());
+/// process-wide table and what replaces it; [`Global`] is the lock a `static`
+/// takes, because a `static` is reachable from every thread (`core::sync`).
+static TABLE: Global<Vec<Entry>> = Global::with_rank(LockRank::LEAF, Vec::new());
 
 /// The identity of a region, as the table keys on it.
 fn key_of(region: &RegionRef) -> usize {

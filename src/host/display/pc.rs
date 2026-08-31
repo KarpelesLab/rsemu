@@ -38,7 +38,7 @@ pub mod capture {
 
     use crate::core::error::Result;
     use crate::core::props::Props;
-    use crate::core::sync::{LockRank, Mutex};
+    use crate::core::sync::{Global, LockRank};
     use crate::dev::pc::video::{CLASS_NAME, Video, VideoScanout};
     use crate::machine::realize::Instance;
     use crate::machine::{Bindings, BuildOptions};
@@ -47,7 +47,7 @@ pub mod capture {
     /// first. A `Vec` rather than one slot because a machine with two display
     /// adapters — a PC really could have an MDA and a CGA at once — is not this
     /// module's business to refuse.
-    static CONSTRUCTED: Mutex<Vec<Arc<Video>>> = Mutex::with_rank(LockRank::LEAF, Vec::new());
+    static CONSTRUCTED: Global<Vec<Arc<Video>>> = Global::with_rank(LockRank::LEAF, Vec::new());
 
     /// Construct an adapter and keep a reference to it.
     ///

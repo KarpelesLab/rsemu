@@ -118,7 +118,7 @@ pub mod capture {
     use super::{Arc, NesPpu, NesScanout, Vec};
     use crate::core::error::Result;
     use crate::core::props::Props;
-    use crate::core::sync::{LockRank, Mutex};
+    use crate::core::sync::{Global, LockRank};
     use crate::dev::ppu::NES_PPU_CLASS;
     use crate::machine::realize::Instance;
     use crate::machine::{Bindings, BuildOptions};
@@ -126,7 +126,7 @@ pub mod capture {
     /// Every PPU constructed since the last [`take`] or [`clear`], oldest
     /// first. A `Vec` rather than a single slot because a machine with two
     /// PPUs is not this module's business to refuse.
-    static CONSTRUCTED: Mutex<Vec<Arc<NesPpu>>> = Mutex::with_rank(LockRank::LEAF, Vec::new());
+    static CONSTRUCTED: Global<Vec<Arc<NesPpu>>> = Global::with_rank(LockRank::LEAF, Vec::new());
 
     /// Construct a PPU and keep a reference to it.
     ///
