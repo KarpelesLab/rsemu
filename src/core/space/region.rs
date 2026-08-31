@@ -247,7 +247,107 @@ pub struct Region {
     kind: RegionKind,
 }
 
+/// An aperture whose reads and writes reach different devices.
+///
+/// See [`Region::split`].
+#[derive(Debug)]
+struct Split {
+    reads: Arc<dyn MemOps>,
+    writes: Arc<dyn MemOps>,
+    constraints: AccessConstraints,
+}
+
+impl MemOps for Split {
+    fn read(&self, offset: u64, dst: &mut [u8], attrs: super::attrs::MemAttrs) -> super::MemResult {
+        self.reads.read(offset, dst, attrs)
+    }
+
+    fn write(&self, offset: u64, src: &[u8], attrs: super::attrs::MemAttrs) -> super::MemResult {
+        self.writes.write(offset, src, attrs)
+    }
+
+    fn constraints(&self) -> AccessConstraints {
+        self.constraints
+    }
+}
+
 impl Region {
+    /// One aperture, two devices: reads go to `reads`, writes go to `writes`.
+    ///
+    /// A `map` statement routes *both halves* of an access to one region, and
+    /// that is the right default — but it cannot describe an address where two
+    /// different registers live, one readable and one writable. The NES has
+    /// exactly that at `$4017`: a write reaches the APU's frame counter and a
+    /// read reaches controller two, and neither half is optional (the frame
+    /// counter's IRQ drives game logic, and the controller is player two).
+    /// Without this the machine has to choose one and lose the other.
+    ///
+    /// The two sides keep their own `MemOps`, so each device still sees only
+    /// the half of the access that belongs to it. The aperture's constraints
+    /// are the **read** side's: `drives_data_bus` is a property of a read, and
+    /// the widths must agree anyway.
+    ///
+    /// # Errors
+    ///
+    /// If either side is not a plain I/O region — a window or a container has
+    /// no single [`MemOps`] to split — if they are different sizes, or if they
+    /// accept different access widths.
+    pub fn split(
+        name: impl Into<String>,
+        reads: impl Into<RegionRef>,
+        writes: impl Into<RegionRef>,
+    ) -> Result<Self, Error> {
+        let name = name.into();
+        let reads = reads.into();
+        let writes = writes.into();
+        let ops = |side: &RegionRef, which: &str| match side.kind() {
+            RegionKind::Io(ops) => Ok(Arc::clone(ops)),
+            _ => Err(Error::Config {
+                at: name.clone(),
+                message: alloc::format!(
+                    "the {which} side of a split must be a plain I/O region, and `{}` is not",
+                    side.name()
+                ),
+            }),
+        };
+        let read_ops = ops(&reads, "read")?;
+        let write_ops = ops(&writes, "write")?;
+        if reads.len() != writes.len() {
+            return Err(Error::Config {
+                at: name,
+                message: alloc::format!(
+                    "a split's two sides must be the same size: `{}` is {:#x} bytes and `{}` is                      {:#x}",
+                    reads.name(),
+                    reads.len(),
+                    writes.name(),
+                    writes.len()
+                ),
+            });
+        }
+        let constraints = reads.constraints;
+        if constraints.min != writes.constraints.min || constraints.max != writes.constraints.max {
+            return Err(Error::Config {
+                at: name,
+                message: alloc::format!(
+                    "a split's two sides must accept the same access widths: `{}` and `{}` do not",
+                    reads.name(),
+                    writes.name()
+                ),
+            });
+        }
+        let len = reads.len();
+        Ok(Region {
+            name,
+            len,
+            constraints,
+            kind: RegionKind::Io(Arc::new(Split {
+                reads: read_ops,
+                writes: write_ops,
+                constraints,
+            })),
+        })
+    }
+
     /// Writable memory backed by `store`, the size of the store.
     #[must_use]
     pub fn ram(name: impl Into<String>, store: Arc<RamStore>) -> Self {

@@ -589,6 +589,10 @@ fn check_region(
         MapTarget::Mirror { inner, .. } | MapTarget::Alias { inner, .. } => {
             check_region(machine, inner, classes)
         }
+        MapTarget::Split { reads, writes, .. } => {
+            check_region(machine, reads, classes)?;
+            check_region(machine, writes, classes)
+        }
     }
 }
 

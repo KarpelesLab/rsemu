@@ -83,11 +83,10 @@ machine "nes-ntsc" {
   map cpubus 0x4015 size 0x0001 = apu.status
   map cpubus 0x4016 size 0x0001 = ports.port1    # controller 1
   # $4017 is two registers on one address: the APU frame counter on a write and
-  # controller 2 on a read. A mapping routes both halves of an access to one
-  # device, so this is a choice, and the frame counter wins — its IRQ drives
-  # game logic, where a missing player two loses only player two. `ports.port2`
-  # exists for a machine that would rather have it the other way.
-  map cpubus 0x4017 size 0x0001 = apu.frame
+  # controller 2 on a read. `split()` is exactly that — one aperture, two
+  # devices — and both halves matter: the frame counter's IRQ drives game logic
+  # and the controller is player two.
+  map cpubus 0x4017 size 0x0001 = split(ports.port2, apu.frame)
   map cpubus 0x8000 size 0x8000 = cart.prg       # NROM-128 repeats itself here
 
   # -- the PPU bus -----------------------------------------------------------

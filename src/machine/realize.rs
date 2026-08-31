@@ -1082,6 +1082,20 @@ impl<'a> Realizer<'a> {
                     size,
                 )?))
             }
+            MapTarget::Split { .. } => {
+                let region = self.base_region(target, at)?;
+                if region.len() == size {
+                    return Ok(region);
+                }
+                Err(config(
+                    at.to_string(),
+                    format!(
+                        "`{}` is {:#x} bytes but the mapping is {size:#x}",
+                        region.name(),
+                        region.len()
+                    ),
+                ))
+            }
         }
     }
 
@@ -1110,6 +1124,15 @@ impl<'a> Realizer<'a> {
                         },
                     )
                 })
+            }
+            MapTarget::Split { reads, writes, .. } => {
+                let reads = self.base_region(reads, at)?;
+                let writes = self.base_region(writes, at)?;
+                Ok(Arc::new(Region::split(
+                    format!("split({}, {})", reads.name(), writes.name()),
+                    reads,
+                    writes,
+                )?))
             }
             // A window with no size of its own is just its target; the outer
             // window is what carries the size.

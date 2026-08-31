@@ -184,6 +184,93 @@ fn ram(name: &str, len: u64) -> (Arc<RamStore>, Region) {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn a_split_sends_reads_and_writes_to_different_devices() {
+    // One address, two registers: the NES puts controller two at $4017 on a
+    // read and the APU's frame counter there on a write, and a mapping routes
+    // both halves of an access to one region.
+    #[derive(Debug, Default)]
+    struct Recorder {
+        answer: u8,
+        seen: sync::Mutex<Vec<u8>>,
+    }
+
+    impl MemOps for Recorder {
+        fn read(&self, _offset: u64, dst: &mut [u8], _attrs: MemAttrs) -> MemResult {
+            for byte in dst.iter_mut() {
+                *byte = self.answer;
+            }
+            Ok(())
+        }
+
+        fn write(&self, _offset: u64, src: &[u8], _attrs: MemAttrs) -> MemResult {
+            self.seen.lock().extend_from_slice(src);
+            Ok(())
+        }
+
+        fn constraints(&self) -> AccessConstraints {
+            AccessConstraints::word(Width::U8, Endian::Little)
+        }
+    }
+
+    let reader = Arc::new(Recorder {
+        answer: 0x5a,
+        ..Recorder::default()
+    });
+    let writer = Arc::new(Recorder::default());
+    let space = AddressSpace::new("bus", 16);
+    let split = Region::split(
+        "port",
+        Arc::new(Region::io(
+            "reads",
+            1,
+            Arc::clone(&reader) as Arc<dyn MemOps>,
+        )),
+        Arc::new(Region::io(
+            "writes",
+            1,
+            Arc::clone(&writer) as Arc<dyn MemOps>,
+        )),
+    )
+    .expect("both sides are plain I/O of the same size");
+    space.topology().map(Arc::new(split), 0x4017).expect("maps");
+
+    assert_eq!(
+        space.read(0x4017, Width::U8, MemAttrs::DEFAULT).unwrap(),
+        0x5a,
+        "the read reaches the read side"
+    );
+    space
+        .write(0x4017, Width::U8, 0xc3, MemAttrs::DEFAULT)
+        .expect("writes");
+    assert_eq!(
+        writer.seen.lock().as_slice(),
+        &[0xc3],
+        "and the write reaches the write side"
+    );
+    assert!(
+        reader.seen.lock().is_empty(),
+        "the read side never sees a write"
+    );
+
+    // A window is not something with a single `MemOps` to split.
+    let err = Region::split(
+        "bad",
+        Arc::new(Region::io("reads", 1, reader as Arc<dyn MemOps>)),
+        Arc::new(
+            Region::mirror(
+                "m",
+                Arc::new(Region::io("writes", 1, writer as Arc<dyn MemOps>)),
+                2,
+            )
+            .expect("mirrors"),
+        ),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("plain I/O region"), "{err}");
+}
+
+#[test]
 fn ram_round_trips_through_the_space() {
     let space = AddressSpace::new("mem", 32);
     let (store, region) = ram("ram", 0x1000);
