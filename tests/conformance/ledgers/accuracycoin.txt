@@ -21,7 +21,7 @@
 #
 # ---------------------------------------------------------------------------
 # 2026-08-31: 130 of 141 pass, 11 fail.
-# 2026-09-01: 136 of 141 pass, 5 fail — the PPU closed six.
+# 2026-09-01: 137 of 141 pass, 4 fail — the PPU closed seven.
 # ---------------------------------------------------------------------------
 #
 # The measurement before this one read "81 of 125", through a stale copy of the
@@ -145,27 +145,23 @@
 
 
 # ---------------------------------------------------------------------------
-# D. A single-dot question in the render pipeline
+# D. The single-dot questions in the render pipeline — closed
 # ---------------------------------------------------------------------------
 #
-# "Stale Sprite Shift Regs" and "BG Serial In" were the other two, and they
-# went together: the sprite X **counters** keep counting through forced blank
-# while the shifters stop (the ROM separates the two in consecutive subtests),
-# and the background shift registers' load pulse is a *registered* signal, so
-# rendering switched back on exactly at a reload dot misses that reload and the
-# register shifts its serial input in for another eight dots. With both, the
-# artifact "BG Serial In" draws starts on the very pixel its sprite zero sits
-# on, which is the arithmetic the ROM was written around.
+# "Stale Sprite Shift Regs" and "BG Serial In" went together: the sprite X
+# **counters** keep counting through forced blank while the shifters stop (the
+# ROM separates the two in consecutive subtests), and the background shift
+# registers' load pulse is a *registered* signal, so rendering switched back on
+# exactly at a reload dot misses that reload and the register shifts its serial
+# input in for another eight dots. With both, the artifact "BG Serial In" draws
+# starts on the very pixel its sprite zero sits on, which is the arithmetic the
+# ROM was written around.
+#
+# "NMI at VBlank end" was the third, and it was one dot in the `/NMI` output
+# register: the core samples the pin on the φ1→φ2 boundary, one dot into its own
+# three-dot cycle, and the scheduler catches this chip up to the dot *after* the
+# cycle before the core looks — so the level the core must be shown is two dots
+# behind the request, not one. A previous attempt at that second dot "stopped
+# the ROM booting" because `next_event_dot` was not extended with it; with both
+# moved together every test on the vblank page passes at once.
 
-55                # $0455 "NMI at VBlank end" code 1: enabling the NMI as vblank
-                  # ends. Measured: the ROM's seven-entry array wants
-                  # `01 01 01 00 00 00 00` and we produce `01 01 00 00 00 00
-                  # 00` — the boundary is one PPU dot early, and both of the
-                  # ROM's two arrays agree with each other, so the model is
-                  # self-consistent and simply shifted. "VBlank end" ($0451),
-                  # which measures the *flag* across the same boundary with the
-                  # same instrument, passes; so the one dot is in how the
-                  # `$2000` write's effect reaches the core's `/NMI` sample and
-                  # not in when the flag clears. Making the write's rise
-                  # immediate changes nothing; giving the output a second dot of
-                  # delay stops the ROM booting.

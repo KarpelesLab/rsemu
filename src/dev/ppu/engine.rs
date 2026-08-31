@@ -432,9 +432,11 @@ pub struct Engine {
     /// A `$2002` read landed on or just after the set, so `/NMI` never drops
     /// for long enough this frame.
     pub(crate) suppress_nmi: bool,
-    /// The `/NMI` level as it stood one dot ago — what the CPU samples. See
-    /// [`Engine::nmi_active`].
+    /// The `/NMI` level as it stood **two** dots ago — what the CPU samples.
+    /// See [`Engine::nmi_active`].
     pub(crate) nmi_out: bool,
+    /// The first stage of that two-dot pipeline: the level one dot ago.
+    pub(crate) nmi_delay: bool,
     /// Whether the pipeline ran on the previous dot.
     ///
     /// The shift registers' load pulse is a registered signal: it reloads on
@@ -548,6 +550,7 @@ impl Engine {
             suppress_vblank_set: false,
             suppress_nmi: false,
             nmi_out: false,
+            nmi_delay: false,
             rendered_last: false,
             region,
             geom: region.geometry(),
@@ -661,6 +664,7 @@ impl Engine {
         self.vblank_set_dot = 0;
         self.suppress_vblank_set = false;
         self.suppress_nmi = false;
+        self.nmi_delay = false;
         self.rendered_last = false;
     }
 
@@ -692,24 +696,26 @@ impl Engine {
         self.status & STATUS_VBLANK != 0 && self.ctrl & CTRL_NMI != 0 && !self.suppress_nmi
     }
 
-    /// The level the CPU sees on `/NMI` — one dot behind the request itself.
+    /// The level the CPU sees on `/NMI` — **two** dots behind the request.
     ///
-    /// # Why a dot
+    /// # Why two dots
     ///
-    /// A 6502 samples `/NMI` during φ2, roughly two thirds of the way through
-    /// its cycle, and completes its bus access at the very end of it. Three
-    /// dots to a CPU cycle, so a request raised on the *first* two dots of a
-    /// cycle is one the CPU acts on that cycle, and one raised on the third is
-    /// not — while a `$2002` read, which happens after the sample, cannot
-    /// unmake a request the CPU has already seen.
+    /// A 6502 samples `/NMI` on the φ1→φ2 boundary, one dot into its own
+    /// three-dot cycle, and completes its bus access at the very end of that
+    /// cycle. The scheduler catches this chip up to the dot *after* the cycle
+    /// before the core looks, so the level the core must be shown is the one
+    /// from two dots back: the end of the cycle's first dot. A `$2002` read,
+    /// which happens after the sample, therefore cannot unmake a request the
+    /// CPU has already seen — but one made in the same cycle still can.
     ///
-    /// Both halves of that are load-bearing, and AccuracyCoin's "NMI
-    /// Suppression" sweep is precisely a measurement of them: a read landing
-    /// one PPU clock after the flag is set suppresses the NMI, one landing
-    /// three clocks after does not, and the difference is which side of φ2 the
-    /// flag moved on. Publishing the level as it stood one dot ago, and
-    /// sampling it at the cycle boundary, is the same statement with the delay
-    /// moved to where it can be written down once.
+    /// The whole of AccuracyCoin's vblank page measures this, and the two dots
+    /// are what makes *all* of it agree at once. "NMI Suppression" fixes which
+    /// side of the sample a `$2002` read falls on; "NMI at VBlank end" fixes
+    /// the other edge, sweeping a `$2000` write across the dot the flag clears
+    /// on and requiring an NMI from the write that lands on the dot before it —
+    /// which a one-dot output cannot produce, because by the CPU's next sample
+    /// the pin is back up. Publishing the level as it stood two dots ago, and
+    /// sampling it at the cycle boundary, is that statement written down once.
     #[inline]
     pub fn nmi_active(&self) -> bool {
         self.nmi_out
@@ -1553,10 +1559,12 @@ impl Engine {
 
     /// Execute the dot at the current position and advance to the next.
     pub fn tick(&mut self) {
-        // The output the CPU samples lags the request by one dot — see
-        // [`Engine::nmi_active`]. Taken before the dot runs, so after a
-        // catch-up to dot *d* it holds the level as it stood at *d* − 1.
-        self.nmi_out = self.nmi_raw();
+        // The output the CPU samples lags the request by two dots — see
+        // [`Engine::nmi_active`]. Both stages move before the dot runs, so
+        // after a catch-up to dot *d* the output holds the level as it stood at
+        // the end of *d* − 2.
+        self.nmi_out = self.nmi_delay;
+        self.nmi_delay = self.nmi_raw();
         // A `$2001` write reaches the pipeline a few dots late.
         if self.mask_delay > 0 {
             self.mask_delay -= 1;
@@ -1768,14 +1776,14 @@ impl Engine {
             self.dots + 1 + (there + frame - here - 1) % frame
         };
         // `run_to(target)` has executed every dot below `target`, so the target
-        // that *includes* the dot doing the work is one past it — and one past
-        // *that*, because the `/NMI` output lags the request by a dot
-        // ([`Engine::nmi_active`]) and a stop that did not run the following dot
-        // would leave the wire still showing the old level. The flag is set at
-        // (241, 1) and cleared at (pre-render, 1), and both move `/NMI`, so
-        // neither is an instant a core may be let run past.
-        let vblank_set = ahead(self.geom.vblank_scanline, 3);
-        let vblank_clear = ahead(self.geom.pre_render_scanline, 3);
+        // that *includes* the dot doing the work is one past it — and two past
+        // *that*, because the `/NMI` output lags the request by two dots
+        // ([`Engine::nmi_active`]) and a stop that did not run the following
+        // dots would leave the wire still showing the old level. The flag is
+        // set at (241, 1) and cleared at (pre-render, 1), and both move `/NMI`,
+        // so neither is an instant a core may be let run past.
+        let vblank_set = ahead(self.geom.vblank_scanline, 4);
+        let vblank_clear = ahead(self.geom.pre_render_scanline, 4);
         // The line boundary is the ceiling: nothing may go stale by more than a
         // scanline, whatever else the chip is or is not about to do.
         let next_line = self.dots + u64::from(DOTS_PER_SCANLINE - self.dot);
@@ -2127,6 +2135,7 @@ impl Engine {
         w.write_u8(self.eval_copy_left)?;
         w.write_bool(self.eval_wrote)?;
         w.write_bool(self.rendered_last)?;
+        w.write_bool(self.nmi_delay)?;
 
         w.write_seq_len(self.fb.len() as u64)?;
         for pixel in self.fb.iter() {
@@ -2208,6 +2217,7 @@ impl Engine {
         self.eval_copy_left = r.read_u8()?;
         self.eval_wrote = r.read_bool()?;
         self.rendered_last = r.read_bool()?;
+        self.nmi_delay = r.read_bool()?;
 
         let len = r.read_seq_len(2)? as usize;
         if len != FRAMEBUFFER_LEN {

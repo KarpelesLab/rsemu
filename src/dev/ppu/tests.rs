@@ -255,18 +255,26 @@ fn reading_2002_on_the_set_dot_returns_the_flag_and_suppresses_the_nmi() {
         let status = ppu.read_register(PPUSTATUS);
         assert_eq!(status & STATUS_VBLANK, STATUS_VBLANK, "dot {dot}");
         assert!(ppu.with_engine(|e| e.suppress_nmi), "dot {dot}");
-        // Through to the end of vblank: the request never comes back.
+        // Through to the end of vblank: whatever the pin does in the next two
+        // dots, it ends up released and never goes low again this frame.
+        ppu.advance_by(2);
         let before = nmi.levels.lock().len();
         ppu.advance_by(u64::from(DOTS_PER_SCANLINE) * 19);
+        assert!(
+            !nmi.levels.lock().last().copied().unwrap_or(false),
+            "dot {dot}: the pin ends released, if it ever moved at all"
+        );
         assert!(
             !nmi.levels.lock()[before..].iter().any(|high| *high),
             "dot {dot}: the NMI must stay suppressed for the frame"
         );
     }
     // At dot 2 the read is early enough that the output — which lags the
-    // request by a dot, because the CPU samples `/NMI` at φ2 — never went high
-    // at all. At dot 3 it had, and the read only pulls it back down; whether
-    // the CPU acted on it is exactly the case AccuracyCoin leaves as "either".
+    // request by two dots, because the CPU samples `/NMI` at the φ1/φ2 boundary
+    // one dot into its own cycle — never went high at all. At dot 3 the request
+    // had already entered the output register, so the pin dips for a single dot
+    // and is back up before the core's next sample; whether a real CPU acted on
+    // that is exactly the case AccuracyCoin leaves as "either".
     let (ppu, _, _) = new_ppu();
     let nmi = with_nmi(&ppu);
     ppu.write_register(PPUCTRL, CTRL_NMI);
@@ -292,8 +300,8 @@ fn a_read_four_dots_after_the_set_is_too_late_to_suppress() {
     assert_eq!(ppu.position(), (VBLANK_SCANLINE, 4));
     assert_eq!(nmi.levels.lock().as_slice(), &[true]);
     ppu.read_register(PPUSTATUS);
-    // The output follows a dot later, which is the whole point of the delay.
-    ppu.advance_by(1);
+    // The output follows two dots later, which is the whole point of the delay.
+    ppu.advance_by(2);
     assert_eq!(nmi.levels.lock().as_slice(), &[true, false]);
 }
 
@@ -307,15 +315,15 @@ fn enabling_nmi_mid_vblank_requests_one_immediately() {
     ppu.advance_by(10);
     assert!(nmi.levels.lock().is_empty(), "NMI output is still off");
     ppu.write_register(PPUCTRL, CTRL_NMI);
-    // The output lags the request by one dot — the CPU samples `/NMI` at φ2 and
-    // latches the data bus at the end of it — so the write is on the wire by
-    // the time the core next looks, which is the next cycle.
-    ppu.advance_by(1);
+    // The output lags the request by two dots — the CPU samples `/NMI` one dot
+    // into its own three-dot cycle — so the write is on the wire by the time
+    // the core next looks, which is the next cycle.
+    ppu.advance_by(2);
     assert_eq!(nmi.levels.lock().as_slice(), &[true]);
     ppu.write_register(PPUCTRL, 0);
-    ppu.advance_by(1);
+    ppu.advance_by(2);
     ppu.write_register(PPUCTRL, CTRL_NMI);
-    ppu.advance_by(1);
+    ppu.advance_by(2);
     assert_eq!(nmi.levels.lock().as_slice(), &[true, false, true]);
 }
 
@@ -328,9 +336,9 @@ fn the_nmi_falls_when_vblank_ends() {
     ppu.advance_by(3);
     assert_eq!(nmi.levels.lock().as_slice(), &[true]);
     // Straight through to the pre-render line's dot 1, where the flag clears —
-    // and one dot further, for the output to follow it.
+    // and two dots further, for the output to follow it.
     seek(&ppu, PRE_RENDER_SCANLINE, 0);
-    ppu.advance_by(3);
+    ppu.advance_by(4);
     assert_eq!(nmi.levels.lock().as_slice(), &[true, false]);
 }
 
@@ -1678,7 +1686,7 @@ fn a_frame_is_the_number_of_cpu_cycles_the_chart_gives() {
 }
 
 #[test]
-fn the_nmi_output_lags_the_request_by_exactly_one_dot_in_every_region() {
+fn the_nmi_output_lags_the_request_by_exactly_two_dots_in_every_region() {
     // A 6502 samples `/NMI` during φ2 and latches its data bus at the end of
     // it, so what it acts on is the level from a dot earlier — see
     // `Engine::nmi_active`. Every region, because the ratio differs and the
@@ -1693,9 +1701,9 @@ fn the_nmi_output_lags_the_request_by_exactly_one_dot_in_every_region() {
             !log.levels.lock().iter().any(|high| *high),
             "{region}: nothing before the flag is even set"
         );
-        // Run the dot that sets the flag: the output still shows the level from
-        // before it.
-        ppu.advance_by(1);
+        // Run the dot that sets the flag, and the one after it: the output
+        // still shows the level from before.
+        ppu.advance_by(2);
         assert!(
             !log.levels.lock().iter().any(|high| *high),
             "{region}: the output lags the request"
@@ -1703,7 +1711,7 @@ fn the_nmi_output_lags_the_request_by_exactly_one_dot_in_every_region() {
         ppu.advance_by(1);
         assert!(
             log.levels.lock().iter().any(|high| *high),
-            "{region}: and follows it one dot later"
+            "{region}: and follows it two dots later"
         );
     }
 }
@@ -1886,7 +1894,7 @@ fn the_nmi_pin_connects_announces_and_refuses_anything_else() {
     // Nothing has ticked, so the sampled output is still the idle level and the
     // net has nothing new to deliver.
     assert!(sink.levels.lock().iter().all(|high| !*high));
-    ppu.advance_by(1);
+    ppu.advance_by(2);
     assert_eq!(sink.levels.lock().last().copied(), Some(true));
 
     // An unknown pin is an error naming the port, and an unknown announce is
