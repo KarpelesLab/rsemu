@@ -19,7 +19,7 @@
 #     they can never appear here.
 #
 # ---------------------------------------------------------------------------
-# Measured 2026-08-31 against the pinned ROM: 125 of 141 pass, 16 fail.
+# Measured 2026-08-31 against the pinned ROM: 126 of 141 pass, 15 fail.
 # ---------------------------------------------------------------------------
 #
 # The earlier "81 of 125" was measured through a stale copy of the ROM's
@@ -173,8 +173,3 @@
 # I. Still open after the DMA unit landed
 # ---------------------------------------------------------------------------
 
-5f                # $045F "Controller Strobing" code 4: the controllers must
-                  # not be strobed when the strobe line is high for exactly one
-                  # *get* cycle — the 4021's reload is level-sensitive but only
-                  # sampled on puts. `nes.ports` has no clock at all, so it
-                  # cannot see the phase. Codes 1-3 pass.

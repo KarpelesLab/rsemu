@@ -62,7 +62,11 @@ machine "nes-ntsc" {
 
   # The two controller ports. `pads` names the host seam buttons arrive
   # through (src/dev/nes/input.rs); the default is what a front end opens.
-  object ports "nes.ports" { pads = "nes-pads" }
+  # The ports take the CPU's clock, and not because anything in them advances
+  # on its own: the console drives the controllers' latch line only on "put"
+  # cycles, so whether a one-cycle strobe pulse ever reaches the pads depends on
+  # which half of an APU cycle the write landed on.
+  object ports "nes.ports" { clock = master / 12, pads = "nes-pads" }
 
   # The RP2A03's DMA unit — both of them, because the die has one arbiter. A
   # write to $4014 copies 256 bytes into OAM through $2004; the DMC's sample

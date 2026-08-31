@@ -60,11 +60,12 @@ use core::fmt;
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
 use crate::core::error::{BusError, Result};
 use crate::core::props::{Props, ValueKind};
+use crate::core::sched::{AccessKind, LazyHandle};
 use crate::core::space::{
     AccessConstraints, MemAttrs, MemOps, MemResult, Region as MmioRegion, RegionRef,
 };
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::core::sync::{AtomicU8, LockRank, Mutex, Ordering};
+use crate::core::sync::{AtomicU8, AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::machine::realize::Instance;
 
@@ -241,6 +242,14 @@ struct Regs {
     /// "1 forever after the eighth read" behaviour, for free and for the same
     /// reason the hardware has it — the 4021's serial input is tied high.
     shift: [u8; 2],
+    /// The CPU cycle the latch line last went high on.
+    ///
+    /// The 4021 is transparent while the line is high, but the console only
+    /// *drives* it on **put** cycles — the second half of an APU cycle — so a
+    /// pulse that is high across nothing but a get cycle never reaches the
+    /// pads at all. Holding the cycle here is what lets the falling edge ask
+    /// whether any put happened in between.
+    raised_at: u64,
 }
 
 /// What the device and its two memory ports both hold.
@@ -250,11 +259,31 @@ struct Shared {
     /// The port's own registers. `DEVICE`-ranked and never held across an
     /// outward call — there are none to make.
     regs: Mutex<Regs>,
+    /// Which CPU cycles are puts: cycle `c` is a get iff `c - 1 + phase` is
+    /// even. Must agree with the APU's `put-phase` and the DMA unit's.
+    phase: u64,
+    /// The CPU cycle this device has been caught up to.
+    ///
+    /// The ports have no state that advances on its own; what they need the
+    /// clock for is the *phase* of the cycle an access lands on, which is not
+    /// something a memory operation is told.
+    cycle: AtomicU64,
+    /// The catch-up handle, so an access can ask what cycle it is on.
+    lazy: Mutex<Option<LazyHandle>>,
+}
+
+/// Whether CPU cycle `cycle` is a get cycle.
+#[inline]
+const fn is_get(cycle: u64, phase: u64) -> bool {
+    (cycle.wrapping_sub(1).wrapping_add(phase)) & 1 == 0
 }
 
 impl fmt::Debug for Shared {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Shared").field("regs", &self.regs).finish()
+        f.debug_struct("Shared")
+            .field("regs", &self.regs)
+            .field("cycle", &self.cycle.load(Ordering::Relaxed))
+            .finish()
     }
 }
 
@@ -282,19 +311,62 @@ impl Shared {
         (bus & OPEN_BUS_BITS) | bit
     }
 
-    /// A write of `value` to `$4016`.
-    fn write_strobe(&self, value: u8) {
+    /// A write of `value` to `$4016`, on CPU cycle `cycle`.
+    ///
+    /// The 4021 is *transparent* while the latch line is high, not
+    /// edge-triggered: it tracks the buttons the whole time and freezes them on
+    /// the falling edge. So the pads are sampled both while the line is high
+    /// and on the write that takes it low — otherwise a game that strobes,
+    /// waits and then releases would read the buttons as they were at the
+    /// rising edge.
+    ///
+    /// **But the console only drives OUT0 on put cycles.** A pulse raised on a
+    /// get and dropped on the next put reaches the pads; one raised on a put
+    /// and dropped on the next get never does, and the registers keep whatever
+    /// they had. `DEC $4016` is a six-cycle instruction whose two writes land
+    /// on consecutive cycles, which is exactly how AccuracyCoin's "Controller
+    /// Strobing" tests 3 and 4 tell the two apart.
+    fn write_strobe(&self, value: u8, cycle: u64) {
         let mut regs = self.regs.lock();
         let was = regs.strobe;
         regs.strobe = value & 1 != 0;
-        // The 4021 is *transparent* while the latch line is high, not
-        // edge-triggered: it tracks the buttons the whole time and freezes them
-        // on the falling edge. So sample both while the line is high and on the
-        // write that takes it low, or a game that strobes, waits and then
-        // releases would read the buttons as they were at the rising edge.
-        if regs.strobe || was {
-            self.latch(&mut regs);
+        if regs.strobe {
+            if !was {
+                regs.raised_at = cycle;
+            }
+            // Nothing is sampled *by the write*: the line has only just gone
+            // high, and the pads see it on the next put. A program that holds
+            // the strobe and reads gets its latch from `read_port`, which is
+            // where "transparent while high" is modelled; one that holds it and
+            // then drops it gets it from the falling edge below.
+            return;
         }
+        if was {
+            // The falling edge. The line was high across cycles
+            // `raised_at + 1 ..= cycle`; the pads saw it only if one of those
+            // was a put.
+            let raised = regs.raised_at;
+            let saw_put = cycle > raised + 1 || !is_get(cycle, self.phase);
+            if saw_put {
+                self.latch(&mut regs);
+            }
+        }
+    }
+
+    /// Catch up to the cycle this access is on, and report it.
+    fn sync(&self, attrs: MemAttrs) -> u64 {
+        let handle = self.lazy.lock().clone();
+        if let Some(handle) = handle {
+            let kind = if attrs.debug {
+                AccessKind::Debug
+            } else {
+                AccessKind::Guest
+            };
+            if let Ok(tick) = handle.sync(kind) {
+                self.cycle.store(tick, Ordering::Relaxed);
+            }
+        }
+        self.cycle.load(Ordering::Relaxed)
     }
 }
 
@@ -326,17 +398,27 @@ impl NesPorts {
     pub fn new(props: &Props) -> Result<NesPorts> {
         let mut r = props.reader();
         let name: String = r.or("pads", String::from(DEFAULT_PAD_PORT))?;
+        let phase = r.or_range::<u64>("put-phase", 0, 0..=1)?;
         r.finish()?;
-        Ok(NesPorts::with_pad(pads::open(&name), name))
+        Ok(NesPorts::with_pad_phase(pads::open(&name), name, phase))
     }
 
     /// Build one against a pad port held directly, for a caller assembling a
     /// NES without the DSL.
     #[must_use]
     pub fn with_pad(pad: Arc<Pad>, port_name: String) -> NesPorts {
+        NesPorts::with_pad_phase(pad, port_name, 0)
+    }
+
+    /// The same, with the console's get/put phase.
+    #[must_use]
+    pub fn with_pad_phase(pad: Arc<Pad>, port_name: String, phase: u64) -> NesPorts {
         let shared = Arc::new(Shared {
             pad,
             regs: Mutex::with_rank(LockRank::DEVICE, Regs::default()),
+            phase: phase & 1,
+            cycle: AtomicU64::new(0),
+            lazy: Mutex::new(None),
         });
         let port = |index: usize, name: &'static str| {
             Arc::new(MmioRegion::io(
@@ -398,7 +480,8 @@ impl MemOps for PortWindow {
         // Only `$4016` carries OUT0. A write to `$4017` is the APU frame
         // counter's, and the port hardware ignores it — see the module docs.
         if self.index == 0 {
-            self.shared.write_strobe(*value);
+            let cycle = self.shared.sync(attrs);
+            self.shared.write_strobe(*value, cycle);
         }
         Ok(())
     }
@@ -414,9 +497,29 @@ impl Device for NesPorts {
     }
 
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
-        // Nothing outward. The ports drive no line, take no clock, and are
-        // placed by `map` statements like every other aperture.
+        // Nothing outward. The ports drive no line and are placed by `map`
+        // statements like every other aperture.
         Ok(())
+    }
+
+    /// Yes — not because anything here advances on its own, but because the
+    /// **phase** of the CPU cycle an access lands on decides whether a `$4016`
+    /// write reaches the pads, and a memory operation is not told what cycle it
+    /// is on. Registering as lazily-advanced is how a device asks.
+    fn is_lazy(&self) -> bool {
+        true
+    }
+
+    fn current_tick(&self) -> u64 {
+        self.shared.cycle.load(Ordering::Relaxed)
+    }
+
+    fn advance_to(&self, tick: u64) {
+        self.shared.cycle.store(tick, Ordering::Relaxed);
+    }
+
+    fn attach_lazy(&self, handle: LazyHandle) {
+        *self.shared.lazy.lock() = Some(handle);
     }
 
     fn reset(&self, _kind: ResetKind) {
@@ -431,16 +534,21 @@ impl Device for NesPorts {
         let regs = *self.shared.regs.lock();
         w.write_bool(regs.strobe)?;
         w.write_u8(regs.shift[0])?;
-        w.write_u8(regs.shift[1])
+        w.write_u8(regs.shift[1])?;
+        // Appended: the cycle the latch line went high on, which decides
+        // whether a one-cycle pulse ever reached the pads.
+        w.write_u64(regs.raised_at)
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
         let strobe = r.read_bool()?;
         let first = r.read_u8()?;
         let second = r.read_u8()?;
+        let raised_at = r.read_u64().unwrap_or(0);
         *self.shared.regs.lock() = Regs {
             strobe,
             shift: [first, second],
+            raised_at,
         };
         Ok(())
     }
@@ -468,12 +576,20 @@ impl Device for NesPorts {
 impl Instance for NesPorts {}
 
 /// The properties [`PORTS_CLASS`] accepts.
-static PORTS_PROPERTIES: &[PropertySpec] = &[PropertySpec {
-    name: "pads",
-    kind: ValueKind::Str,
-    required: false,
-    summary: "the host pad port to read buttons from, by name (default \"nes-pads\")",
-}];
+static PORTS_PROPERTIES: &[PropertySpec] = &[
+    PropertySpec {
+        name: "pads",
+        kind: ValueKind::Str,
+        required: false,
+        summary: "the host pad port to read buttons from, by name (default \"nes-pads\")",
+    },
+    PropertySpec {
+        name: "put-phase",
+        kind: ValueKind::Uint,
+        required: false,
+        summary: "which CPU cycles are puts (0 or 1); must match the APU's",
+    },
+];
 
 /// The device class, as `nes.ports` in a machine description.
 pub static PORTS_CLASS: DeviceClass = DeviceClass {
@@ -508,6 +624,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
     use crate::machine::validate::{ClassSchema, PropSchema};
     ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("pads", ValueKind::Str))
+        .prop(PropSchema::new("put-phase", ValueKind::Uint).range(0, 1))
         .region(PORT1)
         .region(PORT2)
 }
@@ -515,6 +632,17 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Raise the latch line and drop it again, spanning a put cycle.
+    ///
+    /// What every read routine does — `LDA #1 / STA $4016 / LDA #0 / STA
+    /// $4016` puts several cycles between the two writes — so the pads are
+    /// sampled. The one-cycle pulse that does *not* sample them has its own
+    /// test.
+    fn strobe(p: &NesPorts) {
+        p.shared.write_strobe(1, 10);
+        p.shared.write_strobe(0, 14);
+    }
     use crate::core::space::AddressSpace;
     use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
 
@@ -527,8 +655,7 @@ mod tests {
 
     /// Strobe high then low, then read eight bits out of port 1.
     fn sequence(p: &NesPorts) -> u8 {
-        p.shared.write_strobe(1);
-        p.shared.write_strobe(0);
+        strobe(p);
         let mut out = 0u8;
         for _ in 0..8 {
             out = (out << 1) | (p.shared.read_port(0, 0x40, true) & 1);
@@ -555,8 +682,7 @@ mod tests {
     fn an_official_pad_reads_one_after_the_eighth_read() {
         let p = ports("test-ninth");
         p.pad().set(0, buttons::NONE);
-        p.shared.write_strobe(1);
-        p.shared.write_strobe(0);
+        strobe(&p);
         for _ in 0..8 {
             assert_eq!(p.shared.read_port(0, 0x40, true) & 1, 0);
         }
@@ -571,7 +697,7 @@ mod tests {
     fn a_high_strobe_reloads_forever() {
         let p = ports("test-strobe");
         p.pad().set(0, buttons::A);
-        p.shared.write_strobe(1);
+        p.shared.write_strobe(1, 10);
         // Latched continuously: every read is A, and nothing shifts past it.
         for _ in 0..16 {
             assert_eq!(p.shared.read_port(0, 0x40, true) & 1, 1);
@@ -579,7 +705,7 @@ mod tests {
         // Release the strobe and what was latched is the state at the falling
         // edge, not the state at the rising one.
         p.pad().set(0, buttons::NONE);
-        p.shared.write_strobe(0);
+        p.shared.write_strobe(0, 14);
         assert_eq!(
             p.shared.read_port(0, 0x40, true) & 1,
             0,
@@ -591,8 +717,7 @@ mod tests {
     fn the_upper_bits_are_open_bus() {
         let p = ports("test-openbus");
         p.pad().set(0, buttons::A);
-        p.shared.write_strobe(1);
-        p.shared.write_strobe(0);
+        strobe(&p);
         // Bits 7-5 come from the CPU's own bus, and for a read of $4016 that
         // is the high byte of the address.
         assert_eq!(p.shared.read_port(0, 0x40, true), 0x40 | 1);
@@ -603,8 +728,7 @@ mod tests {
         let p = ports("test-two");
         p.pad().set(0, buttons::A);
         p.pad().set(1, buttons::RIGHT);
-        p.shared.write_strobe(1);
-        p.shared.write_strobe(0);
+        strobe(&p);
         // Port 1 shifts A out first; port 2's A is clear and its Right is last.
         assert_eq!(p.shared.read_port(0, 0x40, true) & 1, 1);
         assert_eq!(p.shared.read_port(1, 0x40, true) & 1, 0);
@@ -622,8 +746,7 @@ mod tests {
     fn a_debug_read_does_not_clock_the_controller() {
         let p = ports("test-debug");
         p.pad().set(0, buttons::A);
-        p.shared.write_strobe(1);
-        p.shared.write_strobe(0);
+        strobe(&p);
         for _ in 0..8 {
             assert_eq!(p.shared.read_port(0, 0x40, false), 0x40 | 1, "still A");
         }
@@ -680,8 +803,7 @@ mod tests {
     fn state_round_trips() {
         let p = ports("test-state");
         p.pad().set(0, buttons::B | buttons::DOWN);
-        p.shared.write_strobe(1);
-        p.shared.write_strobe(0);
+        strobe(&p);
         let _ = p.shared.read_port(0, 0x40, true);
 
         let mut shape = MachineShape::new();
@@ -718,7 +840,7 @@ mod tests {
     fn a_reset_clears_the_latch_but_not_the_players_thumb() {
         let p = ports("test-reset");
         p.pad().set(0, buttons::A);
-        p.shared.write_strobe(1);
+        p.shared.write_strobe(1, 10);
         p.reset(ResetKind::Cold);
         assert!(!p.shared.regs.lock().strobe);
         assert_eq!(p.pad().get(0), buttons::A, "the host still holds A");
@@ -742,5 +864,39 @@ mod tests {
     fn an_unknown_property_is_refused() {
         let e = NesPorts::new(&Props::new().with("padz", "x")).expect_err("typo");
         assert!(alloc::format!("{e}").contains("padz"), "{e}");
+    }
+
+    #[test]
+    fn a_one_cycle_strobe_reaches_the_pads_only_across_a_put() {
+        // The console drives OUT0 on put cycles only, so a pulse raised on a
+        // get and dropped on the next put is seen and one raised on a put and
+        // dropped on the next get is not. `DEC $4016` writes twice on
+        // consecutive cycles, which is how AccuracyCoin tells them apart.
+        for (raise, expected) in [(9u64, true), (10, false)] {
+            let p = NesPorts::with_pad_phase(pads::open("t"), String::from("t"), 0);
+            // Something in the shift registers to be overwritten, and a button
+            // held so a latch is visible.
+            p.shared.regs.lock().shift = [0x00, 0x00];
+            p.pad().set(0, buttons::A);
+            p.shared.write_strobe(1, raise);
+            p.shared.write_strobe(0, raise + 1);
+            assert_eq!(
+                p.shared.regs.lock().shift[0] != 0,
+                expected,
+                "raised on cycle {raise}, which is a {}",
+                if is_get(raise, 0) { "get" } else { "put" }
+            );
+        }
+    }
+
+    #[test]
+    fn a_strobe_held_across_more_than_one_cycle_always_reaches_the_pads() {
+        let p = NesPorts::with_pad_phase(pads::open("t2"), String::from("t2"), 0);
+        p.shared.regs.lock().shift = [0x00, 0x00];
+        p.pad().set(0, buttons::A);
+        // Either phase: two consecutive cycles contain a put whichever it is.
+        p.shared.write_strobe(1, 9);
+        p.shared.write_strobe(0, 11);
+        assert_ne!(p.shared.regs.lock().shift[0], 0);
     }
 }
