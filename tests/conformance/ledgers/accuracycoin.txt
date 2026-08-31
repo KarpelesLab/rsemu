@@ -21,7 +21,7 @@
 #
 # ---------------------------------------------------------------------------
 # 2026-08-31: 130 of 141 pass, 11 fail.
-# 2026-09-01: 134 of 141 pass, 7 fail — the PPU closed four.
+# 2026-09-01: 136 of 141 pass, 5 fail — the PPU closed six.
 # ---------------------------------------------------------------------------
 #
 # The measurement before this one read "81 of 125", through a stale copy of the
@@ -145,8 +145,17 @@
 
 
 # ---------------------------------------------------------------------------
-# D. Three single-dot questions in the render pipeline
+# D. A single-dot question in the render pipeline
 # ---------------------------------------------------------------------------
+#
+# "Stale Sprite Shift Regs" and "BG Serial In" were the other two, and they
+# went together: the sprite X **counters** keep counting through forced blank
+# while the shifters stop (the ROM separates the two in consecutive subtests),
+# and the background shift registers' load pulse is a *registered* signal, so
+# rendering switched back on exactly at a reload dot misses that reload and the
+# register shifts its serial input in for another eight dots. With both, the
+# artifact "BG Serial In" draws starts on the very pixel its sprite zero sits
+# on, which is the arithmetic the ROM was written around.
 
 55                # $0455 "NMI at VBlank end" code 1: enabling the NMI as vblank
                   # ends. Measured: the ROM's seven-entry array wants
@@ -160,19 +169,3 @@
                   # not in when the flag clears. Making the write's rise
                   # immediate changes nothing; giving the output a second dot of
                   # delay stops the ROM booting.
-8f                # $048F "Stale Sprite Shift Regs" code 3: rendering switched
-                  # off for ten scanlines mid-sprite, and the half-drawn sprite
-                  # must finish where it left off when it comes back. The
-                  # counters and shifters are real now — code 2, the
-                  # complementary "the counters do *not* stop" case, passes, and
-                  # so does "Stale BG Shift Registers" including its dot-339
-                  # rule — but this one still misses, and the remaining
-                  # difference has not been traced to a specific dot.
-87                # $0487 "BG Serial In" code 2: the background shifters shift
-                  # in a constant — 1 into the high plane — which is
-                  # implemented, and enough shifts without a reload should draw
-                  # pixel `%10` from a fully transparent nametable. The test
-                  # aims a `$2001` write at the reload dot within a window the
-                  # wiki gives as 2-5 PPU cycles; sweeping our delay across 2, 3
-                  # and 4 dots does not move it, so what is missing is in the
-                  # reload itself rather than in the write's travel time.

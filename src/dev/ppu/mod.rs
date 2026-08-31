@@ -635,8 +635,9 @@ pub static NES_PPU_CLASS: DeviceClass = DeviceClass {
     // output, which sprite output units have stopped counting, and a `$2001`
     // write still travelling. v3 appended the board's octal address latch and
     // `$2007`'s access state machine — the two halves of a two-dot access — and
-    // v4 sprite evaluation's step-3a read counter and whether the last even dot
-    // wrote secondary OAM or read it.
+    // v4 sprite evaluation's step-3a read counter, whether the last even dot
+    // wrote secondary OAM or read it, and whether the pipeline ran on the dot
+    // before — which is what gates the shift registers' load pulse.
     version: 4,
     summary: "NES / Famicom picture processing unit (RP2C02 / RP2C07 / UA6538)",
     properties: PPU_PROPERTIES,

@@ -435,6 +435,15 @@ pub struct Engine {
     /// The `/NMI` level as it stood one dot ago — what the CPU samples. See
     /// [`Engine::nmi_active`].
     pub(crate) nmi_out: bool,
+    /// Whether the pipeline ran on the previous dot.
+    ///
+    /// The shift registers' load pulse is a registered signal: it reloads on
+    /// dot 9, 17, ... only if the pipeline was running on the dot before, which
+    /// is the one that finished fetching the tile being loaded. Rendering
+    /// switched back on *at* a reload dot therefore misses that reload, and the
+    /// register keeps shifting its serial input in for another eight dots —
+    /// which is the whole of AccuracyCoin's "BG Serial In".
+    pub(crate) rendered_last: bool,
 
     // -- configuration ------------------------------------------------------
     /// Which console this is. Machine configuration, not architectural state,
@@ -539,6 +548,7 @@ impl Engine {
             suppress_vblank_set: false,
             suppress_nmi: false,
             nmi_out: false,
+            rendered_last: false,
             region,
             geom: region.geometry(),
             warmup,
@@ -651,6 +661,7 @@ impl Engine {
         self.vblank_set_dot = 0;
         self.suppress_vblank_set = false;
         self.suppress_nmi = false;
+        self.rendered_last = false;
     }
 
     // -- helpers ------------------------------------------------------------
@@ -1392,17 +1403,32 @@ impl Engine {
 
     /// One dot of the eight sprite output units: count down, or shift.
     ///
-    /// Runs on dots 1-256 of a rendered scanline and nowhere else. Neither the
-    /// counters nor the shifters move during horizontal blanking or with
-    /// rendering switched off — the ROM's own summary is "if rendering was not
-    /// enabled on dot 339, the shifter counters will be in whatever state they
-    /// were previously in" — and that is what lets a partly-drawn sprite
-    /// survive ten forced-blank scanlines and finish where it left off.
-    fn sprite_output_dot(&mut self) {
+    /// Runs on dots 1-256 of a **visible** scanline, rendering or not. The two
+    /// halves are gated differently and AccuracyCoin's "Stale Sprite Shift
+    /// Regs" separates them in consecutive subtests:
+    ///
+    /// * the X **counters** keep counting through forced blank — "disabling
+    ///   rendering does not stop the sprite counters ... if a sprite should be
+    ///   drawn at a specific X coordinate, disabling rendering before that dot
+    ///   won't affect it";
+    /// * the **shifters** do not — "the actual process of using the shift
+    ///   register and drawing the sprite does get paused during Forced
+    ///   Blanking".
+    ///
+    /// Neither moves during horizontal blanking, and a unit that has already
+    /// stopped counting stays stopped until dot 339 of a *rendered* scanline
+    /// puts it back — "if rendering was not enabled on dot 339, the shifter
+    /// counters will be in whatever state they were previously in" — which is
+    /// what lets a half-drawn sprite survive ten forced-blank scanlines and
+    /// finish where it left off. (AccuracyCoin.asm, MIT, (c) 2025 Chris
+    /// Siebert.)
+    fn sprite_output_dot(&mut self, rendering: bool) {
         for slot in 0..8 {
             if self.sprite_halted & (1 << slot) != 0 {
-                self.sprite_pat_lo[slot] <<= 1;
-                self.sprite_pat_hi[slot] <<= 1;
+                if rendering {
+                    self.sprite_pat_lo[slot] <<= 1;
+                    self.sprite_pat_hi[slot] <<= 1;
+                }
             } else {
                 self.sprite_x[slot] -= 1;
             }
@@ -1607,15 +1633,21 @@ impl Engine {
             self.memory_dot(None, scanline);
         }
 
+        // The X counters run whether or not the pipeline does, so this is
+        // outside the rendering gate — see [`Engine::sprite_output_dot`].
+        if visible && (1..=256).contains(&dot) {
+            self.sprite_arm();
+        }
         if visible && (1..=256).contains(&dot) {
             self.output_pixel(dot - 1, scanline);
         }
         // After the pixel: the units that drew it then advance, which is what
         // makes a sprite eight pixels wide starting at its own X.
-        if rendering && visible && (1..=256).contains(&dot) {
-            self.sprite_output_dot();
+        if visible && (1..=256).contains(&dot) {
+            self.sprite_output_dot(rendering);
         }
 
+        self.rendered_last = rendering && (visible || pre_render);
         self.advance_position(pre_render, rendering);
         self.dots += 1;
     }
@@ -1625,7 +1657,10 @@ impl Engine {
         if (2..=257).contains(&dot) || (322..=337).contains(&dot) {
             self.shift_background();
         }
-        if dot % 8 == 1 && ((9..=257).contains(&dot) || dot == 329 || dot == 337) {
+        if dot % 8 == 1
+            && ((9..=257).contains(&dot) || dot == 329 || dot == 337)
+            && self.rendered_last
+        {
             self.reload_shifters();
         }
         // The memory bus, before anything that moves `v`: the dot-257 fetch
@@ -1649,9 +1684,6 @@ impl Engine {
 
         // -- sprites --
         self.sec_addr = self.secondary_addr(dot);
-        if (1..=256).contains(&dot) {
-            self.sprite_arm();
-        }
         if dot == 339 {
             // Every unit goes back to counting, and only here. See
             // [`Engine::sprite_halted`].
@@ -2094,6 +2126,7 @@ impl Engine {
         w.write_u8(self.v_delay)?;
         w.write_u8(self.eval_copy_left)?;
         w.write_bool(self.eval_wrote)?;
+        w.write_bool(self.rendered_last)?;
 
         w.write_seq_len(self.fb.len() as u64)?;
         for pixel in self.fb.iter() {
@@ -2174,6 +2207,7 @@ impl Engine {
         self.v_delay = r.read_u8()?;
         self.eval_copy_left = r.read_u8()?;
         self.eval_wrote = r.read_bool()?;
+        self.rendered_last = r.read_bool()?;
 
         let len = r.read_seq_len(2)? as usize;
         if len != FRAMEBUFFER_LEN {

@@ -451,6 +451,32 @@ fn the_oam_read_line_answers_for_the_dot_before() {
 }
 
 #[test]
+fn the_sprite_x_counters_run_through_forced_blank() {
+    // "Disabling rendering does not stop the sprite counters" — only the
+    // shifters pause (AccuracyCoin "Stale Sprite Shift Regs", subtests 2 and 3).
+    let (ppu, _, _) = new_ppu();
+    ppu.with_engine(|e| {
+        e.mask = MASK_SPRITE;
+        e.sprite_x[0] = 40;
+        e.sprite_pat_lo[0] = 0xff;
+    });
+    seek(&ppu, 0, 1);
+    ppu.advance_by(10);
+    assert_eq!(ppu.with_engine(|e| e.sprite_x[0]), 30);
+    // Ten dots of forced blank still count.
+    ppu.with_engine(|e| e.mask = 0);
+    ppu.advance_by(10);
+    assert_eq!(ppu.with_engine(|e| e.sprite_x[0]), 20);
+    // But a unit that has started drawing does not shift while blanked.
+    ppu.with_engine(|e| {
+        e.sprite_x[0] = 0;
+        e.sprite_halted = 1;
+    });
+    ppu.advance_by(4);
+    assert_eq!(ppu.with_engine(|e| e.sprite_pat_lo[0]), 0xff);
+}
+
+#[test]
 fn a_palette_read_is_not_buffered_but_still_fills_the_buffer() {
     // The palette answers immediately; the buffer gets the nametable byte
     // hiding under the mirror at $2F00 (NESdev PPU registers, PPUDATA).
