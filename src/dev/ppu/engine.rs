@@ -73,6 +73,14 @@ pub const DEFAULT_DECAY_DOTS: u64 = 3_221_591;
 // Pixels
 // ---------------------------------------------------------------------------
 
+/// Dots between a `$2001` write and the pipeline seeing it.
+///
+/// "Toggling rendering takes effect approximately 3-4 dots after the write"
+/// (NESdev, *PPU registers*); AccuracyCoin's OAM-corruption test measures the
+/// consequence and accepts either 2 or 3 dots of delay from the *write cycle*,
+/// which is this counter started at the dot the write lands on.
+const MASK_WRITE_DELAY_DOTS: u8 = 3;
+
 /// One framebuffer entry: a palette index plus the colour-emphasis bits that
 /// were in force when it was drawn.
 ///
@@ -220,6 +228,10 @@ pub struct Engine {
     /// bytes as Y coordinates exactly as hardware does.
     pub(crate) eval_base: u8,
     /// The byte read on the odd dot, written on the even dot.
+    ///
+    /// Also what a `$2004` read sees during evaluation: the read line the
+    /// sprite unit is driving is the primary-OAM read bus, and it holds its
+    /// value across the odd/even pair.
     pub(crate) eval_latch: u8,
     /// Whether sprite 0 was among the sprites copied for the next scanline.
     pub(crate) sprite_zero_next: bool,
@@ -242,6 +254,16 @@ pub struct Engine {
     /// dot: "sprite 0 hit acts as if the image starts at cycle 2"
     /// (NESdev PPU rendering).
     pub(crate) sprite0_pending: bool,
+    /// `$2001` as written, waiting out [`Engine::mask_delay`].
+    pub(crate) mask_pending: u8,
+    /// Dots left before a `$2001` write takes effect.
+    ///
+    /// "Toggling rendering takes effect approximately 3-4 dots after the
+    /// write" (NESdev, *PPU registers*). It is not cosmetic: three of
+    /// AccuracyCoin's tests switch rendering off at a named dot and measure
+    /// what the pipeline was in the middle of, and the delay is the difference
+    /// between the answer and the one before it.
+    pub(crate) mask_delay: u8,
     /// The dot the vblank flag was last set on.
     pub(crate) vblank_set_dot: u64,
     /// A `$2002` read landed one dot before the vblank flag would be set, so it
@@ -340,6 +362,8 @@ impl Engine {
             sp_y_latch: 0,
             sp_tile_latch: 0,
             sp_attr_latch: 0,
+            mask_pending: 0,
+            mask_delay: 0,
             sprite0_pending: false,
             vblank_set_dot: 0,
             suppress_vblank_set: false,
@@ -655,8 +679,13 @@ impl Engine {
     }
 
     fn shift_background(&mut self) {
+        // Not zeros: "shift registers each shift in a constant: logically 1 for
+        // the high bitplane, 0 for the low bitplane" (NESdev, *PPU rendering*).
+        // Shifted often enough without a reload — which is what switching
+        // rendering off across the reload dot does — the high plane fills with
+        // ones and a transparent nametable starts drawing pixel `%10`.
         self.bg_shift_lo <<= 1;
-        self.bg_shift_hi <<= 1;
+        self.bg_shift_hi = (self.bg_shift_hi << 1) | 1;
         self.at_shift_lo <<= 1;
         self.at_shift_hi <<= 1;
     }
@@ -829,6 +858,44 @@ impl Engine {
         }
     }
 
+    /// What `$2004` reads back while the sprite unit owns OAM.
+    ///
+    /// `OAMADDR` is not the answer during rendering. The sprite unit is driving
+    /// the OAM read line for its own purposes, and a CPU read of `$2004`
+    /// listens in on whatever that line happens to be carrying — which is a
+    /// different thing on each of the scanline's four phases:
+    ///
+    /// * **dots 1-64**, the secondary-OAM clear: the read line is *forced*, so
+    ///   every read comes back `$FF` (NESdev, *PPU sprite evaluation*).
+    /// * **dots 65-256**, evaluation: the primary-OAM read latch, held across
+    ///   the odd/even pair. This is the live evaluation pointer made visible,
+    ///   and it is how a program can watch sprite evaluation happen.
+    /// * **dots 257-320**, the sprite fetches: secondary OAM, following the
+    ///   eight-dot slot cadence — and the fourth byte of a slot is read on five
+    ///   of its eight dots, which is why an empty slot reads `$FF` five times
+    ///   over.
+    /// * **dots 321-340 and dot 0**: secondary OAM entry 0.
+    ///
+    /// `None` when the sprite unit is not driving the line at all, which is
+    /// every dot with rendering off and every line that does not render.
+    fn oam_read_bus(&self) -> Option<u8> {
+        if !self.rendering_enabled() || !self.render_line() {
+            return None;
+        }
+        Some(match self.dot {
+            1..=64 => 0xff,
+            65..=256 => self.eval_latch,
+            257..=320 => {
+                let slot = usize::from((self.dot - 257) / 8);
+                // The slot reads Y, tile, attribute, X — and then keeps the X
+                // byte on the line for the rest of the slot.
+                let byte = usize::from((self.dot - 257) % 8).min(3);
+                self.secondary_oam[(slot * 4 + byte) & 31]
+            }
+            _ => self.secondary_oam[0],
+        })
+    }
+
     /// Dots 257-320: eight 8-dot slots that read secondary OAM and fetch the
     /// two pattern planes for the next scanline.
     ///
@@ -976,10 +1043,14 @@ impl Engine {
         // The output the CPU samples lags the request by one dot — see
         // [`Engine::nmi_active`]. Taken before the dot runs, so after a
         // catch-up to dot *d* it holds the level as it stood at *d* − 1.
-        // The output the CPU samples lags the request by one dot — see
-        // [`Engine::nmi_active`]. Taken before the dot runs, so after a
-        // catch-up to dot *d* it holds the level as it stood at *d* − 1.
         self.nmi_out = self.nmi_raw();
+        // A `$2001` write reaches the pipeline a few dots late.
+        if self.mask_delay > 0 {
+            self.mask_delay -= 1;
+            if self.mask_delay == 0 {
+                self.mask = self.mask_pending;
+            }
+        }
         let scanline = self.scanline;
         let dot = self.dot;
         let rendering = self.rendering_enabled();
@@ -1201,16 +1272,9 @@ impl Engine {
                 value
             }
             OAMDATA => {
-                // During the secondary-OAM clear the read line is forced, so
-                // every read comes back $FF
-                // ([NESdev PPU sprite evaluation]).
-                let value = if self.rendering_enabled()
-                    && self.scanline < self.geom.visible_scanlines
-                    && (1..=64).contains(&self.dot)
-                {
-                    0xff
-                } else {
-                    self.oam[usize::from(self.oam_addr)]
+                let value = match self.oam_read_bus() {
+                    Some(byte) => byte,
+                    None => self.oam[usize::from(self.oam_addr)],
                 };
                 if !debug {
                     self.latch.refresh(now, value, 0xff);
@@ -1327,7 +1391,14 @@ impl Engine {
             }
             PPUMASK => {
                 if self.warm() {
-                    self.mask = value;
+                    // Not immediate: "toggling rendering takes effect
+                    // approximately 3-4 dots after the write" (NESdev, *PPU
+                    // registers*). Three of AccuracyCoin's tests switch
+                    // rendering off at a named dot and then measure what the
+                    // pipeline was in the middle of, so the delay is the
+                    // difference between the right answer and the one before it.
+                    self.mask_pending = value;
+                    self.mask_delay = MASK_WRITE_DELAY_DOTS;
                 }
             }
             PPUSTATUS => {}
@@ -1365,9 +1436,12 @@ impl Engine {
     fn write_oam_data(&mut self, value: u8) {
         if self.rendering_enabled() && self.render_line() {
             // OAM is busy being evaluated, so the write is lost — but OAMADDR
-            // still takes a glitched bump of its high six bits
-            // ([NESdev PPU registers], OAMDATA).
-            self.oam_addr = self.oam_addr.wrapping_add(4);
+            // still takes a glitched bump of its high six bits: it is the
+            // *high six* that move, so the low two are cleared as well as
+            // carried into ([NESdev PPU registers], OAMDATA, and AccuracyCoin's
+            // "Address $2004 behavior" code A, which starts from an odd
+            // OAMADDR precisely to tell the two apart).
+            self.oam_addr = self.oam_addr.wrapping_add(4) & 0xfc;
             return;
         }
         self.write_oam(self.oam_addr, value);

@@ -19,7 +19,7 @@
 #     they can never appear here.
 #
 # ---------------------------------------------------------------------------
-# Measured 2026-08-31 against the pinned ROM: 119 of 141 pass, 22 fail.
+# Measured 2026-08-31 against the pinned ROM: 120 of 141 pass, 21 fail.
 # ---------------------------------------------------------------------------
 #
 # The earlier "81 of 125" was measured through a stale copy of the ROM's
@@ -180,10 +180,6 @@
 # H. What is left of $045B, after the sprite page mostly closed
 # ---------------------------------------------------------------------------
 
-5b                # $045B "Address $2004 behavior" code 8: a $2004 read at
-                  # around dot 130 of a rendered scanline must expose the live
-                  # sprite-evaluation OAM address, which the engine's evaluator
-                  # does not write back to OAMADDR. Codes 1-7 pass.
 
 # ---------------------------------------------------------------------------
 # I. Still open after the DMA unit landed

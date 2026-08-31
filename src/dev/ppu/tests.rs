@@ -75,10 +75,22 @@ fn draw_two_frames(ppu: &NesPpu) {
 }
 
 fn enable_rendering(ppu: &NesPpu) {
-    ppu.write_register(
-        PPUMASK,
-        MASK_BG | MASK_SPRITE | MASK_BG_LEFT | MASK_SPRITE_LEFT,
-    );
+    set_mask(ppu, MASK_BG | MASK_SPRITE | MASK_BG_LEFT | MASK_SPRITE_LEFT);
+}
+
+/// Write `$2001` and let its travel time elapse at once.
+///
+/// A `$2001` write reaches the pipeline three dots later on hardware. Nearly
+/// every test here is *setting the chip up* rather than measuring that, and
+/// three dots of setup would put each of them on a different dot from the one
+/// it means to assert about. The write still goes through the register path, so
+/// the I/O latch is charged the way a real one charges it.
+fn set_mask(ppu: &NesPpu, value: u8) {
+    ppu.write_register(PPUMASK, value);
+    ppu.with_engine(|e| {
+        e.mask = value;
+        e.mask_delay = 0;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -404,7 +416,7 @@ fn open_bus_fills_the_unused_bits_of_2002_and_decays() {
     let ppu = NesPpu::new(&props).unwrap();
     ppu.attach_bus(Arc::new(AddressSpace::new("ppu", 14)));
     // A write to a write-only port charges the whole latch.
-    ppu.write_register(PPUMASK, 0x1f);
+    set_mask(&ppu, 0x1f);
     assert_eq!(ppu.read_register(PPUSTATUS) & 0x1f, 0x1f);
     // Reading a write-only port returns the latch, unchanged.
     assert_eq!(ppu.read_register(PPUCTRL), 0x1f);
@@ -506,7 +518,7 @@ fn palette_entries_are_six_bits() {
 fn a_palette_read_reports_the_top_two_bits_as_open_bus() {
     let (ppu, _, _) = new_ppu();
     ppu.poke_palette(0x3f00, 0x0f);
-    ppu.write_register(PPUMASK, 0xc0); // charges the latch with $C0
+    set_mask(&ppu, 0xc0); // charges the latch with $C0
     ppu.write_register(PPUADDR, 0x3f);
     ppu.write_register(PPUADDR, 0x00);
     // $2006 writes recharged the latch with the last written byte, $00.
@@ -535,7 +547,7 @@ fn the_background_pipeline_draws_a_uniform_screen() {
     plain_background(&chr, &nt, 1);
     ppu.poke_palette(0x3f00, 0x0f); // backdrop
     ppu.poke_palette(0x3f01, 0x21); // colour 1 of palette 0
-    ppu.write_register(PPUMASK, MASK_BG | MASK_BG_LEFT);
+    set_mask(&ppu, MASK_BG | MASK_BG_LEFT);
     draw_two_frames(&ppu);
     for x in [0usize, 1, 7, 8, 128, 255] {
         assert_eq!(ppu.pixel(x, 100).unwrap().index(), 0x21, "x = {x}");
@@ -548,7 +560,7 @@ fn the_left_column_mask_hides_the_first_eight_pixels() {
     plain_background(&chr, &nt, 1);
     ppu.poke_palette(0x3f00, 0x0f);
     ppu.poke_palette(0x3f01, 0x21);
-    ppu.write_register(PPUMASK, MASK_BG); // no MASK_BG_LEFT
+    set_mask(&ppu, MASK_BG); // no MASK_BG_LEFT
     draw_two_frames(&ppu);
     assert_eq!(ppu.pixel(0, 100).unwrap().index(), 0x0f);
     assert_eq!(ppu.pixel(7, 100).unwrap().index(), 0x0f);
@@ -569,7 +581,7 @@ fn fine_x_shifts_the_background_left() {
     }
     ppu.poke_palette(0x3f00, 0x0f);
     ppu.poke_palette(0x3f01, 0x21);
-    ppu.write_register(PPUMASK, MASK_BG | MASK_BG_LEFT);
+    set_mask(&ppu, MASK_BG | MASK_BG_LEFT);
     ppu.write_register(PPUSCROLL, 3); // fine X = 3, coarse X = 0
     ppu.write_register(PPUSCROLL, 0);
     draw_two_frames(&ppu);
@@ -582,7 +594,7 @@ fn greyscale_masks_the_palette_index() {
     let (ppu, chr, nt) = new_ppu();
     plain_background(&chr, &nt, 1);
     ppu.poke_palette(0x3f01, 0x21);
-    ppu.write_register(PPUMASK, MASK_BG | MASK_BG_LEFT | MASK_GREYSCALE);
+    set_mask(&ppu, MASK_BG | MASK_BG_LEFT | MASK_GREYSCALE);
     draw_two_frames(&ppu);
     assert_eq!(ppu.pixel(100, 100).unwrap().index(), 0x20);
 }
@@ -591,7 +603,7 @@ fn greyscale_masks_the_palette_index() {
 fn emphasis_travels_with_the_pixel() {
     let (ppu, _, _) = new_ppu();
     ppu.poke_palette(0x3f00, 0x0f);
-    ppu.write_register(PPUMASK, MASK_EMPHASIS_R | MASK_EMPHASIS_B);
+    set_mask(&ppu, MASK_EMPHASIS_R | MASK_EMPHASIS_B);
     draw_two_frames(&ppu);
     assert_eq!(ppu.pixel(10, 10).unwrap().emphasis(), 0b101);
 }
@@ -689,7 +701,7 @@ fn a_sprite_is_drawn_one_line_below_its_y_byte() {
     ppu.poke_oam(1, 1); // tile
     ppu.poke_oam(2, 0); // attributes: palette 0, in front
     ppu.poke_oam(3, 40); // X
-    ppu.write_register(PPUMASK, MASK_SPRITE | MASK_SPRITE_LEFT);
+    set_mask(&ppu, MASK_SPRITE | MASK_SPRITE_LEFT);
     draw_two_frames(&ppu);
     assert_eq!(ppu.pixel(40, 50).unwrap().index(), 0x0f, "not on line 50");
     assert_eq!(ppu.pixel(40, 51).unwrap().index(), 0x27);
@@ -708,7 +720,7 @@ fn sprites_never_appear_on_scanline_zero() {
     ppu.poke_oam(0, 0xff); // Y = 255 wraps into range for line 0 if evaluated
     ppu.poke_oam(1, 1);
     ppu.poke_oam(3, 0);
-    ppu.write_register(PPUMASK, MASK_SPRITE | MASK_SPRITE_LEFT);
+    set_mask(&ppu, MASK_SPRITE | MASK_SPRITE_LEFT);
     draw_two_frames(&ppu);
     assert_eq!(ppu.pixel(0, 0).unwrap().index(), 0x0f);
 }
@@ -732,7 +744,7 @@ fn an_8x16_sprite_takes_its_bank_from_the_tile_byte() {
     ppu.poke_oam(2, 0);
     ppu.poke_oam(3, 40);
     ppu.write_register(PPUCTRL, CTRL_SPRITE_16);
-    ppu.write_register(PPUMASK, MASK_SPRITE | MASK_SPRITE_LEFT);
+    set_mask(&ppu, MASK_SPRITE | MASK_SPRITE_LEFT);
     draw_two_frames(&ppu);
     assert_eq!(ppu.pixel(40, 51).unwrap().index(), 0x27, "top half");
     assert_eq!(ppu.pixel(40, 59).unwrap().index(), 0x28, "bottom half");
@@ -753,7 +765,7 @@ fn sprite_flipping_mirrors_the_pattern() {
     ppu.poke_oam(1, 1);
     ppu.poke_oam(2, SPRITE_FLIP_X | SPRITE_FLIP_Y);
     ppu.poke_oam(3, 40);
-    ppu.write_register(PPUMASK, MASK_SPRITE | MASK_SPRITE_LEFT);
+    set_mask(&ppu, MASK_SPRITE | MASK_SPRITE_LEFT);
     draw_two_frames(&ppu);
     // Flipped both ways, the solid row is at the bottom and the column right.
     assert_eq!(ppu.pixel(47, 58).unwrap().index(), 0x27);
@@ -774,7 +786,7 @@ fn only_eight_sprites_are_drawn_and_the_ninth_sets_overflow() {
         ppu.poke_oam(index * 4 + 2, 0);
         ppu.poke_oam(index * 4 + 3, index * 8);
     }
-    ppu.write_register(PPUMASK, MASK_SPRITE | MASK_SPRITE_LEFT);
+    set_mask(&ppu, MASK_SPRITE | MASK_SPRITE_LEFT);
     draw_two_frames(&ppu);
     assert_eq!(
         ppu.pixel(56, 51).unwrap().index(),
@@ -810,7 +822,7 @@ fn the_overflow_bug_reads_a_tile_byte_as_a_y_coordinate() {
     // The walk examines (n=8, m=0), then (9, 1), then (10, 2): the second byte
     // it looks at is sprite 9's *tile* number.
     ppu.poke_oam(9 * 4 + 1, 50);
-    ppu.write_register(PPUMASK, MASK_SPRITE | MASK_SPRITE_LEFT);
+    set_mask(&ppu, MASK_SPRITE | MASK_SPRITE_LEFT);
     draw_two_frames(&ppu);
     assert_ne!(
         ppu.with_engine(|e| e.status) & STATUS_OVERFLOW,
@@ -834,7 +846,7 @@ fn the_overflow_flag_stays_clear_with_eight_sprites_and_nothing_in_range() {
             ppu.poke_oam(index * 4 + byte, 0xf0);
         }
     }
-    ppu.write_register(PPUMASK, MASK_SPRITE | MASK_SPRITE_LEFT);
+    set_mask(&ppu, MASK_SPRITE | MASK_SPRITE_LEFT);
     draw_two_frames(&ppu);
     assert_eq!(ppu.with_engine(|e| e.status) & STATUS_OVERFLOW, 0);
 }
@@ -937,7 +949,7 @@ fn sprite_zero_never_hits_in_a_clipped_left_column() {
     let (ppu, chr, nt) = new_ppu();
     sprite_zero_scene(&ppu, &chr, &nt, 0, 50);
     // Background left column shown, sprites clipped: no hit in x 0..7.
-    ppu.write_register(PPUMASK, MASK_BG | MASK_SPRITE | MASK_BG_LEFT);
+    set_mask(&ppu, MASK_BG | MASK_SPRITE | MASK_BG_LEFT);
     draw_two_frames(&ppu);
     assert_eq!(ppu.with_engine(|e| e.status) & STATUS_SPRITE0, 0);
 }
@@ -946,7 +958,7 @@ fn sprite_zero_never_hits_in_a_clipped_left_column() {
 fn sprite_zero_never_hits_with_a_layer_disabled() {
     let (ppu, chr, nt) = new_ppu();
     sprite_zero_scene(&ppu, &chr, &nt, 40, 50);
-    ppu.write_register(PPUMASK, MASK_SPRITE | MASK_SPRITE_LEFT); // no background
+    set_mask(&ppu, MASK_SPRITE | MASK_SPRITE_LEFT); // no background
     draw_two_frames(&ppu);
     assert_eq!(ppu.with_engine(|e| e.status) & STATUS_SPRITE0, 0);
 }
@@ -1021,14 +1033,34 @@ fn writing_2004_while_rendering_bumps_oamaddr_without_storing() {
 }
 
 #[test]
-fn reading_2004_during_the_secondary_oam_clear_returns_ff() {
-    // NESdev PPU sprite evaluation, dots 1-64.
+fn reading_2004_listens_in_on_whatever_the_sprite_unit_is_reading() {
+    // `OAMADDR` is not the answer while the sprite unit owns OAM: a `$2004`
+    // read picks up the OAM read line, and that carries something different on
+    // each phase of the scanline (NESdev, *PPU sprite evaluation*).
     let (ppu, _, _) = new_ppu();
     enable_rendering(&ppu);
     ppu.poke_oam(0, 0x12);
+    // Dots 1-64: the secondary-OAM clear forces the read line.
     seek(&ppu, 10, 30);
     assert_eq!(ppu.read_register(OAMDATA), 0xff);
-    seek(&ppu, 10, 100);
+    // Dots 65-256: the primary-OAM read latch. Run dots 64 and 65 for real —
+    // 64 captures the base OAMADDR, 65 is the odd dot that fills the latch with
+    // the first sprite's Y coordinate.
+    seek(&ppu, 10, 64);
+    ppu.advance_by(2);
+    assert_eq!(ppu.position(), (10, 66));
+    assert_eq!(ppu.read_register(OAMDATA), 0x12);
+    // Dots 257-320: secondary OAM, which nothing was copied into.
+    seek(&ppu, 10, 300);
+    assert_eq!(ppu.read_register(OAMDATA), 0xff);
+    // And with rendering off the unit is not driving the line at all, so the
+    // read is the ordinary `OAMADDR` one.
+    ppu.write_register(PPUMASK, 0);
+    ppu.with_engine(|e| {
+        e.mask = 0;
+        e.mask_delay = 0;
+    });
+    ppu.write_register(OAMADDR, 0);
     assert_eq!(ppu.read_register(OAMDATA), 0x12);
 }
 
@@ -1083,7 +1115,7 @@ fn a_misaligned_oamaddr_reinterprets_oam_bytes() {
     ppu.poke_oam(5, 1);
     ppu.poke_oam(6, 0);
     ppu.poke_oam(7, 60);
-    ppu.write_register(PPUMASK, MASK_SPRITE | MASK_SPRITE_LEFT);
+    set_mask(&ppu, MASK_SPRITE | MASK_SPRITE_LEFT);
     // OAMADDR is forced back to zero at dots 257-320 of every rendering line,
     // so the write has to land after that window and before the next line's
     // evaluation starts at dot 65.
@@ -1140,7 +1172,7 @@ fn realize_announces_the_nmi_line() {
 fn a_cold_reset_returns_every_register_to_its_documented_value() {
     let (ppu, _, _) = new_ppu();
     ppu.write_register(PPUCTRL, 0xff);
-    ppu.write_register(PPUMASK, 0xff);
+    set_mask(&ppu, 0xff);
     ppu.advance_by(1000);
     ppu.reset(ResetKind::Cold);
     ppu.with_engine(|e| {

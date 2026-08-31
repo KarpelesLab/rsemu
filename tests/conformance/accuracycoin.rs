@@ -78,7 +78,11 @@ pub(crate) const RESULTS_BASE: u16 = 0x0400;
 pub(crate) const SCRATCH_START: u16 = 0x0500;
 
 /// Last byte of it.
-pub(crate) const SCRATCH_END: u16 = 0x05ff;
+///
+/// Past the end of the page: the two stress tests lay out one sample per dot of
+/// a 341-dot scanline, which runs to `$0654`, and a dump that stopped at the
+/// page boundary would cut it off exactly where the sprite fetches begin.
+pub(crate) const SCRATCH_END: u16 = 0x0654;
 
 /// What a result byte says about one test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -585,6 +589,9 @@ mod tests {
     fn the_scratch_region_is_captured_for_diagnosis() {
         let mut machine = FakeCoin::default();
         let report = run(&mut machine);
-        assert_eq!(report.scratch.len(), 0x100);
+        assert_eq!(
+            report.scratch.len(),
+            usize::from(SCRATCH_END - SCRATCH_START) + 1
+        );
     }
 }
