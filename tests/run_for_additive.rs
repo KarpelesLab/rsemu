@@ -17,11 +17,11 @@ mod workload;
 use rsemu::core::clock::GlobalTime;
 
 /// Run one workload for `span` in `pieces` equal steps and return its hash.
-fn hash_after(name: &str, span_ns: u64, pieces: u32) -> u64 {
-    let w = workload::all()
-        .into_iter()
-        .find(|w| w.name == name)
-        .expect("a known workload");
+///
+/// `None` when this build has no such workload, which is an ordinary
+/// `--no-default-features` build rather than a failure.
+fn hash_after(name: &str, span_ns: u64, pieces: u32) -> Option<u64> {
+    let w = workload::all().into_iter().find(|w| w.name == name)?;
     let mut booted = w.boot();
     let step = span_ns / u64::from(pieces);
     for _ in 0..pieces {
@@ -30,7 +30,7 @@ fn hash_after(name: &str, span_ns: u64, pieces: u32) -> u64 {
             .run_for(GlobalTime::from_nanos(step))
             .expect("the machine runs");
     }
-    booted.machine.state_hash().expect("it hashes")
+    Some(booted.machine.state_hash().expect("it hashes"))
 }
 
 /// The same span, taken whole and taken in pieces.
@@ -41,10 +41,17 @@ fn hash_after(name: &str, span_ns: u64, pieces: u32) -> u64 {
 #[test]
 fn one_span_and_many_pieces_are_compared_honestly() {
     const SPAN: u64 = 100_000_000; // 100 ms
+    let mut checked = 0usize;
     for name in ["nes-ntsc", "gameboy", "apple1"] {
-        let whole = hash_after(name, SPAN, 1);
-        let halves = hash_after(name, SPAN, 2);
-        let tenths = hash_after(name, SPAN, 10);
+        // A build with no machine feature has nothing to compare. That is an
+        // ordinary narrow build, not a failure -- but a build that has one and
+        // silently checks nothing would be, which is what `checked` is for.
+        let Some(whole) = hash_after(name, SPAN, 1) else {
+            continue;
+        };
+        let halves = hash_after(name, SPAN, 2).expect("the same workload again");
+        let tenths = hash_after(name, SPAN, 10).expect("the same workload again");
+        checked += 1;
         println!(
             "{name}: whole {whole:#018x}  halves {halves:#018x}  tenths {tenths:#018x}  \
              additive={}",
@@ -53,7 +60,7 @@ fn one_span_and_many_pieces_are_compared_honestly() {
         // Splitting the *same* way twice must agree. That is determinism, and
         // it is the part that must never regress.
         assert_eq!(
-            halves,
+            Some(halves),
             hash_after(name, SPAN, 2),
             "{name}: the same split must be reproducible"
         );
@@ -79,6 +86,15 @@ fn one_span_and_many_pieces_are_compared_honestly() {
         assert_eq!(
             halves, tenths,
             "{name}: the split shape is not supposed to matter, only its existence"
+        );
+    }
+
+    if workload::all().is_empty() {
+        eprintln!("no machine features enabled; nothing to compare");
+    } else {
+        assert!(
+            checked > 0,
+            "this build has workloads but none of the named ones — the list above is stale"
         );
     }
 }
