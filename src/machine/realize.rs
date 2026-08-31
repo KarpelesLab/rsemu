@@ -86,20 +86,20 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::fmt;
 
 use crate::core::clock::{ClockForest, DomainId, Rational as ClockRational};
+pub use crate::core::device::SinkPin;
 use crate::core::device::{Deferred, Device, DeviceClass, RealizeCtx, ResetKind};
 use crate::core::error::{Error, Result};
 use crate::core::props::Props;
 use crate::core::registry::Registry;
-use crate::core::sched::{Budget, Consumed, Scheduler, SchedulerConfig};
+use crate::core::sched::{Scheduler, SchedulerConfig};
 use crate::core::space::{
     AddressSpace, Mapping as SpaceMapping, Region, RegionRef, RequesterId, UnassignedPolicy,
 };
 use crate::core::state::MachineShape;
 use crate::core::value::Endian;
-use crate::core::wire::{Wire, WireId, WireIdAllocator, WireSink, WireSource};
+use crate::core::wire::{Wire, WireId, WireIdAllocator, WireSource};
 use crate::machine::machine::{DeviceEntry, Machine, MachineParts, Net, PinRef, RunAdapter};
 use crate::machine::resolver::{
     Clock, ClockParent, MapTarget, Mapping, ObjectId, Resolved, SpaceId,
@@ -109,30 +109,6 @@ use crate::machine::validate::{ClassSchema, ClassTable, realize_order};
 // ---------------------------------------------------------------------------
 // the Instance seam
 // ---------------------------------------------------------------------------
-
-/// A device's input pin: the sink to notify, and the line number *it* uses.
-///
-/// The line is the device's own numbering, not the machine's, because
-/// `WireSink::set_level` hands it back and only the device knows what it means.
-pub struct SinkPin {
-    /// The sink to deliver to.
-    ///
-    /// **The device must keep this alive itself.** A net holds only a weak
-    /// reference to its sinks — the machine owns devices and a wire merely
-    /// refers to them, which is §4.3's weak edge and the reason an IRQ/ack loop
-    /// does not leak.
-    pub sink: Arc<dyn WireSink>,
-    /// Which of the device's own input lines this is.
-    pub line: u32,
-}
-
-impl fmt::Debug for SinkPin {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `WireSink` is not `Debug`: it is a behaviour, and the interesting
-        // part here is which line it was connected to.
-        f.debug_struct("SinkPin").field("line", &self.line).finish()
-    }
-}
 
 /// What a device is told when the machine binds it to the rest of the machine.
 #[derive(Debug)]
@@ -176,68 +152,21 @@ impl<'a> BindCtx<'a> {
 ///
 /// Implemented beside [`Device`], never instead of it. Every method has a
 /// default that answers "I have none of those", so a device that only responds
-/// to MMIO implements [`Instance::region`] and nothing more.
+/// to MMIO implements [`Device::region`] and nothing more.
 ///
 /// See the module docs for why this is not on `Device` itself.
 pub trait Instance: Device {
-    /// A region a `map` statement may name. `""` is the device's whole
-    /// aperture, which is what `map cpubus 0 size 2K = wram` asks for.
-    fn region(&self, name: &str) -> Option<RegionRef> {
-        let _ = name;
-        None
-    }
-
-    /// The sink for input pin `port`, and the line number the device knows it
-    /// by. See [`SinkPin::sink`] for the ownership rule.
-    ///
-    /// `sources` is every id that will drive this pin's net, which the device
-    /// needs to build a [`FanIn`](crate::core::wire::FanIn): §4.3 requires a
-    /// sink to track *which* sources are asserting, `FanIn` is told its sources
-    /// at construction, and a device is constructed long before any `WireId`
-    /// exists. Passing them here is the only moment both are known.
-    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
-        let _ = (port, sources);
-        None
-    }
-
-    /// Take the output port for pin `port`.
-    ///
-    /// Called once per net the pin drives. A pin that drives two nets — one
-    /// `wire` statement to each — is handed two sources and must drive both.
-    ///
-    /// # Errors
-    ///
-    /// If the device has no such output pin.
-    fn connect(&self, port: &str, source: WireSource) -> Result<()> {
-        let _ = source;
-        Err(Error::Config {
-            at: port.to_string(),
-            message: "this device drives no such pin".to_string(),
-        })
-    }
-
-    /// Announce the level `port` idles at — the realize sweep (§4.3).
-    ///
-    /// A device whose outputs idle low may leave this alone: a fresh net is
-    /// already low. An inverter, or anything whose output is a function of its
-    /// inputs, must drive here or the machine comes up inconsistent.
-    fn announce(&self, port: &str) {
-        let _ = port;
-    }
-
-    /// Whether this class forwards a level within one instant, with no state.
-    ///
-    /// Feeds `realize_order`: a cycle of *these* has no topological order and
-    /// is rejected, while a cycle through a stateful device is an ordinary
-    /// handshake (§4.3). A device is sequential until it says otherwise.
-    fn combinational(&self) -> bool {
-        false
-    }
-
     /// Told which clock domain and address space it belongs to.
     ///
     /// Runs after every region is mapped, so a device may read through its
     /// space from here.
+    ///
+    /// This is the one connection method that is *not* on
+    /// [`Device`]: the rest were folded there so a
+    /// class registers once instead of twice. `bind` stays because
+    /// [`BindCtx`] is a machine-layer type — it disappears when `RealizeCtx`
+    /// grows the space and clock handles `ROADMAP.md` §4.4 implies, and then
+    /// `Instance` disappears with it.
     ///
     /// # Errors
     ///
@@ -246,31 +175,6 @@ pub trait Instance: Device {
     fn bind(&self, ctx: &BindCtx<'_>) -> Result<()> {
         let _ = ctx;
         Ok(())
-    }
-
-    /// Whether the scheduler should hand this device execution budgets.
-    ///
-    /// True for a CPU, a DMA engine, a coprocessor. Such a device must have a
-    /// clock domain; realize refuses one without.
-    fn is_runnable(&self) -> bool {
-        false
-    }
-
-    /// Run until the budget is exhausted and report what was consumed (§4.2).
-    ///
-    /// Takes `&self`, like §4.6's `Cpu::run`: a device is shared and holds its
-    /// state behind interior mutability.
-    fn run(&self, budget: Budget) -> Consumed {
-        let _ = budget;
-        Consumed::default()
-    }
-
-    /// An event this device posted has come due.
-    ///
-    /// Outward actions — driving a wire, starting a burst — go on `deferred`,
-    /// which the machine drains the moment this returns (§4.7).
-    fn event(&self, token: u64, deferred: &mut Deferred) {
-        let _ = (token, deferred);
     }
 }
 
@@ -1223,6 +1127,7 @@ mod tests {
     use super::*;
     use crate::core::device::{DeviceClass, PropertySpec};
     use crate::core::props::ValueKind;
+    use crate::core::sched::{Budget, Consumed};
     use crate::core::space::{MemAttrs, MemOps, MemResult, RamStore};
     use crate::core::state::{ChunkReader, ChunkWriter, Migrations, Sink, Source, StateReader};
     use crate::core::sync::Mutex;
@@ -1276,13 +1181,12 @@ mod tests {
             self.store.write_at(0, bytes)?;
             Ok(())
         }
-    }
-
-    impl Instance for Ram {
         fn region(&self, name: &str) -> Option<RegionRef> {
             name.is_empty().then(|| Arc::clone(&self.region))
         }
     }
+
+    impl Instance for Ram {}
 
     static RAM_CLASS: DeviceClass = DeviceClass {
         name: "test.ram",
@@ -1421,9 +1325,6 @@ mod tests {
             self.regs.token.store(word(3), Relaxed);
             Ok(())
         }
-    }
-
-    impl Instance for Timer {
         fn region(&self, name: &str) -> Option<RegionRef> {
             (name == "regs").then(|| Arc::clone(&self.region))
         }
@@ -1463,6 +1364,8 @@ mod tests {
             });
         }
     }
+
+    impl Instance for Timer {}
 
     static TIMER_CLASS: DeviceClass = DeviceClass {
         name: "test.timer",
@@ -1527,9 +1430,6 @@ mod tests {
             Ok(())
         }
         fn reset(&self, _kind: ResetKind) {}
-    }
-
-    impl Instance for Not {
         fn combinational(&self) -> bool {
             true
         }
@@ -1567,6 +1467,8 @@ mod tests {
             }
         }
     }
+
+    impl Instance for Not {}
 
     fn new_not() -> Not {
         Not {
@@ -1668,9 +1570,6 @@ mod tests {
             self.cycles.store(r.read_u64()?, Relaxed);
             Ok(())
         }
-    }
-
-    impl Instance for Cpu {
         fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
             if port != "irq" {
                 return None;
@@ -1680,15 +1579,6 @@ mod tests {
                 sink: Arc::clone(&self.irq) as Arc<dyn WireSink>,
                 line: 0,
             })
-        }
-
-        fn bind(&self, ctx: &BindCtx<'_>) -> Result<()> {
-            let space = ctx
-                .space()
-                .ok_or_else(|| config(ctx.path(), "a cpu needs an address space (`space = …`)"))?;
-            *self.space.lock() = Some(Arc::clone(space));
-            *self.requester.lock() = ctx.requester();
-            Ok(())
         }
 
         fn is_runnable(&self) -> bool {
@@ -1725,6 +1615,17 @@ mod tests {
                 attrs,
             );
             Consumed::new(budget.ticks)
+        }
+    }
+
+    impl Instance for Cpu {
+        fn bind(&self, ctx: &BindCtx<'_>) -> Result<()> {
+            let space = ctx
+                .space()
+                .ok_or_else(|| config(ctx.path(), "a cpu needs an address space (`space = …`)"))?;
+            *self.space.lock() = Some(Arc::clone(space));
+            *self.requester.lock() = ctx.requester();
+            Ok(())
         }
     }
 

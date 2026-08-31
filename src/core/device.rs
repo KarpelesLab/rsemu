@@ -28,14 +28,17 @@
 //! let the caller run it once your handler has returned. See [`Deferred`].
 
 use alloc::boxed::Box;
-use alloc::string::String;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
-use crate::core::space::RequesterId;
+use crate::core::sched::{Budget, Consumed};
+use crate::core::space::{RegionRef, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter};
+use crate::core::wire::{WireId, WireSink, WireSource};
 
 /// How deep a reset goes.
 ///
@@ -101,6 +104,28 @@ impl fmt::Debug for DeviceClass {
     }
 }
 
+/// A device's input pin: the sink to deliver to, and the line the device knows
+/// it by.
+///
+/// The `Arc` is the device's own — **a net holds only a weak reference to its
+/// sinks**, because the machine owns devices and a wire merely refers to them.
+/// That is `ROADMAP.md` §4.3's weak edge, and it is what stops an IRQ/ack loop
+/// leaking.
+pub struct SinkPin {
+    /// The sink to deliver to.
+    pub sink: Arc<dyn WireSink>,
+    /// Which of the device's own input lines this is.
+    pub line: u32,
+}
+
+impl fmt::Debug for SinkPin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `WireSink` is a behaviour, not data; the line number is the part
+        // worth printing.
+        f.debug_struct("SinkPin").field("line", &self.line).finish()
+    }
+}
+
 /// Anything a machine is built from.
 ///
 /// `Send + Sync` from the first commit rather than once threading "is needed":
@@ -140,6 +165,92 @@ pub trait Device: Send + Sync + fmt::Debug {
     fn load(&self, _r: &mut ChunkReader<'_>) -> Result<()> {
         Ok(())
     }
+
+    // ---------------------------------------------------------------------
+    // How this device connects to the rest of the machine.
+    //
+    // These live on `Device` rather than in a second trait beside it. The
+    // machine layer originally had to invent one, because there is no route
+    // from a `dyn Device` to another trait object without `Any` in the
+    // supertrait chain — and the cost was that every class had to be
+    // registered twice, once for construction and once for connection, with
+    // nothing keeping the two tables in step. Every method below is defaulted,
+    // so a device implements only what it actually has.
+    // ---------------------------------------------------------------------
+
+    /// A region a `map` statement may name.
+    ///
+    /// `""` is the device's whole aperture, which is what
+    /// `map cpubus 0 size 2K = wram` asks for.
+    fn region(&self, _name: &str) -> Option<RegionRef> {
+        None
+    }
+
+    /// The sink for input pin `port`, and the line the device knows it by.
+    ///
+    /// `sources` is every id that will drive this pin's net. §4.3 requires a
+    /// sink to track *which* sources are asserting — that is what makes
+    /// wired-OR correct when one source deasserts — and a `FanIn` is told its
+    /// sources at construction, while a device is constructed long before any
+    /// `WireId` exists. This call is the only moment both are known.
+    fn sink(&self, _port: &str, _sources: &[WireId]) -> Option<SinkPin> {
+        None
+    }
+
+    /// Take the output port for pin `port`.
+    ///
+    /// Called once per net the pin drives; a pin driving two nets is handed two
+    /// sources and must drive both.
+    ///
+    /// # Errors
+    ///
+    /// If the device drives no such pin.
+    fn connect(&self, port: &str, _source: WireSource) -> Result<()> {
+        Err(Error::Config {
+            at: port.to_string(),
+            message: "this device drives no such pin".to_string(),
+        })
+    }
+
+    /// Announce the level `port` idles at — the realize sweep (§4.3).
+    ///
+    /// A device whose outputs idle low may ignore this, since a fresh net is
+    /// already low. An inverter, or anything whose output is a function of its
+    /// inputs, must drive here or the machine comes up inconsistent.
+    fn announce(&self, _port: &str) {}
+
+    /// Whether this device forwards a level within one instant, with no state.
+    ///
+    /// Feeds the realize ordering: a cycle of *combinational* devices has no
+    /// topological order and is rejected, while a cycle through a stateful one
+    /// is an ordinary handshake (§4.3). A device is sequential until it says
+    /// otherwise, which is the safe default — claiming to be combinational
+    /// when you are not turns a legitimate handshake into a rejected machine.
+    fn combinational(&self) -> bool {
+        false
+    }
+
+    /// Whether the scheduler should hand this device execution budgets.
+    ///
+    /// True for a CPU, a DMA engine, a coprocessor. Such a device needs a clock
+    /// domain, and realize refuses one without.
+    fn is_runnable(&self) -> bool {
+        false
+    }
+
+    /// Run until the budget is exhausted, and report what was consumed (§4.2).
+    ///
+    /// Takes `&self`: a device is shared, and holds its state behind interior
+    /// mutability.
+    fn run(&self, _budget: Budget) -> Consumed {
+        Consumed::default()
+    }
+
+    /// An event this device posted has come due.
+    ///
+    /// Outward actions — driving a wire, starting a burst — go on `deferred`,
+    /// which the caller drains the moment this returns (§4.7).
+    fn event(&self, _token: u64, _deferred: &mut Deferred) {}
 }
 
 /// A device that performs its own accesses: DMA engines, bus masters, host
