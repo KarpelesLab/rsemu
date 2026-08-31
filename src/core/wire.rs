@@ -297,6 +297,43 @@ pub trait WireSink: Send + Sync {
     fn set_level(&self, src: WireId, line: u32, level: Level);
 }
 
+/// The reverse half of a vectored interrupt line.
+///
+/// A [`WireSink`] carries a *level*, which is all an edge-triggered NMI or a
+/// 6502's `/IRQ` ever needs. A vectored controller needs one thing more: when
+/// the CPU decides to take the interrupt it runs an **acknowledge cycle**, and
+/// the controller drives a vector back along the same piece of copper — that is
+/// what the 8259A's two `INTA` pulses are, and what a GIC's `IAR` read is.
+///
+/// The direction matters. Without it a controller never learns that its request
+/// was taken, so it cannot move the request from "pending" to "in service", and
+/// end-of-interrupt has nothing to clear. Modelling it as a latched byte the
+/// controller writes ahead of time gets the vector right and the priority
+/// bookkeeping wrong.
+///
+/// So the acknowledge travels with the net rather than through a device handle:
+/// the driving device offers one with [`Device::int_ack`], the realizer hands
+/// it to every sink on that net with [`Device::attach_int_ack`], and the sink
+/// keeps a [`Weak`](alloc::sync::Weak) reference — the machine owns devices and
+/// a wire merely refers to them (§4.3's weak edge), so a CPU holding its
+/// controller alive would be a cycle nothing could drop.
+///
+/// The core knows nothing about 8259As or GICs: this is a bus concept, like
+/// [`WireSink`] itself.
+pub trait IntAck: Send + Sync + fmt::Debug {
+    /// The CPU has taken the interrupt. Report the vector, and apply whatever
+    /// the acknowledge cycle changes inside the controller.
+    ///
+    /// Called from the CPU's execution path with no device lock held on the
+    /// CPU's side, so an implementation is free to take its own. It runs at
+    /// most once per interrupt taken, and it must be prepared to be called when
+    /// nothing is pending any more — a request can go away between the moment
+    /// the CPU samples the pin and the moment it acknowledges, and every real
+    /// controller answers that with a defined vector (the 8259A's spurious
+    /// `IR7`).
+    fn acknowledge(&self) -> u32;
+}
+
 /// Per-source level state: the bookkeeping that makes wired-OR possible.
 ///
 /// A sink with several drivers keeps one of these, updates it from
