@@ -1063,10 +1063,12 @@ impl Device for GbApu {
     }
 
     fn reset(&self, _kind: ResetKind) {
+        // The tick is the clock domain's position, not this device's state, and
+        // `Machine::reset` does not rewind domains.
+        let now = self.shared.tick.load(Ordering::Relaxed);
         let mut engine = self.shared.engine.lock();
         *engine = Engine::default();
-        self.shared.tick.store(0, Ordering::Relaxed);
-        self.shared.publish(&engine, 0);
+        self.shared.publish(&engine, now);
         drop(engine);
         self.shared.ring.lock().clear();
     }

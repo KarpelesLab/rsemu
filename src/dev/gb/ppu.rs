@@ -1564,8 +1564,23 @@ impl Device for GbPpu {
         }
     }
 
+    /// Back to power-on, **without rewinding the clock**.
+    ///
+    /// `Machine::reset` resets devices; it does not rewind clock domains, and
+    /// this device's tick *is* its domain's position rather than state of its
+    /// own. Zeroing it would leave the controller claiming dot 0 while the
+    /// forest stands wherever it stands, and the next catch-up would be asked
+    /// to walk every dot since power-on in one call — a hang on a mid-run
+    /// reset, and invisible to any test that only resets a fresh machine.
+    ///
+    /// So the frame restarts — `LY`, the dot within the line, the registers —
+    /// and the tick does not.
     fn reset(&self, _kind: ResetKind) {
-        self.shared.with_engine(|e| *e = Engine::new());
+        self.shared.with_engine(|e| {
+            let dots = e.dots;
+            *e = Engine::new();
+            e.dots = dots;
+        });
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {

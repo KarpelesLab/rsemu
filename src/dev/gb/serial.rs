@@ -423,10 +423,12 @@ impl Device for GbSerial {
     }
 
     fn reset(&self, kind: ResetKind) {
+        // The tick is the clock domain's position, not this device's state, and
+        // `Machine::reset` does not rewind domains.
+        let now = self.shared.tick.load(Ordering::Relaxed);
         let mut regs = self.shared.regs.lock();
         *regs = Regs::default();
-        self.shared.tick.store(0, Ordering::Relaxed);
-        self.shared.publish(&regs, 0);
+        self.shared.publish(&regs, now);
         drop(regs);
         if kind == ResetKind::Cold {
             self.clear_transcript();

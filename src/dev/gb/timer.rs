@@ -642,6 +642,10 @@ impl Device for GbTimer {
     /// `Regs::post_boot_dmg`, and for the same reason: rsemu ships no boot ROM,
     /// so the state one would have produced has to come from somewhere.
     fn reset(&self, _kind: ResetKind) {
+        // The tick is the clock domain's position, not this device's state, and
+        // `Machine::reset` does not rewind domains. Rewinding it here would ask
+        // the next catch-up to replay every clock since power-on.
+        let now = self.shared.tick.load(Ordering::Relaxed);
         let mut regs = self.shared.regs.lock();
         *regs = Regs::default();
         regs.counter = POST_BOOT_COUNTER;
@@ -650,8 +654,7 @@ impl Device for GbTimer {
         // edge that never happened.
         regs.edge = regs.edge_input();
         regs.apu_edge = regs.counter & DIV_APU_BIT != 0;
-        self.shared.tick.store(0, Ordering::Relaxed);
-        self.shared.publish(&regs, 0);
+        self.shared.publish(&regs, now);
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {

@@ -1113,3 +1113,53 @@ fn every_device_resets_to_a_documented_state() {
         device.reset(ResetKind::Bus);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Reset does not rewind a clock domain
+// ---------------------------------------------------------------------------
+
+/// A lazily-advanced device's tick is the **clock domain's** position, not
+/// state of its own, and `Machine::reset` resets devices without rewinding
+/// domains. A device that zeroes its tick therefore claims to be at the
+/// beginning of time while the forest stands wherever it stands, and the very
+/// next catch-up is asked to simulate every tick since power-on in one call —
+/// a hang on a mid-run reset, and a wildly wrong frame if it survives.
+///
+/// The nasty part is that it is invisible to a test that resets a *fresh*
+/// device, because there the domain really is at zero. So this one advances
+/// first, and it covers every lazily-advanced device on the console rather
+/// than the one the bug was found in.
+#[test]
+fn resetting_a_running_device_leaves_its_clock_where_the_domain_put_it() {
+    fn check<D: Device>(device: &D, name: &str, advance: u64) {
+        // `advance_to` is the catch-up entry point the scheduler uses.
+        Device::advance_to(device, advance);
+        let before = Device::current_tick(device);
+        assert_eq!(before, advance, "{name}: did not advance");
+        Device::reset(device, ResetKind::Cold);
+        assert_eq!(
+            Device::current_tick(device),
+            before,
+            "{name}: reset rewound the clock domain"
+        );
+        // And the device's own next event is still in the future, so catch-up
+        // makes progress rather than stalling or replaying.
+        if let Some(next) = Device::next_event_tick(device) {
+            assert!(
+                next > before,
+                "{name}: the next event is at {next}, not after {before}"
+            );
+        }
+    }
+
+    check(&GbPpu::new(), "gb.ppu", 12_345);
+    check(&GbTimer::new(), "gb.timer", 12_345);
+    check(&GbSerial::new(), "gb.serial", 12_345);
+    check(&GbApu::new(), "gb.apu", 12_345);
+    // $10 is MBC3 with a real-time clock, which is what makes the cartridge
+    // lazily advanced at all.
+    let cart = GbCart::new(
+        Cartridge::parse(synthetic_image(2, 0x10, 0x02, &[0x00])).expect("a valid image"),
+    );
+    check(&cart, "gb.cart", 12_345);
+}
