@@ -58,11 +58,37 @@ one snapshot format, one debugger, shared by every machine ever added.
 
 ## Status
 
-Scaffolding. Nothing is emulated yet — what exists is the crate skeleton, the
-error and value types, and a CI matrix that builds and tests every target from
-the first commit. The plan is ordered so that value lands early: the NES
-milestone is a usable emulator, then a RISC-V machine that boots Linux, then a
-PC that boots DOS through Windows XP.
+Early, but it runs things.
+
+**Five CPU cores**, each with a conformance number that was measured rather
+than claimed:
+
+| Core | Suite | Result |
+| --- | --- | --- |
+| MOS 6502 / RP2A03 | SingleStepTests 65x02 | **2,560,000 / 2,560,000** incl. bus traces |
+| Zilog Z80 | SingleStepTests z80, zexall | **1,604,000 / 1,604,000**, 67/67 |
+| RISC-V RV64GC | riscv-tests | **409 / 409** |
+| Intel 8086/8088 | SingleStepTests 8088 | **2,974,160 / 3,007,000** |
+| ARMv5TE | — | no public v5 corpus exists |
+
+**Three machines you can run.** `nes-ntsc` and `nes-pal` boot a cartridge,
+raise NMI and render — AccuracyCoin draws its menu. `apple1` is interactive
+over your terminal:
+
+```console
+$ cargo run --features machine-apple1 -- run apple1
+RSMON
+>FF00
+FF00: D8 A2 FF 9A A9 7F 8D 12
+```
+
+The framework underneath is complete: address spaces with priority and
+mirroring, an oscillator forest with exact intra-tree ratios, wires, devices,
+snapshots, and a `.machine` description language that goes parse → resolve →
+validate → realize → run.
+
+Not started: the IR and JIT (so everything is interpreted), hardware
+acceleration, and the PC. See [`ROADMAP.md`](ROADMAP.md).
 
 ## Build
 

@@ -21,7 +21,30 @@ This roadmap defines the architecture, the phase order, and the acceptance gate
 for each phase. It is written to be executed top-to-bottom; every phase ships
 something a person can actually run (§2).
 
-> **Status (2026-08-30):** nothing implemented. This document is the plan.
+> **Status (2026-08-31).** Phases 0-2 are done and phase 3 is most of the way
+> there. ~88k lines, 1,223 tests, one crate in `cargo tree`, `unsafe` confined
+> to two of the six sanctioned sites.
+>
+> **Five CPU cores**, each with an independently-run conformance number rather
+> than an assertion: MOS 6502 **2,560,000/2,560,000** (with full bus traces),
+> Z80 **1,604,000/1,604,000** plus `zexall` 67/67, RISC-V RV64GC **409/409**,
+> 8086/8088 **2,974,160/3,007,000** (the gap is one microcode residue in the
+> undefined flags after `IMUL`/`DIV`), and ARMv5TE (no usable public corpus for
+> v5 — see §12).
+>
+> **Three machines that run**: `nes-ntsc` and `nes-pal` — AccuracyCoin boots,
+> raises NMI and draws its menu — and `apple1`, which is interactive over a
+> terminal. Plus the DSL front-to-back: parse, resolve, validate, realize, run.
+>
+> Ordering deviated from the plan deliberately, and it was the right call.
+> ARM was pulled forward for a downstream crate; Z80, x86 and RISC-V were built
+> in parallel once the 6502 proved the shape. What did *not* deviate: every core
+> ships its suite, and the framework was finished before the emulation started.
+>
+> What remains for phase 3 is small and known: a controller at `$4016`, OAM DMA
+> at `$4014`, cartridge-driven nametable mirroring, and dot-exact rather than
+> scanline-exact intra-quantum staleness (§4.2). Phase 5's IR and JIT have not
+> been started.
 ---
 
 ## 0. Non-negotiables
