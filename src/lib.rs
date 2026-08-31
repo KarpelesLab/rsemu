@@ -102,6 +102,18 @@ pub fn build_info() -> alloc::string::String {
     if cfg!(feature = "machine-apple1") {
         features.push("machine-apple1");
     }
+    if cfg!(feature = "dev-pc") {
+        features.push("dev-pc");
+    }
+    if cfg!(feature = "dev-pc-video") {
+        features.push("dev-pc-video");
+    }
+    if cfg!(feature = "dev-pc-floppy") {
+        features.push("dev-pc-floppy");
+    }
+    if cfg!(feature = "machine-pc-at") {
+        features.push("machine-pc-at");
+    }
 
     let mut s = String::from("rsemu ");
     s.push_str(VERSION);

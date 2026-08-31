@@ -15,6 +15,7 @@
 //! | [`apu`] | `dev-nes-apu` | the RP2A03 audio half: channels, frame counter, DMC |
 //! | [`cart`] | `dev-nes-cart` | cartridge images and the mappers that decode them |
 //! | [`nes`] | `dev-nes-io` | the console's own I/O: controller ports, OAM DMA |
+//! | [`pc`] | `dev-pc` | an IBM PC/AT board's chips: 8259A, 8254, 8042, MC146818, 8237A, the firmware socket |
 //! | [`ppu`] | `dev-nes-ppu` | the RP2C02 picture unit: the per-dot pipeline |
 //! | [`riscv`] | `dev-riscv` | the RISC-V `virt` board: CLINT, PLIC, 16550, virtio, and the device tree generator |
 //! | [`wdc`] | `dev-wdc` | the W65C51N ACIA and W65C22 VIA, and a 6502 board's ROM |
@@ -38,6 +39,10 @@ pub mod cart;
 #[cfg(feature = "dev-nes-io")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-io")))]
 pub mod nes;
+
+#[cfg(feature = "dev-pc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-pc")))]
+pub mod pc;
 
 #[cfg(feature = "dev-nes-ppu")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-ppu")))]
