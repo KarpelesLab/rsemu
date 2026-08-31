@@ -30,6 +30,19 @@ pub(crate) trait NesMachine: Send {
     /// the [`buttons`] constants rather than literals.
     fn set_controller1(&mut self, buttons: u8);
 
+    /// Where the CPU is, for a report about a machine that stopped making
+    /// progress.
+    ///
+    /// A hang inside a test says nothing on its own: the ROM's result byte
+    /// stays "in progress" and the tally stops. The program counter says which
+    /// of the ROM's several *documented* infinite loops it is sitting in — the
+    /// DMA sync routines "rely on open bus behavior, with the consequence of an
+    /// infinite loop if not correctly emulated" — which turns a timeout into a
+    /// diagnosis.
+    fn cpu_state(&self) -> Option<String> {
+        None
+    }
+
     /// Read CPU-visible memory **without side effects**.
     ///
     /// This is a debugger read (`MemAttrs::debug`, `CLAUDE.md` Devices): it must
@@ -124,6 +137,35 @@ impl NesMachine for Nes {
 
     fn set_controller1(&mut self, buttons: u8) {
         self.pads.set(0, buttons);
+    }
+
+    fn cpu_state(&self) -> Option<String> {
+        use rsemu::core::state::{MachineShape, Migrations, Source as _, StateReader, StateWriter};
+        let cpu = self.machine.device("cpu")?;
+        let class = cpu.device().class();
+        // Through the snapshot surface, because the machine holds its devices
+        // as `dyn Device` and the register file's encoding is published there.
+        let mut shape = MachineShape::new();
+        shape.add_device("cpu", class.name).ok()?;
+        let mut writer = StateWriter::new(shape);
+        let mut chunk = writer.chunk("cpu", class.name, class.version).ok()?;
+        cpu.device().save(&mut chunk).ok()?;
+        let bytes = writer.to_vec().ok()?;
+        let reader = StateReader::new(&bytes).ok()?;
+        let chunk = reader
+            .load("cpu", class.name, class.version, &Migrations::new())
+            .ok()?;
+        let mut r = chunk.reader();
+        let a = r.read_u8().ok()?;
+        let x = r.read_u8().ok()?;
+        let y = r.read_u8().ok()?;
+        let s = r.read_u8().ok()?;
+        let p = r.read_u8().ok()?;
+        let pc = r.read_u16().ok()?;
+        let cycles = r.read_u64().ok()?;
+        Some(format!(
+            "A:{a:02X} X:{x:02X} Y:{y:02X} S:{s:02X} P:{p:02X} PC:{pc:04X} cyc:{cycles}"
+        ))
     }
 
     fn peek(&self, addr: u16) -> u8 {

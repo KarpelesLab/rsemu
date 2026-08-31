@@ -846,15 +846,15 @@ impl MemOps for ApuPort {
     }
 
     fn constraints(&self) -> AccessConstraints {
-        let word = AccessConstraints::word(Width::U8, Endian::Little);
-        if self.first == reg::STATUS {
-            // `$4015` is on the CPU's own die: reading it never puts anything
-            // on the external data bus, so the next open-bus read still sees
-            // the byte from before it (NESdev, "APU").
-            word.internal()
-        } else {
-            word
-        }
+        // Nothing here drives the master's data bus on a read. `$4015` is on
+        // the CPU's own die, so reading it never puts anything on the external
+        // bus and the next open-bus read still sees the byte from before it;
+        // `$4000`-`$4013` and `$4017` are write-only and no circuit in the
+        // console decodes a read of them at all (NESdev, "APU" and "Open bus
+        // behavior"). Either way the byte this port hands back *is* the bus
+        // value it was given, so leaving the latch alone is the only
+        // self-consistent thing to do.
+        AccessConstraints::word(Width::U8, Endian::Little).internal()
     }
 }
 

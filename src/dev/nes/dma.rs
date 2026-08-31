@@ -474,25 +474,30 @@ struct Gate {
 }
 
 impl Gate {
-    /// Perform whatever [`Shared::decide`] chose, outside the state lock.
-    fn perform(&self, act: Act, held: u64, dmc: Option<&Arc<DmcFetch>>) {
-        let Some((bus, attrs)) = self.shared.master() else {
-            return;
+    /// Perform whatever [`Shared::decide`] chose, outside the state lock, and
+    /// report the byte this cycle left on the data bus.
+    fn perform(&self, act: Act, held: u64, data: u8, dmc: Option<&Arc<DmcFetch>>) -> u8 {
+        let Some((space, attrs)) = self.shared.master() else {
+            return data;
         };
+        let attrs = attrs.with_bus(data);
         match act {
-            Act::Release | Act::Hold => {}
+            Act::Release | Act::Hold => data,
             Act::OamRead(addr) => {
-                let byte = self.read_with_conflict(&bus, attrs, addr, held);
+                let byte = self.read_with_conflict(&space, attrs, addr, held);
                 self.shared.latch_oam(byte);
+                byte
             }
             Act::OamWrite(byte) => {
-                let _ = bus.write(OAM_DATA_ADDR, Width::U8, u64::from(byte), attrs);
+                let _ = space.write(OAM_DATA_ADDR, Width::U8, u64::from(byte), attrs);
+                byte
             }
             Act::DmcRead(addr, serial) => {
-                let byte = self.read_with_conflict(&bus, attrs, u64::from(addr), held);
+                let byte = self.read_with_conflict(&space, attrs, u64::from(addr), held);
                 if let Some(dmc) = dmc {
                     dmc.complete(serial, byte);
                 }
+                byte
             }
         }
     }
@@ -515,13 +520,19 @@ impl Gate {
             // to conflict with.
             return byte;
         }
-        let other = bus.read(alias, Width::U8, attrs).unwrap_or(0) as u8;
-        byte & other
+        // Only a register that actually *drives* the wires conflicts. Most of
+        // the block does not — nothing in the console decodes a read of
+        // `$4000`-`$4014` — and a second responder that drives nothing would
+        // otherwise wire-AND the DMA's own byte away to zero.
+        match bus.read_driven(alias, Width::U8, attrs) {
+            Ok((other, true)) => byte & other as u8,
+            _ => byte,
+        }
     }
 }
 
 impl CycleGate for Gate {
-    fn arbitrate(&self, cycle: u64, held: u64, write: bool) -> Arbitration {
+    fn arbitrate(&self, cycle: u64, held: u64, bus: u8, write: bool) -> Arbitration {
         let dmc = self.shared.dmc();
         // The DMC is on the same die and the same clock: its request appears on
         // an exact cycle, so it has to be caught up before it is asked.
@@ -547,11 +558,11 @@ impl CycleGate for Gate {
         };
 
         let act = self.shared.decide(cycle, write, request, alive);
-        self.perform(act, held, dmc.as_ref());
+        let data = self.perform(act, held, bus, dmc.as_ref());
         match act {
             Act::Release => Arbitration::Release,
             Act::Hold => Arbitration::Hold,
-            _ => Arbitration::Steal,
+            _ => Arbitration::Steal(data),
         }
     }
 }
@@ -873,7 +884,7 @@ mod tests {
         let mut out = Vec::new();
         let mut cycle = from;
         loop {
-            let a = gate.arbitrate(cycle, held, false);
+            let a = gate.arbitrate(cycle, held, 0x40, false);
             out.push(a);
             cycle += 1;
             if a == Arbitration::Release {
@@ -942,14 +953,14 @@ mod tests {
         // Three write cycles in a row — an RMW then a push, say. The unit waits.
         for cycle in 1..=3 {
             assert_eq!(
-                gate.arbitrate(cycle, 0x8000, true),
+                gate.arbitrate(cycle, 0x8000, 0x40, true),
                 Arbitration::Release,
                 "cycle {cycle}"
             );
             assert!(!b.dma.halted());
         }
         // And takes the first read cycle it is offered.
-        assert_ne!(gate.arbitrate(4, 0x8000, false), Arbitration::Release);
+        assert_ne!(gate.arbitrate(4, 0x8000, 0x40, false), Arbitration::Release);
         assert!(b.dma.halted());
     }
 
@@ -962,7 +973,7 @@ mod tests {
         assert!(b.oam.written.lock().is_empty());
         assert_eq!(b.dma.transfers(), 0);
         assert_eq!(
-            b.dma.gate().arbitrate(1, 0x8000, false),
+            b.dma.gate().arbitrate(1, 0x8000, 0x40, false),
             Arbitration::Release,
             "and arms nothing"
         );
@@ -990,7 +1001,10 @@ mod tests {
         let b = bus();
         let gate = b.dma.gate();
         for cycle in 1..=8 {
-            assert_eq!(gate.arbitrate(cycle, 0x8000, false), Arbitration::Release);
+            assert_eq!(
+                gate.arbitrate(cycle, 0x8000, 0x40, false),
+                Arbitration::Release
+            );
         }
     }
 
@@ -1014,7 +1028,7 @@ mod tests {
         // Stopped half way through, which v1 of this chunk could not represent.
         let gate = b.dma.gate();
         for cycle in 1..=40 {
-            gate.arbitrate(cycle, 0x8000, false);
+            gate.arbitrate(cycle, 0x8000, 0x40, false);
         }
 
         let mut shape = MachineShape::new();
@@ -1054,6 +1068,117 @@ mod tests {
         wr(&b.space, 0x4014, 0x00);
         drive(&b.dma, 1, 0x8000);
         assert_eq!(b.dma.transfers(), 1);
+    }
+
+    /// A bus with the APU on it and a DMC whose sample lives in "ROM".
+    fn dmc_bus() -> (Bus, Arc<crate::dev::apu::Apu>) {
+        let b = bus();
+        let apu = Arc::new(
+            crate::dev::apu::Apu::new(&Props::new().with("region", "ntsc")).expect("an APU"),
+        );
+        // The sample: one byte of $05 at $ED40, which is what `$4012 = $B5`
+        // points at ($C000 + 0xB5 * 64).
+        let rom = Arc::new(RamStore::new(0x8000));
+        rom.write_at(0x6d40, &[0x05]).expect("in range");
+        {
+            let mut topo = b.space.topology();
+            topo.map(Arc::new(Region::ram("prg", rom)), 0x8000)
+                .expect("maps");
+            topo.map(apu.region("channels").expect("channels"), 0x4000)
+                .expect("maps");
+            topo.map(apu.region("status").expect("status"), 0x4015)
+                .expect("maps");
+        }
+        let fetch = apu
+            .interface(DMC_FETCH)
+            .and_then(|any| any.downcast::<DmcFetch>().ok())
+            .expect("the APU offers its DMC");
+        b.dma.attach_dmc(fetch);
+        (b, apu)
+    }
+
+    /// Run `cycles` CPU cycles of nothing but reads, the way a poll loop does,
+    /// and report the arbiter's answers.
+    ///
+    /// Each answer is what happens to the cycle *after* the one it is keyed by,
+    /// so a run of `n` answers is `n` stolen cycles plus the halt cycle that
+    /// started them — `n + 1` cycles the core lost.
+    ///
+    /// The APU is advanced by hand because there is no scheduler here; on a
+    /// machine the arbiter's own `DmcFetch::sync` does it.
+    fn poll_loop(
+        b: &Bus,
+        apu: &crate::dev::apu::Apu,
+        from: u64,
+        cycles: u64,
+    ) -> Vec<(u64, Arbitration)> {
+        let gate = b.dma.gate();
+        let mut out = Vec::new();
+        for cycle in from..from + cycles {
+            apu.advance_to(cycle);
+            let a = gate.arbitrate(cycle, 0x8000, 0x40, false);
+            if a != Arbitration::Release {
+                out.push((cycle, a));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_dmc_fetch_halts_the_core_for_three_cycles_or_four() {
+        // NESdev "DMA": a *load* fetch — one a `$4015` write scheduled — starts
+        // trying to halt on the get cycle of the second APU cycle after that
+        // write, and costs three cycles; a *reload*, scheduled when the output
+        // unit empties the buffer, starts on a put and costs four. Getting this
+        // wrong is not a rounding error: AccuracyCoin's DMA sync routines step
+        // the fetch through a poll loop by exactly the DMA's own cost, and one
+        // that is always three never visits two thirds of the loop.
+        let (b, apu) = dmc_bus();
+        apu.write(0x10, 0x4f); // loop, fastest rate
+        apu.write(0x12, 0xb5); // sample at $ED40
+        apu.write(0x13, 0x00); // one byte long
+        apu.write(0x15, 0x10); // and go
+        let scheduled = apu.ticks();
+
+        let acts = poll_loop(&b, &apu, scheduled + 1, 16);
+        let load: Vec<u64> = acts.iter().map(|(c, _)| *c).collect();
+        assert_eq!(
+            load.len() + 1,
+            3,
+            "a load fetch costs three cycles; answers at {load:?}"
+        );
+        assert!(
+            matches!(acts.last(), Some((_, Arbitration::Steal(0x05)))),
+            "and the last of them is the get, leaving the sample byte on the bus"
+        );
+        // Consecutive: a halt is not something the core can escape.
+        assert_eq!(load[1], load[0] + 1);
+
+        // Now the reload, when the output unit empties the buffer again — and
+        // the one after it, 432 CPU cycles later, which is the fastest rate's
+        // eight bits.
+        let after = load[1] + 2;
+        let acts = poll_loop(&b, &apu, after, 900);
+        let all: Vec<u64> = acts.iter().map(|(c, _)| *c).collect();
+        assert_eq!(all.len(), 6, "two reloads in the window: {all:?}");
+        assert_eq!(
+            all[3] - all[0],
+            432,
+            "the fastest rate is 432 cycles a byte"
+        );
+        let reload = &all[..3];
+        assert_eq!(
+            reload.len() + 1,
+            4,
+            "a reload fetch costs four cycles; answers at {reload:?}"
+        );
+        assert!(matches!(acts.last(), Some((_, Arbitration::Steal(0x05)))));
+        // A reload halts on a put, which is exactly what costs it the extra
+        // cycle a load does not spend.
+        assert!(!is_get(reload[0], 0), "a reload halts on a put");
+        for pair in reload.windows(2) {
+            assert_eq!(pair[1], pair[0] + 1, "consecutive: {reload:?}");
+        }
     }
 
     #[test]

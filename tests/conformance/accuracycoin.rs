@@ -338,6 +338,9 @@ pub(crate) fn run(machine: &mut dyn NesMachine) -> Report {
         }
         if let RunStatus::TimedOut { completed } = &mut status {
             *completed = machine.peek(ADDR_TALLY);
+            if let Some(cpu) = machine.cpu_state() {
+                println!("  the machine stopped making progress at {cpu}");
+            }
         }
     }
 

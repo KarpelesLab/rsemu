@@ -362,15 +362,20 @@ impl<'a> Exec<'a> {
         };
         let mut held = false;
         loop {
-            match gate.arbitrate(self.state.cycles, u64::from(addr), false) {
+            let bus = self.state.open_bus;
+            match gate.arbitrate(self.state.cycles, u64::from(addr), bus, false) {
                 Arbitration::Release => break,
                 Arbitration::Hold => {
                     held = true;
                     value = self.cycle_read(addr);
                 }
-                Arbitration::Steal => {
+                Arbitration::Steal(byte) => {
                     held = true;
                     self.stolen_cycle();
+                    // Somebody else drove the wires, and the core's latch is
+                    // the wires: the next read of an address nothing decodes
+                    // answers with the byte the DMA left behind.
+                    self.state.open_bus = byte;
                 }
             }
         }
@@ -443,7 +448,7 @@ impl<'a> Exec<'a> {
             self.state.last_fault = addr;
         }
         if let Some(gate) = self.rdy {
-            let _ = gate.arbitrate(self.state.cycles, u64::from(addr), true);
+            let _ = gate.arbitrate(self.state.cycles, u64::from(addr), value, true);
         }
     }
 

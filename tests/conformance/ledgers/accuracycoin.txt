@@ -19,7 +19,7 @@
 #     they can never appear here.
 #
 # ---------------------------------------------------------------------------
-# Measured 2026-08-31 against the pinned ROM: 108 of 141 pass, 33 fail.
+# Measured 2026-08-31 against the pinned ROM: 113 of 141 pass, 28 fail.
 # ---------------------------------------------------------------------------
 #
 # The earlier "81 of 125" was measured through a stale copy of the ROM's
@@ -88,8 +88,6 @@
 # Every test on the ROM's "APU Registers and DMA tests" page is about where that
 # fetch lands relative to a CPU access, so all of them report the same thing.
 
-6c                # $046C "DMA + Open Bus" code 1: LDA $4000 reads back $00
-                  # rather than floating. Needs (C) as well as the DMC DMA.
 6b                # $046B "DMC DMA Bus Conflicts" code 2: no DMC DMA, so no bus
                   # conflict with the APU registers to emulate.
 77                # $0477 "DMC DMA + OAM DMA" code 1: DMC DMA timing. There is
@@ -114,11 +112,6 @@
 # write-only register returns that byte rather than anything the device chose.
 # That latch belongs in cpu.mos6502, beside the cycle accounting.
 
-60                # $0460 "Instruction Timing" code 1: "the DMA should update
-                  # the data bus". Every cycle count from code 3 on is untested
-                  # until this passes; it is not a timing failure.
-6d                # $046D "Implied Dummy Reads" code 3: the data bus was not
-                  # updated when the DMC DMA occurred. (B) and (C) together.
 
 # ---------------------------------------------------------------------------
 # D. PPU staleness is scanline-exact, not dot-exact
@@ -157,11 +150,6 @@
                   # cleared yet on a get -> put transition.
 6a                # $046A "Delta Modulation Channel" code 1: $4015 bit 4 must
                   # follow a playing sample. See (B) — there is no sample fetch.
-5f                # $045F "Controller Strobing" code 4: the controllers must not
-                  # be strobed on a put -> get transition. Codes 1-3 pass, so
-                  # the latch and the shift register are right and only the
-                  # cycle phase is invisible to the device. "Controller
-                  # Clocking" ($047A) passes outright.
 62                # $0462 "NMI Overlap BRK" code 2: interrupt hijacking — an NMI
                   # arriving during BRK's vector fetch. The core polls
                   # interrupts per instruction, not per cycle.
@@ -177,13 +165,8 @@
 # fifteen do not. Each entry names the error code the ROM reported and the
 # subsystem it belongs to, from the README's own tables.
 
-88                # $0488 "DMA + $2002 Read" code 2: the DMC DMA's halt and
-                  # alignment cycles must read $2002. Cause (A)/(B): no /RDY,
-                  # no DMC DMA.
 8d                # $048D "$2002 flag timing" code 1: the sprite-0/overflow
                   # flags must clear on an exact dot. Cause (D).
-80                # $0480 "INC $4014" code 1: a read-modify-write on $4014 does
-                  # the write twice and so starts two OAM DMAs. Cause (A).
 83                # $0483 "Stale BG Shift Registers" code 3: the background
                   # shift registers keep their contents when rendering is
                   # switched off; rsemu's engine has no shift registers.
@@ -210,3 +193,13 @@
                   # around dot 130 of a rendered scanline must expose the live
                   # sprite-evaluation OAM address, which the engine's evaluator
                   # does not write back to OAMADDR. Codes 1-7 pass.
+
+# ---------------------------------------------------------------------------
+# I. Still open after the DMA unit landed
+# ---------------------------------------------------------------------------
+
+5f                # $045F "Controller Strobing" code 4: the controllers must
+                  # not be strobed when the strobe line is high for exactly one
+                  # *get* cycle — the 4021's reload is level-sensitive but only
+                  # sampled on puts. `nes.ports` has no clock at all, so it
+                  # cannot see the phase. Codes 1-3 pass.

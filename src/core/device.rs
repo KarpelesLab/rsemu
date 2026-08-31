@@ -409,9 +409,11 @@ pub enum Arbitration {
     /// how a DMA's halt and alignment cycles clock a NES controller port or
     /// advance `$2007`.
     Hold,
-    /// The arbiter drove the bus this cycle. The core charges a cycle and makes
-    /// no access of its own.
-    Steal,
+    /// The arbiter drove the bus this cycle, leaving this byte on it. The core
+    /// charges a cycle, makes no access of its own, and takes the byte into its
+    /// own data-bus latch — a DMA cycle is a bus cycle, and the next open-bus
+    /// read the core makes answers with whatever the DMA left there.
+    Steal(u8),
 }
 
 /// A bus master that can stop a core mid-instruction: the `/RDY` pin.
@@ -437,9 +439,10 @@ pub trait CycleGate: Send + Sync + fmt::Debug {
     /// Consulted after every bus cycle a core charges.
     ///
     /// `cycle` is the core's own cycle counter *after* that cycle, `held` is
-    /// the address the core is driving, and `write` says whether the cycle was
-    /// a write.
-    fn arbitrate(&self, cycle: u64, held: u64, write: bool) -> Arbitration;
+    /// the address the core is driving, `bus` is the byte the core last left on
+    /// the data bus — an arbiter that reads an undecoded address gets it back —
+    /// and `write` says whether the cycle was a write.
+    fn arbitrate(&self, cycle: u64, held: u64, bus: u8, write: bool) -> Arbitration;
 }
 
 /// A device that performs its own accesses: DMA engines, bus masters, host
