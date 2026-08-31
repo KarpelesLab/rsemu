@@ -326,6 +326,89 @@ Save states, rewind, screenshots, VNC display, and the monitor console are
 properties of the framework (§4.5, §8), so every machine gets them the day it
 exists — not once someone writes per-machine plumbing.
 
+### Three levels of execution
+
+A guest can be fed to rsemu at three depths, and all three share the same CPU
+cores, memory model, snapshot machinery, gdbstub and determinism rules. That
+sharing is the point: one core, three ways to drive it.
+
+| | what is emulated | what runs | analogue |
+| --- | --- | --- | --- |
+| **1. System** | firmware, buses, devices, a guest kernel | anything the silicon runs | `qemu-system-*` |
+| **2. Kernel** | buses and devices; firmware skipped | a kernel image at its entry point | `qemu-system-* -kernel` |
+| **3. Program** | nothing — no devices, no guest kernel | one process's user-mode code | `qemu-user`, gVisor |
+
+**Level 1** is what the phase plan builds: `nes-ntsc`, `pc-at`, `riscv-virt`
+with OpenSBI, Linux and EDK2.
+
+**Level 2** skips the firmware and hands a kernel image control at its entry
+with whatever boot protocol it expects — a device tree for RISC-V and ARM, the
+boot params structure for x86. The devices are still real. `riscv-virt` already
+does most of this through payload staging; what is missing is making it a
+first-class mode rather than a test harness.
+
+**Level 3 has no guest kernel at all.** The guest's `ecall`/`syscall`/`svc`
+does not vector to a handler *inside* the guest — it exits to an **emulated
+kernel written in Rust**, which services the call: files, memory, processes,
+threads, signals, sockets. There is no interrupt controller, no timer chip, no
+block device, because nothing in the guest can see one. A static or dynamically
+linked Linux binary runs directly.
+
+This is a different *product*, not just a faster path. Level 1 answers "what
+does this machine do"; level 3 answers "run this program somewhere it cannot
+hurt me" — a sandbox for `npm install`, an untrusted build script, a CI job.
+It starts in milliseconds rather than seconds because there is nothing to boot.
+
+**What level 3 needs from the framework** is one capability the other two do
+not: a core must be able to **exit on a syscall instruction** rather than
+vectoring internally. That is the same shape an accel backend needs for a VM
+exit (§10), so the two should share a seam rather than grow two.
+
+### 2.1 The nixvm merge
+
+Level 3 is not speculative: `KarpelesLab/nixvm` implements it, is **MIT and
+first-party**, and is being retired into this crate. It is a gVisor-style
+sandbox with no guest kernel — a Rust syscall kernel, ELF loading (static,
+static-PIE and dynamic, with a real `ld-musl` booting stock Alpine),
+multi-process and multi-threaded scheduling on a worker pool, an in-VM network
+stack, several filesystem backends, and KVM and HVF acceleration. Node.js runs
+on it, on the interpreter and on hardware. It boots Alpine in a browser.
+
+**What transfers directly**: the syscall kernel, the Linux ABI types, the ELF
+loader, the filesystem backends (procfs, passthrough, an overlay), the process
+and signal model, the network stack, and the sandbox policy.
+
+**What is a convergence question rather than a copy** — and must be answered
+before any code moves, because getting it wrong leaves the crate with two of
+everything:
+
+- **CPU cores.** nixvm carries its own aarch64 and x86-64 interpreters; rsemu
+  has `cpu/x86` (through i486) and `cpu/arm` (ARMv5TE, ARMv7E-M). These must
+  become *one* set. nixvm's **aarch64 is a core rsemu does not have**, and its
+  x86-64 goes beyond ours; both are gains, but they arrive as an A-profile and
+  an x86 core in rsemu's shape, gated by rsemu's features, not as a parallel
+  `vcpu/` tree.
+- **Soft-float.** nixvm's is dependency-free and models true 80-bit x87
+  extended precision and SSE `MXCSR` directed rounding with IEEE exception
+  flags, validated bit-for-bit against native arithmetic and against real
+  hardware through KVM. That is exactly what §9.1 specifies and it should
+  become §9.1's implementation rather than a second one.
+- **KVM and HVF.** These are §10's accel backends arriving early. nixvm's four
+  `unsafe` sites map onto rsemu's six sanctioned ones — KVM and HVF onto the
+  raw-syscall accel backends, its page-aligned guest-RAM allocation onto the
+  RAM host-pointer fast path, and its `*at(2)` passthrough onto `ffi`. **No
+  seventh site is created**, and any change to that must be a design review
+  rather than a merge artefact.
+
+**What must not transfer**: `ureq`. §0's dependency policy is absolute and
+`ureq` is not on the permitted list, so nixvm's `fetch` feature is dropped or
+re-implemented over the sanctioned stack. `fstool` and `compcol` are already
+permitted and come across unchanged.
+
+**Provenance still applies.** nixvm being ours removes the licence question
+about *its* code, not about anything it absorbed. §1's attribution audit runs
+over it before the merge, exactly as it did for `../gones`.
+
 ### The machine catalog
 
 `machines/` ships description files as **data**: consoles, boards, and PC
@@ -350,6 +433,7 @@ The phase plan (§13) is ordered so that value lands long before the framework i
 | Phase 3 | play NES games, with save states and a debugger |
 | Phase 4 | play Game Boy and Master System games on the same binary |
 | Phase 5 | boot a RISC-V Linux to a shell and debug the kernel over gdb |
+| Phase 5b | sandbox an untrusted build — `npm install`, a CI job — with no guest kernel and a millisecond start |
 | Phase 6 | run a PC — DOS, Win95, Linux, XP — with disks, USB and networking |
 | Phase 7 | run that PC at near-native speed under KVM |
 | Phase 9 | drive all of it over VNC, record and replay sessions, embed it in something else |
@@ -1815,6 +1899,41 @@ TB cache + chaining, SMC detection. RISC-V rv64gc frontend + interpreter.
 green; interpreter-vs-JIT differential clean over a randomized corpus;
 ≥ 100 MIPS single-core on the dev machine; save/restore works *across* an
 engine switch.
+
+### Phase 5b — User-mode execution and the nixvm merge
+
+Level 3 of §2's three (`qemu-user`/gVisor-shaped), and the retirement of
+`KarpelesLab/nixvm` into this crate. Sequenced after phase 5 because it wants
+the same soft-float and the same accel seam, and before phase 6 because a
+sandbox that runs `npm install` is shippable value that does not depend on
+booting Windows.
+
+The framework work is small and the payload is large, which is the right shape:
+
+- **A syscall exit on the CPU seam.** A core must be able to stop *at* an
+  `ecall`/`syscall`/`svc` and hand control out, rather than vectoring to a
+  guest handler. Shared with §10's VM-exit path rather than built twice.
+- **An emulated-kernel seam**, the level-3 analogue of a machine: a memory map
+  with no devices in it, plus an object that services syscalls. It is not a
+  `Device` and it is not on a bus.
+- **A process and thread model** the scheduler can drive, so that §4.2's rules
+  about who owns time still hold when the thing being scheduled is a guest
+  thread rather than a CPU.
+- Then the merge itself: kernel, ABI, loader, filesystems, network, sandbox.
+
+**Gate:** a stock Alpine `busybox sh` runs interactively from a rootfs image on
+at least two guest architectures; `node -e` executes real JavaScript to
+completion and exits cleanly; the same program produces identical output under
+the interpreter and under KVM; a snapshot taken mid-process restores and
+continues; and it runs in the browser, since the whole point of a portable
+syscall kernel is that it has no OS underneath it. The determinism rules hold
+throughout — a syscall's result crossing into the guest is exactly §0's
+"non-deterministic input crossing into the machine", so it goes through the
+record/replay seam or it is a determinism bug.
+
+**Note what this phase does *not* need**: no interrupt controller, no timer
+chip, no block device, no firmware. That is what makes it cheap, and it is also
+why it must not be allowed to grow a second device model by accident.
 
 ### Phase 6 — Buses and the PC
 > **This phase is split**, because as written it held PCI+PCIe, all of USB, the
