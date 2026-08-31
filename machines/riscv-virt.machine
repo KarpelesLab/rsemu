@@ -1,0 +1,199 @@
+# The RISC-V `virt` board — the first machine rsemu boots real system software
+# on.
+#
+#   rsemu run riscv-virt --media firmware=fw.bin
+#   rsemu run riscv-virt --media firmware=fw_payload.bin -p ram=256M
+#
+# There is no such chip as a "virt". This is the board every RISC-V toolchain
+# and every RISC-V kernel already knows how to target: one hart, a CLINT for the
+# timer, a PLIC for everything else, a 16550 for the console, and virtio-MMIO
+# for storage and entropy. No PCI, no ACPI, no legacy — and no hidden
+# convention, because **the guest learns the whole layout from a device tree
+# rsemu generates from this file** (docs/platforms/riscv-virt.md).
+#
+# That last point is worth stating plainly: the addresses below are not a
+# protocol. Change one, and the generated tree changes with it, and the guest
+# follows. They are the conventional RISC-V `virt` numbers because familiar
+# addresses are easier to debug, not because anything outside this repository
+# requires them.
+#
+# Sources: the RISC-V Privileged Architecture (CC-BY-4.0) for the CLINT's
+# semantics, the RISC-V PLIC specification, the National Semiconductor PC16550D
+# data sheet, OASIS VIRTIO 1.2 and the Devicetree Specification. Each device
+# module cites the sections it used.
+
+machine "riscv-virt" {
+  # How much DRAM the board has. A kernel with a ramdisk wants more than this;
+  # `-p ram=1G` is the usual answer.
+  param ram = 128M
+
+  # Which character port the console attaches to, so two of these can run in
+  # one process without typing at each other (`-p console=b`).
+  param console = "console"
+
+  # The kernel command line, handed over as `/chosen/bootargs`.
+  param cmdline = ""
+
+  # Which named power signal a guest's poweroff request lands on, so two of
+  # these can run in one process without stopping each other.
+  param power = "power"
+
+  # The virtio disk's size. It starts as zeroes; a real image goes in through
+  # the `disk` media slot once `virtio.blk` grows one
+  # (`-p storage=64M`, or add `image = "disk"` to the object below).
+  param storage = 16M
+
+  # -- crystals --------------------------------------------------------------
+  #
+  # Three, because the board has three. RISC-V defines no instruction timing at
+  # all, so `core` sets the wall-clock rate and nothing architectural; `rtc` is
+  # what `mtime` counts, and it is a genuinely separate can on real hardware,
+  # which is why it is its own tree rather than a divider off the core clock
+  # (ROADMAP.md §4.2); `uartclk` is the classic 1.8432 MHz UART crystal.
+  osc core    = 1000000000 Hz
+  osc rtc     = 10000000 Hz
+  osc uartclk = 1843200 Hz
+
+  # One flat 64-bit physical space. `unassigned` is left at its default of
+  # `fault`, so an access to a hole becomes an access-fault exception the guest
+  # can see, rather than a plausible-looking zero — a RISC-V hart *can* report
+  # one, unlike a 6502, and hiding it would hide our own memory-map bugs too.
+  space mem { width = 64 }
+
+  # -- the hart --------------------------------------------------------------
+  #
+  # It comes out of reset in the boot ROM at 0x1000, which sets a0 and a1 and
+  # jumps to 0x80000000. See `riscv.boot` below.
+  object cpu0 "cpu.riscv" {
+    clock  = core
+    space  = mem
+    engine = "interp"
+    xlen   = "rv64"
+    isa    = "imafdc"
+    hartid = 0
+    reset  = 0x1000
+  }
+
+  # -- memory ----------------------------------------------------------------
+  #
+  # Declared first among the things that are reset, because a cold reset clears
+  # it and the loaders at the bottom of this file must run afterwards.
+  object dram "ram" { size = ram }
+
+  # -- the timer -------------------------------------------------------------
+  #
+  # `timebase` is the same number as `osc rtc` above, and has to be: the clock
+  # domain is what `mtime` actually counts, and `timebase` is what the device
+  # tree tells the guest it counts at. They are written twice because a device
+  # cannot read its own domain's frequency — `BindCtx` carries the domain but
+  # not the clock forest — and that is a seam to close, not a design.
+  #
+  # KNOWN GAP: this counter is not connected to the hart's own `time` CSR, so
+  # `rdtime` reads zero. Firmware that reads the timer through the register
+  # block below is fine; an operating system that uses `rdtime` as its
+  # clocksource live-locks. src/dev/riscv/clint.rs says exactly what is missing.
+  object clint "riscv.clint" {
+    clock    = rtc
+    harts    = 1
+    timebase = 10000000
+  }
+
+  # -- the interrupt controller ---------------------------------------------
+  #
+  # Two contexts for the one hart: machine mode for the firmware, supervisor
+  # mode for the kernel it starts.
+  object plic "riscv.plic" {
+    sources    = 31
+    harts      = 1
+    supervisor = true
+  }
+
+  # -- the console -----------------------------------------------------------
+  #
+  # The clock is the chip's character rate: one tick is one opportunity to move
+  # a byte between the FIFOs and the host, and the scheduler is the only thing
+  # allowed to decide when that happens.
+  object uart "uart.ns16550" {
+    clock     = uartclk / 16
+    port      = console
+    frequency = 1843200
+  }
+
+  # -- power -----------------------------------------------------------------
+  #
+  # How a guest stops the machine on purpose. `signals::open("power")` is the
+  # host's end; a headless test watches it instead of watching a timeout.
+  object test "riscv.syscon" { signal = power }
+
+  # -- virtio ----------------------------------------------------------------
+  #
+  # Both are bus masters and walk their own descriptor rings, so both declare
+  # the space that DMA traverses (ROADMAP.md §4.4).
+  object blk "virtio.blk" {
+    space  = mem
+    size   = storage
+    serial = "rsemu-virt-0"
+  }
+
+  object rng "virtio.rng" {
+    space = mem
+    # Deterministic by construction: the same seed gives the same bytes every
+    # run, because rsemu has no record/replay seam for host entropy yet and a
+    # machine that drew from one would not be reproducible (ROADMAP.md §0).
+    # This is not a security primitive and the device tree does not claim it is.
+    seed = 1
+  }
+
+  # -- the reset vector and the device tree ----------------------------------
+  #
+  # Five instructions at 0x1000 and, just below them, a device tree generated
+  # from everything above at reset time. `harts`, `isa` and `mmu` are declared
+  # here rather than derived because a hart is not a region in any address
+  # space, so the generator cannot see one; everything with an address — every
+  # `reg`, every `interrupts` — comes out of the realized machine.
+  object boot "riscv.boot" {
+    space    = mem
+    entry    = 0x80000000
+    harts    = 1
+    isa      = "rv64imafdc"
+    mmu      = "sv39"
+    bootargs = cmdline
+    timebase = 10000000
+    model    = "rsemu riscv-virt"
+  }
+
+  # -- the memory map --------------------------------------------------------
+  map mem 0x00001000 size 0x0000f000 = boot   # reset vector, then the DTB
+  map mem 0x00100000 size 0x00001000 = test   # poweroff and reboot
+  map mem 0x02000000 size 0x00010000 = clint  # mtime, mtimecmp, msip
+  map mem 0x0c000000 size 0x00400000 = plic   # priority, enable, claim
+  map mem 0x10000000 size 0x00000100 = uart   # eight registers, sixteen times
+  map mem 0x10001000 size 0x00001000 = blk
+  map mem 0x10002000 size 0x00001000 = rng
+  map mem 0x80000000 size ram        = dram
+
+  # -- interrupts ------------------------------------------------------------
+  #
+  # The PLIC source numbers below are the *only* place they are written: the
+  # generated device tree reads each device's `interrupts` property back out of
+  # this wiring, by asking the PLIC which source the net landed on.
+  wire clint.mtip0 -> cpu0.mtip
+  wire clint.msip0 -> cpu0.msip
+  wire plic.meip0  -> cpu0.meip
+  wire plic.seip0  -> cpu0.seip
+  wire uart.irq    -> plic.irq10
+  wire blk.irq     -> plic.irq1
+  wire rng.irq     -> plic.irq2
+  wire test.reset  -> cpu0.reset
+
+  # -- what gets loaded ------------------------------------------------------
+  #
+  # Last, and that is load-bearing: `Machine::reset` runs devices in declaration
+  # order, a cold reset zeroes `dram`, and a firmware image written before that
+  # would be erased by the reset that ends realize.
+  object fw "riscv.loader" {
+    space = mem
+    image = "firmware"
+    addr  = 0x80000000
+  }
+}
