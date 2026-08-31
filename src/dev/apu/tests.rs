@@ -504,6 +504,51 @@ fn enabling_the_dmc_schedules_a_load_fetch_from_the_sample_address() {
 }
 
 #[test]
+fn a_4015_enable_holds_the_next_fetch_off_for_three_cycles() {
+    // "It just doesn't run until the DMA is enabled, 2 or 3 cycles after a
+    // write to $4015" - AccuracyCoin's "Delta Modulation Channel" subtests L,
+    // M and N, which write $4015 two, one and zero cycles before the timer
+    // reaches zero and expect the fetch delayed by one, two and three.
+    let apu = apu();
+    apu.write(0x12, 0x00);
+    apu.write(0x13, 0x00); // one byte
+    apu.advance(100);
+    apu.write(0x15, 0x10);
+    let request = apu.dma_request().expect("a load fetch is scheduled");
+    assert_eq!(
+        request.not_before,
+        request.at + 3,
+        "the enable latches three cycles after the write"
+    );
+    // A write that does not start the channel does not move the latch: it is
+    // the same value going back into the same flip-flop.
+    let armed = request.not_before;
+    apu.advance(4);
+    apu.write(0x15, 0x10);
+    assert_eq!(apu.dma_request().unwrap().not_before, armed);
+}
+
+#[test]
+fn two_fetches_cannot_be_back_to_back() {
+    // "The DMA cannot occur within 2 cycles of a previous DMC DMA"
+    // (AccuracyCoin, "Implicit DMA Abort" subtest 4).
+    let apu = apu();
+    apu.write(0x12, 0x00);
+    apu.write(0x13, 0x0f); // long enough to keep asking
+    apu.advance(100);
+    apu.write(0x15, 0x10);
+    let first = apu.dma_request().expect("a load fetch is scheduled");
+    assert!(apu.dma_complete(first.serial, 0x55));
+    // Run the output unit until the buffer empties and the reload is asked for.
+    apu.advance(8 * 428);
+    let next = apu.dma_request().expect("the reader wants the next byte");
+    assert!(
+        next.not_before > first.at,
+        "the fetch that follows one cannot halt on top of it"
+    );
+}
+
+#[test]
 fn the_memory_reader_wraps_from_ffff_to_8000() {
     let apu = apu();
     apu.write(0x12, 0xFF); // $C000 + 255 * 64 = $FFC0

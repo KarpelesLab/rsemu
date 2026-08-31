@@ -352,6 +352,15 @@ pub enum MapTarget {
         /// Where it was written.
         span: Span,
     },
+    /// `split(reads, writes)` — one address, two devices.
+    Split {
+        /// Where a read goes.
+        reads: Box<MapTarget>,
+        /// Where a write goes.
+        writes: Box<MapTarget>,
+        /// Where it was written.
+        span: Span,
+    },
 }
 
 impl MapTarget {
@@ -360,7 +369,8 @@ impl MapTarget {
         match self {
             MapTarget::Region { span, .. }
             | MapTarget::Mirror { span, .. }
-            | MapTarget::Alias { span, .. } => *span,
+            | MapTarget::Alias { span, .. }
+            | MapTarget::Split { span, .. } => *span,
         }
     }
 
@@ -369,6 +379,9 @@ impl MapTarget {
         match self {
             MapTarget::Region { object, .. } => *object,
             MapTarget::Mirror { inner, .. } | MapTarget::Alias { inner, .. } => inner.object(),
+            // The read side is the one an access is most likely to be about,
+            // and a target only reports one object.
+            MapTarget::Split { reads, .. } => reads.object(),
         }
     }
 }
@@ -1734,18 +1747,33 @@ impl Resolver<'_> {
                             span: *span,
                         })
                     }
+                    "split" => {
+                        let [reads, writes] = args.as_slice() else {
+                            return Err(Diagnostic::new(
+                                *span,
+                                "`split` takes the read side and the write side: \
+                                 `split(ports.port2, apu.frame)`",
+                            ));
+                        };
+                        Ok(MapTarget::Split {
+                            reads: Box::new(self.map_target(reads, scope, depth + 1)?),
+                            writes: Box::new(self.map_target(writes, scope, depth + 1)?),
+                            span: *span,
+                        })
+                    }
                     other => Err(Diagnostic::new(
                         callee.span,
                         format!(
-                            "no map function named `{other}`; the map functions are `mirror` and \
-                             `alias`"
+                            "no map function named `{other}`; the map functions are `mirror`, \
+                             `alias` and `split`"
                         ),
                     )),
                 }
             }
             other => Err(Diagnostic::new(
                 other.span(),
-                "a `map` target must name an object, a region, or `mirror(…)`/`alias(…)`",
+                "a `map` target must name an object, a region, or \
+                 `mirror(…)`/`alias(…)`/`split(…)`",
             )),
         }
     }
@@ -2509,6 +2537,32 @@ mod tests {
         assert_eq!(m.fan_in(ObjectId(1), "irq"), 2);
         assert_eq!(m.wires[2].from.object, ObjectId(4));
         assert_eq!(m.wires[2].from.port, "irq");
+    }
+
+    #[test]
+    fn a_split_map_target_resolves_both_sides() {
+        let m = machine(
+            "machine \"m\" {\n  \
+             space cpubus { width = 16 }\n  \
+             object a \"nes.input\" { }\n  \
+             object b \"nes.apu\" { }\n  \
+             map cpubus 0x4017 size 1 = split(a.port2, b.frame)\n\
+             }\n",
+        );
+        let MapTarget::Split { reads, writes, .. } = &m.maps[0].target else {
+            panic!("expected a split, got {:?}", m.maps[0].target);
+        };
+        assert!(matches!(**reads, MapTarget::Region { .. }), "{reads:?}");
+        assert!(matches!(**writes, MapTarget::Region { .. }), "{writes:?}");
+        // And a nonsense arity is a diagnostic, not a panic.
+        let e = error(
+            "machine \"m\" {\n  \
+             space cpubus { width = 16 }\n  \
+             object a \"nes.input\" { }\n  \
+             map cpubus 0x4017 size 1 = split(a.port2)\n\
+             }\n",
+        );
+        assert!(e.contains("the read side and the write side"), "{e}");
     }
 
     #[test]

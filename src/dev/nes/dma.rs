@@ -33,11 +33,21 @@
 //! DMC reload  as above, but it starts trying on a put            3 or 4
 //! ```
 //!
+//! Only the *get* is an access. The halt, the dummy and the alignment do
+//! nothing on the bus, so they are allowed to overlap each other and any access
+//! another transfer is making — "allowing cycles to be saved" (NESdev, DMA).
+//! That is why a DMC fetch landing inside a sprite copy costs the copy two
+//! cycles rather than four: the halt and dummy pass straight over the copy's
+//! own get and put, the DMC takes the next get, and the copy needs one
+//! alignment cycle to get back on its phase.
+//!
 //! A *load* fetch — one a `$4015` write scheduled — starts trying to halt on
 //! the get cycle of the second APU cycle after that write, which is the third
 //! or fourth CPU cycle after it. A *reload* — one the output unit scheduled by
-//! emptying the sample buffer — starts trying on the next put. Either way, if
-//! the CPU happens to be writing the halt fails and is retried the next cycle.
+//! emptying the sample buffer — starts trying on the next put, but never before
+//! the channel's enable latch has settled, three CPU cycles after the `$4015`
+//! write that started playback ([`DmaRequest::not_before`](crate::dev::apu::DmaRequest::not_before)). Either way, if the
+//! CPU happens to be writing the halt fails and is retried the next cycle.
 //!
 //! # Bus conflicts
 //!
@@ -75,8 +85,9 @@ const CLASS_NAME: &str = "nes.oamdma";
 /// The snapshot chunk version. Bump with the encoding, never on its own.
 ///
 /// v2 carries the live transfer: v1 could not, because a transfer took no time
-/// and so could never be caught half done.
-const STATE_VERSION: u32 = 2;
+/// and so could never be caught half done. v3 replaced a DMC fetch's single
+/// `dummy` flag with the count of no-operation cycles it still owes.
+const STATE_VERSION: u32 = 3;
 
 /// The name of the region that decodes `$4014`.
 pub const PORT: &str = "port";
@@ -122,8 +133,23 @@ struct Oam {
 struct Job {
     serial: u64,
     addr: u16,
-    /// The dummy cycle the wiki says always follows the halt.
-    dummy: bool,
+    /// No-operation cycles still owed before the fetch may take a get.
+    ///
+    /// A DMC fetch is *halt, dummy, [alignment], get*, and only the get is an
+    /// access. The halt and the dummy do nothing on the bus, so they are
+    /// allowed to **overlap** whatever else is using it: "no-operation cycles
+    /// are allowed to overlap with each other and with access cycles, allowing
+    /// cycles to be saved" (NESdev, DMA). A sprite copy already in progress
+    /// therefore carries on straight through them, which is why a DMC fetch
+    /// landing inside an OAM DMA costs it only two cycles - the get it steals
+    /// and the alignment the copy needs afterwards.
+    ///
+    /// Two when the fetch joins a core the sprite copy has already halted, and
+    /// one when the fetch's own halt cycle was the CPU read that has just been
+    /// stretched - including the case where that read is the sprite copy's halt
+    /// as well, because then "both halt cycles happen at the same time"
+    /// (AccuracyCoin.asm, MIT, (c) 2025 Chris Siebert).
+    noop: u8,
 }
 
 /// What one `arbitrate` call has to tell the DMC afterwards.
@@ -315,7 +341,8 @@ impl Shared {
                     state.job = Some(Job {
                         serial: r.serial,
                         addr: r.addr,
-                        dummy: true,
+                        // The stretched read was the halt; the dummy is left.
+                        noop: 1,
                     });
                 }
             }
@@ -327,23 +354,27 @@ impl Shared {
             state.job = Some(Job {
                 serial: r.serial,
                 addr: r.addr,
-                dummy: false,
+                // Halt and dummy both still to come, and both overlap the
+                // sprite copy rather than displacing it.
+                noop: 2,
             });
         }
 
         let next = cycle + 1;
         let get = is_get(next, phase);
 
-        // The dummy cycle the wiki says always follows a DMC halt.
-        if let Some(job) = &mut state.job
-            && job.dummy
-        {
-            job.dummy = false;
-            return Act::Hold;
+        // The halt and dummy cycles do nothing on the bus, so they fall through
+        // to the sprite copy rather than displacing it - see [`Job::noop`].
+        let mut fetch = None;
+        if let Some(job) = &mut state.job {
+            if job.noop > 0 {
+                job.noop -= 1;
+            } else if get {
+                // The DMC takes precedence over the sprite copy on a get.
+                fetch = state.job.take();
+            }
         }
-
-        // The DMC takes precedence over the sprite copy.
-        if get && let Some(job) = state.job.take() {
+        if let Some(job) = fetch {
             return Act::DmcRead(job.addr, job.serial);
         }
 
@@ -365,7 +396,8 @@ impl Shared {
         }
 
         if state.job.is_some() {
-            // A fetch waiting for its get, on a put.
+            // A fetch still counting off its no-op cycles, or waiting for its
+            // get on a put.
             return Act::Hold;
         }
 
@@ -518,20 +550,20 @@ impl Gate {
         match act {
             Act::Release | Act::Halted | Act::Hold => data,
             Act::OamRead(addr) => {
-                let byte = self.read_with_conflict(&space, attrs, addr, held);
+                let (byte, pins) = self.read_with_conflict(&space, attrs, addr, held);
                 self.shared.latch_oam(byte);
-                byte
+                pins
             }
             Act::OamWrite(byte) => {
                 let _ = space.write(OAM_DATA_ADDR, Width::U8, u64::from(byte), attrs);
                 byte
             }
             Act::DmcRead(addr, serial) => {
-                let byte = self.read_with_conflict(&space, attrs, u64::from(addr), held);
+                let (byte, pins) = self.read_with_conflict(&space, attrs, u64::from(addr), held);
                 if let Some(dmc) = dmc {
                     dmc.complete(serial, byte);
                 }
-                byte
+                pins
             }
         }
     }
@@ -549,26 +581,83 @@ impl Gate {
     /// bits 4-0, so a conflicting read of `$4016` comes back as the sample
     /// byte's top three bits with the controller's in the bottom.
     ///
-    /// Not a wired-AND: a register that drives nothing — `$4015`, which is
-    /// internal, and the whole write-only stretch below it — leaves the DMA's
-    /// byte alone rather than erasing it.
+    /// Not a wired-AND: a register that drives nothing — the whole write-only
+    /// stretch of the block — leaves the DMA's byte alone rather than erasing
+    /// it.
     ///
-    /// The **other** half of the same decode is not modelled yet: a DMA read of
-    /// an address inside the block while the core is *outside* it should reach
-    /// nothing at all, since the block is on the 2A03 die and there is no
-    /// external responder behind it. "APU Register Activation" code 4 is
-    /// exactly that, and the ledger says why it is still open.
-    fn read_with_conflict(&self, bus: &AddressSpace, attrs: MemAttrs, addr: u64, held: u64) -> u8 {
-        let external = bus.read(addr, Width::U8, attrs).unwrap_or(0) as u8;
-        if held & INTERNAL_MASK != INTERNAL_BASE {
-            return external;
+    /// # Two answers, because there are two buses
+    ///
+    /// The byte the transfer **carries** and the byte left on the **pins** are
+    /// not always the same, and AccuracyCoin measures each of them separately.
+    /// `$4015` is on the 2A03's own die: its value reaches the DMA over the
+    /// internal bus and shows up in OAM — "APU Register Activation" reads the
+    /// whole block through an OAM DMA over RAM full of `$FF` and expects the
+    /// APU status byte, not the `$FF` — but it never drives the pins, so a CPU
+    /// reading open bus afterwards still sees what the cartridge put there.
+    /// "DMC DMA Bus Conflicts" is the other half of that and says so in its own
+    /// preamble: "the value the CPU reads, and the value that the DMC DMA
+    /// reloads the shift counter with ... these values are different, and this
+    /// test can only check for the value the CPU sees" (AccuracyCoin.asm, MIT,
+    /// (c) 2025 Chris Siebert).
+    ///
+    /// Returns `(carried, pins)`.
+    ///
+    /// The **other** half of the same decode is the same statement read
+    /// backwards: a DMA read of an address inside the block while the core is
+    /// *outside* it reaches nothing at all, because the block is on the 2A03
+    /// die and there is no external responder behind it. An OAM DMA over page
+    /// `$40` therefore does not clear the frame interrupt flag, which is what
+    /// "APU Register Activation" code 4 measures.
+    fn read_with_conflict(
+        &self,
+        bus: &AddressSpace,
+        attrs: MemAttrs,
+        addr: u64,
+        held: u64,
+    ) -> (u8, u8) {
+        let core_inside = held & INTERNAL_MASK == INTERNAL_BASE;
+        if !core_inside && addr & INTERNAL_MASK == INTERNAL_BASE {
+            // The other half of the decode: the block is selected by bits 15-5
+            // of the *core's* address, so with the core outside it nothing
+            // answers a DMA aimed inside it and the data bus keeps what it had.
+            // "If the OAM address bus is pointing to $4000 through $401F, and
+            // the 6502 address bus isn't, then the OAM DMA will only read open
+            // bus from that range" (AccuracyCoin.asm, "APU Register
+            // Activation", MIT, (c) 2025 Chris Siebert).
+            return (attrs.bus, attrs.bus);
+        }
+        let external = match bus.read_driven(addr, Width::U8, attrs) {
+            Ok((v, _)) => v as u8,
+            Err(_) => attrs.bus,
+        };
+        if !core_inside {
+            return (external, external);
         }
         let alias = INTERNAL_BASE | (addr & 0x1f);
         // The register is handed the DMA's byte as its bus value, so whatever
         // it does not drive floats through.
-        match bus.read_driven(alias, Width::U8, attrs.with_bus(external)) {
-            Ok((v, true)) => v as u8,
-            _ => external,
+        //
+        // Whether it drives the *external* pins decides what happens when
+        // something out on the cartridge is driving them too. `$4015` is on the
+        // 2A03's own die and leaves the pins alone, so a sample fetched from
+        // ROM at an address ending `$15` comes back as the ROM byte and not as
+        // the APU's status — which is what makes "DMC DMA Bus Conflicts" work.
+        // But when nothing external answered at all, the internal register's
+        // value is the only thing on the bus and the DMA reads it: an OAM DMA
+        // over a page nothing decodes comes back full of APU status bytes,
+        // which is what "APU Register Activation" measures.
+        // The aliased register is handed the DMA's byte on *both* buses: the
+        // transfer's own byte is what the internal bus is carrying while it
+        // runs, so `$4015`'s open-bus bit comes from that and not from the
+        // core's. "APU Register Activation" reads the block through a DMA over
+        // RAM full of `$FF` and expects `$24` — bit 5 of the DMA's byte.
+        let attrs = attrs.with_bus(external).with_core_bus(external);
+        match bus.read_driven(alias, Width::U8, attrs) {
+            Ok((v, drives)) => {
+                let v = v as u8;
+                (v, if drives { v } else { external })
+            }
+            Err(_) => (external, external),
         }
     }
 }
@@ -590,8 +679,10 @@ impl CycleGate for Gate {
                     // or fourth CPU cycle. A reload starts on the next put.
                     start: match r.kind {
                         DmaKind::Load => phase_at_or_after(r.at + 3, phase, true),
+                        // A fetch the timer scheduled while a `$4015` enable
+                        // was still settling cannot halt until it has.
                         DmaKind::Reload | DmaKind::Abort => {
-                            phase_at_or_after(r.at + 1, phase, false)
+                            phase_at_or_after(r.at + 1, phase, false).max(r.not_before)
                         }
                     },
                     abort: r.kind == DmaKind::Abort,
@@ -706,13 +797,13 @@ impl Device for OamDma {
                 w.write_bool(true)?;
                 w.write_u64(job.serial)?;
                 w.write_u16(job.addr)?;
-                w.write_bool(job.dummy)
+                w.write_u8(job.noop)
             }
             None => {
                 w.write_bool(false)?;
                 w.write_u64(0)?;
                 w.write_u16(0)?;
-                w.write_bool(false)
+                w.write_u8(0)
             }
         }
     }
@@ -729,7 +820,7 @@ impl Device for OamDma {
         let has_job = r.read_bool()?;
         let serial = r.read_u64()?;
         let addr = r.read_u16()?;
-        let dummy = r.read_bool()?;
+        let noop = r.read_u8()?;
 
         let mut state = self.shared.state.lock();
         state.page = page;
@@ -740,11 +831,7 @@ impl Device for OamDma {
             latch: latched.then_some(latch),
         });
         state.halted = halted;
-        state.job = has_job.then_some(Job {
-            serial,
-            addr,
-            dummy,
-        });
+        state.job = has_job.then_some(Job { serial, addr, noop });
         Ok(())
     }
 
@@ -1204,6 +1291,43 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn a_dmc_fetch_inside_a_sprite_copy_costs_it_only_two_cycles() {
+        // "No-operation cycles are allowed to overlap with each other and with
+        // access cycles, allowing cycles to be saved" (NESdev, DMA). A DMC
+        // fetch's halt and dummy do nothing on the bus, so a sprite copy runs
+        // straight through them; what it loses is the get the DMC takes and the
+        // alignment cycle it then needs to get back on its own phase.
+        // AccuracyCoin's "DMC DMA + OAM DMA" sweeps the two across each other a
+        // cycle at a time and its answer key is full of twos.
+        let run = |with_dmc: bool| -> u64 {
+            let (b, apu) = dmc_bus();
+            apu.write(0x10, 0x0f); // no looping, fastest rate
+            apu.write(0x12, 0xb5); // the sample at $ED40
+            apu.write(0x13, 0x00); // one byte, so there is exactly one fetch
+            wr(&b.space, 0x4014, 0x00);
+            let gate = b.dma.gate();
+            let from = apu.ticks();
+            let mut cycle = from;
+            while b.dma.transfers() == 0 {
+                if with_dmc && cycle == from + 100 {
+                    apu.advance_to(cycle);
+                    apu.write(0x15, 0x10);
+                }
+                apu.advance_to(cycle);
+                gate.arbitrate(cycle, 0x8000, 0x40, false);
+                cycle += 1;
+                assert!(cycle < from + 1000, "the sprite copy never finished");
+            }
+            cycle - from
+        };
+        assert_eq!(
+            run(true) - run(false),
+            2,
+            "a fetch inside a copy costs two cycles, not its own four"
+        );
     }
 
     #[test]

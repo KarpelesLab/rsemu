@@ -1152,7 +1152,9 @@ static APU_PROPERTIES: &[PropertySpec] = &[
 /// The device class, as `nes.apu` in a machine description.
 pub static APU_CLASS: DeviceClass = DeviceClass {
     name: "nes.apu",
-    version: 1,
+    // v2 appended the DMC's enable latch: the cycle a `$4015` write that
+    // started playback lets a fetch halt the CPU from.
+    version: 2,
     summary: "NES APU (RP2A03 / RP2A07 / UA6527P audio): two pulse, triangle, noise, DMC",
     properties: APU_PROPERTIES,
     construct: |props| Ok(Box::new(Apu::new(props)?) as Box<dyn Device>),

@@ -60,9 +60,9 @@ machine "nes-pal" {
   map cpubus 0x4014 size 0x0001 = dma.port
   map cpubus 0x4015 size 0x0001 = apu.status
   map cpubus 0x4016 size 0x0001 = ports.port1
-  # $4017 goes to the APU for the reason nes-ntsc.machine spells out: one
-  # address, two registers, and the frame counter is the half worth having.
-  map cpubus 0x4017 size 0x0001 = apu.frame
+  # $4017 is split for the reason nes-ntsc.machine spells out: one address, two
+  # registers, the frame counter on a write and controller two on a read.
+  map cpubus 0x4017 size 0x0001 = split(ports.port2, apu.frame)
   map cpubus 0x8000 size 0x8000 = cart.prg
 
   # -- the PPU bus -----------------------------------------------------------

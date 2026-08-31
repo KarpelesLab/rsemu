@@ -49,9 +49,8 @@ something a person can actually run (§2).
 > on a timer no machine has supplied yet.
 >
 > **Seven machines that run**, plus four synthetic boards. `nes-ntsc` and
-> `nes-pal` pass **AccuracyCoin 130/141** — the whole-machine gate, run
-> headlessly, with the eleven remaining failures ledgered and each traced to a
-> named piece of hardware. Also `gameboy`; `apple1` and `beneater-6502`,
+> `nes-pal` pass **AccuracyCoin 141/141** — the whole-machine gate, run
+> headlessly, with an empty known-failures ledger. Also `gameboy`; `apple1` and `beneater-6502`,
 > interactive over a terminal; and `riscv-virt`, which is the one that boots
 > real system software: **OpenSBI 1.6 completely**, on a device tree generated
 > from the realized machine rather than shipped, then **Linux 6.12 all the way
@@ -68,8 +67,8 @@ something a person can actually run (§2).
 > That 141 is itself a finding. The conformance table described an *older* ROM
 > release: it listed three tests the pinned ROM never writes and omitted
 > nineteen it does run, so the long-quoted "81/125" was measuring the wrong
-> denominator. Regenerated from the ROM's own menu, the honest before-and-after
-> is **85/141 → 130/141**.
+> denominator. Regenerated from the ROM's own menu, the honest progression is
+> **85/141 → 130/141 → 141/141**.
 >
 > The synthetic boards are `spi-panel`, `arm926`, `z80-mini` and `m68k-mini`:
 > minimum machines that exist so a subsystem has somewhere real to run. Each is
@@ -101,11 +100,16 @@ something a person can actually run (§2).
 > cycles is guest-visible. `unassigned = open-bus` answers with the master's own
 > data bus.
 >
-> What is left on the NES is written down in
-> `tests/conformance/ledgers/accuracycoin.txt`: the PPU has no address bus of
-> its own — a 2C02 access is two dots and an external octal latch, and four
-> tests are about nothing else — and the DMC's phase machine does not overlap
-> the OAM DMA's cycles. Phase 5's IR and JIT have not been started.
+> The NES is finished, and the last eleven tests are written up in
+> `tests/conformance/ledgers/accuracycoin.txt`. The 2C02 has an **address bus of
+> its own**: an access is two dots and an octal latch on the cartridge board,
+> and the low eight address bits live apart from the high six. The DMC's halt
+> and dummy cycles are no-ops that **overlap** whatever else is using the bus,
+> which is why a sample fetch inside a sprite copy costs it two cycles and not
+> four. And `$4017` is two registers on one address — the frame counter on a
+> write, controller two on a read — which `core::space` grew `Region::split`
+> and the DSL grew `split(reads, writes)` to say. Phase 5's IR and JIT have not
+> been started.
 ---
 
 ## 0. Non-negotiables
