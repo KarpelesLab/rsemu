@@ -94,23 +94,17 @@ inherited as folklore.
 **Later adaptations are separate works, and their own licence governs.** Ben
 Eater's well-known port to a 65C51 ACIA is the case in point. The
 [gist](https://gist.github.com/beneater/8136c8b7f2fd95ccdd4562a498758217)
-itself carries no licence header — but the page that publishes it,
-<https://eater.net/6502>, states that **all code used in his videos is released
-under Creative Commons Attribution (CC-BY)**, and lists `wozmon.s` and a
-prebuilt `wozmon.bin` among them.
+itself carries no licence header. The licence is stated on the page that
+publishes it: <https://eater.net/6502> says **all code used in his videos is
+released under a Creative Commons Attribution (CC-BY) licence**, and lists
+`wozmon.s` and a prebuilt `wozmon.bin` among the files it covers. (The site is
+client-rendered, so read it in a browser; `curl` returns only the app shell.)
 
 CC-BY is permissive and redistributable alongside MIT **provided attribution
 travels with it**: credit Ben Eater, name the licence, and say the file was
 modified if it was. Creative Commons themselves advise against CC licences for
 software, but that is advice about fitness, not a defect in the grant — it is a
 valid permission and we may rely on it.
-
-> **Provenance of this determination:** the licence statement was read on
-> `eater.net/6502` by the project owner. It could not be verified from a
-> terminal here — the site is a client-rendered app and every path returns the
-> same shell, so `curl` sees neither the licence text nor the linked assets.
-> Anyone re-checking should open the page in a browser rather than expect to
-> reproduce it with `curl`.
 
 So both layers are usable: the 1976 listing is public domain, and Eater's
 modifications are CC-BY. Attribution is required for the latter and costs
