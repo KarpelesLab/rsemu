@@ -1,5 +1,10 @@
 # rsemu
 
+[![CI](https://github.com/KarpelesLab/rsemu/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/rsemu/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/rsemu.svg)](https://crates.io/crates/rsemu)
+[![docs.rs](https://img.shields.io/docsrs/rsemu)](https://docs.rs/rsemu)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **A multiplatform emulator in pure Rust, built from the bottom up.**
 
 rsemu is an emulator — the thing you point at a ROM or a disk image and run.
