@@ -12,7 +12,7 @@
 //! | Backend | Primitives | Selected when |
 //! | --- | --- | --- |
 //! | [`native_std`] | `std::sync` + `std::thread` | `std`, non-wasm |
-//! | `single` | borrow-checked cells, jobs run inline | everything else |
+//! | `single` | atomic cells, jobs run inline, waiting is a panic | everything else |
 //! | `native-raw` | futex / `WaitOnAddress` by raw syscall | *not implemented* |
 //! | `wasm-atomics` | shared memory + `Atomics.wait` | *not implemented* |
 //!
@@ -23,6 +23,21 @@
 //! contention. `ROADMAP.md` §4.7 requires a machine to produce the same state
 //! hash under `single` and under `native-std`; the tests at the bottom of this
 //! file run one identical workload through both and compare.
+//!
+//! `single` creates no threads. It does not get to assume the *process* has one
+//! — a `no_std` build on a hosted target selects it, and `cargo test` runs that
+//! build on parallel libtest threads — so its locks exclude for real. What is
+//! single-threaded is the waiting, not the safety; see [`Global`].
+//!
+//! # Machine state and process-wide state
+//!
+//! [`Mutex`] and [`RwLock`] are for state a machine owns, and under `single` an
+//! acquisition that would block is reported as the deadlock it is. A `static`
+//! is not machine state: it is reachable from every thread in the process, the
+//! test harness's included, so contention on it is legitimate and the lock must
+//! wait. That is [`Global`], and the rule is mechanical — **if it lives in a
+//! `static`, it is a `Global`** — enforced by a test in this file that reads
+//! the crate's own source.
 //!
 //! The two unimplemented backends are extension points, not omissions. Both
 //! plug in at the same place: add a module beside `single` exporting the same
@@ -88,9 +103,6 @@
 use ::core::fmt;
 use ::core::marker::PhantomData;
 
-#[cfg(all(debug_assertions, feature = "std"))]
-use ::core::cell::Cell;
-
 // Atomics are re-exported rather than reimplemented — they are already
 // portable, and a hot path that had to go through a wrapper would not be a hot
 // path. Device code says `sync::AtomicU32`, never `core::sync::atomic`, so the
@@ -118,7 +130,8 @@ pub use ::core::sync::atomic::{AtomicI64, AtomicU64};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Backend {
-    /// No threads: locks are borrow-checked cells and jobs run inline.
+    /// Creates no threads: jobs run inline, and a lock that would block says
+    /// so rather than waiting.
     Single,
     /// `std::sync` primitives and a pool of `std::thread` workers.
     NativeStd,
@@ -368,20 +381,29 @@ pub fn violates_lock_order(rank: LockRank) -> bool {
 
 /// Per-thread rank bookkeeping, compiled only into debug builds.
 ///
-/// Two storage strategies, because there is no portable per-thread storage
-/// below `std`: `#[thread_local]` is unstable, so a `no_std` build gets process
-/// globals. That is sound there and only there — a `no_std` build selects the
-/// `single` backend, which has exactly one thread by construction.
+/// Three storage strategies, because there is no portable per-thread storage
+/// below `std` — `#[thread_local]` is unstable — and because "no `std`" does
+/// not imply "one thread":
 ///
-/// Unit tests are the exception that forces the `test` cfg below: the libtest
-/// harness runs `#[test]` functions on parallel threads even when the crate
-/// under test is `no_std`, and process globals would have tests inventing
-/// violations in each other. The harness links `std` regardless, so tests take
-/// the thread-local path whatever the feature set says.
+///  1. **Thread-local**, whenever `std` is reachable: the `std` feature, or a
+///     unit-test build. The libtest harness runs `#[test]` functions on
+///     parallel threads even when the crate under test is `no_std`, and it
+///     links `std` regardless, so tests take this path whatever the feature set
+///     says.
+///  2. **Process globals**, where the target cannot create a thread at all:
+///     bare metal (`target_os = "none"`) and wasm without the threads proposal.
+///     A shared stack is exact there because there is only ever one stack.
+///  3. **Nothing at all**, for what is left: a hosted `no_std` build, and
+///     threaded wasm. Both have threads and no TLS to separate them, and a
+///     shared stack would have one thread inventing violations in another —
+///     which is not a weaker check but a false one, and a flaky panic is worse
+///     than no panic. Note that `cfg(test)` is *not* set when the library is
+///     compiled for an integration test, so this is the path a
+///     `--no-default-features` `tests/` binary takes.
 ///
-/// EXTENSION POINT (`native-raw`): a threaded `no_std` build needs real
-/// thread-local storage here — a TLS slot from the raw-syscall layer, keyed the
-/// same way. `native-raw` must not be selected before it has one.
+/// EXTENSION POINT (`native-raw`): case 3 is where the check goes missing, and
+/// a TLS slot from the raw-syscall layer, keyed the same way, is what restores
+/// it. `native-raw` must not be selected before it has one.
 #[cfg(all(debug_assertions, any(feature = "std", test)))]
 mod rank_track {
     #[cfg(all(test, not(feature = "std")))]
@@ -444,17 +466,24 @@ mod rank_track {
     }
 }
 
-/// Rank bookkeeping where there is no thread-local storage; see the sibling
-/// module's documentation for why process globals are sound here.
-#[cfg(all(debug_assertions, not(any(feature = "std", test))))]
+/// Rank bookkeeping on a target with one thread and no thread-local storage;
+/// see the sibling module's documentation (case 2) for why globals are exact.
+#[cfg(all(
+    debug_assertions,
+    not(any(feature = "std", test)),
+    any(
+        target_os = "none",
+        all(target_family = "wasm", not(target_feature = "atomics"))
+    )
+))]
 mod rank_track {
     use ::core::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
     const CAPACITY: usize = 32;
 
-    // Relaxed throughout: this cfg is reachable only from the `single` backend,
-    // which is single-threaded by construction. The atomics buy safe interior
-    // mutability in a `static`, not synchronisation.
+    // Relaxed throughout: this cfg is reachable only on a target that cannot
+    // create a thread, so there is one stack and nothing to order against. The
+    // atomics buy safe interior mutability in a `static`, not synchronisation.
     static RANKS: [AtomicU16; CAPACITY] = [const { AtomicU16::new(0) }; CAPACITY];
     static DEPTH: AtomicUsize = AtomicUsize::new(0);
 
@@ -486,41 +515,81 @@ mod rank_track {
     }
 }
 
+/// Rank bookkeeping where there is neither thread-local storage nor a
+/// guarantee of one thread; see the sibling modules' documentation (case 3).
+///
+/// The ladder is not checked in this configuration. A shared stack would report
+/// one thread's holdings as another's, so the choice is between no check and a
+/// check that fires at random — and a lock-order panic nobody can reproduce
+/// teaches the reader that the tool lies. The `std` and unit-test paths above
+/// keep the ladder honest for every build a person actually debugs.
+#[cfg(all(
+    debug_assertions,
+    not(any(feature = "std", test)),
+    not(any(
+        target_os = "none",
+        all(target_family = "wasm", not(target_feature = "atomics"))
+    ))
+))]
+mod rank_track {
+    pub(super) fn push(_rank: u16) {}
+
+    pub(super) fn remove(_rank: u16) {}
+
+    pub(super) fn max() -> Option<u16> {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The `single` backend
 // ---------------------------------------------------------------------------
 
 /// The `single` backend: no threads, and the reference semantics.
 ///
-/// Locks are borrow-checked cells; [`Pool::submit`] runs the job inline and
-/// hands back a [`Handle`] that already holds the answer. Used by the
-/// no-threads browser build, bare metal, and the deterministic test runner
-/// (`ROADMAP.md` §4.7, §11.3).
+/// Locks are atomic cells; [`Pool::submit`] runs the job inline and hands back
+/// a [`Handle`] that already holds the answer. Used by the no-threads browser
+/// build, bare metal, and the deterministic test runner (`ROADMAP.md` §4.7,
+/// §11.3).
 ///
-/// Because there is no second thread to wait for, every operation that *would*
-/// block is a bug rather than contention, and this backend says so with a panic
-/// instead of hanging. That is what makes it the reference: a suite run under
-/// `single` fails loudly where `native-std` merely gets lucky.
+/// This backend submits no work to a second thread, so within a machine every
+/// operation that *would* block is a bug rather than contention, and it says so
+/// with a panic instead of hanging. That is what makes it the reference: a
+/// suite run under `single` fails loudly where `native-std` merely gets lucky.
+/// The one place the assumption does not hold is a `static`, which is why there
+/// is a [`Global`](super::Global) — see below.
 ///
 /// # Why this module contains `unsafe`
 ///
 /// `ROADMAP.md` §0 sanctions this module as one of six that may opt back in.
 /// The core requires `Send + Sync` on everything, and `RefCell` is not `Sync`,
-/// so there is no safe way to build a single-threaded lock that satisfies the
-/// bound. The cells here are `UnsafeCell` with hand-written `Send`/`Sync`
-/// impls; the SAFETY comments on those impls carry the argument.
+/// so there is no safe way to build a lock that satisfies the bound. The cells
+/// here are `UnsafeCell` with hand-written `Send`/`Sync` impls; the SAFETY
+/// comments on those impls carry the argument.
+///
+/// # What "single-threaded" does and does not mean here
+///
+/// `single` creates no threads. It does **not** get to assume the process has
+/// only one: the libtest harness runs `#[test]` functions on parallel threads
+/// whatever the crate under test says, and a `no_std` build on a hosted target
+/// selects this backend anyway. Anything reachable from a `static` is therefore
+/// reachable from several threads at once in a perfectly ordinary `cargo test`.
+///
+/// So the exclusion here is **real**, not notional: the flag is an atomic and
+/// the acquire/release pair is a genuine read-modify-write, which is what makes
+/// [`Mutex`]'s `Sync` impl true rather than merely conventional. What stays
+/// single-threaded is the *waiting*: an acquisition that would block panics
+/// instead, because with one thread that can only be a deadlock. Process-wide
+/// state, where a second thread is legitimate and waiting is the right answer,
+/// belongs in [`Global`](super::Global) rather than in a `static Mutex`.
 ///
 /// This module is public in every build, not only where it is selected, so the
 /// equivalence tests can run both backends in one binary. Outside those tests,
 /// use the re-exports at the top of [`crate::core::sync`] and let the `cfg`
 /// choose.
-// Crate-private, deliberately. The `unsafe impl Sync` below is sound only on a
-// target that cannot create a second thread, and it is upheld by construction
-// rather than by the type system. Left `pub`, a caller on a threaded target
-// could name `single::Mutex` directly, share it, and reach a data race — UB
-// from safe code, which no amount of documentation makes acceptable in a public
-// API. The selected backend is re-exported publicly below, so nothing legitimate
-// is lost, and the in-crate equivalence tests still see both backends.
+// Crate-private, deliberately. Nothing outside this crate should be picking a
+// backend by hand: the selected one is re-exported publicly below, so nothing
+// legitimate is lost, and the in-crate equivalence tests still see both.
 // Three allows, one reason. On a target where `native_std` is selected this
 // module is compiled but not re-exported, so its items are both dead and
 // unreachable — expected, since it stays compiled only so the equivalence tests
@@ -529,50 +598,168 @@ mod rank_track {
 // items are dropped by the compiler rather than shipped.
 #[allow(unsafe_code, dead_code, unreachable_pub)]
 pub(crate) mod single {
-    use super::{LockRank, RankGuard, Tripwire};
-    use ::core::cell::{Cell, UnsafeCell};
+    use super::{LockRank, RankGuard};
+    use ::core::cell::UnsafeCell;
     use ::core::fmt;
     use ::core::marker::PhantomData;
     use ::core::ops::{Deref, DerefMut};
-    use ::core::sync::atomic::{AtomicU8, Ordering};
+    use ::core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
 
-    /// A mutual-exclusion lock that has nothing to exclude.
+    /// The claim/release pair both locks are built on.
     ///
-    /// Locking checks a flag and panics if it is already set: with one thread,
-    /// a lock that is already held can only be this thread's, and waiting for
-    /// yourself is a hang. The panic names the situation while the stack still
-    /// shows both acquisitions.
+    /// A read-modify-write where the target has one, and a plain load/store
+    /// where it does not. The fallback is not a weaker lock on those targets:
+    /// a core with no compare-and-swap (thumbv6m, and the reason [`Once`] is
+    /// written the way it is) has no way to run two threads over this memory,
+    /// so the pair is atomic with respect to everything that can observe it.
+    /// Where CAS exists — every target in the matrix, plus the libtest harness
+    /// that made this necessary — the RMW is what makes the `Sync` impls below
+    /// true statements rather than house style.
+    mod exclusion {
+        use ::core::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+
+        /// Claim `flag`, reporting whether it was **already** claimed.
+        #[cfg(target_has_atomic = "8")]
+        #[inline]
+        pub(super) fn claim(flag: &AtomicBool) -> bool {
+            flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+        }
+
+        #[cfg(not(target_has_atomic = "8"))]
+        #[inline]
+        pub(super) fn claim(flag: &AtomicBool) -> bool {
+            if flag.load(Ordering::Acquire) {
+                return true;
+            }
+            flag.store(true, Ordering::Relaxed);
+            false
+        }
+
+        /// Release a claim taken by [`claim`].
+        #[inline]
+        pub(super) fn release(flag: &AtomicBool) {
+            flag.store(false, Ordering::Release);
+        }
+
+        /// Take a share of `state`, or report that a writer holds it.
+        #[cfg(target_has_atomic = "ptr")]
+        #[inline]
+        pub(super) fn share(state: &AtomicIsize) -> bool {
+            let mut seen = state.load(Ordering::Relaxed);
+            loop {
+                if seen < 0 {
+                    return false;
+                }
+                match state.compare_exchange_weak(
+                    seen,
+                    seen + 1,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return true,
+                    Err(actual) => seen = actual,
+                }
+            }
+        }
+
+        #[cfg(not(target_has_atomic = "ptr"))]
+        #[inline]
+        pub(super) fn share(state: &AtomicIsize) -> bool {
+            let seen = state.load(Ordering::Acquire);
+            if seen < 0 {
+                return false;
+            }
+            state.store(seen + 1, Ordering::Relaxed);
+            true
+        }
+
+        /// Give up a share taken by [`share`].
+        #[cfg(target_has_atomic = "ptr")]
+        #[inline]
+        pub(super) fn unshare(state: &AtomicIsize) {
+            state.fetch_sub(1, Ordering::Release);
+        }
+
+        #[cfg(not(target_has_atomic = "ptr"))]
+        #[inline]
+        pub(super) fn unshare(state: &AtomicIsize) {
+            let seen = state.load(Ordering::Relaxed);
+            state.store(seen - 1, Ordering::Release);
+        }
+
+        /// Take `state` exclusively, or report that somebody holds it.
+        #[cfg(target_has_atomic = "ptr")]
+        #[inline]
+        pub(super) fn seize(state: &AtomicIsize) -> bool {
+            state
+                .compare_exchange(0, -1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        }
+
+        #[cfg(not(target_has_atomic = "ptr"))]
+        #[inline]
+        pub(super) fn seize(state: &AtomicIsize) -> bool {
+            if state.load(Ordering::Acquire) != 0 {
+                return false;
+            }
+            state.store(-1, Ordering::Relaxed);
+            true
+        }
+
+        /// Give up the exclusive hold taken by [`seize`].
+        #[inline]
+        pub(super) fn relinquish(state: &AtomicIsize) {
+            state.store(0, Ordering::Release);
+        }
+    }
+
+    /// A mutual-exclusion lock with nobody expected to exclude.
+    ///
+    /// Locking claims a flag and panics if it was already claimed. On the
+    /// targets this backend is selected for there is one thread, so a lock that
+    /// is already held can only be this thread's, and waiting for yourself is a
+    /// hang; the panic names the situation while the stack still shows both
+    /// acquisitions. State that genuinely *is* shared between threads — a
+    /// process-wide table, which a `static` makes reachable from the test
+    /// harness's threads as much as from anyone's — wants
+    /// [`Global`](super::Global), which waits instead of reporting.
     pub struct Mutex<T: ?Sized> {
         rank: LockRank,
-        locked: Cell<bool>,
-        tripwire: Tripwire,
+        locked: AtomicBool,
         data: UnsafeCell<T>,
     }
 
-    // SAFETY: sending the whole lock to another thread moves the `Cell` and the
+    // SAFETY: sending the whole lock to another thread moves the flag and the
     // `UnsafeCell` with it, so no two threads ever hold a reference to the same
     // one. This is the bound `std::sync::Mutex` carries, for the same reason.
     unsafe impl<T: ?Sized + Send> Send for Mutex<T> {}
 
-    // SAFETY: `&Mutex<T>` hands out `&mut T` through a guard, which is sound
-    // only while a single thread can reach it. That is the defining property of
-    // this backend, and it is established three ways rather than assumed:
+    // SAFETY: `&Mutex<T>` hands out `&mut T` through a guard, so the guard must
+    // be the only live handle to the value for as long as it exists. That is a
+    // property of the flag, not of the target:
     //
-    //  1. Selection. `BACKEND` picks `single` only for targets that cannot
-    //     create a thread (no-threads wasm, bare metal, `no_std`). Where the
-    //     module is compiled but not selected, it exists for the equivalence
-    //     tests, which keep every value on one thread.
-    //  2. Structure. The seam exposes no `spawn`; the only route to another
-    //     thread is `Pool::submit`, and this backend's pool runs jobs inline on
-    //     the caller's thread. There is no path by which a `single` lock is
-    //     observed from a second thread without another backend's pool being
-    //     handed a `single` lock explicitly.
-    //  3. A tripwire. In debug builds with `std`, every acquisition compares
-    //     `thread::current().id()` against the first thread that used the lock
-    //     and panics on a mismatch. It is best-effort — racing code cannot
-    //     reliably detect its own race — but it turns the one plausible mistake
-    //     (handing a `single` lock to a `native_std` pool while comparing
-    //     backends) from silent corruption into a named panic.
+    //  * `locked` is an `AtomicBool` and a claim is a single `compare_exchange`
+    //    (a plain load/store only where the target has no CAS at all, which is
+    //    a target that cannot run two threads over this memory in the first
+    //    place). At most one caller observes the transition false -> true, so
+    //    at most one guard exists at a time.
+    //  * The claim is `Acquire` and the release is `Release`, so everything the
+    //    previous holder wrote through its guard happens-before everything the
+    //    next holder reads. Without that ordering the exclusion would be real
+    //    and the data still racy.
+    //
+    // An earlier version of this argument rested on "single-threaded by
+    // construction" — selection, structure, and a thread-id tripwire — and it
+    // was **false**. `BACKEND` picks `single` for any `no_std` build, including
+    // one on a hosted target, and `cargo test` runs that build's tests on
+    // parallel libtest threads. A `static Mutex` was therefore reachable from
+    // two threads through entirely safe code, which is a data race on the flag
+    // and undefined behaviour regardless of how tidily it happened to surface.
+    // Soundness is now established by the primitive rather than by a convention
+    // about who calls it; what remains single-threaded is only the *waiting*,
+    // which is a liveness policy and cannot be unsound. See [`Global`] for the
+    // type process-wide state is supposed to use.
     //
     // `T: Send` and not `T: Sync`, matching `std::sync::Mutex`: the guard is an
     // exclusive borrow, so `T` is never shared, only moved between threads.
@@ -588,8 +775,7 @@ pub(crate) mod single {
         pub const fn with_rank(rank: LockRank, value: T) -> Mutex<T> {
             Mutex {
                 rank,
-                locked: Cell::new(false),
-                tripwire: Tripwire::new(),
+                locked: AtomicBool::new(false),
                 data: UnsafeCell::new(value),
             }
         }
@@ -614,9 +800,8 @@ pub(crate) mod single {
         /// reported rather than performed — or if the rank order is violated.
         pub fn lock(&self) -> MutexGuard<'_, T> {
             let rank = self.rank.enter();
-            self.tripwire.check();
             assert!(
-                !self.locked.replace(true),
+                !exclusion::claim(&self.locked),
                 "recursive lock of a `single` Mutex ({}): this deadlocks on a threaded backend",
                 self.rank
             );
@@ -634,8 +819,7 @@ pub(crate) mod single {
         /// panicking.
         pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
             let rank = self.rank.enter_nonblocking();
-            self.tripwire.check();
-            if self.locked.replace(true) {
+            if exclusion::claim(&self.locked) {
                 return None;
             }
             Some(MutexGuard {
@@ -685,9 +869,10 @@ pub(crate) mod single {
         type Target = T;
 
         fn deref(&self) -> &T {
-            // SAFETY: the guard's existence means `locked` is set, and this
-            // backend has one thread, so no other reference to the value can
-            // exist for the guard's lifetime.
+            // SAFETY: this guard exists because its constructor observed the
+            // flag go false -> true atomically, and nothing sets it back until
+            // the guard drops, so no second guard — on this thread or any other
+            // — can exist for this guard's lifetime.
             unsafe { &*self.lock.data.get() }
         }
     }
@@ -702,7 +887,7 @@ pub(crate) mod single {
 
     impl<T: ?Sized> Drop for MutexGuard<'_, T> {
         fn drop(&mut self) {
-            self.lock.locked.set(false);
+            exclusion::release(&self.lock.locked);
         }
     }
 
@@ -719,17 +904,18 @@ pub(crate) mod single {
     pub struct RwLock<T: ?Sized> {
         rank: LockRank,
         /// `-1` for a writer, otherwise the reader count.
-        state: Cell<isize>,
-        tripwire: Tripwire,
+        state: AtomicIsize,
         data: UnsafeCell<T>,
     }
 
     // SAFETY: as `Mutex`, above.
     unsafe impl<T: ?Sized + Send> Send for RwLock<T> {}
 
-    // SAFETY: as `Mutex`, above, with the usual `RwLock` addition: a read guard
-    // hands out `&T` to what may be several holders at once, so sharing the
-    // lock requires `T: Sync` as well as `T: Send`.
+    // SAFETY: as `Mutex`, above — the state is an atomic and every transition
+    // is a read-modify-write, so a writer excludes every other holder for real
+    // — with the usual `RwLock` addition: a read guard hands out `&T` to what
+    // may be several holders at once, so sharing the lock requires `T: Sync` as
+    // well as `T: Send`.
     unsafe impl<T: ?Sized + Send + Sync> Sync for RwLock<T> {}
 
     impl<T> RwLock<T> {
@@ -742,8 +928,7 @@ pub(crate) mod single {
         pub const fn with_rank(rank: LockRank, value: T) -> RwLock<T> {
             RwLock {
                 rank,
-                state: Cell::new(0),
-                tripwire: Tripwire::new(),
+                state: AtomicIsize::new(0),
                 data: UnsafeCell::new(value),
             }
         }
@@ -767,15 +952,12 @@ pub(crate) mod single {
         /// If a writer holds the lock, or if the rank order is violated.
         pub fn read(&self) -> RwLockReadGuard<'_, T> {
             let rank = self.rank.enter();
-            self.tripwire.check();
-            let state = self.state.get();
             assert!(
-                state >= 0,
+                exclusion::share(&self.state),
                 "read of a `single` RwLock ({}) held for writing: this deadlocks on a threaded \
                  backend",
                 self.rank
             );
-            self.state.set(state + 1);
             RwLockReadGuard {
                 lock: self,
                 _rank: rank,
@@ -790,14 +972,12 @@ pub(crate) mod single {
         /// If the lock is held at all, or if the rank order is violated.
         pub fn write(&self) -> RwLockWriteGuard<'_, T> {
             let rank = self.rank.enter();
-            self.tripwire.check();
             assert!(
-                self.state.get() == 0,
+                exclusion::seize(&self.state),
                 "write of a `single` RwLock ({}) that is already held: this deadlocks on a \
                  threaded backend",
                 self.rank
             );
-            self.state.set(-1);
             RwLockWriteGuard {
                 lock: self,
                 _rank: rank,
@@ -808,12 +988,9 @@ pub(crate) mod single {
         /// Acquires shared access, or returns `None` if a writer holds it.
         pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
             let rank = self.rank.enter_nonblocking();
-            self.tripwire.check();
-            let state = self.state.get();
-            if state < 0 {
+            if !exclusion::share(&self.state) {
                 return None;
             }
-            self.state.set(state + 1);
             Some(RwLockReadGuard {
                 lock: self,
                 _rank: rank,
@@ -824,11 +1001,9 @@ pub(crate) mod single {
         /// Acquires exclusive access, or returns `None` if the lock is held.
         pub fn try_write(&self) -> Option<RwLockWriteGuard<'_, T>> {
             let rank = self.rank.enter_nonblocking();
-            self.tripwire.check();
-            if self.state.get() != 0 {
+            if !exclusion::seize(&self.state) {
                 return None;
             }
-            self.state.set(-1);
             Some(RwLockWriteGuard {
                 lock: self,
                 _rank: rank,
@@ -876,15 +1051,17 @@ pub(crate) mod single {
         type Target = T;
 
         fn deref(&self) -> &T {
-            // SAFETY: the guard's existence means the reader count is positive,
-            // so no writer holds the lock and no `&mut T` to the value exists.
+            // SAFETY: this guard exists because its constructor atomically
+            // raised a non-negative reader count, and the count stays positive
+            // until the guard drops, so no writer can seize the lock meanwhile
+            // and no `&mut T` to the value exists.
             unsafe { &*self.lock.data.get() }
         }
     }
 
     impl<T: ?Sized> Drop for RwLockReadGuard<'_, T> {
         fn drop(&mut self) {
-            self.lock.state.set(self.lock.state.get() - 1);
+            exclusion::unshare(&self.lock.state);
         }
     }
 
@@ -905,8 +1082,9 @@ pub(crate) mod single {
         type Target = T;
 
         fn deref(&self) -> &T {
-            // SAFETY: the guard's existence means the state is `-1`, so this is
-            // the only live handle to the value.
+            // SAFETY: this guard exists because its constructor atomically took
+            // the state from `0` to `-1`, which every other acquisition refuses
+            // to touch, so this is the only live handle to the value.
             unsafe { &*self.lock.data.get() }
         }
     }
@@ -920,7 +1098,7 @@ pub(crate) mod single {
 
     impl<T: ?Sized> Drop for RwLockWriteGuard<'_, T> {
         fn drop(&mut self) {
-            self.lock.state.set(0);
+            exclusion::relinquish(&self.lock.state);
         }
     }
 
@@ -934,11 +1112,16 @@ pub(crate) mod single {
     ///
     /// Built on an atomic rather than a cell so it needs no `unsafe` of its
     /// own, and on plain loads and stores rather than a read-modify-write so it
-    /// works on a target with no compare-and-swap at all (thumbv6m). Neither
-    /// costs anything here: with one thread there is nobody to race. The
+    /// works on a target with no compare-and-swap at all (thumbv6m). The
     /// intermediate `RUNNING` state exists purely to catch a `call_once` that
     /// re-enters itself, which would otherwise observe an uninitialised value
     /// and return as if it were ready.
+    ///
+    /// The load/store pair means this is **not** a cross-thread rendezvous:
+    /// two threads arriving together could both run the initialiser. That is
+    /// the same restriction [`Mutex`] states — waiting is what `single` does
+    /// not do — so process-wide state wants [`Global`](super::Global), whose
+    /// value is `const`-constructible and needs no initialiser to race over.
     #[derive(Debug)]
     pub struct Once {
         state: AtomicU8,
@@ -1697,54 +1880,19 @@ pub mod native_std {
 }
 
 // ---------------------------------------------------------------------------
-// The single-threading tripwire used by the `single` backend
+// The tripwire that used to be here
 // ---------------------------------------------------------------------------
-
-/// Best-effort detection of a `single` lock reaching a second thread.
-///
-/// Compiled to nothing unless both `std` (for a thread id) and
-/// `debug_assertions` are on — which is precisely the configuration where the
-/// mistake is possible and cheap to catch: a debug build that selected
-/// `native-std` but touched a `single` lock anyway.
-#[cfg(all(debug_assertions, feature = "std"))]
-#[allow(dead_code)] // used only by the `single` backend; see above.
-struct Tripwire {
-    owner: Cell<Option<std::thread::ThreadId>>,
-}
-
-#[cfg(all(debug_assertions, feature = "std"))]
-impl Tripwire {
-    const fn new() -> Tripwire {
-        Tripwire {
-            owner: Cell::new(None),
-        }
-    }
-
-    fn check(&self) {
-        let me = std::thread::current().id();
-        match self.owner.get() {
-            None => self.owner.set(Some(me)),
-            Some(owner) => assert!(
-                owner == me,
-                "a `single` sync primitive was used from a second thread; the `single` backend is \
-                 single-threaded by construction (ROADMAP.md §0, §4.7)"
-            ),
-        }
-    }
-}
-
-/// The tripwire where it cannot be armed: a zero-sized no-op.
-#[cfg(not(all(debug_assertions, feature = "std")))]
-struct Tripwire;
-
-#[cfg(not(all(debug_assertions, feature = "std")))]
-impl Tripwire {
-    const fn new() -> Tripwire {
-        Tripwire
-    }
-
-    fn check(&self) {}
-}
+//
+// There used to be a tripwire here: a `Cell<Option<ThreadId>>` on every
+// `single` primitive that panicked when a second thread touched it, on the
+// theory that a `single` lock reaching two threads was always a mistake. It
+// was deleted along with the theory. `BACKEND` selects `single` for every
+// `no_std` build, hosted ones included, and `cargo test` runs that build's
+// tests on parallel libtest threads — so a `static` holding one is reached
+// from several threads in an entirely ordinary run, and the tripwire's own
+// `Cell` was part of the race it claimed to detect. The locks now exclude for
+// real (see `single`'s SAFETY comments) and `Global`, below, is where state
+// that outlives any one machine goes.
 
 // ---------------------------------------------------------------------------
 // Backend selection
@@ -1770,11 +1918,189 @@ pub use single::{
     Handle, Mutex, MutexGuard, Once, Pool, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
 
+// ---------------------------------------------------------------------------
+// Process-wide state
+// ---------------------------------------------------------------------------
+
+/// A lock for state that no machine owns.
+///
+/// [`Mutex`] is for state some machine is responsible for, and under `single`
+/// it treats an acquisition that would block as a deadlock and says so. That is
+/// the right answer for a device register and the wrong one for a `static`: a
+/// process-wide table is reachable from every thread in the process — including
+/// the ones the test harness makes, which is how this crate found out it needed
+/// this type — so contention there is legitimate and the lock has to wait.
+///
+/// `Global` waits. On a threaded backend it is the backend's blocking
+/// acquisition; under `single` it spins on `try_lock`, which costs one
+/// uncontended attempt on a target that genuinely has one thread and resolves
+/// in nanoseconds where it does not, because everything below is a table
+/// insertion that calls nothing outward.
+///
+/// # Which one to use
+///
+/// Use `Global` if and only if the value lives in a `static`. Everything else
+/// belongs to a machine and wants [`Mutex`], whose panic is a real diagnostic.
+/// The test at the bottom of this file enforces the first half of that rule by
+/// reading the source: a `static` holding a [`Mutex`] or an [`RwLock`] fails
+/// the build rather than waiting to fail one run in three.
+///
+/// # Re-entrancy
+///
+/// Taking a `Global` while already holding it is a deadlock on every backend,
+/// exactly as it is for `std::sync::Mutex`. Debug builds catch it before it can
+/// happen: `Global` enters its [`LockRank`] with the ordered check, so a second
+/// acquisition of a rank the thread already holds panics naming both. A `Global`
+/// at [`LockRank::UNCHECKED`] gives that up, as anything unchecked does.
+pub struct Global<T: ?Sized> {
+    rank: LockRank,
+    /// The waiting is `Global`'s own business and the rank is entered above, so
+    /// the inner lock is [`LockRank::UNCHECKED`]: it exists for the exclusion
+    /// and contributes nothing to the ladder.
+    inner: Mutex<T>,
+}
+
+impl<T> Global<T> {
+    /// Process-wide state at [`LockRank::LEAF`] — nests under anything.
+    pub const fn new(value: T) -> Global<T> {
+        Global::with_rank(LockRank::LEAF, value)
+    }
+
+    /// Process-wide state at an explicit rank, for one that legitimately nests.
+    pub const fn with_rank(rank: LockRank, value: T) -> Global<T> {
+        Global {
+            rank,
+            inner: Mutex::with_rank(LockRank::UNCHECKED, value),
+        }
+    }
+
+    /// Consumes the lock and returns the protected value.
+    pub fn into_inner(self) -> T {
+        self.inner.into_inner()
+    }
+}
+
+impl<T: ?Sized> Global<T> {
+    /// This lock's rank in the global acquisition order.
+    pub fn rank(&self) -> LockRank {
+        self.rank
+    }
+
+    /// Acquires the lock, waiting for another thread if one holds it.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, if the rank order is violated — which is also how a
+    /// thread taking the same `Global` twice is caught before it hangs.
+    pub fn lock(&self) -> GlobalGuard<'_, T> {
+        let rank = self.rank.enter();
+        GlobalGuard {
+            inner: self.wait(),
+            _rank: rank,
+            _not_send: PhantomData,
+        }
+    }
+
+    /// Acquires the lock, or returns `None` if it is held right now.
+    ///
+    /// The portable re-entrancy probe, as on [`Mutex`]. Note that a `None` here
+    /// may mean "another thread has it" rather than "I have it": that is the
+    /// difference between process-wide state and a machine's own.
+    pub fn try_lock(&self) -> Option<GlobalGuard<'_, T>> {
+        let rank = self.rank.enter_nonblocking();
+        Some(GlobalGuard {
+            inner: self.inner.try_lock()?,
+            _rank: rank,
+            _not_send: PhantomData,
+        })
+    }
+
+    /// Borrows the value directly, given exclusive access to the lock.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.inner.get_mut()
+    }
+
+    /// The wait itself, which is the only part that differs by backend.
+    #[cfg(all(feature = "std", not(target_family = "wasm")))]
+    fn wait(&self) -> MutexGuard<'_, T> {
+        self.inner.lock()
+    }
+
+    /// Under `single` there is no primitive to block on, and on the targets it
+    /// is selected for there is usually nothing to block for: the loop turns
+    /// once. Where a second thread does exist — the test harness, threaded
+    /// wasm — it holds this for a table lookup and an `Arc` clone, so spinning
+    /// costs less than the machinery to avoid it would.
+    #[cfg(not(all(feature = "std", not(target_family = "wasm"))))]
+    fn wait(&self) -> MutexGuard<'_, T> {
+        loop {
+            if let Some(guard) = self.inner.try_lock() {
+                return guard;
+            }
+            ::core::hint::spin_loop();
+        }
+    }
+}
+
+impl<T: Default> Default for Global<T> {
+    fn default() -> Global<T> {
+        Global::new(T::default())
+    }
+}
+
+impl<T: ?Sized + fmt::Debug> fmt::Debug for Global<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut s = f.debug_struct("Global");
+        s.field("rank", &self.rank);
+        match self.try_lock() {
+            Some(guard) => s.field("data", &&*guard).finish(),
+            None => s.field("data", &"<locked>").finish(),
+        }
+    }
+}
+
+/// Exclusive access to the value inside a [`Global`], released on drop.
+pub struct GlobalGuard<'a, T: ?Sized> {
+    inner: MutexGuard<'a, T>,
+    _rank: RankGuard,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<T: ?Sized> ::core::ops::Deref for GlobalGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.inner
+    }
+}
+
+impl<T: ?Sized> ::core::ops::DerefMut for GlobalGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+}
+
+impl<T: ?Sized + fmt::Debug> fmt::Debug for GlobalGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloc::sync::Arc;
     use alloc::vec::Vec;
+
+    // The harness links `std` whatever the feature set says, and two tests here
+    // need it whatever the feature set says too: the one that puts a `static
+    // Global` under real thread pressure, and the one that reads the crate's
+    // own source. Both exist because *tests* are threaded — the mistake they
+    // guard is invisible to a build that only ever runs a machine — so naming
+    // `std::thread` here is the seam testing itself, not `core/` reaching for
+    // the host.
+    #[cfg(not(feature = "std"))]
+    extern crate std;
 
     #[cfg(all(feature = "std", not(target_family = "wasm")))]
     use ::core::sync::atomic::{AtomicUsize, Ordering};
@@ -1785,6 +2111,7 @@ mod tests {
 
     #[test]
     fn the_seam_is_send_and_sync_on_every_backend() {
+        assert_send_sync::<Global<u64>>();
         assert_send_sync::<single::Mutex<u64>>();
         assert_send_sync::<single::RwLock<u64>>();
         assert_send_sync::<single::Once>();
@@ -2305,5 +2632,72 @@ mod tests {
             pool.quiesce();
             assert_eq!(done.load(Ordering::SeqCst), 8);
         }
+    }
+
+    // -- process-wide state ------------------------------------------------
+
+    #[test]
+    fn a_global_guard_is_exclusive_and_releases_on_drop() {
+        let cell = Global::new(7u32);
+        {
+            let mut guard = cell.lock();
+            *guard += 1;
+            assert!(
+                cell.try_lock().is_none(),
+                "a held lock must refuse a second acquisition"
+            );
+        }
+        assert_eq!(*cell.lock(), 8);
+        assert_eq!(cell.rank(), LockRank::LEAF);
+        let mut owned = Global::with_rank(LockRank::MACHINE, 1u8);
+        assert_eq!(owned.rank(), LockRank::MACHINE);
+        *owned.get_mut() = 2;
+        assert_eq!(owned.into_inner(), 2);
+        assert_eq!(cell.into_inner(), 8);
+    }
+
+    /// Process-wide state under the pressure that produced [`Global`].
+    ///
+    /// This is the workload that broke: `cargo test --no-default-features
+    /// --features machine-nes` selects `single`, libtest runs its tests on
+    /// parallel threads, and the `static Mutex` behind `dev::nes::pads` was
+    /// reached from two of them about one run in three. It surfaced as a tidy
+    /// "recursive lock" panic, but the flag reporting it was a `Cell<bool>`
+    /// read and written from two threads, so the diagnostic was itself the
+    /// undefined behaviour. Same shape here, against the type that is allowed
+    /// to have it, on whichever backend this build selected.
+    #[test]
+    fn a_static_global_survives_the_whole_harness_hammering_it() {
+        use alloc::collections::BTreeMap;
+        use alloc::format;
+        use alloc::string::String;
+
+        // Deliberately a `static`: a `Global` on the stack would prove nothing,
+        // since the bug is exactly that a `static` outlives and escapes the one
+        // thread that made it.
+        static TABLE: Global<BTreeMap<String, u64>> = Global::new(BTreeMap::new());
+
+        const THREADS: u64 = 8;
+        const KEYS: u64 = 250;
+
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for key in 0..KEYS {
+                        // Every thread visits every key, so they collide on the
+                        // table rather than politely partitioning it.
+                        let mut table = TABLE.lock();
+                        *table.entry(format!("k{key}")).or_insert(0) += 1;
+                    }
+                });
+            }
+        });
+
+        let table = TABLE.lock();
+        assert_eq!(table.len() as u64, KEYS);
+        assert!(
+            table.values().all(|&seen| seen == THREADS),
+            "every key must have been incremented once per thread"
+        );
     }
 }
