@@ -41,7 +41,7 @@ pub mod sync;
 pub mod value;
 pub mod wire;
 
-pub use device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
+pub use device::{Device, DeviceClass, Export, ExportId, PropertySpec, RealizeCtx, ResetKind};
 pub use error::{BusError, Error, Result};
 pub use registry::Registry;
 pub use value::{Endian, Width};

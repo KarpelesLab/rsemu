@@ -38,6 +38,7 @@ use crate::core::props::{Props, ValueKind};
 use crate::core::sched::{Budget, Consumed, LazyHandle};
 use crate::core::space::{RegionRef, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter};
+use crate::core::sync::AtomicU64;
 use crate::core::wire::{DmaPeripheral, IntAck, WireId, WireSink, WireSource};
 
 /// How deep a reset goes.
@@ -126,6 +127,136 @@ impl fmt::Debug for SinkPin {
     }
 }
 
+// ---------------------------------------------------------------------------
+// exports: a typed handle one device publishes and another holds
+// ---------------------------------------------------------------------------
+
+/// Which handle a device is being asked for.
+///
+/// An open id space rather than an enum, the `pktkit` `EtherType` pattern
+/// (`CLAUDE.md`, *Type conventions*): a new kind of handle is a `pub const`
+/// somewhere in the tree, not a variant every `match` in the crate has to grow.
+///
+/// The ids are what a *consumer* names in its own code — a hart asks for
+/// [`TIMEBASE`](ExportId::TIMEBASE) — so unlike [`Device::region`] and
+/// [`Device::sink`], whose names a human writes in a machine file, a typed
+/// constant is the right selector here rather than a string.
+///
+/// A device with several handles *of one kind* — a two-head display
+/// controller — publishes them from child devices with their own instance
+/// paths (§4.4's composition). The consumer selects the publisher by path and
+/// the kind by id, and those two together are already enough.
+///
+/// Ids below `0x8000` are this crate's; `0x8000` and above are free for an
+/// embedder that adds device classes of its own.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExportId(pub u16);
+
+impl ExportId {
+    /// The publisher's free-running time counter, counted in the publisher's
+    /// own timebase. Transported as [`Export::Cell`].
+    ///
+    /// The RISC-V case is the motivating one: `mtime` belongs to the CLINT, and
+    /// a hart's `time` CSR is architecturally a *view of the platform timer*
+    /// rather than a counter the hart owns. Handing the hart the same cell the
+    /// CLINT stores into is what makes the two agree, and nothing else in the
+    /// framework can express that — a wire carries a level and an address space
+    /// carries an access, neither of which is a shared counter.
+    pub const TIMEBASE: ExportId = ExportId(1);
+
+    /// The name this id is known by, for an error message.
+    ///
+    /// `None` for an id nothing in this crate defines, which an embedder's own
+    /// ids are.
+    #[must_use]
+    pub fn name(self) -> Option<&'static str> {
+        match self {
+            ExportId::TIMEBASE => Some("timebase"),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ExportId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.name() {
+            Some(name) => f.write_str(name),
+            None => write!(f, "export #{}", self.0),
+        }
+    }
+}
+
+/// A handle a device publishes for another device to hold.
+///
+/// # Why a closed enum of transports
+///
+/// [`Device`] has no `Any` in its supertrait chain and is not going to grow
+/// one, so there is no route from a `dyn Device` to a concrete device type. The
+/// three consumers that have wanted one — a debugger reaching a core's
+/// registers, a display reaching a frame buffer, a hart reaching a platform
+/// timer — do not actually want the *device*; each wants one narrow, shareable
+/// thing it holds. So the **kind** of handle is open ([`ExportId`]) and the
+/// **shape** it travels in is closed, which is what keeps the core generic:
+/// `core` must never name `NesPpu` (`ROADMAP.md` §0), and it does not have to,
+/// because a frame buffer and a register file are shapes long before they are
+/// devices.
+///
+/// # Why only one shape so far
+///
+/// A variant with no implementor is a guess, and this project's own rule is
+/// that an unexecuted design is a plausible-looking guess. The other two
+/// consumers are converted separately, and each brings its variant with it:
+///
+/// * **A frame buffer** — `host::display` today intercepts the `nes.ppu`
+///   constructor to keep an `Arc<NesPpu>` of its own. It becomes a `Frames`
+///   variant carrying a pull-model view: geometry, a frame serial, and a
+///   copy-into-the-caller's-buffer call. That is the `Scanout` trait
+///   `host::display` already defines, minus its `std` types — the trait is
+///   already the right shape, and only the *acquisition* is a hack.
+/// * **A register file** — `host::gdb` today reads byte offsets into the
+///   device's snapshot chunk, each table pinned to the class version it was
+///   verified against. It becomes a `Regs` variant carrying a descriptor table
+///   plus indexed get and set. gdb writes registers as well as reading them, so
+///   that shape is read/write where the two above are read-only, and it is why
+///   the enum cannot collapse into "a shared buffer".
+///
+/// Neither is added here: an unused variant fixes its shape before the code
+/// that has to live with it exists, which is the mistake this seam is being
+/// built to correct.
+///
+/// The enum is `#[non_exhaustive]`, so adding those variants breaks no
+/// downstream `match`.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum Export {
+    /// A shared 64-bit cell: the publisher stores into it, the consumer samples
+    /// it, and neither takes a lock to do so.
+    ///
+    /// Deliberately a *cell* rather than a monotonic counter — a guest can
+    /// write RISC-V's `mtime` backwards, and a shape promising monotonicity
+    /// would be lying about the one case it exists for.
+    Cell(Arc<AtomicU64>),
+}
+
+impl Export {
+    /// The cell, if this handle is one.
+    #[must_use]
+    pub fn cell(&self) -> Option<&Arc<AtomicU64>> {
+        match self {
+            Export::Cell(cell) => Some(cell),
+        }
+    }
+
+    /// What shape this handle came back in, for an error that has to say so.
+    #[must_use]
+    pub fn shape(&self) -> &'static str {
+        match self {
+            Export::Cell(_) => "a 64-bit cell",
+        }
+    }
+}
+
 /// Anything a machine is built from.
 ///
 /// `Send + Sync` from the first commit rather than once threading "is needed":
@@ -194,6 +325,25 @@ pub trait Device: Send + Sync + fmt::Debug {
     /// sources at construction, while a device is constructed long before any
     /// `WireId` exists. This call is the only moment both are known.
     fn sink(&self, _port: &str, _sources: &[WireId]) -> Option<SinkPin> {
+        None
+    }
+
+    /// A typed handle this device publishes, for another device to hold.
+    ///
+    /// Answerable from the moment the device is constructed and for the rest of
+    /// its life: the machine layer resolves these while binding, in declaration
+    /// order, so a device must not require that it has been bound, realized or
+    /// reset first. In practice the handle is allocated in `new` and handed out
+    /// by `Arc::clone`.
+    ///
+    /// A handle is **wiring, not guest state**. It is never serialized, and it
+    /// must survive [`reset`](Device::reset). A consumer that keeps one beside
+    /// its address space rather than inside its architectural state gets that
+    /// right by construction; one that keeps it in the state it replaces on
+    /// reset silently unplugs itself the first time the machine reboots.
+    ///
+    /// Defaults to publishing nothing.
+    fn export(&self, _which: ExportId) -> Option<Export> {
         None
     }
 
@@ -571,6 +721,81 @@ mod tests {
         let mut q = Deferred::new();
         assert_eq!(q.drain(), 0);
         assert!(q.is_empty());
+    }
+
+    /// A device that publishes one cell and nothing else.
+    #[derive(Debug)]
+    struct Publisher {
+        cell: Arc<AtomicU64>,
+    }
+
+    static PUBLISHER_CLASS: DeviceClass = DeviceClass {
+        name: "test.publisher",
+        version: 1,
+        summary: "publishes a timebase cell, for the export tests",
+        properties: &[],
+        construct: |_| {
+            Ok(Box::new(Publisher {
+                cell: Arc::new(AtomicU64::new(0)),
+            }))
+        },
+    };
+
+    impl Device for Publisher {
+        fn class(&self) -> &'static DeviceClass {
+            &PUBLISHER_CLASS
+        }
+        fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
+            Ok(())
+        }
+        fn reset(&self, _kind: ResetKind) {
+            // The point of the reset test below: a reset must not replace the
+            // published cell, only what the device counts into it.
+            self.cell.store(0, Ordering::Relaxed);
+        }
+        fn export(&self, which: ExportId) -> Option<Export> {
+            (which == ExportId::TIMEBASE).then(|| Export::Cell(Arc::clone(&self.cell)))
+        }
+    }
+
+    #[test]
+    fn a_device_publishes_nothing_unless_it_says_so() {
+        let d = Publisher {
+            cell: Arc::new(AtomicU64::new(0)),
+        };
+        assert!(d.export(ExportId(0x8000)).is_none(), "an unknown id");
+        assert!(d.export(ExportId::TIMEBASE).is_some());
+    }
+
+    #[test]
+    fn an_exported_cell_is_shared_and_survives_a_reset() {
+        let d = Publisher {
+            cell: Arc::new(AtomicU64::new(0)),
+        };
+        let held = d
+            .export(ExportId::TIMEBASE)
+            .expect("published")
+            .cell()
+            .expect("a cell")
+            .clone();
+        d.cell.store(42, Ordering::Relaxed);
+        assert_eq!(held.load(Ordering::Relaxed), 42, "the consumer sees writes");
+        // Wiring, not guest state: the handle still points at the device's own
+        // cell afterwards, which is what stops a reboot unplugging the clock.
+        d.reset(ResetKind::Cold);
+        d.cell.store(7, Ordering::Relaxed);
+        assert_eq!(held.load(Ordering::Relaxed), 7);
+    }
+
+    #[test]
+    fn export_ids_name_themselves_for_an_error_message() {
+        assert_eq!(ExportId::TIMEBASE.to_string(), "timebase");
+        assert_eq!(ExportId(0x8001).to_string(), "export #32769");
+        assert_eq!(ExportId(0x8001).name(), None);
+        assert_eq!(
+            Export::Cell(Arc::new(AtomicU64::new(0))).shape(),
+            "a 64-bit cell"
+        );
     }
 
     #[test]

@@ -64,6 +64,11 @@ machine "riscv-virt" {
   #
   # It comes out of reset in the boot ROM at 0x1000, which sets a0 and a1 and
   # jumps to 0x80000000. See `riscv.boot` below.
+  # `timer = clint` is what makes `rdtime` read the platform timer rather than
+  # zero. `time` is architecturally a view of the CLINT's `mtime`, not a counter
+  # the hart owns, so the two hold the same cell — named here rather than found
+  # by searching, because a board with two timers must not depend on which one
+  # the machine happened to reach first (ROADMAP.md §0).
   object cpu0 "cpu.riscv" {
     clock  = core
     space  = mem
@@ -72,6 +77,7 @@ machine "riscv-virt" {
     isa    = "imafdc"
     hartid = 0
     reset  = 0x1000
+    timer  = clint
   }
 
   # -- memory ----------------------------------------------------------------
@@ -88,10 +94,7 @@ machine "riscv-virt" {
   # cannot read its own domain's frequency — `BindCtx` carries the domain but
   # not the clock forest — and that is a seam to close, not a design.
   #
-  # KNOWN GAP: this counter is not connected to the hart's own `time` CSR, so
-  # `rdtime` reads zero. Firmware that reads the timer through the register
-  # block below is fine; an operating system that uses `rdtime` as its
-  # clocksource live-locks. src/dev/riscv/clint.rs says exactly what is missing.
+  # This counter is what `cpu0`'s `time` CSR reads: see `timer = clint` above.
   object clint "riscv.clint" {
     clock    = rtc
     harts    = 1
