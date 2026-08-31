@@ -750,10 +750,14 @@ mod tests {
             "the vblank wait loop never ended"
         );
         let nmis = peek(&machine, 0x0000);
-        // Frame 0 is the lockout and frame 1 is where the wait loop ends, so
-        // four are certain and six are the ceiling.
+        // Frame 0 is the lockout, and the two `$2002` wait loops each cost a
+        // frame — a poll that lands on the dot the flag would be set on reads
+        // it clear and suppresses the set for that whole frame, which is the
+        // hardware behaviour the vblank tests exist to pin. So three are
+        // certain and six are the ceiling; what the assertion is really about
+        // is that the count is neither zero nor doubled.
         assert!(
-            (4..=6).contains(&nmis),
+            (3..=6).contains(&nmis),
             "{nmis} NMIs in six frames; one per vblank is the answer"
         );
 

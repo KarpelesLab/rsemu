@@ -394,8 +394,19 @@ pub(crate) struct Lines {
     /// IRQ is level-sensitive: it is taken whenever it is asserted and **I**
     /// is clear.
     irq: AtomicBool,
-    /// The last level seen on NMI, for edge detection.
+    /// The level the NMI pin is being driven at right now.
     nmi_level: AtomicBool,
+    /// What the edge detector saw last time it was clocked.
+    ///
+    /// **The edge detector is clocked, once per CPU cycle** — that is what the
+    /// pin's flip-flop is — so a request raised and withdrawn inside a single
+    /// cycle is one the CPU never sees. On a NES that is not a curiosity: the
+    /// PPU raises `/NMI` when the vblank flag sets and a `$2002` read on the
+    /// same or the next PPU clock pulls it straight back up, and the whole
+    /// point of that test is that no interrupt happens. Comparing levels *at
+    /// the sampling point*, rather than latching every transition the wire
+    /// makes, is what models the flip-flop.
+    nmi_sampled: AtomicBool,
     /// NMI is edge-sensitive: a high-going edge sets this latch, which stays
     /// set until the interrupt is serviced, however long that takes.
     nmi_latch: AtomicBool,
@@ -418,10 +429,17 @@ impl Lines {
         self.irq.load(Ordering::Acquire)
     }
 
-    /// Drive the NMI pin, latching a high-going edge.
+    /// Drive the NMI pin. The edge is not looked for until the detector is
+    /// clocked — see [`Lines::sample_nmi`].
     fn set_nmi(&self, asserted: bool) {
-        let previous = self.nmi_level.swap(asserted, Ordering::AcqRel);
-        if asserted && !previous {
+        self.nmi_level.store(asserted, Ordering::Release);
+    }
+
+    /// Clock the edge detector: once per CPU cycle, and never anywhere else.
+    fn sample_nmi(&self) {
+        let now = self.nmi_level.load(Ordering::Acquire);
+        let previous = self.nmi_sampled.swap(now, Ordering::AcqRel);
+        if now && !previous {
             self.nmi_latch.store(true, Ordering::Release);
         }
     }
@@ -462,6 +480,9 @@ impl Lines {
     fn restore(&self, (irq, level, latch, reset): (bool, bool, bool, bool)) {
         self.irq.store(irq, Ordering::Release);
         self.nmi_level.store(level, Ordering::Release);
+        // The detector comes back holding the level it is standing on, so a
+        // restore does not manufacture an edge out of the load itself.
+        self.nmi_sampled.store(level, Ordering::Release);
         self.nmi_latch.store(latch, Ordering::Release);
         self.reset_req.store(reset, Ordering::Release);
     }
@@ -727,8 +748,13 @@ impl Mos6502 {
     }
 
     /// A complete NMI pulse, for a caller that does not model the pin's level.
+    ///
+    /// The edge detector is clocked once per CPU cycle, so a pulse that went
+    /// up and down between two cycles would be invisible. This one is clocked
+    /// while the line is high, which is what "a pulse the CPU saw" means.
     pub fn pulse_nmi(&self) {
         self.lines.set_nmi(true);
+        self.lines.sample_nmi();
         self.lines.set_nmi(false);
     }
 

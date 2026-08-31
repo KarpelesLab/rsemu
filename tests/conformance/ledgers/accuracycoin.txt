@@ -19,7 +19,7 @@
 #     they can never appear here.
 #
 # ---------------------------------------------------------------------------
-# Measured 2026-08-31 against the pinned ROM: 101 of 141 pass, 40 fail.
+# Measured 2026-08-31 against the pinned ROM: 108 of 141 pass, 33 fail.
 # ---------------------------------------------------------------------------
 #
 # The earlier "81 of 125" was measured through a stale copy of the ROM's
@@ -52,7 +52,7 @@
 #      and `$4000`-`$4013` take their undriven bits from it rather than from a
 #      constant. `$4015` is marked `internal()`, so reading it leaves the latch
 #      alone. What is left of (C) is only what needs a DMA to observe it.
-#   D. PPU staleness is scanline-exact, not dot-exact (ROADMAP.md 4.2's one
+#   D. [MOSTLY FIXED] PPU staleness is scanline-exact, not dot-exact (ROADMAP.md 4.2's one
 #      remaining phase-3 item).
 #   E. APU frame-counter and length-counter edges are not on the right CPU
 #      cycle, and neither the APU nor the ports can see get/put phase.
@@ -90,8 +90,6 @@
 
 6c                # $046C "DMA + Open Bus" code 1: LDA $4000 reads back $00
                   # rather than floating. Needs (C) as well as the DMC DMA.
-5d                # $045D "DMA + $4015 Read" code 2: the halt cycles did not
-                  # read $4015 and so did not clear the frame IRQ flag.
 6b                # $046B "DMC DMA Bus Conflicts" code 2: no DMC DMA, so no bus
                   # conflict with the APU registers to emulate.
 77                # $0477 "DMC DMA + OAM DMA" code 1: DMC DMA timing. There is
@@ -131,15 +129,8 @@
 # the right scanline but not always on the right dot. Every test below reports
 # a flag set or cleared on the wrong PPU cycle, which is exactly that.
 
-50                # $0450 "VBlank beginning" code 1: the $2002 vblank flag was
-                  # not set on the correct PPU cycle.
-53                # $0453 "NMI Timing" code 1: the NMI did not occur on the
-                  # correct PPU cycle.
-54                # $0454 "NMI Suppression" code 1: a precisely timed $2002 read
-                  # must suppress the NMI, which needs the dot to be exact.
 55                # $0455 "NMI at VBlank end" code 1: the NMI was disabled too
                   # early or occurred too late.
-56                # $0456 "NMI disabled at VBlank" code 1: as above.
 
 # ---------------------------------------------------------------------------
 # D2. PPU sprite-evaluation quirks not modelled
@@ -149,9 +140,6 @@
 # $2004 that the engine does not implement yet. Each is a piece of work in
 # src/dev/ppu, not a seam.
 
-5b                # $045B "Address $2004 behavior" code 4: a read of $2004
-                  # during dots 1-64 of a visible scanline with rendering on
-                  # must return $FF, because secondary OAM is being cleared.
 7b                # $047B "OAM Corruption" code 2: the documented corruption
                   # that copies OAM row 0 over another row when rendering is
                   # switched off mid-frame is not modelled.
@@ -167,10 +155,6 @@
 
 67                # $0467 "Frame Counter IRQ" code 7: the IRQ flag must not be
                   # cleared yet on a get -> put transition.
-68                # $0468 "Frame Counter 4-step" code 2: the first clock of the
-                  # length counters was late.
-69                # $0469 "Frame Counter 5-step" code 1: the first clock of the
-                  # length counters was early.
 6a                # $046A "Delta Modulation Channel" code 1: $4015 bit 4 must
                   # follow a playing sample. See (B) — there is no sample fetch.
 5f                # $045F "Controller Strobing" code 4: the controllers must not
@@ -217,3 +201,12 @@
                   # nametable and a pattern fetch. Not modelled.
 90                # $0490 "Internal Data Bus" code 1: the CPU-side open-bus data
                   # latch. Cause (C).
+
+# ---------------------------------------------------------------------------
+# H. What is left of $045B, after the sprite page mostly closed
+# ---------------------------------------------------------------------------
+
+5b                # $045B "Address $2004 behavior" code 8: a $2004 read at
+                  # around dot 130 of a rendered scanline must expose the live
+                  # sprite-evaluation OAM address, which the engine's evaluator
+                  # does not write back to OAMADDR. Codes 1-7 pass.

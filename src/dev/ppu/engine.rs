@@ -69,20 +69,6 @@ pub const WARMUP_DOTS: u64 = Region::Ntsc.geometry().warmup_dots;
 /// and 600 ms is the figure blargg's `ppu_open_bus` test is written against.
 pub const DEFAULT_DECAY_DOTS: u64 = 3_221_591;
 
-/// Dots between the vblank flag being set and the NMI request being announced
-/// on the wire.
-///
-/// The 6502 samples `/NMI` once per CPU cycle, which is three dots, so a request
-/// that is withdrawn inside that window is one the CPU never saw. Announcing at
-/// the next CPU-cycle boundary is what turns the `$2002` race described in
-/// [NESdev PPU frame timing](https://www.nesdev.org/wiki/PPU_frame_timing) into
-/// behaviour rather than a special case: a read on the set dot or one dot later
-/// clears the flag before this expires, and no edge ever reaches the wire.
-///
-/// PAL's CPU cycle is 3.2 dots and so takes 4; see
-/// [`Geometry::nmi_announce_dots`].
-pub const NMI_ANNOUNCE_DOTS: u64 = Region::Ntsc.geometry().nmi_announce_dots;
-
 // ---------------------------------------------------------------------------
 // Pixels
 // ---------------------------------------------------------------------------
@@ -256,7 +242,7 @@ pub struct Engine {
     /// dot: "sprite 0 hit acts as if the image starts at cycle 2"
     /// (NESdev PPU rendering).
     pub(crate) sprite0_pending: bool,
-    /// The dot the vblank flag was last set on, for [`NMI_ANNOUNCE_DOTS`].
+    /// The dot the vblank flag was last set on.
     pub(crate) vblank_set_dot: u64,
     /// A `$2002` read landed one dot before the vblank flag would be set, so it
     /// is not set at all this frame (NESdev PPU frame timing).
@@ -264,6 +250,9 @@ pub struct Engine {
     /// A `$2002` read landed on or just after the set, so `/NMI` never drops
     /// for long enough this frame.
     pub(crate) suppress_nmi: bool,
+    /// The `/NMI` level as it stood one dot ago — what the CPU samples. See
+    /// [`Engine::nmi_active`].
+    pub(crate) nmi_out: bool,
 
     // -- configuration ------------------------------------------------------
     /// Which console this is. Machine configuration, not architectural state,
@@ -355,6 +344,7 @@ impl Engine {
             vblank_set_dot: 0,
             suppress_vblank_set: false,
             suppress_nmi: false,
+            nmi_out: false,
             region,
             geom: region.geometry(),
             warmup,
@@ -476,22 +466,39 @@ impl Engine {
             || self.scanline == self.geom.pre_render_scanline
     }
 
-    /// The level of the (logical) NMI request: `vblank_flag AND nmi_output`,
-    /// with the frame's suppression applied.
+    /// The level the `/NMI` request is at *right now*, before the output delay.
     ///
-    /// [NESdev NMI](https://www.nesdev.org/wiki/NMI). Expressed as an active-high
-    /// request rather than the chip's active-low `/NMI` pin, because
+    /// `vblank_flag AND nmi_output`, with the frame's suppression applied
+    /// ([NESdev NMI](https://www.nesdev.org/wiki/NMI)). Expressed as an
+    /// active-high request rather than the chip's active-low pin, because
     /// [`crate::core::wire`] nets idle low and an inverter is a device
     /// (`ROADMAP.md` §4.3) if a machine wants the pin polarity.
     #[inline]
+    fn nmi_raw(&self) -> bool {
+        self.status & STATUS_VBLANK != 0 && self.ctrl & CTRL_NMI != 0 && !self.suppress_nmi
+    }
+
+    /// The level the CPU sees on `/NMI` — one dot behind [`Engine::nmi_raw`].
+    ///
+    /// # Why a dot
+    ///
+    /// A 6502 samples `/NMI` during φ2, roughly two thirds of the way through
+    /// its cycle, and completes its bus access at the very end of it. Three
+    /// dots to a CPU cycle, so a request raised on the *first* two dots of a
+    /// cycle is one the CPU acts on that cycle, and one raised on the third is
+    /// not — while a `$2002` read, which happens after the sample, cannot
+    /// unmake a request the CPU has already seen.
+    ///
+    /// Both halves of that are load-bearing, and AccuracyCoin's "NMI
+    /// Suppression" sweep is precisely a measurement of them: a read landing
+    /// one PPU clock after the flag is set suppresses the NMI, one landing
+    /// three clocks after does not, and the difference is which side of φ2 the
+    /// flag moved on. Publishing the level as it stood one dot ago, and
+    /// sampling it at the cycle boundary, is the same statement with the delay
+    /// moved to where it can be written down once.
+    #[inline]
     pub fn nmi_active(&self) -> bool {
-        self.status & STATUS_VBLANK != 0
-            && self.ctrl & CTRL_NMI != 0
-            && !self.suppress_nmi
-            && self.dots
-                >= self
-                    .vblank_set_dot
-                    .saturating_add(self.geom.nmi_announce_dots)
+        self.nmi_out
     }
 
     /// Sprite height from `$2000` bit 5.
@@ -966,6 +973,13 @@ impl Engine {
 
     /// Execute the dot at the current position and advance to the next.
     pub fn tick(&mut self) {
+        // The output the CPU samples lags the request by one dot — see
+        // [`Engine::nmi_active`]. Taken before the dot runs, so after a
+        // catch-up to dot *d* it holds the level as it stood at *d* − 1.
+        // The output the CPU samples lags the request by one dot — see
+        // [`Engine::nmi_active`]. Taken before the dot runs, so after a
+        // catch-up to dot *d* it holds the level as it stood at *d* − 1.
+        self.nmi_out = self.nmi_raw();
         let scanline = self.scanline;
         let dot = self.dot;
         let rendering = self.rendering_enabled();
@@ -1109,8 +1123,7 @@ impl Engine {
     ///
     /// Two kinds of instant, and the smaller one wins:
     ///
-    /// * **The vblank edges.** `/NMI` is raised
-    ///   [`Geometry::nmi_announce_dots`] after the flag is set at
+    /// * **The vblank edges.** `/NMI` is raised when the flag is set at
     ///   (`vblank_scanline`, 1) and dropped when the flag is cleared at
     ///   (`pre_render_scanline`, 1). Those are the only dots at which the chip
     ///   drives a wire without anybody having touched it, so a run loop that
@@ -1122,41 +1135,33 @@ impl Engine {
     ///   `$2002` read taken mid-quantum can be. Stopping *more* often is never
     ///   wrong: catch-up is a floor on precision, never a ceiling.
     ///
-    /// The result is always at least [`Geometry::nmi_announce_dots`] + 1 dots
-    /// ahead — one CPU cycle, rounded up, plus one. Two reasons, and both
-    /// matter: catch-up that returns a tick the device is already standing on
-    /// makes no progress, and a clock tree may sit up to one driving-domain
-    /// tick behind virtual time (`core::sched`), so a nearer answer would name
-    /// an instant already in the past and be discarded.
+    /// The result is always **strictly ahead** of where the chip stands, which
+    /// `Device::next_event_tick` requires: a target the device is already on
+    /// makes no progress and would stall catch-up where it is. No candidate is
+    /// ever discarded for being close, though — the one that matters most is
+    /// the one two dots away.
     pub fn next_event_dot(&self) -> u64 {
-        let lead = self.geom.nmi_announce_dots + 1;
-        let floor = self.dots + lead;
-        // Distance from here to (`scanline`, `dot`) on this line or the next.
+        // Distance from here to (`line`, `at`), always strictly ahead: catch-up
+        // that returns a tick the device already stands on makes no progress.
         let ahead = |line: u16, at: u16| -> u64 {
             let here = u64::from(self.scanline) * DOTS_PER_SCANLINE as u64 + u64::from(self.dot);
             let there = u64::from(line) * DOTS_PER_SCANLINE as u64 + u64::from(at);
             let frame = self.geom.dots_per_frame;
-            self.dots + (there + frame - here) % frame
+            self.dots + 1 + (there + frame - here - 1) % frame
         };
-        // `run_to(target)` has executed every dot below `target`, so the dot
-        // that *does* the thing is one less than the target that includes it.
-        let vblank_nmi = ahead(
-            self.geom.vblank_scanline,
-            1 + self.geom.nmi_announce_dots as u16,
-        );
-        let vblank_clear = ahead(self.geom.pre_render_scanline, 2);
-        // The line boundary is the ceiling and must always be eligible, so a
-        // boundary inside the lead is skipped to the one after it — a scanline
-        // is 341 dots, which is far more than any lead.
-        let mut next_line = self.dots + u64::from(DOTS_PER_SCANLINE - self.dot);
-        if next_line < floor {
-            next_line += u64::from(DOTS_PER_SCANLINE);
-        }
-        [vblank_nmi, vblank_clear, next_line]
-            .into_iter()
-            .filter(|t| *t >= floor)
-            .min()
-            .unwrap_or(next_line)
+        // `run_to(target)` has executed every dot below `target`, so the target
+        // that *includes* the dot doing the work is one past it — and one past
+        // *that*, because the `/NMI` output lags the request by a dot
+        // ([`Engine::nmi_active`]) and a stop that did not run the following dot
+        // would leave the wire still showing the old level. The flag is set at
+        // (241, 1) and cleared at (pre-render, 1), and both move `/NMI`, so
+        // neither is an instant a core may be let run past.
+        let vblank_set = ahead(self.geom.vblank_scanline, 3);
+        let vblank_clear = ahead(self.geom.pre_render_scanline, 3);
+        // The line boundary is the ceiling: nothing may go stale by more than a
+        // scanline, whatever else the chip is or is not about to do.
+        let next_line = self.dots + u64::from(DOTS_PER_SCANLINE - self.dot);
+        vblank_set.min(vblank_clear).min(next_line)
     }
 
     /// Run dots until `target` total dots have executed, or until the NMI

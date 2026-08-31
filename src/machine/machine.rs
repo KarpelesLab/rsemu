@@ -277,6 +277,10 @@ impl LazyDevice for LazyAdapter {
     fn next_event_tick(&self) -> Option<u64> {
         self.inner.next_event_tick()
     }
+
+    fn sampled_every_cycle(&self) -> bool {
+        self.inner.sampled_every_cycle()
+    }
 }
 
 /// A realized machine: spaces, clocks, wires and devices, ready to run.

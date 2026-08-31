@@ -252,17 +252,27 @@ impl<'a> Exec<'a> {
 
     /// Charge a cycle and poll the interrupt lines if this is not the first.
     fn begin_cycle(&mut self) {
-        if self.icycle > 0 {
+        self.icycle += 1;
+        self.used += 1;
+        self.state.cycles = self.state.cycles.wrapping_add(1);
+        // Say which cycle this is *first*: anything sampled during it — the
+        // interrupt lines below, the bus access above — has to see the machine
+        // as of this cycle rather than as of the last one.
+        self.publish();
+        // Then clock the `/NMI` edge detector, always. The pin's flip-flop runs
+        // on every cycle whether or not this one polls, and it is what makes a
+        // request raised and withdrawn inside one cycle invisible: what it
+        // samples is a level, and the level it samples is the one from a dot
+        // before the bus access, because the CPU looks at `/NMI` during φ2 and
+        // latches the data bus at the end of it.
+        self.lines.sample_nmi();
+        if self.icycle > 1 {
             if self.skip_poll {
                 self.skip_poll = false;
             } else {
                 self.poll();
             }
         }
-        self.icycle += 1;
-        self.used += 1;
-        self.state.cycles = self.state.cycles.wrapping_add(1);
-        self.publish();
     }
 
     /// Tell whoever is watching which cycle this core is on.

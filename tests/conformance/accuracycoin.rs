@@ -252,6 +252,42 @@ impl Report {
     }
 }
 
+/// Which test to snapshot RAM for the moment it finishes.
+///
+/// `RSEMU_AC_WATCH=0450` dumps zero page and the per-test scratch as soon as
+/// `$0450` stops reading "not run". Most of these tests measure something into
+/// an array and then compare it against a table the ROM carries; the verdict
+/// byte says only *that* the comparison failed, so without the array a failure
+/// is a dead end. The run-all loop clears the scratch per test, so the dump has
+/// to happen the frame the result appears.
+pub(crate) const WATCH_ENV: &str = "RSEMU_AC_WATCH";
+
+/// The address named by [`WATCH_ENV`], if it is set to a hex result address.
+fn watched() -> Option<u16> {
+    let text = std::env::var(WATCH_ENV).ok()?;
+    u16::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok()
+}
+
+/// Print a labelled hex dump of `range`.
+fn dump(machine: &dyn NesMachine, label: &str, range: core::ops::RangeInclusive<u16>) {
+    let start = *range.start();
+    println!("  {label}:");
+    let mut line = String::new();
+    for addr in range {
+        if (addr - start).is_multiple_of(16) {
+            if !line.is_empty() {
+                println!("{line}");
+            }
+            line.clear();
+            let _ = write!(line, "    ${addr:04X} ");
+        }
+        let _ = write!(line, " {:02X}", machine.peek(addr));
+    }
+    if !line.is_empty() {
+        println!("{line}");
+    }
+}
+
 /// Boot the ROM, press Start at the menu, wait for the pass, read the results.
 pub(crate) fn run(machine: &mut dyn NesMachine) -> Report {
     machine.set_controller1(buttons::NONE);
@@ -278,10 +314,25 @@ pub(crate) fn run(machine: &mut dyn NesMachine) -> Report {
         status = RunStatus::TimedOut {
             completed: machine.peek(ADDR_TALLY),
         };
+        let watch = watched();
+        let mut dumped = false;
         for _ in 0..RUN_TIMEOUT_FRAMES {
             if machine.peek(ADDR_RUNNING_ALL) == 0 {
                 status = RunStatus::Complete;
                 break;
+            }
+            if let Some(addr) = watch
+                && !dumped
+                && machine.peek(addr) != 0
+            {
+                dumped = true;
+                println!(
+                    "\n${addr:04X} finished with {:?}; RAM as it stood:",
+                    decode(machine.peek(addr))
+                );
+                dump(machine, "zero page", 0x0000..=0x00ff);
+                dump(machine, "scratch", SCRATCH_START..=SCRATCH_END);
+                println!();
             }
             machine.run_frames(1);
         }

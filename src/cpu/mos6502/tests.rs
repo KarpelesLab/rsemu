@@ -692,7 +692,7 @@ fn an_nmi_arriving_after_the_pushes_does_not_hijack() {
     h.bus.poke(0xfffe, &[0x00, 0xe0]);
     h.step();
     assert_eq!(h.regs().pc, 0xe000);
-    h.cpu.set_nmi(true);
+    h.cpu.pulse_nmi();
     assert!(h.cpu.nmi_pending());
 }
 
@@ -700,8 +700,8 @@ fn an_nmi_arriving_after_the_pushes_does_not_hijack() {
 fn an_nmi_is_edge_triggered_and_latches_until_serviced() {
     let h = Harness::running(&[0xea, 0xea, 0xea]);
     h.bus.poke(0xfffa, &[0x00, 0xf0]);
-    h.cpu.set_nmi(true);
-    h.cpu.set_nmi(false); // a pulse: the latch survives the line dropping
+    // A pulse the detector saw: the latch survives the line dropping.
+    h.cpu.pulse_nmi();
     assert!(h.cpu.nmi_pending());
     h.step(); // NOP polls and latches
     assert_eq!(h.cpu.pending_interrupt(), Some(Interrupt::Nmi));
@@ -710,10 +710,9 @@ fn an_nmi_is_edge_triggered_and_latches_until_serviced() {
     assert!(!h.cpu.nmi_pending());
 
     // A level that never falls produces no second interrupt.
-    h.cpu.set_nmi(true);
-    h.cpu.set_nmi(true);
+    h.cpu.pulse_nmi();
     assert!(h.cpu.nmi_pending(), "the first edge latched");
-    h.cpu.set_nmi(false);
+    h.cpu.pulse_nmi();
     h.cpu.set_nmi(false);
 }
 
@@ -1409,11 +1408,28 @@ fn a_wire_driven_through_the_sink_reaches_the_interrupt_latches() {
     pin.sink.set_level(cart, pin.line, Level::Low);
     assert!(!h.cpu.irq_asserted());
 
-    // NMI is edge-sensitive: the latch survives the level going away.
+    // NMI is edge-sensitive, but the edge detector is *clocked*: a level that
+    // goes up and back down between two cycles is one the CPU never sampled.
+    // A separate core, running NOPs, so that stepping it does not service the
+    // very interrupt being asserted.
+    let n = Harness::running(&[0xea, 0xea, 0xea]);
+    let device: &dyn Device = n.cpu.as_ref();
     let nmi = device.sink("nmi", &[apu]).expect("an nmi pin");
     nmi.sink.set_level(apu, nmi.line, Level::High);
     nmi.sink.set_level(apu, nmi.line, Level::Low);
-    assert!(h.cpu.nmi_pending(), "a high-going edge latches");
+    assert!(
+        !n.cpu.nmi_pending(),
+        "a pulse between two cycles is invisible"
+    );
+    // Held across a cycle, it is seen — and the latch then survives the level
+    // going away.
+    nmi.sink.set_level(apu, nmi.line, Level::High);
+    n.step();
+    nmi.sink.set_level(apu, nmi.line, Level::Low);
+    assert!(
+        n.cpu.nmi_pending(),
+        "a high-going edge the detector saw latches"
+    );
 }
 
 #[test]

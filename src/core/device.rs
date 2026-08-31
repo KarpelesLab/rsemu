@@ -360,6 +360,25 @@ pub trait Device: Send + Sync + fmt::Debug {
         None
     }
 
+    /// Whether this device has to be caught up on **every** cycle of whatever
+    /// is running, rather than only at its own next event.
+    ///
+    /// [`next_event_tick`](Device::next_event_tick) is enough for a device
+    /// whose outputs change only at instants it can name. It is not enough for
+    /// one whose output is *sampled* continuously by a core it does not know
+    /// about: the NES PPU drives `/NMI`, the 6502 looks at that pin once per
+    /// CPU cycle, and whether the pin was up or down on a given cycle is a
+    /// question with a different answer three dots later. A device that says
+    /// yes is caught up from inside the core's own cycle loop
+    /// ([`TickCursor`](crate::core::sched::TickCursor)), which costs a catch-up
+    /// per cycle and buys dot-exact sampling.
+    ///
+    /// Default false, because most lazily-advanced devices are read rather than
+    /// watched, and the ones that are read are caught up by the access itself.
+    fn sampled_every_cycle(&self) -> bool {
+        false
+    }
+
     /// Told the handle that catches this device up.
     ///
     /// This is how sync-on-access reaches the code that answers an access:
