@@ -177,6 +177,21 @@ samp,
   align-items: center;
 }
 
+/* The volume slider takes whatever the button leaves, so the row stays one
+   line at every rail width. */
+.row.sound .volume {
+  flex: 1 1 6rem;
+  min-width: 4rem;
+  accent-color: var(--accent, currentColor);
+}
+
+.volume-read {
+  font-size: 0.78rem;
+  color: var(--fg-dim);
+  min-width: 2.8rem;
+  text-align: right;
+}
+
 /* -- controls -------------------------------------------------------------- */
 
 button,

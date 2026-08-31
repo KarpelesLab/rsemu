@@ -104,13 +104,24 @@ has a browser. That part still needs a human.
   ABI reports no pixel aspect. The keyboard is mapped to controller 1 and
   reaches the console's controller port at `$4016` through the `pads` seam,
   which the guest samples when it strobes; the on-screen pad lights up with it,
-  since the seam is a *level* and a stuck button is otherwise invisible. Sound
-  is not wired to the page at all yet: the APU runs, but nothing carries its
-  samples to a `WebAudio` node.
+  since the seam is a *level* and a stuck button is otherwise invisible.
 * **Apple 1** — a real console, and a different view from the NES rather than a
   framebuffer pretending: type at it and RSMON answers. It needs no file; leave
   the picker empty and it boots rsemu's own monitor ROM, exactly as
   `rsemu run apple1` does.
+* **Sound** — yes, through `WebAudio`. The APU produces one sample per APU
+  cycle at 894 886.36… Hz on an NTSC console; `src/host/audio` applies the
+  board's own RC network (90 Hz and 440 Hz high-pass, 14 kHz low-pass — NESdev,
+  "APU Mixer") and resamples to whatever this browser's `AudioContext` runs at,
+  with an **exact integer phase** and no float anywhere near a duration. The
+  page copies interleaved `f32` straight out of the module's memory into an
+  `AudioBuffer` and schedules it against a playhead (`src/audio.js`).
+
+  A context may only be opened from a user gesture, so sound starts with
+  **Boot** and the panel has a mute and a volume. **Muting changes nothing about
+  the machine**: rsemu still produces every sample and the page throws them
+  away, and the state hash is identical either way — `check.mjs` asserts exactly
+  that, headlessly.
 * **Save states** — `Save to a file` writes a file this tab produced;
   `Restore` reads one back into an identically configured machine. Nothing is
   uploaded, and a save state can also be dropped onto the page.
@@ -126,8 +137,8 @@ repeating here:
 
 1. **Nothing crosses as a pointer JavaScript made.** The page writes into a
    buffer rsemu owns (`rsemu_input_reserve`) and reads out of ones rsemu owns
-   (`rsemu_output_ptr`, `rsemu_frame_ptr`). There is no `from_raw_parts` on a
-   caller-supplied address anywhere in the module.
+   (`rsemu_output_ptr`, `rsemu_frame_ptr`, `rsemu_audio_ptr`). There is no
+   `from_raw_parts` on a caller-supplied address anywhere in the module.
 2. **Machines are named by index**, because a build is a feature set and the
    page has to ask what this one contains anyway. No string ever crosses in.
 3. **One machine at a time.** A second instance is a second module.

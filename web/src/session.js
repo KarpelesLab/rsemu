@@ -17,6 +17,7 @@
 // no SharedArrayBuffer and no COOP/COEP anywhere in the page.
 
 import { Rsemu } from "./rsemu.js";
+import { Speaker, audioSupported } from "./audio.js";
 
 /** Re-exported so components can name a button without importing the glue. */
 export const BUTTONS = Rsemu.BUTTONS;
@@ -58,6 +59,11 @@ export class Session {
     this.canvas = null;
     /** @type {CanvasRenderingContext2D|null} */
     this.ctx = null;
+
+    /** WebAudio, and the only thing in this file that knows real time. */
+    this.speaker = new Speaker();
+    /** What the visitor asked for; whether it is *running* is the speaker's. */
+    this.soundWanted = audioSupported();
 
     this.machines = [];
     this.version = "";
@@ -126,6 +132,9 @@ export class Session {
   boot(entry, image) {
     this.emu.boot(entry.index, entry.media ? image : null);
     this.machine = entry;
+    // Boot arrives from a click, which is the only moment a page is allowed to
+    // start audio — so this is where the context is created, not on load.
+    this.startSound();
     this.consoleText = "";
     this.hooks.console("");
     this.held = 0;
@@ -152,6 +161,7 @@ export class Session {
 
   shutdown() {
     this.stop();
+    this.speaker.silence();
     if (this.emu) this.emu.shutdown();
     this.machine = null;
     this.paused = true;
@@ -188,11 +198,15 @@ export class Session {
 
   pause() {
     this.paused = true;
+    // The playhead is a real-time position; leaving it where it was would
+    // schedule the first block after the pause somewhere in the past.
+    this.speaker.silence();
     this.pushStats();
   }
 
   resume() {
     if (!this.running) return;
+    this.startSound();
     this.paused = false;
     this.pending = 0;
     this.last = performance.now();
@@ -217,6 +231,9 @@ export class Session {
       this.fail(e);
       return;
     }
+    // A single frame while paused is 16 ms of audio nobody asked for. Discard
+    // it rather than clicking; the queue must not grow either way.
+    this.emu.audioConsume(this.emu.audioFrames());
     this.pumpConsole(true);
     this.pushStats(true);
   }
@@ -254,6 +271,11 @@ export class Session {
       this.draw();
       this.drawn += 1;
     }
+
+    // After the machine has run, not before: the frames scheduled here are the
+    // ones it just produced. `push` drops them when the speaker is off, so a
+    // muted tab never accumulates a backlog.
+    this.speaker.push(this.emu);
 
     this.pumpConsole(false, now);
 
@@ -309,6 +331,12 @@ export class Session {
       width: this.running ? this.emu.width : 0,
       height: this.running ? this.emu.height : 0,
       framePeriodMs: this.running ? this.emu.frameMs() : 0,
+      hasAudio: Boolean(this.emu && this.running && this.emu.hasAudio),
+      sound: this.soundOn,
+      soundRate: this.speaker.rate,
+      // Frames the *host* could not keep up with. Not machine state: the guest
+      // ran identically either way, which is the whole point of the seam.
+      audioDropped: this.running ? this.emu.audioDropped() : 0,
       force,
     });
   }
@@ -317,6 +345,47 @@ export class Session {
     this.paused = true;
     this.hooks.status({ text: String(e?.message ?? e), error: true });
     this.pushStats(true);
+  }
+
+  // -- sound -------------------------------------------------------------------
+
+  /** Whether sound is actually coming out. */
+  get soundOn() {
+    return this.speaker.playing;
+  }
+
+  /** Whether this browser can play any at all. */
+  get soundSupported() {
+    return audioSupported();
+  }
+
+  /**
+   * Start the audio context and tell rsemu what rate it runs at.
+   *
+   * Idempotent, and safe to call when the visitor has muted: it does nothing.
+   * **It must be reached from a user gesture** — boot, resume or the sound
+   * button — because a page may not start audio by itself.
+   */
+  startSound() {
+    if (!this.soundWanted || !this.emu) return;
+    if (!this.speaker.enable()) return;
+    // The browser chose the rate; rsemu resamples to it, exactly, from the
+    // console's own crystal. Say it after every enable, because a new context
+    // may have a different one.
+    if (this.speaker.rate > 0) this.emu.audioSetRate(this.speaker.rate);
+  }
+
+  /** Turn sound on or off. Call from a click. */
+  toggleSound() {
+    this.soundWanted = !this.soundWanted;
+    if (this.soundWanted) this.startSound();
+    else this.speaker.disable();
+    this.pushStats(true);
+    return this.soundWanted;
+  }
+
+  setVolume(value) {
+    this.speaker.setVolume(value);
   }
 
   // -- save states -----------------------------------------------------------

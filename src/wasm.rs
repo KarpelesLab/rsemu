@@ -44,6 +44,12 @@
 //! leaves them at [`rsemu_output_ptr`], valid until the next call that writes
 //! there.
 //!
+//! Two buffers sit outside that rule because they are read many times per
+//! second and copying them through `output` would be silly: the picture
+//! ([`rsemu_frame_ptr`]) and the sound ([`rsemu_audio_ptr`]). Both are still
+//! rsemu's own memory — rule 1 holds — and both are read at an address the
+//! module hands out, never one JavaScript made.
+//!
 //! # What runs where
 //!
 //! The non-threaded configuration is a supported target, not a fallback
@@ -51,9 +57,15 @@
 //! one video frame and returns, so a page can drive it from
 //! `requestAnimationFrame` and stay responsive without `SharedArrayBuffer`,
 //! `Atomics.wait`, or a worker. Nothing here reads a host clock — the frame
-//! period is computed from the machine's own oscillator forest — so a session
-//! in a browser and the same session under a native debugger produce the same
-//! state hash (§11.6).
+//! period is computed from the machine's own oscillator forest.
+//!
+//! Sound rides the same call. [`rsemu_run_frame`] drains the machine's audio
+//! device into a queue the page reads through [`rsemu_audio_ptr`], resampled
+//! from the console's own crystal-derived rate to whatever the page's
+//! `AudioContext` runs at. **The pull happens whether or not the page is
+//! listening and never changes how far the machine advances**, which is what
+//! keeps [`rsemu_state_hash`] independent of the audio path — see
+//! [`crate::host::audio`] for the whole argument.
 //!
 //! # `unsafe` in this module
 //!
@@ -158,6 +170,13 @@ struct State {
     /// The pad port the machine's controllers read, if it has any.
     #[cfg(feature = "dev-nes-io")]
     pad: Option<alloc::sync::Arc<crate::dev::nes::input::Pad>>,
+    /// The sound, resampled to whatever the page's `AudioContext` runs at, if
+    /// this machine makes any.
+    audio: Option<crate::host::audio::AudioStream>,
+    /// The rate the page last asked for. Kept across boots, because an
+    /// `AudioContext`'s rate is a property of the browser rather than of the
+    /// machine and the page should not have to say it twice.
+    audio_rate: u32,
     /// Bytes JavaScript hands in: ROM images, typed characters, save states.
     input: Vec<u8>,
     /// Bytes JavaScript reads back: console output, save states, messages.
@@ -179,6 +198,8 @@ impl State {
             console: None,
             #[cfg(feature = "dev-nes-io")]
             pad: None,
+            audio: None,
+            audio_rate: DEFAULT_AUDIO_RATE,
             input: Vec::new(),
             output: Vec::new(),
             error: String::new(),
@@ -334,8 +355,11 @@ pub extern "C" fn rsemu_boot(index: u32, image_len: usize) -> u32 {
         state.scanout = None;
         state.console = None;
         state.shown = u64::MAX;
+        state.audio = None;
         #[cfg(feature = "dev-nes-ppu")]
         crate::host::display::nes::capture::clear();
+        #[cfg(feature = "dev-nes-apu")]
+        crate::host::audio::nes::capture::clear();
 
         let registry = match crate::machine::catalog::registry() {
             Ok(r) => r,
@@ -368,6 +392,18 @@ pub extern "C" fn rsemu_boot(index: u32, image_len: usize) -> u32 {
             return fail(state, e);
         }
 
+        // The APU's output ring has to survive one `rsemu_run_frame`, which is
+        // as long as anything here ever goes without draining it. Sizing it is
+        // the *only* thing this interception changes about the machine, and it
+        // is not guest-visible — see `host::audio::nes::capture`.
+        #[cfg(feature = "dev-nes-apu")]
+        if let Err(e) = crate::host::audio::nes::capture::install(
+            &mut options,
+            crate::dev::apu::DEFAULT_SAMPLE_BUFFER,
+        ) {
+            return fail(state, e);
+        }
+
         let machine = match crate::machine::build(entry.name, entry.source, &registry, &options) {
             Ok(m) => m,
             Err(e) => return fail(state, e),
@@ -377,6 +413,18 @@ pub extern "C" fn rsemu_boot(index: u32, image_len: usize) -> u32 {
         if let Some(scanout) = crate::host::display::nes::capture::take() {
             state.frame = crate::host::display::Surface::for_scanout(&scanout);
             state.scanout = Some(alloc::boxed::Box::new(scanout));
+        }
+
+        // Sound goes out as interleaved `f32` in [-1, 1], which is what
+        // WebAudio's `AudioBuffer` holds, so the page copies rather than
+        // converts.
+        #[cfg(feature = "dev-nes-apu")]
+        if let Some(source) = crate::host::audio::nes::capture::take() {
+            state.audio = Some(crate::host::audio::AudioStream::new(
+                alloc::boxed::Box::new(source),
+                state.audio_rate,
+                crate::host::audio::SampleFormat::F32,
+            ));
         }
 
         // Whatever character port the machine's devices opened is the console.
@@ -423,6 +471,7 @@ pub extern "C" fn rsemu_shutdown() {
         state.machine = None;
         state.scanout = None;
         state.console = None;
+        state.audio = None;
         #[cfg(feature = "dev-nes-io")]
         {
             state.pad = None;
@@ -446,6 +495,12 @@ pub extern "C" fn rsemu_reset() -> u32 {
             return fail(state, "no machine is loaded");
         };
         machine.reset(crate::core::device::ResetKind::Warm);
+        // Whatever was queued belongs to the run that just ended. Playing it
+        // after a reset would be a second or two of the previous game.
+        if let Some(audio) = state.audio.as_mut() {
+            let queued = audio.buffer().frames();
+            audio.consume(queued);
+        }
         1
     })
 }
@@ -483,6 +538,14 @@ pub extern "C" fn rsemu_run_frame() -> u32 {
         };
         if let Err(e) = machine.run_for(crate::core::clock::GlobalTime::from_nanos(period)) {
             return fail(state, e);
+        }
+
+        // Immediately after the machine ran and before anything else: the
+        // device's ring is sized for exactly one of these, and this is the
+        // cadence the page would run at whether or not it were listening — the
+        // audio path must never be what decides how far the machine advances.
+        if let Some(audio) = state.audio.as_mut() {
+            audio.pull();
         }
 
         let Some(scanout) = state.scanout.as_ref() else {
@@ -587,6 +650,120 @@ pub extern "C" fn rsemu_frame_height() -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn rsemu_frame_serial() -> u64 {
     with_state(|state| state.frame.serial())
+}
+
+// ---------------------------------------------------------------------------
+// The sound
+// ---------------------------------------------------------------------------
+
+/// The rate assumed until the page says otherwise.
+///
+/// 48 000 is what an `AudioContext` reports on most desktops; 44 100 is common
+/// enough that a page really should call [`rsemu_audio_set_rate`] with its
+/// context's own `sampleRate` rather than trusting this.
+const DEFAULT_AUDIO_RATE: u32 = 48_000;
+
+/// Whether this machine makes a sound at all.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_has_audio() -> u32 {
+    with_state(|state| u32::from(state.audio.is_some()))
+}
+
+/// Tell rsemu what rate the page's `AudioContext` runs at, in hertz.
+///
+/// Returns `1`, or `0` for a rate outside 8 000–384 000. Anything already
+/// queued is discarded: it was converted for the old rate and playing it at the
+/// new one would be a chirp.
+///
+/// The rate is remembered across [`rsemu_boot`], because it is a property of
+/// the browser rather than of the machine.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_audio_set_rate(hz: u32) -> u32 {
+    with_state(|state| {
+        if !(8_000..=384_000).contains(&hz) {
+            return fail(state, "an audio rate outside 8000..=384000 Hz");
+        }
+        state.audio_rate = hz;
+        if let Some(audio) = state.audio.as_mut() {
+            audio.set_rate(hz);
+        }
+        1
+    })
+}
+
+/// The rate the queued frames are at, in hertz.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_audio_rate() -> u32 {
+    with_state(|state| state.audio_rate)
+}
+
+/// How many channels one queued frame holds. `1` is mono, which every machine
+/// in this build is.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_audio_channels() -> u32 {
+    with_state(|state| {
+        state
+            .audio
+            .as_ref()
+            .map_or(0, |a| u32::from(a.buffer().channels()))
+    })
+}
+
+/// How many frames are waiting to be played.
+///
+/// A *frame* is one sample per channel. [`rsemu_run_frame`] appends to this
+/// queue, so a page reads it after every advance.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_audio_frames() -> usize {
+    with_state(|state| {
+        state
+            .audio
+            .as_ref()
+            .map_or(0, |a| a.buffer().frames() as usize)
+    })
+}
+
+/// The address of the queued frames: `rsemu_audio_frames() ×
+/// rsemu_audio_channels()` little-endian `f32` samples in `[-1.0, 1.0]`,
+/// interleaved — exactly what a WebAudio `AudioBuffer` holds.
+///
+/// **Read it immediately before copying**, and again after every call: unlike
+/// the frame buffer, this queue grows, and a wasm memory that grows detaches
+/// every view JavaScript is holding.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_audio_ptr() -> *const u8 {
+    with_state(|state| {
+        state
+            .audio
+            .as_ref()
+            .map_or(core::ptr::null(), |a| a.buffer().as_ptr())
+    })
+}
+
+/// Drop the oldest `frames` frames, returning how many were actually dropped.
+///
+/// The page calls this once it has copied them into an `AudioBuffer`. Nothing
+/// drops them on its own: a queue that emptied itself between the read and the
+/// copy would hand the page a view over freed bytes.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_audio_consume(frames: usize) -> usize {
+    with_state(|state| {
+        state
+            .audio
+            .as_mut()
+            .map_or(0, |a| a.consume(frames as u64) as usize)
+    })
+}
+
+/// How many frames have been lost because nobody kept up — at the device's ring
+/// or at this queue.
+///
+/// A **diagnostic**: audio the host never collected is not machine state, no
+/// guest can observe it, and it does not enter [`rsemu_state_hash`]. A page can
+/// show it to explain a crackle.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_audio_dropped() -> u64 {
+    with_state(|state| state.audio.as_ref().map_or(0, |a| a.dropped()))
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +882,12 @@ pub extern "C" fn rsemu_load(len: usize) -> u32 {
         match machine.load(&bytes) {
             Ok(()) => {
                 state.shown = u64::MAX;
+                // Same argument as `rsemu_reset`: the queue holds audio from
+                // before the restore.
+                if let Some(audio) = state.audio.as_mut() {
+                    let queued = audio.buffer().frames();
+                    audio.consume(queued);
+                }
                 1
             }
             Err(e) => fail(state, e),
@@ -856,5 +1039,98 @@ mod tests {
         assert_eq!(rsemu_state_hash(), hash, "the snapshot did not restore");
 
         rsemu_shutdown();
+    }
+
+    /// Sound through the ABI: a machine that boots produces frames, the page
+    /// drains them, and doing so leaves the machine bit-identical.
+    ///
+    /// The hash comparison is the load-bearing half. It is run against a
+    /// machine driven exactly as [`rsemu_run_frames`] drives it, because that
+    /// is the cadence a page uses; if pulling audio could ever move
+    /// architectural state, this is where it would show.
+    #[cfg(all(feature = "machine-nes", feature = "dev-nes-apu"))]
+    #[test]
+    fn a_nes_plays_through_the_abi() {
+        let _serialised = crate::host::display::PROCESS_WIDE.lock();
+
+        /// `LDA #$0F / STA $4015 / LDA #$9F / STA $4000 / LDA #$08 / STA $4003`
+        /// and then a tight loop: both pulse channels at full volume, so there
+        /// is something to hear.
+        static NOISY_NROM: &[u8] = &{
+            let mut image = [0u8; 16 + 16384 + 8192];
+            image[0] = b'N';
+            image[1] = b'E';
+            image[2] = b'S';
+            image[3] = 0x1a;
+            image[4] = 1;
+            image[5] = 1;
+            image[16 + 0x3ffc] = 0x00;
+            image[16 + 0x3ffd] = 0xc0;
+            let program: [u8; 18] = [
+                0xa9, 0x0f, 0x8d, 0x15, 0x40, 0xa9, 0x9f, 0x8d, 0x00, 0x40, 0xa9, 0x08, 0x8d, 0x03,
+                0x40, 0x4c, 0x0f, 0xc0,
+            ];
+            let mut i = 0;
+            while i < program.len() {
+                image[16 + i] = program[i];
+                i += 1;
+            }
+            image
+        };
+
+        fn boot_noisy() -> u32 {
+            let index = (0..rsemu_machine_count())
+                .find(|i| {
+                    rsemu_machine_name(*i);
+                    with_state(|state| state.output == b"nes-ntsc")
+                })
+                .expect("machine-nes is on, so the catalog has one");
+            rsemu_input_reserve(NOISY_NROM.len());
+            with_state(|state| state.input.copy_from_slice(NOISY_NROM));
+            assert_eq!(rsemu_boot(index, NOISY_NROM.len()), 1, "boot failed");
+            index
+        }
+
+        boot_noisy();
+        assert_eq!(rsemu_has_audio(), 1);
+        assert_eq!(rsemu_audio_channels(), 1);
+        assert_eq!(rsemu_audio_rate(), 48_000);
+
+        // A page announces its own context's rate; anything absurd is refused
+        // rather than silently accepted.
+        assert_eq!(rsemu_audio_set_rate(44_100), 1);
+        assert_eq!(rsemu_audio_rate(), 44_100);
+        assert_eq!(rsemu_audio_set_rate(3), 0);
+        assert_eq!(rsemu_audio_rate(), 44_100);
+
+        // Thirty frames is half a second, so about 22 050 frames of audio.
+        rsemu_run_frames(30);
+        let queued = rsemu_audio_frames();
+        assert!(queued > 20_000, "half a second gave {queued} frames");
+        assert!(!rsemu_audio_ptr().is_null());
+        assert_eq!(rsemu_audio_dropped(), 0, "the ring is sized for one frame");
+
+        // The page copies and then says so; nothing drops on its own.
+        assert_eq!(rsemu_audio_consume(1000), 1000);
+        assert_eq!(rsemu_audio_frames(), queued - 1000);
+        assert_eq!(rsemu_audio_consume(usize::MAX), queued - 1000);
+        assert_eq!(rsemu_audio_frames(), 0);
+
+        let listened = rsemu_state_hash();
+        assert_ne!(listened, 0);
+
+        // The same run again, with nobody reading the queue at all.
+        boot_noisy();
+        rsemu_run_frames(30);
+        assert_eq!(
+            rsemu_state_hash(),
+            listened,
+            "the state hash depends on whether the page was listening"
+        );
+
+        rsemu_shutdown();
+        assert_eq!(rsemu_has_audio(), 0);
+        assert_eq!(rsemu_audio_frames(), 0);
+        assert!(rsemu_audio_ptr().is_null());
     }
 }

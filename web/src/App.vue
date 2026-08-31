@@ -39,6 +39,15 @@ const status = ref({ text: "Loading the module…", error: false });
 const aspect = ref("tv");
 const dragging = ref(false);
 
+// Sound. `soundOn` is what is actually coming out of the speakers, which is not
+// the same as what the visitor asked for: a browser may refuse until a gesture,
+// and it is honest to show the difference.
+const soundSupported = ref(false);
+const soundWanted = ref(false);
+const soundOn = ref(false);
+const soundRate = ref(0);
+const volume = ref(70);
+
 const stats = ref({
   running: false,
   paused: true,
@@ -49,6 +58,10 @@ const stats = ref({
   width: 256,
   height: 240,
   framePeriodMs: 0,
+  hasAudio: false,
+  sound: false,
+  soundRate: 0,
+  audioDropped: 0,
 });
 
 const terminal = ref(null);
@@ -89,6 +102,8 @@ onMounted(async () => {
     stats: (s) => {
       stats.value = s;
       paused.value = s.paused;
+      soundOn.value = s.sound;
+      soundRate.value = s.soundRate;
     },
     console: (text) => (consoleText.value = text),
     status: (s) => (status.value = s),
@@ -123,6 +138,10 @@ onMounted(async () => {
   // something to press rather than a file picker to satisfy.
   const free = machines.value.find((m) => !m.media);
   chosen.value = (free ?? machines.value[0]).index;
+
+  soundSupported.value = session.soundSupported;
+  soundWanted.value = session.soundWanted;
+  session.setVolume(volume.value / 100);
 
   session.listen();
   phase.value = "ready";
@@ -176,6 +195,22 @@ function reset() {
   } catch (e) {
     say(String(e?.message ?? e), true);
   }
+}
+
+function toggleSound() {
+  soundWanted.value = session.toggleSound();
+  soundOn.value = session.soundOn;
+  soundRate.value = session.speaker.rate;
+  say(
+    soundWanted.value
+      ? `Sound on — resampled from the console's own crystal to ${session.speaker.rate || "?"} Hz.`
+      : "Muted. The machine runs identically either way — the state hash is the proof.",
+  );
+}
+
+function onVolume(event) {
+  volume.value = Number(event.target.value);
+  session.setVolume(volume.value / 100);
 }
 
 function eject() {
@@ -374,6 +409,59 @@ function onStatePicked(event) {
               </button>
             </div>
             <StatGrid :stats="stats" :live="booted" />
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2 class="panel-title"><span>sound</span></h2>
+          <div class="panel-body">
+            <div class="row sound">
+              <button
+                class="btn"
+                type="button"
+                :disabled="!soundSupported"
+                :aria-pressed="soundWanted"
+                @click="toggleSound"
+              >
+                {{ soundWanted ? "Mute" : "Unmute" }}
+              </button>
+              <label class="sr-only" for="volume">Volume</label>
+              <input
+                id="volume"
+                class="volume"
+                type="range"
+                min="0"
+                max="100"
+                :value="volume"
+                :disabled="!soundSupported"
+                @input="onVolume"
+              />
+              <span class="mono volume-read">{{ volume }}%</span>
+            </div>
+            <p class="hint">
+              <template v-if="!soundSupported">
+                This browser has no WebAudio, so there is nothing to play into.
+              </template>
+              <template v-else-if="!booted">
+                Sound starts with the machine — a page may only open an audio context from a
+                click, and Boot is one.
+              </template>
+              <template v-else-if="!stats.hasAudio">
+                {{ entry.name }} has no audio device, so there is nothing to hear.
+              </template>
+              <template v-else-if="soundOn">
+                Playing at {{ soundRate }} Hz, resampled from the console's own crystal —
+                894 886.36… Hz on an NTSC NES — with exact integer phase.
+                <template v-if="stats.audioDropped">
+                  {{ stats.audioDropped }} frames dropped because this tab could not keep up;
+                  the machine ran identically anyway.
+                </template>
+              </template>
+              <template v-else>
+                Muted. The emulator still produces every sample and throws them away here, so
+                the state hash is the same either way.
+              </template>
+            </p>
           </div>
         </section>
 
