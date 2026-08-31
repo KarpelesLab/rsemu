@@ -34,6 +34,10 @@ pub mod z80;
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-x86")))]
 pub mod x86;
 
+#[cfg(feature = "cpu-sm83")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-sm83")))]
+pub mod sm83;
+
 #[cfg(feature = "cpu-riscv")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-riscv")))]
 pub mod riscv;

@@ -32,6 +32,10 @@ pub mod apu;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-cart")))]
 pub mod cart;
 
+#[cfg(feature = "dev-gb")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-gb")))]
+pub mod gb;
+
 #[cfg(feature = "dev-nes-ppu")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-ppu")))]
 pub mod ppu;

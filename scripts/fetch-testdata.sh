@@ -240,6 +240,84 @@ that file says what they mean.
 Consumed by tests/conformance/accuracycoin.rs."
 }
 
+# ---------------------------------------------------------------------------
+# Game Boy
+# ---------------------------------------------------------------------------
+#
+# Two suites, fetched together because a Game Boy bring-up wants both: blargg's
+# ROMs are the quick gate and Gekkio's acceptance suite is the strict one. Both
+# come out of c-sp/game-boy-test-roms, which is a *bundle* of the community's
+# suites with each one's licence carried alongside it — that is the point of
+# using it rather than five separate downloads.
+readonly GB_BUNDLE_TAG="v7.0"
+readonly GB_BUNDLE_URL="https://github.com/c-sp/game-boy-test-roms/releases/download/${GB_BUNDLE_TAG}/game-boy-test-roms-${GB_BUNDLE_TAG}.zip"
+
+fetch_gameboy() {
+	need curl
+	need unzip
+	local dest="${DEST_ROOT}/gb-bundle"
+	local zip="${DEST_ROOT}/game-boy-test-roms-${GB_BUNDLE_TAG}.zip"
+
+	if [ "$FORCE" = 1 ] || [ ! -d "${dest}/mooneye-test-suite" ]; then
+		note "  downloading game-boy-test-roms ${GB_BUNDLE_TAG} ..."
+		download "$GB_BUNDLE_URL" "$zip"
+		rm -rf "$dest"
+		mkdir -p "$dest"
+		unzip -q -o "$zip" -d "$dest"
+		rm -f "$zip"
+	fi
+
+	# The two suites the runners actually read, linked into stable directory
+	# names so the environment variables below never mention a version.
+	rm -rf "${DEST_ROOT}/gb-blargg" "${DEST_ROOT}/gb-mooneye"
+	mkdir -p "${DEST_ROOT}/gb-blargg"
+	# Only the individual `cpu_instrs` tests and `instr_timing`: the combined
+	# `cpu_instrs.gb` is the same eleven tests again inside an MBC1 wrapper, and
+	# running both doubles the time for no extra coverage.
+	local found=0 rom
+	while IFS= read -r rom; do
+		cp "$rom" "${DEST_ROOT}/gb-blargg/"
+		found=$((found + 1))
+	done < <(find "${dest}/blargg" -path '*cpu_instrs/individual/*.gb' -o -name 'instr_timing.gb' 2>/dev/null)
+	[ "$found" -gt 0 ] || warn "no blargg ROMs found in the bundle"
+	ok "gb-blargg: ${found} ROMs"
+
+	if [ -d "${dest}/mooneye-test-suite/acceptance" ]; then
+		cp -r "${dest}/mooneye-test-suite/acceptance" "${DEST_ROOT}/gb-mooneye"
+		ok "gb-mooneye: $(find "${DEST_ROOT}/gb-mooneye" -name '*.gb' | wc -l | tr -d ' ') ROMs"
+	else
+		warn "the bundle has no mooneye acceptance directory"
+	fi
+
+	write_notice "${DEST_ROOT}/gb-blargg" "blargg's Game Boy test ROMs
+via https://github.com/c-sp/game-boy-test-roms (${GB_BUNDLE_TAG})
+
+Licence: UNCLEAR. Shawn Hargreaves' (blargg's) ROMs have been passed around for
+two decades without a stated licence. FETCH AND RUN ONLY — do not commit them,
+do not vendor them, do not attach them to a release. Running one as an emulated
+guest is ordinary use; redistributing it is not ours to do.
+
+Consumed by RSEMU_GB_BLARGG_DIR in src/cpu/sm83/conformance.rs and
+src/dev/gb/conformance.rs."
+
+	write_notice "${DEST_ROOT}/gb-mooneye" "Gekkio/mooneye-test-suite
+via https://github.com/c-sp/game-boy-test-roms (${GB_BUNDLE_TAG})
+
+Licence: MIT, (c) Joonas Javanainen. Redistributable with attribution — but
+this directory is git-ignored anyway, because every corpus is fetched the same
+way. ROADMAP.md §12 names *mooneye-test-suite*, the suite, and not
+*mooneye-gb*, which is the emulator: the suite is a fixture and the emulator is
+somebody else's implementation, which §1 keeps us away from.
+
+Consumed by RSEMU_GB_MOONEYE_DIR in src/dev/gb/conformance.rs."
+
+	note ""
+	note "  Then:"
+	note "      RSEMU_CONFORMANCE=1 RSEMU_GB_BLARGG_DIR=${DEST_ROOT}/gb-blargg \\"
+	note "      RSEMU_GB_MOONEYE_DIR=${DEST_ROOT}/gb-mooneye \\"
+	note "      cargo test --release --all-features -- --nocapture conformance"
+}
+
 fetch_wozmon() {
 	local dest="${DEST_ROOT}/apple1"
 	local target="${dest}/wozmon.bin"
@@ -328,6 +406,7 @@ Suites:
   sst-65x02      SingleStepTests 6502 vectors  (MIT, redistributable)
   nestest        nestest.nes + nestest.log     (licence unclear, FETCH-ONLY)
   accuracycoin   AccuracyCoin.nes + README     (MIT, (c) 2025 Chris Siebert)
+  gameboy        blargg GB + mooneye acceptance (mixed; see the notices)
   wozmon         the Apple 1 monitor           (licence unclear, BRING YOUR OWN)
 
 Options:
@@ -358,7 +437,7 @@ list_present() {
 		return 0
 	fi
 	local suite
-	for suite in sst-65x02 nestest accuracycoin apple1; do
+	for suite in sst-65x02 nestest accuracycoin gb-blargg gb-mooneye apple1; do
 		if [ -d "${DEST_ROOT}/${suite}" ]; then
 			printf '  %-14s %s\n' "$suite" \
 				"$(du -sh "${DEST_ROOT}/${suite}" 2>/dev/null | cut -f1) present"
@@ -376,7 +455,7 @@ SUITES=()
 
 while [ $# -gt 0 ]; do
 	case "$1" in
-		--all) SUITES=(sst-65x02 nestest accuracycoin) ;;
+		--all) SUITES=(sst-65x02 nestest accuracycoin gameboy) ;;
 		--force) FORCE=1 ;;
 		--variant) SST_VARIANT="${2:?--variant needs a value}"; shift ;;
 		--opcodes) SST_OPCODES="${2:?--opcodes needs a value}"; shift ;;
@@ -389,7 +468,7 @@ while [ $# -gt 0 ]; do
 	shift
 done
 
-[ ${#SUITES[@]} -eq 0 ] && SUITES=(sst-65x02 nestest accuracycoin)
+[ ${#SUITES[@]} -eq 0 ] && SUITES=(sst-65x02 nestest accuracycoin gameboy)
 
 mkdir -p "$DEST_ROOT"
 # Belt and braces: even if the repository .gitignore is edited, nothing under
@@ -405,6 +484,7 @@ for suite in "${SUITES[@]}"; do
 		sst-65x02|sst) fetch_sst ;;
 		nestest) fetch_nestest ;;
 		accuracycoin|coin) fetch_accuracycoin ;;
+		gameboy|gb) fetch_gameboy ;;
 		wozmon|apple1) fetch_wozmon ;;
 		*) die "unknown suite $suite (try --help)" ;;
 	esac

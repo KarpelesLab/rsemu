@@ -113,6 +113,31 @@ cpu-arm = []
 # dependencies and is `no_std + alloc`.
 cpu-z80 = []
 
+# The Sharp SM83 core (src/cpu/sm83): the Game Boy's processor, an M-cycle
+# accurate interpreter with all 256 base and 256 $CB encodings, the eleven
+# unimplemented opcodes modelled as the lock-up they are, the HALT bug, EI's
+# one-instruction delay, and the interrupt dispatch whose vector is chosen after
+# the return address is pushed. `IF` and `IE` are regions of this device and its
+# five interrupt inputs are edge-triggered wire pins, which is what gives STAT
+# blocking for free. A disassembler is generated from the same table. Adds no
+# dependencies and is `no_std + alloc`.
+cpu-sm83 = []
+
+# The Game Boy's chips (src/dev/gb): the LCD controller with its four modes,
+# variable mode-3 length, level-driven STAT and VBlank lines and OAM DMA; the
+# divider and timer with the falling-edge detector that makes a DIV write clock
+# TIMA and shift every sound envelope; four sound channels driven by that same
+# 512 Hz output over an ordinary wire; the cartridge header with ROM-only, MBC1,
+# MBC2, MBC3 (real-time clock included, on the cartridge's own crystal) and
+# MBC5; the joypad matrix; and the serial port, which is how a headless test ROM
+# reports its result. `no_std + alloc` and dependency-free.
+dev-gb = []
+
+# The Game Boy as a machine (machines/gameboy.machine plus the classes it
+# names). `rsemu run gameboy --cart tetris.gb`. Phase 4's genericity proof:
+# a machine that is not NES-shaped, on the same core. Adds no dependencies.
+machine-gameboy = ["cpu-sm83", "dev-gb"]
+
 # The Intel 8086/8088 core (src/cpu/x86): a real-mode interpreter with every
 # documented and undocumented encoding, segment:offset addressing that wraps at
 # 1 MiB, a separate I/O address space, the prefetch queue, and a disassembler
