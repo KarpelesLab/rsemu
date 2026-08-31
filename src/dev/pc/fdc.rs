@@ -39,7 +39,7 @@
 //! Every operation is a **command phase** (the CPU writes an opcode and its
 //! parameters), an optional **execution phase** (data moves, by DMA or by the
 //! CPU polling the data register), and a **result phase** (the CPU reads result
-//! bytes until `RQM`/`DIO` say there are none left). [`Phase`] is that state
+//! bytes until `RQM`/`DIO` say there are none left). `Phase` is that state
 //! machine, made explicit because the main status register is a pure function
 //! of it: firmware that reads a wrong `RQM` does not fail, it hangs.
 //!
