@@ -39,6 +39,18 @@ readonly AC_BASE="https://raw.githubusercontent.com/100thCoin/AccuracyCoin/main"
 # mismatch warns; it does not fail.
 readonly AC_ROM_SHA="b8aa2a6bbcf01a8839850d0b802a7a4e4bed6002adfe344729c234c6a0dd0647"
 
+# OpenSBI, the RISC-V supervisor binary interface firmware. BSD-2-Clause, so it
+# may be read and used freely (ROADMAP.md §1) — it is fetched rather than
+# committed only because binaries do not belong in this repository.
+#
+# Debian's package rather than an upstream release: upstream ships source
+# tarballs, and building them needs a cross toolchain this script deliberately
+# does not require. The .deb is a plain `ar` archive; `fw_jump.bin` inside it is
+# already a flat image for 0x80000000.
+readonly OPENSBI_DEB="https://deb.debian.org/debian/pool/main/o/opensbi/opensbi_1.6-1_all.deb"
+readonly OPENSBI_DEB_SHA="dc4a43bd21a0ca11771ed8b19ee6fa8476d1d0f4976bd0b27c0357c699d27e1e"
+readonly OPENSBI_MEMBER="./usr/lib/riscv64-linux-gnu/opensbi/generic/fw_jump.bin"
+
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
@@ -316,6 +328,70 @@ Consumed by RSEMU_APPLE1_ROM in src/dev/apple1/tests.rs, and by
 \`rsemu run apple1 --rom …\`."
 }
 
+fetch_opensbi() {
+	need curl
+	need tar
+	need ar
+	local dest="${DEST_ROOT}/riscv"
+	local target="${dest}/fw_jump.bin"
+
+	if [ "$FORCE" = 0 ] && [ -s "$target" ]; then
+		ok "fw_jump.bin already present ($(wc -c <"$target" | tr -d ' ') bytes)"
+		opensbi_notice "$dest"
+		opensbi_hint "$target"
+		return 0
+	fi
+
+	local work="${dest}/.unpack"
+	rm -rf "$work"
+	mkdir -p "$work"
+	fetch_verified "$OPENSBI_DEB" "${work}/opensbi.deb" "$OPENSBI_DEB_SHA" advisory
+	( cd "$work" && ar x opensbi.deb data.tar.xz ) || die "opensbi.deb is not an ar archive"
+	tar -xf "${work}/data.tar.xz" -C "$work" "$OPENSBI_MEMBER" 2>/dev/null || \
+		die "no ${OPENSBI_MEMBER} in the package; upstream may have moved it"
+	mv -f "${work}/${OPENSBI_MEMBER}" "$target"
+	rm -rf "$work"
+
+	# Content check rather than a checksum of the firmware itself, since the
+	# package may be rebuilt: every OpenSBI build carries its own banner, so
+	# the string is in there. That catches an HTML error page, a truncated
+	# download and the wrong member of the archive alike.
+	local size
+	size="$(wc -c <"$target" | tr -d ' ')"
+	if [ "$size" -lt 32768 ] || ! grep -qa OpenSBI "$target"; then
+		rm -f "$target"
+		die "that is ${size} bytes and does not say OpenSBI anywhere; it is not the firmware"
+	fi
+	ok "fw_jump.bin (${size} bytes)"
+	opensbi_notice "$dest"
+	opensbi_hint "$target"
+}
+
+opensbi_notice() {
+	write_notice "$1" "OpenSBI fw_jump.bin
+${OPENSBI_DEB}
+https://github.com/riscv-software-src/opensbi
+
+Licence: BSD-2-Clause. Permissive, so it may be read as well as run — which is
+unusual among the things in this directory and is why docs/platforms/riscv-virt.md
+names it as the firmware for this board.
+
+fw_jump.bin runs at 0x80000000 and hands control to 0x80200000 in S-mode. To
+boot a kernel as well, concatenate: fw_jump.bin padded to 2 MiB, then a RISC-V
+Image, and give the result to the one firmware slot.
+
+Consumed by RSEMU_RISCV_FIRMWARE in src/dev/riscv/tests.rs, and by
+\`rsemu run riscv-virt --media firmware=…\`."
+}
+
+opensbi_hint() {
+	note ""
+	note "  Boot it:"
+	note "      RSEMU_RISCV_FIRMWARE=$1 \\"
+	note "          cargo test --release --all-features riscv --lib -- --nocapture"
+	note "      rsemu run riscv-virt --media firmware=$1"
+}
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -329,6 +405,7 @@ Suites:
   nestest        nestest.nes + nestest.log     (licence unclear, FETCH-ONLY)
   accuracycoin   AccuracyCoin.nes + README     (MIT, (c) 2025 Chris Siebert)
   wozmon         the Apple 1 monitor           (licence unclear, BRING YOUR OWN)
+  opensbi        RISC-V firmware for riscv-virt (BSD-2-Clause, redistributable)
 
 Options:
   --all               fetch every suite (the default when none is named).
@@ -358,7 +435,7 @@ list_present() {
 		return 0
 	fi
 	local suite
-	for suite in sst-65x02 nestest accuracycoin apple1; do
+	for suite in sst-65x02 nestest accuracycoin apple1 riscv; do
 		if [ -d "${DEST_ROOT}/${suite}" ]; then
 			printf '  %-14s %s\n' "$suite" \
 				"$(du -sh "${DEST_ROOT}/${suite}" 2>/dev/null | cut -f1) present"
@@ -376,7 +453,7 @@ SUITES=()
 
 while [ $# -gt 0 ]; do
 	case "$1" in
-		--all) SUITES=(sst-65x02 nestest accuracycoin) ;;
+		--all) SUITES=(sst-65x02 nestest accuracycoin opensbi) ;;
 		--force) FORCE=1 ;;
 		--variant) SST_VARIANT="${2:?--variant needs a value}"; shift ;;
 		--opcodes) SST_OPCODES="${2:?--opcodes needs a value}"; shift ;;
@@ -389,7 +466,7 @@ while [ $# -gt 0 ]; do
 	shift
 done
 
-[ ${#SUITES[@]} -eq 0 ] && SUITES=(sst-65x02 nestest accuracycoin)
+[ ${#SUITES[@]} -eq 0 ] && SUITES=(sst-65x02 nestest accuracycoin opensbi)
 
 mkdir -p "$DEST_ROOT"
 # Belt and braces: even if the repository .gitignore is edited, nothing under
@@ -406,6 +483,7 @@ for suite in "${SUITES[@]}"; do
 		nestest) fetch_nestest ;;
 		accuracycoin|coin) fetch_accuracycoin ;;
 		wozmon|apple1) fetch_wozmon ;;
+		opensbi|riscv) fetch_opensbi ;;
 		*) die "unknown suite $suite (try --help)" ;;
 	esac
 done
