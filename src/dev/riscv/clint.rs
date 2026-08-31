@@ -51,12 +51,19 @@
 //! the timer, and never advances — a live-lock with a full console log up to
 //! the point the clocksource is first used. See `src/dev/riscv/tests.rs`.
 //!
-//! [`Clint::mtime_cell`] is this side of the fix: a shared cell holding the
-//! live value. What is missing is the other side, in `cpu::riscv`, and it is
-//! small — a `Hart::attach_time(Arc<AtomicU64>)` that the CSR read path
-//! consults instead of its own field, and one line in `machine::realize` (or a
-//! `RealizeCtx` that can hand one device another's handle) to connect them.
-//! This module deliberately does not reach into `cpu/` to do it.
+//! Both halves of the fix now exist and are untested only in combination:
+//! [`Clint::mtime_cell`] publishes the live value, and
+//! `Hart::attach_time(Arc<AtomicU64>)` makes the `time` CSR read it. What is
+//! still missing is the *wiring* — nothing in a realized machine hands one to
+//! the other, because `BindCtx` cannot reach a sibling device's handle.
+//!
+//! That gap is not this board's. It is the third place the same thing has been
+//! wanted: `host::gdb` needs a route from a `dyn Device` to a core's registers,
+//! `host::display` needs one to the PPU's frame buffer, and this needs one to
+//! the CLINT's timer. Each has worked around it differently. The seam belongs
+//! in `core::device`, and with three consumers there is finally enough evidence
+//! to design it rather than guess (`ROADMAP.md` §4.4). This module deliberately
+//! does not reach into `cpu/` to paper over it.
 
 use alloc::boxed::Box;
 use alloc::format;
