@@ -1205,11 +1205,13 @@ fn decode_extra_load_store(raw: u32) -> Insn {
         Index::Pre {
             writeback: bit(raw, 21),
         }
-    } else if bit(raw, 21) {
-        // W must be clear in a post-indexed mode 3 access; ARMv5 has no
-        // `LDRHT`.
-        return Insn::Undefined;
     } else {
+        // `W` is redundant in a post-indexed access, which always writes the
+        // base back, and ARMv5 has no `LDRHT` to give it a second meaning —
+        // so `P == 0, W == 1` is UNPREDICTABLE (ARM ARM A5.3). An ARM7TDMI
+        // simply ignores the bit and performs the post-indexed access, which
+        // is both what the corpus shows and the more useful of the readings;
+        // treating it as Undefined would trap code that runs on real silicon.
         Index::Post {
             unprivileged: false,
         }
