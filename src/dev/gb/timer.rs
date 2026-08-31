@@ -232,9 +232,10 @@ impl Shared {
     /// this buys is not precision for its own sake — it is that between two
     /// consecutive events *nothing changes*, so a read that lands in the gap is
     /// correct even though the device has not been advanced to the exact tick.
-    /// It is also the deadline a running core's [`TickCursor`](crate::core::sched::TickCursor) watches, which is
-    /// how the timer's own interrupt lands on the cycle it is due on rather than
-    /// at the end of the quantum.
+    /// It is also the deadline a running core's
+    /// [`TickCursor`](crate::core::sched::TickCursor) watches, which is how the
+    /// timer's own interrupt lands on the cycle it is due on rather than at the
+    /// end of the quantum.
     fn compute_next_event(&self, regs: &Regs, now: u64) -> u64 {
         // `DIV` steps every 256 clocks.
         let to_div = 256 - u64::from(regs.counter & 0xff);
