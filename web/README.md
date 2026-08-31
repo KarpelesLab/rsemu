@@ -46,10 +46,10 @@ output back. Everything except the DOM, in other words.
 ## What is wired and what is not
 
 * **NES** — picture, yes: 256×240 RGBA at the machine's own frame rate. The
-  keyboard is mapped to controller 1 and reaches `rsemu_set_buttons`, but the
-  console has no controller *device* yet ($4016/$4017 read open bus, which
-  `machines/nes-ntsc.machine` names in its own TODO), so nothing reads those
-  buttons until it lands. Sound is not wired to the page at all yet.
+  keyboard is mapped to controller 1 and reaches the console's controller port
+  at `$4016` through the `pads` seam, which the guest samples when it strobes.
+  Sound is not wired to the page at all yet: the APU runs, but nothing carries
+  its samples to a `WebAudio` node.
 * **Apple 1** — a real console: type at it and the monitor answers. It needs no
   file; leave the picker empty and it boots rsemu's own monitor ROM, exactly as
   `rsemu run apple1` does.

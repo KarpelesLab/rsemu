@@ -155,6 +155,9 @@ struct State {
     scanout: Option<alloc::boxed::Box<dyn crate::host::display::Scanout>>,
     /// The character port the machine opened, if it opened one.
     console: Option<alloc::sync::Arc<crate::host::chardev::CharPort>>,
+    /// The pad port the machine's controllers read, if it has any.
+    #[cfg(feature = "dev-nes-io")]
+    pad: Option<alloc::sync::Arc<crate::dev::nes::input::Pad>>,
     /// Bytes JavaScript hands in: ROM images, typed characters, save states.
     input: Vec<u8>,
     /// Bytes JavaScript reads back: console output, save states, messages.
@@ -174,6 +177,8 @@ impl State {
             frame: crate::host::display::Surface::empty(),
             scanout: None,
             console: None,
+            #[cfg(feature = "dev-nes-io")]
+            pad: None,
             input: Vec::new(),
             output: Vec::new(),
             error: String::new(),
@@ -382,6 +387,24 @@ pub extern "C" fn rsemu_boot(index: u32, image_len: usize) -> u32 {
             state.console = Some(port);
         }
 
+        // And whatever pad port its controllers read is where buttons go. The
+        // same name-based seam as the console (`dev::nes::input::pads`), for
+        // the same reason: a machine file can hand a device a name and nothing
+        // else.
+        #[cfg(feature = "dev-nes-io")]
+        {
+            let pads = crate::dev::nes::input::pads::names();
+            state.pad = pads
+                .first()
+                .and_then(|n| crate::dev::nes::input::pads::get(n));
+            if let Some(pad) = state.pad.as_ref() {
+                // Nothing is held at power-on, whatever the last machine left.
+                pad.set(0, 0);
+                pad.set(1, 0);
+            }
+        }
+        state.buttons = [0; 2];
+
         state.machine = Some(machine);
         state.error.clear();
         1
@@ -395,6 +418,10 @@ pub extern "C" fn rsemu_shutdown() {
         state.machine = None;
         state.scanout = None;
         state.console = None;
+        #[cfg(feature = "dev-nes-io")]
+        {
+            state.pad = None;
+        }
         state.shown = u64::MAX;
     });
 }
@@ -563,23 +590,26 @@ pub extern "C" fn rsemu_frame_serial() -> u64 {
 
 /// Set the buttons held on controller `port` (0 or 1).
 ///
-/// The mask is the NES's own bit order as `$4016` shifts it out: bit 0 A,
-/// 1 B, 2 Select, 3 Start, 4 Up, 5 Down, 6 Left, 7 Right
-/// ([NESdev, "Standard controller"](https://www.nesdev.org/wiki/Standard_controller)).
+/// The mask is the shift register's own output order — `0x80` A, `0x40` B,
+/// `0x20` Select, `0x10` Start, `0x08` Up, `0x04` Down, `0x02` Left, `0x01`
+/// Right — because that is the order the hardware shifts out and therefore the
+/// order the host seam speaks
+/// ([NESdev, "Standard controller"](https://www.nesdev.org/wiki/Standard_controller),
+/// and [`dev::nes::input::buttons`](crate::dev::nes::input::buttons), which is
+/// where the constants live).
 ///
-/// **The state is recorded and not yet delivered**, because the controller
-/// ports do not exist as a device yet — `machines/nes-ntsc.machine` names that
-/// gap in its own TODO, `$4016`/`$4017` read open bus, and software sees no
-/// buttons held. Keeping the export honest and wired from the page means the
-/// day the device lands, one line here changes and the demo has input; the
-/// alternative was a page that silently does not send keystrokes anywhere.
-/// The Apple 1's keyboard is a different path and works today — see
-/// [`rsemu_console_write`].
+/// The state is a **level, not an event**: the console samples it whenever the
+/// guest strobes `$4016`, so a button stays held until the embedder clears it.
+/// That is also what makes the seam replayable.
 #[unsafe(no_mangle)]
 pub extern "C" fn rsemu_set_buttons(port: u32, mask: u32) {
     with_state(|state| {
         if let Some(slot) = state.buttons.get_mut(port as usize) {
-            *slot = mask;
+            *slot = mask & 0xff;
+        }
+        #[cfg(feature = "dev-nes-io")]
+        if let Some(pad) = state.pad.as_ref() {
+            pad.set(port as usize, (mask & 0xff) as u8);
         }
     });
 }
@@ -798,6 +828,22 @@ mod tests {
         let snapshot = with_state(|state| state.output.clone());
         rsemu_run_frames(2);
         assert_ne!(rsemu_state_hash(), hash, "time did not pass");
+
+        // Buttons reach the console's controller port, not just the module's
+        // own record of them: the guest strobes $4016 and reads them back.
+        #[cfg(feature = "dev-nes-io")]
+        {
+            use crate::dev::nes::input::{buttons, pads};
+
+            rsemu_set_buttons(0, u32::from(buttons::A | buttons::START));
+            let pad = pads::names()
+                .first()
+                .and_then(|n| pads::get(n))
+                .expect("the machine opened a pad port");
+            assert_eq!(pad.get(0), buttons::A | buttons::START);
+            rsemu_set_buttons(0, 0);
+            assert_eq!(pad.get(0), buttons::NONE);
+        }
 
         rsemu_input_reserve(snapshot.len());
         with_state(|state| state.input.copy_from_slice(&snapshot));

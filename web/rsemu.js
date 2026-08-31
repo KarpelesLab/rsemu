@@ -186,16 +186,20 @@ export class Rsemu {
 
   // -- input ----------------------------------------------------------------
 
-  /** NES controller bits, in the order $4016 shifts them out. */
+  /**
+   * NES controller bits, in the shift register's own output order: A is the
+   * first bit out, so it is the high bit. Same constants as
+   * `dev::nes::input::buttons`.
+   */
   static BUTTONS = {
-    a: 1 << 0,
-    b: 1 << 1,
-    select: 1 << 2,
-    start: 1 << 3,
-    up: 1 << 4,
-    down: 1 << 5,
-    left: 1 << 6,
-    right: 1 << 7,
+    a: 0x80,
+    b: 0x40,
+    select: 0x20,
+    start: 0x10,
+    up: 0x08,
+    down: 0x04,
+    left: 0x02,
+    right: 0x01,
   };
 
   setButtons(port, mask) {
