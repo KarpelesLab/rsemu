@@ -732,9 +732,28 @@ impl Shared {
             if plan.terminal {
                 self.pulse_eop();
             }
-            if plan.single {
-                break;
-            }
+            // Single mode is *not* stopped here, and that is a decision worth
+            // stating. On real silicon single transfer mode moves one unit,
+            // releases `HRQ` so the CPU gets a bus cycle, and — if `DREQ` is
+            // still asserted — immediately arbitrates for the bus again. Demand
+            // mode simply never lets go. The two therefore differ in how long
+            // the CPU is held off, and **not at all** in the sequence of bytes
+            // that moves.
+            //
+            // rsemu models no bus arbitration cycles: a transfer happens
+            // between one guest access and the next, and there is nothing to
+            // interleave a released bus with. So the two modes are
+            // indistinguishable here, and stopping single mode after one unit
+            // would not model the difference — it would model a controller that
+            // never finishes, because a peripheral holds `DREQ` at a level and
+            // a level that does not change delivers no second notification.
+            // That is what a floppy read looked like before this comment
+            // existed: one byte in memory and a controller stuck in its
+            // execution phase forever.
+            //
+            // The bound below is what keeps that honest: the burst still ends
+            // at a terminal count, at a mask, or at `MAX_BURST_UNITS`.
+            let _ = plan.single;
             match peer.as_ref() {
                 Some(peer) if peer.dma_ready() => {}
                 _ => break,
@@ -1276,6 +1295,16 @@ mod tests {
             }
         }
 
+        /// A peripheral that drops its request after every unit — a floppy
+        /// controller between sectors, say. It is what makes a *single* unit
+        /// observable, now that a level-held request is serviced until the
+        /// peripheral says stop.
+        fn supplying_one_at_a_time(bytes: &[u8]) -> Peer {
+            let peer = Peer::new(false);
+            peer.supply.lock().extend(bytes.iter().copied());
+            peer
+        }
+
         fn supplying(bytes: &[u8]) -> Peer {
             let peer = Peer::new(true);
             peer.supply.lock().extend(bytes.iter().copied());
@@ -1501,8 +1530,9 @@ mod tests {
 
     #[test]
     fn autoinitialise_reloads_the_base_registers_and_leaves_the_channel_open() {
-        let rig = Rig::byte(1, Peer::supplying(&[0x01, 0x02]));
-        // One unit per request, so the reload is observable between them.
+        // A peripheral that drops its request between units, so the reload is
+        // observable between them rather than being run straight through.
+        let rig = Rig::byte(1, Peer::supplying_one_at_a_time(&[0x01, 0x02]));
         rig.program(
             0x00,
             0x0300,
@@ -1618,8 +1648,11 @@ mod tests {
     }
 
     #[test]
-    fn single_mode_moves_one_unit_per_request() {
-        let rig = Rig::byte(1, Peer::supplying(&[0x01, 0x02, 0x03]));
+    fn a_burst_lasts_as_long_as_the_peripheral_keeps_asking() {
+        // A peripheral that drops `DREQ` after each unit gets one unit per
+        // request, which is what "single transfer mode" is usually taken to
+        // mean...
+        let rig = Rig::byte(1, Peer::supplying_one_at_a_time(&[0x01, 0x02, 0x03]));
         rig.program(0x00, 0x0700, 0x00ff, mode(XFER_WRITE, SELECT_SINGLE, 0));
         rig.dma.request(1, true);
         assert_eq!(*rig.peer.served.lock(), 1);
@@ -1627,6 +1660,19 @@ mod tests {
         assert_eq!(*rig.peer.served.lock(), 2);
         assert_eq!(rig.ram(0x700), 0x01);
         assert_eq!(rig.ram(0x701), 0x02);
+
+        // ...and one that holds the line, like a floppy controller with a
+        // sector to deliver, is served until its count runs out. On silicon
+        // that is many arbitrations rather than one; there are no bus cycles
+        // here to tell them apart, and a controller that stopped after one unit
+        // would simply never finish, because a held level delivers no second
+        // notification. See `service`.
+        let held = Rig::byte(1, Peer::supplying(&[0xaa, 0xbb, 0xcc, 0xdd]));
+        held.program(0x00, 0x0700, 3, mode(XFER_WRITE, SELECT_SINGLE, 0));
+        held.dma.request(1, true);
+        assert_eq!(*held.peer.served.lock(), 4, "the whole programmed count");
+        assert_eq!(held.ram(0x703), 0xdd);
+        assert_eq!(held.dma.masked(1), Some(true), "and it reached TC");
     }
 
     #[test]
