@@ -1012,6 +1012,23 @@ decode it can never execute. That breaks the crate-shape rule (§3) directly —
 NES build links a 6502 and nothing else, and a Cortex-M build should link no
 ARM state.
 
+**The target layout.** `arm/` becomes the family, not one member of it:
+
+```
+src/cpu/arm/
+  mod.rs       — family types and re-exports; always compiles, links nothing
+  common/      — shifter, flag rules, DSP semantics, Thumb-1 decode  (LATER)
+  v5te/        — ARMv5TE: A32 + Thumb, seven modes, CP15       (cpu-arm-v5te)
+  v7m/         — ARMv7E-M: Thumb-2, Handler/Thread, NVIC        (cpu-arm-v7m)
+```
+
+Each variant is its own feature, so a Cortex-M build still links no A32 and the
+crate-shape rule (§3) holds. Moving ARMv5TE down into `v5te/` is a **pure
+relocation** — no code changes, no extraction, no guessing — and it is worth
+doing as soon as there is a second member to make room for. Keep `pub use`
+shims at `cpu::arm::*` for one release so a downstream crate importing
+`rsemu::cpu::arm::{Arm, Config}` does not break on a directory move.
+
 **What is genuinely shared, and when to factor it.** The barrel shifter and its
 flag rules, the DSP (E) semantics (`QADD`, `SMLAxy`, `SMUAD`, the SIMD
 add/sub family), and the 16-bit Thumb-1 encodings, which ARMv7-M inherits
