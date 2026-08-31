@@ -56,8 +56,10 @@ Roadmap §1 has the long form. When in doubt, ask **before** reading.
 
 - Default build: `cargo tree` shows only `rsemu`. This is checked in CI.
 - Permitted dependencies are first-party and feature-gated only: `pktkit`,
-  `compcol`, `purecrypto`, **`fstool`**, `puremp`, `noroi`. Nothing else — no
-  `serde`, no `libc`, no async runtime, no GUI toolkit.
+  `compcol`, `purecrypto`, `fstool`, `puremp`, `noroi`, **`oxideav-png`**
+  (`default-features = false`, which drops `oxideav-core` and leaves only
+  `compcol`). Nothing else — no `serde`, no `libc`, no async runtime, no GUI
+  toolkit.
 - The empty-`cargo tree` rule holds for *default* features. Several siblings
   pull external crates under optional features, so CI checks the feature-enabled
   tree too.
