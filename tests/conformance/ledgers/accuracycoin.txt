@@ -21,7 +21,7 @@
 #
 # ---------------------------------------------------------------------------
 # 2026-08-31: 130 of 141 pass, 11 fail.
-# 2026-09-01: 133 of 141 pass, 8 fail — the PPU address bus closed three.
+# 2026-09-01: 134 of 141 pass, 7 fail — the PPU closed four.
 # ---------------------------------------------------------------------------
 #
 # The measurement before this one read "81 of 125", through a stale copy of the
@@ -137,15 +137,12 @@
 # machine (ALE two PPU cycles after M2 falls, Read two after that), the two
 # garbage nametable fetches inside each sprite slot, the dot-337-340 pair, and
 # the `$2006` write's own two-cycle path to `v`. "$2007 Stress Test",
-# "ALE + Read" and "Hybrid Addresses" all pass. What is left in this group is
-# not about the address bus at all:
+# "ALE + Read" and "Hybrid Addresses" all pass. So does "$2004 Stress Test",
+# once the OAM read line is understood to be *registered* — the CPU takes the
+# bus at the end of its cycle, so every phase boundary the guest sees sits one
+# dot after the sprite unit's own — and once step 3a of sprite evaluation reads
+# its three entries rather than range-checking them.
 
-8c                # $048C "$2004 Stress Test" code 2: 341 samples, one per dot
-                  # of a rendered scanline. The three phases of the OAM read bus
-                  # are modelled now, but the answer key also has the
-                  # post-overflow phase alternating the primary read with
-                  # secondary OAM every other dot, which the evaluator does not
-                  # do.
 
 # ---------------------------------------------------------------------------
 # D. Three single-dot questions in the render pipeline

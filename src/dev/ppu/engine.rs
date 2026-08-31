@@ -345,6 +345,21 @@ pub struct Engine {
     pub(crate) eval_latch: u8,
     /// Whether sprite 0 was among the sprites copied for the next scanline.
     pub(crate) sprite_zero_next: bool,
+    /// Entries still to be read after an overflow hit, unconditionally.
+    ///
+    /// Step 3a of sprite evaluation: an in-range byte found with secondary OAM
+    /// already full sets the overflow flag and then "reads the next 3 entries
+    /// of OAM" — *without* range-checking them — after which the unit drops
+    /// into step 4 ([NESdev PPU sprite evaluation]).
+    pub(crate) eval_copy_left: u8,
+    /// Whether the even dot just gone wrote secondary OAM rather than read it.
+    ///
+    /// The distinction is guest-visible: the OAM read line carries the byte
+    /// being written on a write dot, and whatever secondary OAM answers with on
+    /// a read dot. Recorded rather than derived because the phase can change on
+    /// the very dot in question — the eighth sprite's last byte is written by a
+    /// dot that leaves the unit in step 3.
+    pub(crate) eval_wrote: bool,
 
     // -- sprite output registers (for the scanline being drawn) -------------
     pub(crate) sprite_pat_lo: [u8; 8],
@@ -503,6 +518,8 @@ impl Engine {
             eval_base: 0,
             eval_latch: 0,
             sprite_zero_next: false,
+            eval_copy_left: 0,
+            eval_wrote: false,
             sprite_pat_lo: [0; 8],
             sprite_pat_hi: [0; 8],
             sprite_attr: [0; 8],
@@ -619,6 +636,8 @@ impl Engine {
         self.eval_base = 0;
         self.eval_latch = 0;
         self.sprite_zero_next = false;
+        self.eval_copy_left = 0;
+        self.eval_wrote = false;
         self.sprite_pat_lo = [0; 8];
         self.sprite_pat_hi = [0; 8];
         self.sprite_attr = [0; 8];
@@ -1086,6 +1105,9 @@ impl Engine {
             self.eval_latch = self.oam[self.eval_oam_index()];
             return;
         }
+        // Only step 2 writes; steps 3 and 4 read secondary OAM instead, and
+        // that read is what `$2004` sees on this dot.
+        self.eval_wrote = self.eval_phase == EvalPhase::Copy;
         match self.eval_phase {
             EvalPhase::Copy => self.eval_copy(scanline),
             EvalPhase::Overflow => self.eval_overflow(scanline),
@@ -1094,6 +1116,17 @@ impl Engine {
                 self.eval_n = self.eval_n.wrapping_add(1) & 63;
             }
         }
+    }
+
+    /// Step 4: read `OAM[n][0]` and throw it away.
+    ///
+    /// `m` is cleared on the way in, because step 4 reads the *`Y` byte* of
+    /// each sprite however the previous step left the pointer — which is how
+    /// AccuracyCoin's "$2004 Stress Test" sees the address step by four rather
+    /// than continuing the diagonal it was on.
+    fn enter_eval_idle(&mut self) {
+        self.eval_phase = EvalPhase::Idle;
+        self.eval_m = 0;
     }
 
     fn eval_copy(&mut self, scanline: u16) {
@@ -1112,7 +1145,7 @@ impl Engine {
                 self.eval_n += 1;
                 if self.eval_n == 64 {
                     self.eval_n = 0;
-                    self.eval_phase = EvalPhase::Idle;
+                    self.enter_eval_idle();
                 }
             }
             return;
@@ -1125,7 +1158,7 @@ impl Engine {
             self.eval_n += 1;
             if self.eval_n == 64 {
                 self.eval_n = 0;
-                self.eval_phase = EvalPhase::Idle;
+                self.enter_eval_idle();
             } else if self.eval_found == 8 {
                 self.eval_phase = EvalPhase::Overflow;
             }
@@ -1141,26 +1174,38 @@ impl Engine {
     /// and invents ones that never happened
     /// ([NESdev PPU sprite evaluation](https://www.nesdev.org/wiki/PPU_sprite_evaluation)).
     fn eval_overflow(&mut self, scanline: u16) {
+        if self.eval_copy_left > 0 {
+            // The three entries after a hit are read, not range-checked: `m`
+            // carries into `n` normally for each of them, and when the last is
+            // done the unit falls into step 4. Range-checking them instead
+            // would send the pointer off down a diagonal hardware never walks.
+            self.eval_copy_left -= 1;
+            self.advance_eval_pointer();
+            if self.eval_copy_left == 0 {
+                self.enter_eval_idle();
+            }
+            return;
+        }
         if self.sprite_in_range(self.eval_latch, scanline) {
             self.status |= STATUS_OVERFLOW;
-            // Hardware then reads the sprite's other three bytes, m carrying
-            // into n normally.
-            self.eval_m += 1;
-            if self.eval_m == 4 {
-                self.eval_m = 0;
-                self.eval_n += 1;
-                if self.eval_n == 64 {
-                    self.eval_n = 0;
-                    self.eval_phase = EvalPhase::Idle;
-                }
-            }
+            self.eval_copy_left = 3;
+            self.advance_eval_pointer();
             return;
         }
         self.eval_n += 1;
         self.eval_m = (self.eval_m + 1) & 3;
         if self.eval_n == 64 {
             self.eval_n = 0;
-            self.eval_phase = EvalPhase::Idle;
+            self.enter_eval_idle();
+        }
+    }
+
+    /// `m += 1`, carrying into `n` — the ordinary sprite-byte step.
+    fn advance_eval_pointer(&mut self) {
+        self.eval_m += 1;
+        if self.eval_m == 4 {
+            self.eval_m = 0;
+            self.eval_n = (self.eval_n + 1) & 63;
         }
     }
 
@@ -1268,18 +1313,52 @@ impl Engine {
     ///
     /// `None` when the sprite unit is not driving the line at all, which is
     /// every dot with rendering off and every line that does not render.
+    ///
+    /// # The line is registered, so it answers for the dot before
+    ///
+    /// The sprite unit drives the read line out of a latch, and the CPU takes
+    /// the data bus at the *end* of its read cycle — by which point the engine
+    /// stands on the dot after the one the cycle occupied. So `$2004` answers
+    /// with the line as the previous dot left it, and all four phase
+    /// boundaries sit one dot later than the sprite unit's own.
+    ///
+    /// AccuracyCoin's "$2004 Stress Test" measures every dot of a scanline and
+    /// is unambiguous about it: dot 1 still reads secondary OAM entry 0, the
+    /// forced `$FF` runs dots 2-65, evaluation dots 66-257, the fetch slots
+    /// dots 258-321. Its own preamble says why — "we're aiming for the END of
+    /// the CPU read occurring on specific dots here; the data from address
+    /// `$2004` can change mid-read, and it's the value at the end of the read
+    /// that we care about" (AccuracyCoin.asm, MIT, (c) 2025 Chris Siebert).
     fn oam_read_bus(&self) -> Option<u8> {
         if !self.rendering_enabled() || !self.render_line() {
             return None;
         }
-        Some(match self.dot {
+        let dot = if self.dot == 0 {
+            DOTS_PER_SCANLINE - 1
+        } else {
+            self.dot - 1
+        };
+        Some(match dot {
             1..=64 => 0xff,
-            65..=256 => self.eval_latch,
+            65..=256 => {
+                // Odd dots read primary OAM, even dots write that byte into
+                // secondary OAM — and the line carries it either way. But once
+                // secondary OAM is full (step 3) or `n` has wrapped all the way
+                // round (step 4) there is nothing to write, so the unit *reads*
+                // secondary OAM on the even dot instead and that is what the
+                // line carries: "the PPU continues reading from OAM, but reads
+                // from OAM2[OAM2Address] every other cycle".
+                if !dot.is_multiple_of(2) || self.eval_wrote {
+                    self.eval_latch
+                } else {
+                    self.secondary_oam[usize::from(self.eval_sec) & 31]
+                }
+            }
             257..=320 => {
-                let slot = usize::from((self.dot - 257) / 8);
+                let slot = usize::from((dot - 257) / 8);
                 // The slot reads Y, tile, attribute, X — and then keeps the X
                 // byte on the line for the rest of the slot.
-                let byte = usize::from((self.dot - 257) % 8).min(3);
+                let byte = usize::from((dot - 257) % 8).min(3);
                 self.secondary_oam[(slot * 4 + byte) & 31]
             }
             _ => self.secondary_oam[0],
@@ -2013,6 +2092,8 @@ impl Engine {
         w.write_u16(self.data_sm_addr)?;
         w.write_u16(self.v_pending)?;
         w.write_u8(self.v_delay)?;
+        w.write_u8(self.eval_copy_left)?;
+        w.write_bool(self.eval_wrote)?;
 
         w.write_seq_len(self.fb.len() as u64)?;
         for pixel in self.fb.iter() {
@@ -2091,6 +2172,8 @@ impl Engine {
         self.data_sm_addr = r.read_u16()?;
         self.v_pending = r.read_u16()?;
         self.v_delay = r.read_u8()?;
+        self.eval_copy_left = r.read_u8()?;
+        self.eval_wrote = r.read_bool()?;
 
         let len = r.read_seq_len(2)? as usize;
         if len != FRAMEBUFFER_LEN {

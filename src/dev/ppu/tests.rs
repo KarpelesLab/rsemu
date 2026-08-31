@@ -427,6 +427,30 @@ fn a_2006_write_between_a_fetch_s_two_dots_makes_a_hybrid_address() {
 }
 
 #[test]
+fn the_oam_read_line_answers_for_the_dot_before() {
+    // `$2004` is driven off a latch and the CPU takes the bus at the end of its
+    // cycle, so the phase boundaries the guest sees sit one dot after the
+    // sprite unit's own: dot 1 still reads secondary OAM entry 0, and the
+    // forced `$FF` of the clear runs dots 2-65 (AccuracyCoin "$2004 Stress
+    // Test").
+    let (ppu, _, _) = new_ppu();
+    ppu.with_engine(|e| {
+        e.mask = MASK_SPRITE;
+        e.secondary_oam[0] = 0x5a;
+    });
+    seek(&ppu, 0, 1);
+    assert_eq!(
+        ppu.read_register(OAMDATA),
+        0x5a,
+        "dot 1 is not yet the clear"
+    );
+    ppu.advance_by(1);
+    assert_eq!(ppu.read_register(OAMDATA), 0xff);
+    seek(&ppu, 0, 65);
+    assert_eq!(ppu.read_register(OAMDATA), 0xff, "dot 65 still reads $FF");
+}
+
+#[test]
 fn a_palette_read_is_not_buffered_but_still_fills_the_buffer() {
     // The palette answers immediately; the buffer gets the nametable byte
     // hiding under the mirror at $2F00 (NESdev PPU registers, PPUDATA).
