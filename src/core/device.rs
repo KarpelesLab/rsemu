@@ -717,8 +717,6 @@ mod tests {
 
     #[test]
     fn a_device_publishes_nothing_unless_it_says_so() {
-        let mut q = Deferred::new();
-        let _ = &mut q;
         let d = Publisher {
             cell: Arc::new(AtomicU64::new(0)),
         };
