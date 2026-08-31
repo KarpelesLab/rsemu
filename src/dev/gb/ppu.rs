@@ -950,6 +950,22 @@ impl Engine {
     }
 }
 
+/// Where the `index`-th byte of a transfer from `page` is read from.
+///
+/// Pan Docs, *OAM DMA Transfer*, documents the source as `$XX00-$XX9F` with
+/// `XX` from `$00` to `$DF`, and stops there. A DMG answers pages above `$DF`
+/// anyway, and it answers them out of work RAM: the transfer's address is
+/// decoded with fifteen bits, so `$E000-$FFFF` selects the same 8 KiB that
+/// `$C000-$DFFF` does — the echo, extended over the whole quarter rather than
+/// stopping at `$FDFF` the way the CPU's own decode does.
+///
+/// Gekkio's `oam_dma/sources` measures exactly that: it fills `$DE00` and
+/// `$DF00`, transfers from pages `$FE` and `$FF`, and expects those bytes.
+fn dma_source_address(page: u8, index: u64) -> u64 {
+    let addr = (u64::from(page) << 8) | index;
+    if addr >= 0xe000 { addr - 0x2000 } else { addr }
+}
+
 /// One entry of the object attribute table, as the scan produced it.
 #[derive(Debug, Clone, Copy)]
 struct Object {
@@ -1307,7 +1323,7 @@ impl GbPpu {
         let mut out = Vec::with_capacity(count as usize);
         for i in 0..count {
             let index = first + i;
-            let addr = (u64::from(page) << 8) | index;
+            let addr = dma_source_address(page, index);
             let byte = if (VRAM_BASE..VRAM_BASE + VRAM_LEN).contains(&addr) {
                 self.shared.engine.lock().vram[(addr - VRAM_BASE) as usize]
             } else {

@@ -1163,3 +1163,74 @@ fn resetting_a_running_device_leaves_its_clock_where_the_domain_put_it() {
     );
     check(&cart, "gb.cart", 12_345);
 }
+
+/// No boot ROM writes a mapper register, so a cartridge's entry point at
+/// `$0100` runs with whatever the controller came up holding — and every image
+/// expects bank 1 at `$4000` there. MBC1, MBC2 and MBC3 get it from their
+/// "a written zero reads as one" rule; MBC5 has no such rule, so the power-on
+/// value has to be right on its own.
+#[test]
+fn a_cartridge_powers_on_with_bank_one_at_4000_even_on_mbc5() {
+    // $19 is MBC5 with no RAM; $02 in $0148 is four banks.
+    let mut rom = synthetic_image(4, 0x19, 0x00, &[0x00]);
+    // A byte per bank, at the same offset within each.
+    for bank in 0..4usize {
+        rom[bank * 0x4000 + 0x0200] = 0xb0 + bank as u8;
+    }
+    let cart = GbCart::new(Cartridge::parse(rom).expect("a valid image"));
+    let region = Device::region(&cart, super::cart::ROM_REGION).expect("the ROM window");
+    let ops = io(&region);
+    let read = |addr: u64| {
+        let mut byte = [0u8; 1];
+        ops.read(addr, &mut byte, MemAttrs::DEFAULT)
+            .expect("answers");
+        byte[0]
+    };
+
+    assert_eq!(read(0x0200), 0xb0, "bank 0 is at $0000");
+    assert_eq!(read(0x4200), 0xb1, "and bank 1 at $4000 before any write");
+
+    // The bank number is split across two registers, and both halves live in
+    // the ROM one: `bank_high` is MBC5's *RAM* bank and must not leak into it.
+    ops.write(0x2000, &[0x03], MemAttrs::DEFAULT).expect("ok");
+    assert_eq!(read(0x4200), 0xb3);
+    ops.write(0x4000, &[0x0f], MemAttrs::DEFAULT).expect("ok");
+    assert_eq!(
+        read(0x4200),
+        0xb3,
+        "the RAM bank does not move the ROM bank"
+    );
+    // And zero really means zero on this controller.
+    ops.write(0x2000, &[0x00], MemAttrs::DEFAULT).expect("ok");
+    assert_eq!(read(0x4200), 0xb0);
+}
+
+/// Pan Docs documents an OAM transfer's source as `$XX00-$XX9F` with `XX` up to
+/// `$DF` and stops there. A DMG answers higher pages out of work RAM, because
+/// the transfer's address is decoded with fifteen bits — the echo, extended
+/// over the whole quarter rather than stopping at `$FDFF` the way the CPU's own
+/// decode does (Gekkio, `oam_dma/sources`).
+#[test]
+fn a_transfer_from_above_dfff_reads_work_ram() {
+    use crate::core::space::{AddressSpace, RamStore, Region};
+
+    let ppu = GbPpu::new();
+    let space = Arc::new(AddressSpace::new("cpubus", 16));
+    let ram = Arc::new(RamStore::new(0x2000));
+    for i in 0..0xa0u64 {
+        // $DE00 + i, which is offset $1E00 + i within the 8 KiB.
+        ram.write_u8(0x1e00 + i, 0x40 + i as u8).expect("in range");
+    }
+    space
+        .topology()
+        .map(Region::ram("wram", ram), 0xc000)
+        .expect("maps");
+    ppu.attach_space(space);
+
+    // Page $FE, which is $DE with the fifteenth bit decoded away.
+    ppu.write_register(0x00, 0); // LCD off, so only the transfer blocks
+    ppu.write_register(0x06, 0xfe);
+    ppu.advance_by(4 * 162);
+    assert_eq!(ppu.peek_oam(0), 0x40);
+    assert_eq!(ppu.peek_oam(0x9f), 0x40 + 0x9f);
+}
