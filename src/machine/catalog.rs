@@ -562,7 +562,12 @@ mod tests {
     /// promises: its snapshot chunk. Reading it here doubles as a check that
     /// the chunk really is the architectural state, and it pins the layout to
     /// the class version so a bump cannot silently change what this decodes.
+    // Gated on the *core*, but every caller is gated on a machine, so a build
+    // with `cpu-mos6502` and no board leaves these unused. Enumerating the
+    // boards in a `cfg` here would go stale the next time one lands, which is
+    // the same rot the feature sweep itself had.
     #[cfg(feature = "cpu-mos6502")]
+    #[allow(dead_code)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct CpuState {
         a: u8,
@@ -579,6 +584,7 @@ mod tests {
     }
 
     #[cfg(feature = "cpu-mos6502")]
+    #[allow(dead_code)]
     fn cpu_state(machine: &Machine, path: &str) -> CpuState {
         use crate::core::state::{Migrations, Source, StateReader};
         let class = &crate::cpu::mos6502::CLASS;
@@ -881,6 +887,7 @@ mod tests {
     }
 
     #[cfg(feature = "cpu-mos6502")]
+    #[allow(dead_code)]
     fn regs_line(s: &CpuState) -> alloc::string::String {
         alloc::format!(
             "A:{:02x} X:{:02x} Y:{:02x} P:{:02x} SP:{:02x} PC:{:04x}",

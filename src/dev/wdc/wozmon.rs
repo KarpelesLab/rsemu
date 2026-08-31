@@ -187,7 +187,10 @@ pub static WOZMON_IMAGE: &[u8; 32_768] = &{
 /// list still describes the bytes above.
 ///
 /// [`the transcription checkable`]: self::tests::the_listing_walks_the_manuals_own_addresses
+// The test that reads this needs the 6502 disassembler, so a `dev-wdc` build
+// without `cpu-mos6502` compiles the list and nothing that walks it.
 #[cfg(test)]
+#[allow(dead_code)]
 static MANUAL_ADDRESSES: &[u16] = &[
     0xff00, 0xff01, 0xff02, 0xff04, 0xff07, 0xff09, 0xff0c, 0xff0f, 0xff11, 0xff13, 0xff15, 0xff17,
     0xff18, 0xff1a, 0xff1c, 0xff1f, 0xff21, 0xff24, 0xff26, 0xff27, 0xff29, 0xff2c, 0xff2e, 0xff31,
