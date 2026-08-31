@@ -40,13 +40,19 @@ struct Schedule {
     irq_rises: Vec<u64>,
 }
 
+/// Whether CPU cycle `n` is a put, in the phase the frame counter's tables
+/// assume: cycle 1 is a get and they alternate from there.
+fn on_put(n: u64) -> bool {
+    n.is_multiple_of(2)
+}
+
 /// Run `cycles` CPU cycles through `fc`, starting the cycle count at `from`.
 fn record(fc: &mut FrameCounter, from: u64, cycles: u64) -> Schedule {
     let mut out = Schedule::default();
     let mut was_irq = fc.irq();
     for i in 0..cycles {
         let now = from + i;
-        let event = fc.tick(now);
+        let event = fc.tick(now, on_put(now));
         if event.quarter {
             out.quarters.push(now - from + 1);
         }
@@ -100,11 +106,11 @@ fn the_five_step_sequence_clocks_immediately_and_never_raises_an_irq() {
     // Written on a get cycle, so the reset lands 4 CPU cycles later.
     fc.write(0x80, false);
     assert_eq!(fc.mode(), Mode::FiveStep);
-    assert_eq!(fc.tick(1), FrameEvent::NONE);
-    assert_eq!(fc.tick(2), FrameEvent::NONE);
-    assert_eq!(fc.tick(3), FrameEvent::NONE);
+    assert_eq!(fc.tick(1, on_put(1)), FrameEvent::NONE);
+    assert_eq!(fc.tick(2, on_put(2)), FrameEvent::NONE);
+    assert_eq!(fc.tick(3, on_put(3)), FrameEvent::NONE);
     assert_eq!(
-        fc.tick(4),
+        fc.tick(4, on_put(4)),
         FrameEvent::BOTH,
         "bit 7 set clocks both units when the reset takes effect"
     );
@@ -124,10 +130,10 @@ fn a_four_step_write_resets_without_clocking_anything() {
     record(&mut fc, 1, 10_000);
     assert_ne!(fc.cycle(), 0);
     fc.write(0x00, true); // put cycle: 3 CPU cycles
-    assert_eq!(fc.tick(10_001), FrameEvent::NONE);
-    assert_eq!(fc.tick(10_002), FrameEvent::NONE);
+    assert_eq!(fc.tick(10_001, on_put(10_001)), FrameEvent::NONE);
+    assert_eq!(fc.tick(10_002, on_put(10_002)), FrameEvent::NONE);
     assert_eq!(
-        fc.tick(10_003),
+        fc.tick(10_003, on_put(10_003)),
         FrameEvent::NONE,
         "bit 7 clear resets the sequence without clocking"
     );
@@ -136,32 +142,41 @@ fn a_four_step_write_resets_without_clocking_anything() {
 
 #[test]
 fn the_4017_reset_delay_is_three_or_four_cycles_by_alignment() {
-    for (on_put, delay) in [(true, 3u64), (false, 4u64)] {
+    for (write_on_put, delay) in [(true, 3u64), (false, 4u64)] {
         let mut fc = FrameCounter::new(Region::Ntsc);
         record(&mut fc, 1, 1000);
-        fc.write(0x00, on_put);
+        fc.write(0x00, write_on_put);
         for i in 1..delay {
-            fc.tick(1000 + i);
+            fc.tick(1000 + i, on_put(1000 + i));
             assert!(fc.reset_pending(), "reset fired {i} cycles early");
         }
-        fc.tick(1000 + delay);
+        fc.tick(1000 + delay, on_put(1000 + delay));
         assert!(!fc.reset_pending());
         assert_eq!(fc.cycle(), 0);
     }
 }
 
 #[test]
-fn the_frame_irq_is_cleared_by_a_status_read_but_not_on_the_setting_cycle() {
+fn a_status_read_arms_the_clear_rather_than_performing_it() {
+    // The clear happens inside the counter, on its next get cycle, and a set
+    // signal on that cycle wins. So a read on the last cycle before the flag is
+    // set leaves it set, and one two cycles later does not.
     let mut fc = FrameCounter::new(Region::Ntsc);
-    // Cycle 29828 is where the flag is first set.
+    // Cycle 29828 is where the flag is first set, and it is set again on 29829
+    // and 29830.
     record(&mut fc, 1, 29828);
     assert!(fc.irq());
-    // Reading on that very cycle returns 1 and leaves the flag alone.
-    assert!(fc.read_irq(29828, false));
-    assert!(fc.irq(), "a flag set this cycle survives the read");
-    // Reading on any later cycle clears it.
-    assert!(fc.read_irq(29829, false));
-    assert!(!fc.irq());
+    assert!(fc.read_irq(false));
+    assert!(fc.irq(), "the read itself clears nothing");
+    // 29829 is a put, so the armed clear waits; and the sequencer sets the flag
+    // again on that cycle anyway.
+    fc.tick(29829, on_put(29829));
+    assert!(fc.irq());
+    // Past the last set, the next get applies it.
+    record(&mut fc, 29830, 4);
+    assert!(fc.read_irq(false));
+    record(&mut fc, 29834, 2);
+    assert!(!fc.irq(), "the armed clear landed on a get cycle");
 }
 
 #[test]
@@ -169,19 +184,30 @@ fn a_debug_read_never_clears_the_frame_irq() {
     let mut fc = FrameCounter::new(Region::Ntsc);
     record(&mut fc, 1, 29830);
     assert!(fc.irq());
-    assert!(fc.read_irq(99_999, true));
+    assert!(fc.read_irq(true));
     assert!(fc.irq(), "MemAttrs::debug must have no side effect");
 }
 
 #[test]
-fn setting_the_inhibit_bit_clears_and_suppresses_the_frame_irq() {
+fn setting_the_inhibit_bit_clears_the_frame_irq_and_gates_the_line() {
     let mut fc = FrameCounter::new(Region::Ntsc);
     record(&mut fc, 1, 29830);
     assert!(fc.irq());
     fc.write(0x40, false);
     assert!(!fc.irq(), "bit 6 clears the flag immediately");
+    assert!(fc.inhibited());
+
+    // What the inhibit bit does *not* do is stop the flag being raised. It is
+    // still set on the first two of the three cycles the sequencer asserts it,
+    // and a program reading `$4015` there sees it; the third cycle is where the
+    // inhibit finally wins, and the IRQ *line* is gated throughout.
     let s = record(&mut fc, 29831, 4 + 29830);
-    assert!(s.irq_rises.is_empty(), "inhibited: the flag stays clear");
+    assert_eq!(
+        s.irq_rises.len(),
+        1,
+        "raised once, on the first of the three set cycles"
+    );
+    assert!(!fc.irq(), "and clear again by the third");
 }
 
 // ---------------------------------------------------------------------------
@@ -507,11 +533,14 @@ fn a_non_looping_sample_raises_the_dmc_irq_when_its_last_byte_is_read() {
     let request = apu.dma_request().unwrap();
     assert!(apu.dma_complete(request.serial, 0x00));
     assert_eq!(apu.read(0x15, 0) & 0x80, 0x80, "the DMC IRQ flag is set");
+    // The line the core samples follows the flag by one CPU cycle.
+    apu.advance(1);
     assert_eq!(apu.irq_level(), Level::High);
     // A $4015 read does not clear it; only a $4015 write or $4010 bit 7 does.
     assert_eq!(apu.read(0x15, 0) & 0x80, 0x80);
     apu.write(0x15, 0x00);
     assert_eq!(apu.read(0x15, 0) & 0x80, 0);
+    apu.advance(1);
     assert_eq!(apu.irq_level(), Level::Low);
 }
 
@@ -618,16 +647,27 @@ fn a_debug_status_read_reports_the_frame_irq_without_clearing_it() {
         "peeking twice still shows it"
     );
     assert_eq!(apu.read(0x15, 0) & 0x40, 0x40);
-    assert_eq!(apu.read(0x15, 0) & 0x40, 0x00, "a real read clears it");
+    // The read arms the clear; the frame counter applies it on its next get
+    // cycle, so an immediate second read still sees the flag.
+    assert_eq!(
+        apu.read(0x15, 0) & 0x40,
+        0x40,
+        "the read itself clears nothing"
+    );
+    apu.advance(2);
+    assert_eq!(apu.read(0x15, 0) & 0x40, 0x00, "and then it is gone");
 }
 
 #[test]
 fn the_frame_irq_drives_the_irq_line_and_a_status_read_drops_it() {
     let apu = apu();
     assert_eq!(apu.irq_level(), Level::Low);
-    apu.advance(29831);
+    // 29832 rather than 29831: the line the core samples is the level the
+    // previous cycle left, so it follows the flag by one CPU cycle.
+    apu.advance(29832);
     assert_eq!(apu.irq_level(), Level::High);
     apu.read(0x15, 0);
+    apu.advance(3);
     assert_eq!(apu.irq_level(), Level::Low);
 }
 
@@ -661,9 +701,10 @@ fn the_apu_drives_its_irq_wire_on_both_edges() {
     apu.connect_irq(WireSource::new(Arc::clone(&wire), id));
 
     assert_eq!(sink.highs.load(AtomicOrdering::SeqCst), 0);
-    apu.advance(29831);
+    apu.advance(29832);
     assert_eq!(sink.highs.load(AtomicOrdering::SeqCst), 1);
     apu.read(0x15, 0);
+    apu.advance(3);
     assert_eq!(sink.lows.load(AtomicOrdering::SeqCst), 1);
 }
 

@@ -19,7 +19,7 @@
 #     they can never appear here.
 #
 # ---------------------------------------------------------------------------
-# Measured 2026-08-31 against the pinned ROM: 118 of 141 pass, 23 fail.
+# Measured 2026-08-31 against the pinned ROM: 119 of 141 pass, 22 fail.
 # ---------------------------------------------------------------------------
 #
 # The earlier "81 of 125" was measured through a stale copy of the ROM's
@@ -139,8 +139,6 @@
 # the APU nor the controller ports can see whether an access lands on a "get" or
 # a "put" cycle, because a device is handed a bus access, not a CPU half-cycle.
 
-67                # $0467 "Frame Counter IRQ" code 7: the IRQ flag must not be
-                  # cleared yet on a get -> put transition.
 6a                # $046A "Delta Modulation Channel" code 1: $4015 bit 4 must
                   # follow a playing sample. See (B) — there is no sample fetch.
 62                # $0462 "NMI Overlap BRK" code 2: interrupt hijacking — an NMI

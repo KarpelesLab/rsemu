@@ -169,6 +169,9 @@ struct Core {
     dmc: Dmc,
     /// CPU cycles since power-on, in this device's clock domain.
     ticks: u64,
+    /// The `/IRQ` level as it stood one CPU cycle ago — what the core samples.
+    /// See [`Core::irq_asserted`].
+    irq_out: bool,
     /// The power-on alignment between CPU and APU cycles: 0 when CPU cycle 0 is
     /// a get cycle, 1 when it is a put cycle.
     ///
@@ -190,6 +193,7 @@ impl Core {
             noise: Noise::new(region),
             dmc: Dmc::new(region),
             ticks: 0,
+            irq_out: false,
             phase,
             samples: SampleRing::with_capacity(capacity),
         }
@@ -203,10 +207,13 @@ impl Core {
 
     /// Advance one CPU cycle.
     fn tick(&mut self) {
+        // What the core samples this cycle is the level the last one left —
+        // see [`Core::irq_asserted`].
+        self.irq_out = self.irq_raw();
         self.ticks += 1;
         let now = self.ticks;
 
-        let event = self.frame.tick(now);
+        let event = self.frame.tick(now, self.on_put_cycle());
         if event.quarter {
             self.clock_quarter_frame();
         }
@@ -257,8 +264,26 @@ impl Core {
 
     /// Whether either interrupt flag is asserting the IRQ line.
     #[inline]
+    /// The level the `/IRQ` request is at right now, before the output delay.
+    ///
+    /// The inhibit bit gates the *line*, not the flag: `$4015` still reports a
+    /// frame interrupt that was suppressed, which is what AccuracyCoin's
+    /// "Frame Counter IRQ" codes I-M measure.
+    fn irq_raw(&self) -> bool {
+        (self.frame.irq() && !self.frame.inhibited()) || self.dmc.irq()
+    }
+
+    /// The level the CPU sees on `/IRQ` — one CPU cycle behind the request.
+    ///
+    /// The same argument as the PPU's `/NMI` output: a 6502 samples its
+    /// interrupt inputs during φ2 and the flag moves at the end of the cycle,
+    /// so a request raised on cycle *n* is one the core acts on from cycle
+    /// *n + 1*. AccuracyCoin's "Frame Counter IRQ" codes N and O measure it to
+    /// the instruction: with the flag set 29832 cycles after a `$4017` write,
+    /// the interrupt is taken after the *third* following `INX` and not the
+    /// second, and one cycle either way moves that answer.
     fn irq_asserted(&self) -> bool {
-        self.frame.irq() || self.dmc.irq()
+        self.irq_out
     }
 
     fn write(&mut self, index: u8, value: u8) {
@@ -318,7 +343,7 @@ impl Core {
         if self.dmc.active() {
             value |= 0x10;
         }
-        if self.frame.read_irq(self.ticks, peek) {
+        if self.frame.read_irq(peek) {
             value |= 0x40;
         }
         if self.dmc.irq() {
