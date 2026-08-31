@@ -280,7 +280,7 @@ pub trait Device: Send + Sync + fmt::Debug {
     /// lazily-advanced PPU — writes its cycle count here on each cycle, so
     /// catch-up aims at the tick the access really happened on rather than at
     /// the start of the quantum (`ROADMAP.md` §4.2, and
-    /// [`TickCursor`](crate::core::sched::TickCursor)). Called once, by the
+    /// [`TickCursor`]). Called once, by the
     /// machine layer, for every runnable device; ignoring it is legitimate and
     /// costs only accuracy inside one quantum.
     fn attach_cursor(&self, cursor: TickCursor) {
@@ -370,7 +370,7 @@ pub trait Device: Send + Sync + fmt::Debug {
     /// CPU cycle, and whether the pin was up or down on a given cycle is a
     /// question with a different answer three dots later. A device that says
     /// yes is caught up from inside the core's own cycle loop
-    /// ([`TickCursor`](crate::core::sched::TickCursor)), which costs a catch-up
+    /// ([`TickCursor`]), which costs a catch-up
     /// per cycle and buys dot-exact sampling.
     ///
     /// Default false, because most lazily-advanced devices are read rather than

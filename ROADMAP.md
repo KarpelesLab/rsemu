@@ -32,19 +32,29 @@ something a person can actually run (§2).
 > undefined flags after `IMUL`/`DIV`), and ARMv5TE (no usable public corpus for
 > v5 — see §12).
 >
-> **Three machines that run**: `nes-ntsc` and `nes-pal` — AccuracyCoin boots,
-> raises NMI and draws its menu — and `apple1`, which is interactive over a
-> terminal. Plus the DSL front-to-back: parse, resolve, validate, realize, run.
+> **Three machines that run**: `nes-ntsc` and `nes-pal`, which pass
+> **AccuracyCoin 130/141** — the whole-machine gate, run headlessly, with the
+> eleven remaining failures ledgered and each traced to a named piece of
+> hardware — and `apple1`, which is interactive over a terminal. Plus the DSL
+> front-to-back: parse, resolve, validate, realize, run.
 >
 > Ordering deviated from the plan deliberately, and it was the right call.
 > ARM was pulled forward for a downstream crate; Z80, x86 and RISC-V were built
 > in parallel once the 6502 proved the shape. What did *not* deviate: every core
 > ships its suite, and the framework was finished before the emulation started.
 >
-> What remains for phase 3 is small and known: a controller at `$4016`, OAM DMA
-> at `$4014`, cartridge-driven nametable mirroring, and dot-exact rather than
-> scanline-exact intra-quantum staleness (§4.2). Phase 5's IR and JIT have not
-> been started.
+> Phase 3's named gaps are closed. Intra-quantum staleness is dot-exact (§4.2):
+> a runnable publishes its position as it runs, and a device that is *sampled*
+> rather than read can ask to be caught up on every cycle of it. The RP2A03's
+> DMA unit drives a real `/RDY`, so OAM DMA and the DMC's sample fetch halt the
+> core a cycle at a time and what they do to the bus on each of those cycles is
+> guest-visible. `unassigned = open-bus` answers with the master's own data bus.
+>
+> What is left on the NES is written down in
+> `tests/conformance/ledgers/accuracycoin.txt`: the PPU has no address bus of
+> its own — a 2C02 access is two dots and an external octal latch, and four
+> tests are about nothing else — and the DMC's phase machine does not overlap
+> the OAM DMA's cycles. Phase 5's IR and JIT have not been started.
 ---
 
 ## 0. Non-negotiables

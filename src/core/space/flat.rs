@@ -270,7 +270,7 @@ impl FlatEntry {
     /// Whether a read of this entry drives the master's external data bus.
     ///
     /// A combined entry answers with its highest-priority member, the same way
-    /// [`Entry::endian`] does: a wired-or of an on-die register and an external
+    /// [`FlatEntry::endian`] does: a wired-or of an on-die register and an external
     /// one is not a board the core tries to make sense of.
     #[inline]
     #[must_use]

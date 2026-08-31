@@ -7,9 +7,10 @@
 #
 # The PPU and the APU are here, mapped and wired. Both are *lazily advanced*
 # (ROADMAP.md §4.2): they hold their own tick and are caught up before any
-# access is dispatched to them, and the run loop stops the CPU at the PPU's own
-# next event so the NMI lands on the dot that raised it rather than whenever the
-# CPU next happens to read $2002.
+# access is dispatched to them. The PPU goes further and asks to be caught up on
+# every CPU cycle, because it drives /NMI and the core looks at that pin once a
+# cycle — three dots to a cycle, and which of them the pin moved on is a
+# question software can ask.
 #
 # So are the DMA unit, the controller port and cartridge-driven nametable
 # mirroring. The DMA unit drives /RDY, so a sprite copy or a DMC sample fetch

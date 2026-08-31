@@ -540,7 +540,7 @@ impl Engine {
         self.status & STATUS_VBLANK != 0 && self.ctrl & CTRL_NMI != 0 && !self.suppress_nmi
     }
 
-    /// The level the CPU sees on `/NMI` — one dot behind [`Engine::nmi_raw`].
+    /// The level the CPU sees on `/NMI` — one dot behind the request itself.
     ///
     /// # Why a dot
     ///
