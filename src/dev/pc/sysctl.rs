@@ -639,10 +639,33 @@ impl Device for SysCtl {
 
     fn reset(&self, _kind: ResetKind) {
         // Both a cold and a warm reset land here with everything clear, which
-        // is the state the board powers up in: speaker silent, A20 masked. The
-        // remembered input levels go too — realize re-announces them, and a
-        // stale level would put a phantom edge in the first refresh toggle.
-        *self.regs.state.lock() = State::default();
+        // is the state the board powers up in: speaker silent, A20 masked.
+        //
+        // The two remembered *input* levels stay. They are not this device's to
+        // clear: they are what the 8254 is driving onto `refresh` and `timer2`,
+        // and a reset of these latches does not reach across a pin and change
+        // that. The comment that used to stand here said realize re-announces
+        // them, and it does not: `announce` re-drives a *source*, and
+        // `Wire::set` delivers a change rather than a level, so a driver
+        // sitting where it already sat announces nothing at all. Forgetting the
+        // level therefore sticks — port 0x61 bit 5 reads 0 while OUT2 is high,
+        // and `refresh_edge` swallows the next transition as a repeat, which
+        // inverts bit 4's phase for good. It is also what makes the next
+        // re-announcement an edge: `Wire::refresh` delivers unconditionally on
+        // every snapshot load, so a stale level turns into a toggle the saved
+        // machine never had.
+        //
+        // `refresh_toggle` is a different thing and does go: it is this
+        // device's own divide-by-two flip-flop, not a level anything drives.
+        let (refresh_in, timer2_in) = {
+            let s = self.regs.state.lock();
+            (s.refresh_in, s.timer2_in)
+        };
+        *self.regs.state.lock() = State {
+            refresh_in,
+            timer2_in,
+            ..State::default()
+        };
         self.regs.drive_outputs();
     }
 
@@ -1120,6 +1143,49 @@ mod tests {
         assert!(!a20.high());
         assert_eq!(peek(&dev, "portb"), 0);
         assert_eq!(peek(&dev, "porta"), 0);
+    }
+
+    #[test]
+    fn a_reset_does_not_forget_what_the_timer_is_driving() {
+        // The two input pins are the 8254's, not this device's. A reset clears
+        // the latches on this side of them; it does not reach across a pin and
+        // change what the timer is doing, and nothing will ever tell this
+        // device otherwise — a driver that has not moved announces nothing.
+        let dev = SysCtl::default_device();
+        let refresh = feed(&dev, "refresh");
+        let timer2 = feed(&dev, "timer2");
+        timer2.raise();
+        refresh.raise();
+        assert_eq!(peek(&dev, "portb") & B_TIMER2_OUT, B_TIMER2_OUT);
+        let toggle = peek(&dev, "portb") & B_REFRESH;
+
+        dev.reset(ResetKind::Cold);
+
+        // Bit 5 is the pin, with nothing in between (module docs), so it still
+        // reports the level the timer is still driving.
+        assert_eq!(
+            peek(&dev, "portb") & B_TIMER2_OUT,
+            B_TIMER2_OUT,
+            "the speaker's own waveform vanished from port 0x61 across a reset"
+        );
+        // The toggle itself is this device's flip-flop and does reset.
+        assert_eq!(peek(&dev, "portb") & B_REFRESH, 0);
+        let _ = toggle;
+
+        // A re-announcement of an unchanged level — `Wire::refresh` on every
+        // snapshot load — is not an edge and must not flip bit 4.
+        refresh.set(Level::High);
+        timer2.set(Level::High);
+        assert_eq!(
+            peek(&dev, "portb") & B_REFRESH,
+            0,
+            "a level that never moved was counted as a refresh edge"
+        );
+
+        // And the next real transition still is one.
+        refresh.lower();
+        assert_eq!(peek(&dev, "portb") & B_REFRESH, B_REFRESH);
+        assert_eq!(peek(&dev, "portb") & B_TIMER2_OUT, B_TIMER2_OUT);
     }
 
     /// Save `dev` into a one-device snapshot.

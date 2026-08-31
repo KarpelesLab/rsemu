@@ -916,7 +916,20 @@ impl Device for Pic8259 {
     fn reset(&self, _kind: ResetKind) {
         {
             let mut state = self.regs.state.lock();
+            // The IR pin levels survive, for the reason [`State::begin_init`]
+            // already gives about the same event on the ICW1 path: the edge
+            // sense circuit is reset, so nothing latches, but a line the board
+            // is *still holding high* has not moved and the chip has no way to
+            // learn that it did. Nothing re-announces it either — `announce`
+            // here is the `int` output, and a driver whose level did not change
+            // delivers nothing. Forgetting the level costs a level-triggered
+            // request outright, and turns the next re-announcement of that
+            // unchanged high into a fabricated rising edge — which is exactly
+            // what `Wire::refresh` does on every snapshot load.
+            let pins = state.pin_level;
             *state = State::default();
+            state.pin_level = pins;
+            state.irr = state.pin_level & state.level_mask();
         }
         self.regs.drive(false);
     }
@@ -933,6 +946,14 @@ impl Device for Pic8259 {
         let line = Pic8259::pin_number(port)?;
         // The fan-in can only be built now: it is told its sources at
         // construction and no `WireId` existed when this chip was made.
+        //
+        // Nothing seeds `pin_level` from it, and nothing needs to: an IR line
+        // idles low, a fresh `FanIn` holds every source low, and
+        // `State::default` agrees with both. The 8254's `gate2` needed the
+        // opposite treatment only because an undriven GATE is pulled *up*. If
+        // either default ever moves, this is where the level has to be adopted
+        // — a driver idling at its own default announces no change, so the wire
+        // will never say it.
         let pin = Arc::new(InputPin {
             regs: Arc::clone(&self.regs),
             line,
@@ -1716,6 +1737,40 @@ mod tests {
         assert!(!b.probe.high());
         assert_eq!(b.pic.requested(), 0);
         assert_eq!(b.pic.in_service(), 0);
+    }
+
+    #[test]
+    fn a_reset_does_not_forget_which_lines_the_board_is_still_driving() {
+        // The edge sense circuit is reset, so the latched request goes. The
+        // *pin level* does not: nothing moved out there, and the chip is never
+        // told a line it already believes is high is high.
+        let b = bench("master");
+        b.init(ICW1_CASCADE, MASTER_BASE, 0x04, ICW4_8086);
+        b.raise(3);
+        assert_eq!(b.pic.requested(), 1 << 3);
+        b.pic.reset(ResetKind::Cold);
+        assert_eq!(b.pic.requested(), 0, "the edge sense circuit is reset");
+
+        // A re-announcement of that unchanged high — which is what
+        // `Wire::refresh` delivers to every sink on a snapshot load — is not an
+        // edge, and must not invent a request the saved machine did not have.
+        b.set(3, true);
+        assert_eq!(
+            b.pic.requested(),
+            0,
+            "a level that never moved was read as a rising edge"
+        );
+
+        // And the level really is remembered rather than merely not latched:
+        // making the still-high line level-triggered gives it a request at
+        // once, because a level-triggered IRR is a mirror of the pins.
+        b.init(ICW1_CASCADE, MASTER_BASE, 0x04, ICW4_8086);
+        b.poke_elcr(1 << 3);
+        assert_eq!(
+            b.pic.requested(),
+            1 << 3,
+            "the chip forgot the board was still driving IR3"
+        );
     }
 
     #[test]

@@ -417,11 +417,91 @@ fn a_timer_tick_reaches_the_processor_and_acknowledges_to_a_vector() {
     assert!(cpu.intr_asserted(), "the next tick");
 }
 
+/// Save `m`, restore that snapshot into a freshly built board, and compare the
+/// two one device chunk at a time.
+///
+/// The whole-machine hash is a boolean. It says a byte moved somewhere in
+/// sixteen devices, which is a much worse bug report than the one the format
+/// can give for free: chunks are keyed by device instance path (§4.5), so
+/// walking them costs a loop and turns "the board did not round-trip" into
+/// "pit0's byte 58". The hash is checked too, at the end, because it is the
+/// thing §15's invariant is actually written in terms of.
+///
+/// `what` names the point in the board's life this is being asked at, because
+/// a device only fails to round-trip in the state it was driven into.
+#[track_caller]
+fn assert_round_trips(m: &rsemu::machine::Machine, what: &str) {
+    let image = m.save().expect("the board saves");
+
+    let (mut other, _) = board();
+    other.reset(ResetKind::Cold);
+    other.load(&image).expect("the board loads");
+    let again = other.save().expect("the restored board saves");
+
+    let from = rsemu::core::state::StateReader::new(&image).expect("a snapshot we just wrote");
+    let to = rsemu::core::state::StateReader::new(&again).expect("a snapshot we just wrote");
+    let mut report = String::new();
+    for chunk in from.chunks() {
+        let (_, _, saved) = from.load_raw(chunk.path).expect("the chunk we just listed");
+        let (_, _, restored) = to
+            .load_raw(chunk.path)
+            .expect("the same board, so the same chunk keys");
+        if saved == restored {
+            continue;
+        }
+        report.push_str(&format!(
+            "\n  {} ({}): {} bytes saved, {} restored",
+            chunk.path,
+            chunk.class,
+            saved.len(),
+            restored.len()
+        ));
+        for (at, (a, b)) in saved.iter().zip(restored.iter()).enumerate() {
+            if a != b {
+                report.push_str(&format!(
+                    "\n    byte {at}: saved {a:#04x}, restored {b:#04x}"
+                ));
+            }
+        }
+    }
+    assert!(
+        report.is_empty(),
+        "{what}: a restored board must be indistinguishable from the one it \
+         came from, and these chunks differ:{report}"
+    );
+    assert_eq!(
+        other.state_hash().expect("a hash"),
+        m.state_hash().expect("a hash"),
+        "{what}: the chunks all match but the state hash does not, so something \
+         outside a device chunk moved"
+    );
+}
+
 #[test]
 fn the_board_snapshots_and_restores_to_an_identical_state_hash() {
     let (mut m, _cpu) = board();
     m.reset(ResetKind::Cold);
     m.sweep();
+
+    // Straight out of a cold reset, before the guest has touched anything.
+    //
+    // This is the state every level the chipset shares between two chips sits
+    // at its power-on default in, and it is precisely the state a test that
+    // programs the ports first can no longer reach: writing 0x03 to port 0x61
+    // drives GATE2 high, and driving a shared level *repairs* a chip whose idea
+    // of that pin had drifted from the board's. A round-trip test that only
+    // ever looks after the pokes proves the least interesting case.
+    assert_round_trips(&m, "at rest, out of a cold reset");
+
+    // Driven, by an x86 rather than by this file. The image is not firmware, so
+    // what it executes is nonsense — but it is nonsense on a real bus, and what
+    // it pokes at is not up to us.
+    m.run_for(rsemu::core::clock::GlobalTime::from_nanos(500_000))
+        .expect("the machine runs");
+    assert_round_trips(&m, "after 500 us of the reset-vector image");
+
+    // And programmed, the way firmware programs it: a periodic tick, the
+    // speaker gate up, an RTC control register written.
     outb(&m, 0x43, 0x34);
     outb(&m, 0x40, 100);
     outb(&m, 0x40, 0);
@@ -430,18 +510,109 @@ fn the_board_snapshots_and_restores_to_an_identical_state_hash() {
     outb(&m, 0x71, 0x42);
     m.run_for(rsemu::core::clock::GlobalTime::from_nanos(500_000))
         .expect("the machine runs");
+    assert_round_trips(&m, "after the chipset has been programmed");
+
+    // Then the gate back down, so the shared level is exercised in both
+    // directions rather than only the one a write happens to set.
+    outb(&m, 0x61, 0x00);
+    m.run_for(rsemu::core::clock::GlobalTime::from_nanos(500_000))
+        .expect("the machine runs");
+    assert_round_trips(&m, "after the speaker gate has been lowered again");
+
+    // And across a reset of a board that was *running*, which is the case a
+    // test that resets a fresh board and then drives it structurally cannot
+    // reach. A cold reset out of the box finds every shared level already at
+    // its idle, so a chip that invents one for an input pin invents the right
+    // answer by luck; a reset taken while the timer's outputs are mid-waveform
+    // does not have that luck. This is the reset firmware itself takes on its
+    // way out of protected mode.
+    outb(&m, 0x43, 0x34);
+    outb(&m, 0x40, 100);
+    outb(&m, 0x40, 0);
+    outb(&m, 0x43, 0x74);
+    outb(&m, 0x41, 18);
+    outb(&m, 0x41, 0);
+    outb(&m, 0x61, 0x01);
+    m.run_for(rsemu::core::clock::GlobalTime::from_nanos(500_000))
+        .expect("the machine runs");
+    m.reset(ResetKind::Warm);
+    assert_round_trips(&m, "after a warm reset of a board that was running");
+    m.run_for(rsemu::core::clock::GlobalTime::from_nanos(500_000))
+        .expect("the machine runs");
+    assert_round_trips(&m, "and after it has run on from that reset");
+}
+
+#[test]
+fn what_the_guest_wrote_into_the_text_page_survives_a_snapshot() {
+    // Asserted by content, from the guest's side of the bus, because a chunk
+    // diff structurally cannot see this one: a device that forgets to
+    // serialize something is invisible to a comparison of what it *did*
+    // serialize, and the state hash agrees with itself for the same reason.
+    // The adapter's 32 KiB character buffer is its own store rather than a
+    // `ram` instance, and `Machine::save` walks devices, not regions — so
+    // nothing but the adapter was ever going to write it.
+    let (mut m, _cpu) = board();
+    m.reset(ResetKind::Cold);
+    m.sweep();
+    write_text(&m, 3, 7, "rsemu pc-at", 0x0f);
+    assert_eq!(peek(&m, 0x000b_8000 + (3 * 80 + 7) * 2), u64::from(b'r'));
 
     let image = m.save().expect("the board saves");
-    let before = m.state_hash().expect("a hash");
-
     let (mut other, _) = board();
     other.reset(ResetKind::Cold);
     other.load(&image).expect("the board loads");
-    assert_eq!(
-        other.state_hash().expect("a hash"),
-        before,
-        "a restored board must be indistinguishable from the one it came from"
-    );
+
+    for (i, byte) in b"rsemu pc-at".iter().enumerate() {
+        let at = 0x000b_8000 + ((3 * 80 + 7) as u64 + i as u64) * 2;
+        assert_eq!(
+            peek(&other, at),
+            u64::from(*byte),
+            "the text page did not survive the snapshot, at cell {i}"
+        );
+        assert_eq!(peek(&other, at + 1), 0x0f, "nor did the attribute byte");
+    }
+}
+
+#[test]
+fn counter_2_does_not_count_until_port_0x61_gates_it() {
+    // The level port 0x61 bit 0 drives lives in two chips: the system control
+    // port latches it and the 8254 sees it on GATE2. Only one of them owns it,
+    // and this is the assertion that says which — because a timer that has
+    // helped itself to a default for an input pin is indistinguishable from a
+    // correct one until something asks it to stand still.
+    let (mut m, _cpu) = board();
+    m.reset(ResetKind::Cold);
+    m.sweep();
+
+    // Counter 2, low-then-high, mode 3, binary, divided by 100 — about 84 us of
+    // square wave, if it is allowed to run.
+    outb(&m, 0x43, 0xb6);
+    outb(&m, 0x42, 100);
+    outb(&m, 0x42, 0);
+
+    // Port 0x61 bit 0 is clear out of a cold reset, so GATE2 is low, so mode 3
+    // holds OUT2 high and does not count. Bit 5 of the same port is that OUT2
+    // pin brought back to the bus, which is how firmware watches it.
+    assert_eq!(inb(&m, 0x61) & 0x01, 0x00, "the gate is down to begin with");
+    for _ in 0..20 {
+        m.run_for(rsemu::core::clock::GlobalTime::from_nanos(20_000))
+            .expect("the machine runs");
+        assert_eq!(
+            inb(&m, 0x61) & 0x20,
+            0x20,
+            "counter 2 counted through a gate the board is holding low"
+        );
+    }
+
+    // Raise it and the same counter runs.
+    outb(&m, 0x61, 0x01);
+    let mut went_low = false;
+    for _ in 0..20 {
+        m.run_for(rsemu::core::clock::GlobalTime::from_nanos(20_000))
+            .expect("the machine runs");
+        went_low |= inb(&m, 0x61) & 0x20 == 0;
+    }
+    assert!(went_low, "raising the gate never started counter 2");
 }
 
 // ---------------------------------------------------------------------------

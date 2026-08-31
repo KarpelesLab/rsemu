@@ -63,8 +63,17 @@
 //! Three outputs, `out0`, `out1` and `out2`, and one input, `gate2`. Counters 0
 //! and 1 have their gates tied high on an AT, so they have no input pin; a
 //! counter whose gate is not driven idles high here, which is what an
-//! unconnected, pulled-up input does. Counter 2's output is also readable by
-//! the board's system-control port, through [`Pit8254::out`].
+//! unconnected, pulled-up input does. Counter 2's output also reaches the
+//! board's system-control port, over the `out2` wire like any other level.
+//!
+//! A driven GATE is a different thing from an undriven one, and the difference
+//! is not something the wire can announce: a driver that idles low announces a
+//! level the net already holds, and [`Wire::set`](crate::core::wire::Wire::set)
+//! delivers changes rather than levels. So the moment a `gate2` pin is handed
+//! out, the counter is told what level it sits at, and nothing after that —
+//! `reset` included — may invent one for it. The level belongs to whatever
+//! drives the pin; a reset of this chip does not reach across the pin and
+//! change what the board is doing with it. (The 8254 has no RESET pin at all.)
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -134,6 +143,22 @@ struct Counter {
     /// The OUT pin's level.
     output: bool,
     /// The GATE pin's level.
+    ///
+    /// The level belongs to whatever drives the pin — on an AT, counter 2's
+    /// comes from port 0x61 bit 0 — and this is the chip's latched view of it.
+    /// Only [`Counter::set_gate`], through the pin, and the moment the pin is
+    /// first connected may write it; a reset must not, because a reset of the
+    /// chip does not change what the board is driving.
+    ///
+    /// It is nevertheless saved. GATE is edge-sensitive as well as
+    /// level-sensitive — modes 1 and 5 trigger on a rise and modes 2 and 3
+    /// reload on one — so it cannot be rebuilt on load by replaying the wire's
+    /// level through [`Counter::set_gate`]: an input the restored chip had been
+    /// sitting at for a million ticks would arrive as a fresh edge and reload a
+    /// counter that was mid-count. Saving the latched view instead makes the
+    /// wire re-announce that `Machine::load_with` performs a confirming no-op,
+    /// which is the only way the two agree without one of them inventing an
+    /// event.
     gate: bool,
     /// Whether the counting element holds a count and follows the clock.
     ///
@@ -941,11 +966,17 @@ impl Pit8254 {
 
     /// The level counter `counter`'s OUT pin is driving.
     ///
-    /// The board's system-control port reads counter 2's output in bit 5 of
-    /// port `0x61`, which is how the BIOS times a delay loop without an
-    /// interrupt and how a program watches the speaker's own waveform. The chip
-    /// is caught up first, so the answer is the level at the instant of the
-    /// port read rather than at the last quantum boundary.
+    /// The board's system-control port reports counter 2's output in bit 5 of
+    /// port `0x61` — how the BIOS times a delay loop without an interrupt and
+    /// how a program watches the speaker's own waveform — but it does so from
+    /// the `out2` wire, not from here: a level that reaches a sibling over a
+    /// pin has one owner and one path. This is the direct question, for a test
+    /// or a monitor that has the chip rather than the net.
+    ///
+    /// **The chip is caught up first**, so the answer is the level at this
+    /// instant rather than at the last quantum boundary — which also means this
+    /// is not a debug accessor: it advances time, and nothing on a
+    /// [`MemAttrs::debug`] path may call it.
     ///
     /// Out-of-range counter numbers read low.
     #[must_use]
@@ -996,9 +1027,24 @@ impl Device for Pit8254 {
         // Both kinds. There is no battery behind a PIT, and a counter that
         // survived a reset would keep interrupting a kernel that had not
         // programmed it.
+        //
+        // Every GATE level survives, though, because it is not the chip's to
+        // invent: the 8254 has no RESET pin at all (data sheet — the part has
+        // CLK, GATE, OUT, D0-7, /RD, /WR, A0-A1 and /CS and nothing else), and
+        // what a board reset does to GATE2 arrives through whatever drives it.
+        // On an AT that is port 0x61 bit 0, which resets to zero and re-drives
+        // low — an unchanged level, so the wire delivers nothing, so a chip
+        // that had helped itself to the power-on default here would be left
+        // believing its gate was high while the board held it low. That
+        // disagreement is guest-visible (counter 2 counts when it must not) and
+        // it is what a snapshot then faithfully records.
         let levels = {
             let mut state = self.regs.state.lock();
+            let gates = state.counters.each_ref().map(|c| c.gate);
             *state = State::default();
+            for (counter, gate) in state.counters.iter_mut().zip(gates) {
+                counter.gate = gate;
+            }
             self.regs.publish(&state);
             state.levels()
         };
@@ -1040,6 +1086,22 @@ impl Device for Pit8254 {
             counter: 2,
             inputs: FanIn::new(sources),
         });
+        // A gate that is now driven is no longer the pulled-up input
+        // `Counter::default` assumes. A fresh [`FanIn`] holds every source low,
+        // and a driver that idles low announces a level the wire already has —
+        // which `Wire::set` does not deliver, because it is not a change. So
+        // nothing would ever tell this counter its gate had stopped being high,
+        // and it would count through a low GATE2 for as long as the board ran.
+        //
+        // Adopted rather than delivered: there is no edge here. The pin was at
+        // this level from power-on and the counter is only now being told which
+        // pin it has, so an edge's side effects (a mode 1 trigger, a mode 2
+        // reload) would be inventions of the wiring order.
+        {
+            let level = pin.inputs.resolve(Resolve::Or).is_high();
+            let mut state = self.regs.state.lock();
+            state.counters[pin.counter].gate = level;
+        }
         self.pins.lock().push(Arc::clone(&pin));
         Some(SinkPin { sink: pin, line: 2 })
     }
@@ -1591,6 +1653,67 @@ mod tests {
         assert_eq!(Device::next_event_tick(&pit), None);
         assert!(!pit.out(0), "and every output idles low again");
         assert_eq!(Device::current_tick(&pit), 0);
+    }
+
+    #[test]
+    fn connecting_the_gate_pin_lowers_a_gate_that_was_only_pulled_up() {
+        // An undriven GATE is pulled up, which is why counters 0 and 1 count
+        // with nothing wired to them. The instant something *is* wired to
+        // counter 2's, that stops being true — and nothing will ever tell the
+        // chip so, because a driver idling low announces a level the wire
+        // already holds and `Wire::set` delivers only changes.
+        let pit = Pit8254::default_device();
+        let ids = WireIdAllocator::new();
+        let id = ids.alloc();
+        let pin = pit.sink("gate2", &[id]).expect("counter 2 has a gate pin");
+        let wire = Wire::builder()
+            .source(id)
+            .sink(pin.sink, pin.line)
+            .build_shared();
+        let source = WireSource::new(wire, id);
+        assert!(!source.level().is_high(), "a fresh net idles low");
+
+        // Mode 3 with a low gate holds OUT high and does not count.
+        let loaded = program(&pit, 2, 3, 4);
+        pit.advance_to(loaded + 100);
+        assert!(
+            pit.out(2),
+            "counter 2 counted through a gate the board is holding low"
+        );
+        // And it starts on the rising edge, which is the same pin working.
+        source.raise();
+        assert_eq!(
+            samples(&pit, 2, 9),
+            [true, true, true, false, false, true, true, false, false],
+            "a raised gate reloads and starts the square wave"
+        );
+    }
+
+    #[test]
+    fn a_reset_does_not_lift_a_gate_the_board_is_holding_low() {
+        // GATE is an input. The 8254 has no RESET pin, so a board reset reaches
+        // this chip only through what drives its pins — and on an AT port 0x61
+        // bit 0 resets to zero and re-drives *low*, an unchanged level the wire
+        // does not deliver. A chip that helped itself to the power-on default
+        // here would come out of reset believing its gate was high.
+        let pit = Pit8254::default_device();
+        let gate = gate2(&pit);
+        gate.lower();
+        pit.reset(ResetKind::Cold);
+        let loaded = program(&pit, 2, 3, 4);
+        pit.advance_to(loaded + 100);
+        assert!(pit.out(2), "the gate came back high across the reset");
+
+        // The converse, so this is not merely a test that the gate is always
+        // low: a gate the board holds high survives a reset too.
+        gate.raise();
+        pit.reset(ResetKind::Cold);
+        program(&pit, 2, 3, 4);
+        assert_eq!(
+            samples(&pit, 2, 9),
+            [true, true, false, false, true, true, false, false, true],
+            "and a high gate is not lost either"
+        );
     }
 
     #[test]
