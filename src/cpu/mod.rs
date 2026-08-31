@@ -9,9 +9,14 @@
 //! | Core | Feature | State |
 //! | --- | --- | --- |
 //! | `mos6502` | `cpu-mos6502` | cycle-accurate interpreter, illegal opcodes, disassembler |
+//! | `m68k` | `cpu-m68k` | MC68000 interpreter with a modelled prefetch queue, exceptions, disassembler |
 //!
 //! Every core ships an interpreter first; the IR frontend comes later and is
 //! differentially tested against it forever. **The interpreter is the oracle.**
+
+#[cfg(feature = "cpu-m68k")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-m68k")))]
+pub mod m68k;
 
 #[cfg(feature = "cpu-mos6502")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-mos6502")))]

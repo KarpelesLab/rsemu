@@ -68,6 +68,16 @@ dev-nes-ppu = []
 # no dependencies and is `no_std + alloc`.
 cpu-mos6502 = []
 
+# The Motorola MC68000 core (src/cpu/m68k): an interpreter that models the
+# two-word prefetch queue explicitly, charges four cycles per bus access rather
+# than reading a per-instruction table, implements the supervisor/user split
+# with both stack pointers, and takes every 68000 exception with the right
+# stack frame — including the fourteen-byte group-0 frame an address error
+# pushes. Ships a disassembler generated from the same instruction description.
+# The plain 68000 of the Amiga, Atari ST, Mega Drive and early Macs; not the
+# 010 or the 020. Adds no dependencies and is `no_std + alloc`.
+cpu-m68k = []
+
 [lib]
 name = "rsemu"
 path = "src/lib.rs"
