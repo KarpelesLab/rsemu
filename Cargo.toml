@@ -68,6 +68,15 @@ dev-nes-ppu = []
 # no dependencies and is `no_std + alloc`.
 cpu-mos6502 = []
 
+# The ARMv5TE core (src/cpu/arm): an ARM926EJ-S-class interpreter with the full
+# ARM and Thumb instruction sets, interworking, the DSP (E) extensions, all
+# seven modes with their banked registers and the complete exception model, plus
+# a disassembler generated from the same decoders. The MMU, caches and TCMs are
+# not included: CP15 attaches through the `cp::Coprocessor` and `cp::Mmu` traits
+# so a downstream SoC crate supplies its own, and a flat identity map is the
+# default. Adds no dependencies and is `no_std + alloc`.
+cpu-arm = []
+
 [lib]
 name = "rsemu"
 path = "src/lib.rs"

@@ -16,3 +16,7 @@
 #[cfg(feature = "cpu-mos6502")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-mos6502")))]
 pub mod mos6502;
+
+#[cfg(feature = "cpu-arm")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm")))]
+pub mod arm;
