@@ -28,6 +28,7 @@
 //! priority order, and the NaN-boxing rule for single-precision values held in
 //! double-precision registers.
 
+use crate::core::exec::{Access as ExitAccess, Exit, ExitMask, ExitReason};
 use crate::core::space::{AddressSpace, MemAttrs};
 use crate::core::value::Width;
 
@@ -119,6 +120,12 @@ pub(super) struct Exec<'a> {
     space: &'a AddressSpace,
     cfg: &'a Config,
     lines: &'a Lines,
+    /// Which architectural traps leave the hart instead of vectoring into the
+    /// guest (`core::exec`). Empty for a level-1 machine, which is every
+    /// machine in `machines/`.
+    exits: ExitMask,
+    /// Set instead of vectoring, when a trap is named in `exits`.
+    exit: Option<Exit>,
     attrs: MemAttrs,
     /// Cycles charged by this step.
     used: u64,
@@ -167,6 +174,7 @@ impl<'a> Exec<'a> {
         space: &'a AddressSpace,
         cfg: &'a Config,
         lines: &'a Lines,
+        exits: ExitMask,
     ) -> Exec<'a> {
         let attrs = MemAttrs::DEFAULT.with_requester(cfg.requester);
         let this_pc = st.pc;
@@ -176,6 +184,8 @@ impl<'a> Exec<'a> {
             space,
             cfg,
             lines,
+            exits,
+            exit: None,
             attrs,
             used: 0,
             next_pc: this_pc,
@@ -215,12 +225,70 @@ impl<'a> Exec<'a> {
                 }
                 self.st.pc = self.cfg.xlen.trunc(self.next_pc);
             }
-            Err(trap) => {
-                self.enter_trap(trap, false);
-                self.st.pc = self.next_pc;
-            }
+            Err(trap) => match self.exit_for(&trap) {
+                Some(exit) => {
+                    // `resume_pc` is the whole convention: a syscall resumes
+                    // past the instruction, a fault re-executes it. `next_pc`
+                    // already points past, because `execute` set it before it
+                    // decoded (`core::exec`).
+                    self.st.pc = self.cfg.xlen.trunc(exit.resume_pc());
+                    self.exit = Some(exit);
+                }
+                None => {
+                    self.enter_trap(trap, false);
+                    self.st.pc = self.next_pc;
+                }
+            },
         }
         self.used.max(1)
+    }
+
+    /// Take the exit this step produced, if it produced one.
+    pub(super) fn take_exit(&mut self) -> Option<Exit> {
+        self.exit.take()
+    }
+
+    /// Whether `trap` should leave the hart rather than vector into the guest,
+    /// and as what.
+    ///
+    /// Volume II's exception codes carry more than a generic consumer can use,
+    /// so the mapping keeps both: [`Exit::detail`] is the `mcause` code
+    /// verbatim, and [`Exit::access`] is the architecture-independent half a
+    /// demand-paging consumer branches on.
+    fn exit_for(&self, trap: &Trap) -> Option<Exit> {
+        let (reason, access) = match trap.cause {
+            cause::ECALL_U | cause::ECALL_S | cause::ECALL_M => {
+                (ExitReason::SYSCALL, ExitAccess::None)
+            }
+            cause::BREAKPOINT => (ExitReason::BREAKPOINT, ExitAccess::None),
+            cause::ILLEGAL_INSN => (ExitReason::FAULT, ExitAccess::None),
+            cause::INSN_MISALIGNED | cause::INSN_ACCESS | cause::INSN_PAGE_FAULT => {
+                (ExitReason::FAULT, ExitAccess::Execute)
+            }
+            cause::LOAD_MISALIGNED | cause::LOAD_ACCESS | cause::LOAD_PAGE_FAULT => {
+                (ExitReason::FAULT, ExitAccess::Read)
+            }
+            cause::STORE_MISALIGNED | cause::STORE_ACCESS | cause::STORE_PAGE_FAULT => {
+                (ExitReason::FAULT, ExitAccess::Write)
+            }
+            _ => return None,
+        };
+        if !self.exits.contains(reason) {
+            return None;
+        }
+        // `next_pc` is one past the instruction for everything that got as far
+        // as decoding; a fetch fault never set it, and reports length zero
+        // rather than a made-up one.
+        let len = self.next_pc.wrapping_sub(self.this_pc);
+        let len = if len <= 4 { len as u8 } else { 0 };
+        let exit = Exit::new(reason, self.this_pc, len).with_detail(trap.cause);
+        // `stval` is an address only for the faults that have one. For an
+        // illegal instruction it is the encoding, and reporting that as an
+        // address would be worse than reporting nothing.
+        Some(match access {
+            ExitAccess::None => exit,
+            _ => exit.with_access(trap.tval, access),
+        })
     }
 
     // -----------------------------------------------------------------

@@ -188,6 +188,21 @@ dev-lcdc = []
 # `-p link=transactional` switches it. Adds no dependencies.
 machine-spi-panel = ["cpu-riscv", "bus-spi", "dev-st7272a", "dev-lcdc"]
 
+# Level-3 execution (src/usermode): running a program with no guest kernel
+# under it, `qemu-user`/gVisor-shaped (ROADMAP.md §2, phase 5b). The four
+# things a syscall kernel cannot build for itself and rsemu owns because they
+# are hardware: a memory map with no devices in it, a scheduling contract for
+# guest threads, virtual time that advances by executed ticks, and the
+# record/replay funnel every non-deterministic answer passes through. The
+# syscall exit itself is in `core::exec` and is never gated, because it is a
+# property of a core.
+#
+# Deliberately **not** here: a syscall table, file descriptors, errno, a
+# process model, an ELF loader. §2.1 puts those in `KarpelesLab/nixvm`, which
+# depends on this crate rather than being merged into it. Adds no dependencies
+# and is `no_std + alloc`, because the browser is a level-3 target too.
+usermode = []
+
 # The MOS 6502 core (src/cpu/mos6502): a cycle-accurate interpreter with every
 # documented and undocumented opcode, a disassembler generated from the same
 # table, and the RP2A03 (NES) variant selected by a construction property. Adds
