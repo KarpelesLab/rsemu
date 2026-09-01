@@ -56,6 +56,7 @@ fn the_code_fits_below_the_reset_vector() {
         .iter()
         .rposition(|&b| b != 0xff)
         .expect("the image is not empty");
+    println!("the firmware occupies {used:#06x} bytes of its 64 KiB segment");
     assert!(
         used < RESET_VECTOR as usize,
         "the code reaches {used:#06x}, which collides with the reset vector"
