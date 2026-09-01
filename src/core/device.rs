@@ -504,6 +504,46 @@ pub trait Device: Send + Sync + fmt::Debug {
     ///
     /// Takes `&self`: a device is shared, and holds its state behind interior
     /// mutability.
+    ///
+    /// # Per-call work, and what the threading modes do about it
+    ///
+    /// Several devices here do a fixed amount of work *per call* rather than
+    /// per tick — a 16550 pumps its port once, an Apple 1 PIA releases one
+    /// character — because the budget is not the currency the work is measured
+    /// in. That makes **the number of scheduler calls guest-visible**, which is
+    /// legitimate only for as long as that number is a function of the machine
+    /// and not of the caller.
+    ///
+    /// Both facts still hold:
+    ///
+    /// * A round calls `run` **exactly once per runnable**, in every threading
+    ///   mode. `ThreadingMode::Parallel` submits one job per runnable and joins
+    ///   them; it does not slice a round into two passes. So the call count is
+    ///   the same as `ThreadingMode::Deterministic`'s, and the additivity of
+    ///   [`Machine::run_for`](crate::machine::Machine::run_for) (§11.6) — which
+    ///   is exactly the property a second pass destroyed — is untouched.
+    /// * A round's boundaries are a function of virtual time and machine state
+    ///   alone, so the *set* of rounds does not depend on how a caller sliced
+    ///   the run.
+    ///
+    /// What parallel mode does change is that this call may overlap a guest
+    /// access to the same device. That is not a soundness problem — the
+    /// critical sections here are the ordinary ones and the re-entrancy
+    /// contract still applies — but the *interleaving* between the two is host
+    /// timing, so the byte a UART hands over lands on a different guest cycle
+    /// from run to run. That is the non-determinism §4.2 says this mode buys
+    /// speed with, and it is confined to exactly the devices whose input was
+    /// never deterministic in the first place: a host keystroke's arrival
+    /// instant is a record/replay input (§4.5), not a computed one.
+    ///
+    /// A device whose per-call work is *not* of that kind — one where the call
+    /// count is arithmetic the guest can observe, rather than the arrival of
+    /// something from outside — should do the work per tick instead. There is
+    /// no mode in which "how many times was I called" is a safe quantity to
+    /// compute with.
+    ///
+    /// [`ThreadingMode::Parallel`]: crate::core::sched::ThreadingMode::Parallel
+    /// [`ThreadingMode::Deterministic`]: crate::core::sched::ThreadingMode::Deterministic
     fn run(&self, _budget: Budget) -> Consumed {
         Consumed::default()
     }

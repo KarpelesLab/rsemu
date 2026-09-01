@@ -45,10 +45,14 @@ one snapshot format, one debugger, shared by every machine ever added.
   core generically. No device type ever appears in a `core::` signature.
 - **`no_std` + `alloc` core.** Host I/O, JIT, acceleration and frontends live
   above the `std` line.
-- **Multithreaded by design.** Guest CPUs, background JIT compilation, and
-  device I/O can all run in parallel — with the same state hash whether the
-  machine runs on one thread or many. All of it goes through one portability
-  seam, so a device is written once.
+- **Multithreaded by design.** Guest CPUs, background JIT compilation and
+  device I/O can all run in parallel, through one portability seam, so a device
+  is written once. Threading is a *mode*, and the modes differ in what they
+  promise: `deterministic` runs the guests on one thread and is
+  bit-reproducible, and background work never changes what it computes;
+  `parallel` gives every CPU a thread and gives up reproducibility for speed,
+  because two guests racing through memory is not a reproducible thing. Asking
+  a `parallel` machine for a state hash is an error rather than a number.
 - **Runs in the browser.** `wasm32-unknown-unknown` with *and* without threads
   is a CI target from the first commit: Web Workers over shared memory, a JIT
   that emits WebAssembly instead of native code, and no `mmap`, signals, or

@@ -38,10 +38,18 @@
 //! [`Machine::step_until`] is the one path that does split a round, for a
 //! debugger, and says so.
 //!
-//! Only [`ThreadingMode::Deterministic`](crate::core::sched::ThreadingMode) is
-//! driven here, which is the mode §4.2 requires for record/replay and for the
-//! regression suite. The other two are a `core::sched` concern and report
-//! themselves unimplemented.
+//! Which of §4.2's threading modes runs is a `core::sched` concern and the
+//! loop above is the same either way:
+//! [`Deterministic`](crate::core::sched::ThreadingMode::Deterministic) is the
+//! mode §4.2 requires for record/replay and for the regression suite, and
+//! [`Parallel`](crate::core::sched::ThreadingMode::Parallel) runs one job per
+//! runnable on the task pool and joins them at the round's boundary. `accel`
+//! reports itself unimplemented.
+//!
+//! What differs above this line is one thing: [`Machine::state_hash`] refuses
+//! outside a deterministic mode, because a number a parallel run produces is a
+//! sample rather than a baseline and must not be able to become a golden by
+//! accident.
 //!
 //! Events are dispatched **after** the quantum that made them due rather than
 //! from inside it, because `Scheduler::run_quantum` collects them into its
@@ -719,11 +727,89 @@ impl Machine {
     /// state, so equal hashes mean equal state and not merely equal-looking
     /// state.
     ///
+    /// # Only in a deterministic machine, and that is structural
+    ///
+    /// This **refuses** on a machine whose threading mode is not
+    /// [`ThreadingMode::Deterministic`]. `ROADMAP.md` §0 makes reproducibility
+    /// a property of the mode rather than of the thread count, and §4.2 calls
+    /// [`ThreadingMode::Parallel`] non-deterministic in as many words — so a
+    /// number taken from a parallel run is not a regression baseline, it is a
+    /// sample. Refusing here is what makes that structural instead of a comment
+    /// somebody has to have read: a conformance suite, a frame-hash golden or a
+    /// replay trace cannot be blessed against a parallel run by accident,
+    /// because the call that would produce the number returns an error.
+    ///
+    /// [`Machine::nondeterministic_state_hash`] is for the caller that wants
+    /// the number anyway — a snapshot round-trip inside one run, where both
+    /// sides come from the same execution and no golden is being written. Its
+    /// name is the documentation.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] if the machine is not in a deterministic threading
+    /// mode; otherwise as [`Machine::save`].
+    ///
+    /// [`ThreadingMode`]: crate::core::sched::ThreadingMode
+    /// [`ThreadingMode::Deterministic`]: crate::core::sched::ThreadingMode::Deterministic
+    /// [`ThreadingMode::Parallel`]: crate::core::sched::ThreadingMode::Parallel
+    pub fn state_hash(&self) -> Result<u64> {
+        let mode = self.sched.config().mode;
+        if !mode.is_deterministic() {
+            return Err(Error::Config {
+                at: self.name.clone(),
+                message: format!(
+                    "a state hash from `{mode}` threading is not reproducible and must not \
+                     become a golden (ROADMAP.md 4.2); run the machine in `deterministic` \
+                     threading, or say `nondeterministic_state_hash` and mean it"
+                ),
+            });
+        }
+        Ok(fnv1a(&self.save()?))
+    }
+
+    /// A hash of the machine's serialized state, whatever the threading mode.
+    ///
+    /// The escape hatch [`Machine::state_hash`] describes. Legitimate when both
+    /// sides of the comparison come from **one run** — a snapshot taken and
+    /// restored inside the same execution, a device's state before and after a
+    /// reset. Never legitimate as a value checked into a test, a ledger or a
+    /// golden file, because a parallel run does not produce the same one twice.
+    ///
     /// # Errors
     ///
     /// As [`Machine::save`].
-    pub fn state_hash(&self) -> Result<u64> {
+    pub fn nondeterministic_state_hash(&self) -> Result<u64> {
         Ok(fnv1a(&self.save()?))
+    }
+
+    /// The threading mode this machine runs in (§4.2).
+    #[inline]
+    pub fn threading_mode(&self) -> crate::core::sched::ThreadingMode {
+        self.sched.config().mode
+    }
+
+    /// The stop-the-world protocol (§4.7).
+    ///
+    /// Clone it to whatever may need the machine quiescent — a host thread
+    /// wanting a snapshot, a device that remaps memory from inside its own
+    /// write path. See [`SafePoint`](crate::core::sched::SafePoint).
+    #[inline]
+    pub fn safe_point(&self) -> crate::core::sched::SafePoint {
+        self.sched.safe_point()
+    }
+
+    /// Stop the world and hold it stopped until the guard is dropped.
+    ///
+    /// Every runnable that honours its exit flag declines to start another
+    /// block, and the task pool is quiesced. What comes back is a machine
+    /// nobody is executing, which is what a snapshot, a retopology or a reset
+    /// needs (§4.7). Under [`ThreadingMode::Deterministic`] it is nearly free
+    /// and still correct: there was never anybody else to stop.
+    ///
+    /// [`ThreadingMode::Deterministic`]: crate::core::sched::ThreadingMode::Deterministic
+    #[must_use = "the world runs again when the guard is dropped"]
+    pub fn stop_the_world(&self) -> crate::core::sched::StopGuard {
+        self.sched.stop_the_world()
     }
 }
 

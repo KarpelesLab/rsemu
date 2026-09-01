@@ -116,7 +116,7 @@ use crate::core::device::{
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
-use crate::core::sched::{Budget, Consumed, TickCursor};
+use crate::core::sched::{Budget, Consumed, ExitFlag, TickCursor};
 use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{self, AtomicBool, AtomicU32, LockRank, Ordering};
@@ -845,6 +845,23 @@ impl Mos6502 {
     ///
     /// A halted core consumes only the debt it owed plus whatever it managed,
     /// which is how the scheduler sees a `JAM` rather than spinning on it.
+    ///
+    /// # The safe point
+    ///
+    /// The loop consults the scheduler's exit flag between instructions —
+    /// `ROADMAP.md` §4.7's *"generation counter plus a per-CPU exit flag
+    /// checked at translation-block boundaries"*, with the instruction boundary
+    /// standing in for the block boundary an interpreter does not have. Nothing
+    /// raises that flag during an ordinary run, so this is bit-identical to the
+    /// loop without it until somebody actually stops the world; when somebody
+    /// does, the core unwinds here instead of at the end of the round.
+    ///
+    /// Returning early is already a legal report ([`Runnable::run`] documents
+    /// it, and a `JAM` above takes the same exit), so the debt bookkeeping
+    /// below needs no special case: `used < allowance` is the path a halt
+    /// already used.
+    ///
+    /// [`Runnable::run`]: crate::core::sched::Runnable::run
     pub fn run_budget(&self, ticks: u64) -> u64 {
         let owed = self.session.lock().state.debt;
         if owed >= ticks {
@@ -853,6 +870,10 @@ impl Mos6502 {
             self.session.lock().state.debt = owed - ticks;
             return ticks;
         }
+        // Read once: the cursor is wiring, fixed after realize, and taking its
+        // leaf lock per instruction to re-read it would cost more than the two
+        // relaxed loads the flag itself is.
+        let exit = self.links.lock().cursor.as_ref().map(TickCursor::exit_flag);
         let allowance = ticks - owed;
         let mut used = 0u64;
         while used < allowance {
@@ -863,6 +884,9 @@ impl Mos6502 {
                 break;
             }
             used += n;
+            if exit.as_ref().is_some_and(ExitFlag::raised) {
+                break;
+            }
         }
         if used >= allowance {
             self.session.lock().state.debt = used - allowance;

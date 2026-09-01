@@ -1,0 +1,115 @@
+# heterogeneous - two CPU classes, two spaces, one shared RAM region.
+#
+# ROADMAP.md 5 names this file as a test fixture "from day one": *a 6502 and a
+# RISC-V core sharing one RAM region through two spaces with different
+# endianness*, and 13's phase-2 gate says it must realize and run. It is not a
+# board anyone built. It exists so the motivating case of the whole machine
+# description language is a thing that executes rather than a paragraph.
+#
+# It is also the fixture the `parallel` threading mode (4.2) is measured on,
+# because it is the only machine in the tree with two runnable CPUs.
+#
+# ---------------------------------------------------------------------------
+# Two crystals, not one crystal and a divider
+# ---------------------------------------------------------------------------
+#
+# The obvious way to write this board is one oscillator with the 6502 hanging
+# off `soc / 100`. That is wrong here, and the reason is a property of the
+# clock model rather than of this file.
+#
+# A tree has **one** unit counter (4.2: per-domain positions are derived from
+# it, and that derivation is what makes the intra-tree ratios exact). Every
+# domain on the tree is a divider of that counter, so advancing any one of them
+# advances all of them. That is exactly right for the NES, where one runnable -
+# the CPU - drives the tree and the PPU's dot is *computed* from it. It cannot
+# express two CPUs that each execute on their own: one counter cannot say that
+# one of the two is halted while the other is not.
+#
+# So a board with two independently-executing cores wants two roots, which is
+# also what the hardware has - 4.2: "a machine has as many roots as the real
+# board has crystals". A 100 MHz SoC and a 1 MHz 6502 on the same PCB are two
+# cans with independent tolerances, and 4.2 says at length why pretending
+# otherwise emulates a precision that never existed.
+#
+# The consequence is stated rather than hidden: `soc` and `phi2` have no exact
+# ratio, and the ordering between them is the cross-tree fixed-point timeline.
+# Neither guest here depends on that ordering, which is the honest situation
+# for two cores on separate crystals.
+
+machine "heterogeneous" {
+  # How much RAM the two of them share. The 6502 can only see 16 KiB of it -
+  # its whole address space is 64 KiB - so a bigger value simply gives the
+  # RISC-V side more room above the window.
+  param shared = 64K
+
+  # -- the two crystals ------------------------------------------------------
+
+  # The SoC's core clock.
+  osc soc = 100 MHz
+
+  # The 6502's phi2. A separate can; see the header.
+  osc phi2 = 1 MHz
+
+  # -- the two buses ---------------------------------------------------------
+  #
+  # Different widths *and* different endianness, which is the half of the
+  # fixture that is easy to get wrong: `endian` is a property of the space (and
+  # of an individual mapping), never of the initiator, because a big-endian
+  # peripheral on a little-endian bus is ordinary rather than exotic
+  # (ROADMAP.md 4.1).
+  #
+  # `unassigned = open-bus` on both. Neither core has a bus-error input wired
+  # on this board, so faulting would model an exception nothing can take.
+  space little { width = 32, unassigned = open-bus, endian = "little" }
+  space big    { width = 16, unassigned = open-bus, endian = "big"    }
+
+  # -- the region they share -------------------------------------------------
+  #
+  # One object, two mappings, at different addresses, in spaces of different
+  # widths and different endianness. This is the point of the file.
+  object shared_ram "ram" { size = shared }
+
+  # -- the RISC-V side -------------------------------------------------------
+
+  object hart "cpu.riscv" {
+    clock  = soc
+    space  = little
+    engine = "interp"
+    xlen   = "rv64"
+    isa    = "imac"
+    hartid = 0
+    reset  = 0x1000
+  }
+
+  # `image` names a media slot: whoever runs the machine binds the bytes, and
+  # nothing below host/ opens a file.
+  object rvrom "rom" { size = 4K,  image = "rvcode" }
+  object rvram "ram" { size = 8K }
+
+  # -- the 6502 side ---------------------------------------------------------
+
+  object mos "cpu.mos6502" {
+    clock   = phi2
+    space   = big
+    engine  = "interp"
+    variant = "6502"
+  }
+
+  object mosrom "rom" { size = 8K, image = "moscode" }
+  object mosram "ram" { size = 8K }
+
+  # -- the little-endian map -------------------------------------------------
+  map little 0x00001000 size 4K     = rvrom       # reset = 0x1000
+  map little 0x00002000 size 8K     = rvram
+  map little 0x00100000 size shared = shared_ram
+
+  # -- the big-endian map ----------------------------------------------------
+  #
+  # Zero page and the stack at the bottom, the shared window in the middle, and
+  # the ROM at the top because $FFFC is where a 6502 fetches its reset vector.
+  # `alias(shared_ram, 0)` is the *window*: the first 16 KiB of the same object
+  # the RISC-V sees at 0x00100000.
+  map big 0x0000 size 8K   = mosram
+  map big 0x4000 size 16K  = alias(shared_ram, 0)
+  map big 0xe000 size 8K   = mosrom
+}
