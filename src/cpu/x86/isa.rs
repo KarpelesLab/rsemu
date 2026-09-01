@@ -27,6 +27,26 @@
 //! vocabulary rather than inventing one keeps the table checkable against the
 //! manual line by line.
 //!
+//! # The three places one byte is not enough
+//!
+//! Most opcode-extension groups are decided by the ModRM `reg` field alone,
+//! which is what [`resolve_as`] answers. Three are not, and each has its own
+//! table because pretending otherwise is how a decoder acquires a special case
+//! nothing can find:
+//!
+//! - **The x87 escapes, `D8`-`DF`.** With `mod != 11` the `reg` field selects
+//!   one of eight memory forms; with `mod == 11` the *whole* second byte
+//!   selects one of sixty-four register forms. [`X87_MEM`], [`X87_REG`] and
+//!   [`resolve_x87`].
+//! - **The SSE mandatory prefixes.** `66`, `F3` and `F2` stop being an
+//!   operand-size override and a repeat prefix in front of a two-byte opcode
+//!   and become *part of the opcode*. [`TABLE_0F_66`], [`TABLE_0F_F3`] and
+//!   [`TABLE_0F_F2`] are deltas on [`TABLE_0F`], for the same reason
+//!   [`TABLE_386`] is a delta on [`TABLE`]: `66 0F B6` is still `MOVZX`.
+//! - **Group 15 and `0F 12`/`0F 16`**, where the ModRM *mode* field picks
+//!   between a memory instruction and an entirely different register one.
+//!   [`resolve_modrm`] is the single place all three are applied.
+//!
 //! # Why there is no cycle column
 //!
 //! Same reason as the 6502 core: an 8088 cycle is a bus state, and the number
@@ -44,7 +64,10 @@
 //! Manual*, and sandpile.org's opcode tables for the encodings Intel leaves
 //! out of the map. Undocumented encodings and their classification follow the
 //! `SingleStepTests/8088` metadata (MIT) and were each confirmed against the
-//! corpus itself; see `docs/cpu/x86.md`. No copyleft emulator was consulted.
+//! corpus itself; see `docs/cpu/x86.md`. The x87 escape maps and the SSE
+//! mandatory-prefix maps are the *Intel SDM* volume 2 appendix A — tables
+//! A-16 through A-23 for the escapes, §2.1.1 and the two-byte opcode map for
+//! the prefixes. No copyleft emulator was consulted.
 
 use core::fmt;
 
@@ -249,6 +272,60 @@ pub enum Arg {
     Yb,
     /// String destination `ES:DI`, at the operand size.
     Yv,
+
+    // ---- x87 -----------------------------------------------------------
+    //
+    // Intel's own opcode map writes these as `m32fp`, `m64fp`, `m80fp`,
+    // `m16int` and so on rather than as one-letter addressing methods,
+    // because the escapes are not part of the ModRM operand vocabulary: the
+    // r/m field selects memory or a *stack* register, never a general one.
+    /// A single-precision value in memory, `m32fp`.
+    Mf32,
+    /// A double-precision value in memory, `m64fp`.
+    Mf64,
+    /// An 80-bit double extended value in memory, `m80fp`.
+    Mf80,
+    /// A 16-bit integer in memory, `m16int`.
+    Mi16,
+    /// A 32-bit integer in memory, `m32int`.
+    Mi32,
+    /// A 64-bit integer in memory, `m64int`.
+    Mi64,
+    /// The `FLDENV`/`FNSTENV` area: 14 bytes at a 16-bit operand size, 28 at
+    /// a 32-bit one (*Intel SDM* volume 1 §8.1.10).
+    Mfenv,
+    /// The `FNSAVE`/`FRSTOR` area: the environment followed by the eight
+    /// registers, so 94 or 108 bytes.
+    Mfsave,
+    /// `ST(0)`, named implicitly.
+    St0,
+    /// `ST(i)`, named by the low three bits of the ModRM byte.
+    Sti,
+
+    // ---- SSE -----------------------------------------------------------
+    /// An `XMM` register from the ModRM `reg` field, extended by `REX.R`.
+    Vx,
+    /// An `XMM` register or a 128-bit memory operand, from ModRM r/m.
+    Wx,
+    /// An `XMM` register or a **64-bit** memory operand: the scalar-double and
+    /// `MOVQ` forms, where only half the register is transferred.
+    Wq,
+    /// An `XMM` register or a **32-bit** memory operand: the scalar-single
+    /// forms.
+    Wd,
+    /// An `XMM` register only — the ModRM mode field must be `11`. `MOVMSKPS`
+    /// and `MOVHLPS` have no memory form at all.
+    Ux,
+    /// A 64-bit memory operand only, no register form: `MOVLPS`, `MOVHPS`.
+    Mq,
+    /// The 512-byte `FXSAVE` area.
+    Mfx,
+    /// A general register or memory at four or eight bytes, chosen by `REX.W`
+    /// — Intel's `Ey`. `CVTSI2SD` reads one and `MOVD`/`MOVQ` move one.
+    Ey,
+    /// A general register from the ModRM `reg` field at four or eight bytes,
+    /// chosen by `REX.W` — Intel's `Gy`.
+    Gy,
 }
 
 impl Arg {
@@ -285,6 +362,55 @@ impl Arg {
             | Arg::Yv
             | Arg::Jv => Some(osz),
             Arg::None | Arg::M | Arg::Mp | Arg::Ms | Arg::Ap | Arg::Dx => None,
+            // The x87 and SSE operands carry no *general-register* width, and
+            // that is what this function answers: the interpreter's `size`
+            // comes from here and neither family uses it. Their widths are
+            // properties of the operand kind ([`Arg::fp_bytes`]) or of
+            // `REX.W`, not of the effective operand size. Listed one by one
+            // rather than swept up by a wildcard, so a new operand kind is a
+            // compile error here rather than a silent `None`.
+            Arg::Mf32
+            | Arg::Mf64
+            | Arg::Mf80
+            | Arg::Mi16
+            | Arg::Mi32
+            | Arg::Mi64
+            | Arg::Mfenv
+            | Arg::Mfsave
+            | Arg::St0
+            | Arg::Sti
+            | Arg::Vx
+            | Arg::Wx
+            | Arg::Wq
+            | Arg::Wd
+            | Arg::Ux
+            | Arg::Mq
+            | Arg::Mfx
+            | Arg::Ey
+            | Arg::Gy => None,
+        }
+    }
+
+    /// How many bytes of memory this operand occupies, where the operand kind
+    /// fixes it.
+    ///
+    /// The x87 and SSE memory forms have a width that has nothing to do with
+    /// the effective operand size — `FLD m64fp` reads eight bytes whatever
+    /// prefixes precede it — so it is a property of the [`Arg`] rather than
+    /// something the decoder computes. `osz` is consulted only for the two
+    /// x87 save areas, whose size really does follow the operand size
+    /// (*Intel SDM* volume 1 §8.1.10).
+    #[must_use]
+    pub const fn fp_bytes(self, osz: u8) -> Option<u8> {
+        match self {
+            Arg::Mf32 | Arg::Mi32 | Arg::Wd => Some(4),
+            Arg::Mf64 | Arg::Mi64 | Arg::Wq | Arg::Mq => Some(8),
+            Arg::Mf80 => Some(10),
+            Arg::Mi16 => Some(2),
+            Arg::Wx => Some(16),
+            Arg::Mfenv => Some(if osz == 2 { 14 } else { 28 }),
+            Arg::Mfsave => Some(if osz == 2 { 94 } else { 108 }),
+            _ => None,
         }
     }
 
@@ -308,7 +434,37 @@ impl Arg {
                 | Arg::Cd
                 | Arg::Dd
                 | Arg::Td
+                | Arg::Mf32
+                | Arg::Mf64
+                | Arg::Mf80
+                | Arg::Mi16
+                | Arg::Mi32
+                | Arg::Mi64
+                | Arg::Mfenv
+                | Arg::Mfsave
+                | Arg::Sti
+                | Arg::Vx
+                | Arg::Wx
+                | Arg::Wq
+                | Arg::Wd
+                | Arg::Ux
+                | Arg::Mq
+                | Arg::Mfx
+                | Arg::Ey
+                | Arg::Gy
         )
+    }
+
+    /// Whether this operand can reach memory through the ModRM byte.
+    ///
+    /// The interpreter computes an effective address only where one of the
+    /// operands could use it, and this is the list. It is [`Arg::needs_modrm`]
+    /// minus the four that name a register whatever the mode field says —
+    /// `Cd`, `Dd`, `Td` and `Rd` — plus nothing, because everything else that
+    /// decodes a ModRM byte has a memory form.
+    #[must_use]
+    pub const fn uses_modrm_memory(self) -> bool {
+        self.needs_modrm() && !matches!(self, Arg::Rd | Arg::Cd | Arg::Dd | Arg::Td | Arg::Ux)
     }
 
     /// How many immediate bytes follow the displacement for this operand,
@@ -410,6 +566,28 @@ pub enum Grp {
     /// `0F BA`: the bit-test group, `BT`/`BTS`/`BTR`/`BTC` with an immediate
     /// bit number. Intel's group 8; extensions 0-3 are undefined.
     Grp8,
+    /// `0F 12` and `0F 16`: one instruction with a memory operand and a
+    /// *different* one with a register operand — `MOVLPS xmm, m64` against
+    /// `MOVHLPS xmm, xmm`. The selector is the ModRM **mode** field rather
+    /// than its `reg` field, which is why [`resolve_modrm`] exists and
+    /// [`resolve_as`] alone cannot decide it.
+    ModAlt,
+    /// `0F C7`: Intel's group 9 — `CMPXCHG8B`, and `CMPXCHG16B` with `REX.W`.
+    Grp9,
+    /// `0F AE`: Intel's group 15 — `FXSAVE`, `FXRSTOR`, `LDMXCSR`, `STMXCSR`
+    /// and the three fences. The one group whose extension means a *memory*
+    /// instruction with `mod != 11` and a fence with `mod == 11`.
+    Grp15,
+    /// `D8`-`DF`: the x87 escapes.
+    ///
+    /// Two-dimensional in a way no other group is: with `mod != 11` the ModRM
+    /// `reg` field selects one of eight memory-form operations, and with
+    /// `mod == 11` the whole second byte — all sixty-four values of
+    /// `C0`-`FF` — selects a register-form one. Neither the escape byte nor
+    /// the full ModRM byte reaches [`resolve_as`], so this group is applied by
+    /// [`resolve_x87`] instead, from inside the stream decoder where both are
+    /// in hand.
+    X87,
 }
 
 /// Declare the operation enum, its mnemonics and its summaries in one list.
@@ -681,6 +859,173 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("SYSCALL", "syscall"),
     ("SYSRET", "sysret"),
     ("WRMSR", "wrmsr"),
+    ("CMPXCHG8B", "cmpxchg8b"),
+    // The x87 unit.
+    ("FABS", "fabs"),
+    ("FADD", "fadd"),
+    ("FADDP", "faddp"),
+    ("FCHS", "fchs"),
+    ("FCMOVB", "fcmovb"),
+    ("FCMOVBE", "fcmovbe"),
+    ("FCMOVE", "fcmove"),
+    ("FCMOVNB", "fcmovnb"),
+    ("FCMOVNBE", "fcmovnbe"),
+    ("FCMOVNE", "fcmovne"),
+    ("FCMOVNU", "fcmovnu"),
+    ("FCMOVU", "fcmovu"),
+    ("FCOM", "fcom"),
+    ("FCOMI", "fcomi"),
+    ("FCOMIP", "fcomip"),
+    ("FCOMP", "fcomp"),
+    ("FCOMPP", "fcompp"),
+    ("FDECSTP", "fdecstp"),
+    ("FDIV", "fdiv"),
+    ("FDIVP", "fdivp"),
+    ("FDIVR", "fdivr"),
+    ("FDIVRP", "fdivrp"),
+    ("FFREE", "ffree"),
+    ("FIADD", "fiadd"),
+    ("FICOM", "ficom"),
+    ("FICOMP", "ficomp"),
+    ("FIDIV", "fidiv"),
+    ("FIDIVR", "fidivr"),
+    ("FILD", "fild"),
+    ("FIMUL", "fimul"),
+    ("FINCSTP", "fincstp"),
+    ("FIST", "fist"),
+    ("FISTP", "fistp"),
+    ("FISUB", "fisub"),
+    ("FISUBR", "fisubr"),
+    ("FLD", "fld"),
+    ("FLD1", "fld1"),
+    ("FLDCW", "fldcw"),
+    ("FLDENV", "fldenv"),
+    ("FLDL2E", "fldl2e"),
+    ("FLDL2T", "fldl2t"),
+    ("FLDLG2", "fldlg2"),
+    ("FLDLN2", "fldln2"),
+    ("FLDPI", "fldpi"),
+    ("FLDZ", "fldz"),
+    ("FMUL", "fmul"),
+    ("FMULP", "fmulp"),
+    ("FNCLEX", "fnclex"),
+    ("FNINIT", "fninit"),
+    ("FNOP", "fnop"),
+    ("FNSAVE", "fnsave"),
+    ("FNSTCW", "fnstcw"),
+    ("FNSTENV", "fnstenv"),
+    ("FNSTSW", "fnstsw"),
+    ("FPREM", "fprem"),
+    ("FPREM1", "fprem1"),
+    ("FRNDINT", "frndint"),
+    ("FRSTOR", "frstor"),
+    ("FSCALE", "fscale"),
+    ("FSQRT", "fsqrt"),
+    ("FST", "fst"),
+    ("FSTP", "fstp"),
+    ("FSUB", "fsub"),
+    ("FSUBP", "fsubp"),
+    ("FSUBR", "fsubr"),
+    ("FSUBRP", "fsubrp"),
+    ("FTST", "ftst"),
+    ("FUCOM", "fucom"),
+    ("FUCOMI", "fucomi"),
+    ("FUCOMIP", "fucomip"),
+    ("FUCOMP", "fucomp"),
+    ("FUCOMPP", "fucompp"),
+    ("FXAM", "fxam"),
+    ("FXCH", "fxch"),
+    ("FXTRACT", "fxtract"),
+    // SSE and SSE2.
+    ("ADDPD", "addpd"),
+    ("ADDPS", "addps"),
+    ("ADDSD", "addsd"),
+    ("ADDSS", "addss"),
+    ("ANDNPD", "andnpd"),
+    ("ANDNPS", "andnps"),
+    ("ANDPD", "andpd"),
+    ("ANDPS", "andps"),
+    ("CMPPD", "cmppd"),
+    ("CMPPS", "cmpps"),
+    ("CMPSD", "cmpsd"),
+    ("CMPSS", "cmpss"),
+    ("COMISD", "comisd"),
+    ("COMISS", "comiss"),
+    ("CVTPD2PS", "cvtpd2ps"),
+    ("CVTPS2PD", "cvtps2pd"),
+    ("CVTSD2SI", "cvtsd2si"),
+    ("CVTSD2SS", "cvtsd2ss"),
+    ("CVTSI2SD", "cvtsi2sd"),
+    ("CVTSI2SS", "cvtsi2ss"),
+    ("CVTSS2SD", "cvtss2sd"),
+    ("CVTSS2SI", "cvtss2si"),
+    ("CVTTSD2SI", "cvttsd2si"),
+    ("CVTTSS2SI", "cvttss2si"),
+    ("DIVPD", "divpd"),
+    ("DIVPS", "divps"),
+    ("DIVSD", "divsd"),
+    ("DIVSS", "divss"),
+    ("FXRSTOR", "fxrstor"),
+    ("FXSAVE", "fxsave"),
+    ("LDMXCSR", "ldmxcsr"),
+    ("LFENCE", "lfence"),
+    ("MAXPD", "maxpd"),
+    ("MAXPS", "maxps"),
+    ("MAXSD", "maxsd"),
+    ("MAXSS", "maxss"),
+    ("MFENCE", "mfence"),
+    ("MINPD", "minpd"),
+    ("MINPS", "minps"),
+    ("MINSD", "minsd"),
+    ("MINSS", "minss"),
+    ("MOVAPD", "movapd"),
+    ("MOVAPS", "movaps"),
+    ("MOVD", "movd"),
+    ("MOVDQA", "movdqa"),
+    ("MOVDQU", "movdqu"),
+    ("MOVHLPS", "movhlps"),
+    ("MOVHPD", "movhpd"),
+    ("MOVHPS", "movhps"),
+    ("MOVLHPS", "movlhps"),
+    ("MOVLPD", "movlpd"),
+    ("MOVLPS", "movlps"),
+    ("MOVMSKPD", "movmskpd"),
+    ("MOVMSKPS", "movmskps"),
+    ("MOVQ", "movq"),
+    ("MOVSD", "movsd"),
+    ("MOVSS", "movss"),
+    ("MOVUPD", "movupd"),
+    ("MOVUPS", "movups"),
+    ("MULPD", "mulpd"),
+    ("MULPS", "mulps"),
+    ("MULSD", "mulsd"),
+    ("MULSS", "mulss"),
+    ("ORPD", "orpd"),
+    ("ORPS", "orps"),
+    ("PAND", "pand"),
+    ("PANDN", "pandn"),
+    ("POR", "por"),
+    ("PXOR", "pxor"),
+    ("SFENCE", "sfence"),
+    ("SHUFPD", "shufpd"),
+    ("SHUFPS", "shufps"),
+    ("SQRTPD", "sqrtpd"),
+    ("SQRTPS", "sqrtps"),
+    ("SQRTSD", "sqrtsd"),
+    ("SQRTSS", "sqrtss"),
+    ("STMXCSR", "stmxcsr"),
+    ("SUBPD", "subpd"),
+    ("SUBPS", "subps"),
+    ("SUBSD", "subsd"),
+    ("SUBSS", "subss"),
+    ("UCOMISD", "ucomisd"),
+    ("UCOMISS", "ucomiss"),
+    ("UNPCKHPD", "unpckhpd"),
+    ("UNPCKHPS", "unpckhps"),
+    ("UNPCKLPD", "unpcklpd"),
+    ("UNPCKLPS", "unpcklps"),
+    ("XORPD", "xorpd"),
+    ("XORPS", "xorps"),
 ];
 
 define_ops! {
@@ -885,6 +1230,177 @@ define_ops! {
     SWAPGS = "exchange the GS base with IA32_KERNEL_GS_BASE",
     SYSCALL = "fast call to the kernel entry point in LSTAR",
     SYSRET = "fast return from SYSCALL",
+
+    // ---- Pentium: the 64-bit compare and exchange ------------------------
+    CMPXCHG8B = "compare EDX:EAX with a 64-bit memory operand and exchange (CMPXCHG16B with REX.W)",
+
+    // ---- x87 -------------------------------------------------------------
+    FABS = "replace ST(0) with its magnitude",
+    FADD = "floating-point add",
+    FADDP = "floating-point add and pop",
+    FCHS = "invert the sign of ST(0)",
+    FCMOVB = "move ST(i) to ST(0) if below (carry set)",
+    FCMOVBE = "move ST(i) to ST(0) if below or equal",
+    FCMOVE = "move ST(i) to ST(0) if equal (zero set)",
+    FCMOVNB = "move ST(i) to ST(0) if not below (carry clear)",
+    FCMOVNBE = "move ST(i) to ST(0) if not below or equal",
+    FCMOVNE = "move ST(i) to ST(0) if not equal (zero clear)",
+    FCMOVNU = "move ST(i) to ST(0) if not unordered (parity odd)",
+    FCMOVU = "move ST(i) to ST(0) if unordered (parity even)",
+    FCOM = "compare ST(0) with the source, setting the condition codes",
+    FCOMI = "compare ST(0) with ST(i), setting ZF, PF and CF",
+    FCOMIP = "compare ST(0) with ST(i) into the flags, then pop",
+    FCOMP = "compare and pop",
+    FCOMPP = "compare and pop twice",
+    FDECSTP = "decrement the top-of-stack pointer, leaving the tags alone",
+    FDIV = "floating-point divide",
+    FDIVP = "floating-point divide and pop",
+    FDIVR = "floating-point divide, operands reversed",
+    FDIVRP = "floating-point reverse divide and pop",
+    FFREE = "mark ST(i) empty without moving the top-of-stack pointer",
+    FIADD = "add an integer from memory to ST(0)",
+    FICOM = "compare ST(0) with an integer from memory",
+    FICOMP = "compare ST(0) with an integer from memory and pop",
+    FIDIV = "divide ST(0) by an integer from memory",
+    FIDIVR = "divide an integer from memory by ST(0)",
+    FILD = "push an integer from memory, converted",
+    FIMUL = "multiply ST(0) by an integer from memory",
+    FINCSTP = "increment the top-of-stack pointer, leaving the tags alone",
+    FIST = "store ST(0) as an integer",
+    FISTP = "store ST(0) as an integer and pop",
+    FISUB = "subtract an integer from memory from ST(0)",
+    FISUBR = "subtract ST(0) from an integer from memory",
+    FLD = "push a floating-point value",
+    FLD1 = "push +1.0",
+    FLDCW = "load the control word",
+    FLDENV = "load the environment: the control, status and tag words and the pointers",
+    FLDL2E = "push log2(e)",
+    FLDL2T = "push log2(10)",
+    FLDLG2 = "push log10(2)",
+    FLDLN2 = "push ln(2)",
+    FLDPI = "push pi",
+    FLDZ = "push +0.0",
+    FMUL = "floating-point multiply",
+    FMULP = "floating-point multiply and pop",
+    FNCLEX = "clear the exception flags without checking for a pending one",
+    FNINIT = "reinitialise the unit without checking for a pending exception",
+    FNOP = "no operation",
+    FNSAVE = "store the environment and the eight registers, then reinitialise",
+    FNSTCW = "store the control word",
+    FNSTENV = "store the environment",
+    FNSTSW = "store the status word",
+    FPREM = "the partial remainder of ST(0) / ST(1), truncated quotient",
+    FPREM1 = "the IEEE partial remainder of ST(0) / ST(1)",
+    FRNDINT = "round ST(0) to an integer in the current rounding mode",
+    FRSTOR = "reload the environment and the eight registers",
+    FSCALE = "multiply ST(0) by 2 to the truncated ST(1)",
+    FSQRT = "the square root of ST(0)",
+    FST = "store ST(0)",
+    FSTP = "store ST(0) and pop",
+    FSUB = "floating-point subtract",
+    FSUBP = "floating-point subtract and pop",
+    FSUBR = "floating-point subtract, operands reversed",
+    FSUBRP = "floating-point reverse subtract and pop",
+    FTST = "compare ST(0) with +0.0",
+    FUCOM = "compare ST(0) with ST(i), quietly: a quiet NaN is not an invalid operand",
+    FUCOMI = "compare ST(0) with ST(i) quietly, into the flags",
+    FUCOMIP = "compare ST(0) with ST(i) quietly into the flags, then pop",
+    FUCOMP = "unordered compare and pop",
+    FUCOMPP = "unordered compare and pop twice",
+    FXAM = "classify ST(0) into the condition codes",
+    FXCH = "exchange ST(0) with ST(i)",
+    FXTRACT = "split ST(0) into its exponent and its significand",
+
+    // ---- SSE and SSE2 -----------------------------------------------------
+    ADDPD = "add two packed doubles",
+    ADDPS = "add four packed singles",
+    ADDSD = "add the low doubles",
+    ADDSS = "add the low singles",
+    ANDNPD = "bitwise AND NOT of packed doubles",
+    ANDNPS = "bitwise AND NOT of packed singles",
+    ANDPD = "bitwise AND of packed doubles",
+    ANDPS = "bitwise AND of packed singles",
+    CMPPD = "compare packed doubles under an immediate predicate",
+    CMPPS = "compare packed singles under an immediate predicate",
+    CMPSD = "compare the low doubles under an immediate predicate",
+    CMPSS = "compare the low singles under an immediate predicate",
+    COMISD = "compare the low doubles into the flags, signalling on any NaN",
+    COMISS = "compare the low singles into the flags, signalling on any NaN",
+    CVTPD2PS = "convert two packed doubles to two singles",
+    CVTPS2PD = "convert two packed singles to two doubles",
+    CVTSD2SI = "convert the low double to an integer, current rounding mode",
+    CVTSD2SS = "convert the low double to a single",
+    CVTSI2SD = "convert an integer to the low double",
+    CVTSI2SS = "convert an integer to the low single",
+    CVTSS2SD = "convert the low single to a double",
+    CVTSS2SI = "convert the low single to an integer, current rounding mode",
+    CVTTSD2SI = "convert the low double to an integer, truncating",
+    CVTTSS2SI = "convert the low single to an integer, truncating",
+    DIVPD = "divide packed doubles",
+    DIVPS = "divide packed singles",
+    DIVSD = "divide the low doubles",
+    DIVSS = "divide the low singles",
+    FXRSTOR = "reload the x87 and SSE state from a 512-byte area",
+    FXSAVE = "store the x87 and SSE state to a 512-byte area",
+    LDMXCSR = "load MXCSR",
+    LFENCE = "serialise loads",
+    MAXPD = "the larger of packed doubles",
+    MAXPS = "the larger of packed singles",
+    MAXSD = "the larger of the low doubles",
+    MAXSS = "the larger of the low singles",
+    MFENCE = "serialise loads and stores",
+    MINPD = "the smaller of packed doubles",
+    MINPS = "the smaller of packed singles",
+    MINSD = "the smaller of the low doubles",
+    MINSS = "the smaller of the low singles",
+    MOVAPD = "move two aligned packed doubles",
+    MOVAPS = "move four aligned packed singles",
+    MOVD = "move a doubleword between a general register and an XMM register",
+    MOVDQA = "move an aligned double quadword",
+    MOVDQU = "move an unaligned double quadword",
+    MOVHLPS = "move the high quadword of the source to the low quadword",
+    MOVHPD = "move a double to or from the high quadword",
+    MOVHPS = "move two singles to or from the high quadword",
+    MOVLHPS = "move the low quadword of the source to the high quadword",
+    MOVLPD = "move a double to or from the low quadword",
+    MOVLPS = "move two singles to or from the low quadword",
+    MOVMSKPD = "gather the sign bits of two packed doubles",
+    MOVMSKPS = "gather the sign bits of four packed singles",
+    MOVQ = "move a quadword",
+    MOVSD = "move the low double, zeroing the rest on a load from memory",
+    MOVSS = "move the low single, zeroing the rest on a load from memory",
+    MOVUPD = "move two unaligned packed doubles",
+    MOVUPS = "move four unaligned packed singles",
+    MULPD = "multiply packed doubles",
+    MULPS = "multiply packed singles",
+    MULSD = "multiply the low doubles",
+    MULSS = "multiply the low singles",
+    ORPD = "bitwise OR of packed doubles",
+    ORPS = "bitwise OR of packed singles",
+    PAND = "bitwise AND of a double quadword",
+    PANDN = "bitwise AND NOT of a double quadword",
+    POR = "bitwise OR of a double quadword",
+    PXOR = "bitwise exclusive OR of a double quadword",
+    SFENCE = "serialise stores",
+    SHUFPD = "select one double from each source under an immediate",
+    SHUFPS = "select two singles from each source under an immediate",
+    SQRTPD = "the square roots of packed doubles",
+    SQRTPS = "the square roots of packed singles",
+    SQRTSD = "the square root of the low double",
+    SQRTSS = "the square root of the low single",
+    STMXCSR = "store MXCSR",
+    SUBPD = "subtract packed doubles",
+    SUBPS = "subtract packed singles",
+    SUBSD = "subtract the low doubles",
+    SUBSS = "subtract the low singles",
+    UCOMISD = "compare the low doubles into the flags, quietly",
+    UCOMISS = "compare the low singles into the flags, quietly",
+    UNPCKHPD = "interleave the high doubles",
+    UNPCKHPS = "interleave the high singles",
+    UNPCKLPD = "interleave the low doubles",
+    UNPCKLPS = "interleave the low singles",
+    XORPD = "bitwise exclusive OR of packed doubles",
+    XORPS = "bitwise exclusive OR of packed singles",
 }
 
 impl Op {
@@ -1047,6 +1563,249 @@ impl Op {
         matches!(self, Op::CMPSB | Op::CMPSW | Op::SCASB | Op::SCASW)
     }
 
+    /// Whether this is an x87 instruction.
+    ///
+    /// Which matters twice over: these are the encodings `CR0.EM` and
+    /// `CR0.TS` divert to `#NM`, and — with the exception of
+    /// [`Op::x87_no_wait`] — the ones that first check for a pending unmasked
+    /// exception and take `#MF` (*Intel SDM* volume 1 §8.7).
+    #[must_use]
+    pub const fn is_x87(self) -> bool {
+        matches!(
+            self,
+            Op::FABS
+                | Op::FADD
+                | Op::FADDP
+                | Op::FCHS
+                | Op::FCMOVB
+                | Op::FCMOVBE
+                | Op::FCMOVE
+                | Op::FCMOVNB
+                | Op::FCMOVNBE
+                | Op::FCMOVNE
+                | Op::FCMOVNU
+                | Op::FCMOVU
+                | Op::FCOM
+                | Op::FCOMI
+                | Op::FCOMIP
+                | Op::FCOMP
+                | Op::FCOMPP
+                | Op::FDECSTP
+                | Op::FDIV
+                | Op::FDIVP
+                | Op::FDIVR
+                | Op::FDIVRP
+                | Op::FFREE
+                | Op::FIADD
+                | Op::FICOM
+                | Op::FICOMP
+                | Op::FIDIV
+                | Op::FIDIVR
+                | Op::FILD
+                | Op::FIMUL
+                | Op::FINCSTP
+                | Op::FIST
+                | Op::FISTP
+                | Op::FISUB
+                | Op::FISUBR
+                | Op::FLD
+                | Op::FLD1
+                | Op::FLDCW
+                | Op::FLDENV
+                | Op::FLDL2E
+                | Op::FLDL2T
+                | Op::FLDLG2
+                | Op::FLDLN2
+                | Op::FLDPI
+                | Op::FLDZ
+                | Op::FMUL
+                | Op::FMULP
+                | Op::FNCLEX
+                | Op::FNINIT
+                | Op::FNOP
+                | Op::FNSAVE
+                | Op::FNSTCW
+                | Op::FNSTENV
+                | Op::FNSTSW
+                | Op::FPREM
+                | Op::FPREM1
+                | Op::FRNDINT
+                | Op::FRSTOR
+                | Op::FSCALE
+                | Op::FSQRT
+                | Op::FST
+                | Op::FSTP
+                | Op::FSUB
+                | Op::FSUBP
+                | Op::FSUBR
+                | Op::FSUBRP
+                | Op::FTST
+                | Op::FUCOM
+                | Op::FUCOMI
+                | Op::FUCOMIP
+                | Op::FUCOMP
+                | Op::FUCOMPP
+                | Op::FXAM
+                | Op::FXCH
+                | Op::FXTRACT
+        )
+    }
+
+    /// Whether this x87 instruction runs **without** first taking a pending
+    /// unmasked exception.
+    ///
+    /// The six "no-wait" forms exist precisely so that an `#MF` handler can
+    /// look at the state and clear it without the pending exception firing
+    /// again underneath it (*Intel SDM* volume 1 §8.3.3). `FNSTSW` is the one
+    /// that matters most: reading the status word is how a handler finds out
+    /// what happened.
+    #[must_use]
+    pub const fn x87_no_wait(self) -> bool {
+        matches!(
+            self,
+            Op::FNCLEX | Op::FNINIT | Op::FNSTCW | Op::FNSTSW | Op::FNSTENV | Op::FNSAVE
+        )
+    }
+
+    /// Whether this x87 instruction leaves the instruction pointer, data
+    /// pointer and opcode alone.
+    ///
+    /// The nine control instructions, and only those (*Intel SDM* volume 1
+    /// §8.1.8). An exception handler's own `FNSTENV` has to describe the
+    /// instruction that faulted rather than itself, which is what makes this
+    /// a correctness rule and not bookkeeping — and the *data* pointer is the
+    /// half that goes wrong quietly, because an `FNSTENV` that updated it
+    /// would overwrite it with the address of its own save area.
+    ///
+    /// `FDECSTP`, `FINCSTP`, `FFREE` and `FNOP` are deliberately **not** here:
+    /// they are ordinary instructions that happen to do very little.
+    #[must_use]
+    pub const fn x87_freezes_pointers(self) -> bool {
+        matches!(
+            self,
+            Op::FNINIT
+                | Op::FNCLEX
+                | Op::FLDCW
+                | Op::FNSTCW
+                | Op::FNSTSW
+                | Op::FLDENV
+                | Op::FNSTENV
+                | Op::FRSTOR
+                | Op::FNSAVE
+        )
+    }
+
+    /// Whether this is an SSE or SSE2 instruction.
+    ///
+    /// The gate is `CR4.OSFXSR` plus the `SSE`/`SSE2` feature, not `CR0.EM` —
+    /// `CR0.EM` set makes an SSE instruction `#UD` rather than `#NM`, because
+    /// there is no software-emulation protocol for SSE the way there is for
+    /// x87 (*Intel SDM* volume 1 §11.5.1 and volume 3 table 2-2).
+    #[must_use]
+    pub const fn is_sse(self) -> bool {
+        matches!(
+            self,
+            Op::ADDPD
+                | Op::ADDPS
+                | Op::ADDSD
+                | Op::ADDSS
+                | Op::ANDNPD
+                | Op::ANDNPS
+                | Op::ANDPD
+                | Op::ANDPS
+                | Op::CMPPD
+                | Op::CMPPS
+                | Op::CMPSD
+                | Op::CMPSS
+                | Op::COMISD
+                | Op::COMISS
+                | Op::CVTPD2PS
+                | Op::CVTPS2PD
+                | Op::CVTSD2SI
+                | Op::CVTSD2SS
+                | Op::CVTSI2SD
+                | Op::CVTSI2SS
+                | Op::CVTSS2SD
+                | Op::CVTSS2SI
+                | Op::CVTTSD2SI
+                | Op::CVTTSS2SI
+                | Op::DIVPD
+                | Op::DIVPS
+                | Op::DIVSD
+                | Op::DIVSS
+                | Op::LDMXCSR
+                | Op::MAXPD
+                | Op::MAXPS
+                | Op::MAXSD
+                | Op::MAXSS
+                | Op::MINPD
+                | Op::MINPS
+                | Op::MINSD
+                | Op::MINSS
+                | Op::MOVAPD
+                | Op::MOVAPS
+                | Op::MOVD
+                | Op::MOVDQA
+                | Op::MOVDQU
+                | Op::MOVHLPS
+                | Op::MOVHPD
+                | Op::MOVHPS
+                | Op::MOVLHPS
+                | Op::MOVLPD
+                | Op::MOVLPS
+                | Op::MOVMSKPD
+                | Op::MOVMSKPS
+                | Op::MOVQ
+                | Op::MOVSD
+                | Op::MOVSS
+                | Op::MOVUPD
+                | Op::MOVUPS
+                | Op::MULPD
+                | Op::MULPS
+                | Op::MULSD
+                | Op::MULSS
+                | Op::ORPD
+                | Op::ORPS
+                | Op::PAND
+                | Op::PANDN
+                | Op::POR
+                | Op::PXOR
+                | Op::SHUFPD
+                | Op::SHUFPS
+                | Op::SQRTPD
+                | Op::SQRTPS
+                | Op::SQRTSD
+                | Op::SQRTSS
+                | Op::STMXCSR
+                | Op::SUBPD
+                | Op::SUBPS
+                | Op::SUBSD
+                | Op::SUBSS
+                | Op::UCOMISD
+                | Op::UCOMISS
+                | Op::UNPCKHPD
+                | Op::UNPCKHPS
+                | Op::UNPCKLPD
+                | Op::UNPCKLPS
+                | Op::XORPD
+                | Op::XORPS
+        )
+    }
+
+    /// Whether this operation is dispatched to the SIMD unit.
+    ///
+    /// [`Op::is_sse`] plus the five that share its opcode group without being
+    /// SSE arithmetic: the two save/restore instructions and the three fences,
+    /// each of which has its own gating rule.
+    #[must_use]
+    pub const fn is_simd(self) -> bool {
+        self.is_sse()
+            || matches!(
+                self,
+                Op::FXSAVE | Op::FXRSTOR | Op::LFENCE | Op::MFENCE | Op::SFENCE
+            )
+    }
+
     /// Internal execution clocks, excluding every bus transfer.
     ///
     /// Intel's timing tables give a *total* that already contains the transfer
@@ -1126,6 +1885,42 @@ impl Op {
             Op::CMPXCHG | Op::XADD => 6,
             Op::BSWAP => 1,
             Op::INSB | Op::INSW | Op::OUTSB | Op::OUTSW => 9,
+            // The x87 unit, from the i486 microprocessor's instruction-timing
+            // table (the 387's figures restated for the on-die unit). The
+            // spread between best and worst case is enormous for the
+            // iterative operations, and the low end is quoted as it is
+            // everywhere else in this table.
+            Op::FADD | Op::FADDP | Op::FSUB | Op::FSUBP | Op::FSUBR | Op::FSUBRP => 8,
+            Op::FIADD | Op::FISUB | Op::FISUBR => 20,
+            Op::FMUL | Op::FMULP => 16,
+            Op::FIMUL => 23,
+            Op::FDIV | Op::FDIVP | Op::FDIVR | Op::FDIVRP => 73,
+            Op::FIDIV | Op::FIDIVR => 85,
+            Op::FSQRT => 83,
+            Op::FPREM => 70,
+            Op::FPREM1 => 72,
+            Op::FRNDINT => 21,
+            Op::FSCALE => 30,
+            Op::FXTRACT => 16,
+            Op::FLD | Op::FST | Op::FSTP | Op::FXCH => 4,
+            Op::FILD => 13,
+            Op::FIST | Op::FISTP => 29,
+            Op::FCOM | Op::FCOMP | Op::FCOMPP | Op::FUCOM | Op::FUCOMP | Op::FUCOMPP => 4,
+            Op::FICOM | Op::FICOMP => 16,
+            Op::FCOMI | Op::FCOMIP | Op::FUCOMI | Op::FUCOMIP => 4,
+            Op::FLDCW => 4,
+            Op::FLDENV => 34,
+            Op::FNSTENV => 67,
+            Op::FNSAVE => 143,
+            Op::FRSTOR => 131,
+            Op::FNINIT => 17,
+            // The SSE unit. A Pentium III issues most of these in one to five
+            // clocks; the divides and square roots are the exception.
+            Op::DIVSS | Op::DIVPS => 18,
+            Op::DIVSD | Op::DIVPD => 32,
+            Op::SQRTSS | Op::SQRTPS => 28,
+            Op::SQRTSD | Op::SQRTPD => 57,
+            Op::FXSAVE | Op::FXRSTOR => 100,
             // An undefined encoding costs nothing: it raises #UD instead of
             // executing, and the exception sequence charges its own clocks.
             Op::UD => 0,
@@ -1659,6 +2454,19 @@ const PRIMARY_386: ([Insn; 256], [bool; 256]) = opmap! {
     0xc8 ENTER Iw   Ib   None   Documented;
     0xc9 LEAVE None None None   Documented;
 
+    // The eight escapes stop being "compute an address for a coprocessor on
+    // the other side of the bus" and become the on-die x87 unit's opcode
+    // space. The row keeps [`Op::ESC`] because the real operation is not
+    // known until the ModRM byte has been read: see [`Grp::X87`].
+    0xd8 ESC  Ev   None X87    Escape;
+    0xd9 ESC  Ev   None X87    Escape;
+    0xda ESC  Ev   None X87    Escape;
+    0xdb ESC  Ev   None X87    Escape;
+    0xdc ESC  Ev   None X87    Escape;
+    0xdd ESC  Ev   None X87    Escape;
+    0xde ESC  Ev   None X87    Escape;
+    0xdf ESC  Ev   None X87    Escape;
+
     // `F1` is the in-circuit-emulator breakpoint, interrupt 1. Undocumented
     // by Intel, implemented by every part from the 386 on, and used by
     // debuggers precisely because it is one byte and not `CC`.
@@ -1699,6 +2507,37 @@ const SECONDARY: ([Insn; 256], [bool; 256]) = opmap! {
     // Programmer's Manual* volume 3, `SYSCALL`; *Intel SDM* volume 2).
     0x05 UD    None None None   Undefined  => (SYSCALL None None);
     0x07 UD    None None None   Undefined  => (SYSRET None None);
+
+    // SSE, with no mandatory prefix: the packed-single half. Every one of
+    // these is a different instruction under `66`, `F3` or `F2` — see
+    // [`TABLE_0F_66`] and its two siblings.
+    0x10 MOVUPS   Vx Wx None   Documented;
+    0x11 MOVUPS   Wx Vx None   Documented;
+    0x12 MOVLPS   Vx Mq ModAlt Documented;
+    0x13 MOVLPS   Mq Vx ModAlt Documented;
+    0x14 UNPCKLPS Vx Wx None   Documented;
+    0x15 UNPCKHPS Vx Wx None   Documented;
+    0x16 MOVHPS   Vx Mq ModAlt Documented;
+    0x17 MOVHPS   Mq Vx ModAlt Documented;
+    0x28 MOVAPS   Vx Wx None   Documented;
+    0x29 MOVAPS   Wx Vx None   Documented;
+    0x2e UCOMISS  Vx Wd None   Documented;
+    0x2f COMISS   Vx Wd None   Documented;
+    0x50 MOVMSKPS Gy Ux None   Documented;
+    0x51 SQRTPS   Vx Wx None   Documented;
+    0x54 ANDPS    Vx Wx None   Documented;
+    0x55 ANDNPS   Vx Wx None   Documented;
+    0x56 ORPS     Vx Wx None   Documented;
+    0x57 XORPS    Vx Wx None   Documented;
+    0x58 ADDPS    Vx Wx None   Documented;
+    0x59 MULPS    Vx Wx None   Documented;
+    // The source is two singles, so it is a *quadword* even though the
+    // destination is a full register.
+    0x5a CVTPS2PD Vx Wq None   Documented;
+    0x5c SUBPS    Vx Wx None   Documented;
+    0x5d MINPS    Vx Wx None   Documented;
+    0x5e DIVPS    Vx Wx None   Documented;
+    0x5f MAXPS    Vx Wx None   Documented;
 
     0x20 MOV   Rd   Cd   None   Documented;
     0x21 MOV   Rd   Dd   None   Documented;
@@ -1794,8 +2633,18 @@ const SECONDARY: ([Insn; 256], [bool; 256]) = opmap! {
     0xbe MOVSX Gv   Eb   None   Documented;
     0xbf MOVSX Gv   Ew   None   Documented;
 
+    // Intel's group 15: the two save/restore instructions, the two `MXCSR`
+    // moves, and the three fences — which share the opcode and are told apart
+    // by the ModRM *mode* field rather than by `reg` alone.
+    0xae FXSAVE Mfx None Grp15  Documented;
+
     0xc0 XADD  Eb   Gb   None   Documented;
     0xc1 XADD  Ev   Gv   None   Documented;
+    0xc2 CMPPS Vx   Wx  +Ib     None   Documented;
+    0xc6 SHUFPS Vx  Wx  +Ib     None   Documented;
+    // Intel's group 9: the only member is the 64-bit compare-and-exchange,
+    // which becomes the 128-bit one under `REX.W`.
+    0xc7 CMPXCHG8B M None Grp9  Documented;
     0xc8 BSWAP Rv   None None   Documented;
     0xc9 BSWAP Rv   None None   Documented;
     0xca BSWAP Rv   None None   Documented;
@@ -1806,11 +2655,156 @@ const SECONDARY: ([Insn; 256], [bool; 256]) = opmap! {
     0xcf BSWAP Rv   None None   Documented;
 };
 
-/// The two-byte (`0F`) decode table.
+/// The two-byte (`0F`) decode table with no mandatory prefix.
 pub static TABLE_0F: [Insn; 256] = SECONDARY.0;
 
 /// Which two-byte encodings are assigned. The rest raise `#UD`.
 pub static LISTED_0F: [bool; 256] = SECONDARY.1;
+
+/// The two-byte map as a `66` prefix decodes it: SSE2's packed-double and
+/// packed-integer half.
+///
+/// A **delta** on [`TABLE_0F`], for the same reason [`TABLE_386`] is a delta
+/// on [`TABLE`]: `66 0F B6` is still `MOVZX` with a 16-bit operand size, and a
+/// second full table would be two places to forget. Where a row *is* listed
+/// here the `66` has stopped being an operand-size override and become part of
+/// the opcode — Intel calls it a **mandatory prefix** (*SDM* volume 2 §2.1.1)
+/// — so the effective operand size means nothing to it.
+const SECONDARY_66: ([Insn; 256], [bool; 256]) = opmap! {
+    base SECONDARY.0;
+
+    0x10 MOVUPD   Vx Wx None   Documented;
+    0x11 MOVUPD   Wx Vx None   Documented;
+    0x12 MOVLPD   Vx Mq ModAlt Documented;
+    0x13 MOVLPD   Mq Vx ModAlt Documented;
+    0x14 UNPCKLPD Vx Wx None   Documented;
+    0x15 UNPCKHPD Vx Wx None   Documented;
+    0x16 MOVHPD   Vx Mq ModAlt Documented;
+    0x17 MOVHPD   Mq Vx ModAlt Documented;
+    0x28 MOVAPD   Vx Wx None   Documented;
+    0x29 MOVAPD   Wx Vx None   Documented;
+    0x2e UCOMISD  Vx Wq None   Documented;
+    0x2f COMISD   Vx Wq None   Documented;
+    0x50 MOVMSKPD Gy Ux None   Documented;
+    0x51 SQRTPD   Vx Wx None   Documented;
+    0x54 ANDPD    Vx Wx None   Documented;
+    0x55 ANDNPD   Vx Wx None   Documented;
+    0x56 ORPD     Vx Wx None   Documented;
+    0x57 XORPD    Vx Wx None   Documented;
+    0x58 ADDPD    Vx Wx None   Documented;
+    0x59 MULPD    Vx Wx None   Documented;
+    0x5a CVTPD2PS Vx Wx None   Documented;
+    0x5c SUBPD    Vx Wx None   Documented;
+    0x5d MINPD    Vx Wx None   Documented;
+    0x5e DIVPD    Vx Wx None   Documented;
+    0x5f MAXPD    Vx Wx None   Documented;
+    0x6e MOVD     Vx Ey None   Documented;
+    0x6f MOVDQA   Vx Wx None   Documented;
+    0x7e MOVD     Ey Vx None   Documented;
+    0x7f MOVDQA   Wx Vx None   Documented;
+    0xc2 CMPPD    Vx Wx +Ib None Documented;
+    0xc6 SHUFPD   Vx Wx +Ib None Documented;
+    0xd6 MOVQ     Wq Vx None   Documented;
+    0xdb PAND     Vx Wx None   Documented;
+    0xdf PANDN    Vx Wx None   Documented;
+    0xeb POR      Vx Wx None   Documented;
+    0xef PXOR     Vx Wx None   Documented;
+};
+
+/// The two-byte map with a `66` mandatory prefix.
+pub static TABLE_0F_66: [Insn; 256] = SECONDARY_66.0;
+
+/// Which rows the `66` map changes.
+pub static CHANGED_0F_66: [bool; 256] = SECONDARY_66.1;
+
+/// The two-byte map as an `F3` prefix decodes it: the scalar-single half.
+const SECONDARY_F3: ([Insn; 256], [bool; 256]) = opmap! {
+    base SECONDARY.0;
+
+    0x10 MOVSS     Vx Wd None Documented;
+    0x11 MOVSS     Wd Vx None Documented;
+    0x2a CVTSI2SS  Vx Ey None Documented;
+    0x2c CVTTSS2SI Gy Wd None Documented;
+    0x2d CVTSS2SI  Gy Wd None Documented;
+    0x51 SQRTSS    Vx Wd None Documented;
+    0x58 ADDSS     Vx Wd None Documented;
+    0x59 MULSS     Vx Wd None Documented;
+    0x5a CVTSS2SD  Vx Wd None Documented;
+    0x5c SUBSS     Vx Wd None Documented;
+    0x5d MINSS     Vx Wd None Documented;
+    0x5e DIVSS     Vx Wd None Documented;
+    0x5f MAXSS     Vx Wd None Documented;
+    0x6f MOVDQU    Vx Wx None Documented;
+    // `F3 0F 7E` reads a quadword and **zeroes the upper half** of the
+    // destination, which is what makes it different from `66 0F D6` writing
+    // the same quadword the other way.
+    0x7e MOVQ      Vx Wq None Documented;
+    0x7f MOVDQU    Wx Vx None Documented;
+    0xc2 CMPSS     Vx Wd +Ib None Documented;
+};
+
+/// The two-byte map with an `F3` mandatory prefix.
+pub static TABLE_0F_F3: [Insn; 256] = SECONDARY_F3.0;
+
+/// Which rows the `F3` map changes.
+pub static CHANGED_0F_F3: [bool; 256] = SECONDARY_F3.1;
+
+/// The two-byte map as an `F2` prefix decodes it: the scalar-double half.
+const SECONDARY_F2: ([Insn; 256], [bool; 256]) = opmap! {
+    base SECONDARY.0;
+
+    0x10 MOVSD     Vx Wq None Documented;
+    0x11 MOVSD     Wq Vx None Documented;
+    0x2a CVTSI2SD  Vx Ey None Documented;
+    0x2c CVTTSD2SI Gy Wq None Documented;
+    0x2d CVTSD2SI  Gy Wq None Documented;
+    0x51 SQRTSD    Vx Wq None Documented;
+    0x58 ADDSD     Vx Wq None Documented;
+    0x59 MULSD     Vx Wq None Documented;
+    0x5a CVTSD2SS  Vx Wq None Documented;
+    0x5c SUBSD     Vx Wq None Documented;
+    0x5d MINSD     Vx Wq None Documented;
+    0x5e DIVSD     Vx Wq None Documented;
+    0x5f MAXSD     Vx Wq None Documented;
+    0xc2 CMPSD     Vx Wq +Ib None Documented;
+};
+
+/// The two-byte map with an `F2` mandatory prefix.
+pub static TABLE_0F_F2: [Insn; 256] = SECONDARY_F2.0;
+
+/// Which rows the `F2` map changes.
+pub static CHANGED_0F_F2: [bool; 256] = SECONDARY_F2.1;
+
+/// Which mandatory prefix a two-byte opcode carried.
+///
+/// `F2` and `F3` outrank `66`: a `66 F3 0F 10` is `MOVSS`, not `MOVUPD`
+/// (*Intel SDM* volume 2 §2.1.1). Nothing else about the prefixes changes —
+/// an `F3` here is still recorded as a repeat prefix in [`Fields::rep`], so a
+/// disassembler can show what the bytes said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Mandatory {
+    /// No mandatory prefix: the plain [`TABLE_0F`].
+    #[default]
+    None,
+    /// `66`.
+    P66,
+    /// `F3`.
+    PF3,
+    /// `F2`.
+    PF2,
+}
+
+/// Decode one two-byte opcode under a mandatory prefix.
+#[inline]
+#[must_use]
+pub const fn decode_0f_as(prefix: Mandatory, opcode: u8) -> Insn {
+    match prefix {
+        Mandatory::None => TABLE_0F[opcode as usize],
+        Mandatory::P66 => TABLE_0F_66[opcode as usize],
+        Mandatory::PF3 => TABLE_0F_F3[opcode as usize],
+        Mandatory::PF2 => TABLE_0F_F2[opcode as usize],
+    }
+}
 
 /// `80`-`83`: the ModRM `reg` field picks one of the eight ALU operations.
 ///
@@ -1967,6 +2961,397 @@ pub static GROUP8: [Insn; 8] = [
     Insn::new(Op::BTC, Arg::Ev, Arg::Ib, Grp::None, Class::Documented),
 ];
 
+/// `0F C7`: Intel's group 9. Only extension 1 is assigned.
+///
+/// The operand is written as [`Arg::M`] rather than a sized one because the
+/// width is not the effective operand size and not a mandatory prefix's
+/// business either: it is eight bytes, or sixteen with `REX.W`, and the
+/// interpreter reads it as two halves regardless.
+pub static GROUP9: [Insn; 8] = {
+    let mut t = [UNASSIGNED; 8];
+    t[1] = Insn::new(
+        Op::CMPXCHG8B,
+        Arg::M,
+        Arg::None,
+        Grp::None,
+        Class::Documented,
+    );
+    t
+};
+
+/// `0F AE` with `mod != 11`: Intel's group 15's memory forms.
+pub static GROUP15: [Insn; 8] = [
+    Insn::new(
+        Op::FXSAVE,
+        Arg::Mfx,
+        Arg::None,
+        Grp::None,
+        Class::Documented,
+    ),
+    Insn::new(
+        Op::FXRSTOR,
+        Arg::None,
+        Arg::Mfx,
+        Grp::None,
+        Class::Documented,
+    ),
+    Insn::new(
+        Op::LDMXCSR,
+        Arg::None,
+        Arg::Ed,
+        Grp::None,
+        Class::Documented,
+    ),
+    Insn::new(
+        Op::STMXCSR,
+        Arg::Ed,
+        Arg::None,
+        Grp::None,
+        Class::Documented,
+    ),
+    UNASSIGNED,
+    UNASSIGNED,
+    UNASSIGNED,
+    UNASSIGNED,
+];
+
+/// `0F AE` with `mod == 11`: the three fences.
+///
+/// One core with one bus has nothing to reorder, so each of these is a
+/// documented no-operation here rather than an unimplemented instruction —
+/// and saying so is the point: a guest that executes `MFENCE` gets the
+/// ordering it asked for, because there is no weaker ordering to get.
+pub static GROUP15_REG: [Insn; 8] = [
+    UNASSIGNED,
+    UNASSIGNED,
+    UNASSIGNED,
+    UNASSIGNED,
+    UNASSIGNED,
+    Insn::new(
+        Op::LFENCE,
+        Arg::None,
+        Arg::None,
+        Grp::None,
+        Class::Documented,
+    ),
+    Insn::new(
+        Op::MFENCE,
+        Arg::None,
+        Arg::None,
+        Grp::None,
+        Class::Documented,
+    ),
+    Insn::new(
+        Op::SFENCE,
+        Arg::None,
+        Arg::None,
+        Grp::None,
+        Class::Documented,
+    ),
+];
+
+/// Apply every group whose selector needs the **whole** ModRM byte.
+///
+/// [`resolve_as`] answers for the groups the `reg` field decides on its own.
+/// Three do not: the x87 escapes need the escape byte too, group 15 means a
+/// fence or a memory instruction depending on the mode field, and `0F 12` and
+/// `0F 16` are a different instruction entirely with a register operand. This
+/// is the one place that knows, and [`decode_stream_as`] calls it so that the
+/// interpreter and the disassembler still read one description.
+#[must_use]
+pub const fn resolve_modrm(map: Gen, insn: Insn, opcode: u8, two_byte: bool, modrm: ModRm) -> Insn {
+    if matches!(insn.group, Grp::X87) && !two_byte {
+        return resolve_x87(opcode, modrm);
+    }
+    let idx = (modrm.reg & 7) as usize;
+    match insn.group {
+        Grp::Grp9 => {
+            if modrm.md == 3 {
+                // `0F C7` with a register operand is not an instruction: the
+                // whole point of a compare-and-exchange is the memory
+                // location.
+                UNASSIGNED
+            } else {
+                GROUP9[idx]
+            }
+        }
+        Grp::Grp15 => {
+            if modrm.md == 3 {
+                GROUP15_REG[idx]
+            } else {
+                GROUP15[idx]
+            }
+        }
+        Grp::ModAlt => {
+            if modrm.md != 3 {
+                return insn;
+            }
+            // Only the **load** direction has a register encoding, and there
+            // it is a different instruction: `MOVLPS xmm, xmm` is `MOVHLPS`
+            // and `MOVHPS xmm, xmm` is `MOVLHPS`. The store direction
+            // (`0F 13`, `0F 17`) has none at all — its whole point is the
+            // memory operand — and neither packed-double form has one in
+            // either direction.
+            match (insn.op, insn.dst) {
+                (Op::MOVLPS, Arg::Vx) => {
+                    Insn::new(Op::MOVHLPS, Arg::Vx, Arg::Ux, Grp::None, Class::Documented)
+                }
+                (Op::MOVHPS, Arg::Vx) => {
+                    Insn::new(Op::MOVLHPS, Arg::Vx, Arg::Ux, Grp::None, Class::Documented)
+                }
+                _ => UNASSIGNED,
+            }
+        }
+        _ => resolve_as(map, insn, modrm.reg),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The x87 escapes
+// ---------------------------------------------------------------------------
+
+/// Build one x87 sub-table from `start count op dst src class;` rows.
+///
+/// The count is there because the register forms come in runs of eight — one
+/// per `ST(i)` — and writing sixty-four near-identical rows per escape would
+/// bury the eight that are *not* part of a run, which are exactly the ones
+/// worth reading.
+macro_rules! x87map {
+    ($n:literal; $($start:literal x $count:literal $op:ident $dst:ident $src:ident $class:ident;)*) => {{
+        let mut t: [Insn; $n] = [UNASSIGNED; $n];
+        $({
+            let mut i = 0usize;
+            while i < $count {
+                t[$start + i] =
+                    Insn::new(Op::$op, Arg::$dst, Arg::$src, Grp::None, Class::$class);
+                i += 1;
+            }
+        })*
+        t
+    }};
+}
+
+/// `D8`-`DF` with `mod != 11`: the ModRM `reg` field selects one of eight
+/// memory-form operations, indexed `[escape & 7][reg]`.
+///
+/// *Intel SDM* volume 2 appendix A.4, tables A-16 through A-23 (the even
+/// halves). An unassigned slot is a genuine `#UD`, not a fall-through.
+pub static X87_MEM: [[Insn; 8]; 8] = [
+    // D8: single-precision arithmetic.
+    x87map! { 8;
+        0 x 1 FADD  St0 Mf32 Documented;
+        1 x 1 FMUL  St0 Mf32 Documented;
+        2 x 1 FCOM  St0 Mf32 Documented;
+        3 x 1 FCOMP St0 Mf32 Documented;
+        4 x 1 FSUB  St0 Mf32 Documented;
+        5 x 1 FSUBR St0 Mf32 Documented;
+        6 x 1 FDIV  St0 Mf32 Documented;
+        7 x 1 FDIVR St0 Mf32 Documented;
+    },
+    // D9: single-precision load and store, and the environment.
+    x87map! { 8;
+        0 x 1 FLD     None  Mf32  Documented;
+        2 x 1 FST     Mf32  None  Documented;
+        3 x 1 FSTP    Mf32  None  Documented;
+        4 x 1 FLDENV  None  Mfenv Documented;
+        5 x 1 FLDCW   None  Ew    Documented;
+        6 x 1 FNSTENV Mfenv None  Documented;
+        7 x 1 FNSTCW  Ew    None  Documented;
+    },
+    // DA: 32-bit integer arithmetic.
+    x87map! { 8;
+        0 x 1 FIADD  St0 Mi32 Documented;
+        1 x 1 FIMUL  St0 Mi32 Documented;
+        2 x 1 FICOM  St0 Mi32 Documented;
+        3 x 1 FICOMP St0 Mi32 Documented;
+        4 x 1 FISUB  St0 Mi32 Documented;
+        5 x 1 FISUBR St0 Mi32 Documented;
+        6 x 1 FIDIV  St0 Mi32 Documented;
+        7 x 1 FIDIVR St0 Mi32 Documented;
+    },
+    // DB: 32-bit integer transfer, and the 80-bit memory format. `/1` is
+    // `FISTTP`, which arrived with SSE3 and is not implemented here.
+    x87map! { 8;
+        0 x 1 FILD  None Mi32 Documented;
+        2 x 1 FIST  Mi32 None Documented;
+        3 x 1 FISTP Mi32 None Documented;
+        5 x 1 FLD   None Mf80 Documented;
+        7 x 1 FSTP  Mf80 None Documented;
+    },
+    // DC: double-precision arithmetic.
+    x87map! { 8;
+        0 x 1 FADD  St0 Mf64 Documented;
+        1 x 1 FMUL  St0 Mf64 Documented;
+        2 x 1 FCOM  St0 Mf64 Documented;
+        3 x 1 FCOMP St0 Mf64 Documented;
+        4 x 1 FSUB  St0 Mf64 Documented;
+        5 x 1 FSUBR St0 Mf64 Documented;
+        6 x 1 FDIV  St0 Mf64 Documented;
+        7 x 1 FDIVR St0 Mf64 Documented;
+    },
+    // DD: double-precision transfer, and the whole-unit save and restore.
+    x87map! { 8;
+        0 x 1 FLD    None   Mf64   Documented;
+        2 x 1 FST    Mf64   None   Documented;
+        3 x 1 FSTP   Mf64   None   Documented;
+        4 x 1 FRSTOR None   Mfsave Documented;
+        6 x 1 FNSAVE Mfsave None   Documented;
+        7 x 1 FNSTSW Ew     None   Documented;
+    },
+    // DE: 16-bit integer arithmetic.
+    x87map! { 8;
+        0 x 1 FIADD  St0 Mi16 Documented;
+        1 x 1 FIMUL  St0 Mi16 Documented;
+        2 x 1 FICOM  St0 Mi16 Documented;
+        3 x 1 FICOMP St0 Mi16 Documented;
+        4 x 1 FISUB  St0 Mi16 Documented;
+        5 x 1 FISUBR St0 Mi16 Documented;
+        6 x 1 FIDIV  St0 Mi16 Documented;
+        7 x 1 FIDIVR St0 Mi16 Documented;
+    },
+    // DF: 16- and 64-bit integer transfer. `/4` and `/6` are `FBLD` and
+    // `FBSTP`, the packed-decimal pair, which are not implemented.
+    x87map! { 8;
+        0 x 1 FILD  None Mi16 Documented;
+        2 x 1 FIST  Mi16 None Documented;
+        3 x 1 FISTP Mi16 None Documented;
+        5 x 1 FILD  None Mi64 Documented;
+        7 x 1 FISTP Mi64 None Documented;
+    },
+];
+
+/// `D8`-`DF` with `mod == 11`: the whole second byte selects the operation,
+/// indexed `[escape & 7][modrm - 0xc0]`.
+///
+/// *Intel SDM* volume 2 appendix A.4, tables A-16 through A-23 (the odd
+/// halves). The transcendental functions — `F2XM1`, `FYL2X`, `FYL2XP1`,
+/// `FPTAN`, `FPATAN`, `FSIN`, `FCOS`, `FSINCOS` — are deliberately left
+/// unassigned: computing them without a host `f64` is a project of its own,
+/// and an encoding that raises `#UD` is a truthful "not implemented" where an
+/// approximation would be a silent wrong answer. `super`'s module
+/// documentation lists them.
+pub static X87_REG: [[Insn; 64]; 8] = [
+    // D8: ST(0) is the destination throughout.
+    x87map! { 64;
+        0x00 x 8 FADD  St0 Sti  Documented;
+        0x08 x 8 FMUL  St0 Sti  Documented;
+        0x10 x 8 FCOM  Sti None Documented;
+        0x18 x 8 FCOMP Sti None Documented;
+        0x20 x 8 FSUB  St0 Sti  Documented;
+        0x28 x 8 FSUBR St0 Sti  Documented;
+        0x30 x 8 FDIV  St0 Sti  Documented;
+        0x38 x 8 FDIVR St0 Sti  Documented;
+    },
+    // D9: the stack shuffles, the constants, and the exact transcendental
+    // helpers. `D9 F4`-`D9 FD` is where the implemented ones cluster.
+    x87map! { 64;
+        0x00 x 8 FLD     None Sti  Documented;
+        0x08 x 8 FXCH    Sti  None Documented;
+        0x10 x 1 FNOP    None None Documented;
+        0x20 x 1 FCHS    None None Documented;
+        0x21 x 1 FABS    None None Documented;
+        0x24 x 1 FTST    None None Documented;
+        0x25 x 1 FXAM    None None Documented;
+        0x28 x 1 FLD1    None None Documented;
+        0x29 x 1 FLDL2T  None None Documented;
+        0x2a x 1 FLDL2E  None None Documented;
+        0x2b x 1 FLDPI   None None Documented;
+        0x2c x 1 FLDLG2  None None Documented;
+        0x2d x 1 FLDLN2  None None Documented;
+        0x2e x 1 FLDZ    None None Documented;
+        0x34 x 1 FXTRACT None None Documented;
+        0x35 x 1 FPREM1  None None Documented;
+        0x36 x 1 FDECSTP None None Documented;
+        0x37 x 1 FINCSTP None None Documented;
+        0x38 x 1 FPREM   None None Documented;
+        0x3a x 1 FSQRT   None None Documented;
+        0x3c x 1 FRNDINT None None Documented;
+        0x3d x 1 FSCALE  None None Documented;
+    },
+    // DA: the four "move if the integer flags say so" forms.
+    x87map! { 64;
+        0x00 x 8 FCMOVB  St0  Sti  Documented;
+        0x08 x 8 FCMOVE  St0  Sti  Documented;
+        0x10 x 8 FCMOVBE St0  Sti  Documented;
+        0x18 x 8 FCMOVU  St0  Sti  Documented;
+        0x29 x 1 FUCOMPP None None Documented;
+    },
+    // DB: the complementary conditional moves, the two "no-wait" control
+    // instructions, and the compares that write `EFLAGS` rather than the
+    // condition codes.
+    x87map! { 64;
+        0x00 x 8 FCMOVNB  St0  Sti  Documented;
+        0x08 x 8 FCMOVNE  St0  Sti  Documented;
+        0x10 x 8 FCMOVNBE St0  Sti  Documented;
+        0x18 x 8 FCMOVNU  St0  Sti  Documented;
+        0x22 x 1 FNCLEX   None None Documented;
+        0x23 x 1 FNINIT   None None Documented;
+        0x28 x 8 FUCOMI   St0  Sti  Documented;
+        0x30 x 8 FCOMI    St0  Sti  Documented;
+    },
+    // DC: the same eight operations as D8 with **ST(i) as the destination**,
+    // and with subtract and divide swapped against their reversed forms —
+    // `DC E0` is `FSUBR`, not `FSUB`. That crossing is the single most
+    // commonly mis-transcribed row in the escape maps, which is why it is
+    // called out here rather than left to be read off the table.
+    x87map! { 64;
+        0x00 x 8 FADD  Sti St0  Documented;
+        0x08 x 8 FMUL  Sti St0  Documented;
+        0x10 x 8 FCOM  Sti None Alias;
+        0x18 x 8 FCOMP Sti None Alias;
+        0x20 x 8 FSUBR Sti St0  Documented;
+        0x28 x 8 FSUB  Sti St0  Documented;
+        0x30 x 8 FDIVR Sti St0  Documented;
+        0x38 x 8 FDIV  Sti St0  Documented;
+    },
+    // DD: the register-to-register stores and the unordered compares.
+    x87map! { 64;
+        0x00 x 8 FFREE  Sti  None Documented;
+        0x08 x 8 FXCH   Sti  None Alias;
+        0x10 x 8 FST    Sti  None Documented;
+        0x18 x 8 FSTP   Sti  None Documented;
+        0x20 x 8 FUCOM  Sti  None Documented;
+        0x28 x 8 FUCOMP Sti  None Documented;
+    },
+    // DE: the popping arithmetic, with the same subtract/divide crossing DC
+    // has, and `FCOMPP` sitting alone at `DE D9`.
+    x87map! { 64;
+        0x00 x 8 FADDP  Sti  St0  Documented;
+        0x08 x 8 FMULP  Sti  St0  Documented;
+        0x10 x 8 FCOMP  Sti  None Alias;
+        0x19 x 1 FCOMPP None None Documented;
+        0x20 x 8 FSUBRP Sti  St0  Documented;
+        0x28 x 8 FSUBP  Sti  St0  Documented;
+        0x30 x 8 FDIVRP Sti  St0  Documented;
+        0x38 x 8 FDIVP  Sti  St0  Documented;
+    },
+    // DF: `FNSTSW AX` — the one instruction that moves the status word into
+    // a general register, and the reason `SAHF` after it is the classic x87
+    // branch idiom — and the popping flag-setting compares.
+    x87map! { 64;
+        0x20 x 1 FNSTSW  Ew  None Documented;
+        0x28 x 8 FUCOMIP St0 Sti  Documented;
+        0x30 x 8 FCOMIP  St0 Sti  Documented;
+    },
+];
+
+/// Apply [`Grp::X87`]: pick the row an escape byte and a ModRM byte name.
+///
+/// Separate from [`resolve_as`] because the escapes need *both* bytes and that
+/// function is given only the `reg` field. [`decode_stream_as`] calls this one
+/// instead where the group says so, so decode and disassembly still share one
+/// description.
+#[must_use]
+pub const fn resolve_x87(opcode: u8, modrm: ModRm) -> Insn {
+    let escape = (opcode & 7) as usize;
+    if modrm.md == 3 {
+        let byte = (modrm.reg << 3) | modrm.rm;
+        X87_REG[escape][byte as usize]
+    } else {
+        X87_MEM[escape][(modrm.reg & 7) as usize]
+    }
+}
+
 /// Decode one primary-map opcode byte on the 8086.
 ///
 /// Total: all 256 encodings are described, prefixes and undocumented ones
@@ -2058,6 +3443,10 @@ pub const fn resolve_as(map: Gen, insn: Insn, reg: u8) -> Insn {
         Grp::Grp6 => GROUP6[idx],
         Grp::Grp7 => GROUP7[idx],
         Grp::Grp8 => GROUP8[idx],
+        // These four need more than the `reg` field — the escape byte, or the
+        // mode field — so the row is handed back unchanged and
+        // [`resolve_modrm`] finishes the job.
+        Grp::X87 | Grp::Grp9 | Grp::Grp15 | Grp::ModAlt => insn,
     }
 }
 
@@ -2315,6 +3704,15 @@ pub struct Fields {
     pub rep: Option<Rep>,
     /// Whether a `LOCK` prefix was seen.
     pub lock: bool,
+    /// Whether a `66` prefix was seen.
+    ///
+    /// Separate from [`Fields::opsize`], which has already had it applied and
+    /// cannot say whether a 16-bit operand size came from the prefix or from
+    /// the code segment. The SSE maps need to know, because there the `66` is
+    /// part of the opcode rather than an override.
+    pub prefix66: bool,
+    /// Which mandatory prefix selected the two-byte map this row came from.
+    pub mandatory: Mandatory,
     /// Whether the opcode came from the two-byte (`0F`) map.
     pub two_byte: bool,
     /// The effective operand size in bytes: 2, 4 or 8.
@@ -2556,6 +3954,8 @@ pub fn decode_stream_as(map: Gen, bits: Bits, next: &mut dyn FnMut() -> Option<u
         seg_override: None,
         rep: None,
         lock: false,
+        prefix66: false,
+        mandatory: Mandatory::None,
         two_byte: false,
         opsize: bits.operand(),
         addrsize: bits.address(),
@@ -2620,7 +4020,10 @@ pub fn decode_stream_as(map: Gen, bits: Bits, next: &mut dyn FnMut() -> Option<u
                 0x3e => f.seg_override = Some(seg::DS),
                 0x64 => f.seg_override = Some(seg::FS),
                 0x65 => f.seg_override = Some(seg::GS),
-                0x66 => f.opsize = bits.operand_alt(),
+                0x66 => {
+                    f.opsize = bits.operand_alt();
+                    f.prefix66 = true;
+                }
                 _ => f.addrsize = bits.address_alt(),
             },
             Op::LOCK => f.lock = true,
@@ -2651,7 +4054,16 @@ pub fn decode_stream_as(map: Gen, bits: Bits, next: &mut dyn FnMut() -> Option<u
             return f;
         }
         f.opcode = second;
-        insn = decode_0f(second);
+        // A repeat prefix outranks an operand-size one (*Intel SDM* volume 2
+        // §2.1.1), and every one of them is still recorded in its own field so
+        // a listing can show the bytes that were there.
+        f.mandatory = match (f.rep, f.prefix66) {
+            (Some(Rep::While), _) => Mandatory::PF3,
+            (Some(Rep::WhileNot), _) => Mandatory::PF2,
+            (None, true) => Mandatory::P66,
+            (None, false) => Mandatory::None,
+        };
+        insn = decode_0f_as(f.mandatory, second);
     } else {
         f.opcode = opcode;
         insn = decode_as(map, opcode);
@@ -2664,7 +4076,7 @@ pub fn decode_stream_as(map: Gen, bits: Bits, next: &mut dyn FnMut() -> Option<u
         let byte = take(&mut f);
         let modrm = ModRm::new(byte);
         f.modrm = Some(modrm);
-        insn = resolve_as(map, insn, modrm.reg);
+        insn = resolve_modrm(map, insn, f.opcode, f.two_byte, modrm);
         if bits.is_64() {
             insn = insn.in_long();
         }
@@ -2854,6 +4266,19 @@ mod tests {
                 || GROUP6.iter().any(|i| i.op == op)
                 || GROUP7.iter().any(|i| i.op == op)
                 || GROUP8.iter().any(|i| i.op == op)
+                || GROUP9.iter().any(|i| i.op == op)
+                || GROUP15.iter().any(|i| i.op == op)
+                || GROUP15_REG.iter().any(|i| i.op == op)
+                || TABLE_0F_66.iter().any(|i| i.op == op)
+                || TABLE_0F_F3.iter().any(|i| i.op == op)
+                || TABLE_0F_F2.iter().any(|i| i.op == op)
+                || X87_MEM.iter().flatten().any(|i| i.op == op)
+                || X87_REG.iter().flatten().any(|i| i.op == op)
+                // `MOVHLPS` and `MOVLHPS` have no row of their own for the
+                // same reason `SWAPGS` has none: they are what `0F 12` and
+                // `0F 16` mean when the ModRM *mode* field says a register,
+                // and [`resolve_modrm`] is where that is decided.
+                || matches!(op, Op::MOVHLPS | Op::MOVLHPS)
         };
         for op in Op::ALL {
             // `SWAPGS` is the one operation with no row of its own, and it is

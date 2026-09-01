@@ -189,6 +189,28 @@ const fn fixes_size(arg: Arg) -> bool {
             | Arg::Ax
             | Arg::Cl
             | Arg::Dx
+            // The x87 and SSE operands all carry their own width, either in
+            // the operand kind or in the register name, so nothing beside one
+            // of them ever needs a `dword`/`qword` prefix printed for it.
+            | Arg::St0
+            | Arg::Sti
+            | Arg::Vx
+            | Arg::Ux
+            | Arg::Wx
+            | Arg::Wq
+            | Arg::Wd
+            | Arg::Gy
+            | Arg::Ey
+            | Arg::Mf32
+            | Arg::Mf64
+            | Arg::Mf80
+            | Arg::Mi16
+            | Arg::Mi32
+            | Arg::Mi64
+            | Arg::Mfenv
+            | Arg::Mfsave
+            | Arg::Mfx
+            | Arg::Mq
     )
 }
 
@@ -200,7 +222,12 @@ impl fmt::Display for Disassembled {
         if fields.lock {
             f.write_str("lock ")?;
         }
+        // An `F2` or `F3` that selected an SSE row is part of the *opcode*,
+        // not a repeat prefix, and printing `rep movss` would be a listing no
+        // assembler takes back.
+        let mandatory = !matches!(fields.mandatory, isa::Mandatory::None);
         match fields.rep {
+            _ if mandatory => {}
             // The two repeat prefixes share an encoding with `REPE`/`REPNE`;
             // which name reads better depends on the instruction, so the
             // comparing forms get the conditional spelling.
@@ -277,6 +304,17 @@ impl Disassembled {
             (Op::SCASW, true) => "scasd",
             (Op::INSW, true) => "insd",
             (Op::OUTSW, true) => "outsd",
+            // `66 0F 6E`/`7E` move a doubleword and the same encodings with
+            // `REX.W` move a quadword; Intel gave the wide forms the `MOVQ`
+            // name rather than a new opcode.
+            (Op::MOVD, _) if self.fields.rex_w() => "movq",
+            // The two save/restore instructions likewise: `REX.W` selects the
+            // 64-bit image, which has its own mnemonic.
+            (Op::FXSAVE, _) if self.fields.rex_w() => "fxsave64",
+            (Op::FXRSTOR, _) if self.fields.rex_w() => "fxrstor64",
+            // `0F C7 /1` is `CMPXCHG8B` until `REX.W` doubles every field of
+            // it.
+            (Op::CMPXCHG8B, _) if self.fields.rex_w() => "cmpxchg16b",
             (op, _) => op.mnemonic(),
         }
     }
@@ -289,8 +327,19 @@ impl Disassembled {
         for arg in [insn.dst, insn.src, insn.aux] {
             match arg {
                 Arg::Eb | Arg::Ev | Arg::Ew | Arg::Ed if modrm_mem => return true,
+                Arg::Wx | Arg::Wq | Arg::Wd | Arg::Ey if modrm_mem => return true,
                 Arg::M | Arg::Mp | Arg::Ms => return true,
                 Arg::Ob | Arg::Ov | Arg::Xb | Arg::Xv | Arg::Yb | Arg::Yv => return true,
+                Arg::Mf32
+                | Arg::Mf64
+                | Arg::Mf80
+                | Arg::Mi16
+                | Arg::Mi32
+                | Arg::Mi64
+                | Arg::Mfenv
+                | Arg::Mfsave
+                | Arg::Mfx
+                | Arg::Mq => return true,
                 _ => {}
             }
         }
@@ -408,6 +457,58 @@ impl Disassembled {
                 index_name(fields.addrsize, 6)
             ),
             Arg::Yb | Arg::Yv => write!(f, "[es:{}]", index_name(fields.addrsize, 7)),
+
+            // The x87 operands. A stack register is `st(i)`, which is how
+            // Intel's own manual and every assembler spell it.
+            Arg::St0 => f.write_str("st(0)"),
+            Arg::Sti => write!(f, "st({})", fields.modrm.map_or(0, |m| m.rm)),
+            // A floating-point memory operand carries its own width, so the
+            // hint is unconditional rather than decided by the other operand:
+            // `fld dword [bx]` and `fld qword [bx]` are different
+            // instructions with the same operand text.
+            Arg::Mf32
+            | Arg::Mf64
+            | Arg::Mf80
+            | Arg::Mi16
+            | Arg::Mi32
+            | Arg::Mi64
+            | Arg::Mfenv
+            | Arg::Mfsave
+            | Arg::Mfx
+            | Arg::Mq => {
+                let modrm = fields.modrm.unwrap_or(ModRm::new(0));
+                let size = arg.fp_bytes(osz).unwrap_or(0);
+                self.write_mem(f, modrm, size, true)
+            }
+
+            // The SSE operands.
+            Arg::Vx => write!(f, "xmm{}", fields.reg_num()),
+            Arg::Ux => write!(f, "xmm{}", fields.rm_num()),
+            Arg::Wx | Arg::Wq | Arg::Wd => {
+                let modrm = fields.modrm.unwrap_or(ModRm::new(0));
+                if modrm.is_register() {
+                    write!(f, "xmm{}", fields.rm_num())
+                } else {
+                    let size = arg.fp_bytes(osz).unwrap_or(0);
+                    self.write_mem(f, modrm, size, true)
+                }
+            }
+            // Intel's `Ey`/`Gy`: a general register at whichever width
+            // `REX.W` selected, never at the effective operand size — a
+            // mandatory `66` has already spoken for that field.
+            Arg::Ey => {
+                let width = if fields.rex_w() { 8 } else { 4 };
+                let modrm = fields.modrm.unwrap_or(ModRm::new(0));
+                if modrm.is_register() {
+                    f.write_str(regs_for(width, rex)[fields.rm_num() as usize])
+                } else {
+                    self.write_mem(f, modrm, width, true)
+                }
+            }
+            Arg::Gy => {
+                let width = if fields.rex_w() { 8 } else { 4 };
+                f.write_str(regs_for(width, rex)[fields.reg_num() as usize])
+            }
         }
     }
 
@@ -485,7 +586,14 @@ const fn size_hint(size: u8) -> &'static str {
         1 => "byte ",
         2 => "word ",
         4 => "dword ",
-        _ => "qword ",
+        8 => "qword ",
+        // The 80-bit x87 memory format. Intel's assembler spells it `tbyte`
+        // — ten bytes, "ten byte" — and every other assembler followed.
+        10 => "tbyte ",
+        16 => "xmmword ",
+        // The two x87 save areas, whose size follows the operand size. No
+        // assembler names them, so the operand is printed bare.
+        _ => "",
     }
 }
 

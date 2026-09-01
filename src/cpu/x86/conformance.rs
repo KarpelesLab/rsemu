@@ -88,6 +88,19 @@
 //! second run gates is the 16-bit real-mode path of the 32-bit core, which is
 //! where a firmware image spends its first few million instructions.
 //!
+//! # Why the eight escapes are not in the ledger
+//!
+//! `D8`-`DF` are the x87 escapes, and the core now decodes and executes them —
+//! but only on a part whose [`Features::fpu`](super::Features::fpu) is set,
+//! which neither [`Config::I8088`] nor [`Config::I80386`] has. Both presets
+//! are parts that shipped with an empty coprocessor socket, so an escape there
+//! drives the bus cycle a coprocessor would have answered and nothing else:
+//! exactly what this corpus captured from an 8088 with no 8087 beside it, and
+//! exactly what the core did before there was a floating-point unit at all.
+//! Neither run's numbers move. A `Config` with `fpu` set would fail every one
+//! of these files, and rightly — the vectors record a machine with no
+//! coprocessor in it.
+//!
 //! # Why the JSON parser is in here
 //!
 //! The dependency policy allows no `serde` (`ROADMAP.md` §0). This one is

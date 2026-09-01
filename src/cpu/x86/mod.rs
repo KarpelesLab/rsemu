@@ -65,6 +65,25 @@
 //! descriptors and interrupt gates with their interrupt-stack table; the
 //! canonical-address rule; and `SYSCALL`, `SYSRET` and `SWAPGS`.
 //!
+//! **The x87 unit** ([`fpu`], and [`crate::float`] for the arithmetic): the
+//! eight-register rotating stack with its tag word, the control word's
+//! precision and rounding control, the status word's condition codes, the six
+//! exception masks and the deferred `#MF` they produce, `FXCH` and the stack
+//! overflow and underflow rules, the environment and whole-unit save formats,
+//! and the 80-bit double extended format itself. **In software throughout** —
+//! there is no host `f32` or `f64` anywhere on the path from an escape to a
+//! result, which is what makes two hosts agree bit for bit (`ROADMAP.md`
+//! §9.1).
+//!
+//! **SSE and SSE2** ([`fpu`] again): sixteen `XMM` registers, `MXCSR` with its
+//! rounding, flush-to-zero and denormals-are-zero bits mapped onto
+//! [`crate::float::Env`], the scalar and packed single- and double-precision
+//! arithmetic, the compares that write `EFLAGS` and the ones that write a
+//! lane mask, the conversions, the shuffles, and `FXSAVE`/`FXRSTOR`.
+//! `CR4.OSFXSR` and `CR4.OSXMMEXCPT` now decide something: without the first
+//! an SSE instruction is `#UD`, and without the second an unmasked SIMD
+//! exception is `#UD` rather than `#XM`.
+//!
 //! **The exception model**: faults, traps and aborts, with the vectors and
 //! error codes the manual gives them; faults restart the instruction they came
 //! from; and the double-fault table decides whether a second exception is
@@ -76,17 +95,20 @@
 //!
 //! # What is not
 //!
-//! - **No floating-point unit, and no SIMD.** There is no 387, no MMX and no
-//!   SSE; with `CR0.EM` or `CR0.TS` set an escape raises `#NM` so software can
-//!   emulate, which is what an operating system that wants to do so asks for.
-//!   `CR4.OSFXSR` and `CR4.OSXMMEXCPT` have storage because an operating
-//!   system writes and reads them before it decides anything, and **no
-//!   `CPUID` bit claims any of it** — the bits are modelled and the arithmetic
-//!   is not, deliberately, so a guest fails its own feature check rather than
-//!   hitting a `#UD` in the middle of a kernel. A 64-bit operating system that
-//!   requires SSE2 will therefore refuse to boot, and say so.
-//! - **No `CMPXCHG8B` or `CMPXCHG16B`**, and `CPUID`'s `CX8` bit is clear to
-//!   match.
+//! - **No MMX.** Its eight registers alias the x87 stack, which is a
+//!   correctness trap rather than a feature, and `CPUID`'s `MMX` bit is clear.
+//! - **No x87 transcendentals.** `F2XM1`, `FYL2X`, `FYL2XP1`, `FPTAN`,
+//!   `FPATAN`, `FSIN`, `FCOS` and `FSINCOS` are unassigned in [`isa`] and
+//!   raise `#UD`. Computing them to the last bit of a 64-bit significand
+//!   without a host `f64` is a subproject of its own, and an approximation
+//!   would be a silently wrong answer where a missing instruction is a loud
+//!   one. `FBLD`/`FBSTP` (packed decimal) and `FISTTP` (SSE3) are absent for
+//!   the same reason of scope.
+//! - **No `FERR#` pin.** An unmasked x87 exception is delivered as `#MF` only
+//!   with `CR0.NE` set; with it clear a real PC routes the exception through
+//!   the chipset to IRQ 13, and no wire models that, so the exception stays
+//!   pending instead of being delivered down a path that does not exist.
+//! - **No SSE3 or later**, no AVX, and no `XSAVE`.
 //! - **No hardware task switching in long mode**, which is the architecture:
 //!   a far transfer to a task gate or a task state segment is `#GP` there, and
 //!   the 64-bit task state segment is read only for its stack pointers.
@@ -188,6 +210,8 @@
 
 pub mod disasm;
 mod exec;
+mod fpexec;
+pub mod fpu;
 pub mod isa;
 pub mod paging;
 pub mod prot;
@@ -389,6 +413,30 @@ pub struct Features {
     pub pse: bool,
     /// Global pages: `CR4.PGE` and bit 8 of a page-table entry.
     pub pge: bool,
+    /// An on-die x87 floating-point unit: the eight-register stack, the
+    /// `D8`-`DF` escapes, and `CPUID` leaf 1's `FPU` bit.
+    ///
+    /// A *part* property rather than an architectural level, which is the
+    /// whole reason it is here: an 80386 needed a separate 80387 and shipped
+    /// far more often without one, a 486SX had the unit fused off, and a 486DX
+    /// has it. All three are the same instruction set otherwise.
+    pub fpu: bool,
+    /// `CMPXCHG8B`, and `CPUID`'s `CX8` bit. A Pentium addition — the 486
+    /// does not have it, and Linux checks for it by name.
+    pub cx8: bool,
+    /// `FXSAVE`/`FXRSTOR` and the `CR4.OSFXSR` bit that means something.
+    ///
+    /// Separable from [`sse`](Features::sse) in exactly one direction: a part
+    /// can have `FXSR` without `SSE` — the Pentium II did — but not the other
+    /// way, because `CR4.OSFXSR` is how an operating system says it has
+    /// somewhere to save the SSE state. [`Features::validate`] enforces it.
+    pub fxsr: bool,
+    /// SSE: the sixteen `XMM` registers, `MXCSR`, and the single-precision
+    /// scalar and packed instructions.
+    pub sse: bool,
+    /// SSE2: the double-precision half, the packed-integer logic, and the
+    /// conversions between them. Requires [`sse`](Features::sse).
+    pub sse2: bool,
 }
 
 impl Features {
@@ -404,12 +452,32 @@ impl Features {
         cmov: false,
         pse: false,
         pge: false,
+        fpu: false,
+        cx8: false,
+        fxsr: false,
+        sse: false,
+        sse2: false,
     };
 
-    /// What an 80486 has.
+    /// What an 80486DX has: the 486 additions and an on-die x87 unit.
+    ///
+    /// `CMPXCHG8B` is deliberately absent — it arrived with the Pentium, and a
+    /// guest that probes `CPUID`'s `CX8` bit on a part claiming family 4 and
+    /// finds it set has been told something no 486 was ever true of.
     pub const I80486: Features = Features {
         extras_486: true,
+        fpu: true,
         ..Features::NONE
+    };
+
+    /// An 80486SX: the same part with the floating-point unit fused off.
+    ///
+    /// Here because it is the cleanest demonstration of what §6.1.1 is for —
+    /// one bit of difference inside one model number, expressible without a
+    /// second [`Variant`].
+    pub const I80486SX: Features = Features {
+        fpu: false,
+        ..Features::I80486
     };
 
     /// What the baseline x86-64 part has.
@@ -429,6 +497,11 @@ impl Features {
         cmov: true,
         pse: true,
         pge: true,
+        fpu: true,
+        cx8: true,
+        fxsr: true,
+        sse: true,
+        sse2: true,
     };
 
     /// Whether this combination describes a part that could exist.
@@ -458,6 +531,30 @@ impl Features {
         }
         if (self.msr || self.cr4) && !self.extras_486 {
             return missing("extras_486", "cr4 or msr");
+        }
+        if self.sse2 && !self.sse {
+            return missing("sse", "sse2");
+        }
+        if self.sse && !self.fxsr {
+            // `CR4.OSFXSR` is how an operating system says it has somewhere to
+            // save the `XMM` registers; an `SSE` with no `FXSR` would be a
+            // processor whose state no scheduler could preserve.
+            return missing("fxsr", "sse");
+        }
+        if self.sse && !self.fpu {
+            // The two share `CR0.EM` and `CR0.TS`, and `FXSAVE`'s image has
+            // the x87 registers in it whether or not anything uses them.
+            return missing("fpu", "sse");
+        }
+        if self.fxsr && !self.cr4 {
+            return missing("cr4", "fxsr");
+        }
+        if self.long && !self.sse2 {
+            // Not an implementation limit: every x86-64 part has SSE2, the
+            // 64-bit ABI passes floating-point arguments in `XMM` registers,
+            // and Linux refuses to boot without it. A long-mode part with it
+            // switched off is not a processor anyone shipped.
+            return missing("sse2", "long");
         }
         Ok(())
     }
@@ -1797,7 +1894,8 @@ impl X86 {
         // would make an impossible part.
         let mut features = variant.features();
         for name in [
-            "cpuid", "pae", "long", "nx", "syscall", "cmov", "pse", "pge",
+            "cpuid", "pae", "long", "nx", "syscall", "cmov", "pse", "pge", "fpu", "cx8", "fxsr",
+            "sse", "sse2",
         ] {
             let Some(on) = r.optional::<bool>(name)? else {
                 continue;
@@ -1810,7 +1908,12 @@ impl X86 {
                 "syscall" => features.syscall = on,
                 "cmov" => features.cmov = on,
                 "pse" => features.pse = on,
-                _ => features.pge = on,
+                "pge" => features.pge = on,
+                "fpu" => features.fpu = on,
+                "cx8" => features.cx8 = on,
+                "fxsr" => features.fxsr = on,
+                "sse" => features.sse = on,
+                _ => features.sse2 = on,
             }
         }
         features.validate()?;
@@ -1962,6 +2065,33 @@ impl X86 {
         session.state.sys = sys;
         session.state.tlb.flush();
         session.state.queue.flush();
+    }
+
+    /// The x87 unit: the register stack, the three words, and the pointers.
+    #[must_use]
+    pub fn x87(&self) -> fpu::X87 {
+        self.session.lock().state.x87
+    }
+
+    /// Overwrite the x87 unit.
+    ///
+    /// The tag word comes across as given rather than being recomputed from
+    /// the registers: `FRSTOR` can legitimately leave the two disagreeing, and
+    /// a setter that quietly agreed with itself would be unable to reproduce
+    /// that.
+    pub fn set_x87(&self, x87: fpu::X87) {
+        self.session.lock().state.x87 = x87;
+    }
+
+    /// The SSE registers and `MXCSR`.
+    #[must_use]
+    pub fn sse(&self) -> fpu::Sse {
+        self.session.lock().state.sse
+    }
+
+    /// Overwrite the SSE registers and `MXCSR`.
+    pub fn set_sse(&self, sse: fpu::Sse) {
+        self.session.lock().state.sse = sse;
     }
 
     /// Read one register by name. A 16-bit view returns its low half.
@@ -2336,7 +2466,10 @@ pub static CLASS: DeviceClass = DeviceClass {
     name: "cpu.x86",
     // 4: the register file widened to sixty-four bits and the chunk gained the
     //    long-mode block — `CR4`, `EFER`, the segment-base MSRs and `R8`-`R15`.
-    version: 4,
+    // 5: the floating-point block — the eight x87 registers with the control,
+    //    status and tag words and the environment pointers, then the sixteen
+    //    `XMM` registers and `MXCSR`.
+    version: 5,
     summary: "Intel x86 CPU core: 8086/8088 real mode, 80386/80486 protected mode, or x86-64",
     properties: &[
         PropertySpec {
@@ -2394,6 +2527,36 @@ pub static CLASS: DeviceClass = DeviceClass {
             summary: "override the preset: CR4.PGE and the global-page bit",
         },
         PropertySpec {
+            name: "fpu",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: the on-die x87 unit (a 486SX is a 486 with this off)",
+        },
+        PropertySpec {
+            name: "cx8",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: CMPXCHG8B, and CMPXCHG16B in long mode",
+        },
+        PropertySpec {
+            name: "fxsr",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: FXSAVE/FXRSTOR and CR4.OSFXSR",
+        },
+        PropertySpec {
+            name: "sse",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: the XMM registers, MXCSR and the single-precision SIMD",
+        },
+        PropertySpec {
+            name: "sse2",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: the double-precision and packed-integer SIMD",
+        },
+        PropertySpec {
             name: "model",
             kind: ValueKind::Str,
             required: false,
@@ -2426,7 +2589,7 @@ pub static CLASS: DeviceClass = DeviceClass {
 /// core keeps meaning what it meant. A build links one core either way.
 pub static I8086_CLASS: DeviceClass = DeviceClass {
     name: "cpu.i8086",
-    version: 4,
+    version: 5,
     summary: "Intel 8086 / 8088 16-bit CPU core, real mode, hardware-checked interpreter",
     properties: CLASS.properties,
     construct: |props| {
@@ -2656,6 +2819,32 @@ impl Device for X86 {
         w.write_u64(state.sys.lstar)?;
         w.write_u64(state.sys.cstar)?;
         w.write_u64(state.sys.sfmask)?;
+        // The floating-point block, appended for the same reason the
+        // long-mode block was: everything before it keeps the offset it had,
+        // so `host::gdb::arch`'s indexing into the first sixty-four bytes and
+        // every chunk a previous version wrote stay where they were.
+        //
+        // Written unconditionally, on an 8088 as much as on an x86-64. A chunk
+        // whose *shape* depended on the instance's features could not be
+        // loaded into an instance configured differently, and a snapshot that
+        // silently refuses to load is worse than a few hundred wasted bytes.
+        for reg in state.x87.regs {
+            w.write_u64(reg.sig)?;
+            w.write_u16(reg.sign_exp)?;
+        }
+        w.write_u16(state.x87.control)?;
+        w.write_u16(state.x87.status)?;
+        w.write_u16(state.x87.tag)?;
+        w.write_u16(state.x87.last_op)?;
+        w.write_u64(state.x87.last_ip)?;
+        w.write_u64(state.x87.last_dp)?;
+        w.write_u16(state.x87.last_cs)?;
+        w.write_u16(state.x87.last_ds)?;
+        for reg in state.sse.xmm {
+            w.write_u64(reg[0])?;
+            w.write_u64(reg[1])?;
+        }
+        w.write_u32(state.sse.mxcsr)?;
         Ok(())
     }
 
@@ -2771,6 +2960,32 @@ impl Device for X86 {
         state.sys.lstar = r.read_u64()?;
         state.sys.cstar = r.read_u64()?;
         state.sys.sfmask = r.read_u64()?;
+        // The floating-point block, in the order `save` wrote it. Nothing here
+        // was written twice, so — unlike the wide register block above — the
+        // values simply win.
+        for i in 0..8 {
+            let sig = r.read_u64()?;
+            let sign_exp = r.read_u16()?;
+            state.x87.regs[i] = crate::float::x87::F80::new(sign_exp, sig);
+        }
+        state.x87.control = r.read_u16()?;
+        state.x87.status = r.read_u16()?;
+        // The tag word is architectural state and is restored as it was
+        // written, **not** recomputed from the register contents: `FRSTOR` can
+        // legitimately leave the two disagreeing, and a load that "fixed" it
+        // would silently change what the guest sees.
+        state.x87.tag = r.read_u16()?;
+        state.x87.last_op = r.read_u16()?;
+        state.x87.last_ip = r.read_u64()?;
+        state.x87.last_dp = r.read_u64()?;
+        state.x87.last_cs = r.read_u16()?;
+        state.x87.last_ds = r.read_u16()?;
+        for i in 0..16 {
+            let lo = r.read_u64()?;
+            let hi = r.read_u64()?;
+            state.sse.xmm[i] = [lo, hi];
+        }
+        state.sse.mxcsr = r.read_u32()?;
         // The translation-lookaside buffer is derived, so it is not in the
         // snapshot and starts empty — which is correct rather than merely
         // convenient, because the page tables it would cache have just been

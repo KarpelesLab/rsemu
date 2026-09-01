@@ -649,18 +649,24 @@ dev-sms = []
 machine-sms = ["cpu-z80", "dev-sms"]
 
 # The Intel x86 core (src/cpu/x86): one interpreter covering the 8086, the
-# 8088, the 80386 and the 80486, chosen by a construction property rather than
-# a build flag. Real mode with every documented and undocumented 8086 encoding
-# and the segment:offset wrap at 1 MiB; and, on the 32-bit parts, protected
-# mode with the descriptor tables and the hidden descriptor caches, privilege
-# levels, call/interrupt/trap/task gates, the task state segment and task
-# switching, two-level paging with a translation-lookaside buffer and page
-# faults, the full exception model including the double fault, the two-byte
-# `0F` opcode page, and CPUID. A separate I/O address space, the prefetch
-# queue, and a disassembler generated from the same tables. Gated against
-# SingleStepTests/8088 — a corpus captured from real silicon — run both as an
-# 8088 and as a 386. Adds no dependencies and is `no_std + alloc`.
-cpu-x86 = []
+# 8088, the 80386, the 80486 and a generic x86-64, chosen by a construction
+# property rather than a build flag. Real mode with every documented and
+# undocumented 8086 encoding and the segment:offset wrap at 1 MiB; and, on the
+# 32-bit parts, protected mode with the descriptor tables and the hidden
+# descriptor caches, privilege levels, call/interrupt/trap/task gates, the task
+# state segment and task switching, two-level paging with a
+# translation-lookaside buffer and page faults, the full exception model
+# including the double fault, the two-byte `0F` opcode page, and CPUID; and, on
+# the last, long mode with `REX`, sixteen 64-bit registers and four-level
+# paging. The **x87 unit and SSE/SSE2** are here too, computed through `float`
+# rather than on host floating point, which is why this feature enables it:
+# the eight-register stack with its tag word and precision control, `MXCSR`,
+# the scalar and packed arithmetic, and `FXSAVE`/`FXRSTOR`. A separate I/O
+# address space, the prefetch queue, and a disassembler generated from the same
+# tables. Gated against SingleStepTests/8088 — a corpus captured from real
+# silicon — run both as an 8088 and as a 386. Adds no dependencies and is
+# `no_std + alloc`.
+cpu-x86 = ["float"]
 
 # The chips an IBM PC/AT-class board is built from (src/dev/pc): two 8259A
 # interrupt controllers, an 8254 timer, an 8042 keyboard controller with the

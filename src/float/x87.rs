@@ -426,6 +426,253 @@ pub fn fma(a: F80, b: F80, c: F80, pc: Precision, env: Env) -> (F80, Flags) {
     (encode(out, env), f | fa | fb | fc)
 }
 
+/// Round to an integral value in the environment's direction, signalling
+/// inexact when the value moves — IEEE 754-2019 §5.9's `roundToIntegralExact`,
+/// which is what `FRNDINT` computes.
+pub fn round_to_integral(a: F80, env: Env) -> (F80, Flags) {
+    let (pa, fa) = unpack(a, env);
+    let Some(p) = pa else {
+        return (encode(Outcome::DefaultNan, env), Flags::INVALID | fa);
+    };
+    match p.class {
+        Class::Nan => {
+            let flags = if p.snan { Flags::INVALID } else { Flags::NONE };
+            (encode(quiet_nan(p, env), env), flags | fa)
+        }
+        Class::Inf => (encode(Outcome::Num(p.sign, Rounded::Inf), env), fa),
+        // An exponent of zero or more means the last bit of the significand is
+        // already worth one or more, so the value is an integer and nothing —
+        // not even the rounding direction — can move it.
+        _ if p.exp >= 0 => (a, fa),
+        _ => match kernel::to_integer(p, env) {
+            IntValue::Value {
+                sign,
+                magnitude,
+                inexact,
+            } => {
+                // `to_integer` has already applied the rounding direction, so
+                // what comes back is the integer; re-encoding it is exact and
+                // the only flag left to report is the one it told us about.
+                let (out, f) = kernel::round_exact(sign, 0, magnitude, F80::SPEC, env);
+                let inx = if inexact { Flags::INEXACT } else { Flags::NONE };
+                (encode(out, env), f | inx | fa)
+            }
+            // Unreachable: the other two variants are a NaN and an infinity,
+            // both of which returned above.
+            _ => (encode(Outcome::DefaultNan, env), Flags::INVALID | fa),
+        },
+    }
+}
+
+/// Multiply by a power of two, as `FSCALE` does.
+///
+/// Scaling is not a multiplication by a computed constant: `2^n` is not
+/// representable for most `n` a guest may ask for, and computing it first
+/// would overflow where the product does not. Adding to the exponent and
+/// rounding once is both exact and the only way to get `FSCALE`'s documented
+/// behaviour at the ends of the range (*Intel SDM* volume 2, `FSCALE`).
+pub fn scale(a: F80, by: i64, env: Env) -> (F80, Flags) {
+    let (pa, fa) = unpack(a, env);
+    let Some(p) = pa else {
+        return (encode(Outcome::DefaultNan, env), Flags::INVALID | fa);
+    };
+    match p.class {
+        Class::Nan => {
+            let flags = if p.snan { Flags::INVALID } else { Flags::NONE };
+            (encode(quiet_nan(p, env), env), flags | fa)
+        }
+        Class::Inf => (encode(Outcome::Num(p.sign, Rounded::Inf), env), fa),
+        Class::Zero => (encode(Outcome::Num(p.sign, Rounded::Zero), env), fa),
+        Class::Finite => {
+            // Clamped far outside the exponent range rather than saturated at
+            // its edge, so that a scale of a million still overflows to
+            // infinity while the addition below cannot wrap.
+            let by = by.clamp(-(1 << 20), 1 << 20) as i32;
+            let (out, f) = kernel::round_exact(
+                p.sign,
+                p.exp.saturating_add(by),
+                u128::from(p.frac),
+                F80::SPEC,
+                env,
+            );
+            (encode(out, env), f | fa)
+        }
+    }
+}
+
+/// Split a value into its exponent and its significand, as `FXTRACT` does.
+///
+/// The significand comes back in `[1, 2)` with the original sign and the
+/// exponent as an integral value; multiplying the two reproduces the input
+/// exactly. A zero has no exponent, so the pair is `(-inf, ±0)` with the
+/// zero-divide exception — the one place x87 raises `#Z` for something that is
+/// not a division.
+pub fn extract(a: F80, env: Env) -> (F80, F80, Flags) {
+    let (pa, fa) = unpack(a, env);
+    let Some(p) = pa else {
+        let ind = encode(Outcome::DefaultNan, env);
+        return (ind, ind, Flags::INVALID | fa);
+    };
+    match p.class {
+        Class::Nan => {
+            let flags = if p.snan { Flags::INVALID } else { Flags::NONE };
+            let n = encode(quiet_nan(p, env), env);
+            (n, n, flags | fa)
+        }
+        Class::Zero => {
+            let zero = encode(Outcome::Num(p.sign, Rounded::Zero), env);
+            let neg_inf = encode(Outcome::Num(true, Rounded::Inf), env);
+            (neg_inf, zero, Flags::DIV_BY_ZERO | fa)
+        }
+        Class::Inf => {
+            let inf = encode(Outcome::Num(p.sign, Rounded::Inf), env);
+            let pos_inf = encode(Outcome::Num(false, Rounded::Inf), env);
+            (pos_inf, inf, fa)
+        }
+        Class::Finite => {
+            // Normalising first is what makes a subnormal input come out with
+            // a significand in `[1, 2)` and an exponent below `emin`, which is
+            // exactly what the manual says happens.
+            let msb = 63 - p.frac.leading_zeros() as i32;
+            let unbiased = p.exp + msb;
+            let field = BIAS as u16;
+            let sig = F80 {
+                sign_exp: if p.sign { 0x8000 | field } else { field },
+                sig: p.frac << (63 - msb as u32),
+            };
+            let (exp, ef) = from_signed(i64::from(unbiased), 64, env);
+            (exp, sig, ef | fa)
+        }
+    }
+}
+
+/// What `FPREM` and `FPREM1` produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Remainder {
+    /// The partial or complete remainder.
+    pub value: F80,
+    /// The exceptions raised.
+    pub flags: Flags,
+    /// The low three bits of the quotient, as `Q2 Q1 Q0` — meaningless when
+    /// [`incomplete`](Remainder::incomplete) is set.
+    pub quotient: u8,
+    /// Whether the reduction is only partial, so the instruction has to be
+    /// executed again on its own result. `C2` in the status word.
+    pub incomplete: bool,
+}
+
+/// The remainder of `a / b`, as `FPREM` (`ieee` clear) or `FPREM1` (set).
+///
+/// The two differ only in how the implied quotient is rounded: `FPREM`
+/// truncates it, so the remainder has the sign of the dividend, while
+/// `FPREM1` rounds it to nearest-even, which is IEEE 754-2019 §5.3.1's
+/// `remainder` and can therefore return a value of the opposite sign
+/// (*Intel SDM* volume 2, `FPREM` and `FPREM1`).
+///
+/// **Both are exact**: the result is a difference of two representable values
+/// that is itself representable, so the only flags this can raise come from
+/// the operands.
+///
+/// The reduction happens in one step when the operands' exponents differ by
+/// less than 64 and *partially* otherwise, reporting `incomplete` so the guest
+/// loops — which is the architecture, not a shortcut: hardware cannot hold an
+/// unbounded quotient either, and software that calls `FPREM` is written
+/// around the loop.
+pub fn remainder(a: F80, b: F80, ieee: bool, env: Env) -> Remainder {
+    let out = |value: F80, flags: Flags| Remainder {
+        value,
+        flags,
+        quotient: 0,
+        incomplete: false,
+    };
+    let (pa, fa) = unpack(a, env);
+    let (pb, fb) = unpack(b, env);
+    let (Some(pa), Some(pb)) = (pa, pb) else {
+        return out(encode(Outcome::DefaultNan, env), Flags::INVALID | fa | fb);
+    };
+    if let Some((o, f)) = kernel::nan_result(&[pa, pb], env) {
+        return out(encode(o, env), f | fa | fb);
+    }
+    // An infinite dividend, or a zero divisor, has no remainder at all.
+    if pa.class == Class::Inf || pb.class == Class::Zero {
+        return out(encode(Outcome::DefaultNan, env), Flags::INVALID | fa | fb);
+    }
+    // A zero dividend, or an infinite divisor, leaves the dividend alone.
+    if pa.class == Class::Zero || pb.class == Class::Inf {
+        return out(a, fa | fb);
+    }
+
+    // Normalise both significands to bit 63, so that the difference of the two
+    // exponents is exactly the difference of the values' binades.
+    let norm = |p: Parts| -> (i32, u64) {
+        let n = p.frac.leading_zeros();
+        (p.exp - n as i32, p.frac << n)
+    };
+    let (ea, sig_a) = norm(pa);
+    let (eb, sig_b) = norm(pb);
+    let d = ea - eb;
+
+    // More than 63 binades apart: reduce by 63 of them and say so. The
+    // quotient bits are undefined in that case, and the manual says so.
+    if d >= 64 {
+        let k = d - 63;
+        let n = u128::from(sig_a) << 63;
+        let r = n % u128::from(sig_b);
+        let (o, f) = kernel::round_exact(pa.sign, eb + k, r, F80::SPEC, env);
+        return Remainder {
+            value: encode(o, env),
+            flags: f | fa | fb,
+            quotient: 0,
+            incomplete: true,
+        };
+    }
+
+    // Less than a quarter of the divisor: the quotient is zero under either
+    // rounding rule, so the dividend is its own remainder.
+    if d <= -2 {
+        return out(a, fa | fb);
+    }
+
+    let (n, den, scale) = if d >= 0 {
+        (u128::from(sig_a) << d, u128::from(sig_b), eb)
+    } else {
+        // `d == -1`: line the divisor up with the dividend instead.
+        (u128::from(sig_a), u128::from(sig_b) << 1, ea)
+    };
+    let mut q = n / den;
+    let mut r = n % den;
+    let mut sign = pa.sign;
+    if ieee {
+        // Round the quotient to nearest, ties to even, which turns the
+        // remainder negative whenever it was more than half the divisor.
+        let twice = r * 2;
+        if twice > den || (twice == den && q & 1 == 1) {
+            q += 1;
+            r = den - r;
+            sign = !sign;
+        }
+    }
+    let (o, f) = kernel::round_exact(sign, scale, r, F80::SPEC, env);
+    Remainder {
+        value: encode(o, env),
+        flags: f | fa | fb,
+        quotient: (q & 7) as u8,
+        incomplete: false,
+    }
+}
+
+/// The quiet form of a NaN operand, under the environment's propagation rule.
+fn quiet_nan(p: Parts, env: Env) -> Outcome {
+    if env.nan.propagate == super::Propagate::Default {
+        Outcome::DefaultNan
+    } else {
+        Outcome::Nan {
+            sign: p.sign,
+            payload: p.frac,
+        }
+    }
+}
+
 /// The ordering of two values, or `None` when they are unordered — which
 /// includes an unsupported encoding, since it is not a value at all.
 #[must_use]
