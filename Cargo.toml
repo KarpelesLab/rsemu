@@ -340,6 +340,30 @@ machine-riscv-virt = ["cpu-riscv", "dev-riscv", "dev-flash-cfi"]
 # Adds no dependencies and is `no_std + alloc`.
 cpu-arm-v7m = []
 
+# STM32 peripherals (src/dev/stm32): a GPIO port and a USART, as separate
+# classes a `.machine` file places at the addresses its reference manual gives
+# them. The GPIO is the whole F4 register file -- MODER/OTYPER/OSPEEDR/PUPDR,
+# IDR/ODR, the atomic BSRR, the LCKR key sequence and both AFR halves -- plus a
+# real pin mux: MODER selects whether ODR, an alternate-function peripheral, or
+# whatever is driving the pin from outside reaches the port's output wire. The
+# USART is on the character-device seam and ships **both** register layouts,
+# selected by a construction property, because ST redesigned the peripheral
+# between the F4 and the F7 and the two are not compatible: `SR`/`DR` with a
+# read-read flag clear against `ISR`/`RDR`/`TDR` with an `ICR`. Neither device
+# knows what board it is on. Written from ST RM0090 (F4) and RM0410 (F7); no
+# emulator source was consulted (ROADMAP.md §1). `no_std + alloc`, no `unsafe`,
+# no dependencies.
+dev-stm32 = []
+
+# The STM32F407 as a machine (machines/stm32f407.machine plus the classes it
+# names): a Cortex-M4 at 168 MHz, 1 MiB of flash aliased at zero, the three
+# SRAM banks, five GPIO ports and USART2 on the terminal. The first M-profile
+# board rsemu ships, and the one that answers "how does a peripheral raise an
+# interrupt on a core whose NVIC is inside it" -- `wire usart2.irq -> cpu.irq38`,
+# with the number coming from RM0090 Table 62 and living in this file rather
+# than in any device model. Adds no dependencies.
+machine-stm32f407 = ["cpu-arm-v7m", "dev-stm32"]
+
 # The Zilog Z80 core (src/cpu/z80): a cycle-accurate interpreter covering the
 # base, CB, ED, DD/FD and DDCB/FDCB pages, the undocumented IX/IY halves, SLL
 # and the DDCB register copies, the MEMPTR (WZ) latch and flag bits 3 and 5,

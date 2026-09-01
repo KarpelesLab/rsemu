@@ -234,6 +234,25 @@ pub static PC_AT: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/pc-at.machine"),
 };
 
+/// An STM32F407VGT6 microcontroller, when this build has a Cortex-M core.
+///
+/// A real part rather than a synthetic board: the microcontroller on ST's own
+/// STM32F4 Discovery. It is where an M-profile core is exercised through a
+/// machine file, and where the answer to "how does a peripheral raise an
+/// interrupt on a core whose NVIC is *inside* it" is written down — one line,
+/// `wire usart2.irq -> cpu.irq38`, with the number out of RM0090's vector
+/// table. The `firmware` slot takes the flash image the core boots from.
+#[cfg(feature = "machine-stm32f407")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-stm32f407")))]
+pub static STM32F407: CatalogEntry = CatalogEntry {
+    name: "stm32f407",
+    summary: "STM32F407VGT6: Cortex-M4 at 168 MHz, 1 MiB flash, three SRAM banks, six GPIO ports, USART2",
+    // Only `firmware` — the flash image, which the core fetches its initial
+    // `SP` and `PC` out of through the boot alias at zero.
+    media: &["firmware"],
+    source: include_str!("../../machines/stm32f407.machine"),
+};
+
 /// A minimal Z80 board, when this build has a Z80.
 ///
 /// A synthetic board rather than a product: ROM at the reset vector, RAM above
@@ -297,6 +316,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&SMS_PAL);
     #[cfg(feature = "machine-spi-panel")]
     out.push(&SPI_PANEL);
+    #[cfg(feature = "machine-stm32f407")]
+    out.push(&STM32F407);
     #[cfg(feature = "machine-z80-mini")]
     out.push(&Z80_MINI);
     out
@@ -361,6 +382,8 @@ pub fn registry() -> Result<Registry> {
     crate::bus::spi::controller::register(&mut reg)?;
     #[cfg(feature = "dev-st7272a")]
     crate::dev::sitronix::register(&mut reg)?;
+    #[cfg(feature = "dev-stm32")]
+    crate::dev::stm32::register(&mut reg)?;
     #[cfg(feature = "dev-lcdc")]
     crate::dev::lcd::register(&mut reg)?;
     #[cfg(any(
@@ -436,6 +459,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::bus::spi::controller::bind(&mut b)?;
     #[cfg(feature = "dev-st7272a")]
     crate::dev::sitronix::bind(&mut b)?;
+    #[cfg(feature = "dev-stm32")]
+    crate::dev::stm32::bind(&mut b)?;
     #[cfg(feature = "dev-lcdc")]
     crate::dev::lcd::bind(&mut b)?;
     #[cfg(any(
@@ -506,6 +531,10 @@ pub fn classes() -> ClassTable {
     table.insert(crate::bus::spi::controller::schema());
     #[cfg(feature = "dev-st7272a")]
     for schema in crate::dev::sitronix::schemas() {
+        table.insert(schema);
+    }
+    #[cfg(feature = "dev-stm32")]
+    for schema in crate::dev::stm32::schemas() {
         table.insert(schema);
     }
     #[cfg(feature = "cpu-x86")]
@@ -1194,6 +1223,18 @@ mod tests {
             // `tests/arm926_board.rs` supplies the one that does something.
             #[cfg(feature = "machine-arm926")]
             ("arm926", "firmware") => &[0xfe, 0xff, 0xff, 0xea],
+            // The two words a Cortex-M4 fetches out of reset — an initial
+            // stack pointer at the top of SRAM and a reset vector, with bit 0
+            // set because there is no ARM state to interwork to — followed by
+            // `B .`, the two-byte branch to itself at 0x08. Everything needed
+            // to prove the board realizes and the core fetches; the program
+            // that does something is in `tests/stm32f407_board.rs`.
+            #[cfg(feature = "machine-stm32f407")]
+            ("stm32f407", "firmware") => &[
+                0x00, 0x00, 0x02, 0x20, // SP = 0x20020000, the top of SRAM2
+                0x09, 0x00, 0x00, 0x00, // PC = 0x00000008 | 1
+                0xfe, 0xe7, // b .
+            ],
             // `JR -2` — the Z80 branch-to-self, which is the whole two-byte
             // program needed to prove the board realizes and the core fetches.
             // `tests/z80_mini_board.rs` supplies the one that does something.

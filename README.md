@@ -108,6 +108,15 @@ generated device tree describes, and a variable written in one run is read back
 in the next. Where each stops is written down in
 `docs/platforms/riscv-virt.md` rather than rounded up.
 
+`stm32f407` is a microcontroller rather than a computer: an **STM32F407VGT6**,
+the part on ST's own STM32F4 Discovery board — a Cortex-M4 out of flash aliased
+at zero, six GPIO ports as instances of one class, and USART2 on your terminal.
+It is where an M-profile core answers the question the other boards never ask,
+because a Cortex-M's interrupt controller is *inside the core*: a peripheral
+drives `cpu.irq38` directly, and 38 is USART2's row in the part's vector table,
+written in the machine file where the part is chosen rather than in any device
+model.
+
 A seventh, `pc-at`, is a complete IBM PC/AT chipset — cascaded 8259As, 8254,
 MC146818, 8042, two 8237As, MC6845/VGA text mode, µPD765A — with a
 user-supplied BIOS path in the QEMU style (`--bios`, `--vgabios`). No firmware

@@ -1,6 +1,7 @@
 # ARM
 
-Consumed by: `cpu/arm` (ARMv7-A), `cpu/aarch64` (ARMv8-A).
+Consumed by: `cpu/arm/aprofile` (ARMv5TE today, ARMv6/ARMv7-A later),
+`cpu/arm/v7m` (ARMv7E-M, Cortex-M3/M4/M7), `cpu/aarch64` (ARMv8-A).
 
 ## Primary
 
@@ -9,6 +10,8 @@ Consumed by: `cpu/arm` (ARMv7-A), `cpu/aarch64` (ARMv8-A).
 | Arm Architecture Reference Manual for A-profile (DDI 0487) | AArch64 and AArch32: instruction set, exception model, MMU/translation regimes, the memory model | `developer.arm.com/documentation/ddi0487/latest/` **[browser]** |
 | Arm ARM for ARMv7-A/R (DDI 0406) | The ARMv7 architecture, for the 32-bit cores | `developer.arm.com/documentation/ddi0406/latest/` **[browser]** |
 | GIC Architecture Specification (IHI 0069) | Generic Interrupt Controller v3/v4 — required by any modern ARM board | `developer.arm.com/documentation/ihi0069/latest/` **[browser]** |
+| Arm ARM for ARMv7-M (DDI 0403) | The **M profile**: T32 only, Handler/Thread modes, the exception model and `EXC_RETURN`, the NVIC/SCB/SysTick/MPU register map at `0xE000E000`, PMSAv7 | `developer.arm.com/documentation/ddi0403/latest/` **[browser]** |
+| Cortex-M4 TRM (DDI 0439), Cortex-M7 TRM (DDI 0489) | The implementation-defined values a guest can see: `CPUID`, how many priority bits, how many MPU regions, instruction timings | developer.arm.com **[browser]** |
 | PrimeCell UART (PL011), TRM DDI 0183 | The UART every ARM virtual board exposes | developer.arm.com **[browser]** |
 
 Arm's site blocks automated fetches but the documents are free to download after
@@ -25,5 +28,13 @@ secondary reference for the exception model.
   sources.
 - Exception levels, the translation regimes (EL0/1/2/3, stage 1 and stage 2),
   and `TTBR0`/`TTBR1` splitting all need modelling before Linux boots.
+- **The M profile is a different architecture, not a subset.** There is no ARM
+  state, so no A32 decoder; the exception model is hardware register stacking
+  with `EXC_RETURN` rather than banked modes; the interrupt controller is *inside
+  the core* rather than a GIC beside it; and protection is PMSAv7 regions rather
+  than a translation table. `cpu/arm/v7m` shares the `arm` family module with the
+  A-profile core and nothing else. Its board is
+  [`../platforms/stm32f407.md`](../platforms/stm32f407.md), which also records
+  how a peripheral raises an interrupt when the NVIC has no wire of its own.
 - The A64 encoding is regular enough that a generated decoder from the manual's
   encoding tables is straightforward — unlike x86.

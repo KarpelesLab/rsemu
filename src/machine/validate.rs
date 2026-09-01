@@ -926,6 +926,55 @@ mod tests {
     }
 
     #[test]
+    fn a_banked_pin_accepts_its_range_and_names_it_when_it_does_not() {
+        // A device with dozens of identical inputs — an M-profile core's 240
+        // NVIC lines, a GPIO port's sixteen pins — declares them as one bank
+        // rather than enumerating them, and the error message folds them back
+        // into a range instead of printing the first eight of 240.
+        let classes = ClassTable::new()
+            .with(
+                ClassSchema::new("cpu.m")
+                    .port_bank("irq", PortDir::In, 240)
+                    .port("nmi", PortDir::In),
+            )
+            .with(ClassSchema::new("dev").port("irq", PortDir::Out));
+        let machine = |pin: &str| {
+            alloc::format!(
+                "machine \"m\" {{\n  \
+                   osc x = 1 MHz\n  \
+                   object cpu \"cpu.m\" {{ clock = x }}\n  \
+                   object d \"dev\" {{ }}\n  \
+                   wire d.irq -> cpu.{pin}\n\
+                 }}\n"
+            )
+        };
+        for pin in ["irq0", "irq38", "irq239", "nmi"] {
+            check(&machine(pin), &classes, &ValidateOptions::new())
+                .unwrap_or_else(|e| panic!("`{pin}` should be a pin:\n{e}"));
+        }
+        // Past the end of the bank, and — deliberately — a second spelling of
+        // one that is in it. Two spellings would be two nets.
+        for pin in ["irq240", "irq07", "irq", "irqx"] {
+            let e = error(&machine(pin), &classes);
+            assert!(
+                e.contains("`irq0`…`irq239`"),
+                "the message should name the range, not the first eight of 240:\n{e}"
+            );
+        }
+        // And a bank is still a direction: a wire cannot start at an input.
+        let e = error(
+            "machine \"m\" {\n  \
+               osc x = 1 MHz\n  \
+               object cpu \"cpu.m\" { clock = x }\n  \
+               object d \"dev\" { }\n  \
+               wire cpu.irq5 -> d.irq\n\
+             }\n",
+            &classes,
+        );
+        assert!(e.contains("is an input"), "{e}");
+    }
+
+    #[test]
     fn golden_unknown_property_reuses_the_property_systems_message() {
         assert_eq!(
             error(

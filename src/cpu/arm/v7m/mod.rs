@@ -111,6 +111,7 @@ mod corpus;
 mod elf;
 
 use alloc::boxed::Box;
+use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;

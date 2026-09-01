@@ -20,6 +20,7 @@
 //! | [`ppu`] | `dev-nes-ppu` | the RP2C02 picture unit: the per-dot pipeline |
 //! | [`lcd`] | `dev-lcdc` | a generic RGB scanout engine: framebuffer in, `Scanout` out |
 //! | [`sitronix`] | `dev-st7272a` | the ST7272A TFT panel driver: SPI register configuration, no pixel path |
+//! | [`stm32`] | `dev-stm32` | STM32 peripherals: a GPIO port and a USART |
 //! | [`riscv`] | `dev-riscv` | the RISC-V `virt` board: CLINT, PLIC, 16550, virtio, and the device tree generator |
 //! | [`usb`] | `dev-usb-*` | USB host controllers — a generic EHCI and the ChipIdea/ARC variant over it — and a HID mouse |
 //! | [`wdc`] | `dev-wdc` | the W65C51N ACIA and W65C22 VIA, and a 6502 board's ROM |
@@ -71,6 +72,10 @@ pub mod sitronix;
 #[cfg(feature = "dev-sms")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-sms")))]
 pub mod sms;
+
+#[cfg(feature = "dev-stm32")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32")))]
+pub mod stm32;
 
 #[cfg(feature = "dev-riscv")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-riscv")))]
