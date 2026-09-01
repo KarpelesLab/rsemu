@@ -139,6 +139,15 @@ somewhere real to run. `ne2k-mini` is the newest of them: a Z80 with an
 **NE2000 Ethernet card** on its port bus, whose ROM is a real driver — it runs
 the DP8390's initialisation procedure, builds a frame in card memory through
 the remote DMA window, transmits it, and takes the receive interrupt in mode 1.
+`nvme-mini` is the one after it, and it exists for the opposite reason: an
+**NVM Express controller** is the first device here that reads and writes guest
+memory *itself*. A driver builds a submission queue, a completion queue and a
+list of Physical Region Pages in the board's own RAM, writes one doorbell, and
+the controller fetches the command, walks the chain, moves the data to or from
+the disk image, posts a completion with its phase tag and holds its interrupt
+line down until the driver acknowledges it. The board is RAM, a host bridge, an
+8259A and the controller — nothing else, so a failure on it is a failure in the
+device.
 
 The framework underneath is complete: address spaces with priority and
 mirroring, an oscillator forest with exact intra-tree ratios, wires, devices,

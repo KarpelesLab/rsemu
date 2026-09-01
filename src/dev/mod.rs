@@ -18,6 +18,7 @@
 //! | [`flash`] | `dev-flash-cfi`, `dev-flash-spinor` | NOR flash: parallel (CFI) and serial (W25Q on SPI) |
 //! | [`nes`] | `dev-nes-io` | the console's own I/O: controller ports, OAM DMA |
 //! | [`net`] | `dev-net`, `dev-ne2000`, `net-pktkit` | the network seam, an NE2000 card, and the `pktkit` bridge |
+//! | [`nvme`] | `dev-nvme` | an NVM Express controller: a PCI function that DMA-walks its own queues |
 //! | [`pc`] | `dev-pc` | an IBM PC/AT board's chips: 8259A, 8254, 8042, MC146818, 8237A, the firmware socket |
 //! | [`ppu`] | `dev-nes-ppu` | the RP2C02 picture unit: the per-dot pipeline |
 //! | [`lcd`] | `dev-lcdc` | a generic RGB scanout engine: framebuffer in, `Scanout` out |
@@ -80,6 +81,10 @@ pub mod nes;
 #[cfg(feature = "dev-net")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-net")))]
 pub mod net;
+
+#[cfg(feature = "dev-nvme")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-nvme")))]
+pub mod nvme;
 
 #[cfg(feature = "dev-pc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-pc")))]

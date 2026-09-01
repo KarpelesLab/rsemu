@@ -99,6 +99,63 @@ NVMe and virtio-blk are both freely specified and much simpler to implement
 correctly than ATA. Prefer them for new machines; implement ATA because legacy
 guests require it.
 
+**NVMe now exists** (`dev/nvme`, feature `dev-nvme`), and it is the first
+storage device in this tree that is a **bus master**. Everything before it was
+either programmed I/O — the guest reads a data port a word at a time — or
+third-party DMA through an 8237, and in both of those the *guest* or a *third
+chip* moves the bytes. An NVMe controller moves them itself: the driver builds a
+submission queue, a completion queue and a list of Physical Region Pages in its
+own memory, writes one 32-bit doorbell, and the controller fetches the 64-byte
+command out of guest RAM, walks the PRP chain, moves the data, writes a 16-byte
+completion back with its phase tag, and holds `INTA#` down until the host's
+completion queue head doorbell catches up.
+
+Four things about that shape are worth carrying to the next bus master, and
+`dev/nvme/ctrl.rs` argues each where it bites.
+
+**The register block is in the address space the device masters.** So a guest
+can aim a PRP entry at the controller's own doorbells, and the write handler is
+re-entered from inside itself. The answer is the one `core::wire` already gives
+for a re-entrant level change: the work is **iterative, not recursive**. A
+re-entrant doorbell records its tail and returns, and the outermost loop
+re-reads every tail after each command. Recursion depth is one whatever the
+guest builds.
+
+**No lock is held across a guest-memory access, a medium access or a wire
+change** — the re-entrancy contract, and here it is load-bearing rather than
+decorative for exactly that reason. The state lock ranks at `0x5a00`, below
+`DEVICE` (so the PCI function's configuration lock is taken and released before
+it, never the other way round) and above `WIRE` (so the interrupt output is
+driven after it is released). It cannot be `BUS`: `core::space` states that *"a
+CPU holds a `BUS`-ranked lock across the accesses it issues"*, and every access
+to this register block arrives from inside one.
+
+**Every walk over a guest-built structure is bounded**, and the bounds are
+argued rather than guessed. A PRP List's last entry may point at another list,
+so a guest can close a ring; the chain is capped. A doorbell write could
+otherwise become unbounded work inside one guest instruction if the controller's
+own data transfers kept feeding its doorbells, so one entry into the engine
+executes at most as many commands as the queues can hold between them — a bound
+a legitimate driver cannot reach, because reaching it means the data was the
+doorbell. `fuzz/fuzz_targets/nvme_mmio.rs` drives arbitrary bytes through both.
+
+**A full completion queue is back pressure, not an error.** A command whose
+completion has nowhere to go stays on its submission queue, and the *completion
+queue head* doorbell is what releases it — which means that doorbell has to
+resume the engine as well as lower the interrupt. A model that only ran on a
+submission doorbell would strand the command until the driver happened to submit
+another one; `a_command_on_a_queue_whose_completion_queue_is_full_waits` is
+where that was caught.
+
+The namespace is a `dev::ata::Medium` — the same seam an ATA drive's platter
+uses, with the same three snapshot policies — so `--drive nvme0=disk.qcow2`
+works here for the reason it works there, and no image format is parsed.
+`machines/nvme-mini.machine` is the smallest board a driver can run against, and
+`tests/nvme_board.rs` is that driver: it enumerates the bus at `0xcf8`, sizes and
+places the base address register, builds queues in the board's RAM, and checks
+every transfer **against the medium** rather than against the device's own
+buffer. AHCI is still absent.
+
 ## Working references
 
 [OSDev: ATA PIO](https://wiki.osdev.org/ATA_PIO_Mode),

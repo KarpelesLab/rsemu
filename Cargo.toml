@@ -769,6 +769,48 @@ dev-blk = ["std", "dev-ata-disk", "dep:fstool"]
 # it is that board's decode.
 dev-pc-ide = ["dev-pc", "dev-ata-disk"]
 
+# An NVM Express controller as a PCI function (src/dev/nvme): the NVMe 1.4
+# register block behind a 64-bit BAR, and -- the part that matters -- a **bus
+# master** that reads its own work out of guest RAM. A driver builds a
+# submission queue, a completion queue and a Physical Region Page list in its
+# own memory, writes one doorbell, and the controller fetches the 64-byte
+# command, walks the PRP chain, moves the data to or from the namespace's
+# medium, writes a 16-byte completion with its phase tag, and holds `INTA#`
+# down until the host's completion queue head doorbell catches up. That makes
+# it the first device in this tree that is neither programmed I/O nor
+# third-party DMA through an 8237.
+#
+# Covers the controller registers (CAP/VS/INTMS/INTMC/CC/CSTS/AQA/ASQ/ACQ and
+# the doorbell array), enable and Controller Reset with the configuration
+# checks that gate CSTS.RDY, shutdown notification with a real medium flush,
+# the admin command set (Create/Delete I/O Queue, Identify, Set/Get Features,
+# Get Log Page, Abort, and an Asynchronous Event Request held outstanding
+# because nothing generates an event), and the NVM command set (Flush, Read,
+# Write, Write Zeroes). MSI/MSI-X and SGLs are deliberately absent and the
+# module says why. **Every walk over a guest-built PRP chain is bounded**, and
+# `fuzz/fuzz_targets/nvme_mmio.rs` is why.
+#
+# The namespace is a `dev::ata::Medium`, the same seam an ATA drive's platter
+# uses, so `--drive nvme0=disk.qcow2` works here for the same reason and no
+# image format is parsed (ROADMAP.md 7.1). Written from the freely published
+# NVM Express Base Specification 1.4 and the PCI Local Bus Specification; no
+# emulator source was consulted (ROADMAP.md 1). `no_std + alloc`, no `unsafe`,
+# no dependencies. Needs `bus-pci` for the function and `dev-ata-disk` for the
+# medium seam.
+dev-nvme = ["bus-pci", "dev-ata-disk"]
+
+# The `nvme-mini` board (machines/nvme-mini.machine plus the classes it names):
+# RAM, an 82441FX host bridge for the 0xcf8/0xcfc configuration ports, a master
+# 8259A, and an NVM Express controller on the bus, with its `INTx#` wired to
+# IR5. It models no product; it exists so `nvme.controller` has somewhere a
+# driver can reach it the way a driver does -- configuration cycles, a base
+# address register the driver places itself, and queues in the board's own RAM
+# -- without the twenty other objects a PC has. Deliberately has **no
+# processor**: every register is reached through an address space and a test
+# drives those directly, exactly as `tests/pc_at_ide.rs` drives a disk on the
+# AT. Adds no dependencies.
+machine-nvme-mini = ["dev-nvme", "dev-pc-pci"]
+
 # An IBM PC/AT-class machine (machines/pc-at.machine plus the classes it
 # names). The firmware is **not** shipped: the `bios` media slot takes the
 # user's own image (`rsemu run pc-at --bios /usr/share/qemu/bios.bin`) and the
