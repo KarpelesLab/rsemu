@@ -687,7 +687,17 @@ impl MachineShape {
     }
 
     /// Encode the shape into `sink`.
-    fn encode<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<()> {
+    ///
+    /// Public because the shape is the identity check for more than one file
+    /// format: a snapshot carries it in its header, and a
+    /// [recording](crate::core::record::InputLog) carries it so that replaying
+    /// into a differently-shaped machine fails with a [`ShapeDiff`] rather than
+    /// by injecting input into whatever device answers to that name.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `sink` reports.
+    pub fn encode_into<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<()> {
         sink.write_seq_len(self.devices.len() as u64)?;
         for (path, class) in &self.devices {
             sink.write_str(path)?;
@@ -709,7 +719,14 @@ impl MachineShape {
     /// Ordering is enforced rather than merely sorted-on-load so that a
     /// snapshot has exactly one valid encoding; that is what lets "decode then
     /// re-encode" be byte-identical, which the determinism tests rely on.
-    fn decode<'a, S: Source<'a> + ?Sized>(src: &mut S) -> Result<Self> {
+    ///
+    /// The mirror of [`MachineShape::encode_into`], and public for the same
+    /// reason.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::State`] for a truncated, out-of-order or non-UTF-8 encoding.
+    pub fn decode_from<'a, S: Source<'a> + ?Sized>(src: &mut S) -> Result<Self> {
         // A device entry is two length-prefixed strings: 16 bytes minimum.
         let device_count = src.read_seq_len(16)?;
         let mut devices = BTreeMap::new();
@@ -1074,7 +1091,7 @@ impl StateWriter {
         sink.write_u32(FORMAT_VERSION)?;
         sink.write_u16(self.codec.0)?;
         sink.write_u16(self.integrity.0)?;
-        self.shape.encode(sink)?;
+        self.shape.encode_into(sink)?;
         // BTreeMap iteration is ascending by instance path: the canonical order
         // the reader checks for.
         for (path, chunk) in &self.chunks {
@@ -1339,7 +1356,7 @@ impl<'a> StateReader<'a> {
             )));
         }
 
-        let shape = MachineShape::decode(src)?;
+        let shape = MachineShape::decode_from(src)?;
 
         let mut chunks: Vec<RawChunk<'a>> = Vec::new();
         loop {

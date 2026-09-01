@@ -20,6 +20,7 @@
 //! | `wire` | interrupt and GPIO lines (§4.3) |
 //! | `device` | the device trait, lifecycle, composition (§4.4) |
 //! | `props` | dynamic property values and typed extraction (§4.4) |
+//! | [`record`] | the record/replay seam: non-deterministic input, timestamped (§4.5) |
 //! | `registry` | by-name device construction (§4.4) |
 //! | `state` | versioned snapshots (§4.5) |
 //! | `sync` | the concurrency portability seam (§4.7) |
@@ -37,6 +38,7 @@ pub mod error;
 pub mod exec;
 pub mod hosts;
 pub mod props;
+pub mod record;
 pub mod registry;
 pub mod sched;
 pub mod space;
@@ -48,6 +50,7 @@ pub mod wire;
 pub use device::{Device, DeviceClass, Export, ExportId, PropertySpec, RealizeCtx, ResetKind};
 pub use error::{BusError, Error, Result};
 pub use exec::{Access, Exit, ExitMask, ExitReason, ExitingCore, Run};
-pub use hosts::{Captured, HostKind, HostObjects};
+pub use hosts::{Captured, HostKind, HostObjects, InputPolicy};
+pub use record::{Channel, InputEvent, InputLog, InputSink, Recorder};
 pub use registry::Registry;
 pub use value::{Endian, Width};

@@ -147,6 +147,14 @@ path  = "fuzz_targets/blk_image.rs"
 [[bin]]
 name  = "float_ops"
 path  = "fuzz_targets/float_ops.rs"
+# A recording is a file a user hands us — `rsemu replay session.trace` on a
+# different host, out of a bug report — so `core::record`'s reader is a parser
+# on untrusted input like `core::state`'s. Paired with the replay path, because
+# a cursor that could fail to advance over attacker-chosen instants is an
+# infinite loop inside a run rather than a crash.
+[[bin]]
+name  = "record_log"
+path  = "fuzz_targets/record_log.rs"
 test  = false
 doc   = false
 bench = false
