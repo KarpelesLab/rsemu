@@ -1528,9 +1528,20 @@ read-write implementations of ext2/3/4, FAT12/16/32, exFAT, NTFS, XFS, HFS+,
 F2FS, littlefs, SquashFS and ISO9660. Emulated storage controllers sit directly
 on `fstool::BlockDevice` rather than on a parallel rsemu invention.
 
-What rsemu adds on top: the remaining image formats (`vmdk`, `vhdx`, `vdi`),
-copy-on-write overlays and image snapshots tied to machine snapshots (§4.5),
-discard/TRIM, and a write-back cache whose flush contract survives snapshotting.
+**Landed:** `dev/blk` (feature `dev-blk`), the adapter between
+`fstool::BlockDevice` and a drive's storage. `dev::ata::medium::Medium` is the
+seam — `RamStore` on the `no_std` side, `dev::blk::Image` on the `std` side —
+so an ATA drive is a host file with no change to any machine description or host
+adapter, and sparse raw, qcow2, DMG, DiskCopy 4.2 and LUKS all work through
+`fstool`'s own backends. A file-backed drive **references** its image in a
+machine snapshot (flushing it first) rather than copying it; `capture` and
+`refuse` are the other two policies and the choice is explicit.
+
+What rsemu adds on top: the remaining image formats (`vmdk`, `vhdx`, `vdi`) —
+which are new `BlockDevice` backends and so belong beside the ones they sit next
+to, in `fstool`, not layered over them in rsemu — copy-on-write overlays and
+image snapshots tied to machine snapshots (§4.5), discard/TRIM, and a write-back
+cache whose flush contract survives snapshotting.
 
 What this buys the user directly: `rsemu run --disk-from-dir ./rootfs` builds a
 bootable image on the fly; the monitor can inspect and edit a guest disk without
@@ -2141,7 +2152,7 @@ the known-failures ledger; and the machine library under `machines/`.
 | Crate | Used for | Feature-gated |
 | --- | --- | --- |
 | [`pktkit`](https://github.com/KarpelesLab/pktkit-rs) | Networking: NIC models are `L2Device`s and `L2Hub` wires them together. **slirp and WireGuard are `L3Device`, not L2** — an in-crate `L2Adapter` (ARP/NDP/DHCP) sits between, so no rsemu code is needed but the config surface is two layers, not one. OpenVPN is server-only; TAP is Linux-only. v0.1.1 with an explicitly unstable API: substantial and useful, **not finished** | yes |
-| [`fstool`](https://github.com/KarpelesLab/fstool) | The storage substrate: `BlockDevice`, qcow2, DMG, MBR/GPT (RW; **APM is read-only**), and **read-write** ext2/3/4, FAT, exFAT, NTFS, XFS, HFS+, littlefs. **SquashFS and ISO9660 are `Immutable`** (format-and-flush only), as is a reopened F2FS image. **qcow2 backing files, snapshots and encryption hard-error on open**, and compression is read-only — so the CoW-overlay mechanism §7.1 wants is *fstool work*, not rsemu-on-top work. Also the proof that a KLB crate of this shape ships to the browser | yes |
+| [`fstool`](https://github.com/KarpelesLab/fstool) | The storage substrate: `BlockDevice`, qcow2, DMG, MBR/GPT (RW; **APM is read-only**), and **read-write** ext2/3/4, FAT, exFAT, NTFS, XFS, HFS+, littlefs. **SquashFS and ISO9660 are `Immutable`** (format-and-flush only), as is a reopened F2FS image. As of 0.4.2x **qcow2 backing files and encryption open fine** (compression is still read-only, and a write to a compressed cluster copies it out) — but *image* snapshots are still absent, so the CoW-overlay mechanism §7.1 wants remains *fstool work*, not rsemu-on-top work; `dev/blk`'s file-backed drive therefore snapshots a machine by **referencing** its image rather than copying it. Also the proof that a KLB crate of this shape ships to the browser | yes |
 | [`compcol`](https://github.com/KarpelesLab/compcol) | Snapshot compression (and, under `fstool`, every filesystem codec). Its zstd encoder is self-described as partial and benchmarks at ~0.15× reference speed on incompressible data — which guest RAM largely is — so snapshot compression is opt-in and measured, never assumed | yes |
 | [`purecrypto`](https://github.com/KarpelesLab/purecrypto) | TLS for remote display; AES-XTS and PBKDF2/Argon2 as the **primitives** a disk-encryption layer is built from. It does **not** ship LUKS or qcow2 crypto — verified, zero hits — so those are rsemu-side work. On TPM: purecrypto has an external-*signer* seam; the actual TPM 2.0 stack is the separate `purecrypto-tpm` crate | yes |
 | [`puremp`](https://github.com/KarpelesLab/puremp) | Exact `Rational` over arbitrary-precision `Int`, for clock arithmetic if `u128` proves insufficient. **Not usable for guest FP**: MPFR-class with caller-chosen precision, no fixed binary32/64 format, no bounded exponent, no IEEE-754 status flags — see §9.1 | yes, and only if needed |
