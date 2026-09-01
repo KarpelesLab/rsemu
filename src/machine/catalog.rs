@@ -339,6 +339,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::apple1::register(&mut reg)?;
     #[cfg(feature = "cpu-arm-aprofile")]
     crate::cpu::arm::aprofile::register(&mut reg)?;
+    #[cfg(feature = "cpu-arm-v7m")]
+    crate::cpu::arm::v7m::register(&mut reg)?;
     #[cfg(feature = "cpu-z80")]
     crate::cpu::z80::register(&mut reg)?;
     #[cfg(feature = "cpu-m68k")]
@@ -412,6 +414,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::apple1::bind(&mut b)?;
     #[cfg(feature = "cpu-arm-aprofile")]
     crate::cpu::arm::aprofile::bind(&mut b)?;
+    #[cfg(feature = "cpu-arm-v7m")]
+    crate::cpu::arm::v7m::bind(&mut b)?;
     #[cfg(feature = "cpu-z80")]
     crate::cpu::z80::bind(&mut b)?;
     #[cfg(feature = "cpu-m68k")]
@@ -478,6 +482,8 @@ pub fn classes() -> ClassTable {
     }
     #[cfg(feature = "cpu-arm-aprofile")]
     table.insert(crate::cpu::arm::aprofile::schema());
+    #[cfg(feature = "cpu-arm-v7m")]
+    table.insert(crate::cpu::arm::v7m::schema());
     #[cfg(feature = "cpu-z80")]
     table.insert(crate::cpu::z80::schema());
     #[cfg(feature = "cpu-m68k")]

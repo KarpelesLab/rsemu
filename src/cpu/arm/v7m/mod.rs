@@ -115,16 +115,19 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::core::device::{Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind};
-use crate::core::error::Result;
+use crate::core::device::{
+    Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
+};
+use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
 use crate::core::sched::{Budget, Consumed};
 use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::core::sync::{self, AtomicU32, LockRank, Ordering};
+use crate::core::sync::{self, AtomicBool, AtomicU32, LockRank, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink};
+use crate::machine::validate::port_index;
 
 use exec::{Exec, State};
 use sys::{Exception, Sys};
@@ -404,19 +407,47 @@ const IRQ_WORDS: usize = Exception::COUNT / 32;
 /// cleared does; an edge-triggered source writes `NVIC_ISPR` or `STIR`
 /// instead and does not appear here at all.
 #[derive(Debug)]
-struct Lines {
+pub struct Lines {
     level: [AtomicU32; IRQ_WORDS],
+    nmi: AtomicBool,
+    reset: AtomicBool,
 }
 
 impl Default for Lines {
     fn default() -> Lines {
         Lines {
             level: [const { AtomicU32::new(0) }; IRQ_WORDS],
+            nmi: AtomicBool::new(false),
+            reset: AtomicBool::new(false),
         }
     }
 }
 
 impl Lines {
+    /// Drive the NMI input. Level-sensitive, like the rest of them: NMI is
+    /// non-maskable, not edge-triggered (DDI 0403 B1.5.14).
+    fn set_nmi(&self, asserted: bool) {
+        self.nmi.store(asserted, Ordering::Release);
+    }
+
+    fn nmi(&self) -> bool {
+        self.nmi.load(Ordering::Acquire)
+    }
+
+    /// Drive the reset input. A high level latches a request; the sequence
+    /// itself runs on the next step, because a reset is a signal and not a
+    /// method call.
+    fn set_reset(&self, asserted: bool) {
+        if asserted {
+            self.reset.store(true, Ordering::Release);
+        }
+    }
+
+    /// Take the latched reset request, if there is one.
+    fn take_reset(&self) -> bool {
+        self.reset.swap(false, Ordering::AcqRel)
+    }
+
     fn set(&self, irq: u16, asserted: bool) {
         let n = usize::from(irq);
         if n >= Exception::COUNT - 16 {
@@ -449,6 +480,30 @@ impl Lines {
             atomic.store(*value, Ordering::Release);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Input pins
+// ---------------------------------------------------------------------------
+
+/// How many external interrupts a `wire` statement may name.
+///
+/// Sixteen of the 256 exception numbers are the system exceptions, so 240 is
+/// what is left — the most a Cortex-M4 or M7 implements. A real part wires far
+/// fewer; naming one this core has no vector for is a machine-file error, not
+/// a silent no-op.
+pub const IRQ_LINES: u32 = (Exception::COUNT - 16) as u32;
+
+/// The pins the machine layer has taken, keeping the strong reference.
+///
+/// A net holds its sinks *weakly* (§4.3), so a pin nothing else keeps alive
+/// dies the moment `sink` returns and the wire silently delivers to nothing.
+/// The device owns them; the wire refers to them.
+#[derive(Debug, Default)]
+struct Pins {
+    interrupts: Vec<Arc<InterruptPin>>,
+    nmi: Option<Arc<NmiPin>>,
+    reset: Option<Arc<ResetPin>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -486,7 +541,8 @@ impl fmt::Debug for Session {
 #[derive(Debug)]
 pub struct ArmV7m {
     cfg: Config,
-    lines: Lines,
+    lines: Arc<Lines>,
+    pins: sync::Mutex<Pins>,
     session: sync::Mutex<Session>,
 }
 
@@ -511,7 +567,8 @@ impl ArmV7m {
         };
         ArmV7m {
             cfg,
-            lines: Lines::default(),
+            lines: Arc::new(Lines::default()),
+            pins: sync::Mutex::with_rank(LockRank::DEVICE, Pins::default()),
             session: sync::Mutex::with_rank(
                 LockRank::BUS,
                 Session {
@@ -783,6 +840,36 @@ impl ArmV7m {
         self.lines.get(irq)
     }
 
+    /// Drive the non-maskable interrupt input. Level-sensitive, like the
+    /// external ones.
+    pub fn set_nmi(&self, asserted: bool) {
+        self.lines.set_nmi(asserted);
+    }
+
+    /// Whether the NMI input is asserted.
+    #[must_use]
+    pub fn nmi_asserted(&self) -> bool {
+        self.lines.nmi()
+    }
+
+    /// A handle on the core's interrupt input latches.
+    ///
+    /// What [`InterruptPin`], [`NmiPin`] and [`ResetPin`] are built on, and
+    /// deliberately *not* a handle on the core: a pin that held the core alive
+    /// would close a reference cycle §4.3 forbids. A machine file never needs
+    /// this — [`Device::sink`] builds the pins — but a downstream SoC crate
+    /// wiring the core up by hand does.
+    #[must_use]
+    pub fn lines(&self) -> Arc<Lines> {
+        Arc::clone(&self.lines)
+    }
+
+    /// Cycles owed to the next budget — see [`run_budget`](ArmV7m::run_budget).
+    #[must_use]
+    pub fn cycle_debt(&self) -> u64 {
+        self.session.lock().state.debt
+    }
+
     /// Make external interrupt `irq` pending once, the way a write to
     /// `NVIC_ISPR` or `STIR` would.
     ///
@@ -813,12 +900,17 @@ impl ArmV7m {
     /// one cycle per call and keeps sleeping.
     pub fn step(&self) -> u64 {
         let external = self.lines.snapshot();
+        let nmi = self.lines.nmi();
+        let reset = self.lines.take_reset();
         let mut session = self.session.lock();
         let Session { state, space } = &mut *session;
+        if reset {
+            state.reset_pending = true;
+        }
         let Some(space) = space.clone() else {
             return 0;
         };
-        Exec::new(state, &space, &self.cfg).step(&external)
+        Exec::new(state, &space, &self.cfg).step(&external, nmi)
     }
 
     /// Execute until at least `budget` cycles have been charged.
@@ -837,6 +929,44 @@ impl ArmV7m {
             used += n;
         }
         used
+    }
+
+    /// Run a scheduler budget, reporting exactly what was consumed — never
+    /// more.
+    ///
+    /// An instruction cannot be stopped half way, so the last one of a budget
+    /// usually runs past its end, and [`run`](ArmV7m::run) reports the
+    /// overshoot honestly. The scheduler treats an overrun as fatal — the
+    /// overrun has already executed past an event that should have stopped
+    /// it — so what the *device* path does instead is **carry** the
+    /// overshoot: it is deducted from the next budget, which keeps the core's
+    /// cycle count and its domain's tick count in step over any number of
+    /// quanta while never letting a single one overrun.
+    pub fn run_budget(&self, ticks: u64) -> u64 {
+        let owed = self.session.lock().state.debt;
+        if owed >= ticks {
+            self.session.lock().state.debt = owed - ticks;
+            return ticks;
+        }
+        let allowance = ticks - owed;
+        let mut used = 0u64;
+        while used < allowance {
+            let n = self.step();
+            if n == 0 {
+                break;
+            }
+            used += n;
+        }
+        let mut session = self.session.lock();
+        if used >= allowance {
+            session.state.debt = used - allowance;
+            ticks
+        } else {
+            // The core stopped early — no address space, nothing more to run.
+            // Nothing is owed, and the scheduler is told the truth.
+            session.state.debt = 0;
+            owed + used
+        }
     }
 
     /// Disassemble `count` instructions starting at `addr`, reading guest
@@ -977,11 +1107,50 @@ impl Device for ArmV7m {
         &CLASS
     }
 
-    fn realize(&self, ctx: &mut RealizeCtx<'_>) -> Result<()> {
-        if self.session.lock().space.is_none() {
-            return Err(ctx.error("no address space attached to this core"));
-        }
+    fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
+        // Nothing outward. A core with no address space cannot fetch, but
+        // realize runs *before* the machine binds one, so checking here would
+        // refuse every machine — that check is `Instance::bind`'s, which is
+        // where the space arrives.
         Ok(())
+    }
+
+    fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
+        // The fan-in can only be built now: it is told its sources at
+        // construction and no `WireId` existed when this core was made. The
+        // strong reference stays here, because a net holds its sinks weakly.
+        let mut pins = self.pins.lock();
+        match port {
+            "nmi" => {
+                let pin = Arc::new(NmiPin::new(Arc::clone(&self.lines), sources));
+                pins.nmi = Some(Arc::clone(&pin));
+                Some(SinkPin {
+                    sink: pin,
+                    line: u32::from(Exception::NMI.0),
+                })
+            }
+            "reset" => {
+                let pin = Arc::new(ResetPin::new(Arc::clone(&self.lines), sources));
+                pins.reset = Some(Arc::clone(&pin));
+                Some(SinkPin {
+                    sink: pin,
+                    line: u32::from(Exception::RESET.0),
+                })
+            }
+            _ => {
+                let irq = port_index(port, "irq", IRQ_LINES)?;
+                let pin = Arc::new(InterruptPin::new(
+                    Arc::clone(&self.lines),
+                    irq as u16,
+                    sources,
+                ));
+                pins.interrupts.push(Arc::clone(&pin));
+                Some(SinkPin {
+                    sink: pin,
+                    line: irq,
+                })
+            }
+        }
     }
 
     fn reset(&self, kind: ResetKind) {
@@ -998,7 +1167,12 @@ impl Device for ArmV7m {
             }
         }
         if kind == ResetKind::Cold {
+            // A cold start has nothing driving the inputs yet, so zeroing them
+            // is the truth. A *warm* reset does have drivers, and clearing
+            // what they assert would make the reset lie about the machine —
+            // so the levels are left exactly as the wires left them.
             self.lines.restore(&[0; IRQ_WORDS]);
+            self.lines.set_nmi(false);
         }
     }
 
@@ -1015,6 +1189,7 @@ impl Device for ArmV7m {
         w.write_u8(state.basepri)?;
         w.write_u32(state.control)?;
         w.write_u64(state.cycles)?;
+        w.write_u64(state.debt)?;
         w.write_bool(state.asleep)?;
         w.write_bool(state.event)?;
         w.write_bool(state.reset_pending)?;
@@ -1029,6 +1204,9 @@ impl Device for ArmV7m {
         for word in self.lines.snapshot() {
             w.write_u32(word)?;
         }
+        // The interrupt inputs are architectural: a restored machine whose
+        // peripheral was already asserting must still see it.
+        w.write_bool(self.lines.nmi())?;
         Ok(())
     }
 
@@ -1045,6 +1223,7 @@ impl Device for ArmV7m {
         state.basepri = r.read_u8()?;
         state.control = r.read_u32()?;
         state.cycles = r.read_u64()?;
+        state.debt = r.read_u64()?;
         state.asleep = r.read_bool()?;
         state.event = r.read_bool()?;
         state.reset_pending = r.read_bool()?;
@@ -1061,8 +1240,10 @@ impl Device for ArmV7m {
         for word in &mut lines {
             *word = r.read_u32()?;
         }
+        let nmi = r.read_bool()?;
         self.session.lock().state = state;
         self.lines.restore(&lines);
+        self.lines.set_nmi(nmi);
         Ok(())
     }
 
@@ -1071,7 +1252,7 @@ impl Device for ArmV7m {
     }
 
     fn run(&self, budget: Budget) -> Consumed {
-        Consumed::new(self.run(budget.ticks))
+        Consumed::new(self.run_budget(budget.ticks))
     }
 }
 
@@ -1173,24 +1354,96 @@ impl Initiator for ArmV7m {
     }
 }
 
+/// The machine layer's half: a core needs an address space, and this is where
+/// the machine gives it one.
+impl crate::machine::Instance for ArmV7m {
+    fn bind(&self, ctx: &crate::machine::BindCtx<'_>) -> Result<()> {
+        let space = ctx.space().ok_or_else(|| Error::Config {
+            at: ctx.path().to_string(),
+            message: "an ARMv7-M core needs an address space to fetch from (`space = mem`)"
+                .to_string(),
+        })?;
+        self.attach_space(Arc::clone(space));
+        Ok(())
+    }
+}
+
+/// Bind [`CLASS`] into the machine graph.
+///
+/// # Errors
+///
+/// If the class name is already bound.
+pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
+    bindings.bind(CLASS.name, |props| Ok(Arc::new(ArmV7m::from_props(props)?)))
+}
+
+/// What the validator should know about `cpu.arm.v7m`.
+///
+/// # Naming an interrupt
+///
+/// The NVIC is *inside* this core — its registers are part of the system block
+/// at `0xE000E000` and its pending bits are core state — so there is no
+/// separate controller object for a machine file to wire through, the way a
+/// RISC-V board wires through a PLIC. A peripheral raises interrupt *n* by
+/// driving this core's pin `irq{n}` directly:
+///
+/// ```text
+/// wire usart2.irq -> cpu.irq38
+/// ```
+///
+/// Which number a peripheral gets is a **part** fact, not an architecture one
+/// and not a device one: it is a row of the vendor's vector table (for an
+/// STM32F407, RM0090 Table 62). So it belongs in the `.machine` file, where
+/// the part is chosen, and a device model must never hard-code one.
+///
+/// `nmi` and `reset` are the two non-numbered inputs. There is no `irq` pin
+/// without a number, and no output pin at all: an M-profile core drives
+/// nothing this model carries.
+#[must_use]
+pub fn schema() -> crate::machine::validate::ClassSchema {
+    use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
+    ClassSchema::new(CLASS.name)
+        .prop(PropSchema::new("part", ValueKind::Str).values(&[
+            "cortex-m3",
+            "cortex-m4",
+            "cortex-m7",
+        ]))
+        .prop(PropSchema::new("big-endian", ValueKind::Bool))
+        .prop(PropSchema::new("priority-bits", ValueKind::Uint).range(0, 8))
+        .prop(PropSchema::new("dsp", ValueKind::Bool))
+        .prop(PropSchema::new("mpu", ValueKind::Bool))
+        // Inputs only. `irq0`…`irq239` are the NVIC's external lines.
+        .port_bank("irq", PortDir::In, IRQ_LINES)
+        .port("nmi", PortDir::In)
+        .port("reset", PortDir::In)
+}
+
 /// One external interrupt input, as something a [`Wire`] can drive.
+///
+/// A wire hands each sink the level of the *driver that changed*, not the
+/// resolved level of the net, so this keeps a [`FanIn`] and wire-ORs the
+/// sources — which is what a shared interrupt line does in hardware.
+///
+/// The pin keeps a handle on the core's *input latches*, not on the core: the
+/// core owns the pin, and a pin that owned the core back would be a reference
+/// cycle §4.3 forbids and that the machine could never drop. It also could not
+/// be built at all from [`Device::sink`], which has only `&self`.
 ///
 /// [`Wire`]: crate::core::wire::Wire
 #[derive(Debug)]
 pub struct InterruptPin {
-    cpu: Arc<ArmV7m>,
+    lines: Arc<Lines>,
     irq: u16,
     inputs: FanIn,
     resolve: Resolve,
 }
 
 impl InterruptPin {
-    /// Connect external interrupt `irq` of `cpu` to a net driven by
-    /// `sources`.
+    /// Connect external interrupt `irq` to a net driven by `sources`.
     #[must_use]
-    pub fn new(cpu: Arc<ArmV7m>, irq: u16, sources: &[WireId]) -> InterruptPin {
+    pub fn new(lines: Arc<Lines>, irq: u16, sources: &[WireId]) -> InterruptPin {
         InterruptPin {
-            cpu,
+            lines,
             irq,
             inputs: FanIn::new(sources),
             resolve: Resolve::Or,
@@ -1221,6 +1474,97 @@ impl WireSink for InterruptPin {
     fn set_level(&self, src: WireId, _line: u32, level: Level) {
         self.inputs.set(src, level);
         let asserted = self.inputs.resolve(self.resolve).is_high();
-        self.cpu.set_irq(self.irq, asserted);
+        self.lines.set(self.irq, asserted);
+    }
+}
+
+/// The non-maskable interrupt input.
+///
+/// Separate from [`InterruptPin`] because NMI is not one of the NVIC's
+/// external lines: it has no enable bit, no priority register, and no number
+/// a `NVIC_ISER` write can reach.
+#[derive(Debug)]
+pub struct NmiPin {
+    lines: Arc<Lines>,
+    inputs: FanIn,
+    resolve: Resolve,
+}
+
+impl NmiPin {
+    /// Connect the NMI input to a net driven by `sources`.
+    #[must_use]
+    pub fn new(lines: Arc<Lines>, sources: &[WireId]) -> NmiPin {
+        NmiPin {
+            lines,
+            inputs: FanIn::new(sources),
+            resolve: Resolve::Or,
+        }
+    }
+
+    /// The same pin with an explicit resolution rule.
+    #[must_use]
+    pub fn with_resolve(mut self, resolve: Resolve) -> NmiPin {
+        self.resolve = resolve;
+        self
+    }
+
+    /// The per-source levels currently seen.
+    #[must_use]
+    pub fn inputs(&self) -> &FanIn {
+        &self.inputs
+    }
+}
+
+impl WireSink for NmiPin {
+    fn set_level(&self, src: WireId, _line: u32, level: Level) {
+        self.inputs.set(src, level);
+        let asserted = self.inputs.resolve(self.resolve).is_high();
+        self.lines.set_nmi(asserted);
+    }
+}
+
+/// The core's reset input.
+///
+/// Not an interrupt: no vector, no priority, no pending bit. Asserting the
+/// line latches a request; the reset sequence itself runs on the next
+/// [`ArmV7m::step`], because a reset is a signal rather than a method call.
+#[derive(Debug)]
+pub struct ResetPin {
+    lines: Arc<Lines>,
+    inputs: FanIn,
+    resolve: Resolve,
+}
+
+impl ResetPin {
+    /// Connect the reset input to a net driven by `sources`.
+    #[must_use]
+    pub fn new(lines: Arc<Lines>, sources: &[WireId]) -> ResetPin {
+        ResetPin {
+            lines,
+            inputs: FanIn::new(sources),
+            resolve: Resolve::Or,
+        }
+    }
+
+    /// The same pin with an explicit resolution rule.
+    #[must_use]
+    pub fn with_resolve(mut self, resolve: Resolve) -> ResetPin {
+        self.resolve = resolve;
+        self
+    }
+
+    /// The per-source levels currently seen.
+    #[must_use]
+    pub fn inputs(&self) -> &FanIn {
+        &self.inputs
+    }
+}
+
+impl WireSink for ResetPin {
+    fn set_level(&self, src: WireId, _line: u32, level: Level) {
+        self.inputs.set(src, level);
+        if self.inputs.resolve(self.resolve).is_high() {
+            self.lines.set_reset(true);
+        }
     }
 }

@@ -989,6 +989,174 @@ fn the_device_surface_is_wired_up() {
 }
 
 #[test]
+fn realize_does_nothing_outward_and_bind_is_what_needs_a_space() {
+    use crate::core::device::{Deferred, RealizeCtx};
+    use crate::core::space::RequesterId;
+
+    // Realize runs *before* the machine hands anything out, so a
+    // `space.is_none()` check there would refuse every machine. The check
+    // belongs where the space arrives, which is `Instance::bind`
+    // (`ROADMAP.md` §4.4).
+    let cpu = ArmV7m::new(Config::CORTEX_M4);
+    let mut deferred = Deferred::new();
+    let hosts = crate::core::HostObjects::new();
+    let mut ctx = RealizeCtx::new("cpu", RequesterId::ANONYMOUS, &mut deferred, &hosts);
+    assert!(Device::realize(&cpu, &mut ctx).is_ok());
+    assert!(cpu.space().is_none(), "realize attaches nothing");
+}
+
+#[test]
+fn the_interrupt_pins_are_named_by_number() {
+    use crate::core::wire::{Level, WireId};
+
+    let h = Harness::m4(&[0xbf00]);
+    let src = WireId::new(1);
+    // The NVIC is inside the core, so a peripheral drives an interrupt
+    // *number* on the core itself rather than a controller between them.
+    let pin = Device::sink(h.cpu.as_ref(), "irq38", &[src]).expect("irq38");
+    assert_eq!(pin.line, 38);
+    pin.sink.set_level(src, 0, Level::High);
+    assert!(h.cpu.irq_asserted(38));
+
+    assert!(Device::sink(h.cpu.as_ref(), "irq0", &[src]).is_some());
+    assert!(Device::sink(h.cpu.as_ref(), "irq239", &[src]).is_some());
+    // 240 external interrupts is all there is room for in 256 exception
+    // numbers, and a pin the core has no vector for is an error rather than a
+    // line that silently goes nowhere.
+    assert!(Device::sink(h.cpu.as_ref(), "irq240", &[src]).is_none());
+    // One spelling per pin: two would be two nets in the wire graph.
+    assert!(Device::sink(h.cpu.as_ref(), "irq07", &[src]).is_none());
+    assert!(Device::sink(h.cpu.as_ref(), "irq", &[src]).is_none());
+    assert!(Device::sink(h.cpu.as_ref(), "irqx", &[src]).is_none());
+}
+
+#[test]
+fn a_sink_survives_the_handover_to_the_wire() {
+    use crate::core::wire::{Level, WireId};
+
+    // A net holds its sinks *weakly*, so the device has to keep the strong
+    // reference or the wire delivers to a pin that died on handover.
+    let h = Harness::m4(&[0xbf00]);
+    let src = WireId::new(1);
+    let pin = Device::sink(h.cpu.as_ref(), "irq5", &[src]).expect("irq5");
+    let weak = Arc::downgrade(&pin.sink);
+    drop(pin);
+    let alive = weak.upgrade().expect("the core still owns the pin");
+    alive.set_level(src, 0, Level::High);
+    assert!(h.cpu.irq_asserted(5));
+}
+
+#[test]
+fn the_nmi_pin_is_not_one_of_the_numbered_ones() {
+    use crate::core::wire::{Level, WireId};
+
+    let h = Harness::m4(&[0xbf00, 0xbf00]);
+    let src = WireId::new(1);
+    h.set_word(2 * 4, 0x301); // the NMI vector
+    h.set_word(0x300, 0xe7fe); // `B .`
+    let nmi = Device::sink(h.cpu.as_ref(), "nmi", &[src]).expect("nmi");
+    assert_eq!(nmi.line, u32::from(Exception::NMI.0));
+    nmi.sink.set_level(src, 0, Level::High);
+    assert!(h.cpu.nmi_asserted());
+    h.cpu.step();
+    assert_eq!(
+        h.cpu.current_exception(),
+        Exception::NMI,
+        "NMI has no enable bit to be disabled by"
+    );
+}
+
+#[test]
+fn the_reset_pin_is_a_signal_and_not_a_method_call() {
+    use crate::core::wire::{Level, WireId};
+
+    let h = Harness::m4(&[0x2042]);
+    let src = WireId::new(1);
+    h.cpu.step();
+    assert_eq!(h.cpu.reg(0), 0x42);
+    let reset = Device::sink(h.cpu.as_ref(), "reset", &[src]).expect("reset");
+    reset.sink.set_level(src, 0, Level::High);
+    h.cpu.step(); // the sequence runs
+    assert_eq!(h.cpu.pc(), ENTRY, "the reset sequence re-read the vectors");
+}
+
+#[test]
+fn a_warm_reset_does_not_invent_a_level_for_an_input_pin() {
+    let h = Harness::m4(&[0xbf00]);
+    h.cpu.set_irq(7, true);
+    h.cpu.set_nmi(true);
+    Device::reset(h.cpu.as_ref(), crate::core::device::ResetKind::Warm);
+    assert!(
+        h.cpu.irq_asserted(7) && h.cpu.nmi_asserted(),
+        "a warm reset has drivers; clearing what they assert would lie"
+    );
+    Device::reset(h.cpu.as_ref(), crate::core::device::ResetKind::Cold);
+    assert!(!h.cpu.irq_asserted(7) && !h.cpu.nmi_asserted());
+}
+
+#[test]
+fn a_scheduler_budget_is_never_overrun() {
+    use crate::core::clock::GlobalTime;
+    use crate::core::sched::Budget;
+
+    // Nothing here costs one cycle, so a one-tick budget must overshoot — and
+    // the overshoot has to be *carried*, not reported, because the scheduler
+    // treats an overrun as fatal: it has already executed past an event that
+    // should have stopped it.
+    let h = Harness::m4(&[0xfb00, 0xf000, 0xfb00, 0xf000, 0xfb00, 0xf000]);
+    let before = h.cpu.cycles();
+    let mut consumed = 0u64;
+    for _ in 0..6 {
+        let used = Device::run(
+            h.cpu.as_ref(),
+            Budget {
+                until: GlobalTime::ZERO,
+                ticks: 1,
+            },
+        );
+        assert!(
+            used.ticks <= 1,
+            "consumed {} of a 1-tick budget",
+            used.ticks
+        );
+        consumed += used.ticks;
+    }
+    assert_eq!(consumed, 6, "a paid-down debt still spends the budget");
+    // The two accountings agree to within what is still owed. That is the
+    // invariant the debt exists to keep.
+    assert_eq!(h.cpu.cycles() - before, consumed + h.cpu.cycle_debt());
+}
+
+#[test]
+fn the_schema_and_the_sinks_agree_about_every_pin() {
+    use crate::core::wire::WireId;
+    use crate::machine::validate::PortDir;
+
+    let h = Harness::m4(&[0xbf00]);
+    let schema = super::schema();
+    let src = WireId::new(1);
+    for name in ["irq0", "irq38", "irq239", "nmi", "reset"] {
+        let port = schema
+            .port_named(name)
+            .unwrap_or_else(|| panic!("the schema should know `{name}`"));
+        assert_eq!(port.dir, PortDir::In, "{name}");
+        assert!(
+            Device::sink(h.cpu.as_ref(), name, &[src]).is_some(),
+            "the device should build `{name}`"
+        );
+    }
+    for name in ["irq240", "irq07", "irq", "wfi"] {
+        assert!(schema.port_named(name).is_none(), "{name}");
+        assert!(
+            Device::sink(h.cpu.as_ref(), name, &[src]).is_none(),
+            "{name}"
+        );
+    }
+    // An M-profile core drives nothing this model carries.
+    assert!(schema.ports.iter().all(|p| p.dir == PortDir::In));
+}
+
+#[test]
 fn from_props_names_a_part_and_rejects_a_typo() {
     let props = Props::new().with("part", Value::from("cortex-m7"));
     let cpu = ArmV7m::from_props(&props).unwrap();
@@ -1045,7 +1213,7 @@ fn an_interrupt_pin_drives_the_nvic() {
     use crate::core::wire::{Level, WireId, WireSink};
     let h = Harness::m4(&[0xbf00]);
     let src = WireId::new(1);
-    let pin = InterruptPin::new(Arc::clone(&h.cpu), 3, &[src]);
+    let pin = InterruptPin::new(h.cpu.lines(), 3, &[src]);
     assert_eq!(pin.irq(), 3);
     pin.set_level(src, 0, Level::High);
     assert!(h.cpu.irq_asserted(3));

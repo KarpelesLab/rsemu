@@ -94,23 +94,87 @@ impl PortDir {
     }
 }
 
-/// One pin a device class has.
+/// One pin — or one numbered *bank* of pins — a device class has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortSchema {
-    /// Its name, as a `wire` statement spells it.
+    /// Its name, as a `wire` statement spells it. For a bank this is the
+    /// prefix the index is appended to.
     pub name: String,
     /// Which way it drives.
     pub dir: PortDir,
+    /// How many numbered pins this entry stands for.
+    ///
+    /// `None` is a single pin spelled exactly [`name`](PortSchema::name).
+    /// `Some(n)` is a bank: `n` pins spelled `name0` … `name{n-1}`, which is
+    /// how a device with dozens of identical lines — an M-profile core's 240
+    /// NVIC inputs, a GPIO port's sixteen pins — declares them without
+    /// enumerating them.
+    pub count: Option<u32>,
 }
 
 impl PortSchema {
-    /// A pin.
+    /// A single pin.
     pub fn new(name: impl Into<String>, dir: PortDir) -> PortSchema {
         PortSchema {
             name: name.into(),
             dir,
+            count: None,
         }
     }
+
+    /// A bank of `count` pins, spelled `name0` … `name{count-1}`.
+    ///
+    /// The index is written in decimal with no leading zeros, so each pin has
+    /// exactly one spelling. Two spellings would be two nets in the wire
+    /// graph, which is a bug that looks like a typo.
+    pub fn bank(name: impl Into<String>, dir: PortDir, count: u32) -> PortSchema {
+        PortSchema {
+            name: name.into(),
+            dir,
+            count: Some(count),
+        }
+    }
+
+    /// Whether `port` names this pin — or, for a bank, one of its pins.
+    #[must_use]
+    pub fn matches(&self, port: &str) -> bool {
+        let Some(count) = self.count else {
+            return port == self.name;
+        };
+        parse_index(port, &self.name).is_some_and(|i| i < count)
+    }
+
+    /// How an error message spells this entry.
+    fn describe(&self) -> String {
+        match self.count {
+            None => format!("`{}`", self.name),
+            Some(0) => format!("`{}`(none)", self.name),
+            Some(1) => format!("`{}0`", self.name),
+            Some(n) => format!("`{}0`…`{}{}`", self.name, self.name, n - 1),
+        }
+    }
+}
+
+/// Split `port` into `prefix` and a decimal index, rejecting leading zeros.
+///
+/// `irq7` is the pin; `irq07` is not a second spelling of it.
+fn parse_index(port: &str, prefix: &str) -> Option<u32> {
+    let digits = port.strip_prefix(prefix)?;
+    if digits.is_empty() || (digits.len() > 1 && digits.starts_with('0')) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The index a banked pin named `port` carries, if it is one of `prefix`'s.
+///
+/// The counterpart of [`PortSchema::bank`] for a device's own
+/// [`Device::sink`](crate::core::Device::sink): the schema says which
+/// spellings exist and this says what one of them means, so the two cannot
+/// drift apart in how they parse.
+#[must_use]
+pub fn port_index(port: &str, prefix: &str, count: u32) -> Option<u32> {
+    parse_index(port, prefix).filter(|i| *i < count)
 }
 
 /// One property a device class takes.
@@ -220,7 +284,14 @@ impl ClassSchema {
 
     /// The pin `name`, if it has one.
     pub fn port_named(&self, name: &str) -> Option<&PortSchema> {
-        self.ports.iter().find(|p| p.name == name)
+        self.ports.iter().find(|p| p.matches(name))
+    }
+
+    /// Add a bank of `count` numbered pins, spelled `name0` … `name{count-1}`.
+    #[must_use]
+    pub fn port_bank(mut self, name: impl Into<String>, dir: PortDir, count: u32) -> ClassSchema {
+        self.ports.push(PortSchema::bank(name, dir, count));
+        self
     }
 }
 
@@ -619,7 +690,7 @@ fn check_pin(
         return Ok(());
     };
     let Some(port) = schema.port_named(&pin.port) else {
-        let known = names(schema.ports.iter().map(|p| p.name.as_str()));
+        let known = describe_ports(&schema.ports);
         return Err(Diagnostic::new(
             pin.span,
             format!(
@@ -758,6 +829,25 @@ fn space_schema() -> ClassSchema {
 }
 
 /// `` `a`, `b` ``, or `none`.
+/// The pin list an error message shows, banks folded into a range.
+fn describe_ports(ports: &[PortSchema]) -> String {
+    let mut out = String::new();
+    for (i, port) in ports.iter().enumerate() {
+        if i == 8 {
+            out.push_str(", \u{2026}");
+            break;
+        }
+        if i != 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&port.describe());
+    }
+    if ports.is_empty() {
+        out.push_str("none");
+    }
+    out
+}
+
 fn names<'i>(iter: impl Iterator<Item = &'i str>) -> String {
     let mut out = String::new();
     let mut count = 0usize;
