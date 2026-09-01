@@ -575,6 +575,13 @@ fn install_drives(options: &rsemu::machine::BuildOptions, args: &RunArgs) -> rse
     Ok(())
 }
 
+/// Wrap the machine's bindings so a display or audio device hands the host a
+/// handle.
+///
+/// One arm per device family that publishes a scanout or a sample stream,
+/// exactly like the registration lists in `machine::catalog`: a family that is
+/// not named here is not in the build, and that is visible by reading the code.
+#[allow(unused_variables, unused_mut)]
 fn install_capture(
     options: &mut rsemu::machine::BuildOptions,
     args: &RunArgs,
