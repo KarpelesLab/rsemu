@@ -16,6 +16,13 @@
 //! the wrong pin, a vector that never reaches the processor because a mask bit
 //! was still set.
 //!
+//! The same firmware, with one section swapped, arms the **local APIC's own
+//! timer** instead — a path that never touches the I/O APIC — and that is where
+//! the timing rule is asserted: the interrupt lands after a millisecond of
+//! *virtual* time, so a run budgeted half a millisecond sees nothing and a run
+//! budgeted three sees exactly one. A device that consulted a host clock could
+//! not produce that pair of answers.
+//!
 //! # The program
 //!
 //! `machines/pc-apic.machine` puts a 128 KiB ROM socket at `0xe0000` and a
@@ -69,6 +76,15 @@ const COUNTER: u32 = 0x3000;
 /// The vector the redirection entry carries.
 const VECTOR: u8 = 0x40;
 
+/// The vector the local APIC's own timer carries.
+const TIMER_VECTOR: u8 = 0x41;
+
+/// What the guest loads into the APIC timer's initial count. The board's bus
+/// clock is 100 MHz and the divide configuration is one, so this is a
+/// millisecond — long enough that the protected-mode setup before it cannot be
+/// confused with it.
+const TIMER_COUNT: u32 = 100_000;
+
 /// Which I/O APIC input the HPET's first comparator is wired to, per
 /// `machines/pc-apic.machine`.
 const HPET_INPUT: u8 = 20;
@@ -90,9 +106,19 @@ fn store_at(out: &mut Vec<u8>, disp: u32, value: u32) {
     dw(out, value);
 }
 
+/// Which timer the firmware arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// An HPET comparator, level-triggered, routed through the I/O APIC.
+    Hpet,
+    /// The local APIC's own timer, one-shot, which reaches the processor
+    /// without going near the I/O APIC.
+    ApicTimer,
+}
+
 /// The firmware image: real-mode entry, a GDT, protected-mode setup, the driver
 /// and its interrupt handler.
-fn firmware() -> Vec<u8> {
+fn firmware(source: Source) -> Vec<u8> {
     let mut rom = vec![0u8; ROM_LEN];
 
     // -- the reset vector ---------------------------------------------------
@@ -148,11 +174,15 @@ fn firmware() -> Vec<u8> {
     pm.push(0xbc); // mov esp, 0xf000
     dw(&mut pm, 0xf000);
 
-    // Build one interrupt gate, for `VECTOR`, at IDT_BASE + 8 * VECTOR. RAM
-    // comes out of a cold reset zeroed, so every other entry is a not-present
-    // gate already.
+    // Build one interrupt gate, for this source's vector, at
+    // IDT_BASE + 8 * vector. RAM comes out of a cold reset zeroed, so every
+    // other entry is a not-present gate already.
+    let vector = match source {
+        Source::Hpet => VECTOR,
+        Source::ApicTimer => TIMER_VECTOR,
+    };
     pm.push(0xbf); // mov edi, gate
-    dw(&mut pm, IDT_BASE + 8 * u32::from(VECTOR));
+    dw(&mut pm, IDT_BASE + 8 * u32::from(vector));
     pm.push(0xb8); // mov eax, handler
     dw(&mut pm, lin(OFF_HANDLER));
     pm.extend_from_slice(&[0x66, 0x89, 0x07]); // mov [edi], ax
@@ -164,17 +194,19 @@ fn firmware() -> Vec<u8> {
     pm.extend_from_slice(&[0x0f, 0x01, 0x1d]); // lidt [idt_ptr]
     dw(&mut pm, lin(OFF_IDT_PTR));
 
-    // The I/O APIC. Two indirect writes per half: the index register, then the
-    // data window. The high half first, so the entry is never briefly unmasked
-    // with a destination nobody has written.
-    pm.push(0xbf); // mov edi, 0xfec00000
-    dw(&mut pm, 0xfec0_0000);
-    let index = 0x10 + 2 * u32::from(HPET_INPUT);
-    store_at(&mut pm, 0x00, index + 1);
-    store_at(&mut pm, 0x10, 0); // destination: APIC ID 0, physical
-    store_at(&mut pm, 0x00, index);
-    // Vector, level-triggered (bit 15), unmasked, fixed delivery to APIC 0.
-    store_at(&mut pm, 0x10, (1 << 15) | u32::from(VECTOR));
+    if source == Source::Hpet {
+        // The I/O APIC. Two indirect writes per half: the index register, then
+        // the data window. The high half first, so the entry is never briefly
+        // unmasked with a destination nobody has written.
+        pm.push(0xbf); // mov edi, 0xfec00000
+        dw(&mut pm, 0xfec0_0000);
+        let index = 0x10 + 2 * u32::from(HPET_INPUT);
+        store_at(&mut pm, 0x00, index + 1);
+        store_at(&mut pm, 0x10, 0); // destination: APIC ID 0, physical
+        store_at(&mut pm, 0x00, index);
+        // Vector, level-triggered (bit 15), unmasked, fixed delivery to APIC 0.
+        store_at(&mut pm, 0x10, (1 << 15) | u32::from(VECTOR));
+    }
 
     // The local APIC: software-enable it, with 0xff as the spurious vector.
     // Nothing this part delivers reaches the processor until this is written
@@ -183,16 +215,29 @@ fn firmware() -> Vec<u8> {
     dw(&mut pm, 0xfee0_0000);
     store_at(&mut pm, 0xf0, 0x1ff);
 
-    // The HPET: comparator 0 level-triggered and enabled, matching 1000 ticks
-    // from now, and then the main counter started.
-    pm.push(0xbf); // mov edi, 0xfed00000
-    dw(&mut pm, 0xfed0_0000);
-    store_at(&mut pm, 0x100, 0b110); // Tn_INT_ENB_CNF | Tn_INT_TYPE_CNF
-    store_at(&mut pm, 0x104, 0);
-    store_at(&mut pm, 0x108, HPET_DELAY);
-    store_at(&mut pm, 0x10c, 0);
-    store_at(&mut pm, 0x010, 1); // ENABLE_CNF
-    store_at(&mut pm, 0x014, 0);
+    match source {
+        Source::ApicTimer => {
+            // Divide by one, a one-shot at `TIMER_VECTOR`, and the count that
+            // starts it. The order matters and is the architecture's: the LVT
+            // entry says where the interrupt goes, and "writing to the initial
+            // count register starts the timer" (SDM Vol 3A 10.5.4).
+            store_at(&mut pm, 0x3e0, 0b1011);
+            store_at(&mut pm, 0x320, u32::from(TIMER_VECTOR));
+            store_at(&mut pm, 0x380, TIMER_COUNT);
+        }
+        Source::Hpet => {
+            // Comparator 0 level-triggered and enabled, matching 1000 ticks
+            // from now, and then the main counter started.
+            pm.push(0xbf); // mov edi, 0xfed00000
+            dw(&mut pm, 0xfed0_0000);
+            store_at(&mut pm, 0x100, 0b110); // Tn_INT_ENB_CNF | Tn_INT_TYPE_CNF
+            store_at(&mut pm, 0x104, 0);
+            store_at(&mut pm, 0x108, HPET_DELAY);
+            store_at(&mut pm, 0x10c, 0);
+            store_at(&mut pm, 0x010, 1); // ENABLE_CNF
+            store_at(&mut pm, 0x014, 0);
+        }
+    }
 
     pm.push(0xfb); // sti
     pm.extend_from_slice(&[0xeb, 0xfe]); // jmp $
@@ -206,9 +251,11 @@ fn firmware() -> Vec<u8> {
     // never interrupt again; if the remote IRR were not held in the first
     // place, this handler would be re-entered before it finished.
     let mut handler: Vec<u8> = Vec::new();
-    handler.extend_from_slice(&[0xc7, 0x05]); // mov dword [0xfed00020], 1
-    dw(&mut handler, 0xfed0_0020);
-    dw(&mut handler, 1);
+    if source == Source::Hpet {
+        handler.extend_from_slice(&[0xc7, 0x05]); // mov dword [0xfed00020], 1
+        dw(&mut handler, 0xfed0_0020);
+        dw(&mut handler, 1);
+    }
     handler.extend_from_slice(&[0xff, 0x05]); // inc dword [COUNTER]
     dw(&mut handler, COUNTER);
     handler.extend_from_slice(&[0xc7, 0x05]); // mov dword [0xfee000b0], 0
@@ -227,9 +274,9 @@ fn put(rom: &mut [u8], off: usize, bytes: &[u8]) {
 }
 
 /// Build the board with that firmware in its socket.
-fn board() -> Machine {
+fn board(source: Source) -> Machine {
     let mut options = rsemu::machine::catalog::build_options().expect("this build's classes");
-    options.realize.media.insert("bios", firmware());
+    options.realize.media.insert("bios", firmware(source));
     let registry = rsemu::machine::catalog::registry().expect("this build's registry");
     match build("pc-apic.machine", PC_APIC, &registry, &options) {
         Ok(m) => m,
@@ -247,7 +294,7 @@ fn peek32(m: &Machine, addr: u64) -> u32 {
 
 #[test]
 fn the_board_realizes_with_every_apic_page_where_its_specification_puts_it() {
-    let m = board();
+    let m = board(Source::Hpet);
     assert_eq!(m.name(), "pc-apic");
     let mem = m.space("mem").expect("the memory space");
     // The I/O APIC's version register, reached the way a driver reaches it:
@@ -278,7 +325,7 @@ fn the_board_realizes_with_every_apic_page_where_its_specification_puts_it() {
 
 #[test]
 fn a_guest_driver_programs_the_io_apic_takes_the_interrupt_and_ends_it() {
-    let mut m = board();
+    let mut m = board(Source::Hpet);
     m.reset(ResetKind::Cold);
     m.sweep();
 
@@ -331,7 +378,7 @@ fn the_same_run_twice_lands_in_the_same_place() {
     // the same board agree exactly.
     let counts: Vec<u32> = (0..2)
         .map(|_| {
-            let mut m = board();
+            let mut m = board(Source::Hpet);
             m.reset(ResetKind::Cold);
             m.sweep();
             m.run_for(GlobalTime::from_nanos(5_000_000))
@@ -341,4 +388,48 @@ fn the_same_run_twice_lands_in_the_same_place() {
         .collect();
     assert_eq!(counts[0], counts[1]);
     assert_eq!(counts[0], 1);
+}
+
+/// Run the board with `source` armed for `nanos` of virtual time, and report
+/// how many times the guest's handler ran.
+fn interrupts_in(source: Source, nanos: u64) -> u32 {
+    let mut m = board(source);
+    m.reset(ResetKind::Cold);
+    m.sweep();
+    m.run_for(GlobalTime::from_nanos(nanos))
+        .expect("the machine runs");
+    peek32(&m, u64::from(COUNTER))
+}
+
+#[test]
+fn the_apic_timer_fires_at_a_tick_the_scheduler_chose() {
+    // The guest arms a one-shot for 100 000 bus ticks with a divisor of one.
+    // The board's bus crystal is 100 MHz, so that is one millisecond of virtual
+    // time — a number that comes from the machine file's oscillator and the
+    // timer's own arithmetic and from nothing else.
+    //
+    // **This is the test that fails if the device reads a clock.** Virtual time
+    // is the only thing that moves here: `run_for` is a budget, not a delay, and
+    // the whole run takes well under a millisecond of wall time. A timer that
+    // consulted the host would fire in the short run and might fire many times
+    // in the long one; a timer that counts its own domain's ticks fires exactly
+    // once, and only in the run long enough to contain it.
+    assert_eq!(
+        interrupts_in(Source::ApicTimer, 500_000),
+        0,
+        "half a millisecond of virtual time is not a millisecond"
+    );
+    assert_eq!(
+        interrupts_in(Source::ApicTimer, 3_000_000),
+        1,
+        "three milliseconds contains exactly one expiry of a one-shot"
+    );
+}
+
+#[test]
+fn the_apic_timer_lands_in_the_same_place_every_run() {
+    let counts: Vec<u32> = (0..3)
+        .map(|_| interrupts_in(Source::ApicTimer, 3_000_000))
+        .collect();
+    assert_eq!(counts, [1, 1, 1]);
 }
