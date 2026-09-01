@@ -25,6 +25,29 @@ exclude       = ["/docs/local", "/.github"]
 # (CLAUDE.md). Optional, so the default `cargo tree` is still only `rsemu`.
 oxideav-png = { version = "0.1", default-features = false, optional = true }
 
+# Disk images and the block-device seam under `dev/blk`: `fstool::BlockDevice`
+# plus sparse raw, qcow2, DMG, DiskCopy 4.2 and LUKS backends. First-party
+# (Karpelès Lab, MIT) and named as a permitted dependency in CLAUDE.md;
+# `ROADMAP.md` §7.1 makes it *the* storage substrate, so rsemu adapts to it
+# rather than inventing a parallel block abstraction. `default-features =
+# false` drops the CLI's line editor and the archive codecs; `gzip` and `zstd`
+# are the two a qcow2 with compressed clusters actually reads through, and both
+# come from `compcol`, which is permitted already. Optional, so the default
+# `cargo tree` is still only `rsemu`.
+fstool = { version = "0.4.24", default-features = false, features = [
+  "gzip",
+  "zstd",
+], optional = true }
+
+# The L2/L3 packet toolkit `dev::net` bridges to: `Frame`, `MacAddr`,
+# `EtherType`, the `L2Device` seam, `L2Hub`, TAP, slirp and the rest. First-party
+# (Karpeles Lab, MIT) and pure Rust; `default-features = false` is the whole
+# crate's *default* feature set, which is empty, so the added tree is this crate
+# and nothing under it. Optional, so the default `cargo tree` is still only
+# `rsemu` - and it is the reason ROADMAP.md 0 grants `dev/net/*` a `std`
+# exception, since `pktkit` is `std`.
+pktkit = { version = "0.1.3", default-features = false, optional = true }
+
 [features]
 # The emulation core is always compiled and never feature-gated. Everything
 # else is one feature per component, so a NES build links a 6502 and nothing
@@ -129,6 +152,17 @@ dev-apple1 = []
 # dependencies.
 machine-apple1 = ["cpu-mos6502", "dev-apple1"]
 
+# Software IEEE-754 arithmetic (src/float): binary32, binary64 and the x87
+# 80-bit double extended format, computed on integers and rounded once, with
+# every guest-specific rule — NaN propagation, the default NaN's sign,
+# tininess detection, flush-to-zero, the min/max and integer-conversion
+# conventions — as a parameter rather than an assumption. This is what makes a
+# guest FPU bit-reproducible across hosts and in a browser (ROADMAP.md §9.1);
+# it is what `cpu-riscv` computes `F`/`D` with, and what an x87 or a VFP will
+# use. `no_std + alloc`, no dependencies, and no `f32`/`f64` anywhere in the
+# arithmetic — a test asserts that by reading the sources back.
+float = []
+
 # The RISC-V core (src/cpu/riscv): an RV64GC interpreter — RV64I/RV32I with
 # M, A, F, D, Zicsr, Zifencei and C — plus the machine/supervisor/user
 # privileged architecture, Sv39/Sv32 paging with a software TLB, and PMP. The
@@ -136,7 +170,7 @@ machine-apple1 = ["cpu-mos6502", "dev-apple1"]
 # §9.1), so guest floating point is bit-reproducible across hosts. RV32 is a
 # construction property rather than a build flag, so one build runs both. Adds
 # no dependencies and is `no_std + alloc`.
-cpu-riscv = []
+cpu-riscv = ["float"]
 
 # The RISC-V IR frontend (src/cpu/riscv/lift.rs): lifting guest instructions
 # into `ir::Block`s — the first frontend for the translation IR, and the half
@@ -177,12 +211,17 @@ machine-beneater = ["cpu-mos6502", "dev-wdc"]
 # move, **master aborts** (an address nothing answers reads as ones, which is
 # how firmware finds an empty slot), and Configuration Mechanism #1 — the
 # 0xcf8/0xcfc pair, with `CONFADD` Dword-only and `CONFDATA` addressable a byte
-# at a time, both of which firmware depends on. Base address registers,
-# interrupt routing, type 1 cycles and PCI Express's extended space are
-# deliberately absent and the module says so. Written from the PCI Local Bus
-# Specification Rev 2.1 (§3.7.4.1, §6.1, §6.2) and the Intel 82441FX datasheet
-# (§3.1.1, §3.1.2, Table 1); no emulator source was consulted (ROADMAP.md §1).
-# `no_std + alloc`, no dependencies.
+# at a time, both of which firmware depends on. Also **base address registers**:
+# the six of them plus the expansion ROM register, the write-all-ones sizing
+# read-back, 32- and 64-bit memory windows, the prefetchable bit, and the
+# retopology-from-inside-a-configuration-write that moving one is — which is
+# the case `core::space`'s docs open with, and is answered by the same
+# order-exempt try-lock the host bridge's PAM registers use. Interrupt routing,
+# type 1 cycles, PCI Express's extended space and I/O BARs that actually decode
+# are deliberately absent and the module says so. Written from the PCI Local Bus
+# Specification Rev 2.1 (§3.7.4.1, §6.1, §6.2, §6.2.5.1, §6.2.5.2) and the Intel
+# 82441FX datasheet (§3.1.1, §3.1.2, Table 1); no emulator source was consulted
+# (ROADMAP.md §1). `no_std + alloc`, no dependencies.
 bus-pci = []
 
 # The SPI bus (src/bus/spi): the fabric, the peripheral seam, and a generic
@@ -652,7 +691,16 @@ dev-pc-video = ["dev-pc"]
 # window and the Type 00h header a firmware probes to decide there is a bridge
 # at all. Written from the Intel 82441FX datasheet (order 290549-001) §3.1.1,
 # §3.1.2 and §3.2.18, cited by section; no emulator source was consulted
-# (ROADMAP.md §1). Needs `bus-pci` and `dev-pc`.
+# (ROADMAP.md §1).
+#
+# And with it `pc.vga-pci`, the PCI face of a display adapter: the Type 00h
+# header whose class code `030000` is how a firmware written this century finds
+# the console, and the **expansion ROM base address register** its video BIOS
+# arrives on. That is the only route to video on a 440FX board -- the firmware
+# turns 0xc0000-0xdffff into DRAM before it looks, so a legacy option ROM socket
+# there is invisible by the time anything scans it. Written from the PCI Local
+# Bus Specification Rev 2.1 §6.2.5.2 and Appendix D. Needs `bus-pci` and
+# `dev-pc`.
 dev-pc-pci = ["dev-pc", "bus-pci"]
 
 # The PC's floppy controller (src/dev/pc/fdc): a NEC uPD765A as the AT wires
@@ -678,6 +726,39 @@ dev-pc-floppy = ["dev-pc"]
 # `unsafe`, no dependencies.
 dev-ata-disk = []
 
+# Real disk-image backing (src/dev/blk): a guest drive whose bytes are a host
+# *file* rather than a buffer, so a sparse 16 GiB disk costs no RAM and a
+# snapshot does not write 16 GiB. Adds `fstool` (Karpelès Lab, MIT -- named as
+# a permitted dependency in CLAUDE.md) and with it the image formats: sparse
+# **raw**, **qcow2** (v2/v3, read/write, allocate-on-write, compressed
+# clusters, backing files, encryption), UDIF **DMG**, DiskCopy 4.2 and
+# **LUKS**. No format is parsed here and none should ever be -- ROADMAP.md
+# §7.1 puts controllers on `fstool::BlockDevice` "rather than on a parallel
+# rsemu invention", and this feature is about a hundred lines of adapter:
+# `&mut self` to `&self` behind a `core::sync` lock, `std::io::Error` to
+# `BusError`, and a snapshot policy that references the image instead of
+# copying it. A run reaches it through the media slot the machine file already
+# names (`rsemu run pc-at --drive hd0=disk.qcow2`), so no machine description
+# and no host adapter changes, and `--hd0 disk.img` still binds bytes: **both
+# paths work**, and the media slot is what keeps `dev-ata-disk` `no_std`.
+#
+# One of the two documented `std` exceptions to the `no_std` rule (CLAUDE.md),
+# so `--no-default-features` excludes it. `default-features = false` on
+# `fstool` drops its CLI's line editor and most codecs; `gzip` and `zstd` are
+# what a qcow2 with compressed clusters needs, and both are served by
+# `compcol`, which is permitted already. Needs `dev-ata-disk` to have a drive
+# to back.
+#
+# **Known cost, and it is not ours to fix here.** `fstool` 0.4 declares its
+# CLI's dependencies unconditionally rather than behind a `cli` feature, so
+# enabling this feature also pulls `clap`, `serde`, `serde_json`, `toml`,
+# `uuid`, `encoding_rs` and (on unix, for the `BLKGETSIZE64` ioctl) `libc` --
+# every one of which CLAUDE.md's dependency policy names as *not* permitted,
+# and the last of which will not link on `*-linux-fullrust`. The default
+# `cargo tree` is still bare, which is what CI gates on, and the fix is a
+# feature split in `fstool`, not a parallel block layer here.
+dev-blk = ["std", "dev-ata-disk", "dep:fstool"]
+
 # The PC/AT's IDE interface (src/dev/pc/ide.rs): one channel, which is address
 # decode and nothing else. The command block (0x1f0/0x170) and the control
 # block (0x3f6/0x376) as two separate regions, because the AT decodes them at
@@ -692,7 +773,10 @@ dev-pc-ide = ["dev-pc", "dev-ata-disk"]
 # names). The firmware is **not** shipped: the `bios` media slot takes the
 # user's own image (`rsemu run pc-at --bios /usr/share/qemu/bios.bin`) and the
 # `vgabios` slot takes a video option ROM, exactly as `riscv-virt` takes its
-# firmware. Adds no dependencies.
+# firmware. That video BIOS has to be a **PCI** one, carrying the PCI Data
+# Structure naming the vendor and device id the machine file declares: a
+# 440FX-era firmware loads it off the card's expansion ROM BAR and checks. Adds
+# no dependencies.
 machine-pc-at = [
   "cpu-x86",
   "dev-pc",
@@ -758,6 +842,49 @@ machine-mips-mini = ["cpu-mips"]
 # encoded priority level rather than a request, and there is no priority encoder
 # to wire. Adds no dependencies.
 machine-m68k-mini = ["cpu-m68k"]
+
+# The network seam (src/dev/net/link.rs): what a NIC model is attached to --
+# frames out, frames in **against a virtual tick**, carrier, and a station
+# address -- plus `NetPort`, the deterministic in-memory backend every test uses
+# and the one a recording replays into. Receive is a *pull*, not `pktkit`'s
+# push, because the tick a frame becomes visible on is guest-visible and has to
+# be virtual time rather than host time (CLAUDE.md, determinism); `net-pktkit`
+# then makes any `pktkit::L2Device` an implementation of this seam. Nothing here
+# parses a packet -- that is `pktkit`'s job and duplicating it is forbidden.
+# `no_std + alloc`, no dependencies.
+dev-net = []
+
+# A Novell NE2000 Ethernet card (src/dev/net/ne2000.rs): a National
+# Semiconductor DP8390 NIC with the card's own 16 KiB of buffer RAM, its remote
+# DMA data window at base+0x10 and its reset strap at base+0x18. The four banked
+# register pages, the receive buffer ring with its four-byte packet header and
+# its wrap at PSTOP, the transmit page and TBCR, all three remote DMA commands
+# including Send Packet, the address filter with its 64-bit multicast hash, the
+# tally counters, buffer-ring overflow with the data sheet's recovery, and the
+# 32-byte address PROM with the `WW` signature a driver identifies the card by.
+# **No bus mastering** -- the packet buffer is on the card -- so the whole part
+# is 32 I/O ports and one interrupt pin, and a Z80 can drive it with `IN` and
+# `OUT`. Written from the DP8390D data sheet and IEEE 802.3; no emulator source
+# was opened (ROADMAP.md 1). Needs `dev-net`; `no_std + alloc`, no dependencies.
+dev-ne2000 = ["dev-net"]
+
+# The `pktkit` bridge (src/dev/net/pktkit.rs): any `pktkit::L2Device` -- an
+# `L2Hub`, a TAP, slirp, a WireGuard tunnel -- behind the `dev-net` seam. Adds
+# `pktkit` (and nothing under it), and is the one file in `dev/` that needs
+# `std`, which is exactly the exception ROADMAP.md 0 grants `dev/net/*`. The
+# bridge is where push becomes pull: `pktkit` calls a handler on a host thread,
+# the handler stamps the frame into a `NetPort`, and the NIC takes it out at a
+# tick the scheduler chose. A live backend is not deterministic and the module
+# says so; what makes a run reproducible afterwards is `NetPort`'s recording.
+net-pktkit = ["dev-net", "std", "dep:pktkit"]
+
+# The `ne2k-mini` board (machines/ne2k-mini.machine plus the classes it names):
+# a Z80 with 16 KiB of ROM, 48 KiB of RAM, an NE2000 at port 0x300 and its
+# interrupt pin wired to `/INT`. It models no product; it exists so an NE2000
+# has a machine a *real driver* can be run on -- `tests/ne2000_board.rs` boots
+# Z80 firmware that initialises the card, transmits a frame and takes the
+# receive interrupt in mode 1. Adds no dependencies.
+machine-ne2k-mini = ["cpu-z80", "dev-ne2000"]
 
 [[bench]]
 # The frame-time benchmark (ROADMAP.md §13's phase-3 gate). `harness = false`

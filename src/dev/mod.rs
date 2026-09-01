@@ -17,6 +17,7 @@
 //! | [`cart`] | `dev-nes-cart` | cartridge images and the mappers that decode them |
 //! | [`flash`] | `dev-flash-cfi`, `dev-flash-spinor` | NOR flash: parallel (CFI) and serial (W25Q on SPI) |
 //! | [`nes`] | `dev-nes-io` | the console's own I/O: controller ports, OAM DMA |
+//! | [`net`] | `dev-net`, `dev-ne2000`, `net-pktkit` | the network seam, an NE2000 card, and the `pktkit` bridge |
 //! | [`pc`] | `dev-pc` | an IBM PC/AT board's chips: 8259A, 8254, 8042, MC146818, 8237A, the firmware socket |
 //! | [`ppu`] | `dev-nes-ppu` | the RP2C02 picture unit: the per-dot pipeline |
 //! | [`lcd`] | `dev-lcdc` | a generic RGB scanout engine: framebuffer in, `Scanout` out |
@@ -27,9 +28,15 @@
 //! | [`usb`] | `dev-usb-*` | USB host controllers — a generic EHCI, the ChipIdea/ARC variant over it, and a Synopsys dwc2 that shares nothing with either — and a HID mouse |
 //! | [`wdc`] | `dev-wdc` | the W65C51N ACIA and W65C22 VIA, and a 6502 board's ROM |
 //!
-//! Most of `dev/` is `no_std + alloc`. The two documented exceptions —
-//! `dev/blk/*` and `dev/net/*`, which are `std` because `fstool` and `pktkit`
-//! are — do not exist yet.
+//! | [`blk`] | `dev-blk` | disk images: a drive backed by a host file through `fstool` |
+//! | [`net`] | `dev-net` | the frame seam, the NE2000, and the `pktkit` bridge |
+//!
+//! Most of `dev/` is `no_std + alloc`, and both of the documented exceptions
+//! `ROADMAP.md` §0 grants — `dev/blk/*` and `dev/net/*`, `std` because `fstool`
+//! and `pktkit` are — now exist. They are not equally `std`: all of [`blk`]
+//! needs it, whereas [`net`] needs it in exactly one file, `dev/net/pktkit.rs`.
+//! The seam and the NE2000 itself are `no_std + alloc` and dependency-free, so
+//! the `--no-default-features` sweep runs their tests.
 
 #[cfg(feature = "dev-at24c")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-at24c")))]
@@ -46,6 +53,10 @@ pub mod apu;
 #[cfg(feature = "dev-ata-disk")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-ata-disk")))]
 pub mod ata;
+
+#[cfg(feature = "dev-blk")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-blk")))]
+pub mod blk;
 
 #[cfg(feature = "dev-nes-cart")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-cart")))]
@@ -65,6 +76,10 @@ pub mod flash;
 #[cfg(feature = "dev-nes-io")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-io")))]
 pub mod nes;
+
+#[cfg(feature = "dev-net")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-net")))]
+pub mod net;
 
 #[cfg(feature = "dev-pc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-pc")))]

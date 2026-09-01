@@ -96,9 +96,9 @@ use alloc::vec::Vec;
 use crate::core::space::{AddressSpace, MemAttrs};
 use crate::core::value::Width;
 
-use super::isa::{self, Arg, Fields, Op, Rep, seg};
-use super::paging::Tlb;
-use super::prot::{Sys, cr0};
+use super::isa::{self, Arg, Bits, Fields, Op, Rep, seg};
+use super::paging::{self, Tlb};
+use super::prot::{self, Sys, cr0};
 use super::{Config, Lines, Regs, Variant, flags, linear};
 
 /// Clocks the reset sequence spends before the first fetch.
@@ -321,7 +321,7 @@ pub(super) struct State {
     /// How many accesses an address space refused.
     pub faults: u64,
     /// Physical address of the most recent refused access.
-    pub last_fault: u32,
+    pub last_fault: u64,
     /// Clocks owed to the next scheduler budget.
     ///
     /// An x86 cannot be stopped mid-instruction, so a budget that runs out
@@ -339,9 +339,9 @@ impl State {
         let (regs, sys) = if variant.is_32bit() {
             let mut regs = Regs::new();
             regs.cs = 0xf000;
-            regs.eip = 0xfff0;
+            regs.rip = 0xfff0;
             regs.eflags = flags::ALWAYS_SET;
-            regs.edx = variant.reset_signature();
+            regs.rdx = u64::from(variant.reset_signature());
             (regs, Sys::reset())
         } else {
             (Regs::new(), Sys::reset_8086())
@@ -377,13 +377,13 @@ pub(super) struct Exec<'a> {
     pub(super) lines: &'a Lines,
     pub(super) attrs: MemAttrs,
     /// The memory operand's `(segment register, offset)`, computed once.
-    pub(super) ea: Option<(u8, u32)>,
+    pub(super) ea: Option<(u8, u64)>,
     /// The register file as it was before this instruction began, so a fault
     /// can restart it.
     pub(super) entry: Regs,
     /// Where the current instruction started, prefixes included, so a string
     /// operation interrupted between iterations can be restarted.
-    pub(super) start_ip: u32,
+    pub(super) start_ip: u64,
     /// Clocks this step has charged.
     pub(super) used: u64,
     /// How deep the exception delivery is: 0 while executing, 1 while
@@ -447,6 +447,38 @@ impl<'a> Exec<'a> {
             (self.state.regs.cs & 3) as u8
         } else {
             0
+        }
+    }
+
+    /// Whether this part can enter long mode at all.
+    #[inline]
+    pub(super) fn has_long(&self) -> bool {
+        self.cfg.features.long
+    }
+
+    /// Whether the processor is in 64-bit mode right now.
+    ///
+    /// Long mode active **and** the current code segment's `L` bit set —
+    /// compatibility mode answers false, and that is the distinction every
+    /// decode and address decision below turns on.
+    #[inline]
+    pub(super) fn sixty_four(&self) -> bool {
+        self.has_long() && self.state.sys.sixty_four()
+    }
+
+    /// The width the current code segment is decoded at.
+    #[inline]
+    pub(super) fn code_bits(&self) -> Bits {
+        if self.legacy() {
+            return Bits::B16;
+        }
+        if self.sixty_four() {
+            return Bits::B64;
+        }
+        if self.state.sys.seg(seg::CS).big() {
+            Bits::B32
+        } else {
+            Bits::B16
         }
     }
 
@@ -606,18 +638,14 @@ impl<'a> Exec<'a> {
     /// bytes is the *caller's* job where the part or the page boundary
     /// requires it, so that the 8088's two-cycle word read stays visible in
     /// the trace exactly as the corpus records it.
-    pub(super) fn phys_read(&mut self, addr: u32, size: u8) -> u32 {
+    pub(super) fn phys_read(&mut self, addr: u64, size: u8) -> u64 {
         self.charge(self.variant().bus_clocks());
-        let width = match size {
-            1 => Width::U8,
-            2 => Width::U16,
-            _ => Width::U32,
-        };
-        let addr = addr & self.lines.a20_mask();
-        match self.mem.read(u64::from(addr), width, self.attrs) {
+        let width = Self::width_of(size);
+        let addr = self.masked(addr);
+        match self.mem.read(addr, width, self.attrs) {
             Ok(value) => {
                 self.state.open_bus = (value >> ((size as u32 - 1) * 8)) as u8;
-                value as u32
+                value
             }
             Err(_) => {
                 // No bus-error input exists on these parts, so the honest
@@ -625,34 +653,46 @@ impl<'a> Exec<'a> {
                 // finds out.
                 self.state.faults = self.state.faults.wrapping_add(1);
                 self.state.last_fault = addr;
-                let byte = u32::from(self.state.open_bus);
-                match size {
-                    1 => byte,
-                    2 => byte | (byte << 8),
-                    _ => byte | (byte << 8) | (byte << 16) | (byte << 24),
-                }
+                let byte = u64::from(self.state.open_bus);
+                // The same byte on every lane, for as many lanes as the
+                // transfer had.
+                byte.wrapping_mul(0x0101_0101_0101_0101) & Self::mask(size)
             }
         }
     }
 
-    /// One physical bus write of one, two or four bytes.
-    pub(super) fn phys_write(&mut self, addr: u32, size: u8, value: u32) {
+    /// One physical bus write of one, two, four or eight bytes.
+    pub(super) fn phys_write(&mut self, addr: u64, size: u8, value: u64) {
         self.charge(self.variant().bus_clocks());
         self.state.open_bus = (value >> ((size as u32 - 1) * 8)) as u8;
-        let width = match size {
-            1 => Width::U8,
-            2 => Width::U16,
-            _ => Width::U32,
-        };
-        let addr = addr & self.lines.a20_mask();
-        if self
-            .mem
-            .write(u64::from(addr), width, u64::from(value), self.attrs)
-            .is_err()
-        {
+        let width = Self::width_of(size);
+        let addr = self.masked(addr);
+        if self.mem.write(addr, width, value, self.attrs).is_err() {
             self.state.faults = self.state.faults.wrapping_add(1);
             self.state.last_fault = addr;
         }
+    }
+
+    /// The access width for a byte count.
+    #[inline]
+    const fn width_of(size: u8) -> Width {
+        match size {
+            1 => Width::U8,
+            2 => Width::U16,
+            4 => Width::U32,
+            _ => Width::U64,
+        }
+    }
+
+    /// A physical address as it reaches the bus, with the A20 gate applied.
+    ///
+    /// The gate masks bit 20 of a *20-or-21-bit* address; it has nothing to
+    /// say about the bits above 32, so the mask is applied to the low half and
+    /// the rest passes through. A 64-bit guest with the gate shut would
+    /// otherwise lose every address above 4 GiB.
+    #[inline]
+    fn masked(&self, addr: u64) -> u64 {
+        (addr & !0xffff_ffffu64) | (addr & u64::from(self.lines.a20_mask()))
     }
 
     /// Whether a word at this physical address and segment offset is one bus
@@ -661,7 +701,7 @@ impl<'a> Exec<'a> {
     /// Only on an 8086, and only when the transfer is aligned and does not
     /// straddle the end of the segment — an 8088 has eight data pins and
     /// always takes two.
-    fn word_is_one_cycle(&self, base: u32, offset: u16) -> bool {
+    fn word_is_one_cycle(&self, base: u64, offset: u16) -> bool {
         self.cfg.variant.bus_bytes() == 2 && base.is_multiple_of(2) && offset != 0xffff
     }
 
@@ -692,34 +732,34 @@ impl<'a> Exec<'a> {
     fn legacy_write16_seg(&mut self, segment: u16, offset: u16, value: u16) {
         let base = linear(segment, offset);
         if self.word_is_one_cycle(base, offset) {
-            self.phys_write(base, 2, u32::from(value));
+            self.phys_write(base, 2, u64::from(value));
             return;
         }
-        self.phys_write(base, 1, u32::from(value & 0xff));
+        self.phys_write(base, 1, u64::from(value & 0xff));
         self.phys_write(
             linear(segment, offset.wrapping_add(1)),
             1,
-            u32::from(value >> 8),
+            u64::from(value >> 8),
         );
     }
 
     // -- The common memory interface -----------------------------------
 
     /// Read `size` bytes from `sr:offset`.
-    pub(super) fn read_mem(&mut self, sr: u8, offset: u32, size: u8) -> Ex<u32> {
+    pub(super) fn read_mem(&mut self, sr: u8, offset: u64, size: u8) -> Ex<u64> {
         if self.legacy() {
             let segment = self.state.regs.segment(sr);
             return Ok(match size {
-                1 => u32::from(self.phys_read(linear(segment, offset as u16), 1) as u8),
-                _ => u32::from(self.legacy_read16_seg(segment, offset as u16)),
+                1 => u64::from(self.phys_read(linear(segment, offset as u16), 1) as u8),
+                _ => u64::from(self.legacy_read16_seg(segment, offset as u16)),
             });
         }
-        let lin = self.seg_linear(sr, offset, u32::from(size), false)?;
+        let lin = self.seg_linear(sr, offset, u64::from(size), false)?;
         self.linear_read(lin, size)
     }
 
     /// Write `size` bytes to `sr:offset`.
-    pub(super) fn write_mem(&mut self, sr: u8, offset: u32, size: u8, value: u32) -> Ex<()> {
+    pub(super) fn write_mem(&mut self, sr: u8, offset: u64, size: u8, value: u64) -> Ex<()> {
         if self.legacy() {
             let segment = self.state.regs.segment(sr);
             match size {
@@ -728,20 +768,20 @@ impl<'a> Exec<'a> {
             }
             return Ok(());
         }
-        let lin = self.seg_linear(sr, offset, u32::from(size), true)?;
+        let lin = self.seg_linear(sr, offset, u64::from(size), true)?;
         self.linear_write(lin, size, value)
     }
 
     /// Read `size` bytes from a linear address, splitting the access if it
     /// straddles a page boundary.
-    pub(super) fn linear_read(&mut self, lin: u32, size: u8) -> Ex<u32> {
+    pub(super) fn linear_read(&mut self, lin: u64, size: u8) -> Ex<u64> {
         let user = self.cpl() == 3;
         if !self.state.sys.paging() {
             return Ok(self.phys_read(lin, size));
         }
         if Self::crosses_page(lin, size) {
-            let mut value = 0u32;
-            for i in 0..u32::from(size) {
+            let mut value = 0u64;
+            for i in 0..u64::from(size) {
                 let addr = lin.wrapping_add(i);
                 let phys = self.translate(addr, false, user)?;
                 value |= self.phys_read(phys, 1) << (8 * i);
@@ -758,18 +798,18 @@ impl<'a> Exec<'a> {
     /// writing either byte, so a fault on the second page does not leave the
     /// first half written. That is what the architecture guarantees and what a
     /// naive byte loop gets wrong.
-    pub(super) fn linear_write(&mut self, lin: u32, size: u8, value: u32) -> Ex<()> {
+    pub(super) fn linear_write(&mut self, lin: u64, size: u8, value: u64) -> Ex<()> {
         let user = self.cpl() == 3;
         if !self.state.sys.paging() {
             self.phys_write(lin, size, value);
             return Ok(());
         }
         if Self::crosses_page(lin, size) {
-            let mut phys = [0u32; 4];
-            for i in 0..u32::from(size) {
+            let mut phys = [0u64; 8];
+            for i in 0..u64::from(size) {
                 phys[i as usize] = self.translate(lin.wrapping_add(i), true, user)?;
             }
-            for i in 0..u32::from(size) {
+            for i in 0..u64::from(size) {
                 self.phys_write(phys[i as usize], 1, (value >> (8 * i)) & 0xff);
             }
             return Ok(());
@@ -781,8 +821,8 @@ impl<'a> Exec<'a> {
 
     /// Whether an access of `size` bytes at `lin` spans two pages.
     #[inline]
-    fn crosses_page(lin: u32, size: u8) -> bool {
-        (lin & 0xfff) + u32::from(size) > 0x1000
+    fn crosses_page(lin: u64, size: u8) -> bool {
+        (lin & 0xfff) + u64::from(size) > 0x1000
     }
 
     /// Read from a linear address as the processor itself does, ignoring
@@ -793,62 +833,71 @@ impl<'a> Exec<'a> {
     /// the processor is walking its own structures — and the 386 walks them
     /// with paging *on*, which is why this goes through translation rather
     /// than straight to the bus.
-    pub(super) fn sys_read32(&mut self, lin: u32) -> Ex<u32> {
+    pub(super) fn sys_read(&mut self, lin: u64, size: u8) -> Ex<u64> {
         if !self.state.sys.paging() {
-            return Ok(self.phys_read(lin, 4));
+            return Ok(self.phys_read(lin, size));
         }
-        if Self::crosses_page(lin, 4) {
-            let mut value = 0u32;
-            for i in 0..4u32 {
+        if Self::crosses_page(lin, size) {
+            let mut value = 0u64;
+            for i in 0..u64::from(size) {
                 let phys = self.translate(lin.wrapping_add(i), false, false)?;
                 value |= self.phys_read(phys, 1) << (8 * i);
             }
             return Ok(value);
         }
         let phys = self.translate(lin, false, false)?;
-        Ok(self.phys_read(phys, 4))
+        Ok(self.phys_read(phys, size))
     }
 
     /// Write to a linear address as the processor itself does.
-    pub(super) fn sys_write32(&mut self, lin: u32, value: u32) -> Ex<()> {
+    pub(super) fn sys_write(&mut self, lin: u64, size: u8, value: u64) -> Ex<()> {
         if !self.state.sys.paging() {
-            self.phys_write(lin, 4, value);
+            self.phys_write(lin, size, value);
             return Ok(());
         }
-        if Self::crosses_page(lin, 4) {
-            let mut phys = [0u32; 4];
-            for i in 0..4u32 {
+        if Self::crosses_page(lin, size) {
+            let mut phys = [0u64; 8];
+            for i in 0..u64::from(size) {
                 phys[i as usize] = self.translate(lin.wrapping_add(i), true, false)?;
             }
-            for i in 0..4u32 {
+            for i in 0..u64::from(size) {
                 self.phys_write(phys[i as usize], 1, (value >> (8 * i)) & 0xff);
             }
             return Ok(());
         }
         let phys = self.translate(lin, true, false)?;
-        self.phys_write(phys, 4, value);
+        self.phys_write(phys, size, value);
         Ok(())
     }
 
+    /// Read thirty-two bits the same way.
+    pub(super) fn sys_read32(&mut self, lin: u64) -> Ex<u32> {
+        Ok(self.sys_read(lin, 4)? as u32)
+    }
+
+    /// Write thirty-two bits the same way.
+    pub(super) fn sys_write32(&mut self, lin: u64, value: u32) -> Ex<()> {
+        self.sys_write(lin, 4, u64::from(value))
+    }
+
     /// Read sixteen bits the same way.
-    pub(super) fn sys_read16(&mut self, lin: u32) -> Ex<u32> {
-        if !self.state.sys.paging() {
-            return Ok(self.phys_read(lin, 2));
-        }
-        if Self::crosses_page(lin, 2) {
-            let lo = {
-                let phys = self.translate(lin, false, false)?;
-                self.phys_read(phys, 1)
-            };
-            let phys = self.translate(lin.wrapping_add(1), false, false)?;
-            let hi = self.phys_read(phys, 1);
-            return Ok(lo | (hi << 8));
-        }
-        let phys = self.translate(lin, false, false)?;
-        Ok(self.phys_read(phys, 2))
+    pub(super) fn sys_read16(&mut self, lin: u64) -> Ex<u32> {
+        Ok(self.sys_read(lin, 2)? as u32)
     }
 
     // -- I/O -----------------------------------------------------------
+
+    /// How wide an I/O transfer may be.
+    ///
+    /// The I/O space is thirty-two bits wide and stayed that way: `REX.W` on
+    /// an `IN`, `OUT`, `INS` or `OUTS` is **ignored** rather than widening the
+    /// transfer, because there is no 64-bit port cycle for it to mean (*Intel
+    /// SDM* volume 2, `IN`/`OUT`). Clamping here rather than at each of the
+    /// four call sites keeps the rule in one place.
+    #[inline]
+    const fn io_width(opsize: u8) -> u8 {
+        if opsize > 4 { 4 } else { opsize }
+    }
 
     /// One I/O read. A core with no I/O space sees an unterminated bus, which
     /// reads as ones — the same answer the corpus expects from a bare 8088.
@@ -870,7 +919,7 @@ impl<'a> Exec<'a> {
             Ok(value) => value as u32,
             Err(_) => {
                 self.state.faults = self.state.faults.wrapping_add(1);
-                self.state.last_fault = u32::from(port);
+                self.state.last_fault = u64::from(port);
                 match size {
                     1 => 0xff,
                     2 => 0xffff,
@@ -895,7 +944,7 @@ impl<'a> Exec<'a> {
             .is_err()
         {
             self.state.faults = self.state.faults.wrapping_add(1);
-            self.state.last_fault = u32::from(port);
+            self.state.last_fault = u64::from(port);
         }
     }
 
@@ -946,7 +995,7 @@ impl<'a> Exec<'a> {
                 return Err(Fault::gp(0));
             }
             let byte = {
-                let lin = tss.base.wrapping_add(offset);
+                let lin = tss.base.wrapping_add(u64::from(offset));
                 if self.state.sys.paging() {
                     let phys = self.translate(lin, false, false)?;
                     self.phys_read(phys, 1)
@@ -966,21 +1015,32 @@ impl<'a> Exec<'a> {
     // -----------------------------------------------------------------
 
     /// Fetch one byte of the instruction stream at `CS:offset`.
-    fn fetch_at(&mut self, offset: u32) -> Ex<u8> {
+    fn fetch_at(&mut self, offset: u64) -> Ex<u8> {
         if self.legacy() {
             let segment = self.state.regs.cs;
             return Ok(self.phys_read(linear(segment, offset as u16), 1) as u8);
         }
         let cs = self.state.sys.seg(seg::CS);
-        if !cs.in_bounds(offset, 1) {
-            return Err(Fault::gp(0));
-        }
-        let lin = cs.base.wrapping_add(offset);
+        let lin = if self.sixty_four() {
+            // `CS` has no base and no limit in 64-bit mode; `RIP` *is* the
+            // linear address, and it has to be canonical.
+            if !prot::canonical(offset) {
+                return Err(Fault::gp(0));
+            }
+            offset
+        } else {
+            if !cs.in_bounds(offset, 1) {
+                return Err(Fault::gp(0));
+            }
+            cs.base.wrapping_add(offset)
+        };
         let user = self.cpl() == 3;
         if !self.state.sys.paging() {
             return Ok(self.phys_read(lin, 1) as u8);
         }
-        let phys = self.translate(lin, false, user)?;
+        // An instruction fetch is where the no-execute bit is consulted, and
+        // the only place it is: a data read of the same page is fine.
+        let phys = self.translate_access(lin, paging::Access::fetch(user))?;
         Ok(self.phys_read(phys, 1) as u8)
     }
 
@@ -999,8 +1059,8 @@ impl<'a> Exec<'a> {
             let offset = self
                 .state
                 .regs
-                .eip
-                .wrapping_add(u32::from(self.state.queue.len()))
+                .rip
+                .wrapping_add(u64::from(self.state.queue.len()))
                 & 0xffff;
             let byte = self.fetch_at(offset)?;
             self.state.queue.push(byte);
@@ -1011,7 +1071,7 @@ impl<'a> Exec<'a> {
     /// Take the next instruction byte, refilling the queue if it is empty.
     fn fetch_byte(&mut self) -> Ex<u8> {
         let byte = if self.state.queue.len() == 0 {
-            let offset = self.state.regs.eip;
+            let offset = self.state.regs.rip;
             let byte = self.fetch_at(offset)?;
             if self.legacy() {
                 self.state.queue.push(byte);
@@ -1022,13 +1082,16 @@ impl<'a> Exec<'a> {
         } else {
             self.state.queue.pop().unwrap_or(self.state.open_bus)
         };
-        // Guest arithmetic wraps: `IP` is sixteen bits and `ffff` is followed
-        // by `0000` in the same code segment, while `EIP` is thirty-two.
-        self.state.regs.eip = if self.legacy() {
-            (self.state.regs.eip & 0xffff_0000)
-                | u32::from(self.state.regs.eip.wrapping_add(1) as u16)
+        // Guest arithmetic wraps in the guest's own width: `IP` is sixteen
+        // bits and `ffff` is followed by `0000` in the same code segment,
+        // while `EIP` is thirty-two and `RIP` sixty-four.
+        self.state.regs.rip = if self.legacy() {
+            (self.state.regs.rip & !0xffff) | u64::from(self.state.regs.rip.wrapping_add(1) as u16)
+        } else if self.sixty_four() {
+            self.state.regs.rip.wrapping_add(1)
         } else {
-            self.state.regs.eip.wrapping_add(1)
+            (self.state.regs.rip & !0xffff_ffff)
+                | u64::from(self.state.regs.rip.wrapping_add(1) as u32)
         };
         Ok(byte)
     }
@@ -1061,21 +1124,22 @@ impl<'a> Exec<'a> {
 
     /// The most significant bit of an operand of `size` bytes.
     #[inline]
-    const fn msb(size: u8) -> u32 {
-        1u32 << (size as u32 * 8 - 1)
+    pub(super) const fn msb(size: u8) -> u64 {
+        1u64 << (size as u32 * 8 - 1)
     }
 
     /// The mask of an operand of `size` bytes.
     #[inline]
-    const fn mask(size: u8) -> u32 {
+    pub(super) const fn mask(size: u8) -> u64 {
         match size {
             1 => 0xff,
             2 => 0xffff,
-            _ => 0xffff_ffff,
+            4 => 0xffff_ffff,
+            _ => u64::MAX,
         }
     }
 
-    fn set_szp(&mut self, value: u32, size: u8) {
+    fn set_szp(&mut self, value: u64, size: u8) {
         let value = value & Self::mask(size);
         self.set_flag(flags::ZF, value == 0);
         self.set_flag(flags::SF, value & Self::msb(size) != 0);
@@ -1091,13 +1155,18 @@ impl<'a> Exec<'a> {
     /// One implementation rather than three: the flag rules are identical
     /// modulo where the sign bit and the carry out sit, and three copies is
     /// three places for them to drift apart.
-    pub(super) fn add(&mut self, a: u32, b: u32, carry: bool, size: u8) -> u32 {
+    pub(super) fn add(&mut self, a: u64, b: u64, carry: bool, size: u8) -> u64 {
         let mask = Self::mask(size);
         let a = a & mask;
         let b = b & mask;
-        let sum = u64::from(a) + u64::from(b) + u64::from(carry);
-        let r = (sum as u32) & mask;
-        self.set_flag(flags::CF, sum > u64::from(mask));
+        // A 64-bit add can carry out of the host word too, so the carry is
+        // taken from the wide sum's own overflow rather than from a comparison
+        // against the mask — which would always be false at eight bytes.
+        let (partial, c1) = a.overflowing_add(b);
+        let (sum, c2) = partial.overflowing_add(u64::from(carry));
+        let r = sum & mask;
+        let carry_out = if size == 8 { c1 || c2 } else { sum > mask };
+        self.set_flag(flags::CF, carry_out);
         self.set_flag(flags::AF, (a ^ b ^ r) & 0x10 != 0);
         let msb = Self::msb(size);
         self.set_flag(flags::OF, (!(a ^ b)) & (a ^ r) & msb != 0);
@@ -1106,14 +1175,15 @@ impl<'a> Exec<'a> {
     }
 
     /// Subtract, at any operand size.
-    pub(super) fn sub(&mut self, a: u32, b: u32, borrow: bool, size: u8) -> u32 {
+    pub(super) fn sub(&mut self, a: u64, b: u64, borrow: bool, size: u8) -> u64 {
         let mask = Self::mask(size);
         let a = a & mask;
         let b = b & mask;
-        let rhs = u64::from(b) + u64::from(borrow);
-        let diff = u64::from(a).wrapping_sub(rhs);
-        let r = (diff as u32) & mask;
-        self.set_flag(flags::CF, u64::from(a) < rhs);
+        let (rhs, overflowed) = b.overflowing_add(u64::from(borrow));
+        let r = a.wrapping_sub(rhs) & mask;
+        // `b == mask` with a borrow in wraps `rhs` to zero at eight bytes,
+        // which is a borrow whatever `a` is.
+        self.set_flag(flags::CF, overflowed || a < rhs);
         self.set_flag(flags::AF, (a ^ b ^ r) & 0x10 != 0);
         let msb = Self::msb(size);
         self.set_flag(flags::OF, (a ^ b) & (a ^ r) & msb != 0);
@@ -1127,7 +1197,7 @@ impl<'a> Exec<'a> {
     /// undefined; on the 8088 it is cleared too, on every one of the tens of
     /// thousands of corpus vectors that exercise it, so it is modelled as
     /// cleared rather than left alone.
-    pub(super) fn logic_flags(&mut self, r: u32, size: u8) {
+    pub(super) fn logic_flags(&mut self, r: u64, size: u8) {
         self.set_flag(flags::CF | flags::OF | flags::AF, false);
         self.set_szp(r, size);
     }
@@ -1159,20 +1229,20 @@ impl<'a> Exec<'a> {
             self.state.tlb.flush();
             let regs = &mut self.state.regs;
             regs.cs = 0xf000;
-            regs.eip = 0xfff0;
+            regs.rip = 0xfff0;
             regs.ds = 0;
             regs.es = 0;
             regs.ss = 0;
             regs.fs = 0;
             regs.gs = 0;
             regs.eflags = flags::ALWAYS_SET;
-            regs.edx = variant.reset_signature();
+            regs.rdx = u64::from(variant.reset_signature());
             let _ = keep;
         } else {
             self.state.sys = Sys::reset_8086();
             let regs = &mut self.state.regs;
             regs.cs = 0xffff;
-            regs.eip = 0;
+            regs.rip = 0;
             regs.ds = 0;
             regs.es = 0;
             regs.ss = 0;
@@ -1192,6 +1262,10 @@ impl<'a> Exec<'a> {
     pub(super) fn stack_addr_size(&self) -> u8 {
         if self.legacy() {
             2
+        } else if self.sixty_four() {
+            // In 64-bit mode `SS` has no `B` bit that matters: the stack
+            // pointer is `RSP`, always, and a descriptor cannot say otherwise.
+            8
         } else if self.state.sys.seg(seg::SS).big() {
             4
         } else {
@@ -1200,22 +1274,25 @@ impl<'a> Exec<'a> {
     }
 
     /// The current stack pointer, at the stack's address size.
-    pub(super) fn sp(&self) -> u32 {
-        if self.stack_addr_size() == 2 {
-            self.state.regs.esp & 0xffff
-        } else {
-            self.state.regs.esp
+    pub(super) fn sp(&self) -> u64 {
+        match self.stack_addr_size() {
+            2 => self.state.regs.rsp & 0xffff,
+            4 => self.state.regs.rsp & 0xffff_ffff,
+            _ => self.state.regs.rsp,
         }
     }
 
-    /// Move the stack pointer, preserving the high half where the stack is
-    /// sixteen bits wide.
-    pub(super) fn set_sp(&mut self, value: u32) {
-        if self.stack_addr_size() == 2 {
-            self.state.regs.esp = (self.state.regs.esp & 0xffff_0000) | (value & 0xffff);
-        } else {
-            self.state.regs.esp = value;
-        }
+    /// Move the stack pointer, preserving the bits the stack's width does not
+    /// reach.
+    pub(super) fn set_sp(&mut self, value: u64) {
+        let rsp = self.state.regs.rsp;
+        self.state.regs.rsp = match self.stack_addr_size() {
+            2 => (rsp & !0xffff) | (value & 0xffff),
+            // A 32-bit stack pointer is `ESP`, and writing `ESP` zeroes the
+            // top half exactly as any other 32-bit write does.
+            4 => value & 0xffff_ffff,
+            _ => value,
+        };
     }
 
     /// Push `size` bytes: the stack pointer moves first, then the write
@@ -1223,26 +1300,17 @@ impl<'a> Exec<'a> {
     ///
     /// That order is why `PUSH SP` stores `SP - 2` on an 8086. The 80286
     /// changed it, which is handled at the `PUSH` itself rather than here.
-    pub(super) fn push(&mut self, value: u32, size: u8) -> Ex<()> {
-        let sp = self.sp().wrapping_sub(u32::from(size));
-        let sp = if self.stack_addr_size() == 2 {
-            sp & 0xffff
-        } else {
-            sp
-        };
+    pub(super) fn push(&mut self, value: u64, size: u8) -> Ex<()> {
+        let sp = self.sp().wrapping_sub(u64::from(size)) & Self::mask(self.stack_addr_size());
         self.set_sp(sp);
         self.write_mem(seg::SS, sp, size, value)
     }
 
-    pub(super) fn pop(&mut self, size: u8) -> Ex<u32> {
+    pub(super) fn pop(&mut self, size: u8) -> Ex<u64> {
         let sp = self.sp();
         let value = self.read_mem(seg::SS, sp, size)?;
-        let next = sp.wrapping_add(u32::from(size));
-        self.set_sp(if self.stack_addr_size() == 2 {
-            next & 0xffff
-        } else {
-            next
-        });
+        let next = sp.wrapping_add(u64::from(size)) & Self::mask(self.stack_addr_size());
+        self.set_sp(next);
         Ok(value)
     }
 
@@ -1252,17 +1320,17 @@ impl<'a> Exec<'a> {
 
     fn instruction(&mut self) -> Ex<()> {
         self.entry = self.state.regs;
-        self.start_ip = self.state.regs.eip;
+        self.start_ip = self.state.regs.rip;
         self.fill_queue()?;
         let map = self.variant().map();
-        let default32 = !self.legacy() && self.state.sys.seg(seg::CS).big();
+        let bits = self.code_bits();
         // The decoder pulls bytes through a closure so that one decoder serves
         // the interpreter and the disassembler; a fetch fault has to escape it,
         // and a closure cannot return `Err`, so it is latched here.
         let mut fetch_fault: Option<Fault> = None;
         let fields = {
             let this = &mut *self;
-            isa::decode_stream_as(map, default32, &mut || {
+            isa::decode_stream_as(map, bits, &mut || {
                 if fetch_fault.is_some() {
                     return None;
                 }
@@ -1303,28 +1371,30 @@ impl<'a> Exec<'a> {
             && !m.is_register()
             && wants_memory
         {
-            let offset = if f.addrsize == 2 {
-                let regs = &self.state.regs;
-                let terms = match m.rm {
-                    0 => regs.word(3).wrapping_add(regs.word(6)), // BX+SI
-                    1 => regs.word(3).wrapping_add(regs.word(7)), // BX+DI
-                    2 => regs.word(5).wrapping_add(regs.word(6)), // BP+SI
-                    3 => regs.word(5).wrapping_add(regs.word(7)), // BP+DI
-                    4 => regs.word(6),                            // SI
-                    5 => regs.word(7),                            // DI
-                    6 if m.md == 0 => 0,
-                    6 => regs.word(5), // BP
-                    _ => regs.word(3), // BX
-                };
-                let disp = f.disp as u16;
-                let value = if m.md == 0 && m.rm == 6 {
-                    disp
-                } else {
-                    terms.wrapping_add(disp)
-                };
-                u32::from(value)
-            } else {
-                self.ea32(f, m)
+            let offset = match f.addrsize {
+                2 => {
+                    let regs = &self.state.regs;
+                    let terms = match m.rm {
+                        0 => regs.word(3).wrapping_add(regs.word(6)), // BX+SI
+                        1 => regs.word(3).wrapping_add(regs.word(7)), // BX+DI
+                        2 => regs.word(5).wrapping_add(regs.word(6)), // BP+SI
+                        3 => regs.word(5).wrapping_add(regs.word(7)), // BP+DI
+                        4 => regs.word(6),                            // SI
+                        5 => regs.word(7),                            // DI
+                        6 if m.md == 0 => 0,
+                        6 => regs.word(5), // BP
+                        _ => regs.word(3), // BX
+                    };
+                    let disp = f.disp as u16;
+                    let value = if m.md == 0 && m.rm == 6 {
+                        disp
+                    } else {
+                        terms.wrapping_add(disp)
+                    };
+                    u64::from(value)
+                }
+                4 => u64::from(self.ea32(f, m)),
+                _ => self.ea64(f, m),
             };
             self.ea = Some((f.mem_segment(), offset));
             if self.legacy() {
@@ -1336,17 +1406,19 @@ impl<'a> Exec<'a> {
         {
             // The direct-offset moves carry their address in the immediate
             // field and have no ModRM byte at all.
-            let offset = if f.addrsize == 2 {
-                f.imm & 0xffff
-            } else {
-                f.imm
-            };
+            let offset = f.imm & Self::mask(f.addrsize);
             self.ea = Some((f.segment(seg::DS), offset));
         }
     }
 
     /// The 32-bit effective address: base, plus a scaled index, plus a
     /// displacement, all in 32-bit wrapping arithmetic.
+    ///
+    /// Thirty-two bits *even in 64-bit mode with a `67` prefix*, which is what
+    /// makes this a separate function rather than a masked call into
+    /// [`Exec::ea64`]: the terms are summed at the address size and the result
+    /// is widened, not summed wide and masked. Widening first would let a
+    /// negative displacement carry into the top half instead of wrapping.
     fn ea32(&self, f: &Fields, m: isa::ModRm) -> u32 {
         let regs = &self.state.regs;
         let mut value = 0u32;
@@ -1354,18 +1426,49 @@ impl<'a> Exec<'a> {
             let sib = f.sib.unwrap_or(isa::Sib::new(0));
             // Base 5 with mode 0 is "no base": the displacement stands alone.
             if !(sib.base == 5 && m.md == 0) {
-                value = value.wrapping_add(regs.dword(sib.base));
+                value = value.wrapping_add(regs.dword(f.base_num()));
             }
-            if sib.has_index() {
-                value = value.wrapping_add(regs.dword(sib.index) << sib.scale);
+            if f.has_index() {
+                value = value.wrapping_add(regs.dword(f.index_num()) << sib.scale);
             }
         } else if !(m.rm == 5 && m.md == 0) {
-            value = value.wrapping_add(regs.dword(m.rm));
+            value = value.wrapping_add(regs.dword(f.rm_num()));
         }
         value.wrapping_add(f.disp as u32)
     }
 
-    pub(super) fn ea(&self) -> (u8, u32) {
+    /// The 64-bit effective address.
+    ///
+    /// Three differences from the 32-bit form, all of them in the encodings
+    /// that used to mean "no register": `mod == 00` with `r/m == 101` is now
+    /// `RIP` plus the displacement rather than an absolute address; the SIB
+    /// index field's "none" encoding is overridden by `REX.X`; and every term
+    /// is sixty-four bits, so a negative displacement wraps at 2^64 rather
+    /// than at 2^32.
+    fn ea64(&self, f: &Fields, m: isa::ModRm) -> u64 {
+        // `RIP` here is the address of the *next* instruction, which is what
+        // the register already holds: the decoder has consumed every byte,
+        // immediates included, before an effective address is computed.
+        if f.rip_relative {
+            return self.state.regs.rip.wrapping_add(f.disp as i64 as u64);
+        }
+        let regs = &self.state.regs;
+        let mut value = 0u64;
+        if m.rm == 4 {
+            let sib = f.sib.unwrap_or(isa::Sib::new(0));
+            if !(sib.base == 5 && m.md == 0) {
+                value = value.wrapping_add(regs.qword(f.base_num()));
+            }
+            if f.has_index() {
+                value = value.wrapping_add(regs.qword(f.index_num()) << sib.scale);
+            }
+        } else {
+            value = value.wrapping_add(regs.qword(f.rm_num()));
+        }
+        value.wrapping_add(f.disp as i64 as u64)
+    }
+
+    pub(super) fn ea(&self) -> (u8, u64) {
         self.ea.unwrap_or((seg::DS, 0))
     }
 
@@ -1379,35 +1482,36 @@ impl<'a> Exec<'a> {
     }
 
     /// Read one operand at `size` bytes.
-    pub(super) fn read_arg(&mut self, f: &Fields, arg: Arg, size: u8) -> Ex<u32> {
+    pub(super) fn read_arg(&mut self, f: &Fields, arg: Arg, size: u8) -> Ex<u64> {
         let regs = self.state.regs;
+        let rex = f.has_rex();
         let value = match arg {
-            Arg::Eb | Arg::Ev | Arg::Ew => match f.modrm {
-                Some(m) if m.is_register() => regs.read(m.rm, size),
+            Arg::Eb | Arg::Ev | Arg::Ew | Arg::Ed => match f.modrm {
+                Some(m) if m.is_register() => regs.read(f.rm_num(), size, rex),
                 _ => {
                     let (sr, off) = self.ea();
                     self.read_mem(sr, off, size)?
                 }
             },
-            Arg::Gb | Arg::Gv | Arg::Gw => regs.read(f.modrm.map_or(0, |m| m.reg), size),
-            Arg::Rd => regs.dword(f.modrm.map_or(0, |m| m.rm)),
-            Arg::Cd => self.read_control(f.modrm.map_or(0, |m| m.reg))?,
-            Arg::Dd => self.read_debug(f.modrm.map_or(0, |m| m.reg))?,
-            Arg::Td => self.read_test(f.modrm.map_or(0, |m| m.reg))?,
+            Arg::Gb | Arg::Gv | Arg::Gw => regs.read(f.reg_num(), size, rex),
+            Arg::Rd => regs.read(f.rm_num(), self.system_reg_size(), rex),
+            Arg::Cd => self.read_control(f.reg_num())?,
+            Arg::Dd => self.read_debug(f.reg_num())?,
+            Arg::Td => self.read_test(f.reg_num())?,
             // On an 8086 only the low two bits of `reg` are decoded, which is
             // why `8C` accepts a `reg` of 4-7 and aliases down onto `ES`-`DS`.
             Arg::Sw => {
                 let index = f.modrm.map_or(0, |m| m.reg);
                 let index = if self.legacy() { index & 3 } else { index };
-                u32::from(regs.segment(index))
+                u64::from(regs.segment(index))
             }
-            Arg::Sr => u32::from(regs.segment((f.opcode >> 3) & 7)),
-            Arg::Ib | Arg::Iw | Arg::Iv | Arg::Ibs => f.imm & Self::mask(size),
-            Arg::Rb | Arg::Rv => regs.read(f.opcode & 7, size),
-            Arg::Al => u32::from(regs.byte(0)),
-            Arg::Ax => regs.read(0, size),
-            Arg::Cl => u32::from(regs.byte(1)),
-            Arg::Dx => regs.read(2, 2),
+            Arg::Sr => u64::from(regs.segment((f.opcode >> 3) & 7)),
+            Arg::Ib | Arg::Iw | Arg::Iv | Arg::Iz | Arg::Ibs => f.imm & Self::mask(size),
+            Arg::Rb | Arg::Rv => regs.read(f.opcode_reg(), size, rex),
+            Arg::Al => u64::from(regs.byte(0)),
+            Arg::Ax => regs.read(0, size, rex),
+            Arg::Cl => u64::from(regs.byte(1)),
+            Arg::Dx => regs.read(2, 2, rex),
             Arg::One => 1,
             Arg::M | Arg::Mp | Arg::Ms => self.ea().1,
             Arg::Ob | Arg::Ov => {
@@ -1421,28 +1525,38 @@ impl<'a> Exec<'a> {
         Ok(value & Self::mask(size))
     }
 
+    /// How wide a control- or debug-register move is.
+    ///
+    /// Always the full register: `MOV CR0, r` in 64-bit mode transfers
+    /// sixty-four bits with no `REX.W` and *cannot* be narrowed by a `66`
+    /// prefix. Below long mode it is thirty-two (*Intel SDM* volume 2,
+    /// `MOV — Move to/from Control Registers`).
+    #[inline]
+    fn system_reg_size(&self) -> u8 {
+        if self.sixty_four() { 8 } else { 4 }
+    }
+
     /// Write one operand at `size` bytes.
-    pub(super) fn write_arg(&mut self, f: &Fields, arg: Arg, size: u8, value: u32) -> Ex<()> {
+    pub(super) fn write_arg(&mut self, f: &Fields, arg: Arg, size: u8, value: u64) -> Ex<()> {
+        let rex = f.has_rex();
         match arg {
-            Arg::Eb | Arg::Ev | Arg::Ew => match f.modrm {
-                Some(m) if m.is_register() => self.state.regs.write(m.rm, size, value),
+            Arg::Eb | Arg::Ev | Arg::Ew | Arg::Ed => match f.modrm {
+                Some(m) if m.is_register() => self.state.regs.write(f.rm_num(), size, rex, value),
                 _ => {
                     let (sr, off) = self.ea();
                     self.write_mem(sr, off, size, value)?;
                 }
             },
             Arg::Gb | Arg::Gv | Arg::Gw => {
-                self.state
-                    .regs
-                    .write(f.modrm.map_or(0, |m| m.reg), size, value);
+                self.state.regs.write(f.reg_num(), size, rex, value);
             }
-            Arg::Rd => self
-                .state
-                .regs
-                .set_dword(f.modrm.map_or(0, |m| m.rm), value),
-            Arg::Cd => self.write_control(f.modrm.map_or(0, |m| m.reg), value)?,
-            Arg::Dd => self.write_debug(f.modrm.map_or(0, |m| m.reg), value)?,
-            Arg::Td => self.write_test(f.modrm.map_or(0, |m| m.reg), value)?,
+            Arg::Rd => {
+                let width = self.system_reg_size();
+                self.state.regs.write(f.rm_num(), width, rex, value);
+            }
+            Arg::Cd => self.write_control(f.reg_num(), value)?,
+            Arg::Dd => self.write_debug(f.reg_num(), value)?,
+            Arg::Td => self.write_test(f.reg_num(), value)?,
             Arg::Sw => {
                 let index = f.modrm.map_or(0, |m| m.reg);
                 let index = if self.legacy() { index & 3 } else { index };
@@ -1452,11 +1566,11 @@ impl<'a> Exec<'a> {
                 let index = (f.opcode >> 3) & 7;
                 self.load_segment(index, value as u16)?;
             }
-            Arg::Rb | Arg::Rv => self.state.regs.write(f.opcode & 7, size, value),
+            Arg::Rb | Arg::Rv => self.state.regs.write(f.opcode_reg(), size, rex, value),
             Arg::Al => self.state.regs.set_byte(0, value as u8),
-            Arg::Ax => self.state.regs.write(0, size, value),
+            Arg::Ax => self.state.regs.write(0, size, rex, value),
             Arg::Cl => self.state.regs.set_byte(1, value as u8),
-            Arg::Dx => self.state.regs.write(2, 2, value),
+            Arg::Dx => self.state.regs.write(2, 2, rex, value),
             Arg::Ob | Arg::Ov => {
                 let (sr, off) = self.ea();
                 self.write_mem(sr, off, size, value)?;
@@ -1511,9 +1625,49 @@ impl<'a> Exec<'a> {
                 let value = if insn.op == Op::MOVZX {
                     raw
                 } else {
-                    Self::sign_extend32(raw, src_size)
+                    Self::sign_extend(raw, src_size)
                 };
                 self.write_arg(f, insn.dst, f.opsize, value)?;
+            }
+            // `MOVSXD` reclaimed `ARPL`'s encoding, and its source is always
+            // thirty-two bits: without `REX.W` it is an expensive `mov r32,
+            // r/m32`, and with one it is the only sign-extending move from a
+            // doubleword long mode has.
+            Op::MOVSXD => {
+                let raw = self.read_arg(f, insn.src, 4)?;
+                let value = if f.opsize == 8 {
+                    Self::sign_extend(raw, 4)
+                } else {
+                    raw
+                };
+                self.write_arg(f, insn.dst, f.opsize, value)?;
+            }
+            Op::RDMSR => self.rdmsr()?,
+            Op::WRMSR => self.wrmsr()?,
+            Op::SYSCALL => self.syscall()?,
+            Op::SYSRET => self.sysret(f.opsize)?,
+            Op::SWAPGS => self.swapgs()?,
+            // A `REX` prefix never reaches execution: the decoder consumes it
+            // and it becomes a field. Reaching here would be a decoder bug,
+            // and doing nothing is the least harmful way to say so.
+            Op::REX => {}
+            op if op.is_cmov() => {
+                if !self.cfg.features.cmov {
+                    return Err(Fault::bare(VEC_UD));
+                }
+                let cc = op.condition_code().unwrap_or(0);
+                let value = self.read_arg(f, insn.src, size)?;
+                // The destination is written **either way**: a `CMOV` whose
+                // condition is false still zero-extends a 32-bit destination
+                // into its 64-bit register, because the write happens and only
+                // the value is selected. Writing back what was read is how
+                // that stays true without a second code path.
+                let value = if self.condition(cc) {
+                    value
+                } else {
+                    self.read_arg(f, insn.dst, size)?
+                };
+                self.write_arg(f, insn.dst, size, value)?;
             }
             Op::XCHG => {
                 let a = self.read_arg(f, insn.dst, size)?;
@@ -1530,7 +1684,7 @@ impl<'a> Exec<'a> {
             }
             Op::CMPXCHG => {
                 let dst = self.read_arg(f, insn.dst, size)?;
-                let acc = self.state.regs.read(0, size);
+                let acc = self.state.regs.read(0, size, false);
                 // The comparison sets the flags whichever way it goes; the
                 // accumulator is only reloaded on a mismatch.
                 self.sub(acc, dst, false, size);
@@ -1538,7 +1692,7 @@ impl<'a> Exec<'a> {
                     let src = self.read_arg(f, insn.src, size)?;
                     self.write_arg(f, insn.dst, size, src)?;
                 } else {
-                    self.state.regs.write(0, size, dst);
+                    self.state.regs.write(0, size, false, dst);
                     // A failed `CMPXCHG` still writes the destination back, so
                     // a locked read-modify-write on the bus looks the same
                     // either way.
@@ -1546,19 +1700,20 @@ impl<'a> Exec<'a> {
                 }
             }
             Op::BSWAP => {
-                let index = f.opcode & 7;
-                let value = self.state.regs.dword(index);
-                self.state.regs.set_dword(index, value.swap_bytes());
+                let index = f.opcode_reg();
+                if f.opsize == 8 {
+                    let value = self.state.regs.qword(index);
+                    self.state.regs.set_qword(index, value.swap_bytes());
+                } else {
+                    let value = self.state.regs.dword(index);
+                    self.state.regs.set_dword(index, value.swap_bytes());
+                }
             }
             Op::LEA => {
                 let offset = self.ea().1;
                 // The address size decides how much of the address exists; the
                 // operand size decides how much of it is stored.
-                let offset = if f.addrsize == 2 {
-                    offset & 0xffff
-                } else {
-                    offset
-                };
+                let offset = offset & Self::mask(f.addrsize);
                 self.write_arg(f, insn.dst, f.opsize, offset)?;
             }
             Op::LES | Op::LDS | Op::LSS | Op::LFS | Op::LGS => self.load_far_pointer(f)?,
@@ -1573,14 +1728,14 @@ impl<'a> Exec<'a> {
             Op::LEAVE => {
                 // `LEAVE` is `mov esp, ebp` then `pop ebp`, and the stack's
                 // address size decides which halves move.
-                let bp = if self.stack_addr_size() == 2 {
-                    self.state.regs.word(5) as u32
-                } else {
-                    self.state.regs.ebp
+                let bp = match self.stack_addr_size() {
+                    2 => u64::from(self.state.regs.word(5)),
+                    4 => u64::from(self.state.regs.dword(5)),
+                    _ => self.state.regs.rbp,
                 };
                 self.set_sp(bp);
                 let value = self.pop(f.opsize)?;
-                self.state.regs.write(5, f.opsize, value);
+                self.state.regs.write(5, f.opsize, false, value);
             }
             Op::PUSHF => {
                 // `VM` and `RF` are never stored: the image on the stack has to
@@ -1588,7 +1743,7 @@ impl<'a> Exec<'a> {
                 // IOPL-sensitive only in virtual-8086 mode, which this core
                 // does not implement.)
                 let value = self.state.regs.eflags & !(flags::VM | flags::RF);
-                self.push(value, f.opsize)?;
+                self.push(u64::from(value), f.opsize)?;
             }
             Op::POPF => self.popf(f)?,
             Op::SAHF => {
@@ -1600,34 +1755,50 @@ impl<'a> Exec<'a> {
                 let low = (self.state.regs.eflags & 0xff) as u8;
                 self.state.regs.set_byte(4, low);
             }
-            Op::CBW => {
-                if f.opsize == 2 {
+            Op::CBW => match f.opsize {
+                2 => {
                     let al = self.state.regs.byte(0);
                     self.state.regs.set_word(0, i16::from(al as i8) as u16);
-                } else {
+                }
+                4 => {
                     // `CWDE`: the same opcode with a 32-bit operand size.
                     let ax = self.state.regs.word(0);
                     self.state.regs.set_dword(0, i32::from(ax as i16) as u32);
                 }
-            }
-            Op::CWD => {
-                if f.opsize == 2 {
+                _ => {
+                    // `CDQE`, which needs `REX.W`.
+                    let eax = self.state.regs.dword(0);
+                    self.state.regs.set_qword(0, i64::from(eax as i32) as u64);
+                }
+            },
+            Op::CWD => match f.opsize {
+                2 => {
                     let fill = if self.state.regs.word(0) & 0x8000 != 0 {
                         0xffff
                     } else {
                         0
                     };
                     self.state.regs.set_word(2, fill);
-                } else {
+                }
+                4 => {
                     // `CDQ`.
-                    let fill = if self.state.regs.eax & 0x8000_0000 != 0 {
+                    let fill = if self.state.regs.dword(0) & 0x8000_0000 != 0 {
                         0xffff_ffff
                     } else {
                         0
                     };
                     self.state.regs.set_dword(2, fill);
                 }
-            }
+                _ => {
+                    // `CQO`.
+                    let fill = if self.state.regs.rax & (1 << 63) != 0 {
+                        u64::MAX
+                    } else {
+                        0
+                    };
+                    self.state.regs.set_qword(2, fill);
+                }
+            },
             Op::ROL | Op::ROR | Op::RCL | Op::RCR | Op::SHL | Op::SHR | Op::SAR | Op::SETMO => {
                 self.shift(f, size)?;
             }
@@ -1664,7 +1835,19 @@ impl<'a> Exec<'a> {
                 // what makes `sti` / `hlt` race-free.
                 self.state.int_shadow = true;
             }
-            Op::NOP | Op::WAIT | Op::LOCK | Op::REP | Op::REPNE | Op::SEG => {}
+            Op::NOP => {
+                // `90` is `XCHG eAX, eAX`, which is why it is a no-op. With
+                // `REX.B` the second operand becomes `R8`, and the exchange is
+                // real again — `49 90` is `xchg r8, rax`, not a longer `nop`.
+                if f.rex & 1 != 0 {
+                    let index = f.opcode_reg();
+                    let a = self.state.regs.read(0, size, true);
+                    let b = self.state.regs.read(index, size, true);
+                    self.state.regs.write(0, size, true, b);
+                    self.state.regs.write(index, size, true, a);
+                }
+            }
+            Op::WAIT | Op::LOCK | Op::REP | Op::REPNE | Op::SEG => {}
             Op::HLT => {
                 if self.protected() && self.cpl() != 0 {
                     return Err(Fault::gp(0));
@@ -1678,27 +1861,35 @@ impl<'a> Exec<'a> {
             }
             Op::XLAT => {
                 let sr = f.segment(seg::DS);
-                let al = u32::from(self.state.regs.byte(0));
-                let base = if f.addrsize == 2 {
-                    u32::from(self.state.regs.word(3).wrapping_add(al as u16))
-                } else {
-                    self.state.regs.ebx.wrapping_add(al)
+                let al = u64::from(self.state.regs.byte(0));
+                let base = match f.addrsize {
+                    2 => u64::from(self.state.regs.word(3).wrapping_add(al as u16)),
+                    4 => u64::from(self.state.regs.dword(3).wrapping_add(al as u32)),
+                    _ => self.state.regs.rbx.wrapping_add(al),
                 };
                 let value = self.read_mem(sr, base, 1)?;
                 self.state.regs.set_byte(0, value as u8);
             }
             Op::IN => {
                 let port = self.port(f, insn.src);
-                let width = if insn.dst == Arg::Al { 1 } else { f.opsize };
+                let width = if insn.dst == Arg::Al {
+                    1
+                } else {
+                    Self::io_width(f.opsize)
+                };
                 self.io_permitted(port, width)?;
                 let value = self.io_read_sized(port, width);
-                self.state.regs.write(0, width, value);
+                self.state.regs.write(0, width, false, u64::from(value));
             }
             Op::OUT => {
                 let port = self.port(f, insn.dst);
-                let width = if insn.src == Arg::Al { 1 } else { f.opsize };
+                let width = if insn.src == Arg::Al {
+                    1
+                } else {
+                    Self::io_width(f.opsize)
+                };
                 self.io_permitted(port, width)?;
-                let value = self.state.regs.read(0, width);
+                let value = self.state.regs.read(0, width, false) as u32;
                 self.io_write_sized(port, width, value);
             }
             Op::CALL => self.call_near(f)?,
@@ -1719,7 +1910,7 @@ impl<'a> Exec<'a> {
             }
             Op::RET => {
                 let ip = self.pop(f.opsize)?;
-                let extra = if insn.dst == Arg::Iw || insn.dst == Arg::Iv {
+                let extra = if matches!(insn.dst, Arg::Iw | Arg::Iv | Arg::Iz) {
                     f.imm & 0xffff
                 } else {
                     0
@@ -1729,7 +1920,7 @@ impl<'a> Exec<'a> {
                 self.set_sp(sp);
             }
             Op::RETF => {
-                let extra = if insn.dst == Arg::Iw || insn.dst == Arg::Iv {
+                let extra = if matches!(insn.dst, Arg::Iw | Arg::Iv | Arg::Iz) {
                     f.imm & 0xffff
                 } else {
                     0
@@ -1780,12 +1971,16 @@ impl<'a> Exec<'a> {
                 let src = self.read_arg(f, insn.src, size)?;
                 self.set_flag(flags::ZF, src == 0);
                 if src != 0 {
+                    let bits = u32::from(size) * 8;
                     let index = if insn.op == Op::BSF {
                         src.trailing_zeros()
                     } else {
-                        31 - src.leading_zeros()
+                        // The source has already been masked to the operand
+                        // size, so the highest set bit is counted from the
+                        // operand's own width rather than from 64.
+                        bits - 1 - (src.leading_zeros() - (64 - bits))
                     };
-                    self.write_arg(f, insn.dst, size, index)?;
+                    self.write_arg(f, insn.dst, size, u64::from(index))?;
                 }
                 // A source of zero leaves the destination untouched. That is
                 // the architecture, not an omission: the manual says the
@@ -1806,6 +2001,17 @@ impl<'a> Exec<'a> {
                 // invalidating is a no-op — but the privilege check is not.
             }
             Op::INVLPG => {
+                // `0F 01 F8` — group 7 extension 7 with a *register* mode
+                // field — is `SWAPGS`, not an `INVLPG` of a register. The two
+                // share an encoding because long mode had one slot left, and
+                // the mode field is the only thing that tells them apart.
+                if f.rm_is_register() {
+                    if self.sixty_four() && f.modrm.is_some_and(|m| m.rm == 0) {
+                        self.swapgs()?;
+                        return Ok(());
+                    }
+                    return Err(Fault::bare(VEC_UD));
+                }
                 if self.protected() && self.cpl() != 0 {
                     return Err(Fault::gp(0));
                 }
@@ -1823,13 +2029,13 @@ impl<'a> Exec<'a> {
                     self.state.sys.task.selector
                 };
                 self.require_protected()?;
-                self.write_arg(f, insn.dst, 2, u32::from(selector))?;
+                self.write_arg(f, insn.dst, 2, u64::from(selector))?;
             }
             Op::SMSW => {
                 // A register destination gets all thirty-two bits on a 386,
                 // and memory gets sixteen — the 286 compatibility that makes
                 // this instruction's width rule unlike everything else's.
-                let value = self.state.sys.cr0;
+                let value = u64::from(self.state.sys.cr0);
                 if f.rm_is_register() {
                     self.write_arg(f, insn.dst, f.opsize, value)?;
                 } else {
@@ -1842,7 +2048,7 @@ impl<'a> Exec<'a> {
             Op::ARPL => self.arpl(f)?,
             op if op.is_setcc() => {
                 let cc = op.condition_code().unwrap_or(0);
-                let value = u32::from(self.condition(cc));
+                let value = u64::from(self.condition(cc));
                 self.write_arg(f, insn.dst, 1, value)?;
             }
             op if op.is_conditional_jump() => {
@@ -1899,43 +2105,42 @@ impl<'a> Exec<'a> {
     }
 
     /// The `offset:selector` pair a far transfer names.
-    fn far_target(&mut self, f: &Fields) -> Ex<(u32, u16)> {
+    fn far_target(&mut self, f: &Fields) -> Ex<(u64, u16)> {
         if f.insn.dst == Arg::Ap {
             return Ok((f.imm_sized(), f.imm_seg()));
         }
         let (sr, off) = self.ea();
         let offset = self.read_mem(sr, off, f.opsize)?;
-        let selector = self.read_mem(sr, off.wrapping_add(u32::from(f.opsize)), 2)?;
+        let selector = self.read_mem(sr, off.wrapping_add(u64::from(f.opsize)), 2)?;
         Ok((offset, selector as u16))
     }
 
     /// The target of a relative jump: the address of the *next* instruction
     /// plus the displacement, wrapped at the operand size.
-    fn relative_target(&self, f: &Fields) -> u32 {
-        let next = self.state.regs.eip;
+    fn relative_target(&self, f: &Fields) -> u64 {
+        let next = self.state.regs.rip;
+        // The displacement has already been sign-extended to the operand
+        // size by the decoder, so this is one addition however wide the
+        // pointer is — and it wraps in the pointer's own width.
         let target = next.wrapping_add(f.imm);
-        if f.opsize == 2 {
-            target & 0xffff
-        } else {
-            target
-        }
+        target & Self::mask(f.opsize)
     }
 
     /// The count register a `LOOP`, `JCXZ` or repeat prefix uses, at the
     /// address size.
-    fn counter(&self, f: &Fields) -> u32 {
-        if f.addrsize == 2 {
-            u32::from(self.state.regs.word(1))
-        } else {
-            self.state.regs.ecx
+    fn counter(&self, f: &Fields) -> u64 {
+        match f.addrsize {
+            2 => u64::from(self.state.regs.word(1)),
+            4 => u64::from(self.state.regs.dword(1)),
+            _ => self.state.regs.rcx,
         }
     }
 
-    fn set_counter(&mut self, f: &Fields, value: u32) {
-        if f.addrsize == 2 {
-            self.state.regs.set_word(1, value as u16);
-        } else {
-            self.state.regs.ecx = value;
+    fn set_counter(&mut self, f: &Fields, value: u64) {
+        match f.addrsize {
+            2 => self.state.regs.set_word(1, value as u16),
+            4 => self.state.regs.set_dword(1, value as u32),
+            _ => self.state.regs.set_qword(1, value),
         }
     }
 
@@ -2010,7 +2215,7 @@ impl<'a> Exec<'a> {
         let insn = f.insn;
         let size = f.opsize;
         if self.legacy() {
-            let sp = self.sp().wrapping_sub(u32::from(size)) & 0xffff;
+            let sp = self.sp().wrapping_sub(u64::from(size)) & 0xffff;
             self.set_sp(sp);
             let value = self.read_arg(f, insn.dst, size)?;
             return self.write_mem(seg::SS, sp, size, value);
@@ -2028,7 +2233,7 @@ impl<'a> Exec<'a> {
             let value = if index == 4 {
                 original_sp
             } else {
-                self.state.regs.read(index, size)
+                self.state.regs.read(index, size, false)
             };
             self.push(value, size)?;
         }
@@ -2043,7 +2248,7 @@ impl<'a> Exec<'a> {
         for index in (0..8u8).rev() {
             let value = self.pop(size)?;
             if index != 4 {
-                self.state.regs.write(index, size, value);
+                self.state.regs.write(index, size, false, value);
             }
         }
         Ok(())
@@ -2055,22 +2260,22 @@ impl<'a> Exec<'a> {
         let size = f.opsize;
         let frame = f.imm & 0xffff;
         let level = (f.imm2 & 0x1f) as u8;
-        let bp = self.state.regs.read(5, size);
+        let bp = self.state.regs.read(5, size, false);
         self.push(bp, size)?;
         let frame_ptr = self.sp();
         for _ in 1..level {
             // Each nesting level copies the pointer to the frame one level out,
             // building the display the callee walks.
-            let bp = self.state.regs.read(5, size);
-            let bp = bp.wrapping_sub(u32::from(size));
-            self.state.regs.write(5, size, bp);
+            let bp = self.state.regs.read(5, size, false);
+            let bp = bp.wrapping_sub(u64::from(size));
+            self.state.regs.write(5, size, false, bp);
             let value = self.read_mem(seg::SS, bp, size)?;
             self.push(value, size)?;
         }
         if level > 0 {
             self.push(frame_ptr, size)?;
         }
-        self.state.regs.write(5, size, frame_ptr);
+        self.state.regs.write(5, size, false, frame_ptr);
         let sp = frame_ptr.wrapping_sub(frame);
         self.set_sp(sp);
         Ok(())
@@ -2083,7 +2288,7 @@ impl<'a> Exec<'a> {
     /// ignoring the write rather than faulting is what the architecture says,
     /// and it is what makes a `pushf`/`popf` pair harmless in user code.
     fn popf(&mut self, f: &Fields) -> Ex<()> {
-        let value = self.pop(f.opsize)?;
+        let value = self.pop(f.opsize)? as u32;
         let old = self.state.regs.eflags;
         if self.legacy() {
             self.set_flags(value);
@@ -2140,26 +2345,23 @@ impl<'a> Exec<'a> {
         let size = f.opsize;
         let (sr, off) = self.ea();
         let lower = self.read_mem(sr, off, size)?;
-        let upper = self.read_mem(sr, off.wrapping_add(u32::from(size)), size)?;
-        let index = self.read_arg(f, f.insn.dst, size)? as i32;
-        let lower = Self::sign_extend32(lower, size) as i32;
-        let upper = Self::sign_extend32(upper, size) as i32;
-        let index = if size == 2 {
-            index as i16 as i32
-        } else {
-            index
-        };
+        let upper = self.read_mem(sr, off.wrapping_add(u64::from(size)), size)?;
+        let index = self.read_arg(f, f.insn.dst, size)?;
+        let lower = Self::sign_extend(lower, size) as i64;
+        let upper = Self::sign_extend(upper, size) as i64;
+        let index = Self::sign_extend(index, size) as i64;
         if index < lower || index > upper {
             return Err(Fault::bare(VEC_BOUND));
         }
         Ok(())
     }
 
-    /// Sign-extend the low `size` bytes of a value to thirty-two bits.
-    const fn sign_extend32(value: u32, size: u8) -> u32 {
+    /// Sign-extend the low `size` bytes of a value to sixty-four bits.
+    pub(super) const fn sign_extend(value: u64, size: u8) -> u64 {
         match size {
-            1 => ((value as u8) as i8) as u32,
-            2 => ((value as u16) as i16) as u32,
+            1 => ((value as u8) as i8) as i64 as u64,
+            2 => ((value as u16) as i16) as i64 as u64,
+            4 => ((value as u32) as i32) as i64 as u64,
             _ => value,
         }
     }
@@ -2177,7 +2379,7 @@ impl<'a> Exec<'a> {
     /// here rather than reusing the effective address as-is.
     fn bit_test(&mut self, f: &Fields, size: u8) -> Ex<()> {
         let insn = f.insn;
-        let bits = u32::from(size) * 8;
+        let bits = u64::from(size) * 8;
         let raw = self.read_arg(f, insn.src, if insn.src == Arg::Ib { 1 } else { size })?;
         // An *immediate* bit number is always taken modulo the operand size,
         // and so is a register bit number applied to a register operand: in
@@ -2185,19 +2387,19 @@ impl<'a> Exec<'a> {
         // register bit number with a memory operand gets the unbounded form.
         let bounded = f.rm_is_register() || insn.src == Arg::Ib;
         let (index, offset_bytes) = if bounded {
-            (raw % bits, 0i32)
+            (raw % bits, 0i64)
         } else {
-            let signed = Self::sign_extend32(raw, size) as i32;
-            let word = signed.div_euclid(bits as i32);
-            let bit = signed.rem_euclid(bits as i32) as u32;
-            (bit, word * i32::from(size))
+            let signed = Self::sign_extend(raw, size) as i64;
+            let word = signed.div_euclid(bits as i64);
+            let bit = signed.rem_euclid(bits as i64) as u64;
+            (bit, word * i64::from(size))
         };
 
         let value = if bounded {
             self.read_arg(f, insn.dst, size)?
         } else {
             let (sr, off) = self.ea();
-            let off = off.wrapping_add(offset_bytes as u32);
+            let off = off.wrapping_add(offset_bytes as u64);
             self.read_mem(sr, off, size)?
         };
         let bit = (value >> index) & 1;
@@ -2212,7 +2414,7 @@ impl<'a> Exec<'a> {
             self.write_arg(f, insn.dst, size, updated)?;
         } else {
             let (sr, off) = self.ea();
-            let off = off.wrapping_add(offset_bytes as u32);
+            let off = off.wrapping_add(offset_bytes as u64);
             self.write_mem(sr, off, size, updated)?;
         }
         Ok(())
@@ -2226,14 +2428,18 @@ impl<'a> Exec<'a> {
         let insn = f.insn;
         let raw = match insn.src {
             Arg::One => 1,
-            Arg::Cl => u32::from(self.state.regs.byte(1)),
+            Arg::Cl => u64::from(self.state.regs.byte(1)),
             _ => f.imm & 0xff,
         };
         // The 8086 uses the whole of `CL`: masking the count to five bits is
         // 80186-and-later behaviour, and the corpus masks `CL` to six bits
-        // precisely to catch a core that made that mistake.
+        // precisely to catch a core that made that mistake. A 64-bit
+        // operand masks to **six** bits instead, which is the one place the
+        // mask is not a constant (*Intel SDM* volume 2, `SAL/SAR/SHL/SHR`).
         let count = if self.legacy() {
             raw as u8
+        } else if size == 8 {
+            (raw & 0x3f) as u8
         } else {
             (raw & 0x1f) as u8
         };
@@ -2257,7 +2463,7 @@ impl<'a> Exec<'a> {
     /// slower and it is right: the overflow flag of a multi-bit rotate is the
     /// *last* iteration's, `RCL`/`RCR` rotate through a carry that changes
     /// under them, and a closed form has to special-case every one of those.
-    fn shift_value(&mut self, op: Op, value: u32, count: u8, size: u8) -> u32 {
+    fn shift_value(&mut self, op: Op, value: u64, count: u8, size: u8) -> u64 {
         if count == 0 {
             return value;
         }
@@ -2277,25 +2483,25 @@ impl<'a> Exec<'a> {
             match op {
                 Op::ROL => {
                     cf = v & msb != 0;
-                    v = ((v << 1) | u32::from(cf)) & mask;
+                    v = ((v << 1) | u64::from(cf)) & mask;
                     of = (v & msb != 0) != cf;
                 }
                 Op::ROR => {
                     cf = v & 1 != 0;
-                    v = ((v >> 1) | (u32::from(cf) * msb)) & mask;
+                    v = ((v >> 1) | (u64::from(cf) * msb)) & mask;
                     of = (v & msb != 0) != (v & (msb >> 1) != 0);
                 }
                 Op::RCL => {
                     let carry_in = cf;
                     cf = v & msb != 0;
-                    v = ((v << 1) | u32::from(carry_in)) & mask;
+                    v = ((v << 1) | u64::from(carry_in)) & mask;
                     of = (v & msb != 0) != cf;
                 }
                 Op::RCR => {
                     let carry_in = cf;
                     of = (v & msb != 0) != carry_in;
                     cf = v & 1 != 0;
-                    v = ((v >> 1) | (u32::from(carry_in) * msb)) & mask;
+                    v = ((v >> 1) | (u64::from(carry_in) * msb)) & mask;
                 }
                 Op::SHL => {
                     cf = v & msb != 0;
@@ -2310,7 +2516,10 @@ impl<'a> Exec<'a> {
                 _ => {
                     of = false;
                     cf = v & 1 != 0;
-                    v = ((v | if v & msb != 0 { !mask } else { 0 }) as i32 >> 1) as u32 & mask;
+                    // `SAR` shifts the sign in, so the value is widened to
+                    // the host word with its own sign before the shift.
+                    let filled = v | if v & msb != 0 { !mask } else { 0 };
+                    v = ((filled as i64) >> 1) as u64 & mask;
                 }
             }
         }
@@ -2337,10 +2546,14 @@ impl<'a> Exec<'a> {
     fn double_shift(&mut self, f: &Fields, size: u8) -> Ex<()> {
         let insn = f.insn;
         let raw = match insn.aux {
-            Arg::Cl => u32::from(self.state.regs.byte(1)),
+            Arg::Cl => u64::from(self.state.regs.byte(1)),
             _ => f.imm & 0xff,
         };
-        let count = (raw & 0x1f) as u8;
+        let count = if size == 8 {
+            (raw & 0x3f) as u8
+        } else {
+            (raw & 0x1f) as u8
+        };
         if count == 0 {
             return Ok(());
         }
@@ -2382,7 +2595,7 @@ impl<'a> Exec<'a> {
     /// from its top bit, `PF` from its low byte, and `AF` cleared. `CF` and
     /// `OF` are the documented ones, and the caller supplies them because
     /// `MUL` and `IMUL` disagree about what "the result does not fit" means.
-    fn mul_flags(&mut self, high: u32, size: u8, overflow: bool) {
+    fn mul_flags(&mut self, high: u64, size: u8, overflow: bool) {
         self.set_flag(flags::ZF, high == 0);
         self.set_flag(flags::SF, high & Self::msb(size) != 0);
         self.set_flag(flags::PF, Self::parity(high as u8));
@@ -2400,25 +2613,28 @@ impl<'a> Exec<'a> {
         }
         let signed = insn.op == Op::IMUL;
         let src = self.read_arg(f, insn.dst, size)?;
-        let acc = self.state.regs.read(0, size);
+        let acc = self.state.regs.read(0, size, false);
         let mask = Self::mask(size);
         let bits = u32::from(size) * 8;
-        let product: u64 = if signed {
-            let a = i64::from(Self::sign_extend32(acc, size) as i32);
-            let b = i64::from(Self::sign_extend32(src, size) as i32);
-            (a.wrapping_mul(b)) as u64
+        // A 64-bit multiply produces 128 bits, so the intermediate is a
+        // `u128` at every width rather than a `u64` that would silently
+        // lose the high half of the widest one.
+        let product: u128 = if signed {
+            let a = Self::sign_extend(acc, size) as i64 as i128;
+            let b = Self::sign_extend(src, size) as i64 as i128;
+            (a.wrapping_mul(b)) as u128
         } else {
-            u64::from(acc & mask) * u64::from(src & mask)
+            u128::from(acc & mask) * u128::from(src & mask)
         };
-        let low = (product as u32) & mask;
-        let high = ((product >> bits) as u32) & mask;
+        let low = (product as u64) & mask;
+        let high = ((product >> bits) as u64) & mask;
         if size == 1 {
             // A byte multiply's whole result is `AX`, not `AH:AL` as two
             // registers.
             self.state.regs.set_word(0, (low | (high << 8)) as u16);
         } else {
-            self.state.regs.write(0, size, low);
-            self.state.regs.write(2, size, high);
+            self.state.regs.write(0, size, false, low);
+            self.state.regs.write(2, size, false, high);
         }
         let overflow = if signed {
             let sign_fill = if low & Self::msb(size) != 0 { mask } else { 0 };
@@ -2444,21 +2660,21 @@ impl<'a> Exec<'a> {
         } else {
             let raw = self.read_arg(f, insn.aux, if insn.aux == Arg::Ibs { 1 } else { size })?;
             if insn.aux == Arg::Ibs {
-                Self::sign_extend32(raw, 1)
+                Self::sign_extend(raw, 1)
             } else {
                 raw
             }
         };
-        let a = i64::from(Self::sign_extend32(a, size) as i32);
-        let b = i64::from(Self::sign_extend32(b, size) as i32);
+        let a = Self::sign_extend(a, size) as i64 as i128;
+        let b = Self::sign_extend(b, size) as i64 as i128;
         let product = a.wrapping_mul(b);
-        let truncated = (product as u32) & Self::mask(size);
-        let fits = i64::from(Self::sign_extend32(truncated, size) as i32) == product;
+        let truncated = (product as u64) & Self::mask(size);
+        let fits = i128::from(Self::sign_extend(truncated, size) as i64) == product;
         self.set_flag(flags::CF | flags::OF, !fits);
         // The other four are undefined; the 8088 sets them from the high half,
         // and this core keeps that rule for the 386 too rather than inventing
         // a second one.
-        let high = ((product as u64) >> (u32::from(size) * 8)) as u32 & Self::mask(size);
+        let high = ((product as u128) >> (u32::from(size) * 8)) as u64 & Self::mask(size);
         self.set_flag(flags::ZF, high == 0);
         self.set_flag(flags::SF, high & Self::msb(size) != 0);
         self.set_flag(flags::PF, Self::parity(high as u8));
@@ -2478,11 +2694,14 @@ impl<'a> Exec<'a> {
         let bits = u32::from(size) * 8;
 
         let source = self.read_arg(f, insn.dst, size)?;
-        let dividend: u64 = if size == 1 {
-            u64::from(self.state.regs.word(0))
+        // The dividend is twice the operand width, so at eight bytes it is
+        // 128 bits and the whole calculation has to be — a `u64` here would
+        // silently drop `RDX`.
+        let dividend: u128 = if size == 1 {
+            u128::from(self.state.regs.word(0))
         } else {
-            let high = u64::from(self.state.regs.read(2, size));
-            let low = u64::from(self.state.regs.read(0, size));
+            let high = u128::from(self.state.regs.read(2, size, false));
+            let low = u128::from(self.state.regs.read(0, size, false));
             (high << bits) | low
         };
 
@@ -2491,10 +2710,10 @@ impl<'a> Exec<'a> {
         let (magnitude, divisor_magnitude) = if signed {
             (
                 Self::sign_extend_wide(dividend, bits * 2).unsigned_abs(),
-                i64::from(Self::sign_extend32(source, size) as i32).unsigned_abs(),
+                (Self::sign_extend(source, size) as i64 as i128).unsigned_abs(),
             )
         } else {
-            (dividend, u64::from(source))
+            (dividend, u128::from(source))
         };
 
         // Run the loop even when the result will not fit: the flags it leaves
@@ -2505,25 +2724,25 @@ impl<'a> Exec<'a> {
         // Whether the result is representable is decided separately: the loop
         // produces exactly `bits` bits of quotient whatever the true one would
         // have been, so it cannot report an overflow itself.
-        let mask = u64::from(Self::mask(size));
+        let mask = u128::from(Self::mask(size));
         let (quotient, remainder, fault) = if divisor_magnitude == 0 {
             (0, 0, true)
         } else if signed {
             let n = Self::sign_extend_wide(dividend, bits * 2);
-            let d = i64::from(Self::sign_extend32(source, size) as i32);
-            // `IDIV` of the most negative 64-bit dividend by -1 has a quotient
-            // that is not representable at all — `2^63`. That is a divide
-            // error on hardware and it is a *panic* on the host, so it has to
-            // be caught here rather than divided and then range-checked.
+            let d = Self::sign_extend(source, size) as i64 as i128;
+            // `IDIV` of the most negative dividend by -1 has a quotient that
+            // is not representable at all. That is a divide error on hardware
+            // and it is a *panic* on the host, so it has to be caught here
+            // rather than divided and then range-checked.
             match (n.checked_div(d), n.checked_rem(d)) {
                 (Some(mut q), Some(r)) => {
                     if negate {
                         q = q.wrapping_neg();
                     }
-                    let limit = 1i64 << (bits - 1);
+                    let limit = 1i128 << (bits - 1);
                     (
-                        (q as u64) & mask,
-                        (r as u64) & mask,
+                        (q as u128) & mask,
+                        (r as u128) & mask,
                         !(-limit..limit).contains(&q),
                     )
                 }
@@ -2553,16 +2772,16 @@ impl<'a> Exec<'a> {
                 .regs
                 .set_word(0, ((quotient & 0xff) | ((remainder & 0xff) << 8)) as u16);
         } else {
-            self.state.regs.write(0, size, quotient as u32);
-            self.state.regs.write(2, size, remainder as u32);
+            self.state.regs.write(0, size, false, quotient as u64);
+            self.state.regs.write(2, size, false, remainder as u64);
         }
         Ok(())
     }
 
-    /// Sign-extend the low `bits` of a 64-bit value.
-    const fn sign_extend_wide(value: u64, bits: u32) -> i64 {
-        let shift = 64 - bits;
-        ((value as i64) << shift) >> shift
+    /// Sign-extend the low `bits` of a 128-bit value.
+    const fn sign_extend_wide(value: u128, bits: u32) -> i128 {
+        let shift = 128 - bits;
+        ((value as i128) << shift) >> shift
     }
 
     /// The restoring-division loop the 8086 runs in microcode, and the flag
@@ -2576,13 +2795,13 @@ impl<'a> Exec<'a> {
     /// undefined flag results near the hardware's — what an 8088 leaves behind
     /// is the last trial subtraction's flags. "Near", not "equal":
     /// `conformance::KNOWN_FAILURES` records what is still missing.
-    fn cord(&mut self, dividend: u64, divisor: u64, bits: u32) -> (u64, u64) {
-        let mask = if bits >= 64 {
-            u64::MAX
+    fn cord(&mut self, dividend: u128, divisor: u128, bits: u32) -> (u128, u128) {
+        let mask = if bits >= 128 {
+            u128::MAX
         } else {
-            (1u64 << bits) - 1
+            (1u128 << bits) - 1
         };
-        let top = 1u64 << (bits - 1);
+        let top = 1u128 << (bits - 1);
         let mut remainder = (dividend >> bits) & mask;
         let mut quotient = dividend & mask;
         for _ in 0..bits {
@@ -2631,7 +2850,7 @@ impl<'a> Exec<'a> {
         self.state
             .regs
             .set_word(0, u16::from(remainder) | (u16::from(quotient) << 8));
-        self.set_szp(u32::from(remainder), 1);
+        self.set_szp(u64::from(remainder), 1);
         self.set_flag(flags::CF | flags::OF | flags::AF, false);
         Ok(())
     }
@@ -2643,7 +2862,7 @@ impl<'a> Exec<'a> {
         let product = ah.wrapping_mul(base);
         // The adjustment really is an addition, so it sets carry and the
         // auxiliary carry even though Intel calls them undefined.
-        let r = self.add(u32::from(product), u32::from(al), false, 1);
+        let r = self.add(u64::from(product), u64::from(al), false, 1);
         self.state.regs.set_word(0, r as u16);
         Ok(())
     }
@@ -2667,12 +2886,12 @@ impl<'a> Exec<'a> {
         let low = (al & 0x0f) > 9 || auxiliary;
         let threshold = if auxiliary { 0x9f } else { 0x99 };
         let high = self.flag(flags::CF) || al > threshold;
-        let correction = u32::from(if low { 0x06u8 } else { 0x00 })
-            + u32::from(if high { 0x60u8 } else { 0x00 });
+        let correction = u64::from(if low { 0x06u8 } else { 0x00 })
+            + u64::from(if high { 0x60u8 } else { 0x00 });
         let adjusted = if subtract {
-            self.sub(u32::from(al), correction, false, 1)
+            self.sub(u64::from(al), correction, false, 1)
         } else {
-            self.add(u32::from(al), correction, false, 1)
+            self.add(u64::from(al), correction, false, 1)
         };
         self.state.regs.set_byte(0, adjusted as u8);
         // The carry and the auxiliary carry are the *conditions*, not the
@@ -2693,11 +2912,11 @@ impl<'a> Exec<'a> {
     fn ascii_adjust(&mut self, subtract: bool) {
         let al = self.state.regs.byte(0);
         let adjust = (al & 0x0f) > 9 || self.flag(flags::AF);
-        let operand = u32::from(if adjust { 6u8 } else { 0 });
+        let operand = u64::from(if adjust { 6u8 } else { 0 });
         let adjusted = if subtract {
-            self.sub(u32::from(al), operand, false, 1)
+            self.sub(u64::from(al), operand, false, 1)
         } else {
-            self.add(u32::from(al), operand, false, 1)
+            self.add(u64::from(al), operand, false, 1)
         };
         let ah = self.state.regs.byte(4);
         let ah = match (adjust, subtract) {
@@ -2720,9 +2939,9 @@ impl<'a> Exec<'a> {
     fn string(&mut self, f: &Fields, size: u8) -> Ex<()> {
         let op = f.insn.op;
         let delta = if self.flag(flags::DF) {
-            u32::from(size).wrapping_neg()
+            u64::from(size).wrapping_neg()
         } else {
-            u32::from(size)
+            u64::from(size)
         };
         let Some(rep) = f.rep else {
             return self.string_step(f, size, delta);
@@ -2752,7 +2971,7 @@ impl<'a> Exec<'a> {
             // Modelled as a clean restart; the 8086 erratum where it forgets
             // all but the last prefix on resume is not.
             if self.lines.nmi_pending() || (self.flag(flags::IF) && self.lines.intr_pending()) {
-                self.state.regs.eip = self.start_ip;
+                self.state.regs.rip = self.start_ip;
                 self.state.queue.flush();
                 return Ok(());
             }
@@ -2761,31 +2980,31 @@ impl<'a> Exec<'a> {
     }
 
     /// The source index, at the address size.
-    fn si(&self, f: &Fields) -> u32 {
-        if f.addrsize == 2 {
-            u32::from(self.state.regs.word(6))
-        } else {
-            self.state.regs.esi
+    fn si(&self, f: &Fields) -> u64 {
+        match f.addrsize {
+            2 => u64::from(self.state.regs.word(6)),
+            4 => u64::from(self.state.regs.dword(6)),
+            _ => self.state.regs.rsi,
         }
     }
 
     /// The destination index, at the address size.
-    fn di(&self, f: &Fields) -> u32 {
-        if f.addrsize == 2 {
-            u32::from(self.state.regs.word(7))
-        } else {
-            self.state.regs.edi
+    fn di(&self, f: &Fields) -> u64 {
+        match f.addrsize {
+            2 => u64::from(self.state.regs.word(7)),
+            4 => u64::from(self.state.regs.dword(7)),
+            _ => self.state.regs.rdi,
         }
     }
 
-    fn string_step(&mut self, f: &Fields, size: u8, delta: u32) -> Ex<()> {
+    fn string_step(&mut self, f: &Fields, size: u8, delta: u64) -> Ex<()> {
         let op = f.insn.op;
         // The source of a string move is overridable; its destination is
         // always `ES:DI`, and no prefix can change that.
         let src_seg = f.segment(seg::DS);
         let si = self.si(f);
         let di = self.di(f);
-        let acc = self.state.regs.read(0, size);
+        let acc = self.state.regs.read(0, size, false);
         match op {
             Op::MOVSB | Op::MOVSW => {
                 let value = self.read_mem(src_seg, si, size)?;
@@ -2804,7 +3023,7 @@ impl<'a> Exec<'a> {
             }
             Op::LODSB | Op::LODSW => {
                 let value = self.read_mem(src_seg, si, size)?;
-                self.state.regs.write(0, size, value);
+                self.state.regs.write(0, size, false, value);
                 self.advance(f, delta, true, false);
             }
             Op::SCASB | Op::SCASW => {
@@ -2814,38 +3033,44 @@ impl<'a> Exec<'a> {
             }
             Op::INSB | Op::INSW => {
                 let port = self.state.regs.word(2);
-                self.io_permitted(port, size)?;
-                let value = self.io_read_sized(port, size);
+                let width = Self::io_width(size);
+                self.io_permitted(port, width)?;
+                let value = u64::from(self.io_read_sized(port, width));
                 self.write_mem(seg::ES, di, size, value)?;
                 self.advance(f, delta, false, true);
             }
             _ => {
                 let port = self.state.regs.word(2);
-                self.io_permitted(port, size)?;
+                let width = Self::io_width(size);
+                self.io_permitted(port, width)?;
                 let value = self.read_mem(src_seg, si, size)?;
-                self.io_write_sized(port, size, value);
+                self.io_write_sized(port, width, value as u32);
                 self.advance(f, delta, true, false);
             }
         }
         Ok(())
     }
 
-    fn advance(&mut self, f: &Fields, delta: u32, si: bool, di: bool) {
-        if f.addrsize == 2 {
-            if si {
-                let v = self.state.regs.word(6).wrapping_add(delta as u16);
-                self.state.regs.set_word(6, v);
+    fn advance(&mut self, f: &Fields, delta: u64, si: bool, di: bool) {
+        // The pointers step in the *address* size's arithmetic: `SI` wraps
+        // at 65536 in a 16-bit segment however wide the register is.
+        for (want, index) in [(si, 6u8), (di, 7)] {
+            if !want {
+                continue;
             }
-            if di {
-                let v = self.state.regs.word(7).wrapping_add(delta as u16);
-                self.state.regs.set_word(7, v);
-            }
-        } else {
-            if si {
-                self.state.regs.esi = self.state.regs.esi.wrapping_add(delta);
-            }
-            if di {
-                self.state.regs.edi = self.state.regs.edi.wrapping_add(delta);
+            match f.addrsize {
+                2 => {
+                    let v = self.state.regs.word(index).wrapping_add(delta as u16);
+                    self.state.regs.set_word(index, v);
+                }
+                4 => {
+                    let v = self.state.regs.dword(index).wrapping_add(delta as u32);
+                    self.state.regs.set_dword(index, v);
+                }
+                _ => {
+                    let v = self.state.regs.qword(index).wrapping_add(delta);
+                    self.state.regs.set_qword(index, v);
+                }
             }
         }
     }
@@ -2855,15 +3080,20 @@ impl<'a> Exec<'a> {
     // -----------------------------------------------------------------
 
     /// A near jump within the current code segment.
-    fn jump_near(&mut self, target: u32, opsize: u8) -> Ex<()> {
-        let target = if opsize == 2 { target & 0xffff } else { target };
-        if !self.legacy() {
+    fn jump_near(&mut self, target: u64, opsize: u8) -> Ex<()> {
+        let target = target & Self::mask(opsize);
+        if self.sixty_four() {
+            // No limit to check; the target has to be canonical instead.
+            if !prot::canonical(target) {
+                return Err(Fault::gp(0));
+            }
+        } else if !self.legacy() {
             let cs = self.state.sys.seg(seg::CS);
             if !cs.in_bounds(target, 1) {
                 return Err(Fault::gp(0));
             }
         }
-        self.state.regs.eip = target;
+        self.state.regs.rip = target;
         self.state.queue.flush();
         Ok(())
     }
@@ -2873,7 +3103,7 @@ impl<'a> Exec<'a> {
             Arg::Jv | Arg::Jb => self.relative_target(f),
             _ => self.read_arg(f, f.insn.dst, f.opsize)?,
         };
-        let ret = self.state.regs.eip;
+        let ret = self.state.regs.rip;
         // The return address is pushed before the transfer, so a jump that
         // faults on the segment limit leaves the stack already moved — which
         // is what hardware does too.
@@ -2886,7 +3116,7 @@ impl<'a> Exec<'a> {
         let size = f.opsize;
         let (sr, off) = self.ea();
         let offset = self.read_mem(sr, off, size)?;
-        let selector = self.read_mem(sr, off.wrapping_add(u32::from(size)), 2)? as u16;
+        let selector = self.read_mem(sr, off.wrapping_add(u64::from(size)), 2)? as u16;
         let target = match f.insn.op {
             Op::LES => seg::ES,
             Op::LDS => seg::DS,
@@ -2916,32 +3146,101 @@ impl<'a> Exec<'a> {
 
     /// `CPUID`, on the parts that have it.
     ///
-    /// The features doubleword is **zero**: no floating-point unit is
-    /// modelled, there is no time-stamp counter, no model-specific registers,
-    /// no `CMPXCHG8B` and no page-size extension. Reporting a feature this
-    /// core does not implement is how an emulator gets a guest to execute an
-    /// instruction that then raises `#UD` in the middle of a kernel.
+    /// **Every bit reported here is a bit this core implements**, and the
+    /// converse matters more: reporting a feature that is not implemented is
+    /// how an emulator gets a guest to execute an instruction that then raises
+    /// `#UD` in the middle of a kernel, with no clue as to why. So the leaves
+    /// are assembled from [`Features`](super::Features) rather than written
+    /// out as a plausible-looking constant, and the two cannot drift.
+    ///
+    /// Conspicuously absent, and absent on purpose: **`FPU` (bit 0), `MMX`,
+    /// `FXSR`, `SSE` and `SSE2`**. `CR4.OSFXSR` has storage and `CR0.EM` and
+    /// `CR0.TS` behave, because an operating system reads and writes them
+    /// before it decides anything; but no floating-point or SIMD arithmetic
+    /// exists in this core, so nothing here invites a guest to use any. A
+    /// 64-bit operating system that requires SSE2 will not boot, and it will
+    /// fail at its own feature check rather than at a mystery `#UD`.
+    ///
+    /// *Intel SDM* volume 2, `CPUID`; the extended leaves and the `LM` bit are
+    /// from the *AMD64 Architecture Programmer's Manual* volume 3, `CPUID`.
     fn cpuid(&mut self) -> Ex<()> {
-        if !self.variant().has_486_extras() {
+        let features = self.cfg.features;
+        if !features.extras_486 {
             return Err(Fault::bare(VEC_UD));
         }
-        let leaf = self.state.regs.eax;
+        // Leaf 1's feature doubleword, one bit at a time from the lattice.
+        let mut edx1: u32 = 0;
+        if features.msr {
+            edx1 |= 1 << 5; // MSR: RDMSR and WRMSR
+            edx1 |= 1 << 4; // TSC — the counter exists as `State::cycles`
+        }
+        if features.pae {
+            edx1 |= 1 << 6; // PAE
+        }
+        if features.pse {
+            edx1 |= 1 << 3; // PSE: 4 MiB pages
+        }
+        if features.pge {
+            edx1 |= 1 << 13; // PGE
+        }
+        if features.cmov {
+            edx1 |= 1 << 15; // CMOV
+        }
+        if features.extras_486 {
+            edx1 |= 1 << 8; // CX8 — CMPXCHG8B is not implemented; see below
+        }
+        // `CMPXCHG8B` is *not* implemented, so its bit must not be set. The
+        // line above is deliberately undone rather than deleted, because the
+        // temptation to set it is exactly what this comment is for: a 64-bit
+        // Linux checks it, and lying gets a `#UD` inside the scheduler.
+        edx1 &= !(1 << 8);
+
+        let signature = self.cfg.variant.reset_signature();
+        let max_basic: u32 = 1;
+        let leaf = self.state.regs.rax as u32;
         let regs = &mut self.state.regs;
+        let mut set = |a: u32, b: u32, c: u32, d: u32| {
+            // Each half is a 32-bit write, so each zero-extends.
+            regs.set_dword(0, a);
+            regs.set_dword(3, b);
+            regs.set_dword(1, c);
+            regs.set_dword(2, d);
+        };
         match leaf {
-            0 => {
-                regs.eax = 1;
+            0 => set(
+                max_basic,
                 // "GenuineIntel", in the order EBX:EDX:ECX that the
                 // architecture specifies and that nothing else would predict.
-                regs.ebx = u32::from_le_bytes(*b"Genu");
-                regs.edx = u32::from_le_bytes(*b"ineI");
-                regs.ecx = u32::from_le_bytes(*b"ntel");
+                u32::from_le_bytes(*b"Genu"),
+                u32::from_le_bytes(*b"ntel"),
+                u32::from_le_bytes(*b"ineI"),
+            ),
+            1 => set(signature, 0, 0, edx1),
+            // The extended leaves. Their existence is announced by leaf
+            // `8000_0000` returning a value above itself, which is how a guest
+            // that predates them avoids reading garbage.
+            0x8000_0000 => set(if features.long { 0x8000_0008 } else { 0 }, 0, 0, 0),
+            0x8000_0001 if features.long => {
+                let mut edx: u32 = 1 << 29; // LM: long mode
+                if features.nx {
+                    edx |= 1 << 20; // NX
+                }
+                if features.syscall {
+                    edx |= 1 << 11; // SYSCALL/SYSRET
+                }
+                set(signature, 0, 0, edx);
             }
-            _ => {
-                regs.eax = self.cfg.variant.reset_signature();
-                regs.ebx = 0;
-                regs.ecx = 0;
-                regs.edx = 0;
+            0x8000_0008 if features.long => {
+                // Physical and linear address widths: 40 and 48. The linear
+                // width is the one that matters, because it is what makes an
+                // address canonical, and a guest that trusted a different
+                // number would build page tables this core would reject.
+                set(0x0000_3028, 0, 0, 0);
             }
+            // An unimplemented leaf returns zero rather than the highest one,
+            // which is what a guest probing for a feature has to be able to
+            // tell apart from a real answer.
+            _ => set(0, 0, 0, 0),
         }
         Ok(())
     }

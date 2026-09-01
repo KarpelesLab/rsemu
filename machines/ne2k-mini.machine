@@ -1,0 +1,120 @@
+# ne2k-mini - the smallest board that can run a real Ethernet driver.
+#
+#   rsemu run ne2k-mini --media firmware=fw.bin
+#   rsemu run ne2k-mini -p nic-base=0x320 -p mac=52:54:00:aa:bb:cc --media firmware=fw.bin
+#
+# A Z80 with ROM at the reset vector, RAM above it, and an **NE2000 Ethernet
+# card** on the port bus. It models no product. It exists so that `net.ne2000`
+# has somewhere a *driver* can run - not a test harness poking registers, but
+# guest code executing `IN` and `OUT` through the machine's own port space and
+# taking the card's interrupt on `/INT`.
+#
+# ---------------------------------------------------------------------------
+# Why a Z80 board for a NIC
+# ---------------------------------------------------------------------------
+#
+# Because an NE2000 does no bus mastering. A DP8390's packet buffer is 16 KiB of
+# RAM *on the card*, reached a byte at a time through a data port, so the entire
+# device is 32 I/O ports and one interrupt pin - and a Z80 has exactly the two
+# instructions that need. A card that DMA'd into guest memory would need a bus
+# this board does not have; this one needs `IN` and `OUT`.
+#
+# ---------------------------------------------------------------------------
+# The port decoder
+# ---------------------------------------------------------------------------
+#
+# Unlike `z80-mini`, this board decodes all sixteen port address lines, because
+# the card sits at 0x300 - the first address in the ISA prototype range, and the
+# one every NE2000 driver defaults to. That means the driver must reach it with
+# `OUT (C),r` and `IN r,(C)`, which put B on A8-A15; `OUT (n),A` puts the
+# accumulator there instead and would land somewhere else entirely. That is the
+# real Z80 addressing rule and not a simplification.
+#
+# ---------------------------------------------------------------------------
+# The interrupt
+# ---------------------------------------------------------------------------
+#
+# `nic.irq -> cpu.int`, and nothing answers the acknowledge cycle - so the
+# firmware must use **interrupt mode 1**, which vectors to 0x0038 without a
+# vector byte. Mode 2 would need a device driving the data bus during `/IORQ`
+# with `/M1`, and this board has none. The pin is level-sensitive on both ends:
+# the card holds `/INT` down until the driver acknowledges the bit in `ISR`,
+# which is what makes a mode 1 handler that forgets to write `ISR` loop forever
+# - as it would on real hardware.
+
+machine "ne2k-mini" {
+  # How much ROM is at zero. The Z80 resets to 0x0000 and the eight `RST`
+  # targets - 0x0038 among them - live in the first page, so this region's base
+  # is not a parameter.
+  param rom = 16K
+
+  # How much RAM, and where.
+  param ram-base = 0x4000
+  param ram      = 48K
+
+  # Where the card answers. 0x300 is the conventional NE2000 base and what every
+  # driver probes first; a second card on a board would move to 0x320.
+  param nic-base = 0x0300
+
+  # The address in the card's PROM. A locally administered unicast address, so a
+  # default board on a hub cannot collide with real hardware.
+  param mac = "52:54:00:12:34:56"
+
+  # The network port the card is attached to, by name. Whoever builds the
+  # machine binds the other end - a test, a `pktkit` hub, a TAP.
+  param link = "net0"
+
+  # -- the crystal -----------------------------------------------------------
+  #
+  # 3.5 MHz: a plain Z80A-era clock. One oscillator, so every ratio on this
+  # board is exact (ROADMAP.md 4.2) - including the card's, which counts its
+  # arrivals in the same ticks the core counts its T-states.
+  osc clk = 3500000 Hz
+
+  # -- the two buses ---------------------------------------------------------
+  #
+  # `unassigned = open-bus` on both, because a Z80 has **no bus-error input**: a
+  # read nothing answers leaves the data pins floating and the chip latches
+  # whatever was there.
+  space mem  { width = 16, unassigned = open-bus }
+  space port { width = 16, unassigned = open-bus }
+
+  # -- the core --------------------------------------------------------------
+  object cpu "cpu.z80" {
+    clock        = clk
+    space        = mem
+    iospace      = "port"
+    engine       = "interp"
+    cmos         = false
+    floating-bus = 0xff
+  }
+
+  # -- memory ----------------------------------------------------------------
+  object boot "rom" { size = rom, image = "firmware" }
+  object dram "ram" { size = ram }
+
+  # -- the card --------------------------------------------------------------
+  #
+  # `clock = clk` because the card is a *lazy* device: it holds its own tick and
+  # the scheduler catches it up before the guest touches it, so the T-state a
+  # frame becomes visible on is a number the machine computes rather than one
+  # the host happens to produce. That is the whole determinism argument, and it
+  # is why this object needs a clock domain at all - nothing in an NE2000
+  # advances per tick.
+  object nic "net.ne2000" {
+    clock = clk
+    link  = link
+    mac   = mac
+  }
+
+  # -- the maps --------------------------------------------------------------
+  map mem  0x0000   size rom = boot   # reset vector, the RSTs, the NMI vector
+  map mem  ram-base size ram = dram
+
+  # Thirty-two ports, decoded exactly: sixteen DP8390 registers, the card's
+  # remote DMA data window at +0x10, and its reset strap at +0x18.
+  map port nic-base size 0x20 = nic
+
+  # -- the wire --------------------------------------------------------------
+  wire nic.irq -> cpu.int
+}

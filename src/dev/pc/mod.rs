@@ -81,6 +81,10 @@ pub mod sysctl;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-pci")))]
 pub mod pmc;
 
+#[cfg(feature = "dev-pc-pci")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-pci")))]
+pub mod vgapci;
+
 #[cfg(feature = "dev-pc-video")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-video")))]
 pub mod video;
@@ -147,6 +151,8 @@ pub fn register(reg: &mut Registry) -> Result<()> {
     sysctl::register(reg)?;
     #[cfg(feature = "dev-pc-pci")]
     pmc::register(reg)?;
+    #[cfg(feature = "dev-pc-pci")]
+    vgapci::register(reg)?;
     #[cfg(feature = "dev-pc-video")]
     video::register(reg)?;
     #[cfg(feature = "dev-pc-floppy")]
@@ -171,6 +177,8 @@ pub fn bind(b: &mut Bindings) -> Result<()> {
     sysctl::bind(b)?;
     #[cfg(feature = "dev-pc-pci")]
     pmc::bind(b)?;
+    #[cfg(feature = "dev-pc-pci")]
+    vgapci::bind(b)?;
     #[cfg(feature = "dev-pc-video")]
     video::bind(b)?;
     #[cfg(feature = "dev-pc-floppy")]
@@ -195,6 +203,8 @@ pub fn schemas() -> Vec<ClassSchema> {
     ];
     #[cfg(feature = "dev-pc-pci")]
     out.push(pmc::schema());
+    #[cfg(feature = "dev-pc-pci")]
+    out.push(vgapci::schema());
     #[cfg(feature = "dev-pc-video")]
     out.push(video::schema());
     #[cfg(feature = "dev-pc-floppy")]
@@ -351,6 +361,12 @@ mod tests {
         // Two firmware sockets and three removable-or-fitted media. None of
         // them is required: the disks default to an empty bay and the floppy to
         // an empty drive, so the only slot a user *has* to fill is `bios`.
+        //
+        // Deduplicated, because `vgabios` is named **twice** and on purpose:
+        // the legacy socket at 0xc0000 and the PCI card's expansion ROM are two
+        // ways into the same video BIOS, and which one a firmware takes depends
+        // on whether it knows what a 440FX is. A slot is a slot however many
+        // objects read it.
         let resolved =
             resolve_file("pc-at.machine", PC_AT, &ResolveOptions::new()).expect("it resolves");
         let mut slots: alloc::vec::Vec<alloc::string::String> = resolved
@@ -360,6 +376,7 @@ mod tests {
             .filter_map(|v| v.as_str().map(ToString::to_string))
             .collect();
         slots.sort();
+        slots.dedup();
         assert_eq!(slots, ["bios", "floppy", "hd0", "hd1", "vgabios"]);
     }
 }

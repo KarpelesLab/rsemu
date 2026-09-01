@@ -66,6 +66,80 @@ pub enum Gen {
     I386,
 }
 
+/// The width the code segment is being decoded at.
+///
+/// Not the same question as [`Gen`], which is *which map*; this is which of
+/// the three sets of defaults applies to the map that was chosen. It replaces
+/// the `default32` flag the decoder used to take because 64-bit mode is not
+/// "32-bit with a wider register": it has its own default operand size, its
+/// own default address size, its own set of invalid encodings, and a prefix
+/// (`REX`) that does not exist in the other two.
+///
+/// *Intel SDM* volume 2 §2.2.1.7, "Default 64-Bit Operand Size", and table
+/// 2-4; *AMD64 Architecture Programmer's Manual* volume 3 §1.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Bits {
+    /// A 16-bit code segment: operands and addresses default to two bytes.
+    B16,
+    /// A 32-bit code segment: operands and addresses default to four bytes.
+    B32,
+    /// A 64-bit code segment — `CS.L` set. Operands default to **four** bytes
+    /// and addresses to eight, which is the pairing that surprises everyone:
+    /// widening an operand needs `REX.W`, widening an address needs nothing.
+    B64,
+}
+
+impl Bits {
+    /// The default operand size in bytes, before any prefix.
+    #[must_use]
+    pub const fn operand(self) -> u8 {
+        match self {
+            Bits::B16 => 2,
+            Bits::B32 | Bits::B64 => 4,
+        }
+    }
+
+    /// The default address size in bytes, before any prefix.
+    #[must_use]
+    pub const fn address(self) -> u8 {
+        match self {
+            Bits::B16 => 2,
+            Bits::B32 => 4,
+            Bits::B64 => 8,
+        }
+    }
+
+    /// The operand size a `66` prefix selects.
+    ///
+    /// In 64-bit mode `66` still means sixteen bits; it is `REX.W` that means
+    /// sixty-four, and a `66` beside a `REX.W` is ignored rather than
+    /// combined.
+    #[must_use]
+    pub const fn operand_alt(self) -> u8 {
+        match self {
+            Bits::B16 => 4,
+            Bits::B32 | Bits::B64 => 2,
+        }
+    }
+
+    /// The address size a `67` prefix selects. There is no 16-bit addressing
+    /// in 64-bit mode: `67` there means thirty-two bits.
+    #[must_use]
+    pub const fn address_alt(self) -> u8 {
+        match self {
+            Bits::B16 => 4,
+            Bits::B32 => 2,
+            Bits::B64 => 4,
+        }
+    }
+
+    /// Whether this is 64-bit mode.
+    #[must_use]
+    pub const fn is_64(self) -> bool {
+        matches!(self, Bits::B64)
+    }
+}
+
 /// How an operand is encoded, in the notation of Intel's opcode maps.
 ///
 /// The letter is the addressing method and the suffix is the operand size:
@@ -84,6 +158,8 @@ pub enum Arg {
     Ev,
     /// ModRM r/m, always sixteen bits (`LLDT`, `LTR`, `VERR`, `LAR`, `MOVZX`).
     Ew,
+    /// ModRM r/m, always thirty-two bits: `MOVSXD`'s source, and nothing else.
+    Ed,
     /// ModRM `reg`, byte register.
     Gb,
     /// ModRM `reg`, register at the operand size.
@@ -116,8 +192,21 @@ pub enum Arg {
     Ib,
     /// Immediate word, always sixteen bits (`ENTER`, `RET imm16`).
     Iw,
-    /// Immediate at the operand size.
+    /// Immediate at the operand size — two, four or **eight** bytes.
+    ///
+    /// Intel's `Iv`. Only `B8`+`r` uses it, and only there does an x86 read a
+    /// full 64-bit immediate; everything else that looks like it takes one
+    /// takes [`Arg::Iz`] instead.
     Iv,
+    /// Immediate of two or four bytes, sign-extended to the operand size.
+    ///
+    /// Intel's `Iz`. In 64-bit mode `add rax, imm` reads **four** immediate
+    /// bytes and sign-extends them: there is no eight-byte form of any ALU
+    /// immediate, and reading one would desynchronise the instruction stream
+    /// (*Intel SDM* volume 2 §3.1.1.3 and Appendix A's `Iz` notation). Below
+    /// 64-bit mode it is indistinguishable from [`Arg::Iv`], which is exactly
+    /// why the distinction was never needed before.
+    Iz,
     /// Immediate byte, sign-extended to the operand size (`83 /n`, `6A`).
     Ibs,
     /// Byte displacement relative to the end of the instruction.
@@ -183,10 +272,11 @@ impl Arg {
             | Arg::One
             | Arg::Cl => Some(1),
             Arg::Ew | Arg::Gw | Arg::Iw | Arg::Sw | Arg::Sr => Some(2),
-            Arg::Cd | Arg::Dd | Arg::Td | Arg::Rd => Some(4),
+            Arg::Cd | Arg::Dd | Arg::Td | Arg::Rd | Arg::Ed => Some(4),
             Arg::Ev
             | Arg::Gv
             | Arg::Iv
+            | Arg::Iz
             | Arg::Ibs
             | Arg::Ov
             | Arg::Rv
@@ -206,6 +296,7 @@ impl Arg {
             Arg::Eb
                 | Arg::Ev
                 | Arg::Ew
+                | Arg::Ed
                 | Arg::Gb
                 | Arg::Gv
                 | Arg::Gw
@@ -227,7 +318,17 @@ impl Arg {
         match self {
             Arg::Ib | Arg::Ibs | Arg::Jb => 1,
             Arg::Iw => 2,
-            Arg::Iv | Arg::Jv => osz,
+            Arg::Iv => osz,
+            // `Iz` and `Jz`: two bytes at a 16-bit operand size, four at
+            // either wider one. A 64-bit near jump's displacement is `rel32`
+            // and a 64-bit ALU immediate is `imm32`, both sign-extended.
+            Arg::Iz | Arg::Jv => {
+                if osz > 4 {
+                    4
+                } else {
+                    osz
+                }
+            }
             // A `moffs` is an *address*, so it is the address size that
             // decides how many bytes follow — `67 A1` reads a 32-bit offset
             // even with a 16-bit operand size.
@@ -557,6 +658,29 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("VERW", "verw"),
     ("WBINVD", "wbinvd"),
     ("XADD", "xadd"),
+    ("CMOVA", "cmova"),
+    ("CMOVB", "cmovb"),
+    ("CMOVBE", "cmovbe"),
+    ("CMOVG", "cmovg"),
+    ("CMOVGE", "cmovge"),
+    ("CMOVL", "cmovl"),
+    ("CMOVLE", "cmovle"),
+    ("CMOVNB", "cmovnb"),
+    ("CMOVNO", "cmovno"),
+    ("CMOVNP", "cmovnp"),
+    ("CMOVNS", "cmovns"),
+    ("CMOVNZ", "cmovnz"),
+    ("CMOVO", "cmovo"),
+    ("CMOVP", "cmovp"),
+    ("CMOVS", "cmovs"),
+    ("CMOVZ", "cmovz"),
+    ("MOVSXD", "movsxd"),
+    ("RDMSR", "rdmsr"),
+    ("REX", "rex"),
+    ("SWAPGS", "swapgs"),
+    ("SYSCALL", "syscall"),
+    ("SYSRET", "sysret"),
+    ("WRMSR", "wrmsr"),
 ];
 
 define_ops! {
@@ -734,6 +858,33 @@ define_ops! {
     INVLPG = "invalidate one page's translation-lookaside-buffer entry",
     WBINVD = "write the caches back and invalidate them",
     XADD = "exchange, then add",
+
+    // ---- Pentium and later, still 32-bit -------------------------------
+    CMOVA = "move if above (unsigned greater)",
+    CMOVB = "move if below (carry set)",
+    CMOVBE = "move if below or equal",
+    CMOVG = "move if greater (signed)",
+    CMOVGE = "move if greater or equal (signed)",
+    CMOVL = "move if less (signed)",
+    CMOVLE = "move if less or equal (signed)",
+    CMOVNB = "move if not below (carry clear)",
+    CMOVNO = "move if the overflow flag is clear",
+    CMOVNP = "move if parity odd",
+    CMOVNS = "move if the sign flag is clear",
+    CMOVNZ = "move if not equal (zero clear)",
+    CMOVO = "move if the overflow flag is set",
+    CMOVP = "move if parity even",
+    CMOVS = "move if the sign flag is set",
+    CMOVZ = "move if equal (zero set)",
+    RDMSR = "read the model-specific register ECX names into EDX:EAX",
+    WRMSR = "write EDX:EAX to the model-specific register ECX names",
+
+    // ---- x86-64 ---------------------------------------------------------
+    MOVSXD = "move a 32-bit source, sign-extended to the operand size",
+    REX = "prefix: extend the register fields, or widen the operand to 64 bits",
+    SWAPGS = "exchange the GS base with IA32_KERNEL_GS_BASE",
+    SYSCALL = "fast call to the kernel entry point in LSTAR",
+    SYSRET = "fast return from SYSCALL",
 }
 
 impl Op {
@@ -753,25 +904,83 @@ impl Op {
     #[must_use]
     pub const fn condition_code(self) -> Option<u8> {
         let cc = match self {
-            Op::JO | Op::SETO => 0,
-            Op::JNO | Op::SETNO => 1,
-            Op::JB | Op::SETB => 2,
-            Op::JNB | Op::SETNB => 3,
-            Op::JZ | Op::SETZ => 4,
-            Op::JNZ | Op::SETNZ => 5,
-            Op::JBE | Op::SETBE => 6,
-            Op::JA | Op::SETA => 7,
-            Op::JS | Op::SETS => 8,
-            Op::JNS | Op::SETNS => 9,
-            Op::JP | Op::SETP => 10,
-            Op::JNP | Op::SETNP => 11,
-            Op::JL | Op::SETL => 12,
-            Op::JGE | Op::SETGE => 13,
-            Op::JLE | Op::SETLE => 14,
-            Op::JG | Op::SETG => 15,
+            Op::JO | Op::SETO | Op::CMOVO => 0,
+            Op::JNO | Op::SETNO | Op::CMOVNO => 1,
+            Op::JB | Op::SETB | Op::CMOVB => 2,
+            Op::JNB | Op::SETNB | Op::CMOVNB => 3,
+            Op::JZ | Op::SETZ | Op::CMOVZ => 4,
+            Op::JNZ | Op::SETNZ | Op::CMOVNZ => 5,
+            Op::JBE | Op::SETBE | Op::CMOVBE => 6,
+            Op::JA | Op::SETA | Op::CMOVA => 7,
+            Op::JS | Op::SETS | Op::CMOVS => 8,
+            Op::JNS | Op::SETNS | Op::CMOVNS => 9,
+            Op::JP | Op::SETP | Op::CMOVP => 10,
+            Op::JNP | Op::SETNP | Op::CMOVNP => 11,
+            Op::JL | Op::SETL | Op::CMOVL => 12,
+            Op::JGE | Op::SETGE | Op::CMOVGE => 13,
+            Op::JLE | Op::SETLE | Op::CMOVLE => 14,
+            Op::JG | Op::SETG | Op::CMOVG => 15,
             _ => return None,
         };
         Some(cc)
+    }
+
+    /// Whether this operation is a `CMOVcc`.
+    #[must_use]
+    pub const fn is_cmov(self) -> bool {
+        matches!(
+            self,
+            Op::CMOVO
+                | Op::CMOVNO
+                | Op::CMOVB
+                | Op::CMOVNB
+                | Op::CMOVZ
+                | Op::CMOVNZ
+                | Op::CMOVBE
+                | Op::CMOVA
+                | Op::CMOVS
+                | Op::CMOVNS
+                | Op::CMOVP
+                | Op::CMOVNP
+                | Op::CMOVL
+                | Op::CMOVGE
+                | Op::CMOVLE
+                | Op::CMOVG
+        )
+    }
+
+    /// Whether this operation's operand size defaults to sixty-four bits in
+    /// 64-bit mode.
+    ///
+    /// Intel calls these `d64`: the default is eight bytes rather than four,
+    /// `REX.W` is redundant on them, and a `66` prefix still narrows them to
+    /// two. Everything that touches the stack implicitly is here, which is the
+    /// unifying reason — `RSP` is always sixty-four bits wide in 64-bit mode,
+    /// so a four-byte push would leave it misaligned by construction — along
+    /// with the near branches, whose displacement stays `rel32` while the
+    /// pointer they land in is full width.
+    ///
+    /// *Intel SDM* volume 2 §2.2.1.7 and table 2-4; the same list appears in
+    /// the *AMD64 Architecture Programmer's Manual* volume 3 as "default
+    /// operand size 64".
+    #[must_use]
+    pub const fn default_64(self) -> bool {
+        matches!(
+            self,
+            Op::PUSH
+                | Op::POP
+                | Op::PUSHF
+                | Op::POPF
+                | Op::CALL
+                | Op::RET
+                | Op::JMP
+                | Op::ENTER
+                | Op::LEAVE
+                | Op::LOOP
+                | Op::LOOPE
+                | Op::LOOPNE
+                | Op::JCXZ
+        ) || self.is_conditional_jump()
     }
 
     /// Whether this operation is a conditional jump, and therefore reads a
@@ -802,7 +1011,7 @@ impl Op {
     /// Whether this operation is a `SETcc`.
     #[must_use]
     pub const fn is_setcc(self) -> bool {
-        self.condition_code().is_some() && !self.is_conditional_jump()
+        self.condition_code().is_some() && !self.is_conditional_jump() && !self.is_cmov()
     }
 
     /// Whether this operation is one of the string primitives, and so may
@@ -953,6 +1162,31 @@ pub struct Insn {
     pub group: Grp,
     /// How well documented the encoding is.
     pub class: Class,
+    /// What this encoding means in 64-bit mode, where that differs.
+    ///
+    /// The 64-bit answer lives *beside* the legacy one rather than in a second
+    /// table, so a row cannot be changed in one and forgotten in the other —
+    /// `ROADMAP.md` §6.1.1's "decode is gated per entry", applied to a mode
+    /// rather than an extension. [`Insn::in_long`] is the only reader.
+    pub long: L64,
+}
+
+/// What one encoding becomes in 64-bit mode.
+///
+/// Long mode did not extend the opcode map so much as **reclaim** it: the
+/// sixteen `INC`/`DEC` encodings became the `REX` prefix, `ARPL` became
+/// `MOVSXD`, and eighteen instructions that only make sense with 16-bit
+/// segmentation or packed decimal arithmetic became invalid outright. Every
+/// one of those is a difference a "just widen the registers" port gets wrong,
+/// and each is named here rather than deduced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum L64 {
+    /// Decodes and executes exactly as it does in the other modes.
+    Same,
+    /// Not an instruction in 64-bit mode: `#UD`.
+    Gone,
+    /// A different instruction, with its own operands.
+    Alt(Op, Arg, Arg),
 }
 
 impl Insn {
@@ -964,6 +1198,7 @@ impl Insn {
             aux: Arg::None,
             group,
             class,
+            long: L64::Same,
         }
     }
 
@@ -971,6 +1206,41 @@ impl Insn {
     const fn with_aux(mut self, aux: Arg) -> Insn {
         self.aux = aux;
         self
+    }
+
+    /// The same row with a 64-bit-mode override.
+    const fn with_long(mut self, long: L64) -> Insn {
+        self.long = long;
+        self
+    }
+
+    /// This row as 64-bit mode decodes it.
+    ///
+    /// Applied once, by [`decode_stream_as`], before the ModRM byte is read —
+    /// which matters, because whether an encoding *has* a ModRM byte can
+    /// change with it (`63` gains one going from `ARPL` to `MOVSXD`; it has
+    /// one either way, but `06` loses its operands entirely).
+    #[must_use]
+    pub const fn in_long(self) -> Insn {
+        match self.long {
+            L64::Same => self,
+            L64::Gone => UNASSIGNED,
+            L64::Alt(op, dst, src) => Insn {
+                op,
+                dst,
+                src,
+                aux: Arg::None,
+                group: self.group,
+                // A row that becomes `REX` becomes a *prefix*, and the class
+                // is what says so — `40` is `INC EAX` in the other two modes
+                // and carries no operand at all in this one.
+                class: match op {
+                    Op::REX => Class::Prefix,
+                    _ => self.class,
+                },
+                long: L64::Same,
+            },
+        }
     }
 
     /// Whether decoding needs a ModRM byte.
@@ -1021,18 +1291,33 @@ const UNASSIGNED: Insn = Insn::new(Op::UD, Arg::None, Arg::None, Grp::None, Clas
 macro_rules! opmap {
     (
         base $base:expr;
-        $($opcode:literal $op:ident $dst:ident $src:ident $(+ $aux:ident)? $group:ident $class:ident;)*
+        $($opcode:literal $op:ident $dst:ident $src:ident $(+ $aux:ident)? $group:ident $class:ident
+          $(=> ($($long:tt)+))? ;)*
     ) => {{
         let mut t: [Insn; 256] = $base;
         let mut listed = [false; 256];
         $(
             t[$opcode as usize] =
                 Insn::new(Op::$op, Arg::$dst, Arg::$src, Grp::$group, Class::$class)
-                $(.with_aux(Arg::$aux))?;
+                $(.with_aux(Arg::$aux))?
+                $(.with_long(long_spec!($($long)+)))?;
             listed[$opcode as usize] = true;
         )*
         (t, listed)
     }};
+}
+
+/// The `=> (…)` column of a row: what the encoding becomes in 64-bit mode.
+///
+/// `=> (UD)` for one long mode reclaimed, `=> (OP dst src)` for one it
+/// repurposed.
+macro_rules! long_spec {
+    (UD) => {
+        L64::Gone
+    };
+    ($op:ident $dst:ident $src:ident) => {
+        L64::Alt(Op::$op, Arg::$dst, Arg::$src)
+    };
 }
 
 /// The 8086/8088 primary map and its coverage record, built together so the
@@ -1044,16 +1329,16 @@ const PRIMARY_8086: ([Insn; 256], [bool; 256]) = opmap! {
     0x02 ADD  Gb   Eb   None   Documented;
     0x03 ADD  Gv   Ev   None   Documented;
     0x04 ADD  Al   Ib   None   Documented;
-    0x05 ADD  Ax   Iv   None   Documented;
-    0x06 PUSH Sr   None None   Documented;
-    0x07 POP  Sr   None None   Documented;
+    0x05 ADD  Ax   Iz   None   Documented;
+    0x06 PUSH Sr   None None   Documented  => (UD);
+    0x07 POP  Sr   None None   Documented  => (UD);
     0x08 OR   Eb   Gb   None   Documented;
     0x09 OR   Ev   Gv   None   Documented;
     0x0a OR   Gb   Eb   None   Documented;
     0x0b OR   Gv   Ev   None   Documented;
     0x0c OR   Al   Ib   None   Documented;
-    0x0d OR   Ax   Iv   None   Documented;
-    0x0e PUSH Sr   None None   Documented;
+    0x0d OR   Ax   Iz   None   Documented;
+    0x0e PUSH Sr   None None   Documented  => (UD);
     // POP CS assembles and executes; the 8086 simply does not document it,
     // and the 80186 reused the opcode for the two-byte escape.
     0x0f POP  Sr   None None   Undocumented;
@@ -1063,68 +1348,68 @@ const PRIMARY_8086: ([Insn; 256], [bool; 256]) = opmap! {
     0x12 ADC  Gb   Eb   None   Documented;
     0x13 ADC  Gv   Ev   None   Documented;
     0x14 ADC  Al   Ib   None   Documented;
-    0x15 ADC  Ax   Iv   None   Documented;
-    0x16 PUSH Sr   None None   Documented;
-    0x17 POP  Sr   None None   Documented;
+    0x15 ADC  Ax   Iz   None   Documented;
+    0x16 PUSH Sr   None None   Documented  => (UD);
+    0x17 POP  Sr   None None   Documented  => (UD);
     0x18 SBB  Eb   Gb   None   Documented;
     0x19 SBB  Ev   Gv   None   Documented;
     0x1a SBB  Gb   Eb   None   Documented;
     0x1b SBB  Gv   Ev   None   Documented;
     0x1c SBB  Al   Ib   None   Documented;
-    0x1d SBB  Ax   Iv   None   Documented;
-    0x1e PUSH Sr   None None   Documented;
-    0x1f POP  Sr   None None   Documented;
+    0x1d SBB  Ax   Iz   None   Documented;
+    0x1e PUSH Sr   None None   Documented  => (UD);
+    0x1f POP  Sr   None None   Documented  => (UD);
 
     0x20 AND  Eb   Gb   None   Documented;
     0x21 AND  Ev   Gv   None   Documented;
     0x22 AND  Gb   Eb   None   Documented;
     0x23 AND  Gv   Ev   None   Documented;
     0x24 AND  Al   Ib   None   Documented;
-    0x25 AND  Ax   Iv   None   Documented;
+    0x25 AND  Ax   Iz   None   Documented;
     0x26 SEG  Sr   None None   Prefix;
-    0x27 DAA  None None None   Documented;
+    0x27 DAA  None None None   Documented  => (UD);
     0x28 SUB  Eb   Gb   None   Documented;
     0x29 SUB  Ev   Gv   None   Documented;
     0x2a SUB  Gb   Eb   None   Documented;
     0x2b SUB  Gv   Ev   None   Documented;
     0x2c SUB  Al   Ib   None   Documented;
-    0x2d SUB  Ax   Iv   None   Documented;
+    0x2d SUB  Ax   Iz   None   Documented;
     0x2e SEG  Sr   None None   Prefix;
-    0x2f DAS  None None None   Documented;
+    0x2f DAS  None None None   Documented  => (UD);
 
     0x30 XOR  Eb   Gb   None   Documented;
     0x31 XOR  Ev   Gv   None   Documented;
     0x32 XOR  Gb   Eb   None   Documented;
     0x33 XOR  Gv   Ev   None   Documented;
     0x34 XOR  Al   Ib   None   Documented;
-    0x35 XOR  Ax   Iv   None   Documented;
+    0x35 XOR  Ax   Iz   None   Documented;
     0x36 SEG  Sr   None None   Prefix;
-    0x37 AAA  None None None   Documented;
+    0x37 AAA  None None None   Documented  => (UD);
     0x38 CMP  Eb   Gb   None   Documented;
     0x39 CMP  Ev   Gv   None   Documented;
     0x3a CMP  Gb   Eb   None   Documented;
     0x3b CMP  Gv   Ev   None   Documented;
     0x3c CMP  Al   Ib   None   Documented;
-    0x3d CMP  Ax   Iv   None   Documented;
+    0x3d CMP  Ax   Iz   None   Documented;
     0x3e SEG  Sr   None None   Prefix;
-    0x3f AAS  None None None   Documented;
+    0x3f AAS  None None None   Documented  => (UD);
 
-    0x40 INC  Rv   None None   Documented;
-    0x41 INC  Rv   None None   Documented;
-    0x42 INC  Rv   None None   Documented;
-    0x43 INC  Rv   None None   Documented;
-    0x44 INC  Rv   None None   Documented;
-    0x45 INC  Rv   None None   Documented;
-    0x46 INC  Rv   None None   Documented;
-    0x47 INC  Rv   None None   Documented;
-    0x48 DEC  Rv   None None   Documented;
-    0x49 DEC  Rv   None None   Documented;
-    0x4a DEC  Rv   None None   Documented;
-    0x4b DEC  Rv   None None   Documented;
-    0x4c DEC  Rv   None None   Documented;
-    0x4d DEC  Rv   None None   Documented;
-    0x4e DEC  Rv   None None   Documented;
-    0x4f DEC  Rv   None None   Documented;
+    0x40 INC  Rv   None None   Documented  => (REX None None);
+    0x41 INC  Rv   None None   Documented  => (REX None None);
+    0x42 INC  Rv   None None   Documented  => (REX None None);
+    0x43 INC  Rv   None None   Documented  => (REX None None);
+    0x44 INC  Rv   None None   Documented  => (REX None None);
+    0x45 INC  Rv   None None   Documented  => (REX None None);
+    0x46 INC  Rv   None None   Documented  => (REX None None);
+    0x47 INC  Rv   None None   Documented  => (REX None None);
+    0x48 DEC  Rv   None None   Documented  => (REX None None);
+    0x49 DEC  Rv   None None   Documented  => (REX None None);
+    0x4a DEC  Rv   None None   Documented  => (REX None None);
+    0x4b DEC  Rv   None None   Documented  => (REX None None);
+    0x4c DEC  Rv   None None   Documented  => (REX None None);
+    0x4d DEC  Rv   None None   Documented  => (REX None None);
+    0x4e DEC  Rv   None None   Documented  => (REX None None);
+    0x4f DEC  Rv   None None   Documented  => (REX None None);
 
     0x50 PUSH Rv   None None   Documented;
     0x51 PUSH Rv   None None   Documented;
@@ -1180,9 +1465,9 @@ const PRIMARY_8086: ([Insn; 256], [bool; 256]) = opmap! {
     0x7f JG   Jb   None None   Documented;
 
     0x80 ADD  Eb   Ib   Alu    Documented;
-    0x81 ADD  Ev   Iv   Alu    Documented;
+    0x81 ADD  Ev   Iz   Alu    Documented;
     // 82 is 80 again: the sign-extend bit is not decoded for byte operands.
-    0x82 ADD  Eb   Ib   Alu    Alias;
+    0x82 ADD  Eb   Ib   Alu    Alias  => (UD);
     0x83 ADD  Ev   Ibs  Alu    Documented;
     0x84 TEST Eb   Gb   None   Documented;
     0x85 TEST Ev   Gv   None   Documented;
@@ -1207,7 +1492,7 @@ const PRIMARY_8086: ([Insn; 256], [bool; 256]) = opmap! {
     0x97 XCHG Ax   Rv   None   Documented;
     0x98 CBW  None None None   Documented;
     0x99 CWD  None None None   Documented;
-    0x9a CALLF Ap  None None   Documented;
+    0x9a CALLF Ap  None None   Documented  => (UD);
     0x9b WAIT None None None   Documented;
     0x9c PUSHF None None None  Documented;
     0x9d POPF None None None   Documented;
@@ -1223,7 +1508,7 @@ const PRIMARY_8086: ([Insn; 256], [bool; 256]) = opmap! {
     0xa6 CMPSB Xb  Yb   None   Documented;
     0xa7 CMPSW Xv  Yv   None   Documented;
     0xa8 TEST Al   Ib   None   Documented;
-    0xa9 TEST Ax   Iv   None   Documented;
+    0xa9 TEST Ax   Iz   None   Documented;
     0xaa STOSB Yb  Al   None   Documented;
     0xab STOSW Yv  Ax   None   Documented;
     0xac LODSB Al  Xb   None   Documented;
@@ -1256,26 +1541,26 @@ const PRIMARY_8086: ([Insn; 256], [bool; 256]) = opmap! {
     0xc1 RET  None None None   Alias;
     0xc2 RET  Iw   None None   Documented;
     0xc3 RET  None None None   Documented;
-    0xc4 LES  Gv   Mp   None   Documented;
-    0xc5 LDS  Gv   Mp   None   Documented;
+    0xc4 LES  Gv   Mp   None   Documented  => (UD);
+    0xc5 LDS  Gv   Mp   None   Documented  => (UD);
     0xc6 MOV  Eb   Ib   MovImm Documented;
-    0xc7 MOV  Ev   Iv   MovImm Documented;
+    0xc7 MOV  Ev   Iz   MovImm Documented;
     0xc8 RETF Iw   None None   Alias;
     0xc9 RETF None None None   Alias;
     0xca RETF Iw   None None   Documented;
     0xcb RETF None None None   Documented;
     0xcc INT3 None None None   Documented;
     0xcd INT  Ib   None None   Documented;
-    0xce INTO None None None   Documented;
+    0xce INTO None None None   Documented  => (UD);
     0xcf IRET None None None   Documented;
 
     0xd0 ROL  Eb   One  Shift  Documented;
     0xd1 ROL  Ev   One  Shift  Documented;
     0xd2 ROL  Eb   Cl   Shift  Documented;
     0xd3 ROL  Ev   Cl   Shift  Documented;
-    0xd4 AAM  Ib   None None   Documented;
-    0xd5 AAD  Ib   None None   Documented;
-    0xd6 SALC None None None   Undocumented;
+    0xd4 AAM  Ib   None None   Documented  => (UD);
+    0xd5 AAD  Ib   None None   Documented  => (UD);
+    0xd6 SALC None None None   Undocumented  => (UD);
     0xd7 XLAT None None None   Documented;
     0xd8 ESC  Ev   None None   Escape;
     0xd9 ESC  Ev   None None   Escape;
@@ -1296,7 +1581,7 @@ const PRIMARY_8086: ([Insn; 256], [bool; 256]) = opmap! {
     0xe7 OUT  Ib   Ax   None   Documented;
     0xe8 CALL Jv   None None   Documented;
     0xe9 JMP  Jv   None None   Documented;
-    0xea JMPF Ap   None None   Documented;
+    0xea JMPF Ap   None None   Documented  => (UD);
     0xeb JMP  Jb   None None   Documented;
     0xec IN   Al   Dx   None   Documented;
     0xed IN   Ax   Dx   None   Documented;
@@ -1311,7 +1596,7 @@ const PRIMARY_8086: ([Insn; 256], [bool; 256]) = opmap! {
     0xf4 HLT   None None None  Documented;
     0xf5 CMC   None None None  Documented;
     0xf6 TEST  Eb   Ib   Unary Documented;
-    0xf7 TEST  Ev   Iv   Unary Documented;
+    0xf7 TEST  Ev   Iz   Unary Documented;
     0xf8 CLC   None None None  Documented;
     0xf9 STC   None None None  Documented;
     0xfa CLI   None None None  Documented;
@@ -1346,16 +1631,16 @@ const PRIMARY_386: ([Insn; 256], [bool; 256]) = opmap! {
     0x0f ESC   None None None   Escape;
 
     // 60-6F stopped aliasing the conditional jumps on the 80186.
-    0x60 PUSHA None None None   Documented;
-    0x61 POPA  None None None   Documented;
-    0x62 BOUND Gv   M    None   Documented;
-    0x63 ARPL  Ew   Gw   None   Documented;
+    0x60 PUSHA None None None   Documented  => (UD);
+    0x61 POPA  None None None   Documented  => (UD);
+    0x62 BOUND Gv   M    None   Documented  => (UD);
+    0x63 ARPL  Ew   Gw   None   Documented  => (MOVSXD Gv Ed);
     0x64 SEG   None None None   Prefix;
     0x65 SEG   None None None   Prefix;
     0x66 SEG   None None None   Prefix;
     0x67 SEG   None None None   Prefix;
-    0x68 PUSH  Iv   None None   Documented;
-    0x69 IMUL  Gv   Ev  +Iv     None   Documented;
+    0x68 PUSH  Iz   None None   Documented;
+    0x69 IMUL  Gv   Ev  +Iz     None   Documented;
     0x6a PUSH  Ibs  None None   Documented;
     0x6b IMUL  Gv   Ev  +Ibs    None   Documented;
     0x6c INSB  Yb   Dx   None   Documented;
@@ -1406,12 +1691,46 @@ const SECONDARY: ([Insn; 256], [bool; 256]) = opmap! {
     0x08 INVD  None None None   Documented;
     0x09 WBINVD None None None  Documented;
 
+    // `SYSCALL` and `SYSRET` are 64-bit-only on an Intel part — AMD's K6
+    // implemented them in legacy mode and Intel never did, so `#UD` outside
+    // long mode is the behaviour every operating system is written against.
+    // Modelling that as a 64-bit-mode override rather than a feature check
+    // puts the difference where the encoding is (*AMD64 Architecture
+    // Programmer's Manual* volume 3, `SYSCALL`; *Intel SDM* volume 2).
+    0x05 UD    None None None   Undefined  => (SYSCALL None None);
+    0x07 UD    None None None   Undefined  => (SYSRET None None);
+
     0x20 MOV   Rd   Cd   None   Documented;
     0x21 MOV   Rd   Dd   None   Documented;
     0x22 MOV   Cd   Rd   None   Documented;
     0x23 MOV   Dd   Rd   None   Documented;
     0x24 MOV   Rd   Td   None   Documented;
     0x26 MOV   Td   Rd   None   Documented;
+
+    // The model-specific registers. Present from the Pentium, so these are
+    // ordinary rows gated by `Features::msr` at execution — a 486 that decodes
+    // `0F 32` must still raise `#UD`, and the check belongs where the feature
+    // is known rather than in the table.
+    0x30 WRMSR None None None   Documented;
+    0x32 RDMSR None None None   Documented;
+
+    // `CMOVcc`, from the Pentium Pro; gated by `Features::cmov`.
+    0x40 CMOVO  Gv  Ev   None   Documented;
+    0x41 CMOVNO Gv  Ev   None   Documented;
+    0x42 CMOVB  Gv  Ev   None   Documented;
+    0x43 CMOVNB Gv  Ev   None   Documented;
+    0x44 CMOVZ  Gv  Ev   None   Documented;
+    0x45 CMOVNZ Gv  Ev   None   Documented;
+    0x46 CMOVBE Gv  Ev   None   Documented;
+    0x47 CMOVA  Gv  Ev   None   Documented;
+    0x48 CMOVS  Gv  Ev   None   Documented;
+    0x49 CMOVNS Gv  Ev   None   Documented;
+    0x4a CMOVP  Gv  Ev   None   Documented;
+    0x4b CMOVNP Gv  Ev   None   Documented;
+    0x4c CMOVL  Gv  Ev   None   Documented;
+    0x4d CMOVGE Gv  Ev   None   Documented;
+    0x4e CMOVLE Gv  Ev   None   Documented;
+    0x4f CMOVG  Gv  Ev   None   Documented;
 
     0x80 JO    Jv   None None   Documented;
     0x81 JNO   Jv   None None   Documented;
@@ -1534,7 +1853,7 @@ const fn unary_group(byte: bool) -> [Insn; 8] {
     let (e, i) = if byte {
         (Arg::Eb, Arg::Ib)
     } else {
-        (Arg::Ev, Arg::Iv)
+        (Arg::Ev, Arg::Iz)
     };
     [
         Insn::new(Op::TEST, e, i, Grp::None, Class::Documented),
@@ -1981,6 +2300,15 @@ pub enum Rep {
 pub struct Fields {
     /// Which opcode map this was decoded from.
     pub map: Gen,
+    /// The width the code segment was being decoded at.
+    pub bits: Bits,
+    /// The `REX` prefix byte, or zero where there was none.
+    ///
+    /// Zero rather than `Option` because the byte itself is never `0`: a `REX`
+    /// is `4x`, so "no prefix" and "a prefix that sets nothing" stay
+    /// distinguishable — and they *must*, because `40` alone still renames
+    /// `AH` to `SPL` (*Intel SDM* volume 2 §2.2.1.2).
+    pub rex: u8,
     /// The segment register a prefix selected, if any.
     pub seg_override: Option<u8>,
     /// The repeat prefix, if any.
@@ -1989,12 +2317,13 @@ pub struct Fields {
     pub lock: bool,
     /// Whether the opcode came from the two-byte (`0F`) map.
     pub two_byte: bool,
-    /// The effective operand size in bytes: 2 or 4.
+    /// The effective operand size in bytes: 2, 4 or 8.
     ///
-    /// The segment's `D` bit picks the default and a `66` prefix flips it, so
-    /// this is already the answer rather than the prefix.
+    /// The code segment's width picks the default, a `66` prefix flips it and
+    /// `REX.W` overrides both, so this is already the answer rather than the
+    /// prefix.
     pub opsize: u8,
-    /// The effective address size in bytes: 2 or 4. `67` flips it.
+    /// The effective address size in bytes: 2, 4 or 8. `67` flips it.
     pub addrsize: u8,
     /// The opcode byte, after all prefixes and after the `0F` escape.
     pub opcode: u8,
@@ -2010,11 +2339,21 @@ pub struct Fields {
     /// address size and the SIB base both feed into it, so it is decided here
     /// rather than at every point of use.
     pub mem_seg: u8,
+    /// Whether the memory operand is `RIP`-relative.
+    ///
+    /// In 64-bit mode `mod == 00` with `r/m == 101` stopped meaning "the
+    /// displacement is the whole address" and started meaning "the
+    /// displacement is added to the address of the *next* instruction"
+    /// (*Intel SDM* volume 2 §2.2.1.6). It is the one addressing mode whose
+    /// effective address depends on the instruction's own length, which is why
+    /// it is a flag here rather than a term the address calculation could
+    /// simply include.
+    pub rip_relative: bool,
     /// The first immediate the encoding carries, or a far pointer's offset.
-    pub imm: u32,
+    pub imm: u64,
     /// The second immediate — `ENTER`'s nesting level, or a far pointer's
     /// segment. Zero when the encoding has only one.
-    pub imm2: u32,
+    pub imm2: u64,
     /// Total length in bytes, prefixes included.
     pub len: u8,
     /// Whether the stream ran out before the instruction was complete.
@@ -2033,11 +2372,99 @@ impl Fields {
     /// The immediate masked to the effective operand size.
     #[inline]
     #[must_use]
-    pub const fn imm_sized(&self) -> u32 {
-        if self.opsize == 2 {
-            self.imm & 0xffff
-        } else {
-            self.imm
+    pub const fn imm_sized(&self) -> u64 {
+        match self.opsize {
+            2 => self.imm & 0xffff,
+            4 => self.imm & 0xffff_ffff,
+            _ => self.imm,
+        }
+    }
+
+    /// Whether a `REX` prefix was present.
+    #[inline]
+    #[must_use]
+    pub const fn has_rex(&self) -> bool {
+        self.rex != 0
+    }
+
+    /// The `REX.W` bit: widen the operand to sixty-four bits.
+    #[inline]
+    #[must_use]
+    pub const fn rex_w(&self) -> bool {
+        self.rex & 0x8 != 0
+    }
+
+    /// The ModRM `reg` field, extended by `REX.R`.
+    #[inline]
+    #[must_use]
+    pub const fn reg_num(&self) -> u8 {
+        let base = match self.modrm {
+            Some(m) => m.reg,
+            None => 0,
+        };
+        base | ((self.rex & 0x4) << 1)
+    }
+
+    /// The ModRM `r/m` field as a *register* number, extended by `REX.B`.
+    ///
+    /// Only meaningful when the mode field selects a register; as a memory
+    /// operand the same three bits mean a base register instead, which
+    /// [`base_num`](Fields::base_num) answers.
+    #[inline]
+    #[must_use]
+    pub const fn rm_num(&self) -> u8 {
+        let base = match self.modrm {
+            Some(m) => m.rm,
+            None => 0,
+        };
+        base | ((self.rex & 0x1) << 3)
+    }
+
+    /// The SIB base register number, extended by `REX.B`.
+    #[inline]
+    #[must_use]
+    pub const fn base_num(&self) -> u8 {
+        let base = match self.sib {
+            Some(s) => s.base,
+            None => 0,
+        };
+        base | ((self.rex & 0x1) << 3)
+    }
+
+    /// The SIB index register number, extended by `REX.X`.
+    ///
+    /// Note that the extension applies *before* the "index 4 means no index"
+    /// rule is consulted, so `R12` is a usable index while `RSP` is not —
+    /// which is exactly what `REX.X` bought (*Intel SDM* volume 2 table 2-6).
+    #[inline]
+    #[must_use]
+    pub const fn index_num(&self) -> u8 {
+        let base = match self.sib {
+            Some(s) => s.index,
+            None => 0,
+        };
+        base | ((self.rex & 0x2) << 2)
+    }
+
+    /// The register the opcode's low three bits name, extended by `REX.B`.
+    #[inline]
+    #[must_use]
+    pub const fn opcode_reg(&self) -> u8 {
+        (self.opcode & 7) | ((self.rex & 0x1) << 3)
+    }
+
+    /// Whether the SIB byte contributes a scaled index.
+    ///
+    /// An index field of `100` means *no index* — but only without `REX.X`,
+    /// which turns the same encoding into `R12`. `RSP` still cannot be an
+    /// index and `R12` can, and that asymmetry is the whole content of this
+    /// function.
+    #[inline]
+    #[must_use]
+    pub const fn has_index(&self) -> bool {
+        match self.sib {
+            Some(s) => s.index != 4 || self.rex & 0x2 != 0,
+            None => false,
         }
     }
 
@@ -2103,35 +2530,42 @@ pub const MAX_PREFIXES: u8 = 15;
 /// which is what the 8086 does because each prefix simply latches into the
 /// same field.
 pub fn decode_stream(next: &mut dyn FnMut() -> Option<u8>) -> Fields {
-    decode_stream_as(Gen::I8086, false, next)
+    decode_stream_as(Gen::I8086, Bits::B16, next)
 }
 
-/// Decode one instruction from a byte stream on the named generation.
+/// Decode one instruction from a byte stream on the named generation and
+/// code-segment width.
 ///
-/// `default32` is the code segment's `D` bit: it selects the *default*
-/// operand and address sizes, which the `66` and `67` prefixes then flip
-/// individually. On an 8086 it is meaningless and ignored — there is one size
-/// and no prefix to change it.
+/// `bits` selects the *default* operand and address sizes, which the `66`,
+/// `67` and `REX` prefixes then modify. On an 8086 it is meaningless and
+/// ignored — there is one size and no prefix to change it.
 ///
 /// See [`decode_stream`] for what `next` and [`Fields::truncated`] mean.
 #[allow(clippy::too_many_lines)]
-pub fn decode_stream_as(map: Gen, default32: bool, next: &mut dyn FnMut() -> Option<u8>) -> Fields {
-    let wide = matches!(map, Gen::I386) && default32;
-    let base_size = if wide { 4 } else { 2 };
+pub fn decode_stream_as(map: Gen, bits: Bits, next: &mut dyn FnMut() -> Option<u8>) -> Fields {
+    // An 8086 has one width whatever it is asked for: no `D` bit, no `66`, no
+    // `67`, and certainly no `REX`.
+    let bits = match map {
+        Gen::I8086 => Bits::B16,
+        Gen::I386 => bits,
+    };
     let mut f = Fields {
         map,
+        bits,
+        rex: 0,
         seg_override: None,
         rep: None,
         lock: false,
         two_byte: false,
-        opsize: base_size,
-        addrsize: base_size,
+        opsize: bits.operand(),
+        addrsize: bits.address(),
         opcode: 0x90,
         insn: decode_as(map, 0x90),
         modrm: None,
         sib: None,
         disp: 0,
         mem_seg: seg::DS,
+        rip_relative: false,
         imm: 0,
         imm2: 0,
         len: 0,
@@ -2161,7 +2595,10 @@ pub fn decode_stream_as(map: Gen, default32: bool, next: &mut dyn FnMut() -> Opt
         if f.truncated {
             return f;
         }
-        let row = decode_as(map, byte);
+        let mut row = decode_as(map, byte);
+        if bits.is_64() {
+            row = row.in_long();
+        }
         if !row.is_prefix() || prefixes >= MAX_PREFIXES {
             break byte;
         }
@@ -2171,21 +2608,36 @@ pub fn decode_stream_as(map: Gen, default32: bool, next: &mut dyn FnMut() -> Opt
             // works for `26`/`2E`/`36`/`3E` but collides for `64` and `65`,
             // whose bit 3 is part of the opcode rather than the field.
             Op::SEG => match byte {
+                // In 64-bit mode `CS`, `DS`, `ES` and `SS` overrides are
+                // *decoded and ignored* — those four segments have no base
+                // there — while `FS` and `GS` keep working, which is why
+                // thread-local storage moved to them. Recording the override
+                // and letting the address path decide keeps the disassembler
+                // able to print what the byte said.
                 0x26 => f.seg_override = Some(seg::ES),
                 0x2e => f.seg_override = Some(seg::CS),
                 0x36 => f.seg_override = Some(seg::SS),
                 0x3e => f.seg_override = Some(seg::DS),
                 0x64 => f.seg_override = Some(seg::FS),
                 0x65 => f.seg_override = Some(seg::GS),
-                0x66 => f.opsize = if wide { 2 } else { 4 },
-                _ => f.addrsize = if wide { 2 } else { 4 },
+                0x66 => f.opsize = bits.operand_alt(),
+                _ => f.addrsize = bits.address_alt(),
             },
             Op::LOCK => f.lock = true,
             Op::REP => f.rep = Some(Rep::While),
             Op::REPNE => f.rep = Some(Rep::WhileNot),
-            // `is_prefix` is true for exactly the four operations above.
+            // `REX` must be the **last** prefix before the opcode: one
+            // followed by another prefix is ignored entirely (*Intel SDM*
+            // volume 2 §2.2.1). Clearing it here rather than checking
+            // afterwards is what implements that — a later `REX` overwrites,
+            // and a later non-`REX` prefix wipes.
+            Op::REX => {
+                f.rex = byte;
+                continue;
+            }
             _ => {}
         }
+        f.rex = 0;
     };
 
     // `0F` is `POP CS` on an 8086 and the escape to the second map from the
@@ -2204,12 +2656,18 @@ pub fn decode_stream_as(map: Gen, default32: bool, next: &mut dyn FnMut() -> Opt
         f.opcode = opcode;
         insn = decode_as(map, opcode);
     }
+    if bits.is_64() {
+        insn = insn.in_long();
+    }
 
     if insn.needs_modrm() {
         let byte = take(&mut f);
         let modrm = ModRm::new(byte);
         f.modrm = Some(modrm);
         insn = resolve_as(map, insn, modrm.reg);
+        if bits.is_64() {
+            insn = insn.in_long();
+        }
         // The control-, debug- and test-register moves ignore the mode field
         // entirely: there is no memory form, so there is no displacement
         // however the two top bits are encoded.
@@ -2243,6 +2701,12 @@ pub fn decode_stream_as(map: Gen, default32: bool, next: &mut dyn FnMut() -> Opt
                 f.sib = Some(Sib::new(byte));
             }
             f.mem_seg = modrm.default_segment32(f.sib);
+            // The one addressing mode long mode replaced rather than extended:
+            // `mod == 00`, `r/m == 101` was an absolute `disp32` and is now
+            // `RIP + disp32`. The `REX.B` bit does *not* enter into it — this
+            // is a property of the three-bit field, not of the register it
+            // would otherwise name.
+            f.rip_relative = bits.is_64() && !modrm.is_register() && modrm.md == 0 && modrm.rm == 5;
             match modrm.disp_bytes32(f.sib) {
                 1 => {
                     let lo = take(&mut f);
@@ -2266,13 +2730,27 @@ pub fn decode_stream_as(map: Gen, default32: bool, next: &mut dyn FnMut() -> Opt
     }
     f.insn = insn;
 
+    // The operand size is settled here rather than beside the prefixes,
+    // because the group tables can change which operation this is — `FF /6` is
+    // a `PUSH`, and `PUSH` is one of the operations whose operand defaults to
+    // sixty-four bits — and that is not known until the ModRM byte has been
+    // read and resolved.
+    if bits.is_64() {
+        if f.rex_w() {
+            // `REX.W` beats a `66` that came before it.
+            f.opsize = 8;
+        } else if insn.op.default_64() && f.opsize == 4 {
+            f.opsize = 8;
+        }
+    }
+
     let osz = f.opsize;
     let asz = f.addrsize;
-    let mut read = |f: &mut Fields, n: u8| -> u32 {
-        let mut value = 0u32;
+    let mut read = |f: &mut Fields, n: u8| -> u64 {
+        let mut value = 0u64;
         for i in 0..n {
             let byte = take(f);
-            value |= u32::from(byte) << (8 * u32::from(i));
+            value |= u64::from(byte) << (8 * u32::from(i));
         }
         value
     };
@@ -2297,9 +2775,18 @@ pub fn decode_stream_as(map: Gen, default32: bool, next: &mut dyn FnMut() -> Opt
         // byte before use; doing it here keeps every consumer from repeating
         // the cast, and makes a backward jump come out as an addition.
         if matches!(arg, Arg::Ibs | Arg::Jb) {
-            value = (value as u8 as i8) as u32;
-        } else if arg == Arg::Jv && osz == 2 {
-            value &= 0xffff;
+            value = ((value as u8 as i8) as i64) as u64;
+        } else if matches!(arg, Arg::Iz | Arg::Jv) {
+            // `Iz` and `Jz` are sign-extended to the operand size, which is
+            // only visible at an operand size wider than the immediate — that
+            // is, in 64-bit mode. `and rax, -1` is `48 25 ff ff ff ff`, and a
+            // zero-extending decoder makes it `and rax, 0xffffffff`.
+            value = match (n, osz) {
+                (2, _) => u64::from(value as u16),
+                (4, 8) => ((value as u32 as i32) as i64) as u64,
+                (4, _) => u64::from(value as u32),
+                _ => value,
+            };
         }
         if slot == 0 {
             f.imm = value;
@@ -2353,11 +2840,13 @@ mod tests {
     #[test]
     fn every_declared_operation_is_reachable() {
         // An operation nothing decodes to is dead code pretending to be a
-        // feature. The group tables count as reachable.
+        // feature. The group tables count as reachable, and so does the
+        // 64-bit column — `MOVSXD`, `REX`, `SYSCALL` and `SYSRET` exist
+        // *only* there, which is exactly what makes checking it worth doing.
         let reachable = |op: Op| {
-            TABLE.iter().any(|i| i.op == op)
-                || TABLE_386.iter().any(|i| i.op == op)
-                || TABLE_0F.iter().any(|i| i.op == op)
+            TABLE.iter().any(|i| i.op == op || i.in_long().op == op)
+                || TABLE_386.iter().any(|i| i.op == op || i.in_long().op == op)
+                || TABLE_0F.iter().any(|i| i.op == op || i.in_long().op == op)
                 || GROUP_ALU.contains(&op)
                 || GROUP_SHIFT.contains(&op)
                 || GROUP_UNARY8.iter().any(|i| i.op == op)
@@ -2367,6 +2856,15 @@ mod tests {
                 || GROUP8.iter().any(|i| i.op == op)
         };
         for op in Op::ALL {
+            // `SWAPGS` is the one operation with no row of its own, and it is
+            // not an oversight: `0F 01 F8` differs from `INVLPG` only in the
+            // ModRM byte's *mode* field, which the table describes operands
+            // with rather than opcodes. The interpreter picks it out there,
+            // and this exception is written down so that adding a second one
+            // has to be argued for rather than noticed.
+            if *op == Op::SWAPGS {
+                continue;
+            }
             assert!(reachable(*op), "{op:?} is declared but unreachable");
         }
     }
@@ -2388,7 +2886,7 @@ mod tests {
     #[test]
     fn the_unary_group_keeps_its_operand_width() {
         assert_eq!(resolve(decode(0xf6), 0).src, Arg::Ib);
-        assert_eq!(resolve(decode(0xf7), 0).src, Arg::Iv);
+        assert_eq!(resolve(decode(0xf7), 0).src, Arg::Iz);
         assert_eq!(resolve(decode(0xf6), 4).dst, Arg::Eb);
         assert_eq!(resolve(decode(0xf7), 4).dst, Arg::Ev);
     }

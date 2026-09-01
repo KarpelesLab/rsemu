@@ -53,10 +53,39 @@ Like SD and NOR flash, the ATA drive takes a media slot rather than an
 `fstool::BlockDevice`, and for the same reason plus one more: it is `no_std`, so
 `rsemu run pc-at --hd0 disk.img` works on every target the crate builds for. The
 cost is real and worth stating — the medium is a flat `RamStore`, so a drive
-costs its whole capacity in host memory and a snapshot writes all of it. A large
-or sparse image is a `dev/blk/ata` variant under the documented `std` exception,
-reusing the protocol half whole and replacing only `AtaDisk::read_media` and
-`AtaDisk::write_media`.
+costs its whole capacity in host memory and a snapshot writes all of it.
+
+**That variant now exists**, as `dev/blk` under the documented `std` exception,
+and it landed exactly as this paragraph predicted: the drive's storage is a
+`dev::ata::medium::Medium` and the two implementations are a `RamStore` and a
+`dev::blk::Image`, so the protocol half is reused whole and only
+`AtaDisk::read_media` and `AtaDisk::write_media` change hands. Three things are
+worth knowing about it.
+
+**No image format is parsed in rsemu.** `fstool` already has sparse raw, qcow2
+(v2/v3, read/write, allocate-on-write, compressed clusters, backing files,
+encryption), UDIF DMG, DiskCopy 4.2 and LUKS, and §7.1 puts controllers on
+`fstool::BlockDevice` "rather than on a parallel rsemu invention". `dev/blk` is
+therefore an adapter and nothing else: `&mut self` to `&self` behind a
+`core::sync` lock, `std::io::Error` to `BusError`, and a snapshot policy. The
+remaining formats §7.1 lists as rsemu work — `vmdk`, `vhdx`, `vdi` — are new
+*backends*, and a new backend belongs beside the ones it sits next to, which is
+in `fstool`.
+
+**A machine file still names a media slot, never a host path.** The run installs
+a `Medium` under the slot's name (`rsemu run pc-at --drive hd0=disk.qcow2`) and
+`ata.disk` picks it up as it is constructed, so neither `machines/pc-at.machine`
+nor `dev/pc/ide` changed. `--hd0 disk.img` still binds bytes and still copies
+them into RAM; the two are different contracts and both are supported.
+
+**A snapshot of a file-backed drive references the image.** The chunk holds the
+drive's protocol state and the image's identity, `save` flushes the file first
+so what is on disk matches the moment the snapshot was taken, and `load` refuses
+a chunk that names a different image. `snapshot=capture` puts the bytes in the
+chunk for an image small enough to want that, and `snapshot=refuse` says no.
+What is not on offer is silently writing sixteen gigabytes into a snapshot.
+Closing the remaining gap — the guest that writes to the image *after* the
+snapshot — is a copy-on-write overlay, and per §7.1 that is `fstool` work.
 
 NOR flash is here rather than under devices because it is a *transport* too:
 the guest sees a memory window with a command protocol on it, not a controller
@@ -81,7 +110,16 @@ guests require it.
   Send`). Do not invent a parallel block abstraction — but note it is `Send`,
   *not* `Sync`, and its methods take `&mut self`, so a controller owns its
   device behind the seam rather than sharing it. This is also why `dev/blk/*`
-  is one of the two documented `std` exceptions to the `no_std` rule.
+  is one of the two documented `std` exceptions to the `no_std` rule. The lock
+  that bridges the two is `core::sync`'s, never `std::sync`'s: nothing under
+  `dev/` may name that, `std` gate or no `std` gate.
+- **A host read takes zero guest time.** Not an omission — if the duration of a
+  `pread` reached the guest's timeline, two runs of the same machine would
+  diverge on how warm the host's page cache was. When the drive grows an I/O
+  delay it will come from a clock domain and a scheduler event, and the host's
+  actual latency will still not be it.
+- The bounds check is in `u64` and happens before the offset becomes a host
+  `usize`. Disk offsets are where the 64-bit-guest-on-32-bit-host rule bites.
 - **The flush contract matters more than throughput.** A guest issuing FLUSH
   expects durability; a snapshot taken mid-write must restore to a consistent
   state. Decide the write-back cache semantics before writing the first

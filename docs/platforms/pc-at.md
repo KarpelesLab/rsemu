@@ -18,17 +18,46 @@ $ rsemu run pc-at --bios /usr/share/qemu/bios.bin  # or the user's
 $ rsemu run pc-at --bios bios.bin --media vgabios=vgabios.bin --media floppy=boot.img
 ```
 
-What changed is the first line. [`src/fw/pcbios`](../../src/fw/pcbios) is a
-**minimal legacy BIOS written here**, and the `bios` slot defaults to it — see
+What changed in the first line is that [`src/fw/pcbios`](../../src/fw/pcbios) is
+a **minimal legacy BIOS written here**, and the `bios` slot defaults to it — see
 [the section below](#the-in-house-bios). That is a default, not a replacement:
 `--bios` still wins, and every other firmware this board might run still comes
 from the user.
+
+**A third-party video BIOS has to be a PCI one.** A 440FX-era firmware finds video by
+enumerating the bus for class code `030000` and taking that card's option ROM off
+its expansion ROM base address register — and it validates the **PCI Data
+Structure** inside the image against the card's vendor and device id before it
+runs it. A video BIOS built for an ISA card carries no such structure (its
+pointer at offset `0x18` is zero) and no amount of chipset will make one load
+this way. On a machine with QEMU's images installed that means
+`vgabios-stdvga.bin`, not `vgabios.bin` — the latter is the ISA build. If the
+ids do not match, the firmware finds the card, maps the ROM, and silently
+declines to run it; measured, both ways, in the section below.
 
 `--bios` and `--vgabios` are conveniences over `--media bios=…`, and so are
 `--hd0` and `--hd1`, which fill the two drive bays on the primary IDE channel;
 the mechanism is the media table and nothing else. An unbound `hd0` or `hd1` is
 an **empty bay**, not an error — a PC with no hard disk is an ordinary PC, and a
-drive costs its whole capacity in host memory the moment it exists. `pc.rom` is the socket they land in, and
+drive bound that way costs its whole capacity in host memory the moment it
+exists, because the media table is bytes.
+
+A build with `dev-blk` has the other option, which is the one you want for a
+disk of any size:
+
+```console
+$ rsemu run pc-at --bios bios.bin --drive hd0=disk.qcow2
+$ rsemu run pc-at --bios bios.bin --drive hd0=fresh.qcow2,new=8G
+```
+
+`--drive` backs the same media slot with the **file** rather than with a copy of
+its bytes: the capacity comes from the image, the guest's writes go to the file,
+and sparse raw, qcow2, DMG, DiskCopy 4.2 and LUKS are all understood (through
+`fstool` — no image format is parsed in rsemu). Nothing in
+`machines/pc-at.machine` changes, because the machine file names a media slot
+and the *run* decides what is behind that name. A machine snapshot then
+**references** the image rather than copying it; `docs/buses/storage.md` has the
+argument. `pc.rom` is the socket the ROMs land in, and
 its `align` property is the one thing about it that is not obvious: a **system
 BIOS is top-aligned**, because an x86 fetches its first instruction from the top
 of its address space, and an **option ROM is bottom-aligned**, because firmware
@@ -59,6 +88,7 @@ address; every one of them is written once, in that file.
 | Hard disks (2 bays) | `ata.disk` | — (on the cable) | T13 ATA/ATAPI-6 |
 | Firmware sockets | `pc.rom` | 0xc0000, 0xe0000 (+ a high alias) | — |
 | PCI host bridge, and RAM shadowing | `pc.pmc` | 0xcf8-0xcff | Intel 82441FX data sheet |
+| PCI display adapter, and its video BIOS | `pc.vga-pci` | 00:02.0, expansion ROM BAR | PCI Local Bus Spec Rev 2.1 §6.2.5.2 |
 
 Six oscillators, because the board has six cans: the CPU clock, the 8254's
 105/88 MHz — not an integer number of hertz, which is why the description
@@ -172,30 +202,45 @@ What one such image does today, in order:
 4. Sizes RAM from the CMOS — **`RamSize: 0x01000000`**, which is the 640 KiB
    plus 15 MiB the machine file declares — and relocates 44 KiB of init code
    into high memory.
-5. Enumerates PCI, finds the one device there is, allocates its windows, and
-   reports no VGA and no APIC.
+5. Enumerates PCI, finds **two** devices, sizes and places their windows —
+   `PCI: map device bdf=00:02.0 bar 6, addr febf0000, size 00010000 [mem]` is
+   the display adapter's expansion ROM — and says
+   **`PCI: Using 00:02.0 for primary VGA`**. No APIC.
 6. Copies its PIR, MPTABLE and SMBIOS tables *into the f-segment*, which is
    only possible because that segment is now RAM.
-7. Scans for a video option ROM, finds none, initialises the PS/2 keyboard,
-   programs counter 0 of the 8254 in mode 2 and the 8259A pair (`0xb8`/`0x8e`),
-   and takes timer interrupts at 18 Hz for as long as it is left running.
-8. Builds a five-entry e820 map, offers its boot menu, and boots. With the
+7. Scans for a video option ROM, finds the one behind that BAR, copies it into
+   the RAM it made at `0xc0000` and far-calls it: **`Running option rom at
+   c000:0003`**, then the video BIOS's own banner, then **`set VGA mode 3`**.
+   From here everything the firmware prints reaches the screen as well as the
+   log port.
+8. Initialises the PS/2 keyboard, programs counter 0 of the 8254 in mode 2 and
+   the 8259A pair (`0xb8`/`0x8e`), and takes timer interrupts at 18 Hz for as
+   long as it is left running.
+9. Builds a five-entry e820 map, offers its boot menu, and boots. With the
    drive empty it tries the floppy, tries the hard disk and settles into
    `sti; hlt` with **"No bootable device. Retrying in 60 seconds."** With a
    bootable diskette in it (`RSEMU_FLOPPY`) it says **"Booting from
-   0000:7c00"** and hands over — and the sector runs: a twenty-eight byte boot
-   sector that writes to `0xb8000` puts its string on the text page, which the
-   test prints.
+   0000:7c00"** and hands over — and the sector runs, including through
+   `INT 10h`, which is the video BIOS the firmware just installed.
 
-That is a complete POST and a complete boot. The BIOS data area agrees:
-equipment word `0x0007`, base memory 639 KiB at `0x413` (the EBDA takes the
-other kilobyte), the tick count at `0x46c` climbing. The floppy read went
-through the µPD765 and the 8237 on channel 2, so that path is exercised by a
-real driver rather than only by its own unit tests.
+That is a complete POST and a complete boot, with a picture. The BIOS data area
+agrees: equipment word `0x0027` — bit 5 set, "colour 80x25" — the CRT mode byte
+at `0x449` holding **3**, base memory 639 KiB at `0x413` (the EBDA takes the
+other kilobyte), the tick count at `0x46c` climbing. The text page holds what
+the firmware printed:
+
+```text
+|SeaBIOS (version rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org)|
+|Press ESC for boot menu.|
+|Booting from Floppy...|
+```
+
+The floppy read went through the µPD765 and the 8237 on channel 2, so that path
+is exercised by a real driver rather than only by its own unit tests.
 
 ### What that took, and what it cost
 
-Two things, and the second was a surprise.
+Four things, and three of them were surprises.
 
 **The host bridge.** `pc.pmc` is an Intel 82441FX, and steps 3 and 4 above are
 the whole reason it exists. Its module docs quote the datasheet section that
@@ -212,19 +257,52 @@ console, and the log came back. It is worth stating plainly: a working feature
 made a working instrument stop, because the instrument had been relying on a
 missing feature.
 
+**A PCI VGA function and its expansion ROM BAR.** The firmware used to report
+"No VGA found" and never set a mode, and the explanation was already written
+down here: it sets PAM1-PAM5 to read/write, which turns `0xc0000-0xdffff` into
+blank DRAM, so the legacy `vgarom` socket underneath is invisible by the time
+anything scans for a signature. A 440FX-era firmware gets its video ROM off a
+**PCI card's expansion ROM BAR**, and the board now has one: `pc.vga-pci` at
+`00:02.0`, class code `030000`, with the `vgabios` image behind a 64 KiB ROM
+window that `bus/pci`'s base address registers place where the firmware asks.
+
+**A video BIOS writes its registers a word at a time.** Not predicted. With the
+option ROM running, the first run showed **243 unanswered bus accesses, last at
+`0x3d4`**: `pc.video` declared itself byte-only, and a video BIOS programs the
+CRTC, the sequencer and the graphics controller with one `OUT DX, AX` per
+register — index in `AL`, datum in `AH`. That is not a shortcut; it is what the
+register pairs are laid out for, and what every VGA reference gives as *the*
+idiom. The device now accepts a word at a naturally aligned pair and applies it
+low byte first, which latches the index before the datum that uses it. Bus
+faults are back to zero, and the assertion in `tests/pc_at_firmware.rs` that
+they stay there is what would catch the next such gap.
+
+**The video BIOS has to be for this card.** Also not predicted, and the most
+useful thing measured here. A firmware that loads a ROM off a base address
+register checks the image's **PCI Data Structure** — signature `PCIR`, then a
+vendor and a device id — against the card it came off. Three runs, all
+black-box:
+
+| Image | `PCIR` | Card ids | Result |
+| --- | --- | --- | --- |
+| `vgabios.bin` (the ISA build) | none | 1234:1111 | mapped, never run |
+| `vgabios-stdvga.bin` | 1234:1111 | 1013:00b8 | mapped, never run |
+| `vgabios-stdvga.bin` | 1234:1111 | 1234:1111 | **`Running option rom at c000:0003`**, mode 3 |
+
+A Cirrus image against a card declaring Cirrus's ids runs and then correctly
+gives up — "cirrus init / Failed to initialize VGA hardware" — because the card
+is not a Cirrus. So `vendor-id` and `device-id` on the `vgacard` object are
+load-bearing, and the machine file says so.
+
 ### What is still not there
 
-**No video.** The firmware reports "No VGA found" and never sets a video mode,
-so nothing *it* prints reaches the screen — the text page only ever holds what
-a guest wrote there directly. That is not a bug in `pc.video` and it is not new
-— it happened before shadowing too — but it is
-now *explained*: the firmware sets PAM1-PAM5 to read/write, which turns
-`0xc0000-0xdffff` into blank DRAM, and it does not copy an ISA-style option
-ROM into it first because a 440FX-era machine gets its video ROM off a PCI
-card's expansion-ROM BAR. So this board's `vgarom` socket — a legacy ISA ROM
-at `0xc0000` — is invisible to a firmware that knows what a 440FX is. Getting
-a video BIOS in front of this firmware needs base address registers and a PCI
-VGA function, not a bigger ROM socket.
+**A graphics mode.** `pc.video` is text-mode only and says so, and the video
+BIOS agrees: it reports "No VBE DISPI interface detected, falling back to
+stdvga" and sets mode 3. A Cirrus image, whose ids the machine file can be told
+to match, gets as far as `cirrus init` and then correctly refuses — "Failed to
+initialize VGA hardware" — because the card is not a Cirrus. Which is the right
+answer, and a good demonstration that the id fields are load-bearing rather
+than decoration.
 
 ## The in-house BIOS
 
@@ -310,24 +388,27 @@ a firmware bug:
 
 ## What is known to be missing
 
-- **PCI base address registers.** `bus/pci` has configuration space, the
-  `0xcf8`/`0xcfc` mechanism and master aborts, and no BARs: a BAR is a mapping
-  that *moves*, from inside a configuration write, and no function in the tree
-  has one yet. It is the next thing this board needs, because a video BIOS
-  arrives on a PCI card's expansion-ROM BAR.
-- **Everything else on the bus.** One host bridge and nothing behind it. No
+- **PCI I/O BARs that decode.** The register is complete — firmware can size
+  and place one — but `Bars::install` refuses to *map* one, and says why: a
+  configuration cycle travels through the I/O space, so the order-exempt
+  try-lock that makes a memory BAR move from inside a configuration write
+  cannot help there. Nothing in the tree has an I/O BAR yet, so the deferred
+  action that would be the escape is not written on a guess.
+- **Everything else on the bus.** A host bridge and a display adapter. No
   south bridge, so no PCI IDE, no PCI interrupt routing and no `PIRQ` swizzle;
-  no PCI VGA; no bridges, so no bus but bus 0.
+  no bridges, so no bus but bus 0.
 - **`0x510`/`0x511`.** A firmware built for another emulator reads its whole
   configuration — memory map, boot order, SMBIOS and ACPI tables — from a
   paravirtual interface at those ports. Its strings show it *detects* the
   interface rather than requiring it, so the fallback path exists — and it is
   now measured: with nothing there the image falls back to the CMOS for its
   memory map and keeps going.
-- **A video BIOS needs a real VGA**, not a text-mode CRTC: setting even mode 3
-  writes the sequencer, the graphics controller, the attribute controller and
-  the DAC. `pc.video` implements that register file; what it does *not* implement
-  is any graphics mode, deliberately.
+- **A graphics mode.** Setting mode 3 writes the sequencer, the graphics
+  controller, the attribute controller and the DAC, and `pc.video` implements
+  that register file — a real video BIOS drives all of it and reaches a text
+  console. What it does *not* implement is any graphics mode, deliberately, so
+  a guest that asks for one gets a register file that latches and a screen that
+  does not change.
 - **The keyboard takes raw set-2 scan codes** on a character port. Mapping a
   terminal's keystrokes to scan codes is a host concern and belongs in `host/`.
 - **No serial port, no parallel port, no APIC, no ACPI.** The firmware finds

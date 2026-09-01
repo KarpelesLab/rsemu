@@ -1069,12 +1069,12 @@ fn arithmetic_accumulates_the_sticky_flags() {
     assert_eq!(h.hart.f(10), (1.0f64 / 3.0).to_bits());
     assert_eq!(
         h.hart.csrs().fcsr & 0x1f,
-        u64::from(super::float::flags::NX)
+        u64::from(crate::float::Flags::INEXACT.to_fcsr())
     );
     assert_eq!(h.hart.f(13), 4.0f64.to_bits());
     assert_eq!(
         h.hart.csrs().fcsr & 0x1f,
-        u64::from(super::float::flags::NX),
+        u64::from(crate::float::Flags::INEXACT.to_fcsr()),
         "an exact operation does not clear the sticky flag"
     );
 }
