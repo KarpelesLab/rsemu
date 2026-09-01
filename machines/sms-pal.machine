@@ -127,11 +127,14 @@ machine "sms-pal" {
   # reached at 256 different 16-bit addresses depending on what happened to be
   # in a register. The loop below is that missing decode written out.
   #
-  # It is 1024 mappings, which is honest rather than clever: a repeating window
+  # It is 1280 mappings, which is honest rather than clever: a repeating window
   # (`mirror`) needs a single leaf to repeat, and one page here is four
-  # different chips. The alternative — a region kind that repeats a *container*
-  # — is a core::space change, and phase 4 is explicitly not the place to make
-  # one (ROADMAP.md §13). The cost is paid once, at realize.
+  # different chips. It stays spelled out because it is what the board does —
+  # and because it now costs what it should: a topology guard flattens once when
+  # it closes, not once per mapping, so the whole port map is one flatten
+  # (ROADMAP.md §4.1). A region kind that repeats a *container* would remove
+  # the 1280 lines but not the cost, and would put a second level of lookup on
+  # every access to pay for it.
   for page in 0..256 {
     # $00-$3F: memory control on an even address, I/O port control on an odd
     # one. Write-only; a read finds nothing driving the bus.

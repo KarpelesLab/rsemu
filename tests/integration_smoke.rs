@@ -29,7 +29,7 @@ fn a_clock_forest_and_an_address_space_coexist() {
     {
         let mut topo = space.topology();
         topo.map(mirror, 0x0000).unwrap();
-        topo.rebuild().unwrap();
+        topo.rebuild();
     }
 
     let attrs = MemAttrs::default();

@@ -57,6 +57,16 @@ pub enum BusError {
     /// A 32-bit-only register must reject a byte write rather than silently
     /// accept it (`ROADMAP.md` §4.1).
     BadAccess,
+    /// Something *is* mapped here, and it does not permit this direction of
+    /// access.
+    ///
+    /// Distinct from [`BusError::BadAccess`] on purpose, and the distinction
+    /// is what makes copy-on-write possible: a consumer that sees this knows
+    /// the address is real and that the fault is about *terms*, so it can
+    /// resolve it — break the sharing, widen the permission — and reissue.
+    /// Conflated with "bad width" there is nothing to act on. See
+    /// [`Perms`](crate::core::space::Perms).
+    Protected,
     /// The target is busy; the access may be retried.
     ///
     /// Only legal *before* any side effect or partial transfer — a retry that
@@ -85,6 +95,7 @@ impl fmt::Display for BusError {
         let s = match self {
             BusError::Unassigned => "nothing mapped at this address",
             BusError::BadAccess => "access width or alignment not permitted",
+            BusError::Protected => "the mapping does not permit this access",
             BusError::Retry => "target busy, retry",
         };
         f.write_str(s)

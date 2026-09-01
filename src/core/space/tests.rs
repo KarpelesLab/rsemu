@@ -1603,3 +1603,254 @@ fn an_access_during_a_retopology_retries_rather_than_deadlocking() {
 
     assert!(space.read(0, Width::U8, MemAttrs::DEFAULT).is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// The mapping layer: permissions, direction, and one flatten per batch
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_read_only_mapping_refuses_a_write_and_says_why() {
+    // The store is perfectly writable. What refuses is the *mapping*, which is
+    // the whole point: permission is a property of the decode in front of a
+    // region, not of the region.
+    let (store, region) = ram("ram", 0x100);
+    let space = AddressSpace::new("mem", 16);
+    space
+        .topology()
+        .map_with_perms(region, 0, Perms::RX)
+        .unwrap();
+
+    assert!(space.read(0x10, Width::U8, MemAttrs::DEFAULT).is_ok());
+    assert_eq!(
+        space.write(0x10, Width::U8, 0xaa, MemAttrs::DEFAULT),
+        Err(BusError::Protected),
+        "a write must be refused, and told apart from a bad width"
+    );
+    // Refused, not partly performed.
+    assert_eq!(store.read_u8(0x10), Ok(0));
+
+    // And a debug write is refused the same way: a monitor must not be the
+    // thing that breaks a share or moves a mapping.
+    assert_eq!(
+        space.write(0x10, Width::U8, 0xaa, MemAttrs::DEBUG),
+        Err(BusError::Protected)
+    );
+    assert_eq!(store.read_u8(0x10), Ok(0));
+}
+
+#[test]
+fn a_write_only_mapping_refuses_a_read() {
+    let (_store, region) = ram("ram", 0x100);
+    let space = AddressSpace::new("mem", 16);
+    space
+        .topology()
+        .map_with_perms(region, 0, Perms::WRITE)
+        .unwrap();
+
+    assert!(space.write(0, Width::U8, 0x5a, MemAttrs::DEFAULT).is_ok());
+    assert_eq!(
+        space.read(0, Width::U8, MemAttrs::DEFAULT),
+        Err(BusError::Protected)
+    );
+}
+
+#[test]
+fn permissions_intersect_down_the_tree() {
+    // A read-only container makes its children read-only however they were
+    // mapped inside it: the container's decode is in front of them.
+    let (_store, region) = ram("ram", 0x100);
+    let inner = Mapping::new(Arc::new(region), 0).with_perms(Perms::RWX);
+    let container = Region::container("board", 0x100, vec![inner]);
+    let space = AddressSpace::new("mem", 16);
+    space
+        .topology()
+        .map_with_perms(container, 0, Perms::READ)
+        .unwrap();
+
+    assert!(space.read(0, Width::U8, MemAttrs::DEFAULT).is_ok());
+    assert_eq!(
+        space.write(0, Width::U8, 1, MemAttrs::DEFAULT),
+        Err(BusError::Protected)
+    );
+}
+
+#[test]
+fn reads_and_writes_resolve_to_different_mappings_when_the_terms_differ() {
+    // A Master System's slot 2 with `$FFFC` bit 3 set: the same address reads
+    // the ROM bank and writes the on-cartridge RAM. Two overlapping mappings
+    // with complementary permissions, and no new region kind.
+    let rom_store = Arc::new(RomStore::new(vec![0xb2; 0x100]));
+    let rom = Region::rom("bank", rom_store, RomWrite::Ignore);
+    let (ram_store, ram_region) = ram("cart-ram", 0x100);
+
+    let space = AddressSpace::new("mem", 16);
+    {
+        let mut topo = space.topology();
+        topo.map_with_perms(rom, 0x8000, Perms::RX).unwrap();
+        topo.map_with(
+            Mapping::new(Arc::new(ram_region), 0x8000)
+                .with_priority(1)
+                .with_perms(Perms::WRITE),
+        )
+        .unwrap();
+    }
+
+    assert_eq!(
+        space.read(0x8000, Width::U8, MemAttrs::DEFAULT),
+        Ok(0xb2),
+        "the higher-priority mapping cannot answer a read, so the ROM does"
+    );
+    space
+        .write(0x8000, Width::U8, 0x5a, MemAttrs::DEFAULT)
+        .unwrap();
+    assert_eq!(
+        ram_store.read_u8(0),
+        Ok(0x5a),
+        "and the write reached the RAM, not the ROM"
+    );
+    assert_eq!(
+        space.read(0x8000, Width::U8, MemAttrs::DEFAULT),
+        Ok(0xb2),
+        "which the read still cannot see"
+    );
+
+    let view = space.view();
+    let entry = view
+        .flat_view()
+        .entry(view.locate(0x8000).unwrap())
+        .unwrap();
+    assert!(
+        entry.write_to().is_some(),
+        "one entry, two destinations — not two entries"
+    );
+    assert!(!entry.is_direct_ram(), "and not the dispatch fast path");
+}
+
+#[test]
+fn nothing_changes_for_a_machine_that_never_mentions_permission() {
+    // The direction-resolving flattener has to be invisible when every mapping
+    // permits everything, which is every machine in the catalog.
+    let (_store, region) = ram("ram", 0x100);
+    let space = AddressSpace::new("mem", 16);
+    space.topology().map(region, 0).unwrap();
+    let view = space.view();
+    let entry = view.flat_view().entry(0).unwrap();
+    assert!(entry.write_to().is_none());
+    assert!(entry.is_direct_ram());
+}
+
+#[test]
+fn reprotect_changes_the_terms_and_bumps_the_generation() {
+    let (_store, region) = ram("ram", 0x100);
+    let space = AddressSpace::new("mem", 16);
+    let id = space.topology().map(region, 0).unwrap();
+    let before = space.generation();
+    space.write(0, Width::U8, 1, MemAttrs::DEFAULT).unwrap();
+
+    space.topology().reprotect(id, Perms::READ).unwrap();
+    assert_eq!(
+        space.write(0, Width::U8, 2, MemAttrs::DEFAULT),
+        Err(BusError::Protected)
+    );
+    assert_eq!(space.read(0, Width::U8, MemAttrs::DEFAULT), Ok(1));
+    assert!(
+        space.generation() > before,
+        "a permission change invalidates every cache that recorded the old terms"
+    );
+    assert_eq!(space.topology().perms_of(id), Some(Perms::READ));
+}
+
+#[test]
+fn replace_keeps_a_mappings_identity_and_its_place_in_the_overlap_order() {
+    // What a copy-on-write break does: same address, same priority, a private
+    // store behind it. `unmap` + `map` would move it to the back of the
+    // tie-breaking order, which is guest-visible.
+    let (shared, low) = ram("shared", 0x100);
+    let (over, high) = ram("over", 0x100);
+    let (private, replacement) = ram("private", 0x100);
+    shared.write_u8(0, 0x11).unwrap();
+    over.write_u8(0, 0x33).unwrap();
+    private.write_u8(0, 0x22).unwrap();
+
+    let space = AddressSpace::new("mem", 16);
+    let id = {
+        let mut topo = space.topology();
+        let id = topo.map(low, 0).unwrap();
+        // Mapped later, so it wins the tie and hides `low` entirely...
+        topo.map(high, 0).unwrap();
+        id
+    };
+    assert_eq!(space.read(0, Width::U8, MemAttrs::DEFAULT), Ok(0x33));
+
+    space
+        .topology()
+        .replace(id, Mapping::new(Arc::new(replacement), 0))
+        .unwrap();
+    assert_eq!(
+        space.read(0, Width::U8, MemAttrs::DEFAULT),
+        Ok(0x33),
+        "...and still does, because the replacement kept the loser's place"
+    );
+}
+
+#[test]
+fn a_batch_of_mappings_costs_one_flatten_and_one_generation() {
+    // The reason realizing an incompletely decoded board stopped being
+    // quadratic. Not a timing assertion — the generation counter is the
+    // observable that says how many rebuilds happened.
+    let space = AddressSpace::new("mem", 16);
+    let before = space.generation();
+    {
+        let mut topo = space.topology();
+        for i in 0..64u64 {
+            let (_s, region) = ram("page", 0x100);
+            topo.map(region, i * 0x100).unwrap();
+        }
+    }
+    assert_eq!(
+        space.generation(),
+        before + 1,
+        "64 mappings, one flatten, one invalidation"
+    );
+    assert_eq!(space.view().flat_view().len(), 64);
+    assert!(space.read(0x1000, Width::U8, MemAttrs::DEFAULT).is_ok());
+}
+
+#[test]
+fn a_view_taken_after_the_guard_closes_sees_every_mapping_of_the_batch() {
+    // The deferred flatten must never be observable: the guard excludes every
+    // reader and performs it before releasing.
+    let space = AddressSpace::new("mem", 16);
+    {
+        let mut topo = space.topology();
+        let (_s, region) = ram("a", 0x100);
+        topo.map(region, 0).unwrap();
+        // Reading derived state through the open guard catches it up first.
+        assert_eq!(topo.flat_view().len(), 1);
+        let (_s2, region2) = ram("b", 0x100);
+        topo.map(region2, 0x100).unwrap();
+        assert_eq!(topo.flat_view().len(), 2);
+    }
+    assert_eq!(space.view().flat_view().len(), 2);
+}
+
+#[test]
+fn a_region_too_deep_to_flatten_is_refused_when_it_is_mapped() {
+    // The flatten happens where no caller is left to hear an error, so the one
+    // thing that can make it fail is checked eagerly, in constant time.
+    let (_store, leaf) = ram("leaf", 0x10);
+    let mut region: RegionRef = Arc::new(leaf);
+    for i in 0..80 {
+        region = Arc::new(Region::alias(alloc::format!("w{i}"), region, 0, 0x10).unwrap());
+    }
+    let space = AddressSpace::new("mem", 16);
+    let err = space.topology().map(region, 0).unwrap_err();
+    assert!(
+        alloc::format!("{err}").contains("nests"),
+        "{err} should name the nesting"
+    );
+    assert!(
+        space.view().flat_view().is_empty(),
+        "and the space is left as it was, not half-changed"
+    );
+}

@@ -34,8 +34,13 @@
 //! | Method | [`AddressSpace::rebase`] — a **read** guard | [`AddressSpace::topology`] then [`map`](TopologyGuard::map) / [`unmap`](TopologyGuard::unmap) / [`remap`](TopologyGuard::remap) — a **write** guard |
 //! | What changed | an alias's offset slides; the region *set* is identical | regions added, removed, resized, re-prioritized |
 //! | Examples | cartridge bank switching | BAR enable/disable, hotplug, ROM shadowing toggle |
-//! | Cost | one atomic store per affected flat entry | full flatten + table rebuild |
+//! | Cost | one atomic store per affected flat entry | full flatten + table rebuild, **once per guard** |
 //! | Generation counter | untouched | bumped |
+//!
+//! A retopology's flatten is deferred to the moment the guard closes, so a
+//! batch of mappings costs one rebuild rather than one each — see
+//! [`TopologyGuard`] for the board that made that the difference between 354 ms
+//! and 2 ms.
 //!
 //! An MMC3 cartridge rebanks ~15 000 times a second. If that rebuilt the flat
 //! view and bumped the generation — invalidating every TLB and translation
@@ -43,6 +48,45 @@
 //! atomic offset cell and the cached offsets of the flat entries that read it,
 //! and nothing else: not the entry list, not its ordering, not the dispatch
 //! table, not the generation counter.
+//!
+//! # The mapping layer: what answers, and on what terms
+//!
+//! A region list says *what answers an address*. A [`Mapping`] says *under what
+//! terms* — [`Perms`], carried on the placement rather than on the region,
+//! because a ROM chip is a ROM chip and whether this bus may write to it is a
+//! property of the decode in front of it. Permissions intersect down the tree,
+//! so a child of a read-only container is read-only however it was mapped.
+//!
+//! Three things that look like separate features are this one mechanism:
+//!
+//! * **A mapping that faults.** A write to a mapping without [`Perms::WRITE`]
+//!   raises [`BusError::Protected`] — distinct from [`BusError::BadAccess`],
+//!   which is the difference between "you cannot do that here" and "you cannot
+//!   do that at all".
+//! * **Copy-on-write.** Two spaces map one store, both without
+//!   [`Perms::WRITE`]. The first store faults; whoever is driving the machine
+//!   gives that side a private copy, [`replace`](TopologyGuard::replace)s the
+//!   mapping, and reissues. Nothing here knows what a process is —
+//!   [`usermode`](crate::usermode) builds `fork` out of exactly this.
+//! * **One address, two chips.** The flattener resolves reads and writes
+//!   **separately**: the highest-priority mapping that permits reads need not
+//!   be the one that permits writes. A Master System's slot 2 reads a ROM bank
+//!   and writes the on-cartridge RAM `$FFFC` bit 3 switched in — two
+//!   overlapping mappings with complementary permissions, and no new region
+//!   kind. [`Region::split`] remains the terser spelling for the narrower case
+//!   where the two halves are two [`MemOps`] at one address rather than two
+//!   stores.
+//!
+//! With every mapping [`Perms::RWX`] — every machine that has never mentioned
+//! permission — both directions resolve to the same winner, and every entry is
+//! the shape it always was.
+//!
+//! **The fault does not resolve itself.** It cannot: the access holds the
+//! space's read guard and resolving means a retopology, which is the lock
+//! inversion this module's ladder exists to forbid. So a permission fault
+//! leaves the space, exactly as a page fault leaves a CPU, and comes back as a
+//! reissued access once whoever handled it is somewhere a
+//! [`TopologyGuard`] may be taken.
 //!
 //! # Why a guard, and not `&mut self`
 //!
@@ -154,7 +198,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
-pub use attrs::{AccessConstraints, MemAttrs, MemOps, MemResult, RequesterId};
+pub use attrs::{AccessConstraints, MemAttrs, MemOps, MemResult, Perms, RequesterId};
 pub use dispatch::{Dispatch, DispatchEntry, DispatchPolicy};
 pub use flat::{EntryKind, FlatEntry, FlatLeaf, FlatTarget, FlatView};
 pub use region::{
@@ -273,6 +317,13 @@ struct Topology {
     flat: FlatView,
     dispatch: Option<Dispatch>,
     rebase_index: RebaseIndex,
+    /// Set when `root` has changed and the derived state has not caught up.
+    ///
+    /// Only ever true *while a [`TopologyGuard`] is open*, which is the whole
+    /// point: the guard excludes every reader, so nothing can observe the
+    /// disagreement, and the flatten happens once when the guard closes rather
+    /// than once per mapping. See [`TopologyGuard`] for why that matters.
+    dirty: bool,
 }
 
 /// One address space: the view of memory that one bus master has.
@@ -334,6 +385,7 @@ impl AddressSpace {
                     flat: FlatView::default(),
                     dispatch: None,
                     rebase_index: RebaseIndex::new(),
+                    dirty: false,
                 },
             ),
             generation: AtomicU64::new(1),
@@ -696,8 +748,33 @@ impl AddressSpace {
         }
     }
 
-    /// Whether `mapping` lies inside the space. Reads only immutable fields, so
-    /// it is callable with either guard held.
+    /// Everything about a mapping that has to be true before it may be added.
+    ///
+    /// Two things, and the second is here rather than in the flattener for a
+    /// structural reason: [`TopologyGuard`] defers its flatten to the end of a
+    /// batch, so by the time the tree is walked there is no caller left to
+    /// return an error to. Depth is the only way flattening can fail, and
+    /// [`Region::depth`] is maintained at construction, so the check is O(1)
+    /// and lands where the mistake was made.
+    ///
+    /// Reads only immutable fields, so it is callable with either guard held.
+    fn check_mapping(&self, mapping: &Mapping) -> Result<(), Error> {
+        self.check_fits(mapping)?;
+        if mapping.region.depth() > flat::MAX_DEPTH {
+            return Err(Error::Config {
+                at: self.name.clone(),
+                message: alloc::format!(
+                    "region `{}` nests {} deep and the limit is {}",
+                    mapping.region.name(),
+                    mapping.region.depth(),
+                    flat::MAX_DEPTH
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether `mapping` lies inside the space.
     fn check_fits(&self, mapping: &Mapping) -> Result<(), Error> {
         // A 64-bit space reports its size as `u64::MAX`, so a region that ends
         // exactly at 2^64 is rejected. Nothing real is mapped there, and the
@@ -943,7 +1020,7 @@ impl SpaceView<'_> {
                 Some(i) => {
                     let e = self.topo.flat.entry(i).expect("index came from locate");
                     let rel = a - e.start();
-                    let n = e.run_len(rel).min(remaining);
+                    let n = e.read_run_len(rel).min(remaining);
                     if endian.is_none() {
                         endian = Some(e.endian());
                     }
@@ -996,7 +1073,7 @@ impl SpaceView<'_> {
                 Some(i) => {
                     let e = self.topo.flat.entry(i).expect("index came from locate");
                     let rel = a - e.start();
-                    let n = e.run_len(rel).min(remaining);
+                    let n = e.write_run_len(rel).min(remaining);
                     let piece = &src[usize_of(done)..usize_of(done + n)];
                     let w = if n == total { width } else { None };
                     (n, e.write(rel, piece, attrs, w))
@@ -1030,14 +1107,42 @@ impl SpaceView<'_> {
 /// every access, on every thread — so keep it short, and keep it out of MMIO
 /// handlers, which are readers by definition.
 ///
-/// Every mutating method here is a **retopology**: it reflattens the tree,
-/// rebuilds the dispatch table and bumps the generation, invalidating every
-/// derived cache in the machine. A batch under one guard still costs one
-/// rebuild per call; the guard saves the acquisitions, not the flattening.
+/// Every mutating method here is a **retopology**: between them they reflatten
+/// the tree, rebuild the dispatch table and bump the generation, invalidating
+/// every derived cache in the machine.
+///
+/// # One rebuild per guard, not one per call
+///
+/// The flatten is **deferred to the moment the guard closes**. A `map` marks
+/// the topology dirty and returns; the tree is walked once, when the last
+/// mutation is in.
+///
+/// That is not a micro-optimisation. An incompletely decoded bus has to spell
+/// its missing decode out as a mapping per repeat unit — a Master System's
+/// A8-A15 go nowhere, so the same four chips answer at 256 different 16-bit
+/// port addresses and the machine file says so 1280 times. Rebuilding per call
+/// made realizing that board quadratic: 354 ms in release and 3 s in debug, for
+/// a board with five chips on it. Deferring makes it linear in the batch.
+///
+/// The consequence a caller sees is that [`flat_view`](TopologyGuard::flat_view)
+/// and [`dispatch`](TopologyGuard::dispatch) take `&mut self`: reading derived
+/// state through an open guard has to catch it up first. Everything outside
+/// this module reads them through a [`SpaceView`] instead, where they are
+/// always current — the guard is closed by then.
+///
+/// A deferred flatten cannot fail, because the only way flattening *can* fail
+/// is an over-deep region tree and [`map`](TopologyGuard::map) rejects one
+/// eagerly. See [`Region::depth`].
 #[derive(Debug)]
 pub struct TopologyGuard<'a> {
     space: &'a AddressSpace,
     topo: RwLockWriteGuard<'a, Topology>,
+}
+
+impl Drop for TopologyGuard<'_> {
+    fn drop(&mut self) {
+        self.sync();
+    }
 }
 
 impl TopologyGuard<'_> {
@@ -1049,16 +1154,22 @@ impl TopologyGuard<'_> {
     }
 
     /// The flattened view as it stands. Derived state.
+    ///
+    /// Takes `&mut self` because it may have to perform the deferred flatten
+    /// first — see the type's docs.
     #[inline]
-    #[must_use]
-    pub fn flat_view(&self) -> &FlatView {
+    pub fn flat_view(&mut self) -> &FlatView {
+        self.sync();
         &self.topo.flat
     }
 
     /// The dense dispatch table, if this space has one.
+    ///
+    /// Takes `&mut self` for the same reason as
+    /// [`flat_view`](TopologyGuard::flat_view).
     #[inline]
-    #[must_use]
-    pub fn dispatch(&self) -> Option<&Dispatch> {
+    pub fn dispatch(&mut self) -> Option<&Dispatch> {
+        self.sync();
         self.topo.dispatch.as_ref()
     }
 
@@ -1067,14 +1178,36 @@ impl TopologyGuard<'_> {
         self.topo.root.iter().map(|(id, m)| (*id, m))
     }
 
-    /// Map `region` at `base` with priority 0. **Retopology.**
+    /// Map `region` at `base` with priority 0 and no restriction on what it
+    /// permits. **Retopology.**
     ///
     /// # Errors
     ///
-    /// If the region does not fit in the space, or the tree cannot be
-    /// flattened.
+    /// If the region does not fit in the space, or nests too deeply to
+    /// flatten.
     pub fn map(&mut self, region: impl Into<RegionRef>, base: u64) -> Result<MappingId, Error> {
         self.map_with(Mapping::new(region, base))
+    }
+
+    /// Map `region` at `base` on the terms `perms` allows. **Retopology.**
+    ///
+    /// A read-only mapping over writable memory, a write-only aperture over a
+    /// ROM: the store is untouched and only this placement is narrowed. A
+    /// write to a mapping without [`Perms::WRITE`] raises
+    /// [`BusError::Protected`], which a consumer can tell apart from a bad
+    /// width and act on — break a copy-on-write share, widen the permission —
+    /// and then reissue. See [`Perms`].
+    ///
+    /// # Errors
+    ///
+    /// As [`TopologyGuard::map`].
+    pub fn map_with_perms(
+        &mut self,
+        region: impl Into<RegionRef>,
+        base: u64,
+        perms: Perms,
+    ) -> Result<MappingId, Error> {
+        self.map_with(Mapping::new(region, base).with_perms(perms))
     }
 
     /// Map `region` at `base` with an explicit priority, higher winning where
@@ -1101,20 +1234,12 @@ impl TopologyGuard<'_> {
     ///
     /// As [`TopologyGuard::map`].
     pub fn map_with(&mut self, mapping: Mapping) -> Result<MappingId, Error> {
-        self.space.check_fits(&mapping)?;
+        self.space.check_mapping(&mapping)?;
         let id = MappingId(self.topo.next_id);
         self.topo.next_id += 1;
         self.topo.root.push((id, mapping));
-        match self.rebuild() {
-            Ok(()) => Ok(id),
-            Err(e) => {
-                self.topo.root.pop();
-                // Leave the space in the state the caller had before the
-                // failed map, rather than half-changed.
-                let _ = self.rebuild();
-                Err(e)
-            }
-        }
+        self.topo.dirty = true;
+        Ok(id)
     }
 
     /// Remove a mapping. **Retopology.**
@@ -1127,7 +1252,8 @@ impl TopologyGuard<'_> {
             return Err(self.no_such_mapping(id));
         };
         self.topo.root.remove(pos);
-        self.rebuild()
+        self.topo.dirty = true;
+        Ok(())
     }
 
     /// Move a mapping to a new base address. **Retopology.**
@@ -1149,33 +1275,109 @@ impl TopologyGuard<'_> {
         let old = self.topo.root[pos].1.base;
         self.topo.root[pos].1.base = base;
         let mapping = self.topo.root[pos].1.clone();
-        if let Err(e) = self.space.check_fits(&mapping) {
+        if let Err(e) = self.space.check_mapping(&mapping) {
             self.topo.root[pos].1.base = old;
             return Err(e);
         }
-        self.rebuild()
+        self.topo.dirty = true;
+        Ok(())
+    }
+
+    /// Change the terms a mapping answers on, leaving everything else alone.
+    /// **Retopology.**
+    ///
+    /// This is `mprotect(2)`'s shape, and it is a retopology rather than a
+    /// rebase on purpose: a permission change has to invalidate every TLB
+    /// entry and translation block that recorded the old terms, and the
+    /// generation counter is how that is announced (`ROADMAP.md` §4.1). It is
+    /// cheap in the sense that matters — one flatten for a whole batch under
+    /// one guard — not in the sense that nothing is invalidated.
+    ///
+    /// # Errors
+    ///
+    /// If `id` is not a mapping of this space.
+    pub fn reprotect(&mut self, id: MappingId, perms: Perms) -> Result<(), Error> {
+        let Some(pos) = self.topo.root.iter().position(|(i, _)| *i == id) else {
+            return Err(self.no_such_mapping(id));
+        };
+        self.topo.root[pos].1.perms = perms;
+        self.topo.dirty = true;
+        Ok(())
+    }
+
+    /// Swap what a mapping places, keeping its identity and its position in
+    /// the overlap order. **Retopology.**
+    ///
+    /// The operation a copy-on-write fault resolves itself with: the same
+    /// address, the same priority, a private store behind it and
+    /// [`Perms::WRITE`] restored. Doing it as `unmap` + `map` would work but
+    /// would move the mapping to the back of the tie-breaking order, which is
+    /// a guest-visible change nobody asked for.
+    ///
+    /// # Errors
+    ///
+    /// If `id` is not a mapping of this space, or the new mapping does not fit
+    /// or nests too deeply.
+    pub fn replace(&mut self, id: MappingId, mapping: Mapping) -> Result<(), Error> {
+        let Some(pos) = self.topo.root.iter().position(|(i, _)| *i == id) else {
+            return Err(self.no_such_mapping(id));
+        };
+        self.space.check_mapping(&mapping)?;
+        self.topo.root[pos].1 = mapping;
+        self.topo.dirty = true;
+        Ok(())
+    }
+
+    /// The permissions a mapping currently answers on.
+    #[must_use]
+    pub fn perms_of(&self, id: MappingId) -> Option<Perms> {
+        self.topo
+            .root
+            .iter()
+            .find(|(i, _)| *i == id)
+            .map(|(_, m)| m.perms)
     }
 
     /// Reflatten and rebuild the dispatch table, bumping the generation.
     /// **Retopology.**
     ///
-    /// Called for you by every topology change; public because a container's
-    /// contents can be rebuilt out from under a space and a machine may need
-    /// to say so.
+    /// Every mutation on this guard defers to here, and the guard performs it
+    /// when it closes, so a caller almost never needs this. It stays public
+    /// because a container's contents can be rebuilt out from under a space
+    /// and a machine may need to say so.
+    pub fn rebuild(&mut self) {
+        self.topo.dirty = true;
+        self.sync();
+    }
+
+    /// Perform the deferred flatten, if there is one.
     ///
-    /// # Errors
-    ///
-    /// If the region tree cannot be flattened.
-    pub fn rebuild(&mut self) -> Result<(), Error> {
+    /// Infallible, and that is a property of [`map_with`](TopologyGuard::map_with)
+    /// rather than of this function: nesting depth is the only way flattening
+    /// can fail and a mapping too deep to flatten is rejected when it is added.
+    /// If that invariant were ever broken the space would be left answering
+    /// nothing — loudly wrong rather than quietly stale, which is the only
+    /// defensible choice this far from the caller.
+    fn sync(&mut self) {
+        if !self.topo.dirty {
+            return;
+        }
+        self.topo.dirty = false;
         let children: Vec<Mapping> = self.topo.root.iter().map(|(_, m)| m.clone()).collect();
-        let (flat, index) = FlatView::build(&children, self.space.size(), self.space.combine)?;
+        let (flat, index) = match FlatView::build(&children, self.space.size(), self.space.combine)
+        {
+            Ok(built) => built,
+            Err(_) => {
+                debug_assert!(false, "`map` accepted a mapping that cannot be flattened");
+                (FlatView::default(), RebaseIndex::new())
+            }
+        };
         self.topo.dispatch = Dispatch::build(&flat, self.space.dispatch_policy);
         self.topo.flat = flat;
         self.topo.rebase_index = index;
         // The write guard excludes every reader, so this cannot race;
         // `fetch_add` for the ordering, not for the atomicity.
         self.space.generation.fetch_add(1, Ordering::Relaxed);
-        Ok(())
     }
 
     fn no_such_mapping(&self, id: MappingId) -> Error {

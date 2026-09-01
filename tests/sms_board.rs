@@ -205,9 +205,10 @@ fn both_regions_realize_with_the_core_bound_to_both_of_their_spaces() {
 
 #[test]
 fn a_program_reaches_every_chip_through_two_address_spaces_and_banks_its_own_rom() {
-    // One machine, several claims. They share a build because realizing this
-    // board is not cheap — the port map is 1280 mappings and `TopologyGuard`
-    // reflattens on each one — and every claim below is about the same run.
+    // One machine, several claims, sharing one build because every claim below
+    // is about the same run. (Realizing this board used to be the expensive
+    // part: the port map is 1280 mappings and `TopologyGuard` reflattened on
+    // each one. It flattens once per guard now.)
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut m = boot("sms-ntsc");
     let vdp = capture::take_vdp().expect("the machine has a VDP");

@@ -11,7 +11,7 @@
 //! Cycles are impossible by construction: an alias names an already-built
 //! `Arc<Region>`, and there is no way to mutate a node's children afterwards.
 
-use super::attrs::{AccessConstraints, MemOps};
+use super::attrs::{AccessConstraints, MemOps, Perms};
 use super::store::{RamStore, RomStore};
 use crate::core::error::Error;
 use crate::core::value::Endian;
@@ -161,16 +161,21 @@ pub struct Mapping {
     pub base: u64,
     /// Higher wins where children overlap. Ties break by mapping order.
     pub priority: i32,
+    /// What this placement permits — the *terms* on which the region answers
+    /// here, which is not a property of the region. [`Perms::RWX`] unless
+    /// somebody says otherwise.
+    pub perms: Perms,
 }
 
 impl Mapping {
-    /// Place `region` at `base` with priority 0.
+    /// Place `region` at `base` with priority 0 and no restriction.
     #[must_use]
     pub fn new(region: impl Into<RegionRef>, base: u64) -> Self {
         Mapping {
             region: region.into(),
             base,
             priority: 0,
+            perms: Perms::RWX,
         }
     }
 
@@ -178,6 +183,24 @@ impl Mapping {
     #[must_use]
     pub fn with_priority(mut self, priority: i32) -> Self {
         self.priority = priority;
+        self
+    }
+
+    /// Same mapping on narrower terms.
+    ///
+    /// This is the whole of the permission mechanism from a caller's side. A
+    /// read-only view of writable memory is `Mapping::new(region, base)
+    /// .with_perms(Perms::RX)`; the store is untouched and can still be
+    /// read-write somewhere else, which is what makes copy-on-write a mapping
+    /// change rather than a store change.
+    ///
+    /// Where two mappings overlap and neither permits what the other does, the
+    /// flattener resolves **reads and writes separately** — so "read this
+    /// store, write that one" is two overlapping mappings, not a special
+    /// region kind. See [`AddressSpace`](super::AddressSpace)'s module docs.
+    #[must_use]
+    pub fn with_perms(mut self, perms: Perms) -> Self {
+        self.perms = perms;
         self
     }
 
@@ -245,6 +268,16 @@ pub struct Region {
     len: u64,
     constraints: AccessConstraints,
     kind: RegionKind,
+    /// How deep the tree under this node goes, counting this node as 1 and
+    /// saturating.
+    ///
+    /// Computed once at construction rather than walked at flatten time, and
+    /// the reason is not speed: [`TopologyGuard`](super::TopologyGuard) defers
+    /// its flatten to the end of a batch, so the flatten happens where an
+    /// error can no longer be returned to the caller who caused it. Depth is
+    /// the only way flattening can fail, so it is checked when the mapping is
+    /// *added* — which needs it to be O(1) there, not O(tree).
+    depth: u32,
 }
 
 /// An aperture whose reads and writes reach different devices.
@@ -340,6 +373,7 @@ impl Region {
             name,
             len,
             constraints,
+            depth: 1,
             kind: RegionKind::Io(Arc::new(Split {
                 reads: read_ops,
                 writes: write_ops,
@@ -356,6 +390,7 @@ impl Region {
             name: name.into(),
             len,
             constraints: AccessConstraints::ANY,
+            depth: 1,
             kind: RegionKind::Ram(store),
         }
     }
@@ -368,6 +403,7 @@ impl Region {
             name: name.into(),
             len,
             constraints: AccessConstraints::ANY,
+            depth: 1,
             kind: RegionKind::Rom { store, on_write },
         }
     }
@@ -384,6 +420,7 @@ impl Region {
             name: name.into(),
             len,
             constraints,
+            depth: 1,
             kind: RegionKind::Io(ops),
         }
     }
@@ -419,10 +456,12 @@ impl Region {
         }
         let rebasable = target.resolves_to_leaf();
         let constraints = target.constraints;
+        let depth = target.depth.saturating_add(1);
         Ok(Region {
             name,
             len,
             constraints,
+            depth,
             kind: RegionKind::Alias(Alias {
                 target,
                 offset: Arc::new(AtomicU64::new(offset)),
@@ -468,10 +507,12 @@ impl Region {
             });
         }
         let constraints = target.constraints;
+        let depth = target.depth.saturating_add(1);
         Ok(Region {
             name,
             len,
             constraints,
+            depth,
             kind: RegionKind::Alias(Alias {
                 target,
                 offset: Arc::new(AtomicU64::new(0)),
@@ -497,10 +538,17 @@ impl Region {
         children: Vec<Mapping>,
         combine: CombinePolicy,
     ) -> Self {
+        let depth = children
+            .iter()
+            .map(|m| m.region.depth)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         Region {
             name: name.into(),
             len,
             constraints: AccessConstraints::ANY,
+            depth,
             kind: RegionKind::Container(Container { children, combine }),
         }
     }
@@ -557,6 +605,18 @@ impl Region {
     #[must_use]
     pub fn kind(&self) -> &RegionKind {
         &self.kind
+    }
+
+    /// How deep the tree rooted here goes, counting this node as 1.
+    ///
+    /// A leaf is 1; an alias is one more than its target; a container is one
+    /// more than its deepest child. Maintained at construction, so a caller
+    /// about to map this region can reject an over-deep tree in constant time
+    /// — see [`TopologyGuard::map`](super::TopologyGuard::map).
+    #[inline]
+    #[must_use]
+    pub fn depth(&self) -> u32 {
+        self.depth
     }
 
     /// What this region accepts.

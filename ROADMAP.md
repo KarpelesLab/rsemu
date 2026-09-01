@@ -557,6 +557,7 @@ them is a rewrite:
 | **Access-width constraints** | A 32-bit-only register must reject a byte write, not silently accept it. Region-level constraints are the coarse filter; a register block with per-register rules enforces its own, so `AccessConstraints` is a *fast reject*, not the whole guarantee |
 | **Per-region endianness** | Big-endian device on a little-endian bus is normal, not exotic |
 | **Fallible access** | Unmapped read returns a bus fault the CPU can turn into an exception, not `0xFF` guesswork. Per-space "unassigned" policy: fault / read-as-ones / read-as-zeros / log. `MemResult` is `Ok` / `Fault` / `Retry`, where **`Retry` is only legal before any side effect or partial transfer** — a retry that re-runs a half-completed multi-byte access is a correctness bug, so the dispatcher rejects it after first commit |
+| **Per-mapping permissions** | `Perms` on the *mapping*, not the region: the same store is read-write in one space and read-only in another. A refused access raises `BusError::Protected`, distinct from a bad width, so a consumer can resolve it and reissue — which is what makes copy-on-write, `mprotect` and "reads go to the ROM, writes go to the cartridge RAM" one mechanism rather than three. See the note below |
 | **Topology generation counter** | Every cache (TLBs, JIT translation blocks, direct pointers) invalidates on remap |
 | **Dirty-page tracking** | Framebuffer refresh, self-modifying-code detection, live snapshot |
 
@@ -636,6 +637,39 @@ refresh, self-modifying-code detection, watchpoints — and a bare host-pointer
 write sets no dirty bit and can carry no hook. Host signals are forbidden (wasm
 has none, §4.7), so a software check on the write path is the only mechanism
 available. Reads may still go straight through a host pointer. See §9.
+
+**Permissions, and where copy-on-write stops.** A mapping carries `Perms`, they
+intersect down the tree, and the flattener resolves **reads and writes
+separately** — so an address whose highest-priority reader and highest-priority
+writer are different mappings dispatches to both, which is what an incompletely
+decoded board with one chip on `/RD` and another on `/WR` actually does. The
+enforcement is one predictable branch on the leaf, measured at ≤1% of a frame,
+and it is the mechanism `usermode` builds guest-side `Prot` and a lazy `fork`
+out of.
+
+**A permission fault cannot resolve itself**, and that is structural rather than
+unfinished: the access holds the space's read guard, and resolving means a
+retopology, which is the inversion the ladder above forbids. So the fault leaves
+the space the way a page fault leaves a CPU, and the handler reissues.
+
+What that layer **cannot** do is per-page sharing. The unit it can replace is a
+mapping, so copy-on-write breaks a whole mapped range; breaking a page would
+mean a mapping per page, re-flattened and re-sorted on every fault — a page
+table wearing a region list's clothes. Per-page sharing therefore belongs with
+the **software TLB and the page table above this module**, alongside the
+guest-virtual / guest-physical newtypes, and not here. Until that layer exists,
+level 3's `fork` is lazy per range: right for a loader's map, where text and
+read-only data are the bulk and are never written, and no better than an eager
+copy for a guest that scribbles one byte into a huge anonymous range.
+
+**Batch the flatten, not the acquisition.** A retopology guard defers its
+flatten until it closes. Rebuilding per `map` made an incompletely decoded board
+quadratic to realize — the Master System's port map is 1280 mappings and took
+354 ms in release, 2.9 s in debug — and deferring makes it linear in the batch:
+2 ms and 7.6 ms. The sweep that resolves overlaps is likewise incremental rather
+than re-scanning every candidate per boundary. The consequence is that the only
+way flattening can fail — nesting depth — has to be rejected when the mapping is
+*added*, because by flatten time there is no caller left to tell.
 
 *Note on gones.* The `memory.Bus` in `../gones` OR-combines the results of every
 handler mapped at an address and logs a "bus conflict". That is the correct

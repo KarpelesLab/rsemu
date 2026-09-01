@@ -15,7 +15,7 @@
 //! the entry list, not its ordering, not the dispatch table, not the
 //! generation counter.
 
-use super::attrs::{AccessConstraints, MemAttrs, MemOps, MemResult};
+use super::attrs::{AccessConstraints, MemAttrs, MemOps, MemResult, Perms};
 use super::region::{AliasId, CombinePolicy, Mapping, RegionKind, RegionRef, RomWrite};
 use super::store::{RamStore, RomStore};
 use crate::core::error::{BusError, Error};
@@ -31,7 +31,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// Cycles are impossible by construction, so this only bounds absurd
 /// descriptions — and bounds the recursion, which matters on a small wasm
 /// stack.
-const MAX_DEPTH: u32 = 64;
+pub(super) const MAX_DEPTH: u32 = 64;
 
 /// Where a flat entry ultimately sends an access.
 #[derive(Debug, Clone)]
@@ -58,9 +58,21 @@ pub struct FlatLeaf {
     offset: AtomicU64,
     fixed: u64,
     terms: Vec<(AliasId, Arc<AtomicU64>)>,
-    /// Set for a repeating window: the offset wraps at this many bytes.
-    period: Option<u64>,
+    /// For a repeating window, the number of bytes the offset wraps at; 0 for
+    /// a window that does not repeat.
+    ///
+    /// A sentinel rather than an `Option<u64>`, which costs eight bytes of
+    /// padding here — enough, with `perms` beside it, to make a `FlatLeaf`
+    /// wider than it was and the whole flat view a cache line worse. A period
+    /// of zero is not a thing that exists: [`Region::mirror`] refuses to
+    /// repeat an empty region, which is what would produce one.
+    ///
+    /// [`Region::mirror`]: super::Region::mirror
+    period: u64,
     constraints: AccessConstraints,
+    /// The terms the mapping path imposed: every [`Mapping::perms`] the
+    /// flattening passed through, intersected.
+    perms: Perms,
 }
 
 impl FlatLeaf {
@@ -68,6 +80,13 @@ impl FlatLeaf {
     #[must_use]
     pub fn target(&self) -> &FlatTarget {
         &self.target
+    }
+
+    /// What the mapping path permits here.
+    #[inline]
+    #[must_use]
+    pub fn perms(&self) -> Perms {
+        self.perms
     }
 
     /// The offset into the backing store corresponding to the entry's start
@@ -95,7 +114,7 @@ impl FlatLeaf {
     #[inline]
     #[must_use]
     pub fn period(&self) -> Option<u64> {
-        self.period
+        (self.period != 0).then_some(self.period)
     }
 
     /// The offset in the backing store for a byte `rel` past the entry start.
@@ -103,9 +122,10 @@ impl FlatLeaf {
     #[must_use]
     pub fn offset_of(&self, rel: u64) -> u64 {
         let raw = self.offset().wrapping_add(rel);
-        match self.period {
-            Some(p) => raw % p,
-            None => raw,
+        if self.period == 0 {
+            raw
+        } else {
+            raw % self.period
         }
     }
 
@@ -114,9 +134,10 @@ impl FlatLeaf {
     #[inline]
     #[must_use]
     pub fn run_len(&self, rel: u64) -> u64 {
-        match self.period {
-            Some(p) => p - self.offset_of(rel) % p,
-            None => u64::MAX,
+        if self.period == 0 {
+            u64::MAX
+        } else {
+            self.period - self.offset_of(rel) % self.period
         }
     }
 
@@ -152,6 +173,13 @@ impl FlatLeaf {
         attrs: MemAttrs,
         width: Option<Width>,
     ) -> MemResult {
+        // One `and`-and-compare against a byte already in the leaf's own cache
+        // line, on a value that is `RWX` for every mapping that never mentioned
+        // permission. A branch, not an indirection — which is the budget
+        // `ROADMAP.md` §4.1's dispatch section allows.
+        if !self.perms.contains(Perms::READ) {
+            return Err(BusError::Protected);
+        }
         let off = self.offset_of(rel);
         self.check(off, dst.len() as u64, width, attrs)?;
         match &self.target {
@@ -164,6 +192,14 @@ impl FlatLeaf {
     /// Write to this leaf, `rel` bytes past the entry's start.
     #[inline]
     pub fn write(&self, rel: u64, src: &[u8], attrs: MemAttrs, width: Option<Width>) -> MemResult {
+        // Enforced for a debug access too. A refused write changes nothing at
+        // all, which is exactly what `MemAttrs::debug` asks for: a monitor must
+        // not be the thing that breaks a copy-on-write share or moves a
+        // mapping. A consumer that legitimately must write anyway reaches its
+        // own store, as `usermode`'s loader path does.
+        if !self.perms.contains(Perms::WRITE) {
+            return Err(BusError::Protected);
+        }
         let off = self.offset_of(rel);
         self.check(off, src.len() as u64, width, attrs)?;
         match &self.target {
@@ -201,7 +237,34 @@ pub enum EntryKind {
 pub struct FlatEntry {
     start: u64,
     len: u64,
+    /// What answers here — and, unless `write_to` says otherwise, in both
+    /// directions.
     kind: EntryKind,
+    /// Where a *write* goes, when that is not `kind`.
+    ///
+    /// Set when the highest-priority mapping covering this range that permits
+    /// reads is not the one that permits writes — an incompletely decoded
+    /// board with two chips on one aperture, one on `/RD` and one on `/WR`. A
+    /// Master System's slot 2 reads a ROM bank and writes the on-cartridge RAM
+    /// that `$FFFC` bit 3 switched in; the NES's `$4017` is the same shape one
+    /// layer down. It is not a region kind and not a second
+    /// [`Region::split`](super::Region::split): it falls out of per-mapping
+    /// permissions, because "reads go there, writes go here" is two
+    /// overlapping mappings, one without [`Perms::WRITE`] and one without
+    /// [`Perms::READ`].
+    ///
+    /// A field beside `kind` rather than a third [`EntryKind`] variant, and
+    /// that is a measurement rather than a preference. Every read consults
+    /// `kind` four times — the target, the run length, the byte order, whether
+    /// the data bus was driven — and a third arm on each of those cost 4% of a
+    /// whole emulated frame, on every machine, for a shape almost none of them
+    /// contains. Here the read path is exactly what it was and only the write
+    /// path tests an `Option`.
+    ///
+    /// Boxed for the same reason: `EntryKind` is stored inline in every entry,
+    /// and a second leaf's worth of padding in each would make the flat view a
+    /// cache line worse for nothing.
+    write_to: Option<alloc::boxed::Box<FlatLeaf>>,
     conflicts: AtomicU64,
 }
 
@@ -288,7 +351,8 @@ impl FlatEntry {
     #[inline]
     #[must_use]
     pub fn is_direct_ram(&self) -> bool {
-        matches!(&self.kind, EntryKind::Single(l) if matches!(l.target, FlatTarget::Ram(_)))
+        self.write_to.is_none()
+            && matches!(&self.kind, EntryKind::Single(l) if matches!(l.target, FlatTarget::Ram(_)))
     }
 
     /// How many bytes may be transferred in one call starting `rel` bytes
@@ -300,6 +364,15 @@ impl FlatEntry {
     #[inline]
     #[must_use]
     pub fn run_len(&self, rel: u64) -> u64 {
+        self.read_run_len(rel).min(self.write_run_len(rel))
+    }
+
+    /// [`run_len`](FlatEntry::run_len) for a read, which never consults the
+    /// write side. The read path's own bound, and kept separate from the
+    /// write's so that the common direction tests one thing.
+    #[inline]
+    #[must_use]
+    pub fn read_run_len(&self, rel: u64) -> u64 {
         let avail = self.len.saturating_sub(rel);
         let bound = match &self.kind {
             EntryKind::Single(l) => l.run_len(rel),
@@ -310,6 +383,24 @@ impl FlatEntry {
                 .unwrap_or(u64::MAX),
         };
         avail.min(bound)
+    }
+
+    /// [`run_len`](FlatEntry::run_len) for a write, which follows
+    /// [`FlatEntry::write_to`] when there is one.
+    #[inline]
+    #[must_use]
+    pub fn write_run_len(&self, rel: u64) -> u64 {
+        match &self.write_to {
+            Some(l) => self.len.saturating_sub(rel).min(l.run_len(rel)),
+            None => self.read_run_len(rel),
+        }
+    }
+
+    /// Where a write to this entry goes, when that is not where a read goes.
+    #[inline]
+    #[must_use]
+    pub fn write_to(&self) -> Option<&FlatLeaf> {
+        self.write_to.as_deref()
     }
 
     /// How many times a [`CombinePolicy::Conflict`] range saw more than one
@@ -375,6 +466,9 @@ impl FlatEntry {
     /// first error is reported once they all have. That is what a wired bus
     /// does, and stopping halfway would leave the members disagreeing.
     pub fn write(&self, rel: u64, src: &[u8], attrs: MemAttrs, width: Option<Width>) -> MemResult {
+        if let Some(l) = &self.write_to {
+            return l.write(rel, src, attrs, width);
+        }
         match &self.kind {
             EntryKind::Single(l) => l.write(rel, src, attrs, width),
             EntryKind::Combine { members, .. } => {
@@ -404,13 +498,55 @@ impl FlatEntry {
                 }
             }
         }
+        if let Some(l) = &self.write_to {
+            f(WRITE_SIDE, l);
+        }
     }
 
     fn leaf_at(&self, index: usize) -> Option<&FlatLeaf> {
+        if index == WRITE_SIDE {
+            return self.write_to.as_deref();
+        }
         match &self.kind {
             EntryKind::Single(l) if index == 0 => Some(l),
             EntryKind::Single(_) => None,
             EntryKind::Combine { members, .. } => members.get(index),
+        }
+    }
+}
+
+/// The member index [`FlatEntry::write_to`] is filed under in the rebase
+/// index. Not a member of `kind`, so it needs an index no member can have.
+const WRITE_SIDE: usize = u32::MAX as usize;
+
+impl FlatEntry {
+    /// Turn a resolved piece into the entry the dispatcher uses.
+    fn from_piece(p: Piece) -> FlatEntry {
+        let mut leaves = p.leaves.into_iter();
+        let (kind, write_to) = match (p.directed, leaves.len()) {
+            (true, 2) => {
+                let read = leaves.next().expect("len 2").into_leaf();
+                let write = leaves.next().expect("len 2").into_leaf();
+                (EntryKind::Single(read), Some(alloc::boxed::Box::new(write)))
+            }
+            (_, 1) => (
+                EntryKind::Single(leaves.next().expect("len 1").into_leaf()),
+                None,
+            ),
+            _ => (
+                EntryKind::Combine {
+                    policy: p.combine,
+                    members: leaves.map(LeafSpec::into_leaf).collect(),
+                },
+                None,
+            ),
+        };
+        FlatEntry {
+            start: p.start,
+            len: p.len,
+            kind,
+            write_to,
+            conflicts: AtomicU64::new(0),
         }
     }
 }
@@ -440,23 +576,20 @@ impl FlatView {
         combine: CombinePolicy,
     ) -> Result<(FlatView, RebaseIndex), Error> {
         let mut pieces = Vec::new();
-        resolve_children(children, limit, 0, limit, combine, 0, &mut pieces)?;
+        resolve_children(
+            children,
+            limit,
+            0,
+            limit,
+            combine,
+            Descent {
+                depth: 0,
+                perms: Perms::RWX,
+            },
+            &mut pieces,
+        )?;
 
-        let entries: Vec<FlatEntry> = pieces
-            .into_iter()
-            .map(|p| FlatEntry {
-                start: p.start,
-                len: p.len,
-                kind: match p.leaves.len() {
-                    1 => EntryKind::Single(p.leaves.into_iter().next().expect("len 1").into_leaf()),
-                    _ => EntryKind::Combine {
-                        policy: p.combine,
-                        members: p.leaves.into_iter().map(LeafSpec::into_leaf).collect(),
-                    },
-                },
-                conflicts: AtomicU64::new(0),
-            })
-            .collect();
+        let entries: Vec<FlatEntry> = pieces.into_iter().map(FlatEntry::from_piece).collect();
 
         let mut index: RebaseIndex = BTreeMap::new();
         for (e, entry) in entries.iter().enumerate() {
@@ -545,8 +678,9 @@ struct LeafSpec {
     target: FlatTarget,
     fixed: u64,
     terms: Vec<(AliasId, Arc<AtomicU64>)>,
-    period: Option<u64>,
+    period: u64,
     constraints: AccessConstraints,
+    perms: Perms,
 }
 
 impl LeafSpec {
@@ -567,6 +701,7 @@ impl LeafSpec {
             terms: self.terms,
             period: self.period,
             constraints: self.constraints,
+            perms: self.perms,
         }
     }
 
@@ -575,7 +710,7 @@ impl LeafSpec {
     fn continues(&self, next: &LeafSpec, len: u64) -> bool {
         // A repeating window is already one piece; never fuse one with
         // anything, because "the offsets continue" is not true across a wrap.
-        if self.period.is_some() || next.period.is_some() {
+        if self.period != 0 || next.period != 0 {
             return false;
         }
         let same_target = match (&self.target, &next.target) {
@@ -595,6 +730,7 @@ impl LeafSpec {
         };
         same_target
             && self.constraints == next.constraints
+            && self.perms == next.perms
             && self.terms.len() == next.terms.len()
             && self
                 .terms
@@ -613,6 +749,9 @@ struct Piece {
     len: u64,
     leaves: Vec<LeafSpec>,
     combine: CombinePolicy,
+    /// Set when `leaves` is `[read winner, write winner]` rather than a
+    /// combining group — the [`EntryKind::Directed`] shape.
+    directed: bool,
 }
 
 /// A candidate placement inside a container, before overlaps are resolved.
@@ -627,6 +766,40 @@ struct Cand {
     seq: usize,
     leaves: Vec<LeafSpec>,
     combine: CombinePolicy,
+    directed: bool,
+}
+
+impl Cand {
+    /// One past the last address this candidate covers, saturating.
+    fn end(&self) -> u64 {
+        self.start.saturating_add(self.len)
+    }
+
+    /// Whether anything under this candidate answers `want`.
+    fn answers(&self, want: Perms) -> bool {
+        self.leaves.iter().any(|l| l.perms.contains(want))
+    }
+}
+
+/// What a flatten carries down the tree, as opposed to across it.
+///
+/// Two things travel with the recursion rather than with the range being
+/// resolved: how deep it is, and what the mappings above have narrowed the
+/// terms to. One struct because they always travel together.
+#[derive(Debug, Clone, Copy)]
+struct Descent {
+    depth: u32,
+    perms: Perms,
+}
+
+impl Descent {
+    /// One level further in, through a mapping permitting `perms`.
+    fn into_child(self, perms: Perms) -> Descent {
+        Descent {
+            depth: self.depth + 1,
+            perms: self.perms.intersect(perms),
+        }
+    }
 }
 
 /// The backing store of a leaf region, or `None` if it is a tree.
@@ -646,10 +819,11 @@ fn resolve_region(
     region: &RegionRef,
     off: u64,
     len: u64,
-    depth: u32,
+    d: Descent,
     out: &mut Vec<Piece>,
 ) -> Result<(), Error> {
-    if depth > MAX_DEPTH {
+    let perms = d.perms;
+    if d.depth > MAX_DEPTH {
         return Err(Error::Config {
             at: region.name().to_string(),
             message: "region tree nests too deeply".to_string(),
@@ -671,10 +845,12 @@ fn resolve_region(
                 target: FlatTarget::Ram(store.clone()),
                 fixed: off,
                 terms: Vec::new(),
-                period: None,
+                period: 0,
                 constraints,
+                perms,
             }],
             combine: CombinePolicy::Priority,
+            directed: false,
         }),
         RegionKind::Rom { store, on_write } => out.push(Piece {
             start: 0,
@@ -686,10 +862,12 @@ fn resolve_region(
                 },
                 fixed: off,
                 terms: Vec::new(),
-                period: None,
+                period: 0,
                 constraints,
+                perms,
             }],
             combine: CombinePolicy::Priority,
+            directed: false,
         }),
         RegionKind::Io(ops) => out.push(Piece {
             start: 0,
@@ -698,10 +876,12 @@ fn resolve_region(
                 target: FlatTarget::Io(ops.clone()),
                 fixed: off,
                 terms: Vec::new(),
-                period: None,
+                period: 0,
                 constraints,
+                perms,
             }],
             combine: CombinePolicy::Priority,
+            directed: false,
         }),
         RegionKind::Alias(alias) if alias.repeats() => {
             // A repeating window is one entry with a modulus, not `len/period`
@@ -718,10 +898,12 @@ fn resolve_region(
                     target,
                     fixed: off % period,
                     terms: Vec::new(),
-                    period: Some(period),
+                    period,
                     constraints,
+                    perms,
                 }],
                 combine: CombinePolicy::Priority,
+                directed: false,
             });
         }
         RegionKind::Alias(alias) => {
@@ -731,7 +913,7 @@ fn resolve_region(
                 alias.target(),
                 cur.wrapping_add(off),
                 len,
-                depth + 1,
+                d.into_child(Perms::RWX),
                 &mut sub,
             )?;
             if constraints != alias.target().constraints() {
@@ -765,7 +947,7 @@ fn resolve_region(
                 off,
                 len,
                 container.combine(),
-                depth,
+                d,
                 out,
             )?;
         }
@@ -779,7 +961,7 @@ fn resolve_children(
     off: u64,
     len: u64,
     combine: CombinePolicy,
-    depth: u32,
+    d: Descent,
     out: &mut Vec<Piece>,
 ) -> Result<(), Error> {
     let want_end = off.saturating_add(len);
@@ -793,7 +975,16 @@ fn resolve_children(
             continue;
         }
         let mut sub = Vec::new();
-        resolve_region(&m.region, a - child_start, b - a, depth + 1, &mut sub)?;
+        // Intersecting rather than replacing: a permission is a *narrowing*
+        // made by the decode in front of a region, and a child cannot widen
+        // what its container already refused.
+        resolve_region(
+            &m.region,
+            a - child_start,
+            b - a,
+            d.into_child(m.perms),
+            &mut sub,
+        )?;
         for p in sub {
             cands.push(Cand {
                 start: a - off + p.start,
@@ -802,6 +993,7 @@ fn resolve_children(
                 seq,
                 leaves: p.leaves,
                 combine: p.combine,
+                directed: p.directed,
             });
         }
     }
@@ -811,6 +1003,14 @@ fn resolve_children(
 
 /// Sweep-line: cut the candidate set at every boundary, decide each elementary
 /// interval, then merge the cuts that did not actually change anything.
+///
+/// The active set is carried across intervals rather than recomputed from the
+/// whole candidate list at each one. That is the difference between
+/// `O(cands × bounds)` and `O(cands log cands + Σ|active|)`, and it is not
+/// academic: an incompletely decoded port map spells its missing decode out as
+/// a mapping per page, so a Master System arrives here with 1280 candidates and
+/// 2560 boundaries. The old form did four million interval tests to flatten a
+/// board with five chips on it.
 fn resolve_overlaps(cands: Vec<Cand>, combine: CombinePolicy, out: &mut Vec<Piece>) {
     if cands.is_empty() {
         return;
@@ -818,56 +1018,103 @@ fn resolve_overlaps(cands: Vec<Cand>, combine: CombinePolicy, out: &mut Vec<Piec
     let mut bounds: Vec<u64> = Vec::with_capacity(cands.len() * 2);
     for c in &cands {
         bounds.push(c.start);
-        bounds.push(c.start.saturating_add(c.len));
+        bounds.push(c.end());
     }
     bounds.sort_unstable();
     bounds.dedup();
 
+    // Candidate indices in start order, so the sweep can admit them in one
+    // pass; ties keep mapping order, which the priority sort relies on.
+    let mut arrivals: Vec<usize> = (0..cands.len()).collect();
+    arrivals.sort_by_key(|&i| cands[i].start);
+    let mut arrived = 0usize;
+
+    // Kept ordered highest priority first, a later mapping winning a tie —
+    // the rule a machine file can reason about — so the winners are a scan
+    // from the front rather than a sort per interval.
+    let mut active: Vec<usize> = Vec::new();
+
     let mut pieces: Vec<Piece> = Vec::new();
     for w in bounds.windows(2) {
         let (a, b) = (w[0], w[1]);
-        let mut covering: Vec<&Cand> = cands
-            .iter()
-            .filter(|c| c.start <= a && c.start.saturating_add(c.len) >= b)
-            .collect();
-        if covering.is_empty() {
+        while arrived < arrivals.len() && cands[arrivals[arrived]].start <= a {
+            let i = arrivals[arrived];
+            arrived += 1;
+            let rank = |j: usize| {
+                use core::cmp::Reverse;
+                (
+                    Reverse(cands[j].priority),
+                    Reverse(cands[j].seq),
+                    Reverse(j),
+                )
+            };
+            let at = active.partition_point(|&j| rank(j) < rank(i));
+            active.insert(at, i);
+        }
+        // A candidate whose end is behind this interval can never cover a
+        // later one either, because `b` only grows.
+        active.retain(|&i| cands[i].end() >= b);
+        if active.is_empty() {
             continue;
         }
-        // Highest priority first; a later mapping wins a tie, which is the
-        // rule a machine file can reason about.
-        covering.sort_by(|x, y| y.priority.cmp(&x.priority).then_with(|| y.seq.cmp(&x.seq)));
-        let take = if matches!(combine, CombinePolicy::Priority) {
-            1
-        } else {
-            covering.len()
-        };
-        let leaves: Vec<LeafSpec> = covering[..take]
-            .iter()
-            .flat_map(|c| {
-                c.leaves.iter().map(move |leaf| {
-                    let mut leaf = leaf.clone();
-                    leaf.fixed = leaf.fixed.wrapping_add(a - c.start);
-                    leaf
-                })
+
+        // Reads and writes are resolved *separately*: the highest-priority
+        // mapping that permits reads need not be the one that permits writes.
+        // With every mapping `Perms::RWX` — every machine that has never
+        // mentioned permission — both scans stop at the same candidate on the
+        // first element, and the outcome is exactly what it always was.
+        let winner = |want: Perms| active.iter().copied().find(|&i| cands[i].answers(want));
+        let (read_win, write_win) = (winner(Perms::READ), winner(Perms::WRITE));
+
+        let cut = |i: usize| {
+            let c = &cands[i];
+            c.leaves.iter().map(move |leaf| {
+                let mut leaf = leaf.clone();
+                leaf.fixed = leaf.fixed.wrapping_add(a - c.start);
+                leaf
             })
-            .collect();
-        // A nested combining container keeps its own policy when the parent
-        // ranks by priority; otherwise the parent's policy governs the group.
-        let policy = if matches!(combine, CombinePolicy::Priority) {
-            covering[0].combine
-        } else {
-            combine
         };
+
+        let combining = !matches!(combine, CombinePolicy::Priority);
+        let split = !combining
+            && match (read_win, write_win) {
+                (Some(r), Some(w)) => {
+                    // A directed split's two sides are single leaves. A nested
+                    // wired-or under one is not a board, and pretending to
+                    // support it would mean guessing which member answers.
+                    r != w && cands[r].leaves.len() == 1 && cands[w].leaves.len() == 1
+                }
+                _ => false,
+            };
+
+        let (leaves, policy, directed) = if combining {
+            let leaves: Vec<LeafSpec> = active.iter().copied().flat_map(cut).collect();
+            (leaves, combine, false)
+        } else if split {
+            let (r, w) = (read_win.expect("split"), write_win.expect("split"));
+            let mut leaves: Vec<LeafSpec> = cut(r).collect();
+            leaves.extend(cut(w));
+            (leaves, CombinePolicy::Priority, true)
+        } else {
+            // One winner serves both directions, or only one direction has a
+            // winner at all — in which case that leaf's own permissions refuse
+            // the other, which is the same answer by a shorter route.
+            let i = read_win.or(write_win).unwrap_or(active[0]);
+            (cut(i).collect(), cands[i].combine, cands[i].directed)
+        };
+
         let piece = Piece {
             start: a,
             len: b - a,
             leaves,
             combine: policy,
+            directed,
         };
         match pieces.last_mut() {
             Some(prev)
                 if prev.start.wrapping_add(prev.len) == piece.start
                     && prev.combine == piece.combine
+                    && prev.directed == piece.directed
                     && prev.leaves.len() == piece.leaves.len()
                     && prev
                         .leaves

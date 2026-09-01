@@ -14,6 +14,117 @@ use core::fmt;
 /// access.
 pub type MemResult<T = ()> = core::result::Result<T, BusError>;
 
+/// The terms on which a mapping answers: which directions of access it
+/// permits.
+///
+/// A bit set rather than an enumeration, because the three genuinely combine
+/// and every one of the eight combinations is something a real system asks
+/// for. The spelling is the one `/proc/*/maps` and `mprotect(2)` use, because
+/// level 3's `Prot` **is** this type ([`usermode::Prot`] is an alias): a
+/// process's page permissions and a board's decode are the same question asked
+/// twice, and answering it twice is how the two drift apart.
+///
+/// # Where it lives, and why not on the region
+///
+/// Permission is a property of the **mapping**, not of the region it places. A
+/// ROM chip is a ROM chip; whether *this* bus may write to it is a property of
+/// the decode in front of it. The same `Arc<RamStore>` can legitimately be
+/// read-write in one space and read-only in another, and that is exactly what
+/// makes copy-on-write expressible — see [`Mapping::with_perms`].
+///
+/// Permissions **intersect** down the region tree: a child of a read-only
+/// container is read-only however it was mapped, because the container's
+/// decode is in front of it.
+///
+/// [`Mapping::with_perms`]: super::Mapping::with_perms
+/// [`usermode::Prot`]: crate::usermode::Prot
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Perms(pub u8);
+
+impl Perms {
+    /// Nothing at all. Both directions raise [`BusError::Protected`].
+    pub const NONE: Perms = Perms(0);
+    /// The mapping may be read.
+    pub const READ: Perms = Perms(1);
+    /// The mapping may be written.
+    pub const WRITE: Perms = Perms(2);
+    /// Instructions may be fetched from the mapping.
+    ///
+    /// **Carried, not enforced.** Telling a fetch from a load is the master's
+    /// job and no rsemu core marks one yet, so nothing here can distinguish
+    /// them; enforcing it would put an unconditional branch on the read path
+    /// for a bit nothing sets. The bit exists so a consumer's `PROT_EXEC`
+    /// survives a round trip through a mapping and a snapshot, and so that the
+    /// day a core marks its fetches this becomes a one-line change rather than
+    /// a schema change.
+    pub const EXEC: Perms = Perms(4);
+    /// Readable and writable — ordinary memory.
+    pub const RW: Perms = Perms(3);
+    /// Readable and executable — a text segment.
+    pub const RX: Perms = Perms(5);
+    /// Everything, and the default: a mapping that says nothing about
+    /// permission permits everything, so a machine that has never heard of
+    /// this type behaves exactly as it did before it existed.
+    pub const RWX: Perms = Perms(7);
+
+    /// Whether every bit of `other` is set here.
+    #[inline]
+    #[must_use]
+    pub const fn contains(self, other: Perms) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// The union of two permission sets.
+    #[must_use]
+    pub const fn union(self, other: Perms) -> Perms {
+        Perms(self.0 | other.0)
+    }
+
+    /// The intersection — what survives passing through a narrower mapping in
+    /// front of this one.
+    #[inline]
+    #[must_use]
+    pub const fn intersect(self, other: Perms) -> Perms {
+        Perms(self.0 & other.0)
+    }
+
+    /// The same permissions, less `other`.
+    #[must_use]
+    pub const fn without(self, other: Perms) -> Perms {
+        Perms(self.0 & !other.0)
+    }
+
+    /// Whether this is [`Perms::NONE`].
+    #[must_use]
+    pub const fn is_none(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl Default for Perms {
+    /// [`Perms::RWX`] — see the constant for why the permissive value is the
+    /// default rather than the restrictive one.
+    fn default() -> Self {
+        Perms::RWX
+    }
+}
+
+impl fmt::Display for Perms {
+    /// The `rwx` form `/proc/*/maps` uses, so a consumer that prints one does
+    /// not have to reinvent the spelling.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let bit = |set: bool, c: char| if set { c } else { '-' };
+        write!(
+            f,
+            "{}{}{}",
+            bit(self.contains(Perms::READ), 'r'),
+            bit(self.contains(Perms::WRITE), 'w'),
+            bit(self.contains(Perms::EXEC), 'x'),
+        )
+    }
+}
+
 /// Identifies the bus master behind an access.
 ///
 /// Opaque to the core: a PCI requester ID, an AXI master ID, or a CPU index —

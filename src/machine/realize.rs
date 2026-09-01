@@ -106,7 +106,7 @@ use crate::core::props::{Media, Props, Value, ValueKind};
 use crate::core::registry::Registry;
 use crate::core::sched::{Scheduler, SchedulerConfig};
 use crate::core::space::{
-    AddressSpace, Mapping as SpaceMapping, Region, RegionRef, RequesterId, UnassignedPolicy,
+    AddressSpace, Mapping as SpaceMapping, Perms, Region, RegionRef, RequesterId, UnassignedPolicy,
 };
 use crate::core::state::MachineShape;
 use crate::core::sync::AtomicU64;
@@ -996,9 +996,16 @@ impl<'a> Realizer<'a> {
 
     fn map_regions(&mut self) -> Result<Vec<(String, AddressSpace)>> {
         let spaces = core::mem::take(&mut self.spaces);
+        // Built in statement order, then applied one space at a time. Two
+        // passes rather than one because a topology guard is where a batch of
+        // maps becomes a single flatten, and two guards at once is a lock-order
+        // violation — so consecutive statements naming different spaces would
+        // otherwise reopen a guard per statement. Order *within* a space is
+        // preserved, which is the only order the overlap tie-break reads.
+        let mut queued: Vec<(usize, SpaceMapping)> = Vec::new();
         for mapping in &self.machine.maps {
             let index = mapping.space.0 as usize;
-            let Some((name, space)) = spaces.get(index) else {
+            let Some((name, _)) = spaces.get(index) else {
                 return Err(config(
                     self.machine.name.clone(),
                     format!("mapping names address space {index}, which does not exist"),
@@ -1006,7 +1013,7 @@ impl<'a> Realizer<'a> {
             };
             let at = format!("map {} {:#x}", name, mapping.base);
             let region = self.window(&mapping.target, mapping.size, &at)?;
-            let (priority, endian) = mapping_attrs(mapping, &at)?;
+            let (priority, endian, perms) = mapping_attrs(mapping, &at)?;
             let region = match endian {
                 // Per-mapping byte order is a property of the *window*, not of
                 // the target — a 16-bit big-endian aperture onto a
@@ -1031,12 +1038,23 @@ impl<'a> Realizer<'a> {
             };
             self.shape
                 .add_region(name, region.name(), mapping.base, mapping.size);
-            // One guard per statement rather than one for the whole loop:
-            // consecutive `map` statements may name different spaces, and two
-            // topology guards at once is a lock-order violation.
-            space
-                .topology()
-                .map_with(SpaceMapping::new(region, mapping.base).with_priority(priority))?;
+            queued.push((
+                index,
+                SpaceMapping::new(region, mapping.base)
+                    .with_priority(priority)
+                    .with_perms(perms),
+            ));
+        }
+        for (index, (_, space)) in spaces.iter().enumerate() {
+            if !queued.iter().any(|(i, _)| *i == index) {
+                continue;
+            }
+            let mut topo = space.topology();
+            for (i, m) in &queued {
+                if *i == index {
+                    topo.map_with(m.clone())?;
+                }
+            }
         }
         Ok(spaces)
     }
@@ -1427,12 +1445,22 @@ fn parent_of(clock: &Clock, osc_roots: &[DomainId], assigned: &[Option<DomainId>
     }
 }
 
-/// `priority` and `endian` off a `map` statement's trailing block.
-fn mapping_attrs(mapping: &Mapping, at: &str) -> Result<(i32, Option<Endian>)> {
+/// `priority`, `endian` and `perms` off a `map` statement's trailing block.
+fn mapping_attrs(mapping: &Mapping, at: &str) -> Result<(i32, Option<Endian>, Perms)> {
     let mut r = mapping.props.reader();
     let priority: i32 = r
         .or("priority", 0i32)
         .map_err(|e| config(at.to_string(), e.to_string()))?;
+    // Written the way `/proc/*/maps` and `ls` write it, with `-` for a
+    // permission the decode withholds: `perms = "r-x"` is a mapping this bus
+    // may read and fetch from but not write.
+    let perms = match r
+        .optional_str("perms")
+        .map_err(|e| config(at.to_string(), e.to_string()))?
+    {
+        Some(text) => parse_perms(text, at)?,
+        None => Perms::RWX,
+    };
     let endian = match r
         .optional_str("endian")
         .map_err(|e| config(at.to_string(), e.to_string()))?
@@ -1452,12 +1480,40 @@ fn mapping_attrs(mapping: &Mapping, at: &str) -> Result<(i32, Option<Endian>)> {
         return Err(config(
             at.to_string(),
             format!(
-                "unknown mapping attribute {}; a mapping takes `priority` and `endian`",
+                "unknown mapping attribute {}; a mapping takes `priority`, `endian` and `perms`",
                 list(&unused)
             ),
         ));
     }
-    Ok((priority, endian))
+    Ok((priority, endian, perms))
+}
+
+/// `rwx`, with `-` for a permission this mapping withholds.
+fn parse_perms(text: &str, at: &str) -> Result<Perms> {
+    let mut perms = Perms::NONE;
+    let mut chars = text.chars();
+    for (want, present) in [(Perms::READ, 'r'), (Perms::WRITE, 'w'), (Perms::EXEC, 'x')] {
+        match chars.next() {
+            Some(c) if c == present => perms = perms.union(want),
+            Some('-') => {}
+            _ => {
+                return Err(config(
+                    at.to_string(),
+                    format!(
+                        "`{text}` is not a permission set; write three characters from `rwx`, \
+                         with `-` where the mapping withholds one — `r-x`, `rw-`, `---`"
+                    ),
+                ));
+            }
+        }
+    }
+    if chars.next().is_some() {
+        return Err(config(
+            at.to_string(),
+            format!("`{text}` is longer than the three characters `rwx` takes"),
+        ));
+    }
+    Ok(perms)
 }
 
 /// A machine-file frequency as a clock-forest one.
@@ -2757,6 +2813,59 @@ machine "m" {
                 .expect("mapped"),
             0x55
         );
+    }
+
+    #[test]
+    fn a_mapping_may_be_narrowed_to_one_direction() {
+        // The board decides what the bus may do to a chip, not the chip. Both
+        // stores here are ordinary RAM; the decode in front of them is what
+        // sends reads to one and writes to the other — a Master System's
+        // slot 2 with `$FFFC` bit 3 set, in three lines.
+        const M: &str = r#"
+machine "m" {
+  space s { width = 16 }
+  object rom "test.ram" { size = 0x100 }
+  object sram "test.ram" { size = 0x100 }
+  map s 0x8000 size 0x100 = rom  { perms = "r-x" }
+  map s 0x8000 size 0x100 = sram { perms = "-w-", priority = 1 }
+  map s 0x9000 size 0x100 = sram
+}
+"#;
+        let options = BuildOptions::new().with_bindings(bindings());
+        let machine = build("m.machine", M, &registry(), &options).expect("builds");
+        let space = machine.space("s").expect("s");
+
+        space
+            .write(0x8000, Width::U8, 0x5a, MemAttrs::DEFAULT)
+            .expect("the write half is permitted");
+        assert_eq!(
+            space
+                .read(0x9000, Width::U8, MemAttrs::DEFAULT)
+                .expect("mapped"),
+            0x5a,
+            "the write reached `sram`, which is also visible on its own"
+        );
+        assert_eq!(
+            space
+                .read(0x8000, Width::U8, MemAttrs::DEFAULT)
+                .expect("the read half is permitted"),
+            0x00,
+            "and the read still sees `rom`, which nothing wrote"
+        );
+    }
+
+    #[test]
+    fn an_unspellable_permission_set_is_diagnosed() {
+        const M: &str = r#"
+machine "m" {
+  space s { width = 16 }
+  object r "test.ram" { size = 0x100 }
+  map s 0x0000 size 0x100 = r { perms = "rwe" }
+}
+"#;
+        let options = BuildOptions::new().with_bindings(bindings());
+        let e = build("m.machine", M, &registry(), &options).expect_err("not a permission set");
+        assert!(e.to_string().contains("rwx"), "{e}");
     }
 
     #[test]
