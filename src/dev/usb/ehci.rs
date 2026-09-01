@@ -1878,7 +1878,7 @@ impl EhciController {
         let microframe = r.or_range("microframe", 7500u64, 1..=u64::from(u32::MAX))?;
         r.finish()?;
 
-        let bus = buses::open(&bus_name, ports as u8);
+        let bus = buses::attach(props, &bus_name, ports as u8)?;
         if bus.port_count() < ports as u8 {
             return Err(Error::Config {
                 at: String::from(CLASS_NAME),

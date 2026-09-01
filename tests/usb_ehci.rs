@@ -585,25 +585,27 @@ machine "usb-ehci-test" {
 }
 "#;
 
-/// Build the board with a bus name nothing else is using, and a mouse already
-/// plugged into it.
+/// Build the board with a mouse already plugged into its bus.
 ///
 /// The mouse is attached from here rather than declared in the machine file so
-/// that this test can hold it and move it. `bus::usb::buses` is a process-wide
-/// rendezvous table until `core::bus` exists, which is what makes that
-/// possible — and what makes a unique name per test necessary.
+/// that this test can hold it and move it. `bus::usb::buses` is the rendezvous
+/// that makes that possible until `core::bus` exists — a *build's* rendezvous,
+/// so the bus is opened in this build's host objects before the controller is
+/// constructed and the name need not be unique across the test binary.
 fn boot(bus_name: &str) -> (Machine, HidMouse) {
-    buses::close(bus_name);
-    let bus = buses::open(bus_name, 1);
-    let mouse = HidMouse::new_detached(0x1234, 0x5678);
-    bus.attach(0, mouse.device()).expect("an empty port");
-
     let mut options = catalog::build_options().expect("the catalog agrees with itself");
     options.realize.media.insert("firmware", firmware());
     options
         .resolve
         .params
         .push((String::from("usbbus"), String::from(bus_name)));
+
+    // One port, opened before the build: the first object to name a bus fixes
+    // its size, and the controller below asks for exactly one.
+    let bus = buses::open(&options.realize.hosts, bus_name, 1).expect("a bus of this build's");
+    let mouse = HidMouse::new_detached(0x1234, 0x5678);
+    bus.attach(0, mouse.device()).expect("an empty port");
+
     let registry = catalog::registry().expect("a registry");
     let machine =
         rsemu::machine::build("usb-ehci-test", BOARD, &registry, &options).expect("it realizes");
@@ -683,8 +685,6 @@ fn a_guest_enumerates_a_usb_device_and_the_descriptor_lands_in_its_own_ram() {
         0x5678,
         "idProduct"
     );
-
-    buses::close("usb-enumerate");
 }
 
 #[test]
@@ -713,8 +713,6 @@ fn a_mouse_report_reaches_guest_ram_through_the_periodic_schedule() {
     assert_eq!(report[0], 0b101, "buttons one and three");
     assert_eq!(report[1] as i8, 0x12, "relative X");
     assert_eq!(report[2] as i8, -0x22, "relative Y");
-
-    buses::close("usb-report");
 }
 
 #[test]
@@ -736,7 +734,6 @@ fn the_controller_is_where_the_machine_file_put_it() {
         .read(u64::from(EHCI) + 2, Width::U16, MemAttrs::DEBUG)
         .expect("mapped");
     assert_eq!(version, 0x0100, "HCIVERSION: EHCI 1.0");
-    buses::close("usb-placement");
 }
 
 #[test]
@@ -747,7 +744,10 @@ fn a_snapshot_taken_after_enumeration_restores_to_the_same_state() {
     let saved = machine.save().expect("it saves");
     let before = machine.state_hash().expect("a hash");
 
-    let (mut restored, _mouse2) = boot("usb-snapshot-b");
+    // The same bus name as the machine above, deliberately: two boards are
+    // alive at once here, and each opened its bus in its own build's host
+    // objects, so the second one's mouse is on the second one's bus.
+    let (mut restored, _mouse2) = boot("usb-snapshot");
     restored.load(&saved).expect("it loads");
     assert_eq!(
         restored.state_hash().expect("a hash"),
@@ -756,7 +756,4 @@ fn a_snapshot_taken_after_enumeration_restores_to_the_same_state() {
     );
     // The device descriptor came back with the RAM.
     assert_eq!(peek_bytes(&restored, DESC_BUF, 2), vec![18, 1]);
-
-    buses::close("usb-snapshot");
-    buses::close("usb-snapshot-b");
 }

@@ -399,7 +399,7 @@ impl HidMouse {
         // Opening the table entry creates nothing anybody can see; a bus named
         // by a device before its controller comes up with one port, and the
         // controller then finds it too small, which it reports.
-        let bus = buses::open(&bus_name, port as u8 + 1);
+        let bus = buses::attach(props, &bus_name, port as u8 + 1)?;
         let mouse = HidMouse::new_detached(vendor as u16, product as u16);
         bus.attach(port as u8, mouse.device())?;
         Ok(mouse)

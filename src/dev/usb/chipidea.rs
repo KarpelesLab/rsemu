@@ -298,7 +298,7 @@ impl ChipIdea {
         let id = r.or_range("id", u64::from(CX92755_ID), 0..=u64::from(u32::MAX))?;
         r.finish()?;
 
-        let bus = buses::open(&bus_name, ports as u8);
+        let bus = buses::attach(props, &bus_name, ports as u8)?;
         if bus.port_count() < ports as u8 {
             return Err(Error::Config {
                 at: String::from(CLASS_NAME),
