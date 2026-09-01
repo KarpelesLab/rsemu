@@ -1,7 +1,7 @@
 //! A USB HID boot-protocol mouse: the smallest honest proof that the stack
 //! works.
 //!
-//! # Why a mouse, and why high speed
+//! # Why a mouse, and why high speed by default
 //!
 //! A device that only enumerates proves the control pipe. A device that only
 //! moves bulk data proves the DMA walk. A HID mouse does both and is small: it
@@ -11,16 +11,24 @@
 //! millisecond out of the periodic schedule — which is the half of an EHCI that
 //! nothing else in this tree would exercise.
 //!
-//! It is a **high-speed** device, and that is a deliberate decision rather than
-//! a convenience. Real mice are low speed, and a low-speed device cannot be
-//! reached by an EHCI controller at all: it needs a transaction translator
-//! inside a hub, or a companion controller (EHCI 1.0 §4.2). rsemu has neither,
-//! and its EHCI does the honest thing with one — it hands the port to a
-//! companion and the device vanishes. So a low-speed mouse here would be a
-//! device that never enumerates, dressed up as a feature. USB 2.0 permits a
-//! high-speed HID device (§5.7 sets the interrupt endpoint's service interval
-//! in microframes for exactly that case), so this one is high speed and says so
-//! in its own descriptors.
+//! It is a **high-speed** device unless a board says otherwise, and that default
+//! is a deliberate decision rather than a convenience. Real mice are low speed,
+//! and a low-speed device cannot be reached by an EHCI controller at all: it
+//! needs a transaction translator inside a hub, or a companion controller
+//! (EHCI 1.0 §4.2). rsemu has neither, and its EHCI does the honest thing with
+//! one — it hands the port to a companion and the device vanishes. So a
+//! low-speed mouse behind an EHCI would be a device that never enumerates,
+//! dressed up as a feature. USB 2.0 permits a high-speed HID device (§5.7 sets
+//! the interrupt endpoint's service interval in microframes for exactly that
+//! case), so that is the default and the descriptors say so.
+//!
+//! The `speed` property exists because that argument is about EHCI, and there is
+//! now a controller it does not apply to: [`crate::dev::usb::dwc2`] is a
+//! full-speed core, so `speed = "full"` — or `"low"`, which is what a real boot
+//! mouse is — is a device that genuinely enumerates rather than one that
+//! vanishes. The descriptors follow the speed: `bMaxPacketSize0`, `bInterval` in
+//! frames rather than microframes, and no device qualifier for a device that has
+//! only one speed to be (§9.6.2).
 //!
 //! # Where the movement comes from
 //!
@@ -105,12 +113,19 @@ const ENDPOINT: u8 = 1;
 /// (HID 1.11 Appendix B.2).
 pub const REPORT_BYTES: usize = 3;
 
-/// `bInterval` for the interrupt endpoint.
+/// `bInterval` for the interrupt endpoint at high speed.
 ///
-/// At high speed the service interval is `2^(bInterval - 1)` microframes
+/// There the service interval is `2^(bInterval - 1)` microframes
 /// (USB 2.0 §9.6.6), so `4` is eight microframes, which is exactly one
 /// millisecond — the rate a boot mouse is polled at.
-const INTERVAL: u8 = 4;
+const INTERVAL_HIGH: u8 = 4;
+
+/// `bInterval` at full and low speed, where the field is a count of *frames*
+/// rather than an exponent (USB 2.0 §9.6.6) and a low-speed endpoint's smallest
+/// legal value is 10.
+///
+/// Ten milliseconds, which is what a real boot mouse asks for.
+const INTERVAL_FRAMES: u8 = 10;
 
 /// The report descriptor of HID 1.11 Appendix E.10: a three-button mouse with
 /// relative X and Y.
@@ -171,6 +186,9 @@ struct MouseState {
 /// The mouse's class-specific half.
 struct MouseFunction {
     descriptors: Descriptors,
+    /// How fast it signals. Fixed for its lifetime, because a device does not
+    /// change speed — it is a different device.
+    speed: Speed,
     state: Mutex<MouseState>,
 }
 
@@ -185,7 +203,7 @@ impl fmt::Debug for MouseFunction {
 }
 
 impl MouseFunction {
-    fn new(vendor: u16, product: u16) -> MouseFunction {
+    fn new(vendor: u16, product: u16, speed: Speed) -> MouseFunction {
         let device = DeviceDescriptor {
             usb: 0x0200,
             // Zero: the class is on the interface, which is what every
@@ -193,8 +211,9 @@ impl MouseFunction {
             class: 0,
             subclass: 0,
             protocol: 0,
-            // High speed requires exactly 64 (USB 2.0 §5.5.3).
-            max_packet0: 64,
+            // High speed requires exactly 64 and low speed allows only 8
+            // (USB 2.0 §5.5.3).
+            max_packet0: speed.max_control_packet() as u8,
             vendor,
             product,
             device: 0x0100,
@@ -217,7 +236,11 @@ impl MouseFunction {
             address: ENDPOINT | Direction::BIT,
             attributes: TransferType::Interrupt.attribute_bits(),
             max_packet: REPORT_BYTES as u16,
-            interval: INTERVAL,
+            interval: if speed == Speed::High {
+                INTERVAL_HIGH
+            } else {
+                INTERVAL_FRAMES
+            },
         };
 
         let mut body = Vec::new();
@@ -238,11 +261,16 @@ impl MouseFunction {
             &body,
         );
         // A high-speed device is required to have one (USB 2.0 §9.6.2): it is
-        // what it would look like at full speed, and a host asks for it.
-        descriptors.set_qualifier(&device, 0);
+        // what it would look like at full speed, and a host asks for it. A
+        // device with only one speed to be must *not* answer that request, so a
+        // full- or low-speed mouse has no qualifier here and stalls it.
+        if speed == Speed::High {
+            descriptors.set_qualifier(&device, 0);
+        }
 
         MouseFunction {
             descriptors,
+            speed,
             state: Mutex::with_rank(LockRank::DEVICE, MouseState::default()),
         }
     }
@@ -282,7 +310,7 @@ impl Function for MouseFunction {
     }
 
     fn speed(&self) -> Speed {
-        Speed::High
+        self.speed
     }
 
     fn reset(&self) {
@@ -382,6 +410,10 @@ impl HidMouse {
     /// * `port` — which port of it. Defaults to 0.
     /// * `vendor`, `product` — what the device descriptor reports. Default to
     ///   zero, which is what an unbranded device says.
+    /// * `speed` — `high` (the default), `full` or `low`. It changes the
+    ///   descriptors, and it decides which controllers can reach the device at
+    ///   all: an EHCI drives only a high-speed one, a dwc2 only a full- or
+    ///   low-speed one.
     ///
     /// # Errors
     ///
@@ -394,13 +426,18 @@ impl HidMouse {
         let port = r.or_range("port", 0u64, 0..=u64::from(u8::MAX))?;
         let vendor = r.or_range("vendor", 0u64, 0..=u64::from(u16::MAX))?;
         let product = r.or_range("product", 0u64, 0..=u64::from(u16::MAX))?;
+        let spelling = r.or_str("speed", Speed::High.name())?;
+        let speed = Speed::from_name(spelling).ok_or_else(|| crate::Error::Config {
+            at: alloc::string::String::from(CLASS_NAME),
+            message: alloc::format!("`speed` is one of {:?}, not `{spelling}`", Speed::NAMES),
+        })?;
         r.finish()?;
 
         // Opening the table entry creates nothing anybody can see; a bus named
         // by a device before its controller comes up with one port, and the
         // controller then finds it too small, which it reports.
         let bus = buses::attach(props, &bus_name, port as u8 + 1)?;
-        let mouse = HidMouse::new_detached(vendor as u16, product as u16);
+        let mouse = HidMouse::new_detached_at_speed(vendor as u16, product as u16, speed);
         bus.attach(port as u8, mouse.device())?;
         Ok(mouse)
     }
@@ -411,7 +448,17 @@ impl HidMouse {
     /// device itself with [`HidMouse::device`].
     #[must_use]
     pub fn new_detached(vendor: u16, product: u16) -> HidMouse {
-        let function = Arc::new(MouseFunction::new(vendor, product));
+        HidMouse::new_detached_at_speed(vendor, product, Speed::High)
+    }
+
+    /// The same, at a speed the caller chooses.
+    ///
+    /// Separate from [`HidMouse::new_detached`] rather than an argument to it
+    /// because high speed is the default a caller should have to think to leave;
+    /// the module docs say which controller can reach which speed.
+    #[must_use]
+    pub fn new_detached_at_speed(vendor: u16, product: u16, speed: Speed) -> HidMouse {
+        let function = Arc::new(MouseFunction::new(vendor, product, speed));
         let peripheral = Arc::new(Peripheral::new(Arc::clone(&function) as Arc<dyn Function>));
         HidMouse {
             peripheral,
@@ -519,8 +566,8 @@ impl Instance for HidMouse {}
 pub static MOUSE_CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
     version: STATE_VERSION,
-    summary: "a USB HID boot-protocol mouse: high speed, three buttons, relative X and Y on an \
-              interrupt endpoint polled once a millisecond",
+    summary: "a USB HID boot-protocol mouse: three buttons and relative X and Y on an interrupt \
+              endpoint, high speed by default and full or low if the board says so",
     properties: &[
         PropertySpec {
             name: "bus",
@@ -545,6 +592,12 @@ pub static MOUSE_CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Uint,
             required: false,
             summary: "idProduct (default 0)",
+        },
+        PropertySpec {
+            name: "speed",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "how fast it signals: `high` (default), `full` or `low`",
         },
     ],
     construct: |props| Ok(Box::new(HidMouse::new(props)?)),
@@ -577,6 +630,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("port", ValueKind::Uint).range(0, u64::from(u8::MAX)))
         .prop(PropSchema::new("vendor", ValueKind::Uint).range(0, u64::from(u16::MAX)))
         .prop(PropSchema::new("product", ValueKind::Uint).range(0, u64::from(u16::MAX)))
+        .prop(PropSchema::new("speed", ValueKind::Str).values(Speed::NAMES))
 }
 
 // A mouse that could not be built is a mouse nobody can debug, so the one
@@ -690,7 +744,7 @@ mod tests {
         assert_eq!(bytes[18 + 1], DESC_HID, "the HID descriptor follows");
         assert_eq!(bytes[27 + 2], ENDPOINT | 0x80, "bEndpointAddress");
         assert_eq!(bytes[27 + 3] & 0x3, 3, "an interrupt endpoint");
-        assert_eq!(bytes[27 + 6], INTERVAL, "bInterval");
+        assert_eq!(bytes[27 + 6], INTERVAL_HIGH, "bInterval");
     }
 
     #[test]

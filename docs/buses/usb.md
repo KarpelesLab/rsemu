@@ -101,11 +101,11 @@ half-modelled controller can look like a working boot. Detection succeeding is
 the first thing that will change its behaviour, and the first thing that can
 regress it.
 
-## USB, as built (`bus-usb`, `dev-usb-ehci`, `dev-usb-chipidea`, `dev-usb-hid`)
+## USB, as built (`bus-usb`, `dev-usb-ehci`, `dev-usb-chipidea`, `dev-usb-dwc2`, `dev-usb-hid`)
 
-Three layers, in the order they matter — and the order matters because the
-whole value of the arrangement is that the *next* controller reuses the first
-two.
+Four layers, in the order they matter — and the order matters because the whole
+value of the arrangement is that the *next* controller reuses the first one
+unchanged. That is no longer a hope: §4 is the controller that tested it.
 
 ### 1. The fabric (`src/bus/usb/`, `bus-usb`)
 
@@ -247,11 +247,135 @@ and `ENDPTSETUPSTAT`/`ENDPTPRIME`/`ENDPTFLUSH`/`ENDPTSTAT`/`ENDPTCOMPLETE`/
 this piece of work. The firmware's `libusb_printer` role therefore does not
 work, and would configure and then never see a transfer.
 
-### 4. A device (`src/dev/usb/hid.rs`, `dev-usb-hid`)
+### 4. A dwc2 (`src/dev/usb/dwc2.rs`, `dev-usb-dwc2`) — and what it proved
+
+STM32's **OTG_FS** block is a Synopsys DesignWare USB 2.0 OTG core, and it is
+not an EHCI in any respect. It was built here specifically to test the claim
+§1 makes — that the fabric is controller-agnostic because its seam is a
+*transaction* — against a controller shaped nothing like the one the fabric was
+written alongside.
+
+**The result: `src/bus/usb/` needed no change at all.** Not a signature, not a
+type, not a new method. The one thing the controller borrowed from the fabric
+beyond the transaction calls is `TransferType::from_attribute_bits`, which
+decodes `HCCHAR.EPTYP` because those two bits mean what they mean in an endpoint
+descriptor — the controller and the device agree on the encoding because neither
+of them owns it.
+
+How different the two controllers are is worth stating, because that is what
+makes the result mean something:
+
+| | EHCI | dwc2 (slave mode) |
+| --- | --- | --- |
+| Where the work is | linked lists in **guest RAM** | **registers**: `HCCHARn`, `HCTSIZn` |
+| How data moves | the controller DMA-reads and writes it | the **CPU** pushes and pops a FIFO, a word at a time |
+| Bus mastering | required; refused at bind without `space =` | **none**; the machine file gives it no space |
+| Completion | a bit in a qTD the controller wrote back | `HCINTn` → `HAINT` → `GINTSTS` |
+| Receiving | into the buffer the descriptor named | one shared FIFO, announced packet by packet through `GRXSTSP` |
+| Ports | up to fifteen, with a companion to hand one to | exactly one, `HPRT`, and nobody to hand it to |
+| Speed | high only | full and low only (with an FS PHY) |
+
+`tests/usb_dwc2.rs` is the end-to-end claim, and it is the same claim
+`tests/usb_ehci.rs` makes about the same fabric and the same device model: an
+RV32 program running on the emulated hart powers the port, resets it, programs
+host channels, pushes setup packets into a FIFO window and reads the replies
+back out of `GRXSTSP` — and **enumerates a mouse and collects a report from its
+interrupt endpoint**, with the device descriptor landing in the buffer the guest
+named.
+
+#### Host mode, deliberately
+
+Same decision as ChipIdea's and for the same reason. `GUSBCFG.FDMOD` is honoured
+to the extent that selecting it stops the host side, `GINTSTS.CMOD` reports the
+change, reaching for the other role's registers raises `GINTSTS.MMIS` as the
+silicon does, and the device block at `+0x800` reads zero. What device mode would
+need is a `UsbDevice` implementation over `DIEPCTLn`/`DOEPCTLn` fed by the same
+FIFO — and, on the far side, a host to talk to it. The fabric would carry that
+unchanged, because a device is the thing it was designed around; what does not
+exist is anything to enumerate the guest.
+
+#### Speed, and why the honest answer is not EHCI's
+
+An OTG_FS has an on-chip full-speed transceiver and no high-speed PHY, and
+`HCFG.FSLSS` is the register that says so. It therefore drives full- **and
+low-speed** devices, which an EHCI cannot do at all, and cannot drive a
+high-speed one, which an EHCI can.
+
+EHCI's refusal has a register for it — hand the port to a companion controller,
+EHCI 1.0 §4.2.2 — and rsemu's EHCI does that. A dwc2 root port has no companion,
+and there is no encoding for "that device signals faster than these pins". So the
+port simply **does not enable**: `HPRT.PENA` stays clear and a driver's reset
+times out, which is what happens on a bench. The `hid` mouse grew a `speed`
+property for this, because "high speed, deliberately" was an argument about EHCI
+and there is now a controller it does not apply to.
+
+#### Time, and the one simplification
+
+A frame is `HFIR.FRIVL` PHY clocks times the board's ticks-per-PHY-clock. At the
+48 MHz an OTG_FS runs at, a driver writes 48 000 and a frame is exactly 48 000
+ticks — integer, residue-free, the same property the EHCI's 7500-tick microframe
+has. `HFIR`'s reset value of `0xea60` is *not* a millisecond at that clock, and
+the model leaves it wrong until the driver fixes it, exactly as the silicon does.
+
+Transactions are executed at frame boundaries, up to a per-frame byte budget
+taken from the signalling rate (1500 bytes at full speed, 187 at low), each
+charged its packet plus the 13 bytes of protocol overhead USB 2.0 §5.11.3 gives a
+full-speed transaction. Throughput is therefore right; **latency is coarser than
+silicon** — a real full-speed transaction takes about 50 µs, so a channel armed
+just after a frame boundary waits longer here than it would on hardware. That is
+the one timing simplification, and it is written down rather than hidden.
+
+#### What is bounded, and why the fuzz target is different
+
+The EHCI's hazard is that it *reads guest memory*: a list can close a circle.
+This one reads no memory at all, so its hazards are the FIFOs the guest fills and
+the frame that drains them. Each channel's transmit staging and the shared
+receive FIFO are capped by the programmed FIFO sizes, themselves capped by the
+`fifo` property — the RAM the part actually has, 1.25 KiB on an OTG_FS — so no
+register write can make the device allocate. The frame is capped by the byte
+budget and by a hard transaction count, and `HFIR.FRIVL` is clamped so a frame
+interval a guest chose cannot make the host spin.
+`fuzz/fuzz_targets/usb_dwc2.rs` drives arbitrary bytes at both surfaces and
+asserts that a frame always ends.
+
+#### `GRXSTSP` is the `MemAttrs::debug` trap
+
+Reading it **pops the receive FIFO**, and reading a FIFO window consumes the
+packet. Both answer a debug read without moving anything — `GRXSTSP` returns what
+`GRXSTSR` would — and, as with the EHCI, a debug *write* is refused outright:
+`HCINTn` is write-1-to-clear, `GRSTCTL` resets the core, `HCCHAR.CHENA` starts a
+transaction and a FIFO write puts bytes on the wire.
+
+#### The interrupt
+
+`HCINTn` → `HAINT` → `GINTSTS`, gated by `HCINTMSKn`, `HAINTMSK`, `GINTMSK` and
+finally `GAHBCFG.GINTMSK`, collapses to **one level output pin, `irq`**,
+re-derived from the register file on `announce` rather than latched. The pin
+carries no number: which interrupt an OTG_FS is on is a fact about the part — 67
+on an STM32F407 — so a board writes `wire otgfs.irq -> cpu.irq67` and there is
+nothing in between, a Cortex-M's NVIC being inside the core.
+
+#### Generic, not STM32-specific
+
+The file is `dev/usb/dwc2.rs` and the class is `usb.dwc2`, not `stm32.otg`,
+because STM32 adds no registers to this core — unlike ChipIdea, which adds `ID`
+and `USBMODE`. What ST supplies is a *configuration*: eight host channels,
+1.25 KiB of FIFO RAM, a full-speed PHY, and a placement. All four are machine-file
+properties, so an OTG_FS is `usb.dwc2` with `channels = 8, fifo = 320,
+speed = "full"` mapped where the board maps it, and the same class serves the
+several other SoCs that instantiate this core. ST's `GCCFG` and `CID` sit in the
+core's vendor slots at `+0x38` and `+0x3c` and are modelled as what they are
+there: a configuration register nothing gates on, and a user ID a board supplies.
+
+### 5. A device (`src/dev/usb/hid.rs`, `dev-usb-hid`)
 
 A HID boot-protocol mouse: enumeration, a report descriptor, and three-byte
-reports on an interrupt IN endpoint. **High speed, deliberately** — see above
-for why a low-speed one would be a device that never enumerates. Movement enters
+reports on an interrupt IN endpoint. **High speed by default, deliberately** —
+see §2 for why a low-speed one behind an EHCI would be a device that never
+enumerates — and `speed = "full"` or `"low"` for the dwc2, which is the
+controller that argument does not apply to. The descriptors follow the speed:
+`bMaxPacketSize0`, `bInterval` in frames rather than microframes, and no device
+qualifier for a device with only one speed to be (USB 2.0 §9.6.2). Movement enters
 through `HidMouse::motion` and nowhere else, because a real pointer is a
 non-deterministic input and those belong to the record/replay seam, which does
 not exist yet.

@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-hid"]
+features         = ["std", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -80,6 +80,16 @@ bench = false
 [[bin]]
 name  = "usb_ehci"
 path  = "fuzz_targets/usb_ehci.rs"
+test  = false
+doc   = false
+bench = false
+
+# The same bus behind a controller with the opposite hazard: a dwc2 reads no
+# guest memory at all, so what has to be bounded is not a walk but the FIFOs the
+# guest fills a word at a time, and the frame that drains them.
+[[bin]]
+name  = "usb_dwc2"
+path  = "fuzz_targets/usb_dwc2.rs"
 test  = false
 doc   = false
 bench = false

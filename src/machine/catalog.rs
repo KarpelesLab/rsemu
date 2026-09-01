@@ -364,6 +364,7 @@ pub fn registry() -> Result<Registry> {
     #[cfg(any(
         feature = "dev-usb-ehci",
         feature = "dev-usb-chipidea",
+        feature = "dev-usb-dwc2",
         feature = "dev-usb-hid"
     ))]
     crate::dev::usb::register(&mut reg)?;
@@ -437,6 +438,7 @@ pub fn bindings() -> Result<Bindings> {
     #[cfg(any(
         feature = "dev-usb-ehci",
         feature = "dev-usb-chipidea",
+        feature = "dev-usb-dwc2",
         feature = "dev-usb-hid"
     ))]
     crate::dev::usb::bind(&mut b)?;
@@ -517,6 +519,7 @@ pub fn classes() -> ClassTable {
     #[cfg(any(
         feature = "dev-usb-ehci",
         feature = "dev-usb-chipidea",
+        feature = "dev-usb-dwc2",
         feature = "dev-usb-hid"
     ))]
     for schema in crate::dev::usb::schemas() {
