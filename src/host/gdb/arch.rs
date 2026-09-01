@@ -468,6 +468,13 @@ pub static RISCV: Arch = Arch {
 /// written to match it: the first sixty-four bytes of a saved core are the
 /// `g` packet's register block, so these offsets are the identity map rather
 /// than a translation that could drift.
+///
+/// Re-verified at chunk version 4, which widened the register file to
+/// sixty-four bits and added long mode. Nothing here moved: the prefix still
+/// holds each register's **low half** as a `u32` in the same order, and the
+/// full-width block was appended at the end of the chunk for exactly that
+/// reason. A 64-bit register view for gdb would be a new `Arch` with the
+/// `org.gnu.gdb.i386.core` feature replaced, not an edit to this one.
 #[cfg(feature = "cpu-x86")]
 static I8086_REGS: &[RegDesc] = &[
     RegDesc::int("eax", 4, 0),
@@ -507,7 +514,7 @@ static I8086_REGS: &[RegDesc] = &[
 #[cfg(feature = "cpu-x86")]
 pub static I8086: Arch = Arch {
     class: &crate::cpu::x86::CLASS,
-    verified_version: 3,
+    verified_version: 4,
     feature: "org.rsemu.i386",
     architecture: None,
     regs: I8086_REGS,

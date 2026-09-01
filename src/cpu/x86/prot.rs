@@ -24,7 +24,7 @@
 //!   which BIOSes use to copy above 1 MiB without leaving real mode.
 //!
 //! So [`SegReg`] is **saved and restored**, unlike the translation-lookaside
-//! buffer beside it in [`paging`](super::paging). CLAUDE.md's rule that derived state
+//! buffer beside it in [`paging`]. CLAUDE.md's rule that derived state
 //! is never serialized is about state that can be re-derived; this cannot be,
 //! and a snapshot that dropped it would silently break unreal mode across a
 //! save/load. The TLB, which *is* re-derivable from the page tables, is not
@@ -40,6 +40,7 @@
 //! `docs/cpu/x86.md` names the ones that are forbidden.
 
 use super::isa::seg;
+use super::paging;
 
 // ---------------------------------------------------------------------------
 // Selectors
@@ -165,6 +166,9 @@ pub mod ar {
     pub const PRESENT: u32 = 0x0000_8000;
     /// Available to software; the architecture never looks at it.
     pub const AVL: u32 = 0x0010_0000;
+    /// Long: a 64-bit code segment. Bit 53 of the descriptor, which is bit 21
+    /// of the high doubleword — the bit beside `AVL` that a 386 left as zero.
+    pub const L: u32 = 0x0020_0000;
     /// Default operand and address size, or "big" for a stack segment.
     pub const DB: u32 = 0x0040_0000;
     /// Granularity: the limit counts 4 KiB pages rather than bytes.
@@ -190,7 +194,12 @@ pub struct SegReg {
     /// The selector last written.
     pub selector: u16,
     /// The cached base address.
-    pub base: u32,
+    ///
+    /// Sixty-four bits, because `FS` and `GS` keep a full-width base in
+    /// long mode — written through `IA32_FS_BASE`/`IA32_GS_BASE` rather
+    /// than through a descriptor, which is why the register is wider than
+    /// anything that could be loaded into it from a table.
+    pub base: u64,
     /// The cached limit, already expanded by the granularity bit and
     /// **inclusive**: the last byte offset the segment covers.
     pub limit: u32,
@@ -204,7 +213,7 @@ impl SegReg {
     pub const fn real_data(selector: u16) -> SegReg {
         SegReg {
             selector,
-            base: (selector as u32) << 4,
+            base: (selector as u64) << 4,
             limit: 0xffff,
             ar: ar::REAL_DATA,
         }
@@ -215,7 +224,7 @@ impl SegReg {
     pub const fn real_code(selector: u16) -> SegReg {
         SegReg {
             selector,
-            base: (selector as u32) << 4,
+            base: (selector as u64) << 4,
             limit: 0xffff,
             ar: ar::REAL_CODE,
         }
@@ -297,6 +306,19 @@ impl SegReg {
         self.ar & ar::DB != 0
     }
 
+    /// The `L` bit: this code segment runs in 64-bit mode rather than
+    /// compatibility mode.
+    ///
+    /// `L` and `D` together are how long mode's two submodes are selected, and
+    /// `L = 1` with `D = 1` is architecturally invalid — there is no
+    /// "64-bit mode with 32-bit defaults", because the defaults *are* the
+    /// difference. Loading such a descriptor into `CS` is `#GP`.
+    #[inline]
+    #[must_use]
+    pub const fn long(self) -> bool {
+        self.ar & ar::L != 0
+    }
+
     /// The system-descriptor type, meaningful only when [`SegReg::is_app`] is
     /// false.
     #[inline]
@@ -338,21 +360,26 @@ impl SegReg {
     /// And a zero-size access — which nothing generates here, but a
     /// `size == 0` caller would — must not wrap the addition into success.
     #[must_use]
-    pub const fn in_bounds(self, offset: u32, size: u32) -> bool {
+    pub const fn in_bounds(self, offset: u64, size: u64) -> bool {
         if size == 0 {
             return true;
         }
         let last = match offset.checked_add(size - 1) {
             Some(last) => last,
-            // The access runs off the top of the 32-bit space, which is
-            // outside every segment however the limit is set.
             None => return false,
         };
+        // A limit is thirty-two bits wide however wide the offset is, so
+        // an offset above 4 GiB is outside every segment. In 64-bit mode
+        // limits are not checked at all and the caller does not get here.
+        if last > 0xffff_ffff {
+            return false;
+        }
+        let limit = self.limit as u64;
         if self.expand_down() {
-            let top = if self.big() { u32::MAX } else { 0xffff };
-            offset > self.limit && last <= top
+            let top: u64 = if self.big() { 0xffff_ffff } else { 0xffff };
+            offset > limit && last <= top
         } else {
-            last <= self.limit
+            last <= limit
         }
     }
 }
@@ -362,7 +389,7 @@ impl SegReg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct TableReg {
     /// The linear address of the table's first byte.
-    pub base: u32,
+    pub base: u64,
     /// The table's limit, inclusive: one less than its size in bytes.
     pub limit: u32,
 }
@@ -379,6 +406,16 @@ pub struct RawDesc {
     /// Bytes 4-7: the rest of the base, the access rights, and the top nibble
     /// of the limit.
     pub high: u32,
+    /// Bytes 8-11 of a **sixteen-byte** system descriptor: the top half of a
+    /// base or of a gate's offset. Zero for the eight-byte form.
+    ///
+    /// Long mode did not widen code and data descriptors at all — they have no
+    /// base and no limit there — but it doubled every *system* descriptor, so
+    /// an `LDT`, a task state segment and every interrupt gate are sixteen
+    /// bytes with the extra address in this doubleword. A table therefore
+    /// holds two sizes of entry at once, which is why the reader has to know
+    /// which kind it is looking for before it reads.
+    pub upper: u32,
 }
 
 impl RawDesc {
@@ -438,12 +475,18 @@ impl RawDesc {
         ((self.high >> 8) & 0xf) as u8
     }
 
+    /// The base address including a sixteen-byte descriptor's upper half.
+    #[must_use]
+    pub const fn base64(self) -> u64 {
+        (self.base() as u64) | ((self.upper as u64) << 32)
+    }
+
     /// This descriptor as a loaded segment register.
     #[must_use]
     pub const fn to_seg(self, selector: u16) -> SegReg {
         SegReg {
             selector,
-            base: self.base(),
+            base: self.base64(),
             limit: self.limit(),
             ar: self.ar(),
         }
@@ -466,10 +509,32 @@ impl RawDesc {
         (self.low & 0xffff) | (self.high & 0xffff_0000)
     }
 
+    /// A gate's target offset including a sixteen-byte gate's upper half.
+    #[must_use]
+    pub const fn gate_offset64(self) -> u64 {
+        (self.gate_offset() as u64) | ((self.upper as u64) << 32)
+    }
+
     /// How many doublewords a call gate copies from the old stack to the new.
+    ///
+    /// Zero in long mode: a 64-bit call gate has no parameter count, because
+    /// the field it lived in became the interrupt-stack-table index and
+    /// arguments go in registers anyway.
     #[must_use]
     pub const fn gate_argc(self) -> u8 {
         (self.high & 0x1f) as u8
+    }
+
+    /// A 64-bit interrupt gate's interrupt-stack-table index, 0 to 7.
+    ///
+    /// Zero means "use the stack the privilege change selects", which is the
+    /// 32-bit behaviour; one to seven name an unconditional stack in the task
+    /// state segment, which is what makes a double-fault handler able to run
+    /// after the kernel stack itself has gone bad (*Intel SDM* volume 3
+    /// §6.14.5).
+    #[must_use]
+    pub const fn gate_ist(self) -> u8 {
+        (self.high & 0x7) as u8
     }
 }
 
@@ -517,6 +582,110 @@ pub mod cr0 {
     pub const VALID_486: u32 = VALID_386 | NE | WP | AM | NW | CD;
 }
 
+/// The bits of `CR4` this core models.
+///
+/// `CR4` is where the post-486 extensions are switched on one at a time, which
+/// makes it the register a lattice is actually visible in: a guest sets `PAE`
+/// and the paging mode changes underneath it without anything else moving.
+///
+/// *Intel SDM* volume 3 §2.5.
+pub mod cr4 {
+    /// Virtual-8086 mode extensions. Storage only — no virtual-8086 mode is
+    /// modelled.
+    pub const VME: u64 = 1 << 0;
+    /// Protected-mode virtual interrupts. Storage only.
+    pub const PVI: u64 = 1 << 1;
+    /// Time-stamp disable: `RDTSC` becomes privileged. Storage only.
+    pub const TSD: u64 = 1 << 2;
+    /// Debugging extensions. Storage only.
+    pub const DE: u64 = 1 << 3;
+    /// Page size extension: 4 MiB pages in a two-level walk.
+    pub const PSE: u64 = 1 << 4;
+    /// Physical address extension: 64-bit entries and a third level.
+    pub const PAE: u64 = 1 << 5;
+    /// Machine check enable. Storage only.
+    pub const MCE: u64 = 1 << 6;
+    /// Page global enable: the global bit in a page-table entry.
+    pub const PGE: u64 = 1 << 7;
+    /// Performance-counter enable. Storage only.
+    pub const PCE: u64 = 1 << 8;
+    /// `FXSAVE`/`FXRSTOR` and the SSE state.
+    ///
+    /// **Storage only, deliberately.** The bit exists because an operating
+    /// system writes it before it will use SSE and reads it back to check;
+    /// modelling the bit and not the arithmetic is the honest half, and the
+    /// `CPUID` feature bits that would invite a guest to use it are clear.
+    pub const OSFXSR: u64 = 1 << 9;
+    /// Unmasked SIMD floating-point exceptions. Storage only, same reason.
+    pub const OSXMMEXCPT: u64 = 1 << 10;
+}
+
+/// The bits of `IA32_EFER`, the register long mode is armed from.
+///
+/// *AMD64 Architecture Programmer's Manual* volume 2 §3.1.7, and *Intel SDM*
+/// volume 3 §2.2.1.
+pub mod efer {
+    /// `SYSCALL`/`SYSRET` enable.
+    pub const SCE: u64 = 1 << 0;
+    /// Long mode **enable**: software sets this to arm long mode.
+    pub const LME: u64 = 1 << 8;
+    /// Long mode **active**: the *processor* sets this when paging is enabled
+    /// with `LME` on, and clears it when paging goes away.
+    ///
+    /// The two-bit dance is the whole of the mode transition: software cannot
+    /// write `LMA`, and reading it back is how a guest knows it is in long
+    /// mode rather than merely having asked to be.
+    pub const LMA: u64 = 1 << 10;
+    /// No-execute enable: bit 63 of a page-table entry stops being reserved.
+    pub const NXE: u64 = 1 << 11;
+
+    /// The bits software may write. `LMA` is conspicuously not among them.
+    pub const WRITABLE: u64 = SCE | LME | NXE;
+}
+
+/// The addresses of the model-specific registers this core implements.
+///
+/// A short list on purpose: an unimplemented `RDMSR` raises `#GP`, which is
+/// what hardware does for an address it does not have and what lets a guest
+/// probe. Inventing a zero for every address is how an emulator convinces a
+/// kernel that a feature exists.
+pub mod msr {
+    /// `IA32_EFER`.
+    pub const EFER: u32 = 0xc000_0080;
+    /// `IA32_STAR`.
+    pub const STAR: u32 = 0xc000_0081;
+    /// `IA32_LSTAR`.
+    pub const LSTAR: u32 = 0xc000_0082;
+    /// `IA32_CSTAR`.
+    pub const CSTAR: u32 = 0xc000_0083;
+    /// `IA32_FMASK`.
+    pub const SFMASK: u32 = 0xc000_0084;
+    /// `IA32_FS_BASE`.
+    pub const FS_BASE: u32 = 0xc000_0100;
+    /// `IA32_GS_BASE`.
+    pub const GS_BASE: u32 = 0xc000_0101;
+    /// `IA32_KERNEL_GS_BASE`.
+    pub const KERNEL_GS_BASE: u32 = 0xc000_0102;
+}
+
+/// Whether an address is canonical: bits 63-48 must all equal bit 47.
+///
+/// The rule that keeps a 64-bit address space from quietly becoming a 64-bit
+/// *pointer* space — software cannot store a tag in the top bits and expect
+/// the processor to ignore it, which is exactly what it was invented to
+/// prevent. A non-canonical address raises `#GP(0)`, or `#SS(0)` through the
+/// stack segment, *before* any translation is attempted.
+///
+/// *Intel SDM* volume 1 §3.3.7.1.
+#[inline]
+#[must_use]
+pub const fn canonical(addr: u64) -> bool {
+    // Sign-extend bit 47 and compare. Written as a shift pair rather than a
+    // mask so that widening the implemented linear address to 57 bits later is
+    // one constant.
+    ((addr << 16) as i64 >> 16) as u64 == addr
+}
+
 /// The system-register file: everything that is architectural state but is not
 /// a general register.
 ///
@@ -541,13 +710,41 @@ pub struct Sys {
     /// Control register 0.
     pub cr0: u32,
     /// Control register 2: the linear address of the last page fault.
-    pub cr2: u32,
-    /// Control register 3: the page directory's physical base, plus its
+    pub cr2: u64,
+    /// Control register 3: the top page table's physical base, plus its
     /// low-bit flags on later parts.
-    pub cr3: u32,
+    pub cr3: u64,
+    /// Control register 4: the extension enables, `PAE` among them.
+    ///
+    /// Present in the struct on every part and writable only where
+    /// [`Features::cr4`](super::Features::cr4) says so — the register file
+    /// has one shape, and which parts of it exist is a property of the
+    /// instance rather than of the type (`ROADMAP.md` §6.1.1).
+    pub cr4: u64,
+    /// The extended feature enable register, `IA32_EFER`.
+    ///
+    /// A model-specific register rather than a control register, which is
+    /// how long mode came to be armed by a `WRMSR` and entered by a write
+    /// to `CR0`.
+    pub efer: u64,
+    /// `IA32_FS_BASE`: the base `FS` uses in 64-bit mode.
+    pub fs_base: u64,
+    /// `IA32_GS_BASE`: the base `GS` uses in 64-bit mode.
+    pub gs_base: u64,
+    /// `IA32_KERNEL_GS_BASE`: the base `SWAPGS` exchanges `GS` with.
+    pub kernel_gs_base: u64,
+    /// `IA32_STAR`: the selectors `SYSCALL` and `SYSRET` load.
+    pub star: u64,
+    /// `IA32_LSTAR`: the 64-bit entry point `SYSCALL` jumps to.
+    pub lstar: u64,
+    /// `IA32_CSTAR`: the entry point a `SYSCALL` from compatibility mode
+    /// jumps to.
+    pub cstar: u64,
+    /// `IA32_FMASK`: the flags `SYSCALL` clears.
+    pub sfmask: u64,
     /// The eight debug registers. `DR0`-`DR3` are addresses, `DR6` is the
     /// status and `DR7` the control word.
-    pub dr: [u32; 8],
+    pub dr: [u64; 8],
     /// The test registers. On a 386 only `TR6` and `TR7` exist, and they poke
     /// at the translation-lookaside buffer directly.
     pub test: [u32; 8],
@@ -586,6 +783,15 @@ impl Sys {
             cr0: 0,
             cr2: 0,
             cr3: 0,
+            cr4: 0,
+            efer: 0,
+            fs_base: 0,
+            gs_base: 0,
+            kernel_gs_base: 0,
+            star: 0,
+            lstar: 0,
+            cstar: 0,
+            sfmask: 0,
             dr: [0, 0, 0, 0, 0, 0, 0xffff_0ff0, 0x0000_0400],
             test: [0; 8],
         }
@@ -615,6 +821,68 @@ impl Sys {
     #[must_use]
     pub const fn paging(&self) -> bool {
         self.cr0 & cr0::PG != 0
+    }
+
+    /// Whether long mode is **active** — `EFER.LMA`, which the processor sets
+    /// when paging is enabled with `EFER.LME`.
+    ///
+    /// True in *both* of long mode's submodes: this says the four-level walk
+    /// is in force and the 64-bit interrupt and task structures are, not that
+    /// the current code segment is 64-bit. [`Sys::sixty_four`] says that.
+    #[inline]
+    #[must_use]
+    pub const fn long_mode(&self) -> bool {
+        self.efer & efer::LMA != 0
+    }
+
+    /// Whether the processor is executing in **64-bit mode** rather than
+    /// compatibility mode.
+    ///
+    /// Long mode active *and* the current code segment's `L` bit set. The two
+    /// are genuinely different processors from software's point of view — one
+    /// has sixteen 64-bit registers and no segmentation, the other runs a
+    /// 32-bit binary unchanged — and both are reached through the same page
+    /// tables, which is the point of the design.
+    ///
+    /// *AMD64 Architecture Programmer's Manual* volume 2 §1.3.
+    #[inline]
+    #[must_use]
+    pub const fn sixty_four(&self) -> bool {
+        self.long_mode() && self.seg(seg::CS).long()
+    }
+
+    /// Which paging scheme is in force.
+    ///
+    /// The three inputs do not compose the way their names suggest: `PG`
+    /// alone is the two-level walk, `PG` with `PAE` is the three-level one,
+    /// and `PG` with `PAE` **and** `LMA` is the four-level one — while `PAE`
+    /// without `PG` is no paging at all, however set the bit is.
+    #[inline]
+    #[must_use]
+    pub const fn paging_mode(&self, features: super::Features) -> paging::Mode {
+        if self.cr0 & cr0::PG == 0 {
+            return paging::Mode::Off;
+        }
+        if !features.pae || self.cr4 & cr4::PAE == 0 {
+            return paging::Mode::Legacy;
+        }
+        if self.long_mode() {
+            paging::Mode::Ia32e
+        } else {
+            paging::Mode::Pae
+        }
+    }
+
+    /// Everything a page-table walk needs, gathered in one value.
+    #[must_use]
+    pub fn tables(&self, features: super::Features) -> paging::Tables {
+        paging::Tables {
+            mode: self.paging_mode(features),
+            cr3: self.cr3,
+            pse: features.pse && self.cr4 & cr4::PSE != 0,
+            nxe: features.nx && self.efer & efer::NXE != 0,
+            wp: features.extras_486 && self.cr0 & cr0::WP != 0,
+        }
     }
 
     /// A segment register.
@@ -648,32 +916,32 @@ impl Default for Sys {
 /// offset.
 pub mod tss32 {
     /// The selector of the task that called this one.
-    pub const BACK_LINK: u32 = 0x00;
+    pub const BACK_LINK: u64 = 0x00;
     /// The privilege-0 stack pointer.
-    pub const ESP0: u32 = 0x04;
+    pub const ESP0: u64 = 0x04;
     /// The privilege-0 stack selector.
-    pub const SS0: u32 = 0x08;
+    pub const SS0: u64 = 0x08;
     /// The page directory base for this task.
-    pub const CR3: u32 = 0x1c;
+    pub const CR3: u64 = 0x1c;
     /// The saved instruction pointer.
-    pub const EIP: u32 = 0x20;
+    pub const EIP: u64 = 0x20;
     /// The saved flags.
-    pub const EFLAGS: u32 = 0x24;
+    pub const EFLAGS: u64 = 0x24;
     /// The first of the eight saved general registers, in ModRM order.
-    pub const EAX: u32 = 0x28;
+    pub const EAX: u64 = 0x28;
     /// The first of the six saved selectors: `ES`, `CS`, `SS`, `DS`, `FS`,
     /// `GS` — which is *not* the ModRM segment order, and getting it wrong
     /// swaps the code and stack segments of every switched-to task.
-    pub const ES: u32 = 0x48;
+    pub const ES: u64 = 0x48;
     /// The task's local descriptor table selector.
-    pub const LDT: u32 = 0x60;
+    pub const LDT: u64 = 0x60;
     /// The debug trap flag, bit 0 of the word at 0x64.
-    pub const TRAP: u32 = 0x64;
+    pub const TRAP: u64 = 0x64;
     /// The offset of the I/O permission bitmap, in the halfword at 0x66.
-    pub const IOMAP_BASE: u32 = 0x66;
+    pub const IOMAP_BASE: u64 = 0x66;
     /// The smallest legal limit for a 32-bit TSS: the fixed area is 104 bytes
     /// and the limit is inclusive.
-    pub const MIN_LIMIT: u32 = 0x67;
+    pub const MIN_LIMIT: u64 = 0x67;
 }
 
 /// Where the `n`th privilege level's stack pointer and selector live in a
@@ -681,8 +949,8 @@ pub mod tss32 {
 ///
 /// `ESP0` at 4 and `SS0` at 8, then eight bytes per level.
 #[must_use]
-pub const fn tss32_stack(level: u8) -> (u32, u32) {
-    let base = 4 + (level as u32 & 3) * 8;
+pub const fn tss32_stack(level: u8) -> (u64, u64) {
+    let base = 4 + (level as u64 & 3) * 8;
     (base, base + 4)
 }
 
@@ -743,9 +1011,32 @@ impl Exec<'_> {
 
     /// Turn a `segment:offset` pair into a linear address, checking the
     /// segment's limit and its access rights on the way.
-    pub(super) fn seg_linear(&mut self, sr: u8, offset: u32, size: u32, write: bool) -> Ex<u32> {
+    pub(super) fn seg_linear(&mut self, sr: u8, offset: u64, size: u64, write: bool) -> Ex<u64> {
         let s = self.state.sys.seg(sr);
         let vector = Self::seg_fault_vector(sr);
+        if self.sixty_four() {
+            // 64-bit mode has no segmentation worth the name: `CS`, `DS`,
+            // `ES` and `SS` are treated as having a base of zero and no limit,
+            // and their present and type bits are not consulted either. `FS`
+            // and `GS` survive, with a base that comes from an MSR rather than
+            // from a descriptor — which is why they are the two every 64-bit
+            // ABI puts thread-local storage behind.
+            //
+            // What replaces the limit check is the canonical check: the
+            // address must be a sign-extension of bit 47, and it is `#GP(0)`
+            // — or `#SS(0)` through the stack — if it is not. *Intel SDM*
+            // volume 3 §3.4.4 and volume 1 §3.3.7.1.
+            let base = match sr {
+                seg::FS => self.state.sys.fs_base,
+                seg::GS => self.state.sys.gs_base,
+                _ => 0,
+            };
+            let lin = base.wrapping_add(offset);
+            if !canonical(lin) {
+                return Err(Fault::coded(vector, 0));
+            }
+            return Ok(lin);
+        }
         if self.protected() {
             // A null selector leaves the register unusable rather than
             // pointing at address zero, and using it is a fault — which is
@@ -791,10 +1082,24 @@ impl Exec<'_> {
         if sel.offset() + 7 > table.limit {
             return Err(Fault::coded(vector, u32::from(selector & 0xfffc)));
         }
-        let addr = table.base.wrapping_add(sel.offset());
+        let addr = table.base.wrapping_add(u64::from(sel.offset()));
         let low = self.sys_read32(addr)?;
         let high = self.sys_read32(addr.wrapping_add(4))?;
-        Ok(RawDesc { low, high })
+        // In long mode a **system** descriptor is sixteen bytes: the extra
+        // doubleword carries the top half of the base. A code or data
+        // descriptor stays eight, because it has no base to widen. Which kind
+        // this is is the `S` bit, so the second half can only be read once the
+        // first has been.
+        let system = high & ar::S == 0;
+        let upper = if self.state.sys.long_mode() && system {
+            if sel.offset() + 15 > table.limit {
+                return Err(Fault::coded(vector, u32::from(selector & 0xfffc)));
+            }
+            self.sys_read32(addr.wrapping_add(8))?
+        } else {
+            0
+        };
+        Ok(RawDesc { low, high, upper })
     }
 
     /// Set a descriptor's accessed bit, as loading a selector does.
@@ -817,7 +1122,10 @@ impl Exec<'_> {
         } else {
             self.state.sys.gdtr
         };
-        let addr = table.base.wrapping_add(sel.offset()).wrapping_add(4);
+        let addr = table
+            .base
+            .wrapping_add(u64::from(sel.offset()))
+            .wrapping_add(4);
         self.sys_write32(addr, desc.high | ar::ACCESSED)
     }
 
@@ -826,7 +1134,10 @@ impl Exec<'_> {
     fn set_sys_type(&mut self, selector: u16, kind: u8) -> Ex<()> {
         let sel = Selector(selector);
         let table = self.state.sys.gdtr;
-        let addr = table.base.wrapping_add(sel.offset()).wrapping_add(4);
+        let addr = table
+            .base
+            .wrapping_add(u64::from(sel.offset()))
+            .wrapping_add(4);
         let high = self.sys_read32(addr)?;
         let updated = (high & !0x0000_0f00) | (u32::from(kind) << 8);
         self.sys_write32(addr, updated)
@@ -850,7 +1161,7 @@ impl Exec<'_> {
             let cached = self.state.sys.seg(index);
             let entry = self.state.sys.seg_mut(index);
             entry.selector = selector;
-            entry.base = u32::from(selector) << 4;
+            entry.base = u64::from(selector) << 4;
             if !cached.present() {
                 // Nothing valid was ever loaded here; give it the real-mode
                 // defaults rather than a zero limit that would fault at once.
@@ -941,26 +1252,26 @@ impl Exec<'_> {
     pub(super) fn far_transfer(
         &mut self,
         selector: u16,
-        offset: u32,
+        offset: u64,
         is_call: bool,
         opsize: u8,
     ) -> Ex<()> {
         if !self.protected() {
             if is_call {
                 let cs = self.state.regs.cs;
-                let ip = self.state.regs.eip;
-                self.push(u32::from(cs), opsize)?;
+                let ip = self.state.regs.rip;
+                self.push(u64::from(cs), opsize)?;
                 self.push(ip, opsize)?;
             }
             let entry = self.state.sys.seg_mut(seg::CS);
             entry.selector = selector;
-            entry.base = u32::from(selector) << 4;
+            entry.base = u64::from(selector) << 4;
             if !entry.present() {
                 entry.limit = 0xffff;
                 entry.ar = ar::REAL_CODE;
             }
             self.state.regs.cs = selector;
-            self.state.regs.eip = if opsize == 2 { offset & 0xffff } else { offset };
+            self.state.regs.rip = if opsize == 2 { offset & 0xffff } else { offset };
             self.state.queue.flush();
             return Ok(());
         }
@@ -989,21 +1300,50 @@ impl Exec<'_> {
                 return Err(Fault::coded(VEC_NP, u32::from(selector & 0xfffc)));
             }
             let target = desc.to_seg(selector);
-            if !target.in_bounds(offset, 1) {
+            // `L = 1` with `D = 1` is an invalid combination rather than a
+            // reserved one: there is no 64-bit code segment with 32-bit
+            // defaults, and hardware faults rather than choosing (*AMD64
+            // Architecture Programmer's Manual* volume 2 §4.8.1).
+            if self.state.sys.long_mode() && target.long() && target.big() {
+                return Err(Fault::gp(u32::from(selector & 0xfffc)));
+            }
+            // A 64-bit target has no limit to check, and the offset must be
+            // canonical instead.
+            if target.long() && self.state.sys.long_mode() {
+                if !canonical(offset) {
+                    return Err(Fault::gp(0));
+                }
+            } else if !target.in_bounds(offset, 1) {
                 return Err(Fault::gp(0));
             }
             if is_call {
                 let cs = self.state.regs.cs;
-                let ip = self.state.regs.eip;
-                self.push(u32::from(cs), opsize)?;
+                let ip = self.state.regs.rip;
+                self.push(u64::from(cs), opsize)?;
                 self.push(ip, opsize)?;
             }
             self.mark_accessed(selector, desc)?;
             self.commit_cs(selector, desc, cpl);
-            self.state.regs.eip = offset;
+            self.state.regs.rip = offset;
             return Ok(());
         }
 
+        // Long mode has **no hardware task switching**: type 5 does not exist
+        // there, and type 9 is a table of stack pointers rather than a task's
+        // saved state. Falling through to `switch_task` would load a register
+        // image out of a structure that holds none.
+        if self.state.sys.long_mode()
+            && matches!(
+                desc.kind(),
+                sys_type::TASK_GATE
+                    | sys_type::TSS16_AVAIL
+                    | sys_type::TSS16_BUSY
+                    | sys_type::TSS32_AVAIL
+                    | sys_type::TSS32_BUSY
+            )
+        {
+            return Err(Fault::gp(u32::from(selector & 0xfffc)));
+        }
         match desc.kind() {
             sys_type::CALL_GATE16 | sys_type::CALL_GATE32 => {
                 self.call_gate(selector, desc, is_call)
@@ -1052,11 +1392,18 @@ impl Exec<'_> {
             return Err(Fault::coded(VEC_NP, u32::from(target_sel & 0xfffc)));
         }
         let conforming = target.high & ar::DC != 0;
-        let offset = if gate32 {
-            gate.gate_offset()
+        // A long-mode call gate is sixteen bytes with a 64-bit offset, and it
+        // reuses the 32-bit gate's type — there is no separate encoding,
+        // because there is no 32-bit call gate in long mode to collide with.
+        let long = self.state.sys.long_mode();
+        let offset = if long {
+            gate.gate_offset64()
+        } else if gate32 {
+            u64::from(gate.gate_offset())
         } else {
-            gate.gate_offset() & 0xffff
+            u64::from(gate.gate_offset() & 0xffff)
         };
+        let size = if long { 8u8 } else { size };
 
         if !conforming && target.dpl() < cpl && is_call {
             // The privilege really changes, so the stack does too: the new one
@@ -1066,36 +1413,36 @@ impl Exec<'_> {
             let (ss_sel, new_sp) = self.tss_stack(new_cpl)?;
             let ss_desc = self.validate_stack(ss_sel, new_cpl)?;
             let argc = gate.gate_argc();
-            let mut args = [0u32; 31];
+            let mut args = [0u64; 31];
             for (i, slot) in args.iter_mut().enumerate().take(argc as usize) {
-                let off = self.sp().wrapping_add(u32::from(size) * (i as u32));
+                let off = self.sp().wrapping_add(u64::from(size) * (i as u64));
                 *slot = self.read_mem(seg::SS, off, size)?;
             }
             let old_ss = self.state.regs.ss;
             let old_sp = self.sp();
             let old_cs = self.state.regs.cs;
-            let old_ip = self.state.regs.eip;
+            let old_ip = self.state.regs.rip;
 
             self.commit_cs(target_sel, target, new_cpl);
             *self.state.sys.seg_mut(seg::SS) = ss_desc.to_seg(ss_sel);
             self.state.regs.ss = ss_sel;
             self.set_sp(new_sp);
 
-            self.push(u32::from(old_ss), size)?;
+            self.push(u64::from(old_ss), size)?;
             self.push(old_sp, size)?;
             for i in (0..argc as usize).rev() {
                 self.push(args[i], size)?;
             }
-            self.push(u32::from(old_cs), size)?;
+            self.push(u64::from(old_cs), size)?;
             self.push(old_ip, size)?;
-            self.state.regs.eip = offset;
+            self.state.regs.rip = offset;
             return Ok(());
         }
 
         if is_call {
             let cs = self.state.regs.cs;
-            let ip = self.state.regs.eip;
-            self.push(u32::from(cs), size)?;
+            let ip = self.state.regs.rip;
+            self.push(u64::from(cs), size)?;
             self.push(ip, size)?;
         }
         let new_cpl = if conforming {
@@ -1106,13 +1453,13 @@ impl Exec<'_> {
             cpl
         };
         self.commit_cs(target_sel, target, new_cpl);
-        self.state.regs.eip = offset;
+        self.state.regs.rip = offset;
         Ok(())
     }
 
     /// The stack pointer and selector a given privilege level uses, out of the
     /// current task state segment.
-    fn tss_stack(&mut self, level: u8) -> Ex<(u16, u32)> {
+    fn tss_stack(&mut self, level: u8) -> Ex<(u16, u64)> {
         let tss = self.state.sys.task;
         if !tss.present() {
             return Err(Fault::coded(VEC_TS, u32::from(tss.selector & 0xfffc)));
@@ -1124,19 +1471,55 @@ impl Exec<'_> {
         } else {
             // A 286 task state segment packs the same six values into
             // halfwords starting at offset 2.
-            let base = 2 + (u32::from(level) & 3) * 4;
+            let base = 2 + (u64::from(level) & 3) * 4;
             (base, base + 2)
         };
-        if ss_off + 3 > tss.limit {
+        if ss_off + 3 > u64::from(tss.limit) {
             return Err(Fault::coded(VEC_TS, u32::from(tss.selector & 0xfffc)));
         }
         let sp = if wide {
-            self.sys_read32(tss.base.wrapping_add(esp_off))?
+            u64::from(self.sys_read32(tss.base.wrapping_add(esp_off))?)
         } else {
-            self.sys_read16(tss.base.wrapping_add(esp_off))?
+            u64::from(self.sys_read16(tss.base.wrapping_add(esp_off))?)
         };
         let ss = self.sys_read16(tss.base.wrapping_add(ss_off))? as u16;
         Ok((ss, sp))
+    }
+
+    /// `RSP0`, `RSP1` or `RSP2` out of the 64-bit task state segment.
+    ///
+    /// The 64-bit task state segment is not a task's saved state at all — long
+    /// mode dropped hardware task switching — it is a table of seven stack
+    /// pointers and three privilege-level stacks, and nothing else. `RSP0` is
+    /// at offset 4, and each is eight bytes (*Intel SDM* volume 3 §7.7).
+    fn tss_rsp(&mut self, level: u8) -> Ex<u64> {
+        let tss = self.state.sys.task;
+        if !tss.present() {
+            return Err(Fault::coded(VEC_TS, u32::from(tss.selector & 0xfffc)));
+        }
+        let offset = 4 + u64::from(level & 3) * 8;
+        if offset + 7 > u64::from(tss.limit) {
+            return Err(Fault::coded(VEC_TS, u32::from(tss.selector & 0xfffc)));
+        }
+        self.sys_read(tss.base.wrapping_add(offset), 8)
+    }
+
+    /// One of the seven interrupt-stack-table pointers.
+    ///
+    /// `IST1` is at offset 36, and each is eight bytes. The mechanism exists
+    /// so that a handler for a fault that may have destroyed the kernel stack
+    /// — `#DF`, `#NMI`, `#MC` — lands on a stack chosen by the *gate* rather
+    /// than by the privilege change, which in those cases has not happened.
+    fn tss_ist(&mut self, index: u8) -> Ex<u64> {
+        let tss = self.state.sys.task;
+        if !tss.present() || index == 0 || index > 7 {
+            return Err(Fault::coded(VEC_TS, u32::from(tss.selector & 0xfffc)));
+        }
+        let offset = 36 - 8 + u64::from(index) * 8;
+        if offset + 7 > u64::from(tss.limit) {
+            return Err(Fault::coded(VEC_TS, u32::from(tss.selector & 0xfffc)));
+        }
+        self.sys_read(tss.base.wrapping_add(offset), 8)
     }
 
     /// Check that a selector names a stack usable at a given privilege level.
@@ -1160,15 +1543,15 @@ impl Exec<'_> {
     }
 
     /// A far return.
-    pub(super) fn return_far(&mut self, opsize: u8, extra: u32) -> Ex<()> {
+    pub(super) fn return_far(&mut self, opsize: u8, extra: u64) -> Ex<()> {
         let ip = self.pop(opsize)?;
         let selector = self.pop(opsize)? as u16;
         if !self.protected() {
             let entry = self.state.sys.seg_mut(seg::CS);
             entry.selector = selector;
-            entry.base = u32::from(selector) << 4;
+            entry.base = u64::from(selector) << 4;
             self.state.regs.cs = selector;
-            self.state.regs.eip = if opsize == 2 { ip & 0xffff } else { ip };
+            self.state.regs.rip = if opsize == 2 { ip & 0xffff } else { ip };
             let sp = self.sp().wrapping_add(extra);
             self.set_sp(sp);
             self.state.queue.flush();
@@ -1211,12 +1594,12 @@ impl Exec<'_> {
             *self.state.sys.seg_mut(seg::SS) = ss_desc.to_seg(new_ss);
             self.state.regs.ss = new_ss;
             self.set_sp(new_sp.wrapping_add(extra));
-            self.state.regs.eip = if opsize == 2 { ip & 0xffff } else { ip };
+            self.state.regs.rip = if opsize == 2 { ip & 0xffff } else { ip };
             self.drop_privileged_segments(sel.rpl());
             return Ok(());
         }
         self.commit_cs(selector, desc, cpl);
-        self.state.regs.eip = if opsize == 2 { ip & 0xffff } else { ip };
+        self.state.regs.rip = if opsize == 2 { ip & 0xffff } else { ip };
         Ok(())
     }
 
@@ -1270,12 +1653,12 @@ impl Exec<'_> {
             let fl = self.pop(opsize)?;
             let entry = self.state.sys.seg_mut(seg::CS);
             entry.selector = cs;
-            entry.base = u32::from(cs) << 4;
+            entry.base = u64::from(cs) << 4;
             self.state.regs.cs = cs;
-            self.state.regs.eip = if opsize == 2 { ip & 0xffff } else { ip };
+            self.state.regs.rip = if opsize == 2 { ip & 0xffff } else { ip };
             let kept: u32 = if opsize == 2 { 0xffff_0000 } else { 0 };
             let old = self.state.regs.eflags;
-            self.set_flags((fl & !kept) | (old & kept));
+            self.set_flags((fl as u32 & !kept) | (old & kept));
             self.state.queue.flush();
             return Ok(());
         }
@@ -1315,19 +1698,41 @@ impl Exec<'_> {
             return Err(Fault::coded(VEC_NP, u32::from(selector & 0xfffc)));
         }
 
+        // In long mode `IRET` **always** pops `SS:RSP`, because the interrupt
+        // always pushed it. That is the difference that breaks a 32-bit `IRET`
+        // reused unchanged: the frame is five words, not three, and popping
+        // three leaves the stack two deep in the wrong place.
+        let long = self.state.sys.long_mode();
         let outward = sel.rpl() > cpl;
-        if outward {
+        if long || outward {
             let new_sp = self.pop(opsize)?;
             let new_ss = self.pop(opsize)? as u16;
-            let ss_desc = self.validate_return_stack(new_ss, sel.rpl())?;
-            self.commit_cs(selector, desc, sel.rpl());
-            *self.state.sys.seg_mut(seg::SS) = ss_desc.to_seg(new_ss);
+            let new_cpl = sel.rpl();
+            self.commit_cs(selector, desc, new_cpl);
+            if long && Selector(new_ss).is_null() {
+                // Returning to 64-bit code with a null stack selector is
+                // legal: `SS` has no base or limit there, and the selector is
+                // kept only for its privilege level.
+                *self.state.sys.seg_mut(seg::SS) = SegReg {
+                    selector: new_ss,
+                    base: 0,
+                    limit: 0,
+                    ar: ar::PRESENT | ar::S | ar::RW | ar::ACCESSED,
+                };
+            } else {
+                let ss_desc = self.validate_return_stack(new_ss, new_cpl)?;
+                *self.state.sys.seg_mut(seg::SS) = ss_desc.to_seg(new_ss);
+            }
             self.state.regs.ss = new_ss;
             self.set_sp(new_sp);
         } else {
             self.commit_cs(selector, desc, cpl);
         }
-        self.state.regs.eip = if opsize == 2 { ip & 0xffff } else { ip };
+        self.state.regs.rip = match opsize {
+            2 => ip & 0xffff,
+            4 => ip & 0xffff_ffff,
+            _ => ip,
+        };
         self.restore_flags(fl, cpl, opsize);
         if outward {
             self.drop_privileged_segments(sel.rpl());
@@ -1337,8 +1742,9 @@ impl Exec<'_> {
 
     /// Put the flags back after an `IRET`, keeping the fields this privilege
     /// level may not change.
-    fn restore_flags(&mut self, value: u32, cpl: u8, opsize: u8) {
+    fn restore_flags(&mut self, value: u64, cpl: u8, opsize: u8) {
         let old = self.state.regs.eflags;
+        let value = value as u32;
         let mut keep = flags::VM;
         if cpl > self.state.regs.iopl() {
             keep |= flags::IF;
@@ -1362,15 +1768,16 @@ impl Exec<'_> {
     /// is at least its own — which is how an operating system exposes `INT 80`
     /// to user space while keeping the rest of the table to itself.
     pub(super) fn check_software_gate(&mut self, vector: u8) -> Ex<()> {
-        let offset = u32::from(vector) * 8;
+        let stride = if self.state.sys.long_mode() { 16 } else { 8 };
+        let offset = u32::from(vector) * stride;
         let idtr = self.state.sys.idtr;
-        if offset + 7 > idtr.limit {
-            return Err(Fault::gp(offset + 2));
+        if offset + stride - 1 > idtr.limit {
+            return Err(Fault::gp(u32::from(vector) * 8 + 2));
         }
-        let high = self.sys_read32(idtr.base.wrapping_add(offset).wrapping_add(4))?;
+        let high = self.sys_read32(idtr.base.wrapping_add(u64::from(offset)).wrapping_add(4))?;
         let dpl = ((high & ar::DPL) >> ar::DPL_SHIFT) as u8;
         if dpl < self.cpl() {
-            return Err(Fault::gp(offset + 2));
+            return Err(Fault::gp(u32::from(vector) * 8 + 2));
         }
         Ok(())
     }
@@ -1403,16 +1810,16 @@ impl Exec<'_> {
         let target_ip = self.read_ivt(base);
         let target_cs = self.read_ivt(base.wrapping_add(2));
 
-        let saved = self.state.regs.eflags;
+        let saved = u64::from(self.state.regs.eflags);
         self.push(saved, 2)?;
         self.set_flag(flags::IF | flags::TF, false);
         let cs = self.state.regs.cs;
-        let ip = self.state.regs.eip & 0xffff;
-        self.push(u32::from(cs), 2)?;
+        let ip = self.state.regs.rip & 0xffff;
+        self.push(u64::from(cs), 2)?;
         self.push(ip, 2)?;
 
         self.state.regs.cs = target_cs as u16;
-        self.state.regs.eip = target_ip;
+        self.state.regs.rip = target_ip;
         let entry = self.state.sys.seg_mut(seg::CS);
         entry.selector = target_cs as u16;
         entry.base = (target_cs & 0xffff) << 4;
@@ -1424,7 +1831,7 @@ impl Exec<'_> {
     ///
     /// Read through segment zero with the 8086's own adder, so the 1 MiB wrap
     /// applies to it exactly as it does to every other access.
-    fn read_ivt(&mut self, offset: u32) -> u32 {
+    fn read_ivt(&mut self, offset: u32) -> u64 {
         let low = super::linear(0, offset as u16);
         let high = super::linear(0, (offset as u16).wrapping_add(1));
         let lo = self.phys_read(low, 1);
@@ -1444,68 +1851,88 @@ impl Exec<'_> {
         if offset + 3 > idtr.limit {
             return Err(Fault::gp(u32::from(vector) * 8 + 2));
         }
-        let entry_addr = idtr.base.wrapping_add(offset);
-        let target_ip = self.sys_read16(entry_addr)?;
+        let entry_addr = idtr.base.wrapping_add(u64::from(offset));
+        let target_ip = u64::from(self.sys_read16(entry_addr)?);
         let target_cs = self.sys_read16(entry_addr.wrapping_add(2))? as u16;
 
-        let saved = self.state.regs.eflags;
+        let saved = u64::from(self.state.regs.eflags);
         let cs = self.state.regs.cs;
-        let ip = self.state.regs.eip & 0xffff;
+        let ip = self.state.regs.rip & 0xffff;
         self.push(saved, 2)?;
-        self.push(u32::from(cs), 2)?;
+        self.push(u64::from(cs), 2)?;
         self.push(ip, 2)?;
         self.set_flag(flags::IF | flags::TF | flags::AC | flags::RF, false);
 
         self.state.regs.cs = target_cs;
-        self.state.regs.eip = target_ip;
+        self.state.regs.rip = target_ip;
         let entry = self.state.sys.seg_mut(seg::CS);
         entry.selector = target_cs;
-        entry.base = u32::from(target_cs) << 4;
+        entry.base = u64::from(target_cs) << 4;
         self.state.queue.flush();
         Ok(())
     }
 
     /// The protected-mode interrupt sequence: a gate out of the interrupt
     /// descriptor table, and possibly a stack switch to go with it.
+    #[allow(clippy::too_many_lines)]
     fn protected_interrupt(&mut self, vector: u8, error: Option<u32>) -> Ex<()> {
-        let index = u32::from(vector) * 8;
+        // Long mode doubled the interrupt descriptor table's entries, so the
+        // *stride* changes with the mode. An emulator that keeps eight here
+        // reads the second half of the previous gate and lands somewhere
+        // plausible-looking, which is the worst way for this to fail.
+        let long = self.state.sys.long_mode();
+        let stride: u32 = if long { 16 } else { 8 };
+        let index = u32::from(vector) * stride;
         let idtr = self.state.sys.idtr;
         // The error code of a fault *about the table itself* names the entry,
         // with bit 1 set to say the interrupt descriptor table rather than the
         // global one.
-        let table_error = index + 2;
-        if index + 7 > idtr.limit {
+        let table_error = u32::from(vector) * 8 + 2;
+        if index + stride - 1 > idtr.limit {
             return Err(Fault::gp(table_error));
         }
-        let addr = idtr.base.wrapping_add(index);
+        let addr = idtr.base.wrapping_add(u64::from(index));
         let gate = RawDesc {
             low: self.sys_read32(addr)?,
             high: self.sys_read32(addr.wrapping_add(4))?,
+            upper: if long {
+                self.sys_read32(addr.wrapping_add(8))?
+            } else {
+                0
+            },
         };
         if gate.is_app() {
             return Err(Fault::gp(table_error));
         }
         let kind = gate.kind();
-        if kind == sys_type::TASK_GATE {
+        if kind == sys_type::TASK_GATE && !long {
             if !gate.present() {
                 return Err(Fault::coded(VEC_NP, table_error));
             }
             self.switch_task(gate.gate_selector(), true, None)?;
             if let Some(code) = error {
-                self.push(code, 4)?;
+                self.push(u64::from(code), 4)?;
             }
             return Ok(());
         }
         let gate32 = matches!(kind, sys_type::INT_GATE32 | sys_type::TRAP_GATE32);
         let gate16 = matches!(kind, sys_type::INT_GATE16 | sys_type::TRAP_GATE16);
-        if !gate32 && !gate16 {
+        // In long mode the 32-bit gate types are reused for the 64-bit gates —
+        // there is no separate encoding — and the 16-bit ones are invalid.
+        if !gate32 && (!gate16 || long) {
             return Err(Fault::gp(table_error));
         }
         if !gate.present() {
             return Err(Fault::coded(VEC_NP, table_error));
         }
         let interrupt_gate = matches!(kind, sys_type::INT_GATE16 | sys_type::INT_GATE32);
-        let size = if gate32 { 4u8 } else { 2u8 };
+        let size = if long {
+            8u8
+        } else if gate32 {
+            4u8
+        } else {
+            2u8
+        };
 
         let target_sel = gate.gate_selector();
         if Selector(target_sel).is_null() {
@@ -1520,20 +1947,38 @@ impl Exec<'_> {
             return Err(Fault::coded(VEC_NP, u32::from(target_sel & 0xfffc)));
         }
         let conforming = target.high & ar::DC != 0;
-        let offset = if gate32 {
-            gate.gate_offset()
+        let offset = if long {
+            gate.gate_offset64()
+        } else if gate32 {
+            u64::from(gate.gate_offset())
         } else {
-            gate.gate_offset() & 0xffff
+            u64::from(gate.gate_offset() & 0xffff)
         };
 
-        let old_flags = self.state.regs.eflags;
+        let old_flags = u64::from(self.state.regs.eflags);
         let old_cs = self.state.regs.cs;
-        let old_ip = self.state.regs.eip;
+        let old_ip = self.state.regs.rip;
 
-        if !conforming && target.dpl() < cpl {
-            let new_cpl = target.dpl();
-            let (ss_sel, new_sp) = self.tss_stack(new_cpl)?;
-            let ss_desc = self.validate_stack(ss_sel, new_cpl)?;
+        // Long mode pushes `SS:RSP` **always**, even without a privilege
+        // change, and it switches stacks whenever the gate names an interrupt
+        // stack table entry. Both exist so that a handler never has to trust
+        // the stack it was interrupted on — the 32-bit design, which only
+        // switched on a ring change, could not protect a ring-0 fault.
+        let ist = if long { gate.gate_ist() } else { 0 };
+        let switching = (!conforming && target.dpl() < cpl) || ist != 0;
+        if switching {
+            let new_cpl = if conforming { cpl } else { target.dpl() };
+            let (ss_sel, new_sp) = if ist != 0 {
+                (0u16, self.tss_ist(ist)?)
+            } else if long {
+                // A 64-bit stack switch loads a *null* `SS` with the new
+                // privilege level in its selector: there is no stack
+                // descriptor to validate, only `RSP0` out of the 64-bit task
+                // state segment.
+                (u16::from(new_cpl), self.tss_rsp(new_cpl)?)
+            } else {
+                self.tss_stack(new_cpl)?
+            };
             let old_ss = self.state.regs.ss;
             let old_sp = self.sp();
 
@@ -1541,14 +1986,38 @@ impl Exec<'_> {
             // at the *new* privilege level: a page marked supervisor-only is
             // exactly where a ring-0 stack lives.
             self.commit_cs(target_sel, target, new_cpl);
-            *self.state.sys.seg_mut(seg::SS) = ss_desc.to_seg(ss_sel);
+            if long {
+                *self.state.sys.seg_mut(seg::SS) = SegReg {
+                    selector: ss_sel,
+                    base: 0,
+                    limit: 0,
+                    ar: ar::PRESENT | ar::S | ar::RW | ar::ACCESSED,
+                };
+            } else {
+                let ss_desc = self.validate_stack(ss_sel, new_cpl)?;
+                *self.state.sys.seg_mut(seg::SS) = ss_desc.to_seg(ss_sel);
+            }
             self.state.regs.ss = ss_sel;
             self.set_sp(new_sp);
 
-            self.push(u32::from(old_ss), size)?;
+            self.push(u64::from(old_ss), size)?;
             self.push(old_sp, size)?;
             self.push(old_flags, size)?;
-            self.push(u32::from(old_cs), size)?;
+            self.push(u64::from(old_cs), size)?;
+            self.push(old_ip, size)?;
+        } else if long {
+            let new_cpl = if conforming {
+                cpl
+            } else {
+                target.dpl().max(cpl)
+            };
+            let old_ss = self.state.regs.ss;
+            let old_sp = self.sp();
+            self.commit_cs(target_sel, target, new_cpl);
+            self.push(u64::from(old_ss), size)?;
+            self.push(old_sp, size)?;
+            self.push(old_flags, size)?;
+            self.push(u64::from(old_cs), size)?;
             self.push(old_ip, size)?;
         } else {
             let new_cpl = if conforming {
@@ -1560,13 +2029,13 @@ impl Exec<'_> {
             };
             self.commit_cs(target_sel, target, new_cpl);
             self.push(old_flags, size)?;
-            self.push(u32::from(old_cs), size)?;
+            self.push(u64::from(old_cs), size)?;
             self.push(old_ip, size)?;
         }
         if let Some(code) = error {
-            self.push(code, size)?;
+            self.push(u64::from(code), size)?;
         }
-        self.state.regs.eip = offset;
+        self.state.regs.rip = offset;
         // A trap gate leaves interrupts enabled — which is the whole
         // difference between the two, and why a system call goes through a
         // trap gate and a device interrupt through an interrupt gate.
@@ -1618,7 +2087,7 @@ impl Exec<'_> {
             return Err(Fault::coded(VEC_NP, u32::from(selector & 0xfffc)));
         }
         let new_tss = desc.to_seg(selector);
-        if new_tss.limit < tss32::MIN_LIMIT {
+        if u64::from(new_tss.limit) < tss32::MIN_LIMIT {
             return Err(Fault::coded(VEC_TS, u32::from(selector & 0xfffc)));
         }
 
@@ -1638,11 +2107,11 @@ impl Exec<'_> {
         let eflags = self.sys_read32(base.wrapping_add(tss32::EFLAGS))?;
         let mut gpr = [0u32; 8];
         for (i, slot) in gpr.iter_mut().enumerate() {
-            *slot = self.sys_read32(base.wrapping_add(tss32::EAX + 4 * i as u32))?;
+            *slot = self.sys_read32(base.wrapping_add(tss32::EAX + 4 * i as u64))?;
         }
         let mut selectors = [0u16; 6];
         for (i, slot) in selectors.iter_mut().enumerate() {
-            *slot = self.sys_read16(base.wrapping_add(tss32::ES + 4 * i as u32))? as u16;
+            *slot = self.sys_read16(base.wrapping_add(tss32::ES + 4 * i as u64))? as u16;
         }
         let ldt = self.sys_read16(base.wrapping_add(tss32::LDT))? as u16;
 
@@ -1665,14 +2134,14 @@ impl Exec<'_> {
         // floating-point state lazily.
         self.state.sys.cr0 |= cr0::TS;
         if self.state.sys.paging() {
-            self.state.sys.cr3 = cr3;
+            self.state.sys.cr3 = u64::from(cr3);
             self.state.tlb.flush();
         }
 
         for (i, value) in gpr.iter().enumerate() {
             self.state.regs.set_dword(i as u8, *value);
         }
-        self.state.regs.eip = eip;
+        self.state.regs.rip = u64::from(eip);
         let mut flags_value = eflags;
         if !returning && nested {
             flags_value |= flags::NT;
@@ -1715,17 +2184,17 @@ impl Exec<'_> {
     /// Write the outgoing task's state into its own task state segment.
     fn save_task_state(&mut self, tss: SegReg) -> Ex<()> {
         let base = tss.base;
-        let eip = self.state.regs.eip;
-        self.sys_write32(base.wrapping_add(tss32::EIP), eip)?;
+        let eip = self.state.regs.rip;
+        self.sys_write32(base.wrapping_add(tss32::EIP), eip as u32)?;
         let eflags = self.state.regs.eflags;
         self.sys_write32(base.wrapping_add(tss32::EFLAGS), eflags)?;
         for i in 0..8u8 {
             let value = self.state.regs.dword(i);
-            self.sys_write32(base.wrapping_add(tss32::EAX + 4 * u32::from(i)), value)?;
+            self.sys_write32(base.wrapping_add(tss32::EAX + 4 * u64::from(i)), value)?;
         }
         for (i, index) in TSS_SEG_ORDER.iter().enumerate() {
             let value = u32::from(self.state.regs.segment(*index));
-            self.sys_write32(base.wrapping_add(tss32::ES + 4 * i as u32), value)?;
+            self.sys_write32(base.wrapping_add(tss32::ES + 4 * i as u64), value)?;
         }
         let ldt = u32::from(self.state.sys.ldtr.selector);
         self.sys_write32(base.wrapping_add(tss32::LDT), ldt)
@@ -1763,12 +2232,17 @@ impl Exec<'_> {
             return Err(Fault::bare(VEC_UD));
         }
         let (sr, off) = self.ea();
-        let limit = self.read_mem(sr, off, 2)?;
-        let base = self.read_mem(sr, off.wrapping_add(2), 4)?;
+        let limit = self.read_mem(sr, off, 2)? as u32;
+        // In 64-bit mode the pseudo-descriptor is ten bytes, not six: the
+        // base is a full linear address and there is no 16-bit form. That
+        // is why the width comes from the mode rather than from `opsize`,
+        // which a `66` prefix could otherwise narrow.
+        let width = if self.sixty_four() { 8u8 } else { 4 };
+        let base = self.read_mem(sr, off.wrapping_add(2), width)?;
         // With a 16-bit operand size only twenty-four bits of base are loaded,
         // which is the 286 compatibility this instruction carries. The top
         // byte is not read from somewhere else — it is discarded.
-        let base = if f.opsize == 2 {
+        let base = if f.opsize == 2 && !self.sixty_four() {
             base & 0x00ff_ffff
         } else {
             base
@@ -1793,13 +2267,14 @@ impl Exec<'_> {
             self.state.sys.idtr
         };
         let (sr, off) = self.ea();
-        self.write_mem(sr, off, 2, reg.limit & 0xffff)?;
-        let base = if f.opsize == 2 {
+        self.write_mem(sr, off, 2, u64::from(reg.limit & 0xffff))?;
+        let width = if self.sixty_four() { 8u8 } else { 4 };
+        let base = if f.opsize == 2 && !self.sixty_four() {
             reg.base & 0x00ff_ffff
         } else {
             reg.base
         };
-        self.write_mem(sr, off.wrapping_add(2), 4, base)
+        self.write_mem(sr, off.wrapping_add(2), width, base)
     }
 
     /// `LLDT` and `LTR`.
@@ -1815,7 +2290,15 @@ impl Exec<'_> {
             return Err(Fault::gp(u32::from(selector & 0xfffc)));
         }
         let desc = self.descriptor(selector, VEC_GP)?;
-        if desc.is_app() || !matches!(desc.kind(), sys_type::TSS16_AVAIL | sys_type::TSS32_AVAIL) {
+        // Long mode reuses type 9 for its own task state segment — a table of
+        // stack pointers rather than a task's saved state — and drops the
+        // 286 form entirely.
+        let kinds: &[u8] = if self.state.sys.long_mode() {
+            &[sys_type::TSS32_AVAIL]
+        } else {
+            &[sys_type::TSS16_AVAIL, sys_type::TSS32_AVAIL]
+        };
+        if desc.is_app() || !kinds.contains(&desc.kind()) {
             return Err(Fault::gp(u32::from(selector & 0xfffc)));
         }
         if !desc.present() {
@@ -1846,7 +2329,7 @@ impl Exec<'_> {
         self.require_ring0()?;
         let value = self.read_arg(f, f.insn.dst, 2)?;
         let old = self.state.sys.cr0;
-        self.state.sys.cr0 = (old & !cr0::MSW) | (value & cr0::MSW) | (old & cr0::PE);
+        self.state.sys.cr0 = (old & !cr0::MSW) | (value as u32 & cr0::MSW) | (old & cr0::PE);
         Ok(())
     }
 
@@ -1876,10 +2359,14 @@ impl Exec<'_> {
         if sel.offset() + 7 > table.limit {
             return Ok(None);
         }
-        let addr = table.base.wrapping_add(sel.offset());
+        let addr = table.base.wrapping_add(u64::from(sel.offset()));
         let low = self.sys_read32(addr)?;
         let high = self.sys_read32(addr.wrapping_add(4))?;
-        Ok(Some(RawDesc { low, high }))
+        Ok(Some(RawDesc {
+            low,
+            high,
+            upper: 0,
+        }))
     }
 
     /// Whether a descriptor is visible from the current privilege level.
@@ -1939,11 +2426,11 @@ impl Exec<'_> {
             return Ok(());
         }
         self.set_flag(flags::ZF, true);
-        let value = if f.insn.op == Op::LAR {
+        let value = u64::from(if f.insn.op == Op::LAR {
             desc.ar()
         } else {
             desc.limit()
-        };
+        });
         let opsize = f.opsize;
         self.write_arg(f, f.insn.dst, opsize, value)
     }
@@ -1984,7 +2471,7 @@ impl Exec<'_> {
         if dst & 3 < src & 3 {
             self.set_flag(flags::ZF, true);
             let raised = (dst & 0xfffc) | (src & 3);
-            self.write_arg(f, f.insn.dst, 2, u32::from(raised))?;
+            self.write_arg(f, f.insn.dst, 2, u64::from(raised))?;
         } else {
             self.set_flag(flags::ZF, false);
         }
@@ -1994,35 +2481,64 @@ impl Exec<'_> {
     // -- Control, debug and test registers -----------------------------
 
     /// `MOV r32, CRn`.
-    pub(super) fn read_control(&mut self, index: u8) -> Ex<u32> {
+    pub(super) fn read_control(&mut self, index: u8) -> Ex<u64> {
         self.require_ring0()?;
         match index {
-            0 => Ok(self.state.sys.cr0),
+            0 => Ok(u64::from(self.state.sys.cr0)),
             2 => Ok(self.state.sys.cr2),
             3 => Ok(self.state.sys.cr3),
+            4 if self.cfg.features.cr4 => Ok(self.state.sys.cr4),
             // `CR1` is reserved and `CR4` arrived with the Pentium; naming one
-            // on a 386 or 486 is an invalid opcode, not a read of zero.
+            // on a part that has none is an invalid opcode, not a read of
+            // zero — a guest probes with exactly this.
             _ => Err(Fault::bare(VEC_UD)),
         }
     }
 
-    /// `MOV CRn, r32`.
-    pub(super) fn write_control(&mut self, index: u8, value: u32) -> Ex<()> {
+    /// `MOV CRn, r`.
+    ///
+    /// The three writes that change the processor's *mode* all land here, and
+    /// the ordering rules between them are the whole of the long-mode
+    /// transition (*Intel SDM* volume 3 §9.8.5):
+    ///
+    /// 1. `CR0.PG` is cleared, so nothing is translating.
+    /// 2. `CR4.PAE` is set, because the four-level walk is the PAE walk.
+    /// 3. `CR3` is loaded with the `PML4`'s address.
+    /// 4. `EFER.LME` is set — through a `WRMSR`, not through here.
+    /// 5. `CR0.PG` is set again, and *the processor* sets `EFER.LMA`.
+    ///
+    /// Only step 5 makes the transition; the rest are prerequisites, and each
+    /// is enforced below rather than assumed.
+    pub(super) fn write_control(&mut self, index: u8, value: u64) -> Ex<()> {
         self.require_ring0()?;
         match index {
             0 => {
-                let valid = if self.variant().has_486_extras() {
+                let valid = if self.cfg.features.extras_486 {
                     cr0::VALID_486
                 } else {
                     cr0::VALID_386
                 };
                 let old = self.state.sys.cr0;
-                let new = value & valid;
+                let new = (value as u32) & valid;
                 // Paging without protection is impossible: the page tables are
                 // walked with linear addresses, and without segmentation there
                 // is nothing for them to protect.
                 if new & cr0::PG != 0 && new & cr0::PE == 0 {
                     return Err(Fault::gp(0));
+                }
+                let lme = self.state.sys.efer & efer::LME != 0;
+                if new & cr0::PG != 0 && old & cr0::PG == 0 && lme {
+                    // Entering long mode. `CR4.PAE` must already be set: the
+                    // four-level walk *is* the PAE walk with a level added, so
+                    // there is no long mode without it.
+                    if self.state.sys.cr4 & cr4::PAE == 0 {
+                        return Err(Fault::gp(0));
+                    }
+                    self.state.sys.efer |= efer::LMA;
+                } else if new & cr0::PG == 0 && old & cr0::PG != 0 {
+                    // Leaving paging leaves long mode with it — `LMA` is a
+                    // status bit, not a latch.
+                    self.state.sys.efer &= !efer::LMA;
                 }
                 self.state.sys.cr0 = new;
                 if (old ^ new) & (cr0::PG | cr0::WP | cr0::PE) != 0 {
@@ -2042,8 +2558,289 @@ impl Exec<'_> {
                 self.state.tlb.flush();
                 Ok(())
             }
+            4 if self.cfg.features.cr4 => {
+                let old = self.state.sys.cr4;
+                // Only the bits this core models have storage. A guest that
+                // sets one we do not have reads back a zero and knows.
+                let valid = cr4::VME
+                    | cr4::PVI
+                    | cr4::TSD
+                    | cr4::DE
+                    | cr4::PSE
+                    | cr4::PAE
+                    | cr4::MCE
+                    | cr4::PGE
+                    | cr4::PCE
+                    | cr4::OSFXSR
+                    | cr4::OSXMMEXCPT;
+                let new = value & valid;
+                // `CR4.PAE` cannot be cleared while long mode is active: the
+                // page tables under the processor's feet would change shape.
+                if self.state.sys.long_mode() && new & cr4::PAE == 0 {
+                    return Err(Fault::gp(0));
+                }
+                self.state.sys.cr4 = new;
+                if (old ^ new) & (cr4::PAE | cr4::PSE | cr4::PGE) != 0 {
+                    self.state.tlb.flush();
+                }
+                Ok(())
+            }
             _ => Err(Fault::bare(VEC_UD)),
         }
+    }
+
+    /// `RDMSR`: read the model-specific register `ECX` names into `EDX:EAX`.
+    ///
+    /// # Errors
+    ///
+    /// `#GP(0)` outside ring 0 or for an address this core does not implement,
+    /// and `#UD` on a part with no model-specific registers at all.
+    pub(super) fn rdmsr(&mut self) -> Ex<()> {
+        if !self.cfg.features.msr {
+            return Err(Fault::bare(VEC_UD));
+        }
+        self.require_ring0()?;
+        let index = self.state.regs.rcx as u32;
+        let value = self.msr_read(index)?;
+        // `EDX:EAX`, and each half **zero-extends** into its 64-bit register
+        // as any other 32-bit write does.
+        self.state.regs.set_dword(0, value as u32);
+        self.state.regs.set_dword(2, (value >> 32) as u32);
+        Ok(())
+    }
+
+    /// `WRMSR`: write `EDX:EAX` to the model-specific register `ECX` names.
+    ///
+    /// # Errors
+    ///
+    /// As [`Exec::rdmsr`], plus `#GP(0)` for a value the register refuses.
+    pub(super) fn wrmsr(&mut self) -> Ex<()> {
+        if !self.cfg.features.msr {
+            return Err(Fault::bare(VEC_UD));
+        }
+        self.require_ring0()?;
+        let index = self.state.regs.rcx as u32;
+        let value =
+            u64::from(self.state.regs.rax as u32) | (u64::from(self.state.regs.rdx as u32) << 32);
+        self.msr_write(index, value)
+    }
+
+    fn msr_read(&mut self, index: u32) -> Ex<u64> {
+        let sys = &self.state.sys;
+        let value = match index {
+            msr::EFER if self.cfg.features.long => sys.efer,
+            msr::STAR if self.cfg.features.syscall => sys.star,
+            msr::LSTAR if self.cfg.features.syscall => sys.lstar,
+            msr::CSTAR if self.cfg.features.syscall => sys.cstar,
+            msr::SFMASK if self.cfg.features.syscall => sys.sfmask,
+            msr::FS_BASE if self.cfg.features.long => sys.fs_base,
+            msr::GS_BASE if self.cfg.features.long => sys.gs_base,
+            msr::KERNEL_GS_BASE if self.cfg.features.long => sys.kernel_gs_base,
+            _ => return Err(Fault::gp(0)),
+        };
+        Ok(value)
+    }
+
+    fn msr_write(&mut self, index: u32, value: u64) -> Ex<()> {
+        match index {
+            msr::EFER if self.cfg.features.long => {
+                // `LME` may not be changed while paging is on: the transition
+                // is defined only across a `CR0.PG` edge, and allowing it
+                // would leave `LMA` describing a walk that never happened.
+                let old = self.state.sys.efer;
+                let mut new = value & efer::WRITABLE;
+                if !self.cfg.features.nx {
+                    new &= !efer::NXE;
+                }
+                if !self.cfg.features.syscall {
+                    new &= !efer::SCE;
+                }
+                if (old ^ new) & efer::LME != 0 && self.state.sys.cr0 & cr0::PG != 0 {
+                    return Err(Fault::gp(0));
+                }
+                // `LMA` is read-only: whatever software wrote there is
+                // discarded and the processor's own bit is kept.
+                self.state.sys.efer = new | (old & efer::LMA);
+                if (old ^ new) & efer::NXE != 0 {
+                    self.state.tlb.flush();
+                }
+                Ok(())
+            }
+            msr::STAR if self.cfg.features.syscall => {
+                self.state.sys.star = value;
+                Ok(())
+            }
+            msr::LSTAR if self.cfg.features.syscall => {
+                if !canonical(value) {
+                    return Err(Fault::gp(0));
+                }
+                self.state.sys.lstar = value;
+                Ok(())
+            }
+            msr::CSTAR if self.cfg.features.syscall => {
+                if !canonical(value) {
+                    return Err(Fault::gp(0));
+                }
+                self.state.sys.cstar = value;
+                Ok(())
+            }
+            msr::SFMASK if self.cfg.features.syscall => {
+                self.state.sys.sfmask = value;
+                Ok(())
+            }
+            // Writing a segment base MSR writes the *hidden* base of the
+            // register too, which is the only way to give `FS` or `GS` a base
+            // in 64-bit mode — there is no descriptor involved.
+            msr::FS_BASE if self.cfg.features.long => {
+                if !canonical(value) {
+                    return Err(Fault::gp(0));
+                }
+                self.state.sys.fs_base = value;
+                self.state.sys.seg_mut(seg::FS).base = value;
+                Ok(())
+            }
+            msr::GS_BASE if self.cfg.features.long => {
+                if !canonical(value) {
+                    return Err(Fault::gp(0));
+                }
+                self.state.sys.gs_base = value;
+                self.state.sys.seg_mut(seg::GS).base = value;
+                Ok(())
+            }
+            msr::KERNEL_GS_BASE if self.cfg.features.long => {
+                if !canonical(value) {
+                    return Err(Fault::gp(0));
+                }
+                self.state.sys.kernel_gs_base = value;
+                Ok(())
+            }
+            _ => Err(Fault::gp(0)),
+        }
+    }
+
+    /// A code or data segment as `SYSCALL` and `SYSRET` synthesise one.
+    ///
+    /// Neither instruction reads the descriptor table at all: the selectors
+    /// come from `IA32_STAR` and the *descriptors* are fixed by the
+    /// architecture. That is the whole speed-up — a system call that walks the
+    /// GDT is a system call that touches memory — and it is also why an
+    /// operating system has to lay its GDT out in the order `STAR` assumes
+    /// rather than the other way round.
+    fn syscall_seg(selector: u16, code: bool, long: bool) -> SegReg {
+        let mut ar = ar::PRESENT | ar::S | ar::RW | ar::ACCESSED | ar::GRANULAR;
+        if code {
+            ar |= ar::CODE;
+            if long {
+                ar |= ar::L;
+            } else {
+                ar |= ar::DB;
+            }
+        } else {
+            ar |= ar::DB;
+        }
+        SegReg {
+            selector,
+            base: 0,
+            limit: 0xffff_ffff,
+            ar,
+        }
+    }
+
+    /// `SYSCALL`: the fast path into the kernel.
+    ///
+    /// `RCX` takes the return address and `R11` the flags — *not* the stack,
+    /// which is left exactly as user mode had it. A kernel's first job after
+    /// `SYSCALL` is therefore to find a stack of its own, which is what
+    /// `SWAPGS` and a per-CPU structure behind `GS` are for.
+    ///
+    /// *AMD64 Architecture Programmer's Manual* volume 3, `SYSCALL`.
+    ///
+    /// # Errors
+    ///
+    /// `#UD` where the feature is absent, `EFER.SCE` is clear, or the
+    /// processor is not in 64-bit mode.
+    pub(super) fn syscall(&mut self) -> Ex<()> {
+        if !self.cfg.features.syscall || self.state.sys.efer & efer::SCE == 0 || !self.sixty_four()
+        {
+            return Err(Fault::bare(VEC_UD));
+        }
+        let sys = self.state.sys;
+        // `STAR[47:32]` is the kernel's `CS`; `SS` is that plus eight, which
+        // is why the GDT has to hold them adjacently.
+        let cs_sel = ((sys.star >> 32) as u16) & 0xfffc;
+        self.state.regs.rcx = self.state.regs.rip;
+        self.state.regs.r[3] = u64::from(self.state.regs.eflags);
+        self.state.regs.rip = sys.lstar;
+        *self.state.sys.seg_mut(seg::CS) = Self::syscall_seg(cs_sel, true, true);
+        *self.state.sys.seg_mut(seg::SS) = Self::syscall_seg(cs_sel + 8, false, true);
+        self.state.regs.cs = cs_sel;
+        self.state.regs.ss = cs_sel + 8;
+        let masked = self.state.regs.eflags & !(sys.sfmask as u32) & !flags::RF;
+        self.set_flags(masked);
+        self.state.queue.flush();
+        Ok(())
+    }
+
+    /// `SYSRET`: back out again.
+    ///
+    /// `REX.W` selects the 64-bit form, which returns to 64-bit mode; without
+    /// it the return is to compatibility mode, and the selectors differ by
+    /// sixteen rather than by nothing. Returning always lands at privilege 3 —
+    /// there is no other level `SYSRET` can reach, which is why a kernel
+    /// cannot use it to return to itself.
+    ///
+    /// # Errors
+    ///
+    /// `#UD` outside 64-bit mode, `#GP(0)` outside ring 0.
+    pub(super) fn sysret(&mut self, opsize: u8) -> Ex<()> {
+        if !self.cfg.features.syscall || self.state.sys.efer & efer::SCE == 0 || !self.sixty_four()
+        {
+            return Err(Fault::bare(VEC_UD));
+        }
+        self.require_ring0()?;
+        let sys = self.state.sys;
+        let base = (sys.star >> 48) as u16;
+        let wide = opsize == 8;
+        // `STAR[63:48]` names the compatibility-mode `CS`; the 64-bit one is
+        // sixteen further on, and both come back at privilege 3.
+        let cs_sel = (base + if wide { 16 } else { 0 }) | 3;
+        let ss_sel = (base + 8) | 3;
+        let target = self.state.regs.rcx;
+        if wide && !canonical(target) {
+            return Err(Fault::gp(0));
+        }
+        *self.state.sys.seg_mut(seg::CS) = Self::syscall_seg(cs_sel, true, wide);
+        *self.state.sys.seg_mut(seg::SS) = Self::syscall_seg(ss_sel, false, false);
+        self.state.regs.cs = cs_sel;
+        self.state.regs.ss = ss_sel;
+        self.state.regs.rip = if wide { target } else { target & 0xffff_ffff };
+        // `R11` carries the flags back, and `RF` and `VM` are cleared rather
+        // than restored — the same rule `IRET` follows.
+        let restored = (self.state.regs.r[3] as u32) & !(flags::RF | flags::VM);
+        self.set_flags(restored);
+        self.state.queue.flush();
+        Ok(())
+    }
+
+    /// `SWAPGS`: exchange the `GS` base with `IA32_KERNEL_GS_BASE`.
+    ///
+    /// One instruction because it has to be atomic with respect to an
+    /// interrupt: a kernel entered from user mode has no register it can
+    /// safely clobber to find its own state, so the exchange is the first
+    /// thing it does and nothing may run between the two halves.
+    ///
+    /// # Errors
+    ///
+    /// `#UD` outside 64-bit mode, `#GP(0)` outside ring 0.
+    pub(super) fn swapgs(&mut self) -> Ex<()> {
+        if !self.sixty_four() {
+            return Err(Fault::bare(VEC_UD));
+        }
+        self.require_ring0()?;
+        let sys = &mut self.state.sys;
+        core::mem::swap(&mut sys.gs_base, &mut sys.kernel_gs_base);
+        sys.seg_mut(seg::GS).base = sys.gs_base;
+        Ok(())
     }
 
     /// `MOV r32, DRn`.
@@ -2052,13 +2849,13 @@ impl Exec<'_> {
     /// **not** implemented, so `DR7` can be armed and nothing will fire. That
     /// is a known gap rather than a silent one: software that sets a
     /// breakpoint gets no trap rather than a wrong one.
-    pub(super) fn read_debug(&mut self, index: u8) -> Ex<u32> {
+    pub(super) fn read_debug(&mut self, index: u8) -> Ex<u64> {
         self.require_ring0()?;
         Ok(self.state.sys.dr[usize::from(Self::debug_index(index))])
     }
 
     /// `MOV DRn, r32`.
-    pub(super) fn write_debug(&mut self, index: u8, value: u32) -> Ex<()> {
+    pub(super) fn write_debug(&mut self, index: u8, value: u64) -> Ex<()> {
         self.require_ring0()?;
         self.state.sys.dr[usize::from(Self::debug_index(index))] = value;
         Ok(())
@@ -2074,12 +2871,12 @@ impl Exec<'_> {
     }
 
     /// `MOV r32, TRn`: the 386's translation-lookaside-buffer test registers.
-    pub(super) fn read_test(&mut self, index: u8) -> Ex<u32> {
+    pub(super) fn read_test(&mut self, index: u8) -> Ex<u64> {
         self.require_ring0()?;
         if index < 6 {
             return Err(Fault::bare(VEC_UD));
         }
-        Ok(self.state.sys.test[(index & 7) as usize])
+        Ok(u64::from(self.state.sys.test[(index & 7) as usize]))
     }
 
     /// `MOV TRn, r32`.
@@ -2088,12 +2885,12 @@ impl Exec<'_> {
     /// entry into the translation buffer; here the buffer is a cache of the
     /// page tables and nothing else, so an injected entry would have nothing
     /// to be consistent with.
-    pub(super) fn write_test(&mut self, index: u8, value: u32) -> Ex<()> {
+    pub(super) fn write_test(&mut self, index: u8, value: u64) -> Ex<()> {
         self.require_ring0()?;
         if index < 6 {
             return Err(Fault::bare(VEC_UD));
         }
-        self.state.sys.test[(index & 7) as usize] = value;
+        self.state.sys.test[(index & 7) as usize] = value as u32;
         Ok(())
     }
 }
@@ -2128,6 +2925,7 @@ mod tests {
         let d = RawDesc {
             low: 0x5678_ffff,
             high: 0x00cf_9a12 | 0x3400_0000,
+            upper: 0,
         };
         assert_eq!(d.base(), 0x3412_5678);
         assert_eq!(d.limit(), 0xffff_ffff);
@@ -2143,6 +2941,7 @@ mod tests {
         let d = RawDesc {
             low: 0x0000_0000,
             high: 0x0080_9200,
+            upper: 0,
         };
         assert_eq!(d.limit(), 0xfff);
     }
@@ -2208,6 +3007,7 @@ mod tests {
         let g = RawDesc {
             low: 0x0008_1234,
             high: 0xabcd_8e00,
+            upper: 0,
         };
         assert_eq!(g.gate_selector(), 8);
         assert_eq!(g.gate_offset(), 0xabcd_1234);

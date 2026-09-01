@@ -599,7 +599,7 @@ struct Failure {
 /// Apply one `"name": value` pair from the corpus to a register file.
 fn apply_reg(regs: &mut Regs, name: &str, value: u16) {
     let reg = Reg::from_name(name).unwrap_or_else(|| panic!("unknown register `{name}`"));
-    reg.set(regs, u32::from(value));
+    reg.set(regs, u64::from(value));
 }
 
 /// The corpus's register order, for a readable diff.
@@ -684,7 +684,7 @@ fn run_file(path: &Path, cfg: Config, check_bus: bool) -> (usize, Vec<Failure>) 
                 let selector = session.state.regs.segment(index);
                 let entry = session.state.sys.seg_mut(index);
                 entry.selector = selector;
-                entry.base = u32::from(selector) << 4;
+                entry.base = u64::from(selector) << 4;
                 entry.limit = 0xffff;
             }
         }

@@ -1,11 +1,23 @@
-//! Intel x86: the 8086 and 8088 in real mode, and the 80386 and 80486 with
-//! protection, paging and 32-bit operands.
+//! Intel x86: the 8086 and 8088 in real mode, the 80386 and 80486 with
+//! protection, paging and 32-bit operands, and x86-64 with long mode.
 //!
-//! `ROADMAP.md` §6 calls x86 "the hard one". One interpreter covers all four
-//! parts, selected by [`Variant`] rather than by a second module, because the
-//! generations really are close to a superset chain — and where they are not,
-//! the difference is named and modelled rather than flattened (the table in
-//! the private `exec` module lists all ten).
+//! `ROADMAP.md` §6 calls x86 "the hard one". One interpreter covers every
+//! part, selected by [`Variant`] and [`Features`] rather than by a second
+//! module, because the generations really are close to a superset chain — and
+//! where they are not, the difference is named and modelled rather than
+//! flattened (the table in the private `exec` module lists all ten, and
+//! [`isa::L64`] lists the ones long mode added).
+//!
+//! # The lattice, not the ladder
+//!
+//! [`Variant`] names a *part* and [`Features`] says what it has, and the two
+//! are separate on purpose (`ROADMAP.md` §6.1.1). `PAE` arrived on a Pentium
+//! Pro with no long mode; `SYSCALL` on an AMD K6 with no 64-bit anything;
+//! `NX` on parts that shipped both with and without it inside one model
+//! number. So a decode or execute site asks whether the *feature* is present,
+//! never whether the variant is at least some other variant — and [`Variant`]
+//! is deliberately not `Ord`, so it cannot grow the comparison that would make
+//! that possible.
 //!
 //! # What is modelled
 //!
@@ -36,10 +48,22 @@
 //! call, interrupt, trap and task gates; the task state segment, its
 //! privilege-0 stack and its I/O permission bitmap; and task switching.
 //!
-//! **Paging** ([`paging`]): the two-level directory and table walk, `CR2` and
-//! `CR3`, the accessed and dirty bits written by the walk itself, a
-//! translation-lookaside buffer so they are written once rather than on every
-//! access, `INVLPG`, and page faults with the three-bit error code.
+//! **Paging** ([`paging`]): one walk at four depths — off, the two-level
+//! directory and table, PAE's three levels of 64-bit entries, and IA-32e's
+//! four — with 4 MiB, 2 MiB and 1 GiB pages, `CR2` and `CR3`, the accessed and
+//! dirty bits written by the walk itself, a translation-lookaside buffer so
+//! they are written once rather than on every access, `INVLPG`, and page
+//! faults with their error code. The debug walk shares the same function
+//! rather than duplicating it.
+//!
+//! **Long mode** ([`prot`], [`isa`]): `EFER.LME` and the `LMA` bit the
+//! processor sets for itself when paging comes on; `CR4` and the
+//! model-specific registers; the `REX` prefix, sixteen 64-bit registers, and
+//! `RIP`-relative addressing; the changed default operand sizes and the
+//! twenty-odd encodings long mode reclaimed; 64-bit and compatibility submodes
+//! with the descriptor `L` bit that selects them; sixteen-byte system
+//! descriptors and interrupt gates with their interrupt-stack table; the
+//! canonical-address rule; and `SYSCALL`, `SYSRET` and `SWAPGS`.
 //!
 //! **The exception model**: faults, traps and aborts, with the vectors and
 //! error codes the manual gives them; faults restart the instruction they came
@@ -52,9 +76,22 @@
 //!
 //! # What is not
 //!
-//! - **No floating-point unit.** There is no 387 and no `CPUID` bit claiming
-//!   one; with `CR0.EM` or `CR0.TS` set an escape raises `#NM` so software can
+//! - **No floating-point unit, and no SIMD.** There is no 387, no MMX and no
+//!   SSE; with `CR0.EM` or `CR0.TS` set an escape raises `#NM` so software can
 //!   emulate, which is what an operating system that wants to do so asks for.
+//!   `CR4.OSFXSR` and `CR4.OSXMMEXCPT` have storage because an operating
+//!   system writes and reads them before it decides anything, and **no
+//!   `CPUID` bit claims any of it** — the bits are modelled and the arithmetic
+//!   is not, deliberately, so a guest fails its own feature check rather than
+//!   hitting a `#UD` in the middle of a kernel. A 64-bit operating system that
+//!   requires SSE2 will therefore refuse to boot, and say so.
+//! - **No `CMPXCHG8B` or `CMPXCHG16B`**, and `CPUID`'s `CX8` bit is clear to
+//!   match.
+//! - **No hardware task switching in long mode**, which is the architecture:
+//!   a far transfer to a task gate or a task state segment is `#GP` there, and
+//!   the 64-bit task state segment is read only for its stack pointers.
+//! - **No virtual-address width above 48 bits.** Five-level paging (`LA57`)
+//!   is not implemented, and `CPUID` leaf `8000_0008` reports 48.
 //! - **No virtual-8086 mode.** `EFLAGS.VM` has storage and nothing sets it.
 //! - **No debug breakpoints.** `DR0`-`DR7` round-trip; arming one fires
 //!   nothing. `TR6`/`TR7` likewise store and do nothing.
@@ -106,7 +143,7 @@
 //! cpu.step();                       // the reset sequence
 //! assert_eq!(cpu.regs().cs, 0xffff);
 //! cpu.step();                       // mov ax, 0x1234
-//! assert_eq!(cpu.regs().eax & 0xffff, 0x1234);
+//! assert_eq!(cpu.regs().rax & 0xffff, 0x1234);
 //! ```
 //!
 //! A 386 or a 486 resets differently, and the difference is the one that
@@ -135,9 +172,19 @@
 //! sandpile.org's encoding tables for what the manuals leave out. Undefined
 //! behaviour was measured against `SingleStepTests/8088` (MIT), which is
 //! hardware output rather than anyone's emulator, and the 32-bit encodings
-//! were cross-checked against GNU `as` and `objdump`. **No copyleft emulator
-//! was consulted** — `docs/cpu/x86.md` names the three that people reach for
-//! when x86 gets hard and records that all three are forbidden.
+//! were cross-checked against GNU `as` and `objdump`.
+//!
+//! For **long mode**: the *Intel SDM* volume 2 for `REX`, the changed operand
+//! sizes and the reclaimed encodings, and volume 3 chapters 4 (paging), 6
+//! (the 64-bit interrupt descriptor table) and 9.8.5 (the activation
+//! sequence); and the *AMD64 Architecture Programmer's Manual* volumes 2 and
+//! 3, which are clearer on the parts AMD designed — the submodes, `SYSCALL`,
+//! and which descriptor fields stop being read. Every non-obvious behaviour
+//! carries its volume and section where it is implemented.
+//!
+//! **No copyleft emulator was consulted** — `docs/cpu/x86.md` names the three
+//! that people reach for when x86 gets hard and records that all three are
+//! forbidden.
 
 pub mod disasm;
 mod exec;
@@ -260,7 +307,11 @@ pub mod flags {
 /// the flags register growing bits, `PUSH SP` changing what it pushes, the
 /// shift count gaining a mask — are selected here (`ROADMAP.md` §6.1.1, and
 /// the same argument the 6502 core makes for its three parts).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// Deliberately **not** `Ord`: `ROADMAP.md` §6.1.1's whole point is that
+/// `if variant >= X` is the bug, and a type that cannot be compared cannot
+/// grow one. Ask [`Features`] instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Variant {
     /// 16-bit external bus, six-byte prefetch queue, real mode only.
     I8086,
@@ -277,6 +328,139 @@ pub enum Variant {
     /// This is the variant firmware wants: SeaBIOS executes `CPUID`, which a
     /// 386 answers with an invalid-opcode exception.
     I80486,
+    /// A generic x86-64 part: everything the 486 has, plus `CR4`, the
+    /// model-specific registers, physical address extension, four-level
+    /// paging, and long mode with its `REX` prefix and sixteen 64-bit
+    /// registers.
+    ///
+    /// Deliberately not named after a chip. What distinguishes one x86-64 from
+    /// another is a set of *independently selectable* extensions — [`Features`]
+    /// — and a name here would imply a fixed bundle of them. This is the
+    /// baseline: the architecture AMD introduced, with the pieces every part
+    /// implementing it has to have.
+    X86_64,
+}
+
+/// The extensions an instance has, selected independently of the part.
+///
+/// `ROADMAP.md` §6.1.1: a lattice, not a ladder. x86 gets this wrong more
+/// often than most architectures because the marketing names *look* linear —
+/// but `PAE` arrived on a Pentium Pro without long mode, `CMOV` on a Pentium
+/// Pro but not on the contemporary Cyrix parts, `SYSCALL` on an AMD K6 with no
+/// 64-bit anything, and `NX` on parts that shipped both with and without it
+/// inside the same model number. So a decode site asks whether the *feature*
+/// is present, never whether the variant is at least some other variant, and
+/// there is no `PartialOrd` on [`Variant`] for it to reach for.
+///
+/// Total and un-`cfg`'d, as `riscv::Extensions` is: every field exists in
+/// every build, so `Features` is one type with one shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Features {
+    /// The 80486 additions: `CPUID`, `BSWAP`, `XADD`, `CMPXCHG`, `INVLPG`, the
+    /// cache-control instructions, and `CR0.WP`.
+    pub extras_486: bool,
+    /// `CR4` exists. Everything below it in this struct needs a bit in it, so
+    /// a part with an extension and no `CR4` is not expressible — which is
+    /// correct, because no such part exists.
+    pub cr4: bool,
+    /// The model-specific registers, `RDMSR` and `WRMSR`.
+    pub msr: bool,
+    /// Physical address extension: `CR4.PAE`, 64-bit page-table entries, and
+    /// the three-level walk.
+    pub pae: bool,
+    /// Long mode: `EFER.LME`/`LMA`, four-level paging, the `REX` prefix, the
+    /// sixteen 64-bit registers, and 64-bit and compatibility submodes.
+    ///
+    /// Implies [`pae`](Features::pae) at *construction* — a long-mode part
+    /// without physical address extension cannot exist, because the four-level
+    /// walk is the PAE walk with a level added — and [`Features::validate`] says
+    /// so rather than silently turning it on.
+    pub long: bool,
+    /// The no-execute page bit: `EFER.NXE` and bit 63 of a page-table entry.
+    pub nx: bool,
+    /// `SYSCALL` and `SYSRET`, with `STAR`, `LSTAR`, `CSTAR` and `SFMASK`.
+    pub syscall: bool,
+    /// The conditional moves, `CMOVcc` and their `FCMOV` counterparts. Only
+    /// the integer half is implemented here; the floating-point half belongs
+    /// to whoever lands x87.
+    pub cmov: bool,
+    /// The page-size extension: `CR4.PSE` and 4 MiB pages in a legacy
+    /// two-level walk.
+    pub pse: bool,
+    /// Global pages: `CR4.PGE` and bit 8 of a page-table entry.
+    pub pge: bool,
+}
+
+impl Features {
+    /// Nothing beyond the base architecture — an 8086, an 8088 or a 386.
+    pub const NONE: Features = Features {
+        extras_486: false,
+        cr4: false,
+        msr: false,
+        pae: false,
+        long: false,
+        nx: false,
+        syscall: false,
+        cmov: false,
+        pse: false,
+        pge: false,
+    };
+
+    /// What an 80486 has.
+    pub const I80486: Features = Features {
+        extras_486: true,
+        ..Features::NONE
+    };
+
+    /// What the baseline x86-64 part has.
+    ///
+    /// Every one of these is architecturally required of a processor that
+    /// enters long mode (*AMD64 Architecture Programmer's Manual* volume 2
+    /// §1.2, and the *Intel SDM* volume 3 §9.8.5 sequence, which cannot be
+    /// executed without `CR4.PAE` and the `EFER` MSR).
+    pub const X86_64: Features = Features {
+        extras_486: true,
+        cr4: true,
+        msr: true,
+        pae: true,
+        long: true,
+        nx: true,
+        syscall: true,
+        cmov: true,
+        pse: true,
+        pge: true,
+    };
+
+    /// Whether this combination describes a part that could exist.
+    ///
+    /// # Errors
+    ///
+    /// If an extension is selected whose prerequisite is not.
+    pub fn validate(self) -> Result<()> {
+        let missing = |need: &str, want: &str| {
+            Err(Error::Property(alloc::format!(
+                "an x86 with `{want}` must also have `{need}`"
+            )))
+        };
+        if self.long && !self.pae {
+            return missing("pae", "long");
+        }
+        if self.pae && !self.cr4 {
+            return missing("cr4", "pae");
+        }
+        if (self.pse || self.pge) && !self.cr4 {
+            return missing("cr4", "pse or pge");
+        }
+        if self.nx && !self.long {
+            // `EFER.NXE` lives in the same MSR long mode is armed from, and no
+            // part shipped one without the other.
+            return missing("long", "nx");
+        }
+        if (self.msr || self.cr4) && !self.extras_486 {
+            return missing("extras_486", "cr4 or msr");
+        }
+        Ok(())
+    }
 }
 
 impl Variant {
@@ -290,7 +474,7 @@ impl Variant {
         match self {
             Variant::I8086 => 6,
             Variant::I8088 => 4,
-            Variant::I80386 | Variant::I80486 => 16,
+            Variant::I80386 | Variant::I80486 | Variant::X86_64 => 16,
         }
     }
 
@@ -301,6 +485,8 @@ impl Variant {
             Variant::I8086 => 2,
             Variant::I8088 => 1,
             Variant::I80386 | Variant::I80486 => 4,
+            // A 64-bit part moves eight bytes a cycle.
+            Variant::X86_64 => 8,
         }
     }
 
@@ -311,7 +497,7 @@ impl Variant {
     pub const fn bus_clocks(self) -> u32 {
         match self {
             Variant::I8086 | Variant::I8088 => 4,
-            Variant::I80386 | Variant::I80486 => 2,
+            Variant::I80386 | Variant::I80486 | Variant::X86_64 => 2,
         }
     }
 
@@ -320,20 +506,30 @@ impl Variant {
     pub const fn map(self) -> isa::Gen {
         match self {
             Variant::I8086 | Variant::I8088 => isa::Gen::I8086,
-            Variant::I80386 | Variant::I80486 => isa::Gen::I386,
+            Variant::I80386 | Variant::I80486 | Variant::X86_64 => isa::Gen::I386,
         }
     }
 
     /// Whether this part has 32-bit registers, protected mode and paging.
     #[must_use]
     pub const fn is_32bit(self) -> bool {
-        matches!(self, Variant::I80386 | Variant::I80486)
+        matches!(self, Variant::I80386 | Variant::I80486 | Variant::X86_64)
     }
 
-    /// Whether this part implements `CPUID` and the other 80486 additions.
+    /// The extensions this part has when nothing overrides them.
+    ///
+    /// A *preset*, in `ROADMAP.md` §6.1.1's sense: the public surface is a
+    /// name and the name expands to a point in the lattice. Nothing downstream
+    /// branches on the variant to decide whether an instruction exists — it
+    /// asks the [`Features`] the instance was built with, which a machine
+    /// description may narrow.
     #[must_use]
-    pub const fn has_486_extras(self) -> bool {
-        matches!(self, Variant::I80486)
+    pub const fn features(self) -> Features {
+        match self {
+            Variant::I8086 | Variant::I8088 | Variant::I80386 => Features::NONE,
+            Variant::I80486 => Features::I80486,
+            Variant::X86_64 => Features::X86_64,
+        }
     }
 
     /// The bits the flags register has storage for.
@@ -342,7 +538,7 @@ impl Variant {
         match self {
             Variant::I8086 | Variant::I8088 => flags::DEFINED,
             Variant::I80386 => flags::DEFINED_386,
-            Variant::I80486 => flags::DEFINED_486,
+            Variant::I80486 | Variant::X86_64 => flags::DEFINED_486,
         }
     }
 
@@ -351,7 +547,7 @@ impl Variant {
     pub const fn flag_fixed(self) -> u32 {
         match self {
             Variant::I8086 | Variant::I8088 => flags::RESERVED_SET,
-            Variant::I80386 | Variant::I80486 => flags::ALWAYS_SET,
+            Variant::I80386 | Variant::I80486 | Variant::X86_64 => flags::ALWAYS_SET,
         }
     }
 
@@ -368,6 +564,9 @@ impl Variant {
             Variant::I80386 => 0x0000_0308,
             // Family 4, model 8 — a 486DX with CPUID.
             Variant::I80486 => 0x0000_0480,
+            // Family 6, model 15, stepping 1 — what software that predates
+            // `CPUID` reads out of `EDX`, and what leaf 1 reports below.
+            Variant::X86_64 => 0x0000_06f1,
         }
     }
 
@@ -379,11 +578,12 @@ impl Variant {
             Variant::I8088 => "8088",
             Variant::I80386 => "80386",
             Variant::I80486 => "80486",
+            Variant::X86_64 => "x86-64",
         }
     }
 
     /// Every name a machine description may write.
-    pub const NAMES: &'static [&'static str] = &["8086", "8088", "80386", "80486"];
+    pub const NAMES: &'static [&'static str] = &["8086", "8088", "80386", "80486", "x86-64"];
 
     /// Look one up by the name a machine description writes.
     #[must_use]
@@ -393,6 +593,7 @@ impl Variant {
             "8088" => Some(Variant::I8088),
             "80386" | "386" | "i386" => Some(Variant::I80386),
             "80486" | "486" | "i486" => Some(Variant::I80486),
+            "x86-64" | "x86_64" | "amd64" | "x64" => Some(Variant::X86_64),
             _ => None,
         }
     }
@@ -409,6 +610,12 @@ impl fmt::Display for Variant {
 pub struct Config {
     /// Which member of the family this is.
     pub variant: Variant,
+    /// Which extensions this instance has.
+    ///
+    /// Defaults to [`Variant::features`] and may be narrowed from there: a
+    /// part that has `CPUID` but no `CMOV` is a real configuration, and it is
+    /// the one a guest probes for.
+    pub features: Features,
     /// This core's identity in `MemAttrs::requester`, for an IOMMU or a
     /// per-master filter.
     pub requester: RequesterId,
@@ -418,6 +625,7 @@ impl Config {
     /// An 8088: 8-bit bus, four-byte queue.
     pub const I8088: Config = Config {
         variant: Variant::I8088,
+        features: Features::NONE,
         requester: RequesterId::ANONYMOUS,
     };
 
@@ -436,6 +644,15 @@ impl Config {
     /// An 80486 — the variant a PC firmware image expects.
     pub const I80486: Config = Config {
         variant: Variant::I80486,
+        features: Features::I80486,
+        ..Config::I8088
+    };
+
+    /// A baseline x86-64 part, with long mode available but not entered:
+    /// a processor still resets into real mode however wide it is.
+    pub const X86_64: Config = Config {
+        variant: Variant::X86_64,
+        features: Features::X86_64,
         ..Config::I8088
     };
 
@@ -446,10 +663,23 @@ impl Config {
         self
     }
 
-    /// Same configuration, as a different part.
+    /// Same configuration, as a different part **with that part's features**.
+    ///
+    /// The features come along because a variant name is a preset, not a bus
+    /// width: asking for an x86-64 and getting one that cannot enter long mode
+    /// would be the silent downgrade §6.1.1 forbids. Narrow them afterwards
+    /// with [`with_features`](Config::with_features) if that is what is meant.
     #[must_use]
     pub const fn with_variant(mut self, variant: Variant) -> Self {
         self.variant = variant;
+        self.features = variant.features();
+        self
+    }
+
+    /// Same configuration, with the extension set replaced.
+    #[must_use]
+    pub const fn with_features(mut self, features: Features) -> Self {
+        self.features = features;
         self
     }
 }
@@ -472,8 +702,11 @@ impl Default for Config {
 /// 80286 stopped wrapping and broke those programs.
 #[inline]
 #[must_use]
-pub const fn linear(segment: u16, offset: u16) -> u32 {
-    (((segment as u32) << 4).wrapping_add(offset as u32)) & 0xf_ffff
+pub const fn linear(segment: u16, offset: u16) -> u64 {
+    // Computed in the guest's own twenty-bit width and *then* widened: the
+    // wrap at 1 MiB is the whole point of the function, and summing in
+    // sixty-four bits and masking afterwards would agree only by accident.
+    ((((segment as u32) << 4).wrapping_add(offset as u32)) & 0xf_ffff) as u64
 }
 
 /// The architectural register file.
@@ -483,27 +716,38 @@ pub const fn linear(segment: u16, offset: u16) -> u32 {
 /// (`ROADMAP.md` §9's debug story), and [`Reg`] enumerates it by name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Regs {
-    /// Accumulator. `AX` is its low half and `AL`/`AH` its low two bytes.
-    pub eax: u32,
+    /// Accumulator. `EAX` is its low half, `AX` the low quarter, and `AL`/`AH`
+    /// its low two bytes.
+    pub rax: u64,
     /// Count — the implicit operand of `LOOP`, the string repeats, and the
     /// variable shifts.
-    pub ecx: u32,
+    pub rcx: u64,
     /// Data — the implicit high half of a multiply or divide, and the I/O port
     /// register.
-    pub edx: u32,
+    pub rdx: u64,
     /// Base.
-    pub ebx: u32,
+    pub rbx: u64,
     /// Stack pointer, in `SS`.
-    pub esp: u32,
+    pub rsp: u64,
     /// Base pointer; addressing modes that use it default to `SS`.
-    pub ebp: u32,
+    pub rbp: u64,
     /// Source index, for the string instructions.
-    pub esi: u32,
+    pub rsi: u64,
     /// Destination index, for the string instructions.
-    pub edi: u32,
+    pub rdi: u64,
+    /// The eight registers long mode added, `R8` through `R15`.
+    ///
+    /// An array rather than eight named fields because nothing names one of
+    /// them implicitly: they exist only as ModRM numbers 8-15, reachable only
+    /// behind a `REX` prefix, so indexing is the only access there is.
+    pub r: [u64; 8],
     /// Instruction pointer, an offset within `CS`.
-    pub eip: u32,
+    pub rip: u64,
     /// The flags register. See [`flags`].
+    ///
+    /// Thirty-two bits even on a 64-bit part: `RFLAGS` bits 63-32 are reserved
+    /// and read as zero (*Intel SDM* volume 1 §3.4.3), so a `u32` is the whole
+    /// register rather than a truncation of one. `PUSHFQ` zero-extends.
     pub eflags: u32,
     /// Extra segment — always the destination of a string instruction.
     pub es: u16,
@@ -557,15 +801,16 @@ impl Regs {
     #[must_use]
     pub const fn new() -> Regs {
         Regs {
-            eax: 0,
-            ecx: 0,
-            edx: 0,
-            ebx: 0,
-            esp: 0,
-            ebp: 0,
-            esi: 0,
-            edi: 0,
-            eip: 0,
+            rax: 0,
+            rcx: 0,
+            rdx: 0,
+            rbx: 0,
+            rsp: 0,
+            rbp: 0,
+            rsi: 0,
+            rdi: 0,
+            r: [0; 8],
+            rip: 0,
             eflags: flags::RESERVED_SET,
             es: 0,
             cs: 0xffff,
@@ -602,59 +847,87 @@ impl Regs {
         ((self.eflags & flags::IOPL) >> flags::IOPL_SHIFT) as u8
     }
 
-    /// Read one of the eight 32-bit registers by ModRM number.
+    /// Read one of the sixteen 64-bit registers by ModRM number.
+    ///
+    /// Numbers 8-15 are `R8`-`R15`, which only a `REX` prefix can name; a
+    /// decoder that never sets one never produces them.
+    #[inline]
+    #[must_use]
+    pub const fn qword(&self, index: u8) -> u64 {
+        match index & 15 {
+            0 => self.rax,
+            1 => self.rcx,
+            2 => self.rdx,
+            3 => self.rbx,
+            4 => self.rsp,
+            5 => self.rbp,
+            6 => self.rsi,
+            7 => self.rdi,
+            n => self.r[(n - 8) as usize],
+        }
+    }
+
+    /// Write one of the sixteen 64-bit registers by ModRM number.
+    #[inline]
+    pub const fn set_qword(&mut self, index: u8, value: u64) {
+        match index & 15 {
+            0 => self.rax = value,
+            1 => self.rcx = value,
+            2 => self.rdx = value,
+            3 => self.rbx = value,
+            4 => self.rsp = value,
+            5 => self.rbp = value,
+            6 => self.rsi = value,
+            7 => self.rdi = value,
+            n => self.r[(n - 8) as usize] = value,
+        }
+    }
+
+    /// Read one of the sixteen 32-bit registers by ModRM number.
     #[inline]
     #[must_use]
     pub const fn dword(&self, index: u8) -> u32 {
-        match index & 7 {
-            0 => self.eax,
-            1 => self.ecx,
-            2 => self.edx,
-            3 => self.ebx,
-            4 => self.esp,
-            5 => self.ebp,
-            6 => self.esi,
-            _ => self.edi,
-        }
+        self.qword(index) as u32
     }
 
-    /// Write one of the eight 32-bit registers by ModRM number.
+    /// Write one of the sixteen 32-bit registers by ModRM number.
+    ///
+    /// The upper half is **zeroed**, not preserved: a 32-bit result in 64-bit
+    /// mode is zero-extended into the whole register (*Intel SDM* volume 1
+    /// §3.4.1.1), which is the rule that makes `mov eax, eax` a truncation. On
+    /// a part with no upper half there is nothing to zero, so this is one rule
+    /// rather than two.
     #[inline]
     pub const fn set_dword(&mut self, index: u8, value: u32) {
-        match index & 7 {
-            0 => self.eax = value,
-            1 => self.ecx = value,
-            2 => self.edx = value,
-            3 => self.ebx = value,
-            4 => self.esp = value,
-            5 => self.ebp = value,
-            6 => self.esi = value,
-            _ => self.edi = value,
-        }
+        self.set_qword(index, value as u64);
     }
 
-    /// Read one of the eight 16-bit registers by ModRM number.
+    /// Read one of the sixteen 16-bit registers by ModRM number.
     #[inline]
     #[must_use]
     pub const fn word(&self, index: u8) -> u16 {
-        self.dword(index) as u16
+        self.qword(index) as u16
     }
 
-    /// Write one of the eight 16-bit registers by ModRM number.
+    /// Write one of the sixteen 16-bit registers by ModRM number.
     ///
-    /// The high half is **preserved**, which is the 386's rule and not an
+    /// The high bits are **preserved**, which is the 386's rule and not an
     /// implementation convenience: `mov ax, 0` leaves the top of `EAX` alone,
-    /// and code that switches between operand sizes depends on it.
+    /// and code that switches between operand sizes depends on it. Note the
+    /// asymmetry with [`set_dword`](Regs::set_dword) — it is the architecture's,
+    /// not ours.
     #[inline]
     pub const fn set_word(&mut self, index: u8, value: u16) {
-        let merged = (self.dword(index) & 0xffff_0000) | value as u32;
-        self.set_dword(index, merged);
+        let merged = (self.qword(index) & !0xffff) | value as u64;
+        self.set_qword(index, merged);
     }
 
-    /// Read one of the eight 8-bit registers by ModRM number.
+    /// Read one of the eight legacy 8-bit registers by ModRM number.
     ///
     /// Numbers 0-3 are the low halves of `AX`-`BX` and 4-7 the high halves, in
-    /// the same register order — which is why `AH` is 4 and not 1.
+    /// the same register order — which is why `AH` is 4 and not 1. This is the
+    /// encoding with **no** `REX` prefix; see [`byte_rex`](Regs::byte_rex) for
+    /// the other one.
     #[inline]
     #[must_use]
     pub const fn byte(&self, index: u8) -> u8 {
@@ -666,7 +939,7 @@ impl Regs {
         }
     }
 
-    /// Write one of the eight 8-bit registers by ModRM number.
+    /// Write one of the eight legacy 8-bit registers by ModRM number.
     #[inline]
     pub const fn set_byte(&mut self, index: u8, value: u8) {
         let word = self.word(index & 3);
@@ -678,24 +951,52 @@ impl Regs {
         self.set_word(index & 3, merged);
     }
 
-    /// Read a general register at a width of 1, 2 or 4 bytes.
+    /// Read the low byte of one of the sixteen registers.
+    ///
+    /// The presence of a `REX` prefix — *any* `REX` prefix, including `40`,
+    /// which sets no bit at all — replaces `AH`, `CH`, `DH` and `BH` with
+    /// `SPL`, `BPL`, `SIL` and `DIL` (*Intel SDM* volume 2 §2.2.1.2). That is
+    /// why this is a second accessor rather than a wider index into the first:
+    /// register number 4 means two different things depending on a prefix that
+    /// carries no operand of its own.
     #[inline]
     #[must_use]
-    pub const fn read(&self, index: u8, size: u8) -> u32 {
+    pub const fn byte_rex(&self, index: u8) -> u8 {
+        self.qword(index) as u8
+    }
+
+    /// Write the low byte of one of the sixteen registers.
+    #[inline]
+    pub const fn set_byte_rex(&mut self, index: u8, value: u8) {
+        let merged = (self.qword(index) & !0xff) | value as u64;
+        self.set_qword(index, merged);
+    }
+
+    /// Read a general register at a width of 1, 2, 4 or 8 bytes.
+    ///
+    /// `rex` says whether the instruction carried a `REX` prefix, which only
+    /// changes what a byte-sized register number 4-7 names.
+    #[inline]
+    #[must_use]
+    pub const fn read(&self, index: u8, size: u8, rex: bool) -> u64 {
         match size {
-            1 => self.byte(index) as u32,
-            2 => self.word(index) as u32,
-            _ => self.dword(index),
+            1 if rex => self.byte_rex(index) as u64,
+            1 => self.byte(index) as u64,
+            2 => self.word(index) as u64,
+            4 => self.dword(index) as u64,
+            _ => self.qword(index),
         }
     }
 
-    /// Write a general register at a width of 1, 2 or 4 bytes.
+    /// Write a general register at a width of 1, 2, 4 or 8 bytes.
     #[inline]
-    pub const fn write(&mut self, index: u8, size: u8, value: u32) {
+    pub const fn write(&mut self, index: u8, size: u8, rex: bool, value: u64) {
         match size {
+            1 if rex => self.set_byte_rex(index, value as u8),
             1 => self.set_byte(index, value as u8),
             2 => self.set_word(index, value as u16),
-            _ => self.set_dword(index, value),
+            4 => self.set_dword(index, value as u32),
+            _ => self.set_qword(index, value),
         }
     }
 
@@ -744,24 +1045,24 @@ impl fmt::Display for Regs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "EAX:{:08x} EBX:{:08x} ECX:{:08x} EDX:{:08x} ESP:{:08x} EBP:{:08x} ESI:{:08x} \
-             EDI:{:08x} ES:{:04x} CS:{:04x} SS:{:04x} DS:{:04x} FS:{:04x} GS:{:04x} \
-             EIP:{:08x} F:{:08x}",
-            self.eax,
-            self.ebx,
-            self.ecx,
-            self.edx,
-            self.esp,
-            self.ebp,
-            self.esi,
-            self.edi,
+            "RAX:{:016x} RBX:{:016x} RCX:{:016x} RDX:{:016x} RSP:{:016x} RBP:{:016x} \
+             RSI:{:016x} RDI:{:016x} ES:{:04x} CS:{:04x} SS:{:04x} DS:{:04x} FS:{:04x} \
+             GS:{:04x} RIP:{:016x} F:{:08x}",
+            self.rax,
+            self.rbx,
+            self.rcx,
+            self.rdx,
+            self.rsp,
+            self.rbp,
+            self.rsi,
+            self.rdi,
             self.es,
             self.cs,
             self.ss,
             self.ds,
             self.fs,
             self.gs,
-            self.eip,
+            self.rip,
             self.eflags
         )
     }
@@ -829,6 +1130,40 @@ pub enum Reg {
     Ip,
     /// The low half of the flags register.
     Flags,
+    /// Accumulator, 64 bits.
+    Rax,
+    /// Count, 64 bits.
+    Rcx,
+    /// Data, 64 bits.
+    Rdx,
+    /// Base, 64 bits.
+    Rbx,
+    /// Stack pointer, 64 bits.
+    Rsp,
+    /// Base pointer, 64 bits.
+    Rbp,
+    /// Source index, 64 bits.
+    Rsi,
+    /// Destination index, 64 bits.
+    Rdi,
+    /// The first of the eight registers long mode added.
+    R8,
+    /// `R9`.
+    R9,
+    /// `R10`.
+    R10,
+    /// `R11`.
+    R11,
+    /// `R12`.
+    R12,
+    /// `R13`.
+    R13,
+    /// `R14`.
+    R14,
+    /// `R15`.
+    R15,
+    /// Instruction pointer, 64 bits.
+    Rip,
 }
 
 impl Reg {
@@ -873,6 +1208,31 @@ impl Reg {
         Reg::Flags,
     ];
 
+    /// The sixteen 64-bit general registers and `RIP`, in ModRM number order.
+    ///
+    /// Deliberately *not* in [`Reg::ALL`]: the first eight alias registers
+    /// already there, and the snapshot writes this block separately so that
+    /// [`Reg::ALL`]'s prefix stays the gdb i386 core block it has always been.
+    pub const WIDE: &'static [Reg] = &[
+        Reg::Rax,
+        Reg::Rcx,
+        Reg::Rdx,
+        Reg::Rbx,
+        Reg::Rsp,
+        Reg::Rbp,
+        Reg::Rsi,
+        Reg::Rdi,
+        Reg::R8,
+        Reg::R9,
+        Reg::R10,
+        Reg::R11,
+        Reg::R12,
+        Reg::R13,
+        Reg::R14,
+        Reg::R15,
+        Reg::Rip,
+    ];
+
     /// The register's name, lower case, as gdb and the monitor spell it.
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -903,6 +1263,23 @@ impl Reg {
             Reg::Di => "di",
             Reg::Ip => "ip",
             Reg::Flags => "flags",
+            Reg::Rax => "rax",
+            Reg::Rcx => "rcx",
+            Reg::Rdx => "rdx",
+            Reg::Rbx => "rbx",
+            Reg::Rsp => "rsp",
+            Reg::Rbp => "rbp",
+            Reg::Rsi => "rsi",
+            Reg::Rdi => "rdi",
+            Reg::R8 => "r8",
+            Reg::R9 => "r9",
+            Reg::R10 => "r10",
+            Reg::R11 => "r11",
+            Reg::R12 => "r12",
+            Reg::R13 => "r13",
+            Reg::R14 => "r14",
+            Reg::R15 => "r15",
+            Reg::Rip => "rip",
         }
     }
 
@@ -920,6 +1297,23 @@ impl Reg {
             | Reg::Edi
             | Reg::Eip
             | Reg::Eflags => Width::U32,
+            Reg::Rax
+            | Reg::Rcx
+            | Reg::Rdx
+            | Reg::Rbx
+            | Reg::Rsp
+            | Reg::Rbp
+            | Reg::Rsi
+            | Reg::Rdi
+            | Reg::R8
+            | Reg::R9
+            | Reg::R10
+            | Reg::R11
+            | Reg::R12
+            | Reg::R13
+            | Reg::R14
+            | Reg::R15
+            | Reg::Rip => Width::U64,
             _ => Width::U16,
         }
     }
@@ -929,34 +1323,51 @@ impl Reg {
     /// A 16-bit view returns its low half zero-extended, so a caller that
     /// asked for `ax` never sees the other sixteen bits by accident.
     #[must_use]
-    pub const fn get(self, regs: &Regs) -> u32 {
+    pub const fn get(self, regs: &Regs) -> u64 {
         match self {
-            Reg::Eax => regs.eax,
-            Reg::Ecx => regs.ecx,
-            Reg::Edx => regs.edx,
-            Reg::Ebx => regs.ebx,
-            Reg::Esp => regs.esp,
-            Reg::Ebp => regs.ebp,
-            Reg::Esi => regs.esi,
-            Reg::Edi => regs.edi,
-            Reg::Eip => regs.eip,
-            Reg::Eflags => regs.eflags,
-            Reg::Es => regs.es as u32,
-            Reg::Cs => regs.cs as u32,
-            Reg::Ss => regs.ss as u32,
-            Reg::Ds => regs.ds as u32,
-            Reg::Fs => regs.fs as u32,
-            Reg::Gs => regs.gs as u32,
-            Reg::Ax => regs.eax & 0xffff,
-            Reg::Cx => regs.ecx & 0xffff,
-            Reg::Dx => regs.edx & 0xffff,
-            Reg::Bx => regs.ebx & 0xffff,
-            Reg::Sp => regs.esp & 0xffff,
-            Reg::Bp => regs.ebp & 0xffff,
-            Reg::Si => regs.esi & 0xffff,
-            Reg::Di => regs.edi & 0xffff,
-            Reg::Ip => regs.eip & 0xffff,
-            Reg::Flags => regs.eflags & 0xffff,
+            Reg::Eax => regs.rax as u32 as u64,
+            Reg::Ecx => regs.rcx as u32 as u64,
+            Reg::Edx => regs.rdx as u32 as u64,
+            Reg::Ebx => regs.rbx as u32 as u64,
+            Reg::Esp => regs.rsp as u32 as u64,
+            Reg::Ebp => regs.rbp as u32 as u64,
+            Reg::Esi => regs.rsi as u32 as u64,
+            Reg::Edi => regs.rdi as u32 as u64,
+            Reg::Eip => regs.rip as u32 as u64,
+            Reg::Eflags => regs.eflags as u64,
+            Reg::Es => regs.es as u64,
+            Reg::Cs => regs.cs as u64,
+            Reg::Ss => regs.ss as u64,
+            Reg::Ds => regs.ds as u64,
+            Reg::Fs => regs.fs as u64,
+            Reg::Gs => regs.gs as u64,
+            Reg::Ax => regs.rax & 0xffff,
+            Reg::Cx => regs.rcx & 0xffff,
+            Reg::Dx => regs.rdx & 0xffff,
+            Reg::Bx => regs.rbx & 0xffff,
+            Reg::Sp => regs.rsp & 0xffff,
+            Reg::Bp => regs.rbp & 0xffff,
+            Reg::Si => regs.rsi & 0xffff,
+            Reg::Di => regs.rdi & 0xffff,
+            Reg::Ip => regs.rip & 0xffff,
+            Reg::Flags => (regs.eflags & 0xffff) as u64,
+            Reg::Rax => regs.rax,
+            Reg::Rcx => regs.rcx,
+            Reg::Rdx => regs.rdx,
+            Reg::Rbx => regs.rbx,
+            Reg::Rsp => regs.rsp,
+            Reg::Rbp => regs.rbp,
+            Reg::Rsi => regs.rsi,
+            Reg::Rdi => regs.rdi,
+            Reg::R8 => regs.r[0],
+            Reg::R9 => regs.r[1],
+            Reg::R10 => regs.r[2],
+            Reg::R11 => regs.r[3],
+            Reg::R12 => regs.r[4],
+            Reg::R13 => regs.r[5],
+            Reg::R14 => regs.r[6],
+            Reg::R15 => regs.r[7],
+            Reg::Rip => regs.rip,
         }
     }
 
@@ -966,34 +1377,54 @@ impl Reg {
     /// instruction does. Nothing here normalises the flags: the hard-wired
     /// bits depend on the [`Variant`], which a bare register file does not
     /// know, so [`X86::set_reg`] does it where the part is in scope.
-    pub const fn set(self, regs: &mut Regs, value: u32) {
+    pub const fn set(self, regs: &mut Regs, value: u64) {
         match self {
-            Reg::Eax => regs.eax = value,
-            Reg::Ecx => regs.ecx = value,
-            Reg::Edx => regs.edx = value,
-            Reg::Ebx => regs.ebx = value,
-            Reg::Esp => regs.esp = value,
-            Reg::Ebp => regs.ebp = value,
-            Reg::Esi => regs.esi = value,
-            Reg::Edi => regs.edi = value,
-            Reg::Eip => regs.eip = value,
-            Reg::Eflags => regs.eflags = value,
+            // The 32-bit names write a 32-bit register, and a 32-bit write
+            // zero-extends — the same rule [`Regs::set_dword`] states, applied
+            // here so a debugger's `set eax` behaves as an instruction's would.
+            Reg::Eax => regs.rax = value as u32 as u64,
+            Reg::Ecx => regs.rcx = value as u32 as u64,
+            Reg::Edx => regs.rdx = value as u32 as u64,
+            Reg::Ebx => regs.rbx = value as u32 as u64,
+            Reg::Esp => regs.rsp = value as u32 as u64,
+            Reg::Ebp => regs.rbp = value as u32 as u64,
+            Reg::Esi => regs.rsi = value as u32 as u64,
+            Reg::Edi => regs.rdi = value as u32 as u64,
+            Reg::Eip => regs.rip = value as u32 as u64,
+            Reg::Eflags => regs.eflags = value as u32,
             Reg::Es => regs.es = value as u16,
             Reg::Cs => regs.cs = value as u16,
             Reg::Ss => regs.ss = value as u16,
             Reg::Ds => regs.ds = value as u16,
             Reg::Fs => regs.fs = value as u16,
             Reg::Gs => regs.gs = value as u16,
-            Reg::Ax => regs.eax = (regs.eax & 0xffff_0000) | (value & 0xffff),
-            Reg::Cx => regs.ecx = (regs.ecx & 0xffff_0000) | (value & 0xffff),
-            Reg::Dx => regs.edx = (regs.edx & 0xffff_0000) | (value & 0xffff),
-            Reg::Bx => regs.ebx = (regs.ebx & 0xffff_0000) | (value & 0xffff),
-            Reg::Sp => regs.esp = (regs.esp & 0xffff_0000) | (value & 0xffff),
-            Reg::Bp => regs.ebp = (regs.ebp & 0xffff_0000) | (value & 0xffff),
-            Reg::Si => regs.esi = (regs.esi & 0xffff_0000) | (value & 0xffff),
-            Reg::Di => regs.edi = (regs.edi & 0xffff_0000) | (value & 0xffff),
-            Reg::Ip => regs.eip = (regs.eip & 0xffff_0000) | (value & 0xffff),
-            Reg::Flags => regs.eflags = (regs.eflags & 0xffff_0000) | (value & 0xffff),
+            Reg::Ax => regs.rax = (regs.rax & !0xffff) | (value & 0xffff),
+            Reg::Cx => regs.rcx = (regs.rcx & !0xffff) | (value & 0xffff),
+            Reg::Dx => regs.rdx = (regs.rdx & !0xffff) | (value & 0xffff),
+            Reg::Bx => regs.rbx = (regs.rbx & !0xffff) | (value & 0xffff),
+            Reg::Sp => regs.rsp = (regs.rsp & !0xffff) | (value & 0xffff),
+            Reg::Bp => regs.rbp = (regs.rbp & !0xffff) | (value & 0xffff),
+            Reg::Si => regs.rsi = (regs.rsi & !0xffff) | (value & 0xffff),
+            Reg::Di => regs.rdi = (regs.rdi & !0xffff) | (value & 0xffff),
+            Reg::Ip => regs.rip = (regs.rip & !0xffff) | (value & 0xffff),
+            Reg::Flags => regs.eflags = (regs.eflags & 0xffff_0000) | (value as u32 & 0xffff),
+            Reg::Rax => regs.rax = value,
+            Reg::Rcx => regs.rcx = value,
+            Reg::Rdx => regs.rdx = value,
+            Reg::Rbx => regs.rbx = value,
+            Reg::Rsp => regs.rsp = value,
+            Reg::Rbp => regs.rbp = value,
+            Reg::Rsi => regs.rsi = value,
+            Reg::Rdi => regs.rdi = value,
+            Reg::R8 => regs.r[0] = value,
+            Reg::R9 => regs.r[1] = value,
+            Reg::R10 => regs.r[2] = value,
+            Reg::R11 => regs.r[3] = value,
+            Reg::R12 => regs.r[4] = value,
+            Reg::R13 => regs.r[5] = value,
+            Reg::R14 => regs.r[6] = value,
+            Reg::R15 => regs.r[7] = value,
+            Reg::Rip => regs.rip = value,
         }
     }
 
@@ -1003,6 +1434,7 @@ impl Reg {
         Reg::ALL
             .iter()
             .chain(Reg::NARROW.iter())
+            .chain(Reg::WIDE.iter())
             .copied()
             .find(|r| r.name() == name)
     }
@@ -1358,9 +1790,34 @@ impl X86 {
         // *second* address space is named by an ordinary string property and
         // looked up with `BindCtx::space_named`.
         let iospace = r.optional_str("iospace")?.unwrap_or("").to_string();
+        // The lattice's per-instance half (`ROADMAP.md` §6.1.1): the variant
+        // name expands to a preset, and a machine description may switch an
+        // extension off to model a part that lacked it. Switching one *on*
+        // that the preset does not have is refused by `validate` where it
+        // would make an impossible part.
+        let mut features = variant.features();
+        for name in [
+            "cpuid", "pae", "long", "nx", "syscall", "cmov", "pse", "pge",
+        ] {
+            let Some(on) = r.optional::<bool>(name)? else {
+                continue;
+            };
+            match name {
+                "cpuid" => features.extras_486 = on,
+                "pae" => features.pae = on,
+                "long" => features.long = on,
+                "nx" => features.nx = on,
+                "syscall" => features.syscall = on,
+                "cmov" => features.cmov = on,
+                "pse" => features.pse = on,
+                _ => features.pge = on,
+            }
+        }
+        features.validate()?;
         r.finish()?;
         let mut cpu = X86::new(Config {
             variant,
+            features,
             requester: RequesterId::ANONYMOUS,
         });
         cpu.iospace = iospace;
@@ -1481,7 +1938,7 @@ impl X86 {
                 let selector = session.state.regs.segment(index);
                 let entry = session.state.sys.seg_mut(index);
                 entry.selector = selector;
-                entry.base = u32::from(selector) << 4;
+                entry.base = u64::from(selector) << 4;
             }
         }
         session.state.queue.flush();
@@ -1509,12 +1966,12 @@ impl X86 {
 
     /// Read one register by name. A 16-bit view returns its low half.
     #[must_use]
-    pub fn reg(&self, reg: Reg) -> u32 {
+    pub fn reg(&self, reg: Reg) -> u64 {
         reg.get(&self.session.lock().state.regs)
     }
 
     /// Write one register by name.
-    pub fn set_reg(&self, reg: Reg, value: u32) {
+    pub fn set_reg(&self, reg: Reg, value: u64) {
         let mut session = self.session.lock();
         reg.set(&mut session.state.regs, value);
         if matches!(reg, Reg::Eflags | Reg::Flags) {
@@ -1526,7 +1983,7 @@ impl X86 {
                 let selector = session.state.regs.cs;
                 let entry = session.state.sys.seg_mut(isa::seg::CS);
                 entry.selector = selector;
-                entry.base = u32::from(selector) << 4;
+                entry.base = u64::from(selector) << 4;
             }
             session.state.queue.flush();
         }
@@ -1598,7 +2055,7 @@ impl X86 {
     /// instead of silent — a machine whose memory map has a hole will show it
     /// climbing.
     #[must_use]
-    pub fn bus_faults(&self) -> (u64, u32) {
+    pub fn bus_faults(&self) -> (u64, u64) {
         let s = self.session.lock();
         (s.state.faults, s.state.last_fault)
     }
@@ -1797,12 +2254,12 @@ impl X86 {
     /// nothing to translate, the second is a listing that has run off the end
     /// of a mapped page.
     #[must_use]
-    pub fn translate_debug(&self, linear: u32) -> DebugTranslation {
+    pub fn translate_debug(&self, linear: u64) -> DebugTranslation {
         let Some(space) = self.space() else {
             return DebugTranslation::Identity;
         };
         let sys = self.session.lock().state.sys;
-        paging::debug_translate(&sys, &space, linear)
+        paging::debug_translate(&sys, self.cfg.features, &space, linear)
     }
 
     /// Disassemble `count` instructions starting at the current `CS:EIP`,
@@ -1821,23 +2278,36 @@ impl X86 {
     /// and the decoder reports the instruction truncated, which is the honest
     /// answer for a listing that has run off the end of a page.
     #[must_use]
-    pub fn disassemble(&self, cs: u16, eip: u32, count: usize) -> Vec<disasm::Disassembled> {
+    pub fn disassemble(&self, cs: u16, eip: u64, count: usize) -> Vec<disasm::Disassembled> {
         let Some(space) = self.space() else {
             return Vec::new();
         };
-        let (base, bits32, legacy, sys) = {
+        let (base, bits, legacy, sys) = {
             let session = self.session.lock();
             let seg = session.state.sys.seg(isa::seg::CS);
             let legacy = !self.cfg.variant.is_32bit();
             let base = if seg.selector == cs {
                 seg.base
             } else {
-                u32::from(cs) << 4
+                u64::from(cs) << 4
             };
-            (base, !legacy && seg.big(), legacy, session.state.sys)
+            // The listing is decoded at the width the processor would
+            // fetch at, which in long mode is the code segment's `L` bit
+            // rather than its `D` bit.
+            let bits = if legacy {
+                isa::Bits::B16
+            } else if self.cfg.features.long && session.state.sys.long_mode() && seg.long() {
+                isa::Bits::B64
+            } else if seg.big() {
+                isa::Bits::B32
+            } else {
+                isa::Bits::B16
+            };
+            (base, bits, legacy, session.state.sys)
         };
         let map = self.cfg.variant.map();
-        disasm::disassemble_run_as(map, bits32, cs, eip, count, |addr| {
+        let features = self.cfg.features;
+        disasm::disassemble_run_as(map, bits, cs, eip, count, |addr| {
             // Segmentation first, then paging: that is the order the address
             // unit works in, and doing only the first is what used to make a
             // listing of a paged guest show whatever physical memory sat at
@@ -1847,7 +2317,7 @@ impl X86 {
             } else {
                 base.wrapping_add(addr)
             };
-            let addr = paging::debug_translate(&sys, &space, linear).phys(u64::from(linear))?;
+            let addr = paging::debug_translate(&sys, features, &space, linear).phys(linear)?;
             space
                 .read(addr, Width::U8, MemAttrs::DEBUG)
                 .ok()
@@ -1864,15 +2334,64 @@ impl X86 {
 /// older class name working with its own default.
 pub static CLASS: DeviceClass = DeviceClass {
     name: "cpu.x86",
-    // 3: the chunk gained the scheduler debt and the A20 level.
-    version: 3,
-    summary: "Intel x86 CPU core: 8086/8088 real mode, or 80386/80486 with protection and paging",
+    // 4: the register file widened to sixty-four bits and the chunk gained the
+    //    long-mode block — `CR4`, `EFER`, the segment-base MSRs and `R8`-`R15`.
+    version: 4,
+    summary: "Intel x86 CPU core: 8086/8088 real mode, 80386/80486 protected mode, or x86-64",
     properties: &[
         PropertySpec {
             name: "variant",
             kind: ValueKind::Str,
             required: false,
-            summary: "\"8086\", \"8088\", \"80386\" or \"80486\" (the default)",
+            summary: "\"8086\", \"8088\", \"80386\", \"80486\" (the default) or \"x86-64\"",
+        },
+        PropertySpec {
+            name: "cpuid",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: CPUID, BSWAP, XADD, CMPXCHG, INVLPG and CR0.WP",
+        },
+        PropertySpec {
+            name: "pae",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: physical address extension and the three-level walk",
+        },
+        PropertySpec {
+            name: "long",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: long mode, REX, and four-level paging",
+        },
+        PropertySpec {
+            name: "nx",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: EFER.NXE and the no-execute page bit",
+        },
+        PropertySpec {
+            name: "syscall",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: SYSCALL and SYSRET",
+        },
+        PropertySpec {
+            name: "cmov",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: the integer conditional moves",
+        },
+        PropertySpec {
+            name: "pse",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: CR4.PSE and 4 MiB pages in a two-level walk",
+        },
+        PropertySpec {
+            name: "pge",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: CR4.PGE and the global-page bit",
         },
         PropertySpec {
             name: "model",
@@ -1907,7 +2426,7 @@ pub static CLASS: DeviceClass = DeviceClass {
 /// core keeps meaning what it meant. A build links one core either way.
 pub static I8086_CLASS: DeviceClass = DeviceClass {
     name: "cpu.i8086",
-    version: 3,
+    version: 4,
     summary: "Intel 8086 / 8088 16-bit CPU core, real mode, hardware-checked interpreter",
     properties: CLASS.properties,
     construct: |props| {
@@ -1941,15 +2460,12 @@ impl Device for X86 {
     ///
     /// The address is taken as **linear** — segmentation has already been
     /// applied by whoever asked — so this is exactly
-    /// [`translate_debug`](X86::translate_debug), narrowed to 32 bits because
-    /// that is as wide as a linear address gets on this family. An address
-    /// above that has no translation rather than a wrapped one: reporting
-    /// `Unmapped` is the honest answer, and wrapping would invent a page.
+    /// [`translate_debug`](X86::translate_debug). It is no longer narrowed to
+    /// 32 bits: a long-mode guest's linear address really is 48 significant
+    /// bits sign-extended to 64, and truncating one would report `Unmapped`
+    /// for every kernel address, which are all above the boundary.
     fn debug_translate(&self, va: u64) -> DebugTranslation {
-        match u32::try_from(va) {
-            Ok(linear) => self.translate_debug(linear),
-            Err(_) => DebugTranslation::Unmapped,
-        }
+        self.translate_debug(va)
     }
 
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
@@ -2052,6 +2568,14 @@ impl Device for X86 {
     /// registers, the control and debug registers, and the interrupt pins.
     /// The translation-lookaside buffer is **not** written: it is a cache of
     /// the page tables and is rebuilt on demand.
+    ///
+    /// The **long-mode block** comes last, and it comes last on purpose: the
+    /// sixteen 64-bit general registers, `RIP`, `CR4`, `EFER` and the four
+    /// segment-base and `SYSCALL` model-specific registers. Appending rather
+    /// than widening the gdb prefix in place keeps `host::gdb::arch`'s
+    /// indexing into the first sixty-four bytes valid, and the whole of the
+    /// register file is still written exactly once — the prefix holds each
+    /// register's low half and this block replaces it with the full width.
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
         // Fold the `reset` pin's latch in first. It is not a field of its own
         // in the chunk: `reset_pending` is where it was always going, and a
@@ -2064,31 +2588,31 @@ impl Device for X86 {
             session.state
         };
         for reg in Reg::ALL {
-            w.write_u32(reg.get(&state.regs))?;
+            w.write_u32(reg.get(&state.regs) as u32)?;
         }
         w.write_u64(state.cycles)?;
         for index in 0..isa::seg::COUNT as u8 {
             let s = state.sys.seg(index);
             w.write_u16(s.selector)?;
-            w.write_u32(s.base)?;
+            w.write_u64(s.base)?;
             w.write_u32(s.limit)?;
             w.write_u32(s.ar)?;
         }
         for s in [state.sys.ldtr, state.sys.task] {
             w.write_u16(s.selector)?;
-            w.write_u32(s.base)?;
+            w.write_u64(s.base)?;
             w.write_u32(s.limit)?;
             w.write_u32(s.ar)?;
         }
         for t in [state.sys.gdtr, state.sys.idtr] {
-            w.write_u32(t.base)?;
+            w.write_u64(t.base)?;
             w.write_u32(t.limit)?;
         }
         w.write_u32(state.sys.cr0)?;
-        w.write_u32(state.sys.cr2)?;
-        w.write_u32(state.sys.cr3)?;
+        w.write_u64(state.sys.cr2)?;
+        w.write_u64(state.sys.cr3)?;
         for value in state.sys.dr {
-            w.write_u32(value)?;
+            w.write_u64(value)?;
         }
         for value in state.sys.test {
             w.write_u32(value)?;
@@ -2099,7 +2623,7 @@ impl Device for X86 {
         w.write_bool(state.int_shadow)?;
         w.write_u8(state.open_bus)?;
         w.write_u64(state.faults)?;
-        w.write_u32(state.last_fault)?;
+        w.write_u64(state.last_fault)?;
         let queue = state.queue.contents();
         w.write_u8(queue.len() as u8)?;
         for byte in queue {
@@ -2115,6 +2639,23 @@ impl Device for X86 {
         // closed must still have it closed — the chipset that drives it is not
         // going to announce again until the next realize sweep.
         w.write_bool(self.a20_open())?;
+        // The long-mode block. Written unconditionally rather than behind a
+        // feature check: a chunk whose shape depended on the instance's
+        // extensions could not be loaded into an instance configured
+        // differently, and diagnosing *that* is worse than sixteen wasted
+        // doublewords on an 8088.
+        for reg in Reg::WIDE {
+            w.write_u64(reg.get(&state.regs))?;
+        }
+        w.write_u64(state.sys.cr4)?;
+        w.write_u64(state.sys.efer)?;
+        w.write_u64(state.sys.fs_base)?;
+        w.write_u64(state.sys.gs_base)?;
+        w.write_u64(state.sys.kernel_gs_base)?;
+        w.write_u64(state.sys.star)?;
+        w.write_u64(state.sys.lstar)?;
+        w.write_u64(state.sys.cstar)?;
+        w.write_u64(state.sys.sfmask)?;
         Ok(())
     }
 
@@ -2122,20 +2663,20 @@ impl Device for X86 {
         let mut state = State::new(self.cfg.variant);
         for reg in Reg::ALL {
             let value = r.read_u32()?;
-            reg.set(&mut state.regs, value);
+            reg.set(&mut state.regs, u64::from(value));
         }
         state.cycles = r.read_u64()?;
         for index in 0..isa::seg::COUNT as u8 {
             let s = state.sys.seg_mut(index);
             s.selector = r.read_u16()?;
-            s.base = r.read_u32()?;
+            s.base = r.read_u64()?;
             s.limit = r.read_u32()?;
             s.ar = r.read_u32()?;
         }
         for slot in [0usize, 1] {
             let s = prot::SegReg {
                 selector: r.read_u16()?,
-                base: r.read_u32()?,
+                base: r.read_u64()?,
                 limit: r.read_u32()?,
                 ar: r.read_u32()?,
             };
@@ -2147,7 +2688,7 @@ impl Device for X86 {
         }
         for slot in [0usize, 1] {
             let t = prot::TableReg {
-                base: r.read_u32()?,
+                base: r.read_u64()?,
                 limit: r.read_u32()?,
             };
             if slot == 0 {
@@ -2157,10 +2698,10 @@ impl Device for X86 {
             }
         }
         state.sys.cr0 = r.read_u32()?;
-        state.sys.cr2 = r.read_u32()?;
-        state.sys.cr3 = r.read_u32()?;
+        state.sys.cr2 = r.read_u64()?;
+        state.sys.cr3 = r.read_u64()?;
         for i in 0..8 {
-            state.sys.dr[i] = r.read_u32()?;
+            state.sys.dr[i] = r.read_u64()?;
         }
         for i in 0..8 {
             state.sys.test[i] = r.read_u32()?;
@@ -2171,7 +2712,7 @@ impl Device for X86 {
         state.int_shadow = r.read_bool()?;
         state.open_bus = r.read_u8()?;
         state.faults = r.read_u64()?;
-        state.last_fault = r.read_u32()?;
+        state.last_fault = r.read_u64()?;
         let len = r.read_u8()?;
         let mut queue = Vec::with_capacity(usize::from(len));
         for _ in 0..len {
@@ -2190,6 +2731,23 @@ impl Device for X86 {
         let nmi_latch = r.read_bool()?;
         let vector = r.read_u8()?;
         let a20 = r.read_bool()?;
+        // The long-mode block, in the order `save` wrote it. These overwrite
+        // the low halves the gdb prefix restored, which is why they come
+        // after rather than instead: the prefix has to stay where a debugger
+        // expects it, and the full width has to win.
+        for reg in Reg::WIDE {
+            let value = r.read_u64()?;
+            reg.set(&mut state.regs, value);
+        }
+        state.sys.cr4 = r.read_u64()?;
+        state.sys.efer = r.read_u64()?;
+        state.sys.fs_base = r.read_u64()?;
+        state.sys.gs_base = r.read_u64()?;
+        state.sys.kernel_gs_base = r.read_u64()?;
+        state.sys.star = r.read_u64()?;
+        state.sys.lstar = r.read_u64()?;
+        state.sys.cstar = r.read_u64()?;
+        state.sys.sfmask = r.read_u64()?;
         // The translation-lookaside buffer is derived, so it is not in the
         // snapshot and starts empty — which is correct rather than merely
         // convenient, because the page tables it would cache have just been
@@ -2481,6 +3039,33 @@ pub fn describe_isa_for(variant: Variant) -> String {
                 continue;
             }
             row(&mut out, "0f ", opcode, isa::decode_0f(opcode));
+        }
+    }
+    // The 64-bit column, listed separately rather than folded in, because a
+    // part that has long mode still decodes the legacy map above whenever it
+    // is not in it. Generated from the same rows, so an encoding cannot be
+    // reclaimed in the decoder and not here.
+    if variant.features().long {
+        let _ = writeln!(out, "\n-- 64-bit mode differs --");
+        let long_row = |out: &mut String, prefix: &str, opcode: u8, insn: isa::Insn| {
+            if matches!(insn.long, isa::L64::Same) {
+                return;
+            }
+            let now = insn.in_long();
+            let _ = writeln!(
+                out,
+                "{prefix}{opcode:02x}    {:<7} -> {}{:<7} {}",
+                insn.op.mnemonic(),
+                mark(now.class),
+                now.op.mnemonic(),
+                now.op.summary()
+            );
+        };
+        for opcode in 0..=255u8 {
+            long_row(&mut out, "", opcode, isa::decode_as(map, opcode));
+        }
+        for opcode in 0..=255u8 {
+            long_row(&mut out, "0f ", opcode, isa::decode_0f(opcode));
         }
     }
     out

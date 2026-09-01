@@ -273,23 +273,23 @@ fn listen(m: &Machine) -> Arc<DebugPort> {
 /// One trace line: where the core is, what is there, and what it holds.
 fn one(cpu: &X86, regs: &rsemu::cpu::x86::Regs) -> String {
     let text = cpu
-        .disassemble(regs.cs, regs.eip, 1)
+        .disassemble(regs.cs, regs.rip, 1)
         .first()
         .map_or_else(|| "??".to_string(), |d| format!("{d}"));
     format!(
         "{:04x}:{:08x}  {:<34}  eax={:08x} ebx={:08x} ecx={:08x} edx={:08x} esi={:08x} \
          edi={:08x} ebp={:08x} esp={:08x} ds={:04x} es={:04x} ss={:04x} fl={:08x}",
         regs.cs,
-        regs.eip,
+        regs.rip,
         text,
-        regs.eax,
-        regs.ebx,
-        regs.ecx,
-        regs.edx,
-        regs.esi,
-        regs.edi,
-        regs.ebp,
-        regs.esp,
+        regs.rax,
+        regs.rbx,
+        regs.rcx,
+        regs.rdx,
+        regs.rsi,
+        regs.rdi,
+        regs.rbp,
+        regs.rsp,
         regs.ds,
         regs.es,
         regs.ss,
@@ -318,7 +318,7 @@ fn run_until_stuck(m: &mut Machine, cpu: &X86, limit: GlobalTime) -> Stop {
     // tight loop is caught within a millisecond of entering it, coarse enough
     // that two hundred milliseconds is two thousand slices.
     let slice = GlobalTime::from_nanos(100_000);
-    let mut last = (0u16, 0u32, 0u64);
+    let mut last = (0u16, 0u64, 0u64);
     let mut same = 0u32;
     let mut protected = false;
     while m.now() < limit {
@@ -330,7 +330,7 @@ fn run_until_stuck(m: &mut Machine, cpu: &X86, limit: GlobalTime) -> Stop {
         // single step and the core then sits at the *next* address for
         // milliseconds of virtual time repaying the debt. That looks exactly
         // like a wedge and is the opposite of one.
-        let here = (regs.cs, regs.eip, cpu.cycles());
+        let here = (regs.cs, regs.rip, cpu.cycles());
         if cpu.cycle_debt() > 0 {
             // Still repaying: not wedged, just expensive.
             same = 0;
@@ -581,7 +581,7 @@ fn a_pc_firmware_image_runs_on_the_assembled_board() {
         "pc-at firmware: stopped at {:04x}:{:08x} after {} ms of virtual time \
          ({} cycles); stuck={} halted={} reset_pending={}",
         regs.cs,
-        regs.eip,
+        regs.rip,
         stop.at.as_nanos() / 1_000_000,
         cpu.cycles(),
         stop.stuck,
@@ -627,10 +627,9 @@ fn a_pc_firmware_image_runs_on_the_assembled_board() {
         // Through the cached descriptor base, not `selector << 4`: in
         // protected mode the selector is an index into a table and shifting it
         // names an address the machine never drove.
-        let base = u64::from(sys.segs[rsemu::cpu::x86::isa::seg::SS as usize].base)
-            + u64::from(regs.esp & 0xffff);
+        let base = sys.segs[rsemu::cpu::x86::isa::seg::SS as usize].base + (regs.rsp & 0xffff);
         let words = peek_bytes(&m, base, 64);
-        println!("pc-at firmware: stack at {:04x}:{:04x}:", regs.ss, regs.esp);
+        println!("pc-at firmware: stack at {:04x}:{:04x}:", regs.ss, regs.rsp);
         for (i, row) in words.chunks(16).enumerate() {
             let hex: Vec<String> = row.iter().map(|b| format!("{b:02x}")).collect();
             println!("  +{:02x}  {}", i * 16, hex.join(" "));
@@ -741,10 +740,10 @@ fn a_pc_firmware_image_runs_on_the_assembled_board() {
         }
         let mut ring: Vec<String> = Vec::new();
         let tick = GlobalTime::from_nanos(40);
-        let mut last = (0u16, 0u32);
+        let mut last = (0u16, 0u64);
         while m2.now() < stop.at.saturating_add(GlobalTime::from_nanos(200_000)) {
             let regs = cpu2.regs();
-            let here = (regs.cs, regs.eip);
+            let here = (regs.cs, regs.rip);
             if here != last {
                 last = here;
                 ring.push(one(&cpu2, &regs));
