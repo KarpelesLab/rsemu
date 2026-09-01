@@ -353,7 +353,11 @@ pub static Z80: Arch = Arch {
 
 // -- ARMv5TE ----------------------------------------------------------------
 
-/// `src/cpu/arm/mod.rs`'s `save`: `r[0..16]` then `cpsr`, all `u32`.
+/// `src/cpu/arm/aprofile/mod.rs`'s `save`: `r[0..16]` then `cpsr`, all `u32`.
+///
+/// Re-verified at chunk version 3. v3 appends CP15's registers at the *end* of
+/// the chunk, and only when the core was built with one, so the prefix these
+/// offsets index is byte-for-byte what v2 wrote. Nothing below moved.
 #[cfg(feature = "cpu-arm-aprofile")]
 static ARM_REGS: [RegDesc; 17] = arm_regs();
 
@@ -385,7 +389,7 @@ const fn arm_regs() -> [RegDesc; 17] {
 #[cfg(feature = "cpu-arm-aprofile")]
 pub static ARM: Arch = Arch {
     class: &crate::cpu::arm::aprofile::CLASS,
-    verified_version: 2,
+    verified_version: 3,
     feature: "org.rsemu.arm",
     architecture: Some("arm"),
     regs: &ARM_REGS,

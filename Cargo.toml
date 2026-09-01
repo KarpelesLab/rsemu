@@ -303,9 +303,14 @@ cpu-mos6502 = []
 # ARMv5TE interpreter with the full ARM and Thumb instruction sets,
 # interworking, the DSP (E) extensions, all seven modes with their banked
 # registers and the complete exception model, plus a disassembler generated
-# from the same decoders. The MMU, caches and TCMs are not included: CP15
-# attaches through the `cp::Coprocessor` and `cp::Mmu` traits so a downstream
-# SoC crate supplies its own, and a flat identity map is the default.
+# from the same decoders. It also carries an ARM926EJ-S **CP15 and the VMSAv5
+# MMU** -- sections, coarse and fine page tables, the sixteen domains, the AP
+# bits against c1's S and R, the fault status and address registers, and the c7
+# and c8 maintenance operations -- selected by the `cp15` construction property
+# and sitting behind a software TLB. Off by default, which is the bare
+# macrocell and is bit-for-bit what this core was before. Caches, the write
+# buffer and the TCMs are not modelled and remain the SoC's, behind the
+# `cp::Coprocessor` and `cp::Mmu` traits.
 #
 # Named for the profile, not the version, because ARMv6 and ARMv7-A share this
 # core's whole shape -- A32 plus Thumb, banked modes, CP15, the exception model
@@ -322,8 +327,9 @@ cpu-arm-aprofile = []
 # SoC's memory map belongs to the SoC rather than to the architecture. It models
 # no product; it exists so `cpu.arm` has somewhere to run inside a machine file,
 # and so a downstream SoC starts from a file it copies rather than from nothing.
-# No CP15: the core's coprocessor seam is a Rust trait and a machine file cannot
-# yet name one, so the board runs on the flat identity map. Adds no dependencies.
+# It has a CP15: `cp15 = arm926ejs` on the core object, which is how a machine
+# file asks for an MMU, and `-p cp15=none` takes it away again. Adds no
+# dependencies.
 machine-arm926 = ["cpu-arm-aprofile"]
 
 # The RISC-V `virt` board's chips (src/dev/riscv): the CLINT, the PLIC, a 16550

@@ -23,7 +23,11 @@ use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
 use crate::core::sync::{self, LockRank};
 use crate::core::value::{Endian, Width};
 
-use super::cp::{AccessKind, Coprocessor, Cp15Stub, CpEffect, CpFault, CpOp, Fault, FlatMmu, Mmu};
+use super::cp::{
+    self, AccessKind, Coprocessor, Cp15Stub, CpEffect, CpFault, CpOp, Fault, FlatMmu, Mmu, Pa,
+    PhysMem, Regime, Va,
+};
+use super::cp15;
 use super::*;
 
 // ---------------------------------------------------------------------------
@@ -1570,19 +1574,27 @@ fn wait_for_interrupt_halts_until_a_line_comes_up() {
 struct TestMmu;
 
 impl Mmu for TestMmu {
+    fn regime(&self) -> Regime {
+        Regime {
+            translating: true,
+            ..Regime::FLAT
+        }
+    }
+
     fn translate(
         &self,
-        va: u32,
+        _mem: &dyn PhysMem,
+        va: Va,
         kind: AccessKind,
         _privileged: bool,
-    ) -> core::result::Result<u32, Fault> {
-        if va & 0xffff_f000 == 0x5000 && !kind.is_fetch() {
+    ) -> core::result::Result<Pa, Fault> {
+        if va.0 & 0xffff_f000 == 0x5000 && !kind.is_fetch() {
             return Err(Fault::TRANSLATION_PAGE);
         }
-        if va & 0xffff_f000 == 0x4000 {
-            return Ok(va - 0x4000 + 0x2000);
+        if va.0 & 0xffff_f000 == 0x4000 {
+            return Ok(Pa(va.0 - 0x4000 + 0x2000));
         }
-        Ok(va)
+        Ok(Pa(va.0))
     }
 }
 
@@ -1918,12 +1930,10 @@ fn decoding_never_panics_over_a_wide_sweep_of_encodings() {
 #[test]
 fn a_flat_mmu_is_the_default_and_needs_no_configuration() {
     let cpu = Arm::new(Config::ARM926EJS);
-    // The default MMU is FlatMmu; asserting it through behaviour rather than
-    // through a getter keeps the seam free to change shape.
-    assert_eq!(
-        FlatMmu.translate(0x1234, AccessKind::Fetch, true),
-        Ok(0x1234)
-    );
+    assert!(cpu.cp15().is_none(), "no CP15 unless a machine asks");
+    // Asserting the default through behaviour rather than through a getter
+    // keeps the seam free to change shape.
+    assert_eq!(FlatMmu::new().regime(), Regime::FLAT);
     assert_eq!(cpu.config().endian, Endian::Little);
 }
 
@@ -1938,14 +1948,24 @@ struct PrivilegeSpy {
 }
 
 impl Mmu for PrivilegeSpy {
+    fn regime(&self) -> Regime {
+        // Translating, so the core actually asks — a TLB hit would answer
+        // without calling and the spy would see nothing.
+        Regime {
+            translating: true,
+            ..Regime::FLAT
+        }
+    }
+
     fn translate(
         &self,
-        va: u32,
+        _mem: &dyn PhysMem,
+        va: Va,
         kind: AccessKind,
         privileged: bool,
-    ) -> core::result::Result<u32, Fault> {
-        self.seen.lock().push((va, kind, privileged));
-        Ok(va)
+    ) -> core::result::Result<Pa, Fault> {
+        self.seen.lock().push((va.0, kind, privileged));
+        Ok(Pa(va.0))
     }
 }
 
@@ -1991,15 +2011,16 @@ struct AbortRecorder {
 impl Mmu for AbortRecorder {
     fn translate(
         &self,
-        va: u32,
+        _mem: &dyn PhysMem,
+        va: Va,
         _kind: AccessKind,
         _privileged: bool,
-    ) -> core::result::Result<u32, Fault> {
-        Ok(va)
+    ) -> core::result::Result<Pa, Fault> {
+        Ok(Pa(va.0))
     }
 
-    fn report_abort(&self, va: u32, fault: Fault, kind: AccessKind) {
-        *self.last.lock() = Some((va, fault, kind));
+    fn report_abort(&self, va: Va, fault: Fault, kind: AccessKind) {
+        *self.last.lock() = Some((va.0, fault, kind));
     }
 }
 
@@ -2436,4 +2457,354 @@ fn the_scheduler_budget_is_never_overshot_and_the_debt_is_paid_back() {
         total + h.cpu.cycle_debt(),
         "cycles executed but not yet reported are exactly the debt"
     );
+}
+
+// ---------------------------------------------------------------------------
+// CP15 and the MMU, inside the core
+// ---------------------------------------------------------------------------
+
+/// A harness whose core has an ARM926EJ-S CP15, with the page table at
+/// `TABLE`.
+///
+/// `RAM_SIZE` is 128 KiB, so the whole 16 KiB first-level table fits with room
+/// for the program at `0x1000` below it and pages to map above.
+const TABLE: u32 = 0x8000;
+
+fn with_cp15() -> Harness {
+    Harness::with_config(Config::ARM926EJS_MMU)
+}
+
+/// Write a section descriptor mapping virtual megabyte `va` to physical
+/// megabyte `pa`, with access permissions `ap` in domain `domain`.
+fn section(h: &Harness, va: u32, pa: u32, ap: u32, domain: u32) {
+    let descriptor = (pa & 0xfff0_0000) | (ap << 10) | (domain << 5) | 0b10;
+    h.poke(TABLE + ((va >> 20) << 2), descriptor);
+}
+
+/// Point CP15 at `TABLE`, make `domains` the domain access control register,
+/// and turn the MMU on.
+fn enable_mmu(h: &Harness, domains: u32) {
+    let cp15 = h.cpu.cp15().expect("this harness has a CP15").clone();
+    let op = |crn, crm, opc2| CpOp {
+        cp: 15,
+        opc1: 0,
+        crd: 0,
+        crn,
+        crm,
+        opc2,
+    };
+    cp15.mcr(op(2, 0, 0), TABLE).unwrap();
+    cp15.mcr(op(3, 0, 0), domains).unwrap();
+    cp15.mcr(op(1, 0, 0), cp15.control() | cp15::control::M)
+        .unwrap();
+}
+
+#[test]
+fn a_core_with_the_mmu_disabled_runs_exactly_as_one_with_no_cp15() {
+    // The regression that matters (`ROADMAP.md`'s precedent: an unmasked hart
+    // vectors its traps exactly as before). Two cores, the same program, one
+    // with a CP15 that is switched off and one with no CP15 at all: every
+    // register, every cycle count and every bus access must agree.
+    //
+    // A program that touches memory both ways, branches, and takes an
+    // exception, because a difference that only shows on one of those is still
+    // a difference.
+    let program = [
+        0xe3a0_0042, // mov r0, #0x42
+        0xe3a0_1c20, // mov r1, #0x2000
+        0xe581_0000, // str r0, [r1]
+        0xe591_2000, // ldr r2, [r1]
+        0xe082_3000, // add r3, r2, r0
+        0xe5c1_3004, // strb r3, [r1, #4]
+        0xe5d1_4004, // ldrb r4, [r1, #4]
+        0xef00_0001, // swi #1
+    ];
+    let plain = Harness::with_config(Config::ARM926EJS);
+    let with = Harness::with_config(Config::ARM926EJS_MMU);
+    for h in [&plain, &with] {
+        h.program(0x1000, &program);
+        h.boot(0x1000);
+    }
+    let mut cycles = (0u64, 0u64);
+    for _ in 0..program.len() + 2 {
+        cycles.0 += plain.step();
+        cycles.1 += with.step();
+        assert_eq!(
+            plain.regs(),
+            with.regs(),
+            "the register files diverged with the MMU switched off"
+        );
+    }
+    assert_eq!(cycles.0, cycles.1, "the cycle counts diverged");
+    assert_eq!(plain.log(), with.log(), "the bus traffic diverged");
+    assert_eq!(plain.cpu.cycles(), with.cpu.cycles());
+}
+
+#[test]
+fn a_section_relocates_both_the_fetch_and_the_data() {
+    let h = with_cp15();
+    // The program is at 0x1000 physically; run it from virtual megabyte 1,
+    // which maps to physical megabyte 0.
+    h.program(
+        0x1000,
+        &[
+            0xe3a0_0042, // mov r0, #0x42
+            0xe3a0_1c20, // mov r1, #0x2000
+            0xe581_0000, // str r0, [r1]
+            0xeaff_fffe, // b .
+        ],
+    );
+    h.boot(0x1000);
+    section(&h, 0x0000_0000, 0x0000_0000, 0b11, 0);
+    section(&h, 0x0010_0000, 0x0000_0000, 0b11, 0);
+    enable_mmu(&h, 0x5555_5555);
+
+    h.cpu.set_pc(0x0010_1000);
+    for _ in 0..3 {
+        h.step();
+    }
+    assert_ne!(h.cpu.mode(), Mode::ABORT);
+    assert_eq!(h.cpu.reg(0), 0x42, "the fetch through the alias failed");
+    assert_eq!(
+        h.peek(0x2000),
+        0x42,
+        "the store did not reach the physical page"
+    );
+    // The bus never saw a virtual address: every access the address space was
+    // asked for is physical.
+    assert!(
+        h.log().iter().all(|a| a.addr < RAM_SIZE as u32),
+        "an untranslated address reached the bus: {:?}",
+        h.log()
+    );
+}
+
+#[test]
+fn an_unmapped_fetch_with_the_mmu_on_is_a_prefetch_abort_with_a_status() {
+    let h = with_cp15();
+    h.boot(0x1000);
+    section(&h, 0, 0, 0b11, 0);
+    enable_mmu(&h, 0x5555_5555);
+    h.cpu.set_pc(0x0040_0000);
+    h.step();
+
+    assert_eq!(h.cpu.mode(), Mode::ABORT);
+    assert_eq!(h.cpu.pc(), Exception::PrefetchAbort.vector());
+    let cp15 = h.cpu.cp15().expect("a CP15");
+    assert_eq!(
+        cp15.fault_status().1,
+        0x05,
+        "the instruction fault status should say `translation fault, section`"
+    );
+}
+
+#[test]
+fn a_user_write_to_a_privileged_page_is_a_permission_fault() {
+    let h = with_cp15();
+    h.program(
+        0x1000,
+        &[
+            0xe3a0_1c30, // mov r1, #0x3000
+            0xe581_1000, // str r1, [r1]
+            0xeaff_fffe, // b .
+        ],
+    );
+    h.boot(0x1000);
+    // AP 0b10: privileged read/write, unprivileged read only.
+    section(&h, 0, 0, 0b10, 0);
+    enable_mmu(&h, 0x5555_5555);
+
+    // Privileged first: the store lands.
+    h.step();
+    h.step();
+    assert_eq!(h.peek(0x3000), 0x3000);
+    assert_ne!(h.cpu.mode(), Mode::ABORT);
+
+    // Now as user code. The fetch still works — AP 0b10 permits an
+    // unprivileged read — and the store does not.
+    h.cpu.set_pc(0x1000);
+    h.cpu.set_cpsr(u32::from(Mode::USER.0));
+    h.step();
+    h.step();
+    assert_eq!(h.cpu.mode(), Mode::ABORT);
+    let cp15 = h.cpu.cp15().expect("a CP15");
+    assert_eq!(cp15.fault_status().0, 0x0d, "permission fault, section");
+    assert_eq!(cp15.fault_address(), 0x3000);
+}
+
+#[test]
+fn a_tlb_invalidate_is_what_makes_a_remapped_page_visible() {
+    let h = with_cp15();
+    h.program(0x1000, &[0xe591_0000]); // ldr r0, [r1]
+    h.boot(0x1000);
+    section(&h, 0, 0, 0b11, 0);
+    // Virtual megabyte 0x100 -> physical megabyte 0.
+    section(&h, 0x1000_0000, 0x0000_0000, 0b11, 0);
+    enable_mmu(&h, 0x5555_5555);
+    h.poke(0x4000, 0xaaaa_aaaa);
+    h.poke(0x1_4000, 0xbbbb_bbbb);
+
+    h.cpu.set_reg(1, 0x1000_4000);
+    h.step();
+    assert_eq!(h.cpu.reg(0), 0xaaaa_aaaa);
+
+    // Repoint the section at physical megabyte 0 offset 0x10000... a section
+    // is a megabyte, so move the whole thing instead: virtual 0x100 now has to
+    // resolve somewhere else. Rewrite the descriptor *without* invalidating and
+    // the cached translation still answers.
+    let op = |crn, crm, opc2| CpOp {
+        cp: 15,
+        opc1: 0,
+        crd: 0,
+        crn,
+        crm,
+        opc2,
+    };
+    h.poke(TABLE + 0x400, 0);
+    h.cpu.set_pc(0x1000);
+    h.step();
+    assert_eq!(
+        h.cpu.reg(0),
+        0xaaaa_aaaa,
+        "a TLB is allowed to answer from a descriptor that has since changed"
+    );
+    assert_ne!(h.cpu.mode(), Mode::ABORT);
+
+    // `MCR p15, 0, Rd, c8, c7, 0` — invalidate the whole TLB — and the
+    // translation is gone.
+    let cp15 = h.cpu.cp15().expect("a CP15").clone();
+    cp15.mcr(op(8, 7, 0), 0).unwrap();
+    h.cpu.set_pc(0x1000);
+    h.step();
+    assert_eq!(h.cpu.mode(), Mode::ABORT);
+}
+
+#[test]
+fn the_tlb_absorbs_a_loop_rather_than_walking_it() {
+    // A TLB that misses on every access is not a TLB. A three-instruction loop
+    // makes four accesses per iteration (three fetches and one load) and needs
+    // exactly two walks to get going: one for the fetch page, one for the data
+    // page.
+    let h = with_cp15();
+    h.program(
+        0x1000,
+        &[
+            0xe591_0000, // ldr r0, [r1]
+            0xe251_1000, // subs r1, r1, #0
+            0xeaff_fffc, // b .-8
+        ],
+    );
+    h.boot(0x1000);
+    section(&h, 0, 0, 0b11, 0);
+    enable_mmu(&h, 0x5555_5555);
+    h.cpu.set_reg(1, 0x4000);
+
+    for _ in 0..300 {
+        h.step();
+    }
+    let (hits, misses) = h.cpu.tlb_stats();
+    assert!(hits > 0);
+    assert_eq!(
+        misses, 2,
+        "one walk for the code page and one for the data page, then never again"
+    );
+}
+
+#[test]
+fn the_snapshot_carries_cp15_and_leaves_the_tlb_behind() {
+    let h = with_cp15();
+    h.boot(0x1000);
+    section(&h, 0, 0, 0b11, 0);
+    enable_mmu(&h, 0x5555_5555);
+    // Give it something to have cached, and something to have latched.
+    h.cpu.set_pc(0x1000);
+    h.program(0x1000, &[0xe3a0_0042]);
+    h.step();
+    let cp15 = h.cpu.cp15().expect("a CP15");
+    cp15.report_abort(cp::Va(0x1234), Fault::PERMISSION_SECTION, AccessKind::Write);
+    let (before_dfsr, _) = cp15.fault_status();
+
+    let mut shape = MachineShape::new();
+    shape.add_device("cpu", CLASS.name).unwrap();
+    let mut writer = StateWriter::new(shape);
+    {
+        let mut chunk = writer
+            .chunk("cpu", CLASS.name, CLASS.version)
+            .expect("a chunk");
+        h.cpu.save(&mut chunk).expect("it saves");
+    }
+    let bytes = writer.to_vec().expect("a snapshot");
+
+    let other = Harness::with_config(Config::ARM926EJS_MMU);
+    let reader = StateReader::new(&bytes).expect("it opens");
+    let chunk = reader
+        .load("cpu", CLASS.name, CLASS.version, &Migrations::new())
+        .expect("a chunk");
+    other.cpu.load(&mut chunk.reader()).expect("it loads");
+
+    let restored = other.cpu.cp15().expect("a CP15");
+    assert_eq!(restored.ttbr(), TABLE);
+    assert_eq!(restored.domains(), 0x5555_5555);
+    assert!(restored.mmu_enabled());
+    assert_eq!(restored.fault_status().0, before_dfsr);
+    assert_eq!(
+        other.cpu.tlb_stats(),
+        (0, 0),
+        "a restored core starts with an empty TLB and rebuilds it by walking"
+    );
+}
+
+#[test]
+fn a_cold_reset_switches_the_mmu_back_off() {
+    // Otherwise a rebooted machine fetches its reset vector through the page
+    // table the last guest left behind.
+    let h = with_cp15();
+    h.boot(0x1000);
+    section(&h, 0, 0, 0b11, 0);
+    enable_mmu(&h, 0x5555_5555);
+    assert!(h.cpu.cp15().expect("a CP15").mmu_enabled());
+
+    h.cpu.reset(ResetKind::Cold);
+    let cp15 = h.cpu.cp15().expect("a CP15");
+    assert!(!cp15.mmu_enabled());
+    assert_eq!(cp15.ttbr(), 0);
+}
+
+#[test]
+fn the_cp15_property_is_what_a_machine_file_writes() {
+    use crate::core::props::Props;
+
+    let mut props = Props::new();
+    props.insert("cp15", "arm926ejs");
+    let cpu = Arm::from_props(&props).expect("`arm926ejs` is a CP15 this core has");
+    assert_eq!(cpu.config().system, System::Arm926EjS);
+    assert!(cpu.cp15().is_some());
+
+    // The name round-trips, so an error message and a machine file agree.
+    for system in [System::None, System::Arm926EjS] {
+        assert_eq!(System::parse(system.as_str()), Some(system));
+        assert!(System::NAMES.contains(&system.as_str()));
+    }
+
+    // The default is the core as it was before CP15 existed.
+    let bare = Arm::from_props(&Props::new()).expect("no properties at all is fine");
+    assert_eq!(bare.config().system, System::None);
+    assert!(bare.cp15().is_none());
+
+    // And a name nothing implements is refused rather than ignored.
+    let mut wrong = Props::new();
+    wrong.insert("cp15", "arm1176jzf-s");
+    assert!(Arm::from_props(&wrong).is_err());
+}
+
+#[test]
+fn cp15_is_reachable_as_coprocessor_fifteen_from_guest_code() {
+    // MRC p15,0,r0,c0,c0,0 — the identification register, through the
+    // instruction rather than through the Rust type.
+    let h = with_cp15();
+    h.program(0x1000, &[0xee10_0f10]);
+    h.boot(0x1000);
+    h.step();
+    assert_eq!(h.cpu.reg(0), cp15::Cp15::ARM926EJS_ID);
+    assert_ne!(h.cpu.mode(), Mode::UNDEFINED);
 }

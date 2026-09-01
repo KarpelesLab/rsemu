@@ -123,8 +123,9 @@ user-supplied BIOS path in the QEMU style (`--bios`, `--vgabios`). No firmware
 is shipped and none will be.
 
 Beside them are four synthetic boards, each the smallest machine that exercises
-one thing: `spi-panel` (a display path over SPI), `arm926` (an ARM926EJ-S with a
-parameterised peripheral aperture, the starting point for a downstream SoC),
+one thing: `spi-panel` (a display path over SPI), `arm926` (an ARM926EJ-S with CP15,
+the VMSAv5 MMU and a parameterised peripheral aperture, the starting point for
+a downstream SoC),
 `z80-mini` (the Z80's separate 64 KiB I/O space) and `m68k-mini` (a 68000 on a
 big-endian map). They model no products; they exist so those subsystems have
 somewhere real to run.

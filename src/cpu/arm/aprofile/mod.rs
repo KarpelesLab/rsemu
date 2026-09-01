@@ -5,9 +5,10 @@
 //! instruction set including `CLZ`, both forms of `BLX`, `BKPT` and the E
 //! extensions (`QADD`, `SMLA<x><y>`, `LDRD`/`STRD`, `PLD`); the full 16-bit
 //! Thumb set with interworking; all seven processor modes with their banked
-//! registers; and the complete exception model. The MMU, the caches and the
-//! TCMs are **not** here — they are the SoC's, and they attach through
-//! [`cp::Coprocessor`] and [`cp::Mmu`].
+//! registers; the complete exception model; and, when a machine asks for one,
+//! a real [`cp15::Cp15`] with the VMSAv5 MMU behind it. The caches and the
+//! TCMs are **not** here — those are the SoC's, and anything else it wants to
+//! add attaches through [`cp::Coprocessor`] and [`cp::Mmu`].
 //!
 //! # Using it from another crate
 //!
@@ -62,7 +63,8 @@
 //! | [`isa`] | the ARM decoder, producing one semantic value that both the interpreter and the disassembler read |
 //! | [`thumb`] | the same for Thumb |
 //! | [`disasm`] | the disassembler built on those two |
-//! | [`cp`] | the coprocessor and MMU traits, `FlatMmu`, and a CP15 stub |
+//! | [`cp`] | the coprocessor and MMU traits, the software TLB, `FlatMmu`, and a CP15 stub |
+//! | [`cp15`] | the ARMv5 system control coprocessor and the VMSAv5 table walk |
 //! | `exec` (private) | the interpreter, and the timing model it implements |
 //!
 //! # Sources
@@ -75,6 +77,7 @@
 //! source of any licence was consulted (`ROADMAP.md` §1).
 
 pub mod cp;
+pub mod cp15;
 pub mod disasm;
 mod exec;
 pub mod isa;
@@ -107,7 +110,8 @@ use crate::core::sync::{self, AtomicBool, AtomicU32, LockRank, Ordering};
 use crate::core::value::Endian;
 use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink};
 
-use cp::{Coprocessor, FlatMmu, Mmu};
+use cp::{Coprocessor, FlatMmu, Mmu, Tlb};
+use cp15::Cp15;
 use exec::{Exec, State};
 
 pub use exec::Exception;
@@ -491,15 +495,16 @@ pub struct Config {
     pub endian: Endian,
     /// Put the exception vectors at `0xffff0000` from reset.
     ///
-    /// CP15's `V` bit does the same thing at runtime and is ORed with this
-    /// ([`cp::Mmu::high_vectors`]); this is for a machine that has no CP15 but
-    /// wires the `VINITHI` input high.
+    /// This is the `VINITHI` input. It sets the *reset value* of CP15's `V`
+    /// bit when the core has a CP15, and is the whole answer when it does not;
+    /// either way guest code that clears `V` moves the vectors back down, which
+    /// is what hardware does.
     pub high_vectors: bool,
     /// Take a Data Abort on an unaligned access rather than rotating.
     ///
-    /// CP15's `A` bit. Off by default, because that is ARMv5's reset state:
-    /// with it clear an unaligned `LDR` rotates the loaded word (ARM ARM
-    /// A2.8.2).
+    /// CP15's `A` bit, and the strap that sets its reset value. Off by default,
+    /// because that is ARMv5's reset state: with it clear an unaligned `LDR`
+    /// rotates the loaded word (ARM ARM A2.8.2).
     pub alignment_faults: bool,
     /// What a store of `R15` writes: the instruction's address plus this.
     ///
@@ -508,17 +513,47 @@ pub struct Config {
     /// ARM7TDMI stores plus twelve, which is what the public conformance
     /// corpus was generated against.
     pub store_pc_offset: u8,
+    /// Which system control coprocessor to build the core with.
+    ///
+    /// [`System::None`] is the default and is what every existing board asks
+    /// for; [`System::Arm926EjS`] adds CP15 and the VMSAv5 MMU. See [`System`]
+    /// for why an MMU is a construction property and not a connection.
+    pub system: System,
 }
 
 impl Config {
-    /// An ARM926EJ-S: little-endian, low vectors, no alignment faults, and
-    /// `STR pc` storing the instruction's address plus eight.
+    /// An ARM926EJ-S **macrocell**: little-endian, low vectors, no alignment
+    /// faults, `STR pc` storing the instruction's address plus eight, and no
+    /// system coprocessor.
+    ///
+    /// The part with its CP15 is [`ARM926EJS_MMU`](Config::ARM926EJS_MMU), and
+    /// the split is deliberate rather than a naming accident. A real
+    /// ARM926EJ-S has CP15, so this constant is the smaller claim — but it is
+    /// the one two consumers need: the ARMv4T conformance corpus and the
+    /// ARMv7E-M differential tester both use this core as an *oracle*, and an
+    /// oracle that answers `MCR p15` instead of taking an Undefined Instruction
+    /// exception is answering a different question. Anything modelling a board
+    /// should say `ARM926EJS_MMU` or `cp15 = "arm926ejs"`.
     pub const ARM926EJS: Config = Config {
         requester: RequesterId::ANONYMOUS,
         endian: Endian::Little,
         high_vectors: false,
         alignment_faults: false,
         store_pc_offset: 8,
+        // The macrocell without its CP15, which is what this core was before
+        // one existed and what every board that does not ask still gets.
+        system: System::None,
+    };
+
+    /// A whole ARM926EJ-S: the same core with its system control coprocessor,
+    /// the VMSAv5 MMU and the part's identification registers.
+    ///
+    /// The MMU is still *off* — c1's `M` bit is clear out of reset — so a core
+    /// built this way executes identically to [`ARM926EJS`](Config::ARM926EJS)
+    /// until guest code turns it on.
+    pub const ARM926EJS_MMU: Config = Config {
+        system: System::Arm926EjS,
+        ..Config::ARM926EJS
     };
 
     /// An ARM7TDMI-shaped configuration: the same core, but storing `R15` as
@@ -617,6 +652,62 @@ impl Lines {
     }
 }
 
+/// Which system control coprocessor the core is built with.
+///
+/// **This is how a `.machine` file asks for an MMU**, and it is deliberately a
+/// construction property rather than a new connection mechanism. `CLAUDE.md`
+/// and `ROADMAP.md` §4.4 both push back hard on inventing a fourth way for two
+/// things to find each other — `Device::export` absorbed three of them — and
+/// none of the existing three fits: CP15 is not a region, not a wire, and not a
+/// handle one *device* publishes for another. It is part of the CPU. The ARM
+/// ARM says so by specifying it in the architecture manual rather than leaving
+/// it to a SoC's, and the RISC-V core here already agrees, carrying its own
+/// Sv32/Sv39 MMU inside `cpu::riscv`.
+///
+/// So a machine file writes `cp15 = "arm926ejs"` on its `cpu.arm` object and
+/// gets one, exactly as a 6502 writes `variant = "rp2a03"`. What is left behind
+/// [`cp::Coprocessor`] and [`cp::Mmu`] is what those traits were always for: a
+/// coprocessor the *SoC* adds, and an MMU that is not this architecture's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum System {
+    /// None. Addresses are physical, the vectors are where the straps put them,
+    /// and a coprocessor instruction is Undefined — an ARM926EJ-S macrocell
+    /// with its CP15 left out, which is what this core was until now.
+    None,
+    /// An ARM926EJ-S CP15: the VMSAv5 MMU, the domain model, the fault
+    /// registers, and the part's identification values.
+    Arm926EjS,
+}
+
+impl System {
+    /// The name a `.machine` file writes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            System::None => "none",
+            System::Arm926EjS => "arm926ejs",
+        }
+    }
+
+    /// Every name the `cp15` property accepts.
+    pub const NAMES: &'static [&'static str] = &["none", "arm926ejs"];
+
+    /// Parse one of [`NAMES`](System::NAMES).
+    ///
+    /// Not `FromStr`: this is infallible-with-`None` rather than an error
+    /// type, because the caller that has one — `or_enum` — has already
+    /// produced the good error message and only needs the value.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<System> {
+        match name {
+            "none" => Some(System::None),
+            "arm926ejs" => Some(System::Arm926EjS),
+            _ => None,
+        }
+    }
+}
+
 /// Which interrupt input a pin drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Interrupt {
@@ -636,6 +727,9 @@ struct Session {
     space: Option<Arc<AddressSpace>>,
     mmu: Arc<dyn Mmu>,
     coprocessors: [Option<Arc<dyn Coprocessor>>; 16],
+    /// The software TLB. Derived state: never serialized, emptied by reset, by
+    /// a snapshot restore, and by either generation counter moving.
+    tlb: Tlb,
 }
 
 impl fmt::Debug for Session {
@@ -648,6 +742,7 @@ impl fmt::Debug for Session {
                 "coprocessors",
                 &self.coprocessors.iter().filter(|c| c.is_some()).count(),
             )
+            .field("tlb", &self.tlb.stats())
             .finish()
     }
 }
@@ -668,6 +763,13 @@ impl fmt::Debug for Session {
 #[derive(Debug)]
 pub struct Arm {
     cfg: Config,
+    /// The system control coprocessor, when [`Config::system`] asked for one.
+    ///
+    /// Held here as well as inside the session because it is *wiring*, not
+    /// guest state: it must survive a reset, it is answerable before the core
+    /// has ever run, and a monitor or a test wants the concrete type rather
+    /// than a `dyn Mmu`.
+    cp15: Option<Arc<Cp15>>,
     lines: Arc<Lines>,
     /// This core's identity in `MemAttrs::requester`, assigned at bind time.
     ///
@@ -704,8 +806,28 @@ impl Arm {
     /// the PC on the reset vector.
     #[must_use]
     pub fn new(cfg: Config) -> Arm {
+        let cp15 = match cfg.system {
+            System::None => None,
+            System::Arm926EjS => Some(Arc::new(Cp15::arm926ejs(&cfg))),
+        };
+        // `Option<Arc<_>>` is not `Copy`, so the array cannot be written
+        // `[None; 16]`.
+        let mut coprocessors: [Option<Arc<dyn Coprocessor>>; 16] = [const { None }; 16];
+        let mmu: Arc<dyn Mmu> = match &cp15 {
+            Some(cp) => {
+                coprocessors[15] = Some(Arc::clone(cp) as Arc<dyn Coprocessor>);
+                Arc::clone(cp) as Arc<dyn Mmu>
+            }
+            // With no CP15 the flat map carries the board's straps, because the
+            // installed MMU is the one authority on them (see `cp::FlatMmu`).
+            None => Arc::new(FlatMmu {
+                high_vectors: cfg.high_vectors,
+                alignment_faults: cfg.alignment_faults,
+            }),
+        };
         Arm {
             cfg,
+            cp15,
             lines: Arc::new(Lines::default()),
             requester: AtomicU32::new(cfg.requester.0),
             session: sync::Mutex::with_rank(
@@ -713,14 +835,23 @@ impl Arm {
                 Session {
                     state: State::new(),
                     space: None,
-                    mmu: Arc::new(FlatMmu),
-                    // `Option<Arc<_>>` is not `Copy`, so the array cannot be
-                    // written `[None; 16]`.
-                    coprocessors: [const { None }; 16],
+                    mmu,
+                    coprocessors,
+                    tlb: Tlb::new(),
                 },
             ),
             pins: sync::Mutex::new(Pins::default()),
         }
+    }
+
+    /// This core's system control coprocessor, if it was built with one.
+    ///
+    /// The concrete type rather than a trait object: a monitor listing CP15,
+    /// a test asserting a fault status, and a SoC that wants to seed the
+    /// translation table base all want to read named registers.
+    #[must_use]
+    pub fn cp15(&self) -> Option<&Arc<Cp15>> {
+        self.cp15.as_ref()
     }
 
     /// Build one from machine-description properties.
@@ -736,6 +867,7 @@ impl Arm {
         let high_vectors = r.or("high-vectors", false)?;
         let alignment_faults = r.or("alignment-faults", false)?;
         let store_pc_offset = r.or_range("store-pc-offset", 8u64, 8..=12)?;
+        let system = r.or_enum("cp15", "none", System::NAMES)?;
         // Accepted and ignored: there is one engine until phase 5, and a
         // machine file that names it should not have to be edited when the
         // second one lands.
@@ -756,6 +888,8 @@ impl Arm {
             high_vectors,
             alignment_faults,
             store_pc_offset: store_pc_offset as u8,
+            // `or_enum` already rejected anything not in `NAMES`.
+            system: System::parse(system).unwrap_or(System::None),
         }))
     }
 
@@ -790,13 +924,34 @@ impl Arm {
         self.session.lock().space.clone()
     }
 
-    /// Install the object that translates addresses and owns the vector base.
+    /// Install the object that translates addresses and owns the control bits
+    /// the core reads.
     ///
-    /// Defaults to [`FlatMmu`], an identity map. A SoC crate passes its CP15
-    /// here *and* to [`attach_coprocessor`](Arm::attach_coprocessor) — the
-    /// same object usually implements both traits.
+    /// Rarely needed now: a core built with [`System::Arm926EjS`] already has
+    /// a [`Cp15`] installed here and at coprocessor 15. This replaces it, for a
+    /// SoC whose memory management is genuinely not the architecture's — and
+    /// such a SoC usually passes the same object to
+    /// [`attach_coprocessor`](Arm::attach_coprocessor) as well, because one
+    /// type implementing both traits is what a real system coprocessor is.
+    ///
+    /// The MMU installed here becomes the **only** authority on the vector base
+    /// and the alignment check, so an implementation that means to honour the
+    /// board's `VINITHI` strap has to be told about it; the default
+    /// [`FlatMmu`] is constructed from [`Config`] for exactly that reason.
     pub fn attach_mmu(&self, mmu: Arc<dyn Mmu>) {
-        self.session.lock().mmu = mmu;
+        let mut session = self.session.lock();
+        session.mmu = mmu;
+        // Whatever the old one had decided is not this one's answer.
+        session.tlb.flush();
+    }
+
+    /// How many TLB lookups hit and how many missed since the last flush.
+    ///
+    /// Derived state and therefore not in a snapshot; this is for `rsemu`'s
+    /// statistics and for a benchmark that wants to prove the TLB is working.
+    #[must_use]
+    pub fn tlb_stats(&self) -> (u64, u64) {
+        self.session.lock().tlb.stats()
     }
 
     /// Install a coprocessor at number `cp` (`0..=15`).
@@ -978,6 +1133,7 @@ impl Arm {
             space,
             mmu,
             coprocessors,
+            tlb,
         } = &mut *session;
         // The `reset` pin latches outside the lock; this is where the latch
         // becomes execution state, and it must happen before the step so an
@@ -987,7 +1143,7 @@ impl Arm {
             return 0;
         };
         let mmu = Arc::clone(mmu);
-        Exec::new(state, &space, mmu.as_ref(), coprocessors, &cfg).step(irq, fiq)
+        Exec::new(state, &space, mmu.as_ref(), tlb, coprocessors, &cfg).step(irq, fiq)
     }
 
     /// Execute until at least `budget` cycles have been charged.
@@ -1059,6 +1215,13 @@ impl Arm {
     /// core. Debug attributes are the point: a monitor listing the code around
     /// the PC must not pop a FIFO or clear a status bit on the way
     /// (`ROADMAP.md` §15, invariant 5).
+    ///
+    /// **`addr` is physical.** With the MMU on, a caller that passes
+    /// [`pc`](Arm::pc) — a virtual address — gets whatever is at that physical
+    /// address instead, which is usually nothing. Translating here needs the
+    /// walk to run under [`MemAttrs::DEBUG`] and needs an answer for a listing
+    /// that runs off the end of a mapped page, and neither is decided; until it
+    /// is, a debugger that wants a translated listing translates first.
     #[must_use]
     pub fn disassemble(&self, addr: u32, count: usize, thumb: bool) -> Vec<disasm::Listed> {
         let Some(space) = self.space() else {
@@ -1077,8 +1240,12 @@ impl Arm {
 pub static CLASS: DeviceClass = DeviceClass {
     name: "cpu.arm",
     // 2: the chunk gained the scheduler debt, without which a restored core
-    // runs one instruction free.
-    version: 2,
+    //    runs one instruction free.
+    // 3: a core built with `cp15 = "arm926ejs"` appends its CP15 registers. A
+    //    core without one writes the same bytes it wrote at v2, but the chunk
+    //    is no longer the same shape for every instance of the class, so the
+    //    version moves for all of them rather than silently for some.
+    version: 3,
     summary: "ARMv5TE (ARM926EJ-S class) 32-bit CPU core with Thumb and the DSP extensions",
     properties: &[
         PropertySpec {
@@ -1098,6 +1265,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Bool,
             required: false,
             summary: "take a data abort on an unaligned access instead of rotating",
+        },
+        PropertySpec {
+            name: "cp15",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "the system control coprocessor: `none`, or `arm926ejs` for CP15 and the MMU",
         },
         PropertySpec {
             name: "store-pc-offset",
@@ -1141,8 +1314,18 @@ impl Device for Arm {
     }
 
     fn reset(&self, kind: ResetKind) {
+        // CP15 is reset by the same signal the core is, so a cold start puts
+        // its registers back too — including the MMU enable, which is what
+        // makes a rebooted machine fetch its reset vector physically.
+        if kind == ResetKind::Cold
+            && let Some(cp15) = &self.cp15
+        {
+            cp15.reset();
+        }
         {
             let mut session = self.session.lock();
+            // Derived state, and the cheapest correct thing to do with it.
+            session.tlb.flush();
             if kind == ResetKind::Cold {
                 session.state = State::new();
             } else {
@@ -1200,6 +1383,13 @@ impl Device for Arm {
         let (irq, fiq) = self.lines.snapshot();
         w.write_bool(irq)?;
         w.write_bool(fiq)?;
+        // CP15 last, so the bytes a core without one writes are exactly the
+        // bytes it always wrote. The TLB is not here and never will be: it is
+        // derived state, and a snapshot that carried it would be asserting
+        // something about the future rather than about the machine.
+        if let Some(cp15) = &self.cp15 {
+            cp15.save(w)?;
+        }
         Ok(())
     }
 
@@ -1231,7 +1421,15 @@ impl Device for Arm {
         state.debt = r.read_u64()?;
         let irq = r.read_bool()?;
         let fiq = r.read_bool()?;
-        self.session.lock().state = state;
+        if let Some(cp15) = &self.cp15 {
+            cp15.load(r)?;
+        }
+        {
+            let mut session = self.session.lock();
+            session.state = state;
+            // Whatever the TLB held describes the machine we are replacing.
+            session.tlb.flush();
+        }
         self.lines.restore((irq, fiq));
         Ok(())
     }
@@ -1291,13 +1489,16 @@ impl Initiator for Arm {
 /// The machine layer's half: a core needs an address space, and this is where
 /// the machine gives it one.
 ///
-/// **No CP15 arrives here, deliberately.** The MMU, the caches and the TCMs
-/// belong to the SoC rather than to the architecture (see [`cp`]), so a machine
-/// file gets the [`FlatMmu`] identity map and a downstream crate that models a
-/// real SoC calls [`Arm::attach_mmu`] and [`Arm::attach_coprocessor`] itself.
-/// Reaching a `dyn Coprocessor` from a `.machine` file would need the export
-/// seam (`ROADMAP.md` §4.4) to carry one, which it does not yet; until it does,
-/// a board whose firmware programs CP15 has to be assembled in Rust.
+/// **CP15 does not arrive here either**, and that is the point: it arrived at
+/// construction. `cp15 = "arm926ejs"` on the object is read by
+/// [`Arm::from_props`], so by the time the machine layer is binding an address
+/// space the core already has its MMU (see [`System`]). Binding stayed a
+/// two-line function and `Device::export` did not have to grow a shape for a
+/// `dyn Coprocessor`.
+///
+/// What a downstream SoC still does through [`Arm::attach_mmu`] and
+/// [`Arm::attach_coprocessor`] is add what is genuinely its own: the caches,
+/// the TCMs, a coprocessor 14.
 impl crate::machine::Instance for Arm {
     fn bind(&self, ctx: &crate::machine::BindCtx<'_>) -> Result<()> {
         // A CPU with no address space cannot fetch, and a machine that runs
@@ -1332,6 +1533,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("high-vectors", ValueKind::Bool))
         .prop(PropSchema::new("alignment-faults", ValueKind::Bool))
         .prop(PropSchema::new("store-pc-offset", ValueKind::Uint).range(8, 12))
+        .prop(PropSchema::new("cp15", ValueKind::Str).values(System::NAMES))
         .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
         // Inputs only: an ARM926EJ-S drives nothing this core models. The
         // bus-facing outputs a real part has -- `nMREQ`, `nRW`, `nWAIT` -- are
