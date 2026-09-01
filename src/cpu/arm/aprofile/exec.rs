@@ -58,11 +58,15 @@
 //! ARM9 datasheets. No emulator source of any licence was consulted.
 
 use alloc::sync::Arc;
+use core::cell::Cell;
 
 use crate::core::space::{AddressSpace, MemAttrs};
 use crate::core::value::{Endian, Width};
 
-use super::cp::{AccessKind, Coprocessor, CpEffect, CpFault, CpOp, CpTransfer, Fault, Mmu};
+use super::cp::{
+    AccessKind, Coprocessor, CpEffect, CpFault, CpOp, CpTransfer, Fault, Mmu, Pa, PhysMem, Regime,
+    Tlb, Va,
+};
 use super::isa::{
     Decoded, DpOp, ExtraOp, Half, HalfMulOp, Index, Insn, Offset, Operand, SatOp, Shift, ShiftType,
 };
@@ -208,13 +212,51 @@ impl State {
     }
 }
 
+/// Physical memory, as the MMU's table walk sees it.
+///
+/// Built fresh for each walk rather than kept on [`Exec`], because it counts
+/// the descriptor reads: the walk happens behind a `&dyn Mmu` and cannot charge
+/// the core's cycle budget itself, so it counts and the core charges when it
+/// gets the answer back. A `Cell` rather than an atomic because this never
+/// leaves the stack frame that made it.
+struct Walker<'a> {
+    space: &'a AddressSpace,
+    attrs: MemAttrs,
+    endian: Endian,
+    reads: Cell<u32>,
+}
+
+impl PhysMem for Walker<'_> {
+    fn read_u32(&self, at: Pa) -> Option<u32> {
+        self.reads.set(self.reads.get() + 1);
+        let value = self
+            .space
+            .read(u64::from(at.0), Width::U32, self.attrs)
+            .ok()? as u32;
+        // A table walk reads memory the same way the core does, so a
+        // big-endian core walks big-endian tables. The comparison against the
+        // region's own endianness is `to_cpu_order`'s, kept in step with it.
+        Some(
+            if self.endian == Endian::Little || self.space.endian_at(u64::from(at.0)) == self.endian
+            {
+                value
+            } else {
+                value.swap_bytes()
+            },
+        )
+    }
+}
+
 /// One step's worth of execution, borrowing everything it needs.
 pub(super) struct Exec<'a> {
     state: &'a mut State,
     space: &'a AddressSpace,
     mmu: &'a dyn Mmu,
+    tlb: &'a mut Tlb,
     coprocessors: &'a [Option<Arc<dyn Coprocessor>>; 16],
     cfg: &'a Config,
+    /// The MMU's control bits, sampled once for this instruction.
+    regime: Regime,
     attrs: MemAttrs,
     /// Address of the instruction being executed.
     insn_addr: u32,
@@ -227,20 +269,29 @@ pub(super) struct Exec<'a> {
 
 impl<'a> Exec<'a> {
     /// Borrow a core for one step.
+    ///
+    /// This is where the MMU is asked what it is doing — once, for the whole
+    /// instruction. See [`Regime`] for why that is both cheaper and closer to
+    /// the architecture than asking per access.
     pub(super) fn new(
         state: &'a mut State,
         space: &'a AddressSpace,
         mmu: &'a dyn Mmu,
+        tlb: &'a mut Tlb,
         coprocessors: &'a [Option<Arc<dyn Coprocessor>>; 16],
         cfg: &'a Config,
     ) -> Exec<'a> {
         let attrs = MemAttrs::DEFAULT.with_requester(cfg.requester);
+        let regime = mmu.regime();
+        tlb.sync(regime.generation, space.generation());
         Exec {
             state,
             space,
             mmu,
+            tlb,
             coprocessors,
             cfg,
+            regime,
             attrs,
             insn_addr: 0,
             branched: false,
@@ -457,11 +508,13 @@ impl<'a> Exec<'a> {
 
     /// Where the vector table sits.
     ///
-    /// Either the core was configured for high vectors, or CP15's `V` bit says
-    /// so; the machine may fix it and the guest may change it, and both have to
-    /// work (ARM ARM A2.6.11).
+    /// The MMU is the single authority: with no system coprocessor it is a
+    /// [`FlatMmu`](super::cp::FlatMmu) carrying the board's `VINITHI` strap,
+    /// and with one it is CP15's `V` bit, which that strap set the reset value
+    /// of. Guest code that clears the bit moves the vectors back down, which
+    /// hardware permits and an ORed-in strap would not (ARM ARM A2.6.11).
     fn vector_base(&self) -> u32 {
-        if self.cfg.high_vectors || self.mmu.high_vectors() {
+        if self.regime.high_vectors {
             0xffff_0000
         } else {
             0
@@ -491,7 +544,7 @@ impl<'a> Exec<'a> {
 
     /// Take the exception an [`Abort`] calls for, and tell CP15 about it.
     fn take_abort(&mut self, abort: Abort) {
-        self.mmu.report_abort(abort.va, abort.fault, abort.kind);
+        self.mmu.report_abort(Va(abort.va), abort.fault, abort.kind);
         if abort.kind.is_fetch() {
             let lr = self.insn_addr.wrapping_add(4);
             self.take_exception(Exception::PrefetchAbort, lr);
@@ -510,10 +563,53 @@ impl<'a> Exec<'a> {
         self.state.regs.mode().is_privileged()
     }
 
+    /// Virtual to physical, through the TLB.
+    ///
+    /// Three paths, in the order they cost. With no translation switched on
+    /// this is an inlined branch on a bool and nothing else — which is what
+    /// keeps a machine whose firmware never enables the MMU exactly as fast as
+    /// it was before this existed. With translation on, a TLB hit is a mask, a
+    /// compare and an or. Only a miss walks, and only a miss is charged the
+    /// descriptor reads the walk made.
+    #[inline]
     fn translate(&mut self, va: u32, kind: AccessKind, privileged: bool) -> Ex<u32> {
-        self.mmu
-            .translate(va, kind, privileged)
-            .map_err(|fault| Abort { kind, va, fault })
+        if !self.regime.translating {
+            return Ok(va);
+        }
+        self.translate_slow(va, kind, privileged)
+    }
+
+    /// The half of [`translate`](Exec::translate) that is not the common case,
+    /// kept out of line so the common case stays small enough to inline.
+    fn translate_slow(&mut self, va: u32, kind: AccessKind, privileged: bool) -> Ex<u32> {
+        let va = Va(va);
+        if let Some(pa) = self.tlb.lookup(kind, va, privileged) {
+            return Ok(pa.0);
+        }
+        // A table walk is the memory system's own access, not the guest's: it
+        // is privileged whatever the instruction was, because the MMU makes it
+        // rather than the program.
+        let walker = Walker {
+            space: self.space,
+            attrs: self.attrs.with_privileged(true),
+            endian: self.cfg.endian,
+            reads: Cell::new(0),
+        };
+        let result = self.mmu.translate(&walker, va, kind, privileged);
+        // Charged whether the walk succeeded or not: the reads happened on the
+        // bus either way, and a device mapped under a page table sees them.
+        self.cycle(u64::from(walker.reads.get()));
+        match result {
+            Ok(pa) => {
+                self.tlb.insert(kind, va, privileged, pa);
+                Ok(pa.0)
+            }
+            Err(fault) => Err(Abort {
+                kind,
+                va: va.0,
+                fault,
+            }),
+        }
     }
 
     /// Reject a misaligned access, when the machine asked us to.
@@ -522,7 +618,7 @@ impl<'a> Exec<'a> {
     /// alignment checking, and with it clear an unaligned word load rotates
     /// instead of faulting (ARM ARM A2.8.2).
     fn check_alignment(&self, va: u32, width: Width, kind: AccessKind) -> Ex {
-        if self.cfg.alignment_faults && !width.is_aligned(u64::from(va)) {
+        if self.regime.alignment_faults && !width.is_aligned(u64::from(va)) {
             return Err(Abort {
                 kind,
                 va,
@@ -599,7 +695,7 @@ impl<'a> Exec<'a> {
     /// right by eight times the address's low two bits, which puts the
     /// addressed byte in the low lane (ARM ARM A4.1.23).
     fn load_word_rotated(&mut self, va: u32, privileged: bool) -> Ex<u32> {
-        if self.cfg.alignment_faults {
+        if self.regime.alignment_faults {
             self.check_alignment(va, Width::U32, AccessKind::Read)?;
         }
         let value = self.load(va & !3, Width::U32, privileged)?;
@@ -613,7 +709,7 @@ impl<'a> Exec<'a> {
     /// access is aligned and the value comes back rotated so the addressed
     /// byte lands in the low lane. Measured against the corpus.
     fn load_half_rotated(&mut self, va: u32, privileged: bool) -> Ex<u32> {
-        if self.cfg.alignment_faults {
+        if self.regime.alignment_faults {
             self.check_alignment(va, Width::U16, AccessKind::Read)?;
         }
         let value = self.load(va & !1, Width::U16, privileged)?;
@@ -627,7 +723,7 @@ impl<'a> Exec<'a> {
     /// better known consequences of ARMv5 leaving the case UNPREDICTABLE
     /// (ARM ARM A4.1.22). The access on the bus is still a halfword.
     fn load_signed_half(&mut self, va: u32, privileged: bool) -> Ex<u32> {
-        if self.cfg.alignment_faults {
+        if self.regime.alignment_faults {
             self.check_alignment(va, Width::U16, AccessKind::Read)?;
         }
         let value = self.load(va & !1, Width::U16, privileged)?;

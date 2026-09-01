@@ -13,14 +13,33 @@
 //! | Trait | What it is | Default |
 //! | --- | --- | --- |
 //! | [`Coprocessor`] | `MCR`/`MRC`/`CDP`/`LDC`/`STC`/`MCRR`/`MRRC` for one coprocessor number | none attached; every coprocessor instruction is Undefined |
-//! | [`Mmu`] | virtual to physical, plus where the vectors live | [`FlatMmu`], an identity map that never faults |
+//! | [`Mmu`] | virtual to physical, plus the control bits the core reads | [`FlatMmu`], an identity map that never faults |
 //!
 //! A downstream SoC crate implements both on one type — that is what a real
 //! CP15 is — and attaches it with
 //! [`Arm::attach_coprocessor`](super::Arm::attach_coprocessor) and
-//! [`Arm::attach_mmu`](super::Arm::attach_mmu). For bring-up before that
-//! exists, [`Cp15Stub`] answers the handful of registers that boot code
-//! touches and reports no MMU.
+//! [`Arm::attach_mmu`](super::Arm::attach_mmu).
+//!
+//! **The architecture's own CP15 now ships in the core**:
+//! [`Cp15`](super::cp15::Cp15) is a VMSAv5 system control coprocessor and is
+//! selected by a construction property ([`Config::system`](super::Config)), so
+//! a `.machine` file asks for one by name. The traits here remain the seam for
+//! the parts that are genuinely the SoC's — a coprocessor 14 debug unit, a
+//! vendor MMU — and [`Cp15Stub`] remains for bring-up where even a real CP15
+//! is more than is wanted.
+//!
+//! # Why the core keeps the TLB and the MMU does not
+//!
+//! [`Tlb`] lives here, beside the trait, and the *core* owns an instance of
+//! it. An [`Mmu`] implementation is `&self` and `Sync`, so a cache inside one
+//! needs a lock or an atomic on the hot path — a cost paid on every access, to
+//! avoid a walk that happens on one access in a thousand. The core has
+//! `&mut` to its own execution state and can index a plain array, so that is
+//! where the cache goes. What the MMU owes the core instead is
+//! [`Regime::generation`]: a number that changes whenever a cached translation
+//! could have gone stale. `ROADMAP.md` §4.1 puts the page table and the
+//! software TLB *above* `core::space` for the same reason, and this is that
+//! position occupied.
 //!
 //! # Why a fault is data rather than an error type
 //!
@@ -240,6 +259,116 @@ impl AccessKind {
     pub const fn is_fetch(self) -> bool {
         matches!(self, AccessKind::Fetch)
     }
+
+    /// Which of the three per-kind halves of a [`Tlb`] this access uses.
+    #[inline]
+    const fn slot(self) -> usize {
+        match self {
+            AccessKind::Fetch => 0,
+            AccessKind::Read => 1,
+            AccessKind::Write => 2,
+        }
+    }
+}
+
+/// A guest-*virtual* address, as an instruction names it.
+///
+/// Distinct from [`Pa`] because confusing the two is, in `CLAUDE.md`'s words,
+/// the classic emulator bug — and a page-table walk is where it happens: every
+/// descriptor read is at a physical address, every table index comes from a
+/// virtual one, and the two are the same width on a 32-bit ARM so the compiler
+/// is the only thing that can tell them apart. The newtypes stop at this seam:
+/// the interpreter works in `u32` above it, wrapping on the way in and
+/// unwrapping on the way out, because threading them through every addressing
+/// mode would be noise for a distinction that only matters here.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Va(pub u32);
+
+/// A guest-*physical* address: what comes out of translation and goes onto the
+/// bus. See [`Va`].
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Pa(pub u32);
+
+impl fmt::Display for Va {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:#010x}", self.0)
+    }
+}
+
+impl fmt::Display for Pa {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:#010x}", self.0)
+    }
+}
+
+/// Physical memory, as a translation-table walk needs to see it.
+///
+/// The walk is the one part of an [`Mmu`] that reads guest memory, and it must
+/// read it *physically* and without translating — a table walk that went back
+/// through the MMU would not terminate. The core supplies this because the core
+/// is what holds the address space; an `Mmu` that kept its own handle on one
+/// would have to be told about every rebind, and the bus master's identity
+/// would then live in two places.
+pub trait PhysMem {
+    /// Read one 32-bit descriptor.
+    ///
+    /// `None` is a bus error — an unmapped table — which the walker turns into
+    /// [`Fault::EXTERNAL_L1`] or [`Fault::EXTERNAL_L2`] depending on where it
+    /// happened.
+    fn read_u32(&self, at: Pa) -> Option<u32>;
+}
+
+/// Everything about the MMU that the core caches for the length of one
+/// instruction.
+///
+/// Sampled once per [`step`](super::Arm::step) rather than once per access.
+/// Three of the four fields are read on *every* memory access and none of them
+/// can change under the instruction reading them — the only thing that changes
+/// them is an `MCR` to CP15, which is itself an instruction. Sampling per step
+/// also reproduces the architectural rule that enabling the MMU takes effect no
+/// earlier than the following instruction (ARM ARM B2.1 leaves the exact point
+/// implementation-defined, which is why every ARM boot sequence follows the
+/// `MCR` with a pipeline's worth of harmless instructions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Regime {
+    /// Changes whenever a translation the core cached could have gone stale.
+    ///
+    /// The core watches it for *change*, never for value, so an implementation
+    /// may bump it as coarsely as it likes — an ARMv5 CP15 bumps it on every
+    /// c8 TLB operation, on a `TTBR`, domain or `FCSE PID` write, and on an
+    /// MMU enable or disable, which between them cover every architectural
+    /// invalidation.
+    pub generation: u32,
+    /// Whether addresses need translating at all.
+    ///
+    /// `false` is the ARM926EJ-S out of reset, and it means more than an
+    /// identity map: the core skips the TLB, the walk and the permission check
+    /// entirely, so a machine with the MMU off costs what it did before this
+    /// module existed.
+    pub translating: bool,
+    /// CP15 c1's `V` bit: the exception vectors are at `0xffff0000`.
+    pub high_vectors: bool,
+    /// CP15 c1's `A` bit: an unaligned access is a Data Abort, not a rotate.
+    pub alignment_faults: bool,
+}
+
+impl Regime {
+    /// No translation, low vectors, no alignment checking — an ARM with no
+    /// system coprocessor.
+    pub const FLAT: Regime = Regime {
+        generation: 0,
+        translating: false,
+        high_vectors: false,
+        alignment_faults: false,
+    };
+}
+
+impl Default for Regime {
+    fn default() -> Regime {
+        Regime::FLAT
+    }
 }
 
 /// An abort, in the encoding CP15's fault-status register uses.
@@ -269,6 +398,29 @@ impl Fault {
     /// Translation fault, page (`0b0111`).
     pub const TRANSLATION_PAGE: Fault = Fault {
         status: 0b0111,
+        domain: 0,
+    };
+    /// Domain fault, section (`0b1001`) — the domain is "no access".
+    pub const DOMAIN_SECTION: Fault = Fault {
+        status: 0b1001,
+        domain: 0,
+    };
+    /// Domain fault, page (`0b1011`).
+    pub const DOMAIN_PAGE: Fault = Fault {
+        status: 0b1011,
+        domain: 0,
+    };
+    /// External abort on a first-level translation (`0b1100`).
+    ///
+    /// The bus refused the read of the *first-level descriptor* itself. A
+    /// guest that sees this has pointed `TTBR` at nothing.
+    pub const EXTERNAL_L1: Fault = Fault {
+        status: 0b1100,
+        domain: 0,
+    };
+    /// External abort on a second-level translation (`0b1110`).
+    pub const EXTERNAL_L2: Fault = Fault {
+        status: 0b1110,
         domain: 0,
     };
     /// External abort on a non-line-fetch (`0b1000`).
@@ -314,7 +466,21 @@ impl Fault {
 /// tables should cache — the core deliberately does not cache on its behalf,
 /// because only the MMU knows when to invalidate.
 pub trait Mmu: Send + Sync + fmt::Debug {
-    /// Translate one address.
+    /// The control bits the core reads, sampled once per instruction.
+    ///
+    /// Defaults to [`Regime::FLAT`], which is what makes
+    /// [`translate`](Mmu::translate) unreachable for an implementation that
+    /// does not translate: the core never calls it.
+    fn regime(&self) -> Regime {
+        Regime::FLAT
+    }
+
+    /// Translate one address, walking whatever tables this MMU has.
+    ///
+    /// Called only when [`Regime::translating`] is set, and only on a miss in
+    /// the core's [`Tlb`] — so an implementation should do the honest walk here
+    /// and not cache: the core is already caching, and a second cache would
+    /// need a lock the core does not.
     ///
     /// `privileged` is the CPU's current privilege, already adjusted for the
     /// `LDRT`/`STRT` forms, which make a privileged access behave as an
@@ -324,17 +490,13 @@ pub trait Mmu: Send + Sync + fmt::Debug {
     ///
     /// A [`Fault`] the core turns into a Prefetch or Data Abort depending on
     /// [`AccessKind`].
-    fn translate(&self, va: u32, kind: AccessKind, privileged: bool) -> Result<u32, Fault>;
-
-    /// Whether the exception vectors sit at `0xffff0000` rather than `0`.
-    ///
-    /// CP15's control register bit 13 (ARM ARM B2.1). It lives here rather
-    /// than in the core's configuration because it is a *runtime* property
-    /// that guest code flips, and the thing guest code flips it through is
-    /// this object.
-    fn high_vectors(&self) -> bool {
-        false
-    }
+    fn translate(
+        &self,
+        mem: &dyn PhysMem,
+        va: Va,
+        kind: AccessKind,
+        privileged: bool,
+    ) -> Result<Pa, Fault>;
 
     /// Told about every abort the core takes, so `FSR` and `FAR` can be
     /// latched.
@@ -342,7 +504,7 @@ pub trait Mmu: Send + Sync + fmt::Debug {
     /// Called for aborts this trait raised *and* for the ones the address
     /// space raised, which is the case an implementation would otherwise never
     /// hear about.
-    fn report_abort(&self, va: u32, fault: Fault, kind: AccessKind) {
+    fn report_abort(&self, va: Va, fault: Fault, kind: AccessKind) {
         let _ = (va, fault, kind);
     }
 }
@@ -352,12 +514,50 @@ pub trait Mmu: Send + Sync + fmt::Debug {
 /// This is what makes the core usable on its own — hand it an
 /// [`AddressSpace`](crate::core::space::AddressSpace) and it runs, exactly as
 /// an ARM7TDMI or a cacheless bring-up configuration does.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FlatMmu;
+///
+/// It carries the two control bits anyway, seeded from the core's
+/// [`Config`](super::Config), because **the installed MMU is what the core asks
+/// about them** — there is no second answer ORed in from elsewhere. On real
+/// silicon `VINITHI` and the alignment strap set the *reset value* of CP15 c1
+/// and software owns them afterwards; modelling it as "the board's answer, or
+/// CP15's, whichever says yes" would leave a board with `VINITHI` tied high
+/// unable to move its vectors back down, which hardware can do.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FlatMmu {
+    /// The exception vectors are at `0xffff0000`.
+    pub high_vectors: bool,
+    /// An unaligned access is a Data Abort.
+    pub alignment_faults: bool,
+}
+
+impl FlatMmu {
+    /// A flat map with low vectors and no alignment checking.
+    #[must_use]
+    pub const fn new() -> FlatMmu {
+        FlatMmu {
+            high_vectors: false,
+            alignment_faults: false,
+        }
+    }
+}
 
 impl Mmu for FlatMmu {
-    fn translate(&self, va: u32, _kind: AccessKind, _privileged: bool) -> Result<u32, Fault> {
-        Ok(va)
+    fn regime(&self) -> Regime {
+        Regime {
+            high_vectors: self.high_vectors,
+            alignment_faults: self.alignment_faults,
+            ..Regime::FLAT
+        }
+    }
+
+    fn translate(
+        &self,
+        _mem: &dyn PhysMem,
+        va: Va,
+        _kind: AccessKind,
+        _privileged: bool,
+    ) -> Result<Pa, Fault> {
+        Ok(Pa(va.0))
     }
 }
 
@@ -453,13 +653,187 @@ impl Coprocessor for Cp15Stub {
 }
 
 impl Mmu for Cp15Stub {
-    fn translate(&self, va: u32, _kind: AccessKind, _privileged: bool) -> Result<u32, Fault> {
-        Ok(va)
+    fn regime(&self) -> Regime {
+        let control = self.control();
+        Regime {
+            // Control register bits 13 and 1, the `V` and `A` bits
+            // (ARM ARM B2.1). The `M` bit is deliberately *not* read: this stub
+            // has no translation tables, and pretending otherwise is the
+            // half-built MMU its documentation refuses to be.
+            high_vectors: control & (1 << 13) != 0,
+            alignment_faults: control & (1 << 1) != 0,
+            ..Regime::FLAT
+        }
     }
 
-    fn high_vectors(&self) -> bool {
-        // Control register bit 13, the `V` bit (ARM ARM B2.1).
-        self.control() & (1 << 13) != 0
+    fn translate(
+        &self,
+        _mem: &dyn PhysMem,
+        va: Va,
+        _kind: AccessKind,
+        _privileged: bool,
+    ) -> Result<Pa, Fault> {
+        Ok(Pa(va.0))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The software TLB
+// ---------------------------------------------------------------------------
+
+/// How many entries each of the three halves of the TLB holds.
+///
+/// Direct-mapped and a power of two, so a lookup is a mask, a compare and an
+/// add. `ROADMAP.md` §9 calls that the fast path's shape; this is the
+/// interpreter's version of it.
+pub const TLB_ENTRIES: usize = 256;
+
+/// How much address space one TLB entry covers, in bits.
+///
+/// **One kibibyte, not four.** VMSAv5's smallest page is the 1 KiB *tiny* page
+/// (ARM ARM B4.3.2), so four consecutive kibibytes can have four different
+/// translations and four different permissions. Keying at 4 KiB would mean a
+/// tiny page silently answering for its three neighbours, which is the kind of
+/// bug that only shows up in a guest nobody has run yet. Sections and large
+/// pages simply occupy several entries, which costs entries and never
+/// correctness.
+pub const TLB_PAGE_BITS: u32 = 10;
+
+/// One cached translation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Entry {
+    /// Virtual page number, privilege and epoch mixed together, so a stale
+    /// entry can never be mistaken for a hit.
+    tag: u64,
+    /// The physical base of the kibibyte this maps to.
+    base: u32,
+    /// Whether this slot holds anything.
+    valid: bool,
+}
+
+/// The core's software TLB.
+///
+/// Derived state in the strict sense of `ROADMAP.md` §4.5: never serialized,
+/// safe to throw away at any moment, and rebuilt by walking. A restored
+/// snapshot comes back with an empty one, which is always correct and never
+/// stale.
+///
+/// # Split by access kind
+///
+/// Three independent direct-mapped arrays, one per [`AccessKind`], for the
+/// reason the RISC-V core's TLB is split the same way: an entry exists only
+/// because a walk *for that kind of access* succeeded, so a cached store
+/// translation has already passed the write-permission check and a cached fetch
+/// has already passed the execute one. A single shared array would have to
+/// re-check permissions on every hit, which is most of the walk's cost back
+/// again. The tag carries the privilege for the same reason.
+///
+/// # Two things invalidate it
+///
+/// [`sync`](Tlb::sync) is handed the MMU's [`Regime::generation`] and the
+/// address space's topology generation, and bumps a private epoch when either
+/// changes. The first covers `TLBIALL` and every `TTBR`, domain or control
+/// write; the second is `CLAUDE.md`'s rule that derived state dies with the
+/// topology counter. The epoch is a `u64` counted here rather than the MMU's
+/// `u32` counted there, so it cannot wrap in any run that finishes.
+#[derive(Debug)]
+pub struct Tlb {
+    slots: [[Entry; TLB_ENTRIES]; 3],
+    /// What the last [`sync`](Tlb::sync) saw, so a change can be detected.
+    seen: (u32, u64),
+    /// Bumped on every change; mixed into every tag.
+    epoch: u64,
+    hits: u64,
+    misses: u64,
+}
+
+impl Default for Tlb {
+    fn default() -> Tlb {
+        Tlb::new()
+    }
+}
+
+impl Tlb {
+    /// An empty TLB.
+    #[must_use]
+    pub fn new() -> Tlb {
+        Tlb {
+            slots: [[Entry::default(); TLB_ENTRIES]; 3],
+            seen: (0, 0),
+            epoch: 1,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Throw everything away, unconditionally.
+    ///
+    /// Used by reset and by a snapshot restore. The ordinary invalidation path
+    /// is [`sync`](Tlb::sync), which costs one comparison and touches no entry.
+    pub fn flush(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.hits = 0;
+        self.misses = 0;
+    }
+
+    /// Note the current MMU generation and address-space topology generation,
+    /// invalidating everything if either moved.
+    ///
+    /// Called once per instruction, which is why it must be this cheap.
+    #[inline]
+    pub fn sync(&mut self, generation: u32, topology: u64) {
+        if self.seen != (generation, topology) {
+            self.seen = (generation, topology);
+            self.epoch = self.epoch.wrapping_add(1);
+        }
+    }
+
+    /// How many lookups hit and how many missed, for `rsemu` statistics.
+    #[must_use]
+    pub fn stats(&self) -> (u64, u64) {
+        (self.hits, self.misses)
+    }
+
+    /// The tag for a page.
+    #[inline]
+    fn tag(&self, page: u32, privileged: bool) -> u64 {
+        // Both inputs are multiplied rather than shifted into fields. The
+        // page number needs it because the low-order bits that select the slot
+        // would otherwise be the only bits distinguishing one page from
+        // another; the epoch needs it because shifting a `u64` epoch into the
+        // top of a `u64` tag throws away everything above the shift, and an
+        // epoch that has passed that many invalidations would start colliding
+        // with itself — which is a stale entry read as a hit.
+        self.epoch.wrapping_mul(0xff51_afd7_ed55_8ccd)
+            ^ u64::from(page).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ u64::from(privileged)
+    }
+
+    /// Look a page up. `None` is a miss, and the caller walks.
+    #[inline]
+    pub fn lookup(&mut self, kind: AccessKind, va: Va, privileged: bool) -> Option<Pa> {
+        let page = va.0 >> TLB_PAGE_BITS;
+        let slot = &self.slots[kind.slot()][(page as usize) & (TLB_ENTRIES - 1)];
+        if slot.valid && slot.tag == self.tag(page, privileged) {
+            let base = slot.base;
+            self.hits += 1;
+            Some(Pa(base | (va.0 & ((1 << TLB_PAGE_BITS) - 1))))
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
+    /// Record a translation a walk just produced.
+    #[inline]
+    pub fn insert(&mut self, kind: AccessKind, va: Va, privileged: bool, pa: Pa) {
+        let page = va.0 >> TLB_PAGE_BITS;
+        let tag = self.tag(page, privileged);
+        self.slots[kind.slot()][(page as usize) & (TLB_ENTRIES - 1)] = Entry {
+            tag,
+            base: pa.0 & !((1 << TLB_PAGE_BITS) - 1),
+            valid: true,
+        };
     }
 }
 
@@ -483,7 +857,11 @@ mod tests {
         let control = CpOp { crn: 1, ..id };
         assert_eq!(cp.mcr(control, 1 << 13), Ok(CpEffect::NONE));
         assert_eq!(cp.mrc(control), Ok(1 << 13));
-        assert!(cp.high_vectors());
+        assert!(cp.regime().high_vectors);
+        assert!(
+            !cp.regime().translating,
+            "the stub is honest about having no page tables"
+        );
     }
 
     #[test]
@@ -514,19 +892,108 @@ mod tests {
         assert_eq!(cp.mrc(op), Err(CpFault::Undefined));
     }
 
+    /// Physical memory that refuses everything: a flat MMU never reads it.
+    #[derive(Debug)]
+    struct NoMem;
+
+    impl PhysMem for NoMem {
+        fn read_u32(&self, _at: Pa) -> Option<u32> {
+            None
+        }
+    }
+
     #[test]
     fn a_flat_mmu_translates_nothing_and_faults_never() {
-        let mmu = FlatMmu;
+        let mmu = FlatMmu::new();
         assert_eq!(
-            mmu.translate(0xdead_beef, AccessKind::Read, false),
-            Ok(0xdead_beef)
+            mmu.translate(&NoMem, Va(0xdead_beef), AccessKind::Read, false),
+            Ok(Pa(0xdead_beef))
         );
-        assert!(!mmu.high_vectors());
+        assert_eq!(mmu.regime(), Regime::FLAT);
+    }
+
+    #[test]
+    fn a_flat_mmu_carries_the_cores_two_straps() {
+        let mmu = FlatMmu {
+            high_vectors: true,
+            alignment_faults: true,
+        };
+        let regime = mmu.regime();
+        assert!(regime.high_vectors);
+        assert!(regime.alignment_faults);
+        assert!(!regime.translating, "a strap is not a page table");
     }
 
     #[test]
     fn fault_status_packs_the_domain_above_the_status() {
         assert_eq!(Fault::EXTERNAL.to_fsr(), 0b1000);
         assert_eq!(Fault::PERMISSION_PAGE.in_domain(3).to_fsr(), 0x3f);
+        assert_eq!(Fault::DOMAIN_SECTION.in_domain(15).to_fsr(), 0xf9);
+    }
+
+    #[test]
+    fn the_tlb_answers_what_it_was_told_and_only_that() {
+        let mut tlb = Tlb::new();
+        tlb.insert(AccessKind::Read, Va(0x0001_2345), true, Pa(0x8000_0345));
+
+        // The same kibibyte, the same privilege: a hit, with the offset kept.
+        assert_eq!(
+            tlb.lookup(AccessKind::Read, Va(0x0001_2345), true),
+            Some(Pa(0x8000_0345))
+        );
+        assert_eq!(
+            tlb.lookup(AccessKind::Read, Va(0x0001_2000), true),
+            Some(Pa(0x8000_0000)),
+            "another byte of the same kibibyte translates through the same entry"
+        );
+
+        // A different access kind, a different privilege, and the kibibyte
+        // next door are all misses: each would need its own walk.
+        assert_eq!(tlb.lookup(AccessKind::Write, Va(0x0001_2345), true), None);
+        assert_eq!(tlb.lookup(AccessKind::Read, Va(0x0001_2345), false), None);
+        assert_eq!(tlb.lookup(AccessKind::Read, Va(0x0001_2800), true), None);
+    }
+
+    #[test]
+    fn a_tiny_page_does_not_answer_for_its_neighbours() {
+        // The bug this granularity exists to prevent: with a 4 KiB key, the
+        // second kibibyte of a 4 KiB region would hit the first one's entry.
+        let mut tlb = Tlb::new();
+        tlb.insert(AccessKind::Read, Va(0x0000_0000), true, Pa(0x1000_0000));
+        assert_eq!(tlb.lookup(AccessKind::Read, Va(0x0000_0400), true), None);
+    }
+
+    #[test]
+    fn either_generation_moving_empties_the_tlb() {
+        for (generation, topology) in [(1u32, 0u64), (0, 1)] {
+            let mut tlb = Tlb::new();
+            tlb.sync(0, 0);
+            tlb.insert(AccessKind::Fetch, Va(0x4000), true, Pa(0x9000));
+            assert!(tlb.lookup(AccessKind::Fetch, Va(0x4000), true).is_some());
+
+            tlb.sync(generation, topology);
+            assert_eq!(
+                tlb.lookup(AccessKind::Fetch, Va(0x4000), true),
+                None,
+                "generation {generation}, topology {topology} left a stale entry"
+            );
+
+            // And a sync that changes nothing keeps what is there.
+            tlb.insert(AccessKind::Fetch, Va(0x4000), true, Pa(0x9000));
+            tlb.sync(generation, topology);
+            assert!(tlb.lookup(AccessKind::Fetch, Va(0x4000), true).is_some());
+        }
+    }
+
+    #[test]
+    fn the_tlb_counts_its_hits_and_misses() {
+        let mut tlb = Tlb::new();
+        assert_eq!(tlb.lookup(AccessKind::Read, Va(0), true), None);
+        tlb.insert(AccessKind::Read, Va(0), true, Pa(0));
+        assert!(tlb.lookup(AccessKind::Read, Va(0), true).is_some());
+        assert_eq!(tlb.stats(), (1, 1));
+        tlb.flush();
+        assert_eq!(tlb.stats(), (0, 0));
+        assert_eq!(tlb.lookup(AccessKind::Read, Va(0), true), None);
     }
 }

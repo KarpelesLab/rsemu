@@ -21,21 +21,21 @@
 # is tied high - and that is why the boot ROM is mapped there.
 #
 # ---------------------------------------------------------------------------
-# What this board does not have: CP15
+# CP15, and how a machine file asks for one
 # ---------------------------------------------------------------------------
 #
-# The MMU, the caches and the tightly-coupled memories are **not** in the core
-# (`src/cpu/arm/aprofile/cp.rs`): they differ between SoCs built on the same
-# ARM926EJ-S macrocell, so the core exposes `cp::Coprocessor` and `cp::Mmu`
-# traits and a downstream crate supplies its own. With none supplied the core
-# uses `FlatMmu`, an identity map with no translation and no protection, which
-# is what an ARM926EJ-S looks like before its firmware turns the MMU on.
+# `cp15 = arm926ejs` on the core below. That is the whole mechanism: the system
+# control coprocessor is a **construction property of the CPU**, the way a
+# 6502's `variant` is, because CP15 is part of the CPU rather than a device
+# reaching another device. Set it and the core comes up with the VMSAv5 MMU,
+# the domain model, the fault registers and the ARM926EJ-S identification
+# values; `cp15 = none` gives the bare macrocell, which is what this board was
+# before and what it still is bit-for-bit while the MMU is switched off.
 #
-# There is currently **no way to name a coprocessor from a machine file** - that
-# would need the typed export seam (ROADMAP.md 4.4) to carry a `dyn
-# Coprocessor`, which it does not. So a board whose firmware programs CP15 has
-# to be assembled in Rust today, and this file says so rather than pretending an
-# `mmu = ...` property exists.
+# What is *not* here is the caches, the write buffer and the tightly-coupled
+# memories. Those genuinely do differ between SoCs built on the same macrocell,
+# and they remain behind `cp::Coprocessor` and `cp::Mmu` for a downstream crate
+# to add - which is what those traits were always for.
 
 machine "arm926" {
   # -- the map ---------------------------------------------------------------
@@ -54,6 +54,12 @@ machine "arm926" {
   # that is the default rather than a round number chosen for looks.
   param periph      = 0xf0000000
   param periph-size = 64K
+
+  # Which system control coprocessor the core has. `arm926ejs` is the part's
+  # own; `none` is the macrocell with CP15 left out, which is a real
+  # configuration and is also the way to prove that a board with the MMU
+  # switched off behaves identically either way (`-p cp15=none`).
+  param cp15 = "arm926ejs"
 
   # -- the crystal -----------------------------------------------------------
   #
@@ -75,7 +81,10 @@ machine "arm926" {
   #
   # `store-pc-offset = 8` and low vectors are the ARM926EJ-S defaults; they are
   # written out because a board with VINITHI tied high changes the second one,
-  # and the file should show where.
+  # and the file should show where. With a CP15 attached, `high-vectors` and
+  # `alignment-faults` are the *reset values* of its c1 `V` and `A` bits, which
+  # is exactly what the straps do on real silicon: the guest owns the bits
+  # afterwards and can clear either.
   object cpu "cpu.arm" {
     clock            = sysclk
     space            = mem
@@ -84,6 +93,7 @@ machine "arm926" {
     high-vectors     = false
     alignment-faults = false
     store-pc-offset  = 8
+    cp15             = cp15
   }
 
   # -- memory ----------------------------------------------------------------
