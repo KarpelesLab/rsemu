@@ -1239,18 +1239,6 @@ impl Cfi {
             array.geometry().size(),
             Arc::clone(&array) as Arc<dyn MemOps>,
         ));
-        // The device tree generator is board-local today: it lives with the
-        // RISC-V board because that is the only machine that generates a tree
-        // (`dev::riscv::dt`). A flash part is not a RISC-V device, so the
-        // publication is conditional rather than the module being moved — and
-        // when `RealizeCtx` carries the machine graph (`ROADMAP.md` §4.4) this
-        // block goes away entirely.
-        #[cfg(feature = "dev-riscv")]
-        crate::dev::riscv::dt::publish(
-            &region,
-            alloc::sync::Arc::downgrade(&array)
-                as alloc::sync::Weak<dyn crate::dev::riscv::dt::DtSource>,
-        );
         Cfi { array, region }
     }
 
@@ -1373,8 +1361,23 @@ impl Device for Cfi {
         &CLASS
     }
 
-    fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
-        // Nothing outward: a `map` statement places the window.
+    #[cfg_attr(not(feature = "dev-riscv"), expect(unused_variables))]
+    fn realize(&self, ctx: &mut RealizeCtx<'_>) -> Result<()> {
+        // A `map` statement places the window; this says what the window *is*.
+        //
+        // The device tree generator is board-local today: it lives with the
+        // RISC-V board because that is the only machine that generates a tree
+        // (`dev::riscv::dt`). A flash part is not a RISC-V device, so the
+        // publication is conditional rather than the module being moved — and
+        // when `RealizeCtx` carries the machine graph (`ROADMAP.md` §4.4) this
+        // block goes away entirely.
+        #[cfg(feature = "dev-riscv")]
+        crate::dev::riscv::dt::publish(
+            ctx.hosts(),
+            &self.region,
+            alloc::sync::Arc::downgrade(&self.array)
+                as alloc::sync::Weak<dyn crate::dev::riscv::dt::DtSource>,
+        )?;
         Ok(())
     }
 

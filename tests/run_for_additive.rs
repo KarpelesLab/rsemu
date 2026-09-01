@@ -12,6 +12,15 @@
 //! therefore an extra scheduling boundary that the single span does not have,
 //! and a boundary changes how far each runnable gets before the next one runs.
 
+// Every machine named below is asked for by name, so all three have to be in
+// the build. Without this the file fails under any narrower feature set with
+// "a known workload" rather than skipping, which is not a measurement.
+#![cfg(all(
+    feature = "machine-nes",
+    feature = "machine-gameboy",
+    feature = "machine-apple1"
+))]
+
 mod workload;
 
 use rsemu::core::clock::GlobalTime;

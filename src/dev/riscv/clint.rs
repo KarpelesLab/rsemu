@@ -234,7 +234,6 @@ impl Clint {
             REGISTER_WINDOW_LEN,
             Arc::clone(&regs) as Arc<dyn MemOps>,
         ));
-        super::dt::publish(&region, Arc::downgrade(&regs) as Weak<dyn DtSource>);
         Clint { regs, region }
     }
 
@@ -576,9 +575,15 @@ impl Device for Clint {
         &CLASS
     }
 
-    fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
-        // Nothing outward: a `map` statement places the region.
-        Ok(())
+    fn realize(&self, ctx: &mut RealizeCtx<'_>) -> Result<()> {
+        // A `map` statement places the region; this says what the region *is*,
+        // for the board's device-tree generator (`super::dt`). Announcing
+        // yourself into a table a sibling reads is a realize-time action.
+        super::dt::publish(
+            ctx.hosts(),
+            &self.region,
+            Arc::downgrade(&self.regs) as Weak<dyn DtSource>,
+        )
     }
 
     fn reset(&self, _kind: ResetKind) {

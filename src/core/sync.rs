@@ -2666,6 +2666,10 @@ mod tests {
     /// read and written from two threads, so the diagnostic was itself the
     /// undefined behaviour. Same shape here, against the type that is allowed
     /// to have it, on whichever backend this build selected.
+    ///
+    /// `dev::nes::pads` is no longer a `static` at all — a pad port belongs to
+    /// the build that opened it now (`core::hosts`) — so this test carries the
+    /// pressure that found the bug rather than pointing at live code.
     #[test]
     fn a_static_global_survives_the_whole_harness_hammering_it() {
         use alloc::collections::BTreeMap;

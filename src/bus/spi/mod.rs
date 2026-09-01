@@ -723,62 +723,86 @@ impl Default for SpiBus {
 /// ```
 /// # #[cfg(feature = "bus-spi")] {
 /// use rsemu::bus::spi::buses;
+/// use rsemu::core::HostObjects;
 ///
 /// use std::sync::Arc;
 ///
-/// let a = buses::open("doctest-spi");
-/// let b = buses::open("doctest-spi");
+/// let hosts = HostObjects::new();
+/// let a = buses::open(&hosts, "spi0").unwrap();
+/// let b = buses::open(&hosts, "spi0").unwrap();
 /// assert!(Arc::ptr_eq(&a, &b), "the same name is the same bus");
-/// buses::close("doctest-spi");
+///
+/// // And a second build's `spi0` is a second bus, not this one.
+/// let elsewhere = HostObjects::new();
+/// let c = buses::open(&elsewhere, "spi0").unwrap();
+/// assert!(!Arc::ptr_eq(&a, &c));
 /// # }
 /// ```
 pub mod buses {
     use super::SpiBus;
-    use alloc::collections::BTreeMap;
-    use alloc::string::{String, ToString};
+    use alloc::string::String;
     use alloc::sync::Arc;
     use alloc::vec::Vec;
 
-    use crate::core::sync::{Global, LockRank};
+    use crate::core::error::Result;
+    use crate::core::hosts::{HostKind, HostObjects};
+    use crate::core::props::Props;
 
-    /// Name to bus. `BTreeMap`, so listing is in name order rather than hash
-    /// order (`CLAUDE.md`, determinism); [`Global`] because a `static` is
-    /// reachable from every thread in the process (`core::sync`).
-    static TABLE: Global<BTreeMap<String, Arc<SpiBus>>> =
-        Global::with_rank(LockRank::LEAF, BTreeMap::new());
+    /// The kind an SPI bus is filed under in a build's
+    /// [`HostObjects`].
+    pub const KIND: HostKind = HostKind::new("spi-bus");
 
-    /// The bus called `name`, creating it if this is the first mention.
+    /// The an SPI bus `name` refers to in `hosts`, creating it on first mention.
     ///
-    /// Both ends call this, and whichever is constructed first makes the bus.
-    #[must_use]
-    pub fn open(name: &str) -> Arc<SpiBus> {
-        let mut table = TABLE.lock();
-        if let Some(bus) = table.get(name) {
-            return Arc::clone(bus);
-        }
-        let bus = Arc::new(SpiBus::new());
-        table.insert(name.to_string(), Arc::clone(&bus));
-        bus
+    /// The **host** side of the rendezvous: called before the host starts
+    /// driving a transfer, or after the build to pick up what a device opened.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Config`] if another kind of host object is already open
+    /// under that name, which is a collision between two host modules rather
+    /// than anything a machine file can cause.
+    pub fn open(hosts: &HostObjects, name: &str) -> Result<Arc<SpiBus>> {
+        hosts.open(KIND, name, SpiBus::new)
     }
 
-    /// The bus called `name`, if it has been opened.
-    #[must_use]
-    pub fn get(name: &str) -> Option<Arc<SpiBus>> {
-        TABLE.lock().get(name).map(Arc::clone)
+    /// The an SPI bus `name` refers to in the build these properties are being read
+    /// for, creating it on first mention.
+    ///
+    /// The **device** side, called from `new(props)` — acquiring a host object
+    /// is allocation, and [`core::hosts`](crate::core::hosts) argues why. A
+    /// `Props` that belongs to no build gets a private one, so a device a unit
+    /// test constructed directly still works and simply meets nobody.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`].
+    pub fn attach(props: &Props, name: &str) -> Result<Arc<SpiBus>> {
+        props.host(KIND, name, SpiBus::new)
+    }
+
+    /// The an SPI bus called `name`, if it has been opened.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`].
+    pub fn get(hosts: &HostObjects, name: &str) -> Result<Option<Arc<SpiBus>>> {
+        hosts.get(KIND, name)
     }
 
     /// Forget `name`, reporting whether there was one.
     ///
-    /// Anything still holding the `Arc` keeps working; a later [`open`] of the
-    /// same name is a fresh bus. For tests that want the name back.
-    pub fn close(name: &str) -> bool {
-        TABLE.lock().remove(name).is_some()
+    /// Anything still holding the `Arc` keeps working; this only removes the
+    /// table's own reference, so a later [`open`] of the same name is a fresh
+    /// one.
+    pub fn close(hosts: &HostObjects, name: &str) -> bool {
+        hosts.close(KIND, name)
     }
 
-    /// Every open bus's name, in order.
+    /// Every open name, in order.
     #[must_use]
-    pub fn names() -> Vec<String> {
-        TABLE.lock().keys().cloned().collect()
+    pub fn names(hosts: &HostObjects) -> Vec<String> {
+        hosts.names(KIND)
     }
 }
 

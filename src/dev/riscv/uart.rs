@@ -208,7 +208,7 @@ impl Uart16550 {
         )?;
         r.finish()?;
         Ok(Uart16550::with_port(
-            ports::open(&port_name),
+            ports::attach(props, &port_name)?,
             port_name,
             frequency as u32,
         ))
@@ -230,7 +230,6 @@ impl Uart16550 {
             REGISTER_WINDOW_LEN,
             Arc::clone(&regs) as Arc<dyn MemOps>,
         ));
-        super::dt::publish(&region, Arc::downgrade(&regs) as Weak<dyn DtSource>);
         Uart16550 { regs, region }
     }
 
@@ -548,8 +547,13 @@ impl Device for Uart16550 {
         &CLASS
     }
 
-    fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
-        Ok(())
+    fn realize(&self, ctx: &mut RealizeCtx<'_>) -> Result<()> {
+        // What this region is, for the board's device-tree generator.
+        super::dt::publish(
+            ctx.hosts(),
+            &self.region,
+            Arc::downgrade(&self.regs) as Weak<dyn DtSource>,
+        )
     }
 
     fn reset(&self, _kind: ResetKind) {

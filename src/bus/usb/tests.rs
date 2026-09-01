@@ -397,23 +397,29 @@ fn the_default_peek_does_not_invent_data() {
 
 #[test]
 fn a_name_reaches_the_same_bus_from_both_ends() {
-    let name = "test-usb-rendezvous";
-    buses::close(name);
-    assert!(buses::get(name).is_none());
-    let controller_side = buses::open(name, 4);
-    let device_side = buses::open(name, 1);
+    use crate::core::HostObjects;
+
+    let hosts = HostObjects::new();
+    assert!(buses::get(&hosts, "usb0").unwrap().is_none());
+    let controller_side = buses::open(&hosts, "usb0", 4).unwrap();
+    let device_side = buses::open(&hosts, "usb0", 1).unwrap();
     assert!(Arc::ptr_eq(&controller_side, &device_side));
     assert_eq!(
         controller_side.port_count(),
         4,
         "the first mention fixes the size"
     );
-    assert!(buses::names().iter().any(|n| n == name));
-    assert!(buses::close(name));
-    assert!(!buses::close(name));
+    assert_eq!(buses::names(&hosts), ["usb0"]);
+    assert!(buses::close(&hosts, "usb0"));
+    assert!(!buses::close(&hosts, "usb0"));
     // A later open is a fresh bus, which is what makes a test able to have the
     // name back.
-    let again = buses::open(name, 2);
+    let again = buses::open(&hosts, "usb0", 2).unwrap();
     assert!(!Arc::ptr_eq(&controller_side, &again));
-    buses::close(name);
+
+    // And a second build's `usb0` is a second bus, so two machines can both
+    // have one without enumerating each other's devices.
+    let elsewhere = HostObjects::new();
+    let theirs = buses::open(&elsewhere, "usb0", 4).unwrap();
+    assert!(!Arc::ptr_eq(&controller_side, &theirs));
 }

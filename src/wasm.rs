@@ -167,6 +167,14 @@ struct State {
     scanout: Option<alloc::boxed::Box<dyn crate::host::display::Scanout>>,
     /// The character port the machine opened, if it opened one.
     console: Option<alloc::sync::Arc<crate::host::chardev::CharPort>>,
+    /// The host objects the live machine was built against: its character
+    /// ports, its pads, and the capture tables the interceptions filled in.
+    ///
+    /// Kept because the module hands them out after the build — the console and
+    /// the pad below are found by name in here — and because dropping it with
+    /// the machine is what makes a second `rsemu_boot` a genuinely fresh set of
+    /// ports rather than the last machine's.
+    hosts: Option<alloc::sync::Arc<crate::core::hosts::HostObjects>>,
     /// The pad port the machine's controllers read, if it has any.
     #[cfg(feature = "dev-nes-io")]
     pad: Option<alloc::sync::Arc<crate::dev::nes::input::Pad>>,
@@ -196,6 +204,7 @@ impl State {
             frame: crate::host::display::Surface::empty(),
             scanout: None,
             console: None,
+            hosts: None,
             #[cfg(feature = "dev-nes-io")]
             pad: None,
             audio: None,
@@ -348,18 +357,15 @@ pub extern "C" fn rsemu_boot(index: u32, image_len: usize) -> u32 {
             return fail(state, "no machine with that index in this build");
         };
 
-        // Drop the old machine before building the new one: its devices hold
-        // character ports and clock domains, and two machines fighting over a
-        // process-wide port table would be a confusing way to find that out.
+        // Drop the old machine and its host objects before building the new
+        // one: the new build gets a table of its own, so nothing the last
+        // machine opened can be mistaken for this one's.
         state.machine = None;
         state.scanout = None;
         state.console = None;
         state.shown = u64::MAX;
         state.audio = None;
-        #[cfg(feature = "dev-nes-ppu")]
-        crate::host::display::nes::capture::clear();
-        #[cfg(feature = "dev-nes-apu")]
-        crate::host::audio::nes::capture::clear();
+        state.hosts = None;
 
         let registry = match crate::machine::catalog::registry() {
             Ok(r) => r,
@@ -409,8 +415,10 @@ pub extern "C" fn rsemu_boot(index: u32, image_len: usize) -> u32 {
             Err(e) => return fail(state, e),
         };
 
+        let hosts = alloc::sync::Arc::clone(&options.realize.hosts);
+
         #[cfg(feature = "dev-nes-ppu")]
-        if let Some(scanout) = crate::host::display::nes::capture::take() {
+        if let Some(scanout) = crate::host::display::nes::capture::take(&hosts) {
             state.frame = crate::host::display::Surface::for_scanout(&scanout);
             state.scanout = Some(alloc::boxed::Box::new(scanout));
         }
@@ -419,7 +427,7 @@ pub extern "C" fn rsemu_boot(index: u32, image_len: usize) -> u32 {
         // WebAudio's `AudioBuffer` holds, so the page copies rather than
         // converts.
         #[cfg(feature = "dev-nes-apu")]
-        if let Some(source) = crate::host::audio::nes::capture::take() {
+        if let Some(source) = crate::host::audio::nes::capture::take(&hosts) {
             state.audio = Some(crate::host::audio::AudioStream::new(
                 alloc::boxed::Box::new(source),
                 state.audio_rate,
@@ -430,13 +438,11 @@ pub extern "C" fn rsemu_boot(index: u32, image_len: usize) -> u32 {
         // Whatever character port the machine's devices opened is the console.
         // One is unambiguous; a machine with several is not this ABI's problem
         // until one exists.
-        let names = crate::host::chardev::ports::names();
+        let names = crate::host::chardev::ports::names(&hosts);
         if let Some(port) = names
             .first()
-            .and_then(|n| crate::host::chardev::ports::get(n))
+            .and_then(|n| crate::host::chardev::ports::get(&hosts, n).ok().flatten())
         {
-            // Anything a previous machine left queued is not this machine's.
-            let _discarded = port.drain();
             state.console = Some(port);
         }
 
@@ -446,16 +452,12 @@ pub extern "C" fn rsemu_boot(index: u32, image_len: usize) -> u32 {
         // else.
         #[cfg(feature = "dev-nes-io")]
         {
-            let pads = crate::dev::nes::input::pads::names();
+            let pads = crate::dev::nes::input::pads::names(&hosts);
             state.pad = pads
                 .first()
-                .and_then(|n| crate::dev::nes::input::pads::get(n));
-            if let Some(pad) = state.pad.as_ref() {
-                // Nothing is held at power-on, whatever the last machine left.
-                pad.set(0, 0);
-                pad.set(1, 0);
-            }
+                .and_then(|n| crate::dev::nes::input::pads::get(&hosts, n).ok().flatten());
         }
+        state.hosts = Some(hosts);
         state.buttons = [0; 2];
 
         state.machine = Some(machine);
@@ -472,6 +474,7 @@ pub extern "C" fn rsemu_shutdown() {
         state.scanout = None;
         state.console = None;
         state.audio = None;
+        state.hosts = None;
         #[cfg(feature = "dev-nes-io")]
         {
             state.pad = None;
@@ -899,6 +902,19 @@ pub extern "C" fn rsemu_load(len: usize) -> u32 {
 mod tests {
     use super::*;
 
+    /// Serialises the tests that boot a machine through the ABI.
+    ///
+    /// This one is not going away with the rest of them. The ABI genuinely has
+    /// **one machine per module instance** — [`STATE`] is that slot, and
+    /// `rsemu_boot` is documented as replacing whatever was there — so two
+    /// libtest threads booting at once is not a table collision to be designed
+    /// out, it is two callers using the ABI wrongly. Serialising is what a page
+    /// does for free by being single-threaded.
+    ///
+    /// [`LockRank::UNCHECKED`] because it is deliberately held across `STATE`,
+    /// which sits at [`LockRank::MACHINE`]; any checked rank would forbid that.
+    static ONE_MACHINE: Global<()> = Global::with_rank(LockRank::UNCHECKED, ());
+
     #[test]
     fn echo_round_trips() {
         assert_eq!(rsemu_echo(0xdead_beef), 0xdead_beef);
@@ -906,6 +922,7 @@ mod tests {
 
     #[test]
     fn version_pointer_and_length_describe_the_same_string() {
+        let _one = ONE_MACHINE.lock();
         let len = rsemu_version_len();
         assert!(len > 0);
         // Calling twice must return the identical cached allocation, or the
@@ -918,7 +935,7 @@ mod tests {
     /// every index it reports has a name.
     #[test]
     fn the_catalog_is_readable_by_index() {
-        let _serialised = crate::host::display::PROCESS_WIDE.lock();
+        let _one = ONE_MACHINE.lock();
         let count = rsemu_machine_count();
         for index in 0..count {
             assert!(rsemu_machine_name(index) > 0, "machine {index} has no name");
@@ -931,7 +948,7 @@ mod tests {
     /// Every call that needs a machine says so rather than misbehaving.
     #[test]
     fn calls_without_a_machine_report_rather_than_panic() {
-        let _serialised = crate::host::display::PROCESS_WIDE.lock();
+        let _one = ONE_MACHINE.lock();
         rsemu_shutdown();
         assert_eq!(rsemu_is_running(), 0);
         assert_eq!(rsemu_run_frame(), 0);
@@ -945,7 +962,7 @@ mod tests {
     /// meaningful. Nothing here dereferences a caller's pointer.
     #[test]
     fn the_input_buffer_is_resizable() {
-        let _serialised = crate::host::display::PROCESS_WIDE.lock();
+        let _one = ONE_MACHINE.lock();
         let a = rsemu_input_reserve(16);
         assert!(!a.is_null());
         let b = rsemu_input_reserve(1 << 16);
@@ -959,9 +976,7 @@ mod tests {
     #[cfg(all(feature = "machine-nes", feature = "dev-nes-ppu"))]
     #[test]
     fn a_nes_boots_and_draws_through_the_abi() {
-        // The module's state is one slot for the whole process, and so is the
-        // scanout capture table underneath it; see `display::PROCESS_WIDE`.
-        let _serialised = crate::host::display::PROCESS_WIDE.lock();
+        let _one = ONE_MACHINE.lock();
 
         /// The same minimal NROM the display tests use: `JMP $C000` forever.
         static MINIMAL_NROM: &[u8] = &{
@@ -1024,9 +1039,10 @@ mod tests {
             use crate::dev::nes::input::{buttons, pads};
 
             rsemu_set_buttons(0, u32::from(buttons::A | buttons::START));
-            let pad = pads::names()
+            let hosts = with_state(|state| state.hosts.clone()).expect("a machine is booted");
+            let pad = pads::names(&hosts)
                 .first()
-                .and_then(|n| pads::get(n))
+                .and_then(|n| pads::get(&hosts, n).ok().flatten())
                 .expect("the machine opened a pad port");
             assert_eq!(pad.get(0), buttons::A | buttons::START);
             rsemu_set_buttons(0, 0);
@@ -1051,7 +1067,7 @@ mod tests {
     #[cfg(all(feature = "machine-nes", feature = "dev-nes-apu"))]
     #[test]
     fn a_nes_plays_through_the_abi() {
-        let _serialised = crate::host::display::PROCESS_WIDE.lock();
+        let _one = ONE_MACHINE.lock();
 
         /// `LDA #$0F / STA $4015 / LDA #$9F / STA $4000 / LDA #$08 / STA $4003`
         /// and then a tight loop: both pulse channels at full volume, so there

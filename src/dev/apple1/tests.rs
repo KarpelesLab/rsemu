@@ -16,16 +16,16 @@ use crate::machine::{Machine, build, catalog};
 
 use super::monitor::RSMON;
 
-/// Build the shipped `apple1` machine on its own private character port.
+/// Build the shipped `apple1` machine and take the far end of its console.
+///
+/// The port comes out of *this build's* host objects, so the name need not be
+/// unique across the test binary and two of these running at once cannot type
+/// at each other.
 ///
 /// `paced` picks the real display rate or the flat-out one — the property that
 /// exists so a test does not have to spend sixty virtual seconds watching a
 /// memory dump crawl past.
 fn boot(port_name: &str, paced: bool) -> (Machine, Arc<CharPort>) {
-    let port = ports::open(port_name);
-    // A name can be reused across runs of the same test binary.
-    port.clear();
-
     let mut options = catalog::build_options().expect("this build has the classes");
     options.realize.media.insert("rom", &RSMON[..]);
     let options = options
@@ -42,6 +42,7 @@ fn boot(port_name: &str, paced: bool) -> (Machine, Arc<CharPort>) {
         Ok(m) => m,
         Err(e) => panic!("apple1.machine: {e}"),
     };
+    let port = ports::open(&options.realize.hosts, port_name).expect("the PIA opened it");
     (machine, port)
 }
 
@@ -256,8 +257,6 @@ fn the_woz_monitor_boots_and_answers_a_memory_dump() {
     };
     let image = std::fs::read(&path).expect("RSEMU_APPLE1_ROM is readable");
 
-    let port = ports::open("apple1.test.wozmon");
-    port.clear();
     let mut options = catalog::build_options().expect("classes");
     options.realize.media.insert("rom", image.as_slice());
     let options = options
@@ -273,6 +272,8 @@ fn the_woz_monitor_boots_and_answers_a_memory_dump() {
         Ok(m) => m,
         Err(e) => panic!("{path}: {e}"),
     };
+    let port =
+        ports::open(&options.realize.hosts, "apple1.test.wozmon").expect("the PIA opened it");
 
     // Wozmon greets with a backslash and a carriage return, then waits.
     let banner = exchange(&mut machine, &port, "", 50);

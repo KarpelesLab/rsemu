@@ -900,14 +900,19 @@ impl St7272a {
         });
         let pins = Arc::new(SlavePins::new(Arc::clone(&shared) as Arc<dyn SpiSlave>));
 
-        // Attaching to the named bus is the *only* outward action construction
-        // takes, and it is deferred to realize below rather than done here —
-        // two-phase construction means nothing observable happens first
-        // (`ROADMAP.md` §4.4). What happens here is opening the table entry,
-        // which creates nothing anybody can see.
+        // Opening the bus is allocation: `buses::attach` is a get-or-create in
+        // the build's own host-object table and nothing outside this machine
+        // can see it (`core::hosts` argues why that belongs in `new`).
+        //
+        // Hooking this panel onto it is the outward half, and by
+        // `CLAUDE.md`'s two-phase rule that belongs in `realize`. It is done
+        // here instead, which is a pre-existing inconsistency rather than a
+        // considered exception: the controller only reaches its slaves when the
+        // guest drives a transfer, so moving it is a behaviour change nobody
+        // has needed yet rather than a refactor.
         let panel = St7272a { shared, pins };
         if let Some(name) = bus_name {
-            let bus = buses::open(&name);
+            let bus = buses::attach(props, &name)?;
             if cs >= u64::from(crate::bus::spi::MAX_CHIP_SELECTS as u8) {
                 return Err(bad(alloc::format!(
                     "`cs` is {cs}; an SPI bus routes {} chip selects",

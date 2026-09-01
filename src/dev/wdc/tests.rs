@@ -18,16 +18,15 @@ use crate::machine::{Machine, build, catalog};
 use super::monitor::RSMON_IMAGE;
 use super::wozmon::WOZMON_IMAGE;
 
-/// Build the shipped `beneater-6502` machine on its own private port.
+/// Build the shipped `beneater-6502` machine and take the far end of its ACIA.
+///
+/// The port comes out of this build's own host objects, so the name need not be
+/// unique across the test binary.
 ///
 /// `paced` picks the real 19200-baud rate or the flat-out one — the property
 /// that exists so a test does not have to spend virtual seconds watching a
 /// memory dump arrive one character at a time.
 fn boot(port_name: &str, paced: bool, image: &[u8]) -> (Machine, Arc<CharPort>) {
-    let port = ports::open(port_name);
-    // A name can be reused across runs of the same test binary.
-    port.clear();
-
     let mut options = catalog::build_options().expect("this build has the classes");
     options.realize.media.insert("rom", image);
     let options = options
@@ -44,6 +43,7 @@ fn boot(port_name: &str, paced: bool, image: &[u8]) -> (Machine, Arc<CharPort>) 
         Ok(m) => m,
         Err(e) => panic!("beneater-6502.machine: {e}"),
     };
+    let port = ports::open(&options.realize.hosts, port_name).expect("the ACIA opened it");
     (machine, port)
 }
 

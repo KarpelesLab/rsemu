@@ -86,6 +86,17 @@
 //!   every node, but realize returns [`Error`], not a `Diagnostic`, so the
 //!   `file:line:col` §5 promises "always" stops at validate. The spans are
 //!   there; a `realize` that returned `Diagnostic` would keep them.
+//! * **A device needs things a text file cannot hold.** A `port = "console"`
+//!   is a *name*, and the `CharPort` behind it used to come from a `static` —
+//!   which meant two machines built in one process shared it. It now comes from
+//!   [`RealizeOptions::hosts`], one table per build, carried into every
+//!   constructor by [`Props`] and readable by whoever owns the options
+//!   afterwards. [`core::hosts`](crate::core::hosts) has the argument and
+//!   `tests/two_machines.rs` has the assertion.
+//! * **An [`InstanceCtor`] used to be a bare `fn`,** which captures nothing, so
+//!   a host that wanted a handle on what it constructed had to leave it in a
+//!   `static` too. It is an `Arc<dyn Fn>` now, and the capture tables that
+//!   needed the statics are per-build values a closure holds.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -97,11 +108,13 @@ use alloc::vec::Vec;
 use crate::core::clock::{ClockForest, DomainId, Rational as ClockRational};
 pub use crate::core::device::SinkPin;
 use core::any::Any;
+use core::fmt;
 
 use crate::core::device::{
     CycleGate, Deferred, Device, DeviceClass, Export, ExportId, RealizeCtx, ResetKind,
 };
 use crate::core::error::{Error, Result};
+use crate::core::hosts::HostObjects;
 use crate::core::props::{Media, Props, Value, ValueKind};
 use crate::core::registry::Registry;
 use crate::core::sched::{Scheduler, SchedulerConfig};
@@ -323,16 +336,44 @@ pub trait Instance: Device {
 /// The same shape as `DeviceClass::construct`, returning an `Arc<dyn Instance>`
 /// instead of a `Box<dyn Device>`. A class should implement one function and
 /// have both entry points call it, so the two can never disagree.
-pub type InstanceCtor = fn(&Props) -> Result<Arc<dyn Instance>>;
+///
+/// # Why this is a closure and not a `fn`
+///
+/// It was a bare `fn`, and a bare `fn` **captures nothing** - so anything that
+/// wanted a handle on what it constructed had to leave that handle in a
+/// `static`. Five modules did, and a `static` is process-wide: two machines of
+/// the same kind built in one process wrote into one table, and the second one
+/// took the first one's devices. The tests were serialised against each other,
+/// which is what kept it looking like it worked.
+///
+/// A capturing constructor is what makes a per-build capture table possible, so
+/// [`Bindings::replace`] takes one and each `capture` module is a few lines
+/// instead of a table plus an interception loop. `Send + Sync` because
+/// [`Bindings`] travels with the rest of the build options.
+pub type InstanceCtor = Arc<dyn Fn(&Props) -> Result<Arc<dyn Instance>> + Send + Sync>;
 
-/// Class name → [`InstanceCtor`], for the classes that participate in the
+/// Class name to [`InstanceCtor`], for the classes that participate in the
 /// machine graph.
 ///
 /// Ordered by class name: iteration reaches error messages, and hash order is
 /// forbidden anywhere it can be observed.
-#[derive(Debug, Default)]
+///
+/// Cloning shares the constructors rather than copying them, so a host that
+/// wants to intercept one class clones the table and calls
+/// [`replace`](Bindings::replace).
+#[derive(Clone, Default)]
 pub struct Bindings {
     entries: BTreeMap<&'static str, InstanceCtor>,
+}
+
+impl fmt::Debug for Bindings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // A constructor has no useful `Debug`; which classes are bound is what
+        // the reader of a failing build wants.
+        f.debug_struct("Bindings")
+            .field("classes", &self.entries.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl Bindings {
@@ -349,17 +390,20 @@ impl Bindings {
     ///
     /// # Errors
     ///
-    /// If the class is bound twice — two features claiming one name would make
+    /// If the class is bound twice - two features claiming one name would make
     /// the machine depend on registration order, exactly as it would in the
     /// registry.
-    pub fn bind(&mut self, class: &'static str, ctor: InstanceCtor) -> Result<()> {
+    pub fn bind<F>(&mut self, class: &'static str, ctor: F) -> Result<()>
+    where
+        F: Fn(&Props) -> Result<Arc<dyn Instance>> + Send + Sync + 'static,
+    {
         if self.entries.contains_key(class) {
             return Err(Error::Config {
                 at: class.to_string(),
                 message: "device class bound twice".to_string(),
             });
         }
-        self.entries.insert(class, ctor);
+        self.entries.insert(class, Arc::new(ctor));
         Ok(())
     }
 
@@ -369,14 +413,30 @@ impl Bindings {
     ///
     /// If `class` is already bound.
     #[must_use]
-    pub fn with(mut self, class: &'static str, ctor: InstanceCtor) -> Bindings {
+    pub fn with<F>(mut self, class: &'static str, ctor: F) -> Bindings
+    where
+        F: Fn(&Props) -> Result<Arc<dyn Instance>> + Send + Sync + 'static,
+    {
         self.bind(class, ctor).expect("class bound twice");
         self
     }
 
+    /// Bind `class` to `ctor`, replacing whatever was there.
+    ///
+    /// This is the interception a host installs to keep a handle on what it
+    /// builds. Unlike [`bind`](Bindings::bind) it cannot fail: replacing is the
+    /// point, and binding a class the machine turns out not to use costs
+    /// nothing.
+    pub fn replace<F>(&mut self, class: &'static str, ctor: F)
+    where
+        F: Fn(&Props) -> Result<Arc<dyn Instance>> + Send + Sync + 'static,
+    {
+        self.entries.insert(class, Arc::new(ctor));
+    }
+
     /// The constructor for `class`, if it has one.
     pub fn get(&self, class: &str) -> Option<InstanceCtor> {
-        self.entries.get(class).copied()
+        self.entries.get(class).cloned()
     }
 
     /// Every bound class, in name order.
@@ -473,6 +533,11 @@ impl MediaTable {
 }
 
 /// What realize needs beyond the description itself.
+///
+/// Cloning shares the host objects rather than copying them: two builds from
+/// one `RealizeOptions` are deliberately the *same* set of ports and pads, and
+/// a caller that wants two isolated machines makes two `RealizeOptions`. See
+/// [`hosts`](RealizeOptions::hosts).
 #[derive(Debug, Clone, Default)]
 pub struct RealizeOptions {
     /// How the scheduler is configured: threading mode, quantum, rate control.
@@ -483,11 +548,24 @@ pub struct RealizeOptions {
     pub scheduler: SchedulerConfig,
     /// The bytes bound to the machine's media slots. See [`MediaTable`].
     pub media: MediaTable,
+    /// The host objects this build's devices open by name: character ports,
+    /// pads, power signals, buses, and the capture tables a host installs.
+    ///
+    /// Beside [`MediaTable`] and for the same reason — a machine file can hand
+    /// a device a *name*, never an object. The difference is direction: media
+    /// is bytes the caller supplies, and a host object is a rendezvous either
+    /// end may create. [`core::hosts`](crate::core::hosts) has the argument.
+    ///
+    /// One table per build is what stops two machines of the same kind sharing
+    /// a keyboard. It reaches a device through
+    /// [`Props::host`](crate::core::props::Props::host), and it is still here
+    /// afterwards for the host that wants the other end.
+    pub hosts: Arc<HostObjects>,
 }
 
 impl RealizeOptions {
-    /// Defaults: deterministic threading, unbounded rate, a 1 ms quantum, and
-    /// no media bound.
+    /// Defaults: deterministic threading, unbounded rate, a 1 ms quantum, no
+    /// media bound, and an empty host-object table of this build's own.
     pub fn new() -> RealizeOptions {
         RealizeOptions::default()
     }
@@ -496,6 +574,17 @@ impl RealizeOptions {
     #[must_use]
     pub fn with_media(mut self, slot: impl Into<String>, bytes: impl Into<Arc<[u8]>>) -> Self {
         self.media.insert(slot, bytes);
+        self
+    }
+
+    /// Share `hosts` rather than using a table of this build's own.
+    ///
+    /// For a caller that deliberately wants two machines to meet — a machine
+    /// and a debug console, a link cable between two Game Boys. Two machines
+    /// that should *not* share need nothing: that is the default.
+    #[must_use]
+    pub fn with_hosts(mut self, hosts: Arc<HostObjects>) -> Self {
+        self.hosts = hosts;
         self
     }
 }
@@ -785,17 +874,23 @@ impl<'a> Realizer<'a> {
             // is fully built by `new(props)` (§4.4) and never has to reach out
             // for its own image.
             let bound = self.bind_media(object, class)?;
-            let props = bound.as_ref().unwrap_or(&object.props);
+            // Every device is read against this build's host objects, so
+            // `port = "console"` reaches a `CharPort` nothing outside this
+            // machine can also reach (`core::hosts`). One `Props` clone per
+            // device at build time, and nothing in the run path.
+            let props = bound
+                .unwrap_or_else(|| object.props.clone())
+                .with_hosts(Arc::clone(&self.options.hosts));
             let (device, instance) = match self.bindings.get(&object.class) {
                 Some(ctor) => {
-                    let instance = ctor(props)?;
+                    let instance = ctor(&props)?;
                     check_class(&object.name, class.name, instance.class().name)?;
                     let device: Arc<dyn Device> = instance.clone();
                     (device, Some(instance))
                 }
                 None => {
                     let device: Arc<dyn Device> =
-                        Arc::from(self.registry.create(&object.class, props)?);
+                        Arc::from(self.registry.create(&object.class, &props)?);
                     check_class(&object.name, class.name, device.class().name)?;
                     (device, None)
                 }
@@ -868,7 +963,8 @@ impl<'a> Realizer<'a> {
             let device = Arc::clone(&self.built[i].device);
             let path = self.built[i].path.clone();
             let requester = self.built[i].requester;
-            let mut ctx = RealizeCtx::new(&path, requester, &mut self.deferred);
+            let mut ctx =
+                RealizeCtx::new(&path, requester, &mut self.deferred, &self.options.hosts);
             let outcome = device.realize(&mut ctx);
             // Drain whatever the handler queued before deciding what to do
             // with its result: an action pushed by a realize that then failed
@@ -890,7 +986,8 @@ impl<'a> Realizer<'a> {
             let device = Arc::clone(&self.built[i].device);
             let path = self.built[i].path.clone();
             let requester = self.built[i].requester;
-            let mut ctx = RealizeCtx::new(&path, requester, &mut self.deferred);
+            let mut ctx =
+                RealizeCtx::new(&path, requester, &mut self.deferred, &self.options.hosts);
             let _ = device.unrealize(&mut ctx);
         }
         self.deferred.drain();

@@ -30,15 +30,14 @@
 //! let mut options = catalog::build_options()?;
 //! display::sms::capture::install(&mut options)?;   // intercept the three
 //! let machine = machine::build(name, source, &registry, &options)?;
-//! let scanout = display::sms::capture::take_vdp();
+//! let scanout = display::sms::capture::take_vdp(&options.realize.hosts);
 //! ```
 //!
 //! **This is a seam, and it is marked as one**, exactly like
 //! [`nes::capture`](super::nes::capture). It exists because `Device` has no
 //! scanout hook and no input hook yet; when it grows them, every line of
-//! [`capture`] deletes and nothing else here changes. Until then the table is
-//! process-wide, so build one machine at a time or [`capture::clear`] between
-//! them.
+//! [`capture`] deletes and nothing else here changes. The tables belong to the
+//! build, so two consoles built in one process do not swap chips.
 //!
 //! The pads and the debug console are here rather than in a module of their own
 //! for the same reason and by the same mechanism: a front end needs to press a
@@ -46,7 +45,6 @@
 //! need a concrete handle the machine layer will not give them.
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
 use super::{PixelFormat, Scanout, Surface, SurfaceInfo};
 use crate::dev::sms::vdp::{SCREEN_HEIGHT, SCREEN_WIDTH, SmsVdp, TvRegion};
@@ -161,132 +159,108 @@ const _: () = assert!(SCREEN_HEIGHT == 240);
 /// The interception that gets a host concrete handles out of a described
 /// machine. See the module docs: a seam, not a design.
 pub mod capture {
-    use super::{Arc, SmsScanout, SmsVdp, Vec};
+    use super::{Arc, SmsScanout, SmsVdp};
     use crate::core::error::Result;
-    use crate::core::props::Props;
-    use crate::core::sync::{Global, LockRank};
+    use crate::core::hosts::{Captured, HostKind, HostObjects};
     use crate::dev::sms::{SdscConsole, SmsIo};
-    use crate::machine::realize::Instance;
-    use crate::machine::{Bindings, BuildOptions};
+    use crate::machine::BuildOptions;
 
-    /// Every chip of each kind constructed since the last take or [`clear`],
-    /// oldest first. A `Vec` rather than a single slot because a machine with
-    /// two of something is not this module's business to refuse.
-    static VDPS: Global<Vec<Arc<SmsVdp>>> = Global::with_rank(LockRank::LEAF, Vec::new());
-    static IOS: Global<Vec<Arc<SmsIo>>> = Global::with_rank(LockRank::LEAF, Vec::new());
-    static CONSOLES: Global<Vec<Arc<SdscConsole>>> = Global::with_rank(LockRank::LEAF, Vec::new());
-
-    /// A class name and the constructor that keeps a handle to what it builds.
-    type Interception = (&'static str, fn(&Props) -> Result<Arc<dyn Instance>>);
-
-    fn construct_vdp(props: &Props) -> Result<Arc<dyn Instance>> {
-        let vdp = Arc::new(SmsVdp::from_props(props)?);
-        VDPS.lock().push(Arc::clone(&vdp));
-        Ok(vdp)
-    }
-
-    fn construct_io(props: &Props) -> Result<Arc<dyn Instance>> {
-        let io = Arc::new(SmsIo::from_props(props)?);
-        IOS.lock().push(Arc::clone(&io));
-        Ok(io)
-    }
-
-    fn construct_sdsc(props: &Props) -> Result<Arc<dyn Instance>> {
-        let console = Arc::new(SdscConsole::from_props(props)?);
-        CONSOLES.lock().push(Arc::clone(&console));
-        Ok(console)
-    }
-
-    /// Replace the three constructors in `bindings`, leaving every other class
-    /// alone.
+    /// Replace the three constructors in `options` with ones that keep a
+    /// handle, leaving every other class alone.
     ///
     /// # Errors
     ///
-    /// [`crate::Error::Config`] if a class turns out to be bound twice, which
-    /// would be a bug in the caller's binding table rather than here.
-    pub fn intercept(bindings: &Bindings) -> Result<Bindings> {
-        let ours: [Interception; 3] = [
-            (crate::dev::sms::vdp::CLASS.name, construct_vdp),
-            (crate::dev::sms::io::CLASS.name, construct_io),
-            (crate::dev::sms::sdsc::CLASS.name, construct_sdsc),
-        ];
-        let mut out = Bindings::new();
-        let classes: Vec<&'static str> = bindings.classes().collect();
-        for class in classes {
-            match ours.iter().find(|(name, _)| *name == class) {
-                Some((name, ctor)) => out.bind(name, *ctor)?,
-                None => {
-                    if let Some(ctor) = bindings.get(class) {
-                        out.bind(class, ctor)?;
-                    }
-                }
-            }
-        }
-        // A build with the device feature but a machine that does not use one:
-        // binding it anyway is still correct, and an unused binding costs
-        // nothing.
-        for (name, ctor) in ours {
-            if out.get(name).is_none() {
-                out.bind(name, ctor)?;
-            }
-        }
-        Ok(out)
-    }
-
-    /// Point `options` at intercepted bindings, in place.
-    ///
-    /// The one call a host makes between [`catalog::build_options`] and
-    /// [`machine::build`].
-    ///
-    /// [`catalog::build_options`]: crate::machine::catalog::build_options
-    /// [`machine::build`]: crate::machine::build
-    ///
-    /// # Errors
-    ///
-    /// As [`intercept`].
+    /// [`crate::Error::Config`] if something else has already claimed one of
+    /// this build's capture tables.
     pub fn install(options: &mut BuildOptions) -> Result<()> {
-        options.bindings = intercept(&options.bindings)?;
+        let vdps: Arc<Captured<SmsVdp>> = table(options)?;
+        options
+            .bindings
+            .replace(crate::dev::sms::vdp::CLASS.name, move |props| {
+                let vdp = Arc::new(SmsVdp::from_props(props)?);
+                vdps.push(&vdp);
+                Ok(vdp)
+            });
+
+        let ios: Arc<Captured<SmsIo>> = table(options)?;
+        options
+            .bindings
+            .replace(crate::dev::sms::io::CLASS.name, move |props| {
+                let io = Arc::new(SmsIo::from_props(props)?);
+                ios.push(&io);
+                Ok(io)
+            });
+
+        let consoles: Arc<Captured<SdscConsole>> = table(options)?;
+        options
+            .bindings
+            .replace(crate::dev::sms::sdsc::CLASS.name, move |props| {
+                let console = Arc::new(SdscConsole::from_props(props)?);
+                consoles.push(&console);
+                Ok(console)
+            });
         Ok(())
     }
 
-    /// Take the most recently constructed VDP as a [`SmsScanout`], forgetting
-    /// every earlier one.
+    /// This build's capture table for `T`, filed under the class it captures.
+    fn table<T: Captures>(options: &BuildOptions) -> Result<Arc<Captured<T>>> {
+        options
+            .realize
+            .hosts
+            .open(HostKind::CAPTURE, T::CLASS_NAME, Captured::new)
+    }
+
+    /// A chip this module intercepts, and the class it is built for.
     ///
-    /// `None` if no machine with one has been built since the last call — a
-    /// machine with no picture, which a host must be able to render nothing for.
-    #[must_use]
-    pub fn take_vdp() -> Option<SmsScanout> {
-        let mut table = VDPS.lock();
-        let last = table.pop();
-        table.clear();
-        last.map(SmsScanout::new)
+    /// A trait rather than three copies of the same two lines: the class name
+    /// and the captured type have to agree, and this is the only way to say so
+    /// once.
+    trait Captures: Send + Sync + 'static {
+        /// The class whose constructor is replaced to capture this type.
+        const CLASS_NAME: &'static str;
     }
 
-    /// Take the most recently constructed I/O chip, for a front end that has
-    /// buttons to press.
-    #[must_use]
-    pub fn take_io() -> Option<Arc<SmsIo>> {
-        let mut table = IOS.lock();
-        let last = table.pop();
-        table.clear();
-        last
+    impl Captures for SmsVdp {
+        const CLASS_NAME: &'static str = crate::dev::sms::vdp::CLASS.name;
     }
 
-    /// Take the most recently constructed debug console, which is how a
-    /// headless conformance run reads a test ROM's output.
-    #[must_use]
-    pub fn take_console() -> Option<Arc<SdscConsole>> {
-        let mut table = CONSOLES.lock();
-        let last = table.pop();
-        table.clear();
-        last
+    impl Captures for SmsIo {
+        const CLASS_NAME: &'static str = crate::dev::sms::io::CLASS.name;
     }
 
-    /// Forget every kept handle, so the next take cannot return a chip from a
-    /// machine that has already been dropped.
-    pub fn clear() {
-        VDPS.lock().clear();
-        IOS.lock().clear();
-        CONSOLES.lock().clear();
+    impl Captures for SdscConsole {
+        const CLASS_NAME: &'static str = crate::dev::sms::sdsc::CLASS.name;
+    }
+
+    /// What this build captured of `T`, if the interception was installed.
+    fn taken<T: Captures>(hosts: &HostObjects) -> Option<Arc<T>> {
+        hosts
+            .get::<Captured<T>>(HostKind::CAPTURE, T::CLASS_NAME)
+            .ok()
+            .flatten()?
+            .take()
+    }
+
+    /// The VDP this build constructed, as an [`SmsScanout`].
+    ///
+    /// `None` if this build has no VDP in it — a machine with no picture, which
+    /// a host must be able to render nothing for.
+    #[must_use]
+    pub fn take_vdp(hosts: &HostObjects) -> Option<SmsScanout> {
+        taken::<SmsVdp>(hosts).map(SmsScanout::new)
+    }
+
+    /// The I/O chip this build constructed, for a front end that has buttons to
+    /// press.
+    #[must_use]
+    pub fn take_io(hosts: &HostObjects) -> Option<Arc<SmsIo>> {
+        taken::<SmsIo>(hosts)
+    }
+
+    /// The debug console this build constructed, which is how a headless
+    /// conformance run reads a test ROM's output.
+    #[must_use]
+    pub fn take_console(hosts: &HostObjects) -> Option<Arc<SdscConsole>> {
+        taken::<SdscConsole>(hosts)
     }
 }

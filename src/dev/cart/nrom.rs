@@ -1210,7 +1210,13 @@ mod tests {
         assert_eq!(nrom.class().name, CLASS_NAME);
         assert_eq!(nrom.class().version, STATE_VERSION);
         let mut deferred = crate::core::device::Deferred::new();
-        let mut ctx = RealizeCtx::new("cart", crate::core::space::RequesterId(1), &mut deferred);
+        let ctx_hosts = crate::core::HostObjects::new();
+        let mut ctx = RealizeCtx::new(
+            "cart",
+            crate::core::space::RequesterId(1),
+            &mut deferred,
+            &ctx_hosts,
+        );
         nrom.realize(&mut ctx).expect("realizes");
         nrom.unrealize(&mut ctx).expect("unrealizes");
     }

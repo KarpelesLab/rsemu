@@ -180,11 +180,13 @@ impl Nes {
     const FRAME_NS: u64 = 16_639_267;
 
     fn new(rom: &[u8]) -> Result<Nes, rsemu::Error> {
-        let machine = rsemu::machine::catalog::build_catalog("nes-ntsc", &[("cart", rom)])?;
-        Ok(Nes {
-            pads: rsemu::dev::nes::pads::open(rsemu::dev::nes::DEFAULT_PAD_PORT),
-            machine,
-        })
+        let (machine, hosts) =
+            rsemu::machine::catalog::build_catalog_with_hosts("nes-ntsc", &[("cart", rom)])?;
+        // The pad port this machine's own controllers opened, out of this
+        // build's host objects — not a process-wide table another test could be
+        // pressing buttons on at the same time.
+        let pads = rsemu::dev::nes::pads::open(&hosts, rsemu::dev::nes::DEFAULT_PAD_PORT)?;
+        Ok(Nes { pads, machine })
     }
 }
 

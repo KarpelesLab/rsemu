@@ -27,18 +27,27 @@
 //!
 //! # The publication seam
 //!
-//! A device publishes its [`NodeSpec`] into [`publish`], keyed by the region it
-//! also hands to a `map` statement. That is the same shape as
-//! [`host::chardev::ports`](crate::host::chardev::ports) and is a seam for the
-//! same reason: `RealizeCtx` does not yet carry the machine graph, so a device
-//! and the thing that wants to describe it have no other place to meet. When
+//! A device publishes its [`NodeSpec`] into this machine's [`Publications`],
+//! keyed by the region it also hands to a `map` statement. That is a seam
+//! because `RealizeCtx` does not yet carry the machine graph, so a device and
+//! the thing that wants to describe it have no other place to meet. When
 //! `RealizeCtx` grows spaces and wires (`ROADMAP.md` §4.4), this table
 //! collapses into it and the device code does not change.
 //!
+//! It is published **from `Device::realize`**, not from a constructor.
+//! Announcing yourself into a table a sibling reads is an outward action and
+//! `CLAUDE.md`'s two-phase rule puts those in realize — which is the mirror of
+//! [`core::hosts`](crate::core::hosts)'s other half, where *acquiring* a port
+//! is allocation and stays in `new`. The table itself is one of those host
+//! objects, so it belongs to the build: [`table`] opens it from
+//! [`RealizeCtx::hosts`](crate::core::RealizeCtx::hosts), and [`BootRom`] holds
+//! the same handle as a field so the generator can read it back at reset.
+//!
+//! [`BootRom`]: super::boot::BootRom
+//!
 //! Keyed by *region identity*, not by name or instance path: a region is
-//! allocated once by its device, lives exactly as long as it, and is unique
-//! across every machine in the process, so two machines running side by side
-//! cannot collide.
+//! allocated once by its device and lives exactly as long as it, so no two
+//! entries in one machine's table can collide.
 //!
 //! # When the tree is built
 //!
@@ -55,8 +64,9 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
 use crate::core::error::{Error, Result};
+use crate::core::hosts::{HostKind, HostObjects};
 use crate::core::space::{AddressSpace, RegionKind, RegionRef};
-use crate::core::sync::{Global, LockRank};
+use crate::core::sync::{LockRank, Mutex};
 use crate::core::wire::WireId;
 
 use super::fdt::FdtWriter;
@@ -202,43 +212,129 @@ struct Entry {
     source: Weak<dyn DtSource>,
 }
 
-/// Region identity to describer. See the module docs for why this is a
-/// process-wide table and what replaces it; [`Global`] is the lock a `static`
-/// takes, because a `static` is reachable from every thread (`core::sync`).
-static TABLE: Global<Vec<Entry>> = Global::with_rank(LockRank::LEAF, Vec::new());
+/// One machine's region-identity to describer table.
+///
+/// A host object rather than a `static` (see the module docs): a build opens one
+/// through [`table`], every device in that build publishes into it, and its boot
+/// ROM reads it back. Two machines in one process therefore describe themselves
+/// independently, and a machine that is dropped takes its whole table with it.
+#[derive(Default)]
+pub struct Publications {
+    /// [`LockRank::LEAF`]: nothing is locked while this is held.
+    entries: Mutex<Vec<Entry>>,
+}
+
+impl core::fmt::Debug for Publications {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // A `DtSource` has no `Debug` — it is a device's register block — so
+        // the count is what a reader can be told.
+        match self.entries.try_lock() {
+            Some(entries) => f
+                .debug_struct("Publications")
+                .field("published", &entries.len())
+                .finish(),
+            None => f
+                .debug_struct("Publications")
+                .field("published", &"<in use>")
+                .finish(),
+        }
+    }
+}
+
+impl Publications {
+    /// An empty table.
+    #[must_use]
+    pub fn new() -> Publications {
+        Publications {
+            entries: Mutex::with_rank(LockRank::LEAF, Vec::new()),
+        }
+    }
+
+    /// Publish `source` as the description of `region`.
+    ///
+    /// Called from a device's `realize`, once per mappable region it has. A
+    /// second publication of the same region replaces the first, which is what
+    /// a device rebuilt in place wants.
+    pub fn publish(&self, region: &RegionRef, source: Weak<dyn DtSource>) {
+        let key = key_of(region);
+        let mut table = self.entries.lock();
+        // Prune while we are here: an entry only ever dies by its device being
+        // dropped, and that is exactly when nobody is looking.
+        table.retain(|e| e.region.strong_count() > 0 && e.key != key);
+        table.push(Entry {
+            key,
+            region: Arc::downgrade(region),
+            source,
+        });
+    }
+
+    /// The description published for `region`, if it is still live.
+    #[must_use]
+    pub fn lookup(&self, region: &RegionRef) -> Option<Arc<dyn DtSource>> {
+        let key = key_of(region);
+        let table = self.entries.lock();
+        table
+            .iter()
+            .find(|e| e.key == key)
+            .and_then(|e| e.source.upgrade())
+    }
+
+    /// How many live publications there are.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.lock().len()
+    }
+
+    /// Whether nothing has been published.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.lock().is_empty()
+    }
+}
+
+/// The kind a build's [`Publications`] is filed under.
+pub const KIND: HostKind = HostKind::new("riscv.dt");
+
+/// The name it is filed under: one per machine, so the name is a constant.
+const TABLE_NAME: &str = "dt";
+
+/// This build's publication table, creating it on first mention.
+///
+/// # Errors
+///
+/// [`Error::Config`] if another kind of host object is already open under this
+/// name, which would be a collision between two host modules.
+pub fn table(hosts: &HostObjects) -> Result<Arc<Publications>> {
+    hosts.open(KIND, TABLE_NAME, Publications::new)
+}
+
+/// The same table, for a device that has properties rather than a context.
+///
+/// The boot ROM's, which needs the handle at construction because it
+/// regenerates the tree at reset, where `&self` is all there is.
+///
+/// # Errors
+///
+/// As [`table`].
+pub fn table_for(props: &crate::core::props::Props) -> Result<Arc<Publications>> {
+    props.host(KIND, TABLE_NAME, Publications::new)
+}
+
+/// Publish `source` as the description of `region`, in `hosts`'s table.
+///
+/// The one line a device adds to its `Device::realize`.
+///
+/// # Errors
+///
+/// As [`table`].
+pub fn publish(hosts: &HostObjects, region: &RegionRef, source: Weak<dyn DtSource>) -> Result<()> {
+    table(hosts)?.publish(region, source);
+    Ok(())
+}
 
 /// The identity of a region, as the table keys on it.
 fn key_of(region: &RegionRef) -> usize {
     Arc::as_ptr(region) as *const u8 as usize
-}
-
-/// Publish `source` as the description of `region`.
-///
-/// Called from a device's constructor, once per mappable region it has. A
-/// second publication of the same region replaces the first, which is what a
-/// device that rebuilds its region during construction wants.
-pub fn publish(region: &RegionRef, source: Weak<dyn DtSource>) {
-    let key = key_of(region);
-    let mut table = TABLE.lock();
-    // Prune while we are here: entries only ever die by their machine being
-    // dropped, and that is exactly when nobody is looking.
-    table.retain(|e| e.region.strong_count() > 0 && e.key != key);
-    table.push(Entry {
-        key,
-        region: Arc::downgrade(region),
-        source,
-    });
-}
-
-/// The description published for `region`, if it is still live.
-#[must_use]
-pub fn lookup(region: &RegionRef) -> Option<Arc<dyn DtSource>> {
-    let key = key_of(region);
-    let table = TABLE.lock();
-    table
-        .iter()
-        .find(|e| e.key == key)
-        .and_then(|e| e.source.upgrade())
 }
 
 // ---------------------------------------------------------------------------
@@ -273,14 +369,14 @@ fn leaf_of(region: &RegionRef) -> RegionRef {
 
 /// Everything in `space` that describes itself, plus every RAM region, in
 /// address order.
-fn survey(space: &AddressSpace) -> (Vec<Placed>, Vec<(u64, u64)>) {
+fn survey(dt: &Publications, space: &AddressSpace) -> (Vec<Placed>, Vec<(u64, u64)>) {
     let mut placed = Vec::new();
     let mut memory = Vec::new();
     let view = space.view();
     for (_, mapping) in view.mappings() {
         let leaf = leaf_of(&mapping.region);
         let size = mapping.region.len();
-        if let Some(source) = lookup(&leaf) {
+        if let Some(source) = dt.lookup(&leaf) {
             placed.push(Placed {
                 base: mapping.base,
                 size,
@@ -300,12 +396,16 @@ fn survey(space: &AddressSpace) -> (Vec<Placed>, Vec<(u64, u64)>) {
 
 /// Generate the device tree for the machine `space` belongs to.
 ///
+/// `dt` is the machine's own [`Publications`] — what its devices published
+/// about themselves during realize. Passing it in rather than reaching for a
+/// `static` is what stops one board describing another's peripherals.
+///
 /// # Errors
 ///
 /// [`Error::Config`] if the space has no RAM to put a `memory` node on, or if
 /// the tree cannot be encoded.
-pub fn generate(space: &AddressSpace, cfg: &TreeConfig) -> Result<Vec<u8>> {
-    let (placed, memory) = survey(space);
+pub fn generate(dt: &Publications, space: &AddressSpace, cfg: &TreeConfig) -> Result<Vec<u8>> {
+    let (placed, memory) = survey(dt, space);
     if memory.is_empty() {
         return Err(Error::Config {
             at: "device tree".to_string(),
@@ -352,7 +452,7 @@ pub fn generate(space: &AddressSpace, cfg: &TreeConfig) -> Result<Vec<u8>> {
         let mut found = None;
         for (_, mapping) in view.mappings() {
             let leaf = leaf_of(&mapping.region);
-            if let Some(source) = lookup(&leaf)
+            if let Some(source) = dt.lookup(&leaf)
                 && matches!(source.dt_spec().kind, NodeKind::Plic { .. })
             {
                 found = Some(source);
@@ -695,44 +795,65 @@ mod tests {
         }
     }
 
-    fn published() -> (RegionRef, Arc<Fake>) {
+    fn published(dt: &Publications) -> (RegionRef, Arc<Fake>) {
         let ops = Arc::new(Fake);
         let region: RegionRef = Arc::new(Region::io(
             "fake",
             0x100,
             Arc::clone(&ops) as Arc<dyn MemOps>,
         ));
-        publish(&region, Arc::downgrade(&ops) as Weak<dyn DtSource>);
+        dt.publish(&region, Arc::downgrade(&ops) as Weak<dyn DtSource>);
         (region, ops)
     }
 
     #[test]
     fn a_published_region_finds_its_describer_again() {
-        let (region, _ops) = published();
-        let found = lookup(&region).expect("published");
+        let dt = Publications::new();
+        let (region, _ops) = published(&dt);
+        let found = dt.lookup(&region).expect("published");
         assert_eq!(found.dt_spec().name, "fake");
 
         // A region nobody published is not in the table, and asking is not an
         // error — most regions in a machine are ordinary memory.
         let other: RegionRef = Arc::new(Region::ram("ram", Arc::new(RamStore::new(0x100))));
-        assert!(lookup(&other).is_none());
+        assert!(dt.lookup(&other).is_none());
+
+        // And another machine's table knows nothing about this region, which is
+        // what stops one board describing another's peripherals.
+        assert!(Publications::new().lookup(&region).is_none());
     }
 
     #[test]
     fn an_entry_dies_with_its_device() {
+        let dt = Publications::new();
         let key = {
-            let (region, _ops) = published();
+            let (region, _ops) = published(&dt);
             let key = key_of(&region);
-            assert!(lookup(&region).is_some());
+            assert!(dt.lookup(&region).is_some());
             key
         };
         // Publishing anything prunes, which is when the dead entry goes.
-        let (_region, _ops) = published();
-        let table = TABLE.lock();
+        let (_region, _ops) = published(&dt);
         assert!(
-            !table.iter().any(|e| e.key == key),
-            "a dropped machine leaves nothing behind"
+            !dt.entries.lock().iter().any(|e| e.key == key),
+            "a dropped device leaves nothing behind"
         );
+        assert_eq!(dt.len(), 1, "and only the live publication is kept");
+    }
+
+    #[test]
+    fn a_builds_table_is_opened_once_and_shared() {
+        let hosts = crate::core::HostObjects::new();
+        let a = table(&hosts).expect("a fresh table");
+        let b = table(&hosts).expect("the same one");
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(a.is_empty());
+
+        let elsewhere = crate::core::HostObjects::new();
+        assert!(!Arc::ptr_eq(
+            &a,
+            &table(&elsewhere).expect("another build's")
+        ));
     }
 
     /// The full generator is exercised against a real machine in
@@ -753,7 +874,9 @@ mod tests {
             },
             default_timebase_hz: 10_000_000,
         };
-        let e = generate(&space, &cfg).expect_err("no memory").to_string();
+        let e = generate(&Publications::new(), &space, &cfg)
+            .expect_err("no memory")
+            .to_string();
         assert!(e.contains("no RAM"), "{e}");
     }
 }

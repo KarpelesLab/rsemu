@@ -206,7 +206,6 @@ impl Plic {
             REGISTER_WINDOW_LEN,
             Arc::clone(&regs) as Arc<dyn MemOps>,
         ));
-        super::dt::publish(&region, Arc::downgrade(&regs) as Weak<dyn DtSource>);
         Plic {
             regs,
             region,
@@ -609,8 +608,13 @@ impl Device for Plic {
         &CLASS
     }
 
-    fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
-        Ok(())
+    fn realize(&self, ctx: &mut RealizeCtx<'_>) -> Result<()> {
+        // What this region is, for the board's device-tree generator.
+        super::dt::publish(
+            ctx.hosts(),
+            &self.region,
+            Arc::downgrade(&self.regs) as Weak<dyn DtSource>,
+        )
     }
 
     fn reset(&self, _kind: ResetKind) {

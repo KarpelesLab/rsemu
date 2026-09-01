@@ -29,8 +29,7 @@
 //!
 //! # Ports are opened by name
 //!
-//! A machine file cannot hand a device a host object: `Props` carries data, and
-//! the constructor a class registers is a bare `fn` that can capture nothing.
+//! A machine file cannot hand a device a host object: `Props` carries data.
 //! What *can* travel from a machine file into a device is a name — which is
 //! exactly how a ROM image reaches a cartridge
 //! ([`MediaTable`](crate::machine::MediaTable)). So a character port works the
@@ -38,22 +37,16 @@
 //!
 //! ```text
 //! machine file:  object pia "apple1.pia" { port = "console" }
-//! device:        ports::open("console")   ──┐
-//! host:          ports::open("console")   ──┴─► the same Arc<CharPort>
+//! device:        ports::attach(props, "console")  ──┐
+//! host:          ports::open(&hosts, "console")   ──┴─► the same Arc<CharPort>
 //! ```
 //!
-//! [`ports`] is therefore a process-wide table, which is a seam and is marked
-//! as one: when `RealizeOptions` grows a table of host objects the way it has
-//! one for media, `ports` collapses into it and the `port` property keeps
-//! meaning exactly what it means today. Until then, give ports distinct names
-//! per machine — a test that wants isolation should use its own name.
-//!
-//! Being process-wide, the table's lock is a
-//! [`Global`](crate::core::sync::Global) and not a `Mutex`: a `static` is
-//! reachable from every thread in the process, so two libtest threads opening
-//! ports at the same time is ordinary rather than a deadlock. Two names still
-//! mean two ports; what `Global` fixes is the *table*, not the sharing the
-//! table exists to do.
+//! [`ports`] used to be a process-wide `static`, which meant two machines built
+//! in one process with the same port name shared a keyboard. It is now a view
+//! onto the build's own [`HostObjects`](crate::core::hosts::HostObjects), which
+//! `RealizeOptions` carries beside its `MediaTable`: the `port` property means
+//! exactly what it always meant, and the "give ports distinct names per
+//! machine" caveat is gone, because distinct machines have distinct tables.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -253,60 +246,76 @@ impl CharDevice for CharPort {
     }
 }
 
-/// The process-wide table of named character ports.
+/// The build's named character ports.
 ///
 /// See the module docs for why a *name* is the only thing that can travel from
-/// a machine description into a device constructor, and for what replaces this
-/// when `RealizeOptions` grows a host-object table.
+/// a machine description into a device constructor, and
+/// [`core::hosts`](crate::core::hosts) for the table this is a view onto.
 pub mod ports {
     use super::CharPort;
-    use alloc::collections::BTreeMap;
-    use alloc::string::{String, ToString};
+    use alloc::string::String;
     use alloc::sync::Arc;
     use alloc::vec::Vec;
 
-    use crate::core::sync::{Global, LockRank};
+    use crate::core::error::Result;
+    use crate::core::hosts::{HostKind, HostObjects};
+    use crate::core::props::Props;
 
-    /// Name to port. `BTreeMap`, so listing is in name order rather than hash
-    /// order (`CLAUDE.md`, determinism); [`Global`] because a `static` is
-    /// reachable from every thread in the process (`core::sync`).
-    static TABLE: Global<BTreeMap<String, Arc<CharPort>>> =
-        Global::with_rank(LockRank::LEAF, BTreeMap::new());
+    /// The kind a character port is filed under in a build's
+    /// [`HostObjects`].
+    pub const KIND: HostKind = HostKind::new("chardev");
 
-    /// The port called `name`, creating it if this is the first mention.
+    /// The a character port `name` refers to in `hosts`, creating it on first mention.
     ///
-    /// Both ends call this: the device during construction, the host before it
-    /// starts pumping. Whichever runs first makes the port.
-    #[must_use]
-    pub fn open(name: &str) -> Arc<CharPort> {
-        let mut table = TABLE.lock();
-        if let Some(port) = table.get(name) {
-            return Arc::clone(port);
-        }
-        let port = Arc::new(CharPort::new());
-        table.insert(name.to_string(), Arc::clone(&port));
-        port
+    /// The **host** side of the rendezvous: called before the host starts
+    /// pumping bytes, or after the build to pick up what a device opened.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Config`] if another kind of host object is already open
+    /// under that name, which is a collision between two host modules rather
+    /// than anything a machine file can cause.
+    pub fn open(hosts: &HostObjects, name: &str) -> Result<Arc<CharPort>> {
+        hosts.open(KIND, name, CharPort::new)
     }
 
-    /// The port called `name`, if it has been opened.
-    #[must_use]
-    pub fn get(name: &str) -> Option<Arc<CharPort>> {
-        TABLE.lock().get(name).map(Arc::clone)
+    /// The a character port `name` refers to in the build these properties are being read
+    /// for, creating it on first mention.
+    ///
+    /// The **device** side, called from `new(props)` — acquiring a host object
+    /// is allocation, and [`core::hosts`](crate::core::hosts) argues why. A
+    /// `Props` that belongs to no build gets a private one, so a device a unit
+    /// test constructed directly still works and simply meets nobody.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`].
+    pub fn attach(props: &Props, name: &str) -> Result<Arc<CharPort>> {
+        props.host(KIND, name, CharPort::new)
+    }
+
+    /// The a character port called `name`, if it has been opened.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`].
+    pub fn get(hosts: &HostObjects, name: &str) -> Result<Option<Arc<CharPort>>> {
+        hosts.get(KIND, name)
     }
 
     /// Forget `name`, reporting whether there was one.
     ///
     /// Anything still holding the `Arc` keeps working; this only removes the
     /// table's own reference, so a later [`open`] of the same name is a fresh
-    /// port. For tests that want the name back.
-    pub fn close(name: &str) -> bool {
-        TABLE.lock().remove(name).is_some()
+    /// one.
+    pub fn close(hosts: &HostObjects, name: &str) -> bool {
+        hosts.close(KIND, name)
     }
 
-    /// Every open port's name, in order.
+    /// Every open name, in order.
     #[must_use]
-    pub fn names() -> Vec<String> {
-        TABLE.lock().keys().cloned().collect()
+    pub fn names(hosts: &HostObjects) -> Vec<String> {
+        hosts.names(KIND)
     }
 }
 
@@ -374,19 +383,31 @@ mod tests {
     #[test]
     fn a_name_reaches_the_same_port_from_both_ends() {
         // The whole point of the table: two callers that never meet.
-        let device_end: Arc<dyn CharDevice> = ports::open("test.chardev.shared");
-        let host_end = ports::open("test.chardev.shared");
+        let hosts = crate::core::hosts::HostObjects::new();
+        let device_end: Arc<dyn CharDevice> = ports::open(&hosts, "console").unwrap();
+        let host_end = ports::open(&hosts, "console").unwrap();
         host_end.feed(b"Q");
         assert_eq!(device_end.read_byte(), Some(b'Q'));
         device_end.write_byte(b'R');
         assert_eq!(host_end.drain(), b"R".to_vec());
 
-        assert!(ports::names().iter().any(|n| n == "test.chardev.shared"));
-        assert!(ports::close("test.chardev.shared"));
-        assert!(ports::get("test.chardev.shared").is_none());
+        assert_eq!(ports::names(&hosts), ["console"]);
+        assert!(ports::close(&hosts, "console"));
+        assert!(ports::get(&hosts, "console").unwrap().is_none());
         // The Arc outlives the table entry, and a re-open is a fresh port.
         host_end.feed(b"S");
-        assert_eq!(ports::open("test.chardev.shared").pending_input(), 0);
-        ports::close("test.chardev.shared");
+        assert_eq!(ports::open(&hosts, "console").unwrap().pending_input(), 0);
+    }
+
+    #[test]
+    fn two_builds_with_one_port_name_are_two_ports() {
+        // What the process-wide `static` this replaced could not do.
+        let left = crate::core::hosts::HostObjects::new();
+        let right = crate::core::hosts::HostObjects::new();
+        let a = ports::open(&left, "console").unwrap();
+        let b = ports::open(&right, "console").unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
+        a.feed(b"only mine");
+        assert_eq!(b.pending_input(), 0);
     }
 }

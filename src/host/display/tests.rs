@@ -221,8 +221,6 @@ fn a_host_can_ask_for_a_different_byte_order() {
 fn a_nes_boots_renders_and_captures_a_png() {
     use crate::core::clock::GlobalTime;
 
-    // The capture table is process-wide; see `PROCESS_WIDE`.
-    let _serialised = super::PROCESS_WIDE.lock();
     use crate::host::display::palette::nes_rgb;
     use crate::host::display::{nes, png};
     use crate::machine::catalog;
@@ -250,11 +248,10 @@ fn a_nes_boots_renders_and_captures_a_png() {
     options.realize.media.insert("cart", MINIMAL_NROM);
 
     // Take a handle on the PPU as it is constructed; see `nes::capture`.
-    nes::capture::clear();
     nes::capture::install(&mut options).expect("the bindings are intercepted");
     let mut machine = crate::machine::build(entry.name, entry.source, &registry, &options)
         .expect("the nes-ntsc description builds");
-    let scanout = nes::capture::take().expect("the machine has a ppu");
+    let scanout = nes::capture::take(&options.realize.hosts).expect("the machine has a ppu");
 
     scanout.ppu().poke_palette(0x3f00, 0x21);
 
@@ -342,7 +339,6 @@ fn a_nes_boots_renders_and_captures_a_png() {
 fn a_real_cartridge_draws_a_picture() {
     use crate::core::clock::GlobalTime;
 
-    let _serialised = super::PROCESS_WIDE.lock();
     use crate::host::display::{nes, png};
     use crate::machine::catalog;
 
@@ -356,11 +352,10 @@ fn a_real_cartridge_draws_a_picture() {
     let registry = catalog::registry().expect("a registry");
     let mut options = catalog::build_options().expect("build options");
     options.realize.media.insert("cart", image.as_slice());
-    nes::capture::clear();
     nes::capture::install(&mut options).expect("the bindings are intercepted");
     let mut machine = crate::machine::build(entry.name, entry.source, &registry, &options)
         .unwrap_or_else(|e| panic!("{rom}: {e}"));
-    let scanout = nes::capture::take().expect("the machine has a ppu");
+    let scanout = nes::capture::take(&options.realize.hosts).expect("the machine has a ppu");
 
     // Long enough for a title screen to have been drawn: a few seconds of
     // virtual time, one frame at a time so the captures are real frames.

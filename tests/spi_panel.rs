@@ -24,22 +24,17 @@ use rsemu::host::display::lcd::{LcdScanout, capture};
 use rsemu::host::display::{PixelFormat, Scanout, Surface};
 use rsemu::machine::{Machine, catalog};
 
-/// Serialises everything here.
-///
-/// Two process-wide tables are in play — the SPI bus rendezvous in
-/// `bus::spi::buses` and the scanout capture slot — and `cargo test` runs these
-/// in parallel threads of one process. Without this, one test's `take` lands
-/// between another's build and its own, and the failure looks like a bug in the
-/// emulator rather than in the harness. `host::display::nes` documents the same
-/// hazard for the NES.
-static SERIALISE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// How wide and tall the board's panel is.
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;
 
-/// Build the board with a bus name nothing else is using, boot the demo
-/// firmware, and hand back the machine and something to look at it with.
+/// Build the board, boot the demo firmware, and hand back the machine and
+/// something to look at it with.
+///
+/// The bus name no longer has to be unique across the test binary: the SPI
+/// rendezvous and the scanout capture both live in this build's own
+/// `HostObjects`, so two boards booted at once have two `spi0`s and two panels.
+/// `two_boards_at_once_are_two_panels` is the assertion.
 fn boot(link: &str, bus: &str) -> (Machine, LcdScanout) {
     let entry = catalog::machine("spi-panel").expect("this build ships spi-panel");
     let mut options = catalog::build_options().expect("the catalog agrees with itself");
@@ -53,12 +48,12 @@ fn boot(link: &str, bus: &str) -> (Machine, LcdScanout) {
         .params
         .push((String::from("spibus"), String::from(bus)));
 
-    capture::clear();
     capture::install(&mut options).expect("the interception installs");
     let registry = catalog::registry().expect("a registry");
     let mut machine =
         rsemu::machine::build(entry.name, entry.source, &registry, &options).expect("it realizes");
-    let picture = capture::take(&machine).expect("the board has a scanout engine");
+    let picture =
+        capture::take(&options.realize.hosts, &machine).expect("the board has a scanout engine");
 
     // Run until the firmware has enabled the scanout engine, which it does once
     // the framebuffer is painted — 76,800 pixels at about eleven instructions
@@ -113,7 +108,6 @@ fn frame(picture: &LcdScanout) -> Surface {
 
 #[test]
 fn the_firmware_draws_a_picture_that_reaches_the_scanout_seam() {
-    let _guard = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
     let (_machine, picture) = boot("wired", "spi-panel-picture");
 
     let info = picture.info();
@@ -152,7 +146,6 @@ fn the_firmware_draws_a_picture_that_reaches_the_scanout_seam() {
 
 #[test]
 fn the_frame_period_comes_from_the_pixel_clock() {
-    let _guard = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
     let (_machine, picture) = boot("wired", "spi-panel-rate");
 
     // The board's `dclk` is 6 MHz and its totals are the ST7272A datasheet's
@@ -175,8 +168,6 @@ fn the_frame_period_comes_from_the_pixel_clock() {
 
 #[test]
 fn both_spi_link_models_boot_to_the_same_picture() {
-    let _guard = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
-
     let (wired_machine, wired_picture) = boot("wired", "spi-panel-equiv-wired");
     let wired_regs = panel_registers(&wired_machine);
     let wired_frame = frame(&wired_picture);
@@ -202,7 +193,6 @@ fn the_firmware_actually_configured_the_panel_over_spi() {
     // standby (GRB = 1, DISP = 1), 11h <- 80h sets contrast gain 2, 14h <- 40h
     // leaves brightness at 0. Reading them back proves the whole SPI path
     // carried them, not just that a register accepted a write.
-    let _guard = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
     let (machine, _picture) = boot("wired", "spi-panel-config");
     let regs = panel_registers(&machine);
 
@@ -228,7 +218,6 @@ fn the_firmware_actually_configured_the_panel_over_spi() {
 #[cfg(feature = "display-png")]
 #[test]
 fn the_picture_encodes_to_a_png_a_person_can_open() {
-    let _guard = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
     let (_machine, picture) = boot("wired", "spi-panel-png");
     let surface = frame(&picture);
 

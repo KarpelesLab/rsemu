@@ -19,15 +19,14 @@
 
 #![cfg(feature = "machine-sms")]
 
+use rsemu::core::HostObjects;
 use rsemu::core::clock::GlobalTime;
 use rsemu::core::space::MemAttrs;
 use rsemu::core::value::Width;
 use rsemu::host::display::sms::{capture, frame_hash};
 use rsemu::host::display::{PixelFormat, Scanout, Surface};
 use rsemu::machine::{Machine, catalog};
-
-/// Serialises the tests that share the process-wide capture table.
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+use std::sync::Arc;
 
 /// Where the console's work RAM starts.
 const RAM: u64 = 0xc000;
@@ -157,20 +156,23 @@ fn image() -> Vec<u8> {
     rom
 }
 
-/// Build a board out of the catalog with the test image in its `cart` slot.
+/// Build a board out of the catalog with the test image in its `cart` slot,
+/// and hand back the host objects its constructors captured into.
 ///
 /// The bindings are intercepted first, because a machine hands back
 /// `Arc<dyn Device>` and there is no route from one of those to an `Arc<SmsIo>`
-/// - see `host::display::sms::capture`, which is the seam that exists for it.
-fn boot(name: &str) -> Machine {
+/// — see `host::display::sms::capture`, which is the seam that exists for it.
+///
+/// The capture tables belong to this build, which is why this file no longer
+/// needs a mutex to stop two tests taking each other's VDP.
+fn boot(name: &str) -> (Machine, Arc<HostObjects>) {
     let entry = catalog::machine(name).unwrap_or_else(|| panic!("this build ships {name}"));
     let mut options = catalog::build_options().expect("the catalog agrees with itself");
-    capture::clear();
     capture::install(&mut options).expect("the bindings can be intercepted");
     options.realize.media.insert("cart", image());
     let registry = catalog::registry().expect("a registry");
     match rsemu::machine::build(entry.name, entry.source, &registry, &options) {
-        Ok(m) => m,
+        Ok(m) => (m, options.realize.hosts),
         Err(e) => panic!("{name} does not realize: {e}"),
     }
 }
@@ -185,9 +187,8 @@ fn peek(m: &Machine, space: &str, addr: u64) -> u64 {
 
 #[test]
 fn both_regions_realize_with_the_core_bound_to_both_of_their_spaces() {
-    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     for name in ["sms-ntsc", "sms-pal"] {
-        let m = boot(name);
+        let (m, _hosts) = boot(name);
         assert_eq!(m.name(), name);
         for path in ["cpu", "wram", "cart", "vdp", "psg", "io", "sdsc"] {
             assert!(
@@ -208,10 +209,9 @@ fn a_program_reaches_every_chip_through_two_address_spaces_and_banks_its_own_rom
     // One machine, several claims. They share a build because realizing this
     // board is not cheap — the port map is 1280 mappings and `TopologyGuard`
     // reflattens on each one — and every claim below is about the same run.
-    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let mut m = boot("sms-ntsc");
-    let vdp = capture::take_vdp().expect("the machine has a VDP");
-    let console = capture::take_console().expect("the machine has a debug console");
+    let (mut m, hosts) = boot("sms-ntsc");
+    let vdp = capture::take_vdp(&hosts).expect("the machine has a VDP");
+    let console = capture::take_console(&hosts).expect("the machine has a debug console");
 
     // -- the memory map, before anything runs ------------------------------
     assert_eq!(peek(&m, "mem", 0x0000), 0xf3, "the reset vector");
@@ -273,9 +273,8 @@ fn a_program_reaches_every_chip_through_two_address_spaces_and_banks_its_own_rom
 
 #[test]
 fn the_pause_button_is_a_non_maskable_interrupt() {
-    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let mut m = boot("sms-ntsc");
-    let io = capture::take_io().expect("the machine has an I/O chip");
+    let (mut m, hosts) = boot("sms-ntsc");
+    let io = capture::take_io(&hosts).expect("the machine has an I/O chip");
     // The program's first instruction is `di`, so an ordinary interrupt cannot
     // reach it. Run until it is parked in its loop.
     m.run_for(GlobalTime::from_nanos(200_000)).expect("it runs");
@@ -303,9 +302,8 @@ fn the_guest_draws_a_picture_and_the_scanout_seam_hands_it_over() {
     // emulated Z80 programmes the VDP entirely through `OUT ($BE)`/`OUT ($BF)`,
     // the chip renders, and the host side of the scanout seam converts what it
     // rendered into RGB at the right size. No host poking anywhere on that path.
-    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let mut m = boot("sms-ntsc");
-    let scanout = capture::take_vdp().expect("the machine has a VDP");
+    let (mut m, hosts) = boot("sms-ntsc");
+    let scanout = capture::take_vdp(&hosts).expect("the machine has a VDP");
 
     // Two frames: the first is drawn while the program is still setting the
     // chip up, the second with everything in place.

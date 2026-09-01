@@ -330,7 +330,10 @@ impl SpiController {
                 ),
             });
         }
-        let bus = bus_name.as_deref().map(buses::open);
+        let bus = bus_name
+            .as_deref()
+            .map(|name| buses::attach(props, name))
+            .transpose()?;
         Ok(SpiController::with_bus(link, bus, chip_selects as u8))
     }
 

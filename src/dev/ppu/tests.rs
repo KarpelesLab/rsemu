@@ -1343,7 +1343,8 @@ fn realize_no_longer_demands_a_bus_of_its_own() {
     // `machine::tests::a_ppu_without_an_address_space_is_refused`.
     let ppu = NesPpu::new(&Props::new()).unwrap();
     let mut deferred = Deferred::new();
-    let mut ctx = RealizeCtx::new("ppu", RequesterId(1), &mut deferred);
+    let ctx_hosts = crate::core::HostObjects::new();
+    let mut ctx = RealizeCtx::new("ppu", RequesterId(1), &mut deferred, &ctx_hosts);
     ppu.realize(&mut ctx)
         .expect("realize is about the wire, not the bus");
 }
@@ -1355,7 +1356,8 @@ fn realize_announces_the_nmi_line() {
     let (ppu, _, _) = new_ppu();
     let nmi = with_nmi(&ppu);
     let mut deferred = Deferred::new();
-    let mut ctx = RealizeCtx::new("ppu", RequesterId(1), &mut deferred);
+    let ctx_hosts = crate::core::HostObjects::new();
+    let mut ctx = RealizeCtx::new("ppu", RequesterId(1), &mut deferred, &ctx_hosts);
     ppu.realize(&mut ctx).unwrap();
     // Idle low, and announced rather than assumed.
     assert_eq!(nmi.levels.lock().as_slice(), &[] as &[bool]);

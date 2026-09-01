@@ -500,10 +500,9 @@ mod nes {
 #[test]
 fn listening_does_not_change_the_machine() {
     use crate::core::clock::GlobalTime;
+    use crate::core::hosts::HostObjects;
     use crate::host::audio::nes::capture;
     use crate::machine::catalog;
-
-    let _serialised = crate::host::display::PROCESS_WIDE.lock();
 
     /// `JMP $C000` forever, with a handful of APU writes first so the chip is
     /// actually making a noise while the comparison runs.
@@ -535,8 +534,10 @@ fn listening_does_not_change_the_machine() {
         image
     };
 
-    fn build(capacity: u64) -> crate::machine::Machine {
-        capture::clear();
+    /// A NES with an interception installed, and the host objects it captured
+    /// into — one table per build, so the two machines below cannot see each
+    /// other's APU.
+    fn build(capacity: u64) -> (crate::machine::Machine, alloc::sync::Arc<HostObjects>) {
         let registry = catalog::registry().expect("a registry");
         let mut options = catalog::build_options().expect("build options");
         options.realize.media.insert("cart", ROM);
@@ -546,7 +547,9 @@ fn listening_does_not_change_the_machine() {
             .iter()
             .find(|e| e.name == "nes-ntsc")
             .expect("machine-nes is on");
-        crate::machine::build(entry.name, entry.source, &registry, &options).expect("a machine")
+        let machine = crate::machine::build(entry.name, entry.source, &registry, &options)
+            .expect("a machine");
+        (machine, options.realize.hosts)
     }
 
     // The step is one NTSC video frame, which is the cadence every front end
@@ -556,16 +559,17 @@ fn listening_does_not_change_the_machine() {
     let step = GlobalTime::from_nanos(16_639_356);
     const STEPS: u32 = 30;
 
-    let mut listened = build(1 << 20);
-    let source = capture::take().expect("the machine has an APU");
+    let (mut listened, listened_hosts) = build(1 << 20);
+    let source = capture::take(&listened_hosts).expect("the machine has an APU");
     let mut stream = AudioStream::new(Box::new(source), 48_000, SampleFormat::S16);
     for _ in 0..STEPS {
         listened.run_for(step).expect("a frame");
         stream.pull();
     }
 
-    let mut ignored = build(1 << 20);
-    capture::clear();
+    // Built with the same interception and then simply not listened to: its
+    // APU is captured into its own table, which nobody reads.
+    let (mut ignored, _ignored_hosts) = build(1 << 20);
     for _ in 0..STEPS {
         ignored.run_for(step).expect("a frame");
     }
@@ -581,6 +585,4 @@ fn listening_does_not_change_the_machine() {
         "the state hash depends on whether audio was drained"
     );
     assert_eq!(listened.now().as_nanos(), ignored.now().as_nanos());
-
-    capture::clear();
 }

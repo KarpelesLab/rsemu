@@ -1705,10 +1705,12 @@ fn realize_does_nothing_outward_because_the_space_has_not_arrived_yet() {
     // `binding_a_core_with_no_address_space_is_a_machine_error` below.
     let cpu = Arm::new(Config::ARM926EJS);
     let mut deferred = crate::core::device::Deferred::new();
+    let ctx_hosts = crate::core::HostObjects::new();
     let mut ctx = crate::core::device::RealizeCtx::new(
         "cpu",
         crate::core::space::RequesterId::ANONYMOUS,
         &mut deferred,
+        &ctx_hosts,
     );
     assert!(cpu.realize(&mut ctx).is_ok());
 }

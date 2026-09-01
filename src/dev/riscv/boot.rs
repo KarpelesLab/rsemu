@@ -188,6 +188,16 @@ pub struct BootRom {
     entry: u64,
     rv32: bool,
     config: TreeConfig,
+    /// What this machine's devices published about themselves.
+    ///
+    /// A field rather than a `static`: the tree is regenerated at reset, when
+    /// `&self` is all there is, and the table has to be *this* board's — see
+    /// [`dt`](super::dt). Acquired in `new` from the build's host objects,
+    /// which is where every other host object is acquired
+    /// ([`core::hosts`](crate::core::hosts)); a `BootRom` built outside a build
+    /// gets an empty one of its own and describes a machine with no
+    /// peripherals, which is the honest answer for a device with no machine.
+    dt: Arc<super::dt::Publications>,
 }
 
 impl BootRom {
@@ -198,6 +208,7 @@ impl BootRom {
     /// [`Error::Property`] if a property is of the wrong kind or out of range,
     /// or if one this class does not know was given.
     pub fn new(props: &Props) -> Result<BootRom> {
+        let dt = super::dt::table_for(props)?;
         let mut r = props.reader();
         let size = r.or_size("size", DEFAULT_SIZE)?;
         let entry = r.or_addr("entry", DEFAULT_ENTRY)?;
@@ -272,6 +283,7 @@ impl BootRom {
             region,
             entry,
             rv32,
+            dt,
             config: TreeConfig {
                 model,
                 bootargs,
@@ -353,7 +365,7 @@ impl BootRom {
                 ),
             });
         };
-        let dtb = super::dt::generate(&space, &self.config)?;
+        let dtb = super::dt::generate(&self.dt, &space, &self.config)?;
         let mut image = self.stub();
         image.resize(DTB_OFFSET as usize, 0);
         image.extend_from_slice(&dtb);

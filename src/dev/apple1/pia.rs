@@ -197,7 +197,11 @@ impl Pia {
         let port_name = r.or("port", String::from(DEFAULT_PORT))?;
         let paced = r.or("paced", true)?;
         r.finish()?;
-        Ok(Pia::with_port(ports::open(&port_name), port_name, paced))
+        Ok(Pia::with_port(
+            ports::attach(props, &port_name)?,
+            port_name,
+            paced,
+        ))
     }
 
     /// Build one against a character device the caller already has.
@@ -759,7 +763,6 @@ mod tests {
         let pia = Pia::new(&Props::new().with("port", "test.pia.props")).expect("a name");
         assert_eq!(pia.port_name(), "test.pia.props");
         assert!(pia.is_paced());
-        ports::close("test.pia.props");
 
         let pia = Pia::new(&Props::new().with("paced", Value::Bool(false))).expect("unpaced");
         assert!(!pia.is_paced());
@@ -820,6 +823,5 @@ mod tests {
         let device = (class.construct)(&Props::new().with("port", "test.pia.registry"))
             .expect("defaults are enough");
         assert_eq!(device.class().name, CLASS_NAME);
-        ports::close("test.pia.registry");
     }
 }

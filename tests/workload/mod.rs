@@ -48,35 +48,6 @@ use rsemu::host::display::{PixelFormat, Scanout, Surface};
 // CI's `-D warnings`.
 use rsemu::machine::Machine;
 
-/// Serialises everything in this module across the whole test binary.
-///
-/// Held for a [`Booted`]'s entire life, not just its construction — `cargo
-/// test` runs tests in parallel threads of one process and two of the seams a
-/// workload goes through are process-wide by design:
-///
-/// * `host::display::nes::capture` keeps constructed PPUs in a `static`, so one
-///   test's `take` can land between another's build and its own.
-/// * In a `no_std` build `core::sync` uses its `single` backend, whose locks
-///   report a *concurrent* claim as a would-be deadlock rather than blocking —
-///   which is the whole point of that checker (`ROADMAP.md` §0). Two machines
-///   driven from two libtest threads reach the same process-wide `Global` and
-///   trip it, and the panic reads like an emulator bug when it is a harness
-///   one. That is why the guard lives in `Booted` rather than being dropped at
-///   the end of `boot`.
-///
-/// `host::display::PROCESS_WIDE` and `tests/spi_panel.rs` document the same
-/// hazard and take the same approach.
-static SERIALISE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Take [`SERIALISE`], ignoring poisoning.
-///
-/// A test that panicked while holding it has already failed and reported why;
-/// turning every *other* test into a second failure about a poisoned mutex
-/// buries the one that matters.
-fn serialise() -> std::sync::MutexGuard<'static, ()> {
-    SERIALISE.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 /// Points the NES workload at a cartridge the person running it owns.
 ///
 /// The phase-3 gate names three commercial titles; this is the only lawful way
@@ -119,9 +90,11 @@ pub(crate) struct Workload {
 
 /// A built machine plus whatever can look at its picture.
 ///
-/// Not `Send`: it carries [`SERIALISE`]'s guard, so only one of these exists in
-/// the process at a time and it never leaves the thread that built it. Drop it
-/// before booting the next one.
+/// This used to carry a process-wide mutex guard, because the PPU came out of a
+/// `static` capture table and two of these existing at once meant one test
+/// could take the other's chip. Each build now captures into its own
+/// `HostObjects`, so several may exist at once and `cargo test` may run them in
+/// parallel again.
 pub(crate) struct Booted {
     /// The machine itself.
     pub(crate) machine: Machine,
@@ -129,16 +102,10 @@ pub(crate) struct Booted {
     pub(crate) capture: Option<Capture>,
     /// Virtual time in one frame.
     span: GlobalTime,
-    /// Kept, not used. See [`SERIALISE`].
-    _guard: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Booted {
-    fn wrap(
-        guard: std::sync::MutexGuard<'static, ()>,
-        machine: Machine,
-        scanout: Option<Box<dyn Scanout>>,
-    ) -> Booted {
+    fn wrap(machine: Machine, scanout: Option<Box<dyn Scanout>>) -> Booted {
         let capture = scanout.map(Capture::new);
         // A device that publishes no rate — or no device at all — gets the
         // nominal 60 Hz, so "one frame" means one comparable thing across the
@@ -152,7 +119,6 @@ impl Booted {
             machine,
             capture,
             span: GlobalTime::from_nanos(ns),
-            _guard: guard,
         }
     }
 
@@ -242,9 +208,6 @@ pub(crate) fn all() -> Vec<Workload> {
 
 impl Workload {
     /// Build the machine and everything needed to look at it.
-    ///
-    /// Serialised against every other boot in the process: two of the seams
-    /// involved keep process-wide tables.
     ///
     /// # Panics
     ///
@@ -342,17 +305,15 @@ fn boot_nes() -> Booted {
     use rsemu::machine::catalog;
 
     let image = nes_rom();
-    let guard = serialise();
     let entry = catalog::machine("nes-ntsc").expect("this build ships nes-ntsc");
     let mut options = catalog::build_options().expect("the catalog agrees with itself");
     options.realize.media.insert("cart", image.as_slice());
-    capture::clear();
     capture::install(&mut options).expect("the interception installs");
     let registry = catalog::registry().expect("a registry");
     let machine = rsemu::machine::build(entry.name, entry.source, &registry, &options)
         .expect("the NES realizes");
-    let scanout = capture::take().expect("the machine has a PPU");
-    Booted::wrap(guard, machine, Some(Box::new(scanout)))
+    let scanout = capture::take(&options.realize.hosts).expect("the machine has a PPU");
+    Booted::wrap(machine, Some(Box::new(scanout)))
 }
 
 #[cfg(feature = "machine-gameboy")]
@@ -362,21 +323,19 @@ fn boot_gameboy() -> Booted {
     // ROM only, no cartridge RAM: the smallest cartridge that can hold the
     // program below, so the measurement is of the console rather than a mapper.
     let image = rsemu::dev::gb::cart::synthetic_image(2, 0x00, 0x00, GAMEBOY_PROGRAM);
-    let guard = serialise();
     let machine = catalog::build_catalog("gameboy", &[("cart", &image)]).expect("the GB realizes");
     // `host::display` has no Game Boy adapter yet, so there is nothing to hash
     // a frame from — the state hash is the whole regression here.
-    Booted::wrap(guard, machine, None)
+    Booted::wrap(machine, None)
 }
 
 #[cfg(feature = "machine-apple1")]
 fn boot_apple1() -> Booted {
     use rsemu::machine::catalog;
 
-    let guard = serialise();
     let machine = catalog::build_catalog("apple1", &[("rom", rsemu::dev::apple1::RSMON)])
         .expect("the Apple 1 realizes");
-    Booted::wrap(guard, machine, None)
+    Booted::wrap(machine, None)
 }
 
 #[cfg(feature = "machine-riscv-virt")]
@@ -384,7 +343,6 @@ fn boot_riscv_virt() -> Booted {
     use rsemu::machine::catalog;
 
     let firmware = riscv_firmware();
-    let guard = serialise();
     let entry = catalog::machine("riscv-virt").expect("this build ships riscv-virt");
     let mut options = catalog::build_options().expect("the catalog agrees with itself");
     options
@@ -412,7 +370,7 @@ fn boot_riscv_virt() -> Booted {
     let registry = catalog::registry().expect("a registry");
     let machine = rsemu::machine::build(entry.name, entry.source, &registry, &options)
         .expect("the virt board realizes");
-    Booted::wrap(guard, machine, None)
+    Booted::wrap(machine, None)
 }
 
 // ---------------------------------------------------------------------------

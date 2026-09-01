@@ -275,7 +275,7 @@ impl Acia {
         let erratum = r.or("erratum", false)?;
         r.finish()?;
         Ok(Acia::with_port(
-            ports::open(&port_name),
+            ports::attach(props, &port_name)?,
             port_name,
             paced,
             erratum,
@@ -1056,7 +1056,6 @@ mod tests {
         assert_eq!(acia.port_name(), "test.acia.props");
         assert!(acia.is_paced());
         assert!(!acia.has_erratum());
-        ports::close("test.acia.props");
 
         let acia = Acia::new(&Props::new().with("paced", Value::Bool(false))).expect("unpaced");
         assert!(!acia.is_paced());
@@ -1080,7 +1079,6 @@ mod tests {
         assert_eq!(device.class().name, CLASS_NAME);
         // It drives one pin and no other.
         assert!(device.connect("cts", dummy_source()).is_err());
-        ports::close("test.acia.registry");
     }
 
     /// A wire with one source, so the pin has something to drive.

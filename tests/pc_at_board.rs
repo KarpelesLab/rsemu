@@ -20,6 +20,16 @@
 //! `Arc<X86>`. `Device` keeps `Any` out of its supertrait chain on purpose, so
 //! the only moment a concrete type exists is construction — the same seam
 //! `host::display` uses, and for the same reason.
+//!
+//! # Two boards at once
+//!
+//! Several tests here build a second board while the first is still alive: the
+//! snapshot round-trip loads into a fresh one, and so does the text-page test.
+//! That used to need a `static BUILDING` mutex, because the handles came out of
+//! process-wide tables and two builds in parallel could swap them. They do not
+//! any more — the processor arrives in a capture table this function owns, and
+//! the display in the build's own `HostObjects` — so there is nothing left to
+//! serialise, and `two_boards_built_at_once_share_no_device` says so.
 
 #![cfg(all(
     feature = "cpu-x86",
@@ -30,6 +40,7 @@
 
 use std::sync::Arc;
 
+use rsemu::core::Captured;
 use rsemu::core::device::ResetKind;
 use rsemu::core::space::MemAttrs;
 use rsemu::core::value::Width;
@@ -41,25 +52,22 @@ use rsemu::machine::realize::Bindings;
 // reaching the processor
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    /// The core built most recently on this thread.
-    ///
-    /// There is no route from a `dyn Device` to a concrete type — `Device`
-    /// keeps `Any` out of its supertrait chain on purpose — so the handle is
-    /// taken at the one moment the concrete type exists: construction.
-    static LAST_CPU: std::cell::RefCell<Option<Arc<X86>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Everything this board needs to construct, with a `cpu.i8086` that hands a
-/// handle back.
-fn bindings() -> Bindings {
+/// Everything this board needs to construct, with a `cpu.i8086` that pushes
+/// what it builds into `cpus`.
+///
+/// There is no route from a `dyn Device` to a concrete type — `Device` keeps
+/// `Any` out of its supertrait chain on purpose — so the handle is taken at the
+/// one moment the concrete type exists: construction. The table is a *captured*
+/// `Arc` rather than a `static`, which is what makes two boards in one process
+/// two sets of devices.
+fn bindings(cpus: &Arc<Captured<X86>>) -> Bindings {
     let mut b = Bindings::new();
     rsemu::machine::builtin::bind(&mut b).expect("ram and rom");
     rsemu::dev::pc::bind(&mut b).expect("the chipset");
-    b.bind("cpu.i8086", |props| {
+    let kept = Arc::clone(cpus);
+    b.bind("cpu.i8086", move |props| {
         let cpu = Arc::new(X86::from_props_defaulting(props, Variant::I8088)?.as_i8086());
-        LAST_CPU.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&cpu)));
+        kept.push(&cpu);
         Ok(cpu)
     })
     .expect("nothing else in this table claims the name");
@@ -85,16 +93,6 @@ fn fake_vgabios(len: usize) -> Vec<u8> {
     v
 }
 
-/// Serialises board construction.
-///
-/// Both handles a test needs — the stub processor's and the display's — are
-/// taken from process-wide tables, because `Device` has no route back to a
-/// concrete type. Those tables are documented as "build one machine at a time";
-/// `cargo test` runs test functions in parallel, so this is the "at a time".
-static BUILDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// The board, its stub processor, and its display — all three taken while the
-/// construction lock is held, so two tests building at once cannot swap them.
 /// A 1.44 MB image whose every sector says which sector it is, so a transfer
 /// that lands one sector out is a failure rather than a coincidence.
 fn fake_floppy() -> Vec<u8> {
@@ -113,32 +111,19 @@ fn fake_floppy() -> Vec<u8> {
     image
 }
 
+/// The board, its processor, and its display.
+///
+/// All three come out of one build, and nothing here is process-wide, so two
+/// calls give two boards that share no device.
 fn board_with_display() -> (
     rsemu::machine::Machine,
     Arc<X86>,
     rsemu::dev::pc::video::VideoScanout,
 ) {
-    let guard = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
-    let machine = build_board();
-    let cpu = LAST_CPU
-        .with(|slot| slot.borrow().clone())
-        .expect("the constructor kept a handle");
-    let scanout =
-        rsemu::host::display::pc::capture::take().expect("the board has a display adapter");
-    drop(guard);
-    (machine, cpu, scanout)
-}
-
-/// The board and its processor, for a test with no interest in the picture.
-fn board() -> (rsemu::machine::Machine, Arc<X86>) {
-    let (machine, cpu, _) = board_with_display();
-    (machine, cpu)
-}
-
-fn build_board() -> rsemu::machine::Machine {
+    let cpus: Arc<Captured<X86>> = Arc::new(Captured::new());
     let mut options = rsemu::machine::BuildOptions::new()
         .with_classes(rsemu::machine::catalog::classes())
-        .with_bindings(bindings());
+        .with_bindings(bindings(&cpus));
     options.realize.media.insert("bios", fake_bios(128 * 1024));
     options
         .realize
@@ -149,13 +134,47 @@ fn build_board() -> rsemu::machine::Machine {
     options.realize.media.insert("floppy", fake_floppy());
     // Intercept the display's constructor so a test can look at the picture,
     // exactly as `rsemu run --screenshot` does.
-    rsemu::host::display::pc::capture::clear();
     rsemu::host::display::pc::capture::install(&mut options).expect("one display class");
     let registry = rsemu::machine::catalog::registry().expect("this build's registry");
-    match build("pc-at.machine", rsemu::dev::pc::PC_AT, &registry, &options) {
+    let machine = match build("pc-at.machine", rsemu::dev::pc::PC_AT, &registry, &options) {
         Ok(m) => m,
         Err(e) => panic!("the board does not realize: {e}"),
-    }
+    };
+    let cpu = cpus.take().expect("the constructor kept a handle");
+    let scanout = rsemu::host::display::pc::capture::take(&options.realize.hosts)
+        .expect("the board has a display adapter");
+    (machine, cpu, scanout)
+}
+
+/// The board and its processor, for a test with no interest in the picture.
+fn board() -> (rsemu::machine::Machine, Arc<X86>) {
+    let (machine, cpu, _) = board_with_display();
+    (machine, cpu)
+}
+
+/// The same, keeping the host objects the build opened.
+fn board_with_hosts() -> (
+    rsemu::machine::Machine,
+    Arc<X86>,
+    Arc<rsemu::core::HostObjects>,
+) {
+    let cpus: Arc<Captured<X86>> = Arc::new(Captured::new());
+    let mut options = rsemu::machine::BuildOptions::new()
+        .with_classes(rsemu::machine::catalog::classes())
+        .with_bindings(bindings(&cpus));
+    options.realize.media.insert("bios", fake_bios(128 * 1024));
+    options
+        .realize
+        .media
+        .insert("vgabios", fake_vgabios(32 * 1024));
+    options.realize.media.insert("floppy", fake_floppy());
+    let registry = rsemu::machine::catalog::registry().expect("this build's registry");
+    let machine = match build("pc-at.machine", rsemu::dev::pc::PC_AT, &registry, &options) {
+        Ok(m) => m,
+        Err(e) => panic!("the board does not realize: {e}"),
+    };
+    let cpu = cpus.take().expect("the constructor kept a handle");
+    (machine, cpu, options.realize.hosts)
 }
 
 /// Read one byte of the guest's memory space.
@@ -193,7 +212,6 @@ fn the_catalog_realizes_this_board_with_its_own_bindings() {
     // on the core. This one does not: it goes through `catalog::build_options`,
     // which is what `rsemu run pc-at` uses — and which could only realize the
     // board once `cpu.i8086` was bound, `schema`'d and given its pins.
-    let _guard = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
     let entry = rsemu::machine::catalog::machine("pc-at").expect("this build ships pc-at");
     let mut options = rsemu::machine::catalog::build_options().expect("this build's classes");
     options.realize.media.insert("bios", fake_bios(128 * 1024));
@@ -202,7 +220,6 @@ fn the_catalog_realizes_this_board_with_its_own_bindings() {
         .media
         .insert("vgabios", fake_vgabios(32 * 1024));
     options.realize.media.insert("floppy", fake_floppy());
-    rsemu::host::display::pc::capture::clear();
     rsemu::host::display::pc::capture::install(&mut options).expect("one display class");
     let registry = rsemu::machine::catalog::registry().expect("this build's registry");
     let mut m = match build(entry.name, entry.source, &registry, &options) {
@@ -768,4 +785,59 @@ fn a_sector_travels_from_the_floppy_through_the_dma_controller_into_memory() {
     // And the boot signature is where firmware looks.
     assert_eq!(peek(&m, DEST + 510), 0x55);
     assert_eq!(peek(&m, DEST + 511), 0xaa);
+}
+
+/// Two boards in one process are two boards.
+///
+/// The 8042 binds `ports::open("keyboard")` by default and `pc-at.machine`
+/// takes the default, so before the build got its own host objects both boards
+/// resolved that name to one `CharPort` — one keyboard between two PCs, and a
+/// scancode typed at one arriving at the other. Nothing said so, and the tests
+/// that build two boards were serialised for unrelated reasons, so it never
+/// showed. This is the assertion that would have.
+#[test]
+fn two_boards_built_at_once_share_no_device() {
+    use rsemu::host::chardev::ports;
+
+    let (mut left, left_cpu, left_hosts) = board_with_hosts();
+    let (mut right, right_cpu, right_hosts) = board_with_hosts();
+
+    // Two processors, not one taken twice: the capture table each build makes
+    // is that build's, so `take` cannot hand back the other machine's core.
+    assert!(!Arc::ptr_eq(&left_cpu, &right_cpu));
+
+    // Two keyboards, under the same name — which is the whole point.
+    let names = ports::names(&left_hosts);
+    assert_eq!(names, ports::names(&right_hosts));
+    assert_eq!(names, ["keyboard"], "the 8042's default port");
+    let left_kbd = ports::open(&left_hosts, "keyboard").expect("the 8042 opened it");
+    let right_kbd = ports::open(&right_hosts, "keyboard").expect("the 8042 opened it");
+    assert!(
+        !Arc::ptr_eq(&left_kbd, &right_kbd),
+        "one port name in two builds must be two ports"
+    );
+
+    // And the guests agree. Both are reset and swept; a scancode fed to the
+    // left one raises the left 8042's output-buffer-full bit and leaves the
+    // right one saying it has nothing.
+    for m in [&mut left, &mut right] {
+        m.reset(ResetKind::Cold);
+        m.sweep();
+    }
+    left_kbd.feed(&[0x1e]);
+    for m in [&mut left, &mut right] {
+        m.run_for(rsemu::core::clock::GlobalTime::from_nanos(2_000_000))
+            .expect("the machine runs");
+    }
+    assert_eq!(
+        inb(&left, 0x0064) & 0x01,
+        0x01,
+        "the left 8042 never saw the scancode"
+    );
+    assert_eq!(
+        inb(&right, 0x0064) & 0x01,
+        0x00,
+        "the right 8042 read the left machine's keyboard"
+    );
+    assert_eq!(inb(&left, 0x0060), 0x1e, "and it is the byte that was fed");
 }

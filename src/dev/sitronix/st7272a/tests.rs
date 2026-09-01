@@ -498,15 +498,20 @@ fn a_short_frame_is_ignored() {
 
 #[test]
 fn the_panel_attaches_to_a_named_bus_at_the_chip_select_it_is_given() {
-    let name = "test-st7272a-attach";
-    buses::close(name);
+    use alloc::sync::Arc;
+
+    // The panel opens its bus in the host objects its `Props` was read against
+    // — this test's own, so nothing else in the binary can be on this bus.
+    let hosts = Arc::new(crate::core::HostObjects::new());
+    let name = "spi0";
     let panel = St7272a::new(
         &Props::new()
             .with("bus", Value::Str(name.to_string()))
-            .with("cs", Value::Uint(3)),
+            .with("cs", Value::Uint(3))
+            .with_hosts(Arc::clone(&hosts)),
     )
     .expect("a panel on a named bus");
-    let bus = buses::open(name);
+    let bus = buses::open(&hosts, name).expect("the panel opened it");
     assert_eq!(bus.attached(), alloc::vec![ChipSelect(3)]);
     assert_eq!(bus.check_format(FRAME), None, "and it wants §7.1's framing");
 
@@ -516,7 +521,6 @@ fn the_panel_attaches_to_a_named_bus_at_the_chip_select_it_is_given() {
     bus.select(None);
     panel.latch();
     assert!(panel.is_displaying());
-    buses::close(name);
 }
 
 // ---------------------------------------------------------------------------
