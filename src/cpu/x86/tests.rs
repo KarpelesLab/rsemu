@@ -15,7 +15,7 @@ use crate::core::space::{AddressSpace, RamStore, Region, RequesterId};
 use crate::core::state::{ChunkReader, MachineShape, StateWriter};
 
 use super::isa::{Arg, Class, Grp, Op, decode, resolve};
-use super::{Config, Interrupt, Reg, Regs, Variant, X86, flags, linear};
+use super::{Config, Features, Interrupt, Reg, Regs, Variant, X86, flags, linear};
 
 /// A core with a megabyte of RAM and a 64 KiB I/O space, both readable back.
 struct Machine {
@@ -1214,6 +1214,12 @@ struct Pc {
 
 impl Pc {
     fn new(variant: Variant) -> Pc {
+        Pc::with_features(variant, variant.features())
+    }
+
+    /// The same core with a narrowed extension set — a 486 with no
+    /// floating-point unit, say.
+    fn with_features(variant: Variant, features: Features) -> Pc {
         let ram = Arc::new(RamStore::new(0x40_0000));
         let rom = Arc::new(RamStore::new(0x1_0000));
         let mem = AddressSpace::new("mem", 32);
@@ -1230,7 +1236,11 @@ impl Pc {
             .map(Region::ram("ports", ports.clone()), 0)
             .expect("64 KiB fits in 16 bits");
 
-        let cpu = Arc::new(X86::new(Config::default().with_variant(variant)));
+        let cpu = Arc::new(X86::new(
+            Config::default()
+                .with_variant(variant)
+                .with_features(features),
+        ));
         cpu.attach_space(Arc::new(mem));
         cpu.attach_io_space(Arc::new(io));
         Pc {
@@ -1883,8 +1893,10 @@ fn cpuid_reports_the_vendor_and_a_feature_set_this_core_implements() {
         )
     );
 
-    // Leaf 1 reports the signature and **no** optional features, because this
-    // core implements none of them.
+    // Leaf 1 reports the signature and exactly the features a 486DX has: an
+    // on-die x87 unit and nothing else. `CX8` is clear because `CMPXCHG8B`
+    // arrived with the Pentium, and `FXSR`/`SSE`/`SSE2` because they arrived
+    // long after that.
     let pc = pc386();
     pc.start_protected();
     pc.write(at::CODE0, &[0xb8, 0x01, 0x00, 0x00, 0x00, 0x0f, 0xa2, 0xf4]);
@@ -1892,7 +1904,16 @@ fn cpuid_reports_the_vendor_and_a_feature_set_this_core_implements() {
     pc.cpu.step();
     let regs = pc.regs();
     assert_eq!(regs.rax, 0x0000_0480);
-    assert_eq!(regs.rdx, 0);
+    assert_eq!(regs.rdx, 1, "FPU, and nothing else, on a 486DX");
+
+    // A 486SX is the same part with the unit fused off, which is the whole
+    // point of `Features` being separate from `Variant`.
+    let pc = Pc::with_features(Variant::I80486, Features::I80486SX);
+    pc.start_protected();
+    pc.write(at::CODE0, &[0xb8, 0x01, 0x00, 0x00, 0x00, 0x0f, 0xa2, 0xf4]);
+    pc.cpu.step();
+    pc.cpu.step();
+    assert_eq!(pc.regs().rdx, 0, "no FPU bit on a 486SX");
 
     // A 386 has no `CPUID` at all.
     let pc = Pc::new(Variant::I80386);
@@ -3999,5 +4020,1404 @@ mod long_mode {
             ..Features::X86_64
         };
         assert!(impossible.validate().is_err(), "long mode needs PAE");
+    }
+}
+
+/// The x87 unit and the SSE registers, executed as a guest sees them.
+///
+/// Every expected value here comes from the *Intel SDM* — the section is named
+/// on each test — or is arithmetic that can be checked by hand: `1.5 + 2.25`
+/// is `3.75` in any format, and `1/3` rounded to sixty-four significand bits
+/// is `0xaaaa_aaaa_aaaa_aaab` one way and `…aaaa` the other, which is exactly
+/// what makes it a rounding-mode test.
+mod fp {
+    use super::*;
+    use crate::cpu::x86::fpu::{Sse, Tag, cw, mxcsr, sw};
+    use crate::cpu::x86::prot::cr4;
+    use crate::float::x87::F80;
+
+    /// Scratch addresses these tests load from and store to.
+    mod fpat {
+        /// A 16-byte-aligned scratch area.
+        pub(super) const DATA: u64 = 0xb000;
+        /// A second one, deliberately **not** 16-byte aligned.
+        pub(super) const ODD: u64 = 0xb008;
+        /// Where a result is written.
+        pub(super) const OUT: u64 = 0xc000;
+        /// A 512-byte `FXSAVE` area.
+        pub(super) const SAVE: u64 = 0xd000;
+    }
+
+    /// Where every fault handler in this module sits, and where `RIP` ends up
+    /// once its one-byte `hlt` has retired.
+    const HANDLER: u64 = 0x3800;
+    /// `RIP` after the handler's `hlt`.
+    const HANDLED: u64 = HANDLER + 1;
+
+    /// A 486DX: an x87 unit, no SSE.
+    fn x87pc() -> Pc {
+        let pc = pc386();
+        pc.start_protected();
+        pc
+    }
+
+    /// A part with SSE2, in 32-bit protected mode with `CR4.OSFXSR` set — the
+    /// bit an operating system has to write before any of this works.
+    fn ssepc() -> Pc {
+        let pc = Pc::new(Variant::X86_64);
+        pc.start_protected();
+        let mut sys = pc.cpu.sys();
+        sys.cr4 |= cr4::OSFXSR | cr4::OSXMMEXCPT;
+        pc.cpu.set_sys(sys);
+        pc
+    }
+
+    /// Assemble a `disp32` ModRM byte for `reg`: `mod == 00`, `r/m == 101`.
+    fn disp32(reg: u8, addr: u64) -> Vec<u8> {
+        let mut out = alloc::vec![((reg & 7) << 3) | 0b101];
+        out.extend_from_slice(&(addr as u32).to_le_bytes());
+        out
+    }
+
+    /// Run a program at `CODE0`.
+    fn run(pc: &Pc, code: &[u8]) {
+        pc.write(at::CODE0, code);
+        let steps = pc.run(200);
+        assert!(steps < 200, "the program reached its hlt");
+    }
+
+    fn read64(pc: &Pc, addr: u64) -> u64 {
+        let mut v = 0u64;
+        for i in 0..8u64 {
+            v |= u64::from(pc.ram.read_u8(addr + i).unwrap()) << (8 * i);
+        }
+        v
+    }
+
+    fn write64(pc: &Pc, addr: u64, value: u64) {
+        for i in 0..8u64 {
+            pc.ram.write_u8(addr + i, (value >> (8 * i)) as u8).unwrap();
+        }
+    }
+
+    // -- The stack -----------------------------------------------------
+
+    #[test]
+    fn a_load_pushes_and_the_top_of_stack_pointer_moves_down() {
+        // SDM volume 1 §8.1.7: `TOP` decrements on a push, so the first `FLD1`
+        // leaves `ST(0)` in physical register 7.
+        let pc = x87pc();
+        run(&pc, &[0xdb, 0xe3, 0xd9, 0xe8, 0xf4]); // fninit ; fld1 ; hlt
+        let x = pc.cpu.x87();
+        assert_eq!(x.top(), 7);
+        assert_eq!(x.raw(0), F80::new(0x3fff, 0x8000_0000_0000_0000));
+        assert_eq!(x.tag_at(7), Tag::Valid);
+        assert_eq!(x.tag_at(0), Tag::Empty);
+    }
+
+    #[test]
+    fn a_ninth_push_is_a_stack_overflow_with_c1_set() {
+        // §8.5.1.1. The masked response still moves `TOP` and still writes —
+        // with the indefinite — which is why a program that overflows once
+        // keeps producing indefinites rather than recovering.
+        let pc = x87pc();
+        let mut code = alloc::vec![0xdb, 0xe3];
+        for _ in 0..9 {
+            code.extend_from_slice(&[0xd9, 0xe8]); // fld1
+        }
+        code.push(0xf4);
+        run(&pc, &code);
+        let x = pc.cpu.x87();
+        assert_ne!(x.status & sw::IE, 0, "invalid operation");
+        assert_ne!(x.status & sw::SF, 0, "and it was a stack fault");
+        assert_ne!(x.status & sw::C1, 0, "an overflow, not an underflow");
+        assert_eq!(x.raw(0), F80::INDEFINITE);
+    }
+
+    #[test]
+    fn reading_an_empty_register_is_an_underflow_with_c1_clear() {
+        // The other half of §8.5.1.1, and the reason an empty register is not
+        // a zero: `FLD ST(0)` on a fresh unit reads something that is not
+        // there.
+        let pc = x87pc();
+        run(&pc, &[0xdb, 0xe3, 0xd9, 0xc0, 0xf4]); // fninit ; fld st(0) ; hlt
+        let x = pc.cpu.x87();
+        assert_ne!(x.status & sw::IE, 0);
+        assert_ne!(x.status & sw::SF, 0);
+        assert_eq!(x.status & sw::C1, 0, "an underflow sets C1 to zero");
+        assert_eq!(x.raw(0), F80::INDEFINITE);
+    }
+
+    #[test]
+    fn fxch_swaps_the_values_and_their_tags() {
+        // SDM volume 2, `FXCH`. The tags travel with the values, which is what
+        // makes exchanging with an empty register meaningful.
+        let pc = x87pc();
+        // fninit ; fldz ; fld1 ; fxch st(1) ; hlt
+        run(&pc, &[0xdb, 0xe3, 0xd9, 0xee, 0xd9, 0xe8, 0xd9, 0xc9, 0xf4]);
+        let x = pc.cpu.x87();
+        assert_eq!(x.raw(0), F80::ZERO);
+        assert_eq!(x.raw(1), F80::new(0x3fff, 0x8000_0000_0000_0000));
+        assert_eq!(x.tag_at(x.phys(0)), Tag::Zero);
+        assert_eq!(x.tag_at(x.phys(1)), Tag::Valid);
+    }
+
+    #[test]
+    fn fincstp_leaves_the_tag_word_alone_and_a_pop_does_not() {
+        // SDM volume 2, `FINCSTP`: "this instruction does not change the tag
+        // word". `FSTP ST(0)` — the idiomatic pop — does.
+        let pc = x87pc();
+        run(&pc, &[0xdb, 0xe3, 0xd9, 0xe8, 0xd9, 0xf7, 0xf4]);
+        assert_eq!(pc.cpu.x87().tag_at(7), Tag::Valid, "still occupied");
+
+        let pc = x87pc();
+        run(&pc, &[0xdb, 0xe3, 0xd9, 0xe8, 0xdd, 0xd8, 0xf4]);
+        assert_eq!(pc.cpu.x87().tag_at(7), Tag::Empty, "freed by the pop");
+    }
+
+    // -- Arithmetic ----------------------------------------------------
+
+    #[test]
+    fn a_double_precision_add_produces_the_exact_sum() {
+        // 1.5 + 2.25 = 3.75, which every format represents exactly, so the
+        // rounding mode cannot be hiding a wrong answer.
+        let pc = x87pc();
+        write64(&pc, fpat::DATA, 0x3ff8_0000_0000_0000); // 1.5
+        write64(&pc, fpat::DATA + 8, 0x4002_0000_0000_0000); // 2.25
+        let mut code = alloc::vec![0xdb, 0xe3, 0xdd]; // fninit ; fld qword
+        code.extend_from_slice(&disp32(0, fpat::DATA));
+        code.push(0xdc); // fadd qword
+        code.extend_from_slice(&disp32(0, fpat::DATA + 8));
+        code.push(0xdd); // fstp qword
+        code.extend_from_slice(&disp32(3, fpat::OUT));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(read64(&pc, fpat::OUT), 0x400e_0000_0000_0000, "3.75");
+        assert_eq!(pc.cpu.x87().status & sw::EXCEPTIONS, 0, "exactly");
+    }
+
+    #[test]
+    fn precision_control_shortens_the_significand_and_nothing_else() {
+        // SDM volume 1 §8.1.5.2. `1 + 2^-30` is exact at 64-bit precision and
+        // rounds away entirely at 24-bit, which is the whole content of `PC`.
+        let program = |control: u16| {
+            let pc = x87pc();
+            write64(&pc, fpat::DATA, u64::from(control));
+            write64(&pc, fpat::DATA + 8, 0x3e10_0000_0000_0000); // 2^-30
+            let mut code = alloc::vec![0xdb, 0xe3, 0xd9]; // fninit ; fldcw
+            code.extend_from_slice(&disp32(5, fpat::DATA));
+            code.extend_from_slice(&[0xd9, 0xe8, 0xdc]); // fld1 ; fadd qword
+            code.extend_from_slice(&disp32(0, fpat::DATA + 8));
+            code.push(0xdb); // fstp tbyte
+            code.extend_from_slice(&disp32(7, fpat::OUT));
+            code.push(0xf4);
+            run(&pc, &code);
+            (read64(&pc, fpat::OUT), pc.cpu.x87().status)
+        };
+        let (extended, st) = program(cw::RESET);
+        assert_eq!(extended, 0x8000_0002_0000_0000, "2^-30 survives at PC=64");
+        assert_eq!(st & sw::PE, 0, "and the sum is exact");
+
+        let (single, st) = program(cw::RESET & !cw::PC);
+        assert_eq!(single, 0x8000_0000_0000_0000, "and vanishes at PC=24");
+        assert_ne!(st & sw::PE, 0, "which is inexact, and says so");
+    }
+
+    #[test]
+    fn rounding_control_changes_the_last_bit_of_one_third() {
+        // §8.1.5.3. One third has no exact binary form, so the two directions
+        // differ in the last bit and nowhere else.
+        let program = |control: u16| {
+            let pc = x87pc();
+            write64(&pc, fpat::DATA, u64::from(control));
+            write64(&pc, fpat::DATA + 8, 0x4008_0000_0000_0000); // 3.0
+            let mut code = alloc::vec![0xdb, 0xe3, 0xd9];
+            code.extend_from_slice(&disp32(5, fpat::DATA));
+            code.extend_from_slice(&[0xd9, 0xe8, 0xdd]); // fld1 ; fld qword 3.0
+            code.extend_from_slice(&disp32(0, fpat::DATA + 8));
+            // fdivp st(1), st(0): ST(1) <- ST(1) / ST(0), then pop.
+            code.extend_from_slice(&[0xde, 0xf9, 0xdb]);
+            code.extend_from_slice(&disp32(7, fpat::OUT));
+            code.push(0xf4);
+            run(&pc, &code);
+            read64(&pc, fpat::OUT)
+        };
+        assert_eq!(program(cw::RESET), 0xaaaa_aaaa_aaaa_aaab, "to nearest");
+        let toward_zero = cw::RESET | cw::RC;
+        assert_eq!(program(toward_zero), 0xaaaa_aaaa_aaaa_aaaa, "toward zero");
+    }
+
+    #[test]
+    fn the_integer_conversions_round_and_saturate_as_the_manual_says() {
+        // `FILD` is exact for every width; `FIST` rounds under `RC` and
+        // delivers the integer indefinite for anything out of range (SDM
+        // volume 1 §4.2.2.1).
+        let pc = x87pc();
+        write64(&pc, fpat::DATA, 0x4059_0000_0000_0000); // 100.0
+        let mut code = alloc::vec![0xdb, 0xe3, 0xdd];
+        code.extend_from_slice(&disp32(0, fpat::DATA));
+        code.push(0xdb); // fistp dword
+        code.extend_from_slice(&disp32(3, fpat::OUT));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(read64(&pc, fpat::OUT) as u32, 100);
+
+        // 2^40 does not fit in a doubleword, so the answer is the indefinite
+        // and the invalid flag, not a truncation.
+        let pc = x87pc();
+        write64(&pc, fpat::DATA, 0x4270_0000_0000_0000); // 2^40
+        let mut code = alloc::vec![0xdb, 0xe3, 0xdd];
+        code.extend_from_slice(&disp32(0, fpat::DATA));
+        code.push(0xdb);
+        code.extend_from_slice(&disp32(3, fpat::OUT));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(read64(&pc, fpat::OUT) as u32, 0x8000_0000);
+        assert_ne!(pc.cpu.x87().status & sw::IE, 0);
+    }
+
+    #[test]
+    fn fsqrt_frndint_and_fscale_compute_what_they_claim() {
+        let pc = x87pc();
+        write64(&pc, fpat::DATA, 0x4010_0000_0000_0000); // 4.0
+        let mut code = alloc::vec![0xdb, 0xe3, 0xdd];
+        code.extend_from_slice(&disp32(0, fpat::DATA));
+        code.extend_from_slice(&[0xd9, 0xfa, 0xdd]); // fsqrt ; fstp qword
+        code.extend_from_slice(&disp32(3, fpat::OUT));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(read64(&pc, fpat::OUT), 0x4000_0000_0000_0000, "sqrt(4) = 2");
+
+        // `FRNDINT` at the default rounding: 2.5 ties to even, so 2.
+        let pc = x87pc();
+        write64(&pc, fpat::DATA, 0x4004_0000_0000_0000); // 2.5
+        let mut code = alloc::vec![0xdb, 0xe3, 0xdd];
+        code.extend_from_slice(&disp32(0, fpat::DATA));
+        code.extend_from_slice(&[0xd9, 0xfc, 0xdd]);
+        code.extend_from_slice(&disp32(3, fpat::OUT));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(read64(&pc, fpat::OUT), 0x4000_0000_0000_0000, "2.5 -> 2");
+        assert_ne!(pc.cpu.x87().status & sw::PE, 0, "and it moved");
+
+        // `FSCALE`: 1.5 * 2^3 = 12.
+        let pc = x87pc();
+        write64(&pc, fpat::DATA, 0x4008_0000_0000_0000); // 3.0
+        write64(&pc, fpat::DATA + 8, 0x3ff8_0000_0000_0000); // 1.5
+        let mut code = alloc::vec![0xdb, 0xe3, 0xdd];
+        code.extend_from_slice(&disp32(0, fpat::DATA));
+        code.push(0xdd);
+        code.extend_from_slice(&disp32(0, fpat::DATA + 8));
+        code.extend_from_slice(&[0xd9, 0xfd, 0xdd]); // fscale ; fstp qword
+        code.extend_from_slice(&disp32(3, fpat::OUT));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(read64(&pc, fpat::OUT), 0x4028_0000_0000_0000, "12.0");
+    }
+
+    #[test]
+    fn fprem_reduces_exactly_and_reports_the_quotient_bits() {
+        // SDM volume 2, `FPREM`: the remainder of 13 / 4 is 1, and the low
+        // three bits of the truncated quotient (3) land in C1, C3 and C0.
+        let pc = x87pc();
+        write64(&pc, fpat::DATA, 0x4010_0000_0000_0000); // 4.0 -> ST(1)
+        write64(&pc, fpat::DATA + 8, 0x402a_0000_0000_0000); // 13.0 -> ST(0)
+        let mut code = alloc::vec![0xdb, 0xe3, 0xdd];
+        code.extend_from_slice(&disp32(0, fpat::DATA));
+        code.push(0xdd);
+        code.extend_from_slice(&disp32(0, fpat::DATA + 8));
+        code.extend_from_slice(&[0xd9, 0xf8, 0xdd]); // fprem ; fstp qword
+        code.extend_from_slice(&disp32(3, fpat::OUT));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(
+            read64(&pc, fpat::OUT),
+            0x3ff0_0000_0000_0000,
+            "13 mod 4 = 1"
+        );
+        let st = pc.cpu.x87().status;
+        assert_eq!(st & sw::C2, 0, "the reduction was complete");
+        assert_ne!(st & sw::C1, 0, "Q0");
+        assert_ne!(st & sw::C3, 0, "Q1");
+        assert_eq!(st & sw::C0, 0, "Q2 — the quotient is 3");
+    }
+
+    #[test]
+    fn a_memory_source_compare_reads_the_operand_and_not_st_one() {
+        // `D8 /2` compares `ST(0)` with an `m32fp`; `D8 D0+i` compares it with
+        // `ST(i)`. The two share a mnemonic and nothing else, and an
+        // implementation that routed both to the register form would agree
+        // with the manual exactly when `ST(1)` happened to hold the same
+        // value.
+        let pc = x87pc();
+        // ST(1) is 100.0 and the memory operand is 2.0f, so a comparison
+        // against the wrong one gives the opposite answer.
+        write64(&pc, fpat::DATA, 0x4059_0000_0000_0000); // 100.0
+        write64(&pc, fpat::DATA + 8, 0x3ff0_0000_0000_0000); // 1.0
+        pc.ram.write_u8(fpat::DATA + 16, 0x00).unwrap();
+        pc.ram.write_u8(fpat::DATA + 17, 0x00).unwrap();
+        pc.ram.write_u8(fpat::DATA + 18, 0x00).unwrap();
+        pc.ram.write_u8(fpat::DATA + 19, 0x40).unwrap(); // 2.0f
+        let mut code = alloc::vec![0xdb, 0xe3, 0xdd];
+        code.extend_from_slice(&disp32(0, fpat::DATA)); // fld 100.0
+        code.push(0xdd);
+        code.extend_from_slice(&disp32(0, fpat::DATA + 8)); // fld 1.0
+        code.push(0xd8); // fcom dword [DATA+16]
+        code.extend_from_slice(&disp32(2, fpat::DATA + 16));
+        code.extend_from_slice(&[0xdf, 0xe0, 0xf4]); // fnstsw ax
+        run(&pc, &code);
+        let s = (pc.regs().rax & 0xffff) as u16;
+        assert_ne!(s & sw::C0, 0, "1.0 < 2.0");
+        assert_eq!(s & sw::C3, 0);
+    }
+
+    #[test]
+    fn a_store_from_an_empty_register_writes_the_indefinite() {
+        // §8.5.1.1's masked response reaches memory too: the destination gets
+        // the QNaN indefinite rather than keeping whatever was there, which is
+        // what makes a lost stack visible in the data instead of silent.
+        let pc = x87pc();
+        write64(&pc, fpat::OUT, 0x1234_5678_9abc_def0);
+        let mut code = alloc::vec![0xdb, 0xe3, 0xdd]; // fninit ; fstp qword
+        code.extend_from_slice(&disp32(3, fpat::OUT));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(read64(&pc, fpat::OUT), 0xfff8_0000_0000_0000, "-QNaN");
+        let x = pc.cpu.x87();
+        assert_ne!(x.status & sw::IE, 0);
+        assert_ne!(x.status & sw::SF, 0);
+    }
+
+    #[test]
+    fn the_transcendentals_are_absent_and_say_so() {
+        // `D9 F0` is `F2XM1` on hardware and unassigned here, so it raises
+        // `#UD`. Documented in `super`'s module docs: an approximation would
+        // be a silently wrong answer where a missing instruction is a loud
+        // one.
+        let pc = x87pc();
+        pc.idt(6, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        run(&pc, &[0xdb, 0xe3, 0xd9, 0xe8, 0xd9, 0xf0, 0xf4]);
+        assert_eq!(pc.regs().rip, HANDLED, "#UD for F2XM1");
+    }
+
+    #[test]
+    fn the_disassembler_prints_the_escapes_and_the_simd_forms() {
+        // One table: the disassembler follows the interpreter into both new
+        // families without a second opcode list.
+        let pc = ssepc();
+        let listing = |bytes: &[u8]| {
+            pc.write(at::CODE0, bytes);
+            let out = pc.cpu.disassemble(0x08, at::CODE0, 1);
+            alloc::format!("{}", out[0])
+        };
+        assert!(listing(&[0xd9, 0xe8]).ends_with("fld1"), "fld1");
+        assert!(listing(&[0xd8, 0xc1]).ends_with("fadd st(0), st(1)"));
+        assert!(listing(&[0xde, 0xc1]).ends_with("faddp st(1), st(0)"));
+        assert!(listing(&[0xdf, 0xe0]).ends_with("fnstsw ax"));
+        let dq = listing(&[0xdd, 0x05, 0x00, 0xb0, 0x00, 0x00]);
+        assert!(dq.ends_with("fld qword [ds:0xb000]"), "{dq}");
+        let tb = listing(&[0xdb, 0x2d, 0x00, 0xb0, 0x00, 0x00]);
+        assert!(tb.ends_with("fld tbyte [ds:0xb000]"), "{tb}");
+        assert!(listing(&[0xf2, 0x0f, 0x58, 0xc1]).ends_with("addsd xmm0, xmm1"));
+        assert!(listing(&[0x66, 0x0f, 0x28, 0xc1]).ends_with("movapd xmm0, xmm1"));
+        assert!(listing(&[0x0f, 0x50, 0xc1]).ends_with("movmskps eax, xmm1"));
+        let ld = listing(&[0x0f, 0xae, 0x15, 0x00, 0xb0, 0x00, 0x00]);
+        assert!(ld.ends_with("ldmxcsr dword [ds:0xb000]"), "{ld}");
+        assert!(listing(&[0x0f, 0xae, 0xf0]).ends_with("mfence"));
+        let cx = listing(&[0x0f, 0xc7, 0x0d, 0x00, 0xb0, 0x00, 0x00]);
+        assert!(cx.ends_with("cmpxchg8b [ds:0xb000]"), "{cx}");
+        // An `F3` that selected an SSE row is part of the opcode, not a repeat
+        // prefix, and printing `rep movss` would be a listing no assembler
+        // takes back.
+        let ss = listing(&[0xf3, 0x0f, 0x10, 0xc1]);
+        assert!(ss.ends_with("movss xmm0, xmm1"), "{ss}");
+        assert!(!ss.contains("rep"), "{ss}");
+    }
+
+    // -- Comparison and classification ---------------------------------
+
+    #[test]
+    fn fcom_sets_the_three_condition_codes_the_manual_tabulates() {
+        // SDM volume 1 §8.3.4, table 8-3: C3 is "equal", C0 is "less than",
+        // and all three go up together for unordered.
+        let compare = |a: u64, b: u64| {
+            let pc = x87pc();
+            write64(&pc, fpat::DATA, b);
+            write64(&pc, fpat::DATA + 8, a);
+            let mut code = alloc::vec![0xdb, 0xe3, 0xdd];
+            code.extend_from_slice(&disp32(0, fpat::DATA));
+            code.push(0xdd);
+            code.extend_from_slice(&disp32(0, fpat::DATA + 8));
+            // fcom st(1) ; fnstsw ax ; hlt
+            code.extend_from_slice(&[0xd8, 0xd1, 0xdf, 0xe0, 0xf4]);
+            run(&pc, &code);
+            (pc.regs().rax & 0xffff) as u16
+        };
+        let one = 0x3ff0_0000_0000_0000;
+        let two = 0x4000_0000_0000_0000;
+        let qnan = 0x7ff8_0000_0000_0000;
+
+        let s = compare(one, two);
+        assert_ne!(s & sw::C0, 0, "1 < 2 sets C0");
+        assert_eq!(s & (sw::C2 | sw::C3), 0);
+
+        let s = compare(two, one);
+        assert_eq!(s & (sw::C0 | sw::C2 | sw::C3), 0, "2 > 1 clears all three");
+
+        let s = compare(one, one);
+        assert_ne!(s & sw::C3, 0, "equal sets C3");
+        assert_eq!(s & (sw::C0 | sw::C2), 0);
+
+        let s = compare(one, qnan);
+        assert_eq!(
+            s & (sw::C0 | sw::C2 | sw::C3),
+            sw::C0 | sw::C2 | sw::C3,
+            "unordered sets all three"
+        );
+        assert_ne!(s & sw::IE, 0, "and FCOM signals on a quiet NaN");
+    }
+
+    #[test]
+    fn fucom_is_quiet_where_fcom_signals() {
+        // IEEE 754-2019 §5.11's two comparison families, which is why both
+        // instructions exist. `FUCOM` raises invalid only for a *signaling*
+        // NaN.
+        let with = |opcode: [u8; 2]| {
+            let pc = x87pc();
+            write64(&pc, fpat::DATA, 0x7ff8_0000_0000_0000); // quiet NaN
+            write64(&pc, fpat::DATA + 8, 0x3ff0_0000_0000_0000);
+            let mut code = alloc::vec![0xdb, 0xe3, 0xdd];
+            code.extend_from_slice(&disp32(0, fpat::DATA));
+            code.push(0xdd);
+            code.extend_from_slice(&disp32(0, fpat::DATA + 8));
+            code.extend_from_slice(&opcode);
+            code.push(0xf4);
+            run(&pc, &code);
+            pc.cpu.x87().status
+        };
+        assert_ne!(with([0xd8, 0xd1]) & sw::IE, 0, "FCOM signals");
+        assert_eq!(with([0xdd, 0xe1]) & sw::IE, 0, "FUCOM does not");
+    }
+
+    #[test]
+    fn fcomi_writes_the_integer_flags_instead_of_the_condition_codes() {
+        // SDM volume 2, `FCOMI`: ZF, PF and CF, with OF, SF and AF cleared.
+        let pc = x87pc();
+        write64(&pc, fpat::DATA, 0x4000_0000_0000_0000); // 2.0 -> ST(1)
+        write64(&pc, fpat::DATA + 8, 0x3ff0_0000_0000_0000); // 1.0 -> ST(0)
+        let mut code = alloc::vec![0xdb, 0xe3, 0xdd];
+        code.extend_from_slice(&disp32(0, fpat::DATA));
+        code.push(0xdd);
+        code.extend_from_slice(&disp32(0, fpat::DATA + 8));
+        code.extend_from_slice(&[0xdb, 0xf1, 0xf4]); // fcomi st(0), st(1)
+        run(&pc, &code);
+        let e = pc.regs().eflags;
+        assert_ne!(e & flags::CF, 0, "1 < 2");
+        assert_eq!(e & flags::ZF, 0);
+        assert_eq!(e & flags::PF, 0);
+    }
+
+    #[test]
+    fn fxam_tells_an_empty_register_from_a_zero() {
+        // The one instruction that can look at an empty register without
+        // faulting, and the only way to tell the two apart (SDM volume 2,
+        // `FXAM`): empty is C3 C2 C0 = 101, a zero is 100.
+        let pc = x87pc();
+        run(&pc, &[0xdb, 0xe3, 0xd9, 0xe5, 0xf4]); // fninit ; fxam
+        let s = pc.cpu.x87().status;
+        assert_ne!(s & sw::C3, 0);
+        assert_eq!(s & sw::C2, 0);
+        assert_ne!(s & sw::C0, 0, "empty");
+
+        let pc = x87pc();
+        run(&pc, &[0xdb, 0xe3, 0xd9, 0xee, 0xd9, 0xe5, 0xf4]);
+        let s = pc.cpu.x87().status;
+        assert_ne!(s & sw::C3, 0);
+        assert_eq!(s & (sw::C2 | sw::C0), 0, "a zero");
+        assert_eq!(s & sw::C1, 0, "and a positive one");
+    }
+
+    // -- The exception masks -------------------------------------------
+
+    #[test]
+    fn a_mask_decides_whether_the_result_is_written_at_all() {
+        // SDM volume 1 §8.5: masked means "deliver the standard response and
+        // carry on"; unmasked means "record it, leave the destination alone,
+        // and fault at the next floating-point instruction".
+        //
+        // Divide by zero is the clearest of the six: masked it produces an
+        // infinity, unmasked it produces nothing at all.
+        let divide = |control: u16| {
+            let pc = x87pc();
+            write64(&pc, fpat::DATA, u64::from(control));
+            let mut code = alloc::vec![0xdb, 0xe3, 0xd9];
+            code.extend_from_slice(&disp32(5, fpat::DATA));
+            // fldz ; fld1 ; fdiv st(0), st(1)  ->  1.0 / 0.0
+            code.extend_from_slice(&[0xd9, 0xee, 0xd9, 0xe8, 0xd8, 0xf1, 0xf4]);
+            run(&pc, &code);
+            pc.cpu.x87()
+        };
+        let x = divide(cw::RESET);
+        assert_ne!(x.status & sw::ZE, 0, "recorded either way");
+        assert_eq!(x.status & sw::ES, 0, "masked, so nothing is pending");
+        assert_eq!(x.raw(0), F80::INFINITY, "the standard masked response");
+
+        let x = divide(cw::RESET & !cw::ZM);
+        assert_ne!(x.status & sw::ZE, 0);
+        assert_ne!(x.status & sw::ES, 0, "unmasked, so it is pending");
+        assert_ne!(x.status & sw::B, 0);
+        assert_eq!(
+            x.raw(0),
+            F80::new(0x3fff, 0x8000_0000_0000_0000),
+            "and ST(0) still holds the dividend"
+        );
+    }
+
+    #[test]
+    fn every_mask_is_separately_effective() {
+        // One case per mask bit, which is what makes this a test of the
+        // control word rather than of one instruction. Each program provokes
+        // exactly the exception its mask names and checks that unmasking it
+        // raises the summary bit.
+        let cases: [(u16, u16, &[u8]); 4] = [
+            // Invalid: the square root of a negative number.
+            (cw::IM, sw::IE, &[0xd9, 0xe8, 0xd9, 0xe0, 0xd9, 0xfa]),
+            // Zero divide: one over zero.
+            (cw::ZM, sw::ZE, &[0xd9, 0xee, 0xd9, 0xe8, 0xd8, 0xf1]),
+            // Precision: one third is not exact. `fld1 ; fld1 ;
+            // fadd st(0),st(0) ; fadd st(0),st(1)` leaves 3 over 1, and
+            // `fdivp st(1),st(0)` divides the one by the three.
+            (
+                cw::PM,
+                sw::PE,
+                &[0xd9, 0xe8, 0xd9, 0xe8, 0xd8, 0xc0, 0xd8, 0xc1, 0xde, 0xf9],
+            ),
+            // Denormal operand: the smallest subnormal double, loaded.
+            (cw::DM, sw::DE, &[]),
+        ];
+        for (mask, flag, body) in cases {
+            for unmask in [false, true] {
+                let control = if unmask { cw::RESET & !mask } else { cw::RESET };
+                let pc = x87pc();
+                write64(&pc, fpat::DATA, u64::from(control));
+                write64(&pc, fpat::DATA + 8, 1); // the smallest subnormal
+                let mut code = alloc::vec![0xdb, 0xe3, 0xd9];
+                code.extend_from_slice(&disp32(5, fpat::DATA));
+                if body.is_empty() {
+                    code.push(0xdd);
+                    code.extend_from_slice(&disp32(0, fpat::DATA + 8));
+                } else {
+                    code.extend_from_slice(body);
+                }
+                code.push(0xf4);
+                run(&pc, &code);
+                let st = pc.cpu.x87().status;
+                assert_ne!(st & flag, 0, "the flag is sticky whatever the mask");
+                assert_eq!(
+                    st & sw::ES != 0,
+                    unmask,
+                    "mask {mask:#06x}: the summary follows the mask"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unmasked_exception_faults_at_the_next_floating_point_instruction() {
+        // §8.7, and the reason `#MF` exists at all: the exception is deferred
+        // to a synchronisation point the program chose.
+        let pc = x87pc();
+        let mut sys = pc.cpu.sys();
+        // Without `CR0.NE` the exception would go to `FERR#` and IRQ 13, which
+        // this core does not model — see the module documentation.
+        sys.cr0 |= cr0::NE;
+        pc.cpu.set_sys(sys);
+        pc.idt(16, gate(0x08, 0x3800, sys_type::INT_GATE32, 0));
+        pc.write(0x3800, &[0xf4]);
+        write64(&pc, fpat::DATA, u64::from(cw::RESET & !cw::ZM));
+        let mut code = alloc::vec![0xdb, 0xe3, 0xd9];
+        code.extend_from_slice(&disp32(5, fpat::DATA));
+        code.extend_from_slice(&[0xd9, 0xee, 0xd9, 0xe8, 0xd8, 0xf1]);
+        // The dividing instruction itself completes; this `fld1` is the one
+        // that faults.
+        code.extend_from_slice(&[0xd9, 0xe8, 0xf4]);
+        run(&pc, &code);
+        assert_eq!(pc.regs().rip, HANDLED, "#MF was taken by the *next* one");
+    }
+
+    #[test]
+    fn fwait_is_the_synchronisation_point_a_program_chooses() {
+        let pc = x87pc();
+        let mut sys = pc.cpu.sys();
+        sys.cr0 |= cr0::NE;
+        pc.cpu.set_sys(sys);
+        pc.idt(16, gate(0x08, 0x3800, sys_type::INT_GATE32, 0));
+        pc.write(0x3800, &[0xf4]);
+        write64(&pc, fpat::DATA, u64::from(cw::RESET & !cw::ZM));
+        let mut code = alloc::vec![0xdb, 0xe3, 0xd9];
+        code.extend_from_slice(&disp32(5, fpat::DATA));
+        code.extend_from_slice(&[0xd9, 0xee, 0xd9, 0xe8, 0xd8, 0xf1, 0x9b, 0xf4]);
+        run(&pc, &code);
+        assert_eq!(pc.regs().rip, HANDLED, "fwait took it");
+    }
+
+    #[test]
+    fn the_no_wait_forms_run_with_an_exception_pending() {
+        // §8.3.3: `FNSTSW` is how a handler finds out what happened, so it
+        // cannot itself take the exception it is being asked about.
+        let pc = x87pc();
+        let mut sys = pc.cpu.sys();
+        sys.cr0 |= cr0::NE;
+        pc.cpu.set_sys(sys);
+        pc.idt(16, gate(0x08, 0x3800, sys_type::INT_GATE32, 0));
+        pc.write(0x3800, &[0xf4]);
+        write64(&pc, fpat::DATA, u64::from(cw::RESET & !cw::ZM));
+        let mut code = alloc::vec![0xdb, 0xe3, 0xd9];
+        code.extend_from_slice(&disp32(5, fpat::DATA));
+        code.extend_from_slice(&[0xd9, 0xee, 0xd9, 0xe8, 0xd8, 0xf1]);
+        // fnstsw ax ; fnclex ; fld1 — the first two run, the third does not
+        // fault because `FNCLEX` cleared what was pending.
+        code.extend_from_slice(&[0xdf, 0xe0, 0xdb, 0xe2, 0xd9, 0xe8, 0xf4]);
+        run(&pc, &code);
+        assert_ne!(pc.regs().rip, HANDLED, "no #MF was taken");
+        assert_ne!(
+            (pc.regs().rax as u16) & sw::ES,
+            0,
+            "and FNSTSW saw the pending exception before FNCLEX removed it"
+        );
+    }
+
+    #[test]
+    fn an_escape_with_cr0_em_or_ts_set_is_a_device_not_available_fault() {
+        for bit in [cr0::EM, cr0::TS] {
+            let pc = x87pc();
+            let mut sys = pc.cpu.sys();
+            sys.cr0 |= bit;
+            pc.cpu.set_sys(sys);
+            pc.idt(7, gate(0x08, 0x3800, sys_type::INT_GATE32, 0));
+            pc.write(0x3800, &[0xf4]);
+            run(&pc, &[0xd9, 0xe8, 0xf4]);
+            assert_eq!(pc.regs().rip, HANDLED, "#NM with CR0 bit {bit:#x}");
+        }
+    }
+
+    #[test]
+    fn a_part_with_no_unit_is_a_coprocessor_socket_with_nothing_in_it() {
+        // A 486SX, which is a 486 with one `Features` bit clear. An escape
+        // there is not an invalid opcode and not a fault: the processor drives
+        // the bus cycle a coprocessor would have answered, and nothing does.
+        // That is what an 80386 with an empty 80387 socket does, and it is
+        // what the hardware corpus measures on the 386 map.
+        let pc = Pc::with_features(Variant::I80486, Features::I80486SX);
+        pc.start_protected();
+        pc.idt(7, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        run(&pc, &[0xd9, 0xe8, 0xf4]);
+        assert_eq!(pc.regs().rip, at::CODE0 + 3, "the escape did nothing");
+        assert_eq!(
+            pc.cpu.x87(),
+            crate::cpu::x86::fpu::X87::new(),
+            "and left no state"
+        );
+
+        // `CR0.EM` is how software on such a part asks to be told: with it set
+        // the escape becomes `#NM` and an emulator library takes over.
+        let pc = Pc::with_features(Variant::I80486, Features::I80486SX);
+        pc.start_protected();
+        let mut sys = pc.cpu.sys();
+        sys.cr0 |= cr0::EM;
+        pc.cpu.set_sys(sys);
+        pc.idt(7, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        run(&pc, &[0xd9, 0xe8, 0xf4]);
+        assert_eq!(pc.regs().rip, HANDLED, "#NM with CR0.EM set");
+    }
+
+    // -- The environment and the save areas ----------------------------
+
+    #[test]
+    fn fnstenv_writes_the_three_words_and_masks_everything() {
+        // SDM volume 2, `FSTENV`: the control, status and tag words come out
+        // and every exception is masked afterwards, which is what makes it the
+        // first instruction of a handler.
+        let pc = x87pc();
+        write64(&pc, fpat::DATA, u64::from(cw::RESET & !cw::ZM));
+        let mut code = alloc::vec![0xdb, 0xe3, 0xd9];
+        code.extend_from_slice(&disp32(5, fpat::DATA));
+        code.extend_from_slice(&[0xd9, 0xe8, 0xd9]); // fld1 ; fnstenv
+        code.extend_from_slice(&disp32(6, fpat::OUT));
+        code.push(0xf4);
+        run(&pc, &code);
+        let word = |n: u64| (read64(&pc, fpat::OUT + n * 4) & 0xffff) as u16;
+        assert_eq!(word(0), cw::RESET & !cw::ZM, "the control word");
+        assert_eq!(
+            word(1) & sw::TOP,
+            7 << sw::TOP_SHIFT,
+            "TOP is in the status"
+        );
+        assert_eq!(word(2), 0x3fff, "one register occupied, seven empty");
+        assert_eq!(
+            pc.cpu.x87().control & cw::MASKS,
+            cw::MASKS,
+            "and everything is masked now"
+        );
+    }
+
+    #[test]
+    fn fnsave_and_frstor_round_trip_the_whole_unit() {
+        let pc = x87pc();
+        write64(&pc, fpat::DATA, 0x400e_0000_0000_0000); // 3.75
+        let mut code = alloc::vec![0xdb, 0xe3, 0xdd];
+        code.extend_from_slice(&disp32(0, fpat::DATA));
+        code.extend_from_slice(&[0xd9, 0xe8, 0xdd]); // fld1 ; fnsave
+        code.extend_from_slice(&disp32(6, fpat::SAVE));
+        code.push(0xdd); // frstor
+        code.extend_from_slice(&disp32(4, fpat::SAVE));
+        code.push(0xf4);
+        run(&pc, &code);
+        let x = pc.cpu.x87();
+        assert_eq!(x.top(), 6);
+        assert_eq!(x.raw(0), F80::new(0x3fff, 0x8000_0000_0000_0000));
+        assert_eq!(x.raw(1), F80::new(0x4000, 0xf000_0000_0000_0000), "3.75");
+        assert_eq!(x.tag_at(x.phys(2)), Tag::Empty);
+    }
+
+    // -- SSE -----------------------------------------------------------
+
+    #[test]
+    fn a_scalar_double_add_produces_the_exact_sum() {
+        let pc = ssepc();
+        write64(&pc, fpat::DATA, 0x3ff8_0000_0000_0000); // 1.5
+        write64(&pc, fpat::DATA + 8, 0x4002_0000_0000_0000); // 2.25
+        let mut code = alloc::vec![0xf2, 0x0f, 0x10]; // movsd xmm0, [DATA]
+        code.extend_from_slice(&disp32(0, fpat::DATA));
+        code.extend_from_slice(&[0xf2, 0x0f, 0x10]); // movsd xmm1, [DATA+8]
+        code.extend_from_slice(&disp32(1, fpat::DATA + 8));
+        code.extend_from_slice(&[0xf2, 0x0f, 0x58, 0xc1]); // addsd xmm0, xmm1
+        code.extend_from_slice(&[0xf2, 0x0f, 0x11]); // movsd [OUT], xmm0
+        code.extend_from_slice(&disp32(0, fpat::OUT));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(read64(&pc, fpat::OUT), 0x400e_0000_0000_0000, "3.75");
+        assert_eq!(pc.cpu.sse().mxcsr & mxcsr::EXCEPTIONS, 0);
+    }
+
+    #[test]
+    fn a_load_zeroes_the_lanes_above_a_scalar_and_a_register_move_does_not() {
+        // SDM volume 2, `MOVSD`: the two encodings of one mnemonic differ in
+        // exactly this, and code that packs two doubles in a register depends
+        // on it.
+        let pc = ssepc();
+        write64(&pc, fpat::DATA, 0x1111_1111_1111_1111);
+        let mut sse = Sse::new();
+        sse.set(0, [0x2222_2222_2222_2222, 0x3333_3333_3333_3333]);
+        sse.set(1, [0x4444_4444_4444_4444, 0x5555_5555_5555_5555]);
+        pc.cpu.set_sse(sse);
+        let mut code = alloc::vec![0xf2, 0x0f, 0x10];
+        code.extend_from_slice(&disp32(0, fpat::DATA));
+        code.extend_from_slice(&[0xf2, 0x0f, 0x10, 0xd1, 0xf4]); // movsd xmm2, xmm1
+        run(&pc, &code);
+        let sse = pc.cpu.sse();
+        assert_eq!(sse.get(0), [0x1111_1111_1111_1111, 0], "the load zeroed");
+        assert_eq!(sse.get(2)[0], 0x4444_4444_4444_4444);
+        assert_eq!(sse.get(2)[1], 0, "xmm2 kept its own upper half");
+    }
+
+    #[test]
+    fn an_aligned_move_refuses_a_misaligned_address() {
+        // SDM volume 2, `MOVAPS`: `#GP(0)`, not a slow access. The unaligned
+        // form exists so that the aligned one can be a checked assertion.
+        let pc = ssepc();
+        pc.idt(13, gate(0x08, 0x3800, sys_type::INT_GATE32, 0));
+        pc.write(0x3800, &[0xf4]);
+        let mut code = alloc::vec![0x0f, 0x28];
+        code.extend_from_slice(&disp32(0, fpat::ODD));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(pc.regs().rip, HANDLED, "#GP on a misaligned MOVAPS");
+
+        // The unaligned form at the same address is fine.
+        let pc = ssepc();
+        let mut code = alloc::vec![0x0f, 0x10];
+        code.extend_from_slice(&disp32(0, fpat::ODD));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(
+            pc.regs().rip,
+            at::CODE0 + code.len() as u64,
+            "the unaligned form completed and the hlt retired"
+        );
+    }
+
+    #[test]
+    fn sse_needs_cr4_osfxsr_and_says_so_with_an_invalid_opcode() {
+        // *Intel SDM* volume 3 table 2-2: without the operating system's
+        // promise that it can save the state, the instruction does not exist.
+        let pc = Pc::new(Variant::X86_64);
+        pc.start_protected();
+        pc.idt(6, gate(0x08, 0x3800, sys_type::INT_GATE32, 0));
+        pc.write(0x3800, &[0xf4]);
+        run(&pc, &[0x0f, 0x57, 0xc0, 0xf4]); // xorps xmm0, xmm0
+        assert_eq!(pc.regs().rip, HANDLED, "#UD with CR4.OSFXSR clear");
+    }
+
+    #[test]
+    fn cr0_em_makes_sse_invalid_rather_than_trappable() {
+        // The asymmetry with x87: `CR0.EM` means "emulate the 387" and there
+        // has never been an emulation protocol for SSE, so the answer is `#UD`
+        // and not `#NM` (SDM volume 1 §11.5.1).
+        let pc = ssepc();
+        let mut sys = pc.cpu.sys();
+        sys.cr0 |= cr0::EM;
+        pc.cpu.set_sys(sys);
+        pc.idt(6, gate(0x08, 0x3800, sys_type::INT_GATE32, 0));
+        pc.idt(7, gate(0x08, 0x3900, sys_type::INT_GATE32, 0));
+        pc.write(0x3800, &[0xf4]);
+        pc.write(0x3900, &[0xf4]);
+        run(&pc, &[0x0f, 0x57, 0xc0, 0xf4]);
+        assert_eq!(pc.regs().rip, HANDLED, "#UD, not #NM");
+    }
+
+    #[test]
+    fn mxcsr_rounding_reaches_the_arithmetic() {
+        // The point of `float::Env`: `MXCSR.RC` is not a second rounding
+        // implementation, it is the same parameter the x87 control word sets.
+        let divide = |rc: u32| {
+            let pc = ssepc();
+            write64(&pc, fpat::DATA, u64::from(mxcsr::RESET | rc));
+            write64(&pc, fpat::DATA + 8, 0x3ff0_0000_0000_0000); // 1.0
+            write64(&pc, fpat::DATA + 16, 0x4008_0000_0000_0000); // 3.0
+            let mut code = alloc::vec![0x0f, 0xae];
+            code.extend_from_slice(&disp32(2, fpat::DATA)); // ldmxcsr
+            code.extend_from_slice(&[0xf2, 0x0f, 0x10]);
+            code.extend_from_slice(&disp32(0, fpat::DATA + 8));
+            code.extend_from_slice(&[0xf2, 0x0f, 0x10]);
+            code.extend_from_slice(&disp32(1, fpat::DATA + 16));
+            code.extend_from_slice(&[0xf2, 0x0f, 0x5e, 0xc1]); // divsd xmm0, xmm1
+            code.extend_from_slice(&[0xf2, 0x0f, 0x11]);
+            code.extend_from_slice(&disp32(0, fpat::OUT));
+            code.push(0xf4);
+            run(&pc, &code);
+            read64(&pc, fpat::OUT)
+        };
+        assert_eq!(divide(0), 0x3fd5_5555_5555_5555, "1/3, to nearest");
+        assert_eq!(
+            divide(3 << mxcsr::RC_SHIFT),
+            0x3fd5_5555_5555_5555,
+            "toward zero rounds the same way for this value"
+        );
+        // Toward positive infinity is the direction that differs.
+        assert_eq!(divide(2 << mxcsr::RC_SHIFT), 0x3fd5_5555_5555_5556);
+    }
+
+    #[test]
+    fn ldmxcsr_refuses_a_reserved_bit() {
+        // A guest probes for a future extension by setting a reserved bit and
+        // seeing whether the write is taken; accepting one would answer yes.
+        let pc = ssepc();
+        pc.idt(13, gate(0x08, 0x3800, sys_type::INT_GATE32, 0));
+        pc.write(0x3800, &[0xf4]);
+        write64(&pc, fpat::DATA, 0x0001_0000);
+        let mut code = alloc::vec![0x0f, 0xae];
+        code.extend_from_slice(&disp32(2, fpat::DATA));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(pc.regs().rip, HANDLED);
+    }
+
+    #[test]
+    fn the_conversions_move_between_the_integer_and_the_simd_files() {
+        let pc = ssepc();
+        let mut code = alloc::vec![0xb8]; // mov eax, -7
+        code.extend_from_slice(&(-7i32).to_le_bytes());
+        code.extend_from_slice(&[0xf2, 0x0f, 0x2a, 0xc0]); // cvtsi2sd xmm0, eax
+        code.extend_from_slice(&[0xf2, 0x0f, 0x11]);
+        code.extend_from_slice(&disp32(0, fpat::OUT));
+        code.extend_from_slice(&[0xf2, 0x0f, 0x2c, 0xd8]); // cvttsd2si ebx, xmm0
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(read64(&pc, fpat::OUT), 0xc01c_0000_0000_0000, "-7.0");
+        assert_eq!(pc.regs().rbx as i32, -7, "and back again");
+    }
+
+    #[test]
+    fn ucomisd_writes_the_flags_and_comisd_signals_on_a_quiet_nan() {
+        let compare = |op: u8, b: u64| {
+            let pc = ssepc();
+            write64(&pc, fpat::DATA, 0x3ff0_0000_0000_0000); // 1.0
+            write64(&pc, fpat::DATA + 8, b);
+            let mut code = alloc::vec![0xf2, 0x0f, 0x10];
+            code.extend_from_slice(&disp32(0, fpat::DATA));
+            code.extend_from_slice(&[0xf2, 0x0f, 0x10]);
+            code.extend_from_slice(&disp32(1, fpat::DATA + 8));
+            code.extend_from_slice(&[0x66, 0x0f, op, 0xc1, 0xf4]);
+            run(&pc, &code);
+            (pc.regs().eflags, pc.cpu.sse().mxcsr)
+        };
+        let (e, _) = compare(0x2e, 0x4000_0000_0000_0000);
+        assert_ne!(e & flags::CF, 0, "1 < 2");
+        let (e, _) = compare(0x2e, 0x3ff0_0000_0000_0000);
+        assert_ne!(e & flags::ZF, 0, "equal");
+        assert_eq!(e & (flags::CF | flags::PF), 0);
+        let (e, m) = compare(0x2e, 0x7ff8_0000_0000_0000);
+        assert_eq!(
+            e & (flags::ZF | flags::PF | flags::CF),
+            flags::ZF | flags::PF | flags::CF,
+            "unordered"
+        );
+        assert_eq!(m & mxcsr::IE, 0, "UCOMISD is quiet about a quiet NaN");
+        let (_, m) = compare(0x2f, 0x7ff8_0000_0000_0000);
+        assert_ne!(m & mxcsr::IE, 0, "COMISD is not");
+    }
+
+    #[test]
+    fn movmskps_gathers_the_four_sign_bits() {
+        let pc = ssepc();
+        let mut sse = Sse::new();
+        // Lanes 0 and 3 negative, 1 and 2 positive.
+        sse.set(1, [0x0000_0000_8000_0000, 0x8000_0000_0000_0000]);
+        pc.cpu.set_sse(sse);
+        run(&pc, &[0x0f, 0x50, 0xc1, 0xf4]); // movmskps eax, xmm1
+        assert_eq!(pc.regs().rax, 0b1001);
+    }
+
+    #[test]
+    fn the_bitwise_operations_cover_the_whole_register() {
+        let pc = ssepc();
+        let mut sse = Sse::new();
+        sse.set(0, [u64::MAX, 0x0f0f_0f0f_0f0f_0f0f]);
+        sse.set(1, [0x00ff_00ff_00ff_00ff, u64::MAX]);
+        pc.cpu.set_sse(sse);
+        run(&pc, &[0x0f, 0x54, 0xc1, 0x0f, 0x57, 0xd2, 0xf4]); // andps ; xorps
+        let sse = pc.cpu.sse();
+        assert_eq!(sse.get(0), [0x00ff_00ff_00ff_00ff, 0x0f0f_0f0f_0f0f_0f0f]);
+        assert_eq!(
+            sse.get(2),
+            [0, 0],
+            "xorps with itself is the idiomatic zero"
+        );
+    }
+
+    #[test]
+    fn a_packed_add_touches_all_four_lanes() {
+        let pc = ssepc();
+        let mut sse = Sse::new();
+        // 1.0f in every lane, and 2.0f in every lane.
+        sse.set(0, [0x3f80_0000_3f80_0000, 0x3f80_0000_3f80_0000]);
+        sse.set(1, [0x4000_0000_4000_0000, 0x4000_0000_4000_0000]);
+        pc.cpu.set_sse(sse);
+        run(&pc, &[0x0f, 0x58, 0xc1, 0xf4]); // addps xmm0, xmm1
+        assert_eq!(
+            pc.cpu.sse().get(0),
+            [0x4040_0000_4040_0000, 0x4040_0000_4040_0000],
+            "3.0f in all four"
+        );
+    }
+
+    #[test]
+    fn shufps_selects_two_lanes_from_each_source() {
+        let pc = ssepc();
+        let mut sse = Sse::new();
+        sse.set(0, [0x0000_0001_0000_0000, 0x0000_0003_0000_0002]);
+        sse.set(1, [0x0000_0011_0000_0010, 0x0000_0013_0000_0012]);
+        pc.cpu.set_sse(sse);
+        // shufps xmm0, xmm1, 0b11_01_10_00 — lanes 0 and 2 of the destination,
+        // then lanes 1 and 3 of the source.
+        run(&pc, &[0x0f, 0xc6, 0xc1, 0b1101_1000, 0xf4]);
+        assert_eq!(
+            pc.cpu.sse().get(0),
+            [0x0000_0002_0000_0000, 0x0000_0013_0000_0011]
+        );
+    }
+
+    #[test]
+    fn fxsave_and_fxrstor_carry_both_register_files() {
+        let pc = ssepc();
+        let mut sse = Sse::new();
+        sse.set(3, [0xdead_beef_cafe_babe, 0x0123_4567_89ab_cdef]);
+        sse.mxcsr = mxcsr::RESET | mxcsr::FTZ;
+        pc.cpu.set_sse(sse);
+        let mut code = alloc::vec![0xdb, 0xe3, 0xd9, 0xe8, 0x0f, 0xae];
+        code.extend_from_slice(&disp32(0, fpat::SAVE)); // fxsave
+        // Scribble over both files, then restore.
+        code.extend_from_slice(&[0xdb, 0xe3, 0x0f, 0x57, 0xdb, 0x0f, 0xae]);
+        code.extend_from_slice(&disp32(1, fpat::SAVE)); // fxrstor
+        code.push(0xf4);
+        run(&pc, &code);
+        let x = pc.cpu.x87();
+        assert_eq!(x.top(), 7, "TOP came back");
+        assert_eq!(x.raw(0), F80::new(0x3fff, 0x8000_0000_0000_0000));
+        assert_eq!(x.tag_at(x.phys(1)), Tag::Empty, "and so did the tag word");
+        let sse = pc.cpu.sse();
+        assert_eq!(sse.get(3), [0xdead_beef_cafe_babe, 0x0123_4567_89ab_cdef]);
+        assert_eq!(sse.mxcsr, mxcsr::RESET | mxcsr::FTZ);
+    }
+
+    #[test]
+    fn an_unmasked_simd_exception_leaves_its_cause_in_mxcsr() {
+        // `#XM` carries no error code, so the flag is the only channel the
+        // handler has (SDM volume 1 §11.5.3). This performs the classification
+        // a real handler does: unmasked flags that are set.
+        let pc = ssepc();
+        pc.idt(19, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        write64(&pc, fpat::DATA, u64::from(mxcsr::RESET & !mxcsr::ZM));
+        write64(&pc, fpat::DATA + 8, 0x3ff0_0000_0000_0000); // 1.0
+        write64(&pc, fpat::DATA + 16, 0); // 0.0
+        let mut code = alloc::vec![0x0f, 0xae];
+        code.extend_from_slice(&disp32(2, fpat::DATA)); // ldmxcsr
+        code.extend_from_slice(&[0xf2, 0x0f, 0x10]);
+        code.extend_from_slice(&disp32(0, fpat::DATA + 8));
+        code.extend_from_slice(&[0xf2, 0x0f, 0x10]);
+        code.extend_from_slice(&disp32(1, fpat::DATA + 16));
+        code.extend_from_slice(&[0xf2, 0x0f, 0x5e, 0xc1]); // divsd xmm0, xmm1
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(pc.regs().rip, HANDLED, "#XM was taken");
+        let m = pc.cpu.sse().mxcsr;
+        assert_ne!(m & mxcsr::ZE, 0, "and said which exception it was");
+        let cause = (!m >> mxcsr::MASK_SHIFT) & m & mxcsr::EXCEPTIONS;
+        assert_eq!(cause, mxcsr::ZE, "a handler can classify the trap");
+        // The destination is untouched: the handler sees the operands.
+        assert_eq!(pc.cpu.sse().get(0), [0x3ff0_0000_0000_0000, 0]);
+    }
+
+    #[test]
+    fn without_osxmmexcpt_an_unmasked_exception_is_an_invalid_opcode() {
+        // The operating system unmasked an exception and gave the processor
+        // nowhere to deliver it, which the architecture answers loudly.
+        let pc = ssepc();
+        let mut sys = pc.cpu.sys();
+        sys.cr4 &= !cr4::OSXMMEXCPT;
+        pc.cpu.set_sys(sys);
+        pc.idt(6, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        write64(&pc, fpat::DATA, u64::from(mxcsr::RESET & !mxcsr::ZM));
+        write64(&pc, fpat::DATA + 8, 0x3ff0_0000_0000_0000);
+        write64(&pc, fpat::DATA + 16, 0);
+        let mut code = alloc::vec![0x0f, 0xae];
+        code.extend_from_slice(&disp32(2, fpat::DATA));
+        code.extend_from_slice(&[0xf2, 0x0f, 0x10]);
+        code.extend_from_slice(&disp32(0, fpat::DATA + 8));
+        code.extend_from_slice(&[0xf2, 0x0f, 0x10]);
+        code.extend_from_slice(&disp32(1, fpat::DATA + 16));
+        code.extend_from_slice(&[0xf2, 0x0f, 0x5e, 0xc1]);
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(pc.regs().rip, HANDLED, "#UD, not #XM");
+    }
+
+    #[test]
+    fn denormals_are_zeros_reaches_the_comparisons_too() {
+        // A comparison never goes through the arithmetic kernel, so `#D` and
+        // `DAZ` have to be applied on its own path — and with `DAZ` set a
+        // subnormal must compare *equal* to zero, not merely close to it.
+        let compare = |daz: bool| {
+            let pc = ssepc();
+            let value = if daz {
+                mxcsr::RESET | mxcsr::DAZ
+            } else {
+                mxcsr::RESET
+            };
+            write64(&pc, fpat::DATA, u64::from(value));
+            write64(&pc, fpat::DATA + 8, 1); // the smallest subnormal double
+            write64(&pc, fpat::DATA + 16, 0); // +0.0
+            let mut code = alloc::vec![0x0f, 0xae];
+            code.extend_from_slice(&disp32(2, fpat::DATA));
+            code.extend_from_slice(&[0xf2, 0x0f, 0x10]);
+            code.extend_from_slice(&disp32(0, fpat::DATA + 8));
+            code.extend_from_slice(&[0xf2, 0x0f, 0x10]);
+            code.extend_from_slice(&disp32(1, fpat::DATA + 16));
+            code.extend_from_slice(&[0x66, 0x0f, 0x2e, 0xc1, 0xf4]); // ucomisd
+            run(&pc, &code);
+            (pc.regs().eflags, pc.cpu.sse().mxcsr)
+        };
+        let (e, m) = compare(false);
+        assert_eq!(e & flags::ZF, 0, "a subnormal is not zero");
+        assert_ne!(m & mxcsr::DE, 0, "and it is reported");
+        let (e, m) = compare(true);
+        assert_ne!(e & flags::ZF, 0, "with DAZ it is a zero");
+        assert_eq!(m & mxcsr::DE, 0, "and DAZ suppresses the report");
+    }
+
+    #[test]
+    fn the_store_halves_of_movlps_and_movhps_have_no_register_form() {
+        // `0F 12`/`0F 16` become `MOVHLPS`/`MOVLHPS` with a register operand;
+        // `0F 13`/`0F 17` have no register encoding at all, and quietly
+        // writing half an XMM register there would be an instruction the
+        // architecture does not have.
+        let pc = ssepc();
+        pc.idt(6, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        run(&pc, &[0x0f, 0x13, 0xc1, 0xf4]);
+        assert_eq!(pc.regs().rip, HANDLED, "#UD");
+
+        // The load direction at the same mode field is `MOVHLPS`, and works.
+        let pc = ssepc();
+        let mut sse = Sse::new();
+        sse.set(1, [0x1111_1111_1111_1111, 0x2222_2222_2222_2222]);
+        pc.cpu.set_sse(sse);
+        run(&pc, &[0x0f, 0x12, 0xc1, 0xf4]);
+        assert_eq!(pc.cpu.sse().get(0)[0], 0x2222_2222_2222_2222);
+    }
+
+    #[test]
+    fn a_control_instruction_does_not_move_the_data_pointer() {
+        // SDM volume 1 §8.1.8. An exception handler's first act is `FNSTENV`,
+        // and the `FDP` field it reads has to name the operand that faulted —
+        // if the save itself updated the pointer, the field would name the
+        // save area and be useless.
+        let pc = x87pc();
+        write64(&pc, fpat::DATA, 0x3ff0_0000_0000_0000);
+        let mut code = alloc::vec![0xdb, 0xe3, 0xdd];
+        code.extend_from_slice(&disp32(0, fpat::DATA));
+        code.push(0xd9);
+        code.extend_from_slice(&disp32(6, fpat::OUT));
+        code.push(0xf4);
+        run(&pc, &code);
+        let dword = |n: u64| read64(&pc, fpat::OUT + n * 4) & 0xffff_ffff;
+        assert_eq!(dword(5), fpat::DATA, "FDP names the FLD's operand");
+        assert_eq!(pc.cpu.x87().last_dp, fpat::DATA);
+
+        // And `FLDCW` leaves both pointers alone as well.
+        let pc = x87pc();
+        write64(&pc, fpat::DATA, 0x3ff0_0000_0000_0000);
+        write64(&pc, fpat::DATA + 24, u64::from(cw::RESET));
+        let mut code = alloc::vec![0xdb, 0xe3, 0xdd];
+        code.extend_from_slice(&disp32(0, fpat::DATA));
+        code.push(0xd9);
+        code.extend_from_slice(&disp32(5, fpat::DATA + 24));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(pc.cpu.x87().last_dp, fpat::DATA, "FLDCW did not move it");
+    }
+
+    #[test]
+    fn a_denormal_in_a_register_tags_special_where_a_guest_can_see_it() {
+        // §8.1.7's `Special` is "invalid, infinity **or denormal**", and
+        // `FNSTENV` is where a guest reads the tag word out.
+        //
+        // The operand is an 80-bit denormal loaded with `FLD m80fp`, not a
+        // binary64 subnormal: widening one of those produces an ordinary
+        // *normal* 80-bit value, because the wider exponent range has room for
+        // it. That is the whole reason the extended format exists, and it
+        // means the only way to get a denormal into a register is to load one.
+        let pc = x87pc();
+        write64(&pc, fpat::DATA, 1); // significand 1
+        write64(&pc, fpat::DATA + 8, 0); // exponent field and sign both zero
+        let mut code = alloc::vec![0xdb, 0xe3, 0xdb];
+        code.extend_from_slice(&disp32(5, fpat::DATA)); // fld tbyte [DATA]
+        code.push(0xd9);
+        code.extend_from_slice(&disp32(6, fpat::OUT));
+        code.push(0xf4);
+        run(&pc, &code);
+        let tag = (read64(&pc, fpat::OUT + 8) & 0xffff) as u16;
+        // `ST(0)` is physical register 7, so its two bits are the top two.
+        assert_eq!(tag >> 14, 0b10, "Special, not Valid");
+        assert_eq!(pc.cpu.x87().tag_at(7), Tag::Special);
+    }
+
+    // -- CMPXCHG8B -----------------------------------------------------
+
+    #[test]
+    fn cmpxchg8b_exchanges_on_a_match_and_loads_on_a_miss() {
+        // SDM volume 2, `CMPXCHG8B`. The load-on-miss is what makes a
+        // compare-and-exchange loop terminate rather than spin.
+        let build = || {
+            let mut code = alloc::vec![0xb8];
+            code.extend_from_slice(&0x2222_2222u32.to_le_bytes()); // mov eax
+            code.push(0xba);
+            code.extend_from_slice(&0x1111_1111u32.to_le_bytes()); // mov edx
+            code.push(0xbb);
+            code.extend_from_slice(&0xdead_beefu32.to_le_bytes()); // mov ebx
+            code.push(0xb9);
+            code.extend_from_slice(&0xcafe_babeu32.to_le_bytes()); // mov ecx
+            code.extend_from_slice(&[0x0f, 0xc7]);
+            code.extend_from_slice(&disp32(1, fpat::DATA));
+            code.push(0xf4);
+            code
+        };
+        let pc = ssepc();
+        write64(&pc, fpat::DATA, 0x1111_1111_2222_2222);
+        run(&pc, &build());
+        assert_ne!(pc.regs().eflags & flags::ZF, 0, "the compare matched");
+        assert_eq!(read64(&pc, fpat::DATA), 0xcafe_babe_dead_beef);
+
+        // The same program against a value that does not match.
+        let pc = ssepc();
+        write64(&pc, fpat::DATA, 0x3333_3333_4444_4444);
+        run(&pc, &build());
+        assert_eq!(pc.regs().eflags & flags::ZF, 0, "the compare failed");
+        assert_eq!(pc.regs().rax as u32, 0x4444_4444, "and memory was loaded");
+        assert_eq!(pc.regs().rdx as u32, 0x3333_3333);
+        assert_eq!(read64(&pc, fpat::DATA), 0x3333_3333_4444_4444, "untouched");
+    }
+
+    #[test]
+    fn a_part_without_cx8_says_so_and_refuses_the_instruction() {
+        let pc = x87pc(); // a 486DX: no CMPXCHG8B
+        pc.idt(6, gate(0x08, 0x3800, sys_type::INT_GATE32, 0));
+        pc.write(0x3800, &[0xf4]);
+        let mut code = alloc::vec![0x0f, 0xc7];
+        code.extend_from_slice(&disp32(1, fpat::DATA));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(pc.regs().rip, HANDLED);
+    }
+
+    // -- CPUID ---------------------------------------------------------
+
+    #[test]
+    fn cpuid_now_reports_what_a_64_bit_operating_system_looks_for() {
+        // The five bits a 64-bit Linux checks before it will run: `FPU`,
+        // `CX8`, `FXSR`, `SSE` and `SSE2`, plus `PAE`, `MSR`, `PSE`, `PGE`,
+        // `CMOV` and `TSC` from the long-mode work.
+        let pc = Pc::new(Variant::X86_64);
+        pc.start_protected();
+        run(&pc, &[0xb8, 0x01, 0x00, 0x00, 0x00, 0x0f, 0xa2, 0xf4]);
+        let edx = pc.regs().rdx as u32;
+        for (bit, name) in [
+            (0, "FPU"),
+            (3, "PSE"),
+            (4, "TSC"),
+            (5, "MSR"),
+            (6, "PAE"),
+            (8, "CX8"),
+            (13, "PGE"),
+            (15, "CMOV"),
+            (24, "FXSR"),
+            (25, "SSE"),
+            (26, "SSE2"),
+        ] {
+            assert_ne!(edx & (1u32 << bit), 0, "leaf 1 should report {name}");
+        }
+        // And still not MMX, whose registers alias the x87 stack.
+        assert_eq!(edx & (1 << 23), 0, "MMX is not implemented");
+    }
+
+    #[test]
+    fn narrowing_the_feature_set_narrows_what_cpuid_claims() {
+        // §6.1.1's whole point: the answer follows `Features`, not the part
+        // name, so a machine description can model something that shipped.
+        let features = Features {
+            sse2: false,
+            long: false,
+            nx: false,
+            syscall: false,
+            ..Features::X86_64
+        };
+        assert!(features.validate().is_ok());
+        let pc = Pc::with_features(Variant::X86_64, features);
+        pc.start_protected();
+        run(&pc, &[0xb8, 0x01, 0x00, 0x00, 0x00, 0x0f, 0xa2, 0xf4]);
+        let edx = pc.regs().rdx as u32;
+        assert_ne!(edx & (1 << 25), 0, "SSE");
+        assert_eq!(edx & (1 << 26), 0, "but not SSE2");
+    }
+
+    #[test]
+    fn a_long_mode_part_must_have_sse2() {
+        // Not an implementation limit: the 64-bit ABI passes floating-point
+        // arguments in `XMM` registers, so a part with long mode and no SSE2
+        // is not one anybody shipped.
+        let impossible = Features {
+            sse2: false,
+            ..Features::X86_64
+        };
+        assert!(impossible.validate().is_err());
+    }
+
+    #[test]
+    fn no_host_float_reaches_a_guest_result() {
+        // `float`'s own test reads its four sources back and asserts the same
+        // thing; this is the other half of the path, because arithmetic done
+        // in software and then rounded through a host `f64` on the way to a
+        // register would be just as unreproducible (`ROADMAP.md` §9.1).
+        //
+        // Matched on identifier boundaries rather than as a substring, because
+        // `Arg::Mf32` and `Arg::Mf64` are the *operand kinds* — `m32fp` and
+        // `m64fp` in Intel's notation — and naming them is not using them.
+        let sources = [
+            ("fpu.rs", include_str!("fpu.rs")),
+            ("fpexec.rs", include_str!("fpexec.rs")),
+        ];
+        let boundary = |src: &str, at: usize| {
+            let before = src[..at].chars().next_back();
+            let after = src[at..].chars().nth(3);
+            !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+        };
+        for (name, src) in sources {
+            for (n, line) in src.lines().enumerate() {
+                let code = match line.find("//") {
+                    Some(i) => &line[..i],
+                    None => line,
+                };
+                for needle in ["f32", "f64", "f16", "sqrtf", "libm"] {
+                    let mut from = 0;
+                    while let Some(i) = code[from..].find(needle) {
+                        let at = from + i;
+                        assert!(
+                            !boundary(code, at),
+                            "{name}:{}: host floating point: {code}",
+                            n + 1
+                        );
+                        from = at + needle.len();
+                    }
+                }
+            }
+        }
+    }
+
+    // -- The snapshot --------------------------------------------------
+
+    #[test]
+    fn the_floating_point_state_survives_a_snapshot() {
+        let pc = ssepc();
+        run(
+            &pc,
+            &[0xdb, 0xe3, 0xd9, 0xe8, 0xd9, 0xeb, 0x0f, 0x57, 0xc0, 0xf4],
+        );
+        let mut sse = pc.cpu.sse();
+        sse.set(5, [0x1234_5678_9abc_def0, 0x0fed_cba9_8765_4321]);
+        sse.mxcsr = mxcsr::RESET | mxcsr::DAZ;
+        pc.cpu.set_sse(sse);
+
+        let x87_before = pc.cpu.x87();
+        let sse_before = pc.cpu.sse();
+
+        let mut shape = MachineShape::new();
+        shape.add_device("/cpu0", "cpu.x86").unwrap();
+        let mut writer = StateWriter::new(shape);
+        {
+            let mut chunk = writer.chunk("/cpu0", "cpu.x86", 5).unwrap();
+            pc.cpu.save(&mut chunk).unwrap();
+        }
+        let bytes = writer.to_vec().unwrap();
+
+        pc.cpu.reset(ResetKind::Cold);
+        assert_ne!(pc.cpu.x87(), x87_before, "there is something to lose");
+
+        let reader = crate::core::state::StateReader::new(&bytes).unwrap();
+        let (_, _, data) = reader.load_raw("/cpu0").unwrap();
+        let mut chunk = ChunkReader::new(data);
+        pc.cpu.load(&mut chunk).unwrap();
+        // Nothing is left over: the floating-point block is the end of the
+        // chunk, so a mismatched layout shows up here rather than silently.
+        chunk.end().unwrap();
+        assert_eq!(pc.cpu.x87(), x87_before);
+        assert_eq!(pc.cpu.sse(), sse_before);
+
+        // And a second save is byte-identical, which is what "an identical
+        // state hash" means for a chunk this shape.
+        let mut shape = MachineShape::new();
+        shape.add_device("/cpu0", "cpu.x86").unwrap();
+        let mut again = StateWriter::new(shape);
+        {
+            let mut chunk = again.chunk("/cpu0", "cpu.x86", 5).unwrap();
+            pc.cpu.save(&mut chunk).unwrap();
+        }
+        assert_eq!(bytes, again.to_vec().unwrap());
     }
 }

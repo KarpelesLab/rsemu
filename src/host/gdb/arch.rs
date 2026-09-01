@@ -511,10 +511,19 @@ static I8086_REGS: &[RegDesc] = &[
 /// after the core sixteen, and claiming the architecture without supplying it
 /// would make gdb read the wrong halves of the wrong registers. The custom
 /// feature name gives it the sixteen it can use and nothing it cannot.
+///
+/// The core's snapshot *does* now carry the x87 and `XMM` registers — chunk
+/// version 5 appended them after the long-mode block — but this map is
+/// unchanged and deliberately so: exposing them means claiming the `i386`
+/// architecture and matching gdb's exact register numbering for `st0`-`st7`,
+/// `fctrl`, `fstat`, `ftag`, `fiseg`, `fioff`, `foseg`, `fooff`, `fop` and the
+/// `XMM` block, which is a description to get right rather than three lines to
+/// add. Until then the sixteen core registers are all this offers, and the
+/// version below records that the appended block was read and considered.
 #[cfg(feature = "cpu-x86")]
 pub static I8086: Arch = Arch {
     class: &crate::cpu::x86::CLASS,
-    verified_version: 4,
+    verified_version: 5,
     feature: "org.rsemu.i386",
     architecture: None,
     regs: I8086_REGS,

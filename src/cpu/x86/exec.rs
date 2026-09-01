@@ -96,6 +96,7 @@ use alloc::vec::Vec;
 use crate::core::space::{AddressSpace, MemAttrs};
 use crate::core::value::Width;
 
+use super::fpu::{Sse, X87};
 use super::isa::{self, Arg, Bits, Fields, Op, Rep, seg};
 use super::paging::{self, Tlb};
 use super::prot::{self, Sys, cr0};
@@ -132,6 +133,14 @@ pub(super) const VEC_SS: u8 = 12;
 pub(super) const VEC_GP: u8 = 13;
 /// Type 14: page fault.
 pub(super) const VEC_PF: u8 = 14;
+/// Type 16: the x87 floating-point error.
+///
+/// Deferred, unlike every other entry in this list: the instruction that
+/// raised the exception completes, and this vector is taken by the *next*
+/// floating-point instruction or `FWAIT` (*Intel SDM* volume 1 §8.7).
+pub(super) const VEC_MF: u8 = 16;
+/// Type 19: the SIMD floating-point exception, which is not deferred.
+pub(super) const VEC_XM: u8 = 19;
 
 // ---------------------------------------------------------------------------
 // Faults
@@ -294,6 +303,11 @@ pub(super) struct State {
     pub regs: Regs,
     /// The system registers: segment caches, descriptor tables, `CR0`-`CR3`.
     pub sys: Sys,
+    /// The x87 register stack, its control, status and tag words, and the
+    /// instruction and data pointers `FNSTENV` writes.
+    pub x87: X87,
+    /// The sixteen `XMM` registers and `MXCSR`.
+    pub sse: Sse,
     /// The translation-lookaside buffer. Derived state: never serialized.
     pub tlb: Tlb,
     /// Clock cycles executed since power-on.
@@ -349,6 +363,8 @@ impl State {
         State {
             regs,
             sys,
+            x87: X87::new(),
+            sse: Sse::new(),
             tlb: Tlb::new(),
             cycles: 0,
             halted: false,
@@ -1364,9 +1380,22 @@ impl<'a> Exec<'a> {
     fn prepare_ea(&mut self, f: &Fields) {
         self.ea = None;
         let insn = f.insn;
-        let wants_memory = [insn.dst, insn.src, insn.aux]
-            .iter()
-            .any(|a| matches!(a, Arg::Eb | Arg::Ev | Arg::Ew | Arg::M | Arg::Mp | Arg::Ms));
+        // Asked of the operand kind rather than listed here, because the list
+        // was already wrong once: `Arg::Ed` — `MOVSXD`'s source — was missing,
+        // so a `movsxd rax, [rbx]` computed no address and read from `ds:0`.
+        //
+        // The x87 escapes are the exception, and they are one on purpose: the
+        // processor computes the address before it knows what the operation
+        // is, so it does so even for the `reg` values that decode to nothing.
+        // A part with no floating-point unit then performs the read anyway
+        // for a coprocessor that never answers, and the hardware corpus
+        // records that bus cycle — without this clause it would come from
+        // `ds:0`.
+        let escape = !f.two_byte && matches!(f.opcode, 0xd8..=0xdf);
+        let wants_memory = escape
+            || [insn.dst, insn.src, insn.aux]
+                .iter()
+                .any(|a| a.uses_modrm_memory());
         if let Some(m) = f.modrm
             && !m.is_register()
             && wants_memory
@@ -1486,14 +1515,19 @@ impl<'a> Exec<'a> {
         let regs = self.state.regs;
         let rex = f.has_rex();
         let value = match arg {
-            Arg::Eb | Arg::Ev | Arg::Ew | Arg::Ed => match f.modrm {
+            // `Ey` is `Ev` with its width taken from `REX.W` rather than from
+            // the effective operand size — which the caller has already
+            // resolved into `size`, because a mandatory `66` has spoken for
+            // the operand-size field and `Fields::opsize` cannot be trusted
+            // here.
+            Arg::Eb | Arg::Ev | Arg::Ew | Arg::Ed | Arg::Ey => match f.modrm {
                 Some(m) if m.is_register() => regs.read(f.rm_num(), size, rex),
                 _ => {
                     let (sr, off) = self.ea();
                     self.read_mem(sr, off, size)?
                 }
             },
-            Arg::Gb | Arg::Gv | Arg::Gw => regs.read(f.reg_num(), size, rex),
+            Arg::Gb | Arg::Gv | Arg::Gw | Arg::Gy => regs.read(f.reg_num(), size, rex),
             Arg::Rd => regs.read(f.rm_num(), self.system_reg_size(), rex),
             Arg::Cd => self.read_control(f.reg_num())?,
             Arg::Dd => self.read_debug(f.reg_num())?,
@@ -1540,14 +1574,14 @@ impl<'a> Exec<'a> {
     pub(super) fn write_arg(&mut self, f: &Fields, arg: Arg, size: u8, value: u64) -> Ex<()> {
         let rex = f.has_rex();
         match arg {
-            Arg::Eb | Arg::Ev | Arg::Ew | Arg::Ed => match f.modrm {
+            Arg::Eb | Arg::Ev | Arg::Ew | Arg::Ed | Arg::Ey => match f.modrm {
                 Some(m) if m.is_register() => self.state.regs.write(f.rm_num(), size, rex, value),
                 _ => {
                     let (sr, off) = self.ea();
                     self.write_mem(sr, off, size, value)?;
                 }
             },
-            Arg::Gb | Arg::Gv | Arg::Gw => {
+            Arg::Gb | Arg::Gv | Arg::Gw | Arg::Gy => {
                 self.state.regs.write(f.reg_num(), size, rex, value);
             }
             Arg::Rd => {
@@ -1588,6 +1622,28 @@ impl<'a> Exec<'a> {
     fn execute(&mut self, f: &Fields) -> Ex<()> {
         let insn = f.insn;
         let size = Self::width(f);
+        // A part with **no** floating-point unit answers every escape the way
+        // this core did before there was one: `#NM` with `CR0.EM` or `CR0.TS`
+        // set, and otherwise a bus cycle for a coprocessor that is not there
+        // to answer it. That is what an 80386 with an empty 80387 socket does,
+        // and it is what the hardware corpus measures — so the check is on the
+        // *opcode* rather than on the resolved operation, which for an
+        // unassigned extension is `Op::UD` and would otherwise raise `#UD` on
+        // a part that never decoded the escape in the first place.
+        if !self.cfg.features.fpu && !f.two_byte && matches!(f.opcode, 0xd8..=0xdf) {
+            return self.escape(f);
+        }
+        // The two floating-point families are dispatched ahead of the match
+        // rather than inside it: they are a hundred and sixty operations
+        // between them, every one of which needs the same gating checks first,
+        // and threading that through the integer match would put the check in
+        // a hundred and sixty places.
+        if insn.op.is_x87() {
+            return self.x87_instruction(f);
+        }
+        if insn.op.is_simd() {
+            return self.sse_instruction(f);
+        }
         match insn.op {
             Op::UD => return Err(Fault::bare(VEC_UD)),
             Op::ADD | Op::ADC | Op::SUB | Op::SBB | Op::CMP | Op::AND | Op::OR | Op::XOR => {
@@ -1847,7 +1903,16 @@ impl<'a> Exec<'a> {
                     self.state.regs.write(index, size, true, a);
                 }
             }
-            Op::WAIT | Op::LOCK | Op::REP | Op::REPNE | Op::SEG => {}
+            // `WAIT` is not a no-operation on a part with a floating-point
+            // unit: it is the synchronisation point at which a deferred `#MF`
+            // is delivered.
+            Op::WAIT => {
+                if self.cfg.features.fpu {
+                    self.fwait()?;
+                }
+            }
+            Op::LOCK | Op::REP | Op::REPNE | Op::SEG => {}
+            Op::CMPXCHG8B => self.cmpxchg8b(f)?,
             Op::HLT => {
                 if self.protected() && self.cpl() != 0 {
                     return Err(Fault::gp(0));
@@ -3153,13 +3218,18 @@ impl<'a> Exec<'a> {
     /// are assembled from [`Features`](super::Features) rather than written
     /// out as a plausible-looking constant, and the two cannot drift.
     ///
-    /// Conspicuously absent, and absent on purpose: **`FPU` (bit 0), `MMX`,
-    /// `FXSR`, `SSE` and `SSE2`**. `CR4.OSFXSR` has storage and `CR0.EM` and
-    /// `CR0.TS` behave, because an operating system reads and writes them
-    /// before it decides anything; but no floating-point or SIMD arithmetic
-    /// exists in this core, so nothing here invites a guest to use any. A
-    /// 64-bit operating system that requires SSE2 will not boot, and it will
-    /// fail at its own feature check rather than at a mystery `#UD`.
+    /// Conspicuously absent, and absent on purpose: **`MMX` (bit 23)**, whose
+    /// sixty-four-bit register file aliases the x87 stack and which nothing
+    /// here implements; **`TSC`'s companion `RDTSC`** is claimed because the
+    /// counter exists, but no performance-monitoring leaf is; and every bit
+    /// above leaf 1, which is why leaf 0 reports a maximum of one.
+    ///
+    /// `FPU`, `FXSR`, `SSE`, `SSE2` and `CX8` **are** reported now, and each
+    /// is reported because the instructions behind it execute. They follow
+    /// [`Features`](super::Features) rather than the variant, so an instance
+    /// configured as a 486SX answers `FPU` clear and one configured without
+    /// `sse2` answers a 64-bit Linux honestly enough for it to refuse to boot
+    /// rather than to fault later.
     ///
     /// *Intel SDM* volume 2, `CPUID`; the extended leaves and the `LM` bit are
     /// from the *AMD64 Architecture Programmer's Manual* volume 3, `CPUID`.
@@ -3186,14 +3256,21 @@ impl<'a> Exec<'a> {
         if features.cmov {
             edx1 |= 1 << 15; // CMOV
         }
-        if features.extras_486 {
-            edx1 |= 1 << 8; // CX8 — CMPXCHG8B is not implemented; see below
+        if features.cx8 {
+            edx1 |= 1 << 8; // CX8: CMPXCHG8B, and CMPXCHG16B in long mode
         }
-        // `CMPXCHG8B` is *not* implemented, so its bit must not be set. The
-        // line above is deliberately undone rather than deleted, because the
-        // temptation to set it is exactly what this comment is for: a 64-bit
-        // Linux checks it, and lying gets a `#UD` inside the scheduler.
-        edx1 &= !(1 << 8);
+        if features.fpu {
+            edx1 |= 1 << 0; // FPU: an on-die x87 unit
+        }
+        if features.fxsr {
+            edx1 |= 1 << 24; // FXSR: FXSAVE and FXRSTOR
+        }
+        if features.sse {
+            edx1 |= 1 << 25; // SSE
+        }
+        if features.sse2 {
+            edx1 |= 1 << 26; // SSE2
+        }
 
         let signature = self.cfg.variant.reset_signature();
         let max_basic: u32 = 1;

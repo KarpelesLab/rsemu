@@ -1285,3 +1285,199 @@ fn the_profiles_differ_where_they_are_documented_to() {
     assert_eq!(F80::SPEC.precision, 64);
     assert_eq!(F80::SPEC.min_ulp, -16445);
 }
+
+// ---------------------------------------------------------------------------
+// The four operations x87 needs that no interchange format has
+// ---------------------------------------------------------------------------
+
+/// An 80-bit value from a significand in `[1, 2)` and an unbiased exponent.
+fn e80(exp: i32, sig: u64) -> F80 {
+    F80::new((exp + 16383) as u16, sig)
+}
+
+/// `1.0`, `4.0`, and the rest of the small integers these tests use.
+const F1: F80 = F80::new(0x3fff, 0x8000_0000_0000_0000);
+const F4: F80 = F80::new(0x4001, 0x8000_0000_0000_0000);
+const F8: F80 = F80::new(0x4002, 0x8000_0000_0000_0000);
+
+#[test]
+fn rounding_to_an_integral_value_follows_the_direction_and_reports_movement() {
+    // IEEE 754-2019 §5.9's `roundToIntegralExact`, which is `FRNDINT`. The
+    // inexact flag is the "Exact" in the operation's name: it fires exactly
+    // when the value moved.
+    let x87 = Env::X87;
+    let two_and_a_half = e80(1, 0xa000_0000_0000_0000);
+    let two = e80(1, 0x8000_0000_0000_0000);
+    let three = e80(1, 0xc000_0000_0000_0000);
+
+    assert_eq!(
+        x87::round_to_integral(two_and_a_half, x87),
+        (two, Flags::INEXACT),
+        "2.5 ties to even"
+    );
+    assert_eq!(
+        x87::round_to_integral(two_and_a_half, x87.round(Round::TowardPositive)),
+        (three, Flags::INEXACT)
+    );
+    assert_eq!(
+        x87::round_to_integral(two_and_a_half, x87.round(Round::TowardZero)),
+        (two, Flags::INEXACT)
+    );
+    // An integer does not move, and nothing is reported — including at a
+    // rounding direction that would have moved a fraction.
+    assert_eq!(
+        x87::round_to_integral(F4, x87.round(Round::TowardPositive)),
+        (F4, Flags::NONE)
+    );
+    // Infinity and NaN pass through; a signaling NaN is quieted and reported.
+    assert_eq!(
+        x87::round_to_integral(F80::INFINITY, x87),
+        (F80::INFINITY, Flags::NONE)
+    );
+    let snan = F80::new(0x7fff, (1 << 63) | 1);
+    let (out, flags) = x87::round_to_integral(snan, x87);
+    assert_eq!(flags, Flags::INVALID);
+    assert_eq!(x87::classify(out), X87Class::Ieee(Category::QuietNan));
+}
+
+#[test]
+fn scaling_moves_the_exponent_and_saturates_at_both_ends() {
+    // `FSCALE`. Adding to the exponent is exact where multiplying by a
+    // computed `2^n` would overflow first, which is the whole reason this is
+    // its own operation.
+    let x87 = Env::X87;
+    assert_eq!(x87::scale(F1, 3, x87), (F8, Flags::NONE));
+    assert_eq!(x87::scale(F8, -3, x87), (F1, Flags::NONE));
+    // Far past the top of the range: overflow, inexact, and an infinity.
+    let (out, flags) = x87::scale(F1, 100_000, x87);
+    assert_eq!(out, F80::INFINITY);
+    assert!(flags.contains(Flags::OVERFLOW) && flags.contains(Flags::INEXACT));
+    // And far past the bottom: underflow to a signed zero.
+    let (out, flags) = x87::scale(F1, -100_000, x87);
+    assert_eq!(out, F80::ZERO);
+    assert!(flags.contains(Flags::UNDERFLOW));
+    // A zero and an infinity are unchanged whatever the scale.
+    assert_eq!(x87::scale(F80::ZERO, 50, x87), (F80::ZERO, Flags::NONE));
+    assert_eq!(
+        x87::scale(F80::INFINITY, -50, x87),
+        (F80::INFINITY, Flags::NONE)
+    );
+}
+
+#[test]
+fn extract_splits_a_value_into_a_pair_that_multiplies_back() {
+    // `FXTRACT`. The significand comes back in `[1, 2)` with the original
+    // sign, so `exponent` and `significand` reproduce the input exactly.
+    let x87 = Env::X87;
+    let twelve = e80(3, 0xc000_0000_0000_0000);
+    let (exp, sig, flags) = x87::extract(twelve, x87);
+    assert_eq!(flags, Flags::NONE);
+    assert_eq!(exp, e80(1, 0xc000_0000_0000_0000), "3.0");
+    assert_eq!(sig, e80(0, 0xc000_0000_0000_0000), "1.5");
+    assert_eq!(
+        x87::mul(exp_of_two(exp), sig, Precision::Extended, x87).0,
+        twelve
+    );
+
+    // A subnormal normalises, which is why its exponent comes out below the
+    // format's own minimum rather than clamped to it.
+    let subnormal = F80::new(0, 1);
+    let (exp, sig, _) = x87::extract(subnormal, x87);
+    assert_eq!(sig, e80(0, 0x8000_0000_0000_0000), "1.0");
+    assert_eq!(x87::to_signed(exp, 32, x87).0, -16445);
+
+    // A zero has no exponent at all: the manual's answer is minus infinity and
+    // the zero-divide exception, which is the one place x87 raises `#Z` for
+    // something that is not a division.
+    let (exp, sig, flags) = x87::extract(F80::ZERO, x87);
+    assert_eq!(flags, Flags::DIV_BY_ZERO);
+    assert_eq!(sig, F80::ZERO);
+    assert_eq!(
+        x87::classify(exp),
+        X87Class::Ieee(Category::NegativeInfinity)
+    );
+}
+
+/// `2^n` for an exponent `FXTRACT` produced, so a test can multiply back.
+fn exp_of_two(exp: F80) -> F80 {
+    let (n, _) = x87::to_signed(exp, 32, Env::X87);
+    x87::scale(F80::new(0x3fff, 1 << 63), n, Env::X87).0
+}
+
+#[test]
+fn the_two_remainders_differ_in_how_they_round_the_quotient() {
+    // `FPREM` truncates the implied quotient and `FPREM1` rounds it to
+    // nearest-even, so `7 mod 4` is 3 one way and -1 the other. Both are
+    // exact: the result is a difference of two representable values that is
+    // itself representable.
+    let x87 = Env::X87;
+    let seven = e80(2, 0xe000_0000_0000_0000);
+    let three = e80(1, 0xc000_0000_0000_0000);
+    let minus_one = F80::new(0xbfff, 0x8000_0000_0000_0000);
+
+    let r = x87::remainder(seven, F4, false, x87);
+    assert_eq!(r.value, three);
+    assert_eq!(r.flags, Flags::NONE);
+    assert!(!r.incomplete);
+    assert_eq!(r.quotient, 1, "trunc(7/4) = 1");
+
+    let r = x87::remainder(seven, F4, true, x87);
+    assert_eq!(r.value, minus_one, "nearest(7/4) is 2, so 7 - 8");
+    assert_eq!(r.quotient, 2);
+
+    // The dividend is its own remainder when it is smaller than the divisor.
+    let r = x87::remainder(F1, F4, false, x87);
+    assert_eq!(r.value, F1);
+    assert_eq!(r.quotient, 0);
+    // …but not under the IEEE rule when it is more than half of it: 3 mod 4
+    // is -1, because the nearest quotient is one rather than zero.
+    let r = x87::remainder(three, F4, true, x87);
+    assert_eq!(r.value, minus_one);
+
+    // More than 63 binades apart: the reduction is partial and says so, which
+    // is what makes `FPREM` a loop rather than an instruction.
+    let huge = e80(4000, 0x8000_0000_0000_0000);
+    let r = x87::remainder(huge, F80::new(0x3fff, 0x8000_0000_0000_0001), false, x87);
+    assert!(r.incomplete, "63 binades at a time");
+
+    // The three cases with no remainder at all.
+    let r = x87::remainder(F80::INFINITY, F4, false, x87);
+    assert_eq!(r.flags, Flags::INVALID);
+    assert_eq!(r.value, F80::INDEFINITE);
+    let r = x87::remainder(F4, F80::ZERO, false, x87);
+    assert_eq!(r.flags, Flags::INVALID);
+    // An infinite divisor leaves the dividend alone.
+    let r = x87::remainder(F4, F80::INFINITY, false, x87);
+    assert_eq!(r.value, F4);
+    assert_eq!(r.flags, Flags::NONE);
+}
+
+#[test]
+fn a_complete_remainder_is_always_exact() {
+    // Sweep a range of exponent differences and check that nothing ever
+    // reports inexact and that `a - q*b` really is what came back. The
+    // property is what makes `FPREM` usable for argument reduction at all.
+    let x87 = Env::X87;
+    for ea in -3..40i32 {
+        for sa in [0x8000_0000_0000_0000u64, 0xc000_0000_0000_0001, u64::MAX] {
+            let a = e80(ea, sa);
+            let b = e80(0, 0xb000_0000_0000_0003);
+            let r = x87::remainder(a, b, false, x87);
+            assert!(!r.flags.contains(Flags::INEXACT), "ea={ea} sa={sa:#x}");
+            if r.incomplete {
+                continue;
+            }
+            // |remainder| < |divisor|, and it has the dividend's sign.
+            assert_ne!(
+                x87::compare(r.value, F80::ZERO),
+                Some(core::cmp::Ordering::Less),
+                "the remainder has the dividend's sign"
+            );
+            assert_eq!(
+                x87::compare(r.value, b),
+                Some(core::cmp::Ordering::Less),
+                "ea={ea}"
+            );
+        }
+    }
+}
