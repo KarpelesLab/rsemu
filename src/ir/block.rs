@@ -315,6 +315,46 @@ impl BlockBuilder {
         self.push(Opcode::EXIT_TB, Type::I64, None, None, &[], None, None, 0);
     }
 
+    /// Append an instruction with every field spelled out, yielding its index.
+    ///
+    /// The escape hatch for the ops the typed helpers above do not cover: the
+    /// bitfield ops, the atomics, `call_helper`, `brcond` and the two computed
+    /// terminators all carry their payload in `imm` or `aux`, which no
+    /// two-operand helper can pass. A frontend reaches for the typed helper
+    /// where one exists and this where one does not, rather than growing a
+    /// method per opcode before there is a frontend to say what the ergonomic
+    /// shape is.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_raw(
+        &mut self,
+        op: Opcode,
+        ty: Type,
+        dst: Option<Temp>,
+        dst2: Option<Temp>,
+        srcs: &[Temp],
+        imm: Option<Const>,
+        cond: Option<Cond>,
+        aux: u32,
+    ) -> usize {
+        self.push(op, ty, dst, dst2, srcs, imm, cond, aux)
+    }
+
+    /// Rewrite an already-emitted instruction's `aux` payload.
+    ///
+    /// A forward branch names an instruction that does not exist yet, so the
+    /// target is patched once it does — the "label" the `aux` field's
+    /// documentation refers to.
+    pub fn patch_aux(&mut self, inst: usize, aux: u32) {
+        self.block.insts[inst].aux = aux;
+    }
+
+    /// How many instructions have been emitted, which is the index the next
+    /// one will take — the branch target of a forward jump over what follows.
+    #[must_use]
+    pub fn next_index(&self) -> usize {
+        self.block.insts.len()
+    }
+
     /// Finish, yielding the block.
     #[must_use]
     pub fn finish(self) -> Block {

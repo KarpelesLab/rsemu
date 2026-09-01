@@ -138,17 +138,21 @@
 //!
 //! Vector ops (`v128` exists as a [`Type`] so the IR can carry the values;
 //! §9 adds the ops with the SIMD work, not before), the pass pipeline, the
-//! register allocator, and every backend. [`Type::V128`] and the float types
+//! register allocator, and every *host* backend — [`Interp`] is here, because
+//! §11's bare-metal row runs on it and it is the oracle the host backends are
+//! differentially tested against. [`Type::V128`] and the float types
 //! carry values today so that a helper call can take and return them —
 //! tier-1 floating point is helper calls into the soft-float implementation
 //! (§9.1), which is what makes guest FP bit-reproducible across hosts.
 
 mod block;
+mod interp;
 mod op;
 mod types;
 mod verify;
 
 pub use block::{Block, BlockBuilder, InsnStart, Inst, RegSlot};
+pub use interp::{Fault, Interp, IrHost, Outcome, bitfield_aux, bitfield_parts};
 pub use op::{AccessKind, Align, Cond, Endian, MemOp, MemSpace, Opcode, SegId, Sign};
 pub use types::{Const, Temp, Type};
 pub use verify::verify;
