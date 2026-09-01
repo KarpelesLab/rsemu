@@ -152,6 +152,17 @@ dev-apple1 = []
 # dependencies.
 machine-apple1 = ["cpu-mos6502", "dev-apple1"]
 
+# Software IEEE-754 arithmetic (src/float): binary32, binary64 and the x87
+# 80-bit double extended format, computed on integers and rounded once, with
+# every guest-specific rule — NaN propagation, the default NaN's sign,
+# tininess detection, flush-to-zero, the min/max and integer-conversion
+# conventions — as a parameter rather than an assumption. This is what makes a
+# guest FPU bit-reproducible across hosts and in a browser (ROADMAP.md §9.1);
+# it is what `cpu-riscv` computes `F`/`D` with, and what an x87 or a VFP will
+# use. `no_std + alloc`, no dependencies, and no `f32`/`f64` anywhere in the
+# arithmetic — a test asserts that by reading the sources back.
+float = []
+
 # The RISC-V core (src/cpu/riscv): an RV64GC interpreter — RV64I/RV32I with
 # M, A, F, D, Zicsr, Zifencei and C — plus the machine/supervisor/user
 # privileged architecture, Sv39/Sv32 paging with a software TLB, and PMP. The
@@ -159,7 +170,7 @@ machine-apple1 = ["cpu-mos6502", "dev-apple1"]
 # §9.1), so guest floating point is bit-reproducible across hosts. RV32 is a
 # construction property rather than a build flag, so one build runs both. Adds
 # no dependencies and is `no_std + alloc`.
-cpu-riscv = []
+cpu-riscv = ["float"]
 
 # The RISC-V IR frontend (src/cpu/riscv/lift.rs): lifting guest instructions
 # into `ir::Block`s — the first frontend for the translation IR, and the half

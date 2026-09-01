@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-blk", "dev-ne2000", "ir", "cpu-riscv-lift"]
+features         = ["std", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-blk", "dev-ne2000", "ir", "cpu-riscv-lift", "float"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -138,6 +138,15 @@ bench = false
 [[bin]]
 name  = "blk_image"
 path  = "fuzz_targets/blk_image.rs"
+# Soft float: the host FPU is an oracle only for nearest-even arithmetic with a
+# finite result, so this target checks those cases against it and everything
+# else -- the other four rounding attributes, the flags, NaN payloads and the
+# whole 80-bit path -- against properties that must hold whatever the answer
+# is. Reserved x87 encodings go in raw, because "not a value" is a case the
+# arithmetic has to survive rather than trust.
+[[bin]]
+name  = "float_ops"
+path  = "fuzz_targets/float_ops.rs"
 test  = false
 doc   = false
 bench = false

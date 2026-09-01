@@ -70,6 +70,10 @@ pub mod dev;
 pub mod host;
 pub mod machine;
 
+#[cfg(feature = "float")]
+#[cfg_attr(docsrs, doc(cfg(feature = "float")))]
+pub mod float;
+
 #[cfg(feature = "ir")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ir")))]
 pub mod ir;
