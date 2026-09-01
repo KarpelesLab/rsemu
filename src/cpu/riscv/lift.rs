@@ -69,6 +69,47 @@
 //! guest-visible, so dead-code elimination may not remove one whose value is
 //! discarded — `lw x0, 0(a0)` really does read the bus.
 //!
+//! # Paging: which address space `entry_pc` names
+//!
+//! Nothing in this file walks a page table, and that is deliberate — but
+//! "the lifter does not know about paging" would be a bug rather than a
+//! design, because the guest PC *is* a virtual address the moment `satp`
+//! leaves bare mode. Three separate things make a lifted block safe under
+//! translation, and only the third is new here.
+//!
+//! 1. **The page bound above is the MMU's page bound.** `PAGE_MASK` is
+//!    derived from [`mmu::PAGE_SIZE`], which is 4 KiB
+//!    — the smallest translation granule Sv32 and Sv39 have, so a superpage
+//!    never makes the bound *wrong*, only conservative. That is what lets the
+//!    entry translation be resolved once: a block that stays inside one
+//!    virtual page stays inside one PTE's worth of permissions and one
+//!    physical page.
+//! 2. **The entry translation is the caller's, and it must be the *fetch*
+//!    path.** [`InsnSource`] hands the lifter bytes; where they came from is
+//!    not visible here. A caller must read them through the same translation
+//!    `exec`'s fetch performs — the one that sets the accessed bit, checks
+//!    execute permission and charges a walk on a TLB miss — and **never**
+//!    through [`Hart::translate_debug`](super::Hart::translate_debug), whose
+//!    entire purpose is to have none of those effects. Lifting through the
+//!    debug walk would silently stop setting `A` on every page the guest
+//!    executes from, which an operating system's page-replacement code reads.
+//! 3. **The translation context is in the cache key.** A block lifted from a
+//!    virtual address is valid only for the mapping that was in force when it
+//!    was lifted, and the guest may change that mapping without changing any
+//!    address — write a PTE, `SFENCE.VMA`, and the same VA means something
+//!    else. This is the classic translation-cache invalidation bug, so
+//!    [`lift`] takes an [`Origin`] saying which world `entry_pc` lives in and
+//!    folds it into [`Block::key`]. Under translation the [`Origin`] carries
+//!    `Csrs::translation_gen`, the counter `SFENCE.VMA`, a `satp` write and
+//!    any `mstatus` change that alters translation all bump
+//!    (`cpu::riscv::mmu`) — the same counter that flushes the TLB. A cache
+//!    keyed on `(entry_pc, Block::key)` therefore cannot hand back a block
+//!    lifted under a mapping that no longer exists, and cannot confuse a
+//!    physical lift with a virtual one at the same number.
+//!
+//! [`Origin::of`] derives the right answer from a hart's own CSRs, so the
+//! only way to claim `Origin::Bare` wrongly is to write it out by hand.
+//!
 //! # Guest state: the slot numbering
 //!
 //! [`RegSlot`] is numbered by the frontend, and [`ir`](crate::ir)'s decision 3
@@ -123,6 +164,17 @@
 //! design that does not exist yet, and inventing half of one here would be
 //! worse than returning to the dispatcher.
 //!
+//! # How this is known to be right
+//!
+//! It is not, on its own: CLAUDE.md's "CPU cores" rule makes the interpreter
+//! the oracle and this frontend differentially tested against it *forever*.
+//! [`differential`](super::differential) is that harness — one guest program
+//! through both engines, comparing registers, PC, ticks, the static tick
+//! column, guest memory and fault agreement — driven from a generated corpus
+//! in `tests/riscv_lift_differential.rs` and from `fuzz/fuzz_targets/`. The
+//! tests below assert the *shape* of what this file emits; the harness is what
+//! asserts the meaning.
+//!
 //! # Sources
 //!
 //! *The RISC-V Instruction Set Manual, Volume I: Unprivileged ISA*
@@ -141,7 +193,9 @@ use crate::ir::{
     Opcode, RegSlot, Sign, Temp, Type,
 };
 
+use super::csr::{Csrs, Priv};
 use super::isa::{self, Fmt, Op, Xlen};
+use super::mmu;
 use super::{Config, PAGE_MASK};
 
 // ---------------------------------------------------------------------------
@@ -225,6 +279,67 @@ pub enum Stop {
     Unreadable,
 }
 
+/// Which address space `entry_pc` names, and under what mapping.
+///
+/// A block is a function of the *bytes* at `entry_pc`, and under translation
+/// which bytes those are is a function of the page tables. Naming the world a
+/// lift happened in is therefore part of naming the block: see the module
+/// docs, "Paging". [`Origin::of`] derives it from a hart's CSRs, which is the
+/// only way to be sure it agrees with the MMU about whether translation is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// Translation is off for instruction fetch, so `entry_pc` is at once the
+    /// guest PC, the address [`InsnSource`] reads, and the physical address.
+    ///
+    /// Writing this out by hand is a claim about the hart, not a request:
+    /// `AUIPC`, `JAL` and every branch target are computed from `entry_pc`, so
+    /// lifting from a *physical* address on a hart that runs the same code at
+    /// some other virtual address produces a block whose PC arithmetic is
+    /// wrong everywhere.
+    Bare,
+    /// Translation is on: `entry_pc` is a virtual address, valid only for the
+    /// mapping that was in force when the bytes were read.
+    Paged {
+        /// `Csrs::translation_gen` at the moment of the lift — the counter
+        /// `SFENCE.VMA`, a `satp` write and a translation-relevant `mstatus`
+        /// change all bump, and the same one that flushes the TLB.
+        generation: u64,
+    },
+}
+
+impl Origin {
+    /// The origin for a hart whose CSRs are `csrs`, fetching in `mode`.
+    ///
+    /// Asks [`mmu::translation_active`] — the
+    /// same predicate `exec`'s own fetch translation asks — so the two cannot
+    /// disagree about whether a lift is virtual.
+    #[must_use]
+    pub fn of(csrs: &Csrs, mode: Priv) -> Origin {
+        if mmu::translation_active(csrs, mode) {
+            Origin::Paged {
+                generation: csrs.translation_gen,
+            }
+        } else {
+            Origin::Bare
+        }
+    }
+
+    /// This origin's contribution to [`Block::key`].
+    ///
+    /// Bit 3 separates the two worlds, so a physical lift and a virtual lift
+    /// of the same number never collide; above it sits the generation, exact
+    /// until it passes 2^60 — at one `SFENCE.VMA` per nanosecond, thirty-six
+    /// years — after which two generations may alias and a cache would return
+    /// a stale block. Recorded rather than hidden: a wider key is the fix if
+    /// it ever matters.
+    const fn key_bits(self) -> u64 {
+        match self {
+            Origin::Bare => 0,
+            Origin::Paged { generation } => 8 | generation.wrapping_shl(4),
+        }
+    }
+}
+
 /// A lifted block, and what is true about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lifted {
@@ -236,6 +351,8 @@ pub struct Lifted {
     /// How many guest instructions were lifted. Zero is legal and means the
     /// block's first instruction was outside the subset.
     pub insns: usize,
+    /// The world this block was lifted in, as the caller declared it.
+    pub origin: Origin,
 }
 
 /// How many guest instructions [`lift`] will take by default.
@@ -255,6 +372,11 @@ pub const MAX_INSNS: usize = 64;
 /// lifted, in which case the block is just the exit boundary and a terminator
 /// and `Lifted::insns` is zero.
 ///
+/// `origin` says which world `entry_pc` lives in, and lands in
+/// [`Block::key`]; the module docs' "Paging" section is why it is an argument
+/// rather than an assumption. `src` must read through the same translation
+/// the interpreter's *fetch* uses — never the debug walk.
+///
 /// # Errors
 ///
 /// [`Error::Unimplemented`] for an RV32 configuration. RV32 keeps register
@@ -263,6 +385,7 @@ pub const MAX_INSNS: usize = 64;
 /// flag; doing it badly would be worse than not doing it.
 pub fn lift<S: InsnSource>(
     cfg: &Config,
+    origin: Origin,
     entry_pc: u64,
     src: &mut S,
     max_insns: usize,
@@ -271,7 +394,7 @@ pub fn lift<S: InsnSource>(
         return Err(Error::Unimplemented("the RISC-V IR frontend is RV64 only"));
     }
 
-    let mut lf = Lifter::new(cfg, entry_pc);
+    let mut lf = Lifter::new(cfg, origin, entry_pc);
     let page = entry_pc & !PAGE_MASK;
     let mut pc = entry_pc;
     let mut insns = 0usize;
@@ -331,17 +454,24 @@ pub fn lift<S: InsnSource>(
         block: lf.finish(pc),
         stop,
         insns,
+        origin,
     })
 }
 
-/// The block cache key: every configuration bit this lift depends on.
+/// The block cache key: every configuration bit this lift depends on, and the
+/// world it happened in.
 ///
 /// [`Block::key`] is the rest of the cache key beside the entry PC. Identical
 /// guest bytes lift differently under a different `C` setting (`JALR`'s
 /// alignment guarantee, and whether a 16-bit encoding is an instruction at
 /// all) and under a different misalignment policy (the [`Align`] a memory op
 /// carries), so both belong here or a cache returns the wrong translation.
-fn key(cfg: &Config) -> u64 {
+///
+/// The [`Origin`] belongs here for a stronger reason: under translation the
+/// *bytes* at `entry_pc` are a function of the page tables, so a key without
+/// it lets a cache return a block lifted through a mapping the guest has since
+/// replaced. See the module docs, "Paging".
+fn key(cfg: &Config, origin: Origin) -> u64 {
     let mut key = 0u64;
     if cfg.ext.c {
         key |= 1;
@@ -352,8 +482,14 @@ fn key(cfg: &Config) -> u64 {
     if matches!(cfg.xlen, Xlen::Rv64) {
         key |= 4;
     }
-    key
+    key | origin.key_bits()
 }
+
+// The block bound is one page, and it is sound only because the smallest
+// translation granule of every scheme this core implements is that same size:
+// a superpage makes the bound conservative, a *smaller* base page would make
+// it wrong. Checked rather than remembered.
+const _: () = assert!(mmu::PAGE_SIZE == 4096);
 
 // ---------------------------------------------------------------------------
 // The plan: what an encoding means, decided before anything is emitted
@@ -642,10 +778,10 @@ struct Lifter<'a> {
 }
 
 impl<'a> Lifter<'a> {
-    fn new(cfg: &'a Config, entry_pc: u64) -> Lifter<'a> {
+    fn new(cfg: &'a Config, origin: Origin, entry_pc: u64) -> Lifter<'a> {
         Lifter {
             cfg,
-            b: BlockBuilder::new(entry_pc, key(cfg)),
+            b: BlockBuilder::new(entry_pc, key(cfg, origin)),
             x: [None; 32],
             zero: None,
             ticks: 0,
@@ -1111,7 +1247,7 @@ mod tests {
             base,
             words: words.to_vec(),
         };
-        let lifted = lift(cfg, base, &mut src, MAX_INSNS).expect("RV64 lifts");
+        let lifted = lift(cfg, Origin::Bare, base, &mut src, MAX_INSNS).expect("RV64 lifts");
         verify(&lifted.block).unwrap_or_else(|e| panic!("{e}\n{}", lifted.block));
         lifted
     }
@@ -1653,7 +1789,7 @@ mod tests {
             base: BASE,
             words: vec![addi(5, 0, 1); 8],
         };
-        let l = lift(&Config::rv64i(), BASE, &mut src, 3).expect("RV64 lifts");
+        let l = lift(&Config::rv64i(), Origin::Bare, BASE, &mut src, 3).expect("RV64 lifts");
         verify(&l.block).expect("a limited block still verifies");
         assert_eq!(l.insns, 3);
         assert_eq!(l.stop, Stop::Limit);
@@ -1672,12 +1808,104 @@ mod tests {
             base: BASE,
             words: vec![addi(5, 0, 1)],
         };
-        let err =
-            lift(&Config::rv32gc(), BASE, &mut src, MAX_INSNS).expect_err("RV32 is not lifted yet");
+        let err = lift(&Config::rv32gc(), Origin::Bare, BASE, &mut src, MAX_INSNS)
+            .expect_err("RV32 is not lifted yet");
         assert!(matches!(err, Error::Unimplemented(_)), "{err}");
     }
 
     // -- the block as a whole ----------------------------------------------
+
+    // -- paging ------------------------------------------------------------
+
+    /// A hart's CSRs, set up so that translation is on in supervisor mode.
+    fn paged_csrs() -> Csrs {
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, 0);
+        csrs.priv_mode = Priv::Supervisor;
+        // Sv39, root table at physical page 1.
+        csrs.satp = (8u64 << 60) | 1;
+        csrs
+    }
+
+    #[test]
+    fn the_origin_agrees_with_the_mmu_about_whether_a_lift_is_virtual() {
+        // Machine mode is never translated, whatever `satp` says (Volume II),
+        // so a lift there is a bare one even with Sv39 programmed.
+        let mut csrs = paged_csrs();
+        csrs.priv_mode = Priv::Machine;
+        assert_eq!(Origin::of(&csrs, Priv::Machine), Origin::Bare);
+
+        let csrs = paged_csrs();
+        assert_eq!(
+            Origin::of(&csrs, Priv::Supervisor),
+            Origin::Paged {
+                generation: csrs.translation_gen
+            }
+        );
+
+        // And with `satp` bare it is bare again, in every mode.
+        let mut off = paged_csrs();
+        off.satp = 0;
+        assert_eq!(Origin::of(&off, Priv::Supervisor), Origin::Bare);
+        assert_eq!(Origin::of(&off, Priv::User), Origin::Bare);
+    }
+
+    #[test]
+    fn a_virtual_lift_and_a_physical_lift_of_the_same_address_are_different_blocks() {
+        // The classic translation-cache bug in its simplest form: the same
+        // number means two different things, and a key that cannot tell them
+        // apart hands a physical translation to a paged guest.
+        let bare = rv64i(&[addi(5, 0, 1)]).block.key;
+        let mut src = Bytes {
+            base: BASE,
+            words: vec![addi(5, 0, 1)],
+        };
+        let paged = lift(
+            &Config::rv64i(),
+            Origin::Paged { generation: 7 },
+            BASE,
+            &mut src,
+            MAX_INSNS,
+        )
+        .expect("RV64 lifts")
+        .block
+        .key;
+        assert_ne!(bare, paged);
+    }
+
+    #[test]
+    fn changing_the_mapping_invalidates_a_block_lifted_under_the_old_one() {
+        // A guest may replace a page table without any address changing, and
+        // then `SFENCE.VMA`. `translation_gen` is the counter that fences
+        // bumps and the TLB is tagged by; the block key carries it for exactly
+        // the same reason, so a cache cannot return the stale translation.
+        let mut csrs = paged_csrs();
+        let before = Origin::of(&csrs, Priv::Supervisor);
+        csrs.bump_translation();
+        let after = Origin::of(&csrs, Priv::Supervisor);
+        assert_ne!(before, after);
+
+        let words = [addi(5, 0, 1)];
+        let key_of = |origin| {
+            let mut src = Bytes {
+                base: BASE,
+                words: words.to_vec(),
+            };
+            lift(&Config::rv64i(), origin, BASE, &mut src, MAX_INSNS)
+                .expect("RV64 lifts")
+                .block
+                .key
+        };
+        assert_ne!(key_of(before), key_of(after));
+    }
+
+    #[test]
+    fn the_block_bound_is_the_mmus_smallest_page() {
+        // `a_block_never_leaves_the_page_it_started_on` is only sound because
+        // this holds: a block confined to one 4 KiB page is confined to one
+        // PTE's permissions under Sv32 and Sv39 alike, superpages included.
+        assert_eq!(PAGE_MASK + 1, crate::cpu::riscv::mmu::PAGE_SIZE);
+        assert_eq!(crate::cpu::riscv::mmu::PAGE_BITS, 12);
+    }
 
     #[test]
     fn the_cache_key_separates_configurations_that_lift_differently() {
