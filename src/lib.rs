@@ -133,6 +133,12 @@ pub fn build_info() -> alloc::string::String {
     if cfg!(feature = "dev-pc-floppy") {
         features.push("dev-pc-floppy");
     }
+    if cfg!(feature = "dev-ata-disk") {
+        features.push("dev-ata-disk");
+    }
+    if cfg!(feature = "dev-pc-ide") {
+        features.push("dev-pc-ide");
+    }
     if cfg!(feature = "machine-pc-at") {
         features.push("machine-pc-at");
     }

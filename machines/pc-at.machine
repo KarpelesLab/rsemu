@@ -50,6 +50,22 @@ machine "pc-at" {
   # these can run in one process without typing at each other.
   param keyboard = "keyboard"
 
+  # The two drive bays on the primary IDE channel. Zero is an empty bay, and an
+  # empty bay is the default, because a PC with no hard disk is an ordinary PC
+  # and because a drive costs its whole capacity in host memory the moment it
+  # exists. A non-zero size fits a blank drive; binding an image to the `hd0`
+  # or `hd1` media slot fills one; and a size of zero with an image bound takes
+  # the image's own length, which is the usual way in:
+  #
+  #   rsemu run pc-at --bios bios.bin --media hd0=disk.img
+  #   rsemu run pc-at --bios bios.bin --param hd0size=64M
+  #
+  # The secondary channel is wired below and both of its bays are empty. A
+  # machine file that wants a drive there copies `hd0` and says
+  # `bay = "ide1-master"`.
+  param hd0size = 0
+  param hd1size = 0
+
   # The date and time the RTC starts at. A device may never read the host
   # clock (CLAUDE.md, determinism): rsemu has no record/replay seam for it, and
   # a machine that drew from one would not be reproducible. So it is declared,
@@ -225,6 +241,27 @@ machine "pc-at" {
   # faulting.
   object fdc "pc.fdc" { clock = fdd, image = "floppy" }
 
+  # -- the hard disks and the IDE channels ------------------------------------
+  #
+  # The drives are declared *before* the channels, and the order matters:
+  # `Machine::reset` runs devices in declaration order, and an IDE channel's
+  # only job at reset is to re-drive its interrupt pin from whatever the drives
+  # now say. A channel reset before its drives would hold a stale level until
+  # the first port access.
+  #
+  # "IDE" means the controller is on the drive, which is why there are two
+  # kinds of object here rather than one: `ata.disk` is everything on the far
+  # side of the cable — the command set, the registers, the geometry — and
+  # `pc.ide` is what the motherboard contributes, which is address decode, the
+  # master/slave cable position and one wire to the second 8259A. The same
+  # drive would hang off a different adapter unchanged, which is the test of
+  # whether the line is in the right place.
+  object hd0 "ata.disk" { image = "hd0", size = hd0size, bay = "ide0-master" }
+  object hd1 "ata.disk" { image = "hd1", size = hd1size, bay = "ide0-slave" }
+
+  object ide0 "pc.ide" { master = "ide0-master", slave = "ide0-slave" }
+  object ide1 "pc.ide" { master = "ide1-master", slave = "ide1-slave" }
+
   # -- firmware ---------------------------------------------------------------
   #
   # Both sockets take a user-supplied image and neither ships with one. `align`
@@ -288,7 +325,22 @@ machine "pc-at" {
                                               # register's bit 0, not the board
   map port 0x03d8 size 0x0002 = vga.mode       # CGA mode and colour select
   map port 0x03da size 0x0001 = vga.status     # retrace, and the AC flip-flop
-  map port 0x03f0 size 0x0008 = fdc.regs       # uPD765A
+  # The IDE channels. Each decodes in two disjoint places, which is why each
+  # publishes two regions rather than one: eight ports for the command block,
+  # and one port for the control block, whose alternate status register is how
+  # a driver looks at a drive without acknowledging its interrupt.
+  map port 0x0170 size 0x0008 = ide1.regs      # IDE, secondary channel
+  map port 0x01f0 size 0x0008 = ide0.regs      # IDE, primary channel
+  map port 0x0376 size 0x0001 = ide1.ctl       # ...and its control block
+  # The floppy adapter's window has a hole in it at 0x3f6, and the hole is the
+  # board's doing rather than ours: the diskette adapter decodes 0x3f0-0x3f5
+  # and 0x3f7, and 0x3f6 belongs to the fixed-disk adapter. 0x3f7 is genuinely
+  # shared on a real AT — the floppy drives bit 7 and the disk adapter bits 6:0
+  # — and only the floppy's half is modelled, because the other half is a
+  # drive-address register nothing reads.
+  map port 0x03f0 size 0x0006 = fdc.regs       # uPD765A, 0x3f0-0x3f5
+  map port 0x03f6 size 0x0001 = ide0.ctl       # IDE, primary control block
+  map port 0x03f7 size 0x0001 = alias(fdc.regs, 7)  # DIR read, CCR write
   map port 0x04d0 size 0x0001 = pic1.elcr      # edge/level control, master
   map port 0x04d1 size 0x0001 = pic2.elcr      # edge/level control, slave
 
@@ -307,6 +359,8 @@ machine "pc-at" {
   wire pit0.out0   -> pic1.ir0    # the system tick
   wire kbc.irq1    -> pic1.ir1    # a key was pressed
   wire fdc.irq     -> pic1.ir6    # the floppy controller
+  wire ide0.irq    -> pic2.ir6    # IRQ14, the primary IDE channel
+  wire ide1.irq    -> pic2.ir7    # IRQ15, the secondary IDE channel
   wire cmos.irq    -> pic2.ir0    # IRQ8, the RTC
   wire kbc.irq12   -> pic2.ir4    # IRQ12, the auxiliary device
 

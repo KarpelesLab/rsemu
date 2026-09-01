@@ -225,12 +225,16 @@ pub static ARM926: CatalogEntry = CatalogEntry {
 /// the user supplies; `vgabios` and `floppy` likewise. A PC with no BIOS is a
 /// board that realizes and executes open bus, which is a useful thing to be
 /// able to look at and not a machine that boots.
+///
+/// `hd0` and `hd1` are the two drive bays on the primary IDE channel, and an
+/// unbound one is an empty bay rather than an error: a PC with no hard disk is
+/// an ordinary PC.
 #[cfg(feature = "machine-pc-at")]
 #[cfg_attr(docsrs, doc(cfg(feature = "machine-pc-at")))]
 pub static PC_AT: CatalogEntry = CatalogEntry {
     name: "pc-at",
-    summary: "IBM PC/AT-class board: x86, two 8259As, 8254, MC146818, 8042, 8237s, VGA, floppy",
-    media: &["bios", "vgabios", "floppy"],
+    summary: "IBM PC/AT-class board: x86, 8259As, 8254, MC146818, 8042, 8237s, VGA, floppy, IDE",
+    media: &["bios", "vgabios", "floppy", "hd0", "hd1"],
     source: include_str!("../../machines/pc-at.machine"),
 };
 
@@ -374,6 +378,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::flash::register(&mut reg)?;
     #[cfg(feature = "dev-sd-card")]
     crate::dev::sd::register(&mut reg)?;
+    #[cfg(feature = "dev-ata-disk")]
+    crate::dev::ata::register(&mut reg)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::register(&mut reg)?;
     #[cfg(feature = "cpu-x86")]
@@ -454,6 +460,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::flash::bind(&mut b)?;
     #[cfg(feature = "dev-sd-card")]
     crate::dev::sd::bind(&mut b)?;
+    #[cfg(feature = "dev-ata-disk")]
+    crate::dev::ata::bind(&mut b)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::bind(&mut b)?;
     #[cfg(feature = "cpu-x86")]
@@ -531,6 +539,10 @@ pub fn classes() -> ClassTable {
     }
     #[cfg(feature = "dev-sd-card")]
     for schema in crate::dev::sd::schemas() {
+        table.insert(schema);
+    }
+    #[cfg(feature = "dev-ata-disk")]
+    for schema in crate::dev::ata::schemas() {
         table.insert(schema);
     }
     #[cfg(feature = "dev-wdc")]
@@ -1272,6 +1284,12 @@ mod tests {
             ("pc-at", "vgabios") => blank(32 * 1024),
             #[cfg(feature = "machine-pc-at")]
             ("pc-at", "floppy") => blank(1_474_560),
+            // Both IDE bays empty, which is what no bytes bound means: a PC
+            // with no hard disk is an ordinary PC, and a drive would cost this
+            // test its whole capacity in host memory. `tests/pc_at_ide` is
+            // where a populated bay is exercised.
+            #[cfg(feature = "machine-pc-at")]
+            ("pc-at", "hd0" | "hd1") => &[],
             (m, other) => panic!("no fixture for `{m}`'s media slot `{other}`"),
         }
     }

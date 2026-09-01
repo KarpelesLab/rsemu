@@ -17,8 +17,11 @@ $ rsemu run pc-at --bios /usr/share/qemu/bios.bin
 $ rsemu run pc-at --bios bios.bin --media vgabios=vgabios.bin --media floppy=boot.img
 ```
 
-`--bios` and `--vgabios` are conveniences over `--media bios=…`; the mechanism
-is the media table and nothing else. `pc.rom` is the socket they land in, and
+`--bios` and `--vgabios` are conveniences over `--media bios=…`, and so are
+`--hd0` and `--hd1`, which fill the two drive bays on the primary IDE channel;
+the mechanism is the media table and nothing else. An unbound `hd0` or `hd1` is
+an **empty bay**, not an error — a PC with no hard disk is an ordinary PC, and a
+drive costs its whole capacity in host memory the moment it exists. `pc.rom` is the socket they land in, and
 its `align` property is the one thing about it that is not obvious: a **system
 BIOS is top-aligned**, because an x86 fetches its first instruction from the top
 of its address space, and an **option ROM is bottom-aligned**, because firmware
@@ -44,13 +47,18 @@ address; every one of them is written once, in that file.
 | RTC and CMOS | `pc.rtc` | 0x70-0x71 | Motorola MC146818 data sheet |
 | DMA (2, byte and word) | `pc.dma` | 0x00-0x0f, 0xc0-0xdf, pages at 0x80 | Intel 8237A data sheet |
 | Display | `pc.video` | 0x3b4/0x3d4, 0x3c0-0x3cf, 0x3da | MC6845 data sheet, VGA register set |
-| Floppy controller | `pc.fdc` | 0x3f0-0x3f7 | NEC µPD765A data sheet |
+| Floppy controller | `pc.fdc` | 0x3f0-0x3f5, 0x3f7 | NEC µPD765A data sheet |
+| IDE channels (2) | `pc.ide` | 0x1f0-0x1f7 + 0x3f6, 0x170-0x177 + 0x376 | AT Technical Reference, fixed-disk adapter |
+| Hard disks (2 bays) | `ata.disk` | — (on the cable) | T13 ATA/ATAPI-6 |
 | Firmware sockets | `pc.rom` | 0xc0000, 0xe0000 (+ a high alias) | — |
 
-Five oscillators, because the board has five cans: the CPU clock, the 8254's
+Six oscillators, because the board has six cans: the CPU clock, the 8254's
 105/88 MHz — not an integer number of hertz, which is why the description
 language takes rational frequency literals — the RTC's 32.768 kHz, the VGA dot
-clock, and the floppy data separator. Only ratios *within* a tree are
+clock, the 8042's own crystal, and the floppy data separator. The IDE channels
+have none: a drive's controller is on the drive, and this model's is zero-time,
+so there is nothing on this side of the cable for a clock to pace. Only ratios
+*within* a tree are
 guest-visible (`../../ROADMAP.md` §4.2).
 
 The system ROM is mapped **twice**, at `0xe0000` and again just below 4 GiB. A
@@ -127,7 +135,13 @@ So the missing pieces below are ranked by that evidence, not by guesswork.
   is any graphics mode, deliberately.
 - **The keyboard takes raw set-2 scan codes** on a character port. Mapping a
   terminal's keystrokes to scan codes is a host concern and belongs in `host/`.
-- **No serial port, no parallel port, no IDE, no PCI, no APIC, no ACPI.**
+- **No serial port, no parallel port, no PCI, no APIC, no ACPI.**
+- **No ATAPI.** The IDE channels carry `ata.disk` and nothing else; `IDENTIFY
+  PACKET DEVICE` aborts, which is what a non-packet device does. A CD-ROM is a
+  separate command set on the same transport, not a flag on this one.
+- **No busmastering IDE DMA.** PIO only, which is what an AT's cable does; the
+  DMA modes arrived with PCI and would need a busmaster on a fabric this board
+  does not have.
 
 ## Framework gaps this board ran into
 

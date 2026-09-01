@@ -513,12 +513,46 @@ dev-pc-video = ["dev-pc"]
 # it hands bytes to.
 dev-pc-floppy = ["dev-pc"]
 
+# An ATA hard disk (src/dev/ata): the drive, and deliberately not a controller
+# -- "IDE" means the controller is *on the drive*, so the seam is the cable and
+# this is everything on the far side of it. The eight command block registers
+# with their two-deep 48-bit FIFOs, the Status and Error registers, the
+# busy/DRQ handshake in the order the two PIO protocols actually use it (a read
+# raises INTRQ at the start of every block, a write at the end), IDENTIFY
+# DEVICE and its 256 words, READ/WRITE SECTOR(S) and READ/WRITE MULTIPLE in
+# CHS, LBA28 and LBA48, SET MULTIPLE MODE, INITIALIZE DEVICE PARAMETERS -- the
+# command a BIOS uses to make its CHS translation and the drive's agree -- and
+# the software reset protocol. **ATAPI is out of scope**: IDENTIFY PACKET
+# DEVICE aborts, which is what a non-packet device does. Takes a media slot
+# rather than `fstool`, for the same reason `dev-sd-card` and `dev-flash-cfi`
+# do. Written from T13's ATA/ATAPI-6; no emulator source and no operating
+# system's ATA driver was opened (ROADMAP.md §1). `no_std + alloc`, no
+# `unsafe`, no dependencies.
+dev-ata-disk = []
+
+# The PC/AT's IDE interface (src/dev/pc/ide.rs): one channel, which is address
+# decode and nothing else. The command block (0x1f0/0x170) and the control
+# block (0x3f6/0x376) as two separate regions, because the AT decodes them at
+# two disjoint places; master/slave selection, which is the *drive's* decision
+# and reached by broadcasting every write to both; the "device 0 answers for an
+# absent device 1" rule a driver probes with; and one INTRQ output for IRQ
+# 14/15. Needs `dev-ata-disk` to have anything to talk to, and `dev-pc` because
+# it is that board's decode.
+dev-pc-ide = ["dev-pc", "dev-ata-disk"]
+
 # An IBM PC/AT-class machine (machines/pc-at.machine plus the classes it
 # names). The firmware is **not** shipped: the `bios` media slot takes the
 # user's own image (`rsemu run pc-at --bios /usr/share/qemu/bios.bin`) and the
 # `vgabios` slot takes a video option ROM, exactly as `riscv-virt` takes its
 # firmware. Adds no dependencies.
-machine-pc-at = ["cpu-x86", "dev-pc", "dev-pc-video", "dev-pc-floppy"]
+machine-pc-at = [
+  "cpu-x86",
+  "dev-pc",
+  "dev-pc-video",
+  "dev-pc-floppy",
+  "dev-pc-ide",
+  "dev-ata-disk",
+]
 
 # The Motorola MC68000 core (src/cpu/m68k): an interpreter that models the
 # two-word prefetch queue explicitly, charges four cycles per bus access rather
