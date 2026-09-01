@@ -127,7 +127,18 @@ bridge with the PAM registers that shadow the BIOS, and a PCI display adapter
 whose expansion ROM BAR is where a firmware written this century looks for its
 video BIOS — with user-supplied firmware paths in the QEMU style (`--bios`,
 `--vgabios`). A real BIOS completes POST on it, runs the video option ROM, sets
-a text mode and boots a diskette. No firmware is shipped and none will be.
+a text mode and boots a diskette.
+
+**No third-party firmware is shipped and none will be** — but there is now one
+of our own. `rsemu run pc-at --hd0 disk.img` boots with nothing supplied,
+because `src/fw/pcbios` is a minimal legacy BIOS written here: POST, the BIOS
+Data Area, option-ROM dispatch, `INT 10h`/`11h`/`12h`/`13h`/`15h`/`16h`/`19h`/
+`1Ah`, and a bootstrap that reads the first sector and jumps to it. It exists
+because FreeDOS, Windows 95 and Windows XP all need a *legacy* BIOS and every
+one anybody could reach for is GPL. There is no assembler in this repository
+and Rust cannot target 16-bit x86, so the ROM is **emitted**: `src/fw/asm16` is
+a 16-bit x86 assembler in Rust and the firmware is a Rust program that calls
+it, which makes `cargo build` the whole build.
 
 Beside them are four synthetic boards, each the smallest machine that exercises
 one thing: `spi-panel` (a display path over SPI), `arm926` (an ARM926EJ-S with CP15,

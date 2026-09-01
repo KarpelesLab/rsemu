@@ -1,18 +1,29 @@
 # An IBM PC/AT-class machine — the board, not the firmware.
 #
+#   rsemu run pc-at --hd0 disk.img
 #   rsemu run pc-at --bios /usr/share/qemu/bios.bin
 #   rsemu run pc-at --bios bios.bin --media vgabios=vgabios.bin --media floppy=boot.img
 #
-# **rsemu ships no BIOS and never will.** A PC's firmware is somebody's
-# copyrighted binary, and vendoring one would be redistribution; so the machine
-# takes it through a media slot, exactly as `riscv-virt` takes its firmware, and
-# the user points at their own copy. Running a binary as an emulated guest is
-# ordinary use whatever its licence; shipping it is not (ROADMAP.md §1).
+# **rsemu ships no *third-party* BIOS and never will.** A PC's firmware is
+# somebody's copyrighted binary, and vendoring one would be redistribution; so
+# the machine takes it through a media slot, exactly as `riscv-virt` takes its
+# firmware, and the user points at their own copy. Running a binary as an
+# emulated guest is ordinary use whatever its licence; shipping it is not
+# (ROADMAP.md §1).
 #
-# That is also why nothing below assumes *which* firmware. The board is the AT's
-# and the addresses are the AT's, and any firmware written for that board will
-# find what it expects — or will say what is missing, which is the more useful
-# outcome while this machine is being brought up.
+# What the `bios` slot now has is a **default**, not a replacement:
+# `src/fw/pcbios` is rsemu's own minimal legacy BIOS, assembled from Rust source
+# in this repository by `src/fw/asm16`, so the first line above boots with
+# nothing supplied. `--bios` still wins. The reason it exists at all is that
+# FreeDOS, Windows 95 and Windows XP need a *legacy* BIOS, the one permissively
+# licensed PC firmware in the world is UEFI, and every legacy alternative is GPL
+# and therefore unreadable to us — ROADMAP.md phase 6a names it as a
+# deliverable rather than an option.
+#
+# Nothing below assumes *which* firmware. The board is the AT's and the
+# addresses are the AT's, and any firmware written for that board will find what
+# it expects — or will say what is missing, which is the more useful outcome
+# while this machine is being brought up.
 #
 # # Sources
 #
@@ -369,12 +380,18 @@ machine "pc-at" {
   # ROM against the *bottom* because that is where the scan for `0x55 0xaa`
   # looks.
   #
+  # `bios` is the one slot with a default, and the default is ours:
+  # `rsemu::fw::pcbios::image()` is 64 KiB, so it lands in the top half of this
+  # 128 KiB socket with its reset vector at 0xffff0 and at 0xfffffff0 through
+  # the alias below. Anything the user binds displaces it.
+  #
   # `vgarom` is the **legacy** path to the same image the PCI card above
   # carries, and it is kept because it is the only path a pre-PCI firmware
   # knows: a scan of 0xc0000 upward for the signature. A firmware that
   # programs the PAM registers first never sees it, and takes the PCI route
   # instead. One video BIOS, two ways in, and any given firmware takes exactly
-  # one of them.
+  # one of them — rsemu's own takes the legacy one, because it does not
+  # reprogram the PAM registers and does not enumerate the bus.
   object bios   "pc.rom" { image = "bios",    size = biossize, align = "top" }
   object vgarom "pc.rom" { image = "vgabios", size = vgasize,  align = "bottom" }
 

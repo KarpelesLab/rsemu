@@ -45,11 +45,12 @@ RUN OPTIONS:
                         MIT) or `wozmon` (the 1976 Woz Monitor, public domain)
     --disk <file>       Bind the `disk` media slot
     --bios <file>       Bind the `bios` media slot: a PC's system firmware.
-                        rsemu ships none — point this at your own copy, the
-                        way you would point qemu at one. Running a firmware
-                        binary as a guest is ordinary use whatever its licence;
-                        redistributing it is not, which is why there is a flag
-                        here and no file in the repository
+                        Unbound, `pc-at` gets rsemu's own minimal legacy BIOS,
+                        assembled from this repository rather than shipped as
+                        a blob. Point this at somebody else's image and it
+                        wins. Running a firmware binary as a guest is ordinary
+                        use whatever its licence; redistributing it is not,
+                        which is why the only one in the repository is ours
     --vgabios <file>    Bind the `vgabios` media slot: a video option ROM
     --floppy <file>     Bind the `floppy` media slot: a raw diskette image
     --hd0 <file>        Bind the `hd0` media slot: a raw hard disk image for
@@ -342,10 +343,26 @@ fn run(args: &[String]) -> ExitCode {
     // design (`machine::realize`). The same goes for a PC's two IDE bays: no
     // bytes bound is an empty bay, which is what most PCs of the period had in
     // at least one of them.
-    for slot in ["flash0", "flash1", "initrd", "disk", "hd0", "hd1"] {
+    // `floppy` and `vgabios` are the same claim about a PC: an empty drive and
+    // an empty option-ROM socket are both ordinary configurations, and a board
+    // that refused to assemble without a diskette would be describing no
+    // machine anyone ever owned.
+    for slot in [
+        "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "floppy", "vgabios",
+    ] {
         if !images.iter().any(|(bound, _)| bound == slot) {
             images.push((String::from(slot), Vec::new()));
         }
+    }
+
+    // A PC's system firmware, if this build has one and the user named none.
+    // `rsemu` ships exactly one piece of firmware and this is where it is
+    // offered (`fw::pcbios`); `--bios` still wins, because the slot is the
+    // user's and always will be (`docs/platforms/pc-at.md`).
+    if !images.iter().any(|(slot, _)| slot == "bios")
+        && let Some(image) = builtin_bios(&parsed.machine)
+    {
+        images.push((String::from("bios"), image));
     }
 
     // A path wins over a catalog name, so a user editing a copy of a shipped
@@ -1046,6 +1063,29 @@ fn builtin_firmware(machine: &str) -> Option<Vec<u8>> {
     match stem {
         #[cfg(feature = "machine-spi-panel")]
         "spi-panel" => Some(rsemu::dev::lcd::demo::PANEL_DEMO.to_vec()),
+        _ => {
+            let _ = stem;
+            None
+        }
+    }
+}
+
+/// The system firmware for a machine whose `bios` slot the user left unbound.
+///
+/// Only `pc-at` has one, and only because `ROADMAP.md` phase 6a said it must:
+/// every legacy PC BIOS anyone could otherwise reach for is GPL, and running
+/// one is fine while shipping one is not. `--bios` overrides this, so pointing
+/// the board at a real image is still one flag.
+fn builtin_bios(machine: &str) -> Option<Vec<u8>> {
+    let stem = machine
+        .rsplit('/')
+        .next()
+        .unwrap_or(machine)
+        .strip_suffix(".machine")
+        .unwrap_or_else(|| machine.rsplit('/').next().unwrap_or(machine));
+    match stem {
+        #[cfg(all(feature = "fw-pcbios", feature = "machine-pc-at"))]
+        "pc-at" => Some(rsemu::fw::pcbios::image()),
         _ => {
             let _ = stem;
             None

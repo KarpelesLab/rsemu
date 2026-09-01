@@ -4,20 +4,27 @@ Consumed by: `machines/pc-at.machine` and `src/dev/pc`. The source *register*
 for the platform is [`ibm-pc.md`](ibm-pc.md); this page is about the board rsemu
 actually assembles and what is known to be missing from it.
 
-## The firmware is the user's, always
+## The firmware is the user's — and there is now one of our own to fall back on
 
-rsemu ships no BIOS and no video BIOS, and will not. A PC's firmware is somebody
-else's copyrighted binary; **running one as an emulated guest is ordinary use
-whatever its licence, and redistributing it is not** (`../../ROADMAP.md` §1). So
-the machine takes both through media slots, exactly as `riscv-virt` takes its
-firmware:
+rsemu ships **no third-party** BIOS and no third-party video BIOS, and will not.
+A PC's firmware is somebody else's copyrighted binary; **running one as an
+emulated guest is ordinary use whatever its licence, and redistributing it is
+not** (`../../ROADMAP.md` §1). So the machine takes both through media slots,
+exactly as `riscv-virt` takes its firmware:
 
 ```console
-$ rsemu run pc-at --bios /usr/share/qemu/bios.bin
+$ rsemu run pc-at --hd0 disk.img                   # rsemu's own BIOS
+$ rsemu run pc-at --bios /usr/share/qemu/bios.bin  # or the user's
 $ rsemu run pc-at --bios bios.bin --media vgabios=vgabios.bin --media floppy=boot.img
 ```
 
-**The video BIOS has to be a PCI one.** A 440FX-era firmware finds video by
+What changed in the first line is that [`src/fw/pcbios`](../../src/fw/pcbios) is
+a **minimal legacy BIOS written here**, and the `bios` slot defaults to it — see
+[the section below](#the-in-house-bios). That is a default, not a replacement:
+`--bios` still wins, and every other firmware this board might run still comes
+from the user.
+
+**A third-party video BIOS has to be a PCI one.** A 440FX-era firmware finds video by
 enumerating the bus for class code `030000` and taking that card's option ROM off
 its expansion ROM base address register — and it validates the **PCI Data
 Structure** inside the image against the card's vendor and device id before it
@@ -296,6 +303,108 @@ to match, gets as far as `cirrus init` and then correctly refuses — "Failed to
 initialize VGA hardware" — because the card is not a Cirrus. Which is the right
 answer, and a good demonstration that the id fields are load-bearing rather
 than decoration.
+
+## The in-house BIOS
+
+`ROADMAP.md` phase 6a names it and says why: FreeDOS, Windows 95 and Windows XP
+all need a *legacy* BIOS, the only permissively licensed PC firmware in
+existence is EDK II / OVMF (which is UEFI), and every legacy alternative anyone
+reaches for is GPL or LGPL and therefore unreadable to us. Shipping a blob was
+not an option and reading one to learn how was not either, so it is written from
+the interrupt ABI as documented.
+
+### How the image is built
+
+There is no assembler in this repository and no C toolchain, because §0 forbids
+both. Rust cannot target 16-bit x86 either. So the firmware is **emitted**:
+[`src/fw/asm16.rs`](../../src/fw/asm16.rs) is a 16-bit x86 assembler written in
+Rust, [`src/fw/pcbios/`](../../src/fw/pcbios) is a Rust program that calls it,
+and `rsemu::fw::pcbios::image()` returns 65,536 bytes. `cargo build` is the
+whole build; the same source produces the same bytes on every host, which is
+asserted rather than assumed. The alternatives that lost — a `.code16` crate
+needing an external linker script, a vendored `.bin`, and a "BIOS" that is
+really a host callback trapping `INT 13h` — are argued in `src/fw/mod.rs`.
+
+### What it does, measured
+
+`tests/pc_at_boot.rs` runs it on this board with **no environment variable and
+nothing downloaded**, so it is part of an ordinary `cargo test`. Quoted from a
+run:
+
+```text
+  |rsemu BIOS, 639K base, 15360K extended|
+  |Booting.|
+  |Booting from 0000:7c00|
+  |rsemu boot sector on rsemu BIOS|
+  pc-at boot: INT 13h AH=08h says 4 cylinders, 16 heads, 63 sectors, 1 drive(s)
+  pc-at boot: E820[0] base=0x00000000 length=0x0009fc00 type=1
+```
+
+Option-ROM dispatch is measured the same way, with `RSEMU_VGABIOS` pointing at a
+real video BIOS. rsemu's own firmware does **not** enumerate PCI, so it finds
+video the way a pre-PCI machine does — a scan of `0xc0000` upward for `0x55
+0xaa` — which makes the **ISA** build the right image here, the opposite of what
+the 440FX-era firmware above wants. With `vgabios.bin` in the legacy socket the
+scan finds it, checksums it, enters it at `seg:0003`, and the vector moves:
+
+```text
+  pc-at boot: INT 10h -> c000:53ef        (empty socket: f000:047f)
+```
+
+The ROM's own initialisation costs about 145 ms of virtual time, and POST
+resumes afterwards and boots as before — so the whole text page above is then
+drawn by somebody else's video BIOS through our `INT 19h`.
+
+The sequence is: reset at `0xfffffff0`, the far jump, the 8259A pair, the 8254,
+the 146818, the BIOS Data Area, the EBDA and the `E820` table built into it, the
+option-ROM scan over `0xc0000-0xdffff`, the 8042 brought up with translation on,
+`IDENTIFY DEVICE` on the primary IDE channel, and `INT 19h` reading cylinder 0,
+head 0, sector 1 to `0000:7c00` and jumping there. The guest that lands is a
+real program that calls back in: `INT 10h`, `INT 11h`, `INT 12h`, `INT 15h`
+(`E820`) and `INT 13h` for its own second read, all of which answer.
+
+The same test boots the same sector off the **diskette**, with both IDE bays
+empty so `INT 19h` falls through to it — a different path end to end, through
+the µPD765 and DMA channel 2 rather than the IDE command block.
+
+### What it does not do
+
+- **A diskette can be read but not written.** `INT 13h AH=03h` with
+  `DL < 0x80` returns carry. Reads go the whole way — digital output register,
+  four `SENSE INTERRUPT STATUS` commands to clear the reset's ready-changed
+  reports, `SPECIFY`, `SEEK`, an 8237 channel-2 programming and one `READ DATA`
+  per sector — and `tests/pc_at_boot.rs` boots off one.
+- **No PCI BIOS interface, no ACPI, no SMBIOS.** All three are phase-6a
+  deliverables and all three come after a boot.
+- **Text mode only**, because `pc.video` is a text-mode CRTC. `INT 10h AH=00h`
+  records a graphics mode and changes nothing.
+- **`INT 10h AH=06h` scrolls the whole screen** when the line count is
+  non-zero; the rectangle is honoured for a clear (`AL=0`), which is what
+  programs use it for.
+- **US layout, base scan codes only.** Extended (`E0`-prefixed) keys are
+  dropped rather than half-decoded, and the lock states are not tracked.
+
+### Two things the board does that the firmware found
+
+Both are device-side, both are measured by `tests/pc_at_boot.rs`, and neither is
+a firmware bug:
+
+- **A PAM window with nothing under it faults instead of reading as ones.**
+  `pc.pmc` maps thirteen shadow windows across `0xc0000-0xfffff`. Where a
+  window has no permission and no region beneath it — `0xd0000-0xdffff` on this
+  board — a read returns `Err(Protected)` rather than falling through to the
+  space's `unassigned = read-as-ones`. An option-ROM scan walks exactly that
+  range, so the CPU's bus-fault counter climbs by 32 during a normal POST. A
+  440FX with a window set to "ROM read" and no ROM there is an ISA bus with
+  pull-ups, which reads as ones.
+- **`pc.kbc` delivers one keystroke and then goes quiet.** `read_data` clears
+  `OBF` and immediately refills the output buffer from the keyboard's queue
+  without re-driving `IRQ1`, so the line never falls between two bytes and the
+  edge-triggered 8259A never sees a second edge. Measured: after one key the
+  status port reads `0x05` (a byte waiting) with the master's `IRR` at `0x00`.
+  On real hardware the line drops when the buffer is read and rises when the
+  next byte arrives a serial frame later. The fix is a `refresh()` after the
+  clear and a deferred refill.
 
 ## What is known to be missing
 
