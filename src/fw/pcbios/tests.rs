@@ -56,7 +56,13 @@ fn the_code_fits_below_the_reset_vector() {
         .iter()
         .rposition(|&b| b != 0xff)
         .expect("the image is not empty");
-    println!("the firmware occupies {used:#06x} bytes of its 64 KiB segment");
+    // `fw-pcbios` does not imply `std`, and the whole crate is `no_std` without
+    // it, so this diagnostic cannot be unconditional -- the per-feature sweep
+    // builds `--no-default-features --features fw-pcbios` and there is no
+    // `println!` there. The assertions below are the test; this only says how
+    // much room is left.
+    #[cfg(feature = "std")]
+    std::println!("the firmware occupies {used:#06x} bytes of its 64 KiB segment");
     assert!(
         used < RESET_VECTOR as usize,
         "the code reaches {used:#06x}, which collides with the reset vector"
