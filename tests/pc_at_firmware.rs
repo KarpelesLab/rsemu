@@ -105,7 +105,21 @@ use rsemu::machine::realize::Bindings;
 
 /// How long to let the board run, in virtual milliseconds, unless
 /// `RSEMU_BIOS_MS` says otherwise.
-const DEFAULT_MS: u64 = 200;
+///
+/// **This has to exceed what the assertions below need, or the test measures
+/// the budget rather than the machine.** They require a complete POST: PCI
+/// enumeration, the video option ROM running, a mode set, and a boot attempt.
+/// At 200 -- the value this held while the board could not get that far -- the
+/// run stops mid-POST with `stuck=false`, having simply run out of virtual
+/// time, and the video assertion fails against a machine that was doing
+/// nothing wrong. That failure looks exactly like a broken option ROM, which
+/// is the expensive kind of wrong.
+///
+/// 1500 is measured, not guessed: it is where the firmware reaches
+/// `Booting from 0000:7c00`. It costs about five wall-clock minutes, which is
+/// affordable because this whole file is gated on `RSEMU_BIOS` and skips when
+/// it is unset -- `cargo test` never pays it.
+const DEFAULT_MS: u64 = 1500;
 
 /// How many instructions of tail the fine pass keeps, unless `RSEMU_TRACE`
 /// says otherwise.

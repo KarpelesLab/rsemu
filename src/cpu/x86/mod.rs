@@ -2745,8 +2745,22 @@ impl Device for X86 {
         // `a_real_gdb_debugs_a_guest_end_to_end` caught.
         for reg in Reg::WIDE {
             let wide = r.read_u64()?;
-            let low = reg.get(&state.regs) & 0xffff_ffff;
-            reg.set(&mut state.regs, (wide & !0xffff_ffff) | low);
+            let value = match reg {
+                // `r8`-`r15` are long-mode-only and have no `u32` counterpart
+                // in the prefix, so there is nothing there to preserve and
+                // reading one would merge in whatever the prefix loop happened
+                // to leave behind. The wide value is the whole story.
+                Reg::R8
+                | Reg::R9
+                | Reg::R10
+                | Reg::R11
+                | Reg::R12
+                | Reg::R13
+                | Reg::R14
+                | Reg::R15 => wide,
+                _ => (wide & !0xffff_ffff) | (reg.get(&state.regs) & 0xffff_ffff),
+            };
+            reg.set(&mut state.regs, value);
         }
         state.sys.cr4 = r.read_u64()?;
         state.sys.efer = r.read_u64()?;
