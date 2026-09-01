@@ -46,6 +46,14 @@
 //! `region("resetctl")` at 0xcf9. `""` is port B, because it is the one every
 //! AT has.
 //!
+//! A board with a PCI host bridge maps the third one differently, and the
+//! reason is a real chipset fact: `0xcf9` sits inside the four bytes of
+//! `CONFADD` at `0xcf8`, which the north bridge claims for a Dword access while
+//! the south bridge claims `0xcf9` for a byte access. An address space decodes
+//! by address alone, so the bridge holds all four and hands the narrow cycles
+//! on. `ConfAddWindow`, below, is the view of those four bytes this device
+//! publishes through [`ExportId::PORT_PASSTHROUGH`] for that purpose.
+//!
 //! # Port B, 0x61
 //!
 //! ```text
@@ -134,7 +142,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::core::device::{Device, DeviceClass, RealizeCtx, ResetKind, SinkPin};
+use crate::core::device::{Device, DeviceClass, Export, ExportId, RealizeCtx, ResetKind, SinkPin};
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::Props;
 use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region, RegionRef};
@@ -418,6 +426,63 @@ struct PortA(Arc<Registers>);
 #[derive(Debug)]
 struct ResetCtl(Arc<Registers>);
 
+/// Where the reset control register sits inside the four bytes at `0xcf8`.
+///
+/// `0xcf9 - 0xcf8`. It is a board fact, and this device is the board.
+const CONFADD_RESETCTL_OFFSET: u64 = 1;
+
+/// The four bytes at `0xcf8`, as this board's south-bridge stand-in decodes
+/// them: the reset control register at `0xcf9`, and nothing at the other three.
+///
+/// Published through
+/// [`ExportId::PORT_PASSTHROUGH`](crate::core::device::ExportId::PORT_PASSTHROUGH)
+/// so a PCI host bridge can hand on the cycles its own `CONFADD` does not
+/// claim — see [`PortPassthrough`](super::PortPassthrough) for why one chip has
+/// to hold all four. A board with no host bridge maps
+/// [`region("resetctl")`](Device::region) at `0xcf9` instead and never asks for
+/// this; both routes reach the same latch.
+#[derive(Debug)]
+struct ConfAddWindow(Arc<Registers>);
+
+impl MemOps for ConfAddWindow {
+    fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
+        for (i, slot) in dst.iter_mut().enumerate() {
+            *slot = if offset + i as u64 == CONFADD_RESETCTL_OFFSET {
+                self.0.read_c()
+            } else {
+                // I/O space with nothing behind it. The board's pull-ups.
+                0xff
+            };
+        }
+        let _ = attrs;
+        Ok(())
+    }
+
+    fn write(&self, offset: u64, src: &[u8], attrs: MemAttrs) -> MemResult {
+        for (i, byte) in src.iter().enumerate() {
+            if offset + i as u64 != CONFADD_RESETCTL_OFFSET {
+                continue;
+            }
+            if attrs.debug {
+                // The same refusal `ResetCtl` makes, for the same reason: a
+                // debug write of bit 2 would reboot the machine somebody is
+                // debugging, and one that only latched bits 1 and 3 would
+                // still move bit 2's remembered level.
+                return Err(BusError::BadAccess);
+            }
+            self.0.write_c(*byte);
+        }
+        Ok(())
+    }
+
+    fn constraints(&self) -> AccessConstraints {
+        // Byte or word, because that is what reaches here: a Dword access to
+        // these four bytes is the host bridge's own `CONFADD` and never gets
+        // this far (82441FX §3.1.1).
+        AccessConstraints::IO.with_widths(Width::U8, Width::U16)
+    }
+}
+
 /// An 8-bit port on an 8-bit bus. Every port here is one byte at one address,
 /// so a wider access is a decode this board never performs.
 fn byte_port() -> AccessConstraints {
@@ -671,6 +736,16 @@ impl Device for SysCtl {
             ..State::default()
         };
         self.regs.drive_outputs();
+    }
+
+    fn export(&self, which: ExportId) -> Option<Export> {
+        // The four bytes at 0xcf8, for a host bridge that has to hold all of
+        // them. See `ConfAddWindow`.
+        (which == ExportId::PORT_PASSTHROUGH).then(|| {
+            Export::Opaque(Arc::new(super::PortPassthrough::new(
+                Arc::new(ConfAddWindow(Arc::clone(&self.regs))) as Arc<dyn MemOps>,
+            )))
+        })
     }
 
     fn region(&self, name: &str) -> Option<RegionRef> {

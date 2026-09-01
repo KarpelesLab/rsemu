@@ -33,6 +33,14 @@
 //! nothing at all — which is exactly what firmware that probes for shadow RAM
 //! expects to find when there is none.
 //!
+//! The shadow, where there is one, is not this device's: `pc-at` carries a
+//! [`pc.pmc`](super::pmc) host bridge whose PAM registers map main memory over
+//! these sockets, per 16 KiB window and separately for reads and for writes.
+//! The socket goes on behaving as a socket underneath it — a cycle the bridge
+//! does not claim still reaches the ROM, and a write it does not claim still
+//! goes nowhere. That division is the hardware's: a ROM chip has no idea it is
+//! being shadowed.
+//!
 //! # The image, the socket, and which end it sits at
 //!
 //! A socket has a fixed size, set by `size`, and `align` says which end a

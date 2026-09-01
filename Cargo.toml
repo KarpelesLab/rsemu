@@ -171,6 +171,20 @@ dev-wdc = []
 # dependencies.
 machine-beneater = ["cpu-mos6502", "dev-wdc"]
 
+# The PCI bus (src/bus/pci): configuration space and the fabric that routes to
+# it. Bus/device/function addressing, the 256-byte Type 00h header with a
+# per-byte write mask so a function states which of its registers the guest may
+# move, **master aborts** (an address nothing answers reads as ones, which is
+# how firmware finds an empty slot), and Configuration Mechanism #1 — the
+# 0xcf8/0xcfc pair, with `CONFADD` Dword-only and `CONFDATA` addressable a byte
+# at a time, both of which firmware depends on. Base address registers,
+# interrupt routing, type 1 cycles and PCI Express's extended space are
+# deliberately absent and the module says so. Written from the PCI Local Bus
+# Specification Rev 2.1 (§3.7.4.1, §6.1, §6.2) and the Intel 82441FX datasheet
+# (§3.1.1, §3.1.2, Table 1); no emulator source was consulted (ROADMAP.md §1).
+# `no_std + alloc`, no dependencies.
+bus-pci = []
+
 # The SPI bus (src/bus/spi): the fabric, the peripheral seam, and a generic
 # memory-mapped controller. Models the link **both ways** and makes the choice a
 # machine-description property rather than an accident (docs/buses/low-speed.md):
@@ -627,6 +641,20 @@ dev-pc = []
 # nothing yet asks for would be untested code. Needs `dev-pc`.
 dev-pc-video = ["dev-pc"]
 
+# The PC's PCI host bridge (src/dev/pc/pmc): an Intel 82441FX, the north bridge
+# of the 440FX PCIset, and with it the thing every current PC firmware asks a
+# chipset for before it can do anything else -- **RAM shadowing**. The PAM
+# registers at configuration offsets 0x59-0x5f switch 256 KiB of main memory
+# into and out of 0xc0000-0xfffff, sixteen kilobytes at a time, separately for
+# reads and for writes, so firmware can copy itself out of ROM into RAM and then
+# write-protect the copy. Without it a firmware that stores a variable in its
+# own f-segment reads back zero and stops. Also the 0xcf8/0xcfc configuration
+# window and the Type 00h header a firmware probes to decide there is a bridge
+# at all. Written from the Intel 82441FX datasheet (order 290549-001) §3.1.1,
+# §3.1.2 and §3.2.18, cited by section; no emulator source was consulted
+# (ROADMAP.md §1). Needs `bus-pci` and `dev-pc`.
+dev-pc-pci = ["dev-pc", "bus-pci"]
+
 # The PC's floppy controller (src/dev/pc/fdc): a NEC uPD765A as the AT wires
 # it, with the command phases, the result phases, seek and interrupt handling,
 # and both DMA and non-DMA data transfer. Needs `dev-pc` for the DMA controller
@@ -668,6 +696,7 @@ dev-pc-ide = ["dev-pc", "dev-ata-disk"]
 machine-pc-at = [
   "cpu-x86",
   "dev-pc",
+  "dev-pc-pci",
   "dev-pc-video",
   "dev-pc-floppy",
   "dev-pc-ide",

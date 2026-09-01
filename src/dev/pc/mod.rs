@@ -77,6 +77,10 @@ pub mod rom;
 pub mod rtc;
 pub mod sysctl;
 
+#[cfg(feature = "dev-pc-pci")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-pci")))]
+pub mod pmc;
+
 #[cfg(feature = "dev-pc-video")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-video")))]
 pub mod video;
@@ -89,12 +93,44 @@ pub mod fdc;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-ide")))]
 pub mod ide;
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::core::error::Result;
 use crate::core::registry::Registry;
+use crate::core::space::MemOps;
 use crate::machine::realize::Bindings;
 use crate::machine::validate::ClassSchema;
+
+/// A window of I/O space one chip decodes *inside* another chip's window.
+///
+/// The contract behind
+/// [`ExportId::PORT_PASSTHROUGH`](crate::core::device::ExportId::PORT_PASSTHROUGH),
+/// and it exists because a PC's `0xcf8`-`0xcfb` is claimed by the north bridge
+/// for a Dword access and its `0xcf9` byte by the south bridge for a byte
+/// access — two chips, one address, told apart by the byte enables. An
+/// [`AddressSpace`](crate::core::space::AddressSpace) decodes by address alone,
+/// so the chip that needs all four bytes holds them and passes the rest on.
+///
+/// The [`MemOps`] inside is addressed at the **same offsets as the outer
+/// window**, so a chip decoding `0xcf9` answers at offset 1 of a window based
+/// at `0xcf8`.
+#[derive(Debug)]
+pub struct PortPassthrough(Arc<dyn MemOps>);
+
+impl PortPassthrough {
+    /// Wrap `ops` as a pass-through window.
+    #[must_use]
+    pub fn new(ops: Arc<dyn MemOps>) -> PortPassthrough {
+        PortPassthrough(ops)
+    }
+
+    /// What answers the cycles the outer chip does not claim.
+    #[must_use]
+    pub fn ops(&self) -> &Arc<dyn MemOps> {
+        &self.0
+    }
+}
 
 /// Add every class in this module to a registry.
 ///
@@ -109,6 +145,8 @@ pub fn register(reg: &mut Registry) -> Result<()> {
     rom::register(reg)?;
     rtc::register(reg)?;
     sysctl::register(reg)?;
+    #[cfg(feature = "dev-pc-pci")]
+    pmc::register(reg)?;
     #[cfg(feature = "dev-pc-video")]
     video::register(reg)?;
     #[cfg(feature = "dev-pc-floppy")]
@@ -131,6 +169,8 @@ pub fn bind(b: &mut Bindings) -> Result<()> {
     rom::bind(b)?;
     rtc::bind(b)?;
     sysctl::bind(b)?;
+    #[cfg(feature = "dev-pc-pci")]
+    pmc::bind(b)?;
     #[cfg(feature = "dev-pc-video")]
     video::bind(b)?;
     #[cfg(feature = "dev-pc-floppy")]
@@ -153,6 +193,8 @@ pub fn schemas() -> Vec<ClassSchema> {
         rtc::schema(),
         sysctl::schema(),
     ];
+    #[cfg(feature = "dev-pc-pci")]
+    out.push(pmc::schema());
     #[cfg(feature = "dev-pc-video")]
     out.push(video::schema());
     #[cfg(feature = "dev-pc-floppy")]

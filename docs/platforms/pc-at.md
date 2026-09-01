@@ -51,6 +51,7 @@ address; every one of them is written once, in that file.
 | IDE channels (2) | `pc.ide` | 0x1f0-0x1f7 + 0x3f6, 0x170-0x177 + 0x376 | AT Technical Reference, fixed-disk adapter |
 | Hard disks (2 bays) | `ata.disk` | — (on the cable) | T13 ATA/ATAPI-6 |
 | Firmware sockets | `pc.rom` | 0xc0000, 0xe0000 (+ a high alias) | — |
+| PCI host bridge, and RAM shadowing | `pc.pmc` | 0xcf8-0xcff | Intel 82441FX data sheet |
 
 Six oscillators, because the board has six cans: the CPU clock, the 8254's
 105/88 MHz — not an integer number of hertz, which is why the description
@@ -132,7 +133,8 @@ Its own error messages say which of those it can do without. It reports finding
 that channel rather than requiring it; it has a path for "no PCI VGA devices
 found" and one for "no APIC"; it scans 0xc0000 for a **legacy option ROM**,
 which is exactly what this board offers; and it warns rather than stops when it
-cannot find a host bridge to unlock RAM for shadowing. Three of its checks are
+cannot find a host bridge to unlock RAM for shadowing — which it no longer has
+to, since the board grew one. Three of its checks are
 against this board's 8042 — a self test that must answer 0x55, an interface test
 that must answer 0x00, and a keyboard self test that must answer 0xaa — and
 `pc.kbc` answers all three.
@@ -157,41 +159,76 @@ What one such image does today, in order:
 1. Fetches its reset vector from `0xfffffff0`, takes the far jump into the low
    ROM window, sets `CR0.PE`, loads a GDT and runs 32-bit code.
 2. Prints its banner and its build string.
-3. Prints **"Unable to unlock ram - bridge not found"** — see below.
-4. Sizes RAM from the CMOS, and gets **zero**, because it stores the answer in
-   a variable in the `f` segment and that segment is ROM.
-5. Prints "No space for init relocation." and stops on `cli; hlt; jmp .-1`.
+3. Finds the host bridge at `00:00.0`, unlocks `0xc0000-0xfffff` through its
+   PAM registers, copies itself into the RAM that appears there and
+   write-protects the copy.
+4. Sizes RAM from the CMOS — **`RamSize: 0x01000000`**, which is the 640 KiB
+   plus 15 MiB the machine file declares — and relocates 44 KiB of init code
+   into high memory.
+5. Enumerates PCI, finds the one device there is, allocates its windows, and
+   reports no VGA and no APIC.
+6. Copies its PIR, MPTABLE and SMBIOS tables *into the f-segment*, which is
+   only possible because that segment is now RAM.
+7. Scans for a video option ROM, finds none, initialises the PS/2 keyboard,
+   programs counter 0 of the 8254 in mode 2 and the 8259A pair (`0xb8`/`0x8e`),
+   and takes timer interrupts at 18 Hz for as long as it is left running.
+8. Builds a five-entry e820 map, offers its boot menu, and boots. With the
+   drive empty it tries the floppy, tries the hard disk and settles into
+   `sti; hlt` with **"No bootable device. Retrying in 60 seconds."** With a
+   bootable diskette in it (`RSEMU_FLOPPY`) it says **"Booting from
+   0000:7c00"** and hands over — and the sector runs: a twenty-eight byte boot
+   sector that writes to `0xb8000` puts its string on the text page, which the
+   test prints.
 
-Step 4 is the blocker and step 3 is its cause. The firmware expects the
-`0xc0000-0xfffff` window to become **writable RAM** once it has asked a PCI
-host bridge to unlock it, and this board has neither the bridge nor the
-shadow. The same image on the same core against flat RAM — `cpu::x86::firmware`
-— runs twenty million instructions without complaint precisely because
-everything there is RAM, which is the control experiment for this claim.
+That is a complete POST and a complete boot. The BIOS data area agrees:
+equipment word `0x0007`, base memory 639 KiB at `0x413` (the EBDA takes the
+other kilobyte), the tick count at `0x46c` climbing. The floppy read went
+through the µPD765 and the 8237 on channel 2, so that path is exercised by a
+real driver rather than only by its own unit tests.
 
-With a writable copy of the image laid over that window as an experiment
-(`RSEMU_SHADOW=1` in the same test, which is **not** a board and says so), the
-firmware goes considerably further: RAM sizing succeeds, it relocates its init
-code into high memory, programs the 8259A pair (master mask `0xb8`, slave
-`0x8e`) and counter 0 of the 8254 in mode 2, takes **timer interrupts at 18 Hz
-for as long as it is left running**, and fills the BIOS data area — equipment
-word `0x0007`, base memory 639 KiB at `0x413`, the tick count at `0x46c`
-climbing. It then waits in the BIOS's own `sti; hlt; cli` idle without setting
-a video mode or loading a boot sector, and what it is waiting for is not yet
-known. It is the same with and without a video BIOS in the socket, so it is
-stuck *before* the option-ROM scan.
+### What that took, and what it cost
+
+Two things, and the second was a surprise.
+
+**The host bridge.** `pc.pmc` is an Intel 82441FX, and steps 3 and 4 above are
+the whole reason it exists. Its module docs quote the datasheet section that
+fixes the PAM encoding.
+
+**The log port's signature.** The test's sink at `0x402` used to answer reads
+with `0xff`, and that was fine for exactly as long as shadowing did not work.
+A firmware built for an emulated machine *probes* that port and stores a zero
+in its own f-segment if it dislikes the answer — and while the f-segment was a
+ROM socket the store was swallowed, so the log kept working **by accident**.
+The first run after shadowing landed printed the banner and then nothing at
+all. The sink now answers `0xe9`, which is Bochs's convention for its debug
+console, and the log came back. It is worth stating plainly: a working feature
+made a working instrument stop, because the instrument had been relying on a
+missing feature.
+
+### What is still not there
+
+**No video.** The firmware reports "No VGA found" and never sets a video mode,
+so nothing *it* prints reaches the screen — the text page only ever holds what
+a guest wrote there directly. That is not a bug in `pc.video` and it is not new
+— it happened before shadowing too — but it is
+now *explained*: the firmware sets PAM1-PAM5 to read/write, which turns
+`0xc0000-0xdffff` into blank DRAM, and it does not copy an ISA-style option
+ROM into it first because a 440FX-era machine gets its video ROM off a PCI
+card's expansion-ROM BAR. So this board's `vgarom` socket — a legacy ISA ROM
+at `0xc0000` — is invisible to a firmware that knows what a 440FX is. Getting
+a video BIOS in front of this firmware needs base address registers and a PCI
+VGA function, not a bigger ROM socket.
 
 ## What is known to be missing
 
-- **RAM shadowing, and the host bridge that controls it.** The system BIOS
-  window is a ROM socket: `pc.rom` swallows writes, which is what a board with
-  no shadow control does. Current firmware needs the window to be writable and
-  asks a PCI host bridge's PAM registers for it. This is the first thing
-  standing between this board and a boot, and it needs `bus-pci` and a host
-  bridge before it needs anything else.
-- **PCI.** Firmware probes `0xcf8`/`0xcfc` for a host bridge. With nothing
-  mapped there the reads return ones and the probe concludes there is no PCI —
-  measured: it says so and carries on.
+- **PCI base address registers.** `bus/pci` has configuration space, the
+  `0xcf8`/`0xcfc` mechanism and master aborts, and no BARs: a BAR is a mapping
+  that *moves*, from inside a configuration write, and no function in the tree
+  has one yet. It is the next thing this board needs, because a video BIOS
+  arrives on a PCI card's expansion-ROM BAR.
+- **Everything else on the bus.** One host bridge and nothing behind it. No
+  south bridge, so no PCI IDE, no PCI interrupt routing and no `PIRQ` swizzle;
+  no PCI VGA; no bridges, so no bus but bus 0.
 - **`0x510`/`0x511`.** A firmware built for another emulator reads its whole
   configuration — memory map, boot order, SMBIOS and ACPI tables — from a
   paravirtual interface at those ports. Its strings show it *detects* the
@@ -204,7 +241,8 @@ stuck *before* the option-ROM scan.
   is any graphics mode, deliberately.
 - **The keyboard takes raw set-2 scan codes** on a character port. Mapping a
   terminal's keystrokes to scan codes is a host concern and belongs in `host/`.
-- **No serial port, no parallel port, no PCI, no APIC, no ACPI.**
+- **No serial port, no parallel port, no APIC, no ACPI.** The firmware finds
+  and reports all four absences and carries on.
 - **No ATAPI.** The IDE channels carry `ata.disk` and nothing else; `IDENTIFY
   PACKET DEVICE` aborts, which is what a non-packet device does. A CD-ROM is a
   separate command set on the same transport, not a flag on this one.

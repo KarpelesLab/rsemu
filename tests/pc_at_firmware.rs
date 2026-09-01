@@ -41,6 +41,13 @@
 //!   what the firmware sizes RAM from.
 //! - **The 8259A pair and the 8254**, read back through their own commands:
 //!   what is pending, what is masked, what mode the counters are in.
+//! - **The host bridge's configuration space through 0xcf8/0xcfc**, and its
+//!   PAM registers in particular: they say which of the thirteen windows
+//!   between `0xc0000` and `0xfffff` is decoding RAM rather than ROM, and in
+//!   which direction. Beside them, a byte-for-byte comparison of the shadowed
+//!   f-segment against the high ROM alias — which is always the chip — so a
+//!   shadow that was never filled is distinguishable from one the firmware
+//!   filled and then wrote its own variables into.
 //! - **`0x7c00`**, where a boot sector lands, and the text page as characters.
 //!
 //! # The knobs
@@ -49,6 +56,7 @@
 //! | --- | --- |
 //! | `RSEMU_BIOS` | The system firmware image. Without it the test skips. |
 //! | `RSEMU_VGABIOS` | A video option ROM. Without it the socket is empty. |
+//! | `RSEMU_FLOPPY` | A diskette image, padded to 1.44 MB. Blank without it. |
 //! | `RSEMU_BIOS_MS` | How long to run, in virtual milliseconds. |
 //! | `RSEMU_TRACE` | How many instructions of tail to print. |
 //! | `RSEMU_TRACE_BACK_US` | Where the fine pass starts, before the stop. |
@@ -56,7 +64,6 @@
 //! | `RSEMU_TRACE_SKIP` | How many of those to skip first. |
 //! | `RSEMU_TRACE_IVT` | Poke each real-mode vector with its own number, so a |
 //! | | fault into a zeroed table says which vector it was. |
-//! | `RSEMU_SHADOW` | Lay writable RAM over the BIOS window. An experiment. |
 //!
 //! The run is deterministic, so the interesting instant can be found twice: a
 //! coarse pass runs until the machine stops making progress and records *when*
@@ -94,11 +101,10 @@ const DEFAULT_TRACE: usize = 64;
 
 /// The board, with the user's firmware in its sockets.
 ///
-/// `RSEMU_SHADOW` lays writable RAM holding a copy of the image over the
-/// system BIOS window — an experiment, not a board. That is what a chipset's
-/// PAM bits select when firmware unlocks the region for shadowing; this board
-/// has no such register, `pc.rom` says so in its own module docs, and the
-/// switch is here to measure what that costs rather than to supply it.
+/// Nothing is laid over the ROM window. There used to be a switch that did —
+/// writable RAM over `0xe0000`, to measure what shadowing would be worth before
+/// the mechanism existed — and it is gone because the mechanism exists: the
+/// board carries a `pc.pmc` whose PAM registers do the real thing.
 fn board(bios: Vec<u8>, vgabios: Option<Vec<u8>>) -> (Machine, Arc<X86>) {
     let cpus: Arc<Captured<X86>> = Arc::new(Captured::new());
     let mut b = Bindings::new();
@@ -116,13 +122,6 @@ fn board(bios: Vec<u8>, vgabios: Option<Vec<u8>>) -> (Machine, Arc<X86>) {
     let mut options = rsemu::machine::BuildOptions::new()
         .with_classes(rsemu::machine::catalog::classes())
         .with_bindings(b);
-    let shadow = std::env::var("RSEMU_SHADOW").is_ok().then(|| {
-        let ram = Arc::new(rsemu::core::space::RamStore::new(0x2_0000));
-        for (i, byte) in bios[bios.len() - 0x2_0000..].iter().enumerate() {
-            ram.write_u8(i as u64, *byte).expect("inside the store");
-        }
-        ram
-    });
     options.realize.media.insert("bios", bios);
     // A blank option ROM socket if the user named no video BIOS: 64 KiB of
     // zeroes has no `0x55 0xaa` signature, which is exactly what an empty
@@ -131,8 +130,16 @@ fn board(bios: Vec<u8>, vgabios: Option<Vec<u8>>) -> (Machine, Arc<X86>) {
         .realize
         .media
         .insert("vgabios", vgabios.unwrap_or_default());
-    // A formatted-looking blank diskette, and two empty IDE bays.
-    options.realize.media.insert("floppy", vec![0u8; 1_474_560]);
+    // The diskette: whatever `RSEMU_FLOPPY` points at, padded to 1.44 MB, or a
+    // blank one. Blank is the honest default — a PC with no disk in the drive
+    // is an ordinary PC — but a *bootable* one is the only way to measure the
+    // last step of a boot, which is the firmware handing control to 0x7c00.
+    let mut floppy = std::env::var("RSEMU_FLOPPY")
+        .ok()
+        .map(|p| std::fs::read(&p).unwrap_or_else(|e| panic!("{p}: {e}")))
+        .unwrap_or_default();
+    floppy.resize(1_474_560, 0);
+    options.realize.media.insert("floppy", floppy);
     options.realize.media.insert("hd0", Vec::new());
     options.realize.media.insert("hd1", Vec::new());
     let registry = rsemu::machine::catalog::registry().expect("this build's registry");
@@ -143,14 +150,6 @@ fn board(bios: Vec<u8>, vgabios: Option<Vec<u8>>) -> (Machine, Arc<X86>) {
     let cpu = cpus.take().expect("the constructor kept a handle");
     m.reset(ResetKind::Cold);
     m.sweep();
-    // After the reset, so that a cold reset's zeroing of RAM cannot reach it.
-    if let Some(ram) = shadow {
-        m.space("mem")
-            .expect("the memory space")
-            .topology()
-            .map_with_priority(rsemu::core::space::Region::ram("shadow", ram), 0xe_0000, 1)
-            .expect("over the ROM window");
-    }
     (m, cpu)
 }
 
@@ -167,6 +166,23 @@ fn peek_bytes(m: &Machine, addr: u64, len: u64) -> Vec<u8> {
     (0..len).map(|i| peek(m, addr + i)).collect()
 }
 
+/// What the log port answers a read with.
+///
+/// A firmware built for an emulated machine **probes** this port before it
+/// trusts it: it reads, and expects its own opcode-shaped signature back. The
+/// convention is Bochs's, whose debug console at 0xe9 reads back `0xe9`, and
+/// the port at 0x402 answers the same way.
+///
+/// That mattered the moment RAM shadowing started working, and the way it
+/// mattered is worth writing down. The variable holding "which port is the log
+/// port" lives in the firmware's own f-segment. With the f-segment a ROM
+/// socket, a firmware that probed, disliked the answer and stored a zero had
+/// its store *swallowed* — so the log kept working by accident. With the
+/// f-segment shadowed into RAM the store sticks, and an unrecognised port
+/// silently turns the log off. The first run after shadowing landed showed
+/// exactly that: the banner, then nothing.
+const DEBUG_PORT_SIGNATURE: u8 = 0xe9;
+
 /// A write-only port that keeps every byte written to it.
 ///
 /// Mapped at 0x402 by [`listen`], which is **not** part of the board: the
@@ -182,7 +198,7 @@ struct DebugPort {
 
 impl rsemu::core::space::MemOps for DebugPort {
     fn read(&self, _: u64, dst: &mut [u8], _: MemAttrs) -> rsemu::core::space::MemResult {
-        dst.fill(0xff);
+        dst.fill(DEBUG_PORT_SIGNATURE);
         Ok(())
     }
 
@@ -401,6 +417,79 @@ fn a_pc_firmware_image_runs_on_the_assembled_board() {
             u16::from(cmos[0x30]) | u16::from(cmos[0x31]) << 8,
             u16::from(cmos[0x34]) | u16::from(cmos[0x35]) << 8,
         );
+    }
+
+    // The host bridge's configuration space, read the way the firmware reads
+    // it, and the PAM registers in particular: they say which of the thirteen
+    // windows between 0xc0000 and 0xfffff is decoding RAM rather than ROM, and
+    // in which direction (Intel 82441FX datasheet §3.2.18).
+    {
+        let port = m.space("port").expect("the I/O space");
+        let mut cfg = [0u8; 0x60];
+        for (i, byte) in cfg.iter_mut().enumerate() {
+            let addr = 0x8000_0000u64 | (i as u64 & 0xfc);
+            port.write(0xcf8, Width::U32, addr, MemAttrs::DEFAULT).ok();
+            *byte = port
+                .read(0xcfc + (i as u64 & 3), Width::U8, MemAttrs::DEFAULT)
+                .unwrap_or(0xff) as u8;
+        }
+        println!("pc-at firmware: PCI 00:00.0 config 0x00..0x60:");
+        for (i, row) in cfg.chunks(16).enumerate() {
+            let hex: Vec<String> = row.iter().map(|b| format!("{b:02x}")).collect();
+            println!("  {:02x}  {}", i * 16, hex.join(" "));
+        }
+        println!(
+            "pc-at firmware: host bridge {:04x}:{:04x} class {:02x}{:02x}{:02x}, \
+             PAM0-6 = {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+            u16::from(cfg[0]) | u16::from(cfg[1]) << 8,
+            u16::from(cfg[2]) | u16::from(cfg[3]) << 8,
+            cfg[0x0b],
+            cfg[0x0a],
+            cfg[0x09],
+            cfg[0x59],
+            cfg[0x5a],
+            cfg[0x5b],
+            cfg[0x5c],
+            cfg[0x5d],
+            cfg[0x5e],
+            cfg[0x5f],
+        );
+        // Whether the shadow actually holds the firmware. The high ROM alias is
+        // always the chip, so comparing the two windows says whether the copy
+        // happened and whether it is intact.
+        let low = peek_bytes(&m, 0xf_0000, 0x1_0000);
+        let high = peek_bytes(&m, 0xffff_0000, 0x1_0000);
+        let same = low.iter().zip(&high).filter(|(a, b)| a == b).count();
+        println!(
+            "pc-at firmware: f-segment vs the high ROM alias: {same}/{} bytes agree, \
+             low[0..8]={:02x?}",
+            low.len(),
+            &low[..8]
+        );
+        // Where they differ, as runs. A shadow the firmware filled from the ROM
+        // and then wrote its own variables into shows a handful of short runs;
+        // one that was never filled shows one enormous run.
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        let mut start: Option<u64> = None;
+        for i in 0..=low.len() {
+            let differs = i < low.len() && low[i] != high[i];
+            match (differs, start) {
+                (true, None) => start = Some(i as u64),
+                (false, Some(s)) => {
+                    runs.push((s, i as u64 - s));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        println!(
+            "pc-at firmware: {} differing run(s); the ten longest:",
+            runs.len()
+        );
+        runs.sort_by_key(|(_, len)| core::cmp::Reverse(*len));
+        for (at, len) in runs.iter().take(10) {
+            println!("  0xf{:04x} +{len:#x}", at);
+        }
     }
 
     // The interrupt controllers, through their own OCW3 read-back: which
@@ -633,8 +722,16 @@ fn a_pc_firmware_image_runs_on_the_assembled_board() {
         }
     }
 
-    // The gate. Everything above is a report; these three are the claims, and
-    // each of them was false on this board a commit ago.
+    // The gate. Everything above is a report; these four are the claims, and
+    // each of them was false on this board at some point.
+    //
+    // The first is the board's rather than the firmware's: a Dword write to
+    // 0xcf8 followed by a Dword read of 0xcfc reaches the host bridge, and it
+    // answers with its own identity. That one is checked here because the
+    // firmware's whole memory map depends on it, and because 0xcf9 sits inside
+    // `CONFADD` — a board that mapped the reset control register there as well
+    // would split every one of those writes into three pieces and this read
+    // would come back as ones.
     //
     // A firmware that never leaves real mode did not fetch its reset vector —
     // the board's A20 gate was masking bit 20 out from under it — and one that
@@ -642,6 +739,16 @@ fn a_pc_firmware_image_runs_on_the_assembled_board() {
     // bus-fault counter is the third: an AT reads ones off an unterminated bus
     // and never faults, so a climbing count means the memory map has a hole
     // the firmware fell into.
+    {
+        let port = m.space("port").expect("the I/O space");
+        port.write(0xcf8, Width::U32, 0x8000_0000, MemAttrs::DEFAULT)
+            .expect("a Dword write to CONFADD");
+        assert_eq!(
+            port.read(0xcfc, Width::U32, MemAttrs::DEFAULT),
+            Ok(0x1237_8086),
+            "00:00.0 does not answer with the host bridge's vendor and device id"
+        );
+    }
     assert!(
         stop.protected,
         "the image never set CR0.PE on this board — see the trace above"

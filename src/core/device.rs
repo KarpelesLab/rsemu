@@ -183,6 +183,18 @@ impl ExportId {
     /// what was asked for, and nothing more.
     pub const DMC_FETCH: ExportId = ExportId(3);
 
+    /// A window of I/O space one chip decodes *inside* another chip's window.
+    /// Transported as [`Export::Opaque`].
+    ///
+    /// An address space decodes by address, and real chipsets sometimes do not:
+    /// a PC's `CONFADD` is four bytes at `0xcf8` that the north bridge claims
+    /// only for a Dword access, while the south bridge claims the single byte
+    /// at `0xcf9` only for a byte access. One owner has to hold the four bytes
+    /// here, so the one that needs all four holds them and hands the rest on —
+    /// which is what the 82441FX datasheet §3.1.1 calls "pass through", and it
+    /// is a fact about the fabric rather than about either chip.
+    pub const PORT_PASSTHROUGH: ExportId = ExportId(4);
+
     /// The name this id is known by, for an error message.
     ///
     /// `None` for an id nothing in this crate defines, which an embedder's own
@@ -193,6 +205,7 @@ impl ExportId {
             ExportId::TIMEBASE => Some("timebase"),
             ExportId::CYCLE_GATE => Some("cycle gate"),
             ExportId::DMC_FETCH => Some("DMC sample fetch"),
+            ExportId::PORT_PASSTHROUGH => Some("I/O port pass-through"),
             _ => None,
         }
     }
