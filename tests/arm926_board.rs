@@ -16,6 +16,7 @@
 #![cfg(feature = "machine-arm926")]
 
 use rsemu::core::clock::GlobalTime;
+use rsemu::core::device::DebugTranslation;
 use rsemu::core::space::MemAttrs;
 use rsemu::core::value::Width;
 use rsemu::machine::{Machine, catalog};
@@ -391,6 +392,128 @@ fn a_board_with_no_cp15_never_gets_past_the_first_mcr() {
     // The page table was still built — those are ordinary stores — which is
     // what makes this a fair comparison rather than a broken guest.
     assert_eq!(peek(&m, TABLE + 0x400), 0x0210_0c02);
+}
+
+/// What the guest wrote through the alias, and therefore what a debug read at
+/// the alias has to come back with.
+const ALIASED_WORD: u64 = 0xe3a0_a02b;
+
+#[test]
+fn a_debug_translation_follows_the_page_table_the_guest_built() {
+    // The seam, from the outside: a `dyn Device` is asked where a virtual
+    // address lives and answers with the physical one. `0x10000000` is the
+    // alias the firmware built; nothing whatsoever is mapped at physical
+    // `0x10000000`, so a wrong answer and a right one are not just different
+    // numbers, they are "some bytes" and "a bus fault".
+    let m = boot_mmu();
+    let cpu = m.device("cpu").expect("the board has a cpu").device();
+    assert_eq!(
+        cpu.debug_translate(0x1000_0000),
+        DebugTranslation::Mapped(ALIASED),
+        "the debug translation did not follow the guest's page table"
+    );
+    // And the bytes at the translated address are the ones the guest put there.
+    let space = m.space("mem").expect("the memory space");
+    let pa = cpu
+        .debug_translate(0x1000_0000)
+        .phys(0x1000_0000)
+        .expect("mapped");
+    assert_eq!(
+        space
+            .read(pa, Width::U32, MemAttrs::DEBUG)
+            .expect("a mapped word"),
+        ALIASED_WORD
+    );
+    // The untranslated read is the bug this exists to prevent: it does not
+    // return the wrong bytes, it returns nothing at all.
+    assert!(
+        space
+            .read(0x1000_0000, Width::U32, MemAttrs::DEBUG)
+            .is_err(),
+        "physical 0x10000000 must be unmapped, or this test proves nothing"
+    );
+    // An address the guest never mapped is refused rather than passed through.
+    assert_eq!(cpu.debug_translate(0x2000_0000), DebugTranslation::Unmapped);
+}
+
+#[test]
+fn a_debug_translation_leaves_the_fault_registers_and_the_tables_alone() {
+    // The no-side-effects property at board level. The firmware ends by taking
+    // a data abort, so CP15's fault status and address hold real values a
+    // careless debug walk would overwrite — and the walk reads descriptors out
+    // of DRAM, which it must not modify.
+    let m = boot_mmu();
+    let before = (
+        peek(&m, SCRATCH + 0x10),
+        peek(&m, SCRATCH + 0x14),
+        peek(&m, TABLE + 0x400),
+    );
+    let hash = m.state_hash().expect("a hash");
+
+    let cpu = m.device("cpu").expect("the board has a cpu").device();
+    for va in [0x1000_0000u64, 0x2000_0000, 0x0200_0000] {
+        let _ = cpu.debug_translate(va);
+    }
+
+    assert_eq!(
+        (
+            peek(&m, SCRATCH + 0x10),
+            peek(&m, SCRATCH + 0x14),
+            peek(&m, TABLE + 0x400)
+        ),
+        before,
+        "a debug translation changed guest memory"
+    );
+    assert_eq!(
+        m.state_hash().expect("a hash"),
+        hash,
+        "a debug translation changed the machine's state hash"
+    );
+}
+
+#[cfg(feature = "gdb")]
+#[test]
+fn a_gdb_memory_read_at_a_virtual_address_lands_on_the_mapped_page() {
+    // The other half of the defect, and the one that was wider than the
+    // disassembler: every address in an `m` or `M` packet is virtual, and with
+    // the MMU on the gdbstub was handing them straight to `core::space`.
+    use rsemu::host::gdb::{DebugTarget, MachineTarget};
+
+    let mut m = boot_mmu();
+    let mut target = MachineTarget::new(&mut m);
+
+    let mut got = [0u8; 4];
+    target
+        .read_memory(0, 0x1000_0000, &mut got)
+        .expect("the alias is mapped, so a debugger can read it");
+    assert_eq!(
+        u32::from_le_bytes(got),
+        ALIASED_WORD as u32,
+        "the gdbstub read physical 0x10000000 instead of translating"
+    );
+
+    // The same bytes are at the physical address the alias resolves to, and
+    // the physical route reaches them without translating.
+    let mut phys = [0u8; 4];
+    target
+        .read_physical(0, ALIASED, &mut phys)
+        .expect("the physical page is mapped");
+    assert_eq!(phys, got);
+
+    // And a virtual address the guest mapped nothing at is refused, rather
+    // than silently reading whatever the bus has at that number.
+    let mut nothing = [0u8; 4];
+    assert!(
+        target.read_memory(0, 0x2000_0000, &mut nothing).is_err(),
+        "an unmapped virtual address must be refused"
+    );
+
+    // A write goes the same way round: through the table, onto the physical
+    // page.
+    target
+        .write_memory(0, 0x1000_0000, &0xdead_beefu32.to_le_bytes())
+        .expect("the alias is writable");
+    assert_eq!(peek(&m, ALIASED), 0xdead_beef);
 }
 
 #[test]

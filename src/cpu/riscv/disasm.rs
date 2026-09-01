@@ -20,22 +20,70 @@ use super::csr;
 use super::isa::{self, Fmt, Op, Xlen};
 use super::{F_NAMES, X_NAMES};
 
-/// One disassembled instruction.
+/// Why a listing has a hole in it.
+///
+/// A listing does not stop at a hole and does not shorten: it carries the hole
+/// as a value and keeps going, because "the first ten instructions were fine"
+/// is exactly the case a monitor is looking at. Which *kind* of hole matters to
+/// whoever reads the listing — an address no page table maps is a different
+/// problem from one that maps to nothing on the bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Missing {
+    /// The page tables map nothing at that virtual address.
+    ///
+    /// Only ever produced by a listing that was given virtual addresses —
+    /// [`Hart::disassemble_virtual`](super::Hart::disassemble_virtual).
+    Untranslated,
+    /// Nothing answered at that physical address: the bus refused the read.
+    Unmapped,
+}
+
+impl fmt::Display for Missing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Missing::Untranslated => f.write_str("not mapped"),
+            Missing::Unmapped => f.write_str("no memory"),
+        }
+    }
+}
+
+/// One disassembled instruction, or one hole where an instruction could not be
+/// read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Disassembled {
     /// Where it starts.
     pub addr: u64,
-    /// How many bytes it occupies: 2 or 4.
+    /// How many bytes it occupies: 2 or 4. A hole claims 2, the narrowest
+    /// instruction, so a listing steps over it rather than sitting on it.
     pub len: u64,
-    /// The raw encoding, 16 or 32 bits wide as `len` says.
+    /// The raw encoding, 16 or 32 bits wide as `len` says. Zero for a hole.
     pub encoding: u32,
     /// The assembly text.
     pub text: String,
+    /// What was missing, when this entry is a hole rather than an instruction.
+    pub hole: Option<Missing>,
+}
+
+impl Disassembled {
+    /// A hole in a listing: nothing could be read at `addr`, for this reason.
+    #[must_use]
+    pub fn missing(addr: u64, why: Missing) -> Disassembled {
+        Disassembled {
+            addr,
+            len: 2,
+            encoding: 0,
+            text: format!("?? <{why}>"),
+            hole: Some(why),
+        }
+    }
 }
 
 impl fmt::Display for Disassembled {
     /// The one-line form a monitor listing wants.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.hole.is_some() {
+            return write!(f, "{:016x}:           {}", self.addr, self.text);
+        }
         if self.len == 2 {
             write!(
                 f,
@@ -312,6 +360,7 @@ pub fn disassemble_one(
             len: 2,
             encoding: u32::from(low),
             text,
+            hole: None,
         });
     }
     let high = read(addr.wrapping_add(2))?;
@@ -321,26 +370,40 @@ pub fn disassemble_one(
         len: 4,
         encoding: word,
         text: format_word(word, addr, xlen),
+        hole: None,
     })
 }
 
 /// Disassemble `count` instructions starting at `addr`.
 ///
-/// Stops early if the reader refuses, which is what makes it safe to point at
-/// the end of a mapping.
+/// **The result always holds `count` entries.** A halfword the reader refuses
+/// becomes a hole naming its reason ([`Disassembled::missing`]) and the listing
+/// carries on two bytes later, because a listing that runs off the end of a
+/// mapped page part-way through has still answered the first part of the
+/// question — and returning fewer entries would leave the caller unable to tell
+/// "that is where the region ends" from "we gave up for a reason we did not
+/// write down".
 #[must_use]
 pub fn disassemble_run(
     addr: u64,
     count: usize,
     xlen: Xlen,
-    mut read: impl FnMut(u64) -> Option<u16>,
+    mut read: impl FnMut(u64) -> Result<u16, Missing>,
 ) -> Vec<Disassembled> {
     let mut out = Vec::with_capacity(count);
     let mut at = addr;
     for _ in 0..count {
-        let Some(one) = disassemble_one(at, xlen, &mut read) else {
-            break;
-        };
+        // The first refusal in this instruction is the one the hole reports.
+        let mut why = None;
+        let one = disassemble_one(at, xlen, &mut |a| match read(a) {
+            Ok(half) => Some(half),
+            Err(reason) => {
+                why = why.or(Some(reason));
+                None
+            }
+        });
+        let one =
+            one.unwrap_or_else(|| Disassembled::missing(at, why.unwrap_or(Missing::Unmapped)));
         at = at.wrapping_add(one.len);
         out.push(one);
     }
@@ -418,24 +481,34 @@ mod tests {
     #[test]
     fn compressed_instructions_keep_their_own_mnemonic() {
         let mut halves = [0x0505u16, 0x8082].into_iter();
-        let out = disassemble_run(0x8000_0000, 2, Xlen::Rv64, |_| halves.next());
+        let out = disassemble_run(0x8000_0000, 2, Xlen::Rv64, |_| {
+            halves.next().ok_or(Missing::Unmapped)
+        });
         assert_eq!(out[0].len, 2);
         assert_eq!(out[0].text, "c.addi a0, a0, 1");
         assert_eq!(out[1].text, "c.jr zero, 0(ra)");
     }
 
     #[test]
-    fn a_run_stops_where_memory_does() {
-        let out = disassemble_run(
-            0,
-            4,
-            Xlen::Rv64,
-            |addr| {
-                if addr < 4 { Some(0x0013) } else { None }
-            },
-        );
-        assert_eq!(out.len(), 1);
+    fn a_run_carries_on_past_where_memory_stops_and_says_why() {
+        let out = disassemble_run(0, 4, Xlen::Rv64, |addr| {
+            if addr < 4 {
+                Ok(0x0013)
+            } else {
+                Err(Missing::Untranslated)
+            }
+        });
+        // Four asked for, four returned: the hole is a value, not a shorter
+        // answer with no explanation.
+        assert_eq!(out.len(), 4);
         assert_eq!(out[0].len, 4);
+        assert_eq!(out[0].hole, None);
+        for one in &out[1..] {
+            assert_eq!(one.hole, Some(Missing::Untranslated));
+            assert_eq!(one.len, 2, "a hole advances by the narrowest instruction");
+        }
+        assert_eq!(out[1].addr, 4);
+        assert_eq!(out[2].addr, 6);
     }
 
     #[test]
@@ -445,10 +518,25 @@ mod tests {
             len: 4,
             encoding: 0x0000_0013,
             text: "addi zero, zero, 0".into(),
+            hole: None,
         };
         assert_eq!(
             one.to_string(),
             "0000000080000000: 00000013  addi zero, zero, 0"
+        );
+    }
+
+    #[test]
+    fn a_hole_names_the_reason_it_is_a_hole() {
+        let one = Disassembled::missing(0x8000_0000, Missing::Untranslated);
+        assert_eq!(
+            one.to_string(),
+            "0000000080000000:           ?? <not mapped>"
+        );
+        let one = Disassembled::missing(0x8000_0000, Missing::Unmapped);
+        assert_eq!(
+            one.to_string(),
+            "0000000080000000:           ?? <no memory>"
         );
     }
 

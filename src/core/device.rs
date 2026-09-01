@@ -314,6 +314,44 @@ impl Export {
     }
 }
 
+/// Where a guest-virtual address lives, as [`Device::debug_translate`] answers
+/// it.
+///
+/// Three answers rather than `Option<u64>`, because "this device does not
+/// translate" and "this device translates and the tables map nothing here" are
+/// different facts and a debugger reports them differently: the first is a
+/// machine with no MMU, the second is a listing that has run off the end of a
+/// mapped page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugTranslation {
+    /// Nothing translates here: the address is already guest-physical.
+    ///
+    /// What every device that is not a CPU answers, and what a CPU with no MMU
+    /// — or one whose MMU is switched off — answers.
+    Identity,
+    /// The tables map it to this guest-physical address.
+    Mapped(u64),
+    /// The tables map nothing there.
+    Unmapped,
+}
+
+impl DebugTranslation {
+    /// The physical address to access, given the virtual address that was
+    /// asked about.
+    ///
+    /// `None` is [`DebugTranslation::Unmapped`], and a caller that turns it
+    /// into a bus fault is saying the right thing: there is no physical
+    /// address to refuse.
+    #[must_use]
+    pub const fn phys(self, va: u64) -> Option<u64> {
+        match self {
+            DebugTranslation::Identity => Some(va),
+            DebugTranslation::Mapped(pa) => Some(pa),
+            DebugTranslation::Unmapped => None,
+        }
+    }
+}
+
 /// Anything a machine is built from.
 ///
 /// `Send + Sync` from the first commit rather than once threading "is needed":
@@ -480,6 +518,44 @@ pub trait Device: Send + Sync + fmt::Debug {
     /// already low. An inverter, or anything whose output is a function of its
     /// inputs, must drive here or the machine comes up inconsistent.
     fn announce(&self, _port: &str) {}
+
+    /// Where a guest-virtual address lives, as a debugger asks it.
+    ///
+    /// Defaults to [`DebugTranslation::Identity`], which is the truth for every
+    /// device that does not translate — including a CPU with no MMU and a CPU
+    /// whose MMU is switched off. A core that *does* translate overrides this,
+    /// and is then the only place in the machine that knows how.
+    ///
+    /// # This is a question, never an action
+    ///
+    /// A debugger read must not have side effects (`ROADMAP.md` §15 invariant
+    /// 5), and that applies to the **table walk** as much as to the load it
+    /// leads to. An implementation therefore must not set an accessed or dirty
+    /// bit, must not fill the core's TLB, must not latch a fault status or a
+    /// fault address, and must issue every descriptor read it makes with
+    /// [`MemAttrs::DEBUG`](crate::core::space::MemAttrs::DEBUG) — a page table
+    /// can sit under an MMIO region, and a walk that read it as the guest would
+    /// is a debugger changing what it came to look at.
+    ///
+    /// It is a distinct entry point rather than a flag on the ordinary
+    /// translation path precisely because a flag is a thing a caller forgets.
+    ///
+    /// # It answers "where", not "may I"
+    ///
+    /// The question is which physical address a virtual one is mapped to, and
+    /// **nothing else**: no privilege level, no access kind, no permission
+    /// check. A debugger is not the guest. One that could not show a page the
+    /// guest may not read would be useless for exactly the cases people attach
+    /// a debugger for, and one that could not write a read-only page could not
+    /// patch a variable. Whether the resulting *physical* access is allowed
+    /// stays the address space's business, which is where a refusal a debugger
+    /// should respect actually lives.
+    ///
+    /// That is why this takes no [`MemAttrs`](crate::core::space::MemAttrs) and
+    /// no access kind: there is no answer for them to change.
+    fn debug_translate(&self, _va: u64) -> DebugTranslation {
+        DebugTranslation::Identity
+    }
 
     /// Whether this device forwards a level within one instant, with no state.
     ///

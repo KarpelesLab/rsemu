@@ -866,6 +866,124 @@ fn a_supervisor_access_to_an_unmapped_page_raises_a_page_fault() {
 }
 
 #[test]
+fn a_debug_listing_follows_the_page_table_and_a_physical_one_does_not() {
+    // The defect, stated as a test — and it predates the ARM MMU: this core has
+    // had a real Sv39 walker all along and its listing never used it. Entry 0
+    // identity-maps the first gigabyte so the code stays fetchable; entry 1
+    // points at a three-level walk that lands a 4 KiB page holding one
+    // recognisable instruction at virtual 0x4000_1000. Nothing at all is mapped
+    // at *physical* 0x4000_1000, so a listing that skipped translation cannot
+    // produce a plausible-looking wrong answer — it produces a hole.
+    let h = Harness::rv64gc(&[]);
+    let v = super::mmu::pte::V;
+    let x = super::mmu::pte::X;
+    let rw = super::mmu::pte::R | super::mmu::pte::W;
+    let ad = super::mmu::pte::A | super::mmu::pte::D;
+    let root = BASE + 0x1000;
+    h.put_u64(root, v | rw | x | ad);
+    h.put_u64(root + 8, (((BASE + 0x2000) >> 12) << 10) | v);
+    h.put_u64(BASE + 0x2000, (((BASE + 0x3000) >> 12) << 10) | v);
+    h.put_u64(
+        BASE + 0x3000 + 8,
+        (((BASE + 0x4000) >> 12) << 10) | v | rw | x | ad,
+    );
+    // `addi a0, a0, 1` at the start of the mapped page.
+    h.ram
+        .write_at(0x4000, &addi(10, 10, 1).to_le_bytes())
+        .unwrap();
+
+    let mut csrs = h.hart.csrs();
+    csrs.satp = (8 << 60) | (root >> 12);
+    csrs.priv_mode = Priv::Supervisor;
+    h.hart.set_csrs(csrs);
+
+    assert_eq!(h.hart.translate_debug(0x4000_1000), Some(BASE + 0x4000));
+
+    let listing = h.hart.disassemble_virtual(0x4000_1000, 1);
+    assert_eq!(listing[0].hole, None);
+    assert_eq!(listing[0].text, "addi a0, a0, 1");
+
+    // The same number read physically is nowhere, and says so rather than
+    // quietly following the table.
+    let listing = h.hart.disassemble_physical(0x4000_1000, 1);
+    assert_eq!(
+        listing[0].hole,
+        Some(super::disasm::Missing::Unmapped),
+        "a physical listing must not follow the page table"
+    );
+}
+
+#[test]
+fn a_debug_listing_that_runs_off_a_mapped_page_keeps_its_count() {
+    // Only one 4 KiB page is mapped in that gigabyte, so a listing near its end
+    // decodes what it can and then reports holes — four entries for four asked,
+    // each naming why, rather than a short answer with no explanation.
+    let h = Harness::rv64gc(&[]);
+    let v = super::mmu::pte::V;
+    let x = super::mmu::pte::X;
+    let rw = super::mmu::pte::R | super::mmu::pte::W;
+    let ad = super::mmu::pte::A | super::mmu::pte::D;
+    let root = BASE + 0x1000;
+    h.put_u64(root, v | rw | x | ad);
+    h.put_u64(root + 8, (((BASE + 0x2000) >> 12) << 10) | v);
+    h.put_u64(BASE + 0x2000, (((BASE + 0x3000) >> 12) << 10) | v);
+    h.put_u64(
+        BASE + 0x3000 + 8,
+        (((BASE + 0x4000) >> 12) << 10) | v | rw | x | ad,
+    );
+    h.ram
+        .write_at(0x4ffc, &addi(10, 10, 1).to_le_bytes())
+        .unwrap();
+
+    let mut csrs = h.hart.csrs();
+    csrs.satp = (8 << 60) | (root >> 12);
+    csrs.priv_mode = Priv::Supervisor;
+    h.hart.set_csrs(csrs);
+
+    let listing = h.hart.disassemble_virtual(0x4000_1ffc, 4);
+    assert_eq!(listing.len(), 4, "a hole must not shorten the listing");
+    assert_eq!(listing[0].hole, None);
+    for one in &listing[1..] {
+        assert_eq!(one.hole, Some(super::disasm::Missing::Untranslated));
+    }
+    assert_eq!(listing[1].addr, 0x4000_2000);
+}
+
+#[test]
+fn a_debug_listing_sets_no_accessed_bit() {
+    // The no-side-effects property where this architecture actually has one:
+    // an Sv39 walk sets `A` on the leaf, and a debugger's must not. The
+    // fixture's leaf starts with `A` and `D` clear, and executing through it
+    // would set them — which is what the walk test above asserts.
+    let h = Harness::rv64gc(&[]);
+    let v = super::mmu::pte::V;
+    let x = super::mmu::pte::X;
+    let rw = super::mmu::pte::R | super::mmu::pte::W;
+    let root = BASE + 0x1000;
+    h.put_u64(root, v | rw | x | super::mmu::pte::A | super::mmu::pte::D);
+    h.put_u64(root + 8, (((BASE + 0x2000) >> 12) << 10) | v);
+    h.put_u64(BASE + 0x2000, (((BASE + 0x3000) >> 12) << 10) | v);
+    let leaf = (((BASE + 0x4000) >> 12) << 10) | v | rw | x;
+    h.put_u64(BASE + 0x3000 + 8, leaf);
+
+    let mut csrs = h.hart.csrs();
+    csrs.satp = (8 << 60) | (root >> 12);
+    csrs.priv_mode = Priv::Supervisor;
+    h.hart.set_csrs(csrs);
+
+    let cycles = h.hart.cycles();
+    let tlb = h.hart.tlb_stats();
+    assert_eq!(h.hart.translate_debug(0x4000_1000), Some(BASE + 0x4000));
+    assert_eq!(
+        h.get_u64(BASE + 0x3000 + 8),
+        leaf,
+        "a debug walk set the accessed bit"
+    );
+    assert_eq!(h.hart.cycles(), cycles, "a debug walk charged a cycle");
+    assert_eq!(h.hart.tlb_stats(), tlb, "a debug walk touched the TLB");
+}
+
+#[test]
 fn the_tlb_absorbs_repeated_translations() {
     let h = Harness::rv64gc(&[]);
     let v = super::mmu::pte::V;

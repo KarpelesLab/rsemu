@@ -92,14 +92,24 @@ pub const PAGE_BITS: u32 = 12;
 /// The number of bytes in a page.
 pub const PAGE_SIZE: u64 = 1 << PAGE_BITS;
 
-/// Physical memory as the page-table walker needs to see it.
+/// Physical memory as the page-table walk *reads* it.
+///
+/// Split out of [`PhysMem`] so that the debug walk can demand this and only
+/// this. Setting the accessed and dirty bits is the one side effect a RISC-V
+/// translation has, and [`translate_debug`] must not have it — so rather than
+/// asking the walk to remember a flag, the debug entry point takes a memory
+/// handle that **cannot write**. A caller that gets it wrong does not compile.
+pub trait ReadPte {
+    /// Read a `bytes`-wide page-table entry from a physical address.
+    fn read_pte(&mut self, addr: u64, bytes: u32) -> Option<u64>;
+}
+
+/// Physical memory as a *guest* page-table walk needs to see it.
 ///
 /// A trait rather than two closures because a walk both reads a PTE and may
 /// write it back to set the accessed and dirty bits, and threading two
 /// `FnMut`s through a loop is worse than one object.
-pub trait PhysMem {
-    /// Read a `bytes`-wide page-table entry from a physical address.
-    fn read_pte(&mut self, addr: u64, bytes: u32) -> Option<u64>;
+pub trait PhysMem: ReadPte {
     /// Write a `bytes`-wide page-table entry back to a physical address.
     fn write_pte(&mut self, addr: u64, bytes: u32, value: u64) -> Option<()>;
 }
@@ -191,6 +201,21 @@ fn root(csrs: &Csrs) -> u64 {
     (csrs.satp & mask(scheme(csrs.xlen).ppn_bits)) << PAGE_BITS
 }
 
+/// What a walk found, and what the architecture would write on the way.
+///
+/// The walk itself is pure: it reads descriptors and reports the accessed and
+/// dirty update its leaf *would* need, and the caller decides whether to make
+/// it. That is what lets one description of Sv32/Sv39 serve both a guest access
+/// — which sets those bits — and a debugger's, which must not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Walked {
+    /// The physical address the virtual one names.
+    phys: u64,
+    /// `(address, width, new value)` for the accessed/dirty write-back, when
+    /// the leaf needs one and the walk was a guest's.
+    update: Option<(u64, u32, u64)>,
+}
+
 /// Translate a virtual address, walking the page tables.
 ///
 /// Returns the physical address, or the fault to raise. The caller is
@@ -208,8 +233,74 @@ pub fn translate<M: PhysMem>(
     kind: Access,
     mode: Priv,
 ) -> Result<u64, Fault> {
+    let walked = walk(csrs, mem, addr, Some(kind), mode)?;
+    // The specification allows either raising a page fault when A or D is
+    // clear, or setting them in hardware. Setting them is what real
+    // implementations do and what lets an operating system leave them out of
+    // its fault handler entirely.
+    if let Some((at, bytes, value)) = walked.update {
+        if !pmp_allows(csrs, at, u64::from(bytes), Access::Store, mode) {
+            return Err(Fault::Access);
+        }
+        mem.write_pte(at, bytes, value).ok_or(Fault::Access)?;
+    }
+    Ok(walked.phys)
+}
+
+/// Resolve a virtual address for a debugger: the same tables, no side effects,
+/// and no permission check.
+///
+/// Three differences from [`translate`], and each of them is the point:
+///
+/// * **`mem` is [`ReadPte`], not [`PhysMem`]**, so the accessed and dirty bits
+///   cannot be set — not "are not", *cannot be*. A debugger read that marked a
+///   page accessed would be changing the thing it came to look at, and on a
+///   guest that reclaims pages by their accessed bit it would change what the
+///   guest then does.
+/// * **No [`Access`] kind and no permission check.** The question is where the
+///   page is, not whether some access to it would be allowed; a debugger has no
+///   privilege level of its own. Without this, a supervisor with `SUM` clear
+///   could not be asked to show a user page, which is most of what a kernel
+///   debugger is for.
+/// * **No PMP check on the descriptor reads.** PMP is a protection, and this
+///   call is not an access.
+///
+/// `mode` is still needed, because whether translation happens at all is a
+/// property of the privilege the hart is running at: machine mode is never
+/// translated.
+///
+/// # Errors
+///
+/// A [`Fault`] meaning "nothing is mapped there", which a debugger reports
+/// rather than raises.
+pub fn translate_debug<M: ReadPte>(
+    csrs: &Csrs,
+    mem: &mut M,
+    addr: u64,
+    mode: Priv,
+) -> Result<u64, Fault> {
+    Ok(walk(csrs, mem, addr, None, mode)?.phys)
+}
+
+/// The Sv32/Sv39 walk itself, shared by both entry points.
+///
+/// `kind` is `None` for a debugger's walk: no permission check, no PMP on the
+/// descriptor reads, and no accessed/dirty update reported. It is private
+/// precisely so that "which kind of walk is this" is never a parameter anyone
+/// outside this module has to remember to pass — the two public functions above
+/// are the whole surface.
+fn walk<M: ReadPte>(
+    csrs: &Csrs,
+    mem: &mut M,
+    addr: u64,
+    kind: Option<Access>,
+    mode: Priv,
+) -> Result<Walked, Fault> {
     if !translation_active(csrs, mode) {
-        return Ok(addr);
+        return Ok(Walked {
+            phys: addr,
+            update: None,
+        });
     }
     let s = scheme(csrs.xlen);
     // Sv39 requires bits 63:39 of the virtual address to be a sign extension
@@ -231,8 +322,11 @@ pub fn translate<M: PhysMem>(
         let entry_addr = table + index * u64::from(s.pte_bytes);
         // Every page-table read is itself a physical access and is subject to
         // PMP; a walk that reads outside the permitted region is an access
-        // fault, not a page fault.
-        if !pmp_allows(csrs, entry_addr, u64::from(s.pte_bytes), Access::Load, mode) {
+        // fault, not a page fault. A debugger's walk is not an access, so PMP —
+        // a protection — does not apply to it.
+        if kind.is_some()
+            && !pmp_allows(csrs, entry_addr, u64::from(s.pte_bytes), Access::Load, mode)
+        {
             return Err(Fault::Access);
         }
         let pte = mem.read_pte(entry_addr, s.pte_bytes).ok_or(Fault::Access)?;
@@ -261,8 +355,11 @@ pub fn translate<M: PhysMem>(
         }
 
         // A leaf. Check the permissions before anything else, so a
-        // permission failure never sets the accessed bit.
-        if !permitted(csrs, pte, kind, mode) {
+        // permission failure never sets the accessed bit. A debugger's walk
+        // skips this entirely: it asked where the page is.
+        if let Some(kind) = kind
+            && !permitted(csrs, pte, kind, mode)
+        {
             return Err(Fault::Page);
         }
         // A superpage whose low physical page-number bits are not zero is
@@ -271,31 +368,28 @@ pub fn translate<M: PhysMem>(
             return Err(Fault::Page);
         }
 
-        // The specification allows either raising a page fault when A or D is
-        // clear, or setting them in hardware. Setting them is what real
-        // implementations do and what lets an operating system leave them out
-        // of its fault handler entirely.
-        let need = pte::A | if kind == Access::Store { pte::D } else { 0 };
-        if pte & need != need {
-            if !pmp_allows(
-                csrs,
-                entry_addr,
-                u64::from(s.pte_bytes),
-                Access::Store,
-                mode,
-            ) {
-                return Err(Fault::Access);
+        // Which accessed/dirty bits the leaf is missing, reported rather than
+        // written: the walk stays pure and the caller decides. A debugger's
+        // walk reports none, and could not perform one anyway — `mem` is
+        // [`ReadPte`].
+        let update = kind.and_then(|kind| {
+            let need = pte::A | if kind == Access::Store { pte::D } else { 0 };
+            if pte & need == need {
+                None
+            } else {
+                Some((entry_addr, s.pte_bytes, pte | need))
             }
-            mem.write_pte(entry_addr, s.pte_bytes, pte | need)
-                .ok_or(Fault::Access)?;
-        }
+        });
 
         // Assemble the physical address: the untranslated low bits of the
         // virtual address for the levels the superpage spans, then the PTE's
         // page number above.
         let low_bits = PAGE_BITS + s.vpn_bits * level;
         let phys = (ppn << PAGE_BITS) & !((1u64 << low_bits) - 1);
-        return Ok(phys | (addr & ((1u64 << low_bits) - 1)));
+        return Ok(Walked {
+            phys: phys | (addr & ((1u64 << low_bits) - 1)),
+            update,
+        });
     }
 }
 
@@ -529,7 +623,7 @@ mod tests {
     /// A flat physical memory for the walker to read tables out of.
     struct Ram(Vec<u8>);
 
-    impl PhysMem for Ram {
+    impl ReadPte for Ram {
         fn read_pte(&mut self, addr: u64, bytes: u32) -> Option<u64> {
             let at = addr as usize;
             let end = at + bytes as usize;
@@ -540,7 +634,9 @@ mod tests {
             }
             Some(v)
         }
+    }
 
+    impl PhysMem for Ram {
         fn write_pte(&mut self, addr: u64, bytes: u32, value: u64) -> Option<()> {
             let at = addr as usize;
             for i in 0..bytes as usize {
@@ -650,6 +746,55 @@ mod tests {
         let leaf = ram.read_pte(0x3000, 8).unwrap();
         assert_ne!(leaf & pte::A, 0);
         assert_eq!(leaf & pte::D, 0);
+    }
+
+    #[test]
+    fn a_debug_walk_sets_no_accessed_or_dirty_bit() {
+        // The direct statement of the no-side-effects rule: the same tables,
+        // the same leaf, and afterwards the PTE is byte-for-byte what it was.
+        // `translate` on the line below would set A — that is the assertion
+        // above this one — so a regression here is a debugger changing the
+        // guest's page-reclaim decisions by looking at memory.
+        let (csrs, mut ram) = sv39_machine(pte::R | pte::W);
+        let before = ram.read_pte(0x3000, 8).unwrap();
+        assert_eq!(before & (pte::A | pte::D), 0, "the fixture starts clean");
+        assert_eq!(
+            translate_debug(&csrs, &mut ram, 0, Priv::Supervisor),
+            Ok(0x4000)
+        );
+        assert_eq!(
+            ram.read_pte(0x3000, 8).unwrap(),
+            before,
+            "a debug walk wrote to the page table"
+        );
+    }
+
+    #[test]
+    fn a_debug_walk_resolves_a_page_the_permissions_would_hide() {
+        // A user page with `SUM` clear: a supervisor load faults, and a
+        // debugger still gets to see where the page is. A debugger has no
+        // privilege level of its own — it asked "where", not "may I".
+        let (csrs, mut ram) = sv39_machine(pte::R | pte::W | pte::U | pte::A | pte::D);
+        assert_eq!(
+            translate(&csrs, &mut ram, 0x40, Access::Load, Priv::Supervisor),
+            Err(Fault::Page)
+        );
+        assert_eq!(
+            translate_debug(&csrs, &mut ram, 0x40, Priv::Supervisor),
+            Ok(0x4040)
+        );
+    }
+
+    #[test]
+    fn a_debug_walk_of_an_unmapped_address_still_faults() {
+        // Permission-free is not fault-free: nothing is mapped in the second
+        // gigabyte of the fixture, and a listing that runs into it has to be
+        // told so rather than handed a plausible number.
+        let (csrs, mut ram) = sv39_machine(pte::R | pte::W | pte::A | pte::D);
+        assert_eq!(
+            translate_debug(&csrs, &mut ram, 0x4000_0000, Priv::Supervisor),
+            Err(Fault::Page)
+        );
     }
 
     #[test]

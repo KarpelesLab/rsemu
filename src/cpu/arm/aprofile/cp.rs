@@ -498,6 +498,33 @@ pub trait Mmu: Send + Sync + fmt::Debug {
         privileged: bool,
     ) -> Result<Pa, Fault>;
 
+    /// Resolve one address for a debugger, with no side effects at all.
+    ///
+    /// The question is *where is this mapped*, and nothing else: no access
+    /// kind, no privilege, no permission check. See
+    /// [`Device::debug_translate`](crate::core::device::Device::debug_translate)
+    /// for why a debugger asks it that way, and note that `mem` here reads the
+    /// tables with [`MemAttrs::DEBUG`](crate::core::space::MemAttrs::DEBUG).
+    ///
+    /// The default is the ordinary walk, asked as a privileged read. That is
+    /// correct for any MMU in this family, because the seam makes it so:
+    /// [`PhysMem`] is read-only, so a VMSAv5-shaped walk **cannot** write an
+    /// accessed or dirty bit back even if the architecture had one — and
+    /// VMSAv5 does not. What the default cannot do is see a page the
+    /// permissions hide; an implementation that wants a debugger to see one
+    /// anyway overrides this, as [`Cp15`](super::cp15::Cp15) does.
+    ///
+    /// The core never calls [`report_abort`](Mmu::report_abort) for a failure
+    /// here, so an implementation must not latch one itself.
+    ///
+    /// # Errors
+    ///
+    /// A [`Fault`] describing why nothing is mapped. The caller is a debugger,
+    /// so it reports the fault rather than taking an abort.
+    fn translate_debug(&self, mem: &dyn PhysMem, va: Va) -> Result<Pa, Fault> {
+        self.translate(mem, va, AccessKind::Read, true)
+    }
+
     /// Told about every abort the core takes, so `FSR` and `FAR` can be
     /// latched.
     ///

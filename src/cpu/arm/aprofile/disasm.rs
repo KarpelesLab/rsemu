@@ -24,6 +24,35 @@ use core::fmt;
 use super::isa::{Decoded, Insn};
 use super::thumb::Thumb;
 
+/// Why a listing has a hole in it.
+///
+/// A listing does not stop at a hole and does not shorten: it carries the hole
+/// as a value and keeps going, because "the first ten instructions were fine"
+/// is exactly the case a monitor is looking at. Which *kind* of hole it is
+/// matters to whoever reads the listing — an address that no page table maps is
+/// a different problem from one that maps to nothing on the bus, and telling
+/// them apart is the difference between "the guest has not mapped this yet" and
+/// "this board has no memory there".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Missing {
+    /// The page tables map nothing at that virtual address.
+    ///
+    /// Only ever produced by a listing that was given virtual addresses —
+    /// [`Arm::disassemble_virtual`](super::Arm::disassemble_virtual).
+    Untranslated,
+    /// Nothing answered at that physical address: the bus refused the read.
+    Unmapped,
+}
+
+impl fmt::Display for Missing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Missing::Untranslated => f.write_str("not mapped"),
+            Missing::Unmapped => f.write_str("no memory"),
+        }
+    }
+}
+
 /// One instruction at a known address, in whichever state it was decoded in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -53,6 +82,8 @@ pub enum Listed {
         addr: u32,
         /// Which instruction set was being decoded.
         thumb: bool,
+        /// What was missing.
+        why: Missing,
     },
 }
 
@@ -148,7 +179,7 @@ impl fmt::Display for Listed {
                     (None, _) => write!(f, "{insn}"),
                 }
             }
-            Listed::Unreadable { addr, .. } => write!(f, "{addr:08x}: ??"),
+            Listed::Unreadable { addr, why, .. } => write!(f, "{addr:08x}: ??        <{why}>"),
         }
     }
 }
@@ -174,32 +205,43 @@ pub fn disassemble_thumb(addr: u32, half: u16) -> Listed {
 
 /// Disassemble `count` instructions from `addr`, reading bytes through `read`.
 ///
-/// `read` returns `None` for a byte that cannot be read, which yields a
-/// [`Listed::Unreadable`] rather than a decode of invented data. Bytes are
-/// assembled little-endian, which is the byte order of every ARM instruction
-/// stream — even a big-endian ARMv5 fetches its instructions little-endian
-/// unless the whole memory system is BE-32, in which case the caller's `read`
-/// is what compensates.
+/// `read` reports why a byte cannot be read, which becomes a
+/// [`Listed::Unreadable`] rather than a decode of invented data. **The result
+/// always holds `count` entries**: a hole is a value, the walk steps over it by
+/// the width it was attempting, and the listing carries on. Returning fewer
+/// entries would leave the caller unable to tell "the region ended" from "we
+/// stopped for a reason we did not write down".
+///
+/// Bytes are assembled little-endian, which is the byte order of every ARM
+/// instruction stream — even a big-endian ARMv5 fetches its instructions
+/// little-endian unless the whole memory system is BE-32, in which case the
+/// caller's `read` is what compensates.
 pub fn disassemble_run(
     addr: u32,
     count: usize,
     thumb: bool,
-    mut read: impl FnMut(u32) -> Option<u8>,
+    mut read: impl FnMut(u32) -> Result<u8, Missing>,
 ) -> Vec<Listed> {
     let mut out = Vec::with_capacity(count);
     let mut at = addr;
     for _ in 0..count {
         let width = if thumb { 2 } else { 4 };
         let mut word = 0u32;
-        let mut ok = true;
+        // The first reason wins: an instruction straddling the end of a mapped
+        // page is missing for the reason its *first* absent byte gives.
+        let mut missing = None;
         for i in 0..width {
             match read(at.wrapping_add(i)) {
-                Some(byte) => word |= u32::from(byte) << (8 * i),
-                None => ok = false,
+                Ok(byte) => word |= u32::from(byte) << (8 * i),
+                Err(why) => missing = missing.or(Some(why)),
             }
         }
-        let listed = if !ok {
-            Listed::Unreadable { addr: at, thumb }
+        let listed = if let Some(why) = missing {
+            Listed::Unreadable {
+                addr: at,
+                thumb,
+                why,
+            }
         } else if thumb {
             disassemble_thumb(at, word as u16)
         } else {

@@ -44,8 +44,9 @@
 //! and [`Arm::set_regs`] for the whole file, [`Arm::reg`]/[`Arm::set_reg`] and
 //! [`Arm::cpsr`]/[`Arm::set_cpsr`] for one register, [`Arm::set_irq`] and
 //! [`Arm::set_fiq`] to drive the interrupt inputs, [`Arm::attach_mmu`] and
-//! [`Arm::attach_coprocessor`] for the system seam, and [`Arm::disassemble`]
-//! for a listing.
+//! [`Arm::attach_coprocessor`] for the system seam, and
+//! [`Arm::disassemble_virtual`] — or [`Arm::disassemble_physical`], because the
+//! caller says which kind of address it means — for a listing.
 //!
 //! ## The device path
 //!
@@ -98,7 +99,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::core::device::{
-    Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
+    DebugTranslation, Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
 };
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
@@ -1208,30 +1209,96 @@ impl Arm {
         self.session.lock().state.debt
     }
 
-    /// Disassemble `count` instructions starting at `addr`, reading guest
-    /// memory with debug attributes.
+    /// Where a virtual address is mapped, as a debugger asks it.
+    ///
+    /// `None` is "the tables map nothing there". With the MMU off — and on a
+    /// core built with `cp15 = "none"`, where it always is — this is the
+    /// identity and cannot fail.
+    ///
+    /// Side-effect free by construction, which is the whole point of it being a
+    /// separate call rather than a flag on the execution path: it does not
+    /// consult or fill the core's TLB, it does not charge a cycle, it does not
+    /// latch `FSR` or `FAR`, and the descriptor reads it makes carry
+    /// [`MemAttrs::DEBUG`] so a page table living under an MMIO region is not
+    /// disturbed by being looked at. VMSAv5 has no accessed or dirty bit to set
+    /// — and could not set one anyway, because
+    /// [`PhysMem`](cp::PhysMem) is read-only.
+    ///
+    /// It also asks a *permission-free* question: which physical address this
+    /// virtual one names, not whether some access to it would be allowed. See
+    /// [`Device::debug_translate`].
+    #[must_use]
+    pub fn translate_debug(&self, va: u32) -> Option<u32> {
+        let cfg = self.config();
+        let session = self.session.lock();
+        let space = session.space.as_ref()?;
+        exec::debug_translate(space, session.mmu.as_ref(), &cfg, va)
+    }
+
+    /// Disassemble `count` instructions starting at the **virtual** address
+    /// `addr`, reading guest memory with debug attributes.
+    ///
+    /// This is the one to hand [`pc`](Arm::pc), and the reason the two forms
+    /// have different names: an ARM program counter is a virtual address, and
+    /// with the MMU on a listing that skipped translation would decode whatever
+    /// happens to sit at the same number on the bus. Every byte is translated
+    /// through [`translate_debug`](Arm::translate_debug), so a listing that runs
+    /// off the end of a mapped page carries on into
+    /// [`Listed::Unreadable`](disasm::Listed::Unreadable) with
+    /// [`Missing::Untranslated`](disasm::Missing::Untranslated) rather than
+    /// stopping or inventing bytes — the count is always what was asked for.
     ///
     /// `thumb` picks the instruction set; pass [`Arm::is_thumb`] to follow the
-    /// core. Debug attributes are the point: a monitor listing the code around
-    /// the PC must not pop a FIFO or clear a status bit on the way
-    /// (`ROADMAP.md` §15, invariant 5).
-    ///
-    /// **`addr` is physical.** With the MMU on, a caller that passes
-    /// [`pc`](Arm::pc) — a virtual address — gets whatever is at that physical
-    /// address instead, which is usually nothing. Translating here needs the
-    /// walk to run under [`MemAttrs::DEBUG`] and needs an answer for a listing
-    /// that runs off the end of a mapped page, and neither is decided; until it
-    /// is, a debugger that wants a translated listing translates first.
+    /// core.
     #[must_use]
-    pub fn disassemble(&self, addr: u32, count: usize, thumb: bool) -> Vec<disasm::Listed> {
+    pub fn disassemble_virtual(&self, addr: u32, count: usize, thumb: bool) -> Vec<disasm::Listed> {
+        let cfg = self.config();
+        let session = self.session.lock();
+        let Some(space) = session.space.clone() else {
+            return Vec::new();
+        };
+        let mmu = Arc::clone(&session.mmu);
+        drop(session);
+        let attrs = MemAttrs::DEBUG.with_requester(cfg.requester);
+        disasm::disassemble_run(addr, count, thumb, |a| {
+            let pa = exec::debug_translate(&space, mmu.as_ref(), &cfg, a)
+                .ok_or(disasm::Missing::Untranslated)?;
+            space
+                .read(u64::from(pa), crate::core::value::Width::U8, attrs)
+                .map(|v| v as u8)
+                .map_err(|_| disasm::Missing::Unmapped)
+        })
+    }
+
+    /// Disassemble `count` instructions starting at the **physical** address
+    /// `addr`.
+    ///
+    /// The untranslated form, and it is not a legacy shim: a monitor inspecting
+    /// a ROM image, a board bring-up test and every conformance harness in the
+    /// tree genuinely want a bus address, and forcing them through a page table
+    /// the guest has not built yet would be the wrong answer, not a safer one.
+    /// The caller says which it means — that is why neither of these is called
+    /// `disassemble`.
+    ///
+    /// Debug attributes are the point either way: a monitor listing the code
+    /// around the PC must not pop a FIFO or clear a status bit on the way
+    /// (`ROADMAP.md` §15, invariant 5).
+    #[must_use]
+    pub fn disassemble_physical(
+        &self,
+        addr: u32,
+        count: usize,
+        thumb: bool,
+    ) -> Vec<disasm::Listed> {
         let Some(space) = self.space() else {
             return Vec::new();
         };
+        let attrs = MemAttrs::DEBUG.with_requester(self.config().requester);
         disasm::disassemble_run(addr, count, thumb, |a| {
             space
-                .read(u64::from(a), crate::core::value::Width::U8, MemAttrs::DEBUG)
-                .ok()
+                .read(u64::from(a), crate::core::value::Width::U8, attrs)
                 .map(|v| v as u8)
+                .map_err(|_| disasm::Missing::Unmapped)
         })
     }
 }
@@ -1304,6 +1371,23 @@ pub fn register(reg: &mut Registry) -> Result<()> {
 impl Device for Arm {
     fn class(&self) -> &'static DeviceClass {
         &CLASS
+    }
+
+    /// The debug surface's route to the MMU: this is how a gdb `m` packet
+    /// naming a virtual address reaches the right physical one.
+    ///
+    /// A 32-bit core, so the address is truncated on the way in and widened on
+    /// the way out. An address above 4 GiB cannot be mapped by anything an
+    /// ARMv5 has, so it is refused rather than silently wrapped into the low
+    /// four gigabytes and answered as if it were a different address.
+    fn debug_translate(&self, va: u64) -> DebugTranslation {
+        let Ok(va) = u32::try_from(va) else {
+            return DebugTranslation::Unmapped;
+        };
+        match self.translate_debug(va) {
+            Some(pa) => DebugTranslation::Mapped(u64::from(pa)),
+            None => DebugTranslation::Unmapped,
+        }
     }
 
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {

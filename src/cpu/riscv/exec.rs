@@ -152,18 +152,45 @@ struct Walker<'a> {
     accesses: u64,
 }
 
-impl mmu::PhysMem for Walker<'_> {
+impl mmu::ReadPte for Walker<'_> {
     fn read_pte(&mut self, addr: u64, bytes: u32) -> Option<u64> {
         self.accesses += 1;
         let width = Width::from_bytes(u64::from(bytes))?;
         self.space.read(addr, width, self.attrs).ok()
     }
+}
 
+impl mmu::PhysMem for Walker<'_> {
     fn write_pte(&mut self, addr: u64, bytes: u32, value: u64) -> Option<()> {
         self.accesses += 1;
         let width = Width::from_bytes(u64::from(bytes))?;
         self.space.write(addr, width, value, self.attrs).ok()
     }
+}
+
+/// Resolve one address the way a debugger asks it: no TLB, no accessed or
+/// dirty bit, no PMP, no permission check, no cycles, and every descriptor read
+/// carrying [`MemAttrs::DEBUG`].
+///
+/// A free function rather than a method on [`Exec`] because there is no step in
+/// progress: a monitor listing or a `m` packet arrives between instructions.
+/// This is the only route to [`mmu::translate_debug`] in the core, and the
+/// [`Walker`] it builds is handed over as a [`mmu::ReadPte`] — so the write
+/// half of [`mmu::PhysMem`] is not merely unused here, it is unreachable.
+///
+/// `None` means the tables map nothing there.
+pub(super) fn debug_translate(
+    st: &State,
+    space: &AddressSpace,
+    cfg: &Config,
+    va: u64,
+) -> Option<u64> {
+    let mut walker = Walker {
+        space,
+        attrs: MemAttrs::DEBUG.with_requester(cfg.requester),
+        accesses: 0,
+    };
+    mmu::translate_debug(&st.csrs, &mut walker, va, st.csrs.priv_mode).ok()
 }
 
 impl<'a> Exec<'a> {

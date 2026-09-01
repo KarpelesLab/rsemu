@@ -976,6 +976,17 @@ impl ArmV7m {
     /// Debug attributes are the point: a monitor listing the code around the
     /// PC must not pop a FIFO or clear a status bit on the way
     /// (`ROADMAP.md` §15, invariant 5).
+    ///
+    /// # There is only one kind of address here
+    ///
+    /// The A profile has to say whether it means a virtual or a physical
+    /// address ([`Arm::disassemble_virtual`](super::aprofile::Arm::disassemble_virtual)
+    /// and its physical twin). An ARMv7-M does not, and this is not an omission:
+    /// the M profile is **PMSA**. Its MPU *checks* an access against a region's
+    /// permissions and never remaps one, so a virtual address and a physical
+    /// address are the same number by construction (ARMv7-M ARM, B3.5 "Protected
+    /// Memory System Architecture"). Passing [`pc`](ArmV7m::pc) here is
+    /// correct, and there is no translation for a debugger to skip.
     #[must_use]
     pub fn disassemble(&self, addr: u32, count: usize) -> Vec<Listed> {
         let Some(space) = self.space() else {
