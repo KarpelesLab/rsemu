@@ -55,10 +55,40 @@ anything**; this table records a point in time.
 | [ZEXALL-SMS](https://www.smspower.org/Homebrew/ZEXALL-SMS) | The same exerciser on a Master System, reporting through the SDSC debug console at `$FC`/`$FD` — the only SMS test ROM that reports as *text* rather than by drawing | **GPL-2.0** ⛔ (the licence file ships inside the archive) | **No.** Download and run only |
 | [SMS VDP Test](https://www.smspower.org/Homebrew/SMSVDPTest-SMS) (FluBBa) | Master System VDP registers, latches, collision, interrupt timing | No licence file ⛔ | **No** — and not automatable either: it reports on screen only, with no documented pass/fail location |
 | [SMS Test Suite](https://github.com/sverx/SMSTestSuite) (sverx) | Master System video patterns, pads, paddle, BIOS checksums | No licence file ⛔ | **No** — and it needs buttons pressed, so it is a manual suite |
+| [Berkeley TestFloat](http://www.jhauser.us/arithmetic/TestFloat.html) | IEEE 754 arithmetic — the standard cross-check for a soft-float implementation | BSD-style ⚠️ — the project page says "release 3 and later have a U.C. Berkeley open-source license"; the exact text is in the release's `COPYING.txt` and has **not** been verified here | Not vendored, and not wired up — see below |
 
 The MIT-licensed SingleStepTests corpora are the ones we could legitimately
 vendor — and they are also the most valuable, since they test at bus-cycle
 granularity. Even so, size argues for downloading them.
+
+### Floating point has no fetchable corpus, and why
+
+`src/float` is checked against IEEE 754-2019 directly (directed vectors, and an
+exact-integer proof that each result is the correctly rounded one), against the
+host FPU where the host is an oracle, and against binary64 for the x87 path at
+`PC = 53`. There is no downloaded corpus behind any of that, and the reason is
+worth writing down rather than rediscovering.
+
+The obvious candidate is **Berkeley TestFloat**, which is what everyone else
+uses. Three things stop it being a `fetch-testdata.sh` entry today:
+
+* It **generates** its cases by running a program rather than shipping vectors,
+  so "download a corpus" is really "build a C program", which needs a toolchain
+  the default test path does not have (`riscv-arch-test` is the one existing
+  exception, and it says so).
+* The program it compares against **is Berkeley SoftFloat** — TestFloat's
+  reference implementation is that library. Running it is black-box use and is
+  fine; but its source is a soft-float implementation, and this subsystem was
+  written without opening *any* soft-float implementation's source, permissive
+  or not. That is hygiene beyond what the licence requires, and it is cheaper to
+  keep than to re-establish.
+* Its licence is a BSD-style U.C. Berkeley one — almost certainly usable — but
+  "almost certainly" is not the standard this table holds itself to, and nothing
+  currently depends on the answer.
+
+The shape it would take when it is wanted: build the generator **outside** this
+repository, dump its vector files into `$RSEMU_TESTDATA/testfloat/`, and add an
+env-gated runner that reads them. Nothing about `src/float` would change.
 
 ## What each milestone is gated on
 

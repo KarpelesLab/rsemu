@@ -16,7 +16,7 @@
 //! | the interpreter | `exec` |
 //! | CSRs, privilege modes, trap causes, interrupt lines | [`csr`] |
 //! | Sv39/Sv32 walk, PMP, the software TLB | [`mmu`] |
-//! | software IEEE-754 binary32 and binary64 | [`float`] |
+//! | software IEEE-754 binary32 and binary64 | [`crate::float`] |
 //! | the `riscv-tests` runner and its ELF loader | `conformance`, [`elf`] |
 //!
 //! **RV64I and RV32I are the same core**, selected by [`Config::xlen`] — a
@@ -28,8 +28,11 @@
 //!
 //! `ROADMAP.md` §9.1 names a software IEEE-754 implementation as a deliverable
 //! rather than an assumption, because guest floating point executed on host
-//! floating point cannot be bit-identical across hosts. [`float`] is that
-//! implementation and there is **no host-float path in this core at all** —
+//! floating point cannot be bit-identical across hosts. [`crate::float`] is
+//! that implementation — it is shared with every other guest rather than owned
+//! by this core, and RISC-V's rules reach it as
+//! [`Env::RISCV`](crate::float::Env::RISCV) — and there is **no host-float
+//! path in this core at all** —
 //! not even behind a flag — so `F` and `D` results, including NaN payloads,
 //! subnormals and the sticky `fcsr` flags, are reproducible on x86, AArch64
 //! and wasm alike.
@@ -76,7 +79,6 @@ pub mod csr;
 pub mod disasm;
 pub mod elf;
 mod exec;
-pub mod float;
 pub mod isa;
 
 // The IR frontend needs both this core and `src/ir`, so it has its own feature

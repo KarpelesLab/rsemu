@@ -33,10 +33,10 @@ use crate::core::space::{AddressSpace, MemAttrs};
 use crate::core::value::Width;
 
 use super::csr::{self, Csrs, Lines, Priv, cause, irq, status};
-use super::float::{self, B32, B64, Format, Round};
 use super::isa::{self, Op, Xlen};
 use super::mmu::{self, Access, Tlb};
 use super::{Config, PAGE_MASK};
+use crate::float::{self, B32, B64, Env, Flags, Format, Round};
 
 /// A trap the current instruction raised.
 ///
@@ -379,7 +379,7 @@ impl<'a> Exec<'a> {
         if v >> 32 == 0xffff_ffff {
             v & 0xffff_ffff
         } else {
-            B32::CANONICAL_NAN
+            B32::QUIET_NAN
         }
     }
 
@@ -390,10 +390,14 @@ impl<'a> Exec<'a> {
     }
 
     /// Accumulate floating-point exception flags into `fcsr`.
+    ///
+    /// The shared arithmetic reports the five IEEE exceptions in the standard's
+    /// own order; `fcsr.fflags` has its own, so the translation is
+    /// [`Flags::to_fcsr`] rather than a cast.
     #[inline]
-    fn raise(&mut self, flags: u32) {
-        if flags != 0 {
-            self.st.csrs.fcsr |= u64::from(flags);
+    fn raise(&mut self, flags: Flags) {
+        if !flags.is_empty() {
+            self.st.csrs.fcsr |= u64::from(flags.to_fcsr());
             self.st.csrs.dirty_fp();
         }
     }
@@ -1359,19 +1363,23 @@ impl<'a> Exec<'a> {
         Ok(())
     }
 
-    /// Resolve an instruction's rounding mode against `fcsr.frm`.
+    /// Resolve an instruction's rounding mode against `fcsr.frm`, as this
+    /// architecture's floating-point environment.
     ///
     /// An `rm` field of 7 means "dynamic"; a reserved mode in either place
     /// makes the instruction illegal, which is the only way a program finds
-    /// out it wrote nonsense to `frm`.
-    fn rounding(&self, word: u32) -> Option<Round> {
+    /// out it wrote nonsense to `frm`. Everything else about how RISC-V wants
+    /// arithmetic done — one canonical NaN, exact subnormals, tininess after
+    /// rounding, saturating conversions — is [`Env::RISCV`], so the rounding
+    /// direction is the only part an instruction chooses.
+    fn rounding(&self, word: u32) -> Option<Env> {
         let field = isa::funct3(word);
         let mode = if field == 7 {
             ((self.st.csrs.fcsr >> 5) & 7) as u32
         } else {
             field
         };
-        Round::from_bits(mode)
+        Round::from_riscv_rm(mode).map(|r| Env::RISCV.round(r))
     }
 
     /// Every `F` and `D` instruction.
@@ -1506,9 +1514,9 @@ impl<'a> Exec<'a> {
             Op::FminS | Op::FmaxS => {
                 let (x, y) = (self.fs(rs1), self.fs(rs2));
                 let (v, f) = if op == Op::FminS {
-                    float::min::<B32>(x, y)
+                    float::min::<B32>(x, y, Env::RISCV)
                 } else {
-                    float::max::<B32>(x, y)
+                    float::max::<B32>(x, y, Env::RISCV)
                 };
                 self.set_fs(rd, v);
                 self.raise(f);
@@ -1516,9 +1524,9 @@ impl<'a> Exec<'a> {
             Op::FminD | Op::FmaxD => {
                 let (x, y) = (self.f(rs1), self.f(rs2));
                 let (v, f) = if op == Op::FminD {
-                    float::min::<B64>(x, y)
+                    float::min::<B64>(x, y, Env::RISCV)
                 } else {
-                    float::max::<B64>(x, y)
+                    float::max::<B64>(x, y, Env::RISCV)
                 };
                 self.set_f(rd, v);
                 self.raise(f);
@@ -1545,8 +1553,8 @@ impl<'a> Exec<'a> {
                 self.raise(f);
             }
 
-            Op::FclassS => self.set_x(rd, float::classify::<B32>(self.fs(rs1))),
-            Op::FclassD => self.set_x(rd, float::classify::<B64>(self.f(rs1))),
+            Op::FclassS => self.set_x(rd, float::classify::<B32>(self.fs(rs1)).riscv_fclass()),
+            Op::FclassD => self.set_x(rd, float::classify::<B64>(self.f(rs1)).riscv_fclass()),
 
             Op::FcvtSD => {
                 let rm = rm()?;
