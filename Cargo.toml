@@ -34,7 +34,7 @@ oxideav-png = { version = "0.1", default-features = false, optional = true }
 # are the two a qcow2 with compressed clusters actually reads through, and both
 # come from `compcol`, which is permitted already. Optional, so the default
 # `cargo tree` is still only `rsemu`.
-fstool = { version = "0.4.21", default-features = false, features = [
+fstool = { version = "0.4.24", default-features = false, features = [
   "gzip",
   "zstd",
 ], optional = true }
