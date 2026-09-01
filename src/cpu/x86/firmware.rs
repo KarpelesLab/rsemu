@@ -159,7 +159,7 @@ fn a_pc_firmware_image_reaches_protected_mode_and_keeps_running() {
     println!(
         "firmware: {executed} instructions; protected mode after {:?}; stopped at \
          {:04x}:{:08x}",
-        protected_after, regs.cs, regs.eip
+        protected_after, regs.cs, regs.rip
     );
     println!("firmware: {regs}");
     println!(
