@@ -73,8 +73,11 @@ Roadmap §1 has the long form. When in doubt, ask **before** reading.
   `std` appears under `host/`, `jit/`, `accel/` — and, as documented exceptions,
   `dev/blk/*` and `dev/net/*`, because `fstool` and `pktkit` are `std` crates.
   Those two are feature-gated so a `no_std` build excludes them.
-- CI builds `--no-default-features --features alloc`. A `std` leak into the
-  emulation core is a build break, not a style nit.
+- CI builds `--no-default-features`, and that is the whole `no_std` gate:
+  `std` is a *default* feature, so dropping the defaults is what sets
+  `#![no_std]`. There is no `alloc` feature to enable — `extern crate alloc` is
+  unconditional. A `std` leak into the emulation core is a build break, not a
+  style nit.
 
 ## `unsafe`
 
