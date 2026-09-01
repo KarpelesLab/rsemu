@@ -218,7 +218,7 @@ mod tests {
         {
             crate::cpu::x86::schemas()
                 .into_iter()
-                .find(|s| s.class == "cpu.i8086")
+                .find(|s| s.class == "cpu.x86")
                 .expect("the core publishes both of its class names")
         }
         // Without the core compiled in there is nothing to ask, and the board
@@ -226,7 +226,7 @@ mod tests {
         // chipset's, not the processor's.
         #[cfg(not(feature = "cpu-x86"))]
         {
-            ClassSchema::new("cpu.i8086")
+            ClassSchema::new("cpu.x86")
                 .prop(PropSchema::new("model", crate::core::props::ValueKind::Str))
                 .prop(PropSchema::new(
                     "engine",

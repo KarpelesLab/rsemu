@@ -1089,11 +1089,11 @@ pub(crate) struct Lines {
     /// Whether an `a20` pin exists at all.
     ///
     /// The distinction the mask alone cannot make: a board with no gate has
-    /// bit 20 permanently connected, while a board that wires one starts with
-    /// it **shut**, because a fresh net sits low and low is what a closed gate
-    /// looks like. Getting that backwards makes a cold-booted AT disagree with
-    /// the same AT restored from a snapshot, since the wire's own state is
-    /// replayed on load either way.
+    /// bit 20 permanently connected, while a board that wires one takes the
+    /// level off its net. Between `connect` and the realize sweep there is no
+    /// level to take, so the mask sits shut — a fresh net is low — and the
+    /// sweep replaces it with what the chipset actually drives before anything
+    /// executes. After that the pin is never invented again, reset included.
     a20_wired: AtomicBool,
     /// What answers the `INTR` acknowledge cycle, if a controller drives it.
     ///
@@ -1192,11 +1192,6 @@ impl Lines {
     fn wire_a20(&self) {
         self.a20_wired.store(true, Ordering::Release);
         self.set_a20(false);
-    }
-
-    /// The level a reset leaves the gate at: open if there is no gate.
-    fn a20_at_reset(&self) -> bool {
-        !self.a20_wired.load(Ordering::Acquire)
     }
 
     /// Add a controller to those that answer the acknowledge cycle on `INTR`.
@@ -1412,8 +1407,11 @@ impl X86 {
     /// memory.
     ///
     /// Open unless something drives the `a20` pin low. A board with no gate
-    /// wired has bit 20 permanently connected; a board that wires one starts
-    /// with it shut, because that is what its net sitting low means.
+    /// wired has bit 20 permanently connected; a board that wires one takes
+    /// the level from its net, which the realize sweep announces before
+    /// anything executes. On a PC/AT that level is **high** — the 8042's
+    /// output port comes up all-ones, and a gate shut at power-on would mask
+    /// bit 20 out of the reset vector itself.
     ///
     /// The gate is not a processor feature on real silicon — it sits in the
     /// chipset, between the CPU and the bus — but rsemu has no device between
@@ -1962,10 +1960,21 @@ impl Device for X86 {
         drop(session);
         if kind == ResetKind::Cold {
             self.lines.restore((false, false, false, 0));
-            // A board with a gate comes back with it shut, which is what its
-            // net sitting low means and what an AT does; a board with no gate
-            // has bit 20 permanently connected.
-            self.lines.set_a20(self.lines.a20_at_reset());
+            // **The A20 mask is deliberately not touched here.** The gate is
+            // not in the processor — it is a chipset AND gate on the address
+            // bus, modelled here only because rsemu has nothing between an
+            // initiator and its space — so a `RESET` on the processor does not
+            // move it. Driving it shut from here was inventing a level for an
+            // input pin, and the machine could not correct it: a driver
+            // re-announcing the level it was already at is not a change, and
+            // `Wire::set` delivers changes. The result was an AT whose 8042
+            // held the gate open while the core masked bit 20 anyway, so the
+            // reset vector at `0xfffffff0` was fetched from `0xffeffff0`,
+            // which decodes to nothing. Whatever the net says, the pin says.
+            //
+            // A board with no gate wired keeps `u32::MAX` from construction,
+            // which is bit 20 permanently connected — the right answer for a
+            // machine that has no such chip.
         } else {
             // The input *levels* belong to whatever drives them, not to the
             // CPU — clearing them here would make a reset lie about the

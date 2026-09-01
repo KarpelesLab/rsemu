@@ -140,14 +140,36 @@ machine "pc-at" {
 
   # -- the processor ----------------------------------------------------------
   #
+  # An **80486**, named as such, because that is the part this board is wired
+  # for and a machine file describes a board rather than a preference. The
+  # evidence is above and below this line: a 32-bit `mem` space, a 25 MHz clock
+  # whose own comment calls it "a 386DX of the period", the ROM decoded a
+  # second time just under 4 GiB so that a reset vector at 0xfffffff0 finds it,
+  # an ELCR at 0x4d0/1, fast A20 at 0x92, reset control at 0xcf9, and an IDE
+  # cable. Not one of those is on a 1984 PC/AT. `pc-at` names the *lineage* —
+  # the AT's port map, its two cascaded 8259As, its 8042, its CMOS layout —
+  # and not the part in the socket, exactly as every "PC/AT-compatible" 486
+  # clone did.
+  #
+  # A 486 and not a 386 because current firmware executes `CPUID`, which a 386
+  # answers with #UD. If a 286-era board is ever wanted it should be a second
+  # machine file with its own memory map and no high ROM alias, not a property
+  # on this one.
+  #
+  # The class is `cpu.x86` rather than `cpu.i8086`: they are one core and the
+  # names differ only in what an unwritten `model` would mean (an 8088 under
+  # the older name, an 80486 under this one). `model` is written out anyway, so
+  # neither default is load-bearing.
+  #
   # `iospace` names the second space, because `space =` is structural and there
   # is only one of it. A core with no I/O space reads ones and discards writes,
   # which is what an unpopulated bus does — and would make every chip below
   # invisible, so it is named explicitly rather than defaulted.
-  object cpu0 "cpu.i8086" {
+  object cpu0 "cpu.x86" {
     clock   = cpu
     space   = mem
     iospace = "port"
+    model   = "80486"
     engine  = "interp"
   }
 

@@ -89,8 +89,8 @@ fn bindings(cpus: &Arc<Captured<X86>>) -> Bindings {
     rsemu::dev::pc::bind(&mut b).expect("the chipset");
     rsemu::dev::ata::bind(&mut b).expect("the hard disks");
     let kept = Arc::clone(cpus);
-    b.bind("cpu.i8086", move |props| {
-        let cpu = Arc::new(X86::from_props_defaulting(props, Variant::I8088)?.as_i8086());
+    b.bind("cpu.x86", move |props| {
+        let cpu = Arc::new(X86::from_props_defaulting(props, Variant::I80486)?);
         kept.push(&cpu);
         Ok(cpu)
     })

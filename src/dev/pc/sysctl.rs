@@ -639,7 +639,11 @@ impl Device for SysCtl {
 
     fn reset(&self, _kind: ResetKind) {
         // Both a cold and a warm reset land here with everything clear, which
-        // is the state the board powers up in: speaker silent, A20 masked.
+        // is the state the board powers up in: speaker silent, and the fast
+        // A20 path idle. Idle is not the same as shut — this is one of the
+        // net's two drivers and the 8042 is the other, wire-ORed, and that one
+        // comes out of reset holding the gate *open* (see `kbc`'s
+        // `OUTPUT_PORT_RESET`, and `docs/platforms/pc-at.md`).
         //
         // The two remembered *input* levels stay. They are not this device's to
         // clear: they are what the 8254 is driving onto `refresh` and `timer2`,

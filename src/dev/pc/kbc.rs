@@ -157,13 +157,28 @@ const OP_KBD_OBF: u8 = 0x10;
 /// Auxiliary output-buffer-full, reported on a read of the port.
 const OP_AUX_OBF: u8 = 0x20;
 
-/// What the output port holds out of reset.
+/// What the output port holds out of reset: **every line high**.
 ///
-/// Reset inactive (the line is active low, so the bit is *set*) and A20 shut,
-/// which is the state a real AT powers up in — the gate exists precisely so
-/// that the megabyte wrap of an 8086 survives, and firmware opens it when it
-/// wants the memory above.
-const OUTPUT_PORT_RESET: u8 = OP_RESET;
+/// P2 is a quasi-bidirectional port with internal pull-ups, and the UPI-41A /
+/// 8042 data sheet says a `RESET` puts ports 1 and 2 into the input mode — in
+/// which every pin floats high. So bit 0, the system reset line, comes up
+/// *set*, which is inactive because it is active low; and bit 1, the A20
+/// gate, comes up set as well, which opens the gate. One latch, one reset,
+/// one power-up state: it cannot be high for one bit and low for its
+/// neighbour.
+///
+/// This used to hold `OP_RESET` alone, on the reasoning that the gate exists
+/// so that an 8086's megabyte wrap survives and therefore starts shut. The
+/// wrap is why the gate exists; it is not what the gate does at power-on, and
+/// the board says so itself. A 286 fetches its first instruction from
+/// `0xff0000` + `0xfff0` = `0xfffff0` and a 386 or 486 from `0xfffffff0`, and
+/// bit 20 is set in both. A gate that were shut at power-on would turn the
+/// first of those into `0xeffff0` and the second into `0xffeffff0`, neither
+/// of which any AT decodes as ROM: the machine could never fetch its reset
+/// vector, on real silicon as much as here. Firmware closes the gate during
+/// POST — which is exactly why an AT BIOS contains an explicit step to do so,
+/// and would not need one if the hardware had come up that way.
+const OUTPUT_PORT_RESET: u8 = OP_RESET | OP_A20;
 
 /// What a read of the input port (command 0xC0) answers.
 ///
@@ -1036,7 +1051,9 @@ impl Device for Kbc8042 {
             let mut state = self.shared.state.lock();
             *state = State::default();
         }
-        // A20 closes on reset, and something has to say so.
+        // The output port goes back to all-high, which opens A20, and
+        // something has to say so: a net that was left masked by firmware
+        // would still be masked after the reset that put the latch back.
         self.shared.refresh();
     }
 
@@ -1067,9 +1084,9 @@ impl Device for Kbc8042 {
 
     fn announce(&self, port: &str) {
         match port {
-            // A20 in particular: the gate is shut out of reset and a machine
-            // whose address decoder came up disagreeing would be wrong from
-            // the first fetch.
+            // A20 in particular: the gate is *open* out of reset and a net
+            // that came up disagreeing would be wrong from the first fetch —
+            // the reset vector is above bit 20 on every part that has one.
             "irq1" | "irq12" | "a20" => self.shared.refresh(),
             // The reset line is a pulse, and idles where a fresh net already
             // is; announcing it would be indistinguishable from a reboot.
@@ -1319,6 +1336,10 @@ mod tests {
                 .build_shared();
             kbc.connect(pin, WireSource::new(wire, id))
                 .expect("an 8042 drives all four");
+            // What `Machine::sweep` does after realize (§4.3): a source
+            // announces the level it drives, or a net that idles high — A20 —
+            // comes up disagreeing with the chip holding it there.
+            <Kbc8042 as crate::core::device::Device>::announce(&kbc, pin);
             probes.push(probe);
         }
         (kbc, port, probes)
@@ -1409,7 +1430,16 @@ mod tests {
     fn writing_the_output_port_drives_the_a20_gate() {
         let (kbc, _port, probes) = with_pins();
         let a20 = &probes[2];
-        assert!(!a20.high(), "shut out of reset, as on a real AT");
+        // Open out of reset, because P2 comes up high and because a shut gate
+        // would put the reset vector somewhere no AT decodes. Firmware shuts
+        // it during POST; the hardware does not hand it over shut.
+        assert!(a20.high(), "open out of reset, as on a real AT");
+        assert!(kbc.a20_enabled());
+
+        command(&kbc, 0xd1);
+        poke_data(&kbc, OP_RESET);
+        assert!(!a20.high(), "and firmware can shut it");
+        assert!(!kbc.a20_enabled());
 
         command(&kbc, 0xd1);
         poke_data(&kbc, OP_RESET | OP_A20);

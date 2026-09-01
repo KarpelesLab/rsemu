@@ -39,7 +39,7 @@ address; every one of them is written once, in that file.
 
 | Component | Class | Where | Specification |
 | --- | --- | --- | --- |
-| CPU | `cpu.i8086` | — | [`../cpu/x86.md`](../cpu/x86.md) |
+| CPU | `cpu.x86` (80486) | — | [`../cpu/x86.md`](../cpu/x86.md) |
 | Interrupt controllers (2, cascaded) | `pc.pic` | 0x20, 0xa0, ELCR at 0x4d0/1 | Intel 8259A data sheet |
 | Timer | `pc.pit` | 0x40-0x43 | Intel 8254 data sheet |
 | Keyboard controller, A20, reset | `pc.kbc` | 0x60, 0x64 | Intel 8042 data sheet |
@@ -86,6 +86,34 @@ Both are generic mechanisms in `core::wire`, not PC special cases
 Both attach along a net: the driver offers, the sink is handed a `Weak`. They
 exist because `BindCtx` cannot reach a sibling device's handle — see below.
 
+## A20 is **open** at power-on, and it took the reset vector to prove it
+
+The A20 gate exists so that an 8086's megabyte wrap survives, and it is easy to
+read that as "the gate starts shut". It does not, and the board itself is the
+proof: a 286 fetches its first instruction from `0xfffff0` and a 386 or 486
+from `0xfffffff0`, and **bit 20 is set in both**. A gate closed at power-on
+would turn the first into `0xeffff0` and the second into `0xffeffff0`, neither
+of which an AT decodes as ROM. No such machine could reach its own reset
+vector.
+
+What actually happens is in the 8042's data sheet: `RESET` puts ports 1 and 2
+into the input mode, and P2 is quasi-bidirectional with pull-ups, so every
+output-port line comes up high. Bit 0 is the system reset line, active low, so
+high means *not resetting*; bit 1 is the A20 gate, so high means *open*.
+Firmware closes it during POST — which is exactly why an AT BIOS contains a
+step that does so, and would not need one if the hardware handed it over shut.
+
+Two things follow for rsemu, and both were bugs:
+
+- `pc.kbc`'s output port comes out of reset as `OP_RESET | OP_A20`, not
+  `OP_RESET` alone. One latch, one reset, one power-up state.
+- The x86 core does **not** touch its A20 mask on reset. The gate is chipset
+  logic, not a processor feature; a `RESET` on the processor does not move it.
+  Driving it shut from there was inventing a level for an input pin, and no
+  driver could correct it, because a source re-announcing the level it already
+  sits at is not a change and `Wire::set` delivers changes. The board came up
+  with its 8042 holding the gate open and the core masking bit 20 anyway.
+
 ## What a real firmware binary asks for
 
 Measured black-box against one, two ways: scanning it for the immediate operands
@@ -111,24 +139,65 @@ that must answer 0x00, and a keyboard self test that must answer 0xaa — and
 
 So the missing pieces below are ranked by that evidence, not by guesswork.
 
+## How far a real firmware image gets
+
+Measured, not asserted: `tests/pc_at_firmware.rs` runs the user's own image on
+the assembled board and prints what it observed. It is gated on `RSEMU_BIOS`
+and skips without it, so `cargo test` stays hermetic and nothing is vendored.
+
+That test maps a **log port at 0x402**, and the board does not — it is an
+instrument, not a chip. Firmware built for emulated machines writes its
+progress there a character at a time,
+and reading what a program prints is the most ordinary black-box observation
+there is (`../../ROADMAP.md` §1). It is the single most useful instrument on
+this board and it costs one `MemOps`.
+
+What one such image does today, in order:
+
+1. Fetches its reset vector from `0xfffffff0`, takes the far jump into the low
+   ROM window, sets `CR0.PE`, loads a GDT and runs 32-bit code.
+2. Prints its banner and its build string.
+3. Prints **"Unable to unlock ram - bridge not found"** — see below.
+4. Sizes RAM from the CMOS, and gets **zero**, because it stores the answer in
+   a variable in the `f` segment and that segment is ROM.
+5. Prints "No space for init relocation." and stops on `cli; hlt; jmp .-1`.
+
+Step 4 is the blocker and step 3 is its cause. The firmware expects the
+`0xc0000-0xfffff` window to become **writable RAM** once it has asked a PCI
+host bridge to unlock it, and this board has neither the bridge nor the
+shadow. The same image on the same core against flat RAM — `cpu::x86::firmware`
+— runs twenty million instructions without complaint precisely because
+everything there is RAM, which is the control experiment for this claim.
+
+With a writable copy of the image laid over that window as an experiment
+(`RSEMU_SHADOW=1` in the same test, which is **not** a board and says so), the
+firmware goes considerably further: RAM sizing succeeds, it relocates its init
+code into high memory, programs the 8259A pair (master mask `0xb8`, slave
+`0x8e`) and counter 0 of the 8254 in mode 2, takes **timer interrupts at 18 Hz
+for as long as it is left running**, and fills the BIOS data area — equipment
+word `0x0007`, base memory 639 KiB at `0x413`, the tick count at `0x46c`
+climbing. It then waits in the BIOS's own `sti; hlt; cli` idle without setting
+a video mode or loading a boot sector, and what it is waiting for is not yet
+known. It is the same with and without a video BIOS in the socket, so it is
+stuck *before* the option-ROM scan.
+
 ## What is known to be missing
 
-- **The CPU is not bound into the machine graph.** `cpu.i8086` is registered but
-  has no `Instance` impl, no `bind`, no input pins and no `schema`, so a machine
-  file cannot give it an address space or wire an interrupt to it. Until it does,
-  `pc-at` is shipped as data and checked by `dev::pc`'s tests rather than listed
-  in the catalog. What is needed is enumerated in `src/dev/pc/mod.rs`'s tests.
-- **The core is 8086/8088 real-mode only**, and any current PC firmware needs at
-  least a 386: control-register moves, `lgdt`/`lidt`, the 32-bit prefixes,
-  protected mode, and `cpuid`.
+- **RAM shadowing, and the host bridge that controls it.** The system BIOS
+  window is a ROM socket: `pc.rom` swallows writes, which is what a board with
+  no shadow control does. Current firmware needs the window to be writable and
+  asks a PCI host bridge's PAM registers for it. This is the first thing
+  standing between this board and a boot, and it needs `bus-pci` and a host
+  bridge before it needs anything else.
 - **PCI.** Firmware probes `0xcf8`/`0xcfc` for a host bridge. With nothing
-  mapped there the reads return ones and the probe should conclude there is no
-  PCI — but that is a claim to test, not to assume.
+  mapped there the reads return ones and the probe concludes there is no PCI —
+  measured: it says so and carries on.
 - **`0x510`/`0x511`.** A firmware built for another emulator reads its whole
   configuration — memory map, boot order, SMBIOS and ACPI tables — from a
   paravirtual interface at those ports. Its strings show it *detects* the
-  interface rather than requiring it, so the fallback path exists; how far it
-  goes is unmeasured, and measuring it needs the 386 core.
+  interface rather than requiring it, so the fallback path exists — and it is
+  now measured: with nothing there the image falls back to the CMOS for its
+  memory map and keeps going.
 - **A video BIOS needs a real VGA**, not a text-mode CRTC: setting even mode 3
   writes the sequencer, the graphics controller, the attribute controller and
   the DAC. `pc.video` implements that register file; what it does *not* implement

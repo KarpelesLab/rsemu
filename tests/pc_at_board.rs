@@ -53,7 +53,7 @@ use rsemu::machine::realize::Bindings;
 // reaching the processor
 // ---------------------------------------------------------------------------
 
-/// Everything this board needs to construct, with a `cpu.i8086` that pushes
+/// Everything this board needs to construct, with a `cpu.x86` that pushes
 /// what it builds into `cpus`.
 ///
 /// There is no route from a `dyn Device` to a concrete type — `Device` keeps
@@ -67,8 +67,8 @@ fn bindings(cpus: &Arc<Captured<X86>>) -> Bindings {
     rsemu::dev::pc::bind(&mut b).expect("the chipset");
     rsemu::dev::ata::bind(&mut b).expect("the hard disks");
     let kept = Arc::clone(cpus);
-    b.bind("cpu.i8086", move |props| {
-        let cpu = Arc::new(X86::from_props_defaulting(props, Variant::I8088)?.as_i8086());
+    b.bind("cpu.x86", move |props| {
+        let cpu = Arc::new(X86::from_props_defaulting(props, Variant::I80486)?);
         kept.push(&cpu);
         Ok(cpu)
     })
@@ -223,7 +223,7 @@ fn the_catalog_realizes_this_board_with_its_own_bindings() {
     // The rest of this file builds its own `Bindings` so it can keep a handle
     // on the core. This one does not: it goes through `catalog::build_options`,
     // which is what `rsemu run pc-at` uses — and which could only realize the
-    // board once `cpu.i8086` was bound, `schema`'d and given its pins.
+    // board once the core was bound, `schema`'d and given its pins.
     let entry = rsemu::machine::catalog::machine("pc-at").expect("this build ships pc-at");
     let mut options = rsemu::machine::catalog::build_options().expect("this build's classes");
     options.realize.media.insert("bios", fake_bios(128 * 1024));
@@ -364,11 +364,17 @@ fn the_fast_a20_gate_reaches_the_processors_pin() {
     let (mut m, cpu) = board();
     m.reset(ResetKind::Cold);
     m.sweep();
-    assert!(!cpu.a20_open(), "A20 is shut at power on");
+    // Open at power on: the 8042's output port comes up all-high, and a board
+    // whose gate were shut would mask bit 20 out of the reset vector itself.
+    // Port 0x92 is the *other* driver and comes up clear, so the net is the
+    // wired-OR of one high and one low.
+    assert!(cpu.a20_open(), "A20 is open at power on");
+    // Shutting it needs both drivers low, which is the point of the wired-OR.
+    outb(&m, 0x64, 0xd1);
+    outb(&m, 0x60, 0x01);
+    assert!(!cpu.a20_open(), "the 8042's output port shuts it");
     outb(&m, 0x92, 0x02);
-    assert!(cpu.a20_open(), "port 0x92 bit 1 opens it");
-    // And the keyboard controller's path opens the same net — two drivers,
-    // wire-ORed, which is why the pin keeps a `FanIn`.
+    assert!(cpu.a20_open(), "port 0x92 bit 1 opens it again");
     outb(&m, 0x92, 0x00);
     assert!(!cpu.a20_open());
     outb(&m, 0x64, 0xd1);

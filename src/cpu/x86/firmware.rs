@@ -137,6 +137,12 @@ fn a_pc_firmware_image_reaches_protected_mode_and_keeps_running() {
         .unwrap_or(DEFAULT_STEPS);
     let mut protected_after = None;
     let mut executed = 0usize;
+    // Whether a descriptor table was ever loaded, not whether one is loaded at
+    // the end. A PC firmware goes in and out of protected mode many times and
+    // leaves real mode behind it, so the final `GDTR` is routinely the reset
+    // value — asserting on it was asserting that the run stopped in the middle
+    // of a protected-mode stretch, which is not a property of the processor.
+    let mut gdt_loaded = false;
     for step in 0..limit {
         if cpu.step() == 0 {
             break;
@@ -145,6 +151,7 @@ fn a_pc_firmware_image_reaches_protected_mode_and_keeps_running() {
         if protected_after.is_none() && cpu.sys().protected() {
             protected_after = Some(step);
         }
+        gdt_loaded |= cpu.sys().gdtr.limit > 0;
     }
 
     let regs = cpu.regs();
@@ -174,7 +181,7 @@ fn a_pc_firmware_image_reaches_protected_mode_and_keeps_running() {
         protected_after.is_some(),
         "the image never set CR0.PE — see the trace above"
     );
-    assert!(sys.gdtr.limit > 0, "no descriptor table was loaded");
+    assert!(gdt_loaded, "no descriptor table was ever loaded");
     assert_eq!(
         executed, limit,
         "the core stopped early: halted or shut down"

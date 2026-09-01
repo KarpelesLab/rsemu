@@ -233,7 +233,7 @@ pub static ARM926: CatalogEntry = CatalogEntry {
 
 /// The PC/AT, when this build has an x86 core and the board's chips.
 ///
-/// Held out of the catalog until now for one reason: `cpu.i8086` was registered
+/// Held out of the catalog until now for one reason: the x86 core was registered
 /// but not bound, so a machine file could not hand it an address space or wire
 /// an interrupt to it. It can, so the board is here.
 ///
