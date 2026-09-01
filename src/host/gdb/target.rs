@@ -31,11 +31,14 @@
 //! [`DebugTarget::resume`] and [`DebugTarget::step`], both of which are called
 //! from the same thread that services packets and never while a packet is being
 //! answered. `Machine::step_until` returns at a scheduling boundary with every
-//! runnable unwound to the scheduler, which is the safe point of §4.7 in the
-//! `Deterministic` threading mode — the only mode `Machine` drives. Nothing here
-//! reaches into a running CPU, and nothing races the scheduler.
+//! runnable unwound to the scheduler, which is §4.7's safe point — under
+//! `parallel` as much as under `deterministic`, because a parallel round joins
+//! every job it submitted before it returns and that join is the rendezvous.
+//! Nothing here reaches into a running CPU, and nothing races the scheduler.
+//! See [`super`]'s "Stopping the world", and `tests/gdb_multicpu.rs`.
 
 use core::fmt;
+use core::fmt::Write as _;
 
 use crate::core::clock::GlobalTime;
 use crate::core::device::DeviceClass;
@@ -144,7 +147,16 @@ pub enum StopKind {
     /// A step finished, or the client asked for a halt.
     Trap,
     /// A `Z0`/`Z1` breakpoint address was reached.
-    Breakpoint,
+    Breakpoint {
+        /// Whether the client asked for a *hardware* breakpoint (`Z1`).
+        ///
+        /// Both are the same mechanism here — a program-counter comparison —
+        /// but the stop reply is not the same packet, and GDB matches the
+        /// reason it is given against the breakpoint it set. Telling it
+        /// `swbreak` about a `Z1` is telling it about a breakpoint it does not
+        /// have. (GDB manual, "Stop Reply Packets".)
+        hardware: bool,
+    },
     /// A `Z2` watchpoint's memory changed.
     Watchpoint {
         /// The first address in the watched range whose value changed.
@@ -232,23 +244,33 @@ pub trait DebugTarget {
     fn write_memory(&mut self, cpu: usize, addr: u64, src: &[u8]) -> TargetResult<()>;
 
     /// Arm a breakpoint at `addr`. Arming one twice is not an error.
-    fn add_breakpoint(&mut self, addr: u64) -> TargetResult<()>;
+    ///
+    /// `hardware` is `Z1` rather than `Z0`. It changes nothing about how the
+    /// breakpoint works — see [`MachineTarget`] — and everything about which
+    /// stop reply reports it.
+    fn add_breakpoint(&mut self, addr: u64, hardware: bool) -> TargetResult<()>;
 
     /// Disarm a breakpoint. Disarming one that is not set is not an error.
-    fn remove_breakpoint(&mut self, addr: u64) -> TargetResult<()>;
+    fn remove_breakpoint(&mut self, addr: u64, hardware: bool) -> TargetResult<()>;
 
     /// Which watchpoint kinds this target honours.
     fn watch_support(&self) -> WatchSupport {
         WatchSupport::default()
     }
 
-    /// Arm a write watchpoint over `len` bytes at `addr`.
-    fn add_watchpoint(&mut self, _addr: u64, _len: u64) -> TargetResult<()> {
+    /// Arm a write watchpoint over `len` bytes at `addr`, as `cpu` sees it.
+    ///
+    /// **`addr` is virtual, and it belongs to a CPU**, exactly as in
+    /// [`read_memory`](DebugTarget::read_memory). The watched bytes are read
+    /// back repeatedly while the guest runs, so the space and the page tables
+    /// they are read through have to be the ones the address was written
+    /// against — which is the thread GDB had selected, not thread 1.
+    fn add_watchpoint(&mut self, _cpu: usize, _addr: u64, _len: u64) -> TargetResult<()> {
         Err(TargetError::Unsupported)
     }
 
     /// Disarm a write watchpoint.
-    fn remove_watchpoint(&mut self, _addr: u64, _len: u64) -> TargetResult<()> {
+    fn remove_watchpoint(&mut self, _cpu: usize, _addr: u64, _len: u64) -> TargetResult<()> {
         Err(TargetError::Unsupported)
     }
 
@@ -269,7 +291,11 @@ pub trait DebugTarget {
     fn resume(&mut self) -> TargetResult<Option<Stop>>;
 
     /// Answer a `qRcmd` monitor command. `None` means "no such command".
-    fn monitor(&mut self, _command: &str) -> Option<String> {
+    ///
+    /// `cpu` is the thread GDB had selected when the user typed it, because
+    /// half of what a monitor is for — reading memory, translating an address —
+    /// has no answer without one.
+    fn monitor(&mut self, _cpu: usize, _command: &str) -> Option<String> {
         None
     }
 }
@@ -326,9 +352,23 @@ struct Cpu {
 /// A watched range and the bytes it last held.
 #[derive(Debug)]
 struct Watch {
+    /// The CPU whose address space and MMU `addr` is to be read through.
+    ///
+    /// Not a decoration and not CPU 0: on a machine with two cores the same
+    /// number is two different bytes, and polling the wrong space reads
+    /// whatever `unassigned` says — usually a constant, so the shadow never
+    /// changes and the watchpoint silently never fires.
+    cpu: usize,
     addr: u64,
     len: u64,
     shadow: Vec<u8>,
+}
+
+/// An armed breakpoint: an address, and which `Z` packet set it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Breakpoint {
+    addr: u64,
+    hardware: bool,
 }
 
 /// A realized [`Machine`], as a GDB target.
@@ -357,7 +397,7 @@ struct Watch {
 pub struct MachineTarget<'a> {
     machine: &'a mut Machine,
     cpus: Vec<Cpu>,
-    breakpoints: Vec<u64>,
+    breakpoints: Vec<Breakpoint>,
     watchpoints: Vec<Watch>,
     /// Per CPU: an address the resume loop must not report until the program
     /// counter has moved off it. Set by [`DebugTarget::begin_resume`].
@@ -658,28 +698,28 @@ impl<'a> MachineTarget<'a> {
     }
 
     /// Re-read every watched range, and report the first one that moved.
-    fn poll_watchpoints(&mut self) -> TargetResult<Option<u64>> {
+    fn poll_watchpoints(&mut self) -> TargetResult<Option<(usize, u64)>> {
         if self.watchpoints.is_empty() {
             return Ok(None);
         }
         let mut hit = None;
         for i in 0..self.watchpoints.len() {
-            let (addr, len) = {
+            let (cpu, addr, len) = {
                 let watch = &self.watchpoints[i];
-                (watch.addr, watch.len)
+                (watch.cpu, watch.addr, watch.len)
             };
             let mut now = vec![0u8; usize::try_from(len).unwrap_or(0)];
             // A range the bus refuses is not a hit; it is a watchpoint the user
             // put somewhere there is no memory, and saying so once a tick would
             // drown the session.
-            if self.read_memory(0, addr, &mut now).is_err() {
+            if self.read_memory(cpu, addr, &mut now).is_err() {
                 continue;
             }
             let watch = &mut self.watchpoints[i];
             if watch.shadow != now {
                 watch.shadow = now;
                 if hit.is_none() {
-                    hit = Some(addr);
+                    hit = Some((cpu, addr));
                 }
             }
         }
@@ -692,12 +732,12 @@ impl<'a> MachineTarget<'a> {
     /// watched byte does not immediately trip its own watchpoint.
     fn resync_watchpoints(&mut self) {
         for i in 0..self.watchpoints.len() {
-            let (addr, len) = {
+            let (cpu, addr, len) = {
                 let watch = &self.watchpoints[i];
-                (watch.addr, watch.len)
+                (watch.cpu, watch.addr, watch.len)
             };
             let mut now = vec![0u8; usize::try_from(len).unwrap_or(0)];
-            if self.read_memory(0, addr, &mut now).is_ok() {
+            if self.read_memory(cpu, addr, &mut now).is_ok() {
                 self.watchpoints[i].shadow = now;
             }
         }
@@ -716,14 +756,191 @@ impl<'a> MachineTarget<'a> {
             if let Some(slot) = self.suppress.get_mut(index) {
                 *slot = None;
             }
-            if self.breakpoints.contains(&pc) {
+            if let Some(point) = self.breakpoints.iter().find(|b| b.addr == pc) {
                 return Ok(Some(Stop {
                     cpu: index,
-                    kind: StopKind::Breakpoint,
+                    kind: StopKind::Breakpoint {
+                        hardware: point.hardware,
+                    },
                 }));
             }
         }
         Ok(None)
+    }
+}
+
+/// `rwx` for a mapping's terms, which is what a user reads a memory map for.
+///
+/// `Perms` is a bitfield newtype and its `Debug` is the number, which is not
+/// what anybody wants in a map dump.
+fn perms_text(perms: crate::core::space::Perms) -> String {
+    let bit = |set: bool, c: char| if set { c } else { '-' };
+    [
+        bit(perms.contains(crate::core::space::Perms::READ), 'r'),
+        bit(perms.contains(crate::core::space::Perms::WRITE), 'w'),
+        bit(perms.contains(crate::core::space::Perms::EXEC), 'x'),
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// What `monitor help` prints.
+///
+/// The commands are the ones with machinery already behind them, and the pair
+/// that justifies the whole surface is `x` and `xp`: GDB's own `x` is always
+/// virtual, because the protocol has no physical-address packet, so a *bus*
+/// address — a boot ROM under a page table, a BAR before the guest has mapped
+/// it — is not reachable from a GDB session by any other route.
+const MONITOR_HELP: &str = "\
+rsemu monitor commands (addresses are hex, lengths decimal):
+  devices            the device tree, with class and instance path
+  spaces             the machine's address spaces
+  map [space]        what is mapped where, for this CPU's space or a named one
+  x <addr> [len]     read guest memory at a VIRTUAL address, through this CPU
+  xp <addr> [len]    read guest memory at a PHYSICAL address, no translation
+  translate <addr>   where this CPU's MMU maps a virtual address
+  time               the machine's current virtual instant
+  hash               the machine state hash (ROADMAP.md \u{a7}0)
+Every read here sets MemAttrs::debug, so nothing it looks at changes.
+";
+
+/// How many bytes `x` and `xp` show when nobody says.
+const MONITOR_DUMP_DEFAULT: u64 = 64;
+
+/// The most they will show, so a typo cannot ask for a megabyte over a socket
+/// that frames one packet at a time.
+const MONITOR_DUMP_MAX: u64 = 1024;
+
+impl MachineTarget<'_> {
+    /// `<addr>` as a monitor command writes it: hex, with an optional `0x`.
+    fn monitor_addr(text: Option<&str>) -> Result<u64, String> {
+        let text = text.ok_or_else(|| String::from("an address is needed\n"))?;
+        let body = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X"));
+        u64::from_str_radix(body.unwrap_or(text), 16)
+            .map_err(|_| format!("`{text}` is not a hex address\n"))
+    }
+
+    /// `[len]` as a monitor command writes it: decimal, bounded.
+    fn monitor_len(text: Option<&str>) -> Result<u64, String> {
+        let Some(text) = text else {
+            return Ok(MONITOR_DUMP_DEFAULT);
+        };
+        let len: u64 = text
+            .parse()
+            .map_err(|_| format!("`{text}` is not a length\n"))?;
+        if len == 0 || len > MONITOR_DUMP_MAX {
+            return Err(format!("a length must be 1..={MONITOR_DUMP_MAX}\n"));
+        }
+        Ok(len)
+    }
+
+    /// `x` and `xp`: the same dump, one translated and one not.
+    fn monitor_dump(
+        &self,
+        cpu: usize,
+        addr: Option<&str>,
+        len: Option<&str>,
+        physical: bool,
+    ) -> String {
+        let (addr, len) = match (Self::monitor_addr(addr), Self::monitor_len(len)) {
+            (Ok(a), Ok(l)) => (a, l),
+            (Err(e), _) | (_, Err(e)) => return e,
+        };
+        let mut buf = vec![0u8; len as usize];
+        let read = if physical {
+            self.read_physical(cpu, addr, &mut buf)
+        } else {
+            self.read_memory(cpu, addr, &mut buf)
+        };
+        if let Err(e) = read {
+            return format!("{e}\n");
+        }
+        let mut out = String::new();
+        for (row, chunk) in buf.chunks(16).enumerate() {
+            let at = addr.wrapping_add(row as u64 * 16);
+            let _ = write!(out, "{at:08x} ");
+            for byte in chunk {
+                let _ = write!(out, " {byte:02x}");
+            }
+            for _ in chunk.len()..16 {
+                out.push_str("   ");
+            }
+            out.push_str("  |");
+            for byte in chunk {
+                out.push(if byte.is_ascii_graphic() || *byte == b' ' {
+                    char::from(*byte)
+                } else {
+                    '.'
+                });
+            }
+            out.push_str("|\n");
+        }
+        out
+    }
+
+    /// `translate`: the debug MMU walk, on its own, so a user can see the
+    /// answer the `x`/`xp` pair differ by.
+    fn monitor_translate(&self, cpu: usize, addr: Option<&str>) -> String {
+        let addr = match Self::monitor_addr(addr) {
+            Ok(a) => a,
+            Err(e) => return e,
+        };
+        match self.translate(cpu, addr) {
+            Ok(pa) if pa == addr => format!("{addr:#x} -> {pa:#x} (identity)\n"),
+            Ok(pa) => format!("{addr:#x} -> {pa:#x}\n"),
+            Err(e) => format!("{addr:#x}: {e}\n"),
+        }
+    }
+
+    /// `map`: what is mapped where in a space.
+    fn monitor_map(&self, cpu: usize, name: Option<&str>) -> String {
+        let index = match name {
+            Some(name) => {
+                match self
+                    .machine
+                    .spaces()
+                    .iter()
+                    .position(|entry| entry.name() == name)
+                {
+                    Some(i) => i,
+                    None => return format!("no address space named `{name}`\n"),
+                }
+            }
+            None => match self.cpu(cpu).ok().and_then(|entry| entry.space) {
+                Some(i) => i,
+                None => return String::from("this CPU has no address space\n"),
+            },
+        };
+        let Some(entry) = self.machine.spaces().get(index) else {
+            return String::from("no such address space\n");
+        };
+        let space = entry.space();
+        // `try_view` rather than `view`: the map is a nicety, and blocking a
+        // debugger behind a topology change that is mid-flight is not.
+        let Some(view) = space.try_view() else {
+            return String::from("the address space is being rebuilt; try again\n");
+        };
+        let mut rows: Vec<(u64, u64, String, String)> = view
+            .mappings()
+            .map(|(_, m)| {
+                (
+                    m.base,
+                    m.region.len(),
+                    m.region.name().to_string(),
+                    perms_text(m.perms),
+                )
+            })
+            .collect();
+        rows.sort_by_key(|(base, len, _, _)| (*base, *len));
+        let mut out = format!("{} ({} bits)\n", entry.name(), space.bits());
+        for (base, len, name, perms) in rows {
+            let _ = writeln!(
+                out,
+                "  {base:#014x}-{:#014x}  {name}  {perms}",
+                base.saturating_add(len).saturating_sub(1)
+            );
+        }
+        out
     }
 }
 
@@ -830,15 +1047,17 @@ impl DebugTarget for MachineTarget<'_> {
         Ok(())
     }
 
-    fn add_breakpoint(&mut self, addr: u64) -> TargetResult<()> {
-        if !self.breakpoints.contains(&addr) {
-            self.breakpoints.push(addr);
+    fn add_breakpoint(&mut self, addr: u64, hardware: bool) -> TargetResult<()> {
+        let point = Breakpoint { addr, hardware };
+        if !self.breakpoints.contains(&point) {
+            self.breakpoints.push(point);
         }
         Ok(())
     }
 
-    fn remove_breakpoint(&mut self, addr: u64) -> TargetResult<()> {
-        self.breakpoints.retain(|a| *a != addr);
+    fn remove_breakpoint(&mut self, addr: u64, hardware: bool) -> TargetResult<()> {
+        self.breakpoints
+            .retain(|b| !(b.addr == addr && b.hardware == hardware));
         Ok(())
     }
 
@@ -852,26 +1071,34 @@ impl DebugTarget for MachineTarget<'_> {
         }
     }
 
-    fn add_watchpoint(&mut self, addr: u64, len: u64) -> TargetResult<()> {
+    fn add_watchpoint(&mut self, cpu: usize, addr: u64, len: u64) -> TargetResult<()> {
         if len == 0 || len > 4096 {
             return Err(TargetError::Unsupported);
         }
+        // A CPU index the client made up is refused here rather than papered
+        // over with zero, which is what the polling loop used to do.
+        self.cpu(cpu)?;
         if self
             .watchpoints
             .iter()
-            .any(|w| w.addr == addr && w.len == len)
+            .any(|w| w.cpu == cpu && w.addr == addr && w.len == len)
         {
             return Ok(());
         }
         let mut shadow = vec![0u8; usize::try_from(len).map_err(|_| TargetError::Unsupported)?];
-        self.read_memory(0, addr, &mut shadow)?;
-        self.watchpoints.push(Watch { addr, len, shadow });
+        self.read_memory(cpu, addr, &mut shadow)?;
+        self.watchpoints.push(Watch {
+            cpu,
+            addr,
+            len,
+            shadow,
+        });
         Ok(())
     }
 
-    fn remove_watchpoint(&mut self, addr: u64, len: u64) -> TargetResult<()> {
+    fn remove_watchpoint(&mut self, cpu: usize, addr: u64, len: u64) -> TargetResult<()> {
         self.watchpoints
-            .retain(|w| !(w.addr == addr && w.len == len));
+            .retain(|w| !(w.cpu == cpu && w.addr == addr && w.len == len));
         Ok(())
     }
 
@@ -894,9 +1121,9 @@ impl DebugTarget for MachineTarget<'_> {
         if let Some(slot) = self.suppress.get_mut(cpu) {
             *slot = None;
         }
-        if let Some(addr) = self.poll_watchpoints()? {
+        if let Some((watched, addr)) = self.poll_watchpoints()? {
             return Ok(Stop {
-                cpu,
+                cpu: watched,
                 kind: StopKind::Watchpoint { addr },
             });
         }
@@ -928,9 +1155,9 @@ impl DebugTarget for MachineTarget<'_> {
             if let Some(stop) = self.breakpoint_hit()? {
                 return Ok(Some(stop));
             }
-            if let Some(addr) = self.poll_watchpoints()? {
+            if let Some((cpu, addr)) = self.poll_watchpoints()? {
                 return Ok(Some(Stop {
-                    cpu: 0,
+                    cpu,
                     kind: StopKind::Watchpoint { addr },
                 }));
             }
@@ -938,16 +1165,10 @@ impl DebugTarget for MachineTarget<'_> {
         Ok(None)
     }
 
-    fn monitor(&mut self, command: &str) -> Option<String> {
+    fn monitor(&mut self, cpu: usize, command: &str) -> Option<String> {
         let mut words = command.split_whitespace();
         match words.next()? {
-            "help" => Some(
-                "rsemu monitor commands:\n  \
-                 devices    the device tree, with class and instance path\n  \
-                 time       the machine's current virtual instant\n  \
-                 hash       the machine state hash (ROADMAP.md \u{a7}0)\n"
-                    .to_string(),
-            ),
+            "help" => Some(String::from(MONITOR_HELP)),
             "devices" => {
                 let mut out = String::new();
                 for entry in self.machine.devices() {
@@ -958,6 +1179,24 @@ impl DebugTarget for MachineTarget<'_> {
                 }
                 Some(out)
             }
+            "spaces" => {
+                let mut out = String::new();
+                for entry in self.machine.spaces() {
+                    let space = entry.space();
+                    let _ = writeln!(
+                        out,
+                        "{}  {} bits, {} bytes",
+                        entry.name(),
+                        space.bits(),
+                        space.size()
+                    );
+                }
+                Some(out)
+            }
+            "map" => Some(self.monitor_map(cpu, words.next())),
+            "x" => Some(self.monitor_dump(cpu, words.next(), words.next(), false)),
+            "xp" => Some(self.monitor_dump(cpu, words.next(), words.next(), true)),
+            "translate" => Some(self.monitor_translate(cpu, words.next())),
             "time" => Some(format!("{} ns\n", self.machine.now().as_nanos())),
             "hash" => Some(match self.machine.state_hash() {
                 Ok(hash) => format!("{hash:#018x}\n"),

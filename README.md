@@ -138,8 +138,10 @@ The framework underneath is complete: address spaces with priority and
 mirroring, an oscillator forest with exact intra-tree ratios, wires, devices,
 snapshots, a typed export seam so one device can hand another a handle, and a
 `.machine` description language that goes parse → resolve → validate → realize
-→ run. There is a **gdb stub** (`rsemu debug apple1 --gdb :1234`) and a
-**browser build** at <https://karpeleslab.github.io/rsemu/>.
+→ run. There is a **gdb stub** (`rsemu debug apple1 --gdb :1234`) — driven end to end
+by a **real `gdb` binary** in `tests/gdb_real_client.rs`, which attaches, reads
+registers, writes a program into guest RAM, sets a breakpoint, hits it and steps
+— and a **browser build** at <https://karpeleslab.github.io/rsemu/>.
 
 There is **sound**, too. The audio seam mirrors the display one: a device emits
 what the silicon does — the RP2A03 emits an unsigned level out of a non-linear

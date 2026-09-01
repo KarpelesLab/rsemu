@@ -44,11 +44,23 @@
 //! to here, because the session loop and the machine share one thread: virtual
 //! time advances only inside [`DebugTarget::resume`] and
 //! [`DebugTarget::step`], both called from [`GdbServer::poll`] and never while a
-//! packet is being answered. `Machine::step_until` returns at a scheduling stop
-//! with every runnable unwound back to the scheduler — the safe point of §4.7 in
-//! the `Deterministic` threading mode, which is the only mode `Machine` drives.
-//! When the parallel mode lands, the same call site is where its stop-the-world
-//! barrier goes; nothing above it changes.
+//! packet is being answered.
+//!
+//! **That holds under `parallel` too**, which is worth stating because it is
+//! the mode where two cores really are on host threads of their own. A round
+//! joins every job it submitted before it returns, and that join *is* §4.7's
+//! rendezvous — so `Machine::run_until` and `Machine::step_until` both come back
+//! with every runnable unwound to the scheduler whatever the threading mode is,
+//! and there is no instant at which a packet is answered while a guest core is
+//! mid-instruction. The stub therefore never has to raise a stop-the-world
+//! barrier of its own; if `Machine` ever grew a way to leave a round in flight
+//! across a return, [`Machine::stop_the_world`](crate::machine::Machine::stop_the_world)
+//! is what would go around each of those two calls. `tests/gdb_multicpu.rs`
+//! debugs a two-core machine in that mode rather than leaving this a claim.
+//!
+//! What `parallel` does cost the debugger is *speed*, not correctness: a
+//! breakpoint-checking run advances one clock tick at a time, and under
+//! `parallel` each of those ticks is a job dispatch per core.
 //!
 //! # What is not here
 //!

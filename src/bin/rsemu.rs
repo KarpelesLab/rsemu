@@ -670,14 +670,22 @@ fn debug_session(
             Err(_) => eprintln!("  gdbstub listening — the machine is stopped"),
         }
         eprintln!("  attach with: gdb -ex 'target remote {addr}'");
+        eprintln!("  once attached, `monitor help` lists rsemu's own commands");
         // Which devices became GDB threads, and — the hour-saving part — which
         // of them upstream GDB has no architecture for. A target description
         // tells GDB what the registers *are*; it still needs a gdbarch to know
-        // what the machine *is*, and for a 6502 it has none. It says
-        // "Architecture rejected target-supplied description", falls back to its
-        // own register layout, and `target remote` then fails outright. That is
-        // a property of GDB, not of this stub, and reading it here beats
-        // discovering it from that message.
+        // what the machine *is*, and for a 6502 it has none.
+        //
+        // What it does then is worth being exact about, because it was
+        // overstated here until somebody measured it (GDB 16.3):
+        // `target remote` **succeeds**. GDB warns "Architecture rejected
+        // target-supplied description", falls back to *its own host*
+        // architecture's register layout, and then reads the `g` packet
+        // through that layout — so a 6502 session connects and reports
+        // "Truncated register 1 in remote 'g' packet. The program has no
+        // registers now." A session that looks connected and answers nonsense
+        // is worse than one that refuses, which is why this is printed before
+        // anybody attaches.
         let mut thread = 0u32;
         for entry in machine.devices() {
             let Some(arch) = rsemu::host::gdb::arch::for_class(entry.class().name) else {
@@ -692,9 +700,10 @@ fn debug_session(
                 ),
                 None => eprintln!(
                     "  thread {thread}: {} ({}) — upstream gdb has no architecture for\n    \
-                     this core, so it rejects the target description and `target remote`\n    \
-                     fails. The protocol is served in full to any client that reads the\n    \
-                     description rather than insisting on a gdbarch.",
+                     this core, so it rejects the target description, falls back to its\n    \
+                     own host layout, and reads the registers wrong. The protocol is\n    \
+                     served in full to any client that reads the description rather than\n    \
+                     insisting on a gdbarch.",
                     entry.path(),
                     entry.class().name
                 ),

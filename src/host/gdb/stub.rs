@@ -14,17 +14,30 @@
 //! | `p` `P` | one register |
 //! | `m` `M` `X` | read and write memory, hex and binary |
 //! | `c` `C` `s` `S` `vCont` | continue and step, per thread |
-//! | `Z0` `z0` `Z1` `z1` | breakpoints |
-//! | `Z2` `z2` | write watchpoints |
+//! | `Z0` `z0` `Z1` `z1` | breakpoints, software and hardware |
+//! | `Z2` `z2` | write watchpoints, on the selected thread's space |
 //! | `H` `qC` `qfThreadInfo` `qsThreadInfo` `T` `qThreadExtraInfo` | CPUs as threads |
 //! | `qSupported` `qXfer:features:read` | negotiation and the target description |
 //! | `QStartNoAckMode` | drop the `+`/`-` handshake |
-//! | `qRcmd` | the `monitor` command |
+//! | `qRcmd` | the `monitor` command, answered for the selected thread |
 //! | `qAttached` `qSymbol` `!` | the attach handshake |
 //! | `k` `D` | kill and detach |
 //!
 //! Anything else gets an empty reply, which is the protocol's "I do not know
-//! that packet" and is what GDB expects for everything it probes.
+//! that packet" and is what GDB expects for everything it probes. That list is
+//! not a guess: `RSEMU_GDB_DEBUG_REMOTE=1 cargo test --test gdb_real_client`
+//! prints every packet a real GDB sends over a whole session, and the only two
+//! it sends that end up here are `vMustReplyEmpty` and `qTStatus`, both of
+//! which are *supposed* to be answered this way.
+//!
+//! # A stop reply says only what the client asked to hear
+//!
+//! `swbreak` and `hwbreak` post-date the protocol, so a stop reply may name one
+//! **only** when the client offered it in its own `qSupported` — the manual is
+//! explicit, and a client that never asked is entitled to treat an unknown stop
+//! reason as a malformed packet. What we advertise says we *can* report them;
+//! what the client advertises says it will understand them, and the two are
+//! tracked separately.
 //!
 //! # Sources
 //!
@@ -103,6 +116,16 @@ pub struct Stub {
     cont_thread: ThreadSel,
     /// Ctrl-C arrived while the target was running.
     interrupt_pending: bool,
+    /// Whether the client said `swbreak+` in its `qSupported`.
+    ///
+    /// The GDB manual is explicit that a stop reply may only carry `swbreak`
+    /// or `hwbreak` when the client asked for it ("Stop Reply Packets"): the
+    /// reasons post-date the protocol, and a client that has not asked for one
+    /// is entitled to treat an unknown reason as a malformed packet. Real GDB
+    /// always asks; an older one, or a client of our own, does not have to.
+    client_swbreak: bool,
+    /// Whether the client said `hwbreak+`.
+    client_hwbreak: bool,
     /// Why the target last stopped, for `?`.
     last_stop: Stop,
     /// The last packet sent, for a `-` retransmission.
@@ -127,6 +150,8 @@ impl Stub {
             query_thread: 0,
             cont_thread: ThreadSel::Any,
             interrupt_pending: false,
+            client_swbreak: false,
+            client_hwbreak: false,
             last_stop: Stop {
                 cpu: 0,
                 kind: StopKind::Trap,
@@ -184,7 +209,13 @@ impl Stub {
         push_hex_u64(&mut payload, stop.cpu as u64 + 1);
         payload.push(b';');
         match stop.kind {
-            StopKind::Breakpoint => payload.extend_from_slice(b"swbreak:;"),
+            StopKind::Breakpoint { hardware: false } if self.client_swbreak => {
+                payload.extend_from_slice(b"swbreak:;");
+            }
+            StopKind::Breakpoint { hardware: true } if self.client_hwbreak => {
+                payload.extend_from_slice(b"hwbreak:;");
+            }
+            StopKind::Breakpoint { .. } => {}
             StopKind::Watchpoint { addr } => {
                 payload.extend_from_slice(b"watch:");
                 push_hex_u64(&mut payload, addr);
@@ -708,6 +739,14 @@ impl Stub {
 
     /// `<type>,<addr>,<kind>` — the body shared by `Z` and `z`.
     fn parse_point(rest: &[u8]) -> Option<(u8, u64, u64)> {
+        // `Z0,addr,kind[;cond_list][;cmds]`. The tail only appears when the stub
+        // advertised `ConditionalBreakpoints` or `BreakpointCommands`, which
+        // this one does not — but cutting it off costs one line and turns a
+        // future `E22` into a working breakpoint.
+        let rest = match rest.iter().position(|b| *b == b';') {
+            Some(semi) => rest.get(..semi)?,
+            None => rest,
+        };
         let mut parts = rest.split(|b| *b == b',');
         let ty = parts.next()?;
         let addr = parse_hex_u64(parts.next()?)?;
@@ -729,9 +768,13 @@ impl Stub {
         };
         let result = match ty {
             // Software and hardware breakpoints are the same mechanism here —
-            // a program-counter comparison — so `hbreak` works too.
-            b'0' | b'1' => target.add_breakpoint(addr),
-            b'2' if target.watch_support().write => target.add_watchpoint(addr, kind.max(1)),
+            // a program-counter comparison — so `hbreak` works too. Which one
+            // was asked for still has to be remembered: the stop reply that
+            // reports it is a different packet.
+            b'0' | b'1' => target.add_breakpoint(addr, ty == b'1'),
+            b'2' if target.watch_support().write => {
+                target.add_watchpoint(self.query_thread, addr, kind.max(1))
+            }
             _ => {
                 // An empty reply means "not supported", which is how GDB learns
                 // that `rwatch` and `awatch` are not available here. An `E`
@@ -759,8 +802,10 @@ impl Stub {
             return Outcome::Continue;
         };
         let result = match ty {
-            b'0' | b'1' => target.remove_breakpoint(addr),
-            b'2' if target.watch_support().write => target.remove_watchpoint(addr, kind.max(1)),
+            b'0' | b'1' => target.remove_breakpoint(addr, ty == b'1'),
+            b'2' if target.watch_support().write => {
+                target.remove_watchpoint(self.query_thread, addr, kind.max(1))
+            }
             _ => {
                 self.send_empty(out);
                 return Outcome::Continue;
@@ -791,7 +836,18 @@ impl Stub {
             }
             return Outcome::Continue;
         }
-        if rest.starts_with(b"Supported") {
+        if let Some(offer) = rest.strip_prefix(b"Supported") {
+            // The client's own list, which is what decides whether a stop reply
+            // may name a breakpoint kind. `swbreak+` in *our* reply says we can
+            // report it; `swbreak+` in *theirs* says it will understand it.
+            let offer = offer.strip_prefix(b":").unwrap_or(offer);
+            for feature in offer.split(|b| *b == b';') {
+                match feature {
+                    b"swbreak+" => self.client_swbreak = true,
+                    b"hwbreak+" => self.client_hwbreak = true,
+                    _ => {}
+                }
+            }
             // `PacketSize` is hex, and is the size of a *packet*, so a reply
             // never needs splitting below it.
             self.send(
@@ -869,7 +925,7 @@ impl Stub {
             self.send_error(&TargetError::Unsupported, out);
             return Outcome::Continue;
         };
-        match target.monitor(&command) {
+        match target.monitor(self.query_thread, &command) {
             // The reply to `qRcmd` is either `OK`, `E<xx>`, or `O`-packet
             // output followed by `OK`. Text comes back as the latter.
             Some(text) => {
@@ -937,8 +993,8 @@ mod tests {
     struct FakeTarget {
         regs: [[u8; 4]; 2],
         mem: [u8; 256],
-        breakpoints: Vec<u64>,
-        watchpoints: Vec<(u64, u64)>,
+        breakpoints: Vec<(u64, bool)>,
+        watchpoints: Vec<(usize, u64, u64)>,
         steps: usize,
         resumed: usize,
         began: usize,
@@ -1055,12 +1111,12 @@ mod tests {
             dst.copy_from_slice(src);
             Ok(())
         }
-        fn add_breakpoint(&mut self, addr: u64) -> TargetResult<()> {
-            self.breakpoints.push(addr);
+        fn add_breakpoint(&mut self, addr: u64, hardware: bool) -> TargetResult<()> {
+            self.breakpoints.push((addr, hardware));
             Ok(())
         }
-        fn remove_breakpoint(&mut self, addr: u64) -> TargetResult<()> {
-            self.breakpoints.retain(|a| *a != addr);
+        fn remove_breakpoint(&mut self, addr: u64, hardware: bool) -> TargetResult<()> {
+            self.breakpoints.retain(|b| *b != (addr, hardware));
             Ok(())
         }
         fn watch_support(&self) -> WatchSupport {
@@ -1070,12 +1126,12 @@ mod tests {
                 access: false,
             }
         }
-        fn add_watchpoint(&mut self, addr: u64, len: u64) -> TargetResult<()> {
-            self.watchpoints.push((addr, len));
+        fn add_watchpoint(&mut self, cpu: usize, addr: u64, len: u64) -> TargetResult<()> {
+            self.watchpoints.push((cpu, addr, len));
             Ok(())
         }
-        fn remove_watchpoint(&mut self, addr: u64, len: u64) -> TargetResult<()> {
-            self.watchpoints.retain(|w| *w != (addr, len));
+        fn remove_watchpoint(&mut self, cpu: usize, addr: u64, len: u64) -> TargetResult<()> {
+            self.watchpoints.retain(|w| *w != (cpu, addr, len));
             Ok(())
         }
         fn step(&mut self, cpu: usize) -> TargetResult<Stop> {
@@ -1096,14 +1152,16 @@ mod tests {
             if self.resumed >= 3 {
                 Ok(Some(Stop {
                     cpu: 0,
-                    kind: StopKind::Breakpoint,
+                    kind: StopKind::Breakpoint { hardware: false },
                 }))
             } else {
                 Ok(None)
             }
         }
-        fn monitor(&mut self, command: &str) -> Option<String> {
-            (command == "ping").then(|| String::from("pong\n"))
+        fn monitor(&mut self, cpu: usize, command: &str) -> Option<String> {
+            // The CPU is echoed, because which thread a monitor command was
+            // typed on is the whole reason it is a parameter.
+            (command == "ping").then(|| format!("pong from {cpu}\n"))
         }
     }
 
@@ -1261,11 +1319,17 @@ mod tests {
         let (mut stub, mut target) = (Stub::new(), FakeTarget::new());
         assert_eq!(payload(&ask(&mut stub, &mut target, b"Z0,c000,1")), "OK");
         assert_eq!(payload(&ask(&mut stub, &mut target, b"Z1,c010,1")), "OK");
-        assert_eq!(target.breakpoints, vec![0xc000, 0xc010]);
+        // `Z0` and `Z1` are the same mechanism and different stop replies, so
+        // which one was asked for reaches the target.
+        assert_eq!(target.breakpoints, vec![(0xc000, false), (0xc010, true)]);
         assert_eq!(payload(&ask(&mut stub, &mut target, b"z0,c000,1")), "OK");
-        assert_eq!(target.breakpoints, vec![0xc010]);
+        assert_eq!(target.breakpoints, vec![(0xc010, true)]);
+        // A watchpoint carries the thread `H g` selected: its address is read
+        // back through that CPU's space for as long as it is armed.
+        assert_eq!(payload(&ask(&mut stub, &mut target, b"Hg2")), "OK");
         assert_eq!(payload(&ask(&mut stub, &mut target, b"Z2,20,4")), "OK");
-        assert_eq!(target.watchpoints, vec![(0x20, 4)]);
+        assert_eq!(target.watchpoints, vec![(1, 0x20, 4)]);
+        assert_eq!(payload(&ask(&mut stub, &mut target, b"Hg1")), "OK");
         // Read and access watchpoints are not supported, and say so the way
         // the protocol says so: an empty reply, not an error.
         assert_eq!(payload(&ask(&mut stub, &mut target, b"Z3,20,4")), "");
@@ -1273,11 +1337,63 @@ mod tests {
         // Malformed point packets are refused rather than parsed halfway.
         assert_eq!(payload(&ask(&mut stub, &mut target, b"Z0,zz,1")), "E16");
         assert_eq!(payload(&ask(&mut stub, &mut target, b"Z0")), "E16");
+        // A condition list this stub never advertised is ignored rather than
+        // refused: the breakpoint is still a breakpoint at that address.
+        assert_eq!(
+            payload(&ask(&mut stub, &mut target, b"Z0,c020,1;X3,010203")),
+            "OK"
+        );
+        assert!(target.breakpoints.contains(&(0xc020, false)));
+    }
+
+    #[test]
+    fn a_stop_reply_names_a_breakpoint_only_to_a_client_that_asked() {
+        // The GDB manual's "Stop Reply Packets": `swbreak` and `hwbreak` are
+        // sent only when the client offered them in its own `qSupported`.
+        // Sending one unasked is a reason an older client may reject.
+        let (mut stub, mut target) = (Stub::new(), FakeTarget::new());
+        assert_eq!(payload(&ask(&mut stub, &mut target, b"Z0,c000,1")), "OK");
+        stub.last_stop = Stop {
+            cpu: 0,
+            kind: StopKind::Breakpoint { hardware: false },
+        };
+        assert_eq!(payload(&ask(&mut stub, &mut target, b"?")), "T05thread:1;");
+
+        // Now negotiate, and the same stop says why it happened.
+        let mut stub = Stub::new();
+        assert!(
+            payload(&ask(
+                &mut stub,
+                &mut target,
+                b"qSupported:multiprocess+;swbreak+;hwbreak+"
+            ))
+            .contains("swbreak+")
+        );
+        stub.last_stop = Stop {
+            cpu: 0,
+            kind: StopKind::Breakpoint { hardware: false },
+        };
+        assert_eq!(
+            payload(&ask(&mut stub, &mut target, b"?")),
+            "T05thread:1;swbreak:;"
+        );
+        stub.last_stop = Stop {
+            cpu: 0,
+            kind: StopKind::Breakpoint { hardware: true },
+        };
+        assert_eq!(
+            payload(&ask(&mut stub, &mut target, b"?")),
+            "T05thread:1;hwbreak:;",
+            "a `Z1` is reported as the hardware breakpoint it was"
+        );
     }
 
     #[test]
     fn continue_runs_until_the_target_reports_a_stop() {
         let (mut stub, mut target) = (Stub::new(), FakeTarget::new());
+        // Negotiate first, so the stop reply is allowed to say *why* it
+        // stopped — see `a_stop_reply_names_a_breakpoint_only_to_a_client_that_asked`.
+        ask(&mut stub, &mut target, b"qSupported:swbreak+;hwbreak+");
         // `c` has no reply of its own.
         assert_eq!(ask(&mut stub, &mut target, b"c"), "+");
         assert!(stub.is_running());
@@ -1337,7 +1453,8 @@ mod tests {
         let mut request = b"qRcmd,".to_vec();
         push_hex(&mut request, b"ping");
         let reply = ask(&mut stub, &mut target, &request);
-        assert!(reply.contains("$O706f6e670a#"), "{reply}");
+        // "pong from 0\n": the reply carries the thread `H g` had selected.
+        assert!(reply.contains("$O706f6e672066726f6d20300a#"), "{reply}");
         assert_eq!(payload(&reply), "OK");
         let mut unknown = b"qRcmd,".to_vec();
         push_hex(&mut unknown, b"nope");

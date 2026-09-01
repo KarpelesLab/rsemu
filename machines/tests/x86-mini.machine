@@ -1,0 +1,74 @@
+# x86-mini - the smallest 8086 board, so a debugger has somewhere to attach.
+#
+# It models no product. It exists for `tests/gdb_real_client.rs`, which drives a
+# **real `gdb` binary** against rsemu's stub (ROADMAP.md phase 9's gate: "a guest
+# debugged end-to-end over gdb"). That test needs an x86 guest and not a nicer
+# one, for a reason that is about the debugger rather than about the board:
+# stock GDB refuses a target description for an architecture it has no gdbarch
+# for (the 6502, the Z80, the SM83 - see `src/host/gdb/arch.rs`), and a
+# distribution's `gdb` is usually built for the host architecture only. On the
+# overwhelmingly common x86-64 developer machine that leaves exactly one guest
+# family a stock `gdb` will talk to, and this is the smallest board in it.
+#
+# `pc-at` would also do, but it wants a firmware image the repository cannot
+# ship and a chipset the test does not exercise. Sixteen kilobytes of ROM, a
+# megabyte of RAM and a core is the whole board.
+#
+# ---------------------------------------------------------------------------
+# Why the reset vector far-jumps to 0000:0500
+# ---------------------------------------------------------------------------
+#
+# GDB has no notion of x86 segmentation: `$pc` is `eip`, and every address in an
+# `m`, `M` or `Z` packet is that flat number. On a real-mode guest with a
+# non-zero `CS` base, `eip` and the linear address the guest fetches from are
+# different numbers, and a debugger that believed the first would read the wrong
+# bytes. That is a property of the protocol, not a defect in this board - but it
+# does mean a board meant for a debugger should get `CS` to zero as its first
+# act, after which `eip` *is* the linear address and everything a user types
+# means what they think it means.
+#
+# So the only thing in ROM is the five bytes at the reset vector: `EA 00 05 00
+# 00`, `JMP 0000:0500` (Intel 8086 Family User's Manual, the intersegment direct
+# JMP). Everything after that runs in RAM, at an address GDB and the guest agree
+# on, and the test writes it there over the wire - which is the point, since a
+# debugger that cannot put code into a guest is not much of a debugger.
+
+machine "x86-mini" {
+  # Low memory. One megabyte is everything an 8086 can address, and the top
+  # 64 KiB of it is the ROM, so the RAM stops below that.
+  param ram = 0xf0000
+
+  # -- the crystal -----------------------------------------------------------
+  #
+  # 4.77 MHz: the IBM PC's 14.31818 MHz colour-burst crystal divided by three,
+  # which is where every 8086-era board's CPU clock came from. One oscillator,
+  # so every ratio on this board is exact (ROADMAP.md 4.2).
+  osc xtal = 14318180 Hz
+
+  # -- the two buses ---------------------------------------------------------
+  #
+  # `read-as-ones` on both, matching `pc-at`: an 8086 has no bus-error input, so
+  # an unclaimed read is the pull-ups on the data bus and not a fault.
+  space mem  { width = 20, unassigned = read-as-ones }
+  space port { width = 16, unassigned = read-as-ones }
+
+  # -- the core --------------------------------------------------------------
+  object cpu "cpu.x86" {
+    clock   = xtal / 3
+    space   = mem
+    iospace = "port"
+    model   = "8086"
+    engine  = "interp"
+  }
+
+  # -- memory ----------------------------------------------------------------
+  object dram "ram" { size = ram }
+
+  # The boot ROM. `image` names a media slot, so whoever runs the machine binds
+  # the bytes and nothing below host/ opens a file.
+  object boot "rom" { size = 64K, image = "firmware" }
+
+  # -- the map ---------------------------------------------------------------
+  map mem 0x00000 size ram  = dram
+  map mem 0xf0000 size 64K  = boot
+}
