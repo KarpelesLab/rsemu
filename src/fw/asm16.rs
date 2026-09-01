@@ -683,6 +683,11 @@ impl Asm {
         self.encode(&[0xff], 0, dst);
     }
 
+    /// `DEC r/m16` — `FF /1`.
+    pub fn decm(&mut self, dst: impl Into<Rm>) {
+        self.encode(&[0xff], 1, dst);
+    }
+
     /// `INC r/m32` — `66 FF /0`.
     pub fn incm32(&mut self, dst: impl Into<Rm>) {
         self.encode32(&[0xff], 0, dst);

@@ -53,7 +53,7 @@
 //! | `INT 10h` | video: set mode, cursor, teletype, scroll, write string |
 //! | `INT 11h` | the equipment word |
 //! | `INT 12h` | base memory size |
-//! | `INT 13h` | disk: reset, read, write, parameters, and the EDD subset |
+//! | `INT 13h` | disk: the IDE channel and the µPD765 both, plus the EDD subset |
 //! | `INT 15h` | `E820`, `E801`, `AH=88h` — the memory map |
 //! | `INT 16h` | keyboard, out of the buffer `INT 09h` fills |
 //! | `INT 19h` | the bootstrap loader |
@@ -75,6 +75,10 @@
 //!   a clear (`AL=0`), which is the case programs actually use it for.
 //! * **Text mode only**, because `pc.video` is a text-mode CRTC. Setting a
 //!   graphics mode records the number and changes nothing.
+//! * **A diskette can be read but not written.** `INT 13h AH=03h` with
+//!   `DL < 0x80` returns carry: the µPD765 command differs from a read by one
+//!   opcode bit and the 8237's mode by one nibble, and shipping that untested
+//!   would be worse than not shipping it.
 //! * **No serial, parallel, or PS/2 mouse services** (`INT 14h`, `INT 17h`,
 //!   `INT 15h AH=C2h`): the board has none of those devices.
 //! * **The keyboard is US-layout and set 1**, decoded from the translated codes
@@ -206,10 +210,26 @@ const EBDA_LBA_HIGH: u16 = 0x12;
 /// Scratch: the ATA command byte a transfer is in the middle of, so the
 /// per-sector loop can tell a read from a write without holding a register.
 const EBDA_COMMAND: u16 = 0x16;
+/// Diskette scratch: sectors still to transfer (word).
+const EBDA_FD_COUNT: u16 = 0x18;
+/// Diskette scratch: the sector number the next command asks for.
+const EBDA_FD_SECTOR: u16 = 0x1a;
+/// Diskette scratch: the cylinder the head is seeking to.
+const EBDA_FD_CYLINDER: u16 = 0x1b;
+/// Diskette scratch: the head.
+const EBDA_FD_HEAD: u16 = 0x1c;
+/// Diskette scratch: how many sectors have been transferred so far, which is
+/// what `AL` reports back whether the transfer finished or stopped short.
+const EBDA_FD_DONE: u16 = 0x1d;
+/// Diskette scratch: sectors per track, from the CMOS drive type.
+const EBDA_FD_SPT: u16 = 0x1e;
 /// How many `E820` entries [`EBDA_E820`] holds (word).
 const EBDA_E820_COUNT: u16 = 0x14;
 /// The `E820` memory map, built at POST: twenty bytes per entry.
 const EBDA_E820: u16 = 0x20;
+/// The seven result bytes of the last µPD765 command — `ST0`, `ST1`, `ST2`,
+/// `C`, `H`, `R`, `N`. Immediately past the `E820` table.
+const EBDA_FD_RESULT: u16 = EBDA_E820 + E820_ENTRY * 4;
 
 /// How many bytes one `E820` entry occupies: base, length, type.
 const E820_ENTRY: u16 = 20;
@@ -299,6 +319,16 @@ pub(crate) struct Labels {
     pub disk_ok: Label,
     pub disk_fail: Label,
 
+    // diskette primitives
+    pub fd_out: Label,
+    pub fd_in: Label,
+    pub fd_drain: Label,
+    pub fd_start: Label,
+    pub fd_seek: Label,
+    pub fd_dma: Label,
+    pub fd_read_one: Label,
+    pub fd_geometry: Label,
+
     // POST helpers
     pub cmos_read: Label,
     pub kbc_wait_write: Label,
@@ -342,6 +372,14 @@ impl Labels {
             chs_to_lba: a.label(),
             disk_ok: a.label(),
             disk_fail: a.label(),
+            fd_out: a.label(),
+            fd_in: a.label(),
+            fd_drain: a.label(),
+            fd_start: a.label(),
+            fd_seek: a.label(),
+            fd_dma: a.label(),
+            fd_read_one: a.label(),
+            fd_geometry: a.label(),
             cmos_read: a.label(),
             kbc_wait_write: a.label(),
             kbc_wait_read: a.label(),
@@ -423,7 +461,7 @@ const RESET_VECTOR: u16 = 0xfff0;
 /// Assemble the ROM.
 ///
 /// Deterministic: the same source produces the same 65,536 bytes on every host,
-/// and [`tests`] asserts it.
+/// and this module's own tests assert it.
 ///
 /// # Panics
 ///

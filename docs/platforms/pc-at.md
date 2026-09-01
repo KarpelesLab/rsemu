@@ -340,6 +340,21 @@ run:
   pc-at boot: E820[0] base=0x00000000 length=0x0009fc00 type=1
 ```
 
+Option-ROM dispatch is measured the same way, with `RSEMU_VGABIOS` pointing at a
+real video BIOS. rsemu's own firmware does **not** enumerate PCI, so it finds
+video the way a pre-PCI machine does — a scan of `0xc0000` upward for `0x55
+0xaa` — which makes the **ISA** build the right image here, the opposite of what
+the 440FX-era firmware above wants. With `vgabios.bin` in the legacy socket the
+scan finds it, checksums it, enters it at `seg:0003`, and the vector moves:
+
+```text
+  pc-at boot: INT 10h -> c000:53ef        (empty socket: f000:047f)
+```
+
+The ROM's own initialisation costs about 145 ms of virtual time, and POST
+resumes afterwards and boots as before — so the whole text page above is then
+drawn by somebody else's video BIOS through our `INT 19h`.
+
 The sequence is: reset at `0xfffffff0`, the far jump, the 8259A pair, the 8254,
 the 146818, the BIOS Data Area, the EBDA and the `E820` table built into it, the
 option-ROM scan over `0xc0000-0xdffff`, the 8042 brought up with translation on,
@@ -348,12 +363,17 @@ head 0, sector 1 to `0000:7c00` and jumping there. The guest that lands is a
 real program that calls back in: `INT 10h`, `INT 11h`, `INT 12h`, `INT 15h`
 (`E820`) and `INT 13h` for its own second read, all of which answer.
 
+The same test boots the same sector off the **diskette**, with both IDE bays
+empty so `INT 19h` falls through to it — a different path end to end, through
+the µPD765 and DMA channel 2 rather than the IDE command block.
+
 ### What it does not do
 
-- **No diskette.** `INT 13h` with `DL < 0x80` answers a reset and fails
-  everything else; the µPD765 and 8237 path is not written yet. `INT 19h` tries
-  the fixed disk first, so a boot does not depend on it. This is the next thing
-  it needs, because a FreeDOS install image is a diskette.
+- **A diskette can be read but not written.** `INT 13h AH=03h` with
+  `DL < 0x80` returns carry. Reads go the whole way — digital output register,
+  four `SENSE INTERRUPT STATUS` commands to clear the reset's ready-changed
+  reports, `SPECIFY`, `SEEK`, an 8237 channel-2 programming and one `READ DATA`
+  per sector — and `tests/pc_at_boot.rs` boots off one.
 - **No PCI BIOS interface, no ACPI, no SMBIOS.** All three are phase-6a
   deliverables and all three come after a boot.
 - **Text mode only**, because `pc.video` is a text-mode CRTC. `INT 10h AH=00h`

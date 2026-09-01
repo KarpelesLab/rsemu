@@ -134,7 +134,7 @@ fn boot_sector(echo: bool) -> Vec<u8> {
     // INT 13h AH=08h: the drive's geometry, as the firmware read it out of
     // `IDENTIFY DEVICE`.
     a.movi8(AH, 0x08);
-    a.movi8(DL, 0x80);
+    a.mov8(DL, Mem::abs(SCRATCH));
     a.int(0x13);
     a.movto(Mem::abs(SCRATCH + 6), CX);
     a.movto(Mem::abs(SCRATCH + 8), DX);
@@ -154,7 +154,7 @@ fn boot_sector(echo: bool) -> Vec<u8> {
     a.movi(AX, 0x0201);
     a.movi(CX, 0x0002); // cylinder 0, sector 2 — the second sector of track 0
     a.movi8(DH, 0x00);
-    a.movi8(DL, 0x80);
+    a.mov8(DL, Mem::abs(SCRATCH));
     a.movi(BX, SECOND_SECTOR);
     a.int(0x13);
     a.movto(Mem::abs(SCRATCH + 12), AX);
@@ -221,6 +221,16 @@ fn disk_image(echo: bool) -> Vec<u8> {
 /// The `pc-at` board with rsemu's own BIOS in its socket and the test disk in
 /// bay 0.
 fn board(echo: bool) -> (Machine, Arc<X86>, Arc<rsemu::core::hosts::HostObjects>) {
+    board_from(echo, false)
+}
+
+/// The same board with the boot sector on the **diskette** instead, and both
+/// IDE bays empty — so `INT 19h` tries the fixed disk, finds none, and falls
+/// through to the µPD765.
+fn board_from(
+    echo: bool,
+    from_floppy: bool,
+) -> (Machine, Arc<X86>, Arc<rsemu::core::hosts::HostObjects>) {
     let cpus: Arc<Captured<X86>> = Arc::new(Captured::new());
     let mut b = Bindings::new();
     rsemu::machine::builtin::bind(&mut b).expect("ram and rom");
@@ -241,11 +251,35 @@ fn board(echo: bool) -> (Machine, Arc<X86>, Arc<rsemu::core::hosts::HostObjects>
         .realize
         .media
         .insert("bios", rsemu::fw::pcbios::image());
-    // An empty option-ROM socket: 64 KiB of zeroes has no `0x55 0xAA`, which is
-    // exactly what the firmware's scan must survive.
-    options.realize.media.insert("vgabios", Vec::new());
-    options.realize.media.insert("floppy", vec![0u8; 1_474_560]);
-    options.realize.media.insert("hd0", disk_image(echo));
+    // An empty option-ROM socket by default: 64 KiB of zeroes has no
+    // `0x55 0xAA`, which is exactly what the firmware's scan must survive.
+    //
+    // `RSEMU_VGABIOS` puts a real one in the **legacy** socket at `0xc0000`,
+    // which is the path rsemu's own firmware takes — it does not enumerate PCI,
+    // so the expansion-ROM BAR on `pc.vga-pci` is not how it finds video. That
+    // makes the *ISA* build the right image here (`vgabios.bin` on a machine
+    // with QEMU's, not `vgabios-stdvga.bin`), which is the opposite of what a
+    // 440FX-era firmware wants. Nothing is vendored and the variable is
+    // optional, so `cargo test` stays hermetic.
+    options.realize.media.insert(
+        "vgabios",
+        std::env::var("RSEMU_VGABIOS")
+            .ok()
+            .map(|p| std::fs::read(&p).unwrap_or_else(|e| panic!("{p}: {e}")))
+            .unwrap_or_default(),
+    );
+    if from_floppy {
+        // 1.44 MB: 80 cylinders of two heads of eighteen sectors, which is what
+        // `pc.fdc` infers from the length and what the firmware's CMOS-driven
+        // geometry expects.
+        let mut image = disk_image(echo);
+        image.resize(1_474_560, 0);
+        options.realize.media.insert("floppy", image);
+        options.realize.media.insert("hd0", Vec::new());
+    } else {
+        options.realize.media.insert("floppy", vec![0u8; 1_474_560]);
+        options.realize.media.insert("hd0", disk_image(echo));
+    }
     options.realize.media.insert("hd1", Vec::new());
 
     let registry = rsemu::machine::catalog::registry().expect("this build's registry");
@@ -302,10 +336,12 @@ fn text_page(m: &Machine) -> Vec<String> {
 fn the_board_boots_a_guest_on_rsemus_own_firmware() {
     let (mut m, cpu, _hosts) = board(false);
 
-    // Fifty virtual milliseconds is about a thousand times what POST and the
-    // boot need at 25 MHz, and it is short enough that the whole test is a
-    // fraction of a second of host time.
-    m.run_for(GlobalTime::from_nanos(50_000_000))
+    // One virtual second. POST and the boot need about nine milliseconds of it
+    // at 25 MHz with an empty option-ROM socket; the rest of the budget is for
+    // the `RSEMU_VGABIOS` case, where a real video BIOS's own initialisation
+    // costs 145 ms before POST resumes. Either way the whole test is a fraction
+    // of a second of host time, because the guest spends the remainder halted.
+    m.run_for(GlobalTime::from_nanos(1_000_000_000))
         .expect("the machine runs");
 
     println!("pc-at boot: text page:");
@@ -318,12 +354,29 @@ fn the_board_boots_a_guest_on_rsemus_own_firmware() {
     println!(
         "pc-at boot: stopped at {:04x}:{:08x}, halted={}, {} cycles",
         regs.cs,
-        regs.eip,
+        regs.rip,
         cpu.is_halted(),
         cpu.cycles()
     );
     let (faults, last) = cpu.bus_faults();
     println!("pc-at boot: {faults} unanswered bus access(es), last at {last:08x}");
+
+    // Who owns `INT 10h` at the end. With an empty socket it is this firmware;
+    // with `RSEMU_VGABIOS` pointing at a legacy video BIOS the option-ROM scan
+    // found it, checksummed it, entered it at `seg:0003`, and the ROM installed
+    // its own — which is the whole of what option-ROM dispatch is for, and is
+    // checked rather than assumed.
+    let int10 = (peek16(&m, 0x10 * 4 + 2), peek16(&m, 0x10 * 4));
+    println!("pc-at boot: INT 10h -> {:04x}:{:04x}", int10.0, int10.1);
+    if std::env::var("RSEMU_VGABIOS").is_ok() {
+        assert_ne!(
+            int10.0, 0xf000,
+            "a video option ROM was supplied and never took over INT 10h: the \
+             scan did not find it, or its checksum did not come out"
+        );
+    } else {
+        assert_eq!(int10.0, 0xf000, "nothing else should own INT 10h here");
+    }
 
     // -- the firmware's own POST --------------------------------------------
     //
@@ -461,6 +514,84 @@ fn the_board_boots_a_guest_on_rsemus_own_firmware() {
              half of the option-ROM window"
         );
     }
+}
+
+/// The same boot, off the **diskette**, through the µPD765 and the 8237.
+///
+/// Both IDE bays are empty, so `INT 19h` tries `0x80`, `INT 13h` reports no
+/// such drive, and the fallback takes over. Everything after that is a
+/// different path from the fixed disk's: the digital output register, four
+/// `SENSE INTERRUPT STATUS` commands to clear the reset's ready-changed
+/// reports, `SPECIFY`, a `SEEK`, a DMA channel programmed for a memory write,
+/// and a `READ DATA` per sector. The boot sector then reads a sector of its
+/// own the same way.
+#[test]
+fn the_board_boots_off_the_diskette_too() {
+    let (mut m, cpu, _hosts) = board_from(false, true);
+    m.run_for(GlobalTime::from_nanos(1_000_000_000))
+        .expect("the machine runs");
+
+    println!("pc-at boot (diskette): text page:");
+    for line in text_page(&m) {
+        if !line.trim().is_empty() {
+            println!("  |{line}|");
+        }
+    }
+    let regs = cpu.regs();
+    println!(
+        "pc-at boot (diskette): stopped at {:04x}:{:08x}, halted={}",
+        regs.cs,
+        regs.rip,
+        cpu.is_halted()
+    );
+
+    assert_eq!(peek(&m, 0x475), 0, "no fixed disk should have been found");
+    assert_eq!(
+        peek16(&m, u64::from(SCRATCH) + 14),
+        DONE_MARKER,
+        "the diskette's boot sector did not run to the end"
+    );
+    assert_eq!(
+        peek(&m, u64::from(SCRATCH)),
+        0x00,
+        "the sector was not told it came off drive 0"
+    );
+
+    // The geometry `INT 13h AH=08h` reports for a 1.44 MB unit, out of the CMOS
+    // diskette-type byte rather than out of a constant in the firmware.
+    let cx = peek16(&m, u64::from(SCRATCH) + 6);
+    let dx = peek16(&m, u64::from(SCRATCH) + 8);
+    println!(
+        "pc-at boot (diskette): INT 13h AH=08h cylinders-1={}, sectors={}, heads-1={}, drives={}",
+        cx >> 8,
+        cx & 0x3f,
+        dx >> 8,
+        dx & 0xff
+    );
+    assert_eq!(cx & 0x3f, 18, "sectors per track");
+    assert_eq!(dx >> 8, 1, "heads minus one");
+
+    // The sector the guest read for itself, which went through the whole
+    // controller-and-DMA path a second time.
+    assert_eq!(
+        peek16(&m, u64::from(SCRATCH) + 12) >> 8,
+        0,
+        "INT 13h AH=02h on the diskette reported an error"
+    );
+    let got: Vec<u8> = (0..512)
+        .map(|i| peek(&m, u64::from(SECOND_SECTOR) + i))
+        .collect();
+    assert_eq!(
+        got,
+        stamp(1),
+        "the sector the guest read off the diskette is not the one on the medium"
+    );
+
+    let page = text_page(&m);
+    assert!(
+        page.iter().any(|line| line.contains(GREETING)),
+        "the boot sector's greeting never reached the text page"
+    );
 }
 
 /// A key typed at the 8042 comes back out of `INT 16h` as a character.
