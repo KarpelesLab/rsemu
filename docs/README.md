@@ -50,7 +50,8 @@ the question never arises.
 | [`cpu/x86.md`](cpu/x86.md) | 8086 → i386 → x86-64, SSE/AVX, paging, segmentation |
 | [`cpu/arm.md`](cpu/arm.md) | ARMv5TE, ARMv7-A, ARMv7-M / Cortex-M, ARMv8-A / AArch64, GIC |
 | [`cpu/riscv.md`](cpu/riscv.md) | RV32/RV64, privileged spec, SBI |
-| [`cpu/other.md`](cpu/other.md) | 68000, MIPS, PowerPC, SuperH, V850 |
+| [`cpu/mips.md`](cpu/mips.md) | MIPS I / R3000A, the LR33300, and why MIPS32 is the wrong CP0 manual |
+| [`cpu/other.md`](cpu/other.md) | 68000, PowerPC, SuperH, V850 |
 
 ### Machines
 | | |

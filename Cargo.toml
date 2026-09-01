@@ -138,6 +138,24 @@ machine-apple1 = ["cpu-mos6502", "dev-apple1"]
 # no dependencies and is `no_std + alloc`.
 cpu-riscv = []
 
+# The RISC-V IR frontend (src/cpu/riscv/lift.rs): lifting guest instructions
+# into `ir::Block`s — the first frontend for the translation IR, and the half
+# of ROADMAP.md §9 that faces a guest. A documented subset of RV64I, done
+# exactly: LUI/AUIPC, every register-immediate and register-register integer
+# ALU operation including the RV64 `*W` word forms, every load and store, the
+# six conditional branches, JAL and JALR. It reads the same declarative rows in
+# `isa.rs` that decode and the disassembler read, so there is still one
+# description of the instruction set and not a second.
+#
+# Deliberately **not** here: M, A, F, D, the CSR instructions, the privileged
+# instructions, both fences, and RV32 — each of those ends the block with a
+# terminator that hands the PC back to the interpreter, which stays the oracle
+# (CLAUDE.md, "CPU cores"). No block chaining and no host code generation
+# either; a backend that lowers these blocks lives in `jit/`, above the `std`
+# line. Needs `cpu-riscv` for the core and `ir` for the block types. Adds no
+# dependencies and is `no_std + alloc`.
+cpu-riscv-lift = ["cpu-riscv", "ir"]
+
 # The WDC 65xx peripherals (src/dev/wdc): the W65C51N ACIA as a character
 # device, the W65C22 VIA with both ports and both timers, and the 32 KiB
 # program EEPROM socket a 6502 breadboard computer boots from — plus
@@ -277,6 +295,22 @@ dev-lcdc = []
 # something. The machine file writes down which SPI modelling style it uses, and
 # `-p link=transactional` switches it. Adds no dependencies.
 machine-spi-panel = ["cpu-riscv", "bus-spi", "dev-st7272a", "dev-lcdc"]
+
+# The translation IR (src/ir): the architecture-neutral op set every CPU
+# frontend lifts into and every JIT backend lowers from, its typed SSA blocks,
+# the guest-instruction-boundary markers that make a mid-block fault
+# deliverable at the right PC, and the verifier that rejects a malformed block
+# before a backend can miscompile it (ROADMAP.md §9).
+#
+# Also the portable IR interpreter backend, which is here rather than in `jit/`
+# because §11's target table has a bare-metal row whose engine it is, and
+# because it is the oracle every host backend is differentially tested against.
+#
+# Deliberately **not** here: any host code generation. Emitting machine code
+# needs W^X buffers and raw syscalls, and emitting wasm needs an embedder
+# import, so both live in `jit/` above the `std` line. Adds no dependencies and
+# is `no_std + alloc`.
+ir = []
 
 # Level-3 execution (src/usermode): running a program with no guest kernel
 # under it, `qemu-user`/gVisor-shaped (ROADMAP.md §2, phase 5b). The four
@@ -649,6 +683,29 @@ machine-pc-at = [
 # The plain 68000 of the Amiga, Atari ST, Mega Drive and early Macs; not the
 # 010 or the 020. Adds no dependencies and is `no_std + alloc`.
 cpu-m68k = []
+
+# The MIPS core (src/cpu/mips): an LSI/MIPS R3000A-compatible MIPS I
+# interpreter -- the integer instruction set, R3000-style coprocessor 0 with
+# the full exception model and the 64-entry TLB, the fixed kuseg/kseg0/kseg1/
+# kseg2 map, HI/LO with multiply and divide, and branch *and* load delay slots
+# modelled honestly (MIPS I has no load interlock, and an exception in a delay
+# slot sets Cause.BD and points EPC at the branch). Which part is a
+# construction property, not a build flag: `r3000a`, `r3051`, and `lr33300`,
+# which has no TLB at all -- so one build runs both. Big- and little-endian.
+# Ships a disassembler generated from the same instruction description, a
+# 32-bit ELF reader, and the `syscall`-exit seam level-3 execution needs. The
+# GTE, the R3010 FPU and the LR33300 scratchpad are deliberately absent; a
+# COP1/COP2 instruction raises coprocessor-unusable, which is how a guest finds
+# out. Adds no dependencies and is `no_std + alloc`.
+cpu-mips = []
+
+# The `mips-mini` board (machines/mips-mini.machine plus the classes it names):
+# a synthetic little-endian R3000A board -- a boot ROM in kseg1 at the reset
+# vector, RAM at physical zero, and nothing else. It models no product; it
+# exists so `cpu.mips` has somewhere to run inside a machine file and so the
+# segment map is exercised by a real board rather than only by unit tests.
+# Adds no dependencies.
+machine-mips-mini = ["cpu-mips"]
 
 # The `m68k-mini` board (machines/m68k-mini.machine plus the classes it names):
 # a big-endian 24-bit space, ROM at zero holding the exception vector table and

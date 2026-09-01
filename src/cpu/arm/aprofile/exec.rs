@@ -247,6 +247,36 @@ impl PhysMem for Walker<'_> {
     }
 }
 
+/// Resolve one address the way a debugger asks it: no TLB, no fault latch, no
+/// cycles, and every descriptor read carrying [`MemAttrs::DEBUG`].
+///
+/// A free function rather than a method on [`Exec`] because there is no step in
+/// progress: a monitor listing or a `m` packet arrives between instructions, and
+/// building an `Exec` for it would sample a [`Regime`] and sync a TLB that the
+/// debugger has no business touching. This is the *only* route to
+/// [`Mmu::translate_debug`] in the core, which is what keeps the debug walk from
+/// being reachable with the guest's own attributes by accident.
+///
+/// `None` means the tables map nothing there — including the case where the
+/// table itself could not be read.
+pub(super) fn debug_translate(
+    space: &AddressSpace,
+    mmu: &dyn Mmu,
+    cfg: &Config,
+    va: u32,
+) -> Option<u32> {
+    if !mmu.regime().translating {
+        return Some(va);
+    }
+    let walker = Walker {
+        space,
+        attrs: MemAttrs::DEBUG.with_requester(cfg.requester),
+        endian: cfg.endian,
+        reads: Cell::new(0),
+    };
+    mmu.translate_debug(&walker, Va(va)).ok().map(|pa| pa.0)
+}
+
 /// One step's worth of execution, borrowing everything it needs.
 pub(super) struct Exec<'a> {
     state: &'a mut State,

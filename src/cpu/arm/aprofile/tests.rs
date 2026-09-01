@@ -1883,7 +1883,7 @@ fn a_listing_resolves_branch_targets() {
 fn the_core_disassembles_its_own_memory_without_side_effects() {
     let h = running(&[0xe3a0_0042, 0xe081_0002]);
     let before = h.log().len();
-    let listing = h.cpu.disassemble(0x1000, 2, false);
+    let listing = h.cpu.disassemble_physical(0x1000, 2, false);
     assert_eq!(listing.len(), 2);
     assert!(alloc::format!("{}", listing[0]).contains("MOV r0, #66"));
     assert!(alloc::format!("{}", listing[1]).contains("ADD r0, r1, r2"));
@@ -1892,7 +1892,7 @@ fn the_core_disassembles_its_own_memory_without_side_effects() {
 
 #[test]
 fn an_unreadable_listing_says_so_rather_than_inventing_bytes() {
-    let listing = disasm::disassemble_run(0x1000, 2, false, |_| None);
+    let listing = disasm::disassemble_run(0x1000, 2, false, |_| Err(disasm::Missing::Unmapped));
     assert!(matches!(listing[0], disasm::Listed::Unreadable { .. }));
     assert_eq!(listing[1].addr(), 0x1004);
 }
@@ -2481,6 +2481,24 @@ fn section(h: &Harness, va: u32, pa: u32, ap: u32, domain: u32) {
     h.poke(TABLE + ((va >> 20) << 2), descriptor);
 }
 
+/// Where a coarse second-level table goes: immediately above the 16 KiB
+/// first-level one, and 1 KiB aligned as the architecture requires.
+const COARSE: u32 = TABLE + 0x4000;
+
+/// Map one 4 KiB page through a coarse second-level table, so a test can have a
+/// mapping boundary that is not a megabyte away (ARM ARM B4.3.2).
+fn small_page(h: &Harness, va: u32, pa: u32, ap: u32, domain: u32) {
+    h.poke(
+        TABLE + ((va >> 20) << 2),
+        (COARSE & 0xffff_fc00) | (domain << 5) | 0b01,
+    );
+    let subpages = (ap << 10) | (ap << 8) | (ap << 6) | (ap << 4);
+    h.poke(
+        COARSE + (((va >> 12) & 0xff) << 2),
+        (pa & 0xffff_f000) | subpages | 0b10,
+    );
+}
+
 /// Point CP15 at `TABLE`, make `domains` the domain access control register,
 /// and turn the MMU on.
 fn enable_mmu(h: &Harness, domains: u32) {
@@ -2630,6 +2648,142 @@ fn a_user_write_to_a_privileged_page_is_a_permission_fault() {
     let cp15 = h.cpu.cp15().expect("a CP15");
     assert_eq!(cp15.fault_status().0, 0x0d, "permission fault, section");
     assert_eq!(cp15.fault_address(), 0x3000);
+}
+
+#[test]
+fn a_virtual_listing_follows_the_page_table_and_a_physical_one_does_not() {
+    // The defect, stated as a test. The program lives at physical 0x1000 and
+    // virtual megabyte 0x100 aliases physical megabyte 0, so the *same code* is
+    // at VA 0x10001000 and PA 0x00001000 — and at PA 0x10001000 there is
+    // nothing at all. A listing that skipped translation would decode the hole.
+    let h = with_cp15();
+    h.program(0x1000, &[0xe3a0_0042, 0xe081_0002]);
+    h.boot(0x1000);
+    section(&h, 0, 0, 0b11, 0);
+    section(&h, 0x1000_0000, 0x0000_0000, 0b11, 0);
+    enable_mmu(&h, 0x5555_5555);
+
+    let virt = h.cpu.disassemble_virtual(0x1000_1000, 2, false);
+    assert_eq!(virt.len(), 2);
+    assert!(alloc::format!("{}", virt[0]).contains("MOV r0, #66"));
+    assert!(alloc::format!("{}", virt[1]).contains("ADD r0, r1, r2"));
+
+    // The same number read physically is off the end of the harness's RAM, and
+    // says so rather than decoding whatever the bus returned.
+    let phys = h.cpu.disassemble_physical(0x1000_1000, 2, false);
+    assert!(
+        matches!(
+            phys[0],
+            disasm::Listed::Unreadable {
+                why: disasm::Missing::Unmapped,
+                ..
+            }
+        ),
+        "a physical listing must not silently follow the page table: {}",
+        phys[0]
+    );
+}
+
+#[test]
+fn a_virtual_listing_that_runs_off_a_mapped_page_says_so_and_keeps_its_count() {
+    // One 4 KiB page mapped at virtual 0x10000000 and nothing after it. A
+    // listing that starts on its last word gets one decode and then holes —
+    // four entries for four asked, each naming why. This is the case the
+    // design question was about: the first instructions were fine, and failing
+    // the whole request would throw that away.
+    let h = with_cp15();
+    h.program(0x1000, &[0xe3a0_0042]);
+    h.program(0x1ffc, &[0xe3a0_0042]); // the last word of the mapped page
+    h.boot(0x1000);
+    section(&h, 0, 0, 0b11, 0);
+    small_page(&h, 0x1000_0000, 0x0000_1000, 0b11, 0);
+    enable_mmu(&h, 0x5555_5555);
+
+    let listing = h.cpu.disassemble_virtual(0x1000_0ffc, 4, false);
+    assert_eq!(listing.len(), 4, "a hole must not shorten the listing");
+    assert!(matches!(listing[0], disasm::Listed::Arm { .. }));
+    for one in &listing[1..] {
+        assert!(
+            matches!(
+                one,
+                disasm::Listed::Unreadable {
+                    why: disasm::Missing::Untranslated,
+                    ..
+                }
+            ),
+            "expected an untranslated hole, got {one}"
+        );
+    }
+    assert_eq!(listing[1].addr(), 0x1000_1000);
+}
+
+#[test]
+fn a_debug_translation_disturbs_neither_the_core_nor_the_tables() {
+    // The no-side-effects property, asserted directly rather than inferred.
+    // VMSAv5 has no accessed bit, so what there *is* to disturb is the fault
+    // status and address CP15 latches, the TLB the core keeps, the cycle
+    // counter, and the bus log — and a wrong answer here is a debugger that
+    // changes the guest by looking at it.
+    let h = with_cp15();
+    h.boot(0x1000);
+    section(&h, 0, 0, 0b11, 0);
+    section(&h, 0x1000_0000, 0x0000_0000, 0b11, 0);
+    enable_mmu(&h, 0x5555_5555);
+    // Take a real abort first, so the fault registers hold something a
+    // careless debug walk could overwrite.
+    h.cpu.set_pc(0x0040_0000);
+    h.step();
+    let cp15 = h.cpu.cp15().expect("a CP15").clone();
+    let faults = (cp15.fault_status(), cp15.fault_address());
+
+    let cycles = h.cpu.cycles();
+    let tlb = h.cpu.tlb_stats();
+    let log = h.log().len();
+    let table = h.peek(TABLE + 0x400);
+
+    assert_eq!(h.cpu.translate_debug(0x1000_1000), Some(0x0000_1000));
+    assert_eq!(
+        h.cpu.translate_debug(0x0040_0000),
+        None,
+        "an unmapped address is unmapped for a debugger too"
+    );
+
+    assert_eq!(
+        (cp15.fault_status(), cp15.fault_address()),
+        faults,
+        "a debug walk latched a fault status or address"
+    );
+    assert_eq!(h.cpu.cycles(), cycles, "a debug walk charged a cycle");
+    assert_eq!(h.cpu.tlb_stats(), tlb, "a debug walk touched the TLB");
+    assert_eq!(
+        h.peek(TABLE + 0x400),
+        table,
+        "a debug walk wrote to a table"
+    );
+    // `LogRam` records only accesses whose `debug` attribute is clear, so a
+    // walk that read a descriptor as the guest would have shows up here. It
+    // must not: a page table can live under an MMIO region, and a walk that
+    // read it as an ordinary access is a debugger changing what it came to
+    // look at.
+    assert_eq!(
+        h.log().len(),
+        log,
+        "a debug walk made a bus access without the debug attribute"
+    );
+}
+
+#[test]
+fn a_debug_translation_sees_a_page_the_permissions_hide() {
+    // Domain 0 set to "no access" refuses every access the guest makes — and a
+    // debugger still gets an answer, because it asked where the page is, not
+    // whether it may touch it.
+    let h = with_cp15();
+    h.boot(0x1000);
+    section(&h, 0, 0, 0b11, 0);
+    section(&h, 0x1000_0000, 0x0000_0000, 0b11, 1);
+    // Domain 1 = 0b00, no access; domain 0 stays client so the fetch works.
+    enable_mmu(&h, 0x0000_0001);
+    assert_eq!(h.cpu.translate_debug(0x1000_1000), Some(0x0000_1000));
 }
 
 #[test]

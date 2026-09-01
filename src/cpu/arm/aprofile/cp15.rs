@@ -137,6 +137,20 @@ impl Allow {
     }
 }
 
+/// Whether a walk enforces the permission checks or only resolves the mapping.
+///
+/// Two genuinely different questions, and a debugger asks the second one — see
+/// [`Mmu::translate_debug`]. Threading this through rather than writing a
+/// second walk keeps one description of VMSAv5 in the file, for the same reason
+/// the disassembler shares the interpreter's tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Checks {
+    /// A guest access: its kind, and whether it came from a privileged mode.
+    Guest(AccessKind, bool),
+    /// A debugger's: resolve the mapping and check nothing.
+    None,
+}
+
 /// Which level of the table a fault happened at, so it can name itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Level {
@@ -349,10 +363,14 @@ impl Cp15 {
         &self,
         domain: u8,
         ap: u32,
-        kind: AccessKind,
-        privileged: bool,
+        checks: Checks,
         level: Level,
     ) -> core::result::Result<(), Fault> {
+        let Checks::Guest(kind, privileged) = checks else {
+            // A debugger is not the guest, so neither the domain model nor the
+            // access permissions apply to it. It asked where the page is.
+            return Ok(());
+        };
         let access = (self.domains() >> (2 * u32::from(domain))) & 0b11;
         match access {
             // Manager: no permission check at all.
@@ -407,8 +425,7 @@ impl Cp15 {
         descriptor: u32,
         mva: u32,
         domain: u8,
-        kind: AccessKind,
-        privileged: bool,
+        checks: Checks,
     ) -> core::result::Result<Pa, Fault> {
         // The four `AP` fields sit at bits 11..4, two bits each. Which one
         // applies depends on the page size, because they divide the page into
@@ -440,7 +457,7 @@ impl Cp15 {
             // because refusing would invent a fault the manual does not name.
             _ => (subpage(0), descriptor & 0xffff_fc00, 0x0000_03ff),
         };
-        self.domain_check(domain, ap, kind, privileged, Level::Page)?;
+        self.domain_check(domain, ap, checks, Level::Page)?;
         Ok(Pa(base | (mva & offset_mask)))
     }
 }
@@ -551,6 +568,44 @@ impl Mmu for Cp15 {
         }
     }
 
+    fn translate(
+        &self,
+        mem: &dyn PhysMem,
+        va: Va,
+        kind: AccessKind,
+        privileged: bool,
+    ) -> core::result::Result<Pa, Fault> {
+        self.walk(mem, va, Checks::Guest(kind, privileged))
+    }
+
+    /// The same tables, read with the permission checks switched off.
+    ///
+    /// Nothing else changes, and nothing else *can*: [`PhysMem`] is read-only,
+    /// so the walk has no way to write a descriptor back even if VMSAv5 had an
+    /// accessed bit to write — and it has none. The one side effect an ARM
+    /// translation has is latching `FSR` and `FAR`, and that happens in
+    /// [`report_abort`](Mmu::report_abort), which the debug path never reaches.
+    fn translate_debug(&self, mem: &dyn PhysMem, va: Va) -> core::result::Result<Pa, Fault> {
+        self.walk(mem, va, Checks::None)
+    }
+
+    fn report_abort(&self, va: Va, fault: Fault, kind: AccessKind) {
+        if kind.is_fetch() {
+            // An ARM926EJ-S has an instruction fault *status* register
+            // (c5 with opcode_2 = 1, ARM926EJ-S TRM 2.3.5) and no instruction
+            // fault *address* register: a prefetch abort handler recovers the
+            // address from `R14_abt`, which is why one was never needed.
+            self.ifsr.store(fault.to_fsr(), Ordering::Release);
+        } else {
+            self.dfsr.store(fault.to_fsr(), Ordering::Release);
+            // The FAR holds the *modified* virtual address, which is what the
+            // MMU saw.
+            self.far.store(self.mva(va), Ordering::Release);
+        }
+    }
+}
+
+impl Cp15 {
     /// The VMSAv5 walk: at most two descriptor reads, in the order the manual
     /// checks them (ARM ARM B4.3).
     ///
@@ -560,13 +615,7 @@ impl Mmu for Cp15 {
     /// fault reported where the manual calls for a domain fault sends a kernel
     /// down the wrong branch — which is why the checks below are written out one
     /// at a time rather than folded together.
-    fn translate(
-        &self,
-        mem: &dyn PhysMem,
-        va: Va,
-        kind: AccessKind,
-        privileged: bool,
-    ) -> core::result::Result<Pa, Fault> {
+    fn walk(&self, mem: &dyn PhysMem, va: Va, checks: Checks) -> core::result::Result<Pa, Fault> {
         let mva = self.mva(va);
         if self.control() & control::M == 0 {
             // The FCSE brought us here; there is no table to walk.
@@ -589,12 +638,12 @@ impl Mmu for Cp15 {
                 let entry = mem
                     .read_u32(Pa(second))
                     .ok_or_else(|| Fault::EXTERNAL_L2.in_domain(domain))?;
-                self.second_level(entry, mva, domain, kind, privileged)
+                self.second_level(entry, mva, domain, checks)
             }
             // A section: one megabyte, no second level.
             0b10 => {
                 let ap = (descriptor >> 10) & 0b11;
-                self.domain_check(domain, ap, kind, privileged, Level::Section)?;
+                self.domain_check(domain, ap, checks, Level::Section)?;
                 Ok(Pa((descriptor & 0xfff0_0000) | (mva & 0x000f_ffff)))
             }
             // A fine second-level table: 1024 entries of 1 KiB each, so it is
@@ -604,23 +653,8 @@ impl Mmu for Cp15 {
                 let entry = mem
                     .read_u32(Pa(second))
                     .ok_or_else(|| Fault::EXTERNAL_L2.in_domain(domain))?;
-                self.second_level(entry, mva, domain, kind, privileged)
+                self.second_level(entry, mva, domain, checks)
             }
-        }
-    }
-
-    fn report_abort(&self, va: Va, fault: Fault, kind: AccessKind) {
-        if kind.is_fetch() {
-            // An ARM926EJ-S has an instruction fault *status* register
-            // (c5 with opcode_2 = 1, ARM926EJ-S TRM 2.3.5) and no instruction
-            // fault *address* register: a prefetch abort handler recovers the
-            // address from `R14_abt`, which is why one was never needed.
-            self.ifsr.store(fault.to_fsr(), Ordering::Release);
-        } else {
-            self.dfsr.store(fault.to_fsr(), Ordering::Release);
-            // The FAR holds the *modified* virtual address, which is what the
-            // MMU saw.
-            self.far.store(self.mva(va), Ordering::Release);
         }
     }
 }

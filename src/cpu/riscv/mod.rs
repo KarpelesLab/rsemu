@@ -12,6 +12,7 @@
 //! | --- | --- |
 //! | the one declarative instruction table, decode, and `C` expansion | [`isa`] |
 //! | the disassembler generated from that table | [`disasm`] |
+//! | the IR frontend, behind `cpu-riscv-lift` | `lift` |
 //! | the interpreter | `exec` |
 //! | CSRs, privilege modes, trap causes, interrupt lines | [`csr`] |
 //! | Sv39/Sv32 walk, PMP, the software TLB | [`mmu`] |
@@ -77,6 +78,13 @@ pub mod elf;
 mod exec;
 pub mod float;
 pub mod isa;
+
+// The IR frontend needs both this core and `src/ir`, so it has its own feature
+// rather than riding on either (ROADMAP.md §9).
+#[cfg(feature = "cpu-riscv-lift")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-riscv-lift")))]
+pub mod lift;
+
 pub mod mmu;
 
 #[cfg(test)]
@@ -93,7 +101,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::core::device::{
-    Device, DeviceClass, ExportId, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
+    DebugTranslation, Device, DeviceClass, ExportId, Initiator, PropertySpec, RealizeCtx,
+    ResetKind, SinkPin,
 };
 use crate::core::error::{Error, Result};
 use crate::core::exec::{Exit, ExitMask, ExitingCore, Run};
@@ -778,25 +787,76 @@ impl Hart {
         }
     }
 
-    /// Disassemble `count` instructions starting at `pc`, reading guest memory
-    /// with debug attributes.
+    /// Where a virtual address is mapped, as a debugger asks it.
+    ///
+    /// `None` is "the tables map nothing there". With `satp` in bare mode — and
+    /// always in machine mode, which RISC-V never translates — this is the
+    /// identity and cannot fail.
+    ///
+    /// Side-effect free by construction rather than by care: the walk is handed
+    /// a [`mmu::ReadPte`] and so **cannot** set an accessed or dirty bit, it
+    /// does not consult or fill the hart's TLB, it charges no cycles, and its
+    /// descriptor reads carry [`MemAttrs::DEBUG`]. It is also permission-free —
+    /// it answers where the page is, not whether an access would be allowed —
+    /// so a supervisor with `SUM` clear can still be asked to show a user page.
+    /// See [`Device::debug_translate`].
+    #[must_use]
+    pub fn translate_debug(&self, va: u64) -> Option<u64> {
+        let cfg = self.effective_config();
+        let session = self.session.lock();
+        let space = session.space.as_ref()?;
+        exec::debug_translate(&session.state, space, &cfg, va)
+    }
+
+    /// Disassemble `count` instructions starting at the **virtual** address
+    /// `pc`, reading guest memory with debug attributes.
+    ///
+    /// This is the one to hand [`pc`](Hart::pc). Every halfword is translated
+    /// through [`translate_debug`](Hart::translate_debug), so a listing that
+    /// runs off the end of a mapped page carries on with a hole naming
+    /// [`Missing::Untranslated`](disasm::Missing::Untranslated) rather than
+    /// stopping — the count is always what was asked for.
     ///
     /// Debug attributes are the point: a monitor listing the code around the
-    /// program counter must not pop a FIFO or clear a status bit on the way.
-    /// Reads go through the *physical* address only when translation is off;
-    /// with paging on, the listing walks the tables the same way a fetch
-    /// would, but without setting any accessed bit.
+    /// program counter must not pop a FIFO or clear a status bit on the way,
+    /// and neither must the page-table walk that finds it.
     #[must_use]
-    pub fn disassemble(&self, pc: u64, count: usize) -> Vec<disasm::Disassembled> {
+    pub fn disassemble_virtual(&self, pc: u64, count: usize) -> Vec<disasm::Disassembled> {
         let Some(space) = self.space() else {
             return Vec::new();
         };
         let xlen = self.cfg.xlen;
+        let attrs = MemAttrs::DEBUG.with_requester(self.effective_config().requester);
         disasm::disassemble_run(pc, count, xlen, |addr| {
+            let phys = self
+                .translate_debug(addr)
+                .ok_or(disasm::Missing::Untranslated)?;
             space
-                .read(addr, Width::U16, MemAttrs::DEBUG)
-                .ok()
+                .read(phys, Width::U16, attrs)
                 .map(|v| v as u16)
+                .map_err(|_| disasm::Missing::Unmapped)
+        })
+    }
+
+    /// Disassemble `count` instructions starting at the **physical** address
+    /// `addr`.
+    ///
+    /// The untranslated form, and it is not a legacy shim: a monitor inspecting
+    /// a firmware image, a board bring-up test and every conformance harness in
+    /// the tree genuinely want a bus address. The caller says which it means —
+    /// that is why neither of these is called `disassemble`.
+    #[must_use]
+    pub fn disassemble_physical(&self, addr: u64, count: usize) -> Vec<disasm::Disassembled> {
+        let Some(space) = self.space() else {
+            return Vec::new();
+        };
+        let xlen = self.cfg.xlen;
+        let attrs = MemAttrs::DEBUG.with_requester(self.effective_config().requester);
+        disasm::disassemble_run(addr, count, xlen, |at| {
+            space
+                .read(at, Width::U16, attrs)
+                .map(|v| v as u16)
+                .map_err(|_| disasm::Missing::Unmapped)
         })
     }
 }
@@ -904,6 +964,15 @@ fn pin_mask(port: &str) -> Option<u64> {
 impl Device for Hart {
     fn class(&self) -> &'static DeviceClass {
         &CLASS
+    }
+
+    /// The debug surface's route to the MMU: this is how a gdb `m` packet
+    /// naming a virtual address reaches the right physical one.
+    fn debug_translate(&self, va: u64) -> DebugTranslation {
+        match self.translate_debug(va) {
+            Some(pa) => DebugTranslation::Mapped(pa),
+            None => DebugTranslation::Unmapped,
+        }
     }
 
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {

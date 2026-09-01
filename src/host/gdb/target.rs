@@ -16,6 +16,17 @@
 //! instruction*, so a single careless access would be a side effect a thousand
 //! times a second.
 //!
+//! **Every address in a packet is virtual.** `m`, `M`, `X` and the `Z` packets
+//! name addresses the *guest* uses, so with an MMU on they are not the
+//! addresses the bus wants. [`MachineTarget::translate`] is where that is
+//! answered, through [`Device::debug_translate`](crate::core::device::Device::debug_translate)
+//! — which means the page-table walk is the core's, runs with `debug` set, and
+//! sets no accessed or dirty bit on the way. A core with no MMU answers the
+//! identity and pays nothing. Breakpoints need none of this: they are compared
+//! against the program counter, which is itself virtual, so a `Z0` address and
+//! a `$pc` are already in the same space. [`MachineTarget::read_physical`] is
+//! the deliberate way out for a caller that really does mean a bus address.
+//!
 //! **Attaching stops the world.** The machine advances only inside
 //! [`DebugTarget::resume`] and [`DebugTarget::step`], both of which are called
 //! from the same thread that services packets and never while a packet is being
@@ -54,6 +65,13 @@ pub enum TargetError {
     /// The guest bus refused the access, or there is no address space to make
     /// it in.
     Fault,
+    /// The CPU's page tables map nothing at that virtual address.
+    ///
+    /// Distinct from [`TargetError::Fault`] because the two send a user to
+    /// different places: a fault means the machine has no memory there, and
+    /// this means the *guest* has not mapped any — usually that the debugger is
+    /// looking at an address belonging to a process that is not current.
+    Unmapped,
     /// A well-formed request this target cannot serve.
     Unsupported,
     /// A core changed its snapshot layout out from under its register map.
@@ -80,6 +98,7 @@ impl TargetError {
         match self {
             TargetError::NoSuchCpu => 3,                                  // ESRCH
             TargetError::Fault | TargetError::Machine(_) => 5,            // EIO
+            TargetError::Unmapped => 14,                                  // EFAULT
             TargetError::NoSuchRegister | TargetError::Unsupported => 22, // EINVAL
             TargetError::LayoutMismatch { .. } => 8,                      // ENOEXEC
         }
@@ -92,6 +111,7 @@ impl fmt::Display for TargetError {
             TargetError::NoSuchCpu => f.write_str("no such cpu"),
             TargetError::NoSuchRegister => f.write_str("no such register"),
             TargetError::Fault => f.write_str("the guest bus refused the access"),
+            TargetError::Unmapped => f.write_str("nothing is mapped at that virtual address"),
             TargetError::Unsupported => f.write_str("unsupported"),
             TargetError::LayoutMismatch {
                 class,
@@ -197,9 +217,18 @@ pub trait DebugTarget {
     fn write_register(&mut self, cpu: usize, index: usize, data: &[u8]) -> TargetResult<()>;
 
     /// Read guest memory as this CPU sees it, with no side effects.
+    ///
+    /// **`addr` is virtual.** Every address GDB sends in an `m`, `M`, `X` or
+    /// `Z` packet is one the guest would use — that is what "as this CPU sees
+    /// it" has always meant — so an implementation with an MMU must translate
+    /// it, with [`Device::debug_translate`](crate::core::device::Device::debug_translate)
+    /// or its own equivalent. On a machine with no MMU, or with the MMU off,
+    /// that translation is the identity and nothing changes.
     fn read_memory(&self, cpu: usize, addr: u64, dst: &mut [u8]) -> TargetResult<()>;
 
     /// Write guest memory as this CPU sees it.
+    ///
+    /// `addr` is virtual, exactly as in [`read_memory`](DebugTarget::read_memory).
     fn write_memory(&mut self, cpu: usize, addr: u64, src: &[u8]) -> TargetResult<()>;
 
     /// Arm a breakpoint at `addr`. Arming one twice is not an error.
@@ -263,6 +292,15 @@ const FREE_SLICE: GlobalTime = GlobalTime::from_nanos(10_000_000);
 /// magnitude of speed. That is the price of not patching trap instructions into
 /// guest memory — see [`MachineTarget`]'s docs.
 const FINE_TICKS: u32 = 4096;
+
+/// The largest span a single translation is trusted for.
+///
+/// One kibibyte, because that is the *smallest* page any MMU in the tree can
+/// map: VMSAv5's tiny page (ARM ARM B4.3.2) is 1 KiB, and RISC-V's smallest is
+/// four times that. A run that fits inside an aligned granule cannot straddle a
+/// page boundary, so one translation covers it. Lowering this is always safe;
+/// raising it needs an MMU with no page smaller than the new value.
+const TRANSLATION_GRANULE: u64 = 1024;
 
 /// How many ticks one instruction is allowed to take before the stepper gives
 /// up and reports what it has.
@@ -369,6 +407,45 @@ impl<'a> MachineTarget<'a> {
         self.machine
     }
 
+    /// Read guest memory at a **physical** address, skipping translation.
+    ///
+    /// The untranslated half of the pair, and it is not a leftover: a monitor
+    /// inspecting a boot ROM, a board bring-up check and anything that wants to
+    /// see what is under a page table rather than through it all name bus
+    /// addresses. GDB's own packets never do — there is no physical-address
+    /// packet in the protocol — which is why this is an inherent method on the
+    /// concrete target rather than part of [`DebugTarget`].
+    ///
+    /// # Errors
+    ///
+    /// [`TargetError::Fault`] if the bus refuses.
+    pub fn read_physical(&self, cpu: usize, addr: u64, dst: &mut [u8]) -> TargetResult<()> {
+        let entry = self.cpu(cpu)?;
+        let space = self.space(entry)?;
+        space
+            .read_bytes(addr, dst, debug_attrs(entry.requester))
+            .map_err(|_| TargetError::Fault)
+    }
+
+    /// Write guest memory at a **physical** address, skipping translation.
+    ///
+    /// See [`read_physical`](MachineTarget::read_physical).
+    ///
+    /// # Errors
+    ///
+    /// [`TargetError::Fault`] if the bus refuses.
+    pub fn write_physical(&mut self, cpu: usize, addr: u64, src: &[u8]) -> TargetResult<()> {
+        {
+            let entry = self.cpu(cpu)?;
+            let space = self.space(entry)?;
+            space
+                .write_bytes(addr, src, debug_attrs(entry.requester))
+                .map_err(|_| TargetError::Fault)?;
+        }
+        self.resync_watchpoints();
+        Ok(())
+    }
+
     /// The machine being debugged, mutably.
     ///
     /// For a front end that has work of its own between session turns — pumping
@@ -390,6 +467,63 @@ impl<'a> MachineTarget<'a> {
             .get(index)
             .map(|entry| entry.space().as_ref())
             .ok_or(TargetError::Fault)
+    }
+
+    /// Where a virtual address lives, as this CPU's MMU maps it.
+    ///
+    /// The whole of the debugger's answer to paging: a `m` packet names an
+    /// address the *guest* would use, and with the MMU on that is not the
+    /// address the bus wants. A core with no MMU — or one whose MMU is off —
+    /// answers [`DebugTranslation::Identity`](crate::core::device::DebugTranslation::Identity)
+    /// and this is free.
+    ///
+    /// The walk itself is the core's, runs with [`MemAttrs::debug`] set, and
+    /// sets no accessed or dirty bit; see
+    /// [`Device::debug_translate`](crate::core::device::Device::debug_translate).
+    ///
+    /// # Errors
+    ///
+    /// [`TargetError::Unmapped`] when the tables map nothing there.
+    pub fn translate(&self, cpu: usize, va: u64) -> TargetResult<u64> {
+        let device = self.cpu(cpu)?.device;
+        let entry = self
+            .machine
+            .devices()
+            .get(device)
+            .ok_or(TargetError::NoSuchCpu)?;
+        entry
+            .device()
+            .debug_translate(va)
+            .phys(va)
+            .ok_or(TargetError::Unmapped)
+    }
+
+    /// Split a virtual range into runs that are contiguous in physical memory.
+    ///
+    /// Returns `(physical address, offset into the caller's buffer, length)`.
+    ///
+    /// Translating once per byte would be correct and unusably slow — a
+    /// watchpoint poll runs this on every clock tick — and translating once for
+    /// the whole range would be wrong the moment it crosses a page boundary,
+    /// which a `m` packet for a 4 KiB region routinely does. So the range is cut
+    /// on [`TRANSLATION_GRANULE`] boundaries: no MMU in the tree has a page
+    /// smaller than that, so a run inside one is guaranteed contiguous, and the
+    /// common case — a request that fits inside a single granule — is one
+    /// translation and one bulk bus access, exactly as it was before this
+    /// existed. Bulk, and not a byte at a time, because a 32-bit-only register
+    /// must still see a 32-bit access.
+    fn chunks(&self, cpu: usize, addr: u64, len: usize) -> TargetResult<Vec<(u64, usize, usize)>> {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        while at < len {
+            let va = addr.wrapping_add(at as u64);
+            // How far to the next granule boundary, capped by what is left.
+            let to_boundary = TRANSLATION_GRANULE - (va & (TRANSLATION_GRANULE - 1));
+            let run = to_boundary.min((len - at) as u64) as usize;
+            out.push((self.translate(cpu, va)?, at, run));
+            at += run;
+        }
+        Ok(out)
     }
 
     /// A CPU's architectural state, as its snapshot chunk.
@@ -672,18 +806,25 @@ impl DebugTarget for MachineTarget<'_> {
     fn read_memory(&self, cpu: usize, addr: u64, dst: &mut [u8]) -> TargetResult<()> {
         let entry = self.cpu(cpu)?;
         let space = self.space(entry)?;
-        space
-            .read_bytes(addr, dst, debug_attrs(entry.requester))
-            .map_err(|_| TargetError::Fault)
+        let attrs = debug_attrs(entry.requester);
+        for (pa, at, len) in self.chunks(cpu, addr, dst.len())? {
+            space
+                .read_bytes(pa, &mut dst[at..at + len], attrs)
+                .map_err(|_| TargetError::Fault)?;
+        }
+        Ok(())
     }
 
     fn write_memory(&mut self, cpu: usize, addr: u64, src: &[u8]) -> TargetResult<()> {
         {
             let entry = self.cpu(cpu)?;
             let space = self.space(entry)?;
-            space
-                .write_bytes(addr, src, debug_attrs(entry.requester))
-                .map_err(|_| TargetError::Fault)?;
+            let attrs = debug_attrs(entry.requester);
+            for (pa, at, len) in self.chunks(cpu, addr, src.len())? {
+                space
+                    .write_bytes(pa, &src[at..at + len], attrs)
+                    .map_err(|_| TargetError::Fault)?;
+            }
         }
         self.resync_watchpoints();
         Ok(())

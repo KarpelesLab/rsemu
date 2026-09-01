@@ -39,6 +39,12 @@ pub enum Error {
     Bus(BusError),
     /// A snapshot could not be written or restored.
     State(String),
+    /// A translation block is malformed.
+    ///
+    /// Always a bug in a frontend or a pass, never something a user did: the
+    /// IR verifier rejects a block before a backend can miscompile it
+    /// (`ROADMAP.md` §9). Carries a complete sentence naming the instruction.
+    Ir(String),
     /// The operation is not implemented in this build yet.
     ///
     /// Distinct from an error: it means "rsemu has not got here", not "you did
@@ -85,6 +91,7 @@ impl fmt::Display for Error {
             Error::Property(message) => f.write_str(message),
             Error::Bus(e) => write!(f, "bus error: {e}"),
             Error::State(message) => write!(f, "snapshot error: {message}"),
+            Error::Ir(message) => write!(f, "malformed IR: {message}"),
             Error::Unimplemented(what) => write!(f, "not implemented yet: {what}"),
         }
     }
