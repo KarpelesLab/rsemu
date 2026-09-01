@@ -122,9 +122,12 @@ written in the machine file where the part is chosen rather than in any device
 model.
 
 A seventh, `pc-at`, is a complete IBM PC/AT chipset — cascaded 8259As, 8254,
-MC146818, 8042, two 8237As, MC6845/VGA text mode, µPD765A — with a
-user-supplied BIOS path in the QEMU style (`--bios`, `--vgabios`). No firmware
-is shipped and none will be.
+MC146818, 8042, two 8237As, MC6845/VGA text mode, µPD765A, an 82441FX host
+bridge with the PAM registers that shadow the BIOS, and a PCI display adapter
+whose expansion ROM BAR is where a firmware written this century looks for its
+video BIOS — with user-supplied firmware paths in the QEMU style (`--bios`,
+`--vgabios`). A real BIOS completes POST on it, runs the video option ROM, sets
+a text mode and boots a diskette. No firmware is shipped and none will be.
 
 Beside them are four synthetic boards, each the smallest machine that exercises
 one thing: `spi-panel` (a display path over SPI), `arm926` (an ARM926EJ-S with CP15,

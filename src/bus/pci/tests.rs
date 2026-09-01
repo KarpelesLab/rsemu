@@ -5,7 +5,7 @@ use super::*;
 
 use alloc::string::ToString;
 
-use crate::core::space::{AddressSpace, Region, UnassignedPolicy};
+use crate::core::space::{AddressSpace, Perms, Region, UnassignedPolicy};
 use crate::core::value::Width;
 
 /// A function that remembers every access it was asked for, so a test can
@@ -355,4 +355,328 @@ fn the_latch_survives_a_round_trip_and_a_reset_clears_it() {
     );
     ports.reset();
     assert_eq!(ports.address(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// base address registers
+// ---------------------------------------------------------------------------
+
+/// Read one register as a Dword, the way firmware does.
+fn bar_dword(bars: &Bars, offset: u16) -> u32 {
+    let mut dst = [0u8; 4];
+    bars.config_read(offset, &mut dst);
+    u32::from_le_bytes(dst)
+}
+
+/// Write one register as a Dword, reporting whether a latch moved.
+fn set_bar(bars: &Bars, offset: u16, value: u32) -> bool {
+    bars.config_write(offset, &value.to_le_bytes())
+}
+
+/// A store to hang off a window, so a mapping has something behind it.
+fn window_region(len: u64, byte: u8) -> crate::core::space::RegionRef {
+    Arc::new(Region::rom(
+        "window",
+        Arc::new(crate::core::space::RomStore::new(alloc::vec![
+            byte;
+            len as usize
+        ])),
+        crate::core::space::RomWrite::Ignore,
+    ))
+}
+
+#[test]
+fn sizing_a_memory_bar_reads_back_the_size_mask() {
+    // Rev 2.1 §6.2.5.1: write all ones, read back zeroes in the don't-care
+    // address bits. A 64 KiB window therefore answers 0xffff0000, and the
+    // format bits below bit 4 come back as this register's own.
+    let bars = Bars::new()
+        .with(0, Bar::memory(0x1_0000))
+        .expect("BAR0 is free");
+    set_bar(&bars, config::BAR0, 0xffff_ffff);
+    assert_eq!(bar_dword(&bars, config::BAR0), 0xffff_0000);
+    let size = !(bar_dword(&bars, config::BAR0) & 0xffff_fff0) + 1;
+    assert_eq!(size, 0x1_0000, "which is how firmware computes the size");
+
+    // A prefetchable window says so in bit 3, and a register that does not
+    // exist reads as zero — Rev 2.1's way of saying "stop looking".
+    let bars = Bars::new()
+        .with(1, Bar::memory(0x100).prefetchable())
+        .expect("BAR1 is free");
+    set_bar(&bars, config::BAR0 + 4, 0xffff_ffff);
+    assert_eq!(bar_dword(&bars, config::BAR0 + 4), 0xffff_ff08);
+    assert_eq!(bar_dword(&bars, config::BAR0), 0);
+}
+
+#[test]
+fn an_io_bar_marks_itself_and_keeps_its_low_two_bits_clear() {
+    let bars = Bars::new().with(2, Bar::io(0x20)).expect("BAR2 is free");
+    let at = config::BAR0 + 8;
+    set_bar(&bars, at, 0xffff_ffff);
+    // Bit 0 set marks I/O; bit 1 is reserved and reads zero; the window is 32
+    // bytes, so bits 4:2 are don't-care.
+    assert_eq!(bar_dword(&bars, at), 0xffff_ffe1);
+    set_bar(&bars, at, 0xc0d5);
+    assert_eq!(bar_dword(&bars, at), 0xc0c1, "aligned down to 32 bytes");
+    assert_eq!(bars.window(2, config::COMMAND_IO), Some((0xc0c0, true)));
+    assert_eq!(
+        bars.window(2, 0),
+        Some((0xc0c0, false)),
+        "and it decodes nothing until COMMAND[0] says so"
+    );
+}
+
+#[test]
+fn a_64_bit_bar_is_two_registers_and_one_address() {
+    // Rev 2.1 §6.2.5.1, type 10b: this register and the next one are one
+    // address, and the next one has no format bits of its own.
+    let bars = Bars::new()
+        .with(0, Bar::memory(0x10_0000).wide().prefetchable())
+        .expect("BAR0 and BAR1 are free");
+    set_bar(&bars, config::BAR0, 0xffff_ffff);
+    set_bar(&bars, config::BAR0 + 4, 0xffff_ffff);
+    assert_eq!(bar_dword(&bars, config::BAR0), 0xfff0_000c);
+    assert_eq!(bar_dword(&bars, config::BAR0 + 4), 0xffff_ffff);
+
+    set_bar(&bars, config::BAR0, 0x8010_0000);
+    set_bar(&bars, config::BAR0 + 4, 0x0000_0007);
+    assert_eq!(
+        bars.window(0, config::COMMAND_MEMORY),
+        Some((0x7_8010_0000, true)),
+        "the upper half is the top 32 bits of the address, not a second window"
+    );
+    assert!(
+        bars.window(1, config::COMMAND_MEMORY).is_none(),
+        "and the upper half is not a window in its own right"
+    );
+}
+
+#[test]
+fn the_expansion_rom_register_needs_both_enables() {
+    // §6.2.5.2: the address field starts at bit 11, bit 0 is the enable, and
+    // "the Memory Space bit in the Command register has precedence over the
+    // Expansion ROM Enable bit".
+    let bars = Bars::new()
+        .with(Bars::ROM, Bar::rom(0x1_0000))
+        .expect("the ROM register is free");
+    set_bar(&bars, config::EXPANSION_ROM, 0xffff_ffff);
+    assert_eq!(
+        bar_dword(&bars, config::EXPANSION_ROM),
+        0xffff_0001,
+        "the size mask, plus the enable bit which is writable"
+    );
+    set_bar(&bars, config::EXPANSION_ROM, 0xfebf_07fe);
+    assert_eq!(
+        bar_dword(&bars, config::EXPANSION_ROM),
+        0xfebf_0000,
+        "bits 10:1 are reserved and never latch"
+    );
+    assert_eq!(
+        bars.window(Bars::ROM, config::COMMAND_MEMORY),
+        Some((0xfebf_0000, false)),
+        "the memory space bit alone is not enough"
+    );
+    set_bar(&bars, config::EXPANSION_ROM, 0xfebf_0001);
+    assert_eq!(
+        bars.window(Bars::ROM, 0),
+        Some((0xfebf_0000, false)),
+        "and neither is the enable bit alone"
+    );
+    assert_eq!(
+        bars.window(Bars::ROM, config::COMMAND_MEMORY),
+        Some((0xfebf_0000, true)),
+    );
+}
+
+#[test]
+fn a_window_moves_when_its_register_does() {
+    let space = Arc::new(AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::ONES));
+    let bars = Bars::new()
+        .with(
+            0,
+            Bar::memory(0x1000).decoding(window_region(0x1000, 0x5a), Perms::RW),
+        )
+        .expect("BAR0 is free");
+    bars.install(&space, 0).expect("nothing is there yet");
+    // Out of reset the window decodes nothing at all, wherever it nominally
+    // sits: COMMAND[1] is clear.
+    assert_eq!(
+        space.read(0x8000_0000, Width::U8, MemAttrs::DEFAULT),
+        Ok(0xff)
+    );
+
+    set_bar(&bars, config::BAR0, 0x8000_0000);
+    bars.sync(config::COMMAND_MEMORY, true);
+    assert_eq!(
+        space.read(0x8000_0000, Width::U8, MemAttrs::DEFAULT),
+        Ok(0x5a),
+        "enabled, and where the register says"
+    );
+
+    set_bar(&bars, config::BAR0, 0x9000_0000);
+    bars.sync(config::COMMAND_MEMORY, true);
+    assert_eq!(
+        space.read(0x8000_0000, Width::U8, MemAttrs::DEFAULT),
+        Ok(0xff),
+        "it left"
+    );
+    assert_eq!(
+        space.read(0x9000_0000, Width::U8, MemAttrs::DEFAULT),
+        Ok(0x5a),
+        "and arrived"
+    );
+
+    bars.sync(0, true);
+    assert_eq!(
+        space.read(0x9000_0000, Width::U8, MemAttrs::DEFAULT),
+        Ok(0xff),
+        "clearing COMMAND[1] takes it out of the decode without moving it"
+    );
+}
+
+#[test]
+fn a_retopology_that_cannot_happen_now_happens_later() {
+    // The whole reason the try-lock exists: a configuration write may arrive
+    // while something else holds the memory space's topology. That is not
+    // swallowed — the flag says so and the next attempt puts it right.
+    let space = Arc::new(AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::ONES));
+    let bars = Bars::new()
+        .with(
+            0,
+            Bar::memory(0x1000).decoding(window_region(0x1000, 0x5a), Perms::RW),
+        )
+        .expect("BAR0 is free");
+    bars.install(&space, 0).expect("nothing is there yet");
+    set_bar(&bars, config::BAR0, 0x8000_0000);
+    {
+        let _held = space.topology();
+        assert!(
+            !bars.sync(config::COMMAND_MEMORY, false),
+            "the try-lock fails while the guard above is alive"
+        );
+        assert!(bars.is_stale());
+    }
+    assert!(
+        bars.sync(config::COMMAND_MEMORY, false),
+        "and now it does not"
+    );
+    assert!(!bars.is_stale());
+    assert_eq!(
+        space.read(0x8000_0000, Width::U8, MemAttrs::DEFAULT),
+        Ok(0x5a)
+    );
+}
+
+#[test]
+fn a_window_off_the_end_of_the_space_decodes_nothing() {
+    // Firmware can write any base it likes. One that does not fit is a card
+    // decoding an address the machine cannot drive, so it decodes nothing —
+    // rather than the mapping being refused and the register silently
+    // disagreeing with the map.
+    let space = Arc::new(AddressSpace::new("mem", 20).with_unassigned(UnassignedPolicy::ONES));
+    let bars = Bars::new()
+        .with(
+            0,
+            Bar::memory(0x1000).decoding(window_region(0x1000, 0x5a), Perms::RW),
+        )
+        .expect("BAR0 is free");
+    bars.install(&space, 0).expect("nothing is there yet");
+    set_bar(&bars, config::BAR0, 0x000f_f000);
+    assert!(bars.sync(config::COMMAND_MEMORY, true));
+    assert_eq!(
+        space.read(0xf_f000, Width::U8, MemAttrs::DEFAULT),
+        Ok(0x5a),
+        "the last page of a 1 MiB space fits exactly"
+    );
+    set_bar(&bars, config::BAR0, 0x0010_0000);
+    assert!(bars.sync(config::COMMAND_MEMORY, true));
+    assert_eq!(
+        space.read(0xf_f000, Width::U8, MemAttrs::DEFAULT),
+        Ok(0xff),
+        "one page further is off the end, and nothing answers anywhere"
+    );
+}
+
+#[test]
+fn a_malformed_declaration_is_refused_by_name() {
+    let e = Bars::new()
+        .with(0, Bar::memory(0x1800))
+        .expect_err("6 KiB is not a power of two")
+        .to_string();
+    assert!(e.contains("BAR0"), "{e}");
+    assert!(e.contains("power of two"), "{e}");
+
+    assert!(
+        Bars::new().with(5, Bar::memory(0x1000).wide()).is_err(),
+        "a 64-bit register cannot be the last one"
+    );
+    assert!(
+        Bars::new()
+            .with(0, Bar::memory(0x1000).wide())
+            .expect("BAR0 and BAR1")
+            .with(1, Bar::memory(0x1000))
+            .is_err(),
+        "BAR1 is the upper half of BAR0 and is not free"
+    );
+    assert!(
+        Bars::new().with(Bars::ROM, Bar::memory(0x1000)).is_err(),
+        "register 6 is the expansion ROM and holds nothing else"
+    );
+    assert!(
+        Bars::new().with(0, Bar::rom(0x1000)).is_err(),
+        "and the expansion ROM is not BAR0"
+    );
+    assert!(
+        Bars::new().with(Bars::ROM, Bar::rom(1024)).is_err(),
+        "a ROM window is at least 2 KiB — §6.2.5.2's address field starts at bit 11"
+    );
+}
+
+#[test]
+fn an_io_bar_that_wants_a_region_is_refused_with_the_reason() {
+    // Not an oversight: a configuration cycle travels through the I/O space,
+    // so the try-lock that saves every other case cannot help. Better to say
+    // so at bind than to map a window that never moves again.
+    let space = Arc::new(AddressSpace::new("port", 16).with_unassigned(UnassignedPolicy::ONES));
+    let bars = Bars::new()
+        .with(
+            0,
+            Bar::io(0x10).decoding(window_region(0x10, 0x5a), Perms::RW),
+        )
+        .expect("BAR0 is free");
+    let e = bars
+        .install(&space, 0)
+        .expect_err("an I/O BAR cannot carry a region")
+        .to_string();
+    assert!(e.contains("I/O space"), "{e}");
+}
+
+#[test]
+fn the_latches_round_trip_and_a_reset_clears_them() {
+    let bars = Bars::new()
+        .with(0, Bar::memory(0x1000))
+        .expect("BAR0")
+        .with(Bars::ROM, Bar::rom(0x1_0000))
+        .expect("the ROM register");
+    set_bar(&bars, config::BAR0, 0x8000_0000);
+    set_bar(&bars, config::EXPANSION_ROM, 0xfebf_0001);
+    let saved = bars.latches();
+
+    let restored = Bars::new()
+        .with(0, Bar::memory(0x1000))
+        .expect("BAR0")
+        .with(Bars::ROM, Bar::rom(0x1_0000))
+        .expect("the ROM register");
+    restored.set_latches(&saved);
+    assert_eq!(restored.latches(), saved);
+    assert_eq!(bar_dword(&restored, config::EXPANSION_ROM), 0xfebf_0001);
+
+    // A snapshot cannot install bits the hardware could never hold, for the
+    // same reason `ConfigSpace::restore` cannot change a vendor ID.
+    restored.set_latches(&[0xffff_ffff; Bars::COUNT as usize]);
+    assert_eq!(bar_dword(&restored, config::BAR0), 0xffff_f000);
+
+    restored.reset();
+    assert_eq!(bar_dword(&restored, config::BAR0), 0);
+    assert_eq!(bar_dword(&restored, config::EXPANSION_ROM), 0);
 }

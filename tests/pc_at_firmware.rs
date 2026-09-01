@@ -14,9 +14,19 @@
 //!
 //! ```text
 //! RSEMU_BIOS=/usr/share/qemu/bios.bin \
-//! RSEMU_VGABIOS=/usr/share/qemu/vgabios.bin \
+//! RSEMU_VGABIOS=/usr/share/qemu/vgabios-stdvga.bin \
 //!   cargo test --release --all-features --test pc_at_firmware -- --nocapture
 //! ```
+//!
+//! **`vgabios-stdvga.bin`, not `vgabios.bin`.** The board's video adapter is a
+//! PCI card and a 440FX-era firmware takes its option ROM off the card's
+//! expansion ROM base address register, checking the **PCI Data Structure**
+//! inside the image against the card's vendor and device id first. The plain
+//! `vgabios.bin` is the ISA build: its pointer at offset `0x18` is zero, there
+//! is no such structure, and the firmware finds the card, maps the ROM and
+//! declines to run it. That is not a bug in this board — it is the check
+//! working — and the gate at the bottom of this file says so out loud rather
+//! than leaving it a surprise.
 //!
 //! **Nothing is vendored**: both images are read from wherever the variables
 //! point and neither enters this repository. Running a program — including a
@@ -49,13 +59,15 @@
 //!   shadow that was never filled is distinguishable from one the firmware
 //!   filled and then wrote its own variables into.
 //! - **`0x7c00`**, where a boot sector lands, and the text page as characters.
+//!   With a matching video option ROM that page holds what the *firmware*
+//!   printed, because it has an `INT 10h` to print through.
 //!
 //! # The knobs
 //!
 //! | Variable | What it does |
 //! | --- | --- |
 //! | `RSEMU_BIOS` | The system firmware image. Without it the test skips. |
-//! | `RSEMU_VGABIOS` | A video option ROM. Without it the socket is empty. |
+//! | `RSEMU_VGABIOS` | A **PCI** video option ROM. Without it there is none. |
 //! | `RSEMU_FLOPPY` | A diskette image, padded to 1.44 MB. Blank without it. |
 //! | `RSEMU_BIOS_MS` | How long to run, in virtual milliseconds. |
 //! | `RSEMU_TRACE` | How many instructions of tail to print. |
@@ -165,6 +177,32 @@ fn peek(m: &Machine, addr: u64) -> u8 {
 fn peek_bytes(m: &Machine, addr: u64, len: u64) -> Vec<u8> {
     (0..len).map(|i| peek(m, addr + i)).collect()
 }
+
+/// The vendor and device id an option ROM image says it is for.
+///
+/// The PCI Firmware Specification's **PCI Data Structure**: the two bytes at
+/// offset `0x18` of the image point at it, and it begins with the signature
+/// `PCIR` followed by the vendor id and the device id. `None` for an image
+/// that has none, which is what a video BIOS built for an ISA card looks like —
+/// and such an image cannot be loaded off a base address register by any
+/// firmware that checks, which is most of them.
+fn rom_ids(image: &[u8]) -> Option<(u16, u16)> {
+    let at = usize::from(u16::from_le_bytes([*image.get(0x18)?, *image.get(0x19)?]));
+    let pcir = image.get(at..at + 8)?;
+    (&pcir[..4] == b"PCIR").then(|| {
+        (
+            u16::from_le_bytes([pcir[4], pcir[5]]),
+            u16::from_le_bytes([pcir[6], pcir[7]]),
+        )
+    })
+}
+
+/// The vendor and device id `machines/pc-at.machine` gives its display adapter.
+///
+/// Written here rather than read out of the machine, because the point of the
+/// gate below is that the two have to *agree* and a value taken from the board
+/// would agree with itself.
+const VGA_IDS: (u16, u16) = (0x1234, 0x1111);
 
 /// What the log port answers a read with.
 ///
@@ -681,7 +719,7 @@ fn a_pc_firmware_image_runs_on_the_assembled_board() {
         .unwrap_or(DEFAULT_TRACE);
     if keep > 0 {
         println!("pc-at firmware: last {keep} instructions before the stop:");
-        let (mut m2, cpu2) = board(bios, vgabios);
+        let (mut m2, cpu2) = board(bios, vgabios.clone());
         // How much of the tail to single-step. Zero — the default — steps the
         // whole run, which is affordable while the firmware stops in a few
         // milliseconds and is the only setting that is certain to cover the
@@ -762,4 +800,31 @@ fn a_pc_firmware_image_runs_on_the_assembled_board() {
         faults, 0,
         "the memory map refused an access, last at {last:08x}"
     );
+    // And the fourth: with a video option ROM the card can actually claim, the
+    // firmware must have run it and set a mode. `0x449` is the BIOS data area's
+    // CRT mode byte, which only the video BIOS ever writes, and 3 is 80x25
+    // colour text. An image that is not for this card is skipped rather than
+    // failed — the board cannot make an ISA video BIOS loadable off a BAR, and
+    // says so above.
+    if let Some(vgabios) = &vgabios {
+        match rom_ids(vgabios) {
+            Some(VGA_IDS) => {
+                assert_ne!(
+                    peek(&m, 0x449),
+                    0,
+                    "the option ROM matches the card and was mapped, but no video mode was \
+                     set: see `Running option rom` in the log above, or its absence"
+                );
+                assert!(
+                    (0..25 * 80).any(|i| (0x20..=0x7e).contains(&peek(&m, 0xb8000 + i * 2))),
+                    "a video mode was set and nothing was printed through it"
+                );
+            }
+            other => println!(
+                "pc-at firmware: the video BIOS declares {other:#06x?}, and this board's card is \
+                 {VGA_IDS:#06x?}; a firmware that loads a ROM off a BAR will not run it. Use a \
+                 PCI video BIOS, or set `vendor-id`/`device-id` on the `vgacard` object."
+            ),
+        }
+    }
 }
