@@ -84,14 +84,23 @@
 //!
 //! # The backing store
 //!
-//! A [`RamStore`] filled from a media slot, not an `fstool::BlockDevice`. The
-//! same argument [`crate::dev::sd::card`] and `dev-flash-cfi` make: the contents
-//! are a flat image, byte addressed, and reaching for a disk-image crate would
-//! drag `std` into a `no_std` device. `docs/buses/storage.md` names the variant
-//! that does not make that trade — a `dev/blk/ata` under the documented `std`
-//! exception, for a large or sparse image — and it would reuse this whole
-//! protocol half and replace only [`AtaDisk::read_media`] and
-//! [`AtaDisk::write_media`].
+//! A [`Medium`], and there are two.
+//!
+//! The default is a [`RamStore`] filled from a media slot, not an
+//! `fstool::BlockDevice`. The same argument [`crate::dev::sd::card`] and
+//! `dev-flash-cfi` make: the contents are a flat image, byte addressed, and
+//! reaching for a disk-image crate would drag `std` into a `no_std` device. So
+//! `rsemu run pc-at --hd0 disk.img` works on every target the crate builds for,
+//! at the cost of the whole capacity in host memory.
+//!
+//! The other is [`crate::dev::blk`], under the documented `std` exception: a
+//! host file through `fstool::BlockDevice`, which is what makes a sparse
+//! sixteen-gigabyte drive and a structured image format (qcow2) possible.
+//! It arrives through [`medium::MediumSlot`] — the run installs it under the
+//! name of the media slot the machine file already names, so **nothing in the
+//! machine description and nothing in the host adapter changes**, and it
+//! replaces exactly [`AtaDisk::read_media`] and [`AtaDisk::write_media`], as
+//! `docs/buses/storage.md` said it would.
 //!
 //! # Sources
 //!
@@ -123,6 +132,7 @@ use crate::core::props::{Props, ValueKind};
 use crate::core::space::RamStore;
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
+use crate::dev::ata::medium::{self, Medium, Snapshot};
 use crate::machine::realize::Instance;
 use crate::machine::validate::{ClassSchema, PropSchema};
 
@@ -734,7 +744,7 @@ impl Volatile {
 pub struct AtaDisk {
     id: Identity,
     position: Position,
-    media: Arc<RamStore>,
+    media: Arc<dyn Medium>,
     state: Mutex<Volatile>,
 }
 
@@ -745,6 +755,7 @@ impl fmt::Debug for AtaDisk {
             .field("geometry", &self.id.geometry)
             .field("position", &self.position)
             .field("read_only", &self.id.read_only)
+            .field("medium", &self.media)
             .finish_non_exhaustive()
     }
 }
@@ -757,6 +768,21 @@ impl AtaDisk {
     /// not an error: a PC with no hard disk is an ordinary PC, and the
     /// alternative would be a machine description that needed an `if`.
     ///
+    /// # Where the bytes come from
+    ///
+    /// Two sources, and the machine file names neither of them directly. It
+    /// names a **media slot** (`image = "hd0"`), and the run decides what is
+    /// behind that name:
+    ///
+    /// * a [`MediumSlot`](medium::MediumSlot) filled by the host — what
+    ///   `rsemu run … --drive hd0=disk.qcow2` installs — wins, and the drive's
+    ///   capacity comes from the image rather than from `size`;
+    /// * otherwise the media table's bytes, copied into a [`RamStore`] whose
+    ///   length is `size`, or the image's own length when `size` is absent.
+    ///
+    /// A machine file therefore never holds a host path, which is what keeps it
+    /// portable data describing a board.
+    ///
     /// # Errors
     ///
     /// [`Error::Property`] if a property is missing or of the wrong kind;
@@ -765,9 +791,9 @@ impl AtaDisk {
     pub fn new(props: &Props) -> Result<Option<AtaDisk>> {
         let mut r = props.reader();
         let size = r.or_size("size", 0)?;
-        let image = r
-            .optional_media("image")?
-            .map(crate::core::props::Media::to_bytes);
+        let media = r.optional_media("image")?;
+        let slot = media.map(crate::core::props::Media::name);
+        let image = media.map(crate::core::props::Media::to_bytes);
         let read_only = r.or("readonly", false)?;
         let lba48 = r.or("lba48", true)?;
         let max_multiple = r.or_range("multiple", 16u64, 1..=128)? as u8;
@@ -781,18 +807,32 @@ impl AtaDisk {
         let model = r.or_str("model", "RSEMU HARDDISK")?.to_string();
         let serial = r.or_str("serial", "RSEMU0000000000000001")?.to_string();
         let firmware = r.or_str("firmware", "1.0")?.to_string();
-        // Read by `DiskDevice`, which owns the rendezvous; touched here so the
-        // reader does not report it as unknown.
-        let _ = r.optional_str("bay")?;
+        // `DiskDevice` owns the bay rendezvous; read here too, because it is
+        // also the fallback name a host-supplied medium is looked up under when
+        // the drive names no media slot at all.
+        let bay = r.optional_str("bay")?;
         r.finish()?;
 
-        // A capacity from `size`, or from the image if there is one and no
-        // `size`. Zero either way is an empty bay — including an image slot
-        // bound to no bytes, which is how a front end says "there is no disk"
-        // without the machine description needing an `if`.
-        let bytes = match (size, image.as_ref()) {
-            (0, Some(image)) => image.len() as u64,
-            (size, _) => size,
+        // A medium the *host* installed, under the media slot's name if there
+        // is one and the bay's name otherwise. It wins over the media table:
+        // a run that said `--drive hd0=disk.qcow2` meant it.
+        let supplied = match props.hosts() {
+            Some(hosts) => {
+                let name = slot.unwrap_or_else(|| bay.unwrap_or(super::DEFAULT_BAY));
+                medium::get(hosts, name)?.and_then(|slot| slot.take())
+            }
+            None => None,
+        };
+
+        // A capacity from the supplied medium, or from `size`, or from the
+        // image if there is one and no `size`. Zero every way is an empty bay —
+        // including an image slot bound to no bytes, which is how a front end
+        // says "there is no disk" without the machine description needing an
+        // `if`.
+        let bytes = match (&supplied, size, image.as_ref()) {
+            (Some(medium), _, _) => medium.capacity(),
+            (None, 0, Some(image)) => image.len() as u64,
+            (None, size, _) => size,
         };
         if bytes == 0 {
             return Ok(None);
@@ -831,10 +871,20 @@ impl AtaDisk {
         };
 
         let mut id = Identity::new(total, geometry, lba48, max_multiple)?;
-        id.read_only = read_only;
+        // A medium that refuses writes write-protects the drive whatever the
+        // machine file asked for: telling the guest it may write and then
+        // failing every write is worse than an honest read-only drive.
+        id.read_only = read_only || supplied.as_ref().is_some_and(|m| m.is_read_only());
         id.model = model;
         id.serial = serial;
         id.firmware = firmware;
+
+        if let Some(supplied) = supplied {
+            // The media table is ignored here rather than layered on top: a
+            // host that named an image file did not also mean "and stamp these
+            // bytes over the front of it".
+            return AtaDisk::with_medium(id, position, supplied).map(Some);
+        }
 
         let disk = AtaDisk::with_identity(id, position)?;
         if let Some(image) = image {
@@ -861,11 +911,37 @@ impl AtaDisk {
                 "a drive of {bytes} byte(s) is larger than this host's address space"
             )));
         }
+        AtaDisk::with_medium(id, position, Arc::new(RamStore::new(bytes)))
+    }
+
+    /// Build a drive on a medium the caller already has.
+    ///
+    /// The seam `dev/blk` comes in through: hand it an
+    /// [`Image`](crate::dev::blk::Image) and the drive is a host file rather
+    /// than a host allocation, with nothing else about it changed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] if the medium does not hold exactly what the identity
+    /// says the drive holds. Silently taking the smaller of the two would give
+    /// a guest an `IDENTIFY` that lies about the last sector.
+    pub fn with_medium(
+        id: Identity,
+        position: Position,
+        media: Arc<dyn Medium>,
+    ) -> Result<AtaDisk> {
+        let bytes = id.capacity();
+        if media.capacity() != bytes {
+            return Err(config(format!(
+                "the drive holds {bytes} byte(s) and the medium holds {}",
+                media.capacity()
+            )));
+        }
         let geometry = id.geometry;
         Ok(AtaDisk {
             id,
             position,
-            media: Arc::new(RamStore::new(bytes)),
+            media,
             state: Mutex::with_rank(LockRank::DEVICE, Volatile::power_on(position, geometry)),
         })
     }
@@ -938,7 +1014,23 @@ impl AtaDisk {
     pub fn read_media(&self, offset: u64, dst: &mut [u8]) -> Result<()> {
         self.media
             .read_at(offset, dst)
-            .map_err(|_| Error::State(format!("{offset:#x} is outside this drive")))
+            .map_err(|e| medium::error_at(offset, e))
+    }
+
+    /// The medium behind the drive, for a host that wants to look at it
+    /// directly — its capacity, its snapshot policy, what it is.
+    #[must_use]
+    pub fn medium(&self) -> &Arc<dyn Medium> {
+        &self.media
+    }
+
+    /// Make every write so far durable, as `FLUSH CACHE` does.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::State`] if the host refused.
+    pub fn flush_media(&self) -> Result<()> {
+        self.media.flush().map_err(|e| medium::error_at(0, e))
     }
 
     /// Write to the medium, ignoring the protocol entirely.
@@ -949,7 +1041,7 @@ impl AtaDisk {
     pub fn write_media(&self, offset: u64, src: &[u8]) -> Result<()> {
         self.media
             .write_at(offset, src)
-            .map_err(|_| Error::State(format!("{offset:#x} is outside this drive")))
+            .map_err(|e| medium::error_at(offset, e))
     }
 
     /// Put `bytes` on the medium at `offset`. The image loader's door.
@@ -967,13 +1059,22 @@ impl AtaDisk {
         })
     }
 
-    /// The whole medium as a fresh vector, for a snapshot or a test.
-    #[must_use]
-    pub fn contents(&self) -> Vec<u8> {
+    /// The whole medium as a fresh vector, for a [`Snapshot::Capture`] chunk or
+    /// a test.
+    ///
+    /// **Costs the whole capacity in host memory**, which is exactly why a
+    /// file-backed drive does not snapshot this way — see [`Snapshot`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::State`] if the medium could not be read: a host I/O error, or
+    /// an image that shrank under the drive.
+    pub fn contents(&self) -> Result<Vec<u8>> {
         let mut out = alloc::vec![0u8; self.id.capacity() as usize];
-        // Cannot fail: the length is the store's own.
-        let _ = self.media.read_at(0, &mut out);
-        out
+        self.media
+            .read_at(0, &mut out)
+            .map_err(|e| medium::error_at(0, e))?;
+        Ok(out)
     }
 
     // -- power -------------------------------------------------------------
@@ -1159,13 +1260,13 @@ impl AtaDisk {
             return;
         };
         let count = (state.buf.len() as u64) / SECTOR;
-        let ok = self
-            .media
-            .write_at(xfer.next * SECTOR, &state.buf[..])
-            .is_ok();
+        let wrote = self.media.write_at(xfer.next * SECTOR, &state.buf[..]);
         state.status &= !ST_DRQ;
-        if !ok {
-            self.fail(state, ERR_IDNF, xfer.next, xfer.mode);
+        if let Err(e) = wrote {
+            // A host I/O error — a torn write, a full filesystem, a device that
+            // went away — is *not* IDNF: the sector exists. `medium::error_bit`
+            // is the one place that mapping is written down.
+            self.fail(state, medium::error_bit(e), xfer.next, xfer.mode);
             return;
         }
         xfer.last = xfer.next + count - 1;
@@ -1189,8 +1290,10 @@ impl AtaDisk {
         };
         let count = u64::from(xfer.block).min(xfer.left);
         let mut buf = alloc::vec![0u8; (count * SECTOR) as usize];
-        if self.media.read_at(xfer.next * SECTOR, &mut buf).is_err() {
-            self.fail(state, ERR_IDNF, xfer.next, xfer.mode);
+        if let Err(e) = self.media.read_at(xfer.next * SECTOR, &mut buf) {
+            // A short read or a host I/O error is an uncorrectable data error,
+            // not a missing address. See `medium::error_bit`.
+            self.fail(state, medium::error_bit(e), xfer.next, xfer.mode);
             return;
         }
         xfer.last = xfer.next + count - 1;
@@ -1398,8 +1501,19 @@ impl AtaDisk {
             }
             cmd::FLUSH_CACHE | cmd::FLUSH_CACHE_EXT => {
                 // Every write reached the medium inside the call that carried
-                // it, so there is nothing to flush and success is the truth.
-                self.succeed(state);
+                // it, so there is no cache *here* — but "reached the medium"
+                // and "is durable" are different claims once the medium is a
+                // host file, and FLUSH CACHE asks for the second one. A guest
+                // filesystem's barrier is exactly this command, so a failure
+                // has to be reported rather than swallowed (ATA/ATAPI-6 §8.16:
+                // a failed flush aborts and reports the failing LBA).
+                match self.media.flush() {
+                    Ok(()) => self.succeed(state),
+                    Err(e) => {
+                        let last = self.id.sectors - 1;
+                        self.fail(state, medium::error_bit(e), last, Mode::Lba28);
+                    }
+                }
             }
             cmd::SET_FEATURES => self.set_features(state),
             cmd::READ_NATIVE_MAX => {
@@ -1696,11 +1810,27 @@ impl AtaDisk {
     // -- snapshots ---------------------------------------------------------
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
-        // The medium, exactly as `sd.card` and `dev-flash-cfi` save theirs: a
-        // drive's contents are guest-visible state, and a snapshot that
-        // restored to different bytes would be a snapshot of a different
-        // machine.
-        w.write_bytes(&self.contents())?;
+        // The medium first, on the terms the medium itself sets — see
+        // [`Snapshot`], which is where the argument for each of the three
+        // lives. A `RamStore` captures, exactly as `sd.card` and
+        // `dev-flash-cfi` do theirs, so the encoding of a RAM-backed drive is
+        // unchanged and its state hash is what it always was.
+        match self.media.snapshot() {
+            Snapshot::Capture => w.write_bytes(&self.contents()?)?,
+            Snapshot::Reference => {
+                // Flush *first*: the reference is only worth anything if the
+                // file on disk holds what the guest had written by the moment
+                // the snapshot was taken.
+                self.media.flush().map_err(|e| medium::error_at(0, e))?;
+                w.write_bytes(self.media.describe().as_bytes())?;
+            }
+            Snapshot::Refuse => {
+                return Err(Error::State(format!(
+                    "this drive's medium ({}) refuses to be snapshotted",
+                    self.media.describe()
+                )));
+            }
+        }
         let state = self.state.lock();
         w.write_bool(state.selected)?;
         w.write_u8(state.device)?;
@@ -1749,16 +1879,40 @@ impl AtaDisk {
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
         let bytes: &[u8] = r.read_bytes()?;
-        if bytes.len() as u64 != self.id.capacity() {
-            return Err(Error::State(format!(
-                "the snapshot holds a drive of {} byte(s), this one holds {}",
-                bytes.len(),
-                self.id.capacity()
-            )));
+        match self.media.snapshot() {
+            Snapshot::Capture => {
+                if bytes.len() as u64 != self.id.capacity() {
+                    return Err(Error::State(format!(
+                        "the snapshot holds a drive of {} byte(s), this one holds {}",
+                        bytes.len(),
+                        self.id.capacity()
+                    )));
+                }
+                self.media
+                    .write_at(0, bytes)
+                    .map_err(|e| Error::State(format!("the drive refused the snapshot: {e}")))?;
+            }
+            Snapshot::Reference => {
+                // The bytes are still in the image file; what the chunk holds
+                // is which image, and the check is that it is still that one.
+                // A snapshot taken of a *capturing* drive lands here as a
+                // mismatched identity rather than as a silent misread.
+                let want = self.media.describe();
+                if bytes != want.as_bytes() {
+                    return Err(Error::State(format!(
+                        "the snapshot references a different medium: it names `{}` and this \
+                         drive holds `{want}`",
+                        alloc::string::String::from_utf8_lossy(&bytes[..bytes.len().min(120)])
+                    )));
+                }
+            }
+            Snapshot::Refuse => {
+                return Err(Error::State(format!(
+                    "this drive's medium ({}) refuses to be snapshotted",
+                    self.media.describe()
+                )));
+            }
         }
-        self.media
-            .write_at(0, bytes)
-            .map_err(|_| Error::State(String::from("the drive refused the snapshot")))?;
         let selected = r.read_bool()?;
         let device = r.read_u8()?;
         let error = r.read_u8()?;

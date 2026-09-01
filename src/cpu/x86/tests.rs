@@ -48,21 +48,21 @@ impl Machine {
     fn load(&self, cs: u16, ip: u16, code: &[u8]) {
         for (i, byte) in code.iter().enumerate() {
             let addr = linear(cs, ip.wrapping_add(i as u16));
-            self.ram.write_u8(u64::from(addr), *byte).unwrap();
+            self.ram.write_u8(addr, *byte).unwrap();
         }
         let mut regs = self.cpu.regs();
         regs.cs = cs;
-        regs.eip = u32::from(ip);
+        regs.rip = u64::from(ip);
         self.cpu.set_regs(regs);
         self.cpu.session.lock().state.reset_pending = false;
     }
 
-    fn poke(&self, addr: u32, byte: u8) {
-        self.ram.write_u8(u64::from(addr), byte).unwrap();
+    fn poke(&self, addr: u64, byte: u8) {
+        self.ram.write_u8(addr, byte).unwrap();
     }
 
-    fn peek(&self, addr: u32) -> u8 {
-        self.ram.read_u8(u64::from(addr)).unwrap()
+    fn peek(&self, addr: u64) -> u8 {
+        self.ram.read_u8(addr).unwrap()
     }
 
     fn regs(&self) -> Regs {
@@ -105,7 +105,7 @@ fn a_read_above_the_first_megabyte_wraps_to_the_bottom() {
     m.load(0x0000, 0x0100, &[0xa0, 0x10, 0x00]);
     m.set_regs(|r| r.ds = 0xffff);
     m.cpu.step();
-    assert_eq!(m.regs().eax & 0xff, 0x5a);
+    assert_eq!(m.regs().rax & 0xff, 0x5a);
 }
 
 #[test]
@@ -114,23 +114,23 @@ fn bp_based_addressing_defaults_to_the_stack_segment() {
     m.set_regs(|r| {
         r.ds = 0x1000;
         r.ss = 0x2000;
-        r.ebp = 0x0004;
-        r.ebx = 0x0004;
+        r.rbp = 0x0004;
+        r.rbx = 0x0004;
     });
     m.poke(linear(0x2000, 0x0004), 0x11);
     m.poke(linear(0x1000, 0x0004), 0x22);
     // mov al, [bp+0] — SS by default.
     m.load(0x0000, 0x0100, &[0x8a, 0x46, 0x00]);
     m.cpu.step();
-    assert_eq!(m.regs().eax & 0xff, 0x11);
+    assert_eq!(m.regs().rax & 0xff, 0x11);
     // mov al, [bx] — DS by default.
     m.load(0x0000, 0x0200, &[0x8a, 0x07]);
     m.cpu.step();
-    assert_eq!(m.regs().eax & 0xff, 0x22);
+    assert_eq!(m.regs().rax & 0xff, 0x22);
     // ds: mov al, [bp+0] — the override wins.
     m.load(0x0000, 0x0300, &[0x3e, 0x8a, 0x46, 0x00]);
     m.cpu.step();
-    assert_eq!(m.regs().eax & 0xff, 0x22);
+    assert_eq!(m.regs().rax & 0xff, 0x22);
 }
 
 #[test]
@@ -141,12 +141,12 @@ fn the_direct_address_encoding_is_not_bp_relative() {
     m.set_regs(|r| {
         r.ds = 0x1000;
         r.ss = 0x2000;
-        r.ebp = 0xbeef;
+        r.rbp = 0xbeef;
     });
     m.poke(linear(0x1000, 0x0034), 0x77);
     m.load(0x0000, 0x0100, &[0x8a, 0x06, 0x34, 0x00]);
     m.cpu.step();
-    assert_eq!(m.regs().eax & 0xff, 0x77);
+    assert_eq!(m.regs().rax & 0xff, 0x77);
 }
 
 // ---------------------------------------------------------------------------
@@ -158,8 +158,8 @@ fn reset_starts_sixteen_bytes_below_the_top_of_memory() {
     let m = machine();
     m.cpu.step();
     let regs = m.regs();
-    assert_eq!((regs.cs, regs.eip), (0xffff, 0x0000));
-    assert_eq!(linear(regs.cs, regs.eip as u16), 0xf_fff0);
+    assert_eq!((regs.cs, regs.rip), (0xffff, 0x0000));
+    assert_eq!(linear(regs.cs, regs.rip as u16), 0xf_fff0);
     assert_eq!((regs.ds, regs.es, regs.ss), (0, 0, 0));
     assert_eq!(regs.eflags, flags::RESERVED_SET);
     assert!(!m.cpu.reset_pending());
@@ -170,12 +170,12 @@ fn a_reset_vector_jump_lands_where_it_says() {
     let m = machine();
     // The PC's own reset vector shape: jmpf 0xf000:0xe05b.
     for (i, byte) in [0xea, 0x5b, 0xe0, 0x00, 0xf0].into_iter().enumerate() {
-        m.poke(0xf_fff0 + i as u32, byte);
+        m.poke(0xf_fff0 + i as u64, byte);
     }
     m.cpu.step(); // reset
     m.cpu.step(); // the far jump
     let regs = m.regs();
-    assert_eq!((regs.cs, regs.eip), (0xf000, 0xe05b));
+    assert_eq!((regs.cs, regs.rip), (0xf000, 0xe05b));
 }
 
 #[test]
@@ -197,7 +197,7 @@ fn halt_stops_the_core_until_an_interrupt_arrives() {
     assert!(m.cpu.step() > 0);
     assert!(!m.cpu.is_halted());
     let regs = m.regs();
-    assert_eq!((regs.cs, regs.eip), (0x0000, 0x4000));
+    assert_eq!((regs.cs, regs.rip), (0x0000, 0x4000));
 }
 
 #[test]
@@ -206,7 +206,7 @@ fn an_interrupt_pushes_flags_then_cs_then_the_return_address() {
     m.load(0x1000, 0x0100, &[0x90]);
     m.set_regs(|r| {
         r.ss = 0x2000;
-        r.esp = 0x0100;
+        r.rsp = 0x0100;
         r.eflags |= flags::IF | flags::CF;
     });
     // Vector 0x20 → 0x3000:0x1234.
@@ -219,8 +219,8 @@ fn an_interrupt_pushes_flags_then_cs_then_the_return_address() {
     m.cpu.step();
 
     let regs = m.regs();
-    assert_eq!((regs.cs, regs.eip), (0x3000, 0x1234));
-    assert_eq!(regs.esp, 0x00fa);
+    assert_eq!((regs.cs, regs.rip), (0x3000, 0x1234));
+    assert_eq!(regs.rsp, 0x00fa);
     // The saved flags still have IF set; the CPU clears it only after the
     // push, which is what makes IRET restore it.
     let word = |off: u16| {
@@ -238,14 +238,14 @@ fn an_interrupt_is_masked_by_the_interrupt_flag_but_an_nmi_is_not() {
     m.load(0x0000, 0x0100, &[0x90, 0x90]);
     m.set_regs(|r| {
         r.ss = 0x2000;
-        r.esp = 0x0100;
+        r.rsp = 0x0100;
         r.eflags &= !flags::IF;
     });
     m.cpu.set_intr_vector(0x20);
     m.cpu.set_intr(true);
     m.cpu.step();
     assert_eq!(
-        m.regs().eip,
+        m.regs().rip,
         0x0101,
         "INTR must be ignored while IF is clear"
     );
@@ -254,7 +254,7 @@ fn an_interrupt_is_masked_by_the_interrupt_flag_but_an_nmi_is_not() {
     m.poke(0x0009, 0x40);
     m.cpu.pulse_nmi();
     m.cpu.step();
-    assert_eq!(m.regs().eip, 0x4000, "NMI is not maskable");
+    assert_eq!(m.regs().rip, 0x4000, "NMI is not maskable");
 }
 
 #[test]
@@ -264,8 +264,8 @@ fn writing_the_stack_segment_shadows_the_next_instruction() {
     // taken between the two would run the handler on a half-changed stack.
     m.load(0x0000, 0x0100, &[0x8e, 0xd0, 0x89, 0xdc]);
     m.set_regs(|r| {
-        r.eax = 0x3000;
-        r.ebx = 0x0200;
+        r.rax = 0x3000;
+        r.rbx = 0x0200;
         r.eflags |= flags::IF;
     });
     m.cpu.set_intr_vector(0x20);
@@ -277,10 +277,10 @@ fn writing_the_stack_segment_shadows_the_next_instruction() {
     m.cpu.set_intr(true); // ... and only now does the controller ask
     m.cpu.step(); // mov sp, bx runs anyway, because the shadow holds
     assert_eq!(m.regs().ss, 0x3000);
-    assert_eq!(m.regs().esp, 0x0200);
+    assert_eq!(m.regs().rsp, 0x0200);
     assert!(!m.cpu.interrupt_shadow());
     m.cpu.step(); // and only now is the interrupt taken
-    assert_eq!(m.regs().eip, 0x5000);
+    assert_eq!(m.regs().rip, 0x5000);
 }
 
 #[test]
@@ -289,14 +289,14 @@ fn the_trap_flag_takes_a_type_one_interrupt_after_each_instruction() {
     m.load(0x0000, 0x0100, &[0x90]);
     m.set_regs(|r| {
         r.ss = 0x2000;
-        r.esp = 0x0100;
+        r.rsp = 0x0100;
         r.eflags |= flags::TF;
     });
     m.poke(0x04, 0x00);
     m.poke(0x05, 0x60);
     m.cpu.step();
     let regs = m.regs();
-    assert_eq!(regs.eip, 0x6000);
+    assert_eq!(regs.rip, 0x6000);
     // The handler runs with the trap off, or it would trap on its own first
     // instruction forever.
     assert_eq!(regs.eflags & flags::TF, 0);
@@ -331,7 +331,7 @@ fn a_control_transfer_flushes_the_queue() {
     // jmp +0 followed by a byte that must never be executed from the queue.
     m.load(0x0000, 0x0100, &[0xeb, 0x00, 0xf4]);
     m.cpu.step();
-    assert_eq!(m.regs().eip, 0x0102);
+    assert_eq!(m.regs().rip, 0x0102);
     assert!(
         m.cpu.prefetch_queue().is_empty(),
         "the queue held bytes fetched before the jump"
@@ -347,8 +347,8 @@ fn an_installed_queue_is_executed_before_memory_is_read() {
     m.load(0x0000, 0x0100, &[0x90, 0x90]);
     m.cpu.set_prefetch_queue(&[0x40]).unwrap();
     m.cpu.step();
-    assert_eq!(m.regs().eax, 1);
-    assert_eq!(m.regs().eip, 0x0101);
+    assert_eq!(m.regs().rax, 1);
+    assert_eq!(m.regs().rip, 0x0101);
 }
 
 // ---------------------------------------------------------------------------
@@ -360,10 +360,10 @@ fn wait_and_lock_do_nothing_observable() {
     let m = machine();
     m.load(0x0000, 0x0100, &[0x9b, 0xf0, 0x40]);
     m.cpu.step(); // wait
-    assert_eq!(m.regs().eip, 0x0101);
+    assert_eq!(m.regs().rip, 0x0101);
     m.cpu.step(); // lock inc ax — one instruction, prefix included
-    assert_eq!(m.regs().eip, 0x0103);
-    assert_eq!(m.regs().eax, 1);
+    assert_eq!(m.regs().rip, 0x0103);
+    assert_eq!(m.regs().rax, 1);
 }
 
 #[test]
@@ -374,10 +374,10 @@ fn separate_address_spaces_mean_a_port_is_not_a_memory_address() {
     // in al, 0x60
     m.load(0x0000, 0x0100, &[0xe4, 0x60]);
     m.cpu.step();
-    assert_eq!(m.regs().eax & 0xff, 0xa5, "IN must not read memory");
+    assert_eq!(m.regs().rax & 0xff, 0xa5, "IN must not read memory");
 
     // out 0x61, al with al = 0x12
-    m.set_regs(|r| r.eax = 0x0012);
+    m.set_regs(|r| r.rax = 0x0012);
     m.load(0x0000, 0x0200, &[0xe6, 0x61]);
     m.cpu.step();
     assert_eq!(m.ports.read_u8(0x0061).unwrap(), 0x12);
@@ -389,10 +389,10 @@ fn a_word_port_access_is_two_consecutive_ports() {
     let m = machine();
     m.ports.write_u8(0x0300, 0x34).unwrap();
     m.ports.write_u8(0x0301, 0x12).unwrap();
-    m.set_regs(|r| r.edx = 0x0300);
+    m.set_regs(|r| r.rdx = 0x0300);
     m.load(0x0000, 0x0100, &[0xed]); // in ax, dx
     m.cpu.step();
-    assert_eq!(m.regs().eax, 0x1234);
+    assert_eq!(m.regs().rax, 0x1234);
 }
 
 #[test]
@@ -410,72 +410,72 @@ fn a_core_with_no_io_space_reads_ones() {
     }
     cpu.set_regs(Regs {
         cs: 0,
-        eip: 0x100,
+        rip: 0x100,
         ..Regs::new()
     });
     cpu.session.lock().state.reset_pending = false;
     cpu.step();
-    assert_eq!(cpu.regs().eax & 0xff, 0xff);
+    assert_eq!(cpu.regs().rax & 0xff, 0xff);
 }
 
 #[test]
 fn string_moves_follow_the_direction_flag() {
     let m = machine();
     for i in 0..4u32 {
-        m.poke(0x1_0000 + i, 0xa0 + i as u8);
+        m.poke(0x1_0000 + u64::from(i), 0xa0 + i as u8);
     }
     m.set_regs(|r| {
         r.ds = 0x1000;
         r.es = 0x2000;
-        r.esi = 0;
-        r.edi = 0;
-        r.ecx = 4;
+        r.rsi = 0;
+        r.rdi = 0;
+        r.rcx = 4;
     });
     m.load(0x0000, 0x0100, &[0xf3, 0xa4]); // rep movsb
     m.cpu.step();
-    assert_eq!(m.regs().ecx, 0);
-    assert_eq!(m.regs().esi, 4);
-    assert_eq!(m.regs().edi, 4);
+    assert_eq!(m.regs().rcx, 0);
+    assert_eq!(m.regs().rsi, 4);
+    assert_eq!(m.regs().rdi, 4);
     for i in 0..4u32 {
-        assert_eq!(m.peek(0x2_0000 + i), 0xa0 + i as u8);
+        assert_eq!(m.peek(0x2_0000 + u64::from(i)), 0xa0 + i as u8);
     }
 
     // Backwards, and one short: REPNE stops on a match.
     m.set_regs(|r| {
         r.es = 0x2000;
-        r.edi = 3;
-        r.ecx = 4;
-        r.eax = 0xa2;
+        r.rdi = 3;
+        r.rcx = 4;
+        r.rax = 0xa2;
         r.eflags |= flags::DF;
     });
     m.load(0x0000, 0x0200, &[0xf2, 0xae]); // repne scasb
     m.cpu.step();
-    assert_eq!(m.regs().ecx, 2, "scan stops the moment it matches");
-    assert_eq!(m.regs().edi, 1);
+    assert_eq!(m.regs().rcx, 2, "scan stops the moment it matches");
+    assert_eq!(m.regs().rdi, 1);
 }
 
 #[test]
 fn a_repeat_with_a_zero_count_does_nothing_at_all() {
     let m = machine();
     m.set_regs(|r| {
-        r.ecx = 0;
-        r.esi = 0x10;
-        r.edi = 0x20;
+        r.rcx = 0;
+        r.rsi = 0x10;
+        r.rdi = 0x20;
     });
     m.load(0x0000, 0x0100, &[0xf3, 0xa4]);
     m.cpu.step();
     let regs = m.regs();
-    assert_eq!((regs.esi, regs.edi, regs.ecx), (0x10, 0x20, 0));
+    assert_eq!((regs.rsi, regs.rdi, regs.rcx), (0x10, 0x20, 0));
 }
 
 #[test]
 fn a_repeat_is_interruptible_between_iterations() {
     let m = machine();
     m.set_regs(|r| {
-        r.eax = 0x3000;
+        r.rax = 0x3000;
         r.ds = 0x1000;
         r.es = 0x2000;
-        r.ecx = 100;
+        r.rcx = 100;
     });
     // Vector 2 (NMI) → 0x0000:0x7000.
     m.poke(0x08, 0x00);
@@ -488,10 +488,10 @@ fn a_repeat_is_interruptible_between_iterations() {
     m.cpu.step();
     // The instruction backed itself out: IP points at the prefix again, so
     // the handler returns straight into the rest of the copy.
-    assert_eq!(m.regs().eip, 0x0102);
-    assert!(m.regs().ecx < 100 && m.regs().ecx > 0);
+    assert_eq!(m.regs().rip, 0x0102);
+    assert!(m.regs().rcx < 100 && m.regs().rcx > 0);
     m.cpu.step();
-    assert_eq!(m.regs().eip, 0x7000);
+    assert_eq!(m.regs().rip, 0x7000);
 }
 
 #[test]
@@ -501,11 +501,11 @@ fn push_sp_stores_the_decremented_pointer() {
     let m = machine();
     m.set_regs(|r| {
         r.ss = 0x2000;
-        r.esp = 0x0100;
+        r.rsp = 0x0100;
     });
     m.load(0x0000, 0x0100, &[0x54]);
     m.cpu.step();
-    assert_eq!(m.regs().esp, 0x00fe);
+    assert_eq!(m.regs().rsp, 0x00fe);
     let pushed = u16::from(m.peek(linear(0x2000, 0x00fe)))
         | (u16::from(m.peek(linear(0x2000, 0x00ff))) << 8);
     assert_eq!(pushed, 0x00fe);
@@ -528,21 +528,21 @@ fn the_decimal_adjust_threshold_moves_with_the_auxiliary_carry() {
     let m = machine();
     m.load(0x0000, 0x0100, &[0x27]);
     m.set_regs(|r| {
-        r.eax = 0x009a;
+        r.rax = 0x009a;
         r.eflags = (r.eflags | flags::AF) & !flags::CF;
     });
     m.cpu.step();
-    assert_eq!(m.regs().eax & 0xff, 0xa0);
+    assert_eq!(m.regs().rax & 0xff, 0xa0);
     assert_eq!(m.regs().eflags & flags::CF, 0);
 
     // With AF clear the same AL takes both corrections: 0x9a + 0x66 = 0x00.
     m.load(0x0000, 0x0200, &[0x27]);
     m.set_regs(|r| {
-        r.eax = 0x009a;
+        r.rax = 0x009a;
         r.eflags &= !(flags::AF | flags::CF);
     });
     m.cpu.step();
-    assert_eq!(m.regs().eax & 0xff, 0x00);
+    assert_eq!(m.regs().rax & 0xff, 0x00);
     assert_eq!(m.regs().eflags & flags::CF, flags::CF);
 }
 
@@ -554,12 +554,12 @@ fn an_unadjusted_ascii_add_still_sets_sign_zero_and_parity() {
     let m = machine();
     m.load(0x0000, 0x0100, &[0x37]);
     m.set_regs(|r| {
-        r.eax = 0x0081; // AL = 0x81: low digit 1, so no adjustment
+        r.rax = 0x0081; // AL = 0x81: low digit 1, so no adjustment
         r.eflags &= !(flags::AF | flags::SF | flags::PF | flags::ZF);
     });
     m.cpu.step();
     let regs = m.regs();
-    assert_eq!(regs.eax, 0x0001, "only the low digit survives");
+    assert_eq!(regs.rax, 0x0001, "only the low digit survives");
     assert_eq!(
         regs.eflags & flags::SF,
         flags::SF,
@@ -588,10 +588,10 @@ fn a_shift_by_zero_still_writes_its_operand_back() {
     m.ram.write_u8(0x0101, 0x07).unwrap();
     m.set_regs(|r| {
         r.cs = 0;
-        r.eip = 0x100;
+        r.rip = 0x100;
         r.ds = 0x2000;
-        r.ebx = 0;
-        r.ecx = 0; // CL = 0: no rotation at all
+        r.rbx = 0;
+        r.rcx = 0; // CL = 0: no rotation at all
         r.eflags |= flags::CF;
     });
     m.cpu.session.lock().state.reset_pending = false;
@@ -684,12 +684,12 @@ fn a_multiply_takes_its_undefined_flags_from_the_high_half() {
     let m = machine();
     m.load(0x0000, 0x0100, &[0xf6, 0xe3]); // mul bl
     m.set_regs(|r| {
-        r.eax = 0x0010;
-        r.ebx = 0x0010;
+        r.rax = 0x0010;
+        r.rbx = 0x0010;
     });
     m.cpu.step();
     let regs = m.regs();
-    assert_eq!(regs.eax, 0x0100);
+    assert_eq!(regs.rax, 0x0100);
     // AH is 1: not zero, not negative, odd parity.
     assert_eq!(regs.eflags & flags::ZF, 0);
     assert_eq!(regs.eflags & flags::SF, 0);
@@ -706,16 +706,16 @@ fn a_divide_error_pushes_the_following_instruction() {
     let m = machine();
     m.load(0x0000, 0x0100, &[0xf6, 0xf3, 0x90]); // div bl ; nop
     m.set_regs(|r| {
-        r.eax = 0xffff;
-        r.ebx = 0x0001; // BL = 1: the quotient cannot fit in AL
+        r.rax = 0xffff;
+        r.rbx = 0x0001; // BL = 1: the quotient cannot fit in AL
         r.ss = 0x2000;
-        r.esp = 0x0100;
+        r.rsp = 0x0100;
     });
     m.poke(0x00, 0x00);
     m.poke(0x01, 0x04); // vector 0 → 0000:0400
     m.cpu.step();
     let regs = m.regs();
-    assert_eq!((regs.cs, regs.eip), (0x0000, 0x0400));
+    assert_eq!((regs.cs, regs.rip), (0x0000, 0x0400));
     let pushed_ip = u16::from(m.peek(linear(0x2000, 0x00fa)))
         | (u16::from(m.peek(linear(0x2000, 0x00fb))) << 8);
     assert_eq!(pushed_ip, 0x0102, "the address after `div`, not of it");
@@ -729,19 +729,19 @@ fn a_repeat_prefix_inverts_an_idiv_quotient() {
     let m = machine();
     m.load(0x0000, 0x0100, &[0xf3, 0xf6, 0xfb]); // rep idiv bl
     m.set_regs(|r| {
-        r.eax = 0x0064; // 100
-        r.ebx = 0x000a; // BL = 10
+        r.rax = 0x0064; // 100
+        r.rbx = 0x000a; // BL = 10
     });
     m.cpu.step();
-    assert_eq!(m.regs().eax & 0xff, 0xf6, "100 / 10 = 10, negated to -10");
+    assert_eq!(m.regs().rax & 0xff, 0xf6, "100 / 10 = 10, negated to -10");
 
     m.load(0x0000, 0x0200, &[0xf6, 0xfb]); // idiv bl, no prefix
     m.set_regs(|r| {
-        r.eax = 0x0064;
-        r.ebx = 0x000a;
+        r.rax = 0x0064;
+        r.rbx = 0x000a;
     });
     m.cpu.step();
-    assert_eq!(m.regs().eax & 0xff, 0x0a);
+    assert_eq!(m.regs().rax & 0xff, 0x0a);
 }
 
 #[test]
@@ -750,7 +750,7 @@ fn logical_operations_clear_the_auxiliary_carry() {
     let m = machine();
     m.load(0x0000, 0x0100, &[0x24, 0xff]); // and al, 0xff
     m.set_regs(|r| {
-        r.eax = 0x0001;
+        r.rax = 0x0001;
         r.eflags |= flags::AF | flags::CF | flags::OF;
     });
     m.cpu.step();
@@ -766,7 +766,7 @@ fn a_left_shift_leaves_bit_four_of_its_result_in_the_auxiliary_carry() {
     for (value, want) in [(0x08u32, true), (0x04u32, false)] {
         m.load(0x0000, 0x0100, &[0xd0, 0xe0]); // shl al, 1
         m.set_regs(|r| {
-            r.eax = value;
+            r.rax = u64::from(value);
             r.eflags &= !flags::AF;
         });
         m.cpu.step();
@@ -785,17 +785,17 @@ fn a_left_shift_leaves_bit_four_of_its_result_in_the_auxiliary_carry() {
 #[test]
 fn byte_registers_are_the_halves_of_the_word_registers() {
     let mut regs = Regs::new();
-    regs.eax = 0x1234;
+    regs.rax = 0x1234;
     assert_eq!(regs.byte(0), 0x34); // al
     assert_eq!(regs.byte(4), 0x12); // ah
     regs.set_byte(4, 0xab);
-    assert_eq!(regs.eax, 0xab34);
+    assert_eq!(regs.rax, 0xab34);
     regs.set_byte(0, 0xcd);
-    assert_eq!(regs.eax, 0xabcd);
+    assert_eq!(regs.rax, 0xabcd);
     // The order is AL CL DL BL AH CH DH BH, which is why AH is 4.
-    regs.ecx = 0x0000;
+    regs.rcx = 0x0000;
     regs.set_byte(5, 0xff);
-    assert_eq!(regs.ecx, 0xff00);
+    assert_eq!(regs.rcx, 0xff00);
 }
 
 #[test]
@@ -805,7 +805,7 @@ fn the_hard_wired_flag_bits_cannot_be_written() {
     m.load(0x0000, 0x0100, &[0xb8, 0x00, 0x00, 0x50, 0x9d]);
     m.set_regs(|r| {
         r.ss = 0x2000;
-        r.esp = 0x0100;
+        r.rsp = 0x0100;
     });
     m.cpu.step();
     m.cpu.step();
@@ -944,14 +944,14 @@ fn state_round_trips_through_a_snapshot() {
     let m = machine();
     m.load(0x1234, 0x5678, &[0x40, 0x41, 0x42]);
     m.set_regs(|r| {
-        r.eax = 0x1111;
-        r.ebx = 0x2222;
-        r.ecx = 0x3333;
-        r.edx = 0x4444;
-        r.esp = 0x5555;
-        r.ebp = 0x6666;
-        r.esi = 0x7777;
-        r.edi = 0x8888;
+        r.rax = 0x1111;
+        r.rbx = 0x2222;
+        r.rcx = 0x3333;
+        r.rdx = 0x4444;
+        r.rsp = 0x5555;
+        r.rbp = 0x6666;
+        r.rsi = 0x7777;
+        r.rdi = 0x8888;
         r.es = 0x9999;
         r.ss = 0xaaaa;
         r.ds = 0xbbbb;
@@ -993,15 +993,15 @@ fn state_round_trips_through_a_snapshot() {
 #[test]
 fn a_warm_reset_keeps_the_general_registers_and_a_cold_one_does_not() {
     let m = machine();
-    m.set_regs(|r| r.eax = 0xbeef);
+    m.set_regs(|r| r.rax = 0xbeef);
     m.cpu.reset(ResetKind::Warm);
     assert!(m.cpu.reset_pending());
     m.cpu.step();
-    assert_eq!(m.regs().eax, 0xbeef);
+    assert_eq!(m.regs().rax, 0xbeef);
     assert_eq!(m.regs().cs, 0xffff);
 
     m.cpu.reset(ResetKind::Cold);
-    assert_eq!(m.cpu.regs().eax, 0);
+    assert_eq!(m.cpu.regs().rax, 0);
     assert_eq!(m.cpu.cycles(), 0);
 }
 
@@ -1070,12 +1070,12 @@ fn the_undocumented_encodings_execute_rather_than_fault() {
     m.load(0x0000, 0x0100, &[0xf9, 0xd6]);
     m.cpu.step();
     m.cpu.step();
-    assert_eq!(m.regs().eax & 0xff, 0xff);
+    assert_eq!(m.regs().rax & 0xff, 0xff);
     // setmo: the undocumented D0 /6.
-    m.set_regs(|r| r.eax &= 0xff00);
+    m.set_regs(|r| r.rax &= 0xff00);
     m.load(0x0000, 0x0200, &[0xd0, 0xf0]);
     m.cpu.step();
-    assert_eq!(m.regs().eax & 0xff, 0xff);
+    assert_eq!(m.regs().rax & 0xff, 0xff);
     assert_eq!(resolve(decode(0xd0), 6).op, Op::SETMO);
     // The 60-6F aliases really are the conditional jumps.
     assert_eq!(decode(0x64).op, decode(0x74).op);
@@ -1100,7 +1100,7 @@ fn the_disassembler_and_the_interpreter_read_the_same_bytes() {
     for entry in &listing[..2] {
         m.cpu.step();
         ip = ip.wrapping_add(u16::from(entry.len));
-        assert_eq!(m.regs().eip, u32::from(ip));
+        assert_eq!(m.regs().rip, u64::from(ip));
     }
 }
 
@@ -1139,25 +1139,25 @@ use super::prot::{SegReg, Sys, ar, cr0, sys_type, tss32};
 /// something.
 mod at {
     /// The global descriptor table.
-    pub(super) const GDT: u32 = 0x1000;
+    pub(super) const GDT: u64 = 0x1000;
     /// The interrupt descriptor table.
-    pub(super) const IDT: u32 = 0x1800;
+    pub(super) const IDT: u64 = 0x1800;
     /// The task state segment.
-    pub(super) const TSS: u32 = 0x2000;
+    pub(super) const TSS: u64 = 0x2000;
     /// Ring-0 code.
-    pub(super) const CODE0: u32 = 0x3000;
+    pub(super) const CODE0: u64 = 0x3000;
     /// Ring-3 code.
-    pub(super) const CODE3: u32 = 0x4000;
+    pub(super) const CODE3: u64 = 0x4000;
     /// The page directory.
-    pub(super) const PDIR: u32 = 0x5000;
+    pub(super) const PDIR: u64 = 0x5000;
     /// The first page table.
-    pub(super) const PTAB: u32 = 0x6000;
+    pub(super) const PTAB: u64 = 0x6000;
     /// Scratch, for a test to write a marker into.
-    pub(super) const MARK: u32 = 0x7000;
+    pub(super) const MARK: u64 = 0x7000;
     /// The top of the ring-0 stack.
-    pub(super) const STACK0: u32 = 0x9000;
+    pub(super) const STACK0: u64 = 0x9000;
     /// The top of the ring-3 stack.
-    pub(super) const STACK3: u32 = 0xa000;
+    pub(super) const STACK3: u64 = 0xa000;
 }
 
 /// Access-rights words for the descriptors these tests build.
@@ -1181,12 +1181,13 @@ mod rights {
 /// A limit above 1 MiB has to be expressed in pages, and the architecture
 /// rounds *up* to the page containing it — which is why a limit of `0xffffffff`
 /// and a limit of `0xfffff000` produce the same descriptor.
-fn descriptor(base: u32, limit: u32, ar_bits: u32) -> (u32, u32) {
+fn descriptor(base: u64, limit: u32, ar_bits: u32) -> (u32, u32) {
     let (limit, ar_bits) = if limit > 0xf_ffff {
         (limit >> 12, ar_bits | ar::GRANULAR)
     } else {
         (limit, ar_bits)
     };
+    let base = base as u32;
     let low = (limit & 0xffff) | (base << 16);
     let high = ((base >> 16) & 0xff) | ar_bits | (limit & 0x000f_0000) | (base & 0xff00_0000);
     (low, high)
@@ -1240,26 +1241,24 @@ impl Pc {
         }
     }
 
-    fn write(&self, addr: u32, bytes: &[u8]) {
+    fn write(&self, addr: u64, bytes: &[u8]) {
         for (i, byte) in bytes.iter().enumerate() {
+            self.ram.write_u8(addr + i as u64, *byte).unwrap();
+        }
+    }
+
+    fn write32(&self, addr: u64, value: u64) {
+        for i in 0..4u64 {
             self.ram
-                .write_u8(u64::from(addr) + i as u64, *byte)
+                .write_u8(addr + i, (value >> (8 * i)) as u8)
                 .unwrap();
         }
     }
 
-    fn write32(&self, addr: u32, value: u32) {
-        for i in 0..4u32 {
-            self.ram
-                .write_u8(u64::from(addr + i), (value >> (8 * i)) as u8)
-                .unwrap();
-        }
-    }
-
-    fn read32(&self, addr: u32) -> u32 {
-        let mut value = 0u32;
-        for i in 0..4u32 {
-            value |= u32::from(self.ram.read_u8(u64::from(addr + i)).unwrap()) << (8 * i);
+    fn read32(&self, addr: u64) -> u64 {
+        let mut value = 0u64;
+        for i in 0..4u64 {
+            value |= u64::from(self.ram.read_u8(addr + i).unwrap()) << (8 * i);
         }
         value
     }
@@ -1274,15 +1273,15 @@ impl Pc {
     }
 
     /// Write a descriptor into the global descriptor table.
-    fn gdt(&self, index: u32, pair: (u32, u32)) {
-        self.write32(at::GDT + index * 8, pair.0);
-        self.write32(at::GDT + index * 8 + 4, pair.1);
+    fn gdt(&self, index: u64, pair: (u32, u32)) {
+        self.write32(at::GDT + index * 8, u64::from(pair.0));
+        self.write32(at::GDT + index * 8 + 4, u64::from(pair.1));
     }
 
     /// Write a gate into the interrupt descriptor table.
-    fn idt(&self, vector: u32, pair: (u32, u32)) {
-        self.write32(at::IDT + vector * 8, pair.0);
-        self.write32(at::IDT + vector * 8 + 4, pair.1);
+    fn idt(&self, vector: u64, pair: (u32, u32)) {
+        self.write32(at::IDT + vector * 8, u64::from(pair.0));
+        self.write32(at::IDT + vector * 8 + 4, u64::from(pair.1));
     }
 
     /// Start executing in real mode at `cs:eip`, with the reset sequence
@@ -1290,7 +1289,7 @@ impl Pc {
     fn start_real(&self, cs: u16, eip: u32) {
         let mut regs = self.cpu.regs();
         regs.cs = cs;
-        regs.eip = eip;
+        regs.rip = u64::from(eip);
         self.cpu.set_regs(regs);
         self.cpu.session.lock().state.reset_pending = false;
     }
@@ -1340,8 +1339,8 @@ impl Pc {
         regs.es = 0x10;
         regs.fs = 0x10;
         regs.gs = 0x10;
-        regs.esp = at::STACK0;
-        regs.eip = at::CODE0;
+        regs.rsp = at::STACK0;
+        regs.rip = at::CODE0;
         regs.eflags = flags::ALWAYS_SET;
         self.cpu.set_regs(regs);
         self.cpu.session.lock().state.reset_pending = false;
@@ -1380,13 +1379,16 @@ fn the_reset_vector_is_sixteen_bytes_below_the_top_of_the_address_space() {
     pc.rom(0xfff0, &[0xea, 0x00, 0x10, 0x00, 0x00]);
     pc.cpu.step();
     let regs = pc.regs();
-    assert_eq!((regs.cs, regs.eip), (0xf000, 0xfff0));
+    assert_eq!((regs.cs, regs.rip), (0xf000, 0xfff0));
     assert_eq!(pc.cpu.sys().seg(isa::seg::CS).base, 0xffff_0000);
-    assert_eq!(pc.cpu.regs().edx, Variant::I80486.reset_signature());
+    assert_eq!(
+        pc.cpu.regs().rdx,
+        u64::from(Variant::I80486.reset_signature())
+    );
 
     pc.cpu.step();
     let regs = pc.regs();
-    assert_eq!((regs.cs, regs.eip), (0x0000, 0x1000));
+    assert_eq!((regs.cs, regs.rip), (0x0000, 0x1000));
     // The far jump recomputed the base in real mode, and the processor is now
     // in the first megabyte for good.
     assert_eq!(pc.cpu.sys().seg(isa::seg::CS).base, 0);
@@ -1408,7 +1410,7 @@ fn an_operand_size_prefix_selects_the_wide_form_in_real_mode() {
     pc.run(8);
     // The 16-bit `mov` left the high half of `EAX` alone, which is the rule
     // that lets 16-bit and 32-bit code share a register file.
-    assert_eq!(pc.regs().eax, 0x2345_1234);
+    assert_eq!(pc.regs().rax, 0x2345_1234);
 }
 
 #[test]
@@ -1426,7 +1428,7 @@ fn an_address_size_prefix_brings_the_scaled_index_forms_into_real_mode() {
         ],
     );
     pc.run(8);
-    assert_eq!(pc.regs().edx, 0xdead_beef);
+    assert_eq!(pc.regs().rdx, 0xdead_beef);
 }
 
 #[test]
@@ -1480,10 +1482,10 @@ fn entering_protected_mode_reloads_the_cached_descriptor() {
     assert_eq!(cs.selector, 0x08);
     assert_eq!(cs.limit, 0xffff_ffff, "granularity expands the limit");
     assert!(cs.big(), "the D bit makes this a 32-bit segment");
-    assert_eq!(pc.regs().ecx, 0x1111_2222);
+    assert_eq!(pc.regs().rcx, 0x1111_2222);
     assert_eq!(pc.read32(0x7000), 0xcafe_babe);
     // A 32-bit push moved the stack pointer by four, not two.
-    assert_eq!(pc.regs().esp, at::STACK0);
+    assert_eq!(pc.regs().rsp, at::STACK0);
 }
 
 #[test]
@@ -1509,7 +1511,7 @@ fn a_segment_limit_violation_raises_general_protection() {
     pc.cpu.step();
     pc.cpu.step();
     let regs = pc.regs();
-    assert_eq!(regs.eip, 0x3100, "the fault took the #GP gate");
+    assert_eq!(regs.rip, 0x3100, "the fault took the #GP gate");
     assert_eq!(regs.cs & 0xfffc, 0x08);
     // The pushed error code is zero: a limit violation names no selector.
     assert_eq!(pc.read32(at::STACK0 - 16), 0);
@@ -1526,7 +1528,7 @@ fn an_unassigned_encoding_raises_invalid_opcode() {
     // `0f 0a` is not assigned on a 386 or a 486.
     pc.write(at::CODE0, &[0x0f, 0x0a]);
     pc.cpu.step();
-    assert_eq!(pc.regs().eip, 0x3100);
+    assert_eq!(pc.regs().rip, 0x3100);
     // #UD pushes no error code, so the saved EIP is one word closer.
     assert_eq!(pc.read32(at::STACK0 - 12), at::CODE0);
 }
@@ -1539,7 +1541,7 @@ fn paging_translates_through_the_directory_and_the_table() {
     // physical page holding the marker, so a write through the alias lands
     // somewhere the test can see it.
     pc.write32(at::PDIR, at::PTAB | 0b111);
-    for page in 0..1024u32 {
+    for page in 0..1024u64 {
         pc.write32(at::PTAB + page * 4, (page << 12) | 0b111);
     }
     pc.write32(at::PTAB + 0x200 * 4, at::MARK | 0b111);
@@ -1560,7 +1562,7 @@ fn paging_translates_through_the_directory_and_the_table() {
     );
     let steps = pc.run(10);
     assert!(steps < 10);
-    assert_eq!(pc.regs().ebx, 0x0bad_f00d);
+    assert_eq!(pc.regs().rbx, 0x0bad_f00d);
     // The write went to the *physical* page the table names.
     assert_eq!(pc.read32(at::MARK), 0x0bad_f00d);
     // And the walk set the accessed and dirty bits, which is the thing a
@@ -1580,7 +1582,7 @@ fn a_debug_translation_walks_the_tables_and_touches_nothing() {
     let pc = pc386();
     pc.start_protected();
     pc.write32(at::PDIR, at::PTAB | 0b111);
-    for page in 0..1024u32 {
+    for page in 0..1024u64 {
         pc.write32(at::PTAB + page * 4, (page << 12) | 0b111);
     }
     pc.write32(at::PTAB + 0x200 * 4, at::MARK | 0b111);
@@ -1599,7 +1601,7 @@ fn a_debug_translation_walks_the_tables_and_touches_nothing() {
 
     assert_eq!(
         pc.cpu.translate_debug(0x0020_0034),
-        DebugTranslation::Mapped(u64::from(at::MARK + 0x34)),
+        DebugTranslation::Mapped(at::MARK + 0x34),
         "through the directory and the table, offset kept"
     );
     // The second 4 MiB has no directory entry, so there is nothing to name.
@@ -1627,7 +1629,7 @@ fn a_missing_page_faults_with_the_address_in_cr2_and_the_reason_in_the_code() {
     let pc = pc386();
     pc.start_protected();
     pc.write32(at::PDIR, at::PTAB | 0b111);
-    for page in 0..1024u32 {
+    for page in 0..1024u64 {
         pc.write32(at::PTAB + page * 4, (page << 12) | 0b111);
     }
     // Leave the second 4 MiB with no directory entry at all.
@@ -1643,7 +1645,7 @@ fn a_missing_page_faults_with_the_address_in_cr2_and_the_reason_in_the_code() {
         &[0xa3, 0x34, 0x12, 0x40, 0x00, 0xf4], // mov [0x00401234], eax
     );
     pc.cpu.step();
-    assert_eq!(pc.regs().eip, 0x3100);
+    assert_eq!(pc.regs().rip, 0x3100);
     assert_eq!(pc.cpu.sys().cr2, 0x0040_1234);
     // Not present (bit 0 clear), a write (bit 1), supervisor (bit 2 clear).
     assert_eq!(pc.read32(at::STACK0 - 16), 0b010);
@@ -1663,7 +1665,7 @@ fn write_protect_decides_whether_ring_zero_obeys_a_read_only_page() {
         let pc = Pc::new(variant);
         pc.start_protected();
         pc.write32(at::PDIR, at::PTAB | 0b111);
-        for page in 0..1024u32 {
+        for page in 0..1024u64 {
             pc.write32(at::PTAB + page * 4, (page << 12) | 0b111);
         }
         // One page — the one the program writes — is present and
@@ -1683,7 +1685,7 @@ fn write_protect_decides_whether_ring_zero_obeys_a_read_only_page() {
         pc.write(0x3100, &[0xf4]);
         pc.write(at::CODE0, &[0xa3, 0x00, 0x70, 0x00, 0x00, 0xf4]);
         pc.cpu.step();
-        let faulted = pc.regs().eip == 0x3100;
+        let faulted = pc.regs().rip == 0x3100;
         assert_eq!(faulted, expect_fault, "{variant} with WP={wp}");
     }
 }
@@ -1752,16 +1754,16 @@ fn an_interrupt_gate_switches_to_the_stack_the_task_state_segment_names() {
     }
     let regs = pc.regs();
     assert_eq!(regs.cs, 0x1b, "the iret entered ring 3");
-    assert_eq!(regs.esp, at::STACK3);
+    assert_eq!(regs.rsp, at::STACK3);
     assert_eq!(pc.cpu.sys().task.selector, 0x28);
 
     pc.cpu.step(); // int 0x80
     let regs = pc.regs();
     assert_eq!(regs.cs & 3, 0, "the gate raised the privilege level");
-    assert_eq!(regs.eip, 0x3100);
+    assert_eq!(regs.rip, 0x3100);
     assert_eq!(regs.ss, 0x10, "the stack came out of the TSS");
     // Five doublewords: SS, ESP, EFLAGS, CS, EIP.
-    assert_eq!(regs.esp, at::STACK0 - 20);
+    assert_eq!(regs.rsp, at::STACK0 - 20);
     assert_eq!(pc.read32(at::STACK0 - 4), 0x23, "the caller's SS");
     assert_eq!(pc.read32(at::STACK0 - 8), at::STACK3, "the caller's ESP");
     assert_eq!(pc.read32(at::STACK0 - 16), 0x1b, "the caller's CS");
@@ -1774,7 +1776,7 @@ fn an_interrupt_gate_switches_to_the_stack_the_task_state_segment_names() {
     pc.cpu.step(); // iretd
     let regs = pc.regs();
     assert_eq!(regs.cs, 0x1b, "and back out to ring 3");
-    assert_eq!(regs.esp, at::STACK3);
+    assert_eq!(regs.rsp, at::STACK3);
 }
 
 #[test]
@@ -1812,7 +1814,7 @@ fn a_ring_three_program_may_not_touch_the_privileged_instructions() {
     }
     assert_eq!(pc.regs().cs, 0x1b);
     pc.cpu.step();
-    assert_eq!(pc.regs().eip, 0x3100, "hlt in ring 3 is #GP");
+    assert_eq!(pc.regs().rip, 0x3100, "hlt in ring 3 is #GP");
     assert!(!pc.cpu.is_halted());
 }
 
@@ -1871,13 +1873,13 @@ fn cpuid_reports_the_vendor_and_a_feature_set_this_core_implements() {
     pc.write(at::CODE0, &[0x0f, 0xa2, 0xf4]);
     pc.cpu.step();
     let regs = pc.regs();
-    assert_eq!(regs.eax, 1, "the highest leaf");
+    assert_eq!(regs.rax, 1, "the highest leaf");
     assert_eq!(
-        (regs.ebx, regs.edx, regs.ecx),
+        (regs.rbx, regs.rdx, regs.rcx),
         (
-            u32::from_le_bytes(*b"Genu"),
-            u32::from_le_bytes(*b"ineI"),
-            u32::from_le_bytes(*b"ntel")
+            u64::from(u32::from_le_bytes(*b"Genu")),
+            u64::from(u32::from_le_bytes(*b"ineI")),
+            u64::from(u32::from_le_bytes(*b"ntel"))
         )
     );
 
@@ -1889,8 +1891,8 @@ fn cpuid_reports_the_vendor_and_a_feature_set_this_core_implements() {
     pc.cpu.step();
     pc.cpu.step();
     let regs = pc.regs();
-    assert_eq!(regs.eax, 0x0000_0480);
-    assert_eq!(regs.edx, 0);
+    assert_eq!(regs.rax, 0x0000_0480);
+    assert_eq!(regs.rdx, 0);
 
     // A 386 has no `CPUID` at all.
     let pc = Pc::new(Variant::I80386);
@@ -1899,7 +1901,7 @@ fn cpuid_reports_the_vendor_and_a_feature_set_this_core_implements() {
     pc.write(0x3100, &[0xf4]);
     pc.write(at::CODE0, &[0x0f, 0xa2]);
     pc.cpu.step();
-    assert_eq!(pc.regs().eip, 0x3100, "#UD on a 386");
+    assert_eq!(pc.regs().rip, 0x3100, "#UD on a 386");
 }
 
 #[test]
@@ -1928,10 +1930,10 @@ fn the_386_instruction_additions_compute_what_the_manual_says() {
     let steps = pc.run(20);
     assert!(steps < 20);
     let regs = pc.regs();
-    assert_eq!(regs.eax, 0x80, "bts then btr then btc");
-    assert_eq!(regs.ebx, 0xffff_ff81, "movsx sign-extended");
-    assert_eq!(regs.edx, 8, "bsf found the lowest set bit");
-    assert_eq!(regs.esi, 8, "bsr found the highest");
+    assert_eq!(regs.rax, 0x80, "bts then btr then btc");
+    assert_eq!(regs.rbx, 0xffff_ff81, "movsx sign-extended");
+    assert_eq!(regs.rdx, 8, "bsf found the lowest set bit");
+    assert_eq!(regs.rsi, 8, "bsr found the highest");
 
     // The double shifts, the 486 atomics, and the frame instructions.
     let pc = pc386();
@@ -1954,9 +1956,9 @@ fn the_386_instruction_additions_compute_what_the_manual_says() {
     assert!(steps < 20);
     let regs = pc.regs();
     // 0xf0000000 << 4, filled from the top of 0x0f000000.
-    assert_eq!(regs.eax.swap_bytes(), 0x0000_0000);
-    assert_eq!(regs.ebx, 0x0500_0000, "bswap reversed the byte order");
-    assert_eq!(regs.edi, 70, "the three-operand imul");
+    assert_eq!(regs.rax.swap_bytes(), 0x0000_0000);
+    assert_eq!(regs.rbx, 0x0500_0000, "bswap reversed the byte order");
+    assert_eq!(regs.rdi, 70, "the three-operand imul");
 }
 
 #[test]
@@ -1977,9 +1979,9 @@ fn pusha_stores_the_stack_pointer_it_started_with_and_popa_discards_it() {
     let steps = pc.run(10);
     assert!(steps < 10);
     let regs = pc.regs();
-    assert_eq!(regs.eax, 0x1111_1111, "popad restored it");
-    assert_eq!(regs.ebx, 0x3333_3333);
-    assert_eq!(regs.esp, at::STACK0, "and left the stack where it found it");
+    assert_eq!(regs.rax, 0x1111_1111, "popad restored it");
+    assert_eq!(regs.rbx, 0x3333_3333);
+    assert_eq!(regs.rsp, at::STACK0, "and left the stack where it found it");
     // The stored `ESP` is the value the instruction started with, and it is
     // the fifth of the eight — `EAX ECX EDX EBX ESP EBP ESI EDI`.
     assert_eq!(pc.read32(at::STACK0 - 20), at::STACK0);
@@ -2001,17 +2003,17 @@ fn enter_and_leave_build_and_unmake_a_frame() {
     pc.cpu.step();
     pc.cpu.step();
     let regs = pc.regs();
-    assert_eq!(regs.ebp, at::STACK0 - 4, "the frame pointer is the new top");
+    assert_eq!(regs.rbp, at::STACK0 - 4, "the frame pointer is the new top");
     assert_eq!(
-        regs.esp,
+        regs.rsp,
         at::STACK0 - 4 - 0x10,
         "and 16 bytes were reserved"
     );
     assert_eq!(pc.read32(at::STACK0 - 4), 0x8800, "the old EBP was saved");
     pc.cpu.step();
     let regs = pc.regs();
-    assert_eq!(regs.ebp, 0x8800);
-    assert_eq!(regs.esp, at::STACK0);
+    assert_eq!(regs.rbp, 0x8800);
+    assert_eq!(regs.rsp, at::STACK0);
 }
 
 #[test]
@@ -2023,11 +2025,11 @@ fn the_shift_count_is_masked_to_five_bits_from_the_80186_on() {
     let m = machine();
     m.load(0x0000, 0x0100, &[0xd2, 0xe0]); // shl al, cl
     m.set_regs(|r| {
-        r.eax = 0x00ff;
-        r.ecx = 32;
+        r.rax = 0x00ff;
+        r.rcx = 32;
     });
     m.cpu.step();
-    assert_eq!(m.regs().eax & 0xff, 0, "an 8086 really shifts 32 times");
+    assert_eq!(m.regs().rax & 0xff, 0, "an 8086 really shifts 32 times");
 
     let pc = pc386();
     pc.start_protected();
@@ -2041,7 +2043,7 @@ fn the_shift_count_is_masked_to_five_bits_from_the_80186_on() {
         ],
     );
     pc.run(6);
-    assert_eq!(pc.regs().eax & 0xff, 0xff, "a 386 masks the count to zero");
+    assert_eq!(pc.regs().rax & 0xff, 0xff, "a 386 masks the count to zero");
 }
 
 #[test]
@@ -2050,7 +2052,7 @@ fn push_sp_stores_the_value_before_the_decrement_from_the_80286_on() {
     m.load(0x0000, 0x0100, &[0x54]); // push sp
     m.set_regs(|r| {
         r.ss = 0x2000;
-        r.esp = 0x0100;
+        r.rsp = 0x0100;
     });
     m.cpu.step();
     let pushed = u16::from(m.peek(linear(0x2000, 0x00fe)))
@@ -2089,10 +2091,10 @@ fn lar_lsl_verr_and_arpl_answer_without_faulting() {
     let steps = pc.run(10);
     assert!(steps < 10);
     let regs = pc.regs();
-    assert_eq!(regs.ebx, 0x0fff, "lsl read the limit");
-    assert_eq!(regs.ecx & ar::MASK, rights::DATA32);
+    assert_eq!(regs.rbx, 0x0fff, "lsl read the limit");
+    assert_eq!(regs.rcx, u64::from(rights::DATA32 & ar::MASK));
     assert_eq!(
-        regs.edx, 0,
+        regs.rdx, 0,
         "a selector past the table leaves the target alone"
     );
     assert!(!regs.flag(flags::ZF), "and clears ZF rather than faulting");
@@ -2112,7 +2114,7 @@ fn lar_lsl_verr_and_arpl_answer_without_faulting() {
     );
     let steps = pc.run(6);
     assert!(steps < 6);
-    assert_eq!(pc.regs().eax & 0xffff, 0x0b, "raised to RPL 3");
+    assert_eq!(pc.regs().rax & 0xffff, 0x0b, "raised to RPL 3");
     assert!(pc.regs().flag(flags::ZF));
 }
 
@@ -2168,8 +2170,8 @@ fn a_snapshot_round_trips_the_hidden_descriptor_caches() {
     };
     pc.cpu.set_sys(sys);
     pc.cpu.set_regs(Regs {
-        eax: 0x1234_5678,
-        esi: 0x9abc_def0,
+        rax: 0x1234_5678,
+        rsi: 0x9abc_def0,
         ..pc.regs()
     });
     let regs_before = pc.regs();
@@ -2204,15 +2206,15 @@ fn the_first_sixty_four_bytes_of_a_saved_core_are_gdbs_register_block() {
     let pc = pc386();
     pc.start_protected();
     pc.cpu.set_regs(Regs {
-        eax: 0x0000_0001,
-        ecx: 0x0000_0002,
-        edx: 0x0000_0003,
-        ebx: 0x0000_0004,
-        esp: 0x0000_0005,
-        ebp: 0x0000_0006,
-        esi: 0x0000_0007,
-        edi: 0x0000_0008,
-        eip: 0x0000_0009,
+        rax: 0x0000_0001,
+        rcx: 0x0000_0002,
+        rdx: 0x0000_0003,
+        rbx: 0x0000_0004,
+        rsp: 0x0000_0005,
+        rbp: 0x0000_0006,
+        rsi: 0x0000_0007,
+        rdi: 0x0000_0008,
+        rip: 0x0000_0009,
         ..pc.regs()
     });
     let mut shape = MachineShape::new();
@@ -2261,30 +2263,30 @@ fn a_descriptor_that_changes_under_a_loaded_selector_does_not_move_the_segment()
     pc.cpu.step();
     pc.cpu.step();
     pc.cpu.step();
-    assert_eq!(pc.regs().ebx, 0xaaaa_aaaa);
+    assert_eq!(pc.regs().rbx, 0xaaaa_aaaa);
 
     // Move the descriptor's base and read again without reloading `ES`.
     pc.gdt(3, descriptor(0x2_0000, 0xffff, rights::DATA32));
     pc.cpu.set_regs(Regs {
-        eip: at::CODE0 + 7,
+        rip: at::CODE0 + 7,
         ..pc.regs()
     });
     pc.cpu.step();
     assert_eq!(
-        pc.regs().ebx,
+        pc.regs().rbx,
         0xaaaa_aaaa,
         "the cached base is what the processor uses"
     );
 
     // Reloading the selector is what publishes the change.
     pc.cpu.set_regs(Regs {
-        eip: at::CODE0,
+        rip: at::CODE0,
         ..pc.regs()
     });
     pc.cpu.step();
     pc.cpu.step();
     pc.cpu.step();
-    assert_eq!(pc.regs().ebx, 0xbbbb_bbbb);
+    assert_eq!(pc.regs().rbx, 0xbbbb_bbbb);
 }
 
 #[test]
@@ -2306,7 +2308,7 @@ fn a_null_selector_is_loadable_and_then_unusable() {
     pc.cpu.step();
     assert_eq!(pc.regs().es, 0, "loading it is fine");
     pc.cpu.step();
-    assert_eq!(pc.regs().eip, 0x3100, "using it is not");
+    assert_eq!(pc.regs().rip, 0x3100, "using it is not");
     assert_eq!(pc.read32(at::STACK0 - 16), 0, "#GP(0), naming no selector");
 }
 
@@ -2314,7 +2316,7 @@ fn a_null_selector_is_loadable_and_then_unusable() {
 fn a_task_switch_saves_the_outgoing_task_and_loads_the_incoming_one() {
     let pc = pc386();
     pc.start_protected();
-    pub(super) const TSS_B: u32 = 0x2200;
+    pub(super) const TSS_B: u64 = 0x2200;
     pc.gdt(
         5,
         descriptor(
@@ -2333,7 +2335,7 @@ fn a_task_switch_saves_the_outgoing_task_and_loads_the_incoming_one() {
     );
     // The incoming task: a code segment, a stack, and one instruction.
     pc.write32(TSS_B + tss32::EIP, 0x3300);
-    pc.write32(TSS_B + tss32::EFLAGS, flags::ALWAYS_SET);
+    pc.write32(TSS_B + tss32::EFLAGS, u64::from(flags::ALWAYS_SET));
     pc.write32(TSS_B + tss32::EAX, 0x4444_4444);
     pc.write32(TSS_B + tss32::EAX + 16, 0x8f00); // ESP
     pc.write32(TSS_B + tss32::ES, 0x10);
@@ -2357,8 +2359,8 @@ fn a_task_switch_saves_the_outgoing_task_and_loads_the_incoming_one() {
         pc.cpu.step();
     }
     let regs = pc.regs();
-    assert_eq!(regs.eax, 0x4444_4444, "the incoming task's registers");
-    assert_eq!(regs.eip, 0x3300);
+    assert_eq!(regs.rax, 0x4444_4444, "the incoming task's registers");
+    assert_eq!(regs.rip, 0x3300);
     assert_eq!(pc.cpu.sys().task.selector, 0x30);
     assert_eq!(
         pc.cpu.sys().cr0 & cr0::TS,
@@ -2388,7 +2390,7 @@ fn an_io_port_needs_the_privilege_level_or_the_permission_bitmap() {
     pc.write32(at::TSS + tss32::SS0, 0x10);
     // The bitmap starts at 0x68 and permits port 0x60 only.
     pc.write32(at::TSS + 0x64, 0x0068_0000);
-    for i in 0..0x18u32 {
+    for i in 0..0x18u64 {
         pc.write(at::TSS + 0x68 + i, &[0xff]);
     }
     pc.write(at::TSS + 0x68 + 0x0c, &[0xfe]); // port 0x60 allowed
@@ -2416,9 +2418,9 @@ fn an_io_port_needs_the_privilege_level_or_the_permission_bitmap() {
     }
     assert_eq!(pc.regs().cs, 0x1b);
     pc.cpu.step();
-    assert_eq!(pc.regs().eip, at::CODE3 + 2, "port 0x60 went through");
+    assert_eq!(pc.regs().rip, at::CODE3 + 2, "port 0x60 went through");
     pc.cpu.step();
-    assert_eq!(pc.regs().eip, 0x3100, "port 0x61 raised #GP");
+    assert_eq!(pc.regs().rip, 0x3100, "port 0x61 raised #GP");
 }
 
 #[test]
@@ -2472,7 +2474,7 @@ fn a_thirty_two_bit_listing_reads_the_way_the_assembler_wrote_it() {
         (&[0xca, 0x04, 0x00], "retf 0x4"),
     ];
     for (bytes, want) in cases {
-        let d = disassemble_as(isa::Gen::I386, true, 0, 0, bytes);
+        let d = disassemble_as(isa::Gen::I386, isa::Bits::B32, 0, 0, bytes);
         assert_eq!(alloc::format!("{d}"), *want, "for {bytes:02x?}");
         assert_eq!(d.len as usize, bytes.len(), "length of {bytes:02x?}");
     }
@@ -2505,7 +2507,7 @@ fn the_386_map_reclaimed_the_encodings_the_8086_spent_on_aliases() {
 fn the_string_instructions_move_at_the_operand_size() {
     let pc = pc386();
     pc.start_protected();
-    for i in 0..4u32 {
+    for i in 0..4u64 {
         pc.write32(0x8000 + i * 4, 0x1111_1111 * (i + 1));
     }
     pc.write(
@@ -2528,7 +2530,7 @@ fn the_string_instructions_move_at_the_operand_size() {
     );
     let steps = pc.run(30);
     assert!(steps < 30);
-    for i in 0..4u32 {
+    for i in 0..4u64 {
         assert_eq!(pc.read32(0x8100 + i * 4), 0x1111_1111 * (i + 1));
     }
     assert_eq!(pc.read32(0x8200), 0xa5a5_a5a5);
@@ -2537,8 +2539,8 @@ fn the_string_instructions_move_at_the_operand_size() {
     // `repne scasd` compares `EAX` with each doubleword and stops on a match:
     // the first two match, so it stops after one iteration with three left.
     let regs = pc.regs();
-    assert_eq!(regs.ecx, 3);
-    assert_eq!(regs.edi, 0x8204);
+    assert_eq!(regs.rcx, 3);
+    assert_eq!(regs.rdi, 0x8204);
     assert!(regs.flag(flags::ZF));
 }
 
@@ -2556,7 +2558,7 @@ fn the_near_conditional_jumps_take_a_full_displacement() {
     pc.write(at::CODE3, &[0xbb, 0x0d, 0x60, 0x00, 0x00, 0xf4]);
     let steps = pc.run(6);
     assert!(steps < 6);
-    assert_eq!(pc.regs().ebx, 0x600d, "the near jump reached CODE3");
+    assert_eq!(pc.regs().rbx, 0x600d, "the near jump reached CODE3");
 
     // With a 16-bit operand size the same opcode takes a 16-bit displacement
     // and the target wraps in sixteen bits.
@@ -2572,7 +2574,7 @@ fn the_near_conditional_jumps_take_a_full_displacement() {
     pc.write(at::CODE3, &[0xf4]);
     pc.cpu.step();
     pc.cpu.step();
-    assert_eq!(pc.regs().eip, at::CODE3);
+    assert_eq!(pc.regs().rip, at::CODE3);
 }
 
 #[test]
@@ -2591,8 +2593,8 @@ fn xadd_and_cmpxchg_are_the_486_atomics_the_manual_describes() {
     let steps = pc.run(6);
     assert!(steps < 6);
     let regs = pc.regs();
-    assert_eq!(regs.eax, 0x1234, "the sum");
-    assert_eq!(regs.ecx, 0x1000, "and the destination's old value");
+    assert_eq!(regs.rax, 0x1234, "the sum");
+    assert_eq!(regs.rcx, 0x1000, "and the destination's old value");
 
     // `CMPXCHG` compares the destination with the accumulator; on a match the
     // source replaces it, on a mismatch the destination replaces the
@@ -2613,8 +2615,8 @@ fn xadd_and_cmpxchg_are_the_486_atomics_the_manual_describes() {
     assert!(steps < 8);
     let regs = pc.regs();
     assert!(regs.flag(flags::ZF), "the comparison matched");
-    assert_eq!(regs.ebx, 9, "so the source was stored");
-    assert_eq!(regs.eax, 5, "and the accumulator is unchanged");
+    assert_eq!(regs.rbx, 9, "so the source was stored");
+    assert_eq!(regs.rax, 5, "and the accumulator is unchanged");
 
     let pc = pc386();
     pc.start_protected();
@@ -2632,8 +2634,8 @@ fn xadd_and_cmpxchg_are_the_486_atomics_the_manual_describes() {
     assert!(steps < 8);
     let regs = pc.regs();
     assert!(!regs.flag(flags::ZF));
-    assert_eq!(regs.ebx, 5, "the destination is left alone");
-    assert_eq!(regs.eax, 5, "and the accumulator takes its value");
+    assert_eq!(regs.rbx, 5, "the destination is left alone");
+    assert_eq!(regs.rax, 5, "and the accumulator takes its value");
 }
 
 #[test]
@@ -2653,8 +2655,8 @@ fn the_shift_group_gained_an_immediate_count_on_the_80186() {
     let steps = pc.run(8);
     assert!(steps < 8);
     let regs = pc.regs();
-    assert_eq!(regs.eax, 0x20);
-    assert_eq!(regs.ebx & 0xffff, 0x4000);
+    assert_eq!(regs.rax, 0x20);
+    assert_eq!(regs.rbx & 0xffff, 0x4000);
 }
 
 #[test]
@@ -2676,7 +2678,7 @@ fn in_and_out_transfer_at_the_operand_size() {
     );
     let steps = pc.run(6);
     assert!(steps < 6);
-    assert_eq!(pc.regs().eax, 0x4433_2211);
+    assert_eq!(pc.regs().rax, 0x4433_2211);
     for i in 0..4u64 {
         assert_eq!(
             pc.ports.read_u8(0x310 + i).unwrap(),
@@ -2702,7 +2704,7 @@ fn lss_loads_the_stack_and_opens_the_interrupt_shadow() {
     );
     pc.cpu.step();
     let regs = pc.regs();
-    assert_eq!(regs.esp, 0x8800);
+    assert_eq!(regs.rsp, 0x8800);
     assert_eq!(regs.ss, 0x10);
     assert!(
         pc.cpu.interrupt_shadow(),
@@ -2728,7 +2730,7 @@ fn a_386_in_real_mode_takes_its_vectors_through_the_idt_register() {
     pc.write(0x1800, &[0xf4]);
     pc.cpu.step();
     let regs = pc.regs();
-    assert_eq!((regs.cs, regs.eip), (0x0000, 0x1800));
+    assert_eq!((regs.cs, regs.rip), (0x0000, 0x1800));
 }
 
 #[test]
@@ -2739,7 +2741,7 @@ fn a_page_fault_restarts_the_instruction_that_caused_it() {
     let pc = pc386();
     pc.start_protected();
     pc.write32(at::PDIR, at::PTAB | 0b111);
-    for page in 0..1024u32 {
+    for page in 0..1024u64 {
         pc.write32(at::PTAB + page * 4, (page << 12) | 0b111);
     }
     // Unmap exactly the page the program writes to.
@@ -2762,16 +2764,16 @@ fn a_page_fault_restarts_the_instruction_that_caused_it() {
     );
     pc.cpu.step();
     pc.cpu.step();
-    assert_eq!(pc.regs().eip, 0x3100);
+    assert_eq!(pc.regs().rip, 0x3100);
     // The saved `EIP` names the `mov`, not the `hlt` after it.
     assert_eq!(pc.read32(at::STACK0 - 12), at::CODE0 + 5);
-    assert_eq!(pc.regs().eax, 0x0bad_f00d, "the earlier work is not undone");
+    assert_eq!(pc.regs().rax, 0x0bad_f00d, "the earlier work is not undone");
 
     // Map the page, restart, and the instruction completes.
     pc.write32(at::PTAB + (at::MARK >> 12) * 4, at::MARK | 0b111);
     pc.cpu.set_regs(Regs {
-        eip: at::CODE0 + 5,
-        esp: at::STACK0,
+        rip: at::CODE0 + 5,
+        rsp: at::STACK0,
         ..pc.regs()
     });
     let mut sys = pc.cpu.sys();
@@ -2809,8 +2811,8 @@ fn a_sixteen_bit_code_segment_in_protected_mode_runs_sixteen_bit_code() {
     let regs = pc.regs();
     assert_eq!(regs.cs, 0x18);
     assert!(!pc.cpu.sys().seg(isa::seg::CS).big());
-    assert_eq!(regs.eax & 0xffff, 0x1234);
-    assert_eq!(regs.ebx, 0x1234_5678);
+    assert_eq!(regs.rax & 0xffff, 0x1234);
+    assert_eq!(regs.rbx, 0x1234_5678);
     assert_eq!(pc.read32(at::MARK) & 0xffff, 0x1234);
 }
 
@@ -2842,10 +2844,10 @@ fn a_far_call_crosses_between_sixteen_and_thirty_two_bit_segments() {
     let steps = pc.run(8);
     assert!(steps < 8);
     let regs = pc.regs();
-    assert_eq!(regs.eax & 0xffff, 0x9999, "the 16-bit callee ran");
-    assert_eq!(regs.ebx, 0x600d, "and control came back");
+    assert_eq!(regs.rax & 0xffff, 0x9999, "the 16-bit callee ran");
+    assert_eq!(regs.rbx, 0x600d, "and control came back");
     assert_eq!(regs.cs, 0x08);
-    assert_eq!(regs.esp, at::STACK0, "the stack is balanced");
+    assert_eq!(regs.rsp, at::STACK0, "the stack is balanced");
 }
 
 #[test]
@@ -2868,16 +2870,16 @@ fn an_interrupt_onto_a_sixteen_bit_stack_moves_the_pointer_in_sixteen_bits() {
     pc.cpu.set_sys(sys);
     pc.cpu.set_regs(Regs {
         ss: 0x18,
-        esp: 0xdead_9000,
+        rsp: 0xdead_9000,
         ..pc.regs()
     });
     pc.write(at::CODE0, &[0xcd, 0x40, 0xf4]); // int 0x40
     pc.cpu.step();
     let regs = pc.regs();
     assert_eq!(regs.cs, 0x20);
-    assert_eq!(regs.eip, 0x4000);
+    assert_eq!(regs.rip, 0x4000);
     assert_eq!(
-        regs.esp, 0xdead_8ffa,
+        regs.rsp, 0xdead_8ffa,
         "three words pushed, and the high half of ESP untouched"
     );
     assert_eq!(
@@ -2919,15 +2921,15 @@ fn smsw_sldt_and_str_read_back_what_was_loaded() {
     let steps = pc.run(10);
     assert!(steps < 10);
     let regs = pc.regs();
-    assert_eq!(regs.ecx & 0xffff, 0x30, "sldt");
-    assert_eq!(regs.edx & 0xffff, 0x28, "str");
-    assert_eq!(regs.ebx & 1, 1, "smsw sees CR0.PE");
+    assert_eq!(regs.rcx & 0xffff, 0x30, "sldt");
+    assert_eq!(regs.rdx & 0xffff, 0x28, "str");
+    assert_eq!(regs.rbx & 1, 1, "smsw sees CR0.PE");
     assert_eq!(pc.cpu.sys().ldtr.base, 0x9800);
     // Marking the task state segment busy is what stops a second task being
     // switched into the same state; `LTR` does it as a side effect.
     assert_eq!(
         (pc.read32(at::GDT + 5 * 8 + 4) >> 8) & 0xf,
-        u32::from(sys_type::TSS32_BUSY)
+        u64::from(sys_type::TSS32_BUSY)
     );
 }
 
@@ -2987,7 +2989,7 @@ fn the_divide_that_has_no_representable_quotient_is_a_divide_error() {
     for _ in 0..4 {
         pc.cpu.step();
     }
-    assert_eq!(pc.regs().eip, 0x3100, "#DE, not a host panic");
+    assert_eq!(pc.regs().rip, 0x3100, "#DE, not a host panic");
     // #DE is a fault on a 386: the saved address is the `idiv`, not the `hlt`.
     assert_eq!(pc.read32(at::STACK0 - 12), at::CODE0 + 12);
 
@@ -3010,7 +3012,7 @@ fn the_divide_that_has_no_representable_quotient_is_a_divide_error() {
     for _ in 0..4 {
         pc.cpu.step();
     }
-    assert_eq!(pc.regs().eip, 0x3100);
+    assert_eq!(pc.regs().rip, 0x3100);
 }
 
 #[test]
@@ -3039,8 +3041,8 @@ fn a_bit_test_on_memory_with_a_register_offset_reaches_outside_the_operand() {
     let steps = pc.run(10);
     assert!(steps < 10);
     let regs = pc.regs();
-    assert_eq!(regs.eax & 0xff, 1, "bit 34 is one doubleword along");
-    assert_eq!((regs.eax >> 8) & 0xff, 1, "bit -1 is one doubleword back");
+    assert_eq!(regs.rax & 0xff, 1, "bit 34 is one doubleword along");
+    assert_eq!((regs.rax >> 8) & 0xff, 1, "bit -1 is one doubleword back");
 
     // With an immediate the bit number is taken modulo the operand size and
     // never leaves the operand, which is the other half of the same rule.
@@ -3058,7 +3060,7 @@ fn a_bit_test_on_memory_with_a_register_offset_reaches_outside_the_operand() {
     );
     let steps = pc.run(5);
     assert!(steps < 5);
-    assert_eq!(pc.regs().eax & 0xff, 1, "bit 32 wrapped to bit 0");
+    assert_eq!(pc.regs().rax & 0xff, 1, "bit 32 wrapped to bit 0");
 }
 
 // ---------------------------------------------------------------------------
@@ -3068,7 +3070,7 @@ fn a_bit_test_on_memory_with_a_register_offset_reaches_outside_the_operand() {
 /// Point the core back at `at::CODE0` without disturbing anything else.
 fn rewind(pc: &Pc) {
     let mut regs = pc.cpu.regs();
-    regs.eip = at::CODE0;
+    regs.rip = at::CODE0;
     pc.cpu.set_regs(regs);
 }
 
@@ -3086,13 +3088,13 @@ fn the_a20_gate_masks_address_bit_twenty_and_nothing_else() {
     pc.write(at::CODE0, &[0xa0, 0x10, 0x00, 0x10, 0x00]);
     assert!(pc.cpu.a20_open(), "a core with no gate wired has bit 20");
     pc.cpu.step();
-    assert_eq!(pc.regs().eax & 0xff, 0xa5, "the megabyte above");
+    assert_eq!(pc.regs().rax & 0xff, 0xa5, "the megabyte above");
 
     pc.cpu.set_a20(false);
     rewind(&pc);
     pc.cpu.step();
     assert_eq!(
-        pc.regs().eax & 0xff,
+        pc.regs().rax & 0xff,
         0x5a,
         "with the gate shut, bit 20 never reaches memory"
     );
@@ -3102,7 +3104,7 @@ fn the_a20_gate_masks_address_bit_twenty_and_nothing_else() {
     pc.write(at::CODE0, &[0xa0, 0x10, 0x00, 0x20, 0x00]);
     rewind(&pc);
     pc.cpu.step();
-    assert_eq!(pc.regs().eax & 0xff, 0x3c);
+    assert_eq!(pc.regs().rax & 0xff, 0x3c);
 }
 
 #[test]
@@ -3153,4 +3155,849 @@ fn the_scheduler_budget_is_never_overshot_and_the_debt_is_paid_back() {
         total + pc.cpu.cycle_debt(),
         "clocks executed but not yet reported are exactly the debt"
     );
+}
+
+// ===========================================================================
+// Long mode
+// ===========================================================================
+
+/// x86-64: the mode transition, the four-level walk, and 64-bit execution.
+///
+/// Every test here is written from the *Intel SDM* volume 3 §9.8.5's
+/// activation sequence and volume 2's encoding rules, or from the *AMD64
+/// Architecture Programmer's Manual* volume 2 where AMD is clearer — each
+/// cited where the behaviour is not obvious. Nothing here was read off another
+/// emulator (`ROADMAP.md` §1).
+///
+/// The one that matters is
+/// [`a_guest_enters_long_mode_and_executes_64_bit_code`]: the others take
+/// pieces of it apart, but that one is a *guest* doing the whole thing for
+/// itself, from 32-bit protected mode through to a `REX.W` instruction storing
+/// through a `RIP`-relative address.
+mod long_mode {
+    use super::*;
+    use crate::core::state::StateReader;
+    use crate::cpu::x86::Features;
+    use crate::cpu::x86::paging::Mode;
+    use crate::cpu::x86::prot::{cr4, efer, msr};
+
+    /// Where the long-mode tests put their page tables and their code.
+    ///
+    /// Above the `at::` block so the two cannot collide.
+    mod la {
+        /// The four-level table's root.
+        pub(super) const PML4: u64 = 0x1_0000;
+        /// The page-directory-pointer table.
+        pub(super) const PDPT: u64 = 0x1_1000;
+        /// The page directory.
+        pub(super) const PD: u64 = 0x1_2000;
+        /// A page table, where a test wants 4 KiB granularity.
+        pub(super) const PT: u64 = 0x1_4000;
+        /// Where the 64-bit half of a program starts.
+        pub(super) const CODE64: u64 = 0x2_0000;
+        /// Where a 64-bit fault or interrupt handler starts.
+        pub(super) const HANDLER: u64 = 0x2_9000;
+        /// A second handler, for a test that needs two.
+        pub(super) const HANDLER2: u64 = 0x2_a000;
+        /// Scratch for a 64-bit program to store into.
+        pub(super) const MARK: u64 = 0x2_8000;
+    }
+
+    /// A 64-bit code segment: `L` set, `D` clear.
+    const CODE64_AR: u32 = ar::PRESENT | ar::S | ar::CODE | ar::RW | ar::L | ar::GRANULAR;
+
+    /// Present, writable, user — the flags a test's identity map uses.
+    const MAP: u64 = 0b111;
+
+    /// The `PS` bit, which turns a directory entry into a large page.
+    const PS: u64 = 1 << 7;
+
+    impl Pc {
+        fn write64(&self, addr: u64, value: u64) {
+            for i in 0..8u64 {
+                self.ram
+                    .write_u8(addr + i, (value >> (8 * i)) as u8)
+                    .unwrap();
+            }
+        }
+
+        fn read64(&self, addr: u64) -> u64 {
+            let mut value = 0u64;
+            for i in 0..8u64 {
+                value |= u64::from(self.ram.read_u8(addr + i).unwrap()) << (8 * i);
+            }
+            value
+        }
+
+        /// Write a **sixteen-byte** interrupt gate, which is what long mode's
+        /// interrupt descriptor table holds.
+        ///
+        /// Bytes 0-1 and 6-7 are the offset's low thirty-two bits split around
+        /// the selector and the access byte, exactly as a 32-bit gate does it;
+        /// bytes 8-11 are the offset's top half, and bytes 12-15 are reserved.
+        fn idt64(&self, vector: u64, selector: u16, offset: u64) {
+            let base = at::IDT + vector * 16;
+            let low = (offset as u32 & 0xffff) | (u32::from(selector) << 16);
+            let high = (offset as u32 & 0xffff_0000)
+                | ar::PRESENT
+                | (u32::from(sys_type::INT_GATE32) << 8);
+            self.write32(base, u64::from(low));
+            self.write32(base + 4, u64::from(high));
+            self.write32(base + 8, offset >> 32);
+            self.write32(base + 12, 0);
+        }
+
+        /// Build a four-level identity map of the first 4 MiB out of two 2 MiB
+        /// pages, add a 64-bit code descriptor at selector `0x18`, and give
+        /// the interrupt descriptor table room for sixteen-byte entries.
+        fn prepare_long(&self) {
+            self.write64(la::PML4, la::PDPT | MAP);
+            self.write64(la::PDPT, la::PD | MAP);
+            self.write64(la::PD, MAP | PS);
+            self.write64(la::PD + 8, 0x20_0000 | MAP | PS);
+            self.gdt(3, descriptor(0, 0xffff_ffff, CODE64_AR));
+            // A second, identical 64-bit code segment at selector `0x20`. A
+            // test that corrupts the first still needs an intact one for its
+            // fault handler to run in, because in long mode *every* gate
+            // target has to be a 64-bit code segment.
+            self.gdt(4, descriptor(0, 0xffff_ffff, CODE64_AR));
+            let mut sys = self.cpu.sys();
+            sys.idtr.limit = 0xfff;
+            self.cpu.set_sys(sys);
+        }
+    }
+
+    /// The 32-bit bring-up sequence, as an operating system writes it.
+    ///
+    /// *Intel SDM* volume 3 §9.8.5, "Initializing IA-32e Mode", in order:
+    /// paging off (it already is), `CR4.PAE`, `CR3`, `EFER.LME`, `CR0.PG`,
+    /// then a far jump to a code segment with `L` set. Every step is a real
+    /// instruction executed by the guest — the point is that nothing is done
+    /// for it from outside.
+    fn enter_long_mode_code(target: u64) -> Vec<u8> {
+        let mut code = Vec::new();
+        // mov eax, cr4 ; or eax, PAE ; mov cr4, eax
+        code.extend_from_slice(&[0x0f, 0x20, 0xe0]);
+        code.push(0x0d);
+        code.extend_from_slice(&(cr4::PAE as u32).to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x22, 0xe0]);
+        // mov eax, PML4 ; mov cr3, eax
+        code.push(0xb8);
+        code.extend_from_slice(&(la::PML4 as u32).to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x22, 0xd8]);
+        // mov ecx, IA32_EFER ; rdmsr ; or eax, LME ; wrmsr
+        code.push(0xb9);
+        code.extend_from_slice(&msr::EFER.to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x32]);
+        code.push(0x0d);
+        code.extend_from_slice(&(efer::LME as u32).to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x30]);
+        // mov eax, cr0 ; or eax, PG ; mov cr0, eax  — the transition itself
+        code.extend_from_slice(&[0x0f, 0x20, 0xc0]);
+        code.push(0x0d);
+        code.extend_from_slice(&cr0::PG.to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x22, 0xc0]);
+        // jmp 0x18:target — compatibility mode to 64-bit mode
+        code.push(0xea);
+        code.extend_from_slice(&(target as u32).to_le_bytes());
+        code.extend_from_slice(&0x18u16.to_le_bytes());
+        code
+    }
+
+    fn pc64() -> Pc {
+        Pc::new(Variant::X86_64)
+    }
+
+    /// Bring a core into 64-bit mode and run `code` there.
+    ///
+    /// The bring-up is the same every time and running it twenty times tests
+    /// nothing new, so it is factored out here and
+    /// [`a_guest_enters_long_mode_and_executes_64_bit_code`] is the one test
+    /// that walks through it explicitly.
+    fn run64(code: &[u8]) -> Pc {
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        pc.write(la::CODE64, code);
+        let steps = pc.run(200);
+        assert!(steps < 200, "the 64-bit program halted");
+        assert!(pc.cpu.sys().sixty_four(), "and did so in 64-bit mode");
+        pc
+    }
+
+    #[test]
+    fn a_guest_enters_long_mode_and_executes_64_bit_code() {
+        // The whole point of the exercise. Nothing below is set up from
+        // outside except the tables in memory: the processor starts in 32-bit
+        // protected mode and walks itself into 64-bit mode.
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+
+        let mut code = Vec::new();
+        // mov rax, 0x0123456789abcdef — the only 64-bit immediate x86 has.
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&0x0123_4567_89ab_cdefu64.to_le_bytes());
+        // mov rbx, rax — REX.W with no extension bit.
+        code.extend_from_slice(&[0x48, 0x89, 0xc3]);
+        // mov r15, rax — REX.WB, so the r/m field reaches a register the
+        // 32-bit encoding cannot name at all.
+        code.extend_from_slice(&[0x49, 0x89, 0xc7]);
+        // mov rcx, -1 — an imm32 sign-extended to sixty-four bits, which is
+        // what makes `Iz` a different operand from `Iv`.
+        code.extend_from_slice(&[0x48, 0xc7, 0xc1, 0xff, 0xff, 0xff, 0xff]);
+        // mov [rip + disp32], rax. The displacement is relative to the end of
+        // *this* instruction, so it can only be computed once its length is
+        // known — seven bytes.
+        let after = la::CODE64 + code.len() as u64 + 7;
+        let disp = i32::try_from(la::MARK as i64 - after as i64).expect("in range");
+        code.extend_from_slice(&[0x48, 0x89, 0x05]);
+        code.extend_from_slice(&disp.to_le_bytes());
+        code.push(0xf4); // hlt
+        pc.write(la::CODE64, &code);
+
+        let steps = pc.run(40);
+        assert!(steps < 40, "the program reached its hlt in {steps} steps");
+
+        let sys = pc.cpu.sys();
+        assert!(sys.long_mode(), "EFER.LMA is set by the write to CR0.PG");
+        assert!(sys.sixty_four(), "and CS.L put the core in 64-bit mode");
+        assert_eq!(sys.paging_mode(pc.cpu.config().features), Mode::Ia32e);
+        assert_eq!(sys.cr3, la::PML4);
+
+        let regs = pc.regs();
+        assert_eq!(regs.rax, 0x0123_4567_89ab_cdef, "a 64-bit immediate");
+        assert_eq!(regs.rbx, 0x0123_4567_89ab_cdef, "REX.W moved all of it");
+        assert_eq!(regs.r[7], 0x0123_4567_89ab_cdef, "REX.B reached R15");
+        assert_eq!(
+            regs.rcx,
+            u64::MAX,
+            "an imm32 sign-extended, not zero-filled"
+        );
+        assert_eq!(
+            pc.read64(la::MARK),
+            0x0123_4567_89ab_cdef,
+            "a RIP-relative store landed where the displacement pointed"
+        );
+    }
+
+    #[test]
+    fn setting_paging_without_the_address_extension_refuses_to_enter_long_mode() {
+        // SDM volume 3 §9.8.5 gives the order, and the processor enforces the
+        // step that matters rather than trusting software to follow it: the
+        // four-level walk *is* the PAE walk with a level added, so there is no
+        // long mode without `CR4.PAE`.
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        let mut sys = pc.cpu.sys();
+        sys.efer |= efer::LME;
+        sys.cr3 = la::PML4;
+        pc.cpu.set_sys(sys);
+        pc.idt(13, gate(0x08, 0x9000, sys_type::INT_GATE32, 0));
+        pc.write(0x9000, &[0xf4]);
+        // mov eax, cr0 ; or eax, PG ; mov cr0, eax
+        let mut code = alloc::vec![0x0f, 0x20, 0xc0, 0x0d];
+        code.extend_from_slice(&cr0::PG.to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x22, 0xc0]);
+        pc.write(at::CODE0, &code);
+        pc.run(10);
+        assert_eq!(pc.regs().rip, 0x9001, "the write to CR0 raised #GP");
+        assert!(!pc.cpu.sys().long_mode(), "and long mode was not entered");
+    }
+
+    #[test]
+    fn arming_long_mode_while_paging_is_on_is_refused() {
+        // The transition is defined only across a `CR0.PG` edge; allowing
+        // `LME` to move underneath a live page table would leave `LMA`
+        // describing a walk that never happened.
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        let mut sys = pc.cpu.sys();
+        sys.cr4 |= cr4::PAE;
+        sys.cr3 = la::PDPT;
+        sys.cr0 |= cr0::PG;
+        pc.cpu.set_sys(sys);
+        // A three-level identity map, so the guest keeps running while paged.
+        pc.write64(la::PDPT, la::PD | MAP);
+        pc.write64(la::PD, MAP | PS);
+        pc.write64(la::PD + 8, 0x20_0000 | MAP | PS);
+        pc.idt(13, gate(0x08, 0x9000, sys_type::INT_GATE32, 0));
+        pc.write(0x9000, &[0xf4]);
+        // mov ecx, EFER ; rdmsr ; or eax, LME ; wrmsr ; hlt
+        let mut code = alloc::vec![0xb9];
+        code.extend_from_slice(&msr::EFER.to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x32, 0x0d]);
+        code.extend_from_slice(&(efer::LME as u32).to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x30, 0xf4]);
+        pc.write(at::CODE0, &code);
+        pc.run(10);
+        assert_eq!(pc.regs().rip, 0x9001, "the WRMSR raised #GP");
+        assert_eq!(pc.cpu.sys().efer & efer::LME, 0);
+    }
+
+    #[test]
+    fn efer_lma_is_the_processors_bit_and_not_softwares() {
+        // Software writes `LME` and reads `LMA` back; writing `LMA` does
+        // nothing, which is what makes reading it a reliable way to ask what
+        // mode the processor is actually in.
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        // mov ecx, EFER ; mov eax, LMA|LME ; xor edx, edx ; wrmsr ; rdmsr ; hlt
+        let mut code = alloc::vec![0xb9];
+        code.extend_from_slice(&msr::EFER.to_le_bytes());
+        code.push(0xb8);
+        code.extend_from_slice(&((efer::LMA | efer::LME) as u32).to_le_bytes());
+        code.extend_from_slice(&[0x31, 0xd2, 0x0f, 0x30, 0x0f, 0x32, 0xf4]);
+        pc.write(at::CODE0, &code);
+        pc.run(10);
+        let regs = pc.regs();
+        assert_eq!(regs.rax & efer::LME, efer::LME, "LME took");
+        assert_eq!(regs.rax & efer::LMA, 0, "LMA did not");
+        assert_eq!(pc.cpu.sys().efer & efer::LMA, 0);
+    }
+
+    #[test]
+    fn clearing_the_address_extension_in_long_mode_is_refused() {
+        // The page tables would change shape under the processor's feet.
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        pc.idt64(13, 0x18, la::HANDLER);
+        pc.write(la::HANDLER, &[0xf4]);
+        // mov rax, cr4 ; and eax, ~PAE ; mov cr4, rax ; hlt
+        let mut code = alloc::vec![0x0f, 0x20, 0xe0, 0x25];
+        code.extend_from_slice(&(!(cr4::PAE as u32)).to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x22, 0xe0, 0xf4]);
+        pc.write(la::CODE64, &code);
+        pc.run(60);
+        assert!(pc.cpu.sys().long_mode(), "long mode survived the attempt");
+        assert_ne!(pc.cpu.sys().cr4 & cr4::PAE, 0, "and so did CR4.PAE");
+        assert_eq!(pc.regs().rip, la::HANDLER + 1, "#GP was taken");
+    }
+
+    #[test]
+    fn a_code_segment_may_not_be_both_long_and_big() {
+        // AMD64 volume 2 §4.8.1: `L = 1` with `D = 1` is invalid, because the
+        // defaults *are* the difference between the two submodes.
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        pc.gdt(3, descriptor(0, 0xffff_ffff, CODE64_AR | ar::DB));
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        pc.idt64(13, 0x20, la::HANDLER);
+        pc.write(la::HANDLER, &[0xf4]);
+        pc.write(la::CODE64, &[0xf4]);
+        pc.run(40);
+        assert!(pc.cpu.sys().long_mode(), "long mode was entered");
+        assert_eq!(pc.regs().rip, la::HANDLER + 1, "but the far jump was #GP");
+        assert_eq!(
+            pc.cpu.sys().seg(isa::seg::CS).selector & !3,
+            0x20,
+            "and the handler ran in the segment that was still valid"
+        );
+    }
+
+    #[test]
+    fn a_thirty_two_bit_write_zero_extends_and_a_narrower_one_does_not() {
+        // SDM volume 1 §3.4.1.1. The asymmetry is the most load-bearing rule
+        // in the whole register file, and the one a port from a 32-bit core
+        // has no reason to have.
+        let pc = run64(&[
+            0x48, 0xb8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // mov rax, -1
+            0x48, 0x89, 0xc3, // mov rbx, rax
+            0x48, 0x89, 0xc1, // mov rcx, rax
+            0x48, 0x89, 0xc2, // mov rdx, rax
+            0xbb, 0x78, 0x56, 0x34, 0x12, // mov ebx, 0x12345678  (zero-extends)
+            0x66, 0xb9, 0x34, 0x12, // mov cx, 0x1234       (preserves)
+            0xb2, 0x99, // mov dl, 0x99        (preserves)
+            0xf4,
+        ]);
+        let regs = pc.regs();
+        assert_eq!(regs.rbx, 0x1234_5678, "a 32-bit write cleared the top half");
+        assert_eq!(regs.rcx, 0xffff_ffff_ffff_1234, "a 16-bit write did not");
+        assert_eq!(regs.rdx, 0xffff_ffff_ffff_ff99, "nor did an 8-bit one");
+    }
+
+    #[test]
+    fn a_rex_prefix_renames_the_high_byte_registers() {
+        // SDM volume 2 §2.2.1.2: with *any* `REX` prefix — including `40`,
+        // which sets no bit — register numbers 4-7 name `SPL`, `BPL`, `SIL`
+        // and `DIL` instead of `AH`, `CH`, `DH` and `BH`.
+        let pc = run64(&[
+            0x48, 0x31, 0xe4, // xor rsp, rsp
+            0xb0, 0x5a, // mov al, 0x5a
+            0x40, 0x88, 0xc4, // mov spl, al   (REX with no bits set)
+            0x88, 0xc4, // mov ah, al    (no REX: the high byte)
+            0xf4,
+        ]);
+        let regs = pc.regs();
+        assert_eq!(regs.rsp, 0x5a, "the REX form wrote SPL");
+        assert_eq!(regs.rax & 0xffff, 0x5a5a, "the bare form wrote AH");
+    }
+
+    #[test]
+    fn rip_relative_addressing_counts_from_the_end_of_the_instruction() {
+        // SDM volume 2 §2.2.1.6. The displacement is added to the address of
+        // the *next* instruction, so an addressing mode's result depends on
+        // the length of the instruction containing it — unique in x86.
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        pc.write64(la::MARK, 0xdead_beef_cafe_f00d);
+        let mut code = Vec::new();
+        let after = la::CODE64 + 7;
+        let disp = i32::try_from(la::MARK as i64 - after as i64).expect("in range");
+        code.extend_from_slice(&[0x48, 0x8b, 0x05]); // mov rax, [rip+disp32]
+        code.extend_from_slice(&disp.to_le_bytes());
+        code.push(0xf4);
+        pc.write(la::CODE64, &code);
+        pc.run(60);
+        assert_eq!(pc.regs().rax, 0xdead_beef_cafe_f00d);
+    }
+
+    #[test]
+    fn the_stack_moves_eight_bytes_at_a_time_and_a_prefix_narrows_it() {
+        // SDM volume 2 §2.2.1.7: `PUSH` and `POP` have a *default* operand
+        // size of sixty-four in 64-bit mode. `REX.W` is redundant on them and
+        // `66` still narrows them to two.
+        let pc = run64(&[
+            0x48, 0xb8, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, // mov rax, …
+            0x48, 0x89, 0xe3, // mov rbx, rsp
+            0x50, // push rax
+            0x48, 0x89, 0xe1, // mov rcx, rsp
+            0x5a, // pop rdx
+            0x66, 0x50, // push ax   (66 narrows it)
+            0x48, 0x89, 0xe6, // mov rsi, rsp
+            0x66, 0x5f, // pop di
+            0xf4,
+        ]);
+        let regs = pc.regs();
+        assert_eq!(regs.rbx - regs.rcx, 8, "a bare push moved RSP by eight");
+        assert_eq!(regs.rdx, 0x8877_6655_4433_2211, "and popped all of it back");
+        assert_eq!(regs.rbx - regs.rsi, 2, "a 66-prefixed push moved it by two");
+        assert_eq!(regs.rdi & 0xffff, 0x2211);
+    }
+
+    #[test]
+    fn a_near_call_pushes_a_sixty_four_bit_return_address() {
+        // The displacement stays `rel32`, and the pointer it lands in is full
+        // width. Both halves of that are needed: an emulator that widened the
+        // displacement would desynchronise the instruction stream, and one
+        // that narrowed the return address would corrupt the stack.
+        let pc = run64(&[
+            0xe8, 0x08, 0x00, 0x00, 0x00, // call +8
+            0x48, 0xc7, 0xc3, 0x01, 0x00, 0x00, 0x00, // mov rbx, 1
+            0xf4, // hlt
+            // The callee reads the return address off the stack without
+            // disturbing it, so the `ret` still has one to use.
+            0x48, 0x8b, 0x04, 0x24, // mov rax, [rsp]
+            0xc3, // ret
+        ]);
+        let regs = pc.regs();
+        assert_eq!(
+            regs.rax,
+            la::CODE64 + 5,
+            "the pushed return address was the full sixty-four bits"
+        );
+        assert_eq!(regs.rbx, 1, "and the return landed on the next instruction");
+    }
+
+    #[test]
+    fn movsxd_replaced_arpl_and_sign_extends_a_doubleword() {
+        // `63 /r` was `ARPL`, which needs 16-bit segmentation and therefore
+        // cannot exist in 64-bit mode. Long mode reclaimed the encoding.
+        let pc = run64(&[
+            0x48, 0xc7, 0xc1, 0x00, 0x00, 0x00, 0x80, // mov rcx, -0x80000000
+            0x48, 0x63, 0xc1, // movsxd rax, ecx
+            0x63, 0xd9, // movsxd ebx, ecx  (no REX.W: a plain move)
+            0xf4,
+        ]);
+        let regs = pc.regs();
+        assert_eq!(regs.rax, 0xffff_ffff_8000_0000, "REX.W sign-extended");
+        assert_eq!(regs.rbx, 0x8000_0000, "without it the result zero-extends");
+    }
+
+    #[test]
+    fn the_encodings_long_mode_reclaimed_raise_invalid_opcode() {
+        // Each of these is a real instruction in every other mode and gone in
+        // this one — some because the encoding was taken, some because what
+        // they do has no meaning without 16-bit segmentation or packed
+        // decimal. Guessing wrong here executes something plausible instead of
+        // faulting, which is the failure that is hardest to find later.
+        for (opcode, name) in [
+            (0x06u8, "push es"),
+            (0x07, "pop es"),
+            (0x0e, "push cs"),
+            (0x16, "push ss"),
+            (0x1e, "push ds"),
+            (0x27, "daa"),
+            (0x2f, "das"),
+            (0x37, "aaa"),
+            (0x3f, "aas"),
+            (0x60, "pusha"),
+            (0x61, "popa"),
+            (0x62, "bound"),
+            (0x82, "the 80-group alias"),
+            (0x9a, "call far ptr16:32"),
+            (0xc4, "les"),
+            (0xc5, "lds"),
+            (0xce, "into"),
+            (0xd4, "aam"),
+            (0xd5, "aad"),
+            (0xd6, "salc"),
+            (0xea, "jmp far ptr16:32"),
+        ] {
+            let pc = pc64();
+            pc.start_protected();
+            pc.prepare_long();
+            pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+            pc.write(la::CODE64, &[opcode, 0x00, 0x00, 0x00, 0x00, 0x00]);
+            pc.idt64(6, 0x18, la::HANDLER);
+            pc.write(la::HANDLER, &[0xf4]);
+            pc.run(60);
+            assert_eq!(
+                pc.regs().rip,
+                la::HANDLER + 1,
+                "{name} raised #UD in 64-bit mode"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_canonical_address_faults_before_the_page_tables_are_consulted() {
+        // SDM volume 1 §3.3.7.1. Bits 63-48 must be a sign-extension of bit
+        // 47; the rule is what stops software storing a tag in the top bits
+        // and expecting the processor to ignore it.
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        pc.idt64(13, 0x18, la::HANDLER);
+        pc.write(la::HANDLER, &[0xf4]);
+        // mov rax, 0x0001_0000_0000_0000 ; mov rbx, [rax] ; hlt
+        let mut code = alloc::vec![0x48, 0xb8];
+        code.extend_from_slice(&0x0001_0000_0000_0000u64.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x8b, 0x18, 0xf4]);
+        pc.write(la::CODE64, &code);
+        pc.run(60);
+        assert_eq!(pc.regs().rip, la::HANDLER + 1, "#GP, not a page fault");
+        assert_eq!(pc.cpu.sys().cr2, 0, "and CR2 was never latched");
+    }
+
+    #[test]
+    fn an_interrupt_in_long_mode_takes_a_sixteen_byte_gate_and_iretq_returns() {
+        // SDM volume 3 §6.14: a 64-bit gate is sixteen bytes with a 64-bit
+        // offset, and the frame is five eight-byte words because `SS:RSP` is
+        // pushed whether or not the privilege level changed. An `IRET` that
+        // popped three would return to the wrong place — silently.
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        pc.idt64(0x40, 0x18, la::HANDLER);
+        // The handler marks a register and returns with a 64-bit IRET.
+        pc.write(
+            la::HANDLER,
+            &[0x48, 0xc7, 0xc3, 0x2a, 0x00, 0x00, 0x00, 0x48, 0xcf],
+        );
+        // int 0x40 ; mov rcx, 7 ; hlt
+        pc.write(
+            la::CODE64,
+            &[0xcd, 0x40, 0x48, 0xc7, 0xc1, 0x07, 0x00, 0x00, 0x00, 0xf4],
+        );
+        pc.run(80);
+        let regs = pc.regs();
+        assert_eq!(regs.rbx, 42, "the handler ran");
+        assert_eq!(regs.rcx, 7, "and IRETQ came back to the instruction after");
+        assert!(pc.cpu.sys().sixty_four(), "still in 64-bit mode");
+    }
+
+    #[test]
+    fn syscall_and_sysret_cross_the_boundary_without_the_descriptor_tables() {
+        // AMD64 volume 3, `SYSCALL`: the selectors come from `STAR` and the
+        // descriptors are architectural, so neither instruction reads memory.
+        // `RCX` takes the return address and `R11` the flags.
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        let mut sys = pc.cpu.sys();
+        sys.efer |= efer::SCE;
+        // `STAR[47:32]` is the kernel `CS`; `STAR[63:48]` is what `SYSRET`
+        // returns through.
+        sys.star = (0x0010u64 << 48) | (0x0018u64 << 32);
+        sys.lstar = la::HANDLER;
+        pc.cpu.set_sys(sys);
+        // The kernel side: mark a register, then return.
+        pc.write(
+            la::HANDLER,
+            &[0x48, 0xc7, 0xc3, 0x63, 0x00, 0x00, 0x00, 0x48, 0x0f, 0x07],
+        );
+        // syscall ; mov rdx, 9 ; hlt
+        pc.write(
+            la::CODE64,
+            &[0x0f, 0x05, 0x48, 0xc7, 0xc2, 0x09, 0x00, 0x00, 0x00, 0xf4],
+        );
+        pc.run(80);
+        let regs = pc.regs();
+        assert_eq!(regs.rbx, 0x63, "the kernel entry point ran");
+        assert_eq!(regs.rdx, 9, "and SYSRET came back to the next instruction");
+        assert_eq!(regs.cs & 3, 3, "at privilege level three");
+    }
+
+    #[test]
+    fn swapgs_exchanges_the_gs_base_with_the_kernels() {
+        // The one instruction a 64-bit kernel cannot do without: entered from
+        // user mode it has no register it can safely clobber, so finding its
+        // own per-CPU state has to be one atomic step.
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        let mut sys = pc.cpu.sys();
+        sys.gs_base = 0x1111_0000;
+        sys.segs[usize::from(isa::seg::GS)].base = 0x1111_0000;
+        sys.kernel_gs_base = la::MARK;
+        pc.cpu.set_sys(sys);
+        pc.write64(la::MARK, 0xfeed_face_0000_0001);
+        // swapgs ; mov rax, gs:[0] ; swapgs ; hlt
+        pc.write(
+            la::CODE64,
+            &[
+                0x0f, 0x01, 0xf8, // swapgs
+                0x65, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, // mov rax, gs:[0]
+                0x0f, 0x01, 0xf8, // swapgs
+                0xf4,
+            ],
+        );
+        pc.run(60);
+        assert_eq!(
+            pc.regs().rax,
+            0xfeed_face_0000_0001,
+            "GS reached the kernel area"
+        );
+        let sys = pc.cpu.sys();
+        assert_eq!(sys.gs_base, 0x1111_0000, "and the second swap put it back");
+        assert_eq!(sys.kernel_gs_base, la::MARK);
+    }
+
+    #[test]
+    fn the_no_execute_bit_stops_a_fetch_and_leaves_a_read_alone() {
+        // `EFER.NXE` turns bit 63 of an entry from reserved into
+        // execute-disable, and the fault it causes sets bit 4 of the error
+        // code — the one bit that tells a handler the access was a fetch.
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        // 4 KiB granularity for the first 2 MiB — which is where all of this
+        // test's code lives — so one page can be barred without taking the
+        // whole large page with it.
+        pc.write64(la::PD, la::PT | MAP);
+        for page in 0..512u64 {
+            pc.write64(la::PT + page * 8, (page * 0x1000) | MAP);
+        }
+        let barred = la::HANDLER;
+        let index = barred / 0x1000;
+        pc.write64(la::PT + index * 8, barred | MAP | (1 << 63));
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        let mut sys = pc.cpu.sys();
+        sys.efer |= efer::NXE;
+        pc.cpu.set_sys(sys);
+        pc.idt64(14, 0x18, la::HANDLER2);
+        pc.write(la::HANDLER2, &[0xf4]);
+        // A read of the barred page is fine; executing from it is not.
+        pc.write64(barred + 0x100, 0x5555_aaaa_5555_aaaa);
+        let mut code = alloc::vec![0x48, 0xb8];
+        code.extend_from_slice(&(barred + 0x100).to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x8b, 0x18]); // mov rbx, [rax]
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&barred.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xe0]); // jmp rax
+        pc.write(la::CODE64, &code);
+        pc.run(80);
+        assert_eq!(
+            pc.regs().rbx,
+            0x5555_aaaa_5555_aaaa,
+            "the read went through"
+        );
+        assert_eq!(pc.regs().rip, la::HANDLER2 + 1, "and the fetch faulted");
+        assert_eq!(
+            pc.cpu.sys().cr2,
+            barred,
+            "CR2 names the page that was barred"
+        );
+    }
+
+    #[test]
+    fn a_gigabyte_page_is_mapped_by_the_pointer_table_itself() {
+        // SDM volume 3 §4.5. A 1 GiB page is a pointer-table entry with `PS`
+        // set, and the offset is the low thirty bits — the same arithmetic as
+        // a 2 MiB page one level down, which is why the walk needs no special
+        // case for it.
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        pc.write64(la::PDPT, MAP | PS);
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        pc.write64(la::MARK, 0x0102_0304_0506_0708);
+        let mut code = alloc::vec![0x48, 0xb8];
+        code.extend_from_slice(&la::MARK.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x8b, 0x18, 0xf4]); // mov rbx, [rax] ; hlt
+        pc.write(la::CODE64, &code);
+        pc.run(60);
+        assert_eq!(pc.regs().rbx, 0x0102_0304_0506_0708);
+        assert_eq!(
+            pc.cpu.translate_debug(la::MARK),
+            DebugTranslation::Mapped(la::MARK),
+            "and the debug walk agrees, through the same code"
+        );
+    }
+
+    #[test]
+    fn physical_address_extension_translates_without_long_mode() {
+        // PAE is not a long-mode feature: a Pentium Pro had it, with three
+        // levels and a four-entry pointer table indexed by two bits. Long mode
+        // adds a fourth level on top rather than replacing anything, and this
+        // is the middle mode that proves the shared walk really is shared.
+        let pc = pc64();
+        pc.start_protected();
+        pc.write64(la::PDPT, la::PD | MAP);
+        pc.write64(la::PD, MAP | PS);
+        pc.write64(la::PD + 8, 0x20_0000 | MAP | PS);
+        let mut sys = pc.cpu.sys();
+        sys.cr4 |= cr4::PAE;
+        sys.cr3 = la::PDPT;
+        sys.cr0 |= cr0::PG;
+        pc.cpu.set_sys(sys);
+        assert_eq!(
+            pc.cpu.sys().paging_mode(pc.cpu.config().features),
+            Mode::Pae
+        );
+        pc.write32(at::MARK, 0x1234_5678);
+        // mov eax, [MARK] ; hlt
+        let mut code = alloc::vec![0xa1];
+        code.extend_from_slice(&(at::MARK as u32).to_le_bytes());
+        code.push(0xf4);
+        pc.write(at::CODE0, &code);
+        pc.run(10);
+        assert_eq!(pc.regs().rax, 0x1234_5678);
+        assert_eq!(
+            pc.cpu.translate_debug(at::MARK),
+            DebugTranslation::Mapped(at::MARK)
+        );
+    }
+
+    #[test]
+    fn a_long_mode_core_round_trips_through_a_snapshot() {
+        // The state model grew, so the snapshot had to grow with it. A `load`
+        // that quietly dropped `EFER` would leave a restored machine in
+        // compatibility mode executing 64-bit code, and nothing would say so.
+        let pc = run64(&[
+            0x48, 0xb8, 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01, // mov rax, …
+            0x49, 0x89, 0xc7, // mov r15, rax
+            0x49, 0x89, 0xc4, // mov r12, rax
+            0xf4,
+        ]);
+        let before = pc.regs();
+        let sys_before = pc.cpu.sys();
+        assert_ne!(before.r[7], 0, "there is something to lose");
+
+        let mut shape = MachineShape::new();
+        shape.add_device("/cpu0", "cpu.x86").unwrap();
+        let mut writer = StateWriter::new(shape);
+        {
+            let mut chunk = writer.chunk("/cpu0", "cpu.x86", 4).unwrap();
+            pc.cpu.save(&mut chunk).unwrap();
+        }
+        let bytes = writer.to_vec().unwrap();
+
+        pc.cpu.reset(ResetKind::Cold);
+        assert_ne!(pc.cpu.regs(), before);
+        assert!(!pc.cpu.sys().long_mode(), "a reset left long mode");
+
+        let reader = StateReader::new(&bytes).unwrap();
+        let (_, _, data) = reader.load_raw("/cpu0").unwrap();
+        let mut chunk = ChunkReader::new(data);
+        pc.cpu.load(&mut chunk).unwrap();
+        chunk.end().unwrap();
+
+        assert_eq!(pc.cpu.regs(), before, "every register came back");
+        assert_eq!(
+            pc.cpu.sys(),
+            sys_before,
+            "and so did EFER, CR4 and the MSRs"
+        );
+        assert!(pc.cpu.sys().sixty_four());
+
+        // And a second save of the restored state is byte-identical, which is
+        // what "an identical state hash" means for a chunk this shape.
+        let mut shape = MachineShape::new();
+        shape.add_device("/cpu0", "cpu.x86").unwrap();
+        let mut again = StateWriter::new(shape);
+        {
+            let mut chunk = again.chunk("/cpu0", "cpu.x86", 4).unwrap();
+            pc.cpu.save(&mut chunk).unwrap();
+        }
+        assert_eq!(bytes, again.to_vec().unwrap());
+    }
+
+    #[test]
+    fn the_disassembler_prints_the_sixty_four_bit_forms() {
+        // One table, one decoder: the disassembler follows the interpreter
+        // into 64-bit mode without a second opcode list.
+        use crate::cpu::x86::disasm::disassemble_as;
+        let at64 = |bytes: &[u8]| {
+            let d = disassemble_as(isa::Gen::I386, isa::Bits::B64, 0, 0x1000, bytes);
+            alloc::format!("{d}")
+        };
+        assert_eq!(at64(&[0x48, 0x89, 0xc3]), "mov rbx, rax");
+        assert_eq!(at64(&[0x49, 0x89, 0xc7]), "mov r15, rax");
+        assert_eq!(at64(&[0x4d, 0x89, 0xc7]), "mov r15, r8");
+        assert_eq!(at64(&[0x40, 0x88, 0xc4]), "mov spl, al");
+        assert_eq!(at64(&[0x88, 0xc4]), "mov ah, al");
+        assert_eq!(at64(&[0x48, 0x63, 0xc1]), "movsxd rax, ecx");
+        assert_eq!(at64(&[0x0f, 0x05]), "syscall");
+        assert_eq!(
+            at64(&[0x48, 0x8b, 0x05, 0x10, 0x00, 0x00, 0x00]),
+            "mov rax, [ds:rip+0x10]"
+        );
+        // And a reclaimed encoding disassembles as what it now is.
+        assert_eq!(at64(&[0x60]), "ud");
+    }
+
+    #[test]
+    fn the_extension_lattice_is_selected_rather_than_implied() {
+        // `ROADMAP.md` §6.1.1: a preset is a *name for a point in the
+        // lattice*, and narrowing one has to produce a core that really lacks
+        // the instruction rather than one that decodes it anyway.
+        let cfg = Config::X86_64.with_features(Features {
+            long: false,
+            pae: false,
+            nx: false,
+            syscall: false,
+            ..Features::X86_64
+        });
+        let pc = Pc::new(Variant::X86_64);
+        let cpu = Arc::new(X86::new(cfg));
+        let _ = &pc;
+        assert!(!cpu.config().features.long);
+        // A part with no long mode has no `EFER` either: `RDMSR` of it is
+        // `#GP`, which is exactly how a guest finds out.
+        assert!(cfg.features.validate().is_ok());
+
+        // And an impossible point is refused at construction rather than
+        // silently repaired.
+        let impossible = Features {
+            pae: false,
+            ..Features::X86_64
+        };
+        assert!(impossible.validate().is_err(), "long mode needs PAE");
+    }
 }

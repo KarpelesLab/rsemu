@@ -35,6 +35,16 @@
 //! concludes there is no drive there — which is what an unpopulated cable
 //! position does.
 //!
+//! # What the platter is
+//!
+//! [`medium`] is the seam between the protocol and the storage. A drive built
+//! from a media slot gets a `RamStore` and costs its whole capacity in host
+//! memory; one whose slot a host filled with a [`Medium`] gets that instead —
+//! `dev/blk` supplies a host file through `fstool`, so sparse raw, qcow2, DMG and
+//! LUKS images all work and nothing above [`AtaDisk`]'s five methods changes.
+//! **Both paths are supported**: the media slot is what keeps this device
+//! `no_std`, and the file is what keeps a 16 GiB drive out of RAM.
+//!
 //! # Sources
 //!
 //! The **AT Attachment with Packet Interface** standards from T13 — ATA/ATAPI-6
@@ -47,8 +57,10 @@
 //! system's ATA driver was opened** (`CLAUDE.md`, provenance).
 
 pub mod disk;
+pub mod medium;
 
 pub use disk::{Address, AtaDisk, Geometry, Identity, Position, Reg};
+pub use medium::{Medium, MediumSlot, Snapshot};
 
 /// The bay name a drive and an adapter get when neither says.
 pub const DEFAULT_BAY: &str = "ata0";

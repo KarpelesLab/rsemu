@@ -1439,6 +1439,9 @@ enum Window {
 struct Port {
     shared: Arc<Shared>,
     window: Window,
+    /// How many bytes this window decodes, so a 16-bit access that would run
+    /// off the end of it is refused rather than folded back inside.
+    len: u64,
 }
 
 impl Port {
@@ -1669,23 +1672,34 @@ fn attr_write_mask(index: usize) -> u8 {
     }
 }
 
+impl Port {
+    /// Whether an access of `len` bytes at `offset` is one this window answers.
+    ///
+    /// One byte, or two consecutive ones — see [`Port::constraints`].
+    fn spans(&self, offset: u64, len: usize) -> bool {
+        (1..=2).contains(&len) && offset.saturating_add(len as u64) <= self.len
+    }
+}
+
 impl MemOps for Port {
     fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
-        let [byte] = dst else {
+        if !self.spans(offset, dst.len()) {
             return Err(BusError::BadAccess);
-        };
+        }
         // Before anything is read, not after: the status register's answer is a
         // function of the tick, so the tick has to be the one this access
         // happens on.
         self.shared.sync(attrs);
-        *byte = self.read_register(offset, attrs.debug);
+        for (i, byte) in dst.iter_mut().enumerate() {
+            *byte = self.read_register(offset + i as u64, attrs.debug);
+        }
         Ok(())
     }
 
     fn write(&self, offset: u64, src: &[u8], attrs: MemAttrs) -> MemResult {
-        let [value] = src else {
+        if !self.spans(offset, src.len()) {
             return Err(BusError::BadAccess);
-        };
+        }
         if attrs.debug {
             // A debug write to the CRTC's data register would move the start
             // address and scroll the guest's screen, and one to 0x3c0 would
@@ -1694,15 +1708,28 @@ impl MemOps for Port {
             return Err(BusError::BadAccess);
         }
         self.shared.sync(attrs);
-        self.write_register(offset, *value);
+        for (i, value) in src.iter().enumerate() {
+            self.write_register(offset + i as u64, *value);
+        }
         Ok(())
     }
 
     fn constraints(&self) -> AccessConstraints {
-        // Eight-bit parts on an eight-bit bus. A wider access to a register
-        // pair is not a thing the hardware answers, and accepting one would
-        // invent an order between the two halves.
-        AccessConstraints::word(Width::U8, Endian::Little)
+        // Byte **and word**, and the word is not a convenience: a VGA sits on a
+        // 16-bit bus and its index/data pairs are laid out so that one
+        // `OUT DX, AX` writes both halves — index in AL, datum in AH. That is
+        // the idiom every VGA programming reference gives for the CRTC at
+        // 0x3d4, the sequencer at 0x3c4 and the graphics controller at 0x3ce
+        // (IBM's VGA documentation; FreeVGA, "Accessing the VGA Registers"),
+        // and it is what a real video BIOS emits. It invents no order between
+        // the halves: little-endian, low byte first, so the index is latched
+        // before the datum that uses it — which is the order the pair exists
+        // for.
+        //
+        // Naturally aligned, so a word access to the *data* half alone is
+        // still refused: that would be a 16-bit cycle an 8-bit slave splits,
+        // and nothing emits one.
+        AccessConstraints::word(Width::U8, Endian::Little).with_widths(Width::U8, Width::U16)
     }
 }
 
@@ -1772,6 +1799,7 @@ impl Video {
                 Arc::new(Port {
                     shared: Arc::clone(&shared),
                     window,
+                    len,
                 }) as Arc<dyn MemOps>,
             ))
         };
@@ -2283,6 +2311,12 @@ mod tests {
         Port {
             shared: Arc::clone(&video.shared),
             window,
+            len: match window {
+                Window::Crtc | Window::CrtcColour | Window::CrtcMono => CRTC_WINDOW_LEN,
+                Window::Status => STATUS_WINDOW_LEN,
+                Window::Mode => MODE_WINDOW_LEN,
+                Window::Vga => VGA_WINDOW_LEN,
+            },
         }
     }
 
@@ -2809,23 +2843,51 @@ mod tests {
     }
 
     #[test]
-    fn a_debug_write_is_refused_and_so_is_a_wide_access() {
+    fn a_debug_write_is_refused_and_so_is_an_access_wider_than_the_bus() {
         let video = device();
         assert!(
             port(&video, Window::Crtc)
                 .write(ADDRESS, &[0], MemAttrs::DEBUG)
                 .is_err()
         );
-        assert!(
-            port(&video, Window::Crtc)
-                .read(ADDRESS, &mut [0u8; 2], MemAttrs::DEFAULT)
-                .is_err()
-        );
+        // Wider than sixteen bits is not a cycle this bus carries.
         assert!(
             port(&video, Window::Vga)
                 .write(0, &[0u8; 4], MemAttrs::DEFAULT)
                 .is_err()
         );
+        // Nor is a sixteen-bit one that runs off the end of the window: the
+        // CRTC pair is two bytes, and the second half of a word access at the
+        // data register is somebody else's address.
+        assert!(
+            port(&video, Window::Crtc)
+                .write(DATA, &[0u8; 2], MemAttrs::DEFAULT)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn one_word_write_latches_the_index_and_the_datum() {
+        // The idiom every VGA reference gives and every video BIOS emits:
+        // `mov dx,3d4h; mov ax,(datum<<8)|index; out dx,ax`. Little-endian, so
+        // the index is the low byte and is latched first — which is the whole
+        // reason the pair is laid out this way.
+        let video = device();
+        port(&video, Window::Crtc)
+            .write(ADDRESS, &[0x0c, 0x12], MemAttrs::DEFAULT)
+            .expect("a word write to the index register is a VGA's own idiom");
+        assert_eq!(
+            video.shared.state.lock().crtc[0x0c],
+            0x12,
+            "R12, the start address high byte"
+        );
+        // And it reads back the same way: index in the low byte, datum in the
+        // high one.
+        let mut both = [0u8; 2];
+        port(&video, Window::Crtc)
+            .read(ADDRESS, &mut both, MemAttrs::DEFAULT)
+            .expect("and a word read of the pair");
+        assert_eq!(both, [0x0c, 0x12]);
     }
 
     #[test]

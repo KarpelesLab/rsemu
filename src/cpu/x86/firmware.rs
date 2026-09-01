@@ -85,6 +85,23 @@ impl MemOps for PortLog {
 
 #[test]
 fn a_pc_firmware_image_reaches_protected_mode_and_keeps_running() {
+    run_firmware(Variant::I80486);
+}
+
+/// The same image on an x86-64 part.
+///
+/// Long mode changes what `CPUID` reports, adds `CR4` and the model-specific
+/// registers, and widens every register in the file — so a firmware image that
+/// still runs unchanged is evidence that the widening did not disturb the
+/// 16- and 32-bit paths it spends all its time in. SeaBIOS probes `CPUID`
+/// early and takes different branches on what it finds, so this is not the
+/// same run with a different label on it.
+#[test]
+fn the_same_image_runs_on_a_sixty_four_bit_part() {
+    run_firmware(Variant::X86_64);
+}
+
+fn run_firmware(variant: Variant) {
     let Ok(path) = std::env::var("RSEMU_BIOS") else {
         println!(
             "firmware: set RSEMU_BIOS to a legacy PC BIOS image to run it on this \
@@ -127,7 +144,7 @@ fn a_pc_firmware_image_reaches_protected_mode_and_keeps_running() {
         .map(Region::io("ports", 0x1_0000, ports.clone()), 0)
         .expect("64 KiB fits in 16 bits");
 
-    let cpu = X86::new(Config::default().with_variant(Variant::I80486));
+    let cpu = X86::new(Config::default().with_variant(variant));
     cpu.attach_space(Arc::new(mem));
     cpu.attach_io_space(Arc::new(io));
 
@@ -157,9 +174,9 @@ fn a_pc_firmware_image_reaches_protected_mode_and_keeps_running() {
     let regs = cpu.regs();
     let sys = cpu.sys();
     println!(
-        "firmware: {executed} instructions; protected mode after {:?}; stopped at \
-         {:04x}:{:08x}",
-        protected_after, regs.cs, regs.eip
+        "firmware[{variant}]: {executed} instructions; protected mode after {:?}; \
+         stopped at {:04x}:{:08x}",
+        protected_after, regs.cs, regs.rip
     );
     println!("firmware: {regs}");
     println!(

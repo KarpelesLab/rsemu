@@ -70,6 +70,10 @@ pub mod dev;
 pub mod host;
 pub mod machine;
 
+#[cfg(feature = "float")]
+#[cfg_attr(docsrs, doc(cfg(feature = "float")))]
+pub mod float;
+
 #[cfg(feature = "ir")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ir")))]
 pub mod ir;
@@ -140,6 +144,9 @@ pub fn build_info() -> alloc::string::String {
     }
     if cfg!(feature = "dev-ata-disk") {
         features.push("dev-ata-disk");
+    }
+    if cfg!(feature = "dev-blk") {
+        features.push("dev-blk");
     }
     if cfg!(feature = "dev-pc-ide") {
         features.push("dev-pc-ide");

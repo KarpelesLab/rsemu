@@ -19,6 +19,14 @@
 //! fabric: it is an x86 host bridge's window onto it, and a machine with a
 //! different processor reaches the same configuration space a different way.
 //!
+//! [`Bars`] is the fifth, and it belongs to the function rather than to the
+//! fabric for the reason above: the six base address registers and the
+//! expansion ROM register are configuration space, but the windows they name
+//! are ordinary mappings in an ordinary address space, and a bridge never sees
+//! them. It is where the interesting problem lives — a BAR is a mapping that
+//! *moves*, from inside a configuration write — and [`bar`]'s module docs carry
+//! that argument.
+//!
 //! # Finding each other
 //!
 //! As in [`crate::bus::spi`] and [`crate::bus::i2c`]: a host bridge and the
@@ -29,12 +37,10 @@
 //!
 //! # What is deliberately not here yet
 //!
-//! * **Base address registers.** A BAR is a mapping that moves, and moving one
-//!   is a retopology performed from inside a config write — the case
-//!   `core::space`'s module docs open with. The mechanism exists
-//!   ([`remap`](crate::core::space::TopologyGuard::remap)); no function in this
-//!   tree has a BAR yet, so there is nothing to test one against and it is not
-//!   written.
+//! * **I/O BARs that decode.** The register is complete and firmware can size
+//!   and place one; mapping it is refused, because a configuration cycle
+//!   travels through the I/O space and so the try-lock that saves every other
+//!   case cannot help. [`bar`]'s module docs spell it out.
 //! * **Interrupt routing.** `INTA#`-`INTD#` and the `PIRQ` swizzle belong to a
 //!   south bridge, and there is not one.
 //! * **Type 1 cycles and PCI-to-PCI bridges.** [`Bdf`] carries a bus number so
@@ -48,8 +54,11 @@
 //! # Sources
 //!
 //! * *PCI Local Bus Specification, Revision 2.1* — §6.1 for the layout of
-//!   configuration space and §6.2 for the Type 00h header's fields; §3.7.4.1
-//!   for Configuration Mechanism #1, the `0xcf8`/`0xcfc` pair.
+//!   configuration space and §6.2 for the Type 00h header's fields, with
+//!   §6.2.2 for the Command register's space-enable bits and §6.2.5.1 and
+//!   §6.2.5.2 for the base address and expansion ROM registers; §3.7.4.1 for
+//!   Configuration Mechanism #1, the `0xcf8`/`0xcfc` pair; Appendix D for the
+//!   class codes.
 //! * *Intel 440FX PCIset: 82441FX PCI and Memory Controller (PMC) and 82442FX
 //!   Data Bus Accelerator (DBX)*, order number 290549-001 — §3.1.1 and §3.1.2
 //!   for `CONFADD` and `CONFDATA` as an actual host bridge implements them, and
@@ -57,8 +66,12 @@
 //!
 //! No emulator source was consulted for any of it (`CLAUDE.md`, provenance).
 
+pub mod bar;
+
 #[cfg(test)]
 mod tests;
+
+pub use bar::{Bar, BarKind, Bars};
 
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -180,11 +193,21 @@ pub trait PciFunction: fmt::Debug + Send + Sync {
 
 /// A PCI fabric: which function answers at which address.
 ///
-/// The lock is at [`LockRank::BUS`], which is what makes the ordering work: a
-/// configuration write may reach a device that retopologises, and `TOPOLOGY`
-/// sits above `BUS`. So the routing table is *read and released* before the
-/// function is called — never held across the call — which is the re-entrancy
-/// contract written as code.
+/// The routing table is *read and released* before the function is called —
+/// never held across the call — which is the re-entrancy contract written as
+/// code: a configuration write may reach a device that retopologises, and
+/// `TOPOLOGY` sits above everything here.
+///
+/// The lock is at [`LockRank::DEVICE`], **not** [`LockRank::BUS`], and the
+/// difference is not cosmetic. `space.rs` states the invariant this obeys: *"A
+/// CPU holds a `BUS`-ranked lock across the accesses it issues."* Every
+/// configuration cycle arrives from inside one — a guest `IN` on `0xcfc`
+/// reaches [`ConfigPorts`] through the address space with the core's execution
+/// mutex ([`LockRank::BUS`]) already held — so a `BUS`-ranked table here is
+/// unlockable by construction, and panics with `acquiring BUS while holding
+/// BUS` the first time real firmware enumerates the bus. `DEVICE` sits below
+/// `BUS` and above the `LEAF` locks each function holds, so the ladder runs the
+/// one direction calls travel.
 pub struct PciBus {
     functions: Mutex<BTreeMap<Bdf, Arc<dyn PciFunction>>>,
 }
@@ -211,7 +234,7 @@ impl PciBus {
     #[must_use]
     pub fn new() -> PciBus {
         PciBus {
-            functions: Mutex::with_rank(LockRank::BUS, BTreeMap::new()),
+            functions: Mutex::with_rank(LockRank::DEVICE, BTreeMap::new()),
         }
     }
 
@@ -648,11 +671,32 @@ pub mod config {
     pub const BIST: u16 = 0x0f;
     /// The first of the six Type 00h base address registers.
     pub const BAR0: u16 = 0x10;
+    /// Expansion ROM Base Address. 32 bits (Rev 2.1 §6.2.5.2).
+    pub const EXPANSION_ROM: u16 = 0x30;
+    /// Interrupt Line. 8 bits; which input of the interrupt controller this
+    /// function's pin was routed to. Firmware writes it, hardware ignores it.
+    pub const INTERRUPT_LINE: u16 = 0x3c;
+    /// Interrupt Pin. 8 bits, read-only: 0 for a function that has no
+    /// interrupt, 1-4 for `INTA#`-`INTD#`.
+    pub const INTERRUPT_PIN: u16 = 0x3d;
+
+    /// `COMMAND[0]`: the function responds to I/O space accesses (§6.2.2).
+    pub const COMMAND_IO: u16 = 0x0001;
+    /// `COMMAND[1]`: the function responds to memory space accesses (§6.2.2).
+    pub const COMMAND_MEMORY: u16 = 0x0002;
+    /// `COMMAND[2]`: the function may act as a bus master (§6.2.2).
+    pub const COMMAND_MASTER: u16 = 0x0004;
 
     /// Base class `0x06`: a bridge device (Rev 2.1 Appendix D).
     pub const CLASS_BRIDGE: u8 = 0x06;
     /// Sub-class `0x00` under [`CLASS_BRIDGE`]: a host bridge.
     pub const SUBCLASS_HOST_BRIDGE: u8 = 0x00;
+    /// Base class `0x03`: a display controller (Rev 2.1 Appendix D).
+    pub const CLASS_DISPLAY: u8 = 0x03;
+    /// Sub-class `0x00` under [`CLASS_DISPLAY`]: VGA-compatible. With
+    /// programming interface `0x00` that is class code `030000`, which is what
+    /// a firmware looks for when it goes hunting for the console.
+    pub const SUBCLASS_VGA: u8 = 0x00;
 
     /// Intel's vendor ID.
     pub const VENDOR_INTEL: u16 = 0x8086;

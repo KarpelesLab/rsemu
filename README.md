@@ -122,9 +122,12 @@ written in the machine file where the part is chosen rather than in any device
 model.
 
 A seventh, `pc-at`, is a complete IBM PC/AT chipset — cascaded 8259As, 8254,
-MC146818, 8042, two 8237As, MC6845/VGA text mode, µPD765A — with a
-user-supplied BIOS path in the QEMU style (`--bios`, `--vgabios`). No firmware
-is shipped and none will be.
+MC146818, 8042, two 8237As, MC6845/VGA text mode, µPD765A, an 82441FX host
+bridge with the PAM registers that shadow the BIOS, and a PCI display adapter
+whose expansion ROM BAR is where a firmware written this century looks for its
+video BIOS — with user-supplied firmware paths in the QEMU style (`--bios`,
+`--vgabios`). A real BIOS completes POST on it, runs the video option ROM, sets
+a text mode and boots a diskette. No firmware is shipped and none will be.
 
 Beside them are four synthetic boards, each the smallest machine that exercises
 one thing: `spi-panel` (a display path over SPI), `arm926` (an ARM926EJ-S with CP15,
@@ -132,7 +135,10 @@ the VMSAv5 MMU and a parameterised peripheral aperture, the starting point for
 a downstream SoC),
 `z80-mini` (the Z80's separate 64 KiB I/O space) and `m68k-mini` (a 68000 on a
 big-endian map). They model no products; they exist so those subsystems have
-somewhere real to run.
+somewhere real to run. `ne2k-mini` is the newest of them: a Z80 with an
+**NE2000 Ethernet card** on its port bus, whose ROM is a real driver — it runs
+the DP8390's initialisation procedure, builds a frame in card memory through
+the remote DMA window, transmits it, and takes the receive interrupt in mode 1.
 
 The framework underneath is complete: address spaces with priority and
 mirroring, an oscillator forest with exact intra-tree ratios, wires, devices,

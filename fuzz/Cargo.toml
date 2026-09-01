@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-pc", "dev-pc-apic", "dev-pc-hpet", "ir", "cpu-riscv-lift"]
+features         = ["std", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-blk", "dev-ne2000", "dev-pc", "dev-pc-apic", "dev-pc-hpet", "ir", "cpu-riscv-lift", "float"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -98,6 +98,19 @@ bench = false
 # frontend turns attacker-controlled guest bytes into IR. Paired with the
 # optimiser, because a DCE that removes a store, a charge, a dummy read or the
 # temporary a boundary names is a silent miscompile rather than a crash.
+# The NIC's 32 I/O ports, and the receive ring a guest programs behind them.
+# All four ring pointers are writable and the receive path does page arithmetic
+# with them, so what has to hold for an arbitrary configuration is that taking
+# in a frame is bounded work -- an unterminating wrap shows up here as a
+# timeout. The debug-read rule rides along: a debugger must not pop the remote
+# DMA window, clear a tally counter or trip the card's reset strap.
+[[bin]]
+name  = "ne2000_ports"
+path  = "fuzz_targets/ne2000_ports.rs"
+test  = false
+doc   = false
+bench = false
+
 [[bin]]
 name  = "ir_verify"
 path  = "fuzz_targets/ir_verify.rs"
@@ -113,6 +126,31 @@ bench = false
 [[bin]]
 name  = "riscv_lift"
 path  = "fuzz_targets/riscv_lift.rs"
+test  = false
+doc   = false
+bench = false
+
+# The one file rsemu parses that the *user* did not write: a disk image named on
+# the command line, whose header, refcount table and cluster lookup all run
+# before a single guest instruction does. CLAUDE.md asks for a fuzz target on
+# disk-image parsers by name; this is that surface, plus the bounds check that
+# has to hold whatever capacity the header claimed.
+[[bin]]
+name  = "blk_image"
+path  = "fuzz_targets/blk_image.rs"
+test  = false
+doc   = false
+bench = false
+
+# Soft float: the host FPU is an oracle only for nearest-even arithmetic with a
+# finite result, so this target checks those cases against it and everything
+# else -- the other four rounding attributes, the flags, NaN payloads and the
+# whole 80-bit path -- against properties that must hold whatever the answer
+# is. Reserved x87 encodings go in raw, because "not a value" is a case the
+# arithmetic has to survive rather than trust.
+[[bin]]
+name  = "float_ops"
+path  = "fuzz_targets/float_ops.rs"
 test  = false
 doc   = false
 bench = false
