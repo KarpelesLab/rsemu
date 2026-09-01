@@ -11,6 +11,8 @@
 //! | [`gpio`] | `st.gpio` | one general-purpose I/O port: `MODER`…`AFR`, the atomic `BSRR`, and the pin mux |
 //! | [`usart`] | `st.usart` | a USART/UART on the character-device seam, in both the F4 and the F7/H7 register layouts |
 //! | [`sdmmc`] | `st.sdmmc` | the H7 family's SDMMC host controller, its FIFO and its internal DMA |
+//! | [`spi`] | `st.spi` | the F4 family's SPI/I2S master, RM0090 §28 |
+//! | [`octospi`] | `st.octospi` | the L4+/H7A3/L5/U5 OCTOSPI, indirect and memory-mapped |
 //!
 //! # Which part
 //!
@@ -25,6 +27,11 @@
 //! it was written from: [`sdmmc`] is the H7's, RM0433, and is not the F4's
 //! SDIO. A model that quietly averaged two families would be a model of no
 //! real part.
+//!
+//! That applies with force to [`octospi`]: **RM0433's STM32H7 has a QUADSPI,
+//! not an OCTOSPI.** The OCTOSPI manuals are RM0432 (L4+), RM0455 and RM0468
+//! (H7A3/H7B3, H723), RM0438 (L5) and RM0456 (U5). Reaching for RM0433 because
+//! it says "H7" is the first mistake this peripheral invites.
 //!
 //! `no_std + alloc`, no `unsafe`, no dependencies.
 //!
@@ -41,6 +48,27 @@ pub mod usart;
 #[cfg(feature = "dev-stm32-sdmmc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-sdmmc")))]
 pub mod sdmmc;
+
+#[cfg(feature = "dev-stm32-i2c")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-i2c")))]
+pub mod i2c;
+
+#[cfg(feature = "dev-stm32-spi")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-spi")))]
+pub mod spi;
+
+#[cfg(feature = "dev-stm32-octospi")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-octospi")))]
+pub mod octospi;
+
+#[cfg(feature = "machine-spi-flash")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-spi-flash")))]
+pub mod demo;
+
+#[cfg(feature = "dev-stm32-octospi")]
+pub use octospi::Octospi;
+#[cfg(feature = "dev-stm32-spi")]
+pub use spi::Stm32Spi;
 
 use alloc::vec::Vec;
 
@@ -59,6 +87,12 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     usart::register(registry)?;
     #[cfg(feature = "dev-stm32-sdmmc")]
     sdmmc::register(registry)?;
+    #[cfg(feature = "dev-stm32-i2c")]
+    i2c::register(registry)?;
+    #[cfg(feature = "dev-stm32-spi")]
+    spi::register(registry)?;
+    #[cfg(feature = "dev-stm32-octospi")]
+    octospi::register(registry)?;
     Ok(())
 }
 
@@ -74,6 +108,12 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     usart::bind(bindings)?;
     #[cfg(feature = "dev-stm32-sdmmc")]
     sdmmc::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-i2c")]
+    i2c::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-spi")]
+    spi::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-octospi")]
+    octospi::bind(bindings)?;
     Ok(())
 }
 
@@ -86,5 +126,11 @@ pub fn schemas() -> Vec<ClassSchema> {
     out.extend([gpio::schema(), usart::schema()]);
     #[cfg(feature = "dev-stm32-sdmmc")]
     out.push(sdmmc::schema());
+    #[cfg(feature = "dev-stm32-i2c")]
+    out.push(i2c::schema());
+    #[cfg(feature = "dev-stm32-spi")]
+    out.push(spi::schema());
+    #[cfg(feature = "dev-stm32-octospi")]
+    out.push(octospi::schema());
     out
 }

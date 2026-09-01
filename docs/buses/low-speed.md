@@ -7,6 +7,7 @@ relevant to embedded and SoC machines rather than the PC or the consoles.
 | --- | --- | --- |
 | I²C / SMBus | NXP **UM10204** *I2C-bus specification and user manual* — search nxp.com for "UM10204" | The definitive document. SMBus adds timeouts and a command layer on top; SBS Forum publishes the SMBus specification |
 | SPI | No formal standard — Motorola's original application note plus each peripheral's datasheet | In practice the *device* datasheet is the specification: mode (CPOL/CPHA), word size, framing |
+| SPI NOR flash | Winbond **W25Q** datasheets; see [`storage.md`](storage.md) | The one SPI peripheral almost every board has, and the one whose *semantics* matter more than its framing |
 | 1-Wire | Analog Devices / Maxim device datasheets and application notes | Timing-defined protocol; the datasheet is authoritative |
 | MDIO | IEEE 802.3 Clause 22 / 45 | For PHY management behind Ethernet MACs |
 
@@ -40,6 +41,20 @@ controller that clocks it in bit by bit, and a GPIO pin a guest is toggling
 itself. `both_link_models_produce_identical_traffic` asserts that over all four
 CPOL/CPHA modes and both bit orders; `tests/spi_panel.rs` asserts it again at
 machine level, with a whole firmware image.
+
+### What the seam could not express, as of the serial-flash work
+
+Three things, each recorded where a future change would want them:
+
+- **A word format is fixed when `SlavePins` is built.** The only way to change
+  it afterwards is `SlavePins::reset`, which also abandons the chip select.
+- **A slave declares one mode, and some parts accept two.** A W25Q works in
+  mode 0 and mode 3 — they differ only in where SCK rests between frames — so
+  `flash.spinor` takes a `mode` property rather than the seam expressing "either".
+- **The fabric has one data line.** Dual and quad commands are decoded and
+  their byte streams are right, but nothing can say that a phase runs on two or
+  four wires, so they cost single-line time. A controller that cares is
+  measuring a bus width the fabric does not have.
 
 `SpiSlave::turnaround` covers the parts that answer in the *second half of the
 same word* rather than the next one — the ST7272A's read frame is `R A6..A0`

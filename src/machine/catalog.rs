@@ -197,6 +197,22 @@ pub static SPI_PANEL: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/spi-panel.machine"),
 };
 
+/// The `spi-flash` board, when this build has a hart, the SPI bus and the
+/// serial-flash devices.
+///
+/// A synthetic board rather than a product: the smallest machine that drives a
+/// serial flash *both* ways — indirectly, a byte at a time through an STM32 SPI
+/// master, and by executing straight out of an OCTOSPI memory-mapped window.
+/// The `firmware` slot takes whatever should be at the hart's reset vector.
+#[cfg(feature = "machine-spi-flash")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-spi-flash")))]
+pub static SPI_FLASH: CatalogEntry = CatalogEntry {
+    name: "spi-flash",
+    summary: "a serial-flash board: RV32, an STM32 SPI master, an OCTOSPI window and a W25Q part",
+    media: &["firmware"],
+    source: include_str!("../../machines/spi-flash.machine"),
+};
+
 /// A bare ARM926EJ-S SoC skeleton, when this build has an A-profile core.
 ///
 /// A synthetic board rather than a product: a boot ROM at the reset vector,
@@ -316,6 +332,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&SMS_PAL);
     #[cfg(feature = "machine-spi-panel")]
     out.push(&SPI_PANEL);
+    #[cfg(feature = "machine-spi-flash")]
+    out.push(&SPI_FLASH);
     #[cfg(feature = "machine-stm32f407")]
     out.push(&STM32F407);
     #[cfg(feature = "machine-z80-mini")]
@@ -356,6 +374,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::ppu::register(&mut reg)?;
     #[cfg(feature = "dev-nes-apu")]
     crate::dev::apu::register(&mut reg)?;
+    #[cfg(feature = "dev-at24c")]
+    crate::dev::atmel::register(&mut reg)?;
     #[cfg(feature = "dev-apple1")]
     crate::dev::apple1::register(&mut reg)?;
     #[cfg(feature = "cpu-arm-aprofile")]
@@ -370,7 +390,7 @@ pub fn registry() -> Result<Registry> {
     crate::cpu::riscv::register(&mut reg)?;
     #[cfg(feature = "dev-riscv")]
     crate::dev::riscv::register(&mut reg)?;
-    #[cfg(feature = "dev-flash-cfi")]
+    #[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
     crate::dev::flash::register(&mut reg)?;
     #[cfg(feature = "dev-sd-card")]
     crate::dev::sd::register(&mut reg)?;
@@ -384,7 +404,14 @@ pub fn registry() -> Result<Registry> {
     crate::bus::spi::controller::register(&mut reg)?;
     #[cfg(feature = "dev-st7272a")]
     crate::dev::sitronix::register(&mut reg)?;
-    #[cfg(any(feature = "dev-stm32", feature = "dev-stm32-sdmmc"))]
+    #[cfg(any(
+        feature = "dev-stm32",
+        feature = "dev-stm32-sdmmc",
+        feature = "dev-stm32-spi",
+        feature = "dev-stm32-octospi",
+        feature = "dev-stm32-i2c",
+        feature = "machine-spi-flash"
+    ))]
     crate::dev::stm32::register(&mut reg)?;
     #[cfg(feature = "dev-lcdc")]
     crate::dev::lcd::register(&mut reg)?;
@@ -436,6 +463,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::ppu::bind(&mut b)?;
     #[cfg(feature = "dev-nes-apu")]
     crate::dev::apu::bind(&mut b)?;
+    #[cfg(feature = "dev-at24c")]
+    crate::dev::atmel::bind(&mut b)?;
     #[cfg(feature = "dev-apple1")]
     crate::dev::apple1::bind(&mut b)?;
     #[cfg(feature = "cpu-arm-aprofile")]
@@ -450,7 +479,7 @@ pub fn bindings() -> Result<Bindings> {
     crate::cpu::riscv::bind(&mut b)?;
     #[cfg(feature = "dev-riscv")]
     crate::dev::riscv::bind(&mut b)?;
-    #[cfg(feature = "dev-flash-cfi")]
+    #[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
     crate::dev::flash::bind(&mut b)?;
     #[cfg(feature = "dev-sd-card")]
     crate::dev::sd::bind(&mut b)?;
@@ -464,7 +493,14 @@ pub fn bindings() -> Result<Bindings> {
     crate::bus::spi::controller::bind(&mut b)?;
     #[cfg(feature = "dev-st7272a")]
     crate::dev::sitronix::bind(&mut b)?;
-    #[cfg(any(feature = "dev-stm32", feature = "dev-stm32-sdmmc"))]
+    #[cfg(any(
+        feature = "dev-stm32",
+        feature = "dev-stm32-sdmmc",
+        feature = "dev-stm32-spi",
+        feature = "dev-stm32-octospi",
+        feature = "dev-stm32-i2c",
+        feature = "machine-spi-flash"
+    ))]
     crate::dev::stm32::bind(&mut b)?;
     #[cfg(feature = "dev-lcdc")]
     crate::dev::lcd::bind(&mut b)?;
@@ -507,6 +543,10 @@ pub fn classes() -> ClassTable {
     table.insert(crate::dev::ppu::schema());
     #[cfg(feature = "dev-nes-apu")]
     table.insert(crate::dev::apu::schema());
+    #[cfg(feature = "dev-at24c")]
+    for schema in crate::dev::atmel::schemas() {
+        table.insert(schema);
+    }
     #[cfg(feature = "dev-apple1")]
     for schema in crate::dev::apple1::schemas() {
         table.insert(schema);
@@ -525,7 +565,7 @@ pub fn classes() -> ClassTable {
     for schema in crate::dev::riscv::schemas() {
         table.insert(schema);
     }
-    #[cfg(feature = "dev-flash-cfi")]
+    #[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
     for schema in crate::dev::flash::schemas() {
         table.insert(schema);
     }
@@ -543,7 +583,14 @@ pub fn classes() -> ClassTable {
     for schema in crate::dev::sitronix::schemas() {
         table.insert(schema);
     }
-    #[cfg(any(feature = "dev-stm32", feature = "dev-stm32-sdmmc"))]
+    #[cfg(any(
+        feature = "dev-stm32",
+        feature = "dev-stm32-sdmmc",
+        feature = "dev-stm32-spi",
+        feature = "dev-stm32-octospi",
+        feature = "dev-stm32-i2c",
+        feature = "machine-spi-flash"
+    ))]
     for schema in crate::dev::stm32::schemas() {
         table.insert(schema);
     }
@@ -1229,6 +1276,8 @@ mod tests {
             // time by `dev::lcd::demo`, so it needs no toolchain either.
             #[cfg(feature = "machine-spi-panel")]
             ("spi-panel", "firmware") => crate::dev::lcd::demo::PANEL_DEMO,
+            #[cfg(feature = "machine-spi-flash")]
+            ("spi-flash", "firmware") => crate::dev::stm32::demo::SPI_FLASH_DEMO,
             // `B .` — the ARM branch-to-self, which is the whole four-byte
             // program needed to prove the board realizes and the core fetches.
             // `tests/arm926_board.rs` supplies the one that does something.

@@ -365,6 +365,73 @@ dev-sd-card = []
 # no dependencies.
 dev-stm32-sdmmc = ["dev-sd-card"]
 
+# Serial NOR flash (src/dev/flash/spinor.rs): a Winbond **W25Q**-class SPI part
+# -- the chip on the back of nearly every board with an SoC on the front. The
+# JEDEC id (9Fh), read (03h), fast read (0Bh) and the dual/quad forms, page
+# program (02h), 4 KiB sector / 32 KiB / 64 KiB block / chip erase, the three
+# status registers with their BUSY and WEL bits, the block-protection bits,
+# 3- and 4-byte addressing, continuous read mode, deep power-down and the
+# 66h/99h software reset. It is an `SpiSlave`, so the same model answers a
+# controller that hands it a word, one that clocks it bit by bit, and a guest
+# bit-banging GPIO -- and it carries the semantics that make flash *flash*: a
+# program can only clear bits, an erase costs a whole granule, and an
+# instruction cut short by the chip select is not executed at all. Written from
+# the Winbond W25Q128JV datasheet. Needs `bus-spi`.
+dev-flash-spinor = ["bus-spi"]
+# The I2C bus (src/bus/i2c): the fabric, in both modelling styles that
+# docs/buses/low-speed.md asks to be deliberate rather than accidental.
+# `transactional` hands a bus event to the slave in one call; `wired` makes SCL
+# and SDA two real wired-AND nets driven one edge per half bit period on the
+# scheduler, which is what guest firmware that bit-bangs the same pins through
+# GPIO needs. 7-bit and 10-bit addressing, START/repeated START/STOP, the
+# per-byte acknowledge in both directions, clock stretching, multi-master
+# arbitration and the general call. A peripheral implements the byte-level
+# `I2cSlave` once and gets the bit-level front end free. Written from NXP
+# UM10204 Rev. 7.0, cited by section. `no_std + alloc`, no dependencies.
+bus-i2c = []
+
+# The Atmel AT24C01D/02D I2C serial EEPROM (src/dev/atmel): 128 or 256 bytes on
+# two wires, and the smallest honest device that proves an I2C bus works. Byte
+# and page write with the in-page roll-over the datasheet warns about,
+# current-address / random / sequential read with whole-array roll-over, the
+# internally self-timed write cycle that makes acknowledge polling work, and the
+# WP pin sampled at the STOP condition. Written from Atmel-8871F, cited by
+# section. Needs `bus-i2c`.
+dev-at24c = ["bus-i2c"]
+
+# The STM32 I2C peripheral, **v1** -- the F1/F2/F4/L1 block with
+# CR1/CR2/OAR1/DR/SR1/SR2/CCR, not the completely different F0/F3/F7/H7 one with
+# TIMINGR and ISR/ICR. Master mode: the event sequence of RM0090 25.3.3 with its
+# exact read-SR1-then-do clearing rules, 7-bit and 10-bit addressing,
+# ACK/AF/ARLO/BUSY/MSL, CCR and DUTY as the real SCL timing, the peripheral's own
+# clock stretching, and the EV/ER interrupt outputs. Slave mode and SMBus are
+# deliberately absent and the module says so. Written from ST RM0090 Rev. 4
+# chapter 25, cited by section. Needs `bus-i2c` and `dev-stm32`.
+dev-stm32-i2c = ["dev-stm32", "bus-i2c"]
+
+
+# The STM32F4 SPI master (src/dev/stm32/spi.rs): CR1/CR2, SR, DR, CRCPR and the
+# software-slave-management bits, driving `bus-spi` as its controller. RM0090
+# §28 and that family only -- the H7's SPI shares a name with this one and
+# almost nothing else, which is why it would be another module rather than a
+# property. `no_std + alloc`, no dependencies.
+dev-stm32-spi = ["bus-spi"]
+
+# The OCTOSPI controller (src/dev/stm32/octospi.rs): the indirect mode, which
+# is another way to drive a serial flash, and the **memory-mapped** mode, which
+# maps the flash into the address space so code executes from it directly.
+# Written from RM0455/RM0456 and AN5050 -- note RM0433's STM32H7 has a QUADSPI
+# and not an OCTOSPI, which is the first mistake this peripheral invites.
+# `no_std + alloc`, no dependencies.
+dev-stm32-octospi = ["bus-spi"]
+
+# The `spi-flash` demo board (machines/spi-flash.machine plus the classes it
+# names): a hart, RAM, an STM32 SPI master and an OCTOSPI, and a W25Q-class
+# SPI-NOR part on the bus -- the smallest machine that exercises a serial flash
+# both ways, indirectly through a controller and by executing out of a
+# memory-mapped window. Adds no dependencies.
+machine-spi-flash = ["cpu-riscv", "dev-stm32-spi", "dev-stm32-octospi", "dev-flash-spinor"]
+
 # The RISC-V `virt` board as a machine (machines/riscv-virt.machine plus the
 # classes it names): the first machine rsemu can boot real system software on.
 # `rsemu run riscv-virt --firmware fw.bin` loads an image at 0x80000000, hands
@@ -408,7 +475,7 @@ dev-stm32 = []
 # interrupt on a core whose NVIC is inside it" -- `wire usart2.irq -> cpu.irq38`,
 # with the number coming from RM0090 Table 62 and living in this file rather
 # than in any device model. Adds no dependencies.
-machine-stm32f407 = ["cpu-arm-v7m", "dev-stm32"]
+machine-stm32f407 = ["cpu-arm-v7m", "dev-stm32", "dev-stm32-i2c", "dev-at24c"]
 
 # The Zilog Z80 core (src/cpu/z80): a cycle-accurate interpreter covering the
 # base, CB, ED, DD/FD and DDCB/FDCB pages, the undocumented IX/IY halves, SLL

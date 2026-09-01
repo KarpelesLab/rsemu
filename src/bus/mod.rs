@@ -43,6 +43,10 @@
 //! becomes the fabric's registry and every device-facing signature here stays
 //! as it is.
 
+#[cfg(feature = "bus-i2c")]
+#[cfg_attr(docsrs, doc(cfg(feature = "bus-i2c")))]
+pub mod i2c;
+
 #[cfg(feature = "bus-spi")]
 #[cfg_attr(docsrs, doc(cfg(feature = "bus-spi")))]
 pub mod spi;

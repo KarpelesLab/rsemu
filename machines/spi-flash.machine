@@ -1,0 +1,176 @@
+# spi-flash — a board with a serial NOR flash you can execute out of.
+#
+#   rsemu run spi-flash
+#   rsemu run spi-flash --media firmware=fw.bin
+#
+# The smallest machine that exercises the whole serial-flash path: a hart, some
+# RAM, a Winbond W25Q-class part on an SPI bus, an STM32F4 SPI peripheral that
+# talks to it a byte at a time, and an OCTOSPI whose **memory-mapped window
+# puts the flash in the address space** so the hart can fetch instructions
+# straight out of it.
+#
+# It models no product. It exists so the flash and the two controllers have
+# somewhere real to run, and so `rsemu run spi-flash` proves the interesting
+# claim: the demo firmware programs a payload into the flash over SPI and then
+# jumps into the OCTOSPI window and executes it. Every one of those fetches is
+# a real `0Bh` frame clocked down the bus to the flash model.
+#
+# ---------------------------------------------------------------------------
+# The deliberate oddity
+# ---------------------------------------------------------------------------
+#
+# **Two masters, one bus, one flash.** A product would wire the part to one
+# controller; this board hangs both on it so a single firmware image can
+# demonstrate both peripherals against the same array — read the identifier
+# with the STM32 SPI, then program and execute through the OCTOSPI. It is
+# electrically expressible (two masters, one slave, tri-stated) and nobody
+# would design it. The firmware serialises them: it clears the SPI's `SPE`,
+# which raises `NSS` and releases the chip select, before the OCTOSPI touches
+# the bus.
+#
+# ---------------------------------------------------------------------------
+# The one decision this file is written to make explicit
+# ---------------------------------------------------------------------------
+#
+# `docs/buses/low-speed.md` asks for it by name, and both controllers here take
+# `link` as a required property with no default.
+#
+#   link = "transactional"   the default here, and the only value the OCTOSPI
+#                            can take: a memory-mapped access happens inside a
+#                            guest load, and pacing edges through the scheduler
+#                            while the CPU is mid-access is not something the
+#                            core can express.
+#
+#   link = "wired"           available on `spi1` alone, and only when its pins
+#                            are wired to the flash's instead of both meeting
+#                            through the named bus. This board does not do that
+#                            — `machines/spi-panel.machine` is where the wired
+#                            model is exercised end to end.
+#
+# ---------------------------------------------------------------------------
+# What is modelled, and what is not
+# ---------------------------------------------------------------------------
+#
+# The flash's **program and erase semantics are real**: a program can only
+# clear bits, an erase costs a whole granule, and an instruction interrupted by
+# the chip select rising is not executed at all. What is *not* modelled is
+# time — a page program and a sector erase complete inside the frame that
+# commits them, so `BUSY` reads clear on the first poll. `src/dev/flash/spinor.rs`
+# argues why: the part has no clock input a board wires, and a slave is reached
+# from inside its controller's own catch-up, where arming a scheduler event is
+# not available.
+#
+# The dual and quad read commands are decoded and their byte streams are right,
+# but `bus::spi` has one data line, so they cost single-line time. This board's
+# firmware uses `03h` and `0Bh`, where the question does not arise.
+
+machine "spi-flash" {
+  # Which named SPI bus the controllers and the flash meet on, so that two of
+  # these can run in one process without talking over each other.
+  param spibus = "spi0"
+
+  # How big the flash part is. The firmware programs the OCTOSPI's DEVSIZE to
+  # match, so changing this alone is not enough — see `src/dev/stm32/demo.rs`.
+  param flashsize = 1M
+
+  # How much RAM the board has.
+  param ram = 64K
+
+  # Where the OCTOSPI's memory-mapped window lands. `0x90000000` is where an
+  # STM32's OCTOSPI1 answers (AN5050 §3.3.3); the address belongs to the board
+  # rather than to the peripheral, which is why it is written here.
+  param window = 0x90000000
+
+  # -- the crystal -----------------------------------------------------------
+  #
+  # One, because the board has one: everything on it runs from the same system
+  # clock. The flash has no clock input to give a domain to.
+  osc sysclk = 100000000 Hz
+
+  # -- the bus ---------------------------------------------------------------
+  #
+  # One flat 32-bit space. `unassigned` is left at its default of `fault`, so
+  # an access to a hole is a fault the guest can see rather than a
+  # plausible-looking zero.
+  space mem { width = 32 }
+
+  # -- the hart --------------------------------------------------------------
+  #
+  # RV32IMA, which is enough to run a firmware image and nothing more. There is
+  # no interrupt controller on this board and nothing raises one: both
+  # controllers here are polled, and their `irq` pins are left unwired.
+  object cpu "cpu.riscv" {
+    clock  = sysclk
+    space  = mem
+    engine = "interp"
+    xlen   = "rv32"
+    isa    = "ima"
+    hartid = 0
+    reset  = 0x00000000
+  }
+
+  # -- memory ----------------------------------------------------------------
+  #
+  # 64 KiB of firmware ROM at zero, which is where the hart starts. `image`
+  # names a media slot: whoever runs the machine binds the bytes
+  # (`--media firmware=fw.bin`), and nothing below host/ opens a file.
+  object fw "rom" { size = 64K, image = "firmware" }
+
+  object dram "ram" { size = ram }
+
+  # -- the flash -------------------------------------------------------------
+  #
+  # A W25Q-class part. It powers up erased; the `image` slot is left unbound so
+  # the firmware has something to program. No `clock`: see the note above.
+  object nor "flash.spinor" {
+    size = flashsize
+    bus  = spibus
+    cs   = 0
+  }
+
+  # -- the STM32F4 SPI peripheral --------------------------------------------
+  #
+  # Clocked from the system clock, so a frame's duration is counted in the same
+  # ticks the hart's instructions are: RM0090 §28.5.1's divisor is 2^(BR+1), so
+  # the firmware's BR = 3 makes one bit sixteen sysclk ticks.
+  object spi1 "stm32.spi" {
+    clock = sysclk
+    link  = "transactional"
+    bus   = spibus
+    cs    = 0
+  }
+
+  # -- the OCTOSPI -----------------------------------------------------------
+  #
+  # No clock: it takes no time. A memory-mapped access completes inside the
+  # guest load that made it, which `src/dev/stm32/octospi.rs` explains.
+  object qspi "stm32.octospi" {
+    link   = "transactional"
+    bus    = spibus
+    cs     = 0
+    window = flashsize
+  }
+
+  # -- the memory map --------------------------------------------------------
+  map mem 0x00000000 size 64K = fw     # reset vector and firmware
+  map mem 0x20000000 size ram = dram   # RAM, where the payload leaves its mark
+
+  # The flash, as the CPU sees it. `r-x` because that is what a board executing
+  # in place wants and what the OCTOSPI's read path provides; a store here goes
+  # to the *write* register set (`WCCR`/`WIR`), which this board never programs.
+  #
+  # Note `Perms::EXEC` is carried rather than enforced today (`core::space`), so
+  # the `x` is a statement of intent that a fetch-marking core will one day
+  # check. The `-w-` half is real: a write is refused by the decode.
+  map mem window size flashsize = qspi.mem { perms = "r-x" }
+
+  # Both register blocks are a kilobyte, which is the slot an STM32 peripheral
+  # occupies on its bus.
+  map mem 0xf0000000 size 1K = spi1
+  map mem 0xf0001000 size 1K = qspi
+
+  # Not wired, and deliberately: `spi1.irq` and `qspi.irq`. This board polls,
+  # and a net nothing listens to would be three lines saying nothing. A board
+  # with a Cortex-M writes `wire spi1.irq -> cpu.irq35` instead, with the number
+  # out of that part's vector table.
+}

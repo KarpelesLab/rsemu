@@ -65,6 +65,27 @@ machine "stm32f407" {
   # in one process without typing at each other (`-p console=b`).
   param console = "console"
 
+  # Which modelling style the I2C link uses, and which named bus it meets its
+  # devices on. `docs/buses/low-speed.md` asks for the first of these not to be
+  # made by accident, so `st.i2c` refuses to default it and this file chooses:
+  #
+  #   i2clink = "wired"          the default. SCL and SDA are two real
+  #                              open-drain nets, wired-AND across every driver,
+  #                              one edge per half bit period on the scheduler.
+  #                              Clock stretching and arbitration are levels on
+  #                              those nets rather than flags, and anything else
+  #                              on the board can watch them.
+  #
+  #   i2clink = "transactional"  one call per bus event straight to the device.
+  #                              Faster, and indistinguishable to firmware that
+  #                              only drives the peripheral.
+  #
+  # **A transfer costs the same virtual time either way** -- `bus::i2c` fixes
+  # the half-period count of a START, a byte and a STOP, and `CCR` decides what
+  # a half period lasts -- so firmware that polls `SR1` sees one timeline.
+  param i2clink = "wired"
+  param i2cbus  = "i2c1"
+
   # How much flash the part has: 1 MiB on the -VG suffix, 512 KiB on a -VE.
   param flash = 1M
 
@@ -76,6 +97,48 @@ machine "stm32f407" {
   param sram1 = 112K
   param sram2 = 16K
   param ccm   = 64K
+
+  #
+  # The **I2C v1** block: the one an F1, F2, F4 or L1 carries, with `CR1`/`CR2`,
+  # `OAR1`, `DR`, `SR1`/`SR2` and `CCR`. An F0, F3, F7 or H7 has a completely
+  # different peripheral of the same name, with `TIMINGR`, `ISR` and `ICR`, and
+  # firmware for one does not run on the other -- so it is a separate class
+  # rather than a property. `src/dev/stm32/i2c.rs` sets out the fork.
+  #
+  # On APB1, which the clock tree puts at SYSCLK/4 = 42 MHz (RM0090 7.2). The
+  # peripheral's `CR2.FREQ` field is firmware telling the hardware that number;
+  # the number the *emulator* acts on is this clock, which is why `FREQ` is
+  # register storage and this line is not.
+  object i2c1 "st.i2c" {
+    clock = hse * 21 / 4
+    link  = i2clink
+    bus   = i2cbus
+  }
+
+  # -- the EEPROM, which the Discovery board does not have -------------------
+  #
+  # **The one part in this file that is not on the real hardware**, and it is
+  # here for the reason `machines/spi-panel.machine` exists at all: a bus with
+  # nothing on it proves nothing. An AT24C02 on PB6/PB7 is what a person wires
+  # to the Discovery board's header when they want to try I2C, and it is the
+  # smallest device that exercises addressing, the direction bit, the per-byte
+  # acknowledge, the repeated START and a device's own internal timing.
+  #
+  # `chip = 0` ties A2/A1/A0 low, so it answers 0x50 (datasheet 4.1,
+  # Table 4-1). Its clock is a 1 MHz domain derived from the same crystal, so
+  # `write-ticks` -- the internally self-timed write cycle of datasheet 5.4 --
+  # is in microseconds: the default 5000 is the 5 ms maximum the part specifies.
+  # An acknowledge-polling driver (5.3) sees exactly that.
+  #
+  # `wp` is left unwired, and that is *not* an invented level: Table 1-1's note
+  # 1 says the pin is internally pulled down when nothing drives it, and 5.5's
+  # Table 5-1 makes a grounded `WP` mean no protection. A board that wants
+  # hardware write protection wires `eeprom.wp` to a GPIO.
+  object eeprom "atmel.at24c" {
+    clock = hse / 8
+    chip  = 0
+    bus   = i2cbus
+  }
 
   # -- where everything is ---------------------------------------------------
   #
@@ -224,6 +287,7 @@ machine "stm32f407" {
   # the kilobyte is a **hole** rather than a mirror — which is what the part
   # does, and what makes a wrong offset a fault instead of a plausible answer.
   map mem apb1-base + usart2-off size 0x2c = usart2
+  map mem 0x40005400 size 0x28  = i2c1
 
   # The six ports the LQFP100 bonds, at A + n * 0x400: A, B, C, D, E, then H,
   # which is 7. F, G and I exist on the die and have no pins in this package.
@@ -257,4 +321,16 @@ machine "stm32f407" {
   # have nothing to carry. The GPIO's alternate-function inputs exist for the
   # peripherals whose pin genuinely is a level — an SPI clock, a chip select, a
   # timer's compare output.
+
+  # -- I2C: the interrupt pair, then the two open-drain nets -----------------
+  #
+  # Each of SCL and SDA is *two* statements, because on a board it is one wire
+  # every device may pull low; `bus::i2c::wires` resolves that as a wired-AND,
+  # so clock stretching and arbitration are levels rather than flags.
+  wire i2c1.ev -> cpu.irq31
+  wire i2c1.er -> cpu.irq32
+  wire i2c1.scl   -> eeprom.scl
+  wire eeprom.scl -> i2c1.scl
+  wire i2c1.sda   -> eeprom.sda
+  wire eeprom.sda -> i2c1.sda
 }

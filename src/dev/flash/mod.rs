@@ -8,6 +8,12 @@
 //! | Module | Feature | Covers |
 //! | --- | --- | --- |
 //! | [`cfi`] | `dev-flash-cfi` | parallel NOR flash: the CFI query and the Intel/Sharp command set |
+//! | [`spinor`] | `dev-flash-spinor` | serial NOR flash: a Winbond W25Q on the SPI bus |
+//!
+//! The two share their *semantics* — a program clears bits, an erase costs a
+//! whole granule, and a read during a command answers with something other
+//! than the array — and share nothing else, because a parallel part is an
+//! address window and a serial part is a frame on four wires.
 //!
 //! `no_std + alloc`, no dependencies. The backing store is a **media slot**,
 //! the same seam a firmware image or a NES cartridge arrives through, rather
@@ -16,9 +22,17 @@
 //! disk-image crate would drag `std` into a `no_std` device to gain nothing
 //! (`CLAUDE.md`, "`no_std`").
 
+#[cfg(feature = "dev-flash-cfi")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-flash-cfi")))]
 pub mod cfi;
+#[cfg(feature = "dev-flash-spinor")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-flash-spinor")))]
+pub mod spinor;
 
+#[cfg(feature = "dev-flash-cfi")]
 pub use cfi::Cfi;
+#[cfg(feature = "dev-flash-spinor")]
+pub use spinor::SpiNor;
 
 /// Add every flash class to a registry.
 ///
@@ -26,7 +40,12 @@ pub use cfi::Cfi;
 ///
 /// [`Error::Config`](crate::core::Error::Config) if a name is already claimed.
 pub fn register(registry: &mut crate::core::Registry) -> crate::core::Result<()> {
-    cfi::register(registry)
+    // At least one of the two is on, or this module would not be compiled.
+    #[cfg(feature = "dev-flash-cfi")]
+    cfi::register(registry)?;
+    #[cfg(feature = "dev-flash-spinor")]
+    spinor::register(registry)?;
+    Ok(())
 }
 
 /// Bind every flash class into the machine graph.
@@ -35,11 +54,24 @@ pub fn register(registry: &mut crate::core::Registry) -> crate::core::Result<()>
 ///
 /// As [`register`].
 pub fn bind(bindings: &mut crate::machine::Bindings) -> crate::core::Result<()> {
-    cfi::bind(bindings)
+    #[cfg(feature = "dev-flash-cfi")]
+    cfi::bind(bindings)?;
+    #[cfg(feature = "dev-flash-spinor")]
+    spinor::bind(bindings)?;
+    Ok(())
 }
 
 /// Every flash class's validator schema.
 #[must_use]
 pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
-    alloc::vec![cfi::schema()]
+    let mut out = alloc::vec::Vec::new();
+    #[cfg(feature = "dev-flash-cfi")]
+    {
+        out.push(cfi::schema());
+    }
+    #[cfg(feature = "dev-flash-spinor")]
+    {
+        out.push(spinor::schema());
+    }
+    out
 }
