@@ -918,11 +918,13 @@ fn a_machine_file_names_the_core_gives_it_two_spaces_and_it_runs() {
         Ok(m) => m,
         Err(e) => panic!("the board does not realize: {e}"),
     };
-    // Five microseconds at 4.77 MHz is about two dozen clocks, which is the
-    // reset sequence plus three instructions with room to spare. A span rather
-    // than a step count, because the scheduler hands out budgets.
+    // Two milliseconds at 4.77 MHz is thousands of clocks, which is the reset
+    // sequence plus three instructions with room to spare. A span rather than a
+    // step count, because the scheduler hands out budgets — and at least one
+    // whole scheduling round, because `run_for` runs whole rounds and a shorter
+    // span on a board with no periodic device would run none of it (§11.6).
     machine
-        .run_for(crate::core::clock::GlobalTime::from_nanos(500_000))
+        .run_for(crate::core::clock::GlobalTime::from_nanos(2_000_000))
         .expect("it runs");
     let port = machine.space("port").expect("the I/O space");
     assert_eq!(

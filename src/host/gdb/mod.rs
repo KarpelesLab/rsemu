@@ -44,7 +44,7 @@
 //! to here, because the session loop and the machine share one thread: virtual
 //! time advances only inside [`DebugTarget::resume`] and
 //! [`DebugTarget::step`], both called from [`GdbServer::poll`] and never while a
-//! packet is being answered. `Machine::run_until` returns at a quantum boundary
+//! packet is being answered. `Machine::step_until` returns at a scheduling stop
 //! with every runnable unwound back to the scheduler — the safe point of §4.7 in
 //! the `Deterministic` threading mode, which is the only mode `Machine` drives.
 //! When the parallel mode lands, the same call site is where its stop-the-world

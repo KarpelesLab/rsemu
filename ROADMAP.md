@@ -1816,34 +1816,59 @@ replays bit-identically under a native debugger. That is a genuinely unusual
 property and it falls straight out of §0 — but only if nothing in `core/` ever
 reads the host clock (§15).
 
-**It is not true yet, and the reason is worth stating rather than discovering.**
-`Machine::run_for` is **not additive**: running for a span, and running for the
-same span in pieces, reach *different* states.
-`Scheduler::run_quantum_deterministic` picks
-`target = min(now + quantum, limit, next_event)`, so an intermediate deadline
-**truncates a quantum**, and that truncation is a scheduling boundary the single
-span never had. The browser advances frame by frame; `rsemu run --for` advances
-one span; so today they diverge by construction.
-
+**`Machine::run_for` is additive**, and that took a real scheduler change.
 `tests/run_for_additive.rs` measures it rather than asserting it from theory,
-across every workload this build has. Each split is perfectly reproducible, so
-this is a boundary-placement effect and not a determinism failure.
+across every workload this build has: one span, two pieces and ten reach the
+same state hash.
 
-Whether the split *shape* matters turns out to be workload-dependent, and that
-correction is worth keeping: on `nes-ntsc`, `gameboy` and `apple1`, two pieces
-and ten reach the same hash as each other and a different one from the whole —
-so for those, *any* intermediate deadline differs from none and the shape stops
-mattering. An earlier version of this section stated that as a general property.
-It is false: on `riscv-virt`, two pieces and ten reach different hashes as well.
-Three workloads agreeing is not a law, and the test now iterates whatever the
-build has rather than a named list, precisely so a fourth can disagree.
+What it used to do, and why it was wrong, is worth keeping. A round ended at
+`min(now + quantum, limit, next_event)`, so an intermediate deadline
+**truncated a round** — a scheduling boundary the single span never had — and
+`now + quantum` then anchored the next boundary to it, shifting every later one
+for the rest of the run. Two effects came out of that, both permanent:
 
-Two ways to make the claim true, and they are not equivalent: make `run_for`
-additive by making a truncated quantum indistinguishable from an untruncated
-one, which is a real scheduler change; or define the comparison to require the
-same stepping on both sides, which is weaker but honest and costs nothing. The
-first is the one §11.6 is actually promising. Until one of them lands, the
-characterisation test is what stops this being rediscovered.
+- The round-robin cursor is advanced once per round, so an extra round left a
+  *different runnable first* forever. `apple1` (a 6502 and a paced PIA) diverged
+  through this alone.
+- A truncated round hands every runnable a budget the unsliced run never handed
+  out, and then hands out the remainder in a second pass. A runnable that does
+  per-call rather than per-tick work is then run twice where it would have run
+  once — `riscv-virt`'s 16550 pumps its port once per call, so an extra pass is
+  an extra character. `nes-ntsc` and `gameboy` have one runnable each and were
+  never affected by either.
+
+The fix is that **a round's end is a function of virtual time and machine state
+alone**: an absolute quantum grid counted in nanoseconds from the origin, the
+next queued event, or the next event a lazily-advanced device has of its own. A
+caller's deadline inside a round does not shorten it — the round does not start,
+virtual time moves to the deadline, and the round runs whole when the caller
+asks for more. The set of executed rounds is then the same however the run is
+sliced, which is the property, not a coincidence of these four workloads.
+
+**What it costs, stated plainly.** A run can return with up to one round of
+virtual time elapsed and not yet executed. Nothing is lost — budgets come from
+each tree's absolute position, so the next round hands out the ticks — but a
+caller whose deadlines are finer than the machine's own boundaries gets its work
+in bursts. Two consequences follow. A `run_for` shorter than a scheduling round,
+on a board with no periodic device, runs none of it; shorten
+`SchedulerConfig::quantum` if that is the shape of the run. And a debugger
+cannot use this path at all: stepping one CPU cycle at a time would step over
+every breakpoint between here and the round's boundary, so `Machine::step_until`
+asks for the fragment explicitly, and is documented as not additive.
+
+This is a genuine three-way trade and only two of the three are available at
+once: virtual time landing exactly on the caller's deadline; every tree advanced
+exactly to it; and no extra scheduling boundary at an arbitrary instant. The
+first two are what a caller means by "run for a second"; the third is
+additivity. Cutting the round buys the first two, which is what the code did
+before, and it is why the property was missing rather than merely unimplemented.
+
+One thing the test cannot ask for, and this is arithmetic rather than
+scheduling: the pieces must sum to the span *exactly*. `GlobalTime` counts 2⁻⁶⁴
+seconds and rounds down, so `2 × from_nanos(50 ms)` is one unit short of
+`from_nanos(100 ms)` — a different deadline, and `now` is architectural state.
+The test therefore splits a span in raw units, so every piece count divides it
+exactly.
 
 ### 11.7 Deliverable
 

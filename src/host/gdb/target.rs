@@ -19,7 +19,7 @@
 //! **Attaching stops the world.** The machine advances only inside
 //! [`DebugTarget::resume`] and [`DebugTarget::step`], both of which are called
 //! from the same thread that services packets and never while a packet is being
-//! answered. `Machine::run_until` returns at a quantum boundary with every
+//! answered. `Machine::step_until` returns at a scheduling boundary with every
 //! runnable unwound to the scheduler, which is the safe point of §4.7 in the
 //! `Deterministic` threading mode — the only mode `Machine` drives. Nothing here
 //! reaches into a running CPU, and nothing races the scheduler.
@@ -479,9 +479,8 @@ impl<'a> MachineTarget<'a> {
     /// Advance virtual time by one tick of the finest CPU clock domain.
     ///
     /// The finest, so that on a machine with a fast and a slow core neither is
-    /// stepped over. Time is advanced through `Machine::run_until`, which
-    /// returns at a quantum boundary with every runnable unwound — the safe
-    /// point of §4.7.
+    /// stepped over. Time is advanced through `Machine::step_until`, which
+    /// returns with every runnable unwound — the safe point of §4.7.
     fn tick(&mut self) -> TargetResult<()> {
         let now = self.machine.now();
         let mut deadline: Option<GlobalTime> = None;
@@ -514,7 +513,13 @@ impl<'a> MachineTarget<'a> {
         // No CPU could name a future tick — a machine with every clock gated.
         // Fall back to a plain slice so the scheduler's own events still fire.
         let deadline = deadline.unwrap_or_else(|| now.saturating_add(FREE_SLICE));
-        self.machine.run_until(deadline)?;
+        // `step_until`, not `run_until`: one CPU tick is far inside a
+        // scheduling round, and `run_until` declines a round its deadline falls
+        // inside so that a sliced run and an unsliced one agree (§11.6). A
+        // debugger is the one caller that needs the fragment instead — waiting
+        // for the round's own boundary would step over every breakpoint between
+        // here and it.
+        self.machine.step_until(deadline)?;
         Ok(())
     }
 

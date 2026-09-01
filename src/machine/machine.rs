@@ -29,6 +29,15 @@
 //! inside the device's own `MemOps::read`, through a
 //! [`LazyHandle`](crate::core::sched::LazyHandle) the realizer hands it.
 //!
+//! [`Machine::run_for`] is **additive** — a span taken whole and the same span
+//! taken in pieces reach the same state (§11.6) — because that bound, and every
+//! other instant a round may end on, is a function of virtual time and the
+//! machine's state rather than of the caller's deadline. A deadline that falls
+//! inside a round declines the round instead of splitting it, so a run can
+//! return with up to one round's worth of time elapsed and not yet executed.
+//! [`Machine::step_until`] is the one path that does split a round, for a
+//! debugger, and says so.
+//!
 //! Only [`ThreadingMode::Deterministic`](crate::core::sched::ThreadingMode) is
 //! driven here, which is the mode §4.2 requires for record/replay and for the
 //! regression suite. The other two are a `core::sched` concern and report
@@ -212,6 +221,18 @@ pub struct PinRef {
     pub port: String,
     /// The id this pin drives the net with, for a source pin.
     pub id: WireId,
+}
+
+/// Whether a run may split the scheduling round its deadline lands in.
+///
+/// [`Stepping::Whole`] is what a run loop wants and what keeps
+/// [`Machine::run_for`] additive; [`Stepping::Fragment`] is the debugger's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stepping {
+    /// Stop at the deadline, having run only whole rounds.
+    Whole,
+    /// Run whatever fits before the deadline.
+    Fragment,
 }
 
 /// The `Runnable` the scheduler sees, wrapping the `Instance` the machine owns.
@@ -469,33 +490,10 @@ impl Machine {
     /// Whatever the scheduler refuses — an overrun budget, an unimplemented
     /// threading mode — or an event addressed to a device that does not exist.
     pub fn run_quantum(&mut self) -> Result<QuantumReport> {
-        let limit = self.quantum_limit(GlobalTime::MAX);
-        let report = self.sched.run_quantum_until(limit)?;
+        let report = self.sched.run_quantum_until(GlobalTime::MAX)?;
         self.sched.sync_lazy_devices()?;
         self.dispatch(&report)?;
         Ok(report)
-    }
-
-    /// How far the next quantum may run: the caller's deadline, or the next
-    /// instant a lazily-advanced device has an event of its own, whichever
-    /// comes first (§4.2).
-    ///
-    /// This is the *scheduled* half of sync-on-access. Catch-up on access makes
-    /// a `$2002` read see the dot it happened on, but nothing makes the PPU
-    /// reach the dot it raises vblank on while the CPU is busy elsewhere — and
-    /// a game whose main loop spins on a flag its NMI handler sets touches no
-    /// PPU register at all. Stopping the CPU at the PPU's own next event, and
-    /// catching the PPU up there, is what turns "advanced when read" into
-    /// "advanced".
-    ///
-    /// A deadline that has already gone by is not reported by
-    /// [`Scheduler::lazy_deadline`], so this never clamps a quantum to an
-    /// instant the machine is already standing on — which would stall it.
-    fn quantum_limit(&self, deadline: GlobalTime) -> GlobalTime {
-        match self.sched.lazy_deadline() {
-            Some(at) if at < deadline => at,
-            _ => deadline,
-        }
     }
 
     /// Run until virtual time reaches `deadline`.
@@ -509,22 +507,47 @@ impl Machine {
     /// As [`Machine::run_quantum`], plus a machine whose configuration cannot
     /// advance virtual time at all.
     pub fn run_until(&mut self, deadline: GlobalTime) -> Result<()> {
+        self.advance_to(deadline, Stepping::Whole)
+    }
+
+    /// Advance to `deadline`, cutting the round it lands in.
+    ///
+    /// **For a debugger, and not additive.** [`Machine::run_until`] declines a
+    /// round the deadline falls inside, because splitting one is the scheduling
+    /// boundary that made `run_for` non-additive (§11.6). A debugger stepping a
+    /// cycle at a time cannot afford that: waiting for the round to end would
+    /// step over every breakpoint between here and its boundary. So this asks
+    /// for the fragment, explicitly, at the cost of the property `run_until`
+    /// exists to keep.
+    ///
+    /// # Errors
+    ///
+    /// As [`Machine::run_quantum`].
+    pub fn step_until(&mut self, deadline: GlobalTime) -> Result<()> {
+        self.advance_to(deadline, Stepping::Fragment)
+    }
+
+    fn advance_to(&mut self, deadline: GlobalTime, stepping: Stepping) -> Result<()> {
         while self.sched.now() < deadline {
             let before = self.sched.now();
-            let limit = self.quantum_limit(deadline);
-            let report = self.sched.run_quantum_until(limit)?;
+            let report = match stepping {
+                Stepping::Whole => self.sched.run_quantum_until(deadline)?,
+                Stepping::Fragment => self.sched.step_quantum_until(deadline)?,
+            };
             // Before the events are dispatched: a handler that reads a lazily
             // advanced device must see it standing on the instant that fired,
             // not on the one the previous quantum ended at.
             self.sched.sync_lazy_devices()?;
             self.dispatch(&report)?;
             if self.sched.now() <= before {
-                // A quantum always ends at `min(now + quantum, deadline, next
-                // deadline)`, and events due at `now` have already been popped,
-                // so this can only mean a zero quantum. Reporting it is the
-                // only honest option: spinning would hang, and jumping to the
-                // deadline through `Scheduler::run_until` would fire events
-                // into a report nobody reads.
+                // A quantum ends either at its natural boundary or, when the
+                // deadline falls before that, at the deadline itself — and the
+                // deadline is above `now` or this loop would not have run. So
+                // this can only mean a zero quantum, whose grid has every point
+                // on top of every other. Reporting it is the only honest
+                // option: spinning would hang, and jumping to the deadline
+                // through `Scheduler::run_until` would fire events into a
+                // report nobody reads.
                 return Err(Error::Config {
                     at: self.name.clone(),
                     message: "virtual time did not advance: the scheduler quantum is zero"
@@ -536,6 +559,12 @@ impl Machine {
     }
 
     /// Run for `span` of virtual time from wherever the machine is now.
+    ///
+    /// Additive: running for a span and running for the same span in pieces
+    /// reach the same state (§11.6). What that costs is that the run stops on
+    /// the machine's own scheduling boundaries, so it can return with up to one
+    /// round of virtual time elapsed but not yet executed — the next call
+    /// executes it, and nothing is lost.
     ///
     /// # Errors
     ///

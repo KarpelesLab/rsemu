@@ -21,9 +21,9 @@ gameboy         15 0x209b31f7f07789d8 -
 gameboy         30 0xd7cb902827a4e3e4 -
 gameboy         45 0xc3083c49ba4c85d4 -
 gameboy         60 0xedd03cc6fed6e8b3 -
-nes-ntsc        15 0x651c4cdfb9b874f4 0xcee3f9389a95abb2
-nes-ntsc        30 0x0749ad3e83a32787 0x7d1557646f1093ab
-nes-ntsc        45 0x5938b5b6c436d385 0x0dcc61a40e5a7357
-nes-ntsc        60 0x0690493f0765bc45 0x835ad8bae9583deb
-riscv-virt      30 0x1a550db1947614be -
-riscv-virt      60 0xd01053ad6d69e4fa -
+nes-ntsc        15 0x9a8b72d55786790d 0x7ec097eeea2dd8e8
+nes-ntsc        30 0x1ec3925ae2268217 0xf83bc0f01230b86f
+nes-ntsc        45 0xf59ada723a72e0fb 0x69218dbb0d3e15f5
+nes-ntsc        60 0xb9b604475bf6f14e 0x9bd91abf99f1ccff
+riscv-virt      30 0x0fe4158e5f84c905 -
+riscv-virt      60 0x6b7756df1f86c5d2 -
