@@ -9,6 +9,7 @@
 //! | Module | Feature | Covers |
 //! | --- | --- | --- |
 //! | [`ehci`] | `dev-usb-ehci` | a generic EHCI host controller: the register file of EHCI 1.0 and the QH/qTD schedule walker that DMA-reads it out of guest RAM |
+//! | [`dwc2`] | `dev-usb-dwc2` | a Synopsys DesignWare USB 2.0 OTG host controller — STM32's OTG_FS — with host channels and a shared FIFO instead of a schedule in guest memory |
 //! | [`chipidea`] | `dev-usb-chipidea` | the ChipIdea/ARC dual-role variant of the same controller: a `+0x140` operational offset, an `ID` register and a `USBMODE` role select |
 //! | [`hid`] | `dev-usb-hid` | a USB HID boot-protocol mouse: the smallest device that proves the stack |
 //!
@@ -28,6 +29,10 @@
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-usb-chipidea")))]
 pub mod chipidea;
 
+#[cfg(feature = "dev-usb-dwc2")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-usb-dwc2")))]
+pub mod dwc2;
+
 #[cfg(feature = "dev-usb-ehci")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-usb-ehci")))]
 pub mod ehci;
@@ -46,6 +51,8 @@ pub fn register(registry: &mut crate::core::Registry) -> crate::Result<()> {
     ehci::register(registry)?;
     #[cfg(feature = "dev-usb-chipidea")]
     chipidea::register(registry)?;
+    #[cfg(feature = "dev-usb-dwc2")]
+    dwc2::register(registry)?;
     #[cfg(feature = "dev-usb-hid")]
     hid::register(registry)?;
     let _ = registry;
@@ -62,6 +69,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> crate::Result<()> {
     ehci::bind(bindings)?;
     #[cfg(feature = "dev-usb-chipidea")]
     chipidea::bind(bindings)?;
+    #[cfg(feature = "dev-usb-dwc2")]
+    dwc2::bind(bindings)?;
     #[cfg(feature = "dev-usb-hid")]
     hid::bind(bindings)?;
     let _ = bindings;
@@ -81,6 +90,8 @@ pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
     out.push(ehci::schema());
     #[cfg(feature = "dev-usb-chipidea")]
     out.push(chipidea::schema());
+    #[cfg(feature = "dev-usb-dwc2")]
+    out.push(dwc2::schema());
     #[cfg(feature = "dev-usb-hid")]
     out.push(hid::schema());
     out

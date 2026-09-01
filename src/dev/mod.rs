@@ -22,7 +22,7 @@
 //! | [`sitronix`] | `dev-st7272a` | the ST7272A TFT panel driver: SPI register configuration, no pixel path |
 //! | [`stm32`] | `dev-stm32` | STM32 peripherals: a GPIO port and a USART |
 //! | [`riscv`] | `dev-riscv` | the RISC-V `virt` board: CLINT, PLIC, 16550, virtio, and the device tree generator |
-//! | [`usb`] | `dev-usb-*` | USB host controllers — a generic EHCI and the ChipIdea/ARC variant over it — and a HID mouse |
+//! | [`usb`] | `dev-usb-*` | USB host controllers — a generic EHCI, the ChipIdea/ARC variant over it, and a Synopsys dwc2 that shares nothing with either — and a HID mouse |
 //! | [`wdc`] | `dev-wdc` | the W65C51N ACIA and W65C22 VIA, and a 6502 board's ROM |
 //!
 //! Most of `dev/` is `no_std + alloc`. The two documented exceptions —
@@ -84,6 +84,7 @@ pub mod riscv;
 #[cfg(any(
     feature = "dev-usb-ehci",
     feature = "dev-usb-chipidea",
+    feature = "dev-usb-dwc2",
     feature = "dev-usb-hid"
 ))]
 #[cfg_attr(
@@ -91,6 +92,7 @@ pub mod riscv;
     doc(cfg(any(
         feature = "dev-usb-ehci",
         feature = "dev-usb-chipidea",
+        feature = "dev-usb-dwc2",
         feature = "dev-usb-hid"
     )))
 )]

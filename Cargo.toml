@@ -206,6 +206,25 @@ dev-usb-ehci = ["bus-usb"]
 # Needs `dev-usb-ehci`.
 dev-usb-chipidea = ["dev-usb-ehci"]
 
+# A Synopsys DesignWare USB 2.0 OTG host controller (src/dev/usb/dwc2.rs) — the
+# `dwc2` core, which is what STM32's OTG_FS block is. **Nothing like an EHCI**,
+# and that is the point of having it: instead of DMA-walking queue heads the
+# driver built in guest RAM, it has **host channels** the driver programs
+# directly (address, endpoint, direction, packet size, byte count, then arm) and
+# **a shared FIFO** it pushes and pops through 4 KiB windows, with received
+# packets announced one at a time by GRXSTSP. In the full-speed configuration it
+# does no DMA at all, so it is the one controller here that needs no `space =`.
+# Covers the global, host and channel register files, the receive FIFO and the
+# per-channel transmit staging, data toggles, short packets, STALL and
+# transaction errors halting a channel, the root port with its reset and its
+# write-1-to-clear traps, and the GINTSTS/HAINT/HCINTn interrupt tree. Full
+# **and low** speed, which an EHCI cannot drive at all; a device faster than the
+# transceiver leaves the port disabled rather than pretending. Host mode only —
+# device mode is deliberately absent and the module says what it would need.
+# Written from ST's RM0090 §34 and USB 2.0; no driver and no emulator was
+# opened (ROADMAP.md §1). Needs `bus-usb`.
+dev-usb-dwc2 = ["bus-usb"]
+
 # A USB HID boot-protocol mouse (src/dev/usb/hid.rs): the smallest honest device
 # that proves the whole stack — it enumerates, it answers the eleven standard
 # requests through the shared control pipe, it returns a HID report descriptor,
