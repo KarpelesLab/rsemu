@@ -191,12 +191,17 @@ machine-beneater = ["cpu-mos6502", "dev-wdc"]
 # move, **master aborts** (an address nothing answers reads as ones, which is
 # how firmware finds an empty slot), and Configuration Mechanism #1 — the
 # 0xcf8/0xcfc pair, with `CONFADD` Dword-only and `CONFDATA` addressable a byte
-# at a time, both of which firmware depends on. Base address registers,
-# interrupt routing, type 1 cycles and PCI Express's extended space are
-# deliberately absent and the module says so. Written from the PCI Local Bus
-# Specification Rev 2.1 (§3.7.4.1, §6.1, §6.2) and the Intel 82441FX datasheet
-# (§3.1.1, §3.1.2, Table 1); no emulator source was consulted (ROADMAP.md §1).
-# `no_std + alloc`, no dependencies.
+# at a time, both of which firmware depends on. Also **base address registers**:
+# the six of them plus the expansion ROM register, the write-all-ones sizing
+# read-back, 32- and 64-bit memory windows, the prefetchable bit, and the
+# retopology-from-inside-a-configuration-write that moving one is — which is
+# the case `core::space`'s docs open with, and is answered by the same
+# order-exempt try-lock the host bridge's PAM registers use. Interrupt routing,
+# type 1 cycles, PCI Express's extended space and I/O BARs that actually decode
+# are deliberately absent and the module says so. Written from the PCI Local Bus
+# Specification Rev 2.1 (§3.7.4.1, §6.1, §6.2, §6.2.5.1, §6.2.5.2) and the Intel
+# 82441FX datasheet (§3.1.1, §3.1.2, Table 1); no emulator source was consulted
+# (ROADMAP.md §1). `no_std + alloc`, no dependencies.
 bus-pci = []
 
 # The SPI bus (src/bus/spi): the fabric, the peripheral seam, and a generic
@@ -666,7 +671,16 @@ dev-pc-video = ["dev-pc"]
 # window and the Type 00h header a firmware probes to decide there is a bridge
 # at all. Written from the Intel 82441FX datasheet (order 290549-001) §3.1.1,
 # §3.1.2 and §3.2.18, cited by section; no emulator source was consulted
-# (ROADMAP.md §1). Needs `bus-pci` and `dev-pc`.
+# (ROADMAP.md §1).
+#
+# And with it `pc.vga-pci`, the PCI face of a display adapter: the Type 00h
+# header whose class code `030000` is how a firmware written this century finds
+# the console, and the **expansion ROM base address register** its video BIOS
+# arrives on. That is the only route to video on a 440FX board -- the firmware
+# turns 0xc0000-0xdffff into DRAM before it looks, so a legacy option ROM socket
+# there is invisible by the time anything scans it. Written from the PCI Local
+# Bus Specification Rev 2.1 §6.2.5.2 and Appendix D. Needs `bus-pci` and
+# `dev-pc`.
 dev-pc-pci = ["dev-pc", "bus-pci"]
 
 # The PC's floppy controller (src/dev/pc/fdc): a NEC uPD765A as the AT wires
@@ -739,7 +753,10 @@ dev-pc-ide = ["dev-pc", "dev-ata-disk"]
 # names). The firmware is **not** shipped: the `bios` media slot takes the
 # user's own image (`rsemu run pc-at --bios /usr/share/qemu/bios.bin`) and the
 # `vgabios` slot takes a video option ROM, exactly as `riscv-virt` takes its
-# firmware. Adds no dependencies.
+# firmware. That video BIOS has to be a **PCI** one, carrying the PCI Data
+# Structure naming the vendor and device id the machine file declares: a
+# 440FX-era firmware loads it off the card's expansion ROM BAR and checks. Adds
+# no dependencies.
 machine-pc-at = [
   "cpu-x86",
   "dev-pc",

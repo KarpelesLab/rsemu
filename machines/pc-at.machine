@@ -301,6 +301,38 @@ machine "pc-at" {
   # RTC's memory sizes and for the same reason — a seam to close, not a design.
   object vga "pc.video" { clock = dot / 9, dot-clock = 28322000 }
 
+  # The PCI face of that same adapter, and the reason a firmware written this
+  # century puts anything on the screen at all.
+  #
+  # A 440FX-era firmware does not find video by scanning memory. It enumerates
+  # the bus looking for class code 030000 — display, VGA-compatible — and takes
+  # that function's video BIOS off its **expansion ROM base address register**
+  # (PCI Local Bus Specification Rev 2.1 §6.2.5.2). It cannot do anything else
+  # here: the first thing it does to the chipset above is set PAM1-PAM5 to
+  # read/write, which turns 0xc0000-0xdffff into blank DRAM and makes the legacy
+  # `vgarom` socket below invisible from that moment on. That window is the
+  # firmware's scratch pad for the ROMs it copies *into* it, and this is where
+  # one of them comes from.
+  #
+  # Two objects for one card, and the seam is the same one `pc.ide` and
+  # `ata.disk` sit either side of: `pc.video` is the CRTC, the character buffer
+  # and the character generator, reached through the board's own decode of
+  # 0x3c0-0x3df and 0xb8000 exactly as an ISA card is; this is what answers a
+  # configuration cycle. A PCI VGA's legacy aperture is not addressed through
+  # its BARs either, so nothing is lost by splitting them.
+  #
+  # `vendor-id` and `device-id` are not decoration. A video BIOS built for a PCI
+  # card carries a PCI Data Structure naming the ids it is for, and a firmware
+  # that loads a ROM off a BAR checks them; a BIOS built for an ISA card carries
+  # none and cannot be loaded this way at all. The defaults match the common
+  # PCI-VGA image, and a different image wants different numbers here.
+  object vgacard "pc.vga-pci" {
+    space  = mem
+    bus    = "pci0"
+    device = 2
+    image  = "vgabios"
+  }
+
   # -- the floppy controller --------------------------------------------------
   #
   # The `floppy` media slot is optional: a machine with no disk in the drive is
@@ -336,6 +368,13 @@ machine "pc-at" {
   # its socket because that is where the reset vector is, and the video option
   # ROM against the *bottom* because that is where the scan for `0x55 0xaa`
   # looks.
+  #
+  # `vgarom` is the **legacy** path to the same image the PCI card above
+  # carries, and it is kept because it is the only path a pre-PCI firmware
+  # knows: a scan of 0xc0000 upward for the signature. A firmware that
+  # programs the PAM registers first never sees it, and takes the PCI route
+  # instead. One video BIOS, two ways in, and any given firmware takes exactly
+  # one of them.
   object bios   "pc.rom" { image = "bios",    size = biossize, align = "top" }
   object vgarom "pc.rom" { image = "vgabios", size = vgasize,  align = "bottom" }
 
