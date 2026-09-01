@@ -172,8 +172,13 @@ bus-spi = []
 # change. Covers addressing and enumeration (USB 2.0 §9.4's eleven standard
 # requests, including SET_ADDRESS's deferred effect), descriptors (§9.6),
 # endpoints, halt conditions, the three speeds and a port model with connect and
-# enable. Hubs and split transactions are deliberately absent and the module says
-# so. `no_std + alloc`, no dependencies.
+# enable. Works in **both directions**: a `UsbDevice` may be something the
+# emulator provides (a mouse) or a guest presenting itself as a peripheral
+# through a dual-role controller, and the seam is the same one. Carries a
+# host-side transfer composer (`bus::usb::host`) for anything driving the bus
+# that is not a controller with a schedule — a test harness, a loopback, a
+# future usbfs bridge. Hubs and split transactions are deliberately absent and
+# the module says so. `no_std + alloc`, no dependencies.
 bus-usb = []
 
 # A generic EHCI host controller (src/dev/usb/ehci.rs): the EHCI 1.0 capability
@@ -219,10 +224,18 @@ dev-usb-chipidea = ["dev-usb-ehci"]
 # transaction errors halting a channel, the root port with its reset and its
 # write-1-to-clear traps, and the GINTSTS/HAINT/HCINTn interrupt tree. Full
 # **and low** speed, which an EHCI cannot drive at all; a device faster than the
-# transceiver leaves the port disabled rather than pretending. Host mode only —
-# device mode is deliberately absent and the module says what it would need.
-# Written from ST's RM0090 §34 and USB 2.0; no driver and no emulator was
-# opened (ROADMAP.md §1). Needs `bus-usb`.
+# transceiver leaves the port disabled rather than pretending.
+#
+# **Both roles.** GUSBCFG.FDMOD selects the device side, where the *guest* is the
+# peripheral and somebody else enumerates it — the DCFG/DCTL/DSTS register file,
+# DIEPCTLn/DOEPCTLn endpoints over the same shared FIFO, setup packets arriving
+# through GRXSTSP, DAINT feeding GINTSTS.IEPINT/OEPINT, and DCTL.SDIS as the
+# pull-up on D+ that decides whether the device is on the bus at all. That is
+# what an STM32 board presenting as CDC-ACM or mass storage actually uses, and
+# the guest's firmware owns the descriptors and the standard requests — the
+# emulator answers none of them. Written from ST's RM0090 §34 and USB 2.0; no
+# driver and no emulator was opened (ROADMAP.md §1) — in particular not the
+# Linux dwc2 gadget driver, which is GPLv2. Needs `bus-usb`.
 dev-usb-dwc2 = ["bus-usb"]
 
 # A USB HID boot-protocol mouse (src/dev/usb/hid.rs): the smallest honest device

@@ -9,7 +9,7 @@
 //! | Module | Feature | Covers |
 //! | --- | --- | --- |
 //! | [`ehci`] | `dev-usb-ehci` | a generic EHCI host controller: the register file of EHCI 1.0 and the QH/qTD schedule walker that DMA-reads it out of guest RAM |
-//! | [`dwc2`] | `dev-usb-dwc2` | a Synopsys DesignWare USB 2.0 OTG host controller — STM32's OTG_FS — with host channels and a shared FIFO instead of a schedule in guest memory |
+//! | [`dwc2`] | `dev-usb-dwc2` | a Synopsys DesignWare USB 2.0 OTG controller — STM32's OTG_FS — with host channels and a shared FIFO instead of a schedule in guest memory, **in both roles**: host, and device, where the guest is the peripheral |
 //! | [`chipidea`] | `dev-usb-chipidea` | the ChipIdea/ARC dual-role variant of the same controller: a `+0x140` operational offset, an `ID` register and a `USBMODE` role select |
 //! | [`hid`] | `dev-usb-hid` | a USB HID boot-protocol mouse: the smallest device that proves the stack |
 //!
@@ -22,6 +22,18 @@
 //! vendor's own. That is the test of whether the split is real: the next
 //! controller that embeds an EHCI core — and there are many — is another
 //! register map and nothing else.
+//!
+//! # Both directions, and what that cost the fabric
+//!
+//! [`dwc2`]'s device mode is the first thing in this tree where the *guest* is
+//! the peripheral: a host somewhere else issues a `GET_DESCRIPTOR` and guest
+//! firmware answers it out of its own endpoint FIFO. It is a
+//! [`UsbDevice`](crate::bus::usb::UsbDevice) and **not** a
+//! [`Peripheral`](crate::bus::usb::Peripheral), because a `Peripheral` answers
+//! USB 2.0 §9.4 inside the emulator and that is precisely the job the guest is
+//! there to do. What [`crate::bus::usb`] had to grow for it was two additive
+//! things — a start-of-frame broadcast and a host-side transfer composer — plus
+//! one comment that had become untrue. All three are argued where they live.
 //!
 //! Everything here is `no_std + alloc` and names no host facility.
 
