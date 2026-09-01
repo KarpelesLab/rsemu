@@ -23,18 +23,53 @@
 //! management unit actually performs — make a range exist, stop it existing,
 //! change what it permits — and the ability to say what exists now.
 //!
-//! # The gap, stated rather than papered over
+//! # Where the enforcement is
 //!
 //! [`Prot`] is enforced on accesses **this module** performs — the ones a
-//! consumer makes on the guest's behalf. It is only partly enforced on
-//! accesses the *guest* performs: a [`Prot::NONE`] range is simply absent from
-//! the address space, so the guest faults on it, but a read-only range is
-//! mapped read-write and a guest store to it succeeds. Fixing that needs a
-//! per-mapping permission bit in [`core::space`](crate::core::space) and a
-//! write-fault path out of it, which do not exist. The same missing mechanism
-//! is why [`UserMemory::duplicate`] copies eagerly instead of sharing
-//! copy-on-write. Both are generic mechanisms and belong in `core::space` when
-//! they land (`ROADMAP.md` §0, "generic first"), not as a special case here.
+//! consumer makes on the guest's behalf — and, since `core::space` grew a
+//! mapping layer, on the accesses the *guest* performs too. Every range is
+//! placed with [`Perms`] equal to its `Prot`, so a guest store into a
+//! read-only range raises [`BusError::Protected`] from the address space
+//! itself, with no cooperation from the core executing the store.
+//!
+//! That one mechanism is also what makes `fork` lazy. [`UserMemory::duplicate`]
+//! **shares** every backing store with the child and drops [`Perms::WRITE`]
+//! from both sides' mappings. The first store into a shared page raises
+//! `Protected`; the consumer hands the address to
+//! [`UserMemory::resolve_write_fault`], which allocates a private copy, swaps
+//! the mapping to it, restores the permission, and says the access may be
+//! reissued. Copy-on-write is not a feature of this module — it is
+//! per-mapping permissions plus a fault a consumer can tell apart from a bad
+//! width, which is why both live in `core::space` (`ROADMAP.md` §0, "generic
+//! first").
+//!
+//! Sharing is **derived state**: it is not snapshotted, and a
+//! [`load`](UserMemory::load) reconstructs every range with a private store.
+//! The bytes are architectural and are saved; who happened to be sharing them
+//! is not.
+//!
+//! # What is still missing, and what that says
+//!
+//! **Copy-on-write here is per *range*, not per page.** The first store into a
+//! shared range copies the whole range, because the unit `core::space` can
+//! replace is a mapping and a range is one mapping. Breaking at page
+//! granularity would mean splitting a mapped range into a mapping per page —
+//! a hundred-megabyte heap becomes twenty-five thousand regions, every one of
+//! them re-flattened and re-sorted on every fault. That is a page table wearing
+//! a region list's clothes, and a region list is the wrong data structure for
+//! it: `ROADMAP.md` §4.1 already puts the page table above this layer, with the
+//! software TLB, and that is where per-page sharing belongs.
+//!
+//! For the shape of map a program loader builds it is still the right trade:
+//! text and read-only data are the bulk of an executable and are never
+//! written, so a `fork` copies neither. For a guest that scribbles one byte
+//! into a huge anonymous range it is no better than an eager copy, and only a
+//! page table will make it so.
+//!
+//! **[`Perms::EXEC`] is carried and not enforced**, because no rsemu core marks
+//! an instruction fetch as one yet — so a `Prot::RX` range and a `Prot::READ`
+//! one are indistinguishable to a guest. There is no NX here, and the day a
+//! core marks its fetches there will be.
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -42,7 +77,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::core::error::{BusError, Error, Result};
-use crate::core::space::{AddressSpace, MappingId, MemAttrs, RamStore, Region};
+use crate::core::space::{
+    AddressSpace, Mapping as SpaceMapping, MappingId, MemAttrs, Perms, RamStore, Region,
+};
 use crate::core::state::{Sink, Source};
 use crate::core::sync::{self, LockRank};
 
@@ -56,63 +93,12 @@ pub const PAGE_SIZE: u64 = 4096;
 
 /// What a range of the map may be used for.
 ///
-/// A bit set rather than an enumeration, because the three permissions
-/// genuinely combine and every one of the eight combinations is a thing a real
-/// program asks for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(transparent)]
-pub struct Prot(pub u8);
-
-impl Prot {
-    /// No access at all. Such a range is *absent* from the address space, so
-    /// the guest faults on it — which is exactly the intent.
-    pub const NONE: Prot = Prot(0);
-    /// The range may be read.
-    pub const READ: Prot = Prot(1);
-    /// The range may be written.
-    pub const WRITE: Prot = Prot(2);
-    /// Instructions may be fetched from the range.
-    pub const EXEC: Prot = Prot(4);
-    /// Readable and writable — an anonymous mapping's usual shape.
-    pub const RW: Prot = Prot(3);
-    /// Readable and executable — a text segment's usual shape.
-    pub const RX: Prot = Prot(5);
-    /// Everything.
-    pub const RWX: Prot = Prot(7);
-
-    /// Whether every bit of `other` is set here.
-    #[must_use]
-    pub const fn contains(self, other: Prot) -> bool {
-        self.0 & other.0 == other.0
-    }
-
-    /// The union of two permission sets.
-    #[must_use]
-    pub const fn union(self, other: Prot) -> Prot {
-        Prot(self.0 | other.0)
-    }
-
-    /// Whether this is [`Prot::NONE`].
-    #[must_use]
-    pub const fn is_none(self) -> bool {
-        self.0 == 0
-    }
-}
-
-impl core::fmt::Display for Prot {
-    /// The `rwx` form `/proc/*/maps` uses, so a consumer that prints one does
-    /// not have to reinvent the spelling.
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let bit = |set: bool, c: char| if set { c } else { '-' };
-        write!(
-            f,
-            "{}{}{}",
-            bit(self.contains(Prot::READ), 'r'),
-            bit(self.contains(Prot::WRITE), 'w'),
-            bit(self.contains(Prot::EXEC), 'x'),
-        )
-    }
-}
+/// This **is** [`core::space::Perms`](crate::core::space::Perms), not a level-3
+/// copy of it. `mprotect(2)`'s permission bits and an address decoder's are the
+/// same question — under what terms does this answer — and answering it twice
+/// is how the enforcement and the bookkeeping drift apart. Level 3 keeps the
+/// familiar name and nothing else of its own.
+pub type Prot = Perms;
 
 /// One range of the map, as a consumer sees it.
 ///
@@ -135,12 +121,48 @@ pub struct MappingInfo {
 #[derive(Debug)]
 struct Vma {
     len: u64,
+    /// What the range permits *logically* — what the guest asked for and what
+    /// `/proc/self/maps` should say.
+    ///
+    /// Not always what the mapping in the address space permits: while the
+    /// store is shared copy-on-write, the mapping withholds
+    /// [`Perms::WRITE`] so the first store faults, and this still says the
+    /// range is writable. The difference between the two *is* the copy-on-write
+    /// state.
     prot: Prot,
     store: Arc<RamStore>,
-    /// `None` while the range is [`Prot::NONE`] and therefore absent from the
-    /// address space.
-    mapping: Option<MappingId>,
+    /// Whether `store` is shared with another map and must be copied before
+    /// this range is written.
+    ///
+    /// Derived, and deliberately not snapshotted: which two processes happen
+    /// to be sharing a page is not architectural state, and a restored map
+    /// simply owns its bytes.
+    shared: bool,
+    mapping: MappingId,
     name: String,
+}
+
+/// The storage a new range is built over, and whether it is still somebody
+/// else's too.
+///
+/// The two travel together because they are one fact: a store nobody else
+/// holds is a store this range may be written through.
+#[derive(Debug)]
+struct Backing {
+    store: Arc<RamStore>,
+    shared: bool,
+}
+
+impl Vma {
+    /// What the *mapping* permits, which is the logical protection less
+    /// [`Perms::WRITE`] while the store is shared.
+    fn effective(&self) -> Perms {
+        if self.shared {
+            self.prot.without(Perms::WRITE)
+        } else {
+            self.prot
+        }
+    }
 }
 
 /// The ranges, and where to place the next unplaced one.
@@ -337,13 +359,26 @@ impl UserMemory {
         let end = base + len;
         let mut inner = self.inner.lock();
         for vbase in Self::overlapping(&inner, base, end) {
+            let vend = vbase + inner.vmas[&vbase].len;
+            if base <= vbase && end >= vend {
+                // The whole range: the permission is the only thing that
+                // changes, so the store, the sharing and the mapping's place in
+                // the overlap order all survive untouched. This is the case a
+                // `mprotect` after a `fork` takes, and copying there would
+                // defeat the point of a lazy fork.
+                let vma = inner.vmas.get_mut(&vbase).expect("just looked it up");
+                vma.prot = prot;
+                let effective = vma.effective();
+                let id = vma.mapping;
+                self.space.topology().reprotect(id, effective)?;
+                continue;
+            }
+            // A partial overlap splits, and a split materialises: each half
+            // needs a store it can replace on its own.
             let Some(vma) = inner.vmas.remove(&vbase) else {
                 continue;
             };
-            if let Some(id) = vma.mapping {
-                self.space.topology().unmap(id)?;
-            }
-            let vend = vbase + vma.len;
+            self.space.topology().unmap(vma.mapping)?;
             let head = base.max(vbase);
             let tail = end.min(vend);
             let src = |offset| Some((Arc::clone(&vma.store), offset));
@@ -370,6 +405,56 @@ impl UserMemory {
             }
         }
         Ok(())
+    }
+
+    /// Resolve a write that the address space refused, if it is refusable.
+    ///
+    /// The other half of the copy-on-write protocol. A guest store into a
+    /// shared page raises [`BusError::Protected`]; a consumer's fault handler
+    /// hands the address here and is told whether the fault was a *sharing*
+    /// fault or a real one.
+    ///
+    /// * `Ok(true)` — the sharing has been broken, the mapping now permits the
+    ///   write, and the access may be reissued. The consumer restarts the
+    ///   faulting instruction, exactly as it would after mapping a page.
+    /// * `Ok(false)` — nothing here was resolvable: the address is unmapped,
+    ///   or the range genuinely does not permit writing. A signal, not a
+    ///   retry.
+    ///
+    /// Safe to call from a fault handler and only from there: it takes this
+    /// map's lock and then the address space's topology guard, in that order,
+    /// which is legal only when no access is in flight (`ROADMAP.md` §4.1).
+    /// That is the same constraint as "resolve the fault, then resume", so it
+    /// costs a consumer nothing.
+    ///
+    /// # Errors
+    ///
+    /// If the copy or the remap fails, which in practice means allocation.
+    pub fn resolve_write_fault(&self, addr: u64) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        let Some((&vbase, vma)) = inner.vmas.range(..=addr).next_back() else {
+            return Ok(false);
+        };
+        if vbase + vma.len <= addr || !vma.prot.contains(Prot::WRITE) || !vma.shared {
+            return Ok(false);
+        }
+        self.break_cow_locked(&mut inner, vbase)?;
+        Ok(true)
+    }
+
+    /// Whether the range at `addr` is still sharing its bytes with another
+    /// map.
+    ///
+    /// For a consumer's `/proc/self/smaps`, and for a test that wants to prove
+    /// a `fork` did not copy.
+    #[must_use]
+    pub fn is_shared(&self, addr: u64) -> bool {
+        let inner = self.inner.lock();
+        inner
+            .vmas
+            .range(..=addr)
+            .next_back()
+            .is_some_and(|(base, vma)| *base + vma.len > addr && vma.shared)
     }
 
     /// Every range that exists, in address order.
@@ -446,6 +531,14 @@ impl UserMemory {
     /// [`BusError::BadAccess`] if any of it is not writable.
     pub fn write_bytes(&self, addr: u64, src: &[u8]) -> Result<()> {
         self.check_prot(addr, src.len() as u64, Prot::WRITE)?;
+        // A consumer writing on the guest's behalf is not executing a guest
+        // instruction, so there is nothing to restart: it holds no lock the
+        // address space needs and can resolve the sharing itself. The guest's
+        // *own* store cannot, which is why `resolve_write_fault` exists.
+        {
+            let mut inner = self.inner.lock();
+            self.break_cow_range(&mut inner, addr, src.len() as u64)?;
+        }
         self.space.write_bytes(addr, src, MemAttrs::DEFAULT)?;
         Ok(())
     }
@@ -464,10 +557,18 @@ impl UserMemory {
     /// not consulted; existence still is.
     pub fn init_bytes(&self, addr: u64, src: &[u8]) -> Result<()> {
         // Written through the range's own store rather than through the
-        // address space, because a `Prot::NONE` range is deliberately absent
-        // from the space and a loader still has to be able to fill it. The
-        // range must not straddle two mappings; a loader fills one segment at
-        // a time and a snapshot one range at a time.
+        // address space, because the space would refuse it: a text segment is
+        // mapped read-only and filling one is the whole reason this exists.
+        // The range must not straddle two mappings; a loader fills one segment
+        // at a time and a snapshot one range at a time.
+        //
+        // The sharing still has to be broken first — going behind the address
+        // space's back is a licence to ignore *permission*, not a licence to
+        // scribble on a page another map is reading.
+        {
+            let mut inner = self.inner.lock();
+            self.break_cow_range(&mut inner, addr, src.len() as u64)?;
+        }
         let (store, offset) = self.store_at(addr, src.len() as u64)?;
         store.write_at(offset, src)?;
         Ok(())
@@ -497,13 +598,27 @@ impl UserMemory {
     // Copying and snapshots
     // -----------------------------------------------------------------
 
-    /// A second map with the same ranges and the same bytes.
+    /// A second map with the same ranges and the same bytes, sharing them
+    /// copy-on-write.
     ///
-    /// What a consumer's `fork(2)` needs. The copy is **eager**: every mapped
-    /// byte is copied now. Copy-on-write would be better and needs a
-    /// write-fault path out of [`core::space`](crate::core::space) that does
-    /// not exist — see the module docs. Nothing about this signature changes
-    /// when it does.
+    /// What a consumer's `fork(2)` needs, and **lazy**: not one byte is
+    /// copied. Both maps keep the same backing stores and both sides' mappings
+    /// lose [`Perms::WRITE`], so the first store into a page on either side
+    /// raises [`BusError::Protected`] and
+    /// [`resolve_write_fault`](UserMemory::resolve_write_fault) gives that side
+    /// a private copy of that range. A `node -e` process forks a hundred
+    /// megabytes it will never write to; copying it eagerly was the difference
+    /// between a level-3 sandbox that starts in milliseconds and one that does
+    /// not.
+    ///
+    /// The break is per **range**, not per page — see the module docs for why,
+    /// and for what it would take to change.
+    ///
+    /// Two maps, two locks at the same rank, so this is deliberately **two
+    /// phases**: the parent's ranges are marked shared and reprotected under
+    /// the parent's lock, which is then released before the child's is taken.
+    /// Holding both would be a lock-order violation, and taking them in a
+    /// fixed order is not available — either map may be the parent.
     ///
     /// # Errors
     ///
@@ -511,20 +626,42 @@ impl UserMemory {
     pub fn duplicate(&self) -> Result<Arc<UserMemory>> {
         let bits = self.space.bits();
         let copy = Arc::new(UserMemory::new(bits));
-        let (floor, hint) = {
-            let inner = self.inner.lock();
-            (inner.floor, inner.hint)
+
+        // Phase one: everything the parent has to give up, under its own lock.
+        let (floor, hint, ranges) = {
+            let mut inner = self.inner.lock();
+            let bases: Vec<u64> = inner.vmas.keys().copied().collect();
+            let mut ranges = Vec::with_capacity(bases.len());
+            for base in bases {
+                let vma = inner.vmas.get_mut(&base).expect("a base we just listed");
+                vma.shared = true;
+                let (id, effective) = (vma.mapping, vma.effective());
+                let (len, prot, name, store) =
+                    (vma.len, vma.prot, vma.name.clone(), Arc::clone(&vma.store));
+                self.space.topology().reprotect(id, effective)?;
+                ranges.push((base, len, prot, name, store));
+            }
+            (inner.floor, inner.hint, ranges)
         };
+
+        // Phase two: the child, under the child's.
         {
             let mut inner = copy.inner.lock();
             inner.floor = floor;
             inner.hint = hint;
-        }
-        for info in self.mappings() {
-            copy.map_at(info.base, info.len, info.prot, &info.name)?;
-            let mut buf = alloc::vec![0u8; info.len as usize];
-            self.raw_read(info.base, &mut buf)?;
-            copy.init_bytes(info.base, &buf)?;
+            for (base, len, prot, name, store) in ranges {
+                copy.insert_store_locked(
+                    &mut inner,
+                    base,
+                    len,
+                    prot,
+                    &name,
+                    Backing {
+                        store,
+                        shared: true,
+                    },
+                )?;
+            }
         }
         Ok(copy)
     }
@@ -590,7 +727,7 @@ impl UserMemory {
         for _ in 0..count {
             let base = source.read_u64()?;
             let len = source.read_u64()?;
-            let prot = Prot(source.read_u8()?);
+            let prot = Perms(source.read_u8()?);
             let name = source.read_str()?;
             let bytes = source.take(usize::try_from(len).map_err(|_| {
                 Error::State(alloc::format!(
@@ -632,9 +769,11 @@ impl UserMemory {
 
     /// Create `len` bytes at `base`, optionally copying them from `src`.
     ///
-    /// The one place a range comes into existence. A range that permits
-    /// nothing is *not* put into the address space, so the guest faults on it
-    /// while the bookkeeping still remembers it is reserved.
+    /// The one place a range comes into existence. Even a [`Prot::NONE`] range
+    /// is placed in the address space: a reserved range that permits nothing
+    /// and an address with nothing at it are different things, and the fault
+    /// they raise says which ([`BusError::Protected`] against
+    /// [`BusError::Unassigned`]).
     fn insert_locked(
         &self,
         inner: &mut Inner,
@@ -646,29 +785,95 @@ impl UserMemory {
     ) -> Result<()> {
         let store = Arc::new(RamStore::new(len));
         if let Some((from, offset)) = src {
-            // Copying rather than aliasing: sharing a store between two ranges
-            // needs the copy-on-write mechanism the module docs name as
-            // missing.
-            let mut buf = alloc::vec![0u8; len as usize];
-            from.read_at(offset, &mut buf)?;
-            store.write_at(0, &buf)?;
+            // Copying rather than sharing: a *split* of a shared range would
+            // need each half to alias a window of one store, and the halves
+            // then stop being independently replaceable, which is exactly what
+            // a copy-on-write break has to do. A split is rare; a fork is not,
+            // and `duplicate` shares.
+            copy_between(&from, offset, &store, 0, len)?;
         }
-        let mapping = if prot.is_none() {
-            None
+        self.insert_store_locked(
+            inner,
+            base,
+            len,
+            prot,
+            name,
+            Backing {
+                store,
+                shared: false,
+            },
+        )
+    }
+
+    /// [`insert_locked`](UserMemory::insert_locked) over a store that already
+    /// exists, shared or not.
+    fn insert_store_locked(
+        &self,
+        inner: &mut Inner,
+        base: u64,
+        len: u64,
+        prot: Prot,
+        name: &str,
+        backing: Backing,
+    ) -> Result<()> {
+        let Backing { store, shared } = backing;
+        let effective = if shared {
+            prot.without(Perms::WRITE)
         } else {
-            let region = Region::ram(name, Arc::clone(&store));
-            Some(self.space.topology().map(region, base)?)
+            prot
         };
+        let region = Region::ram(name, Arc::clone(&store));
+        let mapping = self
+            .space
+            .topology()
+            .map_with_perms(region, base, effective)?;
         inner.vmas.insert(
             base,
             Vma {
                 len,
                 prot,
                 store,
+                shared,
                 mapping,
                 name: name.to_string(),
             },
         );
+        Ok(())
+    }
+
+    /// Give the range at `vbase` a store of its own, if it is still sharing
+    /// one.
+    ///
+    /// The copy-on-write break, and the only place a copy happens. The mapping
+    /// is *replaced* rather than unmapped and remapped, so it keeps its place
+    /// in the overlap order and its identity.
+    fn break_cow_locked(&self, inner: &mut Inner, vbase: u64) -> Result<()> {
+        let Some(vma) = inner.vmas.get_mut(&vbase) else {
+            return Ok(());
+        };
+        if !vma.shared {
+            return Ok(());
+        }
+        let private = Arc::new(RamStore::new(vma.len));
+        copy_between(&vma.store, 0, &private, 0, vma.len)?;
+        vma.store = private;
+        vma.shared = false;
+        let region = Region::ram(&vma.name, Arc::clone(&vma.store));
+        self.space.topology().replace(
+            vma.mapping,
+            SpaceMapping::new(region, vbase).with_perms(vma.prot),
+        )
+    }
+
+    /// Break every shared range overlapping `base..base + len`.
+    fn break_cow_range(&self, inner: &mut Inner, base: u64, len: u64) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = base.saturating_add(len);
+        for vbase in Self::overlapping(inner, base, end) {
+            self.break_cow_locked(inner, vbase)?;
+        }
         Ok(())
     }
 
@@ -679,9 +884,7 @@ impl UserMemory {
             let Some(vma) = inner.vmas.remove(&vbase) else {
                 continue;
             };
-            if let Some(id) = vma.mapping {
-                self.space.topology().unmap(id)?;
-            }
+            self.space.topology().unmap(vma.mapping)?;
             // Whatever of the range survives is rebuilt as its own mapping,
             // carrying its bytes with it.
             let vend = vbase + vma.len;
@@ -806,6 +1009,32 @@ impl UserMemory {
         }
         Ok(())
     }
+}
+
+/// Copy `len` bytes between two stores, a chunk at a time.
+///
+/// Chunked because a `fork`ed heap is measured in megabytes and a scratch
+/// buffer the size of the whole range is a needless allocation spike; the
+/// stores are addressed by byte offset and never hand out a slice
+/// (`ROADMAP.md` §11), so a buffer of some size there must be.
+fn copy_between(
+    from: &RamStore,
+    from_off: u64,
+    to: &RamStore,
+    to_off: u64,
+    len: u64,
+) -> Result<()> {
+    const CHUNK: u64 = 64 * 1024;
+    let mut buf = alloc::vec![0u8; usize::try_from(len.min(CHUNK)).unwrap_or(0)];
+    let mut done = 0u64;
+    while done < len {
+        let n = (len - done).min(CHUNK);
+        let piece = &mut buf[..usize::try_from(n).map_err(|_| Error::Bus(BusError::BadAccess))?];
+        from.read_at(from_off + done, piece)?;
+        to.write_at(to_off + done, piece)?;
+        done += n;
+    }
+    Ok(())
 }
 
 /// A configuration error naming this module.

@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 
 use crate::core::clock::GlobalTime;
 use crate::core::error::{BusError, Error};
+use crate::core::value::Width;
 
 use super::{Answer, GuestClock, Journal, JournalMode, Prot, Tag, ThreadSet, UserMemory};
 
@@ -157,22 +158,165 @@ fn permission_is_checked_on_the_consumers_accesses() {
 }
 
 #[test]
-fn a_prot_none_range_is_absent_from_the_address_space() {
+fn a_prot_none_range_exists_and_permits_nothing() {
     let mem = UserMemory::new(48);
     mem.map_at(0x1000, 0x1000, Prot::NONE, "guard").unwrap();
     // It exists as bookkeeping...
     assert_eq!(mem.mappings().len(), 1);
     assert_eq!(mem.mapping_at(0x1000).unwrap().prot, Prot::NONE);
-    // ...and the guest cannot touch it, because the space has no region there.
-    assert!(
+    // ...and it exists in the address space too, permitting nothing. The two
+    // faults are different facts and a consumer needs both: a reserved range
+    // that refuses everything is not the same thing as an address nobody
+    // decodes, and only one of them means "you never asked for this".
+    assert_eq!(
         mem.space()
-            .read(
-                0x1000,
-                crate::core::Width::U8,
-                crate::core::space::MemAttrs::DEFAULT
-            )
-            .is_err()
+            .read(0x1000, Width::U8, crate::core::space::MemAttrs::DEFAULT),
+        Err(BusError::Protected)
     );
+    assert_eq!(
+        mem.space()
+            .read(0x9000, Width::U8, crate::core::space::MemAttrs::DEFAULT),
+        Err(BusError::Unassigned)
+    );
+}
+
+#[test]
+fn the_guest_cannot_write_a_read_only_range() {
+    // The gap this closes: `Prot` used to be enforced only on the accesses
+    // this module made *for* the guest. A store the guest issued itself went
+    // to an address space that had never heard of permission.
+    let mem = UserMemory::new(48);
+    mem.map_at(0x1000, 0x1000, Prot::RX, "text").unwrap();
+    mem.init_bytes(0x1000, b"code").unwrap();
+
+    let attrs = crate::core::space::MemAttrs::DEFAULT;
+    assert_eq!(
+        mem.space().read(0x1000, Width::U8, attrs),
+        Ok(u64::from(b'c'))
+    );
+    assert_eq!(
+        mem.space().write(0x1000, Width::U8, 0xff, attrs),
+        Err(BusError::Protected),
+        "a guest store into a text segment must fault"
+    );
+    assert_eq!(
+        mem.space().read(0x1000, Width::U8, attrs),
+        Ok(u64::from(b'c')),
+        "and change nothing"
+    );
+    assert!(
+        !mem.resolve_write_fault(0x1000).unwrap(),
+        "the fault is a real one, not a sharing fault, so there is nothing to resolve"
+    );
+}
+
+#[test]
+fn a_fork_shares_its_pages_until_one_side_writes() {
+    let mem = UserMemory::new(48);
+    mem.map_at(0x1000, 0x1000, Prot::RW, "anon").unwrap();
+    // A second, separate range: the break is per *range*, not per page, so
+    // this is what proves one range's break leaves another's sharing alone.
+    mem.map_at(0x2000, 0x1000, Prot::RW, "[heap]").unwrap();
+    mem.write_bytes(0x1000, b"parent").unwrap();
+
+    let child = mem.duplicate().unwrap();
+    assert!(mem.is_shared(0x1000), "the parent gave up exclusive use");
+    assert!(child.is_shared(0x1000), "and the child never had it");
+
+    // Both sides can still read, and see the same bytes.
+    let mut buf = [0u8; 6];
+    child.read_bytes(0x1000, &mut buf).unwrap();
+    assert_eq!(&buf, b"parent");
+
+    // A guest store on the child's side faults rather than corrupting the
+    // parent, and the consumer's fault handler resolves it.
+    let attrs = crate::core::space::MemAttrs::DEFAULT;
+    assert_eq!(
+        child.space().write(0x1000, Width::U8, b'c'.into(), attrs),
+        Err(BusError::Protected)
+    );
+    assert!(
+        child.resolve_write_fault(0x1000).unwrap(),
+        "a shared page's write fault is resolvable"
+    );
+    assert!(!child.is_shared(0x1000));
+    // Reissued, as a consumer would after restarting the instruction.
+    child
+        .space()
+        .write(0x1000, Width::U8, b'c'.into(), attrs)
+        .unwrap();
+
+    mem.read_bytes(0x1000, &mut buf).unwrap();
+    assert_eq!(&buf, b"parent", "the parent's bytes are its own");
+    child.read_bytes(0x1000, &mut buf).unwrap();
+    assert_eq!(&buf, b"carent");
+
+    // The parent's other range is still shared, and the parent's own store
+    // faults there too until it writes.
+    assert!(mem.is_shared(0x2000));
+    assert!(child.is_shared(0x2000));
+    assert_eq!(
+        mem.space().write(0x2000, Width::U8, 1, attrs),
+        Err(BusError::Protected)
+    );
+    assert!(mem.resolve_write_fault(0x2000).unwrap());
+    assert!(!mem.is_shared(0x2000));
+}
+
+#[test]
+fn a_consumer_side_write_breaks_the_sharing_itself() {
+    // A consumer writing on the guest's behalf holds nothing the address space
+    // needs and has no instruction to restart, so it must not be handed a
+    // fault to resolve. The guest's own store is the case that must.
+    let mem = UserMemory::new(48);
+    mem.map_at(0x1000, 0x1000, Prot::RW, "anon").unwrap();
+    let child = mem.duplicate().unwrap();
+    assert!(child.is_shared(0x1000));
+
+    child.write_bytes(0x1000, b"child!").unwrap();
+    assert!(!child.is_shared(0x1000));
+    let mut buf = [0u8; 6];
+    mem.read_bytes(0x1000, &mut buf).unwrap();
+    assert_eq!(&buf, &[0u8; 6], "the parent is untouched");
+}
+
+#[test]
+fn protecting_a_whole_forked_range_keeps_it_shared() {
+    // `mprotect` after a `fork` is the common case, and copying there would
+    // undo the point of a lazy fork. Only a *split* materialises.
+    let mem = UserMemory::new(48);
+    mem.map_at(0x1000, 0x1000, Prot::RW, "anon").unwrap();
+    let child = mem.duplicate().unwrap();
+
+    child.protect(0x1000, 0x1000, Prot::READ).unwrap();
+    assert!(child.is_shared(0x1000), "nothing was copied");
+    assert_eq!(child.mapping_at(0x1000).unwrap().prot, Prot::READ);
+    assert!(
+        !child.resolve_write_fault(0x1000).unwrap(),
+        "and a write fault there is now a real one"
+    );
+}
+
+#[test]
+fn sharing_does_not_survive_a_snapshot() {
+    // Derived state, and the rule is `ROADMAP.md` §15's: the bytes are
+    // architectural and are saved; who happened to be sharing them is not.
+    let mem = UserMemory::new(48);
+    mem.map_at(0x1000, 0x1000, Prot::RW, "anon").unwrap();
+    mem.write_bytes(0x1000, b"bytes").unwrap();
+    let _child = mem.duplicate().unwrap();
+    assert!(mem.is_shared(0x1000));
+
+    let mut bytes: Vec<u8> = Vec::new();
+    mem.save(&mut bytes).unwrap();
+    let restored = UserMemory::new(48);
+    let mut source = crate::core::state::SliceSource::new(&bytes);
+    restored.load(&mut source).unwrap();
+
+    assert!(!restored.is_shared(0x1000));
+    let mut buf = [0u8; 5];
+    restored.read_bytes(0x1000, &mut buf).unwrap();
+    assert_eq!(&buf, b"bytes");
 }
 
 #[test]
