@@ -166,7 +166,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::core::device::{
-    Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
+    DebugTranslation, Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
 };
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
@@ -1776,6 +1776,35 @@ impl X86 {
         self.session.lock().state.debt
     }
 
+    /// Where a **linear** address lives, as a debugger asks it.
+    ///
+    /// Linear, not virtual-with-a-segment: on this family the debugger's
+    /// address has already had segmentation applied — gdb's i386 target works
+    /// in the flat space its descriptors describe — and paging is the only
+    /// translation left to do. A caller holding a `CS:EIP` pair adds the
+    /// segment's cached base first, which is what
+    /// [`disassemble`](X86::disassemble) does.
+    ///
+    /// Side-effect free by construction, not by care: the walk sets no
+    /// accessed or dirty bit, does not consult or fill the TLB, does not latch
+    /// `CR2`, charges no cycles, and reads both descriptors with
+    /// [`MemAttrs::DEBUG`]. It is permission-free as well — it answers where
+    /// the page is, not whether an access would be allowed — so a debugger can
+    /// be shown a user page while the core is in ring 0.
+    ///
+    /// [`DebugTranslation::Identity`] when paging is off, which is a different
+    /// fact from [`DebugTranslation::Unmapped`]: the first is a processor with
+    /// nothing to translate, the second is a listing that has run off the end
+    /// of a mapped page.
+    #[must_use]
+    pub fn translate_debug(&self, linear: u32) -> DebugTranslation {
+        let Some(space) = self.space() else {
+            return DebugTranslation::Identity;
+        };
+        let sys = self.session.lock().state.sys;
+        paging::debug_translate(&sys, &space, linear)
+    }
+
     /// Disassemble `count` instructions starting at the current `CS:EIP`,
     /// reading guest memory with debug attributes.
     ///
@@ -1785,15 +1814,18 @@ impl X86 {
     ///
     /// Reads go through the code segment's **cached base**, so a listing in
     /// protected mode shows the instructions the processor would fetch rather
-    /// than the ones at `selector << 4`. Paging is not walked: a debugger that
-    /// wants a paged listing has to translate for itself, because walking the
-    /// tables here would set accessed bits and a debug read must not.
+    /// than the ones at `selector << 4`, and then through
+    /// [`translate_debug`](X86::translate_debug), so a listing of a *paged*
+    /// guest shows its code rather than whatever physical memory happens to
+    /// sit at the same number. A byte the tables do not map reads as `None`
+    /// and the decoder reports the instruction truncated, which is the honest
+    /// answer for a listing that has run off the end of a page.
     #[must_use]
     pub fn disassemble(&self, cs: u16, eip: u32, count: usize) -> Vec<disasm::Disassembled> {
         let Some(space) = self.space() else {
             return Vec::new();
         };
-        let (base, bits32, legacy) = {
+        let (base, bits32, legacy, sys) = {
             let session = self.session.lock();
             let seg = session.state.sys.seg(isa::seg::CS);
             let legacy = !self.cfg.variant.is_32bit();
@@ -1802,15 +1834,20 @@ impl X86 {
             } else {
                 u32::from(cs) << 4
             };
-            (base, !legacy && seg.big(), legacy)
+            (base, !legacy && seg.big(), legacy, session.state.sys)
         };
         let map = self.cfg.variant.map();
         disasm::disassemble_run_as(map, bits32, cs, eip, count, |addr| {
-            let addr = if legacy {
-                u64::from(base.wrapping_add(addr) & 0xf_ffff)
+            // Segmentation first, then paging: that is the order the address
+            // unit works in, and doing only the first is what used to make a
+            // listing of a paged guest show whatever physical memory sat at
+            // the same number.
+            let linear = if legacy {
+                base.wrapping_add(addr) & 0xf_ffff
             } else {
-                u64::from(base.wrapping_add(addr))
+                base.wrapping_add(addr)
             };
+            let addr = paging::debug_translate(&sys, &space, linear).phys(u64::from(linear))?;
             space
                 .read(addr, Width::U8, MemAttrs::DEBUG)
                 .ok()
@@ -1897,6 +1934,22 @@ pub fn register(reg: &mut Registry) -> Result<()> {
 impl Device for X86 {
     fn class(&self) -> &'static DeviceClass {
         self.class
+    }
+
+    /// The debug surface's route to the page unit: how a gdb `m` packet
+    /// naming an address in a paged guest reaches the right physical one.
+    ///
+    /// The address is taken as **linear** — segmentation has already been
+    /// applied by whoever asked — so this is exactly
+    /// [`translate_debug`](X86::translate_debug), narrowed to 32 bits because
+    /// that is as wide as a linear address gets on this family. An address
+    /// above that has no translation rather than a wrapped one: reporting
+    /// `Unmapped` is the honest answer, and wrapping would invent a page.
+    fn debug_translate(&self, va: u64) -> DebugTranslation {
+        match u32::try_from(va) {
+            Ok(linear) => self.translate_debug(linear),
+            Err(_) => DebugTranslation::Unmapped,
+        }
     }
 
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {

@@ -239,6 +239,9 @@ pub const fn write_allowed(writable: bool, user_access: bool, wp: bool) -> bool 
 
 use super::exec::{Ex, Exec, Fault, VEC_PF};
 use super::prot::cr0;
+use crate::core::device::DebugTranslation;
+use crate::core::space::{AddressSpace, MemAttrs};
+use crate::core::value::Width;
 
 impl Exec<'_> {
     /// Turn a linear address into a physical one.
@@ -321,6 +324,54 @@ impl Exec<'_> {
         });
         Ok((table_bits & pte::FRAME) | (linear & 0xfff))
     }
+}
+
+/// Where a linear address lives, as a debugger asks it — **without touching
+/// anything**.
+///
+/// [`Exec::translate`] cannot be reused here, and that is the whole reason
+/// `Device::debug_translate` is a separate entry point: the real walk sets the
+/// accessed and dirty bits, fills the TLB and latches `CR2` on a miss. Every
+/// one of those is guest-visible, and a debugger that caused them would be
+/// changing what it came to look at (`ROADMAP.md` §15, invariant 5). So this
+/// is a second walk that does none of them, reads both descriptors with
+/// [`MemAttrs::DEBUG`] — a page table can sit under an MMIO region — and
+/// answers *where the page is*, not whether an access would be allowed. A
+/// debugger showing a user page while the core is in ring 0 is doing its job.
+///
+/// Intel's *80386 Programmer's Reference Manual* §5.2 for the two-level walk.
+pub(super) fn debug_translate(
+    sys: &super::prot::Sys,
+    space: &AddressSpace,
+    linear: u32,
+) -> DebugTranslation {
+    if !sys.paging() {
+        // Not a failure to translate: with `CR0.PG` clear the linear address
+        // *is* the physical one, and saying so is a different fact from "the
+        // tables map nothing here".
+        return DebugTranslation::Identity;
+    }
+    let read = |at: u32| -> Option<u32> {
+        space
+            .read(u64::from(at), Width::U32, MemAttrs::DEBUG)
+            .ok()
+            .map(|v| v as u32)
+    };
+    let dir_addr = (sys.cr3 & pte::FRAME).wrapping_add((linear >> 22) * 4);
+    let Some(dir) = read(dir_addr) else {
+        return DebugTranslation::Unmapped;
+    };
+    if dir & pte::PRESENT == 0 {
+        return DebugTranslation::Unmapped;
+    }
+    let table_addr = (dir & pte::FRAME).wrapping_add(((linear >> 12) & 0x3ff) * 4);
+    let Some(table) = read(table_addr) else {
+        return DebugTranslation::Unmapped;
+    };
+    if table & pte::PRESENT == 0 {
+        return DebugTranslation::Unmapped;
+    }
+    DebugTranslation::Mapped(u64::from((table & pte::FRAME) | (linear & 0xfff)))
 }
 
 #[cfg(test)]

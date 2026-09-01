@@ -10,7 +10,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::core::device::{Deferred, Device, RealizeCtx, ResetKind};
+use crate::core::device::{DebugTranslation, Deferred, Device, RealizeCtx, ResetKind};
 use crate::core::space::{AddressSpace, RamStore, Region, RequesterId};
 use crate::core::state::{ChunkReader, MachineShape, StateWriter};
 
@@ -1568,6 +1568,58 @@ fn paging_translates_through_the_directory_and_the_table() {
     let pte = pc.read32(at::PTAB + 0x200 * 4);
     assert_eq!(pte & 0b110_0000, 0b110_0000, "accessed and dirty");
     assert_eq!(pc.read32(at::PDIR) & 0b10_0000, 0b10_0000, "accessed");
+}
+
+#[test]
+fn a_debug_translation_walks_the_tables_and_touches_nothing() {
+    // The other half of the walk: a debugger asks *where* a linear address
+    // lives and must not change the machine on the way. `Device::translate`
+    // sets accessed and dirty bits, fills the TLB and latches `CR2`; this one
+    // must do none of the three, or every `m` packet a debugger sends would
+    // move the guest's page-replacement state underneath it.
+    let pc = pc386();
+    pc.start_protected();
+    pc.write32(at::PDIR, at::PTAB | 0b111);
+    for page in 0..1024u32 {
+        pc.write32(at::PTAB + page * 4, (page << 12) | 0b111);
+    }
+    pc.write32(at::PTAB + 0x200 * 4, at::MARK | 0b111);
+
+    // Before paging is on, a linear address is already physical, and that is
+    // a different answer from "the tables map nothing here".
+    assert_eq!(
+        pc.cpu.translate_debug(0x0020_0034),
+        DebugTranslation::Identity
+    );
+
+    let mut sys = pc.cpu.sys();
+    sys.cr3 = at::PDIR;
+    sys.cr0 |= cr0::PG;
+    pc.cpu.set_sys(sys);
+
+    assert_eq!(
+        pc.cpu.translate_debug(0x0020_0034),
+        DebugTranslation::Mapped(u64::from(at::MARK + 0x34)),
+        "through the directory and the table, offset kept"
+    );
+    // The second 4 MiB has no directory entry, so there is nothing to name.
+    assert_eq!(
+        pc.cpu.translate_debug(0x0040_1234),
+        DebugTranslation::Unmapped
+    );
+    // And the walk wrote nothing: no accessed bit in either level, and no
+    // fault address latched by the miss.
+    assert_eq!(
+        pc.read32(at::PDIR) & 0b110_0000,
+        0,
+        "the directory is untouched"
+    );
+    assert_eq!(
+        pc.read32(at::PTAB + 0x200 * 4) & 0b110_0000,
+        0,
+        "the table entry is untouched"
+    );
+    assert_eq!(pc.cpu.sys().cr2, 0, "a miss latched no fault address");
 }
 
 #[test]
