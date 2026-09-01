@@ -39,6 +39,15 @@ fstool = { version = "0.4.24", default-features = false, features = [
   "zstd",
 ], optional = true }
 
+# The L2/L3 packet toolkit `dev::net` bridges to: `Frame`, `MacAddr`,
+# `EtherType`, the `L2Device` seam, `L2Hub`, TAP, slirp and the rest. First-party
+# (Karpeles Lab, MIT) and pure Rust; `default-features = false` is the whole
+# crate's *default* feature set, which is empty, so the added tree is this crate
+# and nothing under it. Optional, so the default `cargo tree` is still only
+# `rsemu` - and it is the reason ROADMAP.md 0 grants `dev/net/*` a `std`
+# exception, since `pktkit` is `std`.
+pktkit = { version = "0.1.3", default-features = false, optional = true }
+
 [features]
 # The emulation core is always compiled and never feature-gated. Everything
 # else is one feature per component, so a NES build links a 6502 and nothing
@@ -808,6 +817,49 @@ machine-mips-mini = ["cpu-mips"]
 # encoded priority level rather than a request, and there is no priority encoder
 # to wire. Adds no dependencies.
 machine-m68k-mini = ["cpu-m68k"]
+
+# The network seam (src/dev/net/link.rs): what a NIC model is attached to --
+# frames out, frames in **against a virtual tick**, carrier, and a station
+# address -- plus `NetPort`, the deterministic in-memory backend every test uses
+# and the one a recording replays into. Receive is a *pull*, not `pktkit`'s
+# push, because the tick a frame becomes visible on is guest-visible and has to
+# be virtual time rather than host time (CLAUDE.md, determinism); `net-pktkit`
+# then makes any `pktkit::L2Device` an implementation of this seam. Nothing here
+# parses a packet -- that is `pktkit`'s job and duplicating it is forbidden.
+# `no_std + alloc`, no dependencies.
+dev-net = []
+
+# A Novell NE2000 Ethernet card (src/dev/net/ne2000.rs): a National
+# Semiconductor DP8390 NIC with the card's own 16 KiB of buffer RAM, its remote
+# DMA data window at base+0x10 and its reset strap at base+0x18. The four banked
+# register pages, the receive buffer ring with its four-byte packet header and
+# its wrap at PSTOP, the transmit page and TBCR, all three remote DMA commands
+# including Send Packet, the address filter with its 64-bit multicast hash, the
+# tally counters, buffer-ring overflow with the data sheet's recovery, and the
+# 32-byte address PROM with the `WW` signature a driver identifies the card by.
+# **No bus mastering** -- the packet buffer is on the card -- so the whole part
+# is 32 I/O ports and one interrupt pin, and a Z80 can drive it with `IN` and
+# `OUT`. Written from the DP8390D data sheet and IEEE 802.3; no emulator source
+# was opened (ROADMAP.md 1). Needs `dev-net`; `no_std + alloc`, no dependencies.
+dev-ne2000 = ["dev-net"]
+
+# The `pktkit` bridge (src/dev/net/pktkit.rs): any `pktkit::L2Device` -- an
+# `L2Hub`, a TAP, slirp, a WireGuard tunnel -- behind the `dev-net` seam. Adds
+# `pktkit` (and nothing under it), and is the one file in `dev/` that needs
+# `std`, which is exactly the exception ROADMAP.md 0 grants `dev/net/*`. The
+# bridge is where push becomes pull: `pktkit` calls a handler on a host thread,
+# the handler stamps the frame into a `NetPort`, and the NIC takes it out at a
+# tick the scheduler chose. A live backend is not deterministic and the module
+# says so; what makes a run reproducible afterwards is `NetPort`'s recording.
+net-pktkit = ["dev-net", "std", "dep:pktkit"]
+
+# The `ne2k-mini` board (machines/ne2k-mini.machine plus the classes it names):
+# a Z80 with 16 KiB of ROM, 48 KiB of RAM, an NE2000 at port 0x300 and its
+# interrupt pin wired to `/INT`. It models no product; it exists so an NE2000
+# has a machine a *real driver* can be run on -- `tests/ne2000_board.rs` boots
+# Z80 firmware that initialises the card, transmits a frame and takes the
+# receive interrupt in mode 1. Adds no dependencies.
+machine-ne2k-mini = ["cpu-z80", "dev-ne2000"]
 
 [[bench]]
 # The frame-time benchmark (ROADMAP.md §13's phase-3 gate). `harness = false`

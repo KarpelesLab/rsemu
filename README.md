@@ -135,7 +135,10 @@ the VMSAv5 MMU and a parameterised peripheral aperture, the starting point for
 a downstream SoC),
 `z80-mini` (the Z80's separate 64 KiB I/O space) and `m68k-mini` (a 68000 on a
 big-endian map). They model no products; they exist so those subsystems have
-somewhere real to run.
+somewhere real to run. `ne2k-mini` is the newest of them: a Z80 with an
+**NE2000 Ethernet card** on its port bus, whose ROM is a real driver — it runs
+the DP8390's initialisation procedure, builds a frame in card memory through
+the remote DMA window, transmits it, and takes the receive interrupt in mode 1.
 
 The framework underneath is complete: address spaces with priority and
 mirroring, an oscillator forest with exact intra-tree ratios, wires, devices,
