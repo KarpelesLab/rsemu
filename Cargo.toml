@@ -703,6 +703,20 @@ machine-pc-at = [
   "dev-ata-disk",
 ]
 
+# The in-house legacy PC BIOS (src/fw/pcbios): a 64 KiB real-mode ROM image
+# this crate assembles itself, so `pc-at` boots with nothing supplied from
+# outside. POST, the BIOS Data Area, option-ROM dispatch, and INT 10h/11h/12h/
+# 13h/15h/16h/19h/1Ah. It is the only firmware rsemu ships and the only one it
+# will: FreeDOS, Win95 and XP need a *legacy* BIOS, the one permissively
+# licensed PC firmware in existence is UEFI, and the legacy alternatives are
+# GPL and unreadable to us (ROADMAP.md phase 6a, and §1). The `bios` media slot
+# still takes the user's own image; this is a default for it, not a
+# replacement. Written from the chip data sheets, Ralf Brown's Interrupt List
+# and the Intel SDM; no firmware source was consulted. Brings `src/fw/asm16`,
+# a 16-bit x86 assembler in Rust, with it — there is no external assembler and
+# no build script. Adds no dependencies and is `no_std + alloc`.
+fw-pcbios = []
+
 # The Motorola MC68000 core (src/cpu/m68k): an interpreter that models the
 # two-word prefetch queue explicitly, charges four cycles per bus access rather
 # than reading a per-instruction table, implements the supervisor/user split

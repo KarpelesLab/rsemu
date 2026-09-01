@@ -67,6 +67,11 @@ pub mod bus;
 pub mod core;
 pub mod cpu;
 pub mod dev;
+
+#[cfg(feature = "fw-pcbios")]
+#[cfg_attr(docsrs, doc(cfg(feature = "fw-pcbios")))]
+pub mod fw;
+
 pub mod host;
 pub mod machine;
 

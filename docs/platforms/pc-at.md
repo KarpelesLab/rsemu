@@ -4,18 +4,25 @@ Consumed by: `machines/pc-at.machine` and `src/dev/pc`. The source *register*
 for the platform is [`ibm-pc.md`](ibm-pc.md); this page is about the board rsemu
 actually assembles and what is known to be missing from it.
 
-## The firmware is the user's, always
+## The firmware is the user's — and there is now one of our own to fall back on
 
-rsemu ships no BIOS and no video BIOS, and will not. A PC's firmware is somebody
-else's copyrighted binary; **running one as an emulated guest is ordinary use
-whatever its licence, and redistributing it is not** (`../../ROADMAP.md` §1). So
-the machine takes both through media slots, exactly as `riscv-virt` takes its
-firmware:
+rsemu ships **no third-party** BIOS and no third-party video BIOS, and will not.
+A PC's firmware is somebody else's copyrighted binary; **running one as an
+emulated guest is ordinary use whatever its licence, and redistributing it is
+not** (`../../ROADMAP.md` §1). So the machine takes both through media slots,
+exactly as `riscv-virt` takes its firmware:
 
 ```console
-$ rsemu run pc-at --bios /usr/share/qemu/bios.bin
+$ rsemu run pc-at --hd0 disk.img                   # rsemu's own BIOS
+$ rsemu run pc-at --bios /usr/share/qemu/bios.bin  # or the user's
 $ rsemu run pc-at --bios bios.bin --media vgabios=vgabios.bin --media floppy=boot.img
 ```
+
+What changed is the first line. [`src/fw/pcbios`](../../src/fw/pcbios) is a
+**minimal legacy BIOS written here**, and the `bios` slot defaults to it — see
+[the section below](#the-in-house-bios). That is a default, not a replacement:
+`--bios` still wins, and every other firmware this board might run still comes
+from the user.
 
 `--bios` and `--vgabios` are conveniences over `--media bios=…`, and so are
 `--hd0` and `--hd1`, which fill the two drive bays on the primary IDE channel;
@@ -218,6 +225,88 @@ card's expansion-ROM BAR. So this board's `vgarom` socket — a legacy ISA ROM
 at `0xc0000` — is invisible to a firmware that knows what a 440FX is. Getting
 a video BIOS in front of this firmware needs base address registers and a PCI
 VGA function, not a bigger ROM socket.
+
+## The in-house BIOS
+
+`ROADMAP.md` phase 6a names it and says why: FreeDOS, Windows 95 and Windows XP
+all need a *legacy* BIOS, the only permissively licensed PC firmware in
+existence is EDK II / OVMF (which is UEFI), and every legacy alternative anyone
+reaches for is GPL or LGPL and therefore unreadable to us. Shipping a blob was
+not an option and reading one to learn how was not either, so it is written from
+the interrupt ABI as documented.
+
+### How the image is built
+
+There is no assembler in this repository and no C toolchain, because §0 forbids
+both. Rust cannot target 16-bit x86 either. So the firmware is **emitted**:
+[`src/fw/asm16.rs`](../../src/fw/asm16.rs) is a 16-bit x86 assembler written in
+Rust, [`src/fw/pcbios/`](../../src/fw/pcbios) is a Rust program that calls it,
+and `rsemu::fw::pcbios::image()` returns 65,536 bytes. `cargo build` is the
+whole build; the same source produces the same bytes on every host, which is
+asserted rather than assumed. The alternatives that lost — a `.code16` crate
+needing an external linker script, a vendored `.bin`, and a "BIOS" that is
+really a host callback trapping `INT 13h` — are argued in `src/fw/mod.rs`.
+
+### What it does, measured
+
+`tests/pc_at_boot.rs` runs it on this board with **no environment variable and
+nothing downloaded**, so it is part of an ordinary `cargo test`. Quoted from a
+run:
+
+```text
+  |rsemu BIOS, 639K base, 15360K extended|
+  |Booting.|
+  |Booting from 0000:7c00|
+  |rsemu boot sector on rsemu BIOS|
+  pc-at boot: INT 13h AH=08h says 4 cylinders, 16 heads, 63 sectors, 1 drive(s)
+  pc-at boot: E820[0] base=0x00000000 length=0x0009fc00 type=1
+```
+
+The sequence is: reset at `0xfffffff0`, the far jump, the 8259A pair, the 8254,
+the 146818, the BIOS Data Area, the EBDA and the `E820` table built into it, the
+option-ROM scan over `0xc0000-0xdffff`, the 8042 brought up with translation on,
+`IDENTIFY DEVICE` on the primary IDE channel, and `INT 19h` reading cylinder 0,
+head 0, sector 1 to `0000:7c00` and jumping there. The guest that lands is a
+real program that calls back in: `INT 10h`, `INT 11h`, `INT 12h`, `INT 15h`
+(`E820`) and `INT 13h` for its own second read, all of which answer.
+
+### What it does not do
+
+- **No diskette.** `INT 13h` with `DL < 0x80` answers a reset and fails
+  everything else; the µPD765 and 8237 path is not written yet. `INT 19h` tries
+  the fixed disk first, so a boot does not depend on it. This is the next thing
+  it needs, because a FreeDOS install image is a diskette.
+- **No PCI BIOS interface, no ACPI, no SMBIOS.** All three are phase-6a
+  deliverables and all three come after a boot.
+- **Text mode only**, because `pc.video` is a text-mode CRTC. `INT 10h AH=00h`
+  records a graphics mode and changes nothing.
+- **`INT 10h AH=06h` scrolls the whole screen** when the line count is
+  non-zero; the rectangle is honoured for a clear (`AL=0`), which is what
+  programs use it for.
+- **US layout, base scan codes only.** Extended (`E0`-prefixed) keys are
+  dropped rather than half-decoded, and the lock states are not tracked.
+
+### Two things the board does that the firmware found
+
+Both are device-side, both are measured by `tests/pc_at_boot.rs`, and neither is
+a firmware bug:
+
+- **A PAM window with nothing under it faults instead of reading as ones.**
+  `pc.pmc` maps thirteen shadow windows across `0xc0000-0xfffff`. Where a
+  window has no permission and no region beneath it — `0xd0000-0xdffff` on this
+  board — a read returns `Err(Protected)` rather than falling through to the
+  space's `unassigned = read-as-ones`. An option-ROM scan walks exactly that
+  range, so the CPU's bus-fault counter climbs by 32 during a normal POST. A
+  440FX with a window set to "ROM read" and no ROM there is an ISA bus with
+  pull-ups, which reads as ones.
+- **`pc.kbc` delivers one keystroke and then goes quiet.** `read_data` clears
+  `OBF` and immediately refills the output buffer from the keyboard's queue
+  without re-driving `IRQ1`, so the line never falls between two bytes and the
+  edge-triggered 8259A never sees a second edge. Measured: after one key the
+  status port reads `0x05` (a byte waiting) with the master's `IRR` at `0x00`.
+  On real hardware the line drops when the buffer is read and rises when the
+  next byte arrives a serial frame later. The fix is a `refresh()` after the
+  clear and a deferred refill.
 
 ## What is known to be missing
 
