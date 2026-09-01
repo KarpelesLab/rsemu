@@ -471,7 +471,14 @@ pub fn lift<S: InsnSource>(
 /// *bytes* at `entry_pc` are a function of the page tables, so a key without
 /// it lets a cache return a block lifted through a mapping the guest has since
 /// replaced. See the module docs, "Paging".
-fn key(cfg: &Config, origin: Origin) -> u64 {
+///
+/// Public because a block cache has to ask this question *before* it lifts
+/// anything: `jit::Dispatcher` looks a block up under
+/// `(pc, key(cfg, origin))` and calls [`lift`] only when that misses. A
+/// dispatcher that derived the key itself would be a second copy of the
+/// answer, and the two would drift.
+#[must_use]
+pub fn key(cfg: &Config, origin: Origin) -> u64 {
     let mut key = 0u64;
     if cfg.ext.c {
         key |= 1;

@@ -46,6 +46,22 @@
 //! [`MemOp`]'s size, sign and [`Align`], and a wrong one of those diverges
 //! here immediately.
 //!
+//! # Two harnesses, not one
+//!
+//! [`compare`] runs **one block**, freshly lifted, and stops. That is right
+//! for testing a frontend and blind to everything the translation runtime
+//! does, so `compare_cached` (with the `jit` feature) is the second harness:
+//! the same oracle, the same columns, but many blocks through
+//! `jit::Dispatcher` — served from a block cache, chained exit to successor,
+//! invalidated when the guest writes into a translated page, and with every
+//! access resolved through `jit::Tlb`. Its instruction bytes come out of guest
+//! RAM rather than out of [`Case::program`], which is what makes
+//! self-modifying code testable at all.
+//!
+//! Both are driven from the generated corpus in
+//! `tests/riscv_lift_differential.rs` and from `fuzz/fuzz_targets/`, so a case
+//! that finds a frontend bug also exercises the runtime.
+//!
 //! # What this harness deliberately does not cover
 //!
 //! * **Traps.** When the oracle takes one, the two are compared only on
@@ -72,6 +88,14 @@ use crate::ir::{Align, InsnStart, Interp, IrHost, MemOp, Outcome, RegSlot, verif
 
 use super::lift::{self, Origin, PC, x_slot};
 use super::{Config, Hart};
+
+#[cfg(feature = "jit")]
+use crate::ir::AccessKind;
+#[cfg(feature = "jit")]
+use crate::jit::{
+    BlockCache, Context as TlbContext, DirtyPages, Dispatcher, Epoch, Frontend, Stop, StoreLog,
+    Tlb, Translation,
+};
 
 /// Where a case's program is loaded, and its RAM mapped.
 ///
@@ -684,6 +708,441 @@ impl IrHost for Host {
     fn insn_start(&mut self, _mark: &InsnStart) {}
 }
 
+// ---------------------------------------------------------------------------
+// The cached and chained path
+// ---------------------------------------------------------------------------
+
+/// The same comparison, run through the translation runtime rather than one
+/// block at a time.
+///
+/// [`compare`] lifts one block, runs it, and stops. That is the right shape
+/// for testing a *frontend*, and it is blind to every mechanism `jit` adds:
+/// nothing is ever served from a cache, no exit is ever patched, no
+/// translation is ever invalidated, and no access ever goes through a software
+/// TLB. So this is the second harness, and it covers exactly what the first
+/// cannot:
+///
+/// | | [`compare`] | [`compare_cached`] |
+/// | --- | --- | --- |
+/// | blocks | one | up to `blocks`, chained |
+/// | translations | one, always fresh | cached under `(pc, key)`, and re-served |
+/// | exits | back to the caller | patched straight to the successor |
+/// | memory | the address space directly | through `jit::Tlb`, which must answer identically |
+/// | instruction bytes | the case's own `Vec<u32>` | **guest RAM**, so a store into the code page is visible |
+/// | invalidation | nothing to invalidate | a guest write into a translated page |
+///
+/// The last two rows are what make self-modifying code testable at all: the
+/// subject reads its instructions out of the same RAM it stores into, exactly
+/// as the oracle does, so a program that overwrites itself is a program the
+/// two engines must still agree about.
+///
+/// # Errors
+///
+/// [`Divergence`], on the same columns [`compare`] compares, plus two of its
+/// own: a block cache whose back edges stopped being symmetric, and a chain
+/// link that outlived its target. Both are reported here rather than left to
+/// show up later as a wrong block executed.
+///
+/// # Panics
+///
+/// As [`compare`]: a non-RV64 config, a PMP entry, or a program that does not
+/// fit in the first page is harness misuse.
+#[cfg(feature = "jit")]
+#[allow(clippy::missing_panics_doc)]
+pub fn compare_cached(case: &Case, blocks: usize) -> Result<Verdict, Divergence> {
+    assert!(
+        case.cfg.pmp_count == 0,
+        "the harness compares ticks, and a PMP refusal is not one the block can know about"
+    );
+    assert!(
+        (case.program.len() as u64) * 4 <= DATA,
+        "a case's program lives in the first page"
+    );
+
+    let (oracle_space, oracle_ram) = machine(case);
+    let (subject_space, subject_ram) = machine(case);
+
+    // ---- the subject: cache, chain, and a TLB on the memory path ---------
+    let mut front = Lifter::new(case, Arc::clone(&subject_space));
+    let mut host = CachedHost::new(case, subject_space);
+    let mut disp = Dispatcher::with_cache(BlockCache::with_capacity(256));
+    let run = disp
+        .run(&mut front, &mut host, BASE, blocks)
+        .map_err(|e| diverged(case, format!("the dispatcher refused a block: {e}")))?;
+    if let Some(e) = front.rejected.take() {
+        return Err(diverged(case, e));
+    }
+    if let Err(e) = disp.cache().check() {
+        return Err(diverged(
+            case,
+            format!("the block cache is inconsistent: {e}"),
+        ));
+    }
+    if run.insns == 0 {
+        return Ok(Verdict::Nothing);
+    }
+
+    // ---- the oracle: the interpreter, the same instructions --------------
+    let hart = Hart::new(case.cfg.with_reset_vector(BASE));
+    hart.attach_space(oracle_space);
+    for (n, value) in case.regs.iter().enumerate().skip(1) {
+        hart.set_x(n as u32, *value);
+    }
+    let mut stepped = 0usize;
+    while stepped < run.insns && hart.csrs().mcause == 0 {
+        hart.step();
+        stepped += 1;
+    }
+
+    let oracle_trapped = hart.csrs().mcause != 0;
+    let subject_faulted = matches!(run.stop, Stop::Fault(_));
+    if oracle_trapped != subject_faulted {
+        return Err(diverged(
+            case,
+            format!(
+                "the interpreter {} and the cached path {} (stop {:?}, mcause {:#x}, mtval {:#x})",
+                if oracle_trapped {
+                    "trapped"
+                } else {
+                    "did not trap"
+                },
+                if subject_faulted {
+                    "faulted"
+                } else {
+                    "did not fault"
+                },
+                run.stop,
+                hart.csrs().mcause,
+                hart.csrs().mtval,
+            ),
+        ));
+    }
+    if oracle_trapped {
+        return Ok(Verdict::Trapped { insns: stepped });
+    }
+
+    // ---- every column, over however many blocks ran ---------------------
+    for n in 1..32u32 {
+        let want = hart.x(n);
+        let got = host.slot(x_slot(n));
+        if want != got {
+            return Err(diverged(
+                case,
+                format!(
+                    "x{n} after {} blocks: the interpreter says {want:#018x}, the cached path \
+                     says {got:#018x}",
+                    run.blocks
+                ),
+            ));
+        }
+    }
+
+    let want_pc = hart.pc();
+    if want_pc != run.pc {
+        return Err(diverged(
+            case,
+            format!(
+                "pc after {} blocks: the interpreter says {want_pc:#018x}, the cached path says \
+                 {:#018x}",
+                run.blocks, run.pc
+            ),
+        ));
+    }
+
+    let want_ticks = hart.cycles();
+    if want_ticks != host.ticks {
+        return Err(diverged(
+            case,
+            format!(
+                "ticks after {} blocks: the interpreter charged {want_ticks}, the cached path \
+                 charged {}. A cache hit and a cache miss must be indistinguishable to the \
+                 guest, including in cycle accounting (ROADMAP.md §0)",
+                run.blocks, host.ticks
+            ),
+        ));
+    }
+
+    for off in 0..RAM_SIZE {
+        let want = oracle_ram.read_u8(off).unwrap_or(0);
+        let got = subject_ram.read_u8(off).unwrap_or(0);
+        if want != got {
+            return Err(diverged(
+                case,
+                format!(
+                    "memory at {:#x}: the interpreter left {want:#04x}, the cached path left \
+                     {got:#04x}",
+                    BASE + off
+                ),
+            ));
+        }
+    }
+
+    Ok(Verdict::Agreed {
+        insns: run.insns,
+        ticks: want_ticks,
+    })
+}
+
+/// What a cached run exercised, beside whether it agreed.
+///
+/// Separate from [`Verdict`] because "the two engines agreed" and "the cache
+/// was actually used" are different assertions, and a harness that conflates
+/// them stops noticing the day it quietly stops exercising what it was written
+/// for.
+#[cfg(feature = "jit")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedRun {
+    /// The verdict.
+    pub verdict: Verdict,
+    /// Blocks executed.
+    pub blocks: usize,
+    /// Blocks translated — one per distinct `(pc, key)` that survived.
+    pub translated: u64,
+    /// Blocks reached by following a patched exit, with no lookup at all.
+    pub chained: u64,
+    /// Blocks invalidated by a guest store into their page.
+    pub smc: u64,
+    /// Memory accesses served out of a TLB entry.
+    pub tlb_hits: u64,
+}
+
+/// [`compare_cached`], reporting what the run exercised as well as whether it
+/// agreed.
+///
+/// # Errors
+///
+/// As [`compare_cached`].
+///
+/// # Panics
+///
+/// As [`compare_cached`].
+#[cfg(feature = "jit")]
+#[allow(clippy::missing_panics_doc)]
+pub fn measure_cached(case: &Case, blocks: usize) -> Result<CachedRun, Divergence> {
+    let verdict = compare_cached(case, blocks)?;
+    // A second, independent run on a fresh machine: the counters come from a
+    // run that agreed with the interpreter, and running it twice is itself a
+    // determinism check on the whole path.
+    let (space, _ram) = machine(case);
+    let mut front = Lifter::new(case, Arc::clone(&space));
+    let mut host = CachedHost::new(case, space);
+    let mut disp = Dispatcher::with_cache(BlockCache::with_capacity(256));
+    let run = disp
+        .run(&mut front, &mut host, BASE, blocks)
+        .map_err(|e| diverged(case, format!("the dispatcher refused a block: {e}")))?;
+    Ok(CachedRun {
+        verdict,
+        blocks: run.blocks,
+        translated: disp.stats().translated,
+        chained: disp.stats().chained,
+        smc: disp.stats().smc,
+        tlb_hits: host.tlb.stats().hits,
+    })
+}
+
+/// The RISC-V half of the dispatcher's contract: lift on demand, out of guest
+/// RAM.
+#[cfg(feature = "jit")]
+struct Lifter {
+    cfg: Config,
+    space: Arc<AddressSpace>,
+    attrs: MemAttrs,
+    /// The first block the verifier rejected, reported as a divergence rather
+    /// than swallowed — a malformed block is a frontend bug of exactly the
+    /// kind this harness exists to catch.
+    rejected: Option<String>,
+}
+
+#[cfg(feature = "jit")]
+impl Lifter {
+    fn new(case: &Case, space: Arc<AddressSpace>) -> Lifter {
+        Lifter {
+            cfg: case.cfg,
+            space,
+            attrs: MemAttrs::DEFAULT.with_requester(case.cfg.requester),
+            rejected: None,
+        }
+    }
+}
+
+#[cfg(feature = "jit")]
+impl Frontend for Lifter {
+    fn epoch(&mut self) -> Epoch {
+        // `satp` is bare on this hart and nothing in the lifted subset can
+        // write it, so the translation half is fixed at zero and the topology
+        // half is the only one that can move. A paged dispatcher reads
+        // `Csrs::translation_gen` here — the same counter `Origin::Paged`
+        // carries into the key.
+        Epoch {
+            topology: self.space.generation(),
+            translation: 0,
+        }
+    }
+
+    fn key(&mut self) -> u64 {
+        lift::key(&self.cfg, Origin::Bare)
+    }
+
+    fn pc_slot(&self) -> RegSlot {
+        PC
+    }
+
+    fn translate(&mut self, pc: u64) -> crate::core::error::Result<Translation> {
+        // Out of guest RAM, not out of the case's `Vec<u32>`: a store that
+        // rewrote an instruction has to be visible here, or the whole
+        // self-modifying-code mechanism is untested. In bare mode with plain
+        // RAM this *is* the fetch path (`lift`'s module docs, "Paging"), and a
+        // paged dispatcher owes the walk instead.
+        let space = Arc::clone(&self.space);
+        let attrs = self.attrs;
+        let mut src = |addr: u64| space.read(addr, Width::U16, attrs).ok().map(|v| v as u16);
+        let lifted = lift::lift(&self.cfg, Origin::Bare, pc, &mut src, lift::MAX_INSNS)?;
+        if self.rejected.is_none()
+            && let Err(e) = verify(&lifted.block)
+        {
+            self.rejected = Some(format!(
+                "the frontend produced a block the verifier rejects: {e}\n{}",
+                lifted.block
+            ));
+        }
+        Ok(Translation {
+            page: pc & !crate::jit::PAGE_MASK,
+            insns: lifted.insns,
+            block: lifted.block,
+        })
+    }
+}
+
+/// [`Host`], with the memory path routed through a software TLB and every
+/// store recorded for the block cache.
+///
+/// The access rules are [`Host`]'s, unchanged — one access when aligned, one
+/// per byte when not, a tick each — because those are the *frontend's*
+/// contract and this harness must not quietly relax them. What changes is
+/// only where the bytes come from, which is exactly the claim being tested: a
+/// TLB hit must produce what the address space would have produced, down to
+/// the error.
+#[cfg(feature = "jit")]
+struct CachedHost {
+    slots: [u64; lift::SLOT_COUNT as usize],
+    tlb: Tlb,
+    attrs: MemAttrs,
+    misaligned: bool,
+    ticks: u64,
+    dirty: DirtyPages,
+}
+
+/// The world a bare machine-mode hart's accesses happen in.
+#[cfg(feature = "jit")]
+const MACHINE: TlbContext = TlbContext {
+    level: 3,
+    translating: false,
+};
+
+#[cfg(feature = "jit")]
+impl CachedHost {
+    fn new(case: &Case, space: Arc<AddressSpace>) -> CachedHost {
+        let mut slots = [0u64; lift::SLOT_COUNT as usize];
+        for (n, value) in case.regs.iter().enumerate().skip(1) {
+            slots[n] = *value;
+        }
+        CachedHost {
+            slots,
+            tlb: Tlb::new(space),
+            attrs: MemAttrs::DEFAULT.with_requester(case.cfg.requester),
+            misaligned: case.cfg.misaligned,
+            ticks: 0,
+            dirty: DirtyPages::new(),
+        }
+    }
+
+    fn slot(&self, slot: RegSlot) -> u64 {
+        self.slots[slot.0 as usize]
+    }
+
+    /// One access, through the TLB. Bare mode, so the physical address is the
+    /// guest address.
+    fn once(&mut self, addr: u64, width: Width, value: Option<u64>) -> MemResult<u64> {
+        self.ticks += 1;
+        match value {
+            None => self
+                .tlb
+                .read(AccessKind::Load, addr, addr, width, MACHINE, self.attrs),
+            Some(v) => {
+                let done = self
+                    .tlb
+                    .write(addr, addr, width, v, MACHINE, self.attrs)
+                    .map(|()| 0);
+                if done.is_ok() {
+                    // The self-modifying-code hook. Drained by the dispatcher
+                    // at the next block boundary, which is before anything can
+                    // execute the bytes this just changed.
+                    self.dirty.note(addr, width.bytes());
+                }
+                done
+            }
+        }
+    }
+
+    fn access(&mut self, mem: &MemOp, addr: u64, value: Option<u64>) -> MemResult<u64> {
+        let bytes = mem.size.bytes();
+        if addr.is_multiple_of(bytes) {
+            return self.once(addr, mem.size, value);
+        }
+        if mem.align == Align::Fault || !self.misaligned {
+            return Err(BusError::BadAccess);
+        }
+        match value {
+            None => {
+                let mut got = 0u64;
+                for i in 0..bytes {
+                    let byte = self.once(addr.wrapping_add(i), Width::U8, None)?;
+                    got |= (byte & 0xff) << (8 * i);
+                }
+                Ok(got)
+            }
+            Some(v) => {
+                for i in 0..bytes {
+                    self.once(addr.wrapping_add(i), Width::U8, Some(v >> (8 * i)))?;
+                }
+                Ok(0)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "jit")]
+impl IrHost for CachedHost {
+    fn read_slot(&mut self, slot: RegSlot) -> u128 {
+        u128::from(self.slot(slot))
+    }
+
+    fn write_slot(&mut self, slot: RegSlot, value: u128) {
+        self.slots[slot.0 as usize] = value as u64;
+    }
+
+    fn load(&mut self, mem: &MemOp, addr: u64) -> MemResult<u64> {
+        self.access(mem, addr, None)
+    }
+
+    fn store(&mut self, mem: &MemOp, addr: u64, value: u64) -> MemResult {
+        self.access(mem, addr, Some(value)).map(|_| ())
+    }
+
+    fn charge(&mut self, ticks: u64) {
+        self.ticks += ticks;
+    }
+
+    fn insn_start(&mut self, _mark: &InsnStart) {}
+}
+
+#[cfg(feature = "jit")]
+impl StoreLog for CachedHost {
+    fn drain_dirty(&mut self, sink: &mut dyn FnMut(u64)) {
+        self.dirty.drain_dirty(sink);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,5 +1234,186 @@ mod tests {
         let c_addi = 0x0285u32;
         let case = Case::new(vec![c_addi | (c_addi << 16)]).with_config(cfg);
         assert_eq!(agreed(&case), Verdict::Agreed { insns: 2, ticks: 2 });
+    }
+
+    // -----------------------------------------------------------------------
+    // The cached and chained path
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "jit")]
+    mod cached {
+        use super::*;
+        use crate::jit::{BlockCache, Epoch};
+
+        const fn jal(rd: u32, imm: i32) -> u32 {
+            j_type(rd, imm)
+        }
+
+        fn agreed(case: &Case, blocks: usize) -> CachedRun {
+            match measure_cached(case, blocks) {
+                Ok(run) => {
+                    assert!(
+                        matches!(run.verdict, Verdict::Agreed { .. }),
+                        "expected agreement, got {:?}",
+                        run.verdict
+                    );
+                    run
+                }
+                Err(e) => panic!("diverged:\n{e}"),
+            }
+        }
+
+        #[test]
+        fn a_block_served_from_the_cache_agrees_with_the_interpreter() {
+            // A one-block loop, twenty times round. If a cached block were
+            // served with anything but the bytes it was lifted from, the
+            // register column would say so.
+            let case = Case::new(vec![addi(10, 10, 1), jal(0, -4)]);
+            let run = agreed(&case, 20);
+            assert_eq!(run.blocks, 20);
+            assert_eq!(run.translated, 1, "one translation served twenty times");
+        }
+
+        #[test]
+        fn a_chained_pair_agrees_with_the_interpreter() {
+            // Two blocks alternating, so the exits are patched in both
+            // directions and almost every block after the first two is reached
+            // without a lookup at all.
+            let case = Case::new(vec![
+                addi(10, 10, 1),
+                jal(0, 8),       // 0x04 -> 0x0c
+                addi(11, 11, 2), // 0x08 (only reached from the second jump)
+                jal(0, -4),      // 0x0c -> 0x08
+            ]);
+            let run = agreed(&case, 30);
+            assert!(
+                run.chained >= 25,
+                "chained {} of {} blocks",
+                run.chained,
+                run.blocks
+            );
+        }
+
+        #[test]
+        fn every_access_on_the_cached_path_goes_through_the_software_tlb() {
+            // The TLB is not an optional decoration on this harness: if it
+            // stopped being consulted, every other assertion here would still
+            // pass and the TLB would be untested.
+            let case = Case::seeded(vec![sd(1, 5, 0), ld(6, 1, 0), addi(7, 6, 1)]);
+            let run = agreed(&case, 8);
+            assert!(run.tlb_hits > 0, "no access was served from an entry");
+        }
+
+        #[test]
+        fn a_store_into_the_code_page_invalidates_the_translation_of_it() {
+            // The self-modifying-code test, and the one that fails loudly if
+            // `note_write` stops being called. The loop body is rewritten by
+            // its own store on the first pass:
+            //
+            //   0x00  addi x10, x10, 1     <- becomes addi x10, x10, 7
+            //   0x04  sd   x11, 0(x1)      <- becomes a nop
+            //   0x08  jal  x0, -8          -> back to 0x00
+            //
+            // so the interpreter adds one once and seven thereafter. A cached
+            // block that survived the store adds one every time, which is a
+            // divergence in x10 within three blocks.
+            let replacement = u64::from(addi(10, 10, 7)) | (u64::from(addi(0, 0, 0)) << 32);
+            let case = Case::new(vec![addi(10, 10, 1), sd(1, 11, 0), jal(0, -8)])
+                .with_reg(1, BASE)
+                .with_reg(11, replacement);
+            let run = agreed(&case, 12);
+            assert!(run.smc > 0, "no translation was invalidated by the store");
+        }
+
+        #[test]
+        fn a_store_that_misses_every_translated_page_invalidates_nothing() {
+            // The other half of the same claim: an ordinary data store must
+            // not throw the cache away, or self-modifying-code support costs
+            // the whole speed-up it is paying for.
+            let case = Case::seeded(vec![addi(10, 10, 1), sd(2, 10, 0), jal(0, -8)]);
+            let run = agreed(&case, 12);
+            assert_eq!(run.smc, 0);
+            assert!(run.translated <= 2, "the loop was translated once");
+        }
+
+        #[test]
+        fn changing_the_page_tables_makes_the_same_virtual_address_a_different_block() {
+            // The invalidation the block cache does *not* do by flushing,
+            // because the frontend already put it in the key: write a PTE,
+            // `SFENCE.VMA`, and the same virtual address means something else.
+            // `Csrs::translation_gen` moves, `Origin::Paged` carries it, and
+            // the key no longer matches.
+            let cfg = Config::rv64i();
+            let before = lift::key(&cfg, Origin::Paged { generation: 1 });
+            let after = lift::key(&cfg, Origin::Paged { generation: 2 });
+            assert_ne!(before, after, "the generation is in the key");
+
+            let mut cache = BlockCache::with_capacity(16);
+            let mut src = Words(&[addi(10, 10, 1)]);
+            let lifted =
+                lift::lift(&cfg, Origin::Paged { generation: 1 }, BASE, &mut src, 4).expect("rv64");
+            let id = cache.insert(BASE, before, BASE, lifted.insns, lifted.block);
+            assert_eq!(cache.lookup(BASE, before), Some(id));
+            assert_eq!(
+                cache.lookup(BASE, after),
+                None,
+                "the mapping changed, so the block at this VA must be lifted again"
+            );
+        }
+
+        #[test]
+        fn a_bare_block_and_a_paged_block_at_the_same_address_are_different_blocks() {
+            let cfg = Config::rv64i();
+            assert_ne!(
+                lift::key(&cfg, Origin::Bare),
+                lift::key(&cfg, Origin::Paged { generation: 0 }),
+                "a physical lift and a virtual lift of the same number must not collide"
+            );
+        }
+
+        #[test]
+        fn a_topology_change_invalidates_a_bare_block_that_the_key_would_not() {
+            // `Origin::Bare` contributes nothing to the key, so nothing about
+            // the block distinguishes one lifted before a remap from one
+            // lifted after. The epoch does.
+            let cfg = Config::rv64i();
+            let key = lift::key(&cfg, Origin::Bare);
+            let mut cache = BlockCache::with_capacity(16);
+            let mut src = Words(&[addi(10, 10, 1)]);
+            let lifted = lift::lift(&cfg, Origin::Bare, BASE, &mut src, 4).expect("rv64");
+            cache.insert(BASE, key, BASE, lifted.insns, lifted.block);
+            assert!(cache.lookup(BASE, key).is_some());
+            assert!(cache.sync(Epoch {
+                topology: 1,
+                translation: 0
+            }));
+            assert_eq!(cache.lookup(BASE, key), None);
+        }
+
+        #[test]
+        fn the_cached_path_charges_exactly_the_ticks_the_interpreter_charges() {
+            // Stated as its own test because it is the phase-5 gate in
+            // miniature: a cache hit and a cache miss must be
+            // indistinguishable to the guest, cycle counter included. The
+            // program mixes fetch charges with a misaligned access, whose
+            // charge is data-dependent and paid by the access itself.
+            let case = Case::seeded(vec![sd(1, 5, 1), ld(6, 1, 1), jal(0, -8)]);
+            let run = agreed(&case, 10);
+            let Verdict::Agreed { ticks, .. } = run.verdict else {
+                unreachable!("agreed() asserted it")
+            };
+            assert!(ticks > 0);
+        }
+
+        #[test]
+        fn an_unsupported_instruction_hands_the_pc_back_rather_than_spinning() {
+            // `ecall` is outside the lifted subset, so the block covering it
+            // is empty and the dispatcher must stop instead of translating the
+            // same nothing forever.
+            const ECALL: u32 = 0x0000_0073;
+            let case = Case::new(vec![addi(10, 10, 1), ECALL, addi(11, 11, 1)]);
+            let run = agreed(&case, 100);
+            assert!(run.blocks < 100, "it stopped at the ecall");
+        }
     }
 }

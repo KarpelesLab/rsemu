@@ -156,3 +156,105 @@ fn a_long_program_lifts_up_to_the_block_limit_and_still_agrees() {
     }
     assert_eq!(agreed, 200);
 }
+
+// ---------------------------------------------------------------------------
+// The cached and chained path
+// ---------------------------------------------------------------------------
+
+/// Run `count` generated cases from `seed` through the translation runtime.
+///
+/// Same corpus, same oracle, a different subject: `compare_cached` runs many
+/// blocks through `jit::Dispatcher`, so a case here exercises the block cache,
+/// block chaining, the page filter, and the software TLB on every access. The
+/// sweeps above cover none of those — a single block is never served twice, no
+/// exit is ever patched, and nothing is ever invalidated.
+///
+/// Returns `(agreed, trapped, nothing, chained)`. The last is what lets a test
+/// assert that chaining actually happened, rather than that nothing broke
+/// while it did not.
+#[cfg(feature = "jit")]
+fn cached_sweep(cfg: Config, seed: u64, count: usize, blocks: usize) -> (usize, usize, usize, u64) {
+    use rsemu::cpu::riscv::differential::measure_cached;
+
+    let mut rng = Lcg(seed);
+    let (mut agreed, mut trapped, mut nothing, mut chained) = (0, 0, 0, 0u64);
+    for n in 0..count {
+        let len = 1 + (rng.next() % 12) as usize;
+        let case = Case::seeded(program(&mut rng, len)).with_config(cfg);
+        match measure_cached(&case, blocks) {
+            Ok(run) => {
+                chained += run.chained;
+                match run.verdict {
+                    Verdict::Agreed { .. } => agreed += 1,
+                    Verdict::Trapped { .. } => trapped += 1,
+                    Verdict::Nothing => nothing += 1,
+                }
+            }
+            Err(e) => panic!("case {n} of seed {seed:#x} diverged on the cached path:\n{e}"),
+        }
+    }
+    (agreed, trapped, nothing, chained)
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn the_generated_corpus_agrees_through_the_block_cache_and_the_software_tlb() {
+    let (agreed, trapped, nothing, chained) = cached_sweep(Config::rv64i(), 0x5eed_0001, 2_000, 8);
+    assert!(
+        agreed > 1_000,
+        "only {agreed} of 2000 cases ran to completion ({trapped} trapped, {nothing} lifted \
+         nothing)"
+    );
+    assert!(
+        chained > 0,
+        "not one exit was ever patched, so chaining was never exercised"
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn the_cached_path_agrees_on_a_hart_that_traps_misaligned_accesses_too() {
+    // The misalignment policy is in the cache key, so serving a block lifted
+    // under one policy to a hart running the other is exactly the bug the key
+    // exists to prevent. Running the whole corpus both ways is how that stays
+    // true.
+    let mut strict = Config::rv64i();
+    strict.misaligned = false;
+    let (agreed, trapped, _, _) = cached_sweep(strict, 0x5eed_0002, 1_000, 8);
+    assert!(
+        agreed > 200,
+        "only {agreed} of 1000 cases ran to completion"
+    );
+    assert!(trapped > 0, "the fault column was never tested");
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn the_cached_path_agrees_on_a_core_with_compressed_instructions() {
+    let mut cfg = Config::rv64i();
+    cfg.ext = Extensions {
+        c: true,
+        ..Extensions::I
+    };
+    let (agreed, _, _, _) = cached_sweep(cfg, 0x5eed_0003, 1_000, 8);
+    assert!(
+        agreed > 500,
+        "only {agreed} of 1000 cases ran to completion"
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn a_long_cached_run_stays_in_agreement_for_a_hundred_blocks() {
+    // The sweeps above run eight blocks, which is enough to chain but not
+    // enough for a cached block to be re-served many times or for the page
+    // filter to see much traffic. This one runs a hundred, on programs whose
+    // branches make the block graph revisit itself.
+    let mut rng = Lcg(0x5eed_0005);
+    for n in 0..200 {
+        let case = Case::seeded(program(&mut rng, 10));
+        if let Err(e) = rsemu::cpu::riscv::differential::compare_cached(&case, 100) {
+            panic!("case {n} diverged after up to a hundred blocks:\n{e}");
+        }
+    }
+}

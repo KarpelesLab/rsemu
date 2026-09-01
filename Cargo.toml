@@ -365,6 +365,25 @@ machine-spi-panel = ["cpu-riscv", "bus-spi", "dev-st7272a", "dev-lcdc"]
 # is `no_std + alloc`.
 ir = []
 
+# The translation runtime (src/jit): the three mechanisms ROADMAP.md §9.1 says
+# actually produce speed, in the order it puts them in. A per-CPU
+# direct-mapped software TLB (4096 entries per set, split by access type,
+# entry = guest page tag plus host addend) that resolves a guest address to a
+# byte offset in a `RamStore` without taking the address space's read guard; a
+# translation block cache keyed on `(guest PC, Block::key)` with block
+# chaining — an exit patched straight to its successor, and back edges so it
+# can be unpatched — and self-modifying-code detection through a page filter
+# over the pages translations were lifted from.
+#
+# Deliberately **not** here yet: any host code generation. The dispatcher runs
+# blocks on `ir::Interp`, which is the oracle every host backend will be
+# differentially tested against, and every mechanism above is already the
+# shape a code generator needs. That also means this round needs no W^X buffer
+# and therefore no `unsafe` and no `std`: it is `no_std + alloc` like the IR it
+# serves, so §11's bare-metal row gets the cache too. The `std` line moves in
+# the file that needs it, when one does. Needs `ir`; adds no dependencies.
+jit = ["ir"]
+
 # Level-3 execution (src/usermode): running a program with no guest kernel
 # under it, `qemu-user`/gVisor-shaped (ROADMAP.md §2, phase 5b). The four
 # things a syscall kernel cannot build for itself and rsemu owns because they
@@ -914,3 +933,13 @@ codegen-units = 1
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[[bench]]
+# What the software TLB and the block cache bought, measured one mechanism at a
+# time (ROADMAP.md §9.1). `harness = false` for the same reason the frame-time
+# benchmark gives — libtest's bench harness is nightly-only and this project is
+# stable — and `required-features` because there is nothing to dispatch without
+# a frontend and a runtime.
+name             = "jit_dispatch"
+harness          = false
+required-features = ["jit", "cpu-riscv-lift"]

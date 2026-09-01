@@ -47,11 +47,18 @@
 //! contract for guest threads, and the record/replay funnel; the syscall
 //! kernel is a downstream crate's (`ROADMAP.md` §2.1).
 //!
+//! With `jit`, the translation runtime is in: a per-CPU software TLB, a block
+//! cache keyed on `(guest PC, `Block::key`)` with its exits patched straight to
+//! their successors, and a page filter that throws a translation away when the
+//! guest writes into the page it was lifted from — `ROADMAP.md` §9.1's first
+//! three mechanisms, in front of the IR interpreter. See [`jit`].
+//!
 //! Not yet: a native window or a native sound card — both need either a
 //! GUI/audio dependency the policy forbids or a seventh `unsafe` subsystem the
-//! ceiling forbids; the JIT backends, so everything is interpreted — the
-//! translation IR they lower from is under [`ir`]; and the rest of the host
-//! layer (VNC, an interactive monitor console).
+//! ceiling forbids; the JIT's *host code generators*, so everything is still
+//! interpreted — the translation IR they lower from is under [`ir`] and the
+//! runtime they slot into is under [`jit`]; and the rest of the host layer
+//! (VNC, an interactive monitor console).
 //!
 //! # `no_std`
 //!
@@ -77,6 +84,10 @@ pub mod float;
 #[cfg(feature = "ir")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ir")))]
 pub mod ir;
+
+#[cfg(feature = "jit")]
+#[cfg_attr(docsrs, doc(cfg(feature = "jit")))]
+pub mod jit;
 
 #[cfg(feature = "usermode")]
 #[cfg_attr(docsrs, doc(cfg(feature = "usermode")))]
@@ -153,6 +164,9 @@ pub fn build_info() -> alloc::string::String {
     }
     if cfg!(feature = "machine-pc-at") {
         features.push("machine-pc-at");
+    }
+    if cfg!(feature = "jit") {
+        features.push("jit");
     }
     if cfg!(feature = "ir") {
         features.push("ir");

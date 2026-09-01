@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-blk", "dev-ne2000", "ir", "cpu-riscv-lift", "float"]
+features         = ["std", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-blk", "dev-ne2000", "ir", "jit", "cpu-riscv-lift", "float"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -147,6 +147,19 @@ path  = "fuzz_targets/blk_image.rs"
 [[bin]]
 name  = "float_ops"
 path  = "fuzz_targets/float_ops.rs"
+test  = false
+doc   = false
+bench = false
+
+# Block chaining's hard half. Patching an exit to its successor is easy;
+# clearing that pointer when the successor is invalidated is where translation
+# caches go wrong, because the pointer lives in a block that is not the one
+# going away. `jit::cache` keeps back edges for it and `BlockCache::check`
+# states the invariant; this drives arbitrary sequences of insert, link,
+# invalidate, evict and flush at it and asserts the invariant after every one.
+[[bin]]
+name  = "jit_cache"
+path  = "fuzz_targets/jit_cache.rs"
 test  = false
 doc   = false
 bench = false
