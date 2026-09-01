@@ -1,0 +1,107 @@
+# mips-mini - the smallest R3000A board.
+#
+#   rsemu run mips-mini --media firmware=fw.bin
+#   rsemu run mips-mini -p ram=8M --media firmware=fw.bin
+#   rsemu run mips-mini -p arch=lr33300 --media firmware=fw.bin
+#
+# A boot ROM where the processor's reset vector points, RAM at physical zero,
+# and nothing else. It models no product. It exists so `cpu.mips` has somewhere
+# to run inside a machine file, and so the segment map is exercised by a real
+# board rather than only by unit tests.
+#
+# ---------------------------------------------------------------------------
+# The space is PHYSICAL, and that is the whole trick
+# ---------------------------------------------------------------------------
+#
+# A MIPS core translates before it reaches the bus, so what a board maps is
+# *physical* addresses and the four segments are the processor's business:
+#
+#   kuseg  0x00000000-0x7fffffff   through the TLB (identity, with no TLB)
+#   kseg0  0x80000000-0x9fffffff   physical address = virtual & 0x1fffffff
+#   kseg1  0xa0000000-0xbfffffff   the same physical addresses, uncached
+#   kseg2  0xc0000000-0xffffffff   through the TLB, kernel only
+#
+# So RAM mapped at physical 0 answers at 0x00000000 (kuseg, on a part with no
+# TLB), 0x80000000 (kseg0) and 0xa0000000 (kseg1) alike - which is not three
+# maps here, it is one map and a processor that knows where it is.
+#
+# The reset vector is 0xbfc00000, in kseg1, which is physical 0x1fc00000. That
+# is where the ROM goes, and it is uncached, which is exactly what you want for
+# code running before any cache has been initialised.
+#
+# ---------------------------------------------------------------------------
+# Byte order is a pin, so the board has to say which way it is strapped
+# ---------------------------------------------------------------------------
+#
+# The R3000 is bi-endian and the choice is a package pin. rsemu carries byte
+# order per region (ROADMAP.md 4.1), so a board that strapped the core one way
+# and mapped its memory the other would still realize and would still run, into
+# the weeds - and `LWL`/`LWR`/`SWL`/`SWR` would be silently wrong on top. This
+# board is little-endian, which is what `endian = "little"` on the core and the
+# default byte order of the space between them say. A big-endian board flips
+# both together or it is broken.
+#
+# ---------------------------------------------------------------------------
+# Nothing raises an interrupt here
+# ---------------------------------------------------------------------------
+#
+# The core has six external interrupt inputs, `cpu.int0` to `cpu.int5`, which
+# appear in `Cause.IP[2]` through `Cause.IP[7]`. There is no interrupt
+# controller on this board, so none of them is wired. The two software
+# interrupt requests, `Cause.IP[1:0]`, have no pins at all - a guest raises
+# those by writing `Cause` with `MTC0`.
+
+machine "mips-mini" {
+  # Which part. `r3000a` and `r3051` have a TLB; `lr33300` has none at all, so
+  # kuseg is unmapped and the four TLB instructions are reserved. A machine
+  # file naming a part is the whole point of ROADMAP.md 6.1.1: the difference
+  # is a construction property and not a build flag, so one binary runs both.
+  param arch = "r3000a"
+
+  # How much boot ROM, at physical 0x1fc00000 - the kseg1 reset vector.
+  param rom = 512K
+
+  # How much RAM, at physical zero.
+  param ram = 4M
+
+  # -- the crystal -----------------------------------------------------------
+  #
+  # 25 MHz: a plain R3051 part speed. One oscillator, so every ratio on this
+  # board is exact (ROADMAP.md 4.2).
+  osc clk = 25000000 Hz
+
+  # -- the bus ---------------------------------------------------------------
+  #
+  # 32 bits of physical address. `unassigned` is left at its default of
+  # `fault`, so an access to a hole is a bus error the guest can see - which is
+  # honest here, because a MIPS processor really does have `IBE` and `DBE`
+  # exceptions for exactly that and `cpu.mips` raises them.
+  space mem { width = 32 }
+
+  # -- the core --------------------------------------------------------------
+  object cpu "cpu.mips" {
+    clock  = clk
+    space  = mem
+    arch   = arch
+    endian = "little"
+    engine = "interp"
+  }
+
+  # -- memory ----------------------------------------------------------------
+  #
+  # `image` names a media slot: whoever runs the machine binds the bytes
+  # (`--media firmware=fw.bin`), and nothing below host/ opens a file. The
+  # first instruction of that image is fetched from 0xbfc00000.
+  object boot "rom" { size = rom, image = "firmware" }
+
+  object dram "ram" { size = ram }
+
+  # -- the memory map --------------------------------------------------------
+  #
+  # Two regions and no aliases: the processor's segment decoding is what makes
+  # one megabyte of RAM answer at three virtual addresses, so writing those out
+  # as three mappings here would be modelling the same thing twice and would
+  # come apart the moment a part with a TLB mapped kuseg somewhere else.
+  map mem 0x00000000 size ram = dram
+  map mem 0x1fc00000 size rom = boot
+}
