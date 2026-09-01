@@ -138,6 +138,24 @@ machine-apple1 = ["cpu-mos6502", "dev-apple1"]
 # no dependencies and is `no_std + alloc`.
 cpu-riscv = []
 
+# The RISC-V IR frontend (src/cpu/riscv/lift.rs): lifting guest instructions
+# into `ir::Block`s — the first frontend for the translation IR, and the half
+# of ROADMAP.md §9 that faces a guest. A documented subset of RV64I, done
+# exactly: LUI/AUIPC, every register-immediate and register-register integer
+# ALU operation including the RV64 `*W` word forms, every load and store, the
+# six conditional branches, JAL and JALR. It reads the same declarative rows in
+# `isa.rs` that decode and the disassembler read, so there is still one
+# description of the instruction set and not a second.
+#
+# Deliberately **not** here: M, A, F, D, the CSR instructions, the privileged
+# instructions, both fences, and RV32 — each of those ends the block with a
+# terminator that hands the PC back to the interpreter, which stays the oracle
+# (CLAUDE.md, "CPU cores"). No block chaining and no host code generation
+# either; a backend that lowers these blocks lives in `jit/`, above the `std`
+# line. Needs `cpu-riscv` for the core and `ir` for the block types. Adds no
+# dependencies and is `no_std + alloc`.
+cpu-riscv-lift = ["cpu-riscv", "ir"]
+
 # The WDC 65xx peripherals (src/dev/wdc): the W65C51N ACIA as a character
 # device, the W65C22 VIA with both ports and both timers, and the 32 KiB
 # program EEPROM socket a 6502 breadboard computer boots from — plus

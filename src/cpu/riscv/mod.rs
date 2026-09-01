@@ -12,6 +12,7 @@
 //! | --- | --- |
 //! | the one declarative instruction table, decode, and `C` expansion | [`isa`] |
 //! | the disassembler generated from that table | [`disasm`] |
+//! | the IR frontend, behind `cpu-riscv-lift` | `lift` |
 //! | the interpreter | `exec` |
 //! | CSRs, privilege modes, trap causes, interrupt lines | [`csr`] |
 //! | Sv39/Sv32 walk, PMP, the software TLB | [`mmu`] |
@@ -77,6 +78,13 @@ pub mod elf;
 mod exec;
 pub mod float;
 pub mod isa;
+
+// The IR frontend needs both this core and `src/ir`, so it has its own feature
+// rather than riding on either (ROADMAP.md §9).
+#[cfg(feature = "cpu-riscv-lift")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-riscv-lift")))]
+pub mod lift;
+
 pub mod mmu;
 
 #[cfg(test)]
