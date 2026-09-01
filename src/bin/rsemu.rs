@@ -9,6 +9,7 @@
 //! bytes bound to a named media slot, so the emulation core never learns what a
 //! path is (`CLAUDE.md`, and [`MediaTable`](rsemu::machine::MediaTable)).
 
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use rsemu::core::HostObjects;
 use rsemu::core::clock::GlobalTime;
+use rsemu::core::sched::ThreadingMode;
 use rsemu::host::chardev::{CharDevice, CharPort, ports};
 use rsemu::host::terminal::Terminal;
 use rsemu::machine::{Machine, catalog};
@@ -59,6 +61,14 @@ RUN OPTIONS:
                         the kernel at
     --media <n>=<file>  Bind any media slot by name
     -p <name>=<value>   Override a `param` declared in the machine file
+    --threading <mode>  How guest execution is spread over host threads
+                        (ROADMAP.md 4.2). `deterministic` (the default) is one
+                        thread, round-robin, and bit-reproducible.
+                        `parallel[:N]` is a thread per CPU with a rendezvous
+                        barrier per quantum -- faster on a machine with more
+                        than one CPU, and NOT reproducible, so a state hash is
+                        refused in it. N is the worker count; without it, one
+                        per runnable, capped at what the host has
     --for <duration>    How much virtual time to run, as `1s`, `500ms`, `2m`
                         (default 1s, or forever with a console attached)
     --console <name>    Attach this terminal to a named character port. A
@@ -239,6 +249,13 @@ struct RunArgs {
     /// The rate `--record-audio` writes at.
     audio_rate: u32,
     quiet: bool,
+    /// How guest execution is spread over host threads (§4.2), and how many
+    /// pool workers to ask for.
+    ///
+    /// `None` workers means *one per runnable*, which is what "a thread per
+    /// CPU" means and which the count is only known after the machine is
+    /// built.
+    threading: (ThreadingMode, Option<usize>),
     /// Where to listen for a debugger, if `--gdb` was given.
     #[cfg(feature = "gdb")]
     gdb: Option<String>,
@@ -324,6 +341,7 @@ fn run(args: &[String]) -> ExitCode {
     for (key, value) in &parsed.params {
         options = options.with_param(key.clone(), value.clone());
     }
+    options.realize.scheduler.mode = parsed.threading.0;
 
     // A host gets a typed handle on a display device at the one moment the
     // concrete type exists: construction. Installed unconditionally rather than
@@ -343,6 +361,29 @@ fn run(args: &[String]) -> ExitCode {
         // failures name the instance. Either way `{e}` is the whole report.
         Err(e) => return fail(&e),
     };
+
+    // The pool goes in *after* the build, because `--threading parallel` with
+    // no count means one worker per runnable and there is no way to count them
+    // before the machine exists. Realizing twice to find out is not an option:
+    // a `RealizeOptions`'s host objects are deliberately shared between builds,
+    // so a second realize would open the same character port twice.
+    if parsed.threading.0 == ThreadingMode::Parallel {
+        let workers = parsed.threading.1.unwrap_or_else(|| {
+            let runnables = machine
+                .devices()
+                .iter()
+                .filter(|d| d.runnable().is_some())
+                .count();
+            // Never more than the host has: a worker per runnable on a
+            // four-core box running an eight-CPU guest is eight threads
+            // fighting over four cores, which is slower than four.
+            let hosted = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+            runnables.min(hosted)
+        });
+        machine
+            .scheduler_mut()
+            .set_pool(Arc::new(rsemu::core::sync::Pool::new(workers)));
+    }
 
     if !parsed.quiet {
         describe_machine(&machine);
@@ -913,6 +954,9 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         console: None,
         headless: false,
         quiet: false,
+        // Deterministic unless asked otherwise: reproducibility is the default
+        // a person gets, and giving it up has to be a thing they typed.
+        threading: (ThreadingMode::Deterministic, None),
         #[cfg(feature = "gdb")]
         gdb: None,
     };
@@ -976,6 +1020,10 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
                 }
                 out.audio_rate = hz;
             }
+            "--threading" => {
+                let text = value(arg)?;
+                out.threading = parse_threading(&text)?;
+            }
             "-q" | "--quiet" => out.quiet = true,
             other if other.starts_with('-') => {
                 return Err(format!("unknown option `{other}`"));
@@ -995,6 +1043,37 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         ));
     }
     Ok(out)
+}
+
+/// `deterministic`, `parallel`, or `parallel:<workers>`.
+///
+/// `accel` is deliberately absent: it needs the hardware backends of
+/// `ROADMAP.md` 10 and would only be a way to type an error message.
+fn parse_threading(text: &str) -> Result<(ThreadingMode, Option<usize>), String> {
+    let (name, workers) = match text.split_once(':') {
+        Some((name, count)) => {
+            let n: usize = count
+                .parse()
+                .map_err(|_| format!("--threading {text}: `{count}` is not a worker count"))?;
+            (name, Some(n))
+        }
+        None => (text, None),
+    };
+    match name {
+        "deterministic" => {
+            if workers.is_some() {
+                return Err(String::from(
+                    "--threading deterministic takes no worker count: it is one thread by \
+                     definition",
+                ));
+            }
+            Ok((ThreadingMode::Deterministic, None))
+        }
+        "parallel" => Ok((ThreadingMode::Parallel, workers)),
+        other => Err(format!(
+            "--threading {other}: expected `deterministic` or `parallel[:<workers>]`"
+        )),
+    }
 }
 
 /// What was assembled, before it starts running.
@@ -1026,6 +1105,16 @@ fn summarise(machine: &Machine) {
         if let Ok(ticks) = machine.clocks().ticks(domain) {
             println!("  {:<8} {ticks} ticks", device.path());
         }
+    }
+    if !machine.threading_mode().is_deterministic() {
+        // Not an error, and not a number either: §4.2 says a parallel run is
+        // non-deterministic, so printing a hash here would invite somebody to
+        // paste it into a test. Say what happened instead.
+        println!(
+            "state hash: not reproducible under `{}` threading",
+            machine.threading_mode()
+        );
+        return;
     }
     match machine.state_hash() {
         // The regression method of §0 in one number: run deterministically for

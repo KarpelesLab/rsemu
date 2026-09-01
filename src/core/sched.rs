@@ -46,10 +46,19 @@
 //!   carry the pending events, virtual time, the tie-break counter and the
 //!   round-robin cursor across a save/load, so a restored timer is the same
 //!   number of ticks from firing as the saved one was.
-//! * **Threading modes and rate control**, selected per machine. Only
-//!   [`ThreadingMode::Deterministic`] is implemented here; the others are
-//!   named, have their extension points marked, and return an error rather than
-//!   pretending.
+//! * **Threading modes and rate control**, selected per machine.
+//!   [`ThreadingMode::Deterministic`] round-robins every runnable on one
+//!   thread and is the mode whose state hash is a golden.
+//!   [`ThreadingMode::Parallel`] gives each runnable a job on the
+//!   `core::sync` task pool and joins them at the round's boundary — that join
+//!   is §4.2's rendezvous barrier — and gives up reproducibility for it,
+//!   which is why [`Machine::state_hash`](crate::machine::Machine::state_hash)
+//!   refuses in it. `accel` is named, has its extension point marked, and
+//!   returns an error rather than pretending.
+//! * **Safe points.** [`SafePoint`] is §4.7's stop-the-world protocol: a
+//!   generation counter and a per-runnable [`ExitFlag`], checked at block
+//!   boundaries, never a host signal. [`Scheduler::stop_the_world`] raises it
+//!   and waits out the pool, which is what a snapshot or a retopology needs.
 //!
 //! # Catch-up and the lock ladder
 //!
@@ -60,6 +69,12 @@
 //! [`LockRank::BUS`](crate::core::sync::LockRank::BUS), so an access that
 //! acquired one would invert the ladder, and two CPUs doing it on two buses is a
 //! deadlock rather than a style violation.
+//!
+//! That deadlock is no longer hypothetical: under
+//! [`ThreadingMode::Parallel`] two CPUs really are inside their own
+//! [`LockRank::BUS`](crate::core::sync::LockRank::BUS)-ranked session locks at
+//! the same instant, which is the first time the ladder has had to hold against
+//! anything but one thread's own nesting.
 //!
 //! So catch-up never takes a scheduler lock. Each lazily-advanced device sits in
 //! its own slot behind a leaf-ranked lock that is held across a move and nothing
@@ -110,7 +125,7 @@ use core::cmp::{Ordering, Reverse};
 use core::fmt;
 
 use crate::core::clock::{ClockError, ClockForest, DomainId, GlobalTime, OscillatorId};
-use crate::core::sync::{AtomicU64, Mutex, Ordering as AtomicOrdering};
+use crate::core::sync::{AtomicBool, AtomicU64, Handle, Mutex, Ordering as AtomicOrdering, Pool};
 
 // ---------------------------------------------------------------------------
 // errors
@@ -158,10 +173,12 @@ pub enum SchedError {
     /// empty. Reporting it beats both alternatives: recursing would need two
     /// mutable borrows of one device, and waiting would be a deadlock.
     ///
-    /// Under [`ThreadingMode::Deterministic`] — the only mode implemented — one
-    /// thread runs everything, so this can only mean re-entrancy. A parallel
-    /// mode would also reach it when two CPUs touch one device at the same
-    /// instant, which wants that mode's rendezvous rather than a spin here.
+    /// Under [`ThreadingMode::Deterministic`] one thread runs everything, so
+    /// this can only mean re-entrancy, and it is reported immediately.
+    /// [`ThreadingMode::Parallel`] also reaches the same emptiness when two
+    /// CPUs touch one device inside one quantum, which is contention rather
+    /// than a bug — so there it waits out a bounded spin first and this is what
+    /// is left when the wait expires.
     LazyDeviceBusy(LazyId),
     /// The threading mode is recognised but not implemented in this build.
     ModeUnimplemented(ThreadingMode),
@@ -759,6 +776,211 @@ impl Consumed {
     }
 }
 
+// ---------------------------------------------------------------------------
+// safe points and stop-the-world
+// ---------------------------------------------------------------------------
+
+/// The stop-the-world protocol: a generation counter and a per-runnable exit
+/// flag (`ROADMAP.md` §4.7).
+///
+/// A TLB shootdown, a memory-topology change, a snapshot and a reset all need
+/// every runnable quiescent. `ROADMAP.md` §4.7 fixes the mechanism and rules
+/// out the obvious alternative in the same sentence: *"a generation counter
+/// plus a per-CPU exit flag checked at translation-block boundaries — never a
+/// host signal, because wasm has none and signals are miserable on Windows."*
+///
+/// # How the two halves fit
+///
+/// * [`SafePoint::request`] raises the world flag and bumps the generation. A
+///   runnable sees [`ExitFlag::raised`] at its next block boundary, returns
+///   what it consumed, and the scheduler collects it at the quantum's
+///   rendezvous — which under [`ThreadingMode::Parallel`] is the join at the
+///   end of [`Scheduler::run_quantum`] and under
+///   [`ThreadingMode::Deterministic`] is simply the return of the round.
+/// * The **generation** is what makes a stop distinguishable from the previous
+///   one. A cache keyed on it — a TLB, a decoded page table, a host pointer —
+///   is invalidated by the number changing rather than by a flag that has been
+///   raised and lowered while nobody was looking.
+///
+/// A runnable that ignores its flag is not incorrect: it stops at the quantum
+/// boundary instead of at the next block, so the stop takes up to one quantum
+/// rather than up to one block. Honouring it is a latency optimisation with a
+/// correctness consequence only for a machine whose quantum is long.
+///
+/// The cores that consult it today are the ones the machine layer hands a
+/// [`TickCursor`] to and that keep it: **MOS 6502, SM83 and RISC-V**. A core
+/// opts in by implementing
+/// [`Device::attach_cursor`](crate::core::device::Device::attach_cursor) — the
+/// hook is already called for every runnable device — and asking
+/// [`TickCursor::exit_requested`] where it would stop anyway.
+///
+/// # Determinism
+///
+/// Nothing raises a flag during an ordinary run, so a
+/// [`ThreadingMode::Deterministic`] machine that nobody stops executes exactly
+/// the sequence it executed before this existed. That is deliberate: the mode
+/// whose state hash is a golden must not acquire a new way to diverge.
+#[derive(Debug, Clone, Default)]
+pub struct SafePoint {
+    world: Arc<World>,
+}
+
+/// What every runnable on one machine shares.
+#[derive(Debug, Default)]
+struct World {
+    /// Bumped by every request, so a stop is distinguishable from the one
+    /// before it.
+    generation: AtomicU64,
+    /// Whether a stop is outstanding right now.
+    stop: AtomicBool,
+}
+
+impl SafePoint {
+    /// A protocol with nothing requested.
+    #[must_use]
+    pub fn new() -> SafePoint {
+        SafePoint::default()
+    }
+
+    /// Ask every runnable to unwind at its next block boundary.
+    ///
+    /// Returns the generation this request carries. Idempotent: a second
+    /// request while one is outstanding still bumps the generation, because a
+    /// second reason to stop is a second reason to invalidate.
+    pub fn request(&self) -> u64 {
+        let generation = self
+            .world
+            .generation
+            .fetch_add(1, AtomicOrdering::AcqRel)
+            .wrapping_add(1);
+        self.world.stop.store(true, AtomicOrdering::Release);
+        generation
+    }
+
+    /// Let the world run again.
+    pub fn release(&self) {
+        self.world.stop.store(false, AtomicOrdering::Release);
+    }
+
+    /// Whether a stop is outstanding.
+    #[inline]
+    #[must_use]
+    pub fn stop_requested(&self) -> bool {
+        self.world.stop.load(AtomicOrdering::Acquire)
+    }
+
+    /// The generation of the most recent request.
+    ///
+    /// Starts at zero and only ever rises, so a cache that remembers the value
+    /// it was built under knows it is stale by comparing rather than by being
+    /// told.
+    #[inline]
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.world.generation.load(AtomicOrdering::Acquire)
+    }
+
+    /// A fresh per-runnable flag on this protocol.
+    #[must_use]
+    pub fn flag(&self) -> ExitFlag {
+        ExitFlag {
+            world: Arc::clone(&self.world),
+            mine: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+/// One runnable's exit flag: *stop at your next block boundary*.
+///
+/// Handed to a core through its [`TickCursor`], which every runnable device
+/// already receives, so honouring it costs a core one relaxed load per block
+/// and no change to any signature. See [`SafePoint`] for the protocol.
+#[derive(Debug, Clone)]
+pub struct ExitFlag {
+    world: Arc<World>,
+    mine: Arc<AtomicBool>,
+}
+
+impl Default for ExitFlag {
+    /// A flag on a protocol of its own — which is what a standalone
+    /// [`TickCursor`] wants, and what a test fixture gets.
+    fn default() -> ExitFlag {
+        SafePoint::new().flag()
+    }
+}
+
+impl ExitFlag {
+    /// Whether this runnable should unwind to the scheduler now.
+    ///
+    /// Two relaxed loads, deliberately. The ordering that matters is the
+    /// quantum's rendezvous — the pool join, or the return of the round — which
+    /// is a real happens-before edge; this load only has to become visible
+    /// *eventually*, and paying for an acquire at every block boundary to make
+    /// it visible a few hundred cycles sooner would be paying in the one place
+    /// the machine cannot afford it.
+    #[inline]
+    #[must_use]
+    pub fn raised(&self) -> bool {
+        self.world.stop.load(AtomicOrdering::Relaxed) || self.mine.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Ask this one runnable to unwind, leaving the rest running.
+    ///
+    /// What a debugger's single-step wants, and what a device that needs one
+    /// particular CPU out of the way wants. A world stop is
+    /// [`SafePoint::request`].
+    pub fn raise(&self) {
+        self.mine.store(true, AtomicOrdering::Release);
+    }
+
+    /// Clear this runnable's own flag. Does not clear a world stop.
+    pub fn clear(&self) {
+        self.mine.store(false, AtomicOrdering::Release);
+    }
+
+    /// The generation of the most recent world stop.
+    #[inline]
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.world.generation.load(AtomicOrdering::Acquire)
+    }
+
+    /// The protocol this flag belongs to.
+    #[must_use]
+    pub fn safe_point(&self) -> SafePoint {
+        SafePoint {
+            world: Arc::clone(&self.world),
+        }
+    }
+}
+
+/// The world held stopped, released when this is dropped.
+///
+/// Returned by [`Scheduler::stop_the_world`]. While it is alive every runnable
+/// that honours its [`ExitFlag`] declines to start another block, and the task
+/// pool has been quiesced — so a snapshot, a remap or a reset taken here sees a
+/// machine nobody is executing.
+#[derive(Debug)]
+pub struct StopGuard {
+    safe: SafePoint,
+    generation: u64,
+}
+
+impl StopGuard {
+    /// The generation this stop carries.
+    #[inline]
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl Drop for StopGuard {
+    fn drop(&mut self) {
+        self.safe.release();
+    }
+}
+
 /// Where a runnable has got to **inside** the quantum it is running.
 ///
 /// A [`Runnable`] reports what it consumed only when it returns, so for the
@@ -791,19 +1013,56 @@ struct CursorInner {
     deadline: AtomicU64,
     /// The slots to catch up when that tick arrives.
     slots: Mutex<Option<Arc<[Arc<LazySlot>]>>>,
+    /// *Unwind at your next block boundary* (`ROADMAP.md` §4.7). Carried here
+    /// rather than on [`Budget`] because every runnable device is already
+    /// handed a cursor and no core's signature has to change to consult one.
+    exit: ExitFlag,
 }
 
 impl TickCursor {
-    /// A fresh cursor at zero.
+    /// A fresh cursor at zero, on a safe-point protocol of its own.
     #[must_use]
     pub fn new() -> TickCursor {
+        TickCursor::with_exit(ExitFlag::default())
+    }
+
+    /// A fresh cursor at zero, sharing `exit`'s protocol.
+    ///
+    /// What [`Scheduler::add_runnable`] builds, so every runnable on one
+    /// machine sees the same world stop.
+    #[must_use]
+    pub fn with_exit(exit: ExitFlag) -> TickCursor {
         TickCursor {
             inner: Arc::new(CursorInner {
                 ticks: AtomicU64::new(0),
                 deadline: AtomicU64::new(u64::MAX),
                 slots: Mutex::new(None),
+                exit,
             }),
         }
+    }
+
+    /// Whether this runnable has been asked to unwind to the scheduler.
+    ///
+    /// The block-boundary check of `ROADMAP.md` §4.7's safe-point protocol. A
+    /// core consults it where it would naturally stop anyway — between
+    /// instructions, at the end of a translation block — and returns what it
+    /// has consumed so far. Returning less than the budget is always legal
+    /// ([`Runnable::run`]), so this needs no new contract.
+    ///
+    /// Nothing raises it during an ordinary run, so a core that checks it is
+    /// bit-identical to one that does not until somebody actually stops the
+    /// world.
+    #[inline]
+    #[must_use]
+    pub fn exit_requested(&self) -> bool {
+        self.inner.exit.raised()
+    }
+
+    /// This runnable's exit flag, for a caller that wants to stop exactly one.
+    #[must_use]
+    pub fn exit_flag(&self) -> ExitFlag {
+        self.inner.exit.clone()
     }
 
     /// Publish the runnable's own tick counter.
@@ -916,8 +1175,24 @@ pub trait Runnable: Send + Sync {
     /// Runs until the budget is exhausted and reports what was consumed.
     ///
     /// Returning less than the budget is legitimate — a halt, a wait-for-
-    /// interrupt, a natural block boundary. Returning more is a bug and the
-    /// scheduler treats it as one.
+    /// interrupt, a natural block boundary, or a raised
+    /// [`ExitFlag`]. Returning more is a bug and the scheduler treats it as
+    /// one.
+    ///
+    /// # How many times this is called
+    ///
+    /// **Once per runnable per round, in every threading mode.** A runnable may
+    /// therefore do per-call work — a UART that pumps its port once — without
+    /// that number depending on how a caller sliced the run.
+    /// [`ThreadingMode::Parallel`] submits one job per runnable and joins them
+    /// at the round's end; it does not split a round into passes, which is the
+    /// thing that used to make the count caller-dependent (§11.6).
+    ///
+    /// What it does not promise is *isolation*: under
+    /// [`ThreadingMode::Parallel`] this runs while other runnables are running
+    /// and while guest accesses to the same device are in flight. See
+    /// [`Device::run`](crate::core::device::Device::run) for what that means
+    /// for a device that is a runnable.
     fn run(&mut self, budget: Budget) -> Consumed;
 }
 
@@ -989,15 +1264,84 @@ pub enum ThreadingMode {
     Deterministic,
     /// A thread per CPU with a rendezvous barrier per quantum.
     ///
-    /// Fast, non-deterministic, the intended default for interactive use. Not
-    /// implemented: it needs the `core::sync` task pool and barrier, which is a
-    /// separate seam (`ROADMAP.md` §4.7).
+    /// Fast, **non-deterministic**, and the intended default for interactive
+    /// use. One job per runnable goes to the `core::sync` task pool at the
+    /// start of a round and the round ends when every one of them has been
+    /// joined — that join *is* the rendezvous barrier, and it is also the
+    /// happens-before edge that makes the next round's bookkeeping see
+    /// everything the last round's runnables wrote.
+    ///
+    /// What it gives up is stated rather than hedged: two CPUs that observe
+    /// each other through memory observe each other at host-timing-dependent
+    /// instants, so the state hash is **not** reproducible.
+    /// [`ThreadingMode::is_deterministic`] is false here, and
+    /// [`Machine::state_hash`](crate::machine::Machine::state_hash) refuses
+    /// rather than returning a number a regression suite would then bless.
+    ///
+    /// Everything that is *not* given up: virtual time, the event queue, the
+    /// per-tree tick counters and every budget still come from the same
+    /// absolute grid the deterministic mode uses, so a machine does not run
+    /// *faster* in guest time, only in host time.
+    ///
+    /// On a backend with no threads — the no-threads browser build, bare metal
+    /// — the pool runs jobs inline and this degenerates to submission order.
+    /// That is a supported configuration and not a fallback (§11.3): it is
+    /// slower than [`ThreadingMode::Deterministic`] by one allocation per
+    /// runnable per round and otherwise identical.
+    ///
+    /// # What it is actually worth, measured
+    ///
+    /// A round costs a dispatch per runnable — a queue push, a wake and a wait
+    /// — of the order of a microsecond, and that is paid whether or not there
+    /// is anything to overlap. So the mode is a **loss** below a work-per-round
+    /// threshold and a win above it, and the threshold is not small.
+    ///
+    /// Measured on a 32-core x86-64 Linux host, `--release`, with runnables
+    /// doing genuinely serial work of about 1.5 ns per tick, as a factor
+    /// against [`ThreadingMode::Deterministic`]:
+    ///
+    /// | ticks/round | 2 runnables | 4 | 8 |
+    /// | --- | --- | --- | --- |
+    /// | 1 000 | 0.2–0.5× | 0.8× | 0.8–1.6× |
+    /// | 10 000 (the default cap) | 0.83× | 1.5× | 2.5× |
+    /// | 100 000 | 1.0–1.5× | 1.8–2.6× | 3.5–3.7× |
+    /// | 1 000 000 | 1.5× | 2.5–3.3× | 3.7× |
+    ///
+    /// Two conclusions worth stating plainly rather than burying:
+    ///
+    /// * **Two CPUs at the default [`SchedulerConfig::max_ticks_per_quantum`]
+    ///   are slower in this mode than in the deterministic one.** A machine
+    ///   with two cores wants a larger cap before it asks for parallelism.
+    /// * The speedup saturates near 4× however many runnables there are,
+    ///   because the barrier is per round and the round is only as short as its
+    ///   slowest runnable. This is a rendezvous design, not a free-running one,
+    ///   and §4.2 chose it deliberately.
+    ///
+    /// `machines/tests/heterogeneous.machine` — a 100 MHz RISC-V hart and a
+    /// 1 MHz 6502 — measures **1.05–1.10×**, which is what its work ratio
+    /// allows: the 6502 is about a tenth of the round's work, so Amdahl caps
+    /// the board at roughly 1.1× and the implementation reaches it.
     Parallel,
     /// CPUs run in hardware and virtual time is slaved to the host clock.
     ///
     /// The scheduler becomes a deadline service. Not implemented: it needs the
     /// acceleration backends (`ROADMAP.md` §10).
     Accel,
+}
+
+impl ThreadingMode {
+    /// Whether a run in this mode is bit-reproducible.
+    ///
+    /// True only for [`ThreadingMode::Deterministic`]. `ROADMAP.md` §0 makes
+    /// determinism a property of *the mode*, not of the thread count, and §4.2
+    /// says parallel execution is non-deterministic in as many words — so this
+    /// is the predicate everything that depends on reproducibility asks, rather
+    /// than each caller re-deciding what "deterministic enough" means.
+    #[inline]
+    #[must_use]
+    pub const fn is_deterministic(self) -> bool {
+        matches!(self, ThreadingMode::Deterministic)
+    }
 }
 
 impl fmt::Display for ThreadingMode {
@@ -1150,8 +1494,20 @@ impl RateController {
 /// How a [`Scheduler`] is set up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchedulerConfig {
-    /// Threading mode. Only [`ThreadingMode::Deterministic`] runs here.
+    /// Threading mode.
     pub mode: ThreadingMode,
+    /// How many worker threads [`ThreadingMode::Parallel`] asks the task pool
+    /// for.
+    ///
+    /// Thread count is a machine property, never something a device decides
+    /// (`ROADMAP.md` §4.7, "jobs, not threads"). Zero means *run jobs inline*,
+    /// which is what a backend with no threads does anyway, and is a real
+    /// answer rather than a missing one: a parallel machine on the no-threads
+    /// browser build still runs.
+    ///
+    /// Ignored entirely by [`ThreadingMode::Deterministic`], which creates no
+    /// pool at all.
+    pub workers: usize,
     /// Rate control policy.
     pub rate: RateControl,
     /// The span of virtual time one round of the round-robin covers.
@@ -1176,6 +1532,7 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         SchedulerConfig {
             mode: ThreadingMode::Deterministic,
+            workers: 0,
             rate: RateControl::Unbounded,
             quantum: DEFAULT_QUANTUM,
             max_ticks_per_quantum: 10_000,
@@ -1235,7 +1592,26 @@ struct LazySlot {
     id: LazyId,
     domain: DomainId,
     state: Mutex<LazyState>,
+    /// Whether finding the slot empty may mean *another thread is advancing
+    /// it* rather than *I re-entered my own catch-up*.
+    ///
+    /// Set only under [`ThreadingMode::Parallel`] on a backend that really has
+    /// threads. Under [`ThreadingMode::Deterministic`] an empty slot can only
+    /// be re-entrancy, which is what
+    /// [`SchedError::LazyDeviceBusy`] has always said — so this stays false
+    /// there and that path keeps its exact behaviour, error and all.
+    contended: AtomicBool,
 }
+
+/// How many spins a contended catch-up gives another thread before it decides
+/// the emptiness is re-entrancy after all.
+///
+/// Generous rather than tight: the thread it is waiting for is inside
+/// [`LazyDevice::advance_to`], which on a PPU is a burst of real work. Too
+/// small and an honest contention becomes a spurious error under load; too
+/// large and a genuine re-entrancy bug takes a visible pause before it is
+/// reported. It only ever costs the pause in code that was already wrong.
+const LAZY_CONTENDED_SPINS: u32 = 1 << 16;
 
 impl fmt::Debug for LazySlot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1266,7 +1642,8 @@ impl LazySlot {
     /// §4.7's re-entrancy contract satisfied by construction rather than by
     /// good intentions.
     fn sync(&self, id: LazyId, present: Option<u64>, kind: AccessKind) -> SchedResult<u64> {
-        let (mut device, from, target) = {
+        let mut spins = 0u32;
+        let (mut device, from, target) = loop {
             let mut state = self.state.lock();
             if let Some(p) = present {
                 state.present = p;
@@ -1278,10 +1655,11 @@ impl LazySlot {
                 Some(live) => state.present.max(live.present()),
                 None => state.present,
             };
-            let device = state
-                .device
-                .as_ref()
-                .ok_or(SchedError::LazyDeviceBusy(id))?;
+            let Some(device) = state.device.as_ref() else {
+                drop(state);
+                self.wait_for_the_other_thread(id, &mut spins)?;
+                continue;
+            };
             let from = device.current_tick();
             if kind == AccessKind::Debug {
                 return Ok(from);
@@ -1290,7 +1668,7 @@ impl LazySlot {
                 return Ok(from);
             }
             let device = state.device.take().expect("borrowed successfully above");
-            (device, from, target)
+            break (device, from, target);
         };
         // Never *through* the device's own next event in one step: beyond that
         // tick its behaviour changes. So walk to it, let it happen, and ask
@@ -1321,6 +1699,30 @@ impl LazySlot {
             });
         }
         Ok(to)
+    }
+
+    /// An empty slot: either somebody else is inside this device's
+    /// `advance_to`, or this thread is.
+    ///
+    /// Under [`ThreadingMode::Deterministic`] there is only one thread, so an
+    /// empty slot is unambiguously re-entrancy and reporting it is right —
+    /// recursing would need two mutable borrows of one device and waiting would
+    /// be a deadlock. Under [`ThreadingMode::Parallel`] the same emptiness is
+    /// ordinarily *contention*: two CPUs reached one PPU inside the same
+    /// quantum, which is not a bug and must not be reported as one.
+    ///
+    /// Spinning rather than blocking, because there is nothing to block on: the
+    /// seam has no condition variable (`core::sync` says why), the holder is
+    /// running device code with no lock held, and the wait is bounded by one
+    /// `advance_to`. The bound then keeps a genuine re-entrancy bug from
+    /// hanging: past it the emptiness is reported exactly as it always was.
+    fn wait_for_the_other_thread(&self, id: LazyId, spins: &mut u32) -> SchedResult<()> {
+        if !self.contended.load(AtomicOrdering::Relaxed) || *spins >= LAZY_CONTENDED_SPINS {
+            return Err(SchedError::LazyDeviceBusy(id));
+        }
+        *spins += 1;
+        core::hint::spin_loop();
+        Ok(())
     }
 
     /// Arm the live view of the runnable that is about to execute.
@@ -1356,18 +1758,20 @@ impl LazySlot {
 
     /// Puts the device on a specific tick of its own domain.
     fn sync_to_tick(&self, id: LazyId, tick: u64) -> SchedResult<u64> {
-        let (mut device, from) = {
+        let mut spins = 0u32;
+        let (mut device, from) = loop {
             let mut state = self.state.lock();
-            let device = state
-                .device
-                .as_ref()
-                .ok_or(SchedError::LazyDeviceBusy(id))?;
+            let Some(device) = state.device.as_ref() else {
+                drop(state);
+                self.wait_for_the_other_thread(id, &mut spins)?;
+                continue;
+            };
             let from = device.current_tick();
             if tick <= from {
                 return Ok(from);
             }
             let device = state.device.take().expect("borrowed successfully above");
-            (device, from)
+            break (device, from);
         };
         device.advance_to(tick);
         let to = device.current_tick();
@@ -1560,6 +1964,14 @@ enum Cut {
     Yes,
 }
 
+/// One runnable's job in flight: which slot it came out of, and the handle that
+/// gives the box back with what it consumed.
+///
+/// Named because the round has to keep the box *and* its index together — the
+/// scheduler owns the runnables and the job owns one for the length of the
+/// round, so the index is what puts it back.
+type Dispatched = (usize, Handle<(Box<dyn Runnable>, Consumed)>);
+
 /// What one round of the round-robin did.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QuantumReport {
@@ -1598,6 +2010,20 @@ pub struct Scheduler {
     /// allocate. Rebuilt when a device is registered, which happens at realize
     /// and nowhere else.
     lazy_snapshot: Option<Arc<[Arc<LazySlot>]>>,
+    /// Per runnable, the lazy slots on its *own* oscillator tree — what
+    /// [`ThreadingMode::Parallel`] arms, since two runnables cannot share one
+    /// slot's live view. `None` until the first parallel round builds it, and
+    /// dropped whenever the registration set changes.
+    tree_slots: Option<Vec<Arc<[Arc<LazySlot>]>>>,
+    /// The task pool [`ThreadingMode::Parallel`] submits to.
+    ///
+    /// Built at construction from [`SchedulerConfig::workers`], or handed in by
+    /// an embedder with [`Scheduler::set_pool`] — which is the browser's case
+    /// and the reason the seam exposes a pool rather than `spawn`
+    /// (`ROADMAP.md` §4.7, §11.2).
+    pool: Option<Arc<Pool>>,
+    /// The stop-the-world protocol every runnable's [`ExitFlag`] hangs off.
+    safe: SafePoint,
     rate: RateController,
     host_clock: Option<Box<dyn HostClock>>,
 }
@@ -1621,6 +2047,10 @@ impl Scheduler {
         let queue = EventQueue::new(config.granule_shift);
         let rate = RateController::new(config.rate);
         let quantum_nanos = whole_nanos(config.quantum);
+        // Only the parallel mode has anything to submit, and a pool of workers
+        // nobody uses is a pool of threads nobody uses.
+        let pool =
+            (config.mode == ThreadingMode::Parallel).then(|| Arc::new(Pool::new(config.workers)));
         Scheduler {
             forest,
             queue,
@@ -1631,8 +2061,95 @@ impl Scheduler {
             cursor: 0,
             quantum_nanos,
             lazy_snapshot: None,
+            tree_slots: None,
+            pool,
+            safe: SafePoint::new(),
             rate,
             host_clock: None,
+        }
+    }
+
+    /// Use `pool` instead of one of this scheduler's own.
+    ///
+    /// The embedder's entry point. A browser cannot create a Web Worker
+    /// synchronously from arbitrary code, so the page builds the pool up front
+    /// and hands it in; the same call lets a host share one pool between two
+    /// machines rather than doubling its thread count (`ROADMAP.md` §4.7).
+    pub fn set_pool(&mut self, pool: Arc<Pool>) {
+        self.pool = Some(pool);
+        self.republish_contention();
+    }
+
+    /// The task pool, if this scheduler has one.
+    #[inline]
+    #[must_use]
+    pub fn pool(&self) -> Option<&Arc<Pool>> {
+        self.pool.as_ref()
+    }
+
+    /// Whether an empty lazy slot can mean *another thread has it*.
+    fn contended(&self) -> bool {
+        self.config.mode == ThreadingMode::Parallel
+            && self.pool.as_ref().is_some_and(|p| p.workers() > 0)
+    }
+
+    /// Re-derive [`LazySlot::contended`] after anything that can change the
+    /// answer: a new pool, a new device.
+    fn republish_contention(&self) {
+        let contended = self.contended();
+        for slot in &self.lazy {
+            slot.contended.store(contended, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// The stop-the-world protocol (`ROADMAP.md` §4.7).
+    ///
+    /// Clone it to anything that may need to stop the machine — a host thread,
+    /// a device that remaps memory from inside its own write path. See
+    /// [`SafePoint`].
+    #[inline]
+    #[must_use]
+    pub fn safe_point(&self) -> SafePoint {
+        self.safe.clone()
+    }
+
+    /// One runnable's exit flag.
+    ///
+    /// # Errors
+    ///
+    /// [`SchedError::UnknownRunnable`] if the handle is not from this
+    /// scheduler.
+    pub fn exit_flag(&self, id: RunnableId) -> SchedResult<ExitFlag> {
+        self.runnables
+            .get(id.index())
+            .map(|slot| slot.cursor.exit_flag())
+            .ok_or(SchedError::UnknownRunnable(id))
+    }
+
+    /// Stop the world and hold it stopped until the guard is dropped.
+    ///
+    /// Raises every runnable's exit flag, bumps the generation, and waits for
+    /// the task pool to go idle — the barrier of `ROADMAP.md` §4.7. What comes
+    /// back is a machine nobody is executing: safe to snapshot, to retopologise,
+    /// to reset.
+    ///
+    /// Calling it between rounds is the ordinary case and costs the quiesce.
+    /// Calling it from another thread while a parallel round is in flight is
+    /// the interesting one: the runnables unwind at their next block boundary
+    /// and the round's own join is the rendezvous.
+    ///
+    /// It does **not** take the scheduler's borrow away from whoever is driving
+    /// the run loop; a caller that wants to stop a machine another thread is
+    /// running holds a [`SafePoint`] rather than a `&Scheduler`.
+    #[must_use = "the world runs again when the guard is dropped"]
+    pub fn stop_the_world(&self) -> StopGuard {
+        let generation = self.safe.request();
+        if let Some(pool) = self.pool.as_ref() {
+            pool.quiesce();
+        }
+        StopGuard {
+            safe: self.safe.clone(),
+            generation,
         }
     }
 
@@ -1682,8 +2199,9 @@ impl Scheduler {
         self.runnables.push(RunnableSlot {
             domain,
             inner: Some(runnable),
-            cursor: TickCursor::new(),
+            cursor: TickCursor::with_exit(self.safe.flag()),
         });
+        self.tree_slots = None;
         id
     }
 
@@ -1694,6 +2212,7 @@ impl Scheduler {
         // which keeps this call infallible; zero is the honest starting
         // position either way, since nothing has been simulated yet.
         let present = self.forest.ticks(domain).unwrap_or(0);
+        let contended = self.contended();
         self.lazy.push(Arc::new(LazySlot {
             id,
             domain,
@@ -1702,8 +2221,10 @@ impl Scheduler {
                 live: None,
                 present,
             }),
+            contended: AtomicBool::new(contended),
         }));
         self.lazy_snapshot = None;
+        self.tree_slots = None;
         id
     }
 
@@ -2023,12 +2544,11 @@ impl Scheduler {
     fn run_quantum_bounded(&mut self, limit: GlobalTime, cut: Cut) -> SchedResult<QuantumReport> {
         match self.config.mode {
             ThreadingMode::Deterministic => self.run_quantum_deterministic(limit, cut),
-            // Extension point: `parallel` submits one job per runnable to the
-            // `core::sync` task pool and joins on a barrier at the quantum
-            // boundary; `accel` replaces the target computation below with a
-            // host-clock deadline and lets the hardware run. Both need seams
-            // that do not exist yet, and guessing at them here would be worse
-            // than saying so.
+            ThreadingMode::Parallel => self.run_quantum_parallel(limit, cut),
+            // Extension point: `accel` replaces the target computation below
+            // with a host-clock deadline and lets the hardware run. It needs
+            // seams that do not exist yet, and guessing at them here would be
+            // worse than saying so.
             mode => Err(SchedError::ModeUnimplemented(mode)),
         }
     }
@@ -2144,35 +2664,7 @@ impl Scheduler {
             Cut::No => natural,
         };
         if target > limit {
-            // The caller's deadline falls inside a round, so the round does not
-            // run at all: virtual time moves to the deadline and the round
-            // happens, whole, when the caller asks for more.
-            //
-            // Running the fragment instead — which is what this did, and what
-            // made `run_for` non-additive — hands every runnable a budget the
-            // unsliced run never handed out, and then hands out the remainder
-            // in a second pass. Two runnables that observe each other diverge
-            // there and never converge again. `riscv-virt` is the measured
-            // case: its 16550 pumps its port once per call, so an extra pass is
-            // an extra character. Rotating the round-robin only on a completed
-            // round fixes the ordering but not that.
-            //
-            // Nothing is lost by waiting. Budgets come from each tree's
-            // absolute position (see [`Scheduler::ticks_until`]), so the ticks
-            // this defers are handed out by the round that ends up owning them.
-            // No event can fall in the skipped interval either: one at or
-            // before `limit` would have been the natural target.
-            self.advance_idle_to(limit)?;
-            let mut fired = Vec::new();
-            while let Some(e) = self.queue.pop_due(self.now) {
-                fired.push(e);
-            }
-            return Ok(QuantumReport {
-                from,
-                to: self.now,
-                consumed: Vec::new(),
-                fired,
-            });
+            return self.decline_round(from, limit);
         }
 
         let mut consumed = Vec::with_capacity(self.runnables.len());
@@ -2218,6 +2710,49 @@ impl Scheduler {
             self.cursor = (self.cursor + 1) % count;
         }
 
+        self.close_round(from, target, consumed)
+    }
+
+    /// A round the caller's deadline falls inside: virtual time moves to the
+    /// deadline, nothing executes, and the round runs whole when the caller
+    /// asks for more time.
+    ///
+    /// Running the fragment instead — which is what this did, and what made
+    /// `run_for` non-additive — hands every runnable a budget the unsliced run
+    /// never handed out, and then hands out the remainder in a second pass. Two
+    /// runnables that observe each other diverge there and never converge
+    /// again. `riscv-virt` is the measured case: its 16550 pumps its port once
+    /// per call, so an extra pass is an extra character. Rotating the
+    /// round-robin only on a completed round fixes the ordering but not that.
+    ///
+    /// Nothing is lost by waiting. Budgets come from each tree's absolute
+    /// position (see [`Scheduler::ticks_until`]), so the ticks this defers are
+    /// handed out by the round that ends up owning them. No event can fall in
+    /// the skipped interval either: one at or before `limit` would have been
+    /// the natural target.
+    fn decline_round(&mut self, from: GlobalTime, limit: GlobalTime) -> SchedResult<QuantumReport> {
+        self.advance_idle_to(limit)?;
+        let mut fired = Vec::new();
+        while let Some(e) = self.queue.pop_due(self.now) {
+            fired.push(e);
+        }
+        Ok(QuantumReport {
+            from,
+            to: self.now,
+            consumed: Vec::new(),
+            fired,
+        })
+    }
+
+    /// The tail every round shares: passive crystals, virtual time, the
+    /// positions lazily-advanced devices are caught up to, and the events that
+    /// became due.
+    fn close_round(
+        &mut self,
+        from: GlobalTime,
+        target: GlobalTime,
+        consumed: Vec<(RunnableId, u64)>,
+    ) -> SchedResult<QuantumReport> {
         // Trees nothing drives — a bare RTC crystal — still have to reach the
         // present, and the only way there is through absolute time. This is a
         // legitimate cross-tree conversion: there is no intra-tree alternative.
@@ -2237,6 +2772,306 @@ impl Scheduler {
             consumed,
             fired,
         })
+    }
+
+    /// One round with a thread per runnable and a rendezvous barrier at the end
+    /// (`ROADMAP.md` §4.2's `parallel`).
+    ///
+    /// # What is the same as the deterministic round, and why
+    ///
+    /// Everything except *where the work runs*. The round's target is the same
+    /// natural target — the quantum grid, the next queued event, the next event
+    /// a lazily-advanced device has of its own — and every budget still comes
+    /// from its tree's absolute position through
+    /// [`Scheduler::ticks_until`]. So a parallel machine executes the same
+    /// number of guest ticks in the same number of rounds as a deterministic
+    /// one; what differs is only the order in which two runnables' memory
+    /// effects interleave, which is exactly the thing §4.2 says this mode gives
+    /// up and nothing more.
+    ///
+    /// A deadline inside a round still declines the round, so
+    /// [`Machine::run_for`](crate::machine::Machine::run_for) keeps its shape
+    /// here too — not its state hash, which no mode can promise once two CPUs
+    /// race, but the property that the *set of rounds* does not depend on how
+    /// the caller sliced the run.
+    ///
+    /// # The barrier
+    ///
+    /// `submit` for every runnable **but one**, that one on this thread, then
+    /// `join` for each submitted job. The joins are the barrier: nothing is put
+    /// back in its slot, no domain is advanced and no event is popped until
+    /// every job has finished, and `join` is a happens-before edge, so the
+    /// bookkeeping below reads everything the jobs wrote. Submitting in
+    /// registration order and joining in registration order also means the
+    /// *bookkeeping* is deterministic given the consumed counts — the
+    /// non-determinism is confined to what those counts are and to what the
+    /// guests saw of each other.
+    ///
+    /// Keeping one runnable here is not a micro-optimisation, it is what
+    /// decides whether the mode is worth using on a two-CPU machine. A round
+    /// costs roughly a couple of microseconds per *dispatched* job — a queue
+    /// push, a wake, and a wait — against which a round's actual work must be
+    /// measured. Two CPUs at the default
+    /// [`SchedulerConfig::max_ticks_per_quantum`] of 10 000 is well inside the
+    /// region where two dispatches cost more than the second core saves;
+    /// one dispatch and a driver thread that works instead of blocking roughly
+    /// halves that overhead. It is still a real cost, and
+    /// [`ThreadingMode::Parallel`]'s own documentation says where the crossover
+    /// lies rather than claiming there is not one.
+    ///
+    /// # The round-robin cursor
+    ///
+    /// Not rotated: there is no "first" runnable to rotate away from. It is
+    /// still carried through a snapshot, so a machine saved in parallel mode
+    /// and restored in deterministic mode resumes its round-robin where the
+    /// last deterministic round left it rather than at zero.
+    fn run_quantum_parallel(&mut self, limit: GlobalTime, cut: Cut) -> SchedResult<QuantumReport> {
+        let from = self.now;
+        let natural = self.natural_target();
+        let target = match cut {
+            Cut::Yes => natural.min(limit),
+            Cut::No => natural,
+        };
+        if target > limit {
+            return self.decline_round(from, limit);
+        }
+
+        let count = self.runnables.len();
+        let mut allowed = Vec::with_capacity(count);
+        // Units of each tree already promised to an earlier runnable. See
+        // [`Scheduler::ticks_until_after`] for why a tree has to be shared out
+        // rather than handed to everyone whole.
+        let mut reserved: Vec<(OscillatorId, u64)> = Vec::new();
+        for index in 0..count {
+            let domain = self.runnables[index].domain;
+            let osc = self.forest.root_of(domain).ok();
+            let taken = osc
+                .and_then(|osc| reserved.iter().find(|(o, _)| *o == osc))
+                .map_or(0, |(_, units)| *units);
+            let ticks = self
+                .ticks_until_after(domain, target, taken)?
+                .min(self.config.max_ticks_per_quantum);
+            allowed.push(ticks);
+            if let (Some(osc), Ok(per_tick)) =
+                (osc, self.forest.domain(domain).map(|d| d.units_per_tick()))
+            {
+                let units = ticks.saturating_mul(per_tick);
+                match reserved.iter_mut().find(|(o, _)| *o == osc) {
+                    Some((_, sum)) => *sum = sum.saturating_add(units),
+                    None => reserved.push((osc, units)),
+                }
+            }
+        }
+
+        self.arm_parallel_cursors();
+
+        let mut used_by: Vec<Option<Consumed>> = alloc::vec![None; count];
+
+        // Which runnables actually have work. The last of them stays on this
+        // thread: the driver would otherwise submit every job and then block,
+        // which wastes a core and pays a queue round trip for a runnable that
+        // is already here. One less dispatch per round is the difference
+        // between a two-CPU machine being faster in this mode and being
+        // slower — see the module docs on what the barrier costs.
+        let mut work: Vec<usize> = allowed
+            .iter()
+            .zip(&self.runnables)
+            .enumerate()
+            .filter(|(_, (ticks, slot))| **ticks > 0 && slot.inner.is_some())
+            .map(|(index, _)| index)
+            .collect();
+        let here = work.pop();
+
+        // Cloned out of `self` so the submission loop can borrow the runnables
+        // mutably while it holds the pool.
+        let pool = self.pool.clone();
+        let mut handles: Vec<Dispatched> = Vec::with_capacity(work.len());
+        for index in work {
+            let budget = Budget {
+                until: target,
+                ticks: allowed[index],
+            };
+            let mut runnable = self.runnables[index]
+                .inner
+                .take()
+                .expect("checked just above");
+            match pool.as_ref() {
+                // The job owns the runnable for the length of the round, which
+                // is what makes `&mut self` on `Runnable::run` reachable from a
+                // worker thread at all: the box moves there and comes back.
+                Some(pool) => handles.push((
+                    index,
+                    pool.submit(move || {
+                        let used = runnable.run(budget);
+                        (runnable, used)
+                    }),
+                )),
+                // No pool at all: run it here, in registration order. A
+                // parallel machine on a backend with no threads is still a
+                // machine that runs (§11.3).
+                None => {
+                    let used = runnable.run(budget);
+                    self.runnables[index].inner = Some(runnable);
+                    used_by[index] = Some(used);
+                }
+            }
+        }
+
+        // This thread's share, running alongside everything submitted above.
+        if let Some(index) = here {
+            let budget = Budget {
+                until: target,
+                ticks: allowed[index],
+            };
+            let mut runnable = self.runnables[index]
+                .inner
+                .take()
+                .expect("checked just above");
+            let used = runnable.run(budget);
+            self.runnables[index].inner = Some(runnable);
+            used_by[index] = Some(used);
+        }
+
+        // The rendezvous.
+        for (index, handle) in handles {
+            let (runnable, used) = handle.join();
+            self.runnables[index].inner = Some(runnable);
+            used_by[index] = Some(used);
+        }
+        self.disarm_parallel_cursors();
+
+        let mut consumed = Vec::with_capacity(count);
+        for index in 0..count {
+            let used = used_by[index].unwrap_or_default();
+            self.record_consumption(index, allowed[index], used)?;
+            consumed.push((RunnableId(index as u32), used.ticks));
+        }
+
+        self.close_round(from, target, consumed)
+    }
+
+    /// Check a runnable's report and advance its domain by what it consumed.
+    ///
+    /// Split out because the parallel round has to do it after the barrier
+    /// rather than immediately after the call, and doing it twice by hand is
+    /// how the two rounds would drift apart.
+    fn record_consumption(
+        &mut self,
+        index: usize,
+        allowed: u64,
+        used: Consumed,
+    ) -> SchedResult<()> {
+        if used.ticks > allowed {
+            return Err(SchedError::BudgetExceeded {
+                runnable: RunnableId(index as u32),
+                budget: allowed,
+                consumed: used.ticks,
+            });
+        }
+        if used.ticks > 0 {
+            self.forest
+                .advance_domain(self.runnables[index].domain, used.ticks)?;
+        }
+        Ok(())
+    }
+
+    /// Arm each runnable's cursor over the lazily-advanced devices on *its own*
+    /// oscillator tree, for a round in which every runnable executes at once.
+    ///
+    /// Two differences from [`Scheduler::arm_live_cursors`], both forced:
+    ///
+    /// * A slot holds **one** live view, so a tree with two runnables on it has
+    ///   no honest answer to "where has the executing runnable got to". Such a
+    ///   tree is left unarmed and its devices are caught up to the position the
+    ///   scheduler last published — which is what every device had before
+    ///   [`TickCursor`] existed, and is bounded by the round rather than wrong.
+    /// * A cursor watches only the slots on its own tree. In the deterministic
+    ///   round one cursor watches every slot, which costs a cross-tree
+    ///   catch-up to a published position and nothing else; here it would put
+    ///   two threads into one slot for no benefit at all, since a slot on
+    ///   another tree has no live view to convert against anyway.
+    fn arm_parallel_cursors(&mut self) {
+        self.build_tree_slots();
+        let Some(trees) = self.tree_slots.clone() else {
+            return;
+        };
+        // A tree driven by more than one runnable has no single live position.
+        let mut runnables_on: Vec<(OscillatorId, usize)> = Vec::new();
+        for slot in &self.runnables {
+            if let Ok(osc) = self.forest.root_of(slot.domain) {
+                match runnables_on.iter_mut().find(|(o, _)| *o == osc) {
+                    Some((_, n)) => *n += 1,
+                    None => runnables_on.push((osc, 1)),
+                }
+            }
+        }
+        for (index, slots) in trees.iter().enumerate() {
+            let domain = self.runnables[index].domain;
+            let cursor = self.runnables[index].cursor.clone();
+            let (Ok(osc), Ok(mul), Ok(base_cursor)) = (
+                self.forest.root_of(domain),
+                self.forest.domain(domain).map(|d| d.units_per_tick()),
+                self.forest.ticks(domain),
+            ) else {
+                cursor.watch(None);
+                continue;
+            };
+            if !runnables_on.iter().any(|(o, n)| *o == osc && *n == 1) {
+                cursor.watch(None);
+                continue;
+            }
+            for slot in slots.iter() {
+                let (Ok(div), Ok(base_tick)) = (
+                    self.forest.domain(slot.domain).map(|d| d.units_per_tick()),
+                    self.forest.ticks(slot.domain),
+                ) else {
+                    continue;
+                };
+                if div == 0 {
+                    continue;
+                }
+                slot.arm(Live {
+                    cursor: cursor.clone(),
+                    base_cursor,
+                    base_tick,
+                    mul,
+                    div,
+                });
+            }
+            cursor.watch(Some(Arc::clone(slots)));
+        }
+    }
+
+    /// Drop every live view and every watch a parallel round installed.
+    fn disarm_parallel_cursors(&self) {
+        for slot in &self.runnables {
+            slot.cursor.watch(None);
+        }
+        for slot in &self.lazy {
+            slot.disarm();
+        }
+    }
+
+    /// Per runnable, the lazy slots that share its oscillator tree.
+    ///
+    /// Derived state keyed on the registration set, which changes at realize
+    /// and nowhere else.
+    fn build_tree_slots(&mut self) {
+        if self.tree_slots.is_some() {
+            return;
+        }
+        let mut trees = Vec::with_capacity(self.runnables.len());
+        for slot in &self.runnables {
+            let osc = self.forest.root_of(slot.domain);
+            let mine: Arc<[Arc<LazySlot>]> = self
+                .lazy
+                .iter()
+                .filter(|lazy| osc.is_ok() && self.forest.root_of(lazy.domain) == osc)
+                .cloned()
+                .collect();
+            trees.push(mine);
+        }
+        self.tree_slots = Some(trees);
     }
 
     /// Point every lazily-advanced device on `domain`'s own oscillator tree at
@@ -2347,11 +3182,45 @@ impl Scheduler {
     /// forward, so the rounding in the cross-tree step is bounded by one tick
     /// and cannot accumulate.
     fn ticks_until(&self, domain: DomainId, target: GlobalTime) -> SchedResult<u64> {
+        self.ticks_until_after(domain, target, 0)
+    }
+
+    /// As [`Scheduler::ticks_until`], with `reserved` units of the tree already
+    /// promised to somebody else.
+    ///
+    /// A tree has **one** unit counter and every domain on it is a divider of
+    /// that counter, so two runnables on one tree do not advance independently
+    /// — advancing either moves both. The deterministic round gets this right
+    /// by accident of ordering: it advances each runnable's domain before
+    /// computing the next one's budget, so the second runnable sees the
+    /// position the first left.
+    ///
+    /// A parallel round hands every budget out before anything runs, so it has
+    /// to reserve instead: each runnable on a tree is given the span its
+    /// predecessors could not have used. The two agree exactly whenever every
+    /// runnable consumes what it was given, which is the ordinary case; where
+    /// one under-consumes, the deterministic round can hand the slack to a
+    /// later runnable and the parallel round cannot, because it has already
+    /// started them all.
+    ///
+    /// Note what this is *not* a workaround for: a board with two CPUs on one
+    /// crystal is outside the clock model in **both** modes, since one counter
+    /// cannot say that one of the two halted. Two CPUs want two oscillators —
+    /// which is also what the hardware has (§4.2, "as many roots as the real
+    /// board has crystals"). The reservation exists so that the degenerate
+    /// configuration behaves the same in both modes rather than diverging
+    /// silently.
+    fn ticks_until_after(
+        &self,
+        domain: DomainId,
+        target: GlobalTime,
+        reserved: u64,
+    ) -> SchedResult<u64> {
         if self.forest.is_gated(domain)? {
             return Ok(0);
         }
         let osc = self.forest.root_of(domain)?;
-        let here = self.forest.unit_position(osc)?;
+        let here = self.forest.unit_position(osc)?.saturating_add(reserved);
         let there = self.forest.units_at_global(osc, target)?;
         if there <= here {
             return Ok(0);
@@ -2736,16 +3605,308 @@ mod tests {
     }
 
     #[test]
-    fn parallel_and_accel_refuse_rather_than_pretend() {
-        for mode in [ThreadingMode::Parallel, ThreadingMode::Accel] {
-            let (mut sched, cpu, _ppu) = nes_scheduler();
-            sched.config.mode = mode;
-            sched.add_runnable(cpu, Box::new(Cpu::default()));
-            assert_eq!(
-                sched.run_quantum().unwrap_err(),
-                SchedError::ModeUnimplemented(mode)
-            );
+    fn accel_refuses_rather_than_pretending() {
+        let (mut sched, cpu, _ppu) = nes_scheduler();
+        sched.config.mode = ThreadingMode::Accel;
+        sched.add_runnable(cpu, Box::new(Cpu::default()));
+        assert_eq!(
+            sched.run_quantum().unwrap_err(),
+            SchedError::ModeUnimplemented(ThreadingMode::Accel)
+        );
+    }
+
+    // -- the parallel mode --------------------------------------------------
+
+    /// The same forest as [`nes_scheduler`], in whichever mode is asked for.
+    ///
+    /// `workers` goes to the pool. Zero is the honest configuration on a
+    /// backend with no threads and is also what the equivalence tests want:
+    /// they are about the *bookkeeping* being the same, and a worker thread
+    /// would only add a source of variance to a workload that has none.
+    fn nes_scheduler_in(mode: ThreadingMode, workers: usize) -> (Scheduler, DomainId, DomainId) {
+        let mut forest = ClockForest::new();
+        let master = forest
+            .add_oscillator("master", Rational::new(236_250_000, 11).unwrap())
+            .unwrap();
+        let cpu = forest.add_domain("cpu", master, 1, 12).unwrap();
+        let ppu = forest.add_domain("ppu", master, 1, 4).unwrap();
+        let config = SchedulerConfig {
+            mode,
+            workers,
+            ..SchedulerConfig::default()
+        };
+        (Scheduler::new(forest, config), cpu, ppu)
+    }
+
+    /// A workload whose result cannot depend on the interleaving: three cores
+    /// that consume everything they are given and observe nothing.
+    ///
+    /// That is the point. The claim under test is that *the scheduler's own*
+    /// arithmetic — budgets, tick counters, virtual time, the event queue — is
+    /// the same in both modes, so the workload must contribute no variance of
+    /// its own or the test would be measuring the guests instead.
+    fn three_cores(sched: &mut Scheduler, domains: &[DomainId]) {
+        for domain in domains {
+            sched.add_runnable(*domain, Box::new(Cpu::default()));
         }
+    }
+
+    #[test]
+    fn a_parallel_round_moves_time_exactly_as_a_deterministic_one_does() {
+        let mut ends = Vec::new();
+        for mode in [ThreadingMode::Deterministic, ThreadingMode::Parallel] {
+            let (mut sched, cpu, ppu) = nes_scheduler_in(mode, 0);
+            three_cores(&mut sched, &[cpu, ppu]);
+            sched.schedule_at(t(400_000), EventTarget(7), 11);
+            let mut fired = Vec::new();
+            for _ in 0..8 {
+                let report = sched.run_quantum().unwrap();
+                fired.extend(report.fired.iter().map(|e| (e.time, e.token)));
+            }
+            ends.push((
+                sched.now(),
+                sched.forest().ticks(cpu).unwrap(),
+                sched.forest().ticks(ppu).unwrap(),
+                fired,
+            ));
+        }
+        assert_eq!(
+            ends[0], ends[1],
+            "the parallel round hands out the same budgets and keeps the same time"
+        );
+    }
+
+    #[test]
+    fn a_parallel_round_reports_every_runnable_in_registration_order() {
+        let (mut sched, cpu, ppu) = nes_scheduler_in(ThreadingMode::Parallel, 0);
+        three_cores(&mut sched, &[cpu, ppu, cpu]);
+        // No rotation: there is no "first" runnable in a round where every one
+        // of them starts at once, so the order is the registration order, every
+        // round, and the round-robin cursor stays where it was.
+        for _ in 0..3 {
+            let report = sched.run_quantum().unwrap();
+            let order: Vec<usize> = report.consumed.iter().map(|(id, _)| id.index()).collect();
+            assert_eq!(order, alloc::vec![0, 1, 2]);
+        }
+    }
+
+    #[test]
+    fn a_parallel_round_still_declines_a_round_its_deadline_falls_inside() {
+        let (mut sched, cpu, _ppu) = nes_scheduler_in(ThreadingMode::Parallel, 0);
+        sched.add_runnable(cpu, Box::new(Cpu::default()));
+        // Well inside the 1 ms grid: the round does not start, virtual time
+        // moves to the deadline, and nothing executes. That is what keeps
+        // `Machine::run_for`'s shape (§11.6) in this mode too.
+        let report = sched.run_quantum_until(t(1_000)).unwrap();
+        assert_eq!(report.to, t(1_000));
+        assert!(report.consumed.is_empty());
+        assert_eq!(sched.forest().ticks(cpu).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_parallel_round_still_refuses_a_runnable_that_overran() {
+        let (mut sched, cpu, _ppu) = nes_scheduler_in(ThreadingMode::Parallel, 0);
+        sched.add_runnable(cpu, Box::new(Liar));
+        assert!(matches!(
+            sched.run_quantum().unwrap_err(),
+            SchedError::BudgetExceeded { .. }
+        ));
+    }
+
+    // -- the safe point -----------------------------------------------------
+
+    /// A core that consults its exit flag between "instructions".
+    ///
+    /// One tick per instruction, so "how many did it manage" is exactly "how
+    /// many instructions before it was told to stop".
+    #[derive(Debug)]
+    struct Stoppable {
+        cursor: Arc<Mutex<Option<TickCursor>>>,
+        /// Raise the world stop once this many ticks have gone by, so the test
+        /// can stop the world *from inside* a round rather than between them.
+        stop_at: Option<u64>,
+        safe: SafePoint,
+    }
+
+    impl Runnable for Stoppable {
+        fn run(&mut self, budget: Budget) -> Consumed {
+            let cursor = self.cursor.lock().clone();
+            let mut used = 0;
+            while used < budget.ticks {
+                used += 1;
+                if let Some(cursor) = cursor.as_ref() {
+                    cursor.set(used);
+                    if self.stop_at == Some(used) {
+                        self.safe.request();
+                    }
+                    if cursor.exit_requested() {
+                        break;
+                    }
+                }
+            }
+            Consumed::new(used)
+        }
+    }
+
+    /// Register a [`Stoppable`] and hand it the cursor the scheduler made for
+    /// it.
+    fn stoppable(
+        sched: &mut Scheduler,
+        domain: DomainId,
+        stop_at: Option<u64>,
+    ) -> (RunnableId, Arc<Mutex<Option<TickCursor>>>) {
+        let slot = Arc::new(Mutex::new(None));
+        let safe = sched.safe_point();
+        let id = sched.add_runnable(
+            domain,
+            Box::new(Stoppable {
+                cursor: Arc::clone(&slot),
+                stop_at,
+                safe,
+            }),
+        );
+        *slot.lock() = Some(sched.runnable_cursor(id).unwrap());
+        (id, slot)
+    }
+
+    #[test]
+    fn nothing_raises_an_exit_flag_in_an_ordinary_run() {
+        let (mut sched, cpu, _ppu) = nes_scheduler_in(ThreadingMode::Deterministic, 0);
+        let (id, _) = stoppable(&mut sched, cpu, None);
+        let report = sched.run_quantum().unwrap();
+        let (_, used) = report.consumed[0];
+        assert!(used > 0);
+        assert_eq!(sched.forest().ticks(cpu).unwrap(), used);
+        assert!(!sched.exit_flag(id).unwrap().raised());
+        assert_eq!(sched.safe_point().generation(), 0);
+    }
+
+    #[test]
+    fn a_world_stop_unwinds_every_runnable_at_its_next_block_boundary() {
+        let (mut sched, cpu, ppu) = nes_scheduler_in(ThreadingMode::Parallel, 0);
+        // The first runnable stops the world on its fourth tick; the second
+        // one, which runs afterwards, must see the flag from its very first.
+        stoppable(&mut sched, cpu, Some(4));
+        stoppable(&mut sched, ppu, None);
+        let report = sched.run_quantum().unwrap();
+        assert_eq!(
+            report.consumed[0].1, 4,
+            "the requester stopped where it asked"
+        );
+        assert_eq!(
+            report.consumed[1].1, 1,
+            "the second unwound at its first boundary"
+        );
+        assert_eq!(sched.safe_point().generation(), 1);
+        assert!(sched.safe_point().stop_requested());
+    }
+
+    #[test]
+    fn a_stop_guard_holds_the_world_and_lets_it_go_again() {
+        let (mut sched, cpu, _ppu) = nes_scheduler_in(ThreadingMode::Parallel, 0);
+        stoppable(&mut sched, cpu, None);
+        {
+            let guard = sched.stop_the_world();
+            assert_eq!(guard.generation(), 1);
+            assert!(sched.safe_point().stop_requested());
+            // A round under the guard executes the minimum a runnable can
+            // notice the flag in and no more.
+            let report = sched.run_quantum().unwrap();
+            assert_eq!(report.consumed[0].1, 1);
+        }
+        assert!(!sched.safe_point().stop_requested());
+        let report = sched.run_quantum().unwrap();
+        assert!(report.consumed[0].1 > 1, "the world runs again");
+        // The generation only ever rises, so a cache keyed on it knows it is
+        // stale even though the flag has been raised and lowered since.
+        assert_eq!(sched.safe_point().generation(), 1);
+        assert_eq!(sched.stop_the_world().generation(), 2);
+    }
+
+    #[test]
+    fn an_exit_flag_can_stop_one_runnable_and_leave_the_rest() {
+        let (mut sched, cpu, ppu) = nes_scheduler_in(ThreadingMode::Parallel, 0);
+        let (a, _) = stoppable(&mut sched, cpu, None);
+        stoppable(&mut sched, ppu, None);
+        sched.exit_flag(a).unwrap().raise();
+        let report = sched.run_quantum().unwrap();
+        assert_eq!(report.consumed[0].1, 1, "the one that was asked");
+        assert!(report.consumed[1].1 > 1, "and only that one");
+        assert!(
+            !sched.safe_point().stop_requested(),
+            "no world stop happened"
+        );
+    }
+
+    #[test]
+    fn two_runnables_on_one_tree_share_its_counter_in_both_modes() {
+        // Written down because it is a **finding**, not a feature. A tree has
+        // one unit counter and every domain on it is a divider of that counter,
+        // so two runnables on one oscillator do not advance independently:
+        // whatever the first one consumes has already moved the second one's
+        // clock. The deterministic round gets that right by accident of
+        // ordering — it advances each domain before computing the next budget —
+        // and the second runnable is left with almost nothing.
+        //
+        // Neither mode can do better without a per-domain counter, which is a
+        // change to `core::clock` and not to this file. What both modes *must*
+        // do is agree, and a parallel round that handed every runnable the
+        // whole span would advance the tree twice over. Hence the reservation
+        // in `ticks_until_after`, and hence this test.
+        //
+        // The design answer for a board that wants two CPUs is two
+        // oscillators; `machines/tests/heterogeneous.machine` says so at
+        // length, and it is what the hardware has.
+        let mut reports = Vec::new();
+        for mode in [ThreadingMode::Deterministic, ThreadingMode::Parallel] {
+            let (mut sched, cpu, ppu) = nes_scheduler_in(mode, 0);
+            sched.add_runnable(cpu, Box::new(Cpu::default()));
+            sched.add_runnable(ppu, Box::new(Cpu::default()));
+            let report = sched.run_quantum().unwrap();
+            let by_id = |id: usize| {
+                report
+                    .consumed
+                    .iter()
+                    .find(|(r, _)| r.index() == id)
+                    .map(|(_, n)| *n)
+                    .unwrap()
+            };
+            reports.push((by_id(0), by_id(1), sched.forest().ticks(cpu).unwrap()));
+        }
+        assert_eq!(
+            reports[0], reports[1],
+            "the two modes hand out the same ticks"
+        );
+        let (first, second, _) = reports[0];
+        assert!(
+            first > 1_000,
+            "the first runnable got the tree's whole span"
+        );
+        assert!(
+            second < first / 100,
+            "the second one is left with what the first did not use ({second} against {first})"
+        );
+    }
+
+    #[test]
+    fn a_parallel_round_leaves_a_shared_tree_on_the_published_position() {
+        // Two runnables on one oscillator tree: no single live position exists,
+        // so nothing is armed and catch-up falls back to what the scheduler
+        // last published. The alternative — arming one of the two arbitrarily —
+        // would make a device's dot depend on which runnable happened to be
+        // registered first.
+        let (mut sched, cpu, ppu) = nes_scheduler_in(ThreadingMode::Parallel, 0);
+        sched.add_runnable(cpu, Box::new(Cpu::default()));
+        sched.add_runnable(ppu, Box::new(Cpu::default()));
+        let dev = sched.add_lazy_device(ppu, Box::new(Ppu::default()));
+        sched.run_quantum().unwrap();
+        sched.sync_lazy_devices().unwrap();
+        // Caught up to the quantum's own boundary, exactly as a device on
+        // another tree always was.
+        assert_eq!(
+            sched.sync_for_access(dev, AccessKind::Guest).unwrap(),
+            sched.forest().ticks(ppu).unwrap()
+        );
     }
 
     #[test]

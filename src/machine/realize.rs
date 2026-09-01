@@ -540,11 +540,16 @@ impl MediaTable {
 /// [`hosts`](RealizeOptions::hosts).
 #[derive(Debug, Clone, Default)]
 pub struct RealizeOptions {
-    /// How the scheduler is configured: threading mode, quantum, rate control.
+    /// How the scheduler is configured: threading mode, worker count, quantum,
+    /// rate control.
     ///
-    /// Not in the `.machine` grammar yet — §4.2 says the threading mode is a
-    /// machine property, and when the DSL grows a statement for it this is
-    /// where it lands.
+    /// This is where a machine's threading mode is selected — `rsemu run …
+    /// --threading parallel` sets it, and so does a caller assembling a machine
+    /// in Rust. It is deliberately *not* in the `.machine` grammar: a machine
+    /// file is portable data describing a board, and how many host threads to
+    /// spend on it is a property of the run rather than of the hardware. The
+    /// mode a board *needs* — `accel`, once §10 exists — would be a different
+    /// question and would belong in the file.
     pub scheduler: SchedulerConfig,
     /// The bytes bound to the machine's media slots. See [`MediaTable`].
     pub media: MediaTable,

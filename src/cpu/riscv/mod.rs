@@ -99,7 +99,7 @@ use crate::core::error::{Error, Result};
 use crate::core::exec::{Exit, ExitMask, ExitingCore, Run};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
-use crate::core::sched::{Budget, Consumed};
+use crate::core::sched::{Budget, Consumed, ExitFlag, TickCursor};
 use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{self, AtomicU32, AtomicU64, LockRank, Ordering};
@@ -321,6 +321,12 @@ pub struct Hart {
     /// holds only a weak reference to a sink, so the device owns the strong
     /// one.
     pins: sync::Mutex<Pins>,
+    /// *Unwind at your next instruction boundary* (`ROADMAP.md` §4.7), handed
+    /// over by the machine layer with the runnable's cursor.
+    ///
+    /// A leaf-ranked lock read once per budget rather than per instruction, and
+    /// wiring rather than state, so it is not snapshotted.
+    exit: sync::Mutex<Option<ExitFlag>>,
 }
 
 /// The sinks this hart has published, one per input pin.
@@ -359,6 +365,7 @@ impl Hart {
             exits: AtomicU32::new(ExitMask::NONE.bits()),
             requester: AtomicU32::new(cfg.requester.0),
             pins: sync::Mutex::new(Pins::default()),
+            exit: sync::Mutex::new(None),
             cfg,
         }
     }
@@ -687,6 +694,7 @@ impl Hart {
             self.session.lock().state.debt = owed - ticks;
             return ticks;
         }
+        let exit = self.exit.lock().clone();
         let allowance = ticks - owed;
         let mut used = 0u64;
         while used < allowance {
@@ -695,6 +703,14 @@ impl Hart {
                 break;
             }
             used += n;
+            // `ROADMAP.md` §4.7's block-boundary check. Nothing raises the flag
+            // during an ordinary run, so this is bit-identical to the loop
+            // without it until somebody stops the world, and returning early is
+            // already a legal report — the `n == 0` arm above takes the same
+            // exit and the debt bookkeeping below already handles it.
+            if exit.as_ref().is_some_and(ExitFlag::raised) {
+                break;
+            }
         }
         if used >= allowance {
             self.session.lock().state.debt = used - allowance;
@@ -703,6 +719,16 @@ impl Hart {
             self.session.lock().state.debt = 0;
             owed + used
         }
+    }
+
+    /// Take the safe point's exit flag out of the cursor the machine layer
+    /// hands every runnable device.
+    ///
+    /// This hart does not publish its own position — nothing on a RISC-V board
+    /// here is sampled inside an instruction the way a PPU is — so the cursor's
+    /// *other* half is dropped and only the flag is kept.
+    pub fn attach_cursor(&self, cursor: &TickCursor) {
+        *self.exit.lock() = Some(cursor.exit_flag());
     }
 
     /// Accesses owed to the next budget — see [`run_budget`](Hart::run_budget).
@@ -911,6 +937,10 @@ impl Device for Hart {
 
     fn run(&self, budget: Budget) -> Consumed {
         Consumed::new(self.run_budget(budget.ticks))
+    }
+
+    fn attach_cursor(&self, cursor: TickCursor) {
+        Hart::attach_cursor(self, &cursor);
     }
 
     fn reset(&self, kind: ResetKind) {

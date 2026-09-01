@@ -179,11 +179,16 @@
 //!   addressed by is a property of the master, not of the space, so the newtypes
 //!   belong with the MMU that translates between them. Addresses here are plain
 //!   `u64`.
-//! - **The safe-point handshake.** A retopology is still meant to happen at a
-//!   safe point (§4.7), with the world stopped. The lock makes it *correct*
-//!   without one, not free: until §4.7's generation counter and per-CPU exit
-//!   flag land, a retopology racing a running CPU costs that CPU a
-//!   [`BusError::Retry`] rather than a stall. Honest, but not the design.
+//! - **A retopology that reaches for the safe point on its own.** The protocol
+//!   itself now exists — [`Scheduler::stop_the_world`] is §4.7's generation
+//!   counter and per-CPU exit flag — but nothing in this module calls it, so a
+//!   retopology racing a running CPU still costs that CPU a
+//!   [`BusError::Retry`] rather than a stall. The lock is what makes that
+//!   *correct*; stopping the world first is what would make it free. A caller
+//!   that cares can already take the guard around its own remap, which is what
+//!   a snapshot does.
+//!
+//! [`Scheduler::stop_the_world`]: crate::core::sched::Scheduler::stop_the_world
 //!
 //! [`LockRank::TOPOLOGY`]: crate::core::sync::LockRank::TOPOLOGY
 //! [`LockRank::BUS`]: crate::core::sync::LockRank::BUS

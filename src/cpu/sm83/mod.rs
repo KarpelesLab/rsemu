@@ -99,7 +99,7 @@ use crate::core::device::{
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
-use crate::core::sched::{Budget, Consumed, TickCursor};
+use crate::core::sched::{Budget, Consumed, ExitFlag, TickCursor};
 use crate::core::space::{
     AccessConstraints, AddressSpace, MemAttrs, MemOps, MemResult, Region as MmioRegion, RegionRef,
     RequesterId,
@@ -895,6 +895,14 @@ impl Sm83 {
             self.session.lock().state.debt = owed - ticks;
             return ticks;
         }
+        // Read once: the cursor is wiring, fixed after realize, and the flag
+        // itself is two relaxed loads.
+        let exit = self
+            .session
+            .lock()
+            .cursor
+            .as_ref()
+            .map(TickCursor::exit_flag);
         let allowance = ticks - owed;
         let mut used = 0u64;
         while used < allowance {
@@ -904,6 +912,13 @@ impl Sm83 {
                 break;
             }
             used += n;
+            // `ROADMAP.md` §4.7's block-boundary check. Nothing raises the flag
+            // during an ordinary run, so this is bit-identical to the loop
+            // without it until somebody stops the world; `used < allowance` is
+            // the path the halt above already takes.
+            if exit.as_ref().is_some_and(ExitFlag::raised) {
+                break;
+            }
         }
         if used >= allowance {
             self.session.lock().state.debt = used - allowance;
