@@ -32,3 +32,42 @@ is existing in-house work in `../spice` and `../shells-spice` to draw on.
 - For CI, the same scanout path renders headlessly to a PNG and the frame hash
   is compared — the remote display server and the regression harness share
   everything below the encoder.
+
+## What is built (Phase 9)
+
+`src/host/vnc` is an RFB server implemented from RFC 6143 alone, section by
+section, with each message citing the section that defines it. It speaks RFB
+3.3, 3.7 and 3.8; security type `None` and nothing else; Raw (§7.7.1) and the
+DesktopSize pseudo-encoding (§7.8.2); and it takes `KeyEvent` (§7.5.4) and
+`PointerEvent` (§7.5.5) back. `rsemu run <machine> --vnc :5900` is the frontend;
+`tests/vnc_protocol.rs` is a client speaking the whole handshake to a real VGA
+adapter's framebuffer, and it will also drive an installed viewer binary if
+there is one.
+
+Three of the implementation notes above turned out differently, and the reasons
+are worth recording:
+
+- **Encoding does not run on the task pool.** It cannot yet: the encoder reads
+  the [`Surface`](../../src/host/display/mod.rs) the frontend loop owns and
+  fills from the scanout, and shipping that to a worker means either a copy per
+  frame per client or a lock the emulation loop then waits on. Raw encoding of a
+  720x400 frame is a `memcpy` — the surface is allocated in `BGRA8888`, which is
+  byte for byte what the default RFB pixel format asks for — so there is nothing
+  to move off the thread. When a *compressed* encoding lands, that is the work
+  that belongs on the pool, and the per-connection `FrameEncoder` is already the
+  unit that would be submitted.
+- **There is no region-level dirty tracking to drive it from.** §4.1's dirty
+  log is about guest memory pages, not about scanout, and a display device's
+  frame counter is the only change signal that exists. So damage is computed by
+  comparing the previous frame's rows: a `memcmp` per row, coalesced into
+  full-width bands. Cheaper than it sounds, and exact, which page-level
+  tracking would not be for a text-mode adapter whose whole screen lives in
+  4 kB.
+- **The compression wins are available but not free.** Zlib, Tight and ZRLE
+  each need a zlib stream held open for the life of the connection with a sync
+  flush at every rectangle boundary, and `compcol` does supply that — its
+  `zlib::Encoder` sits on a `RawEncoder` whose `raw_flush` takes a `Flush` mode,
+  which is the primitive §7.7.2 is describing. So what is missing is the work
+  and a decision to put `compcol` into the `vnc` feature's dependency tree, not
+  a capability. Raw is what §7.7.1 obliges every client to support, so Raw is
+  what a first server owes them.

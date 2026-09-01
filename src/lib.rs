@@ -40,6 +40,13 @@
 //! With `gdb`, [`host::gdb`] speaks the GDB remote serial protocol over TCP, so
 //! `rsemu debug apple1 --gdb :1234` is a guest a debugger can step through.
 //!
+//! With `vnc`, [`host::vnc`] speaks RFB (RFC 6143) over TCP, so
+//! `rsemu run pc-at --vnc :5900` is a guest anybody with a viewer can watch and
+//! type at. What they type reaches the machine through [`host::input`], at a
+//! virtual instant the scheduler chose rather than the one the network chose —
+//! which is what makes `--record-input` and `--replay-input` reproduce a
+//! session bit for bit.
+//!
 //! With `usermode`, [`usermode`] is level-3 execution: a program runs with **no
 //! guest kernel under it**, its `ecall` leaves the core through
 //! [`core::exec`], and something in Rust services it. rsemu supplies the
@@ -108,6 +115,9 @@ pub fn build_info() -> alloc::string::String {
     }
     if cfg!(feature = "gdb") {
         features.push("gdb");
+    }
+    if cfg!(feature = "vnc") {
+        features.push("vnc");
     }
     if cfg!(feature = "wasm") {
         features.push("wasm");

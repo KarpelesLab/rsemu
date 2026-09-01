@@ -88,7 +88,7 @@ pub mod stub;
 pub mod target;
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
 use crate::machine::Machine;
@@ -336,22 +336,13 @@ impl GdbServer {
 }
 
 /// Turn `1234`, `:1234` or `host:1234` into addresses to bind.
+///
+/// The rule — a bare port or a leading colon binds the loopback interface only
+/// — and the reason for it live in [`crate::host::listen`], so that the two
+/// frontends which hand a stranger something dangerous cannot drift apart about
+/// what an address means.
 fn resolve(addr: &str) -> std::io::Result<Vec<SocketAddr>> {
-    let spec = if addr.starts_with(':') {
-        format!("127.0.0.1{addr}")
-    } else if addr.chars().all(|c| c.is_ascii_digit()) && !addr.is_empty() {
-        format!("127.0.0.1:{addr}")
-    } else {
-        addr.to_string()
-    };
-    let list: Vec<SocketAddr> = spec.to_socket_addrs()?.collect();
-    if list.is_empty() {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidInput,
-            format!("`{addr}` resolved to no address"),
-        ));
-    }
-    Ok(list)
+    crate::host::listen::resolve(addr)
 }
 
 /// Why [`serve`] returned.

@@ -104,10 +104,12 @@ RUN OPTIONS:
                         display; a machine with neither says so rather than
                         writing nothing
     --record-audio <f>  Write the machine's sound to a RIFF/WAVE file when the
-                        run ends. Needs a machine with an audio device. The
-                        device's ring has to hold the whole run, so a recording
-                        is capped at about 18 seconds; longer runs say what they
-                        lost.
+                        run ends. Needs a machine with an audio device. A
+                        headless run visits the host only once, so the device's
+                        ring has to hold the whole thing and a recording is
+                        capped at about 18 seconds; longer runs say what they
+                        lost. Under --vnc the ring is drained every frame and
+                        there is no cap.
     --audio-rate <hz>   Sample rate for --record-audio (default 44100)
 
     --gdb <addr>        Listen for GDB on <addr> and hold the machine stopped
@@ -115,6 +117,16 @@ RUN OPTIONS:
                         work; a bare port binds the loopback interface only,
                         because the far end can read and write all of guest
                         memory. `rsemu debug` implies `--gdb :1234`
+    --vnc <addr>        Serve the machine's display over VNC (RFB, RFC 6143) and
+                        take keyboard and pointer input from whoever connects.
+                        `5900`, `:5900` and `host:5900` all work; a bare port
+                        binds the loopback interface only, because there is no
+                        authentication. The machine runs at wall-clock speed
+    --record-input <f>  With --vnc, write every input event and the virtual
+                        instant it was delivered at to <f>
+    --replay-input <f>  With --vnc, take input from <f> instead of from the
+                        network, at the instants it records. The run is then
+                        the recorded one, bit for bit
     -q, --quiet         Only print the summary
 
 OPTIONS:
@@ -287,6 +299,15 @@ struct RunArgs {
     /// Where to listen for a debugger, if `--gdb` was given.
     #[cfg(feature = "gdb")]
     gdb: Option<String>,
+    /// Where to listen for VNC clients, if `--vnc` was given.
+    #[cfg(feature = "vnc")]
+    vnc: Option<String>,
+    /// Where to write the input log, if `--record-input` was given.
+    #[cfg(feature = "vnc")]
+    record_input: Option<String>,
+    /// Where to read one from, if `--replay-input` was given.
+    #[cfg(feature = "vnc")]
+    replay_input: Option<String>,
 }
 
 fn run(args: &[String]) -> ExitCode {
@@ -455,6 +476,13 @@ fn run(args: &[String]) -> ExitCode {
             }
         };
         return debug_session(&mut machine, &addr, port.as_ref(), &parsed);
+    }
+
+    // A remote frontend owns when the machine advances, for the same reason a
+    // debugger does — so it is checked before the console loop.
+    #[cfg(feature = "vnc")]
+    if parsed.vnc.is_some() {
+        return vnc_session(&mut machine, &parsed, &options.realize.hosts);
     }
 
     // A machine that opened a character port has a console; attach this
@@ -637,7 +665,7 @@ fn ring_for(args: &RunArgs) -> u64 {
 /// Only the PNG path calls it, so a build without an encoder has no use for it
 /// — and the compiler is right to say so rather than being told to be quiet
 /// about a function that might one day be called.
-#[cfg(feature = "display-png")]
+#[cfg(any(feature = "display-png", feature = "vnc"))]
 #[allow(unused_variables)]
 fn take_scanout(hosts: &HostObjects) -> Option<Box<dyn rsemu::host::display::Scanout>> {
     #[cfg(feature = "dev-pc-video")]
@@ -1005,6 +1033,148 @@ fn interact(machine: &mut Machine, port: &CharPort, args: &RunArgs) -> ExitCode 
     status
 }
 
+/// Serve the machine over VNC until the user stops it.
+///
+/// The frontend loop lives in `host::vnc::session`, not here: the binary's job
+/// is to find the machine's screen, decide which input sinks it has, and hand
+/// the loop a stop condition. Ctrl-C on the emulator's own terminal ends it.
+///
+/// **Which sinks a machine gets is decided by what it opened, not by a flag.**
+/// A character port literally named `keyboard` is what `pc.kbc` opens, and a
+/// pad port is what `nes.ports` opens; a machine with a serial console does not
+/// get scan codes typed into it, because a serial console is not a keyboard.
+#[cfg(feature = "vnc")]
+fn vnc_session(machine: &mut Machine, args: &RunArgs, hosts: &HostObjects) -> ExitCode {
+    use rsemu::host::vnc::{VncServer, VncSession};
+
+    let addr = args.vnc.as_deref().unwrap_or(":5900");
+    let Some(scanout) = take_scanout(hosts) else {
+        eprintln!("rsemu: --vnc: this machine has no display to serve");
+        return ExitCode::from(2);
+    };
+    let server = match VncServer::bind(addr) {
+        Ok(s) => s.named(machine.name()),
+        Err(e) => {
+            eprintln!("rsemu: --vnc {addr}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let where_it_landed = match server.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("rsemu: --vnc: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut session = VncSession::new(server, scanout);
+
+    // The keyboard, if this machine has one.
+    if let Ok(Some(port)) = rsemu::host::chardev::ports::get(hosts, "keyboard") {
+        session = session.with_sink(Box::new(rsemu::host::input::KeyboardSink::new(port)));
+    }
+    // The controllers, if it has those instead.
+    #[cfg(feature = "dev-nes-io")]
+    for (index, name) in rsemu::dev::nes::input::pads::names(hosts)
+        .iter()
+        .enumerate()
+    {
+        if let Ok(Some(pad)) = rsemu::dev::nes::input::pads::get(hosts, name) {
+            session = session.with_sink(Box::new(rsemu::host::input::PadSink::new(pad, index)));
+        }
+    }
+
+    match (&args.record_input, &args.replay_input) {
+        (Some(_), Some(_)) => {
+            eprintln!("rsemu: --record-input and --replay-input are mutually exclusive");
+            return ExitCode::from(2);
+        }
+        (Some(_), None) => session = session.recording(),
+        (None, Some(path)) => match std::fs::read(path) {
+            Ok(bytes) => match rsemu::host::input::InputLog::decode(&bytes) {
+                Ok(log) => {
+                    if !args.quiet {
+                        eprintln!("  replaying {} input events from {path}", log.len());
+                    }
+                    session = session.replaying(log);
+                }
+                Err(e) => {
+                    eprintln!("rsemu: --replay-input {path}: {e}");
+                    return ExitCode::from(2);
+                }
+            },
+            Err(e) => {
+                eprintln!("rsemu: --replay-input: cannot read {path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        (None, None) => {}
+    }
+
+    // Sound, if the user asked for it. **This is where the headless
+    // "make the ring big enough for the whole run" argument stops applying**:
+    // the session drains the device every slice, so the ring holds one frame's
+    // worth rather than the whole run and a recording is no longer capped at
+    // about eighteen seconds. The queue limit is lifted for the same reason
+    // `write_recording` lifts it — nothing may be trimmed on the way to a file.
+    if args.record_audio.is_some() {
+        let Some(source) = take_audio(hosts) else {
+            eprintln!("rsemu: --record-audio: this machine has no audio device");
+            return ExitCode::from(2);
+        };
+        let mut stream = rsemu::host::audio::AudioStream::new(
+            source,
+            args.audio_rate,
+            rsemu::host::audio::SampleFormat::S16,
+        );
+        stream.set_limit_frames(u64::MAX);
+        session = session.with_audio(stream);
+    }
+
+    if !args.quiet {
+        eprintln!("  vnc://{where_it_landed} — Ctrl-C to stop\n");
+    }
+
+    let term = Terminal::open();
+    let deadline = args
+        .span_given
+        .then(|| machine.now().saturating_add(args.span));
+    let status = session.run(machine, |m| {
+        !term.interrupted() && !deadline.is_some_and(|d| m.now() >= d)
+    });
+    drop(term);
+
+    if let Err(e) = status {
+        eprintln!("rsemu: {e}");
+        return ExitCode::FAILURE;
+    }
+    if let (Some(path), Some(log)) = (&args.record_input, session.log())
+        && let Err(e) = std::fs::write(path, log.encode())
+    {
+        eprintln!("rsemu: --record-input {path}: {e}");
+        return ExitCode::FAILURE;
+    }
+    if let (Some(path), Some(stream)) = (&args.record_audio, session.audio()) {
+        let bytes = rsemu::host::audio::wav::encode(stream.info(), stream.buffer());
+        if let Err(e) = std::fs::write(path, &bytes) {
+            eprintln!("rsemu: --record-audio {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+        if !args.quiet {
+            let frames = stream.buffer().frames();
+            println!(
+                "audio       {path} ({} Hz, {frames} frames, {} bytes)",
+                args.audio_rate,
+                bytes.len()
+            );
+        }
+    }
+    if !args.quiet {
+        summarise(machine);
+    }
+    ExitCode::SUCCESS
+}
+
 /// A machine description by path, or by catalog name.
 fn load_description(what: &str) -> Result<(String, String), String> {
     let path = Path::new(what);
@@ -1113,6 +1283,12 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         threading: (ThreadingMode::Deterministic, None),
         #[cfg(feature = "gdb")]
         gdb: None,
+        #[cfg(feature = "vnc")]
+        vnc: None,
+        #[cfg(feature = "vnc")]
+        record_input: None,
+        #[cfg(feature = "vnc")]
+        replay_input: None,
     };
     let mut i = 0;
     while i < args.len() {
@@ -1165,6 +1341,12 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             "--monitor" => out.monitor = Some(value(arg)?),
             #[cfg(feature = "gdb")]
             "--gdb" => out.gdb = Some(value(arg)?),
+            #[cfg(feature = "vnc")]
+            "--vnc" => out.vnc = Some(value(arg)?),
+            #[cfg(feature = "vnc")]
+            "--record-input" => out.record_input = Some(value(arg)?),
+            #[cfg(feature = "vnc")]
+            "--replay-input" => out.replay_input = Some(value(arg)?),
             "--console" => out.console = Some(value(arg)?),
             "--headless" => out.headless = true,
             "--screenshot" => out.screenshot = Some(value(arg)?),
