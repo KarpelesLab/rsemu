@@ -597,6 +597,29 @@ machine-pc-at = ["cpu-x86", "dev-pc", "dev-pc-video", "dev-pc-floppy"]
 # 010 or the 020. Adds no dependencies and is `no_std + alloc`.
 cpu-m68k = []
 
+# The MIPS core (src/cpu/mips): an LSI/MIPS R3000A-compatible MIPS I
+# interpreter -- the integer instruction set, R3000-style coprocessor 0 with
+# the full exception model and the 64-entry TLB, the fixed kuseg/kseg0/kseg1/
+# kseg2 map, HI/LO with multiply and divide, and branch *and* load delay slots
+# modelled honestly (MIPS I has no load interlock, and an exception in a delay
+# slot sets Cause.BD and points EPC at the branch). Which part is a
+# construction property, not a build flag: `r3000a`, `r3051`, and `lr33300`,
+# which has no TLB at all -- so one build runs both. Big- and little-endian.
+# Ships a disassembler generated from the same instruction description, a
+# 32-bit ELF reader, and the `syscall`-exit seam level-3 execution needs. The
+# GTE, the R3010 FPU and the LR33300 scratchpad are deliberately absent; a
+# COP1/COP2 instruction raises coprocessor-unusable, which is how a guest finds
+# out. Adds no dependencies and is `no_std + alloc`.
+cpu-mips = []
+
+# The `mips-mini` board (machines/mips-mini.machine plus the classes it names):
+# a synthetic little-endian R3000A board -- a boot ROM in kseg1 at the reset
+# vector, RAM at physical zero, and nothing else. It models no product; it
+# exists so `cpu.mips` has somewhere to run inside a machine file and so the
+# segment map is exercised by a real board rather than only by unit tests.
+# Adds no dependencies.
+machine-mips-mini = ["cpu-mips"]
+
 # The `m68k-mini` board (machines/m68k-mini.machine plus the classes it names):
 # a big-endian 24-bit space, ROM at zero holding the exception vector table and
 # the two longwords a 68000 fetches out of reset, and RAM above it. It models no

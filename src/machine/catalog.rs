@@ -299,6 +299,22 @@ pub static M68K_MINI: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/m68k-mini.machine"),
 };
 
+/// A minimal R3000A board, when this build has a MIPS core.
+///
+/// A synthetic board rather than a product: a 32-bit **physical** space, a
+/// boot ROM at `0x1FC0_0000` where the `kseg1` reset vector points, and RAM at
+/// physical zero — which the processor's own segment map makes visible at
+/// `0x0000_0000`, `0x8000_0000` and `0xA000_0000` alike. The `firmware` slot
+/// takes whatever should answer at `0xBFC0_0000`.
+#[cfg(feature = "machine-mips-mini")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-mips-mini")))]
+pub static MIPS_MINI: CatalogEntry = CatalogEntry {
+    name: "mips-mini",
+    summary: "a minimal MIPS R3000A board: 25 MHz, a physical 32-bit space, a kseg1 boot ROM, RAM",
+    media: &["firmware"],
+    source: include_str!("../../machines/mips-mini.machine"),
+};
+
 /// Every machine this build can realize, in catalog order.
 // One `#[cfg]`-gated push per shipped machine, which is what the lint is
 // complaining about: a `vec![]` literal cannot carry an attribute on one of its
@@ -318,6 +334,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&GAMEBOY);
     #[cfg(feature = "machine-m68k-mini")]
     out.push(&M68K_MINI);
+    #[cfg(feature = "machine-mips-mini")]
+    out.push(&MIPS_MINI);
     #[cfg(feature = "machine-pc-at")]
     out.push(&PC_AT);
     #[cfg(feature = "machine-nes")]
@@ -386,6 +404,8 @@ pub fn registry() -> Result<Registry> {
     crate::cpu::z80::register(&mut reg)?;
     #[cfg(feature = "cpu-m68k")]
     crate::cpu::m68k::register(&mut reg)?;
+    #[cfg(feature = "cpu-mips")]
+    crate::cpu::mips::register(&mut reg)?;
     #[cfg(feature = "cpu-riscv")]
     crate::cpu::riscv::register(&mut reg)?;
     #[cfg(feature = "dev-riscv")]
@@ -475,6 +495,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::cpu::z80::bind(&mut b)?;
     #[cfg(feature = "cpu-m68k")]
     crate::cpu::m68k::bind(&mut b)?;
+    #[cfg(feature = "cpu-mips")]
+    crate::cpu::mips::bind(&mut b)?;
     #[cfg(feature = "cpu-riscv")]
     crate::cpu::riscv::bind(&mut b)?;
     #[cfg(feature = "dev-riscv")]
@@ -559,6 +581,8 @@ pub fn classes() -> ClassTable {
     table.insert(crate::cpu::z80::schema());
     #[cfg(feature = "cpu-m68k")]
     table.insert(crate::cpu::m68k::schema());
+    #[cfg(feature = "cpu-mips")]
+    table.insert(crate::cpu::mips::schema());
     #[cfg(feature = "cpu-riscv")]
     table.insert(crate::cpu::riscv::schema());
     #[cfg(feature = "dev-riscv")]
@@ -1305,6 +1329,19 @@ mod tests {
             // followed by `BRA .-0`, the two-byte branch to itself. Everything
             // needed to prove the board realizes and the core fetches; the
             // program that does something is in `tests/m68k_mini_board.rs`.
+            // `j .` and its delay slot — the MIPS branch to itself, which is
+            // two words rather than one because every transfer of control on
+            // this architecture drags the instruction after it along. The
+            // target field is 0xbfc00000 >> 2, masked to 26 bits; the top four
+            // bits of the address come from the delay slot's program counter.
+            // Everything needed to prove the board realizes and the core
+            // fetches out of kseg1; the program that does something is in
+            // `tests/mips_mini_board.rs`.
+            #[cfg(feature = "machine-mips-mini")]
+            ("mips-mini", "firmware") => &[
+                0x00, 0x00, 0xf0, 0x0b, // j 0xbfc00000
+                0x00, 0x00, 0x00, 0x00, // nop, in the delay slot
+            ],
             #[cfg(feature = "machine-m68k-mini")]
             ("m68k-mini", "firmware") => &[
                 0x00, 0x20, 0x00, 0x00, // SSP = $00200000
