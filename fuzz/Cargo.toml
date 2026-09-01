@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "ir", "cpu-riscv-lift"]
+features         = ["std", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-ne2000", "ir", "cpu-riscv-lift"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -98,6 +98,19 @@ bench = false
 # frontend turns attacker-controlled guest bytes into IR. Paired with the
 # optimiser, because a DCE that removes a store, a charge, a dummy read or the
 # temporary a boundary names is a silent miscompile rather than a crash.
+# The NIC's 32 I/O ports, and the receive ring a guest programs behind them.
+# All four ring pointers are writable and the receive path does page arithmetic
+# with them, so what has to hold for an arbitrary configuration is that taking
+# in a frame is bounded work -- an unterminating wrap shows up here as a
+# timeout. The debug-read rule rides along: a debugger must not pop the remote
+# DMA window, clear a tally counter or trip the card's reset strap.
+[[bin]]
+name  = "ne2000_ports"
+path  = "fuzz_targets/ne2000_ports.rs"
+test  = false
+doc   = false
+bench = false
+
 [[bin]]
 name  = "ir_verify"
 path  = "fuzz_targets/ir_verify.rs"

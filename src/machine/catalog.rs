@@ -288,6 +288,22 @@ pub static Z80_MINI: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/z80-mini.machine"),
 };
 
+/// A minimal Z80 board with an NE2000 on its port bus, when this build has
+/// both.
+///
+/// A synthetic board rather than a product: it exists so that `net.ne2000` has
+/// somewhere a real driver can run, executing `IN` and `OUT` through the
+/// machine's own port space and taking the card's interrupt on `/INT`. The
+/// `firmware` slot takes whatever should be at `0x0000`.
+#[cfg(feature = "machine-ne2k-mini")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-ne2k-mini")))]
+pub static NE2K_MINI: CatalogEntry = CatalogEntry {
+    name: "ne2k-mini",
+    summary: "a minimal Z80 board with an NE2000 Ethernet card on its port bus",
+    media: &["firmware"],
+    source: include_str!("../../machines/ne2k-mini.machine"),
+};
+
 /// A minimal MC68000 board, when this build has a 68000.
 ///
 /// A synthetic board rather than a product: a big-endian 24-bit space, ROM at
@@ -340,6 +356,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&M68K_MINI);
     #[cfg(feature = "machine-mips-mini")]
     out.push(&MIPS_MINI);
+    #[cfg(feature = "machine-ne2k-mini")]
+    out.push(&NE2K_MINI);
     #[cfg(feature = "machine-pc-at")]
     out.push(&PC_AT);
     #[cfg(feature = "machine-nes")]
@@ -422,6 +440,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::ata::register(&mut reg)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::register(&mut reg)?;
+    #[cfg(feature = "dev-ne2000")]
+    crate::dev::net::ne2000::register(&mut reg)?;
     #[cfg(feature = "cpu-x86")]
     crate::cpu::x86::register(&mut reg)?;
     #[cfg(feature = "dev-pc")]
@@ -515,6 +535,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::ata::bind(&mut b)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::bind(&mut b)?;
+    #[cfg(feature = "dev-ne2000")]
+    crate::dev::net::ne2000::bind(&mut b)?;
     #[cfg(feature = "cpu-x86")]
     crate::cpu::x86::bind(&mut b)?;
     #[cfg(feature = "dev-pc")]
@@ -587,6 +609,8 @@ pub fn classes() -> ClassTable {
     table.insert(crate::cpu::arm::v7m::schema());
     #[cfg(feature = "cpu-z80")]
     table.insert(crate::cpu::z80::schema());
+    #[cfg(feature = "dev-ne2000")]
+    table.insert(crate::dev::net::ne2000::schema());
     #[cfg(feature = "cpu-m68k")]
     table.insert(crate::cpu::m68k::schema());
     #[cfg(feature = "cpu-mips")]
@@ -1336,6 +1360,11 @@ mod tests {
             // `tests/z80_mini_board.rs` supplies the one that does something.
             #[cfg(feature = "machine-z80-mini")]
             ("z80-mini", "firmware") => &[0x18, 0xfe],
+            // The same two bytes, for the same reason: this board realizes and
+            // fetches with them, and the driver that actually talks to the
+            // NE2000 lives in `tests/ne2000_board.rs`.
+            #[cfg(feature = "machine-ne2k-mini")]
+            ("ne2k-mini", "firmware") => &[0x18, 0xfe],
             // The two longwords a 68000 fetches out of reset — a stack pointer
             // at the top of the board's RAM and a program counter at $000008 —
             // followed by `BRA .-0`, the two-byte branch to itself. Everything

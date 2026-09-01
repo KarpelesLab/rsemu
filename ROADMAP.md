@@ -1540,11 +1540,37 @@ guest-filesystem robustness testing for free.
 
 ### 7.2 Networking
 
-**Solved by `pktkit`.** Every emulated NIC (`e1000`, `rtl8139`, `virtio-net`,
-`ne2000`, …) is a `pktkit::L2Device`; the config then attaches it to a
-`pktkit::L2Hub`, a `slirp` NAT stack, a TUN/TAP device, or a WireGuard/OpenVPN
-tunnel with no rsemu-side code. This is a large, already-finished chunk of the
-project that most emulators have to write themselves.
+**Largely solved by `pktkit`** — but not in the shape this section originally
+claimed, and the correction is a determinism one rather than a taste one.
+
+It said every emulated NIC *is* a `pktkit::L2Device`. It cannot be. `L2Device`
+delivers a received frame by **calling a handler** the moment the frame exists,
+on whatever host thread produced it, and at that instant the machine has no
+defined position in virtual time. A NIC that accepted a frame there would put it
+in the guest's receive ring at a different guest cycle on every run — the
+non-deterministic input §0 forbids, and one that would make the state hash of
+any machine with a NIC worthless.
+
+So the seam is `dev::net::link::NetLink`, and receive is a **pull**: an arriving
+frame is queued against a *virtual tick* and the NIC takes it out at a tick the
+scheduler chose (the NIC is a lazy device, so that tick is exact rather than a
+quantum boundary). A `pktkit::L2Device` is then one implementation of that seam
+— `dev::net::pktkit::PktkitLink` is itself an `L2Device`, so it plugs straight
+into an `L2Hub`, a `connect_l2` cable, slirp behind an `L2Adapter`, TUN/TAP or a
+tunnel, with no rsemu-side code. Everything the section promised is still free;
+what is not free is the *direction of control*. Nothing under `dev/net/` parses
+a packet: that is `pktkit`'s job and duplicating it is forbidden.
+
+Two smaller corrections fall out. Only the bridge file needs `std`, so §0's
+`dev/net/*` exception is one file wide rather than a subtree. And `pktkit`'s
+`L2Hub` ages its MAC table on `Instant::now`, as `L2Adapter`'s ARP and NDP
+caches do — not reachable from inside the scheduler, but a topology that depends
+on an aged-out entry is one whose recording is its only reproducible artefact.
+
+Landed: the seam, `NetPort` (the deterministic in-memory backend, with loopback
+and a `(tick, frame)` recording that is the network half of §4.5's record/replay
+seam), an **NE2000** card written from the DP8390D data sheet, the `pktkit`
+bridge, and `ne2k-mini` — a Z80 board whose firmware is a real driver.
 
 ---
 
