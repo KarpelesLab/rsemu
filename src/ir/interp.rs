@@ -82,14 +82,17 @@ pub trait IrHost {
     /// A [`RegSlot`] is an opaque index into the *host's* slot space: the
     /// frontend numbers it and the backend never interprets the numbering.
     ///
-    /// No op in today's IR reads a slot — a frontend materializes guest state
-    /// into temporaries before it lifts, and publishes it back at each
-    /// boundary — so the interpreter itself never calls this. It is half of
-    /// the contract nonetheless: the fault handler that materializes state
+    /// Called for [`Opcode::GET_SLOT`], which is how a block names a guest
+    /// register it did not compute — a frontend materializes the state it
+    /// reads into temporaries and publishes it back at each boundary, and this
+    /// is the materializing half.
+    ///
+    /// Two other consumers read the same slot space through the same trait,
+    /// and should: the fault handler that reconstructs architectural state
     /// from an [`InsnStart`], and the differential harness that compares this
-    /// backend against a host backend, both read the slot space they are
-    /// handed, and both should read it through the same trait the writes go
-    /// through.
+    /// backend against another. The first of those is
+    /// `cpu::riscv::differential`, which runs a lifted RISC-V block here and
+    /// against the guest's own interpreter.
     fn read_slot(&mut self, slot: RegSlot) -> u128;
 
     /// Write a slot of guest architectural state.

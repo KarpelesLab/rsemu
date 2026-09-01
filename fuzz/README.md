@@ -32,6 +32,7 @@ See [The phase-2 gate](#the-phase-2-gate) for the exact command.
 | `state_roundtrip` | `StateWriter` → `StateReader`, structured input     | writer/reader are inverses |
 | `flash_cfi`       | `dev::flash::cfi` — the NOR flash MMIO surface and its snapshot chunk | a program only ever clears bits |
 | `ir_verify`       | `ir::verify` over arbitrary blocks, then `ir::eliminate_dead_code` and `ir::Liveness` | never panics; a block the verifier accepts survives elimination and still verifies |
+| `riscv_lift`      | `cpu::riscv::lift` → `ir::verify` → `ir::Interp`, against `cpu::riscv`'s interpreter | the lifted block and the interpreter agree on registers, PC, ticks, memory and faults |
 
 ### `machine_parser`
 
@@ -127,6 +128,47 @@ terminator normally ends the block — because a uniformly random block dies on
 the first rule it meets and the agreement between the verifier and the pass
 would then never be tested. Every bias is still reachable in the wrong
 direction, so the rejection arms stay live.
+
+### `riscv_lift`
+
+The other half of the IR's correctness, and the half no amount of verification
+reaches. `ir_verify` asks whether a malformed block is *named* rather than
+miscompiled; this asks whether a **well-formed** block means the same thing the
+guest's own interpreter does. `CLAUDE.md` ("CPU cores") is the rule:
+
+> Each core ships an interpreter first; the IR frontend comes later and is
+> differentially tested against the interpreter **forever**. The interpreter is
+> the oracle.
+
+One generated RV64I program runs twice — once through `Hart::step`, once
+through `lift` → `verify` → `ir::Interp` — and every column either engine
+exposes is compared: the integer register file, the PC, the tick count, the
+block's own static tick column, guest RAM byte for byte, and whether the two
+agreed about taking a fault. Each catches a different class of bug, and only
+the first is obvious: a miscounted `charge` is invisible in the registers and
+fails the phase-5 state-hash gate a million cycles later, a store lifted at the
+wrong width writes the right register and the wrong memory, and a mis-computed
+address usually faults where the interpreter did not.
+
+The comparison itself is `cpu::riscv::differential::compare`, shared with
+`tests/riscv_lift_differential.rs` so that a crash found here pastes straight
+into an offline regression that needs no fuzzer.
+
+Input is a four-byte header and five bytes per instruction, hand-decoded; the
+target's header comment has the table. The `form`/`fields` pair goes to
+`differential::synthesize`, which turns any two numbers into an encoding
+*inside the lifted subset* — the same bias `ir_verify` uses and for the same
+reason. A uniformly random 32-bit word is almost never one of the ninety-odd
+encodings this frontend lifts, so an unbiased target would spend its whole
+budget proving that `lift` stops cleanly at an unsupported opcode and would
+never compare two engines at all. The out-of-subset arms stay reachable
+anyway: `JALR` on a core without `C`, an out-of-range shift amount, and a
+branch to a four-byte-misaligned target all come back as "nothing lifted".
+
+The header's first byte picks between three cores — bare RV64I, one that traps
+misaligned accesses, and one with `C` — because the misalignment policy is in
+every memory op's `Align` *and* in the block's cache key, and `C` decides both
+whether a 16-bit halfword is an instruction and whether `JALR` is in the subset.
 
 ## Setup (one-time)
 
