@@ -152,9 +152,16 @@ listening. There is no native sound-card backend for the same reason there is no
 native window: ALSA is an `ioctl` protocol and the alternative to `libc` is a
 seventh `unsafe` subsystem, which the ceiling of six forbids.
 
-Not started: the IR and JIT, so everything is interpreted; hardware
-acceleration; and i386 protected mode, without which no stock PC BIOS runs. See
-[`ROADMAP.md`](ROADMAP.md).
+The **translation IR** has landed — the architecture-neutral op set, typed SSA
+blocks, the guest-instruction-boundary markers that make a mid-block fault
+deliverable at the right PC with the right cycle count, a verifier, liveness
+and dead-code elimination, and a portable interpreter backend that needs no
+`unsafe` and runs on every target including bare metal. A RISC-V frontend lifts
+an RV64I subset into it, and the whole path is tested end to end: guest bytes
+in, IR out, verified, executed, with a tick count asserted equal to what the
+interpreter charges for the same program. Not started: the **host** JIT
+backends, so everything still executes interpreted; hardware acceleration; and
+the rest of the pass pipeline. See [`ROADMAP.md`](ROADMAP.md).
 
 ## Build
 
