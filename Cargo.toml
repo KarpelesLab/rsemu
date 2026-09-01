@@ -278,6 +278,20 @@ dev-lcdc = []
 # `-p link=transactional` switches it. Adds no dependencies.
 machine-spi-panel = ["cpu-riscv", "bus-spi", "dev-st7272a", "dev-lcdc"]
 
+# The translation IR (src/ir): the architecture-neutral op set every CPU
+# frontend lifts into and every JIT backend lowers from, its typed SSA blocks,
+# the guest-instruction-boundary markers that make a mid-block fault
+# deliverable at the right PC, and the verifier that rejects a malformed block
+# before a backend can miscompile it (ROADMAP.md §9).
+#
+# Deliberately **not** here: any host code generation. Emitting machine code
+# needs W^X buffers and raw syscalls, and emitting wasm needs an embedder
+# import, so both live in `jit/` above the `std` line. The portable IR
+# interpreter will land here rather than there, because §11's target table has
+# a bare-metal row whose engine it is. Adds no dependencies and is
+# `no_std + alloc`.
+ir = []
+
 # Level-3 execution (src/usermode): running a program with no guest kernel
 # under it, `qemu-user`/gVisor-shaped (ROADMAP.md §2, phase 5b). The four
 # things a syscall kernel cannot build for itself and rsemu owns because they

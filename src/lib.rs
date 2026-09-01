@@ -49,8 +49,9 @@
 //!
 //! Not yet: a native window or a native sound card — both need either a
 //! GUI/audio dependency the policy forbids or a seventh `unsafe` subsystem the
-//! ceiling forbids; the IR and JIT; and the rest of the host layer (VNC, an
-//! interactive monitor console).
+//! ceiling forbids; the JIT backends, so everything is interpreted — the
+//! translation IR they lower from is under [`ir`]; and the rest of the host
+//! layer (VNC, an interactive monitor console).
 //!
 //! # `no_std`
 //!
@@ -68,6 +69,10 @@ pub mod cpu;
 pub mod dev;
 pub mod host;
 pub mod machine;
+
+#[cfg(feature = "ir")]
+#[cfg_attr(docsrs, doc(cfg(feature = "ir")))]
+pub mod ir;
 
 #[cfg(feature = "usermode")]
 #[cfg_attr(docsrs, doc(cfg(feature = "usermode")))]
@@ -141,6 +146,9 @@ pub fn build_info() -> alloc::string::String {
     }
     if cfg!(feature = "machine-pc-at") {
         features.push("machine-pc-at");
+    }
+    if cfg!(feature = "ir") {
+        features.push("ir");
     }
     if cfg!(feature = "usermode") {
         features.push("usermode");
