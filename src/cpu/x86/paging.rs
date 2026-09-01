@@ -33,8 +33,8 @@
 //! charged. Writing a second walk for it is how the two get out of step — one
 //! gains 1 GiB pages and the other does not — so [`walk`] is parameterised by
 //! how it *reads* an entry and returns the entries it touched, and the caller
-//! decides whether to write anything back. [`Exec::translate`] writes; the
-//! debug path reads with [`MemAttrs::DEBUG`] and writes nothing.
+//! decides whether to write anything back. The executing walk writes; the
+//! debug path reads with `MemAttrs::DEBUG` and writes nothing.
 //!
 //! # Why the TLB is modelled rather than skipped
 //!
@@ -734,13 +734,13 @@ impl Exec<'_> {
 /// Where a linear address lives, as a debugger asks it — **without touching
 /// anything**.
 ///
-/// [`Exec::translate`] cannot be reused here, and that is the whole reason
+/// The executing walk cannot be reused here, and that is the whole reason
 /// `Device::debug_translate` is a separate entry point: the real walk sets the
 /// accessed and dirty bits, fills the TLB and latches `CR2`. Every one of
 /// those is guest-visible, and a debugger that caused them would be changing
 /// what it came to look at (`ROADMAP.md` §15, invariant 5). So this shares the
 /// [`walk`] and not the side effects: it reads every entry with
-/// [`MemAttrs::DEBUG`] — a page table can sit under an MMIO region — and
+/// `MemAttrs::DEBUG` — a page table can sit under an MMIO region — and
 /// answers *where the page is*, not whether an access would be allowed. A
 /// debugger showing a user page while the core is in ring 0 is doing its job.
 pub(super) fn debug_translate(

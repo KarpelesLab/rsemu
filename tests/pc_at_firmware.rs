@@ -589,8 +589,7 @@ fn a_pc_firmware_image_runs_on_the_assembled_board() {
         // Through the cached descriptor base, not `selector << 4`: in
         // protected mode the selector is an index into a table and shifting it
         // names an address the machine never drove.
-        let base = u64::from(sys.segs[rsemu::cpu::x86::isa::seg::SS as usize].base)
-            + u64::from(regs.rsp & 0xffff);
+        let base = sys.segs[rsemu::cpu::x86::isa::seg::SS as usize].base + (regs.rsp & 0xffff);
         let words = peek_bytes(&m, base, 64);
         println!("pc-at firmware: stack at {:04x}:{:04x}:", regs.ss, regs.rsp);
         for (i, row) in words.chunks(16).enumerate() {

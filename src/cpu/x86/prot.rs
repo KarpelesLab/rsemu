@@ -24,7 +24,7 @@
 //!   which BIOSes use to copy above 1 MiB without leaving real mode.
 //!
 //! So [`SegReg`] is **saved and restored**, unlike the translation-lookaside
-//! buffer beside it in [`paging`](super::paging). CLAUDE.md's rule that derived state
+//! buffer beside it in [`paging`]. CLAUDE.md's rule that derived state
 //! is never serialized is about state that can be re-derived; this cannot be,
 //! and a snapshot that dropped it would silently break unreal mode across a
 //! save/load. The TLB, which *is* re-derivable from the page tables, is not
@@ -1328,6 +1328,22 @@ impl Exec<'_> {
             return Ok(());
         }
 
+        // Long mode has **no hardware task switching**: type 5 does not exist
+        // there, and type 9 is a table of stack pointers rather than a task's
+        // saved state. Falling through to `switch_task` would load a register
+        // image out of a structure that holds none.
+        if self.state.sys.long_mode()
+            && matches!(
+                desc.kind(),
+                sys_type::TASK_GATE
+                    | sys_type::TSS16_AVAIL
+                    | sys_type::TSS16_BUSY
+                    | sys_type::TSS32_AVAIL
+                    | sys_type::TSS32_BUSY
+            )
+        {
+            return Err(Fault::gp(u32::from(selector & 0xfffc)));
+        }
         match desc.kind() {
             sys_type::CALL_GATE16 | sys_type::CALL_GATE32 => {
                 self.call_gate(selector, desc, is_call)
@@ -1462,11 +1478,11 @@ impl Exec<'_> {
             return Err(Fault::coded(VEC_TS, u32::from(tss.selector & 0xfffc)));
         }
         let sp = if wide {
-            u64::from(self.sys_read32(tss.base.wrapping_add(u64::from(esp_off)))?)
+            u64::from(self.sys_read32(tss.base.wrapping_add(esp_off))?)
         } else {
-            u64::from(self.sys_read16(tss.base.wrapping_add(u64::from(esp_off)))?)
+            u64::from(self.sys_read16(tss.base.wrapping_add(esp_off))?)
         };
-        let ss = self.sys_read16(tss.base.wrapping_add(u64::from(ss_off)))? as u16;
+        let ss = self.sys_read16(tss.base.wrapping_add(ss_off))? as u16;
         Ok((ss, sp))
     }
 
@@ -1806,7 +1822,7 @@ impl Exec<'_> {
         self.state.regs.rip = target_ip;
         let entry = self.state.sys.seg_mut(seg::CS);
         entry.selector = target_cs as u16;
-        entry.base = u64::from(target_cs & 0xffff) << 4;
+        entry.base = (target_cs & 0xffff) << 4;
         self.state.queue.flush();
         Ok(())
     }
@@ -1818,8 +1834,8 @@ impl Exec<'_> {
     fn read_ivt(&mut self, offset: u32) -> u64 {
         let low = super::linear(0, offset as u16);
         let high = super::linear(0, (offset as u16).wrapping_add(1));
-        let lo = self.phys_read(u64::from(low), 1);
-        let hi = self.phys_read(u64::from(high), 1);
+        let lo = self.phys_read(low, 1);
+        let hi = self.phys_read(high, 1);
         lo | (hi << 8)
     }
 
@@ -2274,7 +2290,15 @@ impl Exec<'_> {
             return Err(Fault::gp(u32::from(selector & 0xfffc)));
         }
         let desc = self.descriptor(selector, VEC_GP)?;
-        if desc.is_app() || !matches!(desc.kind(), sys_type::TSS16_AVAIL | sys_type::TSS32_AVAIL) {
+        // Long mode reuses type 9 for its own task state segment — a table of
+        // stack pointers rather than a task's saved state — and drops the
+        // 286 form entirely.
+        let kinds: &[u8] = if self.state.sys.long_mode() {
+            &[sys_type::TSS32_AVAIL]
+        } else {
+            &[sys_type::TSS16_AVAIL, sys_type::TSS32_AVAIL]
+        };
+        if desc.is_app() || !kinds.contains(&desc.kind()) {
             return Err(Fault::gp(u32::from(selector & 0xfffc)));
         }
         if !desc.present() {

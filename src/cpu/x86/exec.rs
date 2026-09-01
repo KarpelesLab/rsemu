@@ -721,9 +721,9 @@ impl<'a> Exec<'a> {
     fn legacy_read16_seg(&mut self, segment: u16, offset: u16) -> u16 {
         let base = linear(segment, offset);
         if self.word_is_one_cycle(base, offset) {
-            return self.phys_read(u64::from(base), 2) as u16;
+            return self.phys_read(base, 2) as u16;
         }
-        let lo = self.phys_read(u64::from(base), 1) as u8;
+        let lo = self.phys_read(base, 1) as u8;
         let hi = self.phys_read(linear(segment, offset.wrapping_add(1)), 1) as u8;
         u16::from(lo) | (u16::from(hi) << 8)
     }
@@ -732,10 +732,10 @@ impl<'a> Exec<'a> {
     fn legacy_write16_seg(&mut self, segment: u16, offset: u16, value: u16) {
         let base = linear(segment, offset);
         if self.word_is_one_cycle(base, offset) {
-            self.phys_write(u64::from(base), 2, u64::from(value));
+            self.phys_write(base, 2, u64::from(value));
             return;
         }
-        self.phys_write(u64::from(base), 1, u64::from(value & 0xff));
+        self.phys_write(base, 1, u64::from(value & 0xff));
         self.phys_write(
             linear(segment, offset.wrapping_add(1)),
             1,

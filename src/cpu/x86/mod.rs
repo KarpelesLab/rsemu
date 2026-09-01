@@ -1,11 +1,23 @@
-//! Intel x86: the 8086 and 8088 in real mode, and the 80386 and 80486 with
-//! protection, paging and 32-bit operands.
+//! Intel x86: the 8086 and 8088 in real mode, the 80386 and 80486 with
+//! protection, paging and 32-bit operands, and x86-64 with long mode.
 //!
-//! `ROADMAP.md` §6 calls x86 "the hard one". One interpreter covers all four
-//! parts, selected by [`Variant`] rather than by a second module, because the
-//! generations really are close to a superset chain — and where they are not,
-//! the difference is named and modelled rather than flattened (the table in
-//! the private `exec` module lists all ten).
+//! `ROADMAP.md` §6 calls x86 "the hard one". One interpreter covers every
+//! part, selected by [`Variant`] and [`Features`] rather than by a second
+//! module, because the generations really are close to a superset chain — and
+//! where they are not, the difference is named and modelled rather than
+//! flattened (the table in the private `exec` module lists all ten, and
+//! [`isa::L64`] lists the ones long mode added).
+//!
+//! # The lattice, not the ladder
+//!
+//! [`Variant`] names a *part* and [`Features`] says what it has, and the two
+//! are separate on purpose (`ROADMAP.md` §6.1.1). `PAE` arrived on a Pentium
+//! Pro with no long mode; `SYSCALL` on an AMD K6 with no 64-bit anything;
+//! `NX` on parts that shipped both with and without it inside one model
+//! number. So a decode or execute site asks whether the *feature* is present,
+//! never whether the variant is at least some other variant — and [`Variant`]
+//! is deliberately not `Ord`, so it cannot grow the comparison that would make
+//! that possible.
 //!
 //! # What is modelled
 //!
@@ -36,10 +48,22 @@
 //! call, interrupt, trap and task gates; the task state segment, its
 //! privilege-0 stack and its I/O permission bitmap; and task switching.
 //!
-//! **Paging** ([`paging`]): the two-level directory and table walk, `CR2` and
-//! `CR3`, the accessed and dirty bits written by the walk itself, a
-//! translation-lookaside buffer so they are written once rather than on every
-//! access, `INVLPG`, and page faults with the three-bit error code.
+//! **Paging** ([`paging`]): one walk at four depths — off, the two-level
+//! directory and table, PAE's three levels of 64-bit entries, and IA-32e's
+//! four — with 4 MiB, 2 MiB and 1 GiB pages, `CR2` and `CR3`, the accessed and
+//! dirty bits written by the walk itself, a translation-lookaside buffer so
+//! they are written once rather than on every access, `INVLPG`, and page
+//! faults with their error code. The debug walk shares the same function
+//! rather than duplicating it.
+//!
+//! **Long mode** ([`prot`], [`isa`]): `EFER.LME` and the `LMA` bit the
+//! processor sets for itself when paging comes on; `CR4` and the
+//! model-specific registers; the `REX` prefix, sixteen 64-bit registers, and
+//! `RIP`-relative addressing; the changed default operand sizes and the
+//! twenty-odd encodings long mode reclaimed; 64-bit and compatibility submodes
+//! with the descriptor `L` bit that selects them; sixteen-byte system
+//! descriptors and interrupt gates with their interrupt-stack table; the
+//! canonical-address rule; and `SYSCALL`, `SYSRET` and `SWAPGS`.
 //!
 //! **The exception model**: faults, traps and aborts, with the vectors and
 //! error codes the manual gives them; faults restart the instruction they came
@@ -52,9 +76,22 @@
 //!
 //! # What is not
 //!
-//! - **No floating-point unit.** There is no 387 and no `CPUID` bit claiming
-//!   one; with `CR0.EM` or `CR0.TS` set an escape raises `#NM` so software can
+//! - **No floating-point unit, and no SIMD.** There is no 387, no MMX and no
+//!   SSE; with `CR0.EM` or `CR0.TS` set an escape raises `#NM` so software can
 //!   emulate, which is what an operating system that wants to do so asks for.
+//!   `CR4.OSFXSR` and `CR4.OSXMMEXCPT` have storage because an operating
+//!   system writes and reads them before it decides anything, and **no
+//!   `CPUID` bit claims any of it** — the bits are modelled and the arithmetic
+//!   is not, deliberately, so a guest fails its own feature check rather than
+//!   hitting a `#UD` in the middle of a kernel. A 64-bit operating system that
+//!   requires SSE2 will therefore refuse to boot, and say so.
+//! - **No `CMPXCHG8B` or `CMPXCHG16B`**, and `CPUID`'s `CX8` bit is clear to
+//!   match.
+//! - **No hardware task switching in long mode**, which is the architecture:
+//!   a far transfer to a task gate or a task state segment is `#GP` there, and
+//!   the 64-bit task state segment is read only for its stack pointers.
+//! - **No virtual-address width above 48 bits.** Five-level paging (`LA57`)
+//!   is not implemented, and `CPUID` leaf `8000_0008` reports 48.
 //! - **No virtual-8086 mode.** `EFLAGS.VM` has storage and nothing sets it.
 //! - **No debug breakpoints.** `DR0`-`DR7` round-trip; arming one fires
 //!   nothing. `TR6`/`TR7` likewise store and do nothing.
@@ -135,9 +172,19 @@
 //! sandpile.org's encoding tables for what the manuals leave out. Undefined
 //! behaviour was measured against `SingleStepTests/8088` (MIT), which is
 //! hardware output rather than anyone's emulator, and the 32-bit encodings
-//! were cross-checked against GNU `as` and `objdump`. **No copyleft emulator
-//! was consulted** — `docs/cpu/x86.md` names the three that people reach for
-//! when x86 gets hard and records that all three are forbidden.
+//! were cross-checked against GNU `as` and `objdump`.
+//!
+//! For **long mode**: the *Intel SDM* volume 2 for `REX`, the changed operand
+//! sizes and the reclaimed encodings, and volume 3 chapters 4 (paging), 6
+//! (the 64-bit interrupt descriptor table) and 9.8.5 (the activation
+//! sequence); and the *AMD64 Architecture Programmer's Manual* volumes 2 and
+//! 3, which are clearer on the parts AMD designed — the submodes, `SYSCALL`,
+//! and which descriptor fields stop being read. Every non-obvious behaviour
+//! carries its volume and section where it is implemented.
+//!
+//! **No copyleft emulator was consulted** — `docs/cpu/x86.md` names the three
+//! that people reach for when x86 gets hard and records that all three are
+//! forbidden.
 
 pub mod disasm;
 mod exec;
@@ -326,7 +373,7 @@ pub struct Features {
     ///
     /// Implies [`pae`](Features::pae) at *construction* — a long-mode part
     /// without physical address extension cannot exist, because the four-level
-    /// walk is the PAE walk with a level added — and [`Config::validate`] says
+    /// walk is the PAE walk with a level added — and [`Features::validate`] says
     /// so rather than silently turning it on.
     pub long: bool,
     /// The no-execute page bit: `EFER.NXE` and bit 63 of a page-table entry.
@@ -2992,6 +3039,33 @@ pub fn describe_isa_for(variant: Variant) -> String {
                 continue;
             }
             row(&mut out, "0f ", opcode, isa::decode_0f(opcode));
+        }
+    }
+    // The 64-bit column, listed separately rather than folded in, because a
+    // part that has long mode still decodes the legacy map above whenever it
+    // is not in it. Generated from the same rows, so an encoding cannot be
+    // reclaimed in the decoder and not here.
+    if variant.features().long {
+        let _ = writeln!(out, "\n-- 64-bit mode differs --");
+        let long_row = |out: &mut String, prefix: &str, opcode: u8, insn: isa::Insn| {
+            if matches!(insn.long, isa::L64::Same) {
+                return;
+            }
+            let now = insn.in_long();
+            let _ = writeln!(
+                out,
+                "{prefix}{opcode:02x}    {:<7} -> {}{:<7} {}",
+                insn.op.mnemonic(),
+                mark(now.class),
+                now.op.mnemonic(),
+                now.op.summary()
+            );
+        };
+        for opcode in 0..=255u8 {
+            long_row(&mut out, "", opcode, isa::decode_as(map, opcode));
+        }
+        for opcode in 0..=255u8 {
+            long_row(&mut out, "0f ", opcode, isa::decode_0f(opcode));
         }
     }
     out
