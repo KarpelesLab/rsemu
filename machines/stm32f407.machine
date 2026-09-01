@@ -77,6 +77,29 @@ machine "stm32f407" {
   param sram2 = 16K
   param ccm   = 64K
 
+  # -- where everything is ---------------------------------------------------
+  #
+  # Every address is a parameter, and every default below is RM0090 Table 1's
+  # number. That is not because an F407 can be reconfigured — it cannot, these
+  # are wired into the die — but because a *sibling part* moves them, and the
+  # point of a parameter here is that deriving an F401 or an F429 file is
+  # editing a value rather than hunting through `map` statements for a
+  # hexadecimal constant. An override describes a **different part**, not a
+  # different configuration of this one.
+  param boot-base   = 0x00000000   # the alias BOOT0/BOOT1 select; flash, here
+  param flash-base  = 0x08000000
+  param ccm-base    = 0x10000000
+  param sram-base   = 0x20000000
+  param apb1-base   = 0x40000000
+  param ahb1-base   = 0x40020000
+
+  # Peripheral offsets from their bus's base. An STM32 peripheral is allotted a
+  # kilobyte, so the GPIO ports are 0x400 apart and the arithmetic below says so
+  # rather than repeating six constants that must agree.
+  param usart2-off  = 0x4400       # APB1 + 0x4400
+  param gpio-stride = 0x400
+  param rcc-off     = 0x3800       # AHB1 + 0x3800
+
   # -- crystals --------------------------------------------------------------
   #
   # The clock tree in outline. A Discovery board hangs an 8 MHz crystal on HSE
@@ -176,6 +199,9 @@ machine "stm32f407" {
 
   # -- the memory map --------------------------------------------------------
   #
+  # Every base is a `param` from the top of the file; see the note there for why
+  # a fixed part still parameterises its own map.
+  #
   # `perms = "r-x"` on the flash: the part's flash is not writable through the
   # AHB — a program to it goes through the flash interface's key sequence, which
   # this board does not model — so a stray `STR` into it is a BusFault rather
@@ -187,27 +213,28 @@ machine "stm32f407" {
   # the core fetches its initial `SP` and `PC` from out of reset. Modelling the
   # pins would mean an RCC-shaped device; a board that boots from flash is the
   # overwhelmingly common case and this file states which one it is.
-  map mem 0x00000000 size flash = rom   { perms = "r-x" }   # the boot alias
-  map mem 0x08000000 size flash = rom   { perms = "r-x" }   # flash proper
-  map mem 0x10000000 size ccm   = ccmram                    # CCM: no DMA reaches it
-  map mem 0x20000000 size sram1 = ram1
-  map mem 0x2001c000 size sram2 = ram2
+  map mem boot-base            size flash = rom { perms = "r-x" }
+  map mem flash-base           size flash = rom { perms = "r-x" }
+  map mem ccm-base             size ccm   = ccmram   # CCM: no DMA reaches it
+  map mem sram-base            size sram1 = ram1
+  map mem sram-base + sram1    size sram2 = ram2     # SRAM2 abuts SRAM1
 
   # APB1, then AHB1. Each register block is mapped at its own base and at its
-  # own size: an STM32 peripheral is allotted a kilobyte and decodes the
-  # low bytes of it, and the rest of the kilobyte is a hole rather than a
-  # mirror — which is what the part does, and what makes a wrong offset a fault
-  # instead of a plausible answer.
-  map mem 0x40004400 size 0x2c  = usart2
+  # own size: a peripheral decodes the low bytes of its kilobyte and the rest of
+  # the kilobyte is a **hole** rather than a mirror — which is what the part
+  # does, and what makes a wrong offset a fault instead of a plausible answer.
+  map mem apb1-base + usart2-off size 0x2c = usart2
 
-  map mem 0x40020000 size 0x28  = gpioa
-  map mem 0x40020400 size 0x28  = gpiob
-  map mem 0x40020800 size 0x28  = gpioc
-  map mem 0x40020c00 size 0x28  = gpiod
-  map mem 0x40021000 size 0x28  = gpioe
-  map mem 0x40021c00 size 0x28  = gpioh
+  # The six ports the LQFP100 bonds, at A + n * 0x400: A, B, C, D, E, then H,
+  # which is 7. F, G and I exist on the die and have no pins in this package.
+  map mem ahb1-base + gpio-stride * 0 size 0x28 = gpioa
+  map mem ahb1-base + gpio-stride * 1 size 0x28 = gpiob
+  map mem ahb1-base + gpio-stride * 2 size 0x28 = gpioc
+  map mem ahb1-base + gpio-stride * 3 size 0x28 = gpiod
+  map mem ahb1-base + gpio-stride * 4 size 0x28 = gpioe
+  map mem ahb1-base + gpio-stride * 7 size 0x28 = gpioh
 
-  map mem 0x40023800 size 1K    = rcc
+  map mem ahb1-base + rcc-off size 1K = rcc
 
   # -- interrupts ------------------------------------------------------------
   #
