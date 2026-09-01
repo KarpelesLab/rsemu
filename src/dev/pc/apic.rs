@@ -1096,7 +1096,11 @@ impl Registers {
                 REG_LDR => state.ldr = (value >> 24) as u8,
                 REG_DFR => state.dfr = (value >> 28) as u8,
                 REG_SVR => {
-                    state.svr = value & 0x0000_11ff;
+                    // Vector (0-7), the APIC software enable (8), focus
+                    // processor checking (9) and end-of-interrupt broadcast
+                    // suppression (12). Bits 10-11 and everything above are
+                    // reserved (SDM Vol 3A Figure 10-23).
+                    state.svr = value & 0x0000_13ff;
                 }
                 REG_ESR => {
                     // The write is what latches: "the ESR must be written
@@ -1107,7 +1111,12 @@ impl Registers {
                 }
                 REG_ICR_HIGH => state.icr_high = value & 0xff00_0000,
                 REG_ICR_LOW => {
-                    state.icr_low = value & 0x000c_dfff;
+                    // Vector (0-7), delivery mode (8-10), destination mode
+                    // (11), level (14), trigger mode (15) and the destination
+                    // shorthand (18-19). Bit 12 is the delivery status, which
+                    // is read-only and always idle here because delivery is
+                    // synchronous; bit 13 and the rest are reserved.
+                    state.icr_low = value & 0x000c_cfff;
                     let message = Message {
                         vector: value as u8,
                         delivery: Delivery(((value >> 8) & 7) as u8),
@@ -1432,7 +1441,7 @@ impl LocalApic {
     ///
     /// # Errors
     ///
-    /// [`Error::Property`](crate::core::Error::Property) if `id` is not a
+    /// [`Error::Property`] if `id` is not a
     /// value an eight-bit APIC ID can hold, or if a property this class does
     /// not know was given.
     pub fn new(props: &Props) -> Result<LocalApic> {

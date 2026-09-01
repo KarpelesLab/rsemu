@@ -610,7 +610,7 @@ impl Hpet {
     ///
     /// # Errors
     ///
-    /// [`Error::Property`](crate::core::Error::Property) if `period` is zero or
+    /// [`Error::Property`] if `period` is zero or
     /// longer than the 100 ns the specification permits, if a route names an
     /// input above 31, or if a property this class does not know was given.
     pub fn new(props: &Props) -> Result<Hpet> {
@@ -1004,10 +1004,7 @@ mod tests {
             DEFAULT_PERIOD_FS,
             "100 ns in femtoseconds, exactly as declared and never derived"
         );
-        assert!(
-            DEFAULT_PERIOD_FS <= MAX_PERIOD_FS,
-            "which the specification caps at 100 ns"
-        );
+        const { assert!(DEFAULT_PERIOD_FS <= MAX_PERIOD_FS) };
     }
 
     #[test]

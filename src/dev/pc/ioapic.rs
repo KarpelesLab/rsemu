@@ -434,7 +434,7 @@ impl IoApic {
     ///
     /// # Errors
     ///
-    /// [`Error::Property`](crate::core::Error::Property) if `id` or `inputs` is
+    /// [`Error::Property`] if `id` or `inputs` is
     /// out of range, or if a property this class does not know was given.
     pub fn new(props: &Props) -> Result<IoApic> {
         let mut r = props.reader();

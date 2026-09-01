@@ -173,8 +173,8 @@ impl Rig {
         regs.ss = 0x10;
         regs.fs = 0x10;
         regs.gs = 0x10;
-        regs.eip = eip;
-        regs.esp = 0xf000;
+        regs.rip = u64::from(eip);
+        regs.rsp = 0xf000;
         cpu.set_regs(regs);
     }
 
@@ -283,7 +283,7 @@ fn a_second_processor_is_started_by_init_and_start_up() {
     assert_eq!(page, AP_PAGE);
     let mut regs = rig.cpus[1].regs();
     regs.cs = u16::from(page) << 8;
-    regs.eip = 0;
+    regs.rip = 0;
     rig.cpus[1].set_regs(regs);
     // ------------------------------------------------------------------------
 
