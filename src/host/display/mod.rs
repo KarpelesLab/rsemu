@@ -107,32 +107,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
-/// Serialises the tests that touch process-wide state.
-///
-/// Two things in this tree are process-wide by construction: the capture table
-/// in [`nes::capture`], and the single machine slot the wasm module keeps.
-/// `cargo test` runs tests in parallel threads of one process, so a test that
-/// boots a machine through either takes this first — otherwise one test's
-/// `clear` lands between another's build and its `take`, and the failure looks
-/// like a bug in the emulator rather than in the harness.
-///
-/// This is about *interference*, not about soundness: the capture table is a
-/// [`Global`](crate::core::sync::Global), so concurrent access is defined and
-/// merely wrong-answered. Serialising it is what makes the answer right, and
-/// it does not substitute for the table having the correct lock — which was
-/// the whole point of the bug that produced `Global`.
-///
-/// [`LockRank::UNCHECKED`] because it is not part of the machine's lock order
-/// at all: it is deliberately held across everything, which is what any other
-/// rank would forbid.
-// Which tests need it depends on the feature set, and a build with no machine
-// in it has none — that is not an unused static, it is a build with nothing to
-// serialise.
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) static PROCESS_WIDE: crate::core::sync::Global<()> =
-    crate::core::sync::Global::with_rank(crate::core::sync::LockRank::UNCHECKED, ());
-
 // ---------------------------------------------------------------------------
 // Pixel formats
 // ---------------------------------------------------------------------------

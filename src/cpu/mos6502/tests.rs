@@ -1356,7 +1356,8 @@ fn realize_does_nothing_outward_and_bind_is_what_needs_a_space() {
     // later (`ROADMAP.md` §4.4).
     let cpu = Mos6502::new(Config::default());
     let mut deferred = crate::core::device::Deferred::new();
-    let mut ctx = RealizeCtx::new("cpu", RequesterId::ANONYMOUS, &mut deferred);
+    let ctx_hosts = crate::core::HostObjects::new();
+    let mut ctx = RealizeCtx::new("cpu", RequesterId::ANONYMOUS, &mut deferred, &ctx_hosts);
     assert!(cpu.realize(&mut ctx).is_ok());
     assert!(cpu.space().is_none(), "realize attaches nothing");
 }

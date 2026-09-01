@@ -550,12 +550,31 @@ pub fn build_options() -> Result<BuildOptions> {
 /// [`build`](crate::machine::build) refuses — including a media slot the
 /// caller did not bind.
 pub fn build_catalog(name: &str, media: &[(&str, &[u8])]) -> Result<Machine> {
+    build_catalog_with_hosts(name, media).map(|(machine, _)| machine)
+}
+
+/// Build a shipped machine and keep the host objects its devices opened.
+///
+/// The same build as [`build_catalog`], with the other end of every character
+/// port, pad and signal the machine asked for — see
+/// [`core::hosts`](crate::core::hosts). `build_catalog` drops that table, which
+/// is right for a caller that only drives the machine and reads its snapshot,
+/// and useless to one that wants to type at it.
+///
+/// # Errors
+///
+/// As [`build_catalog`].
+pub fn build_catalog_with_hosts(
+    name: &str,
+    media: &[(&str, &[u8])],
+) -> Result<(Machine, alloc::sync::Arc<crate::core::hosts::HostObjects>)> {
     let entry = machine(name).ok_or_else(|| unknown(name))?;
     let mut options = build_options()?;
     for (slot, bytes) in media {
         options.realize.media.insert(*slot, *bytes);
     }
-    crate::machine::build(entry.name, entry.source, &registry()?, &options)
+    let machine = crate::machine::build(entry.name, entry.source, &registry()?, &options)?;
+    Ok((machine, options.realize.hosts))
 }
 
 /// The error for a machine this build does not ship.

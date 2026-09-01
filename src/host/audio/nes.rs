@@ -47,13 +47,13 @@
 //! let mut options = catalog::build_options()?;
 //! audio::nes::capture::install(&mut options, 65_536)?;  // intercept nes.apu
 //! let machine = machine::build(name, source, &registry, &options)?;
-//! let source = audio::nes::capture::take();             // the Arc it kept
+//! let source = audio::nes::capture::take(&options.realize.hosts);
 //! ```
 //!
 //! **This is a seam, and it is marked as one.** When `Device` grows an audio
 //! hook beside `Device::region`, every line of [`capture`] deletes and nothing
-//! else here changes. Until then the table is process-wide, so build one
-//! machine at a time or [`capture::clear`] between them.
+//! else here changes. The capture table belongs to the build rather than to the
+//! process, so two consoles built in one process do not swap chips.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -155,117 +155,77 @@ const fn gcd(mut a: u64, mut b: u64) -> u64 {
 /// The interception that gets a host an `Arc<Apu>` out of a described machine.
 /// See the module docs: a seam, not a design.
 pub mod capture {
-    use super::{Apu, Arc, NesAudio, Vec};
+    use super::{Apu, Arc, NesAudio};
     use crate::core::error::Result;
-    use crate::core::props::Props;
-    use crate::core::sync::{AtomicU64, Global, LockRank, Ordering};
+    use crate::core::hosts::{Captured, HostKind, HostObjects};
     use crate::dev::apu::{APU_CLASS, MAX_SAMPLE_BUFFER};
-    use crate::machine::realize::Instance;
-    use crate::machine::{Bindings, BuildOptions};
+    use crate::machine::BuildOptions;
 
-    /// Every APU constructed since the last [`take`] or [`clear`], oldest
-    /// first. A `Vec` rather than a single slot because a machine with an
-    /// expansion-audio chip alongside the console's own is not this module's
-    /// business to refuse.
-    static CONSTRUCTED: Global<Vec<Arc<Apu>>> = Global::with_rank(LockRank::LEAF, Vec::new());
-
-    /// The smallest output ring the host will accept, in samples; `0` leaves
-    /// whatever the machine description asked for alone.
+    /// Replace `nes.apu`'s constructor in `options` with one that keeps a
+    /// handle and asks for an output ring of at least `capacity` samples.
+    ///
+    /// The one call a host makes between [`catalog::build_options`] and
+    /// [`machine::build`].
     ///
     /// **Sizing the ring is a host concern**, and it is the *only* thing this
     /// interception changes about the machine. It has to be: how many samples
     /// may accumulate before somebody drains them is a fact about the front
     /// end's cadence — one video frame in a browser, a whole run under
-    /// `--record-audio` — and a machine description cannot know it.
+    /// `--record-audio` — and a machine description cannot know it. A
+    /// `capacity` of `0` leaves whatever the description asked for alone.
     ///
     /// Nothing guest-visible depends on it. The ring is output rather than
     /// architectural state, it is absent from the snapshot, and no register
     /// reports its depth, so a machine recorded and a machine ignored produce
     /// the same state hash. `host::audio::tests` asserts exactly that.
-    static WANTED: AtomicU64 = AtomicU64::new(0);
-
-    /// Construct an APU and keep a reference to it.
     ///
-    /// An `InstanceCtor` is a bare `fn` that can capture nothing, which is why
-    /// both the table above and the requested capacity are statics.
-    fn construct(props: &Props) -> Result<Arc<dyn Instance>> {
-        let wanted = WANTED.load(Ordering::Relaxed).min(MAX_SAMPLE_BUFFER);
-        let asked = props
-            .get("sample-buffer")
-            .and_then(crate::core::props::Value::as_uint);
-        let apu = match asked {
-            // A machine that named a capacity and named a big enough one, or a
-            // host that asked for nothing: build exactly what was written.
-            _ if wanted == 0 => Arc::new(Apu::new(props)?),
-            Some(have) if have >= wanted => Arc::new(Apu::new(props)?),
-            _ => Arc::new(Apu::new(&props.clone().with("sample-buffer", wanted))?),
-        };
-        CONSTRUCTED.lock().push(Arc::clone(&apu));
-        Ok(apu)
-    }
-
-    /// Replace `nes.apu`'s constructor in `bindings` with one that keeps a
-    /// handle, leaving every other class alone.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::Error::Config`] if a class turns out to be bound twice, which
-    /// would be a bug in the caller's binding table rather than here.
-    pub fn intercept(bindings: &Bindings) -> Result<Bindings> {
-        let mut out = Bindings::new();
-        let mut replaced = false;
-        let classes: Vec<&'static str> = bindings.classes().collect();
-        for class in classes {
-            if class == APU_CLASS.name {
-                out.bind(class, construct)?;
-                replaced = true;
-            } else if let Some(ctor) = bindings.get(class) {
-                out.bind(class, ctor)?;
-            }
-        }
-        if !replaced {
-            // The APU's own `bind` was never called — a build with the device
-            // feature but a machine that does not use it. Binding it here is
-            // still correct: an unused binding costs nothing.
-            out.bind(APU_CLASS.name, construct)?;
-        }
-        Ok(out)
-    }
-
-    /// Point `options` at intercepted bindings, in place, asking for an output
-    /// ring of at least `capacity` samples.
-    ///
-    /// The one call a host makes between [`catalog::build_options`] and
-    /// [`machine::build`].
+    /// The capacity is a *captured* value rather than a static, which is the
+    /// whole reason [`InstanceCtor`](crate::machine::realize::InstanceCtor) is a
+    /// closure: two builds may want two different rings, and a `static` gave
+    /// them one.
     ///
     /// [`catalog::build_options`]: crate::machine::catalog::build_options
     /// [`machine::build`]: crate::machine::build
     ///
     /// # Errors
     ///
-    /// As [`intercept`].
+    /// [`crate::Error::Config`] if something else has already claimed this
+    /// build's capture table.
     pub fn install(options: &mut BuildOptions, capacity: u64) -> Result<()> {
-        WANTED.store(capacity, Ordering::Relaxed);
-        options.bindings = intercept(&options.bindings)?;
+        let seen: Arc<Captured<Apu>> =
+            options
+                .realize
+                .hosts
+                .open(HostKind::CAPTURE, APU_CLASS.name, Captured::new)?;
+        let wanted = capacity.min(MAX_SAMPLE_BUFFER);
+        options.bindings.replace(APU_CLASS.name, move |props| {
+            let asked = props
+                .get("sample-buffer")
+                .and_then(crate::core::props::Value::as_uint);
+            let apu = match asked {
+                // A machine that named a capacity and named a big enough one, or
+                // a host that asked for nothing: build exactly what was written.
+                _ if wanted == 0 => Arc::new(Apu::new(props)?),
+                Some(have) if have >= wanted => Arc::new(Apu::new(props)?),
+                _ => Arc::new(Apu::new(&props.clone().with("sample-buffer", wanted))?),
+            };
+            seen.push(&apu);
+            Ok(apu)
+        });
         Ok(())
     }
 
-    /// Take the most recently constructed APU as a [`NesAudio`], forgetting
-    /// every earlier one.
+    /// The APU this build constructed, as a [`NesAudio`].
     ///
-    /// `None` if no machine with an APU has been built since the last call — a
-    /// machine with no sound, which a host must be able to play silence for.
+    /// The most recent one, for a machine with an expansion-audio chip alongside
+    /// the console's own. `None` if this build has no APU in it — a machine with
+    /// no sound, which a host must be able to play silence for.
     #[must_use]
-    pub fn take() -> Option<NesAudio> {
-        let mut table = CONSTRUCTED.lock();
-        let last = table.pop();
-        table.clear();
-        last.map(NesAudio::new)
-    }
-
-    /// Forget every kept handle, so the next [`take`] cannot return an APU from
-    /// a machine that has already been dropped.
-    pub fn clear() {
-        CONSTRUCTED.lock().clear();
+    pub fn take(hosts: &HostObjects) -> Option<NesAudio> {
+        let seen = hosts
+            .get::<Captured<Apu>>(HostKind::CAPTURE, APU_CLASS.name)
+            .ok()
+            .flatten()?;
+        seen.take().map(NesAudio::new)
     }
 }

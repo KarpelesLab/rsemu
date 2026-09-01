@@ -14,6 +14,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rsemu::core::HostObjects;
 use rsemu::core::clock::GlobalTime;
 use rsemu::host::chardev::{CharDevice, CharPort, ports};
 use rsemu::host::terminal::Terminal;
@@ -351,7 +352,7 @@ fn run(args: &[String]) -> ExitCode {
     // is checked before the console loop, which would otherwise own that.
     #[cfg(feature = "gdb")]
     if let Some(addr) = parsed.gdb.clone() {
-        let port = match console_port(&parsed) {
+        let port = match console_port(&parsed, &options.realize.hosts) {
             Ok(port) => port,
             Err(e) => {
                 eprintln!("rsemu: {e}");
@@ -363,7 +364,7 @@ fn run(args: &[String]) -> ExitCode {
 
     // A machine that opened a character port has a console; attach this
     // terminal to it and hand the keyboard over.
-    match console_port(&parsed) {
+    match console_port(&parsed, &options.realize.hosts) {
         Err(e) => {
             eprintln!("rsemu: {e}");
             return ExitCode::from(2);
@@ -375,15 +376,15 @@ fn run(args: &[String]) -> ExitCode {
     if let Err(e) = machine.run_for(parsed.span) {
         eprintln!("rsemu: {e}");
         summarise(&machine);
-        write_screenshot(&parsed);
-        write_recording(&parsed);
+        write_screenshot(&parsed, &options.realize.hosts);
+        write_recording(&parsed, &options.realize.hosts);
         return ExitCode::FAILURE;
     }
     summarise(&machine);
     // Both, always: a `--screenshot` that failed must not be the reason a
     // recording is silently skipped.
-    let drew = write_screenshot(&parsed);
-    let played = write_recording(&parsed);
+    let drew = write_screenshot(&parsed, &options.realize.hosts);
+    let played = write_recording(&parsed, &options.realize.hosts);
     if !drew || !played {
         return ExitCode::FAILURE;
     }
@@ -445,18 +446,22 @@ fn ring_for(args: &RunArgs) -> u64 {
 
 /// The display of the machine just built, if it has one this build can see.
 ///
+/// `hosts` is the table the machine was built against, which is where its
+/// constructors left their handles — one table per build, so this can only
+/// return this machine's screen.
+///
 /// Only the PNG path calls it, so a build without an encoder has no use for it
 /// — and the compiler is right to say so rather than being told to be quiet
 /// about a function that might one day be called.
 #[cfg(feature = "display-png")]
-#[allow(unused_mut)]
-fn take_scanout() -> Option<Box<dyn rsemu::host::display::Scanout>> {
+#[allow(unused_variables)]
+fn take_scanout(hosts: &HostObjects) -> Option<Box<dyn rsemu::host::display::Scanout>> {
     #[cfg(feature = "dev-pc-video")]
-    if let Some(s) = rsemu::host::display::pc::capture::take() {
+    if let Some(s) = rsemu::host::display::pc::capture::take(hosts) {
         return Some(Box::new(s));
     }
     #[cfg(feature = "dev-nes-ppu")]
-    if let Some(s) = rsemu::host::display::nes::capture::take() {
+    if let Some(s) = rsemu::host::display::nes::capture::take(hosts) {
         return Some(Box::new(s));
     }
     None
@@ -468,20 +473,20 @@ fn take_scanout() -> Option<Box<dyn rsemu::host::display::Scanout>> {
 /// Returns true when nothing was asked for. A `--screenshot` that could not be
 /// honoured is an error rather than a silence: the user asked for a file and
 /// there has to be one, or a reason.
-fn write_screenshot(args: &RunArgs) -> bool {
+fn write_screenshot(args: &RunArgs, hosts: &HostObjects) -> bool {
     let Some(path) = args.screenshot.as_deref() else {
         return true;
     };
     #[cfg(not(feature = "display-png"))]
     {
-        let _ = path;
+        let _ = (path, hosts);
         eprintln!("rsemu: --screenshot needs a build with the `display-png` feature");
         false
     }
     #[cfg(feature = "display-png")]
     {
         use rsemu::host::display::{Surface, png};
-        let Some(scanout) = take_scanout() else {
+        let Some(scanout) = take_scanout(hosts) else {
             eprintln!("rsemu: --screenshot: this machine has no display");
             return false;
         };
@@ -515,10 +520,10 @@ fn write_screenshot(args: &RunArgs) -> bool {
 }
 
 /// The sound of the machine just built, if it has any this build can hear.
-#[allow(unused_mut)]
-fn take_audio() -> Option<Box<dyn rsemu::host::audio::AudioSource>> {
+#[allow(unused_variables)]
+fn take_audio(hosts: &HostObjects) -> Option<Box<dyn rsemu::host::audio::AudioSource>> {
     #[cfg(feature = "dev-nes-apu")]
-    if let Some(s) = rsemu::host::audio::nes::capture::take() {
+    if let Some(s) = rsemu::host::audio::nes::capture::take(hosts) {
         return Some(Box::new(s));
     }
     None
@@ -529,13 +534,13 @@ fn take_audio() -> Option<Box<dyn rsemu::host::audio::AudioSource>> {
 ///
 /// Returns true when nothing was asked for. As with `--screenshot`, a
 /// recording that could not be made is an error rather than a silence.
-fn write_recording(args: &RunArgs) -> bool {
+fn write_recording(args: &RunArgs, hosts: &HostObjects) -> bool {
     let Some(path) = args.record_audio.as_deref() else {
         return true;
     };
     use rsemu::host::audio::{AudioStream, SampleFormat, wav};
 
-    let Some(source) = take_audio() else {
+    let Some(source) = take_audio(hosts) else {
         eprintln!("rsemu: --record-audio: this machine has no audio device");
         return false;
     };
@@ -681,24 +686,26 @@ fn debug_session(
 /// Which character port this terminal should attach to, if any.
 ///
 /// The machine has already been built, so every port its devices asked for is
-/// open. One is unambiguous; several need `--console` to choose between them,
-/// because guessing would put the keyboard on the wrong machine.
-fn console_port(args: &RunArgs) -> Result<Option<Arc<CharPort>>, String> {
+/// open in `hosts` — the table that build used, and nobody else's. One is
+/// unambiguous; several need `--console` to choose between them, because
+/// guessing would put the keyboard on the wrong device.
+fn console_port(args: &RunArgs, hosts: &HostObjects) -> Result<Option<Arc<CharPort>>, String> {
     if args.headless {
         return Ok(None);
     }
+    let opened = |name: &str| ports::get(hosts, name).ok().flatten();
     if let Some(name) = &args.console {
-        return ports::get(name).map(Some).ok_or_else(|| {
+        return opened(name).map(Some).ok_or_else(|| {
             format!(
                 "no character port named `{name}`; this machine opened {}",
-                list(&ports::names())
+                list(&ports::names(hosts))
             )
         });
     }
-    let names = ports::names();
+    let names = ports::names(hosts);
     match names.len() {
         0 => Ok(None),
-        1 => Ok(ports::get(&names[0])),
+        1 => Ok(opened(&names[0])),
         _ => Err(format!(
             "this machine has {} character ports ({}); pick one with --console, or --headless",
             names.len(),

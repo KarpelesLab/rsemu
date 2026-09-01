@@ -12,6 +12,7 @@
 //! | --- | --- |
 //! | [`error`] | crate-wide error and result types |
 //! | [`exec`] | the execution seam: how a core stops, and why (§4.6, §2.1) |
+//! | [`hosts`] | build-scoped host objects: ports, pads, signals, capture (§4.4) |
 //! | [`value`] | access widths, endianness, typed conversions |
 //! | `space` | address spaces, regions, flat views, dispatch (§4.1) |
 //! | `clock` | the oscillator forest and virtual time (§4.2) |
@@ -34,6 +35,7 @@ pub mod clock;
 pub mod device;
 pub mod error;
 pub mod exec;
+pub mod hosts;
 pub mod props;
 pub mod registry;
 pub mod sched;
@@ -46,5 +48,6 @@ pub mod wire;
 pub use device::{Device, DeviceClass, Export, ExportId, PropertySpec, RealizeCtx, ResetKind};
 pub use error::{BusError, Error, Result};
 pub use exec::{Access, Exit, ExitMask, ExitReason, ExitingCore, Run};
+pub use hosts::{Captured, HostKind, HostObjects};
 pub use registry::Registry;
 pub use value::{Endian, Width};

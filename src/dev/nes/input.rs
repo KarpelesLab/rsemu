@@ -44,13 +44,16 @@
 //!
 //! # Where the buttons come from
 //!
-//! Through [`pads`], a process-wide table of named pad ports — the same shape
-//! as [`crate::host::chardev::ports`], and for the same reason: a *name* is the
+//! Through [`pads`], the build's named pad ports — the same shape as
+//! [`crate::host::chardev::ports`], and for the same reason: a *name* is the
 //! only thing that can travel from a machine description into a device
 //! constructor. The host (or a test) opens the port by name and stores a byte;
 //! the device reads it when the guest strobes. Input crossing into the machine
 //! by exactly one narrow, named seam is what makes it recordable
 //! (`CLAUDE.md`, determinism).
+//!
+//! The table is the *build's* — [`core::hosts`](crate::core::hosts) — not the
+//! process's, so two consoles in one process each have their own `player1`.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -167,62 +170,76 @@ impl Pad {
     }
 }
 
-/// The process-wide table of named pad ports.
+/// The build's named pad ports.
 ///
 /// See the [module docs](self) for why a name is the only thing that can travel
 /// from a machine description into a device constructor, and
-/// [`crate::host::chardev::ports`] for the same pattern applied to a terminal —
-/// including why a `static` table's lock is a
-/// [`Global`](crate::core::sync::Global) rather than a `Mutex`.
+/// [`core::hosts`](crate::core::hosts) for the table this is a view onto.
 pub mod pads {
     use super::Pad;
-    use alloc::collections::BTreeMap;
-    use alloc::string::{String, ToString};
+    use alloc::string::String;
     use alloc::sync::Arc;
     use alloc::vec::Vec;
 
-    use crate::core::sync::{Global, LockRank};
+    use crate::core::error::Result;
+    use crate::core::hosts::{HostKind, HostObjects};
+    use crate::core::props::Props;
 
-    /// Name to pad. `BTreeMap`, so listing is in name order rather than hash
-    /// order (`CLAUDE.md`, determinism); [`Global`] because a `static` is
-    /// reachable from every thread in the process (`core::sync`).
-    static TABLE: Global<BTreeMap<String, Arc<Pad>>> =
-        Global::with_rank(LockRank::LEAF, BTreeMap::new());
+    /// The kind a pad port is filed under in a build's
+    /// [`HostObjects`].
+    pub const KIND: HostKind = HostKind::new("pad");
 
-    /// The pad port called `name`, creating it if this is the first mention.
+    /// The a pad port `name` refers to in `hosts`, creating it on first mention.
     ///
-    /// Both ends call this: the device during construction, the host before it
-    /// starts pressing buttons. Whichever runs first makes the port.
-    #[must_use]
-    pub fn open(name: &str) -> Arc<Pad> {
-        let mut table = TABLE.lock();
-        if let Some(pad) = table.get(name) {
-            return Arc::clone(pad);
-        }
-        let pad = Arc::new(Pad::new());
-        table.insert(name.to_string(), Arc::clone(&pad));
-        pad
+    /// The **host** side of the rendezvous: called before the host starts
+    /// pressing buttons, or after the build to pick up what a device opened.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Config`] if another kind of host object is already open
+    /// under that name, which is a collision between two host modules rather
+    /// than anything a machine file can cause.
+    pub fn open(hosts: &HostObjects, name: &str) -> Result<Arc<Pad>> {
+        hosts.open(KIND, name, Pad::new)
     }
 
-    /// The pad port called `name`, if it has been opened.
-    #[must_use]
-    pub fn get(name: &str) -> Option<Arc<Pad>> {
-        TABLE.lock().get(name).map(Arc::clone)
+    /// The a pad port `name` refers to in the build these properties are being read
+    /// for, creating it on first mention.
+    ///
+    /// The **device** side, called from `new(props)` — acquiring a host object
+    /// is allocation, and [`core::hosts`](crate::core::hosts) argues why. A
+    /// `Props` that belongs to no build gets a private one, so a device a unit
+    /// test constructed directly still works and simply meets nobody.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`].
+    pub fn attach(props: &Props, name: &str) -> Result<Arc<Pad>> {
+        props.host(KIND, name, Pad::new)
+    }
+
+    /// The a pad port called `name`, if it has been opened.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`].
+    pub fn get(hosts: &HostObjects, name: &str) -> Result<Option<Arc<Pad>>> {
+        hosts.get(KIND, name)
     }
 
     /// Forget `name`, reporting whether there was one.
     ///
     /// Anything still holding the `Arc` keeps working; this only removes the
     /// table's own reference, so a later [`open`] of the same name is a fresh
-    /// port. For tests that want the name back.
-    pub fn close(name: &str) -> bool {
-        TABLE.lock().remove(name).is_some()
+    /// one.
+    pub fn close(hosts: &HostObjects, name: &str) -> bool {
+        hosts.close(KIND, name)
     }
 
-    /// Every open port's name, in order.
+    /// Every open name, in order.
     #[must_use]
-    pub fn names() -> Vec<String> {
-        TABLE.lock().keys().cloned().collect()
+    pub fn names(hosts: &HostObjects) -> Vec<String> {
+        hosts.names(KIND)
     }
 }
 
@@ -403,7 +420,11 @@ impl NesPorts {
         let name: String = r.or("pads", String::from(DEFAULT_PAD_PORT))?;
         let phase = r.or_range::<u64>("put-phase", 0, 0..=1)?;
         r.finish()?;
-        Ok(NesPorts::with_pad_phase(pads::open(&name), name, phase))
+        Ok(NesPorts::with_pad_phase(
+            pads::attach(props, &name)?,
+            name,
+            phase,
+        ))
     }
 
     /// Build one against a pad port held directly, for a caller assembling a
@@ -649,11 +670,13 @@ mod tests {
     use crate::core::space::AddressSpace;
     use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
 
-    /// A device on its own pad port, so tests cannot see each other's buttons
-    /// through the process-wide table.
+    /// A device on a pad port of its own.
+    ///
+    /// Nothing here needs a unique name any more: a pad built this way is
+    /// private to the caller, and one built from `Props` belongs to whichever
+    /// build's host objects the `Props` was read against.
     fn ports(name: &str) -> NesPorts {
-        pads::close(name);
-        NesPorts::with_pad(pads::open(name), String::from(name))
+        NesPorts::with_pad(Arc::new(Pad::new()), String::from(name))
     }
 
     /// Strobe high then low, then read eight bits out of port 1.
@@ -852,15 +875,52 @@ mod tests {
 
     #[test]
     fn the_pad_table_hands_the_same_port_to_both_ends() {
-        pads::close("test-table");
-        let host = pads::open("test-table");
-        let device = NesPorts::new(&Props::new().with("pads", "test-table")).expect("constructs");
-        assert_eq!(device.pad_name(), "test-table");
+        let hosts = Arc::new(crate::core::HostObjects::new());
+        let device = NesPorts::new(
+            &Props::new()
+                .with("pads", "player1")
+                .with_hosts(Arc::clone(&hosts)),
+        )
+        .expect("constructs");
+        assert_eq!(device.pad_name(), "player1");
+
+        let host = pads::open(&hosts, "player1").expect("the device opened it");
         host.set(0, buttons::UP);
         assert_eq!(sequence(&device), buttons::UP);
-        assert!(pads::names().iter().any(|n| n == "test-table"));
-        assert!(pads::get("test-table").is_some());
-        assert!(pads::close("test-table"));
+        assert_eq!(pads::names(&hosts), ["player1"]);
+        assert!(pads::get(&hosts, "player1").unwrap().is_some());
+    }
+
+    #[test]
+    fn two_builds_naming_one_pad_port_get_two_pads() {
+        // What the process-wide table this replaced could not do: `player1` in
+        // two machines is two sets of buttons.
+        let left = Arc::new(crate::core::HostObjects::new());
+        let right = Arc::new(crate::core::HostObjects::new());
+        let make = |hosts: &Arc<crate::core::HostObjects>| {
+            NesPorts::new(
+                &Props::new()
+                    .with("pads", "player1")
+                    .with_hosts(Arc::clone(hosts)),
+            )
+            .expect("constructs")
+        };
+        let a = make(&left);
+        let b = make(&right);
+        assert!(!Arc::ptr_eq(a.pad(), b.pad()));
+
+        pads::open(&left, "player1").unwrap().set(0, buttons::UP);
+        assert_eq!(sequence(&a), buttons::UP);
+        assert_eq!(sequence(&b), buttons::NONE, "the other machine's pad");
+    }
+
+    #[test]
+    fn a_device_built_outside_a_build_gets_a_private_pad() {
+        // No host objects on these properties, so there is nothing to meet:
+        // the honest answer is a pad nobody else holds, not a shared one.
+        let a = NesPorts::new(&Props::new().with("pads", "player1")).expect("constructs");
+        let b = NesPorts::new(&Props::new().with("pads", "player1")).expect("constructs");
+        assert!(!Arc::ptr_eq(a.pad(), b.pad()));
     }
 
     #[test]
@@ -876,7 +936,7 @@ mod tests {
         // dropped on the next get is not. `DEC $4016` writes twice on
         // consecutive cycles, which is how AccuracyCoin tells them apart.
         for (raise, expected) in [(9u64, true), (10, false)] {
-            let p = NesPorts::with_pad_phase(pads::open("t"), String::from("t"), 0);
+            let p = NesPorts::with_pad_phase(Arc::new(Pad::new()), String::from("t"), 0);
             // Something in the shift registers to be overwritten, and a button
             // held so a latch is visible.
             p.shared.regs.lock().shift = [0x00, 0x00];
@@ -894,7 +954,7 @@ mod tests {
 
     #[test]
     fn a_strobe_held_across_more_than_one_cycle_always_reaches_the_pads() {
-        let p = NesPorts::with_pad_phase(pads::open("t2"), String::from("t2"), 0);
+        let p = NesPorts::with_pad_phase(Arc::new(Pad::new()), String::from("t2"), 0);
         p.shared.regs.lock().shift = [0x00, 0x00];
         p.pad().set(0, buttons::A);
         // Either phase: two consecutive cycles contain a put whichever it is.

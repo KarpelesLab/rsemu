@@ -269,11 +269,15 @@ struct Board {
     power: Arc<super::syscon::Signal>,
 }
 
-/// Build `riscv-virt` with `firmware` loaded and per-test port names, so two
-/// boards in one test binary do not type at each other.
+/// Build `riscv-virt` with `firmware` loaded.
+///
+/// The port names no longer have to differ per test: each build gets its own
+/// host objects, so two boards in one binary cannot type at each other however
+/// they name their console. `tag` survives only so a failure names the test.
 fn board(tag: &str, firmware: &[u8]) -> Board {
-    let console_name = alloc::format!("test.riscv.console.{tag}");
-    let power_name = alloc::format!("test.riscv.power.{tag}");
+    let _ = tag;
+    let console_name = String::from("console");
+    let power_name = String::from("power");
     let entry = catalog::machine("riscv-virt").expect("this build ships it");
     let options = catalog::build_options()
         .expect("the catalog agrees with itself")
@@ -294,8 +298,8 @@ fn board(tag: &str, firmware: &[u8]) -> Board {
     };
     Board {
         machine,
-        console: ports::open(&console_name),
-        power: signals::open(&power_name),
+        console: ports::open(&options.realize.hosts, &console_name).expect("the UART opened it"),
+        power: signals::open(&options.realize.hosts, &power_name).expect("the syscon opened it"),
     }
 }
 
@@ -398,8 +402,8 @@ fn a_ramdisk_is_staged_in_memory_and_pointed_at_by_the_tree() {
         .with_media("flash1", &[][..])
         .with_media("initrd", ramdisk.as_slice())
         .with_media("disk", &[][..])
-        .with_param("console", "test.riscv.console.initrd")
-        .with_param("power", "test.riscv.power.initrd")
+        .with_param("console", "console")
+        .with_param("power", "power")
         .with_param("ram", "8M")
         // Inside this board's 8 MiB rather than at the shipped default, which
         // assumes the 256M a real kernel wants.
@@ -413,8 +417,8 @@ fn a_ramdisk_is_staged_in_memory_and_pointed_at_by_the_tree() {
     .expect("a board with a ramdisk still builds");
     let b = Board {
         machine,
-        console: ports::open("test.riscv.console.initrd"),
-        power: signals::open("test.riscv.power.initrd"),
+        console: ports::open(&options.realize.hosts, "console").expect("the UART opened it"),
+        power: signals::open(&options.realize.hosts, "power").expect("the syscon opened it"),
     };
 
     let dtb = b.device_tree();
@@ -465,8 +469,8 @@ fn every_address_in_the_tree_came_from_the_memory_map() {
         .with_media("flash1", &[][..])
         .with_media("initrd", &[][..])
         .with_media("disk", &[][..])
-        .with_param("console", "test.riscv.console.moved")
-        .with_param("power", "test.riscv.power.moved")
+        .with_param("console", "console")
+        .with_param("power", "power")
         .with_param("ram", "8M");
     let machine = crate::machine::build(
         "riscv-virt-moved",
@@ -477,8 +481,8 @@ fn every_address_in_the_tree_came_from_the_memory_map() {
     .expect("a moved UART is still a machine");
     let b2 = Board {
         machine,
-        console: ports::open("test.riscv.console.moved"),
-        power: signals::open("test.riscv.power.moved"),
+        console: ports::open(&options.realize.hosts, "console").expect("the UART opened it"),
+        power: signals::open(&options.realize.hosts, "power").expect("the syscon opened it"),
     };
     let tree = super::dt::describe(&b2.device_tree()).expect("it parses");
     assert!(tree.contains("serial@10004000"), "{tree}");
@@ -648,8 +652,8 @@ fn a_hart_with_no_timer_named_reads_zero() {
         .with_media("flash1", &[][..])
         .with_media("initrd", &[][..])
         .with_media("disk", &[][..])
-        .with_param("console", "test.riscv.console.untimed")
-        .with_param("power", "test.riscv.power.untimed")
+        .with_param("console", "console")
+        .with_param("power", "power")
         .with_param("ram", "8M");
     let machine = crate::machine::build(
         "riscv-virt-untimed",
@@ -660,8 +664,8 @@ fn a_hart_with_no_timer_named_reads_zero() {
     .expect("a board with no timer named is still a board");
     let mut b = Board {
         machine,
-        console: ports::open("test.riscv.console.untimed"),
-        power: signals::open("test.riscv.power.untimed"),
+        console: ports::open(&options.realize.hosts, "console").expect("the UART opened it"),
+        power: signals::open(&options.realize.hosts, "power").expect("the syscon opened it"),
     };
     b.run(200);
     assert_eq!(b.peek(RDTIME_SCRATCH, Width::U64), 0);
@@ -1017,8 +1021,8 @@ fn firmware_from_the_environment_reaches_its_console() {
     .expect("riscv-virt builds");
     let mut b = Board {
         machine,
-        console: ports::open(&console_name),
-        power: signals::open(&power_name),
+        console: ports::open(&options.realize.hosts, &console_name).expect("the UART opened it"),
+        power: signals::open(&options.realize.hosts, &power_name).expect("the syscon opened it"),
     };
 
     // Streamed rather than collected: a kernel boot takes minutes of host time

@@ -11,27 +11,27 @@
 //! is no route from a `dyn Device` to `Arc<NesPpu>` — `Device` has no `Any` in
 //! its supertrait chain, on purpose (`machine::realize` explains why). So the
 //! host takes its handle at the only moment the concrete type exists: device
-//! construction. [`capture::install`] wraps the machine's bindings so that
-//! `nes.ppu` is built by a constructor here, which keeps a clone before handing
-//! the device on:
+//! construction. [`capture::install`] replaces `nes.ppu`'s constructor with one
+//! that keeps a clone in **this build's** capture table before handing the
+//! device on:
 //!
 //! ```text
 //! let mut options = catalog::build_options()?;
-//! display::nes::capture::install(&mut options)?;   // intercept nes.ppu
+//! display::nes::capture::install(&mut options)?;        // intercept nes.ppu
 //! let machine = machine::build(name, source, &registry, &options)?;
-//! let scanout = display::nes::capture::take();     // the Arc it kept
+//! let scanout = display::nes::capture::take(&options.realize.hosts);
 //! ```
 //!
-//! **This is a seam, and it is marked as one**, exactly like the process-wide
-//! table in [`chardev::ports`](crate::host::chardev::ports). It exists because
-//! `Device` has no scanout hook yet; when it grows one — the obvious shape is a
-//! defaulted `fn scanout(&self) -> Option<Arc<dyn Scanout>>` beside
-//! `Device::region` — every line of [`capture`] deletes and nothing else here
-//! changes. Until then the table is process-wide, so build one machine at a
-//! time or [`capture::clear`] between them.
+//! **This is a seam, and it is marked as one.** It exists because `Device` has
+//! no scanout hook yet; when it grows one — the obvious shape is a defaulted
+//! `fn scanout(&self) -> Option<Arc<dyn Scanout>>` beside `Device::region` —
+//! every line of [`capture`] deletes and nothing else here changes.
+//!
+//! It is not, however, process-wide any more. The table lives in the build's
+//! [`HostObjects`](crate::core::hosts::HostObjects), so two machines built in
+//! one process capture into two tables and neither can take the other's chip.
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
 use super::palette::nes_rgb;
 use super::{PixelFormat, Scanout, Surface, SurfaceInfo};
@@ -115,90 +115,52 @@ impl Scanout for NesScanout {
 /// The interception that gets a host an `Arc<NesPpu>` out of a described
 /// machine. See the module docs: a seam, not a design.
 pub mod capture {
-    use super::{Arc, NesPpu, NesScanout, Vec};
+    use super::{Arc, NesPpu, NesScanout};
     use crate::core::error::Result;
-    use crate::core::props::Props;
-    use crate::core::sync::{Global, LockRank};
+    use crate::core::hosts::{Captured, HostKind, HostObjects};
     use crate::dev::ppu::NES_PPU_CLASS;
-    use crate::machine::realize::Instance;
-    use crate::machine::{Bindings, BuildOptions};
+    use crate::machine::BuildOptions;
 
-    /// Every PPU constructed since the last [`take`] or [`clear`], oldest
-    /// first. A `Vec` rather than a single slot because a machine with two
-    /// PPUs is not this module's business to refuse.
-    static CONSTRUCTED: Global<Vec<Arc<NesPpu>>> = Global::with_rank(LockRank::LEAF, Vec::new());
-
-    /// Construct a PPU and keep a reference to it.
-    ///
-    /// An `InstanceCtor` is a bare `fn` that can capture nothing, which is why
-    /// the table above is a static rather than a field.
-    fn construct(props: &Props) -> Result<Arc<dyn Instance>> {
-        let ppu = Arc::new(NesPpu::new(props)?);
-        CONSTRUCTED.lock().push(Arc::clone(&ppu));
-        Ok(ppu)
-    }
-
-    /// Replace `nes.ppu`'s constructor in `bindings` with one that keeps a
+    /// Replace `nes.ppu`'s constructor in `options` with one that keeps a
     /// handle, leaving every other class alone.
     ///
-    /// # Errors
-    ///
-    /// [`crate::Error::Config`] if a class turns out to be bound twice, which
-    /// would be a bug in the caller's binding table rather than here.
-    pub fn intercept(bindings: &Bindings) -> Result<Bindings> {
-        let mut out = Bindings::new();
-        let mut replaced = false;
-        let classes: Vec<&'static str> = bindings.classes().collect();
-        for class in classes {
-            if class == NES_PPU_CLASS.name {
-                out.bind(class, construct)?;
-                replaced = true;
-            } else if let Some(ctor) = bindings.get(class) {
-                out.bind(class, ctor)?;
-            }
-        }
-        if !replaced {
-            // The PPU's own `bind` was never called — a build with the device
-            // feature but a machine that does not use it. Binding it here is
-            // still correct: an unused binding costs nothing.
-            out.bind(NES_PPU_CLASS.name, construct)?;
-        }
-        Ok(out)
-    }
-
-    /// Point `options` at intercepted bindings, in place.
-    ///
     /// The one call a host makes between [`catalog::build_options`] and
-    /// [`machine::build`].
+    /// [`machine::build`]. Binding the class in a machine that does not use it
+    /// costs nothing, so there is no "was it already bound?" case to get wrong.
     ///
     /// [`catalog::build_options`]: crate::machine::catalog::build_options
     /// [`machine::build`]: crate::machine::build
     ///
     /// # Errors
     ///
-    /// As [`intercept`].
+    /// [`crate::Error::Config`] if something else has already claimed this
+    /// build's capture table, which would be a name collision between two host
+    /// modules rather than anything a machine file can cause.
     pub fn install(options: &mut BuildOptions) -> Result<()> {
-        options.bindings = intercept(&options.bindings)?;
+        let seen: Arc<Captured<NesPpu>> =
+            options
+                .realize
+                .hosts
+                .open(HostKind::CAPTURE, NES_PPU_CLASS.name, Captured::new)?;
+        options.bindings.replace(NES_PPU_CLASS.name, move |props| {
+            let ppu = Arc::new(NesPpu::new(props)?);
+            seen.push(&ppu);
+            Ok(ppu)
+        });
         Ok(())
     }
 
-    /// Take the most recently constructed PPU as a [`NesScanout`], forgetting
-    /// every earlier one.
+    /// The PPU this build constructed, as a [`NesScanout`].
     ///
-    /// `None` if no machine with a PPU has been built since the last call — a
-    /// machine with no picture, which a host must be able to render nothing
-    /// for.
+    /// The most recent one, for a machine with more than one. `None` if this
+    /// build has no PPU in it — a machine with no picture, which a host must be
+    /// able to render nothing for.
     #[must_use]
-    pub fn take() -> Option<NesScanout> {
-        let mut table = CONSTRUCTED.lock();
-        let last = table.pop();
-        table.clear();
-        last.map(NesScanout::new)
-    }
-
-    /// Forget every kept handle, so the next [`take`] cannot return a PPU from
-    /// a machine that has already been dropped.
-    pub fn clear() {
-        CONSTRUCTED.lock().clear();
+    pub fn take(hosts: &HostObjects) -> Option<NesScanout> {
+        let seen = hosts
+            .get::<Captured<NesPpu>>(HostKind::CAPTURE, NES_PPU_CLASS.name)
+            .ok()
+            .flatten()?;
+        seen.take().map(NesScanout::new)
     }
 }

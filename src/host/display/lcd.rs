@@ -19,7 +19,7 @@
 //! let mut options = catalog::build_options()?;
 //! display::lcd::capture::install(&mut options)?;   // intercept lcd.scanout
 //! let machine = machine::build(name, source, &registry, &options)?;
-//! let picture = display::lcd::capture::take(&machine);
+//! let picture = display::lcd::capture::take(&options.realize.hosts, &machine);
 //! ```
 //!
 //! [`capture::take`] takes the machine as well, because the frame *rate* is a
@@ -30,12 +30,13 @@
 //! written twice.
 //!
 //! This is a seam and it is marked as one. When `Device` grows a scanout hook,
-//! every line of [`capture`] deletes.
+//! every line of [`capture`] deletes. The capture table belongs to the build
+//! rather than to the process, so two panels built in one process do not swap
+//! pictures.
 
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
-use alloc::vec::Vec;
 
 use super::{PixelFormat, Scanout as HostScanout, Surface, SurfaceInfo};
 use crate::dev::lcd::scanout::Scanout;
@@ -101,75 +102,45 @@ impl HostScanout for LcdScanout {
 /// The interception that gets a host an `Arc<Scanout>` out of a described
 /// machine. See the module docs: a seam, not a design.
 pub mod capture {
-    use super::{Arc, LcdScanout, Scanout, String, Vec};
+    use super::{Arc, LcdScanout, Scanout, String};
     use crate::core::error::Result;
-    use crate::core::props::Props;
-    use crate::core::sync::{Global, LockRank};
+    use crate::core::hosts::{Captured, HostKind, HostObjects};
     use crate::dev::lcd::scanout::{SCANOUT_CLASS, set_frame_rate};
-    use crate::machine::realize::Instance;
-    use crate::machine::{Bindings, BuildOptions, Machine};
+    use crate::machine::{BuildOptions, Machine};
 
-    /// Every engine constructed since the last [`take`] or [`clear`], oldest
-    /// first, with the instance path it was built for.
-    ///
-    /// The path is kept because the frame rate is resolved from the machine's
-    /// clock forest afterwards, and the forest is indexed by device.
-    static CONSTRUCTED: Global<Vec<Arc<Scanout>>> = Global::with_rank(LockRank::LEAF, Vec::new());
-
-    /// Construct an engine and keep a reference to it.
-    fn construct(props: &Props) -> Result<Arc<dyn Instance>> {
-        let engine = Arc::new(Scanout::new(props)?);
-        CONSTRUCTED.lock().push(Arc::clone(&engine));
-        Ok(engine)
-    }
-
-    /// Replace `lcd.scanout`'s constructor in `bindings` with one that keeps a
+    /// Replace `lcd.scanout`'s constructor in `options` with one that keeps a
     /// handle, leaving every other class alone.
     ///
     /// # Errors
     ///
-    /// [`crate::Error::Config`] if a class turns out to be bound twice.
-    pub fn intercept(bindings: &Bindings) -> Result<Bindings> {
-        let mut out = Bindings::new();
-        let mut replaced = false;
-        let classes: Vec<&'static str> = bindings.classes().collect();
-        for class in classes {
-            if class == SCANOUT_CLASS.name {
-                out.bind(class, construct)?;
-                replaced = true;
-            } else if let Some(ctor) = bindings.get(class) {
-                out.bind(class, ctor)?;
-            }
-        }
-        if !replaced {
-            out.bind(SCANOUT_CLASS.name, construct)?;
-        }
-        Ok(out)
-    }
-
-    /// Point `options` at intercepted bindings, in place.
-    ///
-    /// # Errors
-    ///
-    /// As [`intercept`].
+    /// [`crate::Error::Config`] if something else has already claimed this
+    /// build's capture table.
     pub fn install(options: &mut BuildOptions) -> Result<()> {
-        options.bindings = intercept(&options.bindings)?;
+        let seen: Arc<Captured<Scanout>> =
+            options
+                .realize
+                .hosts
+                .open(HostKind::CAPTURE, SCANOUT_CLASS.name, Captured::new)?;
+        options.bindings.replace(SCANOUT_CLASS.name, move |props| {
+            let engine = Arc::new(Scanout::new(props)?);
+            seen.push(&engine);
+            Ok(engine)
+        });
         Ok(())
     }
 
-    /// Take the most recently constructed engine, forgetting every earlier one,
-    /// and resolve its frame period from `machine`'s clock forest.
+    /// The engine this build constructed, with its frame period resolved from
+    /// `machine`'s clock forest.
     ///
-    /// `None` if no machine with a scanout engine has been built since the last
-    /// call.
+    /// The most recent one, for a machine with several. `None` if this build has
+    /// no scanout engine in it.
     #[must_use]
-    pub fn take(machine: &Machine) -> Option<LcdScanout> {
-        let engine = {
-            let mut table = CONSTRUCTED.lock();
-            let last = table.pop();
-            table.clear();
-            last?
-        };
+    pub fn take(hosts: &HostObjects, machine: &Machine) -> Option<LcdScanout> {
+        let seen = hosts
+            .get::<Captured<Scanout>>(HostKind::CAPTURE, SCANOUT_CLASS.name)
+            .ok()
+            .flatten()?;
+        let engine = seen.take()?;
         resolve_rate(machine, &engine);
         Some(LcdScanout::new(engine))
     }
@@ -196,11 +167,6 @@ pub mod capture {
         if let Ok(freq) = machine.clocks().domain_frequency(domain) {
             set_frame_rate(engine, freq.num(), freq.den());
         }
-    }
-
-    /// Forget every kept handle.
-    pub fn clear() {
-        CONSTRUCTED.lock().clear();
     }
 
     /// The instance path convention this module documents, for a diagnostic.

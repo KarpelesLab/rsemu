@@ -74,6 +74,7 @@ use core::fmt;
 use core::ops::RangeInclusive;
 
 use crate::core::error::{Error, Result};
+use crate::core::hosts::{HostKind, HostObjects};
 
 // ---------------------------------------------------------------------------
 // Duration
@@ -1338,16 +1339,42 @@ impl FromValue for Value {
 ///
 /// Lookup is linear. A device has a handful of properties and they are read
 /// once at construction, so a hash would cost more than it saved.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// # The host-object table rides along
+///
+/// A property is data, and a device also needs things that are not data: the
+/// character port behind `port = "console"`, the pad behind
+/// `pads = "player1"`. Those used to come from a process-wide `static`, which
+/// meant two machines built in one process shared them. They now come from the
+/// build's own [`HostObjects`], carried here because `Props` is what a
+/// constructor is given — see [`Props::host`] and
+/// [`core::hosts`](crate::core::hosts).
+///
+/// It is deliberately **not** part of equality or of the insertion order: two
+/// property sets with the same properties are the same properties, whichever
+/// build they were read for. That also keeps `Value::Map` comparable.
+#[derive(Debug, Clone, Default)]
 pub struct Props {
     entries: Vec<(String, Value)>,
+    /// The build's host objects, when these properties are being read during a
+    /// build. `None` for a `Props` a test or an embedder assembled by hand.
+    hosts: Option<Arc<HostObjects>>,
 }
+
+impl PartialEq for Props {
+    fn eq(&self, other: &Props) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl Eq for Props {}
 
 impl Props {
     /// An empty set.
     pub fn new() -> Props {
         Props {
             entries: Vec::new(),
+            hosts: None,
         }
     }
 
@@ -1430,6 +1457,59 @@ impl Props {
     /// A reader over these properties.
     pub fn reader(&self) -> Reader<'_> {
         Reader::new(self)
+    }
+
+    // -- host objects ------------------------------------------------------
+
+    /// The build's host-object table, if these properties came from one.
+    pub fn hosts(&self) -> Option<&Arc<HostObjects>> {
+        self.hosts.as_ref()
+    }
+
+    /// Read these properties against `hosts`.
+    ///
+    /// The realizer calls this once per device, just before construction. A
+    /// caller assembling `Props` by hand calls it to put a device in touch with
+    /// a table it already holds.
+    pub fn set_hosts(&mut self, hosts: Arc<HostObjects>) {
+        self.hosts = Some(hosts);
+    }
+
+    /// Builder form of [`Props::set_hosts`].
+    #[must_use]
+    pub fn with_hosts(mut self, hosts: Arc<HostObjects>) -> Props {
+        self.set_hosts(hosts);
+        self
+    }
+
+    /// The host object called `name` under `kind`, creating it on first
+    /// mention.
+    ///
+    /// This is how `port = "console"` becomes an `Arc<CharPort>` the host can
+    /// also reach. Call it from `new(props)`: acquiring a host object is
+    /// allocation, not an outward action — [`core::hosts`](crate::core::hosts)
+    /// argues the case.
+    ///
+    /// **A `Props` with no table gets a private object**, freshly made and
+    /// reachable by nobody else. That is the honest answer for a device a unit
+    /// test built directly: there is no build, so there is nothing to rendezvous
+    /// with. A test that wants both ends holds a [`HostObjects`] and passes it
+    /// in with [`Props::with_hosts`], or builds the device against a handle
+    /// directly.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] if another type is already open under that kind and
+    /// name.
+    pub fn host<T, F>(&self, kind: HostKind, name: &str, make: F) -> Result<Arc<T>>
+    where
+        T: core::any::Any + Send + Sync,
+        F: FnOnce() -> T,
+    {
+        match &self.hosts {
+            Some(hosts) => hosts.open(kind, name, make),
+            None => Ok(Arc::new(make())),
+        }
     }
 }
 

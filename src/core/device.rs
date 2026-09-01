@@ -35,6 +35,7 @@ use core::any::Any;
 use core::fmt;
 
 use crate::core::error::{Error, Result};
+use crate::core::hosts::HostObjects;
 use crate::core::props::{Props, ValueKind};
 use crate::core::sched::{Budget, Consumed, LazyHandle, TickCursor};
 use crate::core::space::{RegionRef, RequesterId};
@@ -797,15 +798,22 @@ pub struct RealizeCtx<'a> {
     path: &'a str,
     requester: RequesterId,
     deferred: &'a mut Deferred,
+    hosts: &'a HostObjects,
 }
 
 impl<'a> RealizeCtx<'a> {
     /// Build a context for the instance at `path`.
-    pub fn new(path: &'a str, requester: RequesterId, deferred: &'a mut Deferred) -> Self {
+    pub fn new(
+        path: &'a str,
+        requester: RequesterId,
+        deferred: &'a mut Deferred,
+        hosts: &'a HostObjects,
+    ) -> Self {
         RealizeCtx {
             path,
             requester,
             deferred,
+            hosts,
         }
     }
 
@@ -820,6 +828,18 @@ impl<'a> RealizeCtx<'a> {
     /// This device's requester id, for accesses it initiates.
     pub fn requester(&self) -> RequesterId {
         self.requester
+    }
+
+    /// The build's host objects.
+    ///
+    /// The same table `new(props)` acquired ports and pads from
+    /// ([`core::hosts`](crate::core::hosts)), reachable here for the other half
+    /// of the problem: **announcing** yourself into something a sibling will
+    /// read. That is an outward action and belongs in this phase, which is why
+    /// `dev::riscv::dt` publishes its device-tree describer from here and not
+    /// from a constructor.
+    pub fn hosts(&self) -> &'a HostObjects {
+        self.hosts
     }
 
     /// Queue an action to run after realize completes.
@@ -962,7 +982,8 @@ mod tests {
     #[test]
     fn realize_errors_name_the_instance() {
         let mut q = Deferred::new();
-        let ctx = RealizeCtx::new("pci.0.nvme", RequesterId(7), &mut q);
+        let ctx_hosts = crate::core::HostObjects::new();
+        let ctx = RealizeCtx::new("pci.0.nvme", RequesterId(7), &mut q, &ctx_hosts);
         assert_eq!(ctx.path(), "pci.0.nvme");
         assert_eq!(ctx.requester(), RequesterId(7));
         let e = ctx.error("cannot map at 0x2000").to_string();
@@ -975,7 +996,8 @@ mod tests {
         let ran = Arc::new(AtomicU32::new(0));
         let mut q = Deferred::new();
         {
-            let mut ctx = RealizeCtx::new("cpu", RequesterId::ANONYMOUS, &mut q);
+            let ctx_hosts = crate::core::HostObjects::new();
+            let mut ctx = RealizeCtx::new("cpu", RequesterId::ANONYMOUS, &mut q, &ctx_hosts);
             let r = Arc::clone(&ran);
             ctx.defer(move || {
                 r.fetch_add(1, Ordering::Relaxed);

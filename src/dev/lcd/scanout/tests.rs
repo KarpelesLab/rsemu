@@ -389,7 +389,8 @@ fn an_engine_with_no_address_space_shows_nothing() {
     )
     .unwrap();
     let mut deferred = crate::core::device::Deferred::new();
-    let mut ctx = RealizeCtx::new("lcdc", RequesterId::ANONYMOUS, &mut deferred);
+    let ctx_hosts = crate::core::HostObjects::new();
+    let mut ctx = RealizeCtx::new("lcdc", RequesterId::ANONYMOUS, &mut deferred, &ctx_hosts);
     engine
         .realize(&mut ctx)
         .expect("realize does not need the space");

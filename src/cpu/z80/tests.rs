@@ -923,7 +923,8 @@ fn realize_does_nothing_outward_because_the_space_has_not_arrived_yet() {
     // check is in `Instance::bind`, and the test for it is below.
     let cpu = Z80::new(Config::NMOS);
     let mut deferred = Deferred::new();
-    let mut ctx = RealizeCtx::new("/cpu0", RequesterId::ANONYMOUS, &mut deferred);
+    let ctx_hosts = crate::core::HostObjects::new();
+    let mut ctx = RealizeCtx::new("/cpu0", RequesterId::ANONYMOUS, &mut deferred, &ctx_hosts);
     assert!(cpu.realize(&mut ctx).is_ok());
 }
 

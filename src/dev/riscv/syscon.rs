@@ -110,53 +110,76 @@ impl Signal {
     }
 }
 
-/// The process-wide table of named power signals.
+/// The build's named power signals.
 ///
 /// See the module docs for why a name is the only thing that can travel from a
 /// machine file into a device constructor, and
-/// [`chardev`](crate::host::chardev) for the precedent.
+/// [`core::hosts`](crate::core::hosts) for the table this is a view onto.
 pub mod signals {
     use super::Signal;
-    use alloc::collections::BTreeMap;
-    use alloc::string::{String, ToString};
+    use alloc::string::String;
     use alloc::sync::Arc;
     use alloc::vec::Vec;
 
-    use crate::core::sync::{Global, LockRank};
+    use crate::core::error::Result;
+    use crate::core::hosts::{HostKind, HostObjects};
+    use crate::core::props::Props;
 
-    /// Name to signal, in name order rather than hash order (`CLAUDE.md`,
-    /// determinism); [`Global`] because a `static` is reachable from every
-    /// thread in the process (`core::sync`).
-    static TABLE: Global<BTreeMap<String, Arc<Signal>>> =
-        Global::with_rank(LockRank::LEAF, BTreeMap::new());
+    /// The kind a power signal is filed under in a build's
+    /// [`HostObjects`].
+    pub const KIND: HostKind = HostKind::new("signal");
 
-    /// The signal called `name`, creating it if this is the first mention.
-    #[must_use]
-    pub fn open(name: &str) -> Arc<Signal> {
-        let mut table = TABLE.lock();
-        if let Some(signal) = table.get(name) {
-            return Arc::clone(signal);
-        }
-        let signal = Arc::new(Signal::new());
-        table.insert(name.to_string(), Arc::clone(&signal));
-        signal
+    /// The a power signal `name` refers to in `hosts`, creating it on first mention.
+    ///
+    /// The **host** side of the rendezvous: called before the host starts
+    /// watching for a poweroff, or after the build to pick up what a device opened.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Config`] if another kind of host object is already open
+    /// under that name, which is a collision between two host modules rather
+    /// than anything a machine file can cause.
+    pub fn open(hosts: &HostObjects, name: &str) -> Result<Arc<Signal>> {
+        hosts.open(KIND, name, Signal::new)
     }
 
-    /// The signal called `name`, if it has been opened.
-    #[must_use]
-    pub fn get(name: &str) -> Option<Arc<Signal>> {
-        TABLE.lock().get(name).map(Arc::clone)
+    /// The a power signal `name` refers to in the build these properties are being read
+    /// for, creating it on first mention.
+    ///
+    /// The **device** side, called from `new(props)` — acquiring a host object
+    /// is allocation, and [`core::hosts`](crate::core::hosts) argues why. A
+    /// `Props` that belongs to no build gets a private one, so a device a unit
+    /// test constructed directly still works and simply meets nobody.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`].
+    pub fn attach(props: &Props, name: &str) -> Result<Arc<Signal>> {
+        props.host(KIND, name, Signal::new)
+    }
+
+    /// The a power signal called `name`, if it has been opened.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`].
+    pub fn get(hosts: &HostObjects, name: &str) -> Result<Option<Arc<Signal>>> {
+        hosts.get(KIND, name)
     }
 
     /// Forget `name`, reporting whether there was one.
-    pub fn close(name: &str) -> bool {
-        TABLE.lock().remove(name).is_some()
+    ///
+    /// Anything still holding the `Arc` keeps working; this only removes the
+    /// table's own reference, so a later [`open`] of the same name is a fresh
+    /// one.
+    pub fn close(hosts: &HostObjects, name: &str) -> bool {
+        hosts.close(KIND, name)
     }
 
-    /// Every open signal's name, in order.
+    /// Every open name, in order.
     #[must_use]
-    pub fn names() -> Vec<String> {
-        TABLE.lock().keys().cloned().collect()
+    pub fn names(hosts: &HostObjects) -> Vec<String> {
+        hosts.names(KIND)
     }
 }
 
@@ -195,7 +218,7 @@ impl Syscon {
         let mut r = props.reader();
         let name = r.or("signal", String::from("power"))?;
         r.finish()?;
-        Ok(Syscon::with_signal(signals::open(&name), name))
+        Ok(Syscon::with_signal(signals::attach(props, &name)?, name))
     }
 
     /// Build one against a signal the caller already holds.
@@ -211,7 +234,6 @@ impl Syscon {
             REGISTER_WINDOW_LEN,
             Arc::clone(&regs) as Arc<dyn MemOps>,
         ));
-        super::dt::publish(&region, Arc::downgrade(&regs) as Weak<dyn DtSource>);
         Syscon { regs, region }
     }
 
@@ -312,8 +334,13 @@ impl Device for Syscon {
         &CLASS
     }
 
-    fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
-        Ok(())
+    fn realize(&self, ctx: &mut RealizeCtx<'_>) -> Result<()> {
+        // What this region is, for the board's device-tree generator.
+        super::dt::publish(
+            ctx.hosts(),
+            &self.region,
+            Arc::downgrade(&self.regs) as Weak<dyn DtSource>,
+        )
     }
 
     fn reset(&self, kind: ResetKind) {
@@ -441,13 +468,20 @@ mod tests {
 
     #[test]
     fn a_name_reaches_the_same_signal_from_both_ends() {
-        let device_end = signals::open("test.syscon.shared");
-        let host_end = signals::open("test.syscon.shared");
+        let hosts = crate::core::HostObjects::new();
+        let device_end = signals::open(&hosts, "power").unwrap();
+        let host_end = signals::open(&hosts, "power").unwrap();
         device_end.raise(Request::Poweroff);
         assert_eq!(host_end.take(), Some(Request::Poweroff));
-        assert!(signals::names().iter().any(|n| n == "test.syscon.shared"));
-        assert!(signals::close("test.syscon.shared"));
-        assert!(signals::get("test.syscon.shared").is_none());
+        assert_eq!(signals::names(&hosts), ["power"]);
+        assert!(signals::close(&hosts, "power"));
+        assert!(signals::get(&hosts, "power").unwrap().is_none());
+
+        // And `power` in another build is another signal, so two boards can
+        // both name it without one powering the other off.
+        let elsewhere = crate::core::HostObjects::new();
+        let other = signals::open(&elsewhere, "power").unwrap();
+        assert!(!alloc::sync::Arc::ptr_eq(&device_end, &other));
     }
 
     #[test]

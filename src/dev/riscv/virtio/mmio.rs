@@ -196,7 +196,6 @@ impl VirtioMmio {
             REGISTER_WINDOW_LEN,
             Arc::clone(&regs) as Arc<dyn MemOps>,
         ));
-        super::super::dt::publish(&region, Arc::downgrade(&regs) as Weak<dyn DtSource>);
         VirtioMmio {
             regs,
             region,
@@ -582,8 +581,13 @@ impl Device for VirtioMmio {
         self.class
     }
 
-    fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
-        Ok(())
+    fn realize(&self, ctx: &mut RealizeCtx<'_>) -> Result<()> {
+        // What this region is, for the board's device-tree generator.
+        super::super::dt::publish(
+            ctx.hosts(),
+            &self.region,
+            Arc::downgrade(&self.regs) as Weak<dyn DtSource>,
+        )
     }
 
     fn reset(&self, _kind: ResetKind) {

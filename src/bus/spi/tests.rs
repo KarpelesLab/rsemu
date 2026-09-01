@@ -254,15 +254,22 @@ fn check_format_names_the_chip_select_that_disagrees() {
 
 #[test]
 fn the_named_table_is_a_rendezvous_not_a_registry() {
-    let name = "test-spi-rendezvous";
-    buses::close(name);
-    let a = buses::open(name);
-    let b = buses::open(name);
+    use crate::core::HostObjects;
+
+    let hosts = HostObjects::new();
+    let a = buses::open(&hosts, "spi0").unwrap();
+    let b = buses::open(&hosts, "spi0").unwrap();
     assert!(Arc::ptr_eq(&a, &b));
-    assert!(buses::names().iter().any(|n| n == name));
-    assert!(buses::get(name).is_some());
-    assert!(buses::close(name));
-    assert!(buses::get(name).is_none());
+    assert_eq!(buses::names(&hosts), ["spi0"]);
+    assert!(buses::get(&hosts, "spi0").unwrap().is_some());
+    assert!(buses::close(&hosts, "spi0"));
+    assert!(buses::get(&hosts, "spi0").unwrap().is_none());
+
+    // And the name is not global: another build's `spi0` is another bus, which
+    // is why two SPI boards in one process no longer have to agree on names.
+    let elsewhere = HostObjects::new();
+    let c = buses::open(&elsewhere, "spi0").unwrap();
+    assert!(!Arc::ptr_eq(&a, &c));
 }
 
 // ---------------------------------------------------------------------------

@@ -928,13 +928,24 @@ impl Kbc8042 {
         let mut r = props.reader();
         let port_name = r.or("port", String::from(DEFAULT_PORT))?;
         r.finish()?;
-        Ok(Kbc8042::with_port(ports::open(&port_name), port_name))
+        Ok(Kbc8042::with_port(
+            ports::attach(props, &port_name)?,
+            port_name,
+        ))
     }
 
-    /// One attached to the default port, with no properties set.
+    /// One on a private port, with no properties set.
+    ///
+    /// Private because there is no build to rendezvous in: a controller made
+    /// this way meets nobody, which is what a unit test wants. Go through
+    /// [`Kbc8042::new`] with a `Props` from a build, or
+    /// [`Kbc8042::with_port`], to reach a port a host can also hold.
     #[must_use]
     pub fn default_device() -> Kbc8042 {
-        Kbc8042::with_port(ports::open(DEFAULT_PORT), String::from(DEFAULT_PORT))
+        Kbc8042::with_port(
+            Arc::new(crate::host::chardev::CharPort::new()),
+            String::from(DEFAULT_PORT),
+        )
     }
 
     /// Build one against a character device the caller already has.
@@ -1673,7 +1684,6 @@ mod tests {
             .expect("a port name is legal");
         assert_eq!(named.port_name(), "test.kbc.props");
         assert!(Kbc8042::new(&Props::new().with("prot", "x")).is_err());
-        ports::close("test.kbc.props");
     }
 
     #[test]
