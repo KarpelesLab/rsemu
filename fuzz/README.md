@@ -31,6 +31,7 @@ See [The phase-2 gate](#the-phase-2-gate) for the exact command.
 | `state_decoder`   | `core::state::StateReader` over arbitrary bytes     | never panics; canonical encoding |
 | `state_roundtrip` | `StateWriter` → `StateReader`, structured input     | writer/reader are inverses |
 | `flash_cfi`       | `dev::flash::cfi` — the NOR flash MMIO surface and its snapshot chunk | a program only ever clears bits |
+| `ir_verify`       | `ir::verify` over arbitrary blocks, then `ir::eliminate_dead_code` and `ir::Liveness` | never panics; a block the verifier accepts survives elimination and still verifies |
 
 ### `machine_parser`
 
@@ -91,6 +92,41 @@ It also checks that a debug read answers without moving the state machine, that
 a reset clears the command state and not the contents, that a save/load round
 trip reproduces the bytes exactly — including a half-issued erase or a staged
 write buffer — and that the chunk decoder survives arbitrary bytes.
+
+### `ir_verify`
+
+The third parser in the tree, and the one whose input nobody types: `ir::verify`
+reads a block a **frontend** built, and a frontend turns attacker-controlled
+guest bytes into IR. A lifter bug — an operand read from the wrong slot, a
+temporary numbered off the end of its table, a carry that came out `i32` — hands
+the verifier a block no hand-written test resembles, and the verifier's whole
+purpose is to *name* the defect there rather than let a backend miscompile it.
+
+The target builds a block from the fuzzer's bytes, dumps it (the `Display` runs
+on malformed blocks too — it is what a differential failure gets reported as),
+verifies it, and then runs dead-code elimination over it whether or not the
+verifier accepted it. That last part is deliberate: a pass is ordinarily run
+after the verifier, but nothing in the type system says so, and a pass that
+panics on a block the verifier would have rejected is a pass that panics the day
+someone reorders the pipeline.
+
+The pass is fuzzed alongside because it is the one component here whose *job* is
+to delete things. Flags are ordinary temporaries in this IR (`src/ir/mod.rs`,
+decision 1), which is a debt until DCE removes the parity and half-carry
+temporaries nothing reads — and a DCE that also removes a store, a charge, a
+6502 dummy read or the temporary an `insn_start` names is a silent miscompile:
+no crash, a guest that diverges a million cycles later. So each iteration also
+asserts that no effect went away, that boundary records and temporary numbering
+are untouched, that what survived is either an effect or a value something
+needs, and that a second run changes nothing.
+
+Input is a five-byte header and a stream of one-byte selectors, hand-decoded;
+the header comment in the target has the table. The generator is biased towards
+blocks that verify — a boundary is opened first, a carry in is usually `i1`, a
+terminator normally ends the block — because a uniformly random block dies on
+the first rule it meets and the agreement between the verifier and the pass
+would then never be tested. Every bias is still reachable in the wrong
+direction, so the rejection arms stay live.
 
 ## Setup (one-time)
 
@@ -173,6 +209,17 @@ by construction), plus four malformed derivatives:
 | `nes-shaped.snap` | five devices, three regions, features, arches, chunks using every typed encoder, including a scheduler chunk (§4.5: the scheduler is architectural state) |
 | `unicode.snap` | multi-byte and empty strings in every string position |
 | `bad-magic.snap`, `truncated-header.snap`, `truncated-chunks.snap`, `trailing.snap` | the four rejection paths, so the mutator starts from them |
+
+`corpus/ir_verify/` — inputs to that target's own `Gen` decoder, so every file
+is a translation block written in the selector encoding the target documents:
+
+| File | Why |
+|---|---|
+| `parity` | the case the pass exists for: an `XOR` that is stored, and a popcount flag nothing reads, which elimination removes |
+| `parity-live` | the same flag named live at the next guest instruction boundary, where it must survive — the pass's subtle failure, and the only difference between the two files |
+| `dummy-read` | a volatile load beside a plain one at the same address: the 6502 dummy read stays, the plain load goes |
+| `effects` | `brcond`, a helper call and an atomic, none of whose results anything reads and none of which may be removed |
+| `malformed` | **invalid on purpose** — a temporary used before it is assigned, one that was never allocated, and a second terminator after the first |
 
 `corpus/state_roundtrip/` — inputs to that target's own `Gen` decoder, not
 snapshots: `empty`, `widths` (every integer width at its extremes),

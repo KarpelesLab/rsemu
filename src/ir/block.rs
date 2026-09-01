@@ -137,6 +137,46 @@ impl Block {
     pub fn temp_count(&self) -> usize {
         self.types.len()
     }
+
+    /// A copy of this block holding only the instructions `keep` selects.
+    ///
+    /// The seam dead-code elimination rebuilds a block through, and it lives
+    /// here rather than in `pass` because the operand array is flat and
+    /// private: dropping an instruction means re-packing every later
+    /// instruction's window into it, which only this module knows the layout
+    /// of. An index `keep` does not reach is kept, so a caller that
+    /// miscounts loses nothing.
+    ///
+    /// Temporary numbering and the boundary records are carried over
+    /// **unchanged**, which is load-bearing in both directions: an
+    /// [`InsnStart`] names temporaries by number, and an `INSN_START`
+    /// instruction names its record by index in `aux`. Renumbering either
+    /// would silently repoint a fault's view of architectural state at the
+    /// wrong value. The cost is a hole in the type table for every temporary
+    /// whose definition went away; a register allocator sees it as a
+    /// temporary with no live range and gives it nothing.
+    pub(crate) fn retain(&self, keep: &[bool]) -> Block {
+        let mut out = Block {
+            entry_pc: self.entry_pc,
+            key: self.key,
+            insts: Vec::with_capacity(self.insts.len()),
+            operands: Vec::with_capacity(self.operands.len()),
+            marks: self.marks.clone(),
+            types: self.types.clone(),
+        };
+        for (i, inst) in self.insts.iter().enumerate() {
+            if !keep.get(i).copied().unwrap_or(true) {
+                continue;
+            }
+            let src_start = out.operands.len() as u32;
+            out.operands.extend_from_slice(self.srcs(i));
+            out.insts.push(Inst {
+                src_start,
+                ..inst.clone()
+            });
+        }
+        out
+    }
 }
 
 impl fmt::Display for Block {

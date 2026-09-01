@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid"]
+features         = ["std", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "ir"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -90,6 +90,17 @@ bench = false
 [[bin]]
 name  = "usb_dwc2"
 path  = "fuzz_targets/usb_dwc2.rs"
+test  = false
+doc   = false
+bench = false
+
+# The IR verifier is a parser too — it reads blocks built by frontends, and a
+# frontend turns attacker-controlled guest bytes into IR. Paired with the
+# optimiser, because a DCE that removes a store, a charge, a dummy read or the
+# temporary a boundary names is a silent miscompile rather than a crash.
+[[bin]]
+name  = "ir_verify"
+path  = "fuzz_targets/ir_verify.rs"
 test  = false
 doc   = false
 bench = false
