@@ -48,7 +48,7 @@ the question never arises.
 | [`cpu/6502.md`](cpu/6502.md) | MOS 6502, RP2A03, 65C02, 65816 |
 | [`cpu/z80-sm83.md`](cpu/z80-sm83.md) | Zilog Z80, Sharp SM83 (Game Boy), Intel 8080 |
 | [`cpu/x86.md`](cpu/x86.md) | 8086 → i386 → x86-64, SSE/AVX, paging, segmentation |
-| [`cpu/arm.md`](cpu/arm.md) | ARMv7-A, ARMv8-A / AArch64, GIC |
+| [`cpu/arm.md`](cpu/arm.md) | ARMv5TE, ARMv7-A, ARMv7-M / Cortex-M, ARMv8-A / AArch64, GIC |
 | [`cpu/riscv.md`](cpu/riscv.md) | RV32/RV64, privileged spec, SBI |
 | [`cpu/other.md`](cpu/other.md) | 68000, MIPS, PowerPC, SuperH, V850 |
 
@@ -62,6 +62,7 @@ the question never arises.
 | [`platforms/ibm-pc.md`](platforms/ibm-pc.md) | IBM PC/AT and modern PC chipsets |
 | [`platforms/pc-at.md`](platforms/pc-at.md) | The `pc-at` machine rsemu builds, its firmware slots, and what is missing |
 | [`platforms/riscv-virt.md`](platforms/riscv-virt.md) | The RISC-V `virt` board |
+| [`platforms/stm32f407.md`](platforms/stm32f407.md) | The `stm32f407` microcontroller board, its peripherals, and how an M-profile interrupt is wired |
 
 ### Buses
 | | |

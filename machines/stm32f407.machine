@@ -1,0 +1,260 @@
+# stm32f407 — an STMicroelectronics STM32F407VGT6.
+#
+#   rsemu run stm32f407 --media firmware=blink.bin
+#   rsemu run stm32f407 -p console=b --media firmware=blink.bin
+#
+# A real part, not a synthesis: LQFP100, a Cortex-M4 at 168 MHz, 1 MiB of flash,
+# 112 + 16 KiB of SRAM plus 64 KiB of core-coupled memory, and the ports that
+# package actually bonds. It is the microcontroller on ST's own STM32F4
+# Discovery board, which is why PD12–PD15 below are described as LEDs and why
+# USART2 is on PA2/PA3.
+#
+# Sources: ST **RM0090** rev 21 (reference manual for STM32F405/415, F407/417,
+# F427/437 and F429/439) — §2.3 for the memory map, §7 for the reset and clock
+# tree, §8 for the GPIOs, §30 for the USART, and Table 62 for the vector table.
+# ST **DS8626** rev 9 (the F407VG datasheet) for what the LQFP100 bonds and for
+# the alternate-function table. The ARMv7-M Architecture Reference Manual, ARM
+# DDI 0403, for the core. No emulator source of any licence was consulted
+# (ROADMAP.md §1).
+#
+# ---------------------------------------------------------------------------
+# How a peripheral raises an interrupt here
+# ---------------------------------------------------------------------------
+#
+# **The NVIC is inside the core.** On every other board in this tree the CPU has
+# one or two interrupt inputs and a separate controller — a PLIC, an 8259A —
+# decides which source drove them. An M-profile core has no such thing to wire:
+# the NVIC's enable, pending and priority registers are part of the core's own
+# system block at 0xE000E000, and interrupt *n* is exception number *n + 16*.
+#
+# So a peripheral drives the core's pin `irq{n}` directly, and the number is
+# written **here**:
+#
+#   wire usart2.irq -> cpu.irq38
+#
+# 38 is USART2's position in RM0090 Table 62. That number is a fact about this
+# *part*, not about the ARMv7-M architecture and not about a USART — a USART on
+# an H7 is a different number and the same device model — so it belongs in the
+# board file where the part is chosen, and a device model must never contain
+# one. `cpu.nmi` and `cpu.reset` are the two inputs that are not numbered.
+#
+# ---------------------------------------------------------------------------
+# What this board does not have
+# ---------------------------------------------------------------------------
+#
+# **RCC is a scratch window, not a device.** `rcc` below is plain RAM at the
+# real address: writes to `AHB1ENR` and friends read back, so firmware that
+# gates a peripheral clock proceeds — but nothing is gated, and a `CR` poll for
+# `HSERDY` or `PLLRDY` spins forever, because plain RAM reads back what was
+# written and those are hardware-set bits. Firmware that brings up the PLL needs
+# an `st.rcc` device, which is not written yet. This file says so rather than
+# pretending the window is a clock controller.
+#
+# The same goes for every other peripheral of the part: SPI, I2C, the OTG cores,
+# SDIO, the ADCs, the timers, EXTI and the DMA controllers are all absent. They
+# are separate device classes and separate `object` lines, and this file is the
+# floor they get added to.
+#
+# GPIOF, GPIOG and GPIOI exist on the die but the LQFP100 bonds no pins of them,
+# so this board does not instantiate them. A file for an F407ZGT6 (LQFP144, A–G)
+# or an F407IGH6 (UFBGA176, A–I) copies the `gpioe` block and changes two
+# numbers.
+
+machine "stm32f407" {
+  # Which character port USART2's console attaches to, so two of these can run
+  # in one process without typing at each other (`-p console=b`).
+  param console = "console"
+
+  # How much flash the part has: 1 MiB on the -VG suffix, 512 KiB on a -VE.
+  param flash = 1M
+
+  # The three RAM banks, separately because they are separately reachable:
+  # SRAM1 and SRAM2 are contiguous and on the bus matrix, while CCM is
+  # core-coupled and **not reachable by DMA** — a distinction that costs a
+  # driver author an afternoon and is a property of the map, so it is modelled
+  # as three regions rather than one.
+  param sram1 = 112K
+  param sram2 = 16K
+  param ccm   = 64K
+
+  # -- where everything is ---------------------------------------------------
+  #
+  # Every address is a parameter, and every default below is RM0090 Table 1's
+  # number. That is not because an F407 can be reconfigured — it cannot, these
+  # are wired into the die — but because a *sibling part* moves them, and the
+  # point of a parameter here is that deriving an F401 or an F429 file is
+  # editing a value rather than hunting through `map` statements for a
+  # hexadecimal constant. An override describes a **different part**, not a
+  # different configuration of this one.
+  param boot-base   = 0x00000000   # the alias BOOT0/BOOT1 select; flash, here
+  param flash-base  = 0x08000000
+  param ccm-base    = 0x10000000
+  param sram-base   = 0x20000000
+  param apb1-base   = 0x40000000
+  param ahb1-base   = 0x40020000
+
+  # Peripheral offsets from their bus's base. An STM32 peripheral is allotted a
+  # kilobyte, so the GPIO ports are 0x400 apart and the arithmetic below says so
+  # rather than repeating six constants that must agree.
+  param usart2-off  = 0x4400       # APB1 + 0x4400
+  param gpio-stride = 0x400
+  param rcc-off     = 0x3800       # AHB1 + 0x3800
+
+  # -- crystals --------------------------------------------------------------
+  #
+  # The clock tree in outline. A Discovery board hangs an 8 MHz crystal on HSE
+  # and the PLL multiplies it to 168 MHz — RM0090 §7.2, with M=8, N=336, P=2,
+  # which is 8 MHz / 8 * 336 / 2. Written as an exact ratio of the crystal
+  # rather than as a frequency, because that is what keeps it exact: whatever
+  # HSE turns out to be, the core runs at 21 times it (ROADMAP.md §4.2).
+  #
+  # What is *not* here: HSI, the PLL's own registers, and the AHB/APB
+  # prescalers. Those are RCC's, and RCC is a scratch window (see the header),
+  # so a guest that reprograms the PLL changes no rate. When an `st.rcc` lands,
+  # the domains below are what it will drive.
+  osc hse = 8000000 Hz
+
+  # The USART's own can. One tick of a USART's clock domain is one *character*
+  # time, so this is divided down to the character rate rather than to the baud
+  # rate: 115200 baud, 8N1, is ten bit times per byte, so 11520 bytes a second.
+  # 1.8432 MHz is the classic UART crystal and 1843200 / 160 is exactly that,
+  # which is why the number is written as a ratio and not as 11520 Hz.
+  #
+  # In practice this is a *ceiling* rather than the rate. The guest has to write
+  # the next byte between the ticks that move them, so a byte costs one
+  # scheduler quantum whenever the quantum is longer than a character time —
+  # which it is here, and is on `riscv-virt`'s 16550 for the same reason. A
+  # slower crystal would throttle the port; a faster one would not speed it up.
+  osc uartclk = 1843200 Hz
+
+  # -- the bus ---------------------------------------------------------------
+  #
+  # One flat 32-bit space. `unassigned` is left at its default of `fault`, so an
+  # access to a hole raises a BusFault the guest can see rather than a
+  # plausible-looking zero — a Cortex-M4 has a BusFault handler, and hiding the
+  # abort would hide our own memory-map bugs with it.
+  space mem { width = 32 }
+
+  # -- the core --------------------------------------------------------------
+  #
+  # A Cortex-M4 with the DSP extension and an eight-region MPU, and **four**
+  # NVIC priority bits, which is what an F4 implements (RM0090 §10.1.2, "4 bits
+  # of interrupt priority are used"). CMSIS discovers the number by writing
+  # 0xFF to a priority register and reading back which bits stuck, so getting it
+  # wrong changes what a guest's `NVIC_SetPriority` does — it is modelled rather
+  # than assumed.
+  #
+  # No FPU: the core does not implement FPv4-SP, so `CPACR` reads zero and a
+  # `VMOV` raises a NOCP UsageFault exactly as it would on an M4 without the
+  # option. An F407 *has* the FPU, so firmware built with `-mfpu=fpv4-sp-d16`
+  # will fault here. That is a stated limitation of the core, not of this board.
+  object cpu "cpu.arm.v7m" {
+    clock         = hse * 21
+    space         = mem
+    part          = "cortex-m4"
+    priority-bits = 4
+  }
+
+  # -- memory ----------------------------------------------------------------
+  #
+  # `image` names a media slot: whoever runs the machine binds the bytes
+  # (`--media firmware=fw.bin`), and nothing below host/ opens a file.
+  object rom "rom" { size = flash, image = "firmware" }
+
+  object ram1   "ram" { size = sram1 }
+  object ram2   "ram" { size = sram2 }
+  object ccmram "ram" { size = ccm }
+
+  # The RCC register window. See the header: this is RAM at the right address,
+  # not a clock controller.
+  object rcc "ram" { size = 1K }
+
+  # -- the GPIO ports --------------------------------------------------------
+  #
+  # One class, six instances, differing only in their reset values — which are
+  # not decorative: `GPIOA` comes up with PA13–PA15 already in alternate
+  # function and pulled, because that is the SWD/JTAG debug port, and `GPIOB`
+  # the same for PB3/PB4 (RM0090 §8.4.1, §8.4.3, §8.4.4). Firmware that reads
+  # `MODER` back to decide what to touch sees the real thing.
+  object gpioa "st.gpio" { moder-reset = 0xa8000000, pupdr-reset = 0x64000000 }
+  object gpiob "st.gpio" { moder-reset = 0x00000280, ospeedr-reset = 0x000000c0, pupdr-reset = 0x00000100 }
+  object gpioc "st.gpio" { }
+  object gpiod "st.gpio" { }
+  object gpioe "st.gpio" { }
+  object gpioh "st.gpio" { }
+
+  # -- USART2 ----------------------------------------------------------------
+  #
+  # On PA2 (TX) and PA3 (RX) through AF7, which is the pair a Discovery board's
+  # ST-LINK virtual COM port lands on. `variant = "f4"` is the default and is
+  # written out because the register map is the one thing about this peripheral
+  # that is not portable between families: an F7 or an H7 puts `ISR` at +0x1c
+  # and clears flags through `ICR`, and firmware for one does not run on the
+  # other.
+  object usart2 "st.usart" {
+    clock   = uartclk / 160
+    port    = console
+    variant = "f4"
+  }
+
+  # -- the memory map --------------------------------------------------------
+  #
+  # Every base is a `param` from the top of the file; see the note there for why
+  # a fixed part still parameterises its own map.
+  #
+  # `perms = "r-x"` on the flash: the part's flash is not writable through the
+  # AHB — a program to it goes through the flash interface's key sequence, which
+  # this board does not model — so a stray `STR` into it is a BusFault rather
+  # than a silently modified program. That is a property of the *decode* in
+  # front of the chip and so belongs on the mapping (`core::space`).
+  #
+  # It is mapped twice on purpose. 0x08000000 is where flash lives; 0x00000000
+  # is the **boot alias**, which is what the BOOT0/BOOT1 pins select and what
+  # the core fetches its initial `SP` and `PC` from out of reset. Modelling the
+  # pins would mean an RCC-shaped device; a board that boots from flash is the
+  # overwhelmingly common case and this file states which one it is.
+  map mem boot-base            size flash = rom { perms = "r-x" }
+  map mem flash-base           size flash = rom { perms = "r-x" }
+  map mem ccm-base             size ccm   = ccmram   # CCM: no DMA reaches it
+  map mem sram-base            size sram1 = ram1
+  map mem sram-base + sram1    size sram2 = ram2     # SRAM2 abuts SRAM1
+
+  # APB1, then AHB1. Each register block is mapped at its own base and at its
+  # own size: a peripheral decodes the low bytes of its kilobyte and the rest of
+  # the kilobyte is a **hole** rather than a mirror — which is what the part
+  # does, and what makes a wrong offset a fault instead of a plausible answer.
+  map mem apb1-base + usart2-off size 0x2c = usart2
+
+  # The six ports the LQFP100 bonds, at A + n * 0x400: A, B, C, D, E, then H,
+  # which is 7. F, G and I exist on the die and have no pins in this package.
+  map mem ahb1-base + gpio-stride * 0 size 0x28 = gpioa
+  map mem ahb1-base + gpio-stride * 1 size 0x28 = gpiob
+  map mem ahb1-base + gpio-stride * 2 size 0x28 = gpioc
+  map mem ahb1-base + gpio-stride * 3 size 0x28 = gpiod
+  map mem ahb1-base + gpio-stride * 4 size 0x28 = gpioe
+  map mem ahb1-base + gpio-stride * 7 size 0x28 = gpioh
+
+  map mem ahb1-base + rcc-off size 1K = rcc
+
+  # -- interrupts ------------------------------------------------------------
+  #
+  # The whole of the wiring, and the reason this board exists: no controller
+  # between the peripheral and the core, and the vector-table position written
+  # once, here. RM0090 Table 62 gives USART1 position 37, USART2 38, USART3 39.
+  wire usart2.irq -> cpu.irq38
+
+  # -- the pins --------------------------------------------------------------
+  #
+  # PD12–PD15 are the Discovery board's four LEDs — green, orange, red, blue.
+  # They are outputs of the port and this board has nothing to wire them to, so
+  # they are left unwired and a test reads them through `GPIOD`'s `IDR`, which
+  # is what a scope on the pin would see. A board with a panel or an LED matrix
+  # wires `gpiod.p12` into it.
+  #
+  # USART2's own pins are likewise unwired, and that is a *modelling* decision
+  # rather than an omission: the USART's data path is the character seam in
+  # `host::chardev`, not a bit stream on a wire, so `gpioa.af2` and `gpioa.af3`
+  # have nothing to carry. The GPIO's alternate-function inputs exist for the
+  # peripherals whose pin genuinely is a level — an SPI clock, a chip select, a
+  # timer's compare output.
+}

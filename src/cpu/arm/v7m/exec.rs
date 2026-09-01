@@ -122,6 +122,9 @@ pub(super) struct State {
     pub sys: Sys,
     /// Cycles executed since power-on.
     pub cycles: u64,
+    /// Cycles already run that a future scheduler budget still owes — see
+    /// [`ArmV7m::run_budget`](super::ArmV7m::run_budget).
+    pub debt: u64,
     /// Sleeping in `WFI` or `WFE`.
     pub asleep: bool,
     /// The event register `SEV` sets and `WFE` consumes.
@@ -163,6 +166,7 @@ impl State {
                 if cfg.ext.mpu { MPU_REGIONS as u8 } else { 0 },
             ),
             cycles: 0,
+            debt: 0,
             asleep: false,
             event: false,
             reset_pending: true,
@@ -335,12 +339,12 @@ impl<'a> Exec<'a> {
 
     /// Run one reset sequence, one exception entry, or one instruction.
     ///
-    /// `external` is the level of each external interrupt input, sampled once
-    /// outside the lock. Level-sensitive inputs re-pend for as long as they
-    /// are asserted, which is what a peripheral that has not been serviced
-    /// does; an edge-triggered source pends itself through `NVIC_ISPR` or
-    /// `STIR` instead.
-    pub(super) fn step(&mut self, external: &[u32]) -> u64 {
+    /// `external` is the level of each external interrupt input and `nmi` the
+    /// level of the non-maskable one, both sampled once outside the lock.
+    /// Level-sensitive inputs re-pend for as long as they are asserted, which
+    /// is what a peripheral that has not been serviced does; an edge-triggered
+    /// source pends itself through `NVIC_ISPR` or `STIR` instead.
+    pub(super) fn step(&mut self, external: &[u32], nmi: bool) -> u64 {
         if self.state.reset_pending {
             self.reset_sequence();
             return self.used;
@@ -351,7 +355,7 @@ impl<'a> Exec<'a> {
             return self.used;
         }
 
-        self.merge_external(external);
+        self.merge_external(external, nmi);
 
         // Arbitration happens before anything else in the step, so an
         // exception that arrives while a lower-priority one is being taken is
@@ -386,8 +390,12 @@ impl<'a> Exec<'a> {
         self.used
     }
 
-    /// Fold the external interrupt levels into the NVIC's pending bits.
-    fn merge_external(&mut self, external: &[u32]) {
+    /// Fold the external interrupt levels into the NVIC's pending bits, and
+    /// the NMI input into its own.
+    fn merge_external(&mut self, external: &[u32], nmi: bool) {
+        if nmi {
+            self.state.sys.set_pending(Exception::NMI, true);
+        }
         for (i, word) in external.iter().enumerate() {
             if *word == 0 {
                 continue;
