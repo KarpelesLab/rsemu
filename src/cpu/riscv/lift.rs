@@ -1225,6 +1225,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dead_code_elimination_preserves_a_lifted_block() {
+        // Three pieces written independently — the frontend, the pass, and the
+        // backend — meeting for the first time. A slot read whose result is
+        // named live at a boundary must survive DCE, or the block stops being
+        // able to reconstruct architectural state at a fault.
+        let l = rv64i(&[addi(5, 0, 7), addi(6, 5, 3), ECALL]);
+        let lean = crate::ir::eliminate_dead_code(&l.block);
+        verify(&lean).expect("an optimised block must still verify");
+
+        let mut before = Slots::default();
+        let mut after = Slots::default();
+        let out_before = crate::ir::Interp::new().run(&l.block, &mut before).unwrap();
+        let out_after = crate::ir::Interp::new().run(&lean, &mut after).unwrap();
+
+        assert_eq!(out_before, out_after);
+        assert_eq!(before.state, after.state);
+        assert_eq!(
+            before.ticks, after.ticks,
+            "DCE may not change the tick count"
+        );
+    }
+
     // -- the subset --------------------------------------------------------
 
     #[test]

@@ -160,10 +160,14 @@
 //! # What is deliberately not here yet
 //!
 //! Vector ops (`v128` exists as a [`Type`] so the IR can carry the values;
-//! §9 adds the ops with the SIMD work, not before), the pass pipeline, the
-//! register allocator, and every *host* backend — [`Interp`] is here, because
-//! §11's bare-metal row runs on it and it is the oracle the host backends are
-//! differentially tested against. [`Type::V128`] and the float types
+//! §9 adds the ops with the SIMD work, not before), the rest of the pass
+//! pipeline — constant folding, copy propagation, the load/store reordering
+//! rules — the register allocator, and every *host* backend. [`Interp`] is
+//! here, because §11's bare-metal row runs on it and it is the oracle the host
+//! backends are differentially tested against; and **liveness and dead-code
+//! elimination are here**, in [`Liveness`] and [`eliminate_dead_code`],
+//! because decision 1 is a debt until they exist rather than after.
+//! [`Type::V128`] and the float types
 //! carry values today so that a helper call can take and return them —
 //! tier-1 floating point is helper calls into the soft-float implementation
 //! (§9.1), which is what makes guest FP bit-reproducible across hosts.
@@ -171,6 +175,7 @@
 mod block;
 mod interp;
 mod op;
+mod pass;
 mod types;
 mod verify;
 
@@ -180,5 +185,6 @@ pub use op::{
     AccessKind, Align, Cond, Endian, MemOp, MemSpace, Opcode, SegId, Sign, bitfield_aux,
     bitfield_parts,
 };
+pub use pass::{Liveness, TempLife, eliminate_dead_code};
 pub use types::{Const, Temp, Type};
 pub use verify::verify;
