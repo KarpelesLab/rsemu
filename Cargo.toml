@@ -319,6 +319,20 @@ dev-riscv = []
 # what installs `gEfiVariableWriteArchProtocolGuid`, and RAM cannot provide it.
 dev-flash-cfi = []
 
+# Serial NOR flash (src/dev/flash/spinor.rs): a Winbond **W25Q**-class SPI part
+# -- the chip on the back of nearly every board with an SoC on the front. The
+# JEDEC id (9Fh), read (03h), fast read (0Bh) and the dual/quad forms, page
+# program (02h), 4 KiB sector / 32 KiB / 64 KiB block / chip erase, the three
+# status registers with their BUSY and WEL bits, the block-protection bits,
+# 3- and 4-byte addressing, continuous read mode, deep power-down and the
+# 66h/99h software reset. It is an `SpiSlave`, so the same model answers a
+# controller that hands it a word, one that clocks it bit by bit, and a guest
+# bit-banging GPIO -- and it carries the semantics that make flash *flash*: a
+# program can only clear bits, an erase costs a whole granule, and an
+# instruction cut short by the chip select is not executed at all. Written from
+# the Winbond W25Q128JV datasheet. Needs `bus-spi`.
+dev-flash-spinor = ["bus-spi"]
+
 # The RISC-V `virt` board as a machine (machines/riscv-virt.machine plus the
 # classes it names): the first machine rsemu can boot real system software on.
 # `rsemu run riscv-virt --firmware fw.bin` loads an image at 0x80000000, hands

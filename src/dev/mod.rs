@@ -14,7 +14,7 @@
 //! | [`apple1`] | `dev-apple1` | the Apple 1's MC6821, its monitor ROM socket, and RSMON |
 //! | [`apu`] | `dev-nes-apu` | the RP2A03 audio half: channels, frame counter, DMC |
 //! | [`cart`] | `dev-nes-cart` | cartridge images and the mappers that decode them |
-//! | [`flash`] | `dev-flash-cfi` | parallel NOR flash: the CFI query and the Intel/Sharp command set |
+//! | [`flash`] | `dev-flash-cfi`, `dev-flash-spinor` | NOR flash: parallel (CFI) and serial (W25Q on SPI) |
 //! | [`nes`] | `dev-nes-io` | the console's own I/O: controller ports, OAM DMA |
 //! | [`pc`] | `dev-pc` | an IBM PC/AT board's chips: 8259A, 8254, 8042, MC146818, 8237A, the firmware socket |
 //! | [`ppu`] | `dev-nes-ppu` | the RP2C02 picture unit: the per-dot pipeline |
@@ -44,8 +44,11 @@ pub mod cart;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-gb")))]
 pub mod gb;
 
-#[cfg(feature = "dev-flash-cfi")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dev-flash-cfi")))]
+#[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor")))
+)]
 pub mod flash;
 
 #[cfg(feature = "dev-nes-io")]

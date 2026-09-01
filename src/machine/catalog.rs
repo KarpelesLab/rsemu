@@ -347,7 +347,7 @@ pub fn registry() -> Result<Registry> {
     crate::cpu::riscv::register(&mut reg)?;
     #[cfg(feature = "dev-riscv")]
     crate::dev::riscv::register(&mut reg)?;
-    #[cfg(feature = "dev-flash-cfi")]
+    #[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
     crate::dev::flash::register(&mut reg)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::register(&mut reg)?;
@@ -420,7 +420,7 @@ pub fn bindings() -> Result<Bindings> {
     crate::cpu::riscv::bind(&mut b)?;
     #[cfg(feature = "dev-riscv")]
     crate::dev::riscv::bind(&mut b)?;
-    #[cfg(feature = "dev-flash-cfi")]
+    #[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
     crate::dev::flash::bind(&mut b)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::bind(&mut b)?;
@@ -488,7 +488,7 @@ pub fn classes() -> ClassTable {
     for schema in crate::dev::riscv::schemas() {
         table.insert(schema);
     }
-    #[cfg(feature = "dev-flash-cfi")]
+    #[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
     for schema in crate::dev::flash::schemas() {
         table.insert(schema);
     }

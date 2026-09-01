@@ -15,11 +15,16 @@ controllers come from [`fstool`](https://github.com/KarpelesLab/fstool) — see
 | SD / MMC | SD Association simplified specifications | sdcard.org **[browser]** — the *simplified* specs are free |
 | virtio-blk | [`virtio.md`](virtio.md) | Free |
 | Parallel NOR flash (CFI) | JEDEC **JESD68.01** (Common Flash Interface) and **JEP137B**; the Intel StrataFlash P30 datasheet for the Intel/Sharp command set, the Spansion/Cypress S29GL datasheets for the AMD one | **Free** — jedec.org registration; the datasheets are open downloads |
+| Serial NOR flash (SPI) | The **Winbond W25Q** datasheets (`W25Q128JV` rev F/H, and the 64/32/16 Mbit siblings) — instruction set §8.1, status registers §7.1, timing §9.6; JEDEC **JEP106** for the manufacturer byte | **Free** — open downloads from winbond.com |
+| OCTOSPI / QUADSPI memory interface | ST **AN5050** *Getting started with Octo-SPI…*; the reference manuals **RM0432** (L4+), **RM0455**/**RM0468** (H7A3/H7B3, H723), **RM0438** (L5), **RM0456** (U5). **RM0433's H7 has a QUADSPI, not an OCTOSPI** | **Free** — st.com; ST's CMSIS/HAL headers are BSD-3-Clause and readable as a cross-check |
 
 NOR flash is here rather than under devices because it is a *transport* too:
 the guest sees a memory window with a command protocol on it, not a controller
 with a queue, which is why `dev/flash/cfi` is not on `fstool::BlockDevice` and
-takes a plain media slot instead.
+takes a plain media slot instead. `dev/flash/spinor` is the same part reached
+the other way round — a frame on four wires rather than an address window — and
+it is an `SpiSlave` on [`low-speed.md`](low-speed.md)'s fabric, so it takes a
+media slot for the same reason.
 
 NVMe and virtio-blk are both freely specified and much simpler to implement
 correctly than ATA. Prefer them for new machines; implement ATA because legacy
