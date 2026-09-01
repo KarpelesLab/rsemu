@@ -238,8 +238,12 @@ fn a_program_reaches_every_chip_through_two_address_spaces_and_banks_its_own_rom
         );
     }
 
-    // Long enough for the whole program: it is under sixty instructions.
-    m.run_for(GlobalTime::from_nanos(200_000)).expect("it runs");
+    // Long enough for the whole program: it is under sixty instructions. At
+    // least one scheduling round, too — `run_for` runs whole rounds and defers
+    // what will not fit (§11.6), so a span shorter than one would run none of
+    // it on a board whose devices have no nearer event.
+    m.run_for(GlobalTime::from_nanos(2_000_000))
+        .expect("it runs");
 
     // -- what the run proves -----------------------------------------------
     //
@@ -278,11 +282,13 @@ fn the_pause_button_is_a_non_maskable_interrupt() {
     let io = capture::take_io(&hosts).expect("the machine has an I/O chip");
     // The program's first instruction is `di`, so an ordinary interrupt cannot
     // reach it. Run until it is parked in its loop.
-    m.run_for(GlobalTime::from_nanos(200_000)).expect("it runs");
+    m.run_for(GlobalTime::from_nanos(2_000_000))
+        .expect("it runs");
     assert_eq!(peek(&m, "mem", RAM + 3), 0x00, "nothing has taken an NMI");
 
     io.pulse_pause();
-    m.run_for(GlobalTime::from_nanos(100_000)).expect("it runs");
+    m.run_for(GlobalTime::from_nanos(2_000_000))
+        .expect("it runs");
     assert_eq!(
         peek(&m, "mem", RAM + 3),
         0x5a,

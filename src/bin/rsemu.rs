@@ -421,11 +421,11 @@ fn install_capture(
 /// why `write_recording` reports what a longer run lost rather than quietly
 /// producing a short file.
 ///
-/// Slicing the run instead would be worse than it sounds: `Machine::run_until`
-/// ends a quantum at `min(now + quantum, deadline, next deadline)`, so an extra
-/// deadline is an extra quantum boundary, and a run cut into pieces does not
-/// reach the same state as the same run taken whole. `--record-audio` would
-/// then change the state hash it is printed beside.
+/// Slicing the run is no longer *wrong* — `Machine::run_for` is additive, so a
+/// run cut into pieces reaches the same state as the same run taken whole
+/// (§11.6) — but it is still not free: each slice ends on a scheduling boundary
+/// and the host would have to be driven between them. The ring stays the
+/// simple answer.
 ///
 /// Zero when nothing is being recorded, which leaves whatever the machine
 /// description asked for untouched.

@@ -583,7 +583,7 @@ pub trait Device: Send + Sync + fmt::Debug {
     ///
     /// Catch-up never crosses it: past that tick the device's behaviour
     /// changes, and simulating through it in one step would compute the wrong
-    /// answer. It is also what the machine layer bounds a quantum by, so that a
+    /// answer. It is also what the scheduler bounds a round by, so that a
     /// CPU is not let run thousands of cycles past the dot an NMI was raised
     /// on. `None` means "nothing pending" and catch-up runs to the present.
     ///

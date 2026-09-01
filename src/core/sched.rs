@@ -16,6 +16,20 @@
 //!   comes first* — and reports back what it [`Consumed`]. That is what lets
 //!   JIT block execution and per-access cycle accounting coexist: the block runs
 //!   to its natural end and the tick count is the truth afterwards.
+//! * **Rounds end where the machine says, not where the caller does.** One
+//!   round of the round-robin runs to its *natural target*: the next point of
+//!   an absolute quantum grid, the next queued event, or the next event a
+//!   lazily-advanced device has of its own — whichever is first, and all three are functions of
+//!   virtual time and machine state alone. A caller's deadline that falls
+//!   *inside* a round does not shorten it; the round simply does not start, and
+//!   runs whole when the caller asks for more time. That is what makes
+//!   [`Machine::run_for`](crate::machine::Machine::run_for) additive (§11.6),
+//!   and it is worth the one thing it costs: a run can return with up to one
+//!   round of virtual time elapsed and not yet executed. Nothing is lost —
+//!   budgets come from each tree's absolute position, so the next round hands
+//!   out the ticks — but a caller that needs execution to track a fine deadline
+//!   wants a shorter [`SchedulerConfig::quantum`], or
+//!   [`Scheduler::step_quantum_until`], which is the debugger's.
 //! * **Sync-on-access.** The queue handles *scheduled* behaviour, but not
 //!   *sampled* behaviour: a 6502 reads `$2002` at an arbitrary cycle and the PPU
 //!   has to be at exactly that dot, sprite-0 and vblank race included. So a
@@ -1145,6 +1159,11 @@ pub struct SchedulerConfig {
     /// Shorter means finer interleaving between runnables and more scheduler
     /// overhead; it does not affect correctness, because catch-up makes every
     /// access exact regardless.
+    ///
+    /// It *is* the grid a round ends on, though: rounds end on whole multiples
+    /// of it counted from the origin, so a deadline that is a whole number of
+    /// quanta lands exactly on a boundary and leaves nothing deferred. See
+    /// [`Scheduler::run_quantum_until`].
     pub quantum: GlobalTime,
     /// A hard cap on ticks handed out in one budget, whatever the quantum works
     /// out to.
@@ -1158,14 +1177,16 @@ impl Default for SchedulerConfig {
         SchedulerConfig {
             mode: ThreadingMode::Deterministic,
             rate: RateControl::Unbounded,
-            // One millisecond: short enough that a machine feels responsive,
-            // long enough that scheduling is not the bottleneck.
-            quantum: GlobalTime::from_nanos(1_000_000),
+            quantum: DEFAULT_QUANTUM,
             max_ticks_per_quantum: 10_000,
             granule_shift: DEFAULT_GRANULE_SHIFT,
         }
     }
 }
+
+/// One millisecond: short enough that a machine feels responsive, long enough
+/// that scheduling is not the bottleneck.
+pub const DEFAULT_QUANTUM: GlobalTime = GlobalTime::from_nanos(1_000_000);
 
 struct RunnableSlot {
     domain: DomainId,
@@ -1512,6 +1533,33 @@ pub struct SchedulerSnapshot {
     pub events: Vec<Event>,
 }
 
+/// `t` as a whole number of nanoseconds, when it is exactly one.
+///
+/// [`GlobalTime::from_nanos`] rounds down and so does
+/// [`GlobalTime::as_nanos`], so the round trip can land a nanosecond low —
+/// `from_nanos(1_000_000).as_nanos()` is 999 999. Both candidates are tried,
+/// and the answer is the one that converts back to exactly `t`.
+fn whole_nanos(t: GlobalTime) -> Option<u64> {
+    let floor = t.as_nanos();
+    [floor, floor.saturating_add(1)]
+        .into_iter()
+        .find(|n| *n != 0 && GlobalTime::from_nanos(*n) == t)
+}
+
+/// Whether a round may be cut short by the caller's deadline.
+///
+/// [`Cut::No`] is what a run loop wants: a deadline that falls inside a round
+/// declines the round rather than splitting it, which is what makes
+/// [`Machine::run_for`](crate::machine::Machine::run_for) additive (§11.6).
+/// [`Cut::Yes`] is the debugger's, and is not additive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cut {
+    /// Run the round whole or not at all.
+    No,
+    /// Run whatever fits before the deadline.
+    Yes,
+}
+
 /// What one round of the round-robin did.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QuantumReport {
@@ -1540,6 +1588,12 @@ pub struct Scheduler {
     /// Where the round-robin starts next round, so no runnable is permanently
     /// first.
     cursor: usize,
+    /// The quantum as a whole number of nanoseconds, when it is one.
+    ///
+    /// The grid a round ends on is counted in these — see
+    /// [`Scheduler::next_grid_point`] for why. Derived from the config, which
+    /// is fixed at construction, so it is computed once rather than per round.
+    quantum_nanos: Option<u64>,
     /// [`Scheduler::lazy`] as one shared slice, so arming a cursor does not
     /// allocate. Rebuilt when a device is registered, which happens at realize
     /// and nowhere else.
@@ -1566,6 +1620,7 @@ impl Scheduler {
     pub fn new(forest: ClockForest, config: SchedulerConfig) -> Scheduler {
         let queue = EventQueue::new(config.granule_shift);
         let rate = RateController::new(config.rate);
+        let quantum_nanos = whole_nanos(config.quantum);
         Scheduler {
             forest,
             queue,
@@ -1574,6 +1629,7 @@ impl Scheduler {
             runnables: Vec::new(),
             lazy: Vec::new(),
             cursor: 0,
+            quantum_nanos,
             lazy_snapshot: None,
             rate,
             host_clock: None,
@@ -1916,12 +1972,57 @@ impl Scheduler {
 
     /// Runs one quantum, but never past `limit`.
     ///
+    /// A round ends at its *natural target*: the next point of the quantum
+    /// grid, the next queued event, or the next event a lazily-advanced device
+    /// has of its own — an instant that depends on virtual time and the
+    /// machine's own state and on nothing else.
+    /// If `limit` falls *before* that instant the round is not started: virtual
+    /// time moves to `limit` with nothing executed, and the round runs whole
+    /// when the caller asks for more time.
+    ///
+    /// That is what makes running for a span and running for the same span in
+    /// pieces reach the same state (§11.6). A deadline is an arbitrary instant
+    /// chosen by whoever is driving the machine — a frame in a browser, a span
+    /// on a command line — and letting it cut a round short would hand every
+    /// runnable a budget the unsliced run never handed out, permanently.
+    ///
+    /// The price is that a caller whose deadlines are finer than the machine's
+    /// own boundaries gets its work in bursts rather than a little at a time.
+    /// Nothing is lost — budgets come from each tree's absolute position, so a
+    /// deferred tick is handed out by the round that owns it — but a caller
+    /// that needs execution to track a fine deadline should shorten
+    /// [`SchedulerConfig::quantum`], which is what it is for.
+    ///
     /// # Errors
     ///
     /// As [`Scheduler::run_quantum`].
     pub fn run_quantum_until(&mut self, limit: GlobalTime) -> SchedResult<QuantumReport> {
+        self.run_quantum_bounded(limit, Cut::No)
+    }
+
+    /// Runs one quantum, cutting it short at `limit` rather than declining it.
+    ///
+    /// **Not additive, and that is the point.** A debugger stepping one CPU
+    /// cycle at a time cannot wait for a round to end — that is thousands of
+    /// cycles, and every breakpoint between here and there would be stepped
+    /// over. So this hands out the fragment of a round that fits before
+    /// `limit`, which is exactly the scheduling boundary
+    /// [`Scheduler::run_quantum_until`] refuses to create.
+    ///
+    /// Use it for stepping and for nothing else. A run loop that reaches for it
+    /// gives up §11.6: two sessions that stop at different instants stop being
+    /// comparable, permanently.
+    ///
+    /// # Errors
+    ///
+    /// As [`Scheduler::run_quantum`].
+    pub fn step_quantum_until(&mut self, limit: GlobalTime) -> SchedResult<QuantumReport> {
+        self.run_quantum_bounded(limit, Cut::Yes)
+    }
+
+    fn run_quantum_bounded(&mut self, limit: GlobalTime, cut: Cut) -> SchedResult<QuantumReport> {
         match self.config.mode {
-            ThreadingMode::Deterministic => self.run_quantum_deterministic(limit),
+            ThreadingMode::Deterministic => self.run_quantum_deterministic(limit, cut),
             // Extension point: `parallel` submits one job per runnable to the
             // `core::sync` task pool and joins on a barrier at the quantum
             // boundary; `accel` replaces the target computation below with a
@@ -1953,15 +2054,125 @@ impl Scheduler {
         Ok(())
     }
 
-    fn run_quantum_deterministic(&mut self, limit: GlobalTime) -> SchedResult<QuantumReport> {
-        let from = self.now;
-        let mut target = self.now.saturating_add(self.config.quantum).min(limit);
+    /// The next instant a round would naturally end at, ignoring the caller.
+    ///
+    /// Three candidates, and every one of them is an *absolute* instant rather
+    /// than an offset from wherever the last round happened to stop:
+    ///
+    /// * the next point of the quantum grid — a multiple of
+    ///   [`SchedulerConfig::quantum`], not `now + quantum`;
+    /// * the next queued event, because a CPU that executes through its own NMI
+    ///   has already got the answer wrong;
+    /// * the next instant a lazily-advanced device has an event of its own, so
+    ///   the PPU reaches the dot it raises vblank on even while the CPU is busy
+    ///   elsewhere (§4.2, the scheduled half of sync-on-access).
+    ///
+    /// Being a pure function of virtual time and machine state — never of how
+    /// the caller sliced the run — is the whole point. See
+    /// [`Scheduler::run_quantum_until`] for what it buys.
+    fn natural_target(&mut self) -> GlobalTime {
+        let mut target = self.next_grid_point();
         if let Some(deadline) = self.queue.next_deadline()
             && deadline < target
         {
-            // Never run past an event: a CPU that executes through its own NMI
-            // is a CPU that has already got the answer wrong.
-            target = deadline.max(self.now);
+            target = deadline;
+        }
+        if let Some(at) = self.lazy_deadline()
+            && at < target
+        {
+            target = at;
+        }
+        // An event already in the past pulls the target below `now`; running
+        // backwards is worse than firing it late, so the round stands still and
+        // the tail of `run_quantum_deterministic` pops it.
+        target.max(self.now)
+    }
+
+    /// The first multiple of the quantum strictly after `now`.
+    ///
+    /// A grid anchored at the origin rather than at `now` is what makes an
+    /// interrupted run resume on the boundaries it would have used anyway: two
+    /// instants in the same cell have the same next boundary, so a caller's
+    /// deadline landing mid-cell cannot shift every later one.
+    ///
+    /// Counted in **nanoseconds** rather than in raw 2⁻⁶⁴-second units,
+    /// whenever the quantum is a whole number of them, because that is the unit
+    /// callers name deadlines in. A nanosecond is not a dyadic fraction of a
+    /// second, so `k` raw quanta drift below `k` quanta-worth of nanoseconds by
+    /// up to `k` units — enough that a run of one virtual second would stop a
+    /// hair before the second and leave the cycle beginning there for the next
+    /// call. Counting the grid the way the caller counts the deadline puts the
+    /// two on the same points: [`GlobalTime::from_nanos`] rounds once, the same
+    /// way, on both sides.
+    ///
+    /// A zero quantum returns `now`, which stalls the machine — deliberately,
+    /// because [`Machine::run_until`](crate::machine::Machine::run_until)
+    /// reports that as the configuration error it is rather than spinning.
+    fn next_grid_point(&self) -> GlobalTime {
+        if let Some(nanos) = self.quantum_nanos {
+            let here = self.now.as_nanos() / nanos;
+            // At most twice: `from_nanos` rounds down, so the boundary that
+            // `now`'s own nanosecond count names can land at or before `now`
+            // itself. The one after it cannot, a quantum being a whole
+            // nanosecond or more.
+            for cell in [here.saturating_add(1), here.saturating_add(2)] {
+                let at = GlobalTime::from_nanos(cell.saturating_mul(nanos));
+                if at > self.now {
+                    return at;
+                }
+            }
+        }
+        let quantum = self.config.quantum.raw();
+        if quantum == 0 {
+            return self.now;
+        }
+        let cell = self.now.raw() / quantum;
+        GlobalTime::from_raw(cell.saturating_add(1).saturating_mul(quantum))
+    }
+
+    fn run_quantum_deterministic(
+        &mut self,
+        limit: GlobalTime,
+        cut: Cut,
+    ) -> SchedResult<QuantumReport> {
+        let from = self.now;
+        let natural = self.natural_target();
+        let target = match cut {
+            // A debugger's fragment. See [`Scheduler::step_quantum_until`] for
+            // why this exists and why nothing else may use it.
+            Cut::Yes => natural.min(limit),
+            Cut::No => natural,
+        };
+        if target > limit {
+            // The caller's deadline falls inside a round, so the round does not
+            // run at all: virtual time moves to the deadline and the round
+            // happens, whole, when the caller asks for more.
+            //
+            // Running the fragment instead — which is what this did, and what
+            // made `run_for` non-additive — hands every runnable a budget the
+            // unsliced run never handed out, and then hands out the remainder
+            // in a second pass. Two runnables that observe each other diverge
+            // there and never converge again. `riscv-virt` is the measured
+            // case: its 16550 pumps its port once per call, so an extra pass is
+            // an extra character. Rotating the round-robin only on a completed
+            // round fixes the ordering but not that.
+            //
+            // Nothing is lost by waiting. Budgets come from each tree's
+            // absolute position (see [`Scheduler::ticks_until`]), so the ticks
+            // this defers are handed out by the round that ends up owning them.
+            // No event can fall in the skipped interval either: one at or
+            // before `limit` would have been the natural target.
+            self.advance_idle_to(limit)?;
+            let mut fired = Vec::new();
+            while let Some(e) = self.queue.pop_due(self.now) {
+                fired.push(e);
+            }
+            return Ok(QuantumReport {
+                from,
+                to: self.now,
+                consumed: Vec::new(),
+                fired,
+            });
         }
 
         let mut consumed = Vec::with_capacity(self.runnables.len());
@@ -2728,6 +2939,12 @@ mod tests {
                 ..Ppu::default()
             }),
         );
+        // Two rounds, because a round is now bounded by the device's own next
+        // event: the first stops at dot 100 and the second, with that deadline
+        // behind it, runs a whole quantum. (This stand-in never moves its
+        // event; a real device advances it, which is why
+        // `Device::next_event_tick` documents that it must.)
+        sched.run_quantum().unwrap();
         sched.run_quantum().unwrap();
         // Thousands of dots have passed, but the device may not be simulated
         // past dot 100, where its own behaviour changes.
@@ -2946,6 +3163,9 @@ mod tests {
             }),
         );
         let handle = sched.lazy_handle(dev).expect("a handle");
+        // Twice, for the reason in `catch_up_stops_at_the_devices_own_next_event`:
+        // the first round ends *on* dot 100 and the second runs past it.
+        sched.run_quantum().unwrap();
         sched.run_quantum().unwrap();
 
         // One sync alone stops at the declared event and goes no further.
@@ -3119,9 +3339,42 @@ mod tests {
         let (mut sched, cpu, _ppu) = nes_scheduler();
         sched.add_runnable(cpu, Box::new(Cpu::default()));
         sched.schedule_at(GlobalTime::ZERO, EventTarget(0), 1);
-        sched.run_until(t(2_000)).unwrap();
-        assert_eq!(sched.now(), t(2_000));
+        // Two milliseconds rather than two microseconds: a round runs only when
+        // the deadline reaches its boundary, so a deadline inside the first
+        // quantum would leave the CPU untouched for a reason that has nothing
+        // to do with what this test is about (see `run_quantum_until`).
+        sched.run_until(t(2_000_000)).unwrap();
+        assert_eq!(sched.now(), t(2_000_000));
         assert!(sched.forest().ticks(cpu).unwrap() > 0);
+    }
+
+    /// A quantum that is not a whole number of nanoseconds still has a grid,
+    /// counted in raw units — the fallback in `next_grid_point`.
+    #[test]
+    fn a_sub_nanosecond_quantum_still_has_an_absolute_grid() {
+        assert_eq!(
+            whole_nanos(GlobalTime::from_nanos(1_000_000)),
+            Some(1_000_000)
+        );
+        // 2⁻²⁰ s is 953.674… ns, which is not a whole number of them.
+        let quantum = GlobalTime::from_raw(1 << 44);
+        assert_eq!(whole_nanos(quantum), None);
+
+        let mut forest = ClockForest::new();
+        let root = forest
+            .add_oscillator("xtal", Rational::integer(1_000_000))
+            .unwrap();
+        let domain = forest.add_domain("d", root, 1, 1).unwrap();
+        let config = SchedulerConfig {
+            quantum,
+            ..SchedulerConfig::default()
+        };
+        let mut sched = Scheduler::new(forest, config);
+        sched.add_runnable(domain, Box::new(Cpu::default()));
+        for k in 1..=4u128 {
+            let report = sched.run_quantum().unwrap();
+            assert_eq!(report.to, GlobalTime::from_raw(k << 44), "round {k}");
+        }
     }
 
     #[test]

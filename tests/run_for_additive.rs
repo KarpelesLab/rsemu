@@ -6,11 +6,14 @@
 //! span and running for the same span in pieces reach the same state — which is
 //! what this file measures rather than assumes.
 //!
-//! It is not obviously true. `Scheduler::run_quantum_deterministic` picks
-//! `target = min(now + quantum, limit, next_event)`, so a deadline that falls
-//! mid-quantum *truncates* that quantum. Every intermediate deadline is
-//! therefore an extra scheduling boundary that the single span does not have,
-//! and a boundary changes how far each runnable gets before the next one runs.
+//! It was not always true. A round used to end at
+//! `min(now + quantum, limit, next_event)`, so an intermediate deadline
+//! truncated one — an extra scheduling boundary, which advanced the round-robin
+//! cursor an extra time and handed every runnable a budget the unsliced run
+//! never handed out. Both effects were permanent. A round now ends at an
+//! instant that depends on virtual time and the machine's state and on nothing
+//! else, and a deadline inside one declines the round instead of splitting it
+//! (`core::sched::Scheduler::run_quantum_until`).
 
 // Every machine named below is asked for by name, so all three have to be in
 // the build. Without this the file fails under any narrower feature set with
@@ -25,90 +28,86 @@ mod workload;
 
 use rsemu::core::clock::GlobalTime;
 
-/// Run one workload for `span` in `pieces` equal steps and return its hash.
+/// About 100 ms, rounded down to a raw span every split below divides exactly.
+///
+/// Exactly, because the pieces have to sum to the whole or the two runs have
+/// different *deadlines* and no scheduler could reconcile them: `GlobalTime`
+/// counts 2⁻⁶⁴ seconds and rounds down, so `2 × from_nanos(50 ms)` is one unit
+/// short of `from_nanos(100 ms)`, and `now` is architectural state. That is
+/// arithmetic, not scheduling, and an earlier version of this file measured it
+/// by accident and reported it as non-additivity.
+const SPAN: GlobalTime =
+    GlobalTime::from_raw(GlobalTime::from_nanos(100_000_000).raw() / SPLIT_LCM * SPLIT_LCM);
+
+/// The least common multiple of every split in [`SPLITS`].
+const SPLIT_LCM: u128 = 10;
+
+/// How the span is cut up. One piece is the unsliced run.
+const SPLITS: [u32; 3] = [1, 2, 10];
+
+/// Run one workload for [`SPAN`] in `pieces` equal steps and return its hash.
 ///
 /// `None` when this build has no such workload, which is an ordinary
 /// `--no-default-features` build rather than a failure.
-fn hash_after(name: &str, span_ns: u64, pieces: u32) -> Option<u64> {
+fn hash_after(name: &str, pieces: u32) -> Option<u64> {
     let w = workload::all().into_iter().find(|w| w.name == name)?;
     let mut booted = w.boot();
-    let step = span_ns / u64::from(pieces);
+    let step = GlobalTime::from_raw(SPAN.raw() / u128::from(pieces));
     for _ in 0..pieces {
-        booted
-            .machine
-            .run_for(GlobalTime::from_nanos(step))
-            .expect("the machine runs");
+        booted.machine.run_for(step).expect("the machine runs");
     }
     Some(booted.machine.state_hash().expect("it hashes"))
 }
 
-/// The same span, taken whole and taken in pieces.
-///
-/// If this ever passes for every split, `run_for` is additive and §11.6's
-/// claim holds. Today it does not, and the assertion below records *which*
-/// way round that is so a future change to the scheduler is noticed.
+/// The same span, taken whole and taken in pieces, reaches the same state.
 #[test]
-fn one_span_and_many_pieces_are_compared_honestly() {
-    const SPAN: u64 = 100_000_000; // 100 ms
-
+fn one_span_and_many_pieces_reach_the_same_state() {
     // Every workload this build has, rather than a named list. A hard-coded
     // list silently stops covering the workload added after it was written —
-    // which is exactly what happened here: `riscv-virt` was missing, and the
-    // guard below caught it in the one feature set where it was the *only*
-    // workload.
+    // which is exactly what happened here: `riscv-virt` was missing, and it
+    // turned out to be the only one of the four that a shifted round-robin
+    // cursor was not the whole story for.
     let names: Vec<&'static str> = workload::all().into_iter().map(|w| w.name).collect();
     if names.is_empty() {
         eprintln!("no machine features enabled; nothing to compare");
         return;
     }
 
-    let mut non_additive = 0usize;
     for name in &names {
-        let whole = hash_after(name, SPAN, 1).expect("a workload this build has");
-        let halves = hash_after(name, SPAN, 2).expect("the same workload again");
-        let tenths = hash_after(name, SPAN, 10).expect("the same workload again");
-        println!(
-            "{name}: whole {whole:#018x}  halves {halves:#018x}  tenths {tenths:#018x}  \
-             additive={}",
-            whole == halves && whole == tenths
-        );
+        let whole = hash_after(name, 1).expect("a workload this build has");
+        let hashes: Vec<(u32, u64)> = SPLITS
+            .iter()
+            .map(|p| (*p, hash_after(name, *p).expect("the same workload again")))
+            .collect();
+        let shown: Vec<String> = hashes
+            .iter()
+            .map(|(p, h)| format!("{p}:{h:#018x}"))
+            .collect();
+        println!("{name}: {}", shown.join("  "));
 
-        // Splitting the *same* way twice must agree. That is determinism, and
-        // it is the part that must never regress.
-        assert_eq!(
-            Some(halves),
-            hash_after(name, SPAN, 2),
-            "{name}: the same split must be reproducible"
-        );
-
-        // Whether the split *shape* matters is workload-dependent, and that is
-        // itself a finding. On `nes-ntsc`, `gameboy` and `apple1` two pieces
-        // and ten reach the same hash; on `riscv-virt` they do not. An earlier
-        // version of this file asserted they always agree, generalising from
-        // the three that did — so it is recorded here and not asserted.
-        if halves != tenths {
-            println!("  ({name}: the split shape matters here, not just its existence)");
-        }
-
-        if whole != halves {
-            non_additive += 1;
+        for (pieces, hash) in hashes {
+            assert_eq!(
+                whole, hash,
+                "{name}: {pieces} pieces reach a different state from one span; \
+                 `run_for` is not additive"
+            );
         }
     }
+}
 
-    // A characterisation of today's behaviour, not an endorsement of it.
-    // `run_for` is **not** additive: an intermediate deadline truncates a
-    // quantum, and that is a scheduling boundary the single span never had.
-    //
-    // **When this assertion starts failing, that is good news**: it means
-    // `run_for` became additive and §11.6's promise that a browser session and
-    // a native session reach the same state hash became true rather than
-    // aspirational. Delete it and fix the roadmap.
-    //
-    // Counted rather than asserted per workload, because a workload with
-    // nothing scheduled has no boundary to be moved and would be additive for
-    // an uninteresting reason.
-    assert!(
-        non_additive > 0,
-        "every workload is now additive — run_for may have been fixed; see the note above"
-    );
+/// Splitting the *same* way twice must agree.
+///
+/// That is determinism rather than additivity, and it is the half that must
+/// never regress: a fix that made every split agree by making the run depend on
+/// something new would pass the test above and fail this one.
+#[test]
+fn the_same_split_twice_reaches_the_same_state() {
+    for w in workload::all() {
+        assert_eq!(
+            hash_after(w.name, 2),
+            hash_after(w.name, 2),
+            "{}: the same split must be reproducible",
+            w.name
+        );
+    }
 }
