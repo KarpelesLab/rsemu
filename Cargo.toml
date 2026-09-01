@@ -302,12 +302,14 @@ machine-spi-panel = ["cpu-riscv", "bus-spi", "dev-st7272a", "dev-lcdc"]
 # deliverable at the right PC, and the verifier that rejects a malformed block
 # before a backend can miscompile it (ROADMAP.md §9).
 #
+# Also the portable IR interpreter backend, which is here rather than in `jit/`
+# because §11's target table has a bare-metal row whose engine it is, and
+# because it is the oracle every host backend is differentially tested against.
+#
 # Deliberately **not** here: any host code generation. Emitting machine code
 # needs W^X buffers and raw syscalls, and emitting wasm needs an embedder
-# import, so both live in `jit/` above the `std` line. The portable IR
-# interpreter will land here rather than there, because §11's target table has
-# a bare-metal row whose engine it is. Adds no dependencies and is
-# `no_std + alloc`.
+# import, so both live in `jit/` above the `std` line. Adds no dependencies and
+# is `no_std + alloc`.
 ir = []
 
 # Level-3 execution (src/usermode): running a program with no guest kernel
