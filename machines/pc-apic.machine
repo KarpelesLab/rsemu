@@ -1,0 +1,239 @@
+# A PC/AT-class board with the APIC interrupt path fitted.
+#
+#   rsemu run pc-apic --bios /path/to/bios.bin
+#
+# This is `pc-at` with three chips added and one wire moved, and it exists
+# because those are exactly the changes an SMP-capable PC needs: a **local
+# APIC** in front of the processor, an **I/O APIC** for the board's interrupt
+# lines to land on, and an **HPET** for a timer that is not the 8254. Everything
+# else — the port map, the two 8259As, the 8042, the CMOS layout — is the AT's,
+# unchanged.
+#
+# It is a separate file rather than an edit to `pc-at.machine` on purpose. A
+# board either has an APIC or it does not, and firmware finds out by looking;
+# a machine file that grew a `param apic = false` would be describing two boards
+# and testing neither.
+#
+# **rsemu ships no BIOS and never will** — the `bios` slot takes the user's own
+# image (ROADMAP.md §1). A board with no firmware realizes and executes open
+# bus, which is a useful thing to look at and not a machine that boots.
+#
+# # What is deliberately absent
+#
+# **A second processor.** Everything on the sending side of an application
+# processor's startup works — `src/dev/pc/apic.rs` implements the interrupt
+# command register, `INIT` and Start-Up, and the receiving APIC latches the page
+# it was told to begin at. What does not exist is the *processor's* half:
+# `cpu.x86` has no wait-for-SIPI state and no input that starts it at a given
+# `CS:IP`, only a `reset` pin that restarts it at the reset vector. Wiring a
+# second processor here would produce a machine where both cores run from
+# 0xfffffff0 at once, which is not what a PC does. `tests/pc_apic_smp.rs`
+# drives the sequence end to end with that one missing step supplied by the
+# test, so the day the core grows it, this file gains four lines.
+#
+# # Sources
+#
+# The IBM Personal Computer AT Technical Reference (1984) for the board; Intel
+# SDM Volume 3A chapter 10 for the local APIC's register page at 0xfee00000; the
+# Intel 82093AA datasheet for the I/O APIC's at 0xfec00000; the IA-PC HPET
+# Specification rev 1.0a for the HPET's at 0xfed00000. No emulator source was
+# consulted for any of it.
+
+machine "pc-apic" {
+  # -- what the user can change -----------------------------------------------
+
+  param basemem = 640K
+  param extmem  = 15M
+
+  param biosbase = 0xe0000
+  param biossize = 128K
+
+  param keyboard = "keyboard"
+
+  # The date and time the RTC starts at. A device may never read the host clock
+  # (CLAUDE.md, determinism), so it is declared and two runs see the same day.
+  param time = "2026-01-01T00:00:00"
+
+  # -- crystals ---------------------------------------------------------------
+
+  osc cpu = 25000000 Hz
+
+  # The 8254's input: 14.31818 MHz / 12, which is not an integer number of hertz
+  # and is why the language takes rational literals.
+  osc pit = 105000000/88 Hz
+
+  osc rtc = 32768 Hz
+  osc kbd = 12000000 Hz
+
+  # The processor's bus clock, which is what the local APIC's timer counts
+  # (SDM Vol 3A §10.5.4: the timer counts "the processor's bus clock or core
+  # crystal clock frequency ... divided by the value in the divide configuration
+  # register"). 100 MHz is a period-appropriate front-side bus.
+  osc bus = 100000000 Hz
+
+  # The HPET's own crystal. 10 MHz, so one tick is 100 ns — and the device is
+  # told the same number a second time, in femtoseconds, because it reports the
+  # period to the guest and cannot see its own domain's rate. The two must
+  # agree: 10^15 / 10^7 = 10^8 fs.
+  osc hpet = 10000000 Hz
+
+  # -- address spaces ---------------------------------------------------------
+
+  space mem  { width = 32, unassigned = read-as-ones }
+  space port { width = 16, unassigned = read-as-ones }
+
+  # -- the processor ----------------------------------------------------------
+
+  object cpu0 "cpu.x86" {
+    clock   = cpu
+    space   = mem
+    iospace = "port"
+    model   = "80486"
+    engine  = "interp"
+  }
+
+  # -- memory -----------------------------------------------------------------
+
+  object ram_low  "ram" { size = basemem }
+  object ram_high "ram" { size = extmem }
+
+  # -- interrupts, the legacy half --------------------------------------------
+  #
+  # The two 8259As are still here, and still cascaded, because every PC boots
+  # through them: firmware and DOS know nothing else. What changes on this board
+  # is where the master's INT output goes — see the wiring below.
+
+  object pic1 "pc.pic" { mode = "master" }
+  object pic2 "pc.pic" { mode = "slave" }
+
+  # -- interrupts, the APIC half ----------------------------------------------
+  #
+  # One local APIC, on the APIC message bus named `apic`; one I/O APIC, on the
+  # same bus. The bus is how a message addressed to an APIC ID finds it, and it
+  # is also how an end-of-interrupt gets back to the I/O APIC to clear a
+  # level-triggered entry's remote IRR.
+  #
+  # `id = 0` and the implied `bsp = true`: this is the bootstrap processor.
+
+  object lapic0 "pc.lapic" { clock = bus, id = 0, bus = "apic" }
+  object ioapic "pc.ioapic" { id = 1, bus = "apic" }
+
+  # -- timers -----------------------------------------------------------------
+
+  object pit0 "pc.pit" { clock = pit }
+
+  # The HPET's three timers, wired to I/O APIC inputs 20, 21 and 22 — inputs
+  # with no ISA line behind them, which is what makes them available. Each
+  # `routeN` says which input its pin reaches, and that is what the timer's
+  # `Tn_INT_ROUTE_CAP` advertises to the guest: the property and the `wire`
+  # below are two halves of one fact and must agree.
+  object hpet0 "pc.hpet" {
+    clock  = hpet
+    period = 100000000
+    route0 = 20
+    route1 = 21
+    route2 = 22
+  }
+
+  # -- the rest of the board --------------------------------------------------
+
+  object cmos "pc.rtc" {
+    clock   = rtc
+    time    = time
+    basemem = basemem
+    extmem  = extmem
+  }
+
+  object kbc    "pc.kbc" { clock = kbd / 12000, port = keyboard }
+  object sysctl "pc.sysctl" {}
+
+  object bios "pc.rom" { image = "bios", size = biossize, align = "top" }
+
+  # -- the memory map ---------------------------------------------------------
+
+  map mem 0x00000000 size basemem  = ram_low
+  map mem biosbase   size biossize = bios
+  map mem 0x00100000 size extmem   = ram_high
+
+  # The three APIC-era register pages, at the addresses their specifications
+  # give as the reset default. None of them is relocatable here: moving the
+  # local APIC's page is `IA32_APIC_BASE`, and this build's x86 core has no
+  # `WRMSR` to write it with.
+  map mem 0xfec00000 size 0x0020   = ioapic.regs   # 82093AA §3.1
+  map mem 0xfed00000 size 0x0400   = hpet0.regs    # HPET spec §3.2.4
+  map mem 0xfee00000 size 0x1000   = lapic0.regs   # SDM Vol 3A §10.4.4
+
+  # The reset vector's copy of the ROM, at the top of the 32-bit space.
+  map mem 0x100000000 - biossize size biossize = bios
+
+  # -- the I/O map ------------------------------------------------------------
+
+  map port 0x0020 size 0x0002 = pic1.regs
+  map port 0x0040 size 0x0004 = pit0.regs
+  map port 0x0060 size 0x0001 = kbc.data
+  map port 0x0061 size 0x0001 = sysctl.portb
+  map port 0x0064 size 0x0001 = kbc.cmd
+  map port 0x0070 size 0x0002 = cmos.regs
+  map port 0x0092 size 0x0001 = sysctl.porta
+  map port 0x00a0 size 0x0002 = pic2.regs
+  map port 0x04d0 size 0x0001 = pic1.elcr
+  map port 0x04d1 size 0x0001 = pic2.elcr
+
+  # -- the wires --------------------------------------------------------------
+  #
+  # The one structural difference from `pc-at`: the master 8259A's INT output
+  # goes to the local APIC's **LINT0** pin rather than straight to the
+  # processor, and the local APIC drives the processor. That is "virtual wire
+  # mode" (SDM Vol 3A §10.5.1's ExtINT delivery, MP specification §3.6.2.1): the
+  # 8259A still supplies the vector, on the acknowledge cycle the local APIC
+  # forwards to it, so DOS keeps working while an SMP operating system has an
+  # APIC to program.
+  #
+  # It costs firmware one write. Out of reset the local APIC is
+  # software-disabled and every local vector table entry reads as masked
+  # (SDM §10.4.7.2), so nothing reaches the processor until firmware sets the
+  # spurious-interrupt vector register's enable bit and programs LINT0 for
+  # ExtINT. That is exactly what a real BIOS does on an APIC board, and a
+  # firmware that does not will find its timer interrupt going nowhere — which
+  # is the true behaviour of the hardware and not a modelling shortcut.
+  wire pic1.int    -> lapic0.lint0
+  wire lapic0.intr -> cpu0.intr
+  wire lapic0.nmi  -> cpu0.nmi
+  wire pic2.int    -> pic1.ir2
+
+  # Every legacy line lands twice: on the 8259A input it has always had, and on
+  # the I/O APIC input the MP specification assigns it. That is how the boards
+  # were actually built — the same pin goes to both parts — and it is what lets
+  # an operating system switch from one controller to the other at run time by
+  # masking the 8259A and unmasking the redirection entry.
+  #
+  # IRQ0 is the exception the MP specification calls out: the 8254's output
+  # reaches I/O APIC input **2**, not input 0, because input 0 is where an
+  # ExtINT entry for the whole 8259A cascade would go (MP spec §5.1).
+  wire pit0.out0   -> pic1.ir0
+  wire pit0.out0   -> ioapic.irq2
+  wire kbc.irq1    -> pic1.ir1
+  wire kbc.irq1    -> ioapic.irq1
+  wire cmos.irq    -> pic2.ir0
+  wire cmos.irq    -> ioapic.irq8
+  wire kbc.irq12   -> pic2.ir4
+  wire kbc.irq12   -> ioapic.irq12
+
+  # The HPET's three comparators, on the inputs its `routeN` properties
+  # advertise.
+  wire hpet0.t0    -> ioapic.irq20
+  wire hpet0.t1    -> ioapic.irq21
+  wire hpet0.t2    -> ioapic.irq22
+
+  # The timer's counter 2 and the board's port B, as on any PC.
+  wire sysctl.gate2 -> pit0.gate2
+  wire pit0.out2    -> sysctl.timer2
+  wire pit0.out1    -> sysctl.refresh
+
+  # A20 and reset each have two drivers, which is the wired-OR a net with two
+  # sources exists for (ROADMAP.md §4.3).
+  wire kbc.a20      -> cpu0.a20
+  wire sysctl.a20   -> cpu0.a20
+  wire kbc.reset    -> cpu0.reset
+  wire sysctl.reset -> cpu0.reset
+}

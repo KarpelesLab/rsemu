@@ -633,6 +633,31 @@ cpu-x86 = []
 # `no_std + alloc`, no dependencies.
 dev-pc = []
 
+# The PC's APIC pair (src/dev/pc/apic and src/dev/pc/ioapic): a **local APIC**
+# per processor -- the register page, the priority registers, the local vector
+# table, the end-of-interrupt, the spurious vector, the APIC timer in one-shot
+# and periodic modes with its divide configuration, and the interrupt command
+# register with `INIT` and Start-Up -- plus an **I/O APIC**, its index/data
+# register pair and its 24-entry redirection table with edge and level
+# triggering, masking and remote IRR. The two meet on a named APIC message bus,
+# which is also how one processor's interprocessor interrupt reaches another's.
+# This is what a firmware needs before it will report more than one processor,
+# and what phase 7's ">= 2 vCPUs" gate rests on. Written from Intel SDM Volume
+# 3A chapter 10, the 82093AA I/O APIC datasheet and the MultiProcessor
+# Specification, cited by section; no emulator source was consulted
+# (ROADMAP.md §1). Needs `dev-pc`.
+dev-pc-apic = ["dev-pc"]
+
+# The PC's high precision event timer (src/dev/pc/hpet): the capability and
+# configuration registers, a 64-bit main counter, and three comparators with
+# one-shot and periodic modes, level and edge interrupts, and the legacy
+# replacement route. The counter's femtosecond period is a declared property and
+# an exact integer -- the device counts its own clock domain's ticks and never
+# converts one to a second (CLAUDE.md, "no floats in the time path"). Written
+# from the Intel IA-PC HPET Specification rev 1.0a, cited by section. Needs
+# `dev-pc`.
+dev-pc-hpet = ["dev-pc"]
+
 # The PC's display side (src/dev/pc/video): an MC6845-derived CRTC, the
 # attribute-plus-character text buffer at 0xb8000, and the character generator
 # that turns the two into pixels on the `host::display` scanout seam — so a

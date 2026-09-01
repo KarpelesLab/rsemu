@@ -1,0 +1,344 @@
+//! Does an interrupt get from an HPET comparator, through an I/O APIC, through
+//! a local APIC and into a handler the guest wrote — and does the guest's
+//! end-of-interrupt let go of it?
+//!
+//! Every chip in this path has unit tests proving it works alone. This is the
+//! one that runs **real x86 instructions**: the firmware image below is
+//! hand-assembled machine code that enters protected mode, builds an interrupt
+//! descriptor table, programs the I/O APIC's redirection entry, software-enables
+//! the local APIC, arms an HPET comparator, sets `IF`, and spins. Everything
+//! after that is the board doing its job.
+//!
+//! That is the standard the rest of this session's devices have been held to —
+//! a real driver through real registers — and it is worth the hand assembly,
+//! because the failure modes it catches are exactly the ones an isolated device
+//! test cannot see: an address that decodes somewhere else, a wire connected to
+//! the wrong pin, a vector that never reaches the processor because a mask bit
+//! was still set.
+//!
+//! # The program
+//!
+//! `machines/pc-apic.machine` puts a 128 KiB ROM socket at `0xe0000` and a
+//! second copy of it at the top of the 32-bit space, so the reset vector at
+//! `0xfffffff0` finds the same image. The layout below is written out once, as
+//! constants, and every jump target is computed from them.
+
+#![cfg(all(
+    feature = "cpu-x86",
+    feature = "dev-pc",
+    feature = "dev-pc-apic",
+    feature = "dev-pc-hpet"
+))]
+
+use rsemu::core::clock::GlobalTime;
+use rsemu::core::device::ResetKind;
+use rsemu::core::space::MemAttrs;
+use rsemu::core::value::Width;
+use rsemu::machine::{Machine, build};
+
+/// The board this file exercises.
+const PC_APIC: &str = include_str!("../machines/pc-apic.machine");
+
+/// The ROM socket's size, which the machine file also declares.
+const ROM_LEN: usize = 128 * 1024;
+
+/// Where the segment `0xf000` starts inside the image: the socket is based at
+/// `0xe0000`, so `0xf0000` is 64 KiB in.
+const SEG_F000: usize = 0x1_0000;
+
+/// The reset vector, sixteen bytes below the top of the socket.
+const RESET_VECTOR: usize = ROM_LEN - 0x10;
+
+// Offsets within segment 0xf000. Linear addresses are `0xf0000 + off`.
+const OFF_ENTRY: usize = 0x0000;
+const OFF_GDT: usize = 0x0100;
+const OFF_GDT_PTR: usize = 0x0120;
+const OFF_IDT_PTR: usize = 0x0128;
+const OFF_PM: usize = 0x0200;
+const OFF_HANDLER: usize = 0x0400;
+
+/// The linear address of an offset in segment 0xf000.
+const fn lin(off: usize) -> u32 {
+    0xf_0000 + off as u32
+}
+
+/// Where the guest puts its interrupt descriptor table, and where it counts.
+const IDT_BASE: u32 = 0x2000;
+const COUNTER: u32 = 0x3000;
+
+/// The vector the redirection entry carries.
+const VECTOR: u8 = 0x40;
+
+/// Which I/O APIC input the HPET's first comparator is wired to, per
+/// `machines/pc-apic.machine`.
+const HPET_INPUT: u8 = 20;
+
+/// How many HPET ticks pass before the comparator matches. At 100 ns a tick,
+/// 1000 of them is 100 microseconds.
+const HPET_DELAY: u32 = 1_000;
+
+/// Append a little-endian 32-bit word.
+fn dw(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+/// `mov dword [edi+disp32], imm32` — the form every register write below takes,
+/// because an APIC register file is further than a signed byte from its base.
+fn store_at(out: &mut Vec<u8>, disp: u32, value: u32) {
+    out.extend_from_slice(&[0xc7, 0x87]);
+    dw(out, disp);
+    dw(out, value);
+}
+
+/// The firmware image: real-mode entry, a GDT, protected-mode setup, the driver
+/// and its interrupt handler.
+fn firmware() -> Vec<u8> {
+    let mut rom = vec![0u8; ROM_LEN];
+
+    // -- the reset vector ---------------------------------------------------
+    //
+    // `jmp far 0xf000:0x0000`, which is how every PC firmware image begins: the
+    // far jump recomputes CS's base as `selector << 4` and drops the processor
+    // out of the top of the address space and into the first megabyte.
+    rom[RESET_VECTOR..RESET_VECTOR + 5].copy_from_slice(&[0xea, 0x00, 0x00, 0x00, 0xf0]);
+
+    // -- real mode: enter protected mode ------------------------------------
+    let mut entry: Vec<u8> = Vec::new();
+    entry.push(0xfa); // cli
+    entry.extend_from_slice(&[0xb8, 0x00, 0xf0]); // mov ax, 0xf000
+    entry.extend_from_slice(&[0x8e, 0xd8]); // mov ds, ax
+    // lgdt [0x0120]. No operand-size prefix: without one the base is loaded
+    // from 24 bits, and 0x000f0100 fits in 24.
+    entry.extend_from_slice(&[0x0f, 0x01, 0x16]);
+    entry.extend_from_slice(&(OFF_GDT_PTR as u16).to_le_bytes());
+    entry.extend_from_slice(&[0x0f, 0x20, 0xc0]); // mov eax, cr0
+    entry.extend_from_slice(&[0x0c, 0x01]); // or al, 1
+    entry.extend_from_slice(&[0x0f, 0x22, 0xc0]); // mov cr0, eax
+    // jmp far 0x08:pm — a 32-bit offset, so the operand-size prefix.
+    entry.extend_from_slice(&[0x66, 0xea]);
+    dw(&mut entry, lin(OFF_PM));
+    entry.extend_from_slice(&[0x08, 0x00]);
+    put(&mut rom, OFF_ENTRY, &entry);
+
+    // -- the descriptor tables ----------------------------------------------
+    let gdt: [u8; 24] = [
+        // The null descriptor.
+        0, 0, 0, 0, 0, 0, 0, 0, // A flat 4 GiB code segment, ring 0, 32-bit.
+        0xff, 0xff, 0, 0, 0, 0x9a, 0xcf, 0, // A flat 4 GiB data segment, ring 0.
+        0xff, 0xff, 0, 0, 0, 0x92, 0xcf, 0,
+    ];
+    put(&mut rom, OFF_GDT, &gdt);
+
+    let mut gdt_ptr = Vec::new();
+    gdt_ptr.extend_from_slice(&(gdt.len() as u16 - 1).to_le_bytes());
+    dw(&mut gdt_ptr, lin(OFF_GDT));
+    put(&mut rom, OFF_GDT_PTR, &gdt_ptr);
+
+    let mut idt_ptr = Vec::new();
+    idt_ptr.extend_from_slice(&0x07ffu16.to_le_bytes());
+    dw(&mut idt_ptr, IDT_BASE);
+    put(&mut rom, OFF_IDT_PTR, &idt_ptr);
+
+    // -- protected mode: the driver -----------------------------------------
+    let mut pm: Vec<u8> = Vec::new();
+    pm.extend_from_slice(&[0xb8, 0x10, 0x00, 0x00, 0x00]); // mov eax, 0x10
+    pm.extend_from_slice(&[0x8e, 0xd8]); // mov ds, ax
+    pm.extend_from_slice(&[0x8e, 0xc0]); // mov es, ax
+    pm.extend_from_slice(&[0x8e, 0xd0]); // mov ss, ax
+    pm.push(0xbc); // mov esp, 0xf000
+    dw(&mut pm, 0xf000);
+
+    // Build one interrupt gate, for `VECTOR`, at IDT_BASE + 8 * VECTOR. RAM
+    // comes out of a cold reset zeroed, so every other entry is a not-present
+    // gate already.
+    pm.push(0xbf); // mov edi, gate
+    dw(&mut pm, IDT_BASE + 8 * u32::from(VECTOR));
+    pm.push(0xb8); // mov eax, handler
+    dw(&mut pm, lin(OFF_HANDLER));
+    pm.extend_from_slice(&[0x66, 0x89, 0x07]); // mov [edi], ax
+    pm.extend_from_slice(&[0x66, 0xc7, 0x47, 0x02, 0x08, 0x00]); // mov word [edi+2], 8
+    pm.extend_from_slice(&[0xc6, 0x47, 0x04, 0x00]); // mov byte [edi+4], 0
+    pm.extend_from_slice(&[0xc6, 0x47, 0x05, 0x8e]); // mov byte [edi+5], 0x8e
+    pm.extend_from_slice(&[0xc1, 0xe8, 0x10]); // shr eax, 16
+    pm.extend_from_slice(&[0x66, 0x89, 0x47, 0x06]); // mov [edi+6], ax
+    pm.extend_from_slice(&[0x0f, 0x01, 0x1d]); // lidt [idt_ptr]
+    dw(&mut pm, lin(OFF_IDT_PTR));
+
+    // The I/O APIC. Two indirect writes per half: the index register, then the
+    // data window. The high half first, so the entry is never briefly unmasked
+    // with a destination nobody has written.
+    pm.push(0xbf); // mov edi, 0xfec00000
+    dw(&mut pm, 0xfec0_0000);
+    let index = 0x10 + 2 * u32::from(HPET_INPUT);
+    store_at(&mut pm, 0x00, index + 1);
+    store_at(&mut pm, 0x10, 0); // destination: APIC ID 0, physical
+    store_at(&mut pm, 0x00, index);
+    // Vector, level-triggered (bit 15), unmasked, fixed delivery to APIC 0.
+    store_at(&mut pm, 0x10, (1 << 15) | u32::from(VECTOR));
+
+    // The local APIC: software-enable it, with 0xff as the spurious vector.
+    // Nothing this part delivers reaches the processor until this is written
+    // (SDM Vol 3A 10.4.7.2).
+    pm.push(0xbf); // mov edi, 0xfee00000
+    dw(&mut pm, 0xfee0_0000);
+    store_at(&mut pm, 0xf0, 0x1ff);
+
+    // The HPET: comparator 0 level-triggered and enabled, matching 1000 ticks
+    // from now, and then the main counter started.
+    pm.push(0xbf); // mov edi, 0xfed00000
+    dw(&mut pm, 0xfed0_0000);
+    store_at(&mut pm, 0x100, 0b110); // Tn_INT_ENB_CNF | Tn_INT_TYPE_CNF
+    store_at(&mut pm, 0x104, 0);
+    store_at(&mut pm, 0x108, HPET_DELAY);
+    store_at(&mut pm, 0x10c, 0);
+    store_at(&mut pm, 0x010, 1); // ENABLE_CNF
+    store_at(&mut pm, 0x014, 0);
+
+    pm.push(0xfb); // sti
+    pm.extend_from_slice(&[0xeb, 0xfe]); // jmp $
+    put(&mut rom, OFF_PM, &pm);
+
+    // -- the interrupt handler ----------------------------------------------
+    //
+    // What a level-triggered driver has to do, in the order it has to do it:
+    // quiet the device first, then count, then end the interrupt. If the
+    // end-of-interrupt did not reach the I/O APIC's remote IRR, the line would
+    // never interrupt again; if the remote IRR were not held in the first
+    // place, this handler would be re-entered before it finished.
+    let mut handler: Vec<u8> = Vec::new();
+    handler.extend_from_slice(&[0xc7, 0x05]); // mov dword [0xfed00020], 1
+    dw(&mut handler, 0xfed0_0020);
+    dw(&mut handler, 1);
+    handler.extend_from_slice(&[0xff, 0x05]); // inc dword [COUNTER]
+    dw(&mut handler, COUNTER);
+    handler.extend_from_slice(&[0xc7, 0x05]); // mov dword [0xfee000b0], 0
+    dw(&mut handler, 0xfee0_00b0);
+    dw(&mut handler, 0);
+    handler.push(0xcf); // iret
+    put(&mut rom, OFF_HANDLER, &handler);
+
+    rom
+}
+
+/// Place `bytes` at `off` inside segment 0xf000.
+fn put(rom: &mut [u8], off: usize, bytes: &[u8]) {
+    let at = SEG_F000 + off;
+    rom[at..at + bytes.len()].copy_from_slice(bytes);
+}
+
+/// Build the board with that firmware in its socket.
+fn board() -> Machine {
+    let mut options = rsemu::machine::catalog::build_options().expect("this build's classes");
+    options.realize.media.insert("bios", firmware());
+    let registry = rsemu::machine::catalog::registry().expect("this build's registry");
+    match build("pc-apic.machine", PC_APIC, &registry, &options) {
+        Ok(m) => m,
+        Err(e) => panic!("the board does not realize: {e}"),
+    }
+}
+
+/// Read a 32-bit word of guest memory.
+fn peek32(m: &Machine, addr: u64) -> u32 {
+    m.space("mem")
+        .expect("the memory space")
+        .read(addr, Width::U32, MemAttrs::DEFAULT)
+        .expect("a mapped word") as u32
+}
+
+#[test]
+fn the_board_realizes_with_every_apic_page_where_its_specification_puts_it() {
+    let m = board();
+    assert_eq!(m.name(), "pc-apic");
+    let mem = m.space("mem").expect("the memory space");
+    // The I/O APIC's version register, reached the way a driver reaches it:
+    // write the index, read the window (82093AA 3.1).
+    mem.write(0xfec0_0000, Width::U32, 1, MemAttrs::DEFAULT)
+        .expect("the index register decodes at 0xfec00000");
+    let version = mem
+        .read(0xfec0_0010, Width::U32, MemAttrs::DEFAULT)
+        .expect("and the data window sixteen bytes above it");
+    assert_eq!(version & 0xff, 0x11, "an 82093AA");
+    assert_eq!((version >> 16) & 0xff, 23, "with twenty-four inputs");
+
+    // The local APIC's version register (SDM Vol 3A Table 10-1).
+    let version = mem
+        .read(0xfee0_0030, Width::U32, MemAttrs::DEFAULT)
+        .expect("the local APIC page decodes at 0xfee00000");
+    assert_eq!(version & 0xff, 0x14, "an integrated local APIC");
+
+    // The HPET's capability register, and the period the machine file declared.
+    let period = mem
+        .read(0xfed0_0004, Width::U32, MemAttrs::DEFAULT)
+        .expect("the HPET decodes at 0xfed00000");
+    assert_eq!(
+        period, 100_000_000,
+        "100 ns in femtoseconds, matching the 10 MHz oscillator the file declares"
+    );
+}
+
+#[test]
+fn a_guest_driver_programs_the_io_apic_takes_the_interrupt_and_ends_it() {
+    let mut m = board();
+    m.reset(ResetKind::Cold);
+    m.sweep();
+
+    // A hundred microseconds of HPET is where the comparator matches; five
+    // milliseconds is room for the processor to have got there and back.
+    m.run_for(GlobalTime::from_nanos(5_000_000))
+        .expect("the machine runs");
+
+    assert_eq!(
+        peek32(&m, u64::from(COUNTER)),
+        1,
+        "the handler ran exactly once: the comparator matched, the I/O APIC \
+         turned the line into a message, the local APIC offered the vector, \
+         and the processor took it"
+    );
+
+    // The redirection entry's remote IRR is clear, which is what the guest's
+    // end-of-interrupt bought: the I/O APIC was told the vector had been
+    // acknowledged and let go of the line.
+    let mem = m.space("mem").expect("the memory space");
+    let index = 0x10 + 2 * u32::from(HPET_INPUT);
+    mem.write(0xfec0_0000, Width::U32, u64::from(index), MemAttrs::DEFAULT)
+        .expect("the index register");
+    let entry = mem
+        .read(0xfec0_0010, Width::U32, MemAttrs::DEFAULT)
+        .expect("the data window") as u32;
+    assert_eq!(
+        entry & 0xff,
+        u32::from(VECTOR),
+        "the vector the guest wrote"
+    );
+    assert_eq!(entry & (1 << 14), 0, "and remote IRR is clear again");
+    assert_eq!(entry & (1 << 16), 0, "with the entry still unmasked");
+
+    // And the local APIC has nothing in service, because the guest ended it.
+    let isr = mem
+        .read(
+            0xfee0_0100 + 0x10 * u64::from(VECTOR >> 5),
+            Width::U32,
+            MemAttrs::DEFAULT,
+        )
+        .expect("the in-service register");
+    assert_eq!(isr, 0);
+}
+
+#[test]
+fn the_same_run_twice_lands_in_the_same_place() {
+    // Determinism, on the path that matters here: the interrupt is delivered on
+    // a tick the scheduler chose from the HPET's own arithmetic, so two runs of
+    // the same board agree exactly.
+    let counts: Vec<u32> = (0..2)
+        .map(|_| {
+            let mut m = board();
+            m.reset(ResetKind::Cold);
+            m.sweep();
+            m.run_for(GlobalTime::from_nanos(5_000_000))
+                .expect("the machine runs");
+            peek32(&m, u64::from(COUNTER))
+        })
+        .collect();
+    assert_eq!(counts[0], counts[1]);
+    assert_eq!(counts[0], 1);
+}
