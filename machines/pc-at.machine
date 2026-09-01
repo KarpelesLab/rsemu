@@ -185,6 +185,51 @@ machine "pc-at" {
   object ram_low  "ram" { size = basemem }
   object ram_high "ram" { size = extmem }
 
+  # -- the host bridge, and the RAM that shadows the ROM ----------------------
+  #
+  # An Intel 82441FX (PMC), the north bridge of the 440FX PCIset. That is a 1996
+  # Pentium Pro part on a board called `pc-at`, and the reason is the same one
+  # that made this board's processor a 486 (see the CPU above): `pc-at` names
+  # the AT's *lineage* — its port map, its two cascaded 8259As, its 8042, its
+  # CMOS layout — and not a 1984 parts list. A firmware written this century
+  # will not get past its own initialisation on a board with no host bridge, and
+  # it says so out loud: "Unable to unlock ram - bridge not found", and then it
+  # sizes RAM, stores the answer in a variable in its own f-segment, and reads
+  # back zero because that segment is a ROM socket.
+  #
+  # Unlocking that segment is the PMC's **PAM** registers, at configuration
+  # offsets 0x59-0x5f: thirteen windows across 0xc0000-0xfffff, each with a read
+  # enable and a write enable, choosing per window and per direction between the
+  # ROM on the expansion bus and 256 KiB of main memory (Intel 82441FX
+  # datasheet, order 290549-001, §3.2.18). `src/dev/pc/pmc.rs` quotes the
+  # section.
+  #
+  # That 256 KiB belongs to *this* object rather than being a third `ram` object
+  # because the PMC is the DRAM controller as well as the bridge — that is what
+  # the two halves of its name mean — and because a machine file cannot hand one
+  # device a reference to another's store (`docs/platforms/pc-at.md`, "framework
+  # gaps"). `space = mem` is how it is told which decode it governs.
+  #
+  # A 440FX is a PCI chipset, so this also brings the 0xcf8/0xcfc configuration
+  # window with it. The bus it is the root of is empty: no slots, no south
+  # bridge, no video. Firmware finds a host bridge, finds nothing else, and says
+  # so — which is the correct answer for this board and a better one than the
+  # master abort at 0xcf8 it used to get.
+  #
+  # `passthrough = sysctl` is the awkward part of this board, and it is a real
+  # chipset fact rather than a modelling wrinkle. `CONFADD` is four bytes at
+  # 0xcf8 that the *north* bridge claims only for a Dword access, while the byte
+  # at 0xcf9 — the reset control register — belongs to the *south* bridge and is
+  # claimed only by a byte access. Two chips, one address, told apart by the
+  # byte enables. An rsemu address space decodes by address alone, so the chip
+  # that needs all four bytes holds them and hands the narrow cycles on, which
+  # is 82441FX §3.1.1's own word for it: a byte or word reference "passes
+  # through the Configuration Address Register to the PCI Bus" — and the south
+  # bridge is on that bus. `pc.sysctl` publishes those four bytes as it decodes
+  # them, this names it as the source, and 0xcf9 is therefore *not* mapped
+  # separately below.
+  object pmc "pc.pmc" { space = mem, bus = "pci0", passthrough = sysctl }
+
   # -- interrupts -------------------------------------------------------------
   #
   # Two 8259As. The slave's INT output drives the master's IR2, which is what
@@ -366,10 +411,18 @@ machine "pc-at" {
   map port 0x04d0 size 0x0001 = pic1.elcr      # edge/level control, master
   map port 0x04d1 size 0x0001 = pic2.elcr      # edge/level control, slave
 
-  # The chipset's own reset control register, and the third way to reboot a PC.
-  # Firmware writes 0x02 then 0x06 here — the reset happens on bit 2's rising
-  # edge — and it is the fastest of the three, which is why it exists at all.
-  map port 0x0cf9 size 0x0001 = sysctl.resetctl
+  # PCI configuration, mechanism #1: the address latch at 0xcf8 and the data
+  # window at 0xcfc, one eight-byte decode because that is one decode on the
+  # board (82441FX §3.1.1, §3.1.2).
+  #
+  # This window swallows 0xcf9, the chipset's reset control register and the
+  # third way to reboot a PC — firmware writes 0x02 then 0x06 there and the
+  # reset happens on bit 2's rising edge. It still works: the bridge hands that
+  # byte to `sysctl` through the `passthrough` link above, which is what a real
+  # north bridge does with a cycle it does not claim. Mapping `sysctl.resetctl`
+  # here as well would put two devices at one address, and the flattener would
+  # split every Dword write to 0xcf8 into three pieces around it.
+  map port 0x0cf8 size 0x0008 = pmc.config
 
   # -- the wires --------------------------------------------------------------
   #

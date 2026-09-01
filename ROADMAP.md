@@ -64,9 +64,13 @@ something a person can actually run (§2).
 > and reads and writes it. And **EDK2 all the way to a UEFI shell prompt**, out
 > of two CFI NOR flash banks the board maps and the generated tree describes. The variable store is real flash, so a variable written in one run
 > is there in the next. Where each stops is written down, not rounded up.
-> `pc-at` — a complete PC/AT chipset with a user-supplied BIOS path — is now
-> **in the catalog**: every CPU core in the tree is bindable from a `.machine`
-> file, so the asymmetry that held it out is gone.
+> `pc-at` — a complete PC/AT chipset with a user-supplied BIOS path — is in the
+> catalog, and now **runs a real PC firmware image through a whole POST and
+> into a boot sector**: it sizes 16 MiB of RAM, shadows itself out of ROM into
+> RAM through an 82441FX host bridge's PAM registers, enumerates PCI, builds an
+> e820 map, initialises the keyboard, reads a diskette through the µPD765 and
+> the 8237, and jumps to `0000:7c00`, where the sector runs. It finds no video,
+> and `docs/platforms/pc-at.md` says exactly why.
 >
 > That 141 is itself a finding. The conformance table described an *older* ROM
 > release: it listed three tests the pinned ROM never writes and omitted
