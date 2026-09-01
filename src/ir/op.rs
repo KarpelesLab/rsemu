@@ -42,6 +42,28 @@ impl Opcode {
     pub const DEPOSIT: Opcode = Opcode(0x06);
     /// Read a bitfield out of a value.
     pub const EXTRACT: Opcode = Opcode(0x07);
+    /// Read a piece of guest architectural state into a temporary.
+    ///
+    /// The slot number rides in [`Inst::aux`](crate::ir::Inst::aux).
+    ///
+    /// **Asymmetric on purpose: there is no `set_slot`.** A write to guest
+    /// state is a *rebinding* — the slot maps to a new temporary from that
+    /// point on, and the boundary marker records the mapping — which is what
+    /// lets a value stay in a host register across several guest instructions
+    /// instead of being stored and reloaded. Reads cannot work the same way,
+    /// because a block's first use of a register has to come from somewhere,
+    /// and `InsnStart::live` can only ever publish *outward*: the verifier
+    /// requires the temporaries it names to be assigned already.
+    ///
+    /// Both the first frontend and the first backend independently invented a
+    /// private convention for this before the op existed, which is the case
+    /// for it being an op.
+    ///
+    /// Ordering: a pass may delete a `get_slot` nothing consumes, but may not
+    /// move one across an [`Opcode::INSN_START`], which publishes live
+    /// temporaries back into guest state and can therefore change what a slot
+    /// holds.
+    pub const GET_SLOT: Opcode = Opcode(0x08);
 
     // ---- Arithmetic: 0x10..0x20 -------------------------------------------
 
@@ -228,6 +250,7 @@ impl Opcode {
             Opcode::BSWAP => "bswap",
             Opcode::DEPOSIT => "deposit",
             Opcode::EXTRACT => "extract",
+            Opcode::GET_SLOT => "get_slot",
             Opcode::ADD => "add",
             Opcode::SUB => "sub",
             Opcode::MUL => "mul",
@@ -324,6 +347,25 @@ impl fmt::Display for Opcode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
     }
+}
+
+/// Pack a bitfield position and length into an instruction's `aux`.
+///
+/// [`Opcode::DEPOSIT`] and [`Opcode::EXTRACT`] need two numbers and `Inst` has
+/// one `u32` to spare, so the two are packed. This lives here rather than in
+/// any one backend because a convention every backend must independently agree
+/// to is not a convention — it is a divergence waiting to happen.
+#[inline]
+#[must_use]
+pub const fn bitfield_aux(pos: u32, len: u32) -> u32 {
+    (pos & 0xffff) | ((len & 0xffff) << 16)
+}
+
+/// Unpack what [`bitfield_aux`] packed, as `(position, length)`.
+#[inline]
+#[must_use]
+pub const fn bitfield_parts(aux: u32) -> (u32, u32) {
+    (aux & 0xffff, (aux >> 16) & 0xffff)
 }
 
 /// A comparison, for [`Opcode::SETCOND`], [`Opcode::MOVCOND`] and

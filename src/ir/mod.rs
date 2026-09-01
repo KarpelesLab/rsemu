@@ -134,6 +134,29 @@
 //! | [`Opcode::MULHSU`] | RISC-V's `mulhsu` is signed-by-unsigned high multiply, which neither `mulu2` nor `muls2` expresses, and it appears in ordinary compiler output. |
 //! | [`Opcode::LD_EXCL`] / [`Opcode::ST_EXCL`] | `cmpxchg` cannot express a reservation that fails *because a trap happened in between*. RISC-V `LR`/`SC` and ARMv7-M `LDREX`/`STREX` both keep a monitor in CPU state that a trap or a foreign store breaks. |
 //!
+//! # Known gaps, recorded rather than discovered twice
+//!
+//! Found by building the first frontend and the first backend against this
+//! IR. None of them blocks the RV64I path; each is written down here so the
+//! next person meets a note instead of a surprise.
+//!
+//! * **`PHI` cannot be executed as defined.** Nothing in [`Inst`] records
+//!   which predecessor each operand arrived from. An edge encoding is owed
+//!   before superblocks land — §9's traces are what make `phi` necessary in
+//!   the first place, so the two arrive together.
+//! * **Atomics carry no [`MemOp`]**, so they take their width from the
+//!   instruction type and have no endianness or address space of their own.
+//!   Since the IR has no `i8`/`i16`, x86's `lock xadd byte` and ARM's
+//!   `LDREXB` are not expressible at all today.
+//! * **[`Opcode::BSWAP`]'s lane width has no field of its own** and is read
+//!   from the immediate.
+//! * **[`Opcode::MOVCOND`] accepts two shapes** — select on a one-bit value,
+//!   or compare a pair and select. Both are natural; the IR should pick one.
+//! * **Nothing checks that [`InsnStart::ticks`] agrees with the charges
+//!   before it.** Deliberate, because a helper may charge through the host and
+//!   legitimately break the equality — but it means the differential harness,
+//!   not the verifier, is what catches a frontend that miscounts.
+//!
 //! # What is deliberately not here yet
 //!
 //! Vector ops (`v128` exists as a [`Type`] so the IR can carry the values;
@@ -152,7 +175,10 @@ mod types;
 mod verify;
 
 pub use block::{Block, BlockBuilder, InsnStart, Inst, RegSlot};
-pub use interp::{Fault, Interp, IrHost, Outcome, bitfield_aux, bitfield_parts};
-pub use op::{AccessKind, Align, Cond, Endian, MemOp, MemSpace, Opcode, SegId, Sign};
+pub use interp::{Fault, Interp, IrHost, Outcome};
+pub use op::{
+    AccessKind, Align, Cond, Endian, MemOp, MemSpace, Opcode, SegId, Sign, bitfield_aux,
+    bitfield_parts,
+};
 pub use types::{Const, Temp, Type};
 pub use verify::verify;

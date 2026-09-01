@@ -53,14 +53,15 @@
 //! * **Where the bitfield ops keep their position and length.** An `Inst` has
 //!   one immediate and one `aux` word, and [`Opcode::DEPOSIT`] and
 //!   [`Opcode::EXTRACT`] need two numbers, so they are packed into `aux` by
-//!   [`bitfield_aux`]. A backend-local convention is not where this belongs;
+//!   [`bitfield_aux`](crate::ir::bitfield_aux). A backend-local convention is
+//!   not where this belongs;
 //!   it is recorded here until the first frontend says what it wants.
 
 use crate::core::error::{BusError, Error, Result};
 use crate::core::space::MemResult;
 use crate::core::value::Width;
 use crate::ir::block::{Block, InsnStart, Inst, RegSlot};
-use crate::ir::op::{AccessKind, Cond, MemOp, Opcode, Sign};
+use crate::ir::op::{AccessKind, Cond, MemOp, Opcode, Sign, bitfield_parts};
 use crate::ir::types::{Temp, Type};
 use alloc::format;
 use alloc::vec::Vec;
@@ -255,25 +256,6 @@ pub struct Fault {
     pub restartable: bool,
 }
 
-/// Pack a bitfield position and length into an instruction's `aux` word.
-///
-/// [`Opcode::DEPOSIT`] and [`Opcode::EXTRACT`] need two numbers and an
-/// instruction has one immediate, so both ride in `aux`: position in the low
-/// byte, length in the next. A width never exceeds 128, so a byte each is room
-/// to spare.
-#[inline]
-#[must_use]
-pub const fn bitfield_aux(pos: u32, len: u32) -> u32 {
-    ((len & 0xff) << 8) | (pos & 0xff)
-}
-
-/// Unpack `(position, length)` from an instruction's `aux` word.
-#[inline]
-#[must_use]
-pub const fn bitfield_parts(aux: u32) -> (u32, u32) {
-    (aux & 0xff, (aux >> 8) & 0xff)
-}
-
 /// The portable IR interpreter.
 ///
 /// Holds the temporary file across a run so a differential harness can compare
@@ -456,6 +438,14 @@ impl Interp {
                         return Err(ir_err(at, op, "a mov needs a source or an immediate"));
                     }
                 };
+                self.write(block, inst, value, at)?;
+            }
+            Opcode::GET_SLOT => {
+                // The slot rides in `aux`; the verifier has already rejected a
+                // slot read that carries operands.
+                // `set` canonicalises to the temporary's width, so a host
+                // that hands back a wider value cannot smuggle bits in.
+                let value = host.read_slot(RegSlot(inst.aux as u16));
                 self.write(block, inst, value, at)?;
             }
             Opcode::EXT_S => {
@@ -1019,6 +1009,7 @@ fn ir_err(at: usize, op: Opcode, what: &str) -> Error {
 mod tests {
     use super::*;
     use crate::ir::block::{BlockBuilder, InsnStart};
+    use crate::ir::op::bitfield_aux;
     use crate::ir::types::Const;
     use crate::ir::verify::verify;
     use alloc::collections::BTreeMap;

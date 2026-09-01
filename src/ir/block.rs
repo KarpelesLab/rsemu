@@ -277,6 +277,26 @@ impl BlockBuilder {
         self.block.insts[inst].mem = Some(mem);
     }
 
+    /// Read guest architectural state into a temporary.
+    ///
+    /// The counterpart to a write, which is not an op at all: a write rebinds
+    /// the slot to a new temporary and the next boundary records it. See
+    /// [`Opcode::GET_SLOT`].
+    pub fn get_slot(&mut self, ty: Type, slot: RegSlot) -> Temp {
+        let dst = self.temp(ty);
+        self.push(
+            Opcode::GET_SLOT,
+            ty,
+            Some(dst),
+            None,
+            &[],
+            None,
+            None,
+            u32::from(slot.0),
+        );
+        dst
+    }
+
     /// Charge guest ticks.
     ///
     /// Emitted where the interpreter charges, because the count is hashed

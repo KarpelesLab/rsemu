@@ -106,13 +106,9 @@
 //!
 //! * **A write is a rebinding.** Nothing is emitted: the slot simply maps to
 //!   the result temporary from here on, and the next boundary records it.
-//! * **A read is [`Opcode::MOV`] with neither a source nor an immediate** — a
-//!   copy whose origin is the architectural slot rather than another
-//!   temporary. It is always emitted immediately *before* a boundary whose
-//!   [`InsnStart::live`] pairs its destination with the slot, so which slot it
-//!   copies is never ambiguous. A slot absent from a boundary's map is not
-//!   dead: it means the slot's value is still in the CPU state and no
-//!   temporary shadows it.
+//! * **A read is [`Opcode::GET_SLOT`]**, naming its slot directly. A slot
+//!   absent from a boundary's map is not dead: it means the slot's value is
+//!   still in the CPU state and no temporary shadows it.
 //!
 //! `x0` is hard-wired zero, and both halves of that fold away here because the
 //! register number is a decode constant: a read of `x0` becomes a zero
@@ -684,9 +680,8 @@ impl<'a> Lifter<'a> {
     ///
     /// `x0` folds to a constant zero — the register number is a decode
     /// constant, so the hard-wired-zero rule costs nothing at run time. Any
-    /// other register that no temporary yet shadows is materialized with a
-    /// source-less, immediate-less [`Opcode::MOV`], which the following
-    /// boundary's [`InsnStart::live`] names (module docs).
+    /// other register that no temporary yet shadows is read with
+    /// [`Opcode::GET_SLOT`].
     fn read_x(&mut self, n: u32) -> Temp {
         if n == 0 {
             return self.zero();
@@ -694,7 +689,7 @@ impl<'a> Lifter<'a> {
         match self.x[n as usize] {
             Some(t) => t,
             None => {
-                let t = self.b.emit(Opcode::MOV, Type::I64, &[]);
+                let t = self.b.get_slot(Type::I64, RegSlot(n as u16));
                 self.x[n as usize] = Some(t);
                 t
             }
@@ -1154,6 +1149,82 @@ mod tests {
         block.marks().last().expect("a block has boundaries").ticks
     }
 
+    // -- end to end --------------------------------------------------------
+
+    /// A guest whose whole state is thirty-four slots and no memory.
+    ///
+    /// The point of this harness is that it knows nothing about RISC-V: the
+    /// slot numbering is the frontend's, and the backend treats it as opaque.
+    #[derive(Debug, Default)]
+    struct Slots {
+        state: alloc::collections::BTreeMap<u16, u128>,
+        ticks: u64,
+        boundaries: Vec<u64>,
+    }
+
+    impl crate::ir::IrHost for Slots {
+        fn read_slot(&mut self, slot: crate::ir::RegSlot) -> u128 {
+            self.state.get(&slot.0).copied().unwrap_or(0)
+        }
+
+        fn write_slot(&mut self, slot: crate::ir::RegSlot, value: u128) {
+            self.state.insert(slot.0, value);
+        }
+
+        fn load(
+            &mut self,
+            _mem: &crate::ir::MemOp,
+            _addr: u64,
+        ) -> crate::core::space::MemResult<u64> {
+            Err(crate::core::error::BusError::Unassigned)
+        }
+
+        fn store(
+            &mut self,
+            _mem: &crate::ir::MemOp,
+            _addr: u64,
+            _value: u64,
+        ) -> crate::core::space::MemResult {
+            Err(crate::core::error::BusError::Unassigned)
+        }
+
+        fn charge(&mut self, ticks: u64) {
+            self.ticks += ticks;
+        }
+
+        fn insn_start(&mut self, mark: &InsnStart) {
+            self.boundaries.push(mark.pc);
+        }
+    }
+
+    #[test]
+    fn a_lifted_block_verifies_and_then_runs_on_the_portable_backend() {
+        // The whole phase-5 path in one test: guest bytes in, IR out, the
+        // verifier accepts it, the backend executes it, and the answer is the
+        // one the guest's own semantics demand.
+        let l = rv64i(&[addi(5, 0, 7), addi(6, 5, 3), ECALL]);
+        assert_eq!(l.insns, 2);
+        verify(&l.block).expect("a lifted block must verify");
+
+        let mut host = Slots::default();
+        let outcome = crate::ir::Interp::new()
+            .run(&l.block, &mut host)
+            .expect("the block executes");
+        assert_eq!(outcome, crate::ir::Outcome::Exit);
+
+        // x5 = 0 + 7, x6 = x5 + 3. Published at the exit boundary, which is
+        // what makes a write a rebinding rather than a store.
+        assert_eq!(host.state.get(&5), Some(&7));
+        assert_eq!(host.state.get(&6), Some(&10));
+        // Two instructions, two halfword fetches each: the same four ticks the
+        // interpreter charges for the same two instructions.
+        assert_eq!(host.ticks, 4);
+        assert_eq!(
+            host.ticks,
+            interpreter_ticks(Config::rv64i(), &[addi(5, 0, 7), addi(6, 5, 3)], 2)
+        );
+    }
+
     // -- the subset --------------------------------------------------------
 
     #[test]
@@ -1166,7 +1237,7 @@ mod tests {
             // The read of x1 precedes the boundary, so the boundary's live map
             // can name it; the exit boundary's constant is the resume PC.
             vec![
-                "mov",        // x1 in
+                "get_slot",   // x1 in
                 "insn_start", //
                 "charge",     // two halfword fetches
                 "mov",        // the immediate

@@ -100,6 +100,17 @@ pub fn verify(block: &Block) -> Result<()> {
                     return Err(at("a charge needs a tick count"));
                 }
             }
+            // A slot read takes its slot from `aux` and nothing else: an
+            // operand would mean the slot were computed, and a slot is a
+            // decode constant on every frontend.
+            Opcode::GET_SLOT => {
+                if inst.dst.is_none() {
+                    return Err(at("a slot read must produce a value"));
+                }
+                if !block.srcs(i).is_empty() {
+                    return Err(at("a slot read takes its slot from aux, not an operand"));
+                }
+            }
             // The condition ops produce one bit, whatever they compared.
             Opcode::SETCOND => {
                 if inst.cond.is_none() {
