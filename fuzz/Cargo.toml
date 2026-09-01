@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-blk", "dev-ne2000", "dev-nvme", "ir", "jit", "cpu-riscv-lift", "float"]
+features         = ["std", "vnc", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-blk", "dev-ne2000", "dev-nvme", "ir", "jit", "cpu-riscv-lift", "float"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -182,6 +182,19 @@ bench = false
 [[bin]]
 name  = "jit_cache"
 path  = "fuzz_targets/jit_cache.rs"
+test  = false
+doc   = false
+bench = false
+
+# The one parser in the tree that decodes bytes from an unauthenticated stranger
+# on a TCP socket: RFB's client messages (RFC 6143 §7.5), two of which carry a
+# length the peer chooses and then index the buffer that length came out of.
+# The properties are framing exactness and prefix monotonicity -- a parser that
+# over-reports its own length desynchronises the stream and starts decoding key
+# events out of the middle of a clipboard.
+[[bin]]
+name  = "vnc_proto"
+path  = "fuzz_targets/vnc_proto.rs"
 test  = false
 doc   = false
 bench = false

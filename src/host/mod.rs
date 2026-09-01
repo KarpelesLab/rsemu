@@ -11,7 +11,11 @@
 //! | [`terminal`] | yes | that seam, driven by the process's own stdin and stdout |
 //! | [`display`] | no | the scanout seam: a guest surface, converted to host pixels |
 //! | [`audio`] | no | the audio seam: a guest's samples, converted and rate-matched |
+//! | [`input`] | no | the input seam: keys and pointer, at a virtual instant |
+//! | `clock` | yes | the host's monotonic clock, which only the rate controller reads |
+//! | `listen` | yes | where a remote frontend binds, and the loopback-by-default rule |
 //! | `gdb` | yes | the GDB remote serial protocol over TCP (§8) |
+//! | `vnc` | yes | the RFB protocol over TCP: a screen and a keyboard (§8) |
 //!
 //! # Why the trait is not itself `std`
 //!
@@ -25,6 +29,15 @@
 pub mod audio;
 pub mod chardev;
 pub mod display;
+pub mod input;
+
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+pub mod clock;
+
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+pub mod listen;
 
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
@@ -33,3 +46,7 @@ pub mod terminal;
 #[cfg(feature = "gdb")]
 #[cfg_attr(docsrs, doc(cfg(feature = "gdb")))]
 pub mod gdb;
+
+#[cfg(feature = "vnc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "vnc")))]
+pub mod vnc;

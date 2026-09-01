@@ -70,6 +70,17 @@ cli = ["std"]
 # external crates. Needs `std`, and a CPU feature to have anything to debug.
 gdb = ["std"]
 
+# The VNC server (src/host/vnc): the RFB protocol over TCP — the handshake, the
+# pixel-format negotiation, Raw-encoded framebuffer updates with row-band damage
+# tracking, the DesktopSize pseudo-encoding, and keyboard and pointer input fed
+# back through `host::input`. This is `ROADMAP.md` §8's "highest-value frontend"
+# and the reason is the dependency policy: a window needs a GUI toolkit and
+# every one of them is forbidden, whereas this needs a socket, a framebuffer and
+# a scan-code table. Implemented from RFC 6143 and nothing else; hand-rolled TCP
+# on `std::net`, no external crates, no thread per connection. Needs `std`, and
+# a display device to have anything to show.
+vnc = ["std"]
+
 # Headless capture in `host::display::png`: a scanout surface as a PNG, and a
 # sequence of them as an APNG. Adds `oxideav-png` (and, through it, `compcol`)
 # — the only dependency any feature of this crate pulls. Needs `std`.

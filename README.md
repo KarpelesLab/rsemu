@@ -169,12 +169,25 @@ by a **real `gdb` binary** in `tests/gdb_real_client.rs`, which attaches, reads
 registers, writes a program into guest RAM, sets a breakpoint, hits it and steps
 — and a **browser build** at <https://karpeleslab.github.io/rsemu/>.
 
+A machine is also **watchable over the network**. `rsemu run pc-at --vnc :5900`
+serves the display over RFB (RFC 6143) and takes keyboard and pointer events
+back from whoever connects; there is no GUI dependency because there is no GUI —
+a socket, a framebuffer and a scan-code table are the whole of it. Input crosses
+into the machine the way every non-deterministic input has to: collected from
+the socket whenever the human produced it, delivered at a virtual instant the
+scheduler chose, and recorded as `(instant, event)` — so `--record-input` and
+`--replay-input` reproduce a session bit for bit, which `tests/vnc_input.rs`
+asserts by comparing state hashes.
+
 There is **sound**, too. The audio seam mirrors the display one: a device emits
 what the silicon does — the RP2A03 emits an unsigned level out of a non-linear
 DAC pair at 894 886.36… Hz — and the host applies the board's own RC network,
 resamples with an exact integer phase, and either writes a `.wav`
 (`rsemu run nes-ntsc --cart game.nes --for 5s --record-audio game.wav`) or hands
-it to WebAudio in the browser. Every float in that path is an amplitude, never a
+it to WebAudio in the browser. A headless capture is bounded by what the
+device's ring can hold, because a headless run visits the host only once; a
+`--vnc` session drains that ring every frame and so records a run of any
+length. Every float in that path is an amplitude, never a
 duration, so a machine's state hash does not depend on whether anybody is
 listening. There is no native sound-card backend for the same reason there is no
 native window: ALSA is an `ioctl` protocol and the alternative to `libc` is a
