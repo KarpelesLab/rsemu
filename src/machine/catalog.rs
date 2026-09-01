@@ -304,6 +304,24 @@ pub static NE2K_MINI: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/ne2k-mini.machine"),
 };
 
+/// A minimal PCI board with an NVM Express controller on it, when this build
+/// has one.
+///
+/// A synthetic board rather than a product: RAM, a host bridge for the
+/// configuration ports, an 8259A for the completion interrupt, and the
+/// controller. It exists so that `nvme.controller` has somewhere a driver can
+/// reach it the way a driver does — through configuration cycles, a base
+/// address register it places itself, and queues in the board's own RAM. The
+/// `nvme0` slot takes the namespace's contents.
+#[cfg(feature = "machine-nvme-mini")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-nvme-mini")))]
+pub static NVME_MINI: CatalogEntry = CatalogEntry {
+    name: "nvme-mini",
+    summary: "a minimal PCI board with an NVM Express controller: RAM, a host bridge, an 8259A",
+    media: &["nvme0"],
+    source: include_str!("../../machines/nvme-mini.machine"),
+};
+
 /// A minimal MC68000 board, when this build has a 68000.
 ///
 /// A synthetic board rather than a product: a big-endian 24-bit space, ROM at
@@ -358,6 +376,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&MIPS_MINI);
     #[cfg(feature = "machine-ne2k-mini")]
     out.push(&NE2K_MINI);
+    #[cfg(feature = "machine-nvme-mini")]
+    out.push(&NVME_MINI);
     #[cfg(feature = "machine-pc-at")]
     out.push(&PC_AT);
     #[cfg(feature = "machine-nes")]
@@ -442,6 +462,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::wdc::register(&mut reg)?;
     #[cfg(feature = "dev-ne2000")]
     crate::dev::net::ne2000::register(&mut reg)?;
+    #[cfg(feature = "dev-nvme")]
+    crate::dev::nvme::register(&mut reg)?;
     #[cfg(feature = "cpu-x86")]
     crate::cpu::x86::register(&mut reg)?;
     #[cfg(feature = "dev-pc")]
@@ -537,6 +559,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::wdc::bind(&mut b)?;
     #[cfg(feature = "dev-ne2000")]
     crate::dev::net::ne2000::bind(&mut b)?;
+    #[cfg(feature = "dev-nvme")]
+    crate::dev::nvme::bind(&mut b)?;
     #[cfg(feature = "cpu-x86")]
     crate::cpu::x86::bind(&mut b)?;
     #[cfg(feature = "dev-pc")]
@@ -611,6 +635,8 @@ pub fn classes() -> ClassTable {
     table.insert(crate::cpu::z80::schema());
     #[cfg(feature = "dev-ne2000")]
     table.insert(crate::dev::net::ne2000::schema());
+    #[cfg(feature = "dev-nvme")]
+    table.insert(crate::dev::nvme::schema());
     #[cfg(feature = "cpu-m68k")]
     table.insert(crate::cpu::m68k::schema());
     #[cfg(feature = "cpu-mips")]
@@ -1365,6 +1391,11 @@ mod tests {
             // NE2000 lives in `tests/ne2000_board.rs`.
             #[cfg(feature = "machine-ne2k-mini")]
             ("ne2k-mini", "firmware") => &[0x18, 0xfe],
+            // No default namespace contents, which leaves the `disk` size in
+            // the machine file to supply a blank one — a board with an
+            // unwritten drive in it, exactly as `riscv-virt` gets.
+            #[cfg(feature = "machine-nvme-mini")]
+            ("nvme-mini", "nvme0") => &[],
             // The two longwords a 68000 fetches out of reset — a stack pointer
             // at the top of the board's RAM and a program counter at $000008 —
             // followed by `BRA .-0`, the two-byte branch to itself. Everything

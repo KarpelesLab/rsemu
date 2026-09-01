@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-blk", "dev-ne2000", "ir", "jit", "cpu-riscv-lift", "float"]
+features         = ["std", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-blk", "dev-ne2000", "dev-nvme", "ir", "jit", "cpu-riscv-lift", "float"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -107,6 +107,20 @@ bench = false
 [[bin]]
 name  = "ne2000_ports"
 path  = "fuzz_targets/ne2000_ports.rs"
+test  = false
+doc   = false
+bench = false
+
+# The third bus master in the tree, and the one whose structures are richest:
+# a doorbell write makes the controller fetch a 64-byte command, walk a PRP
+# chain whose last entry may point at another chain, move data, and write a
+# completion back -- every pointer of it out of guest memory. Its register block
+# is also mapped in the space it masters, so the fuzzer can aim a transfer at
+# the controller's own doorbells and re-enter the write handler from inside
+# itself; a stack overflow here would say the engine was recursive.
+[[bin]]
+name  = "nvme_mmio"
+path  = "fuzz_targets/nvme_mmio.rs"
 test  = false
 doc   = false
 bench = false

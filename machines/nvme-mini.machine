@@ -1,0 +1,124 @@
+# nvme-mini — the smallest board a real NVMe driver can run against.
+#
+#   rsemu run nvme-mini --drive nvme0=disk.qcow2
+#
+# RAM, a PCI host bridge, an 8259A, and an **NVM Express controller** on the
+# bus. It models no product. It exists so that `nvme.controller` has somewhere
+# a driver can reach it the way a driver actually does — enumerate the bus
+# through `0xcf8`/`0xcfc`, size the base address register, place the register
+# block, build queues in this board's own RAM, ring a doorbell, and take the
+# completion interrupt off a real wire into a real interrupt controller.
+#
+# ---------------------------------------------------------------------------
+# Why this board is not `pc-at`
+# ---------------------------------------------------------------------------
+#
+# It could have been: `pc-at` has all four of these chips and a processor as
+# well. This is deliberately the *minimum* around the device under test, for
+# the reason `ne2k-mini` and `spi-flash` exist — a failure on a board with four
+# objects on it is a failure in the device, and a failure on a board with
+# twenty is a bisection. The two boards share every class, so a controller that
+# works here drops into a PC unchanged.
+#
+# ---------------------------------------------------------------------------
+# What is deliberately missing
+# ---------------------------------------------------------------------------
+#
+# **A processor.** Every register this board has is reached through an address
+# space, and a test or a monitor drives those directly — which is what
+# `tests/nvme_board.rs` does, and it is exactly the shape `tests/pc_at_ide.rs`
+# uses for a disk on the AT. Adding a core would mean shipping firmware for it
+# and would prove nothing more about the controller. `pc-at` is where a guest
+# executes.
+#
+# ---------------------------------------------------------------------------
+# The interrupt
+# ---------------------------------------------------------------------------
+#
+# `nvme.irq -> pic.ir5`, and NVMe's `INTx#` is **level triggered** (NVMe 1.4
+# §7.5.1.1): the controller holds the line down while a completion queue holds
+# an entry the host has not acknowledged, and releases it when the host's
+# completion queue head doorbell catches up. So a driver must put IR5 into
+# level mode through the edge/level control register at `0x4d0` — an
+# edge-triggered input would latch one interrupt and then miss every later one
+# that arrived while the line was already low, which is the classic shared-PCI
+# interrupt bug and is worth being able to reproduce on a board this small.
+
+machine "nvme-mini" {
+  # How much RAM, at zero. The queues, the PRP lists and the data buffers all
+  # live in it.
+  param ram = 16M
+
+  # How big the namespace is when the run does not supply an image. A medium
+  # installed under the `nvme0` slot (`--drive nvme0=disk.img`) wins over this
+  # and brings its own capacity.
+  param disk = 2M
+
+  # Bytes in a logical block. 512 is what every driver assumes without asking;
+  # 4096 is what a modern part reports, and this board can be either.
+  param block = 512
+
+  # -- the crystal -----------------------------------------------------------
+  #
+  # One oscillator, so every ratio on this board is exact (ROADMAP.md §4.2).
+  # Nothing here counts it yet: the controller completes a command inside the
+  # doorbell write that submitted it, and when it grows a service latency the
+  # domain is already here to hang it on.
+  osc clk = 33333333 Hz
+
+  # -- the two spaces --------------------------------------------------------
+  #
+  # `read-as-ones` on both, which is what a PCI bus does with a master abort
+  # and what firmware relies on to discover an empty slot.
+  space mem  { width = 32, unassigned = read-as-ones }
+  space port { width = 16, unassigned = read-as-ones }
+
+  # -- memory ----------------------------------------------------------------
+  object dram "ram" { size = ram }
+
+  # -- the host bridge -------------------------------------------------------
+  #
+  # An 82441FX, here for one of its two jobs: `CONFADD`/`CONFDATA` at 0xcf8,
+  # which is how anything reaches configuration space on a machine with an I/O
+  # space. Its PAM shadow windows sit at 0xc0000-0xfffff and decode nothing
+  # until something programs them, which nothing on this board does.
+  object hb "pc.pmc" { space = mem, bus = "pci0" }
+
+  # -- the interrupt controller ----------------------------------------------
+  #
+  # A master 8259A with nothing cascaded onto it. Its `int` output is not
+  # wired: there is no processor to take it, and a test reads the request and
+  # in-service registers through `0x20` instead — which is what makes the
+  # acknowledgement visible rather than implied.
+  object pic "pc.pic" { mode = "master" }
+
+  # -- the controller --------------------------------------------------------
+  #
+  # `space = mem` because it is a **bus master**: its queues, its PRP lists and
+  # its data buffers are all in this board's RAM and it reads and writes them
+  # itself. That property is not decoration — without it the controller has
+  # nowhere to fetch a command from, and `bind` says so.
+  object nvme "nvme.controller" {
+    space  = mem
+    bus    = "pci0"
+    device = 4
+    image  = "nvme0"
+    size   = disk
+    block  = block
+  }
+
+  # -- the memory map --------------------------------------------------------
+  #
+  # RAM, and nothing else: the controller's register block is placed by its
+  # base address register, wherever the driver decides to put it. That is the
+  # whole point of a BAR and is why this board does not name an address for it.
+  map mem 0x00000000 size ram = dram
+
+  # -- the I/O map -----------------------------------------------------------
+  map port 0x0020 size 0x0002 = pic.regs   # the 8259A
+  map port 0x04d0 size 0x0001 = pic.elcr   # edge/level control
+  map port 0x0cf8 size 0x0008 = hb.config  # PCI configuration mechanism #1
+
+  # -- the wire --------------------------------------------------------------
+  wire nvme.irq -> pic.ir5
+}
