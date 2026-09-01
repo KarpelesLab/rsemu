@@ -193,11 +193,21 @@ pub trait PciFunction: fmt::Debug + Send + Sync {
 
 /// A PCI fabric: which function answers at which address.
 ///
-/// The lock is at [`LockRank::BUS`], which is what makes the ordering work: a
-/// configuration write may reach a device that retopologises, and `TOPOLOGY`
-/// sits above `BUS`. So the routing table is *read and released* before the
-/// function is called — never held across the call — which is the re-entrancy
-/// contract written as code.
+/// The routing table is *read and released* before the function is called —
+/// never held across the call — which is the re-entrancy contract written as
+/// code: a configuration write may reach a device that retopologises, and
+/// `TOPOLOGY` sits above everything here.
+///
+/// The lock is at [`LockRank::DEVICE`], **not** [`LockRank::BUS`], and the
+/// difference is not cosmetic. `space.rs` states the invariant this obeys: *"A
+/// CPU holds a `BUS`-ranked lock across the accesses it issues."* Every
+/// configuration cycle arrives from inside one — a guest `IN` on `0xcfc`
+/// reaches [`ConfigPorts`] through the address space with the core's execution
+/// mutex ([`LockRank::BUS`]) already held — so a `BUS`-ranked table here is
+/// unlockable by construction, and panics with `acquiring BUS while holding
+/// BUS` the first time real firmware enumerates the bus. `DEVICE` sits below
+/// `BUS` and above the `LEAF` locks each function holds, so the ladder runs the
+/// one direction calls travel.
 pub struct PciBus {
     functions: Mutex<BTreeMap<Bdf, Arc<dyn PciFunction>>>,
 }
@@ -224,7 +234,7 @@ impl PciBus {
     #[must_use]
     pub fn new() -> PciBus {
         PciBus {
-            functions: Mutex::with_rank(LockRank::BUS, BTreeMap::new()),
+            functions: Mutex::with_rank(LockRank::DEVICE, BTreeMap::new()),
         }
     }
 

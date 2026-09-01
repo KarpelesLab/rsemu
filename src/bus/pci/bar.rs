@@ -322,8 +322,9 @@ struct Placed {
 /// they move.
 ///
 /// Held by a [`PciFunction`](super::PciFunction) beside its
-/// [`ConfigSpace`](super::ConfigSpace): [`owns`](Bars::owns) says which
-/// configuration offsets belong here, and everything else is the function's.
+/// [`ConfigSpace`](super::ConfigSpace): [`config_read`](Bars::config_read) and
+/// [`config_write`](Bars::config_write) claim the offsets that belong here, and
+/// everything else is the function's.
 ///
 /// # Locks
 ///

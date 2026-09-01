@@ -2731,13 +2731,22 @@ impl Device for X86 {
         let nmi_latch = r.read_bool()?;
         let vector = r.read_u8()?;
         let a20 = r.read_bool()?;
-        // The long-mode block, in the order `save` wrote it. These overwrite
-        // the low halves the gdb prefix restored, which is why they come
-        // after rather than instead: the prefix has to stay where a debugger
-        // expects it, and the full width has to win.
+        // The long-mode block, in the order `save` wrote it. Every register
+        // here was already written once, as a `u32`, in the prefix gdb's i386
+        // layout reads — so this block contributes the **upper** half only and
+        // takes its low half from what the prefix restored.
+        //
+        // Letting the full 64-bit value win instead would be correct for a
+        // plain save/load round trip, where the two copies agree by
+        // construction, and silently wrong for any editor of the prefix: a
+        // debugger writing `ebx` through a `P` packet edits the `u32` copy,
+        // and a wide block that overwrote it would discard the write and read
+        // back the old value. That is exactly what
+        // `a_real_gdb_debugs_a_guest_end_to_end` caught.
         for reg in Reg::WIDE {
-            let value = r.read_u64()?;
-            reg.set(&mut state.regs, value);
+            let wide = r.read_u64()?;
+            let low = reg.get(&state.regs) & 0xffff_ffff;
+            reg.set(&mut state.regs, (wide & !0xffff_ffff) | low);
         }
         state.sys.cr4 = r.read_u64()?;
         state.sys.efer = r.read_u64()?;
