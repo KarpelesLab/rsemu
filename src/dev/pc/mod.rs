@@ -77,6 +77,18 @@ pub mod rom;
 pub mod rtc;
 pub mod sysctl;
 
+#[cfg(feature = "dev-pc-apic")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-apic")))]
+pub mod apic;
+
+#[cfg(feature = "dev-pc-apic")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-apic")))]
+pub mod ioapic;
+
+#[cfg(feature = "dev-pc-hpet")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-hpet")))]
+pub mod hpet;
+
 #[cfg(feature = "dev-pc-pci")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-pci")))]
 pub mod pmc;
@@ -149,6 +161,13 @@ pub fn register(reg: &mut Registry) -> Result<()> {
     rom::register(reg)?;
     rtc::register(reg)?;
     sysctl::register(reg)?;
+    #[cfg(feature = "dev-pc-apic")]
+    {
+        apic::register(reg)?;
+        ioapic::register(reg)?;
+    }
+    #[cfg(feature = "dev-pc-hpet")]
+    hpet::register(reg)?;
     #[cfg(feature = "dev-pc-pci")]
     pmc::register(reg)?;
     #[cfg(feature = "dev-pc-pci")]
@@ -175,6 +194,13 @@ pub fn bind(b: &mut Bindings) -> Result<()> {
     rom::bind(b)?;
     rtc::bind(b)?;
     sysctl::bind(b)?;
+    #[cfg(feature = "dev-pc-apic")]
+    {
+        apic::bind(b)?;
+        ioapic::bind(b)?;
+    }
+    #[cfg(feature = "dev-pc-hpet")]
+    hpet::bind(b)?;
     #[cfg(feature = "dev-pc-pci")]
     pmc::bind(b)?;
     #[cfg(feature = "dev-pc-pci")]
@@ -201,6 +227,13 @@ pub fn schemas() -> Vec<ClassSchema> {
         rtc::schema(),
         sysctl::schema(),
     ];
+    #[cfg(feature = "dev-pc-apic")]
+    {
+        out.push(apic::schema());
+        out.push(ioapic::schema());
+    }
+    #[cfg(feature = "dev-pc-hpet")]
+    out.push(hpet::schema());
     #[cfg(feature = "dev-pc-pci")]
     out.push(pmc::schema());
     #[cfg(feature = "dev-pc-pci")]

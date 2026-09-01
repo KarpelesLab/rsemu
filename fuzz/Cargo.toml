@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std", "vnc", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-blk", "dev-ne2000", "dev-nvme", "ir", "jit", "cpu-riscv-lift", "float"]
+features         = ["std", "vnc", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-blk", "dev-ne2000", "dev-nvme", "dev-pc-apic", "dev-pc-hpet", "ir", "jit", "cpu-riscv-lift", "float"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -152,6 +152,10 @@ bench = false
 [[bin]]
 name  = "blk_image"
 path  = "fuzz_targets/blk_image.rs"
+test  = false
+doc   = false
+bench = false
+
 # Soft float: the host FPU is an oracle only for nearest-even arithmetic with a
 # finite result, so this target checks those cases against it and everything
 # else -- the other four rounding attributes, the flags, NaN payloads and the
@@ -195,6 +199,19 @@ bench = false
 [[bin]]
 name  = "vnc_proto"
 path  = "fuzz_targets/vnc_proto.rs"
+test  = false
+doc   = false
+bench = false
+
+# The PC/AT interrupt path an SMP guest programs: a local APIC, an I/O APIC and
+# an HPET, wired to each other. Three MMIO surfaces (CLAUDE.md asks for one
+# target per surface) whose interesting failures are between them -- a pin
+# becomes a message, a message becomes a vector, and an end-of-interrupt travels
+# back -- plus two lazily advanced timers whose catch-up must terminate from any
+# register state a guest can write.
+[[bin]]
+name  = "pc_apic"
+path  = "fuzz_targets/pc_apic.rs"
 test  = false
 doc   = false
 bench = false
