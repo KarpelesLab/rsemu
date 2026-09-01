@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "ir"]
+features         = ["std", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "ir", "cpu-riscv-lift"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -101,6 +101,18 @@ bench = false
 [[bin]]
 name  = "ir_verify"
 path  = "fuzz_targets/ir_verify.rs"
+test  = false
+doc   = false
+bench = false
+
+# The other half of the IR's correctness, and the one verification cannot
+# reach: CLAUDE.md ("CPU cores") makes a frontend differentially tested against
+# its interpreter forever, so this runs one guest program through both and
+# compares registers, PC, ticks, memory and faults. The verifier proves a block
+# is well-formed; only this proves it means the same thing.
+[[bin]]
+name  = "riscv_lift"
+path  = "fuzz_targets/riscv_lift.rs"
 test  = false
 doc   = false
 bench = false

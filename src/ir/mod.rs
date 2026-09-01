@@ -155,7 +155,10 @@
 //! * **Nothing checks that [`InsnStart::ticks`] agrees with the charges
 //!   before it.** Deliberate, because a helper may charge through the host and
 //!   legitimately break the equality — but it means the differential harness,
-//!   not the verifier, is what catches a frontend that miscounts.
+//!   not the verifier, is what catches a frontend that miscounts. For the
+//!   first frontend that harness is
+//!   `cpu::riscv::differential`, which compares the column
+//!   against the ticks the interpreter charged on every case it runs.
 //!
 //! # What is deliberately not here yet
 //!

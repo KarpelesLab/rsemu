@@ -83,6 +83,9 @@ pub mod isa;
 // rather than riding on either (ROADMAP.md §9).
 #[cfg(feature = "cpu-riscv-lift")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-riscv-lift")))]
+pub mod differential;
+#[cfg(feature = "cpu-riscv-lift")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-riscv-lift")))]
 pub mod lift;
 
 pub mod mmu;
