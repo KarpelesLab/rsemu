@@ -1792,12 +1792,17 @@ span never had. The browser advances frame by frame; `rsemu run --for` advances
 one span; so today they diverge by construction.
 
 `tests/run_for_additive.rs` measures it rather than asserting it from theory,
-and the measurement is more specific than the argument: two pieces and ten
-pieces reach the *same* hash as each other, and a different one from the whole.
-So it is not that more boundaries drift further — **any** intermediate deadline
-differs from none, and past that the split shape stops mattering. Each split is
-also perfectly reproducible, so this is a boundary-placement effect and not a
-determinism failure.
+across every workload this build has. Each split is perfectly reproducible, so
+this is a boundary-placement effect and not a determinism failure.
+
+Whether the split *shape* matters turns out to be workload-dependent, and that
+correction is worth keeping: on `nes-ntsc`, `gameboy` and `apple1`, two pieces
+and ten reach the same hash as each other and a different one from the whole —
+so for those, *any* intermediate deadline differs from none and the shape stops
+mattering. An earlier version of this section stated that as a general property.
+It is false: on `riscv-virt`, two pieces and ten reach different hashes as well.
+Three workloads agreeing is not a law, and the test now iterates whatever the
+build has rather than a named list, precisely so a fourth can disagree.
 
 Two ways to make the claim true, and they are not equivalent: make `run_for`
 additive by making a truncated quantum indistinguishable from an untruncated

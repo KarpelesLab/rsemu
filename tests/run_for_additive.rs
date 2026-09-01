@@ -41,22 +41,29 @@ fn hash_after(name: &str, span_ns: u64, pieces: u32) -> Option<u64> {
 #[test]
 fn one_span_and_many_pieces_are_compared_honestly() {
     const SPAN: u64 = 100_000_000; // 100 ms
-    let mut checked = 0usize;
-    for name in ["nes-ntsc", "gameboy", "apple1"] {
-        // A build with no machine feature has nothing to compare. That is an
-        // ordinary narrow build, not a failure -- but a build that has one and
-        // silently checks nothing would be, which is what `checked` is for.
-        let Some(whole) = hash_after(name, SPAN, 1) else {
-            continue;
-        };
+
+    // Every workload this build has, rather than a named list. A hard-coded
+    // list silently stops covering the workload added after it was written —
+    // which is exactly what happened here: `riscv-virt` was missing, and the
+    // guard below caught it in the one feature set where it was the *only*
+    // workload.
+    let names: Vec<&'static str> = workload::all().into_iter().map(|w| w.name).collect();
+    if names.is_empty() {
+        eprintln!("no machine features enabled; nothing to compare");
+        return;
+    }
+
+    let mut non_additive = 0usize;
+    for name in &names {
+        let whole = hash_after(name, SPAN, 1).expect("a workload this build has");
         let halves = hash_after(name, SPAN, 2).expect("the same workload again");
         let tenths = hash_after(name, SPAN, 10).expect("the same workload again");
-        checked += 1;
         println!(
             "{name}: whole {whole:#018x}  halves {halves:#018x}  tenths {tenths:#018x}  \
              additive={}",
             whole == halves && whole == tenths
         );
+
         // Splitting the *same* way twice must agree. That is determinism, and
         // it is the part that must never regress.
         assert_eq!(
@@ -65,36 +72,34 @@ fn one_span_and_many_pieces_are_compared_honestly() {
             "{name}: the same split must be reproducible"
         );
 
-        // A characterisation of today's behaviour, not an endorsement of it.
-        // `run_for` is **not** additive: one span and a split span reach
-        // different states, because an intermediate deadline truncates a
-        // quantum and that is a scheduling boundary the single span never had.
-        //
-        // Note what the numbers say, though: two pieces and ten pieces agree
-        // with each other. It is not that more boundaries drift further — it
-        // is that *any* intermediate deadline differs from none, and past that
-        // the split shape stops mattering.
-        //
-        // **When this assertion starts failing, that is good news**: it means
-        // `run_for` became additive, and §11.6's promise that a browser session
-        // and a native session reach the same state hash became true rather
-        // than aspirational. Delete it and fix the roadmap.
-        assert_ne!(
-            whole, halves,
-            "{name}: run_for has become additive — see the note above"
-        );
-        assert_eq!(
-            halves, tenths,
-            "{name}: the split shape is not supposed to matter, only its existence"
-        );
+        // Whether the split *shape* matters is workload-dependent, and that is
+        // itself a finding. On `nes-ntsc`, `gameboy` and `apple1` two pieces
+        // and ten reach the same hash; on `riscv-virt` they do not. An earlier
+        // version of this file asserted they always agree, generalising from
+        // the three that did — so it is recorded here and not asserted.
+        if halves != tenths {
+            println!("  ({name}: the split shape matters here, not just its existence)");
+        }
+
+        if whole != halves {
+            non_additive += 1;
+        }
     }
 
-    if workload::all().is_empty() {
-        eprintln!("no machine features enabled; nothing to compare");
-    } else {
-        assert!(
-            checked > 0,
-            "this build has workloads but none of the named ones — the list above is stale"
-        );
-    }
+    // A characterisation of today's behaviour, not an endorsement of it.
+    // `run_for` is **not** additive: an intermediate deadline truncates a
+    // quantum, and that is a scheduling boundary the single span never had.
+    //
+    // **When this assertion starts failing, that is good news**: it means
+    // `run_for` became additive and §11.6's promise that a browser session and
+    // a native session reach the same state hash became true rather than
+    // aspirational. Delete it and fix the roadmap.
+    //
+    // Counted rather than asserted per workload, because a workload with
+    // nothing scheduled has no boundary to be moved and would be additive for
+    // an uninteresting reason.
+    assert!(
+        non_additive > 0,
+        "every workload is now additive — run_for may have been fixed; see the note above"
+    );
 }
