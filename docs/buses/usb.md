@@ -105,7 +105,8 @@ regress it.
 
 Four layers, in the order they matter — and the order matters because the whole
 value of the arrangement is that the *next* controller reuses the first one
-unchanged. That is no longer a hope: §4 is the controller that tested it.
+unchanged. That is no longer a hope: §4 is the controller that tested it, and
+§4.1 is the *direction* that tested it.
 
 ### 1. The fabric (`src/bus/usb/`, `bus-usb`)
 
@@ -243,9 +244,17 @@ end-to-end test polls. That gap is real and belongs to whoever wires the board.
 mode stops the host schedule so the controller does not quietly keep walking a
 schedule that no longer exists. The device-side queue-head list is never walked
 and `ENDPTSETUPSTAT`/`ENDPTPRIME`/`ENDPTFLUSH`/`ENDPTSTAT`/`ENDPTCOMPLETE`/
-`ENDPTCTRLn` read zero — a whole second controller, facing the other way, is not
-this piece of work. The firmware's `libusb_printer` role therefore does not
+`ENDPTCTRLn` read zero. The firmware's `libusb_printer` role therefore does not
 work, and would configure and then never see a transfer.
+
+That is now a gap with a shape rather than an open question: §4.1 built device
+mode for the dwc2 and the fabric carried it, so what is left here is this
+block's own device engine — a **dQH/dTD schedule walker in guest memory**, which
+is the ChipIdea device side's actual content and is nothing like dwc2's FIFO. It
+would use `UsbDevice` for everything and the new host-side composer for nothing,
+since it is a device. The honest obstacle is not the seam: it is that no public
+datasheet for the CX92755's device half is available to us, and the first-party
+reverse engineering above covers the host flow only.
 
 ### 4. A dwc2 (`src/dev/usb/dwc2.rs`, `dev-usb-dwc2`) — and what it proved
 
@@ -282,17 +291,6 @@ host channels, pushes setup packets into a FIFO window and reads the replies
 back out of `GRXSTSP` — and **enumerates a mouse and collects a report from its
 interrupt endpoint**, with the device descriptor landing in the buffer the guest
 named.
-
-#### Host mode, deliberately
-
-Same decision as ChipIdea's and for the same reason. `GUSBCFG.FDMOD` is honoured
-to the extent that selecting it stops the host side, `GINTSTS.CMOD` reports the
-change, reaching for the other role's registers raises `GINTSTS.MMIS` as the
-silicon does, and the device block at `+0x800` reads zero. What device mode would
-need is a `UsbDevice` implementation over `DIEPCTLn`/`DOEPCTLn` fed by the same
-FIFO — and, on the far side, a host to talk to it. The fabric would carry that
-unchanged, because a device is the thing it was designed around; what does not
-exist is anything to enumerate the guest.
 
 #### Speed, and why the honest answer is not EHCI's
 
@@ -367,6 +365,152 @@ several other SoCs that instantiate this core. ST's `GCCFG` and `CID` sit in the
 core's vendor slots at `+0x38` and `+0x3c` and are modelled as what they are
 there: a configuration register nothing gates on, and a user ID a board supplies.
 
+#### Dual role, and the direction that tested the fabric
+
+The block is dual-role and **so is this model**: `GUSBCFG.FDMOD` selects the
+device side, `GINTSTS.CMOD` reports which role is running, and reaching for the
+other role's registers raises `GINTSTS.MMIS` as the silicon does. Device mode —
+where the guest is the peripheral and somebody else enumerates it — is §4.1
+below, together with what it cost the fabric.
+
+### 4.1 Device mode: the guest *is* the peripheral
+
+Two controllers declined this in identical terms — *"a whole second controller
+facing the other way"* — and both were right to at the time. It is now built,
+for the dwc2, and the first thing to record is the answer to the question that
+made it worth doing.
+
+#### What drives a guest that is a device
+
+Nothing new. **Anything that calls `UsbBus::setup`/`read`/`write` is a host**,
+and there are now three kinds of caller, all of which were already possible:
+
+| Driver | What it is | Where |
+| --- | --- | --- |
+| Another controller on the same bus | a `usb.dwc2` in host mode, root port on the same named bus | `src/dev/usb/dwc2/device/tests.rs`, `a_dwc2_host_enumerates_a_dwc2_device_over_one_bus` |
+| A host-side transfer composer | `bus::usb::host::ControlTransfer` — no schedule, no clock | `tests/usb_dwc2_device.rs` |
+| A bridge to real hardware | a caller of the same two, over `usbfs` | not started |
+
+The loopback is the interesting one, because it is a *cable between two ports of
+one machine*: a host core and a device core on one `UsbBus`, the host walking
+`HCCHARn` and the device answering out of `DIEPCTLn`, and neither of them
+containing a line about the other.
+
+#### Did the fabric need changing? Almost not, and the "almost" is the finding
+
+`UsbDevice` was already the right seam and needed no new method for the data
+path. **`Function`/`Peripheral` is emphatically the wrong one**, and that is
+worth stating because it is the tempting answer: a `Peripheral` is `Endpoint0`
+wrapped around a `Function`, and `Endpoint0` answers the eleven standard
+requests of USB 2.0 §9.4 *inside the emulator*, out of a descriptor table the
+emulator holds. In device mode all of that is the guest firmware's — its
+descriptors, its `SET_ADDRESS`, its bugs. `Dwc2Gadget` therefore implements
+`UsbDevice` directly, which the trait's own documentation had anticipated:
+*"implemented by `Peripheral` for anything built the ordinary way, and directly
+by anything that genuinely is not, which so far is nothing."*
+
+Three things did move, and all three are additive:
+
+1. **`UsbDevice::start_of_frame`.** A `SOF` is the one thing on the wire that is
+   neither a transaction nor a reset: a token with no data phase and no
+   handshake, broadcast rather than addressed (USB 2.0 §8.4.3). A modelled
+   peripheral never needed it; a guest does, because `DSTS.FNSOF` is a register
+   its driver reads and `GINTSTS.SOF` is how a gadget paces an isochronous
+   endpoint. It is exactly the argument `bus_reset` already made — the *other*
+   non-transaction event — and it has a default that does nothing, so no
+   existing device model changed. `UsbBus::start_of_frame` broadcasts it to
+   every connected device, and the dwc2 host calls it at each frame boundary.
+2. **`bus::usb::host`.** Every previous caller of the transaction methods was a
+   controller with a schedule, so *which sequence of transactions a control
+   transfer is* lived in the controller — correctly. A test harness, a loopback
+   and a `usbfs` bridge have no schedule and would each have rewritten the three
+   stages of §8.5.3. `ControlTransfer` is those three stages written once, and
+   it deliberately **never waits**: one transaction per `step`, `Progress::Nak`
+   handed straight back, because on this side of the seam the device may be a
+   guest that has not run yet.
+3. **One sentence of `UsbDevice::speed`'s documentation.** It said a device's
+   speed is *"fixed for its lifetime: a device does not change speed, it is a
+   different device"*. That is true of a mouse and false of a gadget: a
+   dual-role core with a high-speed transceiver runs at full speed when its
+   firmware writes `DCFG.DSPD` saying so. The *code* needed nothing — the fabric
+   already asks afresh every time and caches nothing — so this is a comment fix,
+   which is the smallest possible kind of finding and is recorded because
+   "nothing changed" would have been the wrong summary.
+
+No new lock rank. The ladder holds unchanged because the re-entrancy contract
+was already being kept: a host controller releases its `HCD_RANK` lock before
+calling the fabric, and `UsbBus` releases `FABRIC_RANK` before calling the
+device, so the *device-side* controller takes `HCD_RANK` with no other
+`HCD_RANK` lock held — even when both ends are the same class on one bus, which
+is the case that would have caught it.
+
+#### Why dwc2 and not ChipIdea
+
+Three reasons, in order of weight. The register map is **documented**: RM0090
+§34.15.3 is free and complete, whereas the CX92755's device half has no public
+datasheet and the first-party reverse engineering above covers the host flow
+only — building it would have meant inventing a queue-head format. The **data
+path already exists**: a dwc2 gadget pushes and pops the same shared FIFO the
+host half already models, so device mode is a second register file over an
+existing engine, while ChipIdea's device side is a *second DMA schedule walker*
+over dQH/dTD lists in guest memory. And the **far end exists**: the dwc2 host
+half is in this tree, so a loopback proves the whole path with no new host.
+
+#### What it is, in registers
+
+`DCFG` (speed and the address the core answers to), `DCTL` (soft connect, global
+NAK), `DSTS` (enumerated speed, and the frame number of the last `SOF`),
+`DIEPCTLn`/`DOEPCTLn` with their `DIEPINTn`/`DOEPINTn` and
+`DIEPTSIZn`/`DOEPTSIZn`, `DTXFSTSn`, `DIEPTXFn`, and `DAINT`/`DAINTMSK` feeding
+`GINTSTS.IEPINT`/`OEPINT` the way `HAINT` feeds `GINTSTS.HCINT`. Setup packets
+arrive through the same `GRXSTSP` the host half receives on, announced with the
+device-mode `PKTSTS` codes (`0110b` setup data, `0100b` setup complete, `0010b`
+`OUT` data, `0011b` `OUT` complete). Endpoint count is a property — four on an
+OTG_FS — like the host's channel count.
+
+Two behaviours are worth singling out because they are the ones a half-built
+device controller gets wrong:
+
+- **`DCTL.SDIS` is the pull-up on D+**, and it resets *set*. So a board with this
+  class on it does not have a device on the bus until its firmware says so, and
+  clearing that bit is literally what calls `UsbBus::attach`. Setting it again,
+  or selecting host mode, or a core reset, is what calls `detach` — and a host
+  core on the same bus sees the port disable, which is tested.
+- **NAK is the whole synchronisation story.** A transaction arrives
+  synchronously and the guest is not running at that instant; an endpoint that
+  is not armed answers `NAK` and the host comes back. Nothing is queued, nothing
+  is deferred, and no callback exists. That is not a simplification — it is what
+  the `NAK` handshake is for (USB 2.0 §8.4.5).
+
+#### What device mode does not do, said plainly
+
+Back-to-back setup packets (`DOEPINT.B2BSTUP` is defined and never raised — one
+packet arrives per transaction and nothing can be behind it); suspend and remote
+wakeup (`DSTS.SUSPSTS` reads zero: a modelled host that stops issuing
+transactions is indistinguishable from a busy one, so a suspend timer would be
+an invented event); the `PKTSTS = 0001b` global-OUT-NAK FIFO entry (the global
+NAK bits themselves *are* honoured — with either set, every endpoint NAKs); and
+the frame-parity and data-toggle selectors `SD0PID`/`SODDFRM`, which are
+accepted and dropped because this fabric carries no PID on an endpoint
+transaction. A compile-time assertion keeps those two out of the writable set so
+a later edit cannot quietly claim otherwise.
+
+#### The end-to-end claim, and it is not "the registers read back"
+
+`tests/usb_dwc2_device.rs`: an RV32 program on the emulated hart forces device
+mode, partitions its FIFO RAM, releases soft disconnect, waits for
+`GINTSTS.USBRST`, arms `DOEPCTL0`, and then — when a `GET_DESCRIPTOR` arrives —
+reads the eight setup bytes out of `GRXSTSP` and its endpoint-zero FIFO window
+into its own RAM, takes `wLength` **out of the request it just read**, programs
+`DIEPTSIZ0` with it, arms `DIEPCTL0`, and pushes eighteen bytes of device
+descriptor into the FIFO a word at a time. The host on the far side collects
+exactly those eighteen bytes. A snapshot taken with the reply still sitting in
+the transmit FIFO restores to the same state hash and the transfer then finishes.
+
+The register-level version of the same claim, with a dwc2 *host core* on the far
+end instead of a Rust composer, is
+`a_dwc2_host_enumerates_a_dwc2_device_over_one_bus`.
+
 ### 5. A device (`src/dev/usb/hid.rs`, `dev-usb-hid`)
 
 A HID boot-protocol mouse: enumeration, a report descriptor, and three-byte
@@ -389,7 +533,10 @@ arrived by polling `USBSTS`.
 ## Host passthrough
 
 Bridging to real hardware is a `UsbDevice` implementor under `host/` and nothing
-more, which is why the seam is shaped the way it is. **`libusb` cannot be used**:
+more, which is why the seam is shaped the way it is. The *other* direction — a
+guest acting as a device, handed to a real host through `usbfs`'s gadget side —
+is a caller of `bus::usb::host::ControlTransfer` and the bus's transaction
+methods, and needs nothing new either. Neither is started. **`libusb` cannot be used**:
 the dependency policy is absolute and OS interaction is by raw syscall. On Linux
 the sanctioned route is `usbfs` — `/dev/bus/usb/BBB/DDD` with the `USBDEVFS_*`
 ioctls, driven by raw `openat`/`ioctl`/`close` — behind its own feature, and it

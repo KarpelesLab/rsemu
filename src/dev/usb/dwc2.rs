@@ -1,5 +1,6 @@
-//! A Synopsys DesignWare USB 2.0 OTG host controller (`dwc2`), as STM32's
-//! OTG_FS block instantiates it.
+//! A Synopsys DesignWare USB 2.0 OTG controller (`dwc2`), as STM32's OTG_FS
+//! block instantiates it — **both roles**: a host that enumerates devices, and
+//! a device that a host enumerates.
 //!
 //! # What this controller is, and why it is not an EHCI
 //!
@@ -39,18 +40,21 @@
 //! channel is nothing but a register-shaped way of asking for one, exactly as a
 //! queue head is a memory-shaped way of asking for one.
 //!
-//! # Host mode, deliberately
+//! # Dual role, both of them real
 //!
-//! The block is dual-role and this model is a **host**. Device mode — the guest
-//! presenting itself as a peripheral to somebody else's PC — is not
-//! half-implemented here: `GUSBCFG.FDMOD` is honoured to the extent that
-//! selecting it *stops the host side*, `GINTSTS.CMOD` reports the change,
-//! touching the other role's registers raises `GINTSTS.MMIS` as the silicon
-//! does, and the device register block at `+0x800` reads zero. The reasoning is
-//! [`crate::dev::usb::chipidea`]'s and has not changed: a device controller is
-//! a second controller facing the other way, and endpoint registers that
-//! half-work produce something that looks like it works. What device mode would
-//! need is at the bottom of this comment.
+//! The block is dual-role and so is this model. `GUSBCFG.FDMOD` selects the
+//! device side, `GINTSTS.CMOD` reports which one is running, and reaching for
+//! the other role's registers raises `GINTSTS.MMIS` as the silicon does. The
+//! host half is this file; the device half is [`device`], and the two share
+//! one register lock, one shared receive FIFO and one interrupt pin, because on
+//! the die they are one block.
+//!
+//! Device mode is where the guest presents *itself* as a peripheral — a board
+//! that is a USB serial port or a printer rather than a USB port you plug one
+//! into. It is a [`UsbDevice`] implementation over `DIEPCTLn`/`DOEPCTLn`, and
+//! **the fabric carried it very nearly unchanged**: see [`device`] for the
+//! whole argument, and `docs/buses/usb.md` §4.1 for the three small things that
+//! did have to move.
 //!
 //! # Speed is real here, and is not the constraint EHCI has
 //!
@@ -147,11 +151,6 @@
 //!
 //! # What is not modelled, said plainly
 //!
-//! * **Device mode.** See above. It would need a
-//!   [`UsbDevice`](crate::bus::usb::UsbDevice) implementation over the
-//!   `DIEPCTLn`/`DOEPCTLn` registers, fed by the same FIFO, plus a host on the
-//!   far side to talk to it — and the fabric would carry it unchanged, because
-//!   a device is the thing the fabric was designed around.
 //! * **DMA.** `GAHBCFG.DMAEN` reads zero, which is what a core with no DMA
 //!   reports and what makes a driver take the slave-mode path this file
 //!   implements. The high-speed core's buffer DMA, and `HCDMAn` with it, is not
@@ -165,22 +164,30 @@
 //!   the frame-parity scheduling `HCCHAR.ODDFRM` selects, so `ODDFRM` stores and
 //!   reads back and is not acted on.
 //! * **OTG session request, HNP and SRP.** `GOTGCTL`'s writable bits store and
-//!   read back; the status bits report a settled A-device session, which is what
-//!   a soldered-down host port is. A board that switches roles at runtime is a
-//!   board this model does not describe.
+//!   read back and the status bits follow the role — a settled A-device session
+//!   in host mode, a B-device one in device mode — but nothing *negotiates*. A
+//!   board that flips roles at runtime does so by writing `FDMOD`/`FHMOD`, which
+//!   is what firmware does anyway; the ID-pin dance that would do it by itself
+//!   is not here.
+//! * The device half has its own list, in [`device`]: back-to-back setup
+//!   packets, suspend and remote wakeup, and the frame-parity selectors.
 //!
 //! # Sources
 //!
 //! ST's **RM0090** (STM32F405/415/407/417/427/437/429/439 reference manual),
-//! §34 *USB on-the-go full-speed (OTG_FS)* — the register map, the reset values,
-//! `GRXSTSP`'s packet-status encoding, `HPRT`'s write-1-to-clear bits and the
-//! channel registers — and the **USB 2.0 specification** (usb.org, free
-//! download) for everything above the controller: §5.11.3 for the
+//! §34 *USB on-the-go full-speed (OTG_FS)* — the register map of both roles and
+//! the reset values, `GRXSTSP`'s packet-status encoding, `HPRT`'s
+//! write-1-to-clear bits and the channel registers; §34.15.3 for the device
+//! block, which [`device`] cites in its own right — and the **USB 2.0
+//! specification** (usb.org, free download) for everything above the
+//! controller: §5.11.3 for the
 //! per-transaction protocol overhead the frame budget is charged in, §8.4 for
 //! what a transaction is, §8.6.1 for the data toggle, and §9 for the device
 //! framework. No emulator source was consulted, and no driver: the Linux dwc2
 //! driver is GPLv2 and ST's HAL is vendor-licensed, and neither was opened
 //! (`ROADMAP.md` §1).
+
+pub mod device;
 
 #[cfg(test)]
 mod tests;
@@ -194,7 +201,8 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::bus::usb::{
-    Completion, DeviceAddress, HCD_RANK, SetupPacket, Speed, Status, TransferType, UsbBus, buses,
+    Completion, DeviceAddress, HCD_RANK, SetupPacket, Speed, Status, TransferType, UsbBus,
+    UsbDevice, buses,
 };
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
 use crate::core::error::{BusError, Error, Result};
@@ -211,7 +219,12 @@ use crate::machine::realize::Instance;
 const CLASS_NAME: &str = "usb.dwc2";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-pub(crate) const STATE_VERSION: u32 = 1;
+///
+/// Version 2 appended the device-mode register file: `DCFG`, `DCTL`, the two
+/// endpoint arrays and their transmit staging.
+pub const STATE_VERSION: u32 = 2;
+
+pub use device::{Dwc2Gadget, MAX_ENDPOINTS};
 
 /// The one root port a dwc2 core has.
 ///
@@ -574,6 +587,12 @@ const NO_EVENT: u64 = u64::MAX;
 pub struct Params {
     /// How many host channels, 1 to [`MAX_CHANNELS`]. STM32's OTG_FS has 8.
     pub channels: u8,
+    /// How many bidirectional endpoints the **device** side has, 1 to
+    /// [`MAX_ENDPOINTS`]. STM32's OTG_FS has 4 — endpoint zero and three more.
+    ///
+    /// Endpoint zero always exists, so one means "the default pipe and nothing
+    /// else", which is a legal if useless gadget.
+    pub endpoints: u8,
     /// How many 32-bit words of dedicated FIFO RAM the block has.
     ///
     /// The guest partitions it between the receive FIFO and the two transmit
@@ -603,6 +622,7 @@ impl Default for Params {
     fn default() -> Params {
         Params {
             channels: 8,
+            endpoints: 4,
             fifo_words: 320,
             phy_ticks: 1,
             max_speed: Speed::Full,
@@ -616,6 +636,7 @@ impl Params {
     fn clamped(self) -> Params {
         Params {
             channels: self.channels.clamp(1, MAX_CHANNELS as u8),
+            endpoints: self.endpoints.clamp(1, MAX_ENDPOINTS as u8),
             fifo_words: self.fifo_words.clamp(1, FIFO_DEPTH_MASK),
             phy_ticks: self.phy_ticks.max(1),
             ..self
@@ -855,6 +876,11 @@ struct State {
     /// board would not load into another built from the same class.
     channels: [Channel; MAX_CHANNELS],
     rx: RxFifo,
+    /// The device-mode register file. Present whichever role is running, for
+    /// the same reason the host registers are: the block has both, and a
+    /// snapshot's shape must not depend on which one a guest happened to
+    /// select.
+    dev: device::DeviceState,
 }
 
 impl State {
@@ -890,6 +916,7 @@ impl State {
             pcgcctl: 0,
             channels: core::array::from_fn(|_| Channel::default()),
             rx: RxFifo::default(),
+            dev: device::DeviceState::reset(),
         }
     }
 }
@@ -965,6 +992,8 @@ pub enum After {
     Port,
     /// `HPRT.PRST` was released: drive the reset and decide who keeps the port.
     FinishReset,
+    /// `DCTL.SDIS` moved: put the gadget on the bus, or take it off.
+    Gadget,
 }
 
 /// A transaction the frame decided to issue.
@@ -1021,6 +1050,14 @@ pub struct Dwc2 {
     irq_level: AtomicU32,
     /// The catch-up handle the register block syncs through.
     lazy: Mutex<Option<LazyHandle>>,
+    /// This core seen from the *other* side of the connector: what a host
+    /// enumerates when `GUSBCFG.FDMOD` is selected and `DCTL.SDIS` is clear.
+    gadget: Arc<Dwc2Gadget>,
+    /// Which port of the bus the gadget plugs into.
+    gadget_port: u8,
+    /// Whether it is currently plugged in. Not serialized — it is derived from
+    /// `GUSBCFG` and `DCTL` and is restored from them.
+    attached: AtomicU32,
 }
 
 impl fmt::Debug for Dwc2 {
@@ -1036,11 +1073,18 @@ impl fmt::Debug for Dwc2 {
 }
 
 impl Dwc2 {
-    /// A controller on `bus`, configured by `params`.
+    /// A controller on `bus`, configured by `params`, plugging its device half
+    /// into port `gadget_port` of that bus when its firmware selects device
+    /// mode.
+    ///
+    /// Shared from the start, because the gadget half holds a weak reference back
+    /// here and a bus that has the gadget plugged into it therefore reaches the
+    /// core — without a cycle, which is the point of building it this way
+    /// rather than handing out an `Arc` afterwards.
     #[must_use]
-    pub fn new(bus: Arc<UsbBus>, params: Params) -> Dwc2 {
+    pub fn new(bus: Arc<UsbBus>, params: Params, gadget_port: u8) -> Arc<Dwc2> {
         let params = params.clamped();
-        Dwc2 {
+        Arc::new_cyclic(|me| Dwc2 {
             bus,
             params,
             state: Mutex::with_rank(HCD_RANK, State::reset(params)),
@@ -1049,6 +1093,60 @@ impl Dwc2 {
             irq: Mutex::with_rank(LockRank::WIRE, None),
             irq_level: AtomicU32::new(0),
             lazy: Mutex::with_rank(LockRank::WIRE, None),
+            gadget: Arc::new(Dwc2Gadget::new(me.clone())),
+            gadget_port,
+            attached: AtomicU32::new(0),
+        })
+    }
+
+    /// The device half, for an embedder that wants to plug it in by hand.
+    #[must_use]
+    pub fn gadget(&self) -> &Arc<Dwc2Gadget> {
+        &self.gadget
+    }
+
+    /// Which port of the bus the gadget plugs into.
+    #[must_use]
+    pub fn gadget_port(&self) -> u8 {
+        self.gadget_port
+    }
+
+    /// Whether the device half is currently on the bus.
+    #[must_use]
+    pub fn is_attached(&self) -> bool {
+        self.attached.load(Ordering::Relaxed) != 0
+    }
+
+    /// Put the gadget on the bus, or take it off, to match `GUSBCFG.FDMOD` and
+    /// `DCTL.SDIS`.
+    ///
+    /// **No lock of ours is held**: this reaches the fabric, which then reaches
+    /// whatever host is on the far side.
+    pub fn settle_gadget(&self) {
+        let want = {
+            let state = self.state.lock();
+            device::soft_connected(&state)
+        };
+        if want {
+            if self
+                .attached
+                .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                let device = Arc::clone(&self.gadget) as Arc<dyn UsbDevice>;
+                if self.bus.attach(self.gadget_port, device).is_err() {
+                    // Something else is already in that port. A machine
+                    // description bug, and the honest outcome is a device that
+                    // is simply not on the bus.
+                    self.attached.store(0, Ordering::Relaxed);
+                }
+            }
+        } else if self
+            .attached
+            .compare_exchange(1, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.bus.detach(self.gadget_port);
         }
     }
 
@@ -1209,11 +1307,17 @@ impl Dwc2 {
         if self.bus.any_change() {
             self.settle_port();
         }
-        {
+        let frame = {
             let mut state = self.state.lock();
             state.frnum = (state.frnum + 1) & 0x3fff;
             state.gintsts |= GINT_SOF;
-        }
+            state.frnum
+        };
+        // The `SOF` token goes out before any other token in the frame does,
+        // and it goes to everything on the wire rather than to an address — so
+        // it is the fabric's broadcast rather than a transaction. Outside our
+        // own lock, like every outward call here.
+        self.bus.start_of_frame(frame as u16);
         self.service();
         self.refresh_irq();
     }
@@ -1649,6 +1753,12 @@ impl Dwc2 {
         if state.rx.level() {
             value |= GINT_RXFLVL;
         }
+        if !Dwc2::host_mode(state) {
+            // The other role's derived bits. `IEPINT`/`OEPINT` are what a
+            // gadget driver's handler is written around, and they come out of
+            // `DAINT` exactly as `HCINT` comes out of `HAINT`.
+            return value | device::gintsts(self, state);
+        }
         if Dwc2::tx_used(state, false, self.params.channels) == 0 {
             value |= GINT_NPTXFE;
         }
@@ -1730,6 +1840,14 @@ impl Dwc2 {
             state.gintsts |= GINT_MMIS;
         }
 
+        if (DEVICE_BASE..DEVICE_END).contains(&offset) {
+            return device::read(self, &state, offset);
+        }
+
+        if let Some(endpoint) = device::tx_fifo_register(self, offset) {
+            return device::read_tx_fifo(&state, endpoint);
+        }
+
         if (HCCHAR_BASE..DEVICE_BASE).contains(&offset) {
             let index = ((offset - HCCHAR_BASE) / CHANNEL_STRIDE) as usize;
             let register = (offset - HCCHAR_BASE) % CHANNEL_STRIDE;
@@ -1786,11 +1904,19 @@ impl Dwc2 {
             GRXFSIZ => state.grxfsiz,
             GNPTXFSIZ => state.gnptxfsiz,
             GNPTXSTS => {
-                let free = self.tx_depth(&state, false).saturating_sub(Dwc2::tx_used(
-                    &state,
-                    false,
-                    self.params.channels,
-                ));
+                // In device mode this register describes endpoint zero's
+                // transmit FIFO, which is the one `GNPTXFSIZ` sizes — the same
+                // register, read from whichever side is transmitting.
+                let free = if Dwc2::host_mode(&state) {
+                    self.tx_depth(&state, false).saturating_sub(Dwc2::tx_used(
+                        &state,
+                        false,
+                        self.params.channels,
+                    ))
+                } else {
+                    device::tx_depth(self, &state, 0)
+                        .saturating_sub(words_of(state.dev.din[0].tx.len()))
+                };
                 free | (TX_QUEUE_DEPTH << 16)
             }
             GCCFG => state.gccfg,
@@ -1835,6 +1961,13 @@ impl Dwc2 {
 
         if offset >= FIFO_BASE {
             let window = ((offset - FIFO_BASE) / FIFO_WINDOW) as usize;
+            if !Dwc2::host_mode(&state) {
+                // In device mode window *n* is `IN` endpoint *n*'s transmit
+                // FIFO, not channel *n*'s: the windows belong to whichever role
+                // is running, which is why they raise no mode mismatch.
+                device::push_word(self, &mut state, window, value);
+                return After::Nothing;
+            }
             if window >= usize::from(self.params.channels) {
                 return After::Nothing;
             }
@@ -1855,6 +1988,22 @@ impl Dwc2 {
         }
 
         let mut after = After::Nothing;
+
+        if (DEVICE_BASE..DEVICE_END).contains(&offset) {
+            let connect = device::write(self, &mut state, offset, value);
+            self.publish(&state);
+            return if connect {
+                After::Gadget
+            } else {
+                After::Nothing
+            };
+        }
+
+        if let Some(endpoint) = device::tx_fifo_register(self, offset) {
+            device::write_tx_fifo(&mut state, endpoint, value);
+            self.publish(&state);
+            return After::Nothing;
+        }
 
         if (HCCHAR_BASE..DEVICE_BASE).contains(&offset) {
             let index = ((offset - HCCHAR_BASE) / CHANNEL_STRIDE) as usize;
@@ -1983,8 +2132,12 @@ impl Dwc2 {
                 };
                 self.bus.set_enabled(ROOT_PORT, enabled);
                 self.settle_port();
+                // A role change is also a connect or a disconnect on the far
+                // side of the same connector.
+                self.settle_gadget();
             }
             After::FinishReset => self.finish_reset(),
+            After::Gadget => self.settle_gadget(),
         }
     }
 
@@ -2006,6 +2159,9 @@ impl Dwc2 {
         }
         self.bus.set_enabled(ROOT_PORT, false);
         self.settle_port();
+        // `DCTL.SDIS` is set again, so the gadget comes off the bus: a core
+        // reset really does unplug the device, which is what a host sees.
+        self.settle_gadget();
         self.refresh_irq();
     }
 
@@ -2030,6 +2186,7 @@ impl Dwc2 {
         }
         self.bus.set_enabled(ROOT_PORT, false);
         self.settle_port();
+        self.settle_gadget();
         self.refresh_irq();
     }
 
@@ -2096,7 +2253,10 @@ impl Dwc2 {
             }
             None => w.write_bool(false)?,
         }
-        Ok(())
+
+        // The device half, always — a snapshot's shape does not depend on which
+        // role the guest happened to have selected when it was taken.
+        device::save(&state.dev, w)
     }
 
     /// Restore what [`save`](Dwc2::save) wrote.
@@ -2126,6 +2286,7 @@ impl Dwc2 {
             pcgcctl: r.read_u32()?,
             channels: core::array::from_fn(|_| Channel::default()),
             rx: RxFifo::default(),
+            dev: device::DeviceState::reset(),
         };
 
         let count = r.read_seq_len(24)?;
@@ -2156,6 +2317,7 @@ impl Dwc2 {
             restored.rx.read = read.min(data.len());
             restored.rx.current = Some(RxPacket { status, data });
         }
+        restored.dev = device::load(r)?;
 
         {
             let mut state = self.state.lock();
@@ -2169,6 +2331,9 @@ impl Dwc2 {
             state.hprt & HPRT_PENA != 0 && Dwc2::host_mode(&state)
         };
         self.bus.set_enabled(ROOT_PORT, enabled);
+        // So is whether the gadget is plugged in: it comes back from
+        // `GUSBCFG.FDMOD` and `DCTL.SDIS`, never from the chunk.
+        self.settle_gadget();
         self.refresh_irq();
         Ok(())
     }
@@ -2193,6 +2358,11 @@ impl Dwc2Controller {
     /// * `bus` — the named [`UsbBus`] this controller is the root of. Required.
     /// * `channels` — how many host channels, 1 to 16. Defaults to 8, which is
     ///   what STM32's OTG_FS has.
+    /// * `endpoints` — how many device-mode endpoints, 1 to 16. Defaults to 4,
+    ///   which is what STM32's OTG_FS has.
+    /// * `port` — which port of `bus` the device half plugs into when firmware
+    ///   selects device mode. Defaults to 0, the port a host controller on the
+    ///   same bus roots.
     /// * `fifo` — 32-bit words of dedicated FIFO RAM. Defaults to 320, which is
     ///   the 1.25 KiB of an OTG_FS.
     /// * `phyclock` — clock-domain ticks in one PHY clock. Defaults to 1, the
@@ -2211,6 +2381,8 @@ impl Dwc2Controller {
         let mut r = props.reader();
         let bus_name = r.require_str("bus")?.to_string();
         let channels = r.or_range("channels", 8u64, 1..=MAX_CHANNELS as u64)?;
+        let endpoints = r.or_range("endpoints", 4u64, 1..=MAX_ENDPOINTS as u64)?;
+        let port = r.or_range("port", u64::from(ROOT_PORT), 0..=u64::from(u8::MAX))?;
         let fifo = r.or_range("fifo", 320u64, 1..=u64::from(FIFO_DEPTH_MASK))?;
         let phyclock = r.or_range("phyclock", 1u64, 1..=u64::from(u32::MAX))?;
         let speed = r.or_str("speed", "full")?.to_string();
@@ -2232,24 +2404,34 @@ impl Dwc2Controller {
         };
 
         // One root port: `HPRT` is a single register, and a second device needs
-        // a hub this tree does not model.
-        let bus = buses::attach(props, &bus_name, 1)?;
-        Ok(Dwc2Controller::with_bus(
+        // a hub this tree does not model. A board that wires this core as a
+        // *device* asks for a port past that, and the bus grows to hold it.
+        let bus = buses::attach(props, &bus_name, (port as u8).saturating_add(1))?;
+        Ok(Dwc2Controller::with_bus_at(
             bus,
             Params {
                 channels: channels as u8,
+                endpoints: endpoints as u8,
                 fifo_words: fifo as u32,
                 phy_ticks: phyclock,
                 max_speed,
                 cid: cid as u32,
             },
+            port as u8,
         ))
     }
 
-    /// A controller on a bus the caller already holds.
+    /// A controller on a bus the caller already holds, its device half on port
+    /// zero of it.
     #[must_use]
     pub fn with_bus(bus: Arc<UsbBus>, params: Params) -> Dwc2Controller {
-        let core = Arc::new(Dwc2::new(bus, params));
+        Dwc2Controller::with_bus_at(bus, params, ROOT_PORT)
+    }
+
+    /// The same, with the device half on a named port.
+    #[must_use]
+    pub fn with_bus_at(bus: Arc<UsbBus>, params: Params, gadget_port: u8) -> Dwc2Controller {
+        let core = Dwc2::new(bus, params, gadget_port);
         let port = Arc::new(Dwc2Port {
             core: Arc::clone(&core),
         });
@@ -2351,8 +2533,14 @@ impl Device for Dwc2Controller {
     }
 
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
-        // Nothing outward: a `map` statement places the region and a `wire`
-        // statement connects the interrupt.
+        // A `map` statement places the region and a `wire` statement connects
+        // the interrupt, so neither of those is here. What *is* an outward
+        // action is the device half plugging into the bus — and out of reset
+        // `DCTL.SDIS` is set, so realize plugs nothing in. It is here because
+        // this is where an outward action belongs, and a `load` before the
+        // first register write must find the fabric already agreeing with the
+        // registers.
+        self.core.settle_gadget();
         Ok(())
     }
 
@@ -2447,6 +2635,18 @@ static DWC2_PROPERTIES: &[PropertySpec] = &[
         summary: "how many host channels, 1 to 16 (default 8, an STM32 OTG_FS)",
     },
     PropertySpec {
+        name: "endpoints",
+        kind: ValueKind::Uint,
+        required: false,
+        summary: "how many device-mode endpoints, 1 to 16 (default 4, an STM32 OTG_FS)",
+    },
+    PropertySpec {
+        name: "port",
+        kind: ValueKind::Uint,
+        required: false,
+        summary: "which port of the bus the device half plugs into (default 0)",
+    },
+    PropertySpec {
         name: "fifo",
         kind: ValueKind::Uint,
         required: false,
@@ -2499,6 +2699,8 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
     ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("bus", ValueKind::Str).required())
         .prop(PropSchema::new("channels", ValueKind::Uint).range(1, MAX_CHANNELS as u64))
+        .prop(PropSchema::new("endpoints", ValueKind::Uint).range(1, MAX_ENDPOINTS as u64))
+        .prop(PropSchema::new("port", ValueKind::Uint).range(0, u64::from(u8::MAX)))
         .prop(PropSchema::new("fifo", ValueKind::Uint).range(1, u64::from(FIFO_DEPTH_MASK)))
         .prop(PropSchema::new("phyclock", ValueKind::Uint).range(1, u64::from(u32::MAX)))
         .prop(PropSchema::new("speed", ValueKind::Str).values(&["full", "high"]))

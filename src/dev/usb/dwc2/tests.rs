@@ -197,6 +197,7 @@ fn fixture_with(phy_speed: Speed, device_speed: Speed) -> Fixture {
         Arc::clone(&bus),
         Params {
             channels: 8,
+            endpoints: 4,
             fifo_words: 320,
             phy_ticks: 1,
             max_speed: phy_speed,

@@ -19,6 +19,14 @@
 //! `-timeout` reports. Unbounded growth shows up as an out-of-memory, which is
 //! what `-rss_limit_mb` reports. Both are failures this target exists to catch.
 //!
+//! **Device mode is the same target, from the other side.** With
+//! `GUSBCFG.FDMOD` selected the guest is the peripheral, and the surface grows a
+//! second half that arbitrary bytes reach: setup packets, `IN` tokens and `OUT`
+//! packets arriving from a host, answered out of `DIEPCTLn`/`DOEPCTLn` and the
+//! same shared FIFO. The properties are the same two — **it returns, and it does
+//! not allocate** — and the receive FIFO is the thing a host could otherwise
+//! fill without bound.
+//!
 //! Three other surfaces come along for free:
 //!
 //! * **A debug read has no side effects** — and this device has two registers
@@ -47,6 +55,10 @@
 //!   0x06                  save, then load what was saved: a round trip
 //!   0x07 ...              load the rest of the input as a snapshot chunk
 //!   0x08 xx yy bb         move the mouse
+//!   0x09 mm               force host (mm even) or device (mm odd) mode
+//!   0x0a ee 8 bytes       a SETUP transaction into the gadget on endpoint ee
+//!   0x0b ee ll            an IN transaction of ll bytes out of the gadget
+//!   0x0c ee ll            an OUT transaction of ll zero bytes into the gadget
 //! ```
 //!
 //! Anything else is skipped, which keeps a mutated corpus productive rather
@@ -54,11 +66,21 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use rsemu::bus::usb::{Speed, UsbBus};
+use rsemu::bus::usb::{DeviceAddress, SetupPacket, Speed, UsbBus};
 use rsemu::core::device::{Device, ResetKind};
 use rsemu::core::space::{MemAttrs, MemOps, RegionKind};
 use rsemu::core::state::{ChunkReader, MachineShape, Migrations, StateReader, StateWriter};
-use rsemu::dev::usb::dwc2::{Dwc2Controller, FIFO_BASE, FIFO_WINDOW, Params};
+use rsemu::dev::usb::dwc2::{Dwc2Controller, FIFO_BASE, FIFO_WINDOW, Params, STATE_VERSION};
+
+/// `GUSBCFG`, whose bit 30 forces device mode.
+const GUSBCFG: u64 = 0x00c;
+/// `GUSBCFG.FDMOD`.
+const FDMOD: u32 = 1 << 30;
+/// `DCTL`, whose bit 1 is soft disconnect.
+const DCTL: u64 = 0x804;
+/// Which port of the bus the gadget half plugs into. Port zero is the mouse,
+/// which is what the *host* half enumerates, so the two do not collide.
+const GADGET_PORT: u8 = 1;
 use rsemu::dev::usb::hid::HidMouse;
 use std::sync::Arc;
 
@@ -74,25 +96,31 @@ struct Fixture {
     controller: Dwc2Controller,
     ops: Arc<dyn MemOps>,
     mouse: HidMouse,
+    bus: Arc<UsbBus>,
 }
 
 fn build() -> Fixture {
-    let bus = Arc::new(UsbBus::new(1));
+    let bus = Arc::new(UsbBus::new(2));
     // Full speed, because that is what this transceiver is: a high-speed device
     // would never enable the port and half the target would be unreachable.
     let mouse = HidMouse::new_detached_at_speed(0x1234, 0x5678, Speed::Full);
     bus.attach(0, mouse.device()).expect("an empty port");
 
-    let controller = Dwc2Controller::with_bus(
+    let controller = Dwc2Controller::with_bus_at(
         Arc::clone(&bus),
         Params {
             channels: 8,
+            endpoints: 4,
             fifo_words: 320,
             phy_ticks: 1,
             max_speed: Speed::Full,
             cid: 0x1000,
         },
+        GADGET_PORT,
     );
+    // The far end of the cable, so the device half is reachable at all. A real
+    // host would have reset the port first; a fuzzer is not a real host.
+    bus.set_enabled(GADGET_PORT, true);
 
     let region = controller.region("").expect("the register block");
     let ops = match region.kind() {
@@ -103,6 +131,7 @@ fn build() -> Fixture {
         controller,
         ops,
         mouse,
+        bus,
     }
 }
 
@@ -111,7 +140,7 @@ fn snapshot(f: &Fixture) -> Option<Vec<u8>> {
     shape.add_device("dwc2", "usb.dwc2").ok()?;
     let mut w = StateWriter::new(shape);
     {
-        let mut chunk = w.chunk("dwc2", "usb.dwc2", 1).ok()?;
+        let mut chunk = w.chunk("dwc2", "usb.dwc2", STATE_VERSION).ok()?;
         f.controller.save(&mut chunk).ok()?;
     }
     w.to_vec().ok()
@@ -213,7 +242,7 @@ fuzz_target!(|data: &[u8]| {
                     let fresh = build();
                     let reader = StateReader::new(&bytes).expect("we just wrote it");
                     let chunk = reader
-                        .load("dwc2", "usb.dwc2", 1, &Migrations::new())
+                        .load("dwc2", "usb.dwc2", STATE_VERSION, &Migrations::new())
                         .expect("it is in there");
                     fresh
                         .controller
@@ -243,6 +272,70 @@ fuzz_target!(|data: &[u8]| {
                 f.mouse
                     .motion(data[at] as i8, data[at + 1] as i8, data[at + 2]);
                 at += 3;
+            }
+            0x09 => {
+                if at >= data.len() {
+                    break;
+                }
+                let device = data[at] & 1 != 0;
+                at += 1;
+                let mut cfg = [0u8; 4];
+                let _ = f.ops.read(GUSBCFG, &mut cfg, MemAttrs::DEFAULT);
+                let value = if device {
+                    u32::from_le_bytes(cfg) | FDMOD
+                } else {
+                    u32::from_le_bytes(cfg) & !FDMOD
+                };
+                let _ = f.ops.write(GUSBCFG, &value.to_le_bytes(), MemAttrs::DEFAULT);
+                // Soft connect, so the gadget is actually on the bus for the
+                // transactions below to reach.
+                let _ = f.ops.write(DCTL, &0u32.to_le_bytes(), MemAttrs::DEFAULT);
+            }
+            0x0a => {
+                if at + 9 > data.len() {
+                    break;
+                }
+                let endpoint = data[at] & 0x0f;
+                let mut raw = [0u8; 8];
+                raw.copy_from_slice(&data[at + 1..at + 9]);
+                at += 9;
+                // A setup packet a host would never send is exactly the input
+                // this target is for.
+                let _ = f
+                    .bus
+                    .setup(DeviceAddress::DEFAULT, endpoint, SetupPacket::decode(&raw));
+            }
+            0x0b => {
+                if at + 2 > data.len() {
+                    break;
+                }
+                let endpoint = data[at] & 0x0f;
+                let len = usize::from(data[at + 1]);
+                at += 2;
+                let mut buf = vec![0u8; len];
+                let live = f.bus.read(DeviceAddress::DEFAULT, endpoint, &mut buf);
+                // The debug path must answer the same thing and take nothing.
+                let mut a = vec![0u8; len];
+                let mut b = vec![0u8; len];
+                let first = f.bus.peek(DeviceAddress::DEFAULT, endpoint, &mut a);
+                let second = f.bus.peek(DeviceAddress::DEFAULT, endpoint, &mut b);
+                assert_eq!(first, second, "a peek at an IN endpoint had a side effect");
+                assert_eq!(a, b);
+                let _ = live;
+            }
+            0x0c => {
+                if at + 2 > data.len() {
+                    break;
+                }
+                let endpoint = data[at] & 0x0f;
+                let len = usize::from(data[at + 1]);
+                at += 2;
+                // **The allocation property, from the host side.** However many
+                // packets arrive, the receive FIFO is the size the guest
+                // declared and no larger.
+                let _ = f
+                    .bus
+                    .write(DeviceAddress::DEFAULT, endpoint, &vec![0xa5u8; len]);
             }
             _ => {}
         }

@@ -423,3 +423,225 @@ fn a_name_reaches_the_same_bus_from_both_ends() {
     let theirs = buses::open(&elsewhere, "usb0", 4).unwrap();
     assert!(!Arc::ptr_eq(&controller_side, &theirs));
 }
+
+// ---------------------------------------------------------------------------
+// Start of frame: the one thing on the wire that is not a transaction
+// ---------------------------------------------------------------------------
+
+/// A device that does nothing but count frames.
+#[derive(Debug, Default)]
+struct FrameCounter {
+    seen: Mutex<Vec<u16>>,
+}
+
+impl UsbDevice for FrameCounter {
+    fn speed(&self) -> Speed {
+        Speed::Full
+    }
+    fn address(&self) -> DeviceAddress {
+        DeviceAddress::DEFAULT
+    }
+    fn bus_reset(&self) {}
+    fn start_of_frame(&self, frame: u16) {
+        self.seen.lock().push(frame);
+    }
+    fn setup(&self, _endpoint: u8, _packet: SetupPacket) -> Status {
+        Status::Ack
+    }
+    fn transfer_in(&self, _endpoint: u8, _dst: &mut [u8]) -> Completion {
+        Completion::nak()
+    }
+    fn transfer_out(&self, _endpoint: u8, _src: &[u8]) -> Completion {
+        Completion::nak()
+    }
+}
+
+#[test]
+fn a_start_of_frame_reaches_every_connected_device_enabled_or_not() {
+    let bus = UsbBus::new(2);
+    let a = Arc::new(FrameCounter::default());
+    let b = Arc::new(FrameCounter::default());
+    bus.attach(0, Arc::clone(&a) as Arc<dyn UsbDevice>)
+        .expect("an empty port");
+    bus.attach(1, Arc::clone(&b) as Arc<dyn UsbDevice>)
+        .expect("an empty port");
+    // Only one port is enabled, and it makes no difference: a `SOF` is
+    // broadcast, not addressed (USB 2.0 §8.4.3).
+    bus.set_enabled(0, true);
+
+    bus.start_of_frame(1);
+    // Eleven bits, because that is the field the token carries.
+    bus.start_of_frame(0x0fff);
+
+    assert_eq!(*a.seen.lock(), alloc::vec![1, 0x7ff]);
+    assert_eq!(
+        *b.seen.lock(),
+        alloc::vec![1, 0x7ff],
+        "a device on a port the controller has not enabled still counts frames"
+    );
+}
+
+#[test]
+fn a_device_that_does_not_care_about_frames_says_nothing() {
+    // The default is a no-op, which is why adding this to the trait changed no
+    // existing device model.
+    let bus = UsbBus::new(1);
+    bus.attach(0, Stub::new(Speed::High, 4) as Arc<dyn UsbDevice>)
+        .expect("an empty port");
+    bus.start_of_frame(7);
+    bus.set_enabled(0, true);
+    assert_eq!(
+        bus.find(DeviceAddress(4)).map(|d| d.speed()),
+        Some(Speed::High)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The host-side transfer composer
+// ---------------------------------------------------------------------------
+
+/// A device with nothing but descriptors: enough to be enumerated, which is all
+/// these tests ask of it.
+#[derive(Debug)]
+struct Plain {
+    descriptors: Descriptors,
+}
+
+impl Plain {
+    fn peripheral() -> Arc<Peripheral> {
+        let device = DeviceDescriptor {
+            vendor: 0x1d6b,
+            product: 0x0104,
+            max_packet0: 8,
+            ..DeviceDescriptor::default()
+        };
+        let body = InterfaceDescriptor {
+            endpoints: 0,
+            class: 0xff,
+            ..InterfaceDescriptor::default()
+        }
+        .encode();
+        let mut descriptors = Descriptors::new().with_device(&device);
+        descriptors.add_configuration(&ConfigurationDescriptor::default(), &body);
+        Arc::new(Peripheral::new(Arc::new(Plain { descriptors })))
+    }
+}
+
+impl Function for Plain {
+    fn descriptors(&self) -> &Descriptors {
+        &self.descriptors
+    }
+    fn speed(&self) -> Speed {
+        Speed::Full
+    }
+}
+
+/// Step a transfer to completion, with a bound: nothing here NAKs, so anything
+/// that needs more than a handful of transactions is a bug in the composer.
+fn run(bus: &UsbBus, address: DeviceAddress, mps: u16, transfer: &mut ControlTransfer) -> Progress {
+    for _ in 0..32 {
+        let progress = transfer.step(bus, address, mps);
+        if progress.is_finished() {
+            return progress;
+        }
+    }
+    panic!("a transfer with no NAKs in it did not finish");
+}
+
+fn enumerable() -> Arc<UsbBus> {
+    let bus = Arc::new(UsbBus::new(1));
+    bus.attach(0, Plain::peripheral() as Arc<dyn UsbDevice>)
+        .expect("an empty port");
+    bus.set_enabled(0, true);
+    bus
+}
+
+#[test]
+fn the_composer_collects_a_descriptor_a_packet_at_a_time() {
+    let bus = enumerable();
+    // Eight bytes a packet, so eighteen bytes is three transactions and the
+    // last one is short — which is how the device says "that is all of it".
+    let mut transfer = ControlTransfer::device_to_host(host::get_descriptor(1, 0, 18));
+    assert_eq!(
+        run(&bus, DeviceAddress::DEFAULT, 8, &mut transfer),
+        Progress::Done
+    );
+    let bytes = transfer.data();
+    assert_eq!(bytes.len(), 18);
+    assert_eq!(bytes[0], 18, "bLength");
+    assert_eq!(bytes[1], 1, "bDescriptorType: DEVICE");
+    assert_eq!(&bytes[8..10], &[0x6b, 0x1d], "idVendor");
+}
+
+#[test]
+fn a_short_descriptor_ends_the_data_stage_early() {
+    let bus = enumerable();
+    // The classic first request of an enumeration: eight bytes of an eighteen
+    // byte descriptor, so the host learns `bMaxPacketSize0` before asking for
+    // the rest.
+    let mut transfer = ControlTransfer::device_to_host(host::get_descriptor(1, 0, 8));
+    assert_eq!(
+        run(&bus, DeviceAddress::DEFAULT, 8, &mut transfer),
+        Progress::Done
+    );
+    assert_eq!(transfer.data().len(), 8);
+    assert_eq!(transfer.data()[7], 8, "bMaxPacketSize0");
+}
+
+#[test]
+fn the_composer_gets_set_address_right_including_the_status_stage() {
+    let bus = enumerable();
+    // The whole point of §9.4.6: the status stage is still addressed to zero,
+    // and the new address only takes effect once it completes. A composer that
+    // switched early would hang here.
+    let mut transfer = ControlTransfer::host_to_device(host::set_address(DeviceAddress(11)), &[]);
+    assert_eq!(
+        run(&bus, DeviceAddress::DEFAULT, 8, &mut transfer),
+        Progress::Done
+    );
+    assert!(bus.find(DeviceAddress(11)).is_some());
+
+    let mut configure = ControlTransfer::host_to_device(host::set_configuration(1), &[]);
+    assert_eq!(
+        run(&bus, DeviceAddress(11), 8, &mut configure),
+        Progress::Done
+    );
+}
+
+#[test]
+fn a_request_the_device_refuses_ends_as_a_stall_and_not_a_hang() {
+    let bus = enumerable();
+    // `SET_DESCRIPTOR` is optional and nothing in this tree implements it
+    // (§9.4.8), so the device stalls the stage after the setup.
+    let setup = SetupPacket {
+        request_type: 0,
+        request: request::SET_DESCRIPTOR,
+        value: 0x0100,
+        index: 0,
+        length: 4,
+    };
+    let mut transfer = ControlTransfer::host_to_device(setup, &[1, 2, 3, 4]);
+    assert_eq!(
+        run(&bus, DeviceAddress::DEFAULT, 8, &mut transfer),
+        Progress::Failed(Status::Stall)
+    );
+    assert_eq!(transfer.failure(), Some(Status::Stall));
+    // And stepping a finished transfer repeats the outcome rather than
+    // restarting anything.
+    assert_eq!(
+        transfer.step(&bus, DeviceAddress::DEFAULT, 8),
+        Progress::Failed(Status::Stall)
+    );
+}
+
+#[test]
+fn an_address_nothing_answers_is_no_device_rather_than_a_wait() {
+    let bus = UsbBus::new(1);
+    let mut transfer = ControlTransfer::device_to_host(host::get_descriptor(1, 0, 18));
+    assert_eq!(
+        transfer.step(&bus, DeviceAddress::DEFAULT, 8),
+        Progress::Failed(Status::NoDevice)
+    );
+    assert!(transfer.is_finished());
+    assert!(transfer.data().is_empty());
+}
