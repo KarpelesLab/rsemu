@@ -27,9 +27,11 @@
 //! | [`usb`] | `dev-usb-*` | USB host controllers — a generic EHCI, the ChipIdea/ARC variant over it, and a Synopsys dwc2 that shares nothing with either — and a HID mouse |
 //! | [`wdc`] | `dev-wdc` | the W65C51N ACIA and W65C22 VIA, and a 6502 board's ROM |
 //!
-//! Most of `dev/` is `no_std + alloc`. The two documented exceptions —
+//! | [`blk`] | `dev-blk` | disk images: a drive backed by a host file through `fstool` |
+//!
+//! Most of `dev/` is `no_std + alloc`. Of the two documented exceptions —
 //! `dev/blk/*` and `dev/net/*`, which are `std` because `fstool` and `pktkit`
-//! are — do not exist yet.
+//! are — [`blk`] now exists and `dev/net` does not.
 
 #[cfg(feature = "dev-at24c")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-at24c")))]
@@ -46,6 +48,10 @@ pub mod apu;
 #[cfg(feature = "dev-ata-disk")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-ata-disk")))]
 pub mod ata;
+
+#[cfg(feature = "dev-blk")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-blk")))]
+pub mod blk;
 
 #[cfg(feature = "dev-nes-cart")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-cart")))]

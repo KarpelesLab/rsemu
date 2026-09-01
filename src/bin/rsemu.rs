@@ -63,6 +63,27 @@ RUN OPTIONS:
                         guest RAM, which the generated device tree then points
                         the kernel at
     --media <n>=<file>  Bind any media slot by name
+    --drive <n>=<file>[,<opt>…]
+                        Back a media slot with the image *file* rather than a
+                        copy of its bytes: the guest's writes go to the file,
+                        the capacity comes from the image, and a structured
+                        format is understood -- raw (sparse), qcow2, DMG,
+                        DiskCopy 4.2 and LUKS, all through `fstool`. So
+                        `--hd0 disk.img` runs a 64 MiB disk out of 64 MiB of
+                        RAM and discards what the guest wrote, and
+                        `--drive hd0=disk.qcow2` runs a sparse one off the
+                        disk and keeps it. Options, comma separated after the
+                        path: `ro` opens it read-only and write protects the
+                        drive; `new=<size>` creates the image instead of
+                        opening it (a `.qcow2` extension makes a qcow2, any
+                        other a sparse raw file); `cluster=<size>` sets a new
+                        qcow2's allocation granularity (default 64K, as
+                        qemu-img); `password=<word>` unlocks an
+                        encrypted container; `snapshot=capture|reference|refuse`
+                        chooses what a machine snapshot does about the bytes
+                        (default `reference` -- the image stays outside the
+                        snapshot, which is the only honest answer for a big
+                        one). Needs a build with `dev-blk`
     -p <name>=<value>   Override a `param` declared in the machine file
     --threading <mode>  How guest execution is spread over host threads
                         (ROADMAP.md 4.2). `deterministic` (the default) is one
@@ -232,6 +253,10 @@ struct RunArgs {
     machine: String,
     /// Media slot to file path, in the order they were given.
     media: Vec<(String, String)>,
+    /// `--drive <slot>=<file>[,ro][,new=<size>]`: media slots backed by the
+    /// host file itself rather than by a copy of its bytes in RAM.
+    #[cfg(feature = "dev-blk")]
+    drives: Vec<Drive>,
     /// A built-in monitor image for the `rom` slot, if the user named one.
     monitor: Option<String>,
     params: Vec<(String, String)>,
@@ -356,6 +381,14 @@ fn run(args: &[String]) -> ExitCode {
         return fail(&e);
     }
 
+    // `--drive` images open here: before the build, so a drive finds its medium
+    // waiting under the media slot the machine file names, and so a path that
+    // does not exist fails before anything is realized.
+    #[cfg(feature = "dev-blk")]
+    if let Err(e) = install_drives(&options, &parsed) {
+        return fail(&e);
+    }
+
     let registry = match catalog::registry() {
         Ok(r) => r,
         Err(e) => return fail(&e),
@@ -366,6 +399,22 @@ fn run(args: &[String]) -> ExitCode {
         // failures name the instance. Either way `{e}` is the whole report.
         Err(e) => return fail(&e),
     };
+
+    // A `--drive` nothing picked up is almost always a typo in the slot name,
+    // and it fails *silently*: the machine builds, the bay is empty, and the
+    // guest reports no disk. Say so rather than letting the user wonder why
+    // their image did not boot.
+    #[cfg(feature = "dev-blk")]
+    for slot in rsemu::dev::ata::medium::names(&options.realize.hosts) {
+        if rsemu::dev::ata::medium::get(&options.realize.hosts, &slot)
+            .is_ok_and(|found| found.is_some_and(|s| s.is_occupied()))
+        {
+            eprintln!(
+                "rsemu: warning: --drive {slot}=… was never picked up; no device in this \
+                 machine names the `{slot}` media slot"
+            );
+        }
+    }
 
     // The pool goes in *after* the build, because `--threading parallel` with
     // no count means one worker per runnable and there is no way to count them
@@ -444,6 +493,88 @@ fn run(args: &[String]) -> ExitCode {
 /// exactly like the registration lists in `machine::catalog`: a family that is
 /// not named here is not in the build, and that is visible by reading the code.
 #[allow(unused_variables, unused_mut)]
+/// One `--drive <slot>=<file>[,ro][,new=<size>][,snapshot=<policy>]`.
+///
+/// The file-backed counterpart of `--hd0`, and deliberately a separate flag
+/// rather than a change to it: `--hd0 disk.img` copies the file's bytes into a
+/// buffer and throws the guest's writes away when the run ends, and `--drive
+/// hd0=disk.img` writes *through* to the file. Those are different contracts,
+/// and quietly upgrading one to the other would make an existing command line
+/// modify a file it never used to touch.
+#[cfg(feature = "dev-blk")]
+#[derive(Debug)]
+struct Drive {
+    slot: String,
+    path: String,
+    options: rsemu::dev::blk::ImageOptions,
+}
+
+#[cfg(feature = "dev-blk")]
+impl Drive {
+    fn parse(spec: &str) -> Result<Drive, String> {
+        let (head, rest) = spec.split_once('=').ok_or_else(|| {
+            format!("--drive wants <slot>=<file>[,ro][,new=<size>], got `{spec}`")
+        })?;
+        // The path comes first and options follow it, so a comma inside a
+        // filename is only ambiguous for a name that also ends in `,ro` — say
+        // so rather than guessing.
+        let mut parts = rest.split(',');
+        let path = parts.next().unwrap_or("").to_string();
+        if path.is_empty() {
+            return Err(format!("--drive {head}= needs a file"));
+        }
+        let mut options = rsemu::dev::blk::ImageOptions::new();
+        for opt in parts {
+            match opt.split_once('=') {
+                None if opt == "ro" || opt == "readonly" => options = options.read_only(true),
+                Some(("new", size)) => {
+                    let bytes = rsemu::core::props::parse_size(size)
+                        .map_err(|e| format!("--drive {head}: new={size}: {e}"))?;
+                    options = options.create(bytes);
+                }
+                Some(("snapshot", policy)) => {
+                    let chosen = rsemu::dev::ata::Snapshot::from_name(policy).ok_or_else(|| {
+                        format!(
+                            "--drive {head}: snapshot={policy}: one of `capture`, `reference` \
+                             or `refuse`"
+                        )
+                    })?;
+                    options = options.snapshot(chosen);
+                }
+                Some(("password", word)) => options = options.password(word),
+                Some(("cluster", size)) => {
+                    let bytes = rsemu::core::props::parse_size(size)
+                        .map_err(|e| format!("--drive {head}: cluster={size}: {e}"))?;
+                    let bytes = u32::try_from(bytes)
+                        .map_err(|_| format!("--drive {head}: cluster={size} is implausible"))?;
+                    options = options.cluster(bytes);
+                }
+                _ => return Err(format!("--drive {head}: `{opt}` is not a drive option")),
+            }
+        }
+        Ok(Drive {
+            slot: head.to_string(),
+            path,
+            options,
+        })
+    }
+}
+
+/// Open every `--drive` image and install it under the media slot it names.
+///
+/// Before the machine is built, so the drive finds its medium waiting when it
+/// is constructed — and so a bad path fails before anything is realized.
+#[cfg(feature = "dev-blk")]
+fn install_drives(options: &rsemu::machine::BuildOptions, args: &RunArgs) -> rsemu::Result<()> {
+    use std::sync::Arc;
+    for drive in &args.drives {
+        let image =
+            rsemu::dev::blk::Image::open(std::path::Path::new(&drive.path), &drive.options)?;
+        rsemu::dev::blk::install(&options.realize.hosts, &drive.slot, Arc::new(image))?;
+    }
+    Ok(())
+}
+
 fn install_capture(
     options: &mut rsemu::machine::BuildOptions,
     args: &RunArgs,
@@ -953,6 +1084,8 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
     let mut out = RunArgs {
         machine: String::new(),
         media: Vec::new(),
+        #[cfg(feature = "dev-blk")]
+        drives: Vec::new(),
         screenshot: None,
         // 44 100 rather than 48 000: it is what a `.wav` is expected to be, and
         // every player on earth opens one without resampling it again.
@@ -1000,6 +1133,11 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
                     .split_once('=')
                     .ok_or_else(|| format!("--media wants <name>=<file>, got `{spec}`"))?;
                 out.media.push((slot.to_string(), path.to_string()));
+            }
+            #[cfg(feature = "dev-blk")]
+            "--drive" => {
+                let spec = value(arg)?;
+                out.drives.push(Drive::parse(&spec)?);
             }
             "-p" | "--param" => {
                 let spec = value(arg)?;

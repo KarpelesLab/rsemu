@@ -25,6 +25,20 @@ exclude       = ["/docs/local", "/.github"]
 # (CLAUDE.md). Optional, so the default `cargo tree` is still only `rsemu`.
 oxideav-png = { version = "0.1", default-features = false, optional = true }
 
+# Disk images and the block-device seam under `dev/blk`: `fstool::BlockDevice`
+# plus sparse raw, qcow2, DMG, DiskCopy 4.2 and LUKS backends. First-party
+# (Karpelès Lab, MIT) and named as a permitted dependency in CLAUDE.md;
+# `ROADMAP.md` §7.1 makes it *the* storage substrate, so rsemu adapts to it
+# rather than inventing a parallel block abstraction. `default-features =
+# false` drops the CLI's line editor and the archive codecs; `gzip` and `zstd`
+# are the two a qcow2 with compressed clusters actually reads through, and both
+# come from `compcol`, which is permitted already. Optional, so the default
+# `cargo tree` is still only `rsemu`.
+fstool = { version = "0.4.21", default-features = false, features = [
+  "gzip",
+  "zstd",
+], optional = true }
+
 [features]
 # The emulation core is always compiled and never feature-gated. Everything
 # else is one feature per component, so a NES build links a 6502 and nothing
@@ -677,6 +691,39 @@ dev-pc-floppy = ["dev-pc"]
 # system's ATA driver was opened (ROADMAP.md §1). `no_std + alloc`, no
 # `unsafe`, no dependencies.
 dev-ata-disk = []
+
+# Real disk-image backing (src/dev/blk): a guest drive whose bytes are a host
+# *file* rather than a buffer, so a sparse 16 GiB disk costs no RAM and a
+# snapshot does not write 16 GiB. Adds `fstool` (Karpelès Lab, MIT -- named as
+# a permitted dependency in CLAUDE.md) and with it the image formats: sparse
+# **raw**, **qcow2** (v2/v3, read/write, allocate-on-write, compressed
+# clusters, backing files, encryption), UDIF **DMG**, DiskCopy 4.2 and
+# **LUKS**. No format is parsed here and none should ever be -- ROADMAP.md
+# §7.1 puts controllers on `fstool::BlockDevice` "rather than on a parallel
+# rsemu invention", and this feature is about a hundred lines of adapter:
+# `&mut self` to `&self` behind a `core::sync` lock, `std::io::Error` to
+# `BusError`, and a snapshot policy that references the image instead of
+# copying it. A run reaches it through the media slot the machine file already
+# names (`rsemu run pc-at --drive hd0=disk.qcow2`), so no machine description
+# and no host adapter changes, and `--hd0 disk.img` still binds bytes: **both
+# paths work**, and the media slot is what keeps `dev-ata-disk` `no_std`.
+#
+# One of the two documented `std` exceptions to the `no_std` rule (CLAUDE.md),
+# so `--no-default-features` excludes it. `default-features = false` on
+# `fstool` drops its CLI's line editor and most codecs; `gzip` and `zstd` are
+# what a qcow2 with compressed clusters needs, and both are served by
+# `compcol`, which is permitted already. Needs `dev-ata-disk` to have a drive
+# to back.
+#
+# **Known cost, and it is not ours to fix here.** `fstool` 0.4 declares its
+# CLI's dependencies unconditionally rather than behind a `cli` feature, so
+# enabling this feature also pulls `clap`, `serde`, `serde_json`, `toml`,
+# `uuid`, `encoding_rs` and (on unix, for the `BLKGETSIZE64` ioctl) `libc` --
+# every one of which CLAUDE.md's dependency policy names as *not* permitted,
+# and the last of which will not link on `*-linux-fullrust`. The default
+# `cargo tree` is still bare, which is what CI gates on, and the fix is a
+# feature split in `fstool`, not a parallel block layer here.
+dev-blk = ["std", "dev-ata-disk", "dep:fstool"]
 
 # The PC/AT's IDE interface (src/dev/pc/ide.rs): one channel, which is address
 # decode and nothing else. The command block (0x1f0/0x170) and the control

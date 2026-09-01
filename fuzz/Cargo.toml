@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "ir", "cpu-riscv-lift"]
+features         = ["std", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-blk", "ir", "cpu-riscv-lift"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -113,6 +113,18 @@ bench = false
 [[bin]]
 name  = "riscv_lift"
 path  = "fuzz_targets/riscv_lift.rs"
+test  = false
+doc   = false
+bench = false
+
+# The one file rsemu parses that the *user* did not write: a disk image named on
+# the command line, whose header, refcount table and cluster lookup all run
+# before a single guest instruction does. CLAUDE.md asks for a fuzz target on
+# disk-image parsers by name; this is that surface, plus the bounds check that
+# has to hold whatever capacity the header claimed.
+[[bin]]
+name  = "blk_image"
+path  = "fuzz_targets/blk_image.rs"
 test  = false
 doc   = false
 bench = false

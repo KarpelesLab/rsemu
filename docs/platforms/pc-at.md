@@ -21,7 +21,25 @@ $ rsemu run pc-at --bios bios.bin --media vgabios=vgabios.bin --media floppy=boo
 `--hd0` and `--hd1`, which fill the two drive bays on the primary IDE channel;
 the mechanism is the media table and nothing else. An unbound `hd0` or `hd1` is
 an **empty bay**, not an error — a PC with no hard disk is an ordinary PC, and a
-drive costs its whole capacity in host memory the moment it exists. `pc.rom` is the socket they land in, and
+drive bound that way costs its whole capacity in host memory the moment it
+exists, because the media table is bytes.
+
+A build with `dev-blk` has the other option, which is the one you want for a
+disk of any size:
+
+```console
+$ rsemu run pc-at --bios bios.bin --drive hd0=disk.qcow2
+$ rsemu run pc-at --bios bios.bin --drive hd0=fresh.qcow2,new=8G
+```
+
+`--drive` backs the same media slot with the **file** rather than with a copy of
+its bytes: the capacity comes from the image, the guest's writes go to the file,
+and sparse raw, qcow2, DMG, DiskCopy 4.2 and LUKS are all understood (through
+`fstool` — no image format is parsed in rsemu). Nothing in
+`machines/pc-at.machine` changes, because the machine file names a media slot
+and the *run* decides what is behind that name. A machine snapshot then
+**references** the image rather than copying it; `docs/buses/storage.md` has the
+argument. `pc.rom` is the socket the ROMs land in, and
 its `align` property is the one thing about it that is not obvious: a **system
 BIOS is top-aligned**, because an x86 fetches its first instruction from the top
 of its address space, and an **option ROM is bottom-aligned**, because firmware

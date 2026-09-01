@@ -141,6 +141,9 @@ pub fn build_info() -> alloc::string::String {
     if cfg!(feature = "dev-ata-disk") {
         features.push("dev-ata-disk");
     }
+    if cfg!(feature = "dev-blk") {
+        features.push("dev-blk");
+    }
     if cfg!(feature = "dev-pc-ide") {
         features.push("dev-pc-ide");
     }
