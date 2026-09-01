@@ -83,6 +83,7 @@ use alloc::vec::Vec;
 use crate::core::clock::{ClockForest, DomainId, GlobalTime};
 use crate::core::device::{Deferred, Device, DeviceClass, ResetKind};
 use crate::core::error::{Error, Result};
+use crate::core::record::Recorder;
 use crate::core::sched::{
     Budget, Consumed, Event, EventId, EventTarget, HostClock, LazyDevice, LazyId, QuantumReport,
     Runnable, RunnableId, Scheduler, SchedulerSnapshot,
@@ -328,6 +329,14 @@ pub struct Machine {
     sweep: Vec<PinRef>,
     shape: MachineShape,
     deferred: Deferred,
+    /// The record/replay seam, if one is attached (§4.5).
+    ///
+    /// `None` is the ordinary case and costs one `Option` test per scheduling
+    /// round, which is nothing against a round. It is deliberately *not* part
+    /// of [`MachineParts`]: a recorder is a property of the run, like the
+    /// threading mode, and attaching one has to be able to fail — see
+    /// [`Machine::set_recorder`].
+    recorder: Option<Arc<Recorder>>,
 }
 
 /// The parts a realizer hands to [`Machine::assemble`].
@@ -370,6 +379,7 @@ impl Machine {
             sweep: parts.sweep,
             shape: parts.shape,
             deferred: parts.deferred,
+            recorder: None,
         }
     }
 
@@ -498,6 +508,7 @@ impl Machine {
     /// Whatever the scheduler refuses — an overrun budget, an unimplemented
     /// threading mode — or an event addressed to a device that does not exist.
     pub fn run_quantum(&mut self) -> Result<QuantumReport> {
+        self.pump_inputs()?;
         let report = self.sched.run_quantum_until(GlobalTime::MAX)?;
         self.sched.sync_lazy_devices()?;
         self.dispatch(&report)?;
@@ -538,6 +549,7 @@ impl Machine {
     fn advance_to(&mut self, deadline: GlobalTime, stepping: Stepping) -> Result<()> {
         while self.sched.now() < deadline {
             let before = self.sched.now();
+            self.pump_inputs()?;
             let report = match stepping {
                 Stepping::Whole => self.sched.run_quantum_until(deadline)?,
                 Stepping::Fragment => self.sched.step_quantum_until(deadline)?,
@@ -716,6 +728,14 @@ impl Machine {
         load_wires(&self.nets, &mut wires.reader())?;
         self.deferred.drain();
         self.sweep();
+        // A load moves virtual time, so the input seam has to move with it or
+        // the next round delivers against an instant the machine has left. This
+        // is what makes `Machine::load` sound on its own rather than only
+        // inside [`Timeline::rewind_to`](crate::machine::Timeline::rewind_to):
+        // a debugger restoring a snapshot gets the same treatment.
+        if let Some(recorder) = &self.recorder {
+            recorder.rewind_to(self.sched.now());
+        }
         Ok(())
     }
 
@@ -780,6 +800,90 @@ impl Machine {
     /// As [`Machine::save`].
     pub fn nondeterministic_state_hash(&self) -> Result<u64> {
         Ok(fnv1a(&self.save()?))
+    }
+
+    // -----------------------------------------------------------------
+    // record / replay (§4.5)
+    // -----------------------------------------------------------------
+
+    /// Attach the record/replay seam.
+    ///
+    /// From here on, the top of every scheduling round drains the recorder:
+    /// in [`Mode::Record`] whatever the host has posted since the last round is
+    /// stamped with the round's own instant, logged and delivered; in
+    /// [`Mode::Replay`] the logged events due at that instant are delivered and
+    /// the host is ignored. [`core::record`](crate::core::record) argues why
+    /// delivery has to happen there and nowhere else.
+    ///
+    /// The machine's [`MachineShape`] is written onto the log, so a recording
+    /// taken here and replayed into a different board fails with a diff.
+    ///
+    /// # Only in a deterministic machine, and that is structural
+    ///
+    /// This **refuses** on a machine whose threading mode is not
+    /// [`ThreadingMode::Deterministic`], exactly as [`Machine::state_hash`]
+    /// does and for the same reason. `ROADMAP.md` §4.2 makes
+    /// [`ThreadingMode::Deterministic`] a requirement of record/replay in as
+    /// many words, and the honest reason is narrower than "parallel is
+    /// non-deterministic": `Scheduler::run_quantum` *does* join every job
+    /// before a round returns, so the round boundaries this seam timestamps
+    /// against are reproducible under `parallel` too. What is not reproducible
+    /// is what happens **inside** a round — two CPU threads interleaving their
+    /// accesses to shared memory in an order the host picks, and reporting back
+    /// tick counts that depend on what they read. No input log can recover
+    /// that, so a recording taken from a parallel run would replay into a
+    /// different machine while looking entirely valid. Refusing here is what
+    /// makes that impossible rather than merely documented.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] if the machine is not in a deterministic threading
+    /// mode.
+    ///
+    /// [`Mode::Record`]: crate::core::record::Mode::Record
+    /// [`Mode::Replay`]: crate::core::record::Mode::Replay
+    /// [`ThreadingMode`]: crate::core::sched::ThreadingMode
+    /// [`ThreadingMode::Deterministic`]: crate::core::sched::ThreadingMode::Deterministic
+    pub fn set_recorder(&mut self, recorder: Arc<Recorder>) -> Result<()> {
+        let mode = self.sched.config().mode;
+        if !mode.is_deterministic() {
+            return Err(Error::Config {
+                at: self.name.clone(),
+                message: format!(
+                    "a recording of a `{mode}` run cannot be replayed: the round boundaries \
+                     are reproducible but what happens inside a round is not, so no input log \
+                     can restore it (ROADMAP.md 4.2). Run the machine in `deterministic` \
+                     threading to record it"
+                ),
+            });
+        }
+        recorder.set_shape(self.shape.clone());
+        self.recorder = Some(recorder);
+        Ok(())
+    }
+
+    /// Detach the seam, returning whatever was attached.
+    pub fn take_recorder(&mut self) -> Option<Arc<Recorder>> {
+        self.recorder.take()
+    }
+
+    /// The attached seam, if there is one.
+    #[inline]
+    pub fn recorder(&self) -> Option<&Arc<Recorder>> {
+        self.recorder.as_ref()
+    }
+
+    /// Deliver the input due at this instant.
+    ///
+    /// Called at the top of every scheduling round, which is the only place a
+    /// non-deterministic input may enter a machine. Standing exactly on a round
+    /// boundary is what makes the instant a function of the guest's timeline
+    /// rather than of the host thread that posted.
+    fn pump_inputs(&mut self) -> Result<()> {
+        if let Some(recorder) = &self.recorder {
+            recorder.deliver(self.sched.now())?;
+        }
+        Ok(())
     }
 
     /// The threading mode this machine runs in (§4.2).

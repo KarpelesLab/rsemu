@@ -44,6 +44,16 @@
 //! belong in realize: see [`dev::riscv::dt`](crate::dev::riscv::dt), which
 //! publishes a device-tree describer from `Device::realize`.
 //!
+//! # The table is also where the record/replay seam is enforced
+//!
+//! A host object is the *only* door from the host into a machine — and that
+//! includes the [`Captured`] table, which is how a host reaches a concrete
+//! device to press its buttons directly. So checking every object against a
+//! recorder's registered channels is checking every non-deterministic input,
+//! once, in one place, rather than trusting each device to declare its own.
+//! [`HostObjects::seal`] is that check and
+//! [`core::record`](crate::core::record) argues why it belongs here.
+//!
 //! # Ordering
 //!
 //! A `BTreeMap` keyed by `(kind, name)`, so [`HostObjects::names`] is in name
@@ -59,6 +69,7 @@ use core::any::Any;
 use core::fmt;
 
 use crate::core::error::{Error, Result};
+use crate::core::record::{Channel, Recorder};
 use crate::core::sync::{LockRank, Mutex};
 
 /// What sort of host object a name refers to.
@@ -116,6 +127,32 @@ pub struct HostObjects {
     /// critical section so that stays true even when the object's own
     /// constructor takes a lock.
     entries: Mutex<BTreeMap<(HostKind, String), Arc<dyn Any + Send + Sync>>>,
+    /// The record/replay seal, if one has been applied. Read before `entries`
+    /// is touched, never while it is held.
+    policy: Mutex<InputPolicy>,
+}
+
+/// What a table does about host objects the record/replay seam does not know.
+///
+/// The enforcement `CLAUDE.md`'s determinism rule needs and could not have
+/// before [`record`](crate::core::record) existed. A host object is the only
+/// door from the host into a machine — a character port, a pad, a NIC's port,
+/// and even the [`Captured`] table a host uses to reach a concrete device — so
+/// checking every object against a recorder's registered channels is checking
+/// every non-deterministic input, once, in one place.
+///
+/// Not an extensible enumeration: this is a two-state policy about one table,
+/// and a third state would be a design change rather than an addition.
+#[derive(Debug, Clone)]
+pub enum InputPolicy {
+    /// Anything may be opened. The default, and what a machine with no
+    /// recording attached wants.
+    Open,
+    /// Only objects whose channel `recorder` has registered may be opened.
+    ///
+    /// Opening anything else is [`Error::Config`] naming the channel, at build
+    /// time — see [`HostObjects::seal`].
+    Sealed(Arc<Recorder>),
 }
 
 impl Default for HostObjects {
@@ -126,6 +163,10 @@ impl Default for HostObjects {
 
 impl fmt::Debug for HostObjects {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Read before `entries` is held: two leaf locks may not be nested, and
+        // `try_lock` being exempt from the order check does not exempt what is
+        // taken *inside* it.
+        let sealed = self.is_sealed();
         match self.entries.try_lock() {
             // The values are `dyn Any` and have no useful `Debug`; the keys are
             // what the reader of a failing test wants anyway.
@@ -138,10 +179,12 @@ impl fmt::Debug for HostObjects {
                         .map(|(kind, name)| format!("{kind}:{name}"))
                         .collect::<Vec<_>>(),
                 )
+                .field("sealed", &sealed)
                 .finish(),
             None => f
                 .debug_struct("HostObjects")
                 .field("objects", &"<in use>")
+                .field("sealed", &sealed)
                 .finish(),
         }
     }
@@ -153,6 +196,7 @@ impl HostObjects {
     pub fn new() -> HostObjects {
         HostObjects {
             entries: Mutex::with_rank(LockRank::LEAF, BTreeMap::new()),
+            policy: Mutex::with_rank(LockRank::LEAF, InputPolicy::Open),
         }
     }
 
@@ -176,6 +220,7 @@ impl HostObjects {
         T: Any + Send + Sync,
         F: FnOnce() -> T,
     {
+        self.check_policy(kind, name)?;
         if let Some(found) = self.get::<T>(kind, name)? {
             return Ok(found);
         }
@@ -207,11 +252,94 @@ impl HostObjects {
     ///
     /// For a host that wants to supply the object rather than let the device
     /// create it — a scripted terminal, a replayed pad.
+    ///
+    /// # Panics
+    ///
+    /// Never. On a [sealed](HostObjects::seal) table an unregistered channel is
+    /// refused by [`HostObjects::try_insert`]; this convenience form ignores
+    /// that refusal, which is right for the caller that sealed the table in the
+    /// first place and knows what it registered.
     pub fn insert<T: Any + Send + Sync>(&self, kind: HostKind, name: &str, object: Arc<T>) {
+        let _ = self.try_insert(kind, name, object);
+    }
+
+    /// [`HostObjects::insert`], reporting a policy refusal instead of ignoring
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] if the table is sealed and no recorder channel matches
+    /// `(kind, name)`.
+    pub fn try_insert<T: Any + Send + Sync>(
+        &self,
+        kind: HostKind,
+        name: &str,
+        object: Arc<T>,
+    ) -> Result<()> {
+        self.check_policy(kind, name)?;
         self.entries.lock().insert(
             (kind, name.to_string()),
             object as Arc<dyn Any + Send + Sync>,
         );
+        Ok(())
+    }
+
+    /// Refuse any host object the recorder has not registered as a channel.
+    ///
+    /// The enforcement half of the record/replay seam. Call it *before* the
+    /// machine is built: every device opens its host objects from `new(props)`,
+    /// so a board with an unrecorded input fails to realize rather than
+    /// producing a recording that is quietly missing a stream.
+    ///
+    /// The recorder is sealed too, so the two lists cannot drift: after this,
+    /// neither a new channel nor a new host object can appear.
+    ///
+    /// Sealing an already-populated table is allowed and checks what is already
+    /// there, so a caller that builds first and seals second still gets the
+    /// diagnostic — one round late, but before the first round runs.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] naming the first host object already open that the
+    /// recorder does not know about.
+    pub fn seal(&self, recorder: Arc<Recorder>) -> Result<()> {
+        let open: Vec<(HostKind, String)> = self.entries.lock().keys().cloned().collect();
+        for (kind, name) in &open {
+            if !recorder.knows(&Channel::new(*kind, name)) {
+                return Err(unrecorded(*kind, name));
+            }
+        }
+        recorder.seal();
+        *self.policy.lock() = InputPolicy::Sealed(recorder);
+        Ok(())
+    }
+
+    /// Drop the seal, whatever it was.
+    ///
+    /// For a host that has finished a recording and wants the table back.
+    pub fn unseal(&self) {
+        *self.policy.lock() = InputPolicy::Open;
+    }
+
+    /// Whether this table is sealed onto a recorder.
+    #[must_use]
+    pub fn is_sealed(&self) -> bool {
+        matches!(&*self.policy.lock(), InputPolicy::Sealed(_))
+    }
+
+    /// The policy check, run before any entry is touched so the two leaf locks
+    /// are never held at once.
+    fn check_policy(&self, kind: HostKind, name: &str) -> Result<()> {
+        // Cloned out rather than held: `Recorder::knows` takes its own lock, and
+        // a leaf lock may not be held while another is acquired.
+        let recorder = match &*self.policy.lock() {
+            InputPolicy::Open => return Ok(()),
+            InputPolicy::Sealed(recorder) => Arc::clone(recorder),
+        };
+        if recorder.knows(&Channel::new(kind, name)) {
+            return Ok(());
+        }
+        Err(unrecorded(kind, name))
     }
 
     /// Forget `name` under `kind`, reporting whether there was one.
@@ -247,6 +375,23 @@ impl HostObjects {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.lock().is_empty()
+    }
+}
+
+/// The diagnostic for a host object that would bypass the record/replay seam.
+///
+/// Named rather than inlined because it is the message a device author will
+/// read when their new device fails to realize under a recording, and it has to
+/// tell them what to do rather than merely that something is wrong.
+fn unrecorded(kind: HostKind, name: &str) -> Error {
+    Error::Config {
+        at: format!("{kind}:{name}"),
+        message: String::from(
+            "this host object would carry non-deterministic input into a machine whose \
+             recorder has no channel for it, so the run could not be replayed \
+             (CLAUDE.md, determinism). Register the channel with the recorder before \
+             building the machine, or do not seal the host-object table",
+        ),
     }
 }
 

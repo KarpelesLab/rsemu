@@ -89,6 +89,7 @@ pub mod realize;
 pub mod resolver;
 pub mod sources;
 pub mod span;
+pub mod timeline;
 pub mod validate;
 
 #[cfg(test)]
@@ -105,6 +106,7 @@ pub use crate::machine::realize::{
 pub use crate::machine::resolver::{ResolveOptions, Resolved, resolve};
 pub use crate::machine::sources::{IncludeLoader, SourceMap};
 pub use crate::machine::span::{SourceFile, Span, Spanned};
+pub use crate::machine::timeline::{DEFAULT_CADENCE, Timeline};
 pub use crate::machine::validate::{ClassTable, ValidateOptions, validate};
 
 /// Parse a machine description, reporting failures as [`Error::Config`].
