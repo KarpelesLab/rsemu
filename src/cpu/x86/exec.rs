@@ -887,6 +887,18 @@ impl<'a> Exec<'a> {
 
     // -- I/O -----------------------------------------------------------
 
+    /// How wide an I/O transfer may be.
+    ///
+    /// The I/O space is thirty-two bits wide and stayed that way: `REX.W` on
+    /// an `IN`, `OUT`, `INS` or `OUTS` is **ignored** rather than widening the
+    /// transfer, because there is no 64-bit port cycle for it to mean (*Intel
+    /// SDM* volume 2, `IN`/`OUT`). Clamping here rather than at each of the
+    /// four call sites keeps the rule in one place.
+    #[inline]
+    const fn io_width(opsize: u8) -> u8 {
+        if opsize > 4 { 4 } else { opsize }
+    }
+
     /// One I/O read. A core with no I/O space sees an unterminated bus, which
     /// reads as ones — the same answer the corpus expects from a bare 8088.
     pub(super) fn io_read(&mut self, port: u16, size: u8) -> u32 {
@@ -1860,14 +1872,22 @@ impl<'a> Exec<'a> {
             }
             Op::IN => {
                 let port = self.port(f, insn.src);
-                let width = if insn.dst == Arg::Al { 1 } else { f.opsize };
+                let width = if insn.dst == Arg::Al {
+                    1
+                } else {
+                    Self::io_width(f.opsize)
+                };
                 self.io_permitted(port, width)?;
                 let value = self.io_read_sized(port, width);
                 self.state.regs.write(0, width, false, u64::from(value));
             }
             Op::OUT => {
                 let port = self.port(f, insn.dst);
-                let width = if insn.src == Arg::Al { 1 } else { f.opsize };
+                let width = if insn.src == Arg::Al {
+                    1
+                } else {
+                    Self::io_width(f.opsize)
+                };
                 self.io_permitted(port, width)?;
                 let value = self.state.regs.read(0, width, false) as u32;
                 self.io_write_sized(port, width, value);
@@ -3013,16 +3033,18 @@ impl<'a> Exec<'a> {
             }
             Op::INSB | Op::INSW => {
                 let port = self.state.regs.word(2);
-                self.io_permitted(port, size)?;
-                let value = u64::from(self.io_read_sized(port, size));
+                let width = Self::io_width(size);
+                self.io_permitted(port, width)?;
+                let value = u64::from(self.io_read_sized(port, width));
                 self.write_mem(seg::ES, di, size, value)?;
                 self.advance(f, delta, false, true);
             }
             _ => {
                 let port = self.state.regs.word(2);
-                self.io_permitted(port, size)?;
+                let width = Self::io_width(size);
+                self.io_permitted(port, width)?;
                 let value = self.read_mem(src_seg, si, size)?;
-                self.io_write_sized(port, size, value as u32);
+                self.io_write_sized(port, width, value as u32);
                 self.advance(f, delta, true, false);
             }
         }
