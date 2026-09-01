@@ -12,6 +12,7 @@
 //! | Module | Feature | Covers |
 //! | --- | --- | --- |
 //! | [`apple1`] | `dev-apple1` | the Apple 1's MC6821, its monitor ROM socket, and RSMON |
+//! | [`ata`] | `dev-ata-disk` | an ATA hard disk: the command block, the command set, CHS and LBA |
 //! | [`apu`] | `dev-nes-apu` | the RP2A03 audio half: channels, frame counter, DMC |
 //! | [`cart`] | `dev-nes-cart` | cartridge images and the mappers that decode them |
 //! | [`flash`] | `dev-flash-cfi`, `dev-flash-spinor` | NOR flash: parallel (CFI) and serial (W25Q on SPI) |
@@ -41,6 +42,10 @@ pub mod apple1;
 #[cfg(feature = "dev-nes-apu")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-apu")))]
 pub mod apu;
+
+#[cfg(feature = "dev-ata-disk")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-ata-disk")))]
+pub mod ata;
 
 #[cfg(feature = "dev-nes-cart")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-cart")))]

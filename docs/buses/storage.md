@@ -8,7 +8,8 @@ controllers come from [`fstool`](https://github.com/KarpelesLab/fstool) — see
 
 | Transport | Source | Access |
 | --- | --- | --- |
-| ATA / ATAPI | [T13](https://www.t13.org/) — the ATA/ATAPI Command Set standards | Drafts historically free; final standards via INCITS |
+| ATA / ATAPI | [T13](https://www.t13.org/) — the ATA/ATAPI Command Set standards; ATA/ATAPI-6 (T13/1410D) is what `dev/ata/disk` was written from | Drafts historically free; final standards via INCITS |
+| AT IDE interface | *IBM Personal Computer AT Technical Reference* (1984), the fixed-disk adapter; Ralf Brown's Interrupt List for the `0x3f6`/`0x3f7` split with the diskette adapter | **Free** |
 | AHCI | Serial ATA AHCI Specification (Intel) | intel.com **[browser]** |
 | NVMe | [NVM Express specifications](https://nvmexpress.org/specifications/) | **Free** |
 | SCSI | [T10](https://www.t10.org/) — SPC (primary commands), SBC (block commands) | Drafts free |
@@ -28,6 +29,34 @@ Like NOR flash, and for the same reason, the card takes a media slot rather
 than an `fstool::BlockDevice`: the contents are a flat image and `fstool` would
 drag `std` into a `no_std` device. A large or sparse image is a `dev/blk/sd`
 variant under the documented `std` exception, reusing the protocol half whole.
+
+ATA is split the same way, and the split is even less of a judgement call than
+SD's: **"IDE" means *integrated drive electronics***, so the controller is
+physically on the drive and what is left on the motherboard is a decoder and a
+buffer. `dev/ata/disk` is therefore everything on the far side of the cable —
+the eight command block registers, the command set, the busy/DRQ handshake, the
+CHS and LBA translations and the 256-word `IDENTIFY DEVICE` response — and
+`dev/pc/ide` is the AT's contribution, which is two chip selects, master/slave
+cable position, and a wire to an 8259A. The falsifiable form: `dev/ata/disk.rs`
+contains no I/O port address and no register offset (a register is a name,
+`Reg`), and `dev/pc/ide.rs` contains no ATA opcode, no `IDENTIFY` word index and
+no status bit. The same drive would hang off a PCI IDE controller, a
+CompactFlash socket or a PCMCIA adapter without changing, because none of those
+change the cable.
+
+**ATAPI is deliberately absent.** `IDENTIFY PACKET DEVICE` is aborted, which is
+the specified behaviour of a device that is not a packet device and is how a
+driver finds out. A CD-ROM is a packet command set on top of this transport and
+is a separate piece of work, not a flag on this one.
+
+Like SD and NOR flash, the ATA drive takes a media slot rather than an
+`fstool::BlockDevice`, and for the same reason plus one more: it is `no_std`, so
+`rsemu run pc-at --hd0 disk.img` works on every target the crate builds for. The
+cost is real and worth stating — the medium is a flat `RamStore`, so a drive
+costs its whole capacity in host memory and a snapshot writes all of it. A large
+or sparse image is a `dev/blk/ata` variant under the documented `std` exception,
+reusing the protocol half whole and replacing only `AtaDisk::read_media` and
+`AtaDisk::write_media`.
 
 NOR flash is here rather than under devices because it is a *transport* too:
 the guest sees a memory window with a command protocol on it, not a controller

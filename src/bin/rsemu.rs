@@ -52,6 +52,9 @@ RUN OPTIONS:
                         here and no file in the repository
     --vgabios <file>    Bind the `vgabios` media slot: a video option ROM
     --floppy <file>     Bind the `floppy` media slot: a raw diskette image
+    --hd0 <file>        Bind the `hd0` media slot: a raw hard disk image for
+                        the first IDE bay. Unbound is an empty bay.
+    --hd1 <file>        Bind the `hd1` media slot: the second IDE bay
     --flash0 <file>     Bind the `flash0` media slot: a NOR flash bank's
                         contents. `riscv-virt` boots UEFI out of it.
     --flash1 <file>     Bind the `flash1` media slot: the second NOR bank,
@@ -311,8 +314,10 @@ fn run(args: &[String]) -> ExitCode {
     // board with blank parts on it, which is what a factory ships and what a
     // UEFI build will format for itself. Naming the slots explicitly on every
     // run to say "empty" would be ceremony, and an unbound slot is an error by
-    // design (`machine::realize`).
-    for slot in ["flash0", "flash1", "initrd", "disk"] {
+    // design (`machine::realize`). The same goes for a PC's two IDE bays: no
+    // bytes bound is an empty bay, which is what most PCs of the period had in
+    // at least one of them.
+    for slot in ["flash0", "flash1", "initrd", "disk", "hd0", "hd1"] {
         if !images.iter().any(|(bound, _)| bound == slot) {
             images.push((String::from(slot), Vec::new()));
         }
@@ -975,7 +980,7 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             // exist at all because `--media bios=…` is correct and nobody
             // types it.
             "--cart" | "--rom" | "--disk" | "--bios" | "--vgabios" | "--floppy" | "--flash0"
-            | "--flash1" | "--initrd" => {
+            | "--flash1" | "--initrd" | "--hd0" | "--hd1" => {
                 let slot = arg.trim_start_matches('-').to_string();
                 let path = value(arg)?;
                 out.media.push((slot, path));

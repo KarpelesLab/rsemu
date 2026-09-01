@@ -3,9 +3,11 @@
 //! Everything here is a part somebody could buy: two 8259A interrupt
 //! controllers, an 8254 timer, an 8042 keyboard controller, an MC146818 RTC,
 //! two 8237A DMA controllers, a 6845-derived CRTC with a character generator in
-//! front of it, and a µPD765 floppy controller. None of it is PC-specific in
-//! itself — the PC is the *wiring*, and that lives in
-//! `machines/pc-at.machine`, not in Rust.
+//! front of it, and a µPD765 floppy controller — plus one thing that is not a
+//! part at all: [`ide`], which is address decode and a cable, because an IDE
+//! drive's controller is on the drive. None of it is PC-specific in itself —
+//! the PC is the *wiring*, and that lives in `machines/pc-at.machine`, not in
+//! Rust.
 //!
 //! # Sources
 //!
@@ -39,10 +41,19 @@
 //!   0x092        system control port A   (A20 gate, fast reset)
 //!   0x0a0-0x0a1  interrupt controller 2  (slave, cascaded onto IR2)
 //!   0x0c0-0x0df  DMA controller 2        (word channels 4-7)
+//!   0x170-0x177  IDE, secondary channel  (command block)
+//!   0x1f0-0x1f7  IDE, primary channel    (command block)
+//!   0x376        IDE, secondary channel  (control block)
 //!   0x3b4-0x3b5  CRTC, monochrome        }  one chip; which pair answers is
 //!   0x3d4-0x3d5  CRTC, colour            }  a board-level decode
-//!   0x3f0-0x3f7  floppy controller
+//!   0x3f0-0x3f5  floppy controller
+//!   0x3f6        IDE, primary channel    (control block)
+//!   0x3f7        floppy digital input / configuration control
 //! ```
+//!
+//! The floppy's window has a hole in it at `0x3f6`, and that is the board's
+//! doing rather than an accident: the diskette adapter decodes `0x3f0-0x3f5`
+//! and `0x3f7`, and `0x3f6` belongs to the fixed-disk adapter.
 //!
 //! # Conventions every chip here follows
 //!
@@ -74,6 +85,10 @@ pub mod video;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-floppy")))]
 pub mod fdc;
 
+#[cfg(feature = "dev-pc-ide")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-ide")))]
+pub mod ide;
+
 use alloc::vec::Vec;
 
 use crate::core::error::Result;
@@ -98,6 +113,8 @@ pub fn register(reg: &mut Registry) -> Result<()> {
     video::register(reg)?;
     #[cfg(feature = "dev-pc-floppy")]
     fdc::register(reg)?;
+    #[cfg(feature = "dev-pc-ide")]
+    ide::register(reg)?;
     Ok(())
 }
 
@@ -118,6 +135,8 @@ pub fn bind(b: &mut Bindings) -> Result<()> {
     video::bind(b)?;
     #[cfg(feature = "dev-pc-floppy")]
     fdc::bind(b)?;
+    #[cfg(feature = "dev-pc-ide")]
+    ide::bind(b)?;
     Ok(())
 }
 
@@ -138,6 +157,8 @@ pub fn schemas() -> Vec<ClassSchema> {
     out.push(video::schema());
     #[cfg(feature = "dev-pc-floppy")]
     out.push(fdc::schema());
+    #[cfg(feature = "dev-pc-ide")]
+    out.push(ide::schema());
     out
 }
 
@@ -150,17 +171,26 @@ pub const PC_AT: &str = include_str!("../../../machines/pc-at.machine");
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(all(feature = "dev-pc-video", feature = "dev-pc-floppy"))]
+    #[cfg(all(
+        feature = "dev-pc-video",
+        feature = "dev-pc-floppy",
+        feature = "dev-pc-ide"
+    ))]
     use crate::machine::ClassTable;
     use crate::machine::ResolveOptions;
     use crate::machine::resolve_file;
-    #[cfg(all(feature = "dev-pc-video", feature = "dev-pc-floppy"))]
+    #[cfg(all(
+        feature = "dev-pc-video",
+        feature = "dev-pc-floppy",
+        feature = "dev-pc-ide"
+    ))]
     use crate::machine::validate::{ClassSchema, ValidateOptions, validate};
     // Only the fallback schema below writes these out by hand; with the core
     // compiled in it publishes its own.
     #[cfg(all(
         feature = "dev-pc-video",
         feature = "dev-pc-floppy",
+        feature = "dev-pc-ide",
         not(feature = "cpu-x86")
     ))]
     use crate::machine::validate::{PortDir, PropSchema};
@@ -178,7 +208,11 @@ mod tests {
     /// The board still validates against it here, because a chipset test that
     /// checks its own machine file is worth having whether or not a CPU feature
     /// is enabled.
-    #[cfg(all(feature = "dev-pc-video", feature = "dev-pc-floppy"))]
+    #[cfg(all(
+        feature = "dev-pc-video",
+        feature = "dev-pc-floppy",
+        feature = "dev-pc-ide"
+    ))]
     fn x86_schema() -> ClassSchema {
         #[cfg(feature = "cpu-x86")]
         {
@@ -209,7 +243,11 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "dev-pc-video", feature = "dev-pc-floppy"))]
+    #[cfg(all(
+        feature = "dev-pc-video",
+        feature = "dev-pc-floppy",
+        feature = "dev-pc-ide"
+    ))]
     fn classes() -> ClassTable {
         let mut table = ClassTable::new();
         for schema in crate::machine::builtin::schemas() {
@@ -249,7 +287,11 @@ mod tests {
     // The board names a display and a floppy controller, so it can only be
     // checked against a build that has them. A `dev-pc`-only build still parses
     // it — the test above — which is the half that does not depend on features.
-    #[cfg(all(feature = "dev-pc-video", feature = "dev-pc-floppy"))]
+    #[cfg(all(
+        feature = "dev-pc-video",
+        feature = "dev-pc-floppy",
+        feature = "dev-pc-ide"
+    ))]
     #[test]
     fn the_board_validates_against_this_builds_classes() {
         // Everything the board names exists, every property is one its class
@@ -263,7 +305,10 @@ mod tests {
     }
 
     #[test]
-    fn the_firmware_slots_are_the_only_media_the_board_needs() {
+    fn the_board_names_exactly_the_media_slots_it_documents() {
+        // Two firmware sockets and three removable-or-fitted media. None of
+        // them is required: the disks default to an empty bay and the floppy to
+        // an empty drive, so the only slot a user *has* to fill is `bios`.
         let resolved =
             resolve_file("pc-at.machine", PC_AT, &ResolveOptions::new()).expect("it resolves");
         let mut slots: alloc::vec::Vec<alloc::string::String> = resolved
@@ -273,6 +318,6 @@ mod tests {
             .filter_map(|v| v.as_str().map(ToString::to_string))
             .collect();
         slots.sort();
-        assert_eq!(slots, ["bios", "floppy", "vgabios"]);
+        assert_eq!(slots, ["bios", "floppy", "hd0", "hd1", "vgabios"]);
     }
 }
