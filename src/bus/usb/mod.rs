@@ -46,6 +46,38 @@
 //! change for that to land — the transfer type never appears in a signature
 //! here, exactly as it does not appear on the wire.
 //!
+//! # When the *guest* is the device
+//!
+//! A [`UsbDevice`] is not necessarily something the emulator provides. A
+//! dual-role controller in device mode ([`crate::dev::usb::dwc2::device`]) is a
+//! `UsbDevice` whose answers come out of a register file the guest programmed:
+//! the guest's firmware owns the descriptors, owns `SET_ADDRESS`, and is wrong
+//! in its own way when it is wrong. The seam did not have to change for that —
+//! it is what [`UsbDevice`]'s own documentation always anticipated, and what
+//! [`Peripheral`] deliberately is *not*, since `Peripheral` answers USB 2.0 §9.4
+//! inside the emulator.
+//!
+//! Two things had to be *added* here, and one promise had to be corrected. They
+//! are worth naming because they are the whole difference between the two
+//! directions — the transaction seam itself did not move at all:
+//!
+//! * [`UsbDevice::start_of_frame`] — a `SOF` is the one thing on the wire that
+//!   is neither a transaction nor a reset, and a modelled peripheral never
+//!   needed it. A guest does: `DSTS.FNSOF` is a register a gadget driver reads.
+//!   Additive, with a default that does nothing, so no existing device model
+//!   changed.
+//! * [`host`] — a **host-side transfer composer**. Every caller of
+//!   [`UsbBus::setup`] used to be a controller with a schedule; a test harness,
+//!   a loopback, and a future `usbfs` bridge have none, and would each have
+//!   rewritten the three stages of a control transfer. [`ControlTransfer`] is
+//!   those three stages, once, driven one transaction per call so the caller
+//!   keeps the clock.
+//! * The correction is [`UsbDevice::speed`]'s own documentation, just below: it
+//!   promised a device's speed was fixed for its lifetime, which is true of a
+//!   mouse and false of a gadget whose firmware writes `DCFG.DSPD`. No code
+//!   changed — the fabric already asked afresh every time — but a comment that
+//!   is now wrong is worse than one that was never written.
+//!
 //! # A device model is written once
 //!
 //! The same argument [`crate::bus::spi`] makes for `Shifter`: the standard
@@ -81,6 +113,11 @@
 //!   sanctioned route is `usbfs` through raw syscalls (`libusb` is a C library
 //!   and the dependency policy forbids it outright), and it is non-portable and
 //!   non-deterministic enough to want the record/replay seam first.
+//! * **The other passthrough**, which is now the nearer one: handing a guest
+//!   *acting as a device* to a real host, through `usbfs`'s gadget side or a
+//!   `/dev/raw-gadget`. That is a caller of [`host::ControlTransfer`] and the
+//!   bus's transaction methods, and nothing in this module has to change for
+//!   it either. Also not started, and for the same reason.
 //!
 //! # Sources
 //!
@@ -94,6 +131,7 @@
 
 pub mod descriptor;
 pub mod function;
+pub mod host;
 
 #[cfg(test)]
 mod tests;
@@ -109,6 +147,7 @@ pub use descriptor::{
     InterfaceDescriptor, language_descriptor, string_descriptor,
 };
 pub use function::{Endpoint0, Function, Peripheral};
+pub use host::{ControlTransfer, Progress};
 
 // ---------------------------------------------------------------------------
 // Where this module sits in the lock ladder
@@ -643,8 +682,16 @@ pub mod feature {
 ///
 /// `Send + Sync` like every device-facing trait (`ROADMAP.md` §0).
 pub trait UsbDevice: Send + Sync + fmt::Debug {
-    /// How fast this device signals. Fixed for its lifetime: a device does not
-    /// change speed, it is a different device.
+    /// How fast this device signals.
+    ///
+    /// Asked afresh every time the fabric needs it — [`UsbBus::speed`] does not
+    /// cache — because the answer is not always a constant. For a modelled
+    /// peripheral it is: a mouse is a full-speed device and would be a
+    /// different device if it were not. For a **guest acting as a device** it
+    /// is a register: a dual-role core with a high-speed transceiver runs at
+    /// full speed when its firmware writes `DCFG.DSPD` saying so, and the
+    /// answer changes when the firmware does. What must not change is the
+    /// answer *within* an enumeration, since the host latches it at reset.
     fn speed(&self) -> Speed;
 
     /// The address it currently answers to.
@@ -660,6 +707,26 @@ pub trait UsbDevice: Send + Sync + fmt::Debug {
     /// Back to the Default state: address zero, unconfigured, endpoints
     /// unhalted, toggles cleared.
     fn bus_reset(&self);
+
+    /// A start-of-frame token went past (USB 2.0 §8.4.3).
+    ///
+    /// `frame` is the eleven-bit frame number the token carried.
+    ///
+    /// **The one thing on the wire that is not a transaction.** A `SOF` is a
+    /// token with no data phase and no handshake, broadcast to everything on
+    /// the bus rather than addressed, and the fabric would have no way to carry
+    /// it if [`UsbDevice`] spoke only transactions — which is precisely the
+    /// argument [`UsbDevice::bus_reset`] already makes for reset, the other
+    /// non-transaction event a device sees.
+    ///
+    /// It exists because a device that *is* a guest needs it: `DSTS.FNSOF` on a
+    /// dwc2 in device mode is the frame number of the last `SOF` seen, and
+    /// `GINTSTS.SOF` is how a gadget driver paces an isochronous endpoint. A
+    /// [`Peripheral`] ignores it, which is why the default is to do nothing —
+    /// no existing device model changed when this arrived.
+    fn start_of_frame(&self, frame: u16) {
+        let _ = frame;
+    }
 
     /// A `SETUP` transaction on a control endpoint.
     ///
@@ -898,6 +965,23 @@ impl UsbBus {
         // Outside the lock: a device may reach further from its own reset.
         if let Some(device) = self.device(port) {
             device.bus_reset();
+        }
+    }
+
+    /// Broadcast a start-of-frame to everything plugged into this bus.
+    ///
+    /// Every *connected* device, not only the enabled ones: a `SOF` is not
+    /// addressed, and a device still in the Default state counts frames like
+    /// any other (USB 2.0 §8.4.3). A controller calls this once per frame, at
+    /// the frame boundary and with no lock of its own held.
+    pub fn start_of_frame(&self, frame: u16) {
+        let devices: Vec<Arc<dyn UsbDevice>> = {
+            let ports = self.ports.lock();
+            ports.iter().filter_map(|p| p.device.clone()).collect()
+        };
+        // Outside the lock: a device may reach further from its own frame tick.
+        for device in devices {
+            device.start_of_frame(frame & 0x7ff);
         }
     }
 
