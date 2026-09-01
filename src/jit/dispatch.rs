@@ -1,0 +1,566 @@
+//! The dispatcher: the loop that keeps a guest inside translated code.
+//!
+//! Lift on a miss, cache under `(pc, key)`, patch the exit to its successor,
+//! and go round again without leaving for the interpreter. This is where the
+//! three mechanisms in [`jit`](super) meet, and it is deliberately the only
+//! place that knows the order they run in.
+//!
+//! # What is generic, and what a guest supplies
+//!
+//! Nothing here knows what a RISC-V is. A guest supplies a [`Frontend`] —
+//! which world it is in ([`Frontend::key`], [`Frontend::epoch`]), how to lift
+//! one block ([`Frontend::translate`]), and which slot the guest PC lands in
+//! at a block exit ([`Frontend::pc_slot`]) — and an
+//! [`IrHost`](crate::ir::IrHost) that also implements [`StoreLog`], so guest
+//! writes can be matched against cached translations.
+//!
+//! # Why self-modifying code is reported rather than intercepted
+//!
+//! A guest store goes through [`IrHost::store`](crate::ir::IrHost::store),
+//! which the dispatcher never sees, and putting the block cache behind a lock
+//! so the store path could reach it would put a lock on the one path that
+//! cannot afford one. So a host **accumulates** the guest-physical pages it
+//! wrote ([`DirtyPages`] is a ready-made accumulator) and the dispatcher
+//! drains them at each block boundary.
+//!
+//! Draining at a boundary rather than at the store is not a compromise, it is
+//! the correct granularity for the two guests that matter here. RISC-V
+//! requires a `FENCE.I` between a store to instruction memory and executing
+//! it, so a store's effect on *later* blocks is all the ISA promises; and the
+//! current lifter ends a block at its first load or store anyway, so nothing
+//! after a store in the same block exists to be modified. An x86 frontend
+//! needs the check *within* a block — x86 makes coherent instruction caches
+//! architectural — and will need a finer hook than this one; that is recorded
+//! here rather than discovered later.
+//!
+//! # Safe points
+//!
+//! A [`Dispatcher`] carrying an [`ExitFlag`] tests it at each block boundary
+//! and stops with [`Stop::Exit`]. That is §4.7's protocol exactly: a
+//! generation counter plus a per-CPU flag checked at block boundaries, never a
+//! signal, because wasm has none.
+
+use alloc::vec::Vec;
+
+use crate::core::error::Result;
+use crate::core::sched::ExitFlag;
+use crate::ir::{Block, Fault, Interp, IrHost, Opcode, Outcome, RegSlot};
+use crate::jit::cache::{BlockCache, BlockId, CacheStats};
+use crate::jit::tlb::{Epoch, PAGE_MASK, PAGE_SIZE};
+
+/// One freshly lifted block, and what the cache needs to know about it.
+#[derive(Debug)]
+pub struct Translation {
+    /// The block.
+    pub block: Block,
+    /// The guest-**physical** page its bytes were read from.
+    ///
+    /// Physical, not virtual: a guest write is matched against this, and a
+    /// write arrives at a physical address. A block never leaves the page it
+    /// started on, so one page is the whole answer.
+    pub page: u64,
+    /// How many guest instructions the block covers.
+    ///
+    /// Zero means the frontend could not lift the instruction at the entry PC,
+    /// and the dispatcher stops with [`Stop::Untranslatable`] rather than
+    /// spinning on a block that cannot advance the PC.
+    pub insns: usize,
+}
+
+/// What a dispatcher needs from a guest.
+pub trait Frontend {
+    /// The counters this guest's translations are stale against.
+    ///
+    /// Read at the start of every [`Dispatcher::run`], so a stop-the-world
+    /// retopology is observed at a block boundary rather than after it.
+    fn epoch(&mut self) -> Epoch;
+
+    /// The rest of the cache key beside the guest PC — the value the frontend
+    /// puts in [`Block::key`](crate::ir::Block::key).
+    fn key(&mut self) -> u64;
+
+    /// The slot a block leaves the guest PC in at its exit boundary.
+    fn pc_slot(&self) -> RegSlot;
+
+    /// Lift the block at `pc`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the frontend says. A dispatcher does not try to recover.
+    fn translate(&mut self, pc: u64) -> Result<Translation>;
+}
+
+/// A host that reports which guest-physical pages its stores touched.
+///
+/// The self-modifying-code half of the contract. A host that cannot write
+/// guest memory implements this as an empty method.
+pub trait StoreLog {
+    /// Hand over the pages stored to since the last call, and forget them.
+    fn drain_dirty(&mut self, sink: &mut dyn FnMut(u64));
+}
+
+/// A ready-made accumulator a host can embed to satisfy [`StoreLog`].
+///
+/// Records pages, not addresses, and de-duplicates against the most recent —
+/// a guest memcpy walks one page for hundreds of stores, and a list with one
+/// entry per store would be the expensive part of the mechanism.
+#[derive(Debug, Clone, Default)]
+pub struct DirtyPages {
+    pages: Vec<u64>,
+}
+
+impl DirtyPages {
+    /// An empty log.
+    #[must_use]
+    pub fn new() -> DirtyPages {
+        DirtyPages::default()
+    }
+
+    /// Record a store of `len` bytes at guest-physical `phys`.
+    #[inline]
+    pub fn note(&mut self, phys: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let first = phys & !PAGE_MASK;
+        let last = phys.saturating_add(len - 1) & !PAGE_MASK;
+        let mut page = first;
+        loop {
+            if self.pages.last() != Some(&page) {
+                self.pages.push(page);
+            }
+            if page >= last {
+                break;
+            }
+            page = page.saturating_add(PAGE_SIZE);
+        }
+    }
+
+    /// Whether anything has been recorded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+}
+
+impl StoreLog for DirtyPages {
+    fn drain_dirty(&mut self, sink: &mut dyn FnMut(u64)) {
+        for page in self.pages.drain(..) {
+            sink(page);
+        }
+    }
+}
+
+/// Why a run stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Stop {
+    /// The block budget ran out. The guest is mid-flight and the PC is live.
+    Budget,
+    /// The safe-point flag was raised (`ROADMAP.md` §4.7).
+    Exit,
+    /// A guest access faulted. The guest's own fault path takes it from here.
+    Fault(Fault),
+    /// The block reached an op this backend does not implement.
+    Unsupported {
+        /// The op.
+        op: Opcode,
+        /// Its index in the block.
+        at: usize,
+    },
+    /// The frontend could not lift the instruction at this PC, so the guest's
+    /// own interpreter has to execute it.
+    Untranslatable {
+        /// The guest PC.
+        pc: u64,
+    },
+}
+
+/// What a run did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Run {
+    /// The guest PC to resume at.
+    pub pc: u64,
+    /// How many blocks executed.
+    pub blocks: usize,
+    /// How many guest instructions those blocks covered.
+    pub insns: usize,
+    /// Why it stopped.
+    pub stop: Stop,
+}
+
+/// What a dispatcher has been asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DispatchStats {
+    /// Blocks executed.
+    pub blocks: u64,
+    /// Blocks reached by following a patched exit.
+    pub chained: u64,
+    /// Blocks reached by a hash lookup.
+    pub looked_up: u64,
+    /// Blocks translated.
+    pub translated: u64,
+    /// Blocks invalidated by a guest store.
+    pub smc: u64,
+    /// Times the epoch moved and the caches were resynchronised.
+    pub resyncs: u64,
+}
+
+/// The loop that keeps a guest inside translated code.
+#[derive(Debug)]
+pub struct Dispatcher {
+    cache: BlockCache,
+    interp: Interp,
+    exit: Option<ExitFlag>,
+    stats: DispatchStats,
+}
+
+impl Dispatcher {
+    /// A dispatcher over a default-sized cache.
+    #[must_use]
+    pub fn new() -> Dispatcher {
+        Dispatcher::with_cache(BlockCache::new())
+    }
+
+    /// A dispatcher over `cache`.
+    #[must_use]
+    pub fn with_cache(cache: BlockCache) -> Dispatcher {
+        Dispatcher {
+            cache,
+            interp: Interp::new(),
+            exit: None,
+            stats: DispatchStats::default(),
+        }
+    }
+
+    /// The same dispatcher, unwinding when `flag` is raised.
+    #[must_use]
+    pub fn with_exit_flag(mut self, flag: ExitFlag) -> Dispatcher {
+        self.exit = Some(flag);
+        self
+    }
+
+    /// The block cache, for statistics and for a caller that invalidates.
+    #[inline]
+    #[must_use]
+    pub fn cache(&self) -> &BlockCache {
+        &self.cache
+    }
+
+    /// The block cache, mutably.
+    #[inline]
+    pub fn cache_mut(&mut self) -> &mut BlockCache {
+        &mut self.cache
+    }
+
+    /// What this dispatcher has been asked to do.
+    #[inline]
+    #[must_use]
+    pub fn stats(&self) -> DispatchStats {
+        self.stats
+    }
+
+    /// The cache's own statistics.
+    #[inline]
+    #[must_use]
+    pub fn cache_stats(&self) -> CacheStats {
+        self.cache.stats()
+    }
+
+    /// Run at most `budget` blocks from `pc`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Frontend::translate`] or
+    /// [`Interp::run`](crate::ir::Interp::run) said. Neither is recoverable
+    /// here: a frontend that cannot lift says so with `insns == 0`, and a
+    /// backend error is a malformed block.
+    ///
+    /// # Panics
+    ///
+    /// Never: every block reached through the cache is one this run inserted
+    /// or found, and both are checked.
+    pub fn run<F, H>(
+        &mut self,
+        front: &mut F,
+        host: &mut H,
+        mut pc: u64,
+        budget: usize,
+    ) -> Result<Run>
+    where
+        F: Frontend + ?Sized,
+        H: IrHost + StoreLog + ?Sized,
+    {
+        if self.cache.sync(front.epoch()) {
+            self.stats.resyncs += 1;
+        }
+        let pc_slot = front.pc_slot();
+        let mut from: Option<BlockId> = None;
+        let mut blocks = 0usize;
+        let mut insns = 0usize;
+
+        let stop = loop {
+            if blocks >= budget {
+                break Stop::Budget;
+            }
+            if self.exit.as_ref().is_some_and(ExitFlag::raised) {
+                break Stop::Exit;
+            }
+
+            let key = front.key();
+            let (id, chained) = match from.and_then(|f| self.cache.follow(f, pc, key)) {
+                Some(id) => (id, true),
+                None => match self.cache.lookup(pc, key) {
+                    Some(id) => {
+                        self.stats.looked_up += 1;
+                        (id, false)
+                    }
+                    None => {
+                        let t = front.translate(pc)?;
+                        self.stats.translated += 1;
+                        if t.insns == 0 {
+                            break Stop::Untranslatable { pc };
+                        }
+                        (self.cache.insert(pc, key, t.page, t.insns, t.block), false)
+                    }
+                },
+            };
+            if chained {
+                self.stats.chained += 1;
+            } else if let Some(f) = from {
+                // The patch. Next time this predecessor exits to this PC it
+                // reaches the successor with no lookup at all.
+                self.cache.link(f, pc, id);
+            }
+
+            let block = self
+                .cache
+                .block(id)
+                .expect("a block just found or just inserted is resident");
+            let outcome = self.interp.run(block, host)?;
+            self.stats.blocks += 1;
+            blocks += 1;
+            insns += self.cache.insns(id).unwrap_or(0);
+
+            // Guest stores land before the next block is chosen, so a block
+            // invalidated by one is never served afterwards.
+            let cache = &mut self.cache;
+            let mut hit = 0usize;
+            host.drain_dirty(&mut |page| hit += cache.note_write(page, 1));
+            self.stats.smc += hit as u64;
+            let survived = self.cache.block(id).is_some();
+
+            match outcome {
+                Outcome::Exit => pc = host.read_slot(pc_slot) as u64,
+                Outcome::Goto { pc: next } | Outcome::Lookup { pc: next } => pc = next,
+                Outcome::Fault(f) => break Stop::Fault(f),
+                Outcome::Unsupported { op, at } => break Stop::Unsupported { op, at },
+            }
+            // A block that wrote into its own page is gone, and the id that
+            // named it may already have been reused, so it cannot be the
+            // predecessor of the next link.
+            from = survived.then_some(id);
+        };
+
+        Ok(Run {
+            pc,
+            blocks,
+            insns,
+            stop,
+        })
+    }
+}
+
+impl Default for Dispatcher {
+    fn default() -> Dispatcher {
+        Dispatcher::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::error::BusError;
+    use crate::core::space::MemResult;
+    use crate::ir::{BlockBuilder, Const, InsnStart, MemOp, Type};
+    use alloc::vec;
+
+    const PC: RegSlot = RegSlot(0);
+
+    /// A block that leaves `next` in the PC slot and exits.
+    fn straight(pc: u64, next: u64) -> Block {
+        let mut b = BlockBuilder::new(pc, 0);
+        b.insn_start(InsnStart {
+            pc,
+            next_pc: next,
+            ticks: 0,
+            live: Vec::new(),
+        });
+        b.charge(1);
+        let t = b.imm(Type::I64, Const::Int(u128::from(next)));
+        b.insn_start(InsnStart {
+            pc: next,
+            next_pc: next,
+            ticks: 1,
+            live: vec![(PC, t)],
+        });
+        b.exit_tb();
+        b.finish()
+    }
+
+    /// A frontend over a fixed straight-line chain of blocks.
+    struct Chain {
+        /// `pc -> next pc`, for as many blocks as the test wants.
+        step: u64,
+        limit: u64,
+        epoch: Epoch,
+        key: u64,
+        translated: Vec<u64>,
+    }
+
+    impl Frontend for Chain {
+        fn epoch(&mut self) -> Epoch {
+            self.epoch
+        }
+        fn key(&mut self) -> u64 {
+            self.key
+        }
+        fn pc_slot(&self) -> RegSlot {
+            PC
+        }
+        fn translate(&mut self, pc: u64) -> Result<Translation> {
+            self.translated.push(pc);
+            let next = if pc + self.step >= self.limit {
+                0x1000
+            } else {
+                pc + self.step
+            };
+            Ok(Translation {
+                block: straight(pc, next),
+                page: pc & !PAGE_MASK,
+                insns: 1,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct Host {
+        slots: [u64; 4],
+        ticks: u64,
+        dirty: DirtyPages,
+    }
+
+    impl IrHost for Host {
+        fn read_slot(&mut self, slot: RegSlot) -> u128 {
+            u128::from(self.slots[slot.0 as usize])
+        }
+        fn write_slot(&mut self, slot: RegSlot, value: u128) {
+            self.slots[slot.0 as usize] = value as u64;
+        }
+        fn load(&mut self, _mem: &MemOp, _addr: u64) -> MemResult<u64> {
+            Err(BusError::Unassigned)
+        }
+        fn store(&mut self, mem: &MemOp, addr: u64, _value: u64) -> MemResult {
+            self.dirty.note(addr, mem.size.bytes());
+            Ok(())
+        }
+        fn charge(&mut self, ticks: u64) {
+            self.ticks += ticks;
+        }
+        fn insn_start(&mut self, _mark: &InsnStart) {}
+    }
+
+    impl StoreLog for Host {
+        fn drain_dirty(&mut self, sink: &mut dyn FnMut(u64)) {
+            self.dirty.drain_dirty(sink);
+        }
+    }
+
+    fn chain(step: u64, limit: u64) -> Chain {
+        Chain {
+            step,
+            limit,
+            epoch: Epoch::default(),
+            key: 0,
+            translated: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_loop_is_translated_once_and_then_chained() {
+        let mut d = Dispatcher::with_cache(BlockCache::with_capacity(64));
+        let mut f = chain(4, 0x1010);
+        let mut h = Host::default();
+        let run = d.run(&mut f, &mut h, 0x1000, 400).expect("runs");
+        assert_eq!(run.blocks, 400);
+        assert_eq!(run.insns, 400);
+        assert_eq!(run.stop, Stop::Budget);
+        // Four distinct blocks in the loop, translated once each.
+        assert_eq!(f.translated.len(), 4);
+        assert_eq!(d.stats().translated, 4);
+        // and after the first time round, every edge is a patched exit.
+        assert!(
+            d.stats().chained >= 390,
+            "chained {} of {}",
+            d.stats().chained,
+            run.blocks
+        );
+        assert_eq!(d.cache_stats().stale_links, 0);
+        d.cache().check().expect("consistent");
+    }
+
+    #[test]
+    fn every_tick_is_charged_whether_the_block_was_cached_or_not() {
+        // A cache hit and a cache miss must be indistinguishable to the guest,
+        // including in cycle accounting (`ROADMAP.md` §0). Each block charges
+        // one, so the total is the block count however the blocks were found.
+        let mut d = Dispatcher::new();
+        let mut f = chain(4, 0x1010);
+        let mut h = Host::default();
+        let run = d.run(&mut f, &mut h, 0x1000, 97).expect("runs");
+        assert_eq!(h.ticks, run.blocks as u64);
+        assert!(d.stats().chained > 0, "and chaining really happened");
+    }
+
+    #[test]
+    fn a_raised_exit_flag_stops_at_a_block_boundary() {
+        let flag = ExitFlag::default();
+        let mut d = Dispatcher::new().with_exit_flag(flag.clone());
+        let mut f = chain(4, 0x1010);
+        let mut h = Host::default();
+        assert_eq!(
+            d.run(&mut f, &mut h, 0x1000, 10).expect("runs").stop,
+            Stop::Budget
+        );
+        flag.raise();
+        let run = d.run(&mut f, &mut h, 0x1000, 10).expect("runs");
+        assert_eq!(run.stop, Stop::Exit);
+        assert_eq!(run.blocks, 0, "no block starts once the flag is up");
+    }
+
+    #[test]
+    fn an_epoch_change_between_runs_resynchronises_the_cache() {
+        let mut d = Dispatcher::new();
+        let mut f = chain(4, 0x1010);
+        let mut h = Host::default();
+        d.run(&mut f, &mut h, 0x1000, 20).expect("runs");
+        assert_eq!(d.stats().translated, 4);
+        f.epoch.topology += 1;
+        d.run(&mut f, &mut h, 0x1000, 20).expect("runs");
+        assert_eq!(d.stats().resyncs, 1);
+        assert_eq!(d.stats().translated, 8, "every block was lifted again");
+    }
+
+    #[test]
+    fn a_key_change_is_a_different_translation_at_the_same_pc() {
+        let mut d = Dispatcher::new();
+        let mut f = chain(4, 0x1010);
+        let mut h = Host::default();
+        d.run(&mut f, &mut h, 0x1000, 20).expect("runs");
+        f.key = 1;
+        d.run(&mut f, &mut h, 0x1000, 20).expect("runs");
+        assert_eq!(d.stats().translated, 8);
+        assert_eq!(d.cache_stats().stale_links, 0);
+        d.cache().check().expect("consistent");
+    }
+}

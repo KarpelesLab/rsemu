@@ -60,7 +60,7 @@ use libfuzzer_sys::fuzz_target;
 
 use rsemu::cpu::riscv::Config;
 use rsemu::cpu::riscv::csr::Extensions;
-use rsemu::cpu::riscv::differential::{Case, compare, synthesize};
+use rsemu::cpu::riscv::differential::{Case, compare, compare_cached, synthesize};
 
 /// How many instructions one input may describe.
 ///
@@ -111,5 +111,15 @@ fuzz_target!(|data: &[u8]| {
     let case = Case::seeded(program).with_config(cfg);
     if let Err(divergence) = compare(&case) {
         panic!("the lifter and the interpreter disagree:\n{divergence}");
+    }
+    // The same program again, through the translation runtime: many blocks
+    // rather than one, served from a cache, chained exit to exit, invalidated
+    // by the guest's own stores, and every access resolved through a software
+    // TLB. `compare` is blind to all of that — a single block is never served
+    // twice — so a corpus entry that is interesting for the frontend is
+    // interesting for the runtime too, and it costs one more run of bytes the
+    // fuzzer has already found.
+    if let Err(divergence) = compare_cached(&case, 32) {
+        panic!("the cached path and the interpreter disagree:\n{divergence}");
     }
 });
