@@ -21,6 +21,8 @@
 //! | [`lcd`] | `dev-lcdc` | a generic RGB scanout engine: framebuffer in, `Scanout` out |
 //! | [`sitronix`] | `dev-st7272a` | the ST7272A TFT panel driver: SPI register configuration, no pixel path |
 //! | [`riscv`] | `dev-riscv` | the RISC-V `virt` board: CLINT, PLIC, 16550, virtio, and the device tree generator |
+//! | [`sd`] | `dev-sd-card` | an SD memory card: the command set, the state machine, the registers |
+//! | [`stm32`] | `dev-stm32-*` | STM32 peripherals; today the H7 family's SDMMC host controller |
 //! | [`usb`] | `dev-usb-*` | USB host controllers — a generic EHCI and the ChipIdea/ARC variant over it — and a HID mouse |
 //! | [`wdc`] | `dev-wdc` | the W65C51N ACIA and W65C22 VIA, and a 6502 board's ROM |
 //!
@@ -75,6 +77,14 @@ pub mod sms;
 #[cfg(feature = "dev-riscv")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-riscv")))]
 pub mod riscv;
+
+#[cfg(feature = "dev-sd-card")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-sd-card")))]
+pub mod sd;
+
+#[cfg(feature = "dev-stm32-sdmmc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-sdmmc")))]
+pub mod stm32;
 
 #[cfg(any(
     feature = "dev-usb-ehci",

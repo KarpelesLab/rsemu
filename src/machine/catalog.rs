@@ -349,6 +349,10 @@ pub fn registry() -> Result<Registry> {
     crate::dev::riscv::register(&mut reg)?;
     #[cfg(feature = "dev-flash-cfi")]
     crate::dev::flash::register(&mut reg)?;
+    #[cfg(feature = "dev-sd-card")]
+    crate::dev::sd::register(&mut reg)?;
+    #[cfg(feature = "dev-stm32-sdmmc")]
+    crate::dev::stm32::register(&mut reg)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::register(&mut reg)?;
     #[cfg(feature = "cpu-x86")]
@@ -422,6 +426,10 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::riscv::bind(&mut b)?;
     #[cfg(feature = "dev-flash-cfi")]
     crate::dev::flash::bind(&mut b)?;
+    #[cfg(feature = "dev-sd-card")]
+    crate::dev::sd::bind(&mut b)?;
+    #[cfg(feature = "dev-stm32-sdmmc")]
+    crate::dev::stm32::bind(&mut b)?;
     #[cfg(feature = "dev-wdc")]
     crate::dev::wdc::bind(&mut b)?;
     #[cfg(feature = "cpu-x86")]
@@ -490,6 +498,14 @@ pub fn classes() -> ClassTable {
     }
     #[cfg(feature = "dev-flash-cfi")]
     for schema in crate::dev::flash::schemas() {
+        table.insert(schema);
+    }
+    #[cfg(feature = "dev-sd-card")]
+    for schema in crate::dev::sd::schemas() {
+        table.insert(schema);
+    }
+    #[cfg(feature = "dev-stm32-sdmmc")]
+    for schema in crate::dev::stm32::schemas() {
         table.insert(schema);
     }
     #[cfg(feature = "dev-wdc")]

@@ -319,6 +319,33 @@ dev-riscv = []
 # what installs `gEfiVariableWriteArchProtocolGuid`, and RAM cannot provide it.
 dev-flash-cfi = []
 
+# An SD memory card (src/dev/sd): the protocol, not a controller. The command
+# set (CMD0/CMD8/ACMD41 initialisation, CMD2/CMD3 identification, CMD7 select,
+# CMD9/CMD10 register reads, CMD16/CMD17/CMD18/CMD23/CMD24/CMD25 transfers,
+# CMD12 stop, CMD32/33/38 erase, CMD6 switch and ACMD6/13/51), the nine-state
+# machine of Physical Layer Table 4-35, the R1/R1b/R2/R3/R6/R7 response shapes,
+# the OCR/CID/CSD/SCR registers with real CRC7s, and both addressing modes --
+# standard capacity counts bytes, high capacity counts 512-byte blocks, and a
+# CSD of the matching version is generated for each. Controller-agnostic on
+# purpose: an SPI-mode card and an SD-mode card are the same die, so an SPI
+# controller hangs off this same model rather than a second one. Backed by a
+# media slot rather than `fstool`, for the same reason `dev-flash-cfi` is.
+# Written from the SD Association's freely published Physical Layer Simplified
+# Specification. `no_std + alloc`, no `unsafe`, no dependencies.
+dev-sd-card = []
+
+# The STM32H7 SDMMC host controller (src/dev/stm32/sdmmc.rs): the register
+# block a driver programs -- POWER, CLKCR, ARGR, CMDR, RESPCMDR, RESP1R-RESP4R,
+# DTIMER, DLENR, DCTRL, DCNTR, STAR, ICR, MASKR and the sixteen-word FIFO --
+# plus the internal DMA (IDMACTRLR/IDMABSIZER/IDMABASE0R/IDMABASE1R), which is
+# what makes this a bus master that moves a block into guest memory itself. The
+# H7 family rather than the F4's SDIO precisely because of that: the F4 has no
+# internal DMA and needs a DMA2 controller nothing in this tree models yet.
+# Drives an `irq` output from STAR & MASKR. Needs `dev-sd-card` to have
+# anything to talk to. Written from ST's RM0433. `no_std + alloc`, no `unsafe`,
+# no dependencies.
+dev-stm32-sdmmc = ["dev-sd-card"]
+
 # The RISC-V `virt` board as a machine (machines/riscv-virt.machine plus the
 # classes it names): the first machine rsemu can boot real system software on.
 # `rsemu run riscv-virt --firmware fw.bin` loads an image at 0x80000000, hands
