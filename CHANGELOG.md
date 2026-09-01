@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/KarpelesLab/rsemu/compare/v0.0.2...v0.0.3) - 2026-09-01
+
+### Added
+
+- *(dev-stm32)* SPI, OCTOSPI and I2C, with a SPI-NOR flash and an EEPROM to talk to
+- *(dev-spinor)* a W25Q-class SPI-NOR flash on the SPI bus
+- *(space)* [**breaking**] permissions on a mapping, and a flatten per guard rather than per map
+- *(space)* [**breaking**] a mapping layer — what answers, and on what terms
+- *(bus-usb)* a USB fabric, a generic EHCI, and the ChipIdea/ARC variant
+- *(dev-sms)* the Sega Master System, and phase 4's second genericity proof
+- *(host)* an audio seam, WAV capture, and NES sound in the browser
+- *(exec)* the level-3 seam — a core that exits at a syscall
+
+### Fixed
+
+- *(machine)* iterate every workload, and correct a generalisation I got wrong
+- *(dev-gb)* mooneye acceptance 22 of 66 to 59 of 66, blargg to 12 of 12
+- *(machine)* run_for_additive must not panic in a build with no machines
+
+### Other
+
+- describe the no_std gate as it is actually built
+- *(cpu-riscv)* riscv-arch-test at 181 of 181, without RISCOF
+- *(machine)* measure whether run_for is additive — it is not
+- *(machine)* a headless frame-hash regression and a frame-time benchmark
+- smoke-run the frame-time benchmark harness
+- *(machine)* a headless frame-hash regression and a frame-time benchmark
+
 ## [0.0.2](https://github.com/KarpelesLab/rsemu/compare/v0.0.1...v0.0.2) - 2026-08-31
 
 ### Added
