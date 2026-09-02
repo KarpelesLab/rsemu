@@ -111,6 +111,26 @@ readonly BUSYBOX_MEMBER="./usr/bin/busybox"
 # matching the fetched `linux` image is found, for `initramfs-virtio` below.
 readonly DEBIAN_PACKAGES="https://deb.debian.org/debian/dists/trixie/main/binary-riscv64/Packages.gz"
 
+# FreeDOS 1.3, floppy edition. `144m/x86BOOT.img` inside the archive is a
+# 1.44 MB FAT12 boot diskette: the FreeDOS kernel, FDCONFIG.SYS, COMMAND.COM
+# and the 1.3 installer. It is what `tests/pc_at_boot.rs` boots on rsemu's own
+# BIOS -- the ROADMAP.md phase 6a gate.
+#
+# The whole archive is 21 MiB and only one file of it is kept, which is still
+# the cheapest way in: the other editions are CD and USB images this board has
+# no way to boot from yet.
+#
+# GPL-2.0 for the kernel; the distribution as a whole is a mix. FETCH-ONLY,
+# exactly like the RISC-V kernel above: booting it as an emulated guest is
+# ordinary use, committing it here would be redistribution, and its source is
+# off limits (ROADMAP.md 1).
+readonly FREEDOS_ZIP="https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/distributions/1.3/official/FD13-FloppyEdition.zip"
+# From upstream's own verify.txt beside the archive. FreeDOS 1.3 is a released
+# version and is not rebuilt, so a mismatch means the wrong file. Fatal.
+readonly FREEDOS_ZIP_SHA="75a4e11a7fce6f124e20927b3022b4b715a2a3f7324c5f5bfea42d90d80eb072"
+readonly FREEDOS_MEMBER="144m/x86BOOT.img"
+readonly FREEDOS_IMG_SHA="3f7834ea4575ba05d106e4b8f59f886da7bfb1979ee386be2a2deba8df518925"
+
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
@@ -490,6 +510,45 @@ Consumed by RSEMU_SMS_ZEXALL_DIR in src/dev/sms/conformance.rs."
 	note "  Then:"
 	note "      RSEMU_CONFORMANCE=1 RSEMU_SMS_ZEXALL_DIR=${dest} \\"
 	note "      cargo test --release --all-features -- --nocapture sms::conformance"
+}
+
+fetch_freedos() {
+	need curl
+	need unzip
+	local dest="${DEST_ROOT}/freedos"
+	local img="${dest}/x86BOOT.img"
+	local zip="${DEST_ROOT}/FD13-FloppyEdition.zip"
+
+	if [ "$FORCE" = 0 ] && [ -f "$img" ] \
+		&& [ "$(sha256_of "$img")" = "$FREEDOS_IMG_SHA" ]; then
+		ok "freedos already present and verified"
+	else
+		note "  downloading FD13-FloppyEdition.zip (21 MiB) ..."
+		download "$FREEDOS_ZIP" "$zip"
+		verify "$zip" "$FREEDOS_ZIP_SHA" fatal
+		mkdir -p "$dest"
+		unzip -q -o -j "$zip" "$FREEDOS_MEMBER" -d "$dest"
+		rm -f "$zip"
+		verify "$img" "$FREEDOS_IMG_SHA" fatal
+		ok "freedos: x86BOOT.img ($(wc -c <"$img" | tr -d ' ') bytes)"
+	fi
+
+	write_notice "$dest" "FreeDOS 1.3, floppy edition -- 144m/x86BOOT.img
+from https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/distributions/1.3/official/
+
+Licence: GPL-2.0 for the kernel; the distribution as a whole is a mix and each
+component carries its own terms. FETCH AND RUN ONLY -- do not commit this
+image, do not vendor it, do not attach it to a release. Booting it as an
+emulated guest is ordinary use; redistributing it is not ours to do, and its
+source was not read (ROADMAP.md 1).
+
+A 1.44 MB FAT12 diskette: the FreeDOS kernel, FDCONFIG.SYS, COMMAND.COM and
+the 1.3 installer. tests/pc_at_boot.rs boots it on rsemu's own BIOS."
+
+	note ""
+	note "  Then:"
+	note "      RSEMU_FREEDOS_FLOPPY=${img} \\"
+	note "      cargo test --release --all-features --test pc_at_boot -- --nocapture freedos"
 }
 
 fetch_wozmon() {
@@ -1485,6 +1544,7 @@ Suites:
   gameboy        blargg GB + mooneye acceptance (mixed; see the notices)
   sms            ZEXALL-SMS, the Z80 exerciser  (GPL-2.0, FETCH-ONLY)
   wozmon         the Apple 1 monitor           (licence unclear, BRING YOUR OWN)
+  freedos        FreeDOS 1.3 boot diskette      (GPL-2.0, FETCH-ONLY)
   opensbi        RISC-V firmware for riscv-virt (BSD-2-Clause, redistributable)
   riscv-arch-test  the RISC-V architectural certification tests (BSD-3-Clause).
                  Built rather than downloaded: needs clang and a RISC-V linker
@@ -1531,7 +1591,7 @@ list_present() {
 	fi
 	local suite
 	for suite in sst-65x02 mips-r3000 nestest accuracycoin gb-blargg gb-mooneye \
-		sms-zexall apple1 riscv riscv-arch-test; do
+		sms-zexall apple1 riscv riscv-arch-test freedos; do
 		if [ -d "${DEST_ROOT}/${suite}" ]; then
 			printf '  %-14s %s\n' "$suite" \
 				"$(du -sh "${DEST_ROOT}/${suite}" 2>/dev/null | cut -f1) present"
@@ -1549,7 +1609,7 @@ SUITES=()
 
 while [ $# -gt 0 ]; do
 	case "$1" in
-		--all) SUITES=(sst-65x02 mips-r3000 nestest accuracycoin gameboy sms opensbi) ;;
+		--all) SUITES=(sst-65x02 mips-r3000 nestest accuracycoin gameboy sms opensbi freedos) ;;
 		--force) FORCE=1 ;;
 		--variant) SST_VARIANT="${2:?--variant needs a value}"; shift ;;
 		--opcodes) SST_OPCODES="${2:?--opcodes needs a value}"; shift ;;
@@ -1562,7 +1622,7 @@ while [ $# -gt 0 ]; do
 	shift
 done
 
-[ ${#SUITES[@]} -eq 0 ] && SUITES=(sst-65x02 mips-r3000 nestest accuracycoin gameboy sms opensbi)
+[ ${#SUITES[@]} -eq 0 ] && SUITES=(sst-65x02 mips-r3000 nestest accuracycoin gameboy sms opensbi freedos)
 
 mkdir -p "$DEST_ROOT"
 # Belt and braces: even if the repository .gitignore is edited, nothing under
@@ -1582,6 +1642,7 @@ for suite in "${SUITES[@]}"; do
 		gameboy|gb) fetch_gameboy ;;
 		sms|mastersystem) fetch_sms ;;
 		wozmon|apple1) fetch_wozmon ;;
+		freedos|dos) fetch_freedos ;;
 		opensbi|riscv) fetch_opensbi ;;
 		riscv-arch-test|arch-test|act) fetch_arch_test ;;
 		edk2|uefi) fetch_edk2 ;;

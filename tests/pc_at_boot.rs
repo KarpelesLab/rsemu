@@ -23,11 +23,24 @@
 //!    for the geometry *and* for a second read of its own, and `INT 15h` for
 //!    the `E820` map. Everything it learns it leaves in low memory, where this
 //!    test reads it.
+//! 6. It **writes** — `INT 13h AH=03h` to the diskette and to the fixed disk,
+//!    each read back afterwards. The fixed disk's is checked against the
+//!    drive's own medium through `ata::bays`, which is the standard
+//!    `tests/pc_at_ide.rs` sets.
+//! 7. And it moves a block out to 8 MiB and back with `INT 15h AH=87h`, the
+//!    one service that reaches above the first megabyte from real mode.
 //!
 //! The boot sector is assembled by [`rsemu::fw::asm16`], the same assembler the
 //! firmware is built with — so the test guest is written the same way the
 //! firmware is, and the assembler is exercised by something other than its own
 //! unit tests.
+//!
+//! # And one that is not hermetic, on purpose
+//!
+//! [`freedos_boots_on_rsemus_own_firmware`] is `ROADMAP.md` phase 6a's gate. It
+//! needs a FreeDOS boot diskette, which this repository will never contain, so
+//! it is gated on `RSEMU_FREEDOS_FLOPPY` and skips cleanly without it — exactly
+//! as `tests/pc_at_firmware.rs` is gated on `RSEMU_BIOS`.
 
 #![cfg(all(
     feature = "cpu-x86",
@@ -74,9 +87,85 @@ const E820_BUFFER: u16 = 0x0600;
 /// Where it reads a second sector of its own.
 const SECOND_SECTOR: u16 = 0x0800;
 
+/// Where the boot sector builds the 512 bytes it writes to the diskette, and
+/// then hands to `INT 15h AH=87h`.
+const PATTERN: u16 = 0x0a00;
+
+/// Where the sector it wrote is read back to.
+const READBACK: u16 = 0x0c00;
+
+/// Where `INT 15h AH=87h` brings the pattern back down to.
+const XFER_BACK: u16 = 0x0e00;
+
+/// Where the sector written to the *fixed disk* is read back to. Not
+/// `XFER_BACK + 512`: the word immediately past the block move's landing zone
+/// is the sentinel that says the move did not overrun, so it has to stay
+/// untouched.
+const HD_READBACK: u16 = 0x1200;
+
+/// The one-based sector on cylinder 0, head 0 the guest writes to the fixed
+/// disk. Sector 1 is the boot sector, so this is the fourth — and with sixteen
+/// heads of 63 sectors it is LBA 3, which is [`HD_WRITE_LBA`].
+const HD_WRITE_SECTOR: u8 = 4;
+
+/// The LBA `INT 13h`'s CHS translation turns that into:
+/// `(C x heads + H) x sectors + (S - 1)`, with C and H zero.
+const HD_WRITE_LBA: u64 = HD_WRITE_SECTOR as u64 - 1;
+
+/// The first word of the pattern; word `k` is this plus `k`. Not a constant
+/// fill, so a transfer that moved the right number of bytes from the wrong
+/// place fails instead of passing.
+const PATTERN_SEED: u16 = 0x1234;
+
+/// Where `INT 15h AH=87h` puts the pattern: 8 MiB, which is inside the 15 MiB
+/// of extended memory the board fits and unreachable from real mode by any
+/// other means. That is the whole point of the function.
+const EXT_TARGET: u32 = 0x0080_0000;
+
+/// The cylinder the guest writes a diskette sector to. Well away from track
+/// zero, so the boot sector it came off is not the thing being overwritten.
+const WRITE_CYLINDER: u8 = 5;
+/// The head it writes to — the second one, because a transfer that ignored the
+/// head would still land on a legal sector and pass.
+const WRITE_HEAD: u8 = 1;
+/// The one-based sector within that track.
+const WRITE_SECTOR: u8 = 7;
+
+/// The LBA the three above name on a 1.44 MB diskette: eighteen sectors per
+/// track, two heads.
+const WRITE_LBA: u64 =
+    ((WRITE_CYLINDER as u64 * 2) + WRITE_HEAD as u64) * 18 + (WRITE_SECTOR as u64 - 1);
+
 /// The word the boot sector writes last, so "it started" and "it finished" are
 /// two different claims.
 const DONE_MARKER: u16 = 0x600d;
+
+/// One `INT 15h AH=87h` segment descriptor over a 64 KiB window at `base`.
+///
+/// The layout is the ordinary 80386 one — limit 15:0, base 23:0, the access
+/// byte, then limit 19:16 with the flags and base 31:24 (Intel SDM Vol. 3A
+/// §3.4.5). `0x93` is present, ring 0, a data segment that is writable and
+/// already accessed, which is what the interface expects of the two the caller
+/// fills in.
+fn descriptor(base: u32) -> [u8; 8] {
+    [
+        0xff,
+        0xff,
+        base as u8,
+        (base >> 8) as u8,
+        (base >> 16) as u8,
+        0x93,
+        0x00,
+        (base >> 24) as u8,
+    ]
+}
+
+/// The 512 bytes the boot sector generates, writes and copies about.
+fn pattern() -> Vec<u8> {
+    (0..256u16)
+        .flat_map(|k| PATTERN_SEED.wrapping_add(k).to_le_bytes())
+        .collect()
+}
 
 /// What the boot sector prints.
 const GREETING: &str = "rsemu boot sector on rsemu BIOS";
@@ -159,6 +248,88 @@ fn boot_sector(echo: bool) -> Vec<u8> {
     a.int(0x13);
     a.movto(Mem::abs(SCRATCH + 12), AX);
 
+    // -- the diskette, written and read back ---------------------------------
+    //
+    // A pattern generated here rather than carried as data, so 512 bytes of the
+    // sector do not have to fit in the sector. Word `k` is `PATTERN_SEED + k`,
+    // which the test recomputes.
+    a.movi(DI, PATTERN);
+    a.movi(CX, 256);
+    a.movi(AX, PATTERN_SEED);
+    let fill = a.here_label();
+    a.stosw();
+    a.inc(AX);
+    a.dec(CX);
+    a.jcc(Cc::NE, fill);
+
+    // `INT 13h AH=03h`, one sector, to the cylinder/head/sector below. Always
+    // drive 0 — the diskette exists in both board configurations, and in the
+    // one that boots off the fixed disk this is the only thing that touches it.
+    a.movi(AX, 0x0301);
+    a.movi(CX, u16::from_be_bytes([WRITE_CYLINDER, WRITE_SECTOR]));
+    a.movi(DX, u16::from_be_bytes([WRITE_HEAD, 0x00]));
+    a.movi(BX, PATTERN);
+    a.int(0x13);
+    a.movto(Mem::abs(SCRATCH + 16), AX);
+
+    // And straight back off the medium into a different buffer. This is the
+    // check that matters: `pc.fdc` refills its sector buffer from the image on
+    // every command, so a read that answers with the pattern is the image
+    // answering, not the buffer the write left behind.
+    a.movi(AX, 0x0201);
+    a.movi(CX, u16::from_be_bytes([WRITE_CYLINDER, WRITE_SECTOR]));
+    a.movi(DX, u16::from_be_bytes([WRITE_HEAD, 0x00]));
+    a.movi(BX, READBACK);
+    a.int(0x13);
+    a.movto(Mem::abs(SCRATCH + 18), AX);
+
+    // -- INT 15h AH=87h, out to extended memory and back ---------------------
+    //
+    // The one BIOS service that reaches above the first megabyte from real
+    // mode. The pattern goes to `EXT_TARGET`, then comes back to a third
+    // buffer, so a call that quietly copied nothing leaves that buffer holding
+    // what it held before and the test sees it.
+    let gdt = a.label();
+    a.movi(AX, 0x8700);
+    a.movi(CX, 256); // words, not bytes
+    a.movi_label(SI, gdt);
+    a.int(0x15);
+    a.movto(Mem::abs(SCRATCH + 20), AX);
+
+    // The same table with the two bases swapped end for end: the descriptors
+    // are patched in place rather than duplicated, because a boot sector has
+    // 512 bytes and two of these would not fit beside the code.
+    a.movi_label(SI, gdt);
+    a.movmi(Mem::si(0x12), (EXT_TARGET & 0xffff) as u16);
+    a.movmi8(Mem::si(0x14), ((EXT_TARGET >> 16) & 0xff) as u8);
+    a.movmi(Mem::si(0x1a), XFER_BACK);
+    a.movmi8(Mem::si(0x1c), 0x00);
+    a.movi(AX, 0x8700);
+    a.movi(CX, 256);
+    a.int(0x15);
+    a.movto(Mem::abs(SCRATCH + 22), AX);
+
+    // -- and the same on the fixed disk --------------------------------------
+    //
+    // `INT 13h AH=03h` with `DL = 0x80` goes down the ATA path instead: a CHS
+    // triple translated to an LBA, `WRITE SECTOR(S)` into the command block and
+    // `REP OUTSW` through the data port. On the board that boots off the
+    // diskette there is no fixed disk and the firmware answers with carry,
+    // which is a claim of its own and the test checks that instead.
+    a.movi(AX, 0x0301);
+    a.movi(CX, u16::from_be_bytes([0x00, HD_WRITE_SECTOR]));
+    a.movi(DX, 0x0080);
+    a.movi(BX, PATTERN);
+    a.int(0x13);
+    a.movto(Mem::abs(SCRATCH + 24), AX);
+
+    a.movi(AX, 0x0201);
+    a.movi(CX, u16::from_be_bytes([0x00, HD_WRITE_SECTOR]));
+    a.movi(DX, 0x0080);
+    a.movi(BX, HD_READBACK);
+    a.int(0x13);
+    a.movto(Mem::abs(SCRATCH + 26), AX);
+
     a.movmi(Mem::abs(SCRATCH + 14), DONE_MARKER);
 
     // The keyboard variant does not stop: it waits on `INT 16h` and echoes what
@@ -181,6 +352,28 @@ fn boot_sector(echo: bool) -> Vec<u8> {
     a.bind(message);
     a.db(GREETING.as_bytes());
     a.db(&[0x0d, 0x0a, 0x00]);
+
+    // `INT 15h AH=87h`'s descriptor table: six eight-byte descriptors, of which
+    // the caller fills in two. Entry 1 is the table's own descriptor and
+    // entries 4 and 5 the BIOS code and stack segments — all three are the
+    // firmware's to fill, and are left zero here precisely so that a firmware
+    // which needed them would fail rather than appear to work (RBIL,
+    // `INT 15h AH=87h`).
+    a.bind(gdt);
+    a.db(&[0u8; 16]);
+    a.db(&descriptor(u32::from(PATTERN)));
+    a.db(&descriptor(EXT_TARGET));
+    a.db(&[0u8; 16]);
+
+    // Nothing may have grown past the signature. The assembler would let it:
+    // `seek` moves the cursor and the two bytes below would land on top of
+    // whatever was there.
+    assert!(
+        a.here() <= BOOT_ADDRESS + 510,
+        "the boot sector is {} bytes of code and data, and 510 is the whole of \
+         what a sector has",
+        a.here() - BOOT_ADDRESS
+    );
 
     // The signature, which is the whole of what makes a sector bootable.
     a.seek(BOOT_ADDRESS + 510);
@@ -221,15 +414,17 @@ fn disk_image(echo: bool) -> Vec<u8> {
 /// The `pc-at` board with rsemu's own BIOS in its socket and the test disk in
 /// bay 0.
 fn board(echo: bool) -> (Machine, Arc<X86>, Arc<rsemu::core::hosts::HostObjects>) {
-    board_from(echo, false)
+    board_from(echo, None)
 }
 
-/// The same board with the boot sector on the **diskette** instead, and both
-/// IDE bays empty — so `INT 19h` tries the fixed disk, finds none, and falls
-/// through to the µPD765.
+/// The same board with a diskette image supplied and both IDE bays empty — so
+/// `INT 19h` tries the fixed disk, finds none, and falls through to the µPD765.
+///
+/// `floppy` is `None` for the fixed-disk boot, where the diskette is blank and
+/// exists only so `INT 13h` has a second drive to talk to.
 fn board_from(
     echo: bool,
-    from_floppy: bool,
+    floppy: Option<Vec<u8>>,
 ) -> (Machine, Arc<X86>, Arc<rsemu::core::hosts::HostObjects>) {
     let cpus: Arc<Captured<X86>> = Arc::new(Captured::new());
     let mut b = Bindings::new();
@@ -268,11 +463,10 @@ fn board_from(
             .map(|p| std::fs::read(&p).unwrap_or_else(|e| panic!("{p}: {e}")))
             .unwrap_or_default(),
     );
-    if from_floppy {
+    if let Some(mut image) = floppy {
         // 1.44 MB: 80 cylinders of two heads of eighteen sectors, which is what
         // `pc.fdc` infers from the length and what the firmware's CMOS-driven
         // geometry expects.
-        let mut image = disk_image(echo);
         image.resize(1_474_560, 0);
         options.realize.media.insert("floppy", image);
         options.realize.media.insert("hd0", Vec::new());
@@ -334,7 +528,7 @@ fn text_page(m: &Machine) -> Vec<String> {
 
 #[test]
 fn the_board_boots_a_guest_on_rsemus_own_firmware() {
-    let (mut m, cpu, _hosts) = board(false);
+    let (mut m, cpu, hosts) = board(false);
 
     // One virtual second. POST and the boot need about nine milliseconds of it
     // at 25 MHz with an empty option-ROM socket; the rest of the budget is for
@@ -483,6 +677,56 @@ fn the_board_boots_a_guest_on_rsemus_own_firmware() {
         "the sector the guest read is not the sector on the disk"
     );
 
+    // The diskette write and the block move. Bay 0 holds the boot disk here, so
+    // the diskette is blank: whatever the read-back answers with, it is not
+    // something that was already on the medium.
+    check_write_and_block_move(&m, &[0u8; 512]);
+
+    // And the fixed-disk write, against the drive's **medium** — the standard
+    // `tests/pc_at_ide.rs` sets, and reachable here because `ata::bays`
+    // publishes the backing store as a host object.
+    let drive = rsemu::dev::ata::bays::get(&hosts, "ide0-master")
+        .expect("no other host object claimed the name")
+        .expect("the channel and the drive both opened it")
+        .drive()
+        .expect("the master bay is populated");
+    assert_eq!(
+        peek16(&m, u64::from(SCRATCH) + 24) >> 8,
+        0,
+        "INT 13h AH=03h reported an error writing the fixed disk"
+    );
+    assert_eq!(
+        peek16(&m, u64::from(SCRATCH) + 26) >> 8,
+        0,
+        "INT 13h AH=02h reported an error reading it back"
+    );
+    let mut on_disk = vec![0u8; 512];
+    drive
+        .read_media(HD_WRITE_LBA * 512, &mut on_disk)
+        .expect("in range");
+    assert_eq!(
+        on_disk,
+        pattern(),
+        "the sector INT 13h AH=03h wrote never reached the drive's medium"
+    );
+    let mut neighbour = vec![0u8; 512];
+    drive
+        .read_media((HD_WRITE_LBA - 1) * 512, &mut neighbour)
+        .expect("in range");
+    assert_eq!(
+        neighbour,
+        stamp(HD_WRITE_LBA - 1),
+        "the write landed on the wrong sector"
+    );
+    let read_back: Vec<u8> = (0..512)
+        .map(|i| peek(&m, u64::from(HD_READBACK) + i))
+        .collect();
+    assert_eq!(
+        read_back,
+        pattern(),
+        "and the guest read back what it wrote"
+    );
+
     // -- what it printed -----------------------------------------------------
     let page = text_page(&m);
     assert!(
@@ -527,7 +771,7 @@ fn the_board_boots_a_guest_on_rsemus_own_firmware() {
 /// own the same way.
 #[test]
 fn the_board_boots_off_the_diskette_too() {
-    let (mut m, cpu, _hosts) = board_from(false, true);
+    let (mut m, cpu, _hosts) = board_from(false, Some(disk_image(false)));
     m.run_for(GlobalTime::from_nanos(1_000_000_000))
         .expect("the machine runs");
 
@@ -587,10 +831,114 @@ fn the_board_boots_off_the_diskette_too() {
         "the sector the guest read off the diskette is not the one on the medium"
     );
 
+    // The write, on the medium the machine actually booted from. The sector it
+    // lands on held [`stamp`] before, which is what makes the read-back a claim
+    // about the medium rather than about the controller's buffer: a write that
+    // never reached the image would answer with that stamp.
+    check_write_and_block_move(&m, &stamp(WRITE_LBA));
+
+    // There is no fixed disk on this board, and the firmware says so rather
+    // than pretending: `INT 13h AH=03h` with `DL = 0x80` comes back with carry
+    // and a non-zero status. A BIOS that answered "done" for a drive that is
+    // not there is the failure this catches.
+    assert_ne!(
+        peek16(&m, u64::from(SCRATCH) + 24) >> 8,
+        0,
+        "INT 13h AH=03h claimed to write a fixed disk this board does not have"
+    );
+
     let page = text_page(&m);
     assert!(
         page.iter().any(|line| line.contains(GREETING)),
         "the boot sector's greeting never reached the text page"
+    );
+}
+
+/// What the guest got out of `INT 13h AH=03h` and `INT 15h AH=87h`.
+///
+/// `before` is what the diskette sector held when the machine was built.
+///
+/// # Why a read-back is a check on the medium
+///
+/// `tests/pc_at_ide.rs` compares a written sector against the drive's backing
+/// store rather than against anything the device model chose to answer with,
+/// and that is the standard. It is reachable there because `ata::bays` publishes
+/// the medium as a host object; `pc.fdc` publishes nothing, its `contents()` is
+/// only reachable from whoever constructed it, and `Bindings::bind` refuses a
+/// second binding for a class `rsemu::dev::pc::bind` has already claimed — so a
+/// test cannot get a handle on the controller this board built.
+///
+/// What is left is still a claim about the medium rather than about a buffer,
+/// for a reason specific to this model and worth writing down: `pc.fdc` rebuilds
+/// its sector buffer from the image at the start of *every* transfer, so the
+/// buffer a write filled is gone by the time the read that follows runs. A read
+/// that answers with the pattern is the image answering. The two failures this
+/// would actually catch — the 8237 programmed for the wrong direction, so the
+/// "write" reads the disk into the guest's buffer instead, and a write that
+/// stops at the controller and never reaches the image — both leave `before` on
+/// the medium, and the assertion below is that `before` is not what came back.
+fn check_write_and_block_move(m: &Machine, before: &[u8]) {
+    let want = pattern();
+    assert_ne!(
+        want, before,
+        "the sector already held the pattern, so reading it back proves nothing"
+    );
+
+    assert_eq!(
+        peek16(m, u64::from(SCRATCH) + 16) >> 8,
+        0,
+        "INT 13h AH=03h reported an error writing the diskette"
+    );
+    assert_eq!(
+        peek16(m, u64::from(SCRATCH) + 18) >> 8,
+        0,
+        "INT 13h AH=02h reported an error reading the sector back"
+    );
+    let got: Vec<u8> = (0..512).map(|i| peek(m, u64::from(READBACK) + i)).collect();
+    assert_eq!(
+        got, want,
+        "the sector read back off the diskette is not the one the guest wrote: \
+         the write never reached the medium"
+    );
+
+    // `INT 15h AH=87h`, out and back. `EXT_TARGET` is above the first megabyte,
+    // so nothing in this boot sector could have put the pattern there by any
+    // other route — it is the only thing here that needed protected mode.
+    assert_eq!(
+        peek16(m, u64::from(SCRATCH) + 20) >> 8,
+        0,
+        "INT 15h AH=87h reported an error moving the block up"
+    );
+    assert_eq!(
+        peek16(m, u64::from(SCRATCH) + 22) >> 8,
+        0,
+        "INT 15h AH=87h reported an error moving it back"
+    );
+    let up: Vec<u8> = (0..512)
+        .map(|i| peek(m, u64::from(EXT_TARGET) + i))
+        .collect();
+    assert_eq!(
+        up, want,
+        "INT 15h AH=87h did not land the block at {EXT_TARGET:#x}"
+    );
+    let down: Vec<u8> = (0..512)
+        .map(|i| peek(m, u64::from(XFER_BACK) + i))
+        .collect();
+    assert_eq!(
+        down, want,
+        "INT 15h AH=87h did not bring the block back down"
+    );
+    // A word count is words, and a handler that read it as bytes would move
+    // twice as much. Both landing zones have zeroed RAM after them.
+    assert_eq!(
+        peek16(m, u64::from(EXT_TARGET) + 512),
+        0,
+        "the block move ran past the end of the block"
+    );
+    assert_eq!(
+        peek16(m, u64::from(XFER_BACK) + 512),
+        0,
+        "the block move back ran past the end of the block"
     );
 }
 
@@ -646,5 +994,134 @@ fn a_key_typed_at_the_8042_reaches_the_guest_through_int_16h() {
     assert!(
         page.iter().any(|line| line == "h"),
         "the key never came back out of INT 16h: the text page is {page:?}"
+    );
+}
+
+/// **FreeDOS boots** — `ROADMAP.md` phase 6a's gate, on rsemu's own firmware.
+///
+/// Gated on `RSEMU_FREEDOS_FLOPPY` naming a FreeDOS boot diskette, so an
+/// ordinary `cargo test` skips it and stays hermetic.
+/// `scripts/fetch-testdata.sh freedos` puts one in the ignored corpus directory
+/// and prints the command:
+///
+/// ```text
+/// scripts/fetch-testdata.sh freedos
+/// RSEMU_FREEDOS_FLOPPY=testdata/freedos/x86BOOT.img \
+///   cargo test --release --all-features --test pc_at_boot -- --nocapture freedos
+/// ```
+///
+/// **Nothing is vendored.** FreeDOS is GPL-2.0 and the image never enters this
+/// repository: running a program as an emulated guest is ordinary use and
+/// creates no derivative work, while shipping it here would be redistribution
+/// under its terms (`ROADMAP.md` §1). Its source was not read, and none of the
+/// firmware was written against it — every function `INT 13h` and `INT 10h`
+/// answer comes from Ralf Brown's Interrupt List. What the boot *did* do is
+/// name which of them a real operating system actually calls, and
+/// `INT 10h AH=08h` was added because of it.
+///
+/// # What a pass means
+///
+/// The whole chain, none of which this firmware had ever been asked for before:
+/// POST, `INT 19h` declining an empty IDE bay and falling through to the
+/// µPD765, FreeDOS's own boot sector loading a compressed kernel one sector at
+/// a time through `INT 13h AH=02h`, the kernel decompressing and initialising,
+/// `FDCONFIG.SYS`, and `COMMAND.COM` printing its banner and running the
+/// startup file. The assertions are deliberately about *the guest owning the
+/// machine* rather than about any particular version's wording, so a different
+/// FreeDOS build still passes.
+#[test]
+fn freedos_boots_on_rsemus_own_firmware() {
+    let Ok(path) = std::env::var("RSEMU_FREEDOS_FLOPPY") else {
+        println!(
+            "pc-at freedos: RSEMU_FREEDOS_FLOPPY is unset, so this test has nothing to \
+             boot. `scripts/fetch-testdata.sh freedos` fetches one."
+        );
+        return;
+    };
+    let image = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    println!("pc-at freedos: booting {path} ({} bytes)", image.len());
+
+    // Sixty virtual seconds. Measured rather than guessed: the kernel's
+    // decompressor is a bit-at-a-time loop and `COMMAND.COM` reaches its banner
+    // at about twenty, with the rest of the budget for the startup file. The
+    // guest spends most of it halted waiting for the tick, so this costs single
+    // digit seconds of host time.
+    let ms: u64 = std::env::var("RSEMU_FREEDOS_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60_000);
+
+    let (mut m, cpu, _hosts) = board_from(false, Some(image));
+    let started = std::time::Instant::now();
+    m.run_for(GlobalTime::from_nanos(ms * 1_000_000))
+        .expect("the machine runs");
+
+    let page = text_page(&m);
+    println!("pc-at freedos: text page after {ms} virtual ms:");
+    for line in &page {
+        if !line.trim().is_empty() {
+            println!("  |{line}|");
+        }
+    }
+    let regs = cpu.regs();
+    println!(
+        "pc-at freedos: {:?} of host time; stopped at {:04x}:{:08x}, halted={}, \
+         protected={}",
+        started.elapsed(),
+        regs.cs,
+        regs.rip,
+        cpu.is_halted(),
+        cpu.sys().protected()
+    );
+    let vectors: Vec<String> = [0x08u64, 0x10, 0x13, 0x1c, 0x21, 0x2f]
+        .iter()
+        .map(|v| {
+            format!(
+                "{v:02x}->{:04x}:{:04x}",
+                peek16(&m, v * 4 + 2),
+                peek16(&m, v * 4)
+            )
+        })
+        .collect();
+    println!("pc-at freedos: vectors {}", vectors.join(" "));
+
+    // POST still did its job: a guest that took the machine over did not have
+    // to repair the BIOS data area first.
+    assert_eq!(peek16(&m, 0x413), 639, "the BDA's memory size");
+
+    // DOS is resident. `INT 21h` starts life pointing at this firmware's
+    // "unknown function" stub in segment 0xf000, and only an operating system
+    // moves it — so this one assertion covers the boot sector, the kernel load,
+    // the decompression and the kernel's own initialisation, and it says
+    // nothing about which DOS or which version.
+    let int21 = peek16(&m, 0x21 * 4 + 2);
+    assert_ne!(
+        int21, 0xf000,
+        "INT 21h still points into the BIOS: no DOS kernel installed itself. \
+         The text page above says how far it got."
+    );
+    assert_ne!(
+        int21, 0x0000,
+        "INT 21h points at the interrupt vector table"
+    );
+
+    // And it got as far as a shell. `COMMAND.COM` is the first thing in the
+    // sequence that prints its own name, so this distinguishes "the kernel
+    // loaded" from "the system came up".
+    assert!(
+        page.iter()
+            .any(|line| line.contains("FreeCom") || line.contains("FreeDOS")),
+        "nothing on the text page names FreeDOS: the kernel loaded but the shell \
+         never printed. The page is {page:?}"
+    );
+
+    // The same bound the other two tests hold: an AT reads ones off an
+    // unterminated bus, and the only refusals on this board are the option-ROM
+    // scan's own walk through the unpopulated half of its window.
+    let (faults, last) = cpu.bus_faults();
+    println!("pc-at freedos: {faults} unanswered bus access(es), last at {last:08x}");
+    assert!(
+        faults <= 32,
+        "the memory map refused {faults} accesses, last at {last:08x}"
     );
 }

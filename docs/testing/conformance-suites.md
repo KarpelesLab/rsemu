@@ -45,6 +45,7 @@ anything**; this table records a point in time.
 | [kvm-unit-tests](https://gitlab.com/kvm-unit-tests/kvm-unit-tests) | Atomics, barriers, interrupt controllers — the parallel-execution stress suite | **GPL-2.0** ⛔ | **No.** Download and run only |
 | Linux (Debian riscv64 installer kernel, and the matching `linux-image` for its `virtio_mmio` and `virtio_blk` modules) | The `riscv-virt` boot-to-shell gate | **GPL-2.0** ⛔ | **No.** Download and run only — and its source is off limits to this project, not merely unvendorable |
 | [busybox](https://www.busybox.net) (Debian's `busybox-static`, riscv64) | The userland `/init` execs, so the boot reaches a prompt | **GPL-2.0** ⛔ | **No.** Download and run only. The `newc` cpio archive built around it by `scripts/fetch-testdata.sh` is ours; the binary inside it is not |
+| [FreeDOS 1.3](https://www.freedos.org) (the floppy edition's `144m/x86BOOT.img`) | The `pc-at` boot-to-DOS gate, on rsemu's own BIOS — `ROADMAP.md` phase 6a | **GPL-2.0** ⛔ for the kernel; the distribution as a whole is a mix | **No.** Download and run only — and its source is off limits, like Linux's |
 | [retrio/gb-test-roms](https://github.com/retrio/gb-test-roms) (blargg) | Game Boy CPU, timing, sound | **No licence file** ⛔ | **No.** Provenance unclear — run only |
 | blargg's NES test ROMs | NES CPU, PPU, APU | Freely circulated, licence unclear ⛔ | **No.** Run only |
 | `nestest` + reference log | 6502 trace comparison — the fastest way to first-boot a 6502 | Licence unclear ⛔ | **No.** Run only |
