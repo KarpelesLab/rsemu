@@ -6,8 +6,9 @@
 //!   sheet (National Semiconductor). The register table, the DLAB latch, the
 //!   line- and modem-status bits, the FIFO control register and the interrupt
 //!   identification priorities all come from it.
-//! * `docs/devices/interrupts-timers.md`, and `docs/platforms/riscv-virt.md`
-//!   and `docs/platforms/pc64.md` for the two boards that put one on a wire.
+//! * `docs/devices/interrupts-timers.md`, and `docs/platforms/riscv-virt.md`,
+//!   `docs/platforms/pc64.md` and `docs/platforms/q35.md` for the three boards
+//!   that put one on a wire.
 //!
 //! # Why it is here and not under a board
 //!
@@ -20,10 +21,10 @@
 //! did either.
 //!
 //! One thing a board *does* own is how it describes the chip to its guest, and
-//! that is the `dev::riscv::dt::DtSource` impl below: a
-//! flattened device tree is a RISC-V board's mechanism, so the impl is behind
-//! `dev-riscv` and a PC build does not compile it. `dev::flash::cfi` publishes
-//! itself under exactly the same condition and for the same reason.
+//! that is the `dev::riscv::dt::DtSource` impl below: a flattened device tree
+//! is a RISC-V board's mechanism, so the impl is behind `dev-riscv` and a PC
+//! build does not compile it. `dev::flash::cfi` publishes itself under exactly
+//! the same condition and for the same reason.
 //!
 //! # The register file
 //!
