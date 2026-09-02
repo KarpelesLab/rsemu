@@ -95,14 +95,14 @@
 //!
 //! (`core::space` module docs). So a PAM window is one mapping of this device's
 //! DRAM at priority 1, sitting over whatever the board decodes at priority 0,
-//! and the four attribute encodings are four [`Perms`] values on that one
-//! mapping:
+//! and the four attribute encodings are three [`Perms`] values on that one
+//! mapping plus **no mapping at all**:
 //!
 //! ```text
-//!   RE WE  datasheet     Perms         reads       writes
-//!   0  0   Disabled      NONE          the ROM     the ROM (a ROM swallows them)
-//!   1  0   Read Only     READ          the DRAM    the ROM
-//!   0  1   Write Only    WRITE         the ROM     the DRAM
+//!   RE WE  datasheet     mapping       reads       writes
+//!   0  0   Disabled      none          the bus     the bus
+//!   1  0   Read Only     READ          the DRAM    the bus
+//!   0  1   Write Only    WRITE         the bus     the DRAM
 //!   1  1   Read/Write    RW            the DRAM    the DRAM
 //! ```
 //!
@@ -111,6 +111,12 @@
 //! [`Perms::EXEC`] rides along with [`Perms::READ`] because the firmware
 //! *executes* out of the window it shadowed, and the bit is carried rather than
 //! enforced (`core::space::Perms`).
+//!
+//! The *Disabled* row is not mapped with [`Perms::NONE`], and the difference is
+//! not cosmetic: a mapping that claims a range and refuses both directions is
+//! only equivalent to no mapping where something else is decoded underneath.
+//! Over a hole it is the opposite, and it cost this board thirty-two bus faults
+//! on every POST — `Registers::retopo` has the long form.
 //!
 //! Nothing in `core::space` was changed for this.
 //!
@@ -347,6 +353,9 @@ struct Registers {
     /// The space the windows are mapped into, and their mapping ids. `None`
     /// until [`Instance::bind`]. At [`LockRank::LEAF`]: read, cloned and
     /// released before the topology guard is taken.
+    ///
+    /// A window's id is itself `None` while its PAM nibble is *Disabled*,
+    /// because a disabled window is not mapped at all — see [`Self::retopo`].
     mapped: Mutex<Option<Mapped>>,
     /// Set when a retopology could not be performed at the instant it was
     /// asked for, so the next opportunity re-applies. Derived state: never
@@ -358,7 +367,7 @@ struct Registers {
 #[derive(Debug, Clone)]
 struct Mapped {
     space: Arc<AddressSpace>,
-    ids: Vec<MappingId>,
+    ids: Vec<Option<MappingId>>,
 }
 
 impl fmt::Debug for Registers {
@@ -429,13 +438,36 @@ impl Registers {
             .collect()
     }
 
-    /// Push `perms` onto the mappings. Returns whether it could be done.
+    /// Bring the mappings into line with `perms`. Returns whether it could be
+    /// done.
     ///
     /// `blocking` picks which guard: the write guard where nothing is in
     /// flight — reset, a snapshot load, bind — and the order-exempt try-lock
     /// from inside a configuration write, where the blocking one would invert
     /// the ladder. See the module docs.
-    fn push_perms(&self, perms: &[Perms], blocking: bool) -> bool {
+    ///
+    /// # Why a disabled window is unmapped rather than mapped with no terms
+    ///
+    /// §3.2.18's *Disabled* encoding says "both read and write cycles are
+    /// directed to the expansion bus", which is a statement that the DRAM does
+    /// not answer — not that the bridge answers and refuses. Those are the same
+    /// thing only where the board decodes something underneath. Over a hole
+    /// they are opposite: `core::space` resolves each direction to the
+    /// highest-priority mapping that permits it, and where *no* mapping permits
+    /// it the winner is whatever is there, whose own permissions then raise
+    /// [`BusError::Protected`](crate::core::space::BusError::Protected) — the
+    /// space's `unassigned` policy never gets a say, because the range is not
+    /// unassigned. On this board `0xd0000`-`0xdffff` has no ROM socket, so an
+    /// option-ROM scan across it took thirty-two bus faults off a machine whose
+    /// bus reads as ones. Unmapping the window makes the range genuinely
+    /// unassigned again, which is what an ISA bus with nothing on it is.
+    ///
+    /// The single-direction encodings still claim the range in *both*
+    /// directions, because one mapping is one range: a *Read Only* window over
+    /// a hole refuses writes rather than dropping them. That is inherent in a
+    /// per-mapping permission and it costs nothing here — firmware sets read
+    /// only after it has shadowed something, which is over a ROM.
+    fn retopo(&self, perms: &[Perms], blocking: bool) -> bool {
         // Cloned out and the lock released: nothing of this device's is held
         // while the space is retopologised, which is what the re-entrancy
         // contract asks for.
@@ -453,11 +485,41 @@ impl Registers {
             *self.stale.lock() = true;
             return false;
         };
-        for (id, p) in mapped.ids.iter().zip(perms) {
-            // The only error is "not a mapping of this space", which cannot
-            // happen: these ids came from this guard's own space at bind.
-            let _ = topo.reprotect(*id, *p);
+        let mut ids = Vec::with_capacity(N);
+        for ((id, p), w) in mapped.ids.iter().zip(perms).zip(&WINDOWS) {
+            let want = *p != Perms::NONE;
+            ids.push(match (*id, want) {
+                // Still claimed, and possibly on different terms. The only
+                // error is "not a mapping of this space", which cannot happen:
+                // these ids came from this guard's own space.
+                (Some(id), true) => {
+                    let _ = topo.reprotect(id, *p);
+                    Some(id)
+                }
+                // Newly claimed.
+                (None, true) => topo
+                    .map_with(
+                        crate::core::space::Mapping::new(
+                            Arc::clone(&self.windows[ids.len()]),
+                            w.base,
+                        )
+                        .with_priority(SHADOW_PRIORITY)
+                        .with_perms(*p),
+                    )
+                    .ok(),
+                // Disabled: the cycle belongs to the expansion bus.
+                (Some(id), false) => {
+                    let _ = topo.unmap(id);
+                    None
+                }
+                (None, false) => None,
+            });
         }
+        drop(topo);
+        *self.mapped.lock() = Some(Mapped {
+            space: Arc::clone(&mapped.space),
+            ids,
+        });
         *self.stale.lock() = false;
         true
     }
@@ -465,31 +527,20 @@ impl Registers {
     /// Bring the mappings into line with the PAM registers.
     fn sync(&self, blocking: bool) -> bool {
         let perms = self.perms();
-        self.push_perms(&perms, blocking)
+        self.retopo(&perms, blocking)
     }
 
-    /// Map the thirteen windows into `space`, with the terms the PAM registers
-    /// currently ask for. **Retopology**, and legal here: `bind` runs during
-    /// machine assembly with no access in flight.
+    /// Claim the space and put the thirteen windows in it on the terms the PAM
+    /// registers currently ask for. **Retopology**, and legal here: `bind` runs
+    /// during machine assembly with no access in flight.
     fn install(&self, space: &Arc<AddressSpace>) -> Result<()> {
-        let perms = self.perms();
-        let mut ids = Vec::with_capacity(N);
-        {
-            let mut topo = space.topology();
-            for ((window, p), w) in self.windows.iter().zip(&perms).zip(&WINDOWS) {
-                ids.push(
-                    topo.map_with(
-                        crate::core::space::Mapping::new(Arc::clone(window), w.base)
-                            .with_priority(SHADOW_PRIORITY)
-                            .with_perms(*p),
-                    )?,
-                );
-            }
-        }
         *self.mapped.lock() = Some(Mapped {
             space: Arc::clone(space),
-            ids,
+            ids: alloc::vec![None; N],
         });
+        // Out of reset every PAM register is `00h`, so this ordinarily maps
+        // nothing at all; a snapshot loaded before bind would map what it says.
+        self.sync(true);
         Ok(())
     }
 }
@@ -535,7 +586,7 @@ impl PciFunction for Registers {
         let touches_pam =
             offset < PAM0 + PAM_COUNT && offset.saturating_add(src.len() as u16) > PAM0;
         if (changed && touches_pam) || *self.stale.lock() {
-            self.push_perms(&perms, false);
+            self.retopo(&perms, false);
         }
     }
 }

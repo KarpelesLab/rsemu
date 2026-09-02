@@ -697,6 +697,18 @@ impl Shared {
     // -- the data port, 0x60 -----------------------------------------------
 
     /// Read the data port. `debug` suppresses every side effect.
+    ///
+    /// **The buffer is not refilled here**, and that is the whole of why a
+    /// second keystroke arrives at all. IRQ1 is a level derived from OBF and
+    /// the 8259A's input for it is *edge* triggered, so a read that emptied the
+    /// buffer and refilled it in the same breath would leave the line high
+    /// throughout: the controller would announce the first byte and then go
+    /// silent for ever, however many codes the keyboard had waiting. A real
+    /// 8042 cannot do that either — the next code has to be clocked in over the
+    /// keyboard's serial line, eleven bits at 10-16.7 kHz — so the refill waits
+    /// for [`Shared::pump`], which the scheduler calls once per tick of this
+    /// chip's own clock domain, one byte-time apart. The caller drives the pins
+    /// afterwards, and IRQ1 falls in the gap.
     fn read_data(&self, debug: bool) -> u8 {
         let mut state = self.state.lock();
         if debug {
@@ -707,7 +719,6 @@ impl Shared {
         let byte = state.obuf;
         state.obf = false;
         state.from_aux = false;
-        Self::transfer(&mut state);
         byte
     }
 
@@ -1275,6 +1286,17 @@ mod tests {
         k.shared.read_data(false)
     }
 
+    /// Read the data port after letting one byte-time pass.
+    ///
+    /// A read does not refill the output buffer in the same access that emptied
+    /// it — that gap is what gives IRQ1 its falling edge — so a test expecting a
+    /// *second* byte has to let the chip's own tick move it, which is what
+    /// firmware polling OBF is doing while it waits.
+    fn next_data(k: &Kbc8042) -> u8 {
+        k.pump();
+        data(k)
+    }
+
     /// Write the data port.
     fn poke_data(k: &Kbc8042, value: u8) {
         k.shared.write_data(value);
@@ -1394,6 +1416,41 @@ mod tests {
     }
 
     #[test]
+    fn a_second_scan_code_gets_its_own_irq1_edge() {
+        let (kbc, port, probes) = with_pins();
+        set_command_byte(&kbc, CB_KBD_INT);
+        port.feed(&[0x1c, 0x32]);
+        kbc.pump();
+        assert!(probes[0].high(), "the first byte raised IRQ1");
+        let edges = probes[0].edges();
+
+        // The guest takes it, and the line must *fall*. An 8259A input in edge
+        // mode latches a transition rather than a level (8259A data sheet,
+        // edge-triggered mode), so a controller that refilled its output buffer
+        // in the same access that emptied it would announce the first keystroke
+        // and then nothing at all, however many codes were waiting behind it.
+        let mut byte = [0u8; 1];
+        DataPort(Arc::clone(&kbc.shared))
+            .read(0, &mut byte, MemAttrs::DEFAULT)
+            .expect("a byte read is legal");
+        assert_eq!(byte[0], 0x1c);
+        assert!(!probes[0].high(), "IRQ1 fell when the buffer emptied");
+        assert_eq!(status(&kbc) & ST_OBF, 0, "and the buffer really is empty");
+
+        // One byte-time later — one tick of this chip's own clock domain, which
+        // is what the scheduler gives it — the next code is there and the line
+        // rises again. That rise is the second edge.
+        kbc.pump();
+        assert!(probes[0].high(), "and rose again for the second byte");
+        assert_eq!(
+            probes[0].edges(),
+            edges + 2,
+            "a fall and a rise, not a line held high across both bytes"
+        );
+        assert_eq!(data(&kbc), 0x32);
+    }
+
+    #[test]
     fn a_scan_code_raises_nothing_while_the_interrupt_is_disabled() {
         let (kbc, port, probes) = with_pins();
         port.feed(&[0x1c]);
@@ -1500,8 +1557,8 @@ mod tests {
         // a mouse.
         poke_data(&kbc, 0xf2);
         assert_eq!(data(&kbc), KB_ACK);
-        assert_eq!(data(&kbc), KB_ID_HIGH);
-        assert_eq!(data(&kbc), KB_ID_LOW);
+        assert_eq!(next_data(&kbc), KB_ID_HIGH);
+        assert_eq!(next_data(&kbc), KB_ID_LOW);
     }
 
     #[test]
@@ -1509,7 +1566,8 @@ mod tests {
         let (kbc, _port) = wired();
         poke_data(&kbc, 0xff);
         assert_eq!(data(&kbc), KB_ACK);
-        assert_eq!(data(&kbc), KB_BAT_OK);
+        assert_eq!(next_data(&kbc), KB_BAT_OK);
+        kbc.pump();
         assert_eq!(status(&kbc) & ST_OBF, 0, "and nothing follows");
     }
 
@@ -1542,14 +1600,14 @@ mod tests {
         port.feed(&[0xe0, 0xf0, 0x14]);
         kbc.pump();
         assert_eq!(data(&kbc), 0xe0);
-        assert_eq!(data(&kbc), 0x1d | 0x80, "right control, coming up");
+        assert_eq!(next_data(&kbc), 0x1d | 0x80, "right control, coming up");
 
         // Without translation the guest sees the set-2 stream verbatim.
         set_command_byte(&kbc, 0);
         port.feed(&[0xf0, 0x1c]);
         kbc.pump();
         assert_eq!(data(&kbc), 0xf0);
-        assert_eq!(data(&kbc), 0x1c);
+        assert_eq!(next_data(&kbc), 0x1c);
     }
 
     #[test]
@@ -1695,10 +1753,16 @@ mod tests {
         );
         command(&restored, 0xae);
         restored.pump();
-        for _ in 0..3 {
-            assert_eq!(data(&restored), KB_ACK, "an acknowledge the keyboard owed");
+        assert_eq!(data(&restored), KB_ACK, "an acknowledge the keyboard owed");
+        for _ in 0..2 {
+            assert_eq!(
+                next_data(&restored),
+                KB_ACK,
+                "an acknowledge the keyboard owed"
+            );
         }
-        assert_eq!(data(&restored), 0x1e);
+        assert_eq!(next_data(&restored), 0x1e);
+        restored.pump();
         assert_eq!(
             status(&restored) & ST_OBF,
             0,
