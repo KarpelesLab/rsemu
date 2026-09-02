@@ -67,7 +67,7 @@ use rsemu::core::state::{ChunkReader, MachineShape, Migrations, StateReader, Sta
 use rsemu::core::sync::{LockRank, Mutex};
 use rsemu::core::value::Width;
 use rsemu::core::wire::{Level, Wire, WireId, WireIdAllocator, WireSink, WireSource};
-use rsemu::dev::ata::Medium;
+use rsemu::dev::medium::Medium;
 use rsemu::dev::nvme::{Controller, Namespace, Params, REGISTER_LEN};
 use std::sync::Arc;
 

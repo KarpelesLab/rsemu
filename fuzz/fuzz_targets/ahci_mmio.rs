@@ -76,7 +76,8 @@ use rsemu::dev::ahci::hba::REGISTER_LEN;
 use rsemu::dev::ahci::{Hba, MAX_PORTS};
 use rsemu::dev::ata::bays::Bay;
 use rsemu::dev::ata::disk::default_geometry;
-use rsemu::dev::ata::{AtaDisk, Identity, Medium, Position};
+use rsemu::dev::ata::{AtaDisk, Identity, Position};
+use rsemu::dev::medium::Medium;
 use std::sync::Arc;
 
 /// Where guest RAM starts. Not zero, so a null pointer in a command header is a
