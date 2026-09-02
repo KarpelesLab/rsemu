@@ -803,9 +803,18 @@ impl Device for Hpet {
         // Both kinds. The counter comes back at zero and disabled, which is the
         // state a driver expects to find (§2.3.5: `ENABLE_CNF` "is set to 0 on
         // reset").
+        // The tick survives, and for the reason `pc.apic`'s `reset` gives about
+        // the same counter: it is not architectural state at all but this
+        // device's cursor in its own clock domain, and the domain does not go
+        // back to zero because a chip on it was reset. A reset that zeroed it
+        // would leave the two disagreeing by however long the machine had been
+        // running — a warm reset from a guest is exactly that case — and the
+        // next catch-up would then advance this part by all of it at once.
         let levels = {
             let mut state = self.regs.state.lock();
+            let tick = state.tick;
             *state = State::default();
+            state.tick = tick;
             for (timer, route) in state.timers.iter_mut().zip(self.routes) {
                 timer.route = route;
             }
@@ -1390,6 +1399,23 @@ mod tests {
         assert!(!b.probes[0].high());
         assert_eq!(b.peek(REG_COUNTER), 0);
         assert_eq!(Device::next_event_tick(&b.hpet), None);
+
+        // The main counter goes back to zero; the chip's position in its clock
+        // domain does not, because a reset line does not move a crystal. The
+        // reason is `pc.apic`'s: with the cursor zeroed, a warm reset of a
+        // running board leaves the device and its domain disagreeing by the
+        // whole uptime, and the next catch-up hands the counter all of it.
+        assert_eq!(Device::current_tick(&b.hpet), 5);
+        b.enable();
+        b.poke(b.timer(0), TIMER_ENABLE | TIMER_LEVEL);
+        b.poke(b.timer(0) + 8, 5);
+        b.hpet.advance_to(9);
+        assert!(
+            !b.probes[0].high(),
+            "four ticks have passed since the reset, not nine: a cursor left at zero would have              dragged the counter past a comparator the guest set after the reset"
+        );
+        b.hpet.advance_to(10);
+        assert!(b.probes[0].high(), "and on the fifth it fires");
     }
 
     #[test]

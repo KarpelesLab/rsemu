@@ -1038,10 +1038,20 @@ impl Device for Pit8254 {
         // believing its gate was high while the board held it low. That
         // disagreement is guest-visible (counter 2 counts when it must not) and
         // it is what a snapshot then faithfully records.
+        //
+        // The tick survives too, and for the reason `pc.apic`'s `reset` gives about
+        // the same counter: it is not architectural state at all but this
+        // device's cursor in its own clock domain, and the domain does not go
+        // back to zero because a chip on it was reset. A reset that zeroed it
+        // would leave the two disagreeing by however long the machine had been
+        // running — a warm reset from a guest is exactly that case — and the
+        // next catch-up would then advance this part by all of it at once.
         let levels = {
             let mut state = self.regs.state.lock();
             let gates = state.counters.each_ref().map(|c| c.gate);
+            let tick = state.tick;
             *state = State::default();
+            state.tick = tick;
             for (counter, gate) in state.counters.iter_mut().zip(gates) {
                 counter.gate = gate;
             }
@@ -1652,7 +1662,24 @@ mod tests {
         pit.reset(ResetKind::Cold);
         assert_eq!(Device::next_event_tick(&pit), None);
         assert!(!pit.out(0), "and every output idles low again");
-        assert_eq!(Device::current_tick(&pit), 0);
+        // But the chip stays where its clock domain is. A reset line does not
+        // move a crystal, and this counter is not architectural state — it is
+        // where this part has been advanced to. This test used to assert 0,
+        // which is the bug `pc.apic`'s `reset` describes: on a warm reset of a
+        // running board the device and its domain end up disagreeing by the
+        // whole uptime, and the next catch-up advances the chip by all of it.
+        assert_eq!(Device::current_tick(&pit), 100);
+
+        // And the proof that it matters: a counter programmed after the reset
+        // reaches its first event 50 ticks from *now*, not 50 ticks from a
+        // zero the domain left behind long ago.
+        let loaded = program(&pit, 0, 2, 50);
+        assert!(loaded >= 100, "the reload lands where the domain is");
+        let at = Device::next_event_tick(&pit).expect("a running counter has one");
+        assert!(
+            at > 100,
+            "the next event is {at}, which is in the past: the chip is counting from a zero its              clock domain left behind"
+        );
     }
 
     #[test]

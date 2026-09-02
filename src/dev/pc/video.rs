@@ -1887,9 +1887,26 @@ impl Device for Video {
     }
 
     fn reset(&self, _kind: ResetKind) {
+        // The tick survives, and for the reason `pc.apic`'s `reset` gives about
+        // the same counter: it is not architectural state at all but this
+        // device's cursor in its own clock domain, and the domain does not go
+        // back to zero because a chip on it was reset. A reset that zeroed it
+        // would leave the two disagreeing by however long the machine had been
+        // running — a warm reset from a guest is exactly that case — and the
+        // next catch-up would then advance this part by all of it at once.
+        //
+        // `frames` does go back to zero — it counts frames since reset and says
+        // so — and `frame_start` comes back level with the cursor, because the
+        // beam restarts at the top of a frame. Leaving `frame_start` at zero
+        // instead would count every frame since the machine booted into the
+        // next catch-up and put the retrace flag at whatever phase the
+        // arithmetic happened to land on.
         let level = {
             let mut state = self.shared.state.lock();
+            let tick = state.ticks;
             *state = State::new();
+            state.ticks = tick;
+            state.frame_start = tick;
             self.shared.publish(&state);
             state.in_vsync()
         };
@@ -2746,6 +2763,38 @@ mod tests {
         let next = Device::next_event_tick(&video).expect("a sync edge");
         assert!(next > video.ticks() && next <= per * 4);
         assert!(Device::is_lazy(&video));
+    }
+
+    #[test]
+    fn a_reset_restarts_the_frame_where_the_clock_actually_is() {
+        // A warm reset of a running board. The CRTC comes back with its
+        // power-on timing and no frames counted, but its cursor in its own
+        // clock domain does not go back to zero — a reset line does not move
+        // the dot clock's crystal, and the counter is not architectural state
+        // but this device's position in a domain the rest of the machine is
+        // still using. `pc.apic` says the same thing about the same counter.
+        let video = device();
+        let per = 100 * 449;
+        video.advance_to(per * 3 + 7);
+        assert_eq!(video.frames(), 3);
+
+        video.reset(ResetKind::Warm);
+        assert_eq!(video.frames(), 0, "frames are counted since the reset");
+        assert_eq!(
+            Device::current_tick(&video),
+            per * 3 + 7,
+            "but the beam is where the clock domain is"
+        );
+
+        // And the frame restarts here rather than three frames ago: one more
+        // frame's worth of ticks completes exactly one frame. With the cursor
+        // left at zero this catch-up would have counted every frame since the
+        // machine booted, and put the retrace flag at whatever phase the
+        // arithmetic happened to land on.
+        video.advance_to(per * 4 + 6);
+        assert_eq!(video.frames(), 0, "one tick short of the first full frame");
+        video.advance_to(per * 4 + 7);
+        assert_eq!(video.frames(), 1);
     }
 
     #[test]
