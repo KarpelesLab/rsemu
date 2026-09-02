@@ -86,18 +86,24 @@
 //! A flush is a call in the *gap* ahead of an instruction, so a value whose
 //! **last use** is that instruction's operand — a branch condition, a load's
 //! address — needs a callee-saved register where rule 2's "strictly between"
-//! deliberately let it keep a volatile one, and there are three of those. On
-//! `benches/jit_dispatch.rs` that costs nothing measurable and the deferral is
-//! worth 1.11–1.50×. On `benches/x86_dispatch.rs` it shows: `branchy` and
-//! `load-heavy` put a `brcond` or an access at nearly every guest instruction,
-//! and both lost about 5% where `alu-loop`, `memcpy` and `chain` gained
-//! 1.06–1.17×.
+//! deliberately let it keep a volatile one, and there are three of those.
+//!
+//! `benches/jit_dispatch.rs` never pays it: RV64I traces gained 1.11–1.50×,
+//! and the allocator's own margin over [`Regs::Frame`] went **up**, because
+//! the bookkeeping it used to be measured through is gone. Where it could
+//! bite is `benches/x86_dispatch.rs`'s `branchy` and `load-heavy`, which put a
+//! `brcond` or an access at nearly every guest instruction. Measured twice
+//! against the same baseline, those two came out at 0.94–0.95× and at
+//! 1.02–1.07×, which is the machine's spread rather than a number: call them
+//! flat, and note that `alu-loop`, `memcpy` and `chain` gained 1.06–1.26× in
+//! both runs. The mechanism is real even where the measurement is not, so it
+//! is written down rather than assumed away.
 //!
 //! Moving a `brcond`'s flush onto the branch's **taken edge**, as an
 //! out-of-line pad, would take the gap call off the condition's interval and
 //! is the obvious next thing to try. It is not obviously a win, which is why
 //! it is a measurement and not a patch: in a superblock the taken edge is the
-//! one that stays in the trace, so the pad would be on the hot path.
+//! one that stays in the trace, so the pad would land on the hot path.
 //!
 //! Values are held **canonically masked to their type**, exactly as
 //! `ir::Interp` holds them: an `i32` temporary never carries bits above 32 and
