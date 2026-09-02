@@ -141,12 +141,15 @@ machine "pc-apic" {
 
   # -- interrupts, the APIC half ----------------------------------------------
   #
-  # One local APIC, on the APIC message bus named `apic`; one I/O APIC, on the
-  # same bus. The bus is how a message addressed to an APIC ID finds it, and it
-  # is also how an end-of-interrupt gets back to the I/O APIC to clear a
-  # level-triggered entry's remote IRR.
+  # One local APIC per processor and one I/O APIC, all three on the APIC message
+  # bus named `apic`. The bus is how a message addressed to an APIC ID finds it,
+  # and it is also how an end-of-interrupt gets back to the I/O APIC to clear a
+  # level-triggered entry's remote IRR — so every part on it needs an ID of its
+  # own, which is why the I/O APIC is 2 rather than 1.
   #
-  # `id = 0` and the implied `bsp = true`: this is the bootstrap processor.
+  # `id = 0` implies `bsp = true` and every other ID implies `bsp = false`: the
+  # bootstrap processor is the one with the lowest ID on every board that has
+  # ever shipped, and `lapic1`'s reset parks `cpu1` because of it.
 
   object lapic0 "pc.lapic" { clock = bus, id = 0, bus = "apic" }
   object lapic1 "pc.lapic" { clock = bus, id = 1, bus = "apic" }
