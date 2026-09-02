@@ -2,6 +2,8 @@
 #
 #   rsemu run pc-apic --bios /path/to/bios.bin
 #
+# (`pc-apic` is in `src/machine/catalog.rs`, so that command works.)
+#
 # This is `pc-at` with three chips added and one wire moved, and it exists
 # because those are exactly the changes an SMP-capable PC needs: a **local
 # APIC** in front of the processor, an **I/O APIC** for the board's interrupt
@@ -9,10 +11,19 @@
 # else — the port map, the two 8259As, the 8042, the CMOS layout — is the AT's,
 # unchanged.
 #
-# It is a separate file rather than an edit to `pc-at.machine` on purpose. A
-# board either has an APIC or it does not, and firmware finds out by looking;
-# a machine file that grew a `param apic = false` would be describing two boards
-# and testing neither.
+# It is a separate file rather than an edit to `pc-at.machine` on purpose — but
+# not for the reason this comment used to give. `pc-at` now carries all three
+# chips as well, additively, with the MP specification's IMCR (§3.6.2.1)
+# deciding which path the 8259A's output takes and powering up in PIC mode so
+# that a DOS-era firmware never notices. What makes this a second file is the
+# **one wire** below that `pc-at` does not have: here `pic1.int` goes straight
+# to `LINT0`, so the board is in virtual-wire mode from the first instruction.
+# That is the state an APIC test wants to reason about and the state a firmware
+# that does not program the APIC cannot boot in, so the two boards are two
+# machine files rather than one with a `param`.
+#
+# It is also the smaller board: no video, no disks, no PCI, no DMA. A failure
+# here names the interrupt controller rather than whatever else was on the bus.
 #
 # **rsemu ships no BIOS and never will** — the `bios` slot takes the user's own
 # image (ROADMAP.md §1). A board with no firmware realizes and executes open

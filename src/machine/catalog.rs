@@ -254,6 +254,29 @@ pub static PC_AT: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/pc-at.machine"),
 };
 
+/// The same lineage stripped to its interrupt path: an x86, the two 8259As, a
+/// local APIC, an I/O APIC and an HPET, and almost nothing else.
+///
+/// `pc-at` carries all of that too, so this is not "the board with an APIC" —
+/// it is the board with *only* the parts an APIC question involves. No video,
+/// no disks, no PCI, no DMA: a machine for `tests/pc_apic.rs` and
+/// `tests/pc_apic_smp.rs` to reason about a redirection entry on, where a
+/// failure names the interrupt controller rather than whatever else happened to
+/// be on the bus. The one structural difference from `pc-at` is that the master
+/// 8259A's `INT` reaches `LINT0` directly rather than through an IMCR, so this
+/// board is in virtual-wire mode from the first instruction — which is the
+/// state an APIC test wants and the state a DOS-era firmware cannot boot in.
+///
+/// **No firmware is shipped.** The `bios` slot takes the user's own image.
+#[cfg(feature = "machine-pc-apic")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-pc-apic")))]
+pub static PC_APIC: CatalogEntry = CatalogEntry {
+    name: "pc-apic",
+    summary: "PC/AT interrupt path with the APIC fitted: x86, 8259As, local APIC, I/O APIC, HPET",
+    media: &["bios"],
+    source: include_str!("../../machines/pc-apic.machine"),
+};
+
 /// An STM32F407VGT6 microcontroller, when this build has a Cortex-M core.
 ///
 /// A real part rather than a synthetic board: the microcontroller on ST's own
@@ -380,6 +403,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&NVME_MINI);
     #[cfg(feature = "machine-pc-at")]
     out.push(&PC_AT);
+    #[cfg(feature = "machine-pc-apic")]
+    out.push(&PC_APIC);
     #[cfg(feature = "machine-nes")]
     out.push(&NES_NTSC);
     #[cfg(feature = "machine-nes")]
@@ -1436,6 +1461,8 @@ mod tests {
             // where a populated bay is exercised.
             #[cfg(feature = "machine-pc-at")]
             ("pc-at", "hd0" | "hd1") => &[],
+            #[cfg(feature = "machine-pc-apic")]
+            ("pc-apic", "bios") => blank(128 * 1024),
             (m, other) => panic!("no fixture for `{m}`'s media slot `{other}`"),
         }
     }
@@ -1446,7 +1473,7 @@ mod tests {
     /// wanted here are a socket's, not a constant's — so the array cannot be a
     /// `static`. Leaking a handful of buffers in a test process is the honest
     /// trade against threading a lifetime through the whole fixture table.
-    #[cfg(feature = "machine-pc-at")]
+    #[cfg(any(feature = "machine-pc-at", feature = "machine-pc-apic"))]
     fn blank(len: usize) -> &'static [u8] {
         use crate::core::sync::Global;
         use alloc::collections::BTreeMap;

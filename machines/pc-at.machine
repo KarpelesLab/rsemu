@@ -31,8 +31,15 @@
 # chip answers which port, which IRQ each device lands on, and the memory map.
 # The Intel data sheets for the 8259A, 8254, 8237A and 8042; the Motorola
 # MC146818 and MC6845 data sheets; the NEC uPD765A data sheet; Ralf Brown's
-# Interrupt List for the ports the data sheets leave to the board. No emulator
-# source was consulted for any of it.
+# Interrupt List for the ports the data sheets leave to the board.
+#
+# For the parts a 1984 AT did not have: the Intel 82441FX datasheet (order
+# 290549-001) for the host bridge and its PAM registers; Intel SDM Volume 3A
+# chapter 10 for the local APIC's register page at 0xfee00000; the Intel 82093AA
+# datasheet for the I/O APIC's at 0xfec00000; the IA-PC HPET Specification
+# rev 1.0a for the HPET's at 0xfed00000; and the MultiProcessor Specification
+# §3.6.2.1 for the IMCR at 0x22/0x23 and §5.1 for which I/O APIC input each
+# legacy line reaches. No emulator source was consulted for any of it.
 
 machine "pc-at" {
   # -- what the user can change -----------------------------------------------
@@ -124,6 +131,19 @@ machine "pc-at" {
   # controller completes its operations without modelling their duration, and
   # says so in its own documentation.
   osc fdd = 1000000 Hz
+
+  # The processor's front-side bus, which is what a local APIC's timer counts:
+  # SDM Vol 3A §10.5.4 says the timer counts "the processor's bus clock or core
+  # crystal clock frequency ... divided by the value in the divide configuration
+  # register". 100 MHz is a period-appropriate number and nothing architectural
+  # depends on it.
+  osc bus = 100000000 Hz
+
+  # The HPET's own crystal. 10 MHz, so one tick is 100 ns — and the device is
+  # told the same number a second time, in femtoseconds, because it reports the
+  # period to the guest and cannot see its own domain's rate. The two must
+  # agree: 10^15 / 10^7 = 10^8 fs.
+  osc hpet = 10000000 Hz
 
   # -- address spaces ---------------------------------------------------------
 
@@ -254,6 +274,32 @@ machine "pc-at" {
   object pic1 "pc.pic" { mode = "master" }
   object pic2 "pc.pic" { mode = "slave" }
 
+  # -- interrupts, the APIC half ----------------------------------------------
+  #
+  # A local APIC in front of the processor, an I/O APIC for the board's lines to
+  # land on, and the **IMCR** that decides which of the two paths the 8259A's
+  # output takes. All three are *additions*: nothing above changes, and a
+  # firmware that has never heard of an APIC boots on this board exactly as it
+  # did before, because the MP specification says a board powers up in PIC mode
+  # and this one does.
+  #
+  # That is the whole reason `pc.imcr` exists rather than the machine file
+  # simply moving `pic1.int` to `lapic0.lint0`. Out of reset a local APIC is
+  # software-disabled and every local vector table entry reads as masked (SDM
+  # Vol 3A §10.4.7.2), so a board wired straight to LINT0 has no timer tick
+  # until firmware switches the APIC on and programs LINT0 for `ExtINT`.
+  # SeaBIOS does that; rsemu's own BIOS does not, and neither did DOS. The
+  # hardware answer to exactly this problem is the MP specification's
+  # §3.6.2.1 interrupt mode configuration register, and it is a chip on the
+  # board rather than a bit in any of these three.
+  #
+  # `id = 0` and the implied `bsp = true`: this is the bootstrap processor. The
+  # I/O APIC takes the next id, which is what the MP specification's I/O APIC
+  # entry publishes and what an operating system addresses it by.
+  object lapic0 "pc.lapic"  { clock = bus, id = 0, bus = "apic" }
+  object ioapic "pc.ioapic" { id = 1, bus = "apic" }
+  object imcr   "pc.imcr"   {}
+
   # -- the timer --------------------------------------------------------------
   #
   # Counter 0 is the system tick on IRQ0, counter 1 drove DRAM refresh, and
@@ -261,6 +307,23 @@ machine "pc-at" {
   # readable back in bit 5 of that same port, which is how firmware calibrates
   # a delay loop without a reference clock.
   object pit0 "pc.pit" { clock = pit }
+
+  # The HPET's three timers, on I/O APIC inputs 20, 21 and 22 — inputs with no
+  # ISA line behind them, which is what makes them available. Each `routeN`
+  # says which input its pin reaches, and that is what the timer's
+  # `Tn_INT_ROUTE_CAP` advertises to the guest: the property and the `wire`
+  # below are two halves of one fact and must agree.
+  #
+  # `LEG_RT_CNF`, the legacy replacement route that disconnects the 8254 from
+  # IRQ0 and the RTC from IRQ8, is a gate between three chips rather than a
+  # register in any of them, so it is not modelled here — see the wires.
+  object hpet0 "pc.hpet" {
+    clock  = hpet
+    period = 100000000
+    route0 = 20
+    route1 = 21
+    route2 = 22
+  }
 
   # -- the real-time clock and CMOS -------------------------------------------
   #
@@ -409,6 +472,14 @@ machine "pc-at" {
   map mem biosbase   size biossize = bios
   map mem 0x00100000 size extmem   = ram_high
 
+  # The three APIC-era register pages, at the addresses their specifications
+  # give as the reset default. None of them is relocatable here: moving the
+  # local APIC's page is `IA32_APIC_BASE`, and this build's x86 core has no
+  # `WRMSR` to write it with.
+  map mem 0xfec00000 size 0x0020   = ioapic.regs   # 82093AA §3.1
+  map mem 0xfed00000 size 0x0400   = hpet0.regs    # HPET spec §3.2.4
+  map mem 0xfee00000 size 0x1000   = lapic0.regs   # SDM Vol 3A §10.4.4
+
   # The same ROM chip, decoded a second time at the top of the 32-bit address
   # space. A 386 fetches its first instruction from 0xfffffff0 with CS's hidden
   # base still pointing there, and only reaches 0x000f0000 once firmware has
@@ -422,6 +493,7 @@ machine "pc-at" {
   # own block.
   map port 0x0000 size 0x0010 = dma1.regs      # DMA 1, channels 0-3
   map port 0x0020 size 0x0002 = pic1.regs      # master 8259A
+  map port 0x0022 size 0x0002 = imcr.regs      # the MP spec's IMCR, §3.6.2.1
   map port 0x0040 size 0x0004 = pit0.regs      # 8254
   map port 0x0060 size 0x0001 = kbc.data       # 8042 data
   map port 0x0061 size 0x0001 = sysctl.portb   # speaker, timer 2 out, refresh
@@ -482,18 +554,66 @@ machine "pc-at" {
 
   # -- the wires --------------------------------------------------------------
   #
-  # The interrupt tree. The slave cascades onto the master's IR2 and the master
-  # drives the CPU; the acknowledge travels back down the same two nets.
-  wire pic1.int    -> cpu0.intr
+  # The interrupt tree. The slave cascades onto the master's IR2, and the
+  # master's INT reaches the processor through the IMCR — which out of reset
+  # passes it straight to `cpu0.intr`, so this is the AT's wiring with a switch
+  # in it rather than a different board. The acknowledge travels back down the
+  # same nets, and the IMCR forwards it: `INTR` carries a level *and* a vector.
   wire pic2.int    -> pic1.ir2
+  wire pic1.int    -> imcr.int
+  wire imcr.intr   -> cpu0.intr
+  wire imcr.lint0  -> lapic0.lint0
 
+  # The local APIC's own output, wire-ORed onto the same pin. Two drivers on
+  # `cpu0.intr`, and **the order of these two `wire` statements is load
+  # bearing**: both offer an acknowledge handler, the processor asks them in
+  # declaration order, and a local APIC never declines a cycle — SDM Vol 3A
+  # §10.9 makes the spurious vector the defined answer to "you asked and there
+  # is nothing". So the IMCR is asked first, and it declines whenever the
+  # register says the APIC owns the pin. Swap the two lines and a PIC-mode
+  # machine takes every interrupt with the spurious vector.
+  wire lapic0.intr -> cpu0.intr
+  wire lapic0.nmi  -> cpu0.nmi
+
+  # Every legacy line lands twice: on the 8259A input it has always had, and on
+  # the I/O APIC input the MP specification assigns it. That is how the boards
+  # were actually built — the same pin goes to both parts — and it is what lets
+  # an operating system switch from one controller to the other at run time by
+  # masking the 8259A and unmasking the redirection entry.
+  #
+  # IRQ0 is the exception the MP specification calls out: the 8254's output
+  # reaches I/O APIC input **2**, not input 0, because input 0 is where an
+  # ExtINT entry for the whole 8259A cascade would go (MP spec §5.1).
   wire pit0.out0   -> pic1.ir0    # the system tick
+  wire pit0.out0   -> ioapic.irq2
   wire kbc.irq1    -> pic1.ir1    # a key was pressed
+  wire kbc.irq1    -> ioapic.irq1
   wire fdc.irq     -> pic1.ir6    # the floppy controller
+  wire fdc.irq     -> ioapic.irq6
   wire ide0.irq    -> pic2.ir6    # IRQ14, the primary IDE channel
+  wire ide0.irq    -> ioapic.irq14
   wire ide1.irq    -> pic2.ir7    # IRQ15, the secondary IDE channel
+  wire ide1.irq    -> ioapic.irq15
   wire cmos.irq    -> pic2.ir0    # IRQ8, the RTC
+  wire cmos.irq    -> ioapic.irq8
   wire kbc.irq12   -> pic2.ir4    # IRQ12, the auxiliary device
+  wire kbc.irq12   -> ioapic.irq12
+
+  # The HPET's three comparators, on the inputs its `routeN` properties
+  # advertise. They land on the I/O APIC and nowhere else: an HPET is not an ISA
+  # part and has no 8259A input of its own.
+  #
+  # What is *not* here is the legacy replacement route. Setting `LEG_RT_CNF` on
+  # a real board disconnects the 8254 from IRQ0 and the RTC from IRQ8 and puts
+  # HPET timers 0 and 1 there instead — a gate between three chips, which is
+  # neither a register in the HPET nor one in the 8259A. The gates exist now
+  # (`wire.and` and `wire.not` are ordinary objects, ROADMAP.md §4.3), but the
+  # HPET has no output pin saying whether the bit is set, so there is nothing to
+  # wire their enable to. That pin is the remaining piece; until it exists the
+  # bit reads back and does nothing, which is what `pc.hpet` documents.
+  wire hpet0.t0    -> ioapic.irq20
+  wire hpet0.t1    -> ioapic.irq21
+  wire hpet0.t2    -> ioapic.irq22
 
   # The timer's counter 2 and the board's port B: software gates the counter
   # through bit 0 and reads its output back in bit 5. Counter 1's output is the

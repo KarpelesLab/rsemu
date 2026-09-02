@@ -883,12 +883,26 @@ machine-nvme-mini = ["dev-nvme", "dev-pc-pci"]
 machine-pc-at = [
   "cpu-x86",
   "dev-pc",
+  "dev-pc-apic",
+  "dev-pc-hpet",
   "dev-pc-pci",
   "dev-pc-video",
   "dev-pc-floppy",
   "dev-pc-ide",
   "dev-ata-disk",
 ]
+
+# The same lineage stripped to its interrupt path (machines/pc-apic.machine):
+# an x86, the two cascaded 8259As, a local APIC, an I/O APIC and an HPET, and
+# nothing else -- no video, no disks, no PCI, no DMA. `machine-pc-at` carries
+# all of those parts too, so this is not "the board with an APIC" but the board
+# with *only* what an APIC question involves, which is what makes a failure in
+# `tests/pc_apic.rs` name the interrupt controller rather than the bus it shared.
+# The structural difference is one wire: the master 8259A reaches `LINT0`
+# directly rather than through an IMCR, so this board is in the MP
+# specification's virtual-wire mode from the first instruction. Adds no
+# dependencies.
+machine-pc-apic = ["cpu-x86", "dev-pc", "dev-pc-apic", "dev-pc-hpet"]
 
 # The in-house legacy PC BIOS (src/fw/pcbios): a 64 KiB real-mode ROM image
 # this crate assembles itself, so `pc-at` boots with nothing supplied from

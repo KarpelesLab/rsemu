@@ -39,7 +39,6 @@
 use std::sync::Arc;
 
 use rsemu::core::Captured;
-use rsemu::core::clock::GlobalTime;
 use rsemu::core::device::ResetKind;
 use rsemu::core::space::MemAttrs;
 use rsemu::core::value::Width;
@@ -142,6 +141,8 @@ fn the_option_rom_scan_raises_no_bus_fault_anywhere_in_its_window() {
 #[cfg(feature = "fw-pcbios")]
 #[test]
 fn a_post_on_rsemus_own_firmware_leaves_no_unanswered_access() {
+    use rsemu::core::clock::GlobalTime;
+
     let (mut m, cpu) = board(rsemu::fw::pcbios::image());
     m.run_for(GlobalTime::from_nanos(200_000_000))
         .expect("the machine runs");

@@ -51,10 +51,13 @@
 //!   route field while it is set — which they already do here. What it *also*
 //!   does on a real board is disconnect the 8254 from IRQ0 and the RTC from
 //!   IRQ8, and that is a gate on the board between three chips, not a register
-//!   in any of them. rsemu has no wire combinator a machine file can
-//!   instantiate yet (`machine::validate::WireCombinators` is empty), so a
-//!   board that turns legacy replacement on will see both timers on the line.
-//!   Said out loud rather than left to be discovered.
+//!   in any of them. The gates now exist — `wire.and` and `wire.not` are
+//!   ordinary devices a machine file can instantiate
+//!   ([`machine::combinator`](crate::machine::combinator)) — but this part has
+//!   no *output pin* saying whether `LEG_RT_CNF` is set, so there is nothing
+//!   for a machine file to wire the enable to. That pin is the remaining piece;
+//!   until it exists a board that turns legacy replacement on will see both
+//!   timers on the line. Said out loud rather than left to be discovered.
 
 use alloc::boxed::Box;
 use alloc::format;

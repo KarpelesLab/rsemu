@@ -1659,12 +1659,22 @@ impl Device for LocalApic {
         // moved, and nothing re-announces an unchanged level. Forgetting it
         // would cost a level-triggered request outright and turn the next
         // re-announcement into a fabricated edge.
+        //
+        // So does the tick, and for a sharper reason: it is not architectural
+        // state at all but this device's cursor in its clock domain, and the
+        // domain does not go back to zero because a chip on it was reset. A
+        // reset that zeroed it would leave the two disagreeing by however long
+        // the machine had been running, and the next catch-up would advance the
+        // timer by all of it at once. `init_reset` keeps it for the same
+        // reason and says so; this is the same fact about the same counter.
         let pending = {
             let mut state = self.regs.state.lock();
             let pins = state.lint_level;
+            let tick = state.tick;
             *state = State::default();
             state.id = self.reset_id;
             state.lint_level = pins;
+            state.tick = tick;
             if self.bsp {
                 state.apic_base |= APIC_BASE_BSP;
             }
