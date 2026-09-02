@@ -22,6 +22,17 @@
 //! hash is identical — which is the whole point of the seam being a pull rather
 //! than `pktkit`'s push. `the_run_is_reproducible` asserts it.
 //!
+//! # And a recorded arrival replays to the same machine
+//!
+//! The card's port is a **record/replay channel** (`netdev:net0`) rather than a
+//! private frame log: a host offers a frame with `Recorder::post`, the machine
+//! stamps it with the scheduling-round boundary it delivered it on, and a
+//! replay re-delivers it there. `a_recorded_arrival_replays_to_the_same_hash`
+//! asserts the two runs' state hashes agree, and
+//! `a_frame_arriving_changes_where_the_run_ends_up` is the control that makes
+//! that mean something — a seam that dropped every frame would pass the first
+//! test on its own.
+//!
 //! [`NetPort::deliver_at`]: rsemu::dev::net::link::NetPort::deliver_at
 
 #![cfg(feature = "machine-ne2k-mini")]
@@ -29,6 +40,8 @@
 use std::sync::Arc;
 
 use rsemu::core::clock::GlobalTime;
+use rsemu::core::hosts::HostObjects;
+use rsemu::core::record::{InputLog, Recorder};
 use rsemu::core::space::MemAttrs;
 use rsemu::core::value::Width;
 use rsemu::dev::net::link::{NetPort, ports};
@@ -351,9 +364,16 @@ fn firmware() -> Vec<u8> {
 /// Build the board with the firmware in its `firmware` slot, and hand back the
 /// far end of its wire.
 fn boot() -> (Machine, Arc<NetPort>) {
+    let (machine, port, _) = boot_with_hosts(Arc::new(HostObjects::new()));
+    (machine, port)
+}
+
+/// [`boot`], against a host-object table the caller supplies and keeps.
+fn boot_with_hosts(hosts: Arc<HostObjects>) -> (Machine, Arc<NetPort>, Arc<HostObjects>) {
     let entry = catalog::machine("ne2k-mini").expect("this build ships ne2k-mini");
     let mut options = catalog::build_options().expect("the catalog agrees with itself");
     options.realize.media.insert("firmware", firmware());
+    options.realize.hosts = Arc::clone(&hosts);
     let registry = catalog::registry().expect("a registry");
     let machine = match rsemu::machine::build(entry.name, entry.source, &registry, &options) {
         Ok(m) => m,
@@ -361,7 +381,25 @@ fn boot() -> (Machine, Arc<NetPort>) {
     };
     // The same name the machine file gave the card resolves, from out here, to
     // the same port object the card is holding.
-    let port = ports::open(&options.realize.hosts, "net0").expect("the board opened a net port");
+    let port = ports::open(&hosts, "net0").expect("the board opened a net port");
+    (machine, port, hosts)
+}
+
+/// The board, with its NIC's arrivals registered as a record/replay channel.
+///
+/// Three lines, and they are the whole conversion: the port is a host object
+/// opened by name, `ports::channel` is that name as a channel, and
+/// `ports::sink` is what a payload does when the machine decides it is time.
+fn boot_recording(recorder: &Arc<Recorder>) -> (Machine, Arc<NetPort>) {
+    let hosts = Arc::new(HostObjects::new());
+    let port = ports::open(&hosts, "net0").expect("a port before the build");
+    recorder
+        .register(ports::channel("net0"), ports::sink(&port))
+        .expect("a fresh recorder takes channels");
+    let (mut machine, port, _) = boot_with_hosts(hosts);
+    machine
+        .set_recorder(Arc::clone(recorder))
+        .expect("the board runs deterministically");
     (machine, port)
 }
 
@@ -530,5 +568,110 @@ fn the_board_snapshots_and_restores_to_an_identical_state_hash() {
         peek_bytes(&other, RX_PAGE + 4, incoming().len()),
         incoming(),
         "and the packet is still where the driver left it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the record/replay seam
+// ---------------------------------------------------------------------------
+
+/// The frame the recorded session receives, and the run that shows it landed.
+///
+/// Posting is not delivering: the recorder holds the payload until the machine
+/// drains it at the top of a scheduling round, and that round's instant is what
+/// the recording carries.
+fn run_with_arrival(machine: &mut Machine, recorder: &Recorder, frames: &[Vec<u8>]) -> u64 {
+    machine.run_for(a_while()).expect("the driver initialises");
+    for frame in frames {
+        recorder
+            .post(&ports::channel("net0"), frame)
+            .expect("a registered channel");
+    }
+    machine.run_for(a_while()).expect("it runs on");
+    machine.state_hash().expect("a deterministic run hashes")
+}
+
+#[test]
+fn a_frame_arriving_changes_where_the_run_ends_up() {
+    // The control. Without it, "record and replay agree" would be satisfied by
+    // a seam that swallowed every frame.
+    let recorder = Arc::new(Recorder::recording());
+    let (mut quiet, _port) = boot_recording(&recorder);
+    let silent = run_with_arrival(&mut quiet, &recorder, &[]);
+    assert_ne!(
+        peek(&quiet, "mem", DONE),
+        0xa5,
+        "nothing arrived, so the driver never copied a packet out of the ring"
+    );
+
+    let recorder = Arc::new(Recorder::recording());
+    let (mut noisy, _port) = boot_recording(&recorder);
+    let heard = run_with_arrival(&mut noisy, &recorder, &[incoming()]);
+    assert_eq!(
+        peek(&noisy, "mem", DONE),
+        0xa5,
+        "the frame reached the guest"
+    );
+    assert_ne!(
+        silent, heard,
+        "a frame crossing the seam is guest-visible, so the two runs are \
+         different machines"
+    );
+    assert_eq!(recorder.log().len(), 1, "and one frame is one logged event");
+}
+
+#[test]
+fn a_recorded_arrival_replays_to_the_same_hash() {
+    let recorder = Arc::new(Recorder::recording());
+    let (mut machine, _port) = boot_recording(&recorder);
+    let recorded = run_with_arrival(&mut machine, &recorder, &[incoming()]);
+    let recorded_at = machine.now();
+    let recorded_ring = peek_bytes(&machine, RX_PAGE + 4, incoming().len());
+
+    // Through the file format on the way, so what is replayed is what a
+    // `.trace` on disk would hold rather than a live object.
+    let bytes = recorder.log().encode().expect("a recording encodes");
+    let log = InputLog::decode(&bytes).expect("and decodes");
+    assert_eq!(log.len(), 1);
+    assert_eq!(log.events()[0].channel.to_string(), "netdev:net0");
+
+    let replay = Arc::new(Recorder::replaying(log));
+    let (mut replayed, _port) = boot_recording(&replay);
+    // No `post` this time: everything the guest sees comes out of the log.
+    let hash = run_with_arrival(&mut replayed, &replay, &[]);
+
+    assert_eq!(replayed.now(), recorded_at, "the same instant");
+    assert_eq!(
+        hash, recorded,
+        "a replayed session is the same machine, bit for bit"
+    );
+    assert_eq!(
+        peek_bytes(&replayed, RX_PAGE + 4, incoming().len()),
+        recorded_ring,
+        "and the same frame is in the ring"
+    );
+    assert_eq!(replay.cursor(), 1, "the recorded event was delivered");
+}
+
+#[test]
+fn a_board_whose_nic_has_no_channel_refuses_to_build() {
+    // The seal, on this board: the card opens `netdev:net0` from its own
+    // `new(props)`, so a recorder that has not registered that channel would
+    // have produced a recording with no network in it.
+    let recorder = Arc::new(Recorder::recording());
+    let hosts = Arc::new(HostObjects::new());
+    hosts.seal(Arc::clone(&recorder)).expect("an empty table");
+
+    let entry = catalog::machine("ne2k-mini").expect("this build ships ne2k-mini");
+    let mut options = catalog::build_options().expect("the catalog agrees with itself");
+    options.realize.media.insert("firmware", firmware());
+    options.realize.hosts = hosts;
+    let registry = catalog::registry().expect("a registry");
+    let err = rsemu::machine::build(entry.name, entry.source, &registry, &options)
+        .expect_err("the card's arrivals have no channel");
+    let text = format!("{err}");
+    assert!(
+        text.contains("netdev:net0"),
+        "the refusal names the input that bypassed the seam: {text}"
     );
 }

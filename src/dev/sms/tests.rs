@@ -660,21 +660,21 @@ fn an_unpressed_pad_reads_as_all_ones() {
 #[test]
 fn a_pressed_button_pulls_its_line_low() {
     let chip = SmsIo::new(Nationalisation::Export);
-    chip.set_pressed(0, Button::Up, true);
+    chip.pads().set_pressed(0, Button::Up, true);
     assert_eq!(chip.read_dc(), 0xfe);
-    chip.set_pressed(0, Button::Two, true);
+    chip.pads().set_pressed(0, Button::Two, true);
     assert_eq!(chip.read_dc(), 0xde);
     // Port B's first two lines are the top of $DC and the rest are in $DD.
-    chip.set_pressed(1, Button::Down, true);
+    chip.pads().set_pressed(1, Button::Down, true);
     assert_eq!(chip.read_dc(), 0x5e);
-    chip.set_pressed(1, Button::One, true);
+    chip.pads().set_pressed(1, Button::One, true);
     assert_eq!(chip.read_dd(), 0xfb);
 }
 
 #[test]
 fn switching_the_io_chip_out_makes_both_ports_read_as_ones() {
     let chip = SmsIo::new(Nationalisation::Export);
-    chip.set_pressed(0, Button::Up, true);
+    chip.pads().set_pressed(0, Button::Up, true);
     assert_eq!(chip.read_dc(), 0xfe);
     // $3E bit 2 disables the I/O chip, which is the documented way to reach
     // $FC/$FD.
@@ -702,15 +702,15 @@ fn the_th_pins_read_back_their_output_level_on_an_export_console() {
 fn the_reset_button_is_both_a_bit_and_a_pin() {
     let chip = SmsIo::new(Nationalisation::Export);
     assert_eq!(chip.read_dd() & 0x10, 0x10);
-    chip.set_reset(true);
+    chip.pads().set_reset(true);
     assert_eq!(chip.read_dd() & 0x10, 0x00, "active low, like everything");
 }
 
 #[test]
 fn an_io_chip_round_trips() {
     let chip = SmsIo::new(Nationalisation::Export);
-    chip.set_buttons(0, 0x15);
-    chip.set_pause(true);
+    chip.pads().set_buttons(0, 0x15);
+    chip.pads().set_pause(true);
     chip.write_control(0, 0x04);
     chip.write_control(1, 0xf5);
     let restored = SmsIo::new(Nationalisation::Export);

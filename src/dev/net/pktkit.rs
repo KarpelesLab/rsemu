@@ -49,13 +49,15 @@
 //!
 //! A live backend is **not** deterministic and this bridge does not pretend
 //! otherwise: which tick a frame lands on depends on when the host produced it.
-//! What the bridge does give is the thing that makes a run reproducible
-//! *afterwards* — turn recording on with [`NetPort::record`] and every frame the
-//! guest is handed is logged against the tick it was handed over at, and
-//! [`NetPort::replay`] on a fresh machine reproduces the run exactly. That log
-//! is the network half of the record/replay seam of `ROADMAP.md` §4.5; the seam
-//! itself does not exist yet, and when it does this is the shape its network
-//! entry has to have.
+//! What makes a run reproducible *afterwards* is
+//! [`core::record`](crate::core::record), which this port is a channel of:
+//! register it with [`ports::channel`](super::link::ports::channel) and
+//! [`ports::sink`](super::link::ports::sink), and every frame is logged against
+//! the scheduling-round boundary the machine delivered it on rather than
+//! against a tick a host thread happened to produce. A station wired straight
+//! to a hub — [`PktkitLink::inbox`] fed by `pktkit`'s own handler — is the
+//! *unrecorded* form of the same path: the frames reach the guest, and nothing
+//! writes down when.
 //!
 //! Two things in `pktkit` read the host's wall clock and are worth knowing
 //! about before wiring a machine to them: `L2Hub`'s MAC-learning table ages
@@ -129,8 +131,9 @@ impl PktkitLink {
 
     /// The inbox arrivals are queued in.
     ///
-    /// This is where [`NetPort::record`] and [`NetPort::recorded`] live, and
-    /// where a replay is injected with [`NetPort::replay`].
+    /// The host object a recording names: hand it to
+    /// [`ports::sink`](super::link::ports::sink) and the frames it hands the
+    /// guest become one stream of a recording.
     #[must_use]
     pub fn inbox(&self) -> &Arc<NetPort> {
         &self.inbox
@@ -274,30 +277,37 @@ mod tests {
     }
 
     #[test]
-    fn a_recording_of_a_live_backend_replays_to_the_same_ticks() {
-        let link = PktkitLink::new();
-        link.inbox().record(true);
+    fn a_live_arrival_is_recorded_through_the_seam_rather_than_by_the_port() {
+        use crate::core::clock::GlobalTime;
+        use crate::core::record::Recorder;
+        use crate::dev::net::link::ports;
+
+        // A station whose inbox is a named host object, which is what a machine
+        // file's `link = "net0"` produces.
+        let hosts = crate::core::hosts::HostObjects::new();
+        let inbox = ports::open(&hosts, "net0").unwrap();
+        let link = PktkitLink::with_inbox(Arc::clone(&inbox));
+        let recorder = Recorder::recording();
+        recorder
+            .register(ports::channel("net0"), ports::sink(&inbox))
+            .unwrap();
+
+        // `send` is the *unrecorded* path: a hub's handler putting a frame in
+        // the inbox, which is exactly what a live backend does.
         let one = frame([0xff; 6], [0, 0, 0, 0, 0, 1]);
-        let two = frame([0xff; 6], [0, 0, 0, 0, 0, 2]);
         link.send(Frame::from_slice(&one)).unwrap();
-        link.send(Frame::from_slice(&two)).unwrap();
-
-        // The machine happened to look at these two ticks.
         assert!(link.receive(700).is_some());
-        assert!(link.receive(9_000).is_some());
-        let trace = link.inbox().recorded();
-        assert_eq!(trace.len(), 2);
-        assert_eq!(trace[0].0, 700);
-        assert_eq!(trace[1].0, 9_000);
+        assert!(recorder.log().is_empty(), "the port writes nothing down");
 
-        // Replayed on a fresh port, the same frames become visible at the same
-        // ticks and not a tick earlier. That is the whole promise.
-        let again = NetPort::new();
-        again.replay(&trace);
-        assert!(again.receive(699).is_none());
-        assert_eq!(again.receive(700).as_deref(), Some(&one[..]));
-        assert!(again.receive(8_999).is_none());
-        assert_eq!(again.receive(9_000).as_deref(), Some(&two[..]));
+        // Through the seam, the same frame is one logged event against the
+        // round boundary the machine delivered it on.
+        let two = frame([0xff; 6], [0, 0, 0, 0, 0, 2]);
+        recorder.post(&ports::channel("net0"), &two).unwrap();
+        recorder.deliver(GlobalTime::from_nanos(9_000)).unwrap();
+        assert_eq!(link.receive(0).as_deref(), Some(&two[..]));
+        let log = recorder.log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.events()[0].at, GlobalTime::from_nanos(9_000));
     }
 
     #[test]

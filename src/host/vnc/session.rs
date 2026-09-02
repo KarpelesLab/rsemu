@@ -5,21 +5,28 @@
 //! *when* things happen rather than about RFB:
 //!
 //! ```text
-//!   ┌── one slice ─────────────────────────────────────────────────┐
-//!   │ 1. capture the scanout into the surface                      │
-//!   │ 2. server.poll(surface)  → frames out, input events back     │
-//!   │ 3. deliver those events at machine.now(), and record them    │
-//!   │ 4. machine.run_until(now + slice)                            │
-//!   │ 5. ask the rate controller how long to wait, and wait        │
-//!   └──────────────────────────────────────────────────────────────┘
+//!   ┌── one slice ──────────────────────────────────────────────────┐
+//!   │ 1. capture the scanout into the surface                       │
+//!   │ 2. server.poll(surface)  → frames out, input events back      │
+//!   │ 3. post those events to the machine's recorder                │
+//!   │ 4. machine.run_until(now + slice) — whose first round is where │
+//!   │    the recorder delivers them, stamped with that round         │
+//!   │ 5. ask the rate controller how long to wait, and wait         │
+//!   └───────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! Step 3 is the whole determinism argument. Events are collected in step 2 at
-//! whatever wall-clock instant the human produced them, and delivered in step 3
-//! at a virtual instant the *scheduler* is standing on — a slice boundary. The
-//! pair `(instant, event)` is what goes in the [`InputLog`], and replaying that
-//! log delivers the same events at the same instants. Nothing the network did
-//! is observable to the guest.
+//! Step 3 is the whole determinism argument, and it is no longer this module's
+//! to make: an event collected in step 2 is **posted to the machine's
+//! [`Recorder`](crate::core::record::Recorder)**, which delivers it at the top
+//! of the next scheduling round and stamps it with that round's own instant.
+//! This loop therefore decides *nothing* about when a keystroke lands, which is
+//! the property a private log could not have — a frontend that stamps its own
+//! instants has to be trusted to stamp a round boundary, and nothing checked
+//! that it did.
+//!
+//! A session with no recorder attached delivers straight to its sinks, because
+//! there is no seam to go through: that is a live run nobody is recording, and
+//! `--record-input` is what attaches one.
 //!
 //! Step 5 is the other rule: the wait comes from
 //! [`Scheduler::pace`](crate::core::sched::Scheduler::pace), driven by the one
@@ -52,25 +59,32 @@
 //! resampler, the queue — is all already here and already fed at the right
 //! rate.
 //!
-//! # Replay stops where the events are
+//! # Why a replay no longer has to shorten its slice
 //!
-//! A live run advances a fixed slice at a time. A replay cannot: an event
-//! recorded at *t* has to be delivered at *t*, and a slice that stepped over
-//! *t* would deliver it late and produce a different run. So a replaying
-//! session shortens its slice to land exactly on the next event's instant.
-//! That is why [`Replay::next_instant`](crate::host::input::Replay::next_instant)
-//! exists, and it is requirement 3 in the [module docs](super) of what the
-//! general record/replay seam has to offer.
+//! It used to. An event recorded at *t* has to be delivered at *t*, and a slice
+//! that stepped over *t* would deliver it late — so a replaying session cut its
+//! slice short to land exactly on the next event's instant. That was
+//! requirement 3 in the [module docs](super) of what the general seam had to
+//! offer, and the seam answers it in a stronger form: an instant in the
+//! recording *is* a scheduling-round boundary, because that is the only place
+//! the recorder ever stamps one, and
+//! [`Machine::run_until`](crate::machine::Machine::run_until) declines a round
+//! it cannot finish rather than splitting it (§11.6). A replay that reaches the
+//! same boundaries — which a deterministic run does, by definition — therefore
+//! stands on *t* whatever the caller's slice was. The slice is a frame rate
+//! again, and nothing about the run depends on it.
 
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::core::clock::GlobalTime;
+use crate::core::record::Channel;
 use crate::core::sched::{Pace, RateControl};
 use crate::host::audio::AudioStream;
 use crate::host::clock::MonotonicClock;
 use crate::host::display::{PixelFormat, Scanout, Surface};
-use crate::host::input::{InputEvent, InputLog, InputSink, Replay};
+use crate::host::input::{self, Feed, InputSink};
 use crate::machine::Machine;
 
 use super::VncServer;
@@ -99,24 +113,16 @@ const MAX_WAIT: Duration = Duration::from_millis(50);
 /// time.
 const MAX_CATCHUP_NANOS: u64 = 250_000_000;
 
-/// Whether a session is recording input, replaying it, or neither.
-#[derive(Debug)]
-enum Tape {
-    /// Live input from the network, unrecorded.
-    Live,
-    /// Live input from the network, recorded.
-    Recording(InputLog),
-    /// No live input: the log is the input.
-    Replaying(Replay),
-}
-
 /// A machine, a VNC server, and the loop between them.
 pub struct VncSession {
     server: VncServer,
     scanout: Box<dyn Scanout>,
     surface: Surface,
-    sinks: Vec<Box<dyn InputSink>>,
-    tape: Tape,
+    /// Where an event goes: the machine's own end of the input channel, which
+    /// is also what a recorder delivers a replayed payload to.
+    feed: Arc<Feed>,
+    /// The channel this session posts on.
+    channel: Channel,
     /// The machine's sound, drained once a slice. See the module docs.
     audio: Option<AudioStream>,
     /// The frame counter the surface was last filled from, so an unchanged
@@ -129,8 +135,8 @@ impl core::fmt::Debug for VncSession {
         f.debug_struct("VncSession")
             .field("server", &self.server)
             .field("scanout", &self.scanout)
-            .field("sinks", &self.sinks.len())
-            .field("tape", &self.tape)
+            .field("feed", &self.feed)
+            .field("channel", &self.channel.to_string())
             .field("audio", &self.audio.is_some())
             .finish_non_exhaustive()
     }
@@ -154,11 +160,47 @@ impl VncSession {
             surface: Surface::new(PixelFormat::BGRA8888, info.width, info.height),
             server,
             scanout,
-            sinks: Vec::new(),
-            tape: Tape::Live,
+            feed: Arc::new(Feed::new()),
+            channel: input::channel(input::DEFAULT_STREAM),
             audio: None,
             captured: u64::MAX,
         }
+    }
+
+    /// Post on `name` rather than on [`input::DEFAULT_STREAM`].
+    ///
+    /// For a process serving two machines, whose recordings must not name one
+    /// stream between them.
+    #[must_use]
+    pub fn on_stream(mut self, name: &str) -> VncSession {
+        self.channel = input::channel(name);
+        self
+    }
+
+    /// The record/replay channel this session's events cross on.
+    #[must_use]
+    pub fn channel(&self) -> &Channel {
+        &self.channel
+    }
+
+    /// The far end of that channel: what a recorded payload is delivered to.
+    #[must_use]
+    pub fn feed(&self) -> &Arc<Feed> {
+        &self.feed
+    }
+
+    /// Register this session's channel with `recorder`.
+    ///
+    /// Call it **before the machine is built** when the host-object table is
+    /// going to be sealed, and before the first run in any case: a channel
+    /// registered late would have missed everything before it, and
+    /// [`Recorder::register`](crate::core::record::Recorder::register) says so.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Config`] if the recorder is already sealed.
+    pub fn attach(&self, recorder: &crate::core::record::Recorder) -> crate::Result<()> {
+        recorder.register(self.channel.clone(), input::sink(&self.feed))
     }
 
     /// Drain `stream` once a slice.
@@ -186,26 +228,8 @@ impl VncSession {
 
     /// Send input to `sink` as well as to whatever is already attached.
     #[must_use]
-    pub fn with_sink(mut self, sink: Box<dyn InputSink>) -> VncSession {
-        self.sinks.push(sink);
-        self
-    }
-
-    /// Record every event that crosses into the machine.
-    #[must_use]
-    pub fn recording(mut self) -> VncSession {
-        self.tape = Tape::Recording(InputLog::new());
-        self
-    }
-
-    /// Replay `log` instead of taking input from the network.
-    ///
-    /// Clients may still watch — a replay is a good thing to watch — but what
-    /// they type is discarded, because accepting it would make the replay a
-    /// different run from the recording.
-    #[must_use]
-    pub fn replaying(mut self, log: InputLog) -> VncSession {
-        self.tape = Tape::Replaying(Replay::new(log));
+    pub fn with_sink(self, sink: Arc<dyn InputSink>) -> VncSession {
+        self.feed.attach(sink);
         self
     }
 
@@ -213,27 +237,6 @@ impl VncSession {
     #[must_use]
     pub fn server(&self) -> &VncServer {
         &self.server
-    }
-
-    /// What has been recorded so far, if this session is recording.
-    #[must_use]
-    pub fn log(&self) -> Option<&InputLog> {
-        match &self.tape {
-            Tape::Recording(log) => Some(log),
-            _ => None,
-        }
-    }
-
-    /// Whether a replay has run out of events.
-    ///
-    /// A live session is never finished, which is why this is false for one:
-    /// there is always another keystroke a person might make.
-    #[must_use]
-    pub fn is_replay_finished(&self) -> bool {
-        match &self.tape {
-            Tape::Replaying(replay) => replay.is_finished(),
-            _ => false,
-        }
     }
 
     /// Prepare a machine for a live session: a host clock, and real-time pacing.
@@ -258,16 +261,27 @@ impl VncSession {
         );
     }
 
-    /// One turn: show the current frame, take what was typed, deliver it.
+    /// One turn: show the current frame and offer what was typed to the machine.
     ///
-    /// Returns how many events were delivered. Does **not** advance virtual
-    /// time — the caller does that, immediately afterwards, which is what makes
-    /// the delivery instant a scheduling boundary.
+    /// Returns how many events crossed the seam. Does **not** advance virtual
+    /// time and does not itself decide when an event lands: with a recorder
+    /// attached the events are *posted*, and the machine delivers them at the
+    /// top of the round the caller's next `run_until` starts — which is the
+    /// same instant this used to stamp, arrived at by the machine rather than
+    /// by a frontend. With no recorder they go straight to the sinks, because
+    /// then there is no seam to go through.
+    ///
+    /// In a replaying session a client's keystrokes are discarded, which is
+    /// [`Recorder::post`](crate::core::record::Recorder::post)'s own rule: a
+    /// replay that also took live input would be a different run wearing a
+    /// recording's name.
     ///
     /// # Errors
     ///
-    /// A failure of the listening socket. A single client's failure closes that
-    /// client and is not an error here.
+    /// A failure of the listening socket, or a recorder that does not know this
+    /// session's channel — which is a wiring mistake
+    /// ([`attach`](VncSession::attach) was not called) rather than something to
+    /// paper over by delivering unrecorded.
     pub fn poll(&mut self, machine: &mut Machine) -> io::Result<usize> {
         self.capture();
         // Before the events, because it is bookkeeping rather than input: what
@@ -278,49 +292,32 @@ impl VncSession {
             audio.pull();
         }
         let live = self.server.poll(&self.surface)?;
-        let now = machine.now();
-        let mut delivered = 0;
-        match &mut self.tape {
-            Tape::Live => {
+        let mut crossed = 0;
+        match machine.recorder() {
+            Some(recorder) => {
                 for event in live {
-                    deliver(&self.sinks, event);
-                    delivered += 1;
+                    recorder
+                        .post(&self.channel, &event.encode())
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    crossed += 1;
                 }
             }
-            Tape::Recording(log) => {
+            None => {
                 for event in live {
-                    log.push(now, event);
-                    deliver(&self.sinks, event);
-                    delivered += 1;
-                }
-            }
-            Tape::Replaying(replay) => {
-                // What a client typed is dropped: see `replaying`.
-                for entry in replay.due(now) {
-                    deliver(&self.sinks, entry.event);
-                    delivered += 1;
+                    self.feed.deliver(event);
+                    crossed += 1;
                 }
             }
         }
-        Ok(delivered)
+        Ok(crossed)
     }
 
-    /// How far this turn may advance virtual time.
+    /// How far this turn may advance virtual time: one [`SLICE`].
     ///
-    /// A slice, unless a replay has an event due sooner — in which case the
-    /// slice ends exactly on it, so the next [`poll`](VncSession::poll)
-    /// delivers it at the instant it was recorded at.
+    /// A replay does not need a shorter one — see the module docs.
     #[must_use]
     pub fn deadline(&self, machine: &Machine) -> GlobalTime {
-        let now = machine.now();
-        let slice = now.saturating_add(SLICE);
-        match &self.tape {
-            Tape::Replaying(replay) => match replay.next_instant() {
-                Some(at) if at > now && at < slice => at,
-                _ => slice,
-            },
-            _ => slice,
-        }
+        machine.now().saturating_add(SLICE)
     }
 
     /// Run until `keep_going` says stop.
@@ -384,18 +381,11 @@ impl VncSession {
     }
 }
 
-/// Hand `event` to every sink.
-fn deliver(sinks: &[Box<dyn InputSink>], event: InputEvent) {
-    for sink in sinks {
-        sink.deliver(event);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::host::display::SurfaceInfo;
-    use crate::host::input::Keysym;
+    use crate::host::input::{InputEvent, Keysym};
     use std::sync::Mutex;
 
     /// A scanout with nothing behind it, so the loop can be tested without a
@@ -418,9 +408,9 @@ mod tests {
 
     /// A sink that remembers what it was given.
     #[derive(Debug, Default)]
-    struct Recorder(Mutex<Vec<InputEvent>>);
+    struct Seen(Mutex<Vec<InputEvent>>);
 
-    impl InputSink for Recorder {
+    impl InputSink for Seen {
         fn deliver(&self, event: InputEvent) {
             self.0.lock().expect("not poisoned").push(event);
         }
@@ -448,61 +438,83 @@ mod tests {
     }
 
     #[test]
-    fn a_replay_delivers_at_the_instant_it_recorded() {
+    fn a_replay_delivers_at_the_instant_it_was_recorded_at() {
+        use crate::core::record::{InputEvent as Record, InputLog, Recorder};
+
+        // A recording made elsewhere, with one event on the session's channel
+        // at an instant this machine's rounds land on.
+        let at = GlobalTime::from_nanos(5_000_000);
         let mut log = InputLog::new();
-        log.push(
-            GlobalTime::from_nanos(0),
-            InputEvent::Key {
+        let channel = crate::host::input::channel(crate::host::input::DEFAULT_STREAM);
+        log.push(Record {
+            at,
+            channel: channel.clone(),
+            payload: InputEvent::Key {
                 keysym: Keysym::from_ascii(b'a'),
                 down: true,
-            },
-        );
-        log.push(
-            GlobalTime::from_nanos(5_000_000),
-            InputEvent::Key {
-                keysym: Keysym::from_ascii(b'a'),
-                down: false,
-            },
-        );
+            }
+            .encode()
+            .to_vec(),
+        })
+        .expect("an empty log takes anything");
+
+        let seen = Arc::new(Seen::default());
         let server = VncServer::bind(":0").expect("an ephemeral port");
-        let sink = std::sync::Arc::new(Recorder::default());
-        let mut session = VncSession::new(server, Box::new(Blank))
-            .with_sink(Box::new(SharedRecorder(sink.clone())))
-            .replaying(log);
+        let session = VncSession::new(server, Box::new(Blank))
+            .with_sink(Arc::clone(&seen) as Arc<dyn InputSink>);
+        let replay = Arc::new(Recorder::replaying(log));
+        session.attach(&replay).expect("a fresh recorder");
+
         let mut machine = a_machine();
+        machine
+            .set_recorder(Arc::clone(&replay))
+            .expect("a deterministic machine");
+        let mut session = session;
 
-        // The first poll delivers the event due at zero.
-        assert_eq!(session.poll(&mut machine).expect("poll"), 1);
-        // And the slice is cut short so the second lands on its own instant
-        // rather than 16 ms later.
+        // Before the event's instant, nothing.
+        session.poll(&mut machine).expect("poll");
+        machine.run_until(at).expect("run");
+        assert!(seen.0.lock().expect("not poisoned").is_empty());
+
+        // The round that starts on it delivers it, and the frontend's slice had
+        // nothing to do with when.
+        session.poll(&mut machine).expect("poll");
         let deadline = session.deadline(&machine);
-        assert_eq!(deadline, GlobalTime::from_nanos(5_000_000));
+        assert_eq!(deadline, machine.now().saturating_add(SLICE));
         machine.run_until(deadline).expect("run");
-        assert_eq!(session.poll(&mut machine).expect("poll"), 1);
-        assert!(session.is_replay_finished());
-        assert_eq!(sink.0.lock().expect("not poisoned").len(), 2);
-        // A live session is never "finished".
-        assert!(session.deadline(&machine) > machine.now());
-    }
-
-    /// `with_sink` takes a box, and the test wants to keep a handle.
-    #[derive(Debug)]
-    struct SharedRecorder(std::sync::Arc<Recorder>);
-
-    impl InputSink for SharedRecorder {
-        fn deliver(&self, event: InputEvent) {
-            self.0.deliver(event);
-        }
+        assert_eq!(seen.0.lock().expect("not poisoned").len(), 1);
+        assert_eq!(replay.cursor(), 1);
     }
 
     #[test]
-    fn a_live_session_records_at_the_machines_instant() {
+    fn a_session_with_no_recorder_delivers_straight_to_its_sinks() {
+        let seen = Arc::new(Seen::default());
         let server = VncServer::bind(":0").expect("an ephemeral port");
-        let mut session = VncSession::new(server, Box::new(Blank)).recording();
+        let mut session = VncSession::new(server, Box::new(Blank))
+            .with_sink(Arc::clone(&seen) as Arc<dyn InputSink>);
         let mut machine = a_machine();
+        // Nothing is connected, so nothing was typed — what is asserted is that
+        // the unrecorded path exists and reports honestly.
         assert_eq!(session.poll(&mut machine).expect("poll"), 0);
-        assert_eq!(session.log().map(InputLog::len), Some(0));
-        assert!(!session.is_replay_finished(), "a live tape never finishes");
+        assert_eq!(session.channel().to_string(), "input:vnc");
+        assert_eq!(session.feed().len(), 1);
+        // And the feed is what a recorded payload lands in.
+        crate::core::record::InputSink::deliver(
+            &**session.feed(),
+            &InputEvent::Key {
+                keysym: Keysym::RETURN,
+                down: true,
+            }
+            .encode(),
+        );
+        assert_eq!(seen.0.lock().expect("not poisoned").len(), 1);
+    }
+
+    #[test]
+    fn a_stream_can_be_named() {
+        let server = VncServer::bind(":0").expect("an ephemeral port");
+        let session = VncSession::new(server, Box::new(Blank)).on_stream("second");
+        assert_eq!(session.channel().to_string(), "input:second");
     }
 
     /// An audio source that hands over one frame every time it is drained, and

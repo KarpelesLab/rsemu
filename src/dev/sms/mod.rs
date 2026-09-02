@@ -77,7 +77,7 @@ mod conformance;
 // The conformance runner reads a downloaded ROM off the filesystem, so it exists
 // only where there is one (`ROADMAP.md` §12).
 
-pub use io::{Button, Nationalisation, SmsIo};
+pub use io::{Button, Nationalisation, SmsIo, SmsPads};
 pub use mapper::SegaMapper;
 pub use psg::SmsPsg;
 pub use sdsc::SdscConsole;

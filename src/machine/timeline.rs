@@ -33,6 +33,20 @@
 //! Taking one mid-round would restore to an instant no input log entry can be
 //! aligned against.
 //!
+//! # The replay cursor is derived, not saved
+//!
+//! The piece that makes a rewind land where it says it does, and it is
+//! deliberately *not* in the snapshot.
+//! [`Machine::load`](crate::machine::Machine::load) calls
+//! [`Recorder::rewind_to`](crate::core::record::Recorder::rewind_to), which
+//! seeks the log to the restored instant by binary search. A cursor kept in the
+//! snapshot would be a second copy of a number the log already implies, and
+//! `CLAUDE.md` is explicit that derived state is rebuilt rather than saved; a
+//! cursor kept nowhere would restart the recording from the beginning and hand
+//! the guest every keystroke of the run a second time. Seeking is the third
+//! option, and it is the one that also works for a debugger loading a snapshot
+//! with no timeline in sight.
+//!
 //! # What a rewind does to host state that cannot be rewound
 //!
 //! The interesting half, and it is not solvable — only decidable. Three kinds

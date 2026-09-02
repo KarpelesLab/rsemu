@@ -47,11 +47,16 @@
 //! * **Reproducible.** The same `(tick, frame)` sequence produces the same
 //!   guest-visible bytes at the same guest cycles, on any host, at any speed,
 //!   under any threading mode.
-//! * **Recordable.** [`NetPort`] can log every frame it hands over against the
-//!   tick it handed it over at, and replaying that log is exactly
-//!   [`NetPort::replay`]. That log is the network half of the record/replay
-//!   seam of `ROADMAP.md` §4.5 — which does not exist yet — in the one shape it
-//!   has to have.
+//! * **Recordable.** An arrival is `(instant, bytes)`, which is exactly what
+//!   [`core::record`](crate::core::record) carries. This port used to keep its
+//!   own `Vec<(tick, frame)>` log and replay it by re-queueing; that log is
+//!   gone and the general seam is the one mechanism. A NIC's port is registered
+//!   as a channel — [`ports::channel`] names it, [`ports::sink`] is the two
+//!   closures that connect it — and the recorder stamps each frame with the
+//!   scheduling-round boundary it delivered it on. What the port gives up is
+//!   deciding *when*, which is the part it should give up: a device that
+//!   timestamps its own input has to be trusted to pick a round boundary and
+//!   nothing checked that it did.
 //!
 //! A `pktkit::L2Device` is then *one implementation of `NetLink`*
 //! ([`super::pktkit`]), not the seam itself: its handler stamps arrivals into a
@@ -326,10 +331,6 @@ struct PortState {
     seq: u64,
     /// Guest to outside, in the order the guest sent them.
     outbound: VecDeque<Vec<u8>>,
-    /// Every frame handed to the guest, against the tick it was handed over at.
-    /// Empty unless recording is on.
-    log: Vec<(u64, Vec<u8>)>,
-    recording: bool,
     link_up: bool,
     mac: MacAddr,
     /// When set, a transmitted frame is queued back as an arrival this many
@@ -347,8 +348,6 @@ impl Default for PortState {
             inbound: BTreeMap::new(),
             seq: 0,
             outbound: VecDeque::new(),
-            log: Vec::new(),
-            recording: false,
             link_up: true,
             mac: MacAddr::ZERO,
             loopback: None,
@@ -441,16 +440,6 @@ impl NetPort {
         self.deliver_at(0, frame)
     }
 
-    /// Queue a whole recorded trace, as [`NetPort::recorded`] produced it.
-    ///
-    /// This is replay: the guest sees the same frames at the same ticks it saw
-    /// them at in the recorded run.
-    pub fn replay(&self, trace: &[(u64, Vec<u8>)]) {
-        for (tick, frame) in trace {
-            self.deliver_at(*tick, frame);
-        }
-    }
-
     /// Take the first frame the guest has transmitted, if any.
     #[must_use]
     pub fn take(&self) -> Option<Vec<u8>> {
@@ -493,31 +482,24 @@ impl NetPort {
         self.state.lock().mac
     }
 
-    /// Start or stop logging what the guest is handed.
+    /// Forget every frame queued for the guest and not yet taken.
     ///
-    /// Turning it on clears whatever was logged: a recording starts where it is
-    /// started.
-    pub fn record(&self, on: bool) {
+    /// The rewind hook ([`InputSink::on_rewind`](crate::core::record::InputSink::on_rewind)):
+    /// the frames sitting in the inbound queue at a rewind target are
+    /// re-delivered from the recording on the way forward, so a port that kept
+    /// them would hand the guest each one twice. What the guest has already
+    /// *transmitted* is not touched — that is output, and output has left.
+    pub fn drop_queued(&self) {
         let mut state = self.state.lock();
-        state.recording = on;
-        state.log.clear();
+        state.inbound.clear();
+        self.publish(&state);
     }
 
-    /// The frames handed to the guest so far, against the tick each was handed
-    /// over at.
-    ///
-    /// Feed it to [`NetPort::replay`] on a fresh machine and the run repeats.
-    #[must_use]
-    pub fn recorded(&self) -> Vec<(u64, Vec<u8>)> {
-        self.state.lock().log.clone()
-    }
-
-    /// Empty both queues and the log, leaving the carrier and the address.
+    /// Empty both queues, leaving the carrier and the address.
     pub fn clear(&self) {
         let mut state = self.state.lock();
         state.inbound.clear();
         state.outbound.clear();
-        state.log.clear();
         self.publish(&state);
     }
 }
@@ -554,12 +536,6 @@ impl NetLink for NetPort {
         }
         let frame = state.inbound.remove(&key)?;
         self.publish(&state);
-        if state.recording {
-            // The tick the guest *saw* it, not the tick it was queued for: that
-            // is what a replay has to reproduce, and for a live backend that
-            // stamped everything 0 it is the only real number in the pair.
-            state.log.push((now, frame.clone()));
-        }
         Some(frame)
     }
 
@@ -593,6 +569,33 @@ impl NetLink for NetPort {
 /// device:        ports::attach(props, "net0")  ──┐
 /// host:          ports::open(&hosts, "net0")   ──┴─► the same Arc<NetPort>
 /// ```
+///
+/// # A port is a record/replay channel
+///
+/// A frame arriving from outside is a non-deterministic input like a keystroke,
+/// so it crosses in through [`core::record`](crate::core::record) and nowhere
+/// else (`CLAUDE.md`, determinism). [`ports::channel`] is the name it goes
+/// under and [`ports::sink`] is the object it goes to, so wiring a NIC into a
+/// recording is:
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use rsemu::core::record::Recorder;
+/// # use rsemu::dev::net::link::ports;
+/// # fn demo(hosts: &rsemu::core::hosts::HostObjects, recorder: &Recorder) -> rsemu::Result<()> {
+/// let port = ports::open(hosts, "net0")?;
+/// recorder.register(ports::channel("net0"), ports::sink(&port))?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// From then on the host offers frames with
+/// [`Recorder::post`](crate::core::record::Recorder::post) rather than with
+/// [`NetPort::deliver`], and the machine decides which round boundary each one
+/// lands on. [`NetPort::deliver_at`] stays, because it is how the *deterministic
+/// backend* is driven from inside the machine's own timeline — a loopback wire,
+/// a scripted test naming a tick of the NIC's clock domain — which is not host
+/// input at all.
 pub mod ports {
     use super::NetPort;
     use alloc::string::String;
@@ -602,6 +605,7 @@ pub mod ports {
     use crate::core::error::Result;
     use crate::core::hosts::{HostKind, HostObjects};
     use crate::core::props::Props;
+    use crate::core::record::{Channel, FnSink, InputSink};
 
     /// The kind a network port is filed under in a build's [`HostObjects`].
     pub const KIND: HostKind = HostKind::new("netdev");
@@ -654,6 +658,36 @@ pub mod ports {
     #[must_use]
     pub fn names(hosts: &HostObjects) -> Vec<String> {
         hosts.names(KIND)
+    }
+
+    /// The record/replay channel the port called `name` receives on.
+    ///
+    /// `netdev:net0`, which is the same `(kind, name)` pair the host-object
+    /// table files the port under — so a board whose NIC has no channel is
+    /// refused by [`HostObjects::seal`](crate::core::hosts::HostObjects::seal)
+    /// naming this string.
+    #[must_use]
+    pub fn channel(name: &str) -> Channel {
+        Channel::new(KIND, name)
+    }
+
+    /// The [`InputSink`] that puts a recorded payload into `port`.
+    ///
+    /// A payload is one Ethernet frame, delivered for the NIC's next look: the
+    /// *instant* is the round boundary the recorder delivered on, and the tick
+    /// the card sees it on follows from that rather than from anything the host
+    /// chose. On a rewind the port drops what it is still holding, because
+    /// those frames are re-delivered from the log on the way forward.
+    #[must_use]
+    pub fn sink(port: &Arc<NetPort>) -> Arc<dyn InputSink> {
+        let receiving = Arc::clone(port);
+        let rewinding = Arc::clone(port);
+        Arc::new(
+            FnSink::new("netdev", move |frame: &[u8]| {
+                receiving.deliver(frame);
+            })
+            .on_rewind(move || rewinding.drop_queued()),
+        )
     }
 }
 
@@ -732,24 +766,47 @@ mod tests {
     }
 
     #[test]
-    fn a_recording_replays_to_the_same_ticks() {
-        let live = NetPort::new();
-        live.record(true);
-        live.deliver(b"one");
-        live.deliver(b"two");
-        // A live backend stamps everything 0; the *delivery* tick is the real
-        // number, and it is what gets logged.
-        assert_eq!(live.receive(40).as_deref(), Some(&b"one"[..]));
-        assert_eq!(live.receive(90).as_deref(), Some(&b"two"[..]));
-        let trace = live.recorded();
-        assert_eq!(trace, vec![(40, b"one".to_vec()), (90, b"two".to_vec())]);
+    fn a_frame_reaches_the_port_through_the_record_seam() {
+        // The conversion, in one test: the host posts a frame and nothing
+        // happens until the machine drains the recorder at a round boundary.
+        use crate::core::clock::GlobalTime;
+        use crate::core::record::Recorder;
 
-        let again = NetPort::new();
-        again.replay(&trace);
-        assert_eq!(again.receive(39), None);
-        assert_eq!(again.receive(40).as_deref(), Some(&b"one"[..]));
-        assert_eq!(again.receive(89), None, "the second one is still to come");
-        assert_eq!(again.receive(90).as_deref(), Some(&b"two"[..]));
+        let hosts = crate::core::hosts::HostObjects::new();
+        let port = ports::open(&hosts, "net0").unwrap();
+        let recorder = Recorder::recording();
+        recorder
+            .register(ports::channel("net0"), ports::sink(&port))
+            .unwrap();
+
+        recorder.post(&ports::channel("net0"), b"frame").unwrap();
+        assert_eq!(port.pending_input(), 0, "posting delivers nothing");
+        recorder.deliver(GlobalTime::from_nanos(1_000)).unwrap();
+        assert_eq!(port.receive(0).as_deref(), Some(&b"frame"[..]));
+
+        // And the recording carries it against that boundary, under the same
+        // name the host-object table files the port under.
+        let log = recorder.log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.events()[0].channel.to_string(), "netdev:net0");
+        assert_eq!(log.events()[0].payload, b"frame");
+    }
+
+    #[test]
+    fn a_rewind_drops_what_the_guest_has_not_taken() {
+        // Without this the frames queued at the rewind target arrive twice:
+        // once from the queue that survived and once from the log.
+        let port = NetPort::new();
+        port.deliver(b"queued");
+        port.transmit(0, b"sent");
+        port.drop_queued();
+        assert_eq!(port.pending_input(), 0);
+        assert_eq!(port.next_arrival(), None);
+        assert_eq!(
+            port.pending_output(),
+            1,
+            "what the guest already transmitted has left and is not rewound"
+        );
     }
 
     #[test]

@@ -160,8 +160,10 @@ fn image() -> Vec<u8> {
 /// and hand back the host objects its constructors captured into.
 ///
 /// The bindings are intercepted first, because a machine hands back
-/// `Arc<dyn Device>` and there is no route from one of those to an `Arc<SmsIo>`
-/// — see `host::display::sms::capture`, which is the seam that exists for it.
+/// `Arc<dyn Device>` and there is no route from one of those to an
+/// `Arc<SmsVdp>` — see `host::display::sms::capture`, which is the seam that
+/// exists for it. Input needs no interception: the pads are a host object the
+/// chip opens by name.
 ///
 /// The capture tables belong to this build, which is why this file no longer
 /// needs a mutex to stop two tests taking each other's VDP.
@@ -279,7 +281,9 @@ fn a_program_reaches_every_chip_through_two_address_spaces_and_banks_its_own_rom
 #[test]
 fn the_pause_button_is_a_non_maskable_interrupt() {
     let (mut m, hosts) = boot("sms-ntsc");
-    let io = capture::take_io(&hosts).expect("the machine has an I/O chip");
+    // By name, through the host-object table — the same seam a recorder
+    // registers as a channel. Nothing is intercepted to reach a button.
+    let io = rsemu::dev::sms::io::pads::open(&hosts, "sms-pads").expect("the board's pads");
     // The program's first instruction is `di`, so an ordinary interrupt cannot
     // reach it. Run until it is parked in its loop.
     m.run_for(GlobalTime::from_nanos(2_000_000))

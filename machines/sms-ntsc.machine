@@ -84,7 +84,10 @@ machine "sms-ntsc" {
 
   # The I/O chip: two control pads, the memory and port control registers, and
   # the console's own two buttons.
-  object io "sms.io" { region = "export" }
+  # `pads` names the host seam buttons arrive through (src/dev/sms/io.rs): a
+  # front end opens the same name and presses through the record/replay seam,
+  # so a session is reproducible from its recording.
+  object io "sms.io" { region = "export", pads = "sms-pads" }
 
   # The SDSC debug console. Not hardware — a convention SMS Power! publishes and
   # every Master System test ROM reports through, mapped on the **write** half

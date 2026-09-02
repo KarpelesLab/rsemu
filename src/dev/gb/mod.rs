@@ -74,7 +74,7 @@ mod conformance;
 
 pub use apu::GbApu;
 pub use cart::{Cartridge, GbCart, Mapper};
-pub use joypad::{Button, GbJoypad};
+pub use joypad::{Button, GbJoypad, GbPad};
 pub use ppu::{GbPpu, Mode, SCREEN_HEIGHT, SCREEN_WIDTH};
 pub use serial::GbSerial;
 pub use timer::GbTimer;

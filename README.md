@@ -173,11 +173,12 @@ A machine is also **watchable over the network**. `rsemu run pc-at --vnc :5900`
 serves the display over RFB (RFC 6143) and takes keyboard and pointer events
 back from whoever connects; there is no GUI dependency because there is no GUI —
 a socket, a framebuffer and a scan-code table are the whole of it. Input crosses
-into the machine the way every non-deterministic input has to: collected from
-the socket whenever the human produced it, delivered at a virtual instant the
-scheduler chose, and recorded as `(instant, event)` — so `--record-input` and
-`--replay-input` reproduce a session bit for bit, which `tests/vnc_input.rs`
-asserts by comparing state hashes.
+into the machine the way every non-deterministic input has to — through the
+record/replay seam: a keystroke is *posted* whenever the human produced it, and
+the machine delivers it at the top of a scheduling round and logs it against
+that round's instant. So `--record-input` and `--replay-input` reproduce a
+session bit for bit, which `tests/vnc_input.rs` asserts by comparing state
+hashes — against a run nobody typed at, which reaches a different one.
 
 There is **sound**, too. The audio seam mirrors the display one: a device emits
 what the silicon does — the RP2A03 emits an unsigned level out of a non-linear

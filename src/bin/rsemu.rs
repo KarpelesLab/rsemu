@@ -1088,7 +1088,7 @@ fn vnc_session(machine: &mut Machine, args: &RunArgs, hosts: &HostObjects) -> Ex
 
     // The keyboard, if this machine has one.
     if let Ok(Some(port)) = rsemu::host::chardev::ports::get(hosts, "keyboard") {
-        session = session.with_sink(Box::new(rsemu::host::input::KeyboardSink::new(port)));
+        session = session.with_sink(Arc::new(rsemu::host::input::KeyboardSink::new(port)));
     }
     // The controllers, if it has those instead.
     #[cfg(feature = "dev-nes-io")]
@@ -1097,23 +1097,27 @@ fn vnc_session(machine: &mut Machine, args: &RunArgs, hosts: &HostObjects) -> Ex
         .enumerate()
     {
         if let Ok(Some(pad)) = rsemu::dev::nes::input::pads::get(hosts, name) {
-            session = session.with_sink(Box::new(rsemu::host::input::PadSink::new(pad, index)));
+            session = session.with_sink(Arc::new(rsemu::host::input::PadSink::new(pad, index)));
         }
     }
 
-    match (&args.record_input, &args.replay_input) {
+    // Recording and replaying are `core::record`'s, not this frontend's: what
+    // the flags do is attach a recorder to the machine and register the
+    // session's channel with it. The instant each event lands at is then the
+    // machine's own round boundary rather than anything decided out here.
+    let recorder = match (&args.record_input, &args.replay_input) {
         (Some(_), Some(_)) => {
             eprintln!("rsemu: --record-input and --replay-input are mutually exclusive");
             return ExitCode::from(2);
         }
-        (Some(_), None) => session = session.recording(),
+        (Some(_), None) => Some(Arc::new(rsemu::core::record::Recorder::recording())),
         (None, Some(path)) => match std::fs::read(path) {
-            Ok(bytes) => match rsemu::host::input::InputLog::decode(&bytes) {
+            Ok(bytes) => match rsemu::core::record::InputLog::decode(&bytes) {
                 Ok(log) => {
                     if !args.quiet {
                         eprintln!("  replaying {} input events from {path}", log.len());
                     }
-                    session = session.replaying(log);
+                    Some(Arc::new(rsemu::core::record::Recorder::replaying(log)))
                 }
                 Err(e) => {
                     eprintln!("rsemu: --replay-input {path}: {e}");
@@ -1125,7 +1129,19 @@ fn vnc_session(machine: &mut Machine, args: &RunArgs, hosts: &HostObjects) -> Ex
                 return ExitCode::FAILURE;
             }
         },
-        (None, None) => {}
+        (None, None) => None,
+    };
+    if let Some(recorder) = &recorder {
+        if let Err(e) = session.attach(recorder) {
+            eprintln!("rsemu: {e}");
+            return ExitCode::FAILURE;
+        }
+        // Refused outright under parallel threading, because a recording of one
+        // could not be replayed (ROADMAP.md §4.2).
+        if let Err(e) = machine.set_recorder(Arc::clone(recorder)) {
+            eprintln!("rsemu: {e}");
+            return ExitCode::from(2);
+        }
     }
 
     // Sound, if the user asked for it. **This is where the headless
@@ -1165,11 +1181,18 @@ fn vnc_session(machine: &mut Machine, args: &RunArgs, hosts: &HostObjects) -> Ex
         eprintln!("rsemu: {e}");
         return ExitCode::FAILURE;
     }
-    if let (Some(path), Some(log)) = (&args.record_input, session.log())
-        && let Err(e) = std::fs::write(path, log.encode())
-    {
-        eprintln!("rsemu: --record-input {path}: {e}");
-        return ExitCode::FAILURE;
+    if let (Some(path), Some(recorder)) = (&args.record_input, &recorder) {
+        let bytes = match recorder.log().encode() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("rsemu: --record-input {path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(e) = std::fs::write(path, bytes) {
+            eprintln!("rsemu: --record-input {path}: {e}");
+            return ExitCode::FAILURE;
+        }
     }
     if let (Some(path), Some(stream)) = (&args.record_audio, session.audio()) {
         let bytes = rsemu::host::audio::wav::encode(stream.info(), stream.buffer());

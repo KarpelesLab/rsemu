@@ -23,8 +23,16 @@
 //! supertrait chain, on purpose (`machine::realize` explains why). So the host
 //! takes its handle at the only moment the concrete type exists: device
 //! construction. [`capture::install`] wraps the machine's bindings so that
-//! `sms.vdp`, `sms.io` and `sms.sdsc` are built by constructors here, each of
-//! which keeps a clone before handing the device on.
+//! `sms.vdp` and `sms.sdsc` are built by constructors here, each of which keeps
+//! a clone before handing the device on.
+//!
+//! **The I/O chip is not one of them any more.** It used to be captured so a
+//! front end could press buttons on it, and that was the interim door
+//! `dev::sms::io` documented; the buttons now live in a named host object
+//! ([`pads`](crate::dev::sms::io::pads)) that a front end opens by name and a
+//! recorder registers as a channel, so there is nothing left to intercept. What
+//! remains here is *output* — a picture and a debug console — which is not
+//! input and does not belong in the record/replay seam.
 //!
 //! ```text
 //! let mut options = catalog::build_options()?;
@@ -162,11 +170,11 @@ pub mod capture {
     use super::{Arc, SmsScanout, SmsVdp};
     use crate::core::error::Result;
     use crate::core::hosts::{Captured, HostKind, HostObjects};
-    use crate::dev::sms::{SdscConsole, SmsIo};
+    use crate::dev::sms::SdscConsole;
     use crate::machine::BuildOptions;
 
-    /// Replace the three constructors in `options` with ones that keep a
-    /// handle, leaving every other class alone.
+    /// Replace the two constructors in `options` with ones that keep a handle,
+    /// leaving every other class alone.
     ///
     /// # Errors
     ///
@@ -180,15 +188,6 @@ pub mod capture {
                 let vdp = Arc::new(SmsVdp::from_props(props)?);
                 vdps.push(&vdp);
                 Ok(vdp)
-            });
-
-        let ios: Arc<Captured<SmsIo>> = table(options)?;
-        options
-            .bindings
-            .replace(crate::dev::sms::io::CLASS.name, move |props| {
-                let io = Arc::new(SmsIo::from_props(props)?);
-                ios.push(&io);
-                Ok(io)
             });
 
         let consoles: Arc<Captured<SdscConsole>> = table(options)?;
@@ -224,10 +223,6 @@ pub mod capture {
         const CLASS_NAME: &'static str = crate::dev::sms::vdp::CLASS.name;
     }
 
-    impl Captures for SmsIo {
-        const CLASS_NAME: &'static str = crate::dev::sms::io::CLASS.name;
-    }
-
     impl Captures for SdscConsole {
         const CLASS_NAME: &'static str = crate::dev::sms::sdsc::CLASS.name;
     }
@@ -248,13 +243,6 @@ pub mod capture {
     #[must_use]
     pub fn take_vdp(hosts: &HostObjects) -> Option<SmsScanout> {
         taken::<SmsVdp>(hosts).map(SmsScanout::new)
-    }
-
-    /// The I/O chip this build constructed, for a front end that has buttons to
-    /// press.
-    #[must_use]
-    pub fn take_io(hosts: &HostObjects) -> Option<Arc<SmsIo>> {
-        taken::<SmsIo>(hosts)
     }
 
     /// The debug console this build constructed, which is how a headless

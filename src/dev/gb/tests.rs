@@ -884,7 +884,7 @@ fn the_joypad_is_a_matrix_and_zero_means_pressed() {
     // Both select bits high means *neither* row is selected, and then nothing
     // can pull a column low.
     ops.write(0, &[0x30], MemAttrs::DEFAULT).expect("accepts");
-    pad.set_pressed(Button::Start, true);
+    pad.pad().set_pressed(Button::Start, true);
     assert_eq!(pad.read() & 0x0f, 0x0f, "neither row is selected");
 
     // Bit 5 low selects the action buttons. Start is bit 3 of that row.
@@ -894,7 +894,7 @@ fn the_joypad_is_a_matrix_and_zero_means_pressed() {
     // Bit 4 low selects the directions instead, and Start is not in that row.
     ops.write(0, &[0x20], MemAttrs::DEFAULT).expect("accepts");
     assert_eq!(pad.read() & 0x0f, 0x0f);
-    pad.set_pressed(Button::Right, true);
+    pad.pad().set_pressed(Button::Right, true);
     assert_eq!(pad.read() & 0x0f, 0b1110);
 
     // Both low at once: the two rows are wired together, and a button held in
@@ -909,7 +909,7 @@ fn the_joypad_is_a_matrix_and_zero_means_pressed() {
 #[test]
 fn a_joypad_round_trips_its_buttons_and_its_select_lines() {
     let pad = GbJoypad::new();
-    pad.set_buttons(0b1010_0101);
+    pad.pad().set_buttons(0b1010_0101);
     let region = Device::region(&pad, super::joypad::REGISTER_REGION).expect("the register");
     io(&region)
         .write(0, &[0x10], MemAttrs::DEFAULT)

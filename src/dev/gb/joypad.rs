@@ -27,11 +27,18 @@
 //!
 //! Button state is a non-deterministic input crossing into the machine, and
 //! `ROADMAP.md` §0 says every one of those goes through the record/replay seam
-//! or it is a determinism bug. That seam does not exist yet, so [`set_pressed`]
-//! is the interim door and it is deliberately the *only* one: when the seam
-//! lands, this is the single place that has to change.
+//! or it is a determinism bug. It does: the buttons live in a **named host
+//! object**, [`GbPad`], which this device opens by name from `new(props)` the
+//! way a UART opens a character port — so [`pads::channel`] is the channel a
+//! recorder registers, [`pads::sink`] is what a recorded payload does, and a
+//! board whose joypad the recorder does not know about is refused by
+//! [`HostObjects::seal`](crate::core::hosts::HostObjects::seal) at build time.
 //!
-//! [`set_pressed`]: GbJoypad::set_pressed
+//! There is no second door. [`GbPad::set_pressed`] is the *device* side of the
+//! seam — the thing the channel's sink calls, exactly as `CharPort::feed` is
+//! for a keystroke — and a host reaches it by opening the pad by name, which is
+//! the act the seal checks. A payload is one byte: the held mask, level rather
+//! than edge, because that is what the matrix reads.
 //!
 //! # Sources
 //!
@@ -39,13 +46,13 @@
 //! source was consulted.
 
 use alloc::boxed::Box;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use core::fmt;
 
-use crate::core::device::{Device, DeviceClass, RealizeCtx, ResetKind};
+use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
 use crate::core::error::{BusError, Error, Result};
-use crate::core::props::Props;
+use crate::core::props::{Props, ValueKind};
 use crate::core::space::{
     AccessConstraints, MemAttrs, MemOps, MemResult, Region as MmioRegion, RegionRef,
 };
@@ -62,6 +69,9 @@ pub const REGISTER_REGION: &str = "regs";
 
 /// The joypad-interrupt output pin.
 pub const IRQ_PIN: &str = "irq";
+
+/// The host pad port a machine gets when its description names none.
+pub const DEFAULT_PAD_PORT: &str = "gb-joypad";
 
 /// One of the eight buttons.
 ///
@@ -184,15 +194,14 @@ impl State {
 
 /// The joypad as a device.
 pub struct GbJoypad {
-    shared: Arc<Shared>,
-    irq: Mutex<Option<WireSource>>,
+    pad: Arc<GbPad>,
     regs_region: RegionRef,
 }
 
 impl fmt::Debug for GbJoypad {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GbJoypad")
-            .field("state", &self.shared.state)
+            .field("pad", &self.pad)
             .finish_non_exhaustive()
     }
 }
@@ -203,72 +212,68 @@ impl Default for GbJoypad {
     }
 }
 
-/// What the register block shares with the device.
-struct Shared {
+/// The matrix itself: what is held, what is selected, and the request line.
+///
+/// This is the **host object** a build files under [`pads::KIND`] and the name
+/// the machine description gave — the console's controller port rather than a
+/// copy of it. The device holds it, the `$FF00` register block holds it, and a
+/// host that presses a button opens it by name. One object rather than a device
+/// handle plus a mirror of its state, because two would have to be kept in step
+/// and nothing would check that they were.
+///
+/// The interrupt line lives here too, and has to: a press is what drives it,
+/// and a press comes from out here.
+pub struct GbPad {
     state: Mutex<State>,
+    /// [`LockRank::WIRE`]: taken after the state lock is released, never with
+    /// it held.
+    irq: Mutex<Option<WireSource>>,
 }
 
-impl fmt::Debug for Shared {
+impl fmt::Debug for GbPad {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Shared")
+        f.debug_struct("GbPad")
             .field("state", &self.state)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
-impl GbJoypad {
-    /// A joypad with nothing held and neither row selected.
-    #[must_use]
-    pub fn new() -> GbJoypad {
-        // One state behind one lock, shared with the register block: the port
-        // needs only the state, and giving it a whole device handle would be an
-        // ownership cycle through the region it is inside.
-        let shared = Arc::new(Shared {
-            state: Mutex::with_rank(LockRank::DEVICE, State::default()),
-        });
-        let regs_region = Arc::new(MmioRegion::io(
-            "gb.joypad.regs",
-            1,
-            Arc::new(JoypadPort {
-                shared: Arc::clone(&shared),
-            }) as Arc<dyn MemOps>,
-        ));
-        GbJoypad {
-            shared,
-            irq: Mutex::with_rank(LockRank::WIRE, None),
-            regs_region,
-        }
+impl Default for GbPad {
+    fn default() -> GbPad {
+        GbPad::new()
     }
+}
 
-    /// Build one from machine-description properties. It takes none.
-    ///
-    /// # Errors
-    ///
-    /// If any property was given at all.
-    pub fn from_props(props: &Props) -> Result<GbJoypad> {
-        props.reader().finish()?;
-        Ok(GbJoypad::new())
+impl GbPad {
+    /// A pad with nothing held and neither row selected.
+    #[must_use]
+    pub fn new() -> GbPad {
+        GbPad {
+            state: Mutex::with_rank(LockRank::DEVICE, State::default()),
+            irq: Mutex::with_rank(LockRank::WIRE, None),
+        }
     }
 
     /// Which buttons are held, one bit each — see [`Button::bit`].
     #[must_use]
     pub fn buttons(&self) -> u8 {
-        self.shared.state.lock().pressed
+        self.state.lock().pressed
     }
 
     /// `$FF00` as the guest reads it.
     #[must_use]
     pub fn read(&self) -> u8 {
-        self.shared.state.lock().read()
+        self.state.lock().read()
     }
 
     /// Press or release one button.
     ///
-    /// The interim door for a non-deterministic input; see the module
-    /// documentation.
+    /// The device end of the record/replay channel — see the module docs. The
+    /// state lock is released before the request line is driven, because
+    /// driving it is an outward call (`CLAUDE.md`, re-entrancy).
     pub fn set_pressed(&self, button: Button, pressed: bool) {
         let asserted = {
-            let mut state = self.shared.state.lock();
+            let mut state = self.state.lock();
             if pressed {
                 state.pressed |= 1 << button.bit();
             } else {
@@ -279,10 +284,13 @@ impl GbJoypad {
         self.drive(asserted);
     }
 
-    /// Set every button at once, as a packed mask.
+    /// Set every button at once, as a packed mask. **1 is pressed.**
+    ///
+    /// What one recorded payload is: the whole held mask, level rather than
+    /// edge, because a matrix has no notion of a transition.
     pub fn set_buttons(&self, pressed: u8) {
         let asserted = {
-            let mut state = self.shared.state.lock();
+            let mut state = self.state.lock();
             state.pressed = pressed;
             state.asserted()
         };
@@ -292,7 +300,7 @@ impl GbJoypad {
     /// Connect the joypad-interrupt request line.
     pub fn attach_irq(&self, source: WireSource) {
         *self.irq.lock() = Some(source);
-        let asserted = self.shared.state.lock().asserted();
+        let asserted = self.state.lock().asserted();
         self.drive(asserted);
     }
 
@@ -305,9 +313,169 @@ impl GbJoypad {
     }
 }
 
+impl GbJoypad {
+    /// A joypad with a private pad port: nothing held, neither row selected.
+    #[must_use]
+    pub fn new() -> GbJoypad {
+        GbJoypad::with_pad(Arc::new(GbPad::new()))
+    }
+
+    /// A joypad reading `pad`, which the host may already hold.
+    #[must_use]
+    pub fn with_pad(pad: Arc<GbPad>) -> GbJoypad {
+        // One state behind one lock, shared with the register block: the port
+        // needs only the pad, and giving it a whole device handle would be an
+        // ownership cycle through the region it is inside.
+        let regs_region = Arc::new(MmioRegion::io(
+            "gb.joypad.regs",
+            1,
+            Arc::new(JoypadPort {
+                pad: Arc::clone(&pad),
+            }) as Arc<dyn MemOps>,
+        ));
+        GbJoypad { pad, regs_region }
+    }
+
+    /// Build one from machine-description properties.
+    ///
+    /// # Errors
+    ///
+    /// If an unknown property was given, or if another kind of host object
+    /// already holds the pad port's name.
+    pub fn from_props(props: &Props) -> Result<GbJoypad> {
+        let mut r = props.reader();
+        let name = r.or_str("pad", DEFAULT_PAD_PORT)?.to_string();
+        r.finish()?;
+        Ok(GbJoypad::with_pad(pads::attach(props, &name)?))
+    }
+
+    /// The pad port this joypad reads: the host end of the seam.
+    #[must_use]
+    pub fn pad(&self) -> &Arc<GbPad> {
+        &self.pad
+    }
+
+    /// Which buttons are held, one bit each — see [`Button::bit`].
+    #[must_use]
+    pub fn buttons(&self) -> u8 {
+        self.pad.buttons()
+    }
+
+    /// `$FF00` as the guest reads it.
+    #[must_use]
+    pub fn read(&self) -> u8 {
+        self.pad.read()
+    }
+}
+
+/// The build's named Game Boy pad ports.
+///
+/// The same shape as [`chardev::ports`](crate::host::chardev::ports) and the
+/// NES's `nes.ports`: a *name* is the only thing that can travel from a machine
+/// description into a device constructor, and both ends resolve it against the
+/// build's own [`HostObjects`](crate::core::hosts::HostObjects).
+///
+/// ```text
+/// machine file:  object pad "gb.joypad" { pad = "gb-joypad" }
+/// device:        pads::attach(props, "gb-joypad")  ──┐
+/// host:          pads::open(&hosts, "gb-joypad")   ──┴─► the same Arc<GbPad>
+/// ```
+pub mod pads {
+    use super::GbPad;
+    use alloc::string::String;
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+
+    use crate::core::error::Result;
+    use crate::core::hosts::{HostKind, HostObjects};
+    use crate::core::props::Props;
+    use crate::core::record::{Channel, FnSink, InputSink};
+
+    /// The kind a pad port is filed under in a build's [`HostObjects`].
+    pub const KIND: HostKind = HostKind::new("pad");
+
+    /// The pad port `name` refers to in `hosts`, creating it on first mention.
+    ///
+    /// The **host** side of the rendezvous: called before anybody presses
+    /// anything, or after the build to pick up what the device opened.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Config`] if another kind of host object already holds
+    /// that name.
+    pub fn open(hosts: &HostObjects, name: &str) -> Result<Arc<GbPad>> {
+        hosts.open(KIND, name, GbPad::new)
+    }
+
+    /// The pad port `name` refers to in the build these properties belong to.
+    ///
+    /// The **device** side, called from `new(props)`: acquiring a host object is
+    /// allocation, not an outward action ([`core::hosts`](crate::core::hosts)
+    /// argues the case). A `Props` that belongs to no build gets a private pad,
+    /// so a device a unit test built directly still works and simply meets
+    /// nobody.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`].
+    pub fn attach(props: &Props, name: &str) -> Result<Arc<GbPad>> {
+        props.host(KIND, name, GbPad::new)
+    }
+
+    /// The pad port called `name`, if it has been opened.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`].
+    pub fn get(hosts: &HostObjects, name: &str) -> Result<Option<Arc<GbPad>>> {
+        hosts.get(KIND, name)
+    }
+
+    /// Forget `name`, reporting whether there was one.
+    pub fn close(hosts: &HostObjects, name: &str) -> bool {
+        hosts.close(KIND, name)
+    }
+
+    /// Every open name, in order.
+    #[must_use]
+    pub fn names(hosts: &HostObjects) -> Vec<String> {
+        hosts.names(KIND)
+    }
+
+    /// The record/replay channel the pad called `name` is pressed through.
+    ///
+    /// `pad:gb-joypad`, which is the same `(kind, name)` pair the host-object
+    /// table files the pad under — so a board whose joypad has no channel is
+    /// refused by [`HostObjects::seal`](crate::core::hosts::HostObjects::seal)
+    /// naming this string.
+    #[must_use]
+    pub fn channel(name: &str) -> Channel {
+        Channel::new(KIND, name)
+    }
+
+    /// The [`InputSink`] that applies a recorded payload to `pad`.
+    ///
+    /// One byte: the held mask, in [`Button::bit`](super::Button::bit) order. A
+    /// longer payload is that mask changing more than once, and each byte is
+    /// applied in turn — which is what a host batching two changes into one
+    /// post means.
+    ///
+    /// No rewind hook: a pad holds a level rather than a queue, and the level
+    /// is part of the machine snapshot a rewind restores.
+    #[must_use]
+    pub fn sink(pad: &Arc<GbPad>) -> Arc<dyn InputSink> {
+        let pad = Arc::clone(pad);
+        Arc::new(FnSink::new("pad", move |payload: &[u8]| {
+            for byte in payload {
+                pad.set_buttons(*byte);
+            }
+        }))
+    }
+}
+
 /// The `$FF00` register.
 struct JoypadPort {
-    shared: Arc<Shared>,
+    pad: Arc<GbPad>,
 }
 
 impl fmt::Debug for JoypadPort {
@@ -323,7 +491,7 @@ impl MemOps for JoypadPort {
         };
         // Reading `$FF00` has no side effect at all, so a debug read needs no
         // special case.
-        *byte = self.shared.state.lock().read();
+        *byte = self.pad.state.lock().read();
         Ok(())
     }
 
@@ -332,7 +500,7 @@ impl MemOps for JoypadPort {
             return Err(BusError::BadAccess);
         };
         // Only the two select bits are writable; the rest are inputs.
-        self.shared.state.lock().select = *value & 0x30;
+        self.pad.state.lock().select = *value & 0x30;
         Ok(())
     }
 
@@ -341,12 +509,20 @@ impl MemOps for JoypadPort {
     }
 }
 
+/// The properties `gb.joypad` takes.
+static JOYPAD_PROPERTIES: &[PropertySpec] = &[PropertySpec {
+    name: "pad",
+    kind: ValueKind::Str,
+    required: false,
+    summary: "the host pad port buttons arrive through, by name (default \"gb-joypad\")",
+}];
+
 /// The `gb.joypad` device class.
 pub static CLASS: DeviceClass = DeviceClass {
     name: "gb.joypad",
     version: 1,
     summary: "Game Boy joypad matrix ($FF00): two selectable rows of four active-low lines",
-    properties: &[],
+    properties: JOYPAD_PROPERTIES,
     construct: |props| Ok(Box::new(GbJoypad::from_props(props)?) as Box<dyn Device>),
 };
 
@@ -367,8 +543,8 @@ impl Device for GbJoypad {
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
         // The realize sweep: announce what the line idles at, which is low with
         // nothing held (`ROADMAP.md` §4.3).
-        let asserted = self.shared.state.lock().asserted();
-        self.drive(asserted);
+        let asserted = self.pad.state.lock().asserted();
+        self.pad.drive(asserted);
         Ok(())
     }
 
@@ -383,27 +559,27 @@ impl Device for GbJoypad {
                 message: alloc::format!("the joypad drives only `{IRQ_PIN}`"),
             });
         }
-        self.attach_irq(source);
+        self.pad.attach_irq(source);
         Ok(())
     }
 
     fn announce(&self, port: &str) {
         if port == IRQ_PIN {
-            let asserted = self.shared.state.lock().asserted();
-            self.drive(asserted);
+            let asserted = self.pad.state.lock().asserted();
+            self.pad.drive(asserted);
         }
     }
 
     fn reset(&self, _kind: ResetKind) {
         // Which buttons a person is holding is not something a reset changes,
         // so only the select lines go back.
-        self.shared.state.lock().select = 0;
-        let asserted = self.shared.state.lock().asserted();
-        self.drive(asserted);
+        self.pad.state.lock().select = 0;
+        let asserted = self.pad.state.lock().asserted();
+        self.pad.drive(asserted);
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
-        let state = *self.shared.state.lock();
+        let state = *self.pad.state.lock();
         w.write_u8(state.pressed)?;
         w.write_u8(state.select)?;
         Ok(())
@@ -414,8 +590,8 @@ impl Device for GbJoypad {
             pressed: r.read_u8()?,
             select: r.read_u8()?,
         };
-        *self.shared.state.lock() = state;
-        self.drive(state.asserted());
+        *self.pad.state.lock() = state;
+        self.pad.drive(state.asserted());
         Ok(())
     }
 }
@@ -436,8 +612,9 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 /// What the validator should know about `gb.joypad`.
 #[must_use]
 pub fn schema() -> crate::machine::validate::ClassSchema {
-    use crate::machine::validate::{ClassSchema, PortDir};
+    use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
     ClassSchema::new(CLASS.name)
+        .prop(PropSchema::new("pad", ValueKind::Str))
         .port(IRQ_PIN, PortDir::Out)
         .region(REGISTER_REGION)
 }

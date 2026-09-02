@@ -1578,10 +1578,12 @@ Two smaller corrections fall out. Only the bridge file needs `std`, so §0's
 caches do — not reachable from inside the scheduler, but a topology that depends
 on an aged-out entry is one whose recording is its only reproducible artefact.
 
-Landed: the seam, `NetPort` (the deterministic in-memory backend, with loopback
-and a `(tick, frame)` recording that is the network half of §4.5's record/replay
-seam), an **NE2000** card written from the DP8390D data sheet, the `pktkit`
-bridge, and `ne2k-mini` — a Z80 board whose firmware is a real driver.
+Landed: the seam, `NetPort` (the deterministic in-memory backend, with
+loopback), an **NE2000** card written from the DP8390D data sheet, the `pktkit`
+bridge, and `ne2k-mini` — a Z80 board whose firmware is a real driver. A port's
+arrivals are a §4.5 record/replay **channel** (`netdev:net0`) rather than a
+private `(tick, frame)` log: the port kept its own until the general seam
+landed, and now registers with it instead.
 
 ---
 

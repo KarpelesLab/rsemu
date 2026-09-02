@@ -36,41 +36,53 @@
 //!
 //! A client sends a key event whenever a human presses a key. That is wall-clock
 //! time, and a guest may not observe it. So [`VncServer::poll`] does not deliver
-//! anything: it *collects*, and hands the caller a batch of
-//! [`InputEvent`]s. The caller delivers them at
-//! the top of a slice — an instant the scheduler chose — and records
-//! `(machine.now(), event)` in an [`InputLog`](crate::host::input::InputLog).
-//! Replaying that log at the same instants reproduces the run exactly;
-//! `tests/vnc_input.rs` asserts the state hashes match.
+//! anything: it *collects*, and hands the caller a batch of [`InputEvent`]s.
+//! [`session`] posts that batch to the machine's
+//! [`Recorder`](crate::core::record::Recorder), which delivers it at the top of
+//! the next scheduling round and logs it against that round's instant.
+//! `tests/vnc_input.rs` asserts that a recorded session replays to an identical
+//! state hash, and — the assertion that makes the first one mean anything —
+//! that a session nobody typed at reaches a different one.
 //!
-//! That is the same shape the NE2000 uses for an arriving frame, and it is the
-//! shape the general record/replay seam should absorb. **What that seam has to
-//! offer for this module to drop its own log:**
+//! # The five things this module asked the general seam for
 //!
-//! 1. **A named stream.** `machine.record_stream("vnc.input")` returning
-//!    something a frontend appends opaque byte records to. The name is the
-//!    source; the bytes are that source's business
-//!    ([`InputEvent::encode`](crate::host::input::InputEvent::encode) is
-//!    already a fixed twelve of them).
-//! 2. **A virtual timestamp per record, supplied by the machine**, not by the
-//!    caller — `now()` read at the moment of the append, so a frontend cannot
-//!    record an instant the machine was never at.
-//! 3. **Replay that hands records back at the same instant, before the slice
-//!    that follows it.** The delivery point has to be a scheduling boundary the
-//!    replay controls, or a record logged at *t* is applied at *t + slice* and
-//!    the run diverges. A `Machine::run_until` that stops at the next pending
-//!    record's instant would do it; so would a callback the scheduler invokes.
-//! 4. **A stable tie-break for records at the same instant** — insertion order,
-//!    like the scheduler's own sequence counter. Two keys in one poll are
-//!    common.
-//! 5. **The cursor in the snapshot.** Rewind restores a snapshot and replays
-//!    forward, and a replay that restarts its log from the beginning replays
-//!    every keystroke of the run twice.
+//! This module used to keep its own `(instant, event)` log, and listed what
+//! [`core::record`](crate::core::record) had to offer before it could be
+//! deleted. It is deleted; here is what answered each point, because two of the
+//! answers are *different* from what was asked for and the difference matters:
 //!
-//! Points 1 to 4 are what [`input`](crate::host::input) implements privately
-//! today. Point 5 is the one it cannot do alone, and it is why this log is a
-//! separate file rather than a snapshot chunk: nothing here can make the
-//! cursor part of machine state.
+//! 1. **A named stream.** [`Channel`](crate::core::record::Channel) —
+//!    `input:vnc`, from [`input::channel`](crate::host::input::channel) — with
+//!    an opaque byte payload. [`InputEvent::encode`](crate::host::input::InputEvent::encode)
+//!    is still the twelve bytes it always was; the seam never looks inside.
+//! 2. **A virtual timestamp supplied by the machine.** Stronger than asked:
+//!    [`Recorder::post`](crate::core::record::Recorder::post) takes *no* time
+//!    at all, and the instant is stamped by
+//!    [`Recorder::deliver`](crate::core::record::Recorder::deliver) at a round
+//!    boundary. A frontend cannot record an instant the machine was never at
+//!    because it cannot record an instant.
+//! 3. **Delivery at the same instant, before the slice that follows.** This is
+//!    the one that silently corrupts a replay if it is wrong, and the seam
+//!    answers it structurally rather than by stopping the run: the instants in
+//!    a recording *are* round boundaries, because that is the only place one is
+//!    ever stamped, and
+//!    [`Machine::run_until`](crate::machine::Machine::run_until) declines a
+//!    round it cannot finish rather than splitting it (§11.6). A deterministic
+//!    replay therefore stands on every boundary the recording names, whatever
+//!    slice the frontend asks for — so no `run_until` that stops at the next
+//!    record and no scheduler callback was needed.
+//! 4. **A stable tie-break at equal instants.** Two keys in one poll are one
+//!    payload, in order, and two payloads on one boundary are delivered in the
+//!    order they were posted — the log is written in delivery order and replayed
+//!    in log order, which are the same sequence rather than two that have to be
+//!    argued equal.
+//! 5. **The cursor in the snapshot.** Not in the snapshot, and it must not be:
+//!    the cursor is *derived* state (`CLAUDE.md`), and
+//!    [`Machine::load`](crate::machine::Machine::load) recomputes it by seeking
+//!    the log to the restored instant — a binary search in
+//!    [`Recorder::rewind_to`](crate::core::record::Recorder::rewind_to). That
+//!    is why a rewind does not replay the run's keystrokes twice, and it works
+//!    for a debugger restoring a snapshot with no timeline in sight.
 //!
 //! # Security
 //!

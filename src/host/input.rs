@@ -3,38 +3,53 @@
 //!
 //! A frontend learns about a keystroke whenever the human makes one, which is
 //! wall-clock time and therefore not something a machine may observe. So
-//! nothing here reads a clock, nothing here holds a socket, and an event
-//! becomes part of the guest's history only when a *caller* hands it to an
-//! [`InputSink`] at a virtual instant it chose. That instant is what
-//! [`InputLog`] records, and replaying the log at the same instants reproduces
-//! the run — which is the whole of `CLAUDE.md`'s "any non-deterministic input
-//! crossing into the machine goes through the record/replay seam".
+//! nothing here reads a clock and nothing here holds a socket: an event is
+//! **posted to [`core::record`](crate::core::record)**, which delivers it at
+//! the top of a scheduling round and logs it against that round's instant.
+//! Replaying the recording re-delivers it there — which is the whole of
+//! `CLAUDE.md`'s "any non-deterministic input crossing into the machine goes
+//! through the record/replay seam".
 //!
 //! | Type | Role |
 //! | --- | --- |
 //! | [`Keysym`] | one key, named the way RFB names it: an X11 keysym |
 //! | [`InputEvent`] | what happened: a key went down, a pointer moved |
-//! | [`TimedInput`] | that event, plus the virtual instant it was delivered at |
-//! | [`InputLog`] | the recording, and its byte format |
-//! | [`Replay`] | that recording, played back |
 //! | [`InputSink`] | where an event lands: a keyboard port, a pad, a tablet |
+//! | [`Feed`] | the channel's end: decodes a payload and fans it out to sinks |
 //! | [`KeyMap`] | keysym → AT scan codes, with the shift state that implies |
 //!
 //! # Shape
 //!
 //! ```text
-//!   host                     seam (here)                    device (dev/)
-//!   ────                     ───────────                    ─────────────
-//!   VNC socket ─► InputEvent ─┬─► InputLog  (at = machine.now())
-//!                             └─► KeyboardSink ─► CharPort ─► pc.kbc ─► guest
-//!                                 PadSink      ─► nes::Pad ─► nes.io  ─► guest
+//!   host                  seam (core::record)              device (dev/)
+//!   ────                  ───────────────────              ─────────────
+//!   VNC socket ─► InputEvent::encode ─► Recorder::post
+//!                                            │  (a round boundary at t)
+//!                                            ▼
+//!                        (t, "input:vnc", 12 bytes) ─► Feed ─┬─► KeyboardSink
+//!                                            │               └─► PadSink
+//!                                       the recording
 //! ```
 //!
-//! The frontend collects events from its socket whenever they arrive, and
-//! delivers the batch it has collected at the top of a slice — a scheduling
-//! boundary chosen by the scheduler rather than by the network. Two runs given
-//! the same `(instant, event)` sequence therefore compute the same thing,
-//! whatever the host was doing at the time.
+//! Until this module's own log was deleted, the middle column was a private
+//! `Vec<(instant, event)>` here, and [`vnc`](super::vnc) listed the five things
+//! the general seam had to offer before it could go. It offers them, and this
+//! is what is left: the event *vocabulary*, the sinks that put an event into a
+//! device, and a twelve-byte encoding for one record — the payload the channel
+//! carries. Nothing here stamps an instant any more, because nothing here is
+//! entitled to: the machine does it, at a boundary the scheduler chose.
+//!
+//! # A stream is a channel, and it is not a host object
+//!
+//! [`channel`] names one — `input:vnc` — and a frontend registers it with
+//! [`sink`]. Unlike a character port or a pad port there is nothing for a
+//! *device* to open here: a frontend is not part of the machine, and the
+//! objects its events end up in (a `CharPort`, a `nes::Pad`) are host objects
+//! of their own with their own names. So this channel is not covered by
+//! [`HostObjects::seal`](crate::core::hosts::HostObjects::seal); what covers it
+//! is that [`Recorder::post`](crate::core::record::Recorder::post) refuses an
+//! unregistered channel, so a frontend that forgot to register gets an error
+//! rather than an unrecorded run.
 //!
 //! # Why level for a pad and edge for a keyboard
 //!
@@ -53,12 +68,13 @@
 //! gets. Only the thing *producing* the events needs an operating system.
 
 use alloc::boxed::Box;
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::core::clock::GlobalTime;
+use crate::core::hosts::HostKind;
+use crate::core::record::{Channel, InputSink as RecordSink};
+use crate::core::sync::{LockRank, Mutex};
 
 use super::chardev::CharPort;
 
@@ -202,7 +218,7 @@ pub enum InputEvent {
     },
 }
 
-/// How many bytes one event occupies in an [`InputLog`].
+/// How many bytes one event occupies in a recorded payload.
 pub const EVENT_BYTES: usize = 12;
 
 impl InputEvent {
@@ -211,11 +227,15 @@ impl InputEvent {
     /// Kind tag for [`InputEvent::Pointer`].
     const KIND_POINTER: u8 = 2;
 
-    /// The fixed-width encoding a log stores.
+    /// The fixed-width encoding a recording carries.
     ///
-    /// Fixed width on purpose: a log is then seekable and a record's index is
-    /// its offset, which is what rewind wants (§4.5). Little-endian, like every
-    /// other byte format in the tree.
+    /// Fixed width on purpose: a payload holding several events is then a plain
+    /// array of records, so two keys seen in one poll can be posted together
+    /// and arrive together. Little-endian, like every other byte format in the
+    /// tree. The *instant* is not in here — [`core::record`](crate::core::record)
+    /// stamps it, in `GlobalTime`'s raw 2⁻⁶⁴-second units, which is what keeps
+    /// a replay from landing a fraction of a nanosecond away from where it was
+    /// recorded.
     #[must_use]
     pub const fn encode(self) -> [u8; EVENT_BYTES] {
         let (kind, flags, a, b) = match self {
@@ -253,212 +273,6 @@ impl InputEvent {
     }
 }
 
-/// An event and the virtual instant it was delivered at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TimedInput {
-    /// When, in virtual time. **Not** when the human pressed the key: when the
-    /// machine was told.
-    pub at: GlobalTime,
-    /// What.
-    pub event: InputEvent,
-}
-
-// ---------------------------------------------------------------------------
-// the log
-// ---------------------------------------------------------------------------
-
-/// The eight-byte magic a log starts with.
-const LOG_MAGIC: [u8; 8] = *b"RSEMUIN\x00";
-
-/// The log format version. Bump it with the encoding, never on its own.
-const LOG_VERSION: u32 = 1;
-
-/// How many bytes a log's header occupies: magic, version, record count.
-const LOG_HEADER: usize = 16;
-
-/// How many bytes one record occupies: the instant, then the event.
-///
-/// The instant is [`GlobalTime`]'s **raw** 2⁻⁶⁴-second count and not a
-/// nanosecond figure. That matters: `GlobalTime::as_nanos` rounds, and an event
-/// replayed a fraction of a nanosecond away from where it was recorded lands on
-/// a different tick of a fast clock domain — which is a divergent run, found
-/// six hours later as a state-hash mismatch.
-const RECORD_BYTES: usize = 16 + EVENT_BYTES;
-
-/// A recording of every input event that crossed into a machine.
-///
-/// Append-only and sorted by [`TimedInput::at`], because that is the order it
-/// is written in and the order it is replayed in; events at the same instant
-/// keep their insertion order, which is the tie-break the scheduler's own
-/// sequence counter uses (§4.2).
-///
-/// This is deliberately a *self-contained* file rather than a chunk of a
-/// machine snapshot: it is the piece a bug report attaches, and it has to be
-/// readable by a build that cannot reconstruct the machine. When the general
-/// record/replay seam lands, this becomes one source's stream inside it — the
-/// [`vnc`](super::vnc) module docs say exactly what that seam has to offer for
-/// this one to be deleted.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct InputLog {
-    events: Vec<TimedInput>,
-}
-
-impl InputLog {
-    /// An empty log.
-    #[must_use]
-    pub const fn new() -> InputLog {
-        InputLog { events: Vec::new() }
-    }
-
-    /// Append an event delivered at `at`.
-    ///
-    /// A caller that goes backwards in time is recording something that could
-    /// not have happened; the log keeps what it was given rather than sorting,
-    /// so the mistake shows up in [`is_ordered`](InputLog::is_ordered) instead
-    /// of being hidden.
-    pub fn push(&mut self, at: GlobalTime, event: InputEvent) {
-        self.events.push(TimedInput { at, event });
-    }
-
-    /// Everything recorded, in order.
-    #[must_use]
-    pub fn events(&self) -> &[TimedInput] {
-        &self.events
-    }
-
-    /// How many events are recorded.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.events.len()
-    }
-
-    /// Whether nothing was recorded.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.events.is_empty()
-    }
-
-    /// Whether the instants never go backwards.
-    #[must_use]
-    pub fn is_ordered(&self) -> bool {
-        self.events.windows(2).all(|w| w[0].at <= w[1].at)
-    }
-
-    /// The whole log as bytes.
-    #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(LOG_HEADER + self.events.len() * RECORD_BYTES);
-        out.extend_from_slice(&LOG_MAGIC);
-        out.extend_from_slice(&LOG_VERSION.to_le_bytes());
-        #[allow(clippy::cast_possible_truncation)]
-        out.extend_from_slice(&(self.events.len() as u32).to_le_bytes());
-        for entry in &self.events {
-            out.extend_from_slice(&entry.at.raw().to_le_bytes());
-            out.extend_from_slice(&entry.event.encode());
-        }
-        out
-    }
-
-    /// Read back what [`encode`](InputLog::encode) wrote.
-    ///
-    /// # Errors
-    ///
-    /// A short file, a wrong magic, a version this build does not know, or a
-    /// record whose kind it does not know. All four are the same kind of
-    /// mistake — this is not the file you think it is — and all four say so.
-    pub fn decode(bytes: &[u8]) -> crate::core::Result<InputLog> {
-        let bad = |message: &str| crate::Error::Config {
-            at: String::from("input log"),
-            message: String::from(message),
-        };
-        if bytes.len() < LOG_HEADER || bytes[..8] != LOG_MAGIC {
-            return Err(bad("not an rsemu input log"));
-        }
-        let version = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        if version != LOG_VERSION {
-            return Err(bad("input log version is not one this build can read"));
-        }
-        let count = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
-        let body = &bytes[LOG_HEADER..];
-        if body.len() < count * RECORD_BYTES {
-            return Err(bad("input log is shorter than its own record count"));
-        }
-        let mut log = InputLog::new();
-        log.events.reserve(count);
-        for i in 0..count {
-            let record = &body[i * RECORD_BYTES..];
-            let mut when = [0u8; 16];
-            when.copy_from_slice(&record[..16]);
-            let mut raw = [0u8; EVENT_BYTES];
-            raw.copy_from_slice(&record[16..RECORD_BYTES]);
-            let event = InputEvent::decode(&raw)
-                .ok_or_else(|| bad("input log holds an event kind this build does not know"))?;
-            log.events.push(TimedInput {
-                at: GlobalTime::from_raw(u128::from_le_bytes(when)),
-                event,
-            });
-        }
-        Ok(log)
-    }
-}
-
-/// A cursor over an [`InputLog`], for replaying one.
-///
-/// The replay counterpart of a socket: a frontend asks it, at the top of each
-/// slice, for everything due by the instant the slice starts at, and delivers
-/// exactly that. Because both the recording and the replay deliver at a slice
-/// boundary, and because `Machine::run_until` is additive across boundaries
-/// (§11.6), the two runs are the same run.
-#[derive(Debug, Clone)]
-pub struct Replay {
-    log: InputLog,
-    next: usize,
-}
-
-impl Replay {
-    /// Start at the beginning of `log`.
-    #[must_use]
-    pub const fn new(log: InputLog) -> Replay {
-        Replay { log, next: 0 }
-    }
-
-    /// Every event due at or before `at`, consumed.
-    pub fn due(&mut self, at: GlobalTime) -> &[TimedInput] {
-        let start = self.next;
-        while self
-            .log
-            .events
-            .get(self.next)
-            .is_some_and(|entry| entry.at <= at)
-        {
-            self.next += 1;
-        }
-        &self.log.events[start..self.next]
-    }
-
-    /// Whether every event has been replayed.
-    #[must_use]
-    pub fn is_finished(&self) -> bool {
-        self.next >= self.log.events.len()
-    }
-
-    /// How many events have not been replayed yet.
-    #[must_use]
-    pub fn remaining(&self) -> usize {
-        self.log.events.len() - self.next
-    }
-
-    /// The instant of the next event, if there is one.
-    ///
-    /// What a replay-driven run uses to decide how far it may advance before it
-    /// has to stop and deliver: running past an event's instant and delivering
-    /// late would be a different run.
-    #[must_use]
-    pub fn next_instant(&self) -> Option<GlobalTime> {
-        self.log.events.get(self.next).map(|entry| entry.at)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // sinks
 // ---------------------------------------------------------------------------
@@ -483,6 +297,121 @@ pub fn deliver_all(sinks: &[Box<dyn InputSink>], event: InputEvent) {
     for sink in sinks {
         sink.deliver(event);
     }
+}
+
+// ---------------------------------------------------------------------------
+// the record/replay channel
+// ---------------------------------------------------------------------------
+
+/// The kind an input stream's channel is named under.
+///
+/// Not a [`HostObjects`](crate::core::hosts::HostObjects) kind: nothing is
+/// filed under it, because there is no object for a device to open — see the
+/// module docs.
+pub const KIND: HostKind = HostKind::new("input");
+
+/// The stream name a frontend gets when it asks for nothing better.
+pub const DEFAULT_STREAM: &str = "vnc";
+
+/// The record/replay channel an input stream crosses on: `input:vnc`.
+#[must_use]
+pub fn channel(name: &str) -> Channel {
+    Channel::new(KIND, name)
+}
+
+/// Where a channel's payloads go: every attached [`InputSink`], in turn.
+///
+/// One payload is any number of whole [`EVENT_BYTES`]-byte records, so a
+/// frontend that saw two keys in one poll may post them together and they
+/// arrive together — which is the tie-break requirement a private log had to
+/// implement for itself. A trailing partial record is ignored rather than
+/// guessed at: a recording is a parser's input like any other.
+///
+/// A [`Mutex`] rather than a plain `Vec` because the sinks are attached after
+/// the feed is already inside an `Arc` — the recorder holds one end, the
+/// frontend the other.
+pub struct Feed {
+    /// [`LockRank::LEAF`]: held only to clone out the list, never across the
+    /// call into a sink.
+    sinks: Mutex<Vec<Arc<dyn InputSink>>>,
+}
+
+impl Default for Feed {
+    fn default() -> Feed {
+        Feed::new()
+    }
+}
+
+impl fmt::Debug for Feed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.sinks.try_lock() {
+            Some(sinks) => f.debug_struct("Feed").field("sinks", &sinks.len()).finish(),
+            None => f.debug_struct("Feed").field("sinks", &"<in use>").finish(),
+        }
+    }
+}
+
+impl Feed {
+    /// A feed with nothing attached, which discards what it is given.
+    #[must_use]
+    pub fn new() -> Feed {
+        Feed {
+            sinks: Mutex::with_rank(LockRank::LEAF, Vec::new()),
+        }
+    }
+
+    /// Also deliver to `sink`.
+    pub fn attach(&self, sink: Arc<dyn InputSink>) {
+        self.sinks.lock().push(sink);
+    }
+
+    /// How many sinks are attached.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.sinks.lock().len()
+    }
+
+    /// Whether nothing is attached, so events go nowhere.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.sinks.lock().is_empty()
+    }
+
+    /// Hand one event to every sink.
+    ///
+    /// The list is cloned out and the lock released first: a sink writes into a
+    /// device, which is an outward call (`CLAUDE.md`, re-entrancy).
+    pub fn deliver(&self, event: InputEvent) {
+        let sinks: Vec<Arc<dyn InputSink>> = self.sinks.lock().clone();
+        for sink in &sinks {
+            sink.deliver(event);
+        }
+    }
+}
+
+impl RecordSink for Feed {
+    fn deliver(&self, payload: &[u8]) {
+        // A trailing partial record is dropped rather than guessed at: a
+        // recording is a parser's input like any other.
+        for record in payload.as_chunks::<EVENT_BYTES>().0 {
+            // An event kind this build does not know came from a newer rsemu.
+            // Skipping it keeps the rest of the payload playable, which is what
+            // a reader of somebody else's recording wants.
+            if let Some(event) = InputEvent::decode(record) {
+                Feed::deliver(self, event);
+            }
+        }
+    }
+}
+
+/// The [`InputSink`](crate::core::record::InputSink) a recorder registers for
+/// an input stream.
+///
+/// The whole adapter between `core::record` and this module, and it is a cast:
+/// [`Feed`] *is* the sink.
+#[must_use]
+pub fn sink(feed: &Arc<Feed>) -> Arc<dyn RecordSink> {
+    Arc::clone(feed) as Arc<dyn RecordSink>
 }
 
 // ---------------------------------------------------------------------------
@@ -887,6 +816,8 @@ impl InputSink for PadSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
+    use alloc::vec;
 
     #[test]
     fn an_event_survives_its_own_encoding() {
@@ -917,61 +848,90 @@ mod tests {
         assert_eq!(InputEvent::decode(&bytes), None);
     }
 
-    #[test]
-    fn a_log_survives_its_own_encoding() {
-        let mut log = InputLog::new();
-        log.push(
-            GlobalTime::from_nanos(0),
-            InputEvent::Key {
-                keysym: Keysym::from_ascii(b'A'),
-                down: true,
-            },
-        );
-        log.push(
-            GlobalTime::from_nanos(16_000_000),
-            InputEvent::Pointer {
-                x: 3,
-                y: 4,
-                buttons: 1,
-            },
-        );
-        let bytes = log.encode();
-        let back = InputLog::decode(&bytes).expect("our own bytes");
-        assert_eq!(back, log);
-        assert!(back.is_ordered());
-    }
+    /// A sink that remembers what it was given.
+    #[derive(Debug, Default)]
+    struct Seen(Mutex<Vec<InputEvent>>);
 
-    #[test]
-    fn a_log_that_is_not_one_is_an_error() {
-        assert!(InputLog::decode(b"").is_err());
-        assert!(InputLog::decode(b"not a log at all").is_err());
-        let mut bytes = InputLog::new().encode();
-        bytes[8] = 0xff;
-        assert!(
-            InputLog::decode(&bytes).is_err(),
-            "a version we cannot read"
-        );
-    }
-
-    #[test]
-    fn a_replay_hands_back_what_is_due_and_no_more() {
-        let mut log = InputLog::new();
-        for (i, ch) in (*b"abc").into_iter().enumerate() {
-            log.push(
-                GlobalTime::from_nanos(i as u64 * 10),
-                InputEvent::Key {
-                    keysym: Keysym::from_ascii(ch),
-                    down: true,
-                },
-            );
+    impl InputSink for Seen {
+        fn deliver(&self, event: InputEvent) {
+            self.0.lock().push(event);
         }
-        let mut replay = Replay::new(log);
-        assert_eq!(replay.next_instant(), Some(GlobalTime::from_nanos(0)));
-        assert_eq!(replay.due(GlobalTime::from_nanos(5)).len(), 1);
-        assert_eq!(replay.due(GlobalTime::from_nanos(5)).len(), 0);
-        assert_eq!(replay.due(GlobalTime::from_nanos(25)).len(), 2);
-        assert!(replay.is_finished());
-        assert_eq!(replay.remaining(), 0);
+    }
+
+    #[test]
+    fn a_feed_decodes_a_payload_and_hands_it_to_every_sink() {
+        let seen = Arc::new(Seen::default());
+        let feed = Arc::new(Feed::new());
+        feed.attach(Arc::clone(&seen) as Arc<dyn InputSink>);
+        feed.attach(Arc::clone(&seen) as Arc<dyn InputSink>);
+        assert_eq!(feed.len(), 2);
+        assert!(!feed.is_empty());
+
+        // Two events in one payload: the common case, and the tie-break the
+        // seam gets for free by keeping them in one record.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(
+            &InputEvent::Key {
+                keysym: Keysym::SHIFT_L,
+                down: true,
+            }
+            .encode(),
+        );
+        payload.extend_from_slice(
+            &InputEvent::Key {
+                keysym: Keysym::from_ascii(b'a'),
+                down: true,
+            }
+            .encode(),
+        );
+        RecordSink::deliver(&*feed, &payload);
+
+        let got = seen.0.lock().clone();
+        assert_eq!(got.len(), 4, "two events, two sinks");
+        assert_eq!(
+            got[0],
+            InputEvent::Key {
+                keysym: Keysym::SHIFT_L,
+                down: true
+            },
+            "and in the order they were posted"
+        );
+    }
+
+    #[test]
+    fn a_feed_ignores_a_record_it_cannot_read() {
+        let seen = Arc::new(Seen::default());
+        let feed = Arc::new(Feed::new());
+        feed.attach(Arc::clone(&seen) as Arc<dyn InputSink>);
+
+        // A kind from a newer rsemu, then a good record, then three bytes that
+        // are not a record at all. The reader takes what it understands and
+        // never panics — this is somebody else's file.
+        let mut payload = vec![0xfeu8; EVENT_BYTES];
+        payload.extend_from_slice(
+            &InputEvent::Pointer {
+                x: 1,
+                y: 2,
+                buttons: 4,
+            }
+            .encode(),
+        );
+        payload.extend_from_slice(&[0, 0, 0]);
+        RecordSink::deliver(&*feed, &payload);
+        assert_eq!(
+            seen.0.lock().as_slice(),
+            [InputEvent::Pointer {
+                x: 1,
+                y: 2,
+                buttons: 4
+            }]
+        );
+    }
+
+    #[test]
+    fn a_channel_names_the_stream() {
+        assert_eq!(channel(DEFAULT_STREAM).to_string(), "input:vnc");
+        assert!(channel("x").is_kind(KIND));
     }
 
     /// The set-2 table here and `dev::pc::kbc`'s set-2-to-set-1 translation
@@ -1111,7 +1071,7 @@ mod tests {
     fn every_sink_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<KeyboardSink>();
-        assert_send_sync::<InputLog>();
+        assert_send_sync::<Feed>();
         #[cfg(feature = "dev-nes-io")]
         assert_send_sync::<PadSink>();
     }

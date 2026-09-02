@@ -14,30 +14,31 @@
 //!    once with the recording as the only input. The two runs' state hashes are
 //!    compared.
 //!
-//! # What is and is not proved about determinism
+//! # What is proved about determinism, and by what
 //!
-//! What is proved is the thing this frontend is responsible for: an input event
-//! is applied at a virtual instant, that instant is recorded, and replaying at
-//! the same instants produces a bit-identical machine. That is `CLAUDE.md`'s
-//! rule for a non-deterministic input crossing into the machine.
+//! The frontend no longer keeps a log of its own: an event is posted to the
+//! machine's [`Recorder`](rsemu::core::record::Recorder) and the *machine*
+//! decides which scheduling-round boundary it lands on. So what is asserted
+//! below is a whole-session recording in the general format — the one
+//! `rsemu replay` reads, carrying the machine's shape, that a bug report
+//! attaches — rather than a private file with a private cursor.
 //!
-//! What is **not** proved here is a *whole-session* replay across a process
-//! boundary, because the general record/replay seam does not exist yet: the
-//! log this frontend writes is its own file, its cursor is not part of a
-//! snapshot, and nothing else non-deterministic in the machine is captured
-//! alongside it. `src/host/vnc/mod.rs` lists the five things the general seam
-//! has to offer for this file's log to be deleted in its favour.
+//! Three assertions, and the first is what makes the other two mean anything:
+//! a run nobody typed at reaches a *different* state hash, the replay reaches
+//! the *same* one, and the guest executed on the bytes either way.
 
 #![cfg(feature = "vnc")]
 
 use rsemu::core::clock::GlobalTime;
-use rsemu::host::input::{InputEvent, InputLog, Keysym};
+use rsemu::core::record::InputLog;
+use rsemu::host::input::{self, Feed, InputEvent, Keysym};
 
-// A build with `vnc` but no keyboard and no pad still runs the log's own
-// round-trip test below, and must not carry imports for the guests it does not
-// have — the feature sweep builds exactly that combination with warnings denied.
+// A build with `vnc` but no keyboard and no pad still runs the payload tests
+// below, and must not carry imports for the guests it does not have — the
+// feature sweep builds exactly that combination with warnings denied.
 #[cfg(any(all(feature = "cpu-x86", feature = "dev-pc"), feature = "dev-nes-io"))]
 use rsemu::host::input::InputSink;
+use std::sync::Arc;
 
 /// How much virtual time each turn of the test's loop advances.
 ///
@@ -297,84 +298,139 @@ fn a_key_held_in_a_client_holds_a_button_on_a_controller() {
 /// of one scheduler tick changes which instruction the byte lands in the middle
 /// of, and the state hash covers the CPU's registers as well as its RAM.
 #[cfg(all(feature = "cpu-x86", feature = "dev-pc"))]
-#[test]
-fn a_recorded_session_replays_to_an_identical_state_hash() {
-    // -- the recording ------------------------------------------------------
-    //
-    // The events stand in for what a client sent; what matters is that they are
-    // delivered at a slice boundary and that the instant is recorded with them.
-    let script = [
-        (3u32, Keysym::from_ascii(b'a'), true),
+mod determinism {
+    use super::*;
+    use rsemu::core::record::Recorder;
+
+    /// A PC whose keyboard is the far end of the `input:vnc` channel.
+    ///
+    /// The whole wiring a frontend does: a `Feed` holding the sinks, registered
+    /// with the recorder under the channel's name, and the recorder attached to
+    /// the machine.
+    fn a_recorded_pc(recorder: &Arc<Recorder>) -> rsemu::machine::Machine {
+        let (mut machine, port) = a_pc();
+        let feed = Arc::new(Feed::new());
+        feed.attach(Arc::new(rsemu::host::input::KeyboardSink::new(port)));
+        recorder
+            .register(input::channel(input::DEFAULT_STREAM), input::sink(&feed))
+            .expect("a fresh recorder takes channels");
+        machine
+            .set_recorder(Arc::clone(recorder))
+            .expect("a deterministic machine records");
+        machine
+    }
+
+    /// What a client sent, as `(turn, keysym, down)`.
+    ///
+    /// Two of them land on the same turn on purpose: two keys in one poll is
+    /// the common case, and they are one payload — which is the tie-break at
+    /// equal instants that the seam has to have.
+    const SCRIPT: [(u32, Keysym, bool); 4] = [
+        (3, Keysym::from_ascii(b'a'), true),
         (5, Keysym::from_ascii(b'a'), false),
         (9, Keysym::SHIFT_L, true),
-        (11, Keysym::from_ascii(b'b'), true),
+        (9, Keysym::from_ascii(b'b'), true),
     ];
 
-    let (mut machine, port) = a_pc();
-    let keyboard = rsemu::host::input::KeyboardSink::new(port);
-    let mut log = InputLog::new();
-    for turn in 0..24u32 {
-        // Step 3 of the session loop: deliver at `machine.now()`, and record
-        // the instant that was.
-        for (at, keysym, down) in &script {
-            if *at == turn {
-                let event = InputEvent::Key {
-                    keysym: *keysym,
-                    down: *down,
-                };
-                log.push(machine.now(), event);
-                keyboard.deliver(event);
+    /// Run 24 turns, posting the script's events before the turn they belong
+    /// to. Returns the final state hash.
+    fn drive(machine: &mut rsemu::machine::Machine, recorder: &Recorder, typing: bool) -> u64 {
+        let channel = input::channel(input::DEFAULT_STREAM);
+        for turn in 0..24u32 {
+            if typing {
+                // Everything for this turn in one payload, exactly as one
+                // `VncServer::poll` hands back a batch.
+                let mut payload = Vec::new();
+                for (at, keysym, down) in &SCRIPT {
+                    if *at == turn {
+                        payload.extend_from_slice(
+                            &InputEvent::Key {
+                                keysym: *keysym,
+                                down: *down,
+                            }
+                            .encode(),
+                        );
+                    }
+                }
+                if !payload.is_empty() {
+                    recorder
+                        .post(&channel, &payload)
+                        .expect("a registered channel");
+                }
             }
+            let deadline = machine.now().saturating_add(SLICE);
+            machine.run_until(deadline).expect("the guest runs");
         }
-        let deadline = machine.now().saturating_add(SLICE);
-        machine.run_until(deadline).expect("the guest runs");
+        machine.state_hash().expect("a hash of a deterministic run")
     }
-    let recorded = machine.state_hash().expect("a hash of the recorded run");
-    assert_eq!(log.len(), script.len());
-    assert!(log.is_ordered());
 
-    // The log survives being written out and read back, which is what a bug
-    // report attaching one relies on.
-    let bytes = log.encode();
-    let log = InputLog::decode(&bytes).expect("our own bytes");
+    #[test]
+    fn typing_at_the_machine_changes_where_it_ends_up() {
+        // The control. Without it, "record and replay agree" would be satisfied
+        // by a seam that dropped every keystroke on the floor.
+        let quiet_recorder = Arc::new(Recorder::recording());
+        let mut quiet = a_recorded_pc(&quiet_recorder);
+        let silent = drive(&mut quiet, &quiet_recorder, false);
+        assert_eq!(peek(&quiet, SENTINEL_ADDR), 0, "nobody typed");
 
-    // -- the replay ---------------------------------------------------------
-    let (mut replayed, port) = a_pc();
-    let keyboard = rsemu::host::input::KeyboardSink::new(port);
-    let mut replay = rsemu::host::input::Replay::new(log);
-    for _ in 0..24 {
-        for entry in replay.due(replayed.now()) {
-            keyboard.deliver(entry.event);
-        }
-        let deadline = replayed.now().saturating_add(SLICE);
-        replayed.run_until(deadline).expect("the guest runs");
+        let recorder = Arc::new(Recorder::recording());
+        let mut machine = a_recorded_pc(&recorder);
+        let typed = drive(&mut machine, &recorder, true);
+        assert_eq!(
+            peek(&machine, SENTINEL_ADDR),
+            0x1c,
+            "the guest executed IN AL, 60h on the `a` key's make code"
+        );
+        assert_ne!(
+            silent, typed,
+            "a machine nobody typed at is not the same machine"
+        );
     }
-    assert!(replay.is_finished(), "every event was replayed");
 
-    assert_eq!(
-        replayed.state_hash().expect("a hash of the replayed run"),
-        recorded,
-        "a replayed session is the same machine, bit for bit"
-    );
+    #[test]
+    fn a_recorded_session_replays_to_an_identical_state_hash() {
+        let recorder = Arc::new(Recorder::recording());
+        let mut machine = a_recorded_pc(&recorder);
+        let recorded = drive(&mut machine, &recorder, true);
+        let recorded_at = machine.now();
 
-    // And the claim is not vacuous: a run given *no* input reaches a different
-    // state, so the hash really is sensitive to what was typed.
-    let (mut silent, _port) = a_pc();
-    for _ in 0..24 {
-        let deadline = silent.now().saturating_add(SLICE);
-        silent.run_until(deadline).expect("the guest runs");
+        // Three posts, because two of the four events shared a turn.
+        let log = recorder.log();
+        assert_eq!(log.len(), 3);
+        assert_eq!(log.events()[0].channel.to_string(), "input:vnc");
+        assert!(
+            log.events().windows(2).all(|w| w[0].at <= w[1].at),
+            "a recording is delivery-ordered"
+        );
+
+        // Out through the file format and back: this is what a bug report
+        // attaches, and it carries the machine's shape.
+        let bytes = log.encode().expect("a recording encodes");
+        let log = InputLog::decode(&bytes).expect("our own bytes");
+
+        let replay = Arc::new(Recorder::replaying(log));
+        let mut replayed = a_recorded_pc(&replay);
+        let hash = drive(&mut replayed, &replay, false);
+
+        assert_eq!(replayed.now(), recorded_at, "the same instant");
+        assert_eq!(
+            hash, recorded,
+            "a replayed session is the same machine, bit for bit"
+        );
+        assert_eq!(
+            peek(&replayed, SENTINEL_ADDR),
+            0x1c,
+            "and the guest executed on the replayed bytes"
+        );
+        assert_eq!(replay.cursor(), 3, "every recorded payload was delivered");
     }
-    assert_ne!(
-        silent.state_hash().expect("a hash of the silent run"),
-        recorded,
-        "a machine nobody typed at is not the same machine"
-    );
 }
 
 /// An event replayed a fraction of a nanosecond late is a different run, so the
-/// log stores `GlobalTime`'s raw units rather than a rounded nanosecond count.
+/// recording stores `GlobalTime`'s raw units rather than a rounded nanosecond
+/// count — end to end, through the encoder the VNC path actually uses.
 #[test]
-fn a_logs_instants_survive_a_round_trip_exactly() {
+fn a_recordings_instants_survive_a_round_trip_exactly() {
     // A raw instant that is deliberately not a whole number of nanoseconds:
     // `GlobalTime` counts 2⁻⁶⁴-second units, and a machine's `now()` lands on
     // one of them, not on a nanosecond boundary.
@@ -385,13 +441,40 @@ fn a_logs_instants_survive_a_round_trip_exactly() {
         "the instant this test is about is one nanoseconds cannot hold"
     );
     let mut log = InputLog::new();
-    log.push(
-        odd,
-        InputEvent::Key {
+    log.push(rsemu::core::record::InputEvent {
+        at: odd,
+        channel: input::channel(input::DEFAULT_STREAM),
+        payload: InputEvent::Key {
             keysym: Keysym::RETURN,
             down: true,
-        },
-    );
-    let back = InputLog::decode(&log.encode()).expect("our own bytes");
+        }
+        .encode()
+        .to_vec(),
+    })
+    .expect("an empty log takes anything");
+    let back = InputLog::decode(&log.encode().expect("encodes")).expect("our own bytes");
     assert_eq!(back.events()[0].at, odd);
+    assert_eq!(back.events()[0].at.raw(), odd.raw());
+}
+
+/// The payload the channel carries is this module's business and nobody
+/// else's: twelve bytes an event at a time, so a batch is an array of them.
+#[test]
+fn a_batch_of_events_is_one_payload() {
+    let feed = Arc::new(Feed::new());
+    let mut payload = Vec::new();
+    for down in [true, false] {
+        payload.extend_from_slice(
+            &InputEvent::Key {
+                keysym: Keysym::from_ascii(b'q'),
+                down,
+            }
+            .encode(),
+        );
+    }
+    assert_eq!(payload.len(), 2 * rsemu::host::input::EVENT_BYTES);
+    // Nothing attached: the feed is where the seam puts a payload, and a
+    // machine with no keyboard must not be a panic.
+    rsemu::core::record::InputSink::deliver(&*feed, &payload);
+    assert!(feed.is_empty());
 }

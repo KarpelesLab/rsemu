@@ -18,8 +18,9 @@
 //! | Input | Status |
 //! | --- | --- |
 //! | Keystrokes and terminal bytes | **through here** — a character port is a host object, and a host object is a channel |
-//! | Gamepad buttons | **through here** — the NES pad table is a host object |
-//! | Network frames | **through here** once a NIC registers its port as a channel; the shape is exactly `(instant, frame bytes)` |
+//! | A frontend's keys and pointer | **through here** — `host::input` posts twelve-byte records on `input:vnc`; it used to keep its own `(instant, event)` log and no longer does |
+//! | Gamepad buttons | **through here** — a NES pad table, a Game Boy `GbPad` and a Master System `SmsPads` are all host objects under `pad:` |
+//! | Network frames | **through here** — a NIC's port is a host object, registered as a channel by `dev::net::link::ports`; the shape is exactly `(instant, frame bytes)` |
 //! | Guest-visible randomness | already deterministic: `virtio-rng` is a seeded SplitMix64, and says so in its own docs |
 //! | The real-time clock | already deterministic: the MC146818 takes its epoch from a `time` property and advances from its own clock domain, never the host's |
 //! | The host wall clock | not readable below `host/`: the only wall-clock read in the tree is the binary's rate controller |
@@ -35,11 +36,14 @@
 //! [`HostObjects`](crate::core::hosts::HostObjects):
 //!
 //! * a character port is opened by name through it;
-//! * a pad table is opened by name through it;
-//! * and even the *bypasses* go through it — a host that wants to call
-//!   `GbJoypad::set_pressed` directly can only obtain the concrete
-//!   `Arc<GbJoypad>` out of a [`Captured`](crate::core::hosts::Captured) table,
-//!   which is itself a host object under
+//! * a pad table is opened by name through it — including the Game Boy's and
+//!   the Master System's, which reached the host through a
+//!   [`Captured`](crate::core::hosts::Captured) table until they were converted
+//!   and now open a named `pad:` object like everything else;
+//! * a NIC's port is opened by name through it;
+//! * and even the remaining *capture* users go through it — a host that wants
+//!   a concrete `Arc<NesPpu>` to draw from can only obtain one out of a
+//!   `Captured` table, which is itself a host object under
 //!   [`HostKind::CAPTURE`](crate::core::hosts::HostKind::CAPTURE).
 //!
 //! So enforcement is a property of that table rather than of each device.
@@ -131,29 +135,37 @@
 //! sections of one file rather than two file formats. A third mechanism for
 //! either job is a design review, not a commit.
 //!
-//! # How a device with a private queue adopts this
+//! # How a device with a private mechanism adopts this
 //!
-//! A NIC that grew its own `Vec<(tick, frame)>` before this module existed —
-//! recorded as the guest is handed each frame, replayed by re-queueing at the
-//! same ticks — is describing exactly what is here, and the conversion is
-//! three lines rather than a redesign. Delete the private queue and the private
-//! tick stamping; keep the receive path. Then, host-side:
+//! Three did, and the recipe is the same each time: **the device keeps the
+//! object the host was already reaching for, and that object becomes a
+//! channel.** What it gives up is the *stamping* — deciding which instant an
+//! input arrived at — and that is exactly the part it should give up, because a
+//! device that timestamps its own input has to be trusted to pick a round
+//! boundary and nothing checks that it did. What it gains is the file format,
+//! the shape check, the rewind hook, and the seal.
+//!
+//! [`dev::net::link::ports`](crate::dev::net::link::ports) is the worked
+//! example. Its `NetPort` had grown a `Vec<(tick, frame)>` of its own; the log
+//! is gone, the receive path is untouched, and the wiring is three lines:
 //!
 //! ```text
-//! let port = <the NIC's host object, opened by name as usual>;
-//! recorder.register(
-//!     Channel::new(net::KIND, "eth0"),
-//!     Arc::new(FnSink::new("net:eth0", move |frame: &[u8]| port.receive(frame))
-//!         .on_rewind(move || port.drop_queued())),
-//! )?;
+//! // `dev::net::link::ports`, which this module cannot name: `core` is never
+//! // feature-gated and a NIC is.
+//! let port = ports::open(hosts, "net0")?;
+//! recorder.register(ports::channel("net0"), ports::sink(&port))?;
 //! ```
 //!
-//! What the device gives up is the stamping — it no longer decides which tick a
-//! frame arrived at — and that is the part it should give up: a device that
-//! timestamps its own input has to be trusted to pick a *round boundary*, and
-//! nothing checks that it did. What it gains is the file format, the shape
-//! check, the rewind hook, and the seal. A frame is a payload like a keystroke;
-//! nothing about Ethernet needs a second mechanism.
+//! `dev::gb::joypad::pads` and `dev::sms::io::pads` are the same shape with a
+//! *level* payload rather than a queued one — a held-button mask, which is what
+//! a matrix is — and so they register no rewind hook: a level is architectural
+//! state that the snapshot already carries. `host::input` is the same shape
+//! again with a payload of fixed twelve-byte event records, and its channel is
+//! the one case with no host object behind it, because a frontend is not part
+//! of the machine (`host::input` says why).
+//!
+//! A frame, a button and a keystroke are all payloads. None of them needed a
+//! second mechanism.
 //!
 //! # The recording is a file, so it is a parser
 //!

@@ -65,9 +65,17 @@
 //!
 //! Button state is a non-deterministic input crossing into the machine, and
 //! `ROADMAP.md` §0 says every one of those goes through the record/replay seam
-//! or it is a determinism bug. That seam does not exist yet, so
-//! [`set_pressed`](SmsIo::set_pressed) and its neighbours are the interim door
-//! and are deliberately the only one.
+//! or it is a determinism bug. It does: the chip's state lives in a **named
+//! host object**, [`SmsPads`], which this device opens by name from
+//! `new(props)` the way a UART opens a character port — so [`pads::channel`] is
+//! the channel a recorder registers, [`pads::sink`] is what a recorded payload
+//! does, and a board whose pads the recorder does not know about is refused by
+//! [`HostObjects::seal`](crate::core::hosts::HostObjects::seal) at build time.
+//!
+//! There is no second door. [`SmsPads::set_pressed`] and its neighbours are the
+//! *device* side of the seam — what the channel's sink calls, exactly as
+//! `CharPort::feed` is for a keystroke — and a host reaches them by opening the
+//! pads by name, which is the act the seal checks.
 //!
 //! # Sources
 //!
@@ -76,7 +84,7 @@
 //! consulted (`ROADMAP.md` §1).
 
 use alloc::boxed::Box;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use core::fmt;
 
@@ -101,6 +109,9 @@ pub const CONTROL_REGION: &str = "ctrl";
 ///
 /// Two bytes, mirrored across `$C0`-`$FF` for the same reason.
 pub const PAD_REGION: &str = "pads";
+
+/// The host pad port a machine gets when its description names none.
+pub const DEFAULT_PAD_PORT: &str = "sms-pads";
 
 /// The Pause button's output, wired to the core's `/NMI`.
 pub const PAUSE_PIN: &str = "nmi";
@@ -315,20 +326,108 @@ struct Links {
     reset: Option<WireSource>,
 }
 
-struct Shared {
+/// The chip's state: the two control pads, the console's own two buttons, the
+/// control registers, and the pins the buttons drive.
+///
+/// This is the **host object** a build files under [`pads::KIND`] and the name
+/// the machine description gave — the console's controller ports rather than a
+/// copy of them. The device holds it, both register blocks hold it, and a host
+/// that presses a button opens it by name. One object rather than a device
+/// handle plus a mirror of its state, because two would have to be kept in step
+/// and nothing would check that they were.
+///
+/// The Pause and Reset pins live here too, and have to: a press is what drives
+/// them, and a press comes from out here.
+pub struct SmsPads {
     state: Mutex<State>,
     links: Mutex<Links>,
 }
 
-impl fmt::Debug for Shared {
+impl fmt::Debug for SmsPads {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Shared")
+        f.debug_struct("SmsPads")
             .field("state", &self.state)
             .finish_non_exhaustive()
     }
 }
 
-impl Shared {
+impl Default for SmsPads {
+    fn default() -> SmsPads {
+        SmsPads::new(Nationalisation::Export)
+    }
+}
+
+impl SmsPads {
+    /// A chip with nothing held and every pin an input.
+    #[must_use]
+    pub fn new(nation: Nationalisation) -> SmsPads {
+        SmsPads {
+            state: Mutex::with_rank(LockRank::DEVICE, State::new(nation)),
+            links: Mutex::with_rank(LockRank::WIRE, Links::default()),
+        }
+    }
+
+    /// Which console this chip is in.
+    #[must_use]
+    pub fn nationalisation(&self) -> Nationalisation {
+        self.state.lock().nation
+    }
+
+    /// Say which console this chip is in.
+    ///
+    /// The device calls it after opening the port by name: a host that opened
+    /// the same name first got the default, and the machine description is the
+    /// authority on which console this is.
+    pub fn set_nationalisation(&self, nation: Nationalisation) {
+        self.state.lock().nation = nation;
+    }
+
+    /// Press or release one button on `port` (0 or 1).
+    ///
+    /// The device end of the record/replay channel; see the module docs.
+    pub fn set_pressed(&self, port: usize, button: Button, pressed: bool) {
+        let mut state = self.state.lock();
+        let mask = 1u8 << button.bit();
+        if pressed {
+            state.pads[port & 1] |= mask;
+        } else {
+            state.pads[port & 1] &= !mask;
+        }
+    }
+
+    /// Set every button on `port` at once, as a packed mask. **1 is pressed.**
+    pub fn set_buttons(&self, port: usize, pressed: u8) {
+        self.state.lock().pads[port & 1] = pressed & 0x3f;
+    }
+
+    /// Which buttons are held on `port`.
+    #[must_use]
+    pub fn buttons(&self, port: usize) -> u8 {
+        self.state.lock().pads[port & 1]
+    }
+
+    /// Hold or release the Pause button.
+    ///
+    /// It drives a level; the core's pin latches the rising edge, which is what
+    /// makes one press one NMI however long it is held.
+    pub fn set_pause(&self, held: bool) {
+        self.state.lock().pause = held;
+        self.settle();
+    }
+
+    /// A complete Pause press, for a caller that does not model the button's
+    /// travel.
+    pub fn pulse_pause(&self) {
+        self.set_pause(true);
+        self.set_pause(false);
+    }
+
+    /// Hold or release the Reset button.
+    pub fn set_reset(&self, held: bool) {
+        self.state.lock().reset = held;
+        self.settle();
+    }
+
     /// Drive both console buttons' pins, with no lock of this device held.
     fn drive(&self, pause: bool, reset: bool) {
         let (p, r) = {
@@ -354,7 +453,7 @@ impl Shared {
 
 /// The Master System's I/O chip.
 pub struct SmsIo {
-    shared: Arc<Shared>,
+    pads: Arc<SmsPads>,
     control_region: RegionRef,
     pad_region: RegionRef,
 }
@@ -362,7 +461,7 @@ pub struct SmsIo {
 impl fmt::Debug for SmsIo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SmsIo")
-            .field("state", &self.shared.state)
+            .field("state", &self.pads.state)
             .finish_non_exhaustive()
     }
 }
@@ -374,29 +473,31 @@ impl Default for SmsIo {
 }
 
 impl SmsIo {
-    /// A chip with nothing held and every pin an input.
+    /// A chip with a private pad port: nothing held, every pin an input.
     #[must_use]
     pub fn new(nation: Nationalisation) -> SmsIo {
-        let shared = Arc::new(Shared {
-            state: Mutex::with_rank(LockRank::DEVICE, State::new(nation)),
-            links: Mutex::with_rank(LockRank::WIRE, Links::default()),
-        });
+        SmsIo::with_pads(Arc::new(SmsPads::new(nation)))
+    }
+
+    /// A chip reading `pads`, which the host may already hold.
+    #[must_use]
+    pub fn with_pads(pads: Arc<SmsPads>) -> SmsIo {
         let control_region = Arc::new(MmioRegion::io(
             "sms.io.ctrl",
             2,
             Arc::new(ControlPorts {
-                shared: Arc::clone(&shared),
+                pads: Arc::clone(&pads),
             }) as Arc<dyn MemOps>,
         ));
         let pad_region = Arc::new(MmioRegion::io(
             "sms.io.pads",
             2,
             Arc::new(PadPorts {
-                shared: Arc::clone(&shared),
+                pads: Arc::clone(&pads),
             }) as Arc<dyn MemOps>,
         ));
         SmsIo {
-            shared,
+            pads,
             control_region,
             pad_region,
         }
@@ -414,89 +515,60 @@ impl SmsIo {
             at: String::from("region"),
             message: alloc::format!("`{name}` is not a console region; use `export` or `japan`"),
         })?;
+        let port = r.or_str("pads", DEFAULT_PAD_PORT)?.to_string();
         r.finish()?;
-        Ok(SmsIo::new(nation))
+        let pads = pads::attach(props, &port)?;
+        // A host that opened this name first got a default console; the machine
+        // description is the authority on which one it is.
+        pads.set_nationalisation(nation);
+        Ok(SmsIo::with_pads(pads))
+    }
+
+    /// The pad port this chip's buttons come from: the host end of the seam.
+    #[must_use]
+    pub fn pads(&self) -> &Arc<SmsPads> {
+        &self.pads
     }
 
     /// Which console this chip is in.
     #[must_use]
     pub fn nationalisation(&self) -> Nationalisation {
-        self.shared.state.lock().nation
-    }
-
-    /// Press or release one button on `port` (0 or 1).
-    ///
-    /// The interim door for a non-deterministic input; see the module docs.
-    pub fn set_pressed(&self, port: usize, button: Button, pressed: bool) {
-        let mut state = self.shared.state.lock();
-        let mask = 1u8 << button.bit();
-        if pressed {
-            state.pads[port & 1] |= mask;
-        } else {
-            state.pads[port & 1] &= !mask;
-        }
-    }
-
-    /// Set every button on `port` at once, as a packed mask. **1 is pressed.**
-    pub fn set_buttons(&self, port: usize, pressed: u8) {
-        self.shared.state.lock().pads[port & 1] = pressed & 0x3f;
+        self.pads.nationalisation()
     }
 
     /// Which buttons are held on `port`.
     #[must_use]
     pub fn buttons(&self, port: usize) -> u8 {
-        self.shared.state.lock().pads[port & 1]
-    }
-
-    /// Hold or release the Pause button.
-    ///
-    /// It drives a level; the core's pin latches the rising edge, which is what
-    /// makes one press one NMI however long it is held.
-    pub fn set_pause(&self, held: bool) {
-        self.shared.state.lock().pause = held;
-        self.shared.settle();
-    }
-
-    /// A complete Pause press, for a caller that does not model the button's
-    /// travel.
-    pub fn pulse_pause(&self) {
-        self.set_pause(true);
-        self.set_pause(false);
-    }
-
-    /// Hold or release the Reset button.
-    pub fn set_reset(&self, held: bool) {
-        self.shared.state.lock().reset = held;
-        self.shared.settle();
+        self.pads.buttons(port)
     }
 
     /// `$DC` as the guest reads it.
     #[must_use]
     pub fn read_dc(&self) -> u8 {
-        self.shared.state.lock().read_dc()
+        self.pads.state.lock().read_dc()
     }
 
     /// `$DD` as the guest reads it.
     #[must_use]
     pub fn read_dd(&self) -> u8 {
-        self.shared.state.lock().read_dd()
+        self.pads.state.lock().read_dd()
     }
 
     /// `$3E` as it was last written.
     #[must_use]
     pub fn memory_control(&self) -> u8 {
-        self.shared.state.lock().memory_control
+        self.pads.state.lock().memory_control
     }
 
     /// `$3F` as it was last written.
     #[must_use]
     pub fn io_control(&self) -> u8 {
-        self.shared.state.lock().io_control
+        self.pads.state.lock().io_control
     }
 
     /// Write `$3E` or `$3F` as the guest would — offset 0 or 1.
     pub fn write_control(&self, offset: u64, value: u8) {
-        let mut state = self.shared.state.lock();
+        let mut state = self.pads.state.lock();
         if offset & 1 == 0 {
             state.memory_control = value;
         } else {
@@ -506,14 +578,142 @@ impl SmsIo {
 
     /// Connect the Pause line.
     pub fn attach_pause(&self, source: WireSource) {
-        self.shared.links.lock().pause = Some(source);
-        self.shared.settle();
+        self.pads.links.lock().pause = Some(source);
+        self.pads.settle();
     }
 
     /// Connect the Reset line.
     pub fn attach_reset(&self, source: WireSource) {
-        self.shared.links.lock().reset = Some(source);
-        self.shared.settle();
+        self.pads.links.lock().reset = Some(source);
+        self.pads.settle();
+    }
+}
+
+/// The build's named Master System pad ports.
+///
+/// The same shape as [`chardev::ports`](crate::host::chardev::ports): a *name*
+/// is the only thing that can travel from a machine description into a device
+/// constructor, and both ends resolve it against the build's own
+/// [`HostObjects`](crate::core::hosts::HostObjects).
+///
+/// ```text
+/// machine file:  object io "sms.io" { pads = "sms-pads" }
+/// device:        pads::attach(props, "sms-pads")  ──┐
+/// host:          pads::open(&hosts, "sms-pads")   ──┴─► the same Arc<SmsPads>
+/// ```
+pub mod pads {
+    use super::{Nationalisation, SmsPads};
+    use alloc::string::String;
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+
+    use crate::core::error::Result;
+    use crate::core::hosts::{HostKind, HostObjects};
+    use crate::core::props::Props;
+    use crate::core::record::{Channel, FnSink, InputSink};
+
+    /// The kind a pad port is filed under in a build's [`HostObjects`].
+    pub const KIND: HostKind = HostKind::new("pad");
+
+    /// How many bytes one recorded press is: port A, port B, the console's own
+    /// two buttons.
+    pub const RECORD_BYTES: usize = 3;
+
+    /// Bit 0 of a payload's third byte: the Pause button.
+    pub const PAUSE: u8 = 0x01;
+
+    /// Bit 1 of a payload's third byte: the Reset button.
+    pub const RESET: u8 = 0x02;
+
+    /// The pad port `name` refers to in `hosts`, creating it on first mention.
+    ///
+    /// The **host** side of the rendezvous. A port created here is an export
+    /// console until a device says otherwise, which the device does from its
+    /// own constructor.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Config`] if another kind of host object already holds
+    /// that name.
+    pub fn open(hosts: &HostObjects, name: &str) -> Result<Arc<SmsPads>> {
+        hosts.open(KIND, name, || SmsPads::new(Nationalisation::Export))
+    }
+
+    /// The pad port `name` refers to in the build these properties belong to.
+    ///
+    /// The **device** side, called from `new(props)`: acquiring a host object is
+    /// allocation, not an outward action ([`core::hosts`](crate::core::hosts)
+    /// argues the case). A `Props` that belongs to no build gets a private port.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`].
+    pub fn attach(props: &Props, name: &str) -> Result<Arc<SmsPads>> {
+        props.host(KIND, name, || SmsPads::new(Nationalisation::Export))
+    }
+
+    /// The pad port called `name`, if it has been opened.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`].
+    pub fn get(hosts: &HostObjects, name: &str) -> Result<Option<Arc<SmsPads>>> {
+        hosts.get(KIND, name)
+    }
+
+    /// Forget `name`, reporting whether there was one.
+    pub fn close(hosts: &HostObjects, name: &str) -> bool {
+        hosts.close(KIND, name)
+    }
+
+    /// Every open name, in order.
+    #[must_use]
+    pub fn names(hosts: &HostObjects) -> Vec<String> {
+        hosts.names(KIND)
+    }
+
+    /// The record/replay channel the pads called `name` are pressed through.
+    ///
+    /// `pad:sms-pads`, which is the same `(kind, name)` pair the host-object
+    /// table files the port under — so a board whose pads have no channel is
+    /// refused by [`HostObjects::seal`](crate::core::hosts::HostObjects::seal)
+    /// naming this string.
+    #[must_use]
+    pub fn channel(name: &str) -> Channel {
+        Channel::new(KIND, name)
+    }
+
+    /// The [`InputSink`] that applies a recorded payload to `pads`.
+    ///
+    /// [`RECORD_BYTES`] bytes: the held mask of port A, the held mask of port B
+    /// — both in [`Button::bit`](super::Button::bit) order — and then the
+    /// console's own buttons, [`PAUSE`] and [`RESET`]. Level rather than edge,
+    /// because that is what the lines are; a Pause *press* is two payloads, one
+    /// with the bit set and one without, exactly as a person's thumb produces.
+    ///
+    /// A longer payload is that state changing more than once and each group is
+    /// applied in turn; a short trailing group applies the bytes it has, so a
+    /// host that only ever touches port A may post one byte.
+    ///
+    /// No rewind hook: these are levels rather than a queue, and the levels are
+    /// part of the machine snapshot a rewind restores.
+    #[must_use]
+    pub fn sink(pads: &Arc<SmsPads>) -> Arc<dyn InputSink> {
+        let pads = Arc::clone(pads);
+        Arc::new(FnSink::new("pad", move |payload: &[u8]| {
+            for group in payload.chunks(RECORD_BYTES) {
+                if let Some(a) = group.first() {
+                    pads.set_buttons(0, *a);
+                }
+                if let Some(b) = group.get(1) {
+                    pads.set_buttons(1, *b);
+                }
+                if let Some(console) = group.get(2) {
+                    pads.set_pause(console & PAUSE != 0);
+                    pads.set_reset(console & RESET != 0);
+                }
+            }
+        }))
     }
 }
 
@@ -523,7 +723,7 @@ impl SmsIo {
 
 /// `$3E` and `$3F`, write-only.
 struct ControlPorts {
-    shared: Arc<Shared>,
+    pads: Arc<SmsPads>,
 }
 
 impl fmt::Debug for ControlPorts {
@@ -550,7 +750,7 @@ impl MemOps for ControlPorts {
             // Writing `$3E` can switch the cartridge out from under the guest.
             return Ok(());
         }
-        let mut state = self.shared.state.lock();
+        let mut state = self.pads.state.lock();
         if offset & 1 == 0 {
             state.memory_control = *value;
         } else {
@@ -566,7 +766,7 @@ impl MemOps for ControlPorts {
 
 /// `$DC` and `$DD`, read-only.
 struct PadPorts {
-    shared: Arc<Shared>,
+    pads: Arc<SmsPads>,
 }
 
 impl fmt::Debug for PadPorts {
@@ -582,7 +782,7 @@ impl MemOps for PadPorts {
         };
         // Reading a pad has no side effect at all, so a debug read needs no
         // special case: this is the aperture a monitor can look at freely.
-        let state = self.shared.state.lock();
+        let state = self.pads.state.lock();
         *byte = if offset & 1 == 0 {
             state.read_dc()
         } else {
@@ -615,14 +815,25 @@ pub static CLASS: DeviceClass = DeviceClass {
     name: "sms.io",
     version: 1,
     summary: "Master System I/O: two control pads at $DC/$DD, $3E/$3F, Pause as an NMI",
-    properties: &[PropertySpec {
+    properties: IO_PROPERTIES,
+    construct: |props| Ok(Box::new(SmsIo::from_props(props)?) as Box<dyn Device>),
+};
+
+/// The properties `sms.io` takes.
+static IO_PROPERTIES: &[PropertySpec] = &[
+    PropertySpec {
         name: "region",
         kind: ValueKind::Str,
         required: false,
         summary: "console region, for the `$3F` readback: `export` or `japan`",
-    }],
-    construct: |props| Ok(Box::new(SmsIo::from_props(props)?) as Box<dyn Device>),
-};
+    },
+    PropertySpec {
+        name: "pads",
+        kind: ValueKind::Str,
+        required: false,
+        summary: "the host pad port buttons arrive through, by name (default \"sms-pads\")",
+    },
+];
 
 /// Add this class to a registry.
 ///
@@ -641,13 +852,13 @@ impl Device for SmsIo {
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
         // The realize sweep: say what both lines idle at, which is low with
         // neither button held (`ROADMAP.md` §4.3).
-        self.shared.settle();
+        self.pads.settle();
         Ok(())
     }
 
     fn unrealize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
-        self.shared.drive(false, false);
-        let mut links = self.shared.links.lock();
+        self.pads.drive(false, false);
+        let mut links = self.pads.links.lock();
         links.pause = None;
         links.reset = None;
         Ok(())
@@ -679,7 +890,7 @@ impl Device for SmsIo {
 
     fn announce(&self, port: &str) {
         if port == PAUSE_PIN || port == RESET_PIN {
-            self.shared.settle();
+            self.pads.settle();
         }
     }
 
@@ -687,15 +898,15 @@ impl Device for SmsIo {
         // Which buttons a person is holding is not something a reset changes,
         // so only the two control registers go back.
         {
-            let mut state = self.shared.state.lock();
+            let mut state = self.pads.state.lock();
             state.memory_control = 0;
             state.io_control = 0xff;
         }
-        self.shared.settle();
+        self.pads.settle();
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
-        let state = *self.shared.state.lock();
+        let state = *self.pads.state.lock();
         w.write_u32(STATE_VERSION)?;
         w.write_u8(state.pads[0])?;
         w.write_u8(state.pads[1])?;
@@ -714,7 +925,7 @@ impl Device for SmsIo {
             )));
         }
         {
-            let mut state = self.shared.state.lock();
+            let mut state = self.pads.state.lock();
             state.pads[0] = r.read_u8()?;
             state.pads[1] = r.read_u8()?;
             state.pause = r.read_bool()?;
@@ -723,7 +934,7 @@ impl Device for SmsIo {
             state.io_control = r.read_u8()?;
         }
         // The restored state implies levels nothing has announced.
-        self.shared.settle();
+        self.pads.settle();
         Ok(())
     }
 }
@@ -745,6 +956,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
     use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
     ClassSchema::new(CLASS.name)
         .prop(PropSchema::new("region", ValueKind::Str).values(&["export", "japan"]))
+        .prop(PropSchema::new("pads", ValueKind::Str))
         .port(PAUSE_PIN, PortDir::Out)
         .port(RESET_PIN, PortDir::Out)
         .region(CONTROL_REGION)
