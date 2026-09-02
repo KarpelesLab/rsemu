@@ -158,7 +158,14 @@ the controller fetches the command, walks the chain, moves the data to or from
 the disk image, posts a completion with its phase tag and holds its interrupt
 line down until the driver acknowledges it. The board is RAM, a host bridge, an
 8259A and the controller — nothing else, so a failure on it is a failure in the
-device.
+device. `ahci-mini` is its twin for the *other* way a modern machine reaches a
+disk: a **Serial ATA host bus adapter**, which is a bus master over an ordinary
+ATA drive — the same drive object the PC/AT hangs off its IDE cable, with the
+same command set behind it. That reuse is the point of the work rather than a
+side effect: an AHCI port carries an ATA command, so the drive grew a *taskfile*
+seam — the command block as a struct, loaded into the same registers and
+dispatched by the same code a port write reaches — and `src/dev/pc/ide.rs` did
+not change by one line.
 
 The framework underneath is complete: address spaces with priority and
 mirroring, an oscillator forest with exact intra-tree ratios, wires, devices,

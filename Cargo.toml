@@ -780,7 +780,17 @@ dev-pc-floppy = ["dev-pc"]
 # CHS, LBA28 and LBA48, SET MULTIPLE MODE, INITIALIZE DEVICE PARAMETERS -- the
 # command a BIOS uses to make its CHS translation and the drive's agree -- and
 # the software reset protocol. **ATAPI is out of scope**: IDENTIFY PACKET
-# DEVICE aborts, which is what a non-packet device does. Takes a media slot
+# DEVICE aborts, which is what a non-packet device does.
+#
+# Two front doors, one command set. The eight registers are the ribbon cable,
+# and `dev/ata/disk/taskfile` is the same command block as a **struct** for a
+# host adapter that has no cable to write -- loaded into the very same
+# registers, dispatched by the very same code, with its data phase running the
+# same busy/DRQ handshake in bulk. `dev-pc-ide` uses the first and `dev-ahci`
+# uses the second, and neither has a copy of the decode. The `dma` property
+# (default false) turns on the DMA data transfer protocols and the READ/WRITE
+# DMA family: off is the honest default for an AT cable, which has no bus master
+# on it, and a bus-mastering adapter's machine file turns it on. Takes a media slot
 # rather than `fstool`, for the same reason `dev-sd-card` and `dev-flash-cfi`
 # do. Written from T13's ATA/ATAPI-6; no emulator source and no operating
 # system's ATA driver was opened (ROADMAP.md §1). `no_std + alloc`, no
@@ -829,6 +839,52 @@ dev-blk = ["std", "dev-ata-disk", "dep:fstool"]
 # 14/15. Needs `dev-ata-disk` to have anything to talk to, and `dev-pc` because
 # it is that board's decode.
 dev-pc-ide = ["dev-pc", "dev-ata-disk"]
+
+# A Serial ATA host bus adapter as a PCI function (src/dev/ahci): the AHCI
+# 1.3.1 register block behind ABAR (base address register five), and -- the
+# part that matters -- a **bus master** that reads its own work out of guest
+# RAM. A driver builds a 32-entry command list, a received-FIS area and a
+# Physical Region Descriptor Table in its own memory, writes one bit into PxCI,
+# and the adapter fetches the command header, fetches the Register - Host to
+# Device FIS that *is* the ATA command, hands it to the drive, walks the PRDT
+# moving data between the drive's medium and the addresses it names, posts the
+# device's answering FIS into the received-FIS area, writes PRDBC back into the
+# command header and holds `INTA#` down until the driver clears PxIS and IS.
+#
+# Covers the generic host control registers (CAP/GHC/IS/PI/VS/CAP2) and the
+# per-port ones (PxCLB/PxFB/PxIS/PxIE/PxCMD/PxTFD/PxSIG/PxSSTS/PxSCTL/PxSERR/
+# PxSACT/PxCI), start and stop of the command list engine, the FIS receive
+# engine, command list override, COMRESET through PxSCTL.DET, the AHCI software
+# reset sequence's two control FISes, **both data transfer protocols** -- a PIO
+# command is announced by a PIO Setup FIS per block and ends on PxIS.PSS, a DMA
+# one ends on a D2H Register FIS and PxIS.DHRS -- and the error paths that stop
+# a port (taskfile error, PRD overflow, host bus error). NCQ, port multipliers,
+# FIS-based switching, command completion coalescing, enclosure management,
+# MSI/MSI-X and ATAPI are deliberately absent and CAP says so. **Every walk over
+# a guest-built structure is bounded**, and `fuzz/fuzz_targets/ahci_mmio.rs` is
+# why.
+#
+# The command set underneath is `dev-ata-disk`'s and is **not duplicated**: a
+# command reaches the drive through the taskfile seam
+# (src/dev/ata/disk/taskfile.rs), which loads the same command block registers a
+# port write would have left and runs the same dispatch, so the AT's IDE channel
+# and an AHCI port share one implementation. Written from the Serial ATA AHCI
+# Specification 1.3.1 (Intel) and Serial ATA Revision 1.0 for the FIS layouts;
+# no emulator source and no operating system's AHCI driver was opened
+# (ROADMAP.md 1). `no_std + alloc`, no `unsafe`, no dependencies. Needs
+# `bus-pci` for the function and `dev-ata-disk` for the drive.
+dev-ahci = ["bus-pci", "dev-ata-disk"]
+
+# The `ahci-mini` board (machines/ahci-mini.machine plus the classes it names):
+# RAM, an 82441FX host bridge for the 0xcf8/0xcfc configuration ports, a master
+# 8259A, an AHCI adapter on the bus with its `INTx#` wired to IR5, and one ATA
+# drive in its port 0 bay. It models no product; it exists so `ahci.hba` has
+# somewhere a driver can reach it the way a driver does -- configuration cycles,
+# an ABAR the driver places itself, and a command list in the board's own RAM.
+# Deliberately has **no processor**, for the same reason `nvme-mini` has none:
+# every register is reached through an address space and a test drives those
+# directly. Adds no dependencies.
+machine-ahci-mini = ["dev-ahci", "dev-pc-pci"]
 
 # An NVM Express controller as a PCI function (src/dev/nvme): the NVMe 1.4
 # register block behind a 64-bit BAR, and -- the part that matters -- a **bus

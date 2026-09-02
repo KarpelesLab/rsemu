@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std", "vnc", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-blk", "dev-ne2000", "dev-nvme", "dev-pc-apic", "dev-pc-hpet", "ir", "jit", "cpu-riscv-lift", "float"]
+features         = ["std", "vnc", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-blk", "dev-ne2000", "dev-nvme", "dev-ahci", "dev-pc-apic", "dev-pc-hpet", "ir", "jit", "cpu-riscv-lift", "float"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -121,6 +121,21 @@ bench = false
 [[bin]]
 name  = "nvme_mmio"
 path  = "fuzz_targets/nvme_mmio.rs"
+test  = false
+doc   = false
+bench = false
+
+# The AHCI adapter, for the same reason and against a larger structure: one
+# write to PxCI makes it fetch a 32-byte command header, then a command table
+# whose base that header names, then a command FIS whose length that header
+# names, then a Physical Region Descriptor Table of up to 65,535 entries -- and
+# then hand the whole thing to a real ATA drive on a real medium. Its register
+# block is mapped in the space it masters, so the fuzzer can aim a data block at
+# PxCI, or at PxCLB while a command is running, and re-enter the write handler
+# from inside itself.
+[[bin]]
+name  = "ahci_mmio"
+path  = "fuzz_targets/ahci_mmio.rs"
 test  = false
 doc   = false
 bench = false

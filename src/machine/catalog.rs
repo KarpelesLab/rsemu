@@ -304,6 +304,25 @@ pub static NE2K_MINI: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/ne2k-mini.machine"),
 };
 
+/// A minimal PCI board with a Serial ATA host bus adapter on it, when this
+/// build has one.
+///
+/// A synthetic board rather than a product: RAM, a host bridge for the
+/// configuration ports, an 8259A for the completion interrupt, an AHCI adapter,
+/// and one ATA drive in its port 0 bay. It exists so that `ahci.hba` has
+/// somewhere a driver can reach it the way a driver does — through
+/// configuration cycles, an `ABAR` it places itself, and a command list in the
+/// board's own RAM. The `sata0` slot takes the drive's contents.
+#[cfg(feature = "machine-ahci-mini")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-ahci-mini")))]
+pub static AHCI_MINI: CatalogEntry = CatalogEntry {
+    name: "ahci-mini",
+    summary: "a minimal PCI board with an AHCI adapter and one SATA drive: RAM, a host bridge, \
+              an 8259A",
+    media: &["sata0"],
+    source: include_str!("../../machines/ahci-mini.machine"),
+};
+
 /// A minimal PCI board with an NVM Express controller on it, when this build
 /// has one.
 ///
@@ -376,6 +395,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&MIPS_MINI);
     #[cfg(feature = "machine-ne2k-mini")]
     out.push(&NE2K_MINI);
+    #[cfg(feature = "machine-ahci-mini")]
+    out.push(&AHCI_MINI);
     #[cfg(feature = "machine-nvme-mini")]
     out.push(&NVME_MINI);
     #[cfg(feature = "machine-pc-at")]
@@ -462,6 +483,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::wdc::register(&mut reg)?;
     #[cfg(feature = "dev-ne2000")]
     crate::dev::net::ne2000::register(&mut reg)?;
+    #[cfg(feature = "dev-ahci")]
+    crate::dev::ahci::register(&mut reg)?;
     #[cfg(feature = "dev-nvme")]
     crate::dev::nvme::register(&mut reg)?;
     #[cfg(feature = "cpu-x86")]
@@ -559,6 +582,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::wdc::bind(&mut b)?;
     #[cfg(feature = "dev-ne2000")]
     crate::dev::net::ne2000::bind(&mut b)?;
+    #[cfg(feature = "dev-ahci")]
+    crate::dev::ahci::bind(&mut b)?;
     #[cfg(feature = "dev-nvme")]
     crate::dev::nvme::bind(&mut b)?;
     #[cfg(feature = "cpu-x86")]
@@ -635,6 +660,8 @@ pub fn classes() -> ClassTable {
     table.insert(crate::cpu::z80::schema());
     #[cfg(feature = "dev-ne2000")]
     table.insert(crate::dev::net::ne2000::schema());
+    #[cfg(feature = "dev-ahci")]
+    table.insert(crate::dev::ahci::schema());
     #[cfg(feature = "dev-nvme")]
     table.insert(crate::dev::nvme::schema());
     #[cfg(feature = "cpu-m68k")]
@@ -1396,6 +1423,11 @@ mod tests {
             // unwritten drive in it, exactly as `riscv-virt` gets.
             #[cfg(feature = "machine-nvme-mini")]
             ("nvme-mini", "nvme0") => &[],
+            // The same, and for the same reason: the `disk` size in the machine
+            // file supplies a blank drive, and a run that means something else
+            // says `--drive sata0=disk.img`.
+            #[cfg(feature = "machine-ahci-mini")]
+            ("ahci-mini", "sata0") => &[],
             // The two longwords a 68000 fetches out of reset — a stack pointer
             // at the top of the board's RAM and a program counter at $000008 —
             // followed by `BRA .-0`, the two-byte branch to itself. Everything
