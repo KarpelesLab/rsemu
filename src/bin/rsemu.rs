@@ -1134,15 +1134,15 @@ fn vnc_session(machine: &mut Machine, args: &RunArgs, hosts: &HostObjects) -> Ex
     if let Ok(Some(port)) = rsemu::host::chardev::ports::get(hosts, "keyboard") {
         session = session.with_sink(Arc::new(rsemu::host::input::KeyboardSink::new(port)));
     }
-    // The controllers, if it has those instead.
-    #[cfg(feature = "dev-nes-io")]
-    for (index, name) in rsemu::dev::nes::input::pads::names(hosts)
-        .iter()
-        .enumerate()
-    {
-        if let Ok(Some(pad)) = rsemu::dev::nes::input::pads::get(hosts, name) {
-            session = session.with_sink(Arc::new(rsemu::host::input::PadSink::new(pad, index)));
-        }
+    // The controllers, if it has those instead. Whichever console's they are:
+    // all three families file their port under the same `pad` host kind, so the
+    // loop this replaced — list the kind, ask for a NES-typed pad — got a Game
+    // Boy's and a Master System's *names* and then failed the downcast in
+    // silence, which is a screen with no buttons. `host::input::Pads` asks each
+    // family for its own type.
+    #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+    if let Some(pad) = rsemu::host::input::PadSink::open(hosts, 0) {
+        session = session.with_sink(Arc::new(pad));
     }
 
     // Recording and replaying are `core::record`'s, not this frontend's: what
