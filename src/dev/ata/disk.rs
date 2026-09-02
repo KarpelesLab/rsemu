@@ -2294,6 +2294,15 @@ impl Device for DiskDevice {
         }
     }
 
+    fn flush(&self) -> Result<()> {
+        // What `FLUSH CACHE` would have done, without a guest asking: the run
+        // is over and nothing else will write these bytes.
+        match &self.drive {
+            Some(drive) => drive.flush_media(),
+            None => Ok(()),
+        }
+    }
+
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
         match &self.drive {
             None => w.write_bool(false),

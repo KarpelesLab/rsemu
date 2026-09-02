@@ -98,6 +98,20 @@ pub trait Backend: Send + Sync + fmt::Debug {
     /// Return to the state a `Status` write of zero implies.
     fn reset(&self);
 
+    /// Push anything already accepted from the driver out to the host.
+    ///
+    /// [`Device::flush`] for a backend: the
+    /// transport has no host state of its own and forwards this to whatever is
+    /// behind it. An entropy source has nothing to do here; a block device has
+    /// its medium.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the host refused.
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Serialize whatever of this device is architectural state.
     ///
     /// # Errors

@@ -169,6 +169,17 @@ impl VirtioBlk {
         &self.media
     }
 
+    /// Make every write so far durable, as a `T_FLUSH` request does.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::State`] if the host refused.
+    pub fn flush(&self) -> Result<()> {
+        self.media
+            .flush()
+            .map_err(|e| Error::State(alloc::format!("virtio disk: {e}")))
+    }
+
     /// Whether writes are refused.
     #[must_use]
     pub fn is_read_only(&self) -> bool {
@@ -351,6 +362,10 @@ impl Backend for VirtioBlk {
         // driver put it.
         let _ = q.write_chain(chain, writable - 1, &[status]);
         (written + 1) as u32
+    }
+
+    fn flush(&self) -> Result<()> {
+        VirtioBlk::flush(self)
     }
 
     fn reset(&self) {

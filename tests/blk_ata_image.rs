@@ -524,3 +524,112 @@ fn the_media_slot_path_still_builds_a_capturing_ram_drive() {
     assert_eq!(drive.medium().snapshot(), Snapshot::Capture);
     assert_eq!(read_sector(&drive, 0), vec![0xa5u8; SECTOR as usize]);
 }
+
+// ---------------------------------------------------------------------------
+// the end of a run
+// ---------------------------------------------------------------------------
+
+/// A medium that counts what the machine asks of it, over bytes that behave.
+///
+/// The point of the count is that a drive is *entitled* to hold a write: a
+/// guest that never issued `FLUSH CACHE` has been promised nothing, and a
+/// medium with a cache in front of it is free to keep the bytes. What the count
+/// proves is that ending the run is a moment where somebody asks anyway.
+#[derive(Debug)]
+struct Counting {
+    inner: rsemu::core::space::RamStore,
+    flushes: AtomicU64,
+}
+
+impl Counting {
+    fn new(bytes: u64) -> Counting {
+        Counting {
+            inner: rsemu::core::space::RamStore::new(bytes),
+            flushes: AtomicU64::new(0),
+        }
+    }
+
+    fn flushes(&self) -> u64 {
+        self.flushes.load(Ordering::Relaxed)
+    }
+}
+
+impl Medium for Counting {
+    fn capacity(&self) -> u64 {
+        Medium::capacity(&self.inner)
+    }
+
+    fn read_at(&self, offset: u64, dst: &mut [u8]) -> rsemu::core::space::MemResult {
+        Medium::read_at(&self.inner, offset, dst)
+    }
+
+    fn write_at(&self, offset: u64, src: &[u8]) -> rsemu::core::space::MemResult {
+        Medium::write_at(&self.inner, offset, src)
+    }
+
+    fn flush(&self) -> rsemu::core::space::MemResult {
+        self.flushes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn describe(&self) -> String {
+        String::from("counting")
+    }
+}
+
+/// The `ata.disk` object built on `medium`, through a media slot, as a machine
+/// description does it.
+fn device_over(slot: &str, medium: Arc<dyn Medium>) -> DiskDevice {
+    let hosts = Arc::new(HostObjects::new());
+    rsemu::dev::medium::install(&hosts, slot, medium).expect("nothing else claimed the slot");
+    let mut props = Props::new();
+    props.insert("image", Value::Media(Media::new(slot, Vec::new())));
+    props.insert("size", Value::Uint(0));
+    props.insert("bay", Value::Str(String::from("counting-bay")));
+    let props = props.with_hosts(hosts);
+    DiskDevice::new(&props).expect("a drive")
+}
+
+#[test]
+fn ending_a_run_flushes_a_drive_the_guest_never_asked_to_flush() {
+    // The bug this exists for: a guest writes, is killed or simply stops, and
+    // the bytes it wrote are still in the image's cache when the process exits.
+    // Linux writes a bare block device's dirty pages back on `sync(2)` but
+    // issues the device flush from `blkdev_fsync`, so a run can end with the
+    // data cluster written and the metadata that finds it not — which on a
+    // qcow2 is a hole where a sector used to be.
+    let medium = Arc::new(Counting::new(1 << 20));
+    let device = device_over("hd0", Arc::clone(&medium) as Arc<dyn Medium>);
+    let disk = device.drive().expect("a drive").clone();
+
+    write_sector(&disk, 3, &stamp(3));
+    assert_eq!(
+        medium.flushes(),
+        0,
+        "the guest issued no FLUSH CACHE, so nothing has asked the medium"
+    );
+
+    // What the machine does when the run ends: `Machine::flush` is this call,
+    // once per device, in the machine description's order.
+    Device::flush(&device).expect("the medium took it");
+    assert_eq!(medium.flushes(), 1, "and the drive passed it on");
+
+    // Idempotent, because more than one thing may end a run: a `--span` that
+    // expired and then a snapshot on the way out.
+    Device::flush(&device).expect("again");
+    assert_eq!(medium.flushes(), 2);
+    assert_eq!(read_sector(&disk, 3), stamp(3), "and nothing moved");
+}
+
+#[test]
+fn an_empty_bay_has_nothing_to_flush() {
+    // A machine with an `ata.disk` object and no medium in its slot is a cable
+    // position with no drive on it. Ending a run must not turn that into an
+    // error.
+    let mut props = Props::new();
+    props.insert("bay", Value::Str(String::from("empty-bay")));
+    props.insert("size", Value::Uint(0));
+    let device = DiskDevice::new(&props).expect("a bay");
+    assert!(device.drive().is_none());
+    Device::flush(&device).expect("nothing to do, and no complaint about it");
+}

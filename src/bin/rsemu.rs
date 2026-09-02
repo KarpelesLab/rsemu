@@ -492,14 +492,16 @@ fn run(args: &[String]) -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        return debug_session(&mut machine, &addr, port.as_ref(), &parsed);
+        let status = debug_session(&mut machine, &addr, port.as_ref(), &parsed);
+        return finish(&machine, status);
     }
 
     // A remote frontend owns when the machine advances, for the same reason a
     // debugger does — so it is checked before the console loop.
     #[cfg(feature = "vnc")]
     if parsed.vnc.is_some() {
-        return vnc_session(&mut machine, &parsed, &options.realize.hosts);
+        let status = vnc_session(&mut machine, &parsed, &options.realize.hosts);
+        return finish(&machine, status);
     }
 
     // A machine that opened a character port has a console; attach this
@@ -509,7 +511,10 @@ fn run(args: &[String]) -> ExitCode {
             eprintln!("rsemu: {e}");
             return ExitCode::from(2);
         }
-        Ok(Some(port)) => return interact(&mut machine, &port, &parsed),
+        Ok(Some(port)) => {
+            let status = interact(&mut machine, &port, &parsed);
+            return finish(&machine, status);
+        }
         Ok(None) => {}
     }
 
@@ -518,7 +523,7 @@ fn run(args: &[String]) -> ExitCode {
         summarise(&machine);
         write_screenshot(&parsed, &options.realize.hosts);
         write_recording(&parsed, &options.realize.hosts);
-        return ExitCode::FAILURE;
+        return finish(&machine, ExitCode::FAILURE);
     }
     summarise(&machine);
     // Both, always: a `--screenshot` that failed must not be the reason a
@@ -526,9 +531,35 @@ fn run(args: &[String]) -> ExitCode {
     let drew = write_screenshot(&parsed, &options.realize.hosts);
     let played = write_recording(&parsed, &options.realize.hosts);
     if !drew || !played {
-        return ExitCode::FAILURE;
+        return finish(&machine, ExitCode::FAILURE);
     }
-    ExitCode::SUCCESS
+    finish(&machine, ExitCode::SUCCESS)
+}
+
+/// End a run: push what the guest wrote out to the host, and report.
+///
+/// **Every way out of a run goes through here**, including the failing ones. A
+/// guest that was never asked to flush has promised nothing, and a drive is
+/// entitled to hold a write in its cache — but that entitlement lasts as long
+/// as the machine does, and when the process exits there is nobody left to
+/// write those bytes. On a qcow2 it is worse than staleness: the data cluster
+/// and the L2 entry that finds it are both in the image, and losing one of them
+/// leaves a hole where a sector used to be.
+///
+/// A machine that crashed still flushes. What the guest managed to write before
+/// it died is not made better by throwing it away, and `--drive` is how a user
+/// asked for a disk that outlives the run.
+///
+/// A flush failure turns a successful run into a failing exit, because the run
+/// did not do what the user asked: the bytes are not on disk.
+fn finish(machine: &Machine, status: ExitCode) -> ExitCode {
+    match machine.flush() {
+        Ok(()) => status,
+        Err(e) => {
+            eprintln!("rsemu: flushing at exit: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Wrap the machine's bindings so a display or audio device hands the host a

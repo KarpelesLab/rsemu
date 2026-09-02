@@ -643,6 +643,13 @@ impl Device for Nvme {
         self.regs.bars.sync(self.regs.command(), true);
     }
 
+    fn flush(&self) -> Result<()> {
+        // What a shutdown notification through `CC.SHN` would have done, and
+        // for the same reason a drive's does: the guest is not obliged to ask,
+        // and the write it made still happened.
+        self.ctrl.namespace().flush()
+    }
+
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
         // The namespace first, on the terms the medium itself sets — the same
         // three policies an ATA drive's platter offers, and for the same

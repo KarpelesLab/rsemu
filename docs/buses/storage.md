@@ -317,6 +317,16 @@ libata driver was opened.**
   expects durability; a snapshot taken mid-write must restore to a consistent
   state. Decide the write-back cache semantics before writing the first
   controller, not after.
+- **And the run itself ends with a flush**, whether or not the guest asked for
+  one — `Machine::flush`, backed by `Device::flush`, and the CLI runs it on
+  every way out of a run including the failing ones. A guest that never issued
+  FLUSH CACHE has been promised nothing and the drive is entitled to hold the
+  write; that entitlement lasts exactly as long as the machine does, and when
+  the process exits nobody is left to write those bytes. Linux makes this easy
+  to hit: it writes a bare block device's dirty pages back on `sync(2)` but
+  issues the device flush from `blkdev_fsync`, so `dd` without `conv=fsync`
+  leaves a qcow2 with the data cluster written and the L2 entry that finds it
+  still in the image's cache — a hole, not merely a stale sector.
 - I/O runs on the task pool, with completions delivered through the event queue
   at guest-derived virtual times (`ROADMAP.md` §4.7).
 - `fstool`'s `crash_inject` block device gives guest-filesystem robustness
