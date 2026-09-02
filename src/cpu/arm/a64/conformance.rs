@@ -181,24 +181,33 @@ enum Outcome {
     Skipped(String),
 }
 
-/// Load and run one built guest.
-fn run_one(path: &Path, cfg: Config) -> Outcome {
+/// Load and run one built guest, reporting what it did and how much of the
+/// machine it moved.
+///
+/// The second number is not decoration. `docs/testing/README.md` records the
+/// mistake this directory has already made once: a ratio on its own cannot
+/// tell a clean run from a run that measured nothing, and a guest whose body
+/// was optimised away reports success just as loudly as one that ran.
+fn run_one(path: &Path, cfg: Config) -> (Outcome, u64) {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
-        Err(e) => return Outcome::Skipped(format!("unreadable: {e}")),
+        Err(e) => return (Outcome::Skipped(format!("unreadable: {e}")), 0),
     };
     let elf = match Elf::parse(&bytes) {
         Ok(e) => e,
-        Err(e) => return Outcome::Skipped(e.to_string()),
+        Err(e) => return (Outcome::Skipped(e.to_string()), 0),
     };
 
     let ram = Arc::new(RamStore::new(RAM_SIZE));
     for segment in &elf.segments {
         if segment.addr < RAM_BASE || segment.addr + segment.mem_len > RAM_BASE + RAM_SIZE {
-            return Outcome::Skipped(format!(
-                "segment at {:#x} does not fit in RAM",
-                segment.addr
-            ));
+            return (
+                Outcome::Skipped(format!(
+                    "segment at {:#x} does not fit in RAM",
+                    segment.addr
+                )),
+                0,
+            );
         }
         let at = segment.addr - RAM_BASE;
         ram.write_at(at, &segment.bytes).expect("in range");
@@ -237,9 +246,9 @@ fn run_one(path: &Path, cfg: Config) -> Outcome {
         let Some(exit) = run.exit else {
             continue;
         };
-        return classify(&cpu, &exit);
+        return (classify(&cpu, &exit), used);
     }
-    Outcome::Timeout { pc: cpu.pc() }
+    (Outcome::Timeout { pc: cpu.pc() }, used)
 }
 
 /// Turn the exit a guest produced into an outcome.
@@ -333,6 +342,7 @@ fn a64_conformance() {
     let mut passed = Vec::new();
     let mut failures = Vec::new();
     let mut skipped = 0usize;
+    let mut charged = 0u64;
 
     for path in &entries {
         let name = path
@@ -344,15 +354,16 @@ fn a64_conformance() {
         {
             continue;
         }
-        let outcome = run_one(path, cfg);
+        let (outcome, accesses) = run_one(path, cfg);
         if let Outcome::Skipped(why) = &outcome {
             skipped += 1;
             println!("skipped {name}: {why}");
             continue;
         }
+        charged += accesses;
         match outcome.failure() {
             None => {
-                println!("pass {name}");
+                println!("pass {name} ({accesses} bus accesses)");
                 passed.push(name);
             }
             Some(why) => {
@@ -363,7 +374,8 @@ fn a64_conformance() {
     }
 
     println!(
-        "a64 conformance: {} passed, {} failed, {skipped} skipped",
+        "a64 conformance: {} passed, {} failed, {skipped} skipped, \
+         {charged} bus accesses charged",
         passed.len(),
         failures.len()
     );
@@ -371,6 +383,13 @@ fn a64_conformance() {
         !passed.is_empty() || !failures.is_empty(),
         "no guest binaries under {} — did the build script run?",
         dir.display()
+    );
+    // A guest that reported success without executing anything is the failure
+    // mode a pass count cannot see.
+    assert!(
+        charged > 100_000 || !failures.is_empty(),
+        "the suite passed having charged only {charged} bus accesses, \
+         which is too few to have run anything"
     );
 
     // The ledger, both ways round.

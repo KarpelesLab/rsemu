@@ -258,7 +258,10 @@ expectations from outside this project:
 | `RSEMU_A64_TESTS=/path` | where the built guests are; without it the test prints how to build them and passes |
 | `RSEMU_A64_TESTS_ONLY=fp_arith,memory` | run only the guests whose name contains one of these |
 
-**6 of 6** as of the commit that added floating point, with an empty ledger.
+**6 of 6** as of the commit that added floating point, with an empty ledger,
+over 243 949 charged bus accesses. The runner prints that number per guest and
+asserts the total is non-zero: a pass count on its own cannot tell a clean run
+from a guest whose body was optimised away.
 The ledger is a `const` list in `src/cpu/arm/a64/conformance.rs` rather than a
 file under `ledgers/`, because this suite's runner lives in the crate beside
 the core it measures; it is enforced both ways round like every other one here.
