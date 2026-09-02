@@ -521,14 +521,14 @@ fn run(args: &[String]) -> ExitCode {
     if let Err(e) = machine.run_for(parsed.span) {
         eprintln!("rsemu: {e}");
         summarise(&machine);
-        write_screenshot(&parsed, &options.realize.hosts);
+        write_screenshot(&parsed, &options.realize.hosts, &machine);
         write_recording(&parsed, &options.realize.hosts);
         return finish(&machine, ExitCode::FAILURE);
     }
     summarise(&machine);
     // Both, always: a `--screenshot` that failed must not be the reason a
     // recording is silently skipped.
-    let drew = write_screenshot(&parsed, &options.realize.hosts);
+    let drew = write_screenshot(&parsed, &options.realize.hosts, &machine);
     let played = write_recording(&parsed, &options.realize.hosts);
     if !drew || !played {
         return finish(&machine, ExitCode::FAILURE);
@@ -671,6 +671,8 @@ fn install_capture(
     rsemu::host::display::gb::capture::install(options)?;
     #[cfg(feature = "dev-sms")]
     rsemu::host::display::sms::capture::install(options)?;
+    #[cfg(feature = "dev-lcdc")]
+    rsemu::host::display::lcd::capture::install(options)?;
     #[cfg(feature = "dev-nes-apu")]
     rsemu::host::audio::nes::capture::install(options, ring_for(args))?;
     Ok(())
@@ -715,12 +717,23 @@ fn ring_for(args: &RunArgs) -> u64 {
 /// constructors left their handles — one table per build, so this can only
 /// return this machine's screen.
 ///
+/// `machine` is here for the one adapter that cannot answer without it. A
+/// generic `lcd.scanout` engine does not know its own frame rate: the rate is a
+/// property of the clock forest rather than of the device, and a device cannot
+/// reach the forest from `&self`. So the realized machine is handed in and
+/// `lcd::capture::take` resolves the domain's exact rational frequency out of it
+/// (`host::display::lcd`). Every other adapter ignores it, which is why it is
+/// `unused_variables` on a build with none of them.
+///
 /// Only the PNG path calls it, so a build without an encoder has no use for it
 /// — and the compiler is right to say so rather than being told to be quiet
 /// about a function that might one day be called.
 #[cfg(any(feature = "display-png", feature = "vnc"))]
 #[allow(unused_variables)]
-fn take_scanout(hosts: &HostObjects) -> Option<Box<dyn rsemu::host::display::Scanout>> {
+fn take_scanout(
+    hosts: &HostObjects,
+    machine: &Machine,
+) -> Option<Box<dyn rsemu::host::display::Scanout>> {
     #[cfg(feature = "dev-pc-video")]
     if let Some(s) = rsemu::host::display::pc::capture::take(hosts) {
         return Some(Box::new(s));
@@ -737,6 +750,13 @@ fn take_scanout(hosts: &HostObjects) -> Option<Box<dyn rsemu::host::display::Sca
     if let Some(s) = rsemu::host::display::sms::capture::take_vdp(hosts) {
         return Some(Box::new(s));
     }
+    // Last, because it is the generic one: a board with a console's own video
+    // chip *and* an `lcd.scanout` engine is showing the console, and the engine
+    // is whatever else it happens to have.
+    #[cfg(feature = "dev-lcdc")]
+    if let Some(s) = rsemu::host::display::lcd::capture::take(hosts, machine) {
+        return Some(Box::new(s));
+    }
     None
 }
 
@@ -746,20 +766,20 @@ fn take_scanout(hosts: &HostObjects) -> Option<Box<dyn rsemu::host::display::Sca
 /// Returns true when nothing was asked for. A `--screenshot` that could not be
 /// honoured is an error rather than a silence: the user asked for a file and
 /// there has to be one, or a reason.
-fn write_screenshot(args: &RunArgs, hosts: &HostObjects) -> bool {
+fn write_screenshot(args: &RunArgs, hosts: &HostObjects, machine: &Machine) -> bool {
     let Some(path) = args.screenshot.as_deref() else {
         return true;
     };
     #[cfg(not(feature = "display-png"))]
     {
-        let _ = (path, hosts);
+        let _ = (path, hosts, machine);
         eprintln!("rsemu: --screenshot needs a build with the `display-png` feature");
         false
     }
     #[cfg(feature = "display-png")]
     {
         use rsemu::host::display::{Surface, png};
-        let Some(scanout) = take_scanout(hosts) else {
+        let Some(scanout) = take_scanout(hosts, machine) else {
             eprintln!("rsemu: --screenshot: this machine has no display");
             return false;
         };
@@ -1109,7 +1129,7 @@ fn vnc_session(machine: &mut Machine, args: &RunArgs, hosts: &HostObjects) -> Ex
     use rsemu::host::vnc::{VncServer, VncSession};
 
     let addr = args.vnc.as_deref().unwrap_or(":5900");
-    let Some(scanout) = take_scanout(hosts) else {
+    let Some(scanout) = take_scanout(hosts, machine) else {
         eprintln!("rsemu: --vnc: this machine has no display to serve");
         return ExitCode::from(2);
     };
