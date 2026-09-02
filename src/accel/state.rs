@@ -21,42 +21,70 @@
 //! | `GDTR`, `IDTR` | [`Sys::gdtr`], [`Sys::idtr`] | `kvm_sregs.gdt/idt` | **yes** |
 //! | `LDTR`, `TR`, with their caches | [`Sys::ldtr`], [`Sys::task`] | `kvm_sregs.ldt/tr` | **yes** |
 //! | `CR0`, `CR2`, `CR3`, `CR4`, `EFER` | [`Sys`] | `kvm_sregs` | **yes** |
+//! | `STAR`, `LSTAR`, `CSTAR`, `SFMASK`, `KERNEL_GS_BASE` | [`Sys`] | `KVM_GET_MSRS` | **yes** |
+//! | `DR0`–`DR3`, `DR6`, `DR7` | [`Sys::dr`] | `KVM_GET_DEBUGREGS` | **yes** |
+//! | the x87 file, control, status and tag words | [`X87`] | `KVM_GET_FPU` | **yes** |
+//! | `XMM0`–`XMM15` | [`Sse`] | `KVM_GET_FPU` | **yes** |
+//! | `MXCSR` | [`Sse::mxcsr`] | `KVM_GET_FPU` | **out of hardware only** |
+//! | `IA32_TSC` and the counter's rate | — | `KVM_GET_MSRS`, `KVM_GET_TSC_KHZ` | **carried, not applied** |
+//! | `CR8`, `apic_base` | — | `kvm_sregs` | **carried, not applied** |
 //!
 //! # What does not, and why — the honest list
 //!
-//! * **`CR8` and `apic_base`.** KVM has them; rsemu's [`Sys`] has neither,
-//!   because the local APIC is a *device* in this crate (`dev::pc::apic`) and
-//!   not part of the core's register file. Restoring an accelerated snapshot
-//!   into the interpreter therefore has to hand these to that device, and there
-//!   is no route from a core's state chunk to a sibling device's. Named in
-//!   phase 7's deliverable list as *"LAPIC/x2APIC state"* and genuinely not
-//!   done.
-//! * **The rest of the MSRs.** `KVM_GET_MSRS`/`KVM_SET_MSRS` are not
-//!   implemented here. rsemu keeps `STAR`, `LSTAR`, `CSTAR`, `SFMASK`,
-//!   `FS_BASE`, `GS_BASE` and `KERNEL_GS_BASE` in [`Sys`], and KVM keeps the
-//!   first four in MSRs rather than in `kvm_sregs`, so a 64-bit guest that has
-//!   armed `SYSCALL` **loses those four** across an engine switch. The two
-//!   `FS`/`GS` bases do survive, because KVM reports them as the `fs` and `gs`
-//!   segment *bases*, which is where the hardware keeps them.
-//! * **The x87 and SSE files.** `KVM_GET_FPU`/`KVM_GET_XSAVE` are not
-//!   implemented; rsemu has [`fpu::X87`](crate::cpu::x86::fpu::X87) and
-//!   [`fpu::Sse`](crate::cpu::x86::fpu::Sse) waiting for them. Phase 7 names
-//!   *"the XSAVE area"* for the same reason.
-//! * **The TSC offset**, and with it any guest that reads `RDTSC` and expects
-//!   monotonicity across the switch.
-//! * **`DR0`–`DR7`**, which rsemu has and `kvm_sregs` does not carry.
+//! * **`CR8`.** It is the local APIC's task-priority register seen through the
+//!   processor, and in this crate the local APIC is a *device*
+//!   (`dev::pc::apic`), not part of the core's register file. [`ArchState`]
+//!   therefore **carries** the value rather than dropping it, and
+//!   [`tpr_through_space`] is the one honest route into the device: the APIC's
+//!   register page is mapped by the machine file, so writing `CR8 << 4` to
+//!   offset `0x80` of that page is a driver doing what a driver does. That is
+//!   deliberately not automatic — this module does not know where a board put
+//!   its APIC.
+//! * **`apic_base`.** Also the device's, and here the crate *does* have a seam:
+//!   [`LocalController::base_register`](crate::core::wire::LocalController::base_register)
+//!   is exactly a route from a core to the sibling that owns `IA32_APIC_BASE`,
+//!   and `X86` already forwards `RDMSR`/`WRMSR` of it through that link. What
+//!   is missing is not the route but a *holder*: `store_from_vcpu` is handed a
+//!   core and a vCPU and has no third party to ask. [`ArchState`] carries the
+//!   value so that a caller who has the link can apply it.
+//! * **The TSC.** [`ArchState::tsc`] carries `IA32_TSC` and
+//!   [`Vm::tsc_khz`](super::kvm::Vm::tsc_khz) the rate, but the interpreter's
+//!   counter is its own retired-cycle count — a different quantity in a
+//!   different unit — and there is no public setter for it. Writing one is a
+//!   change to `cpu::x86`, so what is here is the carrying half.
+//! * **`MXCSR`, in the *into*-hardware direction.** `KVM_GET_FPU` reports it
+//!   and `KVM_SET_FPU` does not write it — the kernel's set path fills the
+//!   `fxsave` legacy area field by field and that one field is not among them.
+//!   Measured, not assumed: `the_syscall_msrs_the_debug_registers_and_the_fpu_survive_hardware`
+//!   sets it, reads it back, and finds it unchanged, which is why
+//!   [`differs`] excludes it. A guest restored *onto* an accelerator therefore
+//!   keeps whatever rounding mode and exception masks the vCPU already had.
+//!   `KVM_SET_XSAVE` would carry it and is a larger transcription — a
+//!   deliverable, named here rather than discovered later.
+//! * **`XSAVE` beyond x87 and SSE.** `KVM_GET_FPU` is used rather than
+//!   `KVM_GET_XSAVE` because the interpreter models exactly the state
+//!   `kvm_fpu` holds: there is no AVX file in `cpu::x86` for a `YMM` half to
+//!   land in. When there is one, the ioctl changes and this note goes with it.
+//! * **The x87 last-instruction selectors.** `kvm_fpu` carries `last_ip` and
+//!   `last_dp` but not the `CS` and `DS` that went with them, so
+//!   [`X87::last_cs`] and [`X87::last_ds`] are preserved from the destination
+//!   rather than transferred. Only `FNSTENV` in a 16- or 32-bit form can
+//!   observe the difference.
 //!
-//! Each of those is an `ioctl` and a transcribed structure away, and each is a
-//! *deliverable* rather than something that falls out of this one. What is
-//! here is the part the phase-7 gate's first sentence needs and the part a
-//! 16- or 32-bit guest needs entirely.
+//! [`X87`]: crate::cpu::x86::fpu::X87
+//! [`Sse`]: crate::cpu::x86::fpu::Sse
+//! [`Sse::mxcsr`]: crate::cpu::x86::fpu::Sse::mxcsr
+//! [`X87::last_cs`]: crate::cpu::x86::fpu::X87::last_cs
+//! [`X87::last_ds`]: crate::cpu::x86::fpu::X87::last_ds
 
+use crate::cpu::x86::fpu::{Sse, Tag, X87};
 use crate::cpu::x86::isa::seg;
-use crate::cpu::x86::prot::{SegReg, Sys, TableReg, ar};
+use crate::cpu::x86::prot::{SegReg, Sys, TableReg, ar, msr};
 use crate::cpu::x86::{Regs, X86};
+use crate::float::x87::F80;
 
 use super::AccelResult;
-use super::kvm::{KvmDtable, KvmRegs, KvmSegment, KvmSregs, Vcpu};
+use super::kvm::{KvmDebugregs, KvmDtable, KvmFpu, KvmRegs, KvmSegment, KvmSregs, Vcpu};
 
 // ---------------------------------------------------------------------------
 // registers
@@ -264,6 +292,222 @@ pub fn sregs_to_sys(kvm: &KvmSregs, base: &Sys) -> Sys {
 }
 
 // ---------------------------------------------------------------------------
+// model-specific registers
+// ---------------------------------------------------------------------------
+
+/// The model-specific registers rsemu keeps in [`Sys`] that `kvm_sregs` does
+/// not carry, in the order the two functions below use.
+///
+/// `EFER` is not here because it *is* in `kvm_sregs`, and `FS_BASE`/`GS_BASE`
+/// are not because KVM reports them as the `fs` and `gs` segment bases — which
+/// is where the hardware actually keeps them, and carrying them twice would
+/// let the two copies disagree.
+pub const CARRIED_MSRS: [u32; 5] = [
+    msr::STAR,
+    msr::LSTAR,
+    msr::CSTAR,
+    msr::SFMASK,
+    msr::KERNEL_GS_BASE,
+];
+
+/// The values of [`CARRIED_MSRS`], read out of the interpreter.
+#[must_use]
+pub fn msrs_to_kvm(sys: &Sys) -> [(u32, u64); 5] {
+    [
+        (msr::STAR, sys.star),
+        (msr::LSTAR, sys.lstar),
+        (msr::CSTAR, sys.cstar),
+        (msr::SFMASK, sys.sfmask),
+        (msr::KERNEL_GS_BASE, sys.kernel_gs_base),
+    ]
+}
+
+/// The same, in reverse: put the values of [`CARRIED_MSRS`] into `sys`.
+pub fn msrs_from_kvm(values: &[u64; 5], sys: &mut Sys) {
+    sys.star = values[0];
+    sys.lstar = values[1];
+    sys.cstar = values[2];
+    sys.sfmask = values[3];
+    sys.kernel_gs_base = values[4];
+}
+
+// ---------------------------------------------------------------------------
+// debug registers
+// ---------------------------------------------------------------------------
+
+/// The interpreter's debug registers as `kvm_debugregs`.
+///
+/// `DR4` and `DR5` have no field because they have no existence: with `CR4.DE`
+/// clear they alias `DR6` and `DR7`, and with it set they raise `#UD`. rsemu
+/// stores eight for the index arithmetic's sake; only six are state.
+#[must_use]
+pub fn dregs_to_kvm(sys: &Sys) -> KvmDebugregs {
+    KvmDebugregs {
+        db: [sys.dr[0], sys.dr[1], sys.dr[2], sys.dr[3]],
+        dr6: sys.dr[6],
+        dr7: sys.dr[7],
+        flags: 0,
+        reserved: [0; 9],
+    }
+}
+
+/// The same, in reverse.
+pub fn dregs_from_kvm(kvm: &KvmDebugregs, sys: &mut Sys) {
+    sys.dr[0] = kvm.db[0];
+    sys.dr[1] = kvm.db[1];
+    sys.dr[2] = kvm.db[2];
+    sys.dr[3] = kvm.db[3];
+    sys.dr[6] = kvm.dr6;
+    sys.dr[7] = kvm.dr7;
+}
+
+// ---------------------------------------------------------------------------
+// the x87 and SSE files
+// ---------------------------------------------------------------------------
+
+/// The interpreter's floating-point state as `kvm_fpu`.
+///
+/// The tag word is **abridged** on the way out: `FXSAVE`'s format is one bit
+/// per physical register, set when the register is not empty, and the
+/// two-bit-per-register word rsemu keeps is what `FNSTENV` writes (*Intel SDM*
+/// volume 1 §8.1.7). Nothing is lost going this way — the discarded
+/// valid/zero/special distinction is recomputable from the register itself,
+/// which is exactly what [`fpu_from_kvm`] does and what `FXRSTOR` does in
+/// hardware.
+#[must_use]
+pub fn fpu_to_kvm(x87: &X87, sse: &Sse) -> KvmFpu {
+    let mut fpu = KvmFpu {
+        fcw: x87.control,
+        fsw: x87.status,
+        ftwx: 0,
+        last_opcode: x87.last_op & 0x7ff,
+        last_ip: x87.last_ip,
+        last_dp: x87.last_dp,
+        mxcsr: sse.mxcsr,
+        ..KvmFpu::default()
+    };
+    for i in 0..8 {
+        fpu.fpr[i][..10].copy_from_slice(&x87.regs[i].to_bytes());
+        if Tag::from_bits(x87.tag >> (2 * i)) != Tag::Empty {
+            fpu.ftwx |= 1 << i;
+        }
+    }
+    for i in 0..16 {
+        fpu.xmm[i][..8].copy_from_slice(&sse.xmm[i][0].to_le_bytes());
+        fpu.xmm[i][8..].copy_from_slice(&sse.xmm[i][1].to_le_bytes());
+    }
+    fpu
+}
+
+/// `kvm_fpu` as the interpreter's floating-point state.
+///
+/// `base` supplies the two fields `kvm_fpu` has no room for — the code and data
+/// selectors that went with `last_ip` and `last_dp` — for the same reason
+/// [`sregs_to_sys`] takes one.
+#[must_use]
+pub fn fpu_from_kvm(kvm: &KvmFpu, base: &X87) -> (X87, Sse) {
+    let mut x87 = X87 {
+        regs: [F80::ZERO; 8],
+        control: kvm.fcw,
+        status: kvm.fsw,
+        tag: 0,
+        last_ip: kvm.last_ip,
+        last_cs: base.last_cs,
+        last_dp: kvm.last_dp,
+        last_ds: base.last_ds,
+        last_op: kvm.last_opcode & 0x7ff,
+    };
+    for i in 0..8 {
+        let mut bytes = [0u8; 10];
+        bytes.copy_from_slice(&kvm.fpr[i][..10]);
+        x87.regs[i] = F80::from_bytes(bytes);
+        // The abridged word says only *empty or not*. A register that is not
+        // empty gets its full tag recomputed from its own encoding, which is
+        // what `FXRSTOR` does; one that is empty keeps the encoding it had, as
+        // hardware does — an empty register still holds bits.
+        let tag = if kvm.ftwx & (1 << i) == 0 {
+            Tag::Empty
+        } else {
+            Tag::of(x87.regs[i])
+        };
+        x87.tag |= tag.bits() << (2 * i);
+    }
+    let mut sse = Sse {
+        xmm: [[0; 2]; 16],
+        mxcsr: kvm.mxcsr,
+    };
+    for i in 0..16 {
+        let mut lo = [0u8; 8];
+        let mut hi = [0u8; 8];
+        lo.copy_from_slice(&kvm.xmm[i][..8]);
+        hi.copy_from_slice(&kvm.xmm[i][8..]);
+        sse.xmm[i] = [u64::from_le_bytes(lo), u64::from_le_bytes(hi)];
+    }
+    (x87, sse)
+}
+
+// ---------------------------------------------------------------------------
+// the local APIC's task priority, which is what CR8 is
+// ---------------------------------------------------------------------------
+
+/// Byte offset of the task-priority register within a local APIC's page.
+///
+/// *Intel SDM* volume 3A §10.4.4, table 10-1.
+pub const APIC_TPR: u64 = 0x80;
+
+/// Write `cr8` into a local APIC's task-priority register, through the address
+/// space the machine file mapped that APIC into.
+///
+/// **This is the route the module documentation says is missing**, made
+/// explicit rather than implied. `CR8` is not a register the core owns: it is
+/// the top four bits of the local APIC's TPR, reached by the processor over a
+/// dedicated path (SDM volume 3A §10.8.6.1). rsemu models the APIC as a
+/// device, so the only honest way to put a value into it is the way software
+/// does — a store to its register page. A caller that knows where its board put
+/// that page can therefore complete the transfer; this module cannot know, and
+/// does not guess.
+///
+/// # Errors
+///
+/// Whatever the address space says: a board with no APIC at `apic_base`, or one
+/// whose APIC is hardware-disabled, refuses the access rather than swallowing
+/// it.
+pub fn tpr_through_space(
+    space: &crate::core::space::AddressSpace,
+    apic_base: u64,
+    cr8: u8,
+) -> crate::core::space::MemResult {
+    space.write(
+        apic_base + APIC_TPR,
+        crate::core::Width::U32,
+        u64::from(cr8) << 4,
+        crate::core::space::MemAttrs::DEFAULT,
+    )
+}
+
+/// Read a local APIC's task-priority register back as a `CR8` value.
+///
+/// A **debug** access, so that sampling the priority cannot disturb the device
+/// — `CLAUDE.md` requires every MMIO device to honour that, and a state
+/// transfer is precisely a debugger-shaped read.
+///
+/// # Errors
+///
+/// Whatever the address space says.
+pub fn tpr_from_space(
+    space: &crate::core::space::AddressSpace,
+    apic_base: u64,
+) -> crate::core::space::MemResult<u8> {
+    let tpr = space.read(
+        apic_base + APIC_TPR,
+        crate::core::Width::U32,
+        crate::core::space::MemAttrs::DEBUG,
+    )?;
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(((tpr >> 4) & 0xf) as u8)
+}
+
+// ---------------------------------------------------------------------------
 // whole-core transfer
 // ---------------------------------------------------------------------------
 
@@ -288,14 +532,25 @@ pub fn overlay_sys(sys: &Sys, sregs: &mut KvmSregs) {
 
 /// Copy the interpreter's architectural state into a vCPU.
 ///
+/// Everything the table at the top of this module marks **yes**: the register
+/// file, the system state, the five carried MSRs, the debug registers and the
+/// x87/SSE files. What it does not carry is named there too.
+///
 /// # Errors
 ///
-/// [`AccelError::Sys`](super::AccelError::Sys) if any `ioctl` fails.
+/// [`AccelError::Sys`](super::AccelError::Sys) if any `ioctl` fails, and
+/// [`AccelError::Unsupported`](super::AccelError::Unsupported) if this host
+/// refuses one of the model-specific registers — which is a real difference
+/// between the two engines and is reported rather than dropped.
 pub fn load_into_vcpu(cpu: &X86, vcpu: &Vcpu) -> AccelResult<()> {
+    let sys = cpu.sys();
     let mut sregs = vcpu.sregs()?;
-    overlay_sys(&cpu.sys(), &mut sregs);
+    overlay_sys(&sys, &mut sregs);
     vcpu.set_sregs(&sregs)?;
     vcpu.set_regs(&regs_to_kvm(&cpu.regs()))?;
+    vcpu.set_msrs(msrs_to_kvm(&sys))?;
+    vcpu.set_debugregs(&dregs_to_kvm(&sys))?;
+    vcpu.set_fpu(&fpu_to_kvm(&cpu.x87(), &cpu.sse()))?;
     Ok(())
 }
 
@@ -310,6 +565,9 @@ pub fn load_into_vcpu(cpu: &X86, vcpu: &Vcpu) -> AccelResult<()> {
 pub fn store_from_vcpu(vcpu: &Vcpu, cpu: &X86) -> AccelResult<()> {
     let regs = vcpu.regs()?;
     let sregs = vcpu.sregs()?;
+    let msrs = vcpu.msrs(CARRIED_MSRS)?;
+    let dregs = vcpu.debugregs()?;
+    let fpu = vcpu.fpu()?;
     // Registers first, system state second, and the order is load-bearing:
     // [`X86::set_regs`] recomputes the segment caches from the selectors when
     // the core is in real mode, which is right for a debugger writing `CS` and
@@ -318,7 +576,13 @@ pub fn store_from_vcpu(vcpu: &Vcpu, cpu: &X86) -> AccelResult<()> {
     // `selector << 4` cannot express. Letting `set_sys` land last keeps the
     // authoritative copy.
     cpu.set_regs(regs_from_kvm(&regs, &sregs));
-    cpu.set_sys(sregs_to_sys(&sregs, &cpu.sys()));
+    let mut sys = sregs_to_sys(&sregs, &cpu.sys());
+    msrs_from_kvm(&msrs, &mut sys);
+    dregs_from_kvm(&dregs, &mut sys);
+    cpu.set_sys(sys);
+    let (x87, sse) = fpu_from_kvm(&fpu, &cpu.x87());
+    cpu.set_x87(x87);
+    cpu.set_sse(sse);
     Ok(())
 }
 
@@ -357,7 +621,30 @@ pub fn differs(vcpu: &Vcpu, cpu: &X86) -> AccelResult<Option<&'static str>> {
     if sregs.gdt != our_sregs.gdt || sregs.idt != our_sregs.idt {
         return Ok(Some("a descriptor table register"));
     }
+    let sys = cpu.sys();
+    if vcpu.msrs(CARRIED_MSRS)? != msrs_to_kvm(&sys).map(|(_, data)| data) {
+        return Ok(Some("a model-specific register"));
+    }
+    if vcpu.debugregs()? != dregs_to_kvm(&sys) {
+        return Ok(Some("a debug register"));
+    }
+    if comparable(vcpu.fpu()?) != comparable(fpu_to_kvm(&cpu.x87(), &cpu.sse())) {
+        return Ok(Some("the floating-point state"));
+    }
     Ok(None)
+}
+
+/// A `kvm_fpu` with the fields that cannot be compared removed.
+///
+/// `MXCSR` because `KVM_SET_FPU` does not write it (see the module
+/// documentation), so a loaded state and the accelerator's will legitimately
+/// disagree there and reporting it would make [`differs`] cry wolf on every
+/// call. The padding because it is padding.
+fn comparable(mut fpu: KvmFpu) -> KvmFpu {
+    fpu.mxcsr = 0;
+    fpu.pad1 = 0;
+    fpu.pad2 = 0;
+    fpu
 }
 
 /// The state this module knows how to carry, as a plain value.
@@ -370,7 +657,26 @@ pub struct ArchState {
     pub regs: KvmRegs,
     /// Segments, descriptor tables and control registers.
     pub sregs: KvmSregs,
+    /// The values of [`CARRIED_MSRS`], in that order.
+    pub msrs: [u64; 5],
+    /// `DR0`-`DR3`, `DR6`, `DR7`.
+    pub dregs: KvmDebugregs,
+    /// The x87 and SSE files.
+    pub fpu: KvmFpu,
+    /// `IA32_TSC` as the accelerator reported it, and the rate it advances at
+    /// in kHz.
+    ///
+    /// **Carried, not applied.** The interpreter's `RDTSC` reads its own
+    /// retired-cycle count, which is a different quantity in a different unit
+    /// and has no public setter. Dropping the value would be worse than
+    /// holding it: a caller that later gains somewhere to put it needs the
+    /// number to have survived the trip.
+    pub tsc: Option<(u64, u64)>,
 }
+
+/// `IA32_TSC`, read separately from [`CARRIED_MSRS`] because it is the one
+/// value in this module that no engine can *apply* to the other.
+const TSC_MSR: [u32; 1] = [msr::TSC];
 
 impl ArchState {
     /// Read it out of a vCPU.
@@ -382,16 +688,51 @@ impl ArchState {
         Ok(ArchState {
             regs: vcpu.regs()?,
             sregs: vcpu.sregs()?,
+            msrs: vcpu.msrs(CARRIED_MSRS)?,
+            dregs: vcpu.debugregs()?,
+            fpu: vcpu.fpu()?,
+            tsc: vcpu.msrs(TSC_MSR).ok().map(|v| (v[0], 0)),
         })
     }
 
     /// Read it out of the interpreter.
+    ///
+    /// [`tsc`](ArchState::tsc) comes back `None`: the interpreter's counter is
+    /// its retired-cycle count, not a time-stamp counter with an offset, and
+    /// reporting one as the other is exactly the kind of quiet lie this module
+    /// exists to avoid.
     #[must_use]
     pub fn from_interpreter(cpu: &X86) -> ArchState {
+        let sys = cpu.sys();
         ArchState {
             regs: regs_to_kvm(&cpu.regs()),
-            sregs: sys_to_sregs(&cpu.sys()),
+            sregs: sys_to_sregs(&sys),
+            msrs: msrs_to_kvm(&sys).map(|(_, data)| data),
+            dregs: dregs_to_kvm(&sys),
+            fpu: fpu_to_kvm(&cpu.x87(), &cpu.sse()),
+            tsc: None,
         }
+    }
+
+    /// The value `CR8` had on the accelerator, for a caller that has a route
+    /// into the board's local APIC — see [`tpr_through_space`].
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn cr8(&self) -> u8 {
+        (self.sregs.cr8 & 0xf) as u8
+    }
+
+    /// `IA32_APIC_BASE` as the accelerator had it.
+    ///
+    /// The crate does have a seam for this —
+    /// [`LocalController::set_base_register`](crate::core::wire::LocalController::set_base_register),
+    /// which `X86` already forwards `WRMSR` through — so a caller holding that
+    /// link can complete the transfer. This type carries the value because
+    /// [`store_from_vcpu`] is handed a core and a vCPU and has no third party
+    /// to hand it to.
+    #[must_use]
+    pub const fn apic_base(&self) -> u64 {
+        self.sregs.apic_base
     }
 
     /// Write it into a vCPU.
@@ -411,7 +752,11 @@ impl ArchState {
         sregs.apic_base = keep.1;
         sregs.interrupt_bitmap = keep.2;
         vcpu.set_sregs(&sregs)?;
-        vcpu.set_regs(&self.regs)
+        vcpu.set_regs(&self.regs)?;
+        let values: [(u32, u64); 5] = core::array::from_fn(|i| (CARRIED_MSRS[i], self.msrs[i]));
+        vcpu.set_msrs(values)?;
+        vcpu.set_debugregs(&self.dregs)?;
+        vcpu.set_fpu(&self.fpu)
     }
 
     /// Write it into the interpreter.
@@ -420,7 +765,13 @@ impl ArchState {
     /// that order matters.
     pub fn into_interpreter(self, cpu: &X86) {
         cpu.set_regs(regs_from_kvm(&self.regs, &self.sregs));
-        cpu.set_sys(sregs_to_sys(&self.sregs, &cpu.sys()));
+        let mut sys = sregs_to_sys(&self.sregs, &cpu.sys());
+        msrs_from_kvm(&self.msrs, &mut sys);
+        dregs_from_kvm(&self.dregs, &mut sys);
+        cpu.set_sys(sys);
+        let (x87, sse) = fpu_from_kvm(&self.fpu, &cpu.x87());
+        cpu.set_x87(x87);
+        cpu.set_sse(sse);
     }
 }
 
@@ -580,6 +931,197 @@ mod tests {
         let back = sregs_to_sys(&sys_to_sregs(&sys), &Sys::reset());
         assert_eq!(back.fs_base, 0x7fff_0000_0000);
         assert_eq!(back.gs_base, 0x7fff_0000_1000);
+    }
+
+    #[test]
+    fn the_carried_msrs_round_trip() {
+        // The four `SYSCALL` registers plus `KERNEL_GS_BASE`: the set a 64-bit
+        // guest loses across an engine switch if this does not work, with the
+        // symptom being a kernel entry that jumps to zero.
+        let mut sys = Sys::reset();
+        sys.star = 0x0023_0010_0000_0000;
+        sys.lstar = 0xffff_8000_0010_0000;
+        sys.cstar = 0xffff_8000_0010_1000;
+        sys.sfmask = 0x0000_0000_0004_7700;
+        sys.kernel_gs_base = 0xffff_8880_0000_0000;
+
+        let pairs = msrs_to_kvm(&sys);
+        assert_eq!(
+            pairs.map(|(index, _)| index),
+            CARRIED_MSRS,
+            "the order the two functions agree on is the array's"
+        );
+        let mut back = Sys::reset();
+        msrs_from_kvm(&pairs.map(|(_, data)| data), &mut back);
+        assert_eq!(back.star, sys.star);
+        assert_eq!(back.lstar, sys.lstar);
+        assert_eq!(back.cstar, sys.cstar);
+        assert_eq!(back.sfmask, sys.sfmask);
+        assert_eq!(back.kernel_gs_base, sys.kernel_gs_base);
+    }
+
+    #[test]
+    fn the_debug_registers_round_trip_and_dr4_dr5_are_not_invented() {
+        let mut sys = Sys::reset();
+        sys.dr = [
+            0x1000,
+            0x2000,
+            0x3000,
+            0x4000,
+            0,
+            0,
+            0xffff_0ff0,
+            0x0000_0405,
+        ];
+        let kvm = dregs_to_kvm(&sys);
+        assert_eq!(kvm.db, [0x1000, 0x2000, 0x3000, 0x4000]);
+        assert_eq!(kvm.dr6, 0xffff_0ff0);
+        assert_eq!(kvm.dr7, 0x0000_0405);
+        assert_eq!(kvm.flags, 0);
+
+        let mut back = Sys::reset();
+        back.dr[4] = 0xdead;
+        back.dr[5] = 0xbeef;
+        dregs_from_kvm(&kvm, &mut back);
+        assert_eq!(back.dr[0..4], sys.dr[0..4]);
+        assert_eq!(back.dr[6], sys.dr[6]);
+        assert_eq!(back.dr[7], sys.dr[7]);
+        // `DR4`/`DR5` are aliases and have no field in `kvm_debugregs`, so a
+        // restore must leave whatever was there rather than zeroing it.
+        assert_eq!(back.dr[4], 0xdead);
+        assert_eq!(back.dr[5], 0xbeef);
+    }
+
+    #[test]
+    fn the_x87_and_sse_files_round_trip() {
+        let mut x87 = X87::new();
+        // 2.0 in the extended format: biased exponent 0x4000, integer bit set.
+        x87.regs[0] = F80::new(0x4000, 1 << 63);
+        x87.regs[1] = F80::ZERO;
+        // Registers 0 and 1 hold values; the other six are empty (0b11).
+        x87.tag = Tag::Valid.bits() | (Tag::Zero.bits() << 2) | 0xfff0;
+        x87.control = 0x027f;
+        x87.status = 0x3800;
+        x87.last_ip = 0x0000_1234_5678_9abc;
+        x87.last_dp = 0x0000_0000_dead_beef;
+        x87.last_op = 0x1d9;
+        x87.last_cs = 0x0008;
+        x87.last_ds = 0x0010;
+
+        let mut sse = Sse::new();
+        for (i, reg) in sse.xmm.iter_mut().enumerate() {
+            *reg = [
+                0x0101_0101_0101_0100 + i as u64,
+                0x0202_0202_0202_0200 + i as u64,
+            ];
+        }
+        sse.mxcsr = 0x1f80;
+
+        let kvm = fpu_to_kvm(&x87, &sse);
+        assert_eq!(kvm.ftwx & 1, 1, "register 0 holds a value");
+        assert_eq!(kvm.ftwx & 2, 2, "and so does register 1, which holds zero");
+        assert_eq!(kvm.ftwx & 0xfc, 0, "the other six are empty");
+
+        let (back87, backsse) = fpu_from_kvm(&kvm, &x87);
+        assert_eq!(back87.regs, x87.regs);
+        assert_eq!(
+            back87.tag, x87.tag,
+            "the abridged word rebuilds the full one"
+        );
+        assert_eq!(back87.control, x87.control);
+        assert_eq!(back87.status, x87.status);
+        assert_eq!(back87.last_ip, x87.last_ip);
+        assert_eq!(back87.last_dp, x87.last_dp);
+        assert_eq!(back87.last_op, x87.last_op);
+        assert_eq!(backsse, sse);
+    }
+
+    #[test]
+    fn a_tag_that_disagrees_with_its_register_is_corrected_the_way_fxrstor_does() {
+        // The one place the translation is deliberately lossy: `FXSAVE` keeps
+        // one bit per register, so *valid* against *zero* against *special* is
+        // recomputed from the encoding rather than carried. A tag word that
+        // lied about its register comes back telling the truth — which is what
+        // the hardware does, and worth a test because it looks like a bug.
+        let mut x87 = X87::new();
+        x87.regs[0] = F80::ZERO;
+        x87.tag = Tag::Valid.bits(); // claims a normal number, holds zero
+        let (back, _) = fpu_from_kvm(&fpu_to_kvm(&x87, &Sse::new()), &x87);
+        assert_eq!(Tag::from_bits(back.tag), Tag::Zero);
+    }
+
+    #[test]
+    fn an_empty_register_keeps_its_bits() {
+        // An empty x87 register still holds an encoding, and `FXSAVE` writes
+        // it. Zeroing it on the way back would be visible to a guest that
+        // pops a register and then reloads the file.
+        let mut x87 = X87::new();
+        x87.regs[3] = F80::new(0x4000, 1 << 63);
+        x87.tag = 0xffff; // every register empty
+        let (back, _) = fpu_from_kvm(&fpu_to_kvm(&x87, &Sse::new()), &x87);
+        assert_eq!(back.tag, 0xffff);
+        assert_eq!(back.regs[3], x87.regs[3]);
+    }
+
+    #[test]
+    fn cr8_reaches_a_local_apic_the_only_way_a_device_can_be_reached() {
+        // The structural gap, closed as far as it can be: `CR8` is the local
+        // APIC's task-priority register, the APIC is a device, and a device is
+        // reached through the address space its registers are mapped into.
+        use crate::core::space::{
+            AccessConstraints, AddressSpace, MemAttrs, MemOps, MemResult, Region,
+        };
+        use crate::core::sync::Mutex;
+        use alloc::sync::Arc;
+
+        #[derive(Debug, Default)]
+        struct FakeApic {
+            tpr: Mutex<u32>,
+        }
+        impl MemOps for FakeApic {
+            fn read(&self, offset: u64, dst: &mut [u8], _attrs: MemAttrs) -> MemResult {
+                let value = if offset == APIC_TPR {
+                    *self.tpr.lock()
+                } else {
+                    0
+                };
+                for (i, b) in dst.iter_mut().enumerate() {
+                    *b = (value >> (8 * i)) as u8;
+                }
+                Ok(())
+            }
+            fn write(&self, offset: u64, src: &[u8], _attrs: MemAttrs) -> MemResult {
+                if offset == APIC_TPR {
+                    let mut value = 0u32;
+                    for (i, b) in src.iter().enumerate() {
+                        value |= u32::from(*b) << (8 * i);
+                    }
+                    *self.tpr.lock() = value;
+                }
+                Ok(())
+            }
+            fn constraints(&self) -> AccessConstraints {
+                AccessConstraints::ANY
+            }
+        }
+
+        let apic = Arc::new(FakeApic::default());
+        let space = AddressSpace::new("mem", 32);
+        space
+            .topology()
+            .map(
+                Arc::new(Region::io(
+                    "lapic",
+                    0x1000,
+                    Arc::clone(&apic) as Arc<dyn MemOps>,
+                )),
+                0xfee0_0000,
+            )
+            .expect("map the APIC page");
+
+        tpr_through_space(&space, 0xfee0_0000, 0x0b).expect("write TPR");
+        assert_eq!(*apic.tpr.lock(), 0xb0, "CR8 is the top nibble of the TPR");
+        assert_eq!(tpr_from_space(&space, 0xfee0_0000).expect("read TPR"), 0x0b);
     }
 
     #[test]

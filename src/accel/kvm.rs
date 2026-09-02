@@ -90,10 +90,9 @@ use core::mem::size_of;
 
 use crate::core::exec::{Access, Exit, ExitMask, ExitReason, ExitingCore, Run};
 use crate::core::sched::{Budget, Consumed, ExitFlag, ThreadingMode};
-use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
+use crate::core::space::{AddressSpace, HOST_PAGE, MemAttrs, RamStore, RequesterId, RomStore};
 use crate::core::sync::{LockRank, Mutex};
 
-use super::mem::HostPages;
 use super::sys::{self, Errno, Fd, PAGE_SIZE, SysResult};
 use super::{AccelError, AccelResult};
 
@@ -111,6 +110,9 @@ const DIR_NONE: u64 = 0;
 const DIR_WRITE: u64 = 1;
 /// `_IOC_READ`: the kernel fills a structure in.
 const DIR_READ: u64 = 2;
+/// `_IOC_READ | _IOC_WRITE`: userspace fills part of a structure in and the
+/// kernel fills the rest. `KVM_GET_MSRS` is the one request here that is both.
+const DIR_RW: u64 = DIR_READ | DIR_WRITE;
 
 /// The `_IOC` encoding from `asm-generic/ioctl.h`, for the "asm-generic"
 /// architectures — which x86, ARM and RISC-V all are.
@@ -165,6 +167,10 @@ const KVM_CREATE_VCPU: ReqVal = ReqVal(ioc(DIR_NONE, 0x41, 0));
 const KVM_SET_TSS_ADDR: ReqVal = ReqVal(ioc(DIR_NONE, 0x47, 0));
 /// `KVM_RUN`: enter the guest. No argument.
 const KVM_RUN: ReqVal = ReqVal(ioc(DIR_NONE, 0x80, 0));
+/// `KVM_GET_TSC_KHZ`: the frequency the guest's time-stamp counter advances
+/// at. The other half of what makes a `RDTSC` reading mean anything on the far
+/// side of an engine switch.
+const KVM_GET_TSC_KHZ: ReqVal = ReqVal(ioc(DIR_NONE, 0xa3, 0));
 
 /// `KVM_SET_USER_MEMORY_REGION`.
 const KVM_SET_USER_MEMORY_REGION: Req<KvmUserspaceMemoryRegion> = Req::new(ioc(
@@ -182,6 +188,38 @@ const KVM_SET_REGS: Req<KvmRegs> = Req::new(ioc(DIR_WRITE, 0x82, size_of::<KvmRe
 const KVM_GET_SREGS: Req<KvmSregs> = Req::new(ioc(DIR_READ, 0x83, size_of::<KvmSregs>() as u64));
 /// `KVM_SET_SREGS`.
 const KVM_SET_SREGS: Req<KvmSregs> = Req::new(ioc(DIR_WRITE, 0x84, size_of::<KvmSregs>() as u64));
+/// `KVM_INTERRUPT`: inject one vector, for a VM whose interrupt controller
+/// lives in userspace — which every board in this crate's does.
+const KVM_INTERRUPT: Req<KvmInterrupt> =
+    Req::new(ioc(DIR_WRITE, 0x86, size_of::<KvmInterrupt>() as u64));
+/// `KVM_GET_FPU`.
+const KVM_GET_FPU: Req<KvmFpu> = Req::new(ioc(DIR_READ, 0x8c, size_of::<KvmFpu>() as u64));
+/// `KVM_SET_FPU`.
+const KVM_SET_FPU: Req<KvmFpu> = Req::new(ioc(DIR_WRITE, 0x8d, size_of::<KvmFpu>() as u64));
+/// `KVM_GET_DEBUGREGS`.
+const KVM_GET_DEBUGREGS: Req<KvmDebugregs> =
+    Req::new(ioc(DIR_READ, 0xa1, size_of::<KvmDebugregs>() as u64));
+/// `KVM_SET_DEBUGREGS`.
+const KVM_SET_DEBUGREGS: Req<KvmDebugregs> =
+    Req::new(ioc(DIR_WRITE, 0xa2, size_of::<KvmDebugregs>() as u64));
+
+/// `KVM_GET_MSRS`, and `KVM_SET_MSRS` below it.
+///
+/// **The size in these two numbers is eight, not the size of the argument**,
+/// and that is the ABI rather than a mistake: `struct kvm_msrs` ends in a
+/// flexible array, so the `_IOC` size is the *header's* — two `__u32` — and
+/// the entry count in the header says how much more the kernel may touch.
+/// They are therefore plain `u64`s rather than [`Req`] values, because the
+/// invariant `Req` exists to carry (*the number names this exact type*) is not
+/// true of either.
+const KVM_GET_MSRS: u64 = ioc(DIR_RW, 0x88, 8);
+/// See [`KVM_GET_MSRS`].
+const KVM_SET_MSRS: u64 = ioc(DIR_WRITE, 0x89, 8);
+
+const _: () = assert!(
+    PAGE_SIZE == HOST_PAGE,
+    "core::space aligns its stores to a different page than this backend asks for"
+);
 
 /// `KVM_CAP_USER_MEMORY`: the memory-slot interface exists. Without it there
 /// is nothing to run out of.
@@ -190,9 +228,21 @@ pub const KVM_CAP_USER_MEMORY: u64 = 3;
 pub const KVM_CAP_SET_TSS_ADDR: u64 = 4;
 /// `KVM_CAP_NR_MEMSLOTS`: how many memory regions this VM may hold.
 pub const KVM_CAP_NR_MEMSLOTS: u64 = 10;
+/// `KVM_CAP_READONLY_MEM`: a memory slot may be marked read-only, so that a
+/// guest *write* to it leaves hardware as an MMIO exit while reads and
+/// **instruction fetches** are served straight from the host pages.
+///
+/// The capability firmware needs. KVM's instruction emulator declines to fetch
+/// through an MMIO exit, so a ROM that is not a slot is a board that cannot
+/// execute its own reset vector.
+pub const KVM_CAP_READONLY_MEM: u64 = 81;
 /// `KVM_CAP_IMMEDIATE_EXIT`: the signal-free way to decline to enter the
 /// guest. See the module documentation.
 pub const KVM_CAP_IMMEDIATE_EXIT: u64 = 136;
+
+/// `KVM_MEM_READONLY`, the flag that makes a slot's pages read-only to the
+/// guest.
+const KVM_MEM_READONLY: u32 = 1 << 1;
 
 /// The API version every kernel since 2.6.22 reports.
 pub const KVM_API_VERSION: i64 = 12;
@@ -334,6 +384,99 @@ pub struct KvmSregs {
 }
 const _: () = assert!(size_of::<KvmSregs>() == 312);
 
+/// `struct kvm_interrupt` — the vector to inject.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvmInterrupt {
+    /// The interrupt vector, 0-255.
+    pub irq: u32,
+}
+const _: () = assert!(size_of::<KvmInterrupt>() == 4);
+
+/// `struct kvm_fpu` — the x87 and SSE register files, in `FXSAVE` shape.
+///
+/// The tag word is the **abridged** one `FXSAVE` writes — one bit per physical
+/// register, set when the register is not empty — rather than the two-bits-per
+/// register word `FNSTENV` produces. Converting between them is
+/// [`state::fpu_from_kvm`](crate::accel::state::fpu_from_kvm)'s job, and it is
+/// not lossless in the direction that matters: recovering *valid* from *zero*
+/// from *special* means re-examining the register's own encoding, which is
+/// exactly what `FXRSTOR` does (*Intel SDM* volume 1 §8.1.7).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvmFpu {
+    /// The eight data registers, in physical order, each a 10-byte extended
+    /// value in the low bytes of a 16-byte slot.
+    pub fpr: [[u8; 16]; 8],
+    /// The control word.
+    pub fcw: u16,
+    /// The status word.
+    pub fsw: u16,
+    /// The abridged tag word: bit `i` set means register `i` is not empty.
+    pub ftwx: u8,
+    /// Padding.
+    pub pad1: u8,
+    /// The last escape opcode, eleven bits.
+    pub last_opcode: u16,
+    /// The last instruction pointer.
+    pub last_ip: u64,
+    /// The last data pointer.
+    pub last_dp: u64,
+    /// `XMM0` through `XMM15`, little-endian.
+    pub xmm: [[u8; 16]; 16],
+    /// The SSE control and status register.
+    pub mxcsr: u32,
+    /// Padding.
+    pub pad2: u32,
+}
+const _: () = assert!(size_of::<KvmFpu>() == 416);
+
+/// `struct kvm_debugregs` — `DR0`-`DR3`, `DR6` and `DR7`.
+///
+/// `DR4` and `DR5` are aliases of `DR6` and `DR7` on every part that has them,
+/// which is why neither the structure nor the hardware carries them.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvmDebugregs {
+    /// `DR0` through `DR3`: the four breakpoint addresses.
+    pub db: [u64; 4],
+    /// `DR6`, the status register.
+    pub dr6: u64,
+    /// `DR7`, the control register.
+    pub dr7: u64,
+    /// Flags; none are defined and it must be zero.
+    pub flags: u64,
+    /// Reserved.
+    pub reserved: [u64; 9],
+}
+const _: () = assert!(size_of::<KvmDebugregs>() == 128);
+
+/// One entry of `struct kvm_msrs`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvmMsrEntry {
+    /// The model-specific register's number, as `RDMSR` takes it in `ECX`.
+    pub index: u32,
+    /// Reserved; zero.
+    pub reserved: u32,
+    /// The value.
+    pub data: u64,
+}
+const _: () = assert!(size_of::<KvmMsrEntry>() == 16);
+
+/// `struct kvm_msrs`, with the flexible array given a length.
+///
+/// The kernel reads `nmsrs` and touches exactly that many entries, so a
+/// `const` generic is a faithful transcription rather than an approximation of
+/// one: the type *is* the header plus `N` entries.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct KvmMsrs<const N: usize> {
+    nmsrs: u32,
+    pad: u32,
+    entries: [KvmMsrEntry; N],
+}
+
 /// Byte offsets into the `kvm_run` page.
 ///
 /// Read as a table rather than transcribed as a `#[repr(C)]` struct on
@@ -343,9 +486,15 @@ const _: () = assert!(size_of::<KvmSregs>() == 312);
 /// header of the structure — everything up to the union at offset 32 — is
 /// fixed, and so is each arm's own layout.
 mod run {
+    /// `__u8 request_interrupt_window`: ask to be let out when the guest can
+    /// take an interrupt. The other field userspace writes.
+    pub(super) const REQUEST_INTERRUPT_WINDOW: u64 = 0;
     /// `__u8 immediate_exit`: set before `KVM_RUN` to decline to enter the
     /// guest. The one field userspace *writes*.
     pub(super) const IMMEDIATE_EXIT: u64 = 1;
+    /// `__u8 ready_for_interrupt_injection`: whether `KVM_INTERRUPT` would be
+    /// accepted right now.
+    pub(super) const READY_FOR_INTERRUPT: u64 = 12;
     /// `__u32 exit_reason`.
     pub(super) const EXIT_REASON: u64 = 8;
     /// `__u8 if_flag`: whether the guest has interrupts enabled.
@@ -420,6 +569,23 @@ fn ioctl_struct<T>(fd: &Fd, req: Req<T>, arg: &mut T) -> SysResult<i64> {
     // live, aligned, uniquely borrowed `T` for the whole call, which covers
     // both the read and the write direction.
     unsafe { sys::ioctl(fd, req.0, core::ptr::from_mut(arg) as u64) }
+}
+
+/// Perform `KVM_GET_MSRS` or `KVM_SET_MSRS`.
+///
+/// Separate from [`ioctl_struct`] because those two numbers encode the size of
+/// the *header* rather than of the argument — see [`KVM_GET_MSRS`] — so the
+/// type-carrying [`Req`] would be claiming something untrue.
+#[allow(unsafe_code)]
+fn ioctl_msrs<const N: usize>(fd: &Fd, req: u64, arg: &mut KvmMsrs<N>) -> SysResult<i64> {
+    // SAFETY: `req` is one of the two constants above, whose UAPI argument is
+    // `struct kvm_msrs`; `KvmMsrs<N>` is its `#[repr(C)]` transcription with
+    // the flexible array given the length `arg.nmsrs` reports, and the caller
+    // below is the only constructor — it sets `nmsrs` to `N` and never to more.
+    // The kernel therefore touches the header plus exactly `N` entries, all of
+    // which are inside this live, aligned, uniquely borrowed value for the
+    // whole call.
+    unsafe { sys::ioctl(fd, req, core::ptr::from_mut(arg) as u64) }
 }
 
 fn sys_err(what: &'static str) -> impl Fn(Errno) -> AccelError {
@@ -527,6 +693,7 @@ impl Kvm {
             fd: Fd::from_raw(fd as i32),
             vcpu_mmap_size: self.vcpu_mmap_size,
             immediate_exit: self.check_extension(KVM_CAP_IMMEDIATE_EXIT) != 0,
+            readonly_mem: self.check_extension(KVM_CAP_READONLY_MEM) != 0,
             slots: Mutex::with_rank(LockRank::MACHINE, Vec::new()),
         };
         vm.prepare_x86()?;
@@ -544,11 +711,119 @@ pub struct Vm {
     fd: Fd,
     vcpu_mmap_size: u64,
     immediate_exit: bool,
+    readonly_mem: bool,
     /// The stores backing each slot, kept alive for as long as the kernel
-    /// holds their addresses. Dropping a [`HostPages`] whose slot is still
-    /// installed would unmap memory the guest is executing out of, so the VM
-    /// owns them.
+    /// holds their addresses. Dropping a store whose slot is still installed
+    /// would free memory the guest is executing out of, so the VM owns a
+    /// reference to it.
     slots: Mutex<Vec<Slot>>,
+}
+
+/// Which of `core::space`'s stores a slot is backed by.
+#[derive(Debug, Clone)]
+enum Store {
+    Ram(Arc<RamStore>),
+    Rom(Arc<RomStore>),
+}
+
+/// A window onto a backing store, as a hypervisor sees it.
+///
+/// The store is `core::space`'s own, which is the point: the guest's hardware,
+/// the interpreter, the debugger, a DMA master and a snapshot all reach *the
+/// same bytes*, with no copy and no second RAM type. That is what
+/// [`RamStore::host_addr`] made possible — before it a board's declared `ram`
+/// had allocation alignment 1 and could not be a memory slot at all.
+///
+/// A *window* rather than the whole store, because a board's flat view is
+/// entitled to map part of one: an aliased aperture, a shadowed ROM, a region
+/// split by a device that sits in the middle of it.
+#[derive(Debug, Clone)]
+pub struct Backing {
+    store: Store,
+    offset: u64,
+    len: u64,
+}
+
+impl Backing {
+    /// The whole of a [`RamStore`], read/write.
+    #[must_use]
+    pub fn ram(store: &Arc<RamStore>) -> Backing {
+        Backing {
+            len: store.len(),
+            store: Store::Ram(Arc::clone(store)),
+            offset: 0,
+        }
+    }
+
+    /// The whole of a [`RomStore`], read-only.
+    #[must_use]
+    pub fn rom(store: &Arc<RomStore>) -> Backing {
+        Backing {
+            len: store.len(),
+            store: Store::Rom(Arc::clone(store)),
+            offset: 0,
+        }
+    }
+
+    /// `len` bytes starting `offset` into the same store.
+    ///
+    /// # Errors
+    ///
+    /// [`AccelError::Unsupported`] if the window leaves the store.
+    pub fn window(self, offset: u64, len: u64) -> AccelResult<Backing> {
+        let whole = match &self.store {
+            Store::Ram(r) => r.len(),
+            Store::Rom(r) => r.len(),
+        };
+        let end = offset.saturating_add(len);
+        if end > whole {
+            return Err(AccelError::Unsupported(
+                "a memory-slot window that leaves its backing store",
+            ));
+        }
+        Ok(Backing {
+            store: self.store,
+            offset,
+            len,
+        })
+    }
+
+    /// Size of the window in bytes.
+    #[must_use]
+    pub const fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the window holds no bytes. A zero-length region is how the ABI
+    /// spells *delete a slot*, so it is refused before the ioctl.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Whether the guest may write here.
+    #[must_use]
+    pub const fn is_writable(&self) -> bool {
+        matches!(self.store, Store::Ram(_))
+    }
+
+    /// The host address the kernel is given.
+    #[must_use]
+    pub fn host_addr(&self) -> u64 {
+        let base = match &self.store {
+            Store::Ram(r) => r.host_addr(),
+            Store::Rom(r) => r.host_addr(),
+        };
+        base + self.offset
+    }
+
+    /// The slot flags this backing needs.
+    const fn flags(&self) -> u32 {
+        match self.store {
+            Store::Ram(_) => 0,
+            Store::Rom(_) => KVM_MEM_READONLY,
+        }
+    }
 }
 
 /// One installed memory region.
@@ -556,7 +831,7 @@ pub struct Vm {
 struct Slot {
     index: u32,
     guest_phys_addr: u64,
-    pages: Arc<HostPages>,
+    backing: Backing,
 }
 
 impl Vm {
@@ -570,22 +845,44 @@ impl Vm {
     /// The scratch areas an Intel part without unrestricted-guest support
     /// needs before it can run 16-bit code.
     ///
-    /// Both are ignored where the host does not need them, and both are placed
-    /// just under 4 GiB, where no machine this crate builds puts RAM. A
-    /// failure is *not* an error: on AMD, and on Intel with unrestricted
+    /// A failure is *not* an error: on AMD, and on Intel with unrestricted
     /// guest, the ioctls are either absent or unnecessary.
+    ///
+    /// # Where they go, and why not where they used to
+    ///
+    /// The kernel turns each of these into a **private memory slot**, and a
+    /// user slot may not overlap one. They were placed *just under 4 GiB* —
+    /// which is precisely where every PC board in this crate puts the second
+    /// copy of its firmware socket, so that `CS:IP = f000:fff0` finds a reset
+    /// vector. Installing that ROM as a slot would have been refused, on any
+    /// host old enough to need the scratch at all, with an `EEXIST` naming
+    /// neither party.
+    ///
+    /// They now sit in the **PCI memory hole** immediately below the local
+    /// APIC's page. That range is decoded by devices on every board this crate
+    /// describes, never by RAM or ROM, so it is never a user slot — which is
+    /// the property that actually matters, and "somewhere nothing is mapped"
+    /// was never it.
     fn prepare_x86(&self) -> AccelResult<()> {
-        // `KVM_SET_TSS_ADDR` wants three consecutive pages; the conventional
-        // placement leaves the identity map immediately below them.
-        const TSS_ADDR: u64 = 0xffff_b000;
-        const IDENTITY_MAP_ADDR: u64 = 0xffff_a000;
+        // `KVM_SET_TSS_ADDR` wants three consecutive pages; the identity map
+        // sits immediately below them.
+        const TSS_ADDR: u64 = 0xfeff_c000;
+        const IDENTITY_MAP_ADDR: u64 = 0xfeff_b000;
         let _ = ioctl_val(&self.fd, KVM_SET_TSS_ADDR, TSS_ADDR);
         let mut addr = IDENTITY_MAP_ADDR;
         let _ = ioctl_struct(&self.fd, KVM_SET_IDENTITY_MAP_ADDR, &mut addr);
         Ok(())
     }
 
-    /// Install `pages` as guest physical memory at `guest_phys_addr`.
+    /// Whether this kernel can mark a slot read-only, and therefore whether
+    /// [`set_rom_region`](Vm::set_rom_region) will work.
+    #[must_use]
+    pub const fn has_readonly_mem(&self) -> bool {
+        self.readonly_mem
+    }
+
+    /// Install a board's [`RamStore`] as guest physical memory at
+    /// `guest_phys_addr`.
     ///
     /// The store is kept alive by the VM: the kernel holds its host address
     /// until the slot is removed, so dropping it early would hand the guest a
@@ -600,11 +897,71 @@ impl Vm {
         &self,
         index: u32,
         guest_phys_addr: u64,
-        pages: &Arc<HostPages>,
+        store: &Arc<RamStore>,
     ) -> AccelResult<()> {
-        if !guest_phys_addr.is_multiple_of(PAGE_SIZE) || !pages.len().is_multiple_of(PAGE_SIZE) {
+        self.set_region(index, guest_phys_addr, Backing::ram(store))
+    }
+
+    /// Install a [`RomStore`] as a **read-only** slot.
+    ///
+    /// Reads and instruction fetches are served by hardware; a guest write
+    /// leaves as an MMIO exit and is routed into the address space, where the
+    /// region's [`RomWrite`](crate::core::space::RomWrite) policy decides what
+    /// it does — the same answer the interpreter gives.
+    ///
+    /// # Errors
+    ///
+    /// [`AccelError::Unsupported`] if this kernel has no
+    /// [`KVM_CAP_READONLY_MEM`], because installing firmware as writable
+    /// memory instead would be a silently different machine.
+    pub fn set_rom_region(
+        &self,
+        index: u32,
+        guest_phys_addr: u64,
+        store: &Arc<RomStore>,
+    ) -> AccelResult<()> {
+        if !self.readonly_mem {
+            return Err(AccelError::Unsupported(
+                "this kernel has no KVM_CAP_READONLY_MEM, so a ROM cannot be a memory slot",
+            ));
+        }
+        self.set_region(index, guest_phys_addr, Backing::rom(store))
+    }
+
+    /// The general form both of the above are.
+    ///
+    /// # Errors
+    ///
+    /// [`AccelError::Unsupported`] for a misaligned region, [`AccelError::Sys`]
+    /// if the kernel refuses it.
+    pub fn set_region(
+        &self,
+        index: u32,
+        guest_phys_addr: u64,
+        backing: Backing,
+    ) -> AccelResult<()> {
+        if !backing.is_writable() && !self.readonly_mem {
+            return Err(AccelError::Unsupported(
+                "this kernel has no KVM_CAP_READONLY_MEM, so a ROM cannot be a memory slot",
+            ));
+        }
+        // Zero is a multiple of the page size, so the size check below would
+        // let an empty store through — and a zero `memory_size` is how the ABI
+        // spells *delete this slot*. Installing nothing must not quietly
+        // remove something.
+        if backing.is_empty() {
+            return Err(AccelError::Unsupported(
+                "an empty backing store: a zero-length region is the ABI's way of deleting a slot",
+            ));
+        }
+        if !guest_phys_addr.is_multiple_of(PAGE_SIZE) || !backing.len().is_multiple_of(PAGE_SIZE) {
             return Err(AccelError::Unsupported(
                 "a KVM memory region needs a page-aligned guest address and a page-multiple size",
+            ));
+        }
+        if !backing.host_addr().is_multiple_of(PAGE_SIZE) {
+            return Err(AccelError::Unsupported(
+                "a backing store whose allocation is not host-page aligned",
             ));
         }
         // A slot whose *geometry* changes has to be deleted and recreated: the
@@ -617,20 +974,20 @@ impl Vm {
             slots
                 .iter()
                 .find(|s| s.index == index)
-                .map(|s| (s.guest_phys_addr, s.pages.len()))
+                .map(|s| (s.guest_phys_addr, s.backing.len()))
         };
         if let Some((old_addr, old_len)) = stale
-            && (old_addr != guest_phys_addr || old_len != pages.len())
+            && (old_addr != guest_phys_addr || old_len != backing.len())
         {
             self.delete_memory_region(index)?;
         }
 
         let mut region = KvmUserspaceMemoryRegion {
             slot: index,
-            flags: 0,
+            flags: backing.flags(),
             guest_phys_addr,
-            memory_size: pages.len(),
-            userspace_addr: pages.host_addr(),
+            memory_size: backing.len(),
+            userspace_addr: backing.host_addr(),
         };
         ioctl_struct(&self.fd, KVM_SET_USER_MEMORY_REGION, &mut region)
             .map_err(sys_err("KVM_SET_USER_MEMORY_REGION"))?;
@@ -639,7 +996,7 @@ impl Vm {
         slots.push(Slot {
             index,
             guest_phys_addr,
-            pages: Arc::clone(pages),
+            backing,
         });
         Ok(())
     }
@@ -674,10 +1031,25 @@ impl Vm {
             .slots
             .lock()
             .iter()
-            .map(|s| (s.index, s.guest_phys_addr, s.pages.len()))
+            .map(|s| (s.index, s.guest_phys_addr, s.backing.len()))
             .collect();
         slots.sort_unstable();
         slots
+    }
+
+    /// The frequency the guest's time-stamp counter runs at, in kHz.
+    ///
+    /// Needed to make a `RDTSC` value mean the same thing on both sides of an
+    /// engine switch: the counter is a *rate* plus an offset, and carrying the
+    /// offset without the rate would move a guest's idea of elapsed time.
+    ///
+    /// # Errors
+    ///
+    /// [`AccelError::Sys`] if the kernel has no `KVM_GET_TSC_KHZ`.
+    pub fn tsc_khz(&self) -> AccelResult<u64> {
+        let khz = ioctl_val(&self.fd, KVM_GET_TSC_KHZ, 0).map_err(sys_err("KVM_GET_TSC_KHZ"))?;
+        #[allow(clippy::cast_sign_loss)]
+        Ok(khz as u64)
     }
 
     /// Create a vCPU, mapping its shared `kvm_run` page.
@@ -847,11 +1219,157 @@ impl Vcpu {
         Ok(())
     }
 
+    /// The x87 and SSE register files.
+    ///
+    /// # Errors
+    ///
+    /// [`AccelError::Sys`] if `KVM_GET_FPU` fails.
+    pub fn fpu(&self) -> AccelResult<KvmFpu> {
+        let inner = self.inner.lock();
+        let mut fpu = KvmFpu::default();
+        ioctl_struct(&inner.fd, KVM_GET_FPU, &mut fpu).map_err(sys_err("KVM_GET_FPU"))?;
+        Ok(fpu)
+    }
+
+    /// Set the x87 and SSE register files.
+    ///
+    /// # Errors
+    ///
+    /// [`AccelError::Sys`] if `KVM_SET_FPU` fails.
+    pub fn set_fpu(&self, fpu: &KvmFpu) -> AccelResult<()> {
+        let inner = self.inner.lock();
+        let mut fpu = *fpu;
+        ioctl_struct(&inner.fd, KVM_SET_FPU, &mut fpu).map_err(sys_err("KVM_SET_FPU"))?;
+        Ok(())
+    }
+
+    /// The debug registers.
+    ///
+    /// # Errors
+    ///
+    /// [`AccelError::Sys`] if `KVM_GET_DEBUGREGS` fails.
+    pub fn debugregs(&self) -> AccelResult<KvmDebugregs> {
+        let inner = self.inner.lock();
+        let mut dregs = KvmDebugregs::default();
+        ioctl_struct(&inner.fd, KVM_GET_DEBUGREGS, &mut dregs)
+            .map_err(sys_err("KVM_GET_DEBUGREGS"))?;
+        Ok(dregs)
+    }
+
+    /// Set the debug registers.
+    ///
+    /// # Errors
+    ///
+    /// [`AccelError::Sys`] if `KVM_SET_DEBUGREGS` fails.
+    pub fn set_debugregs(&self, dregs: &KvmDebugregs) -> AccelResult<()> {
+        let inner = self.inner.lock();
+        let mut dregs = *dregs;
+        ioctl_struct(&inner.fd, KVM_SET_DEBUGREGS, &mut dregs)
+            .map_err(sys_err("KVM_SET_DEBUGREGS"))?;
+        Ok(())
+    }
+
+    /// Read `N` model-specific registers, in the order asked for.
+    ///
+    /// # Errors
+    ///
+    /// [`AccelError::Sys`] if the ioctl fails, [`AccelError::Unsupported`] if
+    /// the kernel read fewer than asked — which is how it reports an MSR this
+    /// host does not implement, and which a caller must not read as a zero.
+    pub fn msrs<const N: usize>(&self, indices: [u32; N]) -> AccelResult<[u64; N]> {
+        let inner = self.inner.lock();
+        let mut msrs = KvmMsrs::<N> {
+            nmsrs: N as u32,
+            pad: 0,
+            entries: indices.map(|index| KvmMsrEntry {
+                index,
+                reserved: 0,
+                data: 0,
+            }),
+        };
+        let read =
+            ioctl_msrs(&inner.fd, KVM_GET_MSRS, &mut msrs).map_err(sys_err("KVM_GET_MSRS"))?;
+        if read != N as i64 {
+            return Err(AccelError::Unsupported(
+                "this host does not implement one of the model-specific registers asked for",
+            ));
+        }
+        Ok(msrs.entries.map(|e| e.data))
+    }
+
+    /// Write `N` model-specific registers.
+    ///
+    /// # Errors
+    ///
+    /// [`AccelError::Sys`] if the ioctl fails, [`AccelError::Unsupported`] if
+    /// the kernel accepted fewer than were offered.
+    pub fn set_msrs<const N: usize>(&self, values: [(u32, u64); N]) -> AccelResult<()> {
+        let inner = self.inner.lock();
+        let mut msrs = KvmMsrs::<N> {
+            nmsrs: N as u32,
+            pad: 0,
+            entries: values.map(|(index, data)| KvmMsrEntry {
+                index,
+                reserved: 0,
+                data,
+            }),
+        };
+        let set =
+            ioctl_msrs(&inner.fd, KVM_SET_MSRS, &mut msrs).map_err(sys_err("KVM_SET_MSRS"))?;
+        if set != N as i64 {
+            return Err(AccelError::Unsupported(
+                "this host refused one of the model-specific registers offered",
+            ));
+        }
+        Ok(())
+    }
+
     /// Whether the guest currently has interrupts enabled, as of the last
     /// exit.
     #[must_use]
     pub fn interrupts_enabled(&self) -> bool {
         self.inner.lock().run.load_u8(run::IF_FLAG) == Some(1)
+    }
+
+    /// Whether the guest would accept an injected vector right now, as of the
+    /// last exit.
+    #[must_use]
+    pub fn ready_for_interrupt(&self) -> bool {
+        self.inner.lock().run.load_u8(run::READY_FOR_INTERRUPT) == Some(1)
+    }
+
+    /// Ask to be let out of the guest as soon as it can take an interrupt.
+    ///
+    /// The userspace-interrupt-controller half of the design: a board's
+    /// 8259A or local APIC is a [`Device`](crate::core::Device) here, so KVM
+    /// has no interrupt state of its own to consult and has to be told when
+    /// there is something waiting. Setting this produces a
+    /// `KVM_EXIT_IRQ_WINDOW_OPEN` the moment `IF` and the interrupt shadow
+    /// allow, and [`inject`](Vcpu::inject) is then accepted.
+    pub fn request_interrupt_window(&self, want: bool) {
+        let inner = self.inner.lock();
+        inner
+            .run
+            .store_u8(run::REQUEST_INTERRUPT_WINDOW, u8::from(want));
+    }
+
+    /// Inject one interrupt vector.
+    ///
+    /// The vector is the one the board's own interrupt controller supplied on
+    /// its acknowledge cycle — nothing here invents it.
+    ///
+    /// # Errors
+    ///
+    /// [`AccelError::Sys`] if `KVM_INTERRUPT` fails, which it does with
+    /// `EEXIST` when one is already pending and `EINVAL` for a vector above
+    /// 255.
+    pub fn inject(&self, vector: u8) -> AccelResult<()> {
+        let inner = self.inner.lock();
+        let mut irq = KvmInterrupt {
+            irq: u32::from(vector),
+        };
+        ioctl_struct(&inner.fd, KVM_INTERRUPT, &mut irq).map_err(sys_err("KVM_INTERRUPT"))?;
+        Ok(())
     }
 
     /// Enter the guest once and report what came back, **without** routing

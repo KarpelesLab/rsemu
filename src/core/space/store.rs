@@ -20,6 +20,45 @@
 //! Ordering is `Relaxed` throughout. Guest atomicity and guest barriers are
 //! the IR lifter's job (§4.7): the store provides per-byte atomicity so that a
 //! racing access is never undefined behaviour, and nothing more.
+//!
+//! # Why the allocation is host-page aligned
+//!
+//! A hypervisor is handed guest RAM as a *host address*, and both KVM's
+//! `KVM_SET_USER_MEMORY_REGION` and Hypervisor.framework's `hv_vm_map` reject
+//! one that is not page aligned. A `Vec<AtomicU8>` from the global allocator
+//! has layout alignment **1**, so before this it was structurally impossible
+//! for a board's declared `ram` to be a memory slot — `ROADMAP.md` phase 7's
+//! gate ("the phase-6 machines boot under KVM") was blocked on an allocator
+//! detail.
+//!
+//! The fix is deliberately the smallest one that could work: allocate
+//! [`HOST_PAGE`]` - 1` extra bytes and remember the offset at which the
+//! allocation first crosses a page boundary. [`RamStore::host_addr`] reports
+//! that address and it is page aligned by construction.
+//!
+//! What this **does not** do is as important as what it does:
+//!
+//! * It is not an `mmap`. There is no new syscall, nothing target-specific,
+//!   and no `unsafe` — `Vec::as_ptr` is safe, and the value is reported as a
+//!   `u64`, never as a pointer or a slice. `core/` stays `no_std`, and a wasm
+//!   build gets the identical code path (see below for what it costs there).
+//! * It does not change the API by one function. Guest RAM is still addressed
+//!   **by byte offset and never handed out as `&mut [u8]`** (`CLAUDE.md`,
+//!   "Targets"), so the store can still live in a `SharedArrayBuffer`; that
+//!   rule is about the *shape of the accessors*, and the accessors are
+//!   untouched.
+//! * It does not add a second RAM type or make the store a property of the
+//!   machine. Two stores would mean two code paths, boards that are
+//!   accelerable and boards that are not, and a `Region::ram` arm per backing
+//!   — for a property every allocation can simply have.
+//!
+//! The costs, stated rather than discovered: **up to [`HOST_PAGE`]` - 1` wasted
+//! bytes per store**, which on a wasm build (where the address is a linear
+//! memory offset that no hypervisor will ever read) buys nothing at all. A
+//! machine with a dozen RAM objects loses under 48 KiB. The alternative —
+//! aligning only when some feature is on — would make the *offset arithmetic*
+//! differ between builds, which is precisely the kind of thing that makes a
+//! state hash target-dependent.
 
 use super::attrs::MemResult;
 use crate::core::error::BusError;
@@ -31,6 +70,29 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 /// assumes.
 pub const DEFAULT_PAGE_BITS: u32 = 12;
 
+/// The alignment every backing store's allocation is given, in bytes.
+///
+/// 4 KiB, because that is the granularity a hypervisor's second-dimension page
+/// tables work in: `KVM_SET_USER_MEMORY_REGION` requires a page-aligned
+/// `userspace_addr`, and 4 KiB is the base page on every architecture this
+/// crate can accelerate on. It is a constant rather than a query of the host,
+/// because it is a property of the *guest* interface being satisfied — a host
+/// with 16 KiB pages still accepts a 4 KiB-aligned address, it just needs the
+/// value rounded further, and that is the accelerator's business, not the
+/// store's.
+///
+/// Deliberately separate from [`DEFAULT_PAGE_BITS`], which is dirty-tracking
+/// granularity and is allowed to differ.
+pub const HOST_PAGE: u64 = 4096;
+
+/// The offset, from `addr`, of the first [`HOST_PAGE`]-aligned byte at or
+/// after it.
+#[inline]
+const fn align_gap(addr: usize) -> usize {
+    // `HOST_PAGE` is a power of two, so the gap is `(-addr) mod HOST_PAGE`.
+    addr.wrapping_neg() % (HOST_PAGE as usize)
+}
+
 /// Writable guest memory, addressed by byte offset and shareable across
 /// threads.
 ///
@@ -38,7 +100,17 @@ pub const DEFAULT_PAGE_BITS: u32 = 12;
 /// dirty state can be recorded: host signals are forbidden (wasm has none), so
 /// there is no way to trap a write after the fact (`ROADMAP.md` §4.1).
 pub struct RamStore {
+    /// `len` bytes of guest RAM, preceded by `base` bytes of alignment slack.
+    ///
+    /// Never resized after construction — a hypervisor holds
+    /// [`host_addr`](RamStore::host_addr) until its memory slot is removed, so
+    /// a reallocation would hand the guest a window onto whatever the
+    /// allocator did next. Every method takes `&self`, which is what makes
+    /// that unrepresentable rather than merely intended.
     cells: Vec<AtomicU8>,
+    /// Index of guest byte zero: chosen so `cells.as_ptr() + base` is
+    /// [`HOST_PAGE`] aligned.
+    base: usize,
     dirty: Vec<AtomicU64>,
     page_bits: u32,
     len: u64,
@@ -49,6 +121,7 @@ impl fmt::Debug for RamStore {
         f.debug_struct("RamStore")
             .field("len", &self.len)
             .field("page_size", &self.page_size())
+            .field("host_addr", &format_args!("{:#x}", self.host_addr()))
             .finish_non_exhaustive()
     }
 }
@@ -78,16 +151,46 @@ impl RamStore {
         let n = usize::try_from(len).expect("guest RAM larger than the host address space");
         let pages = len.div_ceil(1u64 << page_bits);
         let words = usize::try_from(pages.div_ceil(64)).expect("dirty bitmap too large");
+        // The slack that buys a page-aligned `host_addr`. A zero-length store
+        // has no bytes to align, and allocating a page for it to say so would
+        // be worse than admitting it has no address.
+        let pad = if n == 0 { 0 } else { HOST_PAGE as usize - 1 };
         let mut cells = Vec::new();
-        cells.resize_with(n, || AtomicU8::new(0));
+        cells.resize_with(n + pad, || AtomicU8::new(0));
+        let base = if n == 0 {
+            0
+        } else {
+            align_gap(cells.as_ptr() as usize)
+        };
         let mut dirty = Vec::new();
         dirty.resize_with(words, || AtomicU64::new(0));
         RamStore {
             cells,
+            base,
             dirty,
             page_bits,
             len,
         }
+    }
+
+    /// The host address of guest byte zero, as an integer.
+    ///
+    /// [`HOST_PAGE`] aligned, and stable for the life of the store — which
+    /// together are exactly the contract a hypervisor's memory-slot call makes
+    /// of a `userspace_addr`. Meaningless for a zero-length store, which has
+    /// no bytes to point at.
+    ///
+    /// **A `u64`, not a pointer and not a slice**, and that is the whole
+    /// design: this hands out a *fact about the allocation*, not a way to
+    /// alias it. Reading these bytes from Rust still goes through the
+    /// byte-offset accessors below; the only consumer that dereferences the
+    /// address is a kernel that was handed it, in one of `ROADMAP.md` §0's
+    /// sanctioned subsystems. On a target with no hypervisor the value is a
+    /// linear-memory offset and nothing asks for it.
+    #[inline]
+    #[must_use]
+    pub fn host_addr(&self) -> u64 {
+        (self.cells.as_ptr() as usize + self.base) as u64
     }
 
     /// Size in bytes.
@@ -125,7 +228,8 @@ impl RamStore {
             return Err(BusError::BadAccess);
         }
         // `self.len` fits in a usize by construction, so `offset` does too.
-        usize::try_from(offset).map_err(|_| BusError::BadAccess)
+        let at = usize::try_from(offset).map_err(|_| BusError::BadAccess)?;
+        Ok(self.base + at)
     }
 
     /// Copy `dst.len()` bytes from `offset` into `dst`.
@@ -257,22 +361,42 @@ impl RamStore {
 /// tracking. What happens to a *write* is a property of the region, not of the
 /// store — see [`RomWrite`](super::RomWrite).
 pub struct RomStore {
+    /// `len` bytes of ROM, preceded by `base` bytes of alignment slack.
     bytes: Vec<u8>,
+    base: usize,
+    len: usize,
 }
 
 impl fmt::Debug for RomStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RomStore")
-            .field("len", &self.bytes.len())
+            .field("len", &self.len)
+            .field("host_addr", &format_args!("{:#x}", self.host_addr()))
             .finish_non_exhaustive()
     }
 }
 
 impl RomStore {
     /// Take ownership of `bytes` as ROM contents.
+    ///
+    /// The image is **copied** into a host-page-aligned allocation, for the
+    /// reason [`RamStore`] carries one: firmware is the one region a guest must
+    /// be able to *fetch* from, and a hypervisor cannot fetch from a region
+    /// that is not a memory slot — KVM's instruction emulator declines a fetch
+    /// that would come back as an MMIO exit. A ROM that cannot be a slot is a
+    /// board that cannot boot under acceleration, so the copy is the price.
     #[must_use]
     pub fn new(bytes: Vec<u8>) -> Self {
-        RomStore { bytes }
+        Self::from_slice(&bytes)
+    }
+
+    /// The same, from a borrowed image.
+    #[must_use]
+    pub fn from_slice(image: &[u8]) -> Self {
+        let mut store = RomStore::zeroed(image.len() as u64);
+        let base = store.base;
+        store.bytes[base..base + image.len()].copy_from_slice(image);
+        store
     }
 
     /// A ROM of `len` zero bytes, for tests and for a socket with no cartridge
@@ -284,8 +408,17 @@ impl RomStore {
     #[must_use]
     pub fn zeroed(len: u64) -> Self {
         let n = usize::try_from(len).expect("ROM larger than the host address space");
+        let pad = if n == 0 { 0 } else { HOST_PAGE as usize - 1 };
+        let bytes = alloc::vec![0u8; n + pad];
+        let base = if n == 0 {
+            0
+        } else {
+            align_gap(bytes.as_ptr() as usize)
+        };
         RomStore {
-            bytes: alloc::vec![0u8; n],
+            bytes,
+            base,
+            len: n,
         }
     }
 
@@ -293,20 +426,33 @@ impl RomStore {
     #[inline]
     #[must_use]
     pub fn len(&self) -> u64 {
-        self.bytes.len() as u64
+        self.len as u64
     }
 
     /// Whether the ROM is zero-sized.
     #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
+        self.len == 0
+    }
+
+    /// The host address of ROM byte zero, as an integer.
+    ///
+    /// [`HOST_PAGE`] aligned and stable for the life of the store — the
+    /// read-only twin of [`RamStore::host_addr`], and documented there. A
+    /// hypervisor installs it as a read-only slot, so a guest *write* still
+    /// leaves hardware and arrives at [`RomWrite`](super::RomWrite) the way it
+    /// already does under the interpreter.
+    #[inline]
+    #[must_use]
+    pub fn host_addr(&self) -> u64 {
+        (self.bytes.as_ptr() as usize + self.base) as u64
     }
 
     /// The contents, for hashing and snapshotting.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
+        &self.bytes[self.base..self.base + self.len]
     }
 
     /// Copy `dst.len()` bytes from `offset` into `dst`.
@@ -318,8 +464,8 @@ impl RomStore {
         if end > self.len() {
             return Err(BusError::BadAccess);
         }
-        let base = usize::try_from(offset).map_err(|_| BusError::BadAccess)?;
-        dst.copy_from_slice(&self.bytes[base..base + dst.len()]);
+        let at = usize::try_from(offset).map_err(|_| BusError::BadAccess)? + self.base;
+        dst.copy_from_slice(&self.bytes[at..at + dst.len()]);
         Ok(())
     }
 }
