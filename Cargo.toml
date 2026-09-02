@@ -62,6 +62,20 @@ std = []
 # The `rsemu` binary. Needs `std`.
 cli = ["std"]
 
+# The C ABI (src/ffi): builds the `ffi` module, which is what makes rsemu
+# embeddable in a program that is not written in Rust — a CI runner, a test
+# harness, a bring-up tool — the way `purecrypto` and `kataan` are
+# (ROADMAP.md §2, phase 9). One of the six subsystems allowed to opt back into
+# `unsafe`. The crate stays `rlib` by default, so build the C library on demand:
+#   cargo rustc --lib --release --features ffi --crate-type staticlib
+#   cargo rustc --lib --release --features ffi --crate-type cdylib
+# The header is `include/rsemu.h`, generated from `src/ffi/abi.rs` and compared
+# against it by `cargo test --features ffi` — there is no cbindgen, because the
+# dependency policy does not have room for one. Needs `std`: containing a panic
+# at the boundary is `std::panic::catch_unwind`, and an embedder that wants
+# RSEMU_PANIC rather than an abort must link an unwinding build.
+ffi = ["std"]
+
 # The gdbstub (src/host/gdb): the GDB remote serial protocol over TCP —
 # registers, memory, breakpoints and write watchpoints, a machine's CPUs as GDB
 # threads, and `qXfer:features:read` target descriptions generated from each

@@ -237,6 +237,20 @@ cp target/wasm32-unknown-unknown/release/rsemu.wasm web/public/
 cd web && npm ci && npm run build && python3 -m http.server -d dist 8080
 ```
 
+The C ABI — `rsemu run` as twenty-three `extern "C"` functions, so a program
+that is not written in Rust can build a machine, run it for an amount of
+virtual time, read and write its memory, snapshot it and hash it:
+
+```sh
+cargo rustc --lib --release --features ffi --crate-type staticlib
+cargo rustc --lib --release --features ffi --crate-type cdylib
+```
+
+The header is [`include/rsemu.h`](include/rsemu.h). It is **generated** from
+`src/ffi/abi.rs` and compared against it by `cargo test --features ffi`, so it
+cannot drift; regenerate it with `RSEMU_UPDATE_HEADER=1`. There is no cbindgen
+— the dependency policy has no room for one.
+
 See [`web/README.md`](web/README.md). MSRV is 1.88, pinned by a CI job so it
 stays a checked claim.
 
