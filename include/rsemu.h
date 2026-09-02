@@ -168,6 +168,12 @@ typedef enum rsemu_status {
      */
     RSEMU_BUS_RETRY = -14,
     /*
+     * A hardware-acceleration backend refused or failed. Only a build with
+     * an `accel-*` feature can produce one, and only on a host that has the
+     * hypervisor device -- an embedder without one never sees this code.
+     */
+    RSEMU_ACCEL = -15,
+    /*
      * A panic was caught at the boundary. A machine that returns this is
      * poisoned: only `rsemu_last_error` and `rsemu_free` still work on it.
      */
