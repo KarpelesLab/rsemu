@@ -12,6 +12,7 @@
 //! | [`dwc2`] | `dev-usb-dwc2` | a Synopsys DesignWare USB 2.0 OTG controller — STM32's OTG_FS — with host channels and a shared FIFO instead of a schedule in guest memory, **in both roles**: host, and device, where the guest is the peripheral |
 //! | [`chipidea`] | `dev-usb-chipidea` | the ChipIdea/ARC dual-role variant of the same controller: a `+0x140` operational offset, an `ID` register and a `USBMODE` role select |
 //! | [`hid`] | `dev-usb-hid` | a USB HID boot-protocol mouse: the smallest device that proves the stack |
+//! | [`xhci`] | `dev-usb-xhci` | an xHCI host controller: rings and contexts in guest RAM instead of linked lists, a command ring, an event ring with an ERST, and one interrupter |
 //! | [`msd`] | `dev-usb-msd` | a USB mass storage device: Bulk-Only Transport and a SCSI command set over two bulk endpoints, backed by the same [`Medium`](crate::dev::medium::Medium) an ATA drive or an NVMe namespace reads |
 //!
 //! # The layering, and why it is the point
@@ -23,6 +24,14 @@
 //! vendor's own. That is the test of whether the split is real: the next
 //! controller that embeds an EHCI core — and there are many — is another
 //! register map and nothing else.
+//!
+//! [`xhci`] is the other half of the same claim, from the far side. It shares
+//! *nothing* with [`ehci`] — rings and contexts instead of linked lists, a Cycle
+//! bit instead of an Active bit, an event ring the controller produces instead
+//! of a status field it writes back — and it still needed no change to
+//! [`crate::bus::usb`], because the seam there is a transaction and a
+//! transaction is a transaction whatever built the schedule. [`msd`]'s disk
+//! answers both without knowing which is asking.
 //!
 //! # Both directions, and what that cost the fabric
 //!
@@ -58,6 +67,10 @@ pub mod hid;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-usb-msd")))]
 pub mod msd;
 
+#[cfg(feature = "dev-usb-xhci")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-usb-xhci")))]
+pub mod xhci;
+
 /// Add every USB class this build has to a registry.
 ///
 /// # Errors
@@ -74,6 +87,8 @@ pub fn register(registry: &mut crate::core::Registry) -> crate::Result<()> {
     hid::register(registry)?;
     #[cfg(feature = "dev-usb-msd")]
     msd::register(registry)?;
+    #[cfg(feature = "dev-usb-xhci")]
+    xhci::register(registry)?;
     let _ = registry;
     Ok(())
 }
@@ -94,6 +109,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> crate::Result<()> {
     hid::bind(bindings)?;
     #[cfg(feature = "dev-usb-msd")]
     msd::bind(bindings)?;
+    #[cfg(feature = "dev-usb-xhci")]
+    xhci::bind(bindings)?;
     let _ = bindings;
     Ok(())
 }
@@ -117,5 +134,7 @@ pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
     out.push(hid::schema());
     #[cfg(feature = "dev-usb-msd")]
     out.push(msd::schema());
+    #[cfg(feature = "dev-usb-xhci")]
+    out.push(xhci::schema());
     out
 }
