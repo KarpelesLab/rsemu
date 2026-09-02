@@ -789,6 +789,12 @@ fn install_capture(
     rsemu::host::display::sms::capture::install(options)?;
     #[cfg(feature = "dev-lcdc")]
     rsemu::host::display::lcd::capture::install(options)?;
+    // The pointer. Unconditional for the same reason a display is: the
+    // interception constructs the same device from the same properties and
+    // keeps an `Arc`, so whether a frontend is listening cannot change what was
+    // built.
+    #[cfg(feature = "dev-usb-hid")]
+    rsemu::host::input::mouse::capture::install(options)?;
     #[cfg(feature = "dev-nes-apu")]
     rsemu::host::audio::nes::capture::install(options, ring_for(args))?;
     // The two console sound chips, and unlike the NES's these are installed
@@ -1414,6 +1420,14 @@ fn vnc_session(
     #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
     if let Some(pad) = rsemu::host::input::PadSink::open(hosts, 0) {
         session = session.with_sink(Arc::new(pad));
+    }
+    // The pointer, if it has one of those. Nothing in `machines/` does yet — a
+    // USB controller and a display are not on the same board in this tree — so
+    // this is the half of the path that lives in `host/`, wired where it will
+    // be needed. `tests/vnc_pointer.rs` drives it with a mouse built by hand.
+    #[cfg(feature = "dev-usb-hid")]
+    if let Some(mouse) = rsemu::host::input::MouseSink::open(hosts) {
+        session = session.with_sink(Arc::new(mouse));
     }
 
     // Recording and replaying are `core::record`'s, not this frontend's: what

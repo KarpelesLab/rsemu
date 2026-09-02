@@ -14,7 +14,7 @@
 //! | --- | --- |
 //! | [`Keysym`] | one key, named the way RFB names it: an X11 keysym |
 //! | [`InputEvent`] | what happened: a key went down, a pointer moved |
-//! | [`InputSink`] | where an event lands: a keyboard port, a pad, a tablet |
+//! | [`InputSink`] | where an event lands: a keyboard port, a pad, a mouse |
 //! | [`Feed`] | the channel's end: decodes a payload and fans it out to sinks |
 //! | [`KeyMap`] | keysym → AT scan codes, with the shift state that implies |
 //!
@@ -27,7 +27,8 @@
 //!                                            │  (a round boundary at t)
 //!                                            ▼
 //!                        (t, "input:vnc", 12 bytes) ─► Feed ─┬─► KeyboardSink
-//!                                            │               └─► PadSink
+//!                                            │               ├─► PadSink
+//!                                            │               └─► MouseSink
 //!                                       the recording
 //! ```
 //!
@@ -1003,6 +1004,185 @@ impl InputSink for PadSink {
         };
         self.held.store(next, Ordering::Relaxed);
         self.pads.set(self.port, next);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the pointer
+// ---------------------------------------------------------------------------
+
+/// An [`InputSink`] that moves a USB HID mouse.
+///
+/// The one sink that has to *convert* rather than translate: RFB says where the
+/// pointer is (RFC 6143 §7.5.5, absolute, in framebuffer pixels) and a boot
+/// mouse says how far it moved (HID 1.11 Appendix E.10, relative, one signed
+/// byte per axis). So this keeps the last position it was told about and sends
+/// the difference.
+///
+/// # Two places where the conversion is lossy, and what is done about each
+///
+/// **A jump larger than a report can carry.** The descriptor's logical range is
+/// -127..127, so a pointer that crosses a 640-pixel screen in one event cannot
+/// be expressed. The delta is clamped and *the remainder is kept*: the
+/// reference position advances by what was actually sent, so the next event
+/// continues the movement rather than restarting from the new position. A
+/// continuous drag therefore arrives intact, and only a jump that stops mid-way
+/// leaves the guest's pointer short — which is the honest cost of driving a
+/// relative device from an absolute protocol, and the reason an absolute HID
+/// tablet is the right long-term answer (there is no tablet model in `dev/`
+/// yet).
+///
+/// **The buttons are not in the same order.** RFB's mask is physical — bit 0
+/// left, bit 1 middle, bit 2 right — and HID's is by usage: button 1 primary,
+/// button 2 secondary, button 3 tertiary, which on a mouse is left, *right*,
+/// middle (HID Usage Tables, "Button Page"; HID 1.11 Appendix B.2 for the boot
+/// report). Bits 1 and 2 are therefore swapped on the way through, and getting
+/// this wrong is invisible until somebody right-clicks. The wheel — RFB bits 3
+/// and 4, sent as button presses — has nowhere to go: this device's report is
+/// three bytes with no wheel axis, so it is dropped rather than turned into a
+/// button the guest would see as a click.
+///
+/// # Determinism
+///
+/// Nothing here is timed and nothing here is stamped. The event arrives from
+/// [`Feed`], which the machine hands its round instant, so a recorded session
+/// replays into the same deltas — the sink is a pure function of the events it
+/// has seen, which is exactly what makes it replayable.
+#[cfg(feature = "dev-usb-hid")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-usb-hid")))]
+#[derive(Debug)]
+pub struct MouseSink {
+    mouse: Arc<crate::dev::usb::hid::HidMouse>,
+    /// Where the sink believes the guest's pointer is, in framebuffer pixels.
+    ///
+    /// `None` until the first event: the first thing a client sends is wherever
+    /// the pointer happened to be over its window, and reporting a jump from
+    /// the origin to there would fling the guest's cursor across the screen.
+    at: crate::core::sync::Mutex<Option<(i64, i64)>>,
+}
+
+#[cfg(feature = "dev-usb-hid")]
+impl MouseSink {
+    /// Move `mouse`.
+    #[must_use]
+    pub fn new(mouse: Arc<crate::dev::usb::hid::HidMouse>) -> MouseSink {
+        MouseSink {
+            mouse,
+            at: crate::core::sync::Mutex::new(None),
+        }
+    }
+
+    /// Move whatever mouse this build's machine constructed.
+    ///
+    /// `None` for a machine with no pointer — every board in `machines/` today,
+    /// which is not an error and must not be reported as one.
+    #[must_use]
+    pub fn open(hosts: &crate::core::hosts::HostObjects) -> Option<MouseSink> {
+        mouse::capture::take(hosts).map(MouseSink::new)
+    }
+
+    /// The RFB button mask as a HID boot-report button byte.
+    ///
+    /// Bits 1 and 2 swap; everything above bit 2 — the wheel — is dropped.
+    fn hid_buttons(rfb: u8) -> u8 {
+        (rfb & 0b001) | ((rfb & 0b010) << 1) | ((rfb & 0b100) >> 1)
+    }
+}
+
+#[cfg(feature = "dev-usb-hid")]
+impl InputSink for MouseSink {
+    fn deliver(&self, event: InputEvent) {
+        let InputEvent::Pointer { x, y, buttons } = event else {
+            return;
+        };
+        let (x, y) = (i64::from(x), i64::from(y));
+        let mut at = self.at.lock();
+        // The first event only establishes where the pointer is. A button held
+        // in it still has to reach the guest, so the report is sent either way
+        // — with a zero delta, which is what a click without a move is.
+        let (px, py) = at.unwrap_or((x, y));
+        let dx = (x - px).clamp(-127, 127);
+        let dy = (y - py).clamp(-127, 127);
+        // By what was sent, not by where the client said: the remainder of a
+        // clamped jump is then still owed and arrives with the next event.
+        *at = Some((px + dx, py + dy));
+        drop(at);
+        // Outside the lock, because `motion` takes the device's own
+        // (`CLAUDE.md`'s re-entrancy contract: release, then call outward).
+        #[allow(clippy::cast_possible_truncation)]
+        self.mouse
+            .motion(dx as i8, dy as i8, MouseSink::hid_buttons(buttons));
+    }
+}
+
+/// The interception that gets a host an `Arc<HidMouse>` out of a described
+/// machine.
+///
+/// The same seam every display and sound chip is found through
+/// (`host::display::nes::capture`), and it is host-side on purpose: the device
+/// model publishes nothing, so nothing about `dev/usb/hid.rs` has to know that
+/// a frontend exists.
+///
+/// `dev/usb/hid.rs`'s own module docs say there is no host input seam "because
+/// a real pointer's movements are a non-deterministic input crossing into the
+/// machine, and `CLAUDE.md` requires those to go through the record/replay
+/// seam, which does not exist yet". It exists now, and [`MouseSink`] is
+/// downstream of it: a frontend posts to [`Feed`] and the machine delivers at a
+/// round boundary it stamped, so the condition that doc set is met rather than
+/// waived.
+#[cfg(feature = "dev-usb-hid")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-usb-hid")))]
+pub mod mouse {
+    /// Finding the mouse a build constructed.
+    pub mod capture {
+        use alloc::sync::Arc;
+
+        use crate::core::error::Result;
+        use crate::core::hosts::{Captured, HostKind, HostObjects};
+        use crate::dev::usb::hid::{HidMouse, MOUSE_CLASS};
+        use crate::machine::BuildOptions;
+
+        /// Replace `usb.mouse`'s constructor in `options` with one that keeps a
+        /// handle.
+        ///
+        /// Installed unconditionally rather than only when a frontend is
+        /// listening, for the reason the display captures are: the interception
+        /// changes nothing about the machine — it constructs the same device
+        /// from the same properties and keeps an `Arc` — so whether a host
+        /// wants a pointer must not be able to change what was built.
+        ///
+        /// # Errors
+        ///
+        /// [`crate::Error::Config`] if something else has already claimed this
+        /// build's capture table for this class.
+        pub fn install(options: &mut BuildOptions) -> Result<()> {
+            let seen: Arc<Captured<HidMouse>> =
+                options
+                    .realize
+                    .hosts
+                    .open(HostKind::CAPTURE, MOUSE_CLASS.name, Captured::new)?;
+            options.bindings.replace(MOUSE_CLASS.name, move |props| {
+                let mouse = Arc::new(HidMouse::new(props)?);
+                seen.push(&mouse);
+                Ok(mouse)
+            });
+            Ok(())
+        }
+
+        /// The mouse this build constructed, the most recent one if there are
+        /// several.
+        ///
+        /// `None` when there is none, which is every machine in `machines/`
+        /// today: a USB controller and a display do not yet appear on the same
+        /// board.
+        #[must_use]
+        pub fn take(hosts: &HostObjects) -> Option<Arc<HidMouse>> {
+            hosts
+                .get::<Captured<HidMouse>>(HostKind::CAPTURE, MOUSE_CLASS.name)
+                .ok()
+                .flatten()?
+                .take()
+        }
     }
 }
 
