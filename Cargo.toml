@@ -1359,6 +1359,30 @@ machine-q35 = [
   "dev-ata-disk",
 ]
 
+# The q35-linux board (machines/q35-linux.machine): the q35 chipset with a
+# kernel in the socket instead of a firmware. `machine-q35` is a board for
+# firmware and `machine-pc64` is a board for a kernel; this is the third, and it
+# exists because they cannot be one -- `x86.linuxboot` maps its reset stub at
+# the top of the address space, which is exactly where the firmware socket is.
+#
+# So: the ICH9, the (G)MCH with ECAM, the APICs, the HPET and the generated ACPI
+# tables from `machine-q35`, `x86.linuxboot` from `machine-pc64`, and an **NVM
+# Express controller** on the PCI bus for the kernel to find a disk on. NVMe and
+# not one of the three other controllers in this tree because that is what a
+# stock distribution kernel has *built in*: a module lives on the root that has
+# not been mounted yet, and `nvme.ko` publishes `/dev/nvme0n1` with no SCSI
+# layer under it. No video, no 8042, no IDE, no floppy: each would be a second
+# thing being tested. Adds no dependencies.
+machine-q35-linux = [
+  "cpu-x86",
+  "dev-q35",
+  "dev-uart-ns16550",
+  "dev-pc-apic",
+  "dev-pc-hpet",
+  "dev-linuxboot",
+  "dev-nvme",
+]
+
 # The pc64 board (machines/pc64.machine): a PC with a long-mode processor and no
 # firmware at all. A `bzImage` bound to the `kernel` media slot is written into
 # memory and entered at its 32-bit entry point, so the first thing that executes

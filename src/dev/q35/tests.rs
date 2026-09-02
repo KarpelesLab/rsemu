@@ -128,8 +128,10 @@ impl Rig {
             Bdf::new(0, lpc::LPC_DEVICE, 0).expect("legal"),
             0x2918,
             0,
-            pm_base,
-            [0x80; lpc::PIRQS],
+            lpc::Post {
+                pm_base,
+                ..lpc::Post::default()
+            },
             String::from("port"),
         );
         mch.attach_space(&mem);
@@ -494,21 +496,85 @@ fn a_table_the_machine_has_no_part_for_is_not_emitted() {
     assert!(!has(b"HPET"), "a machine with no HPET gets no HPET table");
 }
 
-#[test]
-fn every_table_checksums_and_the_rsdp_checksums_twice() {
-    let facts = acpi::MachineFacts {
+/// The facts a fully populated q35 presents, which is what
+/// `machines/q35-linux.machine` builds.
+fn full_facts() -> acpi::MachineFacts {
+    acpi::MachineFacts {
         lapic: Some((0xfee0_0000, 0)),
         ioapic: Some(0xfec0_0000),
         hpet: Some((0xfed0_0000, 0x8086_a201)),
         acpi_io: Some(0x600),
         ecam: Some((0xe000_0000, 256 * 1024 * 1024)),
         tables: Some(0xe_0000),
+        ram_top: Some(0x1010_0000),
+        config_ports: Some((0xcf8, 8)),
         prt: alloc::vec![acpi::PrtRoute {
             device: 4,
             pin: 0,
             gsi: 11
         }],
+    }
+}
+
+#[test]
+fn the_host_bridge_declares_windows_that_leave_room_for_a_base_address_register() {
+    let dsdt = acpi::dsdt(&full_facts(), &acpi::TableConfig::default());
+    let holds = |what: &[u8]| dsdt.windows(what.len()).any(|w| w == what);
+
+    // The bus numbers, and the two halves of the I/O space with the 0xcf8 pair
+    // cut out between them. Nothing downstream may be allocated those eight
+    // ports: they are the bridge's own register file.
+    assert!(holds(&aml::bus_number_range(0, 0xff)), "bus 0-255");
+    assert!(holds(&aml::dword_io(0x0000, 0x0cf7)), "I/O below the pair");
+    assert!(holds(&aml::dword_io(0x0d00, 0xffff)), "I/O above the pair");
+
+    // And the memory window, in the two pieces the ECAM window divides it
+    // into: from the megabyte above the top of RAM to the base of the window
+    // the (G)MCH placed, and from the end of that window to the I/O APIC's
+    // page. Both edges are read out of the machine, so moving `PCIEXBAR` or
+    // giving the board more memory moves them.
+    assert!(
+        holds(&aml::dword_memory(0x1010_0000, 0xdfff_ffff, true)),
+        "from the top of RAM to the ECAM window"
+    );
+    assert!(
+        holds(&aml::dword_memory(0xf000_0000, 0xfebf_ffff, true)),
+        "and from the end of it to the I/O APIC"
+    );
+
+    // The ECAM window itself, declared again as a motherboard resource the
+    // bridge *consumes* — which is what an operating system looks for before it
+    // is willing to reach configuration space through the window at all.
+    assert!(
+        holds(&aml::dword_memory(0xe000_0000, 0xefff_ffff, false)),
+        "PNP0C02, holding the ECAM window"
+    );
+    assert!(
+        holds(&aml::eisa_id("PNP0C02").expect("well formed").to_le_bytes()),
+        "and the identifier that makes it one"
+    );
+}
+
+#[test]
+fn a_board_with_no_ecam_gets_one_undivided_memory_window() {
+    // The division is the ECAM window's doing and nothing else's: without one
+    // there is a single window from the top of RAM to the I/O APIC.
+    let facts = acpi::MachineFacts {
+        ecam: None,
+        ..full_facts()
     };
+    let dsdt = acpi::dsdt(&facts, &acpi::TableConfig::default());
+    let holds = |what: &[u8]| dsdt.windows(what.len()).any(|w| w == what);
+    assert!(holds(&aml::dword_memory(0x1010_0000, 0xfebf_ffff, true)));
+    assert!(
+        !holds(&aml::dword_memory(0x1010_0000, 0xdfff_ffff, true)),
+        "the piece that only exists to avoid the window"
+    );
+}
+
+#[test]
+fn every_table_checksums_and_the_rsdp_checksums_twice() {
+    let facts = full_facts();
     let cfg = acpi::TableConfig::default();
     let tables = acpi::generate(0xe_0000, &facts, &cfg).expect("a complete machine");
     let at = |address: u64| (address - tables.base) as usize;

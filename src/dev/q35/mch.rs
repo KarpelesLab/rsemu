@@ -724,7 +724,7 @@ impl Mch {
         }
         let ports = Arc::new(ConfigPorts::new(Arc::clone(&bus)));
         let config_region: RegionRef = Arc::new(Region::io(
-            "q35.mch.config",
+            CONFIG_REGION,
             CONFIG_PORT_WINDOW_LEN,
             Arc::clone(&ports) as Arc<dyn MemOps>,
         ));
@@ -810,6 +810,14 @@ impl Mch {
 /// them, and this constant is what makes the two ends agree without a second
 /// copy of either number.
 pub const ECAM_REGION: &str = "q35.mch.ecam";
+
+/// The name the 0xcf8/0xcfc register pair's region carries.
+///
+/// The same seam [`ECAM_REGION`] is, for the other window: [`super::acpi`]
+/// looks the pair up by name to punch a hole in the I/O aperture it hands the
+/// bus, because those eight ports are the bridge's own register file and not
+/// an address anything downstream may be allocated.
+pub const CONFIG_REGION: &str = "q35.mch.config";
 
 /// The `q35.mch` device class.
 pub static CLASS: DeviceClass = DeviceClass {

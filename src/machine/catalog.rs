@@ -305,6 +305,26 @@ pub static Q35: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/q35.machine"),
 };
 
+/// The q35 chipset with a kernel in the socket instead of a firmware.
+///
+/// [`Q35`] is a board for *firmware* and [`PC64`] is a board for a *kernel*,
+/// and they cannot be one board: `x86.linuxboot` maps its reset stub at the top
+/// of the address space, which is exactly where the firmware socket is. This is
+/// the third — the ICH9, the (G)MCH with its ECAM window, the APICs, the HPET
+/// and the generated ACPI tables, entered by `crate::dev::linuxboot`, with an
+/// **NVM Express controller** on the PCI bus for the kernel to find a disk on.
+///
+/// **No firmware is shipped and none can be**: a `bzImage` bound to the
+/// `kernel` slot is what executes after the reset vector.
+#[cfg(feature = "machine-q35-linux")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-q35-linux")))]
+pub static Q35_LINUX: CatalogEntry = CatalogEntry {
+    name: "q35-linux",
+    summary: "a q35 with no firmware: ECAM, ICH9, APICs, HPET, ACPI, an NVMe disk, and a kernel",
+    media: &["kernel", "initrd", "nvme0"],
+    source: include_str!("../../machines/q35-linux.machine"),
+};
+
 /// A PC with a long-mode processor and a kernel loaded straight into it.
 ///
 /// No firmware, no boot loader, no disk: a `bzImage` bound to the `kernel`
@@ -563,6 +583,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&PC_APIC);
     #[cfg(feature = "machine-q35")]
     out.push(&Q35);
+    #[cfg(feature = "machine-q35-linux")]
+    out.push(&Q35_LINUX);
     #[cfg(feature = "machine-pc64")]
     out.push(&PC64);
     #[cfg(feature = "machine-nes")]
@@ -1797,6 +1819,12 @@ mod tests {
             // is where a real one runs, behind `RSEMU_KERNEL`.
             #[cfg(feature = "machine-pc64")]
             ("pc64", "kernel" | "initrd") => &[],
+            // The same, and an empty namespace image: the `disk` parameter
+            // gives the controller its capacity, so a board with no bytes
+            // bound still has a drive on it. `tests/q35_linux` is where a real
+            // image goes, behind `RSEMU_DISK`.
+            #[cfg(feature = "machine-q35-linux")]
+            ("q35-linux", "kernel" | "initrd" | "nvme0") => &[],
             (m, other) => panic!("no fixture for `{m}`'s media slot `{other}`"),
         }
     }
