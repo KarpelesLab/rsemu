@@ -456,7 +456,15 @@ machine-arm926 = ["cpu-arm-aprofile"]
 # `no_std + alloc`, no `unsafe`, no dependencies. Written from the RISC-V
 # privileged/PLIC/ACLINT specifications, the PC16550D data sheet, OASIS VIRTIO
 # 1.2 and the Devicetree Specification.
-dev-riscv = []
+#
+# `dev-ata-disk` is here for the *medium seam alone* -- `dev::ata::Medium`,
+# which `virtio.blk` stores its bytes behind so that `--drive disk=root.qcow2`
+# backs it with a host file through `dev-blk` exactly as it backs an ATA drive
+# or an NVMe namespace (ROADMAP.md 7.1). It is what `dev-nvme` depends on it
+# for too. Nothing here talks ATA, and the dependency is heavier than the seam:
+# the seam should live somewhere neutral rather than under `dev/ata`, which is
+# a move rather than a feature edit -- see src/dev/riscv/virtio/blk.rs.
+dev-riscv = ["dev-ata-disk"]
 
 # Parallel NOR flash (src/dev/flash/cfi): the Common Flash Interface query
 # structure and the Intel/Sharp extended command set (CFI id 0x0001) -- status

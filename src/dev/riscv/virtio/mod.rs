@@ -10,7 +10,7 @@
 //! | --- | --- |
 //! | [`queue`] | split virtqueues: descriptor chains, available and used rings |
 //! | [`mmio`] | the MMIO transport register block and the status handshake |
-//! | [`blk`] | virtio-blk (device ID 2) over a byte-slice medium |
+//! | [`blk`] | virtio-blk (device ID 2), on the `dev::ata::Medium` seam |
 //! | [`rng`] | virtio-rng (device ID 4), deterministically seeded |
 //!
 //! # Source, and one prohibition
@@ -36,7 +36,9 @@ use core::fmt;
 use crate::core::device::{Device, DeviceClass, PropertySpec};
 use crate::core::error::Result;
 use crate::core::props::{Props, ValueKind};
+use crate::core::space::RamStore;
 use crate::core::state::{ChunkReader, ChunkWriter};
+use crate::dev::ata::Medium;
 
 use queue::{Descriptor, Queue};
 
@@ -118,33 +120,92 @@ pub trait Backend: Send + Sync + fmt::Debug {
     }
 }
 
+/// The media slot a `virtio.blk` looks for a host medium under when its
+/// machine description names none.
+pub const DEFAULT_SLOT: &str = "disk";
+
 /// Build a `virtio.blk` from machine-description properties.
+///
+/// # Where the bytes come from
+///
+/// The same two places an [`AtaDisk`](crate::dev::ata::AtaDisk)'s and an NVMe
+/// namespace's do, and the machine file names neither of them directly. It
+/// names a **media slot** (`image = "disk"`), and the run decides what is
+/// behind that name:
+///
+/// * a [`Medium`] the host installed — what
+///   `rsemu run riscv-virt --drive disk=root.qcow2` does — wins, and brings
+///   its own capacity, so `size` and the media table are both ignored. A host
+///   that named an image file did not also mean "and stamp these bytes over
+///   the front of it";
+/// * otherwise the media table's bytes, copied into a [`RamStore`] of `size`
+///   bytes — or of the image's own length when there is no `size`.
+///
+/// **Both paths are supported and neither is a degraded version of the
+/// other**: the media slot is what keeps this device `no_std` and what a wasm
+/// build runs on, and the file is what keeps a 16 GiB disk out of host memory.
 ///
 /// # Errors
 ///
 /// [`Error::Property`](crate::core::Error::Property) if neither `size` nor
-/// `image` was given, or if a property this class does not know was.
+/// `image` nor a host medium supplied anything, or if a property this class
+/// does not know was given; [`Error::Config`](crate::core::Error::Config) if
+/// an installed medium's capacity is not a whole number of 512-byte sectors.
 pub fn blk_from_props(props: &Props) -> Result<VirtioMmio> {
     let mut r = props.reader();
-    let image = r.optional_media("image")?.map(|m| m.to_bytes().to_vec());
+    let media = r.optional_media("image")?;
+    let slot = media.map(crate::core::props::Media::name);
+    let image = media.map(crate::core::props::Media::to_bytes);
     let size = r.or_size("size", 0)?;
     let serial = r.or("serial", String::from("rsemu-virtio"))?;
     let read_only = r.or("readonly", false)?;
     r.finish()?;
 
-    let mut bytes = image.unwrap_or_default();
-    let size = usize::try_from(size).unwrap_or(usize::MAX);
-    if size > bytes.len() {
-        bytes.resize(size, 0);
-    }
-    if bytes.is_empty() {
+    // A medium the *host* installed, under the media slot's name if there is
+    // one. It wins over the media table: a run that said
+    // `--drive disk=root.qcow2` meant it.
+    let supplied = match props.hosts() {
+        Some(hosts) => {
+            let name = slot.unwrap_or(DEFAULT_SLOT);
+            crate::dev::ata::medium::get(hosts, name)?.and_then(|slot| slot.take())
+        }
+        None => None,
+    };
+    let bytes = match (&supplied, size, image.as_ref()) {
+        (Some(medium), _, _) => medium.capacity(),
+        // The larger of the two, which is what `size` has always meant here: a
+        // media slot holds the *front* of the disk and `size` pads it out, so
+        // an image longer than `size` is a bigger disk rather than an error.
+        (None, size, Some(image)) => size.max(image.len() as u64),
+        (None, size, None) => size,
+    };
+    if bytes == 0 {
         return Err(crate::core::Error::Property(String::from(
             "a `virtio.blk` needs a medium: give it a `size` (`size = 16M`) or an `image` \
-             media slot, or both to pad an image out to a larger disk",
+             media slot, or both to pad an image out to a larger disk — or install one under \
+             its media slot with `--drive disk=…`",
         )));
     }
+    let media: Arc<dyn Medium> = match supplied {
+        Some(medium) => medium,
+        None => {
+            // Rounded up rather than refused: a media slot holds whatever a
+            // front end bound to it, and a short tail there is a ramdisk
+            // image's rather than a misconfiguration.
+            let bytes = bytes.next_multiple_of(blk::SECTOR_SIZE);
+            let store = RamStore::new(bytes);
+            if let Some(image) = image {
+                RamStore::write_at(&store, 0, &image).map_err(|e| crate::core::Error::Config {
+                    at: String::from(BLK_CLASS_NAME),
+                    message: alloc::format!("the bound image did not fit: {e}"),
+                })?;
+            }
+            Arc::new(store)
+        }
+    };
+
     Ok(VirtioMmio::new(
-        Arc::new(VirtioBlk::new(bytes, serial, read_only)) as Arc<dyn Backend>,
+        Arc::new(VirtioBlk::new(media, serial, read_only)?) as Arc<dyn Backend>,
         &BLK_CLASS,
     ))
 }
@@ -169,19 +230,21 @@ pub fn rng_from_props(props: &Props) -> Result<VirtioMmio> {
 pub static BLK_CLASS: DeviceClass = DeviceClass {
     name: BLK_CLASS_NAME,
     version: 1,
-    summary: "virtio block device on the MMIO transport, over an in-memory medium",
+    summary: "virtio block device on the MMIO transport, over a `dev::ata::Medium`",
     properties: &[
         PropertySpec {
             name: "size",
             kind: ValueKind::Size,
             required: false,
-            summary: "how large the disk is, as in `size = 16M`",
+            summary: "how large the disk is, as in `size = 16M`; ignored when a host \
+                      installed a medium under the media slot",
         },
         PropertySpec {
             name: "image",
             kind: ValueKind::Media,
             required: false,
-            summary: "the disk's contents, as the name of a media slot",
+            summary: "the media slot the disk is bound to; a host medium under that name \
+                      wins, which is what `--drive disk=root.qcow2` installs",
         },
         PropertySpec {
             name: "serial",
@@ -269,6 +332,34 @@ mod tests {
         let disk = blk_from_props(&Props::new().with("size", Value::Size(4096)))
             .expect("a size is enough");
         assert_eq!(disk.backend().device_id(), DEVICE_ID_BLOCK);
+    }
+
+    #[test]
+    fn a_medium_the_host_installed_wins_over_the_machine_files_size() {
+        // `--drive disk=root.qcow2` in the small: the run installs a medium
+        // under the slot the machine file names, and it brings its own
+        // capacity. A run that named an image file meant it.
+        use crate::core::hosts::HostObjects;
+        use crate::core::space::RamStore;
+        use crate::dev::ata::medium;
+
+        let hosts = alloc::sync::Arc::new(HostObjects::new());
+        let store: Arc<dyn Medium> = Arc::new(RamStore::new(8 * 512));
+        medium::install(&hosts, "disk", store).expect("nothing else claimed it");
+
+        let props = Props::new()
+            .with("size", Value::Size(64 * 1024))
+            .with_hosts(hosts);
+        let disk = blk_from_props(&props).expect("a medium is enough");
+        let backend = disk.backend();
+        assert_eq!(backend.device_id(), DEVICE_ID_BLOCK);
+        let mut config = [0u8; 8];
+        backend.config_read(0, &mut config);
+        assert_eq!(
+            u64::from_le_bytes(config),
+            8,
+            "the medium's eight sectors, not the 128 `size` asked for"
+        );
     }
 
     #[test]

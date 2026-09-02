@@ -50,6 +50,13 @@ machine "riscv-virt" {
   # The virtio disk's size. Whatever is bound to the `disk` media slot is the
   # start of it, padded out to this with zeroes — so `-p storage=64M` alone is
   # a blank 64 MiB disk, and `--disk foo.img` alone is exactly that image.
+  #
+  # Ignored when the *run* backs that slot with a host file instead:
+  # `--drive disk=root.qcow2` installs a medium, the medium brings its own
+  # capacity, and the guest sees the image's size rather than this one. The two
+  # are different contracts and both are supported — bytes in a slot are what a
+  # `no_std` or wasm build has, and a file is what keeps a 16 GiB disk out of
+  # host memory (docs/buses/storage.md).
   param storage = 16M
 
   # How big each of the two NOR flash banks is. Two, because that is how a
@@ -147,6 +154,12 @@ machine "riscv-virt" {
   #
   # Both are bus masters and walk their own descriptor rings, so both declare
   # the space that DMA traverses (ROADMAP.md §4.4).
+  # The disk's bytes come from the `disk` media slot, and the machine file says
+  # a slot name rather than a host path because a machine file is portable data
+  # describing a board. What is behind that name is the run's business:
+  #
+  #   rsemu run riscv-virt --disk rootfs.img          # bytes, copied into RAM
+  #   rsemu run riscv-virt --drive disk=root.qcow2    # a file, left on disk
   object blk "virtio.blk" {
     space  = mem
     size   = storage

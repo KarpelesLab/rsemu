@@ -99,6 +99,36 @@ NVMe and virtio-blk are both freely specified and much simpler to implement
 correctly than ATA. Prefer them for new machines; implement ATA because legacy
 guests require it.
 
+**virtio-blk is on the `Medium` seam too**, which makes it three devices rather
+than two and settles what "the seam" means in this tree: `dev::ata::Medium` is
+where a storage device's bytes come from, and a controller that invents its own
+backing store is a controller that has quietly opted out of `--drive`, out of
+the snapshot policies, and out of qcow2. `dev/riscv/virtio/blk` held a
+`Vec<u8>` until it did not, and the three things that cost are worth recording
+because they are what any *next* device would also pay: the whole capacity in
+host memory whatever the guest actually touched; no answer at all to what a
+snapshot of it means, so a 16 GiB disk went into the chunk; and a
+guest-supplied descriptor length reaching an allocator, because the range check
+was a slice index on the backing vector and the vector was indexed *after* the
+buffer for it had been allocated. The seam does not fix the last one by itself
+— the fix is to check the range in `u64` and stage the transfer in bounded
+chunks — but it is what made the check expressible.
+
+The seam's *location* is now the one loose end. It lives in `src/dev/ata/`
+because ATA was the first device to want it, so `dev-riscv` and `dev-nvme` both
+depend on `dev-ata-disk` for a trait, a slot and a three-valued enum, and a
+`riscv-virt` build links an ATA command set it will never issue. That is a
+crate-shape problem rather than a correctness one — the file is `no_std` and
+dependency-free — but the shape rule is explicit that a NES build links a 6502
+and nothing else. Moving `medium.rs` to a neutral `src/dev/medium.rs` under its
+own feature is the fix; it is a rename, so it is one commit and not a design.
+
+`machines/riscv-virt.machine` did not change to get any of this, which is the
+test of whether the media-slot design held: the board still says
+`image = "disk"`, `--disk rootfs.img` still binds bytes to that slot, and
+`--drive disk=root.qcow2` installs a `Medium` under the same name that wins and
+brings its own capacity.
+
 **NVMe now exists** (`dev/nvme`, feature `dev-nvme`), and it is the first
 storage device in this tree that is a **bus master**. Everything before it was
 either programmed I/O — the guest reads a data port a word at a time — or
