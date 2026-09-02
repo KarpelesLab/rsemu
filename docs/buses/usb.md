@@ -547,7 +547,7 @@ arrived by polling `USBSTS`.
 
 The device that makes USB reach the storage stack. A **USB mass storage device**
 speaking **Bulk-Only Transport** over a SCSI transparent command set, whose bytes
-are a `dev::ata::Medium` — the same seam an ATA drive, an AHCI port and an NVMe
+are a `dev::medium::Medium` — the same seam an ATA drive, an AHCI port and an NVMe
 namespace read and write — so `rsemu run usb-mini --drive usb0=disk.qcow2` puts a
 sparse qcow2 behind a USB stick through the media slot that already existed.
 

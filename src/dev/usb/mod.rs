@@ -12,7 +12,7 @@
 //! | [`dwc2`] | `dev-usb-dwc2` | a Synopsys DesignWare USB 2.0 OTG controller — STM32's OTG_FS — with host channels and a shared FIFO instead of a schedule in guest memory, **in both roles**: host, and device, where the guest is the peripheral |
 //! | [`chipidea`] | `dev-usb-chipidea` | the ChipIdea/ARC dual-role variant of the same controller: a `+0x140` operational offset, an `ID` register and a `USBMODE` role select |
 //! | [`hid`] | `dev-usb-hid` | a USB HID boot-protocol mouse: the smallest device that proves the stack |
-//! | [`msd`] | `dev-usb-msd` | a USB mass storage device: Bulk-Only Transport and a SCSI command set over two bulk endpoints, backed by the same [`Medium`](crate::dev::ata::Medium) an ATA drive or an NVMe namespace reads |
+//! | [`msd`] | `dev-usb-msd` | a USB mass storage device: Bulk-Only Transport and a SCSI command set over two bulk endpoints, backed by the same [`Medium`](crate::dev::medium::Medium) an ATA drive or an NVMe namespace reads |
 //!
 //! # The layering, and why it is the point
 //!

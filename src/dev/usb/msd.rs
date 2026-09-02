@@ -117,7 +117,7 @@ use crate::core::props::{Props, ValueKind};
 use crate::core::space::RamStore;
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
-use crate::dev::ata::{Medium, Snapshot, medium};
+use crate::dev::medium::{self as medium, Medium, Snapshot};
 use crate::machine::realize::Instance;
 
 /// The class name a machine description writes.

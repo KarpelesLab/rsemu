@@ -81,7 +81,7 @@ use rsemu::core::clock::GlobalTime;
 use rsemu::core::device::ResetKind;
 use rsemu::core::space::{MemAttrs, RamStore};
 use rsemu::core::value::Width;
-use rsemu::dev::ata::Medium;
+use rsemu::dev::medium::Medium;
 use rsemu::machine::{Machine, catalog};
 
 // ---------------------------------------------------------------------------
@@ -893,7 +893,7 @@ fn board() -> (Machine, Arc<RamStore>) {
 
     let mut options = catalog::build_options().expect("this build's options");
     options.realize.media.insert("firmware", firmware());
-    rsemu::dev::ata::medium::install(
+    rsemu::dev::medium::install(
         &options.realize.hosts,
         "usb0",
         Arc::clone(&store) as Arc<dyn Medium>,
