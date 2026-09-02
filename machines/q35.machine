@@ -24,8 +24,10 @@
 #     ROM. §5.1.18-§5.1.24.
 #   * **PCI interrupt routing.** The ICH9's eight `PIRQ[A-H]` routers steer a
 #     PCI function's interrupt onto an ISA line. `pc-at` has no answer for that
-#     at all — `src/bus/pci` says so out loud — and it is what an operating
-#     system needs before a PCI device's interrupt reaches anything.
+#     at all, and it is what an operating system needs before a PCI device's
+#     interrupt reaches anything. The other half of it is in `src/bus/pci`: a
+#     function drives an `INTA#`-`INTD#` pin, the fabric rotates it by device
+#     number onto one of four bus nets, and the bridge below collects them.
 #   * **ACPI.** The register block at `PMBASE`, and the tables. A modern kernel
 #     will not enumerate a q35 without an RSDP, an XSDT, a FADT and a MADT, and
 #     will not find its interrupt routing without the last of those.
@@ -232,12 +234,31 @@ machine "q35" {
   # this function, and it is a lazily advanced device that counts its own
   # domain's ticks one for one. Without a domain the realizer refuses the
   # object, which is the right answer — a timer with no clock is not a timer.
+  #
+  # `pirq-routes` is the third of this board's firmware stand-ins, and it stands
+  # in for the same missing thing `ecambase` and `pmbase` do. An ICH9 powers up
+  # with every `PIRQ[n]_ROUT` holding 80h, which means *not routed*, and §13.1.17
+  # says so out loud: "BIOS must program this bit to 0 during POST for any of
+  # the PIRQs that are being used". rsemu's own BIOS does not, so the board
+  # states the routing a POST would have written — and the ACPI `_PRT` below is
+  # generated from what the bridge actually holds rather than from a constant
+  # beside it, so the two cannot disagree. A firmware that programs the
+  # registers itself overrides all four and publishes its own tables, which is
+  # the arrangement a real machine has.
+  #
+  # The numbers: `PIRQ[A-D]` alternately to IRQ11 and IRQ10, the two lines a PC
+  # has traditionally left free for PCI, and the two this board wires to both an
+  # 8259A input and the I/O APIC input of the same number. `PIRQ[E-H]` are left
+  # unrouted because nothing reaches them: the fabric's four interrupt nets land
+  # on A-D, and steering an internal function onto one of the other four needs
+  # the `D<n>IR` registers in the root complex block, which is not modelled.
   object lpc "q35.lpc" {
-    clock     = pmtmr
-    bus       = "pci0"
-    iospace   = "port"
-    device-id = 0x2918
-    pm-base   = pmbase
+    clock       = pmtmr
+    bus         = "pci0"
+    iospace     = "port"
+    device-id   = 0x2918
+    pm-base     = pmbase
+    pirq-routes = [11, 10, 11, 10]
   }
 
   # -- the ACPI tables --------------------------------------------------------
@@ -264,6 +285,7 @@ machine "q35" {
   object acpi "q35.acpi" {
     space      = mem
     iospace    = "port"
+    bus        = "pci0"
     size       = acpisize
     cpus       = 1
     ioapic-id  = 1
@@ -458,10 +480,18 @@ machine "q35" {
   # The `PIRQ` routers' eleven outputs. Every one is wired, to the 8259A input
   # it names and to the I/O APIC input of the same number, because which of them
   # a given PCI function ends up on is a run-time decision made by whatever
-  # firmware writes `PIRQ[n]_ROUT`. Nothing drives the eight `PIRQ` *inputs*
-  # yet: no PCI function in this tree publishes an `INTA#` pin, and the board
-  # cannot wire what does not exist. That is the next thing this board needs,
-  # and it is a change to the PCI functions rather than to the chipset.
+  # firmware writes `PIRQ[n]_ROUT`. Wiring both is also what makes this board's
+  # `_PRT` honest in either mode: the global system interrupt and the ISA
+  # interrupt are the same number, so one table describes both.
+  #
+  # The eight `PIRQ` *inputs* are not wired here, and that is not an omission.
+  # Four of them are driven by the fabric itself: a PCI function drives its own
+  # `INTA#` pin, `src/bus/pci` swizzles it by device number onto one of the
+  # bus's four interrupt nets, and this bridge collects those nets because it
+  # says `bus = "pci0"`. A board cannot wire that wrong, which is the point of
+  # its not being wiring. All eight remain available as ordinary wire sinks for
+  # a board with something else to hang on one, and a pin driven from both is
+  # the wired-OR of the two.
   wire lpc.irq3    -> pic1.ir3
   wire lpc.irq3    -> ioapic.irq3
   wire lpc.irq4    -> pic1.ir4

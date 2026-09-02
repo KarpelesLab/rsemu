@@ -50,7 +50,17 @@
 //!   0x09                  cold reset both bridges
 //!   0x0a                  save, then load what was saved: a round trip
 //!   0x0b ...              load the rest of the input as a snapshot chunk
+//!   0x0c dd               drive a PCI function's INTA# : device (dd>>1)&3,
+//!                         level dd&1
 //! ```
+//!
+//! The last one is the path a *card* takes rather than a register: a function
+//! drives its `INTA#` pin, the fabric swizzles it by device number onto one of
+//! four interrupt nets, and the south bridge routes that net onto an ISA line
+//! whose level this target watches. It is re-entrant — a configuration write to
+//! `PIRQ[n]_ROUT` re-derives eleven outputs from inside the write — and it
+//! crosses three lock ranks, so a debug build's rank assertions are doing real
+//! work here.
 //!
 //! Anything else is skipped, which keeps a mutated corpus productive rather
 //! than mostly-rejected.
@@ -59,7 +69,7 @@ use std::sync::Arc;
 
 use libfuzzer_sys::fuzz_target;
 
-use rsemu::bus::pci::{Bdf, PciBus};
+use rsemu::bus::pci::{Bdf, Intx, IntxPin, PciBus};
 use rsemu::core::HostObjects;
 use rsemu::core::device::{Deferred, Device, RealizeCtx, ResetKind};
 use rsemu::core::space::{
@@ -67,6 +77,7 @@ use rsemu::core::space::{
 };
 use rsemu::core::state::{MachineShape, Migrations, StateReader, StateWriter};
 use rsemu::core::value::Width;
+use rsemu::core::wire::{FanIn, Level, Wire, WireId, WireIdAllocator, WireSink, WireSource};
 use rsemu::dev::q35::{lpc, mch};
 
 /// Where the board starts the ECAM window, so most inputs land inside it.
@@ -75,6 +86,20 @@ const ECAM: u64 = 0xe000_0000;
 /// Where the board starts the ACPI register block.
 const PMBASE: u32 = 0x600;
 
+/// One of the router's eleven ISA outputs, watched.
+#[derive(Debug)]
+struct Watcher {
+    inputs: FanIn,
+    high: rsemu::core::sync::Mutex<[bool; lpc::ROUTABLE.len()]>,
+}
+
+impl WireSink for Watcher {
+    fn set_level(&self, src: WireId, line: u32, level: Level) {
+        self.inputs.set(src, level);
+        self.high.lock()[line as usize] = level.is_high();
+    }
+}
+
 /// A memory space, an I/O space, and the two bridges on one fabric.
 struct Rig {
     mem: Arc<AddressSpace>,
@@ -82,6 +107,14 @@ struct Rig {
     bus: Arc<PciBus>,
     mch: mch::Mch,
     lpc: lpc::Lpc,
+    /// Four cards, at four device numbers, each driving nothing but `INTA#` —
+    /// so the four of them land on four different nets (the swizzle).
+    pins: Vec<Intx>,
+    /// Where the eleven ISA outputs are.
+    irq: Arc<Watcher>,
+    /// Whether an untrusted snapshot has been loaded, which can put a `PIRQ`
+    /// *wire* input high without any card asserting.
+    tainted: std::cell::Cell<bool>,
 }
 
 impl Rig {
@@ -116,6 +149,7 @@ impl Rig {
             0x2918,
             0,
             PMBASE,
+            [0x80; lpc::PIRQS],
             String::from("port"),
         );
         mch.attach_space(&mem);
@@ -132,12 +166,46 @@ impl Rig {
                 RealizeCtx::new("lpc", RequesterId::ANONYMOUS, &mut deferred, &hosts);
             lpc.realize(&mut ctx).expect("00:1f.0 is free");
         }
+        // The eleven outputs, all onto one watcher, one input line each.
+        let ids = WireIdAllocator::new();
+        let sources: Vec<WireId> = lpc::ROUTABLE.iter().map(|_| ids.alloc()).collect();
+        let irq = Arc::new(Watcher {
+            inputs: FanIn::new(&sources),
+            high: rsemu::core::sync::Mutex::with_rank(
+                rsemu::core::sync::LockRank::LEAF,
+                [false; lpc::ROUTABLE.len()],
+            ),
+        });
+        for (line, id) in sources.iter().enumerate() {
+            let wire = Arc::new(
+                Wire::builder()
+                    .source(*id)
+                    .sink(Arc::clone(&irq) as Arc<dyn WireSink>, line as u32)
+                    .build(),
+            );
+            lpc.connect(
+                &format!("irq{}", lpc::ROUTABLE[line]),
+                WireSource::new(wire, *id),
+            )
+            .expect("the bridge drives every routable line");
+        }
+        // Four cards. Device 4 through 7, so the rotation puts one on each net.
+        let pins: Vec<Intx> = (4u8..8)
+            .map(|device| {
+                let pin = Intx::new(IntxPin::A);
+                pin.plug(&bus, Bdf::new(0, device, 0).expect("legal"));
+                pin
+            })
+            .collect();
         Rig {
             mem,
             io,
             bus,
             mch,
             lpc,
+            pins,
+            irq,
+            tainted: std::cell::Cell::new(false),
         }
     }
 
@@ -213,6 +281,18 @@ impl Rig {
         if let Some(base) = self.lpc.acpi_base() {
             assert_eq!(base % 128, 0, "PMBASE is on a 128-byte boundary");
             assert!(base <= 0xffff, "an I/O window is in the 64 KiB I/O space");
+        }
+        // With no card asserting, no ISA output may be held down. A router that
+        // rerouted a live input without releasing the line it left — or that
+        // came back from a reset still driving one — strands a level nothing
+        // can ever lower, which is the failure this whole path exists to
+        // prevent. Skipped once an untrusted snapshot has been loaded, because
+        // that can legitimately restore a `PIRQ` *wire* input as asserted.
+        if !self.tainted.get() && self.pins.iter().all(|p| p.level().is_low()) {
+            assert!(
+                self.irq.high.lock().iter().all(|high| !high),
+                "an ISA output is asserted with nothing driving any PIRQ"
+            );
         }
     }
 }
@@ -363,10 +443,17 @@ fuzz_target!(|data: &[u8]| {
                     .expect("the chunk is there");
                 rig.lpc.load(&mut chunk.reader()).expect("its own image");
             }
+            0x0c => {
+                let dd = byte(at);
+                at += 1;
+                rig.pins[usize::from((dd >> 1) & 3)]
+                    .set(Level::from_bool(dd & 1 != 0));
+            }
             0x0b => {
                 // The snapshot loader is a parser on bytes nobody vouched for.
                 // It has to reject or accept, never panic, and leave bridges
                 // that still work — which the invariants below then check.
+                rig.tainted.set(true);
                 if let Ok(reader) = StateReader::new(&data[at..]) {
                     if let Ok(chunk) =
                         reader.load("mch", mch::CLASS_NAME, 1, &Migrations::new())

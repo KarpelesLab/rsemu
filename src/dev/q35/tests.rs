@@ -129,6 +129,7 @@ impl Rig {
             0x2918,
             0,
             pm_base,
+            [0x80; lpc::PIRQS],
             String::from("port"),
         );
         mch.attach_space(&mem);
@@ -502,6 +503,11 @@ fn every_table_checksums_and_the_rsdp_checksums_twice() {
         acpi_io: Some(0x600),
         ecam: Some((0xe000_0000, 256 * 1024 * 1024)),
         tables: Some(0xe_0000),
+        prt: alloc::vec![acpi::PrtRoute {
+            device: 4,
+            pin: 0,
+            gsi: 11
+        }],
     };
     let cfg = acpi::TableConfig::default();
     let tables = acpi::generate(0xe_0000, &facts, &cfg).expect("a complete machine");
@@ -646,5 +652,198 @@ fn the_madt_carries_the_timers_interrupt_source_override() {
     assert!(
         nmi,
         "no Local APIC NMI entry: nothing routes an NMI to LINT1"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// a PCI function's interrupt, through the fabric and out of the router
+// ---------------------------------------------------------------------------
+
+/// One of the router's eleven ISA outputs, watched.
+#[derive(Debug)]
+struct Watch {
+    inputs: crate::core::wire::FanIn,
+    level: crate::core::sync::Mutex<crate::core::wire::Level>,
+}
+
+impl crate::core::wire::WireSink for Watch {
+    fn set_level(
+        &self,
+        src: crate::core::wire::WireId,
+        _line: u32,
+        level: crate::core::wire::Level,
+    ) {
+        self.inputs.set(src, level);
+        *self.level.lock() = self.inputs.resolve(crate::core::wire::Resolve::Or);
+    }
+}
+
+/// Wire `port` of the bridge to a watcher and hand back both halves.
+fn watch(lpc: &lpc::Lpc, ids: &crate::core::wire::WireIdAllocator, port: &str) -> Arc<Watch> {
+    use crate::core::wire::{FanIn, Level, Wire, WireSink, WireSource};
+    let id = ids.alloc();
+    let watcher = Arc::new(Watch {
+        inputs: FanIn::new(&[id]),
+        level: crate::core::sync::Mutex::with_rank(crate::core::sync::LockRank::LEAF, Level::Low),
+    });
+    let wire = Arc::new(
+        Wire::builder()
+            .source(id)
+            .sink(Arc::clone(&watcher) as Arc<dyn WireSink>, 0)
+            .build(),
+    );
+    lpc.connect(port, WireSource::new(wire, id))
+        .expect("the bridge drives this pin");
+    watcher
+}
+
+#[test]
+fn a_functions_intx_reaches_the_router_through_the_fabric() {
+    use crate::bus::pci::{Intx, IntxPin};
+    use crate::core::wire::Level;
+
+    let rig = Rig::new();
+    let ids = crate::core::wire::WireIdAllocator::new();
+    let irq5 = watch(&rig.lpc, &ids, "irq5");
+    let irq7 = watch(&rig.lpc, &ids, "irq7");
+    let f = function(&rig.bus, Bdf::new(0, lpc::LPC_DEVICE, 0).expect("legal"));
+
+    // A card at device 4 driving `INTA#`. 4 % 4 is 0, so it is on `INTA#` of
+    // the bus and arrives as `PIRQA`.
+    let at = Bdf::new(0, 4, 0).expect("legal");
+    let card = Intx::new(IntxPin::A);
+    card.plug(&rig.bus, at);
+    card.set(Level::High);
+
+    // Nothing yet: §13.1.17's power-up value is 80h, "the PIRQ is not routed to
+    // the 8259", which is exactly why the datasheet tells a BIOS to program it.
+    assert_eq!(*irq5.level.lock(), Level::Low);
+    assert_eq!(*irq7.level.lock(), Level::Low);
+
+    // Route PIRQA to IRQ5, with the line already asserted. A router that only
+    // acted on the *next* assertion would leave this interrupt lost for ever,
+    // which is the level-triggered failure worth having a test for.
+    rig.write_config(&*f, 0x60, &[0x05]);
+    assert_eq!(*irq5.level.lock(), Level::High);
+    assert_eq!(*irq7.level.lock(), Level::Low);
+
+    // Reprogram the same router while the same card is still asserting: the
+    // interrupt arrives on a different input, and the old one is released.
+    rig.write_config(&*f, 0x60, &[0x07]);
+    assert_eq!(*irq5.level.lock(), Level::Low, "IRQ5 was let go of");
+    assert_eq!(*irq7.level.lock(), Level::High, "and IRQ7 picked it up");
+
+    // The card deasserting releases it.
+    card.set(Level::Low);
+    assert_eq!(*irq7.level.lock(), Level::Low);
+}
+
+#[test]
+fn two_cards_sharing_one_pirq_hold_the_line_until_both_let_go() {
+    use crate::bus::pci::{Intx, IntxPin};
+    use crate::core::wire::Level;
+
+    let rig = Rig::new();
+    let ids = crate::core::wire::WireIdAllocator::new();
+    let irq11 = watch(&rig.lpc, &ids, "irq11");
+    let f = function(&rig.bus, Bdf::new(0, lpc::LPC_DEVICE, 0).expect("legal"));
+    // PIRQA and PIRQB both to IRQ11, which is what a firmware with more cards
+    // than router inputs does and what "sharing a PCI interrupt" means.
+    rig.write_config(&*f, 0x60, &[0x0b, 0x0b]);
+
+    // Device 4 pin A is net 0 (PIRQA); device 5 pin A is net 1 (PIRQB).
+    let first = Intx::new(IntxPin::A);
+    first.plug(&rig.bus, Bdf::new(0, 4, 0).expect("legal"));
+    let second = Intx::new(IntxPin::A);
+    second.plug(&rig.bus, Bdf::new(0, 5, 0).expect("legal"));
+
+    first.set(Level::High);
+    assert_eq!(*irq11.level.lock(), Level::High);
+    second.set(Level::High);
+    assert_eq!(*irq11.level.lock(), Level::High);
+    first.set(Level::Low);
+    assert_eq!(
+        *irq11.level.lock(),
+        Level::High,
+        "the other card is still asserting"
+    );
+    second.set(Level::Low);
+    assert_eq!(*irq11.level.lock(), Level::Low);
+}
+
+#[test]
+fn a_board_may_state_the_routing_its_missing_firmware_would_have_programmed() {
+    // The same stand-in `ecam` and `pm-base` are, and for the same reason:
+    // §13.1.17 has a BIOS program these during POST, and a board with no
+    // firmware that does it would have a router that routes nothing.
+    let props = crate::core::props::Props::new()
+        .with("device-id", 0x2918u64)
+        .with(
+            "pirq-routes",
+            crate::core::props::Value::List(alloc::vec![
+                crate::core::props::Value::Uint(11),
+                crate::core::props::Value::Uint(10),
+                crate::core::props::Value::Uint(0),
+            ]),
+        );
+    let lpc = lpc::Lpc::new(&props).expect("a legal description");
+    assert_eq!(lpc.pirq_route(0), 0x0b, "PIRQA routed to IRQ11");
+    assert_eq!(lpc.pirq_route(1), 0x0a, "PIRQB routed to IRQ10");
+    assert_eq!(lpc.pirq_route(2), 0x80, "0 leaves the datasheet's default");
+    assert_eq!(lpc.pirq_route(7), 0x80, "and so does saying nothing at all");
+
+    // An interrupt §13.1.17's table cannot name is refused rather than rounded.
+    let props = crate::core::props::Props::new()
+        .with("device-id", 0x2918u64)
+        .with(
+            "pirq-routes",
+            crate::core::props::Value::List(alloc::vec![crate::core::props::Value::Uint(8)]),
+        );
+    let e = lpc::Lpc::new(&props)
+        .expect_err("IRQ8 has no encoding")
+        .to_string();
+    assert!(e.contains("IRQ8"), "{e}");
+}
+
+#[test]
+fn the_routing_table_reads_the_same_in_both_directions() {
+    // §13.1.17's table has holes in it — five of the sixteen encodings are
+    // reserved — and it is read in both directions: forwards to drive a pin,
+    // backwards to turn a board's `pirq-routes` into a register value. A hole
+    // in one direction only would route an interrupt somewhere nobody listens.
+    for irq in 0..=255u8 {
+        let Some(encoding) = lpc::route_encoding(irq) else {
+            continue;
+        };
+        assert!(
+            lpc::ROUTABLE.contains(&irq),
+            "IRQ{irq} has an encoding but is not in ROUTABLE"
+        );
+        assert_eq!(lpc::pirq_destination(encoding), Some(irq));
+    }
+    for byte in 0..=255u8 {
+        let Some(irq) = lpc::pirq_destination(byte) else {
+            continue;
+        };
+        assert!(lpc::ROUTABLE.contains(&irq));
+        assert_eq!(lpc::route_encoding(irq), Some(byte & 0x0f));
+    }
+    for irq in lpc::ROUTABLE {
+        assert!(
+            lpc::route_encoding(irq).is_some(),
+            "ROUTABLE names IRQ{irq}, which no encoding reaches"
+        );
+    }
+}
+
+#[test]
+fn the_two_pirq_runs_are_disjoint_and_in_order() {
+    // §13.1.17 puts PIRQ[A-D] at 0x60 and §13.1.19 puts PIRQ[E-H] at 0x68, and
+    // the gap between them is the detail a second reader of the register file
+    // gets wrong.
+    let offsets: alloc::vec::Vec<u16> = (0..lpc::PIRQS).map(lpc::pirq_rout).collect();
+    assert_eq!(
+        offsets,
+        alloc::vec![0x60, 0x61, 0x62, 0x63, 0x68, 0x69, 0x6a, 0x6b]
     );
 }

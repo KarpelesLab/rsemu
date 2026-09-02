@@ -1091,3 +1091,62 @@ fn a_third_party_firmware_runs_on_this_board() {
          the images this instrument suits, or it stopped before it opened the log"
     );
 }
+
+#[test]
+fn the_dsdt_routes_every_slots_interrupt_where_the_router_is_programmed() {
+    // ACPI §6.2.13: `_PRT` maps a slot's `INTA#`-`INTD#` to an interrupt. This
+    // board's is generated from two things it can be asked for — the swizzle
+    // `src/bus/pci` applies, and the `PIRQ[n]_ROUT` bytes the bridge is
+    // actually holding — so the assertion is that the bytes in the table agree
+    // with the register the machine file programmed.
+    let (machine, _cpu, tables) = board();
+    let facts = tables.facts();
+
+    // `machines/q35.machine` states `pirq-routes = [11, 10, 11, 10]`, and the
+    // rotation is by device number: device 4 pin A is `PIRQA` (IRQ11), pin B is
+    // `PIRQB` (IRQ10), and device 5 pin A is `PIRQB`.
+    let gsi = |device: u8, pin: u8| {
+        facts
+            .prt
+            .iter()
+            .find(|r| r.device == device && r.pin == pin)
+            .map(|r| r.gsi)
+    };
+    assert_eq!(gsi(4, 0), Some(11), "device 4 INTA# is PIRQA");
+    assert_eq!(gsi(4, 1), Some(10), "device 4 INTB# is PIRQB");
+    assert_eq!(gsi(4, 2), Some(11), "device 4 INTC# is PIRQC");
+    assert_eq!(gsi(4, 3), Some(10), "device 4 INTD# is PIRQD");
+    assert_eq!(gsi(5, 0), Some(10), "the next slot along is rotated by one");
+    assert_eq!(gsi(31, 0), Some(10), "31 % 4 is 3, so PIRQD");
+    assert_eq!(
+        facts.prt.len(),
+        32 * 4,
+        "`_PRT` describes wiring rather than inventory: every device number the \
+         bus can carry, whether or not anything answers there"
+    );
+
+    // And the rows are really in the AML. One row is a `Package(4)` of
+    // {(device << 16) | 0xffff, pin, 0, gsi}; the encoded form of device 4's
+    // `INTA#` is searched for as bytes rather than parsed, because this file
+    // has no AML interpreter and the byte string is the thing an operating
+    // system will be handed.
+    let mem = mem(&machine);
+    let fadt = table(&mem, b"FACP");
+    let dsdt_at = u64::from_le_bytes(fadt[140..148].try_into().expect("eight bytes"));
+    let header = read_bytes(&mem, dsdt_at, 36);
+    let len = u32::from_le_bytes(header[4..8].try_into().expect("four bytes")) as usize;
+    let dsdt = read_bytes(&mem, dsdt_at, len);
+    assert_eq!(acpi::checksum(&dsdt), 0, "the DSDT still checksums");
+    assert!(
+        dsdt.windows(4).any(|w| w == b"_PRT"),
+        "no _PRT: an operating system has no way to find a PCI interrupt"
+    );
+    // `DWordPrefix` 0x0c, then 0x0004ffff; `ZeroOp` for pin A; `ZeroOp` for the
+    // source, which §6.2.13 defines as "allocated from the global interrupt
+    // pool"; then `BytePrefix` 0x0a and 11.
+    let row = [0x0c, 0xff, 0xff, 0x04, 0x00, 0x00, 0x00, 0x0a, 0x0b];
+    assert!(
+        dsdt.windows(row.len()).any(|w| w == row),
+        "device 4's INTA# is not routed to IRQ11 in the AML"
+    );
+}

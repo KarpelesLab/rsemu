@@ -107,6 +107,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::bus::pci::{Bdf, INTX_LINES, IntxPin, MAX_DEVICE, PciBus, buses, config, swizzle};
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
 use crate::core::props::{Props, ValueKind};
 use crate::core::space::{AddressSpace, MemAttrs, RamStore, Region, RegionRef};
@@ -174,6 +175,29 @@ pub struct MachineFacts {
     pub ecam: Option<(u64, u64)>,
     /// Where this device's own table region is mapped.
     pub tables: Option<u64>,
+    /// What `_PRT` should say: one entry per (device number, pin) that reaches
+    /// an interrupt. Empty where there is no fabric to ask, or where its router
+    /// routes nothing. [`routing`] builds it.
+    pub prt: Vec<PrtRoute>,
+}
+
+/// One row of `_PRT`: a slot's interrupt pin and the interrupt it reaches.
+///
+/// *ACPI Specification* revision 6.5 §6.2.13. A `_PRT` package is four fields —
+/// address, pin, source and source index — and this carries the two that vary
+/// plus the answer. The source is always the integer zero here, which §6.2.13
+/// defines as "the interrupt is allocated from the global interrupt pool" and
+/// makes the fourth field the global system interrupt itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PrtRoute {
+    /// The device number on bus 0. `_PRT`'s address field names every function
+    /// of it (§6.2.13: "the low word must be 0xFFFF").
+    pub device: u8,
+    /// Which pin, 0 for `INTA#` through 3 for `INTD#` — `_PRT`'s own encoding,
+    /// which is one less than the Interrupt Pin register's.
+    pub pin: u8,
+    /// The global system interrupt it arrives on.
+    pub gsi: u32,
 }
 
 /// Follow aliases down to the region that actually answers.
@@ -224,12 +248,106 @@ fn peek(space: &AddressSpace, addr: u64) -> Option<u32> {
     space.read(addr, Width::U32, attrs).ok().map(|v| v as u32)
 }
 
+/// The interrupt router on `bus`, found the way software finds it: by class
+/// code `060100h`, an ISA bridge (*PCI Local Bus Specification* Rev 2.1
+/// Appendix D).
+///
+/// Not by address. `machines/q35.machine` puts the bridge at 00:1f.0 because
+/// that is where an ICH9 lives, but the object takes a `device` property and a
+/// board may move it — and a generator that hard-coded the address would then
+/// describe a machine that was not built, which is the one thing this module
+/// exists not to do.
+fn router(bus: &PciBus) -> Option<Bdf> {
+    let attrs = MemAttrs {
+        debug: true,
+        ..MemAttrs::default()
+    };
+    bus.addresses().into_iter().find(|at| {
+        let mut class = [0u8; 3];
+        bus.config_read(*at, config::CLASS_CODE, &mut class, attrs);
+        class == [0x00, 0x01, config::CLASS_BRIDGE]
+    })
+}
+
+/// What `_PRT` should say about the functions on `bus`.
+///
+/// Two pieces of arithmetic and one read of the realized machine:
+///
+/// 1. [`crate::bus::pci::swizzle`], which turns a device number and one of
+///    `INTA#`-`INTD#` into one of the bus's four interrupt nets — the rotation
+///    the *PCI-to-PCI Bridge Architecture Specification* Revision 1.1 §9.1
+///    defines and `src/bus/pci` implements;
+/// 2. the router's **`PIRQ[n]_ROUT`** byte for that net (ICH9 §13.1.17), read
+///    out of the bridge that was actually built, which says which ISA interrupt
+///    the net comes out on.
+///
+/// The read carries `MemAttrs::debug`, and the register is one a debugger may
+/// read: it is a plain latch with no side effect and it is not behind an index,
+/// which is the distinction [`TableConfig::ioapic_id`] exists for.
+///
+/// # Every device number, not every device
+///
+/// The rows cover the whole bus — device 0 to [`MAX_DEVICE`], four pins each —
+/// rather than only the functions that happen to answer at reset. `_PRT`
+/// describes **wiring, not inventory**: a function that appears later reaches
+/// the same net by the same rotation, and an operating system that read the
+/// table once would have nothing to look up for it. Which is also why nothing
+/// here consults a function's Interrupt Pin register — the routing exists
+/// whether or not anything is plugged into it.
+///
+/// A net whose router routes nowhere — §13.1.17's power-up `80h`, or a reserved
+/// encoding — contributes **no row**. A `_PRT` that claimed an interrupt
+/// arrives somewhere it does not is worse than one that is silent about that
+/// pin, and silence reads as "this pin has no routing" rather than as a wrong
+/// one. A board with no router at all gets no rows, and therefore no `_PRT`.
+#[must_use]
+pub fn routing(bus: &PciBus) -> Vec<PrtRoute> {
+    let attrs = MemAttrs {
+        debug: true,
+        ..MemAttrs::default()
+    };
+    let Some(router) = router(bus) else {
+        return Vec::new();
+    };
+    // The four nets, resolved once: every device number reads the same four
+    // routing registers, only rotated.
+    let mut gsi = [None; INTX_LINES as usize];
+    for (net, slot) in gsi.iter_mut().enumerate() {
+        let mut route = [0u8; 1];
+        bus.config_read(router, lpc::pirq_rout(net), &mut route, attrs);
+        *slot = lpc::pirq_destination(route[0]).map(u32::from);
+    }
+    let mut out = Vec::new();
+    for device in 0..=MAX_DEVICE {
+        let at = Bdf {
+            bus: 0,
+            device,
+            function: 0,
+        };
+        for pin in [IntxPin::A, IntxPin::B, IntxPin::C, IntxPin::D] {
+            let (Some(index), Some(net)) = (pin.index(), swizzle(at, pin)) else {
+                continue;
+            };
+            let Some(gsi) = gsi[net as usize] else {
+                continue;
+            };
+            out.push(PrtRoute {
+                device,
+                pin: index,
+                gsi,
+            });
+        }
+    }
+    out
+}
+
 /// Ask the realized machine about itself.
 ///
-/// `mem` is the space the chipset decodes and `io` the one `PMBASE` places the
-/// ACPI block in.
+/// `mem` is the space the chipset decodes, `io` the one `PMBASE` places the
+/// ACPI block in, and `bus` the fabric whose functions `_PRT` describes — a
+/// board with no PCI fabric passes `None` and gets no `_PRT`.
 #[must_use]
-pub fn survey(mem: &AddressSpace, io: &AddressSpace) -> MachineFacts {
+pub fn survey(mem: &AddressSpace, io: &AddressSpace, bus: Option<&PciBus>) -> MachineFacts {
     let lapic = find(mem, LAPIC_REGION).map(|(base, _)| {
         // The ID register holds it in bits 31:24 (SDM Vol 3A §11.4.6). A part
         // that declines a debug read leaves the ID at zero, which is the
@@ -248,6 +366,7 @@ pub fn survey(mem: &AddressSpace, io: &AddressSpace) -> MachineFacts {
         acpi_io: find(io, lpc::ACPI_REGION).map(|(base, _)| base),
         ecam: find(mem, mch::ECAM_REGION),
         tables: find(mem, TABLES_REGION).map(|(base, _)| base),
+        prt: bus.map(routing).unwrap_or_default(),
     }
 }
 
@@ -465,14 +584,34 @@ const SLP_TYP_S5: u64 = 0b111;
 ///   I/O and memory apertures and the ECAM window as a resource template. An
 ///   operating system takes those from `MCFG` and from its own probing when
 ///   they are absent.
-/// * `_PRT`, the PCI interrupt routing table, which is the DSDT's statement of
-///   which `PIRQ` each slot's `INTA#`-`INTD#` reaches. [`super::lpc`] implements
-///   the *router*; what is missing is the swizzle, and the swizzle is a
-///   property of the board's traces rather than of the chipset. It is the next
-///   thing this file needs.
 /// * `Method`, `If`, `Return` — [`super::aml`] cannot encode them, on purpose.
+///
+/// # `_PRT`, and the one form of it this board can honestly emit
+///
+/// `_PRT` *is* here, from [`MachineFacts::prt`], and it is the **fixed** form:
+/// each package's source is the integer zero and its source index is a global
+/// system interrupt (ACPI §6.2.13). The alternative form names a PCI interrupt
+/// link device, and a link device is only meaningful with `_PRS`, `_CRS`,
+/// `_SRS` and `_DIS` — four methods that read and write the router's own
+/// configuration register, and [`super::aml`] deliberately cannot encode a
+/// method. Emitting link devices without them would be a `_PRT` that an
+/// operating system follows into a device it cannot then program, which is
+/// worse than the fixed form.
+///
+/// The fixed form is not a lie on *this* board, and the reason is a property of
+/// its wiring rather than a convenience: `machines/q35.machine` takes every one
+/// of the router's eleven outputs to the 8259A input it names **and** to the
+/// I/O APIC input of the same number, so the global system interrupt and the
+/// ISA interrupt are the same number and one table is true in both modes. What
+/// it does not survive is a guest *reprogramming* `PIRQ[n]_ROUT` after the
+/// tables were generated — the table then describes where the interrupt used to
+/// go. That is exactly why the routing this reads comes from the realized
+/// bridge rather than from a constant: a board states its power-up routing with
+/// `q35.lpc`'s `pirq-routes` (a stand-in for the POST §13.1.17 asks for), the
+/// tables are generated from it, and the two cannot disagree. A firmware that
+/// wants to move it publishes its own tables, which is what a firmware is for.
 #[must_use]
-pub fn dsdt(cfg: &TableConfig) -> Vec<u8> {
+pub fn dsdt(facts: &MachineFacts, cfg: &TableConfig) -> Vec<u8> {
     use super::aml;
     let mut body = Vec::new();
     // `\_S0`: the working state. `000b` on this chipset.
@@ -499,6 +638,28 @@ pub fn dsdt(cfg: &TableConfig) -> Vec<u8> {
     // `_BBN`: the bus number this bridge is the root of. Zero, because
     // everything on this board is on bus 0 — see the module docs on root ports.
     pci0.extend_from_slice(&aml::name("_BBN", &aml::integer(0)));
+    // `_PRT` (§6.2.13). Absent rather than empty when nothing on the bus
+    // interrupts: an empty package is a claim that no slot has an interrupt,
+    // and a board whose router simply has not been programmed has not made
+    // that claim.
+    if !facts.prt.is_empty() {
+        let mut rows = Vec::new();
+        for route in &facts.prt {
+            let mut row = Vec::new();
+            // §6.2.13: "the low word must be 0xFFFF", which names every
+            // function of the device rather than function zero.
+            row.extend_from_slice(&aml::integer((u64::from(route.device) << 16) | 0xffff));
+            row.extend_from_slice(&aml::integer(u64::from(route.pin)));
+            // Source zero: allocated from the global interrupt pool, so the
+            // next field is the interrupt itself rather than an index into a
+            // link device's possible settings.
+            row.extend_from_slice(&aml::integer(0));
+            row.extend_from_slice(&aml::integer(u64::from(route.gsi)));
+            rows.extend_from_slice(&aml::package(4, &row));
+        }
+        let count = u8::try_from(facts.prt.len()).unwrap_or(u8::MAX);
+        pci0.extend_from_slice(&aml::name("_PRT", &aml::package(count, &rows)));
+    }
     body.extend_from_slice(&aml::scope("\\_SB_", &aml::device("PCI0", &pci0)));
 
     let mut table = Table::new(b"DSDT", 2, cfg);
@@ -761,7 +922,7 @@ pub fn generate(base: u64, facts: &MachineFacts, cfg: &TableConfig) -> Result<Ta
             ),
         });
     }
-    let dsdt_bytes = dsdt(cfg);
+    let dsdt_bytes = dsdt(facts, cfg);
     let facs_bytes = facs();
     let madt_bytes = madt(facts, cfg);
     let mcfg_bytes = mcfg(facts, cfg);
@@ -846,6 +1007,8 @@ pub struct AcpiTables {
     len: u64,
     cfg: TableConfig,
     iospace: String,
+    /// The fabric `_PRT` describes, if the board has one.
+    bus: Option<Arc<PciBus>>,
     /// The two spaces the survey walks. `None` until [`Instance::bind`].
     /// [`LockRank::LEAF`].
     spaces: Mutex<Option<(Arc<AddressSpace>, Arc<AddressSpace>)>>,
@@ -866,6 +1029,7 @@ impl AcpiTables {
         let mut r = props.reader();
         let len = r.or_size("size", DEFAULT_LEN)?;
         let iospace = r.or_str("iospace", "port")?.to_string();
+        let bus_name = r.or_str("bus", "pci0")?.to_string();
         let oem_id = r.or_str("oem-id", "RSEMU")?.to_string();
         let oem_table_id = r.or_str("oem-table-id", "RSEMUQ35")?.to_string();
         let cpus = r.or_range("cpus", 1u64, 1..=255)?;
@@ -898,7 +1062,10 @@ impl AcpiTables {
         cfg.oem_id.copy_from_slice(&fit(&oem_id, 6, "oem-id")?);
         cfg.oem_table_id
             .copy_from_slice(&fit(&oem_table_id, 8, "oem-table-id")?);
-        Ok(AcpiTables::with_config(len, cfg, iospace))
+        // Acquiring a host object *is* allocation (`core::hosts`), so it
+        // belongs in `new` beside the rest of it; nothing is announced.
+        let bus = buses::attach(props, &bus_name)?;
+        Ok(AcpiTables::with_config(len, cfg, iospace).on_bus(bus))
     }
 
     /// The same device, built from a configuration a test already has.
@@ -912,9 +1079,21 @@ impl AcpiTables {
             len,
             cfg,
             iospace,
+            bus: None,
             spaces: Mutex::with_rank(LockRank::LEAF, None),
             facts: Mutex::with_rank(LockRank::LEAF, MachineFacts::default()),
         }
+    }
+
+    /// The fabric whose functions `_PRT` describes.
+    ///
+    /// A plain strong handle, and it closes no cycle: this device is not a
+    /// function on the bus, so nothing on the bus can reach back to it. The
+    /// build owns the fabric anyway, under [`buses`].
+    #[must_use]
+    pub fn on_bus(mut self, bus: Arc<PciBus>) -> AcpiTables {
+        self.bus = Some(bus);
+        self
     }
 
     /// What the last generation found the machine to be.
@@ -952,7 +1131,7 @@ impl AcpiTables {
             // Not bound. Nothing to describe, and nothing has asked yet.
             return Ok(());
         };
-        let facts = survey(&mem, &io);
+        let facts = survey(&mem, &io, self.bus.as_deref());
         *self.facts.lock() = facts.clone();
         let Some(base) = facts.tables else {
             return Err(Error::Config {
@@ -999,6 +1178,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "the space the ACPI register block is decoded in, so the FADT can find it \
                       (default `port`)",
+        },
+        PropertySpec {
+            name: "bus",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "the PCI fabric whose functions `_PRT` describes (default `pci0`)",
         },
         PropertySpec {
             name: "oem-id",
@@ -1122,6 +1307,7 @@ pub fn schema() -> ClassSchema {
     ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("size", ValueKind::Size))
         .prop(PropSchema::new("iospace", ValueKind::Str))
+        .prop(PropSchema::new("bus", ValueKind::Str))
         .prop(PropSchema::new("oem-id", ValueKind::Str))
         .prop(PropSchema::new("oem-table-id", ValueKind::Str))
         .prop(PropSchema::new("cpus", ValueKind::Uint).range(1, 255))
