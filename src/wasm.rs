@@ -1138,6 +1138,12 @@ mod tests {
     }
 
     /// The catalog index of the machine called `name` in this build.
+    ///
+    /// Only the `machine-beneater` tests name a machine and an image, so this
+    /// is dead code in a build without it -- and `--no-default-features
+    /// --features wasm` is a real sweep configuration that compiles the ABI
+    /// with an empty catalog.
+    #[cfg(feature = "machine-beneater")]
     fn machine_index(name: &str) -> u32 {
         (0..rsemu_machine_count())
             .find(|i| {
@@ -1148,6 +1154,12 @@ mod tests {
     }
 
     /// The index of `machine`'s built-in image called `image`.
+    ///
+    /// Only the `machine-beneater` tests name a machine and an image, so this
+    /// is dead code in a build without it -- and `--no-default-features
+    /// --features wasm` is a real sweep configuration that compiles the ABI
+    /// with an empty catalog.
+    #[cfg(feature = "machine-beneater")]
     fn builtin_index(machine: u32, image: &str) -> u32 {
         (0..rsemu_machine_builtin_count(machine))
             .find(|b| {
@@ -1192,6 +1204,9 @@ mod tests {
     }
 
     /// Type `text` at the machine's console and run for `frames` frames.
+    ///
+    /// Only the `machine-beneater` transcript tests drive a console this way.
+    #[cfg(feature = "machine-beneater")]
     fn exchange(text: &str, frames: u32) -> String {
         if !text.is_empty() {
             let bytes = text.as_bytes();
