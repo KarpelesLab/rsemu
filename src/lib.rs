@@ -37,6 +37,13 @@
 //! in that path is an amplitude, never a time, so a machine's state hash does
 //! not depend on whether anybody is listening.
 //!
+//! With `ffi`, [`ffi`] is the C ABI: `rsemu run` expressed as twenty-three
+//! `extern "C"` functions, so a program that is not written in Rust can build a
+//! machine, run it for an amount of virtual time, read and write its memory,
+//! snapshot it and hash it. `include/rsemu.h` is generated from the Rust and
+//! checked against it by a test. This is the third of the tri-modal shape
+//! `purecrypto` and `kataan` set (`ROADMAP.md` §2, phase 9).
+//!
 //! With `gdb`, [`host::gdb`] speaks the GDB remote serial protocol over TCP, so
 //! `rsemu debug apple1 --gdb :1234` is a guest a debugger can step through.
 //!
@@ -104,6 +111,10 @@ pub mod dev;
 #[cfg_attr(docsrs, doc(cfg(feature = "fw-pcbios")))]
 pub mod fw;
 
+#[cfg(feature = "ffi")]
+#[cfg_attr(docsrs, doc(cfg(feature = "ffi")))]
+pub mod ffi;
+
 pub mod host;
 pub mod machine;
 
@@ -155,6 +166,9 @@ pub fn build_info() -> alloc::string::String {
     }
     if cfg!(feature = "wasm") {
         features.push("wasm");
+    }
+    if cfg!(feature = "ffi") {
+        features.push("ffi");
     }
     if cfg!(feature = "cpu-mos6502") {
         features.push("cpu-mos6502");
