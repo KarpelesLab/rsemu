@@ -344,8 +344,6 @@ struct Registers {
     /// The 256 bytes of configuration space, and which of them the guest may
     /// move. At [`LockRank::DEVICE`], released before anything outward.
     config: Mutex<ConfigSpace>,
-    /// The `0xcf8`/`0xcfc` window. Owns the `CONFADD` latch.
-    ports: Arc<ConfigPorts>,
     /// The main memory that lives under `0xc0000-0xfffff`.
     dram: Arc<RamStore>,
     /// One alias per window, kept so the mappings can be made at bind time.
@@ -595,6 +593,26 @@ impl PciFunction for Registers {
 #[derive(Debug)]
 pub struct Pmc {
     regs: Arc<Registers>,
+    /// The `0xcf8`/`0xcfc` window, which owns the `CONFADD` latch.
+    ///
+    /// Held by the **device** rather than by [`Registers`], and that is not a
+    /// filing decision — it is what keeps the object graph acyclic.
+    /// [`ConfigPorts`] holds its fabric, the fabric holds every function on it
+    /// strongly, and `Registers` *is* a function on this fabric; putting the
+    /// ports inside it closes the loop `fabric → registers → ports → fabric`,
+    /// and an `Arc` cycle is a leak that nothing ever collects. `Pmc` is owned
+    /// by the machine and is not itself on the bus, so the same handle here is
+    /// a plain edge.
+    ///
+    /// The edge is cut on *this* side deliberately. `ConfigPorts` may well grow
+    /// a `Weak` fabric handle of its own — [`super::super::super::bus::pci`] is
+    /// where that decision lives — and if it does, this stops being the thing
+    /// that breaks the cycle and goes back to being a filing decision. Either
+    /// way the graph is acyclic, which is the property worth holding rather
+    /// than the mechanism. [`crate::dev::q35::mch::Mch`] has the same field for
+    /// the same reason; LeakSanitizer found it there first, through the
+    /// `q35_chipset` fuzz target.
+    ports: Arc<ConfigPorts>,
     bus: Arc<PciBus>,
     at: Bdf,
     config_region: RegionRef,
@@ -663,12 +681,12 @@ impl Pmc {
         Ok(Pmc {
             regs: Arc::new(Registers {
                 config: Mutex::with_rank(LockRank::DEVICE, Registers::fresh_config(revision)),
-                ports,
                 dram,
                 windows,
                 mapped: Mutex::with_rank(LockRank::LEAF, None),
                 stale: Mutex::with_rank(LockRank::LEAF, false),
             }),
+            ports,
             bus,
             at,
             config_region,
@@ -769,7 +787,7 @@ impl Device for Pmc {
         // does. PAM back to 00h means the ROM is decoded again, which is the
         // state firmware expects to find at its reset vector.
         *self.regs.config.lock() = Registers::fresh_config(self.revision);
-        self.regs.ports.reset();
+        self.ports.reset();
         if kind == ResetKind::Cold {
             // Power clears memory; a reset line does not — the same rule the
             // `ram` object follows, and what makes a "did we come from
@@ -796,7 +814,7 @@ impl Device for Pmc {
         // why — but saving all 256 keeps the chunk trivially diffable and
         // costs nothing.
         w.write_bytes(self.regs.config.lock().bytes())?;
-        w.write_u32(self.regs.ports.address())?;
+        w.write_u32(self.ports.address())?;
         // The shadow DRAM is guest-visible state: the firmware copies itself
         // into it and then executes out of it, so a snapshot that dropped it
         // would resume into 256 KiB of zeroes.
@@ -822,7 +840,7 @@ impl Device for Pmc {
             *c = Registers::fresh_config(self.revision);
             c.restore(config);
         }
-        self.regs.ports.set_address(address);
+        self.ports.set_address(address);
         self.regs.dram.write_at(0, dram)?;
         // The memory map is a function of the PAM registers, so it is rebuilt
         // rather than saved (`CLAUDE.md`: derived state is never serialized).
@@ -849,7 +867,7 @@ impl Instance for Pmc {
         if let Some(path) = wanted {
             let handle =
                 ctx.export_as::<super::PortPassthrough>(&path, ExportId::PORT_PASSTHROUGH)?;
-            self.regs.ports.set_passthrough(Arc::clone(handle.ops()));
+            self.ports.set_passthrough(Arc::clone(handle.ops()));
         }
         Ok(())
     }

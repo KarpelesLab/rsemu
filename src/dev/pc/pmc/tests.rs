@@ -493,22 +493,17 @@ fn a_narrow_access_inside_confadd_passes_through_and_a_dword_does_not() {
     let rig = Rig::new();
     let cf9 = Arc::new(Cf9::default());
     rig.pmc
-        .regs
         .ports
         .set_passthrough(Arc::clone(&cf9) as Arc<dyn crate::core::space::MemOps>);
 
     // A byte write at 0xcf9 reaches the other chip and leaves the latch alone.
     rig.select(PAM0);
-    let latched = rig.pmc.regs.ports.address();
+    let latched = rig.pmc.ports.address();
     rig.port
         .write(0xcf9, Width::U8, 0x06, MemAttrs::DEFAULT)
         .expect("an ordinary byte port");
     assert_eq!(*cf9.0.lock(), 0x06, "the south bridge saw it");
-    assert_eq!(
-        rig.pmc.regs.ports.address(),
-        latched,
-        "and CONFADD did not move"
-    );
+    assert_eq!(rig.pmc.ports.address(), latched, "and CONFADD did not move");
     assert_eq!(rig.port.read(0xcf9, Width::U8, MemAttrs::DEFAULT), Ok(0x06));
     assert_eq!(
         rig.port.read(0xcfa, Width::U8, MemAttrs::DEFAULT),
@@ -520,7 +515,7 @@ fn a_narrow_access_inside_confadd_passes_through_and_a_dword_does_not() {
     rig.port
         .write(0xcf8, Width::U32, 0x8000_5900, MemAttrs::DEFAULT)
         .expect("a Dword write to CONFADD");
-    assert_eq!(rig.pmc.regs.ports.address(), 0x8000_5900);
+    assert_eq!(rig.pmc.ports.address(), 0x8000_5900);
     assert_eq!(
         rig.port.read(0xcf8, Width::U32, MemAttrs::DEFAULT),
         Ok(0x8000_5900)
@@ -562,7 +557,7 @@ fn the_board_wires_the_pass_through_to_the_reset_control_register() {
         .expect("as a port pass-through");
 
     let rig = Rig::new();
-    rig.pmc.regs.ports.set_passthrough(Arc::clone(ops.ops()));
+    rig.pmc.ports.set_passthrough(Arc::clone(ops.ops()));
 
     let ids = WireIdAllocator::new();
     let id = ids.alloc();
@@ -590,5 +585,46 @@ fn the_board_wires_the_pass_through_to_the_reset_control_register() {
         probe.0.load(Ordering::Relaxed),
         1,
         "the machine was reset through the bridge's pass-through"
+    );
+}
+
+/// The object graph is acyclic, so a machine that drops its bridge gets its
+/// fabric back.
+///
+/// The cycle this guards is `fabric → registers → ports → fabric`: `Registers`
+/// is announced onto the bus as an `Arc<dyn PciFunction>` and the bus keeps it
+/// strongly, so anything reachable from `Registers` that holds the bus closes a
+/// loop no reference count can ever unwind. `ConfigPorts` holds the bus, so it
+/// lives on the *device* instead — see the field's own comment. A `Weak` that
+/// still upgrades after the last owner is gone is the whole of the assertion,
+/// and it is the cheapest leak detector there is: it needs no sanitizer, and it
+/// fails on the machine that runs `cargo test`.
+///
+/// This is deliberately indifferent to which side breaks the cycle. If
+/// `ConfigPorts` is later given a `Weak` fabric handle of its own, this still
+/// passes; what it refuses is a graph in which nothing does.
+#[test]
+fn dropping_the_bridge_releases_its_fabric() {
+    let bus = Arc::new(PciBus::new());
+    let watch = Arc::downgrade(&bus);
+    {
+        let pmc = Pmc::with_bus(Arc::clone(&bus), Bdf::default(), 0x02).expect("a legal bridge");
+        let mut deferred = Deferred::new();
+        let hosts = HostObjects::new();
+        let mut ctx = RealizeCtx::new("pmc", RequesterId::ANONYMOUS, &mut deferred, &hosts);
+        pmc.realize(&mut ctx).expect("it announces onto the fabric");
+        deferred.drain();
+        // The bridge is on the bus and the bus is under the bridge, which is
+        // the arrangement the cycle needs; the test is meaningless without it.
+        assert!(
+            watch.upgrade().is_some(),
+            "the fabric is alive while something holds it"
+        );
+    }
+    drop(bus);
+    assert!(
+        watch.upgrade().is_none(),
+        "the fabric outlived every owner, which means something under it still holds it: an \
+         `Arc` cycle, and a leak nothing collects"
     );
 }
