@@ -807,7 +807,19 @@ impl Interp {
                     // Counted within the guest's width, not u128's: a value is
                     // held masked, so the leading zeros above the width are ours
                     // and have to come off.
-                    Opcode::CLZ => a.leading_zeros() - (128 - w),
+                    //
+                    // **Saturating, and that is a fix rather than a nicety.**
+                    // The IR does not oblige an operand to carry the
+                    // instruction's type, so `clz.i32` over an `i64` temporary
+                    // holding a value above `2^32` sees fewer than `128 - 32`
+                    // leading zeros and this subtraction used to underflow —
+                    // a debug-build panic, on a block `verify` accepted.
+                    // `verify` now rejects that shape (its `CLZ` arm says so),
+                    // which makes this unreachable through the supported path;
+                    // it saturates anyway, because `Interp` is reachable
+                    // without the verifier and a panic in the oracle is worse
+                    // than a wrong answer on a block nothing should have built.
+                    Opcode::CLZ => a.leading_zeros().saturating_sub(128 - w),
                     Opcode::CTZ => a.trailing_zeros().min(w),
                     _ => a.count_ones(),
                 });
@@ -1668,6 +1680,38 @@ mod tests {
         assert_eq!(i.temp_value(rotl), Some(0x0000_0018));
         assert_eq!(i.temp_value(rotr), Some(0x1800_0000));
         assert_eq!(i.temp_value(turn), Some(0x8000_0001));
+    }
+
+    #[test]
+    fn a_bit_count_over_a_wider_operand_saturates_rather_than_panicking() {
+        // `verify` rejects this block — the width of these ops is an operand,
+        // not just the width the result is masked to — but `Interp` is
+        // reachable without it: `jit::Dispatcher` does not verify, and neither
+        // does a `no_std` board running the portable backend. This used to be
+        // `leading_zeros() - (128 - w)` and it underflowed, which is a panic in
+        // a debug build and a nonsense answer in a release one. Saturating is
+        // an answer; panicking in the oracle is not.
+        let mut b = started();
+        let wide = b.imm(Type::I64, Const::Int(0x1_0000_0000));
+        let narrow = b.temp(Type::I32);
+        b.emit_raw(
+            Opcode::CLZ,
+            Type::I32,
+            Some(narrow),
+            None,
+            &[wide],
+            None,
+            None,
+            0,
+        );
+        b.exit_tb();
+        let block = b.finish();
+        crate::ir::verify(&block).expect_err("the verifier is the real answer");
+
+        let mut i = Interp::new();
+        let out = i.run(&block, &mut Host::default());
+        assert!(out.is_ok(), "{out:?}");
+        assert_eq!(i.temp_value(narrow), Some(0));
     }
 
     #[test]

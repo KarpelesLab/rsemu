@@ -134,6 +134,50 @@ pub fn verify(block: &Block) -> Result<()> {
                 }
                 expect_type(block, inst.dst, Type::I1).map_err(|e| at(&e))?;
             }
+            // The width-sensitive ops: their value operands are the
+            // instruction's own type, or the answer is not defined.
+            //
+            // The IR does **not** require an instruction's type to match its
+            // operands' in general, and most of the time that is harmless —
+            // `add.i32` over an `i64` operand computes at 64 bits and masks to
+            // 32, which is the same answer. For these ops it is not the same
+            // answer, because the width *is* an operand: a rotate wraps at it,
+            // a bit count counts within it, a `bswap` lane divides it, a
+            // widening multiply's high half starts at it.
+            //
+            // [`Interp`](crate::ir::Interp) computes at the operand's width and
+            // masks at the instruction's, which for `clz.i32` over an `i64`
+            // reaches `a.leading_zeros() - (128 - 32)` and **underflows** — a
+            // debug-build panic on a block this verifier used to accept. The
+            // interpreter now saturates rather than panicking, and this is the
+            // rule that means it never has to: the shape is rejected here, one
+            // level above, where the error can name the instruction.
+            //
+            // `jit::x86`'s `Compiler::src_typed` refuses exactly this list and
+            // says the same thing, and neither frontend in the tree emits one.
+            Opcode::CLZ
+            | Opcode::CTZ
+            | Opcode::POPCOUNT
+            | Opcode::BSWAP
+            | Opcode::ROTL
+            | Opcode::ROTR
+            | Opcode::MULU2
+            | Opcode::MULS2 => {
+                // The rotates take their amount from a second operand, which
+                // is a count rather than a value and is reduced modulo the
+                // width whatever its type. Only the value operands are checked.
+                let values = if matches!(inst.op, Opcode::MULU2 | Opcode::MULS2) {
+                    2
+                } else {
+                    1
+                };
+                for k in 0..values {
+                    let src = block.srcs(i).get(k).copied();
+                    if src.is_some() {
+                        expect_type(block, src, inst.ty).map_err(|e| at(&e))?;
+                    }
+                }
+            }
             // Carry in and carry out are one bit each.
             Opcode::ADDC | Opcode::SUBB | Opcode::ROTLC | Opcode::ROTRC => {
                 let srcs = block.srcs(i);
@@ -300,6 +344,73 @@ mod tests {
         b.insn_start(mark(0x1008, 1));
         b.exit_tb();
         verify(&b.finish()).expect("two exits are legal");
+    }
+
+    #[test]
+    fn a_bit_count_over_an_operand_of_another_width_is_rejected() {
+        // The hole this rule closes: `Interp` counts leading zeros in a `u128`
+        // and subtracts `128 - w`, so `clz.i32` over an `i64` operand holding
+        // anything above `2^32` underflowed and panicked in a debug build — on
+        // a block the verifier used to accept. The width is an *operand* of
+        // these ops, not just the width their result is masked to.
+        let mut b = wellformed();
+        let wide = b.imm(Type::I64, Const::Int(0x1_0000_0000));
+        let narrow = b.temp(Type::I32);
+        b.emit_raw(
+            Opcode::CLZ,
+            Type::I32,
+            Some(narrow),
+            None,
+            &[wide],
+            None,
+            None,
+            0,
+        );
+        b.exit_tb();
+        let err = verify(&b.finish()).expect_err("the widths disagree");
+        assert!(
+            format!("{err}").contains("is i64 where i32 is required"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_rotate_takes_its_amount_from_an_operand_of_any_width() {
+        // The counterpart, and the reason the rule is stated per operand
+        // rather than per instruction: a rotate's *value* decides the width,
+        // its *amount* is reduced modulo that width whatever type it has, and
+        // `cpu::x86::lift` really does hand a count of a different type.
+        let mut b = wellformed();
+        let value = b.imm(Type::I32, Const::Int(0x1234));
+        let amount = b.imm(Type::I64, Const::Int(3));
+        let _ = b.binary(Opcode::ROTL, Type::I32, value, amount);
+        b.exit_tb();
+        verify(&b.finish()).expect("only the value operand carries the width");
+    }
+
+    #[test]
+    fn a_widening_multiply_checks_both_of_its_value_operands() {
+        let mut b = wellformed();
+        let a = b.imm(Type::I32, Const::Int(3));
+        let wide = b.imm(Type::I64, Const::Int(5));
+        let lo = b.temp(Type::I32);
+        let hi = b.temp(Type::I32);
+        b.emit_raw(
+            Opcode::MULU2,
+            Type::I32,
+            Some(lo),
+            Some(hi),
+            &[a, wide],
+            None,
+            None,
+            0,
+        );
+        b.exit_tb();
+        let err = verify(&b.finish()).expect_err("the second operand is wider");
+        assert!(
+            format!("{err}").contains("is i64 where i32 is required"),
+            "{err}"
+        );
     }
 
     #[test]

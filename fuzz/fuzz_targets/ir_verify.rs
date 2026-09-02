@@ -88,8 +88,9 @@ use libfuzzer_sys::fuzz_target;
 
 use rsemu::core::value::Width;
 use rsemu::ir::{
-    AccessKind, Align, Block, BlockBuilder, Cond, Const, Endian, InsnStart, Liveness, MemOp,
-    MemSpace, Opcode, RegSlot, SegId, Sign, Temp, Type, eliminate_dead_code, verify,
+    AccessKind, Align, Block, BlockBuilder, Cond, Const, Endian, Home, InsnStart, Liveness, MemOp,
+    MemSpace, Opcode, RegBanks, RegSlot, SegId, Sign, Temp, Type, eliminate_dead_code, linear_scan,
+    verify,
 };
 
 /// How many selectors one input may drive. A block a frontend builds is tens
@@ -547,7 +548,74 @@ fuzz_target!(|data: &[u8]| {
             .all(|w| (w[0].1, w[0].0) <= (w[1].1, w[1].0)),
         "intervals came back out of order"
     );
-    for (temp, lo, hi) in intervals {
+    for (temp, lo, hi) in &intervals {
         assert!(lo <= hi, "{temp} has a backwards live range");
+    }
+
+    // And the allocator that consumes them, over the same arbitrary blocks.
+    // Three properties, each of which is a silent miscompile rather than a
+    // crash when it stops holding.
+    let live = Liveness::compute(&block);
+    let calls: Vec<bool> = block
+        .insts()
+        .iter()
+        .map(|i| matches!(i.op, Opcode::LD | Opcode::ST | Opcode::CALL_HELPER))
+        .collect();
+    let banks = RegBanks {
+        saved: &[0, 1, 2],
+        volatile: &[3, 4, 5, 6],
+    };
+    let alloc = linear_scan(&block, &live, &banks, &calls);
+
+    // 1. The same block allocates the same way every time. Register
+    //    assignment decides guest-visible state, so a hashed iteration order
+    //    or an unstable sort in here would make a state hash stop being an
+    //    identity (`ROADMAP.md` §0).
+    assert_eq!(
+        alloc,
+        linear_scan(&block, &live, &banks, &calls),
+        "the allocation is not reproducible"
+    );
+
+    // 2. No two temporaries whose live ranges overlap share a register. The
+    //    one property the whole algorithm exists to keep, and the one a
+    //    differential shows only when the two values happen to differ.
+    for (a, alo, ahi) in &intervals {
+        let Home::Reg(ra) = alloc.home(*a) else {
+            continue;
+        };
+        for (b, blo, bhi) in &intervals {
+            if b <= a {
+                continue;
+            }
+            let Home::Reg(rb) = alloc.home(*b) else {
+                continue;
+            };
+            // Half-open at the join: an instruction reads its operands before
+            // it writes its results, so a range ending where another begins
+            // may share.
+            if ra == rb {
+                assert!(
+                    ahi <= blo || bhi <= alo,
+                    "{a} [{alo},{ahi}] and {b} [{blo},{bhi}] both took r{ra}:\n{block}"
+                );
+            }
+        }
+    }
+
+    // 3. Everything a boundary names reaches the frame, whatever else it got.
+    //    That is `ROADMAP.md` §9's precise-exception requirement expressed at
+    //    the allocator: the exception path materializes architectural state
+    //    out of the frame and has nowhere else to look.
+    for mark in block.marks() {
+        for (_, temp) in &mark.live {
+            if temp.index() < block.temp_count() {
+                assert!(
+                    alloc.frame_backed(*temp),
+                    "{temp} is named live at {:#x} and would not reach the frame:\n{block}",
+                    mark.pc
+                );
+            }
+        }
     }
 });

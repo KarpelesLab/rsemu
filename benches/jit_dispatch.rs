@@ -15,12 +15,19 @@
 //! | `cached+tlb` | block cache, exits chained | basic block | `jit::Tlb` | `ir::Interp` |
 //! | `+extended` | block cache, exits chained | a load no longer ends a block | `jit::Tlb` | `ir::Interp` |
 //! | `+superblock` | block cache, exits chained | direct branches merged, with side exits | `jit::Tlb` | `ir::Interp` |
-//! | `+compiled` | " | " | `jit::Tlb`, **inlined** | `jit::x86` |
+//! | `+compiled` | " | " | `jit::Tlb`, **inlined** | `jit::x86`, temporaries in a frame |
+//! | `+allocated` | " | " | " | `jit::x86`, **linear scan** |
 //!
-//! The last column is the whole of `ROADMAP.md` §9's first backend, and it is
-//! also where the TLB finally does what §9.1 asks of it — *"the fast path is
-//! inlined into generated code: mask, compare, add, load"*. Every earlier row
-//! reaches the TLB through a call.
+//! The last two columns are `ROADMAP.md` §9's first backend, and `+compiled`
+//! is also where the TLB finally does what §9.1 asks of it — *"the fast path
+//! is inlined into generated code: mask, compare, add, load"*. Every earlier
+//! row reaches the TLB through a call.
+//!
+//! **`+allocated` is §9's pipeline finished** — *"register allocation (linear
+//! scan) → host backend"*. It is a separate column rather than a replacement
+//! because `jit::x86::Regs::Frame` is still a supported policy and is what the
+//! backend's differential runs as its control, so the two are measurable
+//! against each other rather than against a number in a commit message.
 //!
 //! It is only a column where there is a backend to run it: `jit-x86` is
 //! `cfg`-gated to an x86-64 Linux host, and elsewhere it repeats
@@ -123,7 +130,7 @@ fn main() {
         args.insns, args.reps
     );
     println!(
-        "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+        "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
         "workload",
         "interpreter",
         "lift-each",
@@ -132,30 +139,34 @@ fn main() {
         "+extended",
         "+superblock",
         "+compiled",
+        "+allocated",
     );
     for w in workloads() {
         let basic = Shape::BasicBlock;
         let interp = best(args.reps, || run_interpreter(&w, args.insns));
         let cold = best(args.reps, || {
-            run_translated(&w, args.insns, false, false, basic, false)
+            run_translated(&w, args.insns, false, false, basic, Engine::Interp)
         });
         let cached = best(args.reps, || {
-            run_translated(&w, args.insns, true, false, basic, false)
+            run_translated(&w, args.insns, true, false, basic, Engine::Interp)
         });
         let tlb = best(args.reps, || {
-            run_translated(&w, args.insns, true, true, basic, false)
+            run_translated(&w, args.insns, true, true, basic, Engine::Interp)
         });
         let extended = best(args.reps, || {
-            run_translated(&w, args.insns, true, true, Shape::Extended, false)
+            run_translated(&w, args.insns, true, true, Shape::Extended, Engine::Interp)
         });
         let trace = best(args.reps, || {
-            run_translated(&w, args.insns, true, true, Shape::Trace, false)
+            run_translated(&w, args.insns, true, true, Shape::Trace, Engine::Interp)
         });
         let jit = best(args.reps, || {
-            run_translated(&w, args.insns, true, true, Shape::Trace, true)
+            run_translated(&w, args.insns, true, true, Shape::Trace, Engine::Frame)
+        });
+        let scan = best(args.reps, || {
+            run_translated(&w, args.insns, true, true, Shape::Trace, Engine::Scan)
         });
         println!(
-            "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             w.name,
             mips(args.insns, interp),
             mips(args.insns, cold),
@@ -164,9 +175,10 @@ fn main() {
             mips(args.insns, extended),
             mips(args.insns, trace),
             mips(args.insns, jit),
+            mips(args.insns, scan),
         );
         println!(
-            "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "",
             "1.00x",
             ratio(interp, cold),
@@ -175,6 +187,13 @@ fn main() {
             ratio(interp, extended),
             ratio(interp, trace),
             ratio(interp, jit),
+            ratio(interp, scan),
+        );
+        println!(
+            "{:<12} {:>83} {:>11}",
+            "",
+            "the allocator against the frame:",
+            ratio(jit, scan),
         );
     }
     println!(
@@ -384,6 +403,18 @@ fn run_interpreter(w: &Workload, insns: u64) -> Duration {
     took
 }
 
+/// Which engine executes a block, and under which register policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Engine {
+    /// `ir::Interp`.
+    Interp,
+    /// The host code generator with every temporary in a frame slot: the
+    /// backend before `ROADMAP.md` §9's register allocator.
+    Frame,
+    /// The host code generator with linear-scan register allocation.
+    Scan,
+}
+
 /// The translated path, with the cache and the TLB switched independently.
 ///
 /// Checked against the interpreter before it is timed: the two must reach the
@@ -395,7 +426,7 @@ fn run_translated(
     cache: bool,
     tlb: bool,
     shape: Shape,
-    compiled: bool,
+    engine: Engine,
 ) -> Duration {
     let (space, _ram) = machine(w);
     let mut front = Lifter::new(Arc::clone(&space), shape);
@@ -406,8 +437,8 @@ fn run_translated(
     // the cache live inside the call and measure something else. Its cache is
     // sized to one block so that the flush itself is not what is being timed.
     let mut disp = Dispatcher::with_cache(BlockCache::with_capacity(if cache { 1024 } else { 1 }));
-    if compiled {
-        disp = with_backend(disp);
+    if engine != Engine::Interp {
+        disp = with_backend(disp, engine == Engine::Scan);
     }
     let mut budget = if cache { BLOCK_BUDGET } else { 1 };
 
@@ -475,12 +506,18 @@ fn run_translated(
 /// x86-64 Linux host, so this file builds and runs everywhere and the compiled
 /// column simply repeats the `+superblock` one where there is no backend.
 #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
-fn with_backend(disp: Dispatcher) -> Dispatcher {
-    disp.with_backend(rsemu::jit::x86::Engine::new().expect("a W^X code buffer"))
+fn with_backend(disp: Dispatcher, allocate: bool) -> Dispatcher {
+    let mut engine = rsemu::jit::x86::Engine::new().expect("a W^X code buffer");
+    engine.set_regs(if allocate {
+        rsemu::jit::x86::Regs::Scan
+    } else {
+        rsemu::jit::x86::Regs::Frame
+    });
+    disp.with_backend(engine)
 }
 
 #[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
-fn with_backend(disp: Dispatcher) -> Dispatcher {
+fn with_backend(disp: Dispatcher, _allocate: bool) -> Dispatcher {
     disp
 }
 

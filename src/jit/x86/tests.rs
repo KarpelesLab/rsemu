@@ -35,6 +35,7 @@ use crate::ir::{
 };
 use crate::jit::{Context, FastMem, LoadPlan, Tlb};
 
+use super::compile::Regs;
 use super::rt::Engine;
 
 /// Where the test machine's RAM lives.
@@ -185,11 +186,29 @@ impl FastMem for Scratch {
 // The comparison
 // ---------------------------------------------------------------------------
 
-/// Run `block` on both engines and assert they agreed about everything.
+/// Run `block` on both engines under both register policies, and assert they
+/// agreed about everything.
 ///
 /// Returns whether the compiled run happened at all, so a caller can tell a
 /// clean agreement from a block the backend refused.
+///
+/// Both policies, because the register allocator is the thing most able to
+/// make a backend wrong in a way only some blocks show:
+/// [`Regs::Frame`] is the backend as it stood before it — every temporary in
+/// the frame, every operand a load — and it is what says whether a divergence
+/// is the allocation or the lowering.
 fn agree(block: &Block, inline: bool) -> bool {
+    let frame = agree_under(block, inline, Regs::Frame);
+    let scan = agree_under(block, inline, Regs::Scan);
+    assert_eq!(
+        frame, scan,
+        "one policy compiled and the other did not\n{block}"
+    );
+    scan
+}
+
+/// One policy's run against the interpreter.
+fn agree_under(block: &Block, inline: bool, regs: Regs) -> bool {
     verify(block).expect("the generator produces well-formed blocks");
 
     let mut oracle_host = Scratch::new(inline);
@@ -197,6 +216,7 @@ fn agree(block: &Block, inline: bool) -> bool {
     let oracle = interp.run(block, &mut oracle_host);
 
     let mut engine = Engine::with_capacity(1 << 18).expect("a code buffer");
+    engine.set_regs(regs);
     let code = match engine.compile(block) {
         Ok(c) => c,
         Err(_) => return false,
@@ -216,11 +236,40 @@ fn agree(block: &Block, inline: bool) -> bool {
         _ => panic!("one engine failed and the other did not: {oracle:?} vs {subject:?}\n{block}"),
     }
 
+    // Every temporary the run *kept*. A register-allocated one is gone once
+    // the epilogue has restored the caller's registers, and `temp_value` says
+    // so rather than handing back the frame's zero — see its documentation.
+    // Under `Regs::Frame` nothing is register-allocated, so this is still the
+    // whole comparison it used to be on every block the corpus generates.
+    let mut compared = 0;
     for t in 0..block.temp_count() {
         let temp = Temp(t as u32);
         let want = interp.temp_value(temp).expect("allocated");
-        let got = u128::from(engine.temp_value(temp).expect("allocated"));
-        assert_eq!(want, got, "temporary {temp} differs\n{block}");
+        if let Some(got) = engine.temp_value(temp) {
+            assert_eq!(want, u128::from(got), "temporary {temp} differs\n{block}");
+            compared += 1;
+        }
+    }
+    if regs == Regs::Frame {
+        assert_eq!(
+            compared,
+            block.temp_count(),
+            "the control policy must keep every temporary\n{block}"
+        );
+    }
+    // `ROADMAP.md` §9's precise-exception contract, asserted on every block
+    // rather than only on the ones that fault: the exception path materializes
+    // architectural state out of the frame, so every temporary a boundary
+    // names has to be readable from it whatever the allocator did.
+    for mark in block.marks() {
+        for &(slot, temp) in &mark.live {
+            assert!(
+                engine.temp_value(temp).is_some(),
+                "{temp} is named live for slot {} at {:#x} and the frame does not hold it\n{block}",
+                slot.0,
+                mark.pc
+            );
+        }
     }
     assert_eq!(
         oracle_host.slots, host.slots,
@@ -707,6 +756,269 @@ fn address(b: &mut BlockBuilder, r: &mut Rng, size: Width) -> Temp {
 // ---------------------------------------------------------------------------
 // The tests
 // ---------------------------------------------------------------------------
+
+#[test]
+fn the_call_map_the_allocator_is_given_matches_what_the_lowerings_emit() {
+    // The one input `linear_scan` cannot check for itself. If `calls_out` says
+    // an op makes no call and its lowering does, a value in a volatile
+    // register is destroyed by the callee and the block computes with
+    // whatever the host left there — which no test that does not happen to
+    // land that temporary in `r8` will show.
+    //
+    // So this counts the `call [r14 + disp32]` sequences in the emitted bytes
+    // and compares them against what the map claims, on a block whose
+    // immediates are chosen so that none of them can spell that sequence by
+    // accident.
+    let mut b = BlockBuilder::new(BASE, 0);
+    b.insn_start(InsnStart {
+        pc: BASE,
+        next_pc: BASE + 4,
+        ticks: 0,
+        live: Vec::new(),
+    });
+    b.charge(1);
+    let x = b.get_slot(Type::I64, RegSlot(1));
+    let one = b.imm(Type::I64, Const::Int(1));
+    let sum = b.binary(Opcode::ADD, Type::I64, x, one);
+    let shifted = b.binary(Opcode::SHL, Type::I64, sum, one);
+    let _ = b.unary(Opcode::POPCOUNT, Type::I64, shifted);
+    let addr = b.imm(Type::I64, Const::Int(u128::from(BASE + 64)));
+    // One load the backend inlines — two calls, the fast path's tick and the
+    // slow path's own — and one store, which is always a call.
+    let value = b.load(Type::I64, addr, MemOp::load(Width::U64));
+    b.store(Type::I64, addr, value, MemOp::store(Width::U64));
+    b.insn_start(InsnStart {
+        pc: BASE + 4,
+        next_pc: BASE + 8,
+        ticks: 1,
+        live: vec![(RegSlot(0), sum)],
+    });
+    b.exit_tb();
+    let block = b.finish();
+    verify(&block).expect("well formed");
+
+    // `41 ff 96 disp32` is `call [r14 + disp32]`, and it is the only call this
+    // backend emits.
+    fn calls(code: &[u8]) -> usize {
+        code.windows(3).filter(|w| *w == [0x41, 0xff, 0x96]).count()
+    }
+    let mut want = 0usize;
+    for inst in block.insts() {
+        want += match inst.op {
+            Opcode::GET_SLOT | Opcode::CHARGE | Opcode::INSN_START | Opcode::ST => 1,
+            // A load carries the slow path's call whatever happens, and the
+            // inlined probe adds `note_fast_load` on top of it.
+            Opcode::LD => 2,
+            _ => 0,
+        };
+    }
+    for regs in [Regs::Frame, Regs::Scan] {
+        let compiled = super::compile::compile_with(&block, regs).expect("compiles");
+        assert_eq!(
+            calls(compiled.code()),
+            want,
+            "the emitted calls and the map disagree under {regs:?}"
+        );
+    }
+}
+
+/// Whether the backend's lowering of `op` contains a call into the host.
+///
+/// Written out here rather than read off `compile::calls_out`, and the
+/// duplication is the point: `the_call_map_the_allocator_is_given_matches_what_
+/// the_lowerings_emit` checks this list against the *emitted bytes*, and the
+/// test below checks the allocator was given this list. A single shared
+/// constant would make both of them agree with a wrong answer.
+fn a_call_site(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::LD | Opcode::ST | Opcode::GET_SLOT | Opcode::CHARGE | Opcode::INSN_START
+    )
+}
+
+/// Assert the allocator's central invariant over one block.
+fn no_volatile_register_spans_a_call(block: &Block) {
+    let live = crate::ir::Liveness::compute(block);
+    let compiled = super::compile::compile_with(block, Regs::Scan).expect("compiles");
+    let calls: Vec<bool> = block.insts().iter().map(|i| a_call_site(i.op)).collect();
+    for (temp, lo, hi) in live.intervals() {
+        let crate::ir::Home::Reg(r) = compiled.home(temp) else {
+            continue;
+        };
+        // Strictly between: an operand is read before its instruction's call
+        // and a result is written after it.
+        let crosses = ((lo as usize + 1)..(hi as usize)).any(|i| calls[i]);
+        if crosses {
+            assert!(
+                super::compile::SAVED.contains(&r),
+                "{temp} is live across a call in r{r}, which is not callee-saved\n{block}"
+            );
+        }
+        assert!(
+            super::compile::SAVED.contains(&r) || super::compile::VOLATILE.contains(&r),
+            "{temp} took r{r}, which is not a register the backend hands out"
+        );
+    }
+}
+
+#[test]
+fn a_value_that_spans_only_a_charge_still_needs_a_callee_saved_register() {
+    // Every op that calls has to be in the map, and a charge is the one no
+    // generated corpus reaches: both frontends emit `insn_start` and `charge`
+    // adjacent, so nothing is ever defined between them and no interval
+    // crosses a charge without also crossing a boundary. This block is that
+    // shape on purpose — a temporary born between the two and read after the
+    // charge — and it is the only thing standing between `calls_out` losing
+    // `CHARGE` and a value being destroyed by `IrHost::charge`.
+    let mut b = BlockBuilder::new(BASE, 0);
+    b.insn_start(InsnStart {
+        pc: BASE,
+        next_pc: BASE + 4,
+        ticks: 0,
+        live: Vec::new(),
+    });
+    let early = b.imm(Type::I64, Const::Int(0x1234_5678));
+    b.charge(2);
+    let later = b.imm(Type::I64, Const::Int(1));
+    let sum = b.binary(Opcode::ADD, Type::I64, early, later);
+    b.insn_start(InsnStart {
+        pc: BASE + 4,
+        next_pc: BASE + 8,
+        ticks: 2,
+        live: vec![(RegSlot(0), sum)],
+    });
+    b.exit_tb();
+    let block = b.finish();
+    verify(&block).expect("well formed");
+    no_volatile_register_spans_a_call(&block);
+    assert!(agree(&block, true));
+}
+
+#[test]
+fn no_value_that_outlives_a_call_is_left_where_a_call_can_destroy_it() {
+    // The allocator's central invariant, checked structurally, because it is
+    // exactly the one a differential cannot be relied on to show: whether a
+    // value in `r10` survives `IrHost::charge` depends on what the compiler
+    // did to `charge`, not on what this backend did. A run that happens to
+    // pass is not evidence.
+    for seed in 0..200u64 {
+        no_volatile_register_spans_a_call(&random_block(seed ^ 0x5eed, 20));
+    }
+}
+
+#[test]
+fn a_block_with_more_live_values_than_registers_still_agrees() {
+    // Seven host registers against blocks that keep dozens of values alive:
+    // this is where the spill path, the steal heuristic and both banks
+    // running dry are actually exercised. The shorter corpus above almost
+    // never runs out.
+    let mut spilled = 0usize;
+    let mut total = 0usize;
+    for seed in 0..120u64 {
+        let block = random_block(seed ^ 0x0fu64, 40);
+        assert!(agree(&block, true));
+        let compiled = super::compile::compile_with(&block, Regs::Scan).expect("compiles");
+        for t in 0..block.temp_count() {
+            total += 1;
+            if compiled.home(Temp(t as u32)) == crate::ir::Home::Frame {
+                spilled += 1;
+            }
+        }
+    }
+    assert!(
+        spilled * 4 > total,
+        "only {spilled} of {total} temporaries spilled; the pressure is not real"
+    );
+}
+
+#[test]
+fn a_value_read_before_it_is_assigned_reads_the_frame_the_interpreter_reads() {
+    // `verify` rejects this block, and `compile` is public and the dispatcher
+    // does not verify — so the backend has to answer, and the only answer that
+    // agrees with the oracle is the frame's zero. A register would hold
+    // whatever the last temporary to own it left there.
+    let mut b = BlockBuilder::new(BASE, 0);
+    b.insn_start(InsnStart {
+        pc: BASE,
+        next_pc: BASE + 4,
+        ticks: 0,
+        live: Vec::new(),
+    });
+    b.charge(1);
+    let later = b.temp(Type::I64);
+    let seen = b.binary(Opcode::ADD, Type::I64, later, later);
+    // Assign it afterwards, so it is a temporary with a definition that comes
+    // too late rather than one with none at all.
+    let seven = b.imm(Type::I64, Const::Int(7));
+    b.emit_raw(
+        Opcode::MOV,
+        Type::I64,
+        Some(later),
+        None,
+        &[seven],
+        None,
+        None,
+        0,
+    );
+    b.insn_start(InsnStart {
+        pc: BASE + 4,
+        next_pc: BASE + 8,
+        ticks: 1,
+        live: vec![(RegSlot(0), seen), (RegSlot(1), later)],
+    });
+    b.exit_tb();
+    let block = b.finish();
+    verify(&block).expect_err("the verifier is the real answer to this shape");
+
+    let mut oracle = Scratch::new(true);
+    let mut interp = Interp::new();
+    interp
+        .run(&block, &mut oracle)
+        .expect("the interpreter runs it");
+
+    let mut engine = Engine::with_capacity(1 << 16).expect("a code buffer");
+    let code = engine.compile(&block).expect("compiles");
+    let mut host = Scratch::new(true);
+    engine
+        .run(&block, code, &mut host)
+        .expect("live")
+        .expect("ok");
+    assert_eq!(oracle.slots, host.slots, "{block}");
+}
+
+#[test]
+fn the_allocator_actually_places_values_in_registers() {
+    // Non-vacuity, and it is the assertion the rest of this file rests on: the
+    // differential compares the temporaries `temp_value` hands back, so a
+    // corpus where the allocator quietly gave up would still pass every other
+    // test in here while measuring nothing.
+    let mut in_regs = 0usize;
+    let mut total = 0usize;
+    let mut written_through = 0usize;
+    for seed in 0..200u64 {
+        let block = random_block(seed, 12);
+        let compiled = super::compile::compile_with(&block, Regs::Scan).expect("compiles");
+        in_regs += compiled.in_registers();
+        total += block.temp_count();
+        written_through += (0..block.temp_count())
+            .filter(|t| compiled.frame_backed(Temp(*t as u32)))
+            .count();
+    }
+    assert!(
+        in_regs * 3 > total,
+        "only {in_regs} of {total} temporaries got a register"
+    );
+    // and some of them still reach the frame, because a boundary names them:
+    // if none did, the precise-state assertion above would be vacuous too.
+    assert!(written_through > 0 && written_through < total);
+
+    // The control really is the control.
+    for seed in 0..20u64 {
+        let block = random_block(seed, 12);
+        let compiled = super::compile::compile_with(&block, Regs::Frame).expect("compiles");
+        assert_eq!(compiled.in_registers(), 0);
+    }
+}
 
 #[test]
 fn a_thousand_random_blocks_agree_with_the_interpreter() {
