@@ -504,6 +504,41 @@ cpu-mos6502 = []
 # Adds no dependencies and is `no_std + alloc`.
 cpu-arm-aprofile = []
 
+# The AArch64 core (src/cpu/arm/a64): an A64 **integer** interpreter -- the 31
+# general registers with the SP/XZR encoding distinction, PC-relative
+# addressing, the bitfield and move-wide families, every branch form, the
+# conditional selects and compares, loads and stores in all six addressing
+# modes including the pair forms, the load/store exclusives with LDAR/STLR, and
+# the multiply, divide, shift and bit-manipulation instructions. Plus EL0/EL1
+# with PSTATE, the sixteen-slot VBAR_EL1 vector table, SVC/BRK/ERET, the
+# system-register file MRS/MSR reaches, and the VMSAv8-64 stage-1 MMU
+# (4 KiB granule, TTBR0/TTBR1, one to four levels, the access flag,
+# hierarchical permissions) behind a software TLB, joining the shared
+# `debug_translate` seam. A disassembler is generated from the same instruction
+# description.
+#
+# `FEAT_LSE` and `FEAT_CRC32` are **instance** properties, not build flags:
+# `cpu = "cortex-a53"` gets CRC32 and no atomics, `cpu = "neoverse-n1"` gets
+# both, and an absent feature does not decode (ROADMAP.md 6.1.1). A third
+# module beside `aprofile` and `v7m` rather than a variant of either, because
+# AArch64 shares neither the register file, the encoding, the status word, the
+# system-register space, the exception model nor the MMU -- which is the third
+# boundary 6.1.1 anticipated.
+#
+# No SIMD, no floating point, no EL2/EL3, no AArch32, no generic timer: each is
+# reported absent through the ID registers rather than silently missing. Adds
+# no dependencies and is `no_std + alloc`.
+cpu-arm-a64 = []
+
+# The `a64-mini` board (machines/a64-mini.machine plus the classes it names): a
+# minimal AArch64 board -- a boot ROM at the reset vector, DRAM, and one
+# peripheral aperture, with every address a `param` because an SoC's memory map
+# belongs to the SoC. It models no product; it exists so `cpu.arm.a64` has
+# somewhere to run inside a machine file and so the exception vectors and the
+# MMU are exercised by a real board rather than only by unit tests. Adds no
+# dependencies.
+machine-a64-mini = ["cpu-arm-a64"]
+
 # The `arm926` board (machines/arm926.machine plus the classes it names): a bare
 # ARM926EJ-S SoC skeleton -- an ARMv5TE core, a boot ROM at the reset vector,
 # DRAM, and one peripheral aperture, with every address a `param` because an ARM9

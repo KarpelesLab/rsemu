@@ -1,0 +1,135 @@
+# a64-mini - the smallest AArch64 board.
+#
+#   rsemu run a64-mini --media firmware=fw.bin
+#   rsemu run a64-mini -p part=neoverse-n1 --media firmware=fw.bin
+#   rsemu run a64-mini -p ram=1G -p periph=0x09000000 --media firmware=fw.bin
+#
+# A boot ROM at the reset vector, DRAM, and one peripheral aperture. It models
+# no product. It exists so `cpu.arm.a64` has somewhere to run inside a machine
+# file, and so the exception vectors and the translation tables are exercised
+# by a real board rather than only by unit tests.
+#
+# ---------------------------------------------------------------------------
+# There is no architectural reset vector, and that is the point
+# ---------------------------------------------------------------------------
+#
+# An ARMv5 core comes out of reset at 0x00000000 (or 0xFFFF0000 with VINITHI
+# strapped high) because the architecture says so, which is why machines/
+# arm926.machine can map its ROM at zero and stop thinking about it. AArch64
+# says the opposite: the core starts at `RVBAR_EL1`, which is IMPLEMENTATION
+# DEFINED - a pin, a fuse, or a hard-wired constant, chosen by whoever built
+# the SoC. So `reset` below is a property of *this board* and nothing more, and
+# a downstream SoC file changes it without changing anything else.
+#
+# Zero is chosen here because it makes the boot ROM's first word the first
+# instruction, which is the least surprising thing a synthetic board can do.
+#
+# ---------------------------------------------------------------------------
+# Which part, and why the board says so
+# ---------------------------------------------------------------------------
+#
+# `part = "cortex-a53"`, handed to the core's `cpu` property below. That is the
+# whole extension lattice in one line (ROADMAP.md 6.1.1): a Cortex-A53 is
+# Armv8.0-A with FEAT_CRC32 and **without** FEAT_LSE, so `CAS` and `LDADD` do
+# not decode on it and a guest that probes `ID_AA64ISAR0_EL1` is told so.
+# `-p part=neoverse-n1` is an Armv8.2 part where both exist. Same binary, same core, different instance:
+# the difference is a construction property and not a build flag, which is what
+# lets one machine run two different parts side by side.
+#
+# ---------------------------------------------------------------------------
+# The space is 64 bits and the addresses are PHYSICAL
+# ---------------------------------------------------------------------------
+#
+# An AArch64 core translates before it reaches the bus, so what this file maps
+# is physical addresses; the virtual layout is the guest's business and it
+# builds its own translation tables to express it. Out of reset the MMU is off
+# (`SCTLR_EL1.M` is architecturally zero), so the first instructions run on
+# physical addresses and firmware that never touches `TTBR0_EL1` sees exactly
+# this map.
+#
+# ---------------------------------------------------------------------------
+# Nothing raises an interrupt here
+# ---------------------------------------------------------------------------
+#
+# The core has `cpu.irq` and `cpu.fiq` inputs, which a real board drives from a
+# GIC. There is no GIC on this board and no other interrupt source, so neither
+# is wired: a net with no driver would be two lines saying nothing. A guest can
+# still exercise its own vector table through `SVC` and `BRK`, which is what
+# tests/a64_mini_board.rs does.
+
+machine "a64-mini" {
+  # Which part the core is. `armv8.0` is a bare Armv8.0-A with no optional
+  # feature at all; `cortex-a53` and `cortex-a72` add FEAT_CRC32;
+  # `neoverse-n1` is Armv8.2 and adds FEAT_LSE on top.
+  #
+  # Named `part` rather than `cpu` because the *object* below is called `cpu`,
+  # and the machine language refuses a name that is both a parameter and an
+  # instance rather than silently picking one.
+  param part = "cortex-a53"
+
+  # Where the core starts fetching, which on AArch64 is the board's decision
+  # rather than the architecture's - see above.
+  param reset = 0x00000000
+
+  # How big the boot ROM is. It is mapped at `reset` because that is where the
+  # first instruction has to be.
+  param rom = 1M
+
+  # Where DRAM starts and how much there is. 0x40000000 is the conventional
+  # place for it on an AArch64 board with a 1 GiB hole below for devices, which
+  # is the reason for that number rather than a round one chosen for looks.
+  param ram-base = 0x40000000
+  param ram      = 128M
+
+  # The peripheral aperture: where a SoC's register blocks live, and how much
+  # address space they get.
+  param periph      = 0x09000000
+  param periph-size = 64K
+
+  # -- the crystal -----------------------------------------------------------
+  #
+  # One oscillator: everything on this board descends from the same can, so
+  # every ratio on it is exact (ROADMAP.md 4.2). Arm defines no instruction
+  # timing at all, so this sets the wall-clock rate and nothing architectural.
+  osc sysclk = 1000000000 Hz
+
+  # -- the bus ---------------------------------------------------------------
+  #
+  # One flat 64-bit physical space. `unassigned` is left at its default of
+  # `fault`, so an access to a hole becomes an external-abort data abort the
+  # guest can see rather than a plausible-looking zero - which is honest here,
+  # because an AArch64 core really does report one and `cpu.arm.a64` raises it.
+  space mem { width = 64 }
+
+  # -- the core --------------------------------------------------------------
+  object cpu "cpu.arm.a64" {
+    clock  = sysclk
+    space  = mem
+    engine = "interp"
+    cpu    = part
+    reset  = reset
+    # What MPIDR_EL1 reports. Bit 31 is RES1 and the low byte is Aff0, so this
+    # is "processor 0 of cluster 0" - the value a single-core board must give,
+    # and the one an SMP guest reads to tell cores apart.
+    mpidr  = 0x80000000
+  }
+
+  # -- memory ----------------------------------------------------------------
+  #
+  # `image` names a media slot: whoever runs the machine binds the bytes
+  # (`--media firmware=fw.bin`), and nothing below host/ opens a file.
+  object boot "rom" { size = rom, image = "firmware" }
+
+  object dram "ram" { size = ram }
+
+  # The peripheral aperture, backed by plain memory. A SoC file replaces this
+  # one object with its own register blocks at their own offsets; until then it
+  # is a window firmware can write to and a test can read back, which is what
+  # makes this board provable rather than decorative.
+  object regs "ram" { size = periph-size }
+
+  # -- the memory map --------------------------------------------------------
+  map mem reset     size rom         = boot
+  map mem periph    size periph-size = regs
+  map mem ram-base  size ram         = dram
+}

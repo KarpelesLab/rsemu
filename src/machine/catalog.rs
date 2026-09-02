@@ -395,6 +395,23 @@ pub static MIPS_MINI: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/mips-mini.machine"),
 };
 
+/// A minimal AArch64 board, when this build has an A64 core.
+///
+/// A synthetic board rather than a product: a flat 64-bit **physical** space,
+/// a boot ROM where `RVBAR_EL1` points, DRAM at `0x4000_0000` and one
+/// peripheral aperture. AArch64 fixes no reset vector — it is
+/// IMPLEMENTATION DEFINED — so `reset` is a parameter of the board rather than
+/// a constant, and so is the part: `part = "cortex-a53"` has `FEAT_CRC32` and
+/// no `FEAT_LSE`, `part = "neoverse-n1"` has both.
+#[cfg(feature = "machine-a64-mini")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-a64-mini")))]
+pub static A64_MINI: CatalogEntry = CatalogEntry {
+    name: "a64-mini",
+    summary: "a minimal AArch64 board: 1 GHz, a flat 64-bit physical space, a boot ROM, DRAM",
+    media: &["firmware"],
+    source: include_str!("../../machines/a64-mini.machine"),
+};
+
 /// Every machine this build can realize, in catalog order.
 // One `#[cfg]`-gated push per shipped machine, which is what the lint is
 // complaining about: a `vec![]` literal cannot carry an attribute on one of its
@@ -406,6 +423,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     let mut out: Vec<&'static CatalogEntry> = Vec::new();
     #[cfg(feature = "machine-apple1")]
     out.push(&APPLE1);
+    #[cfg(feature = "machine-a64-mini")]
+    out.push(&A64_MINI);
     #[cfg(feature = "machine-arm926")]
     out.push(&ARM926);
     #[cfg(feature = "machine-beneater")]
@@ -563,6 +582,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::atmel::register(&mut reg)?;
     #[cfg(feature = "dev-apple1")]
     crate::dev::apple1::register(&mut reg)?;
+    #[cfg(feature = "cpu-arm-a64")]
+    crate::cpu::arm::a64::register(&mut reg)?;
     #[cfg(feature = "cpu-arm-aprofile")]
     crate::cpu::arm::aprofile::register(&mut reg)?;
     #[cfg(feature = "cpu-arm-v7m")]
@@ -662,6 +683,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::atmel::bind(&mut b)?;
     #[cfg(feature = "dev-apple1")]
     crate::dev::apple1::bind(&mut b)?;
+    #[cfg(feature = "cpu-arm-a64")]
+    crate::cpu::arm::a64::bind(&mut b)?;
     #[cfg(feature = "cpu-arm-aprofile")]
     crate::cpu::arm::aprofile::bind(&mut b)?;
     #[cfg(feature = "cpu-arm-v7m")]
@@ -756,6 +779,8 @@ pub fn classes() -> ClassTable {
     for schema in crate::dev::apple1::schemas() {
         table.insert(schema);
     }
+    #[cfg(feature = "cpu-arm-a64")]
+    table.insert(crate::cpu::arm::a64::schema());
     #[cfg(feature = "cpu-arm-aprofile")]
     table.insert(crate::cpu::arm::aprofile::schema());
     #[cfg(feature = "cpu-arm-v7m")]
@@ -1495,6 +1520,11 @@ mod tests {
             ("spi-panel", "firmware") => crate::dev::lcd::demo::PANEL_DEMO,
             #[cfg(feature = "machine-spi-flash")]
             ("spi-flash", "firmware") => crate::dev::stm32::demo::SPI_FLASH_DEMO,
+            // `B .` — the A64 branch-to-self, which is the whole four-byte
+            // program needed to prove the board realizes and the core fetches.
+            // `tests/a64_mini_board.rs` supplies the one that does something.
+            #[cfg(feature = "machine-a64-mini")]
+            ("a64-mini", "firmware") => &[0x00, 0x00, 0x00, 0x14],
             // `B .` — the ARM branch-to-self, which is the whole four-byte
             // program needed to prove the board realizes and the core fetches.
             // `tests/arm926_board.rs` supplies the one that does something.
