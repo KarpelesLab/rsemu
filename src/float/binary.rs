@@ -54,6 +54,22 @@ pub trait Format: Copy + core::fmt::Debug {
     const SPEC: Spec = Spec::interchange(Self::PRECISION, Self::EMAX);
 }
 
+/// IEEE 754 binary16 — ARM's `H`.
+///
+/// Armv8.0-A converts to and from this format with `FCVT` whether or not it
+/// has `FEAT_FP16`; what the optional feature adds is *arithmetic* in it. So a
+/// core that implements only the base level still needs the encoding, and that
+/// is what this is here for. Nothing about the arithmetic below is
+/// format-specific, so `add::<B16>` works too — a guest with `FEAT_FP16` needs
+/// no new kernel, only new rows in its instruction table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct B16;
+
+impl Format for B16 {
+    const SIG_BITS: u32 = 10;
+    const EXP_BITS: u32 = 5;
+}
+
 /// IEEE 754 binary32 — RISC-V's `F` extension, x86's scalar single, ARM's `S`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct B32;
@@ -253,6 +269,67 @@ pub fn sqrt<F: Format>(a: u64, env: Env) -> (u64, Flags) {
     let (pa, fa) = unpack::<F>(a, env);
     let (out, f) = kernel::sqrt(pa, F::SPEC, env);
     (encode_outcome::<F>(out, env), f | fa)
+}
+
+/// Round `a` to an integral value **in the same format** (§5.9's
+/// `roundToIntegral` family).
+///
+/// Not a conversion: the result is a float, so `roundToIntegralTiesToEven` of
+/// `1e300` is `1e300` and nothing overflows. §5.9 gives six operations, and
+/// they differ in exactly two parameters, which is why this is one function:
+/// the direction is [`Env::round`], and `signal_inexact` picks between the
+/// five `roundToIntegral<direction>` operations, which raise nothing, and
+/// `roundToIntegralExact`, which raises inexact when the result differs from
+/// the operand.
+///
+/// That maps onto Arm's family one-for-one: `FRINTN`/`FRINTP`/`FRINTM`/
+/// `FRINTZ`/`FRINTA` name their direction and pass `FALSE`, `FRINTI` takes the
+/// direction from `FPCR.RMode` and passes `FALSE`, and `FRINTX` is the same as
+/// `FRINTI` with `TRUE` — the one that reports (DDI 0487, `FPRoundInt`).
+///
+/// Neither overflow nor underflow is possible: a value large enough to be at
+/// risk of either is already an integer and comes back untouched.
+pub fn round_to_integral<F: Format>(a: u64, env: Env, signal_inexact: bool) -> (u64, Flags) {
+    let (p, fa) = unpack::<F>(a, env);
+    let out = match p.class {
+        Class::Nan => match kernel::nan_result(&[p], env) {
+            Some((out, f)) => return (encode_outcome::<F>(out, env), f | fa),
+            // `nan_result` answers `None` only when no operand is a NaN.
+            None => Outcome::DefaultNan,
+        },
+        // An infinity and a zero are already integral, sign included.
+        Class::Inf => Outcome::Num(p.sign, Rounded::Inf),
+        Class::Zero => Outcome::Num(p.sign, Rounded::Zero),
+        // `exp` is the exponent of the significand's last bit, so a
+        // non-negative one means every bit of the value is an integer bit.
+        // Returning the operand unchanged here is what keeps the operation
+        // total over the whole format rather than only over the part that
+        // fits in an integer.
+        Class::Finite if p.exp >= 0 => return (a & F::MASK, fa),
+        Class::Finite => match kernel::to_integer(p, env) {
+            IntValue::Value {
+                sign,
+                magnitude,
+                inexact,
+            } => {
+                // The operand was not integral, so its magnitude is below the
+                // format's first all-integers value — `2^(p-1)` — and the
+                // rounded magnitude is at most that. It therefore fits the
+                // precision exactly and this step cannot round a second time.
+                let (out, _) = kernel::round_exact(sign, 0, magnitude, F::SPEC, env);
+                let flags = if signal_inexact && inexact {
+                    Flags::INEXACT
+                } else {
+                    Flags::NONE
+                };
+                return (encode_outcome::<F>(out, env), flags | fa);
+            }
+            // Both other variants are the classes already matched above.
+            IntValue::Nan => Outcome::DefaultNan,
+            IntValue::Inf(sign) => Outcome::Num(sign, Rounded::Inf),
+        },
+    };
+    (encode_outcome::<F>(out, env), fa)
 }
 
 /// `a * b + c`, rounded once (§5.4.1's `fusedMultiplyAdd`).
