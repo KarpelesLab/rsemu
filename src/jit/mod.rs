@@ -11,13 +11,14 @@
 //! >    with **block chaining** […]
 //! > 3. **Self-modifying code** — page dirty bitmap […]
 //!
-//! Those three are this module, and they are all reachable with
-//! [`ir::Interp`](crate::ir::Interp) as the executor — a chained block cache in
-//! front of the portable backend is a real result, where half a host code
-//! generator is not. **There is no host code generation here yet.** When there
-//! is, it slots in under [`Dispatcher`] as a different way to execute a
-//! [`Block`](crate::ir::Block), and every mechanism here is already the shape
-//! it needs.
+//! Those three are this module, and all three are reachable with
+//! [`ir::Interp`](crate::ir::Interp) as the executor. **The fourth is now
+//! here too**: [`x86`] is a host code generator, and it slots in under
+//! [`Dispatcher`] as a different way to execute a
+//! [`Block`](crate::ir::Block) — which is exactly the shape this module was
+//! left in for it. A block it refuses runs on the interpreter, so the two
+//! engines are alternatives rather than a switch, and the interpreter stays
+//! the oracle either way.
 //!
 //! §9.1's **fourth** mechanism — *"superblocks / traces — merge across direct
 //! branches, keep guest registers in host registers across block boundaries
@@ -34,20 +35,25 @@
 //!
 //! `ROADMAP.md` §0 puts `jit/` above the `std` line, alongside `host/` and
 //! `accel/`, because emitting native code needs W^X `mmap` through raw
-//! syscalls and emitting wasm needs an embedder import. **Nothing in this
-//! round needs either**, so this module is `no_std + alloc` like the IR it
-//! serves, and §11's bare-metal row — whose engine is the IR interpreter —
-//! gets the TLB and the block cache too rather than being the one target that
-//! runs everything cold. The `std` line moves when the first backend lands,
-//! and it moves in the file that needs it.
+//! syscalls and emitting wasm needs an embedder import. **The TLB, the block
+//! cache and the dispatcher need neither**, so they are `no_std + alloc` like
+//! the IR they serve, and §11's bare-metal row — whose engine is the IR
+//! interpreter — gets them too rather than being the one target that runs
+//! everything cold. The `std` line moves in the file that needs it, and the
+//! file that needs it is [`x86`], which is behind its own feature and
+//! `cfg`-gated to an x86-64 Linux host.
 //!
-//! For the same reason there is **no `unsafe` here**. The one sanctioned
-//! opt-in in this subsystem is the JIT *code buffer* (CLAUDE.md, "`unsafe`"),
-//! and there is no code buffer yet. Guest RAM is still reached by byte offset
-//! through [`RamStore`](crate::core::space::RamStore) — never as a
-//! `&mut [u8]` — so the TLB's "host addend" is an addend into a store rather
-//! than a host pointer, which is what keeps it working when guest RAM is a
-//! `SharedArrayBuffer` (`ROADMAP.md` §11.2).
+//! The same split holds for `unsafe`. There is **none** in this module or in
+//! its three `no_std` files; the one sanctioned opt-in in this subsystem is
+//! the JIT *code buffer* (CLAUDE.md, "`unsafe`"), and it is confined to
+//! [`x86::buf`] and [`x86::rt`] — mapping the memory, and crossing into it.
+//! Guest RAM is still reached by byte offset through
+//! [`RamStore`](crate::core::space::RamStore) — never as a `&mut [u8]` — so
+//! the TLB's "host addend" is an addend into a store, which is what keeps it
+//! working when guest RAM is a `SharedArrayBuffer` (`ROADMAP.md` §11.2). The
+//! *host address* an entry also carries is for generated code alone: read-only,
+//! computed from [`RamStore::host_ptr`](crate::core::space::RamStore::host_ptr),
+//! and zero on every page a backend may not touch that way.
 //!
 //! # One answer to "stale", shared by both caches
 //!
@@ -107,10 +113,16 @@
 
 mod cache;
 mod dispatch;
+mod fast;
 mod tlb;
 
-pub use cache::{BlockCache, BlockId, CacheStats, DEFAULT_CAPACITY, EXITS};
+#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "jit-x86")))]
+pub mod x86;
+
+pub use cache::{BlockCache, BlockId, CacheStats, CodeRef, DEFAULT_CAPACITY, EXITS};
 pub use dispatch::{
     DirtyPages, DispatchStats, Dispatcher, Frontend, Run, Stop, StoreLog, Translation,
 };
-pub use tlb::{Context, DEFAULT_ENTRIES, Epoch, PAGE_MASK, PAGE_SIZE, Tlb, TlbStats};
+pub use fast::{FastMem, LoadPlan};
+pub use tlb::{Context, DEFAULT_ENTRIES, Epoch, FastSet, PAGE_MASK, PAGE_SIZE, Tlb, TlbStats};

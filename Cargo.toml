@@ -537,6 +537,31 @@ ir = []
 # the file that needs it, when one does. Needs `ir`; adds no dependencies.
 jit = ["ir"]
 
+# The x86-64 host code generator (src/jit/x86): ROADMAP.md §9's first backend,
+# and §9.1's fourth mechanism after the TLB, the block cache and SMC detection.
+# An IR block is lowered to machine code in a W^X buffer — mapped RW by raw
+# `mmap`, flipped to RX by raw `mprotect`, never both at once, no libc — and the
+# software TLB's fast path is inlined into it: a null check, an alignment test,
+# an index, a tag compare, an add and a `mov`, which is §9.1's "mask, compare,
+# add, load".
+#
+# A block carrying an op the backend does not lower is **refused** and runs on
+# `ir::Interp` instead, which is the same degradation §9 asks for from an
+# unsupported host. The interpreter therefore stays the oracle, and both
+# differential harnesses run the compiled path against it.
+#
+# This is the crate's second `unsafe` subsystem, on §0's sanctioned list — the
+# JIT code buffer — confined to `src/jit/x86/buf.rs` and `src/jit/x86/rt.rs`.
+# Adds no dependencies. Needs `jit`, and implies `std` because `jit/x86` lives
+# above the `std` line with `host/` and `accel/`.
+#
+# x86-64 Linux only, and `cfg`-gated to it in `src/jit/mod.rs`: a `syscall`
+# instruction and an instruction encoder mean nothing on another target, and
+# wasm has no writable-then-executable memory at all (§11.4), so the module is
+# absent there rather than present and refusing. Turning the feature on for a
+# wasm or macOS build is harmless.
+jit-x86 = ["jit", "std"]
+
 # Level-3 execution (src/usermode): running a program with no guest kernel
 # under it, `qemu-user`/gVisor-shaped (ROADMAP.md §2, phase 5b). The four
 # things a syscall kernel cannot build for itself and rsemu owns because they

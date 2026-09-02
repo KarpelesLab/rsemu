@@ -346,6 +346,51 @@ impl RamStore {
         }
     }
 
+    /// The host address of the byte at `offset`, if `len` bytes follow it
+    /// inside this store.
+    ///
+    /// **The seam `ROADMAP.md` §0's "RAM host-pointer fast path" is for**, and
+    /// the module docs above predicted it: *"it can be added later behind this
+    /// same API without touching a single caller"*. Nothing in this crate
+    /// dereferences the result from Rust — the one consumer is the x86-64 JIT
+    /// backend, which bakes the address into generated machine code so that a
+    /// guest load becomes a mask, a compare, an add and a `mov`
+    /// (`ROADMAP.md` §9.1's first mechanism, *"inlined into generated code"*).
+    ///
+    /// Returning a raw pointer is itself safe; every obligation is on whoever
+    /// reads through it, and there are three:
+    ///
+    /// * The pointer is valid only while this store is alive. The backing
+    ///   allocation is made once in [`RamStore::with_page_bits`] and never
+    ///   grows, so it does not move — but a caller must keep its
+    ///   `Arc<RamStore>` for as long as the address is live.
+    /// * Only the `len` bytes this call was asked about are in range.
+    /// * The bytes are [`AtomicU8`], written by other threads with relaxed
+    ///   stores. A reader must be a plain machine load of the same kind — the
+    ///   instruction a relaxed atomic byte load compiles to — and must never
+    ///   form a Rust reference to them, or a concurrent guest write is a data
+    ///   race rather than the relaxed traffic the type promises.
+    ///
+    /// **Read-only on purpose.** A write through a host pointer would skip
+    /// [`RamStore::mark_dirty`], and the dirty bitmap is the only record a
+    /// framebuffer refresh or a live snapshot has (§4.1). A backend that wants
+    /// to inline stores owes that bit first.
+    #[inline]
+    #[must_use]
+    pub fn host_ptr(&self, offset: u64, len: u64) -> Option<*const AtomicU8> {
+        let end = offset.checked_add(len)?;
+        if end > self.len {
+            return None;
+        }
+        let base = usize::try_from(offset).ok()?;
+        // Indexing, then a reference-to-pointer cast: both safe, and the index
+        // is in range because `self.len` bounds it and fits a `usize` by
+        // construction. A zero-length request at the very end of the store
+        // would index one past, so it is refused rather than special-cased.
+        let cell = self.cells.get(base)?;
+        Some(core::ptr::from_ref(cell))
+    }
+
     /// How many pages are dirty.
     #[must_use]
     pub fn dirty_page_count(&self) -> u64 {

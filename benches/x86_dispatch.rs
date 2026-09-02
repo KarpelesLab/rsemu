@@ -1,13 +1,12 @@
 //! What the x86 frontend's three policies actually bought, measured.
 //!
 //! The companion to `benches/jit_dispatch.rs`, which measures the same
-//! translation runtime with the RISC-V frontend in front of it. Everything
-//! below is still *interpreting* — there is no host code generator yet — so
-//! what this measures is the thing that is finished: the mechanisms
-//! `ROADMAP.md` §9.1 puts ahead of code generation, plus the two decisions x86
-//! forced that RISC-V did not have to make.
+//! translation runtime with the RISC-V frontend in front of it: the mechanisms
+//! `ROADMAP.md` §9.1 lists, plus the two decisions x86 forced that RISC-V did
+//! not have to make, plus — in the last column — the **x86-64 host code
+//! generator** those mechanisms were all waiting for.
 //!
-//! # The eight configurations
+//! # The nine configurations
 //!
 //! | | translation | block shape | flags | stores | memory |
 //! | --- | --- | --- | --- | --- | --- |
@@ -19,6 +18,17 @@
 //! | `+trace` | " | direct branches merged, with side exits | eager | end the block | `jit::Tlb` |
 //! | `+elide` | " | trace | **elided** | end the block | `jit::Tlb` |
 //! | `+guard` | " | trace | elided | **guarded in place** | `jit::Tlb` |
+//! | `+compiled` | " | trace | elided | guarded in place | `jit::Tlb`, and **compiled to host code** |
+//!
+//! The last row is `ROADMAP.md` §9's first backend. Note what it does *not*
+//! change: x86's loads still take a call, because a load's address here is an
+//! effective address — the segment base is added and the limit checked before
+//! anything reaches the TLB — so the backend refuses to inline a segmented
+//! access and this column measures the code generator alone. The RISC-V bench
+//! is where the inlined TLB shows.
+//!
+//! It is only a column where there is a backend: `jit-x86` is `cfg`-gated to
+//! an x86-64 Linux host, and elsewhere it repeats `+guard`.
 //!
 //! The rows are cumulative on purpose, and the last two are what this file
 //! exists for:
@@ -103,29 +113,30 @@
 //!   writes a flag — and `branchy`, which *reads* its flags, gained 1.36x
 //!   rather than 2.2x. That spread is the claim: the win is exactly the dead
 //!   flags and nothing else.
-//! * **`+guard` is a wash, and that is worth knowing.** It was expected to
-//!   pay on `memcpy`, where `Smc::EndBlock` ends a block at every store; it
-//!   cost about four percent instead. The reason is visible in the same table:
-//!   the guard removes roughly fourteen dispatches out of fifteen and buys
-//!   nothing, so a dispatch is not what this configuration spends its time on
-//!   — interpreting the IR is. Three extra IR instructions per store therefore
-//!   cost more than the dispatches they save. What that says is *when* the
-//!   guard pays: once a host backend turns those three instructions into a
-//!   not-taken compare and branch and a dispatch back into tens of
-//!   instructions, not before. It stays the default because it is the answer
-//!   to `ROADMAP.md` §9.1's third mechanism rather than a speed knob, and
-//!   because both policies are correct and both are in the cache key.
-//! * **Two workloads are still slower than the interpreter.** `branchy` and
-//!   `chain` are, and honestly: there is no host code generator, so every row
-//!   here is one interpreter in front of another. `benches/jit_dispatch.rs`
-//!   says the same thing about the same runtime with a RISC-V frontend, where
-//!   the ratios are better for a reason worth stating — an RV64I instruction
-//!   lifts to two or three IR instructions and an x86 one with live flags to
-//!   fifteen.
+//! * **`+guard` was a wash, and the backend is what changed that.** It was
+//!   expected to pay on `memcpy`, where `Smc::EndBlock` ends a block at every
+//!   store; interpreted it cost about four percent instead, because the guard
+//!   removes roughly fourteen dispatches out of fifteen and a dispatch is not
+//!   what an IR interpreter spends its time on. The note written then said
+//!   exactly when it would pay — *"once a host backend turns those three
+//!   instructions into a not-taken compare and branch and a dispatch back into
+//!   tens of instructions"* — and that is now measurable rather than predicted:
+//!   compiled, `memcpy` runs at 171.8 Mi/s under `Smc::Guard` against
+//!   137.0 Mi/s under `Smc::EndBlock` — a 25 % win, where the same comparison
+//!   interpreted was a 4 % loss. The prediction was right and it is worth
+//!   saying so, because the policy stayed the default on an argument rather
+//!   than on a number.
+//! * **The two workloads that were slower than the interpreter no longer
+//!   are.** `branchy` and `chain` were 0.94x and 0.87x interpreted, for the
+//!   reason recorded here: every row was one interpreter in front of another,
+//!   and an x86 instruction with live flags lifts to fifteen IR instructions
+//!   where an RV64I one lifts to two or three. Compiled they are about 8x and
+//!   11x. The ratio is *larger* on x86 than on RISC-V for the same reason it
+//!   was smaller before — fifteen IR instructions is fifteen dispatches saved.
 //!
 //! ```text
-//! cargo bench --features jit,cpu-x86-lift --bench x86_dispatch
-//! cargo bench --features jit,cpu-x86-lift --bench x86_dispatch -- --insns 20000000
+//! cargo bench --features jit-x86,cpu-x86-lift --bench x86_dispatch
+//! cargo bench --features jit-x86,cpu-x86-lift --bench x86_dispatch -- --insns 20000000
 //! ```
 
 use std::sync::Arc;
@@ -141,7 +152,8 @@ use rsemu::cpu::x86::lift::{
 };
 use rsemu::ir::{AccessKind, InsnStart, IrHost, MemOp, RegSlot};
 use rsemu::jit::{
-    BlockCache, Context, DirtyPages, Dispatcher, Epoch, Frontend, StoreLog, Tlb, Translation,
+    BlockCache, Context, DirtyPages, Dispatcher, Epoch, FastMem, Frontend, StoreLog, Tlb,
+    Translation,
 };
 
 fn main() {
@@ -151,7 +163,7 @@ fn main() {
         args.insns, args.reps
     );
     println!(
-        "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+        "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
         "workload",
         "interpreter",
         "lift-each",
@@ -161,6 +173,7 @@ fn main() {
         "+trace",
         "+elide",
         "+guard",
+        "+compiled",
     );
 
     // The eight configurations, in the order the table lists them. Each one
@@ -174,6 +187,7 @@ fn main() {
         Config::new(true, true, Shape::Trace, Flags::Eager, Smc::EndBlock),
         Config::new(true, true, Shape::Trace, Flags::Elide, Smc::EndBlock),
         Config::new(true, true, Shape::Trace, Flags::Elide, Smc::Guard),
+        Config::new(true, true, Shape::Trace, Flags::Elide, Smc::Guard).compiled(),
     ];
 
     for w in workloads() {
@@ -230,6 +244,8 @@ struct Config {
     shape: Shape,
     flags: Flags,
     smc: Smc,
+    /// Whether the blocks are compiled to host code rather than interpreted.
+    compiled: bool,
 }
 
 impl Config {
@@ -240,8 +256,30 @@ impl Config {
             shape,
             flags,
             smc,
+            compiled: false,
         }
     }
+
+    /// The same configuration, executed by `ROADMAP.md` §9's x86-64 backend.
+    const fn compiled(mut self) -> Config {
+        self.compiled = true;
+        self
+    }
+}
+
+/// Attach the host code generator, where this build has one.
+///
+/// The backend is behind `jit-x86` and `cfg`-gated to an x86-64 Linux host, so
+/// this file builds and runs everywhere; where there is no backend the compiled
+/// column simply repeats the one beside it.
+#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+fn with_backend(disp: Dispatcher) -> Dispatcher {
+    disp.with_backend(rsemu::jit::x86::Engine::new().expect("a W^X code buffer"))
+}
+
+#[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
+fn with_backend(disp: Dispatcher) -> Dispatcher {
+    disp
 }
 
 // ---------------------------------------------------------------------------
@@ -389,6 +427,9 @@ fn run_translated(w: &Workload, insns: u64, cfg: Config) -> Duration {
     // chaining — a translator that re-lifts has no predecessor to patch.
     let mut disp =
         Dispatcher::with_cache(BlockCache::with_capacity(if cfg.cache { 1024 } else { 1 }));
+    if cfg.compiled {
+        disp = with_backend(disp);
+    }
     let mut budget = if cfg.cache { BLOCK_BUDGET } else { 1 };
 
     let start = Instant::now();
@@ -610,6 +651,17 @@ impl StoreLog for BenchHost {
         self.dirty.drain_dirty(sink);
     }
 }
+
+/// **No fast path, and that is x86's answer rather than this file's.**
+///
+/// A load's address here is an effective address: `Segments::linear` adds the
+/// segment base and checks the limit before anything reaches the TLB, and
+/// `cpu::x86::lift` says so by giving every `MemOp` a `SegId`. The backend
+/// refuses to inline a segmented access for exactly that reason, so publishing
+/// a plan would change nothing — see `cpu::x86::differential`'s `FastMem` impl.
+/// The compiled column below therefore measures the code generator alone, with
+/// every guest access still a call.
+impl FastMem for BenchHost {}
 
 // ---------------------------------------------------------------------------
 // Arguments
