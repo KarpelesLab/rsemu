@@ -13,9 +13,16 @@
 //! | file | what it is | `unsafe` |
 //! | --- | --- | --- |
 //! | [`emit`] | an x86-64 assembler over a `Vec<u8>` | no |
-//! | [`compile`](mod@compile) | one IR block lowered to that assembler | no |
+//! | [`compile`](mod@compile) | one IR block lowered to that assembler, over the homes [`ir::linear_scan`](crate::ir::linear_scan) chose | no |
 //! | [`buf`] | the W^X `mmap`/`mprotect` code buffer | **yes** |
 //! | [`rt`] | the context, the thunks, and entering the code | **yes** |
+//!
+//! The register allocator itself is not one of them: it is
+//! [`ir::linear_scan`](crate::ir::linear_scan), because everything it decides
+//! is a property of the block rather than of a host, and the next backend
+//! should not write it again. What this module contributes is its two register
+//! banks — which registers it is willing to give away, and which of them a
+//! thunk call destroys.
 //!
 //! The two that opt in are one subsystem — *the JIT code buffer*, §0's second
 //! sanctioned site — split so that *mapping memory* and *crossing the
@@ -84,5 +91,5 @@ pub mod rt;
 mod tests;
 
 pub use buf::{CodeBuf, DEFAULT_CAPACITY};
-pub use compile::{Compiled, Refusal, compile, compiles};
+pub use compile::{Compiled, Refusal, Regs, compile, compile_with, compiles};
 pub use rt::{Ctx, Engine, EngineStats, Vtable};

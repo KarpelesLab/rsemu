@@ -18,7 +18,8 @@
 //! | `+trace` | " | direct branches merged, with side exits | eager | end the block | `jit::Tlb` |
 //! | `+elide` | " | trace | **elided** | end the block | `jit::Tlb` |
 //! | `+guard` | " | trace | elided | **guarded in place** | `jit::Tlb` |
-//! | `+compiled` | " | trace | elided | guarded in place | `jit::Tlb`, and **compiled to host code** |
+//! | `+compiled` | " | trace | elided | guarded in place | `jit::Tlb`, and **compiled to host code** with its temporaries in a frame |
+//! | `+allocated` | " | trace | elided | guarded in place | the same, with **linear-scan register allocation** |
 //!
 //! The last row is `ROADMAP.md` §9's first backend. Note what it does *not*
 //! change: x86's loads still take a call, because a load's address here is an
@@ -163,7 +164,7 @@ fn main() {
         args.insns, args.reps
     );
     println!(
-        "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+        "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
         "workload",
         "interpreter",
         "lift-each",
@@ -174,6 +175,7 @@ fn main() {
         "+elide",
         "+guard",
         "+compiled",
+        "+allocated",
     );
 
     // The eight configurations, in the order the table lists them. Each one
@@ -187,7 +189,8 @@ fn main() {
         Config::new(true, true, Shape::Trace, Flags::Eager, Smc::EndBlock),
         Config::new(true, true, Shape::Trace, Flags::Elide, Smc::EndBlock),
         Config::new(true, true, Shape::Trace, Flags::Elide, Smc::Guard),
-        Config::new(true, true, Shape::Trace, Flags::Elide, Smc::Guard).compiled(),
+        Config::new(true, true, Shape::Trace, Flags::Elide, Smc::Guard).compiled(Regs::Frame),
+        Config::new(true, true, Shape::Trace, Flags::Elide, Smc::Guard).compiled(Regs::Scan),
     ];
 
     for w in workloads() {
@@ -206,6 +209,18 @@ fn main() {
             print!(" {:>11}", ratio(interp, *t));
         }
         println!();
+        // The two compiled columns against each other, which is the number the
+        // register allocator is actually accountable for. Against the
+        // interpreter both are enormous and the difference between them is
+        // invisible.
+        if let (Some(frame), Some(scan)) = (times.iter().nth_back(1), times.last()) {
+            println!(
+                "{:<12} {:>95} {:>11}",
+                "",
+                "the allocator against the frame:",
+                ratio(*frame, *scan)
+            );
+        }
     }
     println!(
         "\nEvery row was checked against the interpreter's final register file \
@@ -244,8 +259,9 @@ struct Config {
     shape: Shape,
     flags: Flags,
     smc: Smc,
-    /// Whether the blocks are compiled to host code rather than interpreted.
-    compiled: bool,
+    /// Where a compiled block keeps its temporaries, or `None` when the blocks
+    /// are interpreted rather than compiled.
+    compiled: Option<Regs>,
 }
 
 impl Config {
@@ -256,15 +272,27 @@ impl Config {
             shape,
             flags,
             smc,
-            compiled: false,
+            compiled: None,
         }
     }
 
     /// The same configuration, executed by `ROADMAP.md` §9's x86-64 backend.
-    const fn compiled(mut self) -> Config {
-        self.compiled = true;
+    const fn compiled(mut self, regs: Regs) -> Config {
+        self.compiled = Some(regs);
         self
     }
+}
+
+/// Where a compiled block keeps its temporaries.
+///
+/// Mirrors `jit::x86::Regs` rather than naming it, so this file still builds
+/// where the backend does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Regs {
+    /// Every temporary in a frame slot: the backend before the allocator.
+    Frame,
+    /// Linear scan over the block's live intervals.
+    Scan,
 }
 
 /// Attach the host code generator, where this build has one.
@@ -273,12 +301,17 @@ impl Config {
 /// this file builds and runs everywhere; where there is no backend the compiled
 /// column simply repeats the one beside it.
 #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
-fn with_backend(disp: Dispatcher) -> Dispatcher {
-    disp.with_backend(rsemu::jit::x86::Engine::new().expect("a W^X code buffer"))
+fn with_backend(disp: Dispatcher, regs: Regs) -> Dispatcher {
+    let mut engine = rsemu::jit::x86::Engine::new().expect("a W^X code buffer");
+    engine.set_regs(match regs {
+        Regs::Frame => rsemu::jit::x86::Regs::Frame,
+        Regs::Scan => rsemu::jit::x86::Regs::Scan,
+    });
+    disp.with_backend(engine)
 }
 
 #[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
-fn with_backend(disp: Dispatcher) -> Dispatcher {
+fn with_backend(disp: Dispatcher, _regs: Regs) -> Dispatcher {
     disp
 }
 
@@ -427,8 +460,8 @@ fn run_translated(w: &Workload, insns: u64, cfg: Config) -> Duration {
     // chaining — a translator that re-lifts has no predecessor to patch.
     let mut disp =
         Dispatcher::with_cache(BlockCache::with_capacity(if cfg.cache { 1024 } else { 1 }));
-    if cfg.compiled {
-        disp = with_backend(disp);
+    if let Some(regs) = cfg.compiled {
+        disp = with_backend(disp, regs);
     }
     let mut budget = if cfg.cache { BLOCK_BUDGET } else { 1 };
 

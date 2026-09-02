@@ -6,25 +6,44 @@
 //!
 //! # The machine this compiles to
 //!
-//! **Temporaries live in a frame, not in host registers.** Every IR
-//! instruction loads its operands out of a `u64` array, computes in `rax`,
-//! `rcx` and `rdx`, and stores its result back. That is a deliberate first
-//! step and not the end state: `ROADMAP.md` §9's pipeline ends *"register
-//! allocation (linear scan) → host backend"*, and this is the backend without
-//! the allocator. What it already buys is the whole of the interpreter's
-//! dispatch — a `match` over sixty opcodes, an operand-arity check, a `u128`
-//! masked at every step, a bounds check per temporary — replaced by three or
-//! four instructions with L1-hot operands. What it leaves on the table is the
-//! loads and stores between them, which is exactly what linear scan removes.
+//! **Temporaries live where [`linear_scan`] puts them**, which is
+//! `ROADMAP.md` §9's pipeline finished: *"register allocation (linear scan) →
+//! host backend"*. A temporary with a host register is read and written there
+//! and never touches memory; one the allocator could not place keeps its slot
+//! in the `u64` frame the [`Ctx`](super::rt::Ctx) points at, and is loaded and
+//! stored exactly as the whole backend used to work. [`Regs::Frame`] switches
+//! the allocator off and is that earlier backend, kept runnable as the control
+//! every differential and both benchmarks compare against.
 //!
-//! Keeping the frame also makes the hard half of §9 nearly free: *"when a load
-//! faults halfway through a translated block, the guest must observe exactly
-//! the architectural state its ISA specifies"*. There is no host-register-to-
-//! guest-register side table to reconstruct, because every temporary is
-//! already where the interpreter would have left it, and the runtime publishes
-//! the boundary's live mapping from the same array the interpreter publishes
-//! from. A register allocator is what makes that a real problem; this backend
-//! is the one that proves everything *around* it first.
+//! ## Precise state at a fault, which is where the allocator gets interesting
+//!
+//! §9: *"when a load faults halfway through a translated block, the guest must
+//! observe exactly the architectural state its ISA specifies"*, and the design
+//! it names for that is a side table keyed by host code offset, so the runtime
+//! can materialize architectural state from wherever the allocator left it.
+//!
+//! **This backend does not need one, and the reason is a measurement rather
+//! than a preference.** A temporary an [`InsnStart`](crate::ir::InsnStart)
+//! names is *written through*: it goes to its host register and to its frame
+//! slot, once, at its definition, and stays right for the rest of the block
+//! because the IR is SSA. The exception path then reads the frame exactly as
+//! it always did — `rt`'s `publish` is unchanged — and reconstructs the same
+//! state the interpreter would have had. Everything the boundaries do **not**
+//! name is dead the moment its last reader has run, and never reaches memory
+//! at all.
+//!
+//! The alternative was tried on paper and is worse *here*, which is the part
+//! worth writing down. A side table lets the write-through go, but only if the
+//! value is still in a register when the fault happens — so every temporary a
+//! boundary names has to stay live until the boundary's extent ends, not until
+//! its last reader. On `cpu::riscv::lift` a boundary's live map names **every
+//! shadowed guest register**: a trace of the benchmark's `alu-loop` has 85
+//! temporaries, 57 of them named at some boundary, over three callee-saved
+//! host registers. Extending 57 intervals to overlap would spill all but three
+//! of them, which is the write-through's cost paid as a spill plus a reload.
+//! The table becomes the right trade when a frontend names few registers per
+//! boundary or a host has thirty-two of them; it is not this frontend on this
+//! host, and [`Allocation::frame_backed`] is where the decision is stated.
 //!
 //! Values are held **canonically masked to their type**, exactly as
 //! `ir::Interp` holds them: an `i32` temporary never carries bits above 32 and
@@ -39,12 +58,25 @@
 //! | `rbx` | the [`Ctx`](super::rt::Ctx) |
 //! | `r12` | the temporary frame |
 //! | `r14` | the thunk table |
-//! | `r15` | the software TLB's load set, or null |
-//! | `rax` `rcx` `rdx` `rsi` `rdi` `r13` | scratch |
+//! | `rax` `rcx` `rdx` `rsi` `rdi` | scratch |
+//! | `rbp` `r13` `r15` | allocated to intervals that cross a call |
+//! | `r8` `r9` `r10` `r11` | allocated to intervals that do not |
 //!
-//! The four persistent ones are callee-saved, so a thunk call cannot lose
-//! them; `r13` is callee-saved too, which is why it is the one scratch that
-//! may hold a value *across* a call.
+//! The three pinned ones are callee-saved, so a thunk call cannot lose them.
+//! `r15` used to hold the TLB's load set for the whole block and `r13` used to
+//! be the scratch that survived a call; both now go to the allocator, because
+//! three callee-saved registers instead of one is the difference between an
+//! allocation that can hold a guest register across a boundary and one that
+//! cannot. What that cost is written down where it is paid: the inlined probe
+//! reloads the load set from the context, and parks its result in a stack slot
+//! across `note_fast_load`.
+//!
+//! Seven registers is the ceiling, and it is worth knowing why it is so low.
+//! Generated code calls into the host at every `charge`, every `insn_start`,
+//! every `get_slot` and on every access — on a lifted RV64I trace that is 130
+//! call sites in 215 IR instructions — so anything that outlives a guest
+//! instruction needs a callee-saved register, and System V has six of which
+//! two are already the context and the frame.
 //!
 //! # Out-of-range shifts
 //!
@@ -69,7 +101,8 @@ use alloc::vec::Vec;
 
 use crate::core::value::Width;
 use crate::ir::{
-    AccessKind, Block, Cond, Inst, MemOp, MemSpace, Opcode, Sign, Temp, Type, bitfield_parts,
+    AccessKind, Allocation, Block, Cond, Home, Inst, Liveness, MemOp, MemSpace, Opcode, RegBanks,
+    Sign, Temp, Type, bitfield_parts, linear_scan,
 };
 use crate::jit::PAGE_MASK;
 use crate::jit::tlb::FastSet;
@@ -192,6 +225,15 @@ pub struct Compiled {
     /// naming freed memory.
     #[allow(dead_code)]
     mems: Box<[MemOp]>,
+    /// Where the register allocator put every temporary.
+    ///
+    /// Carried forward because the *runtime* needs it and cannot re-derive it:
+    /// after a run, a temporary that lived only in a host register is gone,
+    /// and reading its frame slot would hand back the zero the frame was
+    /// cleared to. Every temporary a boundary names is
+    /// [`frame_backed`](Allocation::frame_backed) by construction — that is
+    /// what keeps `ROADMAP.md` §9's precise exceptions exact.
+    alloc: Allocation,
     offset: u64,
 }
 
@@ -219,6 +261,34 @@ impl Compiled {
         self
     }
 
+    /// Where the allocator put `temp`.
+    ///
+    /// Exposed so that a test can check the *invariant* rather than only its
+    /// consequences: a value that outlives a call and sits in a register the
+    /// callee may destroy is wrong even on the runs where the callee happens
+    /// not to destroy it, and that is not a property a differential can be
+    /// relied on to show — see
+    /// `no_value_that_outlives_a_call_is_left_where_a_call_can_destroy_it`.
+    #[inline]
+    #[must_use]
+    pub fn home(&self, temp: Temp) -> Home {
+        self.alloc.home(temp)
+    }
+
+    /// Whether this code writes `temp`'s value into the frame, which is the
+    /// only place Rust can read it from after the run.
+    #[inline]
+    #[must_use]
+    pub fn frame_backed(&self, temp: Temp) -> bool {
+        self.alloc.frame_backed(temp)
+    }
+
+    /// How many temporaries the allocator kept in host registers.
+    #[must_use]
+    pub fn in_registers(&self) -> usize {
+        self.alloc.in_registers()
+    }
+
     /// How many descriptors it carries, for tests.
     #[cfg(test)]
     #[must_use]
@@ -227,13 +297,95 @@ impl Compiled {
     }
 }
 
+/// Where a compiled block keeps its temporaries.
+///
+/// A switch rather than a constant for two reasons, and neither is taste.
+/// [`Regs::Frame`] is the **control** every differential in this backend runs
+/// against — the same block, the same host, the same everything, with the
+/// allocator switched off — which is what turns "the two engines agree" into
+/// "the allocator did not change the answer". And it is the column
+/// `benches/jit_dispatch.rs` and `benches/x86_dispatch.rs` compare against,
+/// because a register allocator whose win is asserted rather than measured is
+/// a register allocator nobody can tell has regressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Regs {
+    /// Every temporary lives in the frame: the backend as it stood before the
+    /// allocator, kept runnable.
+    Frame,
+    /// Linear scan over the block's live intervals — [`linear_scan`].
+    #[default]
+    Scan,
+}
+
 /// Compile `block`, or say why not.
 ///
 /// # Errors
 ///
 /// [`Refusal`], naming the op, type or shape that stopped it.
 pub fn compile(block: &Block) -> Result<Compiled, Refusal> {
-    Compiler::new(block)?.run()
+    compile_with(block, Regs::default())
+}
+
+/// The same, with the register allocator switched.
+///
+/// # Errors
+///
+/// [`Refusal`], naming the op, type or shape that stopped it.
+pub fn compile_with(block: &Block, regs: Regs) -> Result<Compiled, Refusal> {
+    Compiler::new(block, regs)?.run()
+}
+
+/// The host registers a temporary may live in, by [`Reg`] number.
+///
+/// Three saved and four volatile out of sixteen, and the arithmetic is worth
+/// stating because it is the whole ceiling on what the allocator can do here.
+/// System V gives six callee-saved registers; `rbx` holds the context and
+/// `r12` the frame, `r14` holds the thunk table because a call happens two or
+/// three times per guest instruction and reloading it each time costs more
+/// than the register is worth, and the remaining three are these. `rax`,
+/// `rcx`, `rdx`, `rsi` and `rdi` stay fixed scratch: the lowerings for
+/// `popcount`, `bswap`, `deposit` and the inlined TLB probe each need three or
+/// four registers they may destroy, and `rcx` is the only register a variable
+/// shift can take its count from.
+pub(super) const SAVED: [u8; 3] = [Reg::Rbp as u8, Reg::R13 as u8, Reg::R15 as u8];
+
+/// The registers a thunk call may destroy, which the allocator gives only to
+/// intervals that do not span one.
+pub(super) const VOLATILE: [u8; 4] = [Reg::R8 as u8, Reg::R9 as u8, Reg::R10 as u8, Reg::R11 as u8];
+
+/// A register number back into a [`Reg`].
+///
+/// Only the numbers [`SAVED`] and [`VOLATILE`] contain can reach here, and an
+/// allocation naming anything else is a bug in this file rather than in a
+/// guest — so the fallback is `rax`, which every lowering already treats as
+/// destroyed, rather than a panic in generated-code emission.
+const fn reg_of(n: u8) -> Reg {
+    match n {
+        5 => Reg::Rbp,
+        8 => Reg::R8,
+        9 => Reg::R9,
+        10 => Reg::R10,
+        11 => Reg::R11,
+        13 => Reg::R13,
+        15 => Reg::R15,
+        _ => Reg::Rax,
+    }
+}
+
+/// Whether this backend's lowering of `op` contains a thunk call.
+///
+/// The input [`linear_scan`] cannot check for itself, so it is one expression
+/// that can be read against the lowerings — and
+/// `the_call_map_the_allocator_is_given_matches_what_the_lowerings_emit`
+/// asserts it against the emitted bytes rather than against this list.
+const fn calls_out(op: Opcode) -> bool {
+    matches!(
+        op,
+        // Every access has a slow path with a call on it, whether or not the
+        // fast path is taken at run time, and the fast path has its own call
+        // to `note_fast_load`.
+        Opcode::LD | Opcode::ST | Opcode::GET_SLOT | Opcode::CHARGE | Opcode::INSN_START
+    )
 }
 
 /// The `mem` table, collected before anything is emitted so its addresses are
@@ -254,6 +406,8 @@ struct Compiler<'a> {
     block: &'a Block,
     asm: Asm,
     mems: Box<[MemOp]>,
+    /// Where every temporary lives.
+    alloc: Allocation,
     /// The next descriptor to hand out, in the order [`descriptors`] collected.
     next_mem: usize,
     /// Where each IR instruction's code begins.
@@ -266,14 +420,23 @@ struct Compiler<'a> {
 
 /// The stack this backend reserves below its saved registers.
 ///
-/// Forty bytes: eight for a load thunk's out-parameter and thirty-two of
-/// padding that keeps `rsp` sixteen-byte aligned at every `call`, which the
-/// System V AMD64 ABI requires and a violation of which shows up as a fault
-/// inside some unrelated library's SSE prologue rather than here.
+/// Forty bytes: eight for a load thunk's out-parameter, eight for
+/// [`PARKED`], and twenty-four of padding that keeps `rsp` sixteen-byte
+/// aligned at every `call`, which the System V AMD64 ABI requires and a
+/// violation of which shows up as a fault inside some unrelated library's SSE
+/// prologue rather than here.
 const FRAME: i32 = 0x28;
 
+/// Where the inlined load parks its value across `note_fast_load`.
+///
+/// It used to be `r13`, and `r13` is now a register the allocator hands out —
+/// three callee-saved registers instead of two is a third more of the only
+/// bank that can hold a value across a call, and the fast path pays two stack
+/// accesses for it on a path that already has a dozen instructions.
+const PARKED: i32 = 8;
+
 impl<'a> Compiler<'a> {
-    fn new(block: &'a Block) -> Result<Compiler<'a>, Refusal> {
+    fn new(block: &'a Block, regs: Regs) -> Result<Compiler<'a>, Refusal> {
         // A temporary's frame slot is reached with a 32-bit displacement.
         if block
             .temp_count()
@@ -282,10 +445,27 @@ impl<'a> Compiler<'a> {
         {
             return Err(Refusal::Shape("the block has too many temporaries"));
         }
+        let alloc = match regs {
+            Regs::Frame => Allocation::none(block),
+            Regs::Scan => {
+                let live = Liveness::compute(block);
+                let calls: Vec<bool> = block.insts().iter().map(|i| calls_out(i.op)).collect();
+                linear_scan(
+                    block,
+                    &live,
+                    &RegBanks {
+                        saved: &SAVED,
+                        volatile: &VOLATILE,
+                    },
+                    &calls,
+                )
+            }
+        };
         Ok(Compiler {
             block,
             asm: Asm::new(),
             mems: descriptors(block),
+            alloc,
             next_mem: 0,
             starts: Vec::with_capacity(block.insts().len()),
             branches: Vec::new(),
@@ -311,6 +491,7 @@ impl<'a> Compiler<'a> {
         Ok(Compiled {
             code: self.asm.finish(),
             mems: self.mems,
+            alloc: self.alloc,
             offset: 0,
         })
     }
@@ -325,7 +506,9 @@ impl<'a> Compiler<'a> {
         self.asm.mov_rr(Reg::Rbx, Reg::Rdi);
         self.asm.mov_rm(Reg::R12, Reg::Rbx, off::TEMPS);
         self.asm.mov_rm(Reg::R14, Reg::Rbx, off::VT);
-        self.asm.mov_rm(Reg::R15, Reg::Rbx, off::TLB_BASE);
+        // `r15` used to hold the TLB's load set for the whole block and now
+        // belongs to the allocator; the inlined probe loads it from the
+        // context instead, which is one `mov` on a path with a dozen.
     }
 
     fn epilogue(&mut self) {
@@ -352,14 +535,108 @@ impl<'a> Compiler<'a> {
         (temp.index() as i32) * 8
     }
 
+    /// The host register `temp` lives in, if it lives in one.
+    fn home(&self, temp: Temp) -> Option<Reg> {
+        match self.alloc.home(temp) {
+            Home::Reg(n) => Some(reg_of(n)),
+            Home::Frame => None,
+        }
+    }
+
+    /// Get `temp` into `reg`, which the caller may then destroy.
+    ///
+    /// A register-to-register move where the allocator gave it a home and a
+    /// load out of the frame where it did not. The move is what the allocator
+    /// bought: it is renamed away on any out-of-order host, where the load is
+    /// an address computation and an L1 access even on a hit.
     fn load_temp(&mut self, reg: Reg, temp: Temp) {
-        let at = Self::frame(temp);
-        self.asm.mov_rm(reg, Reg::R12, at);
+        match self.home(temp) {
+            Some(home) => {
+                if home != reg {
+                    self.asm.mov_rr(reg, home);
+                }
+            }
+            None => {
+                let at = Self::frame(temp);
+                self.asm.mov_rm(reg, Reg::R12, at);
+            }
+        }
+    }
+
+    /// A **read-only** operand: the register holding `temp`, without copying it
+    /// when it already lives in one.
+    ///
+    /// The caller promises not to write the register this returns, which is
+    /// why it is a separate method from [`Compiler::load_temp`] rather than an
+    /// optimisation inside it. Every use of it below is an instruction that
+    /// only reads its second operand — the `r/m` side of an `add`, the source
+    /// of a `cmov`, the value a `test` looks at — and getting that wrong
+    /// corrupts a temporary that is still live, which is exactly the class of
+    /// bug that shows up three instructions later as a wrong guest register.
+    fn operand(&mut self, scratch: Reg, temp: Temp) -> Reg {
+        match self.home(temp) {
+            Some(home) => home,
+            None => {
+                self.load_temp(scratch, temp);
+                scratch
+            }
+        }
+    }
+
+    /// The register an op should compute into.
+    ///
+    /// The destination's own home where there is one, which turns the common
+    /// three-instruction shape — fetch, operate, put back — into two, or into
+    /// one where the destination inherited an operand's register. `rax`
+    /// otherwise, which is the pre-allocator behaviour.
+    ///
+    /// `blocked` is the operands still read **after** the accumulator is first
+    /// written: the right-hand side of a two-operand sequence. An operand read
+    /// only *into* the accumulator is deliberately not blocked, and the reason
+    /// is a property of the allocator rather than luck. A register is handed to
+    /// the destination only out of the free set, and an operand's register is
+    /// free at this instruction exactly when that operand's interval ended
+    /// here — so `home(dst) == home(a)` *is* the statement that `a` is dead
+    /// after this instruction, and writing over it is writing over a value
+    /// nothing will read again.
+    fn acc(&self, inst: &Inst, blocked: &[Temp]) -> Reg {
+        let Some(dst) = inst.dst else { return Reg::Rax };
+        let Some(home) = self.home(dst) else {
+            return Reg::Rax;
+        };
+        if blocked.iter().any(|t| self.home(*t) == Some(home)) {
+            Reg::Rax
+        } else {
+            home
+        }
     }
 
     fn store_temp(&mut self, temp: Temp, reg: Reg) {
         let at = Self::frame(temp);
         self.asm.mov_mr(Reg::R12, at, reg);
+    }
+
+    /// Put `reg`'s value where `temp` lives — and, when the frame is also its
+    /// home, in both places.
+    ///
+    /// The write-through is `ROADMAP.md` §9's precise-exception requirement in
+    /// this backend. A temporary an [`InsnStart`](crate::ir::InsnStart) names
+    /// is read by the *exception path*, out of the frame, from outside the
+    /// generated code — so it reaches the frame at its definition, once, and
+    /// stays right for the rest of the block because the IR is SSA. Everything
+    /// else is dead the moment its last reader has run and never touches
+    /// memory at all.
+    fn commit(&mut self, temp: Temp, reg: Reg) {
+        if let Some(home) = self.home(temp) {
+            if home != reg {
+                self.asm.mov_rr(home, reg);
+            }
+            if self.alloc.frame_backed(temp) {
+                self.store_temp(temp, reg);
+            }
+        } else {
+            self.store_temp(temp, reg);
+        }
     }
 
     /// Canonicalise `reg` to `ty`, as `Interp::set` does.
@@ -397,6 +674,10 @@ impl<'a> Compiler<'a> {
     /// the two orders differ: the ops that do not mask to the instruction's
     /// width would keep bits this backend has already dropped. Nothing in the
     /// tree emits one, and refusing costs a block on the interpreter.
+    ///
+    /// `reg` is masked **in place**, so it must be a scratch register and
+    /// never one [`Compiler::operand`] handed back — that one is some live
+    /// temporary's home.
     fn write(&mut self, inst: &Inst, reg: Reg) -> Result<(), Refusal> {
         let dst = inst
             .dst
@@ -415,7 +696,7 @@ impl<'a> Compiler<'a> {
         if dst_ty != inst.ty {
             self.mask(reg, dst_ty);
         }
-        self.store_temp(dst, reg);
+        self.commit(dst, reg);
         Ok(())
     }
 
@@ -495,14 +776,15 @@ impl<'a> Compiler<'a> {
 
         match op {
             Opcode::MOV => {
+                let acc = self.acc(inst, &[]);
                 match (self.block.srcs(at).first().copied(), inst.imm) {
-                    (Some(s), _) => self.load_temp(Reg::Rax, s),
-                    (None, Some(c)) => self.asm.mov_ri(Reg::Rax, c.bits() as u64),
+                    (Some(s), _) => self.load_temp(acc, s),
+                    (None, Some(c)) => self.asm.mov_ri(acc, c.bits() as u64),
                     (None, None) => {
                         return Err(Refusal::Shape("a mov needs a source or an immediate"));
                     }
                 }
-                self.write(inst, Reg::Rax)?;
+                self.write(inst, acc)?;
             }
             Opcode::GET_SLOT => {
                 self.ctx_to_rdi();
@@ -517,14 +799,16 @@ impl<'a> Compiler<'a> {
                     .type_of(s)
                     .ok_or(Refusal::Shape("the source was never allocated"))?;
                 check_type(from)?;
-                self.load_temp(Reg::Rax, s);
-                self.sext(Reg::Rax, from.bits());
-                self.write(inst, Reg::Rax)?;
+                let acc = self.acc(inst, &[]);
+                self.load_temp(acc, s);
+                self.sext(acc, from.bits());
+                self.write(inst, acc)?;
             }
             Opcode::EXT_Z | Opcode::TRUNC => {
                 let s = self.src(at, 0)?;
-                self.load_temp(Reg::Rax, s);
-                self.write(inst, Reg::Rax)?;
+                let acc = self.acc(inst, &[]);
+                self.load_temp(acc, s);
+                self.write(inst, acc)?;
             }
             Opcode::BSWAP => {
                 let lane = match inst.imm {
@@ -611,8 +895,9 @@ impl<'a> Compiler<'a> {
             Opcode::ADD | Opcode::SUB | Opcode::AND | Opcode::OR | Opcode::XOR => {
                 let a = self.src(at, 0)?;
                 let b = self.src(at, 1)?;
-                self.load_temp(Reg::Rax, a);
-                self.load_temp(Reg::Rcx, b);
+                let acc = self.acc(inst, &[b]);
+                self.load_temp(acc, a);
+                let rhs = self.operand(Reg::Rcx, b);
                 let alu = match op {
                     Opcode::ADD => Alu::Add,
                     Opcode::SUB => Alu::Sub,
@@ -620,37 +905,43 @@ impl<'a> Compiler<'a> {
                     Opcode::OR => Alu::Or,
                     _ => Alu::Xor,
                 };
-                self.asm.alu_rr(alu, Reg::Rax, Reg::Rcx);
-                self.write(inst, Reg::Rax)?;
+                self.asm.alu_rr(alu, acc, rhs);
+                self.write(inst, acc)?;
             }
             Opcode::ANDC => {
                 let a = self.src(at, 0)?;
                 let b = self.src(at, 1)?;
-                self.load_temp(Reg::Rax, a);
+                // `b` is read after the accumulator is first written, so the
+                // accumulator may not be the register `b` lives in.
+                let acc = self.acc(inst, &[b]);
+                self.load_temp(acc, a);
                 self.load_temp(Reg::Rcx, b);
                 self.asm.not(Reg::Rcx);
-                self.asm.alu_rr(Alu::And, Reg::Rax, Reg::Rcx);
-                self.write(inst, Reg::Rax)?;
+                self.asm.alu_rr(Alu::And, acc, Reg::Rcx);
+                self.write(inst, acc)?;
             }
             Opcode::MUL => {
                 let a = self.src(at, 0)?;
                 let b = self.src(at, 1)?;
-                self.load_temp(Reg::Rax, a);
-                self.load_temp(Reg::Rcx, b);
-                self.asm.imul_rr(Reg::Rax, Reg::Rcx);
-                self.write(inst, Reg::Rax)?;
+                let acc = self.acc(inst, &[b]);
+                self.load_temp(acc, a);
+                let rhs = self.operand(Reg::Rcx, b);
+                self.asm.imul_rr(acc, rhs);
+                self.write(inst, acc)?;
             }
             Opcode::NEG => {
                 let a = self.src(at, 0)?;
-                self.load_temp(Reg::Rax, a);
-                self.asm.neg(Reg::Rax);
-                self.write(inst, Reg::Rax)?;
+                let acc = self.acc(inst, &[]);
+                self.load_temp(acc, a);
+                self.asm.neg(acc);
+                self.write(inst, acc)?;
             }
             Opcode::NOT => {
                 let a = self.src(at, 0)?;
-                self.load_temp(Reg::Rax, a);
-                self.asm.not(Reg::Rax);
-                self.write(inst, Reg::Rax)?;
+                let acc = self.acc(inst, &[]);
+                self.load_temp(acc, a);
+                self.asm.not(acc);
+                self.write(inst, acc)?;
             }
             Opcode::MULU2 | Opcode::MULS2 => self.widening_multiply(at, inst, w)?,
             Opcode::SHL | Opcode::SHR | Opcode::SAR => self.shift(at, inst, w)?,
@@ -764,14 +1055,20 @@ impl<'a> Compiler<'a> {
     /// first: temporaries are held zero-extended, so `-1` as an `i32` is
     /// `0xffff_ffff` and would compare *above* zero rather than below it.
     fn compare(&mut self, cond: Cond, w: u32, a: Temp, b: Temp) -> Cc {
-        self.load_temp(Reg::Rax, a);
-        self.load_temp(Reg::Rcx, b);
         let signed = matches!(cond, Cond::LtS | Cond::LeS | Cond::GtS | Cond::GeS);
-        if signed {
+        self.load_temp(Reg::Rax, a);
+        // A signed comparison rewrites both operands, so neither may be the
+        // register a live temporary is sitting in; an unsigned one only reads
+        // the right-hand side.
+        let rhs = if signed {
+            self.load_temp(Reg::Rcx, b);
             self.sext(Reg::Rax, w);
             self.sext(Reg::Rcx, w);
-        }
-        self.asm.alu_rr(Alu::Cmp, Reg::Rax, Reg::Rcx);
+            Reg::Rcx
+        } else {
+            self.operand(Reg::Rcx, b)
+        };
+        self.asm.alu_rr(Alu::Cmp, Reg::Rax, rhs);
         cc_of(cond)
     }
 
@@ -785,18 +1082,18 @@ impl<'a> Compiler<'a> {
                 // `mov` does not touch the flags, so the two candidates can be
                 // fetched between the compare and the conditional move.
                 self.load_temp(Reg::Rax, t);
-                self.load_temp(Reg::Rcx, f);
-                self.asm.cmovcc(invert(cc), Reg::Rax, Reg::Rcx);
+                let other = self.operand(Reg::Rcx, f);
+                self.asm.cmovcc(invert(cc), Reg::Rax, other);
             }
             (_, 3) => {
                 let sel = self.src(at, 0)?;
                 let (t, f) = (self.src(at, 1)?, self.src(at, 2)?);
-                self.load_temp(Reg::Rdx, sel);
-                self.asm.test_ri32(Reg::Rdx, 1);
+                let bit = self.operand(Reg::Rdx, sel);
+                self.asm.test_ri32(bit, 1);
                 self.load_temp(Reg::Rax, t);
-                self.load_temp(Reg::Rcx, f);
+                let other = self.operand(Reg::Rcx, f);
                 // Zero means the selector's low bit was clear, so take `f`.
-                self.asm.cmovcc(Cc::E, Reg::Rax, Reg::Rcx);
+                self.asm.cmovcc(Cc::E, Reg::Rax, other);
             }
             _ => {
                 return Err(Refusal::Shape(
@@ -825,8 +1122,8 @@ impl<'a> Compiler<'a> {
             }
             (_, 1) => {
                 let sel = self.src(at, 0)?;
-                self.load_temp(Reg::Rax, sel);
-                self.asm.test_ri32(Reg::Rax, 1);
+                let bit = self.operand(Reg::Rax, sel);
+                self.asm.test_ri32(bit, 1);
                 Cc::Ne
             }
             _ => {
@@ -886,14 +1183,14 @@ impl<'a> Compiler<'a> {
         self.load_temp(Reg::Rax, a);
         self.load_temp(Reg::Rcx, carry_in);
         self.asm.alu_ri(Alu::And, Reg::Rcx, 1);
-        // `r13` is callee-saved and this sequence makes no call, but it is
-        // also the only register left once the value, the carry in and the
-        // carry out are all live at once.
-        self.asm.mov_rr(Reg::R13, Reg::Rax);
+        // A third scratch register, because the value, the carry in and the
+        // carry out are all live at once. It used to be `r13`, which the
+        // allocator now hands out.
+        self.asm.mov_rr(Reg::Rsi, Reg::Rax);
         if inst.op == Opcode::ROTLC {
             self.asm.shift_ri(Shift::Shl, Reg::Rax, 1);
             self.asm.alu_rr(Alu::Or, Reg::Rax, Reg::Rcx);
-            self.asm.shift_ri(Shift::Shr, Reg::R13, (w - 1) as u8);
+            self.asm.shift_ri(Shift::Shr, Reg::Rsi, (w - 1) as u8);
         } else {
             self.asm.shift_ri(Shift::Shr, Reg::Rax, 1);
             if w > 1 {
@@ -901,10 +1198,10 @@ impl<'a> Compiler<'a> {
             }
             self.asm.alu_rr(Alu::Or, Reg::Rax, Reg::Rcx);
         }
-        self.asm.alu_ri(Alu::And, Reg::R13, 1);
+        self.asm.alu_ri(Alu::And, Reg::Rsi, 1);
         self.write(inst, Reg::Rax)?;
-        self.mask(Reg::R13, carry_ty);
-        self.store_temp(carry_out, Reg::R13);
+        self.mask(Reg::Rsi, carry_ty);
+        self.commit(carry_out, Reg::Rsi);
         Ok(())
     }
 
@@ -981,7 +1278,7 @@ impl<'a> Compiler<'a> {
             } else {
                 self.asm.mul(Reg::Rcx);
             }
-            self.asm.mov_rr(Reg::R13, Reg::Rdx);
+            self.asm.mov_rr(Reg::Rsi, Reg::Rdx);
         } else {
             // Below 64 bits the whole product fits in one register, so the
             // high half is a shift. A signed product needs both operands
@@ -992,16 +1289,16 @@ impl<'a> Compiler<'a> {
                 self.sext(Reg::Rcx, w);
             }
             self.asm.imul_rr(Reg::Rax, Reg::Rcx);
-            self.asm.mov_rr(Reg::R13, Reg::Rax);
-            self.asm.shift_ri(Shift::Shr, Reg::R13, w as u8);
+            self.asm.mov_rr(Reg::Rsi, Reg::Rax);
+            self.asm.shift_ri(Shift::Shr, Reg::Rsi, w as u8);
         }
         self.write(inst, Reg::Rax)?;
         // The interpreter masks the high half twice as well: once to the
         // instruction's width, where it takes it out of the double-width
         // product, and once to the temporary it lands in.
-        self.mask(Reg::R13, inst.ty);
-        self.mask(Reg::R13, high_ty);
-        self.store_temp(high, Reg::R13);
+        self.mask(Reg::Rsi, inst.ty);
+        self.mask(Reg::Rsi, high_ty);
+        self.commit(high, Reg::Rsi);
         Ok(())
     }
 
@@ -1066,7 +1363,10 @@ impl<'a> Compiler<'a> {
             // RAM branches out to the host's own path, which is the one that
             // fills the entry.
             self.load_temp(Reg::Rax, addr);
-            self.asm.test_rr(Reg::R15, Reg::R15);
+            // The load set, which used to sit in `r15` for the whole block and
+            // is now one of the three registers the allocator has to work with.
+            self.asm.mov_rm(Reg::Rsi, Reg::Rbx, off::TLB_BASE);
+            self.asm.test_rr(Reg::Rsi, Reg::Rsi);
             slow.push(self.asm.jcc(Cc::E));
             if bytes > 1 {
                 // Natural alignment. It is also what makes the page-crossing
@@ -1083,7 +1383,7 @@ impl<'a> Compiler<'a> {
             self.asm.alu_rr(Alu::And, Reg::Rcx, Reg::Rdx);
             self.asm
                 .shift_ri(Shift::Shl, Reg::Rcx, FastSet::STRIDE.trailing_zeros() as u8);
-            self.asm.alu_rr(Alu::Add, Reg::Rcx, Reg::R15);
+            self.asm.alu_rr(Alu::Add, Reg::Rcx, Reg::Rsi);
             // tag = (addr & !PAGE_MASK) | context | valid
             self.asm.mov_rr(Reg::Rdx, Reg::Rax);
             self.asm.mov_ri(Reg::Rsi, !PAGE_MASK);
@@ -1099,12 +1399,15 @@ impl<'a> Compiler<'a> {
             self.asm.test_rr(Reg::Rdx, Reg::Rdx);
             slow.push(self.asm.jcc(Cc::E));
             self.asm.alu_rr(Alu::Add, Reg::Rdx, Reg::Rax);
-            self.asm.load_zx(Reg::R13, Reg::Rdx, 0, bytes);
+            self.asm.load_zx(Reg::Rax, Reg::Rdx, 0, bytes);
+            // Park the value across the call rather than in a callee-saved
+            // register, which the allocator now owns; see `PARKED`.
+            self.asm.mov_mr(Reg::Rsp, PARKED, Reg::Rax);
             // The tick the host's own path would have charged for this access.
             self.ctx_to_rdi();
             self.call(vt::FAST_TICK);
             self.bump(off::FAST_HITS);
-            self.asm.mov_rr(Reg::Rax, Reg::R13);
+            self.asm.mov_rm(Reg::Rax, Reg::Rsp, PARKED);
             joined = Some(self.asm.jmp());
         }
 
@@ -1159,8 +1462,11 @@ impl<'a> Compiler<'a> {
         self.load_temp(Reg::Rcx, value);
         let mask = mem.size.mask();
         if mask != u64::MAX {
-            self.asm.mov_ri(Reg::R13, mask);
-            self.asm.alu_rr(Alu::And, Reg::Rcx, Reg::R13);
+            // `rax` rather than a callee-saved register: it is not an argument
+            // register, this sequence makes no call before the `and`, and
+            // `r13` now belongs to the allocator.
+            self.asm.mov_ri(Reg::Rax, mask);
+            self.asm.alu_rr(Alu::And, Reg::Rcx, Reg::Rax);
         }
         self.call(vt::STORE);
         self.asm.test_rr(Reg::Rax, Reg::Rax);

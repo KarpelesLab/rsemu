@@ -52,7 +52,7 @@ use crate::ir::{Block, Fault, InsnStart, IrHost, MemOp, Opcode, Outcome, RegSlot
 use crate::jit::{CodeRef, FastMem};
 
 use super::buf::{CodeBuf, DEFAULT_CAPACITY};
-use super::compile::{Compiled, Refusal, compile};
+use super::compile::{Compiled, Refusal, Regs, compile_with};
 
 /// Why a compiled block stopped, as generated code reports it in `rax`.
 ///
@@ -429,6 +429,10 @@ pub struct Engine {
     buf: CodeBuf,
     arena: Vec<Compiled>,
     temps: Vec<u64>,
+    /// Which block's code last ran, so [`Engine::temp_value`] knows which
+    /// temporaries that code wrote into the frame.
+    last: Option<CodeRef>,
+    regs: Regs,
     ticks: u64,
     boundaries: u64,
     mark: Option<u32>,
@@ -450,11 +454,31 @@ impl Engine {
             buf: CodeBuf::new(bytes)?,
             arena: Vec::new(),
             temps: Vec::new(),
+            last: None,
+            regs: Regs::default(),
             ticks: 0,
             boundaries: 0,
             mark: None,
             stats: EngineStats::default(),
         })
+    }
+
+    /// Where blocks compiled from now on keep their temporaries.
+    ///
+    /// [`Regs::Frame`] is the backend without the register allocator, kept
+    /// runnable as the control: it is what the differential in
+    /// `jit::x86::tests` compares against and what the two benchmarks' columns
+    /// separate. Blocks already compiled keep the policy they were compiled
+    /// under.
+    pub fn set_regs(&mut self, regs: Regs) {
+        self.regs = regs;
+    }
+
+    /// Which policy new blocks are compiled under.
+    #[inline]
+    #[must_use]
+    pub fn regs(&self) -> Regs {
+        self.regs
     }
 
     /// What this engine has been asked to do.
@@ -485,14 +509,38 @@ impl Engine {
         self.mark
     }
 
-    /// The value a temporary held when the last run stopped.
+    /// The value a temporary held when the last run stopped, if the run kept
+    /// it.
     ///
     /// The counterpart of
     /// [`Interp::temp_value`](crate::ir::Interp::temp_value), and what a
-    /// backend-level differential compares.
+    /// backend-level differential compares — but not on every temporary, and
+    /// the difference is the register allocator rather than an omission. A
+    /// temporary the allocator kept in a host register is **gone** once the
+    /// block has returned and the epilogue has restored the caller's
+    /// registers; its frame slot holds the zero the frame was cleared to, and
+    /// handing that back as a value would be a lie a differential would then
+    /// assert. So this returns `None` for one.
+    ///
+    /// What it never returns `None` for is a temporary an
+    /// [`InsnStart`] names, because that is the state the exception path
+    /// materializes and the backend writes those through to the frame at their
+    /// definition. That is the property, and `jit::x86::tests`' `agree_under`
+    /// asserts it on every block the differential generates, faulting or not.
     #[inline]
     #[must_use]
     pub fn temp_value(&self, temp: crate::ir::Temp) -> Option<u64> {
+        // Through `is_live`, because a code-buffer reset clears the arena and
+        // refills it: an index from before one names a different block's
+        // allocation, and answering out of that would be a wrong answer rather
+        // than a missing one.
+        let last = self.last?;
+        if !self.is_live(last) {
+            return None;
+        }
+        if !self.arena.get(last.index as usize)?.frame_backed(temp) {
+            return None;
+        }
         self.temps.get(temp.index()).copied()
     }
 
@@ -509,7 +557,7 @@ impl Engine {
     ///
     /// [`Refusal`], naming the op or the shape that stopped it.
     pub fn compile(&mut self, block: &Block) -> core::result::Result<CodeRef, Refusal> {
-        let compiled = match compile(block) {
+        let compiled = match compile_with(block, self.regs) {
             Ok(c) => c,
             Err(e) => {
                 self.stats.refused += 1;
@@ -564,6 +612,7 @@ impl Engine {
         }
         let compiled = &self.arena[code.index as usize];
         let offset = compiled.offset();
+        self.last = Some(code);
         self.temps.clear();
         self.temps.resize(block.temp_count(), 0);
 

@@ -189,11 +189,16 @@
 //! Vector ops (`v128` exists as a [`Type`] so the IR can carry the values;
 //! §9 adds the ops with the SIMD work, not before), the rest of the pass
 //! pipeline — constant folding, copy propagation, the load/store reordering
-//! rules — the register allocator, and every *host* backend. [`Interp`] is
+//! rules — and every *host* backend. [`Interp`] is
 //! here, because §11's bare-metal row runs on it and it is the oracle the host
-//! backends are differentially tested against; and **liveness and dead-code
+//! backends are differentially tested against; **liveness and dead-code
 //! elimination are here**, in [`Liveness`] and [`eliminate_dead_code`],
-//! because decision 1 is a debt until they exist rather than after.
+//! because decision 1 is a debt until they exist rather than after; and
+//! **so is the register allocator**, in [`linear_scan`], because everything it
+//! decides — which intervals overlap, which definitions a forward branch can
+//! jump over, which values outlive a call — is a property of the block rather
+//! than of a host. A backend contributes two lists of register numbers and
+//! gets back one [`Home`] per temporary.
 //! [`Type::V128`] and the float types
 //! carry values today so that a helper call can take and return them —
 //! tier-1 floating point is helper calls into the soft-float implementation
@@ -203,6 +208,7 @@ mod block;
 mod interp;
 mod op;
 mod pass;
+mod regalloc;
 mod types;
 mod verify;
 
@@ -213,5 +219,6 @@ pub use op::{
     bitfield_parts,
 };
 pub use pass::{Liveness, TempLife, eliminate_dead_code};
+pub use regalloc::{Allocation, Home, MAX_REGS, RegBanks, linear_scan};
 pub use types::{Const, Temp, Type};
 pub use verify::verify;
