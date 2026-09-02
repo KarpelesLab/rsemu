@@ -1723,7 +1723,13 @@ mod tests {
     #[test]
     fn the_busiest_decode_bucket_has_headroom() {
         let busiest = INDEX.iter().map(|b| b.len as usize).max().unwrap_or(0);
-        println!("busiest bucket: {busiest} of {BUCKET_CAP}");
+        // `cpu-arm-a64` does not imply `std`, and the per-feature sweep builds
+        // exactly that configuration -- the only one that compiles this core
+        // with no `std` underneath it. The assertion below is the test; this
+        // only reports how much room is left, so it is gated rather than the
+        // margin being left unreported in a build that can print.
+        #[cfg(feature = "std")]
+        std::println!("busiest bucket: {busiest} of {BUCKET_CAP}");
         assert!(
             busiest + 16 <= BUCKET_CAP,
             "the busiest decode bucket holds {busiest} of {BUCKET_CAP} rows: \
