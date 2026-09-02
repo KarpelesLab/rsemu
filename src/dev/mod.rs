@@ -154,6 +154,7 @@ pub mod uart;
     feature = "dev-usb-dwc2",
     feature = "dev-usb-hid",
     feature = "dev-usb-msd",
+    feature = "dev-usb-hub",
     feature = "dev-usb-xhci"
 ))]
 #[cfg_attr(
@@ -164,6 +165,7 @@ pub mod uart;
         feature = "dev-usb-dwc2",
         feature = "dev-usb-hid",
         feature = "dev-usb-msd",
+        feature = "dev-usb-hub",
         feature = "dev-usb-xhci"
     )))
 )]

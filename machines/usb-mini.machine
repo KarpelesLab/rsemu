@@ -29,12 +29,19 @@
 # What is deliberately missing
 # ---------------------------------------------------------------------------
 #
-# **A companion controller and a hub.** An EHCI drives high-speed devices and
-# nothing else (EHCI 1.0 §4.2); a full-speed device reaches one through a
-# transaction translator in a hub, and rsemu models neither. So the disk on this
-# board is high speed, and one that said otherwise would be handed to a
-# companion that is not there and would vanish. `usb.storage` refuses `low`
-# outright, because USB 2.0 §5.8 defines no bulk transfers at low speed at all.
+# **A companion controller, and a transaction translator.** An EHCI drives
+# high-speed devices and nothing else (EHCI 1.0 §4.2); a full-speed device
+# reaches one through a transaction translator inside a hub, and rsemu models
+# neither the companion nor the translator. So the disk on this board is high
+# speed, and one that said otherwise would be handed to a companion that is not
+# there and would vanish. `usb.storage` refuses `low` outright, because USB 2.0
+# §5.8 defines no bulk transfers at low speed at all.
+#
+# **A hub**, which used to be on this list and no longer is: `machines/hub-mini.machine`
+# is this board with a `usb.hub` between the controller and the disk, and the
+# disk reached through it reads the same sector off the same medium. What a hub
+# cannot do here is the thing above — carry a *slow* device to a high-speed
+# controller — because that is the translator rather than the hub.
 #
 # **A second port.** The bus is sized by whichever object names it first, which
 # is the controller below; `ports = 1` and the disk sits in port 0.

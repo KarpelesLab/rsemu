@@ -109,23 +109,30 @@
 //!
 //! # What is not here
 //!
-//! * **Hubs.** The fabric has the port model a hub needs (connect, enable,
-//!   speed, reset) and a hub device model would be an ordinary [`Function`]
-//!   with downstream ports — plus the hub class requests and the status-change
-//!   endpoint of USB 2.0 §11.
+//! * **The transaction translator**, which is now the whole of what a hub is
+//!   missing. Hubs themselves are built — [`crate::dev::usb::hub`], and the
+//!   **routing** they needed is here: [`UsbBus::find`] walks tiers rather than
+//!   a flat list, descending through [`UsbDevice::downstream`], bounded by
+//!   [`MAX_TIERS`] and [`MAX_DEVICES`] because a machine description can build
+//!   a cycle out of two hubs.
 //!
-//!   What is genuinely missing is **routing**: [`UsbBus::find`] searches a flat
-//!   list of enabled ports, so a device behind a hub has nowhere to be. That is
-//!   the work, and it is the fabric's rather than a device model's.
+//!   Two earlier notes here were wrong in opposite directions and both are
+//!   worth keeping. The first said a hub would *also* need EHCI split
+//!   transactions, which is **too strong**: `SPLIT` tokens, a queue head's
+//!   `µFrame C-mask` and the `siTD` are what a high-speed hub carrying a
+//!   **full- or low-speed** device needs (USB 2.0 §11.14, EHCI 1.0 §4.12), and
+//!   a high-speed hub with high-speed devices behind it needs none of them. The
+//!   second said what a hub needs first is routing, *"and it is the fabric's
+//!   rather than a device model's"* — true of the walk, and **not** true of the
+//!   port state: a hub's ports are the hub's, the host reaches them through
+//!   nine class requests it addresses to the hub like any other device, and
+//!   [`crate::dev::usb::hub`] is where they live. What the fabric owed was
+//!   sixty lines and one defaulted trait method.
 //!
-//!   An earlier note here said a hub would *also* need EHCI split transactions,
-//!   and that is **too strong** — split transactions (`SPLIT` tokens, a queue
-//!   head's `µFrame C-mask`, the `siTD`) are what a **high-speed hub carrying a
-//!   full- or low-speed device** needs (USB 2.0 §11.14, EHCI 1.0 §4.12). A
-//!   high-speed hub with high-speed devices behind it needs none of them. So the
-//!   obstacle to a hub is smaller than it was written to be, and the obstacle to
-//!   a hub that is any *use* — one that lets a full-speed device reach an EHCI
-//!   at last — is the transaction translator.
+//!   So a full-speed device behind a high-speed hub is still unreachable, and
+//!   the hub says so at the port rather than pretending: see
+//!   [`crate::dev::usb::hub`] for why that is the same refusal an EHCI already
+//!   makes with `PORTSC.Port Owner`.
 //! * **Host passthrough.** Sharing a real device from the host is a
 //!   [`UsbDevice`] implementor living under `host/` and nothing more, which is
 //!   why the seam is shaped this way. It is not started here: on Linux the
@@ -775,6 +782,35 @@ pub trait UsbDevice: Send + Sync + fmt::Debug {
         let _ = (endpoint, dst);
         Completion::nak()
     }
+
+    /// The bus this device is itself the root of, if it is a **hub**.
+    ///
+    /// `None` for everything that is not, which is the default and which is
+    /// every other device model in this tree.
+    ///
+    /// # Why the fabric asks rather than the hub telling
+    ///
+    /// A USB address is flat: the token on the wire carries seven bits and a
+    /// hub is a repeater, not a router — it does not look at the address and it
+    /// does not know which of its ports the reply will come from. So the *host*
+    /// is what holds the topology, and here the host controller's view of the
+    /// topology is [`UsbBus`]. Routing is therefore a walk this module does,
+    /// over ports this module already models, and the only thing it needs from
+    /// a hub is the next tier's port table.
+    ///
+    /// Returning the [`UsbBus`] itself rather than a list of devices is what
+    /// keeps the tiers identical: a hub's downstream ports carry connect,
+    /// enable, reset and speed exactly as a root port does, so a device behind
+    /// one is found by the same rule that finds a device in front of one — an
+    /// **enabled** port, and only an enabled port ([`UsbBus::find`]).
+    ///
+    /// A hub that returns the bus it is *plugged into* would close a cycle;
+    /// [`UsbBus::find`] is bounded so that this is a bad topology rather than a
+    /// hang, and [`crate::dev::usb::hub`] refuses the one-hub form of it at
+    /// construction.
+    fn downstream(&self) -> Option<Arc<UsbBus>> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -788,6 +824,28 @@ pub trait UsbDevice: Send + Sync + fmt::Debug {
 /// device asking for a sixteenth is a configuration error at construction, not
 /// a silent wrap.
 pub const MAX_PORTS: usize = 15;
+
+/// How many **tiers** a bus may be deep (USB 2.0 §4.1.1).
+///
+/// Seven, counting the host's own root hub as tier 1 — so a device on a root
+/// port is at tier 2, at most five hubs may be chained in series, and the
+/// deepest device sits at tier 7. That gives [`MAX_PORTS`]'s sibling bound:
+/// [`UsbBus::find`] expands **six** levels of ports and then stops.
+///
+/// This is a *cable-length* limit in the specification — the propagation delay
+/// budget of §7.1.19 is what fixes it at seven — and it is a *termination*
+/// limit here, which is the same discipline the schedule walkers keep: a
+/// topology the machine description built can close a cycle (two hubs each
+/// naming the other's bus), and a routing walk must end whatever it was handed.
+pub const MAX_TIERS: u8 = 7;
+
+/// How many devices one bus may carry (USB 2.0 §4.1.1).
+///
+/// 127, because a device address is seven bits and zero is the default address
+/// rather than an assignable one. [`UsbBus::find`] visits at most this many
+/// devices however the tiers are arranged, which bounds a *wide* topology the
+/// way [`MAX_TIERS`] bounds a deep one.
+pub const MAX_DEVICES: usize = 127;
 
 /// One port of a [`UsbBus`].
 #[derive(Debug, Clone, Default)]
@@ -878,7 +936,7 @@ impl UsbBus {
                 at: alloc::format!("port {port}"),
                 message: alloc::string::String::from(
                     "two devices on one USB port; give one of them another `port`, \
-                     or add a hub — which this tree does not model yet",
+                     or put a `usb.hub` here and plug them into its downstream bus",
                 ),
             });
         }
@@ -987,44 +1045,124 @@ impl UsbBus {
         }
     }
 
-    /// Broadcast a start-of-frame to everything plugged into this bus.
+    /// Broadcast a start-of-frame to everything plugged into this bus, and to
+    /// everything plugged in behind a hub on it.
     ///
     /// Every *connected* device, not only the enabled ones: a `SOF` is not
     /// addressed, and a device still in the Default state counts frames like
     /// any other (USB 2.0 §8.4.3). A controller calls this once per frame, at
     /// the frame boundary and with no lock of its own held.
+    ///
+    /// **The fabric's rule, at every tier, is "plugged in hears an unaddressed
+    /// signal; enabled can be addressed"** — which is looser than §11.5.1.4,
+    /// where a hub port in the Disabled state propagates no signalling at all.
+    /// The difference is deliberate and is stated rather than hidden: a
+    /// [`Peripheral`] ignores a `SOF` entirely, so the only thing that could
+    /// observe it is a guest acting as a device, and making the rule differ
+    /// between a root port and a hub port would be a second rule to get wrong.
+    ///
+    /// Bounded exactly as [`find`](UsbBus::find) is, and for the same reason:
+    /// the topology can contain a cycle.
     pub fn start_of_frame(&self, frame: u16) {
-        let devices: Vec<Arc<dyn UsbDevice>> = {
-            let ports = self.ports.lock();
-            ports.iter().filter_map(|p| p.device.clone()).collect()
-        };
-        // Outside the lock: a device may reach further from its own frame tick.
-        for device in devices {
-            device.start_of_frame(frame & 0x7ff);
+        let mut frontier = self.connected_devices();
+        let mut budget = MAX_DEVICES;
+        for _ in 1..MAX_TIERS {
+            if frontier.is_empty() {
+                return;
+            }
+            let mut next: Vec<Arc<dyn UsbDevice>> = Vec::new();
+            for device in frontier {
+                if budget == 0 {
+                    return;
+                }
+                budget -= 1;
+                // Outside the lock: a device may reach further from its own
+                // frame tick.
+                device.start_of_frame(frame & 0x7ff);
+                if let Some(below) = device.downstream() {
+                    next.extend(below.connected_devices());
+                }
+            }
+            frontier = next;
         }
     }
 
-    /// The device answering to `address` on an enabled port, if any.
+    /// Every device on an **enabled** port of this bus, in port order.
     ///
-    /// Ports are searched in index order, which is deterministic and is what
-    /// makes two freshly attached devices — both at
+    /// The lock is taken and released here and the `Arc`s are cloned out,
+    /// because everything a caller does with the result is a call into a device
+    /// and the re-entrancy contract forbids holding the fabric's lock across
+    /// one. That is what makes the tiered walk in [`find`](UsbBus::find) safe:
+    /// it holds one bus's lock at a time, never two, so two buses at
+    /// [`FABRIC_RANK`] never nest.
+    fn enabled_devices(&self) -> Vec<Arc<dyn UsbDevice>> {
+        let ports = self.ports.lock();
+        ports
+            .iter()
+            .filter(|p| p.enabled)
+            .filter_map(|p| p.device.clone())
+            .collect()
+    }
+
+    /// Every device *plugged into* this bus, enabled or not, in port order.
+    fn connected_devices(&self) -> Vec<Arc<dyn UsbDevice>> {
+        let ports = self.ports.lock();
+        ports.iter().filter_map(|p| p.device.clone()).collect()
+    }
+
+    /// The device answering to `address`, anywhere in the tree below this bus.
+    ///
+    /// Ports are searched in index order and tier by tier, which is
+    /// deterministic and is what makes two freshly attached devices — both at
     /// [`DeviceAddress::DEFAULT`] — a *modelled* hazard rather than a
     /// hash-order coin flip. In practice a host resets one port at a time
-    /// precisely so the situation does not arise (§9.1.2), and only the
-    /// enabled port is searched, so it does not.
+    /// precisely so the situation does not arise (§9.1.2), and only enabled
+    /// ports are searched, so it does not.
+    ///
+    /// # Through a hub
+    ///
+    /// A hub is a repeater and not a router: the address on the wire is flat,
+    /// and reaching a device behind a hub is *the host's* problem rather than
+    /// the hub's (USB 2.0 §11.1.2.1). So the search descends through
+    /// [`UsbDevice::downstream`] — a hub's own port table, with the same
+    /// connect/enable/speed model a root port has — and a device behind a hub
+    /// whose port the host has not yet reset and enabled is as unreachable as a
+    /// device on a root port that has not been.
+    ///
+    /// **The walk is bounded twice**, because the topology is built by a
+    /// machine description and two hubs can name each other's bus:
+    /// [`MAX_TIERS`] caps the depth at the six levels of ports USB 2.0 §4.1.1
+    /// allows, and [`MAX_DEVICES`] caps the total visited at the 127 addresses
+    /// the bus has. A cycle therefore ends in "no such device", which is what a
+    /// host sees when it talks to an address nothing answers.
     #[must_use]
     pub fn find(&self, address: DeviceAddress) -> Option<Arc<dyn UsbDevice>> {
-        let candidates: Vec<Arc<dyn UsbDevice>> = {
-            let ports = self.ports.lock();
-            ports
-                .iter()
-                .filter(|p| p.enabled)
-                .filter_map(|p| p.device.clone())
-                .collect()
-        };
-        // The address query is a call into the device, so the lock is released
-        // first.
-        candidates.into_iter().find(|d| d.address() == address)
+        let mut frontier = self.enabled_devices();
+        let mut budget = MAX_DEVICES;
+        // Tier 1 is the root hub, so `frontier` starts at tier 2 and there are
+        // `MAX_TIERS - 1` levels of ports to expand.
+        for _ in 1..MAX_TIERS {
+            if frontier.is_empty() {
+                return None;
+            }
+            let mut next: Vec<Arc<dyn UsbDevice>> = Vec::new();
+            for device in frontier {
+                if budget == 0 {
+                    return None;
+                }
+                budget -= 1;
+                // Both of these are calls into the device with no lock of this
+                // bus's held — `enabled_devices` released it above.
+                if device.address() == address {
+                    return Some(device);
+                }
+                if let Some(below) = device.downstream() {
+                    next.extend(below.enabled_devices());
+                }
+            }
+            frontier = next;
+        }
+        None
     }
 
     /// A `SETUP` transaction to `address`, endpoint `endpoint`.

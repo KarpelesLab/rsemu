@@ -403,10 +403,25 @@ dev-usb-dwc2 = ["bus-usb"]
 # and it delivers three-byte reports on an interrupt IN endpoint that a host
 # controller polls once a millisecond. **High speed**, deliberately: EHCI cannot
 # drive a full- or low-speed device without a transaction translator, and this
-# tree has no hub, so a device that claimed to be low speed would be a device
-# that never enumerated. Written from USB 2.0 §9, HID 1.11 and the HID Usage
-# Tables. Needs `bus-usb`.
+# tree's hub does not have one either, so a device that claimed to be low speed
+# behind either would be a device that never enumerated. Written from USB 2.0 §9,
+# HID 1.11 and the HID Usage Tables. Needs `bus-usb`.
 dev-usb-hid = ["bus-usb"]
+
+# A USB 2.0 hub (src/dev/usb/hub.rs): **the device that makes the bus a tree**.
+# Downstream ports with the state machine of USB 2.0 §11.5, the nine class
+# requests of §11.24.2, the hub descriptor of §11.23.2.1 and the status change
+# endpoint of §11.12.4. Its ports form a **second named bus**, so a device behind
+# the hub is an ordinary object in a machine file whose `bus` is the hub's
+# `downstream` name — and the routing that reaches it is the fabric's, which now
+# walks tiers instead of a flat port list.
+#
+# **No transaction translator.** Its requests are answered, because a high-speed
+# hub is required to have one; the split-transaction *data path* is not built, so
+# a full- or low-speed device behind a high-speed hub does not enable and says
+# so at the port. A `speed = "full"` hub needs no translator and carries full-
+# and low-speed devices completely. Needs `bus-usb`.
+dev-usb-hub = ["bus-usb"]
 
 # A USB mass storage device (src/dev/usb/msd.rs): **Bulk-Only Transport and a
 # SCSI command set over two bulk endpoints, with a real medium behind it**. This
@@ -910,6 +925,17 @@ machine-usb-mini = ["cpu-riscv", "dev-riscv", "dev-usb-ehci", "dev-usb-msd"]
 # The `firmware` media slot takes the program the hart runs, and the `usb0` slot
 # takes the disk.
 machine-xhci-mini = ["cpu-riscv", "dev-riscv", "dev-usb-xhci", "dev-usb-msd"]
+
+# The `hub-mini` board (machines/hub-mini.machine plus the classes it names):
+# `usb-mini` with a **hub** inserted between the EHCI and the disk, and nothing
+# else changed. It exists so the claim a hub is worth making has somewhere to be
+# made: a guest enumerates the hub, powers a downstream port, resets it, and then
+# issues control transfers and Bulk-Only commands to a device that is on **no
+# root port at all** — which the fabric's old flat list of enabled ports could
+# not have routed. The disk sits where the hub's one-based port numbers and the
+# fabric's zero-based indices disagree, so a conversion bug fails the test rather
+# than cancelling out. `tests/usb_hub.rs` boots it.
+machine-hub-mini = ["cpu-riscv", "dev-riscv", "dev-usb-ehci", "dev-usb-hub", "dev-usb-msd"]
 
 # The Sharp SM83 core (src/cpu/sm83): the Game Boy's processor, an M-cycle
 # accurate interpreter with all 256 base and 256 $CB encodings, the eleven

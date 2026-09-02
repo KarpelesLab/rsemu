@@ -105,13 +105,16 @@ half-modelled controller can look like a working boot. Detection succeeding is
 the first thing that will change its behaviour, and the first thing that can
 regress it.
 
-## USB, as built (`bus-usb`, `dev-usb-ehci`, `dev-usb-chipidea`, `dev-usb-dwc2`, `dev-usb-hid`, `dev-usb-msd`, `dev-usb-xhci`)
+## USB, as built (`bus-usb`, `dev-usb-ehci`, `dev-usb-chipidea`, `dev-usb-dwc2`, `dev-usb-hid`, `dev-usb-msd`, `dev-usb-xhci`, `dev-usb-hub`)
 
 In the order they matter — and the order matters because the whole value of the
 arrangement is that the *next* controller reuses the first one unchanged. That
 is no longer a hope: §4 is the controller that tested it, §4.1 is the
 *direction* that tested it, and §7 is the controller whose schedule format is
-least like the fabric's and still needed nothing from it.
+least like the fabric's and still needed nothing from it. §8 is the first thing
+that did need something — a hub is a *topology* rather than a device, and the
+fabric owed it a walk — and what it needed turned out to be one defaulted trait
+method.
 
 ### 1. The fabric (`src/bus/usb/`, `bus-usb`)
 
@@ -134,6 +137,19 @@ controller, not to the fabric**, which is what makes "two freshly attached
 devices both answer address zero" a modelled situation rather than an
 undetectable one.
 
+And the fabric **routes**, which since §8 means it walks a tree rather than
+scanning a list. `UsbBus::find` starts at the enabled root ports, and for each
+device it did not match it asks `UsbDevice::downstream` for the bus that device
+is itself the root of — `None` for everything but a hub. That single defaulted
+method plus sixty lines of walk is the whole of what a hub cost the fabric,
+which is smaller than this file predicted; §8 records what it cost instead.
+
+The walk is bounded twice, because a *machine description* can build a cycle out
+of two hubs the way guest memory can build one out of two queue heads:
+`MAX_TIERS` caps it at the six levels of ports USB 2.0 §4.1.1 allows and
+`MAX_DEVICES` at the 127 addresses the bus has. A cycle therefore ends in "no
+such device" rather than in a hang.
+
 ### 2. A generic EHCI (`src/dev/usb/ehci.rs`, `dev-usb-ehci`)
 
 The register file is the small half. The controller proper is the **schedule
@@ -150,14 +166,16 @@ itself, a descriptor can point at itself, a frame list can close a circle — an
 `fuzz/fuzz_targets/usb_ehci.rs` drives arbitrary bytes through both the register
 block and guest RAM to keep it that way.
 
-Isochronous `iTD`/`siTD` nodes are followed and **not executed**; there are no
-split transactions and no hub. Those two are less coupled than this file used to
-say: `SPLIT` tokens, the `µFrame C-mask` and the `siTD` are what a high-speed hub
-carrying a **full- or low-speed** device needs (USB 2.0 §11.14, EHCI 1.0 §4.12),
-and a high-speed hub with high-speed devices behind it needs none of them. What a
-hub of *any* kind actually needs first is routing in the fabric — `UsbBus::find`
-searches a flat list of enabled ports — so the obstacle is smaller than it was
-written to be and it is in a different place. EHCI is high-speed only, and this one does the
+Isochronous `iTD`/`siTD` nodes are followed and **not executed**; there are still
+no split transactions, and there is now a hub (§8) that does not need them. The
+two were never as coupled as this file first said: `SPLIT` tokens, the
+`µFrame C-mask` and the `siTD` are what a high-speed hub carrying a **full- or
+low-speed** device needs (USB 2.0 §11.14, EHCI 1.0 §4.12), and a high-speed hub
+with high-speed devices behind it needs none of them. The controller therefore
+needed **no change at all** for a hub to work behind it, which is the fourth time
+this file records that a USB addition cost the layer below it nothing: a hub is a
+device that answers control transfers, and this controller already issues those.
+EHCI is high-speed only, and this one does the
 honest thing with anything else: it hands the port to a companion controller by
 setting `PORTSC.Port Owner` (EHCI 1.0 §4.2.2), so a full-speed device attached to
 a bare EHCI *vanishes* rather than silently enumerating on a bus that could not
@@ -665,6 +683,85 @@ nothing vanishes.
 nothing else changed, which is what makes the comparison worth anything: the same
 hart, the same PLIC, the same disk, and the sector read over rings checked
 against the same `Medium::read_at` as the sector read over queue heads.
+
+### 8. A hub (`src/dev/usb/hub.rs`, `dev-usb-hub`)
+
+The device that makes the bus a **tree**, and the first one here whose interesting
+half is not what it says but *where other devices are*.
+
+**A hub is not a router.** The address on the wire is seven flat bits and a hub
+never looks at them (USB 2.0 §11.1.2.1): downstream it repeats, upstream it
+forwards. What makes a device behind a hub reachable is the *host* having powered,
+reset and enabled the port it is on, through nine class requests addressed to the
+hub like to any other device. So the routing is the fabric's (§1) and the port
+state machine of §11.5 is the hub's, and the split between them is the reverse of
+what §1 used to predict — that file said the missing piece was routing *"and it is
+the fabric's rather than a device model's"*, which is true of the walk and false of
+the ports.
+
+**Its downstream ports are a second named `UsbBus`.** That is the decision that
+made everything else small: a hub's ports carry connect, enable, reset and speed
+exactly as root ports do, so the port model already existed, the machine-file
+rendezvous already existed, and a device behind a hub is an ordinary object whose
+`bus` is the hub's `downstream` name. Neither object mentions the other.
+
+**It is a `UsbDevice` directly rather than a `Peripheral`**, and that is the one
+structural thing a hub asked for. `Endpoint0` holds its lock across the call into
+the `Function` — deliberately, since serving a request is one step — and a hub's
+`SetPortFeature(PORT_RESET)` has to call `UsbBus::reset_port`, which calls
+`bus_reset` on the device behind the port and takes *that* device's `EP0_RANK`
+lock. Same rank, so the ladder catches it, and it is right to: this is the
+re-entrancy contract in its plainest form. A port request therefore records what
+it wants and returns; a `flush` around each transaction does the outward half —
+the reset, the enable, the connection sample — with no pipe lock held. **No new
+lock rank**, which is what the brief said should not be needed and was correct.
+
+Ports are **not powered at reset**, so an unpowered port reports no connection at
+all however much is plugged into it (§11.5.1.1) — the same decision the EHCI makes
+about `CONFIGFLAG`, and deliberately not papered over.
+
+**The transaction translator's requests exist; its data path does not.** A
+high-speed hub is required to have a TT, so `bDeviceProtocol` is 1 and
+`ClearTTBuffer`/`ResetTT`/`StopTT` are answered as the no-ops they honestly are
+for a TT that has never buffered anything. What is missing is `SPLIT` tokens, the
+µFrame C-mask and the `siTD` (§11.14, EHCI 1.0 §4.12) — so a full- or low-speed
+device behind a **high-speed** hub connects, reports its speed, and leaves the
+port disabled. That is the same refusal the EHCI already makes with `PORTSC.Port
+Owner` and the dwc2 by leaving `HPRT.PENA` clear, moved to the port where it
+belongs. A **full-speed** hub needs no translator at all, so `speed = "full"` with
+full- and low-speed devices behind it is complete. A hub may not be low speed
+(§11.1) and this one refuses to be.
+
+Also not modelled: suspend propagation (`PORT_SUSPEND` is remembered and the
+resume completes at once), over-current (no bit ever sets, and the hub descriptor
+says *no over-current protection* rather than claiming protection that never
+reports), port indicators beyond storing the selector, and `GetTTState`, whose
+bytes §11.24.2.4 leaves implementation defined. A reset completes before the next
+transaction instead of taking the 10 ms of §11.5.1.5, because a hub here has no
+clock domain — the same direction of simplification the dwc2's frame budget makes.
+
+**A cycle is refused at `realize`, and the fuzz target is why.** Two hubs can be
+given each other's bus; `new` cannot see it, because neither hub exists when the
+other is built, so `realize` walks down from each hub and refuses if it arrives
+back at itself. Routing would have survived — it is bounded — but a `UsbBus` holds
+an `Arc` to each device and a hub holds an `Arc` to the bus below it, so a cycle in
+the topology is a cycle in the reference counts and the whole loop leaks.
+`fuzz/fuzz_targets/usb_hub.rs` reported that on its first run, from an input that
+did nothing at all, and it still builds the cycle on purpose so that the bound
+stays honest rather than resting on the check.
+
+`tests/usb_hub.rs` is the end-to-end claim, on `machines/hub-mini.machine` — which
+is `usb-mini` with one object inserted, so the comparison means something. A guest
+program enumerates the hub, reads its descriptor, powers a downstream port, sees
+the connection appear *because* of the power, clears the change, resets the port,
+sees it enable — and then addresses, configures and reads the device descriptor of
+a disk that is **on no root port at all**, and moves a sector each way over its
+bulk endpoints. The sector is checked against `Medium::read_at` with the
+neighbours asserted untouched, and the seventeen completion interrupts are counted
+so that acknowledging in the wrong order is a failure. The disk sits on the
+downstream index where §11.24.2's one-based port numbers and the fabric's
+zero-based indices disagree, so an off-by-one powers the empty port and the run
+never finishes.
 
 ## Host passthrough
 

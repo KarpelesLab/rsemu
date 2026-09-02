@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std", "vnc", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-xhci", "dev-usb-dwc2", "dev-usb-hid", "dev-usb-msd", "dev-blk", "dev-ne2000", "dev-nvme", "dev-ahci", "dev-riscv", "dev-pc-apic", "dev-pc-hpet", "ir", "jit", "cpu-riscv-lift", "float", "dev-q35", "cpu-x86-lift"]
+features         = ["std", "vnc", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-xhci", "dev-usb-dwc2", "dev-usb-hid", "dev-usb-hub", "dev-usb-msd", "dev-blk", "dev-ne2000", "dev-nvme", "dev-ahci", "dev-riscv", "dev-pc-apic", "dev-pc-hpet", "ir", "jit", "cpu-riscv-lift", "float", "dev-q35", "cpu-x86-lift"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -120,6 +120,24 @@ bench = false
 [[bin]]
 name  = "usb_msd"
 path  = "fuzz_targets/usb_msd.rs"
+test  = false
+doc   = false
+bench = false
+
+# The hub's surfaces are a control request and, unlike anything else here, a
+# **topology**. A machine description can plug two hubs into each other's
+# downstream bus and neither can detect it locally, so every routing decision
+# afterwards is a traversal of a graph with a loop in it. The fixture is built
+# with that cycle on purpose, and the properties are that `find` and
+# `start_of_frame` always terminate (USB 2.0 §4.1.1's seven tiers and 127
+# devices are the bounds), that a walk never answers with a device that has a
+# different address, that a debug peek neither samples the fabric nor finishes a
+# deferred port reset, and that the status change bitmap never exceeds one bit
+# per port plus one. An unbounded walk shows up here as a timeout, which is the
+# opposite failure from `usb_msd`'s and is why it is a separate target.
+[[bin]]
+name  = "usb_hub"
+path  = "fuzz_targets/usb_hub.rs"
 test  = false
 doc   = false
 bench = false

@@ -458,6 +458,27 @@ pub static XHCI_MINI: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/xhci-mini.machine"),
 };
 
+/// The same board again with a **hub** between the controller and the disk,
+/// when this build has one.
+///
+/// `usb-mini` with one object inserted: the same hart, the same PLIC, the same
+/// EHCI and the same `usb.storage` behind the same medium — but the disk is on
+/// port 2 of a hub rather than on a root port, so the sector the guest reads
+/// travels through a tier that a flat list of root ports could not have
+/// expressed. The disk deliberately sits where the hub's one-based port numbers
+/// and the fabric's zero-based indices disagree, so a conversion bug fails
+/// rather than cancelling out. The `firmware` slot takes the program; the `usb0`
+/// slot takes the disk's contents.
+#[cfg(feature = "machine-hub-mini")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-hub-mini")))]
+pub static HUB_MINI: CatalogEntry = CatalogEntry {
+    name: "hub-mini",
+    summary: "a minimal board with an EHCI, a USB hub and a mass storage device behind it: a \
+              RISC-V hart, RAM, a PLIC",
+    media: &["firmware", "usb0"],
+    source: include_str!("../../machines/hub-mini.machine"),
+};
+
 /// A minimal MC68000 board, when this build has a 68000.
 ///
 /// A synthetic board rather than a product: a big-endian 24-bit space, ROM at
@@ -563,6 +584,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&USB_MINI);
     #[cfg(feature = "machine-xhci-mini")]
     out.push(&XHCI_MINI);
+    #[cfg(feature = "machine-hub-mini")]
+    out.push(&HUB_MINI);
     #[cfg(feature = "machine-z80-mini")]
     out.push(&Z80_MINI);
     out
@@ -745,6 +768,7 @@ pub fn registry() -> Result<Registry> {
         feature = "dev-usb-dwc2",
         feature = "dev-usb-hid",
         feature = "dev-usb-msd",
+        feature = "dev-usb-hub",
         feature = "dev-usb-xhci"
     ))]
     crate::dev::usb::register(&mut reg)?;
@@ -854,6 +878,7 @@ pub fn bindings() -> Result<Bindings> {
         feature = "dev-usb-dwc2",
         feature = "dev-usb-hid",
         feature = "dev-usb-msd",
+        feature = "dev-usb-hub",
         feature = "dev-usb-xhci"
     ))]
     crate::dev::usb::bind(&mut b)?;
@@ -980,6 +1005,7 @@ pub fn classes() -> ClassTable {
         feature = "dev-usb-dwc2",
         feature = "dev-usb-hid",
         feature = "dev-usb-msd",
+        feature = "dev-usb-hub",
         feature = "dev-usb-xhci"
     ))]
     for schema in crate::dev::usb::schemas() {
@@ -1685,6 +1711,10 @@ mod tests {
             // The same four bytes and the same reasoning for the xHCI board: it
             // realizes and the hart fetches with them, and the driver that
             // enumerates a disk over rings lives in `tests/usb_xhci.rs`.
+            #[cfg(feature = "machine-hub-mini")]
+            ("hub-mini", "firmware") => &[0x6f, 0x00, 0x00, 0x00],
+            #[cfg(feature = "machine-hub-mini")]
+            ("hub-mini", "usb0") => &[],
             #[cfg(feature = "machine-xhci-mini")]
             ("xhci-mini", "firmware") => &[0x6f, 0x00, 0x00, 0x00],
             #[cfg(feature = "machine-xhci-mini")]
