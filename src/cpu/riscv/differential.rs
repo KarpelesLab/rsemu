@@ -14,19 +14,34 @@
 //! | | oracle | subject |
 //! | --- | --- | --- |
 //! | engine | [`Hart::step`], `insns` times | [`lift`] → [`verify`] → [`Interp`] |
-//! | registers | `x1`..`x31` and the PC | the slots published at the exit boundary |
+//! | registers | `x1`..`x31` and the PC | the slots the block materialized |
 //! | ticks | `Hart::cycles` | the sum of the charges the block made |
 //! | memory | the RAM it wrote | the RAM it wrote |
-//! | faults | whether a trap was taken | whether the block reported a fault |
+//! | faults | whether a trap was taken, where, and in what state | whether the block faulted, where, and in what state |
 //!
-//! `insns` is [`Lifted::insns`](super::lift::Lifted::insns), so the oracle is stopped at exactly the guest
-//! instruction the block ends after. Every column is compared, because each
-//! catches a different class of frontend bug and only the first is obvious: a
-//! miscounted [`Opcode::CHARGE`](crate::ir::Opcode::CHARGE) is invisible in
-//! the registers and fails the phase-5 state-hash gate a million cycles later
+//! `insns` is what the block **retired**, which is
+//! [`Interp::boundaries`](crate::ir::Interp::boundaries) minus one rather than
+//! [`Lifted::insns`](super::lift::Lifted::insns): a superblock covers every
+//! instruction on the path it inlined and retires only the ones it reached, so
+//! the static count would stop the oracle in the wrong place. Every column is
+//! compared, because each catches a different class of frontend bug and only
+//! the first is obvious: a miscounted
+//! [`Opcode::CHARGE`](crate::ir::Opcode::CHARGE) is invisible in the registers
+//! and fails the phase-5 state-hash gate a million cycles later
 //! (`src/ir/mod.rs`, decision 2), a store lifted with the wrong width writes
 //! the right register and the wrong memory, and a load whose address is
 //! computed wrongly usually faults where the interpreter did not.
+//!
+//! # Faults are compared through, not around
+//!
+//! A trap used to end the comparison — both engines had to *stop*, and nothing
+//! after that was checked. That was tolerable while a memory access was the
+//! last instruction in its block, and it is not once traces exist: a fault in
+//! the **middle** of a trace has to reconstruct architectural state from a
+//! boundary record, with a dozen guest registers living in temporaries and
+//! nothing written back. `precise_state` is that comparison — every integer
+//! register, the faulting instruction's PC against `mepc`, and the cycle
+//! counter — and it runs on both harnesses.
 //!
 //! # Why the host here re-implements the memory path
 //!
@@ -64,11 +79,18 @@
 //!
 //! # What this harness deliberately does not cover
 //!
-//! * **Traps.** When the oracle takes one, the two are compared only on
-//!   *whether* they both stopped, not on the architectural state afterwards:
-//!   delivering an exception from a lifted block needs the fault-materializing
-//!   path that `ROADMAP.md` §9 owes and this frontend has not been given yet.
-//!   Reported as [`Verdict::Trapped`] rather than silently passed.
+//! * **What a trap does next.** The state *at* the fault is compared in full;
+//!   what the guest's own trap handler then does with it is not, because
+//!   vectoring into `mtvec` is the interpreter's job and a lifted block hands
+//!   the fault back rather than delivering it. Reported as
+//!   [`Verdict::Trapped`].
+//! * **Code a running trace overwrites.** RISC-V requires a `FENCE.I` between
+//!   a store to instruction memory and executing it, so a trace runs to its
+//!   end on the bytes it was lifted from while the oracle, being an
+//!   interpreter, sees the new ones. That is a legal disagreement rather than
+//!   a bug, so the harness's self-modifying-code cases put the store and the
+//!   re-execution in different blocks — see
+//!   `a_store_into_the_code_page_invalidates_the_translation_of_it`.
 //! * **Paging.** [`Case`] is a bare machine-mode hart, so `satp` is off and
 //!   [`Origin::Bare`] is the truth rather than a claim. Lifting under
 //!   translation needs the entry translation to come from the fetch path
@@ -84,9 +106,9 @@ use alloc::vec::Vec;
 use crate::core::error::BusError;
 use crate::core::space::{AddressSpace, MemAttrs, MemResult, RamStore, Region, UnassignedPolicy};
 use crate::core::value::Width;
-use crate::ir::{Align, InsnStart, Interp, IrHost, MemOp, Outcome, RegSlot, verify};
+use crate::ir::{Align, Fault, InsnStart, Interp, IrHost, MemOp, Outcome, RegSlot, verify};
 
-use super::lift::{self, Origin, PC, x_slot};
+use super::lift::{self, Origin, PC, Shape, x_slot};
 use super::{Config, Hart};
 
 #[cfg(feature = "jit")]
@@ -128,6 +150,14 @@ pub struct Case {
     /// all zeroes, so a case that wants a load to reach memory has to put an
     /// address in a register.
     pub regs: [u64; 32],
+    /// How much the lifter is allowed to swallow into one block.
+    ///
+    /// Every shape is a separate frontend to test, not a setting: they emit
+    /// different IR from the same bytes — a [`Shape::Trace`] branch is a
+    /// [`Opcode::BRCOND`](crate::ir::Opcode::BRCOND) and a side exit where a
+    /// [`Shape::BasicBlock`] one is a `setcond`/`movcond` pair — and all of
+    /// them must agree with the one interpreter.
+    pub shape: Shape,
 }
 
 impl Case {
@@ -139,7 +169,15 @@ impl Case {
             cfg: Config::rv64i(),
             program,
             regs: [0; 32],
+            shape: Shape::default(),
         }
+    }
+
+    /// The same case lifted under `shape`.
+    #[must_use]
+    pub fn with_shape(mut self, shape: Shape) -> Case {
+        self.shape = shape;
+        self
     }
 
     /// The same case with `x`*n* starting at `value`.
@@ -332,15 +370,19 @@ pub enum Verdict {
     /// compare. Not a failure: the block is still well-formed, and the
     /// interpreter picks the instruction up itself.
     Nothing,
-    /// Both engines stopped on a trap at the same guest instruction. The state
-    /// afterwards is not compared (module docs).
+    /// Both engines stopped on a trap at the same guest instruction, in the
+    /// same architectural state (`precise_state`).
     Trapped {
-        /// How many guest instructions the block covered.
+        /// How many guest instructions **retired** before the trap.
+        ///
+        /// The faulting instruction is not one of them: it opened its boundary
+        /// and did not complete, which is exactly what makes the state at the
+        /// fault comparable.
         insns: usize,
     },
     /// They agreed on every column.
     Agreed {
-        /// How many guest instructions the block covered.
+        /// How many guest instructions the block retired.
         insns: usize,
         /// How many ticks both charged.
         ticks: u64,
@@ -399,8 +441,15 @@ pub fn compare(case: &Case) -> Result<Verdict, Divergence> {
     // machine mode with `satp` zero, and nothing in the lifted subset can
     // write either.
     let mut src = Words(&case.program);
-    let lifted = lift::lift(&case.cfg, Origin::Bare, BASE, &mut src, lift::MAX_INSNS)
-        .expect("the harness builds RV64 cases only");
+    let lifted = lift::lift(
+        &case.cfg,
+        Origin::Bare,
+        BASE,
+        &mut src,
+        lift::MAX_INSNS,
+        case.shape,
+    )
+    .expect("the harness builds RV64 cases only");
     if lifted.insns == 0 {
         return Ok(Verdict::Nothing);
     }
@@ -415,26 +464,35 @@ pub fn compare(case: &Case) -> Result<Verdict, Divergence> {
     }
 
     let mut host = Host::new(case, subject_space);
-    let outcome = Interp::new()
+    let mut interp = Interp::new();
+    let outcome = interp
         .run(&lifted.block, &mut host)
         .map_err(|e| diverged(case, format!("the backend refused the block: {e}")))?;
 
-    // ---- the oracle: the interpreter, the same number of instructions ---
+    // How many guest instructions actually retired, which is not
+    // `Lifted::insns` once a block has side exits: a trace covers every
+    // instruction on the path it inlined and retires only the ones it reached.
+    let retired = interp.boundaries().saturating_sub(1) as usize;
+    let subject_faulted = matches!(outcome, Outcome::Fault(_));
+
+    // ---- the oracle: the interpreter, the same instructions -------------
     let hart = Hart::new(case.cfg.with_reset_vector(BASE));
     hart.attach_space(oracle_space);
     for (n, value) in case.regs.iter().enumerate().skip(1) {
         hart.set_x(n as u32, *value);
     }
-    for _ in 0..lifted.insns {
+    // One more step when the subject faulted: the faulting instruction is the
+    // one that did *not* retire, and the oracle has to attempt it to trap on
+    // it. Stepping one at a time and stopping at the first trap keeps a trap
+    // the subject did not predict from being run past into a trap handler.
+    let want = retired + usize::from(subject_faulted);
+    let mut stepped = 0usize;
+    while stepped < want && hart.csrs().mcause == 0 {
         hart.step();
+        stepped += 1;
     }
 
-    // A trap is the one thing this harness does not compare through. Both
-    // engines must have taken one, or neither: a lifted block that faults
-    // where the interpreter did not is a wrong address, and one that does not
-    // fault where the interpreter did is a missing check.
     let oracle_trapped = hart.csrs().mcause != 0;
-    let subject_faulted = matches!(outcome, Outcome::Fault(_));
     if oracle_trapped != subject_faulted {
         return Err(diverged(
             case,
@@ -456,10 +514,10 @@ pub fn compare(case: &Case) -> Result<Verdict, Divergence> {
             ),
         ));
     }
-    if oracle_trapped {
-        return Ok(Verdict::Trapped {
-            insns: lifted.insns,
-        });
+    if let Outcome::Fault(fault) = &outcome {
+        precise_state(case, &hart, fault, &host.slots, host.ticks, "the block")?;
+        memory(case, &oracle_ram, &subject_ram)?;
+        return Ok(Verdict::Trapped { insns: retired });
     }
 
     if !matches!(outcome, Outcome::Exit) {
@@ -512,11 +570,10 @@ pub fn compare(case: &Case) -> Result<Verdict, Divergence> {
     // module docs). Those two numbers adding up is the whole of decision 2's
     // claim, and a fault taken at a boundary hashes on the column rather than
     // on the total.
-    let column = lifted
-        .block
-        .marks()
-        .last()
-        .expect("a block has boundaries")
+    let column = interp
+        .mark()
+        .and_then(|m| lifted.block.marks().get(m as usize))
+        .expect("a block that ran reached a boundary")
         .ticks;
     if column + host.access_ticks != want_ticks {
         return Err(diverged(
@@ -528,9 +585,19 @@ pub fn compare(case: &Case) -> Result<Verdict, Divergence> {
         ));
     }
 
+    memory(case, &oracle_ram, &subject_ram)?;
+
+    Ok(Verdict::Agreed {
+        insns: retired,
+        ticks: want_ticks,
+    })
+}
+
+/// Compare guest RAM byte for byte.
+fn memory(case: &Case, oracle: &RamStore, subject: &RamStore) -> Result<(), Divergence> {
     for off in 0..RAM_SIZE {
-        let want = oracle_ram.read_u8(off).unwrap_or(0);
-        let got = subject_ram.read_u8(off).unwrap_or(0);
+        let want = oracle.read_u8(off).unwrap_or(0);
+        let got = subject.read_u8(off).unwrap_or(0);
         if want != got {
             return Err(diverged(
                 case,
@@ -542,11 +609,81 @@ pub fn compare(case: &Case) -> Result<Verdict, Divergence> {
             ));
         }
     }
+    Ok(())
+}
 
-    Ok(Verdict::Agreed {
-        insns: lifted.insns,
-        ticks: want_ticks,
-    })
+/// The architectural state at a fault, against the interpreter's.
+///
+/// **This is the hard half of `ROADMAP.md` §9**, and the half a superblock
+/// makes hard: *"when a load faults halfway through a translated block, the
+/// guest must observe exactly the architectural state its ISA specifies at that
+/// instruction — the right PC, the right registers, and nothing from
+/// instructions that had not yet retired."* A trace faults with a dozen guest
+/// registers living in temporaries and a PC that is a constant in a boundary
+/// record rather than anything the block computed, so "the right registers" is
+/// a claim about the whole lazy-publication scheme
+/// (`ir::interp`, "Materializing guest state") rather than about the load.
+///
+/// Three columns, and each fails differently:
+///
+/// * **Every integer register.** The interpreter's `x1`..`x31` against the
+///   slots the fault materialized. A trace that published the *wrong*
+///   boundary's mapping shows up here and nowhere else.
+/// * **The PC.** [`Fault::pc`] against `mepc`, which `enter_trap` sets to the
+///   faulting instruction's own address. A trace that reported the block's
+///   entry PC, or the next instruction's, is caught by this alone.
+/// * **The cycle counter.** Every tick charged, against `Hart::cycles`. The
+///   faulting access charges for the bus cycles it made before it failed — the
+///   interpreter's `read_once` charges and *then* reads — so this is not
+///   "ticks up to the boundary", and a subject that reconciled the two would
+///   differ here.
+fn precise_state(
+    case: &Case,
+    hart: &Hart,
+    fault: &Fault,
+    slots: &[u64; lift::SLOT_COUNT as usize],
+    ticks: u64,
+    what: &str,
+) -> Result<(), Divergence> {
+    for n in 1..32u32 {
+        let want = hart.x(n);
+        let got = slots[x_slot(n).0 as usize];
+        if want != got {
+            return Err(diverged(
+                case,
+                format!(
+                    "x{n} at the fault: the interpreter says {want:#018x}, {what} says \
+                     {got:#018x} ({fault:?}, mcause {:#x})",
+                    hart.csrs().mcause,
+                ),
+            ));
+        }
+    }
+
+    let want_pc = hart.csrs().mepc;
+    if want_pc != fault.pc {
+        return Err(diverged(
+            case,
+            format!(
+                "the faulting instruction's pc: the interpreter took the trap at \
+                 {want_pc:#018x} (mepc), {what} reported {:#018x}",
+                fault.pc
+            ),
+        ));
+    }
+
+    let want_ticks = hart.cycles();
+    if want_ticks != ticks {
+        return Err(diverged(
+            case,
+            format!(
+                "ticks at the fault: the interpreter charged {want_ticks}, {what} charged \
+                 {ticks}. A fault mid-block must leave the cycle counter where the \
+                 interpreter leaves it, or the state hash differs (ROADMAP.md §0)"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Build the report for a disagreement, disassembling the program into it.
@@ -788,14 +925,18 @@ pub fn compare_cached(case: &Case, blocks: usize) -> Result<Verdict, Divergence>
     for (n, value) in case.regs.iter().enumerate().skip(1) {
         hart.set_x(n as u32, *value);
     }
+    // `Run::insns` is what retired, counted from the boundaries the backend
+    // passed rather than summed from the blocks' static instruction counts —
+    // a trace that left through a side exit retires fewer than it covers.
+    let subject_faulted = matches!(run.stop, Stop::Fault(_));
+    let want = run.insns + usize::from(subject_faulted);
     let mut stepped = 0usize;
-    while stepped < run.insns && hart.csrs().mcause == 0 {
+    while stepped < want && hart.csrs().mcause == 0 {
         hart.step();
         stepped += 1;
     }
 
     let oracle_trapped = hart.csrs().mcause != 0;
-    let subject_faulted = matches!(run.stop, Stop::Fault(_));
     if oracle_trapped != subject_faulted {
         return Err(diverged(
             case,
@@ -817,8 +958,21 @@ pub fn compare_cached(case: &Case, blocks: usize) -> Result<Verdict, Divergence>
             ),
         ));
     }
-    if oracle_trapped {
-        return Ok(Verdict::Trapped { insns: stepped });
+    if let Stop::Fault(fault) = &run.stop {
+        // The fault-in-the-middle-of-a-trace case, and the reason this harness
+        // extends to it: many blocks have run, the faulting one merged across
+        // however many branches it could, and the state the fault reports must
+        // still be the one instruction's the ISA names.
+        precise_state(
+            case,
+            &hart,
+            fault,
+            &host.slots,
+            host.ticks,
+            "the cached path",
+        )?;
+        memory(case, &oracle_ram, &subject_ram)?;
+        return Ok(Verdict::Trapped { insns: run.insns });
     }
 
     // ---- every column, over however many blocks ran ---------------------
@@ -862,20 +1016,7 @@ pub fn compare_cached(case: &Case, blocks: usize) -> Result<Verdict, Divergence>
         ));
     }
 
-    for off in 0..RAM_SIZE {
-        let want = oracle_ram.read_u8(off).unwrap_or(0);
-        let got = subject_ram.read_u8(off).unwrap_or(0);
-        if want != got {
-            return Err(diverged(
-                case,
-                format!(
-                    "memory at {:#x}: the interpreter left {want:#04x}, the cached path left \
-                     {got:#04x}",
-                    BASE + off
-                ),
-            ));
-        }
-    }
+    memory(case, &oracle_ram, &subject_ram)?;
 
     Ok(Verdict::Agreed {
         insns: run.insns,
@@ -896,6 +1037,12 @@ pub struct CachedRun {
     pub verdict: Verdict,
     /// Blocks executed.
     pub blocks: usize,
+    /// Guest instructions retired across those blocks.
+    ///
+    /// The number a superblock is *for*: the same block budget retires far
+    /// more instructions once direct branches are merged, and this is where
+    /// that shows up without a stopwatch.
+    pub insns_retired: usize,
     /// Blocks translated — one per distinct `(pc, key)` that survived.
     pub translated: u64,
     /// Blocks reached by following a patched exit, with no lookup at all.
@@ -933,6 +1080,7 @@ pub fn measure_cached(case: &Case, blocks: usize) -> Result<CachedRun, Divergenc
     Ok(CachedRun {
         verdict,
         blocks: run.blocks,
+        insns_retired: run.insns,
         translated: disp.stats().translated,
         chained: disp.stats().chained,
         smc: disp.stats().smc,
@@ -945,6 +1093,7 @@ pub fn measure_cached(case: &Case, blocks: usize) -> Result<CachedRun, Divergenc
 #[cfg(feature = "jit")]
 struct Lifter {
     cfg: Config,
+    shape: Shape,
     space: Arc<AddressSpace>,
     attrs: MemAttrs,
     /// The first block the verifier rejected, reported as a divergence rather
@@ -958,6 +1107,7 @@ impl Lifter {
     fn new(case: &Case, space: Arc<AddressSpace>) -> Lifter {
         Lifter {
             cfg: case.cfg,
+            shape: case.shape,
             space,
             attrs: MemAttrs::DEFAULT.with_requester(case.cfg.requester),
             rejected: None,
@@ -980,7 +1130,7 @@ impl Frontend for Lifter {
     }
 
     fn key(&mut self) -> u64 {
-        lift::key(&self.cfg, Origin::Bare)
+        lift::key(&self.cfg, Origin::Bare, self.shape)
     }
 
     fn pc_slot(&self) -> RegSlot {
@@ -996,7 +1146,14 @@ impl Frontend for Lifter {
         let space = Arc::clone(&self.space);
         let attrs = self.attrs;
         let mut src = |addr: u64| space.read(addr, Width::U16, attrs).ok().map(|v| v as u16);
-        let lifted = lift::lift(&self.cfg, Origin::Bare, pc, &mut src, lift::MAX_INSNS)?;
+        let lifted = lift::lift(
+            &self.cfg,
+            Origin::Bare,
+            pc,
+            &mut src,
+            lift::MAX_INSNS,
+            self.shape,
+        )?;
         if self.rejected.is_none()
             && let Err(e) = verify(&lifted.block)
         {
@@ -1158,6 +1315,14 @@ mod tests {
     const fn sd(rs1: u32, rs2: u32, imm: i32) -> u32 {
         s_type(3, rs1, rs2, imm)
     }
+    const fn beq(rs1: u32, rs2: u32, imm: i32) -> u32 {
+        b_type(0, rs1, rs2, imm)
+    }
+    const fn jal(rd: u32, imm: i32) -> u32 {
+        j_type(rd, imm)
+    }
+    /// `ecall`: outside the lifted subset, so it ends a block cleanly.
+    const ECALL: u32 = 0x0000_0073;
 
     fn agreed(case: &Case) -> Verdict {
         match compare(case) {
@@ -1208,13 +1373,127 @@ mod tests {
         let case = Case::new(vec![ld(3, 1, 1)])
             .with_config(strict)
             .with_reg(1, BASE + DATA);
-        assert_eq!(compare(&case), Ok(Verdict::Trapped { insns: 1 }));
+        // Nothing retired: the load is the faulting instruction.
+        assert_eq!(compare(&case), Ok(Verdict::Trapped { insns: 0 }));
     }
 
     #[test]
     fn an_access_off_the_end_of_ram_faults_in_both_engines() {
         let case = Case::new(vec![ld(3, 1, 0)]).with_reg(1, BASE + RAM_SIZE + 0x1000);
-        assert_eq!(compare(&case), Ok(Verdict::Trapped { insns: 1 }));
+        assert_eq!(compare(&case), Ok(Verdict::Trapped { insns: 0 }));
+    }
+
+    #[test]
+    fn a_fault_in_the_middle_of_a_trace_reports_the_interpreters_exact_state() {
+        // The test `ROADMAP.md` §9 is really asking for, and the one a
+        // superblock makes hard. The trace is ten instructions long and merges
+        // across a direct jump; the ninth faults, and by then eight guest
+        // registers are living in temporaries that were never written back.
+        //
+        // Everything `precise_state` compares is checked here by construction:
+        // every integer register (eight of them changed since block entry, and
+        // `x9` is assigned *after* the faulting load, so a trace that published
+        // the wrong boundary reports it early), the faulting instruction's PC
+        // against `mepc`, and the cycle counter — including the tick the failed
+        // access itself charged.
+        let case = Case::new(vec![
+            addi(2, 0, 0x11), // 0x00
+            addi(3, 2, 0x22), // 0x04
+            addi(4, 3, 0x33), // 0x08
+            jal(0, 8),        // 0x0c -> 0x14, merged
+            addi(31, 0, -1),  // 0x10  never executed
+            addi(5, 4, 0x44), // 0x14
+            addi(6, 5, 0x55), // 0x18
+            addi(7, 6, 0x66), // 0x1c
+            addi(8, 7, 0x77), // 0x20
+            ld(9, 1, 0),      // 0x24  faults: x1 is off the end of RAM
+            addi(10, 0, -1),  // 0x28  never executed
+        ])
+        .with_reg(1, BASE + RAM_SIZE + 0x4000);
+
+        // Eight instructions retired; the load did not.
+        assert_eq!(compare(&case), Ok(Verdict::Trapped { insns: 8 }));
+
+        // and the same program through the whole runtime, where the faulting
+        // block is reached after a cache lookup rather than freshly lifted.
+        #[cfg(feature = "jit")]
+        assert_eq!(compare_cached(&case, 4), Ok(Verdict::Trapped { insns: 8 }));
+    }
+
+    #[test]
+    fn a_side_exit_that_is_taken_leaves_with_the_registers_the_interpreter_has() {
+        // A trace inlines the fall-through of a forward branch and turns the
+        // taken side into an exit; this program takes it. The exit's own
+        // boundary is then the only thing that carries `x5` out of the block —
+        // emptying its live map leaves `x5` at its pre-block value and nothing
+        // else notices, which is exactly what this test was added for after a
+        // mutation survived every other case in the file.
+        let case = Case::new(vec![
+            addi(5, 0, 7), // 0x00
+            beq(0, 0, 12), // 0x04  always taken -> 0x10, so the exit is taken
+            addi(6, 0, 1), // 0x08  inlined but never executed
+            addi(7, 0, 2), // 0x0c  likewise
+            addi(8, 0, 3), // 0x10  the target; a later block's problem
+        ]);
+        assert_eq!(compare(&case), Ok(Verdict::Agreed { insns: 2, ticks: 4 }));
+    }
+
+    #[test]
+    fn a_long_trace_charges_every_instruction_it_merged_in() {
+        // Thirty-two iterations of a two-instruction loop merged into one
+        // block, and the tick column is compared against the interpreter's
+        // cycle counter for all sixty-four. A trace that charged only the
+        // instructions before some limit passes every short case in this file.
+        let case = Case::new(vec![addi(10, 10, 1), jal(0, -4)]);
+        assert_eq!(
+            compare(&case),
+            Ok(Verdict::Agreed {
+                insns: 64,
+                ticks: 128
+            })
+        );
+    }
+
+    #[test]
+    fn a_fault_after_a_side_exit_was_not_taken_still_reports_exact_state() {
+        // The same claim on the other kind of merged boundary: the branch is
+        // not taken, so the trace runs *through* the side exit's sequence
+        // without entering it, and the fault two instructions later must still
+        // name the right registers and PC.
+        let case = Case::new(vec![
+            addi(2, 0, 5),  // 0x00
+            beq(2, 0, 12),  // 0x04  not taken (x2 = 5): side exit skipped
+            addi(3, 2, 7),  // 0x08
+            ld(4, 1, 0),    // 0x0c  faults
+            addi(5, 0, -1), // 0x10  the branch's target, never executed
+        ])
+        .with_reg(1, BASE + RAM_SIZE + 0x4000);
+        assert_eq!(compare(&case), Ok(Verdict::Trapped { insns: 3 }));
+    }
+
+    #[test]
+    fn every_shape_agrees_with_the_interpreter_about_the_same_program() {
+        // The three shapes are three frontends over one oracle. A program with
+        // a jump, a branch, a load and a store exercises every place they
+        // differ, and they must all reach the same register file — which is
+        // what makes the benchmark's attribution honest as well.
+        let program = vec![
+            addi(5, 0, 3),
+            sd(1, 5, 0),
+            ld(6, 1, 0),
+            beq(6, 5, 8),
+            addi(7, 0, -1),
+            addi(8, 6, 1),
+            ECALL,
+        ];
+        for shape in [Shape::BasicBlock, Shape::Extended, Shape::Trace] {
+            let case = Case::seeded(program.clone()).with_shape(shape);
+            match compare(&case) {
+                Ok(Verdict::Agreed { .. } | Verdict::Trapped { .. }) => {}
+                Ok(other) => panic!("{shape:?} produced {other:?}"),
+                Err(e) => panic!("{shape:?} diverged:\n{e}"),
+            }
+        }
     }
 
     #[test]
@@ -1244,10 +1523,6 @@ mod tests {
     mod cached {
         use super::*;
         use crate::jit::{BlockCache, Epoch};
-
-        const fn jal(rd: u32, imm: i32) -> u32 {
-            j_type(rd, imm)
-        }
 
         fn agreed(case: &Case, blocks: usize) -> CachedRun {
             match measure_cached(case, blocks) {
@@ -1304,6 +1579,22 @@ mod tests {
             assert!(run.tlb_hits > 0, "no access was served from an entry");
         }
 
+        const fn jalr(rd: u32, rs1: u32, imm: i32) -> u32 {
+            i_type(0x67, 0, rd, rs1, imm)
+        }
+
+        /// A core with `C`, which is the only way a `JALR` is in the subset —
+        /// and a `JALR` is the only back edge a trace does **not** merge, so
+        /// it is how a test gets one block per loop iteration.
+        fn indirect_loop() -> Config {
+            let mut cfg = Config::rv64i();
+            cfg.ext = Extensions {
+                c: true,
+                ..Extensions::I
+            };
+            cfg
+        }
+
         #[test]
         fn a_store_into_the_code_page_invalidates_the_translation_of_it() {
             // The self-modifying-code test, and the one that fails loudly if
@@ -1312,17 +1603,63 @@ mod tests {
             //
             //   0x00  addi x10, x10, 1     <- becomes addi x10, x10, 7
             //   0x04  sd   x11, 0(x1)      <- becomes a nop
-            //   0x08  jal  x0, -8          -> back to 0x00
+            //   0x08  jalr x0, 0(x12)      -> back to 0x00
             //
             // so the interpreter adds one once and seven thereafter. A cached
             // block that survived the store adds one every time, which is a
             // divergence in x10 within three blocks.
+            //
+            // The back edge is a `JALR` rather than a `JAL` on purpose. A `JAL`
+            // is a direct branch and a trace merges straight through it, and
+            // then the running trace executes the bytes it was *lifted* from
+            // while the oracle, being an interpreter, executes the new ones —
+            // a disagreement RISC-V allows (the guest owes a `FENCE.I`) and
+            // this harness has no way to express. An indirect back edge ends
+            // the block, so the store and the re-execution are in different
+            // translations, which is exactly the case the mechanism is for.
             let replacement = u64::from(addi(10, 10, 7)) | (u64::from(addi(0, 0, 0)) << 32);
-            let case = Case::new(vec![addi(10, 10, 1), sd(1, 11, 0), jal(0, -8)])
+            let case = Case::new(vec![addi(10, 10, 1), sd(1, 11, 0), jalr(0, 12, 0)])
+                .with_config(indirect_loop())
                 .with_reg(1, BASE)
-                .with_reg(11, replacement);
+                .with_reg(11, replacement)
+                .with_reg(12, BASE);
             let run = agreed(&case, 12);
             assert!(run.smc > 0, "no translation was invalidated by the store");
+            assert!(run.translated > 1, "the loop was never lifted again");
+        }
+
+        #[test]
+        fn a_store_in_the_middle_of_a_trace_invalidates_the_trace() {
+            // Invalidation *mid-trace*: the store is the third of five merged
+            // instructions and rewrites bytes the trace has already run past,
+            // so the running translation is unaffected and the next one is
+            // lifted from the new bytes. Both engines must agree throughout —
+            // which they can only do because what the store rewrote is behind
+            // the store rather than ahead of it.
+            //
+            //   0x00  addi x10, x10, 1     <- becomes addi x10, x10, 7
+            //   0x04  addi x13, x13, 1     <- rewritten with itself
+            //   0x08  sd   x11, 0(x1)
+            //   0x0c  addi x14, x14, 1
+            //   0x10  jalr x0, 0(x12)      -> back to 0x00
+            let replacement = u64::from(addi(10, 10, 7)) | (u64::from(addi(13, 13, 1)) << 32);
+            let case = Case::new(vec![
+                addi(10, 10, 1),
+                addi(13, 13, 1),
+                sd(1, 11, 0),
+                addi(14, 14, 1),
+                jalr(0, 12, 0),
+            ])
+            .with_config(indirect_loop())
+            .with_reg(1, BASE)
+            .with_reg(11, replacement)
+            .with_reg(12, BASE);
+            let run = agreed(&case, 10);
+            assert!(
+                run.smc > 0,
+                "the trace was not invalidated by its own store"
+            );
+            assert!(run.translated > 1, "the trace was never lifted again");
         }
 
         #[test]
@@ -1333,7 +1670,36 @@ mod tests {
             let case = Case::seeded(vec![addi(10, 10, 1), sd(2, 10, 0), jal(0, -8)]);
             let run = agreed(&case, 12);
             assert_eq!(run.smc, 0);
-            assert!(run.translated <= 2, "the loop was translated once");
+            assert!(
+                run.translated <= 3,
+                "the loop was translated {} times, so the cache is being thrown away",
+                run.translated
+            );
+        }
+
+        #[test]
+        fn a_trace_merges_a_loop_into_one_block_and_still_agrees() {
+            // The measurement claim, asserted rather than only benchmarked: the
+            // same loop is one translation per iteration under the old shape
+            // and one translation for thirty-two iterations under a trace,
+            // with the same register file at the end of both.
+            let program = vec![addi(10, 10, 1), jal(0, -4)];
+            let basic = agreed(
+                &Case::new(program.clone()).with_shape(Shape::BasicBlock),
+                24,
+            );
+            let trace = agreed(&Case::new(program).with_shape(Shape::Trace), 24);
+            assert_eq!(basic.blocks, 24);
+            assert_eq!(trace.blocks, 24);
+            // Two guest instructions per iteration, so a trace covers
+            // thirty-two of them where a basic block covered one.
+            assert!(
+                trace.insns_retired > basic.insns_retired * 20,
+                "a trace retired {} instructions in the same block budget where basic blocks \
+                 retired {}",
+                trace.insns_retired,
+                basic.insns_retired
+            );
         }
 
         #[test]
@@ -1344,14 +1710,21 @@ mod tests {
             // `Csrs::translation_gen` moves, `Origin::Paged` carries it, and
             // the key no longer matches.
             let cfg = Config::rv64i();
-            let before = lift::key(&cfg, Origin::Paged { generation: 1 });
-            let after = lift::key(&cfg, Origin::Paged { generation: 2 });
+            let before = lift::key(&cfg, Origin::Paged { generation: 1 }, Shape::default());
+            let after = lift::key(&cfg, Origin::Paged { generation: 2 }, Shape::default());
             assert_ne!(before, after, "the generation is in the key");
 
             let mut cache = BlockCache::with_capacity(16);
             let mut src = Words(&[addi(10, 10, 1)]);
-            let lifted =
-                lift::lift(&cfg, Origin::Paged { generation: 1 }, BASE, &mut src, 4).expect("rv64");
+            let lifted = lift::lift(
+                &cfg,
+                Origin::Paged { generation: 1 },
+                BASE,
+                &mut src,
+                4,
+                Shape::default(),
+            )
+            .expect("rv64");
             let id = cache.insert(BASE, before, BASE, lifted.insns, lifted.block);
             assert_eq!(cache.lookup(BASE, before), Some(id));
             assert_eq!(
@@ -1365,8 +1738,8 @@ mod tests {
         fn a_bare_block_and_a_paged_block_at_the_same_address_are_different_blocks() {
             let cfg = Config::rv64i();
             assert_ne!(
-                lift::key(&cfg, Origin::Bare),
-                lift::key(&cfg, Origin::Paged { generation: 0 }),
+                lift::key(&cfg, Origin::Bare, Shape::default()),
+                lift::key(&cfg, Origin::Paged { generation: 0 }, Shape::default()),
                 "a physical lift and a virtual lift of the same number must not collide"
             );
         }
@@ -1377,10 +1750,11 @@ mod tests {
             // the block distinguishes one lifted before a remap from one
             // lifted after. The epoch does.
             let cfg = Config::rv64i();
-            let key = lift::key(&cfg, Origin::Bare);
+            let key = lift::key(&cfg, Origin::Bare, Shape::default());
             let mut cache = BlockCache::with_capacity(16);
             let mut src = Words(&[addi(10, 10, 1)]);
-            let lifted = lift::lift(&cfg, Origin::Bare, BASE, &mut src, 4).expect("rv64");
+            let lifted =
+                lift::lift(&cfg, Origin::Bare, BASE, &mut src, 4, Shape::default()).expect("rv64");
             cache.insert(BASE, key, BASE, lifted.insns, lifted.block);
             assert!(cache.lookup(BASE, key).is_some());
             assert!(cache.sync(Epoch {

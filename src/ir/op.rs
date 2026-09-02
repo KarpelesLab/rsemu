@@ -398,6 +398,35 @@ pub enum Cond {
     GeU,
 }
 
+impl Cond {
+    /// The condition that holds exactly when this one does not.
+    ///
+    /// Needed the moment a frontend builds a **side exit**: a superblock
+    /// inlines one side of a branch and leaves the other as an
+    /// [`Opcode::BRCOND`] that jumps *over* the exit sequence, which tests the
+    /// negation of the branch the guest wrote. Every condition here has its
+    /// negation in the same set — that is why the set has ten members rather
+    /// than the six a comparison needs — so this is total and needs no
+    /// `swap the operands` fallback that would break a frontend's operand
+    /// order.
+    #[inline]
+    #[must_use]
+    pub const fn invert(self) -> Cond {
+        match self {
+            Cond::Eq => Cond::Ne,
+            Cond::Ne => Cond::Eq,
+            Cond::LtS => Cond::GeS,
+            Cond::GeS => Cond::LtS,
+            Cond::LeS => Cond::GtS,
+            Cond::GtS => Cond::LeS,
+            Cond::LtU => Cond::GeU,
+            Cond::GeU => Cond::LtU,
+            Cond::LeU => Cond::GtU,
+            Cond::GtU => Cond::LeU,
+        }
+    }
+}
+
 /// Whether a load sign-extends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Sign {
@@ -578,6 +607,30 @@ mod tests {
         }
         // A plain load is eliminable; a volatile one is the MemOp's business.
         assert!(!Opcode::LD.has_side_effect());
+    }
+
+    #[test]
+    fn every_condition_has_its_negation_in_the_set() {
+        // A side exit branches over itself on the *negation* of the guest's
+        // branch, so a condition whose negation were missing would force a
+        // frontend to swap the operands and get the signedness wrong.
+        for cond in [
+            Cond::Eq,
+            Cond::Ne,
+            Cond::LtS,
+            Cond::LeS,
+            Cond::GtS,
+            Cond::GeS,
+            Cond::LtU,
+            Cond::LeU,
+            Cond::GtU,
+            Cond::GeU,
+        ] {
+            assert_ne!(cond.invert(), cond);
+            assert_eq!(cond.invert().invert(), cond);
+        }
+        assert_eq!(Cond::LtS.invert(), Cond::GeS);
+        assert_eq!(Cond::GtU.invert(), Cond::LeU);
     }
 
     #[test]

@@ -19,6 +19,17 @@
 //! [`Block`](crate::ir::Block), and every mechanism here is already the shape
 //! it needs.
 //!
+//! §9.1's **fourth** mechanism — *"superblocks / traces — merge across direct
+//! branches, keep guest registers in host registers across block boundaries
+//! within a trace"* — is not here, and that is where it belongs: merging is a
+//! property of a *frontend* (`cpu::riscv::lift`'s `Shape`), and keeping
+//! registers in temporaries across a merged boundary is a property of the
+//! *backend* (`ir::interp`, "Materializing guest state"). What this module
+//! owes it is two things, both of which are now true: a run reports the guest
+//! instructions it **retired** rather than the ones its blocks cover, because a
+//! trace has several exits; and the safe-point flag is still honoured within
+//! one block, which is now a longer bound and a stated one.
+//!
 //! # Where this sits, and why it is `no_std`
 //!
 //! `ROADMAP.md` §0 puts `jit/` above the `std` line, alongside `host/` and
