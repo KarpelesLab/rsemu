@@ -222,6 +222,12 @@ pub struct AcpiBlock {
     sink: Mutex<Option<Weak<dyn SciSink>>>,
     /// The handle that catches this block up before an access reaches it.
     lazy: Mutex<Option<LazyHandle>>,
+    /// What `PM1_CNT` holds after a reset.
+    ///
+    /// Zero on real silicon, which is what [`AcpiBlock::new`] gives. A board
+    /// with no firmware can ask for `SCI_EN` here instead, and
+    /// [`crate::dev::q35::lpc`]'s `sci-en` property is where that is argued.
+    reset_cnt: u32,
 }
 
 impl fmt::Debug for AcpiBlock {
@@ -245,12 +251,29 @@ impl AcpiBlock {
     /// A block out of reset: every register zero and the counter at zero.
     #[must_use]
     pub fn new() -> AcpiBlock {
+        AcpiBlock::with_reset_cnt(0)
+    }
+
+    /// The same block, with `PM1_CNT` holding `reset_cnt` after every reset.
+    ///
+    /// The only value a board has any business asking for is [`SCI_EN`], and
+    /// only a board with no firmware: see `q35.lpc`'s `sci-en` property.
+    #[must_use]
+    pub fn with_reset_cnt(reset_cnt: u32) -> AcpiBlock {
+        let reset_cnt = reset_cnt & PM1_CNT_MASK;
         let block = AcpiBlock {
-            state: Mutex::with_rank(LockRank::DEVICE, State::default()),
+            state: Mutex::with_rank(
+                LockRank::DEVICE,
+                State {
+                    cnt: reset_cnt,
+                    ..State::default()
+                },
+            ),
             tick: AtomicU64::new(0),
             next_event: AtomicU64::new(TMROF_PERIOD),
             sink: Mutex::with_rank(LockRank::LEAF, None),
             lazy: Mutex::with_rank(LockRank::LEAF, None),
+            reset_cnt,
         };
         block.publish();
         block
@@ -332,7 +355,10 @@ impl AcpiBlock {
     /// reset", and rsemu's warm reset is what stands in for `PCIRST#` on this
     /// board.
     pub fn reset(&self) {
-        *self.state.lock() = State::default();
+        *self.state.lock() = State {
+            cnt: self.reset_cnt,
+            ..State::default()
+        };
         self.tick.store(0, Ordering::Relaxed);
         self.publish();
         self.drive();
@@ -548,9 +574,12 @@ impl MemOps for AcpiBlock {
 }
 
 /// A block behind an `Arc`, which is what the LPC holds.
+///
+/// `reset_cnt` is what `PM1_CNT` comes up holding — zero on real silicon, and
+/// [`SCI_EN`] on a board that has no firmware to set it (`q35.lpc`'s `sci-en`).
 #[must_use]
-pub fn block() -> Arc<AcpiBlock> {
-    Arc::new(AcpiBlock::new())
+pub fn block(reset_cnt: u32) -> Arc<AcpiBlock> {
+    Arc::new(AcpiBlock::with_reset_cnt(reset_cnt))
 }
 
 #[cfg(test)]

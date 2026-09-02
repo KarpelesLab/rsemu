@@ -148,8 +148,10 @@ impl Rig {
             Bdf::new(0, lpc::LPC_DEVICE, 0).expect("legal"),
             0x2918,
             0,
-            PMBASE,
-            [0x80; lpc::PIRQS],
+            lpc::Post {
+                pm_base: PMBASE,
+                ..lpc::Post::default()
+            },
             String::from("port"),
         );
         mch.attach_space(&mem);

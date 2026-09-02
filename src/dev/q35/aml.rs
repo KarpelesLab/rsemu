@@ -60,6 +60,8 @@ const DWORD_PREFIX: u8 = 0x0c;
 const STRING_PREFIX: u8 = 0x0d;
 /// `QWordPrefix` (§20.2.3).
 const QWORD_PREFIX: u8 = 0x0e;
+/// `BufferOp` (§20.2.5.4).
+const BUFFER_OP: u8 = 0x11;
 /// `ZeroOp` (§20.2.3).
 const ZERO_OP: u8 = 0x00;
 /// `OneOp` (§20.2.3).
@@ -248,6 +250,149 @@ pub fn scope(path: &str, body: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&pkg_length(inner.len()));
     out.extend_from_slice(&inner);
     out
+}
+
+/// `Buffer(n) { … }` (§20.2.5.4).
+///
+/// The size is written as an ordinary integer term, which is what an ASL
+/// compiler emits for a buffer whose length is known — and it is the form a
+/// resource template takes.
+#[must_use]
+pub fn buffer(bytes: &[u8]) -> Vec<u8> {
+    let mut body = integer(bytes.len() as u64);
+    body.extend_from_slice(bytes);
+    let mut out = Vec::new();
+    out.push(BUFFER_OP);
+    out.extend_from_slice(&pkg_length(body.len()));
+    out.extend_from_slice(&body);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// resource templates
+// ---------------------------------------------------------------------------
+//
+// A `_CRS` is a `Buffer` holding a byte stream of *resource descriptors*
+// terminated by an end tag — a different encoding from AML proper, defined in
+// ACPI §6.4. The three descriptors below are the ones a host bridge's windows
+// need, and they are all the same shape: §6.4.3.5's address space descriptors,
+// in the 16-bit, 32-bit and 64-bit widths.
+
+/// `Word Address Space Descriptor`, large resource type 8 (§6.4.3.5.3).
+const WORD_ADDRESS_SPACE: u8 = 0x88;
+/// `DWord Address Space Descriptor`, large resource type 7 (§6.4.3.5.2).
+const DWORD_ADDRESS_SPACE: u8 = 0x87;
+/// Resource type 0: a memory range (§6.4.3.5, Table 6.42).
+const SPACE_MEMORY: u8 = 0x00;
+/// Resource type 1: an I/O range.
+const SPACE_IO: u8 = 0x01;
+/// Resource type 2: a bus number range.
+const SPACE_BUS: u8 = 0x02;
+/// General flags for a window a bridge **produces** for the bus below it, with
+/// both edges fixed: `_DEC` positive, `_MIF` and `_MAF` set (Table 6.43).
+const FLAGS_PRODUCER_FIXED: u8 = 0x0c;
+/// The same, for a range the device itself **consumes** — bit 0 set.
+const FLAGS_CONSUMER_FIXED: u8 = 0x0d;
+/// Memory type flags: read/write, non-cacheable, an ordinary memory range
+/// (Table 6.44).
+const MEMORY_RW_NONCACHEABLE: u8 = 0x01;
+/// I/O type flags: `_RNG` = 3, the entire range (Table 6.45).
+const IO_ENTIRE_RANGE: u8 = 0x03;
+/// `EndTag`, small resource type 15 with one length byte (§6.4.2.9).
+const END_TAG: u8 = 0x79;
+
+/// One address space descriptor, at `width` bytes per address field.
+///
+/// §6.4.3.5's layout is identical in all three widths: a type byte, two flag
+/// bytes, and then granularity, minimum, maximum, translation offset and
+/// length, each `width` bytes wide and little-endian.
+fn address_space(
+    tag: u8,
+    width: usize,
+    kind: u8,
+    general: u8,
+    specific: u8,
+    min: u64,
+    max: u64,
+) -> Vec<u8> {
+    let len = 3 + 5 * width;
+    let mut out = Vec::with_capacity(3 + len);
+    out.push(tag);
+    out.extend_from_slice(&(len as u16).to_le_bytes());
+    out.push(kind);
+    out.push(general);
+    out.push(specific);
+    // Granularity is zero for a fixed window: §6.4.3.5 defines it as the bits
+    // that may vary, and neither edge of a fixed one does.
+    for value in [0, min, max, 0, max.wrapping_sub(min).wrapping_add(1)] {
+        out.extend_from_slice(&value.to_le_bytes()[..width]);
+    }
+    out
+}
+
+/// `WordBusNumber(…, min, max, 0, max - min + 1)`.
+#[must_use]
+pub fn bus_number_range(min: u8, max: u8) -> Vec<u8> {
+    address_space(
+        WORD_ADDRESS_SPACE,
+        2,
+        SPACE_BUS,
+        FLAGS_PRODUCER_FIXED,
+        0,
+        u64::from(min),
+        u64::from(max),
+    )
+}
+
+/// `DWordIO(ResourceProducer, MinFixed, MaxFixed, PosDecode, EntireRange, …)`.
+#[must_use]
+pub fn dword_io(min: u32, max: u32) -> Vec<u8> {
+    address_space(
+        DWORD_ADDRESS_SPACE,
+        4,
+        SPACE_IO,
+        FLAGS_PRODUCER_FIXED,
+        IO_ENTIRE_RANGE,
+        u64::from(min),
+        u64::from(max),
+    )
+}
+
+/// `DWordMemory(…, NonCacheable, ReadWrite, …)`.
+///
+/// `produced` says whether this is a window the bridge hands to the bus below
+/// it or a range the device itself consumes — the difference is bit 0 of the
+/// general flags, and it is the whole difference between "allocate BARs here"
+/// and "this address is already spoken for".
+#[must_use]
+pub fn dword_memory(min: u32, max: u32, produced: bool) -> Vec<u8> {
+    address_space(
+        DWORD_ADDRESS_SPACE,
+        4,
+        SPACE_MEMORY,
+        if produced {
+            FLAGS_PRODUCER_FIXED
+        } else {
+            FLAGS_CONSUMER_FIXED
+        },
+        MEMORY_RW_NONCACHEABLE,
+        u64::from(min),
+        u64::from(max),
+    )
+}
+
+/// Wrap already-encoded descriptors as a `ResourceTemplate` buffer.
+///
+/// The end tag's second byte is a checksum, and zero is the defined "no
+/// checksum" value (§6.4.2.9) — which is what every ASL compiler emits, because
+/// a template is not transmitted anywhere that could corrupt it.
+#[must_use]
+pub fn resource_template(descriptors: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(descriptors.len() + 2);
+    bytes.extend_from_slice(descriptors);
+    bytes.push(END_TAG);
+    bytes.push(0);
+    buffer(&bytes)
 }
 
 /// `EisaId("PNP0A08")` as the DWord constant it compiles to (ACPI §19.6.30).

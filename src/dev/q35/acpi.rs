@@ -110,7 +110,7 @@ use alloc::vec::Vec;
 use crate::bus::pci::{Bdf, INTX_LINES, IntxPin, MAX_DEVICE, PciBus, buses, config, swizzle};
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
 use crate::core::props::{Props, ValueKind};
-use crate::core::space::{AddressSpace, MemAttrs, RamStore, Region, RegionRef};
+use crate::core::space::{AddressSpace, MemAttrs, RamStore, Region, RegionKind, RegionRef};
 use crate::core::sync::{LockRank, Mutex};
 use crate::core::value::Width;
 use crate::core::{Error, Result};
@@ -175,6 +175,19 @@ pub struct MachineFacts {
     pub ecam: Option<(u64, u64)>,
     /// Where this device's own table region is mapped.
     pub tables: Option<u64>,
+    /// One past the highest byte of RAM in the memory space.
+    ///
+    /// The low edge of the window a host bridge hands to the bus below it: a
+    /// base address register may go anywhere the processor decodes that is not
+    /// already memory, and this is where "already memory" stops.
+    pub ram_top: Option<u64>,
+    /// Where the configuration port pair decodes in the I/O space, and how
+    /// wide it is.
+    ///
+    /// A hole in the bridge's own I/O window rather than a window: 0xcf8-0xcff
+    /// is the bridge's register file, not an address anything downstream may
+    /// be given.
+    pub config_ports: Option<(u64, u64)>,
     /// What `_PRT` should say: one entry per (device number, pin) that reaches
     /// an interrupt. Empty where there is no fabric to ask, or where its router
     /// routes nothing. [`routing`] builds it.
@@ -232,6 +245,25 @@ fn find(space: &AddressSpace, name: &str) -> Option<(u64, u64)> {
         });
     }
     found
+}
+
+/// One past the last byte of RAM in `space`, or `None` if there is none.
+///
+/// By [`RegionKind`] rather than by name, which is the only honest way to ask:
+/// a machine file names its memory objects whatever it likes — `ram_low`,
+/// `ram_high`, `dram` — and what makes a mapping memory is that the region
+/// behind it is a store, not what it is called.
+fn ram_top(space: &AddressSpace) -> Option<u64> {
+    let view = space.view();
+    let mut top: Option<u64> = None;
+    for (_, mapping) in view.mappings() {
+        if !matches!(leaf_of(&mapping.region).kind(), RegionKind::Ram(_)) {
+            continue;
+        }
+        let end = mapping.base.saturating_add(mapping.region.len());
+        top = Some(top.map_or(end, |best: u64| best.max(end)));
+    }
+    top
 }
 
 /// Read a 32-bit register through `space` with `MemAttrs::debug` set.
@@ -366,6 +398,8 @@ pub fn survey(mem: &AddressSpace, io: &AddressSpace, bus: Option<&PciBus>) -> Ma
         acpi_io: find(io, lpc::ACPI_REGION).map(|(base, _)| base),
         ecam: find(mem, mch::ECAM_REGION),
         tables: find(mem, TABLES_REGION).map(|(base, _)| base),
+        ram_top: ram_top(mem),
+        config_ports: find(io, mch::CONFIG_REGION),
         prt: bus.map(routing).unwrap_or_default(),
     }
 }
@@ -580,11 +614,40 @@ const SLP_TYP_S5: u64 = 0b111;
 /// **What is deliberately not in it**, because each would be a claim this board
 /// cannot back:
 ///
-/// * `_CRS` on the host bridge, which would declare the bus number range, the
-///   I/O and memory apertures and the ECAM window as a resource template. An
-///   operating system takes those from `MCFG` and from its own probing when
-///   they are absent.
 /// * `Method`, `If`, `Return` — [`super::aml`] cannot encode them, on purpose.
+///
+/// # `_CRS`, and why a board without one has no disk
+///
+/// The host bridge's `_CRS` is the list of *windows it produces* — the bus
+/// numbers, the I/O ports and the physical addresses that belong to the bus
+/// below it rather than to the processor. An operating system allocates every
+/// base address register out of those windows, so a bridge that declares none
+/// has declared that nothing downstream may be given an address:
+///
+/// ```text
+///     pci 0000:00:04.0: BAR 0: no space for [mem size 0x00002000 64bit]
+///     pci 0000:00:04.0: BAR 0: failed to assign [mem size 0x00002000 64bit]
+/// ```
+///
+/// which is a Linux 6.6 kernel on `machines/q35-linux.machine` before this
+/// existed, and is the whole distance between "the controller is enumerated"
+/// and "the controller has a driver".
+///
+/// Every edge of it is read out of the realized machine, which is this file's
+/// rule and here it is also the only way to be right:
+///
+/// | Window | Where its edges come from |
+/// | --- | --- |
+/// | bus numbers | 0 to 255: everything is on bus 0 and there is no Type 1 header to divide the range with (`docs/platforms/q35.md`) |
+/// | I/O | 0 to 0xffff, with the hole [`MachineFacts::config_ports`] found the 0xcf8 pair at |
+/// | memory | [`MachineFacts::ram_top`] up to the lowest of the APIC and HPET pages, with [`MachineFacts::ecam`]'s window cut out |
+///
+/// The ECAM window is cut out and then declared again on a separate `PNP0C02`
+/// motherboard device, which is what a firmware does with it and what makes an
+/// operating system willing to *use* the window: Linux refuses a memory-mapped
+/// configuration space that is reserved neither in e820 nor by a motherboard
+/// device's `_CRS`, and says so —
+/// `PCI: MMCONFIG at [mem ...] not reserved in ACPI motherboard resources`.
 ///
 /// # `_PRT`, and the one form of it this board can honestly emit
 ///
@@ -638,6 +701,8 @@ pub fn dsdt(facts: &MachineFacts, cfg: &TableConfig) -> Vec<u8> {
     // `_BBN`: the bus number this bridge is the root of. Zero, because
     // everything on this board is on bus 0 — see the module docs on root ports.
     pci0.extend_from_slice(&aml::name("_BBN", &aml::integer(0)));
+    // `_CRS`: the windows this bridge produces for the bus below it.
+    pci0.extend_from_slice(&aml::name("_CRS", &host_bridge_crs(facts)));
     // `_PRT` (§6.2.13). Absent rather than empty when nothing on the bus
     // interrupts: an empty package is a claim that no slot has an interrupt,
     // and a board whose router simply has not been programmed has not made
@@ -660,11 +725,113 @@ pub fn dsdt(facts: &MachineFacts, cfg: &TableConfig) -> Vec<u8> {
         let count = u8::try_from(facts.prt.len()).unwrap_or(u8::MAX);
         pci0.extend_from_slice(&aml::name("_PRT", &aml::package(count, &rows)));
     }
-    body.extend_from_slice(&aml::scope("\\_SB_", &aml::device("PCI0", &pci0)));
+    let mut devices = aml::device("PCI0", &pci0);
+    // The ECAM window, as a motherboard resource. `PNP0C02` is ACPI §9.15's
+    // "PNP Motherboard Registers": a device that exists only to say that an
+    // address is spoken for.
+    if let Some((base, len)) = facts.ecam
+        && let Ok(min) = u32::try_from(base)
+        && let Ok(max) = u32::try_from(base + len - 1)
+    {
+        let mut res = Vec::new();
+        res.extend_from_slice(
+            &aml::name_eisa_id("_HID", "PNP0C02").expect("a well-formed EISA identifier"),
+        );
+        res.extend_from_slice(&aml::name("_UID", &aml::integer(1)));
+        res.extend_from_slice(&aml::name(
+            "_CRS",
+            &aml::resource_template(&aml::dword_memory(min, max, false)),
+        ));
+        devices.extend_from_slice(&aml::device("PCIE", &res));
+    }
+    body.extend_from_slice(&aml::scope("\\_SB_", &devices));
 
     let mut table = Table::new(b"DSDT", 2, cfg);
     table.bytes(&body);
     table.finish()
+}
+
+/// The host bridge's `_CRS`, as a resource template.
+///
+/// See [`dsdt`]'s own documentation for where each edge comes from and why the
+/// table is useless without this.
+fn host_bridge_crs(facts: &MachineFacts) -> Vec<u8> {
+    use super::aml;
+
+    /// What the memory window is rounded to. A megabyte, which is the
+    /// granularity every PC firmware has placed a PCI hole on, and coarse
+    /// enough that a base address register with a large alignment still fits
+    /// at the bottom of the window.
+    const WINDOW_ALIGN: u64 = 1 << 20;
+    /// The ceiling when nothing is mapped above the window. Four gigabytes:
+    /// this emits 32-bit descriptors, so a window that reached higher could not
+    /// be described by one.
+    const FOUR_GIB: u64 = 1 << 32;
+
+    let mut out = Vec::new();
+    // Bus numbers. The whole range, because there is no Type 1 header in
+    // `src/bus/pci` and therefore no second bus to divide it with.
+    out.extend_from_slice(&aml::bus_number_range(0, 0xff));
+
+    // The I/O window, with the configuration port pair cut out of it.
+    let ports = facts.config_ports.and_then(|(base, len)| {
+        let end = base + len;
+        (base > 0 && end <= 0x1_0000).then_some((base as u32, end as u32))
+    });
+    match ports {
+        Some((base, end)) => {
+            out.extend_from_slice(&aml::dword_io(0, base - 1));
+            if end <= 0xffff {
+                out.extend_from_slice(&aml::dword_io(end, 0xffff));
+            }
+        }
+        None => out.extend_from_slice(&aml::dword_io(0, 0xffff)),
+    }
+
+    // The memory window: from the top of RAM to the lowest thing the processor
+    // already decodes above it, which on every board this runs on is one of the
+    // three APIC or HPET pages.
+    let start = facts
+        .ram_top
+        .unwrap_or(WINDOW_ALIGN)
+        .div_ceil(WINDOW_ALIGN)
+        .saturating_mul(WINDOW_ALIGN);
+    let ceiling = [
+        facts.ioapic,
+        facts.hpet.map(|(base, _)| base),
+        facts.lapic.map(|(base, _)| base),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|base| *base > start)
+    .min()
+    .unwrap_or(FOUR_GIB)
+    .min(FOUR_GIB);
+
+    // ...with the ECAM window cut out of it, because that address is decoded
+    // already and a base address register placed on top of it would be two
+    // things answering one address.
+    let hole = facts
+        .ecam
+        .map(|(base, len)| (base, base.saturating_add(len)))
+        .filter(|(base, end)| *end > start && *base < ceiling);
+    let mut window = |from: u64, to: u64| {
+        if to <= from {
+            return;
+        }
+        let (Ok(min), Ok(max)) = (u32::try_from(from), u32::try_from(to - 1)) else {
+            return;
+        };
+        out.extend_from_slice(&aml::dword_memory(min, max, true));
+    };
+    match hole {
+        Some((base, end)) => {
+            window(start, base.max(start));
+            window(end.max(start), ceiling);
+        }
+        None => window(start, ceiling),
+    }
+    aml::resource_template(&out)
 }
 
 /// Build the FACS (§5.2.10, Table 5.13).

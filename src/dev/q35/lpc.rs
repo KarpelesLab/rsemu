@@ -758,6 +758,7 @@ impl Lpc {
         let revision = r.or_range("revision", 0u64, 0..=255)?;
         let iospace = r.or_str("iospace", "port")?.to_string();
         let pm_base = r.or_size("pm-base", 0)?;
+        let sci_en = r.or("sci-en", false)?;
         let routes = r.optional_list("pirq-routes")?.map(<[Value]>::to_vec);
         r.finish()?;
         if pm_base > 0xffff || pm_base % u64::from(pm::BLOCK_LEN as u32) != 0 {
@@ -809,8 +810,11 @@ impl Lpc {
             at,
             device_id as u16,
             revision as u8,
-            pm_base as u32,
-            pirq,
+            Post {
+                pm_base: pm_base as u32,
+                sci_en,
+                pirq,
+            },
             iospace,
         ))
     }
@@ -822,11 +826,15 @@ impl Lpc {
         at: Bdf,
         device_id: u16,
         revision: u8,
-        pm_base: u32,
-        pirq: [u8; PIRQS],
+        post: Post,
         iospace: String,
     ) -> Lpc {
-        let acpi = pm::block();
+        let Post {
+            pm_base,
+            sci_en,
+            pirq,
+        } = post;
+        let acpi = pm::block(if sci_en { pm::SCI_EN } else { 0 });
         let acpi_region: RegionRef = Arc::new(Region::io(
             ACPI_REGION,
             pm::BLOCK_LEN,
@@ -903,6 +911,34 @@ impl Lpc {
 /// [`super::acpi`] looks it up by when it fills in the FADT's block pointers.
 pub const ACPI_REGION: &str = "q35.lpc.acpi";
 
+/// The three things a POST would have programmed, and this board declares.
+///
+/// One struct rather than three arguments because they are one idea: an ICH9
+/// comes out of reset with `PMBASE` unplaced, `PM1_CNT.SCI_EN` clear and every
+/// `PIRQ[n]_ROUT` holding `80h`, and firmware is what moves all three during
+/// initialisation (§13.1.13, §13.1.17, §13.8.3.3). A board with no firmware
+/// states what a POST would have left behind; the field defaults are the
+/// silicon's own values, so a board that says nothing gets the datasheet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Post {
+    /// Where `PMBASE` points, with `ACPI_EN` set. Zero decodes nothing.
+    pub pm_base: u32,
+    /// Whether `PM1_CNT.SCI_EN` comes up set.
+    pub sci_en: bool,
+    /// The `PIRQ[n]_ROUT` byte each of `PIRQ[A-H]` comes up holding.
+    pub pirq: [u8; PIRQS],
+}
+
+impl Default for Post {
+    fn default() -> Post {
+        Post {
+            pm_base: 0,
+            sci_en: false,
+            pirq: [PIRQ_DISABLE; PIRQS],
+        }
+    }
+}
+
 /// The `q35.lpc` device class.
 pub static CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
@@ -957,6 +993,15 @@ pub static CLASS: DeviceClass = DeviceClass {
             summary: "where PMBASE comes out of reset pointing, with ACPI_EN set — a stand-in for \
                       the firmware initialisation this board does not have; 0 is the datasheet's \
                       own default, which decodes nothing",
+        },
+        PropertySpec {
+            name: "sci-en",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "bring PM1_CNT.SCI_EN up set (default false, which is the silicon's own \
+                      reset value) — the third firmware stand-in, for a board whose FADT reports \
+                      no SMI command port and therefore no way for an operating system to ask \
+                      for ACPI mode",
         },
     ],
     construct: |props| Ok(Box::new(Lpc::new(props)?)),
@@ -1196,6 +1241,7 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("revision", ValueKind::Uint).range(0, 255))
         .prop(PropSchema::new("iospace", ValueKind::Str))
         .prop(PropSchema::new("pm-base", ValueKind::Size))
+        .prop(PropSchema::new("sci-en", ValueKind::Bool))
         .prop(PropSchema::new("pirq-routes", ValueKind::List))
         .region("acpi");
     for name in [

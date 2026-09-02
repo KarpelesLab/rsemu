@@ -1,0 +1,529 @@
+# q35-linux — the q35 chipset with a kernel in the socket instead of a firmware.
+#
+#   rsemu run q35-linux --media kernel=bzImage
+#   rsemu run q35-linux --media kernel=bzImage --media initrd=initramfs.cpio \
+#                       --drive nvme0=disk.img
+#
+# # Why this board exists, and why it is not `q35` with a flag
+#
+# Two boards each had half of what a kernel needs.
+#
+# `machines/q35.machine` has the chipset — ECAM, the PAM file at 0x90, the
+# ICH9's `PIRQ` routers, a generated set of ACPI tables — and therefore a PCI
+# bus with somewhere to put a disk controller. What it has is a **firmware**
+# socket at `0xffff0000`, and what runs on it starts in real mode at
+# `0xfffffff0`.
+#
+# `machines/pc64.machine` has the other half: `x86.linuxboot` writes a
+# `bzImage` into memory and enters it at its own 32-bit entry point, which is
+# the one interface a Linux kernel offers to something that is not a BIOS. What
+# it has *not* got is a PCI bus, so the only root a kernel on it can be given
+# is an initramfs.
+#
+# The two cannot be one board. `x86.linuxboot` maps its reset stub at the top
+# of the address space, which is exactly where the firmware socket is; a board
+# with both would have two things decoding `0xfffffff0`. So this is the third
+# board: **`q35`'s chipset, `pc64`'s entry, and an NVM Express controller on
+# the bus for the kernel to find a disk on.**
+#
+# Everything below the chipset section is the object `machines/q35.machine`
+# uses at the address it uses, and the two files should be read side by side —
+# this one documents the *differences* rather than re-describing an ICH9.
+#
+# # What is here that `q35` has not got
+#
+#   * **`x86.linuxboot`** instead of `pc.rom`. `src/dev/linuxboot.rs` has the
+#     protocol; `docs/platforms/pc64.md` has what a kernel entered that way
+#     does before it prints its first character.
+#   * **`nvme.controller`** on the PCI bus at device 4. Why NVMe and not the
+#     three other controllers this tree has is the one real design decision on
+#     this board, and it is measured rather than preferred — see below.
+#
+# # What is here that `q35` has and this does not
+#
+#   * **No firmware, no video adapter and no option ROM.** The console is the
+#     16550, because that is what `console=ttyS0` names and because a board
+#     with no BIOS has no `INT 10h` to set a text mode with. `x86.linuxboot`
+#     leaves `screen_info` in the zero page zeroed, which is how the kernel is
+#     told there is no video console.
+#   * **No 8042, and A20 is deliberately unwired.** A net with a driver comes
+#     up low and a low `a20` pin shuts the gate; on `q35` the firmware opens it
+#     during POST and here there is no firmware to. An unwired pin is a
+#     permanently connected address line, which is the machine we want — a
+#     kernel entered in protected mode never asks for anything else. The same
+#     reasoning `machines/pc64.machine` writes out at its own `wire` block.
+#   * **No IDE and no 8237As.** Each would be a second thing being tested, and
+#     the kernel this board is for does not build a driver for either.
+#
+# # Why NVMe
+#
+# Not because it is the newest. Because of what a *stock distribution kernel*
+# has built in, which is the constraint that decides this and not which
+# controller is easiest to wire.
+#
+# A distribution kernel builds nearly every storage driver as a **module**, and
+# a module lives on the root that has not been mounted yet. Measured against a
+# stock Gentoo 6.6.67 build's own `modules.builtin` — which is the kernel
+# saying what it linked in, not a guess:
+#
+#   * `drivers/nvme/host/nvme.ko` is **built in**. It is also self-contained:
+#     an NVMe namespace becomes `/dev/nvme0n1` through blk-mq with no SCSI
+#     layer under it.
+#   * `drivers/ata/libata.ko` is built in but `libahci`/`ahci` are not, and
+#     `sd_mod` is not either — so an AHCI adapter on this board would be
+#     enumerated and then have no driver to bind, and even with one there would
+#     be no SCSI disk to publish the block device.
+#   * There is no virtio of any kind in that list.
+#
+# So NVMe is the one controller a kernel that has never heard of rsemu can
+# actually drive off a board like this. A kernel with a different set built in
+# is a different answer, and this file is one `object` and one `wire` away from
+# either of the others — `machines/ahci-mini.machine` and
+# `tests/riscv_virtio_blk.rs` show both shapes.
+#
+# # The interrupt the disk arrives on
+#
+# Nothing is wired for it, and that is the point. The controller drives its own
+# `INTA#`; `src/bus/pci` rotates it by device number onto one of the bus's four
+# interrupt nets; the ICH9 collects those nets as `PIRQ[A-D]` because it says
+# `bus = "pci0"`; the `pirq-routes` below say where a POST would have steered
+# them; and `q35.acpi`'s `_PRT` is generated from the routers the bridge is
+# actually holding, so what the kernel reads out of the DSDT and what the
+# hardware does cannot disagree. Device 4 with `INTA#` swizzles to `PIRQ[A]`,
+# which these routes put on IRQ11.
+#
+# # Sources
+#
+# `machines/q35.machine`'s, unchanged — the Intel 3 Series datasheet
+# (316966-002), the ICH9 datasheet (316972-004), ACPI 6.5 — plus the NVM
+# Express specification for the controller and the PC16550D data sheet for the
+# UART. The kernel image is *data*: it is loaded and run, never read as source
+# (`ROADMAP.md` §1).
+
+machine "q35-linux" {
+  # -- parameters -------------------------------------------------------------
+
+  # Base memory: the 640 KiB below the video hole, which is where the loader
+  # puts the zero page, the command line and its mode-switch stub.
+  param basemem = 640K
+
+  # Extended memory, from 0x100000 up. A current kernel wants `init_size` —
+  # around 54 MiB for a distribution build — clear above its load address
+  # before it can decompress, an initramfs on top of that, and then a page
+  # cache to read a disk into. 256 MiB is what `pc64` settled on and it is what
+  # the e820 map below describes; the machine refuses to build if the kernel
+  # bound to it does not fit.
+  param extmem = 256M
+
+  # The kernel command line.
+  #
+  # `nokaslr` is not a preference and it is the same line `pc64` carries, for
+  # the same reason: address-space randomisation draws entropy partly from the
+  # 8254, by issuing a read-back command and spinning until the **null-count**
+  # bit in the status byte goes clear. That bit is set by a control-word write
+  # and cleared when a count is actually loaded (Intel 8254 data sheet,
+  # "Read-Back Command"), so on a machine where nothing has ever programmed
+  # counter 0 it never clears. On `q35` a firmware programs it during POST and
+  # the bit is measurably clear by the time a guest runs; **this board has no
+  # firmware**, so it is back, and the line has to be here. Determinism wants
+  # it anyway (CLAUDE.md).
+  #
+  # `nolapic` is **not** here and, measured today, a run needs it. Two device
+  # models deliver no interrupt on paths this board is the first guest to use:
+  # a local APIC timer in periodic mode, and an edge-triggered I/O APIC
+  # redirection entry — which is what an interrupt source override for the 8254
+  # is. With the line below a current kernel panics with
+  # `IO-APIC + timer doesn't work!`; with `nolapic` added it stays in PIC mode
+  # and reaches userspace. `docs/platforms/q35-linux.md` has both logs.
+  #
+  # It stays out of the default anyway, and that is a deliberate choice rather
+  # than an oversight. The board really does have both APICs and really does
+  # publish a MADT describing them; a default command line that hid two device
+  # defects would put them where nobody looks, and when they are fixed this
+  # line starts working with no change here.
+  param cmdline = "console=ttyS0,115200 earlyprintk=ttyS0,115200 nokaslr"
+
+  # Where the ACPI tables are staged. ACPI §5.2.5.1 has an operating system
+  # search "the BIOS read-only memory space between 0E0000h and 0FFFFFh" on
+  # 16-byte boundaries for the RSDP, and this is the low edge of it. On `q35`
+  # this address is shared with a firmware socket that begins at 0xf0000; here
+  # there is no socket, and the 64 KiB from 0xf0000 up decodes nothing.
+  param acpibase = 0xe0000
+  param acpisize = 64K
+
+  # Where `PCIEXBAR` comes out of reset pointing, with its enable bit set, and
+  # where `PMBASE` does. Both are firmware stand-ins on `q35` and both are
+  # *load bearing* here, because there is no firmware at all to program them:
+  # a kernel that found `PCIEXBAR` disabled would fall back to 0xcf8, and one
+  # that found `PMBASE` unplaced would have an FADT naming an ACPI register
+  # block that does not decode. §5.1.16 and ICH9 §13.1.13-§13.1.14 give the
+  # registers; the values are this board's.
+  param ecambase = 0xe0000000
+  param pmbase   = 0x600
+
+  # Which host character port COM1 attaches to, so two of these can run in one
+  # process without writing over each other.
+  param console = "console"
+
+  # How big the NVMe namespace is when the run supplies no image. A medium
+  # installed under the `nvme0` slot (`--drive nvme0=disk.img`) wins over this
+  # and brings its own capacity.
+  param disk = 16M
+
+  # Bytes in a logical block. 512 is what every driver assumes without asking;
+  # 4096 is what a modern part reports, and this board can be either.
+  param block = 512
+
+  # The date and time the RTC starts at. A device may never read the host clock
+  # (CLAUDE.md, determinism), so it is declared.
+  param time = "2026-01-01T00:00:00"
+
+  # -- crystals ---------------------------------------------------------------
+  #
+  # `q35`'s, less the two that only a video adapter and an 8042 counted.
+
+  # The processor. 100 MHz rather than `q35`'s 25, and the number is a
+  # measurement rather than a part: a kernel boot is a fixed amount of *work*,
+  # and a slower core spreads it over more virtual time — more timer
+  # interrupts, more `udelay` spins charged against a slower clock, and more
+  # wall clock for the same boot. `pc64` settled on 100 MHz for exactly this
+  # and this board is doing the same job.
+  osc cpu   = 100000000 Hz
+  osc pit   = 105000000/88 Hz
+  osc rtc   = 32768 Hz
+  osc bus   = 100000000 Hz
+  osc hpet  = 10000000 Hz
+
+  # The ACPI power-management timer: 14.31818 MHz divided by four, written as
+  # the division because neither number is an integer count of hertz and the
+  # language takes rational literals so the ratio stays exact (ICH9 §13.8.3.4).
+  osc pmtmr = 315000000/88 Hz
+
+  # The UART's. 1.8432 MHz divided by sixteen is one character time at the
+  # fastest rate the chip runs.
+  osc uart  = 1843200 Hz
+
+  # -- address spaces ---------------------------------------------------------
+  space mem  { width = 64, unassigned = read-as-ones }
+  space port { width = 16, unassigned = read-as-ones }
+
+  # -- the processor ----------------------------------------------------------
+  #
+  # `variant = "x86-64"` is a preset (ROADMAP.md §6.1.1): the point in the
+  # extension lattice every part that implements long mode has to be at. The
+  # kernel's decompressor builds page tables, sets `EFER.LME`, enters long mode
+  # and decompresses itself before printing a character, so anything that
+  # reaches the first line of output has already exercised most of it.
+  object cpu0 "cpu.x86" {
+    clock   = cpu
+    space   = mem
+    iospace = "port"
+    variant = "x86-64"
+    engine  = "interp"
+  }
+
+  # -- memory -----------------------------------------------------------------
+  #
+  # Declared before anything that writes into memory: `Machine::reset` runs
+  # devices in declaration order and a cold reset zeroes RAM, so the loader at
+  # the bottom of this file must run after these.
+  object ram_low  "ram" { size = basemem }
+  object ram_high "ram" { size = extmem }
+
+  # -- the north bridge -------------------------------------------------------
+  #
+  # `machines/q35.machine`'s, unchanged and for its reasons: `device-id =
+  # 0x29c0` is the identification the world recognises for this part family
+  # (datasheet §5.1.2, Table 5-1), `clock = bus` is there because a
+  # configuration write through ECAM can only be applied at a scheduler tick,
+  # and `passthrough = sysctl` hands the byte at 0xcf9 to the south bridge's
+  # reset control register.
+  object mch "q35.mch" {
+    device-id   = 0x29c0
+    clock       = bus
+    space       = mem
+    bus         = "pci0"
+    ecam        = ecambase
+    passthrough = sysctl
+  }
+
+  # -- the south bridge -------------------------------------------------------
+  #
+  # `machines/q35.machine`'s, with one property added. `device-id` is required
+  # and has no datasheet value — §13.1.2 defers it to a Specification Update
+  # that could not be retrieved — so 0x2918 is this board's claim, exactly as
+  # it is there.
+  #
+  # `sci-en = true` is the addition, and it is the same *kind* of thing
+  # `pirq-routes` is: a stand-in for a POST this board does not have. An ICH9
+  # powers up with `PM1_CNT.SCI_EN` clear, meaning an enabled ACPI event would
+  # raise `SMI#` rather than `SCI` (§13.8.3.3), and firmware sets the bit when
+  # the operating system asks for ownership through the SMI command port. This
+  # board has no SMI path and no firmware to answer on one, and `q35.acpi`
+  # therefore publishes an FADT with `SMI_CMD` zero — which ACPI §5.2.9 defines
+  # as "this system does not support ACPI mode transitions". An operating
+  # system that reads that and then finds `SCI_EN` clear has been told two
+  # contradictory things: there is no way into ACPI mode, and we are not in it.
+  # So the board states the bit a firmware would have set, and the two agree.
+  object lpc "q35.lpc" {
+    clock       = pmtmr
+    bus         = "pci0"
+    iospace     = "port"
+    device-id   = 0x2918
+    pm-base     = pmbase
+    sci-en      = true
+    pirq-routes = [11, 10, 11, 10]
+  }
+
+  # -- the ACPI tables --------------------------------------------------------
+  #
+  # Generated at reset from the realized machine, exactly as on `q35`, and this
+  # is the answer to "who publishes ACPI on a board with no firmware": nobody
+  # has to. The tables are a device with a region, the machine file maps that
+  # region inside §5.2.5.1's own RSDP search window, and a kernel scanning
+  # 0xe0000-0xfffff finds them there without anything having staged them. On a
+  # real machine the firmware would allocate this and report it in e820 as ACPI
+  # reclaim memory; `docs/platforms/q35.md` says why that is where this should
+  # end up.
+  #
+  # The three declared properties are the three that cannot be read out of the
+  # topology: how many processors there are, the I/O APIC's ID (reaching it
+  # means writing its index register, which a debug read may not do), and which
+  # interrupt the SCI appears on.
+  object acpi "q35.acpi" {
+    space      = mem
+    iospace    = "port"
+    bus        = "pci0"
+    size       = acpisize
+    cpus       = 1
+    ioapic-id  = 1
+    sci-irq    = 9
+  }
+
+  # -- interrupts -------------------------------------------------------------
+  #
+  # `q35`'s, unchanged: two 8259As with the slave cascaded onto the master's
+  # IR2, a local APIC, an I/O APIC, and the MP specification's IMCR deciding
+  # which path the master's INT takes. The kernel switches the IMCR itself once
+  # it has read the MADT and seen `PCAT_COMPAT`.
+  object pic1   "pc.pic"    { mode = "master" }
+  object pic2   "pc.pic"    { mode = "slave" }
+  object lapic0 "pc.lapic"  { clock = bus, id = 0, bus = "apic" }
+  object ioapic "pc.ioapic" { id = 1, bus = "apic" }
+  object imcr   "pc.imcr"   {}
+
+  # -- the timers -------------------------------------------------------------
+
+  object pit0 "pc.pit" { clock = pit }
+
+  # The HPET's three comparators on I/O APIC inputs 16, 17 and 18, off the
+  # inputs the SCI can be steered onto. `q35` explains the choice.
+  object hpet0 "pc.hpet" {
+    clock  = hpet
+    period = 100000000
+    route0 = 16
+    route1 = 17
+    route2 = 18
+  }
+
+  # -- the real-time clock and CMOS -------------------------------------------
+  #
+  # The memory sizes are written here as well as being the `ram` objects' sizes
+  # because a device cannot read the machine's memory map. Note that a kernel
+  # entered by `x86.linuxboot` believes the **e820 map** rather than CMOS; this
+  # is here for the wall clock, and the sizes are declared so the two cannot
+  # disagree if something does read them.
+  object cmos "pc.rtc" {
+    clock   = rtc
+    time    = time
+    basemem = basemem
+    extmem  = extmem
+  }
+
+  # -- the system control ports -----------------------------------------------
+  #
+  # Not a chip: latches and gates on the board. Port B at 0x61 gates counter 2
+  # and reads its output back, which is the path `quick_pit_calibrate` takes.
+  object sysctl "pc.sysctl" {}
+
+  # -- the console ------------------------------------------------------------
+  #
+  # A 16550 at 0x3f8 on IRQ4. On a real q35 it is a Super I/O part on the LPC
+  # bus that the south bridge decodes for (ICH9 §13.1.3, §13.1.4); this board
+  # models the chip and not the decode, because the register file a guest
+  # touches is the 16550's either way.
+  object com1 "uart.ns16550" {
+    clock     = uart / 16
+    port      = console
+    frequency = 1843200
+  }
+
+  # -- the disk ---------------------------------------------------------------
+  #
+  # An NVM Express controller at device 4, function 0. `space = mem` is not
+  # decoration: it is a **bus master**, and its submission queues, its
+  # completion queues, its PRP lists and its data buffers are all in this
+  # board's RAM, which it reads and writes itself. Without the property it has
+  # nowhere to fetch a command from and `bind` says so.
+  #
+  # Its register block is **not** in the memory map below, and that is the
+  # point of a base address register: the kernel sizes `BAR0` and places the
+  # block wherever its own resource allocator decides.
+  object nvme0 "nvme.controller" {
+    space  = mem
+    bus    = "pci0"
+    device = 4
+    image  = "nvme0"
+    size   = disk
+    block  = block
+  }
+
+  # -- what gets loaded -------------------------------------------------------
+  #
+  # Last, and that is load bearing: a cold reset zeroes RAM and anything
+  # written before that reset would be erased by it.
+  #
+  # `extmem` is repeated here because this is what builds the e820 map, and a
+  # kernel believes the map rather than the machine. One parameter, so the two
+  # cannot disagree.
+  object boot "x86.linuxboot" {
+    space   = mem
+    kernel  = "kernel"
+    initrd  = "initrd"
+    cmdline = cmdline
+    basemem = basemem
+    extmem  = extmem
+  }
+
+  # -- the memory map ---------------------------------------------------------
+  #
+  # 0x00000    base RAM, up to the video hole
+  # 0xe0000    the ACPI tables
+  # 0x100000   extended memory
+  # 0xfec00000 the I/O APIC, 0xfed00000 the HPET, 0xfee00000 the local APIC
+  # 0xfffffff0 the loader's reset vector
+  #
+  # The ECAM window is not here — `PCIEXBAR` places it — and neither is the
+  # NVMe controller's register block, which `BAR0` places.
+  map mem 0x00000000 size basemem  = ram_low
+  map mem acpibase   size acpisize = acpi.tables
+  map mem 0x00100000 size extmem   = ram_high
+
+  map mem 0xfec00000 size 0x0020   = ioapic.regs   # 82093AA §3.1
+  map mem 0xfed00000 size 0x0400   = hpet0.regs    # HPET spec §3.2.4
+  map mem 0xfee00000 size 0x1000   = lapic0.regs   # SDM Vol 3A §10.4.4
+
+  # The sixteen bytes at the top of the address space, and the only thing on
+  # this board above 4 GiB minus a page. A processor fetches its first
+  # instruction from 0xfffffff0 with CS's cached base still at 0xffff0000; what
+  # is there is a far jump to the loader's stub in low memory, which is the one
+  # instruction that can change that base.
+  map mem 0x100000000 - 16 size 16 = boot.reset
+
+  # -- the I/O map ------------------------------------------------------------
+  #
+  # The AT's, less everything this board does not have. The ACPI register block
+  # is not here: `PMBASE` places it, exactly as `PCIEXBAR` places ECAM.
+  map port 0x0020 size 0x0002 = pic1.regs     # master 8259A
+  map port 0x0022 size 0x0002 = imcr.regs     # the MP specification's IMCR
+  map port 0x0040 size 0x0004 = pit0.regs     # 8254
+  map port 0x0061 size 0x0001 = sysctl.portb  # speaker, timer 2 out, refresh
+  map port 0x0070 size 0x0002 = cmos.regs     # RTC index (with the NMI mask)
+  map port 0x0092 size 0x0001 = sysctl.porta  # fast A20 and fast reset
+  map port 0x00a0 size 0x0002 = pic2.regs     # slave 8259A
+  map port 0x03f8 size 0x0008 = com1.regs     # COM1
+  map port 0x04d0 size 0x0001 = pic1.elcr     # edge/level control, master
+  map port 0x04d1 size 0x0001 = pic2.elcr     # edge/level control, slave
+
+  # PCI configuration mechanism #1, and the reset control register at 0xcf9
+  # inside it, handed on to `sysctl` through the north bridge's pass-through.
+  # ECAM does not replace this window — a q35 has both, and Linux probes here
+  # first and then upgrades to the window `MCFG` names.
+  map port 0x0cf8 size 0x0008 = mch.config
+
+  # -- the wires --------------------------------------------------------------
+  #
+  # The interrupt tree, `q35`'s: the slave cascades onto the master's IR2, the
+  # master's INT reaches the processor through the IMCR, and the local APIC's
+  # own output is wire-ORed onto the same pin. The order of the two `cpu0.intr`
+  # drivers is load bearing — the IMCR is asked for an acknowledge first and
+  # declines when the register says the APIC owns the pin.
+  wire pic2.int    -> pic1.ir2
+  wire pic1.int    -> imcr.int
+  wire imcr.intr   -> cpu0.intr
+  wire imcr.lint0  -> lapic0.lint0
+  wire lapic0.intr -> cpu0.intr
+  wire lapic0.nmi  -> cpu0.nmi
+
+  # The legacy lines land twice, on the 8259A input they have always had and on
+  # the I/O APIC input the MP specification assigns them. IRQ0 is the
+  # exception: the 8254's output reaches I/O APIC input **2**, and the MADT's
+  # interrupt source override is the other half of that.
+  wire pit0.out0   -> pic1.ir0
+  wire pit0.out0   -> ioapic.irq2
+  wire cmos.irq    -> pic2.ir0
+  wire cmos.irq    -> ioapic.irq8
+  wire com1.irq    -> pic1.ir4
+  wire com1.irq    -> ioapic.irq4
+
+  wire hpet0.t0    -> ioapic.irq16
+  wire hpet0.t1    -> ioapic.irq17
+  wire hpet0.t2    -> ioapic.irq18
+
+  # The SCI. `ACPI_CNTL[2:0]` picks one of five destinations and the bridge
+  # drives one pin per destination, so all five are wired and at most one is
+  # ever high.
+  wire lpc.sci9    -> pic2.ir1
+  wire lpc.sci9    -> ioapic.irq9
+  wire lpc.sci10   -> pic2.ir2
+  wire lpc.sci10   -> ioapic.irq10
+  wire lpc.sci11   -> pic2.ir3
+  wire lpc.sci11   -> ioapic.irq11
+  wire lpc.sci20   -> ioapic.irq20
+  wire lpc.sci21   -> ioapic.irq21
+
+  # The `PIRQ` routers' outputs, each to the 8259A input it names and to the
+  # I/O APIC input of the same number, because which one a given function ends
+  # up on is a run-time decision. Wiring both is what makes the `_PRT` honest in
+  # either mode: the global system interrupt and the ISA interrupt are the same
+  # number, so one table describes both.
+  #
+  # The `PIRQ` *inputs* are not wired, and that is not an omission: the fabric
+  # drives four of them itself, by rotating each function's `INTA#`-`INTD#` pin
+  # by device number onto one of the bus's four interrupt nets, which this
+  # bridge collects because it says `bus = "pci0"`. The NVMe controller's
+  # interrupt reaches IRQ11 that way and by no line written here.
+  wire lpc.irq3    -> pic1.ir3
+  wire lpc.irq3    -> ioapic.irq3
+  wire lpc.irq5    -> pic1.ir5
+  wire lpc.irq5    -> ioapic.irq5
+  wire lpc.irq6    -> pic1.ir6
+  wire lpc.irq6    -> ioapic.irq6
+  wire lpc.irq7    -> pic1.ir7
+  wire lpc.irq7    -> ioapic.irq7
+  wire lpc.irq10   -> pic2.ir2
+  wire lpc.irq10   -> ioapic.irq10
+  wire lpc.irq11   -> pic2.ir3
+  wire lpc.irq11   -> ioapic.irq11
+  wire lpc.irq12   -> pic2.ir4
+  wire lpc.irq12   -> ioapic.irq12
+  wire lpc.irq14   -> pic2.ir6
+  wire lpc.irq14   -> ioapic.irq14
+  wire lpc.irq15   -> pic2.ir7
+  wire lpc.irq15   -> ioapic.irq15
+
+  # `lpc.irq4` is absent because COM1 is already on that net and `lpc.irq9` is
+  # absent because the SCI's default selection lands there; a second driver on
+  # either would make two unrelated sources indistinguishable. The board's own
+  # `pirq-routes` send all four nets to IRQ10 and IRQ11 anyway.
+
+  # The timer's counter 2 and the board's port B — the calibration path.
+  wire sysctl.gate2 -> pit0.gate2
+  wire pit0.out2    -> sysctl.timer2
+  wire pit0.out1    -> sysctl.refresh
+
+  # Reset, from the chipset's fast port and from 0xcf9 through the north
+  # bridge's pass-through. **A20 is deliberately not wired**, for the reason at
+  # the top of this file.
+  wire sysctl.reset -> cpu0.reset
+}

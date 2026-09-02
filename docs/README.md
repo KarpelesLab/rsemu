@@ -64,6 +64,7 @@ the question never arises.
 | [`platforms/pc-at.md`](platforms/pc-at.md) | The `pc-at` machine rsemu builds, its firmware slots, and what is missing |
 | [`platforms/q35.md`](platforms/q35.md) | The `q35` board: an 82Q35 (G)MCH, an ICH9, ECAM, and the generated ACPI tables |
 | [`platforms/pc64.md`](platforms/pc64.md) | The `pc64` board: a long-mode PC with no firmware, and a Linux kernel entered directly |
+| [`platforms/q35-linux.md`](platforms/q35-linux.md) | The `q35-linux` board: that chipset with no firmware, a kernel entered directly, and an NVMe disk |
 | [`platforms/riscv-virt.md`](platforms/riscv-virt.md) | The RISC-V `virt` board |
 | [`platforms/stm32f407.md`](platforms/stm32f407.md) | The `stm32f407` microcontroller board, its peripherals, and how an M-profile interrupt is wired |
 

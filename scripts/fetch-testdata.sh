@@ -1141,7 +1141,7 @@ fetch_initramfs_x86() {
 }
 
 initramfs_x86_notice() {
-	printf '%s\n' "initramfs-x86.cpio -- a busybox root filesystem for pc64
+	printf '%s\n' "initramfs-x86.cpio -- a busybox root filesystem for pc64 and q35-linux
 busybox 1.35.0, x86-64, statically linked against musl, from
 ${BUSYBOX_X86_URL}
 https://www.busybox.net
@@ -1154,8 +1154,9 @@ The cpio archive around it is built by scripts/fetch-testdata.sh, which also
 writes the /init inside it. Nothing in the archive was downloaded except the
 busybox binary.
 
-Consumed by RSEMU_INITRD in tests/pc64_linux.rs. The kernel that loads it is
-not fetched by this script: point RSEMU_KERNEL at a bzImage of your own." \
+Consumed by RSEMU_INITRD in tests/pc64_linux.rs and tests/q35_linux.rs. The
+kernel that loads it is not fetched by this script: point RSEMU_KERNEL at a
+bzImage of your own." \
 		>"${1}/PROVENANCE-initramfs.txt"
 }
 
@@ -1171,6 +1172,17 @@ initramfs_x86_hint() {
 	note "      RSEMU_KERNEL_STOP_AT=x86_64 \\"
 	note "          cargo test --release --features machine-pc64 \\"
 	note "              --test pc64_linux -- --nocapture"
+	note ""
+	note "  The same archive on q35-linux, which has a PCI bus and an NVMe disk"
+	note "  under it (docs/platforms/q35-linux.md says why nolapic is needed):"
+	note "      RSEMU_KERNEL=/boot/vmlinuz \\"
+	note "      RSEMU_INITRD=${dest}/${archive} \\"
+	note "      RSEMU_KERNEL_CMDLINE='console=ttyS0,115200 nokaslr cryptomgr.notests nolapic' \\"
+	note "      RSEMU_KERNEL_MS=2500000 \\"
+	note "      RSEMU_KERNEL_INPUT='rsemu# =>head -c 40 /dev/nvme0n1\\n' \\"
+	note "      RSEMU_KERNEL_STOP_AT='LBA 0' \\"
+	note "          cargo test --release --features machine-q35-linux \\"
+	note "              --test q35_linux -- --nocapture"
 }
 
 virtio_hint() {
@@ -1744,8 +1756,9 @@ Suites:
                  the same archive with the kernel's own virtio-mmio and
                  virtio-blk modules in it, plus a disk image to read
   initramfs-x86  the same archive built around busybox.net's own x86-64
-                 static build, for the pc64 board (GPL-2.0, FETCH-ONLY). The
-                 kernel it boots under is yours: no bzImage is fetched.
+                 static build, for the pc64 and q35-linux boards (GPL-2.0,
+                 FETCH-ONLY). The kernel it boots under is yours: no bzImage
+                 is fetched.
 
 Options:
   --all               fetch every suite (the default when none is named).
