@@ -1481,3 +1481,117 @@ fn a_complete_remainder_is_always_exact() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// binary16, and round-to-integral
+// ---------------------------------------------------------------------------
+
+/// Overflow always reports inexact too (§7.4).
+const INEX_OVER: Flags = Flags(Flags::OVERFLOW.0 | Flags::INEXACT.0);
+
+/// Host `f32` bits narrowed to binary16 by the implementation under test, used
+/// only to write readable expectations.
+fn h(v: f32) -> u64 {
+    convert::<B32, B16>(s(v), RV).0
+}
+
+#[test]
+fn binary16_is_the_same_kernel_at_a_third_of_the_width() {
+    // The format's landmarks (IEEE 754-2019 §3.6): bias 15, ten stored
+    // significand bits, largest finite 65504, smallest subnormal 2^-24.
+    assert_eq!(h(1.0), 0x3c00);
+    assert_eq!(h(-2.0), 0xc000);
+    assert_eq!(h(65504.0), 0x7bff);
+    assert_eq!(B16::MAX_FINITE, 0x7bff);
+    assert_eq!(B16::QUIET_NAN, 0x7e00);
+    // 65520 is the first value that rounds up to infinity at nearest-even.
+    assert_eq!(convert::<B32, B16>(s(65520.0), RV), (0x7c00, INEX_OVER));
+    // 2^-24 is exactly the smallest subnormal; 2^-25 is a tie that
+    // nearest-even resolves to the even candidate, which is zero.
+    assert_eq!(h(f32::from_bits(0x3380_0000)), 1);
+    assert_eq!(
+        convert::<B32, B16>(s(f32::from_bits(0x3300_0000)), RV),
+        (0, Flags::INEXACT | Flags::UNDERFLOW)
+    );
+    // The arithmetic itself is format-generic: 2^-11 is half an ulp of one in
+    // binary16 and the tie rounds to even, which is one.
+    assert_eq!(add::<B16>(h(1.0), h(0.000_488_281_25), RV).0, h(1.0));
+    // ... while 2^-10 is a whole ulp and does not.
+    assert_eq!(add::<B16>(h(1.0), h(0.000_976_562_5), RV).0, 0x3c01);
+    assert_eq!(div::<B16>(h(1.0), h(0.0), RV).1, Flags::DIV_BY_ZERO);
+}
+
+#[test]
+fn round_to_integral_moves_in_the_direction_it_is_given() {
+    let rint = |v: f64, r: Round| round_to_integral::<B64>(d(v), RV.round(r), false).0;
+    for (v, near, away, zero, down, up) in [
+        (2.5, 2.0, 3.0, 2.0, 2.0, 3.0),
+        (3.5, 4.0, 4.0, 3.0, 3.0, 4.0),
+        (-2.5, -2.0, -3.0, -2.0, -3.0, -2.0),
+        (0.5, 0.0, 1.0, 0.0, 0.0, 1.0),
+        (-0.5, -0.0, -1.0, -0.0, -1.0, -0.0),
+        (1.4, 1.0, 1.0, 1.0, 1.0, 2.0),
+    ] {
+        assert_eq!(rint(v, Round::TiesEven), d(near), "rint {v} nearest");
+        assert_eq!(rint(v, Round::TiesAway), d(away), "rint {v} away");
+        assert_eq!(rint(v, Round::TowardZero), d(zero), "rint {v} zero");
+        assert_eq!(rint(v, Round::TowardNegative), d(down), "rint {v} down");
+        assert_eq!(rint(v, Round::TowardPositive), d(up), "rint {v} up");
+    }
+}
+
+/// §5.9: the sign of a zero result is the operand's, which is the rule a
+/// truncation written as `as i64 as f64` gets wrong.
+#[test]
+fn round_to_integral_keeps_the_sign_of_a_zero() {
+    let rint = |v: f64, r: Round| round_to_integral::<B64>(d(v), RV.round(r), false).0;
+    assert_eq!(rint(-0.25, Round::TiesEven), d(-0.0));
+    assert_eq!(rint(-0.0, Round::TiesEven), d(-0.0));
+    assert_eq!(rint(-0.75, Round::TowardPositive), d(-0.0));
+    assert!(rint(-0.25, Round::TiesEven) & B64::SIGN != 0);
+}
+
+/// It is not a conversion, so nothing overflows and the huge values no integer
+/// could hold come back untouched.
+#[test]
+fn round_to_integral_is_total() {
+    let rint = |bits: u64| round_to_integral::<B64>(bits, RV, false);
+    assert_eq!(rint(d(1e300)), (d(1e300), Flags::NONE));
+    assert_eq!(rint(d(f64::INFINITY)), (d(f64::INFINITY), Flags::NONE));
+    assert_eq!(rint(d(f64::NEG_INFINITY)).0, d(f64::NEG_INFINITY));
+    // A quiet NaN passes through under RISC-V's rule as the canonical one.
+    assert_eq!(rint(0x7ff8_0000_0000_0abc).0, B64::QUIET_NAN);
+    // A signaling NaN raises invalid.
+    assert!(rint(0x7ff0_0000_0000_0abc).1.contains(Flags::INVALID));
+}
+
+/// The two halves of §5.9: five operations that raise nothing, and
+/// `roundToIntegralExact`, which raises inexact when it changed the value.
+/// Arm spells that difference `FRINTZ` versus `FRINTX`.
+#[test]
+fn only_the_exact_form_reports_inexact() {
+    assert_eq!(round_to_integral::<B64>(d(2.5), RV, false).1, Flags::NONE);
+    assert_eq!(round_to_integral::<B64>(d(2.5), RV, true).1, Flags::INEXACT);
+    // An operand that was already integral is not inexact either way, and
+    // neither is a zero or an infinity.
+    assert_eq!(round_to_integral::<B64>(d(2.0), RV, true).1, Flags::NONE);
+    assert_eq!(round_to_integral::<B64>(d(-0.0), RV, true).1, Flags::NONE);
+    assert_eq!(
+        round_to_integral::<B64>(d(f64::INFINITY), RV, true).1,
+        Flags::NONE
+    );
+}
+
+/// ARM's `FPCR.FZ` flushes a subnormal *operand* to zero and reports it
+/// through `FPSR.IDC`, which round-to-integral honours like every other
+/// operation.
+#[test]
+fn round_to_integral_honours_flush_to_zero() {
+    let arm = Env::ARM.flush(true);
+    let (value, flags) = round_to_integral::<B64>(MIN_SUB64, arm, true);
+    assert_eq!(value, 0);
+    assert_eq!(flags, Flags::DENORMAL);
+    // Without flushing the same operand rounds up to one under FRINTP.
+    let up = Env::ARM.round(Round::TowardPositive);
+    assert_eq!(round_to_integral::<B64>(MIN_SUB64, up, false).0, d(1.0));
+}

@@ -50,8 +50,8 @@
 //! instruction encoding, the status word, the system-register space, the
 //! exception model and the MMU all differ, and a `Version` spanning them would
 //! make an ARM926EJ-S build link a 64-bit four-level page-table walker. The
-//! lattice still applies *within* it — `FEAT_LSE` and `FEAT_CRC32` are
-//! per-instance flags, and a named part selects them.
+//! lattice still applies *within* it — `FEAT_LSE`, `FEAT_CRC32` and `FEAT_FP`
+//! are per-instance flags, and a named part selects them.
 //!
 //! ROADMAP.md §6.1 and §6.1.1 carry the long form.
 

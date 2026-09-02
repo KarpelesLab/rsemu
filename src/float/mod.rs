@@ -13,14 +13,14 @@
 //!
 //! # What is implemented
 //!
-//! * [`binary`] — the interchange formats [`B32`] and [`B64`], as one
+//! * [`binary`] — the interchange formats [`B16`], [`B32`] and [`B64`], as one
 //!   implementation over [`Format`], on raw bit patterns held in a `u64`.
 //! * [`x87`] — the 80-bit double extended format, with the explicit integer
 //!   bit, the unsupported encodings, and x87's precision control.
 //! * `add`/`sub`/`mul`/`div`/`sqrt`/`fma`, comparisons, `min`/`max`,
-//!   classification, format conversion and both directions of integer
-//!   conversion, at all five rounding modes, with exact subnormals and the
-//!   sticky exception flags.
+//!   classification, round-to-integral, format conversion and both directions
+//!   of integer conversion, at all five rounding modes, with exact subnormals
+//!   and the sticky exception flags.
 //!
 //! # What is guest-specific, and is therefore a parameter
 //!
@@ -75,8 +75,8 @@ pub mod x87;
 mod tests;
 
 pub use binary::{
-    B32, B64, Category, Format, add, classify, compare, convert, div, eq, fma, from_signed,
-    from_unsigned, le, lt, max, min, mul, sqrt, sub, to_signed, to_unsigned,
+    B16, B32, B64, Category, Format, add, classify, compare, convert, div, eq, fma, from_signed,
+    from_unsigned, le, lt, max, min, mul, round_to_integral, sqrt, sub, to_signed, to_unsigned,
 };
 
 /// A rounding-direction attribute.

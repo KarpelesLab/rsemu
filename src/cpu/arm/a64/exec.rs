@@ -29,7 +29,9 @@
 use crate::core::exec::{Access as ExitAccess, Exit, ExitMask, ExitReason};
 use crate::core::space::{AddressSpace, MemAttrs};
 use crate::core::value::Width;
+use crate::float::{Flags, Round};
 
+use super::fp;
 use super::isa::{self, Fmt, LsAccess, Nzcv, Op, ShiftKind};
 use super::mmu::{self, Access, Tlb};
 use super::sysreg::{self, El, SysReg, SysRegs, VectorKind, daif, ec, sctlr};
@@ -83,6 +85,12 @@ pub(super) struct State {
     /// a 32nd slot is exactly the place a stray `SP` write would land
     /// unnoticed.
     pub x: [u64; 31],
+    /// `V0`-`V31`, the SIMD&FP register file.
+    ///
+    /// All thirty-two are real registers, unlike the general file: A64 spells
+    /// `SP` and `XZR` in the *general* encodings only, so there is no `V31`
+    /// that means something else.
+    pub v: fp::Vregs,
     /// The program counter.
     pub pc: u64,
     /// `PSTATE` and the system registers.
@@ -104,6 +112,7 @@ impl State {
     pub(super) fn new(cfg: &Config) -> State {
         State {
             x: [0; 31],
+            v: fp::Vregs::new(),
             pc: cfg.reset_vector,
             sys: SysRegs::new(),
             exclusive: None,
@@ -282,7 +291,12 @@ impl<'a> Exec<'a> {
                     (ExitReason::FAULT, ExitAccess::Read)
                 }
             }
-            ec::UNKNOWN => (ExitReason::FAULT, ExitAccess::None),
+            // A `CPACR_EL1` trap is a fault a supervisor above the core wants
+            // to see: for a level-3 consumer it is "this thread touched the
+            // FPU", which is exactly the event a lazy context switch is built
+            // on, and for a conformance run it is a diagnosis rather than a
+            // jump into a vector table the guest never set up.
+            ec::UNKNOWN | ec::FP_ACCESS => (ExitReason::FAULT, ExitAccess::None),
             _ => return None,
         };
         if !self.exits.contains(reason) {
@@ -641,6 +655,15 @@ impl<'a> Exec<'a> {
     fn execute(&mut self) -> Result<(), Trap> {
         let word = self.fetch()?;
         let insn = isa::decode(word, self.cfg.features).ok_or_else(Trap::undefined)?;
+        if insn.feat == isa::Feat::Fp {
+            // One check for the whole family, keyed off the table's own
+            // feature column: every SIMD&FP encoding traps here and nothing
+            // else does, so there is no list to keep in step with the rows.
+            if self.st.sys.fp_access_trapped() {
+                return Err(self.fp_trap());
+            }
+            return self.fp_execute(word, insn.op, insn.fmt);
+        }
         if insn.fmt.is_load_store() {
             return self.load_store(word, insn.fmt);
         }
@@ -1243,6 +1266,7 @@ impl<'a> Exec<'a> {
         if !spec.access.readable_at(self.st.sys.el) {
             return Err(Trap::undefined());
         }
+        self.check_fp_sysreg(spec.reg)?;
         let s = &self.st.sys;
         Ok(match spec.reg {
             SysReg::Midr => self.cfg.midr,
@@ -1283,6 +1307,8 @@ impl<'a> Exec<'a> {
             SysReg::TpidrEl0 => s.tpidr_el0,
             SysReg::TpidrroEl0 => s.tpidrro_el0,
             SysReg::Mdscr => s.mdscr,
+            SysReg::Fpcr => s.fpcr,
+            SysReg::Fpsr => s.fpsr,
         })
     }
 
@@ -1297,6 +1323,7 @@ impl<'a> Exec<'a> {
             // configured something.
             return Err(Trap::undefined());
         }
+        self.check_fp_sysreg(spec.reg)?;
         // Anything that changes the translation regime invalidates every
         // cached translation. Bumping the generation is the whole
         // invalidation (`ROADMAP.md` §4.5).
@@ -1339,9 +1366,35 @@ impl<'a> Exec<'a> {
             SysReg::TpidrEl0 => s.tpidr_el0 = value,
             SysReg::TpidrroEl0 => s.tpidrro_el0 = value,
             SysReg::Mdscr => s.mdscr = value,
+            // The bits this core does not implement are RES0 rather than
+            // storage: a guest that sets `FPCR.AHP` or an exception-enable bit
+            // reads back zero and can tell it did not get what it asked for.
+            // `fp::fpcr`'s documentation lists which, and why each is absent.
+            SysReg::Fpcr => s.fpcr = value & fp::fpcr::WRITABLE,
+            SysReg::Fpsr => s.fpsr = value & fp::fpsr::WRITABLE,
             // Everything else in the table is read-only, and `writable_at`
             // already refused it.
             _ => return Err(Trap::undefined()),
+        }
+        Ok(())
+    }
+
+    /// Refuse an `MRS`/`MSR` of `FPCR` or `FPSR` that `CPACR_EL1.FPEN` traps.
+    ///
+    /// DDI 0487 D: the `FPEN` trap covers *accesses to* the SIMD and
+    /// floating-point registers, and that includes `MRS` and `MSR` of `FPCR`
+    /// and `FPSR` — reported with the same exception class 0x07. It has to:
+    /// a kernel saving a process's floating-point context reads `FPSR` before
+    /// it reads a single `V` register, and if that read were allowed while the
+    /// registers themselves were not, lazy context switching would silently
+    /// see the wrong process's state.
+    ///
+    /// Keyed on the register rather than on the instruction, because `MRS` and
+    /// `MSR` are `Feat::Base` rows in the table — most of what they reach has
+    /// nothing to do with floating point.
+    fn check_fp_sysreg(&self, reg: SysReg) -> Result<(), Trap> {
+        if matches!(reg, SysReg::Fpcr | SysReg::Fpsr) && self.st.sys.fp_access_trapped() {
+            return Err(self.fp_trap());
         }
         Ok(())
     }
@@ -1597,6 +1650,517 @@ impl<'a> Exec<'a> {
         // and `XZR` discarding it is exactly what `write_reg` already does.
         self.write_reg(t, width, false, old);
         Ok(())
+    }
+    // -----------------------------------------------------------------
+    // Scalar floating point
+    // -----------------------------------------------------------------
+
+    /// The trap a floating-point instruction takes when `CPACR_EL1.FPEN`
+    /// forbids it.
+    ///
+    /// DDI 0487 D17.2.37: for exception class `0x07` taken from AArch64 state
+    /// the syndrome is `CV == 0` with `COND` RES0 — that is, a zero ISS. The
+    /// non-zero forms exist for AArch32, where a conditional instruction has a
+    /// condition worth reporting; A64 has four conditional instructions and
+    /// none of them is this.
+    fn fp_trap(&self) -> Trap {
+        Trap {
+            ec: ec::FP_ACCESS,
+            iss: 0,
+            far: None,
+            advance: false,
+        }
+    }
+
+    /// The precision an *arithmetic* floating-point encoding names.
+    ///
+    /// Two rejections, and they are different in kind. `0b10` is unallocated
+    /// in every arithmetic encoding, so it is `UNDEFINED` by the architecture.
+    /// `0b11` is half precision, which is allocated but needs `FEAT_FP16` —
+    /// this core does not have it, so half is `UNDEFINED` here too and
+    /// `ID_AA64PFR0_EL1.FP` says so. Half is still reachable through `FCVT`
+    /// and through a load or store, because Armv8.0-A has the *format*
+    /// without having arithmetic in it.
+    fn arith_prec(&self, word: u32) -> Result<fp::Prec, Trap> {
+        match fp::Prec::from_ptype(isa::ptype(word)) {
+            Some(fp::Prec::Half) | None => Err(Trap::undefined()),
+            Some(prec) => Ok(prec),
+        }
+    }
+
+    /// Fold an operation's exceptions into `FPSR`.
+    #[inline]
+    fn set_fp_flags(&mut self, flags: Flags) {
+        fp::accumulate(&mut self.st.sys.fpsr, flags);
+    }
+
+    /// Everything with `Feat::Fp` in the table, once the access check passed.
+    fn fp_execute(&mut self, word: u32, op: Op, fmt: Fmt) -> Result<(), Trap> {
+        if fmt.is_fp_load_store() {
+            return self.fp_load_store(word, fmt);
+        }
+        if fmt == Fmt::LoadFpLiteral {
+            return self.fp_literal(word);
+        }
+        self.fp_data_processing(word, op, fmt)
+    }
+
+    /// The scalar floating-point data-processing instructions.
+    #[allow(clippy::too_many_lines)]
+    fn fp_data_processing(&mut self, word: u32, op: Op, fmt: Fmt) -> Result<(), Trap> {
+        let d = isa::rd(word);
+        let n = isa::rn(word);
+        let m = isa::rm(word);
+        match fmt {
+            Fmt::FpOneSrc => {
+                let prec = self.arith_prec(word)?;
+                let bytes = prec.bytes();
+                let a = self.st.v.read(n, bytes);
+                let env = fp::env(self.st.sys.fpcr, prec);
+                // `FRINTN` and friends name their direction in the mnemonic;
+                // `FRINTI` and `FRINTX` take it from `FPCR`. `FRINTX` is the
+                // only one that reports inexact.
+                let rint = |mode: Option<Round>, signal| {
+                    let env = match mode {
+                        Some(r) => env.round(r),
+                        None => env,
+                    };
+                    fp::round_int(prec, a, env, signal)
+                };
+                let (result, flags) = match op {
+                    Op::Fmov => (a, Flags::NONE),
+                    Op::Fabs => (fp::abs(prec, a), Flags::NONE),
+                    Op::Fneg => (fp::neg(prec, a), Flags::NONE),
+                    Op::Fsqrt => fp::sqrt(prec, a, env),
+                    Op::Frintn => rint(Some(Round::TiesEven), false),
+                    Op::Frintp => rint(Some(Round::TowardPositive), false),
+                    Op::Frintm => rint(Some(Round::TowardNegative), false),
+                    Op::Frintz => rint(Some(Round::TowardZero), false),
+                    Op::Frinta => rint(Some(Round::TiesAway), false),
+                    Op::Frintx => rint(None, true),
+                    _ => rint(None, false),
+                };
+                self.set_fp_flags(flags);
+                self.st.v.write(d, bytes, result);
+            }
+
+            Fmt::FpCvt => {
+                let from = self.cvt_prec(isa::ptype(word))?;
+                // The destination's type is `opc`, bits 16:15, on the same
+                // three-value encoding — and a conversion to the format it
+                // came from is unallocated rather than a no-op.
+                let to = self.cvt_prec(isa::field(word, 16, 15))?;
+                if from == to {
+                    return Err(Trap::undefined());
+                }
+                let value = self.st.v.read(n, from.bytes());
+                let (result, flags) = fp::convert(from, to, value, self.st.sys.fpcr);
+                self.set_fp_flags(flags);
+                self.st.v.write(d, to.bytes(), result);
+            }
+
+            Fmt::FpTwoSrc => {
+                let prec = self.arith_prec(word)?;
+                let bytes = prec.bytes();
+                let a = self.st.v.read(n, bytes);
+                let b = self.st.v.read(m, bytes);
+                let env = fp::env(self.st.sys.fpcr, prec);
+                let (result, flags) = match op {
+                    Op::Fmul => fp::mul(prec, a, b, env),
+                    Op::Fdiv => fp::div(prec, a, b, env),
+                    Op::Fadd => fp::add(prec, a, b, env),
+                    Op::Fsub => fp::sub(prec, a, b, env),
+                    Op::Fmax => fp::max_min(prec, a, b, false, env),
+                    Op::Fmin => fp::max_min(prec, a, b, true, env),
+                    Op::Fmaxnm => fp::max_min_num(prec, a, b, false, env),
+                    Op::Fminnm => fp::max_min_num(prec, a, b, true, env),
+                    _ => {
+                        // `FNMUL` negates the *result*, so a NaN product comes
+                        // out with its sign flipped rather than untouched.
+                        let (value, flags) = fp::mul(prec, a, b, env);
+                        (fp::neg(prec, value), flags)
+                    }
+                };
+                self.set_fp_flags(flags);
+                self.st.v.write(d, bytes, result);
+            }
+
+            Fmt::FpThreeSrc => {
+                let prec = self.arith_prec(word)?;
+                let bytes = prec.bytes();
+                let op1 = self.st.v.read(n, bytes);
+                let op2 = self.st.v.read(m, bytes);
+                let addend = self.st.v.read(isa::ra(word), bytes);
+                let env = fp::env(self.st.sys.fpcr, prec);
+                // DDI 0487 C7: all four are `FPMulAdd(addend, op1, op2)` with
+                // one or both of `addend` and `op1` negated first. The
+                // negation is on the *operands*, not on the result, which is
+                // why `FNMADD` is not `-(a*b+c)` — the two differ in the sign
+                // of a zero and in which NaN survives.
+                let (op1, addend) = match op {
+                    Op::Fmadd => (op1, addend),
+                    Op::Fmsub => (fp::neg(prec, op1), addend),
+                    Op::Fnmadd => (fp::neg(prec, op1), fp::neg(prec, addend)),
+                    _ => (op1, fp::neg(prec, addend)),
+                };
+                let (result, flags) = fp::mul_add(prec, addend, op1, op2, env);
+                self.set_fp_flags(flags);
+                self.st.v.write(d, bytes, result);
+            }
+
+            Fmt::FpCmp => {
+                let prec = self.arith_prec(word)?;
+                let bytes = prec.bytes();
+                let zero_form = matches!(op, Op::FcmpZero | Op::FcmpeZero);
+                // The compare-with-zero encodings put nothing in `Rm`, and a
+                // non-zero value there is unallocated rather than ignored.
+                if zero_form && m != 0 {
+                    return Err(Trap::undefined());
+                }
+                let a = self.st.v.read(n, bytes);
+                let b = if zero_form {
+                    0
+                } else {
+                    self.st.v.read(m, bytes)
+                };
+                let signal_all = matches!(op, Op::Fcmpe | Op::FcmpeZero);
+                let env = fp::env(self.st.sys.fpcr, prec);
+                let (nzcv, flags) = fp::compare(prec, a, b, signal_all, env);
+                self.set_fp_flags(flags);
+                self.st.sys.nzcv = nzcv;
+            }
+
+            Fmt::FpCondCmp => {
+                let prec = self.arith_prec(word)?;
+                if isa::cond_hi(word).holds(self.st.sys.nzcv) {
+                    let bytes = prec.bytes();
+                    let a = self.st.v.read(n, bytes);
+                    let b = self.st.v.read(m, bytes);
+                    let env = fp::env(self.st.sys.fpcr, prec);
+                    let (nzcv, flags) = fp::compare(prec, a, b, op == Op::Fccmpe, env);
+                    self.set_fp_flags(flags);
+                    self.st.sys.nzcv = nzcv;
+                } else {
+                    // The alternative flags come from the encoding, and no
+                    // comparison happens — so no exception is raised either,
+                    // even for a signaling NaN sitting in the operands.
+                    self.st.sys.nzcv = Nzcv::from_nibble(word & 0xf);
+                }
+            }
+
+            Fmt::FpCondSel => {
+                let prec = self.arith_prec(word)?;
+                let bytes = prec.bytes();
+                let source = if isa::cond_hi(word).holds(self.st.sys.nzcv) {
+                    n
+                } else {
+                    m
+                };
+                let value = self.st.v.read(source, bytes);
+                self.st.v.write(d, bytes, value);
+            }
+
+            Fmt::FpImm => {
+                let prec = self.arith_prec(word)?;
+                let value = fp::expand_imm(isa::fp_imm8(word), prec);
+                self.st.v.write(d, prec.bytes(), value);
+            }
+
+            Fmt::FpIntCvt => self.fp_int_convert(word)?,
+            Fmt::FpFixCvt => self.fp_fixed_convert(word)?,
+
+            // Every `Feat::Fp` row is one of the formats above; a new row with
+            // a format nothing here handles is a build-time gap rather than a
+            // silent no-op.
+            _ => return Err(Trap::undefined()),
+        }
+        Ok(())
+    }
+
+    /// The precision a *conversion* encoding names, where half is allowed.
+    ///
+    /// `FCVT` to and from half precision is Armv8.0-A and does not need
+    /// `FEAT_FP16`: the feature adds half-precision *arithmetic*, and the
+    /// format existed as a storage and interchange type before it.
+    fn cvt_prec(&self, ptype: u32) -> Result<fp::Prec, Trap> {
+        fp::Prec::from_ptype(ptype).ok_or_else(Trap::undefined)
+    }
+
+    /// Conversion between a SIMD&FP register and a general one.
+    fn fp_int_convert(&mut self, word: u32) -> Result<(), Trap> {
+        let d = isa::rd(word);
+        let n = isa::rn(word);
+        let opcode = isa::cvt_opcode(word);
+        let rmode = isa::cvt_rmode(word);
+        let sixty_four = isa::sf(word);
+        let int_bits = if sixty_four { 64 } else { 32 };
+
+        // `rmode == 0b01` with `opcode` 110 or 111 is the pair that reaches
+        // the *top half* of a vector register, and it is spelled with
+        // `ptype == 0b10` — an encoding that is unallocated everywhere else.
+        // It is the only SIMD&FP register write in this core that merges
+        // rather than replacing.
+        //
+        // The `opcode` half of that condition is load-bearing: on
+        // `FCVTPS`/`FCVTPU` the very same `rmode` means "round toward
+        // +infinity", so keying on `rmode` alone would make every `FCVTP`
+        // UNDEFINED.
+        if rmode == 0b01 && matches!(opcode, 0b110 | 0b111) {
+            if !sixty_four || isa::ptype(word) != 0b10 {
+                return Err(Trap::undefined());
+            }
+            match opcode {
+                0b110 => {
+                    let value = self.st.v.high(n);
+                    self.write_reg(d, 64, false, value);
+                }
+                0b111 => {
+                    let value = self.read_reg(n, 64, false);
+                    self.st.v.set_high(d, value);
+                }
+                _ => return Err(Trap::undefined()),
+            }
+            return Ok(());
+        }
+
+        let prec = self.arith_prec(word)?;
+        let bytes = prec.bytes();
+        let env = fp::env(self.st.sys.fpcr, prec);
+        match opcode {
+            // `FMOV` between the files moves bits and rounds nothing, so the
+            // two widths must agree exactly: `W`↔`S` and `X`↔`D`. `X`↔`S`
+            // would be a conversion, and the architecture does not allocate
+            // it.
+            0b110 | 0b111 => {
+                let matched = match prec {
+                    fp::Prec::Single => !sixty_four,
+                    fp::Prec::Double => sixty_four,
+                    fp::Prec::Half => false,
+                };
+                if rmode != 0 || !matched {
+                    return Err(Trap::undefined());
+                }
+                if opcode == 0b110 {
+                    let value = self.st.v.read(n, bytes);
+                    self.write_reg(d, int_bits, false, value);
+                } else {
+                    let value = self.read_reg(n, int_bits, false);
+                    self.st.v.write(d, bytes, value);
+                }
+            }
+            // `SCVTF`/`UCVTF`: integer to floating point, rounded in the
+            // direction `FPCR` names — these are the only conversions in the
+            // group that do not carry their own.
+            0b010 | 0b011 => {
+                if rmode != 0 {
+                    return Err(Trap::undefined());
+                }
+                let value = self.read_reg(n, int_bits, false);
+                let (result, flags) = fp::from_int(prec, value, int_bits, opcode == 0b010, env);
+                self.set_fp_flags(flags);
+                self.st.v.write(d, bytes, result);
+            }
+            // `FCVT{N,P,M,Z}{S,U}`: the direction is in `rmode`, on the same
+            // encoding `FPCR.RMode` uses — which is why this reads it through
+            // the same function rather than a second table.
+            0b000 | 0b001 => {
+                let env = env.round(fp::rounding(u64::from(rmode) << fp::fpcr::RMODE_SHIFT));
+                let value = self.st.v.read(n, bytes);
+                let (result, flags) = fp::to_int(prec, value, int_bits, opcode == 0b000, env);
+                self.set_fp_flags(flags);
+                self.write_reg(d, int_bits, false, result);
+            }
+            // `FCVTA{S,U}`: ties away from zero, which `FPCR.RMode` cannot
+            // name at all — the reason it is a separate opcode rather than a
+            // fifth `rmode`.
+            0b100 | 0b101 => {
+                if rmode != 0 {
+                    return Err(Trap::undefined());
+                }
+                let env = env.round(Round::TiesAway);
+                let value = self.st.v.read(n, bytes);
+                let (result, flags) = fp::to_int(prec, value, int_bits, opcode == 0b100, env);
+                self.set_fp_flags(flags);
+                self.write_reg(d, int_bits, false, result);
+            }
+            _ => return Err(Trap::undefined()),
+        }
+        Ok(())
+    }
+
+    /// Conversion between a SIMD&FP register and a fixed-point value in a
+    /// general one.
+    ///
+    /// # Why scaling by a power of two is done as a multiplication
+    ///
+    /// `FixedToFP` and `FPToFixed` both divide or multiply by `2^fbits` in
+    /// *unbounded* real arithmetic and round once at the end. Doing it as a
+    /// sequence of exact multiplications by two gives the same answer here,
+    /// and the reason is a range argument rather than luck: `fbits` is at most
+    /// 64 and the integer is at most 64 bits, so every intermediate value in
+    /// the `SCVTF` direction stays above `2^-64` — far inside binary32's
+    /// normal range, let alone binary64's — and every multiplication by two or
+    /// by a half is therefore exact. Nothing rounds twice.
+    fn fp_fixed_convert(&mut self, word: u32) -> Result<(), Trap> {
+        let d = isa::rd(word);
+        let n = isa::rn(word);
+        let prec = self.arith_prec(word)?;
+        let bytes = prec.bytes();
+        let sixty_four = isa::sf(word);
+        let int_bits = if sixty_four { 64 } else { 32 };
+        // DDI 0487: with `sf == 0` the top bit of `scale` must be set, which
+        // is exactly the statement that a 32-bit form may not name more than
+        // 32 fraction bits.
+        if !sixty_four && isa::field(word, 15, 10) < 32 {
+            return Err(Trap::undefined());
+        }
+        let fbits = isa::fbits(word);
+        let env = fp::env(self.st.sys.fpcr, prec);
+        match isa::cvt_opcode(word) {
+            0b010 | 0b011 => {
+                let signed = isa::cvt_opcode(word) == 0b010;
+                let value = self.read_reg(n, int_bits, false);
+                let (converted, mut flags) = fp::from_int(prec, value, int_bits, signed, env);
+                let (result, scale_flags) =
+                    fp::scale_by_pow2(prec, converted, -(fbits as i32), env);
+                flags |= scale_flags;
+                self.set_fp_flags(flags);
+                self.st.v.write(d, bytes, result);
+            }
+            opcode @ (0b000 | 0b001) => {
+                let value = self.st.v.read(n, bytes);
+                // The scale-up is discarded of its own exceptions on purpose:
+                // `FPToFixed` performs it in real arithmetic, so it can raise
+                // nothing, and a value large enough to overflow the format
+                // here was already out of the integer's range — which the
+                // conversion below reports as invalid, exactly as it should.
+                let (scaled, _) = fp::scale_by_pow2(prec, value, fbits as i32, env);
+                let env = env.round(Round::TowardZero);
+                let (result, flags) = fp::to_int(prec, scaled, int_bits, opcode == 0b000, env);
+                self.set_fp_flags(flags);
+                self.write_reg(d, int_bits, false, result);
+            }
+            _ => return Err(Trap::undefined()),
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // SIMD&FP loads and stores
+    // -----------------------------------------------------------------
+
+    /// A SIMD&FP load or store, dispatched by addressing mode.
+    fn fp_load_store(&mut self, word: u32, fmt: Fmt) -> Result<(), Trap> {
+        match fmt {
+            Fmt::LdStFpPairOff | Fmt::LdStFpPairPost | Fmt::LdStFpPairPre => {
+                self.fp_pair(word, fmt)
+            }
+            _ => self.fp_single(word, fmt),
+        }
+    }
+
+    /// Move `bytes` bytes between memory at `addr` and SIMD&FP register `t`.
+    ///
+    /// The 128-bit width is two 64-bit accesses, because that is the widest
+    /// value the bus carries — but the *alignment* it is checked against is
+    /// sixteen, which is the access the guest asked for.
+    fn fp_access(&mut self, addr: u64, bytes: u64, t: u32, load: bool) -> Result<(), Trap> {
+        if bytes < 16 {
+            if load {
+                let value = self.load(addr, bytes)?;
+                self.st.v.write(t, bytes, value);
+            } else {
+                let value = self.st.v.read(t, bytes);
+                self.store(addr, bytes, value)?;
+            }
+            return Ok(());
+        }
+        let kind = if load { Access::Load } else { Access::Store };
+        self.check_align(addr, 16, kind, false)?;
+        if load {
+            let lo = self.load(addr, 8)?;
+            let hi = self.load(addr.wrapping_add(8), 8)?;
+            self.st.v.set_q(t, u128::from(lo) | (u128::from(hi) << 64));
+        } else {
+            let value = self.st.v.q(t);
+            self.store(addr, 8, value as u64)?;
+            self.store(addr.wrapping_add(8), 8, (value >> 64) as u64)?;
+        }
+        Ok(())
+    }
+
+    /// A single-register SIMD&FP load or store.
+    fn fp_single(&mut self, word: u32, fmt: Fmt) -> Result<(), Trap> {
+        let scale = isa::fp_ls_scale(word).ok_or_else(Trap::undefined)?;
+        let bytes = 1u64 << scale;
+        let load = isa::bit(word, 22);
+        let t = isa::rd(word);
+        let n = isa::rn(word);
+        let base = self.read_reg(n, 64, true);
+
+        let (addr, writeback) = match fmt {
+            Fmt::LdStFpUImm => (
+                base.wrapping_add(u64::from(isa::imm12(word)) << scale),
+                None,
+            ),
+            Fmt::LdStFpUnscaled => (base.wrapping_add(isa::imm9(word) as u64), None),
+            Fmt::LdStFpPost => (base, Some(base.wrapping_add(isa::imm9(word) as u64))),
+            Fmt::LdStFpPre => {
+                let a = base.wrapping_add(isa::imm9(word) as u64);
+                (a, Some(a))
+            }
+            _ => {
+                let option = isa::extend_option(word);
+                if option & 2 == 0 {
+                    return Err(Trap::undefined());
+                }
+                let amount = if isa::bit(word, 12) { scale } else { 0 };
+                let index =
+                    isa::extend_reg(self.read_reg(isa::rm(word), 64, false), option, amount);
+                (base.wrapping_add(index), None)
+            }
+        };
+        self.fp_access(addr, bytes, t, load)?;
+        // As on the integer side, the write-back happens after the access so a
+        // fault leaves the base register restartable.
+        if let Some(value) = writeback {
+            self.write_reg(n, 64, true, value);
+        }
+        Ok(())
+    }
+
+    /// A SIMD&FP load or store of a register pair.
+    fn fp_pair(&mut self, word: u32, fmt: Fmt) -> Result<(), Trap> {
+        let scale = isa::fp_opc_scale(word).ok_or_else(Trap::undefined)?;
+        let bytes = 1u64 << scale;
+        let load = isa::bit(word, 22);
+        let t = isa::rd(word);
+        let t2 = isa::ra(word);
+        let n = isa::rn(word);
+        let base = self.read_reg(n, 64, true);
+        let offset = (isa::imm7(word) << scale) as u64;
+
+        let (addr, writeback) = match fmt {
+            Fmt::LdStFpPairOff => (base.wrapping_add(offset), None),
+            Fmt::LdStFpPairPost => (base, Some(base.wrapping_add(offset))),
+            _ => {
+                let a = base.wrapping_add(offset);
+                (a, Some(a))
+            }
+        };
+        self.fp_access(addr, bytes, t, load)?;
+        self.fp_access(addr.wrapping_add(bytes), bytes, t2, load)?;
+        if let Some(value) = writeback {
+            self.write_reg(n, 64, true, value);
+        }
+        Ok(())
+    }
+
+    /// `LDR <Vt>, #label`: a SIMD&FP load from a PC-relative literal.
+    fn fp_literal(&mut self, word: u32) -> Result<(), Trap> {
+        let scale = isa::fp_opc_scale(word).ok_or_else(Trap::undefined)?;
+        let addr = self.this_pc.wrapping_add(isa::imm19(word) as u64);
+        self.fp_access(addr, 1u64 << scale, isa::rd(word), true)
     }
 }
 

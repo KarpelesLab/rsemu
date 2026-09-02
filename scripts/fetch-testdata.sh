@@ -1634,6 +1634,77 @@ arch_test_hint() {
 # Entry point
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# a64-tests: the AArch64 suite this repository *builds* rather than fetches
+# ---------------------------------------------------------------------------
+#
+# Nothing is downloaded. There is no AArch64 corpus that can be used --
+# SingleStepTests has no AArch64 repository, Arm's own architecture validation
+# suite is licensed to implementers, sail-arm is a model rather than a corpus,
+# and kvm-unit-tests is GPL-2.0 and is a machine gate rather than a core one.
+# So the guests are ours (tests/a64/*.rs, MIT) and this builds them.
+#
+# The only tool needed is `rustc` with the aarch64-unknown-none target
+# installed. That target's linker is `rust-lld`, which ships inside the Rust
+# toolchain, so there is no C toolchain and no cross binutils anywhere in this
+# path -- which is also why it can be in --all where riscv-arch-test cannot.
+#
+# src/cpu/arm/a64/conformance.rs is the runner, and says what each guest proves
+# and where its expected values come from.
+build_a64_tests() {
+	need rustc
+
+	local src="${REPO_ROOT}/tests/a64"
+	local dest="${DEST_ROOT}/a64-tests"
+	[ -d "$src" ] || die "${src} is missing; this is not an rsemu checkout"
+
+	if ! rustc --print target-list 2>/dev/null | grep -qx aarch64-unknown-none; then
+		die "this rustc does not know aarch64-unknown-none"
+	fi
+	# The precompiled `core` for the target. Without it every build below fails
+	# with "can't find crate for core", which is a confusing way to say "run
+	# rustup target add".
+	if ! rustc --target aarch64-unknown-none --print target-libdir 2>/dev/null |
+		xargs -r test -d; then
+		die "the aarch64-unknown-none standard library is not installed
+  rustup target add aarch64-unknown-none"
+	fi
+
+	mkdir -p "$dest"
+	local guest name built=0
+	for guest in "$src"/*.rs; do
+		name="$(basename "$guest" .rs)"
+		# rt.rs is `include!`d by every guest and is not one itself.
+		[ "$name" = "rt" ] && continue
+		if [ "$FORCE" != 1 ] && [ -f "${dest}/${name}.elf" ] &&
+			[ "${dest}/${name}.elf" -nt "$guest" ] &&
+			[ "${dest}/${name}.elf" -nt "${src}/rt.rs" ]; then
+			note "  ${name}.elf is up to date"
+			built=$((built + 1))
+			continue
+		fi
+		note "  building ${name} ..."
+		# -C panic=abort: there is no unwinder. -C debuginfo=0: the loader
+		# reads program headers only, and debug sections would be megabytes of
+		# nothing. The linker script pins the image at the board's DRAM base.
+		rustc --edition 2024 \
+			--target aarch64-unknown-none \
+			-C panic=abort \
+			-C opt-level=2 \
+			-C debuginfo=0 \
+			-C link-arg=-T -C link-arg="${src}/link.ld" \
+			--crate-name "$name" \
+			-o "${dest}/${name}.elf" \
+			"$guest" || die "could not build ${name}"
+		built=$((built + 1))
+	done
+
+	[ "$built" -gt 0 ] || die "no guests under ${src}"
+	ok "a64-tests: ${built} guest binaries in ${dest}"
+	note "    RSEMU_A64_TESTS=${dest} cargo test --all-features a64_conformance -- --nocapture"
+}
+
 usage() {
 	cat <<'EOF'
 usage: scripts/fetch-testdata.sh [options] [suite ...]
@@ -1648,6 +1719,12 @@ Suites:
   wozmon         the Apple 1 monitor           (licence unclear, BRING YOUR OWN)
   freedos        FreeDOS 1.3 boot diskette      (GPL-2.0, FETCH-ONLY)
   opensbi        RISC-V firmware for riscv-virt (BSD-2-Clause, redistributable)
+  a64-tests      the AArch64 suite this repository BUILDS rather than
+                 fetches -- nothing is downloaded and nothing is committed.
+                 Needs `rustc` with the aarch64-unknown-none target installed
+                 (`rustup target add aarch64-unknown-none`); the linker is the
+                 rust-lld inside the toolchain, so there is no C toolchain in
+                 this path. See src/cpu/arm/a64/conformance.rs.
   riscv-arch-test  the RISC-V architectural certification tests (BSD-3-Clause).
                  Built rather than downloaded: needs clang and a RISC-V linker
                  (lld, or rustup's rust-lld), and fetches the Sail reference
@@ -1696,7 +1773,7 @@ list_present() {
 	fi
 	local suite
 	for suite in sst-65x02 mips-r3000 nestest accuracycoin gb-blargg gb-mooneye \
-		sms-zexall apple1 riscv riscv-arch-test freedos x86; do
+		sms-zexall apple1 riscv riscv-arch-test a64-tests freedos x86; do
 		if [ -d "${DEST_ROOT}/${suite}" ]; then
 			printf '  %-14s %s\n' "$suite" \
 				"$(du -sh "${DEST_ROOT}/${suite}" 2>/dev/null | cut -f1) present"
@@ -1749,6 +1826,7 @@ for suite in "${SUITES[@]}"; do
 		wozmon|apple1) fetch_wozmon ;;
 		freedos|dos) fetch_freedos ;;
 		opensbi|riscv) fetch_opensbi ;;
+		a64-tests|a64) build_a64_tests ;;
 		riscv-arch-test|arch-test|act) fetch_arch_test ;;
 		edk2|uefi) fetch_edk2 ;;
 		linux|kernel) fetch_linux ;;
