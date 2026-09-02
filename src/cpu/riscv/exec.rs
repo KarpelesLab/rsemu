@@ -115,10 +115,10 @@ impl State {
 
 /// One step's worth of execution, borrowing everything it needs.
 pub(super) struct Exec<'a> {
-    st: &'a mut State,
+    pub(super) st: &'a mut State,
     tlb: &'a mut Tlb,
     space: &'a AddressSpace,
-    cfg: &'a Config,
+    pub(super) cfg: &'a Config,
     lines: &'a Lines,
     /// Which architectural traps leave the hart instead of vectoring into the
     /// guest (`core::exec`). Empty for a level-1 machine, which is every
@@ -128,11 +128,25 @@ pub(super) struct Exec<'a> {
     exit: Option<Exit>,
     attrs: MemAttrs,
     /// Cycles charged by this step.
-    used: u64,
+    pub(super) used: u64,
     /// Where execution continues, unless a jump overrides it.
-    next_pc: u64,
+    pub(super) next_pc: u64,
     /// The address of the instruction being executed, for `mepc`.
-    this_pc: u64,
+    pub(super) this_pc: u64,
+    /// Guest-**physical** pages this borrow has written to, for the block
+    /// cache's self-modifying-code check (`jit::dispatch`).
+    ///
+    /// Two, and two is the whole answer: an access is at most eight bytes and
+    /// each byte of a misaligned one is translated on its own, so a single
+    /// store reaches at most two pages. A run that writes to more than that
+    /// has taken more than one step, and the engine drains this between them.
+    ///
+    /// Recorded unconditionally rather than behind a flag: it is two compares
+    /// and a store on a path that has just charged a bus cycle, and a flag
+    /// that could be off is a way for an invalidation to be silently missed.
+    pub(super) wrote: [u64; 2],
+    /// How many of [`Exec::wrote`] are live.
+    pub(super) wrote_n: u8,
     /// Set when this instruction wrote `minstret` itself.
     ///
     /// Volume II: a write to `minstret` takes precedence over the increment
@@ -217,6 +231,8 @@ impl<'a> Exec<'a> {
             used: 0,
             next_pc: this_pc,
             this_pc,
+            wrote: [0; 2],
+            wrote_n: 0,
             wrote_instret: false,
         }
     }
@@ -282,7 +298,7 @@ impl<'a> Exec<'a> {
     /// so the mapping keeps both: [`Exit::detail`] is the `mcause` code
     /// verbatim, and [`Exit::access`] is the architecture-independent half a
     /// demand-paging consumer branches on.
-    fn exit_for(&self, trap: &Trap) -> Option<Exit> {
+    pub(super) fn exit_for(&self, trap: &Trap) -> Option<Exit> {
         let (reason, access) = match trap.cause {
             cause::ECALL_U | cause::ECALL_S | cause::ECALL_M => {
                 (ExitReason::SYSCALL, ExitAccess::None)
@@ -324,7 +340,7 @@ impl<'a> Exec<'a> {
 
     /// Charge one bus access.
     #[inline]
-    fn charge(&mut self) {
+    pub(super) fn charge(&mut self) {
         self.used += 1;
         self.st.cycles = self.st.cycles.wrapping_add(1);
         if self.st.csrs.mcountinhibit & 1 == 0 {
@@ -437,7 +453,7 @@ impl<'a> Exec<'a> {
     }
 
     /// Translate one virtual address, consulting and filling the TLB.
-    fn translate(&mut self, vaddr: u64, kind: Access, len: u64) -> Result<u64, Trap> {
+    pub(super) fn translate(&mut self, vaddr: u64, kind: Access, len: u64) -> Result<u64, Trap> {
         let mode = self.effective_priv(kind);
         let phys = if mmu::translation_active(&self.st.csrs, mode) {
             let vpn = vaddr >> mmu::PAGE_BITS;
@@ -503,7 +519,10 @@ impl<'a> Exec<'a> {
         let phys = self.translate(vaddr, Access::Store, width.bytes())?;
         self.charge();
         match self.space.write(phys, width, value, self.attrs) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.note_write(phys);
+                Ok(())
+            }
             Err(_) => {
                 self.st.faults = self.st.faults.wrapping_add(1);
                 Err(Trap {
@@ -511,6 +530,22 @@ impl<'a> Exec<'a> {
                     tval: vaddr,
                 })
             }
+        }
+    }
+
+    /// Remember the guest-physical page a write landed on.
+    ///
+    /// De-duplicated against what is already there, because a misaligned store
+    /// makes up to eight writes into at most two pages.
+    #[inline]
+    fn note_write(&mut self, phys: u64) {
+        let page = phys & !PAGE_MASK;
+        if self.wrote[..self.wrote_n as usize].contains(&page) {
+            return;
+        }
+        if self.wrote_n < 2 {
+            self.wrote[self.wrote_n as usize] = page;
+            self.wrote_n += 1;
         }
     }
 
@@ -522,7 +557,7 @@ impl<'a> Exec<'a> {
     /// written for a hart that supports them run — and each byte is translated
     /// separately, so an access straddling a page boundary faults on the half
     /// that is actually unmapped.
-    fn load(&mut self, vaddr: u64, bytes: u64) -> Result<u64, Trap> {
+    pub(super) fn load(&mut self, vaddr: u64, bytes: u64) -> Result<u64, Trap> {
         let width = Width::from_bytes(bytes).ok_or(Trap::bare(cause::LOAD_ACCESS))?;
         if vaddr.is_multiple_of(bytes) {
             return self.read_once(vaddr, width, Access::Load);
@@ -542,7 +577,7 @@ impl<'a> Exec<'a> {
     }
 
     /// Store `bytes` bytes, splitting a misaligned access into bytes.
-    fn store(&mut self, vaddr: u64, bytes: u64, value: u64) -> Result<(), Trap> {
+    pub(super) fn store(&mut self, vaddr: u64, bytes: u64, value: u64) -> Result<(), Trap> {
         let width = Width::from_bytes(bytes).ok_or(Trap::bare(cause::STORE_ACCESS))?;
         // A store into the reservation set breaks it, which is what makes a
         // load-reserved/store-conditional pair fail when something else wrote
@@ -615,7 +650,7 @@ impl<'a> Exec<'a> {
     /// one is always taken, one destined for the current privilege is taken
     /// only if that privilege's global enable is set, and one destined for a
     /// lower privilege is never taken.
-    fn pending_interrupt(&self) -> Option<u64> {
+    pub(super) fn pending_interrupt(&self) -> Option<u64> {
         let ready = self.lines.pending() & self.st.csrs.mie;
         if ready == 0 {
             return None;
@@ -656,7 +691,7 @@ impl<'a> Exec<'a> {
     /// into `xPIE`, interrupts are disabled, the previous privilege is saved
     /// into `xPP`, and the hart moves to the handling privilege. Delegation
     /// decides which of the two register sets is used.
-    fn enter_trap(&mut self, trap: Trap, interrupt: bool) {
+    pub(super) fn enter_trap(&mut self, trap: Trap, interrupt: bool) {
         let csrs = &mut self.st.csrs;
         let bit = 1u64 << trap.cause;
         let delegated = if interrupt {
@@ -1035,8 +1070,12 @@ impl<'a> Exec<'a> {
             // This core executes one instruction at a time in program order
             // and has no store buffer, so both fences are architecturally
             // complete as no-ops. FENCE.I additionally invalidates any decoded
-            // instruction cache; there is none yet, and when the JIT lands it
-            // will hook here.
+            // instruction cache, and the translation cache `cpu::riscv::engine`
+            // keeps is one — but it is invalidated by *the pages this hart
+            // wrote*, not here: Linux issues a FENCE.I on essentially every
+            // executable page it maps, and hooking it costs the whole cache
+            // thousands of times a second. The measurement, and the one case
+            // it leaves uncovered, are in that module's documentation.
             Op::Fence | Op::FenceI => {}
 
             // -- A ---------------------------------------------------------

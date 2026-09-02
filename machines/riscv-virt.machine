@@ -47,6 +47,24 @@ machine "riscv-virt" {
   # these can run in one process without stopping each other.
   param power = "power"
 
+  # Which execution engine the hart runs on: `interp`, `jit`, or `jit-host`.
+  #
+  #   rsemu run riscv-virt --media firmware=fw.bin -p engine=jit
+  #
+  # A parameter rather than a fixed property because the three are supposed to
+  # be *indistinguishable to the guest* — same registers, same memory, same
+  # cycle counts, same scheduler debt (ROADMAP.md §0) — and the only way to
+  # keep a claim like that honest is for one board file to run all three and
+  # for the state hashes to be compared. `tests/riscv_virt_engines.rs` does
+  # exactly that; docs/platforms/riscv-virt.md has what each one costs.
+  #
+  # `interp` is the default because it is the oracle. `jit` is the translation
+  # runtime and `jit-host` is the same runtime with the host code generator
+  # attached; both need a build with `cpu-riscv-lift` and `jit`, and a build
+  # without them refuses the property with a message saying so rather than
+  # quietly interpreting.
+  param engine = "interp"
+
   # The virtio disk's size. Whatever is bound to the `disk` media slot is the
   # start of it, padded out to this with zeroes — so `-p storage=64M` alone is
   # a blank 64 MiB disk, and `--disk foo.img` alone is exactly that image.
@@ -94,7 +112,7 @@ machine "riscv-virt" {
   object cpu0 "cpu.riscv" {
     clock  = core
     space  = mem
-    engine = "interp"
+    engine = engine
     xlen   = "rv64"
     isa    = "imafdc"
     hartid = 0

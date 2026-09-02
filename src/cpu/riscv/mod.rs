@@ -90,6 +90,11 @@ pub mod differential;
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-riscv-lift")))]
 pub mod lift;
 
+// The translated execution engine needs the frontend *and* the translation
+// runtime, so it is gated on both rather than on either (`ROADMAP.md` §9).
+#[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
+mod engine;
+
 pub mod mmu;
 
 #[cfg(test)]
@@ -286,6 +291,73 @@ impl Default for Config {
     }
 }
 
+/// Which execution engine a hart runs on.
+///
+/// A construction property rather than a `#[cfg]`, exactly as [`Config::xlen`]
+/// is: one build of rsemu runs the same board both ways, which is what makes
+/// *"a bit-identical state hash across the interpreter and the JIT for the
+/// same guest"* (`ROADMAP.md` §0) a thing a test can assert rather than a
+/// claim about two builds.
+///
+/// All of them are **indistinguishable to the guest** — same registers, same
+/// memory, same faults, same cycle counts, same scheduler debt — so this is a
+/// speed knob and never a semantic one. `cpu::riscv::engine` has what that
+/// costs to keep true, and what each is worth measured on a Linux boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Engine {
+    /// The interpreter, and the oracle everything else is measured against
+    /// (CLAUDE.md, "CPU cores").
+    #[default]
+    Interp,
+    /// The translation runtime: guest instructions lifted into IR blocks,
+    /// cached under `(pc, physical page)`, and executed by the **portable** IR
+    /// backend.
+    ///
+    /// Runs anywhere the crate does, `no_std` and every wasm target included,
+    /// and is the faster of the two JIT engines today — measured 1.4× the
+    /// interpreter on a `riscv-virt` Linux boot, against 0.5× for
+    /// [`JitHost`](Engine::JitHost). See `cpu::riscv::engine` for why.
+    ///
+    /// **The variant only exists in a build with `cpu-riscv-lift` and `jit`**,
+    /// so a build that cannot run this engine cannot be asked to and quietly
+    /// interpret instead — `from_props` refuses the property with a message
+    /// naming the features, and the Rust API does not compile. An engine that
+    /// silently is not the one you asked for is how a JIT stays unmeasured for
+    /// a year, which is what happened to this one.
+    #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "cpu-riscv-lift", feature = "jit"))))]
+    Jit,
+    /// [`Jit`](Engine::Jit), with the **host code generator** attached: the
+    /// same blocks from the same cache, lowered to machine code by
+    /// [`jit::x86`](crate::jit::x86).
+    ///
+    /// Falls back rather than refusing, unlike the features above: a build
+    /// without `jit-x86`, or a host that is not x86-64 Linux, runs the same
+    /// blocks on the portable backend and gets the same answers. That is the
+    /// difference between a configuration error and a portability property,
+    /// and they are treated differently on purpose.
+    ///
+    /// It is a **separate value rather than what `jit` does where it can**
+    /// because on this guest today it is the slower of the two, by a factor of
+    /// three, and a knob that silently picks the slower one is not a knob
+    /// anybody can measure with. The overhead is per-instruction bookkeeping
+    /// over four-instruction blocks rather than the code emitted; when that is
+    /// collapsed this becomes the obvious default, and it stays selectable
+    /// from one binary in the meantime — which is what made the comparison
+    /// above possible at all.
+    #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "cpu-riscv-lift", feature = "jit"))))]
+    JitHost,
+}
+
+#[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
+impl Engine {
+    /// Whether this engine runs blocks through the translation runtime.
+    fn translates(self) -> bool {
+        matches!(self, Engine::Jit | Engine::JitHost)
+    }
+}
+
 /// Everything the interpreter mutates, behind one lock.
 #[derive(Debug)]
 struct Session {
@@ -298,6 +370,14 @@ struct Session {
     /// state, so it lives here beside `space` instead of in `state`: `reset`
     /// replaces `state`, and a reset must not unplug the clock.
     time_src: Option<Arc<AtomicU64>>,
+    /// The translation runtime, on a hart configured for it.
+    ///
+    /// Built on the first run rather than in `new`, because `new` performs no
+    /// outward action (`ROADMAP.md` §4.4) and mapping a code buffer is one.
+    /// Derived state throughout: never serialized, dropped by a reset and by a
+    /// snapshot restore.
+    #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
+    jit: Option<Box<engine::Jit>>,
 }
 
 /// One RISC-V hart.
@@ -313,6 +393,13 @@ struct Session {
 #[derive(Debug)]
 pub struct Hart {
     cfg: Config,
+    /// Which execution engine this hart runs on.
+    ///
+    /// Not in [`Config`] and not in the snapshot: it is neither architectural
+    /// state nor something a lifted block's cache key may depend on, and a
+    /// snapshot taken under one engine must restore under the other
+    /// (`ROADMAP.md` phase 7's gate).
+    engine: Engine,
     /// The instance named by `timer = …`, if a machine file named one. Held as
     /// a path rather than a handle because two-phase construction forbids
     /// reaching a sibling from `new`; it is resolved at bind, through
@@ -365,6 +452,7 @@ impl Hart {
             cfg.ext.f = true;
         }
         Hart {
+            engine: Engine::Interp,
             timer: None,
             lines: Arc::new(Lines::default()),
             session: sync::Mutex::with_rank(
@@ -374,6 +462,8 @@ impl Hart {
                     tlb: Tlb::new(),
                     space: None,
                     time_src: None,
+                    #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
+                    jit: None,
                 },
             ),
             exits: AtomicU32::new(ExitMask::NONE.bits()),
@@ -404,9 +494,11 @@ impl Hart {
         let misaligned = r.or("misaligned", true)?;
         let supervisor = r.or("supervisor", true)?;
         let user = r.or("user", true)?;
-        // Accepted, and for now only one value is: `ROADMAP.md` §5's example
-        // writes `engine = "interp"`, and the IR frontend is phase 5.
-        let _ = r.or_enum("engine", "interp", &["interp"])?;
+        // Both values are named in every build, so a machine file validates
+        // the same everywhere and a build that cannot run one says *why*
+        // rather than "expected one of `interp`".
+        let want = r.or_enum("engine", "interp", &["interp", "jit", "jit-host"])?;
+        let want_jit = want != "interp";
         // Validated here, resolved at bind: `new` allocates and checks, and
         // performs no outward action at all (`ROADMAP.md` §4.4).
         let timer = r.optional_link("timer")?.map(|l| String::from(l.as_str()));
@@ -443,6 +535,35 @@ impl Hart {
                 }
             }
         }
+        #[cfg(not(all(feature = "cpu-riscv-lift", feature = "jit")))]
+        if want_jit {
+            return Err(Error::Property(String::from(
+                "`engine = \"jit\"` needs a build with the `cpu-riscv-lift` and `jit` \
+                 features; this one has only the interpreter. Refused rather than \
+                 interpreted silently, because an engine that is not the one you asked \
+                 for is a measurement that quietly means nothing",
+            )));
+        }
+        #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
+        let engine = if want_jit {
+            if !matches!(xlen, Xlen::Rv64) {
+                return Err(Error::Property(String::from(
+                    "`engine = \"jit\"` is RV64 only: the IR frontend refuses an RV32 \
+                     configuration outright rather than silently mis-widening \
+                     (`cpu::riscv::lift`). Use `engine = \"interp\"` for an RV32 hart",
+                )));
+            }
+            if want == "jit-host" {
+                Engine::JitHost
+            } else {
+                Engine::Jit
+            }
+        } else {
+            Engine::Interp
+        };
+        #[cfg(not(all(feature = "cpu-riscv-lift", feature = "jit")))]
+        let engine = Engine::Interp;
+
         let mut hart = Hart::new(Config {
             xlen,
             ext,
@@ -452,8 +573,41 @@ impl Hart {
             misaligned,
             requester: RequesterId::ANONYMOUS,
         });
+        hart.engine = engine;
         hart.timer = timer;
         Ok(hart)
+    }
+
+    /// The same hart, running on `engine`.
+    ///
+    /// A consuming builder because an engine is chosen when a hart is built,
+    /// like every other construction property; a machine file says
+    /// `engine = "jit"` and reaches the same place through
+    /// [`from_props`](Hart::from_props).
+    #[must_use]
+    pub fn with_engine(mut self, engine: Engine) -> Hart {
+        self.engine = engine;
+        self
+    }
+
+    /// Which execution engine this hart runs on.
+    #[must_use]
+    pub fn engine(&self) -> Engine {
+        self.engine
+    }
+
+    /// Blocks executed and blocks executed as *host code*, on a hart running a
+    /// JIT engine that has run at least once.
+    ///
+    /// A statistic and never a behaviour — the engines are indistinguishable
+    /// to the guest — but a backend whose coverage is unmeasured is a backend
+    /// whose coverage rots, and this is what tells `jit` and `jit-host`
+    /// apart.
+    #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "cpu-riscv-lift", feature = "jit"))))]
+    #[must_use]
+    pub fn jit_stats(&self) -> Option<(u64, u64)> {
+        self.session.lock().jit.as_ref().map(|jit| jit.stats())
     }
 
     /// This hart's configuration.
@@ -547,6 +701,10 @@ impl Hart {
         let mut session = self.session.lock();
         session.state.csrs = csrs;
         session.tlb.flush();
+        #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
+        if let Some(jit) = session.jit.as_mut() {
+            jit.flush();
+        }
     }
 
     /// Bus accesses charged since reset.
@@ -665,6 +823,7 @@ impl Hart {
             tlb,
             space,
             time_src,
+            ..
         } = &mut *session;
         if let Some(timer) = time_src {
             // Relaxed: `mtime` is a standalone counter, and nothing else the
@@ -679,11 +838,62 @@ impl Hart {
         (used, exec.take_exit())
     }
 
+    /// Advance the hart by one *unit of the configured engine*: one
+    /// instruction under `Engine::Interp`, one translated block — or one
+    /// instruction, where a block would be wrong — under either JIT engine.
+    ///
+    /// `remaining` is what is left of the caller's budget, and it is not
+    /// advisory: a block whose worst case does not fit is not run, so that
+    /// a hart stops on the same instruction whichever engine drives it. See
+    /// `engine`'s module documentation for why that matters as far as the
+    /// machine's state hash.
+    fn advance(&self, remaining: u64) -> (u64, Option<Exit>) {
+        #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
+        if self.engine.translates() {
+            let cfg = self.effective_config();
+            let exits = self.exit_mask();
+            let mut session = self.session.lock();
+            if self.lines.take_reset_request() {
+                session.state = State::new(&cfg);
+                session.tlb.flush();
+                if let Some(jit) = session.jit.as_mut() {
+                    jit.flush();
+                }
+            }
+            if session.jit.is_none() {
+                session.jit = Some(Box::new(engine::Jit::new(self.engine == Engine::JitHost)));
+            }
+            let Session {
+                state,
+                tlb,
+                space,
+                time_src,
+                jit,
+            } = &mut *session;
+            if let Some(timer) = time_src {
+                state.csrs.mtime = timer.load(Ordering::Relaxed);
+            }
+            let Some(space) = space.clone() else {
+                return (0, None);
+            };
+            let jit = jit.as_mut().expect("just installed");
+            return engine::advance(jit, state, tlb, &space, &cfg, &self.lines, exits, remaining);
+        }
+        let _ = remaining;
+        self.step_to_exit()
+    }
+
     /// Execute until at least `budget` accesses have been charged.
+    ///
+    /// On the configured engine, so a hart running a JIT engine runs blocks
+    /// here as it does under the scheduler. Unlike
+    /// [`run_budget`](Hart::run_budget) this carries no debt: it is the plain
+    /// "run about this much" helper, and the overrun is in the number it
+    /// returns.
     pub fn run(&self, budget: u64) -> u64 {
         let mut used = 0;
         while used < budget {
-            let n = self.step();
+            let (n, _) = self.advance(budget - used);
             if n == 0 {
                 break;
             }
@@ -712,7 +922,7 @@ impl Hart {
         let allowance = ticks - owed;
         let mut used = 0u64;
         while used < allowance {
-            let n = self.step();
+            let (n, _) = self.advance(allowance - used);
             if n == 0 {
                 break;
             }
@@ -767,7 +977,7 @@ impl Hart {
         let allowance = ticks - owed;
         let mut used = 0u64;
         while used < allowance {
-            let (n, exit) = self.step_to_exit();
+            let (n, exit) = self.advance(allowance - used);
             if n == 0 {
                 break;
             }
@@ -924,7 +1134,9 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "engine",
             kind: ValueKind::Str,
             required: false,
-            summary: "which execution engine; only `interp` exists until phase 5",
+            summary: "which execution engine: `interp`, `jit` (the translation runtime), \
+                      or `jit-host` (the same, with the host code generator). Both JIT \
+                      values are RV64 only and need `cpu-riscv-lift` and `jit`",
         },
         PropertySpec {
             name: "timer",
@@ -1022,6 +1234,12 @@ impl Device for Hart {
         let mut session = self.session.lock();
         session.state = State::new(&cfg);
         session.tlb.flush();
+        // Translations are derived state and a reset is a topology-free way to
+        // change every byte in RAM (`ROADMAP.md` §4.5).
+        #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
+        if let Some(jit) = session.jit.as_mut() {
+            jit.flush();
+        }
         drop(session);
         if kind == ResetKind::Cold {
             // A cold start has nothing driving the interrupt pins yet. A warm
@@ -1159,8 +1377,14 @@ impl Device for Hart {
         let mut session = self.session.lock();
         session.state = s;
         // The TLB is derived state and is never restored: it comes back empty,
-        // which is always correct (`ROADMAP.md` §4.5).
+        // which is always correct (`ROADMAP.md` §4.5). So are the
+        // translations, which is half of why a snapshot is interchangeable
+        // between any two engines: there is nothing engine-specific in it.
         session.tlb.flush();
+        #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
+        if let Some(jit) = session.jit.as_mut() {
+            jit.flush();
+        }
         drop(session);
         self.lines.set_all_pending(pending);
         Ok(())
@@ -1256,7 +1480,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("misaligned", ValueKind::Bool))
         .prop(PropSchema::new("supervisor", ValueKind::Bool))
         .prop(PropSchema::new("user", ValueKind::Bool))
-        .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
+        .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp", "jit", "jit-host"]))
         .prop(PropSchema::new("timer", ValueKind::Link))
         // Inputs only: a hart drives no line this core models.
         .port("meip", PortDir::In)
