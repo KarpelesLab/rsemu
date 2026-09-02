@@ -746,6 +746,46 @@ mod tests {
         u64::from(v.to_bits())
     }
 
+    /// `ROADMAP.md` §9.1, one level up.
+    ///
+    /// `src/float` asserts that *its* sources contain no host floating point.
+    /// That is necessary and not sufficient: a core could compute a guest's
+    /// arithmetic in software and then reach for an `f64` anyway — to
+    /// normalise a comparison, to print an immediate, to take a square root
+    /// the subsystem does not expose — and a state hash would stop being
+    /// reproducible across hosts for exactly one instruction. So the same test
+    /// runs over the two files that carry the guest's floating point: this
+    /// one, and the interpreter that calls it.
+    ///
+    /// Comments and the test modules are excluded, because both may name the
+    /// host types freely — this file's own tests write their expectations as
+    /// `d(1.5)` precisely so they read as arithmetic.
+    #[test]
+    fn no_host_float_on_the_guest_path() {
+        let sources = [
+            ("fp.rs", include_str!("fp.rs")),
+            ("exec.rs", include_str!("exec.rs")),
+        ];
+        for (name, src) in sources {
+            // Everything from the test module down is exempt.
+            let body = src.split("#[cfg(test)]").next().unwrap_or(src);
+            for (n, line) in body.lines().enumerate() {
+                let code = match line.find("//") {
+                    Some(i) => &line[..i],
+                    None => line,
+                };
+                for needle in ["f16", "f32", "f64", "f128", "sqrtf", "libm"] {
+                    assert!(
+                        !code.contains(needle),
+                        "{name}:{}: `{needle}` on the guest path — guest \
+                         floating point must go through `crate::float`",
+                        n + 1
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_scalar_write_zeroes_the_rest_of_the_register() {
         let mut v = Vregs::new();
