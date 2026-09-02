@@ -17,6 +17,9 @@
 
 //! | `m68k` | `cpu-m68k` | MC68000 interpreter with a modelled prefetch queue, exceptions, disassembler |
 //! | `mips` | `cpu-mips` | MIPS I / R3000A interpreter: branch and load delay slots, CP0, the 64-entry TLB, disassembler |
+
+//! | `arm::a64` | `cpu-arm-a64` | AArch64 A64 integer interpreter: EL0/EL1, the VBAR_EL1 vector table, the VMSAv8-64 MMU, `FEAT_LSE`/`FEAT_CRC32` as instance properties |
+
 //!
 //! Every core ships an interpreter first; the IR frontend comes later and is
 //! differentially tested against it forever. **The interpreter is the oracle.**

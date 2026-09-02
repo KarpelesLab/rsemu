@@ -91,6 +91,45 @@ The shape it would take when it is wanted: build the generator **outside** this
 repository, dump its vector files into `$RSEMU_TESTDATA/testfloat/`, and add an
 env-gated runner that reads them. Nothing about `src/float` would change.
 
+### AArch64 has no fetchable instruction corpus either, and why
+
+`cpu/arm/a64` ships directed tests written from DDI 0487 and a board test that
+runs a real program, and **no downloaded corpus at all**. That is not an
+oversight, and the search behind it is worth recording so it is not repeated.
+
+* **SingleStepTests has no AArch64 suite.** The organisation covers 65x02, z80,
+  8088/8086, 80286, 80386, 68000, SPC700, V20 and r3000 — every one of them a
+  processor somebody could put on a bench with a logic analyser. AArch64 parts
+  are not single-steppable that way, and no corpus in that format exists for
+  one.
+* **Arm's Architecture Validation Suite is not public.** It is licensed to
+  implementers under agreement. There is no version of it we can fetch, and no
+  substitute Arm publishes.
+* **`rems-project/sail-arm`** is the formal model, generated from Arm's ASL. It
+  is permissively licensed and could legitimately be *run* — but running it
+  means building a Sail/OCaml toolchain, which is further outside the default
+  test path than `riscv-arch-test`'s clang requirement, and it produces a model
+  to differentially test against rather than a corpus to download.
+* **`kvm-unit-tests` has an arm64 target**, and it is GPL-2.0: run-only, like
+  every other row above marked so, and it gates a *machine* rather than a core.
+* **Built test binaries** are the realistic next step, exactly as
+  `riscv-arch-test` is built rather than vendored: `clang` targets
+  `aarch64-unknown-none` directly, and a small ELF per feature signalling pass
+  or fail through a `BRK` would cover the instruction set and the exception
+  model together. That needs the level-3 exit seam the core already has, plus a
+  loader, plus a toolchain in CI.
+
+Until then the honest description is the one `ROADMAP.md` §0 uses: a core with
+no suite is **untested**, not done. What exists in its place is (a) directed
+tests per instruction family written against the manual, with the
+`SP`/`XZR` distinction, the carry rule on subtraction, `DecodeBitMasks` and the
+translation walk each covered by a test that would fail if the rule were
+guessed; (b) a board test that assembles a real program — a loop, a stack, a
+supervisor call through the guest's own vector table, and a three-level
+translation-table hierarchy the guest builds and then executes through; and
+(c) a decode-table self-check that no two rows accept the same word and that
+every row is reachable.
+
 ## What each milestone is gated on
 
 Phase numbers live in [`../../ROADMAP.md`](../../ROADMAP.md) §13 and are not

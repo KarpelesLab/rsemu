@@ -9,13 +9,13 @@
 //! ARM is cut here **by profile rather than by architecture version**, because
 //! that is where the machine actually changes shape:
 //!
-//! | | [`aprofile`] | `v7m` |
-//! |---|---|---|
-//! | instruction sets | A32 and Thumb | Thumb-2 only |
-//! | registers | seven modes, banked | one bank, two stack pointers |
-//! | status | `CPSR`/`SPSR` | `xPSR` |
-//! | system regs | CP15, a coprocessor | a memory-mapped SCB |
-//! | exceptions | eight vectors at a fixed base | a relocatable NVIC table |
+//! | | [`aprofile`] | `v7m` | `a64` |
+//! |---|---|---|---|
+//! | instruction sets | A32 and Thumb | Thumb-2 only | A64 only |
+//! | registers | seven modes, banked | one bank, two stack pointers | 31, plus `SP`/`XZR` encodings |
+//! | status | `CPSR`/`SPSR` | `xPSR` | `PSTATE`, which is not a register |
+//! | system regs | CP15, a coprocessor | a memory-mapped SCB | a flat `op0:op1:CRn:CRm:op2` space |
+//! | exceptions | eight vectors at a fixed base | a relocatable NVIC table | sixteen slots at `VBAR_EL1` |
 //!
 //! Versions *within* a profile share all of that, so they share a core and
 //! differ by a construction property. ARMv6 adds ten things to ARMv5TE — media
@@ -42,7 +42,22 @@
 //! ARM1176JZF-S beside a Cortex-A8 in one binary. Features decide what is
 //! *compiled*; the configuration decides what an *instance* does.
 //!
+//! # And why AArch64 is a third module
+//!
+//! `ROADMAP.md` §6.1.1 anticipates exactly one more boundary — "a third
+//! appears only if AArch64 lands, which shares even less" — and that is what
+//! [`a64`] is. It is not "A-profile but wider": the register file, the
+//! instruction encoding, the status word, the system-register space, the
+//! exception model and the MMU all differ, and a `Version` spanning them would
+//! make an ARM926EJ-S build link a 64-bit four-level page-table walker. The
+//! lattice still applies *within* it — `FEAT_LSE` and `FEAT_CRC32` are
+//! per-instance flags, and a named part selects them.
+//!
 //! ROADMAP.md §6.1 and §6.1.1 carry the long form.
+
+#[cfg(feature = "cpu-arm-a64")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-a64")))]
+pub mod a64;
 
 #[cfg(feature = "cpu-arm-aprofile")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-aprofile")))]

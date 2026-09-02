@@ -1,7 +1,7 @@
 # ARM
 
 Consumed by: `cpu/arm/aprofile` (ARMv5TE today, ARMv6/ARMv7-A later),
-`cpu/arm/v7m` (ARMv7E-M, Cortex-M3/M4/M7), `cpu/aarch64` (ARMv8-A).
+`cpu/arm/v7m` (ARMv7E-M, Cortex-M3/M4/M7), `cpu/arm/a64` (ARMv8-A AArch64).
 
 ## Primary
 
@@ -46,4 +46,29 @@ secondary reference for the exception model.
   [`../platforms/stm32f407.md`](../platforms/stm32f407.md), which also records
   how a peripheral raises an interrupt when the NVIC has no wire of its own.
 - The A64 encoding is regular enough that a generated decoder from the manual's
-  encoding tables is straightforward — unlike x86.
+  encoding tables is straightforward — unlike x86. `cpu/arm/a64/isa.rs` is that
+  decoder: one `(mask, bits)` row per instruction, bucketed at compile time on
+  the top-level `op0` field (bits 28:25) that DDI 0487 C4.1 classifies on.
+- **AArch64 is a third core beside `aprofile` and `v7m`, not a variant of
+  either**, which is the boundary `ROADMAP.md` §6.1.1 anticipated and declined
+  to draw until it was needed. It shares neither the register file (31 plus two
+  *encodings* rather than 16 with the PC among them), the status word (`PSTATE`
+  is fields with no register; `CPSR` is a register), the system-register space
+  (a flat `op0:op1:CRn:CRm:op2` rather than CP15), the exception model
+  (`ELR_EL1`/`SPSR_EL1`/`ESR_EL1` and sixteen vector slots rather than banked
+  modes and eight vector *instructions*), nor the MMU. The lattice still applies
+  *within* it: `FEAT_LSE` and `FEAT_CRC32` are per-instance flags a named part
+  selects, and an absent one does not decode.
+- **The `SP`/`XZR` distinction is a property of the encoding, not of the
+  register number**, and it is the single easiest thing to get wrong: register
+  31 is the stack pointer in the base register of every load and store and in
+  `ADD`/`SUB` immediate and extended-register forms, and the zero register
+  everywhere else — including in `ADDS`, whose destination differs from `ADD`'s
+  for exactly this reason (DDI 0487 C1.2.5). In `cpu/arm/a64` it lives on the
+  operand *format*, so the interpreter and the disassembler cannot disagree
+  about it.
+- **`TG0` and `TG1` spell the 4 KiB granule differently** — `0b00` and `0b10`
+  respectively — and so do `TGran4` and `TGran16` in `ID_AA64MMFR0_EL1`, where
+  `0b0000` means *supported* in one field and *not supported* in the other. A
+  walker that works on the low half of the address space and not the high one
+  has usually tripped on the first of those.
