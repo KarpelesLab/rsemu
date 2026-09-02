@@ -378,6 +378,31 @@ impl Endpoint0 {
         }
     }
 
+    /// What the next data-stage `IN` would return, without taking it.
+    ///
+    /// The [`crate::core::space::MemAttrs::debug`] rule applied to the default
+    /// pipe: the outgoing bytes of a control transfer are already computed and
+    /// sitting in a buffer, so a debugger may see them, and seeing them must
+    /// not advance the offset. [`Completion::nak`] when there is no data stage
+    /// in progress, which is the same answer a real device gives a host that
+    /// asks too early.
+    ///
+    /// Public because [`Peripheral`] is not the only [`UsbDevice`] built out of
+    /// an [`Endpoint0`]: a hub answers its own class requests here and dispatches
+    /// its status-change endpoint itself, so it needs the same debug path
+    /// without reaching into this module's private state.
+    #[must_use]
+    pub fn peek(&self, dst: &mut [u8]) -> Completion {
+        let state = self.state.lock();
+        if state.stalled || state.stage != Stage::DataIn {
+            return Completion::nak();
+        }
+        let remaining = state.buffer.len().saturating_sub(state.offset);
+        let n = remaining.min(dst.len());
+        dst[..n].copy_from_slice(&state.buffer[state.offset..state.offset + n]);
+        Completion::ack(n as u64)
+    }
+
     /// Everything a snapshot needs, written in the class's own chunk.
     ///
     /// # Errors
@@ -695,14 +720,7 @@ impl UsbDevice for Peripheral {
         if endpoint == 0 {
             // The control pipe's outgoing bytes are known without consuming
             // anything, so a debugger may see them.
-            let state = self.ep0.state.lock();
-            if state.stalled || state.stage != Stage::DataIn {
-                return Completion::nak();
-            }
-            let remaining = state.buffer.len().saturating_sub(state.offset);
-            let n = remaining.min(dst.len());
-            dst[..n].copy_from_slice(&state.buffer[state.offset..state.offset + n]);
-            return Completion::ack(n as u64);
+            return self.ep0.peek(dst);
         }
         self.ep0.function().peek_in(endpoint, dst)
     }

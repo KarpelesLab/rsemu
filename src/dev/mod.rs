@@ -149,6 +149,7 @@ pub mod sd;
     feature = "dev-usb-dwc2",
     feature = "dev-usb-hid",
     feature = "dev-usb-msd",
+    feature = "dev-usb-hub",
     feature = "dev-usb-xhci"
 ))]
 #[cfg_attr(
@@ -159,6 +160,7 @@ pub mod sd;
         feature = "dev-usb-dwc2",
         feature = "dev-usb-hid",
         feature = "dev-usb-msd",
+        feature = "dev-usb-hub",
         feature = "dev-usb-xhci"
     )))
 )]

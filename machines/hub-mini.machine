@@ -1,0 +1,144 @@
+# hub-mini — `usb-mini` with a **hub** between the controller and the disk.
+#
+#   rsemu run hub-mini --media firmware=fw.bin --drive usb0=disk.img
+#
+# Deliberately `usb-mini` with one object inserted and one property changed: the
+# same hart, the same PLIC, the same EHCI, the same `usb.storage` and the same
+# medium behind it. What differs is that the disk is no longer on a root port —
+# it is on **port 2 of a hub**, which is on the root port — so the sector the
+# guest reads has to travel through a tier the flat port list of the old fabric
+# could not have expressed.
+#
+# ---------------------------------------------------------------------------
+# What the second bus is for
+# ---------------------------------------------------------------------------
+#
+# A hub's downstream ports *are* a USB bus: they carry connect, enable, reset
+# and speed exactly as root ports do, and a device behind a hub is found by the
+# same rule that finds a device in front of one. So the hub names one —
+# `downstream = "usb-down"` — and the disk plugs into it by name, the way every
+# other device in this tree finds its controller. Neither object mentions the
+# other, which is the point: the machine file is the only place the topology
+# exists.
+#
+# The disk sits at **port 1 of that bus**, not port 0, because the hub class
+# requests of USB 2.0 §11.24.2 number ports from **one** while the fabric
+# indexes them from zero. A disk on port 0 would make the two numberings agree
+# by accident and hide a conversion bug; on port 1 the firmware has to ask about
+# hub port 2, and it does.
+#
+# ---------------------------------------------------------------------------
+# Why everything here is high speed
+# ---------------------------------------------------------------------------
+#
+# The hub is high speed because an EHCI drives nothing else (EHCI 1.0 §4.2), and
+# the disk is high speed because **this hub has no transaction translator**: its
+# requests are answered, since a high-speed hub is required to have one, but the
+# split-transaction data path is not built. A full-speed disk here would connect,
+# report its speed honestly, and leave the port disabled — which is the same
+# refusal a full-speed device gets on a bare EHCI root port, moved to the port
+# where it belongs. `src/dev/usb/hub.rs` says so at length.
+#
+# The hub has four ports and three of them are empty, because a hub with one
+# port is not a hub and because an empty port has to report *nothing* rather
+# than report badly.
+
+machine "hub-mini" {
+  # How much ROM the firmware image gets, and how much RAM there is for the
+  # schedule, the buffers and the disk's data.
+  param rom  = 64K
+  param ram  = 1M
+
+  # How big the disk is when the run does not supply an image. A medium
+  # installed under the `usb0` slot (`--drive usb0=disk.img`) wins over this
+  # and brings its own capacity.
+  param capacity = 1M
+
+  # Bytes in a logical block.
+  param block = 512
+
+  # Where the register block sits.
+  param ehci_at = 0xf0000000
+
+  # -- the crystals ----------------------------------------------------------
+  osc sysclk = 100000000 Hz
+  osc usbclk = 60000000 Hz
+
+  # -- the one address space -------------------------------------------------
+  space mem { width = 32 }
+
+  # -- the processor ---------------------------------------------------------
+  object cpu "cpu.riscv" {
+    clock  = sysclk
+    space  = mem
+    engine = "interp"
+    xlen   = "rv32"
+    isa    = "ima"
+    hartid = 0
+    reset  = 0x00000000
+  }
+
+  # -- memory ----------------------------------------------------------------
+  object fw   "rom" { size = rom, image = "firmware" }
+  object dram "ram" { size = ram }
+
+  # -- the interrupt controller ---------------------------------------------
+  object plic "riscv.plic" {
+    sources    = 8
+    harts      = 1
+    supervisor = false
+  }
+
+  # -- the host controller ---------------------------------------------------
+  #
+  # `space = mem` because it is a bus master: its queue heads, its transfer
+  # descriptors and its data buffers are all in this board's RAM.
+  object ehci "usb.ehci" {
+    clock      = usbclk
+    space      = mem
+    bus        = "usb"
+    ports      = 1
+    microframe = 7500
+  }
+
+  # -- the hub ---------------------------------------------------------------
+  #
+  # It masters nothing and has no register block: everything it does, it does by
+  # answering control transfers the controller issues to it, which is why there
+  # is no `space` here and no `map` line below. What it *has* that no other
+  # device model here has is a second bus.
+  object hub "usb.hub" {
+    bus        = "usb"
+    port       = 0
+    downstream = "usb-down"
+    ports      = 4
+    speed      = "high"
+  }
+
+  # -- the disk --------------------------------------------------------------
+  #
+  # Behind the hub. `bus = "usb-down"` is the only line that says so.
+  object disk "usb.storage" {
+    bus   = "usb-down"
+    port  = 1
+    image = "usb0"
+    size  = capacity
+    block = block
+    speed = "high"
+  }
+
+  # -- the memory map --------------------------------------------------------
+  map mem 0x00000000 size rom      = fw
+  map mem 0x0c000000 size 0x400000 = plic
+  map mem 0x10000000 size ram      = dram
+  map mem ehci_at    size 256      = ehci
+
+  # -- the wire --------------------------------------------------------------
+  #
+  # As `usb-mini`: the controller's level interrupt into the PLIC, and the
+  # PLIC's `meip0` into the hart. The hub adds nothing here — it has no
+  # interrupt output, because a hub reports what changed on an endpoint the host
+  # polls (USB 2.0 §11.12.4) and not on a wire.
+  wire ehci.irq   -> plic.irq1
+  wire plic.meip0 -> cpu.meip
+}

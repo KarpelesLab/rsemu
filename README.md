@@ -195,6 +195,23 @@ event TRBs, and acknowledging one is three writes in the order the specification
 fixes; the test counts the guest's traps and asserts fifteen, because the wrong
 order measures thirty.
 
+`hub-mini` is `usb-mini` again with one object inserted: a **USB hub** between
+the controller and the disk. A hub is the first device here whose interesting
+half is not what it says about itself but *where other things are* — and it is
+not a router, because the address on the wire is flat and a hub never looks at
+it. What makes a device behind one reachable is the host powering, resetting and
+enabling the port it is on, through class requests it addresses to the hub like
+to anything else; so the hub's downstream ports are simply a **second named
+bus**, and the disk behind it is an ordinary object whose `bus` is that name.
+Neither mentions the other. The RV32 program enumerates the hub, reads its
+descriptor, powers a port, watches the connection appear *because* of the power,
+resets it, watches it enable — and then addresses and reads a disk that is on no
+root port at all, and moves a sector each way over its bulk endpoints, checked
+against the same `Medium::read_at`. What a hub here still cannot do is carry a
+*slow* device to a high-speed controller: that is the transaction translator,
+which is a second and larger deliverable, and the port says so by not enabling
+rather than by pretending.
+
 The framework underneath is complete: address spaces with priority and
 mirroring, an oscillator forest with exact intra-tree ratios, wires, devices,
 snapshots, a typed export seam so one device can hand another a handle, and a
