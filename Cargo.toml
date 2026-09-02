@@ -87,10 +87,39 @@ vnc = ["std"]
 display-png = ["std", "dep:oxideav-png"]
 
 # The browser demo (web/): the wasm exports the page calls, plus the machines it
-# offers — an NTSC NES with a picture and sound, and an Apple 1 on a terminal.
-# This is the feature set `web/README.md` builds; plain `wasm` stays minimal so
-# the CI wasm job keeps checking the boundary rather than the catalog.
-demo = ["wasm", "machine-nes", "dev-nes-ppu", "dev-nes-apu", "machine-apple1"]
+# offers. This is the feature set `web/README.md` builds; plain `wasm` stays
+# minimal so the CI wasm job keeps checking the boundary rather than the catalog.
+#
+# Four machines, and the selection rule is **what a visitor can actually run**:
+# three of them boot on an image compiled into the module, so the page has
+# something to press before it has a file to open.
+#
+#   nes-ntsc / nes-pal  the one machine worth a file picker: everyone knows what
+#                       a .nes is, it has a picture and it has sound.
+#   apple1              a console, RSMON built in, nothing to upload.
+#   beneater-6502       a serial console with *two* built-in monitors — RSMON,
+#                       and the public-domain Woz Monitor of 1976.
+#   spi-panel           a picture with nothing uploaded: its own RV32 program
+#                       paints a gradient through a real SPI display path, and
+#                       it is what keeps `host::display::lcd` exercised in a
+#                       browser rather than only in a PNG test.
+#
+# Deliberately absent, and each for a reason that would show on the page: the
+# Game Boy and the Master System need a cartridge nobody has to hand (and the
+# DMG has no `host::display` adapter at all, so it would draw nothing); the
+# bare boards — z80-mini, m68k-mini, mips-mini, arm926, stm32f407 — want a
+# firmware image and have neither a console nor a screen without one; riscv-virt
+# wants a kernel or an SBI build and is the single largest thing this list could
+# add; and the PC boards' BIOS is the user's to supply (ROADMAP.md §1).
+demo = [
+    "wasm",
+    "machine-nes",
+    "dev-nes-ppu",
+    "dev-nes-apu",
+    "machine-apple1",
+    "machine-beneater",
+    "machine-spi-panel",
+]
 
 # NES cartridges (src/dev/cart): iNES and NES 2.0 image parsing, the
 # `Cartridge` type, and NROM (iNES mapper 0) as a device that maps PRG ROM,

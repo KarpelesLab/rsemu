@@ -303,6 +303,7 @@ if (nes) {
   emu.load(state);
   check(emu.stateHash() === hash, "and loading the snapshot restores it");
 
+  check(emu.hasPad, "the NES has controllers to press");
   emu.setButtons(0, Rsemu.BUTTONS.start | Rsemu.BUTTONS.a);
   check(emu.buttons(0) === (Rsemu.BUTTONS.start | Rsemu.BUTTONS.a), "buttons are recorded");
   console.log(`  state hash: ${hash}, ${(emu.nowNs() / 1e6).toFixed(1)} ms of virtual time`);
@@ -313,12 +314,97 @@ if (apple1) {
   emu.boot(apple1.index, null);
   check(emu.running, "the Apple 1 boots with no file at all");
   check(emu.hasConsole, "it has a console");
+  check(!emu.hasPad, "and no controllers, so the page draws none");
   emu.runFrames(30);
   let text = decode(emu.consoleRead());
   emu.consoleWrite("\r");
   emu.runFrames(30);
   text += decode(emu.consoleRead());
   check(text.length > 0, `the monitor says something (${JSON.stringify(text.slice(0, 40))})`);
+  emu.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 2b. The images the module carries, and the machines that boot on them
+// ---------------------------------------------------------------------------
+//
+// This is the headline claim of the page — "press one button and you are
+// typing at a monitor" — so it is checked rather than asserted. Every built-in
+// image every machine offers is booted with **nothing uploaded**: no
+// `rsemu_input_reserve`, no file, no bytes crossing in at all.
+
+const withImages = machines.filter((m) => m.builtins.length > 0);
+console.log(
+  `  built-in images: ${
+    withImages.map((m) => `${m.name} [${m.builtins.map((b) => b.name).join(", ")}]`).join("; ") ||
+    "(none)"
+  }`,
+);
+check(withImages.length > 0, "at least one machine runs with no file at all");
+
+for (const m of withImages) {
+  for (const b of m.builtins) {
+    check(Boolean(b.name && b.summary && b.slot), `${m.name}/${b.name} describes itself`);
+    check(
+      m.media.length === 0 || m.builtins.every((i) => i.slot.length > 0),
+      `${m.name}/${b.name} names the slot it fills`,
+    );
+    emu.bootBuiltin(m.index, b.index);
+    check(emu.running, `${m.name} boots on ${b.name} with nothing uploaded`);
+    check(
+      emu.hasVideo || emu.hasConsole,
+      `${m.name} on ${b.name} has something to look at (video ${emu.hasVideo}, console ${emu.hasConsole})`,
+    );
+    if (emu.hasVideo) {
+      // The ABI promises RGBA whatever the display adapter would rather
+      // produce, and `ImageData` would tear the picture apart otherwise.
+      check(
+        instance.exports.rsemu_frame_len() === emu.width * emu.height * 4,
+        `${m.name}'s framebuffer is four bytes a pixel`,
+      );
+      let drew = 0;
+      for (let i = 0; i < 240; i++) if (emu.runFrame()) drew++;
+      const px = emu.bytes(
+        instance.exports.rsemu_frame_ptr(),
+        instance.exports.rsemu_frame_len(),
+      );
+      const seen = new Set();
+      for (let i = 0; i < px.length; i += 4) seen.add((px[i] << 16) | (px[i + 1] << 8) | px[i + 2]);
+      check(drew > 0, `${m.name} on ${b.name} produced ${drew} frames`);
+      check(px.every((v, i) => i % 4 !== 3 || v === 255), `${m.name}'s picture is opaque`);
+      check(seen.size > 1, `${m.name} on ${b.name} drew ${seen.size} colours, not one flat one`);
+    }
+    emu.shutdown();
+  }
+}
+
+// And the one that is the whole point: Woz's monitor of 1976, answering in the
+// browser build. The bytes it prints are the ones the Apple-1 Operation
+// Manual's own listing holds at $FF00 — nobody at rsemu chose them — and
+// `src/dev/wdc/tests.rs` asserts the same transcript one layer down.
+const beneater = machines.find((m) => m.name === "beneater-6502");
+const wozmon = beneater?.builtins.find((b) => b.name === "wozmon");
+if (beneater && wozmon) {
+  emu.bootBuiltin(beneater.index, wozmon.index);
+  check(emu.running && emu.hasConsole, "beneater-6502 boots the Woz Monitor, nothing uploaded");
+  emu.runFrames(30);
+  check(decode(emu.consoleRead()) === "\\\n", "it greets with a backslash, as it did in 1976");
+  emu.consoleWrite("FF00.FF0F\r");
+  emu.runFrames(90);
+  const dump = decode(emu.consoleRead());
+  check(
+    dump.includes("FF00: D8 58 A0 7F A9 1F 8D 03"),
+    `examining $FF00 prints the manual's own bytes (${JSON.stringify(dump.slice(-30))})`,
+  );
+  emu.consoleWrite("0300: AA BB CC\r");
+  emu.runFrames(90);
+  emu.consoleWrite("0300.0302\r");
+  emu.runFrames(90);
+  check(
+    decode(emu.consoleRead()).includes("0300: AA BB CC"),
+    "and depositing three bytes reads them back",
+  );
+  console.log(`  state hash after the Wozmon session: ${emu.stateHash()}`);
   emu.shutdown();
 }
 
@@ -424,6 +510,23 @@ if (nes) {
   driver.key(press({ code: "ArrowLeft", key: "ArrowLeft" }), true);
   driver.releaseAll();
   check(driver.emu.buttons(0) === 0, "and losing focus never leaves a button stuck down");
+}
+
+// The page's own path to a built-in image: `session.boot(entry, null, image)`,
+// which is what the idle screen's one-click buttons call.
+if (beneater && wozmon) {
+  driver.boot(beneater, null, wozmon);
+  driver.consoleFocused = true;
+  spin(500);
+  for (const key of ["F", "F", "0", "0", ".", "F", "F", "0", "F", "Enter"]) {
+    driver.key(press({ key }), true);
+  }
+  spin(1200);
+  check(
+    consoleSeen.includes("FF00: D8 58 A0 7F A9 1F 8D 03"),
+    `the driver types at Wozmon and it answers (${JSON.stringify(consoleSeen.slice(-32))})`,
+  );
+  driver.shutdown();
 }
 
 if (apple1) {

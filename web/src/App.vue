@@ -7,7 +7,7 @@
 // frame loop and the framebuffer sixty times a second. What crosses back into
 // Vue is a handful of numbers and one string.
 
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import { Session } from "./session.js";
 import ScreenView from "./components/ScreenView.vue";
 import TerminalView from "./components/TerminalView.vue";
@@ -23,6 +23,11 @@ const fatal = ref("");
 const version = ref("");
 const machines = shallowRef([]);
 const chosen = ref(0);
+// Which image the next boot binds: an index into this machine's built-in
+// images, or FROM_FILE for one the visitor opens. A number rather than an
+// object, because it is a `v-model` on a radio group.
+const FROM_FILE = -1;
+const image = ref(FROM_FILE);
 
 // The ROM image is a Uint8Array of up to a few megabytes and must never become
 // a Proxy; only its name and size are of any interest to the UI.
@@ -30,9 +35,16 @@ let romBytes = null;
 const rom = ref(null); // { name, size } | null
 
 const booted = ref(false);
+// What is actually running, as opposed to what the picker is showing. The
+// console pane needs it: RSMON and the Woz Monitor take different commands.
+const running = ref(null);
 const paused = ref(true);
 const hasVideo = ref(false);
 const hasConsole = ref(false);
+// Whether the machine has controllers, which is not the same as having a
+// picture: a display panel with no game pad would otherwise get a d-pad drawn
+// for hardware it does not have.
+const hasPad = ref(false);
 const consoleText = ref("");
 const held = ref(0);
 const status = ref({ text: "Loading the module…", error: false });
@@ -72,14 +84,40 @@ const terminal = ref(null);
 // out an index and that is what the option value carries — look it up.
 const entry = computed(() => machines.value.find((m) => m.index === chosen.value) ?? null);
 const needsMedia = computed(() => Boolean(entry.value?.media));
-const canBoot = computed(
-  () => phase.value === "ready" && entry.value !== null && (!needsMedia.value || rom.value !== null),
+// The images the module carries for this machine. A machine with at least one
+// runs with nothing uploaded, which is the only thing a first-time visitor
+// really wants to know about it.
+const builtins = computed(() => entry.value?.builtins ?? []);
+const fromFile = computed(() => image.value === FROM_FILE);
+const chosenImage = computed(() => (fromFile.value ? null : (builtins.value[image.value] ?? null)));
+const canBoot = computed(() => {
+  if (phase.value !== "ready" || entry.value === null) return false;
+  if (!fromFile.value) return chosenImage.value !== null;
+  return !needsMedia.value || rom.value !== null;
+});
+
+// Every (machine, image) pair in this build that runs with no file at all —
+// read out of the ABI, never a list kept by hand here. This is what the idle
+// screen offers, so the first thing a visitor can do is press one button.
+const quickStarts = computed(() =>
+  machines.value.flatMap((m) => m.builtins.map((b) => ({ machine: m, image: b }))),
 );
+
+// A machine picked from the catalog defaults to its own first image, so
+// changing the selection never leaves the page asking for a file it could have
+// supplied itself.
+watch(entry, (m) => {
+  image.value = m && m.builtins.length > 0 ? 0 : FROM_FILE;
+});
 
 const bootHint = computed(() => {
   const m = entry.value;
   if (!m) return "";
-  if (!m.media) return `${m.name} needs no file — it boots rsemu's own ROM.`;
+  const b = chosenImage.value;
+  if (b) {
+    return `${b.name} is compiled into this page — nothing to upload. It goes in the “${b.slot}” slot: ${b.summary}.`;
+  }
+  if (!m.media) return `${m.name} takes no image at all.`;
   return rom.value
     ? `${rom.value.name} · ${bytes(rom.value.size)} ready for the “${m.media}” slot.`
     : `${m.name} loads a file into its “${m.media}” slot. Choose one, or drop it on the page.`;
@@ -134,10 +172,11 @@ onMounted(async () => {
     return;
   }
 
-  // Default to a machine that needs no file, so a first-time visitor has
-  // something to press rather than a file picker to satisfy.
-  const free = machines.value.find((m) => !m.media);
+  // Default to a machine that runs with nothing uploaded, so a first-time
+  // visitor has something to press rather than a file picker to satisfy.
+  const free = machines.value.find((m) => m.builtins.length > 0 || !m.media);
   chosen.value = (free ?? machines.value[0]).index;
+  image.value = entry.value?.builtins.length ? 0 : FROM_FILE;
 
   soundSupported.value = session.soundSupported;
   soundWanted.value = session.soundWanted;
@@ -159,24 +198,46 @@ function onCanvas(canvas) {
   session.attach(canvas);
 }
 
-async function boot() {
-  const m = entry.value;
+/** Boot the machine and image the picker is showing. */
+function boot() {
+  return bootWith(entry.value, chosenImage.value);
+}
+
+/**
+ * Boot `m` on `b`, or on the file the visitor opened when `b` is null.
+ *
+ * Takes both explicitly rather than reading the picker, so the idle screen's
+ * buttons do not depend on a `watch` having run first.
+ */
+async function bootWith(m, b) {
   try {
-    session.boot(m, romBytes);
+    session.boot(m, romBytes, b);
   } catch (e) {
     say(String(e?.message ?? e), true);
     return;
   }
   booted.value = true;
+  running.value = { machine: m, image: b };
   hasVideo.value = session.hasVideo;
   hasConsole.value = session.hasConsole;
-  say(`${m.name} running${rom.value ? ` — ${rom.value.name}` : ""}.`);
+  hasPad.value = session.hasPad;
+  const on = b ? ` on ${b.name}` : rom.value ? ` — ${rom.value.name}` : "";
+  say(`${m.name} running${on}.`);
   // A console machine is useless until it has focus, and asking the visitor to
   // discover that is a worse page than just giving it to them.
   if (session.hasConsole && !session.hasVideo) {
     await nextTick();
     terminal.value?.focus();
   }
+}
+
+/** One of the idle screen's "nothing to upload" buttons. */
+async function quickStart(start) {
+  await bootWith(start.machine, start.image);
+  // Leave the picker showing what is running, so Reboot means what it says.
+  chosen.value = start.machine.index;
+  await nextTick();
+  image.value = start.image.index;
 }
 
 function toggleRun() {
@@ -216,8 +277,10 @@ function onVolume(event) {
 function eject() {
   session.shutdown();
   booted.value = false;
+  running.value = null;
   hasVideo.value = false;
   hasConsole.value = false;
+  hasPad.value = false;
   say("Machine shut down.");
 }
 
@@ -227,6 +290,9 @@ async function takeFile(file) {
   if (!file) return;
   romBytes = new Uint8Array(await file.arrayBuffer());
   rom.value = { name: file.name, size: romBytes.length };
+  // Opening a file is a choice: switch the picker to it, or the next Boot
+  // would quietly run a built-in image instead of what was just dropped.
+  if (needsMedia.value) image.value = FROM_FILE;
   say(`${file.name}: ${bytes(romBytes.length)} read. Nothing was uploaded.`);
 }
 
@@ -261,7 +327,8 @@ function saveState() {
   const url = URL.createObjectURL(new Blob([snapshot], { type: "application/octet-stream" }));
   const a = document.createElement("a");
   a.href = url;
-  a.download = `${entry.value.name}-${new Date().toISOString().replace(/[:.]/g, "-")}.rsemustate`;
+  const name = running.value?.machine.name ?? "rsemu";
+  a.download = `${name}-${new Date().toISOString().replace(/[:.]/g, "-")}.rsemustate`;
   a.click();
   URL.revokeObjectURL(url);
   say(`Saved ${bytes(snapshot.length)} at state hash ${stats.value.hash}. Nothing was uploaded.`);
@@ -295,8 +362,10 @@ function onStatePicked(event) {
       <div class="brand">
         <h1>rsemu<span class="brand-dim"> in the browser</span></h1>
         <p class="tagline">
-          A whole emulated machine, client-side. Nothing is uploaded: the ROM you pick is
-          read by the page, and a save state is a file this tab writes.
+          A whole emulated machine, client-side. Several boot on ROMs compiled into this
+          page &mdash; including the Woz Monitor of 1976 &mdash; so there is something to
+          press before there is anything to open. Nothing is uploaded either way: a
+          cartridge you pick is read here, and a save state is a file this tab writes.
         </p>
       </div>
       <p class="build mono" :title="version || 'loading'">{{ version || "loading…" }}</p>
@@ -308,7 +377,7 @@ function onStatePicked(event) {
       <!-- ------------------------------------------------ the viewport -->
       <section class="viewport panel" aria-label="Machine display">
         <div class="panel-title">
-          <span>{{ booted ? entry.name : "display" }}</span>
+          <span>{{ booted ? running.machine.name : "display" }}</span>
           <span v-if="booted && hasVideo" class="aspect">
             <label class="sr-only" for="aspect">Pixel aspect</label>
             <select id="aspect" v-model="aspect" class="mini">
@@ -334,13 +403,47 @@ function onStatePicked(event) {
             ref="terminal"
             :text="consoleText"
             :live="booted && !paused"
+            :monitor="running?.image?.name ?? ''"
             @focus="session.consoleFocused = true"
             @blur="session.consoleFocused = false"
           />
 
-          <div v-if="!booted" class="idle">
+          <!-- A machine with neither a picture nor a console would otherwise
+               be a black rectangle claiming to be a computer. -->
+          <div v-if="booted && !hasVideo && !hasConsole" class="idle">
             <p class="idle-mark" aria-hidden="true">▮</p>
             <p class="hint">
+              {{ running.machine.name }} is running, and this build has no way to look at it: no
+              display device and no console. The state hash and the clock on the right are
+              still the machine's own.
+            </p>
+          </div>
+
+          <div v-if="!booted" class="idle">
+            <p class="idle-mark" aria-hidden="true">▮</p>
+            <template v-if="quickStarts.length">
+              <p class="hint">
+                Nothing to upload &mdash; these boot on images compiled into this page.
+              </p>
+              <ul class="starts">
+                <li v-for="s in quickStarts" :key="`${s.machine.name}/${s.image.name}`">
+                  <button
+                    class="btn start"
+                    type="button"
+                    :disabled="phase !== 'ready'"
+                    @click="quickStart(s)"
+                  >
+                    <span class="start-name mono">{{ s.machine.name }} · {{ s.image.name }}</span>
+                    <span class="start-note">{{ s.image.summary }}</span>
+                  </button>
+                </li>
+              </ul>
+              <p class="hint">
+                Or pick any machine on the right &mdash; a cartridge is a file you open, and
+                it is read here rather than sent anywhere.
+              </p>
+            </template>
+            <p v-else class="hint">
               No machine is running. Pick one and press <strong>Boot</strong>.
             </p>
           </div>
@@ -365,15 +468,31 @@ function onStatePicked(event) {
               </select>
             </div>
 
+            <fieldset v-if="builtins.length || needsMedia" class="images">
+              <legend>Boot on</legend>
+              <label v-for="b in builtins" :key="b.name" class="choice">
+                <input type="radio" :value="b.index" v-model.number="image" />
+                <span class="choice-name mono">{{ b.name }}</span>
+                <span class="choice-note">{{ b.summary }}</span>
+              </label>
+              <label v-if="needsMedia" class="choice">
+                <input type="radio" :value="-1" v-model.number="image" />
+                <span class="choice-name">a file of your own</span>
+                <span class="choice-note">
+                  read here, never uploaded &mdash; it fills the &ldquo;{{ entry.media }}&rdquo;
+                  slot
+                </span>
+              </label>
+            </fieldset>
+
             <p class="hint">{{ bootHint }}</p>
 
-            <div class="row">
-              <label class="file" :class="{ off: !needsMedia }">
+            <div v-if="fromFile && needsMedia" class="row">
+              <label class="file">
                 <span>{{ rom ? "Change file" : "Choose file" }}</span>
                 <input
                   type="file"
                   accept=".nes,.bin,.rom,application/octet-stream"
-                  :disabled="!needsMedia"
                   aria-label="Cartridge or firmware image"
                   @change="onRomPicked"
                 />
@@ -447,7 +566,7 @@ function onStatePicked(event) {
                 click, and Boot is one.
               </template>
               <template v-else-if="!stats.hasAudio">
-                {{ entry.name }} has no audio device, so there is nothing to hear.
+                {{ running.machine.name }} has no audio device, so there is nothing to hear.
               </template>
               <template v-else-if="soundOn">
                 Playing at {{ soundRate }} Hz, resampled from the console's own crystal —
@@ -490,12 +609,12 @@ function onStatePicked(event) {
           </div>
         </section>
 
-        <section v-if="hasVideo || !booted" class="panel">
+        <section v-if="hasPad || !booted" class="panel">
           <h2 class="panel-title"><span>controller 1</span></h2>
           <div class="panel-body">
             <PadLegend
               :held="held"
-              :live="booted && hasVideo"
+              :live="booted && hasPad"
               @press="(bit) => session.setButton(bit, true)"
               @release="(bit) => session.setButton(bit, false)"
             />
@@ -511,6 +630,14 @@ function onStatePicked(event) {
         <code>wasm32-unknown-unknown</code> and driven from
         <code>requestAnimationFrame</code>. There is no <code>wasm-bindgen</code>: the
         module exports plain C functions and one file of glue is the entire boundary.
+      </p>
+      <p>
+        The machine list is not written here &mdash; a machine is a feature set, so this
+        page asks the module it fetched what is in it, and the same question gets the
+        images it carries. Those are rsemu's own monitors and one board's demonstration
+        firmware, plus Steve Wozniak's monitor of 1976, whose listing was published
+        without a copyright notice and is public domain. A cartridge is yours to supply,
+        which is why none is shipped here.
       </p>
       <p>
         The page deliberately does <em>not</em> need cross-origin isolation. Threaded
@@ -626,6 +753,85 @@ h1 {
   line-height: 1;
   color: var(--line-strong);
   animation: pulse 2.4s ease-in-out infinite;
+}
+
+/* -- the idle screen's one-click starts ------------------------------------ */
+
+.starts {
+  display: grid;
+  gap: 0.5rem;
+  width: min(34rem, 100%);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.start {
+  display: grid;
+  gap: 0.15rem;
+  width: 100%;
+  padding: 0.6rem 0.8rem;
+  text-align: left;
+}
+
+.start-name {
+  font-size: 0.9rem;
+  font-weight: 650;
+  color: var(--fg);
+}
+
+.start-note {
+  font-size: 0.78rem;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--fg-dim);
+}
+
+/* -- the image chooser ----------------------------------------------------- */
+
+.images {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+
+.images legend {
+  padding: 0 0.35rem;
+  font-size: 0.68rem;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+}
+
+.choice {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: 0.1rem 0.5rem;
+  cursor: pointer;
+}
+
+.choice input {
+  grid-row: span 2;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.choice-name {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.choice-note {
+  grid-column: 2;
+  font-size: 0.76rem;
+  color: var(--fg-dim);
 }
 
 @keyframes pulse {
