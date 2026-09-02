@@ -531,10 +531,15 @@ static I8086_REGS: &[RegDesc] = &[
 /// after the multiprocessor block. Appended, so nothing moved; and it is a
 /// model-specific register rather than one of the sixteen, so this map has
 /// nothing to grow.
+///
+/// And once more at chunk version 8, which appends the memory-type range
+/// registers after that. Twenty more model-specific registers, appended again,
+/// so nothing here moved and there is again nothing for a map of the sixteen
+/// core registers to grow.
 #[cfg(feature = "cpu-x86")]
 pub static I8086: Arch = Arch {
     class: &crate::cpu::x86::CLASS,
-    verified_version: 7,
+    verified_version: 8,
     feature: "org.rsemu.i386",
     architecture: None,
     regs: I8086_REGS,

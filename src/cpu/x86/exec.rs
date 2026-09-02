@@ -3451,6 +3451,9 @@ impl<'a> Exec<'a> {
         if features.sse2 {
             edx1 |= 1 << 26; // SSE2
         }
+        if features.mtrr {
+            edx1 |= 1 << 12; // MTRR: the memory-type range registers
+        }
 
         let xd_enabled = self.state.sys.misc_enable & super::prot::misc_enable::XD_DISABLE == 0;
         let signature = self.cfg.variant.reset_signature();

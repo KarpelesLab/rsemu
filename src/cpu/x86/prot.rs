@@ -685,6 +685,25 @@ pub mod msr {
     /// clears the execute-disable lock through it -- so a `#GP` for an
     /// unimplemented address becomes a triple fault with no output at all.
     pub const MISC_ENABLE: u32 = 0x1a0;
+    /// `IA32_MTRRCAP`: how many memory-type range registers there are and
+    /// which kinds.
+    ///
+    /// Read-only, and a `WRMSR` to it raises `#GP(0)`. See [`super::mtrr`] for
+    /// what this core reports and why the ranges are stored rather than obeyed.
+    pub const MTRRCAP: u32 = 0xfe;
+    /// `IA32_MTRR_PHYSBASE0`. The variable ranges are base/mask **pairs** at
+    /// consecutive addresses, so range `n` is at `0x200 + 2n` and `0x201 + 2n`.
+    pub const MTRR_PHYSBASE0: u32 = 0x200;
+    /// One past the last variable-range register, `IA32_MTRR_PHYSMASK7`.
+    pub const MTRR_PHYS_END: u32 = MTRR_PHYSBASE0 + 2 * super::mtrr::VCNT;
+    /// `IA32_MTRR_FIX64K_00000`: eight types for the first 512 KiB.
+    pub const MTRR_FIX64K: u32 = 0x250;
+    /// `IA32_MTRR_FIX16K_80000` and `_A0000`.
+    pub const MTRR_FIX16K: u32 = 0x258;
+    /// `IA32_MTRR_FIX4K_C0000` through `_F8000`: eight registers.
+    pub const MTRR_FIX4K: u32 = 0x268;
+    /// `IA32_MTRR_DEF_TYPE`: the type outside every range, and the two enables.
+    pub const MTRR_DEF_TYPE: u32 = 0x2ff;
     /// `IA32_EFER`.
     pub const EFER: u32 = 0xc000_0080;
     /// `IA32_STAR`.
@@ -764,6 +783,103 @@ pub mod misc_enable {
     /// The bits a `WRMSR` may set; anything else raises `#GP(0)`, as it does
     /// for the reserved bits of [`super::apic_base`].
     pub const WRITABLE: u64 = FAST_STRINGS | XD_DISABLE;
+}
+
+/// The memory-type range registers: what this core reports, and what it does
+/// with what a guest writes.
+///
+/// **Every long-mode part has these.** They are not an extension a machine
+/// description can plausibly leave out: the `MTRR` bit in `CPUID` leaf 1 has
+/// been set on every processor since the Pentium Pro, and firmware and
+/// operating systems both assume them. Linux is the concrete case — with the
+/// bit clear it reports `MTRRs disabled (not available)`, `pmd_set_huge` then
+/// refuses every 2 MiB mapping "due to MTRR override", and a kernel built with
+/// `CONFIG_DEBUG_VM_PGTABLE` warns twice on the way past. So
+/// [`Features::mtrr`](super::Features::mtrr) is part of the `x86-64` preset,
+/// and a part configured without it is one a machine file asked for.
+///
+/// # Stored and reported, not obeyed — and why that is honest here
+///
+/// [`misc_enable`]'s rule is that a bit controlling a feature this core does
+/// not have must be refused rather than stored, because a guest that sets one
+/// and believes it has been misled. A memory *type* is the case where storing
+/// is the whole truth rather than a shortcut, and the argument is worth writing
+/// down rather than assumed:
+///
+/// * A type says what the **cache** may do — combine writes, defer them,
+///   speculate a read, reorder against a neighbouring access.
+/// * This core has no cache. Every load and every store is one bus transaction,
+///   made in program order, reaching the device or the RAM immediately.
+/// * That behaviour satisfies `UC`, the strongest type, and `UC` is a legal
+///   implementation of every weaker one: `WB` permits a write to reach memory
+///   immediately, `WC` permits writes not to be combined, `WT` and `WP` are
+///   both stricter than they need to be here.
+///
+/// So the registers are architectural state that round-trips a snapshot, the
+/// reserved bits and the invalid types are refused exactly as hardware refuses
+/// them — which is what lets a guest probe — and no guest can construct an
+/// experiment that distinguishes the answer this core gives from a processor
+/// whose caches are all disabled. Add a cache model and these stop being
+/// storage; until then they are not a knob connected to nothing, they are a
+/// knob whose every setting the machine already honours.
+///
+/// *Intel SDM* volume 3A §12.11 ("Memory Type Range Registers"), tables 12-8
+/// through 12-10, and volume 4 Table 2-2 for the addresses.
+pub mod mtrr {
+    /// How many variable ranges this core has: the architectural maximum a
+    /// `VCNT` field can name in one nibble's worth of use, and what every part
+    /// since the Pentium Pro reports.
+    pub const VCNT: u32 = 8;
+
+    /// [`msr::MTRRCAP`](super::msr::MTRRCAP)'s value.
+    ///
+    /// `VCNT` = 8, `FIX` (bit 8) set because the eleven fixed-range registers
+    /// are implemented, `WC` (bit 10) set because write-combining is one of
+    /// the types a range may name, and `SMRR` (bit 11) clear because system
+    /// management mode is not implemented and a range that guarded it would
+    /// guard nothing.
+    pub const CAP: u64 = (VCNT as u64) | FIX | WC;
+
+    /// Bit 8 of [`CAP`]: the fixed-range registers exist.
+    pub const FIX: u64 = 1 << 8;
+    /// Bit 10 of [`CAP`]: write-combining is an available type.
+    pub const WC: u64 = 1 << 10;
+
+    /// Bit 10 of [`msr::MTRR_DEF_TYPE`](super::msr::MTRR_DEF_TYPE): the
+    /// fixed-range registers are consulted.
+    pub const DEF_FE: u64 = 1 << 10;
+    /// Bit 11: the whole mechanism is enabled. Clear out of reset, which is
+    /// what makes everything uncacheable until firmware has programmed the
+    /// ranges.
+    pub const DEF_E: u64 = 1 << 11;
+    /// The bits of `IA32_MTRR_DEF_TYPE` outside the type field. Anything else
+    /// is reserved and a write that sets one raises `#GP(0)`.
+    pub const DEF_WRITABLE: u64 = DEF_FE | DEF_E | 0xff;
+
+    /// Bit 11 of a `PHYSMASK` register: this range is in use.
+    pub const MASK_VALID: u64 = 1 << 11;
+
+    /// The physical-address field of a `PHYSBASE` or `PHYSMASK` register.
+    ///
+    /// Bits 12 up to the physical address width, which `CPUID` leaf
+    /// `8000_0008` reports as 40 here. A write that sets a bit above it raises
+    /// `#GP(0)`, which is how software discovers the width if it did not ask.
+    pub const PHYS_FIELD: u64 = 0x0000_00ff_ffff_f000;
+
+    /// How many fixed-range registers there are: one 64 KiB, two 16 KiB and
+    /// eight 4 KiB, covering the first megabyte between them.
+    pub const FIXED_COUNT: usize = 11;
+
+    /// Whether `ty` is one of the five memory types the architecture defines.
+    ///
+    /// 2 and 3 are reserved and so is everything above 6; a `WRMSR` naming one
+    /// raises `#GP(0)` rather than storing it. That refusal is load-bearing: it
+    /// is how software finds out what a processor supports (*Intel SDM* volume
+    /// 3A table 12-8).
+    #[must_use]
+    pub const fn valid_type(ty: u8) -> bool {
+        matches!(ty, 0 | 1 | 4 | 5 | 6)
+    }
 }
 
 /// Whether an address is canonical: bits 63-48 must all equal bit 47.
@@ -846,6 +962,21 @@ pub struct Sys {
     pub cstar: u64,
     /// `IA32_FMASK`: the flags `SYSCALL` clears.
     pub sfmask: u64,
+    /// The eight variable memory-type ranges, as base/mask **pairs** in the
+    /// order the model-specific registers appear: index `2n` is range `n`'s
+    /// `PHYSBASE` and `2n + 1` its `PHYSMASK`.
+    ///
+    /// One flat array rather than eight structs because a snapshot writes them
+    /// in a fixed order and `RDMSR` indexes them by address arithmetic; a
+    /// struct per range would be two orderings to keep in step. See [`mtrr`]
+    /// for what is done with them.
+    pub mtrr_var: [u64; 2 * mtrr::VCNT as usize],
+    /// The eleven fixed memory-type ranges, in `RDMSR` address order: the one
+    /// 64 KiB register, then the two 16 KiB, then the eight 4 KiB.
+    pub mtrr_fix: [u64; mtrr::FIXED_COUNT],
+    /// `IA32_MTRR_DEF_TYPE`: the type outside every range, plus the fixed-range
+    /// enable and the global enable.
+    pub mtrr_def_type: u64,
     /// The eight debug registers. `DR0`-`DR3` are addresses, `DR6` is the
     /// status and `DR7` the control word.
     pub dr: [u64; 8],
@@ -897,6 +1028,15 @@ impl Sys {
             lstar: 0,
             cstar: 0,
             sfmask: 0,
+            // The variable and fixed ranges are architecturally *undefined*
+            // out of reset and `IA32_MTRR_DEF_TYPE` is not: its enable bit is
+            // clear, which is what makes the undefined ranges harmless and
+            // makes everything uncacheable until firmware has programmed them.
+            // Zero is both a legal undefined value and the reproducible one,
+            // which is what a deterministic emulator needs.
+            mtrr_var: [0; 2 * mtrr::VCNT as usize],
+            mtrr_fix: [0; mtrr::FIXED_COUNT],
+            mtrr_def_type: 0,
             dr: [0, 0, 0, 0, 0, 0, 0xffff_0ff0, 0x0000_0400],
             test: [0; 8],
         }
@@ -1074,6 +1214,120 @@ pub const TSS_SEG_ORDER: [u8; 6] = [seg::ES, seg::CS, seg::SS, seg::DS, seg::FS,
 use super::exec::{Ex, Exec, Fault, VEC_GP, VEC_NP, VEC_SS, VEC_TS, VEC_UD};
 use super::flags;
 use super::isa::{Fields, Op};
+
+/// Which memory-type range register an `RDMSR`/`WRMSR` address names.
+///
+/// The whole family is decided in one place so that the read and the write
+/// cannot disagree about which addresses exist: an address this returns `None`
+/// for falls through to the ordinary match and ends as `#GP(0)`, which is what
+/// a processor does for a register it does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MtrrSlot {
+    /// `IA32_MTRRCAP`, read-only.
+    Cap,
+    /// `IA32_MTRR_DEF_TYPE`.
+    DefType,
+    /// A `PHYSBASE`, at index `n` of [`Sys::mtrr_var`].
+    Base(usize),
+    /// A `PHYSMASK`, at index `n` of [`Sys::mtrr_var`].
+    Mask(usize),
+    /// A fixed range, at index `n` of [`Sys::mtrr_fix`].
+    Fixed(usize),
+}
+
+/// Which memory-type range register `index` names, if any.
+fn mtrr_index(index: u32) -> Option<MtrrSlot> {
+    match index {
+        msr::MTRRCAP => Some(MtrrSlot::Cap),
+        msr::MTRR_DEF_TYPE => Some(MtrrSlot::DefType),
+        n if (msr::MTRR_PHYSBASE0..msr::MTRR_PHYS_END).contains(&n) => {
+            let slot = (n - msr::MTRR_PHYSBASE0) as usize;
+            if slot.is_multiple_of(2) {
+                Some(MtrrSlot::Base(slot))
+            } else {
+                Some(MtrrSlot::Mask(slot))
+            }
+        }
+        // The eleven fixed ranges are at three disjoint runs of addresses, and
+        // the gaps between the runs are not registers.
+        msr::MTRR_FIX64K => Some(MtrrSlot::Fixed(0)),
+        n if (msr::MTRR_FIX16K..msr::MTRR_FIX16K + 2).contains(&n) => {
+            Some(MtrrSlot::Fixed(1 + (n - msr::MTRR_FIX16K) as usize))
+        }
+        n if (msr::MTRR_FIX4K..msr::MTRR_FIX4K + 8).contains(&n) => {
+            Some(MtrrSlot::Fixed(3 + (n - msr::MTRR_FIX4K) as usize))
+        }
+        _ => None,
+    }
+}
+
+impl MtrrSlot {
+    /// What `RDMSR` reads back.
+    fn read(self, sys: &Sys) -> u64 {
+        match self {
+            MtrrSlot::Cap => mtrr::CAP,
+            MtrrSlot::DefType => sys.mtrr_def_type,
+            MtrrSlot::Base(n) | MtrrSlot::Mask(n) => sys.mtrr_var[n],
+            MtrrSlot::Fixed(n) => sys.mtrr_fix[n],
+        }
+    }
+
+    /// What `WRMSR` accepts.
+    ///
+    /// Every refusal here is one hardware makes, and each is what lets a guest
+    /// *probe* rather than believe: a reserved bit accepted is a feature a
+    /// kernel thinks it turned on, and a physical-address bit above the
+    /// implemented width accepted is a range it thinks it covered.
+    ///
+    /// # Errors
+    ///
+    /// `#GP(0)` for a write to the read-only capability register, for a
+    /// reserved bit, for an address bit past the 40 `CPUID` leaf `8000_0008`
+    /// reports, and for a memory type the architecture does not define.
+    fn write(self, sys: &mut Sys, value: u64) -> Ex<()> {
+        match self {
+            // Read-only: how many ranges a processor has is not something
+            // software gets to change.
+            MtrrSlot::Cap => Err(Fault::gp(0)),
+            MtrrSlot::DefType => {
+                if value & !mtrr::DEF_WRITABLE != 0 || !mtrr::valid_type(value as u8) {
+                    return Err(Fault::gp(0));
+                }
+                sys.mtrr_def_type = value;
+                Ok(())
+            }
+            MtrrSlot::Base(n) => {
+                // Bits 7:0 are the type and bits 12 up are the base. The eight
+                // bits between them are reserved, and so is everything above
+                // the physical address width.
+                if value & !(mtrr::PHYS_FIELD | 0xff) != 0 || !mtrr::valid_type(value as u8) {
+                    return Err(Fault::gp(0));
+                }
+                sys.mtrr_var[n] = value;
+                Ok(())
+            }
+            MtrrSlot::Mask(n) => {
+                if value & !(mtrr::PHYS_FIELD | mtrr::MASK_VALID) != 0 {
+                    return Err(Fault::gp(0));
+                }
+                sys.mtrr_var[n] = value;
+                Ok(())
+            }
+            MtrrSlot::Fixed(n) => {
+                // Eight independent types in one register, and *every* one of
+                // them has to be legal: a write with one bad byte is refused
+                // whole rather than storing the seven good ones.
+                for byte in value.to_le_bytes() {
+                    if !mtrr::valid_type(byte) {
+                        return Err(Fault::gp(0));
+                    }
+                }
+                sys.mtrr_fix[n] = value;
+                Ok(())
+            }
+        }
+    }
+}
 
 /// Which way a task switch was entered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2789,6 +3043,11 @@ impl Exec<'_> {
             msr::APIC_BASE => return self.lines.base_register().ok_or(Fault::gp(0)),
             _ => {}
         }
+        if self.cfg.features.mtrr
+            && let Some(value) = mtrr_index(index).map(|slot| slot.read(&self.state.sys))
+        {
+            return Ok(value);
+        }
         let sys = &self.state.sys;
         let value = match index {
             msr::EFER if self.cfg.features.long => sys.efer,
@@ -2809,6 +3068,11 @@ impl Exec<'_> {
     }
 
     fn msr_write(&mut self, index: u32, value: u64) -> Ex<()> {
+        if self.cfg.features.mtrr
+            && let Some(slot) = mtrr_index(index)
+        {
+            return slot.write(&mut self.state.sys, value);
+        }
         match index {
             // Writing the counter is what a hypervisor or a firmware
             // synchronising two processors does (*Intel SDM* volume 3 §17.17.3).

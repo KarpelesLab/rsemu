@@ -6042,7 +6042,7 @@ mod multiprocessor {
     use crate::core::state::StateReader;
     use crate::core::sync::{AtomicU64, Ordering};
     use crate::core::wire::{LocalController, Startup};
-    use crate::cpu::x86::prot::{apic_base, cr4};
+    use crate::cpu::x86::prot::{apic_base, cr4, msr, mtrr};
 
     /// The page a Start-Up names in these tests: linear `0x8000`.
     const PAGE: u8 = 0x08;
@@ -6664,5 +6664,248 @@ mod multiprocessor {
         pc.cpu.step();
         pc.cpu.step();
         assert_ne!(pc.regs().rdx & (1 << 9), 0, "and one wired says so");
+    }
+
+    // -- The memory-type range registers ---------------------------------
+    //
+    // *Intel SDM* volume 3A §12.11 and volume 4 Table 2-2. What made these
+    // worth having is written up on `prot::mtrr`: with `CPUID`'s `MTRR` bit
+    // clear, Linux reports `MTRRs disabled (not available)` and `pmd_set_huge`
+    // then refuses every 2 MiB mapping, so a 64-bit kernel loses its large
+    // pages on a part that claims long mode.
+
+    /// A part with the memory-type range registers: the `x86-64` preset, which
+    /// is where they belong.
+    fn pc_mtrr() -> Pc {
+        let pc = Pc::new(Variant::X86_64);
+        pc.start_protected();
+        pc
+    }
+
+    /// `mov ecx, index ; mov eax, lo ; mov edx, hi ; wrmsr`, stepped exactly
+    /// four times.
+    ///
+    /// Stepped rather than run to a `hlt`, because a halted core answers every
+    /// later `step` with zero and a second program would then quietly not run
+    /// at all — which is a way to write a passing test that measures nothing.
+    fn wrmsr(pc: &Pc, index: u32, value: u64) {
+        let mut code = alloc::vec![0xb9];
+        code.extend_from_slice(&index.to_le_bytes());
+        code.push(0xb8);
+        code.extend_from_slice(&(value as u32).to_le_bytes());
+        code.push(0xba);
+        code.extend_from_slice(&((value >> 32) as u32).to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x30]);
+        pc.write(at::CODE0, &code);
+        set_rip(pc, at::CODE0);
+        for _ in 0..4 {
+            pc.cpu.step();
+        }
+    }
+
+    /// `mov ecx, index ; rdmsr`, stepped twice, with `EDX:EAX` reassembled.
+    fn rdmsr(pc: &Pc, index: u32) -> u64 {
+        let mut code = alloc::vec![0xb9];
+        code.extend_from_slice(&index.to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x32]);
+        pc.write(at::CODE0, &code);
+        set_rip(pc, at::CODE0);
+        pc.cpu.step();
+        pc.cpu.step();
+        let r = pc.regs();
+        u64::from(r.rax as u32) | (u64::from(r.rdx as u32) << 32)
+    }
+
+    #[test]
+    fn every_long_mode_part_has_the_memory_type_range_registers() {
+        // Not a preference: `Features::validate` refuses the combination,
+        // because `CPUID` leaf 1 has set the `MTRR` bit on every part since
+        // the Pentium Pro and a 64-bit kernel that finds it clear concludes
+        // its firmware left the memory map undescribed.
+        let impossible = Features {
+            mtrr: false,
+            ..Features::X86_64
+        };
+        assert!(impossible.validate().is_err(), "long mode needs MTRRs");
+        // And a part with the ranges but no `RDMSR` to reach them is refused
+        // for the reason that is not a part either.
+        let impossible = Features {
+            mtrr: true,
+            ..Features::NONE
+        };
+        assert!(impossible.validate().is_err());
+    }
+
+    #[test]
+    fn cpuid_reports_the_mtrr_bit_and_mtrrcap_says_how_many_there_are() {
+        let pc = pc_mtrr();
+        // mov eax, 1 ; cpuid
+        pc.write(at::CODE0, &[0xb8, 1, 0, 0, 0, 0x0f, 0xa2, 0xf4]);
+        pc.run(20);
+        assert_ne!(pc.regs().rdx & (1 << 12), 0, "leaf 1 should report MTRR");
+
+        let pc = pc_mtrr();
+        let cap = rdmsr(&pc, msr::MTRRCAP);
+        assert_eq!(cap & 0xff, 8, "eight variable ranges");
+        assert_ne!(cap & mtrr::FIX, 0, "and the fixed ones");
+        assert_ne!(cap & mtrr::WC, 0, "write-combining is an available type");
+        assert_eq!(cap & (1 << 11), 0, "but there is no SMRR: no SMM here");
+    }
+
+    #[test]
+    fn the_capability_register_is_read_only() {
+        let pc = pc_mtrr();
+        pc.idt(13, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        wrmsr(&pc, msr::MTRRCAP, 0);
+        assert_eq!(pc.regs().rip, HANDLER, "#GP(0), not a stored value");
+    }
+
+    #[test]
+    fn a_range_written_reads_back_and_survives_a_reset_of_nothing_else() {
+        let pc = pc_mtrr();
+        // The shape firmware writes: 0-2 GiB write-back, enabled.
+        wrmsr(&pc, msr::MTRR_PHYSBASE0, 6);
+        wrmsr(
+            &pc,
+            msr::MTRR_PHYSBASE0 + 1,
+            0xff_8000_0000 | mtrr::MASK_VALID,
+        );
+        wrmsr(&pc, msr::MTRR_DEF_TYPE, mtrr::DEF_E | mtrr::DEF_FE);
+        assert_eq!(rdmsr(&pc, msr::MTRR_PHYSBASE0), 6);
+        assert_eq!(
+            rdmsr(&pc, msr::MTRR_PHYSBASE0 + 1),
+            0xff_8000_0000 | mtrr::MASK_VALID
+        );
+        assert_eq!(
+            rdmsr(&pc, msr::MTRR_DEF_TYPE),
+            mtrr::DEF_E | mtrr::DEF_FE,
+            "and the enables"
+        );
+        // The seventh range is there too, which is what `VCNT` promised.
+        wrmsr(&pc, msr::MTRR_PHYSBASE0 + 14, 0x1000 | 1);
+        assert_eq!(rdmsr(&pc, msr::MTRR_PHYSBASE0 + 14), 0x1000 | 1);
+        // And the register one past the last is not.
+        pc.idt(13, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        rdmsr(&pc, msr::MTRR_PHYS_END);
+        assert_eq!(pc.regs().rip, HANDLER, "eight ranges, not nine");
+    }
+
+    #[test]
+    fn the_fixed_ranges_are_eleven_registers_at_three_runs_of_addresses() {
+        let pc = pc_mtrr();
+        pc.idt(13, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        // All write-back, which is what firmware leaves the first megabyte as
+        // once it has finished shadowing itself.
+        for index in [
+            msr::MTRR_FIX64K,
+            msr::MTRR_FIX16K,
+            msr::MTRR_FIX16K + 1,
+            msr::MTRR_FIX4K,
+            msr::MTRR_FIX4K + 7,
+        ] {
+            wrmsr(&pc, index, 0x0606_0606_0606_0606);
+            assert_eq!(rdmsr(&pc, index), 0x0606_0606_0606_0606, "{index:#x}");
+        }
+        // The gaps between the runs are not registers, and neither is the one
+        // past the last 4 KiB range.
+        for index in [
+            msr::MTRR_FIX16K + 2,
+            msr::MTRR_FIX4K - 1,
+            msr::MTRR_FIX4K + 8,
+        ] {
+            rdmsr(&pc, index);
+            assert_eq!(pc.regs().rip, HANDLER, "{index:#x} is not a register");
+        }
+    }
+
+    #[test]
+    fn a_reserved_bit_or_an_undefined_memory_type_is_refused() {
+        // The rule `IA32_APIC_BASE` and `IA32_MISC_ENABLE` already follow: a
+        // reserved bit accepted is a feature a guest thinks it turned on, and
+        // an undefined type accepted is how software would fail to discover
+        // which types a processor has.
+        let pc = pc_mtrr();
+        pc.idt(13, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        let faults = |value: u64, index: u32| {
+            wrmsr(&pc, index, value);
+            pc.regs().rip == HANDLER
+        };
+        assert!(faults(2, msr::MTRR_PHYSBASE0), "type 2 is reserved");
+        assert!(faults(3, msr::MTRR_PHYSBASE0), "and so is type 3");
+        assert!(faults(7, msr::MTRR_PHYSBASE0), "and everything above 6");
+        assert!(faults(0x100, msr::MTRR_PHYSBASE0), "bits 11:8 are reserved");
+        assert!(
+            faults(0x0100_0000_0000, msr::MTRR_PHYSBASE0),
+            "and so is every bit above the 40 CPUID reports"
+        );
+        assert!(
+            faults(0x0100_0000_0000, msr::MTRR_PHYSBASE0 + 1),
+            "the mask has the same width"
+        );
+        assert!(faults(1 << 12, msr::MTRR_DEF_TYPE), "def-type bit 12");
+        assert!(faults(7, msr::MTRR_DEF_TYPE), "and its type field too");
+        assert!(
+            faults(0x0606_0606_0606_0602, msr::MTRR_FIX64K),
+            "one bad byte in eight refuses the whole write"
+        );
+        assert_eq!(
+            rdmsr(&pc, msr::MTRR_FIX64K),
+            0,
+            "and stores none of the other seven"
+        );
+    }
+
+    #[test]
+    fn a_part_without_the_feature_has_no_such_registers_at_all() {
+        // `pc_msr` is a 486 with model-specific registers and no MTRRs, which
+        // is a part that shipped. Reading one has to be `#GP(0)` rather than a
+        // plausible zero, because that is how a guest tells "absent" from
+        // "present and disabled".
+        let pc = pc_msr();
+        pc.start_protected();
+        pc.idt(13, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        rdmsr(&pc, msr::MTRRCAP);
+        assert_eq!(pc.regs().rip, HANDLER);
+    }
+
+    #[test]
+    fn the_ranges_are_in_the_snapshot_because_a_guest_reads_back_what_it_wrote() {
+        let pc = pc_mtrr();
+        wrmsr(&pc, msr::MTRR_PHYSBASE0, 6);
+        wrmsr(
+            &pc,
+            msr::MTRR_PHYSBASE0 + 1,
+            0xff_8000_0000 | mtrr::MASK_VALID,
+        );
+        wrmsr(&pc, msr::MTRR_FIX4K + 3, 0x0505_0505_0505_0505);
+        wrmsr(&pc, msr::MTRR_DEF_TYPE, mtrr::DEF_E);
+        let before = pc.cpu.sys();
+
+        let mut shape = MachineShape::new();
+        shape.add_device("/cpu0", "cpu.x86").unwrap();
+        let mut writer = StateWriter::new(shape);
+        {
+            let mut chunk = writer
+                .chunk("/cpu0", "cpu.x86", crate::cpu::x86::CLASS.version)
+                .unwrap();
+            pc.cpu.save(&mut chunk).unwrap();
+        }
+        let bytes = writer.to_vec().unwrap();
+
+        let restored = pc_mtrr();
+        let reader = StateReader::new(&bytes).unwrap();
+        let (_, _, data) = reader.load_raw("/cpu0").unwrap();
+        let mut chunk = ChunkReader::new(data);
+        restored.cpu.load(&mut chunk).unwrap();
+        chunk.end().unwrap();
+        let after = restored.cpu.sys();
+        assert_eq!(after.mtrr_var, before.mtrr_var);
+        assert_eq!(after.mtrr_fix, before.mtrr_fix);
+        assert_eq!(after.mtrr_def_type, before.mtrr_def_type);
     }
 }
