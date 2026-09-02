@@ -410,6 +410,29 @@ jit = ["ir"]
 # and is `no_std + alloc`, because the browser is a level-3 target too.
 usermode = []
 
+# The KVM acceleration backend (src/accel): running guest code on the host's
+# own silicon when the guest ISA is the host ISA (ROADMAP.md §10, phase 7).
+# `/dev/kvm`, the VM and vCPU descriptors, `KVM_SET_USER_MEMORY_REGION` over
+# page-aligned guest RAM, the shared `kvm_run` page, and MMIO and PIO exits
+# routed straight back into `core::space` — so an accelerated guest reaches the
+# same device models the interpreter does. Also the x86 register bridge, so a
+# vCPU's architectural state moves into `cpu::x86` and back.
+#
+# Reached **entirely by raw `ioctl` syscall**: no libc, no bindgen, no header,
+# no build script (ROADMAP.md §0). Adds no dependencies. It is one of the two
+# subsystems in the crate that opt back into `unsafe`, both of them on §0's
+# sanctioned list — the raw-syscall accel backends and the RAM host-pointer
+# fast path.
+#
+# Linux on x86-64 only, and `src/accel` is `cfg`-gated to that in lib.rs: a
+# `syscall` instruction and a table of `ioctl` numbers mean nothing on another
+# target, so the module is absent there rather than present and refusing.
+# Turning the feature on for a wasm or macOS build is therefore harmless.
+# Implies `std` because `accel/` lives above the `std` line with `host/` and
+# `jit/` — it uses none of it, but that is what keeps it out of the `no_std`
+# gate.
+accel-kvm = ["std"]
+
 # The MOS 6502 core (src/cpu/mos6502): a cycle-accurate interpreter with every
 # documented and undocumented opcode, a disassembler generated from the same
 # table, and the RP2A03 (NES) variant selected by a construction property. Adds

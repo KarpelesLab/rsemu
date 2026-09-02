@@ -45,6 +45,17 @@ pub enum Error {
     /// IR verifier rejects a block before a backend can miscompile it
     /// (`ROADMAP.md` §9). Carries a complete sentence naming the instruction.
     Ir(String),
+    /// An acceleration backend failed: `/dev/kvm` is missing, an `ioctl` was
+    /// refused, or a routed exit hit a bus fault (`ROADMAP.md` §10).
+    ///
+    /// Carries a complete sentence for the same reason
+    /// [`Error::Property`] does. The structured form, which distinguishes
+    /// *"this host has no KVM"* from *"KVM went wrong"*, is
+    /// `accel::AccelError` — which exists only in a Linux x86-64 build with
+    /// the `accel-kvm` feature, and is therefore named here rather than
+    /// linked. This is what it becomes when it crosses into the crate's own
+    /// error type.
+    Accel(String),
     /// The operation is not implemented in this build yet.
     ///
     /// Distinct from an error: it means "rsemu has not got here", not "you did
@@ -92,6 +103,7 @@ impl fmt::Display for Error {
             Error::Bus(e) => write!(f, "bus error: {e}"),
             Error::State(message) => write!(f, "snapshot error: {message}"),
             Error::Ir(message) => write!(f, "malformed IR: {message}"),
+            Error::Accel(message) => write!(f, "acceleration error: {message}"),
             Error::Unimplemented(what) => write!(f, "not implemented yet: {what}"),
         }
     }

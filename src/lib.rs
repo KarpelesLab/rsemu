@@ -60,6 +60,15 @@
 //! guest writes into the page it was lifted from — `ROADMAP.md` §9.1's first
 //! three mechanisms, in front of the IR interpreter. See [`jit`].
 //!
+//! With `accel-kvm` on a Linux x86-64 host, [`accel`] runs guest code on the
+//! host's own silicon: `/dev/kvm` reached by raw `ioctl` — no libc, no header,
+//! no build script — page-aligned guest RAM handed to the kernel and still
+//! reachable by byte offset from `core::space`, and MMIO and port exits routed
+//! straight back into the address space, so an accelerated guest talks to the
+//! same device models the interpreter does. `accel::state` carries a vCPU's
+//! architectural registers into `cpu::x86` and back, which is how a guest can
+//! start under one engine and finish under the other.
+//!
 //! Not yet: a native window or a native sound card — both need either a
 //! GUI/audio dependency the policy forbids or a seventh `unsafe` subsystem the
 //! ceiling forbids; the JIT's *host code generators*, so everything is still
@@ -76,6 +85,15 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 extern crate alloc;
+
+// Linux on x86-64 only: everything in it is a raw `ioctl` on `/dev/kvm` and a
+// `syscall` instruction, so the module does not exist elsewhere rather than
+// existing and refusing. A build with the feature on and the wrong target gets
+// a crate without `accel`, which is what "run guest code on the host's own
+// silicon" means when the host is a browser.
+#[cfg(all(feature = "accel-kvm", target_os = "linux", target_arch = "x86_64"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "accel-kvm")))]
+pub mod accel;
 
 pub mod bus;
 pub mod core;
@@ -188,6 +206,9 @@ pub fn build_info() -> alloc::string::String {
     }
     if cfg!(feature = "usermode") {
         features.push("usermode");
+    }
+    if cfg!(feature = "accel-kvm") {
+        features.push("accel-kvm");
     }
 
     let mut s = String::from("rsemu ");
