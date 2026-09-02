@@ -64,13 +64,29 @@ something a person can actually run (§2).
 > and reads and writes it. And **EDK2 all the way to a UEFI shell prompt**, out
 > of two CFI NOR flash banks the board maps and the generated tree describes. The variable store is real flash, so a variable written in one run
 > is there in the next. Where each stops is written down, not rounded up.
-> `pc-at` — a complete PC/AT chipset with a user-supplied BIOS path — is in the
-> catalog, and now **runs a real PC firmware image through a whole POST and
-> into a boot sector**: it sizes 16 MiB of RAM, shadows itself out of ROM into
-> RAM through an 82441FX host bridge's PAM registers, enumerates PCI, builds an
-> e820 map, initialises the keyboard, reads a diskette through the µPD765 and
-> the 8237, and jumps to `0000:7c00`, where the sector runs. It finds no video,
-> and `docs/platforms/pc-at.md` says exactly why.
+> `pc-at` is in the catalog and **boots FreeDOS 1.3 to its installer prompt on
+> firmware this repository assembles from source** — phase 6a's gate. It sizes
+> 16 MiB of RAM, shadows itself out of ROM into RAM through an 82441FX host
+> bridge's PAM registers, enumerates PCI, maps a video card's option ROM off an
+> expansion-ROM BAR and runs it, sets an 80×25 text mode, reads a diskette
+> through the µPD765 and the 8237, and jumps to `0000:7c00` — where FreeDOS's
+> own boot sector loads a compressed kernel a sector at a time, decompresses it,
+> runs `FDCONFIG.SYS` and `COMMAND.COM`, and reaches a live prompt with `INT 21h`
+> and `INT 2Fh` now DOS's.
+>
+> Two firmwares reach that board and the distinction matters. A **user-supplied
+> image** — SeaBIOS, say — still works and is what `RSEMU_BIOS` binds; running a
+> copyleft firmware as a guest is ordinary use (§1). But the shipping path is
+> **`src/fw/pcbios`, ours, MIT, written in Rust and emitted by a 16-bit x86
+> assembler in `src/fw/asm16.rs`** — no external assembler, no C toolchain, no
+> vendored blob, and a byte-identical image across builds. That is what §6a
+> demanded so that 6c could not "quietly become ship a GPL blob", and it is why
+> `cargo test` boots the board with no environment variable set and nothing
+> downloaded.
+>
+> Where it stops is written down rather than rounded up: the installer cannot be
+> driven past its first keystroke, because `pc.kbc` delivers one and then goes
+> silent. `docs/platforms/pc-at.md` carries that and the rest of the ledger.
 >
 > That 141 is itself a finding. The conformance table described an *older* ROM
 > release: it listed three tests the pinned ROM never writes and omitted
