@@ -1,6 +1,7 @@
 //! Does an interrupt get from an HPET comparator, through an I/O APIC, through
 //! a local APIC and into a handler the guest wrote — and does the guest's
-//! end-of-interrupt let go of it?
+//! end-of-interrupt let go of it? And does firmware on this board's bootstrap
+//! processor start its **second** processor?
 //!
 //! Every chip in this path has unit tests proving it works alone. This is the
 //! one that runs **real x86 instructions**: the firmware image below is
@@ -73,6 +74,22 @@ const fn lin(off: usize) -> u32 {
 const IDT_BASE: u32 = 0x2000;
 const COUNTER: u32 = 0x3000;
 
+/// Where the bootstrap processor writes the second one's trampoline, and the
+/// page a Start-Up names to send it there: 0x8000 is page 0x08.
+const AP_TRAMPOLINE: u32 = 0x8000;
+const AP_PAGE: u8 = 0x08;
+
+/// Where the second processor says it is alive, and what it writes there.
+const AP_MARKER: u32 = 0x3200;
+const ALIVE: u16 = 0xa55a;
+
+/// How many processors have executed the firmware's entry point.
+///
+/// One, on a board whose application processor is parked in wait-for-SIPI —
+/// which is the whole point of the second `pc.lapic`. Counted by the firmware
+/// itself rather than asserted from the outside.
+const ARRIVALS: u32 = 0x3100;
+
 /// The vector the redirection entry carries.
 const VECTOR: u8 = 0x40;
 
@@ -114,6 +131,10 @@ enum Source {
     /// The local APIC's own timer, one-shot, which reaches the processor
     /// without going near the I/O APIC.
     ApicTimer,
+    /// No timer at all: the firmware starts the board's *second processor*
+    /// instead, with the MultiProcessor Specification's three interrupt
+    /// command register writes (v1.4 B.4).
+    Smp,
 }
 
 /// The firmware image: real-mode entry, a GDT, protected-mode setup, the driver
@@ -130,6 +151,11 @@ fn firmware(source: Source) -> Vec<u8> {
 
     // -- real mode: enter protected mode ------------------------------------
     let mut entry: Vec<u8> = Vec::new();
+    // Say that a processor got here. `DS` is zero out of reset and this is
+    // real mode, so the address is physical and lands in `ram_low`, which a
+    // cold reset leaves zeroed.
+    entry.extend_from_slice(&[0xff, 0x06]); // inc word [ARRIVALS]
+    entry.extend_from_slice(&(ARRIVALS as u16).to_le_bytes());
     entry.push(0xfa); // cli
     entry.extend_from_slice(&[0xb8, 0x00, 0xf0]); // mov ax, 0xf000
     entry.extend_from_slice(&[0x8e, 0xd8]); // mov ds, ax
@@ -179,7 +205,7 @@ fn firmware(source: Source) -> Vec<u8> {
     // other entry is a not-present gate already.
     let vector = match source {
         Source::Hpet => VECTOR,
-        Source::ApicTimer => TIMER_VECTOR,
+        Source::ApicTimer | Source::Smp => TIMER_VECTOR,
     };
     pm.push(0xbf); // mov edi, gate
     dw(&mut pm, IDT_BASE + 8 * u32::from(vector));
@@ -224,6 +250,39 @@ fn firmware(source: Source) -> Vec<u8> {
             store_at(&mut pm, 0x3e0, 0b1011);
             store_at(&mut pm, 0x320, u32::from(TIMER_VECTOR));
             store_at(&mut pm, 0x380, TIMER_COUNT);
+        }
+        Source::Smp => {
+            // The other processor. First its trampoline, written into RAM as
+            // three doublewords — real-mode code, because that is the mode a
+            // Start-Up leaves a processor in however this one is running (SDM
+            // Vol 3A 8.4.3):
+            //
+            //     xor ax, ax ; mov ds, ax ; mov word [AP_MARKER], ALIVE ; jmp $
+            let mut tramp = Vec::new();
+            tramp.extend_from_slice(&[0x31, 0xc0, 0x8e, 0xd8, 0xc7, 0x06]);
+            tramp.extend_from_slice(&(AP_MARKER as u16).to_le_bytes());
+            tramp.extend_from_slice(&ALIVE.to_le_bytes());
+            tramp.extend_from_slice(&[0xeb, 0xfe]);
+            pm.push(0xbf); // mov edi, 0
+            dw(&mut pm, 0);
+            for (i, word) in tramp.chunks(4).enumerate() {
+                let mut bytes = [0u8; 4];
+                bytes[..word.len()].copy_from_slice(word);
+                store_at(
+                    &mut pm,
+                    AP_TRAMPOLINE + 4 * i as u32,
+                    u32::from_le_bytes(bytes),
+                );
+            }
+            // Then the sequence itself, through this processor's own interrupt
+            // command register: the destination half, INIT assert, INIT
+            // de-assert, Start-Up carrying the page.
+            pm.push(0xbf); // mov edi, 0xfee00000
+            dw(&mut pm, 0xfee0_0000);
+            store_at(&mut pm, 0x310, 1 << 24);
+            store_at(&mut pm, 0x300, 0x0000_c500);
+            store_at(&mut pm, 0x300, 0x0000_8500);
+            store_at(&mut pm, 0x300, 0x0000_0600 | u32::from(AP_PAGE));
         }
         Source::Hpet => {
             // Comparator 0 level-triggered and enabled, matching 1000 ticks
@@ -432,4 +491,62 @@ fn the_apic_timer_lands_in_the_same_place_every_run() {
         .map(|_| interrupts_in(Source::ApicTimer, 3_000_000))
         .collect();
     assert_eq!(counts, [1, 1, 1]);
+}
+
+#[test]
+fn the_application_processor_is_parked_and_the_bootstrap_one_runs() {
+    // The board carries two processors and only one of them executes firmware.
+    // Nothing in this file makes that true: `pc.lapic`'s own reset parks the
+    // processor in front of it when it is not the bootstrap one, because that
+    // is what the MP initialization protocol does at power-up (Intel SDM Vol 3A
+    // 8.4.3), and it says so over the `LocalController` link the machine file's
+    // `lapic1.intr -> cpu1.intr` wire carries.
+    //
+    // The count is the firmware's own: the first instruction at the entry point
+    // increments it, so a second processor arriving at 0xfffffff0 would be
+    // visible as a two. Scheduler accounting cannot answer this — a stopped
+    // core still consumes its budget, which is how it tells the scheduler not
+    // to spin on it.
+    let mut m = board(Source::Hpet);
+    assert_eq!(peek32(&m, ARRIVALS.into()), 0, "nothing has executed yet");
+    m.run_for(GlobalTime::from_nanos(5_000_000))
+        .expect("the machine runs");
+    assert_eq!(
+        peek32(&m, ARRIVALS.into()),
+        1,
+        "one processor ran the firmware; the other is waiting for a Start-Up"
+    );
+    assert!(
+        peek32(&m, COUNTER.into()) > 0,
+        "and the one that ran it is the one taking interrupts"
+    );
+}
+
+#[test]
+fn the_guest_starts_the_second_processor_on_the_board() {
+    // The Phase 7 gate, on a machine file rather than in a rig: firmware
+    // running on `cpu0` writes a trampoline into RAM, sends `INIT` and a
+    // Start-Up through its own local APIC's interrupt command register, and
+    // `cpu1` — which until then had executed nothing at all — starts at the
+    // page the Start-Up named and says so.
+    //
+    // Nothing here touches the second processor. The whole path is the board's:
+    // `lapic0`'s ICR, the `apic` message bus, `lapic1`'s INIT and Start-Up, and
+    // the `LocalController` it offers on the `lapic1.intr -> cpu1.intr` wire.
+    let mut m = board(Source::Smp);
+    assert_eq!(peek32(&m, AP_MARKER.into()), 0, "nothing has run yet");
+
+    m.run_for(GlobalTime::from_nanos(5_000_000))
+        .expect("the machine runs");
+
+    assert_eq!(
+        peek32(&m, ARRIVALS.into()),
+        1,
+        "only the bootstrap processor ever ran the firmware"
+    );
+    assert_eq!(
+        peek32(&m, AP_MARKER.into()) & 0xffff,
+        u32::from(ALIVE),
+        "and the second processor executed the trampoline it was sent to"
+    );
 }

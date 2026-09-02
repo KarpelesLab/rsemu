@@ -13,19 +13,28 @@
 //! started by the guest's own instructions, which is what `ROADMAP.md` Phase
 //! 7's "≥ 2 vCPUs" gate needs to be true.
 //!
-//! # The one piece of scaffolding, and exactly what would replace it
+//! # No scaffolding
 //!
 //! A processor asks its own local interrupt controller what it has once per
-//! instruction boundary, through `core::wire`'s [`LocalController`] — the same
+//! instruction boundary, through `core::wire`'s `LocalController` — the same
 //! shape as the acknowledge cycle it already runs against an 8259A, and offered
-//! along the same `intr` net, so a machine file needs no new syntax. What is
-//! missing is the *controller's* half: `src/dev/pc/apic.rs` has all five
-//! accessors ([`LocalApic::waiting_for_startup`], `init_asserted`,
-//! `take_startup`, `apic_base`, `set_apic_base`) and does not yet offer them
-//! through
-//! [`Device::local_controller`](rsemu::core::device::Device::local_controller).
-//! `ApicLink` below is that eight-line forwarder, and the day the APIC grows it
-//! this file deletes `ApicLink` and asserts exactly the same things.
+//! along the same `intr` net, so a machine file needs no new syntax. Both
+//! halves exist: `src/dev/pc/apic.rs` offers the controller through
+//! [`Device::local_controller`](rsemu::core::device::Device::local_controller)
+//! and the core takes it through `attach_local_controller`, which is exactly
+//! what `machines/pc-apic.machine`'s two processors are wired with. Nothing in
+//! this file stands between them.
+//!
+//! # Why these APICs are never reset
+//!
+//! [`Device::reset`](rsemu::core::device::Device::reset) on a **non-bootstrap**
+//! local APIC parks its processor in wait-for-SIPI at once, because that is
+//! what the MP initialization protocol does at power-up (SDM Vol 3A 8.4.3): an
+//! application processor on a real board never fetches the reset vector. This
+//! rig deliberately does not run that reset, so the second processor here comes
+//! up *running*, and the INIT below is then demonstrably what stops it rather
+//! than a state it was already in. The board's version of the same sequence,
+//! with the reset, is `machines/pc-apic.machine`.
 //!
 //! # Two APIC pages, not one
 //!
@@ -45,55 +54,17 @@
 #![cfg(all(feature = "cpu-x86", feature = "dev-pc", feature = "dev-pc-apic"))]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use rsemu::core::device::{Deferred, Device, RealizeCtx};
 use rsemu::core::hosts::HostObjects;
 use rsemu::core::props::Props;
 use rsemu::core::space::{AddressSpace, MemAttrs, RamStore, Region, RequesterId};
 use rsemu::core::value::Width;
-use rsemu::core::wire::{LocalController, Startup, Wire, WireIdAllocator, WireSource};
+use rsemu::core::wire::{LocalController, Wire, WireIdAllocator, WireSource};
 use rsemu::cpu::x86::isa::seg;
 use rsemu::cpu::x86::prot::{SegReg, ar};
 use rsemu::cpu::x86::{Variant, X86};
 use rsemu::dev::pc::apic::{ApicBus, LocalApic};
-
-/// The processor-side view of a local APIC, which `src/dev/pc/apic.rs` does not
-/// offer yet — see the module documentation.
-///
-/// Everything it reports is a public accessor on `LocalApic`; the only state of
-/// its own is one bit of edge detection, because the APIC exposes an accepted
-/// INIT as a *condition* (`waiting_for_startup`) and a processor needs the
-/// *edge*.
-#[derive(Debug)]
-struct ApicLink {
-    apic: Arc<LocalApic>,
-    /// Whether the INIT currently in flight has already been reported.
-    reported: AtomicBool,
-}
-
-impl LocalController for ApicLink {
-    fn take_startup(&self) -> Startup {
-        let held = self.apic.init_asserted();
-        let waiting = self.apic.waiting_for_startup();
-        let page = self.apic.take_startup();
-        // One INIT is in flight from the moment the message is accepted until
-        // the Start-Up behind it has been handed over. A processor that was not
-        // running for any of that sees the whole sequence in a single ask,
-        // which is what `Startup`'s three separate fields are for.
-        let pending = held || waiting || page.is_some();
-        let init = pending && !self.reported.swap(pending, Ordering::AcqRel);
-        Startup { init, held, page }
-    }
-
-    fn base_register(&self) -> u64 {
-        self.apic.apic_base()
-    }
-
-    fn set_base_register(&self, value: u64) {
-        self.apic.set_apic_base(value);
-    }
-}
 
 /// Where the bootstrap processor's program sits.
 const BSP_CODE: u32 = 0x1000;
@@ -115,10 +86,6 @@ struct Rig {
     ram: Arc<RamStore>,
     cpus: [Arc<X86>; 2],
     apics: [Arc<LocalApic>; 2],
-    /// Kept alive here because a processor holds its controller *weakly*, for
-    /// the same reason it holds the thing that answers its acknowledge cycle
-    /// weakly: the machine owns devices and a wire merely refers to them.
-    _links: [Arc<ApicLink>; 2],
 }
 
 /// Run a device's `realize`, which is what puts a local APIC on its bus.
@@ -165,13 +132,7 @@ fn rig_of(variant: Variant) -> Rig {
         cpu.attach_space(Arc::clone(&mem));
         cpu
     });
-    let links = apics.clone().map(|apic| {
-        Arc::new(ApicLink {
-            apic,
-            reported: AtomicBool::new(false),
-        })
-    });
-    for ((apic, cpu), link) in apics.iter().zip(&cpus).zip(&links) {
+    for (apic, cpu) in apics.iter().zip(&cpus) {
         // The local APIC drives the processor's `INTR` and answers its
         // acknowledge cycle, exactly as an 8259A does.
         let src = ids.alloc();
@@ -190,8 +151,13 @@ fn rig_of(variant: Variant) -> Rig {
         // a Start-Up travel. Offered along the same net as the interrupt,
         // because on the hardware it is the same connection: the controller is
         // inside the processor it interrupts.
-        let peer: Arc<dyn LocalController> = Arc::clone(link) as Arc<dyn LocalController>;
+        let peer: Arc<dyn LocalController> = apic
+            .local_controller("intr")
+            .expect("a local APIC is its processor's own controller");
         cpu.attach_local_controller("intr", Arc::downgrade(&peer));
+        // The device owns that `Arc` — the core keeps a `Weak` — so dropping
+        // this one here is what the realizer does too.
+        drop(peer);
         // Consume the reset sequence, so the first step of a run is an
         // instruction rather than a restart at the reset vector.
         cpu.step();
@@ -202,7 +168,6 @@ fn rig_of(variant: Variant) -> Rig {
         ram,
         cpus,
         apics,
-        _links: links,
     }
 }
 

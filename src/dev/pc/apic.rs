@@ -50,12 +50,12 @@
 //!
 //! # What is not here
 //!
-//! * **`IA32_APIC_BASE` is state without a writer.** The register is modelled —
-//!   [`LocalApic::apic_base`] and its enable, BSP and base-address fields —
-//!   but this build's x86 core has no `RDMSR`/`WRMSR`, so nothing can reach it
-//!   from the guest. Relocating the register window would also be an address
-//!   space retopology, which a device does not get to do to itself; a machine
-//!   file's `map` places the page.
+//! * **A relocatable register window.** `IA32_APIC_BASE`'s base-address field
+//!   is reported rather than obeyed: moving the window is an address-space
+//!   retopology and a device does not get to do that to itself, so a machine
+//!   file's `map` places the page. The rest of the register is live — a guest's
+//!   `RDMSR`/`WRMSR` reaches it through [`LocalController`], and clearing the
+//!   enable bit does make this APIC transparent.
 //! * **x2APIC.** The MSR interface and the 32-bit APIC IDs are a separate mode
 //!   with its own register semantics, and nothing asks for it yet.
 //! * **SMI delivery.** No core here has a system management mode to enter, so
@@ -67,6 +67,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt;
+use core::mem;
 
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
 use crate::core::error::{BusError, Error, Result};
@@ -77,7 +78,8 @@ use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{
-    FanIn, IntAck, IntAckCycle, IntAckResponse, Level, Resolve, WireId, WireSink, WireSource,
+    FanIn, IntAck, IntAckCycle, IntAckResponse, Level, LocalController, Resolve, Startup, WireId,
+    WireSink, WireSource,
 };
 use crate::machine::realize::Instance;
 use crate::machine::validate::ClassSchema;
@@ -88,7 +90,7 @@ pub use bus::{ApicBus, Delivery, EoiSink, Message, Shorthand, Target};
 pub const CLASS_NAME: &str = "pc.lapic";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 /// How much address space the register block answers.
 ///
@@ -621,6 +623,15 @@ struct State {
     init_asserted: bool,
     /// The page a Start-Up named, until whoever starts processors takes it.
     startup: Option<u8>,
+    /// An accepted `INIT` this APIC's processor has not been told about yet.
+    ///
+    /// `init_asserted` is the *line*; this is the *edge*. A processor runs one
+    /// INIT sequence per message accepted, and it may not ask until after the
+    /// de-assert half of the level-triggered pair has already dropped the line
+    /// (SDM Vol 3A 10.6.1) — so the edge is latched here rather than
+    /// reconstructed from the level, which could not tell "asserted and
+    /// dropped again" from "never asserted".
+    init_pending: bool,
 }
 
 impl Default for State {
@@ -652,6 +663,7 @@ impl Default for State {
             wait_for_sipi: false,
             init_asserted: false,
             startup: None,
+            init_pending: false,
         }
     }
 }
@@ -1231,6 +1243,7 @@ impl Registers {
                         state.init_reset();
                         state.wait_for_sipi = true;
                         state.init_asserted = true;
+                        state.init_pending = true;
                     } else {
                         // The de-assert half of the level-triggered pair. On a
                         // P6 it reset the arbitration IDs; there is nothing
@@ -1335,6 +1348,35 @@ impl IntAck for Registers {
         };
         self.refresh();
         response
+    }
+}
+
+impl LocalController for Registers {
+    fn take_startup(&self) -> Startup {
+        let mut state = self.state.lock();
+        // Three separate facts, and a processor that was not running for any of
+        // the sequence sees all three at once: the INIT it owes a reset for,
+        // whether the line is still holding it there, and the page a Start-Up
+        // named behind it (`core::wire`'s `Startup`).
+        let init = mem::replace(&mut state.init_pending, false);
+        Startup {
+            init,
+            held: state.init_asserted,
+            page: state.startup.take(),
+        }
+    }
+
+    fn base_register(&self) -> u64 {
+        self.state.lock().apic_base
+    }
+
+    fn set_base_register(&self, value: u64) {
+        // What `LocalApic::set_apic_base` does, and the outward half is outside
+        // the critical section for the reason every other path here is: the
+        // enable bit decides whether `INTR` is this APIC's or LINT0's, and
+        // driving that pin re-enters the processor.
+        self.state.lock().apic_base = value;
+        self.refresh();
     }
 }
 
@@ -1514,16 +1556,16 @@ impl LocalApic {
 
     /// `IA32_APIC_BASE`, with its enable and bootstrap-processor flags.
     ///
-    /// Architectural state with no writer in this build: the x86 core here has
-    /// no `RDMSR`/`WRMSR`, so nothing in the guest can reach it. It is modelled
-    /// and snapshotted anyway, because the moment the core grows those two
-    /// instructions this is what they read.
+    /// The register a guest's `RDMSR`/`WRMSR` reaches: the core forwards those
+    /// two instructions here through [`LocalController::base_register`],
+    /// because the register names state that lives in the controller rather
+    /// than in the processor (SDM Vol 3A 10.4.3).
     #[must_use]
     pub fn apic_base(&self) -> u64 {
         self.regs.state.lock().apic_base
     }
 
-    /// Set `IA32_APIC_BASE`, for whoever eventually implements `WRMSR`.
+    /// Set `IA32_APIC_BASE`, as a guest's `WRMSR` does.
     ///
     /// The base address field is *reported*, not obeyed: relocating the
     /// register page is an address-space retopology and a device does not get
@@ -1571,14 +1613,13 @@ impl LocalApic {
 
     /// Take the page a Start-Up named, if one has arrived.
     ///
-    /// **This is the seam an application processor is started through, and the
-    /// other half of it does not exist yet.** A Start-Up message tells the
-    /// processor to begin executing at `CS:IP = vector << 8 : 0` — a real-mode
-    /// segment whose base is `vector << 12` — from a halted, wait-for-SIPI
-    /// state. No x86 core in this tree has that state or an input that leaves
-    /// it: `cpu.x86` has a `reset` pin that restarts it at the reset vector,
-    /// which is a different thing. So the APIC latches the page and whoever
-    /// owns the processors takes it from here.
+    /// A Start-Up message tells the processor to begin executing at
+    /// `CS:IP = vector << 8 : 0` — a real-mode segment whose base is
+    /// `vector << 12` — from a halted, wait-for-SIPI state.
+    ///
+    /// **The processor takes it through [`LocalController`], not through
+    /// here**: this is the accessor a test uses to look at the latch, and it
+    /// consumes it, so a machine's processor and a test cannot both have it.
     pub fn take_startup(&self) -> Option<u8> {
         self.regs.state.lock().startup.take()
     }
@@ -1677,6 +1718,20 @@ impl Device for LocalApic {
             state.tick = tick;
             if self.bsp {
                 state.apic_base |= APIC_BASE_BSP;
+            } else {
+                // An application processor does not execute the reset vector.
+                // The MP initialization protocol runs over the APIC bus at
+                // power-up; one processor wins the BSP flag and every other one
+                // "enters a wait-for-SIPI state" without ever fetching an
+                // instruction (SDM Vol 3A 8.4.3, and MP specification 4.3.2).
+                //
+                // This part is the half of the pair that knows which processor
+                // it is sitting in front of — `bsp` is its property, not the
+                // core's — so this is where that is said. The processor is told
+                // at its first instruction boundary, through `LocalController`,
+                // which is the same route a later INIT takes.
+                state.wait_for_sipi = true;
+                state.init_pending = true;
             }
             self.regs.publish(&state);
             Pending {
@@ -1738,6 +1793,15 @@ impl Device for LocalApic {
         // The device owns this `Arc`; the net gets a `Weak`, so building one
         // here would hand out a reference that is already dead.
         (port == "intr").then(|| Arc::clone(&self.regs) as Arc<dyn IntAck>)
+    }
+
+    fn local_controller(&self, port: &str) -> Option<Arc<dyn LocalController>> {
+        // The processor's own half of this part: where an INIT and a Start-Up
+        // reach it, and where its `IA32_APIC_BASE` lives. Offered on the pin
+        // that drives `INTR`, because on the hardware it is one connection —
+        // the controller is inside the processor it interrupts. The device owns
+        // this `Arc`; the core keeps a `Weak`, as it does for `int_ack`.
+        (port == "intr").then(|| Arc::clone(&self.regs) as Arc<dyn LocalController>)
     }
 
     fn attach_int_ack(&self, port: &str, ack: Weak<dyn IntAck>) {
@@ -1802,7 +1866,12 @@ impl Device for LocalApic {
         for level in state.lint_level {
             w.write_bool(level)?;
         }
-        for flag in [state.extint, state.wait_for_sipi, state.init_asserted] {
+        for flag in [
+            state.extint,
+            state.wait_for_sipi,
+            state.init_asserted,
+            state.init_pending,
+        ] {
             w.write_bool(flag)?;
         }
         match state.startup {
@@ -1855,6 +1924,7 @@ impl Device for LocalApic {
         state.extint = r.read_bool()?;
         state.wait_for_sipi = r.read_bool()?;
         state.init_asserted = r.read_bool()?;
+        state.init_pending = r.read_bool()?;
         state.startup = if r.read_bool()? {
             Some(r.read_u8()?)
         } else {
@@ -2417,6 +2487,143 @@ mod tests {
         // the processor is no longer waiting for one.
         bsp.poke(REG_ICR_LOW, (u32::from(Delivery::STARTUP.0) << 8) | 0x08);
         assert_eq!(ap.apic.take_startup(), None);
+    }
+
+    #[test]
+    fn the_processor_takes_the_whole_sequence_through_its_controller() {
+        // What a processor actually sees, and it is the same three messages as
+        // the test above — asked for through `LocalController` rather than
+        // through this device's own accessors, because that is the seam a core
+        // is wired to.
+        let bus = Arc::new(ApicBus::new());
+        let bsp = bench_on(&bus, 0, true);
+        let ap = bench_on(&bus, 1, false);
+        let link = ap
+            .apic
+            .local_controller("intr")
+            .expect("a local APIC is its processor's own controller");
+        assert!(
+            ap.apic.local_controller("lint0").is_none(),
+            "and only on the pin that drives INTR"
+        );
+        assert_eq!(link.take_startup(), Startup::NONE, "nothing has happened");
+
+        bsp.poke(REG_ICR_HIGH, 1 << 24);
+        let init = (u32::from(Delivery::INIT.0) << 8) | (1 << 14) | (1 << 15);
+        bsp.poke(REG_ICR_LOW, init);
+        assert_eq!(
+            link.take_startup(),
+            Startup {
+                init: true,
+                held: true,
+                page: None
+            },
+            "an INIT to run the sequence for, and the line still holding it"
+        );
+        assert_eq!(
+            link.take_startup(),
+            Startup {
+                init: false,
+                held: true,
+                page: None
+            },
+            "the edge is reported once; the level is reported while it lasts"
+        );
+
+        bsp.poke(REG_ICR_LOW, init & !(1 << 14));
+        assert_eq!(link.take_startup(), Startup::NONE, "the line dropped");
+
+        bsp.poke(REG_ICR_LOW, (u32::from(Delivery::STARTUP.0) << 8) | 0x08);
+        assert_eq!(
+            link.take_startup(),
+            Startup {
+                init: false,
+                held: false,
+                page: Some(0x08)
+            }
+        );
+        assert_eq!(link.take_startup(), Startup::NONE, "and taken once");
+    }
+
+    #[test]
+    fn a_processor_that_was_not_asking_sees_the_whole_sequence_at_once() {
+        // The case `Startup`'s three separate fields exist for: an application
+        // processor is not executing while the bootstrap processor sends all
+        // three messages, so its first ask is also its last.
+        let bus = Arc::new(ApicBus::new());
+        let bsp = bench_on(&bus, 0, true);
+        let ap = bench_on(&bus, 1, false);
+        bsp.poke(REG_ICR_HIGH, 1 << 24);
+        let init = (u32::from(Delivery::INIT.0) << 8) | (1 << 14) | (1 << 15);
+        bsp.poke(REG_ICR_LOW, init);
+        bsp.poke(REG_ICR_LOW, init & !(1 << 14));
+        bsp.poke(REG_ICR_LOW, (u32::from(Delivery::STARTUP.0) << 8) | 0x08);
+
+        let link = ap.apic.local_controller("intr").expect("its controller");
+        assert_eq!(
+            link.take_startup(),
+            Startup {
+                init: true,
+                held: false,
+                page: Some(0x08)
+            }
+        );
+    }
+
+    #[test]
+    fn a_reset_parks_an_application_processor_and_leaves_the_bootstrap_one_running() {
+        // The MP initialization protocol at power-up (SDM Vol 3A 8.4.3): the
+        // processor that loses it never fetches an instruction. This part is the
+        // half of the pair that knows which one it is in front of.
+        let bus = Arc::new(ApicBus::new());
+        let bsp = bench_on(&bus, 0, true);
+        let ap = bench_on(&bus, 1, false);
+        bsp.apic.reset(ResetKind::Cold);
+        ap.apic.reset(ResetKind::Cold);
+
+        assert!(!bsp.apic.waiting_for_startup());
+        assert_eq!(
+            bsp.apic
+                .local_controller("intr")
+                .expect("its controller")
+                .take_startup(),
+            Startup::NONE,
+            "the bootstrap processor is told nothing and runs the reset vector"
+        );
+
+        assert!(ap.apic.waiting_for_startup());
+        let link = ap.apic.local_controller("intr").expect("its controller");
+        assert_eq!(
+            link.take_startup(),
+            Startup {
+                init: true,
+                held: false,
+                page: None
+            },
+            "an INIT with no line behind it: run the sequence and wait"
+        );
+        assert_eq!(link.take_startup(), Startup::NONE);
+    }
+
+    #[test]
+    fn the_base_register_a_processor_reads_is_this_parts_own() {
+        // `IA32_APIC_BASE` is reached by `RDMSR`, which is a *processor*
+        // instruction naming state that lives here (SDM Vol 3A 10.4.3).
+        let bench = bench_on(&Arc::new(ApicBus::new()), 0, true);
+        let link = bench.apic.local_controller("intr").expect("its controller");
+        assert_eq!(link.base_register(), bench.apic.apic_base());
+        assert_eq!(
+            link.base_register() & APIC_BASE_BSP,
+            APIC_BASE_BSP,
+            "and it says this is the bootstrap processor"
+        );
+
+        link.set_base_register(link.base_register() & !APIC_BASE_ENABLE);
+        assert_eq!(bench.apic.apic_base() & APIC_BASE_ENABLE, 0);
+        assert!(
+            !bench.apic.regs.state.lock().hardware_enabled(),
+            "and a hardware-disabled APIC is transparent"
+        );
     }
 
     #[test]

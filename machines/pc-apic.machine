@@ -29,18 +29,19 @@
 # image (ROADMAP.md §1). A board with no firmware realizes and executes open
 # bus, which is a useful thing to look at and not a machine that boots.
 #
-# # What is deliberately absent
+# # Two processors
 #
-# **A second processor.** Everything on the sending side of an application
-# processor's startup works — `src/dev/pc/apic.rs` implements the interrupt
-# command register, `INIT` and Start-Up, and the receiving APIC latches the page
-# it was told to begin at. What does not exist is the *processor's* half:
-# `cpu.x86` has no wait-for-SIPI state and no input that starts it at a given
-# `CS:IP`, only a `reset` pin that restarts it at the reset vector. Wiring a
-# second processor here would produce a machine where both cores run from
-# 0xfffffff0 at once, which is not what a PC does. `tests/pc_apic_smp.rs`
-# drives the sequence end to end with that one missing step supplied by the
-# test, so the day the core grows it, this file gains four lines.
+# This board is a multiprocessor, which is the thing an APIC is *for*. Each
+# processor has its own local APIC; the second one is an application processor
+# and it does not execute the reset vector. At power-up the MP initialization
+# protocol leaves every non-bootstrap processor in a wait-for-SIPI state (Intel
+# SDM Vol 3A 8.4.3), and here that is `pc.lapic`'s reset: the part knows which
+# processor it sits in front of, because `bsp` is its property, and it says so
+# over the same `LocalController` link an `INIT` and a Start-Up later travel.
+# So `cpu1` runs its reset sequence, is parked, and executes nothing until
+# firmware sends it the specification's three interrupt-command-register writes.
+# `tests/pc_apic.rs` runs a firmware that does exactly that, and
+# `tests/pc_apic_smp.rs` takes the same sequence apart on a bare rig.
 #
 # # Sources
 #
@@ -95,7 +96,28 @@ machine "pc-apic" {
 
   # -- the processor ----------------------------------------------------------
 
+  # Two of them, identical but for which one the APIC bus calls the bootstrap
+  # processor — that is `lapic0`'s `bsp`, not a property of the core.
+  #
+  # **These are 486s, so they have no model-specific registers**, and that is a
+  # limit of what a machine file can currently say rather than a choice. A local
+  # APIC's base register is `IA32_APIC_BASE`, an MSR, and the core does forward
+  # `RDMSR`/`WRMSR` for it through `LocalController` — but `cpu.x86`'s feature
+  # toggles (`msr`, `cr4`, and the rest of `Features`) are construction
+  # properties the *validator's* schema does not list, so writing `msr = true`
+  # here is rejected before the core ever sees it. Until that schema names them,
+  # an operating system on this board finds its local APIC at the address the
+  # `map` below gives rather than by asking the processor.
+
   object cpu0 "cpu.x86" {
+    clock   = cpu
+    space   = mem
+    iospace = "port"
+    model   = "80486"
+    engine  = "interp"
+  }
+
+  object cpu1 "cpu.x86" {
     clock   = cpu
     space   = mem
     iospace = "port"
@@ -127,7 +149,8 @@ machine "pc-apic" {
   # `id = 0` and the implied `bsp = true`: this is the bootstrap processor.
 
   object lapic0 "pc.lapic" { clock = bus, id = 0, bus = "apic" }
-  object ioapic "pc.ioapic" { id = 1, bus = "apic" }
+  object lapic1 "pc.lapic" { clock = bus, id = 1, bus = "apic" }
+  object ioapic "pc.ioapic" { id = 2, bus = "apic" }
 
   # -- timers -----------------------------------------------------------------
 
@@ -174,6 +197,15 @@ machine "pc-apic" {
   map mem 0xfed00000 size 0x0400   = hpet0.regs    # HPET spec §3.2.4
   map mem 0xfee00000 size 0x1000   = lapic0.regs   # SDM Vol 3A §10.4.4
 
+  # The second processor's APIC page. **On real hardware it would also be at
+  # 0xfee00000**: the aperture is per processor, and each one sees its own.
+  # rsemu has one address space per bus and both processors are on this one, so
+  # the second part answers at a page of its own. A guest that finds its APIC
+  # through `IA32_APIC_BASE` — which is what an MP-aware operating system does —
+  # would read the right address on each processor, because that register is per
+  # part; on this board, with no MSRs, it is the `map` that says where they are.
+  map mem 0xfef00000 size 0x1000   = lapic1.regs
+
   # The reset vector's copy of the ROM, at the top of the 32-bit space.
   map mem 0x100000000 - biossize size biossize = bios
 
@@ -212,6 +244,13 @@ machine "pc-apic" {
   wire lapic0.nmi  -> cpu0.nmi
   wire pic2.int    -> pic1.ir2
 
+  # The application processor's half. Its LINT0 is **not** wired to the 8259A:
+  # virtual-wire mode delivers `ExtINT` to one processor, and a second one
+  # acknowledging the same controller would take vectors meant for the first
+  # (MP specification 3.6.2). Everything else it is sent arrives as a message.
+  wire lapic1.intr -> cpu1.intr
+  wire lapic1.nmi  -> cpu1.nmi
+
   # Every legacy line lands twice: on the 8259A input it has always had, and on
   # the I/O APIC input the MP specification assigns it. That is how the boards
   # were actually built — the same pin goes to both parts — and it is what lets
@@ -243,8 +282,23 @@ machine "pc-apic" {
 
   # A20 and reset each have two drivers, which is the wired-OR a net with two
   # sources exists for (ROADMAP.md §4.3).
+  #
+  # A20 reaches **both** processors: the gate is one AND gate on the address
+  # bus, shared by everything that drives it, and is modelled per initiator here
+  # only because rsemu has nothing between an initiator and its space.
   wire kbc.a20      -> cpu0.a20
   wire sysctl.a20   -> cpu0.a20
+  wire kbc.a20      -> cpu1.a20
+  wire sysctl.a20   -> cpu1.a20
+
+  # Reset reaches the bootstrap processor only, which is a modelling limit
+  # stated rather than hidden. On the hardware these two pulses reset the whole
+  # system, local APICs included, and the MP initialization protocol runs again
+  # to re-park the application processor. Here a `reset` pin reaches a core and
+  # nothing reaches `pc.lapic`, so driving `cpu1.reset` would restart the second
+  # processor at 0xfffffff0 with no APIC to park it — two cores in the firmware
+  # at once, which is the failure this board exists to not have. Left parked, it
+  # is where the re-run firmware's own Start-Up will find it.
   wire kbc.reset    -> cpu0.reset
   wire sysctl.reset -> cpu0.reset
 }
