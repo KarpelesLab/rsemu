@@ -4,8 +4,12 @@
 //! # Sources
 //!
 //! * Ralf Brown's Interrupt List for `INT 08h`, `INT 11h`, `INT 12h`,
-//!   `INT 15h` (`AH=88h`, `AX=E801h`, `AX=E820h`), `INT 18h`, `INT 19h` and
-//!   `INT 1Ah`.
+//!   `INT 15h` (`AH=87h`, `AH=88h`, `AX=E801h`, `AX=E820h`), `INT 18h`,
+//!   `INT 19h` and `INT 1Ah`.
+//! * The **Intel SDM** Volume 3A for what `AH=87h` borrows: §3.4.3 for the
+//!   hidden descriptor cache a segment register carries, §3.4.5 for the
+//!   descriptor layout the caller fills in, and §9.9.2 for what survives a
+//!   switch back to real-address mode.
 //! * ACPI 6.5 §15.2 for the `E820` entry layout and its address-range types.
 //! * Motorola MC146818 data sheet for the clock registers `INT 1Ah` reads, and
 //!   the AT's CMOS map for the century byte at 0x32.
@@ -14,11 +18,11 @@
 
 use super::{
     BDA_EQUIPMENT, BDA_MEMSIZE, BDA_MOTOR, BDA_MOTOR_TIMEOUT, BDA_ROLLOVER, BDA_TICKS, E820_ENTRY,
-    EBDA_E820, EBDA_E820_COUNT, EBDA_SEGMENT, F_AX, F_CX, F_DX, FLAG_CF, Labels, POST_STACK,
-    clear_cf, ds_bda, enter, leave, load_seg, set_cf,
+    EBDA_E820, EBDA_E820_COUNT, EBDA_GDTR, EBDA_SEGMENT, F_AX, F_CX, F_DX, FLAG_CF, Labels,
+    POST_STACK, clear_cf, ds_bda, enter, leave, load_seg, set_cf,
 };
 use crate::fw::asm16::{
-    AH, AL, AX, Alu, Asm, BH, BL, BP, BX, CS, CX, Cc, DL, DS, DX, ES, Mem, SI, SP, SS,
+    AH, AL, AX, Alu, Asm, BH, BL, BP, BX, CS, CX, Cc, DI, DL, DS, DX, ES, Mem, SI, SP, SS, Shift,
 };
 
 // The `INT 15h` frame. That handler alone uses `PUSHAD`, because `E820` is
@@ -26,6 +30,8 @@ use crate::fw::asm16::{
 // would drop the halves the caller cares about. Four bytes per register, so
 // every offset differs from the `PUSHA` frame the other handlers use.
 
+/// The saved `ESI` — where `AH=87h`'s descriptor table is pointed at.
+const G_ESI: i32 = 4;
 /// The saved `EBX` — `E820`'s continuation index.
 const G_EBX: i32 = 16;
 /// The saved `EDX` — where `'SMAP'` arrives.
@@ -113,6 +119,7 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.cld();
 
     let ext_size = a.label();
+    let block_move = a.label();
     let e8xx = a.label();
     let e801 = a.label();
     let e820 = a.label();
@@ -122,6 +129,8 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.mov8(AH, Mem::bp(G_EAX + 1));
     a.alui8(Alu::CMP, AH, 0x88);
     a.jcc(Cc::E, ext_size);
+    a.alui8(Alu::CMP, AH, 0x87);
+    a.jcc(Cc::E, block_move);
     a.alui8(Alu::CMP, AH, 0xe8);
     a.jcc(Cc::E, e8xx);
     a.jmp(fail);
@@ -196,11 +205,11 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.mul(CX);
     a.mov(SI, AX);
     a.alui(Alu::ADD, SI, EBDA_E820);
-    a.push(crate::fw::asm16::DI);
+    a.push(DI);
     a.movi(CX, E820_ENTRY / 2);
     a.rep();
     a.movsw();
-    a.pop(crate::fw::asm16::DI);
+    a.pop(DI);
 
     a.movi32(AX, SMAP);
     a.movto32(Mem::bp(G_EAX), AX);
@@ -217,6 +226,117 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.bind(not_last);
     a.movto32(Mem::bp(G_EBX), BX);
     a.alui(Alu::AND, Mem::bp(G_FLAGS), !FLAG_CF);
+    a.jmp(g_done);
+
+    // AH=87h, block move. `ES:SI` points at a table of six 8-byte segment
+    // descriptors and `CX` holds a *word* count, at most 8000h — one segment's
+    // worth, which is the whole reason the interface is shaped this way. Entry
+    // 2 describes the source and entry 3 the destination; entries 1, 4 and 5
+    // are the caller's to leave blank and a real BIOS's to fill in with the
+    // table's own descriptor, its code segment and its stack. **This one does
+    // not fill them**, because it never loads a selector that names one, and
+    // writing into the caller's table to satisfy a convention nobody reads
+    // back would be a side effect rather than a service (RBIL, `INT 15h`
+    // `AH=87h`).
+    //
+    // How the copy is done, and why it is not a full mode switch:
+    //
+    // The descriptor caches are architectural state: a segment register loaded
+    // in protected mode keeps its base and limit when `CR0.PE` goes back to
+    // zero, and real-address mode then addresses through them (Intel SDM
+    // Vol. 3A §3.4.3 for the hidden part of a segment register, §9.9.2 for
+    // what survives the switch back). So `PE` is set just long enough to load
+    // `DS` from the source descriptor and `ES` from the destination one, and
+    // the transfer itself is an ordinary real-mode `REP MOVSW` reaching
+    // wherever those two descriptors point — including above the first
+    // megabyte, which is the only reason anybody calls this function.
+    //
+    // Interrupts are off across the whole of it: while `PE` is set the
+    // processor would take an interrupt through a *protected-mode* IDT, and
+    // the one loaded is the real-mode vector table. `src/cpu/x86/prot.rs`
+    // models the caches this way for exactly this idiom, and real 386 and 486
+    // silicon does too.
+    //
+    // Nothing unreal survives the call: the epilogue's `POP ES` and `POP DS`
+    // reload both registers in real mode, which puts their bases back to
+    // `selector * 16` and their limits back to 64 KiB. The caller gets its own
+    // segments, not this handler's.
+    //
+    // `CX` is taken at face value. RBIL documents a maximum of 8000h words and
+    // this does not enforce it: the descriptors the caller supplied carry the
+    // limits, so a caller that asks for more than its own segment holds gets a
+    // fault rather than a silently truncated copy, which is the more useful of
+    // the two wrong answers.
+    //
+    // A20 is not re-checked here. POST opens it and nothing this firmware runs
+    // closes it, so `AH=03h` — the "A20 failed" status — is a code this
+    // handler has no way to produce and does not pretend to.
+    a.bind(block_move);
+    let bad_descriptor = a.label();
+    let flush = a.label();
+    a.cli();
+    // `ES` is still the caller's — nothing between the handler's prologue and
+    // here touches it — but `SI` comes out of the frame rather than being
+    // assumed, so a function added to the dispatch above cannot quietly break
+    // this one by using it as scratch.
+    a.mov(SI, Mem::bp(G_ESI));
+    // Neither descriptor being present would fault the moment its selector is
+    // loaded, and a fault with `PE` set and the real-mode vector table still
+    // installed is not a diagnosable event. Checking the access byte first
+    // turns it into a status code (SDM Vol. 3A §3.4.5, the P bit).
+    a.testi8(Mem::si(0x15).seg(ES), 0x80);
+    a.jcc(Cc::E, bad_descriptor);
+    a.testi8(Mem::si(0x1d).seg(ES), 0x80);
+    a.jcc(Cc::E, bad_descriptor);
+
+    // The table's linear address, `ES * 16 + SI`, which is what `LGDT` wants.
+    a.movrs(AX, ES);
+    a.movi32(BX, 0);
+    a.mov(BX, AX);
+    a.shift32(Shift::SHL, BX, 4);
+    a.movi32(AX, 0);
+    a.mov(AX, Mem::bp(G_ESI));
+    a.alu32(Alu::ADD, BX, AX);
+    load_seg(a, DS, EBDA_SEGMENT, AX);
+    // Six descriptors, so the limit is 0x2f: the largest selector this handler
+    // ever loads is 0x18, and a limit that covered more of the caller's memory
+    // than the interface defines would be this firmware's mistake to make.
+    a.movmi(Mem::abs(EBDA_GDTR), 6 * 8 - 1);
+    a.movto32(Mem::abs(EBDA_GDTR + 2), BX);
+    a.lgdt(Mem::abs(EBDA_GDTR));
+
+    // The word count, which the `REP MOVSW` below consumes out of `CX`.
+    a.movi32(CX, 0);
+    a.mov(CX, Mem::bp(G_ECX));
+
+    a.read_cr0(AX);
+    a.alui32(Alu::OR, AX, 1);
+    a.write_cr0(AX);
+    a.movi(BX, 0x10); // the source descriptor, entry 2
+    a.movsr(DS, BX);
+    a.movi(BX, 0x18); // the destination descriptor, entry 3
+    a.movsr(ES, BX);
+    a.read_cr0(AX);
+    a.alui32(Alu::AND, AX, !1u32);
+    a.write_cr0(AX);
+    // A jump to the next instruction, which is what flushes a prefetch queue
+    // that was filled under the other mode.
+    a.jmp(flush);
+    a.bind(flush);
+    a.movi(SI, 0);
+    a.movi(DI, 0);
+    a.cld();
+    a.rep();
+    a.movsw();
+    a.movmi8(Mem::bp(G_EAX + 1), 0x00);
+    a.alui(Alu::AND, Mem::bp(G_FLAGS), !FLAG_CF);
+    a.jmp(g_done);
+
+    // AH=02h is "exception occurred", which is the nearest thing RBIL has to
+    // "your descriptor would have faulted".
+    a.bind(bad_descriptor);
+    a.movmi8(Mem::bp(G_EAX + 1), 0x02);
+    a.alui(Alu::OR, Mem::bp(G_FLAGS), FLAG_CF);
     a.jmp(g_done);
 
     // Everything else. AH=86h is "unsupported function", which is what a caller

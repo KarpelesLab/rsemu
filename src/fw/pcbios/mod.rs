@@ -46,15 +46,18 @@
 //! # What it does
 //!
 //! POST brings up the chipset, fills the BIOS Data Area, scans for option ROMs,
-//! finds the disks and boots:
+//! finds the disks and boots. It is enough for **FreeDOS 1.3 to boot off a
+//! diskette** and reach an interactive prompt, which is `ROADMAP.md` phase 6a's
+//! gate; `tests/pc_at_boot.rs` runs that, gated on an image nothing here
+//! vendors.
 //!
 //! | | |
 //! | --- | --- |
-//! | `INT 10h` | video: set mode, cursor, teletype, scroll, write string |
+//! | `INT 10h` | video: set mode, cursor, teletype, scroll, read and write cells, write string |
 //! | `INT 11h` | the equipment word |
 //! | `INT 12h` | base memory size |
-//! | `INT 13h` | disk: the IDE channel and the µPD765 both, plus the EDD subset |
-//! | `INT 15h` | `E820`, `E801`, `AH=88h` — the memory map |
+//! | `INT 13h` | disk: the IDE channel and the µPD765 both, read and write, plus the EDD subset |
+//! | `INT 15h` | `E820`, `E801`, `AH=88h` — the memory map — and `AH=87h`, block move |
 //! | `INT 16h` | keyboard, out of the buffer `INT 09h` fills |
 //! | `INT 19h` | the bootstrap loader |
 //! | `INT 1Ah` | the tick count and the real-time clock |
@@ -67,18 +70,22 @@
 //! * **No PCI BIOS interface (`INT 1Ah AH=B1h`)** and no ACPI or SMBIOS tables.
 //!   `ROADMAP.md` phase 6a names all three; they come after a boot, and a boot
 //!   without them is the milestone.
-//! * **No protected-mode services.** `INT 15h AH=87h` (block move) and `AH=89h`
-//!   (switch to protected mode) return carry. A guest that wants protected mode
-//!   sets it up itself, which every one of them does anyway.
+//! * **`INT 15h AH=89h`, switch to protected mode, returns carry.** `AH=87h`
+//!   is here; handing the machine over permanently is not, and no guest needs
+//!   it — every one of them sets protected mode up itself.
+//! * **No `INT 10h AH=11h`**, the character-generator group. `AL=30h` answers
+//!   with a pointer to a font table, and this ROM has no font in it: the text
+//!   is drawn by `pc.video`, not by the firmware. Fabricating a pointer would
+//!   be worse than carry. FreeDOS calls it once while booting and does not
+//!   mind.
 //! * **`INT 10h AH=06h` scrolls the whole screen** rather than the requested
 //!   rectangle when the line count is non-zero; the rectangle *is* honoured for
 //!   a clear (`AL=0`), which is the case programs actually use it for.
 //! * **Text mode only**, because `pc.video` is a text-mode CRTC. Setting a
 //!   graphics mode records the number and changes nothing.
-//! * **A diskette can be read but not written.** `INT 13h AH=03h` with
-//!   `DL < 0x80` returns carry: the µPD765 command differs from a read by one
-//!   opcode bit and the 8237's mode by one nibble, and shipping that untested
-//!   would be worse than not shipping it.
+//! * **No diskette `FORMAT TRACK`** (`INT 13h AH=05h`). Reads and writes work;
+//!   formatting one is a different command phase and nothing that boots asks
+//!   for it, because a diskette that boots is already formatted.
 //! * **No serial, parallel, or PS/2 mouse services** (`INT 14h`, `INT 17h`,
 //!   `INT 15h AH=C2h`): the board has none of those devices.
 //! * **The keyboard is US-layout and set 1**, decoded from the translated codes
@@ -223,6 +230,11 @@ const EBDA_FD_HEAD: u16 = 0x1c;
 const EBDA_FD_DONE: u16 = 0x1d;
 /// Diskette scratch: sectors per track, from the CMOS drive type.
 const EBDA_FD_SPT: u16 = 0x1e;
+/// Diskette scratch: the µPD765 command a transfer is running — `READ DATA` or
+/// `WRITE DATA`. Two things have to agree about a transfer's direction, the
+/// chip's opcode and the 8237's mode register, and both are derived from this
+/// one byte so that they cannot disagree.
+const EBDA_FD_CMD: u16 = 0x1f;
 /// How many `E820` entries [`EBDA_E820`] holds (word).
 const EBDA_E820_COUNT: u16 = 0x14;
 /// The `E820` memory map, built at POST: twenty bytes per entry.
@@ -230,6 +242,12 @@ const EBDA_E820: u16 = 0x20;
 /// The seven result bytes of the last µPD765 command — `ST0`, `ST1`, `ST2`,
 /// `C`, `H`, `R`, `N`. Immediately past the `E820` table.
 const EBDA_FD_RESULT: u16 = EBDA_E820 + E820_ENTRY * 4;
+
+/// The six-byte pseudo-descriptor `INT 15h AH=87h` hands to `LGDT`: a 16-bit
+/// limit and a 32-bit base, built from the caller's `ES:SI`. It lives here
+/// rather than on the stack because `LGDT` takes a memory operand and the
+/// handler's stack frame is what `[bp+n]` names.
+const EBDA_GDTR: u16 = EBDA_FD_RESULT + 7;
 
 /// How many bytes one `E820` entry occupies: base, length, type.
 const E820_ENTRY: u16 = 20;
@@ -326,7 +344,7 @@ pub(crate) struct Labels {
     pub fd_start: Label,
     pub fd_seek: Label,
     pub fd_dma: Label,
-    pub fd_read_one: Label,
+    pub fd_xfer_one: Label,
     pub fd_geometry: Label,
 
     // POST helpers
@@ -378,7 +396,7 @@ impl Labels {
             fd_start: a.label(),
             fd_seek: a.label(),
             fd_dma: a.label(),
-            fd_read_one: a.label(),
+            fd_xfer_one: a.label(),
             fd_geometry: a.label(),
             cmos_read: a.label(),
             kbc_wait_write: a.label(),
