@@ -367,13 +367,73 @@ The same test boots the same sector off the **diskette**, with both IDE bays
 empty so `INT 19h` falls through to it — a different path end to end, through
 the µPD765 and DMA channel 2 rather than the IDE command block.
 
+The guest also *writes*: `INT 13h AH=03h` to the diskette and to the fixed disk,
+each read back afterwards. The fixed disk's is compared against the drive's own
+**medium** through `ata::bays`, which is the standard `tests/pc_at_ide.rs` sets;
+the diskette's cannot be, because `pc.fdc` publishes no host object and
+`Bindings::bind` refuses a second binding for a class `dev::pc::bind` has already
+claimed — so it is a read-back instead, which is still a claim about the medium
+because that controller rebuilds its sector buffer from the image at the start of
+every transfer. An `Fdc765` medium accessor reachable from a realized machine
+would close that gap. And the guest moves 512 bytes out to 8 MiB and back with
+`INT 15h AH=87h`, the one service that reaches above the first megabyte from
+real mode.
+
+### FreeDOS boots
+
+`ROADMAP.md` phase 6a's gate, and it is met. `tests/pc_at_boot.rs` boots a
+**FreeDOS 1.3 diskette** on this board with rsemu's own firmware in the socket,
+gated on `RSEMU_FREEDOS_FLOPPY` so an ordinary `cargo test` stays hermetic;
+`scripts/fetch-testdata.sh freedos` fetches one into the ignored corpus
+directory. **Nothing is vendored** — FreeDOS is GPL-2.0, running it as an
+emulated guest is ordinary use, shipping it here would not be, and its source
+was not read (`ROADMAP.md` §1). Quoted from a run:
+
+```text
+  |FreeCom version 0.85a - WATCOMC - XMS_Swap [Jul 10 2021 19:28:06]|
+  |Welcome to the FreeDOS 1.3 installation program.|
+  |Do you want to proceed [Y,N]?|
+  pc-at freedos: 5.8s of host time; stopped at 2241:0000375f, halted=true
+  pc-at freedos: vectors 08->0070:000f 10->f000:047f 13->f000:09c9 21->00d8:129a
+```
+
+Sixty seconds of virtual time end to end, six of host time: FreeDOS's own boot
+sector loads a compressed kernel a sector at a time through `INT 13h AH=02h`,
+printing a dot as it goes; the kernel decompresses and initialises,
+`FDCONFIG.SYS` runs, `COMMAND.COM` prints its banner, and the installer draws a
+screen and waits at a prompt. Feeding one scan code to the 8042 at that point
+puts an `N` on the line after the prompt, so it is a live prompt rather than a
+picture; the committed test does not do that, because a second keystroke does
+not arrive (see the `pc.kbc` note in `tests/pc_at_boot.rs`) and half a
+conversation is not worth asserting. `INT 21h` moving out of segment `0xf000`
+is the assertion that says a kernel installed itself, and it is independent of
+which DOS.
+
+Two things the boot taught the firmware, neither predicted:
+
+- **`INT 10h AH=08h`, read the character and attribute under the cursor, is
+  called over four hundred times in the first twenty virtual seconds** — and
+  was not implemented, so it answered with whatever `AX` happened to hold. It
+  is now. That count is measured, by single-stepping the boot and decoding
+  every `CD` opcode the guest executed.
+- **`INT 15h` is not called once** over that same window — not `E820`, not
+  `E801`, not `AH=88h`, not `AH=87h`. A 16-bit DOS sizes memory from the BDA
+  and reaches extended memory through its own XMS driver, so the whole
+  memory-map interface is for the operating systems that come after this one.
+  `AH=87h` was implemented anyway, because a DOS extender is the next thing to
+  run here and block move is the service it asks for; it is exercised by the
+  hermetic test's own boot sector rather than by FreeDOS.
+
 ### What it does not do
 
-- **A diskette can be read but not written.** `INT 13h AH=03h` with
-  `DL < 0x80` returns carry. Reads go the whole way — digital output register,
-  four `SENSE INTERRUPT STATUS` commands to clear the reset's ready-changed
-  reports, `SPECIFY`, `SEEK`, an 8237 channel-2 programming and one `READ DATA`
-  per sector — and `tests/pc_at_boot.rs` boots off one.
+- **No diskette `FORMAT TRACK`** (`INT 13h AH=05h`). Reads and writes both go
+  the whole way — digital output register, four `SENSE INTERRUPT STATUS`
+  commands to clear the reset's ready-changed reports, `SPECIFY`, `SEEK`, an
+  8237 channel-2 programming and one `READ DATA` or `WRITE DATA` per sector —
+  and formatting is a different command phase that nothing which boots asks for.
+- **No `INT 10h AH=11h`**, the character-generator group: `AL=30h` answers with
+  a pointer to a font table and this ROM has no font in it, because the text is
+  drawn by `pc.video`. FreeDOS calls it once while booting and does not mind.
 - **No PCI BIOS interface, no ACPI, no SMBIOS.** All three are phase-6a
   deliverables and all three come after a boot.
 - **Text mode only**, because `pc.video` is a text-mode CRTC. `INT 10h AH=00h`

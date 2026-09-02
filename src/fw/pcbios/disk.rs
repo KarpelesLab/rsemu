@@ -26,16 +26,18 @@
 //!
 //! `DL < 0x80` goes to the µPD765 through [`diskette`], which has its own
 //! source list: the motor and data rate, `SPECIFY`, `SEEK`, `SENSE INTERRUPT
-//! STATUS`, an 8237 channel-2 programming and one `READ DATA` per sector. Only
-//! unit 0 exists on this board, and a diskette **write** returns carry — the
-//! command differs from a read by one opcode bit and one DMA mode nibble, and
-//! shipping it untested would be worse than not shipping it.
+//! STATUS`, an 8237 channel-2 programming and one `READ DATA` or `WRITE DATA`
+//! per sector. Only unit 0 exists on this board. Reads and writes share every
+//! step; the two things that differ — the µPD765 opcode and the 8237's transfer
+//! type — are both derived from the one byte at `EBDA_FD_CMD`, because a write
+//! programmed with a read's DMA direction does not fail loudly, it fills the
+//! caller's buffer from the disk and leaves the disk untouched.
 
 use super::{
-    EBDA_COMMAND, EBDA_FD_COUNT, EBDA_FD_CYLINDER, EBDA_FD_DONE, EBDA_FD_HEAD, EBDA_FD_RESULT,
-    EBDA_FD_SECTOR, EBDA_FD_SPT, EBDA_HD_CAPACITY, EBDA_HD_CYLINDERS, EBDA_HD_FLAGS, EBDA_HD_HEADS,
-    EBDA_HD_SECTORS, EBDA_LBA_HIGH, EBDA_LBA_LOW, F_AX, F_BX, F_CX, F_DS, F_DX, F_ES, F_SI, Labels,
-    clear_cf, ds_ebda, enter, leave, set_cf,
+    EBDA_COMMAND, EBDA_FD_CMD, EBDA_FD_COUNT, EBDA_FD_CYLINDER, EBDA_FD_DONE, EBDA_FD_HEAD,
+    EBDA_FD_RESULT, EBDA_FD_SECTOR, EBDA_FD_SPT, EBDA_HD_CAPACITY, EBDA_HD_CYLINDERS,
+    EBDA_HD_FLAGS, EBDA_HD_HEADS, EBDA_HD_SECTORS, EBDA_LBA_HIGH, EBDA_LBA_LOW, F_AX, F_BX, F_CX,
+    F_DS, F_DX, F_ES, F_SI, Labels, clear_cf, ds_ebda, enter, leave, set_cf,
 };
 use crate::fw::asm16::{
     AH, AL, AX, Alu, Asm, BH, BL, BX, CH, CL, CS, CX, Cc, DH, DI, DL, DS, DX, ES, Mem, SI, Shift,
@@ -101,11 +103,11 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     }
     a.jmp(l.disk_fail);
 
-    // The diskette. Only unit 0 exists on this board, and only reads and the
-    // two parameter queries are answered; a write returns carry.
+    // The diskette. Only unit 0 exists on this board.
     a.bind(floppy);
     let fd_reset = a.label();
     let fd_read = a.label();
+    let fd_write = a.label();
     let fd_params = a.label();
     let fd_kind = a.label();
     a.alui8(Alu::CMP, DL, 0x00);
@@ -114,6 +116,7 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
         (0x00u8, fd_reset),
         (0x01, l.disk_ok),
         (0x02, fd_read),
+        (0x03, fd_write),
         (0x04, l.disk_ok),
         (0x08, fd_params),
         (0x15, fd_kind),
@@ -147,12 +150,28 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     clear_cf(a);
     a.jmp(done);
 
-    // AH=02h for a diskette. The caller's CHS goes to the controller unchanged
-    // — a µPD765 addresses by cylinder, head and sector, so unlike the fixed
-    // disk there is no translation to get wrong. One `READ DATA` command per
+    // AH=02h and AH=03h for a diskette. The caller's CHS goes to the controller
+    // unchanged — a µPD765 addresses by cylinder, head and sector, so unlike
+    // the fixed disk there is no translation to get wrong. One command per
     // sector, because that makes the terminal-count and end-of-track rules
-    // somebody else's problem: `EOT` is set to the sector being read.
+    // somebody else's problem: `EOT` is set to the sector being transferred.
+    //
+    // Two things differ between a read and a write, and both are derived from
+    // the one byte at `EBDA_FD_CMD`: the µPD765 opcode (`READ DATA` 0x06 versus
+    // `WRITE DATA` 0x05, both with `MFM` set), and the 8237's transfer-type
+    // field, which says *write to memory* for one and *read from memory* for
+    // the other (8237A data sheet, mode register bits 3-2). Deriving the second
+    // from the first is what stops them disagreeing — a write programmed with a
+    // read's DMA mode does not fail loudly, it fills the caller's buffer from
+    // the sector already on the disk and leaves the disk untouched.
     a.bind(fd_read);
+    a.movi8(AL, 0x46); // READ DATA, MFM
+    let fd_transfer = a.label();
+    a.jmp(fd_transfer);
+    a.bind(fd_write);
+    a.movi8(AL, 0x45); // WRITE DATA, MFM
+    a.bind(fd_transfer);
+    a.movto8(Mem::abs(EBDA_FD_CMD), AL);
     let fd_loop = a.label();
     let fd_stop = a.label();
     let fd_finished = a.label();
@@ -179,7 +198,7 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
 
     a.bind(fd_loop);
     a.call(l.fd_dma);
-    a.call(l.fd_read_one);
+    a.call(l.fd_xfer_one);
     a.jcc(Cc::B, fd_stop);
     a.incm8(Mem::abs(EBDA_FD_DONE));
     a.alui(Alu::ADD, BX, 512);
@@ -688,14 +707,16 @@ fn diskette(a: &mut Asm, l: &Labels) {
     a.pop(AX);
     a.ret();
 
-    // -- fd_dma: one sector, into ES:BX -------------------------------------
+    // -- fd_dma: one sector, to or from ES:BX -------------------------------
     //
     // The 8237 addresses memory physically, so the far pointer is flattened
     // here: `ES * 16 + BX`, whose carry out of sixteen bits is the page latch's
-    // business. Mode `0x46` is a single transfer, address increment, no
-    // auto-initialise, a *write* transfer (device to memory), channel 2. The
-    // count is one less than the length, which is what the chip counts down
-    // from.
+    // business. The mode byte is a single transfer, address increment, no
+    // auto-initialise, channel 2 — and a transfer type that follows the µPD765
+    // command: `0x46` is a *write* transfer (device to memory) for a read, and
+    // `0x4a` is a *read* transfer (memory to device) for a write (8237A data
+    // sheet, "Mode Register", bits 3-2). The count is one less than the length,
+    // which is what the chip counts down from.
     a.bind(l.fd_dma);
     a.push(AX);
     a.push(BX);
@@ -712,7 +733,12 @@ fn diskette(a: &mut Asm, l: &Labels) {
     a.out_al(0x0a);
     a.movi8(AL, 0x00); // clear the byte-pointer flip-flop
     a.out_al(0x0c);
+    let dma_mode = a.label();
     a.movi8(AL, 0x46);
+    a.alui8(Alu::CMP, Mem::abs(EBDA_FD_CMD), 0x45);
+    a.jcc(Cc::NE, dma_mode);
+    a.movi8(AL, 0x4a);
+    a.bind(dma_mode);
     a.out_al(0x0b);
     a.mov8(AL, CL);
     a.out_al(0x04);
@@ -734,19 +760,22 @@ fn diskette(a: &mut Asm, l: &Labels) {
     a.pop(AX);
     a.ret();
 
-    // -- fd_read_one --------------------------------------------------------
+    // -- fd_xfer_one --------------------------------------------------------
     //
-    // `READ DATA` with `MFM` set and `MT`/`SK` clear, and `EOT` equal to the
-    // sector being read, so the command covers exactly one sector and the
-    // multi-track and end-of-cylinder rules never come into it. Carry comes
-    // back set unless `ST0`'s interrupt code is 00.
-    a.bind(l.fd_read_one);
+    // The command in `EBDA_FD_CMD` — `READ DATA` or `WRITE DATA`, both with
+    // `MFM` set and `MT`/`SK` clear — with `EOT` equal to the sector being
+    // transferred, so the command covers exactly one sector and the multi-track
+    // and end-of-cylinder rules never come into it. Carry comes back set unless
+    // `ST0`'s interrupt code is 00, which is also how a write to a
+    // write-protected medium reports itself: the chip terminates abnormally and
+    // sets `ST1`'s not-writable bit (µPD765A data sheet, status register 1).
+    a.bind(l.fd_xfer_one);
     a.push(AX);
     a.push(CX);
     a.push(DI);
     let r_ok = a.label();
     let r_out = a.label();
-    a.movi8(AL, 0x46);
+    a.mov8(AL, Mem::abs(EBDA_FD_CMD));
     a.call(l.fd_out);
     a.mov8(AL, Mem::abs(EBDA_FD_HEAD));
     a.shift8(Shift::SHL, AL, 2);

@@ -1024,6 +1024,33 @@ impl Asm {
         self.db(&[0xef]);
     }
 
+    // -- system -------------------------------------------------------------
+    //
+    // The three instructions a real-mode BIOS needs in order to borrow the
+    // protected-mode machinery for the length of one service call, and no
+    // more. Everything else about protection is the guest's business.
+
+    /// `LGDT m16&32` — `0F 01 /2` (SDM Vol. 2, `LGDT/LIDT`).
+    ///
+    /// With no operand-size prefix the base is loaded from 24 bits and the top
+    /// byte is cleared, which is the 16-bit form and exactly what a table in
+    /// the first megabyte needs.
+    pub fn lgdt(&mut self, table: Mem) {
+        self.encode(&[0x0f, 0x01], 2, table);
+    }
+
+    /// `MOV r32, CR0` — `0F 20 /r` with the `reg` field naming the control
+    /// register. The operand is 32 bits whatever the code size, so there is no
+    /// `66` prefix (SDM Vol. 2, `MOV — Move to/from Control Registers`).
+    pub fn read_cr0(&mut self, dst: R16) {
+        self.encode(&[0x0f, 0x20], 0, dst);
+    }
+
+    /// `MOV CR0, r32` — `0F 22 /r`.
+    pub fn write_cr0(&mut self, src: R16) {
+        self.encode(&[0x0f, 0x22], 0, src);
+    }
+
     // -- fixups -------------------------------------------------------------
 
     fn rel16(&mut self, label: Label) {
@@ -1094,6 +1121,15 @@ mod tests {
             one(|a| a.movi32(CX, 20)),
             [0x66, 0xb9, 0x14, 0x00, 0x00, 0x00]
         );
+        // The three system instructions. `MOV r32, CR0` takes no `66` prefix:
+        // its operand is 32 bits in every code size, so emitting one would be
+        // a different instruction rather than a longer encoding of this one.
+        assert_eq!(
+            one(|a| a.lgdt(Mem::abs(0x0078))),
+            [0x0f, 0x01, 0x16, 0x78, 0x00]
+        );
+        assert_eq!(one(|a| a.read_cr0(AX)), [0x0f, 0x20, 0xc0]);
+        assert_eq!(one(|a| a.write_cr0(AX)), [0x0f, 0x22, 0xc0]);
     }
 
     #[test]

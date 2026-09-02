@@ -41,6 +41,7 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     let scroll_fn = a.label();
     let write_ca = a.label();
     let write_c = a.label();
+    let read_ca = a.label();
     let teletype = a.label();
     let get_mode = a.label();
     let write_str = a.label();
@@ -53,6 +54,7 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
         (0x02, set_pos),
         (0x03, get_pos),
         (0x06, scroll_fn),
+        (0x08, read_ca),
         (0x09, write_ca),
         (0x0a, write_c),
         (0x0e, teletype),
@@ -152,6 +154,23 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.mov8(AH, Mem::bp(F_BX));
     a.rep();
     a.stosw();
+    a.jmp(done);
+
+    // AH=08h, read the character and attribute under the cursor: AL is the
+    // character and AH the attribute, which is the word the text page holds in
+    // that order. `BH`, the page, is ignored for the same reason AH=09h ignores
+    // it — this firmware keeps one cursor, in `0040:0050`, and a page it never
+    // switches to has no cursor to read from.
+    //
+    // Not a nicety: FreeDOS's command interpreter calls this hundreds of times
+    // during a boot, and an unimplemented function here returns whatever `AX`
+    // happened to hold.
+    a.bind(read_ca);
+    a.call(l.cell_offset);
+    a.movi(AX, TEXT_SEGMENT);
+    a.movsr(ES, AX);
+    a.mov(AX, Mem::di(0).seg(ES));
+    a.movto(Mem::bp(F_AX), AX);
     a.jmp(done);
 
     // AH=0Eh, teletype output: the one function POST and a boot sector both
