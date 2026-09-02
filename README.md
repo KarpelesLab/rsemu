@@ -179,6 +179,22 @@ NVMe namespace read, so `--drive usb0=disk.qcow2` works here for the same reason
 and through the same media slot. Its completion interrupt is the one that is not
 polled: it travels a wire into a PLIC and the guest takes a real trap for it.
 
+`xhci-mini` is that board with the controller swapped and nothing else changed,
+which is what makes the comparison worth anything. An **xHCI** is shaped like
+NVMe rather than like EHCI: the driver builds a Device Context Base Address
+Array, a command ring, an event ring with a segment table and one transfer ring
+per endpoint, and hands them over a doorbell at a time — with the **Cycle bit**
+in each Transfer Request Block as the ownership flag, so a ring is a cycle by
+construction and every walk over one is bounded. The RV32 program on this board
+resets the root port, issues Enable Slot and Address Device, reads the device
+descriptor over the default pipe, configures two bulk endpoints and then moves
+the same CBW/data/CSW triples to the same disk — checked against the same
+`Medium::read_at` as the EHCI board's, so "the bytes came back" cannot be
+satisfied by a controller echoing its own buffers. Its completions arrive as
+event TRBs, and acknowledging one is three writes in the order the specification
+fixes; the test counts the guest's traps and asserts fifteen, because the wrong
+order measures thirty.
+
 The framework underneath is complete: address spaces with priority and
 mirroring, an oscillator forest with exact intra-tree ratios, wires, devices,
 snapshots, a typed export seam so one device can hand another a handle, and a

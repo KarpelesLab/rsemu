@@ -27,7 +27,11 @@ there is no excuse for working from anything else.
   — so a device model works behind any controller. The controller then becomes a
   translator between its ring/queue format and generic transfers.
 - **xHCI first** if only one is built: it is what modern guests prefer, and it
-  is cleaner than EHCI's split-transaction handling.
+  is cleaner than EHCI's split-transaction handling. Ordering went the other way
+  here and the note is kept because the advice is still right for a fresh tree —
+  what made EHCI the cheaper *first* controller was that the fabric under it did
+  not exist yet, and a queue head is a smaller thing to be wrong about than a
+  ring, a context and a Cycle bit. Both are built now (§2 and §7).
 - Transfers are asynchronous and take guest-visible time. Route completions
   through the event queue at a virtual time derived from the guest clock, never
   the host clock — that is what keeps determinism (`ROADMAP.md` §4.7).
@@ -101,12 +105,13 @@ half-modelled controller can look like a working boot. Detection succeeding is
 the first thing that will change its behaviour, and the first thing that can
 regress it.
 
-## USB, as built (`bus-usb`, `dev-usb-ehci`, `dev-usb-chipidea`, `dev-usb-dwc2`, `dev-usb-hid`, `dev-usb-msd`)
+## USB, as built (`bus-usb`, `dev-usb-ehci`, `dev-usb-chipidea`, `dev-usb-dwc2`, `dev-usb-hid`, `dev-usb-msd`, `dev-usb-xhci`)
 
-Four layers, in the order they matter — and the order matters because the whole
-value of the arrangement is that the *next* controller reuses the first one
-unchanged. That is no longer a hope: §4 is the controller that tested it, and
-§4.1 is the *direction* that tested it.
+In the order they matter — and the order matters because the whole value of the
+arrangement is that the *next* controller reuses the first one unchanged. That
+is no longer a hope: §4 is the controller that tested it, §4.1 is the
+*direction* that tested it, and §7 is the controller whose schedule format is
+least like the fabric's and still needed nothing from it.
 
 ### 1. The fabric (`src/bus/usb/`, `bus-usb`)
 
@@ -605,6 +610,61 @@ after a reset, no `MODE SENSE` page bodies beyond the parameter header that
 carries the write-protect bit, and no `FORMAT UNIT`. A second LUN would be a
 property and a `Vec` of media; the rest is a page whose contents would be an
 invention.
+
+### 7. An xHCI (`src/dev/usb/xhci.rs`, `dev-usb-xhci`)
+
+The modern controller, and the one shaped like **NVMe** rather than like EHCI.
+Where §2 hands the controller two linked lists, xHCI hands it *rings*: a command
+ring, one transfer ring per endpoint, and an event ring the controller is the
+**producer** of — plus a Device Context Base Address Array, device and endpoint
+contexts, and a doorbell array. All of it lives in guest RAM.
+
+**The Cycle bit is the ownership protocol** (xHCI 1.2 §4.9). A ring has no head
+and tail register: each TRB carries a bit, the producer's cycle state says which
+value means "mine", the consumer walks forward until the bit disagrees, and a
+**Link TRB** closes the ring back on itself and toggles the state when its `TC`
+flag is set. So a ring is a *cycle by construction*, which is the same hazard the
+EHCI's circular queue-head list has with a different spelling, and it is bounded
+the same way: link hops, TRBs per Transfer Descriptor, work items per doorbell,
+packets per TRB. `fuzz/fuzz_targets/usb_xhci.rs` keeps all four true, and it maps
+the register block **into the space the controller masters** so a TRB's data
+buffer can be aimed at the doorbell array — four bytes of anything are a doorbell
+write, so the engine is iterative rather than recursive, exactly as `dev-nvme`
+is for a PRP entry aimed at `SQyTDBL`. It found a real defect on its first seeded
+run: a Slot ID is eight bits of a guest-written TRB and the enabled-slot bitmap
+is a `u32`, so 32 shifted past the end of it.
+
+**Nothing in `src/bus/usb/` changed for it.** That is the second time the seam
+has been tested by a controller with a completely different schedule format —
+§4 was the first — and this time it was tested by the one whose format is least
+like the fabric's. The device on the other end is §6's disk, unmodified.
+
+**Acknowledging an interrupt is three writes in a fixed order**, and the order is
+the specification's rather than a convention: `USBSTS.EINT` first (§5.4.2 bit 3
+names the race), then `ERDP` with `EHB` (§5.5.2.3.3, which is also how software
+says how far it has read), then `IMAN.IP` (§4.17.3: the pin stays asserted until
+that write). `tests/usb_xhci.rs` counts the traps a guest takes and asserts
+**fifteen**; completing the interrupt-controller claim before the third write
+measures **thirty**.
+
+**Traps and events are deliberately different numbers there** — nineteen events
+in fifteen interrupts — because `ERDP.EHB` blocks a second interrupt until the
+handler has drained the ring, which is §4.17.2's moderation scheme working. Both
+numbers are asserted, so a change to either is a failure rather than a difference
+nobody notices.
+
+What is not modelled, said plainly: **SuperSpeed** (the fabric has no such
+speed, so the one Supported Protocol capability declares `USB ` 2.0 and nothing
+else), **streams** (a non-zero `MaxPStreams` is a *Parameter Error*, not a field
+ignored), **isochronous transfers**, **scratchpad buffers**, **save/restore
+state**, and **more than one interrupter**. Unlike an EHCI the root hub drives
+full- and low-speed devices itself, so nothing is handed to a companion and
+nothing vanishes.
+
+`machines/xhci-mini.machine` is `usb-mini` with the controller swapped and
+nothing else changed, which is what makes the comparison worth anything: the same
+hart, the same PLIC, the same disk, and the sector read over rings checked
+against the same `Medium::read_at` as the sector read over queue heads.
 
 ## Host passthrough
 

@@ -1,0 +1,164 @@
+# xhci-mini — the smallest board a real xHCI driver can run on.
+#
+#   rsemu run xhci-mini --media firmware=fw.bin --drive usb0=disk.img
+#
+# A RISC-V hart, some RAM, an **xHCI host controller** and a **USB mass storage
+# device** plugged into its one root port. It models no product. It exists so
+# that a program can do the thing only a modern USB controller makes it do:
+# reset a root port, build a Device Context Base Address Array, a command ring
+# and an event ring with a segment table in this board's own RAM, issue Enable
+# Slot and Address Device, hand over endpoint contexts and transfer rings, and
+# then push a Command Block Wrapper out of a bulk endpoint and pull a sector and
+# a Command Status Wrapper back in — with every completion arriving as a TRB on
+# the event ring, the controller's interrupt travelling a real wire into a real
+# interrupt controller, and the acknowledgement being the three writes the
+# specification puts in a fixed order.
+#
+# ---------------------------------------------------------------------------
+# Why this board exists next to `usb-mini`
+# ---------------------------------------------------------------------------
+#
+# `usb-mini` is the same board with an EHCI on it, and the two are deliberately
+# identical apart from the controller: same hart, same PLIC, same disk, same
+# medium behind it. That is what makes the comparison worth anything. A guest
+# that reads sector 9 over EHCI and a guest that reads sector 9 over xHCI are
+# checked against the *same* `Medium::read_at`, so "the bytes came back" cannot
+# be satisfied by a controller that echoes its own buffers.
+#
+# ---------------------------------------------------------------------------
+# What is deliberately missing
+# ---------------------------------------------------------------------------
+#
+# **SuperSpeed.** `bus/usb` models low, full and high speed and nothing else, so
+# this controller declares one xHCI Supported Protocol Capability for `USB ` 2.0
+# covering every root port (xHCI 1.2 §7.2). A USB3 protocol capability would be
+# a promise about a bus that is not there.
+#
+# **A hub.** Every device is on a root port, so the Route String in a Slot
+# Context is zero and there is no Transaction Translator to describe. Unlike an
+# EHCI, an xHCI root hub drives full- and low-speed devices itself, so nothing
+# is handed to a companion controller and nothing vanishes — which is why the
+# disk here could be `full` and still work.
+#
+# **A second port and a second interrupter.** The bus is sized by whichever
+# object names it first, which is the controller below; `ports = 1` and the disk
+# sits in port 0. `HCSPARAMS1.MaxIntrs` is 1, wired to one pin.
+
+machine "xhci-mini" {
+  # How much ROM the firmware image gets, and how much RAM there is for the
+  # contexts, the rings, the buffers and the disk's data.
+  param rom  = 64K
+  param ram  = 1M
+
+  # How big the disk is when the run does not supply an image. A medium
+  # installed under the `usb0` slot (`--drive usb0=disk.img`) wins over this
+  # and brings its own capacity.
+  param capacity = 1M
+
+  # Bytes in a logical block. 512 is what every driver assumes without asking.
+  param block = 512
+
+  # Where the register block sits. A parameter because a test that moves it
+  # proves the board is a description rather than a set of constants.
+  param xhci_at = 0xf0000000
+
+  # -- the crystals ----------------------------------------------------------
+  #
+  # Two oscillators, because a board has two: the hart's, and the USB PHY's.
+  # 60 MHz is what a USB 2.0 PHY runs at, and 60 MHz / 8000 microframes a second
+  # is exactly 7500 ticks with no remainder — which is why the controller counts
+  # microframes in its own domain's ticks rather than in nanoseconds
+  # (ROADMAP.md §4.2).
+  osc sysclk = 100000000 Hz
+  osc usbclk = 60000000 Hz
+
+  # -- the one address space -------------------------------------------------
+  space mem { width = 32 }
+
+  # -- the processor ---------------------------------------------------------
+  object cpu "cpu.riscv" {
+    clock  = sysclk
+    space  = mem
+    engine = "interp"
+    xlen   = "rv32"
+    isa    = "ima"
+    hartid = 0
+    reset  = 0x00000000
+  }
+
+  # -- memory ----------------------------------------------------------------
+  #
+  # `image` names a media slot: whoever runs the machine binds the bytes
+  # (`--media firmware=fw.bin`), and nothing below host/ opens a file.
+  object fw   "rom" { size = rom, image = "firmware" }
+  object dram "ram" { size = ram }
+
+  # -- the interrupt controller ---------------------------------------------
+  #
+  # One hart, one context: machine mode, because this board has no supervisor
+  # to hand the second one to.
+  object plic "riscv.plic" {
+    sources    = 8
+    harts      = 1
+    supervisor = false
+  }
+
+  # -- the host controller ---------------------------------------------------
+  #
+  # `space = mem` because it is a **bus master**: the Device Context Base
+  # Address Array, the contexts, all four kinds of ring and every data buffer
+  # are in this board's RAM and the controller reads and writes them itself.
+  # Without that property it has nowhere to fetch a command from, and `bind`
+  # says so.
+  #
+  # It is named before the disk so that it is the object that fixes the bus
+  # size.
+  object xhci "usb.xhci" {
+    clock      = usbclk
+    space      = mem
+    bus        = "usb"
+    ports      = 1
+    slots      = 4
+    microframe = 7500
+  }
+
+  # -- the disk --------------------------------------------------------------
+  #
+  # A USB mass storage device on the controller's one root port. It masters
+  # nothing and has no register block: everything it does, it does by answering
+  # transactions the controller issues, which is why there is no `space` here
+  # and no `map` line below.
+  object disk "usb.storage" {
+    bus   = "usb"
+    port  = 0
+    image = "usb0"
+    size  = capacity
+    block = block
+    speed = "high"
+  }
+
+  # -- the memory map --------------------------------------------------------
+  #
+  # The register block is 12 KiB: the capability registers and the extended
+  # capability at the bottom, the operational registers at `CAPLENGTH`, the
+  # doorbell array at `DBOFF` = 0x1000 and the runtime registers at `RTSOFF` =
+  # 0x2000 (xHCI 1.2 §5.3.7, §5.3.8). A driver reads all three offsets out of
+  # the capability registers rather than assuming them, which is the point of
+  # their being registers.
+  map mem 0x00000000 size rom      = fw
+  map mem 0x0c000000 size 0x400000 = plic   # priority, enable, threshold, claim
+  map mem 0x10000000 size ram      = dram
+  map mem xhci_at    size 0x3000   = xhci
+
+  # -- the wire --------------------------------------------------------------
+  #
+  # xHCI's interrupt is **level triggered** and is the AND of `USBCMD.INTE`,
+  # `IMAN.IE` and `IMAN.IP` (xHCI 1.2 §4.17.3): once asserted the line stays
+  # asserted until software writes a one to `IMAN.IP`. A handler that completed
+  # the PLIC claim before doing that would leave the level asserted, the PLIC
+  # would re-latch the source, and the guest would take a spurious second trap
+  # for every interrupt — which is why `tests/usb_xhci.rs` counts traps instead
+  # of merely noticing one.
+  wire xhci.irq   -> plic.irq1
+  wire plic.meip0 -> cpu.meip
+}

@@ -418,6 +418,27 @@ pub static USB_MINI: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/usb-mini.machine"),
 };
 
+/// The same board with an **xHCI** on it, when this build has one.
+///
+/// Deliberately `usb-mini` with the controller swapped: the same hart, the same
+/// PLIC, the same `usb.storage` device and the same medium behind it, so that a
+/// guest reading a sector over rings and contexts is checked against the same
+/// `Medium::read_at` as a guest reading it over queue heads. What it adds is
+/// everything only a modern controller makes a driver do — a Device Context
+/// Base Address Array, a command ring, an event ring with a segment table, an
+/// Enable Slot and an Address Device — and the three-write acknowledgement
+/// xHCI 1.2 §4.17 fixes the order of. The `firmware` slot takes the program;
+/// the `usb0` slot takes the disk's contents.
+#[cfg(feature = "machine-xhci-mini")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-xhci-mini")))]
+pub static XHCI_MINI: CatalogEntry = CatalogEntry {
+    name: "xhci-mini",
+    summary: "a minimal board with an xHCI and a USB mass storage device: a RISC-V hart, RAM, \
+              a PLIC",
+    media: &["firmware", "usb0"],
+    source: include_str!("../../machines/xhci-mini.machine"),
+};
+
 /// A minimal MC68000 board, when this build has a 68000.
 ///
 /// A synthetic board rather than a product: a big-endian 24-bit space, ROM at
@@ -519,6 +540,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&STM32F407);
     #[cfg(feature = "machine-usb-mini")]
     out.push(&USB_MINI);
+    #[cfg(feature = "machine-xhci-mini")]
+    out.push(&XHCI_MINI);
     #[cfg(feature = "machine-z80-mini")]
     out.push(&Z80_MINI);
     out
@@ -696,7 +719,8 @@ pub fn registry() -> Result<Registry> {
         feature = "dev-usb-chipidea",
         feature = "dev-usb-dwc2",
         feature = "dev-usb-hid",
-        feature = "dev-usb-msd"
+        feature = "dev-usb-msd",
+        feature = "dev-usb-xhci"
     ))]
     crate::dev::usb::register(&mut reg)?;
     Ok(reg)
@@ -800,7 +824,8 @@ pub fn bindings() -> Result<Bindings> {
         feature = "dev-usb-chipidea",
         feature = "dev-usb-dwc2",
         feature = "dev-usb-hid",
-        feature = "dev-usb-msd"
+        feature = "dev-usb-msd",
+        feature = "dev-usb-xhci"
     ))]
     crate::dev::usb::bind(&mut b)?;
     Ok(b)
@@ -921,7 +946,8 @@ pub fn classes() -> ClassTable {
         feature = "dev-usb-chipidea",
         feature = "dev-usb-dwc2",
         feature = "dev-usb-hid",
-        feature = "dev-usb-msd"
+        feature = "dev-usb-msd",
+        feature = "dev-usb-xhci"
     ))]
     for schema in crate::dev::usb::schemas() {
         table.insert(schema);
@@ -1623,6 +1649,13 @@ mod tests {
             // `--drive usb0=disk.img`.
             #[cfg(feature = "machine-usb-mini")]
             ("usb-mini", "usb0") => &[],
+            // The same four bytes and the same reasoning for the xHCI board: it
+            // realizes and the hart fetches with them, and the driver that
+            // enumerates a disk over rings lives in `tests/usb_xhci.rs`.
+            #[cfg(feature = "machine-xhci-mini")]
+            ("xhci-mini", "firmware") => &[0x6f, 0x00, 0x00, 0x00],
+            #[cfg(feature = "machine-xhci-mini")]
+            ("xhci-mini", "usb0") => &[],
             // `JR -2` — the Z80 branch-to-self, which is the whole two-byte
             // program needed to prove the board realizes and the core fetches.
             // `tests/z80_mini_board.rs` supplies the one that does something.

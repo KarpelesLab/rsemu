@@ -444,6 +444,35 @@ dev-usb-hid = ["bus-usb"]
 # for the fabric and `dev-ata-disk` for the `Medium` seam.
 dev-usb-msd = ["bus-usb", "dev-ata-disk"]
 
+# An xHCI host controller (src/dev/usb/xhci.rs): **the modern USB controller,
+# and the one shaped like NVMe rather than like EHCI**. Where EHCI hands the
+# controller two linked lists, xHCI hands it *rings*: a command ring, one
+# transfer ring per endpoint, and an event ring the controller is the producer
+# of — plus a Device Context Base Address Array, device and endpoint contexts,
+# and a doorbell array. All of it lives in guest RAM and the controller
+# DMA-reads it.
+#
+# Covers the xHCI 1.2 capability, operational, runtime and doorbell register
+# files; one xHCI Supported Protocol extended capability declaring USB 2.0 root
+# ports; the Enable Slot, Disable Slot, Address Device, Configure Endpoint,
+# Evaluate Context, Reset/Stop Endpoint, Set TR Dequeue Pointer, Reset Device
+# and No Op commands; Setup/Data/Status Stage, Normal, Link, Event Data and
+# No-Op transfer TRBs with the Cycle bit, Chain, IOC, ISP and IDT flags; and an
+# event ring with a segment table, a Producer Cycle State, the ring-full rule
+# and one interrupter with IMOD moderation and the EHB handshake.
+#
+# **Every ring is a cycle by construction**, so every walk is bounded — link
+# hops, TRBs per Transfer Descriptor, work items per run, packets per TRB — and
+# a doorbell rung from inside the controller's own DMA is iterative rather than
+# recursive, the hazard `dev-nvme` names for a PRP entry aimed at a doorbell.
+# `fuzz/fuzz_targets/usb_xhci.rs` is why.
+#
+# Written from the eXtensible Host Controller Interface for Universal Serial Bus
+# Requirements Specification revision 1.2c (Intel, document 868295), read
+# directly; no emulator source and no operating system's xHCI driver was opened
+# (ROADMAP.md §1). Needs `bus-usb`.
+dev-usb-xhci = ["bus-usb"]
+
 # The Sitronix ST7272A (src/dev/sitronix): a 320RGBx240 dual-gate TFT panel
 # driver, configured over 3-wire SPI. Its **SPI carries registers only** —
 # power, gamma, contrast, brightness, scan direction, standby — while pixels
@@ -821,6 +850,21 @@ machine-z80-mini = ["cpu-z80"]
 # making needs a program executing. The `firmware` slot takes that program and
 # the `usb0` slot takes the disk.
 machine-usb-mini = ["cpu-riscv", "dev-riscv", "dev-usb-ehci", "dev-usb-msd"]
+
+# The `xhci-mini` board (machines/xhci-mini.machine plus the classes it names):
+# the same shape as `usb-mini` — a RISC-V hart, RAM, a PLIC and a `usb.storage`
+# device — with an **xHCI** in place of the EHCI. It exists so that a guest can
+# do the thing only a modern controller makes it do: reset a root port, build a
+# Device Context Base Address Array, a command ring and an event ring with a
+# segment table, issue Enable Slot and Address Device, hand over endpoint
+# contexts and transfer rings, and then move a Bulk-Only CBW/data/CSW triple to
+# a disk — with the controller's completion events travelling a real interrupt
+# wire into a real interrupt controller and being acknowledged in the order the
+# specification fixes. `tests/usb_xhci.rs` boots it.
+#
+# The `firmware` media slot takes the program the hart runs, and the `usb0` slot
+# takes the disk.
+machine-xhci-mini = ["cpu-riscv", "dev-riscv", "dev-usb-xhci", "dev-usb-msd"]
 
 # The Sharp SM83 core (src/cpu/sm83): the Game Boy's processor, an M-cycle
 # accurate interpreter with all 256 base and 256 $CB encodings, the eleven
