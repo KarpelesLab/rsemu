@@ -16,7 +16,8 @@ use crate::core::state::{ChunkReader, MachineShape, Migrations, StateReader, Sta
 use crate::core::value::Width;
 use crate::core::wire::{Wire, WireIdAllocator};
 use crate::dev::ata::disk::default_geometry;
-use crate::dev::ata::{AtaDisk, Identity, Medium, Position};
+use crate::dev::ata::{AtaDisk, Identity, Position};
+use crate::dev::medium::Medium;
 
 /// Where guest RAM starts. Not zero, so a null pointer in a command header is a
 /// bus fault the adapter has to survive rather than a plausible read.

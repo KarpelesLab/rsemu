@@ -1003,3 +1003,17 @@ fn a_drive_answers_the_ata_signature_before_anything_has_reset_it() {
     assert_eq!(disk.read_reg(Reg::LbaMid, false) as u8, 0x00);
     assert_eq!(disk.read_reg(Reg::LbaHigh, false) as u8, 0x00);
 }
+
+#[test]
+fn a_medium_error_becomes_the_error_register_bit_that_describes_it() {
+    // `dev::medium`'s three-way answer, as this device's guest sees it. The
+    // distinction is not cosmetic: IDNF says the sector is not there and UNC
+    // says it is there and unreadable, and a driver retries one and not the
+    // other.
+    use crate::core::error::BusError;
+
+    assert_eq!(error_bit(BusError::BadAccess), ERR_IDNF);
+    assert_eq!(error_bit(BusError::Unassigned), ERR_UNC);
+    assert_eq!(error_bit(BusError::Retry), ERR_UNC);
+    assert_eq!(error_bit(BusError::Protected), ERR_ABRT);
+}

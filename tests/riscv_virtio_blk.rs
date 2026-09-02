@@ -34,8 +34,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rsemu::core::device::ResetKind;
 use rsemu::core::space::MemAttrs;
 use rsemu::core::value::Width;
-use rsemu::dev::ata::{Medium, Snapshot};
 use rsemu::dev::blk::{Image, ImageOptions};
+use rsemu::dev::medium::{Medium, Snapshot};
 use rsemu::machine::Machine;
 
 // -- the board ---------------------------------------------------------------

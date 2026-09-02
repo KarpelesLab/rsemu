@@ -43,7 +43,7 @@ use std::sync::Arc;
 use rsemu::core::device::ResetKind;
 use rsemu::core::space::{MemAttrs, RamStore};
 use rsemu::core::value::Width;
-use rsemu::dev::ata::Medium;
+use rsemu::dev::medium::Medium;
 use rsemu::machine::Machine;
 
 // ---------------------------------------------------------------------------
@@ -92,7 +92,7 @@ fn board() -> (Machine, Arc<RamStore>) {
     RamStore::write_at(&store, 0, &image()).expect("the image fits");
 
     let mut options = rsemu::machine::catalog::build_options().expect("this build's options");
-    rsemu::dev::ata::medium::install(
+    rsemu::dev::medium::install(
         &options.realize.hosts,
         "sata0",
         Arc::clone(&store) as Arc<dyn Medium>,

@@ -127,12 +127,12 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
-use crate::core::error::{Error, Result};
+use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::space::RamStore;
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
-use crate::dev::ata::medium::{self, Medium, Snapshot};
+use crate::dev::medium::{self, Medium, Snapshot};
 use crate::machine::realize::Instance;
 use crate::machine::validate::{ClassSchema, PropSchema};
 
@@ -1303,9 +1303,9 @@ impl AtaDisk {
         state.status &= !ST_DRQ;
         if let Err(e) = wrote {
             // A host I/O error — a torn write, a full filesystem, a device that
-            // went away — is *not* IDNF: the sector exists. `medium::error_bit`
+            // went away — is *not* IDNF: the sector exists. `error_bit`
             // is the one place that mapping is written down.
-            self.fail(state, medium::error_bit(e), xfer.next, xfer.mode);
+            self.fail(state, error_bit(e), xfer.next, xfer.mode);
             return;
         }
         xfer.last = xfer.next + count - 1;
@@ -1331,8 +1331,8 @@ impl AtaDisk {
         let mut buf = alloc::vec![0u8; (count * SECTOR) as usize];
         if let Err(e) = self.media.read_at(xfer.next * SECTOR, &mut buf) {
             // A short read or a host I/O error is an uncorrectable data error,
-            // not a missing address. See `medium::error_bit`.
-            self.fail(state, medium::error_bit(e), xfer.next, xfer.mode);
+            // not a missing address. See `error_bit`.
+            self.fail(state, error_bit(e), xfer.next, xfer.mode);
             return;
         }
         xfer.last = xfer.next + count - 1;
@@ -1564,7 +1564,7 @@ impl AtaDisk {
                     Ok(()) => self.succeed(state),
                     Err(e) => {
                         let last = self.id.sectors - 1;
-                        self.fail(state, medium::error_bit(e), last, Mode::Lba28);
+                        self.fail(state, error_bit(e), last, Mode::Lba28);
                     }
                 }
             }
@@ -2357,6 +2357,27 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("model", ValueKind::Str))
         .prop(PropSchema::new("serial", ValueKind::Str))
         .prop(PropSchema::new("firmware", ValueKind::Str))
+}
+
+/// Turn a [`Medium`] error into the ATA Error-register bit that describes it.
+///
+/// [`dev::medium`](crate::dev::medium)'s error table, in code, and on this side
+/// of the seam because the ATA Error register is this module's: `dev::medium`
+/// says what went wrong and each device says what its guest is told. Written
+/// down once, so the mapping cannot drift between the two read paths and the
+/// write path.
+#[must_use]
+pub fn error_bit(e: BusError) -> u8 {
+    match e {
+        // The address is not on this medium: no such sector.
+        BusError::BadAccess => ERR_IDNF,
+        // Write protected — the command should never have been accepted.
+        BusError::Protected => ERR_ABRT,
+        // The sector exists and the bytes did not arrive. `Retry` lands here
+        // because the drive has no way to stall: it has already told the host
+        // the command was taken.
+        _ => ERR_UNC,
+    }
 }
 
 #[cfg(test)]

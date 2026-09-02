@@ -31,7 +31,7 @@ use std::sync::Arc;
 use rsemu::core::device::ResetKind;
 use rsemu::core::space::{MemAttrs, RamStore};
 use rsemu::core::value::Width;
-use rsemu::dev::ata::Medium;
+use rsemu::dev::medium::Medium;
 use rsemu::machine::Machine;
 
 // ---------------------------------------------------------------------------
@@ -81,7 +81,7 @@ fn board() -> (Machine, Arc<RamStore>) {
 
     let mut options = rsemu::machine::catalog::build_options().expect("this build's options");
     // The machine file names the slot; the run says what is behind it.
-    rsemu::dev::ata::medium::install(
+    rsemu::dev::medium::install(
         &options.realize.hosts,
         "nvme0",
         Arc::clone(&store) as Arc<dyn Medium>,

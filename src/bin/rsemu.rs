@@ -443,8 +443,8 @@ fn run(args: &[String]) -> ExitCode {
     // guest reports no disk. Say so rather than letting the user wonder why
     // their image did not boot.
     #[cfg(feature = "dev-blk")]
-    for slot in rsemu::dev::ata::medium::names(&options.realize.hosts) {
-        if rsemu::dev::ata::medium::get(&options.realize.hosts, &slot)
+    for slot in rsemu::dev::medium::names(&options.realize.hosts) {
+        if rsemu::dev::medium::get(&options.realize.hosts, &slot)
             .is_ok_and(|found| found.is_some_and(|s| s.is_occupied()))
         {
             eprintln!(
@@ -578,12 +578,13 @@ impl Drive {
                     options = options.create(bytes);
                 }
                 Some(("snapshot", policy)) => {
-                    let chosen = rsemu::dev::ata::Snapshot::from_name(policy).ok_or_else(|| {
-                        format!(
-                            "--drive {head}: snapshot={policy}: one of `capture`, `reference` \
+                    let chosen =
+                        rsemu::dev::medium::Snapshot::from_name(policy).ok_or_else(|| {
+                            format!(
+                                "--drive {head}: snapshot={policy}: one of `capture`, `reference` \
                              or `refuse`"
-                        )
-                    })?;
+                            )
+                        })?;
                     options = options.snapshot(chosen);
                 }
                 Some(("password", word)) => options = options.password(word),

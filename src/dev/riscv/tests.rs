@@ -1047,7 +1047,7 @@ fn firmware_from_the_environment_reaches_its_console() {
         eprintln!(
             "RSEMU_RISCV_DRIVE: {} ({} bytes{})",
             image.describe(),
-            crate::dev::ata::Medium::capacity(&image),
+            crate::dev::medium::Medium::capacity(&image),
             if read_only { ", read-only" } else { "" }
         );
         crate::dev::blk::install(&options.realize.hosts, "disk", alloc::sync::Arc::new(image))

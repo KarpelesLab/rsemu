@@ -52,9 +52,12 @@
 //!
 //! # What the platter is
 //!
-//! [`medium`] is the seam between the protocol and the storage. A drive built
-//! from a media slot gets a `RamStore` and costs its whole capacity in host
-//! memory; one whose slot a host filled with a [`Medium`] gets that instead —
+//! [`dev::medium`](crate::dev::medium) is the seam between the protocol and the
+//! storage, and it is not this module's: an NVMe namespace and a `virtio.blk`
+//! store their bytes behind the same trait, so it lives one level up under its
+//! own `dev-medium` feature. A drive built from a media slot gets a `RamStore`
+//! and costs its whole capacity in host memory; one whose slot a host filled
+//! with a [`Medium`](crate::dev::medium::Medium) gets that instead —
 //! `dev/blk` supplies a host file through `fstool`, so sparse raw, qcow2, DMG and
 //! LUKS images all work and nothing above [`AtaDisk`]'s five methods changes.
 //! **Both paths are supported**: the media slot is what keeps this device
@@ -72,11 +75,9 @@
 //! system's ATA driver was opened** (`CLAUDE.md`, provenance).
 
 pub mod disk;
-pub mod medium;
 
 pub use disk::taskfile::{Phase, Registers, Taskfile};
 pub use disk::{Address, AtaDisk, Geometry, Identity, Position, Reg};
-pub use medium::{Medium, MediumSlot, Snapshot};
 
 /// The bay name a drive and an adapter get when neither says.
 pub const DEFAULT_BAY: &str = "ata0";

@@ -105,7 +105,7 @@ use crate::core::state::{Sink, Source};
 use crate::core::sync::{AtomicBool, AtomicU32, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{Level, WireSource};
-use crate::dev::ata::{Medium, Snapshot};
+use crate::dev::medium::{Medium, Snapshot};
 
 // ---------------------------------------------------------------------------
 // shape
@@ -360,7 +360,7 @@ const IDENTIFY_LEN: u64 = 4096;
 
 /// The one namespace this controller presents, and the bytes behind it.
 ///
-/// The medium is [`dev::ata::Medium`](crate::dev::ata::Medium) — the seam a
+/// The medium is [`dev::medium::Medium`](crate::dev::medium::Medium) — the seam a
 /// [`RamStore`](crate::core::space::RamStore) and a
 /// [`blk::Image`](crate::dev::blk) both satisfy — so an NVMe namespace is a
 /// qcow2 file for exactly the same reason an ATA drive is, and neither module

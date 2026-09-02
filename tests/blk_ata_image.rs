@@ -27,8 +27,8 @@ use rsemu::core::state::{MachineShape, Migrations, StateReader, StateWriter};
 use rsemu::dev::ata::disk::{
     self, AtaDisk, DEV_LBA, DiskDevice, Geometry, Identity, Position, Reg, SECTOR, cmd,
 };
-use rsemu::dev::ata::{Medium, Snapshot};
 use rsemu::dev::blk::{Image, ImageOptions};
+use rsemu::dev::medium::{Medium, Snapshot};
 
 /// Bits 7 and 5 of the Device register are obsolete and read back as ones.
 const DEV_OBSOLETE: u8 = 0xa0;

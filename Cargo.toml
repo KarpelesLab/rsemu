@@ -457,14 +457,11 @@ machine-arm926 = ["cpu-arm-aprofile"]
 # privileged/PLIC/ACLINT specifications, the PC16550D data sheet, OASIS VIRTIO
 # 1.2 and the Devicetree Specification.
 #
-# `dev-ata-disk` is here for the *medium seam alone* -- `dev::ata::Medium`,
+# `dev-medium` is here for the storage seam alone -- `dev::medium::Medium`,
 # which `virtio.blk` stores its bytes behind so that `--drive disk=root.qcow2`
 # backs it with a host file through `dev-blk` exactly as it backs an ATA drive
-# or an NVMe namespace (ROADMAP.md 7.1). It is what `dev-nvme` depends on it
-# for too. Nothing here talks ATA, and the dependency is heavier than the seam:
-# the seam should live somewhere neutral rather than under `dev/ata`, which is
-# a move rather than a feature edit -- see src/dev/riscv/virtio/blk.rs.
-dev-riscv = ["dev-ata-disk"]
+# or an NVMe namespace (ROADMAP.md 7.1). Nothing here talks ATA.
+dev-riscv = ["dev-medium"]
 
 # Parallel NOR flash (src/dev/flash/cfi): the Common Flash Interface query
 # structure and the Intel/Sharp extended command set (CFI id 0x0001) -- status
@@ -803,7 +800,20 @@ dev-pc-floppy = ["dev-pc"]
 # do. Written from T13's ATA/ATAPI-6; no emulator source and no operating
 # system's ATA driver was opened (ROADMAP.md §1). `no_std + alloc`, no
 # `unsafe`, no dependencies.
-dev-ata-disk = []
+dev-ata-disk = ["dev-medium"]
+
+# What a drive's platter *is* (src/dev/medium.rs): the `Medium` trait -- capacity,
+# bytes by offset, flush, read-only, and a snapshot policy -- plus the media slot
+# a run installs one into, which is the other half of `--drive hd0=disk.qcow2`.
+# About four hundred lines and no dependencies.
+#
+# Its own feature because it belongs to no one device. An ATA drive, an NVMe
+# namespace and a `virtio.blk` all store their bytes behind it, and it used to
+# live under `dev/ata`, so a `riscv-virt` build linked the whole ATA command set
+# to name a trait, three functions and a three-valued enum. `no_std + alloc`; the
+# `std` half -- a host file through `fstool` -- is `dev-blk`, on the other side of
+# this seam, which is the arrangement that keeps the devices `no_std`.
+dev-medium = []
 
 # Real disk-image backing (src/dev/blk): a guest drive whose bytes are a host
 # *file* rather than a buffer, so a sparse 16 GiB disk costs no RAM and a
@@ -825,8 +835,9 @@ dev-ata-disk = []
 # so `--no-default-features` excludes it. `default-features = false` on
 # `fstool` drops its CLI's line editor and most codecs; `gzip` and `zstd` are
 # what a qcow2 with compressed clusters needs, and both are served by
-# `compcol`, which is permitted already. Needs `dev-ata-disk` to have a drive
-# to back.
+# `compcol`, which is permitted already. Needs `dev-medium` to have a seam to
+# supply, and nothing else: what it backs may be an ATA drive, an NVMe namespace
+# or a `virtio.blk`.
 #
 # **Known cost, and it is not ours to fix here.** `fstool` 0.4 declares its
 # CLI's dependencies unconditionally rather than behind a `cli` feature, so
@@ -836,7 +847,7 @@ dev-ata-disk = []
 # and the last of which will not link on `*-linux-fullrust`. The default
 # `cargo tree` is still bare, which is what CI gates on, and the fix is a
 # feature split in `fstool`, not a parallel block layer here.
-dev-blk = ["std", "dev-ata-disk", "dep:fstool"]
+dev-blk = ["std", "dev-medium", "dep:fstool"]
 
 # The PC/AT's IDE interface (src/dev/pc/ide.rs): one channel, which is address
 # decode and nothing else. The command block (0x1f0/0x170) and the control
@@ -915,14 +926,14 @@ machine-ahci-mini = ["dev-ahci", "dev-pc-pci"]
 # module says why. **Every walk over a guest-built PRP chain is bounded**, and
 # `fuzz/fuzz_targets/nvme_mmio.rs` is why.
 #
-# The namespace is a `dev::ata::Medium`, the same seam an ATA drive's platter
+# The namespace is a `dev::medium::Medium`, the same seam an ATA drive's platter
 # uses, so `--drive nvme0=disk.qcow2` works here for the same reason and no
 # image format is parsed (ROADMAP.md 7.1). Written from the freely published
 # NVM Express Base Specification 1.4 and the PCI Local Bus Specification; no
 # emulator source was consulted (ROADMAP.md 1). `no_std + alloc`, no `unsafe`,
-# no dependencies. Needs `bus-pci` for the function and `dev-ata-disk` for the
+# no dependencies. Needs `bus-pci` for the function and `dev-medium` for the
 # medium seam.
-dev-nvme = ["bus-pci", "dev-ata-disk"]
+dev-nvme = ["bus-pci", "dev-medium"]
 
 # The `nvme-mini` board (machines/nvme-mini.machine plus the classes it names):
 # RAM, an 82441FX host bridge for the 0xcf8/0xcfc configuration ports, a master

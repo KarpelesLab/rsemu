@@ -19,7 +19,7 @@
 //! image format is parsed in this module and none should ever be.
 //!
 //! What is here is the *impedance match* between that trait and
-//! [`ata::Medium`](crate::dev::ata::Medium):
+//! [`Medium`]:
 //!
 //! ```text
 //!   AtaDisk ──► Medium::read_at(&self, u64, &mut [u8]) -> MemResult
@@ -44,7 +44,7 @@
 //!   read, a torn write, an image that shrank and a full filesystem are
 //!   different failures and the guest is told so: see [`bus_error`].
 //! * **Snapshots.** A file-backed drive references its image rather than
-//!   copying it — [`Snapshot`](crate::dev::ata::Snapshot) has the argument.
+//!   copying it — [`Snapshot`](crate::dev::medium::Snapshot) has the argument.
 //!
 //! # Time
 //!
@@ -87,7 +87,7 @@ use alloc::sync::Arc;
 
 use crate::core::error::{BusError, Error, Result};
 use crate::core::hosts::HostObjects;
-use crate::dev::ata::Medium;
+use crate::dev::medium::Medium;
 
 mod image;
 
@@ -96,7 +96,7 @@ pub use image::{Image, ImageOptions, create_raw};
 /// Turn an `fstool` failure into the bus error that describes it.
 ///
 /// The mapping the guest ultimately sees as an ATA error code, so it is written
-/// down once — [`ata::medium`](crate::dev::ata::medium) has the other half of
+/// down once — [`dev::medium`](crate::dev::medium) has the other half of
 /// the table:
 ///
 /// | `fstool::Error` | [`BusError`] | Why |
@@ -172,7 +172,7 @@ pub(crate) fn config_error(path: &str, e: &fstool::Error) -> Error {
 /// data loss rather than a configuration.
 pub fn install(hosts: &HostObjects, slot: &str, image: Arc<Image>) -> Result<()> {
     let medium: Arc<dyn Medium> = image;
-    if crate::dev::ata::medium::install(hosts, slot, medium)? {
+    if crate::dev::medium::install(hosts, slot, medium)? {
         return Ok(());
     }
     Err(Error::Config {
