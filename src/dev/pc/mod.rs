@@ -33,6 +33,7 @@
 //! ```text
 //!   0x000-0x00f  DMA controller 1        (byte channels 0-3)
 //!   0x020-0x021  interrupt controller 1  (master)
+//!   0x022-0x023  interrupt mode configuration register (APIC boards only)
 //!   0x040-0x043  8254 timer
 //!   0x060,0x064  8042 keyboard controller
 //!   0x061        system control port B   (speaker gate, timer 2 out, refresh)
@@ -84,6 +85,10 @@ pub mod apic;
 #[cfg(feature = "dev-pc-apic")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-apic")))]
 pub mod ioapic;
+
+#[cfg(feature = "dev-pc-apic")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-apic")))]
+pub mod imcr;
 
 #[cfg(feature = "dev-pc-hpet")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-hpet")))]
@@ -165,6 +170,7 @@ pub fn register(reg: &mut Registry) -> Result<()> {
     {
         apic::register(reg)?;
         ioapic::register(reg)?;
+        imcr::register(reg)?;
     }
     #[cfg(feature = "dev-pc-hpet")]
     hpet::register(reg)?;
@@ -198,6 +204,7 @@ pub fn bind(b: &mut Bindings) -> Result<()> {
     {
         apic::bind(b)?;
         ioapic::bind(b)?;
+        imcr::bind(b)?;
     }
     #[cfg(feature = "dev-pc-hpet")]
     hpet::bind(b)?;
@@ -231,6 +238,7 @@ pub fn schemas() -> Vec<ClassSchema> {
     {
         out.push(apic::schema());
         out.push(ioapic::schema());
+        out.push(imcr::schema());
     }
     #[cfg(feature = "dev-pc-hpet")]
     out.push(hpet::schema());
@@ -257,6 +265,8 @@ pub const PC_AT: &str = include_str!("../../../machines/pc-at.machine");
 mod tests {
     use super::*;
     #[cfg(all(
+        feature = "dev-pc-apic",
+        feature = "dev-pc-hpet",
         feature = "dev-pc-video",
         feature = "dev-pc-floppy",
         feature = "dev-pc-ide"
@@ -265,6 +275,8 @@ mod tests {
     use crate::machine::ResolveOptions;
     use crate::machine::resolve_file;
     #[cfg(all(
+        feature = "dev-pc-apic",
+        feature = "dev-pc-hpet",
         feature = "dev-pc-video",
         feature = "dev-pc-floppy",
         feature = "dev-pc-ide"
@@ -273,6 +285,8 @@ mod tests {
     // Only the fallback schema below writes these out by hand; with the core
     // compiled in it publishes its own.
     #[cfg(all(
+        feature = "dev-pc-apic",
+        feature = "dev-pc-hpet",
         feature = "dev-pc-video",
         feature = "dev-pc-floppy",
         feature = "dev-pc-ide",
@@ -294,6 +308,8 @@ mod tests {
     /// checks its own machine file is worth having whether or not a CPU feature
     /// is enabled.
     #[cfg(all(
+        feature = "dev-pc-apic",
+        feature = "dev-pc-hpet",
         feature = "dev-pc-video",
         feature = "dev-pc-floppy",
         feature = "dev-pc-ide"
@@ -329,6 +345,8 @@ mod tests {
     }
 
     #[cfg(all(
+        feature = "dev-pc-apic",
+        feature = "dev-pc-hpet",
         feature = "dev-pc-video",
         feature = "dev-pc-floppy",
         feature = "dev-pc-ide"
@@ -352,9 +370,11 @@ mod tests {
             Err(e) => panic!("{e}"),
         };
         assert_eq!(resolved.name, "pc-at");
-        // Six crystals, because the board has six cans and they are six trees
-        // rather than dividers off one (`ROADMAP.md` §4.2).
-        assert_eq!(resolved.oscillators.len(), 6);
+        // Eight crystals, because the board has eight cans and they are eight
+        // trees rather than dividers off one (`ROADMAP.md` §4.2). Six of them
+        // are the AT's; the front-side bus the local APIC's timer counts and
+        // the HPET's own 10 MHz can are the two an APIC-era board adds.
+        assert_eq!(resolved.oscillators.len(), 8);
         // The 8254's input is not an integer number of hertz, which is the
         // whole reason the language takes rational frequency literals. Written
         // 105000000/88 because that is 14.31818 MHz over 12 and how the board
@@ -373,6 +393,8 @@ mod tests {
     // checked against a build that has them. A `dev-pc`-only build still parses
     // it — the test above — which is the half that does not depend on features.
     #[cfg(all(
+        feature = "dev-pc-apic",
+        feature = "dev-pc-hpet",
         feature = "dev-pc-video",
         feature = "dev-pc-floppy",
         feature = "dev-pc-ide"

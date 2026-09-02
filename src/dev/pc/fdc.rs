@@ -1362,11 +1362,192 @@ impl DmaPeripheral for Registers {
     }
 }
 
+/// The drive a controller's medium can be reached through.
+///
+/// # Why this exists
+///
+/// [`Fdc765::contents`] is public and useless to anybody but the code that
+/// constructed the controller — and on a realized board that is
+/// [`Bindings`](crate::machine::realize::Bindings), which refuses a second
+/// binding for `pc.fdc` once [`crate::dev::pc::bind`] has claimed the name. So
+/// a test that wants to know what the guest actually wrote to the diskette has
+/// no route to the object that holds it, and has to settle for reading the
+/// bytes back through the same controller that wrote them — which cannot tell
+/// "the write landed on the medium" from "the write landed in the sector
+/// buffer and the medium was never touched".
+///
+/// This is the rendezvous that closes it, in the shape
+/// [`crate::dev::ata::bays`] already has: the controller files itself under a
+/// name in the build's [`HostObjects`], and whoever built the machine looks it
+/// up afterwards. The name is the `drive` property, [`drives::DEFAULT_NAME`] when a
+/// machine file does not say — and a `HostObjects` belongs to one build, so two
+/// boards in one process do not collide however they are named.
+///
+/// # The lock
+///
+/// [`LockRank::LEAF`], deliberately unlike [`bays::BAY_RANK`], because nothing
+/// a guest access reaches ever takes this: an adapter consults a *bay* on every
+/// register access to find its drive, while this controller holds its own
+/// medium directly and looks at this object never. It is written once at
+/// construction and read by the host afterwards. Every accessor clones the
+/// controller out and releases this lock before touching the controller's own
+/// `DEVICE`-ranked state, so the ladder is walked downward even so.
+///
+/// [`HostObjects`]: crate::core::hosts::HostObjects
+/// [`bays::BAY_RANK`]: crate::dev::ata::bays::BAY_RANK
+pub mod drives {
+    use alloc::string::String;
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use core::fmt;
+
+    use super::Registers;
+    use crate::core::error::Result;
+    use crate::core::hosts::{HostKind, HostObjects};
+    use crate::core::props::Props;
+    use crate::core::sync::{LockRank, Mutex};
+
+    /// The kind a floppy drive is filed under in a build's `HostObjects`.
+    pub const KIND: HostKind = HostKind::new("floppy-drive");
+
+    /// The name a controller files itself under when a machine file does not
+    /// say. `fd0`, which is what the first diskette drive has been called for
+    /// long enough that nobody has to look it up.
+    pub const DEFAULT_NAME: &str = "fd0";
+
+    /// One diskette drive: at most one controller's medium, by name.
+    pub struct Drive {
+        fdc: Mutex<Option<Arc<Registers>>>,
+    }
+
+    impl fmt::Debug for Drive {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Drive")
+                .field("occupied", &self.fdc.lock().is_some())
+                .finish()
+        }
+    }
+
+    impl Default for Drive {
+        fn default() -> Drive {
+            Drive::new()
+        }
+    }
+
+    impl Drive {
+        /// An empty drive.
+        #[must_use]
+        pub fn new() -> Drive {
+            Drive {
+                fdc: Mutex::with_rank(LockRank::LEAF, None),
+            }
+        }
+
+        /// Put a controller in it, if it is empty.
+        ///
+        /// # Errors
+        ///
+        /// The controller back, unchanged, if one is already there. The caller
+        /// has the names and makes the message.
+        pub(super) fn fit(&self, regs: Arc<Registers>) -> core::result::Result<(), Arc<Registers>> {
+            let mut held = self.fdc.lock();
+            if held.is_some() {
+                return Err(regs);
+            }
+            *held = Some(regs);
+            Ok(())
+        }
+
+        /// Whether a controller has filed itself here.
+        #[must_use]
+        pub fn is_occupied(&self) -> bool {
+            self.fdc.lock().is_some()
+        }
+
+        /// A copy of the medium, as the controller holds it now.
+        ///
+        /// `None` when no controller is filed here; an empty `Vec` when there
+        /// is one and its drive has no disk in it.
+        #[must_use]
+        pub fn contents(&self) -> Option<Vec<u8>> {
+            // Cloned out and this lock released before the controller's own
+            // state lock is taken, which is the ladder's direction.
+            let regs = self.fdc.lock().clone()?;
+            Some(regs.state.lock().image.clone())
+        }
+
+        /// Whether anything has been written to the medium.
+        #[must_use]
+        pub fn is_dirty(&self) -> Option<bool> {
+            let regs = self.fdc.lock().clone()?;
+            Some(regs.state.lock().dirty)
+        }
+
+        /// The medium's geometry, as `(cylinders, heads, sectors)`.
+        #[must_use]
+        pub fn geometry(&self) -> Option<(u8, u8, u8)> {
+            let regs = self.fdc.lock().clone()?;
+            let g = regs.state.lock().geom;
+            Some((g.cylinders, g.heads, g.sectors))
+        }
+    }
+
+    /// The drive `name` refers to in `hosts`, creating it on first mention.
+    ///
+    /// The **host** side of the rendezvous: called after a build to look at
+    /// what the controller it built is holding.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Config`] if another kind of host object is already open
+    /// under that name.
+    pub fn open(hosts: &HostObjects, name: &str) -> Result<Arc<Drive>> {
+        hosts.open(KIND, name, Drive::new)
+    }
+
+    /// The drive `name` refers to in the build these properties are being read
+    /// for, creating it on first mention.
+    ///
+    /// The **device** side, called from `new(props)`. A `Props` that belongs to
+    /// no build gets a private drive, so a controller a unit test constructed
+    /// directly still works and simply meets nobody.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`].
+    pub fn attach(props: &Props, name: &str) -> Result<Arc<Drive>> {
+        props.host(KIND, name, Drive::new)
+    }
+
+    /// The drive called `name`, if it has been opened.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`].
+    pub fn get(hosts: &HostObjects, name: &str) -> Result<Option<Arc<Drive>>> {
+        hosts.get(KIND, name)
+    }
+
+    /// Forget `name`, reporting whether there was one.
+    pub fn close(hosts: &HostObjects, name: &str) -> bool {
+        hosts.close(KIND, name)
+    }
+
+    /// Every open drive name, in name order.
+    #[must_use]
+    pub fn names(hosts: &HostObjects) -> Vec<String> {
+        hosts.names(KIND)
+    }
+}
+
 /// A NEC µPD765A floppy disk controller.
 #[derive(Debug)]
 pub struct Fdc765 {
     regs: Arc<Registers>,
     region: RegionRef,
+    /// The name this controller filed itself under, for `Debug` and for the
+    /// error message when two claim one drive.
+    drive_name: String,
 }
 
 impl Fdc765 {
@@ -1382,12 +1563,29 @@ impl Fdc765 {
         let media = r.optional_media("image")?;
         let geometry: String = r.or("geometry", String::from("auto"))?;
         let readonly: bool = r.or("readonly", false)?;
+        let drive: String = r.or("drive", String::from(drives::DEFAULT_NAME))?;
         r.finish()?;
         let (name, image) = match media {
             Some(m) => (m.name().to_string(), m.bytes().to_vec()),
             None => (String::from("<none>"), Vec::new()),
         };
-        Fdc765::with_image(name, image, &geometry, readonly)
+        let fdc = Fdc765::with_image(name, image, &geometry, readonly)?;
+        // The rendezvous, and the last thing `new` does: a device that filed
+        // itself and then failed to build would leave a half-made controller
+        // in the build's host table.
+        drives::attach(props, &drive)?
+            .fit(Arc::clone(&fdc.regs))
+            .map_err(|_| Error::Config {
+                at: drive.clone(),
+                message: String::from(
+                    "two floppy controllers claim one drive; give one of them its own \
+                     `drive = \"...\"`",
+                ),
+            })?;
+        Ok(Fdc765 {
+            drive_name: drive,
+            ..fdc
+        })
     }
 
     /// Build one around an image the caller already has.
@@ -1425,11 +1623,27 @@ impl Fdc765 {
             REGISTER_WINDOW_LEN,
             Arc::clone(&regs) as Arc<dyn MemOps>,
         ));
-        Ok(Fdc765 { regs, region })
+        Ok(Fdc765 {
+            regs,
+            region,
+            // Not filed anywhere: this constructor takes no `Props`, so there
+            // is no build to file it in. `new` overwrites this.
+            drive_name: String::from("<unattached>"),
+        })
+    }
+
+    /// The name this controller is filed under in its build's host objects.
+    #[must_use]
+    pub fn drive_name(&self) -> &str {
+        &self.drive_name
     }
 
     /// A copy of the medium, for a test or a tool that wants to see what the
     /// guest wrote.
+    ///
+    /// Reachable only from whoever constructed the controller. On a realized
+    /// board that is the machine's binding table, so a test goes through
+    /// [`drives::get`] instead.
     #[must_use]
     pub fn contents(&self) -> Vec<u8> {
         self.regs.state.lock().image.clone()
@@ -1480,6 +1694,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "write protect the medium: a write sets ST1's not-writable bit \
                       (default false)",
+        },
+        PropertySpec {
+            name: "drive",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "the host-object name the medium is reachable under (default \"fd0\")",
         },
     ],
     construct: |props| Ok(Box::new(Fdc765::new(props)?)),
@@ -1729,6 +1949,7 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("image", ValueKind::Media))
         .prop(PropSchema::new("geometry", ValueKind::Str))
         .prop(PropSchema::new("readonly", ValueKind::Bool))
+        .prop(PropSchema::new("drive", ValueKind::Str))
         .region("")
         .region("regs")
         .port("irq", PortDir::Out)
@@ -2276,6 +2497,77 @@ mod tests {
             .with("readonly", true);
         let fdc = Fdc765::new(&props).expect("a 1.44M image in a bound slot");
         assert_eq!(fdc.geometry(), (80, 2, 18));
+    }
+
+    #[test]
+    fn the_medium_is_reachable_through_the_drive_a_build_filed_it_under() {
+        use crate::core::hosts::HostObjects;
+
+        // The shape a realized board has: the build owns a `HostObjects`, the
+        // controller files itself in it, and whoever built the machine looks it
+        // up afterwards — which is the only route to the medium once
+        // `Bindings` has claimed `pc.fdc` and a test can no longer construct it.
+        let hosts = Arc::new(HostObjects::new());
+        let mut props = Props::new().with(
+            "image",
+            crate::core::props::Media::new("floppy", image_1440k()),
+        );
+        props.set_hosts(Arc::clone(&hosts));
+        let fdc = Fdc765::new(&props).expect("a 1.44M image in a bound slot");
+        assert_eq!(fdc.drive_name(), drives::DEFAULT_NAME);
+
+        let drive = drives::get(&hosts, drives::DEFAULT_NAME)
+            .expect("a drive, not a name collision")
+            .expect("the controller filed itself");
+        assert!(drive.is_occupied());
+        assert_eq!(drive.geometry(), Some((80, 2, 18)));
+        assert_eq!(drive.is_dirty(), Some(false));
+        assert_eq!(
+            drive.contents().expect("a medium").len(),
+            image_1440k().len()
+        );
+        assert_eq!(drives::names(&hosts), alloc::vec![String::from("fd0")]);
+
+        // What the whole thing is for: a write the *guest* made is visible on
+        // the medium from outside the controller, so a test need not read it
+        // back through the same sector buffer that wrote it.
+        {
+            let mut state = fdc.regs.state.lock();
+            state.image[512] = 0xa5;
+            state.dirty = true;
+        }
+        assert_eq!(drive.contents().expect("a medium")[512], 0xa5);
+        assert_eq!(drive.is_dirty(), Some(true));
+
+        // A second controller on the same name is a machine-file error rather
+        // than a silent overwrite of whose medium is reachable.
+        let mut second = Props::new();
+        second.set_hosts(Arc::clone(&hosts));
+        let e = Fdc765::new(&second).expect_err("fd0 is taken").to_string();
+        assert!(e.contains("fd0"), "{e}");
+
+        // And a name of its own is fine.
+        let mut third = Props::new().with("drive", "fd1");
+        third.set_hosts(Arc::clone(&hosts));
+        let other = Fdc765::new(&third).expect("fd1 is free");
+        assert_eq!(other.drive_name(), "fd1");
+        assert_eq!(
+            drives::get(&hosts, "fd1")
+                .expect("no collision")
+                .expect("filed")
+                .contents(),
+            Some(alloc::vec![]),
+            "an empty drive is a controller with no disk, not an absent one"
+        );
+
+        // A controller a unit test built directly meets nobody, which is what
+        // makes every other test in this file work without a build.
+        assert_eq!(
+            Fdc765::with_image(String::from("x"), Vec::new(), "auto", false)
+                .expect("legal")
+                .drive_name(),
+            "<unattached>"
+        );
     }
 
     #[test]

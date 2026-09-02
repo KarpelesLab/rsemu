@@ -360,19 +360,56 @@ impl Classes for ClassTable {
 
 /// The `wire.*` combinators §4.3 ships, for callers with no registry.
 ///
-/// Only what §4.3 states: which of them are combinational. Their pins are left
-/// undeclared because §4.3 does not name them and inventing pin names would
-/// make a wrong `wire` statement *pass* while a right one failed.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct WireCombinators;
+/// The five gates [`machine::combinator`](crate::machine::combinator) builds,
+/// described the way the validator wants them. They are always compiled — like
+/// `ram` and `rom`, and for the same reason — so a caller that has nothing else
+/// can still check a machine file that puts an inverter between two pins.
+///
+/// This used to answer nothing at all, which meant §4.3's gates were documented
+/// and unbuildable at the same time; `pc::hpet`'s legacy replacement route is
+/// the case that noticed.
+///
+/// The indexed pins (`in0`, `out1`, …) are still not declared, and that is
+/// deliberate: how many there are depends on a property the validator does not
+/// evaluate, so a fixed list would reject a legal three-input gate. What is
+/// declared is what does not vary — the class names, the properties, the
+/// single-sided pin, and that four of the five are combinational.
+/// It **owns** its table rather than being a unit struct, because
+/// [`Classes::get`] hands back a borrow and a schema owns `String`s — so there
+/// is nowhere for one to live but here. `WireCombinators::new()` where the old
+/// unit value stood.
+#[derive(Debug, Clone)]
+pub struct WireCombinators {
+    table: ClassTable,
+}
+
+impl Default for WireCombinators {
+    /// The five gates, not an empty table — a derived `Default` here would be a
+    /// `WireCombinators` that knows no combinators.
+    fn default() -> WireCombinators {
+        WireCombinators::new()
+    }
+}
+
+impl WireCombinators {
+    /// The five gates, as the validator wants them.
+    #[must_use]
+    pub fn new() -> WireCombinators {
+        let mut table = ClassTable::new();
+        for schema in crate::machine::combinator::schemas() {
+            table.insert(schema);
+        }
+        WireCombinators { table }
+    }
+}
 
 impl Classes for WireCombinators {
-    fn get(&self, _class: &str) -> Option<&ClassSchema> {
-        None
+    fn get(&self, class: &str) -> Option<&ClassSchema> {
+        self.table.get(class)
     }
 
     fn names(&self) -> Vec<&str> {
-        Vec::new()
+        self.table.names()
     }
 }
 
@@ -1269,7 +1306,19 @@ error: wire cycle through combinational devices: `n1` → `n2` → `n1`; one dev
         assert_eq!(table.len(), 1);
         assert!(table.get("a").expect("present").combinational);
         assert!(!ClassTable::new().with(ClassSchema::new("a")).is_empty());
-        assert_eq!(WireCombinators.names(), Vec::<&str>::new());
-        assert!(WireCombinators.get("wire.not").is_none());
+        // The five gates 4.3 ships, which used to be an empty list -- so they
+        // were documented and unbuildable at the same time.
+        let stock = WireCombinators::new();
+        assert_eq!(stock.names().len(), 5);
+        assert!(stock.get("wire.not").expect("an inverter").combinational);
+        assert!(stock.get("wire.and").is_some());
+        assert!(
+            !stock
+                .get("wire.level-to-edge")
+                .expect("a detector")
+                .combinational,
+            "an edge detector holds a bit"
+        );
+        assert!(stock.get("wire.xor").is_none());
     }
 }
