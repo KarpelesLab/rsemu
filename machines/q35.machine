@@ -107,6 +107,10 @@ machine "q35" {
   # Which host character port the keyboard's scan codes arrive on.
   param keyboard = "keyboard"
 
+  # And which one COM1 is. Named separately from the keyboard so that two of
+  # these can run in one process without writing over each other.
+  param console = "console"
+
   # The two drive bays on the primary IDE channel. Zero is an empty bay.
   param hd0size = 0
   param hd1size = 0
@@ -136,24 +140,50 @@ machine "q35" {
   # that the ratio stays exact. 315000000/88 Hz is 3.579545454... MHz.
   osc pmtmr = 315000000/88 Hz
 
+  # The serial port's. 1.8432 MHz is the can every PC 16550 has hung off since
+  # the IBM Asynchronous Communications Adapter, and dividing it by sixteen is
+  # the chip's own baud generator: one tick of the device's domain is one
+  # opportunity to move one character at the fastest rate it runs.
+  osc uart = 1843200 Hz
+
   # -- address spaces ---------------------------------------------------------
 
-  space mem  { width = 32, unassigned = read-as-ones }
+  # 64 bits wide because the processor is. Nothing this board maps is above
+  # 4 GiB — the reset alias at 0xffff0000 is the highest — but a long-mode guest
+  # computes physical addresses in sixty-four bits, and a space that could not
+  # carry one would turn a guest's own bug into a silent wrap rather than the
+  # open-bus read it should be. `unassigned = read-as-ones` is the ISA bus's
+  # behaviour and what a probe for an absent chip expects.
+  space mem  { width = 64, unassigned = read-as-ones }
   space port { width = 16, unassigned = read-as-ones }
 
   # -- the processor ----------------------------------------------------------
   #
-  # An 80486, as `pc-at` has, and that is this board's honest limit today:
-  # ROADMAP.md phase 6b's gate is a modern distribution booting to a desktop,
-  # and that needs long mode, SSE and SMP, none of which this core has yet. The
-  # chipset below is what a 6b board needs *around* the processor, and it is
-  # buildable and testable before the core catches up — which is the point of
-  # landing it separately.
+  # `variant = "x86-64"` is a **preset** (ROADMAP.md §6.1.1), not a part number:
+  # it expands to the point in the extension lattice every processor that
+  # implements long mode has to be at — CR4, the model-specific registers, PAE,
+  # four-level paging, NX, SYSCALL, CMOV, PSE, PGE, x87, CX8, FXSR, SSE and
+  # SSE2. Any one of them can be switched off by name here to model a part that
+  # lacked it, and a combination no part could have is refused with the missing
+  # prerequisite named.
+  #
+  # This line used to read `model = "80486"`, with a comment saying that long
+  # mode was the distance between this board and phase 6b's gate. The core has
+  # long mode now, and a q35 with a 486 in it was describing a machine that
+  # never existed: the chipset around it is a 2007 part, and the *reason* every
+  # register in it was modelled — ECAM, the PAM file at 0x90, the PIRQ routers,
+  # the ACPI tables — is software that will not run on a 486. The two halves of
+  # the board now agree about what year it is.
+  #
+  # What is still missing against 6b's gate is SMP: this board declares one
+  # processor and `q35.acpi` below publishes a MADT saying so. That is the next
+  # thing, and it is a board change (a second `cpu.x86`, a second local APIC,
+  # the start-up IPI path) rather than a core one.
   object cpu0 "cpu.x86" {
     clock   = cpu
     space   = mem
     iospace = "port"
-    model   = "80486"
+    variant = "x86-64"
     engine  = "interp"
   }
 
@@ -336,6 +366,28 @@ machine "q35" {
   object dma1   "pc.dma"    { space = mem, mode = "byte", base = 0 }
   object dma2   "pc.dma"    { space = mem, mode = "word", base = 4 }
 
+  # -- the serial port --------------------------------------------------------
+  #
+  # A 16550 at 0x3f8 on IRQ4: COM1, at the address and on the line every PC has
+  # put it since 1981. On a real q35 it is not in the ICH9 at all — it is in a
+  # Super I/O part on the LPC bus, which the south bridge decodes for through
+  # `LPC_IO_DEC`/`LPC_EN` (ICH9 §13.1.3, §13.1.4). This board models the chip
+  # and not the decode: the register file a guest touches is the 16550's either
+  # way, and a Super I/O with one function in it would be a box drawn around
+  # nothing.
+  #
+  # It is here because **this is how a board that has no video console still
+  # says something**. `pc-at` has none, so every measurement on that board is
+  # taken through a video adapter's text page or a firmware's own debug port;
+  # a serial port is what a firmware reports as a boot console and what
+  # `console=ttyS0` names, and it is the one instrument that works before a
+  # video mode is set and after one is torn down.
+  object com1 "uart.ns16550" {
+    clock     = uart / 16
+    port      = console
+    frequency = 1843200
+  }
+
   # -- video ------------------------------------------------------------------
 
   object vga     "pc.video"    { clock = dot / 9, dot-clock = 28322000 }
@@ -408,6 +460,7 @@ machine "q35" {
   map port 0x00a0 size 0x0002 = pic2.regs
   map port 0x00c0 size 0x0020 = dma2.regs
   map port 0x03b4 size 0x0002 = vga.crtc-mono
+  map port 0x03f8 size 0x0008 = com1.regs
   map port 0x03c0 size 0x0010 = vga.vga
   map port 0x03d4 size 0x0002 = vga.crtc-colour
   map port 0x03d8 size 0x0002 = vga.mode
@@ -455,6 +508,13 @@ machine "q35" {
   wire cmos.irq    -> ioapic.irq8
   wire kbc.irq12   -> pic2.ir4
   wire kbc.irq12   -> ioapic.irq12
+
+  # COM1 on IRQ4, which is also `PIRQ`'s `lpc.irq4` below. Two drivers on one
+  # net is the wired-OR a shared PC interrupt line has always been, and it is
+  # only reachable at all if a guest routes a `PIRQ` there — the board's
+  # `pirq-routes` default sends all four to IRQ10 and IRQ11 instead.
+  wire com1.irq    -> pic1.ir4
+  wire com1.irq    -> ioapic.irq4
 
   wire hpet0.t0    -> ioapic.irq16
   wire hpet0.t1    -> ioapic.irq17

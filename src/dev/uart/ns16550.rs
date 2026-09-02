@@ -6,13 +6,25 @@
 //!   sheet (National Semiconductor). The register table, the DLAB latch, the
 //!   line- and modem-status bits, the FIFO control register and the interrupt
 //!   identification priorities all come from it.
-//! * `docs/devices/interrupts-timers.md` and `docs/platforms/riscv-virt.md` for
-//!   where it sits on this board.
+//! * `docs/devices/interrupts-timers.md`, and `docs/platforms/riscv-virt.md`,
+//!   `docs/platforms/pc64.md` and `docs/platforms/q35.md` for the three boards
+//!   that put one on a wire.
 //!
-//! Nothing about this chip is RISC-V specific: it lives here because the
-//! `virt` board is the first machine that needs one, and its class is named
-//! `uart.ns16550` rather than `riscv.*` so that it can move to `dev/uart/` the
-//! day a second board wants it, without a machine file changing.
+//! # Why it is here and not under a board
+//!
+//! It used to live under `dev/riscv/`, because the `virt` board was the first
+//! machine that wanted one, and its own docs said it would move to `dev/uart/`
+//! the day a second board did. Three now do — `riscv-virt`, `pc64` and `q35` —
+//! and a PC build that had to link a PLIC, a CLINT and virtio to get a serial
+//! port contradicted the crate-shape rule (`CLAUDE.md`: a NES build links a
+//! 6502 and nothing else). The class name never changed, so no machine file
+//! did either.
+//!
+//! One thing a board *does* own is how it describes the chip to its guest, and
+//! that is the `dev::riscv::dt::DtSource` impl below: a flattened device tree
+//! is a RISC-V board's mechanism, so the impl is behind `dev-riscv` and a PC
+//! build does not compile it. `dev::flash::cfi` publishes itself under exactly
+//! the same condition and for the same reason.
 //!
 //! # The register file
 //!
@@ -42,7 +54,7 @@
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::string::{String, ToString};
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use core::fmt;
 
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
@@ -56,8 +68,6 @@ use crate::core::value::{Endian, Width};
 use crate::core::wire::{Level, WireSource};
 use crate::host::chardev::{CharDevice, ports};
 use crate::machine::realize::Instance;
-
-use super::dt::{DtSource, NodeSpec};
 
 /// The class name a machine description writes.
 pub const CLASS_NAME: &str = "uart.ns16550";
@@ -167,9 +177,10 @@ struct Registers {
     /// The name the port was opened under, for `Debug` and diagnostics.
     port_name: String,
     frequency_hz: u32,
-    /// The net the interrupt pin drives, so the device tree can look its
-    /// number up in the PLIC's pin table rather than have it written twice.
-    /// See [`dt`](super::dt).
+    /// The net the interrupt pin drives, so a board that describes itself to
+    /// its guest can look the number up in its interrupt controller's pin
+    /// table rather than have it written down twice. Read by
+    /// [`Uart16550::irq_wire`] and by the device-tree impl below.
     irq_wire: Mutex<Option<crate::core::wire::WireId>>,
 }
 
@@ -239,10 +250,22 @@ impl Uart16550 {
         &self.regs.port_name
     }
 
-    /// The reference clock the device tree reports.
+    /// The reference clock a board reports to its guest, in hertz.
     #[must_use]
     pub fn frequency_hz(&self) -> u32 {
         self.regs.frequency_hz
+    }
+
+    /// The net the interrupt pin drives, or `None` until a board wires it.
+    ///
+    /// A board that describes its own interrupt routing to its guest — a
+    /// device tree, an ACPI table — needs to know which net this chip is on so
+    /// that it can look the number up in the controller the net reaches,
+    /// rather than have the number written down a second time next to the
+    /// wire. That is the whole reason the identity is kept.
+    #[must_use]
+    pub fn irq_wire(&self) -> Option<crate::core::wire::WireId> {
+        *self.regs.irq_wire.lock()
     }
 
     /// Move bytes between the chip and the host: fill the receive FIFO, and
@@ -505,9 +528,17 @@ impl MemOps for Registers {
     }
 }
 
-impl DtSource for Registers {
-    fn dt_spec(&self) -> NodeSpec {
-        let mut spec = NodeSpec::peripheral("serial", &["ns16550a"])
+/// How a board that generates a flattened device tree describes this chip.
+///
+/// Behind `dev-riscv` because the generator is: a device tree is what a RISC-V
+/// board hands its guest, and a PC finds its serial port from an ACPI table or
+/// from the port number every PC has always used. `dev::flash::cfi` publishes
+/// itself under the same condition, for the same reason, and both blocks go
+/// away when `RealizeCtx` carries the machine graph (`ROADMAP.md` §4.4).
+#[cfg(feature = "dev-riscv")]
+impl crate::dev::riscv::dt::DtSource for Registers {
+    fn dt_spec(&self) -> crate::dev::riscv::dt::NodeSpec {
+        let mut spec = crate::dev::riscv::dt::NodeSpec::peripheral("serial", &["ns16550a"])
             .with_cells("clock-frequency", alloc::vec![self.frequency_hz])
             // Spelled out rather than left to the binding's defaults: this
             // board decodes three address lines and puts the registers one
@@ -547,13 +578,18 @@ impl Device for Uart16550 {
         &CLASS
     }
 
+    #[cfg_attr(not(feature = "dev-riscv"), expect(unused_variables))]
     fn realize(&self, ctx: &mut RealizeCtx<'_>) -> Result<()> {
-        // What this region is, for the board's device-tree generator.
-        super::dt::publish(
+        // What this region is, for a board whose guest is handed a device
+        // tree. Conditional rather than unconditional because the generator is
+        // a RISC-V board's, not this chip's — see the impl above.
+        #[cfg(feature = "dev-riscv")]
+        crate::dev::riscv::dt::publish(
             ctx.hosts(),
             &self.region,
-            Arc::downgrade(&self.regs) as Weak<dyn DtSource>,
-        )
+            Arc::downgrade(&self.regs) as alloc::sync::Weak<dyn crate::dev::riscv::dt::DtSource>,
+        )?;
+        Ok(())
     }
 
     fn reset(&self, _kind: ResetKind) {

@@ -674,19 +674,39 @@ machine-a64-mini = ["cpu-arm-a64"]
 # dependencies.
 machine-arm926 = ["cpu-arm-aprofile"]
 
-# The RISC-V `virt` board's chips (src/dev/riscv): the CLINT, the PLIC, a 16550
-# UART on the character-device seam, a system controller, virtio-MMIO with block
-# and entropy devices, and a **device tree generator** that emits the DTB from
-# the realized machine graph rather than from a file somebody wrote by hand.
-# `no_std + alloc`, no `unsafe`, no dependencies. Written from the RISC-V
-# privileged/PLIC/ACLINT specifications, the PC16550D data sheet, OASIS VIRTIO
-# 1.2 and the Devicetree Specification.
+# A National Semiconductor 16550 UART (src/dev/uart/ns16550.rs): the eight
+# registers, the DLAB latch, both sixteen-byte FIFOs, the interrupt
+# identification priorities and modelled back pressure -- a byte the host will
+# not take stays in the holding register and `THRE` reads clear, so a guest
+# waits exactly as it would on a real one rather than the emulated machine
+# outrunning every real machine and losing output. Sits on the character-device
+# seam (`host::chardev`), so a board's console is a host port by name.
+# `no_std + alloc`, no `unsafe`, no dependencies. Written from the PC16550D data
+# sheet.
+#
+# It is its own feature because it is nobody's board's chip: `riscv-virt`,
+# `pc64` and `q35` all want one, and before this feature existed a PC that
+# wanted a console linked the whole RISC-V board -- a PLIC, a CLINT and virtio
+# -- to get it. With `dev-riscv` also enabled it grows the device-tree node a
+# RISC-V board describes it with, the same way `dev-flash-cfi` grows its
+# `cfi-flash` node; on its own it is a serial port and nothing else.
+dev-uart-ns16550 = []
+
+# The RISC-V `virt` board's chips (src/dev/riscv): the CLINT, the PLIC, a system
+# controller, virtio-MMIO with block and entropy devices, and a **device tree
+# generator** that emits the DTB from the realized machine graph rather than
+# from a file somebody wrote by hand. `no_std + alloc`, no `unsafe`, no
+# dependencies. Written from the RISC-V privileged/PLIC/ACLINT specifications,
+# OASIS VIRTIO 1.2 and the Devicetree Specification.
+#
+# `dev-uart-ns16550` is the board's console, and it is a feature of its own
+# rather than a module here: see its comment above.
 #
 # `dev-medium` is here for the storage seam alone -- `dev::medium::Medium`,
 # which `virtio.blk` stores its bytes behind so that `--drive disk=root.qcow2`
 # backs it with a host file through `dev-blk` exactly as it backs an ATA drive
 # or an NVMe namespace (ROADMAP.md 7.1). Nothing here talks ATA.
-dev-riscv = ["dev-medium"]
+dev-riscv = ["dev-medium", "dev-uart-ns16550"]
 
 # Parallel NOR flash (src/dev/flash/cfi): the Common Flash Interface query
 # structure and the Intel/Sharp extended command set (CFI id 0x0001) -- status
@@ -1287,14 +1307,16 @@ machine-pc-apic = ["cpu-x86", "dev-pc", "dev-pc-apic", "dev-pc-hpet"]
 
 # The q35 board (machines/q35.machine): the same legacy device set `pc-at` has,
 # behind an ICH9 south bridge and an 82Q35 north bridge instead of a 440FX, with
-# a memory-mapped configuration window and a generated set of ACPI tables. This
-# is `ROADMAP.md` phase 6b's board, and it is the board rather than the gate:
-# a modern distribution booting to a desktop needs long mode and SMP as well.
-# The `bios` slot takes a user image and defaults to rsemu's own, exactly as
-# `pc-at` does. Adds no dependencies.
+# a memory-mapped configuration window and a generated set of ACPI tables, a
+# COM1 to say something through, and an **x86-64** processor. This is
+# `ROADMAP.md` phase 6b's board; what still stands between it and 6b's gate is
+# SMP and a distribution's worth of drivers, not the core. The `bios` slot
+# takes a user image and defaults to rsemu's own, exactly as `pc-at` does.
+# Adds no dependencies.
 machine-q35 = [
   "cpu-x86",
   "dev-q35",
+  "dev-uart-ns16550",
   "dev-pc-apic",
   "dev-pc-hpet",
   "dev-pc-pci",
@@ -1311,13 +1333,12 @@ machine-q35 = [
 # something a kernel's early boot touches. This is where `ROADMAP.md` phase 6b's
 # core meets a modern guest. Adds no dependencies.
 #
-# `dev-riscv` is here for **one device**: the 16550, whose class is `uart.ns16550`
-# and which lives under `dev/riscv/` because the `virt` board was the first
-# machine to want one. Its own module docs call that placement provisional and
-# name the fix -- move it to `dev/uart/` the day a second board wants it, which
-# is today. Not done here because the move also has to cfg-gate its device-tree
-# `DtSource` impl, and that is a RISC-V change riding on an x86 commit.
-machine-pc64 = ["cpu-x86", "dev-pc", "dev-riscv", "dev-linuxboot"]
+# `dev-uart-ns16550` is the console. It used to be spelled `dev-riscv`, because
+# the 16550 lived under `dev/riscv/` where the `virt` board that first wanted
+# one had put it -- so this board linked a PLIC, a CLINT and virtio to get a
+# serial port. The chip has moved to `dev/uart/`; the class name never changed,
+# so `machines/pc64.machine` did not either.
+machine-pc64 = ["cpu-x86", "dev-pc", "dev-uart-ns16550", "dev-linuxboot"]
 
 # The in-house legacy PC BIOS (src/fw/pcbios): a 64 KiB real-mode ROM image
 # this crate assembles itself, so `pc-at` boots with nothing supplied from
