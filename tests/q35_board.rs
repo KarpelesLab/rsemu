@@ -99,6 +99,26 @@ fn board_configured(
     hd0: Vec<u8>,
     params: &[(&str, &str)],
 ) -> (Machine, Arc<X86>, Arc<acpi::AcpiTables>) {
+    let (machine, cpu, tables, _console) = board_and_console(image, hd0, params);
+    (machine, cpu, tables)
+}
+
+/// The same again, handing back the host end of COM1 as well.
+///
+/// The serial port is a *host* object rather than a region, so it cannot be
+/// reached through the built machine the way a space or a device can: it is
+/// opened out of the `HostObjects` the build was given, which is why this is
+/// the function that does the building and the three above delegate to it.
+fn board_and_console(
+    image: Vec<u8>,
+    hd0: Vec<u8>,
+    params: &[(&str, &str)],
+) -> (
+    Machine,
+    Arc<X86>,
+    Arc<acpi::AcpiTables>,
+    Arc<rsemu::host::chardev::CharPort>,
+) {
     let cpus: Arc<Captured<X86>> = Arc::new(Captured::new());
     let tables: Arc<Captured<acpi::AcpiTables>> = Arc::new(Captured::new());
     let mut options = rsemu::machine::BuildOptions::new()
@@ -119,12 +139,15 @@ fn board_configured(
         Ok(m) => m,
         Err(e) => panic!("the board does not realize: {e}"),
     };
+    let console = rsemu::host::chardev::ports::open(&options.realize.hosts, "console")
+        .expect("the 16550 opened the board's console port");
     machine.reset(ResetKind::Cold);
     machine.sweep();
     (
         machine,
         cpus.take().expect("the constructor kept a handle"),
         tables.take().expect("the constructor kept a handle"),
+        console,
     )
 }
 
@@ -645,8 +668,10 @@ fn the_board_snapshots_and_restores_to_an_identical_state_hash() {
 /// * It does not boot a guest. The IDE bays are empty here; `tests/pc_at_boot`
 ///   is where a boot sector runs, and pointing it at this board is the next
 ///   step rather than this one.
-/// * It says nothing about a modern kernel. That needs long mode, and the x86
-///   core does not have it.
+/// * It says nothing about the processor. A legacy BIOS never leaves real and
+///   16-bit protected mode, so a POST is a measurement of the chipset;
+///   `a_guest_reaches_long_mode_and_prints_through_com1_on_this_board` is the
+///   one that measures the `x86-64` this board now asks for.
 #[cfg(feature = "fw-pcbios")]
 #[test]
 fn rsemus_own_bios_posts_on_this_board() {
@@ -766,10 +791,12 @@ fn boot_sector() -> Vec<u8> {
 
 /// **A guest boots off the IDE drive on this board.**
 ///
-/// The furthest observable this work reaches, and the ladder it is on is
-/// `ROADMAP.md` phase 6b's: *the board builds and a firmware enumerates it* →
-/// *a kernel's early console prints* → *a kernel finds its root device*. This
-/// is the first rung, on a chipset a 6b guest would recognise.
+/// The ladder is `ROADMAP.md` phase 6b's: *the board builds and a firmware
+/// enumerates it* → *a kernel's early console prints* → *a kernel finds its
+/// root device*. This is the first rung, on a chipset a 6b guest would
+/// recognise;
+/// `a_guest_reaches_long_mode_and_prints_through_com1_on_this_board` takes the
+/// same path and keeps going into 64-bit code.
 ///
 /// Each step is checked rather than assumed:
 ///
@@ -965,8 +992,15 @@ fn listen(m: &Machine) -> Arc<DebugPort> {
 ///   tick that is still counting.
 ///
 /// It does **not** boot an operating system, and nothing here claims it would:
-/// there is no bootable medium in this test, and a modern kernel would want
-/// long mode from a core that has not got it.
+/// there is no bootable medium in this test. Nor does it say anything about
+/// the processor — a legacy PC firmware never leaves real and 16-bit protected
+/// mode, whatever the part underneath is.
+///
+/// One line in the log *is* about a part of this board rather than the
+/// chipset: `Found 1 serial ports`. Before `machines/q35.machine` grew a
+/// `uart.ns16550` at `0x3f8` the same firmware printed `Found 0 serial ports`,
+/// and the equipment word at `0040:0010` went from `0x0006` to `0x0206` — bits
+/// 11-9 are the count.
 #[test]
 fn a_third_party_firmware_runs_on_this_board() {
     let Ok(path) = std::env::var("RSEMU_BIOS") else {
@@ -1148,5 +1182,284 @@ fn the_dsdt_routes_every_slots_interrupt_where_the_router_is_programmed() {
     assert!(
         dsdt.windows(row.len()).any(|w| w == row),
         "device 4's INTA# is not routed to IRQ11 in the AML"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// a 64-bit processor, and a serial port to say so through
+// ---------------------------------------------------------------------------
+
+/// Where the long-mode sector leaves its proof, and what it leaves there.
+#[cfg(feature = "fw-pcbios")]
+const LM_MARKER_AT: u64 = 0x0510;
+/// A value that can only have been stored by an instruction naming `R8`.
+#[cfg(feature = "fw-pcbios")]
+const LM_MARKER: u64 = 0x0000_0000_c0ff_ee64;
+
+// Fixed addresses inside the boot sector. Fixed rather than labelled because
+// the far jump that leaves 16-bit mode takes a **32-bit** immediate offset,
+// which `fw::asm16` has no fixup for — it is a 16-bit assembler, and this is
+// the one instruction in this sector that is not a 16-bit instruction.
+
+/// The 64-bit code descriptor and the data descriptor beside it.
+#[cfg(feature = "fw-pcbios")]
+const SECTOR_GDT: u16 = 0x7ce0;
+/// The pseudo-descriptor `LGDT` reads.
+#[cfg(feature = "fw-pcbios")]
+const SECTOR_GDTR: u16 = 0x7cf8;
+/// Where the far jump lands, in an `L=1` code segment.
+#[cfg(feature = "fw-pcbios")]
+const SECTOR_LONG: u16 = 0x7d00;
+/// The string the real-mode half prints.
+#[cfg(feature = "fw-pcbios")]
+const SECTOR_TEXT: u16 = 0x7dc0;
+
+// The three pages the sector builds its address translation out of: a PML4, a
+// PDPT and a page directory, identity-mapping the first 4 MiB with two 2 MiB
+// pages — which covers everything this guest touches: itself at `0x7c00`, its
+// tables, and the marker at `0x510`. SDM Vol. 3A §4.5.
+
+/// The level-4 table, and what `CR3` is loaded with.
+#[cfg(feature = "fw-pcbios")]
+const PT_PML4: u16 = 0x9000;
+/// The level-3 table.
+#[cfg(feature = "fw-pcbios")]
+const PT_PDPT: u16 = 0xa000;
+/// The level-2 table, whose entries are 2 MiB pages.
+#[cfg(feature = "fw-pcbios")]
+const PT_PD: u16 = 0xb000;
+
+/// Emit "wait for `THRE`, then write one character to COM1", in 64-bit code.
+///
+/// Hand-encoded because there is no 64-bit assembler in this repository and
+/// this test does not justify one: five instructions, each cited. The polling
+/// is not optional — `uart.ns16550` models back pressure, so a guest that
+/// writes without looking at the line status loses characters exactly as it
+/// would on real hardware.
+#[cfg(feature = "fw-pcbios")]
+fn com1_putc64(a: &mut rsemu::fw::asm16::Asm, ch: u8) {
+    // mov dx, 0x3fd — the line status register.
+    a.db(&[0x66, 0xba, 0xfd, 0x03]);
+    // in al, dx / test al, 0x20 / jz -5: spin until the holding register is
+    // empty. `0xfb` is -5, back to the `in`.
+    a.db(&[0xec, 0xa8, 0x20, 0x74, 0xfb]);
+    // mov dx, 0x3f8 / mov al, ch / out dx, al — the transmit holding register.
+    a.db(&[0x66, 0xba, 0xf8, 0x03]);
+    a.db(&[0xb0, ch]);
+    a.db(&[0xee]);
+}
+
+/// A boot sector that talks to COM1, enters **long mode**, and talks again.
+///
+/// The two things this board gained in one change are exactly the two things
+/// this proves, and it proves them the only way that counts — by being a guest:
+///
+/// 1. A guest programs the 16550 at `0x3f8` and its characters reach the host
+///    end of the character port, with the `THRE` handshake respected.
+/// 2. The processor is an x86-64. The sector builds a four-level page table,
+///    sets `CR4.PAE`, `CR3`, `EFER.LME` and `CR0.PG|PE`, far-jumps into a code
+///    descriptor with `L=1`, and then executes two instructions that **cannot
+///    be encoded outside 64-bit mode**: `mov r8, imm64` and `mov [abs], r8`.
+///    A 486 decoding those bytes would run something else entirely and would
+///    never write the marker.
+///
+/// Sources: SDM Vol. 3A §9.8.5 for the order of the transition, §4.5 for the
+/// four-level tables and §3.4.5 for the `L` bit; the PC16550D data sheet for
+/// the divisor latch and `LSR`.
+#[cfg(feature = "fw-pcbios")]
+fn long_mode_boot_sector() -> Vec<u8> {
+    use rsemu::fw::asm16::{AL, AX, Asm, BL, CX, Cc, DI, DS, DX, ES, Mem, SI, SP, SS};
+    let mut a = Asm::new(usize::from(BOOT_ADDRESS) + 512, 0x00);
+    a.seek(BOOT_ADDRESS);
+
+    // Segments, a stack, and interrupts off for good. There is no IDT on the
+    // far side of the transition, so an interrupt taken after `CR0.PG` would
+    // be a triple fault rather than a test failure.
+    a.cli();
+    a.movi(AX, 0);
+    a.movsr(DS, AX);
+    a.movsr(ES, AX);
+    a.movsr(SS, AX);
+    a.movi(SP, BOOT_ADDRESS);
+    a.cld();
+
+    // COM1 at 115200 8N1: interrupts off, then the divisor behind DLAB, then
+    // the line control that clears DLAB again, then FIFOs off and the modem
+    // control lines up.
+    for (port, value) in [
+        (0x3f9u16, 0x00u8),
+        (0x3fb, 0x80),
+        (0x3f8, 0x01),
+        (0x3f9, 0x00),
+        (0x3fb, 0x03),
+        (0x3fa, 0x00),
+        (0x3fc, 0x03),
+    ] {
+        a.movi(DX, port);
+        a.movi8(AL, value);
+        a.out_dx_al();
+    }
+
+    // Print the first string, polling `THRE` between characters.
+    a.movi(SI, SECTOR_TEXT);
+    let next = a.here_label();
+    let done = a.label();
+    a.lodsb();
+    a.test8(AL, AL);
+    a.jcc(Cc::E, done);
+    a.mov8(BL, AL);
+    a.movi(DX, 0x3fd);
+    let wait = a.here_label();
+    a.in_al_dx();
+    a.testi8(AL, 0x20);
+    a.jcc(Cc::E, wait);
+    a.movi(DX, 0x3f8);
+    a.mov8(AL, BL);
+    a.out_dx_al();
+    a.jmp(next);
+    a.bind(done);
+
+    // Three zeroed pages, then the three entries that chain them. The page
+    // directory maps 0 and 2 MiB as 2 MiB pages: present, writable, `PS`.
+    a.movi(DI, PT_PML4);
+    a.movi(AX, 0);
+    a.movi(CX, 0x1800);
+    a.rep();
+    a.stosw();
+    a.movmi(Mem::abs(PT_PML4), PT_PDPT | 0x003);
+    a.movmi(Mem::abs(PT_PDPT), PT_PD | 0x003);
+    a.movmi(Mem::abs(PT_PD), 0x0083);
+    a.movmi(Mem::abs(PT_PD + 8), 0x0083);
+    a.movmi(Mem::abs(PT_PD + 10), 0x0020);
+
+    // CR4.PAE.
+    a.db(&[0x0f, 0x20, 0xe0]);
+    a.db(&[0x66, 0x83, 0xc8, 0x20]);
+    a.db(&[0x0f, 0x22, 0xe0]);
+    // CR3.
+    a.db(&[0x66, 0xb8]);
+    a.db(&u32::from(PT_PML4).to_le_bytes());
+    a.db(&[0x0f, 0x22, 0xd8]);
+    // EFER.LME, through the model-specific register at 0xc0000080.
+    a.db(&[0x66, 0xb9, 0x80, 0x00, 0x00, 0xc0]);
+    a.db(&[0x0f, 0x32]);
+    a.db(&[0x66, 0x0d, 0x00, 0x01, 0x00, 0x00]);
+    a.db(&[0x0f, 0x30]);
+    // The descriptor table, then paging and protection in one write — the
+    // check is against the resulting CR0, which has both bits set.
+    a.lgdt(Mem::abs(SECTOR_GDTR));
+    a.db(&[0x0f, 0x20, 0xc0]);
+    a.db(&[0x66, 0x0d, 0x01, 0x00, 0x00, 0x80]);
+    a.db(&[0x0f, 0x22, 0xc0]);
+    // jmp far 0x0008:0x00007d00 — the only instruction that can put `CS.L` up.
+    a.db(&[0x66, 0xea]);
+    a.db(&u32::from(SECTOR_LONG).to_le_bytes());
+    a.db(&[0x08, 0x00]);
+
+    assert!(
+        a.here() <= SECTOR_GDT,
+        "the real-mode half grew into the descriptor table at {:#06x}",
+        SECTOR_GDT
+    );
+
+    // The descriptors. A null, a 64-bit code segment (`L` set, and `D` clear
+    // because the two may not both be), and a data segment.
+    a.seek(SECTOR_GDT);
+    a.db(&[0, 0, 0, 0, 0, 0, 0, 0]);
+    a.db(&[0xff, 0xff, 0x00, 0x00, 0x00, 0x9a, 0xaf, 0x00]);
+    a.db(&[0xff, 0xff, 0x00, 0x00, 0x00, 0x92, 0xcf, 0x00]);
+    a.seek(SECTOR_GDTR);
+    a.dw(23);
+    a.db(&u32::from(SECTOR_GDT).to_le_bytes());
+
+    // The 64-bit half.
+    a.seek(SECTOR_LONG);
+    // mov r8, LM_MARKER — `REX.WB` plus `B8+r`, so the register is `r8`.
+    a.db(&[0x49, 0xb8]);
+    a.db(&LM_MARKER.to_le_bytes());
+    // mov [0x510], r8 — `REX.WR`, `89 /r`, and a SIB naming a bare disp32.
+    a.db(&[0x4c, 0x89, 0x04, 0x25]);
+    a.db(&(LM_MARKER_AT as u32).to_le_bytes());
+    for ch in b"LONG64\r\n" {
+        com1_putc64(&mut a, *ch);
+    }
+    a.hlt();
+    a.db(&[0xeb, 0xfe]);
+    assert!(
+        a.here() <= SECTOR_TEXT,
+        "the 64-bit half grew into the string at {:#06x}",
+        SECTOR_TEXT
+    );
+
+    a.seek(SECTOR_TEXT);
+    a.db(b"q35: real mode\r\n\0");
+
+    let mut image = a.finish();
+    image[usize::from(BOOT_ADDRESS) + 510] = 0x55;
+    image[usize::from(BOOT_ADDRESS) + 511] = 0xaa;
+    image[usize::from(BOOT_ADDRESS)..].to_vec()
+}
+
+/// **A guest on this board reaches long mode, and says so down COM1.**
+///
+/// `machines/q35.machine` used to ask for an 80486, on a chipset from 2007,
+/// with a comment saying long mode was the distance between the board and
+/// `ROADMAP.md` phase 6b. The core has long mode; this is the board's own
+/// evidence that it is reachable from the reset vector, through a firmware,
+/// off a disk — rather than only from a unit test that sets the registers up
+/// by hand.
+///
+/// The whole ladder, and every rung is checked below:
+///
+/// 1. The processor fetches `0xfffffff0` out of the ROM alias and POSTs.
+/// 2. `INT 19h` reads the first sector off the IDE drive and jumps to it.
+/// 3. The sector programs the 16550 and prints; the characters come out of the
+///    host end of the character port.
+/// 4. It builds four-level page tables, sets `CR4.PAE`, `CR3`, `EFER.LME` and
+///    `CR0.PG|PE`, and far-jumps into an `L=1` descriptor.
+/// 5. It stores a marker with `R8` — a register that does not exist outside
+///    long mode — and prints again from 64-bit code.
+#[cfg(feature = "fw-pcbios")]
+#[test]
+fn a_guest_reaches_long_mode_and_prints_through_com1_on_this_board() {
+    const SECTORS: usize = 4 * 16 * 63;
+    let mut disk = vec![0u8; SECTORS * 512];
+    disk[..512].copy_from_slice(&long_mode_boot_sector());
+
+    let (mut machine, cpu, _tables, console) =
+        board_and_console(rsemu::fw::pcbios::image().to_vec(), disk, &[]);
+    machine
+        .run_for(rsemu::core::clock::GlobalTime::from_nanos(400_000_000))
+        .expect("the board runs");
+
+    let text = String::from_utf8_lossy(&console.drain()).into_owned();
+    let regs = cpu.regs();
+    println!(
+        "q35 long mode: stopped at {:04x}:{:08x}, halted={}, {} cycles",
+        regs.cs,
+        regs.rip,
+        cpu.is_halted(),
+        cpu.cycles()
+    );
+    for line in text.lines() {
+        println!("  |{line}|");
+    }
+
+    assert!(
+        text.contains("q35: real mode"),
+        "nothing came out of COM1 in real mode, so the board's new serial port \
+         is not reachable from a guest; the port said {text:?}"
+    );
+    let marker = read_bytes(&mem(&machine), LM_MARKER_AT, 8);
+    assert_eq!(
+        u64::from_le_bytes(marker.try_into().expect("eight bytes")),
+        LM_MARKER,
+        "the marker `R8` was supposed to store is not there, so the far jump \
+         never landed in a 64-bit code segment"
+    );
+    assert!(
+        text.contains("LONG64"),
+        "long mode was entered -- the marker is in memory -- but nothing came \
+         out of COM1 from 64-bit code; the port said {text:?}"
     );
 }

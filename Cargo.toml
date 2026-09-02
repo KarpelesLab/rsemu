@@ -1307,14 +1307,16 @@ machine-pc-apic = ["cpu-x86", "dev-pc", "dev-pc-apic", "dev-pc-hpet"]
 
 # The q35 board (machines/q35.machine): the same legacy device set `pc-at` has,
 # behind an ICH9 south bridge and an 82Q35 north bridge instead of a 440FX, with
-# a memory-mapped configuration window and a generated set of ACPI tables. This
-# is `ROADMAP.md` phase 6b's board, and it is the board rather than the gate:
-# a modern distribution booting to a desktop needs long mode and SMP as well.
-# The `bios` slot takes a user image and defaults to rsemu's own, exactly as
-# `pc-at` does. Adds no dependencies.
+# a memory-mapped configuration window and a generated set of ACPI tables, a
+# COM1 to say something through, and an **x86-64** processor. This is
+# `ROADMAP.md` phase 6b's board; what still stands between it and 6b's gate is
+# SMP and a distribution's worth of drivers, not the core. The `bios` slot
+# takes a user image and defaults to rsemu's own, exactly as `pc-at` does.
+# Adds no dependencies.
 machine-q35 = [
   "cpu-x86",
   "dev-q35",
+  "dev-uart-ns16550",
   "dev-pc-apic",
   "dev-pc-hpet",
   "dev-pc-pci",
