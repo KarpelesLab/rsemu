@@ -285,18 +285,18 @@ fn a_guest_under_kvm_reaches_a_device_model_through_an_out() {
     assert_eq!(vcpu.stats().pio, 3);
 }
 
-/// The same, through **a real device model**: the 16550 the RISC-V board uses,
-/// unmodified, on the character-device seam.
+/// The same, through **a real device model**: the 16550 three of this tree's
+/// boards use, unmodified, on the character-device seam.
 ///
 /// The point of running it twice is that the previous test proves the routing
 /// and this one proves it lands somewhere a machine would actually put it —
 /// a stateful device with a FIFO, a host backend and a reset, reached at COM1's
 /// own port number.
-#[cfg(feature = "dev-riscv")]
+#[cfg(feature = "dev-uart-ns16550")]
 #[test]
 fn a_guest_under_kvm_prints_through_the_emulated_16550() {
     use crate::core::device::{Device, ResetKind};
-    use crate::dev::riscv::Uart16550;
+    use crate::dev::uart::Uart16550;
     use crate::host::chardev::CharPort;
     use alloc::string::String;
 
