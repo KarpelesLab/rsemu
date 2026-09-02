@@ -1379,7 +1379,7 @@ impl DmaPeripheral for Registers {
 /// This is the rendezvous that closes it, in the shape
 /// [`crate::dev::ata::bays`] already has: the controller files itself under a
 /// name in the build's [`HostObjects`], and whoever built the machine looks it
-/// up afterwards. The name is the `drive` property, [`DEFAULT_NAME`] when a
+/// up afterwards. The name is the `drive` property, [`drives::DEFAULT_NAME`] when a
 /// machine file does not say — and a `HostObjects` belongs to one build, so two
 /// boards in one process do not collide however they are named.
 ///
