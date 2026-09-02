@@ -241,7 +241,7 @@ the missing Advanced SIMD `MOVI Dd, #0` in an early build of `fp_rules` was
 diagnosed in one line.
 
 **Generating a corpus removes the licensing problem completely. It does not by
-itself remove the evidence problem**, so two of the five guests take their
+itself remove the evidence problem**, so four of the six guests take their
 expectations from outside this project:
 
 | Guest | Expectations come from |
@@ -262,6 +262,7 @@ expectations from outside this project:
 over 243 949 charged bus accesses. The runner prints that number per guest and
 asserts the total is non-zero: a pass count on its own cannot tell a clean run
 from a guest whose body was optimised away.
+
 The ledger is a `const` list in `src/cpu/arm/a64/conformance.rs` rather than a
 file under `ledgers/`, because this suite's runner lives in the crate beside
 the core it measures; it is enforced both ways round like every other one here.
