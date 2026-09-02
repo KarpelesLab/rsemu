@@ -244,6 +244,32 @@ cpu-riscv = ["float"]
 # dependencies and is `no_std + alloc`.
 cpu-riscv-lift = ["cpu-riscv", "ir"]
 
+# The x86 IR frontend (src/cpu/x86/lift.rs): lifting 32-bit protected-mode
+# guest instructions into `ir::Block`s — the *second* frontend for the
+# translation IR, after RISC-V, and the one that exercises the two things
+# RISC-V could not. Flags: six of them written by nearly every arithmetic
+# instruction and read by almost none, computed as ordinary temporaries and
+# then removed by dead-code elimination wherever no boundary can observe them
+# (ROADMAP.md §9, and the IR's own decision 1). Self-modifying code: x86 makes
+# coherent instruction caches architectural, so a store gets a run-time test of
+# its linear page against the block's own and turns a self-modifying store into
+# a precise side exit — the *within-block* hook `jit::dispatch` records that an
+# x86 frontend would need.
+#
+# The subset is 32-bit protected mode with paging off: the ALU, MOV/MOVZX/
+# MOVSX/LEA, the shifts and rotates, MUL/IMUL, BSF/BSR, SETcc/CMOVcc, the
+# stack, and every near transfer of control. Deliberately **not** here: x87,
+# SSE, long mode, real mode, paging, DIV/IDIV, the string primitives, LOCK,
+# segment loads and the far transfers — each ends the block with a terminator
+# that hands the PC back to the interpreter, which stays the oracle
+# (CLAUDE.md, "CPU cores"). It reads the same declarative rows in `isa.rs`
+# that decode, execute and the disassembler read, so there is still one
+# description of the instruction set and not a second decoder. Needs `cpu-x86`
+# for the core and `ir` for the block types; `jit` adds the cached and chained
+# half of the differential harness. Adds no dependencies and is
+# `no_std + alloc`.
+cpu-x86-lift = ["cpu-x86", "ir"]
+
 # The WDC 65xx peripherals (src/dev/wdc): the W65C51N ACIA as a character
 # device, the W65C22 VIA with both ports and both timers, and the 32 KiB
 # program EEPROM socket a 6502 breadboard computer boots from — plus
@@ -1328,6 +1354,20 @@ codegen-units = 1
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[[bench]]
+# What the x86 frontend's three policies bought, one mechanism at a time
+# (ROADMAP.md §9.1), against the same interpreter the differential harness uses
+# as its oracle. Two of the columns exist only because x86 exists: flag elision,
+# which is what makes the IR's "flags are ordinary temporaries" decision cheaper
+# than eager packing rather than dearer, and the in-block self-modifying-code
+# guard, which is what makes a coherent instruction cache architectural without
+# ending a block at every store. `harness = false` for the same reason the other
+# two benchmarks give — libtest's bench harness is nightly-only and this project
+# is stable.
+name             = "x86_dispatch"
+harness          = false
+required-features = ["jit", "cpu-x86-lift"]
 
 [[bench]]
 # What the software TLB and the block cache bought, measured one mechanism at a

@@ -1,0 +1,524 @@
+//! The x86 lifter against the x86 interpreter, over a generated corpus.
+//!
+//! CLAUDE.md, "CPU cores": an IR frontend *is differentially tested against the
+//! interpreter forever*, and the interpreter is the oracle. The comparison
+//! itself lives in [`cpu::x86::differential`], because
+//! `fuzz_targets/x86_lift.rs` drives the same functions; this file is the half
+//! of it that runs in a plain `cargo test`, offline, with no fuzzer and no
+//! downloaded corpus.
+//!
+//! The programs are generated rather than written, because the bugs a
+//! hand-written suite finds are the ones its author thought of. Generation is a
+//! 64-bit LCG with a fixed seed, so the corpus is the same on every machine and
+//! in every run (`ROADMAP.md` §0) — a failure here is reproducible from the
+//! seed printed beside it, and a new failure is a real regression rather than a
+//! different draw.
+//!
+//! # Six frontends, not one
+//!
+//! Every case runs under all three [`Shape`]s crossed with both [`Flags`]
+//! policies, because each of those emits **different IR from the same bytes**:
+//!
+//! * a `Shape::Trace` conditional jump is a `brcond` and a side exit where a
+//!   `Shape::BasicBlock` one is a `setcond`/`movcond` pair;
+//! * `Flags::Elide` leaves a flag out of a boundary's live map when the next
+//!   instruction overwrites it and cannot fault, and dead-code elimination then
+//!   deletes the arithmetic behind it, where `Flags::Eager` keeps all six
+//!   everywhere.
+//!
+//! All six must agree with the one interpreter on every column, so a
+//! disagreement between two of them is a frontend bug wherever it shows up.
+//! [`Smc`] is the third axis, exercised the same way by the self-modifying-code
+//! cases below.
+
+#![cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+
+use rsemu::cpu::x86::differential::{
+    Case, Verdict, compare, compare_cached, measure_cached, synthesize,
+};
+use rsemu::cpu::x86::lift::{Flags, Shape, Smc};
+
+/// A 64-bit linear congruential generator — Knuth's MMIX multiplier and
+/// increment.
+///
+/// A named, fixed generator rather than anything from the host: the corpus has
+/// to be identical everywhere, and a hash of the run index would give a
+/// different sequence the day the hasher changes.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.0
+    }
+}
+
+/// One generated program of up to `len` instructions, terminated by a byte the
+/// lifter refuses so a run cannot fall off the end into the data window.
+fn generate(rng: &mut Lcg, len: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for _ in 0..len {
+        let bits = rng.next();
+        out.extend_from_slice(&synthesize((bits >> 40) as u32, bits as u32));
+    }
+    // `HLT`: outside the subset, so the block ends cleanly rather than lifting
+    // whatever the data window happens to hold.
+    out.push(0xf4);
+    out
+}
+
+/// What a sweep covered. A [`Verdict::Trapped`] is a real result — both engines
+/// stopped at the same instruction in the same state — and a
+/// [`Verdict::Nothing`] means the first instruction was outside the subset, so
+/// counting them is how the test can assert it is exercising the lifter rather
+/// than measuring an empty block a thousand times.
+#[derive(Default, Debug)]
+struct Coverage {
+    agreed: usize,
+    trapped: usize,
+    nothing: usize,
+    insns: usize,
+}
+
+fn sweep(seed: u64, count: usize, shape: Shape, flags: Flags) -> Coverage {
+    let mut rng = Lcg(seed);
+    let mut cov = Coverage::default();
+    for n in 0..count {
+        let len = 1 + (rng.next() % 12) as usize;
+        let case = Case::seeded(generate(&mut rng, len))
+            .with_shape(shape)
+            .with_flags(flags);
+        match compare(&case) {
+            Ok(Verdict::Agreed { insns, .. }) => {
+                cov.agreed += 1;
+                cov.insns += insns;
+            }
+            Ok(Verdict::Trapped { insns }) => {
+                cov.trapped += 1;
+                cov.insns += insns;
+            }
+            Ok(Verdict::Nothing) => cov.nothing += 1,
+            Err(e) => panic!("case {n} of seed {seed:#x} diverged under {shape:?}/{flags:?}:\n{e}"),
+        }
+    }
+    cov
+}
+
+#[test]
+fn a_generated_corpus_agrees_with_the_interpreter_under_every_shape_and_flag_policy() {
+    // The cross product is the point: the same bytes lift to different IR under
+    // each of the six, and every one of them is compared against the one
+    // interpreter.
+    let mut total = Coverage::default();
+    for (n, shape) in [Shape::BasicBlock, Shape::Extended, Shape::Trace]
+        .into_iter()
+        .enumerate()
+    {
+        for (m, flags) in [Flags::Eager, Flags::Elide].into_iter().enumerate() {
+            let seed = 0x5eed_0000 + (n as u64) * 16 + m as u64;
+            let cov = sweep(seed, 600, shape, flags);
+            assert!(
+                cov.agreed > 300,
+                "{shape:?}/{flags:?}: only {} of 600 cases ran to completion ({} trapped, {} \
+                 lifted nothing) — the generator has stopped producing programs in the subset",
+                cov.agreed,
+                cov.trapped,
+                cov.nothing
+            );
+            total.agreed += cov.agreed;
+            total.trapped += cov.trapped;
+            total.nothing += cov.nothing;
+            total.insns += cov.insns;
+        }
+    }
+    assert!(
+        total.trapped > 0,
+        "no case reached a fault, so the precise-state column was never tested"
+    );
+    assert!(
+        total.insns > 5_000,
+        "only {} guest instructions retired across the whole corpus",
+        total.insns
+    );
+}
+
+#[test]
+fn the_same_corpus_agrees_through_the_cached_and_chained_runtime() {
+    // The second harness: many blocks, served from a cache, exits patched, the
+    // instruction bytes read out of guest RAM, and every access through the
+    // software TLB. It covers what one freshly lifted block cannot.
+    let mut rng = Lcg(0x5eed_beef);
+    let (mut agreed, mut trapped, mut nothing) = (0usize, 0usize, 0usize);
+    for n in 0..600 {
+        let len = 1 + (rng.next() % 12) as usize;
+        let case = Case::seeded(generate(&mut rng, len));
+        match compare_cached(&case, 32) {
+            Ok(Verdict::Agreed { .. }) => agreed += 1,
+            Ok(Verdict::Trapped { .. }) => trapped += 1,
+            Ok(Verdict::Nothing) => nothing += 1,
+            Err(e) => panic!("cached case {n} diverged:\n{e}"),
+        }
+    }
+    assert!(
+        agreed > 300,
+        "only {agreed} of 600 cached cases ran to completion ({trapped} trapped, {nothing} lifted \
+         nothing)"
+    );
+    assert!(trapped > 0, "no cached case reached a fault");
+}
+
+/// A tight loop: `dec ecx` / `jnz` back to it, entered with a small count.
+///
+/// Four bytes, wholly inside one page, and the shape that shows what merging
+/// buys — a trace unrolls the back edge until the instruction limit, where a
+/// basic block dispatches once per iteration.
+fn counted_loop(count: u32) -> Case {
+    let program = vec![
+        // 0: dec ecx
+        0x49, // 1: jnz -3
+        0x75, 0xfd, // 3: hlt
+        0xf4,
+    ];
+    Case::new(program).with_reg(1, count)
+}
+
+#[test]
+fn a_backward_branch_unrolls_under_a_trace_and_does_not_under_a_basic_block() {
+    let plain = measure_cached(&counted_loop(40).with_shape(Shape::BasicBlock), 200)
+        .expect("the basic-block shape agrees");
+    let trace = measure_cached(&counted_loop(40).with_shape(Shape::Trace), 200)
+        .expect("the trace shape agrees");
+    assert!(matches!(plain.verdict, Verdict::Agreed { .. }));
+    assert!(matches!(trace.verdict, Verdict::Agreed { .. }));
+    // The same guest work, in far fewer blocks: that is the whole of
+    // `ROADMAP.md` §9's fourth mechanism, measured rather than asserted.
+    assert!(
+        trace.blocks * 4 < plain.blocks,
+        "a trace took {} blocks where a basic block took {}",
+        trace.blocks,
+        plain.blocks
+    );
+    // The basic-block run goes round the loop forty times through the same two
+    // translations, so nearly every edge is a patched exit rather than a
+    // lookup. The trace does not chain, and that is the point: it has swallowed
+    // the edges that would have been chained.
+    assert!(
+        plain.chained > 30,
+        "only {} of {} blocks were reached by a patched exit",
+        plain.chained,
+        plain.blocks
+    );
+    assert!(trace.translated <= plain.translated);
+}
+
+#[test]
+fn a_generated_corpus_agrees_on_a_486() {
+    // A different `Op::clocks` table is not what changes here — the tick model
+    // is the same — but the variant is in the cache key and in `World`, so it
+    // is a second frontend to run rather than a second run of the first.
+    let mut rng = Lcg(0x486_0001);
+    for n in 0..400 {
+        let len = 1 + (rng.next() % 10) as usize;
+        let mut case = Case::seeded(generate(&mut rng, len));
+        case.variant = rsemu::cpu::x86::Variant::I80486;
+        if let Err(e) = compare(&case) {
+            panic!("486 case {n} diverged:\n{e}");
+        }
+    }
+}
+
+/// A program that writes a byte into its own page and then executes what it
+/// wrote.
+///
+/// `mov [eax], bl` with `EAX` pointing at the instruction two ahead of it, then
+/// that instruction. Under the interpreter the store is visible immediately,
+/// because the interpreter re-fetches; under a translated block it is visible
+/// only if the block gives the dispatcher a boundary to invalidate at, which is
+/// exactly what the two [`Smc`] policies do in their two different ways.
+fn self_modifying() -> Vec<u8> {
+    vec![
+        // 0: mov [eax], bl        — EAX is set to 4 by the caller
+        0x88, 0x18, // 2: nop
+        0x90, // 3: nop
+        0x90, // 4: inc esi        — overwritten by the store
+        0x46, // 5: hlt
+        0xf4,
+    ]
+}
+
+#[test]
+fn a_store_into_a_running_block_is_honoured_under_both_policies() {
+    for smc in [Smc::EndBlock, Smc::Guard] {
+        for shape in [Shape::BasicBlock, Shape::Extended, Shape::Trace] {
+            // EAX points at offset 4, BL holds `0x47` — `inc edi` — so the
+            // instruction the block was lifted from changes under it.
+            let case = Case::new(self_modifying())
+                .with_reg(0, 4)
+                .with_reg(3, 0x47)
+                .with_shape(shape)
+                .with_smc(smc);
+            let run =
+                measure_cached(&case, 32).unwrap_or_else(|e| panic!("{smc:?}/{shape:?}: {e}"));
+            assert!(
+                matches!(run.verdict, Verdict::Agreed { .. }),
+                "{smc:?}/{shape:?}: {:?}",
+                run.verdict
+            );
+            assert!(
+                run.smc > 0,
+                "{smc:?}/{shape:?}: the store never invalidated a translation, so the case is \
+                 not testing what it says it is"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_store_that_misses_the_code_page_invalidates_nothing() {
+    // The other half of the guard: the overwhelmingly common case is a store
+    // that has nothing to do with code, and it must cost one not-taken branch
+    // rather than a block boundary.
+    let program = vec![
+        // mov [eax], bl ; inc esi ; hlt — EAX points into the data window.
+        0x88, 0x18, 0x46, 0xf4,
+    ];
+    let case = Case::seeded(program).with_smc(Smc::Guard);
+    let run = measure_cached(&case, 32).expect("agrees");
+    assert!(matches!(run.verdict, Verdict::Agreed { .. }));
+    assert_eq!(run.smc, 0, "a data store must not invalidate a translation");
+    assert_eq!(
+        run.insns_retired, 2,
+        "the guard must not cut the block short: {run:?}"
+    );
+}
+
+#[test]
+fn an_access_past_the_segment_limit_faults_in_the_same_state_in_both_engines() {
+    // The fault column, driven deliberately rather than waited for. `EAX` is
+    // one byte inside the limit, so a doubleword read straddles it — and the
+    // architectural state at the fault is everything the two adds before it
+    // produced, flags included.
+    let program = vec![
+        // 0: add ecx, edx
+        0x01, 0xd1, // 2: sub ebx, 1
+        0x83, 0xeb, 0x01, // 5: mov esi, [eax]
+        0x8b, 0x30, // 7: inc edi   — never reached
+        0x47, 0xf4,
+    ];
+    for shape in [Shape::BasicBlock, Shape::Extended, Shape::Trace] {
+        for flags in [Flags::Eager, Flags::Elide] {
+            let case = Case::seeded(program.clone())
+                .with_reg(0, (rsemu::cpu::x86::differential::RAM_SIZE - 1) as u32)
+                .with_shape(shape)
+                .with_flags(flags);
+            let verdict = compare(&case).unwrap_or_else(|e| panic!("{shape:?}/{flags:?}: {e}"));
+            assert!(
+                matches!(verdict, Verdict::Trapped { insns: 2 }),
+                "{shape:?}/{flags:?}: {verdict:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_program_of_pure_flag_arithmetic_agrees_bit_for_bit() {
+    // Every flag-producing family in one program, with a `LAHF` at the end so
+    // the packed low byte is observed rather than only compared.
+    let program = vec![
+        0x83, 0xc0, 0x7f, // add eax, 127
+        0x11, 0xd8, // adc eax, ebx
+        0x19, 0xc8, // sbb eax, ecx
+        0x21, 0xd0, // and eax, edx
+        0xf7, 0xd8, // neg eax
+        0xd1, 0xe0, // shl eax, 1
+        0xc1, 0xf8, 0x03, // sar eax, 3
+        0xd1, 0xd0, // rcl eax, 1
+        0xc1, 0xc8, 0x07, // ror eax, 7
+        0xf7, 0xe3, // mul ebx
+        0x0f, 0xaf, 0xc1, // imul eax, ecx
+        0x9f, // lahf
+        0xf4,
+    ];
+    for start in [0u32, 0x8000_0000, 0xffff_ffff, 1, 0x7fff_ffff] {
+        for shape in [Shape::BasicBlock, Shape::Extended, Shape::Trace] {
+            for flags in [Flags::Eager, Flags::Elide] {
+                let case = Case::seeded(program.clone())
+                    .with_reg(0, start)
+                    .with_reg(3, start.rotate_left(13))
+                    .with_shape(shape)
+                    .with_flags(flags);
+                compare(&case).unwrap_or_else(|e| panic!("{start:#x}/{shape:?}/{flags:?}: {e}"));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_call_and_a_return_agree_through_the_stack() {
+    let program = vec![
+        0xe8, 0x03, 0x00, 0x00, 0x00, // call +3  -> offset 8
+        0x46, // inc esi
+        0xeb, 0x03, // jmp +3 -> offset 11
+        0x47, // inc edi
+        0xc3, // ret
+        0x90, // nop (padding so the jump lands here)
+        0xf4, // hlt
+    ];
+    for shape in [Shape::BasicBlock, Shape::Extended, Shape::Trace] {
+        for smc in [Smc::EndBlock, Smc::Guard] {
+            let case = Case::seeded(program.clone())
+                .with_shape(shape)
+                .with_smc(smc);
+            let verdict =
+                compare_cached(&case, 16).unwrap_or_else(|e| panic!("{shape:?}/{smc:?}: {e}"));
+            assert!(
+                matches!(verdict, Verdict::Agreed { .. }),
+                "{shape:?}/{smc:?}: {verdict:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_shift_by_cl_agrees_at_every_count_including_zero() {
+    // The one instruction in the subset whose *whole effect* is conditional: a
+    // count of zero writes no flag and no operand, which the lifter expresses
+    // as a select rather than a branch.
+    for op in [0xe0u8, 0xe8, 0xf8, 0xc0, 0xc8, 0xd0, 0xd8] {
+        for count in [0u32, 1, 7, 31, 32, 33, 255] {
+            let program = vec![0xd3, op, 0xf4];
+            let case = Case::seeded(program)
+                .with_reg(0, 0x8123_4567)
+                .with_reg(1, count)
+                .with_eflags(0x0002 | 0x0001);
+            compare(&case).unwrap_or_else(|e| panic!("d3 /{op:#x} by {count}: {e}"));
+        }
+    }
+}
+
+/// A `CALL` whose pushed return address lands on the instruction it is about
+/// to jump to.
+///
+/// The one instruction in the subset whose store is **not** its last effect:
+/// `CALL` pushes and then transfers, so a self-modifying-code exit taken at the
+/// push has to resume at the call's *target* and not after the call. That is
+/// the whole reason the lifter carries a `Resume` rather than assuming the next
+/// instruction, and nothing in the generated corpus reaches it — the corpus
+/// keeps its stack in the data window, where a push can never be code.
+fn call_that_overwrites_its_own_target() -> Vec<u8> {
+    let mut program = vec![0xe8, 0x17, 0x00, 0x00, 0x00]; // call +0x17 -> 0x1c
+    while program.len() < 0x1c {
+        program.push(0x90); // nop
+    }
+    program.push(0x46); // 0x1c: inc esi — the byte the push overwrites
+    while program.len() < 0x21 {
+        program.push(0xf4); // hlt, so the untouched path stops here
+    }
+    program.push(0xf4); // 0x21: hlt, where the *rewritten* instruction ends
+    program
+}
+
+#[test]
+fn a_call_that_rewrites_its_own_target_resumes_at_the_target() {
+    // ESP is four bytes past the target, so the pushed return address lands
+    // exactly on it. Under `Smc::Guard` the trace has already merged across the
+    // call, so the store's page guard is the only thing between the push and
+    // executing bytes that no longer exist.
+    let case = Case::new(call_that_overwrites_its_own_target())
+        .with_reg(4, 0x20)
+        .with_shape(Shape::Trace)
+        .with_smc(Smc::Guard);
+    let mut case = case;
+    case.keep_esp = true;
+    let run = measure_cached(&case, 32).expect("the two engines agree");
+    assert!(
+        matches!(run.verdict, Verdict::Agreed { .. }),
+        "{:?}",
+        run.verdict
+    );
+    assert!(
+        run.smc > 0,
+        "the push never invalidated a translation, so the case is not testing what it says"
+    );
+}
+
+#[test]
+fn a_compare_against_memory_still_makes_its_bus_cycle() {
+    // The shape `MemOp::volatile` exists for. `cmp eax, [ebx]` loads a
+    // doubleword whose *value* nothing keeps: it feeds the six flags and
+    // nothing else. The `xor` after it overwrites all six and cannot fault, so
+    // under `Flags::Elide` the boundary drops them and dead-code elimination is
+    // free to take the whole chain — the popcount, the comparisons, and the
+    // load with them. Only the load's `volatile` stops it, and without that the
+    // block would be two ticks short and one bus cycle quieter than the
+    // interpreter.
+    let program = vec![
+        0x3b, 0x03, // cmp eax, [ebx]
+        0x31, 0xc9, // xor ecx, ecx
+        0xf4,
+    ];
+    for flags in [Flags::Eager, Flags::Elide] {
+        let case = Case::seeded(program.clone()).with_flags(flags);
+        let verdict = compare(&case).unwrap_or_else(|e| panic!("{flags:?}: {e}"));
+        assert!(
+            matches!(verdict, Verdict::Agreed { insns: 2, .. }),
+            "{flags:?}: {verdict:?}"
+        );
+    }
+}
+
+#[test]
+fn a_pop_into_a_stack_relative_address_uses_the_stack_pointer_it_started_with() {
+    // The one instruction in the subset that rebinds a register and *then*
+    // reaches memory. `Exec::prepare_ea` computes the effective address before
+    // execution, so `pop [esp+4]` stores through the `ESP` the instruction
+    // began with; an address computed lazily at the store would use the one the
+    // pop had just moved, and land four bytes away.
+    //
+    // Written by hand rather than generated, because the corpus keeps `ESP`
+    // out of its operands on purpose: a random stack pointer makes every push
+    // a fault.
+    // The value has to be one the wrong address would not already hold, or the
+    // two answers write the same zero four bytes apart and nothing notices —
+    // which is exactly what the first draft of this test did.
+    let program = vec![
+        0xc7, 0x04, 0x24, 0x44, 0x33, 0x22, 0x11, // mov dword [esp], 0x11223344
+        0x8f, 0x44, 0x24, 0x04, // pop dword [esp+4]
+        0x40, // inc eax
+        0xf4,
+    ];
+    for shape in [Shape::BasicBlock, Shape::Extended, Shape::Trace] {
+        for smc in [Smc::EndBlock, Smc::Guard] {
+            let case = Case::seeded(program.clone())
+                .with_shape(shape)
+                .with_smc(smc);
+            let verdict = compare(&case).unwrap_or_else(|e| panic!("{shape:?}/{smc:?}: {e}"));
+            assert!(
+                matches!(verdict, Verdict::Agreed { .. } | Verdict::Trapped { .. }),
+                "{shape:?}/{smc:?}: {verdict:?}"
+            );
+        }
+    }
+    // and the same through the cached path, where the store also has to be
+    // matched against the block cache at the right address.
+    let case = Case::seeded(program);
+    compare_cached(&case, 8).expect("the cached path agrees");
+}
+
+#[test]
+fn a_push_of_a_stack_relative_operand_reads_before_the_pointer_moves() {
+    // The mirror image, and the one the interpreter gets right by ordering
+    // rather than by caching: `push [esp]` reads its operand and *then* moves
+    // the pointer.
+    let program = vec![
+        0xff, 0x34, 0x24, // push dword [esp]
+        0x40, // inc eax
+        0xf4,
+    ];
+    let case = Case::seeded(program);
+    let verdict = compare(&case).expect("agrees");
+    assert!(matches!(verdict, Verdict::Agreed { .. }), "{verdict:?}");
+}

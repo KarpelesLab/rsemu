@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std", "vnc", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-usb-msd", "dev-blk", "dev-ne2000", "dev-nvme", "dev-ahci", "dev-riscv", "dev-pc-apic", "dev-pc-hpet", "ir", "jit", "cpu-riscv-lift", "float", "dev-q35"]
+features         = ["std", "vnc", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-usb-msd", "dev-blk", "dev-ne2000", "dev-nvme", "dev-ahci", "dev-riscv", "dev-pc-apic", "dev-pc-hpet", "ir", "jit", "cpu-riscv-lift", "float", "dev-q35", "cpu-x86-lift"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -181,6 +181,19 @@ bench = false
 [[bin]]
 name  = "riscv_lift"
 path  = "fuzz_targets/riscv_lift.rs"
+test  = false
+doc   = false
+bench = false
+
+# The same question for the *second* frontend, where the two things RISC-V
+# could not exercise live: six condition flags that nearly every arithmetic
+# instruction writes and almost nothing reads, and self-modifying code, which
+# x86 makes architectural rather than optional. The comparison adds `EFLAGS`
+# whole to the columns the RISC-V target compares, because a flag the frontend
+# elided wrongly is invisible in a register file.
+[[bin]]
+name  = "x86_lift"
+path  = "fuzz_targets/x86_lift.rs"
 test  = false
 doc   = false
 bench = false
