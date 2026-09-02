@@ -362,6 +362,33 @@ fn bitfield_moves_cover_the_shift_and_extend_aliases() {
 
 /// A variable shift takes its amount modulo the operand width, so a shift by
 /// 64 is a no-op rather than a zero.
+/// DDI 0487 C6: the 32-bit bitfield moves require `immr<5>` and `imms<5>` to
+/// be zero, and a word with either set is `UNDEFINED`.
+///
+/// `DecodeBitMasks` does not catch it, which is why this is a separate check
+/// and not a consequence of one: that function asks whether the *element*
+/// fits the operand, and a six-bit field naming bit 55 of a 32-bit register
+/// produces an eight-bit element that fits perfectly well. Found by the
+/// `llvm-mc` differential, where it was the last thing in the whole encoding
+/// space this core accepted and an assembler did not.
+#[test]
+fn a_thirty_two_bit_bitfield_move_may_not_name_a_bit_above_thirty_one() {
+    // `ubfm w29, w30, #0, #55`, assembled by llvm-mc and rejected by it.
+    let h = Harness::a53(&[0x5300_dfdd]);
+    h.steps(1);
+    assert_eq!(h.cpu.sysregs().esr_el1 >> 26, ec::UNKNOWN);
+
+    // `immr` above 31 is the same rule on the other field.
+    let h = Harness::a53(&[bitfield(0x5300_0000, 0, 0, 1, 32, 3)]);
+    h.steps(1);
+    assert_eq!(h.cpu.sysregs().esr_el1 >> 26, ec::UNKNOWN);
+
+    // The 64-bit variant may name every bit it has.
+    let h = Harness::a53(&[bitfield(0x5300_0000, 1, 0, 1, 32, 55)]);
+    h.steps(1);
+    assert_eq!(h.cpu.sysregs().esr_el1, 0);
+}
+
 #[test]
 fn a_variable_shift_wraps_at_the_operand_width() {
     let h = Harness::a53(&[

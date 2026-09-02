@@ -779,6 +779,14 @@ impl<'a> Exec<'a> {
                 }
                 let r = isa::immr(word);
                 let s = isa::imms(word);
+                // DDI 0487 C6: the 32-bit variant requires `immr<5>` and
+                // `imms<5>` to be zero. `DecodeBitMasks` does not catch it —
+                // it only checks that the *element* fits, and a six-bit field
+                // naming bit 55 of a 32-bit register produces an element that
+                // fits perfectly well.
+                if !isa::sf(word) && (r | s) >= 32 {
+                    return Err(Trap::undefined());
+                }
                 let (wmask, tmask) = isa::decode_bit_masks(isa::n_bit(word), s, r, false, width)
                     .ok_or_else(Trap::undefined)?;
                 let src = self.read_reg(n, width, false);
