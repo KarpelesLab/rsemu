@@ -99,6 +99,30 @@ pub trait Function: Send + Sync + fmt::Debug {
         false
     }
 
+    /// The host cleared the halt condition on `endpoint` — a `CLEAR_FEATURE`
+    /// naming `ENDPOINT_HALT` (USB 2.0 §9.4.1).
+    ///
+    /// `endpoint` is a `bEndpointAddress`, direction bit and all, exactly as
+    /// `wIndex` carried it. [`Endpoint0`] has already cleared its own halt bit;
+    /// this is for a class that halted an endpoint *itself* and has to know
+    /// when the host let it go.
+    ///
+    /// **The reason it exists**, because a hook with one caller deserves one:
+    /// a device may stall a bulk endpoint as a protocol signal rather than
+    /// because [`Endpoint0`] was told to, and the class specification may then
+    /// say the stall survives a class reset. USB Mass Storage's Bulk-Only
+    /// Transport is exactly that — §3.1: *"The device shall preserve the value
+    /// of its bulk data toggle bits and endpoint STALL conditions despite the
+    /// Bulk-Only Mass Storage Reset"* — so the only thing that may clear such a
+    /// stall is the `CLEAR_FEATURE` the host sends afterwards, and without this
+    /// the class would never hear about it.
+    ///
+    /// Additive, with a default that does nothing, so no existing device model
+    /// changed when it arrived.
+    fn halt_cleared(&self, endpoint: u8) {
+        let _ = endpoint;
+    }
+
     /// An `IN` transaction on endpoint `endpoint` — never zero, which
     /// [`Endpoint0`] owns.
     ///
@@ -535,6 +559,12 @@ impl Endpoint0 {
                     state.halted |= bit;
                 } else {
                     state.halted &= !bit;
+                    // A class may have halted this endpoint itself, in which
+                    // case clearing our bit is only half the job — see
+                    // [`Function::halt_cleared`]. Called with the pipe's lock
+                    // held, which is this module's documented contract for
+                    // every call into the function.
+                    self.function.halt_cleared(packet.index as u8);
                 }
                 true
             }

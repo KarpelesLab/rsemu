@@ -101,7 +101,7 @@ half-modelled controller can look like a working boot. Detection succeeding is
 the first thing that will change its behaviour, and the first thing that can
 regress it.
 
-## USB, as built (`bus-usb`, `dev-usb-ehci`, `dev-usb-chipidea`, `dev-usb-dwc2`, `dev-usb-hid`)
+## USB, as built (`bus-usb`, `dev-usb-ehci`, `dev-usb-chipidea`, `dev-usb-dwc2`, `dev-usb-hid`, `dev-usb-msd`)
 
 Four layers, in the order they matter — and the order matters because the whole
 value of the arrangement is that the *next* controller reuses the first one
@@ -146,7 +146,13 @@ itself, a descriptor can point at itself, a frame list can close a circle — an
 block and guest RAM to keep it that way.
 
 Isochronous `iTD`/`siTD` nodes are followed and **not executed**; there are no
-split transactions and no hub. EHCI is high-speed only, and this one does the
+split transactions and no hub. Those two are less coupled than this file used to
+say: `SPLIT` tokens, the `µFrame C-mask` and the `siTD` are what a high-speed hub
+carrying a **full- or low-speed** device needs (USB 2.0 §11.14, EHCI 1.0 §4.12),
+and a high-speed hub with high-speed devices behind it needs none of them. What a
+hub of *any* kind actually needs first is routing in the fabric — `UsbBus::find`
+searches a flat list of enabled ports — so the obstacle is smaller than it was
+written to be and it is in a different place. EHCI is high-speed only, and this one does the
 honest thing with anything else: it hands the port to a companion controller by
 setting `PORTSC.Port Owner` (EHCI 1.0 §4.2.2), so a full-speed device attached to
 a bare EHCI *vanishes* rather than silently enumerating on a bus that could not
@@ -236,9 +242,16 @@ over by defaulting `CONFIGFLAG` to one.
 
 The flow also says transfers are **interrupt-driven, not polled**. The
 controller drives a level `irq` output (the AND of `USBSTS` with `USBINTR`) and
-its assertion and acknowledgement are tested — but no test wires it to an
-interrupt controller and no guest here has taken an interrupt from it: the
-end-to-end test polls. That gap is real and belongs to whoever wires the board.
+its assertion and acknowledgement are tested. For *this* block no test wires that
+output to an interrupt controller — but the gap is no longer the shape it was:
+`machines/usb-mini.machine` wires the **generic** EHCI's `irq` into a PLIC whose
+`meip0` reaches the hart, and `tests/usb_msd.rs` has a guest take a real machine
+external trap on `IOC` and acknowledge it in the order the level forces:
+`USBSTS` write-one-to-clear *first*, then the PLIC claim complete. That order is
+asserted by **counting traps** rather than by noticing one — eleven in the right
+order, twenty-two in the wrong one, because completing a claim while the level is
+still asserted makes the PLIC re-latch the source. Since `chipidea` is a register
+map over the same engine, what is left here is a board, not a mechanism.
 
 **Dual role is partial and says so.** Host mode is complete; selecting device
 mode stops the host schedule so the controller does not quietly keep walking a
@@ -529,6 +542,69 @@ emulated hart, claims the root ports, resets one, builds queue heads and
 descriptors in its own RAM, starts the controller, and finds the device
 descriptor and a mouse report in the buffers it named — having learned that they
 arrived by polling `USBSTS`.
+
+### 6. A disk (`src/dev/usb/msd.rs`, `dev-usb-msd`)
+
+The device that makes USB reach the storage stack. A **USB mass storage device**
+speaking **Bulk-Only Transport** over a SCSI transparent command set, whose bytes
+are a `dev::ata::Medium` — the same seam an ATA drive, an AHCI port and an NVMe
+namespace read and write — so `rsemu run usb-mini --drive usb0=disk.qcow2` puts a
+sparse qcow2 behind a USB stick through the media slot that already existed.
+
+**It needed no new controller**, and that is the claim worth making about it.
+Bulk-Only is two bulk endpoints and the default pipe (BOT §1.1: it does not even
+require an interrupt endpoint), and §2's EHCI already walks bulk queue heads,
+keeps data toggles, honours short packets and turns a `STALL` into a halted qTD.
+So a guest driver reaches a device written months later through a controller that
+never heard of it, which is the test of whether §1's transaction seam was the
+right shape. It was; nothing in `src/bus/usb/` changed for the transfers.
+
+One thing *was* added to the fabric, and it is argued where it lives:
+`Function::halt_cleared`. This device halts a bulk pipe **itself**, as a protocol
+signal, and BOT §3.1 says the class reset preserves endpoint stall conditions
+while §5.3.4 makes Reset Recovery the class reset *followed by* a
+`CLEAR_FEATURE(ENDPOINT_HALT)` on each pipe. Without the hook the class would
+never hear about the host's `CLEAR_FEATURE` and could not model the sequence the
+specification defines. Additive, defaulted, and no existing device model changed.
+
+**All thirteen cases are implemented, not approximated.** BOT §6.7 tabulates
+every combination of what the host said it wanted against what the device turned
+out to intend, and says for each one what the residue is, whether the status is
+Command Passed, Command Failed or Phase Error, and which pipe gets stalled. Six
+of the thirteen are error paths a driver only reaches when it has miscomputed
+something — exactly the ones an emulator is tempted to skip — and `msd/tests.rs`
+walks every one by name.
+
+**Nothing is ever sized from a number the guest chose.** This device masters no
+bus and walks no guest structure, so the hazard the EHCI has is not its hazard;
+what it has instead is a byte stream on a bulk endpoint, and the same discipline
+applies to it. A CBW is one 31-byte packet or it is not a CBW (§5.1, §6.2.1), so
+there is no reassembly buffer to grow. `dCBWDataTransferLength` is a `u32` the
+guest chose and is a counter, never a length. A `READ (10)` for 65,535 blocks is
+a **cursor into the medium**, so it costs one packet of memory rather than
+32 MiB. Every allocation length is clamped before it reaches a `Vec`, and every
+logical block address is checked in `u64` with `checked_add`, so `u64::MAX` is
+`LOGICAL BLOCK ADDRESS OUT OF RANGE` rather than a wrap into block zero.
+`fuzz/fuzz_targets/usb_msd.rs` is the target that keeps all of that true, and it
+carries BOT §5.2's own invariant with it: the residue shall not exceed the
+transfer length it answers.
+
+`tests/usb_msd.rs` is the end-to-end claim, and it is the storage one:
+`machines/usb-mini.machine` boots an RV32 program that enumerates the disk,
+issues `GET_MAX_LUN`, and then runs `INQUIRY`, `READ CAPACITY (10)`,
+`READ (10)` and `WRITE (10)` as CBW/data/CSW triples through the EHCI's bulk
+path — and the sector that lands in guest RAM is asserted **against the medium**,
+which the test holds a second handle to and the guest cannot reach, with the
+neighbouring blocks asserted untouched. The completion interrupt is not polled:
+it travels `ehci.irq → plic.irq1 → plic.meip0 → cpu.meip`, the guest's own trap
+handler acknowledges it, and the test counts the traps so that acknowledging in
+the wrong order is a failure rather than a slowdown nobody notices.
+
+What is not modelled: **one LUN** (`Get Max LUN` answers zero), no unit attention
+after a reset, no `MODE SENSE` page bodies beyond the parameter header that
+carries the write-protect bit, and no `FORMAT UNIT`. A second LUN would be a
+property and a `Vec` of media; the rest is a page whose contents would be an
+invention.
 
 ## Host passthrough
 

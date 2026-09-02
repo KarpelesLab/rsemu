@@ -1,0 +1,152 @@
+# usb-mini — the smallest board a real USB storage driver can run on.
+#
+#   rsemu run usb-mini --media firmware=fw.bin --drive usb0=disk.img
+#
+# A RISC-V hart, some RAM, an **EHCI host controller** and a **USB mass storage
+# device** plugged into its one root port. It models no product. It exists so
+# that `usb.storage` has somewhere a driver can reach it the way a driver
+# actually does — reset the root port, build queue heads and transfer
+# descriptors in this board's own RAM, hand over `ASYNCLISTADDR`, enumerate the
+# device over the default pipe, and then push a Command Block Wrapper out of a
+# bulk endpoint and pull a sector and a Command Status Wrapper back in, with the
+# controller's completion interrupt travelling a real wire into a real interrupt
+# controller and being acknowledged there.
+#
+# ---------------------------------------------------------------------------
+# Why this board has a processor and `nvme-mini` does not
+# ---------------------------------------------------------------------------
+#
+# `nvme-mini` and `ahci-mini` are register blocks: a test writes a doorbell and
+# the command completes inside that write, so a core would prove nothing and
+# would cost a firmware. An EHCI is not like that. Its schedule runs on its own
+# clock, one microframe at a time, and the interesting claim is that a *program*
+# can hand it a structure and get bytes back — which needs something executing.
+# So this board is shaped like `tests/usb_ehci.rs`'s: the smallest core that can
+# build a queue head, and nothing else on the bus to blame when it does not
+# work.
+#
+# ---------------------------------------------------------------------------
+# What is deliberately missing
+# ---------------------------------------------------------------------------
+#
+# **A companion controller and a hub.** An EHCI drives high-speed devices and
+# nothing else (EHCI 1.0 §4.2); a full-speed device reaches one through a
+# transaction translator in a hub, and rsemu models neither. So the disk on this
+# board is high speed, and one that said otherwise would be handed to a
+# companion that is not there and would vanish. `usb.storage` refuses `low`
+# outright, because USB 2.0 §5.8 defines no bulk transfers at low speed at all.
+#
+# **A second port.** The bus is sized by whichever object names it first, which
+# is the controller below; `ports = 1` and the disk sits in port 0.
+
+machine "usb-mini" {
+  # How much ROM the firmware image gets, and how much RAM there is for the
+  # schedule, the buffers and the disk's data.
+  param rom  = 64K
+  param ram  = 1M
+
+  # How big the disk is when the run does not supply an image. A medium
+  # installed under the `usb0` slot (`--drive usb0=disk.img`) wins over this
+  # and brings its own capacity.
+  param capacity = 1M
+
+  # Bytes in a logical block. 512 is what every driver assumes without asking.
+  param block = 512
+
+  # Where the register block and the two memories sit. Named as parameters
+  # because a test that moves them proves the board is a description rather
+  # than a set of constants.
+  param ehci_at = 0xf0000000
+
+  # -- the crystals ----------------------------------------------------------
+  #
+  # Two oscillators, because a board has two: the hart's, and the USB PHY's.
+  # 60 MHz is what a USB 2.0 PHY runs at, and 60 MHz / 8000 microframes a second
+  # is exactly 7500 ticks with no remainder — which is the whole reason the
+  # controller counts microframes in its own domain's ticks rather than in
+  # nanoseconds (ROADMAP.md §4.2).
+  osc sysclk = 100000000 Hz
+  osc usbclk = 60000000 Hz
+
+  # -- the one address space -------------------------------------------------
+  space mem { width = 32 }
+
+  # -- the processor ---------------------------------------------------------
+  object cpu "cpu.riscv" {
+    clock  = sysclk
+    space  = mem
+    engine = "interp"
+    xlen   = "rv32"
+    isa    = "ima"
+    hartid = 0
+    reset  = 0x00000000
+  }
+
+  # -- memory ----------------------------------------------------------------
+  #
+  # `image` names a media slot: whoever runs the machine binds the bytes
+  # (`--media firmware=fw.bin`), and nothing below host/ opens a file.
+  object fw   "rom" { size = rom, image = "firmware" }
+  object dram "ram" { size = ram }
+
+  # -- the interrupt controller ---------------------------------------------
+  #
+  # One hart, one context: machine mode, because this board has no supervisor
+  # to hand the second one to.
+  object plic "riscv.plic" {
+    sources    = 8
+    harts      = 1
+    supervisor = false
+  }
+
+  # -- the host controller ---------------------------------------------------
+  #
+  # `space = mem` because it is a **bus master**: its queue heads, its transfer
+  # descriptors and its data buffers are all in this board's RAM and it reads
+  # and writes them itself. That property is not decoration — without it the
+  # controller has nowhere to fetch a schedule from, and `bind` says so.
+  #
+  # It is named before the disk so that it is the object that fixes the bus
+  # size.
+  object ehci "usb.ehci" {
+    clock      = usbclk
+    space      = mem
+    bus        = "usb"
+    ports      = 1
+    microframe = 7500
+  }
+
+  # -- the disk --------------------------------------------------------------
+  #
+  # A USB mass storage device on the controller's one root port. It masters
+  # nothing and has no register block: everything it does, it does by answering
+  # transactions the controller issues, which is why there is no `space` here
+  # and no `map` line below.
+  object disk "usb.storage" {
+    bus   = "usb"
+    port  = 0
+    image = "usb0"
+    size  = capacity
+    block = block
+    speed = "high"
+  }
+
+  # -- the memory map --------------------------------------------------------
+  map mem 0x00000000 size rom      = fw
+  map mem 0x0c000000 size 0x400000 = plic   # priority, enable, threshold, claim
+  map mem 0x10000000 size ram      = dram
+  map mem ehci_at    size 256      = ehci
+
+  # -- the wire --------------------------------------------------------------
+  #
+  # EHCI's interrupt is **level triggered** and is the AND of `USBSTS` with
+  # `USBINTR` (EHCI 1.0 §2.3.2): the controller holds the line down while a
+  # status bit the host has not acknowledged is set, and releases it when the
+  # host writes a one to that bit. A handler that completed the PLIC claim
+  # before acknowledging the controller would leave the level asserted, the PLIC
+  # would re-latch the source, and the guest would take a spurious second trap
+  # for every completion — which is why `tests/usb_msd.rs` counts traps instead
+  # of merely noticing one.
+  wire ehci.irq   -> plic.irq1
+  wire plic.meip0 -> cpu.meip
+}

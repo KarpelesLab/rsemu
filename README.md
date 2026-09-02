@@ -167,6 +167,18 @@ seam — the command block as a struct, loaded into the same registers and
 dispatched by the same code a port write reaches — and `src/dev/pc/ide.rs` did
 not change by one line.
 
+`usb-mini` is the third way to a disk and the one that reuses the most: a **USB
+mass storage device** speaking Bulk-Only Transport over a SCSI command set, on
+the **EHCI host controller that was finished before it existed**. Bulk-Only is
+two bulk endpoints and the default pipe, and the controller already walked bulk
+queue heads — so an RV32 program on this board enumerates the disk, pushes a
+Command Block Wrapper out of an endpoint and pulls a sector and a Command Status
+Wrapper back in, and the sector that lands in its RAM is the sector on the
+medium. The disk's bytes are the same `Medium` an ATA drive, an AHCI port and an
+NVMe namespace read, so `--drive usb0=disk.qcow2` works here for the same reason
+and through the same media slot. Its completion interrupt is the one that is not
+polled: it travels a wire into a PLIC and the guest takes a real trap for it.
+
 The framework underneath is complete: address spaces with priority and
 mirroring, an oscillator forest with exact intra-tree ratios, wires, devices,
 snapshots, a typed export seam so one device can hand another a handle, and a

@@ -132,7 +132,8 @@ NVMe and virtio-blk are both freely specified and much simpler to implement
 correctly than ATA. Prefer them for new machines; implement ATA because legacy
 guests require it.
 
-**virtio-blk is on the `Medium` seam too**, which makes it three devices rather
+**virtio-blk is on the `Medium` seam too**, and so is the USB disk
+(`dev/usb/msd`, `docs/buses/usb.md` §6), which makes it several devices rather
 than two and settles what "the seam" means in this tree: `dev::medium::Medium` is
 where a storage device's bytes come from, and a controller that invents its own
 backing store is a controller that has quietly opted out of `--drive`, out of

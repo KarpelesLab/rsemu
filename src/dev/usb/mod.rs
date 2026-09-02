@@ -12,6 +12,7 @@
 //! | [`dwc2`] | `dev-usb-dwc2` | a Synopsys DesignWare USB 2.0 OTG controller — STM32's OTG_FS — with host channels and a shared FIFO instead of a schedule in guest memory, **in both roles**: host, and device, where the guest is the peripheral |
 //! | [`chipidea`] | `dev-usb-chipidea` | the ChipIdea/ARC dual-role variant of the same controller: a `+0x140` operational offset, an `ID` register and a `USBMODE` role select |
 //! | [`hid`] | `dev-usb-hid` | a USB HID boot-protocol mouse: the smallest device that proves the stack |
+//! | [`msd`] | `dev-usb-msd` | a USB mass storage device: Bulk-Only Transport and a SCSI command set over two bulk endpoints, backed by the same [`Medium`](crate::dev::ata::Medium) an ATA drive or an NVMe namespace reads |
 //!
 //! # The layering, and why it is the point
 //!
@@ -53,6 +54,10 @@ pub mod ehci;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-usb-hid")))]
 pub mod hid;
 
+#[cfg(feature = "dev-usb-msd")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-usb-msd")))]
+pub mod msd;
+
 /// Add every USB class this build has to a registry.
 ///
 /// # Errors
@@ -67,6 +72,8 @@ pub fn register(registry: &mut crate::core::Registry) -> crate::Result<()> {
     dwc2::register(registry)?;
     #[cfg(feature = "dev-usb-hid")]
     hid::register(registry)?;
+    #[cfg(feature = "dev-usb-msd")]
+    msd::register(registry)?;
     let _ = registry;
     Ok(())
 }
@@ -85,6 +92,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> crate::Result<()> {
     dwc2::bind(bindings)?;
     #[cfg(feature = "dev-usb-hid")]
     hid::bind(bindings)?;
+    #[cfg(feature = "dev-usb-msd")]
+    msd::bind(bindings)?;
     let _ = bindings;
     Ok(())
 }
@@ -106,5 +115,7 @@ pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
     out.push(dwc2::schema());
     #[cfg(feature = "dev-usb-hid")]
     out.push(hid::schema());
+    #[cfg(feature = "dev-usb-msd")]
+    out.push(msd::schema());
     out
 }
