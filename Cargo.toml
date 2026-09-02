@@ -411,7 +411,7 @@ dev-usb-hid = ["bus-usb"]
 # A USB mass storage device (src/dev/usb/msd.rs): **Bulk-Only Transport and a
 # SCSI command set over two bulk endpoints, with a real medium behind it**. This
 # is the feature that makes USB reach the storage stack — the disk is a
-# `dev::ata::Medium`, the same seam an ATA drive, an AHCI port and an NVMe
+# `dev::medium::Medium`, the same seam an ATA drive, an AHCI port and an NVMe
 # namespace read and write, so `rsemu run … --drive usb0=disk.qcow2` puts a
 # sparse qcow2 behind a USB stick for the same reason and through the same media
 # slot it puts one behind SATA.
