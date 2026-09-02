@@ -25,7 +25,7 @@ use core::fmt;
 use core::fmt::Write as _;
 
 use super::isa::{self, Fmt, Suffix};
-use super::sysreg;
+use super::{fp, sysreg};
 
 /// Why a listing has a hole in it.
 ///
@@ -110,6 +110,42 @@ fn reg(index: u32, width: u32, is_sp: bool) -> String {
         };
     }
     format!("{}{}", if sixty_four { 'x' } else { 'w' }, index)
+}
+
+/// A SIMD&FP register's name at a precision.
+///
+/// The letter *is* the width — `s0`, `d0`, `h0` — which is why A64's
+/// floating-point mnemonics carry no width suffix and this function exists.
+/// An unallocated `ptype` prints the register as `v<n>.?`, which is what a
+/// listing of a word that will raise `UNDEFINED` should say.
+fn vreg_prec(index: u32, prec: Option<fp::Prec>) -> String {
+    match prec {
+        Some(p) => format!("{}{index}", p.letter()),
+        None => format!("v{index}.?"),
+    }
+}
+
+/// A SIMD&FP register's name, at the precision this word's `ptype` names.
+fn vreg(index: u32, word: u32) -> String {
+    vreg_prec(index, fp::Prec::from_ptype(isa::ptype(word)))
+}
+
+/// A SIMD&FP register's name at a load or store's access width, as the
+/// base-2 logarithm of its size in bytes.
+///
+/// Five widths here rather than three: a load or store can move a single byte
+/// or a whole 128-bit register, neither of which is a floating-point format
+/// and neither of which [`fp::Prec`] therefore names.
+fn vreg_scale(index: u32, scale: Option<u32>) -> String {
+    let letter = match scale {
+        Some(0) => 'b',
+        Some(1) => 'h',
+        Some(2) => 's',
+        Some(3) => 'd',
+        Some(4) => 'q',
+        _ => return format!("v{index}.?"),
+    };
+    format!("{letter}{index}")
 }
 
 /// A signed immediate, in the form an assembler would accept.
@@ -571,6 +607,205 @@ pub fn disassemble(word: u32, pc: u64, features: isa::Features) -> Disassembled 
                 width
             };
             let _ = write!(ops, "{}, {}", reg(d, w, false), reg(n, w, false));
+        }
+        // -- Scalar floating point ---------------------------------------
+        Fmt::FpOneSrc => {
+            let _ = write!(ops, "{}, {}", vreg(d, word), vreg(n, word));
+        }
+        Fmt::FpCvt => {
+            // The destination's precision is `opc` (bits 16:15) and the
+            // source's is `ptype`, which is the one place in the whole
+            // encoding where the two ends of an instruction disagree.
+            let dst = fp::Prec::from_ptype(isa::field(word, 16, 15));
+            let _ = write!(
+                ops,
+                "{}, {}",
+                vreg_prec(d, dst),
+                vreg_prec(n, fp::Prec::from_ptype(isa::ptype(word)))
+            );
+        }
+        Fmt::FpTwoSrc => {
+            let _ = write!(
+                ops,
+                "{}, {}, {}",
+                vreg(d, word),
+                vreg(n, word),
+                vreg(m, word)
+            );
+        }
+        Fmt::FpThreeSrc => {
+            let _ = write!(
+                ops,
+                "{}, {}, {}, {}",
+                vreg(d, word),
+                vreg(n, word),
+                vreg(m, word),
+                vreg(isa::ra(word), word)
+            );
+        }
+        Fmt::FpCmp => {
+            // Bit 3 of `opcode2` selects the compare-with-zero form, whose
+            // second operand is written out rather than named.
+            if isa::bit(word, 3) {
+                let _ = write!(ops, "{}, #0.0", vreg(n, word));
+            } else {
+                let _ = write!(ops, "{}, {}", vreg(n, word), vreg(m, word));
+            }
+        }
+        Fmt::FpCondCmp => {
+            let _ = write!(
+                ops,
+                "{}, {}, #0x{:x}, {}",
+                vreg(n, word),
+                vreg(m, word),
+                word & 0xf,
+                isa::cond_hi(word)
+            );
+        }
+        Fmt::FpCondSel => {
+            let _ = write!(
+                ops,
+                "{}, {}, {}, {}",
+                vreg(d, word),
+                vreg(n, word),
+                vreg(m, word),
+                isa::cond_hi(word)
+            );
+        }
+        Fmt::FpImm => {
+            // The eight bits are printed as the value they expand to, in hex:
+            // a decimal here would need a float formatter, and this crate has
+            // no host floating point to write one with.
+            let value = fp::Prec::from_ptype(isa::ptype(word))
+                .map_or(0, |p| fp::expand_imm(isa::fp_imm8(word), p));
+            let _ = write!(ops, "{}, #0x{value:x}", vreg(d, word));
+        }
+        Fmt::FpIntCvt => {
+            let prec = fp::Prec::from_ptype(isa::ptype(word));
+            // `SCVTF`, `UCVTF` and `FMOV` from a general register write the
+            // floating-point side; every other opcode in the group writes the
+            // general one. The `rmode == 01` forms name the *top half* of a
+            // vector register, which no other encoding can reach.
+            let opcode = isa::cvt_opcode(word);
+            let fp_is_dest = matches!(opcode, 0b010 | 0b011 | 0b111);
+            // `rmode == 0b01` is the *top half* pair only in company with an
+            // `FMOV` opcode: on `FCVTPS` the same `rmode` means "round toward
+            // +infinity", and reading it as a register half would print a
+            // vector operand for an ordinary conversion.
+            let high = isa::cvt_rmode(word) == 0b01 && matches!(opcode, 0b110 | 0b111);
+            let fp_side = |index: u32| {
+                if high {
+                    format!("v{index}.d[1]")
+                } else {
+                    vreg_prec(index, prec)
+                }
+            };
+            if fp_is_dest {
+                let _ = write!(ops, "{}, {}", fp_side(d), reg(n, width, false));
+            } else {
+                let _ = write!(ops, "{}, {}", reg(d, width, false), fp_side(n));
+            }
+        }
+        Fmt::FpFixCvt => {
+            let prec = fp::Prec::from_ptype(isa::ptype(word));
+            let fp_is_dest = matches!(isa::cvt_opcode(word), 0b010 | 0b011);
+            if fp_is_dest {
+                let _ = write!(
+                    ops,
+                    "{}, {}, #{}",
+                    vreg_prec(d, prec),
+                    reg(n, width, false),
+                    isa::fbits(word)
+                );
+            } else {
+                let _ = write!(
+                    ops,
+                    "{}, {}, #{}",
+                    reg(d, width, false),
+                    vreg_prec(n, prec),
+                    isa::fbits(word)
+                );
+            }
+        }
+        Fmt::LoadFpLiteral => {
+            let _ = write!(
+                ops,
+                "{}, {}",
+                vreg_scale(d, isa::fp_opc_scale(word)),
+                target(pc, isa::imm19(word))
+            );
+        }
+        Fmt::LdStFpUImm
+        | Fmt::LdStFpUnscaled
+        | Fmt::LdStFpPost
+        | Fmt::LdStFpPre
+        | Fmt::LdStFpRegOff => {
+            let scale = isa::fp_ls_scale(word);
+            let t = vreg_scale(d, scale);
+            let base = reg(n, 64, rn_sp);
+            match insn.fmt {
+                Fmt::LdStFpUImm => {
+                    let offset = u64::from(isa::imm12(word)) << scale.unwrap_or(0);
+                    if offset == 0 {
+                        let _ = write!(ops, "{t}, [{base}]");
+                    } else {
+                        let _ = write!(ops, "{t}, [{base}, #0x{offset:x}]");
+                    }
+                }
+                Fmt::LdStFpUnscaled => {
+                    let offset = isa::imm9(word);
+                    if offset == 0 {
+                        let _ = write!(ops, "{t}, [{base}]");
+                    } else {
+                        let _ = write!(ops, "{t}, [{base}, {}]", imm(offset));
+                    }
+                }
+                Fmt::LdStFpPost => {
+                    let _ = write!(ops, "{t}, [{base}], {}", imm(isa::imm9(word)));
+                }
+                Fmt::LdStFpPre => {
+                    let _ = write!(ops, "{t}, [{base}, {}]!", imm(isa::imm9(word)));
+                }
+                _ => {
+                    let option = isa::extend_option(word);
+                    let amount = if isa::bit(word, 12) {
+                        scale.unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let index_width = if option & 1 == 0 { 32 } else { 64 };
+                    let _ = write!(
+                        ops,
+                        "{t}, [{base}, {}{}]",
+                        reg(m, index_width, false),
+                        extend_tail(word, amount, 3)
+                    );
+                }
+            }
+        }
+        Fmt::LdStFpPairOff | Fmt::LdStFpPairPost | Fmt::LdStFpPairPre => {
+            let scale = isa::fp_opc_scale(word);
+            let offset = isa::imm7(word) << scale.unwrap_or(0);
+            let base = reg(n, 64, rn_sp);
+            let pair = format!(
+                "{}, {}",
+                vreg_scale(d, scale),
+                vreg_scale(isa::ra(word), scale)
+            );
+            match insn.fmt {
+                Fmt::LdStFpPairOff if offset == 0 => {
+                    let _ = write!(ops, "{pair}, [{base}]");
+                }
+                Fmt::LdStFpPairOff => {
+                    let _ = write!(ops, "{pair}, [{base}, {}]", imm(offset));
+                }
+                Fmt::LdStFpPairPost => {
+                    let _ = write!(ops, "{pair}, [{base}], {}", imm(offset));
+                }
+                _ => {
+                    let _ = write!(ops, "{pair}, [{base}, {}]!", imm(offset));
+                }
+            }
         }
     }
 

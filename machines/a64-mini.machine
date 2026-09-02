@@ -30,11 +30,17 @@
 #
 # `part = "cortex-a53"`, handed to the core's `cpu` property below. That is the
 # whole extension lattice in one line (ROADMAP.md 6.1.1): a Cortex-A53 is
-# Armv8.0-A with FEAT_CRC32 and **without** FEAT_LSE, so `CAS` and `LDADD` do
-# not decode on it and a guest that probes `ID_AA64ISAR0_EL1` is told so.
-# `-p part=neoverse-n1` is an Armv8.2 part where both exist. Same binary, same core, different instance:
-# the difference is a construction property and not a build flag, which is what
-# lets one machine run two different parts side by side.
+# Armv8.0-A with FEAT_CRC32 and FEAT_FP and **without** FEAT_LSE, so `CAS` and
+# `LDADD` do not decode on it and a guest that probes `ID_AA64ISAR0_EL1` is
+# told so. `-p part=neoverse-n1` is an Armv8.2 part where all three exist. Same
+# binary, same core, different instance: the difference is a construction
+# property and not a build flag, which is what lets one machine run two
+# different parts side by side.
+#
+# `-p part=armv8.0` is the lower bound and has no optional feature at all,
+# floating point included -- FEAT_FP really is optional in Armv8.0-A even
+# though every part anybody ships has it, so it is the configuration that
+# proves the ID_AA64PFR0_EL1 gate.
 #
 # ---------------------------------------------------------------------------
 # The space is 64 bits and the addresses are PHYSICAL
@@ -56,11 +62,23 @@
 # is wired: a net with no driver would be two lines saying nothing. A guest can
 # still exercise its own vector table through `SVC` and `BRK`, which is what
 # tests/a64_mini_board.rs does.
+#
+# ---------------------------------------------------------------------------
+# Floating point starts switched off, and that is the architecture
+# ---------------------------------------------------------------------------
+#
+# `CPACR_EL1.FPEN` resets to zero on every AArch64 part, so the first `FADD` a
+# guest executes takes a synchronous exception with `ESR_EL1.EC == 0x07` until
+# firmware writes `CPACR_EL1`. Firmware for this board therefore starts with
+# something like `mov x0, #(3 << 20); msr cpacr_el1, x0; isb`. It is not a
+# quirk of this file: it is how a kernel finds out that a process has begun
+# using the FPU.
 
 machine "a64-mini" {
   # Which part the core is. `armv8.0` is a bare Armv8.0-A with no optional
-  # feature at all; `cortex-a53` and `cortex-a72` add FEAT_CRC32;
-  # `neoverse-n1` is Armv8.2 and adds FEAT_LSE on top.
+  # feature at all -- floating point included, so an `FADD` is UNDEFINED on it;
+  # `cortex-a53` and `cortex-a72` add FEAT_CRC32 and FEAT_FP; `neoverse-n1` is
+  # Armv8.2 and adds FEAT_LSE on top.
   #
   # Named `part` rather than `cpu` because the *object* below is called `cpu`,
   # and the machine language refuses a name that is both a parameter and an

@@ -1148,3 +1148,549 @@ fn a_memory_read_with_debug_attributes_does_not_charge_the_core() {
     assert!(space.read(0, Width::U32, attrs).is_ok());
     assert_eq!(h.cpu.cycles(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Scalar floating point
+// ---------------------------------------------------------------------------
+//
+// The interesting cases here are the ones a reasonable guess gets wrong:
+// `CPACR_EL1` traps the *first* floating-point instruction a guest executes
+// and does not report `UNDEFINED` while doing it; `FMOV` between the register
+// files insists the two widths match; a scalar write zeroes the rest of the
+// destination; and the two `MOVI`-shaped `FMOV` forms that reach the top half
+// of a vector register are the only writes that do not.
+
+/// Assemble the `ptype` field for a precision.
+const PT_S: u32 = 0b00;
+const PT_D: u32 = 0b01;
+
+const fn fp_two_src(base: u32, ptype: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    base | (ptype << 22) | (rm << 16) | (rn << 5) | rd
+}
+const fn fadd(ptype: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    fp_two_src(0x1e20_2800, ptype, rd, rn, rm)
+}
+const fn fmul(ptype: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    fp_two_src(0x1e20_0800, ptype, rd, rn, rm)
+}
+const fn fdiv(ptype: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    fp_two_src(0x1e20_1800, ptype, rd, rn, rm)
+}
+const fn fmov_to_fp(sf: u32, ptype: u32, rd: u32, rn: u32) -> u32 {
+    (sf << 31) | 0x1e27_0000 | (ptype << 22) | (rn << 5) | rd
+}
+const fn fmov_to_gp(sf: u32, ptype: u32, rd: u32, rn: u32) -> u32 {
+    (sf << 31) | 0x1e26_0000 | (ptype << 22) | (rn << 5) | rd
+}
+const fn fmov_hi_to_gp(rd: u32, rn: u32) -> u32 {
+    0x9eae_0000 | (rn << 5) | rd
+}
+const fn fmov_gp_to_hi(rd: u32, rn: u32) -> u32 {
+    0x9eaf_0000 | (rn << 5) | rd
+}
+const fn fcmp(ptype: u32, rn: u32, rm: u32) -> u32 {
+    0x1e20_2000 | (ptype << 22) | (rm << 16) | (rn << 5)
+}
+const fn fcvtzs(sf: u32, ptype: u32, rd: u32, rn: u32) -> u32 {
+    (sf << 31) | 0x1e38_0000 | (ptype << 22) | (rn << 5) | rd
+}
+const fn scvtf(sf: u32, ptype: u32, rd: u32, rn: u32) -> u32 {
+    (sf << 31) | 0x1e22_0000 | (ptype << 22) | (rn << 5) | rd
+}
+const fn fcvt(dst: u32, src: u32, rd: u32, rn: u32) -> u32 {
+    0x1e22_4000 | (src << 22) | (dst << 15) | (rn << 5) | rd
+}
+const fn fmov_imm(ptype: u32, rd: u32, imm8: u32) -> u32 {
+    0x1e20_1000 | (ptype << 22) | (imm8 << 13) | rd
+}
+const fn ldr_v_imm(size: u32, opc1: u32, rt: u32, rn: u32, imm12: u32) -> u32 {
+    (size << 30) | 0x3d40_0000 | (opc1 << 23) | (imm12 << 10) | (rn << 5) | rt
+}
+const fn str_v_imm(size: u32, opc1: u32, rt: u32, rn: u32, imm12: u32) -> u32 {
+    (size << 30) | 0x3d00_0000 | (opc1 << 23) | (imm12 << 10) | (rn << 5) | rt
+}
+
+/// Enable EL0 and EL1 access to SIMD and floating point, the way firmware does.
+fn enable_fp(h: &Harness) {
+    let mut regs = h.cpu.sysregs();
+    regs.cpacr = 3 << 20;
+    h.cpu.set_sysregs(regs);
+}
+
+/// Bits of a `binary64` value, written with a host float only so the test
+/// reads as arithmetic. The core never sees one.
+fn d(value: f64) -> u64 {
+    value.to_bits()
+}
+
+/// `CPACR_EL1.FPEN` resets to zero, so the first floating-point instruction a
+/// guest executes traps — and it traps with exception class 0x07, which Linux
+/// tells apart from an undefined instruction to decide whether to restore a
+/// process's FP registers. Reporting `UNKNOWN` instead would turn a lazily
+/// switched FPU into a SIGILL.
+#[test]
+fn floating_point_is_trapped_until_cpacr_enables_it() {
+    let h = Harness::a53(&[fadd(PT_D, 0, 0, 0)]);
+    let mut regs = h.cpu.sysregs();
+    regs.vbar_el1 = 0x2000;
+    h.cpu.set_sysregs(regs);
+    h.steps(1);
+    let regs = h.cpu.sysregs();
+    assert_eq!(regs.esr_el1 >> 26, ec::FP_ACCESS);
+    // ISS is zero for an A64 access (CV clear, COND RES0), and the return
+    // address is the faulting instruction rather than the one after it: a
+    // handler that enables access must be able to re-execute it.
+    assert_eq!(regs.esr_el1 & 0x01ff_ffff, 0);
+    assert_eq!(regs.elr_el1, 0);
+    // Taken from EL1 with SP_EL1 selected: the `0x200` group.
+    assert_eq!(h.cpu.pc(), 0x2200);
+
+    // With `FPEN` set to `0b11` the same instruction retires.
+    let h = Harness::a53(&[fadd(PT_D, 0, 0, 0)]);
+    enable_fp(&h);
+    h.steps(1);
+    assert_eq!(h.cpu.sysregs().esr_el1, 0);
+    assert_eq!(h.cpu.pc(), 4);
+}
+
+/// `FPEN == 0b01` traps at EL0 only, and `0b10` traps at both — the encoding
+/// that looks like it should mean something different and does not.
+#[test]
+fn the_fpen_field_has_two_encodings_that_trap_everywhere() {
+    for (fpen, el1_traps, el0_traps) in [
+        (0b00u64, true, true),
+        (0b01, false, true),
+        (0b10, true, true),
+        (0b11, false, false),
+    ] {
+        let mut regs = super::sysreg::SysRegs::new();
+        regs.cpacr = fpen << 20;
+        regs.el = El::El1;
+        assert_eq!(regs.fp_access_trapped(), el1_traps, "EL1, FPEN {fpen:#b}");
+        regs.el = El::El0;
+        assert_eq!(regs.fp_access_trapped(), el0_traps, "EL0, FPEN {fpen:#b}");
+    }
+}
+
+/// A part without `FEAT_FP` must not decode a floating-point instruction at
+/// all, and must say so in `ID_AA64PFR0_EL1`. That is how a guest probes.
+#[test]
+fn floating_point_exists_only_on_a_part_that_has_it() {
+    let bare = Config::armv8_0();
+    assert!(!bare.features.fp);
+    assert!(super::isa::decode(fadd(PT_D, 0, 0, 0), bare.features).is_none());
+    // `ID_AA64PFR0_EL1.FP` is bits 19:16, and `0b1111` is *not implemented*.
+    assert_eq!((bare.id_aa64pfr0() >> 16) & 0xf, 0xf);
+    assert_eq!((Config::cortex_a53().id_aa64pfr0() >> 16) & 0xf, 0);
+
+    // On the bare part it is UNDEFINED even with `CPACR_EL1` wide open, which
+    // is the distinction between "not allowed" and "not there".
+    let h = Harness::new(bare, &[fadd(PT_D, 0, 0, 0)]);
+    enable_fp(&h);
+    let mut regs = h.cpu.sysregs();
+    regs.cpacr = 3 << 20;
+    h.cpu.set_sysregs(regs);
+    h.steps(1);
+    assert_eq!(h.cpu.sysregs().esr_el1 >> 26, ec::UNKNOWN);
+}
+
+/// Arithmetic through the whole path: a general register into a `D` register,
+/// three operations, and back out.
+#[test]
+fn scalar_arithmetic_runs_through_the_register_file() {
+    let h = Harness::a53(&[
+        movz(1, 0, 0x4000, 48), // 2.0
+        movz(1, 1, 0x4008, 48), // 3.0
+        fmov_to_fp(1, PT_D, 0, 0),
+        fmov_to_fp(1, PT_D, 1, 1),
+        fadd(PT_D, 2, 0, 1), // 5.0
+        fmul(PT_D, 3, 0, 1), // 6.0
+        fdiv(PT_D, 4, 1, 0), // 1.5
+        fmov_to_gp(1, PT_D, 2, 2),
+        fmov_to_gp(1, PT_D, 3, 3),
+        fmov_to_gp(1, PT_D, 4, 4),
+    ]);
+    enable_fp(&h);
+    h.steps(10);
+    assert_eq!(h.cpu.x(2), d(5.0));
+    assert_eq!(h.cpu.x(3), d(6.0));
+    assert_eq!(h.cpu.x(4), d(1.5));
+    // The `V` registers hold what the arithmetic put there, with nothing above.
+    assert_eq!(h.cpu.v(2), u128::from(d(5.0)));
+}
+
+/// DDI 0487 C1.2.2: a scalar write zeroes the rest of the destination
+/// register. It is guest-visible and software relies on it — and
+/// `FMOV Vd.D[1], Xn` is the one write that does not.
+#[test]
+fn a_scalar_write_zeroes_the_rest_and_the_high_move_does_not() {
+    let h = Harness::a53(&[
+        movz(1, 0, 0x4000, 48),
+        fmov_to_fp(1, PT_D, 0, 0),
+        fmov_gp_to_hi(0, 0), // V0.D[1] = the same bits
+        fadd(PT_S, 1, 0, 0), // a 32-bit write to V1
+        fmov_hi_to_gp(1, 0), // read V0.D[1] back
+    ]);
+    enable_fp(&h);
+    h.cpu.set_v(1, u128::MAX);
+    h.steps(5);
+    // `FMOV Vd.D[1], Xn` merged: both halves of V0 are set.
+    assert_eq!(h.cpu.v(0), (u128::from(d(2.0)) << 64) | u128::from(d(2.0)));
+    assert_eq!(h.cpu.x(1), d(2.0));
+    // The 32-bit `FADD` cleared everything above its result.
+    assert_eq!(h.cpu.v(1) >> 32, 0);
+}
+
+/// `FMOV` between the register files moves bits and rounds nothing, so the
+/// widths must agree: `W`↔`S` and `X`↔`D` exist and `X`↔`S` does not.
+#[test]
+fn fmov_between_the_files_refuses_mismatched_widths() {
+    // `FMOV X0, S0` — 64-bit general, 32-bit floating point.
+    let h = Harness::a53(&[fmov_to_gp(1, PT_S, 0, 0)]);
+    enable_fp(&h);
+    h.steps(1);
+    assert_eq!(h.cpu.sysregs().esr_el1 >> 26, ec::UNKNOWN);
+
+    // `FMOV W0, S0` is the allocated pair, and it zero-extends into `X0`.
+    let h = Harness::a53(&[fmov_to_gp(0, PT_S, 0, 0)]);
+    enable_fp(&h);
+    h.cpu.set_v(0, 0xffff_ffff_dead_beef);
+    h.steps(1);
+    assert_eq!(h.cpu.x(0), 0xdead_beef);
+}
+
+/// The unallocated `ptype` is `UNDEFINED`, and so is half precision, which
+/// needs `FEAT_FP16` this core does not have — even though `FCVT` to and from
+/// half works, because that is Armv8.0-A.
+#[test]
+fn half_precision_arithmetic_is_undefined_but_conversion_is_not() {
+    const PT_H: u32 = 0b11;
+    const PT_BAD: u32 = 0b10;
+    for ptype in [PT_H, PT_BAD] {
+        let h = Harness::a53(&[fadd(ptype, 0, 0, 0)]);
+        enable_fp(&h);
+        h.steps(1);
+        assert_eq!(
+            h.cpu.sysregs().esr_el1 >> 26,
+            ec::UNKNOWN,
+            "ptype {ptype:#b} must not do arithmetic"
+        );
+    }
+    // `FCVT H0, D0` then `FCVT D1, H0`: 1.5 survives the round trip, and the
+    // intermediate really is the binary16 encoding.
+    let h = Harness::a53(&[
+        movz(1, 0, 0x3ff8, 48),
+        fmov_to_fp(1, PT_D, 0, 0),
+        fcvt(PT_H, PT_D, 1, 0),
+        fmov_to_gp(0, PT_S, 1, 1),
+        fcvt(PT_D, PT_H, 2, 1),
+        fmov_to_gp(1, PT_D, 2, 2),
+    ]);
+    enable_fp(&h);
+    h.steps(6);
+    assert_eq!(h.cpu.x(1) & 0xffff, 0x3e00, "1.5 as binary16");
+    assert_eq!(h.cpu.x(2), d(1.5));
+    // A conversion to the precision it came from is unallocated.
+    let h = Harness::a53(&[fcvt(PT_D, PT_D, 0, 0)]);
+    enable_fp(&h);
+    h.steps(1);
+    assert_eq!(h.cpu.sysregs().esr_el1 >> 26, ec::UNKNOWN);
+}
+
+/// `FCMP` writes `NZCV` in a pattern no integer comparison produces: unordered
+/// sets `C` **and** `V`, which is what makes `B.VS` the "was there a NaN" test.
+#[test]
+fn a_floating_point_compare_sets_c_and_v_when_unordered() {
+    let h = Harness::a53(&[
+        movz(1, 0, 0x7ff8, 48), // a quiet NaN
+        fmov_to_fp(1, PT_D, 0, 0),
+        fcmp(PT_D, 0, 0),
+    ]);
+    enable_fp(&h);
+    h.steps(3);
+    assert_eq!(h.flags(), Nzcv::new(false, false, true, true));
+    // The comparison of a NaN with itself is unordered rather than equal, and
+    // `FCMP` does not raise on a quiet one.
+    assert_eq!(h.cpu.sysregs().fpsr, 0);
+}
+
+/// `FPSR` is sticky and `FPCR` selects the rounding direction, both through
+/// the ordinary system-register path.
+#[test]
+fn fpcr_selects_the_rounding_and_fpsr_accumulates() {
+    let h = Harness::a53(&[
+        movz(1, 0, 0x3ff0, 48), // 1.0
+        movz(1, 1, 0x4008, 48), // 3.0
+        fmov_to_fp(1, PT_D, 0, 0),
+        fmov_to_fp(1, PT_D, 1, 1),
+        fdiv(PT_D, 2, 0, 1),
+        fmov_to_gp(1, PT_D, 2, 2),
+    ]);
+    enable_fp(&h);
+    h.steps(6);
+    assert_eq!(h.cpu.x(2), 0x3fd5_5555_5555_5555, "1/3, round to nearest");
+    // Inexact, and nothing else.
+    assert_eq!(h.cpu.sysregs().fpsr, 1 << 4);
+
+    // Round toward +infinity. Arm's encoding is `01`, which is x86's
+    // round-toward-*negative* — the mistake this asserts against.
+    let h = Harness::new(
+        Config::cortex_a53(),
+        &[
+            movz(1, 0, 0x3ff0, 48),
+            movz(1, 1, 0x4008, 48),
+            fmov_to_fp(1, PT_D, 0, 0),
+            fmov_to_fp(1, PT_D, 1, 1),
+            fdiv(PT_D, 2, 0, 1),
+            fmov_to_gp(1, PT_D, 2, 2),
+        ],
+    );
+    let mut regs = h.cpu.sysregs();
+    regs.cpacr = 3 << 20;
+    regs.fpcr = 1 << 22;
+    h.cpu.set_sysregs(regs);
+    h.steps(6);
+    assert_eq!(h.cpu.x(2), 0x3fd5_5555_5555_5556);
+}
+
+/// The bits of `FPCR` this core does not implement are RES0: a guest that
+/// writes `AHP` or an exception-enable bit reads back zero and can tell.
+#[test]
+fn the_unimplemented_fpcr_bits_read_back_as_zero() {
+    let h = Harness::a53(&[
+        movn(1, 0, 0, 0), // all ones
+        msr(key(SysReg::Fpcr), 0),
+        mrs(key(SysReg::Fpcr), 1),
+        msr(key(SysReg::Fpsr), 0),
+        mrs(key(SysReg::Fpsr), 2),
+    ]);
+    enable_fp(&h);
+    h.steps(5);
+    assert_eq!(h.cpu.x(1), super::fp::fpcr::WRITABLE);
+    assert_eq!(h.cpu.x(2), super::fp::fpsr::WRITABLE);
+    // `AHP` is bit 26 and is one of the ones that must not stick.
+    assert_eq!(h.cpu.x(1) & (1 << 26), 0);
+}
+
+/// A conversion out of range saturates and a NaN converts to zero, both with
+/// invalid raised — which is `IntOverflow::SaturateNanZero` reaching the guest.
+#[test]
+fn a_float_to_integer_conversion_saturates() {
+    let h = Harness::a53(&[
+        movz(1, 0, 0x7ff0, 48), // +inf
+        fmov_to_fp(1, PT_D, 0, 0),
+        fcvtzs(1, PT_D, 1, 0),
+        movz(1, 2, 0x7ff8, 48), // a quiet NaN
+        fmov_to_fp(1, PT_D, 2, 2),
+        fcvtzs(1, PT_D, 3, 2),
+        scvtf(1, PT_D, 4, 1), // i64::MAX back to a double
+        fmov_to_gp(1, PT_D, 4, 4),
+    ]);
+    enable_fp(&h);
+    h.steps(8);
+    assert_eq!(h.cpu.x(1), 0x7fff_ffff_ffff_ffff);
+    assert_eq!(h.cpu.x(3), 0);
+    // `i64::MAX` is not representable in `binary64`, so `SCVTF` rounds it up
+    // to 2^63 — a value that would not fit back in a signed integer.
+    assert_eq!(h.cpu.x(4), 0x43e0_0000_0000_0000);
+    assert_eq!(h.cpu.sysregs().fpsr & 1, 1, "invalid was raised");
+}
+
+/// `FMOV` with an immediate expands eight bits into the destination's format,
+/// so the same encoding is a different number at each precision.
+#[test]
+fn the_move_immediate_expands_per_precision() {
+    let h = Harness::a53(&[
+        fmov_imm(PT_D, 0, 0x70),
+        fmov_to_gp(1, PT_D, 0, 0),
+        fmov_imm(PT_S, 1, 0x70),
+        fmov_to_gp(0, PT_S, 1, 1),
+    ]);
+    enable_fp(&h);
+    h.steps(4);
+    assert_eq!(h.cpu.x(0), d(1.0));
+    assert_eq!(h.cpu.x(1), u64::from(1.0f32.to_bits()));
+}
+
+/// A 128-bit load and store move all sixteen bytes, and the `Q` width is the
+/// one spelled across two non-adjacent fields.
+#[test]
+fn a_quadword_load_and_store_move_the_whole_register() {
+    let h = Harness::a53(&[
+        ldr_v_imm(0, 1, 0, 31, 0), // ldr q0, [sp]
+        str_v_imm(0, 1, 0, 31, 1), // str q0, [sp, #16]
+        ldr_v_imm(3, 0, 1, 31, 2), // ldr d1, [sp, #16]
+    ]);
+    enable_fp(&h);
+    h.cpu.set_sp(0x800);
+    h.write64(0x800, 0x0011_2233_4455_6677);
+    h.write64(0x808, 0x8899_aabb_ccdd_eeff);
+    h.steps(3);
+    assert_eq!(
+        h.cpu.v(0),
+        (0x8899_aabb_ccdd_eeffu128 << 64) | 0x0011_2233_4455_6677
+    );
+    assert_eq!(h.read64(0x810), 0x0011_2233_4455_6677);
+    assert_eq!(h.read64(0x818), 0x8899_aabb_ccdd_eeff);
+    // The `D` load took only the low half and zeroed the rest.
+    assert_eq!(h.cpu.v(1), 0x0011_2233_4455_6677);
+}
+
+/// A `Q` access must be aligned to sixteen bytes when `SCTLR_EL1.A` is set,
+/// and the width it is checked against is the access the guest asked for
+/// rather than the eight-byte pieces the bus sees.
+#[test]
+fn a_quadword_access_is_checked_against_sixteen_bytes() {
+    let h = Harness::a53(&[ldr_v_imm(0, 1, 0, 0, 0)]);
+    enable_fp(&h);
+    let mut regs = h.cpu.sysregs();
+    regs.sctlr |= sctlr::A;
+    regs.cpacr = 3 << 20;
+    h.cpu.set_sysregs(regs);
+    h.cpu.set_x(0, 8); // eight-byte aligned, not sixteen
+    h.steps(1);
+    assert_eq!(h.cpu.sysregs().esr_el1 >> 26, ec::DABT_SAME);
+    assert_eq!(h.cpu.sysregs().far_el1, 8);
+}
+
+/// The disassembler prints the SIMD&FP register file at the width the encoding
+/// names, which is the whole reason A64's floating-point mnemonics carry no
+/// suffix.
+#[test]
+fn the_disassembler_names_the_floating_point_width() {
+    let text = |word: u32| super::disasm::disassemble(word, 0, Features::ALL).text;
+    assert_eq!(text(fadd(PT_D, 0, 1, 2)), "fadd\td0, d1, d2");
+    assert_eq!(text(fadd(PT_S, 0, 1, 2)), "fadd\ts0, s1, s2");
+    assert_eq!(text(fcvt(PT_D, PT_S, 0, 1)), "fcvt\td0, s1");
+    assert_eq!(text(fcvtzs(1, PT_D, 0, 1)), "fcvtzs\tx0, d1");
+    assert_eq!(text(fcvtzs(0, PT_S, 0, 1)), "fcvtzs\tw0, s1");
+    assert_eq!(text(scvtf(1, PT_D, 0, 1)), "scvtf\td0, x1");
+    assert_eq!(text(fmov_hi_to_gp(0, 1)), "fmov\tx0, v1.d[1]");
+    assert_eq!(text(fmov_gp_to_hi(0, 1)), "fmov\tv0.d[1], x1");
+    assert_eq!(text(ldr_v_imm(0, 1, 0, 1, 1)), "ldr\tq0, [x1, #0x10]");
+    assert_eq!(text(ldr_v_imm(0, 0, 0, 1, 1)), "ldr\tb0, [x1, #0x1]");
+    // An unallocated `ptype` prints the register as unknown rather than
+    // guessing a width the encoding does not name.
+    assert!(text(fadd(0b10, 0, 1, 2)).contains("v0.?"));
+    // A part without floating point does not disassemble one at all.
+    let bare = super::disasm::disassemble(fadd(PT_D, 0, 1, 2), 0, Features::NONE);
+    assert!(bare.text.starts_with(".word"));
+}
+
+/// `LDNP`/`STNP` are the non-temporal pair, and the signed-word form has no
+/// non-temporal counterpart — so `opc == 0b01` must stay UNDEFINED.
+#[test]
+fn the_non_temporal_pair_exists_and_its_signed_form_does_not() {
+    use super::isa::{Op, decode};
+    assert_eq!(decode(0x2900_0000, Features::ALL).unwrap().op, Op::StpWOff);
+    assert_eq!(decode(0x2800_0000, Features::ALL).unwrap().op, Op::StnpW);
+    assert_eq!(decode(0x2840_0000, Features::ALL).unwrap().op, Op::LdnpW);
+    assert_eq!(decode(0xa840_0000, Features::ALL).unwrap().op, Op::LdnpX);
+    assert_eq!(decode(0x2c40_0000, Features::ALL).unwrap().op, Op::LdnpV);
+    // `LDPSW` exists; `LDNPSW` does not.
+    assert_eq!(decode(0x6940_0000, Features::ALL).unwrap().op, Op::LdpswOff);
+    assert!(decode(0x6840_0000, Features::ALL).is_none());
+}
+
+/// The state chunk carries the whole SIMD&FP file, `FPCR` and `FPSR`, and a
+/// round trip is a fixed point.
+#[test]
+fn the_floating_point_state_survives_a_snapshot() -> Result<()> {
+    let h = Harness::a53(&[]);
+    enable_fp(&h);
+    for i in 0..32u32 {
+        h.cpu
+            .set_v(i, (u128::from(i) << 100) | u128::from(0xdead_beefu32) << i);
+    }
+    let mut regs = h.cpu.sysregs();
+    regs.fpcr = 1 << 22;
+    regs.fpsr = 0x11;
+    h.cpu.set_sysregs(regs);
+
+    let mut shape = MachineShape::new();
+    shape.add_device("cpu", CLASS.name)?;
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("cpu", CLASS.name, CLASS.version)?;
+        h.cpu.save(&mut chunk)?;
+    }
+    let bytes = w.to_vec()?;
+
+    let restored = Cpu::new(h.cpu.config());
+    let reader = StateReader::new(&bytes)?;
+    let chunk = reader.load("cpu", CLASS.name, CLASS.version, &Migrations::new())?;
+    let mut cr = chunk.reader();
+    restored.load(&mut cr)?;
+    cr.end()?;
+
+    for i in 0..32u32 {
+        assert_eq!(restored.v(i), h.cpu.v(i), "V{i}");
+    }
+    assert_eq!(restored.sysregs(), h.cpu.sysregs());
+
+    let mut shape2 = MachineShape::new();
+    shape2.add_device("cpu", CLASS.name)?;
+    let mut w2 = StateWriter::new(shape2);
+    {
+        let mut chunk = w2.chunk("cpu", CLASS.name, CLASS.version)?;
+        restored.save(&mut chunk)?;
+    }
+    assert_eq!(w2.to_vec()?, bytes, "a round trip must be a fixed point");
+    Ok(())
+}
+
+/// The fixed-point conversions, which have no Rust spelling and so are not
+/// covered by the built corpus: `SCVTF <Dd>, <Xn>, #fbits` reads the integer
+/// as a fixed-point value with `fbits` fraction bits, and `FCVTZS` is its
+/// inverse.
+#[test]
+fn the_fixed_point_conversions_scale_by_a_power_of_two() {
+    const fn scvtf_fix(sf: u32, ptype: u32, rd: u32, rn: u32, fbits: u32) -> u32 {
+        (sf << 31) | 0x1e02_0000 | (ptype << 22) | ((64 - fbits) << 10) | (rn << 5) | rd
+    }
+    const fn fcvtzs_fix(sf: u32, ptype: u32, rd: u32, rn: u32, fbits: u32) -> u32 {
+        (sf << 31) | 0x1e18_0000 | (ptype << 22) | ((64 - fbits) << 10) | (rn << 5) | rd
+    }
+    let h = Harness::a53(&[
+        movz(1, 0, 3, 0),
+        scvtf_fix(1, PT_D, 0, 0, 1), // 3 with one fraction bit is 1.5
+        fmov_to_gp(1, PT_D, 1, 0),
+        fcvtzs_fix(1, PT_D, 2, 0, 2), // 1.5 with two fraction bits is 6
+        movn(1, 3, 0, 0),             // -1
+        scvtf_fix(1, PT_D, 1, 3, 4),  // -1 with four fraction bits is -1/16
+        fmov_to_gp(1, PT_D, 4, 1),
+    ]);
+    enable_fp(&h);
+    h.steps(7);
+    assert_eq!(h.cpu.x(1), d(1.5));
+    assert_eq!(h.cpu.x(2), 6);
+    assert_eq!(h.cpu.x(4), d(-0.0625));
+
+    // A 32-bit form may not name more than 32 fraction bits: DDI 0487 makes
+    // the top bit of `scale` mandatory when `sf` is clear.
+    let h = Harness::a53(&[scvtf_fix(0, PT_S, 0, 0, 33)]);
+    enable_fp(&h);
+    h.steps(1);
+    assert_eq!(h.cpu.sysregs().esr_el1 >> 26, ec::UNKNOWN);
+}
+
+/// `CPACR_EL1.FPEN` traps an `MRS` of `FPCR` too, not only the instructions
+/// that use the registers. A kernel saving floating-point context reads `FPSR`
+/// before it reads a single `V` register, so a trap that let that read through
+/// would make lazy context switching see the wrong process's state.
+#[test]
+fn the_access_trap_covers_fpcr_and_fpsr_as_well() {
+    let h = Harness::a53(&[mrs(key(SysReg::Fpcr), 0)]);
+    h.steps(1);
+    assert_eq!(h.cpu.sysregs().esr_el1 >> 26, ec::FP_ACCESS);
+
+    let h = Harness::a53(&[msr(key(SysReg::Fpsr), 0)]);
+    h.steps(1);
+    assert_eq!(h.cpu.sysregs().esr_el1 >> 26, ec::FP_ACCESS);
+
+    // An unrelated system register is not trapped by it.
+    let h = Harness::a53(&[mrs(key(SysReg::Midr), 0)]);
+    h.steps(1);
+    assert_eq!(h.cpu.sysregs().esr_el1, 0);
+    assert_eq!(h.cpu.x(0), Config::cortex_a53().midr);
+}

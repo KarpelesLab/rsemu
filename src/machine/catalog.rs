@@ -496,7 +496,8 @@ pub static MIPS_MINI: CatalogEntry = CatalogEntry {
 /// peripheral aperture. AArch64 fixes no reset vector — it is
 /// IMPLEMENTATION DEFINED — so `reset` is a parameter of the board rather than
 /// a constant, and so is the part: `part = "cortex-a53"` has `FEAT_CRC32` and
-/// no `FEAT_LSE`, `part = "neoverse-n1"` has both.
+/// floating point and no `FEAT_LSE`, `part = "neoverse-n1"` has all three, and
+/// `part = "armv8.0"` has none of them.
 #[cfg(feature = "machine-a64-mini")]
 #[cfg_attr(docsrs, doc(cfg(feature = "machine-a64-mini")))]
 pub static A64_MINI: CatalogEntry = CatalogEntry {

@@ -51,15 +51,38 @@
 //! | the interpreter | `exec` |
 //! | `PSTATE`, exception levels, the system-register table | [`sysreg`] |
 //! | the stage-1 translation walk and the software TLB | [`mmu`] |
+//! | the SIMD&FP register file, `FPCR`/`FPSR`, and Arm's IEEE rules | [`fp`] |
+//!
+//! # Floating point is software, and that is the point
+//!
+//! `ROADMAP.md` §9.1: guest floating point executed on *host* floating point
+//! cannot give bit-identical results across hosts, because no two
+//! architectures agree on NaN payloads or on flush-to-zero and wasm
+//! canonicalises NaNs. So every `F*` instruction here goes through
+//! [`crate::float`], the shared software IEEE-754 subsystem, with `FPCR`
+//! mapped onto its `Env`. There is no host-float fast path, not even behind a
+//! flag.
+//!
+//! `CPACR_EL1.FPEN` resets to zero, so a guest takes an exception on its first
+//! floating-point instruction unless it enabled access first. That is the
+//! architecture rather than an inconvenience: it is how a kernel discovers
+//! that a process has started using the FPU.
 //!
 //! # What is deliberately absent
 //!
-//! There is **no SIMD and no floating point**: `CPACR_EL1` reads zero and an
-//! FP or Advanced SIMD instruction does not decode, so `ID_AA64PFR0_EL1`
-//! reports both as absent and a guest that probes finds out honestly. Also
-//! absent: EL2 and EL3 (so `HVC` and `SMC` are `UNDEFINED`), AArch32 at any
-//! level, the generic timer, pointer authentication, MTE, SVE, big-endian
-//! data, and the `DC ZVA` block operation — `DCZID_EL0.DZP` says so.
+//! **Advanced SIMD** — the *vector* instructions — is not implemented, and
+//! `ID_AA64PFR0_EL1.AdvSIMD` says so while `.FP` says floating point is
+//! present. DDI 0487 requires those two fields to agree, so that is a part
+//! nobody makes; [`Config::id_aa64pfr0`] explains why reporting an impossible
+//! part beats claiming a capability that would `UNDEF` on first use.
+//!
+//! Also absent: `FEAT_FP16` arithmetic (half precision exists here only as a
+//! conversion format, which is Armv8.0-A), EL2 and EL3 (so `HVC` and `SMC` are
+//! `UNDEFINED`), AArch32 at any level, the generic timer, `LDXP`/`STXP`, the
+//! unprivileged `LDTR`/`STTR` family, pointer authentication, MTE, SVE,
+//! big-endian data, and the `DC ZVA` block operation — `DCZID_EL0.DZP` says
+//! so.
+
 //!
 //! # Timing
 //!
@@ -79,6 +102,7 @@
 
 pub mod disasm;
 mod exec;
+pub mod fp;
 pub mod isa;
 pub mod mmu;
 pub mod sysreg;
@@ -186,10 +210,14 @@ impl Config {
     /// written out with its fields named rather than as a bare number.
     pub const ID_AA64MMFR0: u64 = 0x0000_0000_1000_0025;
 
-    /// A bare Armv8.0-A part with no optional feature at all.
+    /// A bare Armv8.0-A part with no optional feature at all — **including no
+    /// floating point**.
     ///
     /// Useful as a lower bound and as what a test builds: a guest that runs
-    /// here runs everywhere.
+    /// here runs everywhere. `FEAT_FP` really is optional in Armv8.0-A even
+    /// though every part anybody ships has it, so this is also the
+    /// configuration that proves the `ID_AA64PFR0_EL1.FP` gate and the
+    /// `UNDEFINED` an absent feature must raise.
     #[must_use]
     pub const fn armv8_0() -> Config {
         Config {
@@ -204,7 +232,8 @@ impl Config {
         }
     }
 
-    /// Cortex-A53: Armv8.0-A with `FEAT_CRC32`, no `FEAT_LSE`.
+    /// Cortex-A53: Armv8.0-A with `FEAT_CRC32` and floating point, no
+    /// `FEAT_LSE`.
     ///
     /// `MIDR_EL1` 0x410FD034 — implementer `0x41` (Arm), architecture `0xF`,
     /// part `0xD03`, revision r0p4.
@@ -214,6 +243,7 @@ impl Config {
             features: Features {
                 lse: false,
                 crc32: true,
+                fp: true,
             },
             midr: 0x410f_d034,
             ..Config::armv8_0()
@@ -296,12 +326,32 @@ impl Config {
     }
 
     /// `ID_AA64PFR0_EL1`: EL0 and EL1 implemented in AArch64 only, no EL2, no
-    /// EL3, and neither floating point nor Advanced SIMD.
+    /// EL3, floating point as [`Features::fp`] says, and **Advanced SIMD
+    /// absent**.
+    ///
+    /// # A combination no silicon has, reported deliberately
+    ///
+    /// DDI 0487 says the `FP` and `AdvSIMD` fields must hold the same value:
+    /// a part has both or neither. This core has scalar floating point and no
+    /// vector instructions, so it reports `FP == 0b0000` and
+    /// `AdvSIMD == 0b1111` — a part that does not exist.
+    ///
+    /// The alternative was to claim Advanced SIMD and then raise `UNDEFINED`
+    /// on the first `ADD V0.4S, …`, and between describing a part nobody makes
+    /// and lying about a capability, the first is the one a guest can act on:
+    /// software that checks `AdvSIMD` before using a vector `memcpy` gets the
+    /// right answer, and software that assumes the fields agree finds out here
+    /// rather than in a fault it cannot explain. When the vector instructions
+    /// land the two fields agree again and this note goes away.
     #[must_use]
     pub const fn id_aa64pfr0(&self) -> u64 {
-        // EL0 = 0b0001, EL1 = 0b0001 (AArch64 only); FP and AdvSIMD = 0b1111
-        // (not implemented).
-        0x0000_0000_00ff_0011
+        // EL0 = 0b0001, EL1 = 0b0001 (AArch64 only); AdvSIMD = 0b1111.
+        let mut value = 0x0000_0000_00f0_0011;
+        if !self.features.fp {
+            // 0b1111: not implemented.
+            value |= 0xf << 16;
+        }
+        value
     }
 }
 
@@ -525,6 +575,27 @@ impl Cpu {
     /// Write the stack pointer the current `PSTATE` selects.
     pub fn set_sp(&self, value: u64) {
         self.session.lock().state.sys.set_sp(value);
+    }
+
+    /// Read a SIMD&FP register whole.
+    ///
+    /// The 128-bit value, because that is what the register is: a caller
+    /// wanting the `S` or `D` view narrows it, and handing out a `u64` here
+    /// would quietly discard the top half of a `Q` register a debugger asked
+    /// for.
+    #[must_use]
+    pub fn v(&self, index: u32) -> u128 {
+        if index >= fp::V_COUNT as u32 {
+            return 0;
+        }
+        self.session.lock().state.v.q(index)
+    }
+
+    /// Write a SIMD&FP register whole. An index past the file is discarded.
+    pub fn set_v(&self, index: u32, value: u128) {
+        if index < fp::V_COUNT as u32 {
+            self.session.lock().state.v.set_q(index, value);
+        }
     }
 
     /// The current exception level.
@@ -910,6 +981,15 @@ impl Device for Cpu {
         for r in s.x {
             w.write_u64(r)?;
         }
+        // The SIMD&FP file, low half then high, one register at a time. Two
+        // words rather than a 128-bit primitive because the chunk format has
+        // no wider one, and the order is fixed here so `load` reads it back
+        // the same way.
+        for index in 0..fp::V_COUNT as u32 {
+            let value = s.v.q(index);
+            w.write_u64(value as u64)?;
+            w.write_u64((value >> 64) as u64)?;
+        }
         w.write_u64(s.pc)?;
         w.write_u64(s.cycles)?;
         w.write_u64(s.debt)?;
@@ -941,6 +1021,11 @@ impl Device for Cpu {
         let mut s = State::new(&cfg);
         for slot in &mut s.x {
             *slot = r.read_u64()?;
+        }
+        for index in 0..fp::V_COUNT as u32 {
+            let lo = r.read_u64()?;
+            let hi = r.read_u64()?;
+            s.v.set_q(index, u128::from(lo) | (u128::from(hi) << 64));
         }
         s.pc = r.read_u64()?;
         s.cycles = r.read_u64()?;
@@ -984,7 +1069,7 @@ impl Device for Cpu {
 
 impl Cpu {
     /// How many 64-bit system-register words a snapshot carries.
-    const SYSREG_WORDS: usize = 22;
+    const SYSREG_WORDS: usize = 24;
 
     /// The system registers a snapshot carries, in a fixed order.
     ///
@@ -1020,6 +1105,8 @@ impl Cpu {
             s.tpidr_el0,
             s.tpidrro_el0,
             s.mdscr,
+            s.fpcr,
+            s.fpsr,
         ]
     }
 
@@ -1048,6 +1135,8 @@ impl Cpu {
             &mut s.tpidr_el0,
             &mut s.tpidrro_el0,
             &mut s.mdscr,
+            &mut s.fpcr,
+            &mut s.fpsr,
         ];
         for (slot, value) in fields.into_iter().zip(w) {
             *slot = *value;

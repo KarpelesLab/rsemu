@@ -278,6 +278,11 @@ pub enum Feat {
     /// `FEAT_CRC32` — the CRC-32 accelerators, optional in Armv8.0 and
     /// mandatory from Armv8.1.
     Crc32,
+    /// `FEAT_FP` — scalar floating point: the SIMD&FP register file and the
+    /// `F*` instructions. OPTIONAL in Armv8.0-A, and present on every part
+    /// anybody ships — but optional is optional, and a guest probes for it by
+    /// reading `ID_AA64PFR0_EL1.FP` and by taking the `CPACR_EL1` trap.
+    Fp,
 }
 
 impl Feat {
@@ -288,6 +293,7 @@ impl Feat {
             Feat::Base => "base",
             Feat::Lse => "lse",
             Feat::Crc32 => "crc32",
+            Feat::Fp => "fp",
         }
     }
 }
@@ -308,6 +314,8 @@ pub struct Features {
     pub lse: bool,
     /// `FEAT_CRC32`, the CRC-32 accelerators.
     pub crc32: bool,
+    /// `FEAT_FP`, scalar floating point and the SIMD&FP register file.
+    pub fp: bool,
 }
 
 impl Features {
@@ -315,12 +323,14 @@ impl Features {
     pub const NONE: Features = Features {
         lse: false,
         crc32: false,
+        fp: false,
     };
 
     /// Everything this core implements.
     pub const ALL: Features = Features {
         lse: true,
         crc32: true,
+        fp: true,
     };
 
     /// Whether an encoding requiring `feat` may decode here.
@@ -331,6 +341,7 @@ impl Features {
             Feat::Base => true,
             Feat::Lse => self.lse,
             Feat::Crc32 => self.crc32,
+            Feat::Fp => self.fp,
         }
     }
 }
@@ -450,6 +461,52 @@ pub enum Fmt {
     CrcReg,
     /// `Rd, Rn`.
     TwoReg,
+
+    // -- Scalar floating point -------------------------------------------
+    //
+    // The SIMD&FP register file is a second register file with its own
+    // widths, so these do not reuse the integer formats even where the
+    // operand *count* matches: `reg()` and `vreg()` print different names,
+    // and the interpreter reads different state.
+    /// `<Vd>, <Vn>` at one precision — `FABS`, `FNEG`, `FSQRT`, `FRINT*`.
+    FpOneSrc,
+    /// `<Vd>, <Vn>` where the two differ — `FCVT`.
+    FpCvt,
+    /// `<Vd>, <Vn>, <Vm>` — `FADD` and its family.
+    FpTwoSrc,
+    /// `<Vd>, <Vn>, <Vm>, <Va>` — `FMADD` and its family.
+    FpThreeSrc,
+    /// `<Vn>, <Vm>` or `<Vn>, #0.0` — `FCMP`, `FCMPE`.
+    FpCmp,
+    /// `<Vn>, <Vm>, #nzcv, cond` — `FCCMP`, `FCCMPE`.
+    FpCondCmp,
+    /// `<Vd>, <Vn>, <Vm>, cond` — `FCSEL`.
+    FpCondSel,
+    /// `<Vd>, #imm` — `FMOV` with an eight-bit immediate.
+    FpImm,
+    /// A general register on one side and a SIMD&FP register on the other —
+    /// `FCVTZS`, `SCVTF`, `FMOV` between the files.
+    FpIntCvt,
+    /// The same, with a fixed-point scale — `SCVTF <Sd>, <Wn>, #fbits`.
+    FpFixCvt,
+    /// `<Vt>, #label` — a SIMD&FP literal load.
+    LoadFpLiteral,
+    /// `<Vt>, [Rn|SP{, #pimm}]`.
+    LdStFpUImm,
+    /// `<Vt>, [Rn|SP{, #simm}]` — `LDUR`/`STUR` of a SIMD&FP register.
+    LdStFpUnscaled,
+    /// `<Vt>, [Rn|SP], #simm` — post-indexed.
+    LdStFpPost,
+    /// `<Vt>, [Rn|SP, #simm]!` — pre-indexed.
+    LdStFpPre,
+    /// `<Vt>, [Rn|SP, Rm{, extend {#amount}}]`.
+    LdStFpRegOff,
+    /// `<Vt>, <Vt2>, [Rn|SP{, #imm}]`.
+    LdStFpPairOff,
+    /// `<Vt>, <Vt2>, [Rn|SP], #imm` — post-indexed.
+    LdStFpPairPost,
+    /// `<Vt>, <Vt2>, [Rn|SP, #imm]!` — pre-indexed.
+    LdStFpPairPre,
 }
 
 impl Fmt {
@@ -484,6 +541,14 @@ impl Fmt {
                 | Fmt::LdStExclusive
                 | Fmt::StoreExclusive
                 | Fmt::Atomic
+                | Fmt::LdStFpUImm
+                | Fmt::LdStFpUnscaled
+                | Fmt::LdStFpPost
+                | Fmt::LdStFpPre
+                | Fmt::LdStFpRegOff
+                | Fmt::LdStFpPairOff
+                | Fmt::LdStFpPairPost
+                | Fmt::LdStFpPairPre
         )
     }
 
@@ -513,6 +578,28 @@ impl Fmt {
                 | Fmt::LdStPairOff
                 | Fmt::LdStPairPost
                 | Fmt::LdStPairPre
+        )
+    }
+
+    /// Whether this format is one of the SIMD&FP load/store families.
+    ///
+    /// Separate from [`Fmt::is_load_store`] rather than folded into it,
+    /// because the two dispatch to different register files and share only
+    /// the addressing-mode arithmetic. Folding them would put a
+    /// `if is_simd { … }` inside every one of those modes.
+    #[inline]
+    #[must_use]
+    pub const fn is_fp_load_store(self) -> bool {
+        matches!(
+            self,
+            Fmt::LdStFpUImm
+                | Fmt::LdStFpUnscaled
+                | Fmt::LdStFpPost
+                | Fmt::LdStFpPre
+                | Fmt::LdStFpRegOff
+                | Fmt::LdStFpPairOff
+                | Fmt::LdStFpPairPost
+                | Fmt::LdStFpPairPre
         )
     }
 }
@@ -737,6 +824,21 @@ a64! {
     0xffe00c00 0xf8a00800 PrfmReg   "prfm"  LdStRegOff Base "prefetch memory at a register offset";
 
     // -- Loads and stores: pairs --------------------------------------------
+    // `LDNP`/`STNP` are the plain offset form with a *hint* attached: the
+    // access is non-temporal, meaning the data is unlikely to be reused soon
+    // and the caches need not keep it. There is no cache in this core, so the
+    // hint has no effect and these behave exactly as `LDP`/`STP` — which is
+    // architecturally correct rather than a shortcut, since the hint changes
+    // no architectural state on any implementation.
+    //
+    // `opc == 0b01` has no row here on purpose: the signed-word `LDPSW` has no
+    // non-temporal counterpart, so that encoding is unallocated and must
+    // `UNDEF`. Fixing `opc` in these masks is what makes that true without a
+    // check in the interpreter.
+    0xffc00000 0x28000000 StnpW     "stnp"  LdStPairOff  Base "store a pair of words, non-temporal";
+    0xffc00000 0x28400000 LdnpW     "ldnp"  LdStPairOff  Base "load a pair of words, non-temporal";
+    0xffc00000 0xa8000000 StnpX     "stnp"  LdStPairOff  Base "store a pair of doublewords, non-temporal";
+    0xffc00000 0xa8400000 LdnpX     "ldnp"  LdStPairOff  Base "load a pair of doublewords, non-temporal";
     0xffc00000 0x28800000 StpWPost  "stp"   LdStPairPost Base "store a pair of words, post-indexed";
     0xffc00000 0x28c00000 LdpWPost  "ldp"   LdStPairPost Base "load a pair of words, post-indexed";
     0xffc00000 0x29000000 StpWOff   "stp"   LdStPairOff  Base "store a pair of words";
@@ -873,6 +975,110 @@ a64! {
     0xffe08000 0x9ba08000 Umsubl "umsubl" FourReg  Base "unsigned multiply-subtract of two words from a doubleword";
     0xffe0fc00 0x9b407c00 Smulh  "smulh"  ThreeReg Base "signed multiply, high half";
     0xffe0fc00 0x9bc07c00 Umulh  "umulh"  ThreeReg Base "unsigned multiply, high half";
+    // -- Scalar floating point: data processing (1 source) -----------------
+    //
+    // `ptype` (bits 23:22) is deliberately *not* fixed by these masks: it
+    // names the precision, and one row per precision would be three rows
+    // describing the same instruction. The interpreter reads it with
+    // `fp::Prec::from_ptype`, which rejects the unallocated `0b10` and — with
+    // no `FEAT_FP16` here — the arithmetic uses of `0b11`.
+    0xff3ffc00 0x1e204000 Fmov   "fmov"   FpOneSrc Fp "move a floating-point register";
+    0xff3ffc00 0x1e20c000 Fabs   "fabs"   FpOneSrc Fp "floating-point absolute value";
+    0xff3ffc00 0x1e214000 Fneg   "fneg"   FpOneSrc Fp "floating-point negate";
+    0xff3ffc00 0x1e21c000 Fsqrt  "fsqrt"  FpOneSrc Fp "floating-point square root";
+    0xff3e7c00 0x1e224000 Fcvt   "fcvt"   FpCvt    Fp "convert between floating-point precisions";
+    0xff3ffc00 0x1e244000 Frintn "frintn" FpOneSrc Fp "round to an integral value, ties to even";
+    0xff3ffc00 0x1e24c000 Frintp "frintp" FpOneSrc Fp "round to an integral value, toward +infinity";
+    0xff3ffc00 0x1e254000 Frintm "frintm" FpOneSrc Fp "round to an integral value, toward -infinity";
+    0xff3ffc00 0x1e25c000 Frintz "frintz" FpOneSrc Fp "round to an integral value, toward zero";
+    0xff3ffc00 0x1e264000 Frinta "frinta" FpOneSrc Fp "round to an integral value, ties away from zero";
+    0xff3ffc00 0x1e274000 Frintx "frintx" FpOneSrc Fp "round to an integral value, current mode, signalling inexact";
+    0xff3ffc00 0x1e27c000 Frinti "frinti" FpOneSrc Fp "round to an integral value, current mode";
+
+    // -- Scalar floating point: data processing (2 source) -----------------
+    0xff20fc00 0x1e200800 Fmul   "fmul"   FpTwoSrc Fp "floating-point multiply";
+    0xff20fc00 0x1e201800 Fdiv   "fdiv"   FpTwoSrc Fp "floating-point divide";
+    0xff20fc00 0x1e202800 Fadd   "fadd"   FpTwoSrc Fp "floating-point add";
+    0xff20fc00 0x1e203800 Fsub   "fsub"   FpTwoSrc Fp "floating-point subtract";
+    0xff20fc00 0x1e204800 Fmax   "fmax"   FpTwoSrc Fp "floating-point maximum, propagating a NaN";
+    0xff20fc00 0x1e205800 Fmin   "fmin"   FpTwoSrc Fp "floating-point minimum, propagating a NaN";
+    0xff20fc00 0x1e206800 Fmaxnm "fmaxnm" FpTwoSrc Fp "floating-point maximum, preferring a number to a quiet NaN";
+    0xff20fc00 0x1e207800 Fminnm "fminnm" FpTwoSrc Fp "floating-point minimum, preferring a number to a quiet NaN";
+    0xff20fc00 0x1e208800 Fnmul  "fnmul"  FpTwoSrc Fp "floating-point multiply, negating the result";
+
+    // -- Scalar floating point: data processing (3 source) -----------------
+    0xff208000 0x1f000000 Fmadd  "fmadd"  FpThreeSrc Fp "fused multiply-add";
+    0xff208000 0x1f008000 Fmsub  "fmsub"  FpThreeSrc Fp "fused multiply-subtract";
+    0xff208000 0x1f200000 Fnmadd "fnmadd" FpThreeSrc Fp "fused negated multiply-add";
+    0xff208000 0x1f208000 Fnmsub "fnmsub" FpThreeSrc Fp "fused negated multiply-subtract";
+
+    // -- Scalar floating point: compare ------------------------------------
+    0xff20fc1f 0x1e202000 Fcmp      "fcmp"  FpCmp Fp "floating-point compare, quiet";
+    0xff20fc1f 0x1e202008 FcmpZero  "fcmp"  FpCmp Fp "floating-point compare with zero, quiet";
+    0xff20fc1f 0x1e202010 Fcmpe     "fcmpe" FpCmp Fp "floating-point compare, signalling on any NaN";
+    0xff20fc1f 0x1e202018 FcmpeZero "fcmpe" FpCmp Fp "floating-point compare with zero, signalling on any NaN";
+
+    // -- Scalar floating point: conditional --------------------------------
+    0xff200c10 0x1e200400 Fccmp  "fccmp"  FpCondCmp Fp "conditional floating-point compare, quiet";
+    0xff200c10 0x1e200410 Fccmpe "fccmpe" FpCondCmp Fp "conditional floating-point compare, signalling on any NaN";
+    0xff200c00 0x1e200c00 Fcsel  "fcsel"  FpCondSel Fp "floating-point conditional select";
+    0xff201fe0 0x1e201000 FmovImm "fmov"  FpImm     Fp "move an expanded 8-bit floating-point immediate";
+
+    // -- Conversion between floating point and a general register ----------
+    //
+    // `sf` (bit 31) and `ptype` are both free here for the same reason as
+    // above: they name the integer and floating-point widths, and every valid
+    // combination is one instruction with one behaviour. The interpreter
+    // rejects the combinations DDI 0487 leaves unallocated.
+    0x7f3ffc00 0x1e200000 Fcvtns   "fcvtns" FpIntCvt Fp "convert to a signed integer, ties to even";
+    0x7f3ffc00 0x1e210000 Fcvtnu   "fcvtnu" FpIntCvt Fp "convert to an unsigned integer, ties to even";
+    0x7f3ffc00 0x1e220000 Scvtf    "scvtf"  FpIntCvt Fp "convert a signed integer to floating point";
+    0x7f3ffc00 0x1e230000 Ucvtf    "ucvtf"  FpIntCvt Fp "convert an unsigned integer to floating point";
+    0x7f3ffc00 0x1e240000 Fcvtas   "fcvtas" FpIntCvt Fp "convert to a signed integer, ties away from zero";
+    0x7f3ffc00 0x1e250000 Fcvtau   "fcvtau" FpIntCvt Fp "convert to an unsigned integer, ties away from zero";
+    0x7f3ffc00 0x1e260000 FmovToGp "fmov"   FpIntCvt Fp "move a floating-point register to a general one";
+    0x7f3ffc00 0x1e270000 FmovToFp "fmov"   FpIntCvt Fp "move a general register to a floating-point one";
+    0x7f3ffc00 0x1e280000 Fcvtps   "fcvtps" FpIntCvt Fp "convert to a signed integer, toward +infinity";
+    0x7f3ffc00 0x1e290000 Fcvtpu   "fcvtpu" FpIntCvt Fp "convert to an unsigned integer, toward +infinity";
+    0x7f3ffc00 0x1e2e0000 FmovHiToGp "fmov" FpIntCvt Fp "move the top half of a vector register to a general one";
+    0x7f3ffc00 0x1e2f0000 FmovGpToHi "fmov" FpIntCvt Fp "move a general register into the top half of a vector one";
+    0x7f3ffc00 0x1e300000 Fcvtms   "fcvtms" FpIntCvt Fp "convert to a signed integer, toward -infinity";
+    0x7f3ffc00 0x1e310000 Fcvtmu   "fcvtmu" FpIntCvt Fp "convert to an unsigned integer, toward -infinity";
+    0x7f3ffc00 0x1e380000 Fcvtzs   "fcvtzs" FpIntCvt Fp "convert to a signed integer, toward zero";
+    0x7f3ffc00 0x1e390000 Fcvtzu   "fcvtzu" FpIntCvt Fp "convert to an unsigned integer, toward zero";
+
+    // -- Conversion with a fixed-point scale -------------------------------
+    0x7f3f0000 0x1e020000 ScvtfFix  "scvtf"  FpFixCvt Fp "convert a signed fixed-point value to floating point";
+    0x7f3f0000 0x1e030000 UcvtfFix  "ucvtf"  FpFixCvt Fp "convert an unsigned fixed-point value to floating point";
+    0x7f3f0000 0x1e180000 FcvtzsFix "fcvtzs" FpFixCvt Fp "convert to a signed fixed-point value, toward zero";
+    0x7f3f0000 0x1e190000 FcvtzuFix "fcvtzu" FpFixCvt Fp "convert to an unsigned fixed-point value, toward zero";
+
+    // -- SIMD&FP loads and stores ------------------------------------------
+    //
+    // One row per direction rather than one per width: `LDR B0`, `LDR H0`,
+    // `LDR S0`, `LDR D0` and `LDR Q0` are all spelled **`ldr`**, with the
+    // width in the register name, so five rows would name one instruction
+    // five times. Bit 22 is the load/store bit and is fixed; `size` (31:30)
+    // and `opc<1>` (bit 23) together give the width and stay free.
+    0x3f000000 0x1c000000 LdrLitV  "ldr"  LoadFpLiteral  Fp "load a SIMD&FP register from a PC-relative literal";
+    0x3f400000 0x3d000000 StrVImm  "str"  LdStFpUImm     Fp "store a SIMD&FP register";
+    0x3f400000 0x3d400000 LdrVImm  "ldr"  LdStFpUImm     Fp "load a SIMD&FP register";
+    0x3f600c00 0x3c000000 SturV    "stur" LdStFpUnscaled Fp "store a SIMD&FP register, unscaled offset";
+    0x3f600c00 0x3c400000 LdurV    "ldur" LdStFpUnscaled Fp "load a SIMD&FP register, unscaled offset";
+    0x3f600c00 0x3c000400 StrVPost "str"  LdStFpPost     Fp "store a SIMD&FP register, post-indexed";
+    0x3f600c00 0x3c400400 LdrVPost "ldr"  LdStFpPost     Fp "load a SIMD&FP register, post-indexed";
+    0x3f600c00 0x3c000c00 StrVPre  "str"  LdStFpPre      Fp "store a SIMD&FP register, pre-indexed";
+    0x3f600c00 0x3c400c00 LdrVPre  "ldr"  LdStFpPre      Fp "load a SIMD&FP register, pre-indexed";
+    0x3f600c00 0x3c200800 StrVReg  "str"  LdStFpRegOff   Fp "store a SIMD&FP register, register offset";
+    0x3f600c00 0x3c600800 LdrVReg  "ldr"  LdStFpRegOff   Fp "load a SIMD&FP register, register offset";
+    0x3fc00000 0x2c000000 StnpV    "stnp" LdStFpPairOff  Fp "store a pair of SIMD&FP registers, non-temporal";
+    0x3fc00000 0x2c400000 LdnpV    "ldnp" LdStFpPairOff  Fp "load a pair of SIMD&FP registers, non-temporal";
+    0x3fc00000 0x2c800000 StpVPost "stp"  LdStFpPairPost Fp "store a pair of SIMD&FP registers, post-indexed";
+    0x3fc00000 0x2cc00000 LdpVPost "ldp"  LdStFpPairPost Fp "load a pair of SIMD&FP registers, post-indexed";
+    0x3fc00000 0x2d000000 StpVOff  "stp"  LdStFpPairOff  Fp "store a pair of SIMD&FP registers";
+    0x3fc00000 0x2d400000 LdpVOff  "ldp"  LdStFpPairOff  Fp "load a pair of SIMD&FP registers";
+    0x3fc00000 0x2d800000 StpVPre  "stp"  LdStFpPairPre  Fp "store a pair of SIMD&FP registers, pre-indexed";
+    0x3fc00000 0x2dc00000 LdpVPre  "ldp"  LdStFpPairPre  Fp "load a pair of SIMD&FP registers, pre-indexed";
 }
 
 // ---------------------------------------------------------------------------
@@ -883,8 +1089,11 @@ a64! {
 ///
 /// A compile-time bound: [`build_index`] panics during const evaluation if a
 /// bucket overflows it, which is a build break rather than a silently
-/// truncated decode table.
-const BUCKET_CAP: usize = 96;
+/// truncated decode table. `the_busiest_decode_bucket_has_headroom` reports
+/// the margin so that break never arrives as a surprise — the scalar
+/// floating-point rows took the busiest bucket from 46 to 90, which is why
+/// this is no longer 96.
+const BUCKET_CAP: usize = 160;
 
 /// One bucket of [`INDEX`]: the rows whose fixed bits are compatible with one
 /// value of the top-level `op0` field.
@@ -1194,6 +1403,86 @@ pub const fn ls_access(size: u32, opc: u32) -> Option<LsAccess> {
     }
 }
 
+/// The `ptype` field of a scalar floating-point encoding, bits 23:22.
+///
+/// It names the precision, and `0b10` is unallocated on every encoding that
+/// carries it except the `FMOV` forms that reach the top half of a vector
+/// register — which is why decoding it is [`super::fp::Prec::from_ptype`]'s
+/// job and not this function's.
+#[inline]
+#[must_use]
+pub const fn ptype(word: u32) -> u32 {
+    field(word, 23, 22)
+}
+
+/// The `rmode` field of a conversion between floating point and a general
+/// register, bits 20:19.
+#[inline]
+#[must_use]
+pub const fn cvt_rmode(word: u32) -> u32 {
+    field(word, 20, 19)
+}
+
+/// The `opcode` field of a conversion between floating point and a general
+/// register, bits 18:16.
+#[inline]
+#[must_use]
+pub const fn cvt_opcode(word: u32) -> u32 {
+    field(word, 18, 16)
+}
+
+/// The number of fraction bits a fixed-point conversion uses.
+///
+/// The encoding holds `64 - fbits` in bits 15:10, so a scale of one is spelled
+/// `0b111111`. Subtracting rather than reading it directly is the whole
+/// content of the field.
+#[inline]
+#[must_use]
+pub const fn fbits(word: u32) -> u32 {
+    64 - field(word, 15, 10)
+}
+
+/// The eight-bit immediate `FMOV` expands, bits 20:13.
+#[inline]
+#[must_use]
+pub const fn fp_imm8(word: u32) -> u32 {
+    field(word, 20, 13)
+}
+
+/// The base-2 logarithm of a SIMD&FP load or store's access width in bytes.
+///
+/// The width is spelled across two fields that are not adjacent: `size` in
+/// bits 31:30 and `opc<1>` in bit 23. Together they give `B`, `H`, `S`, `D`
+/// and — with `opc<1>` set and `size` zero — `Q`. Every other combination
+/// with `opc<1>` set is unallocated, which is the `None`.
+#[inline]
+#[must_use]
+pub const fn fp_ls_scale(word: u32) -> Option<u32> {
+    let size = ls_size(word);
+    if bit(word, 23) {
+        if size == 0 { Some(4) } else { None }
+    } else {
+        Some(size)
+    }
+}
+
+/// The base-2 logarithm, in bytes, of the width the SIMD&FP `opc` field names.
+///
+/// Bits 31:30, shared by the pair encodings and the literal load; unlike the
+/// single-register form it is a width on its own, with no second field to
+/// combine with: `00` is `S`, `01` is `D`, `10` is `Q`, and `11` is
+/// unallocated.
+#[inline]
+#[must_use]
+pub const fn fp_opc_scale(word: u32) -> Option<u32> {
+    match field(word, 31, 30) {
+        0b00 => Some(2),
+        0b01 => Some(3),
+        0b10 => Some(4),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared pseudocode
 // ---------------------------------------------------------------------------
@@ -1424,6 +1713,24 @@ pub const fn barrier_domain(crm: u32) -> &'static str {
 mod tests {
     use super::*;
 
+    /// The busiest index bucket must leave room.
+    ///
+    /// [`build_index`] already panics during const evaluation if a bucket
+    /// overflows, so an overflow is a build break rather than a silently
+    /// truncated table. But a build break at the moment somebody adds a row is
+    /// a poor place to discover there was no margin, so this reports the
+    /// margin while there still is one.
+    #[test]
+    fn the_busiest_decode_bucket_has_headroom() {
+        let busiest = INDEX.iter().map(|b| b.len as usize).max().unwrap_or(0);
+        println!("busiest bucket: {busiest} of {BUCKET_CAP}");
+        assert!(
+            busiest + 16 <= BUCKET_CAP,
+            "the busiest decode bucket holds {busiest} of {BUCKET_CAP} rows: \
+             raise BUCKET_CAP before adding more"
+        );
+    }
+
     /// Every row must be reachable: the index buckets on bits 28:25, and a row
     /// that no bucket accepted would be an instruction the table declares and
     /// `decode` can never return.
@@ -1563,6 +1870,52 @@ mod tests {
             (0x9ac02000, Op::Lslv),
             (0x5ac00000, Op::Rbit),
             (0xdac00c00, Op::RevX),
+            // The scalar floating-point rows, every word below assembled by
+            // `llvm-mc -triple=aarch64` rather than derived from the masks
+            // here — which is the only way this test says anything the table
+            // does not already say about itself.
+            (0x1e204020, Op::Fmov),     // fmov s0, s1
+            (0x1e20c0a4, Op::Fabs),     // fabs s4, s5
+            (0x1e6140e6, Op::Fneg),     // fneg d6, d7
+            (0x1e21c128, Op::Fsqrt),    // fsqrt s8, s9
+            (0x1e22c020, Op::Fcvt),     // fcvt d0, s1
+            (0x1e23c020, Op::Fcvt),     // fcvt h0, s1
+            (0x1e244020, Op::Frintn),   // frintn s0, s1
+            (0x1e674020, Op::Frintx),   // frintx d0, d1
+            (0x1e210820, Op::Fmul),     // fmul s0, s1, s2
+            (0x1e622820, Op::Fadd),     // fadd d0, d1, d2
+            (0x1e628820, Op::Fnmul),    // fnmul d0, d1, d2
+            (0x1f020c20, Op::Fmadd),    // fmadd s0, s1, s2, s3
+            (0x1f628c20, Op::Fnmsub),   // fnmsub d0, d1, d2, d3
+            (0x1e212000, Op::Fcmp),     // fcmp s0, s1
+            (0x1e602008, Op::FcmpZero), // fcmp d0, #0.0
+            (0x1e212010, Op::Fcmpe),    // fcmpe s0, s1
+            (0x1e210403, Op::Fccmp),    // fccmp s0, s1, #3, eq
+            (0x1e22cc20, Op::Fcsel),    // fcsel s0, s1, s2, gt
+            (0x1e2e1000, Op::FmovImm),  // fmov s0, #1.0
+            (0x1e200020, Op::Fcvtns),   // fcvtns w0, s1
+            (0x1e220020, Op::Scvtf),    // scvtf s0, w1
+            (0x1e260020, Op::FmovToGp), // fmov w0, s1
+            (0x1e270020, Op::FmovToFp), // fmov s0, w1
+            // The pair that decides `rmode == 01` is a rounding direction and
+            // not a register half. Keying on `rmode` alone made every `FCVTP`
+            // UNDEFINED, which is what the llvm-mc cross-check found.
+            (0x1e280020, Op::Fcvtps),     // fcvtps w0, s1
+            (0x9eae0020, Op::FmovHiToGp), // fmov x0, v1.d[1]
+            (0x9eaf0020, Op::FmovGpToHi), // fmov v0.d[1], x1
+            (0x1e380020, Op::Fcvtzs),     // fcvtzs w0, s1
+            (0x1e02fc20, Op::ScvtfFix),   // scvtf s0, w1, #1
+            (0x1e188020, Op::FcvtzsFix),  // fcvtzs w0, s1, #32
+            (0x1c000000, Op::LdrLitV),    // ldr s0, .
+            (0x3d800420, Op::StrVImm),    // str q0, [x1, #16]
+            (0x3dc00420, Op::LdrVImm),    // ldr q0, [x1, #16]
+            (0xbc1fc020, Op::SturV),      // stur s0, [x1, #-4]
+            (0xfc408420, Op::LdrVPost),   // ldr d0, [x1], #8
+            (0x3c810c20, Op::StrVPre),    // str q0, [x1, #16]!
+            (0xfc227820, Op::StrVReg),    // str d0, [x1, x2, lsl #3]
+            (0x2c810440, Op::StpVPost),   // stp s0, s1, [x2], #8
+            (0xad010440, Op::StpVOff),    // stp q0, q1, [x2, #32]
+            (0xadc10440, Op::LdpVPre),    // ldp q0, q1, [x2, #32]!
         ];
         for (word, op) in cases {
             let insn =

@@ -97,6 +97,15 @@ pub mod ec {
     /// A trapped `WFI` or `WFE`. Not raised here; named because the bit
     /// pattern is easy to confuse with `UNKNOWN`.
     pub const WF: u64 = 0x01;
+    /// An access to SIMD or floating-point functionality that `CPACR_EL1.FPEN`
+    /// traps.
+    ///
+    /// **Not** `UNKNOWN`: a guest whose `CPACR_EL1` still has its reset value
+    /// takes this on its first `FADD`, and Linux's lazy FPU state switching is
+    /// built on telling this exception class apart from an undefined
+    /// instruction. Reporting `UNKNOWN` instead would make an FP-using process
+    /// die with SIGILL rather than get its registers restored.
+    pub const FP_ACCESS: u64 = 0x07;
     /// `SVC` executed in AArch64 state.
     pub const SVC64: u64 = 0x15;
     /// A trapped `MRS`, `MSR` or system instruction.
@@ -271,6 +280,14 @@ sysregs! {
     3 0  1 0 1 Actlr        "actlr_el1"   El1Rw "implementation-defined auxiliary control";
     3 0  1 0 2 Cpacr        "cpacr_el1"   El1Rw "which coprocessor and SIMD accesses EL0 and EL1 may make";
 
+    // -- floating point ------------------------------------------------------
+    //
+    // Both are `El0Rw`: unprivileged code sets its own rounding mode and reads
+    // its own sticky flags, which is what makes `fenv.h` work without a system
+    // call.
+    3 3  4 4 0 Fpcr         "fpcr"        El0Rw "the floating-point control register: rounding, flushing and the default NaN";
+    3 3  4 4 1 Fpsr         "fpsr"        El0Rw "the floating-point status register: the cumulative exception flags";
+
     // -- translation ---------------------------------------------------------
     3 0  2 0 0 Ttbr0        "ttbr0_el1"   El1Rw "the base of the low half's translation table";
     3 0  2 0 1 Ttbr1        "ttbr1_el1"   El1Rw "the base of the high half's translation table";
@@ -378,6 +395,10 @@ pub struct SysRegs {
     pub tpidrro_el0: u64,
     /// `MDSCR_EL1`.
     pub mdscr: u64,
+    /// `FPCR`.
+    pub fpcr: u64,
+    /// `FPSR`.
+    pub fpsr: u64,
     /// Bumped by anything that invalidates a cached translation, so the TLB
     /// beside this can drop its entries without being reached into.
     ///
@@ -445,6 +466,12 @@ impl SysRegs {
             tpidr_el0: 0,
             tpidrro_el0: 0,
             mdscr: 0,
+            // DDI 0487: `FPCR` resets to an architecturally UNKNOWN value.
+            // Zero is round-to-nearest, no flushing and NaN propagation on —
+            // the IEEE default, and the state a guest that never writes
+            // `FPCR` is entitled to assume nothing about but always gets here.
+            fpcr: 0,
+            fpsr: 0,
             translation_gen: 0,
         }
     }
@@ -479,6 +506,29 @@ impl SysRegs {
             self.sp_el1 = value;
         } else {
             self.sp_el0 = value;
+        }
+    }
+
+    /// Whether an access to SIMD or floating-point functionality traps.
+    ///
+    /// DDI 0487 D: `CPACR_EL1.FPEN` (bits 21:20) is `0b00` or `0b10` to trap
+    /// at both EL0 and EL1, `0b01` to trap at EL0 only, and `0b11` to trap
+    /// neither. Two encodings meaning the same thing is not a transcription
+    /// error — the architecture allocates `0b10` that way — and writing this
+    /// as `fpen != 0b11` would get the EL0-only case wrong in the direction
+    /// that lets an unprivileged process use registers the kernel has not
+    /// saved for it.
+    ///
+    /// `CPACR_EL1` resets to zero, so a guest takes this trap on its first
+    /// floating-point instruction unless it enabled access first. That is the
+    /// architecture and not an inconvenience: it is how a kernel knows a
+    /// process has started using the FPU.
+    #[must_use]
+    pub const fn fp_access_trapped(&self) -> bool {
+        match (self.cpacr >> 20) & 3 {
+            0b01 => matches!(self.el, El::El0),
+            0b11 => false,
+            _ => true,
         }
     }
 
