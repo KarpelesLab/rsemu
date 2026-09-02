@@ -680,7 +680,7 @@ fn the_board_boots_a_guest_on_rsemus_own_firmware() {
     // The diskette write and the block move. Bay 0 holds the boot disk here, so
     // the diskette is blank: whatever the read-back answers with, it is not
     // something that was already on the medium.
-    check_write_and_block_move(&m, &[0u8; 512]);
+    check_write_and_block_move(&m, &hosts, &[0u8; 512], &[0u8; 512]);
 
     // And the fixed-disk write, against the drive's **medium** — the standard
     // `tests/pc_at_ide.rs` sets, and reachable here because `ata::bays`
@@ -738,26 +738,16 @@ fn the_board_boots_a_guest_on_rsemus_own_firmware() {
         "the boot sector's greeting never reached the text page"
     );
 
-    // An AT reads ones off an unterminated bus and never faults — except that
-    // this board's `pc.pmc` answers `Protected` for an address inside a PAM
-    // window with no region under it, instead of falling through to the
-    // space's `unassigned = read-as-ones`. The option-ROM scan walks
-    // `0xc0000-0xdffff`, and `0xd0000-0xdffff` is exactly that: a window the
-    // bridge decodes and nothing populates. Sixteen 2 KiB steps, one word
-    // each, is thirty-two bytes and no more. Bounded rather than asserted at
-    // zero, so a fix on the device side does not fail this test.
-    assert!(
-        faults <= 32,
-        "the memory map refused {faults} accesses, last at {last:08x}: more than \
-         the option-ROM scan's own"
+    // An AT reads ones off an unterminated bus and never faults, and this board
+    // does not either: `unassigned = read-as-ones` covers every address the
+    // firmware touches that nothing answers, the option-ROM scan's walk through
+    // the unpopulated half of `0xc0000-0xdffff` included. Zero rather than a
+    // bound, because a refused access here is a hole in the memory map and the
+    // number that says so is not "few".
+    assert_eq!(
+        faults, 0,
+        "the memory map refused {faults} accesses, last at {last:08x}"
     );
-    if faults > 0 {
-        assert!(
-            (0xd_0000..0xe_0000).contains(&last),
-            "the last refused access at {last:08x} is not in the unpopulated \
-             half of the option-ROM window"
-        );
-    }
 }
 
 /// The same boot, off the **diskette**, through the µPD765 and the 8237.
@@ -771,7 +761,7 @@ fn the_board_boots_a_guest_on_rsemus_own_firmware() {
 /// own the same way.
 #[test]
 fn the_board_boots_off_the_diskette_too() {
-    let (mut m, cpu, _hosts) = board_from(false, Some(disk_image(false)));
+    let (mut m, cpu, hosts) = board_from(false, Some(disk_image(false)));
     m.run_for(GlobalTime::from_nanos(1_000_000_000))
         .expect("the machine runs");
 
@@ -835,7 +825,7 @@ fn the_board_boots_off_the_diskette_too() {
     // lands on held [`stamp`] before, which is what makes the read-back a claim
     // about the medium rather than about the controller's buffer: a write that
     // never reached the image would answer with that stamp.
-    check_write_and_block_move(&m, &stamp(WRITE_LBA));
+    check_write_and_block_move(&m, &hosts, &stamp(WRITE_LBA), &stamp(WRITE_LBA + 1));
 
     // There is no fixed disk on this board, and the firmware says so rather
     // than pretending: `INT 13h AH=03h` with `DL = 0x80` comes back with carry
@@ -856,28 +846,35 @@ fn the_board_boots_off_the_diskette_too() {
 
 /// What the guest got out of `INT 13h AH=03h` and `INT 15h AH=87h`.
 ///
-/// `before` is what the diskette sector held when the machine was built.
+/// `before` is what the diskette sector held when the machine was built, and
+/// `neighbour` what the sector after it held — the two boards this runs on put
+/// different images in the drive.
 ///
-/// # Why a read-back is a check on the medium
+/// # Against the medium, not against a read-back
 ///
 /// `tests/pc_at_ide.rs` compares a written sector against the drive's backing
 /// store rather than against anything the device model chose to answer with,
-/// and that is the standard. It is reachable there because `ata::bays` publishes
-/// the medium as a host object; `pc.fdc` publishes nothing, its `contents()` is
-/// only reachable from whoever constructed it, and `Bindings::bind` refuses a
-/// second binding for a class `rsemu::dev::pc::bind` has already claimed — so a
-/// test cannot get a handle on the controller this board built.
+/// and that is the standard. `pc.fdc` reaches it the same way `ata.disk` does:
+/// [`fdc::drives`](rsemu::dev::pc::fdc::drives) is a named rendezvous in the
+/// build's host objects, the controller files itself under the `drive` property
+/// (`fd0` here, which is the default `machines/pc-at.machine` takes), and this
+/// looks it up afterwards. A `Bindings` that refuses a second binding for
+/// `pc.fdc` is no longer in the way, because nothing has to hold the object the
+/// board built.
 ///
-/// What is left is still a claim about the medium rather than about a buffer,
-/// for a reason specific to this model and worth writing down: `pc.fdc` rebuilds
-/// its sector buffer from the image at the start of *every* transfer, so the
-/// buffer a write filled is gone by the time the read that follows runs. A read
-/// that answers with the pattern is the image answering. The two failures this
-/// would actually catch — the 8237 programmed for the wrong direction, so the
-/// "write" reads the disk into the guest's buffer instead, and a write that
-/// stops at the controller and never reaches the image — both leave `before` on
-/// the medium, and the assertion below is that `before` is not what came back.
-fn check_write_and_block_move(m: &Machine, before: &[u8]) {
+/// The read-back is still asserted, because it is a claim of its own — that
+/// `INT 13h AH=02h` reads what `AH=03h` wrote — but it is no longer the *only*
+/// claim, and it never was the strong one: the two failures worth catching are
+/// the 8237 programmed for the wrong direction, so the "write" reads the disk
+/// into the guest's buffer instead, and a write that stops at the controller
+/// and never reaches the image. Both leave `before` on the medium, which is
+/// exactly what the medium is now checked for.
+fn check_write_and_block_move(
+    m: &Machine,
+    hosts: &rsemu::core::hosts::HostObjects,
+    before: &[u8],
+    neighbour: &[u8],
+) {
     let want = pattern();
     assert_ne!(
         want, before,
@@ -897,9 +894,32 @@ fn check_write_and_block_move(m: &Machine, before: &[u8]) {
     let got: Vec<u8> = (0..512).map(|i| peek(m, u64::from(READBACK) + i)).collect();
     assert_eq!(
         got, want,
-        "the sector read back off the diskette is not the one the guest wrote: \
-         the write never reached the medium"
+        "the sector read back off the diskette is not the one the guest wrote"
     );
+
+    // And the medium itself, which is the claim the read-back cannot make.
+    let drive = rsemu::dev::pc::fdc::drives::get(hosts, "fd0")
+        .expect("no other host object claimed the name")
+        .expect("the controller filed itself under the default drive name");
+    let image = drive.contents().expect("a controller is filed there");
+    assert_eq!(
+        drive.geometry(),
+        Some((80, 2, 18)),
+        "a 1.44 MB diskette, which is what the LBA arithmetic below assumes"
+    );
+    let at = (WRITE_LBA * 512) as usize;
+    assert_eq!(
+        &image[at..at + 512],
+        &want[..],
+        "the sector on the diskette image is not the one the guest wrote: \
+         the write stopped at the controller"
+    );
+    assert_eq!(
+        &image[at + 512..at + 1024],
+        neighbour,
+        "the write ran past its own sector"
+    );
+    assert_eq!(drive.is_dirty(), Some(true), "and the medium says it moved");
 
     // `INT 15h AH=87h`, out and back. `EXT_TARGET` is above the first megabyte,
     // so nothing in this boot sector could have put the pattern there by any
@@ -942,15 +962,16 @@ fn check_write_and_block_move(m: &Machine, before: &[u8]) {
     );
 }
 
-/// A key typed at the 8042 comes back out of `INT 16h` as a character.
+/// Keys typed at the 8042 come back out of `INT 16h` as characters.
 ///
 /// This is the half of the firmware that has nothing to do with the disk:
 /// `INT 09h` takes the byte off port 0x60, decodes it against the set-1 table
 /// and puts scan code and character in the BDA's ring; `INT 16h` blocks in a
 /// `HLT` loop until one is there. None of it can be tested without a running
-/// machine, an unmasked IRQ1 and a guest that asks.
+/// machine, an unmasked IRQ1 and a guest that asks — and two keys rather than
+/// one, because the interesting failure is the *second* interrupt.
 #[test]
-fn a_key_typed_at_the_8042_reaches_the_guest_through_int_16h() {
+fn keys_typed_at_the_8042_reach_the_guest_through_int_16h() {
     use rsemu::host::chardev::ports;
 
     let (mut m, _cpu, hosts) = board(true);
@@ -967,20 +988,21 @@ fn a_key_typed_at_the_8042_reaches_the_guest_through_int_16h() {
     );
 
     // Set 2, which is what an AT keyboard sends and what `pc.kbc` carries:
-    // `0x33` is the `H` key going down. The controller translates it to set 1
-    // on the way to the output buffer, because POST turned translation on.
+    // `0x33` is the `H` key and `0x43` the `I` key, each followed by the `0xf0`
+    // break prefix and the code again for the release. The controller
+    // translates all of it to set 1 on the way to the output buffer, because
+    // POST turned translation on, and `INT 09h` drops the breaks.
     //
-    // **One key, not two, and that is a device bug rather than a firmware
-    // one.** `pc.kbc`'s `read_data` clears `OBF` and immediately refills the
-    // output buffer from the keyboard's queue *without* re-driving `IRQ1`, so
-    // the line never falls between two bytes and an edge-triggered 8259A —
-    // which is what `ICW1` asks for and what a PC has — never sees a second
-    // edge. Measured on this test: after the first key the status port reads
-    // `0x05` (a byte waiting) with the master's `IRR` at `0x00` (nothing
-    // pending). Feed two keys here and the second never arrives. When that is
-    // fixed, this test should feed a make/break pair for each of two keys and
-    // assert both characters.
-    keyboard.feed(&[0x33]);
+    // **Two keys, which is the point.** One key would pass on a controller that
+    // announced the first byte and then went silent: `IRQ1` is a level derived
+    // from `OBF` and the 8259A's input for it is edge triggered, so a
+    // controller that refilled its output buffer in the same access that
+    // emptied it would never give the line the falling edge the second byte's
+    // rise needs. `pc.kbc` refills on its own clock's tick instead — one
+    // byte-time later, as the serial line does — and this is the whole-machine
+    // check that it works: six bytes in, two characters out, through the
+    // 8259A, `INT 09h`, the BDA ring and `INT 16h`.
+    keyboard.feed(&[0x33, 0xf0, 0x33, 0x43, 0xf0, 0x43]);
     m.run_for(GlobalTime::from_nanos(40_000_000))
         .expect("the machine runs");
 
@@ -992,8 +1014,8 @@ fn a_key_typed_at_the_8042_reaches_the_guest_through_int_16h() {
         }
     }
     assert!(
-        page.iter().any(|line| line == "h"),
-        "the key never came back out of INT 16h: the text page is {page:?}"
+        page.iter().any(|line| line == "hi"),
+        "both keys did not come back out of INT 16h: the text page is {page:?}"
     );
 }
 
