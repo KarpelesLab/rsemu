@@ -41,8 +41,8 @@
 //! that are **not** this project:
 //!
 //! 1. **`rustc`'s constant evaluator** as a floating-point oracle. Each
-//!    expectation in `fp_arith.rs`, `fp_random.rs` and `fp_convert.rs` is
-//!    computed on the host
+//!    expectation in `fp_arith.rs`, `fp_random.rs`, `fp_convert.rs` and
+//!    `fp_natural.rs` is computed on the host
 //!    at compile time by `rustc_apfloat` — a port of LLVM's `APFloat`, sharing
 //!    no code and no authorship with `src/float` — and the same expression is
 //!    computed again at run time by the guest, where `black_box` forces real
@@ -63,6 +63,41 @@
 //! and `fp_rules.rs` says so on every case. Those are directed tests that
 //! happen to run in a guest, not conformance evidence, and this file does not
 //! pretend otherwise.
+//!
+//! # Advanced SIMD, and where its oracle stops
+//!
+//! `fp_natural.rs` is the second guest built around source (2), and it is the
+//! one that could not exist before the vector instructions did. The other
+//! floating-point guests route every operand through `black_box` as a bit
+//! pattern and never write a floating-point literal, because LLVM materialises
+//! `0.0` with `MOVI Dd, #0` — an Advanced SIMD encoding — and vectorises any
+//! loop long enough to be worth it. `fp_natural.rs` removes both contortions:
+//! literals are literals, the arrays are long, and the vectoriser is left
+//! alone. For the encodings LLVM then chooses, the oracle is genuinely two
+//! independent computations of the same function — a vectorised loop against
+//! `rustc_apfloat` evaluating the scalar one — and it covers `MOVI`, `DUP`,
+//! `UMOV`, `ADDV`, the lanewise arithmetic and compares, `USHLL`/`UADDW`,
+//! `EXT`, `REV64` and both conversion directions.
+//!
+//! It stops there, and the boundary is worth naming rather than blurring:
+//!
+//! * **Only what the compiler emits.** `TBL`/`TBX`, the permutes, `LD2`–`LD4`,
+//!   the reductions other than `ADDV`, the `MOVI` shift and `MSL` forms, `INS`
+//!   and `SMOV` — nothing in ordinary Rust produces them, so nothing here is
+//!   an independent check of them. Their tests are directed ones in
+//!   `super::tests`, written from DDI 0487, and they prove that two parts of
+//!   one head agree and nothing more.
+//! * **Only where the vectoriser preserves the operation order.** It will not
+//!   reassociate floating point, which is exactly why a vectorised loop and a
+//!   scalar one must agree bit for bit — but it also means no floating-point
+//!   vector *reduction* is ever produced, so `FADDP`, `FMAXV` and their
+//!   relatives have no oracle here either.
+//! * **Decode, separately.** The table was diffed against `llvm-mc` over
+//!   sampled words in the Advanced SIMD and structure-load encoding spaces,
+//!   comparing not the disassembly but whether the *interpreter* accepts the
+//!   word at all. Over 40 000 words of data processing and 30 000 of loads and
+//!   stores, nothing this core accepts is rejected by `llvm-mc`. That is a
+//!   check on the masks, and it says nothing about the semantics.
 //!
 //! # Running it
 //!
@@ -138,7 +173,8 @@ const ACCESS_LIMIT: u64 = 40_000_000;
 ///
 /// **This list is empty.** At the commit that added this file, all six
 /// binaries passed — 12 000 differentially-checked floating-point vectors
-/// among them.
+/// among them — and it stayed empty when the seventh, `fp_natural`, arrived
+/// with the Advanced SIMD slice.
 const LEDGER: &[(&str, &str)] = &[];
 
 // ---------------------------------------------------------------------------

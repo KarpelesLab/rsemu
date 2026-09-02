@@ -671,10 +671,18 @@ cpu-arm-aprofile = []
 # hosts and in a browser (ROADMAP.md 9.1). That is why this feature depends on
 # `float`.
 #
-# No Advanced SIMD (the *vector* instructions), no FEAT_FP16 arithmetic, no
-# EL2/EL3, no AArch32, no generic timer: each is reported absent through the ID
-# registers rather than silently missing. Adds no dependencies and is
-# `no_std + alloc`.
+# **Advanced SIMD** is the vector half of the same register file: the lanewise
+# integer and floating-point operations, the lane moves, the permutes, the
+# shifts, the reductions and the `LD1`-`LD4` structure accesses -- the slice
+# that lets ordinary compiled floating-point code run, starting with the
+# `MOVI Dd, #0` LLVM uses to materialise a zero. Its arithmetic is the scalar
+# arithmetic applied per lane, so it too goes through `float`.
+#
+# Absent, and reported absent through the ID registers rather than silently
+# missing: the saturating and rounding SIMD arithmetic (and therefore
+# `FPSR.QC`), the reciprocal-estimate family, polynomial multiply, FEAT_FP16
+# arithmetic, EL2/EL3, AArch32, and the generic timer. Adds no dependencies and
+# is `no_std + alloc`.
 cpu-arm-a64 = ["float"]
 
 # The `a64-mini` board (machines/a64-mini.machine plus the classes it names): a

@@ -29,11 +29,12 @@
 use crate::core::exec::{Access as ExitAccess, Exit, ExitMask, ExitReason};
 use crate::core::space::{AddressSpace, MemAttrs};
 use crate::core::value::Width;
-use crate::float::{Flags, Round};
+use crate::float::{Env, Flags, Round};
 
 use super::fp;
 use super::isa::{self, Fmt, LsAccess, Nzcv, Op, ShiftKind};
 use super::mmu::{self, Access, Tlb};
+use super::simd::{self, Arrangement, FpCmp};
 use super::sysreg::{self, El, SysReg, SysRegs, VectorKind, daif, ec, sctlr};
 use super::{Config, Lines};
 
@@ -655,14 +656,20 @@ impl<'a> Exec<'a> {
     fn execute(&mut self) -> Result<(), Trap> {
         let word = self.fetch()?;
         let insn = isa::decode(word, self.cfg.features).ok_or_else(Trap::undefined)?;
-        if insn.feat == isa::Feat::Fp {
+        if insn.feat.is_simd_fp() {
             // One check for the whole family, keyed off the table's own
             // feature column: every SIMD&FP encoding traps here and nothing
             // else does, so there is no list to keep in step with the rows.
+            // `CPACR_EL1.FPEN` is a trap on the *register file*, which is why
+            // it covers Advanced SIMD and scalar floating point alike.
             if self.st.sys.fp_access_trapped() {
                 return Err(self.fp_trap());
             }
-            return self.fp_execute(word, insn.op, insn.fmt);
+            return if insn.feat == isa::Feat::AdvSimd {
+                self.simd_execute(word, insn.op, insn.fmt)
+            } else {
+                self.fp_execute(word, insn.op, insn.fmt)
+            };
         }
         if insn.fmt.is_load_store() {
             return self.load_store(word, insn.fmt);
@@ -772,6 +779,14 @@ impl<'a> Exec<'a> {
                 }
                 let r = isa::immr(word);
                 let s = isa::imms(word);
+                // DDI 0487 C6: the 32-bit variant requires `immr<5>` and
+                // `imms<5>` to be zero. `DecodeBitMasks` does not catch it —
+                // it only checks that the *element* fits, and a six-bit field
+                // naming bit 55 of a 32-bit register produces an element that
+                // fits perfectly well.
+                if !isa::sf(word) && (r | s) >= 32 {
+                    return Err(Trap::undefined());
+                }
                 let (wmask, tmask) = isa::decode_bit_masks(isa::n_bit(word), s, r, false, width)
                     .ok_or_else(Trap::undefined)?;
                 let src = self.read_reg(n, width, false);
@@ -2161,6 +2176,1342 @@ impl<'a> Exec<'a> {
         let scale = isa::fp_opc_scale(word).ok_or_else(Trap::undefined)?;
         let addr = self.this_pc.wrapping_add(isa::imm19(word) as u64);
         self.fp_access(addr, 1u64 << scale, isa::rd(word), true)
+    }
+
+    // -----------------------------------------------------------------
+    // Advanced SIMD
+    // -----------------------------------------------------------------
+
+    /// The arrangement a `size`:`Q` pair names, or `UNDEFINED`.
+    fn arr_size(&self, word: u32) -> Result<Arrangement, Trap> {
+        Arrangement::from_size(isa::simd_size(word), isa::q(word)).ok_or_else(Trap::undefined)
+    }
+
+    /// The arrangement a floating-point `sz`:`Q` pair names, or `UNDEFINED`.
+    fn arr_sz(&self, word: u32) -> Result<Arrangement, Trap> {
+        Arrangement::from_sz(isa::simd_sz(word), isa::q(word)).ok_or_else(Trap::undefined)
+    }
+
+    /// Write a vector result, zeroing everything above the operand width.
+    ///
+    /// DDI 0487 C1.2.2 again: a 64-bit vector operation clears the top half of
+    /// its destination. Doing it here rather than in each operation is what
+    /// stops one of forty lanewise loops forgetting.
+    fn vset(&mut self, index: u32, arr: Arrangement, value: u128) {
+        let masked = if arr.is_q() {
+            value
+        } else {
+            value & u128::from(u64::MAX)
+        };
+        self.st.v.set_q(index, masked);
+    }
+
+    /// Everything with `Feat::AdvSimd` in the table, once the access check
+    /// passed.
+    fn simd_execute(&mut self, word: u32, op: Op, fmt: Fmt) -> Result<(), Trap> {
+        if fmt.is_struct_load_store() {
+            return self.simd_struct(word, fmt);
+        }
+        match fmt {
+            Fmt::VecModImm => self.simd_mod_imm(word, op),
+            Fmt::VecDupElem | Fmt::VecDupGen | Fmt::VecToGp | Fmt::VecInsGen | Fmt::VecInsElem => {
+                self.simd_copy(word, op, fmt)
+            }
+            Fmt::VecThreeSame => self.simd_three_same(word, op),
+            Fmt::VecThreeSameLog => self.simd_three_same_log(word, op),
+            Fmt::VecThreeSameFp => self.simd_three_same_fp(word, op),
+            Fmt::VecTwoMisc | Fmt::VecCmpZero => self.simd_two_misc(word, op),
+            Fmt::VecTwoMiscFp | Fmt::VecCmpZeroFp => self.simd_two_misc_fp(word, op),
+            Fmt::VecNarrow => self.simd_narrow(word, op),
+            Fmt::VecWiden => self.simd_widen(word),
+            Fmt::VecAcross => self.simd_across(word, op),
+            Fmt::VecAcrossFp => self.simd_across_fp(word, op),
+            Fmt::VecExt => self.simd_ext(word),
+            Fmt::VecTable => self.simd_table(word, op),
+            Fmt::VecShiftImm => self.simd_shift_imm(word, op),
+            Fmt::VecShiftLong => self.simd_shift_long(word, op),
+            Fmt::VecShiftNarrow => self.simd_shift_narrow(word),
+            Fmt::VecThreeDiff | Fmt::VecThreeWide => self.simd_three_diff(word, op, fmt),
+            Fmt::VecByElem => self.simd_by_elem(word, op),
+            Fmt::SimdScalarThree
+            | Fmt::SimdScalarTwo
+            | Fmt::SimdScalarCmpZero
+            | Fmt::SimdScalarPair => self.simd_scalar(word, op, fmt),
+            // Every `Feat::AdvSimd` row is one of the formats above; a new row
+            // with a format nothing here handles is a gap rather than a
+            // silent no-op.
+            _ => Err(Trap::undefined()),
+        }
+    }
+
+    /// The modified-immediate family: `MOVI`, `MVNI`, `FMOV`, and the
+    /// immediate forms of `ORR` and `BIC`.
+    fn simd_mod_imm(&mut self, word: u32, op: Op) -> Result<(), Trap> {
+        let q = isa::q(word);
+        // `FMOV Vd.2D, #imm` has no 64-bit spelling: one double fills half a
+        // register, and the encoding with `Q == 0` is unallocated rather than
+        // meaning `FMOV Dd, #imm` (which is the *scalar* `FMOV`, elsewhere).
+        if op == Op::FmovVecD && !q {
+            return Err(Trap::undefined());
+        }
+        let imm = simd::expand_imm(
+            isa::bit(word, 29),
+            isa::simd_cmode(word),
+            isa::simd_imm8(word),
+        )
+        .ok_or_else(Trap::undefined)?;
+        let wide = if q {
+            u128::from(imm) | (u128::from(imm) << 64)
+        } else {
+            u128::from(imm)
+        };
+        let d = isa::rd(word);
+        let value = match op {
+            Op::MvniShift | Op::MvniShiftH | Op::MvniMsl => !wide,
+            Op::OrrVecImm | Op::OrrVecImmH => self.st.v.q(d) | wide,
+            Op::BicVecImm | Op::BicVecImmH => self.st.v.q(d) & !wide,
+            _ => wide,
+        };
+        let arr = Arrangement {
+            esize: 0,
+            lanes: if q { 16 } else { 8 },
+        };
+        self.vset(d, arr, value);
+        Ok(())
+    }
+
+    /// The element width and lane index an `imm5` field names.
+    ///
+    /// DDI 0487 spells both in one field by the position of its lowest set
+    /// bit — `xxxx1` is a byte, `xxx10` a halfword, and so on — so a zero low
+    /// nibble names no width at all and is `UNDEFINED`.
+    fn imm5_lane(word: u32) -> Result<(u32, u32), Trap> {
+        let imm5 = isa::simd_imm5(word);
+        if imm5 & 0xf == 0 {
+            return Err(Trap::undefined());
+        }
+        let esize = imm5.trailing_zeros();
+        Ok((esize, imm5 >> (esize + 1)))
+    }
+
+    /// `DUP`, `INS`, `UMOV` and `SMOV`: the moves between a lane and either a
+    /// general register or every other lane.
+    fn simd_copy(&mut self, word: u32, op: Op, fmt: Fmt) -> Result<(), Trap> {
+        let (esize, index) = Self::imm5_lane(word)?;
+        let q = isa::q(word);
+        let d = isa::rd(word);
+        let n = isa::rn(word);
+        match fmt {
+            Fmt::VecDupElem | Fmt::VecDupGen => {
+                let arr = Arrangement::from_size(esize, q).ok_or_else(Trap::undefined)?;
+                let source = if fmt == Fmt::VecDupGen {
+                    self.read_reg(n, if esize == 3 { 64 } else { 32 }, false)
+                } else {
+                    simd::elem(self.st.v.q(n), esize, index)
+                };
+                let mut out = 0u128;
+                for lane in 0..arr.lanes {
+                    out = simd::set_elem(out, esize, lane, source);
+                }
+                self.vset(d, arr, out);
+            }
+            Fmt::VecToGp => {
+                let value = simd::elem(self.st.v.q(n), esize, index);
+                let width = if q { 64 } else { 32 };
+                if op == Op::Umov {
+                    // `UMOV` moves a whole lane, so the destination width and
+                    // the element width must agree: only `D` reaches an `X`
+                    // register and nothing narrower may.
+                    if (esize == 3) != q {
+                        return Err(Trap::undefined());
+                    }
+                    self.write_reg(d, width, false, value);
+                } else {
+                    // `SMOV` sign-extends, so a *narrower* element into a
+                    // wider register is the whole point — but there is
+                    // nothing above a doubleword to extend into, and a word
+                    // only extends into an `X`.
+                    if esize == 3 || (esize == 2 && !q) {
+                        return Err(Trap::undefined());
+                    }
+                    self.write_reg(d, width, false, simd::sext(value, esize) as u64);
+                }
+            }
+            // `INS` is the one vector write that merges: it names a lane, and
+            // the rest of the register keeps what it had.
+            Fmt::VecInsGen => {
+                let value = self.read_reg(n, if esize == 3 { 64 } else { 32 }, false);
+                let current = self.st.v.q(d);
+                self.st
+                    .v
+                    .set_q(d, simd::set_elem(current, esize, index, value));
+            }
+            _ => {
+                let index2 = isa::simd_imm4(word) >> esize;
+                let value = simd::elem(self.st.v.q(n), esize, index2);
+                let current = self.st.v.q(d);
+                self.st
+                    .v
+                    .set_q(d, simd::set_elem(current, esize, index, value));
+            }
+        }
+        Ok(())
+    }
+
+    /// Three registers of the same shape, integer.
+    #[allow(clippy::too_many_lines)]
+    fn simd_three_same(&mut self, word: u32, op: Op) -> Result<(), Trap> {
+        let arr = self.arr_size(word)?;
+        // Not every lanewise operation has a doubleword form. The ones that
+        // do are the ones a 64-bit general register could also do — add,
+        // subtract, compare, shift — and the ones that do not are exactly the
+        // ones A64 never gave a scalar spelling: there is no `SMAX X0, X1,
+        // X2`, and `SMAX V0.2D` is reserved rather than an oversight.
+        if arr.esize == 3
+            && matches!(
+                op,
+                Op::MulVec
+                    | Op::MlaVec
+                    | Op::MlsVec
+                    | Op::SmaxVec
+                    | Op::SminVec
+                    | Op::UmaxVec
+                    | Op::UminVec
+                    | Op::SabdVec
+                    | Op::UabdVec
+                    | Op::SmaxpVec
+                    | Op::SminpVec
+                    | Op::UmaxpVec
+                    | Op::UminpVec
+            )
+        {
+            return Err(Trap::undefined());
+        }
+
+        let e = arr.esize;
+        let d = isa::rd(word);
+        let a = self.st.v.q(isa::rn(word));
+        let b = self.st.v.q(isa::rm(word));
+
+        // The permutes read their two sources as a shape rather than
+        // lanewise, so they cannot be a lane function.
+        if let Some(out) = simd_permute(op, arr, a, b) {
+            self.vset(d, arr, out);
+            return Ok(());
+        }
+
+        // A pairwise operation folds *adjacent* lanes of one source, so it is
+        // the same lane function over a different pairing — which is why the
+        // function is chosen once and the loop twice.
+        let pairwise: Option<fn(u32, u64, u64) -> u64> = match op {
+            Op::AddpVec => Some(simd::add),
+            Op::SmaxpVec => Some(simd::smax),
+            Op::SminpVec => Some(simd::smin),
+            Op::UmaxpVec => Some(simd::umax),
+            Op::UminpVec => Some(simd::umin),
+            _ => None,
+        };
+        if let Some(f) = pairwise {
+            let half = arr.lanes / 2;
+            let mut out = 0u128;
+            for lane in 0..arr.lanes {
+                let (source, k) = if lane < half {
+                    (a, lane)
+                } else {
+                    (b, lane - half)
+                };
+                let x = simd::elem(source, e, 2 * k);
+                let y = simd::elem(source, e, 2 * k + 1);
+                out = simd::set_elem(out, e, lane, f(e, x, y));
+            }
+            self.vset(d, arr, out);
+            return Ok(());
+        }
+
+        // `MLA` and `MLS` accumulate into the destination, so they read it.
+        let accumulate = matches!(op, Op::MlaVec | Op::MlsVec);
+        let current = self.st.v.q(d);
+        let f: fn(u32, u64, u64) -> u64 = match op {
+            Op::AddVec => simd::add,
+            Op::SubVec => simd::sub,
+            Op::MulVec | Op::MlaVec | Op::MlsVec => simd::mul,
+            Op::SmaxVec => simd::smax,
+            Op::SminVec => simd::smin,
+            Op::UmaxVec => simd::umax,
+            Op::UminVec => simd::umin,
+            Op::SabdVec => simd::sabd,
+            Op::UabdVec => simd::uabd,
+            Op::CmgtVec => simd::cmgt,
+            Op::CmgeVec => simd::cmge,
+            Op::CmhiVec => simd::cmhi,
+            Op::CmhsVec => simd::cmhs,
+            Op::CmeqVec => simd::cmeq,
+            Op::CmtstVec => simd::cmtst,
+            Op::SshlVec => |e, a, b| simd::shl_reg(e, a, b, true),
+            Op::UshlVec => |e, a, b| simd::shl_reg(e, a, b, false),
+            _ => return Err(Trap::undefined()),
+        };
+        let mut out = 0u128;
+        for lane in 0..arr.lanes {
+            let x = simd::elem(a, e, lane);
+            let y = simd::elem(b, e, lane);
+            let product = f(e, x, y);
+            let value = if accumulate {
+                let acc = simd::elem(current, e, lane);
+                if op == Op::MlaVec {
+                    simd::add(e, acc, product)
+                } else {
+                    simd::sub(e, acc, product)
+                }
+            } else {
+                product
+            };
+            out = simd::set_elem(out, e, lane, value);
+        }
+        self.vset(d, arr, out);
+        Ok(())
+    }
+
+    /// The bitwise three-register operations, which have no element width at
+    /// all — `size` selects the *operation*, not a shape.
+    fn simd_three_same_log(&mut self, word: u32, op: Op) -> Result<(), Trap> {
+        let q = isa::q(word);
+        let d = isa::rd(word);
+        let a = self.st.v.q(isa::rn(word));
+        let b = self.st.v.q(isa::rm(word));
+        let c = self.st.v.q(d);
+        // DDI 0487 C7: the three insert forms differ only in where the mask
+        // comes from and whether it is inverted, so they are one expression
+        // with two parameters rather than three near-identical lines.
+        let value = match op {
+            Op::AndVec => a & b,
+            Op::BicVec => a & !b,
+            Op::OrrVec => a | b,
+            Op::OrnVec => a | !b,
+            Op::EorVec => a ^ b,
+            Op::BslVec => b ^ ((b ^ a) & c),
+            Op::BitVec => c ^ ((c ^ a) & b),
+            Op::BifVec => c ^ ((c ^ a) & !b),
+            _ => return Err(Trap::undefined()),
+        };
+        let arr = Arrangement {
+            esize: 0,
+            lanes: if q { 16 } else { 8 },
+        };
+        self.vset(d, arr, value);
+        Ok(())
+    }
+
+    /// Three registers of the same shape, floating point.
+    fn simd_three_same_fp(&mut self, word: u32, op: Op) -> Result<(), Trap> {
+        let arr = self.arr_sz(word)?;
+        let prec = arr.prec().ok_or_else(Trap::undefined)?;
+        let e = arr.esize;
+        let d = isa::rd(word);
+        let a = self.st.v.q(isa::rn(word));
+        let b = self.st.v.q(isa::rm(word));
+        let current = self.st.v.q(d);
+        let env = fp::env(self.st.sys.fpcr, prec);
+        let mut flags = Flags::NONE;
+        let mut out = 0u128;
+
+        let pairwise = matches!(
+            op,
+            Op::FaddpVec | Op::FmaxpVec | Op::FminpVec | Op::FmaxnmpVec | Op::FminnmpVec
+        );
+        for lane in 0..arr.lanes {
+            let (x, y) = if pairwise {
+                let half = arr.lanes / 2;
+                let (source, k) = if lane < half {
+                    (a, lane)
+                } else {
+                    (b, lane - half)
+                };
+                (
+                    simd::elem(source, e, 2 * k),
+                    simd::elem(source, e, 2 * k + 1),
+                )
+            } else {
+                (simd::elem(a, e, lane), simd::elem(b, e, lane))
+            };
+            let (value, f) = match op {
+                Op::FaddVec | Op::FaddpVec => fp::add(prec, x, y, env),
+                Op::FsubVec => fp::sub(prec, x, y, env),
+                Op::FmulVec => fp::mul(prec, x, y, env),
+                Op::FdivVec => fp::div(prec, x, y, env),
+                Op::FmaxVec | Op::FmaxpVec => fp::max_min(prec, x, y, false, env),
+                Op::FminVec | Op::FminpVec => fp::max_min(prec, x, y, true, env),
+                Op::FmaxnmVec | Op::FmaxnmpVec => fp::max_min_num(prec, x, y, false, env),
+                Op::FminnmVec | Op::FminnmpVec => fp::max_min_num(prec, x, y, true, env),
+                Op::FabdVec => simd::fabd(prec, x, y, env),
+                Op::FmlaVec | Op::FmlsVec => {
+                    let addend = simd::elem(current, e, lane);
+                    let op1 = if op == Op::FmlaVec {
+                        x
+                    } else {
+                        fp::neg(prec, x)
+                    };
+                    fp::mul_add(prec, addend, op1, y, env)
+                }
+                Op::FcmeqVec | Op::FcmgeVec | Op::FcmgtVec | Op::FacgeVec | Op::FacgtVec => {
+                    let kind = match op {
+                        Op::FcmeqVec => FpCmp::Eq,
+                        Op::FcmgeVec => FpCmp::Ge,
+                        Op::FcmgtVec => FpCmp::Gt,
+                        Op::FacgeVec => FpCmp::AbsGe,
+                        _ => FpCmp::AbsGt,
+                    };
+                    let (held, f) = simd::fcompare(prec, x, y, kind, env);
+                    (simd::mask_of(held, e), f)
+                }
+                _ => return Err(Trap::undefined()),
+            };
+            flags |= f;
+            out = simd::set_elem(out, e, lane, value);
+        }
+        self.set_fp_flags(flags);
+        self.vset(d, arr, out);
+        Ok(())
+    }
+
+    /// Two registers, integer: the reversals, the bit counters and the
+    /// compares against zero.
+    #[allow(clippy::too_many_lines)]
+    fn simd_two_misc(&mut self, word: u32, op: Op) -> Result<(), Trap> {
+        let arr = self.arr_size(word)?;
+        let e = arr.esize;
+        let d = isa::rd(word);
+        let a = self.st.v.q(isa::rn(word));
+
+        // `REV64`, `REV32` and `REV16` reverse the elements inside a
+        // container, and the element must be narrower than the container —
+        // `REV16 V0.4S` reverses nothing and is unallocated rather than a
+        // move.
+        let container = match op {
+            Op::Rev64Vec => Some(3),
+            Op::Rev32Vec => Some(2),
+            Op::Rev16Vec => Some(1),
+            _ => None,
+        };
+        if let Some(group) = container {
+            if e >= group {
+                return Err(Trap::undefined());
+            }
+            let lo = simd::rev_within(a as u64, e, group);
+            let hi = simd::rev_within((a >> 64) as u64, e, group);
+            let out = u128::from(lo) | (u128::from(hi) << 64);
+            self.vset(d, arr, out);
+            return Ok(());
+        }
+
+        // `NOT`, `RBIT` and `CNT` operate on **bytes** whatever `size` says,
+        // and `size` is part of what selects them: `NOT` is `00` and `RBIT` is
+        // `01` on the same opcode, so reading it as an element width would
+        // make `RBIT` a halfword operation and reject it. `CNT` is the one of
+        // the three whose row leaves `size` free, so it is the one that has
+        // to check it.
+        let bytes = Arrangement {
+            esize: 0,
+            lanes: arr.lanes << e,
+        };
+        let bytewise = match op {
+            Op::NotVec => Some(!a),
+            Op::RbitVec => Some(
+                u128::from(simd::rbit_bytes(a as u64))
+                    | (u128::from(simd::rbit_bytes((a >> 64) as u64)) << 64),
+            ),
+            Op::CntVec => Some(
+                u128::from(simd::cnt_bytes(a as u64))
+                    | (u128::from(simd::cnt_bytes((a >> 64) as u64)) << 64),
+            ),
+            _ => None,
+        };
+        if let Some(out) = bytewise {
+            if op == Op::CntVec && e != 0 {
+                return Err(Trap::undefined());
+            }
+            self.vset(d, bytes, out);
+            return Ok(());
+        }
+
+        let f: fn(u32, u64) -> u64 = match op {
+            Op::AbsVec => simd::abs,
+            Op::NegVec => simd::neg,
+            Op::ClsVec => simd::cls,
+            Op::ClzVec => simd::clz,
+            Op::CmgtZeroVec => |e, x| simd::cmgt(e, x, 0),
+            Op::CmgeZeroVec => |e, x| simd::cmge(e, x, 0),
+            Op::CmeqZeroVec => |e, x| simd::cmeq(e, x, 0),
+            Op::CmltZeroVec => |e, x| simd::cmgt(e, 0, x),
+            Op::CmleZeroVec => |e, x| simd::cmge(e, 0, x),
+            _ => return Err(Trap::undefined()),
+        };
+        // `CLS` and `CLZ` have no doubleword form: there is no `V0.1D`
+        // arrangement for them and `V0.2D` is unallocated.
+        if matches!(op, Op::ClsVec | Op::ClzVec) && e == 3 {
+            return Err(Trap::undefined());
+        }
+        let mut out = 0u128;
+        for lane in 0..arr.lanes {
+            out = simd::set_elem(out, e, lane, f(e, simd::elem(a, e, lane)));
+        }
+        self.vset(d, arr, out);
+        Ok(())
+    }
+
+    /// Two registers, floating point: the sign operations, the roundings, the
+    /// conversions and the compares against zero.
+    #[allow(clippy::too_many_lines)]
+    fn simd_two_misc_fp(&mut self, word: u32, op: Op) -> Result<(), Trap> {
+        let arr = self.arr_sz(word)?;
+        let prec = arr.prec().ok_or_else(Trap::undefined)?;
+        let e = arr.esize;
+        let bits = arr.bits();
+        let d = isa::rd(word);
+        let a = self.st.v.q(isa::rn(word));
+        let env = fp::env(self.st.sys.fpcr, prec);
+        let mut flags = Flags::NONE;
+        let mut out = 0u128;
+
+        for lane in 0..arr.lanes {
+            let x = simd::elem(a, e, lane);
+            let rint = |mode: Option<Round>, signal| {
+                let env = match mode {
+                    Some(r) => env.round(r),
+                    None => env,
+                };
+                fp::round_int(prec, x, env, signal)
+            };
+            let to_int = |mode: Option<Round>, signed| {
+                let env = match mode {
+                    Some(r) => env.round(r),
+                    None => env,
+                };
+                fp::to_int(prec, x, bits, signed, env)
+            };
+            let compare = |kind| {
+                let (held, f) = simd::fcompare(prec, x, 0, kind, env);
+                (simd::mask_of(held, e), f)
+            };
+            let (value, f) = match op {
+                Op::FabsVec => (fp::abs(prec, x), Flags::NONE),
+                Op::FnegVec => (fp::neg(prec, x), Flags::NONE),
+                Op::FsqrtVec => fp::sqrt(prec, x, env),
+                Op::FrintnVec => rint(Some(Round::TiesEven), false),
+                Op::FrintmVec => rint(Some(Round::TowardNegative), false),
+                Op::FrintpVec => rint(Some(Round::TowardPositive), false),
+                Op::FrintzVec => rint(Some(Round::TowardZero), false),
+                Op::FrintaVec => rint(Some(Round::TiesAway), false),
+                Op::FrintxVec => rint(None, true),
+                Op::FrintiVec => rint(None, false),
+                Op::FcvtnsVec => to_int(Some(Round::TiesEven), true),
+                Op::FcvtnuVec => to_int(Some(Round::TiesEven), false),
+                Op::FcvtmsVec => to_int(Some(Round::TowardNegative), true),
+                Op::FcvtmuVec => to_int(Some(Round::TowardNegative), false),
+                Op::FcvtpsVec => to_int(Some(Round::TowardPositive), true),
+                Op::FcvtpuVec => to_int(Some(Round::TowardPositive), false),
+                Op::FcvtzsVec => to_int(Some(Round::TowardZero), true),
+                Op::FcvtzuVec => to_int(Some(Round::TowardZero), false),
+                Op::FcvtasVec => to_int(Some(Round::TiesAway), true),
+                Op::FcvtauVec => to_int(Some(Round::TiesAway), false),
+                Op::ScvtfVec => fp::from_int(prec, x, bits, true, env),
+                Op::UcvtfVec => fp::from_int(prec, x, bits, false, env),
+                Op::FcmeqZeroVec => compare(FpCmp::Eq),
+                Op::FcmgeZeroVec => compare(FpCmp::Ge),
+                Op::FcmgtZeroVec => compare(FpCmp::Gt),
+                // `FCMLT`/`FCMLE` against zero are the same comparison with
+                // the operands the other way round; zero is its own negation
+                // for this purpose, so no sign flip is needed.
+                Op::FcmltZeroVec => {
+                    let (held, f) = simd::fcompare(prec, 0, x, FpCmp::Gt, env);
+                    (simd::mask_of(held, e), f)
+                }
+                Op::FcmleZeroVec => {
+                    let (held, f) = simd::fcompare(prec, 0, x, FpCmp::Ge, env);
+                    (simd::mask_of(held, e), f)
+                }
+                _ => return Err(Trap::undefined()),
+            };
+            flags |= f;
+            out = simd::set_elem(out, e, lane, value);
+        }
+        self.set_fp_flags(flags);
+        self.vset(d, arr, out);
+        Ok(())
+    }
+
+    /// `XTN`/`XTN2` and `FCVTN`/`FCVTN2`: a result half as wide as its source,
+    /// written into the half of the destination `Q` selects.
+    fn simd_narrow(&mut self, word: u32, op: Op) -> Result<(), Trap> {
+        let (dst, src) = if op == Op::XtnVec {
+            let size = isa::simd_size(word);
+            if size > 2 {
+                return Err(Trap::undefined());
+            }
+            (size, size + 1)
+        } else {
+            let sz = u32::from(isa::simd_sz(word));
+            (1 + sz, 2 + sz)
+        };
+        let lanes = 64 / (8 << dst);
+        let a = self.st.v.q(isa::rn(word));
+        let mut half = 0u128;
+        let mut flags = Flags::NONE;
+        for lane in 0..lanes {
+            let x = simd::elem(a, src, lane);
+            let value = if op == Op::XtnVec {
+                simd::trunc(x, dst)
+            } else {
+                let (from, to) = (prec_of(src)?, prec_of(dst)?);
+                let (value, f) = fp::convert(from, to, x, self.st.sys.fpcr);
+                flags |= f;
+                value
+            };
+            half = simd::set_elem(half, dst, lane, value);
+        }
+        self.set_fp_flags(flags);
+        self.write_half(isa::rd(word), isa::q(word), half);
+        Ok(())
+    }
+
+    /// Write a 64-bit result into the low or high half of a vector register.
+    ///
+    /// The low half zeroes the top — it is an ordinary 64-bit vector write —
+    /// while the high half *merges*, because that is what the `2` in `XTN2`
+    /// means: the instruction exists to fill the other half of a register the
+    /// unsuffixed form already wrote.
+    fn write_half(&mut self, index: u32, high: bool, value: u128) {
+        if high {
+            let current = self.st.v.q(index) & u128::from(u64::MAX);
+            self.st.v.set_q(index, current | (value << 64));
+        } else {
+            self.st.v.set_q(index, value & u128::from(u64::MAX));
+        }
+    }
+
+    /// `FCVTL`/`FCVTL2`: a result twice as wide as its source, read from the
+    /// half of the source `Q` selects.
+    fn simd_widen(&mut self, word: u32) -> Result<(), Trap> {
+        let sz = u32::from(isa::simd_sz(word));
+        let (src, dst) = (1 + sz, 2 + sz);
+        let lanes = 64 / (8 << src);
+        let whole = self.st.v.q(isa::rn(word));
+        let source = if isa::q(word) { whole >> 64 } else { whole };
+        let (from, to) = (prec_of(src)?, prec_of(dst)?);
+        let mut out = 0u128;
+        let mut flags = Flags::NONE;
+        for lane in 0..lanes {
+            let x = simd::elem(source, src, lane);
+            let (value, f) = fp::convert(from, to, x, self.st.sys.fpcr);
+            flags |= f;
+            out = simd::set_elem(out, dst, lane, value);
+        }
+        self.set_fp_flags(flags);
+        self.st.v.set_q(isa::rd(word), out);
+        Ok(())
+    }
+
+    /// A reduction across the lanes, integer.
+    fn simd_across(&mut self, word: u32, op: Op) -> Result<(), Trap> {
+        let arr = self.arr_size(word)?;
+        let e = arr.esize;
+        // A reduction over a doubleword is one lane wide or two, and Arm
+        // allocates neither: `size == 0b11` is reserved and `0b10` needs
+        // `Q == 1` because `2S` would fold a pair, which `ADDP` already does.
+        if e == 3 || (e == 2 && !isa::q(word)) {
+            return Err(Trap::undefined());
+        }
+        let a = self.st.v.q(isa::rn(word));
+        let widening = matches!(op, Op::SaddlvVec | Op::UaddlvVec);
+        let dst = if widening { e + 1 } else { e };
+        let mut acc = if widening { 0 } else { simd::elem(a, e, 0) };
+        let start = u32::from(!widening);
+        for lane in start..arr.lanes {
+            let x = simd::elem(a, e, lane);
+            acc = match op {
+                Op::AddvVec => simd::add(e, acc, x),
+                Op::SmaxvVec => simd::smax(e, acc, x),
+                Op::SminvVec => simd::smin(e, acc, x),
+                Op::UmaxvVec => simd::umax(e, acc, x),
+                Op::UminvVec => simd::umin(e, acc, x),
+                Op::SaddlvVec => simd::add(dst, acc, simd::trunc(simd::sext(x, e) as u64, dst)),
+                Op::UaddlvVec => simd::add(dst, acc, x),
+                _ => return Err(Trap::undefined()),
+            };
+        }
+        self.st.v.write(isa::rd(word), 1u64 << dst, acc);
+        Ok(())
+    }
+
+    /// A reduction across the lanes, floating point.
+    ///
+    /// Only `4S` is allocated: a two-lane reduction is what the scalar
+    /// pairwise `FADDP` is for, and there is no 128-bit `2D` form.
+    fn simd_across_fp(&mut self, word: u32, op: Op) -> Result<(), Trap> {
+        if isa::simd_sz(word) || !isa::q(word) {
+            return Err(Trap::undefined());
+        }
+        let prec = fp::Prec::Single;
+        let env = fp::env(self.st.sys.fpcr, prec);
+        let a = self.st.v.q(isa::rn(word));
+        let mut flags = Flags::NONE;
+        let mut fold = |x: u64, y: u64| -> Result<u64, Trap> {
+            let (value, f) = match op {
+                Op::FmaxvVec => fp::max_min(prec, x, y, false, env),
+                Op::FminvVec => fp::max_min(prec, x, y, true, env),
+                Op::FmaxnmvVec => fp::max_min_num(prec, x, y, false, env),
+                Op::FminnmvVec => fp::max_min_num(prec, x, y, true, env),
+                _ => return Err(Trap::undefined()),
+            };
+            flags |= f;
+            Ok(value)
+        };
+        // DDI 0487's `Reduce` is a *balanced tree*, not a left fold, and for
+        // floating point the two differ: `FPMax` returns its second operand
+        // when the two compare equal, so `+0.0` against `-0.0` — and which of
+        // several NaNs survives — depends on the pairing.
+        let lo = fold(simd::elem(a, 2, 0), simd::elem(a, 2, 1))?;
+        let hi = fold(simd::elem(a, 2, 2), simd::elem(a, 2, 3))?;
+        let acc = fold(lo, hi)?;
+        self.set_fp_flags(flags);
+        self.st.v.write(isa::rd(word), 4, acc);
+        Ok(())
+    }
+
+    /// `EXT`: a register-width window sliding across the pair `Vn`:`Vm`.
+    fn simd_ext(&mut self, word: u32) -> Result<(), Trap> {
+        let q = isa::q(word);
+        let position = u64::from(isa::simd_imm4(word));
+        let bytes = if q { 16 } else { 8 };
+        // With `Q == 0` the window is eight bytes wide, so bit 3 of the
+        // position would index past the pair: the architecture leaves it
+        // unallocated rather than wrapping.
+        if position >= bytes {
+            return Err(Trap::undefined());
+        }
+        let a = self.st.v.q(isa::rn(word));
+        let b = self.st.v.q(isa::rm(word));
+        let mut out = 0u128;
+        for i in 0..bytes {
+            let source = position + i;
+            let byte = if source < bytes {
+                (a >> (8 * source)) & 0xff
+            } else {
+                (b >> (8 * (source - bytes))) & 0xff
+            };
+            out |= byte << (8 * i);
+        }
+        let arr = Arrangement {
+            esize: 0,
+            lanes: u32::try_from(bytes).unwrap_or(8),
+        };
+        self.vset(isa::rd(word), arr, out);
+        Ok(())
+    }
+
+    /// `TBL`/`TBX`: a byte-wise table lookup across up to four registers.
+    fn simd_table(&mut self, word: u32, op: Op) -> Result<(), Trap> {
+        let q = isa::q(word);
+        let len = isa::field(word, 14, 13) + 1;
+        let bytes = if q { 16u64 } else { 8 };
+        let base = isa::rn(word);
+        let index = self.st.v.q(isa::rm(word));
+        let current = self.st.v.q(isa::rd(word));
+        let mut out = 0u128;
+        for i in 0..bytes {
+            let selector = u32::try_from((index >> (8 * i)) & 0xff).unwrap_or(u32::MAX);
+            let value = if selector < 16 * len {
+                // The table wraps at `V31`, which is what lets `TBL` name a
+                // window ending at `V0`.
+                let reg = (base + selector / 16) % 32;
+                (self.st.v.q(reg) >> (8 * (selector % 16))) & 0xff
+            } else if op == Op::TbxVec {
+                (current >> (8 * i)) & 0xff
+            } else {
+                0
+            };
+            out |= value << (8 * i);
+        }
+        let arr = Arrangement {
+            esize: 0,
+            lanes: u32::try_from(bytes).unwrap_or(8),
+        };
+        self.vset(isa::rd(word), arr, out);
+        Ok(())
+    }
+
+    /// The element width an `immh` field names, and the whole `immh:immb`
+    /// value the shift amount is computed from.
+    ///
+    /// `immh == 0b0000` is not a shift at all — it is the modified-immediate
+    /// encoding, which the table matches first — so reaching here with it is
+    /// a decode bug rather than a guest one, and it is still rejected.
+    fn shift_width(word: u32) -> Result<(u32, u32), Trap> {
+        let immhb = isa::simd_immhb(word);
+        let immh = immhb >> 3;
+        if immh == 0 {
+            return Err(Trap::undefined());
+        }
+        Ok((31 - immh.leading_zeros(), immhb))
+    }
+
+    /// Shifts by an immediate that keep the element width.
+    fn simd_shift_imm(&mut self, word: u32, op: Op) -> Result<(), Trap> {
+        let (e, immhb) = Self::shift_width(word)?;
+        let arr = Arrangement::from_size(e, isa::q(word)).ok_or_else(Trap::undefined)?;
+        let bits = arr.bits();
+        let d = isa::rd(word);
+        let a = self.st.v.q(isa::rn(word));
+        let current = self.st.v.q(d);
+        let env = arr
+            .prec()
+            .map(|prec| (prec, fp::env(self.st.sys.fpcr, prec)));
+        let mut flags = Flags::NONE;
+        let mut out = 0u128;
+        for lane in 0..arr.lanes {
+            let x = simd::elem(a, e, lane);
+            let acc = simd::elem(current, e, lane);
+            let value = match op {
+                Op::ShlVec => simd::trunc(x << (immhb - bits), e),
+                Op::SliVec => {
+                    let shift = immhb - bits;
+                    let kept = simd::trunc(u64::MAX << shift, e);
+                    simd::trunc((x << shift) | (acc & !kept), e)
+                }
+                Op::SshrVec | Op::SsraVec | Op::UshrVec | Op::UsraVec | Op::SriVec => {
+                    let shift = 2 * bits - immhb;
+                    let signed = matches!(op, Op::SshrVec | Op::SsraVec);
+                    let shifted = shift_element(x, e, shift, signed);
+                    match op {
+                        Op::SsraVec | Op::UsraVec => simd::add(e, acc, shifted),
+                        Op::SriVec => {
+                            // `SRI Vd.2D, Vn.2D, #64` is a real instruction,
+                            // so the mask is computed by the same shift the
+                            // value went through rather than by `>>`, which
+                            // has no answer at the operand width.
+                            let kept = shift_element(u64::MAX, e, shift, false);
+                            simd::trunc(shifted | (acc & !kept), e)
+                        }
+                        _ => shifted,
+                    }
+                }
+                _ => {
+                    // The fixed-point conversions: `immh:immb` names the
+                    // number of fraction bits rather than a shift, and only
+                    // the 32- and 64-bit element widths carry one.
+                    let Some((prec, env)) = env else {
+                        return Err(Trap::undefined());
+                    };
+                    let fbits = 2 * bits - immhb;
+                    let (value, f) = fixed_convert(prec, op, x, bits, fbits, env)?;
+                    flags |= f;
+                    value
+                }
+            };
+            out = simd::set_elem(out, e, lane, value);
+        }
+        self.set_fp_flags(flags);
+        self.vset(d, arr, out);
+        Ok(())
+    }
+
+    /// `SSHLL`/`USHLL`: a shift left into elements twice as wide, reading the
+    /// half of the source `Q` selects.
+    fn simd_shift_long(&mut self, word: u32, op: Op) -> Result<(), Trap> {
+        let (src, immhb) = Self::shift_width(word)?;
+        if src == 3 {
+            return Err(Trap::undefined());
+        }
+        let dst = src + 1;
+        let bits = 8 << src;
+        let shift = immhb - bits;
+        let lanes = 64 / bits;
+        let whole = self.st.v.q(isa::rn(word));
+        let source = if isa::q(word) { whole >> 64 } else { whole };
+        let mut out = 0u128;
+        for lane in 0..lanes {
+            let x = simd::elem(source, src, lane);
+            let widened = if op == Op::SshllVec {
+                simd::trunc(simd::sext(x, src) as u64, dst)
+            } else {
+                x
+            };
+            out = simd::set_elem(out, dst, lane, simd::trunc(widened << shift, dst));
+        }
+        self.st.v.set_q(isa::rd(word), out);
+        Ok(())
+    }
+
+    /// `SHRN`/`SHRN2`: a shift right into elements half as wide.
+    fn simd_shift_narrow(&mut self, word: u32) -> Result<(), Trap> {
+        let (dst, immhb) = Self::shift_width(word)?;
+        if dst == 3 {
+            return Err(Trap::undefined());
+        }
+        let src = dst + 1;
+        let bits = 8 << dst;
+        let shift = 2 * bits - immhb;
+        let lanes = 64 / bits;
+        let a = self.st.v.q(isa::rn(word));
+        let mut half = 0u128;
+        for lane in 0..lanes {
+            let x = simd::elem(a, src, lane);
+            half = simd::set_elem(half, dst, lane, simd::trunc(x >> shift, dst));
+        }
+        self.write_half(isa::rd(word), isa::q(word), half);
+        Ok(())
+    }
+
+    /// The widening three-register operations: `Vd` is twice the width of the
+    /// narrow sources, and `Q` selects which half of them to read.
+    fn simd_three_diff(&mut self, word: u32, op: Op, fmt: Fmt) -> Result<(), Trap> {
+        let src = isa::simd_size(word);
+        if src > 2 {
+            return Err(Trap::undefined());
+        }
+        let dst = src + 1;
+        let lanes = 64 / (8 << src);
+        let offset = if isa::q(word) { lanes } else { 0 };
+        let d = isa::rd(word);
+        let a = self.st.v.q(isa::rn(word));
+        let b = self.st.v.q(isa::rm(word));
+        let current = self.st.v.q(d);
+        let signed = matches!(
+            op,
+            Op::SaddlVec
+                | Op::SaddwVec
+                | Op::SsublVec
+                | Op::SsubwVec
+                | Op::SmullVec
+                | Op::SmlalVec
+                | Op::SmlslVec
+        );
+        let widen = |x: u64| {
+            if signed {
+                simd::trunc(simd::sext(x, src) as u64, dst)
+            } else {
+                x
+            }
+        };
+        let mut out = 0u128;
+        for lane in 0..lanes {
+            // The wide form reads `Vn` at the destination width and `Vm` at
+            // the source width, which is the whole difference between
+            // `UADDL` and `UADDW`.
+            let x = if fmt == Fmt::VecThreeWide {
+                simd::elem(a, dst, lane)
+            } else {
+                widen(simd::elem(a, src, lane + offset))
+            };
+            let y = widen(simd::elem(b, src, lane + offset));
+            let value = match op {
+                Op::SaddlVec | Op::UaddlVec | Op::SaddwVec | Op::UaddwVec => simd::add(dst, x, y),
+                Op::SsublVec | Op::UsublVec | Op::SsubwVec | Op::UsubwVec => simd::sub(dst, x, y),
+                Op::SmullVec | Op::UmullVec => simd::mul(dst, x, y),
+                Op::SmlalVec | Op::UmlalVec => {
+                    simd::add(dst, simd::elem(current, dst, lane), simd::mul(dst, x, y))
+                }
+                Op::SmlslVec | Op::UmlslVec => {
+                    simd::sub(dst, simd::elem(current, dst, lane), simd::mul(dst, x, y))
+                }
+                _ => return Err(Trap::undefined()),
+            };
+            out = simd::set_elem(out, dst, lane, value);
+        }
+        self.st.v.set_q(d, out);
+        Ok(())
+    }
+
+    /// An operation whose second source is one element of a register, chosen
+    /// by an index the encoding spells across three separate bits.
+    fn simd_by_elem(&mut self, word: u32, op: Op) -> Result<(), Trap> {
+        let floating = matches!(op, Op::FmulElem | Op::FmlaElem | Op::FmlsElem);
+        let l = u32::from(isa::bit(word, 21));
+        let m_bit = u32::from(isa::bit(word, 20));
+        let h = u32::from(isa::bit(word, 11));
+        let (arr, index, m) = if floating {
+            let arr = self.arr_sz(word)?;
+            if isa::simd_sz(word) {
+                // A doubleword element leaves only two of them to index, so
+                // `L` has nothing to say and must be zero.
+                if l != 0 {
+                    return Err(Trap::undefined());
+                }
+                (arr, h, isa::rm(word))
+            } else {
+                (arr, (h << 1) | l, isa::rm(word))
+            }
+        } else {
+            match isa::simd_size(word) {
+                // A halfword element has eight of them, so the index needs
+                // three bits and `M` is one of them — which costs `Vm` its
+                // top bit, and is why `MUL Vd.8H, Vn.8H, V16.H[0]` does not
+                // exist.
+                0b01 => (
+                    self.arr_size(word)?,
+                    (h << 2) | (l << 1) | m_bit,
+                    isa::field(word, 19, 16),
+                ),
+                0b10 => (self.arr_size(word)?, (h << 1) | l, isa::rm(word)),
+                _ => return Err(Trap::undefined()),
+            }
+        };
+        let e = arr.esize;
+        let d = isa::rd(word);
+        let a = self.st.v.q(isa::rn(word));
+        let current = self.st.v.q(d);
+        let y = simd::elem(self.st.v.q(m), e, index);
+        let mut flags = Flags::NONE;
+        let mut out = 0u128;
+        for lane in 0..arr.lanes {
+            let x = simd::elem(a, e, lane);
+            let acc = simd::elem(current, e, lane);
+            let value = match op {
+                Op::MulElem => simd::mul(e, x, y),
+                Op::MlaElem => simd::add(e, acc, simd::mul(e, x, y)),
+                Op::MlsElem => simd::sub(e, acc, simd::mul(e, x, y)),
+                _ => {
+                    let prec = arr.prec().ok_or_else(Trap::undefined)?;
+                    let env = fp::env(self.st.sys.fpcr, prec);
+                    let (value, f) = match op {
+                        Op::FmulElem => fp::mul(prec, x, y, env),
+                        Op::FmlaElem => fp::mul_add(prec, acc, x, y, env),
+                        _ => fp::mul_add(prec, acc, fp::neg(prec, x), y, env),
+                    };
+                    flags |= f;
+                    value
+                }
+            };
+            out = simd::set_elem(out, e, lane, value);
+        }
+        self.set_fp_flags(flags);
+        self.vset(d, arr, out);
+        Ok(())
+    }
+
+    /// The scalar SIMD forms: one lane, and a destination that zeroes the
+    /// rest of its register.
+    fn simd_scalar(&mut self, word: u32, op: Op, fmt: Fmt) -> Result<(), Trap> {
+        let d = isa::rd(word);
+        let n = isa::rn(word);
+        if op == Op::DupElemScalar {
+            let (esize, index) = Self::imm5_lane(word)?;
+            let value = simd::elem(self.st.v.q(n), esize, index);
+            self.st.v.write(d, 1u64 << esize, value);
+            return Ok(());
+        }
+        // Every remaining scalar form is either a doubleword integer
+        // operation — `size` is fixed at `0b11` in the table — or a
+        // floating-point one whose precision is `sz`.
+        let floating = matches!(
+            op,
+            Op::FcmeqScalar
+                | Op::FcmgeScalar
+                | Op::FcmgtScalar
+                | Op::FabdScalar
+                | Op::FcmeqZeroScalar
+                | Op::FcmgeZeroScalar
+                | Op::FcmgtZeroScalar
+                | Op::FcmleZeroScalar
+                | Op::FcmltZeroScalar
+                | Op::FaddpScalar
+                | Op::FmaxpScalar
+                | Op::FminpScalar
+        );
+        let (e, prec) = if floating {
+            let e = 2 + u32::from(isa::simd_sz(word));
+            (e, Some(prec_of(e)?))
+        } else {
+            (3, None)
+        };
+        let bytes = 1u64 << e;
+        let env = prec.map(|p| fp::env(self.st.sys.fpcr, p));
+        let (x, y) = match fmt {
+            Fmt::SimdScalarPair => {
+                let a = self.st.v.q(n);
+                (simd::elem(a, e, 0), simd::elem(a, e, 1))
+            }
+            Fmt::SimdScalarCmpZero => (self.st.v.read(n, bytes), 0),
+            _ => (
+                self.st.v.read(n, bytes),
+                self.st.v.read(isa::rm(word), bytes),
+            ),
+        };
+        let mut flags = Flags::NONE;
+        let value = match op {
+            Op::AddScalar | Op::AddpScalar => simd::add(e, x, y),
+            Op::SubScalar => simd::sub(e, x, y),
+            Op::CmeqScalar | Op::CmeqZeroScalar => simd::cmeq(e, x, y),
+            Op::CmgtScalar | Op::CmgtZeroScalar => simd::cmgt(e, x, y),
+            Op::CmgeScalar | Op::CmgeZeroScalar => simd::cmge(e, x, y),
+            Op::CmhiScalar => simd::cmhi(e, x, y),
+            Op::CmhsScalar => simd::cmhs(e, x, y),
+            Op::CmltZeroScalar => simd::cmgt(e, y, x),
+            Op::CmleZeroScalar => simd::cmge(e, y, x),
+            Op::AbsScalar => simd::abs(e, x),
+            Op::NegScalar => simd::neg(e, x),
+            _ => {
+                let (Some(prec), Some(env)) = (prec, env) else {
+                    return Err(Trap::undefined());
+                };
+                let (value, f) = match op {
+                    Op::FabdScalar => simd::fabd(prec, x, y, env),
+                    Op::FaddpScalar => fp::add(prec, x, y, env),
+                    Op::FmaxpScalar => fp::max_min(prec, x, y, false, env),
+                    Op::FminpScalar => fp::max_min(prec, x, y, true, env),
+                    _ => {
+                        let (kind, swap) = match op {
+                            Op::FcmeqScalar | Op::FcmeqZeroScalar => (FpCmp::Eq, false),
+                            Op::FcmgeScalar | Op::FcmgeZeroScalar => (FpCmp::Ge, false),
+                            Op::FcmgtScalar | Op::FcmgtZeroScalar => (FpCmp::Gt, false),
+                            Op::FcmleZeroScalar => (FpCmp::Ge, true),
+                            Op::FcmltZeroScalar => (FpCmp::Gt, true),
+                            _ => return Err(Trap::undefined()),
+                        };
+                        let (a, b) = if swap { (y, x) } else { (x, y) };
+                        let (held, f) = simd::fcompare(prec, a, b, kind, env);
+                        (simd::mask_of(held, e), f)
+                    }
+                };
+                flags |= f;
+                value
+            }
+        };
+        self.set_fp_flags(flags);
+        self.st.v.write(d, bytes, value);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Advanced SIMD structure loads and stores
+    // -----------------------------------------------------------------
+
+    /// `LD1`–`LD4` and their stores.
+    fn simd_struct(&mut self, word: u32, fmt: Fmt) -> Result<(), Trap> {
+        let single = matches!(fmt, Fmt::LdStStructSingle | Fmt::LdStStructSinglePost);
+        let post = matches!(fmt, Fmt::LdStStructPost | Fmt::LdStStructSinglePost);
+        let n = isa::rn(word);
+        let base = self.read_reg(n, 64, true);
+        let moved = if single {
+            self.simd_struct_single(word, base)?
+        } else {
+            self.simd_struct_multiple(word, base)?
+        };
+        if post {
+            // `Rm == 0b11111` is the immediate form, and the immediate is
+            // *always* the number of bytes the instruction moved — there is
+            // no encoding for any other value, which is why it is computed
+            // rather than decoded.
+            let m = isa::rm(word);
+            let offset = if m == 31 {
+                moved
+            } else {
+                self.read_reg(m, 64, false)
+            };
+            self.write_reg(n, 64, true, base.wrapping_add(offset));
+        }
+        Ok(())
+    }
+
+    /// The multiple-structures form, returning how many bytes it moved.
+    fn simd_struct_multiple(&mut self, word: u32, base: u64) -> Result<u64, Trap> {
+        let (repeats, selem) =
+            isa::struct_shape(isa::field(word, 15, 12)).ok_or_else(Trap::undefined)?;
+        let size = isa::field(word, 11, 10);
+        let q = isa::q(word);
+        // `V0.1D` is a legal *arrangement* here — one doubleword in a 64-bit
+        // register — but only when the structure is one register wide;
+        // interleaving single lanes has nothing to interleave.
+        if size == 3 && !q && selem != 1 {
+            return Err(Trap::undefined());
+        }
+        let ebytes = 1u64 << size;
+        let elements = (if q { 16u64 } else { 8 }) / ebytes;
+        let load = isa::bit(word, 22);
+        let t = isa::rd(word);
+        let mut addr = base;
+        for r in 0..repeats {
+            for e in 0..elements {
+                for s in 0..selem {
+                    let reg = (t + r * selem + s) % 32;
+                    let lane = u32::try_from(e).unwrap_or(0);
+                    if load {
+                        let value = self.load(addr, ebytes)?;
+                        let current = self.st.v.q(reg);
+                        self.st
+                            .v
+                            .set_q(reg, simd::set_elem(current, size, lane, value));
+                    } else {
+                        let value = simd::elem(self.st.v.q(reg), size, lane);
+                        self.store(addr, ebytes, value)?;
+                    }
+                    addr = addr.wrapping_add(ebytes);
+                }
+            }
+        }
+        // A 64-bit load leaves the top half of each destination zero, and
+        // that has to happen *after* the lanes are written rather than
+        // before: the same register may be written twice by one instruction.
+        if load && !q {
+            for r in 0..repeats {
+                for s in 0..selem {
+                    let reg = (t + r * selem + s) % 32;
+                    let low = self.st.v.q(reg) & u128::from(u64::MAX);
+                    self.st.v.set_q(reg, low);
+                }
+            }
+        }
+        Ok(addr.wrapping_sub(base))
+    }
+
+    /// The single-element form, and the replicating loads.
+    fn simd_struct_single(&mut self, word: u32, base: u64) -> Result<u64, Trap> {
+        let t = isa::rd(word);
+        let selem = isa::struct_single_selem(word);
+        let mut addr = base;
+
+        // `opcode<2:1> == 0b11` is the replicating load: one element per
+        // register, spread across every lane of it.
+        if isa::field(word, 15, 14) == 0b11 {
+            let size = isa::field(word, 11, 10);
+            // `1D` is a legal arrangement for a *load*, unlike for every
+            // lanewise operation, so this is not `from_size`.
+            let arr = Arrangement::whole(size, isa::q(word)).ok_or_else(Trap::undefined)?;
+            let ebytes = 1u64 << size;
+            for s in 0..selem {
+                let value = self.load(addr, ebytes)?;
+                let mut out = 0u128;
+                for lane in 0..arr.lanes {
+                    out = simd::set_elem(out, size, lane, value);
+                }
+                self.vset((t + s) % 32, arr, out);
+                addr = addr.wrapping_add(ebytes);
+            }
+            return Ok(addr.wrapping_sub(base));
+        }
+
+        let (esize, index) = isa::struct_single_shape(word).ok_or_else(Trap::undefined)?;
+        let ebytes = 1u64 << esize;
+        let load = isa::bit(word, 22);
+        for s in 0..selem {
+            let reg = (t + s) % 32;
+            if load {
+                let value = self.load(addr, ebytes)?;
+                let current = self.st.v.q(reg);
+                self.st
+                    .v
+                    .set_q(reg, simd::set_elem(current, esize, index, value));
+            } else {
+                let value = simd::elem(self.st.v.q(reg), esize, index);
+                self.store(addr, ebytes, value)?;
+            }
+            addr = addr.wrapping_add(ebytes);
+        }
+        Ok(addr.wrapping_sub(base))
+    }
+}
+
+/// The three permute pairs, which read their sources as a shape rather than
+/// lanewise.
+///
+/// `None` means the operation is not a permute, which is how
+/// `simd_three_same` tells the two families apart without a second table.
+fn simd_permute(op: Op, arr: Arrangement, a: u128, b: u128) -> Option<u128> {
+    let e = arr.esize;
+    let lanes = arr.lanes;
+    let half = lanes / 2;
+    let mut out = 0u128;
+    match op {
+        Op::Zip1Vec | Op::Zip2Vec => {
+            let base = if op == Op::Zip2Vec { half } else { 0 };
+            for i in 0..half {
+                out = simd::set_elem(out, e, 2 * i, simd::elem(a, e, i + base));
+                out = simd::set_elem(out, e, 2 * i + 1, simd::elem(b, e, i + base));
+            }
+        }
+        Op::Uzp1Vec | Op::Uzp2Vec => {
+            let start = u32::from(op == Op::Uzp2Vec);
+            for i in 0..lanes {
+                let index = 2 * i + start;
+                let value = if index < lanes {
+                    simd::elem(a, e, index)
+                } else {
+                    simd::elem(b, e, index - lanes)
+                };
+                out = simd::set_elem(out, e, i, value);
+            }
+        }
+        Op::Trn1Vec | Op::Trn2Vec => {
+            let offset = u32::from(op == Op::Trn2Vec);
+            for i in 0..half {
+                out = simd::set_elem(out, e, 2 * i, simd::elem(a, e, 2 * i + offset));
+                out = simd::set_elem(out, e, 2 * i + 1, simd::elem(b, e, 2 * i + offset));
+            }
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
+/// The floating-point format an element width names.
+///
+/// A byte is not one, and a halfword is one only as a conversion target — the
+/// arithmetic on it needs `FEAT_FP16`, which this core does not have, so the
+/// callers that could reach half precision are exactly the two conversions.
+fn prec_of(esize: u32) -> Result<fp::Prec, Trap> {
+    match esize {
+        1 => Ok(fp::Prec::Half),
+        2 => Ok(fp::Prec::Single),
+        3 => Ok(fp::Prec::Double),
+        _ => Err(Trap::undefined()),
+    }
+}
+
+/// A right shift of one element by an amount that may equal its width.
+///
+/// The architecture allows `USHR Vd.16B, Vn.16B, #8` — a shift by the whole
+/// element — and Rust's shift operators do not, so the saturating case is
+/// written out rather than left to overflow-checking to catch in debug and
+/// wrap in release (CLAUDE.md, "Arithmetic").
+fn shift_element(value: u64, esize: u32, shift: u32, signed: bool) -> u64 {
+    let bits = 8u32 << esize;
+    if signed {
+        let clamped = if shift >= bits { bits - 1 } else { shift };
+        simd::trunc((simd::sext(value, esize) >> clamped) as u64, esize)
+    } else if shift >= bits {
+        0
+    } else {
+        simd::trunc(value, esize) >> shift
+    }
+}
+
+/// The lanewise fixed-point conversions, which are the scalar ones with the
+/// scale coming from `immh`:`immb` instead of a `scale` field.
+fn fixed_convert(
+    prec: fp::Prec,
+    op: Op,
+    value: u64,
+    bits: u32,
+    fbits: u32,
+    env: Env,
+) -> Result<(u64, Flags), Trap> {
+    match op {
+        Op::ScvtfFixVec | Op::UcvtfFixVec => {
+            let (converted, mut flags) =
+                fp::from_int(prec, value, bits, op == Op::ScvtfFixVec, env);
+            let (result, scale) = fp::scale_by_pow2(prec, converted, -(fbits as i32), env);
+            flags |= scale;
+            Ok((result, flags))
+        }
+        Op::FcvtzsFixVec | Op::FcvtzuFixVec => {
+            // As on the scalar side, the scale-up cannot raise anything of its
+            // own: it happens in real arithmetic in `FPToFixed`, and a value
+            // too large for the format was already out of the integer's range.
+            let (scaled, _) = fp::scale_by_pow2(prec, value, fbits as i32, env);
+            let env = env.round(Round::TowardZero);
+            Ok(fp::to_int(prec, scaled, bits, op == Op::FcvtzsFixVec, env))
+        }
+        _ => Err(Trap::undefined()),
     }
 }
 

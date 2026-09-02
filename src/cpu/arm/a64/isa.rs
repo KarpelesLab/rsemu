@@ -283,6 +283,15 @@ pub enum Feat {
     /// anybody ships — but optional is optional, and a guest probes for it by
     /// reading `ID_AA64PFR0_EL1.FP` and by taking the `CPACR_EL1` trap.
     Fp,
+    /// `FEAT_AdvSIMD` — the *vector* instructions, sharing the register file
+    /// and the `CPACR_EL1` trap with [`Feat::Fp`] but not the encodings.
+    ///
+    /// A separate variant rather than folded into `Fp` because a row must say
+    /// what it needs, and these are two `ID_AA64PFR0_EL1` fields. DDI 0487
+    /// then requires the two fields to hold the *same* value — so the two
+    /// flags move together on every named part, and
+    /// `every_part_agrees_about_fp_and_advsimd` is what stops them drifting.
+    AdvSimd,
 }
 
 impl Feat {
@@ -294,7 +303,20 @@ impl Feat {
             Feat::Lse => "lse",
             Feat::Crc32 => "crc32",
             Feat::Fp => "fp",
+            Feat::AdvSimd => "advsimd",
         }
+    }
+
+    /// Whether this feature is one of the two the `CPACR_EL1.FPEN` trap
+    /// covers.
+    ///
+    /// The trap is on the *register file*, which both features use, so the
+    /// interpreter asks the table's own feature column rather than keeping a
+    /// second list of which encodings touch `V0`–`V31`.
+    #[inline]
+    #[must_use]
+    pub const fn is_simd_fp(self) -> bool {
+        matches!(self, Feat::Fp | Feat::AdvSimd)
     }
 }
 
@@ -316,6 +338,11 @@ pub struct Features {
     pub crc32: bool,
     /// `FEAT_FP`, scalar floating point and the SIMD&FP register file.
     pub fp: bool,
+    /// `FEAT_AdvSIMD`, the vector instructions. DDI 0487 requires this to
+    /// equal [`Features::fp`]; nothing here enforces it at construction,
+    /// because `Features` is a plain description — the *parts* keep them
+    /// together and a test says so.
+    pub advsimd: bool,
 }
 
 impl Features {
@@ -324,6 +351,7 @@ impl Features {
         lse: false,
         crc32: false,
         fp: false,
+        advsimd: false,
     };
 
     /// Everything this core implements.
@@ -331,6 +359,7 @@ impl Features {
         lse: true,
         crc32: true,
         fp: true,
+        advsimd: true,
     };
 
     /// Whether an encoding requiring `feat` may decode here.
@@ -342,6 +371,7 @@ impl Features {
             Feat::Lse => self.lse,
             Feat::Crc32 => self.crc32,
             Feat::Fp => self.fp,
+            Feat::AdvSimd => self.advsimd,
         }
     }
 }
@@ -360,6 +390,14 @@ pub enum Suffix {
     Cond,
     /// `A`, `L` or `AL`, from the acquire and release bits of an LSE atomic.
     Order,
+    /// `2`, from the `Q` bit of a widening or narrowing Advanced SIMD
+    /// encoding — `XTN` against `XTN2`, `UMULL` against `UMULL2`.
+    ///
+    /// The third and last suffix a *format* owns. It is here for the same
+    /// reason as the other two: writing `XTN` and `XTN2` as separate rows
+    /// would be a table describing the encoding rather than the instruction
+    /// set, and every one of these instructions would need doubling.
+    Wide,
 }
 
 /// How an instruction's operands are laid out, and therefore how the
@@ -507,6 +545,95 @@ pub enum Fmt {
     LdStFpPairPost,
     /// `<Vt>, <Vt2>, [Rn|SP, #imm]!` — pre-indexed.
     LdStFpPairPre,
+
+    // -- Advanced SIMD ---------------------------------------------------
+    //
+    // A vector operand is a register *and an arrangement* — `V0.4S` — and the
+    // arrangement is spelled in bits the mnemonic does not carry (`size` and
+    // `Q`). So these formats say which fields name the arrangement, exactly
+    // as the scalar formats say which field names the precision, and
+    // [`super::simd`] turns the fields into the letters. There is no
+    // `Fmt::VecAny` with a runtime shape: a format that could not be printed
+    // from the encoding alone would be a format the disassembler has to guess
+    // at.
+    /// `Vd.<T>, #imm8{, LSL #amount}` — the modified-immediate family
+    /// (`MOVI`, `MVNI`, `ORR`, `BIC`, `FMOV`).
+    VecModImm,
+    /// `Vd.<T>, Vn.<Ts>[index]` — `DUP` from an element.
+    VecDupElem,
+    /// `Vd.<T>, Rn` — `DUP` from a general register.
+    VecDupGen,
+    /// `Rd, Vn.<Ts>[index]` — `UMOV`, `SMOV`.
+    VecToGp,
+    /// `Vd.<Ts>[index], Rn` — `INS` from a general register.
+    VecInsGen,
+    /// `Vd.<Ts>[index], Vn.<Ts>[index2]` — `INS` from an element.
+    VecInsElem,
+    /// `Vd.<T>, Vn.<T>, Vm.<T>` with the arrangement from `size`:`Q`.
+    VecThreeSame,
+    /// The same, with the arrangement from `sz`:`Q` — a floating-point
+    /// three-same, where bit 23 selects the operation rather than the width.
+    VecThreeSameFp,
+    /// `Vd.<T>, Vn.<T>, Vm.<T>` where `<T>` is `8B` or `16B` whatever `size`
+    /// says — the bitwise operations, which have no element width.
+    VecThreeSameLog,
+    /// `Vd.<T>, Vn.<T>` with the arrangement from `size`:`Q`.
+    VecTwoMisc,
+    /// The same, with the arrangement from `sz`:`Q`.
+    VecTwoMiscFp,
+    /// `Vd.<T>, Vn.<T>, #0` — an integer compare against zero.
+    VecCmpZero,
+    /// `Vd.<T>, Vn.<T>, #0.0` — a floating-point compare against zero.
+    VecCmpZeroFp,
+    /// `Vd.<Tb>, Vn.<Ta>` — a narrowing two-register operation, whose `Q`
+    /// selects the top half of the destination rather than a wider source
+    /// (`XTN`/`XTN2`, `FCVTN`/`FCVTN2`).
+    VecNarrow,
+    /// `Vd.<Ta>, Vn.<Tb>` — a widening two-register operation, whose `Q`
+    /// selects the top half of the *source* (`FCVTL`/`FCVTL2`).
+    VecWiden,
+    /// `<V>d, Vn.<T>` — a reduction across the lanes.
+    VecAcross,
+    /// The same, with the arrangement from `sz`:`Q`.
+    VecAcrossFp,
+    /// `Vd.<T>, Vn.<T>, Vm.<T>, #index` — `EXT`.
+    VecExt,
+    /// `Vd.<Ta>, { Vn.16B .. }, Vm.<Ta>` — `TBL`, `TBX`.
+    VecTable,
+    /// `Vd.<T>, Vn.<T>, #shift` — a shift by an immediate, whose element
+    /// width comes from `immh` rather than from a `size` field.
+    VecShiftImm,
+    /// `Vd.<Ta>, Vn.<Tb>, #shift` — a widening shift (`SSHLL`, `USHLL`).
+    VecShiftLong,
+    /// `Vd.<Tb>, Vn.<Ta>, #shift` — a narrowing shift (`SHRN`).
+    VecShiftNarrow,
+    /// `Vd.<Ta>, Vn.<Tb>, Vm.<Tb>` — a widening three-register operation
+    /// (`UMULL`, `SADDL`).
+    VecThreeDiff,
+    /// `Vd.<Ta>, Vn.<Ta>, Vm.<Tb>` — the same with a wide first source
+    /// (`UADDW`, `SSUBW`).
+    VecThreeWide,
+    /// `Vd.<T>, Vn.<T>, Vm.<Ts>[index]` — an operation by a scalar element.
+    VecByElem,
+    /// `<V>d, <V>n, <V>m` — a scalar SIMD three-register operation, which is
+    /// the lanewise rule applied to one lane and is why it is here rather
+    /// than beside the scalar floating point.
+    SimdScalarThree,
+    /// `<V>d, <V>n` — a scalar SIMD two-register operation.
+    SimdScalarTwo,
+    /// `<V>d, <V>n, #0` / `#0.0` — a scalar SIMD compare against zero.
+    SimdScalarCmpZero,
+    /// `<V>d, Vn.<T>` — a scalar SIMD pairwise reduction (`ADDP D0, V1.2D`).
+    SimdScalarPair,
+    /// `{ Vt.<T>, .. }, [Rn|SP]` — a structure load or store.
+    LdStStruct,
+    /// `{ Vt.<T>, .. }, [Rn|SP], <imm|Xm>` — post-indexed.
+    LdStStructPost,
+    /// `{ Vt.<Ts> }[index], [Rn|SP]` — a single-element structure access, and
+    /// the replicating load.
+    LdStStructSingle,
+    /// The same, post-indexed.
+    LdStStructSinglePost,
 }
 
 impl Fmt {
@@ -549,6 +676,10 @@ impl Fmt {
                 | Fmt::LdStFpPairOff
                 | Fmt::LdStFpPairPost
                 | Fmt::LdStFpPairPre
+                | Fmt::LdStStruct
+                | Fmt::LdStStructPost
+                | Fmt::LdStStructSingle
+                | Fmt::LdStStructSinglePost
         )
     }
 
@@ -559,6 +690,12 @@ impl Fmt {
         match self {
             Fmt::CondBranch => Suffix::Cond,
             Fmt::Atomic => Suffix::Order,
+            Fmt::VecNarrow
+            | Fmt::VecWiden
+            | Fmt::VecShiftLong
+            | Fmt::VecShiftNarrow
+            | Fmt::VecThreeDiff
+            | Fmt::VecThreeWide => Suffix::Wide,
             _ => Suffix::None,
         }
     }
@@ -600,6 +737,26 @@ impl Fmt {
                 | Fmt::LdStFpPairOff
                 | Fmt::LdStFpPairPost
                 | Fmt::LdStFpPairPre
+        )
+    }
+
+    /// Whether this format is one of the Advanced SIMD structure load/store
+    /// families — `LD1`–`LD4` and their stores.
+    ///
+    /// A third family beside [`Fmt::is_load_store`] and
+    /// [`Fmt::is_fp_load_store`] rather than a member of either: these
+    /// address *several* registers from one base and have no offset form at
+    /// all, so they share neither the addressing modes nor the register
+    /// plumbing of the other two.
+    #[inline]
+    #[must_use]
+    pub const fn is_struct_load_store(self) -> bool {
+        matches!(
+            self,
+            Fmt::LdStStruct
+                | Fmt::LdStStructPost
+                | Fmt::LdStStructSingle
+                | Fmt::LdStStructSinglePost
         )
     }
 }
@@ -1079,6 +1236,300 @@ a64! {
     0x3fc00000 0x2d400000 LdpVOff  "ldp"  LdStFpPairOff  Fp "load a pair of SIMD&FP registers";
     0x3fc00000 0x2d800000 StpVPre  "stp"  LdStFpPairPre  Fp "store a pair of SIMD&FP registers, pre-indexed";
     0x3fc00000 0x2dc00000 LdpVPre  "ldp"  LdStFpPairPre  Fp "load a pair of SIMD&FP registers, pre-indexed";
+
+    // -- Advanced SIMD: modified immediate -----------------------------------
+    0xbff89c00 0x0f000400 MoviShift "movi" VecModImm AdvSimd "move a shifted 8-bit immediate into each 32-bit lane";
+    0xbff8dc00 0x0f008400 MoviShiftH "movi" VecModImm AdvSimd "move a shifted 8-bit immediate into each 16-bit lane";
+    0xbff8ec00 0x0f00c400 MoviMsl "movi" VecModImm AdvSimd "move an 8-bit immediate into each 32-bit lane, shifting ones in";
+    0xbff8fc00 0x0f00e400 MoviByte "movi" VecModImm AdvSimd "move an 8-bit immediate into every byte";
+    0xbff8fc00 0x0f00f400 FmovVecS "fmov" VecModImm AdvSimd "move an expanded 8-bit immediate into each single-precision lane";
+    0xbff89c00 0x0f001400 OrrVecImm "orr" VecModImm AdvSimd "bitwise OR a shifted 8-bit immediate into each 32-bit lane";
+    0xbff8dc00 0x0f009400 OrrVecImmH "orr" VecModImm AdvSimd "bitwise OR a shifted 8-bit immediate into each 16-bit lane";
+    0xbff89c00 0x2f000400 MvniShift "mvni" VecModImm AdvSimd "move the inverse of a shifted 8-bit immediate into each 32-bit lane";
+    0xbff8dc00 0x2f008400 MvniShiftH "mvni" VecModImm AdvSimd "move the inverse of a shifted 8-bit immediate into each 16-bit lane";
+    0xbff8ec00 0x2f00c400 MvniMsl "mvni" VecModImm AdvSimd "move the inverse of an 8-bit immediate shifted with ones";
+    0xbff8fc00 0x2f00e400 MoviWide "movi" VecModImm AdvSimd "move a bytewise-expanded immediate into a 64-bit lane";
+    0xbff8fc00 0x2f00f400 FmovVecD "fmov" VecModImm AdvSimd "move an expanded 8-bit immediate into each double-precision lane";
+    0xbff89c00 0x2f001400 BicVecImm "bic" VecModImm AdvSimd "bitwise clear a shifted 8-bit immediate in each 32-bit lane";
+    0xbff8dc00 0x2f009400 BicVecImmH "bic" VecModImm AdvSimd "bitwise clear a shifted 8-bit immediate in each 16-bit lane";
+
+    // -- Advanced SIMD: copy between lanes and general registers -------------
+    0xbfe0fc00 0x0e000400 DupElem "dup" VecDupElem AdvSimd "duplicate a vector element into every lane";
+    0xbfe0fc00 0x0e000c00 DupGen "dup" VecDupGen AdvSimd "duplicate a general register into every lane";
+    0xffe0fc00 0x4e001c00 InsGen "ins" VecInsGen AdvSimd "insert a general register into one lane";
+    0xbfe0fc00 0x0e002c00 Smov "smov" VecToGp AdvSimd "move a lane to a general register, sign-extended";
+    0xbfe0fc00 0x0e003c00 Umov "umov" VecToGp AdvSimd "move a lane to a general register, zero-extended";
+    0xffe08400 0x6e000400 InsElem "ins" VecInsElem AdvSimd "insert one vector element into another";
+
+    // -- Advanced SIMD: three registers of the same shape, integer -----------
+    0xbf20fc00 0x0e203400 CmgtVec "cmgt" VecThreeSame AdvSimd "compare lanes signed greater than";
+    0xbf20fc00 0x0e203c00 CmgeVec "cmge" VecThreeSame AdvSimd "compare lanes signed greater than or equal";
+    0xbf20fc00 0x2e203400 CmhiVec "cmhi" VecThreeSame AdvSimd "compare lanes unsigned higher";
+    0xbf20fc00 0x2e203c00 CmhsVec "cmhs" VecThreeSame AdvSimd "compare lanes unsigned higher or same";
+    0xbf20fc00 0x0e204400 SshlVec "sshl" VecThreeSame AdvSimd "shift lanes left by a signed register amount";
+    0xbf20fc00 0x2e204400 UshlVec "ushl" VecThreeSame AdvSimd "shift lanes left by an unsigned register amount";
+    0xbf20fc00 0x0e206400 SmaxVec "smax" VecThreeSame AdvSimd "signed maximum of each lane pair";
+    0xbf20fc00 0x0e206c00 SminVec "smin" VecThreeSame AdvSimd "signed minimum of each lane pair";
+    0xbf20fc00 0x2e206400 UmaxVec "umax" VecThreeSame AdvSimd "unsigned maximum of each lane pair";
+    0xbf20fc00 0x2e206c00 UminVec "umin" VecThreeSame AdvSimd "unsigned minimum of each lane pair";
+    0xbf20fc00 0x0e207400 SabdVec "sabd" VecThreeSame AdvSimd "signed absolute difference of each lane pair";
+    0xbf20fc00 0x2e207400 UabdVec "uabd" VecThreeSame AdvSimd "unsigned absolute difference of each lane pair";
+    0xbf20fc00 0x0e208400 AddVec "add" VecThreeSame AdvSimd "add lanewise";
+    0xbf20fc00 0x2e208400 SubVec "sub" VecThreeSame AdvSimd "subtract lanewise";
+    0xbf20fc00 0x0e208c00 CmtstVec "cmtst" VecThreeSame AdvSimd "compare lanes for a common set bit";
+    0xbf20fc00 0x2e208c00 CmeqVec "cmeq" VecThreeSame AdvSimd "compare lanes for equality";
+    0xbf20fc00 0x0e209400 MlaVec "mla" VecThreeSame AdvSimd "multiply and accumulate lanewise";
+    0xbf20fc00 0x2e209400 MlsVec "mls" VecThreeSame AdvSimd "multiply and subtract lanewise";
+    0xbf20fc00 0x0e209c00 MulVec "mul" VecThreeSame AdvSimd "multiply lanewise";
+    0xbf20fc00 0x0e20a400 SmaxpVec "smaxp" VecThreeSame AdvSimd "pairwise signed maximum";
+    0xbf20fc00 0x0e20ac00 SminpVec "sminp" VecThreeSame AdvSimd "pairwise signed minimum";
+    0xbf20fc00 0x2e20a400 UmaxpVec "umaxp" VecThreeSame AdvSimd "pairwise unsigned maximum";
+    0xbf20fc00 0x2e20ac00 UminpVec "uminp" VecThreeSame AdvSimd "pairwise unsigned minimum";
+    0xbf20fc00 0x0e20bc00 AddpVec "addp" VecThreeSame AdvSimd "pairwise add";
+
+    // -- Advanced SIMD: three registers of the same shape, bitwise -----------
+    0xbfe0fc00 0x0e201c00 AndVec "and" VecThreeSameLog AdvSimd "bitwise AND";
+    0xbfe0fc00 0x0e601c00 BicVec "bic" VecThreeSameLog AdvSimd "bitwise AND with an inverted register";
+    0xbfe0fc00 0x0ea01c00 OrrVec "orr" VecThreeSameLog AdvSimd "bitwise OR";
+    0xbfe0fc00 0x0ee01c00 OrnVec "orn" VecThreeSameLog AdvSimd "bitwise OR with an inverted register";
+    0xbfe0fc00 0x2e201c00 EorVec "eor" VecThreeSameLog AdvSimd "bitwise exclusive-OR";
+    0xbfe0fc00 0x2e601c00 BslVec "bsl" VecThreeSameLog AdvSimd "bitwise select, the mask in the destination";
+    0xbfe0fc00 0x2ea01c00 BitVec "bit" VecThreeSameLog AdvSimd "bitwise insert where the second source is set";
+    0xbfe0fc00 0x2ee01c00 BifVec "bif" VecThreeSameLog AdvSimd "bitwise insert where the second source is clear";
+
+    // -- Advanced SIMD: three registers of the same shape, floating point ----
+    0xbfa0fc00 0x0e20c400 FmaxnmVec "fmaxnm" VecThreeSameFp AdvSimd "lanewise maximum, preferring a number";
+    0xbfa0fc00 0x0ea0c400 FminnmVec "fminnm" VecThreeSameFp AdvSimd "lanewise minimum, preferring a number";
+    0xbfa0fc00 0x0e20cc00 FmlaVec "fmla" VecThreeSameFp AdvSimd "lanewise fused multiply-add";
+    0xbfa0fc00 0x0ea0cc00 FmlsVec "fmls" VecThreeSameFp AdvSimd "lanewise fused multiply-subtract";
+    0xbfa0fc00 0x0e20d400 FaddVec "fadd" VecThreeSameFp AdvSimd "lanewise add";
+    0xbfa0fc00 0x0ea0d400 FsubVec "fsub" VecThreeSameFp AdvSimd "lanewise subtract";
+    0xbfa0fc00 0x0e20e400 FcmeqVec "fcmeq" VecThreeSameFp AdvSimd "lanewise compare for equality";
+    0xbfa0fc00 0x0e20f400 FmaxVec "fmax" VecThreeSameFp AdvSimd "lanewise maximum, propagating a NaN";
+    0xbfa0fc00 0x0ea0f400 FminVec "fmin" VecThreeSameFp AdvSimd "lanewise minimum, propagating a NaN";
+    0xbfa0fc00 0x2e20c400 FmaxnmpVec "fmaxnmp" VecThreeSameFp AdvSimd "pairwise maximum, preferring a number";
+    0xbfa0fc00 0x2ea0c400 FminnmpVec "fminnmp" VecThreeSameFp AdvSimd "pairwise minimum, preferring a number";
+    0xbfa0fc00 0x2e20d400 FaddpVec "faddp" VecThreeSameFp AdvSimd "pairwise add";
+    0xbfa0fc00 0x2ea0d400 FabdVec "fabd" VecThreeSameFp AdvSimd "lanewise absolute difference";
+    0xbfa0fc00 0x2e20dc00 FmulVec "fmul" VecThreeSameFp AdvSimd "lanewise multiply";
+    0xbfa0fc00 0x2e20e400 FcmgeVec "fcmge" VecThreeSameFp AdvSimd "lanewise compare greater than or equal";
+    0xbfa0fc00 0x2ea0e400 FcmgtVec "fcmgt" VecThreeSameFp AdvSimd "lanewise compare greater than";
+    0xbfa0fc00 0x2e20ec00 FacgeVec "facge" VecThreeSameFp AdvSimd "lanewise compare absolute values, greater or equal";
+    0xbfa0fc00 0x2ea0ec00 FacgtVec "facgt" VecThreeSameFp AdvSimd "lanewise compare absolute values, greater";
+    0xbfa0fc00 0x2e20f400 FmaxpVec "fmaxp" VecThreeSameFp AdvSimd "pairwise maximum, propagating a NaN";
+    0xbfa0fc00 0x2ea0f400 FminpVec "fminp" VecThreeSameFp AdvSimd "pairwise minimum, propagating a NaN";
+    0xbfa0fc00 0x2e20fc00 FdivVec "fdiv" VecThreeSameFp AdvSimd "lanewise divide";
+
+    // -- Advanced SIMD: two registers, miscellaneous -------------------------
+    0xbf3ffc00 0x0e200800 Rev64Vec "rev64" VecTwoMisc AdvSimd "reverse the elements in each doubleword";
+    0xbf3ffc00 0x0e201800 Rev16Vec "rev16" VecTwoMisc AdvSimd "reverse the bytes in each halfword";
+    0xbf3ffc00 0x2e200800 Rev32Vec "rev32" VecTwoMisc AdvSimd "reverse the elements in each word";
+    0xbf3ffc00 0x0e204800 ClsVec "cls" VecTwoMisc AdvSimd "count leading sign bits lanewise";
+    0xbf3ffc00 0x2e204800 ClzVec "clz" VecTwoMisc AdvSimd "count leading zeroes lanewise";
+    0xbf3ffc00 0x0e205800 CntVec "cnt" VecTwoMisc AdvSimd "count the set bits in each byte";
+    0xbffffc00 0x2e205800 NotVec "not" VecTwoMisc AdvSimd "bitwise NOT";
+    0xbffffc00 0x2e605800 RbitVec "rbit" VecTwoMisc AdvSimd "reverse the bits in each byte";
+    0xbf3ffc00 0x0e208800 CmgtZeroVec "cmgt" VecCmpZero AdvSimd "compare lanes greater than zero";
+    0xbf3ffc00 0x0e209800 CmeqZeroVec "cmeq" VecCmpZero AdvSimd "compare lanes equal to zero";
+    0xbf3ffc00 0x0e20a800 CmltZeroVec "cmlt" VecCmpZero AdvSimd "compare lanes less than zero";
+    0xbf3ffc00 0x2e208800 CmgeZeroVec "cmge" VecCmpZero AdvSimd "compare lanes greater than or equal to zero";
+    0xbf3ffc00 0x2e209800 CmleZeroVec "cmle" VecCmpZero AdvSimd "compare lanes less than or equal to zero";
+    0xbf3ffc00 0x0e20b800 AbsVec "abs" VecTwoMisc AdvSimd "absolute value lanewise";
+    0xbf3ffc00 0x2e20b800 NegVec "neg" VecTwoMisc AdvSimd "negate lanewise";
+    0xbf3ffc00 0x0e212800 XtnVec "xtn" VecNarrow AdvSimd "extract the low half of each lane";
+    0xbfbffc00 0x0e216800 FcvtnVec "fcvtn" VecNarrow AdvSimd "convert lanes to a narrower floating-point format";
+    0xbfbffc00 0x0e217800 FcvtlVec "fcvtl" VecWiden AdvSimd "convert lanes to a wider floating-point format";
+    0xbfbffc00 0x0ea0c800 FcmgtZeroVec "fcmgt" VecCmpZeroFp AdvSimd "compare lanes greater than zero";
+    0xbfbffc00 0x0ea0d800 FcmeqZeroVec "fcmeq" VecCmpZeroFp AdvSimd "compare lanes equal to zero";
+    0xbfbffc00 0x0ea0e800 FcmltZeroVec "fcmlt" VecCmpZeroFp AdvSimd "compare lanes less than zero";
+    0xbfbffc00 0x2ea0c800 FcmgeZeroVec "fcmge" VecCmpZeroFp AdvSimd "compare lanes greater than or equal to zero";
+    0xbfbffc00 0x2ea0d800 FcmleZeroVec "fcmle" VecCmpZeroFp AdvSimd "compare lanes less than or equal to zero";
+    0xbfbffc00 0x0ea0f800 FabsVec "fabs" VecTwoMiscFp AdvSimd "absolute value lanewise";
+    0xbfbffc00 0x2ea0f800 FnegVec "fneg" VecTwoMiscFp AdvSimd "negate lanewise";
+    0xbfbffc00 0x2ea1f800 FsqrtVec "fsqrt" VecTwoMiscFp AdvSimd "square root lanewise";
+    0xbfbffc00 0x0e218800 FrintnVec "frintn" VecTwoMiscFp AdvSimd "round lanes to an integral value, ties to even";
+    0xbfbffc00 0x0e219800 FrintmVec "frintm" VecTwoMiscFp AdvSimd "round lanes toward -infinity";
+    0xbfbffc00 0x0ea18800 FrintpVec "frintp" VecTwoMiscFp AdvSimd "round lanes toward +infinity";
+    0xbfbffc00 0x0ea19800 FrintzVec "frintz" VecTwoMiscFp AdvSimd "round lanes toward zero";
+    0xbfbffc00 0x2e218800 FrintaVec "frinta" VecTwoMiscFp AdvSimd "round lanes, ties away from zero";
+    0xbfbffc00 0x2e219800 FrintxVec "frintx" VecTwoMiscFp AdvSimd "round lanes in the current mode, signalling inexact";
+    0xbfbffc00 0x2ea19800 FrintiVec "frinti" VecTwoMiscFp AdvSimd "round lanes in the current mode";
+    0xbfbffc00 0x0e21a800 FcvtnsVec "fcvtns" VecTwoMiscFp AdvSimd "convert lanes to signed integers, ties to even";
+    0xbfbffc00 0x0e21b800 FcvtmsVec "fcvtms" VecTwoMiscFp AdvSimd "convert lanes to signed integers, toward -infinity";
+    0xbfbffc00 0x0e21c800 FcvtasVec "fcvtas" VecTwoMiscFp AdvSimd "convert lanes to signed integers, ties away";
+    0xbfbffc00 0x0e21d800 ScvtfVec "scvtf" VecTwoMiscFp AdvSimd "convert signed integer lanes to floating point";
+    0xbfbffc00 0x0ea1a800 FcvtpsVec "fcvtps" VecTwoMiscFp AdvSimd "convert lanes to signed integers, toward +infinity";
+    0xbfbffc00 0x0ea1b800 FcvtzsVec "fcvtzs" VecTwoMiscFp AdvSimd "convert lanes to signed integers, toward zero";
+    0xbfbffc00 0x2e21a800 FcvtnuVec "fcvtnu" VecTwoMiscFp AdvSimd "convert lanes to unsigned integers, ties to even";
+    0xbfbffc00 0x2e21b800 FcvtmuVec "fcvtmu" VecTwoMiscFp AdvSimd "convert lanes to unsigned integers, toward -infinity";
+    0xbfbffc00 0x2e21c800 FcvtauVec "fcvtau" VecTwoMiscFp AdvSimd "convert lanes to unsigned integers, ties away";
+    0xbfbffc00 0x2e21d800 UcvtfVec "ucvtf" VecTwoMiscFp AdvSimd "convert unsigned integer lanes to floating point";
+    0xbfbffc00 0x2ea1a800 FcvtpuVec "fcvtpu" VecTwoMiscFp AdvSimd "convert lanes to unsigned integers, toward +infinity";
+    0xbfbffc00 0x2ea1b800 FcvtzuVec "fcvtzu" VecTwoMiscFp AdvSimd "convert lanes to unsigned integers, toward zero";
+
+    // -- Advanced SIMD: reductions across the lanes --------------------------
+    0xbf3ffc00 0x0e303800 SaddlvVec "saddlv" VecAcross AdvSimd "add the lanes signed into a wider destination";
+    0xbf3ffc00 0x2e303800 UaddlvVec "uaddlv" VecAcross AdvSimd "add the lanes unsigned into a wider destination";
+    0xbf3ffc00 0x0e30a800 SmaxvVec "smaxv" VecAcross AdvSimd "signed maximum across the lanes";
+    0xbf3ffc00 0x0e31a800 SminvVec "sminv" VecAcross AdvSimd "signed minimum across the lanes";
+    0xbf3ffc00 0x2e30a800 UmaxvVec "umaxv" VecAcross AdvSimd "unsigned maximum across the lanes";
+    0xbf3ffc00 0x2e31a800 UminvVec "uminv" VecAcross AdvSimd "unsigned minimum across the lanes";
+    0xbf3ffc00 0x0e31b800 AddvVec "addv" VecAcross AdvSimd "add across the lanes";
+    0xbfbffc00 0x2e30c800 FmaxnmvVec "fmaxnmv" VecAcrossFp AdvSimd "maximum across the lanes, preferring a number";
+    0xbfbffc00 0x2eb0c800 FminnmvVec "fminnmv" VecAcrossFp AdvSimd "minimum across the lanes, preferring a number";
+    0xbfbffc00 0x2e30f800 FmaxvVec "fmaxv" VecAcrossFp AdvSimd "maximum across the lanes, propagating a NaN";
+    0xbfbffc00 0x2eb0f800 FminvVec "fminv" VecAcrossFp AdvSimd "minimum across the lanes, propagating a NaN";
+
+    // -- Advanced SIMD: permutes ---------------------------------------------
+    0xbf20fc00 0x0e001800 Uzp1Vec "uzp1" VecThreeSame AdvSimd "take the even-numbered lanes of both sources";
+    0xbf20fc00 0x0e005800 Uzp2Vec "uzp2" VecThreeSame AdvSimd "take the odd-numbered lanes of both sources";
+    0xbf20fc00 0x0e002800 Trn1Vec "trn1" VecThreeSame AdvSimd "transpose the even-numbered lanes";
+    0xbf20fc00 0x0e006800 Trn2Vec "trn2" VecThreeSame AdvSimd "transpose the odd-numbered lanes";
+    0xbf20fc00 0x0e003800 Zip1Vec "zip1" VecThreeSame AdvSimd "interleave the lower halves of both sources";
+    0xbf20fc00 0x0e007800 Zip2Vec "zip2" VecThreeSame AdvSimd "interleave the upper halves of both sources";
+    0xbfe08400 0x2e000000 ExtVec "ext" VecExt AdvSimd "extract a register-width window from a pair of registers";
+    0xbfe09c00 0x0e000000 TblVec "tbl" VecTable AdvSimd "look each byte up in a table of registers, zero outside it";
+    0xbfe09c00 0x0e001000 TbxVec "tbx" VecTable AdvSimd "look each byte up in a table of registers, keeping the destination outside it";
+
+    // -- Advanced SIMD: three registers of different shapes ------------------
+    0xbf20fc00 0x0e200000 SaddlVec "saddl" VecThreeDiff AdvSimd "add signed lanes into wider ones";
+    0xbf20fc00 0x2e200000 UaddlVec "uaddl" VecThreeDiff AdvSimd "add unsigned lanes into wider ones";
+    0xbf20fc00 0x0e201000 SaddwVec "saddw" VecThreeWide AdvSimd "add narrow signed lanes to wide ones";
+    0xbf20fc00 0x2e201000 UaddwVec "uaddw" VecThreeWide AdvSimd "add narrow unsigned lanes to wide ones";
+    0xbf20fc00 0x0e202000 SsublVec "ssubl" VecThreeDiff AdvSimd "subtract signed lanes into wider ones";
+    0xbf20fc00 0x2e202000 UsublVec "usubl" VecThreeDiff AdvSimd "subtract unsigned lanes into wider ones";
+    0xbf20fc00 0x0e203000 SsubwVec "ssubw" VecThreeWide AdvSimd "subtract narrow signed lanes from wide ones";
+    0xbf20fc00 0x2e203000 UsubwVec "usubw" VecThreeWide AdvSimd "subtract narrow unsigned lanes from wide ones";
+    0xbf20fc00 0x0e208000 SmlalVec "smlal" VecThreeDiff AdvSimd "signed multiply-accumulate into wider lanes";
+    0xbf20fc00 0x2e208000 UmlalVec "umlal" VecThreeDiff AdvSimd "unsigned multiply-accumulate into wider lanes";
+    0xbf20fc00 0x0e20a000 SmlslVec "smlsl" VecThreeDiff AdvSimd "signed multiply-subtract from wider lanes";
+    0xbf20fc00 0x2e20a000 UmlslVec "umlsl" VecThreeDiff AdvSimd "unsigned multiply-subtract from wider lanes";
+    0xbf20fc00 0x0e20c000 SmullVec "smull" VecThreeDiff AdvSimd "signed multiply into wider lanes";
+    0xbf20fc00 0x2e20c000 UmullVec "umull" VecThreeDiff AdvSimd "unsigned multiply into wider lanes";
+
+    // -- Advanced SIMD: shift by an immediate --------------------------------
+    0xbf80fc00 0x0f000400 SshrVec "sshr" VecShiftImm AdvSimd "shift lanes right, signed";
+    0xbf80fc00 0x2f000400 UshrVec "ushr" VecShiftImm AdvSimd "shift lanes right, unsigned";
+    0xbf80fc00 0x0f001400 SsraVec "ssra" VecShiftImm AdvSimd "shift lanes right signed and accumulate";
+    0xbf80fc00 0x2f001400 UsraVec "usra" VecShiftImm AdvSimd "shift lanes right unsigned and accumulate";
+    0xbf80fc00 0x2f004400 SriVec "sri" VecShiftImm AdvSimd "shift lanes right and insert";
+    0xbf80fc00 0x0f005400 ShlVec "shl" VecShiftImm AdvSimd "shift lanes left";
+    0xbf80fc00 0x2f005400 SliVec "sli" VecShiftImm AdvSimd "shift lanes left and insert";
+    0xbf80fc00 0x0f008400 ShrnVec "shrn" VecShiftNarrow AdvSimd "shift right and narrow";
+    0xbf80fc00 0x0f00a400 SshllVec "sshll" VecShiftLong AdvSimd "shift left signed into wider lanes";
+    0xbf80fc00 0x2f00a400 UshllVec "ushll" VecShiftLong AdvSimd "shift left unsigned into wider lanes";
+    0xbf80fc00 0x0f00e400 ScvtfFixVec "scvtf" VecShiftImm AdvSimd "convert signed fixed-point lanes to floating point";
+    0xbf80fc00 0x2f00e400 UcvtfFixVec "ucvtf" VecShiftImm AdvSimd "convert unsigned fixed-point lanes to floating point";
+    0xbf80fc00 0x0f00fc00 FcvtzsFixVec "fcvtzs" VecShiftImm AdvSimd "convert lanes to signed fixed point, toward zero";
+    0xbf80fc00 0x2f00fc00 FcvtzuFixVec "fcvtzu" VecShiftImm AdvSimd "convert lanes to unsigned fixed point, toward zero";
+
+    // -- Advanced SIMD: one source is a single element -----------------------
+    0xbf00f400 0x0f008000 MulElem "mul" VecByElem AdvSimd "multiply each lane by one element";
+    0xbf00f400 0x2f000000 MlaElem "mla" VecByElem AdvSimd "multiply by one element and accumulate";
+    0xbf00f400 0x2f004000 MlsElem "mls" VecByElem AdvSimd "multiply by one element and subtract";
+    0xbf80f400 0x0f801000 FmlaElem "fmla" VecByElem AdvSimd "fused multiply-add by one element";
+    0xbf80f400 0x0f805000 FmlsElem "fmls" VecByElem AdvSimd "fused multiply-subtract by one element";
+    0xbf80f400 0x0f809000 FmulElem "fmul" VecByElem AdvSimd "multiply each lane by one element";
+
+    // -- Advanced SIMD: the scalar forms -------------------------------------
+    0xffe0fc00 0x5e000400 DupElemScalar "mov" SimdScalarTwo AdvSimd "move one vector element to a scalar";
+    0xffe0fc00 0x5ee08400 AddScalar "add" SimdScalarThree AdvSimd "add two doubleword scalars";
+    0xffe0fc00 0x7ee08400 SubScalar "sub" SimdScalarThree AdvSimd "subtract two doubleword scalars";
+    0xffe0fc00 0x7ee08c00 CmeqScalar "cmeq" SimdScalarThree AdvSimd "compare two scalars for equality";
+    0xffe0fc00 0x5ee03400 CmgtScalar "cmgt" SimdScalarThree AdvSimd "compare scalars signed greater than";
+    0xffe0fc00 0x5ee03c00 CmgeScalar "cmge" SimdScalarThree AdvSimd "compare scalars signed greater or equal";
+    0xffe0fc00 0x7ee03400 CmhiScalar "cmhi" SimdScalarThree AdvSimd "compare scalars unsigned higher";
+    0xffe0fc00 0x7ee03c00 CmhsScalar "cmhs" SimdScalarThree AdvSimd "compare scalars unsigned higher or same";
+    0xffa0fc00 0x5e20e400 FcmeqScalar "fcmeq" SimdScalarThree AdvSimd "compare two scalars for equality";
+    0xffa0fc00 0x7e20e400 FcmgeScalar "fcmge" SimdScalarThree AdvSimd "compare scalars greater or equal";
+    0xffa0fc00 0x7ea0e400 FcmgtScalar "fcmgt" SimdScalarThree AdvSimd "compare scalars greater than";
+    0xffa0fc00 0x7ea0d400 FabdScalar "fabd" SimdScalarThree AdvSimd "absolute difference of two scalars";
+    0xfffffc00 0x5ee0b800 AbsScalar "abs" SimdScalarTwo AdvSimd "absolute value of a doubleword scalar";
+    0xfffffc00 0x7ee0b800 NegScalar "neg" SimdScalarTwo AdvSimd "negate a doubleword scalar";
+    0xfffffc00 0x5ee08800 CmgtZeroScalar "cmgt" SimdScalarCmpZero AdvSimd "compare a scalar greater than zero";
+    0xfffffc00 0x5ee09800 CmeqZeroScalar "cmeq" SimdScalarCmpZero AdvSimd "compare a scalar equal to zero";
+    0xfffffc00 0x5ee0a800 CmltZeroScalar "cmlt" SimdScalarCmpZero AdvSimd "compare a scalar less than zero";
+    0xfffffc00 0x7ee08800 CmgeZeroScalar "cmge" SimdScalarCmpZero AdvSimd "compare a scalar greater or equal to zero";
+    0xfffffc00 0x7ee09800 CmleZeroScalar "cmle" SimdScalarCmpZero AdvSimd "compare a scalar less or equal to zero";
+    0xffbffc00 0x5ea0c800 FcmgtZeroScalar "fcmgt" SimdScalarCmpZero AdvSimd "compare a scalar greater than zero";
+    0xffbffc00 0x5ea0d800 FcmeqZeroScalar "fcmeq" SimdScalarCmpZero AdvSimd "compare a scalar equal to zero";
+    0xffbffc00 0x5ea0e800 FcmltZeroScalar "fcmlt" SimdScalarCmpZero AdvSimd "compare a scalar less than zero";
+    0xffbffc00 0x7ea0c800 FcmgeZeroScalar "fcmge" SimdScalarCmpZero AdvSimd "compare a scalar greater or equal to zero";
+    0xffbffc00 0x7ea0d800 FcmleZeroScalar "fcmle" SimdScalarCmpZero AdvSimd "compare a scalar less or equal to zero";
+    0xfffffc00 0x5ef1b800 AddpScalar "addp" SimdScalarPair AdvSimd "add the two doubleword lanes of a vector";
+    0xffbffc00 0x7e30d800 FaddpScalar "faddp" SimdScalarPair AdvSimd "add the two lanes of a vector";
+    0xffbffc00 0x7e30f800 FmaxpScalar "fmaxp" SimdScalarPair AdvSimd "maximum of the two lanes of a vector";
+    0xffbffc00 0x7eb0f800 FminpScalar "fminp" SimdScalarPair AdvSimd "minimum of the two lanes of a vector";
+
+    // -- Advanced SIMD: structure loads and stores ---------------------------
+    0xbffff000 0x0c000000 St4Multi "st4" LdStStruct AdvSimd "store four-register structure";
+    0xbfe0f000 0x0c800000 St4MultiPost "st4" LdStStructPost AdvSimd "store four-register structure, post-indexed";
+    0xbffff000 0x0c400000 Ld4Multi "ld4" LdStStruct AdvSimd "load four-register structure";
+    0xbfe0f000 0x0cc00000 Ld4MultiPost "ld4" LdStStructPost AdvSimd "load four-register structure, post-indexed";
+    0xbffff000 0x0c002000 St1x4Multi "st1" LdStStruct AdvSimd "store four registers";
+    0xbfe0f000 0x0c802000 St1x4MultiPost "st1" LdStStructPost AdvSimd "store four registers, post-indexed";
+    0xbffff000 0x0c402000 Ld1x4Multi "ld1" LdStStruct AdvSimd "load four registers";
+    0xbfe0f000 0x0cc02000 Ld1x4MultiPost "ld1" LdStStructPost AdvSimd "load four registers, post-indexed";
+    0xbffff000 0x0c004000 St3Multi "st3" LdStStruct AdvSimd "store three-register structure";
+    0xbfe0f000 0x0c804000 St3MultiPost "st3" LdStStructPost AdvSimd "store three-register structure, post-indexed";
+    0xbffff000 0x0c404000 Ld3Multi "ld3" LdStStruct AdvSimd "load three-register structure";
+    0xbfe0f000 0x0cc04000 Ld3MultiPost "ld3" LdStStructPost AdvSimd "load three-register structure, post-indexed";
+    0xbffff000 0x0c006000 St1x3Multi "st1" LdStStruct AdvSimd "store three registers";
+    0xbfe0f000 0x0c806000 St1x3MultiPost "st1" LdStStructPost AdvSimd "store three registers, post-indexed";
+    0xbffff000 0x0c406000 Ld1x3Multi "ld1" LdStStruct AdvSimd "load three registers";
+    0xbfe0f000 0x0cc06000 Ld1x3MultiPost "ld1" LdStStructPost AdvSimd "load three registers, post-indexed";
+    0xbffff000 0x0c007000 St1x1Multi "st1" LdStStruct AdvSimd "store one register";
+    0xbfe0f000 0x0c807000 St1x1MultiPost "st1" LdStStructPost AdvSimd "store one register, post-indexed";
+    0xbffff000 0x0c407000 Ld1x1Multi "ld1" LdStStruct AdvSimd "load one register";
+    0xbfe0f000 0x0cc07000 Ld1x1MultiPost "ld1" LdStStructPost AdvSimd "load one register, post-indexed";
+    0xbffff000 0x0c008000 St2Multi "st2" LdStStruct AdvSimd "store two-register structure";
+    0xbfe0f000 0x0c808000 St2MultiPost "st2" LdStStructPost AdvSimd "store two-register structure, post-indexed";
+    0xbffff000 0x0c408000 Ld2Multi "ld2" LdStStruct AdvSimd "load two-register structure";
+    0xbfe0f000 0x0cc08000 Ld2MultiPost "ld2" LdStStructPost AdvSimd "load two-register structure, post-indexed";
+    0xbffff000 0x0c00a000 St1x2Multi "st1" LdStStruct AdvSimd "store two registers";
+    0xbfe0f000 0x0c80a000 St1x2MultiPost "st1" LdStStructPost AdvSimd "store two registers, post-indexed";
+    0xbffff000 0x0c40a000 Ld1x2Multi "ld1" LdStStruct AdvSimd "load two registers";
+    0xbfe0f000 0x0cc0a000 Ld1x2MultiPost "ld1" LdStStructPost AdvSimd "load two registers, post-indexed";
+    0xbfffa000 0x0d000000 St1SingleB "st1" LdStStructSingle AdvSimd "store one 8- or 16-bit element of one vector";
+    0xbfffe000 0x0d008000 St1SingleW "st1" LdStStructSingle AdvSimd "store one 32- or 64-bit element of one vector";
+    0xbfffa000 0x0d400000 Ld1SingleB "ld1" LdStStructSingle AdvSimd "load one 8- or 16-bit element of one vector";
+    0xbfffe000 0x0d408000 Ld1SingleW "ld1" LdStStructSingle AdvSimd "load one 32- or 64-bit element of one vector";
+    0xbffff000 0x0d40c000 Ld1r "ld1r" LdStStructSingle AdvSimd "load one element of one vector into every lane";
+    0xbfffa000 0x0d200000 St2SingleB "st2" LdStStructSingle AdvSimd "store one 8- or 16-bit element of two vectors";
+    0xbfffe000 0x0d208000 St2SingleW "st2" LdStStructSingle AdvSimd "store one 32- or 64-bit element of two vectors";
+    0xbfffa000 0x0d600000 Ld2SingleB "ld2" LdStStructSingle AdvSimd "load one 8- or 16-bit element of two vectors";
+    0xbfffe000 0x0d608000 Ld2SingleW "ld2" LdStStructSingle AdvSimd "load one 32- or 64-bit element of two vectors";
+    0xbffff000 0x0d60c000 Ld2r "ld2r" LdStStructSingle AdvSimd "load one element of two vectors into every lane";
+    0xbfffa000 0x0d002000 St3SingleB "st3" LdStStructSingle AdvSimd "store one 8- or 16-bit element of three vectors";
+    0xbfffe000 0x0d00a000 St3SingleW "st3" LdStStructSingle AdvSimd "store one 32- or 64-bit element of three vectors";
+    0xbfffa000 0x0d402000 Ld3SingleB "ld3" LdStStructSingle AdvSimd "load one 8- or 16-bit element of three vectors";
+    0xbfffe000 0x0d40a000 Ld3SingleW "ld3" LdStStructSingle AdvSimd "load one 32- or 64-bit element of three vectors";
+    0xbffff000 0x0d40e000 Ld3r "ld3r" LdStStructSingle AdvSimd "load one element of three vectors into every lane";
+    0xbfffa000 0x0d202000 St4SingleB "st4" LdStStructSingle AdvSimd "store one 8- or 16-bit element of four vectors";
+    0xbfffe000 0x0d20a000 St4SingleW "st4" LdStStructSingle AdvSimd "store one 32- or 64-bit element of four vectors";
+    0xbfffa000 0x0d602000 Ld4SingleB "ld4" LdStStructSingle AdvSimd "load one 8- or 16-bit element of four vectors";
+    0xbfffe000 0x0d60a000 Ld4SingleW "ld4" LdStStructSingle AdvSimd "load one 32- or 64-bit element of four vectors";
+    0xbffff000 0x0d60e000 Ld4r "ld4r" LdStStructSingle AdvSimd "load one element of four vectors into every lane";
+    0xbfe0a000 0x0d800000 St1SingleBPost "st1" LdStStructSinglePost AdvSimd "store one 8- or 16-bit element of one vector, post-indexed";
+    0xbfe0e000 0x0d808000 St1SingleWPost "st1" LdStStructSinglePost AdvSimd "store one 32- or 64-bit element of one vector, post-indexed";
+    0xbfe0a000 0x0dc00000 Ld1SingleBPost "ld1" LdStStructSinglePost AdvSimd "load one 8- or 16-bit element of one vector, post-indexed";
+    0xbfe0e000 0x0dc08000 Ld1SingleWPost "ld1" LdStStructSinglePost AdvSimd "load one 32- or 64-bit element of one vector, post-indexed";
+    0xbfe0f000 0x0dc0c000 Ld1rPost "ld1r" LdStStructSinglePost AdvSimd "load one element of one vector into every lane, post-indexed";
+    0xbfe0a000 0x0da00000 St2SingleBPost "st2" LdStStructSinglePost AdvSimd "store one 8- or 16-bit element of two vectors, post-indexed";
+    0xbfe0e000 0x0da08000 St2SingleWPost "st2" LdStStructSinglePost AdvSimd "store one 32- or 64-bit element of two vectors, post-indexed";
+    0xbfe0a000 0x0de00000 Ld2SingleBPost "ld2" LdStStructSinglePost AdvSimd "load one 8- or 16-bit element of two vectors, post-indexed";
+    0xbfe0e000 0x0de08000 Ld2SingleWPost "ld2" LdStStructSinglePost AdvSimd "load one 32- or 64-bit element of two vectors, post-indexed";
+    0xbfe0f000 0x0de0c000 Ld2rPost "ld2r" LdStStructSinglePost AdvSimd "load one element of two vectors into every lane, post-indexed";
+    0xbfe0a000 0x0d802000 St3SingleBPost "st3" LdStStructSinglePost AdvSimd "store one 8- or 16-bit element of three vectors, post-indexed";
+    0xbfe0e000 0x0d80a000 St3SingleWPost "st3" LdStStructSinglePost AdvSimd "store one 32- or 64-bit element of three vectors, post-indexed";
+    0xbfe0a000 0x0dc02000 Ld3SingleBPost "ld3" LdStStructSinglePost AdvSimd "load one 8- or 16-bit element of three vectors, post-indexed";
+    0xbfe0e000 0x0dc0a000 Ld3SingleWPost "ld3" LdStStructSinglePost AdvSimd "load one 32- or 64-bit element of three vectors, post-indexed";
+    0xbfe0f000 0x0dc0e000 Ld3rPost "ld3r" LdStStructSinglePost AdvSimd "load one element of three vectors into every lane, post-indexed";
+    0xbfe0a000 0x0da02000 St4SingleBPost "st4" LdStStructSinglePost AdvSimd "store one 8- or 16-bit element of four vectors, post-indexed";
+    0xbfe0e000 0x0da0a000 St4SingleWPost "st4" LdStStructSinglePost AdvSimd "store one 32- or 64-bit element of four vectors, post-indexed";
+    0xbfe0a000 0x0de02000 Ld4SingleBPost "ld4" LdStStructSinglePost AdvSimd "load one 8- or 16-bit element of four vectors, post-indexed";
+    0xbfe0e000 0x0de0a000 Ld4SingleWPost "ld4" LdStStructSinglePost AdvSimd "load one 32- or 64-bit element of four vectors, post-indexed";
+    0xbfe0f000 0x0de0e000 Ld4rPost "ld4r" LdStStructSinglePost AdvSimd "load one element of four vectors into every lane, post-indexed";
 }
 
 // ---------------------------------------------------------------------------
@@ -1091,12 +1542,25 @@ a64! {
 /// bucket overflows it, which is a build break rather than a silently
 /// truncated decode table. `the_busiest_decode_bucket_has_headroom` reports
 /// the margin so that break never arrives as a surprise — the scalar
-/// floating-point rows took the busiest bucket from 46 to 90, which is why
-/// this is no longer 96.
-const BUCKET_CAP: usize = 160;
+/// floating-point rows took the busiest bucket from 46 to 90, and the
+/// Advanced SIMD rows would have taken it past 160 had the index not gained a
+/// bit at the same time (see [`INDEX_BITS`]).
+const BUCKET_CAP: usize = 224;
+
+/// How many buckets [`INDEX`] has, and therefore how many bits of the encoding
+/// the first cut reads.
+///
+/// Five, not four. DDI 0487 C4.1's `op0` is bits 28:25, and that was the whole
+/// index until Advanced SIMD landed — at which point it stopped separating
+/// anything, because **every** Advanced SIMD data-processing encoding has
+/// `op0 == 0b0111`. Bit 24 is the next cut the architecture itself makes: it
+/// splits the register forms (`0x0e…` — three-same, two-misc, copy, permute)
+/// from the immediate forms (`0x0f…` — modified immediate, shift by immediate,
+/// by element), and it splits the structure loads and stores the same way.
+const INDEX_BITS: u32 = 5;
 
 /// One bucket of [`INDEX`]: the rows whose fixed bits are compatible with one
-/// value of the top-level `op0` field.
+/// value of the top-level index field.
 #[derive(Debug, Clone, Copy)]
 pub struct Bucket {
     /// How many entries of `rows` are used.
@@ -1105,31 +1569,35 @@ pub struct Bucket {
     rows: [u16; BUCKET_CAP],
 }
 
-/// The rows to scan for each value of the top-level `op0` field, bits 28:25.
+/// The bits the index is cut on, 28:24.
+const INDEX_MASK: u32 = 0x1f00_0000;
+
+/// The rows to scan for each value of bits 28:24.
 ///
-/// DDI 0487 C4.1 classifies every A64 encoding on those four bits, so they are
-/// the natural first cut. A row whose mask leaves one of them free — `B`,
-/// whose 26-bit displacement reaches bit 25 — appears in every bucket it is
-/// compatible with, so the index cannot hide an instruction the table
-/// declares. Built by a `const fn` from `TABLE` itself, so it is a derived
-/// cache in the strict sense: it cannot disagree with what it indexes, and
-/// adding a row needs no second edit.
-pub static INDEX: [Bucket; 16] = build_index(TABLE);
+/// DDI 0487 C4.1 classifies every A64 encoding on bits 28:25, so those are the
+/// natural first cut, and bit 24 is the second cut the architecture itself
+/// makes, for the reason `INDEX_BITS` records. A row whose mask leaves one of
+/// these bits free — `B`, whose 26-bit displacement reaches bit 25 — appears in
+/// every bucket it is compatible with, so the index cannot hide an instruction
+/// the table declares. Built by a `const fn` from `TABLE` itself, so it is a
+/// derived cache in the strict sense: it cannot disagree with what it indexes,
+/// and adding a row needs no second edit.
+pub static INDEX: [Bucket; 1 << INDEX_BITS] = build_index(TABLE);
 
 /// Compute [`INDEX`] at compile time.
-const fn build_index(table: &[Insn]) -> [Bucket; 16] {
+const fn build_index(table: &[Insn]) -> [Bucket; 1 << INDEX_BITS] {
     let mut index = [Bucket {
         len: 0,
         rows: [0; BUCKET_CAP],
-    }; 16];
+    }; 1 << INDEX_BITS];
     let mut op0 = 0usize;
-    while op0 < 16 {
-        let probe = (op0 as u32) << 25;
+    while op0 < (1 << INDEX_BITS) {
+        let probe = (op0 as u32) << 24;
         let mut i = 0usize;
         while i < table.len() {
             let row = &table[i];
-            // Compatible when every bit of 28:25 the row fixes agrees.
-            if (probe ^ row.bits) & row.mask & 0x1e00_0000 == 0 {
+            // Compatible when every bit of 28:24 the row fixes agrees.
+            if (probe ^ row.bits) & row.mask & INDEX_MASK == 0 {
                 let n = index[op0].len as usize;
                 assert!(n < BUCKET_CAP, "raise BUCKET_CAP: a decode bucket is full");
                 index[op0].rows[n] = i as u16;
@@ -1150,7 +1618,7 @@ const fn build_index(table: &[Insn]) -> [Bucket; 16] {
 /// guest discovers what it is running on.
 #[must_use]
 pub fn decode(word: u32, features: Features) -> Option<&'static Insn> {
-    let bucket = &INDEX[field(word, 28, 25) as usize];
+    let bucket = &INDEX[field(word, 28, 24) as usize];
     let mut i = 0usize;
     while i < bucket.len as usize {
         let insn = &TABLE[bucket.rows[i] as usize];
@@ -1403,6 +1871,79 @@ pub const fn ls_access(size: u32, opc: u32) -> Option<LsAccess> {
     }
 }
 
+/// How many registers a multiple-structures load or store names, as
+/// `(repeats, structure size)`.
+///
+/// DDI 0487 C4.1.4 tabulates `opcode` against the pair, and `LD1` appears four
+/// times in it because one, two, three and four registers are four encodings
+/// of one instruction. Stating it here rather than in the interpreter is the
+/// same rule as [`ls_access`]: the rows name the instructions, and this decides
+/// what they move.
+#[inline]
+#[must_use]
+pub const fn struct_shape(opcode: u32) -> Option<(u32, u32)> {
+    match opcode {
+        0b0000 => Some((1, 4)),
+        0b0010 => Some((4, 1)),
+        0b0100 => Some((1, 3)),
+        0b0110 => Some((3, 1)),
+        0b0111 => Some((1, 1)),
+        0b1000 => Some((1, 2)),
+        0b1010 => Some((2, 1)),
+        _ => None,
+    }
+}
+
+/// How many registers a single-structure load or store touches.
+///
+/// Two bits in two places: `R` (bit 21) and `opcode<0>` (bit 13). Together
+/// they are `LD1`, `LD2`, `LD3`, `LD4` — and they are not adjacent, which is
+/// why reading them is a function rather than a field.
+#[inline]
+#[must_use]
+pub const fn struct_single_selem(word: u32) -> u32 {
+    ((bit(word, 13) as u32) << 1) + (bit(word, 21) as u32) + 1
+}
+
+/// The element width and lane index a single-structure load or store names,
+/// as `(esize, index)`.
+///
+/// The index is spelled across `Q` (bit 30), `S` (bit 12) and `size`
+/// (bits 11:10), with the width in `opcode<2:1>` — so the wider the element,
+/// the fewer of those bits are an index and the more of them the architecture
+/// requires to be zero. `None` is one of those reserved combinations.
+#[inline]
+#[must_use]
+pub const fn struct_single_shape(word: u32) -> Option<(u32, u32)> {
+    let q = bit(word, 30) as u32;
+    let s = bit(word, 12) as u32;
+    let size = field(word, 11, 10);
+    match field(word, 15, 14) {
+        0b00 => Some((0, (q << 3) | (s << 2) | size)),
+        0b01 => {
+            if size & 1 != 0 {
+                None
+            } else {
+                Some((1, (q << 2) | (s << 1) | (size >> 1)))
+            }
+        }
+        0b10 => match size {
+            0b00 => Some((2, (q << 1) | s)),
+            0b01 => {
+                if s != 0 {
+                    None
+                } else {
+                    Some((3, q))
+                }
+            }
+            _ => None,
+        },
+        // `opcode<2:1> == 0b11` is the replicating load, whose "index" is
+        // every lane — the caller handles it, and reaching here is a bug.
+        _ => None,
+    }
+}
+
 /// The `ptype` field of a scalar floating-point encoding, bits 23:22.
 ///
 /// It names the precision, and `0b10` is unallocated on every encoding that
@@ -1440,6 +1981,77 @@ pub const fn cvt_opcode(word: u32) -> u32 {
 #[must_use]
 pub const fn fbits(word: u32) -> u32 {
     64 - field(word, 15, 10)
+}
+
+// ---------------------------------------------------------------------------
+// Advanced SIMD fields
+// ---------------------------------------------------------------------------
+
+/// The `Q` bit, bit 30: set for a 128-bit vector, clear for a 64-bit one.
+#[inline]
+#[must_use]
+pub const fn q(word: u32) -> bool {
+    bit(word, 30)
+}
+
+/// The `size` field of an Advanced SIMD encoding, bits 23:22 — the base-2
+/// logarithm of the element width in bytes.
+///
+/// The same two bits are `ptype` on a scalar floating-point encoding and
+/// `opc` on a load or store, which is why each has its own accessor: they are
+/// three different fields that happen to share a position.
+#[inline]
+#[must_use]
+pub const fn simd_size(word: u32) -> u32 {
+    field(word, 23, 22)
+}
+
+/// The `sz` bit of a floating-point Advanced SIMD encoding, bit 22: clear for
+/// single precision, set for double.
+#[inline]
+#[must_use]
+pub const fn simd_sz(word: u32) -> bool {
+    bit(word, 22)
+}
+
+/// The `imm5` field of the copy encodings, bits 20:16, which names both the
+/// element width and the lane index.
+#[inline]
+#[must_use]
+pub const fn simd_imm5(word: u32) -> u32 {
+    field(word, 20, 16)
+}
+
+/// The `imm4` field of `INS` (element) and `EXT`, bits 14:11.
+#[inline]
+#[must_use]
+pub const fn simd_imm4(word: u32) -> u32 {
+    field(word, 14, 11)
+}
+
+/// The `cmode` field of the modified-immediate encodings, bits 15:12.
+#[inline]
+#[must_use]
+pub const fn simd_cmode(word: u32) -> u32 {
+    field(word, 15, 12)
+}
+
+/// The eight-bit immediate of a modified-immediate encoding, spelled `abc` in
+/// bits 18:16 and `defgh` in bits 9:5.
+#[inline]
+#[must_use]
+pub const fn simd_imm8(word: u32) -> u32 {
+    (field(word, 18, 16) << 5) | field(word, 9, 5)
+}
+
+/// The `immh`:`immb` field of the shift-by-immediate encodings, bits 22:16.
+///
+/// The two are always read together — `immh` gives the element width and the
+/// pair gives the amount — so there is one accessor rather than two.
+#[inline]
+#[must_use]
+pub const fn simd_immhb(word: u32) -> u32 {
+    field(word, 22, 16)
 }
 
 /// The eight-bit immediate `FMOV` expands, bits 20:13.
@@ -1764,24 +2376,64 @@ mod tests {
     }
 
     /// Two rows that accept the same word would make decoding depend on table
-    /// order in a way the table does not show. The generic `HINT` row is the
-    /// one deliberate exception: `NOP` and its named relatives are more
-    /// specific spellings of encodings it also accepts, and they precede it.
+    /// order in a way the table does not show. There are exactly two places
+    /// where A64's own encoding forces that, and both are listed rather than
+    /// waved through.
+    ///
+    /// * The generic `HINT` row: `NOP` and its named relatives are more
+    ///   specific spellings of encodings it also accepts, and they precede it.
+    /// * The Advanced SIMD **modified immediate** encodings, which are the
+    ///   shift-by-immediate encodings with `immh == 0b0000`. "`immh` is
+    ///   non-zero" is not a mask, so the more specific rows — the ones that
+    ///   *do* fix `immh` — come first and the general ones follow.
     #[test]
     fn no_unintended_overlap() {
+        // `(earlier, later)`: the earlier format's rows are the more specific
+        // spelling and must precede the later's, which the index check below
+        // enforces.
+        const ORDERED: &[(Fmt, Fmt)] = &[
+            (Fmt::VecModImm, Fmt::VecShiftImm),
+            (Fmt::VecModImm, Fmt::VecShiftLong),
+            (Fmt::VecModImm, Fmt::VecShiftNarrow),
+        ];
         for (i, a) in TABLE.iter().enumerate() {
             for b in &TABLE[i + 1..] {
                 let common = a.mask & b.mask;
-                if a.bits & common == b.bits & common {
-                    assert!(
-                        a.op == Op::Hint || b.op == Op::Hint,
-                        "{:?} and {:?} accept the same encodings",
-                        a.op,
-                        b.op
-                    );
+                if a.bits & common != b.bits & common {
+                    continue;
                 }
+                let hint = a.op == Op::Hint || b.op == Op::Hint;
+                let ordered = ORDERED.contains(&(a.fmt, b.fmt));
+                assert!(
+                    hint || ordered,
+                    "{:?} and {:?} accept the same encodings",
+                    a.op,
+                    b.op
+                );
             }
         }
+    }
+
+    /// The sanctioned overlap only works in one direction, so assert the
+    /// direction rather than trusting the file's layout: every
+    /// modified-immediate row precedes every shift-by-immediate one.
+    #[test]
+    fn the_modified_immediate_rows_come_first() {
+        let last_mod = TABLE.iter().rposition(|r| r.fmt == Fmt::VecModImm);
+        let first_shift = TABLE.iter().position(|r| {
+            matches!(
+                r.fmt,
+                Fmt::VecShiftImm | Fmt::VecShiftLong | Fmt::VecShiftNarrow
+            )
+        });
+        let (Some(last_mod), Some(first_shift)) = (last_mod, first_shift) else {
+            panic!("both encoding groups should be in the table");
+        };
+        assert!(
+            last_mod < first_shift,
+            "a shift-by-immediate row precedes a modified-immediate one, so \
+             `MOVI` would decode as a shift of zero"
+        );
     }
 
     #[test]

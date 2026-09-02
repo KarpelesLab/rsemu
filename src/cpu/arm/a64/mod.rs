@@ -52,6 +52,7 @@
 //! | `PSTATE`, exception levels, the system-register table | [`sysreg`] |
 //! | the stage-1 translation walk and the software TLB | [`mmu`] |
 //! | the SIMD&FP register file, `FPCR`/`FPSR`, and Arm's IEEE rules | [`fp`] |
+//! | Advanced SIMD: arrangements, lanes, and the lanewise rules | [`simd`] |
 //!
 //! # Floating point is software, and that is the point
 //!
@@ -68,28 +69,41 @@
 //! architecture rather than an inconvenience: it is how a kernel discovers
 //! that a process has started using the FPU.
 //!
+//! # Advanced SIMD is the same register file
+//!
+//! The vector instructions live in [`simd`] and share everything with the
+//! scalar ones: the register file, `FPCR`/`FPSR`, the `CPACR_EL1` trap, and
+//! the arithmetic itself — a lanewise `FADD` is [`fp::add`] in a loop. What
+//! `simd` adds is the *arrangement*, which is a vector operand's shape and the
+//! source of most of the ways this family goes wrong.
+//!
+//! The slice implemented is the one that makes compiled floating-point code
+//! runnable rather than a shallow pass over the whole encoding space, and
+//! `simd`'s own documentation lists what is absent. The headline is that
+//! `MOVI Dd, #0` — how LLVM materialises a floating-point zero — is an
+//! Advanced SIMD encoding, so *scalar* floating-point code was not fully
+//! runnable without it.
+//!
 //! # What is deliberately absent
 //!
-//! **Advanced SIMD** — the *vector* instructions — is not implemented, and
-//! `ID_AA64PFR0_EL1.AdvSIMD` says so while `.FP` says floating point is
-//! present. DDI 0487 requires those two fields to agree, so that is a part
-//! nobody makes; [`Config::id_aa64pfr0`] explains why reporting an impossible
-//! part beats claiming a capability that would `UNDEF` on first use.
+//! The saturating and rounding SIMD arithmetic (and so `FPSR.QC` stays
+//! storage), the reciprocal-estimate family, polynomial multiply, and the
+//! by-element long multiplies. `FEAT_FP16` arithmetic (half precision exists
+//! here only as a conversion format, which is Armv8.0-A), EL2 and EL3 (so
+//! `HVC` and `SMC` are `UNDEFINED`), AArch32 at any level, the generic timer,
+//! `LDXP`/`STXP`, the unprivileged `LDTR`/`STTR` family, pointer
+//! authentication, MTE, SVE, big-endian data, and the `DC ZVA` block operation
+//! — `DCZID_EL0.DZP` says so.
 //!
-//! Also absent: `FEAT_FP16` arithmetic (half precision exists here only as a
-//! conversion format, which is Armv8.0-A), EL2 and EL3 (so `HVC` and `SMC` are
-//! `UNDEFINED`), AArch32 at any level, the generic timer, `LDXP`/`STXP`, the
-//! unprivileged `LDTR`/`STTR` family, pointer authentication, MTE, SVE,
-//! big-endian data, and the `DC ZVA` block operation — `DCZID_EL0.DZP` says
-//! so.//!
 //! # Accuracy
 //!
 //! `conformance` runs a suite this repository **builds** rather than fetches,
 //! because no usable AArch64 corpus exists; its module documentation says what
 //! that does and does not prove. The instruction table has also been diffed
 //! against `llvm-mc` over a sample of the encoding space, which is what found
-//! the missing `LDNP`/`STNP` rows.
-
+//! the missing `LDNP`/`STNP` rows, and — over the Advanced SIMD space — a
+//! `FMUL` by element that decoded a bit it should have fixed, an `INS` that
+//! decoded with `Q` clear, and an `LD1R` that decoded with `S` set.
 //!
 //! # Timing
 //!
@@ -112,6 +126,7 @@ mod exec;
 pub mod fp;
 pub mod isa;
 pub mod mmu;
+pub mod simd;
 pub mod sysreg;
 
 #[cfg(test)]
@@ -260,6 +275,7 @@ impl Config {
                 lse: false,
                 crc32: true,
                 fp: true,
+                advsimd: true,
             },
             midr: 0x410f_d034,
             ..Config::armv8_0()
@@ -342,30 +358,33 @@ impl Config {
     }
 
     /// `ID_AA64PFR0_EL1`: EL0 and EL1 implemented in AArch64 only, no EL2, no
-    /// EL3, floating point as [`Features::fp`] says, and **Advanced SIMD
-    /// absent**.
+    /// EL3, and floating point and Advanced SIMD as [`Features`] says.
     ///
-    /// # A combination no silicon has, reported deliberately
+    /// # This register used to describe a part nobody makes
     ///
-    /// DDI 0487 says the `FP` and `AdvSIMD` fields must hold the same value:
-    /// a part has both or neither. This core has scalar floating point and no
-    /// vector instructions, so it reports `FP == 0b0000` and
-    /// `AdvSIMD == 0b1111` — a part that does not exist.
+    /// DDI 0487 requires the `FP` and `AdvSIMD` fields to hold the same
+    /// value: a part has both or neither. Until the vector instructions
+    /// landed this core had scalar floating point without them, and it
+    /// reported `FP == 0b0000` with `AdvSIMD == 0b1111` — an impossible
+    /// combination, chosen deliberately over claiming a capability that would
+    /// `UNDEF` on first use, because software checking `AdvSIMD` before a
+    /// vector `memcpy` got the right answer that way.
     ///
-    /// The alternative was to claim Advanced SIMD and then raise `UNDEFINED`
-    /// on the first `ADD V0.4S, …`, and between describing a part nobody makes
-    /// and lying about a capability, the first is the one a guest can act on:
-    /// software that checks `AdvSIMD` before using a vector `memcpy` gets the
-    /// right answer, and software that assumes the fields agree finds out here
-    /// rather than in a fault it cannot explain. When the vector instructions
-    /// land the two fields agree again and this note goes away.
+    /// It no longer has to. The two fields are read from two flags that the
+    /// named parts always set together, and
+    /// `every_part_agrees_about_fp_and_advsimd` is what keeps them together —
+    /// so a guest that assumes the architecture's own rule is now right.
     #[must_use]
     pub const fn id_aa64pfr0(&self) -> u64 {
-        // EL0 = 0b0001, EL1 = 0b0001 (AArch64 only); AdvSIMD = 0b1111.
-        let mut value = 0x0000_0000_00f0_0011;
+        // EL0 = 0b0001, EL1 = 0b0001, both AArch64 only.
+        let mut value = 0x0000_0000_0000_0011;
+        // 0b1111 is "not implemented" in both fields, and 0b0000 is the
+        // Armv8.0 baseline — no `FEAT_FP16`, which this core does not have.
         if !self.features.fp {
-            // 0b1111: not implemented.
             value |= 0xf << 16;
+        }
+        if !self.features.advsimd {
+            value |= 0xf << 20;
         }
         value
     }
