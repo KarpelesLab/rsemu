@@ -805,13 +805,16 @@ fn the_call_map_the_allocator_is_given_matches_what_the_lowerings_emit() {
     let mut want = 0usize;
     for inst in block.insts() {
         want += match inst.op {
-            Opcode::GET_SLOT | Opcode::CHARGE | Opcode::INSN_START | Opcode::ST => 1,
+            Opcode::GET_SLOT | Opcode::ST => 1,
             // A load carries the slow path's call whatever happens, and the
             // inlined probe adds `note_fast_load` on top of it.
             Opcode::LD => 2,
+            // A charge and a boundary emit nothing at all: their work is the
+            // region's flush, counted below.
             _ => 0,
         };
     }
+    want += a_flush_before(&block).iter().filter(|f| **f).count();
     for regs in [Regs::Frame, Regs::Scan] {
         let compiled = super::compile::compile_with(&block, regs).expect("compiles");
         assert_eq!(
@@ -822,18 +825,51 @@ fn the_call_map_the_allocator_is_given_matches_what_the_lowerings_emit() {
     }
 }
 
-/// Whether the backend's lowering of `op` contains a call into the host.
+/// Whether the backend's lowering of `op` calls into the host *after* reading
+/// its operands and before writing its results.
 ///
-/// Written out here rather than read off `compile::calls_out`, and the
+/// Written out here rather than read off `compile::calls_inside`, and the
 /// duplication is the point: `the_call_map_the_allocator_is_given_matches_what_
-/// the_lowerings_emit` checks this list against the *emitted bytes*, and the
-/// test below checks the allocator was given this list. A single shared
-/// constant would make both of them agree with a wrong answer.
+/// the_lowerings_emit` checks this against the *emitted bytes*, and the test
+/// below checks the allocator was given it. A single shared constant would
+/// make both of them agree with a wrong answer.
 fn a_call_site(op: Opcode) -> bool {
-    matches!(
-        op,
-        Opcode::LD | Opcode::ST | Opcode::GET_SLOT | Opcode::CHARGE | Opcode::INSN_START
-    )
+    matches!(op, Opcode::LD | Opcode::ST | Opcode::GET_SLOT)
+}
+
+/// Where the backend replays a region's deferred bookkeeping, worked out again
+/// rather than read off `compile::plan_flushes`.
+///
+/// Deliberately the *other* formulation: `plan_flushes` carries the region
+/// start forward in one pass, and this searches backwards for it per
+/// instruction. The two agreeing is evidence; one of them reading the other
+/// would not be.
+fn a_flush_before(block: &Block) -> Vec<bool> {
+    let insts = block.insts();
+    let n = insts.len();
+    let mut is_target = vec![false; n];
+    for inst in insts {
+        if inst.op == Opcode::BRCOND && (inst.aux as usize) < n {
+            is_target[inst.aux as usize] = true;
+        }
+    }
+    let boundary = |i: usize| {
+        is_target[i]
+            || a_call_site(insts[i].op)
+            || insts[i].op == Opcode::BRCOND
+            || insts[i].op.is_terminator()
+    };
+    (0..n)
+        .map(|i| {
+            if !boundary(i) {
+                return false;
+            }
+            // The region runs from the previous boundary — inclusive, because
+            // a boundary starts the next region at itself — up to here.
+            let from = (0..i).rev().find(|j| boundary(*j)).unwrap_or(0);
+            (from..i).any(|j| matches!(insts[j].op, Opcode::CHARGE | Opcode::INSN_START))
+        })
+        .collect()
 }
 
 /// Assert the allocator's central invariant over one block.
@@ -841,14 +877,19 @@ fn no_volatile_register_spans_a_call(block: &Block) {
     let live = crate::ir::Liveness::compute(block);
     let compiled = super::compile::compile_with(block, Regs::Scan).expect("compiles");
     let calls: Vec<bool> = block.insts().iter().map(|i| a_call_site(i.op)).collect();
+    let flushes = a_flush_before(block);
     for (temp, lo, hi) in live.intervals() {
         let crate::ir::Home::Reg(r) = compiled.home(temp) else {
             continue;
         };
-        // Strictly between: an operand is read before its instruction's call
-        // and a result is written after it.
-        let crosses = ((lo as usize + 1)..(hi as usize)).any(|i| calls[i]);
-        if crosses {
+        // Strictly between for a call *inside* an instruction: an operand is
+        // read before it and a result is written after it. **Up to and
+        // including** for a flush, which runs in the gap ahead of an
+        // instruction and therefore before it has read anything — the one
+        // asymmetry `ir::CallSites` exists for.
+        let inside = ((lo as usize + 1)..(hi as usize)).any(|i| calls[i]);
+        let gap = ((lo as usize + 1)..=(hi as usize)).any(|i| flushes.get(i) == Some(&true));
+        if inside || gap {
             assert!(
                 super::compile::SAVED.contains(&r),
                 "{temp} is live across a call in r{r}, which is not callee-saved\n{block}"
@@ -862,14 +903,14 @@ fn no_volatile_register_spans_a_call(block: &Block) {
 }
 
 #[test]
-fn a_value_that_spans_only_a_charge_still_needs_a_callee_saved_register() {
-    // Every op that calls has to be in the map, and a charge is the one no
-    // generated corpus reaches: both frontends emit `insn_start` and `charge`
-    // adjacent, so nothing is ever defined between them and no interval
-    // crosses a charge without also crossing a boundary. This block is that
-    // shape on purpose — a temporary born between the two and read after the
-    // charge — and it is the only thing standing between `calls_out` losing
-    // `CHARGE` and a value being destroyed by `IrHost::charge`.
+fn a_value_read_at_the_instruction_a_flush_runs_ahead_of_needs_a_saved_register() {
+    // The shape that separates `CallSites`' two arrays, and the one that would
+    // be silently miscompiled if the flush were recorded as a call *inside*
+    // the instruction it precedes. `addr` is defined at one instruction and
+    // read by the next, and the region's flush runs in the gap between them —
+    // before the load has read its address into an argument register. As an
+    // `inside` call it would not cross an interval that ends there, so a
+    // volatile register would look safe and `flush_thunk` would destroy it.
     let mut b = BlockBuilder::new(BASE, 0);
     b.insn_start(InsnStart {
         pc: BASE,
@@ -877,21 +918,118 @@ fn a_value_that_spans_only_a_charge_still_needs_a_callee_saved_register() {
         ticks: 0,
         live: Vec::new(),
     });
-    let early = b.imm(Type::I64, Const::Int(0x1234_5678));
     b.charge(2);
-    let later = b.imm(Type::I64, Const::Int(1));
-    let sum = b.binary(Opcode::ADD, Type::I64, early, later);
+    let addr = b.imm(Type::I64, Const::Int(u128::from(BASE + 64)));
+    let value = b.load(Type::I64, addr, MemOp::load(Width::U64));
     b.insn_start(InsnStart {
         pc: BASE + 4,
         next_pc: BASE + 8,
         ticks: 2,
-        live: vec![(RegSlot(0), sum)],
+        live: vec![(RegSlot(0), value)],
     });
     b.exit_tb();
     let block = b.finish();
     verify(&block).expect("well formed");
+
+    // Non-vacuity: the load really is the flush point, and `addr` really does
+    // end its life there.
+    let flushes = a_flush_before(&block);
+    assert_eq!(flushes[3], true, "the load is where the region is replayed");
+    let live = crate::ir::Liveness::compute(&block);
+    let life = live.life(addr).expect("addr is live");
+    assert_eq!((life.def, life.last_use), (Some(2), Some(3)));
+
     no_volatile_register_spans_a_call(&block);
+    let compiled = super::compile::compile_with(&block, Regs::Scan).expect("compiles");
+    if let crate::ir::Home::Reg(r) = compiled.home(addr) {
+        assert!(
+            super::compile::SAVED.contains(&r),
+            "the address took volatile r{r} across the flush"
+        );
+    }
     assert!(agree(&block, true));
+}
+
+#[test]
+fn a_charge_a_branch_jumps_over_is_never_charged() {
+    // The reason a `brcond` is a region boundary. The skipped range holds a
+    // charge and a boundary, and the flush at the branch target replays the
+    // range the *fall-through* executed — so a taken branch must arrive after
+    // that flush, with nothing of its own pending. Getting this wrong charges
+    // ticks for a guest instruction that did not run, which `ROADMAP.md` §0
+    // makes a state-hash divergence.
+    for take in [false, true] {
+        let mut b = BlockBuilder::new(BASE, 0);
+        b.insn_start(InsnStart {
+            pc: BASE,
+            next_pc: BASE + 4,
+            ticks: 0,
+            live: Vec::new(),
+        });
+        b.charge(5);
+        // `x < x` never holds; `x == x` always does.
+        let x = b.imm(Type::I64, Const::Int(3));
+        let cond = if take { Cond::Eq } else { Cond::LtU };
+        let sel = b.setcond(cond, Type::I64, x, x);
+        let over = b.emit_raw(Opcode::BRCOND, Type::I64, None, None, &[sel], None, None, 0);
+        // The skipped range: a whole guest instruction's worth of bookkeeping.
+        b.insn_start(InsnStart {
+            pc: BASE + 4,
+            next_pc: BASE + 8,
+            ticks: 5,
+            live: Vec::new(),
+        });
+        b.charge(9);
+        b.patch_aux(over, b.next_index() as u32);
+        b.insn_start(InsnStart {
+            pc: BASE + 8,
+            next_pc: BASE + 12,
+            ticks: if take { 5 } else { 14 },
+            live: vec![(RegSlot(0), x)],
+        });
+        b.charge(1);
+        b.exit_tb();
+        let block = b.finish();
+        verify(&block).expect("well formed");
+        assert!(agree(&block, true), "{block}");
+
+        // and the number itself, so the assertion is not only "both engines
+        // agree" but "they agree on the right answer".
+        let mut host = Scratch::new(true);
+        let mut interp = Interp::new();
+        interp.run(&block, &mut host).expect("runs");
+        assert_eq!(interp.ticks(), if take { 6 } else { 15 });
+    }
+}
+
+#[test]
+fn a_guest_instructions_bookkeeping_costs_no_code_at_all() {
+    // The non-vacuity assertion for the whole deferral: a boundary and a
+    // charge used to be nineteen instructions and two calls, and are now
+    // nothing. So a region's code size must not depend on how many guest
+    // instructions are in it — which is a property no differential can show,
+    // because a backend that emitted all nineteen again would still be right.
+    fn bytes(insns: u64) -> usize {
+        let mut b = BlockBuilder::new(BASE, 0);
+        for i in 0..insns {
+            b.insn_start(InsnStart {
+                pc: BASE + i * 4,
+                next_pc: BASE + (i + 1) * 4,
+                ticks: i,
+                live: Vec::new(),
+            });
+            b.charge(1);
+        }
+        b.exit_tb();
+        let block = b.finish();
+        super::compile::compile_with(&block, Regs::Scan)
+            .expect("compiles")
+            .code()
+            .len()
+    }
+    let one = bytes(1);
+    assert_eq!(one, bytes(8));
+    assert_eq!(one, bytes(64));
 }
 
 #[test]
