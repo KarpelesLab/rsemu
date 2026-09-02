@@ -78,6 +78,46 @@ physical-address packet, so a bus address — a boot ROM under a page table, a B
 before the guest has mapped it — is not reachable from a GDB session by any
 other route. Every one of those reads sets `MemAttrs::debug`.
 
+### Why the monitor is not a TUI
+
+`ROADMAP.md` phase 9 names a **`noroi` monitor TUI**. It is not built, and the
+reasons are recorded here so the line is not implemented by inertia later.
+
+- **The command set already exists, and on a surface that reaches further.**
+  Everything a monitor would be for — the address spaces, the region map, a
+  hexdump by virtual *and* physical address, the device tree, the clock, the
+  state hash — is the list above, reachable from any GDB session and from any
+  program that can open a TCP socket and write a packet. A TUI would be a second
+  parser and a second set of eight commands over the same `DebugTarget`.
+- **`noroi` cannot be in `--all-features`.** Its README's "zero external crates"
+  is a claim about the dependency graph, not about linkage: with `std` enabled
+  it declares `tcgetattr`, `tcsetattr` and `ioctl` in an `unsafe extern "C"`
+  block and hard-codes the **Linux** `termios` layout, so `src/sys/mod.rs`
+  raises `compile_error!` on Windows and `src/sys/unix.rs` raises one on every
+  unix that is not Linux or Android. rsemu's test job runs on ubuntu, macos and
+  windows; a feature that fails to compile on two of the three cannot be in the
+  `--all-features` build those jobs use. That is before the design argument, and
+  it is enough on its own.
+- **It contradicts §0's raw-syscall rule.** Linking libc symbols is exactly what
+  `host::terminal` goes out of its way to avoid — it shells out to `stty`
+  instead, which is why the emulator's own console works on a `fullrust` target.
+  A debugger UI that is less portable than the console it debugs through is the
+  wrong way round.
+- **It would want stdin, and the guest already has it.** `rsemu run apple1`
+  gives the terminal to the machine. A full-screen monitor wants the same
+  terminal, so a TUI is either mutually exclusive with the console — which is
+  the only frontend most boards in this tree have — or it needs a multiplexer
+  nobody has asked for.
+- **It reads input on a thread it spawns itself** (`EventStream::spawn`), which
+  is not how work is started here (`CLAUDE.md`: submit jobs, never spawn
+  threads).
+
+If a monitor is ever wanted, the thing to build is not a second command set: it
+is a way to reach *this* one without a GDB client — the commands are
+`MachineTarget::monitor` in `src/host/gdb/target.rs` and they take a string and
+return a string, which is the whole interface a REPL, a socket or a wasm export
+would need.
+
 ## Implementation notes
 
 - Multi-CPU machines present as **threads** to GDB, which maps cleanly onto our

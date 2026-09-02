@@ -44,6 +44,31 @@ DesktopSize pseudo-encoding (§7.8.2); and it takes `KeyEvent` (§7.5.4) and
 adapter's framebuffer, and it will also drive an installed viewer binary if
 there is one.
 
+Input lands in a **sink** chosen by what the machine opened rather than by a
+flag: a character port named `keyboard` is what `pc.kbc` opens, a pad port is
+what a console's controller ports open, and a `usb.mouse` is what the pointer
+drives. That last one is the newest and the one with a caveat:
+
+- **The pointer converts rather than translates.** RFB is absolute (§7.5.5) and
+  a HID boot mouse is relative (HID 1.11 Appendix E.10), so
+  [`MouseSink`](../../src/host/input.rs) keeps the last position and sends the
+  difference, clamped to the report's `-127..127` with the remainder carried
+  into the next event. The button masks are ordered differently as well — RFB
+  is physical (left, middle, right) and HID is by usage (button 1 primary,
+  button 2 secondary, button 3 tertiary, i.e. left, right, middle) — so bits 1
+  and 2 swap, and the wheel, which RFB sends as presses on bits 3 and 4, is
+  dropped because a three-byte boot report has no wheel axis. An absolute HID
+  tablet would need none of this; there is no tablet model in `dev/`.
+- **No shipped machine has a pointer yet.** The boards with a USB controller
+  (`usb-mini`, `hub-mini`, `xhci-mini`) have no display, and every board with a
+  display has no USB — and joining them is not a machine-file edit, because
+  neither `usb.ehci` nor `usb.xhci` has a PCI attachment for the PC boards. So
+  `tests/vnc_pointer.rs` proves the host end against a mouse built by hand:
+  real `PointerEvent` bytes through the server's own parser, out as the report
+  a host controller collects from the interrupt endpoint.
+  `tests/usb_ehci.rs` already proves the far end, with an RV32 guest reading
+  the same reports out of its own RAM.
+
 Three of the implementation notes above turned out differently, and the reasons
 are worth recording:
 
