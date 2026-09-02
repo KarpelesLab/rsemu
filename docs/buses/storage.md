@@ -10,7 +10,7 @@ controllers come from [`fstool`](https://github.com/KarpelesLab/fstool) — see
 | --- | --- | --- |
 | ATA / ATAPI | [T13](https://www.t13.org/) — the ATA/ATAPI Command Set standards; ATA/ATAPI-6 (T13/1410D) is what `dev/ata/disk` was written from | Drafts historically free; final standards via INCITS |
 | AT IDE interface | *IBM Personal Computer AT Technical Reference* (1984), the fixed-disk adapter; Ralf Brown's Interrupt List for the `0x3f6`/`0x3f7` split with the diskette adapter | **Free** |
-| AHCI | Serial ATA AHCI Specification (Intel) | intel.com **[browser]** |
+| AHCI | Serial ATA AHCI Specification 1.3.1 (Intel), and *Serial ATA: High Speed Serialized AT Attachment* Rev 1.0 for the FIS layouts it defers to | intel.com **[browser]** — see the note below; the SATA revision is an open download from seagate.com |
 | NVMe | [NVM Express specifications](https://nvmexpress.org/specifications/) | **Free** |
 | SCSI | [T10](https://www.t10.org/) — SPC (primary commands), SBC (block commands) | Drafts free |
 | SD / MMC | SD Association simplified specifications | sdcard.org **[browser]** — the *simplified* specs are free |
@@ -48,6 +48,39 @@ change the cable.
 the specified behaviour of a device that is not a packet device and is how a
 driver finds out. A CD-ROM is a packet command set on top of this transport and
 is a separate piece of work, not a flag on this one.
+
+### The taskfile seam
+
+A drive was reachable only through eight 8-bit ports written in the right order,
+which is the right model of a ribbon cable and the wrong model of a Serial ATA
+link — a SATA host adapter receives a *Register - Host to Device FIS*, a
+twenty-byte structure carrying the whole command block at once, and there is no
+ordering, no chip select and no register offset in it. `dev/ata/disk/taskfile`
+is that second door: a `Taskfile` of six named fields, loaded into the very same
+command block registers a port write would have left, dispatched by the very
+same `AtaDisk::command`.
+
+The falsifiable form, and it is the whole point: **delete `taskfile.rs` and the
+AT's IDE channel is unchanged**; delete `AtaDisk::command` and both adapters
+stop working. `src/dev/pc/ide.rs` did not change by one line when AHCI landed.
+The data phase is shared the same way — `taskfile_read` and `taskfile_write`
+copy in bulk out of (or into) the block the drive currently has under `DRQ` and
+then run the identical `block_consumed` / `block_filled` path a word-at-a-time
+drain would have run, so the busy/DRQ handshake, the per-block interrupt timing
+and the completion write-back are shared rather than reimplemented.
+
+One thing the seam had to add rather than reuse: the **DMA data transfer
+protocols**. A drive on an AT-class cable has no bus master to move bytes for
+it, so `IDENTIFY DEVICE` word 49 bit 8 is clear and `READ DMA` aborts; a drive
+on a Serial ATA port has one, and a real driver issues `READ DMA EXT` and
+nothing else. That is a property of the drive, so it is a property on the drive
+(`dma = true`, default false) rather than something the adapter switches on
+behind a machine file's back, and the AT is bit-identical without it. Which
+protocol a command uses comes *out of the drive* in `Phase::Data { dma }` rather
+than being re-derived from the opcode by the adapter, because a Serial ATA PIO
+command is announced by a PIO Setup FIS before every block and a DMA one is not
+— getting that backwards is the kind of thing that works with one driver and
+hangs another.
 
 Like SD and NOR flash, the ATA drive takes a media slot rather than an
 `fstool::BlockDevice`, and for the same reason plus one more: it is `no_std`, so
@@ -154,7 +187,78 @@ works here for the reason it works there, and no image format is parsed.
 `tests/nvme_board.rs` is that driver: it enumerates the bus at `0xcf8`, sizes and
 places the base address register, builds queues in the board's RAM, and checks
 every transfer **against the medium** rather than against the device's own
-buffer. AHCI is still absent.
+buffer.
+
+**AHCI now exists too** (`dev/ahci`, feature `dev-ahci`), and it is the second
+bus master. It is also the one that needed the taskfile seam above, which is why
+that seam is the first commit of this work rather than the last: an AHCI port
+carries an ATA command, the command set was already written, and writing it
+twice would have been the failure.
+
+The shape is NVMe's with different structures. A driver builds a 32-entry
+**command list**, a **received-FIS area** and a **command table** — the command
+FIS followed by a Physical Region Descriptor Table — in its own memory, writes
+one bit into `PxCI`, and the adapter fetches the header, fetches the FIS, hands
+the taskfile to the drive, walks the PRDT moving data between the medium and the
+addresses it names, posts the device's answering FIS into the received-FIS area,
+writes the byte count back into the header's `PRDBC` field, and holds `INTA#`
+down until the driver has cleared `PxIS` **and then** the global `IS`.
+
+Four things it does differently from NVMe, and each is a specification
+requirement rather than a preference.
+
+**The interrupt needs two registers cleared, in order.** `IS.IPS[x]` is
+write-1-to-clear, and the adapter re-derives it from every port whose
+`PxIS & PxIE` is non-zero — so clearing `IS` before `PxIS` achieves nothing and
+the line stays down. AHCI §5.5.3 spells the order out; a model that treated `IS`
+as ordinary storage would let a driver get away with the wrong one and then
+strand it on real hardware.
+
+**A fatal error clears `PxCMD.CR`, not `PxCMD.ST`.** §6.2.2: a taskfile error,
+an interface error or a host bus error stops the command list engine and leaves
+`PxCI` holding the failing slot so software can see which command it was.
+Software restarts the port by writing `ST` one-to-zero — which is what resets
+`PxCI` — and then back to one. `OFS` — a PRD table too short for the transfer —
+is *not* fatal on a read: §6.1.5 has the adapter make "a best effort to
+continue", so the extra sectors are read and discarded and the command completes
+short with `PRDBC` saying so. On a **write** it is fatal, because the only thing
+an adapter with no data could hand the drive is data it made up and the drive
+would put it on the medium. So nothing is invented, the port stops, `PxTFD`
+reports the `DRQ` that §6.2.2.1 says to `COMRESET` on, and the sectors that were
+not written keep what they had.
+
+**A software reset is two commands and the device answers only the second.**
+§10.4.1's sequence is a control FIS asserting `SRST` and another releasing it.
+While `SRST` is asserted the device is silent, so nothing clears that slot's
+`PxCI` unless the command header's `C` bit asked the adapter to; a slot the
+adapter has sent and cannot complete is *parked* rather than re-sent, which is
+what keeps the engine making progress instead of looping on it.
+
+**The bounds are the same three NVMe documents**, against a larger structure: a
+`PRDTL` of up to 65,535 entries, a data phase capped at the sectors a 48-bit
+command can name, and one entry into the engine capped at every port's whole
+command list twice over — a bound a legitimate driver cannot reach, because
+reaching it means the data was the doorbell. `fuzz/fuzz_targets/ahci_mmio.rs`
+drives arbitrary bytes through all three, and the register block is mapped in
+the space the adapter masters so the fuzzer can aim a data block at `PxCI`.
+
+`machines/ahci-mini.machine` is the smallest board a driver can run against and
+`tests/ahci_board.rs` is that driver, held to the same standard: it enumerates
+the bus, sizes `ABAR` at base address register five (§2.1.11 puts it at
+configuration offset `24h`, which is not a choice), builds a command list and a
+scatter/gather table in the board's RAM, runs a command in each protocol, takes
+the completion interrupt off a real wire into an 8259A, and checks every
+transfer **against the medium** with the neighbouring sector asserted untouched.
+
+**On obtaining the specification.** Intel's own PDF of *Serial ATA AHCI 1.3.1*
+answers `403` to anything that is not a browser, which is why this table has
+said `[browser]` here since it was written and why AHCI waited. It is
+nevertheless obtainable and
+citable: the Internet Archive has Intel's file, and *Serial ATA Revision 1.0* —
+which AHCI §4.2.3.1 defers to for the FIS layouts and does not repeat — is an
+open download from seagate.com. Both are hardware documentation from the parties
+that wrote the standards. **No emulator source and no operating system's AHCI or
+libata driver was opened.**
 
 ## Working references
 

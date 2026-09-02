@@ -11,6 +11,7 @@
 //!
 //! | Module | Feature | Covers |
 //! | --- | --- | --- |
+//! | [`ahci`] | `dev-ahci` | a Serial ATA host bus adapter: a PCI function that DMA-walks its own command lists |
 //! | [`apple1`] | `dev-apple1` | the Apple 1's MC6821, its monitor ROM socket, and RSMON |
 //! | [`ata`] | `dev-ata-disk` | an ATA hard disk: the command block, the command set, CHS and LBA |
 //! | [`apu`] | `dev-nes-apu` | the RP2A03 audio half: channels, frame counter, DMC |
@@ -48,6 +49,10 @@ pub mod apple1;
 #[cfg(feature = "dev-nes-apu")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-apu")))]
 pub mod apu;
+
+#[cfg(feature = "dev-ahci")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-ahci")))]
+pub mod ahci;
 
 #[cfg(feature = "dev-ata-disk")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-ata-disk")))]

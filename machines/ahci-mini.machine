@@ -1,0 +1,142 @@
+# ahci-mini — the smallest board a real AHCI driver can run against.
+#
+#   rsemu run ahci-mini --drive sata0=disk.qcow2
+#
+# RAM, a PCI host bridge, an 8259A, an **AHCI host bus adapter** on the bus, and
+# one ATA drive in its port 0 bay. It models no product. It exists so that
+# `ahci.hba` has somewhere a driver can reach it the way a driver actually does
+# — enumerate the bus through `0xcf8`/`0xcfc`, size `ABAR`, place the register
+# block, build a command list and a scatter/gather table in this board's own
+# RAM, write one bit into `PxCI`, and take the completion interrupt off a real
+# wire into a real interrupt controller.
+#
+# ---------------------------------------------------------------------------
+# Why this board is not `pc-at`
+# ---------------------------------------------------------------------------
+#
+# The same argument `nvme-mini` makes: this is deliberately the *minimum*
+# around the device under test, so that a failure here is a failure in the
+# device rather than a bisection across twenty objects. The two boards share
+# every class, so an adapter that works here drops into a PC unchanged.
+#
+# ---------------------------------------------------------------------------
+# The drive
+# ---------------------------------------------------------------------------
+#
+# An ordinary `ata.disk` — the *same* object `pc-at` fits to its IDE cable, with
+# the same command set behind it. Two properties differ and both are about the
+# transport rather than the drive:
+#
+# * `bay = "sata0"`, which is where port 0 of the adapter looks. A drive bay is
+#   a cable position and a Serial ATA port is a cable position; the rendezvous
+#   is the same one the AT's channel uses.
+#
+# * `dma = true`, because a Serial ATA host adapter *is* a bus master and a real
+#   driver therefore issues `READ DMA EXT` and `WRITE DMA EXT` rather than the
+#   PIO forms. The default is false and that default is right for the AT: there
+#   is no bus master on that cable, so a drive that advertised DMA there would
+#   be inviting a driver to program an engine that is not present. Both
+#   protocols work here — `tests/ahci_board.rs` runs a command in each.
+#
+# ---------------------------------------------------------------------------
+# What is deliberately missing
+# ---------------------------------------------------------------------------
+#
+# **A processor.** Every register on this board is reached through an address
+# space, and a test or a monitor drives those directly — which is what
+# `tests/ahci_board.rs` does, and it is exactly the shape `tests/nvme_board.rs`
+# and `tests/pc_at_ide.rs` use. Adding a core would mean shipping firmware for
+# it and would prove nothing more about the adapter.
+#
+# ---------------------------------------------------------------------------
+# The interrupt
+# ---------------------------------------------------------------------------
+#
+# `ahci.irq -> pic.ir5`, and AHCI's `INTx#` is **level triggered**: the adapter
+# holds the line down while `GHC.IE` is set and any port has an enabled
+# interrupt pending in `PxIS`, and releases it when the driver has cleared both
+# `PxIS` and the global `IS` — in that order, which the specification requires
+# (§5.5.3) and which this model enforces by re-deriving `IS` from the ports. So
+# a driver must put IR5 into level mode through the edge/level control register
+# at `0x4d0`.
+
+machine "ahci-mini" {
+  # How much RAM, at zero. The command list, the received-FIS area, the PRD
+  # table and the data buffers all live in it.
+  param ram = 16M
+
+  # How big the drive is when the run does not supply an image. A medium
+  # installed under the `sata0` slot (`--drive sata0=disk.img`) wins over this
+  # and brings its own capacity.
+  param disk = 2M
+
+  # -- the crystal -----------------------------------------------------------
+  #
+  # One oscillator, so every ratio on this board is exact (ROADMAP.md §4.2).
+  # Nothing here counts it yet: the adapter completes a command inside the
+  # `PxCI` write that issued it, and when it grows a service latency the domain
+  # is already here to hang it on.
+  osc clk = 33333333 Hz
+
+  # -- the two spaces --------------------------------------------------------
+  #
+  # `read-as-ones` on both, which is what a PCI bus does with a master abort
+  # and what firmware relies on to discover an empty slot.
+  space mem  { width = 32, unassigned = read-as-ones }
+  space port { width = 16, unassigned = read-as-ones }
+
+  # -- memory ----------------------------------------------------------------
+  object dram "ram" { size = ram }
+
+  # -- the host bridge -------------------------------------------------------
+  #
+  # An 82441FX, here for one of its two jobs: `CONFADD`/`CONFDATA` at 0xcf8,
+  # which is how anything reaches configuration space on a machine with an I/O
+  # space.
+  object hb "pc.pmc" { space = mem, bus = "pci0" }
+
+  # -- the interrupt controller ----------------------------------------------
+  #
+  # A master 8259A with nothing cascaded onto it. Its `int` output is not
+  # wired: there is no processor to take it, and a test reads the request and
+  # in-service registers through `0x20` instead — which is what makes the
+  # acknowledgement visible rather than implied.
+  object pic "pc.pic" { mode = "master" }
+
+  # -- the adapter -----------------------------------------------------------
+  #
+  # `space = mem` because it is a **bus master**: its command lists, its PRD
+  # tables and its data buffers are all in this board's RAM and it reads and
+  # writes them itself. That property is not decoration — without it the
+  # adapter has nowhere to fetch a command from, and `bind` says so.
+  object ahci "ahci.hba" {
+    space  = mem
+    bus    = "pci0"
+    device = 5
+    ports  = 1
+    bays   = "sata"
+  }
+
+  # -- the drive -------------------------------------------------------------
+  object disk0 "ata.disk" {
+    bay   = "sata0"
+    image = "sata0"
+    size  = disk
+    dma   = true
+  }
+
+  # -- the memory map --------------------------------------------------------
+  #
+  # RAM, and nothing else: the adapter's register block is placed by `ABAR`,
+  # wherever the driver decides to put it. That is the whole point of a base
+  # address register and is why this board does not name an address for it.
+  map mem 0x00000000 size ram = dram
+
+  # -- the I/O map -----------------------------------------------------------
+  map port 0x0020 size 0x0002 = pic.regs   # the 8259A
+  map port 0x04d0 size 0x0001 = pic.elcr   # edge/level control
+  map port 0x0cf8 size 0x0008 = hb.config  # PCI configuration mechanism #1
+
+  # -- the wire --------------------------------------------------------------
+  wire ahci.irq -> pic.ir5
+}
