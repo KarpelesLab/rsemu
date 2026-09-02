@@ -310,8 +310,14 @@ with acceptance gates, and the design invariants.
 compression), [`purecrypto`](https://github.com/KarpelesLab/purecrypto)
 (disk/snapshot encryption, emulated crypto devices),
 [`fstool`](https://github.com/KarpelesLab/fstool) (block devices, qcow2,
-partition tables, and read-write ext/FAT/exFAT/NTFS/XFS/HFS+),
-[`noroi`](https://github.com/KarpelesLab/noroi) (monitor TUI).
+partition tables, and read-write ext/FAT/exFAT/NTFS/XFS/HFS+).
+
+[`noroi`](https://github.com/KarpelesLab/noroi) is *not* among them. It was
+listed here for a monitor TUI that has not been built and is not planned: the
+commands such a UI would carry already answer over GDB's `monitor`, and noroi's
+`std` layer is Linux-only by construction, so it could not be in the
+`--all-features` build our macOS and Windows jobs test. The reasoning is in
+[`docs/system/debug-protocols.md`](docs/system/debug-protocols.md).
 
 ## License and provenance
 
