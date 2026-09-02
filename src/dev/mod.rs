@@ -25,6 +25,7 @@
 //! | [`lcd`] | `dev-lcdc` | a generic RGB scanout engine: framebuffer in, `Scanout` out |
 //! | [`sitronix`] | `dev-st7272a` | the ST7272A TFT panel driver: SPI register configuration, no pixel path |
 //! | [`stm32`] | `dev-stm32` | STM32 peripherals: a GPIO port and a USART |
+//! | [`q35`] | `dev-q35` | the q35 chipset: an 82Q35 (G)MCH, an ICH9 LPC bridge, ECAM, and the ACPI table generator |
 //! | [`riscv`] | `dev-riscv` | the RISC-V `virt` board: CLINT, PLIC, 16550, virtio, and the device tree generator |
 //! | [`sd`] | `dev-sd-card` | an SD memory card: the command set, the state machine, the registers |
 //! | [`usb`] | `dev-usb-*` | USB host controllers — a generic EHCI, the ChipIdea/ARC variant over it, and a Synopsys dwc2 that shares nothing with either — and a HID mouse |
@@ -119,6 +120,10 @@ pub mod sms;
 ))]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32")))]
 pub mod stm32;
+
+#[cfg(feature = "dev-q35")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-q35")))]
+pub mod q35;
 
 #[cfg(feature = "dev-riscv")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-riscv")))]

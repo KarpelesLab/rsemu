@@ -778,6 +778,37 @@ dev-pc-pci = ["dev-pc", "bus-pci"]
 # it hands bytes to.
 dev-pc-floppy = ["dev-pc"]
 
+# The q35 chipset (src/dev/q35): an Intel 82Q35 (G)MCH and an ICH9 LPC bridge,
+# which is what a machine needs before a firmware or an operating system written
+# this century will recognise it as anything other than a 1996 board.
+#
+# Four things, and not one of them is a device `dev-pc` already has -- the
+# 8259As, the 8254, the MC146818, the 8042, the 8237As, the APICs and the HPET
+# are all reused from there by `machines/q35.machine`:
+#
+#   * **ECAM**, the PCI Express Enhanced Configuration Access Mechanism: a
+#     window of *memory* in which the address is the configuration address, so
+#     software reaches a function's 4 KiB of configuration space instead of the
+#     256 bytes 0xcf8/0xcfc can name. The (G)MCH's PCIEXBAR places it.
+#   * **PAM at 0x90-0x96**, the same thirteen shadow windows the 440FX has at
+#     0x59-0x5f, because a q35 firmware still copies itself into RAM.
+#   * **PCI interrupt routing**: the eight PIRQ[A-H] routers that steer a PCI
+#     function's interrupt onto an ISA line, which `bus-pci` names as the thing
+#     it cannot do "because a south bridge belongs to it and there is not one".
+#   * **ACPI**: the register block at PMBASE -- PM1 status, enable, control and
+#     the 3.579545 MHz power-management timer -- and the **tables**, RSDP,
+#     RSDT/XSDT, FADT, FACS, MADT, MCFG, HPET and a DSDT, generated from the
+#     realized machine rather than written down, the way `dev-riscv` generates
+#     its device tree.
+#
+# Written from the Intel 3 Series Express Chipset Family Datasheet (316966-002),
+# the Intel ICH9 Family Datasheet (316972-004), the ACPI Specification 6.5 and
+# the IA-PC HPET Specification, cited by section; no emulator source and no
+# firmware source was consulted (ROADMAP.md §1). `no_std + alloc`, no
+# dependencies. Needs `bus-pci` for the fabric and `dev-pc` for the parts the
+# board reuses.
+dev-q35 = ["dev-pc", "bus-pci"]
+
 # An ATA hard disk (src/dev/ata): the drive, and deliberately not a controller
 # -- "IDE" means the controller is *on the drive*, so the seam is the cable and
 # this is everything on the far side of it. The eight command block registers
@@ -967,6 +998,24 @@ machine-pc-at = [
 # specification's virtual-wire mode from the first instruction. Adds no
 # dependencies.
 machine-pc-apic = ["cpu-x86", "dev-pc", "dev-pc-apic", "dev-pc-hpet"]
+
+# The q35 board (machines/q35.machine): the same legacy device set `pc-at` has,
+# behind an ICH9 south bridge and an 82Q35 north bridge instead of a 440FX, with
+# a memory-mapped configuration window and a generated set of ACPI tables. This
+# is `ROADMAP.md` phase 6b's board, and it is the board rather than the gate:
+# a modern distribution booting to a desktop needs long mode and SMP as well.
+# The `bios` slot takes a user image and defaults to rsemu's own, exactly as
+# `pc-at` does. Adds no dependencies.
+machine-q35 = [
+  "cpu-x86",
+  "dev-q35",
+  "dev-pc-apic",
+  "dev-pc-hpet",
+  "dev-pc-pci",
+  "dev-pc-video",
+  "dev-pc-ide",
+  "dev-ata-disk",
+]
 
 # The in-house legacy PC BIOS (src/fw/pcbios): a 64 KiB real-mode ROM image
 # this crate assembles itself, so `pc-at` boots with nothing supplied from

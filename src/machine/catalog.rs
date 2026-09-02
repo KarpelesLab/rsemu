@@ -277,6 +277,28 @@ pub static PC_APIC: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/pc-apic.machine"),
 };
 
+/// The q35 board, when this build has an x86 core and the chipset.
+///
+/// `ROADMAP.md` phase 6b's board: the same legacy device set `pc-at` has,
+/// behind an ICH9 south bridge and an 82Q35 north bridge, with a
+/// memory-mapped configuration window and a **generated** set of ACPI tables.
+///
+/// It is the board and not the phase gate. A modern distribution booting to a
+/// desktop also needs long mode, SSE and SMP, and the x86 core has none of the
+/// three yet; what this entry buys is a machine those can be brought up
+/// *against*, and a chipset that a firmware written this century recognises.
+///
+/// **No firmware is shipped.** The `bios` slot defaults to rsemu's own image,
+/// exactly as `pc-at`'s does, and `--bios` displaces it.
+#[cfg(feature = "machine-q35")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-q35")))]
+pub static Q35: CatalogEntry = CatalogEntry {
+    name: "q35",
+    summary: "q35-class board: x86, 82Q35 MCH with ECAM, ICH9 LPC, APICs, HPET, VGA, IDE, ACPI",
+    media: &["bios", "vgabios", "hd0", "hd1"],
+    source: include_str!("../../machines/q35.machine"),
+};
+
 /// An STM32F407VGT6 microcontroller, when this build has a Cortex-M core.
 ///
 /// A real part rather than a synthetic board: the microcontroller on ST's own
@@ -426,6 +448,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&PC_AT);
     #[cfg(feature = "machine-pc-apic")]
     out.push(&PC_APIC);
+    #[cfg(feature = "machine-q35")]
+    out.push(&Q35);
     #[cfg(feature = "machine-nes")]
     out.push(&NES_NTSC);
     #[cfg(feature = "machine-nes")]
@@ -516,6 +540,8 @@ pub fn registry() -> Result<Registry> {
     crate::cpu::x86::register(&mut reg)?;
     #[cfg(feature = "dev-pc")]
     crate::dev::pc::register(&mut reg)?;
+    #[cfg(feature = "dev-q35")]
+    crate::dev::q35::register(&mut reg)?;
     #[cfg(feature = "bus-spi")]
     crate::bus::spi::controller::register(&mut reg)?;
     #[cfg(feature = "dev-st7272a")]
@@ -615,6 +641,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::cpu::x86::bind(&mut b)?;
     #[cfg(feature = "dev-pc")]
     crate::dev::pc::bind(&mut b)?;
+    #[cfg(feature = "dev-q35")]
+    crate::dev::q35::bind(&mut b)?;
     #[cfg(feature = "bus-spi")]
     crate::bus::spi::controller::bind(&mut b)?;
     #[cfg(feature = "dev-st7272a")]
@@ -738,6 +766,10 @@ pub fn classes() -> ClassTable {
     }
     #[cfg(feature = "dev-pc")]
     for schema in crate::dev::pc::schemas() {
+        table.insert(schema);
+    }
+    #[cfg(feature = "dev-q35")]
+    for schema in crate::dev::q35::schemas() {
         table.insert(schema);
     }
     #[cfg(feature = "dev-lcdc")]
@@ -1495,6 +1527,14 @@ mod tests {
             ("pc-at", "hd0" | "hd1") => &[],
             #[cfg(feature = "machine-pc-apic")]
             ("pc-apic", "bios") => blank(128 * 1024),
+            // The q35 board's BIOS socket is 64 KiB rather than `pc-at`'s 128,
+            // because 0xe0000-0xeffff is where its ACPI tables go.
+            #[cfg(feature = "machine-q35")]
+            ("q35", "bios") => blank(64 * 1024),
+            #[cfg(feature = "machine-q35")]
+            ("q35", "vgabios") => blank(32 * 1024),
+            #[cfg(feature = "machine-q35")]
+            ("q35", "hd0" | "hd1") => &[],
             (m, other) => panic!("no fixture for `{m}`'s media slot `{other}`"),
         }
     }
@@ -1505,7 +1545,11 @@ mod tests {
     /// wanted here are a socket's, not a constant's — so the array cannot be a
     /// `static`. Leaking a handful of buffers in a test process is the honest
     /// trade against threading a lifetime through the whole fixture table.
-    #[cfg(any(feature = "machine-pc-at", feature = "machine-pc-apic"))]
+    #[cfg(any(
+        feature = "machine-pc-at",
+        feature = "machine-pc-apic",
+        feature = "machine-q35"
+    ))]
     fn blank(len: usize) -> &'static [u8] {
         use crate::core::sync::Global;
         use alloc::collections::BTreeMap;

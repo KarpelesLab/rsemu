@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std", "vnc", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-blk", "dev-ne2000", "dev-nvme", "dev-ahci", "dev-riscv", "dev-pc-apic", "dev-pc-hpet", "ir", "jit", "cpu-riscv-lift", "float"]
+features         = ["std", "vnc", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-blk", "dev-ne2000", "dev-nvme", "dev-ahci", "dev-riscv", "dev-pc-apic", "dev-pc-hpet", "dev-q35", "ir", "jit", "cpu-riscv-lift", "float"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -236,6 +236,20 @@ bench = false
 [[bin]]
 name  = "pc_apic"
 path  = "fuzz_targets/pc_apic.rs"
+test  = false
+doc   = false
+bench = false
+
+# The q35 chipset's three new surfaces: the ECAM window, the two bridges'
+# configuration registers, and the ACPI register block at PMBASE. One target
+# rather than three, because the interesting failures are between them -- a
+# configuration write through ECAM moves a window in the space the write is
+# already travelling through, and one through 0xcfc moves a window in the other
+# -- and because every one of them can leave the address space holding a mapping
+# the registers no longer agree with.
+[[bin]]
+name  = "q35_chipset"
+path  = "fuzz_targets/q35_chipset.rs"
 test  = false
 doc   = false
 bench = false
