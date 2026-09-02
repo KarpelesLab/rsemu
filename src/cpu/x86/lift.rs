@@ -34,9 +34,9 @@
 //! | Excluded | Why |
 //! | --- | --- |
 //! | x87, SSE, MMX | the IR has no vector ops (`ROADMAP.md` §9 adds them with the SIMD work) and tier-1 floating point is a helper call into soft-float that no x87 entry point exists for yet |
-//! | long mode, `REX` | a second operand-size and address-size lattice on top of the one below, and no guest here runs it |
+//! | long mode, `REX` | a second operand-size and address-size lattice on top of the one below, **and a carry the IR cannot compute at this width** — see "Widening the world" |
 //! | real mode and virtual-8086 | `segment << 4 + offset` with a *16-bit offset wrap* is a different address path in `exec`, checked against three million hardware vectors, and generalising it is how that accuracy gets lost |
-//! | paging | see "Ticks": a fetch inside the block could miss the guest TLB and walk, and then no fetch charge is static any more |
+//! | paging | a fetch inside the block can charge a page-table walk, and **not only at the block's entry** — see "Widening the world" |
 //! | `DIV`, `IDIV` | `#DE` is an exception the block cannot deliver, and the undefined flags come out of `exec::cord`'s trial-subtraction **loop**, which a block with only forward branches cannot express |
 //! | the string primitives, `REP` | a loop inside a block; the IR's verifier rejects a backward [`Opcode::BRCOND`] because `ir::pass`'s liveness is a single backward walk |
 //! | `LOCK`, `XCHG` with memory | the IR's atomics carry no [`MemOp`], so a byte- or word-wide atomic has no type to name (`ir`'s "Known gaps") |
@@ -157,11 +157,13 @@
 //!   page: `CS.base` need not be page-aligned, and it is the *linear* page a
 //!   guest store is matched against (`jit::Translation::page` is guest-physical,
 //!   and with paging off physical is linear).
-//! * **Paging is out of the subset.** With paging on, the first fetch of a
-//!   block may miss the guest's own TLB and charge a page-table walk, and no
-//!   lift can know whether the entry is warm. Data accesses would be fine —
-//!   they charge through the host — so this is a restriction on *fetch*
-//!   alone, and it is the one that keeps every fetch charge static.
+//! * **Paging is out of the subset.** With paging on, a fetch may miss the
+//!   guest's own translation-lookaside buffer and charge a page-table walk,
+//!   which is two to four bus reads and possibly an accessed-bit write. Data
+//!   accesses would be fine — they charge through the host — so this is a
+//!   restriction on *fetch* alone, and it is the one that keeps every fetch
+//!   charge static. "Widening the world" below says exactly what it would
+//!   take to lift it, because the obvious answer is not enough.
 //!
 //! ## Page-straddling instructions
 //!
@@ -181,6 +183,90 @@
 //! charge rather than a guess. A block whose **first** instruction straddles
 //! lifts nothing at all, reports zero instructions, and the dispatcher answers
 //! `Stop::Untranslatable` — which is the contract that already existed.
+//!
+//! # Widening the world: what long mode and paging would actually cost
+//!
+//! Both refusals in [`World::of`] are the ones between this frontend and a
+//! 64-bit guest, since a 64-bit kernel is in long mode with paging on from the
+//! decompressor onward. They are written up here rather than left as two `if`
+//! statements, because in each case the reason in the table above is the
+//! *smaller* half of the problem and rediscovering the larger half is a day
+//! nobody needs to spend twice.
+//!
+//! ## Paging: the entry walk is the easy part
+//!
+//! The obvious plan works as far as it goes. A block never leaves its page, so
+//! the whole of it translates through one entry; give [`World`] an origin
+//! carrying a translation generation the way `cpu::riscv::lift::Origin` does,
+//! fold it into [`key`], and require the caller to read the entry's bytes
+//! through `exec`'s own *fetch* path — which charges the walk, sets the
+//! accessed bit and checks execute permission — rather than through a debug
+//! walk. That accounts for a cold entry exactly.
+//!
+//! What it does not account for is a **second** walk *inside* the block, and
+//! there is one available: `paging::Tlb` is a single 32-entry array indexed
+//! `page % 32`, shared by fetches and data accesses, and `Exec::fetch_at` and
+//! `Exec::translate` both go through `translate_access` into it. So a guest
+//! instruction whose data operand lies 128 KiB from the code page evicts the
+//! code page's own translation, and the interpreter's *next* instruction fetch
+//! re-walks and charges for it. A lifted block makes no fetches at all and
+//! cannot charge that, so the two engines disagree on the tick column at a
+//! point no static analysis of the block can predict.
+//!
+//! Three ways out, and the middle one is the one to take:
+//!
+//! * Model the buffer's replacement inside the block. That is a second
+//!   implementation of `Tlb` in the IR, which is the thing this crate keeps
+//!   refusing to do for good reasons.
+//! * **Split the buffer into an instruction and a data half**, which is what
+//!   the hardware has had since the 486 and what the *Intel SDM* volume 3
+//!   §4.10.2 describes. A data access then cannot evict a code translation,
+//!   the only walk a block can charge is the entry one, and the plan above
+//!   becomes exact. It is an accuracy improvement in the interpreter rather
+//!   than a concession to the translator — but it *changes the virtual-time
+//!   total of every paged guest*, so it wants to land with a re-measured
+//!   `docs/platforms/pc64.md` boot beside it rather than on its own.
+//! * Stop comparing ticks under paging. That is giving up the column the
+//!   phase-5 state-hash gate is built on, and it is not an option.
+//!
+//! ## Long mode: `REX` is not the hard part either
+//!
+//! The register file and the prefix are mechanical — [`isa::decode_stream_as`]
+//! already decodes `Bits::B64`, because `exec` runs it. Four things behind
+//! them are not:
+//!
+//! 1. **The carry of a 64-bit `ADD` is bit 64, and there is no `i65`.**
+//!    `Lifter::add` computes `CF` as `self.bit(wide, bits)` at
+//!    [`Type::I64`], which is exactly why "Arithmetic is at [`Type::I64`]
+//!    whatever the operand size" is stated below as an invariant — and at a
+//!    64-bit operand size that bit does not exist and the flag would come out
+//!    zero. `Lifter::sub`'s `setcond(LtU, a, rhs)` survives without a
+//!    borrow in and fails with one, because `rhs = b + 1` wraps to zero on an
+//!    all-ones subtrahend. Both want the unsigned-compare formulation
+//!    (`CF = r < a` for an add, `a < b || (a == b && borrow)` for a subtract)
+//!    at the operand's width, which is a change to the arithmetic core rather
+//!    than a new case beside it.
+//! 2. **A 64-bit `MUL` needs [`Opcode::MULU2`]/[`Opcode::MULS2`]**, which
+//!    "What the IR could not say" below records as unexercised precisely
+//!    because a 32-bit subset never reaches them.
+//! 3. **The slot numbering doubles.** Sixteen general registers pushes `RIP`
+//!    and the six flags up the numbering, which every consumer of
+//!    [`SLOT_COUNT`] and [`FLAG_SLOTS`] — [`differential`](super::differential)
+//!    included — reads.
+//! 4. **`RIP`-relative addressing makes the effective address depend on the
+//!    instruction's own length**, and `Lifter`'s effective-address helper masks
+//!    every sum to thirty-two bits.
+//!
+//! ## And it is not sufficient on its own
+//!
+//! Worth saying because it is easy to assume otherwise: widening this world
+//! makes a 64-bit block *translatable*, and nothing more. No CPU core has a
+//! JIT execution path — `X86`'s `Runnable::run` calls the interpreter's `step`
+//! in a loop, and `jit::Dispatcher` appears only in
+//! [`differential`](super::differential) and `cpu::riscv::differential`, driven
+//! by their own hosts. `docs/platforms/pc64.md` measures the consequence: a
+//! kernel boot with `jit-x86` and without it is byte-for-byte identical.
+//! Both halves are needed, and this one is the second.
 //!
 //! # Self-modifying code, which x86 makes architectural
 //!
