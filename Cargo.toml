@@ -104,12 +104,11 @@ display-png = ["std", "dep:oxideav-png"]
 # offers. This is the feature set `web/README.md` builds; plain `wasm` stays
 # minimal so the CI wasm job keeps checking the boundary rather than the catalog.
 #
-# Four machines, and the selection rule is **what a visitor can actually run**:
-# three of them boot on an image compiled into the module, so the page has
-# something to press before it has a file to open.
+# Six machines in two groups (eight catalog entries: the NES and the Master
+# System each ship an NTSC and a PAL file), and the selection rule is **what a
+# visitor can actually run**. Three of them boot on an image compiled into the
+# module, so the page has something to press before it has a file to open:
 #
-#   nes-ntsc / nes-pal  the one machine worth a file picker: everyone knows what
-#                       a .nes is, it has a picture and it has sound.
 #   apple1              a console, RSMON built in, nothing to upload.
 #   beneater-6502       a serial console with *two* built-in monitors — RSMON,
 #                       and the public-domain Woz Monitor of 1976.
@@ -118,9 +117,16 @@ display-png = ["std", "dep:oxideav-png"]
 #                       it is what keeps `host::display::lcd` exercised in a
 #                       browser rather than only in a PNG test.
 #
+# The other three want a cartridge the visitor supplies, read in the page and
+# never uploaded:
+#
+#   nes-ntsc / nes-pal  everyone knows what a .nes is; a picture and sound.
+#   gameboy             a .gb, and a second not-6502-shaped console with a
+#                       picture — `host::display::gb` is what makes it one.
+#   sms-ntsc / sms-pal  a .sms, a Z80 with a separate I/O space, and the only
+#                       machine here with two controller ports.
+#
 # Deliberately absent, and each for a reason that would show on the page: the
-# Game Boy and the Master System need a cartridge nobody has to hand (and the
-# DMG has no `host::display` adapter at all, so it would draw nothing); the
 # bare boards — z80-mini, m68k-mini, mips-mini, arm926, stm32f407 — want a
 # firmware image and have neither a console nor a screen without one; riscv-virt
 # wants a kernel or an SBI build and is the single largest thing this list could
@@ -133,6 +139,8 @@ demo = [
     "machine-apple1",
     "machine-beneater",
     "machine-spi-panel",
+    "machine-gameboy",
+    "machine-sms",
 ]
 
 # NES cartridges (src/dev/cart): iNES and NES 2.0 image parsing, the

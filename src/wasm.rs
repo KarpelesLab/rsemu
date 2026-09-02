@@ -180,8 +180,8 @@ struct State {
     /// ports rather than the last machine's.
     hosts: Option<alloc::sync::Arc<crate::core::hosts::HostObjects>>,
     /// The pad port the machine's controllers read, if it has any.
-    #[cfg(feature = "dev-nes-io")]
-    pad: Option<alloc::sync::Arc<crate::dev::nes::input::Pad>>,
+    #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+    pad: Option<Pads>,
     /// The sound, resampled to whatever the page's `AudioContext` runs at, if
     /// this machine makes any.
     audio: Option<crate::host::audio::AudioStream>,
@@ -209,7 +209,7 @@ impl State {
             scanout: None,
             console: None,
             hosts: None,
-            #[cfg(feature = "dev-nes-io")]
+            #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
             pad: None,
             audio: None,
             audio_rate: DEFAULT_AUDIO_RATE,
@@ -229,7 +229,12 @@ impl State {
     /// RGB888 to avoid a padding byte — but this buffer's format is part of the
     /// ABI ([`rsemu_frame_ptr`]: four bytes a pixel, which is what `ImageData`
     /// holds), so it is fixed here and every adapter converts on capture.
-    #[cfg(any(feature = "dev-nes-ppu", feature = "dev-lcdc"))]
+    #[cfg(any(
+        feature = "dev-nes-ppu",
+        feature = "dev-lcdc",
+        feature = "dev-gb",
+        feature = "dev-sms"
+    ))]
     fn attach_scanout(&mut self, scanout: alloc::boxed::Box<dyn crate::host::display::Scanout>) {
         let info = scanout.info();
         self.frame = crate::host::display::Surface::new(
@@ -238,6 +243,140 @@ impl State {
             info.height,
         );
         self.scanout = Some(scanout);
+    }
+}
+
+/// Whichever console's controllers this machine has, behind one host mask.
+///
+/// [`rsemu_set_buttons`] speaks **one** button order for every machine — the
+/// eight named bits `web/src/rsemu.js` calls `BUTTONS`, which are the NES
+/// shift register's because that is the console the seam was written for. No
+/// two of these consoles agree on a bit order, and none of them is going to:
+/// the Game Boy's matrix reads its four columns out in the opposite direction
+/// and the Master System's pad has six lines and no Select at all. Translating
+/// is therefore a *host* job, exactly as turning a palette index into a colour
+/// is, and this enum is where it happens — a page presses "A" and each console
+/// receives whatever "A" is wired to on its own pins.
+///
+/// A build with no controller device at all has no variants here, which is why
+/// every use of it carries the same `any(...)` gate the field does.
+#[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+enum Pads {
+    /// Two NES ports, in the shift register's own order — no translation.
+    #[cfg(feature = "dev-nes-io")]
+    Nes(alloc::sync::Arc<crate::dev::nes::input::Pad>),
+    /// The Game Boy's one matrix.
+    #[cfg(feature = "dev-gb")]
+    Gb(alloc::sync::Arc<crate::dev::gb::joypad::GbPad>),
+    /// Two Master System ports, plus the console's own Pause button.
+    #[cfg(feature = "dev-sms")]
+    Sms(alloc::sync::Arc<crate::dev::sms::io::SmsPads>),
+}
+
+#[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+impl Pads {
+    /// Apply the host mask for `port`.
+    fn set(&self, port: usize, mask: u8) {
+        match self {
+            #[cfg(feature = "dev-nes-io")]
+            Pads::Nes(pad) => pad.set(port, mask),
+            // One pad, so port 1 is nobody: a Game Boy has a single matrix and
+            // pressing a second controller on it would be inventing hardware.
+            //
+            // Bit order (Pan Docs, "Joypad Input", and `dev::gb::joypad`):
+            // 0 Right, 1 Left, 2 Up, 3 Down, 4 A, 5 B, 6 Select, 7 Start.
+            #[cfg(feature = "dev-gb")]
+            Pads::Gb(pad) => {
+                if port != 0 {
+                    return;
+                }
+                let mut out = 0u8;
+                for (from, to) in [
+                    (0x01, 0), // Right
+                    (0x02, 1), // Left
+                    (0x08, 2), // Up
+                    (0x04, 3), // Down
+                    (0x80, 4), // A
+                    (0x40, 5), // B
+                    (0x20, 6), // Select
+                    (0x10, 7), // Start
+                ] {
+                    if mask & from != 0 {
+                        out |= 1 << to;
+                    }
+                }
+                pad.set_buttons(out);
+            }
+            // Six lines a pad (`dev::sms::io::Button`): 0 Up, 1 Down, 2 Left,
+            // 3 Right, 4 button 1, 5 button 2. A and B become the two buttons
+            // the console actually has.
+            //
+            // **Start is the Pause button**, which is not on the pad at all —
+            // it is a switch on the console driving `/NMI`. Holding it is
+            // correct rather than approximate: the pin latches the rising edge,
+            // so one press is one interrupt however long a thumb rests on it.
+            // Select has nowhere to go, and inventing a seventh line for it
+            // would be worse than dropping it.
+            #[cfg(feature = "dev-sms")]
+            Pads::Sms(pads) => {
+                let mut out = 0u8;
+                for (from, to) in [
+                    (0x08, 0), // Up
+                    (0x04, 1), // Down
+                    (0x02, 2), // Left
+                    (0x01, 3), // Right
+                    (0x80, 4), // button 1
+                    (0x40, 5), // button 2
+                ] {
+                    if mask & from != 0 {
+                        out |= 1 << to;
+                    }
+                }
+                pads.set_buttons(port, out);
+                if port == 0 {
+                    pads.set_pause(mask & 0x10 != 0);
+                }
+            }
+        }
+    }
+
+    /// Whatever this build's machine opened, found by name in `hosts`.
+    ///
+    /// The same name-based seam the console uses, and the *only* input door:
+    /// each family's `pads` module is what a recorder registers as a channel,
+    /// so a button pressed here is a button a replay reproduces.
+    fn take(hosts: &crate::core::hosts::HostObjects) -> Option<Pads> {
+        #[cfg(feature = "dev-nes-io")]
+        {
+            use crate::dev::nes::input::pads;
+            if let Some(pad) = pads::names(hosts)
+                .first()
+                .and_then(|n| pads::get(hosts, n).ok().flatten())
+            {
+                return Some(Pads::Nes(pad));
+            }
+        }
+        #[cfg(feature = "dev-gb")]
+        {
+            use crate::dev::gb::joypad::pads;
+            if let Some(pad) = pads::names(hosts)
+                .first()
+                .and_then(|n| pads::get(hosts, n).ok().flatten())
+            {
+                return Some(Pads::Gb(pad));
+            }
+        }
+        #[cfg(feature = "dev-sms")]
+        {
+            use crate::dev::sms::io::pads;
+            if let Some(pad) = pads::names(hosts)
+                .first()
+                .and_then(|n| pads::get(hosts, n).ok().flatten())
+            {
+                return Some(Pads::Sms(pad));
+            }
+        }
+        None
     }
 }
 
@@ -553,6 +692,14 @@ fn boot_with(index: u32, media: Media) -> u32 {
         if let Err(e) = crate::host::display::lcd::capture::install(&mut options) {
             return fail(state, e);
         }
+        #[cfg(feature = "dev-gb")]
+        if let Err(e) = crate::host::display::gb::capture::install(&mut options) {
+            return fail(state, e);
+        }
+        #[cfg(feature = "dev-sms")]
+        if let Err(e) = crate::host::display::sms::capture::install(&mut options) {
+            return fail(state, e);
+        }
 
         // The APU's output ring has to survive one `rsemu_run_frame`, which is
         // as long as anything here ever goes without draining it. Sizing it is
@@ -586,6 +733,18 @@ fn boot_with(index: u32, media: Media) -> u32 {
         {
             state.attach_scanout(alloc::boxed::Box::new(scanout));
         }
+        #[cfg(feature = "dev-gb")]
+        if state.scanout.is_none()
+            && let Some(scanout) = crate::host::display::gb::capture::take(&hosts)
+        {
+            state.attach_scanout(alloc::boxed::Box::new(scanout));
+        }
+        #[cfg(feature = "dev-sms")]
+        if state.scanout.is_none()
+            && let Some(scanout) = crate::host::display::sms::capture::take_vdp(&hosts)
+        {
+            state.attach_scanout(alloc::boxed::Box::new(scanout));
+        }
 
         // Sound goes out as interleaved `f32` in [-1, 1], which is what
         // WebAudio's `AudioBuffer` holds, so the page copies rather than
@@ -611,15 +770,12 @@ fn boot_with(index: u32, media: Media) -> u32 {
         }
 
         // And whatever pad port its controllers read is where buttons go. The
-        // same name-based seam as the console (`dev::nes::input::pads`), for
-        // the same reason: a machine file can hand a device a name and nothing
-        // else.
-        #[cfg(feature = "dev-nes-io")]
+        // same name-based seam as the console, for the same reason: a machine
+        // file can hand a device a name and nothing else. Which console's pad
+        // it is decides how a host mask reaches its pins — see [`Pads`].
+        #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
         {
-            let pads = crate::dev::nes::input::pads::names(&hosts);
-            state.pad = pads
-                .first()
-                .and_then(|n| crate::dev::nes::input::pads::get(&hosts, n).ok().flatten());
+            state.pad = Pads::take(&hosts);
         }
         state.hosts = Some(hosts);
         state.buttons = [0; 2];
@@ -639,7 +795,7 @@ pub extern "C" fn rsemu_shutdown() {
         state.console = None;
         state.audio = None;
         state.hosts = None;
-        #[cfg(feature = "dev-nes-io")]
+        #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
         {
             state.pad = None;
         }
@@ -939,16 +1095,20 @@ pub extern "C" fn rsemu_audio_dropped() -> u64 {
 
 /// Set the buttons held on controller `port` (0 or 1).
 ///
-/// The mask is the shift register's own output order — `0x80` A, `0x40` B,
-/// `0x20` Select, `0x10` Start, `0x08` Up, `0x04` Down, `0x02` Left, `0x01`
-/// Right — because that is the order the hardware shifts out and therefore the
-/// order the host seam speaks
+/// The mask is `0x80` A, `0x40` B, `0x20` Select, `0x10` Start, `0x08` Up,
+/// `0x04` Down, `0x02` Left, `0x01` Right. That is the NES shift register's own
+/// output order
 /// ([NESdev, "Standard controller"](https://www.nesdev.org/wiki/Standard_controller),
 /// and [`dev::nes::input::buttons`](crate::dev::nes::input::buttons), which is
-/// where the constants live).
+/// where the constants live), and it is **the ABI's order for every machine**,
+/// not only that one: a page presses "A" and each console receives whatever A
+/// is wired to on its own pins. The module's own `Pads` is the translation, and
+/// it says what each console does with a button it has not got — a Game Boy has
+/// one pad, a Master System has two and no Select, and its Start is the Pause
+/// switch on the console rather than a line on the pad.
 ///
 /// The state is a **level, not an event**: the console samples it whenever the
-/// guest strobes `$4016`, so a button stays held until the embedder clears it.
+/// guest strobes its port, so a button stays held until the embedder clears it.
 /// That is also what makes the seam replayable.
 #[unsafe(no_mangle)]
 pub extern "C" fn rsemu_set_buttons(port: u32, mask: u32) {
@@ -956,7 +1116,7 @@ pub extern "C" fn rsemu_set_buttons(port: u32, mask: u32) {
         if let Some(slot) = state.buttons.get_mut(port as usize) {
             *slot = mask & 0xff;
         }
-        #[cfg(feature = "dev-nes-io")]
+        #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
         if let Some(pad) = state.pad.as_ref() {
             pad.set(port as usize, (mask & 0xff) as u8);
         }
@@ -978,13 +1138,13 @@ pub extern "C" fn rsemu_buttons(port: u32) -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn rsemu_has_pad() -> u32 {
     with_state(|state| {
-        #[cfg(feature = "dev-nes-io")]
+        #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
         {
             u32::from(state.pad.is_some())
         }
         // A build with no controller device has no pad on any machine, and the
         // export still exists so a page never has to feature-detect.
-        #[cfg(not(feature = "dev-nes-io"))]
+        #[cfg(not(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms")))]
         {
             let _ = state;
             0
@@ -1143,7 +1303,11 @@ mod tests {
     /// is dead code in a build without it -- and `--no-default-features
     /// --features wasm` is a real sweep configuration that compiles the ABI
     /// with an empty catalog.
-    #[cfg(feature = "machine-beneater")]
+    #[cfg(any(
+        feature = "machine-beneater",
+        feature = "machine-gameboy",
+        feature = "machine-sms"
+    ))]
     fn machine_index(name: &str) -> u32 {
         (0..rsemu_machine_count())
             .find(|i| {
@@ -1457,6 +1621,126 @@ mod tests {
         with_state(|state| state.input.copy_from_slice(&snapshot));
         assert_eq!(rsemu_load(snapshot.len()), 1, "load failed");
         assert_eq!(rsemu_state_hash(), hash, "the snapshot did not restore");
+
+        rsemu_shutdown();
+    }
+
+    /// The Game Boy through the ABI: a picture, and a button that lands on the
+    /// console's own pins rather than only in the module's record of it.
+    ///
+    /// The translation is the point. [`rsemu_set_buttons`] speaks one order for
+    /// every machine and no two of these consoles agree on one, so "A" has to
+    /// arrive as the DMG's bit 4 and not as `$80` — and the only way to know is
+    /// to read it back off the pad the machine actually opened.
+    #[cfg(feature = "machine-gameboy")]
+    #[test]
+    fn a_game_boy_draws_and_takes_a_button_through_the_abi() {
+        let _one = ONE_MACHINE.lock();
+
+        // `LD A,$91 / LDH ($40),A` — the LCD on with the background enabled,
+        // then a park. Enough for the controller to complete frames; the
+        // picture a program draws is `host::display::gb`'s own test.
+        let image = crate::dev::gb::cart::synthetic_image(
+            2,
+            0x00,
+            0x00,
+            &[0x3e, 0x91, 0xe0, 0x40, 0x18, 0xfe],
+        );
+        let index = machine_index("gameboy");
+        rsemu_input_reserve(image.len());
+        with_state(|state| state.input.copy_from_slice(&image));
+        assert_eq!(rsemu_boot(index, image.len()), 1, "the Game Boy boots");
+
+        assert_eq!(rsemu_has_video(), 1, "the DMG has a picture now");
+        assert_eq!(rsemu_frame_width(), 160);
+        assert_eq!(rsemu_frame_height(), 144);
+        assert_eq!(rsemu_frame_len(), 160 * 144 * 4, "four bytes a pixel");
+        assert_eq!(rsemu_frame_period_ns(), 16_742_706);
+        assert!(rsemu_run_frames(4) > 0, "four frames produced no picture");
+
+        assert_eq!(rsemu_has_pad(), 1, "and eight buttons to press");
+        {
+            use crate::dev::gb::joypad::{Button, DEFAULT_PAD_PORT, pads};
+
+            let hosts = with_state(|state| state.hosts.clone()).expect("a machine is booted");
+            let pad = pads::get(&hosts, DEFAULT_PAD_PORT)
+                .ok()
+                .flatten()
+                .expect("the machine opened its pad port");
+            // `0x80 | 0x08` is A and Up in the ABI's order; on a DMG that is
+            // bit 4 and bit 2.
+            rsemu_set_buttons(0, 0x88);
+            assert_eq!(
+                pad.buttons(),
+                (1 << Button::A.bit()) | (1 << Button::Up.bit()),
+                "A and Up did not arrive in the joypad's own bit order"
+            );
+            // Port 1 is nobody: a Game Boy has one matrix.
+            rsemu_set_buttons(1, 0xff);
+            assert_eq!(
+                pad.buttons(),
+                (1 << Button::A.bit()) | (1 << Button::Up.bit()),
+                "a second controller pressed buttons on the only one"
+            );
+            rsemu_set_buttons(0, 0);
+            assert_eq!(pad.buttons(), 0);
+        }
+
+        rsemu_shutdown();
+    }
+
+    /// The Master System through the ABI, and the two things it does that no
+    /// other machine here does: a second controller port, and a Start that is
+    /// the console's Pause switch rather than a line on the pad.
+    #[cfg(feature = "machine-sms")]
+    #[test]
+    fn a_master_system_draws_and_takes_two_pads_through_the_abi() {
+        let _one = ONE_MACHINE.lock();
+
+        // `DI / LD A,$40 / OUT ($BF),A / LD A,$81 / OUT ($BF),A / JR $` —
+        // register 1 with the display enabled, then a park.
+        let mut image = alloc::vec![0xffu8; 0x4000 * 2];
+        image[..11].copy_from_slice(&[
+            0xf3, 0x3e, 0x40, 0xd3, 0xbf, 0x3e, 0x81, 0xd3, 0xbf, 0x18, 0xfe,
+        ]);
+        let index = machine_index("sms-ntsc");
+        rsemu_input_reserve(image.len());
+        with_state(|state| state.input.copy_from_slice(&image));
+        assert_eq!(rsemu_boot(index, image.len()), 1, "the Master System boots");
+
+        assert_eq!(rsemu_has_video(), 1);
+        assert_eq!(rsemu_frame_width(), 256);
+        assert_eq!(rsemu_frame_height(), 192, "mode 4's default height");
+        assert!(rsemu_run_frames(4) > 0, "four frames produced no picture");
+
+        assert_eq!(rsemu_has_pad(), 1);
+        {
+            use crate::dev::sms::io::{Button, DEFAULT_PAD_PORT, pads};
+
+            let hosts = with_state(|state| state.hosts.clone()).expect("a machine is booted");
+            let pads = pads::get(&hosts, DEFAULT_PAD_PORT)
+                .ok()
+                .flatten()
+                .expect("the machine opened its pad ports");
+            // A and Left in the ABI's order become button 1 and Left.
+            rsemu_set_buttons(0, 0x82);
+            assert_eq!(
+                pads.buttons(0),
+                (1 << Button::One.bit()) | (1 << Button::Left.bit())
+            );
+            // And port 1 is a real second pad, which is what a two-player
+            // machine means.
+            rsemu_set_buttons(1, 0x40);
+            assert_eq!(pads.buttons(1), 1 << Button::Two.bit());
+            assert_eq!(
+                pads.buttons(0),
+                (1 << Button::One.bit()) | (1 << Button::Left.bit()),
+                "port 1 wrote over port 0"
+            );
+            rsemu_set_buttons(0, 0);
+            rsemu_set_buttons(1, 0);
+            assert_eq!((pads.buttons(0), pads.buttons(1)), (0, 0));
+        }
 
         rsemu_shutdown();
     }

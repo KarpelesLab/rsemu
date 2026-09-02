@@ -22,11 +22,9 @@
 //!                             (Scanout)              → wasm exports → a canvas
 //! ```
 //!
-//! The device side is one small adapter per display device
-//! ([`nes::NesScanout`] is the first, [`lcd::LcdScanout`] the second); the host
-//! side never learns which machine
-//! it is looking at. A Game Boy's LCD, a VGA card and a virtio-gpu each add an
-//! adapter and nothing else changes.
+//! The device side is one small adapter per display device — [`nes`], [`lcd`],
+//! [`pc`], [`sms`] and [`gb`] — and the host side never learns which machine it
+//! is looking at. A virtio-gpu adds an adapter and nothing else changes.
 //!
 //! # Why a callback-free `Surface` rather than a borrowed slice
 //!
@@ -79,6 +77,10 @@
 //! buffer is actually indexed.
 
 pub mod palette;
+
+#[cfg(feature = "dev-gb")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-gb")))]
+pub mod gb;
 
 #[cfg(feature = "dev-lcdc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-lcdc")))]

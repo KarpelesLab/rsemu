@@ -243,6 +243,8 @@ if (machines.length === 0) {
 
 const nes = machines.find((m) => m.name.startsWith("nes"));
 const apple1 = machines.find((m) => m.name === "apple1");
+const gameboy = machines.find((m) => m.name === "gameboy");
+const sms = machines.find((m) => m.name.startsWith("sms"));
 
 if (nes) {
   const image = romPath ? new Uint8Array(readFileSync(romPath)) : minimalNrom();
@@ -307,6 +309,59 @@ if (nes) {
   emu.setButtons(0, Rsemu.BUTTONS.start | Rsemu.BUTTONS.a);
   check(emu.buttons(0) === (Rsemu.BUTTONS.start | Rsemu.BUTTONS.a), "buttons are recorded");
   console.log(`  state hash: ${hash}, ${(emu.nowNs() / 1e6).toFixed(1)} ms of virtual time`);
+  emu.shutdown();
+}
+
+// The other two cartridge machines. Neither carries a built-in image — a
+// cartridge is the visitor's to supply — so the picture is checked against a
+// ROM generated right here, exactly as the NES's is. Nothing is vendored.
+for (const [machine, image, label, shape] of [
+  [gameboy, gameboy && minimalGb(), "Game Boy", [160, 144]],
+  [sms, sms && minimalSms(), "Master System", [256, 192]],
+]) {
+  if (!machine) continue;
+  emu.boot(machine.index, image);
+  check(emu.running, `the ${label} boots`);
+  check(emu.hasVideo, `the ${label} has a picture`);
+  check(
+    emu.width === shape[0] && emu.height === shape[1],
+    `${label}: ${emu.width}x${emu.height}, wanted ${shape[0]}x${shape[1]}`,
+  );
+
+  let drawn = 0;
+  for (let i = 0; i < 120; i++) if (emu.runFrame()) drawn++;
+  check(drawn > 100, `${drawn} of 120 ${label} frames produced a picture`);
+
+  const pixels = emu.bytes(instance.exports.rsemu_frame_ptr(), instance.exports.rsemu_frame_len());
+  check(
+    pixels.length === shape[0] * shape[1] * 4,
+    `${label}: four bytes a pixel, which is what ImageData holds`,
+  );
+  check(
+    pixels.every((b, i) => i % 4 !== 3 || b === 255),
+    `${label}: every pixel is opaque`,
+  );
+  const colours = new Set();
+  for (let i = 0; i < pixels.length; i += 4) {
+    colours.add((pixels[i] << 16) | (pixels[i + 1] << 8) | pixels[i + 2]);
+  }
+  check(colours.size > 1, `${label}: ${colours.size} distinct colours, so it drew something`);
+
+  check(emu.hasPad, `the ${label} has controllers to press`);
+  emu.setButtons(0, Rsemu.BUTTONS.start | Rsemu.BUTTONS.a);
+  check(
+    emu.buttons(0) === (Rsemu.BUTTONS.start | Rsemu.BUTTONS.a),
+    `${label}: buttons are recorded`,
+  );
+  emu.setButtons(0, 0);
+
+  const hash = emu.stateHash();
+  const state = emu.save();
+  check(state.length > 0, `${label}: save state is ${state.length} bytes`);
+  emu.runFrames(5);
+  check(emu.stateHash() !== hash, `${label}: running changes the state hash`);
+  emu.load(state);
+  check(emu.stateHash() === hash, `${label}: and loading the snapshot restores it`);
   emu.shutdown();
 }
 
@@ -569,4 +624,61 @@ function minimalNrom() {
   image[16 + 0x3ffc] = 0x00;
   image[16 + 0x3ffd] = 0xc0;
   return image;
+}
+
+// A two-bank Game Boy cartridge whose program fills tile data and the tile map,
+// turns the LCD on and then scrolls — the same shape as the one
+// `tests/workload/mod.rs` generates for the frame-hash regression, so the
+// browser is looking at the machine the native tests pin. The header checksum
+// at $014D is computed rather than baked: the boot ROM is not emulated here,
+// but `gb.cart` validates the header the way the console's does.
+function minimalGb() {
+  const rom = new Uint8Array(2 * 16384);
+  rom.set([0x00, 0xc3, 0x50, 0x01], 0x100); // NOP ; JP $0150
+  rom.set(
+    [
+      0x21, 0x00, 0x80, 0x0e, 0x00, 0x3e, 0x00, 0x77, 0x3c, 0x23, 0x0d, 0x20, 0xfa, // tile data
+      0x21, 0x00, 0x98, 0x0e, 0x00, 0x3e, 0x00, 0x77, 0x3c, 0x23, 0x0d, 0x20, 0xfa, // tile map
+      0x3e, 0xe4, 0xe0, 0x47, // BGP  = $E4
+      0x3e, 0x91, 0xe0, 0x40, // LCDC = $91: on, background on, tiles at $8000
+      0xf0, 0x42, 0x3c, 0xe0, 0x42, 0x18, 0xf9, // SCY++ forever
+    ],
+    0x150,
+  );
+  rom[0x147] = 0x00; // ROM only
+  rom[0x148] = 0x00; // two banks
+  rom[0x149] = 0x00; // no cartridge RAM
+  let sum = 0;
+  for (let i = 0x134; i < 0x14d; i++) sum = (sum - rom[i] - 1) & 0xff;
+  rom[0x14d] = sum;
+  return rom;
+}
+
+// And a two-bank Sega cartridge that sets mode 4, writes a palette, sixteen
+// tile patterns and a full name table through the VDP's own ports, then moves
+// the horizontal scroll once a frame. Also the workload the native regression
+// pins, for the same reason.
+function minimalSms() {
+  const rom = new Uint8Array(2 * 16384).fill(0xff);
+  rom.set(
+    [
+      0xf3, 0x31, 0xf0, 0xdf, // di ; ld sp,$dff0
+      0x3e, 0x04, 0xd3, 0xbf, 0x3e, 0x80, 0xd3, 0xbf, // R0 = mode 4
+      0x3e, 0x40, 0xd3, 0xbf, 0x3e, 0x81, 0xd3, 0xbf, // R1 = display on
+      0x3e, 0xff, 0xd3, 0xbf, 0x3e, 0x82, 0xd3, 0xbf, // R2 = name table $3800
+      0xaf, 0xd3, 0xbf, 0x3e, 0xc0, 0xd3, 0xbf, // CRAM address 0
+      0x06, 0x20, 0x0e, 0x00, 0x79, 0xd3, 0xbe, 0x0c, 0x10, 0xfa, // 32 colours
+      0xaf, 0xd3, 0xbf, 0x3e, 0x40, 0xd3, 0xbf, // VRAM address 0
+      0x21, 0x00, 0x02, 0x0e, 0x00,
+      0x79, 0xd3, 0xbe, 0xc6, 0x4d, 0x4f, 0x2b, 0x7c, 0xb5, 0x20, 0xf5, // 16 tiles
+      0xaf, 0xd3, 0xbf, 0x3e, 0x78, 0xd3, 0xbf, // VRAM $3800
+      0x21, 0x80, 0x03, 0x0e, 0x00,
+      0x79, 0xe6, 0x0f, 0xd3, 0xbe, 0xaf, 0xd3, 0xbe, 0x0c, 0x2b, 0x7c, 0xb5, 0x20, 0xf2,
+      0x0e, 0x00,
+      0xdb, 0xbf, 0xe6, 0x80, 0x28, 0xfa, // wait for the frame flag
+      0x79, 0xd3, 0xbf, 0x3e, 0x88, 0xd3, 0xbf, 0x0c, 0x18, 0xf0, // R8 = scroll
+    ],
+    0,
+  );
+  return rom;
 }

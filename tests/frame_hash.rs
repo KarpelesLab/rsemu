@@ -169,10 +169,12 @@ fn a_machine_with_a_picture_actually_draws_one() {
             continue;
         }
         assert!(
-            colours >= 8,
-            "`{}` drew a frame with only {colours} distinct colours; \
-             a blank picture would pass the hash check and mean nothing",
-            w.name
+            colours >= w.min_colours,
+            "`{}` drew a frame with only {colours} distinct colours, fewer than \
+             the {} its hardware can produce; a blank picture would pass the \
+             hash check and mean nothing",
+            w.name,
+            w.min_colours
         );
         let mut distinct = hashes.clone();
         distinct.sort_unstable();

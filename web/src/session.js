@@ -309,11 +309,22 @@ export class Session {
    * `imageData()` is a view over the module's memory rather than a copy — the
    * pixels are laid out as RGBA for exactly this call — so it is rebuilt every
    * time: a wasm memory that grows detaches every existing view.
+   *
+   * The canvas is resized when the guest changes the picture's shape, which is
+   * not hypothetical: a Master System's mode 4 has 192, 224 and 240 lines and a
+   * game may switch between them. Assigning a canvas's width or height clears
+   * it, so this is guarded rather than done every frame.
    */
   draw() {
     if (!this.ctx) return;
     const image = this.emu.imageData();
-    if (image) this.ctx.putImageData(image, 0, 0);
+    if (!image) return;
+    if (this.canvas.width !== image.width || this.canvas.height !== image.height) {
+      this.canvas.width = image.width;
+      this.canvas.height = image.height;
+      this.pushStats();
+    }
+    this.ctx.putImageData(image, 0, 0);
   }
 
   /** Drain guest console output into the pane, batched so Vue is not spammed. */
