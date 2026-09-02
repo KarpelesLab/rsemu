@@ -997,6 +997,64 @@ fn a_key_typed_at_the_8042_reaches_the_guest_through_int_16h() {
     );
 }
 
+/// A machine with nothing to boot parks in `INT 18h` **with interrupts on**.
+///
+/// The firmware's own comment there promises "interrupts on so a keystroke
+/// still reaches the buffer", and until the `STI` was added it was not true:
+/// `INT 18h` is entered by an `INT` instruction, which clears `IF`, and a `HLT`
+/// with `IF` clear is the one halt an x86 cannot be woken from. The machine
+/// looked alive and was not — no tick, no keystroke, nothing but `RESET`.
+///
+/// So this asserts the consequence rather than the instruction: a key typed at
+/// the 8042 *after* the machine has parked reaches the BIOS keyboard buffer,
+/// which can only happen if `INT 09h` ran, which can only happen if `IF` is
+/// set.
+#[test]
+fn a_machine_with_nothing_to_boot_parks_with_interrupts_on() {
+    use rsemu::host::chardev::ports;
+
+    // A blank diskette and no fixed disk: `INT 19h` finds no signature on
+    // either and falls through to `INT 18h`.
+    let (mut m, cpu, hosts) = board_from(false, Some(Vec::new()));
+    let keyboard = ports::open(&hosts, "keyboard").expect("the 8042 opened its port");
+    m.run_for(GlobalTime::from_nanos(200_000_000))
+        .expect("the machine runs");
+
+    let page = text_page(&m);
+    println!("pc-at boot (nothing bootable): text page:");
+    for line in &page {
+        if !line.trim().is_empty() {
+            println!("  |{line}|");
+        }
+    }
+    assert!(
+        page.iter().any(|line| line.contains("No bootable device")),
+        "the firmware did not reach INT 18h: the text page is {page:?}"
+    );
+    assert!(cpu.is_halted(), "and it parked rather than running on");
+    assert_ne!(
+        cpu.regs().eflags & 0x200,
+        0,
+        "parked with IF clear, which is a halt nothing but RESET ends"
+    );
+
+    // The BIOS Data Area's keyboard ring, at 0040:001a and 0040:001c. Empty
+    // means head == tail; a key that arrived moves the tail.
+    let head = peek16(&m, 0x41a);
+    assert_eq!(peek16(&m, 0x41c), head, "the buffer starts empty");
+
+    // `0x33` is `H` going down, in set 2, which is what an AT keyboard sends.
+    keyboard.feed(&[0x33]);
+    m.run_for(GlobalTime::from_nanos(40_000_000))
+        .expect("the machine runs");
+    assert_ne!(
+        peek16(&m, 0x41c),
+        head,
+        "the keystroke never reached the buffer: the parked processor was \
+         asleep with interrupts off"
+    );
+}
+
 /// **FreeDOS boots** — `ROADMAP.md` phase 6a's gate, on rsemu's own firmware.
 ///
 /// Gated on `RSEMU_FREEDOS_FLOPPY` naming a FreeDOS boot diskette, so an
