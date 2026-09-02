@@ -9,6 +9,7 @@ is never run is a target that quietly stops working.
 rsemu's own monitors, one board's demonstration firmware, and the Woz Monitor of
 1976 — so the first thing on the page is a row of buttons rather than a file
 picker, and a visitor is typing at a 1976 monitor a few seconds after landing.
+The other three want a cartridge, which is the visitor's to supply.
 
 It is a **Vue 3 application built by Vite**, published to
 <https://karpeleslab.github.io/rsemu/> by `.github/workflows/pages.yml`.
@@ -57,7 +58,7 @@ commit, because it is the boundary that must never rot.
 ### Why the `.wasm` lives in `public/`
 
 Vite copies `public/` to the site root **verbatim** — not hashed, not inlined,
-not transformed. That is exactly the treatment a 1.4 MB cargo build product
+not transformed. That is exactly the treatment a 1.8 MB cargo build product
 wants. Nothing imports it, so Rollup never sees it, and the page fetches
 `./rsemu.wasm` relative to itself.
 
@@ -85,11 +86,13 @@ Three layers, and it is what gates the Pages deploy:
    it, so it is never skipped where it matters.
 3. **The ABI and the driver, running.** Boots a NES, renders 120 frames, checks
    the framebuffer is opaque and has more than one colour, takes a save state,
-   runs on, restores it and compares state hashes; boots an Apple 1 with no file
-   at all and reads its monitor back. Then **every built-in image every machine
-   offers** is booted with nothing uploaded, and each has to have a console or a
-   picture — a picture being checked for four-byte pixels, opacity and more than
-   one colour. The Woz Monitor gets its own transcript: it must greet with a
+   runs on, restores it and compares state hashes; does the same for the Game
+   Boy and the Master System on cartridges it **generates**, since neither ships
+   one and neither has a built-in image to fall back on; boots an Apple 1 with
+   no file at all and reads its monitor back. Then **every built-in image every
+   machine offers** is booted with nothing uploaded, and each has to have a
+   console or a picture — a picture being checked for four-byte pixels, opacity
+   and more than one colour. The Woz Monitor gets its own transcript: it must greet with a
    backslash and answer `FF00.FF0F` with the manual's own bytes, which is the
    same assertion `src/dev/wdc/tests.rs` and `src/wasm.rs`'s own tests make one
    layer down. Then it drives `src/session.js` itself under a stub canvas and a
@@ -116,22 +119,30 @@ the module it fetched, so this table describes the build rather than the page:
 | Machine | What a visitor gets | Needs a file? |
 | --- | --- | --- |
 | `nes-ntsc`, `nes-pal` | picture and sound, controller on the keyboard | **yes** — a `.nes` cartridge, read here and never uploaded |
+| `gameboy` | a 160×144 picture in the DMG's four shades, eight buttons | **yes** — a `.gb` |
+| `sms-ntsc`, `sms-pal` | a 256×192 mode-4 picture, two pads and the Pause switch | **yes** — a `.sms` |
 | `apple1` | a console: RSMON, rsemu's own monitor | no |
 | `beneater-6502` | a serial console, and a choice of *two* monitors: RSMON, or the Woz Monitor of 1976 | no |
 | `spi-panel` | a picture with nothing uploaded: an RV32 board configures an ST7272A over SPI and paints a gradient | no |
 
+The three that want a file sit in the same quadrant as each other and a
+different one from the rest: there is nothing to press until the visitor opens
+a cartridge, because rsemu ships none and never will (`ROADMAP.md` §1). The
+page says so — `bootHint` names the slot and the file picker is the only route
+in — and `check.mjs` proves the path anyway by generating a cartridge of its own
+for each of them.
+
 What is deliberately **not** here, because the page would be worse for it: the
-Game Boy and the Master System need a cartridge nobody has to hand, and the DMG
-has no `host::display` adapter at all, so it would draw a dead canvas; the bare
-boards (`z80-mini`, `m68k-mini`, `mips-mini`, `arm926`, `stm32f407`) want a
+bare boards (`z80-mini`, `m68k-mini`, `mips-mini`, `arm926`, `stm32f407`) want a
 firmware image and have neither a screen nor a console without one; `riscv-virt`
 wants a kernel or an SBI build and is the largest single thing this build could
 add; and the PC boards' BIOS is the user's to supply. `Cargo.toml`'s `demo`
 feature says the same thing where a reader will trip over it.
 
-The module is about **1.4 MB** (≈400 KB over the wire, gzipped), of which the
-last two machines are roughly 330 KB — 64 KB of that is two 32 KiB EEPROM
-images that are mostly erased cells and compress to nothing.
+The module is about **1.8 MB** (≈480 KB over the wire, gzipped). The Game Boy
+and the Master System cost **406 KB** of that between them — two CPU cores
+(SM83 and Z80) and two video chips, which is most of a console each; measured as
+1 416 362 bytes before and 1 822 234 after, both `--release` and unstripped.
 
 ## What is wired and what is not
 
@@ -165,6 +176,26 @@ images that are mostly erased cells and compress to nothing.
   prefers": this board's scanout engine would rather hand out `RGB888`, and an
   `ImageData` built over three-byte pixels is a sheared picture. The module
   fixes the surface format and every adapter converts on capture.
+* **Game Boy and Master System** — pictures, and this is what changed: the DMG
+  had no `host::display` adapter at all, and the Master System's was written but
+  reached neither the CLI nor this module. Both are wired now, so `--screenshot`,
+  the VNC server and this page all see the same frame. The Game Boy is 160×144
+  in four greys — the panel drives four evenly spaced levels and a DMG's green
+  tint belongs to its glass rather than to the chip, so `host::display::gb` emits
+  the greyscale and says why. The Master System is 256×192, or 224 or 240 lines
+  when a game asks for them, and the adapter reports the height the VDP is
+  actually in.
+
+  Neither has sound here: `host::audio` has an adapter for the RP2A03 and not
+  yet for the DMG's four channels or the SN76489, so `rsemu_has_audio` answers
+  `0` and the page says the machine has no audio device. That is honest rather
+  than silent, and it is the next thing either console wants.
+
+  Both are on the same eight-bit pad the NES is, translated per console in
+  `src/wasm.rs` — a Game Boy's matrix reads its columns out in the opposite
+  order, a Master System pad has six lines and no Select, and its Start is the
+  console's Pause switch on `/NMI`. `rsemu_has_pad` is true for both, so the
+  d-pad is drawn and the arrow keys belong to the guest.
 * **Sound** — yes, through `WebAudio`. The APU produces one sample per APU
   cycle at 894 886.36… Hz on an NTSC console; `src/host/audio` applies the
   board's own RC network (90 Hz and 440 Hz high-pass, 14 kHz low-pass — NESdev,

@@ -492,7 +492,7 @@ function onStatePicked(event) {
                 <span>{{ rom ? "Change file" : "Choose file" }}</span>
                 <input
                   type="file"
-                  accept=".nes,.bin,.rom,application/octet-stream"
+                  accept=".nes,.gb,.gbc,.sms,.bin,.rom,application/octet-stream"
                   aria-label="Cartridge or firmware image"
                   @change="onRomPicked"
                 />

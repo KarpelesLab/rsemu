@@ -667,6 +667,10 @@ fn install_capture(
     rsemu::host::display::nes::capture::install(options)?;
     #[cfg(feature = "dev-pc-video")]
     rsemu::host::display::pc::capture::install(options)?;
+    #[cfg(feature = "dev-gb")]
+    rsemu::host::display::gb::capture::install(options)?;
+    #[cfg(feature = "dev-sms")]
+    rsemu::host::display::sms::capture::install(options)?;
     #[cfg(feature = "dev-nes-apu")]
     rsemu::host::audio::nes::capture::install(options, ring_for(args))?;
     Ok(())
@@ -723,6 +727,14 @@ fn take_scanout(hosts: &HostObjects) -> Option<Box<dyn rsemu::host::display::Sca
     }
     #[cfg(feature = "dev-nes-ppu")]
     if let Some(s) = rsemu::host::display::nes::capture::take(hosts) {
+        return Some(Box::new(s));
+    }
+    #[cfg(feature = "dev-gb")]
+    if let Some(s) = rsemu::host::display::gb::capture::take(hosts) {
+        return Some(Box::new(s));
+    }
+    #[cfg(feature = "dev-sms")]
+    if let Some(s) = rsemu::host::display::sms::capture::take_vdp(hosts) {
         return Some(Box::new(s));
     }
     None

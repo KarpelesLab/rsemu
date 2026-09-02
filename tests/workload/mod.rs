@@ -84,6 +84,15 @@ pub(crate) struct Workload {
     pub(crate) frames: u32,
     /// How often the regression records a framebuffer hash.
     pub(crate) checkpoint_every: u32,
+    /// The fewest distinct pixel values a frame of this workload may hold.
+    ///
+    /// The guard against a guest that silently stopped drawing: a blank screen
+    /// has a perfectly stable hash, so pinning the hash alone would bless a ROM
+    /// that stopped rendering. It is per-workload rather than a constant
+    /// because **the ceiling is the hardware's**: a DMG has four shades and no
+    /// more, so demanding eight of it would be demanding a Game Boy that does
+    /// not exist. Zero for a workload with no display.
+    pub(crate) min_colours: usize,
     /// Builds the machine. Boxed because each arm captures a different image.
     build: fn() -> Booted,
 }
@@ -172,6 +181,9 @@ pub(crate) fn all() -> Vec<Workload> {
         // is a different bug from one that shows up at the first.
         frames: 60,
         checkpoint_every: 15,
+        // A full-screen background with sprites over it: the NES palette has
+        // 54 usable colours and this ROM reaches a good few of them.
+        min_colours: 8,
         build: boot_nes,
     });
 
@@ -182,7 +194,22 @@ pub(crate) fn all() -> Vec<Workload> {
                a 4 KiB read-modify-write loop in WRAM",
         frames: 60,
         checkpoint_every: 15,
+        // Four, and four is the whole set: a DMG's panel drives four levels
+        // and `BGP` is $E4, so this ROM draws every colour the machine has.
+        min_colours: 4,
         build: boot_gameboy,
+    });
+
+    #[cfg(feature = "machine-sms")]
+    out.push(Workload {
+        name: "sms-ntsc",
+        what: "mode 4 with a full name table of sixteen patterned tiles, \
+               a sixteen-colour palette and one scroll write per frame",
+        frames: 60,
+        checkpoint_every: 15,
+        // Sixteen background entries, all written and all different.
+        min_colours: 8,
+        build: boot_sms,
     });
 
     #[cfg(feature = "machine-apple1")]
@@ -191,6 +218,8 @@ pub(crate) fn all() -> Vec<Workload> {
         what: "RSMON at its prompt: a 6502 polling the PIA, no display device",
         frames: 60,
         checkpoint_every: 30,
+        // No display device at all, so nothing to count.
+        min_colours: 0,
         build: boot_apple1,
     });
 
@@ -200,6 +229,7 @@ pub(crate) fn all() -> Vec<Workload> {
         what: "an RV64I integer loop through DRAM: add, store, load, shift",
         frames: 60,
         checkpoint_every: 30,
+        min_colours: 0,
         build: boot_riscv_virt,
     });
 
@@ -318,15 +348,38 @@ fn boot_nes() -> Booted {
 
 #[cfg(feature = "machine-gameboy")]
 fn boot_gameboy() -> Booted {
+    use rsemu::host::display::gb::capture;
     use rsemu::machine::catalog;
 
     // ROM only, no cartridge RAM: the smallest cartridge that can hold the
     // program below, so the measurement is of the console rather than a mapper.
     let image = rsemu::dev::gb::cart::synthetic_image(2, 0x00, 0x00, GAMEBOY_PROGRAM);
-    let machine = catalog::build_catalog("gameboy", &[("cart", &image)]).expect("the GB realizes");
-    // `host::display` has no Game Boy adapter yet, so there is nothing to hash
-    // a frame from — the state hash is the whole regression here.
-    Booted::wrap(machine, None)
+    let entry = catalog::machine("gameboy").expect("this build ships gameboy");
+    let mut options = catalog::build_options().expect("the catalog agrees with itself");
+    options.realize.media.insert("cart", image.as_slice());
+    capture::install(&mut options).expect("the interception installs");
+    let registry = catalog::registry().expect("a registry");
+    let machine = rsemu::machine::build(entry.name, entry.source, &registry, &options)
+        .expect("the GB realizes");
+    let scanout = capture::take(&options.realize.hosts).expect("the machine has an LCD");
+    Booted::wrap(machine, Some(Box::new(scanout)))
+}
+
+#[cfg(feature = "machine-sms")]
+fn boot_sms() -> Booted {
+    use rsemu::host::display::sms::capture;
+    use rsemu::machine::catalog;
+
+    let image = sms_rom();
+    let entry = catalog::machine("sms-ntsc").expect("this build ships sms-ntsc");
+    let mut options = catalog::build_options().expect("the catalog agrees with itself");
+    options.realize.media.insert("cart", image.as_slice());
+    capture::install(&mut options).expect("the interception installs");
+    let registry = catalog::registry().expect("a registry");
+    let machine = rsemu::machine::build(entry.name, entry.source, &registry, &options)
+        .expect("the Master System realizes");
+    let scanout = capture::take_vdp(&options.realize.hosts).expect("the machine has a VDP");
+    Booted::wrap(machine, Some(Box::new(scanout)))
 }
 
 #[cfg(feature = "machine-apple1")]
@@ -666,6 +719,131 @@ const GAMEBOY_PROGRAM: &[u8] = &[
     0xe0, 0x42, //       $0182  LDH  ($42),A
     0x18, 0xec, //       $0184  JR   main
 ];
+
+// ---------------------------------------------------------------------------
+// the Master System image
+// ---------------------------------------------------------------------------
+
+/// A synthetic Sega cartridge whose program draws a full screen and scrolls it.
+///
+/// Everything reaches the VDP through the two ports at `$BE`/`$BF` — no host
+/// poking — so what the frame hash covers is the whole chain from `OUT` to
+/// pixel: colour RAM, tile patterns, the name table, and one horizontal-scroll
+/// write per vertical blank so no two frames are identical.
+///
+/// Hand-assembled from Zilog's UM0080 opcode table and the 315-5124's
+/// documented port behaviour. No emulator source was consulted (`CLAUDE.md`).
+///
+/// ```text
+///   0000: f3            di
+///   0001: 31 f0 df      ld   sp, $dff0
+///   0004: 3e 04         ld   a, $04            ; R0 = mode 4
+///   0006: d3 bf         out  ($bf), a
+///   0008: 3e 80         ld   a, $80
+///   000a: d3 bf         out  ($bf), a
+///   000c: 3e 40         ld   a, $40            ; R1 = display on, no IRQ
+///   000e: d3 bf         out  ($bf), a
+///   0010: 3e 81         ld   a, $81
+///   0012: d3 bf         out  ($bf), a
+///   0014: 3e ff         ld   a, $ff            ; R2 = name table at $3800
+///   0016: d3 bf         out  ($bf), a
+///   0018: 3e 82         ld   a, $82
+///   001a: d3 bf         out  ($bf), a
+///   001c: af            xor  a                 ; CRAM address 0, code 3
+///   001d: d3 bf         out  ($bf), a
+///   001f: 3e c0         ld   a, $c0
+///   0021: d3 bf         out  ($bf), a
+///   0023: 06 20         ld   b, $20            ; 32 palette entries
+///   0025: 0e 00         ld   c, $00
+///   0027: 79            ld   a, c              ; <- palette
+///   0028: d3 be         out  ($be), a
+///   002a: 0c            inc  c
+///   002b: 10 fa         djnz palette
+///   002d: af            xor  a                 ; VRAM address 0, code 1
+///   002e: d3 bf         out  ($bf), a
+///   0030: 3e 40         ld   a, $40
+///   0032: d3 bf         out  ($bf), a
+///   0034: 21 00 02      ld   hl, $0200         ; 16 tiles of 32 bytes
+///   0037: 0e 00         ld   c, $00
+///   0039: 79            ld   a, c              ; <- pattern
+///   003a: d3 be         out  ($be), a
+///   003c: c6 4d         add  a, $4d            ; a stride coprime with 256
+///   003e: 4f            ld   c, a
+///   003f: 2b            dec  hl
+///   0040: 7c            ld   a, h
+///   0041: b5            or   l
+///   0042: 20 f5         jr   nz, pattern
+///   0044: af            xor  a                 ; VRAM $3800, code 1
+///   0045: d3 bf         out  ($bf), a
+///   0047: 3e 78         ld   a, $78
+///   0049: d3 bf         out  ($bf), a
+///   004b: 21 80 03      ld   hl, $0380         ; 32 x 28 cells
+///   004e: 0e 00         ld   c, $00
+///   0050: 79            ld   a, c              ; <- names
+///   0051: e6 0f         and  $0f               ; one of the sixteen tiles
+///   0053: d3 be         out  ($be), a
+///   0055: af            xor  a
+///   0056: d3 be         out  ($be), a          ; no flip, no priority
+///   0058: 0c            inc  c
+///   0059: 2b            dec  hl
+///   005a: 7c            ld   a, h
+///   005b: b5            or   l
+///   005c: 20 f2         jr   nz, names
+///   005e: 0e 00         ld   c, $00
+///   0060: db bf         in   a, ($bf)          ; <- wait: status, and clear it
+///   0062: e6 80         and  $80               ; the frame flag
+///   0064: 28 fa         jr   z, wait
+///   0066: 79            ld   a, c              ; R8 = horizontal scroll
+///   0067: d3 bf         out  ($bf), a
+///   0069: 3e 88         ld   a, $88
+///   006b: d3 bf         out  ($bf), a
+///   006d: 0c            inc  c
+///   006e: 18 f0         jr   wait
+/// ```
+///
+/// The `add a, $4d` is the reason the picture has sixteen colours rather than
+/// four. A tile row is four *bitplanes* in consecutive bytes, so filling video
+/// RAM from a counter that merely increments makes all four planes agree in
+/// every bit above the bottom two — every pixel comes out as colour 0, 10, 12
+/// or 15 and the screen is four flat colours wearing a pattern. A stride
+/// coprime with 256 decorrelates the planes, which is what makes the frame hash
+/// cover the renderer rather than one corner of it.
+///
+/// The sprite attribute table is left wherever reset put it (`R5` is never
+/// written), so a few dozen pixels a frame come out of the object renderer
+/// reading the tile data above as sprite coordinates. That is deliberate only
+/// in the sense that it is left alone: it is perfectly deterministic, and it
+/// means the hash covers the sprite path as well as the background one.
+#[cfg(feature = "machine-sms")]
+fn sms_rom() -> Vec<u8> {
+    // Two 16 KiB banks: the smallest image the mapper accepts that is not one
+    // bank pretending, so the measurement is of the console rather than of a
+    // degenerate cartridge.
+    let mut rom = vec![0xffu8; 0x4000 * 2];
+    let program: &[u8] = &[
+        0xf3, // di
+        0x31, 0xf0, 0xdf, // ld sp, $dff0
+        0x3e, 0x04, 0xd3, 0xbf, 0x3e, 0x80, 0xd3, 0xbf, // R0 = mode 4
+        0x3e, 0x40, 0xd3, 0xbf, 0x3e, 0x81, 0xd3, 0xbf, // R1 = display on
+        0x3e, 0xff, 0xd3, 0xbf, 0x3e, 0x82, 0xd3, 0xbf, // R2 = $3800
+        0xaf, 0xd3, 0xbf, 0x3e, 0xc0, 0xd3, 0xbf, // CRAM address 0
+        0x06, 0x20, 0x0e, 0x00, // ld b,32 ; ld c,0
+        0x79, 0xd3, 0xbe, 0x0c, 0x10, 0xfa, // the palette loop
+        0xaf, 0xd3, 0xbf, 0x3e, 0x40, 0xd3, 0xbf, // VRAM address 0
+        0x21, 0x00, 0x02, 0x0e, 0x00, // ld hl,512 ; ld c,0
+        0x79, 0xd3, 0xbe, 0xc6, 0x4d, 0x4f, 0x2b, 0x7c, 0xb5, 0x20, 0xf5, // the patterns
+        0xaf, 0xd3, 0xbf, 0x3e, 0x78, 0xd3, 0xbf, // VRAM $3800
+        0x21, 0x80, 0x03, 0x0e, 0x00, // ld hl,896 ; ld c,0
+        0x79, 0xe6, 0x0f, 0xd3, 0xbe, 0xaf, 0xd3, 0xbe, // one cell
+        0x0c, 0x2b, 0x7c, 0xb5, 0x20, 0xf2, // and around again
+        0x0e, 0x00, // ld c,0
+        0xdb, 0xbf, 0xe6, 0x80, 0x28, 0xfa, // wait for the frame flag
+        0x79, 0xd3, 0xbf, 0x3e, 0x88, 0xd3, 0xbf, // R8 = c
+        0x0c, 0x18, 0xf0, // and around again
+    ];
+    rom[..program.len()].copy_from_slice(program);
+    rom
+}
 
 // ---------------------------------------------------------------------------
 // the RISC-V image

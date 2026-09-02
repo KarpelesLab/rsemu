@@ -79,10 +79,14 @@ function hex(mask) {
   </div>
 
   <p class="hint">
-    Arrow keys are the d-pad. The mask reaches the console's controller port at
-    <code>$4016</code> as a level the guest samples when it strobes — currently
+    Arrow keys are the d-pad. The mask reaches the console's controller port as a
+    <em>level</em> the guest samples when it strobes — currently
     <code class="mask">{{ hex(held) }}</code
-    >.
+    >. This is one pad for every machine, so each console takes what it has: a
+    NES reads all eight bits at <code>$4016</code>, a Game Boy the same eight
+    through its <code>$FF00</code> matrix, and a Master System six — Select goes
+    nowhere and Start is the Pause switch on the console, which is wired to
+    <code>/NMI</code> rather than to the pad.
   </p>
 </template>
 
