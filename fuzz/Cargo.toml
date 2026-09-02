@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std", "vnc", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-blk", "dev-ne2000", "dev-nvme", "dev-pc-apic", "dev-pc-hpet", "ir", "jit", "cpu-riscv-lift", "float"]
+features         = ["std", "vnc", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-blk", "dev-ne2000", "dev-nvme", "dev-riscv", "dev-pc-apic", "dev-pc-hpet", "ir", "jit", "cpu-riscv-lift", "float"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -121,6 +121,19 @@ bench = false
 [[bin]]
 name  = "nvme_mmio"
 path  = "fuzz_targets/nvme_mmio.rs"
+test  = false
+doc   = false
+bench = false
+
+# The virtio-MMIO surface, for the same reason as the NVMe one and with two
+# defects already to its name: a `u32` descriptor length reached an allocator
+# before it was checked against the disk, and a writable descriptor aimed at
+# this device's own `QueueNotify` re-entered a recursive engine. Both are the
+# shape a fuzzer finds and a unit test does not -- an arbitrary structure in
+# guest memory that the device then walks.
+[[bin]]
+name  = "virtio_mmio"
+path  = "fuzz_targets/virtio_mmio.rs"
 test  = false
 doc   = false
 bench = false
