@@ -121,8 +121,8 @@
 //!   exactly when it would pay — *"once a host backend turns those three
 //!   instructions into a not-taken compare and branch and a dispatch back into
 //!   tens of instructions"* — and that is now measurable rather than predicted:
-//!   compiled, `memcpy` runs at 154.6 Mi/s under `Smc::Guard` against
-//!   129.8 Mi/s under `Smc::EndBlock`, a 19 % win where the same comparison
+//!   compiled, `memcpy` runs at 171.8 Mi/s under `Smc::Guard` against
+//!   137.0 Mi/s under `Smc::EndBlock` — a 25 % win, where the same comparison
 //!   interpreted was a 4 % loss. The prediction was right and it is worth
 //!   saying so, because the policy stayed the default on an argument rather
 //!   than on a number.
