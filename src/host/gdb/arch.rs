@@ -526,10 +526,15 @@ static I8086_REGS: &[RegDesc] = &[
 /// the floating-point one. Appended again, so again nothing here moved. None of
 /// it is a *register*, so there is nothing for this map to grow even when it
 /// does claim the `i386` architecture.
+///
+/// Re-verified again at chunk version 7, which appends `IA32_MISC_ENABLE`
+/// after the multiprocessor block. Appended, so nothing moved; and it is a
+/// model-specific register rather than one of the sixteen, so this map has
+/// nothing to grow.
 #[cfg(feature = "cpu-x86")]
 pub static I8086: Arch = Arch {
     class: &crate::cpu::x86::CLASS,
-    verified_version: 6,
+    verified_version: 7,
     feature: "org.rsemu.i386",
     architecture: None,
     regs: I8086_REGS,

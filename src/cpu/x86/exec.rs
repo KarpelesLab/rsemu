@@ -1514,32 +1514,7 @@ impl<'a> Exec<'a> {
             && !m.is_register()
             && wants_memory
         {
-            let offset = match f.addrsize {
-                2 => {
-                    let regs = &self.state.regs;
-                    let terms = match m.rm {
-                        0 => regs.word(3).wrapping_add(regs.word(6)), // BX+SI
-                        1 => regs.word(3).wrapping_add(regs.word(7)), // BX+DI
-                        2 => regs.word(5).wrapping_add(regs.word(6)), // BP+SI
-                        3 => regs.word(5).wrapping_add(regs.word(7)), // BP+DI
-                        4 => regs.word(6),                            // SI
-                        5 => regs.word(7),                            // DI
-                        6 if m.md == 0 => 0,
-                        6 => regs.word(5), // BP
-                        _ => regs.word(3), // BX
-                    };
-                    let disp = f.disp as u16;
-                    let value = if m.md == 0 && m.rm == 6 {
-                        disp
-                    } else {
-                        terms.wrapping_add(disp)
-                    };
-                    u64::from(value)
-                }
-                4 => u64::from(self.ea32(f, m)),
-                _ => self.ea64(f, m),
-            };
-            self.ea = Some((f.mem_segment(), offset));
+            self.ea = Some((f.mem_segment(), self.ea_offset(f, m)));
             if self.legacy() {
                 self.charge(isa::ea_clocks(m.md, m.rm, f.seg_override.is_some()));
             }
@@ -1551,6 +1526,42 @@ impl<'a> Exec<'a> {
             // field and have no ModRM byte at all.
             let offset = f.imm & Self::mask(f.addrsize);
             self.ea = Some((f.segment(seg::DS), offset));
+        }
+    }
+
+    /// The offset half of a memory operand's address, from the registers as
+    /// they stand *now*.
+    ///
+    /// Separate from [`prepare_ea`](Exec::prepare_ea) because one instruction
+    /// has to ask twice — see `POP` with a stack-relative destination, which
+    /// computes its address after the increment rather than before it. The
+    /// clock charge stays in `prepare_ea`: an 8086 computes the address once
+    /// however many times this is called.
+    fn ea_offset(&self, f: &Fields, m: isa::ModRm) -> u64 {
+        match f.addrsize {
+            2 => {
+                let regs = &self.state.regs;
+                let terms = match m.rm {
+                    0 => regs.word(3).wrapping_add(regs.word(6)), // BX+SI
+                    1 => regs.word(3).wrapping_add(regs.word(7)), // BX+DI
+                    2 => regs.word(5).wrapping_add(regs.word(6)), // BP+SI
+                    3 => regs.word(5).wrapping_add(regs.word(7)), // BP+DI
+                    4 => regs.word(6),                            // SI
+                    5 => regs.word(7),                            // DI
+                    6 if m.md == 0 => 0,
+                    6 => regs.word(5), // BP
+                    _ => regs.word(3), // BX
+                };
+                let disp = f.disp as u16;
+                let value = if m.md == 0 && m.rm == 6 {
+                    disp
+                } else {
+                    terms.wrapping_add(disp)
+                };
+                u64::from(value)
+            }
+            4 => u64::from(self.ea32(f, m)),
+            _ => self.ea64(f, m),
         }
     }
 
@@ -1670,7 +1681,22 @@ impl<'a> Exec<'a> {
             // pointer moves; nothing else should ask for one.
             _ => 0,
         };
-        Ok(value & Self::mask(size))
+        // The width the *result* is narrowed to is the operand's, and for the
+        // system registers that is not the instruction's operand size.
+        //
+        // `MOV r64, CR2` in 64-bit mode transfers sixty-four bits with no
+        // `REX.W`, so `Fields::opsize` says four and the answer is eight. This
+        // mask said four, and the bug it produced is the reason the comment is
+        // this long: a 64-bit Linux reads `CR2` in its early page-fault
+        // handler, computes `cr2 - PAGE_OFFSET`, and decides the address is
+        // out of range when the top half is missing. It then declines to map
+        // the page, falls through to a handler that has no fixup, and halts —
+        // in a loop, with no console yet, having printed nothing at all.
+        let width = match arg {
+            Arg::Rd | Arg::Cd | Arg::Dd | Arg::Td => self.system_reg_size(),
+            _ => size,
+        };
+        Ok(value & Self::mask(width))
     }
 
     /// How wide a control- or debug-register move is.
@@ -1891,6 +1917,31 @@ impl<'a> Exec<'a> {
             Op::PUSH => self.push_op(f)?,
             Op::POP => {
                 let value = self.pop(f.opsize)?;
+                // *Intel SDM* volume 2, `POP`: "If the ESP register is used as
+                // a base register for addressing a destination operand in
+                // memory, the POP instruction computes the effective address
+                // of the operand **after** it increments the ESP register."
+                //
+                // So the address is recomputed here rather than reused from
+                // decode. It costs one recomputation on every `POP` to memory
+                // and it is the only way to be right: `pop 0x10(%rsp)` — which
+                // is how a compiler writes `local_irq_save` on x86-64 — stores
+                // eight bytes lower than it should when the address is taken
+                // before the pop, quietly overwriting whatever local lives
+                // there. A Linux kernel does exactly that in `__text_poke`,
+                // loses the argument in the clobbered slot, and dies with a
+                // null-pointer dereference sixteen instructions later
+                // (`tests/pc64_linux.rs`).
+                //
+                // Only 32- and 64-bit addressing can name the stack pointer as
+                // a base at all, so a 16-bit `POP` recomputes the same answer
+                // it already had.
+                if let Some(m) = f.modrm
+                    && !m.is_register()
+                    && insn.dst.uses_modrm_memory()
+                {
+                    self.ea = Some((f.mem_segment(), self.ea_offset(f, m)));
+                }
                 self.write_arg(f, insn.dst, f.opsize, value)?;
             }
             Op::PUSHA => self.pusha(f)?,
@@ -2006,6 +2057,10 @@ impl<'a> Exec<'a> {
                 // what makes `sti` / `hlt` race-free.
                 self.state.int_shadow = true;
             }
+            // The reserved-NOP space, `ENDBR64` among it: the operand was
+            // decoded so the instruction has the right length, and is never
+            // accessed. See the rows in `isa`.
+            Op::NOPR => {}
             Op::NOP => {
                 // `90` is `XCHG eAX, eAX`, which is why it is a no-op. With
                 // `REX.B` the second operand becomes `R8`, and the exchange is
@@ -3397,6 +3452,7 @@ impl<'a> Exec<'a> {
             edx1 |= 1 << 26; // SSE2
         }
 
+        let xd_enabled = self.state.sys.misc_enable & super::prot::misc_enable::XD_DISABLE == 0;
         let signature = self.cfg.variant.reset_signature();
         let max_basic: u32 = 1;
         let leaf = self.state.regs.rax as u32;
@@ -3424,7 +3480,13 @@ impl<'a> Exec<'a> {
             0x8000_0000 => set(if features.long { 0x8000_0008 } else { 0 }, 0, 0, 0),
             0x8000_0001 if features.long => {
                 let mut edx: u32 = 1 << 29; // LM: long mode
-                if features.nx {
+                // The no-execute bit answers to two things: whether the part
+                // has it, and whether the execute-disable lock in
+                // `IA32_MISC_ENABLE` is set. That second one is the whole
+                // reason the register is modelled — an operating system clears
+                // it and then asks this question (*Intel SDM* volume 4
+                // Table 2-2, `IA32_MISC_ENABLE[34]`).
+                if features.nx && xd_enabled {
                     edx |= 1 << 20; // NX
                 }
                 if features.syscall {
