@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/KarpelesLab/rsemu/compare/v0.0.3...v0.0.4) - 2026-09-02
+
+### Added
+
+- *(cpu-x86)* [**breaking**] INIT, Start-Up, and the registers that name state outside the core
+- *(cpu-x86)* [**breaking**] the x87 unit and SSE2, computed in software
+- *(dev-blk)* a guest drive that is a host file, through fstool
+- *(dev-pc-pmc)* a PCI host bridge with PAM, and the RAM shadowing that boots a PC
+- *(dev-ata-disk)* an ATA hard disk and the AT's IDE interface
+
+### Fixed
+
+- *(cpu-x86)* merge only the wide registers the gdb prefix carries
+- *(bus-pci)* [**breaking**] rank the routing table below BUS, where a config cycle can reach it
+- *(cli)* restore the allow attribute a merge dropped from install_capture
+- *(cpu-x86)* walk the page tables for a debug read, without touching them
+- *(dev-pc)* [**breaking**] A20 is open at power-on, and pc-at is a 486
+
+### Other
+
+- Merge branch 'worktree-agent-a6b085084f72350dd'
+- say what the PC board actually does now
+- Merge branch 'worktree-agent-abcfcd255e8dada68'
+- Merge branch 'worktree-agent-a40927053483c6041'
+- Merge branch 'worktree-agent-acb56bd1a51838819'
+- Merge branch 'worktree-agent-ab024847a2545b730'
+- Merge branch 'worktree-agent-ab3cfa107e5d0cb21'
+- Merge branch 'worktree-agent-aef8641698ffb4954'
+- Merge branch 'worktree-agent-ac9c594747acefa7b'
+- Merge branch 'worktree-agent-aa184cec409a4fa98'
+- Merge branch 'worktree-agent-a55dd47cda3540d97'
+- Merge branch 'worktree-agent-ab452dfa9e18957c6'
+- *(dev-blk)* take fstool 0.4.24, which moves the CLI's deps behind a feature
+- Merge branch 'worktree-agent-a519d1c66177ceb2b'
+- Merge branch 'worktree-agent-a35cb94fe239ee459'
+- Merge branch 'master' into worktree-agent-abbfbfe4d360b2f08
+- Merge branch 'worktree-agent-a82ff4501bdb741e1'
+
 ## [0.0.3](https://github.com/KarpelesLab/rsemu/compare/v0.0.2...v0.0.3) - 2026-09-01
 
 ### Added
