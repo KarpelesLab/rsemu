@@ -3,6 +3,13 @@
 #   rsemu run pc64 --media kernel=bzImage
 #   rsemu run pc64 --media kernel=bzImage --media initrd=initramfs.cpio.gz
 #
+# The second line is the one that reaches userspace, and it is not a
+# convenience: this board has no disk and no PCI, so an initramfs is the only
+# root a kernel on it can be given. `scripts/fetch-testdata.sh initramfs-x86`
+# builds one around busybox, and `docs/platforms/pc64.md` shows the prompt it
+# reaches and the one extra kernel argument -- `cryptomgr.notests` -- that
+# keeps the run to a few minutes.
+#
 # # What this board is for
 #
 # `pc-at` and `q35` are boards for *firmware*: they have a ROM socket, a video

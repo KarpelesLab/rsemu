@@ -111,6 +111,32 @@ readonly BUSYBOX_MEMBER="./usr/bin/busybox"
 # matching the fetched `linux` image is found, for `initramfs-virtio` below.
 readonly DEBIAN_PACKAGES="https://deb.debian.org/debian/dists/trixie/main/binary-riscv64/Packages.gz"
 
+# The same job for x86-64, and from a different place, which is the whole
+# interest of this entry: busybox.net's own statically linked release build,
+# against **musl** rather than glibc.
+#
+# Debian ships an amd64 `busybox-static` and it is the obvious choice, but it
+# is linked against glibc, and glibc's static startup runs `PUNPCKLDQ`
+# (`66 0F 62`) about a hundred instructions into userspace, packing two CPUID
+# results into one XMM register. rsemu's x86 core advertises SSE2 in
+# `CPUID.01H:EDX[26]` and does not decode that opcode, so a glibc init dies of
+# `#UD` before it prints anything:
+#
+#     Run /init as init process
+#     traps: init[1] trap invalid opcode ip:4a80b6 ... in busybox
+#     Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000004
+#
+# musl's startup does not use the packed-integer half of SSE2 at all, so this
+# build reaches a shell on the same core. When the core grows those opcodes
+# either binary will do; until then this one is the fixture, and the reason is
+# written here rather than rediscovered.
+#
+# 1.35.0 is a released build that upstream does not rebuild, so a checksum
+# mismatch means the wrong file. Fatal. GPL-2.0, FETCH-ONLY, on exactly the
+# terms above.
+readonly BUSYBOX_X86_URL="https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox"
+readonly BUSYBOX_X86_SHA="6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348"
+
 # FreeDOS 1.3, floppy edition. `144m/x86BOOT.img` inside the archive is a
 # 1.44 MB FAT12 boot diskette: the FreeDOS kernel, FDCONFIG.SYS, COMMAND.COM
 # and the 1.3 installer. It is what `tests/pc_at_boot.rs` boots on rsemu's own
@@ -898,16 +924,33 @@ busybox_binary() {
 	rm -f "${work}/data.tar.xz" "${work}/busybox.deb"
 	local bb="${work}/${BUSYBOX_MEMBER}"
 
-	# Shape check rather than a second checksum: a riscv64 ELF starts with the
-	# ELF magic and carries machine type 243 (EM_RISCV) in the two little-endian
-	# bytes at offset 18. That catches the wrong architecture, which is the one
-	# mistake that would otherwise show up as a kernel panic ten minutes into a
-	# boot rather than here.
-	local elf machine
-	elf="$(dd if="$bb" bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')"
-	machine="$(od -An -tu2 -j 18 -N 2 "$bb" | tr -d ' \n')"
-	[ "$elf" = "7f454c46" ] || die "${BUSYBOX_MEMBER} is not an ELF file"
-	[ "$machine" = "243" ] || die "${BUSYBOX_MEMBER} is for machine ${machine}, not RISC-V (243)"
+	elf_is "$bb" 243 "RISC-V"
+	BUSYBOX_BIN="$bb"
+}
+
+# elf_is <file> <e_machine> <what to call it>
+#
+# Shape check rather than a second checksum: an ELF file starts with the ELF
+# magic and carries its machine type in the two little-endian bytes at offset
+# 18 -- 243 (EM_RISCV), 62 (EM_X86_64). That catches the wrong architecture,
+# which is the one mistake that would otherwise show up as a kernel panic ten
+# minutes into a boot rather than here.
+elf_is() {
+	local file="$1" want="$2" name="$3" elf machine
+	elf="$(dd if="$file" bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+	machine="$(od -An -tu2 -j 18 -N 2 "$file" | tr -d ' \n')"
+	[ "$elf" = "7f454c46" ] || die "$(basename -- "$file") is not an ELF file"
+	[ "$machine" = "$want" ] ||
+		die "$(basename -- "$file") is for ELF machine ${machine}, not ${name} (${want})"
+}
+
+# The x86-64 busybox, downloaded into <scratch dir>. Sets BUSYBOX_BIN, as
+# busybox_binary does, and for the same reason.
+busybox_x86_binary() {
+	local work="$1" bb="${work}/busybox"
+	fetch_verified "$BUSYBOX_X86_URL" "$bb" "$BUSYBOX_X86_SHA" fatal
+	chmod 0755 "$bb"
+	elf_is "$bb" 62 "x86-64"
 	BUSYBOX_BIN="$bb"
 }
 
@@ -1064,6 +1107,65 @@ fetch_initramfs_virtio() {
 
 	initramfs_notice "$dest"
 	virtio_hint "$dest"
+}
+
+# The same archive, built around an x86-64 busybox, for the `pc64` board.
+#
+# `pc64` has no firmware and no disk (docs/platforms/pc64.md), so an initramfs
+# is the only root a kernel on it can be given -- and without one it panics for
+# want of one, which is a complete boot but not a userspace. The kernel itself
+# is *not* fetched: a bzImage is whatever the person running the test points
+# RSEMU_KERNEL at, and this script has no business choosing one.
+fetch_initramfs_x86() {
+	need curl
+	local dest="${DEST_ROOT}/x86"
+	local target="${dest}/initramfs-x86.cpio"
+	mkdir -p "$dest"
+
+	local work="${dest}/.initramfs"
+	rm -rf "$work"
+	mkdir -p "$work"
+
+	busybox_x86_binary "$work"
+	build_initramfs "$target" "$BUSYBOX_BIN" "$work"
+	rm -rf "$work"
+
+	ok "$(basename -- "$target") ($(wc -c <"$target" | tr -d ' ') bytes)"
+	initramfs_x86_notice "$dest"
+	initramfs_x86_hint "$dest" "$(basename -- "$target")"
+}
+
+initramfs_x86_notice() {
+	printf '%s\n' "initramfs-x86.cpio -- a busybox root filesystem for pc64
+busybox 1.35.0, x86-64, statically linked against musl, from
+${BUSYBOX_X86_URL}
+https://www.busybox.net
+
+Licence: GPL-2.0. FETCH-ONLY -- running busybox as an emulated guest is
+ordinary use; committing it here would be redistribution under its terms, and
+its source is off limits to this project entirely (CLAUDE.md, Provenance).
+
+The cpio archive around it is built by scripts/fetch-testdata.sh, which also
+writes the /init inside it. Nothing in the archive was downloaded except the
+busybox binary.
+
+Consumed by RSEMU_INITRD in tests/pc64_linux.rs. The kernel that loads it is
+not fetched by this script: point RSEMU_KERNEL at a bzImage of your own." \
+		>"${1}/PROVENANCE-initramfs.txt"
+}
+
+initramfs_x86_hint() {
+	local dest="$1" archive="$2"
+	note ""
+	note "  Boot a kernel of your own to a shell on it, and type at the shell:"
+	note "      RSEMU_KERNEL=/boot/vmlinuz \\"
+	note "      RSEMU_INITRD=${dest}/${archive} \\"
+	note "      RSEMU_KERNEL_CMDLINE='console=ttyS0,115200 nokaslr cryptomgr.notests' \\"
+	note "      RSEMU_KERNEL_MS=1200000 \\"
+	note "      RSEMU_KERNEL_INPUT='rsemu# =>uname -srm\\n' \\"
+	note "      RSEMU_KERNEL_STOP_AT=x86_64 \\"
+	note "          cargo test --release --features machine-pc64 \\"
+	note "              --test pc64_linux -- --nocapture"
 }
 
 virtio_hint() {
@@ -1559,6 +1661,9 @@ Suites:
   initramfs-virtio
                  the same archive with the kernel's own virtio-mmio and
                  virtio-blk modules in it, plus a disk image to read
+  initramfs-x86  the same archive built around busybox.net's own x86-64
+                 static build, for the pc64 board (GPL-2.0, FETCH-ONLY). The
+                 kernel it boots under is yours: no bzImage is fetched.
 
 Options:
   --all               fetch every suite (the default when none is named).
@@ -1591,7 +1696,7 @@ list_present() {
 	fi
 	local suite
 	for suite in sst-65x02 mips-r3000 nestest accuracycoin gb-blargg gb-mooneye \
-		sms-zexall apple1 riscv riscv-arch-test freedos; do
+		sms-zexall apple1 riscv riscv-arch-test freedos x86; do
 		if [ -d "${DEST_ROOT}/${suite}" ]; then
 			printf '  %-14s %s\n' "$suite" \
 				"$(du -sh "${DEST_ROOT}/${suite}" 2>/dev/null | cut -f1) present"
@@ -1649,6 +1754,7 @@ for suite in "${SUITES[@]}"; do
 		linux|kernel) fetch_linux ;;
 		initramfs|rootfs) fetch_initramfs ;;
 		initramfs-virtio|virtio) fetch_initramfs_virtio ;;
+		initramfs-x86|x86) fetch_initramfs_x86 ;;
 		*) die "unknown suite $suite (try --help)" ;;
 	esac
 done
