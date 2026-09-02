@@ -78,6 +78,11 @@ export class Rsemu {
   /**
    * Every machine this build can run. A machine is a feature set, so this is a
    * property of the .wasm that was fetched.
+   *
+   * `builtins` is what makes a machine runnable with nothing uploaded: images
+   * compiled into the module for its own media slot — RSMON, the Woz Monitor,
+   * a board's demonstration firmware. An empty one means the visitor has to
+   * supply a file, which is every cartridge and every BIOS.
    */
   machines() {
     const out = [];
@@ -87,6 +92,21 @@ export class Rsemu {
         name: this.text(this.e.rsemu_machine_name(i)),
         summary: this.text(this.e.rsemu_machine_summary(i)),
         media: this.text(this.e.rsemu_machine_media(i)),
+        builtins: this.builtins(i),
+      });
+    }
+    return out;
+  }
+
+  /** The images this build carries for machine `index`, in the module's order. */
+  builtins(index) {
+    const out = [];
+    for (let b = 0; b < this.e.rsemu_machine_builtin_count(index); b++) {
+      out.push({
+        index: b,
+        name: this.text(this.e.rsemu_machine_builtin_name(index, b)),
+        summary: this.text(this.e.rsemu_machine_builtin_summary(index, b)),
+        slot: this.text(this.e.rsemu_machine_builtin_slot(index, b)),
       });
     }
     return out;
@@ -102,6 +122,22 @@ export class Rsemu {
   boot(index, image) {
     const len = image ? this.input(image) : 0;
     if (!this.e.rsemu_boot(index, len)) {
+      throw new Error(this.error() || "boot failed");
+    }
+  }
+
+  /**
+   * Build machine `index` on one of the images the module carries, uploading
+   * nothing at all.
+   *
+   * `rsemu run beneater-6502 --monitor wozmon` for a page with no command
+   * line: the bytes are already in the module, so this is one click from a
+   * cold load.
+   * @param {number} index
+   * @param {number} builtin
+   */
+  bootBuiltin(index, builtin) {
+    if (!this.e.rsemu_boot_builtin(index, builtin)) {
       throw new Error(this.error() || "boot failed");
     }
   }
@@ -263,6 +299,17 @@ export class Rsemu {
 
   buttons(port) {
     return this.e.rsemu_buttons(port);
+  }
+
+  /**
+   * Whether this machine has controllers at all.
+   *
+   * Not the same question as `hasVideo`: a display panel with no game pad is
+   * an ordinary machine, and a page that drew a d-pad for one would be
+   * inventing hardware.
+   */
+  get hasPad() {
+    return this.e.rsemu_has_pad() !== 0;
   }
 
   get hasConsole() {

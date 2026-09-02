@@ -1,5 +1,6 @@
 <script setup>
-// The Apple 1 is a console, not a framebuffer, so it gets its own view.
+// A console machine — the Apple 1, Ben Eater's board — is not a framebuffer,
+// so it gets its own view.
 //
 // The distinction is not cosmetic: `rsemu_has_video` is false for this machine
 // and `rsemu_has_console` is true, there are no pixels to blit at all, and the
@@ -13,6 +14,8 @@ import { nextTick, ref, watch } from "vue";
 const props = defineProps({
   text: { type: String, default: "" },
   live: { type: Boolean, default: false },
+  /** Which monitor is running, when the machine booted on one of ours. */
+  monitor: { type: String, default: "" },
 });
 
 const emit = defineEmits(["focus", "blur"]);
@@ -64,16 +67,25 @@ defineExpose({ focus });
     </div>
 
     <p class="hint">
-      <template v-if="focused">
+      <template v-if="!focused">
+        Click the screen, or tab to it, to type at the machine. Keystrokes only
+        reach the guest while this pane has focus.
+      </template>
+      <template v-else-if="monitor === 'wozmon'">
+        <strong>Typing goes to the machine</strong>, and that is Steve Wozniak's monitor
+        of 1976 &mdash; the prompt is the <kbd>\</kbd> it printed. Type
+        <kbd>F</kbd><kbd>F</kbd><kbd>0</kbd><kbd>0</kbd><kbd>.</kbd><kbd>F</kbd><kbd>F</kbd
+        ><kbd>0</kbd><kbd>F</kbd> then <kbd>Enter</kbd> to examine a range eight bytes to
+        a line &mdash; those bytes are the monitor's own &mdash;
+        <kbd>0</kbd><kbd>3</kbd><kbd>0</kbd><kbd>0</kbd><kbd>:</kbd><kbd>A</kbd><kbd>A</kbd>
+        to deposit, or an address and <kbd>R</kbd> to run it.
+      </template>
+      <template v-else>
         <strong>Typing goes to the machine.</strong> RSMON is a hex examine/deposit
         monitor: type <kbd>F</kbd><kbd>F</kbd><kbd>0</kbd><kbd>0</kbd> then
         <kbd>Enter</kbd> to dump eight bytes, <kbd>Enter</kbd> again to walk on, or
         <kbd>0</kbd><kbd>3</kbd><kbd>0</kbd><kbd>0</kbd><kbd>:</kbd><kbd>A</kbd><kbd>A</kbd>
         to deposit one. The upper case is the keyboard's doing, not the page's.
-      </template>
-      <template v-else>
-        Click the screen, or tab to it, to type at the machine. Keystrokes only
-        reach the guest while this pane has focus.
       </template>
     </p>
   </div>

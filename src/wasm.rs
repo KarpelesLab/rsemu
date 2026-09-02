@@ -35,7 +35,11 @@
 //! 2. **Machines are named by index**, from [`rsemu_machine_count`] and
 //!    [`rsemu_machine_name`] — a build is a feature set, so the catalog is
 //!    build-specific and the page has to ask anyway. That also means no string
-//!    ever crosses *into* the module.
+//!    ever crosses *into* the module. **Built-in images are named by index
+//!    too**, per machine ([`rsemu_machine_builtin_count`],
+//!    [`rsemu_machine_builtin_name`]), which is how the browser gets what
+//!    `rsemu run beneater-6502 --monitor wozmon` gets on a command line the
+//!    page does not have.
 //! 3. **One machine at a time**, in a module-wide slot. The browser runs one
 //!    console in one tab; a second instance is a second module.
 //!
@@ -216,6 +220,25 @@ impl State {
             shown: u64::MAX,
         }
     }
+
+    /// Take `scanout` as this machine's display, and shape the frame buffer for
+    /// it.
+    ///
+    /// **`RGBA8888` whatever the adapter would prefer.** `Surface::for_scanout`
+    /// asks the device family — the NES's PPU says RGBA, an RGB panel says
+    /// RGB888 to avoid a padding byte — but this buffer's format is part of the
+    /// ABI ([`rsemu_frame_ptr`]: four bytes a pixel, which is what `ImageData`
+    /// holds), so it is fixed here and every adapter converts on capture.
+    #[cfg(any(feature = "dev-nes-ppu", feature = "dev-lcdc"))]
+    fn attach_scanout(&mut self, scanout: alloc::boxed::Box<dyn crate::host::display::Scanout>) {
+        let info = scanout.info();
+        self.frame = crate::host::display::Surface::new(
+            crate::host::display::PixelFormat::RGBA8888,
+            info.width,
+            info.height,
+        );
+        self.scanout = Some(scanout);
+    }
 }
 
 /// The module's one machine slot.
@@ -331,6 +354,66 @@ pub extern "C" fn rsemu_machine_media(index: u32) -> usize {
     })
 }
 
+/// How many built-in images machine `index` carries.
+///
+/// An image rsemu ships for that machine's own media slot: RSMON, the Woz
+/// Monitor, a board's demonstration firmware. **A machine with at least one
+/// boots with nothing uploaded**, which is the question a page really wants
+/// answered — [`rsemu_machine_media`] says a slot exists, not that the visitor
+/// has to fill it.
+///
+/// `0` for a machine whose image is the user's to supply, which is every
+/// cartridge and every BIOS (`ROADMAP.md` §1).
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_machine_builtin_count(index: u32) -> u32 {
+    catalog_entry(index).map_or(0, |e| builtins(e).len() as u32)
+}
+
+/// Copy the name of machine `index`'s built-in image `builtin` into the output
+/// buffer, returning its length.
+///
+/// The same names the CLI takes — `rsmon`, `wozmon` — so a browser session and
+/// a `rsemu run` are describable in the same words.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_machine_builtin_name(index: u32, builtin: u32) -> usize {
+    with_state(|state| {
+        state.output.clear();
+        if let Some(image) = builtin_image(index, builtin) {
+            state.output.extend_from_slice(image.name.as_bytes());
+        }
+        state.output.len()
+    })
+}
+
+/// Copy the one-line description of machine `index`'s built-in image `builtin`
+/// into the output buffer, returning its length.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_machine_builtin_summary(index: u32, builtin: u32) -> usize {
+    with_state(|state| {
+        state.output.clear();
+        if let Some(image) = builtin_image(index, builtin) {
+            state.output.extend_from_slice(image.summary.as_bytes());
+        }
+        state.output.len()
+    })
+}
+
+/// Copy the media slot machine `index`'s built-in image `builtin` fills into
+/// the output buffer, returning its length.
+///
+/// `rom` for a monitor, `firmware` for a board's demonstration program. A page
+/// shows it so that "boots with no upload" does not have to be taken on trust.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_machine_builtin_slot(index: u32, builtin: u32) -> usize {
+    with_state(|state| {
+        state.output.clear();
+        if let Some(image) = builtin_image(index, builtin) {
+            state.output.extend_from_slice(image.slot.as_bytes());
+        }
+        state.output.len()
+    })
+}
+
 /// One catalog entry by index.
 fn catalog_entry(index: u32) -> Option<&'static crate::machine::catalog::CatalogEntry> {
     crate::machine::catalog::machines()
@@ -338,20 +421,73 @@ fn catalog_entry(index: u32) -> Option<&'static crate::machine::catalog::Catalog
         .copied()
 }
 
+/// The images this build carries for `entry`.
+fn builtins(
+    entry: &'static crate::machine::catalog::CatalogEntry,
+) -> &'static [crate::machine::catalog::BuiltinImage] {
+    crate::machine::catalog::builtins(entry.name)
+}
+
+/// One built-in image, by machine index and image index.
+fn builtin_image(
+    index: u32,
+    builtin: u32,
+) -> Option<&'static crate::machine::catalog::BuiltinImage> {
+    builtins(catalog_entry(index)?).get(builtin as usize)
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
+/// Where the media image a boot binds comes from.
+///
+/// Not part of the ABI — the two exported entry points below each name one, so
+/// that "boot with an uploaded cartridge" and "boot with the Woz Monitor" share
+/// every line after this choice.
+#[derive(Debug, Clone, Copy)]
+enum Media {
+    /// The first `n` bytes of the input buffer, in the machine's first slot.
+    Uploaded(usize),
+    /// This machine's built-in image `n`, in whichever slot it belongs to.
+    Builtin(u32),
+    /// Whatever this machine boots with when nobody says: its first built-in
+    /// image, or nothing at all.
+    Default,
+}
+
 /// Build machine `index`, binding the first `image_len` bytes of the input
 /// buffer to its media slot. Returns `1` on success, `0` with [`rsemu_error`].
 ///
-/// An `image_len` of `0` binds nothing, which is what an Apple 1 wants: it
-/// falls back to rsemu's own monitor ROM, exactly as `rsemu run apple1` does.
+/// An `image_len` of `0` binds this machine's **default built-in image** if it
+/// has one — RSMON on an Apple 1, exactly as `rsemu run apple1` does — and
+/// nothing if it has none. [`rsemu_boot_builtin`] picks a different one.
 ///
 /// Any previous machine is dropped first, so booting twice is how the page
 /// changes cartridges.
 #[unsafe(no_mangle)]
 pub extern "C" fn rsemu_boot(index: u32, image_len: usize) -> u32 {
+    if image_len > 0 {
+        boot_with(index, Media::Uploaded(image_len))
+    } else {
+        boot_with(index, Media::Default)
+    }
+}
+
+/// Build machine `index` with its built-in image `builtin` bound, uploading
+/// nothing. Returns `1` on success, `0` with [`rsemu_error`].
+///
+/// This is `--monitor wozmon` for a page that has no command line: the images
+/// are compiled into the module, so a visitor is typing at a 1976 monitor one
+/// click after the module loads. [`rsemu_machine_builtin_count`] says how many
+/// a machine has and [`rsemu_machine_builtin_name`] what they are called.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_boot_builtin(index: u32, builtin: u32) -> u32 {
+    boot_with(index, Media::Builtin(builtin))
+}
+
+/// The whole of a boot, whichever way the image was chosen.
+fn boot_with(index: u32, media: Media) -> u32 {
     with_state(|state| {
         let Some(entry) = catalog_entry(index) else {
             return fail(state, "no machine with that index in this build");
@@ -376,25 +512,45 @@ pub extern "C" fn rsemu_boot(index: u32, image_len: usize) -> u32 {
             Err(e) => return fail(state, e),
         };
 
-        let image: Vec<u8> = state.input.get(..image_len).unwrap_or(&[]).to_vec();
-        if image_len > 0 {
-            let Some(slot) = entry.media.first() else {
-                return fail(state, "this machine takes no media");
-            };
-            options.realize.media.insert(*slot, image.as_slice());
-        } else if entry.media.contains(&"rom") {
-            // The same courtesy the CLI extends: a machine that wants a `rom`
-            // and was given none gets rsemu's own monitor, so the Apple 1 boots
-            // with nothing uploaded and no ROM of unclear provenance.
-            #[cfg(feature = "dev-apple1")]
-            options
-                .realize
-                .media
-                .insert("rom", &crate::dev::apple1::RSMON[..]);
+        // The uploaded bytes have to outlive the build, and a built-in image
+        // already does — so both end up as one `(slot, bytes)` pair, with the
+        // `Vec` kept alive alongside it for the uploaded case.
+        let uploaded: Vec<u8> = match media {
+            Media::Uploaded(len) => state.input.get(..len).unwrap_or(&[]).to_vec(),
+            Media::Builtin(_) | Media::Default => Vec::new(),
+        };
+        let binding: Option<(&'static str, &[u8])> = match media {
+            Media::Uploaded(_) => {
+                let Some(slot) = entry.media.first() else {
+                    return fail(state, "this machine takes no media");
+                };
+                Some((*slot, uploaded.as_slice()))
+            }
+            Media::Builtin(which) => {
+                let Some(image) = builtins(entry).get(which as usize) else {
+                    return fail(state, "this machine has no built-in image with that index");
+                };
+                Some((image.slot, image.bytes))
+            }
+            // The same courtesy the CLI extends: a machine that ships an image
+            // and was given none boots on it, so an Apple 1 comes up with
+            // nothing uploaded and no ROM of unclear provenance.
+            Media::Default => builtins(entry).first().map(|i| (i.slot, i.bytes)),
+        };
+        if let Some((slot, bytes)) = binding {
+            options.realize.media.insert(slot, bytes);
         }
 
+        // One arm per display family this build has, exactly like the
+        // registration lists in `machine::catalog`: a family that is not named
+        // here has no picture in a browser, and that is visible by reading the
+        // code rather than by booting the machine and seeing black.
         #[cfg(feature = "dev-nes-ppu")]
         if let Err(e) = crate::host::display::nes::capture::install(&mut options) {
+            return fail(state, e);
+        }
+        #[cfg(feature = "dev-lcdc")]
+        if let Err(e) = crate::host::display::lcd::capture::install(&mut options) {
             return fail(state, e);
         }
 
@@ -419,8 +575,16 @@ pub extern "C" fn rsemu_boot(index: u32, image_len: usize) -> u32 {
 
         #[cfg(feature = "dev-nes-ppu")]
         if let Some(scanout) = crate::host::display::nes::capture::take(&hosts) {
-            state.frame = crate::host::display::Surface::for_scanout(&scanout);
-            state.scanout = Some(alloc::boxed::Box::new(scanout));
+            state.attach_scanout(alloc::boxed::Box::new(scanout));
+        }
+        // The panel boards' engine, taken after the build because its frame
+        // period is read out of the realized machine's clock forest rather than
+        // written into a machine file twice.
+        #[cfg(feature = "dev-lcdc")]
+        if state.scanout.is_none()
+            && let Some(scanout) = crate::host::display::lcd::capture::take(&hosts, &machine)
+        {
+            state.attach_scanout(alloc::boxed::Box::new(scanout));
         }
 
         // Sound goes out as interleaved `f32` in [-1, 1], which is what
@@ -805,6 +969,29 @@ pub extern "C" fn rsemu_buttons(port: u32) -> u32 {
     with_state(|state| state.buttons.get(port as usize).copied().unwrap_or(0))
 }
 
+/// Whether this machine has controllers to press at all.
+///
+/// The companion of [`rsemu_has_video`] and [`rsemu_has_console`], and it is
+/// **not** implied by either: a board with a display panel and no game pad is
+/// an ordinary machine, and a page that drew a d-pad for it would be inventing
+/// hardware. It also decides whether the arrow keys belong to the guest.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_has_pad() -> u32 {
+    with_state(|state| {
+        #[cfg(feature = "dev-nes-io")]
+        {
+            u32::from(state.pad.is_some())
+        }
+        // A build with no controller device has no pad on any machine, and the
+        // export still exists so a page never has to feature-detect.
+        #[cfg(not(feature = "dev-nes-io"))]
+        {
+            let _ = state;
+            0
+        }
+    })
+}
+
 /// Give the machine's console the first `len` bytes of the input buffer, as if
 /// they had been typed. Returns how many were accepted — a full queue takes
 /// fewer, which is the back pressure a real terminal has.
@@ -945,6 +1132,207 @@ mod tests {
         assert_eq!(rsemu_machine_name(count), 0);
     }
 
+    /// Whatever the output buffer holds, as a string.
+    fn out() -> String {
+        with_state(|state| String::from_utf8_lossy(&state.output).into_owned())
+    }
+
+    /// The catalog index of the machine called `name` in this build.
+    fn machine_index(name: &str) -> u32 {
+        (0..rsemu_machine_count())
+            .find(|i| {
+                rsemu_machine_name(*i);
+                out() == name
+            })
+            .unwrap_or_else(|| panic!("this build has no `{name}` in its catalog"))
+    }
+
+    /// The index of `machine`'s built-in image called `image`.
+    fn builtin_index(machine: u32, image: &str) -> u32 {
+        (0..rsemu_machine_builtin_count(machine))
+            .find(|b| {
+                rsemu_machine_builtin_name(machine, *b);
+                out() == image
+            })
+            .unwrap_or_else(|| panic!("no built-in image called `{image}`"))
+    }
+
+    /// Every built-in image is describable, and one past the end is empty
+    /// rather than a panic — the same contract the machine catalog has.
+    #[test]
+    fn built_in_images_are_readable_by_index() {
+        let _one = ONE_MACHINE.lock();
+        for machine in 0..rsemu_machine_count() {
+            let count = rsemu_machine_builtin_count(machine);
+            for image in 0..count {
+                assert!(rsemu_machine_builtin_name(machine, image) > 0);
+                assert!(rsemu_machine_builtin_summary(machine, image) > 0);
+                // A built-in image that named no slot could not be bound to
+                // anything, which would make it undiscoverable rather than
+                // merely undocumented.
+                assert!(rsemu_machine_builtin_slot(machine, image) > 0);
+                let slot = out();
+                rsemu_machine_media(machine);
+                let media = out();
+                assert!(
+                    !media.is_empty() && (slot == media || catalog_slots(machine).contains(&slot)),
+                    "built-in image {image} fills `{slot}`, which is not one of {media:?}"
+                );
+            }
+            assert_eq!(rsemu_machine_builtin_name(machine, count), 0);
+        }
+        assert_eq!(rsemu_machine_builtin_count(rsemu_machine_count()), 0);
+    }
+
+    /// Every media slot a machine declares, for the assertion above.
+    fn catalog_slots(index: u32) -> Vec<String> {
+        catalog_entry(index)
+            .map(|e| e.media.iter().map(|s| String::from(*s)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Type `text` at the machine's console and run for `frames` frames.
+    fn exchange(text: &str, frames: u32) -> String {
+        if !text.is_empty() {
+            let bytes = text.as_bytes();
+            rsemu_input_reserve(bytes.len());
+            with_state(|state| state.input.copy_from_slice(bytes));
+            assert_eq!(rsemu_console_write(bytes.len()), bytes.len());
+        }
+        let mut seen = String::new();
+        for _ in 0..frames {
+            rsemu_run_frame();
+            if rsemu_console_read() > 0 {
+                with_state(|state| {
+                    for byte in &state.output {
+                        // A 1976 console ends a line with a bare carriage
+                        // return and has no lower case; `web/src/session.js`
+                        // does exactly this on the page's side.
+                        match byte & 0x7f {
+                            0x0d => seen.push('\n'),
+                            c @ 0x20..=0x7e => seen.push(c as char),
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        }
+        seen
+    }
+
+    /// **The Woz Monitor of 1976, in a browser, with nothing uploaded.**
+    ///
+    /// Everything a visitor does: pick the machine, pick the monitor, press
+    /// boot, type. The expected bytes are not rsemu's — the dump is what the
+    /// *Apple-1 Operation Manual*'s own listing holds at `$FF00`, fetched by
+    /// Woz's code through this board's bus, and `dev::wdc::tests` asserts the
+    /// same transcript one layer down.
+    #[cfg(feature = "machine-beneater")]
+    #[test]
+    fn wozmon_boots_and_answers_through_the_abi() {
+        let _one = ONE_MACHINE.lock();
+        let machine = machine_index("beneater-6502");
+        let wozmon = builtin_index(machine, "wozmon");
+
+        // No `rsemu_input_reserve`, no file, no bytes from the page at all.
+        assert_eq!(rsemu_boot_builtin(machine, wozmon), 1, "{}", {
+            rsemu_error();
+            out()
+        });
+        assert_eq!(rsemu_has_console(), 1);
+        assert_eq!(rsemu_has_video(), 0, "this board drives a serial line");
+        assert_eq!(rsemu_has_pad(), 0, "and it has no controllers to draw");
+
+        // Wozmon greets with a backslash and a carriage return, and then waits.
+        let banner = exchange("", 30);
+        assert_eq!(banner, "\\\n", "got {banner:?}");
+
+        // `AAAA.BBBB` examines a range, eight bytes to a line.
+        let dump = exchange("FF00.FF0F\r", 60);
+        assert!(
+            dump.contains("FF00: D8 58 A0 7F A9 1F 8D 03")
+                && dump.contains("FF08: 50 A9 0B 8D 02 50 EA C9"),
+            "got {dump:?}"
+        );
+
+        // `AAAA: xx yy` deposits, which is the other half of the monitor.
+        let deposit = exchange("0300: AA BB CC\r", 60);
+        assert!(deposit.contains("0300: 00"), "got {deposit:?}");
+        let readback = exchange("0300.0302\r", 60);
+        assert!(readback.contains("0300: AA BB CC"), "got {readback:?}");
+
+        std::println!("--- rsemu_boot_builtin(beneater-6502, wozmon) ---");
+        std::println!("{banner}{dump}{deposit}{readback}");
+        rsemu_shutdown();
+    }
+
+    /// The same board with nothing chosen at all: `rsemu_boot(index, 0)` is the
+    /// machine's default image, which is rsemu's own monitor.
+    #[cfg(feature = "machine-beneater")]
+    #[test]
+    fn a_default_boot_takes_the_first_built_in_image() {
+        let _one = ONE_MACHINE.lock();
+        let machine = machine_index("beneater-6502");
+        assert_eq!(builtin_index(machine, "rsmon"), 0, "rsmon is the default");
+        assert_eq!(rsemu_boot(machine, 0), 1);
+        let banner = exchange("", 40);
+        assert!(banner.starts_with("RSMON"), "got {banner:?}");
+
+        // And an index nobody offers is an error with a message, not a panic
+        // and not a silent boot on the wrong image.
+        assert_eq!(rsemu_boot_builtin(machine, 99), 0);
+        assert!(rsemu_error() > 0);
+        rsemu_shutdown();
+    }
+
+    /// A machine whose picture does not come from a NES PPU still reaches the
+    /// canvas: `spi-panel` boots its own firmware and paints a gradient.
+    ///
+    /// The reason this test is here rather than in `host::display`: the frame
+    /// buffer's format is part of the ABI, and this adapter would rather hand
+    /// out `RGB888`. A page building `ImageData` over three-byte pixels gets a
+    /// sheared picture, and nothing else would notice.
+    #[cfg(all(feature = "machine-spi-panel", feature = "dev-lcdc"))]
+    #[test]
+    fn a_panel_board_draws_through_the_abi() {
+        let _one = ONE_MACHINE.lock();
+        let machine = machine_index("spi-panel");
+        assert_eq!(rsemu_boot_builtin(machine, 0), 1, "{}", {
+            rsemu_error();
+            out()
+        });
+        assert_eq!(rsemu_has_video(), 1);
+        // A picture is not a game console: this board has no controller port,
+        // and a page that drew a d-pad for it would be inventing hardware.
+        assert_eq!(rsemu_has_pad(), 0);
+        let (width, height) = (rsemu_frame_width(), rsemu_frame_height());
+        assert!(width > 0 && height > 0);
+        assert_eq!(
+            rsemu_frame_len(),
+            (width as usize) * (height as usize) * 4,
+            "the ABI promises four bytes a pixel whatever the adapter prefers"
+        );
+
+        // The demo has a whole SPI configuration sequence to get through before
+        // it paints, so this is generous on purpose.
+        let mut drawn = 0;
+        for _ in 0..240 {
+            drawn += rsemu_run_frame();
+        }
+        assert!(drawn > 0, "the panel never produced a frame");
+
+        let colours = with_state(|state| {
+            let mut seen = alloc::collections::BTreeSet::new();
+            for pixel in state.frame.pixels().as_chunks::<4>().0 {
+                assert_eq!(pixel[3], 0xff, "a pixel the canvas would draw see-through");
+                seen.insert((pixel[0], pixel[1], pixel[2]));
+            }
+            seen.len()
+        });
+        assert!(colours > 1, "the panel drew one flat colour");
+        rsemu_shutdown();
+    }
+
     /// Every call that needs a machine says so rather than misbehaving.
     #[test]
     fn calls_without_a_machine_report_rather_than_panic() {
@@ -1012,6 +1400,7 @@ mod tests {
         }
         assert_eq!(rsemu_is_running(), 1);
         assert_eq!(rsemu_has_video(), 1);
+        assert_eq!(rsemu_has_pad(), u32::from(cfg!(feature = "dev-nes-io")));
         assert_eq!(rsemu_frame_width(), 256);
         assert_eq!(rsemu_frame_height(), 240);
         assert_eq!(rsemu_frame_len(), 256 * 240 * 4);

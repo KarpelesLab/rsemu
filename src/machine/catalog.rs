@@ -454,6 +454,85 @@ pub fn machine(name: &str) -> Option<&'static CatalogEntry> {
     machines().into_iter().find(|m| m.name == stem)
 }
 
+/// An image this build carries for one of a machine's media slots.
+///
+/// A machine that has one demonstrates itself with **nothing downloaded and no
+/// licence question** (`ROADMAP.md` §1): rsemu's own monitors, and the 1976 Woz
+/// Monitor, which is public domain (`dev::wdc::wozmon` records the
+/// determination). It is what `rsemu run beneater-6502` binds when no `--rom`
+/// is given and what `--monitor wozmon` selects instead, and — because the wasm
+/// ABI has no command line — it is the only way a browser visitor can run one
+/// of these at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinImage {
+    /// How a host names it: `rsmon`, `wozmon`, the CLI's `--monitor <name>`.
+    pub name: &'static str,
+    /// One line about what it is, for a picker or a listing.
+    pub summary: &'static str,
+    /// Which of the machine's media slots it belongs in.
+    pub slot: &'static str,
+    /// The bytes themselves, compiled in.
+    pub bytes: &'static [u8],
+}
+
+/// The images this build carries for `machine`, the first being its default.
+///
+/// Empty for a machine that ships none, which is most of them: a PC's BIOS and
+/// a cartridge are the user's to supply, and `ROADMAP.md` §1 is why rsemu will
+/// not "helpfully" carry someone else's.
+///
+/// The order is the order a host offers them in, and index `0` is what a
+/// machine gets when its slot is left unbound.
+#[must_use]
+pub fn builtins(machine: &str) -> &'static [BuiltinImage] {
+    let stem = machine.strip_suffix(".machine").unwrap_or(machine);
+    match stem {
+        #[cfg(feature = "machine-apple1")]
+        "apple1" => &APPLE1_IMAGES,
+        #[cfg(feature = "machine-beneater")]
+        "beneater-6502" => &BENEATER_IMAGES,
+        #[cfg(feature = "machine-spi-panel")]
+        "spi-panel" => &SPI_PANEL_IMAGES,
+        _ => &[],
+    }
+}
+
+/// The Apple 1's socket: rsemu's own monitor, and nothing of unclear
+/// provenance.
+#[cfg(feature = "machine-apple1")]
+static APPLE1_IMAGES: [BuiltinImage; 1] = [BuiltinImage {
+    name: "rsmon",
+    summary: "RSMON, rsemu's own 256-byte monitor: examine, deposit, run",
+    slot: "rom",
+    bytes: crate::dev::apple1::RSMON.as_slice(),
+}];
+
+/// Ben Eater's EEPROM socket, and the one machine that offers a choice.
+#[cfg(feature = "machine-beneater")]
+static BENEATER_IMAGES: [BuiltinImage; 2] = [
+    BuiltinImage {
+        name: "rsmon",
+        summary: "RSMON/serial, rsemu's own monitor over the 65C51 at 19200 baud",
+        slot: "rom",
+        bytes: crate::dev::wdc::RSMON_IMAGE.as_slice(),
+    },
+    BuiltinImage {
+        name: "wozmon",
+        summary: "the Woz Monitor of 1976, re-plumbed onto the ACIA (public domain)",
+        slot: "rom",
+        bytes: crate::dev::wdc::WOZMON_IMAGE.as_slice(),
+    },
+];
+
+/// The `spi-panel` board's own demonstration program.
+#[cfg(feature = "machine-spi-panel")]
+static SPI_PANEL_IMAGES: [BuiltinImage; 1] = [BuiltinImage {
+    name: "panel-demo",
+    summary: "the board's own RV32 program: configure the panel, paint a gradient, scan it out",
+    slot: "firmware",
+    bytes: crate::dev::lcd::demo::PANEL_DEMO,
+}];
+
 /// Every device class this build can construct.
 ///
 /// # Errors

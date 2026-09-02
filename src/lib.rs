@@ -159,6 +159,12 @@ pub fn build_info() -> alloc::string::String {
     if cfg!(feature = "machine-apple1") {
         features.push("machine-apple1");
     }
+    if cfg!(feature = "machine-beneater") {
+        features.push("machine-beneater");
+    }
+    if cfg!(feature = "machine-spi-panel") {
+        features.push("machine-spi-panel");
+    }
     if cfg!(feature = "dev-pc") {
         features.push("dev-pc");
     }

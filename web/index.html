@@ -6,7 +6,7 @@
     <title>rsemu in the browser</title>
     <meta
       name="description"
-      content="A whole emulated machine running client-side in WebAssembly: pick a machine, load a ROM, take a save state. Nothing is uploaded."
+      content="A whole emulated machine running client-side in WebAssembly: type at the Woz Monitor of 1976, load a NES cartridge, take a save state. Nothing is uploaded."
     />
     <meta name="color-scheme" content="light dark" />
     <meta name="theme-color" content="#f4f2ef" media="(prefers-color-scheme: light)" />
@@ -19,7 +19,7 @@
 
          Deliberately not preloaded: `rel=preload as=fetch` has to match the
          request's credentials mode or the browser fetches the module twice,
-         and 900 KB fetched twice is a worse page than 900 KB fetched late. -->
+         and 1.4 MB fetched twice is a worse page than 1.4 MB fetched late. -->
   </head>
   <body>
     <div id="app"></div>

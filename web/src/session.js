@@ -69,6 +69,8 @@ export class Session {
     this.version = "";
     /** The catalog entry currently booted, if any. */
     this.machine = null;
+    /** Which built-in image it was booted on, if any. */
+    this.builtin = null;
 
     this.paused = true;
     this.held = 0;
@@ -126,12 +128,21 @@ export class Session {
 
   /**
    * Build a machine and start running it.
+   *
+   * Two ways in, and the page picks between them rather than this file: an
+   * image the visitor opened, or one of the images the module carries for this
+   * machine — RSMON, the Woz Monitor, a board's own firmware — which is what
+   * lets a first-time visitor press one button and be typing at a monitor.
+   *
    * @param {object} entry a catalog entry from `load()`
    * @param {Uint8Array|null} image the media image, or null for none
+   * @param {object|null} builtin one of `entry.builtins`, or null
    */
-  boot(entry, image) {
-    this.emu.boot(entry.index, entry.media ? image : null);
+  boot(entry, image, builtin = null) {
+    if (builtin) this.emu.bootBuiltin(entry.index, builtin.index);
+    else this.emu.boot(entry.index, entry.media ? image : null);
     this.machine = entry;
+    this.builtin = builtin;
     // Boot arrives from a click, which is the only moment a page is allowed to
     // start audio — so this is where the context is created, not on load.
     this.startSound();
@@ -164,6 +175,7 @@ export class Session {
     this.speaker.silence();
     if (this.emu) this.emu.shutdown();
     this.machine = null;
+    this.builtin = null;
     this.paused = true;
     this.consoleText = "";
     this.hooks.console("");
@@ -182,6 +194,10 @@ export class Session {
 
   get hasConsole() {
     return Boolean(this.emu && this.emu.hasConsole);
+  }
+
+  get hasPad() {
+    return Boolean(this.emu && this.emu.hasPad);
   }
 
   start() {
@@ -431,7 +447,7 @@ export class Session {
     if (!this.running) return;
     if (event.ctrlKey || event.metaKey || event.altKey) return;
 
-    if (this.hasVideo && !isFormControl(event.target)) {
+    if (this.hasPad && !isFormControl(event.target)) {
       const bit = PAD[event.code];
       if (bit !== undefined) {
         this.held = down ? this.held | bit : this.held & ~bit;
@@ -461,7 +477,7 @@ export class Session {
 
   /** Press or release a button from the on-screen pad. */
   setButton(bit, down) {
-    if (!this.running || !this.hasVideo) return;
+    if (!this.running || !this.hasPad) return;
     this.held = down ? this.held | bit : this.held & ~bit;
     this.emu.setButtons(0, this.held);
     this.hooks.buttons(this.held);
