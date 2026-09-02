@@ -33,25 +33,44 @@
 //!   interpreter uses" is two traits and a convention, not one trait.
 //! * **`engine = "kvm"` is not a machine-file property yet.** Every core in the
 //!   crate accepts `engine` and rejects anything but `"interp"`, in
-//!   `cpu::x86`'s property reader *and* in its validator schema. Wiring this
-//!   backend in as a device class means editing `src/cpu/x86/`, which this
-//!   round deliberately does not touch. The supported way in without editing
-//!   it is
-//!   [`Bindings::replace`](crate::machine::Bindings::replace), which lets a
-//!   host construct something else for the `cpu.x86` class — that is where an
-//!   accelerated CPU *device* will go.
+//!   `cpu::x86`'s property reader *and* in its validator schema. So a *board*
+//!   still cannot ask to be accelerated; a **host** can, through
+//!   [`Bindings::replace`](crate::machine::Bindings::replace), and [`cpu`] is
+//!   the device class it replaces `cpu.x86` with. Closing the remaining gap is
+//!   four lines in `src/cpu/x86/mod.rs` — `"kvm"` added to the property
+//!   reader's `or_enum` list and to `schema_for`'s `values` — and this module
+//!   deliberately does not make them.
 //! * **[`ThreadingMode::Accel`](crate::core::sched::ThreadingMode::Accel) is
 //!   unimplemented in the scheduler**, which refuses it with
 //!   `SchedError::ModeUnimplemented`. That refusal is load-bearing and is left
-//!   standing.
-//! * **No interrupt reaches an accelerated guest on a board.** The vector
-//!   comes from the board's 8259A or local APIC on an *acknowledge cycle*
-//!   ([`IntAck`](crate::core::wire::IntAck)), and only a CPU device is on the
-//!   receiving end of that wire. [`kvm::Vcpu::inject`] and
-//!   [`kvm::Vcpu::request_interrupt_window`] are the hypervisor half and are
-//!   here; the board half needs the CPU device above.
+//!   standing, and it is what an accelerated board actually wants: under
+//!   [`Parallel`](crate::core::sched::ThreadingMode::Parallel) virtual time is
+//!   still the emulated grid, so a guest that runs for a host millisecond
+//!   between exits advances the board's clock by one budget, not by a
+//!   millisecond.
+//!
+//! What used to be on that list and no longer is:
+//!
+//! * **An interrupt reaches an accelerated guest on a board.** The vector comes
+//!   from the board's 8259A or local APIC on an *acknowledge cycle*
+//!   ([`IntAck`](crate::core::wire::IntAck)), and [`cpu::AccelCpu`] is the CPU
+//!   device on the receiving end of that wire.
+//!   [`kvm::Vcpu::run_until_exit_with`] runs the cycle between guest entries,
+//!   outside every lock this module holds, and injects what the controller
+//!   answers with.
+//! * **A second processor is started by the guest's own `INIT` and Start-Up.**
+//!   [`LocalController`](crate::core::wire::LocalController) is asked once per
+//!   slice and the restart sequences run on the interpreter the device carries,
+//!   which is how both engines get one implementation of *Intel SDM* Vol 3A
+//!   Table 9-1 rather than two.
 //!
 //! # A board, not a harness
+//!
+//! [`cpu`] is where a board's processor lives: an accelerated `cpu.x86` with
+//! the interpreter's own properties, pins, acknowledge cycle and snapshot
+//! chunk, whose guest instructions run on the host. `tests/kvm_smp.rs` builds
+//! `machines/pc-apic.machine` verbatim with two of them and lets the guest
+//! start the second one.
 //!
 //! [`board`] closes the gap phase 7 named: it takes an
 //! [`AddressSpace`](crate::core::space::AddressSpace) — a real one, from a real
@@ -112,6 +131,10 @@ use core::fmt;
 pub mod board;
 pub mod kvm;
 pub mod sys;
+
+#[cfg(feature = "cpu-x86")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-x86")))]
+pub mod cpu;
 
 #[cfg(feature = "cpu-x86")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-x86")))]

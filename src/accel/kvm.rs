@@ -167,6 +167,10 @@ const KVM_CREATE_VCPU: ReqVal = ReqVal(ioc(DIR_NONE, 0x41, 0));
 const KVM_SET_TSS_ADDR: ReqVal = ReqVal(ioc(DIR_NONE, 0x47, 0));
 /// `KVM_RUN`: enter the guest. No argument.
 const KVM_RUN: ReqVal = ReqVal(ioc(DIR_NONE, 0x80, 0));
+/// `KVM_NMI`: queue a non-maskable interrupt. No argument, and no vector —
+/// `NMI` is vectored through entry 2 by the architecture, which is why it has
+/// its own request rather than travelling through `KVM_INTERRUPT`.
+const KVM_NMI: ReqVal = ReqVal(ioc(DIR_NONE, 0x9a, 0));
 /// `KVM_GET_TSC_KHZ`: the frequency the guest's time-stamp counter advances
 /// at. The other half of what makes a `RDTSC` reading mean anything on the far
 /// side of an engine switch.
@@ -1372,6 +1376,46 @@ impl Vcpu {
         Ok(())
     }
 
+    /// Queue a non-maskable interrupt.
+    ///
+    /// No vector, because `NMI` does not carry one: the architecture vectors it
+    /// through entry 2 of the interrupt-descriptor table (*Intel SDM* Vol 3A
+    /// §6.3.1). The pin is edge-triggered on the board's side, so this is
+    /// called once per edge and never per entry.
+    ///
+    /// # Errors
+    ///
+    /// [`AccelError::Sys`] if `KVM_NMI` fails.
+    pub fn nmi(&self) -> AccelResult<()> {
+        let inner = self.inner.lock();
+        ioctl_val(&inner.fd, KVM_NMI, 0).map_err(sys_err("KVM_NMI"))?;
+        Ok(())
+    }
+
+    /// One round of interrupt bookkeeping, between guest entries.
+    ///
+    /// Split out of [`run_until_exit_with`](Vcpu::run_until_exit_with) so that
+    /// it is visibly a thing that happens with no lock held: every call it
+    /// makes into `source` may reach a sibling device.
+    fn offer_interrupt(&self, source: &dyn IntrSource) -> AccelResult<()> {
+        if !source.intr_asserted() {
+            self.request_interrupt_window(false);
+            return Ok(());
+        }
+        if !self.ready_for_interrupt() {
+            // Not yet: `IF` is clear, an interrupt shadow is up, or one is
+            // already in flight. Ask to be let out the moment that changes.
+            self.request_interrupt_window(true);
+            return Ok(());
+        }
+        // The acknowledge cycle proper, outside every lock this type holds:
+        // the controller answers with a vector *and* moves the request from
+        // pending to in service on its own side.
+        let vector = source.acknowledge();
+        self.request_interrupt_window(false);
+        self.inject(vector)
+    }
+
     /// Enter the guest once and report what came back, **without** routing
     /// anything.
     ///
@@ -1529,12 +1573,50 @@ impl Vcpu {
     /// [`AccelError`] for a failure of the backend itself. A *guest*-caused
     /// stop is not an error: it comes back as an [`Exit`].
     pub fn run_until_exit(&self, max_entries: u64) -> AccelResult<Run> {
-        let inner = self.inner.lock();
+        self.run_until_exit_with(max_entries, None)
+    }
+
+    /// The same, with a board on the far end of the `INTR` pin.
+    ///
+    /// **This is the half [`accel`](crate::accel)'s module documentation said
+    /// was missing.** A vector reaches a guest only through an acknowledge
+    /// cycle, and the controller that answers one is a
+    /// [`Device`](crate::core::Device) in this crate rather than state inside
+    /// the kernel — so the hypervisor has to be *told* there is something
+    /// waiting, and told what its number is once it can be taken.
+    ///
+    /// Between entries, with **no lock of this vCPU's held**, the loop asks
+    /// `intr` whether the pin is asserted. If it is and the guest can take an
+    /// interrupt — `IF` set, no interrupt shadow, nothing already injected,
+    /// which is what `kvm_run.ready_for_interrupt_injection` reports — it runs
+    /// the acknowledge cycle and injects the vector the board answered with.
+    /// If it is asserted and the guest cannot take it yet, it asks for an
+    /// interrupt window instead and the very next entry comes straight back
+    /// out with `KVM_EXIT_IRQ_WINDOW_OPEN`.
+    ///
+    /// The lock is taken per entry rather than held across the loop precisely
+    /// so that the acknowledge cycle — which calls *into another device*, and
+    /// which that device answers under its own lock — happens outside it. That
+    /// is `ROADMAP.md` §4.7's re-entrancy contract, and it is the same
+    /// discipline `cpu::x86` follows around its own `INTA`.
+    ///
+    /// # Errors
+    ///
+    /// As [`run_until_exit`](Vcpu::run_until_exit).
+    pub fn run_until_exit_with(
+        &self,
+        max_entries: u64,
+        intr: Option<&dyn IntrSource>,
+    ) -> AccelResult<Run> {
         let mut entries = 0u64;
         loop {
             if entries >= max_entries {
                 return Ok(Run::completed(Consumed::new(entries)));
             }
+            if let Some(source) = intr {
+                self.offer_interrupt(source)?;
+            }
+            let inner = self.inner.lock();
             entries += 1;
             let raw = self.enter(&inner)?;
             let reason = match raw {
@@ -1634,6 +1716,34 @@ impl Vcpu {
         }
         Ok(VcpuRunnable { vcpu: self })
     }
+}
+
+/// The board on the far end of a vCPU's `INTR` pin.
+///
+/// Two questions, which are the two halves of what a processor does with that
+/// pin — *"is anything asserted?"*, asked every entry, and *"what is its
+/// number?"*, asked once, at the instant the guest can take it. They are
+/// separate because the second has side effects on the controller that answers
+/// it: an 8259A or a local APIC moves the request from pending to in service
+/// during the acknowledge, so asking it speculatively would lose interrupts.
+///
+/// This is deliberately *not* [`IntAck`](crate::core::wire::IntAck) itself. A
+/// board's `INTR` net may have several controllers on it and the level comes
+/// from the wire rather than from any one of them, so the thing that can answer
+/// both questions is the **processor**, which is where
+/// [`cpu`](crate::accel::cpu) implements it.
+pub trait IntrSource: Send + Sync + core::fmt::Debug {
+    /// Whether the `INTR` pin is asserted, as of now.
+    ///
+    /// Level-sensitive and free of side effects: it is asked before every
+    /// guest entry.
+    fn intr_asserted(&self) -> bool;
+
+    /// Run the acknowledge cycle and report the vector.
+    ///
+    /// Called only when the guest can actually take the interrupt, because it
+    /// changes the controller's state.
+    fn acknowledge(&self) -> u8;
 }
 
 /// What one `KVM_RUN` produced, before it is interpreted.

@@ -22,16 +22,19 @@
 //! so a board's declared memory *can* be a memory slot. Before it, none of the
 //! above was expressible.
 //!
-//! # What this is still not
+//! # What this is, and what `tests/kvm_smp.rs` is
 //!
-//! It is not `engine = "kvm"` in the machine file, and the board's two
-//! `cpu.x86` objects are still interpreters that this test does not run. The
-//! vCPU here is created beside the board rather than being one of its
-//! processors, because a CPU is a device and `cpu.x86` is not this
-//! subsystem's file to edit. The consequence is visible in what is *not*
-//! asserted below: no interrupt is delivered, because the vector comes from
-//! the board's local APIC on an acknowledge cycle and there is no accelerated
-//! CPU device to run one.
+//! The vCPU here is created **beside** the board rather than being one of its
+//! processors, so the board's two `cpu.x86` objects are still interpreters
+//! that this test does not run. That is deliberate and still worth keeping:
+//! it is the narrowest possible statement that a board's *memory map* is a
+//! hypervisor's memory map, with no CPU device in the way.
+//!
+//! The consequence is visible in what is not asserted below — no interrupt is
+//! delivered, because the vector comes from the board's local APIC on an
+//! acknowledge cycle and only a CPU *device* can run one.
+//! `rsemu::accel::cpu` is that device and `tests/kvm_smp.rs` is where two of
+//! them run this same board.
 //!
 //! Every test skips cleanly with no `/dev/kvm`.
 

@@ -33,6 +33,19 @@
 //! silently install a ROM as writable memory when the host lacks
 //! `KVM_CAP_READONLY_MEM`.
 //!
+//! # One thing a read-only slot costs, worth knowing before it costs a day
+//!
+//! An interpreter drops a write to a [`RomStore`](crate::core::space::RomStore)
+//! and carries on. Hardware does not: a write to a `KVM_MEM_READONLY` slot
+//! leaves the guest, and there is one write firmware makes without meaning to
+//! — **a descriptor load sets the descriptor's accessed bit if it is clear**
+//! (*Intel SDM* Vol 3A §3.4.5.1). A GDT that lives in the firmware socket with
+//! `A` clear therefore turns the far jump into protected mode into a write the
+//! hypervisor cannot land, and because the processor never leaves hardware to
+//! say so it presents as a `KVM_RUN` that does not return rather than as an
+//! error. Real firmware sets `A` in a ROM-resident GDT for exactly this reason;
+//! `tests/kvm_smp.rs`'s does, and says why.
+//!
 //! # What it refuses, out loud
 //!
 //! A hypervisor's memory slots are page-granular and a board's regions are

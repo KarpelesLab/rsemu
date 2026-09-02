@@ -522,12 +522,39 @@ pub fn tpr_from_space(
 /// already knows is both correct and the honest expression of the gap.
 pub fn overlay_sys(sys: &Sys, sregs: &mut KvmSregs) {
     let fresh = sys_to_sregs(sys);
+    let tr = usable_task_register(fresh.tr, sregs.tr);
     *sregs = KvmSregs {
         cr8: sregs.cr8,
         apic_base: sregs.apic_base,
         interrupt_bitmap: sregs.interrupt_bitmap,
+        tr,
         ..fresh
     };
+}
+
+/// Pick a task register a hypervisor will accept: `ours` unless it is
+/// unusable, in which case whatever the vCPU already had.
+///
+/// **This is not a fudge, and the reason is worth writing down.** *Intel SDM*
+/// Vol 3A Table 9-1 gives `TR` a selector of `0000`, a base of 0, a limit of
+/// `FFFFh` and a **present** 16-bit busy-TSS type after `RESET`;
+/// [`Sys::reset`](crate::cpu::x86::prot::Sys::reset) leaves it zeroed, which is
+/// one place the core is less specific than the table. That costs the
+/// interpreter nothing — it never consults `TR` until a `LTR` or a task gate
+/// loads one — and it costs a hypervisor the entire entry: VMX's guest-state
+/// checks (*SDM* Vol 3C §26.3.1.2) require the task register to be *usable*,
+/// and a VM entry with an unusable one fails with "invalid guest state" before
+/// a single guest instruction runs. That failure was `0x80000021` on a board
+/// whose firmware never touches `TR`.
+///
+/// Keeping the destination's is the same argument
+/// [`overlay_sys`] already makes for `apic_base`: the field is one the
+/// accelerator knows more about than the state being loaded, so writing an
+/// empty one over it is a loss rather than a transfer. Fabricating Table 9-1's
+/// descriptor here instead would put a value in the *translation* that neither
+/// engine holds, and [`differs`] would then be comparing an invention.
+fn usable_task_register(ours: KvmSegment, theirs: KvmSegment) -> KvmSegment {
+    if ours.unusable == 0 { ours } else { theirs }
 }
 
 /// Copy the interpreter's architectural state into a vCPU.
@@ -746,11 +773,14 @@ impl ArchState {
     /// [`AccelError::Sys`](super::AccelError::Sys) if any `ioctl` fails.
     pub fn into_vcpu(self, vcpu: &Vcpu) -> AccelResult<()> {
         let mut sregs = vcpu.sregs()?;
-        let keep = (sregs.cr8, sregs.apic_base, sregs.interrupt_bitmap);
+        let keep = (sregs.cr8, sregs.apic_base, sregs.interrupt_bitmap, sregs.tr);
         sregs = self.sregs;
         sregs.cr8 = keep.0;
         sregs.apic_base = keep.1;
         sregs.interrupt_bitmap = keep.2;
+        // The same rule `overlay_sys` follows, and for the reason
+        // `usable_task_register` gives.
+        sregs.tr = usable_task_register(sregs.tr, keep.3);
         vcpu.set_sregs(&sregs)?;
         vcpu.set_regs(&self.regs)?;
         let values: [(u32, u64); 5] = core::array::from_fn(|i| (CARRIED_MSRS[i], self.msrs[i]));
