@@ -43,10 +43,10 @@
 //! * A [`BusError::Retry`] after a commit is rejected rather than delivered.
 //!
 //! The first two are **deferred, not batched**, and the distinction is the
-//! whole of [`flush_thunk`]: generated code emits nothing at a charge or a
+//! whole of `flush_thunk`: generated code emits nothing at a charge or a
 //! boundary, and the calls happen — same count, same arguments, same order —
 //! at the next point the host could observe anything. See
-//! [`compile`](super::compile)'s "Deferred bookkeeping" for why the range a
+//! [`compile`](mod@super::compile)'s "Deferred bookkeeping" for why the range a
 //! flush is handed is exactly the set of instructions that ran.
 
 #![allow(unsafe_code)]
@@ -107,7 +107,7 @@ const fn error_of(code: u64) -> BusError {
 /// [`Opcode::INSN_START`] does when its region is replayed.
 ///
 /// A compiled block carries these in a dense array rather than having
-/// [`flush_thunk`] read the IR again, and the difference is not tidiness. An
+/// `flush_thunk` read the IR again, and the difference is not tidiness. An
 /// [`Inst`](crate::ir::Inst) is wide — an `Option<Const>` alone is thirty-two
 /// bytes — so re-walking a 215-instruction block on every one of the hundred
 /// thousand times a hot trace runs streams megabytes of cold data past the
@@ -180,7 +180,7 @@ pub struct Ctx {
 /// Six fields have no entry, and their absence is the shape of this backend
 /// rather than an oversight: [`Ctx::ticks`], [`Ctx::retired`],
 /// [`Ctx::boundaries`], [`Ctx::boundary_pc`], [`Ctx::mark`] and
-/// [`Ctx::published`] are written only by [`flush_thunk`], in Rust, through
+/// [`Ctx::published`] are written only by `flush_thunk`, in Rust, through
 /// the struct. Generated code stopped naming them when the bookkeeping moved
 /// there.
 pub mod off {
@@ -347,10 +347,28 @@ unsafe extern "sysv64" fn flush_thunk<H: IrHost + FastMem>(raw: *mut c_void, lo:
         let block = &*c.block;
         let all = core::slice::from_raw_parts(c.events, c.event_count as usize);
         let hi = (hi as usize).min(all.len());
+        // Clamped to `hi`, not to the table. `compile` never emits a reversed
+        // range — `plan` only ever hands out `(region, here)` with
+        // `region < here` — so the two clamps are the same function on every
+        // input generated code can produce, and a mutation between them
+        // survives every test. Recorded rather than tuned away, because they
+        // are *not* the same function on a range that never happens: clamping
+        // to the table would leave `lo > hi` and index a backwards slice.
+        // This is the arm that answers a corrupted immediate with nothing
+        // rather than with a panic in generated-code territory.
         let lo = (lo as usize).min(hi);
         for event in &all[lo..hi] {
             match *event {
                 Event::Charge(ticks) => {
+                    // The context first, then the host — and the order is
+                    // *unobservable*, which is worth writing down because a
+                    // mutation that swaps it survives every test in the tree.
+                    // `IrHost::charge` is handed a `u64` and nothing else; the
+                    // context is a local of `Engine::run` whose only pointer
+                    // lives in generated code's argument register and in this
+                    // thunk's own parameter, so an `H` cannot reach it to read
+                    // or to write. Two writes to disjoint objects with no
+                    // intervening read commute. The order kept is `Interp`'s.
                     c.ticks = c.ticks.wrapping_add(ticks);
                     c.committed = 1;
                     host_of::<H>(c).charge(ticks);

@@ -121,7 +121,16 @@ impl Scratch {
 
 impl IrHost for Scratch {
     fn read_slot(&mut self, slot: RegSlot) -> u128 {
-        self.slots.get(&slot.0).copied().unwrap_or(0)
+        // A slot this harness did not seed still answers something specific to
+        // its **number**, rather than the same zero every unseeded slot would
+        // give. Generated code carries a slot number to the thunk as an
+        // immediate, and a zero for every number out of range is exactly the
+        // answer that cannot tell a truncated one from an intact one — see
+        // `a_slot_number_wider_than_a_byte_reaches_the_host_intact`.
+        self.slots
+            .get(&slot.0)
+            .copied()
+            .unwrap_or_else(|| u128::from(slot.0) * 0x1000_0001 + 3)
     }
 
     fn write_slot(&mut self, slot: RegSlot, value: u128) {
@@ -934,7 +943,7 @@ fn a_value_read_at_the_instruction_a_flush_runs_ahead_of_needs_a_saved_register(
     // Non-vacuity: the load really is the flush point, and `addr` really does
     // end its life there.
     let flushes = a_flush_before(&block);
-    assert_eq!(flushes[3], true, "the load is where the region is replayed");
+    assert!(flushes[3], "the load is where the region is replayed");
     let live = crate::ir::Liveness::compute(&block);
     let life = live.life(addr).expect("addr is live");
     assert_eq!((life.def, life.last_use), (Some(2), Some(3)));
@@ -1000,6 +1009,134 @@ fn a_charge_a_branch_jumps_over_is_never_charged() {
         interp.run(&block, &mut host).expect("runs");
         assert_eq!(interp.ticks(), if take { 6 } else { 15 });
     }
+}
+
+#[test]
+fn a_malformed_charge_or_boundary_is_refused_rather_than_replayed_wrong() {
+    // The two shapes the deferred bookkeeping cannot represent. `plan` refuses
+    // them rather than defaulting, because `ir::Interp` reports each as an
+    // **error** — so a compiled block that charged zero, or that skipped a
+    // boundary it could not resolve, would be a different answer rather than a
+    // slower one. Nothing else in this file builds either shape: the builder's
+    // `charge` and `insn_start` cannot, and the generator uses them.
+    let mut b = BlockBuilder::new(BASE, 0);
+    b.emit_raw(Opcode::CHARGE, Type::I64, None, None, &[], None, None, 0);
+    b.exit_tb();
+    let no_count = b.finish();
+
+    let mut b = BlockBuilder::new(BASE, 0);
+    b.emit_raw(
+        Opcode::INSN_START,
+        Type::I64,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        7,
+    );
+    b.exit_tb();
+    let no_record = b.finish();
+
+    for (what, block) in [
+        ("a charge with no count", &no_count),
+        ("a boundary marker with no record", &no_record),
+    ] {
+        for regs in [Regs::Frame, Regs::Scan] {
+            assert!(
+                matches!(
+                    super::compile::compile_with(block, regs),
+                    Err(super::compile::Refusal::Shape(_))
+                ),
+                "{what} compiled under {regs:?}"
+            );
+        }
+        // and the interpreter, which is where a refused block goes, really
+        // does call it an error rather than running it.
+        let mut host = Scratch::new(true);
+        Interp::new().run(block, &mut host).expect_err(what);
+    }
+}
+
+#[test]
+fn a_slot_number_wider_than_a_byte_reaches_the_host_intact() {
+    // The generator's slot space is eight wide, so nothing else in this file
+    // can tell a slot number masked to sixteen bits from one masked to eight —
+    // and generated code carries that number to the thunk as an immediate it
+    // has to narrow *somewhere*.
+    let mut b = BlockBuilder::new(BASE, 0);
+    b.insn_start(InsnStart {
+        pc: BASE,
+        next_pc: BASE + 4,
+        ticks: 0,
+        live: Vec::new(),
+    });
+    b.charge(1);
+    let wide = b.get_slot(Type::I64, RegSlot(0x1234));
+    let narrow = b.get_slot(Type::I64, RegSlot(0x34));
+    let sum = b.binary(Opcode::SUB, Type::I64, wide, narrow);
+    b.insn_start(InsnStart {
+        pc: BASE + 4,
+        next_pc: BASE + 8,
+        ticks: 1,
+        live: vec![(RegSlot(0), sum), (RegSlot(1), wide)],
+    });
+    b.exit_tb();
+    let block = b.finish();
+    verify(&block).expect("well formed");
+    // Non-vacuity: the two slots really do answer differently, so a backend
+    // that truncated `0x1234` to `0x34` would read the wrong one.
+    let mut host = Scratch::new(true);
+    assert_ne!(
+        host.read_slot(RegSlot(0x1234)),
+        host.read_slot(RegSlot(0x34))
+    );
+    assert!(agree(&block, true));
+}
+
+#[test]
+fn a_fault_reports_the_ticks_that_were_charged_not_the_column_the_frontend_wrote() {
+    // `ir`'s "Known gaps" records that nothing checks `InsnStart::ticks`
+    // against the charges before it, and `Interp` answers a fault with what it
+    // **charged**. Every block this file's generator builds has an honest
+    // column, so the two are indistinguishable there; this one lies, and both
+    // engines have to be wrong in the same way.
+    let mut b = BlockBuilder::new(BASE, 0);
+    let x = b.imm(Type::I64, Const::Int(0x1234_5678));
+    b.insn_start(InsnStart {
+        pc: BASE,
+        next_pc: BASE + 4,
+        // The lie: nothing has been charged yet.
+        ticks: 0x9999,
+        live: vec![(RegSlot(0), x)],
+    });
+    b.charge(2);
+    let a = b.imm(Type::I64, Const::Int(u128::from(BASE + RAM + 0x800)));
+    let _ = b.load(Type::I64, a, MemOp::load(Width::U64));
+    b.insn_start(InsnStart {
+        pc: BASE + 4,
+        next_pc: BASE + 8,
+        ticks: 0x9999,
+        live: vec![(RegSlot(0), x)],
+    });
+    b.exit_tb();
+    let block = b.finish();
+    verify(&block).expect("well formed");
+    assert!(agree(&block, true));
+
+    let mut engine = Engine::with_capacity(1 << 16).expect("a code buffer");
+    let code = engine.compile(&block).expect("compiles");
+    let mut host = Scratch::new(true);
+    let out = engine
+        .run(&block, code, &mut host)
+        .expect("live")
+        .expect("no error");
+    let Outcome::Fault(fault) = out else {
+        panic!("that address is off the end of RAM: {out:?}");
+    };
+    // Zero, because the boundary came before the charge — not `0x9999`.
+    assert_eq!(fault.retired_ticks, 0);
+    assert_eq!(fault.charged_ticks, 2);
 }
 
 #[test]

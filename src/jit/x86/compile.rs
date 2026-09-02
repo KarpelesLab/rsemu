@@ -52,7 +52,7 @@
 //! [`Opcode::INSN_START`] and an [`Opcode::CHARGE`] and both used to be a
 //! thunk call with a fistful of context stores around it. Neither emits a
 //! single byte now. They are **replayed** instead, by
-//! [`flush_thunk`](super::rt) — one call per *region* — and a region is
+//! [`rt`](super::rt)'s `flush_thunk` — one call per *region* — and a region is
 //! usually the whole block.
 //!
 //! What makes a static range the right answer is a property of the block
@@ -64,7 +64,7 @@
 //! strictly inside a region, every path that reaches a flush entered its
 //! region at the top, and the events in `[region, here)` are exactly the ones
 //! that ran. A branch lands *after* the flush at its target — that is
-//! what [`Compiler::starts`] records — so the taken path arrives with nothing
+//! what `Compiler::starts` records — so the taken path arrives with nothing
 //! pending and the fall-through arrives having replayed the range the branch
 //! skipped.
 //!
@@ -80,6 +80,24 @@
 //! The two things generated code still writes itself are `committed`, which a
 //! store and a volatile load set after their flush, and `fast_hits`. That is
 //! the whole of a guest instruction's per-instruction cost now: nothing.
+//!
+//! ### What it costs, which is in the allocator
+//!
+//! A flush is a call in the *gap* ahead of an instruction, so a value whose
+//! **last use** is that instruction's operand — a branch condition, a load's
+//! address — needs a callee-saved register where rule 2's "strictly between"
+//! deliberately let it keep a volatile one, and there are three of those. On
+//! `benches/jit_dispatch.rs` that costs nothing measurable and the deferral is
+//! worth 1.11–1.50×. On `benches/x86_dispatch.rs` it shows: `branchy` and
+//! `load-heavy` put a `brcond` or an access at nearly every guest instruction,
+//! and both lost about 5% where `alu-loop`, `memcpy` and `chain` gained
+//! 1.06–1.17×.
+//!
+//! Moving a `brcond`'s flush onto the branch's **taken edge**, as an
+//! out-of-line pad, would take the gap call off the condition's interval and
+//! is the obvious next thing to try. It is not obviously a win, which is why
+//! it is a measurement and not a patch: in a superblock the taken edge is the
+//! one that stays in the trace, so the pad would be on the hot path.
 //!
 //! Values are held **canonically masked to their type**, exactly as
 //! `ir::Interp` holds them: an `i32` temporary never carries bits above 32 and
