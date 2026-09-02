@@ -305,7 +305,8 @@ pub fn ram_schema() -> ClassSchema {
 /// [`Error::Config`] if something already claimed one of the names.
 pub fn register(registry: &mut Registry) -> Result<()> {
     registry.add(&RAM_CLASS)?;
-    registry.add(&ROM_CLASS)
+    registry.add(&ROM_CLASS)?;
+    super::combinator::register(registry)
 }
 
 /// Bind every built-in class into the machine graph.
@@ -315,13 +316,16 @@ pub fn register(registry: &mut Registry) -> Result<()> {
 /// [`Error::Config`] if a name is already bound.
 pub fn bind(bindings: &mut Bindings) -> Result<()> {
     bindings.bind(RAM_CLASS_NAME, |props| Ok(Arc::new(Ram::new(props)?)))?;
-    bindings.bind(ROM_CLASS_NAME, |props| Ok(Arc::new(Rom::new(props)?)))
+    bindings.bind(ROM_CLASS_NAME, |props| Ok(Arc::new(Rom::new(props)?)))?;
+    super::combinator::bind(bindings)
 }
 
 /// Every built-in class's validator schema, in registration order.
 #[must_use]
 pub fn schemas() -> Vec<ClassSchema> {
-    alloc::vec![ram_schema(), rom_schema()]
+    let mut out = alloc::vec![ram_schema(), rom_schema()];
+    out.extend(super::combinator::schemas());
+    out
 }
 
 #[cfg(test)]

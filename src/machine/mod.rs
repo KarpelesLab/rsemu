@@ -77,6 +77,7 @@
 pub mod ast;
 pub mod builtin;
 pub mod catalog;
+pub mod combinator;
 pub mod diag;
 pub mod lexer;
 // `machine::machine` reads oddly, but the type it holds is `Machine` and the
