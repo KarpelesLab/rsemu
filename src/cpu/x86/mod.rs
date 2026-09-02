@@ -231,6 +231,14 @@
 
 pub mod disasm;
 mod exec;
+
+#[cfg(feature = "cpu-x86-lift")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-x86-lift")))]
+pub mod differential;
+#[cfg(feature = "cpu-x86-lift")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-x86-lift")))]
+pub mod lift;
+
 mod fpexec;
 pub mod fpu;
 pub mod isa;
