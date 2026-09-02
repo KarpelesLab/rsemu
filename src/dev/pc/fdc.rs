@@ -500,6 +500,15 @@ struct State {
     /// Whether an interrupt is pending. Whether it reaches the pin also depends
     /// on the DOR's gate.
     irq: bool,
+    /// Set by a non-DMA data-register access that reset `INT` and re-raised it
+    /// in the same breath, so [`Registers::refresh`] takes the pin low before
+    /// driving it high again and an edge-triggered controller sees one request
+    /// per byte rather than one per command.
+    ///
+    /// Transient and derived: it is set inside one access and consumed by the
+    /// `refresh` that ends the same access, so it is never live across two of
+    /// them and is not serialized (`CLAUDE.md`: derived state is never saved).
+    retrigger: bool,
     /// `DSKCHG`, per drive.
     changed: [bool; DRIVES],
     /// Whether anything has been written to the medium.
@@ -556,6 +565,7 @@ impl State {
             st2: 0,
             st3: 0,
             irq: false,
+            retrigger: false,
             // A drive reads "disk changed" until a step is taken with a medium
             // in it, which is what the line means at power-on.
             changed: [true; DRIVES],
@@ -588,6 +598,7 @@ impl State {
         self.st2 = 0;
         self.st3 = 0;
         self.irq = false;
+        self.retrigger = false;
         self.buf.clear();
         self.pos = 0;
         self.xfer = None;
@@ -1151,11 +1162,19 @@ impl State {
                 if debug {
                     return self.buf.get(self.pos as usize).copied().unwrap_or(0xff);
                 }
-                let byte = self.take_byte(false);
-                // Re-armed for the next byte at once, because there is no
-                // rotational delay to wait through.
-                self.irq = self.phase == Phase::Execution;
-                byte
+                // The data-register access resets `INT` and the next byte
+                // raises it again — `take_byte` leaves it raised either way,
+                // for the next byte or for the result phase it has just
+                // entered. So what has to reach the pin is the **fall between
+                // them**, and that is what `retrigger` asks for. Assigning
+                // `self.irq` here instead was wrong twice over: it held the
+                // line high across every byte, and the 8259A input it lands on
+                // is edge-triggered, so a command delivered one request and
+                // then went silent however many bytes were left; and when the
+                // byte was the last one it overwrote the `true` the result
+                // phase had just set, losing the end-of-command interrupt.
+                self.retrigger = true;
+                self.take_byte(false)
             }
             // The data sheet leaves a read the direction bit forbids undefined;
             // an undriven AT bus reads as ones.
@@ -1177,7 +1196,8 @@ impl State {
                 if self.non_dma_execution(Dir::ToDevice) || self.non_dma_execution(Dir::Format) =>
             {
                 self.put_byte(byte, false);
-                self.irq = self.phase == Phase::Execution;
+                // The same fall, for the same reason; see `read_data`.
+                self.retrigger = true;
             }
             // A write while the controller has results for the CPU, or while
             // the 8237 owns the data path, is swallowed: the chip is not
@@ -1252,10 +1272,22 @@ impl Registers {
     /// Recompute both output pins, with the state lock released before either
     /// is driven — the re-entrancy contract.
     fn refresh(&self) {
-        let (irq, drq) = {
-            let state = self.state.lock();
-            (state.irq_level(), state.drq_level())
+        let (irq, drq, retrigger) = {
+            let mut state = self.state.lock();
+            (
+                state.irq_level(),
+                state.drq_level(),
+                core::mem::take(&mut state.retrigger),
+            )
         };
+        if retrigger && irq {
+            // The byte time between two non-DMA requests, with no duration
+            // because this chip does not model transfer time (see the module
+            // header). Zero-length or not, the fall happened on real hardware
+            // and a wire delivers it, which is the whole difference between a
+            // controller that latches one request and one that latches each.
+            Registers::drive(&self.irq_out, false);
+        }
         Registers::drive(&self.irq_out, irq);
         Registers::drive(&self.drq_out, drq);
     }
@@ -1983,18 +2015,30 @@ mod tests {
     #[derive(Debug, Default)]
     struct Probe {
         level: AtomicU32,
+        /// Low-to-high transitions seen. The level alone cannot tell a second
+        /// request from the first one still standing, and on an edge-triggered
+        /// 8259A input that is exactly the difference that matters.
+        rises: AtomicU32,
     }
 
     impl Probe {
         fn high(&self) -> bool {
             self.level.load(Ordering::Relaxed) != 0
         }
+
+        fn rises(&self) -> u32 {
+            self.rises.load(Ordering::Relaxed)
+        }
     }
 
     impl WireSink for Probe {
         fn set_level(&self, _src: WireId, _line: u32, level: Level) {
-            self.level
-                .store(u32::from(level.is_high()), Ordering::Relaxed);
+            let was = self
+                .level
+                .swap(u32::from(level.is_high()), Ordering::Relaxed);
+            if level.is_high() && was == 0 {
+                self.rises.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -2386,13 +2430,33 @@ mod tests {
         // open the per-byte interrupt is delivered as well.
         rig.poke(REG_DOR, 0x1c);
         rig.command(&[CMD_SPECIFY, 0xdf, 0x03]);
+        let before = rig.irq.rises();
         rig.command(&[0x46, 0x00, 0, 0, 1, 2, 1, 0x1b, 0xff]);
         assert!(rig.irq.high(), "a byte is waiting");
+        assert_eq!(rig.irq.rises(), before + 1, "and it announced itself once");
         assert_eq!(rig.peek(REG_DATA), image[0]);
         assert!(rig.irq.high(), "and so is the next one");
+        // The claim the level cannot make. `INT` is reset by the data-register
+        // access and raised again by the next byte (uPD765A data sheet, the
+        // non-DMA execution phase), so each byte is its own request. The 8259A
+        // input this lands on is edge-triggered and latches `IRR` only on a
+        // low-to-high transition, so a model that left the line high delivered
+        // one interrupt for the whole command and the guest waited for ever.
+        assert_eq!(
+            rig.irq.rises(),
+            before + 2,
+            "the second byte is a second request, not the first one still standing"
+        );
+        let mut bytes = 1u32;
         while rig.msr() & MSR_NDMA != 0 {
             let _ = rig.peek(REG_DATA);
+            bytes += 1;
         }
+        assert_eq!(bytes, 512, "a whole sector, one byte at a time");
+        // One rise per byte, plus the one that opened the result phase — which
+        // the byte that ended the transfer used to overwrite with `false`.
+        assert_eq!(rig.irq.rises(), before + bytes + 1);
+        assert!(rig.irq.high(), "and the result phase is announced");
         let _ = rig.results();
 
         // And a write travels the same path.
