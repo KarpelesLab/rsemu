@@ -682,3 +682,16 @@ fn a_write_overflow_stops_the_port_and_puts_nothing_on_the_medium() {
     );
     assert_eq!(rig.peek(DATA, SECTOR), stamp(61));
 }
+
+#[test]
+fn the_interrupt_pin_register_names_the_pin_the_adapter_drives() {
+    // Two places state one fact — the hardwired Interrupt Pin register (Rev 2.1
+    // §6.2.4) and the `Intx` the adapter actually drives — and nothing else
+    // would notice them drifting apart. A function that told firmware `INTA#`
+    // and then drove `INTB#` would land on the wrong router input, on a board
+    // whose swizzle rotates by device number.
+    let rig = rig();
+    let config = Function::fresh_config(0x8086, 0x2922, 0);
+    assert_eq!(config.byte(config::INTERRUPT_PIN), rig.hba.intx().pin().0);
+    assert_eq!(rig.hba.intx().pin(), crate::bus::pci::IntxPin::A);
+}

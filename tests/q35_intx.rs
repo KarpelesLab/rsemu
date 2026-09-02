@@ -231,9 +231,10 @@ fn firmware() -> Vec<u8> {
     );
     rom[..code.len()].copy_from_slice(&code);
 
-    // A handler records the vector it was entered on, masks its own input —
-    // the line is still asserted, so returning without masking would re-enter
-    // for ever — acknowledges the controller, and returns.
+    // A handler records the vector it was entered on, masks every input — the
+    // controller is still asserting, so returning with the input unmasked would
+    // re-enter for ever, which is what a level *means* — sends the 8259A its
+    // end-of-interrupt, and returns.
     let handler = |vector: u8, at: u64| -> Vec<u8> {
         let mut out = vec![0x50u8]; // push ax
         out.extend_from_slice(&[0xb0, 0xff, 0xe6, 0x21]); // mov al,0xff; out 0x21,al
