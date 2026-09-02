@@ -18,6 +18,21 @@
 //!
 //! If either grep starts returning hits, the split has rotted.
 //!
+//! # Two front doors, one command set
+//!
+//! Eight ports written in the right order is the right model of a ribbon cable
+//! and the wrong model of a Serial ATA link, which carries the whole command
+//! block at once in a structure with no ordering and no register offset in it.
+//! [`disk::taskfile`] is the second door: a [`Taskfile`] of six named fields,
+//! loaded into the very same command block registers a port write would have
+//! left, dispatched by the very same `AtaDisk::command`, with its data phase
+//! running the identical busy/DRQ handshake in bulk.
+//!
+//! The falsifiable form of *that* claim: **delete [`disk::taskfile`] and
+//! [`crate::dev::pc::ide`] is unchanged**; delete `AtaDisk::command` and both
+//! adapters stop working. `dev/ahci` is the second caller and it did not need a
+//! line of `pc/ide` to change.
+//!
 //! **ATAPI is out of scope.** There is no packet interface here, no SCSI
 //! command descriptor block and no CD-ROM: `IDENTIFY PACKET DEVICE` is aborted,
 //! which is exactly what a non-packet device does and exactly how a driver
@@ -59,6 +74,7 @@
 pub mod disk;
 pub mod medium;
 
+pub use disk::taskfile::{Phase, Registers, Taskfile};
 pub use disk::{Address, AtaDisk, Geometry, Identity, Position, Reg};
 pub use medium::{Medium, MediumSlot, Snapshot};
 

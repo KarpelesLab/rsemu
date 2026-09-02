@@ -136,11 +136,16 @@ use crate::dev::ata::medium::{self, Medium, Snapshot};
 use crate::machine::realize::Instance;
 use crate::machine::validate::{ClassSchema, PropSchema};
 
+pub mod taskfile;
+
 /// The class name a machine description writes.
 pub const CLASS_NAME: &str = "ata.disk";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+///
+/// Version 2 added the transfer-in-progress protocol flag, which the taskfile
+/// seam needs and the eight-port path cannot derive.
+const STATE_VERSION: u32 = 2;
 
 /// How many bytes an ATA logical sector holds.
 ///
@@ -236,6 +241,8 @@ pub mod cmd {
     pub const READ_SECTORS_NORETRY: u8 = 0x21;
     /// `READ SECTOR(S) EXT`: 48-bit addressing.
     pub const READ_SECTORS_EXT: u8 = 0x24;
+    /// `READ DMA EXT`: 48-bit addressing, DMA data transfer protocol.
+    pub const READ_DMA_EXT: u8 = 0x25;
     /// `READ NATIVE MAX ADDRESS EXT`.
     pub const READ_NATIVE_MAX_EXT: u8 = 0x27;
     /// `READ MULTIPLE EXT`.
@@ -246,6 +253,8 @@ pub mod cmd {
     pub const WRITE_SECTORS_NORETRY: u8 = 0x31;
     /// `WRITE SECTOR(S) EXT`.
     pub const WRITE_SECTORS_EXT: u8 = 0x34;
+    /// `WRITE DMA EXT`: 48-bit addressing, DMA data transfer protocol.
+    pub const WRITE_DMA_EXT: u8 = 0x35;
     /// `WRITE MULTIPLE EXT`.
     pub const WRITE_MULTIPLE_EXT: u8 = 0x39;
     /// `READ VERIFY SECTOR(S)`.
@@ -268,6 +277,14 @@ pub mod cmd {
     pub const WRITE_MULTIPLE: u8 = 0xc5;
     /// `SET MULTIPLE MODE`.
     pub const SET_MULTIPLE: u8 = 0xc6;
+    /// `READ DMA`, with retries: 28-bit addressing, DMA data transfer protocol.
+    pub const READ_DMA: u8 = 0xc8;
+    /// `READ DMA`, without retries. The same command here.
+    pub const READ_DMA_NORETRY: u8 = 0xc9;
+    /// `WRITE DMA`.
+    pub const WRITE_DMA: u8 = 0xca;
+    /// `WRITE DMA`, without retries.
+    pub const WRITE_DMA_NORETRY: u8 = 0xcb;
     /// `STANDBY IMMEDIATE`.
     pub const STANDBY_IMMEDIATE: u8 = 0xe0;
     /// `IDLE IMMEDIATE`.
@@ -491,6 +508,17 @@ pub struct Identity {
     pub read_only: bool,
     /// Whether the 48-bit Address feature set is supported.
     pub lba48: bool,
+    /// Whether the **DMA data transfer protocols** are supported: the
+    /// `READ DMA`/`WRITE DMA` command family, `IDENTIFY DEVICE` word 49's DMA
+    /// bit, and `SET FEATURES`' DMA transfer modes.
+    ///
+    /// Off by default, and the default is the honest one for a drive on a plain
+    /// AT-class IDE cable: nothing on that board moves bytes for the drive, so a
+    /// drive that advertised DMA would be inviting a driver to program an engine
+    /// that is not there. A host adapter that *is* a bus master — an AHCI port,
+    /// where DMA is the only protocol a real driver uses — wants it on, and its
+    /// machine file says so.
+    pub dma: bool,
     /// The largest block `SET MULTIPLE MODE` will accept, in sectors.
     pub max_multiple: u8,
 }
@@ -541,6 +569,7 @@ impl Identity {
             firmware: String::from("1.0"),
             read_only: false,
             lba48,
+            dma: false,
             max_multiple,
         })
     }
@@ -644,6 +673,14 @@ struct Transfer {
     left: u64,
     /// Sectors per DRQ block: one, or the `SET MULTIPLE MODE` count.
     block: u32,
+    /// Whether the command that started this uses the **DMA** data transfer
+    /// protocol rather than the PIO one.
+    ///
+    /// Nothing below this line behaves differently — the bytes move the same
+    /// way — but the two protocols are not the same on the wire, and a host
+    /// adapter that has to announce a data phase needs to know which one it is
+    /// announcing. [`Phase`](super::taskfile::Phase) is where it comes out.
+    dma: bool,
     /// How the completion address is written back.
     mode: Mode,
     /// The last sector actually moved, for that write-back.
@@ -796,6 +833,7 @@ impl AtaDisk {
         let image = media.map(crate::core::props::Media::to_bytes);
         let read_only = r.or("readonly", false)?;
         let lba48 = r.or("lba48", true)?;
+        let dma = r.or("dma", false)?;
         let max_multiple = r.or_range("multiple", 16u64, 1..=128)? as u8;
         let position = match r.or_enum("position", "master", &["master", "slave"])? {
             "slave" => Position::Device1,
@@ -875,6 +913,7 @@ impl AtaDisk {
         // machine file asked for: telling the guest it may write and then
         // failing every write is worse than an honest read-only drive.
         id.read_only = read_only || supplied.as_ref().is_some_and(|m| m.is_read_only());
+        id.dma = dma;
         id.model = model;
         id.serial = serial;
         id.firmware = firmware;
@@ -1483,10 +1522,24 @@ impl AtaDisk {
                 // is the only honest answer while ATAPI is out of scope.
                 self.abort(state);
             }
-            cmd::READ_SECTORS | cmd::READ_SECTORS_NORETRY => self.transfer(state, false, false, 1),
-            cmd::READ_SECTORS_EXT => self.transfer(state, false, true, 1),
-            cmd::WRITE_SECTORS | cmd::WRITE_SECTORS_NORETRY => self.transfer(state, true, false, 1),
-            cmd::WRITE_SECTORS_EXT => self.transfer(state, true, true, 1),
+            cmd::READ_SECTORS | cmd::READ_SECTORS_NORETRY => {
+                self.transfer(state, false, false, 1, false);
+            }
+            cmd::READ_SECTORS_EXT => self.transfer(state, false, true, 1, false),
+            cmd::WRITE_SECTORS | cmd::WRITE_SECTORS_NORETRY => {
+                self.transfer(state, true, false, 1, false);
+            }
+            cmd::WRITE_SECTORS_EXT => self.transfer(state, true, true, 1, false),
+            // The DMA family. Identical arithmetic and identical media
+            // accesses — the difference is the protocol that carries the
+            // bytes, which is the host adapter's business and comes out of
+            // [`Phase`](taskfile::Phase). A drive whose `dma` is off has no
+            // such protocol and aborts, which is what a device that does not
+            // implement a command is required to do.
+            cmd::READ_DMA | cmd::READ_DMA_NORETRY => self.dma_transfer(state, false, false),
+            cmd::READ_DMA_EXT => self.dma_transfer(state, false, true),
+            cmd::WRITE_DMA | cmd::WRITE_DMA_NORETRY => self.dma_transfer(state, true, false),
+            cmd::WRITE_DMA_EXT => self.dma_transfer(state, true, true),
             cmd::READ_MULTIPLE => self.multiple_transfer(state, false, false),
             cmd::READ_MULTIPLE_EXT => self.multiple_transfer(state, false, true),
             cmd::WRITE_MULTIPLE => self.multiple_transfer(state, true, false),
@@ -1553,8 +1606,24 @@ impl AtaDisk {
         }
     }
 
+    /// `READ DMA`, `WRITE DMA` and their EXT forms.
+    ///
+    /// One sector per block, which is invisible above the seam: the DMA
+    /// protocol has no DRQ block at all, so the size this model moves at a time
+    /// is a property of the buffer rather than anything the guest can observe.
+    /// It is deliberately not the whole transfer, because the whole transfer of
+    /// a 48-bit command is 32 MiB and a host allocation of that size is not what
+    /// a data path should cost.
+    fn dma_transfer(&self, state: &mut Volatile, out: bool, ext: bool) {
+        if !self.id.dma {
+            self.abort(state);
+            return;
+        }
+        self.transfer(state, out, ext, 1, true);
+    }
+
     /// `READ SECTOR(S)`, `WRITE SECTOR(S)` and their EXT forms.
-    fn transfer(&self, state: &mut Volatile, out: bool, ext: bool, block: u32) {
+    fn transfer(&self, state: &mut Volatile, out: bool, ext: bool, block: u32, dma: bool) {
         if ext && !self.id.lba48 {
             self.abort(state);
             return;
@@ -1581,6 +1650,7 @@ impl AtaDisk {
             next: lba,
             left: count,
             block,
+            dma,
             mode,
             last: lba,
         });
@@ -1602,7 +1672,7 @@ impl AtaDisk {
             self.abort(state);
             return;
         }
-        self.transfer(state, out, ext, u32::from(block));
+        self.transfer(state, out, ext, u32::from(block), false);
     }
 
     fn verify(&self, state: &mut Volatile, ext: bool) {
@@ -1686,12 +1756,18 @@ impl AtaDisk {
         const ENABLE_REVERT_ON_POWER_UP: u8 = 0xcc;
         match state.features.current {
             SET_TRANSFER_MODE => {
-                // Only PIO modes exist here: the transfer mode value's top
-                // three bits are the class, and anything that is not PIO
-                // (0b000) or PIO flow control (0b001) is a DMA mode this drive
-                // does not have.
-                let mode = state.count.current;
-                if mode >> 3 <= 1 {
+                // The transfer mode value's top five bits are the class: 0b00000
+                // is PIO default, 0b00001 is PIO flow control, 0b00100 is
+                // multiword DMA and 0b01000 is Ultra DMA. A drive answers for
+                // the classes it has and aborts the rest — so a PIO-only drive
+                // takes the first two, and one with `dma` takes all four.
+                let class = state.count.current >> 3;
+                let ok = match class {
+                    0 | 1 => true,
+                    0b00100 | 0b01000 => self.id.dma,
+                    _ => false,
+                };
+                if ok {
                     self.succeed(state);
                 } else {
                     self.abort(state);
@@ -1746,15 +1822,17 @@ impl AtaDisk {
         // 0x80 the standard puts in the high byte.
         w[47] = 0x8000 | u16::from(id.max_multiple);
         // Word 49: LBA supported (bit 9), IORDY supported (bit 11) and may be
-        // disabled (bit 10). DMA (bit 8) is deliberately clear — this drive
-        // moves data through the data register and nothing else.
-        w[49] = (1 << 9) | (1 << 10) | (1 << 11);
+        // disabled (bit 10). Bit 8 is DMA supported, and it says what the drive
+        // is: off, and this drive moves data through the data register and
+        // nothing else; on, and the DMA command family answers.
+        w[49] = (1 << 9) | (1 << 10) | (1 << 11) | if id.dma { 1 << 8 } else { 0 };
         // Word 50: bit 14 is set to distinguish the word from a zero one.
         w[50] = 0x4000;
         // Word 51: PIO data transfer cycle timing mode 2, in the high byte.
         w[51] = 0x0200;
-        // Word 53: words 54-58 are valid (bit 0), and 64-70 (bit 1).
-        w[53] = 0x0003;
+        // Word 53: words 54-58 are valid (bit 0), 64-70 (bit 1), and — when
+        // there is a DMA mode to report — word 88 (bit 2).
+        w[53] = 0x0003 | if id.dma { 0x0004 } else { 0 };
         // Words 54-58: the *current* translation, and how much it addresses.
         // This is the pair a BIOS and this drive have to agree on.
         w[54] = state.current.cylinders;
@@ -1773,6 +1851,16 @@ impl AtaDisk {
         let lba28 = id.sectors.min(LBA28_LIMIT - 1);
         w[60] = lba28 as u16;
         w[61] = (lba28 >> 16) as u16;
+        if id.dma {
+            // Words 62-63 and 88: the transfer modes supported in the low byte
+            // and the one selected in the high byte. Multiword DMA 0-2 and
+            // Ultra DMA 0-5, with mode 2 and mode 5 selected, which is what a
+            // drive of this vintage reports once a host has run SET FEATURES.
+            // Word 62 is the single-word set and is obsolete since ATA-4, so it
+            // stays zero rather than claiming a mode that no longer exists.
+            w[63] = 0x0007 | (1 << (8 + 2));
+            w[88] = 0x003f | (1 << (8 + 5));
+        }
         // Word 64: PIO modes 3 and 4 supported.
         w[64] = 0x0003;
         // Words 67-68: minimum PIO cycle time, with and without IORDY, in ns.
@@ -1863,6 +1951,7 @@ impl AtaDisk {
             Some(x) => {
                 w.write_bool(true)?;
                 w.write_bool(x.out)?;
+                w.write_bool(x.dma)?;
                 w.write_u64(x.next)?;
                 w.write_u64(x.left)?;
                 w.write_u32(x.block)?;
@@ -1941,6 +2030,7 @@ impl AtaDisk {
         }
         let xfer = if r.read_bool()? {
             let out = r.read_bool()?;
+            let dma = r.read_bool()?;
             let next = r.read_u64()?;
             let left = r.read_u64()?;
             let block = r.read_u32()?;
@@ -1963,6 +2053,7 @@ impl AtaDisk {
             }
             Some(Transfer {
                 out,
+                dma,
                 next,
                 left,
                 block,
@@ -2069,6 +2160,13 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Bool,
             required: false,
             summary: "advertise and accept the 48-bit Address feature set (default true)",
+        },
+        PropertySpec {
+            name: "dma",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "advertise and accept the DMA data transfer protocols and the READ/WRITE \
+                      DMA command family (default false); a bus-mastering host adapter wants it",
         },
         PropertySpec {
             name: "multiple",
@@ -2251,6 +2349,7 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("position", ValueKind::Str).values(&["master", "slave"]))
         .prop(PropSchema::new("readonly", ValueKind::Bool))
         .prop(PropSchema::new("lba48", ValueKind::Bool))
+        .prop(PropSchema::new("dma", ValueKind::Bool))
         .prop(PropSchema::new("multiple", ValueKind::Uint).range(1, 128))
         .prop(PropSchema::new("cylinders", ValueKind::Uint).range(1, 65535))
         .prop(PropSchema::new("heads", ValueKind::Uint).range(1, 16))
