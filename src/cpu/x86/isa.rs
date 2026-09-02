@@ -854,6 +854,7 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("CMOVZ", "cmovz"),
     ("MOVSXD", "movsxd"),
     ("RDMSR", "rdmsr"),
+    ("RDTSC", "rdtsc"),
     ("REX", "rex"),
     ("SWAPGS", "swapgs"),
     ("SYSCALL", "syscall"),
@@ -1222,6 +1223,7 @@ define_ops! {
     CMOVS = "move if the sign flag is set",
     CMOVZ = "move if equal (zero set)",
     RDMSR = "read the model-specific register ECX names into EDX:EAX",
+    RDTSC = "read the time-stamp counter into EDX:EAX",
     WRMSR = "write EDX:EAX to the model-specific register ECX names",
 
     // ---- x86-64 ---------------------------------------------------------
@@ -2551,6 +2553,9 @@ const SECONDARY: ([Insn; 256], [bool; 256]) = opmap! {
     // `0F 32` must still raise `#UD`, and the check belongs where the feature
     // is known rather than in the table.
     0x30 WRMSR None None None   Documented;
+    // The counter behind `CPUID`'s `TSC` bit, gated by `Features::msr` at
+    // execution for the same reason its neighbours are.
+    0x31 RDTSC None None None   Documented;
     0x32 RDMSR None None None   Documented;
 
     // `CMOVcc`, from the Pentium Pro; gated by `Features::cmov`.

@@ -520,10 +520,16 @@ static I8086_REGS: &[RegDesc] = &[
 /// `XMM` block, which is a description to get right rather than three lines to
 /// add. Until then the sixteen core registers are all this offers, and the
 /// version below records that the appended block was read and considered.
+///
+/// Re-verified at chunk version 6, which appends the multiprocessor block —
+/// the wait-for-SIPI state, the two `INIT` levels and the Start-Up page — after
+/// the floating-point one. Appended again, so again nothing here moved. None of
+/// it is a *register*, so there is nothing for this map to grow even when it
+/// does claim the `i386` architecture.
 #[cfg(feature = "cpu-x86")]
 pub static I8086: Arch = Arch {
     class: &crate::cpu::x86::CLASS,
-    verified_version: 5,
+    verified_version: 6,
     feature: "org.rsemu.i386",
     architecture: None,
     regs: I8086_REGS,

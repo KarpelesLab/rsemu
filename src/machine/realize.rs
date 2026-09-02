@@ -1400,6 +1400,24 @@ impl<'a> Realizer<'a> {
                     }
                     drop(peer);
                 }
+                // And the half of a *local* interrupt controller that no level
+                // can carry: the INIT/Start-Up pair that starts a second
+                // processor, and the base register the processor reads through
+                // its own `RDMSR` (`core::wire`'s `LocalController`). It
+                // travels the same net as the interrupt it drives, because on
+                // the hardware it *is* the same connection — the controller is
+                // inside the processor it interrupts.
+                if let Some(peer) = instance.local_controller(port) {
+                    let weak = Arc::downgrade(&peer);
+                    for sink_pin in receivers.iter().copied() {
+                        let (sink_object, sink_port) = pins.pin(sink_pin);
+                        let sink_built = self.device(sink_object, "wire")?;
+                        if let Some(sink_instance) = sink_built.instance.as_ref() {
+                            sink_instance.attach_local_controller(sink_port, Weak::clone(&weak));
+                        }
+                    }
+                    drop(peer);
+                }
                 refs.push(PinRef {
                     device: object.0 as usize,
                     port: port.to_string(),

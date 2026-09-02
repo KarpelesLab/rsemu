@@ -84,6 +84,27 @@
 //! an SSE instruction is `#UD`, and without the second an unmasked SIMD
 //! exception is `#UD` rather than `#XM`.
 //!
+//! **The model-specific registers** ([`prot::msr`]): `RDMSR` and `WRMSR`
+//! reaching `IA32_EFER`, the four `SYSCALL` registers, the three segment-base
+//! registers, the time-stamp counter that `RDTSC` also reads, and
+//! `IA32_APIC_BASE` — which is the one whose *state* is not in the processor at
+//! all, and reaches this core's own interrupt controller through
+//! [`crate::core::wire::LocalController`]. An address this
+//! core does not implement raises `#GP(0)`; a guest that read a plausible zero
+//! instead would conclude a feature was present and disabled, and misbehave a
+//! long way from the cause.
+//!
+//! **Starting a second processor**: the INIT and Start-Up pair, which is what
+//! makes an application processor possible. `INIT` — a pin, or a message from
+//! this core's own local interrupt controller — is a *lesser* restart than
+//! `RESET`: it leaves the processor in the **wait-for-SIPI** state rather than
+//! fetching from the reset vector, and nothing but a Start-Up moves it from
+//! there, not an `INTR` and not an `NMI`. A Start-Up names a page, and the
+//! processor begins executing at `CS:IP = page << 8 : 0`. See
+//! [`X86::request_init`] and [`X86::start_up`], the *MultiProcessor
+//! Specification* v1.4 §B.4 for the sequence a guest writes, and
+//! `tests/pc_apic_smp.rs` for a guest writing it.
+//!
 //! **The exception model**: faults, traps and aborts, with the vectors and
 //! error codes the manual gives them; faults restart the instruction they came
 //! from; and the double-fault table decides whether a second exception is
@@ -248,7 +269,8 @@ use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{self, AtomicBool, AtomicU32, LockRank, Ordering};
 use crate::core::value::Width;
 use crate::core::wire::{
-    FanIn, IntAck, IntAckCycle, IntAckHandlers, IntAckResponse, Level, Resolve, WireId, WireSink,
+    FanIn, IntAck, IntAckCycle, IntAckHandlers, IntAckResponse, Level, LocalController, Resolve,
+    WireId, WireSink,
 };
 
 use exec::{Exec, State};
@@ -1637,7 +1659,42 @@ pub(crate) struct Lines {
     /// a cycle nothing could drop (`ROADMAP.md` §4.3), and the controller is
     /// free to take its own locks.
     acks: IntAckHandlers,
+    /// The `INIT` pin's level, as whatever drives that net says.
+    ///
+    /// Separate from [`init_peer`](Lines::init_peer) because they are two
+    /// different drivers of one architectural condition and a single flag could
+    /// not tell which of them dropped it — the wired-OR bug `ROADMAP.md` §4.3
+    /// names, in miniature.
+    init_pin: AtomicBool,
+    /// The same condition as this core's own local controller reports it.
+    init_peer: AtomicBool,
+    /// A rising edge on either, latched until a step folds it into the
+    /// execution state — exactly as [`reset`](Lines::reset) is, and for the
+    /// same re-entrancy reason.
+    init_latch: AtomicBool,
+    /// The page a Start-Up named, or [`NO_STARTUP`] for none.
+    ///
+    /// A `u32` rather than an `Option<u8>` because it is written from inside a
+    /// write this core issued — the bootstrap processor's store to its own
+    /// interrupt command register — and reaching for a lock there would
+    /// re-enter this core's critical section (§4.7).
+    startup: AtomicU32,
+    /// This core's own interrupt controller, if a machine wired one.
+    ///
+    /// Weak and behind a leaf lock, for the reason [`acks`](Lines::acks) is.
+    /// Asked once per instruction boundary — see [`has_intc`](Lines::has_intc)
+    /// for what keeps that free on a machine that has no such controller.
+    intc: sync::Mutex<Option<Weak<dyn LocalController>>>,
+    /// Whether [`intc`](Lines::intc) holds anything.
+    ///
+    /// The hot path's gate: one relaxed load per instruction on a machine with
+    /// no local controller, rather than a lock acquisition per instruction.
+    has_intc: AtomicBool,
 }
+
+/// [`Lines::startup`] when no Start-Up is waiting. Not a page: a Start-Up's
+/// vector is eight bits, so no real value can collide with it.
+const NO_STARTUP: u32 = u32::MAX;
 
 impl Default for Lines {
     fn default() -> Lines {
@@ -1650,6 +1707,12 @@ impl Default for Lines {
             a20_mask: AtomicU32::new(u32::MAX),
             a20_wired: AtomicBool::new(false),
             acks: IntAckHandlers::new(),
+            init_pin: AtomicBool::new(false),
+            init_peer: AtomicBool::new(false),
+            init_latch: AtomicBool::new(false),
+            startup: AtomicU32::new(NO_STARTUP),
+            intc: sync::Mutex::new(None),
+            has_intc: AtomicBool::new(false),
         }
     }
 }
@@ -1726,6 +1789,158 @@ impl Lines {
     /// Add a controller to those that answer the acknowledge cycle on `INTR`.
     fn attach_ack(&self, ack: Weak<dyn IntAck>) {
         self.acks.attach(ack);
+    }
+
+    /// Drive the `INIT` pin, latching a rising edge.
+    fn set_init_pin(&self, asserted: bool) {
+        let previous = self.init_pin.swap(asserted, Ordering::AcqRel);
+        if asserted && !previous {
+            self.init_latch.store(true, Ordering::Release);
+        }
+    }
+
+    /// The same, for the level this core's own controller reports.
+    fn set_init_peer(&self, asserted: bool) {
+        self.init_peer.store(asserted, Ordering::Release);
+    }
+
+    /// Latch an INIT the core has not run the sequence for yet.
+    fn request_init(&self) {
+        self.init_latch.store(true, Ordering::Release);
+    }
+
+    /// Consume the latch, reporting whether an INIT sequence is owed.
+    ///
+    /// Loaded before it is swapped, unlike the `NMI` latch beside it. Both are
+    /// read once per instruction, but this one is read by *every* processor on
+    /// a multiprocessor board and a read-modify-write takes the cache line
+    /// exclusively every time — which is a line two cores would then trade back
+    /// and forth for the whole of a run in which nothing happens.
+    pub(crate) fn take_init_request(&self) -> bool {
+        if !self.init_latch.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.init_latch.swap(false, Ordering::AcqRel)
+    }
+
+    /// Whether `INIT` is asserted from either driver, which holds the
+    /// processor in reset rather than merely restarting it.
+    pub(crate) fn init_held(&self) -> bool {
+        self.init_pin.load(Ordering::Acquire) || self.init_peer.load(Ordering::Acquire)
+    }
+
+    /// Latch a Start-Up naming `page`.
+    ///
+    /// Last one wins, which is what the hardware does with a message it has
+    /// already accepted and not yet acted on: there is one latch.
+    fn request_startup(&self, page: u8) {
+        self.startup.store(u32::from(page), Ordering::Release);
+    }
+
+    /// Consume the Start-Up latch, reporting the page it named.
+    ///
+    /// Loaded before it is swapped, for the reason
+    /// [`take_init_request`](Lines::take_init_request) gives.
+    pub(crate) fn take_startup(&self) -> Option<u8> {
+        if self.startup.load(Ordering::Relaxed) == NO_STARTUP {
+            return None;
+        }
+        match self.startup.swap(NO_STARTUP, Ordering::AcqRel) {
+            NO_STARTUP => None,
+            page => Some(page as u8),
+        }
+    }
+
+    /// Whether a Start-Up is latched, without consuming it.
+    fn startup_pending(&self) -> Option<u8> {
+        match self.startup.load(Ordering::Acquire) {
+            NO_STARTUP => None,
+            page => Some(page as u8),
+        }
+    }
+
+    /// Whether an INIT sequence is owed, without consuming the latch.
+    fn init_latched(&self) -> bool {
+        self.init_latch.load(Ordering::Acquire)
+    }
+
+    /// The `INIT` pin's level and the level this core's controller reports, as
+    /// two separate facts — which is what a snapshot has to write, since
+    /// restoring their disjunction could not tell them apart afterwards.
+    fn init_levels(&self) -> (bool, bool) {
+        (
+            self.init_pin.load(Ordering::Acquire),
+            self.init_peer.load(Ordering::Acquire),
+        )
+    }
+
+    /// Put the INIT and Start-Up state back as a snapshot recorded it.
+    fn restore_startup(&self, pin: bool, peer: bool, latch: bool, page: Option<u8>) {
+        self.init_pin.store(pin, Ordering::Release);
+        self.init_peer.store(peer, Ordering::Release);
+        self.init_latch.store(latch, Ordering::Release);
+        self.startup
+            .store(page.map_or(NO_STARTUP, u32::from), Ordering::Release);
+    }
+
+    /// Whether a machine wired a local interrupt controller to this core.
+    pub(crate) fn has_local_controller(&self) -> bool {
+        self.has_intc.load(Ordering::Relaxed)
+    }
+
+    /// Adopt this core's own interrupt controller.
+    fn attach_intc(&self, peer: Weak<dyn LocalController>) {
+        *self.intc.lock() = Some(peer);
+        self.has_intc.store(true, Ordering::Release);
+    }
+
+    /// This core's own interrupt controller, if a machine wired one.
+    ///
+    /// The lock is released before the caller uses what it holds, because
+    /// everything the controller is asked runs its own critical section.
+    fn intc(&self) -> Option<Arc<dyn LocalController>> {
+        if !self.has_intc.load(Ordering::Relaxed) {
+            return None;
+        }
+        let peer = self.intc.lock().clone();
+        peer.and_then(|weak| weak.upgrade())
+    }
+
+    /// Ask this core's controller what it has, and fold it into the latches.
+    ///
+    /// Called once per instruction boundary with **no execution lock held**:
+    /// the controller takes its own, and it is free to drive this core's `INTR`
+    /// pin back while it does (§4.7's re-entrancy contract).
+    fn poll_intc(&self) {
+        let Some(intc) = self.intc() else { return };
+        let signal = intc.take_startup();
+        if signal.init {
+            self.request_init();
+        }
+        self.set_init_peer(signal.held);
+        if let Some(page) = signal.page {
+            self.request_startup(page);
+        }
+    }
+
+    /// `IA32_APIC_BASE`, as this core's own controller reports it.
+    pub(crate) fn base_register(&self) -> Option<u64> {
+        self.intc().map(|intc| intc.base_register())
+    }
+
+    /// Write `IA32_APIC_BASE` through to the controller that owns it.
+    ///
+    /// Reports whether there was a controller to take it, so a `WRMSR` to a
+    /// register no part of this machine implements raises `#GP` rather than
+    /// being swallowed.
+    pub(crate) fn set_base_register(&self, value: u64) -> bool {
+        match self.intc() {
+            Some(intc) => {
+                intc.set_base_register(value);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Run the acknowledge cycle and report the vector.
@@ -1894,14 +2109,16 @@ impl X86 {
         // would make an impossible part.
         let mut features = variant.features();
         for name in [
-            "cpuid", "pae", "long", "nx", "syscall", "cmov", "pse", "pge", "fpu", "cx8", "fxsr",
-            "sse", "sse2",
+            "cpuid", "cr4", "msr", "pae", "long", "nx", "syscall", "cmov", "pse", "pge", "fpu",
+            "cx8", "fxsr", "sse", "sse2",
         ] {
             let Some(on) = r.optional::<bool>(name)? else {
                 continue;
             };
             match name {
                 "cpuid" => features.extras_486 = on,
+                "cr4" => features.cr4 = on,
+                "msr" => features.msr = on,
                 "pae" => features.pae = on,
                 "long" => features.long = on,
                 "nx" => features.nx = on,
@@ -2268,6 +2485,62 @@ impl X86 {
         self.lines.reset.load(Ordering::Acquire)
     }
 
+    /// Request an INIT, without changing any register.
+    ///
+    /// The lesser of the two restarts (SDM Vol 3A Table 9-1): the sequence runs
+    /// on the next [`step`](X86::step), and what it leaves behind is a
+    /// processor in the **wait-for-SIPI** state rather than one fetching from
+    /// the reset vector. Nothing but a Start-Up leaves that state — see
+    /// [`start_up`](X86::start_up) — which is exactly the difference between an
+    /// INIT and a `RESET` and the reason a second processor needs both.
+    pub fn request_init(&self) {
+        self.lines.request_init();
+    }
+
+    /// Deliver a Start-Up naming `page`.
+    ///
+    /// The processor leaves wait-for-SIPI and begins executing at
+    /// `CS:IP = page << 8 : 0` — a real-mode segment whose base is
+    /// `page << 12`, so physical `000PP000H` (*MultiProcessor Specification*
+    /// v1.4 §B.4, Intel SDM Vol 3A §8.4.3).
+    ///
+    /// Latched rather than applied: a Start-Up is a message that arrives from
+    /// inside whatever device sent it — on a real board, from inside a store
+    /// the *other* processor issued — so it lands in an atomic outside the
+    /// execution lock and the next step folds it in (§4.7).
+    ///
+    /// A Start-Up to a processor that is not waiting for one is ignored, which
+    /// is why the specification's algorithm sends two and does not care that
+    /// the second is redundant.
+    pub fn start_up(&self, page: u8) {
+        self.lines.request_startup(page);
+    }
+
+    /// Whether the core is halted awaiting a Start-Up.
+    ///
+    /// Distinct from [`is_halted`](X86::is_halted): a `HLT` is left by any
+    /// interrupt, and this is left by nothing but a Start-Up. An `INTR` or an
+    /// `NMI` arriving here stays pending rather than being taken.
+    #[must_use]
+    pub fn is_waiting_for_startup(&self) -> bool {
+        self.session.lock().state.wait_for_sipi
+    }
+
+    /// Whether an INIT sequence has been latched and not yet run.
+    #[must_use]
+    pub fn init_requested(&self) -> bool {
+        self.lines.init_latched()
+    }
+
+    /// Whether the `INIT` line is asserted, from a pin or from this core's own
+    /// interrupt controller.
+    ///
+    /// While it is, the processor is held in reset and charges no cycles.
+    #[must_use]
+    pub fn init_held(&self) -> bool {
+        self.lines.init_held()
+    }
+
     /// Run the `INTR` acknowledge cycle now and report the vector.
     ///
     /// This is exactly what the core does when it takes a maskable interrupt,
@@ -2286,6 +2559,12 @@ impl X86 {
     /// interrupt pending, or has no address space, which the caller must treat
     /// as "stop", not "retry".
     pub fn step(&self) -> u64 {
+        // Ask this core's own interrupt controller what it has, **before** the
+        // execution lock is taken: it takes its own, and it may drive this
+        // core's `INTR` pin back while it is answering (§4.7). One relaxed load
+        // when no such controller is wired, which is every machine in the tree
+        // but a multiprocessor one.
+        self.lines.poll_intc();
         let reset = self.lines.take_reset_request();
         let cfg = self.config();
         let mut session = self.session.lock();
@@ -2469,7 +2748,9 @@ pub static CLASS: DeviceClass = DeviceClass {
     // 5: the floating-point block — the eight x87 registers with the control,
     //    status and tag words and the environment pointers, then the sixteen
     //    `XMM` registers and `MXCSR`.
-    version: 5,
+    // 6: the multiprocessor block — the wait-for-SIPI state, the two `INIT`
+    //    levels, the INIT latch and the Start-Up page.
+    version: 6,
     summary: "Intel x86 CPU core: 8086/8088 real mode, 80386/80486 protected mode, or x86-64",
     properties: &[
         PropertySpec {
@@ -2483,6 +2764,18 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Bool,
             required: false,
             summary: "override the preset: CPUID, BSWAP, XADD, CMPXCHG, INVLPG and CR0.WP",
+        },
+        PropertySpec {
+            name: "cr4",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: CR4 exists, which every extension below needs a bit in",
+        },
+        PropertySpec {
+            name: "msr",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: RDMSR, WRMSR, RDTSC and the model-specific registers",
         },
         PropertySpec {
             name: "pae",
@@ -2589,7 +2882,7 @@ pub static CLASS: DeviceClass = DeviceClass {
 /// core keeps meaning what it meant. A build links one core either way.
 pub static I8086_CLASS: DeviceClass = DeviceClass {
     name: "cpu.i8086",
-    version: 5,
+    version: 6,
     summary: "Intel 8086 / 8088 16-bit CPU core, real mode, hardware-checked interpreter",
     properties: CLASS.properties,
     construct: |props| {
@@ -2649,12 +2942,23 @@ impl Device for X86 {
             "intr" => Input::Intr,
             "nmi" => Input::Nmi,
             "reset" => Input::Reset,
+            // No `INIT` pin on a 16-bit part: it arrived with the parts that
+            // could be a second processor. A machine file naming one on an 8088
+            // is a wiring error and is told so, rather than being given a pin
+            // that does nothing.
+            "init" if self.cfg.variant.is_32bit() => Input::Init,
             "a20" => Input::A20,
             _ => return None,
         };
         if which == Input::A20 {
             self.lines.wire_a20();
         }
+        // No `wire_init` beside that: `INIT` needs no such note. A fresh net
+        // sits low and `INIT` is asserted high, so a pin nobody has driven yet
+        // reads as de-asserted — which is what a processor nobody is holding in
+        // reset wants, and it is the *net's* answer rather than this core's
+        // guess. The A20 gate needed the opposite treatment for the opposite
+        // reason, and `Device::reset` says why.
         let pin = Arc::new(InputPin::new(Arc::clone(&self.lines), which, sources));
         self.pins.lock().push((port.to_string(), Arc::clone(&pin)));
         Some(SinkPin { sink: pin, line: 0 })
@@ -2665,6 +2969,19 @@ impl Device for X86 {
         // 2 by the architecture and nothing drives a vector for it.
         if port == "intr" {
             self.lines.attach_ack(ack);
+        }
+    }
+
+    /// This core's *own* interrupt controller — a local APIC — offered on the
+    /// pin it drives.
+    ///
+    /// `intr` and `nmi` both, because a local APIC drives both of them and the
+    /// machine offers the peer on whichever net it was wired along; a board
+    /// that wires only `nmi` should still be able to start this processor.
+    /// Attaching the same controller twice is harmless: there is one slot.
+    fn attach_local_controller(&self, port: &str, peer: Weak<dyn LocalController>) {
+        if matches!(port, "intr" | "nmi") {
+            self.lines.attach_intc(peer);
         }
     }
 
@@ -2715,6 +3032,15 @@ impl Device for X86 {
         }
         // The sequence the machine just asked for is the one the pin owed.
         self.lines.take_reset_request();
+        // And it outranks an INIT, which is a *lesser* restart: a processor
+        // that has just been reset is not owed the sequence that would have put
+        // it back where reset already put it. The two latches are internal, so
+        // they go; the `INIT` **level** does not, for exactly the reason the
+        // A20 comment above gives — whatever drives that net still drives it,
+        // and a core that cleared it here would start executing while the board
+        // was still holding it in reset.
+        self.lines.take_init_request();
+        self.lines.take_startup();
     }
 
     /// The snapshot layout.
@@ -2845,6 +3171,24 @@ impl Device for X86 {
             w.write_u64(reg[1])?;
         }
         w.write_u32(state.sse.mxcsr)?;
+        // The multiprocessor block, appended for the reason the two before it
+        // were: everything ahead of it keeps the offset it had.
+        //
+        // The two `INIT` **levels** go in for the same reason the A20 gate's
+        // does — they belong to whatever drives them, and nothing is going to
+        // announce again until the next realize sweep, so a restored processor
+        // that was being held in reset must still be held. The latch and the
+        // Start-Up page are internal, and a snapshot taken between a Start-Up
+        // arriving and the step that acts on it would otherwise lose the
+        // processor entirely.
+        w.write_bool(state.wait_for_sipi)?;
+        let (init_pin, init_peer) = self.lines.init_levels();
+        w.write_bool(init_pin)?;
+        w.write_bool(init_peer)?;
+        w.write_bool(self.lines.init_latched())?;
+        let page = self.lines.startup_pending();
+        w.write_bool(page.is_some())?;
+        w.write_u8(page.unwrap_or(0))?;
         Ok(())
     }
 
@@ -2986,6 +3330,14 @@ impl Device for X86 {
             state.sse.xmm[i] = [lo, hi];
         }
         state.sse.mxcsr = r.read_u32()?;
+        // The multiprocessor block, in the order `save` wrote it.
+        state.wait_for_sipi = r.read_bool()?;
+        let init_pin = r.read_bool()?;
+        let init_peer = r.read_bool()?;
+        let init_latch = r.read_bool()?;
+        let has_startup = r.read_bool()?;
+        let startup_page = r.read_u8()?;
+        let startup = has_startup.then_some(startup_page);
         // The translation-lookaside buffer is derived, so it is not in the
         // snapshot and starts empty — which is correct rather than merely
         // convenient, because the page tables it would cache have just been
@@ -2994,6 +3346,8 @@ impl Device for X86 {
         self.session.lock().state = state;
         self.lines.restore((intr, nmi_level, nmi_latch, vector));
         self.lines.set_a20(a20);
+        self.lines
+            .restore_startup(init_pin, init_peer, init_latch, startup);
         Ok(())
     }
 }
@@ -3076,6 +3430,11 @@ fn schema_for(name: &'static str) -> crate::machine::validate::ClassSchema {
         .port("intr", PortDir::In)
         .port("nmi", PortDir::In)
         .port("reset", PortDir::In)
+        // The lesser restart. Offered on every class here even though a 16-bit
+        // part has no such pin — the schema describes the class, and the class
+        // covers five parts; `Device::sink` is where the part decides, and it
+        // refuses this one on an 8086.
+        .port("init", PortDir::In)
         // Not a processor pin on real silicon: the gate is in the chipset,
         // between the CPU and the bus. It is an input here because this core
         // does its own address wrapping and the gate is exactly a suppression
@@ -3092,6 +3451,9 @@ enum Input {
     Nmi,
     /// `RESET`, latched on assertion.
     Reset,
+    /// `INIT`, level-sensitive: the rising edge runs the INIT sequence and the
+    /// level holds the processor there until it drops.
+    Init,
     /// The A20 gate: high opens it, low masks address bit 20.
     A20,
 }
@@ -3149,6 +3511,11 @@ impl WireSink for InputPin {
                     self.lines.request_reset();
                 }
             }
+            // Unlike `RESET`, the level is kept as well as the edge: `INIT` is
+            // one half of a level-triggered pair (SDM Vol 3A §10.6.1), and a
+            // processor whose `INIT` is still asserted is held in reset rather
+            // than restarted.
+            Input::Init => self.lines.set_init_pin(asserted),
             Input::A20 => self.lines.set_a20(asserted),
         }
     }
