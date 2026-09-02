@@ -81,6 +81,26 @@ pub struct BlockId {
     stamp: u64,
 }
 
+/// A handle on one block's compiled host code.
+///
+/// Plain data — an index and a generation — so that this module can hold one
+/// beside the block it names without knowing what a code buffer is, and so
+/// that `jit/cache.rs` stays `no_std` while the thing it refers to is behind a
+/// feature and a target `cfg`. The generation is what makes a handle from
+/// before a code buffer was reset *rejected* rather than followed into
+/// whatever took its place; the backend checks it, not this cache.
+///
+/// A handle lives and dies with its slot: [`BlockCache::insert`] starts it at
+/// `None`, and an invalidated or evicted block drops it, so the one thing that
+/// cannot happen is code left attached to a block that has gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeRef {
+    /// The backend's index for this code.
+    pub index: u32,
+    /// The code buffer generation it was emitted in.
+    pub generation: u64,
+}
+
 /// How many successors one block may be chained to.
 ///
 /// Two: the taken and not-taken sides of a conditional branch, which is the
@@ -135,6 +155,8 @@ struct Slot {
     /// The back edges. Without them an invalidated block leaves live pointers
     /// behind it in blocks that are perfectly valid themselves.
     preds: Vec<(u32, u8)>,
+    /// This block's compiled host code, once a backend has produced some.
+    code: Option<CodeRef>,
 }
 
 /// What a [`BlockCache`] has been asked to do.
@@ -374,6 +396,7 @@ impl BlockCache {
             next: NONE,
             exits: [Link::empty(); EXITS],
             preds: Vec::new(),
+            code: None,
         };
         let id = match self.free.pop() {
             Some(i) => {
@@ -411,6 +434,29 @@ impl BlockCache {
     #[must_use]
     pub fn insns(&self, id: BlockId) -> Option<usize> {
         self.slot(id).map(|s| s.insns)
+    }
+
+    /// The compiled code attached to a block, if any has been.
+    #[inline]
+    #[must_use]
+    pub fn code(&self, id: BlockId) -> Option<CodeRef> {
+        self.slot(id).and_then(|s| s.code)
+    }
+
+    /// Attach compiled code to a block.
+    ///
+    /// A no-op for an id whose block has gone, which is what makes it safe to
+    /// call after a run: a block that wrote into its own page invalidated
+    /// itself while its id was still live.
+    pub fn set_code(&mut self, id: BlockId, code: CodeRef) {
+        if let Some(slot) = self
+            .slots
+            .get_mut(id.slot as usize)
+            .and_then(Option::as_mut)
+            .filter(|s| s.stamp == id.stamp)
+        {
+            slot.code = Some(code);
+        }
     }
 
     /// The guest-physical page the block was lifted from.

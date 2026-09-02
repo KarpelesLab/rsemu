@@ -1,0 +1,1229 @@
+//! The code generator: one [`Block`] in, one function's worth of x86-64 out.
+//!
+//! Safe Rust. It produces a `Vec<u8>` and a table of [`MemOp`] descriptors;
+//! [`buf`](super::buf) is what makes those bytes executable and
+//! [`rt`](super::rt) is what enters them.
+//!
+//! # The machine this compiles to
+//!
+//! **Temporaries live in a frame, not in host registers.** Every IR
+//! instruction loads its operands out of a `u64` array, computes in `rax`,
+//! `rcx` and `rdx`, and stores its result back. That is a deliberate first
+//! step and not the end state: `ROADMAP.md` §9's pipeline ends *"register
+//! allocation (linear scan) → host backend"*, and this is the backend without
+//! the allocator. What it already buys is the whole of the interpreter's
+//! dispatch — a `match` over sixty opcodes, an operand-arity check, a `u128`
+//! masked at every step, a bounds check per temporary — replaced by three or
+//! four instructions with L1-hot operands. What it leaves on the table is the
+//! loads and stores between them, which is exactly what linear scan removes.
+//!
+//! Keeping the frame also makes the hard half of §9 nearly free: *"when a load
+//! faults halfway through a translated block, the guest must observe exactly
+//! the architectural state its ISA specifies"*. There is no host-register-to-
+//! guest-register side table to reconstruct, because every temporary is
+//! already where the interpreter would have left it, and the runtime publishes
+//! the boundary's live mapping from the same array the interpreter publishes
+//! from. A register allocator is what makes that a real problem; this backend
+//! is the one that proves everything *around* it first.
+//!
+//! Values are held **canonically masked to their type**, exactly as
+//! `ir::Interp` holds them: an `i32` temporary never carries bits above 32 and
+//! an `i1` never carries bits above 1. Every op therefore assumes canonical
+//! inputs and masks its own output exactly once, which is the same contract
+//! the oracle keeps and the reason the two can be compared value for value.
+//!
+//! # The register assignment
+//!
+//! | register | holds |
+//! | --- | --- |
+//! | `rbx` | the [`Ctx`](super::rt::Ctx) |
+//! | `r12` | the temporary frame |
+//! | `r14` | the thunk table |
+//! | `r15` | the software TLB's load set, or null |
+//! | `rax` `rcx` `rdx` `rsi` `rdi` `r13` | scratch |
+//!
+//! The four persistent ones are callee-saved, so a thunk call cannot lose
+//! them; `r13` is callee-saved too, which is why it is the one scratch that
+//! may hold a value *across* a call.
+//!
+//! # Out-of-range shifts
+//!
+//! [`Opcode::SHL`], [`Opcode::SHR`] and [`Opcode::SAR`] are undefined in the
+//! IR when the amount reaches the type's width, and `ir::Interp` — the oracle
+//! — deliberately takes the *mathematical* answer rather than the
+//! mask-the-count behaviour x86-64 gives for free, so that a frontend which
+//! forgot its guard diverges instead of being quietly rescued. This backend
+//! therefore emits the compare and the branch rather than taking the free
+//! behaviour: agreeing with the oracle is the requirement, and "the host does
+//! it differently for nothing" is precisely the divergence the interpreter's
+//! choice exists to expose.
+//!
+//! # Baseline instructions only
+//!
+//! No `popcnt`, no `lzcnt`, no `tzcnt`, no BMI — see [`emit`](super::emit).
+//! Population count is the SWAR sequence and the zero counts are `BSR`/`BSF`
+//! with an explicit zero case, so the generated code runs on any x86-64.
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+
+use crate::core::value::Width;
+use crate::ir::{
+    AccessKind, Block, Cond, Inst, MemOp, MemSpace, Opcode, Sign, Temp, Type, bitfield_parts,
+};
+use crate::jit::PAGE_MASK;
+use crate::jit::tlb::FastSet;
+
+use super::emit::{Alu, Asm, Cc, Fixup, Reg, Shift};
+use super::rt::{off, status, vt};
+
+/// Why a block was not compiled.
+///
+/// Never an error: the IR interpreter is always the fallback
+/// (`ROADMAP.md` §9, "Backends"), so a refusal costs speed on that block and
+/// nothing else. Every variant names something specific, because "the JIT did
+/// not take it" with no reason attached is how a backend's coverage silently
+/// rots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Refusal {
+    /// An opcode this backend does not lower. See [`compiles`].
+    Op(Opcode),
+    /// A type this backend does not hold in a host register: anything wider
+    /// than 64 bits, and both float types — tier-1 floating point is a helper
+    /// call, and helper calls are refused too.
+    Type(Type),
+    /// The block is shaped in a way the compiler will not take: a branch that
+    /// is not forward, a missing terminator, an operand count that does not
+    /// match the op, a bitfield outside its type.
+    Shape(&'static str),
+    /// The code buffer had no room, even after being reset.
+    CodeBufferFull,
+}
+
+impl core::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Refusal::Op(op) => write!(f, "no lowering for `{op}`"),
+            Refusal::Type(ty) => write!(f, "no host register holds an `{ty}`"),
+            Refusal::Shape(what) => write!(f, "{what}"),
+            Refusal::CodeBufferFull => f.write_str("the code buffer is full"),
+        }
+    }
+}
+
+/// Whether this backend lowers `op`.
+///
+/// The union of what the RISC-V and x86 frontends emit, plus the neighbours
+/// that cost nothing once their family is in. What is *not* here, and why:
+///
+/// * **The atomics and `fence`** — a guest atomic has to reach the host's
+///   atomic, and `IrHost::rmw` is the seam that does it. Inlining one means
+///   deciding the host memory model in generated code, which is
+///   `ROADMAP.md` §9.1's sixth mechanism and not this one.
+/// * **`call_helper`** — arbitrary Rust, and a barrier for the register
+///   mapping (`ir`'s decision 4). Cheap to add later; nothing emits one yet.
+/// * **`phi`** — cannot be executed as defined, in this backend or the
+///   interpreter (`ir`'s "Known gaps").
+/// * **`div`/`rem`, `addc`/`subb`, `mulhsu`** — no frontend in the tree emits
+///   one. Lowering an op nothing exercises would mean shipping untested code
+///   generation, which is worse than shipping none: the differential harnesses
+///   cannot reach it.
+#[must_use]
+pub fn compiles(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::MOV
+            | Opcode::GET_SLOT
+            | Opcode::EXT_S
+            | Opcode::EXT_Z
+            | Opcode::TRUNC
+            | Opcode::BSWAP
+            | Opcode::DEPOSIT
+            | Opcode::EXTRACT
+            | Opcode::ADD
+            | Opcode::SUB
+            | Opcode::MUL
+            | Opcode::NEG
+            | Opcode::MULU2
+            | Opcode::MULS2
+            | Opcode::AND
+            | Opcode::OR
+            | Opcode::XOR
+            | Opcode::NOT
+            | Opcode::ANDC
+            | Opcode::SHL
+            | Opcode::SHR
+            | Opcode::SAR
+            | Opcode::ROTL
+            | Opcode::ROTR
+            | Opcode::ROTLC
+            | Opcode::ROTRC
+            | Opcode::CLZ
+            | Opcode::CTZ
+            | Opcode::POPCOUNT
+            | Opcode::SETCOND
+            | Opcode::MOVCOND
+            | Opcode::BRCOND
+            | Opcode::LD
+            | Opcode::ST
+            | Opcode::GOTO_TB
+            | Opcode::EXIT_TB
+            | Opcode::LOOKUP_AND_GOTO
+            | Opcode::CHARGE
+            | Opcode::INSN_START
+    )
+}
+
+/// One block's worth of host code, and the descriptors it points at.
+///
+/// The [`MemOp`] table is a `Box<[MemOp]>` whose element addresses are baked
+/// into the code as immediates, so it must not move once compilation has
+/// finished. A `Box`'s allocation does not move when the `Box` does, which is
+/// why it is a box and not a `Vec` field — a `Vec` that were ever pushed to
+/// would reallocate under the generated code.
+#[derive(Debug)]
+pub struct Compiled {
+    code: Vec<u8>,
+    /// Never read from Rust after compilation — and that is the point. Its
+    /// element *addresses* are immediates in the code above, so what this
+    /// field does is keep the allocation alive for as long as the code that
+    /// points into it. Dropping it would leave the generated `mov rsi, imm64`
+    /// naming freed memory.
+    #[allow(dead_code)]
+    mems: Box<[MemOp]>,
+    offset: u64,
+}
+
+impl Compiled {
+    /// The machine code.
+    #[inline]
+    #[must_use]
+    pub fn code(&self) -> &[u8] {
+        &self.code
+    }
+
+    /// Where it was placed in the code buffer.
+    #[inline]
+    #[must_use]
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// The same block, recorded as living at `offset`.
+    #[must_use]
+    pub fn at(mut self, offset: u64) -> Compiled {
+        self.offset = offset;
+        // The code is copied into the buffer, and nothing reads it again.
+        self.code = Vec::new();
+        self
+    }
+
+    /// How many descriptors it carries, for tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn mem_count(&self) -> usize {
+        self.mems.len()
+    }
+}
+
+/// Compile `block`, or say why not.
+///
+/// # Errors
+///
+/// [`Refusal`], naming the op, type or shape that stopped it.
+pub fn compile(block: &Block) -> Result<Compiled, Refusal> {
+    Compiler::new(block)?.run()
+}
+
+/// The `mem` table, collected before anything is emitted so its addresses are
+/// final.
+fn descriptors(block: &Block) -> Box<[MemOp]> {
+    let mut out = Vec::new();
+    for inst in block.insts() {
+        if matches!(inst.op, Opcode::LD | Opcode::ST)
+            && let Some(mem) = inst.mem
+        {
+            out.push(mem);
+        }
+    }
+    out.into_boxed_slice()
+}
+
+struct Compiler<'a> {
+    block: &'a Block,
+    asm: Asm,
+    mems: Box<[MemOp]>,
+    /// The next descriptor to hand out, in the order [`descriptors`] collected.
+    next_mem: usize,
+    /// Where each IR instruction's code begins.
+    starts: Vec<usize>,
+    /// Branches whose target is an IR instruction index.
+    branches: Vec<(Fixup, usize)>,
+    /// Jumps to the epilogue.
+    exits: Vec<Fixup>,
+}
+
+/// The stack this backend reserves below its saved registers.
+///
+/// Forty bytes: eight for a load thunk's out-parameter and thirty-two of
+/// padding that keeps `rsp` sixteen-byte aligned at every `call`, which the
+/// System V AMD64 ABI requires and a violation of which shows up as a fault
+/// inside some unrelated library's SSE prologue rather than here.
+const FRAME: i32 = 0x28;
+
+impl<'a> Compiler<'a> {
+    fn new(block: &'a Block) -> Result<Compiler<'a>, Refusal> {
+        // A temporary's frame slot is reached with a 32-bit displacement.
+        if block
+            .temp_count()
+            .checked_mul(8)
+            .is_none_or(|n| i32::try_from(n).is_err())
+        {
+            return Err(Refusal::Shape("the block has too many temporaries"));
+        }
+        Ok(Compiler {
+            block,
+            asm: Asm::new(),
+            mems: descriptors(block),
+            next_mem: 0,
+            starts: Vec::with_capacity(block.insts().len()),
+            branches: Vec::new(),
+            exits: Vec::new(),
+        })
+    }
+
+    fn run(mut self) -> Result<Compiled, Refusal> {
+        let insts = self.block.insts();
+        if !insts.last().is_some_and(|i| i.op.is_terminator()) {
+            return Err(Refusal::Shape("the block does not end in a terminator"));
+        }
+        self.prologue();
+        for (at, inst) in insts.iter().enumerate() {
+            self.starts.push(self.asm.here());
+            self.inst(at, inst)?;
+        }
+        self.epilogue();
+        for (fixup, target) in core::mem::take(&mut self.branches) {
+            let at = self.starts[target];
+            self.asm.bind_to(fixup, at);
+        }
+        Ok(Compiled {
+            code: self.asm.finish(),
+            mems: self.mems,
+            offset: 0,
+        })
+    }
+
+    // ---- frame ---------------------------------------------------------
+
+    fn prologue(&mut self) {
+        for r in [Reg::Rbx, Reg::Rbp, Reg::R12, Reg::R13, Reg::R14, Reg::R15] {
+            self.asm.push(r);
+        }
+        self.asm.alu_ri(Alu::Sub, Reg::Rsp, FRAME);
+        self.asm.mov_rr(Reg::Rbx, Reg::Rdi);
+        self.asm.mov_rm(Reg::R12, Reg::Rbx, off::TEMPS);
+        self.asm.mov_rm(Reg::R14, Reg::Rbx, off::VT);
+        self.asm.mov_rm(Reg::R15, Reg::Rbx, off::TLB_BASE);
+    }
+
+    fn epilogue(&mut self) {
+        for f in core::mem::take(&mut self.exits) {
+            self.asm.bind(f);
+        }
+        self.asm.alu_ri(Alu::Add, Reg::Rsp, FRAME);
+        for r in [Reg::R15, Reg::R14, Reg::R13, Reg::R12, Reg::Rbp, Reg::Rbx] {
+            self.asm.pop(r);
+        }
+        self.asm.ret();
+    }
+
+    /// Leave the block with `code` in `rax`.
+    fn leave(&mut self, code: u64) {
+        self.asm.mov_ri(Reg::Rax, code);
+        let f = self.asm.jmp();
+        self.exits.push(f);
+    }
+
+    // ---- operands ------------------------------------------------------
+
+    fn frame(temp: Temp) -> i32 {
+        (temp.index() as i32) * 8
+    }
+
+    fn load_temp(&mut self, reg: Reg, temp: Temp) {
+        let at = Self::frame(temp);
+        self.asm.mov_rm(reg, Reg::R12, at);
+    }
+
+    fn store_temp(&mut self, temp: Temp, reg: Reg) {
+        let at = Self::frame(temp);
+        self.asm.mov_mr(Reg::R12, at, reg);
+    }
+
+    /// Canonicalise `reg` to `ty`, as `Interp::set` does.
+    fn mask(&mut self, reg: Reg, ty: Type) {
+        match ty {
+            Type::I1 => self.asm.alu_ri(Alu::And, reg, 1),
+            Type::I32 => self.asm.mov_rr32(reg, reg),
+            Type::I64 => {}
+            // Refused at `check_type`, so this is unreachable rather than
+            // wrong; masking nothing is still the conservative answer.
+            _ => {}
+        }
+    }
+
+    /// Sign-extend the low `bits` of `reg` through the whole register.
+    fn sext(&mut self, reg: Reg, bits: u32) {
+        if bits < 64 {
+            let shift = (64 - bits) as u8;
+            self.asm.shift_ri(Shift::Shl, reg, shift);
+            self.asm.shift_ri(Shift::Sar, reg, shift);
+        }
+    }
+
+    /// Write `reg` into the instruction's destination.
+    ///
+    /// `ir::Interp` applies **two** masks here and this reproduces both: the
+    /// arithmetic ops mask their result to the *instruction's* width, and every
+    /// write then masks to the *destination temporary's*. Usually the two are
+    /// the same type — `BlockBuilder::emit` allocates the destination with the
+    /// instruction's type — but not always, and the exception is not exotic:
+    /// [`Opcode::SETCOND`]'s type is the type it *compared* and its destination
+    /// is one bit, which the verifier insists on.
+    ///
+    /// A destination **wider** than the instruction is refused, because there
+    /// the two orders differ: the ops that do not mask to the instruction's
+    /// width would keep bits this backend has already dropped. Nothing in the
+    /// tree emits one, and refusing costs a block on the interpreter.
+    fn write(&mut self, inst: &Inst, reg: Reg) -> Result<(), Refusal> {
+        let dst = inst
+            .dst
+            .ok_or(Refusal::Shape("this op must have a destination"))?;
+        let dst_ty = self
+            .block
+            .type_of(dst)
+            .ok_or(Refusal::Shape("the destination was never allocated"))?;
+        check_type(dst_ty)?;
+        if dst_ty.bits() > inst.ty.bits() {
+            return Err(Refusal::Shape(
+                "this op's destination is wider than the op's own type",
+            ));
+        }
+        self.mask(reg, inst.ty);
+        if dst_ty != inst.ty {
+            self.mask(reg, dst_ty);
+        }
+        self.store_temp(dst, reg);
+        Ok(())
+    }
+
+    fn src(&self, at: usize, i: usize) -> Result<Temp, Refusal> {
+        self.block
+            .srcs(at)
+            .get(i)
+            .copied()
+            .ok_or(Refusal::Shape("too few source operands"))
+    }
+
+    /// The same, refusing an operand whose type is not the instruction's.
+    ///
+    /// **The IR does not require the two to agree**, and the verifier does not
+    /// check it — so an `i32` `rotl` over an `i64` operand is a legal block, and
+    /// `ir::Interp` then computes on the operand's *own* width and masks the
+    /// result at the instruction's. For the ops where the two answers differ —
+    /// the rotates, the bit counts, `bswap`, and the widening multiplies —
+    /// reproducing that would mean carrying the interpreter's accident into
+    /// generated code, and doing anything else would be a silent divergence.
+    /// So it is refused, and the interpreter runs the block.
+    ///
+    /// Neither frontend in the tree emits one: `cpu::riscv::lift` truncates to
+    /// `i32` before every word-width operation, and `cpu::x86::lift` is `i64`
+    /// and `i1` throughout. The narrower ops — `add`, `and`, `shl` and their
+    /// neighbours — are unaffected either way, because masking the result is
+    /// the whole difference, so they are not checked.
+    fn src_typed(&self, at: usize, i: usize, ty: Type) -> Result<Temp, Refusal> {
+        let temp = self.src(at, i)?;
+        if self.block.type_of(temp) == Some(ty) {
+            Ok(temp)
+        } else {
+            Err(Refusal::Shape(
+                "this op's operand is not the op's own type, and the interpreter \
+                 would compute at the operand's width",
+            ))
+        }
+    }
+
+    // ---- calls ---------------------------------------------------------
+
+    /// `call [r14 + slot]`, with the context already in `rdi`.
+    fn call(&mut self, slot: i32) {
+        self.asm.call_m(Reg::R14, slot);
+    }
+
+    fn ctx_to_rdi(&mut self) {
+        self.asm.mov_rr(Reg::Rdi, Reg::Rbx);
+    }
+
+    /// Add one to a `u64` context field.
+    fn bump(&mut self, field: i32) {
+        self.asm.mov_rm(Reg::Rax, Reg::Rbx, field);
+        self.asm.alu_ri(Alu::Add, Reg::Rax, 1);
+        self.asm.mov_mr(Reg::Rbx, field, Reg::Rax);
+    }
+
+    /// The sequence a faulting access jumps to: record where and why, and
+    /// leave. `rax` holds the error code on entry.
+    fn fault(&mut self, at: usize) -> Result<(), Refusal> {
+        let at = i32::try_from(at).map_err(|_| Refusal::Shape("the block is too long"))?;
+        self.asm.mov_mr(Reg::Rbx, off::FAULT_ERROR, Reg::Rax);
+        self.asm.mov_mi(Reg::Rbx, off::FAULT_AT, at);
+        self.leave(status::FAULT);
+        Ok(())
+    }
+
+    // ---- the opcodes ---------------------------------------------------
+
+    fn inst(&mut self, at: usize, inst: &Inst) -> Result<(), Refusal> {
+        let op = inst.op;
+        if !compiles(op) {
+            return Err(Refusal::Op(op));
+        }
+        check_type(inst.ty)?;
+        let w = inst.ty.bits();
+
+        match op {
+            Opcode::MOV => {
+                match (self.block.srcs(at).first().copied(), inst.imm) {
+                    (Some(s), _) => self.load_temp(Reg::Rax, s),
+                    (None, Some(c)) => self.asm.mov_ri(Reg::Rax, c.bits() as u64),
+                    (None, None) => {
+                        return Err(Refusal::Shape("a mov needs a source or an immediate"));
+                    }
+                }
+                self.write(inst, Reg::Rax)?;
+            }
+            Opcode::GET_SLOT => {
+                self.ctx_to_rdi();
+                self.asm.mov_ri(Reg::Rsi, u64::from(inst.aux & 0xffff));
+                self.call(vt::GET_SLOT);
+                self.write(inst, Reg::Rax)?;
+            }
+            Opcode::EXT_S => {
+                let s = self.src(at, 0)?;
+                let from = self
+                    .block
+                    .type_of(s)
+                    .ok_or(Refusal::Shape("the source was never allocated"))?;
+                check_type(from)?;
+                self.load_temp(Reg::Rax, s);
+                self.sext(Reg::Rax, from.bits());
+                self.write(inst, Reg::Rax)?;
+            }
+            Opcode::EXT_Z | Opcode::TRUNC => {
+                let s = self.src(at, 0)?;
+                self.load_temp(Reg::Rax, s);
+                self.write(inst, Reg::Rax)?;
+            }
+            Opcode::BSWAP => {
+                let lane = match inst.imm {
+                    Some(c) => u32::try_from(c.bits())
+                        .map_err(|_| Refusal::Shape("the lane width is absurd"))?,
+                    None => w,
+                };
+                if !matches!(lane, 8 | 16 | 32 | 64) || lane > w || !w.is_multiple_of(lane) {
+                    return Err(Refusal::Shape(
+                        "a bswap lane is 8, 16, 32 or 64 bits and divides the type",
+                    ));
+                }
+                let s = self.src_typed(at, 0, inst.ty)?;
+                self.load_temp(Reg::Rax, s);
+                if lane == w && (w == 32 || w == 64) {
+                    // The whole-type case, which is one instruction.
+                    if w == 64 {
+                        self.asm.bswap64(Reg::Rax);
+                    } else {
+                        self.asm.bswap32(Reg::Rax);
+                    }
+                } else {
+                    // A lane narrower than the type: `BSWAP` cannot express it,
+                    // so it is the swap cascade — bytes within halfwords, then
+                    // halfwords within words, then words — stopped at the lane
+                    // width. x86's `BSWAP r16` is documented as undefined, and
+                    // ARM's `REV16` is exactly this shape, which is why the op
+                    // carries a lane width at all.
+                    //
+                    // The masks span the whole register rather than the type's
+                    // width, which is correct because a value is held
+                    // canonically masked: the bits above `w` are zero going in
+                    // and are masked off again coming out.
+                    for (shift, mask) in [
+                        (8u8, 0x00ff_00ff_00ff_00ffu64),
+                        (16, 0x0000_ffff_0000_ffff),
+                        (32, 0x0000_0000_ffff_ffff),
+                    ] {
+                        if lane <= u32::from(shift) {
+                            break;
+                        }
+                        self.asm.mov_rr(Reg::Rcx, Reg::Rax);
+                        self.asm.mov_ri(Reg::Rdx, mask);
+                        self.asm.alu_rr(Alu::And, Reg::Rcx, Reg::Rdx);
+                        self.asm.shift_ri(Shift::Shl, Reg::Rcx, shift);
+                        self.asm.shift_ri(Shift::Shr, Reg::Rax, shift);
+                        self.asm.alu_rr(Alu::And, Reg::Rax, Reg::Rdx);
+                        self.asm.alu_rr(Alu::Or, Reg::Rax, Reg::Rcx);
+                    }
+                }
+                self.write(inst, Reg::Rax)?;
+            }
+            Opcode::DEPOSIT => {
+                let (pos, len) = bitfield_parts(inst.aux);
+                let field = field_mask(pos, len, w)
+                    .ok_or(Refusal::Shape("the bitfield leaves the type"))?;
+                let into = self.src(at, 0)?;
+                let what = self.src(at, 1)?;
+                self.load_temp(Reg::Rax, into);
+                self.asm.mov_ri(Reg::Rcx, !field);
+                self.asm.alu_rr(Alu::And, Reg::Rax, Reg::Rcx);
+                self.load_temp(Reg::Rcx, what);
+                if pos > 0 {
+                    self.asm.shift_ri(Shift::Shl, Reg::Rcx, pos as u8);
+                }
+                self.asm.mov_ri(Reg::Rdx, field);
+                self.asm.alu_rr(Alu::And, Reg::Rcx, Reg::Rdx);
+                self.asm.alu_rr(Alu::Or, Reg::Rax, Reg::Rcx);
+                self.write(inst, Reg::Rax)?;
+            }
+            Opcode::EXTRACT => {
+                let (pos, len) = bitfield_parts(inst.aux);
+                let field = field_mask(pos, len, w)
+                    .ok_or(Refusal::Shape("the bitfield leaves the type"))?;
+                let s = self.src(at, 0)?;
+                self.load_temp(Reg::Rax, s);
+                self.asm.mov_ri(Reg::Rcx, field);
+                self.asm.alu_rr(Alu::And, Reg::Rax, Reg::Rcx);
+                if pos > 0 {
+                    self.asm.shift_ri(Shift::Shr, Reg::Rax, pos as u8);
+                }
+                self.write(inst, Reg::Rax)?;
+            }
+            Opcode::ADD | Opcode::SUB | Opcode::AND | Opcode::OR | Opcode::XOR => {
+                let a = self.src(at, 0)?;
+                let b = self.src(at, 1)?;
+                self.load_temp(Reg::Rax, a);
+                self.load_temp(Reg::Rcx, b);
+                let alu = match op {
+                    Opcode::ADD => Alu::Add,
+                    Opcode::SUB => Alu::Sub,
+                    Opcode::AND => Alu::And,
+                    Opcode::OR => Alu::Or,
+                    _ => Alu::Xor,
+                };
+                self.asm.alu_rr(alu, Reg::Rax, Reg::Rcx);
+                self.write(inst, Reg::Rax)?;
+            }
+            Opcode::ANDC => {
+                let a = self.src(at, 0)?;
+                let b = self.src(at, 1)?;
+                self.load_temp(Reg::Rax, a);
+                self.load_temp(Reg::Rcx, b);
+                self.asm.not(Reg::Rcx);
+                self.asm.alu_rr(Alu::And, Reg::Rax, Reg::Rcx);
+                self.write(inst, Reg::Rax)?;
+            }
+            Opcode::MUL => {
+                let a = self.src(at, 0)?;
+                let b = self.src(at, 1)?;
+                self.load_temp(Reg::Rax, a);
+                self.load_temp(Reg::Rcx, b);
+                self.asm.imul_rr(Reg::Rax, Reg::Rcx);
+                self.write(inst, Reg::Rax)?;
+            }
+            Opcode::NEG => {
+                let a = self.src(at, 0)?;
+                self.load_temp(Reg::Rax, a);
+                self.asm.neg(Reg::Rax);
+                self.write(inst, Reg::Rax)?;
+            }
+            Opcode::NOT => {
+                let a = self.src(at, 0)?;
+                self.load_temp(Reg::Rax, a);
+                self.asm.not(Reg::Rax);
+                self.write(inst, Reg::Rax)?;
+            }
+            Opcode::MULU2 | Opcode::MULS2 => self.widening_multiply(at, inst, w)?,
+            Opcode::SHL | Opcode::SHR | Opcode::SAR => self.shift(at, inst, w)?,
+            Opcode::ROTL | Opcode::ROTR => {
+                if w != 32 && w != 64 {
+                    return Err(Refusal::Shape("a rotate is 32 or 64 bits wide"));
+                }
+                let a = self.src_typed(at, 0, inst.ty)?;
+                let b = self.src(at, 1)?;
+                self.load_temp(Reg::Rax, a);
+                self.load_temp(Reg::Rcx, b);
+                let sh = if op == Opcode::ROTL {
+                    Shift::Rol
+                } else {
+                    Shift::Ror
+                };
+                // `cl` is masked to six bits at 64 and five at 32, which is
+                // exactly the amount modulo the width the IR asks for.
+                if w == 64 {
+                    self.asm.shift_rcl(sh, Reg::Rax);
+                } else {
+                    self.asm.shift_rcl32(sh, Reg::Rax);
+                }
+                self.write(inst, Reg::Rax)?;
+            }
+            Opcode::ROTLC | Opcode::ROTRC => self.rotate_through_carry(at, inst, w)?,
+            Opcode::CLZ | Opcode::CTZ => self.count_zeros(at, inst, w)?,
+            Opcode::POPCOUNT => {
+                let a = self.src_typed(at, 0, inst.ty)?;
+                self.load_temp(Reg::Rax, a);
+                self.popcount();
+                self.write(inst, Reg::Rax)?;
+            }
+            Opcode::SETCOND => {
+                let cond = inst
+                    .cond
+                    .ok_or(Refusal::Shape("a comparison needs a condition"))?;
+                let a = self.src(at, 0)?;
+                let b = self.src(at, 1)?;
+                let cc = self.compare(cond, w, a, b);
+                self.asm.setcc(cc, Reg::Rax);
+                self.write(inst, Reg::Rax)?;
+            }
+            Opcode::MOVCOND => self.movcond(at, inst, w)?,
+            Opcode::BRCOND => self.brcond(at, inst, w)?,
+            Opcode::LD => self.load(at, inst)?,
+            Opcode::ST => self.store(at, inst)?,
+            Opcode::CHARGE => {
+                let ticks = inst
+                    .imm
+                    .ok_or(Refusal::Shape("a charge needs a tick count"))?
+                    .bits() as u64;
+                // Exactly what `Interp` does, in the same order: the running
+                // count, the commit flag, then the host — unbatched, because
+                // the count is hashed output rather than a budget.
+                self.asm.mov_rm(Reg::Rax, Reg::Rbx, off::TICKS);
+                self.asm.mov_ri(Reg::Rdx, ticks);
+                self.asm.alu_rr(Alu::Add, Reg::Rax, Reg::Rdx);
+                self.asm.mov_mr(Reg::Rbx, off::TICKS, Reg::Rax);
+                self.asm.mov_mi(Reg::Rbx, off::COMMITTED, 1);
+                self.ctx_to_rdi();
+                self.asm.mov_ri(Reg::Rsi, ticks);
+                self.call(vt::CHARGE);
+            }
+            Opcode::INSN_START => {
+                let index = inst.aux;
+                let mark = self
+                    .block
+                    .marks()
+                    .get(index as usize)
+                    .ok_or(Refusal::Shape("the boundary marker points at no record"))?;
+                let pc = mark.pc;
+                let index32 =
+                    i32::try_from(index).map_err(|_| Refusal::Shape("too many boundaries"))?;
+                self.asm.mov_mi(Reg::Rbx, off::MARK, index32);
+                self.asm.mov_mi(Reg::Rbx, off::PUBLISHED, 0);
+                self.bump(off::BOUNDARIES);
+                self.asm.mov_ri(Reg::Rax, pc);
+                self.asm.mov_mr(Reg::Rbx, off::BOUNDARY_PC, Reg::Rax);
+                self.asm.mov_rm(Reg::Rax, Reg::Rbx, off::TICKS);
+                self.asm.mov_mr(Reg::Rbx, off::RETIRED, Reg::Rax);
+                self.asm.mov_mi(Reg::Rbx, off::COMMITTED, 0);
+                self.ctx_to_rdi();
+                self.asm.mov_ri(Reg::Rsi, u64::from(index));
+                self.call(vt::INSN_START);
+            }
+            Opcode::GOTO_TB => {
+                let pc = inst
+                    .imm
+                    .ok_or(Refusal::Shape("a goto_tb needs its successor's PC"))?
+                    .bits() as u64;
+                self.asm.mov_ri(Reg::Rax, pc);
+                self.asm.mov_mr(Reg::Rbx, off::OUT_PC, Reg::Rax);
+                self.leave(status::GOTO);
+            }
+            Opcode::EXIT_TB => self.leave(status::EXIT),
+            Opcode::LOOKUP_AND_GOTO => {
+                let s = self.src(at, 0)?;
+                self.load_temp(Reg::Rax, s);
+                self.asm.mov_mr(Reg::Rbx, off::OUT_PC, Reg::Rax);
+                self.leave(status::LOOKUP);
+            }
+            other => return Err(Refusal::Op(other)),
+        }
+        Ok(())
+    }
+
+    /// `cmp` the two operands and return the condition to branch on.
+    ///
+    /// Signed comparisons at a width below 64 need the values sign-extended
+    /// first: temporaries are held zero-extended, so `-1` as an `i32` is
+    /// `0xffff_ffff` and would compare *above* zero rather than below it.
+    fn compare(&mut self, cond: Cond, w: u32, a: Temp, b: Temp) -> Cc {
+        self.load_temp(Reg::Rax, a);
+        self.load_temp(Reg::Rcx, b);
+        let signed = matches!(cond, Cond::LtS | Cond::LeS | Cond::GtS | Cond::GeS);
+        if signed {
+            self.sext(Reg::Rax, w);
+            self.sext(Reg::Rcx, w);
+        }
+        self.asm.alu_rr(Alu::Cmp, Reg::Rax, Reg::Rcx);
+        cc_of(cond)
+    }
+
+    fn movcond(&mut self, at: usize, inst: &Inst, w: u32) -> Result<(), Refusal> {
+        let srcs = self.block.srcs(at);
+        match (inst.cond, srcs.len()) {
+            (Some(cond), 4) => {
+                let (a, b) = (self.src(at, 0)?, self.src(at, 1)?);
+                let (t, f) = (self.src(at, 2)?, self.src(at, 3)?);
+                let cc = self.compare(cond, w, a, b);
+                // `mov` does not touch the flags, so the two candidates can be
+                // fetched between the compare and the conditional move.
+                self.load_temp(Reg::Rax, t);
+                self.load_temp(Reg::Rcx, f);
+                self.asm.cmovcc(invert(cc), Reg::Rax, Reg::Rcx);
+            }
+            (_, 3) => {
+                let sel = self.src(at, 0)?;
+                let (t, f) = (self.src(at, 1)?, self.src(at, 2)?);
+                self.load_temp(Reg::Rdx, sel);
+                self.asm.test_ri32(Reg::Rdx, 1);
+                self.load_temp(Reg::Rax, t);
+                self.load_temp(Reg::Rcx, f);
+                // Zero means the selector's low bit was clear, so take `f`.
+                self.asm.cmovcc(Cc::E, Reg::Rax, Reg::Rcx);
+            }
+            _ => {
+                return Err(Refusal::Shape(
+                    "a movcond takes a selector and two values, or a condition and four",
+                ));
+            }
+        }
+        self.write(inst, Reg::Rax)
+    }
+
+    fn brcond(&mut self, at: usize, inst: &Inst, w: u32) -> Result<(), Refusal> {
+        let target = inst.aux as usize;
+        // Forward only, and inside the block. `Liveness` is a single backward
+        // walk that is exact for forward control flow and silently wrong for a
+        // loop, the verifier enforces it, and a compiled backward branch would
+        // additionally have no step limit to stop it (`ir::Interp`'s does).
+        if target <= at || target >= self.block.insts().len() {
+            return Err(Refusal::Shape(
+                "a brcond branches forward, inside the block",
+            ));
+        }
+        let cc = match (inst.cond, self.block.srcs(at).len()) {
+            (Some(cond), 2) => {
+                let (a, b) = (self.src(at, 0)?, self.src(at, 1)?);
+                self.compare(cond, w, a, b)
+            }
+            (_, 1) => {
+                let sel = self.src(at, 0)?;
+                self.load_temp(Reg::Rax, sel);
+                self.asm.test_ri32(Reg::Rax, 1);
+                Cc::Ne
+            }
+            _ => {
+                return Err(Refusal::Shape(
+                    "a brcond takes a selector, or a condition and two values",
+                ));
+            }
+        };
+        let f = self.asm.jcc(cc);
+        self.branches.push((f, target));
+        Ok(())
+    }
+
+    fn shift(&mut self, at: usize, inst: &Inst, w: u32) -> Result<(), Refusal> {
+        let a = self.src(at, 0)?;
+        let b = self.src(at, 1)?;
+        self.load_temp(Reg::Rax, a);
+        self.load_temp(Reg::Rcx, b);
+        let arithmetic = inst.op == Opcode::SAR;
+        if arithmetic {
+            // The value is held zero-extended, so an arithmetic shift has to
+            // see the sign bit where the host expects it.
+            self.sext(Reg::Rax, w);
+        }
+        // Out of range is undefined in the IR and the oracle takes the
+        // mathematical answer; see the module docs for why the free
+        // mask-the-count behaviour is not used.
+        self.asm.alu_ri(Alu::Cmp, Reg::Rcx, w as i32);
+        let out_of_range = self.asm.jcc(Cc::Ae);
+        let sh = match inst.op {
+            Opcode::SHL => Shift::Shl,
+            Opcode::SHR => Shift::Shr,
+            _ => Shift::Sar,
+        };
+        self.asm.shift_rcl(sh, Reg::Rax);
+        let done = self.asm.jmp();
+        self.asm.bind(out_of_range);
+        if arithmetic {
+            self.asm.shift_ri(Shift::Sar, Reg::Rax, 63);
+        } else {
+            self.asm.mov_ri(Reg::Rax, 0);
+        }
+        self.asm.bind(done);
+        self.write(inst, Reg::Rax)
+    }
+
+    fn rotate_through_carry(&mut self, at: usize, inst: &Inst, w: u32) -> Result<(), Refusal> {
+        let a = self.src(at, 0)?;
+        let carry_in = self.src(at, 1)?;
+        let carry_out = inst
+            .dst2
+            .ok_or(Refusal::Shape("a carry op must produce its carry out"))?;
+        let carry_ty = self
+            .block
+            .type_of(carry_out)
+            .ok_or(Refusal::Shape("the carry out was never allocated"))?;
+        self.load_temp(Reg::Rax, a);
+        self.load_temp(Reg::Rcx, carry_in);
+        self.asm.alu_ri(Alu::And, Reg::Rcx, 1);
+        // `r13` is callee-saved and this sequence makes no call, but it is
+        // also the only register left once the value, the carry in and the
+        // carry out are all live at once.
+        self.asm.mov_rr(Reg::R13, Reg::Rax);
+        if inst.op == Opcode::ROTLC {
+            self.asm.shift_ri(Shift::Shl, Reg::Rax, 1);
+            self.asm.alu_rr(Alu::Or, Reg::Rax, Reg::Rcx);
+            self.asm.shift_ri(Shift::Shr, Reg::R13, (w - 1) as u8);
+        } else {
+            self.asm.shift_ri(Shift::Shr, Reg::Rax, 1);
+            if w > 1 {
+                self.asm.shift_ri(Shift::Shl, Reg::Rcx, (w - 1) as u8);
+            }
+            self.asm.alu_rr(Alu::Or, Reg::Rax, Reg::Rcx);
+        }
+        self.asm.alu_ri(Alu::And, Reg::R13, 1);
+        self.write(inst, Reg::Rax)?;
+        self.mask(Reg::R13, carry_ty);
+        self.store_temp(carry_out, Reg::R13);
+        Ok(())
+    }
+
+    fn count_zeros(&mut self, at: usize, inst: &Inst, w: u32) -> Result<(), Refusal> {
+        let a = self.src_typed(at, 0, inst.ty)?;
+        self.load_temp(Reg::Rax, a);
+        // The width is the answer for a zero input, in both directions:
+        // `CLZ` counts within the type and `CTZ` saturates at it.
+        self.asm.mov_ri(Reg::Rdx, u64::from(w));
+        self.asm.test_rr(Reg::Rax, Reg::Rax);
+        let zero = self.asm.jcc(Cc::E);
+        if inst.op == Opcode::CLZ {
+            // `bsr` gives the index of the highest set bit, so the count of
+            // leading zeros within `w` bits is `w - 1 - index`.
+            self.asm.bsr(Reg::Rcx, Reg::Rax);
+            self.asm.mov_ri(Reg::Rdx, u64::from(w - 1));
+            self.asm.alu_rr(Alu::Sub, Reg::Rdx, Reg::Rcx);
+        } else {
+            self.asm.bsf(Reg::Rdx, Reg::Rax);
+        }
+        self.asm.bind(zero);
+        self.asm.mov_rr(Reg::Rax, Reg::Rdx);
+        self.write(inst, Reg::Rax)
+    }
+
+    /// Population count of `rax`, in `rax`.
+    ///
+    /// The classic SWAR sequence — pairs, nibbles, bytes, then one multiply to
+    /// sum the bytes — rather than `POPCNT`, which is an extension a host may
+    /// not have. The input is already masked to its type, so counting the
+    /// whole 64-bit register counts exactly the type's bits.
+    fn popcount(&mut self) {
+        self.asm.mov_rr(Reg::Rcx, Reg::Rax);
+        self.asm.shift_ri(Shift::Shr, Reg::Rcx, 1);
+        self.asm.mov_ri(Reg::Rdx, 0x5555_5555_5555_5555);
+        self.asm.alu_rr(Alu::And, Reg::Rcx, Reg::Rdx);
+        self.asm.alu_rr(Alu::Sub, Reg::Rax, Reg::Rcx);
+
+        self.asm.mov_ri(Reg::Rdx, 0x3333_3333_3333_3333);
+        self.asm.mov_rr(Reg::Rcx, Reg::Rax);
+        self.asm.alu_rr(Alu::And, Reg::Rcx, Reg::Rdx);
+        self.asm.shift_ri(Shift::Shr, Reg::Rax, 2);
+        self.asm.alu_rr(Alu::And, Reg::Rax, Reg::Rdx);
+        self.asm.alu_rr(Alu::Add, Reg::Rax, Reg::Rcx);
+
+        self.asm.mov_rr(Reg::Rcx, Reg::Rax);
+        self.asm.shift_ri(Shift::Shr, Reg::Rcx, 4);
+        self.asm.alu_rr(Alu::Add, Reg::Rax, Reg::Rcx);
+        self.asm.mov_ri(Reg::Rdx, 0x0f0f_0f0f_0f0f_0f0f);
+        self.asm.alu_rr(Alu::And, Reg::Rax, Reg::Rdx);
+
+        self.asm.mov_ri(Reg::Rdx, 0x0101_0101_0101_0101);
+        self.asm.imul_rr(Reg::Rax, Reg::Rdx);
+        self.asm.shift_ri(Shift::Shr, Reg::Rax, 56);
+    }
+
+    fn widening_multiply(&mut self, at: usize, inst: &Inst, w: u32) -> Result<(), Refusal> {
+        let a = self.src_typed(at, 0, inst.ty)?;
+        let b = self.src_typed(at, 1, inst.ty)?;
+        let high = inst
+            .dst2
+            .ok_or(Refusal::Shape("a widening multiply produces its high half"))?;
+        let high_ty = self
+            .block
+            .type_of(high)
+            .ok_or(Refusal::Shape("the high half was never allocated"))?;
+        let signed = inst.op == Opcode::MULS2;
+        self.load_temp(Reg::Rax, a);
+        self.load_temp(Reg::Rcx, b);
+        if w == 64 {
+            // The one-operand form: `rdx:rax` is the whole product.
+            if signed {
+                self.asm.imul1(Reg::Rcx);
+            } else {
+                self.asm.mul(Reg::Rcx);
+            }
+            self.asm.mov_rr(Reg::R13, Reg::Rdx);
+        } else {
+            // Below 64 bits the whole product fits in one register, so the
+            // high half is a shift. A signed product needs both operands
+            // sign-extended first; the result's bits `w..2w` are then the same
+            // whether the product is read as 64 or 128 bits wide.
+            if signed {
+                self.sext(Reg::Rax, w);
+                self.sext(Reg::Rcx, w);
+            }
+            self.asm.imul_rr(Reg::Rax, Reg::Rcx);
+            self.asm.mov_rr(Reg::R13, Reg::Rax);
+            self.asm.shift_ri(Shift::Shr, Reg::R13, w as u8);
+        }
+        self.write(inst, Reg::Rax)?;
+        // The interpreter masks the high half twice as well: once to the
+        // instruction's width, where it takes it out of the double-width
+        // product, and once to the temporary it lands in.
+        self.mask(Reg::R13, inst.ty);
+        self.mask(Reg::R13, high_ty);
+        self.store_temp(high, Reg::R13);
+        Ok(())
+    }
+
+    // ---- memory --------------------------------------------------------
+
+    /// The address of the next descriptor, which generated code holds as an
+    /// immediate.
+    fn next_descriptor(&mut self) -> Result<u64, Refusal> {
+        let mem = self
+            .mems
+            .get(self.next_mem)
+            .ok_or(Refusal::Shape("a memory op with no descriptor"))?;
+        self.next_mem += 1;
+        Ok(core::ptr::from_ref(mem) as u64)
+    }
+
+    /// Whether the inlined TLB probe is a correct answer for this access.
+    ///
+    /// Every condition is a case where the fast path and
+    /// [`Tlb::read`](crate::jit::Tlb::read) would not agree, rather than a
+    /// case where the fast path would merely be slower:
+    ///
+    /// * A **store** reads a different set, and its entry was admitted on
+    ///   `WRITE` alone. Stores are not inlined at all — see [`Compiler::store`].
+    /// * A **segmented** access is translated before it reaches the TLB (x86's
+    ///   `mem_load` adds the segment base and checks the limit), and that
+    ///   translation is the frontend's, not this backend's.
+    /// * A **separate I/O space** is not what the TLB fronts.
+    /// * A width that is not a whole power of two up to eight has no single
+    ///   host load.
+    ///
+    /// Alignment and page containment are checked at run time, not here,
+    /// because they are properties of the address rather than of the access.
+    fn inlinable(mem: &MemOp) -> bool {
+        mem.space == MemSpace::MEM
+            && mem.seg.is_none()
+            && mem.kind == AccessKind::Load
+            && matches!(mem.size, Width::U8 | Width::U16 | Width::U32 | Width::U64)
+    }
+
+    fn load(&mut self, at: usize, inst: &Inst) -> Result<(), Refusal> {
+        let mem = inst
+            .mem
+            .ok_or(Refusal::Shape("a memory op needs a MemOp descriptor"))?;
+        let addr = self.src(at, 0)?;
+        let descriptor = self.next_descriptor()?;
+        let bytes = mem.size.bytes();
+
+        // A volatile load is a bus cycle whose occurrence the guest can
+        // observe even when its value is discarded, so it commits — and it
+        // commits *before* the access, because whether the fault that access
+        // may take is restartable depends on it.
+        if mem.volatile {
+            self.asm.mov_mi(Reg::Rbx, off::COMMITTED, 1);
+        }
+
+        let mut slow: Vec<Fixup> = Vec::new();
+        let mut joined: Option<Fixup> = None;
+        if Self::inlinable(&mem) {
+            // `ROADMAP.md` §9.1's first mechanism, inlined: mask, compare,
+            // add, load. Everything that is not a hit on plain little-endian
+            // RAM branches out to the host's own path, which is the one that
+            // fills the entry.
+            self.load_temp(Reg::Rax, addr);
+            self.asm.test_rr(Reg::R15, Reg::R15);
+            slow.push(self.asm.jcc(Cc::E));
+            if bytes > 1 {
+                // Natural alignment. It is also what makes the page-crossing
+                // check unnecessary: an aligned access of at most eight bytes
+                // cannot span two 4 KiB pages.
+                self.asm
+                    .test_ri32(Reg::Rax, i32::try_from(bytes - 1).unwrap_or(7));
+                slow.push(self.asm.jcc(Cc::Ne));
+            }
+            // index = (addr >> 12) & mask, scaled by the entry stride
+            self.asm.mov_rr(Reg::Rcx, Reg::Rax);
+            self.asm.shift_ri(Shift::Shr, Reg::Rcx, 12);
+            self.asm.mov_rm(Reg::Rdx, Reg::Rbx, off::TLB_MASK);
+            self.asm.alu_rr(Alu::And, Reg::Rcx, Reg::Rdx);
+            self.asm
+                .shift_ri(Shift::Shl, Reg::Rcx, FastSet::STRIDE.trailing_zeros() as u8);
+            self.asm.alu_rr(Alu::Add, Reg::Rcx, Reg::R15);
+            // tag = (addr & !PAGE_MASK) | context | valid
+            self.asm.mov_rr(Reg::Rdx, Reg::Rax);
+            self.asm.mov_ri(Reg::Rsi, !PAGE_MASK);
+            self.asm.alu_rr(Alu::And, Reg::Rdx, Reg::Rsi);
+            self.asm.mov_rm(Reg::Rsi, Reg::Rbx, off::TAG_BITS);
+            self.asm.alu_rr(Alu::Or, Reg::Rdx, Reg::Rsi);
+            let tag = i32::try_from(FastSet::TAG).unwrap_or(0);
+            self.asm.alu_rm(Alu::Cmp, Reg::Rdx, Reg::Rcx, tag);
+            slow.push(self.asm.jcc(Cc::Ne));
+            // The host addend, zero when this page has no inline path.
+            let host = i32::try_from(FastSet::HOST).unwrap_or(8);
+            self.asm.mov_rm(Reg::Rdx, Reg::Rcx, host);
+            self.asm.test_rr(Reg::Rdx, Reg::Rdx);
+            slow.push(self.asm.jcc(Cc::E));
+            self.asm.alu_rr(Alu::Add, Reg::Rdx, Reg::Rax);
+            self.asm.load_zx(Reg::R13, Reg::Rdx, 0, bytes);
+            // The tick the host's own path would have charged for this access.
+            self.ctx_to_rdi();
+            self.call(vt::FAST_TICK);
+            self.bump(off::FAST_HITS);
+            self.asm.mov_rr(Reg::Rax, Reg::R13);
+            joined = Some(self.asm.jmp());
+        }
+
+        for f in slow {
+            self.asm.bind(f);
+        }
+        self.ctx_to_rdi();
+        self.asm.mov_ri(Reg::Rsi, descriptor);
+        self.load_temp(Reg::Rdx, addr);
+        // The out-parameter: the eight bytes of frame the prologue reserved.
+        self.asm.mov_rr(Reg::Rcx, Reg::Rsp);
+        self.call(vt::LOAD);
+        self.asm.test_rr(Reg::Rax, Reg::Rax);
+        let ok = self.asm.jcc(Cc::E);
+        self.fault(at)?;
+        self.asm.bind(ok);
+        self.asm.mov_rm(Reg::Rax, Reg::Rsp, 0);
+
+        if let Some(f) = joined {
+            self.asm.bind(f);
+        }
+        if mem.sign == Sign::Signed {
+            self.sext(Reg::Rax, mem.size.bits());
+        }
+        self.write(inst, Reg::Rax)
+    }
+
+    /// A store, always through the host.
+    ///
+    /// Not inlined, and the reason is a contract rather than a difficulty: a
+    /// guest store owes two things the backend cannot see. It has to reach the
+    /// host's guest-physical dirty log, which the dispatcher drains at the next
+    /// block boundary to invalidate translations of the page it wrote
+    /// (`ROADMAP.md` §9.1's third mechanism), and it has to mark the
+    /// [`RamStore`](crate::core::space::RamStore)'s own dirty bitmap, which is
+    /// the only record a framebuffer refresh or a live snapshot has. Writing
+    /// guest RAM through a host pointer skips both, silently, and
+    /// `RamStore::host_ptr` is read-only for exactly that reason. Inlining
+    /// stores is a real win and it is owed those two bits first.
+    fn store(&mut self, at: usize, inst: &Inst) -> Result<(), Refusal> {
+        let mem = inst
+            .mem
+            .ok_or(Refusal::Shape("a memory op needs a MemOp descriptor"))?;
+        let addr = self.src(at, 0)?;
+        let value = self.src(at, 1)?;
+        let descriptor = self.next_descriptor()?;
+
+        self.asm.mov_mi(Reg::Rbx, off::COMMITTED, 1);
+        self.ctx_to_rdi();
+        self.asm.mov_ri(Reg::Rsi, descriptor);
+        self.load_temp(Reg::Rdx, addr);
+        self.load_temp(Reg::Rcx, value);
+        let mask = mem.size.mask();
+        if mask != u64::MAX {
+            self.asm.mov_ri(Reg::R13, mask);
+            self.asm.alu_rr(Alu::And, Reg::Rcx, Reg::R13);
+        }
+        self.call(vt::STORE);
+        self.asm.test_rr(Reg::Rax, Reg::Rax);
+        let ok = self.asm.jcc(Cc::E);
+        self.fault(at)?;
+        self.asm.bind(ok);
+        Ok(())
+    }
+}
+
+/// The condition code a comparison branches on.
+const fn cc_of(cond: Cond) -> Cc {
+    match cond {
+        Cond::Eq => Cc::E,
+        Cond::Ne => Cc::Ne,
+        Cond::LtS => Cc::L,
+        Cond::LeS => Cc::Le,
+        Cond::GtS => Cc::G,
+        Cond::GeS => Cc::Ge,
+        Cond::LtU => Cc::B,
+        Cond::LeU => Cc::Be,
+        Cond::GtU => Cc::A,
+        Cond::GeU => Cc::Ae,
+    }
+}
+
+/// The condition that holds exactly when `cc` does not.
+const fn invert(cc: Cc) -> Cc {
+    match cc {
+        Cc::E => Cc::Ne,
+        Cc::Ne => Cc::E,
+        Cc::L => Cc::Ge,
+        Cc::Ge => Cc::L,
+        Cc::Le => Cc::G,
+        Cc::G => Cc::Le,
+        Cc::B => Cc::Ae,
+        Cc::Ae => Cc::B,
+        Cc::Be => Cc::A,
+        Cc::A => Cc::Be,
+    }
+}
+
+/// The mask of a `len`-bit field at `pos`, or `None` if it leaves the type.
+const fn field_mask(pos: u32, len: u32, width: u32) -> Option<u64> {
+    if len == 0 || pos + len > width || width > 64 {
+        return None;
+    }
+    let ones = if len >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << len) - 1
+    };
+    Some(ones << pos)
+}
+
+/// Refuse a type no host register holds.
+const fn check_type(ty: Type) -> Result<(), Refusal> {
+    match ty {
+        Type::I1 | Type::I32 | Type::I64 => Ok(()),
+        // `i128` needs a register pair and the widening multiplies produce
+        // their high half separately, so nothing in the tree asks for one;
+        // the float types exist to be carried into a helper call, and helper
+        // calls are refused.
+        other => Err(Refusal::Type(other)),
+    }
+}

@@ -115,8 +115,8 @@ use super::{Config, Hart};
 use crate::ir::AccessKind;
 #[cfg(feature = "jit")]
 use crate::jit::{
-    BlockCache, Context as TlbContext, DirtyPages, Dispatcher, Epoch, Frontend, Stop, StoreLog,
-    Tlb, Translation,
+    BlockCache, Context as TlbContext, DirtyPages, Dispatcher, Epoch, FastMem, Frontend, LoadPlan,
+    Stop, StoreLog, Tlb, Translation,
 };
 
 /// Where a case's program is loaded, and its RAM mapped.
@@ -845,6 +845,11 @@ impl IrHost for Host {
     fn insn_start(&mut self, _mark: &InsnStart) {}
 }
 
+/// This host reaches the address space directly, so there is no table for a
+/// backend to inline: every load takes the call, which is the default.
+#[cfg(feature = "jit")]
+impl FastMem for Host {}
+
 // ---------------------------------------------------------------------------
 // The cached and chained path
 // ---------------------------------------------------------------------------
@@ -887,6 +892,63 @@ impl IrHost for Host {
 #[cfg(feature = "jit")]
 #[allow(clippy::missing_panics_doc)]
 pub fn compare_cached(case: &Case, blocks: usize) -> Result<Verdict, Divergence> {
+    cached(case, blocks, false)
+}
+
+/// [`compare_cached`], with the blocks executed as **host code** rather than
+/// interpreted.
+///
+/// The third harness, and the one `jit::x86` exists to be held to. Everything
+/// [`compare_cached`] compares is compared here against the same oracle — every
+/// integer register, the PC, the cycle counter, guest memory, and at a fault
+/// the architectural state at the faulting instruction — with the only
+/// difference being which engine ran the block. A block the backend refuses
+/// runs on the interpreter, so this is a superset of the cached path rather
+/// than an alternative to it, and a mixture of the two is the normal case.
+///
+/// The memory path is compared twice over, because the backend inlines the
+/// software TLB's fast path: a hit answers from a host address the entry
+/// carries and never calls [`IrHost::load`] at all, so a wrong tag, a wrong
+/// addend, a wrong width or a missing tick is a divergence here and nowhere
+/// else.
+///
+/// # Errors
+///
+/// As [`compare_cached`].
+///
+/// # Panics
+///
+/// As [`compare_cached`], plus a code buffer the kernel would not give.
+#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "jit-x86")))]
+#[allow(clippy::missing_panics_doc)]
+pub fn compare_compiled(case: &Case, blocks: usize) -> Result<Verdict, Divergence> {
+    cached(case, blocks, true)
+}
+
+/// A dispatcher, with the host code generator attached when one is asked for
+/// and available.
+///
+/// `compiled` is silently ignored on a target with no backend, which is what
+/// makes the harnesses above build everywhere: the comparison is still run,
+/// against the interpreter on both sides, and passes for the same reason it
+/// always did.
+#[cfg(feature = "jit")]
+fn dispatcher(compiled: bool) -> Dispatcher {
+    let disp = Dispatcher::with_cache(BlockCache::with_capacity(256));
+    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    if compiled {
+        return disp.with_backend(
+            crate::jit::x86::Engine::new().expect("the kernel gave a W^X code buffer"),
+        );
+    }
+    let _ = compiled;
+    disp
+}
+
+#[cfg(feature = "jit")]
+#[allow(clippy::missing_panics_doc)]
+fn cached(case: &Case, blocks: usize, compiled: bool) -> Result<Verdict, Divergence> {
     assert!(
         case.cfg.pmp_count == 0,
         "the harness compares ticks, and a PMP refusal is not one the block can know about"
@@ -902,7 +964,7 @@ pub fn compare_cached(case: &Case, blocks: usize) -> Result<Verdict, Divergence>
     // ---- the subject: cache, chain, and a TLB on the memory path ---------
     let mut front = Lifter::new(case, Arc::clone(&subject_space));
     let mut host = CachedHost::new(case, subject_space);
-    let mut disp = Dispatcher::with_cache(BlockCache::with_capacity(256));
+    let mut disp = dispatcher(compiled);
     let run = disp
         .run(&mut front, &mut host, BASE, blocks)
         .map_err(|e| diverged(case, format!("the dispatcher refused a block: {e}")))?;
@@ -1051,6 +1113,20 @@ pub struct CachedRun {
     pub smc: u64,
     /// Memory accesses served out of a TLB entry.
     pub tlb_hits: u64,
+    /// Blocks executed as compiled host code rather than interpreted.
+    ///
+    /// Zero on the cached path, and zero on a target with no backend. What it
+    /// is *for* is the compiled path: a harness that quietly stopped compiling
+    /// anything would still agree with the interpreter, perfectly, forever.
+    pub compiled: u64,
+    /// Guest loads the backend served from an **inlined** TLB probe, with no
+    /// call into this host at all.
+    ///
+    /// `ROADMAP.md` §9.1's first mechanism, doing the thing it exists for. The
+    /// same reasoning as [`CachedRun::compiled`] applies twice over here: a
+    /// backend that stopped inlining would still agree with the interpreter,
+    /// and the only thing that would notice is this number.
+    pub fast_loads: u64,
 }
 
 /// [`compare_cached`], reporting what the run exercised as well as whether it
@@ -1066,14 +1142,36 @@ pub struct CachedRun {
 #[cfg(feature = "jit")]
 #[allow(clippy::missing_panics_doc)]
 pub fn measure_cached(case: &Case, blocks: usize) -> Result<CachedRun, Divergence> {
-    let verdict = compare_cached(case, blocks)?;
+    measure(case, blocks, false)
+}
+
+/// [`measure_cached`] with the host code generator attached.
+///
+/// # Errors
+///
+/// As [`compare_compiled`].
+///
+/// # Panics
+///
+/// As [`compare_compiled`].
+#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "jit-x86")))]
+#[allow(clippy::missing_panics_doc)]
+pub fn measure_compiled(case: &Case, blocks: usize) -> Result<CachedRun, Divergence> {
+    measure(case, blocks, true)
+}
+
+#[cfg(feature = "jit")]
+#[allow(clippy::missing_panics_doc)]
+fn measure(case: &Case, blocks: usize, compiled: bool) -> Result<CachedRun, Divergence> {
+    let verdict = cached(case, blocks, compiled)?;
     // A second, independent run on a fresh machine: the counters come from a
     // run that agreed with the interpreter, and running it twice is itself a
     // determinism check on the whole path.
     let (space, _ram) = machine(case);
     let mut front = Lifter::new(case, Arc::clone(&space));
     let mut host = CachedHost::new(case, space);
-    let mut disp = Dispatcher::with_cache(BlockCache::with_capacity(256));
+    let mut disp = dispatcher(compiled);
     let run = disp
         .run(&mut front, &mut host, BASE, blocks)
         .map_err(|e| diverged(case, format!("the dispatcher refused a block: {e}")))?;
@@ -1085,7 +1183,23 @@ pub fn measure_cached(case: &Case, blocks: usize) -> Result<CachedRun, Divergenc
         chained: disp.stats().chained,
         smc: disp.stats().smc,
         tlb_hits: host.tlb.stats().hits,
+        compiled: disp.stats().compiled,
+        fast_loads: fast_loads(&disp),
     })
+}
+
+/// How many loads a dispatcher's backend served inline.
+#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+fn fast_loads(disp: &Dispatcher) -> u64 {
+    disp.backend().map_or(0, |e| e.stats().fast_loads)
+}
+
+#[cfg(all(
+    feature = "jit",
+    not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))
+))]
+fn fast_loads(_disp: &Dispatcher) -> u64 {
+    0
 }
 
 /// The RISC-V half of the dispatcher's contract: lift on demand, out of guest
@@ -1297,6 +1411,33 @@ impl IrHost for CachedHost {
 impl StoreLog for CachedHost {
     fn drain_dirty(&mut self, sink: &mut dyn FnMut(u64)) {
         self.dirty.drain_dirty(sink);
+    }
+}
+
+/// The half of the compiled path this harness has to get right.
+///
+/// The backend inlines an aligned load into a mask, a compare, an add and a
+/// `mov`, which skips [`IrHost::load`] entirely — so the tick that path charges
+/// has to be charged here instead, and it has to be *the same* tick, or the
+/// cycle-counter column diverges and `compare_compiled` fails. That is the
+/// point: this is not a hook the harness works around, it is the thing being
+/// tested.
+///
+/// The table is the host's own [`Tlb`], not a second one, so a fill made
+/// through the slow path is what the next inlined probe hits.
+#[cfg(feature = "jit")]
+impl FastMem for CachedHost {
+    fn load_plan(&mut self) -> Option<LoadPlan> {
+        Some(LoadPlan {
+            set: self.tlb.fast_set(AccessKind::Load),
+            ctx: MACHINE,
+        })
+    }
+
+    fn note_fast_load(&mut self) {
+        // `CachedHost::once`, with the access itself already done: one bus
+        // access is one cycle (`cpu::riscv::exec`).
+        self.ticks += 1;
     }
 }
 
@@ -1788,6 +1929,140 @@ mod tests {
             let case = Case::new(vec![addi(10, 10, 1), ECALL, addi(11, 11, 1)]);
             let run = agreed(&case, 100);
             assert!(run.blocks < 100, "it stopped at the ecall");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The compiled path
+    // -----------------------------------------------------------------------
+
+    /// The same programs as `cached`, executed as host code.
+    ///
+    /// Every one of these ran green before there was a code generator, which is
+    /// the point: the compiled path is not a new set of claims, it is the same
+    /// claims made by a different engine. What is new is the assertion that the
+    /// engine was actually used — `run.compiled` — because a backend that
+    /// quietly stopped taking any block would pass every column here forever.
+    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    mod compiled {
+        use super::*;
+
+        fn agreed(case: &Case, blocks: usize) -> CachedRun {
+            match measure_compiled(case, blocks) {
+                Ok(run) => {
+                    assert!(
+                        matches!(run.verdict, Verdict::Agreed { .. }),
+                        "expected agreement, got {:?}",
+                        run.verdict
+                    );
+                    run
+                }
+                Err(e) => panic!("diverged on the compiled path:\n{e}"),
+            }
+        }
+
+        #[test]
+        fn a_compiled_loop_agrees_with_the_interpreter_and_was_really_compiled() {
+            let case = Case::new(vec![addi(10, 10, 1), jal(0, -4)]);
+            let run = agreed(&case, 20);
+            assert_eq!(run.blocks, 20);
+            assert_eq!(run.translated, 1, "lifted once");
+            assert_eq!(run.compiled, 20, "and compiled once, then run twenty times");
+        }
+
+        #[test]
+        fn every_column_agrees_over_a_program_that_loads_stores_and_branches() {
+            let case = Case::seeded(vec![
+                sd(1, 5, 0),
+                ld(6, 1, 0),
+                addi(7, 6, 1),
+                beq(0, 0, -12),
+            ]);
+            let run = agreed(&case, 24);
+            assert!(run.compiled > 0);
+            assert!(run.tlb_hits > 0 || run.blocks > 0);
+        }
+
+        #[test]
+        fn a_fault_in_the_middle_of_a_compiled_trace_reports_the_exact_state() {
+            // `ROADMAP.md` §9's hard half, with the registers living in a
+            // temporary frame that generated code wrote and Rust reads back.
+            let case = Case::new(vec![
+                addi(2, 0, 0x11),
+                addi(3, 2, 0x22),
+                addi(4, 3, 0x33),
+                jal(0, 8),
+                addi(31, 0, -1),
+                addi(5, 4, 0x44),
+                addi(6, 5, 0x55),
+                addi(7, 6, 0x66),
+                addi(8, 7, 0x77),
+                ld(9, 1, 0),
+                addi(10, 0, -1),
+            ])
+            .with_reg(1, BASE + RAM_SIZE + 0x4000);
+            assert_eq!(
+                compare_compiled(&case, 4),
+                Ok(Verdict::Trapped { insns: 8 })
+            );
+        }
+
+        #[test]
+        fn the_software_tlb_is_inlined_into_the_generated_code() {
+            // `ROADMAP.md` §9.1: *"the fast path is inlined into generated
+            // code: mask, compare, add, load"*, and *"everything else about
+            // the JIT is secondary to this"*. Without this assertion the whole
+            // mechanism could be dead and every other column would still
+            // agree.
+            let case = Case::seeded(vec![ld(6, 2, 0), ld(7, 2, 8), addi(8, 7, 1), jal(0, -12)]);
+            let run = agreed(&case, 24);
+            assert!(
+                run.fast_loads > 8,
+                "only {} loads were served without a call",
+                run.fast_loads
+            );
+        }
+
+        #[test]
+        fn a_misaligned_access_still_costs_what_the_interpreter_says_it_costs() {
+            // The inlined fast path refuses a misaligned address and calls the
+            // host, which splits it into bytes and charges one tick each. A
+            // backend that inlined it anyway would read the right bytes and
+            // charge one tick, and only this column would notice.
+            let case = Case::seeded(vec![ld(3, 1, 1), addi(4, 3, 1)]);
+            let run = agreed(&case, 8);
+            assert!(run.compiled > 0);
+        }
+
+        #[test]
+        fn a_store_into_the_code_page_invalidates_compiled_code_too() {
+            // Compiled code is attached to a cache slot, so an invalidated
+            // block takes its code with it. If it did not, the next execution
+            // of that address would run the *old* machine code.
+            let case = Case::seeded(vec![sd(1, 5, 0), addi(6, 0, 1)])
+                .with_reg(1, BASE)
+                .with_reg(5, 0x0000_0001);
+            let run = agreed(&case, 12);
+            assert!(run.compiled > 0);
+        }
+
+        #[test]
+        fn every_shape_agrees_when_it_is_compiled() {
+            // A trace is one long block with several exits, a basic block is
+            // many short ones, and the extended shape is in between; the
+            // backend has to be right about all three, and the branch a side
+            // exit is branched over is emitted only by the first.
+            for shape in [Shape::BasicBlock, Shape::Extended, Shape::Trace] {
+                let case = Case::seeded(vec![
+                    addi(10, 10, 1),
+                    beq(10, 0, 8),
+                    ld(6, 2, 0),
+                    jal(0, -12),
+                ])
+                .with_shape(shape);
+                let run = agreed(&case, 20);
+                assert!(run.compiled > 0, "{shape:?} compiled nothing");
+            }
         }
     }
 }

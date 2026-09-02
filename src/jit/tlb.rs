@@ -142,6 +142,20 @@ impl Context {
     const fn bits(self) -> u64 {
         ((self.level as u64 & 7) << 2) | ((self.translating as u64) << 1)
     }
+
+    /// Everything a tag carries besides the page number: this context, and the
+    /// valid bit.
+    ///
+    /// Public because a **host code generator** bakes it into an immediate:
+    /// the inlined fast path builds `(addr & !PAGE_MASK) | tag_bits()` and
+    /// compares it against [`FastSet`]'s entry in one instruction, which is
+    /// `ROADMAP.md` §9.1's *"mask, compare, add, load"*. A backend that
+    /// derived the constant itself would be a second copy of this encoding.
+    #[inline]
+    #[must_use]
+    pub const fn tag_bits(self) -> u64 {
+        self.bits() | 1
+    }
 }
 
 /// One cached resolution.
@@ -150,6 +164,13 @@ impl Context {
 /// store index standing in for the addend's other half: guest RAM is addressed
 /// by byte offset into a store and never handed out as a slice
 /// (`ROADMAP.md` §11.2), so "host addend" is `(which store, what offset)`.
+///
+/// **The layout is `#[repr(C)]` and load-bearing**, because generated code
+/// indexes this array with an immediate shift and reads the first two fields
+/// with two `mov`s. [`FastSet`] publishes the shift and the offsets; the test
+/// `the_entry_layout_a_code_generator_bakes_in_is_the_one_rust_built` asserts
+/// they still agree.
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct Entry {
     /// `page | context | VALID`, or [`Entry::EMPTY`].
@@ -158,6 +179,23 @@ struct Entry {
     /// rides in them and one `u64` compare decides the whole tag. No hashing,
     /// so two different worlds cannot alias into one hit.
     tag: u64,
+    /// `guest address + host` is the **host** address of that guest byte, or
+    /// zero when there is no host address to have.
+    ///
+    /// The other half of `ROADMAP.md` §9.1's *"host addend"*, and the half the
+    /// safe path deliberately does not use: `Tlb::read` reaches guest RAM by
+    /// byte offset through a [`RamStore`], never as a slice, because that is
+    /// what keeps it working when guest RAM lives in a `SharedArrayBuffer`
+    /// (§11.2). Generated code has no such option — it is machine code, and a
+    /// `mov` needs an address — so the address is precomputed here, once per
+    /// fill, and is zero for every page a backend may not touch this way:
+    /// anything not plain little-endian RAM, anything whose page is not wholly
+    /// inside its store, and every page on a host where the pointer is
+    /// meaningless.
+    ///
+    /// Reading through it is the JIT code buffer's obligation, stated in
+    /// [`RamStore::host_ptr`](crate::core::space::RamStore::host_ptr).
+    host: u64,
     /// `guest address + addend` is the offset in [`Entry::store`].
     addend: u64,
     /// Index into [`Tlb::stores`], or [`Entry::SLOW`].
@@ -181,6 +219,7 @@ impl Entry {
     const fn empty() -> Entry {
         Entry {
             tag: Entry::EMPTY,
+            host: 0,
             addend: 0,
             store: Entry::SLOW,
             endian: Endian::Little,
@@ -490,9 +529,20 @@ impl Tlb {
         let Some(index) = self.intern(&store) else {
             return slow;
         };
+        let addend = offset.wrapping_sub(addr & !PAGE_MASK);
+        // The host address, for a backend that inlines the fast path. Only for
+        // a whole little-endian page: a big-endian region needs the byte swap
+        // the safe path applies, and a page that runs off the end of its store
+        // would hand generated code an address the bounds check no longer
+        // covers.
+        let host = match store.host_ptr(offset, PAGE_SIZE) {
+            Some(p) if endian == Endian::Little => (p as u64).wrapping_sub(addr & !PAGE_MASK),
+            _ => 0,
+        };
         Entry {
             tag: Entry::EMPTY,
-            addend: offset.wrapping_sub(addr & !PAGE_MASK),
+            host,
+            addend,
             store: index,
             endian,
         }
@@ -553,6 +603,29 @@ impl Tlb {
         u32::try_from(self.stores.len() - 1).ok()
     }
 
+    /// The raw parts of one access type's set, for a host code generator.
+    ///
+    /// `ROADMAP.md` §9.1 says of this TLB that *"the fast path is inlined into
+    /// generated code: mask, compare, add, load"*, and that everything else
+    /// about the JIT is secondary to it. Reaching it through a call is
+    /// precisely what that sentence rules out, so the array is published in the
+    /// shape machine code indexes it: a base, a mask, and the entry stride and
+    /// field offsets [`FastSet`] documents.
+    ///
+    /// The pointer is valid while this TLB is alive and while no
+    /// [`Tlb::flush`] has run. Both hold for exactly one block's execution: a
+    /// flush comes from [`Tlb::sync`], which is called at a block boundary,
+    /// and nothing else reallocates the sets — [`Tlb::fill`] writes entries in
+    /// place.
+    #[inline]
+    #[must_use]
+    pub fn fast_set(&self, kind: AccessKind) -> FastSet {
+        FastSet {
+            base: self.sets[set_of(kind)].as_ptr().cast::<u8>(),
+            mask: self.mask,
+        }
+    }
+
     /// Look one page up. Mask, compare, add — and nothing else.
     #[inline]
     fn probe(&self, kind: AccessKind, addr: u64, ctx: Context) -> Probe {
@@ -575,6 +648,38 @@ impl Tlb {
         // `mask` is bounded by the allocation, so this always fits.
         ((addr >> 12) & self.mask) as usize
     }
+}
+
+/// One access type's entry array, as a code generator addresses it.
+///
+/// Deliberately a bag of numbers rather than a slice: the consumer is emitted
+/// machine code, which cannot hold a Rust reference, and the whole point of
+/// publishing it is that the probe becomes four instructions rather than a
+/// call. Everything a backend needs to index it is here, so no backend has to
+/// re-derive the encoding — the way `bitfield_aux` exists so two backends
+/// cannot disagree about where a bitfield's position lives.
+///
+/// The [`FastSet::base`] pointer is only valid for the borrow it came from;
+/// see [`Tlb::fast_set`].
+#[derive(Debug, Clone, Copy)]
+pub struct FastSet {
+    /// The first entry.
+    pub base: *const u8,
+    /// `entries - 1`. The index is `(addr >> 12) & mask`.
+    pub mask: u64,
+}
+
+impl FastSet {
+    /// The size of one entry, in bytes — the shift an index needs.
+    ///
+    /// A power of two so that indexing is a shift; asserted against the real
+    /// layout by a test rather than assumed.
+    pub const STRIDE: u64 = 32;
+    /// Byte offset of the tag within an entry.
+    pub const TAG: u64 = 0;
+    /// Byte offset of the host addend within an entry. Zero means *no inline
+    /// path for this page*, which a backend tests for.
+    pub const HOST: u64 = 8;
 }
 
 /// What a probe found.
@@ -633,6 +738,18 @@ mod tests {
 
     const BASE: u64 = 0x2000_0000;
     const SIZE: u64 = 8 * PAGE_SIZE;
+
+    #[test]
+    fn the_entry_layout_a_code_generator_bakes_in_is_the_one_rust_built() {
+        // A backend indexes this array with a shift and reads two fields with
+        // two `mov`s, from constants it cannot re-derive. Adding a field or
+        // reordering two is then a miscompile rather than a build error, so
+        // the agreement is asserted here where the layout is decided.
+        assert_eq!(core::mem::size_of::<Entry>() as u64, FastSet::STRIDE);
+        assert!(FastSet::STRIDE.is_power_of_two());
+        assert_eq!(core::mem::offset_of!(Entry, tag) as u64, FastSet::TAG);
+        assert_eq!(core::mem::offset_of!(Entry, host) as u64, FastSet::HOST);
+    }
 
     fn space() -> (Arc<AddressSpace>, Arc<RamStore>) {
         let ram = Arc::new(RamStore::new(SIZE));

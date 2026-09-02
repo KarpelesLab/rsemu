@@ -296,6 +296,54 @@ fn the_cached_path_agrees_on_a_core_with_compressed_instructions() {
     );
 }
 
+/// The same corpus, executed as **host code** rather than interpreted.
+///
+/// `ROADMAP.md` §9's x86-64 backend against the same oracle every other engine
+/// in this crate answers to. A block the backend refuses runs on the
+/// interpreter, so this is a superset of the cached sweep above and a mixture
+/// of the two engines is the normal case — which is why the last assertion is
+/// that compilation actually happened.
+#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn the_generated_corpus_agrees_when_it_is_compiled_to_host_code() {
+    use rsemu::cpu::riscv::differential::measure_compiled;
+
+    for (seed, cfg, shape) in [
+        (0xc0de_0001u64, Config::rv64i(), Shape::BasicBlock),
+        (0xc0de_0002, Config::rv64i(), Shape::Extended),
+        (0xc0de_0003, Config::rv64i(), Shape::Trace),
+    ] {
+        let mut rng = Lcg(seed);
+        let (mut agreed, mut trapped, mut compiled, mut blocks) = (0usize, 0usize, 0u64, 0u64);
+        for n in 0..600 {
+            let len = 1 + (rng.next() % 12) as usize;
+            let case = Case::seeded(program(&mut rng, len))
+                .with_config(cfg)
+                .with_shape(shape);
+            match measure_compiled(&case, 8) {
+                Ok(run) => {
+                    compiled += run.compiled;
+                    blocks += run.blocks as u64;
+                    match run.verdict {
+                        Verdict::Agreed { .. } => agreed += 1,
+                        Verdict::Trapped { .. } => trapped += 1,
+                        Verdict::Nothing => {}
+                    }
+                }
+                Err(e) => panic!("case {n} of seed {seed:#x} diverged when compiled:\n{e}"),
+            }
+        }
+        assert!(
+            agreed > 250,
+            "{shape:?}: only {agreed} of 600 compiled cases ran to completion ({trapped} trapped)"
+        );
+        assert!(
+            compiled * 2 > blocks,
+            "{shape:?}: only {compiled} of {blocks} blocks were executed as host code"
+        );
+    }
+}
+
 #[cfg(feature = "jit")]
 #[test]
 fn a_long_cached_run_stays_in_agreement_for_a_hundred_blocks() {

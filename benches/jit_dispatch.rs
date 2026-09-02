@@ -1,22 +1,30 @@
 //! What the software TLB and the block cache actually bought, measured.
 //!
-//! `ROADMAP.md` §13's phase-8 gate is a wall-clock number, and this is nowhere
-//! near it — there is no host code generator yet, so every configuration below
-//! is still interpreting. What this measures is the thing that *is* finished:
-//! the three mechanisms §9.1 puts ahead of code generation, each switched on
-//! one at a time so the number attaches to a mechanism rather than to a
-//! release.
+//! `ROADMAP.md` §13's phase-8 gate is a wall-clock number. What this measures
+//! is each of §9.1's mechanisms, switched on one at a time so the number
+//! attaches to a mechanism rather than to a release — and, in the last column,
+//! the one they were all waiting for: the **x86-64 host code generator**.
 //!
-//! # The six configurations
+//! # The seven configurations
 //!
-//! | | translation | block shape | memory |
-//! | --- | --- | --- | --- |
-//! | `interpreter` | none — `Hart::step`, the oracle | — | `AddressSpace` |
-//! | `lift-each-time` | re-lift every block, no cache | basic block | `AddressSpace` |
-//! | `cached` | block cache, exits chained | basic block | `AddressSpace` |
-//! | `cached+tlb` | block cache, exits chained | basic block | `jit::Tlb` |
-//! | `+extended` | block cache, exits chained | a load no longer ends a block | `jit::Tlb` |
-//! | `+superblock` | block cache, exits chained | direct branches merged, with side exits | `jit::Tlb` |
+//! | | translation | block shape | memory | engine |
+//! | --- | --- | --- | --- | --- |
+//! | `interpreter` | none — `Hart::step`, the oracle | — | `AddressSpace` | — |
+//! | `lift-each-time` | re-lift every block, no cache | basic block | `AddressSpace` | `ir::Interp` |
+//! | `cached` | block cache, exits chained | basic block | `AddressSpace` | `ir::Interp` |
+//! | `cached+tlb` | block cache, exits chained | basic block | `jit::Tlb` | `ir::Interp` |
+//! | `+extended` | block cache, exits chained | a load no longer ends a block | `jit::Tlb` | `ir::Interp` |
+//! | `+superblock` | block cache, exits chained | direct branches merged, with side exits | `jit::Tlb` | `ir::Interp` |
+//! | `+compiled` | " | " | `jit::Tlb`, **inlined** | `jit::x86` |
+//!
+//! The last column is the whole of `ROADMAP.md` §9's first backend, and it is
+//! also where the TLB finally does what §9.1 asks of it — *"the fast path is
+//! inlined into generated code: mask, compare, add, load"*. Every earlier row
+//! reaches the TLB through a call.
+//!
+//! It is only a column where there is a backend to run it: `jit-x86` is
+//! `cfg`-gated to an x86-64 Linux host, and elsewhere it repeats
+//! `+superblock`. Build with `--features jit-x86,cpu-riscv-lift` to get it.
 //!
 //! The rows are cumulative on purpose: `lift-each-time` is the honest
 //! starting point for a translator, because a translator that re-lifts is
@@ -83,8 +91,8 @@
 //! and an `Instant` loop is all this needs.
 //!
 //! ```text
-//! cargo bench --features jit,cpu-riscv-lift --bench jit_dispatch
-//! cargo bench --features jit,cpu-riscv-lift --bench jit_dispatch -- --insns 20000000
+//! cargo bench --features jit-x86,cpu-riscv-lift --bench jit_dispatch
+//! cargo bench --features jit-x86,cpu-riscv-lift --bench jit_dispatch -- --insns 20000000
 //! ```
 
 use std::sync::Arc;
@@ -97,7 +105,8 @@ use rsemu::cpu::riscv::lift::{self, Origin, PC, SLOT_COUNT, Shape, x_slot};
 use rsemu::cpu::riscv::{Config, Hart};
 use rsemu::ir::{AccessKind, Align, InsnStart, IrHost, MemOp, RegSlot};
 use rsemu::jit::{
-    BlockCache, Context, DirtyPages, Dispatcher, Epoch, Frontend, StoreLog, Tlb, Translation,
+    BlockCache, Context, DirtyPages, Dispatcher, Epoch, FastMem, Frontend, LoadPlan, StoreLog, Tlb,
+    Translation,
 };
 
 /// Where the program is loaded and RAM is mapped.
@@ -114,29 +123,39 @@ fn main() {
         args.insns, args.reps
     );
     println!(
-        "{:<12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
-        "workload", "interpreter", "lift-each", "cached", "cached+tlb", "+extended", "+superblock",
+        "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+        "workload",
+        "interpreter",
+        "lift-each",
+        "cached",
+        "cached+tlb",
+        "+extended",
+        "+superblock",
+        "+compiled",
     );
     for w in workloads() {
         let basic = Shape::BasicBlock;
         let interp = best(args.reps, || run_interpreter(&w, args.insns));
         let cold = best(args.reps, || {
-            run_translated(&w, args.insns, false, false, basic)
+            run_translated(&w, args.insns, false, false, basic, false)
         });
         let cached = best(args.reps, || {
-            run_translated(&w, args.insns, true, false, basic)
+            run_translated(&w, args.insns, true, false, basic, false)
         });
         let tlb = best(args.reps, || {
-            run_translated(&w, args.insns, true, true, basic)
+            run_translated(&w, args.insns, true, true, basic, false)
         });
         let extended = best(args.reps, || {
-            run_translated(&w, args.insns, true, true, Shape::Extended)
+            run_translated(&w, args.insns, true, true, Shape::Extended, false)
         });
         let trace = best(args.reps, || {
-            run_translated(&w, args.insns, true, true, Shape::Trace)
+            run_translated(&w, args.insns, true, true, Shape::Trace, false)
+        });
+        let jit = best(args.reps, || {
+            run_translated(&w, args.insns, true, true, Shape::Trace, true)
         });
         println!(
-            "{:<12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+            "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             w.name,
             mips(args.insns, interp),
             mips(args.insns, cold),
@@ -144,9 +163,10 @@ fn main() {
             mips(args.insns, tlb),
             mips(args.insns, extended),
             mips(args.insns, trace),
+            mips(args.insns, jit),
         );
         println!(
-            "{:<12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+            "{:<12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "",
             "1.00x",
             ratio(interp, cold),
@@ -154,6 +174,7 @@ fn main() {
             ratio(interp, tlb),
             ratio(interp, extended),
             ratio(interp, trace),
+            ratio(interp, jit),
         );
     }
     println!(
@@ -368,7 +389,14 @@ fn run_interpreter(w: &Workload, insns: u64) -> Duration {
 /// Checked against the interpreter before it is timed: the two must reach the
 /// same register file after the same number of guest instructions, or the
 /// number below is measuring a guest that stopped working.
-fn run_translated(w: &Workload, insns: u64, cache: bool, tlb: bool, shape: Shape) -> Duration {
+fn run_translated(
+    w: &Workload,
+    insns: u64,
+    cache: bool,
+    tlb: bool,
+    shape: Shape,
+    compiled: bool,
+) -> Duration {
     let (space, _ram) = machine(w);
     let mut front = Lifter::new(Arc::clone(&space), shape);
     let mut host = BenchHost::new(w, space, tlb);
@@ -378,6 +406,9 @@ fn run_translated(w: &Workload, insns: u64, cache: bool, tlb: bool, shape: Shape
     // the cache live inside the call and measure something else. Its cache is
     // sized to one block so that the flush itself is not what is being timed.
     let mut disp = Dispatcher::with_cache(BlockCache::with_capacity(if cache { 1024 } else { 1 }));
+    if compiled {
+        disp = with_backend(disp);
+    }
     let mut budget = if cache { BLOCK_BUDGET } else { 1 };
 
     let start = Instant::now();
@@ -436,6 +467,21 @@ fn run_translated(w: &Workload, insns: u64, cache: bool, tlb: bool, shape: Shape
     // instruction*, and dividing a run's time by the count it was asked for
     // rather than the count it retired credits an overshoot as slowness.
     Duration::from_secs_f64(took.as_secs_f64() * insns as f64 / done as f64)
+}
+
+/// Attach the host code generator, where this build has one.
+///
+/// `ROADMAP.md` §9's x86-64 backend is behind `jit-x86` and `cfg`-gated to an
+/// x86-64 Linux host, so this file builds and runs everywhere and the compiled
+/// column simply repeats the `+superblock` one where there is no backend.
+#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+fn with_backend(disp: Dispatcher) -> Dispatcher {
+    disp.with_backend(rsemu::jit::x86::Engine::new().expect("a W^X code buffer"))
+}
+
+#[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
+fn with_backend(disp: Dispatcher) -> Dispatcher {
+    disp
 }
 
 /// The largest number of blocks one dispatcher call is asked for.
@@ -603,6 +649,22 @@ impl IrHost for BenchHost {
 impl StoreLog for BenchHost {
     fn drain_dirty(&mut self, sink: &mut dyn FnMut(u64)) {
         self.dirty.drain_dirty(sink);
+    }
+}
+
+/// The seam the compiled column measures: the backend inlines an aligned load
+/// into a mask, a compare, an add and a `mov`, out of *this* host's own TLB.
+///
+/// `note_fast_load` charges nothing because `BenchHost::once` charges nothing —
+/// this file measures wall time, and `charge` is a no-op throughout. The
+/// correctness of the tick accounting is `cpu::riscv::differential`'s job and
+/// is checked there, on the same code path.
+impl FastMem for BenchHost {
+    fn load_plan(&mut self) -> Option<LoadPlan> {
+        self.tlb.as_ref().map(|tlb| LoadPlan {
+            set: tlb.fast_set(AccessKind::Load),
+            ctx: MACHINE,
+        })
     }
 }
 

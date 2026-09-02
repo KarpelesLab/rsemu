@@ -56,7 +56,11 @@ use crate::core::error::Result;
 use crate::core::sched::ExitFlag;
 use crate::ir::{Block, Fault, Interp, IrHost, Opcode, Outcome, RegSlot};
 use crate::jit::cache::{BlockCache, BlockId, CacheStats};
+use crate::jit::fast::FastMem;
 use crate::jit::tlb::{Epoch, PAGE_MASK, PAGE_SIZE};
+
+#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+use crate::jit::x86::Engine;
 
 /// One freshly lifted block, and what the cache needs to know about it.
 #[derive(Debug)]
@@ -227,6 +231,13 @@ pub struct DispatchStats {
     pub smc: u64,
     /// Times the epoch moved and the caches were resynchronised.
     pub resyncs: u64,
+    /// Blocks executed as compiled host code rather than interpreted.
+    ///
+    /// The two engines are indistinguishable to the guest, so this is a
+    /// statistic and never a behaviour — but a backend whose coverage is
+    /// unmeasured is a backend whose coverage rots, which is why it is
+    /// counted rather than assumed.
+    pub compiled: u64,
 }
 
 /// The loop that keeps a guest inside translated code.
@@ -234,6 +245,12 @@ pub struct DispatchStats {
 pub struct Dispatcher {
     cache: BlockCache,
     interp: Interp,
+    /// The host code generator, when there is one and it has been given.
+    ///
+    /// `None` is the whole of the portable path: every block is interpreted,
+    /// which is what `no_std`, wasm and any host without a backend do.
+    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    backend: Option<Engine>,
     exit: Option<ExitFlag>,
     stats: DispatchStats,
 }
@@ -251,9 +268,35 @@ impl Dispatcher {
         Dispatcher {
             cache,
             interp: Interp::new(),
+            #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+            backend: None,
             exit: None,
             stats: DispatchStats::default(),
         }
+    }
+
+    /// The same dispatcher, compiling blocks with `engine` where it can.
+    ///
+    /// A block the engine refuses runs on [`Interp`](crate::ir::Interp), and
+    /// the two are indistinguishable to the guest — same registers, same
+    /// memory, same faults, same ticks, in the same order — which is the claim
+    /// both differential harnesses check. So this is a speed knob and never a
+    /// semantic one.
+    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "jit-x86")))]
+    #[must_use]
+    pub fn with_backend(mut self, engine: Engine) -> Dispatcher {
+        self.backend = Some(engine);
+        self
+    }
+
+    /// The host code generator, if this dispatcher has one.
+    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "jit-x86")))]
+    #[inline]
+    #[must_use]
+    pub fn backend(&self) -> Option<&Engine> {
+        self.backend.as_ref()
     }
 
     /// The same dispatcher, unwinding when `flag` is raised.
@@ -312,7 +355,7 @@ impl Dispatcher {
     ) -> Result<Run>
     where
         F: Frontend + ?Sized,
-        H: IrHost + StoreLog + ?Sized,
+        H: IrHost + StoreLog + FastMem,
     {
         if self.cache.sync(front.epoch()) {
             self.stats.resyncs += 1;
@@ -356,18 +399,20 @@ impl Dispatcher {
                 self.cache.link(f, pc, id);
             }
 
-            let block = self
-                .cache
-                .block(id)
-                .expect("a block just found or just inserted is resident");
-            let outcome = self.interp.run(block, host)?;
+            // Compiled if there is a backend and it takes this block, and
+            // interpreted otherwise. The two are indistinguishable to the
+            // guest, including in cycle accounting, so `retired` is read off
+            // whichever ran rather than off a fixed engine — a run that read
+            // the wrong one would tell an oracle to step the wrong number of
+            // times, which is the bug the retired count exists to avoid.
+            let (outcome, retired) = self.execute(id, host)?;
             self.stats.blocks += 1;
             blocks += 1;
             // Every exit is preceded by one boundary that begins no guest
             // instruction, and exactly one exit is reached, so this is what
             // retired — at a fault too, where the faulting instruction opened
             // its boundary and did not retire.
-            insns += (self.interp.boundaries().saturating_sub(1)) as usize;
+            insns += retired;
 
             // Guest stores land before the next block is chosen, so a block
             // invalidated by one is never served afterwards.
@@ -395,6 +440,62 @@ impl Dispatcher {
             insns,
             stop,
         })
+    }
+
+    /// Execute the block `id` names, and say what it did and how many guest
+    /// instructions it retired.
+    ///
+    /// The one place that chooses an engine. A backend that takes the block
+    /// runs it; anything else — no backend, a refusal, a code handle that a
+    /// buffer reset invalidated — interprets, which is `ROADMAP.md` §9's
+    /// *"degrades in speed rather than failing to run"* applied one level down,
+    /// to a block rather than to a host.
+    fn execute<H>(&mut self, id: BlockId, host: &mut H) -> Result<(Outcome, usize)>
+    where
+        H: IrHost + FastMem,
+    {
+        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        {
+            // Destructured, because compiling reads the block out of the cache
+            // while the engine is borrowed mutably, and the two are different
+            // fields of the same struct.
+            let Dispatcher {
+                cache,
+                backend,
+                stats,
+                ..
+            } = self;
+            if let Some(engine) = backend.as_mut() {
+                let block = cache
+                    .block(id)
+                    .expect("a block just found or just inserted is resident");
+                let code = match cache.code(id).filter(|c| engine.is_live(*c)) {
+                    Some(code) => Some(code),
+                    // A refusal is not an error and is not recorded against
+                    // the block: the engine counts it, and the next time this
+                    // block is reached it is refused again for the same
+                    // reason, which costs a compile attempt and nothing else.
+                    None => engine.compile(block).ok(),
+                };
+                if let Some(code) = code {
+                    cache.set_code(id, code);
+                    let block = cache
+                        .block(id)
+                        .expect("a block just found or just inserted is resident");
+                    if let Some(outcome) = engine.run(block, code, host) {
+                        stats.compiled += 1;
+                        let retired = engine.boundaries().saturating_sub(1) as usize;
+                        return Ok((outcome?, retired));
+                    }
+                }
+            }
+        }
+        let block = self
+            .cache
+            .block(id)
+            .expect("a block just found or just inserted is resident");
+        let outcome = self.interp.run(block, host)?;
+        Ok((outcome, self.interp.boundaries().saturating_sub(1) as usize))
     }
 }
 
@@ -503,6 +604,10 @@ mod tests {
         }
     }
 
+    // No software TLB here, so no fast path to publish: this host's loads all
+    // take the call, which is the default and always correct.
+    impl FastMem for Host {}
+
     fn chain(step: u64, limit: u64) -> Chain {
         Chain {
             step,
@@ -547,6 +652,41 @@ mod tests {
         let run = d.run(&mut f, &mut h, 0x1000, 97).expect("runs");
         assert_eq!(h.ticks, run.blocks as u64);
         assert!(d.stats().chained > 0, "and chaining really happened");
+    }
+
+    /// The same guard, with the blocks executed as host code.
+    ///
+    /// `ROADMAP.md` §0 requires a bit-identical state hash *across the
+    /// interpreter and the JIT for the same guest*, and the cycle counter is in
+    /// that hash. So the two engines must charge the same ticks at the same
+    /// points, whichever ran the block — and the run is done twice, once each
+    /// way, on the same programs, so the numbers are compared rather than
+    /// merely asserted.
+    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn a_compiled_block_charges_exactly_what_an_interpreted_one_charges() {
+        let mut interpreted = Dispatcher::new();
+        let mut hi = Host::default();
+        let a = interpreted
+            .run(&mut chain(4, 0x1010), &mut hi, 0x1000, 97)
+            .expect("runs");
+
+        let mut compiled = Dispatcher::new()
+            .with_backend(crate::jit::x86::Engine::new().expect("a W^X code buffer"));
+        let mut hc = Host::default();
+        let b = compiled
+            .run(&mut chain(4, 0x1010), &mut hc, 0x1000, 97)
+            .expect("runs");
+
+        assert!(compiled.stats().compiled > 0, "nothing was compiled");
+        assert_eq!(hi.ticks, hc.ticks, "the cycle counters must agree");
+        assert_eq!(
+            a.insns, b.insns,
+            "and so must the retired instruction count"
+        );
+        assert_eq!(a.pc, b.pc);
+        assert_eq!(a.stop, b.stop);
+        assert_eq!(hi.slots, hc.slots, "and the guest's own state");
     }
 
     /// A block covering `insns` guest instructions, with a side exit taken
@@ -684,6 +824,36 @@ mod tests {
         };
         let mut h = Host::default();
         d.run(&mut f, &mut h, 0x1000, 1).expect("runs");
+        flag.raise();
+        let run = d.run(&mut f, &mut h, 0x1000, 100).expect("runs");
+        assert_eq!(run.stop, Stop::Exit);
+        assert_eq!(run.blocks, 0, "no block starts once the flag is up");
+    }
+
+    /// The safe-point bound, with the blocks executed as host code.
+    ///
+    /// A compiled block has exactly the same boundaries as the interpreted one
+    /// — the code generator changes how a block runs, never where it ends — so
+    /// `ROADMAP.md` §4.7's protocol is unchanged and the delay before a raised
+    /// flag is honoured is still bounded by a frontend's own instruction limit.
+    /// That is asserted rather than argued, because "the backend did not change
+    /// it" is the kind of claim that stops being true quietly.
+    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn a_raised_exit_flag_stops_a_compiled_run_within_one_block_too() {
+        let flag = ExitFlag::default();
+        let mut d = Dispatcher::new()
+            .with_exit_flag(flag.clone())
+            .with_backend(crate::jit::x86::Engine::new().expect("a W^X code buffer"));
+        let mut f = Traces {
+            insns: 64,
+            leave_at: None,
+            epoch: Epoch::default(),
+        };
+        let mut h = Host::default();
+        let run = d.run(&mut f, &mut h, 0x1000, 4).expect("runs");
+        assert_eq!(run.insns, 4 * 64, "every merged instruction retired");
+        assert!(d.stats().compiled > 0, "the blocks really were compiled");
         flag.raise();
         let run = d.run(&mut f, &mut h, 0x1000, 100).expect("runs");
         assert_eq!(run.stop, Stop::Exit);

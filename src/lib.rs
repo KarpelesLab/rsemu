@@ -65,7 +65,11 @@
 //! cache keyed on `(guest PC, `Block::key`)` with its exits patched straight to
 //! their successors, and a page filter that throws a translation away when the
 //! guest writes into the page it was lifted from — `ROADMAP.md` §9.1's first
-//! three mechanisms, in front of the IR interpreter. See [`jit`].
+//! three mechanisms, in front of the IR interpreter. With `jit-x86` on an
+//! x86-64 Linux host there is a **host code generator** behind them as well:
+//! an IR block becomes machine code in a W^X buffer, with the TLB's fast path
+//! inlined into it. A block it declines runs on the interpreter, which stays
+//! the oracle both are tested against. See [`jit`].
 //!
 //! With `accel-kvm` on a Linux x86-64 host, [`accel`] runs guest code on the
 //! host's own silicon: `/dev/kvm` reached by raw `ioctl` — no libc, no header,
@@ -226,6 +230,9 @@ pub fn build_info() -> alloc::string::String {
     }
     if cfg!(feature = "jit") {
         features.push("jit");
+    }
+    if cfg!(feature = "jit-x86") {
+        features.push("jit-x86");
     }
     if cfg!(feature = "ir") {
         features.push("ir");

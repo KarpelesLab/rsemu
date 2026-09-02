@@ -176,8 +176,8 @@ use crate::core::value::Width;
 use crate::ir::AccessKind;
 #[cfg(feature = "jit")]
 use crate::jit::{
-    BlockCache, Context as TlbContext, DirtyPages, Dispatcher, Epoch, Frontend, Stop, StoreLog,
-    Tlb, Translation,
+    BlockCache, Context as TlbContext, DirtyPages, Dispatcher, Epoch, FastMem, Frontend, Stop,
+    StoreLog, Tlb, Translation,
 };
 
 /// Where a case's RAM is mapped, and where its program starts.
@@ -917,6 +917,11 @@ impl Host {
     }
 }
 
+/// No table for a backend to inline: this host reaches the address space
+/// directly, and every load takes the call.
+#[cfg(feature = "jit")]
+impl FastMem for Host {}
+
 impl IrHost for Host {
     fn read_slot(&mut self, slot: RegSlot) -> u128 {
         u128::from(self.slot(slot))
@@ -977,6 +982,56 @@ impl IrHost for Host {
 #[cfg(feature = "jit")]
 #[allow(clippy::missing_panics_doc)]
 pub fn compare_cached(case: &Case, blocks: usize) -> Result<Verdict, Divergence> {
+    cached(case, blocks, false)
+}
+
+/// [`compare_cached`], with the blocks executed as **host code**.
+///
+/// The third harness. Everything [`compare_cached`] compares is compared here
+/// against the same oracle — the eight general registers, `EIP`, the flags word
+/// assembled from its seven slots, the cycle counter, guest memory, and at a
+/// fault the state at the faulting instruction — with the only difference being
+/// which engine ran the block.
+///
+/// x86 is the harder of the two frontends for a backend, and deliberately so:
+/// an instruction with live flags lifts to something like fifteen IR
+/// instructions where an RV64I one lifts to two or three, so this path
+/// exercises `movcond`, `popcount`, `deposit`, `extract`, the rotates through
+/// carry and both widening multiplies — every one of which the RISC-V harness
+/// never emits.
+///
+/// # Errors
+///
+/// As [`compare_cached`].
+///
+/// # Panics
+///
+/// As [`compare_cached`], plus a code buffer the kernel would not give.
+#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "jit-x86")))]
+#[allow(clippy::missing_panics_doc)]
+pub fn compare_compiled(case: &Case, blocks: usize) -> Result<Verdict, Divergence> {
+    cached(case, blocks, true)
+}
+
+/// A dispatcher, with the host code generator attached when asked for and
+/// available. `compiled` is ignored on a target with no backend.
+#[cfg(feature = "jit")]
+fn dispatcher(compiled: bool) -> Dispatcher {
+    let disp = Dispatcher::with_cache(BlockCache::with_capacity(256));
+    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    if compiled {
+        return disp.with_backend(
+            crate::jit::x86::Engine::new().expect("the kernel gave a W^X code buffer"),
+        );
+    }
+    let _ = compiled;
+    disp
+}
+
+#[cfg(feature = "jit")]
+#[allow(clippy::missing_panics_doc)]
+fn cached(case: &Case, blocks: usize, compiled: bool) -> Result<Verdict, Divergence> {
     assert!(
         (case.program.len() as u64) < DATA,
         "a case's program lives in the first page"
@@ -987,7 +1042,7 @@ pub fn compare_cached(case: &Case, blocks: usize) -> Result<Verdict, Divergence>
 
     let mut front = Lifter::new(case, Arc::clone(&subject_space));
     let mut host = CachedHost::new(case, subject_space);
-    let mut disp = Dispatcher::with_cache(BlockCache::with_capacity(256));
+    let mut disp = dispatcher(compiled);
     let run = disp
         .run(&mut front, &mut host, BASE, blocks)
         .map_err(|e| diverged(case, format!("the dispatcher refused a block: {e}")))?;
@@ -1115,6 +1170,12 @@ pub struct CachedRun {
     pub chained: u64,
     /// Blocks invalidated by a guest store into their page.
     pub smc: u64,
+    /// Blocks executed as compiled host code rather than interpreted.
+    ///
+    /// Zero on the cached path. What it is *for* is the compiled path: a
+    /// harness that quietly stopped compiling anything would still agree with
+    /// the interpreter, perfectly, forever.
+    pub compiled: u64,
 }
 
 /// [`compare_cached`], with the counters that say what it exercised.
@@ -1129,14 +1190,36 @@ pub struct CachedRun {
 #[cfg(feature = "jit")]
 #[allow(clippy::missing_panics_doc)]
 pub fn measure_cached(case: &Case, blocks: usize) -> Result<CachedRun, Divergence> {
-    let verdict = compare_cached(case, blocks)?;
+    measure(case, blocks, false)
+}
+
+/// [`measure_cached`] with the host code generator attached.
+///
+/// # Errors
+///
+/// As [`compare_compiled`].
+///
+/// # Panics
+///
+/// As [`compare_compiled`].
+#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "jit-x86")))]
+#[allow(clippy::missing_panics_doc)]
+pub fn measure_compiled(case: &Case, blocks: usize) -> Result<CachedRun, Divergence> {
+    measure(case, blocks, true)
+}
+
+#[cfg(feature = "jit")]
+#[allow(clippy::missing_panics_doc)]
+fn measure(case: &Case, blocks: usize, compiled: bool) -> Result<CachedRun, Divergence> {
+    let verdict = cached(case, blocks, compiled)?;
     // A second, independent run on a fresh machine: the counters come from a
     // run that agreed with the interpreter, and running it twice is itself a
     // determinism check on the whole path.
     let (space, _ram) = machine(case);
     let mut front = Lifter::new(case, Arc::clone(&space));
     let mut host = CachedHost::new(case, space);
-    let mut disp = Dispatcher::with_cache(BlockCache::with_capacity(256));
+    let mut disp = dispatcher(compiled);
     let run = disp
         .run(&mut front, &mut host, BASE, blocks)
         .map_err(|e| diverged(case, format!("the dispatcher refused a block: {e}")))?;
@@ -1147,6 +1230,7 @@ pub fn measure_cached(case: &Case, blocks: usize) -> Result<CachedRun, Divergenc
         translated: disp.stats().translated,
         chained: disp.stats().chained,
         smc: disp.stats().smc,
+        compiled: disp.stats().compiled,
     })
 }
 
@@ -1327,6 +1411,24 @@ impl StoreLog for CachedHost {
         self.dirty.drain_dirty(sink);
     }
 }
+
+/// **x86 publishes no fast path, and that is a property of the guest.**
+///
+/// A load's address here is an *effective* address: the segment base is added
+/// and the limit checked before anything reaches the TLB, by `Segments::linear`
+/// on this host and by the descriptor cache on a real core. The backend's
+/// inlined probe tags on the address it is handed, so it would be tagging on a
+/// number one translation short — and the frontend says so in the block, since
+/// `cpu::x86::lift` gives every [`MemOp`] a [`SegId`](crate::ir::SegId).
+///
+/// So the backend refuses to inline a segmented access (`Compiler::inlinable`)
+/// and this host offers nothing, which is the same answer said twice.
+/// Inlining x86's loads means lowering the segment fold into generated code —
+/// a base add and a limit compare against state a `MOV DS, ax` can change
+/// between two instructions — and that is a frontend change, not a backend
+/// one.
+#[cfg(feature = "jit")]
+impl FastMem for CachedHost {}
 
 // ---------------------------------------------------------------------------
 // The generator
@@ -1548,6 +1650,62 @@ mod tests {
             }
         }
         assert!(lifted > 400, "only {lifted} guest instructions were lifted");
+    }
+
+    /// The same corpus, executed as host code.
+    ///
+    /// x86 is where the backend earns its keep: `cpu::x86::lift` turns one
+    /// guest instruction with live flags into a dozen or more IR instructions —
+    /// a `popcount` for `PF`, an `extract` for `AF`, two comparisons and a
+    /// `movcond` — which is exactly the shape an interpreter is worst at and a
+    /// code generator is best at. It is also the only frontend in the tree that
+    /// emits `rotlc`, `mulu2`, `bswap`, `clz` and `ctz` at all, so this is the
+    /// only harness that covers those lowerings against a real guest.
+    #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+    mod compiled {
+        use super::*;
+
+        fn agreed(case: &Case, blocks: usize) -> CachedRun {
+            match measure_compiled(case, blocks) {
+                Ok(run) => run,
+                Err(e) => panic!("diverged on the compiled path:\n{e}"),
+            }
+        }
+
+        #[test]
+        fn a_generated_corpus_agrees_when_it_is_compiled() {
+            let mut compiled = 0u64;
+            let mut steps = 0usize;
+            for n in 0..400u64 {
+                let case = Case::seeded(program(0x9e37_0000 + n, 6));
+                let run = agreed(&case, 8);
+                compiled += run.compiled;
+                steps += run.insns_retired;
+            }
+            assert!(
+                compiled > 400,
+                "only {compiled} blocks were compiled across 400 cases"
+            );
+            assert!(steps > 400, "only {steps} guest instructions retired");
+        }
+
+        #[test]
+        fn every_policy_pair_agrees_when_it_is_compiled() {
+            // The flag policy and the store policy are both in the cache key
+            // and both change the IR a guest instruction lifts to — elision
+            // removes the dead flag arithmetic, and the store guard adds a
+            // load, a compare and a branch *inside* the block. A backend has to
+            // be right about all four combinations.
+            for flags in [lift::Flags::Eager, lift::Flags::Elide] {
+                for smc in [lift::Smc::EndBlock, lift::Smc::Guard] {
+                    let mut case = Case::seeded(program(0x5150_0001, 8));
+                    case.flags = flags;
+                    case.smc = smc;
+                    let run = agreed(&case, 12);
+                    assert!(run.compiled > 0, "{flags:?}/{smc:?} compiled nothing");
+                }
+            }
+        }
     }
 
     #[test]

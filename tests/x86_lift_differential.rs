@@ -170,6 +170,59 @@ fn the_same_corpus_agrees_through_the_cached_and_chained_runtime() {
     assert!(trapped > 0, "no cached case reached a fault");
 }
 
+/// The same corpus again, executed as **host code**.
+///
+/// `ROADMAP.md` §9's x86-64 backend, held to the standard CLAUDE.md sets for
+/// everything below it: the interpreter is the oracle, forever. Every column
+/// `compare_cached` compares is compared here — the eight general registers,
+/// `EIP`, the flags word, the cycle counter, guest memory, and the
+/// architectural state at a fault — with the only difference being which engine
+/// executed the block.
+///
+/// x86 is the frontend that exercises the lowerings RISC-V never reaches:
+/// `popcount` on the parity flag, `extract` on the auxiliary carry, both
+/// widening multiplies, the rotates through carry, `bswap`, `clz` and `ctz`.
+#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn the_same_corpus_agrees_when_it_is_compiled_to_host_code() {
+    use rsemu::cpu::x86::differential::measure_compiled;
+
+    let mut rng = Lcg(0x5eed_beef);
+    let (mut agreed, mut trapped, mut nothing) = (0usize, 0usize, 0usize);
+    let (mut compiled, mut blocks) = (0u64, 0u64);
+    for n in 0..600 {
+        let len = 1 + (rng.next() % 12) as usize;
+        let case = Case::seeded(generate(&mut rng, len));
+        match measure_compiled(&case, 32) {
+            Ok(run) => {
+                compiled += run.compiled;
+                blocks += run.blocks as u64;
+                match run.verdict {
+                    Verdict::Agreed { .. } => agreed += 1,
+                    Verdict::Trapped { .. } => trapped += 1,
+                    Verdict::Nothing => nothing += 1,
+                }
+            }
+            Err(e) => panic!("compiled case {n} diverged:\n{e}"),
+        }
+    }
+    assert!(
+        agreed > 300,
+        "only {agreed} of 600 compiled cases ran to completion ({trapped} trapped, {nothing} \
+         lifted nothing)"
+    );
+    assert!(trapped > 0, "no compiled case reached a fault");
+    // The assertion without which all of the above would pass on a backend
+    // that had quietly stopped taking a single block. It is a *fraction*
+    // rather than a count, because the interesting number is coverage: a
+    // refused block is correct and slow, and the two engines are mixed inside
+    // one run.
+    assert!(
+        compiled * 2 > blocks,
+        "only {compiled} of {blocks} blocks were executed as host code"
+    );
+}
+
 /// A tight loop: `dec ecx` / `jnz` back to it, entered with a small count.
 ///
 /// Four bytes, wholly inside one page, and the shape that shows what merging
