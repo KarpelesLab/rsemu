@@ -14,6 +14,7 @@
 //! | [`ahci`] | `dev-ahci` | a Serial ATA host bus adapter: a PCI function that DMA-walks its own command lists |
 //! | [`apple1`] | `dev-apple1` | the Apple 1's MC6821, its monitor ROM socket, and RSMON |
 //! | [`ata`] | `dev-ata-disk` | an ATA hard disk: the command block, the command set, CHS and LBA |
+//! | [`medium`] | `dev-medium` | what a drive's platter *is*: the storage seam every block device stores its bytes behind |
 //! | [`apu`] | `dev-nes-apu` | the RP2A03 audio half: channels, frame counter, DMC |
 //! | [`cart`] | `dev-nes-cart` | cartridge images and the mappers that decode them |
 //! | [`flash`] | `dev-flash-cfi`, `dev-flash-spinor` | NOR flash: parallel (CFI) and serial (W25Q on SPI) |
@@ -57,6 +58,10 @@ pub mod ahci;
 #[cfg(feature = "dev-ata-disk")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-ata-disk")))]
 pub mod ata;
+
+#[cfg(feature = "dev-medium")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-medium")))]
+pub mod medium;
 
 #[cfg(feature = "dev-blk")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-blk")))]

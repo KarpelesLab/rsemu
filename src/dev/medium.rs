@@ -1,8 +1,16 @@
 //! What a drive's platter actually is.
 //!
-//! [`AtaDisk`](super::AtaDisk) models the command block, the command set and
-//! the handshake; it does not model *storage*. The bytes come from a
-//! [`Medium`], and there are two of them in the tree:
+//! A storage device models a register file, a command set and a handshake; it
+//! does not model *storage*. The bytes come from a [`Medium`], and every device
+//! in the tree that has any — `ata.disk`, an NVMe namespace, `virtio.blk` —
+//! reads and writes through this one trait, which is why `--drive` works the
+//! same way on all of them.
+//!
+//! It lives here rather than under any one of them because it belongs to none:
+//! a `riscv-virt` build has a virtio disk and no ATA command set anywhere, and
+//! `dev-medium` is the feature that says so.
+//!
+//! There are two implementations:
 //!
 //! * [`RamStore`] — a flat buffer, filled from a media slot. `no_std`, no
 //!   dependency, and the whole capacity costs host memory.
@@ -11,9 +19,9 @@
 //!   16 GiB drive costs 16 GiB of *disk*. `std`, and one of the two documented
 //!   exceptions to the `no_std` rule (`CLAUDE.md`).
 //!
-//! The trait lives here rather than in `dev/blk` because `dev/ata` is `no_std`
-//! and `dev/blk` is not: the seam has to be nameable from the side that cannot
-//! see `std`. It is deliberately *not* a parallel invention of
+//! The trait is not in `dev/blk` because `dev/blk` is `std` and its callers are
+//! not: the seam has to be nameable from the side that cannot see `std`. It is
+//! deliberately *not* a parallel invention of
 //! `fstool::BlockDevice` — it is narrower (`&self`, no `Seek`, no `Read`) so
 //! that the RAM implementation stays lock-free, and `dev/blk` adapts one to the
 //! other in about thirty lines.
@@ -21,14 +29,18 @@
 //! # Errors are a three-way answer, not an `Option`
 //!
 //! Everything here returns [`MemResult`], and *which* error comes back is part
-//! of the contract, because the drive turns it into an ATA error code:
+//! of the contract, because the device turns it into a status its guest can
+//! act on — an ATA error bit, an NVMe status code, a virtio `S_IOERR`:
 //!
-//! | Error | Means | The drive reports |
-//! | --- | --- | --- |
-//! | [`BusError::BadAccess`] | the range is not on this medium — off the end, or the image shrank | `ERR_IDNF`, address not found |
-//! | [`BusError::Unassigned`] | the medium is there and the bytes could not be moved: a host I/O error, a short read, a torn write | `ERR_UNC`, uncorrectable |
-//! | [`BusError::Protected`] | the medium is write protected | `ERR_ABRT` |
-//! | [`BusError::Retry`] | busy, and **nothing has happened yet** | `ERR_UNC`; the transfer is not half done |
+//! | Error | Means |
+//! | --- | --- |
+//! | [`BusError::BadAccess`] | the range is not on this medium — off the end, or the image shrank |
+//! | [`BusError::Unassigned`] | the medium is there and the bytes could not be moved: a host I/O error, a short read, a torn write |
+//! | [`BusError::Protected`] | the medium is write protected |
+//! | [`BusError::Retry`] | busy, and **nothing has happened yet** |
+//!
+//! `dev::ata::disk::error_bit` is that translation for ATA, and it is written
+//! down once so the two read paths and the write path cannot disagree.
 //!
 //! A silent `0xff` and a bare `None` are both forbidden (`CLAUDE.md`).
 //!
@@ -189,12 +201,12 @@ impl Medium for RamStore {
 // ---------------------------------------------------------------------------
 
 /// The kind a drive medium is filed under in a build's [`HostObjects`].
-pub const KIND: HostKind = HostKind::new("ata-medium");
+pub const KIND: HostKind = HostKind::new("medium");
 
 /// Where a medium slot's lock sits in the ranked order.
 ///
-/// Beside [`bays::BAY_RANK`](super::bays::BAY_RANK) and for the same reason: it
-/// is taken alone, once, during construction.
+/// Beside `dev::ata::bays::BAY_RANK` and for the same reason: it is taken
+/// alone, once, during construction.
 pub const MEDIUM_RANK: LockRank = LockRank::new(0x4c41);
 
 /// A medium a *host* supplies, waiting for the drive that will use it.
@@ -309,27 +321,14 @@ pub fn names(hosts: &HostObjects) -> alloc::vec::Vec<String> {
     hosts.names(KIND)
 }
 
-/// Turn a medium error into the ATA Error-register bit that describes it.
-///
-/// The table in this module's documentation, in code, so that the drive has one
-/// place to look and the mapping cannot drift between the two read paths and
-/// the write path.
-#[must_use]
-pub fn error_bit(e: BusError) -> u8 {
-    match e {
-        // The address is not on this medium: no such sector.
-        BusError::BadAccess => super::disk::ERR_IDNF,
-        // Write protected — the command should never have been accepted.
-        BusError::Protected => super::disk::ERR_ABRT,
-        // The sector exists and the bytes did not arrive. `Retry` lands here
-        // because the drive has no way to stall: it has already told the host
-        // the command was taken.
-        _ => super::disk::ERR_UNC,
-    }
-}
-
 /// A medium error, as a diagnostic for a host-side caller.
-pub(crate) fn error_at(offset: u64, e: BusError) -> Error {
+///
+/// What a device says when a medium refuses something *outside* a guest
+/// command — filling a namespace at construction, flushing at realize — where
+/// there is no status register to report it in and the offset is the only
+/// thing that identifies which access failed.
+#[must_use]
+pub fn error_at(offset: u64, e: BusError) -> Error {
     Error::State(alloc::format!("{offset:#x}: {e}"))
 }
 
@@ -360,10 +359,6 @@ mod tests {
             Medium::read_at(&store, 510, &mut got),
             Err(BusError::BadAccess)
         );
-        assert_eq!(error_bit(BusError::BadAccess), super::super::disk::ERR_IDNF);
-        assert_eq!(error_bit(BusError::Unassigned), super::super::disk::ERR_UNC);
-        assert_eq!(error_bit(BusError::Retry), super::super::disk::ERR_UNC);
-        assert_eq!(error_bit(BusError::Protected), super::super::disk::ERR_ABRT);
     }
 
     #[test]

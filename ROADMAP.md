@@ -1545,7 +1545,7 @@ F2FS, littlefs, SquashFS and ISO9660. Emulated storage controllers sit directly
 on `fstool::BlockDevice` rather than on a parallel rsemu invention.
 
 **Landed:** `dev/blk` (feature `dev-blk`), the adapter between
-`fstool::BlockDevice` and a drive's storage. `dev::ata::medium::Medium` is the
+`fstool::BlockDevice` and a drive's storage. `dev::medium::Medium` is the
 seam — `RamStore` on the `no_std` side, `dev::blk::Image` on the `std` side —
 so an ATA drive is a host file with no change to any machine description or host
 adapter, and sparse raw, qcow2, DMG, DiskCopy 4.2 and LUKS all work through
@@ -1556,11 +1556,12 @@ machine snapshot (flushing it first) rather than copying it; `capture` and
 **All three storage devices are on that seam.** `nvme.controller`'s namespace
 and `virtio.blk`'s disk are `Medium`s too, so `--drive nvme0=disk.qcow2` and
 `--drive disk=root.qcow2` mean what `--drive hd0=disk.qcow2` means, and
-`riscv-virt` boots Linux off a qcow2 that stays on disk. The seam's *home* is
-the loose end: it lives under `dev/ata` because ATA wanted it first, which
-makes `dev-riscv` and `dev-nvme` depend on `dev-ata-disk` for a trait rather
-than for a command set. Moving `medium.rs` to a neutral module under its own
-feature is a rename, and it is what §3's crate-shape rule asks for.
+`riscv-virt` boots Linux off a qcow2 that stays on disk. The seam has a home of
+its own: `src/dev/medium.rs`, feature `dev-medium`, which `dev-ata-disk`,
+`dev-nvme`, `dev-riscv` and `dev-blk` each depend on. It used to live under
+`dev/ata` because ATA wanted it first, and a `riscv-virt` build linked a whole
+ATA command set to name a trait — which is not what §3's crate-shape rule asks
+for.
 
 What rsemu adds on top: the remaining image formats (`vmdk`, `vhdx`, `vdi`) —
 which are new `BlockDevice` backends and so belong beside the ones they sit next

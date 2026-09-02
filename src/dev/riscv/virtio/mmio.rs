@@ -690,6 +690,12 @@ impl Device for VirtioMmio {
         self.regs.reset();
     }
 
+    fn flush(&self) -> Result<()> {
+        // The transport holds nothing a host can see; whatever is behind it
+        // might.
+        self.regs.backend.flush()
+    }
+
     fn region(&self, name: &str) -> Option<RegionRef> {
         matches!(name, "" | "regs").then(|| Arc::clone(&self.region))
     }

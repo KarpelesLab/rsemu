@@ -391,6 +391,34 @@ pub trait Device: Send + Sync + fmt::Debug {
     /// Return to a documented reset state.
     fn reset(&self, kind: ResetKind);
 
+    /// Push everything already accepted from the guest out to the host.
+    ///
+    /// Defaults to doing nothing, which is right for a device that holds no
+    /// host-visible state — most of them.
+    ///
+    /// **Not a guest-visible operation.** A drive's cache-flush command is the
+    /// guest asking, and it is answered where the command is decoded; this is
+    /// the *machine* saying the run is over, so a write the guest issued and
+    /// the device accepted is not lost because the process is about to exit.
+    /// The two are different questions: a guest that never issued `FLUSH
+    /// CACHE` has promised nothing, but the write it made still happened, and
+    /// on a qcow2 the metadata that finds those bytes is in the same layer as
+    /// the bytes. Losing it leaves an image that is not merely stale but
+    /// inconsistent.
+    ///
+    /// Called with the machine stopped: no runnable is executing and no
+    /// scheduler round is in progress, so an implementation may take its own
+    /// locks and do host I/O. Idempotent — flushing twice must be harmless.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the host refused, named well enough to say which device and
+    /// which offset. A machine keeps going after one and reports the first
+    /// (`Machine::flush`).
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Serialize architectural state — never derived caches (invariant 3).
     ///
     /// Defaults to writing nothing, for a genuinely stateless device. Anything

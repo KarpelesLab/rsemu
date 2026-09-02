@@ -90,7 +90,7 @@ costs its whole capacity in host memory and a snapshot writes all of it.
 
 **That variant now exists**, as `dev/blk` under the documented `std` exception,
 and it landed exactly as this paragraph predicted: the drive's storage is a
-`dev::ata::medium::Medium` and the two implementations are a `RamStore` and a
+`dev::medium::Medium` and the two implementations are a `RamStore` and a
 `dev::blk::Image`, so the protocol half is reused whole and only
 `AtaDisk::read_media` and `AtaDisk::write_media` change hands. Three things are
 worth knowing about it.
@@ -133,7 +133,7 @@ correctly than ATA. Prefer them for new machines; implement ATA because legacy
 guests require it.
 
 **virtio-blk is on the `Medium` seam too**, which makes it three devices rather
-than two and settles what "the seam" means in this tree: `dev::ata::Medium` is
+than two and settles what "the seam" means in this tree: `dev::medium::Medium` is
 where a storage device's bytes come from, and a controller that invents its own
 backing store is a controller that has quietly opted out of `--drive`, out of
 the snapshot policies, and out of qcow2. `dev/riscv/virtio/blk` held a
@@ -147,14 +147,16 @@ buffer for it had been allocated. The seam does not fix the last one by itself
 — the fix is to check the range in `u64` and stage the transfer in bounded
 chunks — but it is what made the check expressible.
 
-The seam's *location* is now the one loose end. It lives in `src/dev/ata/`
-because ATA was the first device to want it, so `dev-riscv` and `dev-nvme` both
-depend on `dev-ata-disk` for a trait, a slot and a three-valued enum, and a
-`riscv-virt` build links an ATA command set it will never issue. That is a
-crate-shape problem rather than a correctness one — the file is `no_std` and
-dependency-free — but the shape rule is explicit that a NES build links a 6502
-and nothing else. Moving `medium.rs` to a neutral `src/dev/medium.rs` under its
-own feature is the fix; it is a rename, so it is one commit and not a design.
+The seam has its own home: `src/dev/medium.rs`, feature `dev-medium`, which
+`dev-ata-disk`, `dev-nvme`, `dev-riscv` and `dev-blk` each depend on. It lived
+in `src/dev/ata/` for as long as ATA was the only device that wanted it, and
+the cost of leaving it there was a `riscv-virt` build linking an ATA command set
+it will never issue in order to name a trait, a slot and a three-valued enum —
+a crate-shape problem rather than a correctness one, since the file is `no_std`
+and dependency-free, but the shape rule is explicit that a NES build links a
+6502 and nothing else. The one thing that stayed behind is
+`dev::ata::disk::error_bit`, the translation from a medium's three-way answer to
+the ATA Error register, because that half belongs to the command set.
 
 `machines/riscv-virt.machine` did not change to get any of this, which is the
 test of whether the media-slot design held: the board still says
@@ -210,7 +212,7 @@ submission doorbell would strand the command until the driver happened to submit
 another one; `a_command_on_a_queue_whose_completion_queue_is_full_waits` is
 where that was caught.
 
-The namespace is a `dev::ata::Medium` — the same seam an ATA drive's platter
+The namespace is a `dev::medium::Medium` — the same seam an ATA drive's platter
 uses, with the same three snapshot policies — so `--drive nvme0=disk.qcow2`
 works here for the reason it works there, and no image format is parsed.
 `machines/nvme-mini.machine` is the smallest board a driver can run against, and
@@ -315,6 +317,16 @@ libata driver was opened.**
   expects durability; a snapshot taken mid-write must restore to a consistent
   state. Decide the write-back cache semantics before writing the first
   controller, not after.
+- **And the run itself ends with a flush**, whether or not the guest asked for
+  one — `Machine::flush`, backed by `Device::flush`, and the CLI runs it on
+  every way out of a run including the failing ones. A guest that never issued
+  FLUSH CACHE has been promised nothing and the drive is entitled to hold the
+  write; that entitlement lasts exactly as long as the machine does, and when
+  the process exits nobody is left to write those bytes. Linux makes this easy
+  to hit: it writes a bare block device's dirty pages back on `sync(2)` but
+  issues the device flush from `blkdev_fsync`, so `dd` without `conv=fsync`
+  leaves a qcow2 with the data cluster written and the L2 entry that finds it
+  still in the image's cache — a hole, not merely a stale sector.
 - I/O runs on the task pool, with completions delivered through the event queue
   at guest-derived virtual times (`ROADMAP.md` §4.7).
 - `fstool`'s `crash_inject` block device gives guest-filesystem robustness

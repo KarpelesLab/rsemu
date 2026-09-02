@@ -4,7 +4,7 @@
 //!
 //! Everything else in this tree that moves bytes for a guest is either
 //! programmed I/O — the guest reads a data port a word at a time, as
-//! [`ata`](crate::dev::ata) does — or third-party DMA, where a separate
+//! `dev::ata` does — or third-party DMA, where a separate
 //! controller ([`pc::dma`](crate::dev::pc::dma)) does the moving. An NVMe
 //! controller is neither. It is a **bus master**: the driver builds a
 //! submission queue, a completion queue and a list of Physical Region Pages in
@@ -48,7 +48,7 @@
 //!
 //! # The namespace is a `Medium`
 //!
-//! The bytes come from [`dev::ata::Medium`](crate::dev::ata::Medium), the same
+//! The bytes come from [`dev::medium::Medium`](crate::dev::medium::Medium), the same
 //! seam an ATA drive's platter uses, so `--drive nvme0=disk.qcow2` works here
 //! for exactly the reason it works there and **no image format is parsed in
 //! this module** (`ROADMAP.md` §7.1). A `no_std` build gets a
@@ -100,7 +100,7 @@ use crate::core::space::{AddressSpace, MemAttrs, Perms, RamStore, Region, Region
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
 use crate::core::wire::WireSource;
-use crate::dev::ata::{Medium, Snapshot, medium};
+use crate::dev::medium::{self, Medium, Snapshot};
 use crate::machine::realize::{BindCtx, Instance};
 use crate::machine::validate::ClassSchema;
 
@@ -314,7 +314,7 @@ impl Nvme {
     ///
     /// # Where the bytes come from
     ///
-    /// The same two places an [`AtaDisk`](crate::dev::ata::AtaDisk)'s do, and
+    /// The same two places an `ata.disk`'s do, and
     /// the machine file names neither directly. It names a **media slot**
     /// (`image = "nvme0"`), and the run decides what is behind that name: a
     /// [`Medium`] the host installed — what
@@ -643,10 +643,17 @@ impl Device for Nvme {
         self.regs.bars.sync(self.regs.command(), true);
     }
 
+    fn flush(&self) -> Result<()> {
+        // What a shutdown notification through `CC.SHN` would have done, and
+        // for the same reason a drive's does: the guest is not obliged to ask,
+        // and the write it made still happened.
+        self.ctrl.namespace().flush()
+    }
+
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
         // The namespace first, on the terms the medium itself sets — the same
         // three policies an ATA drive's platter offers, and for the same
-        // reasons ([`Snapshot`](crate::dev::ata::Snapshot)). A `RamStore`
+        // reasons ([`Snapshot`](crate::dev::medium::Snapshot)). A `RamStore`
         // captures; a `dev::blk::Image` records which image it is and flushes
         // it, so what is on disk matches the moment the snapshot was taken.
         let ns = self.ctrl.namespace();

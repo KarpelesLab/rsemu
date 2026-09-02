@@ -254,8 +254,14 @@ pub static PC_AT: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/pc-at.machine"),
 };
 
-/// The same lineage stripped to its interrupt path: an x86, the two 8259As, a
-/// local APIC, an I/O APIC and an HPET, and almost nothing else.
+/// The same lineage stripped to its interrupt path: **two** x86s with a local
+/// APIC each, the two 8259As, an I/O APIC and an HPET, and almost nothing else.
+///
+/// It is the tree's multiprocessor board. The second processor is an
+/// application processor and does not execute the reset vector — its local APIC
+/// parks it in wait-for-SIPI at power-up, as the MP initialization protocol does
+/// (SDM Vol 3A 8.4.3) — so firmware starts it with the specification's
+/// `INIT`/Start-Up sequence or it never runs at all.
 ///
 /// `pc-at` carries all of that too, so this is not "the board with an APIC" —
 /// it is the board with *only* the parts an APIC question involves. No video,
@@ -272,7 +278,7 @@ pub static PC_AT: CatalogEntry = CatalogEntry {
 #[cfg_attr(docsrs, doc(cfg(feature = "machine-pc-apic")))]
 pub static PC_APIC: CatalogEntry = CatalogEntry {
     name: "pc-apic",
-    summary: "PC/AT interrupt path with the APIC fitted: x86, 8259As, local APIC, I/O APIC, HPET",
+    summary: "an SMP PC/AT interrupt path: two x86s, two local APICs, 8259As, I/O APIC, HPET",
     media: &["bios"],
     source: include_str!("../../machines/pc-apic.machine"),
 };

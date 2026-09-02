@@ -14,7 +14,15 @@ use fstool::block::{BlockDevice, CreateOpts, FileBackend, Qcow2Backend};
 use crate::core::error::{BusError, Result};
 use crate::core::space::MemResult;
 use crate::core::sync::{LockRank, Mutex};
-use crate::dev::ata::{Medium, Snapshot};
+use crate::dev::medium::{Medium, Snapshot};
+
+/// The unit an image's capacity has to be a whole number of.
+///
+/// 512 because every device on the [`Medium`] seam addresses its storage in
+/// 512-byte logical blocks — ATA's sector, NVMe's LBA at its default format,
+/// virtio-blk's `SECTOR_SIZE` — and an image that is not a whole number of them
+/// has a tail no guest can reach.
+const SECTOR: u64 = 512;
 
 use super::{config_error, media_error};
 
@@ -198,7 +206,7 @@ impl Image {
                 ),
             ));
         }
-        if !capacity.is_multiple_of(crate::dev::ata::disk::SECTOR) {
+        if !capacity.is_multiple_of(SECTOR) {
             return Err(config_error(
                 &describe,
                 &fstool::Error::InvalidArgument(alloc::format!(

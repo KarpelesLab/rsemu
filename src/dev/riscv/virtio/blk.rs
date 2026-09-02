@@ -23,8 +23,8 @@
 //!
 //! # The backing store is a `Medium`
 //!
-//! The same seam an [`AtaDisk`](crate::dev::ata::AtaDisk)'s platter and an NVMe
-//! namespace use — [`dev::ata::Medium`](crate::dev::ata::Medium) — and for the
+//! The same seam an `ata.disk`'s platter and an NVMe
+//! namespace use — [`dev::medium::Medium`](crate::dev::medium::Medium) — and for the
 //! same three reasons. A [`RamStore`](crate::core::space::RamStore) is what a
 //! machine file's media slot gives, which is `no_std` and is what a wasm build
 //! runs on; a [`dev::blk::Image`](crate::dev::blk) is a host file through
@@ -59,7 +59,7 @@ use alloc::vec::Vec;
 
 use crate::core::error::{Error, Result};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::dev::ata::{Medium, Snapshot};
+use crate::dev::medium::{Medium, Snapshot};
 
 use super::queue::{Descriptor, Queue};
 use super::{Backend, DEVICE_ID_BLOCK};
@@ -167,6 +167,17 @@ impl VirtioBlk {
     #[must_use]
     pub fn medium(&self) -> &Arc<dyn Medium> {
         &self.media
+    }
+
+    /// Make every write so far durable, as a `T_FLUSH` request does.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::State`] if the host refused.
+    pub fn flush(&self) -> Result<()> {
+        self.media
+            .flush()
+            .map_err(|e| Error::State(alloc::format!("virtio disk: {e}")))
     }
 
     /// Whether writes are refused.
@@ -351,6 +362,10 @@ impl Backend for VirtioBlk {
         // driver put it.
         let _ = q.write_chain(chain, writable - 1, &[status]);
         (written + 1) as u32
+    }
+
+    fn flush(&self) -> Result<()> {
+        VirtioBlk::flush(self)
     }
 
     fn reset(&self) {

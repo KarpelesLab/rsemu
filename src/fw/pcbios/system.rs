@@ -480,10 +480,20 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     // Historically ROM BASIC. There is none, so this says so and stops, with
     // interrupts on so a keystroke still reaches the buffer and a debugger
     // attached to the machine sees a live core rather than a shut-down one.
+    //
+    // **`STI` is what makes that true.** This is entered by an `INT`
+    // instruction, which clears `IF` (SDM Vol 2A, `INT n`), so a park loop that
+    // did not turn interrupts back on would `HLT` a processor nothing could
+    // wake: no timer tick, no keystroke, no `INT 09h` filling the buffer this
+    // comment promises, and a `HLT` with `IF` clear is the one shutdown state
+    // an x86 has no way out of but `RESET`. It is placed before the loop rather
+    // than inside it because `IF` stays set once set, and after `puts` so the
+    // message cannot be interleaved with a handler's own output.
     a.bind(l.int18);
     let no_disk = a.label();
     a.movi_label(SI, no_disk);
     a.call(l.puts);
+    a.sti();
     let park = a.here_label();
     a.hlt();
     a.jmp(park);

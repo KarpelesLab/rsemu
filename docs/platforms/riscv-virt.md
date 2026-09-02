@@ -115,7 +115,7 @@ build runs on.
 ## Booting off a qcow2
 
 The other path backs the same slot with a host **file**. `virtio.blk` stores
-its bytes behind `dev::ata::Medium`, the seam an ATA drive's platter and an
+its bytes behind `dev::medium::Medium`, the seam an ATA drive's platter and an
 NVMe namespace already use, so `--drive` works here for the reason it works
 there and no image format is parsed in rsemu — sparse raw, qcow2, DMG and LUKS
 all come from `fstool`.

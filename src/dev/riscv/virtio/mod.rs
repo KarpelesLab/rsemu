@@ -10,7 +10,7 @@
 //! | --- | --- |
 //! | [`queue`] | split virtqueues: descriptor chains, available and used rings |
 //! | [`mmio`] | the MMIO transport register block and the status handshake |
-//! | [`blk`] | virtio-blk (device ID 2), on the `dev::ata::Medium` seam |
+//! | [`blk`] | virtio-blk (device ID 2), on the `dev::medium::Medium` seam |
 //! | [`rng`] | virtio-rng (device ID 4), deterministically seeded |
 //!
 //! # Source, and one prohibition
@@ -38,7 +38,7 @@ use crate::core::error::Result;
 use crate::core::props::{Props, ValueKind};
 use crate::core::space::RamStore;
 use crate::core::state::{ChunkReader, ChunkWriter};
-use crate::dev::ata::Medium;
+use crate::dev::medium::Medium;
 
 use queue::{Descriptor, Queue};
 
@@ -98,6 +98,20 @@ pub trait Backend: Send + Sync + fmt::Debug {
     /// Return to the state a `Status` write of zero implies.
     fn reset(&self);
 
+    /// Push anything already accepted from the driver out to the host.
+    ///
+    /// [`Device::flush`] for a backend: the
+    /// transport has no host state of its own and forwards this to whatever is
+    /// behind it. An entropy source has nothing to do here; a block device has
+    /// its medium.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the host refused.
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Serialize whatever of this device is architectural state.
     ///
     /// # Errors
@@ -128,7 +142,7 @@ pub const DEFAULT_SLOT: &str = "disk";
 ///
 /// # Where the bytes come from
 ///
-/// The same two places an [`AtaDisk`](crate::dev::ata::AtaDisk)'s and an NVMe
+/// The same two places an `ata.disk`'s and an NVMe
 /// namespace's do, and the machine file names neither of them directly. It
 /// names a **media slot** (`image = "disk"`), and the run decides what is
 /// behind that name:
@@ -167,7 +181,7 @@ pub fn blk_from_props(props: &Props) -> Result<VirtioMmio> {
     let supplied = match props.hosts() {
         Some(hosts) => {
             let name = slot.unwrap_or(DEFAULT_SLOT);
-            crate::dev::ata::medium::get(hosts, name)?.and_then(|slot| slot.take())
+            crate::dev::medium::get(hosts, name)?.and_then(|slot| slot.take())
         }
         None => None,
     };
@@ -230,7 +244,7 @@ pub fn rng_from_props(props: &Props) -> Result<VirtioMmio> {
 pub static BLK_CLASS: DeviceClass = DeviceClass {
     name: BLK_CLASS_NAME,
     version: 1,
-    summary: "virtio block device on the MMIO transport, over a `dev::ata::Medium`",
+    summary: "virtio block device on the MMIO transport, over a `dev::medium::Medium`",
     properties: &[
         PropertySpec {
             name: "size",
@@ -341,7 +355,7 @@ mod tests {
         // capacity. A run that named an image file meant it.
         use crate::core::hosts::HostObjects;
         use crate::core::space::RamStore;
-        use crate::dev::ata::medium;
+        use crate::dev::medium;
 
         let hosts = alloc::sync::Arc::new(HostObjects::new());
         let store: Arc<dyn Medium> = Arc::new(RamStore::new(8 * 512));

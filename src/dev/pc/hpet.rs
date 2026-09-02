@@ -46,18 +46,28 @@
 //!   exactly the input the board actually wired. Writing another value is
 //!   recorded and changes nothing, which is the honest answer for a part whose
 //!   output pin is soldered.
-//! * **Legacy replacement route.** `LEG_RT_CNF` is implemented as far as this
-//!   part reaches: it is settable and reported, and timers 0 and 1 ignore their
-//!   route field while it is set — which they already do here. What it *also*
-//!   does on a real board is disconnect the 8254 from IRQ0 and the RTC from
-//!   IRQ8, and that is a gate on the board between three chips, not a register
-//!   in any of them. The gates now exist — `wire.and` and `wire.not` are
-//!   ordinary devices a machine file can instantiate
-//!   ([`machine::combinator`](crate::machine::combinator)) — but this part has
-//!   no *output pin* saying whether `LEG_RT_CNF` is set, so there is nothing
-//!   for a machine file to wire the enable to. That pin is the remaining piece;
-//!   until it exists a board that turns legacy replacement on will see both
-//!   timers on the line. Said out loud rather than left to be discovered.
+//! * **Legacy replacement route.** `LEG_RT_CNF` is settable and reported, and
+//!   timers 0 and 1 ignore their route field while it is set — which they
+//!   already do here. What it *also* does on a real board is disconnect the
+//!   8254 from IRQ0 and the RTC from IRQ8, and that is a gate on the board
+//!   between three chips rather than a register in any of them. So this part
+//!   drives an **output pin**, [`legacy`](Hpet::legacy_asserted), which is high
+//!   exactly while the bit is set, and a machine file gates the other two chips
+//!   with it through the ordinary wire combinators
+//!   ([`machine::combinator`](crate::machine::combinator)):
+//!
+//!   ```text
+//!   object leg  "wire.not" {}          # the 8254 and the RTC are cut off
+//!   object gate0 "wire.and" { inputs = 2 }
+//!   wire hpet0.legacy -> leg.in
+//!   wire leg.out      -> gate0.in0
+//!   wire pit0.out0    -> gate0.in1
+//!   wire gate0.out    -> pic1.ir0
+//!   ```
+//!
+//!   The pin is a level, not a strobe, and it is announced from state on the
+//!   realize sweep and after a snapshot restore, so a machine that comes up
+//!   with the bit already set comes up with its gates already shut.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -127,6 +137,9 @@ const REG_TIMER_STRIDE: u64 = 0x20;
 
 /// `ENABLE_CNF`: the main counter runs and interrupts are permitted (§2.3.5).
 const CONF_ENABLE: u64 = 1 << 0;
+/// The output pin that reports `LEG_RT_CNF` to the board.
+const LEGACY_PIN: &str = "legacy";
+
 /// `LEG_RT_CNF`: the legacy replacement route (§2.3.5).
 const CONF_LEGACY: u64 = 1 << 1;
 
@@ -309,6 +322,9 @@ struct Registers {
     /// One output pin per timer, at [`LockRank::LEAF`] so a line can be driven
     /// with nothing else held.
     outs: Mutex<[Option<WireSource>; TIMERS]>,
+    /// The `legacy` pin: `LEG_RT_CNF`, as a level a board can gate with. Same
+    /// rank and for the same reason.
+    legacy: Mutex<Option<WireSource>>,
     /// The catch-up handle the register paths sync through (§4.2).
     lazy: Mutex<Option<LazyHandle>>,
     /// The counter period this part reports, in femtoseconds.
@@ -360,6 +376,16 @@ impl Registers {
             } else {
                 source.set(Level::from_bool(level));
             }
+        }
+    }
+
+    /// Drive the `legacy` pin. No lock held on the way in, as [`drive`] is.
+    ///
+    /// [`drive`]: Registers::drive
+    fn drive_legacy(&self, high: bool) {
+        let source = self.legacy.lock().clone();
+        if let Some(source) = source {
+            source.set(Level::from_bool(high));
         }
     }
 
@@ -557,7 +583,7 @@ impl MemOps for Registers {
         }
         self.sync(attrs);
         let aligned = offset & !7;
-        let (levels, drive) = {
+        let (levels, drive, legacy) = {
             let mut state = self.state.lock();
             let old = self.read_register(&state, aligned);
             let value = match src.len() {
@@ -578,11 +604,22 @@ impl MemOps for Registers {
             self.publish(&state);
             // Only the status register can lower an output, and only from
             // inside this critical section, so the pins are re-driven for it
-            // and left alone otherwise.
-            (state.timers.map(|t| t.output), aligned == REG_STATUS)
+            // and left alone otherwise. `LEG_RT_CNF` is the general
+            // configuration register's, and it is a level either way, so what
+            // travels out of here is the level rather than "it changed".
+            (
+                state.timers.map(|t| t.output),
+                aligned == REG_STATUS,
+                (aligned == REG_CONF).then_some(state.conf & CONF_LEGACY != 0),
+            )
         };
         if drive {
             self.drive(levels, [false; TIMERS]);
+        }
+        // Outside the critical section, because this pin reaches a gate that
+        // reaches an interrupt controller (§4.7's re-entrancy contract).
+        if let Some(high) = legacy {
+            self.drive_legacy(high);
         }
         Ok(())
     }
@@ -653,6 +690,7 @@ impl Hpet {
         let regs = Arc::new(Registers {
             state: Mutex::with_rank(LockRank::DEVICE, state),
             outs: Mutex::with_rank(LockRank::LEAF, [const { None }; TIMERS]),
+            legacy: Mutex::with_rank(LockRank::LEAF, None),
             lazy: Mutex::with_rank(LockRank::LEAF, None),
             period_fs,
             vendor,
@@ -698,6 +736,12 @@ impl Hpet {
     }
 
     /// Which timer's output pin `port` names, if it names one.
+    /// Whether `LEG_RT_CNF` is set — what the `legacy` pin is driving.
+    #[must_use]
+    pub fn legacy_asserted(&self) -> bool {
+        self.regs.state.lock().conf & CONF_LEGACY != 0
+    }
+
     fn out_pin(port: &str) -> Option<usize> {
         let index: usize = port.strip_prefix('t')?.parse().ok()?;
         (index < TIMERS).then_some(index)
@@ -769,6 +813,9 @@ impl Device for Hpet {
             [false; TIMERS]
         };
         self.regs.drive(levels, [false; TIMERS]);
+        // `ENABLE_CNF` and `LEG_RT_CNF` are both zero after a reset (§2.3.5),
+        // so the board's gates open again and the 8254 has IRQ0 back.
+        self.regs.drive_legacy(false);
     }
 
     fn region(&self, name: &str) -> Option<RegionRef> {
@@ -776,15 +823,27 @@ impl Device for Hpet {
     }
 
     fn connect(&self, port: &str, source: WireSource) -> Result<()> {
+        if port == LEGACY_PIN {
+            *self.regs.legacy.lock() = Some(source);
+            return Ok(());
+        }
         let index = Hpet::out_pin(port).ok_or_else(|| Error::Config {
             at: port.to_string(),
-            message: String::from("an HPET drives one pin per timer, `t0` to `t2`"),
+            message: String::from("an HPET drives one pin per timer, `t0` to `t2`, plus `legacy`"),
         })?;
         self.regs.outs.lock()[index] = Some(source);
         Ok(())
     }
 
     fn announce(&self, port: &str) {
+        if port == LEGACY_PIN {
+            // Announced from state rather than assumed low: a restored machine
+            // may come up with `LEG_RT_CNF` already set, and a board whose
+            // gates disagreed with the register would put two timers on IRQ0.
+            let high = self.regs.state.lock().conf & CONF_LEGACY != 0;
+            self.regs.drive_legacy(high);
+            return;
+        }
         let Some(index) = Hpet::out_pin(port) else {
             return;
         };
@@ -905,7 +964,9 @@ pub fn schema() -> ClassSchema {
             .prop(PropSchema::new(format!("route{index}"), ValueKind::Uint).range(0, 31))
             .port(format!("t{index}"), PortDir::Out);
     }
-    schema
+    // The legacy replacement route, as a level a board can gate the 8254 and
+    // the RTC with.
+    schema.port(LEGACY_PIN, PortDir::Out)
 }
 
 #[cfg(test)]
@@ -915,10 +976,12 @@ mod tests {
     use crate::core::sync::{AtomicU32, Ordering as AtomicOrdering};
     use crate::core::wire::{Wire, WireId, WireIdAllocator, WireSink};
 
-    /// One HPET with all three outputs wired to probes.
+    /// One HPET with all three timer outputs and the `legacy` pin wired to
+    /// probes.
     struct Bench {
         hpet: Hpet,
         probes: [Arc<Probe>; TIMERS],
+        legacy: Arc<Probe>,
     }
 
     #[derive(Debug, Default)]
@@ -960,7 +1023,19 @@ mod tests {
             hpet.connect(&format!("t{index}"), WireSource::new(wire, src))
                 .expect("every timer has an output pin");
         }
-        Bench { hpet, probes }
+        let legacy = Arc::new(Probe::default());
+        let src = ids.alloc();
+        let wire = Wire::builder()
+            .source(src)
+            .sink(Arc::clone(&legacy) as Arc<dyn WireSink>, 0)
+            .build_shared();
+        hpet.connect(LEGACY_PIN, WireSource::new(wire, src))
+            .expect("and the legacy replacement route is a pin too");
+        Bench {
+            hpet,
+            probes,
+            legacy,
+        }
     }
 
     impl Bench {
@@ -991,6 +1066,74 @@ mod tests {
         fn enable(&self) {
             self.poke(REG_CONF, CONF_ENABLE);
         }
+    }
+
+    #[test]
+    fn the_legacy_replacement_route_is_a_pin_the_board_can_gate_with() {
+        // `LEG_RT_CNF` disconnects the 8254 from IRQ0 and the RTC from IRQ8
+        // (IA-PC HPET specification 2.3.5), which is a gate on the *board*
+        // between three chips rather than a register in any of them. This part
+        // can only say whether the bit is set; a machine file does the rest
+        // with `wire.not` and `wire.and`.
+        let b = bench();
+        assert!(!b.legacy.high(), "clear out of reset");
+        assert!(!b.hpet.legacy_asserted());
+
+        b.poke(REG_CONF, CONF_ENABLE | CONF_LEGACY);
+        assert!(b.legacy.high(), "the write raised the pin");
+        assert!(b.hpet.legacy_asserted());
+        assert_eq!(b.peek(REG_CONF) & CONF_LEGACY, CONF_LEGACY);
+
+        // Enabling the counter is not a legacy write, and the pin is a level:
+        // it does not pulse and it does not follow the other bit.
+        let edges = b.legacy.edges();
+        b.poke(REG_CONF, CONF_LEGACY);
+        assert!(b.legacy.high());
+        assert_eq!(b.legacy.edges(), edges, "a level, not a strobe");
+
+        b.poke(REG_CONF, CONF_ENABLE);
+        assert!(!b.legacy.high(), "and clearing the bit drops it again");
+        assert!(!b.hpet.legacy_asserted());
+    }
+
+    #[test]
+    fn a_reset_opens_the_boards_gates_again() {
+        let b = bench();
+        b.poke(REG_CONF, CONF_LEGACY);
+        assert!(b.legacy.high());
+        b.hpet.reset(ResetKind::Cold);
+        assert!(
+            !b.legacy.high(),
+            "ENABLE_CNF and LEG_RT_CNF are both zero after a reset (2.3.5)"
+        );
+    }
+
+    #[test]
+    fn a_restored_machine_announces_the_route_it_came_back_with() {
+        // The realize sweep asks every source what level it drives, and a
+        // machine restored with `LEG_RT_CNF` set must answer high — otherwise
+        // the board's gates and the register disagree and two timers end up on
+        // IRQ0.
+        let b = bench();
+        b.poke(REG_CONF, CONF_LEGACY);
+        let mut shape = MachineShape::new();
+        shape.add_device("hpet", CLASS.name).unwrap();
+        let mut w = StateWriter::new(shape);
+        {
+            let mut chunk = w.chunk("hpet", CLASS.name, CLASS.version).unwrap();
+            b.hpet.save(&mut chunk).unwrap();
+        }
+        let bytes = w.to_vec().unwrap();
+
+        let restored = bench();
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("hpet", CLASS.name, CLASS.version, &Migrations::new())
+            .unwrap();
+        restored.hpet.load(&mut chunk.reader()).unwrap();
+        assert!(restored.hpet.legacy_asserted(), "the bit came back");
+        restored.hpet.announce(LEGACY_PIN);
+        assert!(restored.legacy.high(), "and so did the pin");
     }
 
     #[test]

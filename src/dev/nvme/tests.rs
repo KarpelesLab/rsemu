@@ -15,7 +15,7 @@ use crate::core::space::{AddressSpace, MemOps, RamStore, Region, RequesterId, Un
 use crate::core::state::{ChunkReader, MachineShape, Migrations, StateReader, StateWriter};
 use crate::core::value::Width;
 use crate::core::wire::{Level, Resolve, Wire, WireIdAllocator, WireSource};
-use crate::dev::ata::Medium;
+use crate::dev::medium::Medium;
 
 /// Where guest RAM starts. Not zero, so that a null pointer in a command is a
 /// bus fault the controller has to survive rather than a plausible read.

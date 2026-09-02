@@ -199,3 +199,68 @@ fn a_pin_a_gate_does_not_have_is_reported_by_name() {
     .expect_err("a misspelt property");
     assert!(e.contains("inpts"), "{e}");
 }
+
+/// The HPET's legacy replacement route, gating a chip off an interrupt line.
+///
+/// This is what the combinators are *for*, and the case `ROADMAP.md` §4.3 and
+/// `src/dev/pc/hpet.rs` both name: `LEG_RT_CNF` disconnects the 8254 from IRQ0
+/// and the RTC from IRQ8 (IA-PC HPET specification 2.3.5), which is a gate on
+/// the board between three chips rather than a register in any of them. The
+/// HPET says whether the bit is set on its `legacy` pin and the machine file
+/// does the rest.
+///
+/// `pc.sysctl`'s `gate2` stands in for the 8254's output and its `timer2` input
+/// for the interrupt controller, because those two are the only pins on this
+/// board a guest can drive and read from the far side of a gate.
+#[test]
+#[cfg(feature = "dev-pc-hpet")]
+fn an_hpets_legacy_route_gates_a_timer_off_its_line() {
+    let mut m = assemble(
+        r#"machine "hpetgate" {
+  osc hpet = 10000000 Hz
+  space mem  { width = 32, unassigned = read-as-ones }
+  space port { width = 16, unassigned = read-as-ones }
+  object sysctl "pc.sysctl" {}
+  object hpet0 "pc.hpet" { clock = hpet, period = 100000000 }
+  object inv "wire.not" {}
+  object gate "wire.and" { inputs = 2 }
+  map mem 0xfed00000 size 0x0400 = hpet0.regs
+  map port 0x0061 size 0x0001 = sysctl.portb
+  wire hpet0.legacy -> inv.in
+  wire inv.out      -> gate.in0
+  wire sysctl.gate2 -> gate.in1
+  wire gate.out     -> sysctl.timer2
+}"#,
+    )
+    .expect("the board realizes");
+    m.reset(ResetKind::Cold);
+    m.sweep();
+
+    // The line as it is on every PC that has ever booted: legacy replacement
+    // off, so the timer's output reaches the controller.
+    outb(&m, 0x61, GATE2);
+    assert_eq!(
+        inb(&m, 0x61) & TIMER2_IN,
+        TIMER2_IN,
+        "with LEG_RT_CNF clear the timer drives the line"
+    );
+
+    // `LEG_RT_CNF`, written where a driver writes it: bit 1 of the general
+    // configuration register at offset 0x10.
+    let mem = m.space("mem").expect("the memory space");
+    mem.write(0xfed0_0010, Width::U32, 0b10, MemAttrs::DEFAULT)
+        .expect("the general configuration register");
+    assert_eq!(
+        inb(&m, 0x61) & TIMER2_IN,
+        0,
+        "the HPET took the line over and nothing disconnected the 8254"
+    );
+
+    mem.write(0xfed0_0010, Width::U32, 0, MemAttrs::DEFAULT)
+        .expect("the general configuration register");
+    assert_eq!(
+        inb(&m, 0x61) & TIMER2_IN,
+        TIMER2_IN,
+        "and clearing it gives the line back"
+    );
+}

@@ -479,6 +479,42 @@ impl Machine {
         self.sweep();
     }
 
+    /// Push every device's host-visible state out to the host.
+    ///
+    /// What a run ends with. A drive that took a write and has not been asked
+    /// to flush it is entitled to hold it — that is a write cache, and it is
+    /// what the hardware does — but the entitlement lasts as long as the
+    /// machine does, and nothing else in this process is going to write those
+    /// bytes. So the machine says so once, here, when it stops.
+    ///
+    /// Every device is asked even after one fails, because a failure on `hd0`
+    /// is no reason to lose `hd1`; the first error is what comes back. The
+    /// order is the machine description's, as [`reset`](Machine::reset)'s is
+    /// and for the same reason.
+    ///
+    /// **Not** part of a snapshot: a device whose medium is snapshotted by
+    /// reference flushes it in its own `save`, because that reference is only
+    /// worth something if the file holds what the guest had written by the
+    /// moment the snapshot was taken.
+    ///
+    /// # Errors
+    ///
+    /// The first [`Device::flush`] that refused.
+    pub fn flush(&self) -> Result<()> {
+        let mut first = None;
+        for entry in &self.devices {
+            if let Err(e) = entry.device.flush()
+                && first.is_none()
+            {
+                first = Some(e);
+            }
+        }
+        match first {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     /// The realize sweep: walk wire sources in topological order and announce
     /// the level each drives (§4.3).
     ///

@@ -7,8 +7,8 @@
 
 use super::*;
 use crate::core::error::BusError;
-use crate::dev::ata::Medium;
 use crate::dev::blk::{bus_error, media_error};
+use crate::dev::medium::Medium;
 use alloc::vec;
 use fstool::block::{CrashInject, FailAfter, MemoryBackend};
 use std::path::PathBuf;
@@ -64,8 +64,9 @@ fn a_read_only_image_refuses_writes_with_protected_not_bad_access() {
     // The distinction matters: `Protected` is what the drive turns into ABRT,
     // and `BadAccess` is what it turns into IDNF. A write-protected drive that
     // told a guest "no such sector" would be lying about its geometry.
+    #[cfg(feature = "dev-ata-disk")]
     assert_eq!(
-        crate::dev::ata::medium::error_bit(BusError::Protected),
+        crate::dev::ata::disk::error_bit(BusError::Protected),
         crate::dev::ata::disk::ERR_ABRT
     );
     // And a flush on a drive that cannot be written succeeds, because nothing
@@ -213,8 +214,9 @@ fn a_corrupt_image_is_uncorrectable_rather_than_a_missing_sector() {
     };
     assert_eq!(bus_error(&corrupt), BusError::BadAccess);
     assert_eq!(media_error(&corrupt), BusError::Unassigned);
+    #[cfg(feature = "dev-ata-disk")]
     assert_eq!(
-        crate::dev::ata::medium::error_bit(media_error(&corrupt)),
+        crate::dev::ata::disk::error_bit(media_error(&corrupt)),
         crate::dev::ata::disk::ERR_UNC
     );
     // Everything else is unchanged by the narrowing.
