@@ -32,6 +32,29 @@
 //! Indices `0x00`-`0x0d` are the clock and its four status registers;
 //! `0x0e`-`0x7f` are ordinary battery-backed RAM.
 //!
+//! # How much memory the board has, in two pieces
+//!
+//! The memory-size bytes are the part of the RAM half that is easiest to get
+//! wrong, because there are four pairs and they are not four numbers:
+//!
+//! ```text
+//!   0x15/0x16  base memory, in KiB          — the 640 KiB below the video hole
+//!   0x17/0x18  extended memory, in KiB      — the AT's own pair
+//!   0x30/0x31  extended memory, in KiB      — the copy POST compares against it
+//!   0x34/0x35  memory above 16 MiB, in 64 KiB units
+//! ```
+//!
+//! `0x17`/`0x18` and `0x30`/`0x31` hold the **same** number, and that number
+//! covers the 1-16 MiB region **only** — at most 0x3c00 KiB. Everything above
+//! 16 MiB is counted in `0x34`/`0x35` instead, and firmware adds the two. That
+//! is the same partition `INT 15h AX=E801h` reports (AX/CX the kilobytes to
+//! 16 MiB, BX/DX the 64 KiB blocks above it), which is not a coincidence: the
+//! CMOS pairs are where an `E801` answer is kept between boots, and
+//! [`crate::fw::pcbios`] reads them exactly that way for both `E801` and its
+//! `E820` map. So the [`extmem`](CLASS) property is *all* the memory above
+//! 1 MiB and this module does the split; two properties would be two numbers
+//! that could disagree.
+//!
 //! # A real-time clock that does not track real time
 //!
 //! **This clock does not read the host's.** `CLAUDE.md` forbids a device
@@ -276,14 +299,21 @@ const DEFAULT_EQUIPMENT: u8 = 0x2d;
 /// The floppy byte's default: one 1.44 MB drive as A, nothing as B.
 const DEFAULT_FLOPPY: u8 = 0x40;
 
-/// The largest extended-memory figure the two CMOS bytes are allowed to hold.
+/// How much extended memory the kilobyte pairs describe: the 15 MiB between
+/// 1 MiB and 16 MiB, and not a byte more.
 ///
-/// 65280 KiB is 0xff00, the cap every BIOS applies: the word is 16 bits and the
-/// top page is reserved, so anything larger is reported through `0x34`/`0x35`
-/// instead. A machine with more memory is clamped here rather than refused —
-/// which is what real firmware does, and the guest finds the rest by other
-/// means.
-const EXT_MEM_MAX_KIB: u64 = 65_280;
+/// 0x3c00 KiB, and it is a *window* rather than a saturating cap. Above 16 MiB
+/// the count continues in [`REG_HIGH_MEM`] in 64 KiB units, and firmware adds
+/// the two — which is the same split `INT 15h AX=E801h` hands a caller (AX/CX
+/// the 1-16 MiB region in KiB, capped at 3C00h; BX/DX everything above 16 MiB
+/// in 64 KiB blocks), because the CMOS pairs are where an `E801` answer is
+/// kept. Letting this pair saturate at 0xff00 instead would double-count the
+/// 15 MiB the two pairs both claim, or — with `0x34`/`0x35` left at zero —
+/// simply lose every megabyte above 64 MiB.
+const EXT_MEM_WINDOW_KIB: u64 = 15 * 1024;
+
+/// The unit [`REG_HIGH_MEM`] counts in: 64 KiB blocks above 16 MiB.
+const HIGH_MEM_UNIT: u64 = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // the calendar
@@ -659,6 +689,48 @@ impl Default for Seed {
     }
 }
 
+/// Split extended memory across the two register pairs that report it.
+///
+/// Returns the kilobytes for `0x17`/`0x18` and `0x30`/`0x31`, and the 64 KiB
+/// units above 16 MiB for `0x34`/`0x35`.
+///
+/// # Why a split and not one number
+///
+/// Neither pair is in the data sheet — `0x0e`-`0x3f` is 50 bytes of
+/// general-purpose RAM as far as the MC146818 is concerned (data sheet, address
+/// map), so all of this is BIOS convention. The convention is the one
+/// `INT 15h AX=E801h` returns, and it is a *partition*, not a value and a
+/// bigger value: the kilobyte pair describes the 1-16 MiB region only, capped
+/// at 3C00h, and everything above 16 MiB is counted separately in 64 KiB
+/// blocks. Firmware adds them. A model that saturated the kilobyte pair at
+/// 0xff00 and left the block count at zero — which is what this did — reports
+/// 63.75 MiB for any board with more than 64 MiB, and reports the 1-16 MiB
+/// region twice for any board that also filled `0x34`/`0x35`.
+///
+/// Anything below a whole unit of either register is rounded **down**: a guest
+/// told about memory that is not there is a fault, and one told about slightly
+/// less than is there is not.
+///
+/// # Errors
+///
+/// [`Error::Property`] if `bytes` is more than the two pairs together can say.
+/// Clamping would be a silent loss of gigabytes; the next rung of the same
+/// convention is `0x5b`-`0x5d`, which nothing on these boards reads.
+fn split_extended(bytes: u64) -> Result<(u16, u16)> {
+    let window = bytes.min(EXT_MEM_WINDOW_KIB * 1024);
+    let above = (bytes - window) / HIGH_MEM_UNIT;
+    if above > u64::from(u16::MAX) {
+        let max = EXT_MEM_WINDOW_KIB * 1024 + u64::from(u16::MAX) * HIGH_MEM_UNIT;
+        return Err(Error::Property(format!(
+            "property `extmem`: {bytes} bytes above 1 MiB does not fit the CMOS bytes that report \
+             it; 0x17/0x18 and 0x30/0x31 hold the {EXT_MEM_WINDOW_KIB} KiB up to 16 MiB and \
+             0x34/0x35 holds {} 64 KiB blocks above it, so at most {max} bytes",
+            u16::MAX
+        )));
+    }
+    Ok(((window / 1024) as u16, above as u16))
+}
+
 /// Write a little-endian 16-bit value into two CMOS bytes.
 fn put16(cmos: &mut [u8; CMOS_BYTES], at: usize, value: u16) {
     cmos[at] = value as u8;
@@ -980,7 +1052,6 @@ impl Rtc146818 {
         let time = r.or_str("time", DEFAULT_TIME)?;
         let base_mem = r.or_size("basemem", DEFAULT_BASE_MEM)?;
         let ext_mem = r.or_size("extmem", 0)?;
-        let high_mem = r.or_size("highmem", 0)?;
         let equipment = r.or_range("equipment", u64::from(DEFAULT_EQUIPMENT), 0..=255)?;
         let floppy = r.or_range("floppy", u64::from(DEFAULT_FLOPPY), 0..=255)?;
         let century: Option<u64> = r.optional("century")?;
@@ -994,11 +1065,10 @@ impl Rtc146818 {
                 u16::MAX
             )));
         }
-        // Extended memory is clamped rather than refused, because that is what
-        // firmware does with it: the word saturates and the machine reports the
-        // rest through `0x34`/`0x35`.
-        let ext_kib = (ext_mem / 1024).min(EXT_MEM_MAX_KIB) as u16;
-        let high_units = (high_mem / (64 * 1024)).min(u64::from(u16::MAX)) as u16;
+        // One size in, two register pairs out. `extmem` is *all* the memory
+        // above 1 MiB, and the split between the pairs is arithmetic rather
+        // than a second property, so the two cannot be made to disagree.
+        let (ext_kib, high_units) = split_extended(ext_mem)?;
 
         let mut now = parse_time(time)?;
         if let Some(century) = century {
@@ -1127,14 +1197,8 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "extmem",
             kind: ValueKind::Size,
             required: false,
-            summary: "memory above 1M, in kilobytes at CMOS 0x17/0x18 and 0x30/0x31, capped at \
-                      65280K",
-        },
-        PropertySpec {
-            name: "highmem",
-            kind: ValueKind::Size,
-            required: false,
-            summary: "memory above 16M, in 64K units at CMOS 0x34/0x35 (default 0)",
+            summary: "all memory above 1M: kilobytes up to 16M at CMOS 0x17/0x18 and 0x30/0x31, \
+                      the rest in 64K units at 0x34/0x35",
         },
         PropertySpec {
             name: "equipment",
@@ -1346,7 +1410,6 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("time", ValueKind::Str))
         .prop(PropSchema::new("basemem", ValueKind::Size))
         .prop(PropSchema::new("extmem", ValueKind::Size))
-        .prop(PropSchema::new("highmem", ValueKind::Size))
         .prop(PropSchema::new("equipment", ValueKind::Uint).range(0, 255))
         .prop(PropSchema::new("floppy", ValueKind::Uint).range(0, 255))
         .prop(PropSchema::new("century", ValueKind::Uint).range(0, 99))
@@ -1741,23 +1804,40 @@ mod tests {
         assert_ne!(sum, 0);
     }
 
+    /// What a firmware adds up when it wants the size of extended memory:
+    /// the kilobytes at `0x30`/`0x31` plus the 64 KiB blocks at `0x34`/`0x35`.
+    ///
+    /// This is `src/fw/pcbios`'s own arithmetic — `post.rs` builds the E820
+    /// entry for memory above 1 MiB exactly this way, and `system.rs` answers
+    /// `INT 15h AX=E801h` out of the same two pairs. It is not this model's
+    /// convention to choose, which is why the sum is written out here rather
+    /// than being asserted against a number the model computed.
+    fn extended_as_firmware_sees_it(d: &Rtc146818) -> u64 {
+        let kib = u64::from(d.cmos(REG_EXT_MEM_MIRROR as u8))
+            | u64::from(d.cmos(REG_EXT_MEM_MIRROR as u8 + 1)) << 8;
+        let blocks =
+            u64::from(d.cmos(REG_HIGH_MEM as u8)) | u64::from(d.cmos(REG_HIGH_MEM as u8 + 1)) << 8;
+        kib * 1024 + blocks * HIGH_MEM_UNIT
+    }
+
     #[test]
     fn the_memory_properties_land_where_the_bios_looks_for_them() {
         let d = Rtc146818::new(
             &Props::new()
                 .with("extmem", Value::Size(64 * 1024 * 1024))
-                .with("highmem", Value::Size(1024 * 1024 * 1024))
                 .with("time", "1999-12-31T23:59:59"),
         )
         .expect("a legal configuration");
-        // 64 MiB above 1 MiB is 65536 KiB, over the cap: firmware clamps.
+        // The kilobyte pair describes the 1-16 MiB region and stops there.
         let ext = u16::from(d.cmos(REG_EXT_MEM as u8)) | u16::from(d.cmos(0x18)) << 8;
-        assert_eq!(u64::from(ext), EXT_MEM_MAX_KIB);
+        assert_eq!(u64::from(ext), EXT_MEM_WINDOW_KIB);
         let mirror = u16::from(d.cmos(REG_EXT_MEM_MIRROR as u8)) | u16::from(d.cmos(0x31)) << 8;
         assert_eq!(ext, mirror, "0x30/0x31 is extended memory, not base memory");
-        // 1 GiB in 64 KiB units.
+        // And the 49 MiB above 16 MiB is in the block pair, so the sum comes
+        // back out whole.
         let high = u16::from(d.cmos(REG_HIGH_MEM as u8)) | u16::from(d.cmos(0x35)) << 8;
-        assert_eq!(u64::from(high) * 64 * 1024, 1024 * 1024 * 1024);
+        assert_eq!(u64::from(high) * HIGH_MEM_UNIT, 49 * 1024 * 1024);
+        assert_eq!(extended_as_firmware_sees_it(&d), 64 * 1024 * 1024);
         assert_eq!(d.cmos(REG_CENTURY), 0x19);
 
         // The set `machines/pc-at.machine` actually passes, so that a change
@@ -1771,7 +1851,44 @@ mod tests {
         .expect("the board's configuration");
         let ext = u16::from(board.cmos(REG_EXT_MEM as u8)) | u16::from(board.cmos(0x18)) << 8;
         assert_eq!(ext, 15 * 1024);
+        assert_eq!(board.cmos(REG_HIGH_MEM as u8), 0, "nothing is above 16 MiB");
         assert_eq!(board.cmos(REG_BASE_MEM as u8), 640u16 as u8);
+    }
+
+    /// The q35 board's 128 MiB, which is where this was found: firmware read
+    /// the CMOS and reported `RamSize: 0x040c0000` — 64 MiB + 768 KiB — because
+    /// the kilobyte pair had saturated at 0xff00 and `0x34`/`0x35` was zero.
+    #[test]
+    fn a_board_with_more_than_64_mib_reports_all_of_it() {
+        for extmem in [
+            15 * 1024 * 1024,       // exactly the window, nothing above
+            16 * 1024 * 1024,       // one megabyte over the 16 MiB line
+            64 * 1024 * 1024,       // where the old saturating cap bit
+            128 * 1024 * 1024,      // `machines/q35.machine`
+            2 * 1024 * 1024 * 1024, // and a board a kilobyte pair cannot say
+        ] {
+            let d = Rtc146818::new(
+                &Props::new()
+                    .with("time", DEFAULT_TIME)
+                    .with("extmem", Value::Size(extmem)),
+            )
+            .expect("a legal configuration");
+            assert_eq!(
+                extended_as_firmware_sees_it(&d),
+                extmem,
+                "a board with {extmem} bytes above 1 MiB must not lose any of it in the CMOS"
+            );
+        }
+    }
+
+    #[test]
+    fn extended_memory_the_two_pairs_cannot_say_is_refused_rather_than_clamped() {
+        let max = EXT_MEM_WINDOW_KIB * 1024 + u64::from(u16::MAX) * HIGH_MEM_UNIT;
+        assert!(split_extended(max).is_ok());
+        assert!(
+            Rtc146818::new(&Props::new().with("extmem", Value::Size(max + HIGH_MEM_UNIT))).is_err(),
+            "silently dropping 4 GiB of a guest's memory is worse than refusing to boot"
+        );
     }
 
     #[test]
