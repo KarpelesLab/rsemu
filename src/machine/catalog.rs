@@ -364,6 +364,32 @@ pub static NVME_MINI: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/nvme-mini.machine"),
 };
 
+/// The smallest board a real USB storage driver can run on, when this build has
+/// an EHCI and a USB disk.
+///
+/// A synthetic board rather than a product: a RISC-V hart, RAM, a PLIC, an EHCI
+/// host controller and a `usb.storage` device in its one root port. It exists so
+/// that `usb.storage` has somewhere a driver can reach it the way a driver does
+/// — reset the port, enumerate over the default pipe, then push a Command Block
+/// Wrapper out of a bulk endpoint and pull a sector and a Command Status Wrapper
+/// back in, with the controller's completion interrupt travelling a real wire
+/// into a real interrupt controller.
+///
+/// **It has a processor and `nvme-mini` does not**, and the difference is the
+/// device: an NVMe command completes inside the doorbell write that submitted
+/// it, while an EHCI's schedule runs on its own clock a microframe at a time, so
+/// the claim worth making about one needs a program executing. The `firmware`
+/// slot takes that program; the `usb0` slot takes the disk's contents.
+#[cfg(feature = "machine-usb-mini")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-usb-mini")))]
+pub static USB_MINI: CatalogEntry = CatalogEntry {
+    name: "usb-mini",
+    summary: "a minimal board with an EHCI and a USB mass storage device: a RISC-V hart, RAM, \
+              a PLIC",
+    media: &["firmware", "usb0"],
+    source: include_str!("../../machines/usb-mini.machine"),
+};
+
 /// A minimal MC68000 board, when this build has a 68000.
 ///
 /// A synthetic board rather than a product: a big-endian 24-bit space, ROM at
@@ -442,6 +468,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&SPI_FLASH);
     #[cfg(feature = "machine-stm32f407")]
     out.push(&STM32F407);
+    #[cfg(feature = "machine-usb-mini")]
+    out.push(&USB_MINI);
     #[cfg(feature = "machine-z80-mini")]
     out.push(&Z80_MINI);
     out
@@ -535,7 +563,8 @@ pub fn registry() -> Result<Registry> {
         feature = "dev-usb-ehci",
         feature = "dev-usb-chipidea",
         feature = "dev-usb-dwc2",
-        feature = "dev-usb-hid"
+        feature = "dev-usb-hid",
+        feature = "dev-usb-msd"
     ))]
     crate::dev::usb::register(&mut reg)?;
     Ok(reg)
@@ -634,7 +663,8 @@ pub fn bindings() -> Result<Bindings> {
         feature = "dev-usb-ehci",
         feature = "dev-usb-chipidea",
         feature = "dev-usb-dwc2",
-        feature = "dev-usb-hid"
+        feature = "dev-usb-hid",
+        feature = "dev-usb-msd"
     ))]
     crate::dev::usb::bind(&mut b)?;
     Ok(b)
@@ -748,7 +778,8 @@ pub fn classes() -> ClassTable {
         feature = "dev-usb-ehci",
         feature = "dev-usb-chipidea",
         feature = "dev-usb-dwc2",
-        feature = "dev-usb-hid"
+        feature = "dev-usb-hid",
+        feature = "dev-usb-msd"
     ))]
     for schema in crate::dev::usb::schemas() {
         table.insert(schema);
@@ -1433,6 +1464,18 @@ mod tests {
                 0x09, 0x00, 0x00, 0x00, // PC = 0x00000008 | 1
                 0xfe, 0xe7, // b .
             ],
+            // `jal x0, 0` — the RV32 jump-to-itself, which is the whole
+            // four-byte program needed to prove the board realizes and the hart
+            // fetches. `tests/usb_msd.rs` supplies the one that enumerates a
+            // disk and moves a sector.
+            #[cfg(feature = "machine-usb-mini")]
+            ("usb-mini", "firmware") => &[0x6f, 0x00, 0x00, 0x00],
+            // No default disk contents, which leaves the `capacity` in the
+            // machine file to supply a blank one — exactly as `nvme-mini` and
+            // `ahci-mini` get, and a run that means something else says
+            // `--drive usb0=disk.img`.
+            #[cfg(feature = "machine-usb-mini")]
+            ("usb-mini", "usb0") => &[],
             // `JR -2` — the Z80 branch-to-self, which is the whole two-byte
             // program needed to prove the board realizes and the core fetches.
             // `tests/z80_mini_board.rs` supplies the one that does something.

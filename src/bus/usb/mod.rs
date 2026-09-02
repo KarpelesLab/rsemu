@@ -57,9 +57,10 @@
 //! [`Peripheral`] deliberately is *not*, since `Peripheral` answers USB 2.0 §9.4
 //! inside the emulator.
 //!
-//! Two things had to be *added* here, and one promise had to be corrected. They
-//! are worth naming because they are the whole difference between the two
-//! directions — the transaction seam itself did not move at all:
+//! Three things had to be *added* here over time, and one promise had to be
+//! corrected. They are worth naming because two of them are the whole difference
+//! between the two directions and the third is what a real device class asked
+//! for — the transaction seam itself has never moved:
 //!
 //! * [`UsbDevice::start_of_frame`] — a `SOF` is the one thing on the wire that
 //!   is neither a transaction nor a reset, and a modelled peripheral never
@@ -72,6 +73,13 @@
 //!   rewritten the three stages of a control transfer. [`ControlTransfer`] is
 //!   those three stages, once, driven one transaction per call so the caller
 //!   keeps the clock.
+//! * [`Function::halt_cleared`] — the *third* addition, and it came from the
+//!   other end of the tree: [`crate::dev::usb::msd`] halts a bulk pipe itself,
+//!   as a protocol signal, and USB Mass Storage's Bulk-Only Transport §3.1 says
+//!   that stall survives the class reset and is cleared only by the host's
+//!   `CLEAR_FEATURE`. A [`Function`] had no way to hear about that request,
+//!   because [`Endpoint0`] answers it. Additive and defaulted, like the last
+//!   two, so nothing else changed.
 //! * The correction is [`UsbDevice::speed`]'s own documentation, just below: it
 //!   promised a device's speed was fixed for its lifetime, which is true of a
 //!   mouse and false of a gadget whose firmware writes `DCFG.DSPD`. No code
@@ -103,10 +111,21 @@
 //!
 //! * **Hubs.** The fabric has the port model a hub needs (connect, enable,
 //!   speed, reset) and a hub device model would be an ordinary [`Function`]
-//!   with downstream ports. What it would *also* need is EHCI split
-//!   transactions (`SPLIT` tokens, the `µFrame C-mask` in a queue head, and the
-//!   `siTD`), and none of that exists. So there is no hub, and a tiered bus is
-//!   not modelled.
+//!   with downstream ports — plus the hub class requests and the status-change
+//!   endpoint of USB 2.0 §11.
+//!
+//!   What is genuinely missing is **routing**: [`UsbBus::find`] searches a flat
+//!   list of enabled ports, so a device behind a hub has nowhere to be. That is
+//!   the work, and it is the fabric's rather than a device model's.
+//!
+//!   An earlier note here said a hub would *also* need EHCI split transactions,
+//!   and that is **too strong** — split transactions (`SPLIT` tokens, a queue
+//!   head's `µFrame C-mask`, the `siTD`) are what a **high-speed hub carrying a
+//!   full- or low-speed device** needs (USB 2.0 §11.14, EHCI 1.0 §4.12). A
+//!   high-speed hub with high-speed devices behind it needs none of them. So the
+//!   obstacle to a hub is smaller than it was written to be, and the obstacle to
+//!   a hub that is any *use* — one that lets a full-speed device reach an EHCI
+//!   at last — is the transaction translator.
 //! * **Host passthrough.** Sharing a real device from the host is a
 //!   [`UsbDevice`] implementor living under `host/` and nothing more, which is
 //!   why the seam is shaped this way. It is not started here: on Linux the

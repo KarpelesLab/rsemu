@@ -331,6 +331,42 @@ dev-usb-dwc2 = ["bus-usb"]
 # Tables. Needs `bus-usb`.
 dev-usb-hid = ["bus-usb"]
 
+# A USB mass storage device (src/dev/usb/msd.rs): **Bulk-Only Transport and a
+# SCSI command set over two bulk endpoints, with a real medium behind it**. This
+# is the feature that makes USB reach the storage stack — the disk is a
+# `dev::ata::Medium`, the same seam an ATA drive, an AHCI port and an NVMe
+# namespace read and write, so `rsemu run … --drive usb0=disk.qcow2` puts a
+# sparse qcow2 behind a USB stick for the same reason and through the same media
+# slot it puts one behind SATA.
+#
+# It needs **no new host controller**: Bulk-Only is two bulk endpoints and the
+# default pipe, and `dev-usb-ehci` already walks bulk queue heads, keeps data
+# toggles, honours short packets and turns a STALL into a halted qTD. A guest
+# driver therefore reaches this device through a controller finished before it
+# existed, which is the test of whether `bus-usb`'s transaction seam was the
+# right shape.
+#
+# Covers the CBW and CSW wire formats, the three phases, `Get Max LUN` and the
+# Bulk-Only Mass Storage Reset, **all thirteen** of the host/device data-transfer
+# cases including the six phase-error ones, and the two endpoint stalls that
+# survive a class reset and are cleared only by CLEAR_FEATURE — the reason
+# `bus-usb`'s `Function` grew a `halt_cleared` hook. The command set is
+# TEST UNIT READY, REQUEST SENSE with fixed-format sense data, INQUIRY with vital
+# product data pages 00h and 80h, MODE SENSE (6) and (10), READ CAPACITY (10)
+# and (16), REPORT LUNS, VERIFY (10), SYNCHRONIZE CACHE, and READ/WRITE in their
+# 6-, 10-, 12- and 16-byte forms.
+#
+# **Nothing is ever sized from a number the guest chose.** A CBW is one 31-byte
+# packet or it is not a CBW, a transfer length is a cursor into the medium rather
+# than a buffer, every allocation length is clamped, and every logical block
+# address is checked in u64 with `checked_add`; `fuzz/fuzz_targets/usb_msd.rs`
+# is why. Written from the freely available USB Mass Storage Class Bulk-Only
+# Transport 1.0 and Specification Overview 1.4, and from Seagate's published SCSI
+# Commands Reference Manual for the command formats; no emulator and no operating
+# system's usb-storage or SCSI driver was opened (ROADMAP.md §1). Needs `bus-usb`
+# for the fabric and `dev-ata-disk` for the `Medium` seam.
+dev-usb-msd = ["bus-usb", "dev-ata-disk"]
+
 # The Sitronix ST7272A (src/dev/sitronix): a 320RGBx240 dual-gate TFT panel
 # driver, configured over 3-wire SPI. Its **SPI carries registers only** —
 # power, gamma, contrast, brightness, scan direction, standby — while pixels
@@ -638,6 +674,21 @@ cpu-z80 = []
 # answers the acknowledge cycle, and there is none to wire yet. Adds no
 # dependencies.
 machine-z80-mini = ["cpu-z80"]
+
+# The `usb-mini` board (machines/usb-mini.machine plus the classes it names):
+# a RISC-V hart, RAM, a PLIC, an EHCI host controller and a `usb.storage` device
+# in its one root port, with the controller's interrupt on a real wire into the
+# PLIC. It models no product; it exists so `usb.storage` and the EHCI's bulk path
+# have somewhere a driver can reach them the way a driver does, and it is what
+# `tests/usb_msd.rs` boots.
+#
+# **It has a processor and `nvme-mini` does not**, and that is about the device
+# rather than about taste: an NVMe command completes inside the doorbell write
+# that submitted it, so a core there would prove nothing, while an EHCI's
+# schedule runs on its own clock a microframe at a time and the claim worth
+# making needs a program executing. The `firmware` slot takes that program and
+# the `usb0` slot takes the disk.
+machine-usb-mini = ["cpu-riscv", "dev-riscv", "dev-usb-ehci", "dev-usb-msd"]
 
 # The Sharp SM83 core (src/cpu/sm83): the Game Boy's processor, an M-cycle
 # accurate interpreter with all 256 base and 256 $CB encodings, the eleven

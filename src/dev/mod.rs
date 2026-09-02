@@ -27,7 +27,7 @@
 //! | [`stm32`] | `dev-stm32` | STM32 peripherals: a GPIO port and a USART |
 //! | [`riscv`] | `dev-riscv` | the RISC-V `virt` board: CLINT, PLIC, 16550, virtio, and the device tree generator |
 //! | [`sd`] | `dev-sd-card` | an SD memory card: the command set, the state machine, the registers |
-//! | [`usb`] | `dev-usb-*` | USB host controllers — a generic EHCI, the ChipIdea/ARC variant over it, and a Synopsys dwc2 that shares nothing with either — and a HID mouse |
+//! | [`usb`] | `dev-usb-*` | USB host controllers — a generic EHCI, the ChipIdea/ARC variant over it, and a Synopsys dwc2 that shares nothing with either — a HID mouse, and a mass storage device on a real medium |
 //! | [`wdc`] | `dev-wdc` | the W65C51N ACIA and W65C22 VIA, and a 6502 board's ROM |
 //! | [`blk`] | `dev-blk` | disk images: a drive backed by a host file through `fstool` |
 //!
@@ -132,7 +132,8 @@ pub mod sd;
     feature = "dev-usb-ehci",
     feature = "dev-usb-chipidea",
     feature = "dev-usb-dwc2",
-    feature = "dev-usb-hid"
+    feature = "dev-usb-hid",
+    feature = "dev-usb-msd"
 ))]
 #[cfg_attr(
     docsrs,
@@ -140,7 +141,8 @@ pub mod sd;
         feature = "dev-usb-ehci",
         feature = "dev-usb-chipidea",
         feature = "dev-usb-dwc2",
-        feature = "dev-usb-hid"
+        feature = "dev-usb-hid",
+        feature = "dev-usb-msd"
     )))
 )]
 pub mod usb;

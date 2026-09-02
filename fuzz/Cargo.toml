@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std", "vnc", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-blk", "dev-ne2000", "dev-nvme", "dev-ahci", "dev-riscv", "dev-pc-apic", "dev-pc-hpet", "ir", "jit", "cpu-riscv-lift", "float"]
+features         = ["std", "vnc", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-dwc2", "dev-usb-hid", "dev-usb-msd", "dev-blk", "dev-ne2000", "dev-nvme", "dev-ahci", "dev-riscv", "dev-pc-apic", "dev-pc-hpet", "ir", "jit", "cpu-riscv-lift", "float"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -90,6 +90,23 @@ bench = false
 [[bin]]
 name  = "usb_dwc2"
 path  = "fuzz_targets/usb_dwc2.rs"
+test  = false
+doc   = false
+bench = false
+
+# The same bus again, and the first device on it whose untrusted input is not a
+# structure in guest memory but a **byte stream on a bulk endpoint**. A USB mass
+# storage device masters nothing and walks nothing, so what has to be bounded is
+# what it is told: a `dCBWDataTransferLength` of 0xffffffff, a READ (10) for
+# every block a 16-bit field can name, and an allocation length of 65,535 all
+# have to cost one packet of memory and one packet of work. An unbounded
+# allocation shows up here as an out-of-memory abort. Three invariants ride
+# along: BOT 5.2's "the residue shall not exceed the transfer length", the
+# debug-peek rule (a monitor must not pop a status wrapper or advance a data
+# cursor), and the snapshot decoder on untrusted bytes.
+[[bin]]
+name  = "usb_msd"
+path  = "fuzz_targets/usb_msd.rs"
 test  = false
 doc   = false
 bench = false
