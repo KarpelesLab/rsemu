@@ -1854,3 +1854,67 @@ fn a_region_too_deep_to_flatten_is_refused_when_it_is_mapped() {
         "and the space is left as it was, not half-changed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// host-page alignment
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_backing_store_is_host_page_aligned() {
+    // The property a hypervisor's memory-slot call requires of a host address,
+    // and the reason a board's declared `ram` can be one at all (`ROADMAP.md`
+    // phase 7). Several sizes, including ones smaller than a page and ones
+    // that are not a multiple of it, because the global allocator's own
+    // alignment for these element types is 1 and the padding is what buys it.
+    for len in [1u64, 7, 0x800, HOST_PAGE, HOST_PAGE + 1, 3 * HOST_PAGE - 3] {
+        let ram = RamStore::new(len);
+        assert_eq!(
+            ram.host_addr() % HOST_PAGE,
+            0,
+            "a {len}-byte RamStore is not page aligned"
+        );
+        assert_eq!(ram.len(), len, "and its length is what was asked for");
+
+        let rom = RomStore::zeroed(len);
+        assert_eq!(rom.host_addr() % HOST_PAGE, 0);
+        assert_eq!(rom.len(), len);
+    }
+}
+
+#[test]
+fn alignment_does_not_move_a_single_byte_of_the_store() {
+    // The regression this guards: the slack sits *before* byte zero, so an
+    // off-by-one in the base index would shift every access — and every state
+    // hash — by one byte, silently.
+    let ram = RamStore::new(0x30);
+    for i in 0..0x30u64 {
+        ram.write_u8(i, (i as u8) ^ 0x5a).expect("in range");
+    }
+    for i in 0..0x30u64 {
+        assert_eq!(ram.read_u8(i).expect("in range"), (i as u8) ^ 0x5a);
+    }
+    // And one past the end is still a fault rather than a read of the slack.
+    assert_eq!(ram.read_u8(0x30), Err(BusError::BadAccess));
+    assert_eq!(ram.write_u8(0x30, 1), Err(BusError::BadAccess));
+
+    let rom = RomStore::new(alloc::vec![0u8, 1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(rom.as_bytes(), &[0u8, 1, 2, 3, 4, 5, 6, 7]);
+    let mut buf = [0u8; 3];
+    rom.read_at(5, &mut buf).expect("in range");
+    assert_eq!(buf, [5, 6, 7]);
+    assert_eq!(rom.read_at(6, &mut buf), Err(BusError::BadAccess));
+}
+
+#[test]
+fn a_zero_length_store_allocates_no_slack() {
+    // A store with no bytes has no address worth aligning, and reserving a
+    // whole page to say so would be worse than admitting it.
+    let ram = RamStore::new(0);
+    assert!(ram.is_empty());
+    assert_eq!(ram.len(), 0);
+    assert_eq!(ram.read_u8(0), Err(BusError::BadAccess));
+
+    let rom = RomStore::zeroed(0);
+    assert!(rom.is_empty());
+    assert!(rom.as_bytes().is_empty());
+}

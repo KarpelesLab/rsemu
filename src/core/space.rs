@@ -210,7 +210,7 @@ pub use region::{
     Alias, AliasId, CombinePolicy, Container, Mapping, MappingId, Region, RegionKind, RegionRef,
     RomWrite,
 };
-pub use store::{DEFAULT_PAGE_BITS, RamStore, RomStore};
+pub use store::{DEFAULT_PAGE_BITS, HOST_PAGE, RamStore, RomStore};
 
 use crate::core::error::{BusError, Error};
 use crate::core::sync::{LockRank, RwLock, RwLockReadGuard, RwLockWriteGuard};
