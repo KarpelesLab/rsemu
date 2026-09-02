@@ -30,11 +30,37 @@
 //!
 //! * **[`Opcode::CHARGE`] charges exactly.** The immediate is handed to
 //!   [`IrHost::charge`] unrounded and unbatched, at the point it appears.
-//! * **[`Opcode::INSN_START`] is a barrier.** Before announcing the boundary
-//!   the interpreter publishes every live `(slot, temp)` pair through
-//!   [`IrHost::write_slot`], so a fault taken after it is delivered with the
-//!   architectural state the ISA specifies, at that boundary's PC, with that
-//!   boundary's tick count.
+//! * **[`Opcode::INSN_START`] is a barrier, and it is *lazy*.** The boundary
+//!   is announced, and the live `(slot, temp)` mapping is remembered rather
+//!   than written out. Architectural state is materialized through
+//!   [`IrHost::write_slot`] only when something can observe it — see
+//!   "Materializing guest state" below. That is `ROADMAP.md` §9's design
+//!   verbatim (*"on a fault, the runtime … materializes the architectural
+//!   state from the recorded mapping"*), and it is what lets a guest register
+//!   stay in a temporary across a whole superblock instead of being written
+//!   back once per guest instruction.
+//!
+//! # Materializing guest state
+//!
+//! Between boundaries the host's slot storage is **stale**: the truth is in
+//! the temporaries the current [`InsnStart::live`] mapping names. The
+//! interpreter publishes that mapping — exactly once, whatever happens
+//! afterwards — immediately before any of:
+//!
+//! * returning an [`Outcome`] or an [`Error`] from [`Interp::run`], which
+//!   covers every exit, every fault and every unsupported op;
+//! * [`IrHost::call_helper`], because a helper is arbitrary Rust that may read
+//!   the guest's registers;
+//! * [`IrHost::read_slot`] for a slot the current mapping binds, so a
+//!   [`Opcode::GET_SLOT`] can never read a value a temporary has superseded.
+//!
+//! Nothing else can see guest state. [`IrHost::load`], [`IrHost::store`] and
+//! [`IrHost::rmw`] reach guest *memory*, which no design in this crate lets a
+//! device use to read a CPU's register file, and [`IrHost::insn_start`] is
+//! told the boundary's PC and tick column directly.
+//!
+//! The saving is the point: a 64-instruction trace with fifteen live registers
+//! wrote roughly nine hundred slots eagerly and writes fifteen now.
 //!
 //! # Where this backend has to *choose*
 //!
@@ -129,9 +155,12 @@ pub trait IrHost {
 
     /// A guest instruction boundary has been reached.
     ///
-    /// The live slots have already been published. A host records
-    /// [`InsnStart::pc`] and [`InsnStart::ticks`] so that a fault taken before
-    /// the next boundary is delivered at the architecturally correct place.
+    /// The live slots have **not** been published: they are materialized
+    /// lazily, at the points the module docs list, so a host may not read its
+    /// own slot storage from here and expect the boundary's state. What it may
+    /// read is what it is handed — [`InsnStart::pc`] and [`InsnStart::ticks`]
+    /// — which is what a host records so that a fault taken before the next
+    /// boundary is delivered at the architecturally correct place.
     fn insn_start(&mut self, mark: &InsnStart);
 
     /// Perform an atomic read-modify-write, returning the value the location
@@ -241,6 +270,14 @@ pub struct Fault {
     ///
     /// The architectural count: what the guest's cycle counter must read if
     /// the faulting instruction is treated as not having started.
+    ///
+    /// **Measured, not read off the boundary.** [`InsnStart::ticks`] is the
+    /// *static* column — the charges a frontend could know at lift time — and
+    /// a block that has already performed a data-dependent access (a
+    /// misaligned load splitting into bytes, a page-table walk) has spent more
+    /// than that. This is the number actually charged when the boundary was
+    /// reached, so it stays exact however many accesses a superblock made
+    /// before the faulting instruction.
     pub retired_ticks: u64,
     /// Ticks actually charged to the host when the access faulted.
     ///
@@ -270,6 +307,12 @@ pub struct Interp {
     args: Vec<u128>,
     ticks: u64,
     mark: Option<u32>,
+    /// Whether [`Interp::mark`]'s live mapping has been written out yet.
+    ///
+    /// The whole of the lazy-publication scheme (module docs): `false` means
+    /// the host's slot storage is behind the temporaries.
+    published: bool,
+    boundaries: u64,
     boundary_pc: u64,
     retired: u64,
     committed: bool,
@@ -314,10 +357,22 @@ impl Interp {
         self.args.clear();
         self.ticks = 0;
         self.mark = None;
+        self.published = true;
+        self.boundaries = 0;
         self.boundary_pc = block.entry_pc;
         self.retired = 0;
         self.committed = false;
 
+        let outcome = self.execute(block, host);
+        // Whatever happened — an exit, a fault, a malformed block — the guest's
+        // architectural state is materialized before the caller can look at it.
+        // One place rather than eight, because a path that forgot would leave
+        // registers in temporaries nobody can reach (module docs).
+        self.publish(block, host);
+        outcome
+    }
+
+    fn execute<H: IrHost + ?Sized>(&mut self, block: &Block, host: &mut H) -> Result<Outcome> {
         let insts = block.insts();
         let mut at = 0usize;
         let mut steps = 0u64;
@@ -354,8 +409,9 @@ impl Interp {
     /// Ticks charged during the run so far.
     ///
     /// The number a differential test compares against the host backend's, and
-    /// against the last boundary's [`InsnStart::ticks`] plus whatever the
-    /// current guest instruction has charged.
+    /// against the boundary [`Interp::mark`] names — its [`InsnStart::ticks`]
+    /// is the *static* column, and the difference is exactly what the block's
+    /// accesses spent.
     #[inline]
     #[must_use]
     pub fn ticks(&self) -> u64 {
@@ -367,6 +423,72 @@ impl Interp {
     #[must_use]
     pub fn temp_value(&self, temp: Temp) -> Option<u128> {
         self.temps.get(temp.index()).copied()
+    }
+
+    /// How many [`Opcode::INSN_START`] boundaries the run passed.
+    ///
+    /// The **dynamic** instruction count, and the only honest one once a block
+    /// has more than one exit: a superblock's static instruction count says how
+    /// many guest instructions it *covers*, and a run that leaves through a
+    /// side exit retires fewer than that. Every frontend in the tree closes a
+    /// block with one boundary that begins no instruction — the exit boundary
+    /// carrying the outgoing register map — and exactly one of those is reached
+    /// on any path, so **`boundaries() - 1` is the number of guest instructions
+    /// that retired**. At a fault the same expression is still right, and for
+    /// the same reason: the faulting instruction opened its boundary and did
+    /// not retire.
+    #[inline]
+    #[must_use]
+    pub fn boundaries(&self) -> u64 {
+        self.boundaries
+    }
+
+    /// The index into [`Block::marks`](crate::ir::Block::marks) of the boundary
+    /// the run last reached, or `None` if it reached none.
+    ///
+    /// What a caller reads the *static* tick column off, which is the column
+    /// a differential harness cross-checks against the ticks actually charged.
+    #[inline]
+    #[must_use]
+    pub fn mark(&self) -> Option<u32> {
+        self.mark
+    }
+
+    /// Materialize the pending boundary's live mapping into guest state.
+    ///
+    /// Idempotent, and a no-op when there is nothing pending, so every caller
+    /// can be unconditional. See the module docs for where it is called from
+    /// and why nowhere else needs it.
+    fn publish<H: IrHost + ?Sized>(&mut self, block: &Block, host: &mut H) {
+        if self.published {
+            return;
+        }
+        self.published = true;
+        let Some(mark) = self.mark.and_then(|m| block.marks().get(m as usize)) else {
+            return;
+        };
+        for &(slot, temp) in &mark.live {
+            // A temporary the block never allocated is a malformed block, which
+            // the verifier rejects; publishing nothing for it is better than
+            // failing here, because this runs on the way out of an error.
+            if let Some(value) = self.temps.get(temp.index()).copied() {
+                host.write_slot(slot, value);
+            }
+        }
+    }
+
+    /// Whether the pending boundary binds `slot` to a temporary.
+    ///
+    /// The guard on [`Opcode::GET_SLOT`]: a read of a slot a temporary shadows
+    /// has to see the temporary. A linear scan over a mapping that is at most a
+    /// register file wide, and one the first frontend never triggers — it emits
+    /// a slot read only for a register nothing has bound.
+    fn shadowed(&self, block: &Block, slot: RegSlot) -> bool {
+        !self.published
+            && self
+                .mark
+                .and_then(|m| block.marks().get(m as usize))
+                .is_some_and(|mark| mark.live.iter().any(|&(s, _)| s == slot))
     }
 
     #[inline]
@@ -448,7 +570,15 @@ impl Interp {
                 // slot read that carries operands.
                 // `set` canonicalises to the temporary's width, so a host
                 // that hands back a wider value cannot smuggle bits in.
-                let value = host.read_slot(RegSlot(inst.aux as u16));
+                let slot = RegSlot(inst.aux as u16);
+                if self.shadowed(block, slot) {
+                    // Guest state is published lazily, so a slot the current
+                    // boundary binds is stale in the host until it is written
+                    // out. Reading it without this would hand back the value
+                    // from before the temporary took over.
+                    self.publish(block, host);
+                }
+                let value = host.read_slot(slot);
                 self.write(block, inst, value, at)?;
             }
             Opcode::EXT_S => {
@@ -805,6 +935,11 @@ impl Interp {
                     self.args.push(v);
                 }
                 self.committed = true;
+                // A helper is arbitrary Rust and may read the guest's registers
+                // — a mode change is a helper call and a barrier for exactly
+                // this reason (the `ir` module docs, decision 4) — so the
+                // pending boundary is written out before it runs.
+                self.publish(block, host);
                 let (first, second) = host.call_helper(inst.aux, &self.args)?;
                 if let Some(dst) = inst.dst {
                     self.set(block, dst, first, at, op)?;
@@ -828,15 +963,20 @@ impl Interp {
                     .marks()
                     .get(inst.aux as usize)
                     .ok_or_else(|| ir_err(at, op, "the boundary marker points at no record"))?;
-                // Publish before announcing, so the host sees the architectural
-                // state the boundary describes rather than a half-updated one.
-                for &(slot, temp) in &mark.live {
-                    let value = self.get(temp, at, op)?;
-                    host.write_slot(slot, value);
-                }
+                // The mapping is *remembered*, not written out: the previous
+                // boundary's is superseded here, so publishing it would be work
+                // thrown away, and the new one is only needed if something can
+                // observe guest state before the next boundary (module docs).
+                // Every live temporary named here is already assigned — the
+                // verifier checks that — so nothing is lost by deferring.
                 self.mark = Some(inst.aux);
+                self.published = false;
+                self.boundaries = self.boundaries.wrapping_add(1);
                 self.boundary_pc = mark.pc;
-                self.retired = mark.ticks;
+                // The charged count rather than `mark.ticks`, which is the
+                // static column and undercounts once an access in this block
+                // has spent a data-dependent tick.
+                self.retired = self.ticks;
                 // Restart granularity is the guest instruction, so the previous
                 // one's commits stop blocking a retry here.
                 self.committed = false;
@@ -1844,6 +1984,92 @@ mod tests {
     }
 
     #[test]
+    fn guest_state_is_written_out_once_however_many_boundaries_a_trace_has() {
+        // The saving superblocks are for: a trace binds the same slot at every
+        // boundary and the host must see one write, not one per instruction.
+        // Four boundaries, one slot, one `write_slot`.
+        let mut host = Host::default();
+        let mut b = BlockBuilder::new(0x1000, 0);
+        let mut last = b.imm(Type::I64, Const::Int(0));
+        for i in 0..4u64 {
+            b.insn_start(InsnStart {
+                pc: 0x1000 + i * 4,
+                next_pc: 0x1004 + i * 4,
+                ticks: i,
+                live: vec![(RegSlot(3), last)],
+            });
+            b.charge(1);
+            let one = b.imm(Type::I64, Const::Int(1));
+            last = b.binary(Opcode::ADD, Type::I64, last, one);
+        }
+        b.insn_start(InsnStart {
+            pc: 0x1010,
+            next_pc: 0x1010,
+            ticks: 4,
+            live: vec![(RegSlot(3), last)],
+        });
+        b.exit_tb();
+
+        let (_, outcome) = run(b, &mut host);
+        assert_eq!(outcome, Outcome::Exit);
+        assert_eq!(
+            host.published,
+            vec![(3, 4)],
+            "guest state went out once, holding the last boundary's value"
+        );
+    }
+
+    #[test]
+    fn a_fault_materializes_the_boundary_it_faulted_at_and_not_a_later_one() {
+        // The precise-exception claim at the level of the backend: two guest
+        // instructions, the second faults, and the slot must hold what the
+        // *second* boundary named — not the value the first bound and not one
+        // the faulting instruction computed.
+        let mut host = Host::default();
+        host.faults.insert(0x80, BusError::BadAccess);
+
+        let mut b = BlockBuilder::new(0x1000, 0);
+        let first = b.imm(Type::I64, Const::Int(0x11));
+        b.insn_start(InsnStart {
+            pc: 0x1000,
+            next_pc: 0x1004,
+            ticks: 0,
+            live: vec![(RegSlot(3), first)],
+        });
+        b.charge(1);
+        let second = b.imm(Type::I64, Const::Int(0x22));
+        b.insn_start(InsnStart {
+            pc: 0x1004,
+            next_pc: 0x1008,
+            ticks: 1,
+            live: vec![(RegSlot(3), second)],
+        });
+        b.charge(1);
+        let addr = b.imm(Type::I64, Const::Int(0x80));
+        let mut mem = MemOp::load(Width::U64);
+        mem.volatile = true;
+        let loaded = b.load(Type::I64, addr, mem);
+        b.insn_start(InsnStart {
+            pc: 0x1008,
+            next_pc: 0x1008,
+            ticks: 2,
+            live: vec![(RegSlot(3), loaded)],
+        });
+        b.exit_tb();
+
+        let (i, outcome) = run(b, &mut host);
+        let Outcome::Fault(fault) = outcome else {
+            panic!("the load faults");
+        };
+        assert_eq!(fault.pc, 0x1004);
+        assert_eq!(host.read_slot(RegSlot(3)), 0x22, "the faulting boundary's");
+        assert_eq!(host.published, vec![(3, 0x22)], "and only that one");
+        // Two boundaries were passed, so one guest instruction retired.
+        assert_eq!(i.boundaries(), 2);
+        assert_eq!(i.mark(), Some(1));
+    }
+
+    #[test]
     fn a_boundary_publishes_its_live_slots_before_it_announces_itself() {
         let mut host = Host::default();
         let mut b = BlockBuilder::new(0x1000, 0);
@@ -1868,6 +2094,42 @@ mod tests {
         assert_eq!(host.read_slot(RegSlot(0x2000)), 1);
         // A slot nobody published reads as whatever the host had.
         assert_eq!(host.read_slot(RegSlot(9)), 0);
+    }
+
+    #[test]
+    fn a_slot_read_of_a_shadowed_slot_sees_the_temporary_and_not_the_host() {
+        // Lazy publication has exactly one way to be observed from inside a
+        // block: a `get_slot` naming a slot the current boundary binds. The
+        // first frontend never emits one, so this is the guard that keeps a
+        // later frontend from finding out the hard way.
+        let mut host = Host::default();
+        host.slots.insert(3, 0x1111);
+
+        let mut b = BlockBuilder::new(0x1000, 0);
+        let fresh = b.imm(Type::I64, Const::Int(0x2222));
+        b.insn_start(InsnStart {
+            pc: 0x1000,
+            next_pc: 0x1004,
+            ticks: 0,
+            live: vec![(RegSlot(3), fresh)],
+        });
+        b.charge(1);
+        let read_back = b.get_slot(Type::I64, RegSlot(3));
+        b.insn_start(InsnStart {
+            pc: 0x1004,
+            next_pc: 0x1004,
+            ticks: 1,
+            live: vec![(RegSlot(9), read_back)],
+        });
+        b.exit_tb();
+
+        let (i, outcome) = run(b, &mut host);
+        assert_eq!(outcome, Outcome::Exit);
+        assert_eq!(
+            i.temp_value(read_back),
+            Some(0x2222),
+            "the slot read saw the value the host still held"
+        );
     }
 
     #[test]

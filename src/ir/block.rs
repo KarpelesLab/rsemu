@@ -36,16 +36,51 @@ pub struct InsnStart {
     /// difference and on x86 an instruction's length is not a static property
     /// of its opcode.
     pub next_pc: u64,
-    /// Guest ticks retired at this boundary, counted from block entry.
+    /// Guest ticks **statically** charged at this boundary, counted from block
+    /// entry: the sum of the [`Opcode::CHARGE`] immediates ahead of it.
     ///
-    /// The column that makes an exact tick count reconstructible at a fault.
     /// A core's cycle counter is in its snapshot and the state hash is taken
-    /// over that snapshot, so a JIT that cannot reproduce this number at a
+    /// over that snapshot, so a JIT that cannot reproduce the cycle count at a
     /// mid-block fault produces a different hash from the interpreter at the
     /// same instruction — which is precisely what phase 5's "save/restore
     /// across an engine switch" gate tests.
+    ///
+    /// **Static is not the whole count, and saying so is the point.** A guest
+    /// access spends a number of ticks no lift can know: one when aligned,
+    /// `bytes` when it splits, plus a page-table walk on a miss. Those are
+    /// charged by the access itself, through the host, and are *not* in this
+    /// column. The two add up — that identity is what the differential harness
+    /// checks — and the exact retired count at a fault is
+    /// [`Fault::retired_ticks`](crate::ir::Fault::retired_ticks), which
+    /// [`Interp`](crate::ir::Interp) measures rather than reads off here.
+    ///
+    /// This column is therefore what a *frontend* is accountable for, and it
+    /// is monotonic across a block's boundaries whatever the accesses did,
+    /// which is what the verifier checks.
     pub ticks: u64,
     /// Which temporary currently holds each live piece of guest state.
+    ///
+    /// # The invariant a frontend owes
+    ///
+    /// Guest state is materialized **lazily** (`ir::interp`, "Materializing
+    /// guest state"): reaching a boundary supersedes the previous one's
+    /// mapping without writing it out. So a slot this boundary does *not*
+    /// name is read straight from the host — and if an earlier boundary on the
+    /// same path named it, the host's copy is stale.
+    ///
+    /// **Once a boundary names a slot, every later boundary reachable from it
+    /// must name it too**, until something publishes: an
+    /// [`Opcode::CALL_HELPER`], or the exit. A frontend that drops a slot from
+    /// the mapping mid-block silently reverts that register to whatever the
+    /// host last held. A boundary that is followed straight by a terminator is
+    /// an *exit* boundary and may name more than the ones before it — the
+    /// program counter, typically — because nothing on that path follows it.
+    ///
+    /// This is not checked by [`verify`](crate::ir::verify), because "reachable
+    /// from" needs the branch graph and a superblock's exits make that
+    /// non-trivial; it is asserted per frontend instead. For the first one that
+    /// is `cpu::riscv::lift`'s
+    /// `a_slot_a_boundary_shadows_stays_shadowed_at_every_later_boundary`.
     pub live: Vec<(RegSlot, Temp)>,
 }
 
@@ -155,7 +190,29 @@ impl Block {
     /// wrong value. The cost is a hole in the type table for every temporary
     /// whose definition went away; a register allocator sees it as a
     /// temporary with no live range and gives it nothing.
+    ///
+    /// One `aux` payload is *not* carried over unchanged, and must not be: a
+    /// [`Opcode::BRCOND`]'s target is an **instruction index**, so dropping
+    /// anything before it slides the target. Every branch is repointed at the
+    /// new index of its old target — or, when the target itself was dropped, at
+    /// the first surviving instruction after it, which is the same place
+    /// control would have arrived. This was a latent bug until superblocks: the
+    /// first frontend emitted no branch at all, so nothing in a block could
+    /// notice.
     pub(crate) fn retain(&self, keep: &[bool]) -> Block {
+        let alive = |i: usize| keep.get(i).copied().unwrap_or(true);
+        // `moved[i]` is how many kept instructions precede `i`, which is the
+        // new index of `i` when it survives and of its successor when it does
+        // not. One extra entry so a branch to the end still lands at the end.
+        let mut moved = Vec::with_capacity(self.insts.len() + 1);
+        let mut kept = 0u32;
+        for i in 0..=self.insts.len() {
+            moved.push(kept);
+            if i < self.insts.len() && alive(i) {
+                kept += 1;
+            }
+        }
+
         let mut out = Block {
             entry_pc: self.entry_pc,
             key: self.key,
@@ -165,13 +222,19 @@ impl Block {
             types: self.types.clone(),
         };
         for (i, inst) in self.insts.iter().enumerate() {
-            if !keep.get(i).copied().unwrap_or(true) {
+            if !alive(i) {
                 continue;
             }
             let src_start = out.operands.len() as u32;
             out.operands.extend_from_slice(self.srcs(i));
+            let aux = if inst.op == Opcode::BRCOND {
+                moved.get(inst.aux as usize).copied().unwrap_or(kept)
+            } else {
+                inst.aux
+            };
             out.insts.push(Inst {
                 src_start,
+                aux,
                 ..inst.clone()
             });
         }

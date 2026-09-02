@@ -23,15 +23,18 @@
 //! wrote ([`DirtyPages`] is a ready-made accumulator) and the dispatcher
 //! drains them at each block boundary.
 //!
-//! Draining at a boundary rather than at the store is not a compromise, it is
-//! the correct granularity for the two guests that matter here. RISC-V
-//! requires a `FENCE.I` between a store to instruction memory and executing
-//! it, so a store's effect on *later* blocks is all the ISA promises; and the
-//! current lifter ends a block at its first load or store anyway, so nothing
-//! after a store in the same block exists to be modified. An x86 frontend
-//! needs the check *within* a block — x86 makes coherent instruction caches
-//! architectural — and will need a finer hook than this one; that is recorded
-//! here rather than discovered later.
+//! Draining at a boundary rather than at the store is the granularity RISC-V
+//! asks for, and now the *only* one available: the ISA requires a `FENCE.I`
+//! between a store to instruction memory and executing it, so a store's effect
+//! on **later** blocks is all it promises. That used to be belt and braces —
+//! the lifter ended a block at its first access, so nothing after a store in
+//! the same block existed to be modified — and superblocks spend the braces: a
+//! trace runs to its end on the bytes it was lifted from, and a store it made
+//! into its own page invalidates it for the *next* execution. A guest that
+//! wants otherwise owes a `FENCE.I`. An x86 frontend needs the check *within*
+//! a block — x86 makes coherent instruction caches architectural — and will
+//! need a finer hook than this one; that is recorded here rather than
+//! discovered later.
 //!
 //! # Safe points
 //!
@@ -39,6 +42,13 @@
 //! and stops with [`Stop::Exit`]. That is §4.7's protocol exactly: a
 //! generation counter plus a per-CPU flag checked at block boundaries, never a
 //! signal, because wasm has none.
+//!
+//! A trace has *fewer* boundaries than the basic blocks it replaces, so the
+//! delay before a raised flag is honoured is bounded by a frontend's own
+//! instruction limit rather than by a basic block's length — sixty-four guest
+//! instructions for the RISC-V frontend. That is the price of merging, it is
+//! bounded, and it is checked by
+//! `a_raised_exit_flag_stops_within_one_block_however_long_the_block_is`.
 
 use alloc::vec::Vec;
 
@@ -64,6 +74,11 @@ pub struct Translation {
     /// Zero means the frontend could not lift the instruction at the entry PC,
     /// and the dispatcher stops with [`Stop::Untranslatable`] rather than
     /// spinning on a block that cannot advance the PC.
+    ///
+    /// A **static** count, and not the one [`Run::insns`] reports: a
+    /// superblock covers every instruction on the path it inlined, and a run
+    /// that leaves through a side exit retires fewer of them. What retired is
+    /// counted by [`Interp::boundaries`](crate::ir::Interp::boundaries).
     pub insns: usize,
 }
 
@@ -183,7 +198,15 @@ pub struct Run {
     pub pc: u64,
     /// How many blocks executed.
     pub blocks: usize,
-    /// How many guest instructions those blocks covered.
+    /// How many guest instructions those blocks **retired**.
+    ///
+    /// Counted from the boundaries the backend actually passed, not summed
+    /// from [`Translation::insns`]: a trace that leaves through a side exit
+    /// retires fewer instructions than it covers, and a block that faulted
+    /// retires everything before the faulting instruction and no more. A
+    /// caller that steps an oracle this many times — the differential harness
+    /// does — gets a wrong answer from the static number and a right one from
+    /// this.
     pub insns: usize,
     /// Why it stopped.
     pub stop: Stop,
@@ -340,7 +363,11 @@ impl Dispatcher {
             let outcome = self.interp.run(block, host)?;
             self.stats.blocks += 1;
             blocks += 1;
-            insns += self.cache.insns(id).unwrap_or(0);
+            // Every exit is preceded by one boundary that begins no guest
+            // instruction, and exactly one exit is reached, so this is what
+            // retired — at a fault too, where the faulting instruction opened
+            // its boundary and did not retire.
+            insns += (self.interp.boundaries().saturating_sub(1)) as usize;
 
             // Guest stores land before the next block is chosen, so a block
             // invalidated by one is never served afterwards.
@@ -520,6 +547,147 @@ mod tests {
         let run = d.run(&mut f, &mut h, 0x1000, 97).expect("runs");
         assert_eq!(h.ticks, run.blocks as u64);
         assert!(d.stats().chained > 0, "and chaining really happened");
+    }
+
+    /// A block covering `insns` guest instructions, with a side exit taken
+    /// when `leave_at` is reached.
+    ///
+    /// The superblock shape in miniature: several boundaries, two terminators,
+    /// and a forward branch over the first exit sequence.
+    fn trace(pc: u64, insns: u64, leave_at: Option<u64>, after: u64) -> Block {
+        let mut b = BlockBuilder::new(pc, 0);
+        // The branch jumps *over* the exit sequence, so a zero here is the
+        // side exit being taken — the inversion `cpu::riscv::lift` emits.
+        let skip = b.imm(Type::I1, Const::Int(0));
+        let mut ticks = 0u64;
+        for i in 0..insns {
+            b.insn_start(InsnStart {
+                pc: pc + i * 4,
+                next_pc: pc + (i + 1) * 4,
+                ticks,
+                live: Vec::new(),
+            });
+            b.charge(1);
+            ticks += 1;
+            if leave_at == Some(i) {
+                // The side exit, inline and branched over — exactly the shape
+                // `cpu::riscv::lift` emits.
+                let over = b.emit_raw(
+                    Opcode::BRCOND,
+                    Type::I64,
+                    None,
+                    None,
+                    &[skip],
+                    None,
+                    None,
+                    0,
+                );
+                let t = b.imm(Type::I64, Const::Int(u128::from(after)));
+                b.insn_start(InsnStart {
+                    pc: after,
+                    next_pc: after,
+                    ticks,
+                    live: vec![(PC, t)],
+                });
+                b.exit_tb();
+                b.patch_aux(over, b.next_index() as u32);
+            }
+        }
+        let t = b.imm(Type::I64, Const::Int(u128::from(after)));
+        b.insn_start(InsnStart {
+            pc: after,
+            next_pc: after,
+            ticks,
+            live: vec![(PC, t)],
+        });
+        b.exit_tb();
+        b.finish()
+    }
+
+    /// A frontend serving one trace, over and over.
+    struct Traces {
+        insns: u64,
+        leave_at: Option<u64>,
+        epoch: Epoch,
+    }
+
+    impl Frontend for Traces {
+        fn epoch(&mut self) -> Epoch {
+            self.epoch
+        }
+        fn key(&mut self) -> u64 {
+            0
+        }
+        fn pc_slot(&self) -> RegSlot {
+            PC
+        }
+        fn translate(&mut self, pc: u64) -> Result<Translation> {
+            Ok(Translation {
+                block: trace(pc, self.insns, self.leave_at, pc),
+                page: pc & !PAGE_MASK,
+                // Deliberately the *static* count, which is what a superblock
+                // covers and not what a run through it retires.
+                insns: self.insns as usize,
+            })
+        }
+    }
+
+    #[test]
+    fn a_side_exit_retires_fewer_instructions_than_the_trace_covers() {
+        // The static count would say sixteen a block; the run leaves through
+        // the side exit after five. A dispatcher that reported the static
+        // number would tell an oracle to step three times too far.
+        let mut d = Dispatcher::new();
+        let mut f = Traces {
+            insns: 16,
+            leave_at: Some(4),
+            epoch: Epoch::default(),
+        };
+        let mut h = Host::default();
+        let run = d.run(&mut f, &mut h, 0x1000, 10).expect("runs");
+        assert_eq!(run.blocks, 10);
+        assert_eq!(
+            run.insns, 50,
+            "five guest instructions a block, not sixteen"
+        );
+        // and the ticks agree with the instructions, not with the coverage.
+        assert_eq!(h.ticks, 50);
+    }
+
+    #[test]
+    fn a_trace_that_runs_to_its_end_retires_everything_it_covers() {
+        let mut d = Dispatcher::new();
+        let mut f = Traces {
+            insns: 16,
+            leave_at: None,
+            epoch: Epoch::default(),
+        };
+        let mut h = Host::default();
+        let run = d.run(&mut f, &mut h, 0x1000, 10).expect("runs");
+        assert_eq!(run.insns, 160);
+        assert_eq!(h.ticks, 160);
+    }
+
+    #[test]
+    fn a_raised_exit_flag_stops_within_one_block_however_long_the_block_is() {
+        // A trace has fewer boundaries than the basic blocks it replaces, so
+        // the safe-point protocol's promise weakens from "one basic block" to
+        // "one translation" — bounded by a frontend's instruction limit
+        // (`ROADMAP.md` §4.7, and `cpu::riscv::lift::MAX_INSNS`). Bounded is
+        // the claim, so this asserts the bound rather than the old wording.
+        let flag = ExitFlag::default();
+        let mut d = Dispatcher::new().with_exit_flag(flag.clone());
+        let mut f = Traces {
+            insns: 64,
+            leave_at: None,
+            epoch: Epoch::default(),
+        };
+        let mut h = Host::default();
+        d.run(&mut f, &mut h, 0x1000, 1).expect("runs");
+        flag.raise();
+        let run = d.run(&mut f, &mut h, 0x1000, 100).expect("runs");
+        assert_eq!(run.stop, Stop::Exit);
+        assert_eq!(run.blocks, 0, "no block starts once the flag is up");
     }
 
     #[test]

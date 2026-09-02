@@ -47,27 +47,111 @@
 //! | a page-table read during a walk | 0 on a TLB hit, 1 per level on a miss | no — depends on the TLB |
 //!
 //! Only the first is a static property of the bytes, so only the first is
-//! emitted as [`Opcode::CHARGE`]. The other two force two structural rules,
-//! and the rules are how this frontend stays exact instead of guessing:
+//! emitted as [`Opcode::CHARGE`]. Exactly **one** structural rule follows from
+//! that, and it is how this frontend stays exact instead of guessing (the
+//! other rule about where a block ends, two sections down, is not about ticks
+//! at all):
 //!
 //! * **A block never leaves the page it started on.** The fetch translation is
 //!   then resolved once, at block entry, exactly as the interpreter resolves it
 //!   for the first instruction — so no fetch *inside* the block can miss the
 //!   TLB, walk, or fault, and `charge(1)`/`charge(2)` per instruction is the
 //!   whole fetch cost. Crossing a page would make every later instruction's
-//!   cumulative tick column a guess. See [`Stop::Page`].
-//! * **A load or store is the last guest instruction in its block.** Its
-//!   access count is `1` or `bytes`, plus zero to three walk reads, none of it
-//!   known at lift time. [`InsnStart::ticks`] is a *static* cumulative column,
-//!   so an instruction whose charge is data-dependent may have nothing after
-//!   it. The [`Opcode::LD`]/[`Opcode::ST`] therefore charges for itself — it
-//!   is the only thing that knows how many accesses it made — and this
-//!   frontend emits no charge for it at all. See [`Stop::Access`].
+//!   cumulative tick column a guess. See [`Stop::Page`]. It is also why a
+//!   *trace* is bounded by the entry page: merging across a branch is free
+//!   only while the merged instructions cost the same to fetch.
 //!
-//! That second rule is also why every load and store here is
-//! [`MemOp::volatile`]: the access spends ticks and can fault, both
-//! guest-visible, so dead-code elimination may not remove one whose value is
-//! discarded — `lw x0, 0(a0)` really does read the bus.
+//! ## Why a memory access used to end the block, and what replaced the reason
+//!
+//! It used to be a second rule — *"a load or store is the last guest
+//! instruction in its block"* — and the reason was not the access, it was the
+//! column. [`InsnStart::ticks`] was read as "ticks retired here", so an
+//! instruction whose charge is data-dependent could have nothing after it or
+//! every later boundary would be a guess. That cost `load-heavy` its whole
+//! block: one guest instruction per translation, where per-block dispatch
+//! costs more than the access it dispatches to.
+//!
+//! The reason is dealt with rather than removed. [`InsnStart::ticks`] is now
+//! **defined** as the static column — the [`Opcode::CHARGE`] immediates ahead
+//! of the boundary, and nothing else — and the exact retired count at a fault
+//! is measured by [`Interp`](crate::ir::Interp) from the ticks actually
+//! charged. The static column stays exactly as truthful as before, monotonic
+//! and reconstructible, and no longer has to be the *whole* count. So an
+//! access charges for itself, through the host, wherever it sits in the block,
+//! and the block goes on.
+//!
+//! That is also why every load and store here is [`MemOp::volatile`]: the
+//! access spends ticks and can fault, both guest-visible, so dead-code
+//! elimination may not remove one whose value is discarded — `lw x0, 0(a0)`
+//! really does read the bus.
+//!
+//! ## A store still ends the block, for a different reason
+//!
+//! A **load** cannot change what the rest of the block means. A store can: if
+//! it lands in the page the block was lifted from, every instruction after it
+//! in the block is a translation of bytes that no longer exist.
+//!
+//! RISC-V permits that — a guest owes a `FENCE.I` between writing instruction
+//! memory and executing it, so what a translation does in between is
+//! unspecified — but `ROADMAP.md` §0 does not: *"a bit-identical state hash …
+//! across the interpreter and the JIT for the same guest"*, and the
+//! interpreter re-fetches every instruction, so it always sees the new bytes.
+//! Diverging there would be legal for RISC-V and a broken promise for rsemu,
+//! and — just as bad — a differential harness cannot tell that divergence
+//! apart from a lifter bug. The generated corpus produces such programs
+//! readily, because a `JAL` linking into a register a later store uses as its
+//! base is enough.
+//!
+//! The invalidation mechanism's granularity is what forces the answer: a guest
+//! store is matched against cached translations at the **block boundary**
+//! (`jit::dispatch`), so a block boundary is where a store's effect on code
+//! can first be honoured. Ending the block after a store puts the boundary
+//! exactly there. It costs a store-heavy loop one extra block per store and
+//! costs a load-heavy one nothing at all, which is the shape of the trade.
+//!
+//! The way out, when someone wants it, is the same hook `jit::dispatch`
+//! already records that an **x86** frontend will need — a check *within* a
+//! block, because x86 makes coherent instruction caches architectural. With
+//! that in place this rule becomes a policy rather than a necessity.
+//!
+//! # Superblocks: merging across direct branches
+//!
+//! `ROADMAP.md` §9's fourth speed mechanism — *"merge across direct branches,
+//! keep guest registers in host registers across block boundaries within a
+//! trace"*. [`Shape`] selects it, and [`Shape::Trace`] is the default.
+//!
+//! * **`JAL` to a direct target is not an exit at all.** The link register is
+//!   bound and lifting simply continues at the target. A loop whose back edge
+//!   is a `JAL` unrolls until the instruction limit.
+//! * **A conditional branch becomes a side exit.** One side is inlined and the
+//!   other becomes an inline exit sequence the trace branches *over*:
+//!
+//!   ```text
+//!     brcond !cond -> after      ; the negation, so the sequence is skipped
+//!     mov  t = <the other pc>
+//!     insn_start  pc=<the other pc>  live = <every register> + PC=t
+//!     exit_tb
+//!   after:
+//!     ...the inlined side continues here...
+//!   ```
+//!
+//!   The boundary is what makes it a *precise* exit: it carries the whole
+//!   register map as of the branch, so leaving through it restores exactly the
+//!   architectural state the interpreter would have had.
+//! * **Which side is inlined** is the classic static prediction, and it is the
+//!   difference between unrolling a loop and unrolling nothing: a **backward**
+//!   branch is a loop's back edge, so the *taken* side is inlined and the
+//!   fall-through becomes the side exit; a **forward** branch is an `if`, so
+//!   the fall-through is inlined. A backward target outside the entry page is
+//!   not inlined, because no instruction outside that page may be lifted.
+//! * **`JALR` still ends the block.** Its target is computed, so there is
+//!   nothing to merge with.
+//!
+//! Guest registers stay in temporaries across every merged boundary — the
+//! `x[..]` mapping simply survives — and the IR interpreter publishes them
+//! into guest state lazily (`ir::interp`, "Materializing guest state") rather
+//! than at each boundary, so a sixty-four instruction trace writes the
+//! register file once instead of sixty-four times.
 //!
 //! # Paging: which address space `entry_pc` names
 //!
@@ -158,11 +242,19 @@
 //!
 //! # Termination
 //!
-//! Every block ends in [`Opcode::EXIT_TB`], preceded by the exit boundary that
-//! carries the outgoing register map and the [`PC`] slot. Block chaining
+//! Every path out of a block ends in [`Opcode::EXIT_TB`], preceded by the exit
+//! boundary that carries the outgoing register map and the [`PC`] slot — the
+//! one at the end of the block, and one per side exit. Block chaining
 //! ([`Opcode::GOTO_TB`], [`Opcode::LOOKUP_AND_GOTO`]) needs a successor-linking
 //! design that does not exist yet, and inventing half of one here would be
-//! worse than returning to the dispatcher.
+//! worse than returning to the dispatcher; `jit::Dispatcher` patches the exit
+//! to its successor from outside instead.
+//!
+//! Because every exit is preceded by exactly one boundary that begins no
+//! guest instruction, the number of guest instructions a run *retired* is
+//! [`Interp::boundaries`](crate::ir::Interp::boundaries) minus one — which is
+//! what a caller must count, not [`Lifted::insns`], the moment a block has
+//! more than one exit.
 //!
 //! # How this is known to be right
 //!
@@ -266,10 +358,12 @@ pub enum Stop {
     /// An encoding outside the subset. It was not lifted; the block's exit PC
     /// is its address, so the interpreter executes it next.
     Unsupported,
-    /// A load or store, which was lifted and must be the block's last guest
-    /// instruction because its tick charge is data-dependent (module docs).
+    /// A load or store, which was lifted and ended the block because the
+    /// [`Shape::BasicBlock`] shape asked for it. Never reported by the other
+    /// two shapes, where an access is an ordinary instruction (module docs).
     Access,
-    /// A branch, `JAL` or `JALR`, which was lifted and transfers control.
+    /// A transfer of control this block cannot follow: a `JALR` always, and a
+    /// branch or a `JAL` under a [`Shape`] that does not merge.
     Transfer,
     /// The next instruction would leave the page the block started on.
     Page,
@@ -277,6 +371,69 @@ pub enum Stop {
     Limit,
     /// The instruction bytes could not be read.
     Unreadable,
+}
+
+/// How much a block is allowed to swallow.
+///
+/// `ROADMAP.md` §9's fourth speed mechanism is superblocks, and this is the
+/// switch. [`Shape::Trace`] is what a dispatcher wants; the other two exist
+/// because a speed claim with no baseline is not a measurement — `benches/`
+/// runs all three over the same workloads, and the differential harness runs
+/// all three against the same oracle, so "merging bought this much" is a
+/// number anyone can reproduce rather than an assertion.
+///
+/// The shapes are strictly nested: everything [`Shape::BasicBlock`] lifts,
+/// [`Shape::Extended`] lifts, and everything that lifts, [`Shape::Trace`]
+/// lifts. All three must agree with the interpreter on every column — a
+/// disagreement between two of them is a frontend bug wherever it shows up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Shape {
+    /// A basic block: it ends at the first memory access and at the first
+    /// transfer of control.
+    ///
+    /// The shape this frontend had before traces, kept as the baseline. Its
+    /// cost is written down in the module docs: a load-heavy guest is one
+    /// instruction per block, and per-block dispatch then costs more than the
+    /// work it dispatches to.
+    BasicBlock,
+    /// An extended basic block: a **load** is an ordinary instruction, and only
+    /// a store or a transfer of control ends the block.
+    ///
+    /// One entry, one exit, and the shape that isolates what dealing with the
+    /// tick column alone bought. A store still ends it, for a reason that is
+    /// about self-modifying code rather than about ticks (module docs).
+    Extended,
+    /// A trace: direct branches are merged in, with a precise side exit for
+    /// each path not taken.
+    ///
+    /// One entry, several exits. The default.
+    #[default]
+    Trace,
+}
+
+impl Shape {
+    /// Whether a **load** ends the block. A store always does (module docs).
+    #[inline]
+    #[must_use]
+    pub const fn access_ends_block(self) -> bool {
+        matches!(self, Shape::BasicBlock)
+    }
+
+    /// Whether a direct branch is merged into the block.
+    #[inline]
+    #[must_use]
+    pub const fn merges(self) -> bool {
+        matches!(self, Shape::Trace)
+    }
+
+    /// This shape's contribution to [`Block::key`].
+    const fn key_bits(self) -> u64 {
+        match self {
+            Shape::BasicBlock => 0,
+            Shape::Extended => 1 << 3,
+            Shape::Trace => 2 << 3,
+        }
+    }
 }
 
 /// Which address space `entry_pc` names, and under what mapping.
@@ -326,16 +483,16 @@ impl Origin {
 
     /// This origin's contribution to [`Block::key`].
     ///
-    /// Bit 3 separates the two worlds, so a physical lift and a virtual lift
+    /// Bit 5 separates the two worlds, so a physical lift and a virtual lift
     /// of the same number never collide; above it sits the generation, exact
-    /// until it passes 2^60 — at one `SFENCE.VMA` per nanosecond, thirty-six
-    /// years — after which two generations may alias and a cache would return
-    /// a stale block. Recorded rather than hidden: a wider key is the fix if
-    /// it ever matters.
+    /// until it passes 2^58 — at one `SFENCE.VMA` per nanosecond, nine years —
+    /// after which two generations may alias and a cache would return a stale
+    /// block. Recorded rather than hidden: a wider key is the fix if it ever
+    /// matters.
     const fn key_bits(self) -> u64 {
         match self {
             Origin::Bare => 0,
-            Origin::Paged { generation } => 8 | generation.wrapping_shl(4),
+            Origin::Paged { generation } => (1 << 5) | generation.wrapping_shl(6),
         }
     }
 }
@@ -350,6 +507,12 @@ pub struct Lifted {
     pub stop: Stop,
     /// How many guest instructions were lifted. Zero is legal and means the
     /// block's first instruction was outside the subset.
+    ///
+    /// What the block **covers**, which under [`Shape::Trace`] is not what a
+    /// run through it retires: a trace inlines one side of every branch it
+    /// merges, and leaving through a side exit retires only the instructions
+    /// on the path taken. Anything that has to know what retired counts
+    /// boundaries instead — [`Interp::boundaries`](crate::ir::Interp::boundaries).
     pub insns: usize,
     /// The world this block was lifted in, as the caller declared it.
     pub origin: Origin,
@@ -358,7 +521,13 @@ pub struct Lifted {
 /// How many guest instructions [`lift`] will take by default.
 ///
 /// A block is bounded by its page anyway; this bounds a block of `nop`s in a
-/// tight page and keeps one translation's cost predictable.
+/// tight page and keeps one translation's cost predictable. Under
+/// [`Shape::Trace`] it does a second job: it is the only thing that bounds an
+/// unrolled loop, and — because a dispatcher checks its exit flag at block
+/// boundaries and a trace has fewer of them — it is also the bound on how long
+/// a safe point can be delayed (`ROADMAP.md` §4.7). Sixty-four guest
+/// instructions is a few microseconds of interpreted execution, so a stop is
+/// still prompt.
 pub const MAX_INSNS: usize = 64;
 
 // ---------------------------------------------------------------------------
@@ -389,13 +558,14 @@ pub fn lift<S: InsnSource>(
     entry_pc: u64,
     src: &mut S,
     max_insns: usize,
+    shape: Shape,
 ) -> Result<Lifted> {
     if !matches!(cfg.xlen, Xlen::Rv64) {
         return Err(Error::Unimplemented("the RISC-V IR frontend is RV64 only"));
     }
 
-    let mut lf = Lifter::new(cfg, origin, entry_pc);
-    let page = entry_pc & !PAGE_MASK;
+    let mut lf = Lifter::new(cfg, origin, entry_pc, shape);
+    let page = lf.page;
     let mut pc = entry_pc;
     let mut insns = 0usize;
 
@@ -433,14 +603,22 @@ pub fn lift<S: InsnSource>(
         let next_pc = pc.wrapping_add(len);
         match lf.insn(word, pc, next_pc, fetch) {
             Flow::Rejected => break Stop::Unsupported,
-            Flow::Continue => {
+            // `next` is `next_pc` for everything in program order and the
+            // target for a merged branch, which is the whole of what merging
+            // does to this loop.
+            Flow::Continue(next) => {
                 insns += 1;
-                pc = next_pc;
+                pc = next;
             }
-            Flow::Access => {
+            Flow::Access { next, store } => {
                 insns += 1;
-                pc = next_pc;
-                break Stop::Access;
+                pc = next;
+                // A store ends the block under every shape, and the reason is
+                // not the tick column — see "A store still ends the block" in
+                // the module docs.
+                if store || shape.access_ends_block() {
+                    break Stop::Access;
+                }
             }
             Flow::Transfer => {
                 insns += 1;
@@ -464,8 +642,11 @@ pub fn lift<S: InsnSource>(
 /// [`Block::key`] is the rest of the cache key beside the entry PC. Identical
 /// guest bytes lift differently under a different `C` setting (`JALR`'s
 /// alignment guarantee, and whether a 16-bit encoding is an instruction at
-/// all) and under a different misalignment policy (the [`Align`] a memory op
-/// carries), so both belong here or a cache returns the wrong translation.
+/// all), under a different misalignment policy (the [`Align`] a memory op
+/// carries), and under a different [`Shape`] — so all three belong here or a
+/// cache returns the wrong translation. The shape is in the key even though
+/// every shape is *correct*: a cache that mixed them would make a measurement
+/// of one of them a measurement of whichever happened to be resident.
 ///
 /// The [`Origin`] belongs here for a stronger reason: under translation the
 /// *bytes* at `entry_pc` are a function of the page tables, so a key without
@@ -478,7 +659,7 @@ pub fn lift<S: InsnSource>(
 /// dispatcher that derived the key itself would be a second copy of the
 /// answer, and the two would drift.
 #[must_use]
-pub fn key(cfg: &Config, origin: Origin) -> u64 {
+pub fn key(cfg: &Config, origin: Origin, shape: Shape) -> u64 {
     let mut key = 0u64;
     if cfg.ext.c {
         key |= 1;
@@ -489,7 +670,7 @@ pub fn key(cfg: &Config, origin: Origin) -> u64 {
     if matches!(cfg.xlen, Xlen::Rv64) {
         key |= 4;
     }
-    key | origin.key_bits()
+    key | shape.key_bits() | origin.key_bits()
 }
 
 // The block bound is one page, and it is sound only because the smallest
@@ -753,25 +934,44 @@ const fn branch_cond(op: Op) -> Cond {
 // The lifter
 // ---------------------------------------------------------------------------
 
-/// What lifting one instruction did to the block.
+/// What lifting one instruction did to the block, and where lifting goes next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Flow {
     /// Nothing was emitted; the instruction is outside the subset.
     Rejected,
-    /// Lifted; the block may continue.
-    Continue,
-    /// Lifted, and it made a memory access, so the block must end.
-    Access,
-    /// Lifted, and it transferred control, so the block must end.
+    /// Lifted; carry on at this guest PC.
+    ///
+    /// The PC is the program-order successor for everything except a merged
+    /// direct branch, where it is the branch's target — which is the entire
+    /// mechanism by which a trace spans more than one basic block.
+    Continue(u64),
+    /// Lifted a memory access; carry on at this guest PC unless the [`Shape`]
+    /// ends the block at one, or unless it was a store.
+    Access {
+        /// Where lifting carries on.
+        next: u64,
+        /// Whether it was a store, which ends the block whatever the shape.
+        store: bool,
+    },
+    /// Lifted, and it transferred control somewhere this block cannot follow,
+    /// so the block ends.
     Transfer,
 }
 
 /// One translation in progress.
 struct Lifter<'a> {
     cfg: &'a Config,
+    shape: Shape,
+    /// The page the entry PC is on. No instruction outside it is ever lifted,
+    /// which is what keeps every fetch charge static (module docs).
+    page: u64,
     b: BlockBuilder,
     /// Which temporary holds each integer register, where one does. `x[0]` is
     /// never bound: the register is hard-wired zero.
+    ///
+    /// **This is the trace's register allocation.** It survives a merged
+    /// branch untouched, so a value computed before a `JAL` is still in a
+    /// temporary after it rather than having gone out to a slot and come back.
     x: [Option<Temp>; 32],
     /// The block's one zero immediate, shared by every `x0` read.
     zero: Option<Temp>,
@@ -785,16 +985,56 @@ struct Lifter<'a> {
 }
 
 impl<'a> Lifter<'a> {
-    fn new(cfg: &'a Config, origin: Origin, entry_pc: u64) -> Lifter<'a> {
+    fn new(cfg: &'a Config, origin: Origin, entry_pc: u64, shape: Shape) -> Lifter<'a> {
         Lifter {
             cfg,
-            b: BlockBuilder::new(entry_pc, key(cfg, origin)),
+            shape,
+            page: entry_pc & !PAGE_MASK,
+            b: BlockBuilder::new(entry_pc, key(cfg, origin, shape)),
             x: [None; 32],
             zero: None,
             ticks: 0,
             pc_out: None,
             static_exit: None,
         }
+    }
+
+    /// Emit a precise side exit: leave the block for `exit_pc` when `when`
+    /// holds of `lhs` and `rhs`, and fall through otherwise.
+    ///
+    /// The sequence is *inline* and branched over on the negated condition,
+    /// rather than appended at the end of the block. Three things that buys,
+    /// and none of them is cosmetic: the boundary records stay in program
+    /// order so [`InsnStart::ticks`] stays monotonic and the verifier's check
+    /// on it keeps working; every [`Opcode::BRCOND`] stays a *forward* branch,
+    /// which is the assumption `ir::pass`'s single backward liveness walk is
+    /// built on; and the exit's live map is taken exactly here, at the branch,
+    /// which is what makes leaving through it architecturally precise.
+    fn side_exit(&mut self, when: Cond, lhs: Temp, rhs: Temp, exit_pc: u64) {
+        let over = self.b.emit_raw(
+            Opcode::BRCOND,
+            Type::I64,
+            None,
+            None,
+            &[lhs, rhs],
+            None,
+            Some(when.invert()),
+            0,
+        );
+        // Everything from here to the terminator runs only on the exit path,
+        // so the constant costs nothing when the branch is not taken.
+        let target = self.konst(exit_pc);
+        let mut live = self.live_regs();
+        live.push((PC, target));
+        self.b.insn_start(InsnStart {
+            pc: exit_pc,
+            next_pc: exit_pc,
+            ticks: self.ticks,
+            live,
+        });
+        self.b.exit_tb();
+        let after = self.b.next_index() as u32;
+        self.b.patch_aux(over, after);
     }
 
     /// Materialize a 64-bit constant.
@@ -939,14 +1179,14 @@ impl<'a> Lifter<'a> {
         self.ticks += fetch;
 
         if folded {
-            return Flow::Continue;
+            return Flow::Continue(next_pc);
         }
 
         match plan {
             Plan::Alu(alu) => {
                 let v = self.emit_alu(alu, a, b);
                 self.write_x(rd, v);
-                Flow::Continue
+                Flow::Continue(next_pc)
             }
             Plan::Load { size, sign } => {
                 let base = self.need(a);
@@ -966,7 +1206,10 @@ impl<'a> Lifter<'a> {
                 };
                 let v = self.b.load(Type::I64, addr, mem);
                 self.write_x(rd, v);
-                Flow::Access
+                Flow::Access {
+                    next: next_pc,
+                    store: false,
+                }
             }
             Plan::Store { size } => {
                 let base = self.need(a);
@@ -984,26 +1227,53 @@ impl<'a> Lifter<'a> {
                     volatile: true,
                 };
                 self.b.store(Type::I64, addr, value, mem);
-                Flow::Access
+                Flow::Access {
+                    next: next_pc,
+                    store: true,
+                }
             }
             Plan::Branch { cond, target } => {
                 let lhs = self.need(a);
                 let rhs = self.need(b);
-                let taken = self.b.setcond(cond, Type::I64, lhs, rhs);
-                let then = self.konst(target);
-                let other = self.konst(next_pc);
-                // MOVCOND's operands are the condition and then the two
-                // values, in `cond ? then : else` order.
-                let sel = self
-                    .b
-                    .emit(Opcode::MOVCOND, Type::I64, &[taken, then, other]);
-                self.pc_out = Some(sel);
-                Flow::Transfer
+                if !self.shape.merges() {
+                    let taken = self.b.setcond(cond, Type::I64, lhs, rhs);
+                    let then = self.konst(target);
+                    let other = self.konst(next_pc);
+                    // MOVCOND's operands are the condition and then the two
+                    // values, in `cond ? then : else` order.
+                    let sel = self
+                        .b
+                        .emit(Opcode::MOVCOND, Type::I64, &[taken, then, other]);
+                    self.pc_out = Some(sel);
+                    return Flow::Transfer;
+                }
+                // Static prediction, and it is what decides whether a loop
+                // unrolls: a backward branch is a back edge, so the taken side
+                // is the trace; a forward one is an `if`, so the fall-through
+                // is. A backward target off the entry page is not a candidate,
+                // because no instruction outside that page may be lifted.
+                let inline_taken = target < pc && target & !PAGE_MASK == self.page;
+                let (exit_pc, next, exit_when) = if inline_taken {
+                    (next_pc, target, cond.invert())
+                } else {
+                    (target, next_pc, cond)
+                };
+                self.side_exit(exit_when, lhs, rhs, exit_pc);
+                Flow::Continue(next)
             }
             Plan::Jal { target } => {
                 if rd != 0 {
                     let link = self.konst(next_pc);
                     self.write_x(rd, link);
+                }
+                if self.shape.merges() {
+                    // A direct unconditional transfer: the trace continues at
+                    // the target and the jump costs nothing but its fetch. A
+                    // target off the entry page ends the block one turn later,
+                    // through the loop's page check, and `finish` then names
+                    // the target as the exit PC — the same answer this arm
+                    // would have produced.
+                    return Flow::Continue(target);
                 }
                 let t = self.konst(target);
                 self.pc_out = Some(t);
@@ -1250,17 +1520,27 @@ mod tests {
     /// Every test goes through here, which is how "verify accepts every block
     /// this frontend produces" is asserted everywhere rather than once.
     fn lift_at(cfg: &Config, base: u64, words: &[u32]) -> Lifted {
+        lift_shaped(cfg, base, words, Shape::default())
+    }
+
+    fn lift_shaped(cfg: &Config, base: u64, words: &[u32], shape: Shape) -> Lifted {
         let mut src = Bytes {
             base,
             words: words.to_vec(),
         };
-        let lifted = lift(cfg, Origin::Bare, base, &mut src, MAX_INSNS).expect("RV64 lifts");
+        let lifted = lift(cfg, Origin::Bare, base, &mut src, MAX_INSNS, shape).expect("RV64 lifts");
         verify(&lifted.block).unwrap_or_else(|e| panic!("{e}\n{}", lifted.block));
         lifted
     }
 
     fn rv64i(words: &[u32]) -> Lifted {
         lift_at(&Config::rv64i(), BASE, words)
+    }
+
+    /// The same program under every shape, so a test that names one shape's
+    /// behaviour is never quietly testing another's.
+    fn shaped(words: &[u32], shape: Shape) -> Lifted {
+        lift_shaped(&Config::rv64i(), BASE, words, shape)
     }
 
     /// The ops in a block, as mnemonics, so a test can say what it expects.
@@ -1585,23 +1865,61 @@ mod tests {
     }
 
     #[test]
-    fn a_memory_op_ends_the_block_and_charges_nothing_itself() {
+    fn a_memory_op_charges_nothing_itself_whatever_the_shape() {
+        // The access count is 1 when aligned and `bytes` when not, plus walk
+        // reads on a TLB miss, so the LD accounts for itself and this frontend
+        // emits no charge for it. What changed with traces is only *where* the
+        // block ends, not what it charges.
         let program = [ld(5, 1, 8), addi(6, 0, 1)];
-        let l = rv64i(&program);
-        assert_eq!(l.insns, 1);
-        assert_eq!(l.stop, Stop::Access);
-        // Only the fetch is charged here: the access count is 1 when aligned
-        // and `bytes` when not, plus walk reads on a TLB miss, so the LD
-        // accounts for itself and nothing may follow it in the block.
-        assert_eq!(block_ticks(&l.block), 2);
-        let charges: Vec<u128> = l
-            .block
-            .insts()
-            .iter()
-            .filter(|i| i.op == Opcode::CHARGE)
-            .filter_map(|i| i.imm.map(Const::bits))
-            .collect();
-        assert_eq!(charges, vec![2]);
+        for shape in [Shape::BasicBlock, Shape::Extended, Shape::Trace] {
+            let l = shaped(&program, shape);
+            let charges: Vec<u128> = l
+                .block
+                .insts()
+                .iter()
+                .filter(|i| i.op == Opcode::CHARGE)
+                .filter_map(|i| i.imm.map(Const::bits))
+                .collect();
+            if shape.access_ends_block() {
+                assert_eq!(l.insns, 1, "{shape:?}");
+                assert_eq!(l.stop, Stop::Access);
+                assert_eq!(block_ticks(&l.block), 2);
+                assert_eq!(charges, vec![2]);
+            } else {
+                // The `addi` after the load is in the block now, and the only
+                // charges are still the two fetches.
+                assert_eq!(l.insns, 2, "{shape:?}");
+                assert_eq!(block_ticks(&l.block), 4, "{shape:?}");
+                assert_eq!(charges, vec![2, 2], "{shape:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_store_ends_the_block_under_every_shape() {
+        // Not about ticks: a store into the block's own page would make every
+        // instruction after it a translation of bytes that no longer exist,
+        // and the interpreter — which re-fetches — would see the new ones.
+        for shape in [Shape::BasicBlock, Shape::Extended, Shape::Trace] {
+            let l = shaped(&[sd(1, 2, 0), addi(6, 0, 1), ECALL], shape);
+            assert_eq!(l.insns, 1, "{shape:?}");
+            assert_eq!(l.stop, Stop::Access, "{shape:?}");
+        }
+        // A load does not, once the shape allows it.
+        let l = shaped(&[ld(5, 1, 0), addi(6, 0, 1), ECALL], Shape::Trace);
+        assert_eq!(l.insns, 2);
+    }
+
+    #[test]
+    fn the_static_tick_column_stays_monotonic_across_an_access() {
+        // The reason an access used to end a block was this column, so this is
+        // the assertion that stands in for the rule that went away: the column
+        // counts the *static* charges and nothing else, so it is still exactly
+        // two per uncompressed instruction with a load in the middle.
+        let l = rv64i(&[addi(5, 0, 1), ld(6, 1, 0), addi(7, 0, 2), ECALL]);
+        let ticks: Vec<u64> = l.block.marks().iter().map(|m| m.ticks).collect();
+        assert_eq!(ticks, vec![0, 2, 4, 6]);
+        assert_eq!(l.insns, 3);
     }
 
     // -- loads and stores ---------------------------------------------------
@@ -1675,49 +1993,245 @@ mod tests {
     // -- control flow -------------------------------------------------------
 
     #[test]
-    fn a_conditional_branch_selects_between_two_constant_pcs() {
-        let l = rv64i(&[beq(1, 2, 8), addi(5, 0, 1)]);
-        assert_eq!(l.insns, 1);
-        assert_eq!(l.stop, Stop::Transfer);
-        let names = ops(&l.block);
-        assert!(names.contains(&"setcond"), "{names:?}");
-        assert!(names.contains(&"movcond"), "{names:?}");
-        // The selected value is the exit PC.
-        let sel = l
-            .block
-            .insts()
-            .iter()
-            .find(|i| i.op == Opcode::MOVCOND)
-            .unwrap();
-        let exit = l.block.marks().last().unwrap();
-        assert_eq!(exit.live.last().copied(), Some((PC, sel.dst.unwrap())));
-        // The two candidates are the taken target and the fall-through.
-        let constants: Vec<u128> = l
-            .block
-            .insts()
-            .iter()
-            .filter_map(|i| i.imm.map(Const::bits))
-            .collect();
-        assert!(constants.contains(&u128::from(BASE + 8)), "{constants:x?}");
-        assert!(constants.contains(&u128::from(BASE + 4)), "{constants:x?}");
+    fn without_merging_a_conditional_branch_selects_between_two_constant_pcs() {
+        for shape in [Shape::BasicBlock, Shape::Extended] {
+            let l = shaped(&[beq(1, 2, 8), addi(5, 0, 1)], shape);
+            assert_eq!(l.insns, 1);
+            assert_eq!(l.stop, Stop::Transfer);
+            let names = ops(&l.block);
+            assert!(names.contains(&"setcond"), "{names:?}");
+            assert!(names.contains(&"movcond"), "{names:?}");
+            // The selected value is the exit PC.
+            let sel = l
+                .block
+                .insts()
+                .iter()
+                .find(|i| i.op == Opcode::MOVCOND)
+                .unwrap();
+            let exit = l.block.marks().last().unwrap();
+            assert_eq!(exit.live.last().copied(), Some((PC, sel.dst.unwrap())));
+            // The two candidates are the taken target and the fall-through.
+            let constants: Vec<u128> = l
+                .block
+                .insts()
+                .iter()
+                .filter_map(|i| i.imm.map(Const::bits))
+                .collect();
+            assert!(constants.contains(&u128::from(BASE + 8)), "{constants:x?}");
+            assert!(constants.contains(&u128::from(BASE + 4)), "{constants:x?}");
+        }
     }
 
     #[test]
-    fn jal_links_a_constant_and_exits_at_a_known_pc() {
-        let l = rv64i(&[j_type(1, 8), addi(5, 0, 1)]);
-        assert_eq!(l.stop, Stop::Transfer);
+    fn a_forward_branch_becomes_a_side_exit_and_the_trace_falls_through() {
+        // `beq` over one instruction, then two more. A forward branch is an
+        // `if`, so the fall-through is inlined and the taken side is the exit.
+        let l = shaped(
+            &[beq(1, 2, 8), addi(5, 0, 1), addi(6, 0, 2), ECALL],
+            Shape::Trace,
+        );
+        assert_eq!(l.insns, 3, "the branch and both instructions after it");
+        let names = ops(&l.block);
+        assert!(names.contains(&"brcond"), "{names:?}");
+        assert!(
+            !names.contains(&"movcond"),
+            "no pc select is needed: {names:?}"
+        );
+
+        // Two exit boundaries: the side exit at the taken target, and the
+        // block's own at the `ecall`.
+        let exits: Vec<u64> = l
+            .block
+            .marks()
+            .iter()
+            .filter(|m| m.pc == m.next_pc)
+            .map(|m| m.pc)
+            .collect();
+        assert_eq!(exits, vec![BASE + 8, BASE + 12], "{}", l.block);
+        // The branch is inverted, so it skips the exit sequence rather than
+        // entering it.
+        let brcond = l
+            .block
+            .insts()
+            .iter()
+            .find(|i| i.op == Opcode::BRCOND)
+            .expect("a side exit branches");
+        assert_eq!(brcond.cond, Some(Cond::Eq.invert()));
+        // Every side exit ends in a terminator of its own.
+        assert_eq!(
+            l.block
+                .insts()
+                .iter()
+                .filter(|i| i.op == Opcode::EXIT_TB)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_backward_branch_unrolls_the_loop_it_closes() {
+        // A back edge is predicted taken, so the *taken* side is the trace and
+        // the fall-through becomes the side exit. Two instructions round the
+        // loop and a sixty-four instruction limit is thirty-two iterations.
+        let l = shaped(&[addi(5, 5, 1), beq(0, 0, -4)], Shape::Trace);
+        assert_eq!(l.insns, MAX_INSNS);
+        assert_eq!(l.stop, Stop::Limit);
+        // Every side exit leaves for the fall-through, which is the
+        // instruction after the branch.
+        let exits: Vec<u64> = l
+            .block
+            .marks()
+            .iter()
+            .filter(|m| m.pc == m.next_pc)
+            .map(|m| m.pc)
+            .collect();
+        assert_eq!(exits.len(), 33, "one per iteration, plus the block's own");
+        assert!(exits[..32].iter().all(|pc| *pc == BASE + 8), "{exits:x?}");
+    }
+
+    #[test]
+    fn a_backward_branch_off_the_entry_page_is_a_side_exit_rather_than_a_trace() {
+        // No instruction outside the entry page may be lifted, so a back edge
+        // that leaves it cannot be the inlined side — the fall-through is.
+        let base = BASE + 0x1000;
+        let l = lift_shaped(
+            &Config::rv64i(),
+            base,
+            &[beq(0, 0, -0x100), addi(5, 0, 1), ECALL],
+            Shape::Trace,
+        );
+        assert_eq!(l.insns, 2, "the branch and the fall-through");
+        let exits: Vec<u64> = l
+            .block
+            .marks()
+            .iter()
+            .filter(|m| m.pc == m.next_pc)
+            .map(|m| m.pc)
+            .collect();
+        assert_eq!(exits, vec![base - 0x100, base + 8]);
+    }
+
+    #[test]
+    fn without_merging_jal_links_a_constant_and_exits_at_a_known_pc() {
+        for shape in [Shape::BasicBlock, Shape::Extended] {
+            let l = shaped(&[j_type(1, 8), addi(5, 0, 1)], shape);
+            assert_eq!(l.stop, Stop::Transfer);
+            let exit = l.block.marks().last().unwrap();
+            // The exit boundary names the target, because JAL's is a constant.
+            assert_eq!(exit.pc, BASE + 8);
+            // x1 holds the return address.
+            assert!(exit.live.iter().any(|(s, _)| *s == x_slot(1)));
+        }
+    }
+
+    #[test]
+    fn a_trace_walks_straight_through_a_direct_jump() {
+        // `jal` over one instruction, into two more. The skipped instruction
+        // is not in the block at all, and the jump costs nothing but its fetch.
+        let l = shaped(
+            &[j_type(1, 8), addi(5, 0, 1), addi(6, 0, 2), ECALL],
+            Shape::Trace,
+        );
+        assert_eq!(l.insns, 2, "the jump and the instruction it jumped to");
+        let pcs: Vec<u64> = l.block.marks().iter().map(|m| m.pc).collect();
+        assert_eq!(pcs, vec![BASE, BASE + 8, BASE + 12]);
+        assert_eq!(
+            l.block.marks()[2].ticks,
+            4,
+            "two fetches each, nothing else"
+        );
+        // x1 still holds the return address the jump linked.
         let exit = l.block.marks().last().unwrap();
-        // The exit boundary names the target, because JAL's is a constant.
-        assert_eq!(exit.pc, BASE + 8);
-        // x1 holds the return address.
         assert!(exit.live.iter().any(|(s, _)| *s == x_slot(1)));
     }
 
     #[test]
+    fn a_slot_a_boundary_shadows_stays_shadowed_at_every_later_boundary() {
+        // `InsnStart::live`'s invariant, asserted for this frontend. Lazy
+        // publication means a slot dropped from the mapping mid-block silently
+        // reverts to whatever the host last held, and nothing would fail —
+        // until a fault, on one path, in one program.
+        //
+        // A trace with a merged jump, a merged backward branch and a load, so
+        // the mapping is built up across every kind of merged boundary.
+        let l = shaped(
+            &[
+                addi(5, 0, 1), // 0x00
+                addi(6, 5, 2), // 0x04
+                ld(7, 1, 0),   // 0x08
+                beq(0, 0, -8), // 0x0c  back edge, taken side inlined
+            ],
+            Shape::Trace,
+        );
+        let mut seen: Vec<u16> = Vec::new();
+        let insts = l.block.insts();
+        for (i, inst) in insts.iter().enumerate() {
+            if inst.op != Opcode::INSN_START {
+                continue;
+            }
+            let mark = &l.block.marks()[inst.aux as usize];
+            let here: Vec<u16> = mark.live.iter().map(|(s, _)| s.0).collect();
+            for slot in &seen {
+                assert!(
+                    here.contains(slot),
+                    "boundary {i} at {:#x} dropped slot {slot}, whose host copy is stale:\n{}",
+                    mark.pc,
+                    l.block
+                );
+            }
+            // An exit boundary — one followed straight by a terminator — may
+            // name more, because nothing on that path follows it. Its extras
+            // are therefore not required of the boundaries after it.
+            let is_exit = insts.get(i + 1).is_some_and(|next| next.op.is_terminator());
+            if !is_exit {
+                for slot in here {
+                    if !seen.contains(&slot) {
+                        seen.push(slot);
+                    }
+                }
+            }
+        }
+        assert!(seen.len() >= 3, "the trace bound x5, x6 and x7: {seen:?}");
+    }
+
+    #[test]
+    fn a_register_computed_before_a_merged_jump_is_still_in_a_temporary_after_it() {
+        // `ROADMAP.md` §9's mechanism 4, second half: *keep guest registers in
+        // host registers across block boundaries within a trace*. `x5` is
+        // written before the jump and read after it, and the read must reuse
+        // the temporary rather than emit a `get_slot`.
+        let l = shaped(
+            &[
+                addi(5, 0, 7),
+                j_type(0, 8),
+                addi(9, 0, 1),
+                addi(6, 5, 1),
+                ECALL,
+            ],
+            Shape::Trace,
+        );
+        assert_eq!(l.insns, 3);
+        let reads: Vec<u32> = l
+            .block
+            .insts()
+            .iter()
+            .filter(|i| i.op == Opcode::GET_SLOT)
+            .map(|i| i.aux)
+            .collect();
+        assert!(
+            !reads.contains(&5),
+            "x5 went out to a slot and came back: {}",
+            l.block
+        );
+    }
+
+    #[test]
     fn jal_with_no_link_register_emits_no_link() {
-        let l = rv64i(&[j_type(0, 8)]);
-        let exit = l.block.marks().last().unwrap();
-        assert_eq!(exit.live.len(), 1, "only the PC");
+        for shape in [Shape::BasicBlock, Shape::Extended] {
+            let l = shaped(&[j_type(0, 8)], shape);
+            let exit = l.block.marks().last().unwrap();
+            assert_eq!(exit.live.len(), 1, "only the PC");
+        }
     }
 
     #[test]
@@ -1796,7 +2310,15 @@ mod tests {
             base: BASE,
             words: vec![addi(5, 0, 1); 8],
         };
-        let l = lift(&Config::rv64i(), Origin::Bare, BASE, &mut src, 3).expect("RV64 lifts");
+        let l = lift(
+            &Config::rv64i(),
+            Origin::Bare,
+            BASE,
+            &mut src,
+            3,
+            Shape::default(),
+        )
+        .expect("RV64 lifts");
         verify(&l.block).expect("a limited block still verifies");
         assert_eq!(l.insns, 3);
         assert_eq!(l.stop, Stop::Limit);
@@ -1815,8 +2337,15 @@ mod tests {
             base: BASE,
             words: vec![addi(5, 0, 1)],
         };
-        let err = lift(&Config::rv32gc(), Origin::Bare, BASE, &mut src, MAX_INSNS)
-            .expect_err("RV32 is not lifted yet");
+        let err = lift(
+            &Config::rv32gc(),
+            Origin::Bare,
+            BASE,
+            &mut src,
+            MAX_INSNS,
+            Shape::default(),
+        )
+        .expect_err("RV32 is not lifted yet");
         assert!(matches!(err, Error::Unimplemented(_)), "{err}");
     }
 
@@ -1872,6 +2401,7 @@ mod tests {
             BASE,
             &mut src,
             MAX_INSNS,
+            Shape::default(),
         )
         .expect("RV64 lifts")
         .block
@@ -1897,10 +2427,17 @@ mod tests {
                 base: BASE,
                 words: words.to_vec(),
             };
-            lift(&Config::rv64i(), origin, BASE, &mut src, MAX_INSNS)
-                .expect("RV64 lifts")
-                .block
-                .key
+            lift(
+                &Config::rv64i(),
+                origin,
+                BASE,
+                &mut src,
+                MAX_INSNS,
+                Shape::default(),
+            )
+            .expect("RV64 lifts")
+            .block
+            .key
         };
         assert_ne!(key_of(before), key_of(after));
     }

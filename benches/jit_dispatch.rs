@@ -7,40 +7,53 @@
 //! one at a time so the number attaches to a mechanism rather than to a
 //! release.
 //!
-//! # The four configurations
+//! # The six configurations
 //!
-//! | | translation | memory |
-//! | --- | --- | --- |
-//! | `interpreter` | none — `Hart::step`, the oracle | `AddressSpace` |
-//! | `lift-every-time` | re-lift every block, no cache | `AddressSpace` |
-//! | `cached` | block cache, exits chained | `AddressSpace` |
-//! | `cached+tlb` | block cache, exits chained | `jit::Tlb` |
+//! | | translation | block shape | memory |
+//! | --- | --- | --- | --- |
+//! | `interpreter` | none — `Hart::step`, the oracle | — | `AddressSpace` |
+//! | `lift-each-time` | re-lift every block, no cache | basic block | `AddressSpace` |
+//! | `cached` | block cache, exits chained | basic block | `AddressSpace` |
+//! | `cached+tlb` | block cache, exits chained | basic block | `jit::Tlb` |
+//! | `+extended` | block cache, exits chained | a load no longer ends a block | `jit::Tlb` |
+//! | `+superblock` | block cache, exits chained | direct branches merged, with side exits | `jit::Tlb` |
 //!
-//! The rows are cumulative on purpose: `lift-every-time` is the honest
+//! The rows are cumulative on purpose: `lift-each-time` is the honest
 //! starting point for a translator, because a translator that re-lifts is
 //! slower than the interpreter it replaces, and the cache is what turns that
 //! around. Reporting the cache's win against the interpreter instead would
 //! credit it with the lifter's speed as well.
 //!
+//! The last two rows exist because a claim about superblocks needs a baseline
+//! that is still runnable rather than a number from a previous commit. They
+//! are [`lift::Shape`]'s three values, and the corpus in
+//! `tests/riscv_lift_differential.rs` runs all three against the interpreter,
+//! so a shape that got faster by getting wrong would fail a test rather than
+//! win a column.
+//!
 //! # The workloads
 //!
-//! Three RISC-V programs, all inside the lifted RV64I subset, all written here
+//! Four RISC-V programs, all inside the lifted RV64I subset, all written here
 //! rather than fetched, because a commercial ROM cannot be committed
 //! (CLAUDE.md, "Testing"):
 //!
 //! * **`alu-loop`** — a tight arithmetic loop, one block, chained to itself.
 //!   The best case for the block cache and a case the TLB never sees, since it
-//!   touches no memory.
+//!   touches no memory. Its back edge is a direct `JAL`, so a trace unrolls it.
 //! * **`memcpy`** — a byte-at-a-time copy loop: a load, a store, six
 //!   arithmetic instructions and a branch. Every iteration crosses the memory
-//!   path twice.
-//! * **`load-heavy`** — four loads and a jump. The lifter ends a block at
-//!   every access (`cpu::riscv::lift`, "Ticks"), so this is one guest
-//!   instruction per block and the highest ratio of memory work to everything
-//!   else the subset can express. It is the TLB's best case *and* the block
-//!   cache's worst, and the two facts are the same fact.
+//!   path twice, and the **store** ends the block under every shape
+//!   (`cpu::riscv::lift`, "A store still ends the block"), so this is the
+//!   workload that shows what that rule costs.
+//! * **`load-heavy`** — four loads and a jump. Under the basic-block shape the
+//!   lifter ended a block at every access, so this was one guest instruction
+//!   per block and the highest ratio of memory work to everything else the
+//!   subset can express: the TLB's best case *and* the block cache's worst,
+//!   which are the same fact. It is the row the `+extended` column was written
+//!   for.
 //! * **`chain`** — four blocks in a cycle, so the exits are patched in four
-//!   directions and a lookup is a lookup rather than a self-loop.
+//!   directions and a lookup is a lookup rather than a self-loop. Every edge
+//!   is a direct `JAL`, so a trace swallows the whole cycle.
 //!
 //! # The method
 //!
@@ -51,6 +64,18 @@
 //! the most expensive mistake available in a file like this. The reported
 //! figure is the best of `--reps` timed runs after one warm-up, because the
 //! minimum is the sample least polluted by the host's other work.
+//!
+//! **A dispatcher's budget is in blocks, and a trace is a much bigger block,**
+//! which is a trap this file fell into and is worth writing down. The timed
+//! loop asks for blocks until the instruction target is met, so a fixed block
+//! budget overshoots by up to one budget's worth of blocks: 0.6% of a five
+//! million instruction run under basic blocks, and **thirteen times the whole
+//! run** under a trace, which read as the superblock column being four times
+//! *slower* than no translation at all. Two things fix it, and both are here
+//! because either alone would leave a number that is nearly right for the
+//! wrong reason: the block budget is re-aimed at what is left after every
+//! call, and the reported time is scaled by the instructions actually retired
+//! rather than by the ones asked for.
 //!
 //! **`cargo bench` only.** The bench profile is `-O` with debug assertions
 //! off; the same code under `cargo test` is several times slower and the
@@ -68,7 +93,7 @@ use std::time::{Duration, Instant};
 use rsemu::core::error::Result;
 use rsemu::core::space::{AddressSpace, MemAttrs, MemResult, RamStore, Region, UnassignedPolicy};
 use rsemu::core::value::Width;
-use rsemu::cpu::riscv::lift::{self, Origin, PC, SLOT_COUNT, x_slot};
+use rsemu::cpu::riscv::lift::{self, Origin, PC, SLOT_COUNT, Shape, x_slot};
 use rsemu::cpu::riscv::{Config, Hart};
 use rsemu::ir::{AccessKind, Align, InsnStart, IrHost, MemOp, RegSlot};
 use rsemu::jit::{
@@ -89,29 +114,46 @@ fn main() {
         args.insns, args.reps
     );
     println!(
-        "{:<12} {:>14} {:>14} {:>14} {:>14}",
-        "workload", "interpreter", "lift-each-time", "cached", "cached+tlb"
+        "{:<12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+        "workload", "interpreter", "lift-each", "cached", "cached+tlb", "+extended", "+superblock",
     );
     for w in workloads() {
+        let basic = Shape::BasicBlock;
         let interp = best(args.reps, || run_interpreter(&w, args.insns));
-        let cold = best(args.reps, || run_translated(&w, args.insns, false, false));
-        let cached = best(args.reps, || run_translated(&w, args.insns, true, false));
-        let tlb = best(args.reps, || run_translated(&w, args.insns, true, true));
+        let cold = best(args.reps, || {
+            run_translated(&w, args.insns, false, false, basic)
+        });
+        let cached = best(args.reps, || {
+            run_translated(&w, args.insns, true, false, basic)
+        });
+        let tlb = best(args.reps, || {
+            run_translated(&w, args.insns, true, true, basic)
+        });
+        let extended = best(args.reps, || {
+            run_translated(&w, args.insns, true, true, Shape::Extended)
+        });
+        let trace = best(args.reps, || {
+            run_translated(&w, args.insns, true, true, Shape::Trace)
+        });
         println!(
-            "{:<12} {:>14} {:>14} {:>14} {:>14}",
+            "{:<12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
             w.name,
             mips(args.insns, interp),
             mips(args.insns, cold),
             mips(args.insns, cached),
             mips(args.insns, tlb),
+            mips(args.insns, extended),
+            mips(args.insns, trace),
         );
         println!(
-            "{:<12} {:>14} {:>14} {:>14} {:>14}",
+            "{:<12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
             "",
             "1.00x",
             ratio(interp, cold),
             ratio(interp, cached),
             ratio(interp, tlb),
+            ratio(interp, extended),
+            ratio(interp, trace),
         );
     }
     println!(
@@ -326,9 +368,9 @@ fn run_interpreter(w: &Workload, insns: u64) -> Duration {
 /// Checked against the interpreter before it is timed: the two must reach the
 /// same register file after the same number of guest instructions, or the
 /// number below is measuring a guest that stopped working.
-fn run_translated(w: &Workload, insns: u64, cache: bool, tlb: bool) -> Duration {
+fn run_translated(w: &Workload, insns: u64, cache: bool, tlb: bool, shape: Shape) -> Duration {
     let (space, _ram) = machine(w);
-    let mut front = Lifter::new(Arc::clone(&space));
+    let mut front = Lifter::new(Arc::clone(&space), shape);
     let mut host = BenchHost::new(w, space, tlb);
     // "No cache" is one block per call plus a flush between, which also
     // removes chaining — a translator that re-lifts has no predecessor to
@@ -336,7 +378,7 @@ fn run_translated(w: &Workload, insns: u64, cache: bool, tlb: bool) -> Duration 
     // the cache live inside the call and measure something else. Its cache is
     // sized to one block so that the flush itself is not what is being timed.
     let mut disp = Dispatcher::with_cache(BlockCache::with_capacity(if cache { 1024 } else { 1 }));
-    let budget = if cache { 4096 } else { 1 };
+    let mut budget = if cache { BLOCK_BUDGET } else { 1 };
 
     let start = Instant::now();
     let mut done = 0u64;
@@ -355,9 +397,24 @@ fn run_translated(w: &Workload, insns: u64, cache: bool, tlb: bool) -> Duration 
         pc = run.pc;
         if !cache {
             disp.cache_mut().flush();
+        } else if run.blocks > 0 {
+            // Re-aim at what is left. A budget in *blocks* means a trace can
+            // overshoot the target by an order of magnitude, and a run that
+            // did thirteen times the work in the same time is not a slow run
+            // (see "The method").
+            let per_block = (run.insns as u64 / run.blocks as u64).max(1);
+            budget = usize::try_from((insns.saturating_sub(done) / per_block) + 1)
+                .unwrap_or(BLOCK_BUDGET)
+                .clamp(1, BLOCK_BUDGET);
         }
     }
     let took = start.elapsed();
+    // A diagnostic rather than decoration: nearly every wrong number this file
+    // has produced was a dispatcher that stopped caching or a run that did the
+    // wrong amount of work, and both are visible here in one line.
+    if std::env::var("RSEMU_BENCH_STATS").is_ok() {
+        eprintln!("{} {shape:?}: {done} insns, {:?}", w.name, disp.stats());
+    }
 
     // The check. `done` is at least `insns`, so the oracle runs the same
     // number the translated path actually retired.
@@ -370,12 +427,22 @@ fn run_translated(w: &Workload, insns: u64, cache: bool, tlb: bool) -> Duration 
         assert_eq!(
             hart.x(n),
             host.slots[x_slot(n).0 as usize],
-            "{}: x{n} disagrees after {done} instructions",
+            "{}: x{n} disagrees after {done} instructions under {shape:?}",
             w.name
         );
     }
-    took
+    // Scaled to the instruction target, because a configuration cannot always
+    // stop exactly on it: what is being reported is time *per guest
+    // instruction*, and dividing a run's time by the count it was asked for
+    // rather than the count it retired credits an overshoot as slowness.
+    Duration::from_secs_f64(took.as_secs_f64() * insns as f64 / done as f64)
 }
+
+/// The largest number of blocks one dispatcher call is asked for.
+///
+/// Also the largest overshoot in blocks, which is why the loop above re-aims
+/// it rather than leaving it at the maximum.
+const BLOCK_BUDGET: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // The frontend and the host
@@ -383,13 +450,15 @@ fn run_translated(w: &Workload, insns: u64, cache: bool, tlb: bool) -> Duration 
 
 struct Lifter {
     cfg: Config,
+    shape: Shape,
     space: Arc<AddressSpace>,
 }
 
 impl Lifter {
-    fn new(space: Arc<AddressSpace>) -> Lifter {
+    fn new(space: Arc<AddressSpace>, shape: Shape) -> Lifter {
         Lifter {
             cfg: Config::rv64i(),
+            shape,
             space,
         }
     }
@@ -403,7 +472,7 @@ impl Frontend for Lifter {
         }
     }
     fn key(&mut self) -> u64 {
-        lift::key(&self.cfg, Origin::Bare)
+        lift::key(&self.cfg, Origin::Bare, self.shape)
     }
     fn pc_slot(&self) -> RegSlot {
         PC
@@ -416,7 +485,14 @@ impl Frontend for Lifter {
                 .ok()
                 .map(|v| v as u16)
         };
-        let lifted = lift::lift(&self.cfg, Origin::Bare, pc, &mut src, lift::MAX_INSNS)?;
+        let lifted = lift::lift(
+            &self.cfg,
+            Origin::Bare,
+            pc,
+            &mut src,
+            lift::MAX_INSNS,
+            self.shape,
+        )?;
         Ok(Translation {
             page: pc & !rsemu::jit::PAGE_MASK,
             insns: lifted.insns,

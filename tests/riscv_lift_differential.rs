@@ -23,6 +23,7 @@
 use rsemu::cpu::riscv::Config;
 use rsemu::cpu::riscv::csr::Extensions;
 use rsemu::cpu::riscv::differential::{Case, Verdict, compare, synthesize};
+use rsemu::cpu::riscv::lift::Shape;
 
 /// A 64-bit linear congruential generator — Knuth's MMIX multiplier and
 /// increment.
@@ -61,16 +62,22 @@ fn program(rng: &mut Lcg, len: usize) -> Vec<u32> {
 /// counting them is how the test can assert it is actually exercising the
 /// lifter rather than measuring an empty block a thousand times.
 fn sweep(cfg: Config, seed: u64, count: usize) -> (usize, usize, usize) {
+    shaped_sweep(cfg, seed, count, Shape::Trace)
+}
+
+fn shaped_sweep(cfg: Config, seed: u64, count: usize, shape: Shape) -> (usize, usize, usize) {
     let mut rng = Lcg(seed);
     let (mut agreed, mut trapped, mut nothing) = (0, 0, 0);
     for n in 0..count {
         let len = 1 + (rng.next() % 12) as usize;
-        let case = Case::seeded(program(&mut rng, len)).with_config(cfg);
+        let case = Case::seeded(program(&mut rng, len))
+            .with_config(cfg)
+            .with_shape(shape);
         match compare(&case) {
             Ok(Verdict::Agreed { .. }) => agreed += 1,
             Ok(Verdict::Trapped { .. }) => trapped += 1,
             Ok(Verdict::Nothing) => nothing += 1,
-            Err(e) => panic!("case {n} of seed {seed:#x} diverged:\n{e}"),
+            Err(e) => panic!("case {n} of seed {seed:#x} diverged under {shape:?}:\n{e}"),
         }
     }
     (agreed, trapped, nothing)
@@ -125,6 +132,52 @@ fn a_generated_corpus_agrees_on_a_core_with_compressed_instructions() {
     assert!(
         agreed > 1_000,
         "only {agreed} of 2000 cases ran to completion"
+    );
+}
+
+#[test]
+fn every_shape_agrees_with_the_interpreter_over_the_whole_corpus() {
+    // Three shapes are three frontends over one oracle (`lift::Shape`), and
+    // the benchmark attributes its numbers to the difference between them —
+    // so a shape that were quietly wrong would be reported as a speed-up. The
+    // same seed for all three, so a divergence names the shape that broke.
+    for shape in [Shape::BasicBlock, Shape::Extended, Shape::Trace] {
+        let (agreed, trapped, nothing) = shaped_sweep(Config::rv64i(), 0x5eed_0011, 1_000, shape);
+        assert!(
+            agreed > 400,
+            "{shape:?}: only {agreed} of 1000 cases ran to completion ({trapped} trapped, \
+             {nothing} lifted nothing)"
+        );
+        assert!(trapped > 0, "{shape:?}: the fault column was never tested");
+    }
+}
+
+#[test]
+fn a_trace_retires_far_more_instructions_per_block_than_a_basic_block() {
+    // The whole point of the change, measured without a stopwatch: over the
+    // same corpus, a trace covers several basic blocks' worth of guest
+    // instructions per translation.
+    let mut basic = 0usize;
+    let mut trace = 0usize;
+    for (shape, total) in [(Shape::BasicBlock, &mut basic), (Shape::Trace, &mut trace)] {
+        let mut rng = Lcg(0x5eed_0012);
+        for _ in 0..500 {
+            // Long enough that a trace has somewhere to go: a twelve-word
+            // program runs out of bytes before it runs out of merging.
+            let case = Case::seeded(program(&mut rng, 48)).with_shape(shape);
+            if let Ok(Verdict::Agreed { insns, .. } | Verdict::Trapped { insns }) = compare(&case) {
+                *total += insns;
+            }
+        }
+    }
+    // A generated program ends early often — an opcode outside the subset, a
+    // store, an indirect jump — so the ratio is bounded by the corpus rather
+    // than by the merging. Half again is well clear of noise and well short of
+    // what the benchmark's hand-written loops show.
+    assert!(
+        trace * 2 > basic * 3,
+        "one block retired {trace} instructions as a trace and {basic} as a basic block, \
+         so merging is not happening"
     );
 }
 

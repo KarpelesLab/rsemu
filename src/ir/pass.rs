@@ -437,8 +437,9 @@ mod tests {
         let flag = b.imm(Type::I1, Const::Int(1));
         // No result, not a terminator, not flagged as a side effect: the case
         // a "no dst means dead" rule would delete, taking the control flow
-        // with it.
-        b.emit_void(Opcode::BRCOND, Type::I1, &[flag]);
+        // with it. Its target is patched once the instructions it jumps over
+        // exist, because a branch is forward or the verifier rejects it.
+        let branch = b.emit_raw(Opcode::BRCOND, Type::I1, None, None, &[flag], None, None, 0);
         // A helper's return value is unused here, and a helper may do
         // anything — a mode change, a device access, a trap.
         let _ = b.emit(Opcode::CALL_HELPER, Type::I64, &[]);
@@ -446,6 +447,7 @@ mod tests {
         let addr = b.imm(Type::I64, Const::Int(0x40));
         let one = b.imm(Type::I64, Const::Int(1));
         let _ = b.emit(Opcode::FETCH_ADD, Type::I64, &[addr, one]);
+        b.patch_aux(branch, b.next_index() as u32);
         b.exit_tb();
         let block = b.finish();
         verify(&block).expect("well formed");
@@ -453,6 +455,46 @@ mod tests {
         let out = eliminate_dead_code(&block);
         verify(&out).expect("still well formed");
         assert_eq!(out.insts(), block.insts(), "nothing here may go:\n{out}");
+    }
+
+    #[test]
+    fn eliminating_dead_code_repoints_a_forward_branch_at_what_is_left() {
+        // A `brcond`'s target is an *instruction index*, so dropping anything
+        // ahead of it slides the target — a superblock's side exit would land
+        // in the middle of the trace it was meant to skip. Latent until
+        // traces: the first frontend emitted no branch at all.
+        let mut b = BlockBuilder::new(0x1000, 0);
+        b.insn_start(mark(0x1000, 0, &[]));
+        b.charge(1);
+        let flag = b.imm(Type::I1, Const::Int(0));
+        let branch = b.emit_raw(Opcode::BRCOND, Type::I1, None, None, &[flag], None, None, 0);
+        // Three dead instructions between the branch and its target, all of
+        // which elimination removes.
+        let a = b.imm(Type::I64, Const::Int(3));
+        let n = b.unary(Opcode::NEG, Type::I64, a);
+        let _ = b.unary(Opcode::NOT, Type::I64, n);
+        b.patch_aux(branch, b.next_index() as u32);
+        b.charge(2);
+        b.exit_tb();
+        let block = b.finish();
+        verify(&block).expect("well formed");
+
+        let out = eliminate_dead_code(&block);
+        verify(&out).expect("still well formed");
+        let (at, brcond) = out
+            .insts()
+            .iter()
+            .enumerate()
+            .find(|(_, i)| i.op == Opcode::BRCOND)
+            .expect("the branch stayed");
+        // It still jumps to the charge, which is now three instructions
+        // earlier than it was.
+        assert_eq!(
+            out.insts()[brcond.aux as usize].op,
+            Opcode::CHARGE,
+            "the branch lost its target:\n{out}"
+        );
+        assert_eq!(brcond.aux as usize, at + 1, "{out}");
     }
 
     #[test]

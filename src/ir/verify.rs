@@ -52,9 +52,25 @@ pub fn verify(block: &Block) -> Result<()> {
             *slot = true;
         }
 
-        // A terminator ends the block and nothing follows it.
-        if inst.op.is_terminator() && i + 1 != insts.len() {
-            return Err(at("a terminator must be the last instruction in a block"));
+        // A branch is forward, and lands inside the block.
+        //
+        // Both halves are load-bearing rather than tidiness. `pass`'s liveness
+        // is one backward walk, which computes the true live set only because
+        // the sole control flow inside a block is a jump *ahead*; a backward
+        // one would need a fixpoint and would silently get a wrong answer
+        // instead of an error. And a target past the end is a block that runs
+        // off into nothing — [`Interp`](crate::ir::Interp) reports it, but a
+        // host backend would have emitted a jump to a label it never placed.
+        if inst.op == Opcode::BRCOND {
+            let target = inst.aux as usize;
+            if target <= i {
+                return Err(at(
+                    "a brcond must branch forward; a loop inside a block needs a fixpoint                      liveness this IR does not have",
+                ));
+            }
+            if target >= insts.len() {
+                return Err(at("the branch target is outside the block"));
+            }
         }
 
         // Only the memory ops carry an access descriptor, and they must.
@@ -260,12 +276,71 @@ mod tests {
     }
 
     #[test]
-    fn a_terminator_in_the_middle_is_rejected() {
+    fn a_block_may_hold_several_terminators_because_a_superblock_has_side_exits() {
+        // The rule used to be "a terminator is the last instruction", and it
+        // was wrong the moment traces landed: a superblock merges across a
+        // branch and leaves the other side as an inline exit sequence, which
+        // ends in a terminator with the rest of the trace after it
+        // (`ROADMAP.md` §9, mechanism 4).
         let mut b = wellformed();
+        let cond = b.imm(Type::I1, Const::Int(1));
+        let over = b.emit_raw(
+            Opcode::BRCOND,
+            Type::I64,
+            None,
+            None,
+            &[cond],
+            None,
+            None,
+            0,
+        );
+        b.insn_start(mark(0x1004, 1));
         b.exit_tb();
-        let _ = b.imm(Type::I64, Const::Int(1));
+        b.patch_aux(over, b.next_index() as u32);
+        b.insn_start(mark(0x1008, 1));
         b.exit_tb();
-        let err = verify(&b.finish()).expect_err("early terminator");
-        assert!(format!("{err}").contains("must be the last instruction"));
+        verify(&b.finish()).expect("two exits are legal");
+    }
+
+    #[test]
+    fn a_backward_branch_inside_a_block_is_rejected() {
+        // `pass`'s liveness is a single backward walk, which is exact only for
+        // forward control flow. A block with a loop in it would get a wrong
+        // live set rather than an error, so the verifier refuses one.
+        let mut b = wellformed();
+        let cond = b.imm(Type::I1, Const::Int(1));
+        let at = b.next_index() as u32;
+        let _ = b.emit_raw(
+            Opcode::BRCOND,
+            Type::I64,
+            None,
+            None,
+            &[cond],
+            None,
+            None,
+            at,
+        );
+        b.exit_tb();
+        let err = verify(&b.finish()).expect_err("a backward branch");
+        assert!(format!("{err}").contains("must branch forward"), "{err}");
+    }
+
+    #[test]
+    fn a_branch_off_the_end_of_the_block_is_rejected() {
+        let mut b = wellformed();
+        let cond = b.imm(Type::I1, Const::Int(1));
+        let _ = b.emit_raw(
+            Opcode::BRCOND,
+            Type::I64,
+            None,
+            None,
+            &[cond],
+            None,
+            None,
+            99,
+        );
+        b.exit_tb();
+        let err = verify(&b.finish()).expect_err("a branch off the end");
+        assert!(format!("{err}").contains("outside the block"), "{err}");
     }
 }

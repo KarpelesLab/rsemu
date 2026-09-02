@@ -140,10 +140,16 @@
 //! IR. None of them blocks the RV64I path; each is written down here so the
 //! next person meets a note instead of a surprise.
 //!
-//! * **`PHI` cannot be executed as defined.** Nothing in [`Inst`] records
-//!   which predecessor each operand arrived from. An edge encoding is owed
-//!   before superblocks land — §9's traces are what make `phi` necessary in
-//!   the first place, so the two arrive together.
+//! * **`PHI` cannot be executed as defined**, and superblocks landed without
+//!   needing it — which corrects what this note used to say. Nothing in
+//!   [`Inst`] records which predecessor each operand arrived from, and §9
+//!   lists `phi` as *"required — superblocks span branches"*. They do, but a
+//!   superblock is one entry and **many exits**: `cpu::riscv::lift` inlines one
+//!   side of every branch and turns the other into a side exit that leaves the
+//!   block, so control never *rejoins* and there is no merge point for a `phi`
+//!   to name. `phi` becomes necessary at the first construction that merges
+//!   paths back together — an if-conversion, or a tier-2 region — and an edge
+//!   encoding is owed then rather than now.
 //! * **Atomics carry no [`MemOp`]**, so they take their width from the
 //!   instruction type and have no endianness or address space of their own.
 //!   Since the IR has no `i8`/`i16`, x86's `lock xadd byte` and ARM's
@@ -159,6 +165,24 @@
 //!   first frontend that harness is
 //!   `cpu::riscv::differential`, which compares the column
 //!   against the ticks the interpreter charged on every case it runs.
+//!
+//! ## 7. A block is straight-line SSA with forward branches, and several exits
+//!
+//! Not a decision that was made up front — it is what superblocks turned out
+//! to need, and it is recorded here because three separate things depend on it
+//! and none of them says so locally.
+//!
+//! * A [`Opcode::BRCOND`] branches **forward** and lands inside the block. The
+//!   verifier enforces it because [`Liveness`] is a single backward walk, which
+//!   is exact for forward control flow and silently *wrong* for a loop rather
+//!   than being an error.
+//! * A terminator may appear **anywhere**, and the last instruction must be
+//!   one. That is what a side exit is: an inline `insn_start`/`exit_tb` pair
+//!   the trace branches over.
+//! * A branch target is an instruction *index*, so
+//!   [`eliminate_dead_code`] repoints every branch when it drops
+//!   instructions ahead of one. That was a latent bug for as long as no
+//!   frontend emitted a branch.
 //!
 //! # What is deliberately not here yet
 //!
