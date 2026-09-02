@@ -898,7 +898,7 @@ impl Pads {
     /// a button pressed through this is a button a replay reproduces.
     ///
     /// All three families file their port under the same
-    /// [`HostKind`](crate::core::hosts::HostKind), `pad`. So listing that kind
+    /// [`HostKind`] — `pad`. So listing that kind
     /// and hoping a NES-typed `get` succeeds is exactly the defect this
     /// function exists to remove — the downcast fails for a Game Boy, quietly,
     /// and the guest never sees a button. Each family is asked for *its own*

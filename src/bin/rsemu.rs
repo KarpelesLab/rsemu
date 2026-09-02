@@ -105,12 +105,11 @@ RUN OPTIONS:
                         display; a machine with neither says so rather than
                         writing nothing
     --record-audio <f>  Write the machine's sound to a RIFF/WAVE file when the
-                        run ends. Needs a machine with an audio device. A
-                        headless run visits the host only once, so the device's
-                        ring has to hold the whole thing and a recording is
-                        capped at about 18 seconds; longer runs say what they
-                        lost. Under --vnc the ring is drained every frame and
-                        there is no cap.
+                        run ends. Needs a machine with an audio device: a NES,
+                        a Game Boy or a Master System. The device is drained as
+                        the run goes, so a recording is as long as the run and
+                        there is no cap; if a ring ever did overflow the file
+                        says how much it lost rather than shortening quietly
     --audio-rate <hz>   Sample rate for --record-audio (default 44100)
 
     --gdb <addr>        Listen for GDB on <addr> and hold the machine stopped
@@ -518,18 +517,22 @@ fn run(args: &[String]) -> ExitCode {
         Ok(None) => {}
     }
 
-    if let Err(e) = machine.run_for(parsed.span) {
+    // The sound path opens before the run, not after it: a console's output ring
+    // holds a fraction of a second, so a recording has to be taken as the run
+    // goes rather than lifted out at the end. `open_recording` says why.
+    let mut audio = open_recording(&parsed, &options.realize.hosts, &machine);
+    if let Err(e) = run_headless(&mut machine, parsed.span, audio.as_mut()) {
         eprintln!("rsemu: {e}");
         summarise(&machine);
         write_screenshot(&parsed, &options.realize.hosts, &machine);
-        write_recording(&parsed, &options.realize.hosts);
+        write_recording(&parsed, audio.as_ref());
         return finish(&machine, ExitCode::FAILURE);
     }
     summarise(&machine);
     // Both, always: a `--screenshot` that failed must not be the reason a
     // recording is silently skipped.
     let drew = write_screenshot(&parsed, &options.realize.hosts, &machine);
-    let played = write_recording(&parsed, &options.realize.hosts);
+    let played = write_recording(&parsed, audio.as_ref());
     if !drew || !played {
         return finish(&machine, ExitCode::FAILURE);
     }
@@ -675,24 +678,34 @@ fn install_capture(
     rsemu::host::display::lcd::capture::install(options)?;
     #[cfg(feature = "dev-nes-apu")]
     rsemu::host::audio::nes::capture::install(options, ring_for(args))?;
+    // The two console sound chips, and unlike the NES's these are installed
+    // only when somebody asked for sound. The reason is the same one that makes
+    // `ring_for` return zero: the interception's one effect on the machine is to
+    // switch the chip's `record` flag on, which both machine files leave off, so
+    // installing it on a run that is not recording would fill a ring nobody
+    // reads. Nothing guest-visible either way — `host::audio::tests` hashes a
+    // recorded Game Boy against an unrecorded one.
+    #[cfg(feature = "dev-gb")]
+    if args.record_audio.is_some() {
+        rsemu::host::audio::gb::capture::install(options)?;
+    }
+    #[cfg(feature = "dev-sms")]
+    if args.record_audio.is_some() {
+        rsemu::host::audio::sms::capture::install(options)?;
+    }
     Ok(())
 }
 
-/// How deep an audio device's output ring has to be for this run.
+/// How deep the NES APU's output ring has to be for this run.
 ///
-/// **The recording must not change how the machine is driven.** A headless run
-/// is one `run_for(span)` with nothing between, so there is no cadence at which
-/// the host could drain — which leaves exactly one honest option: make the ring
-/// big enough for the whole run. That is why a recording is capped at what the
-/// device will allocate (`dev::apu::MAX_SAMPLE_BUFFER`, about 18 seconds) and
-/// why `write_recording` reports what a longer run lost rather than quietly
-/// producing a short file.
-///
-/// Slicing the run is no longer *wrong* — `Machine::run_for` is additive, so a
-/// run cut into pieces reaches the same state as the same run taken whole
-/// (§11.6) — but it is still not free: each slice ends on a scheduling boundary
-/// and the host would have to be driven between them. The ring stays the
-/// simple answer.
+/// Headroom, now, rather than the whole answer. A headless recording used to be
+/// one `run_for(span)` with nothing between it and the file, so the ring had to
+/// hold the entire run and a recording was capped at what the device would
+/// allocate (`dev::apu::MAX_SAMPLE_BUFFER`, about 18 seconds). It is drained
+/// every [`DRAIN_SLICE`] now — the two console chips have a fixed ring of a
+/// fraction of a second and left no other option — so the size below is far
+/// more than a slice needs and simply means the NES can never be the one that
+/// overflows.
 ///
 /// Zero when nothing is being recorded, which leaves whatever the machine
 /// description asked for untouched.
@@ -813,13 +826,99 @@ fn write_screenshot(args: &RunArgs, hosts: &HostObjects, machine: &Machine) -> b
 }
 
 /// The sound of the machine just built, if it has any this build can hear.
+///
+/// `machine` for the reason `take_scanout` takes it, and for two of the three
+/// chips rather than one: a Game Boy's APU and a Master System's PSG do not know
+/// their own sample rate, because it is their clock domain's frequency divided
+/// by a constant and a device cannot reach the clock forest from `&self`. The
+/// PSG's is not even the same between regions — 44 744.32 Hz on an NTSC console
+/// and 44 336.19 on a PAL one — and neither is an integer, which is exactly what
+/// `StreamInfo`'s rational is for.
 #[allow(unused_variables)]
-fn take_audio(hosts: &HostObjects) -> Option<Box<dyn rsemu::host::audio::AudioSource>> {
+fn take_audio(
+    hosts: &HostObjects,
+    machine: &Machine,
+) -> Option<Box<dyn rsemu::host::audio::AudioSource>> {
     #[cfg(feature = "dev-nes-apu")]
     if let Some(s) = rsemu::host::audio::nes::capture::take(hosts) {
         return Some(Box::new(s));
     }
+    #[cfg(feature = "dev-gb")]
+    if let Some(s) = rsemu::host::audio::gb::capture::take(hosts, machine) {
+        return Some(Box::new(s));
+    }
+    #[cfg(feature = "dev-sms")]
+    if let Some(s) = rsemu::host::audio::sms::capture::take(hosts, machine) {
+        return Some(Box::new(s));
+    }
     None
+}
+
+/// How far a headless recording lets the machine run between drains.
+///
+/// Ten milliseconds of *virtual* time. The bound that matters is the shallowest
+/// output ring in the tree: a Game Boy's is 8 192 frames at 32 768 Hz, which is
+/// a quarter of a second, and a Master System's is about a third. Ten
+/// milliseconds is twenty-five times inside the tighter of those, so a slow host
+/// or an unusually productive slice still cannot overflow one.
+///
+/// Nothing about this is a wall-clock cadence. It is how far the machine is
+/// advanced per turn, and `Machine::run_for` is additive (`ROADMAP.md` §11.6):
+/// the run reaches the same state cut into slices as taken whole, which
+/// `tests/run_for_additive.rs` asserts and `tests/cli_record_audio.rs` asserts
+/// again for this specific path by hashing a recorded run against an unrecorded
+/// one.
+const DRAIN_SLICE: GlobalTime = GlobalTime::from_nanos(10_000_000);
+
+/// Open `--record-audio`'s stream, before the run rather than after it.
+///
+/// **Before**, because the two console sound chips cannot hold a whole run. The
+/// NES's APU takes a `sample-buffer` property and the host sizes it for the
+/// span; a `gb.apu` and an `sms.psg` have a fixed ring of a fraction of a second
+/// and no property at all, so the only way to record more than that is to take
+/// the samples as the run produces them. That is a change in how the machine is
+/// *driven* and not in what it does — see [`DRAIN_SLICE`].
+///
+/// `None` when nothing was asked for, and also when this machine has no audio
+/// device: the diagnostic for the second case belongs to `write_recording`,
+/// which is where the user's request either produces a file or a reason.
+fn open_recording(
+    args: &RunArgs,
+    hosts: &HostObjects,
+    machine: &Machine,
+) -> Option<rsemu::host::audio::AudioStream> {
+    use rsemu::host::audio::{AudioStream, SampleFormat};
+    args.record_audio.as_ref()?;
+    let source = take_audio(hosts, machine)?;
+    let mut stream = AudioStream::new(source, args.audio_rate, SampleFormat::S16);
+    // Nothing may be trimmed on the way to a file: the default queue limit is
+    // two seconds and a recording is not that.
+    stream.set_limit_frames(u64::MAX);
+    Some(stream)
+}
+
+/// Run the machine for `span`, draining `audio` as it goes if anything is
+/// listening.
+///
+/// One `run_for` when nobody is: a run with no recording is driven exactly as it
+/// always was, so this cannot change what an ordinary `rsemu run` does.
+fn run_headless(
+    machine: &mut Machine,
+    span: GlobalTime,
+    audio: Option<&mut rsemu::host::audio::AudioStream>,
+) -> rsemu::Result<()> {
+    let Some(stream) = audio else {
+        return machine.run_for(span);
+    };
+    let end = machine.now().saturating_add(span);
+    while machine.now() < end {
+        let next = end.min(machine.now().saturating_add(DRAIN_SLICE));
+        machine.run_until(next)?;
+        stream.pull();
+    }
+    // Whatever the last slice left in the ring.
+    stream.pull();
+    Ok(())
 }
 
 /// Write `--record-audio`'s WAV, reporting whether the run should still count
@@ -827,21 +926,16 @@ fn take_audio(hosts: &HostObjects) -> Option<Box<dyn rsemu::host::audio::AudioSo
 ///
 /// Returns true when nothing was asked for. As with `--screenshot`, a
 /// recording that could not be made is an error rather than a silence.
-fn write_recording(args: &RunArgs, hosts: &HostObjects) -> bool {
+fn write_recording(args: &RunArgs, stream: Option<&rsemu::host::audio::AudioStream>) -> bool {
     let Some(path) = args.record_audio.as_deref() else {
         return true;
     };
-    use rsemu::host::audio::{AudioStream, SampleFormat, wav};
+    use rsemu::host::audio::wav;
 
-    let Some(source) = take_audio(hosts) else {
+    let Some(stream) = stream else {
         eprintln!("rsemu: --record-audio: this machine has no audio device");
         return false;
     };
-    let mut stream = AudioStream::new(source, args.audio_rate, SampleFormat::S16);
-    // The whole run is in the device's ring, so nothing may be trimmed on the
-    // way out: the default queue limit is two seconds and this is not that.
-    stream.set_limit_frames(u64::MAX);
-    stream.pull();
 
     let bytes = wav::encode(stream.info(), stream.buffer());
     match std::fs::write(path, &bytes) {
@@ -860,9 +954,9 @@ fn write_recording(args: &RunArgs, hosts: &HostObjects) -> bool {
             let lost = stream.dropped();
             if lost > 0 {
                 eprintln!(
-                    "rsemu: --record-audio: {lost} samples were lost. The device's ring holds \
-                     about 18 seconds of audio and this run was longer, so the file is its \
-                     *tail* — a ring keeps the newest. Record a shorter --for."
+                    "rsemu: --record-audio: {lost} samples were lost. The device's output ring \
+                     filled before the host drained it, so the file is its *tail* — a ring keeps \
+                     the newest. Record a shorter --for."
                 );
             }
             true
@@ -1215,7 +1309,7 @@ fn vnc_session(machine: &mut Machine, args: &RunArgs, hosts: &HostObjects) -> Ex
     // about eighteen seconds. The queue limit is lifted for the same reason
     // `write_recording` lifts it — nothing may be trimmed on the way to a file.
     if args.record_audio.is_some() {
-        let Some(source) = take_audio(hosts) else {
+        let Some(source) = take_audio(hosts, machine) else {
             eprintln!("rsemu: --record-audio: this machine has no audio device");
             return ExitCode::from(2);
         };

@@ -588,6 +588,18 @@ fn boot_with(index: u32, media: Media) -> u32 {
         ) {
             return fail(state, e);
         }
+        // The two console chips have a fixed ring instead of a sized one — a
+        // quarter of a second on a Game Boy, a third on a Master System — so
+        // there is nothing to size and the interception's one effect is to turn
+        // recording on. A frame is sixty times inside the shallower of those.
+        #[cfg(feature = "dev-gb")]
+        if let Err(e) = crate::host::audio::gb::capture::install(&mut options) {
+            return fail(state, e);
+        }
+        #[cfg(feature = "dev-sms")]
+        if let Err(e) = crate::host::audio::sms::capture::install(&mut options) {
+            return fail(state, e);
+        }
 
         let machine = match crate::machine::build(entry.name, entry.source, &registry, &options) {
             Ok(m) => m,
@@ -627,6 +639,30 @@ fn boot_with(index: u32, media: Media) -> u32 {
         // converts.
         #[cfg(feature = "dev-nes-apu")]
         if let Some(source) = crate::host::audio::nes::capture::take(&hosts) {
+            state.audio = Some(crate::host::audio::AudioStream::new(
+                alloc::boxed::Box::new(source),
+                state.audio_rate,
+                crate::host::audio::SampleFormat::F32,
+            ));
+        }
+        // Both of these are taken *after* the build and with the machine in
+        // hand, because neither chip knows its own sample rate: it is its clock
+        // domain's frequency over a constant, and a Master System's is not even
+        // the same between regions.
+        #[cfg(feature = "dev-gb")]
+        if state.audio.is_none()
+            && let Some(source) = crate::host::audio::gb::capture::take(&hosts, &machine)
+        {
+            state.audio = Some(crate::host::audio::AudioStream::new(
+                alloc::boxed::Box::new(source),
+                state.audio_rate,
+                crate::host::audio::SampleFormat::F32,
+            ));
+        }
+        #[cfg(feature = "dev-sms")]
+        if state.audio.is_none()
+            && let Some(source) = crate::host::audio::sms::capture::take(&hosts, &machine)
+        {
             state.audio = Some(crate::host::audio::AudioStream::new(
                 alloc::boxed::Box::new(source),
                 state.audio_rate,

@@ -115,12 +115,39 @@ pub mod filter;
 pub mod resample;
 pub mod wav;
 
+#[cfg(feature = "dev-gb")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-gb")))]
+pub mod gb;
+
 #[cfg(feature = "dev-nes-apu")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-apu")))]
 pub mod nes;
 
+#[cfg(feature = "dev-sms")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-sms")))]
+pub mod sms;
+
 #[cfg(test)]
 mod tests;
+
+/// Greatest common divisor, so a device adapter reports its rate in lowest
+/// terms.
+///
+/// Reducing is not cosmetic: [`resample`] multiplies the denominator by the
+/// host rate, and an unreduced 236 250 000 / 264 — or a Game Boy's
+/// 4 194 304 / 128 — would push that product further up the `u64` range for
+/// nothing. Here rather than in one adapter because three of them need it —
+/// and gated on those three, because a build with no sound chip in it has no
+/// rate to reduce.
+#[cfg(any(feature = "dev-nes-apu", feature = "dev-gb", feature = "dev-sms"))]
+pub(crate) const fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    if a == 0 { 1 } else { a }
+}
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
