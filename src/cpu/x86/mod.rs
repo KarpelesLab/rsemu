@@ -79,14 +79,20 @@
 //! rounding, flush-to-zero and denormals-are-zero bits mapped onto
 //! [`crate::float::Env`], the scalar and packed single- and double-precision
 //! arithmetic, the compares that write `EFLAGS` and the ones that write a
-//! lane mask, the conversions, the shuffles, and `FXSAVE`/`FXRSTOR`.
+//! lane mask, the conversions, the shuffles, SSE2's whole packed-**integer**
+//! half — the adds and subtracts at four widths with and without saturation,
+//! the compares, the packs and unpacks, the shifts by an immediate and by a
+//! register, the multiplies, `PSADBW`, `PSHUFD` and the two half-register word
+//! shuffles, `PMOVMSKB`, `PINSRW`/`PEXTRW` — and `FXSAVE`/`FXRSTOR`.
 //! `CR4.OSFXSR` and `CR4.OSXMMEXCPT` now decide something: without the first
 //! an SSE instruction is `#UD`, and without the second an unmasked SIMD
 //! exception is `#UD` rather than `#XM`.
 //!
 //! **The model-specific registers** ([`prot::msr`]): `RDMSR` and `WRMSR`
 //! reaching `IA32_EFER`, the four `SYSCALL` registers, the three segment-base
-//! registers, the time-stamp counter that `RDTSC` also reads, and
+//! registers, the time-stamp counter that `RDTSC` also reads,
+//! `IA32_MISC_ENABLE`, the twenty memory-type range registers
+//! ([`prot::mtrr`]), and
 //! `IA32_APIC_BASE` — which is the one whose *state* is not in the processor at
 //! all, and reaches this core's own interrupt controller through
 //! [`crate::core::wire::LocalController`]. An address this
@@ -419,6 +425,15 @@ pub struct Features {
     pub cr4: bool,
     /// The model-specific registers, `RDMSR` and `WRMSR`.
     pub msr: bool,
+    /// The memory-type range registers, and `CPUID` leaf 1's `MTRR` bit.
+    ///
+    /// Separate from [`msr`](Features::msr) because a part can have
+    /// model-specific registers without these — the earliest ones did — but
+    /// **every long-mode part has them**, which is why the `x86-64` preset
+    /// carries it. A guest told otherwise loses its large mappings: Linux
+    /// reports `MTRRs disabled (not available)` and then refuses every 2 MiB
+    /// page. See [`prot::mtrr`] for what a write to one does here.
+    pub mtrr: bool,
     /// Physical address extension: `CR4.PAE`, 64-bit page-table entries, and
     /// the three-level walk.
     pub pae: bool,
@@ -475,6 +490,7 @@ impl Features {
         extras_486: false,
         cr4: false,
         msr: false,
+        mtrr: false,
         pae: false,
         long: false,
         nx: false,
@@ -520,6 +536,7 @@ impl Features {
         extras_486: true,
         cr4: true,
         msr: true,
+        mtrr: true,
         pae: true,
         long: true,
         nx: true,
@@ -561,6 +578,18 @@ impl Features {
         }
         if (self.msr || self.cr4) && !self.extras_486 {
             return missing("extras_486", "cr4 or msr");
+        }
+        if self.mtrr && !self.msr {
+            // The ranges *are* model-specific registers; a part with them and
+            // no `RDMSR` would have nowhere to read them from.
+            return missing("msr", "mtrr");
+        }
+        if self.long && !self.mtrr {
+            // Not an implementation limit either: `CPUID` leaf 1 has reported
+            // the `MTRR` bit on every part since the Pentium Pro, and a
+            // 64-bit operating system that finds it clear concludes its
+            // firmware left the memory map undescribed.
+            return missing("mtrr", "long");
         }
         if self.sse2 && !self.sse {
             return missing("sse", "sse2");
@@ -2117,8 +2146,8 @@ impl X86 {
         // would make an impossible part.
         let mut features = variant.features();
         for name in [
-            "cpuid", "cr4", "msr", "pae", "long", "nx", "syscall", "cmov", "pse", "pge", "fpu",
-            "cx8", "fxsr", "sse", "sse2",
+            "cpuid", "cr4", "msr", "mtrr", "pae", "long", "nx", "syscall", "cmov", "pse", "pge",
+            "fpu", "cx8", "fxsr", "sse", "sse2",
         ] {
             let Some(on) = r.optional::<bool>(name)? else {
                 continue;
@@ -2127,6 +2156,7 @@ impl X86 {
                 "cpuid" => features.extras_486 = on,
                 "cr4" => features.cr4 = on,
                 "msr" => features.msr = on,
+                "mtrr" => features.mtrr = on,
                 "pae" => features.pae = on,
                 "long" => features.long = on,
                 "nx" => features.nx = on,
@@ -2760,7 +2790,11 @@ pub static CLASS: DeviceClass = DeviceClass {
     //    levels, the INIT latch and the Start-Up page.
     // 7: `IA32_MISC_ENABLE`, whose execute-disable lock decides what `CPUID`
     //    reports about `NX` and is therefore guest-visible state.
-    version: 7,
+    // 8: the memory-type range registers — `IA32_MTRR_DEF_TYPE`, the eight
+    //    variable base/mask pairs and the eleven fixed ranges. Guest-visible
+    //    because a guest reads back what it wrote, and appended, so every
+    //    offset below it is unchanged.
+    version: 8,
     summary: "Intel x86 CPU core: 8086/8088 real mode, 80386/80486 protected mode, or x86-64",
     properties: &[
         PropertySpec {
@@ -2786,6 +2820,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Bool,
             required: false,
             summary: "override the preset: RDMSR, WRMSR, RDTSC and the model-specific registers",
+        },
+        PropertySpec {
+            name: "mtrr",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: the memory-type range registers and CPUID's MTRR bit",
         },
         PropertySpec {
             name: "pae",
@@ -3207,6 +3247,20 @@ impl Device for X86 {
         // the long-mode block — and it is not in there because a part can have
         // it without having long mode.
         w.write_u64(state.sys.misc_enable)?;
+        // The memory-type range registers, appended for the reason every block
+        // above was: nothing ahead of them moves, so `host::gdb::arch`'s
+        // indexing into the first sixty-four bytes still lands where it did.
+        // They go in whatever `Features::mtrr` says, because a chunk whose
+        // length depended on the feature set would be a second thing to get
+        // right and a restore onto a differently-configured part would read
+        // the wrong number of bytes rather than fail cleanly.
+        w.write_u64(state.sys.mtrr_def_type)?;
+        for value in state.sys.mtrr_var {
+            w.write_u64(value)?;
+        }
+        for value in state.sys.mtrr_fix {
+            w.write_u64(value)?;
+        }
         Ok(())
     }
 
@@ -3357,6 +3411,13 @@ impl Device for X86 {
         let startup_page = r.read_u8()?;
         let startup = has_startup.then_some(startup_page);
         state.sys.misc_enable = r.read_u64()?;
+        state.sys.mtrr_def_type = r.read_u64()?;
+        for i in 0..state.sys.mtrr_var.len() {
+            state.sys.mtrr_var[i] = r.read_u64()?;
+        }
+        for i in 0..state.sys.mtrr_fix.len() {
+            state.sys.mtrr_fix[i] = r.read_u64()?;
+        }
         // The translation-lookaside buffer is derived, so it is not in the
         // snapshot and starts empty — which is correct rather than merely
         // convenient, because the page tables it would cache have just been

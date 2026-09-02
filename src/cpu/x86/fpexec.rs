@@ -168,55 +168,56 @@ impl Exec<'_> {
             }
             _ => {}
         }
-        let needs_sse2 = matches!(
-            op,
-            Op::ADDPD
-                | Op::ADDSD
-                | Op::ANDNPD
-                | Op::ANDPD
-                | Op::CMPPD
-                | Op::CMPSD
-                | Op::COMISD
-                | Op::CVTPD2PS
-                | Op::CVTPS2PD
-                | Op::CVTSD2SI
-                | Op::CVTSD2SS
-                | Op::CVTSI2SD
-                | Op::CVTSS2SD
-                | Op::CVTTSD2SI
-                | Op::DIVPD
-                | Op::DIVSD
-                | Op::MAXPD
-                | Op::MAXSD
-                | Op::MINPD
-                | Op::MINSD
-                | Op::MOVAPD
-                | Op::MOVD
-                | Op::MOVDQA
-                | Op::MOVDQU
-                | Op::MOVHPD
-                | Op::MOVLPD
-                | Op::MOVMSKPD
-                | Op::MOVQ
-                | Op::MOVSD
-                | Op::MOVUPD
-                | Op::MULPD
-                | Op::MULSD
-                | Op::ORPD
-                | Op::PAND
-                | Op::PANDN
-                | Op::POR
-                | Op::PXOR
-                | Op::SHUFPD
-                | Op::SQRTPD
-                | Op::SQRTSD
-                | Op::SUBPD
-                | Op::SUBSD
-                | Op::UCOMISD
-                | Op::UNPCKHPD
-                | Op::UNPCKLPD
-                | Op::XORPD
-        );
+        let needs_sse2 = op.is_sse2_packed_int()
+            || matches!(
+                op,
+                Op::ADDPD
+                    | Op::ADDSD
+                    | Op::ANDNPD
+                    | Op::ANDPD
+                    | Op::CMPPD
+                    | Op::CMPSD
+                    | Op::COMISD
+                    | Op::CVTPD2PS
+                    | Op::CVTPS2PD
+                    | Op::CVTSD2SI
+                    | Op::CVTSD2SS
+                    | Op::CVTSI2SD
+                    | Op::CVTSS2SD
+                    | Op::CVTTSD2SI
+                    | Op::DIVPD
+                    | Op::DIVSD
+                    | Op::MAXPD
+                    | Op::MAXSD
+                    | Op::MINPD
+                    | Op::MINSD
+                    | Op::MOVAPD
+                    | Op::MOVD
+                    | Op::MOVDQA
+                    | Op::MOVDQU
+                    | Op::MOVHPD
+                    | Op::MOVLPD
+                    | Op::MOVMSKPD
+                    | Op::MOVQ
+                    | Op::MOVSD
+                    | Op::MOVUPD
+                    | Op::MULPD
+                    | Op::MULSD
+                    | Op::ORPD
+                    | Op::PAND
+                    | Op::PANDN
+                    | Op::POR
+                    | Op::PXOR
+                    | Op::SHUFPD
+                    | Op::SQRTPD
+                    | Op::SQRTSD
+                    | Op::SUBPD
+                    | Op::SUBSD
+                    | Op::UCOMISD
+                    | Op::UNPCKHPD
+                    | Op::UNPCKLPD
+                    | Op::XORPD
+            );
         if !features.sse || (needs_sse2 && !features.sse2) {
             return Err(Fault::bare(VEC_UD));
         }
@@ -1590,9 +1591,94 @@ impl Exec<'_> {
                 Ok(())
             }
 
+            // -- SSE2's packed-integer half ------------------------------
+            _ if op.is_sse2_packed_int() => self.sse_packed(f, op),
+
             // -- Arithmetic ----------------------------------------------
             _ => self.sse_arith(f, op),
         }
+    }
+
+    /// SSE2's packed-integer instructions.
+    ///
+    /// Everything here is exact integer arithmetic on lanes of a 128-bit
+    /// register, so none of it touches `MXCSR`'s exception flags and none of it
+    /// can raise `#XM` — which is why this path never calls
+    /// [`Exec::sse_raise`] and why the lane arithmetic lives in the free
+    /// function [`packed`] where it can be tested without a machine.
+    ///
+    /// *Intel SDM* volume 2 for every instruction reference, and volume 1
+    /// §11.6 for the lane numbering.
+    fn sse_packed(&mut self, f: &Fields, op: Op) -> Ex<()> {
+        let reg = f.reg_num();
+        let register_form = f.modrm.is_some_and(super::isa::ModRm::is_register);
+        match op {
+            // A non-temporal store has no register form at all: bypassing a
+            // cache into a register is not a thing to ask for.
+            Op::MOVNTDQ => {
+                if register_form {
+                    return Err(Fault::bare(VEC_UD));
+                }
+                let v = self.state.sse.get(reg);
+                return self.sse_write_rm(f, Arg::Wx, true, v);
+            }
+            // The two that cross between an `XMM` register and a general one.
+            Op::PMOVMSKB => {
+                if !register_form {
+                    return Err(Fault::bare(VEC_UD));
+                }
+                let v = self.state.sse.get(f.rm_num());
+                let mut mask = 0u64;
+                for i in 0..16 {
+                    mask |= u64::from((byte_lane(v, i) >> 7) & 1) << i;
+                }
+                return self.write_arg(f, Arg::Gy, if f.rex_w() { 8 } else { 4 }, mask);
+            }
+            Op::PEXTRW => {
+                if !register_form {
+                    return Err(Fault::bare(VEC_UD));
+                }
+                let v = self.state.sse.get(f.rm_num());
+                let word = u64::from(word_lane(v, (f.imm as usize) & 7));
+                return self.write_arg(f, Arg::Gy, if f.rex_w() { 8 } else { 4 }, word);
+            }
+            // The one that reads a *general* register or sixteen bits of
+            // memory rather than an `XMM` operand.
+            Op::PINSRW => {
+                let value = self.read_arg(f, Arg::Ew, 2)? as u16;
+                let mut out = self.state.sse.get(reg);
+                let lane = (f.imm as usize) & 7;
+                let shift = 16 * (lane % 4);
+                out[lane / 4] =
+                    (out[lane / 4] & !(0xffffu64 << shift)) | (u64::from(value) << shift);
+                self.state.sse.set(reg, out);
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        // The shift-by-immediate group forms name their operand in ModRM's
+        // `r/m` field, because the `reg` field is the opcode extension. The
+        // shift-by-`XMM` forms name it in `reg` as every other instruction
+        // does, and take the count from the source's **low quadword** —
+        // a 128-bit count would be a count no shift could use.
+        if matches!(f.insn.dst, Arg::Ux) {
+            let index = f.rm_num();
+            let value = self.state.sse.get(index);
+            self.state
+                .sse
+                .set(index, shift_lanes(op, value, u64::from(f.imm as u8)));
+            return Ok(());
+        }
+        let src = self.sse_read_rm(f, f.insn.src, false)?;
+        let dst = self.state.sse.get(reg);
+        let out = if is_shift(op) {
+            shift_lanes(op, dst, src[0])
+        } else {
+            packed(op, dst, src, f.imm as u8)
+        };
+        self.state.sse.set(reg, out);
+        Ok(())
     }
 
     /// The four bitwise operations, which are the same 128 bits whatever the
@@ -2078,5 +2164,452 @@ impl Exec<'_> {
             return Err(Fault::bare(VEC_MF));
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SSE2's packed-integer lane arithmetic
+// ---------------------------------------------------------------------------
+//
+// Free functions rather than methods, because none of this touches the machine:
+// a 128-bit value in, a 128-bit value out, no memory, no flags and no
+// exception. That makes every one of them directly testable, which is what the
+// tests at the bottom of `super::tests` do.
+
+/// Byte lane `i` of a 128-bit value, numbered from the least significant.
+#[inline]
+fn byte_lane(v: [u64; 2], i: usize) -> u8 {
+    (v[i / 8] >> (8 * (i % 8))) as u8
+}
+
+/// Word lane `i`.
+#[inline]
+fn word_lane(v: [u64; 2], i: usize) -> u16 {
+    (v[i / 4] >> (16 * (i % 4))) as u16
+}
+
+/// Doubleword lane `i`.
+#[inline]
+fn dword_lane(v: [u64; 2], i: usize) -> u32 {
+    (v[i / 2] >> (32 * (i % 2))) as u32
+}
+
+/// Build a value from sixteen byte lanes.
+fn of_bytes(l: [u8; 16]) -> [u64; 2] {
+    let mut out = [0u64; 2];
+    for (i, b) in l.into_iter().enumerate() {
+        out[i / 8] |= u64::from(b) << (8 * (i % 8));
+    }
+    out
+}
+
+/// Build a value from eight word lanes.
+fn of_words(l: [u16; 8]) -> [u64; 2] {
+    let mut out = [0u64; 2];
+    for (i, w) in l.into_iter().enumerate() {
+        out[i / 4] |= u64::from(w) << (16 * (i % 4));
+    }
+    out
+}
+
+/// Build a value from four doubleword lanes.
+fn of_dwords(l: [u32; 4]) -> [u64; 2] {
+    let mut out = [0u64; 2];
+    for (i, d) in l.into_iter().enumerate() {
+        out[i / 2] |= u64::from(d) << (32 * (i % 2));
+    }
+    out
+}
+
+/// Apply `f` to each of the sixteen byte lanes of two operands.
+fn map_bytes(a: [u64; 2], b: [u64; 2], f: impl Fn(u8, u8) -> u8) -> [u64; 2] {
+    let mut out = [0u8; 16];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = f(byte_lane(a, i), byte_lane(b, i));
+    }
+    of_bytes(out)
+}
+
+/// Apply `f` to each of the eight word lanes.
+fn map_words(a: [u64; 2], b: [u64; 2], f: impl Fn(u16, u16) -> u16) -> [u64; 2] {
+    let mut out = [0u16; 8];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = f(word_lane(a, i), word_lane(b, i));
+    }
+    of_words(out)
+}
+
+/// Apply `f` to each of the four doubleword lanes.
+fn map_dwords(a: [u64; 2], b: [u64; 2], f: impl Fn(u32, u32) -> u32) -> [u64; 2] {
+    let mut out = [0u32; 4];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = f(dword_lane(a, i), dword_lane(b, i));
+    }
+    of_dwords(out)
+}
+
+/// Apply `f` to each of the two quadword lanes.
+fn map_qwords(a: [u64; 2], b: [u64; 2], f: impl Fn(u64, u64) -> u64) -> [u64; 2] {
+    [f(a[0], b[0]), f(a[1], b[1])]
+}
+
+/// Whether this operation takes a shift **count** rather than a second vector.
+///
+/// The distinction matters twice over: the count comes from the source's low
+/// quadword rather than lane by lane, and a count at or past the lane's width
+/// is defined — zero for a logical shift, the sign for an arithmetic one —
+/// rather than being the host's undefined behaviour.
+fn is_shift(op: Op) -> bool {
+    matches!(
+        op,
+        Op::PSRLW
+            | Op::PSRLD
+            | Op::PSRLQ
+            | Op::PSRAW
+            | Op::PSRAD
+            | Op::PSLLW
+            | Op::PSLLD
+            | Op::PSLLQ
+            | Op::PSRLDQ
+            | Op::PSLLDQ
+    )
+}
+
+/// The packed shifts, by a count taken from an immediate or from a register.
+///
+/// `count` is the whole 64-bit quantity the architecture defines it as, which
+/// is why it is a `u64` and not the five bits a host shift would take: *Intel
+/// SDM* volume 2 says a count greater than the operand width produces zero
+/// (or, for `PSRAW`/`PSRAD`, a lane of sign bits), and a count of 300 has to
+/// reach that rule rather than wrap into a shift of 44.
+fn shift_lanes(op: Op, v: [u64; 2], count: u64) -> [u64; 2] {
+    // A logical shift by the width or more clears the lane. Named once so the
+    // four widths cannot disagree about it.
+    let zero = [0u64; 2];
+    match op {
+        Op::PSRLW => {
+            if count >= 16 {
+                zero
+            } else {
+                map_words(v, v, |a, _| a >> count)
+            }
+        }
+        Op::PSLLW => {
+            if count >= 16 {
+                zero
+            } else {
+                map_words(v, v, |a, _| a << count)
+            }
+        }
+        // An arithmetic shift saturates its count instead: shifting a signed
+        // lane right by more than its width leaves a lane of sign bits, which
+        // is the same answer a shift by width-1 gives.
+        Op::PSRAW => {
+            let c = if count > 15 { 15 } else { count as u32 };
+            map_words(v, v, |a, _| ((a as i16) >> c) as u16)
+        }
+        Op::PSRLD => {
+            if count >= 32 {
+                zero
+            } else {
+                map_dwords(v, v, |a, _| a >> count)
+            }
+        }
+        Op::PSLLD => {
+            if count >= 32 {
+                zero
+            } else {
+                map_dwords(v, v, |a, _| a << count)
+            }
+        }
+        Op::PSRAD => {
+            let c = if count > 31 { 31 } else { count as u32 };
+            map_dwords(v, v, |a, _| ((a as i32) >> c) as u32)
+        }
+        Op::PSRLQ => {
+            if count >= 64 {
+                zero
+            } else {
+                map_qwords(v, v, |a, _| a >> count)
+            }
+        }
+        Op::PSLLQ => {
+            if count >= 64 {
+                zero
+            } else {
+                map_qwords(v, v, |a, _| a << count)
+            }
+        }
+        // The two that shift the whole register by whole **bytes**. Neither
+        // has an MMX form, because there is no 64-bit register for a shift to
+        // cross a quadword boundary in.
+        Op::PSRLDQ => {
+            let n = count as usize;
+            let mut out = [0u8; 16];
+            for (i, o) in out.iter_mut().enumerate() {
+                if i + n < 16 {
+                    *o = byte_lane(v, i + n);
+                }
+            }
+            of_bytes(out)
+        }
+        _ => {
+            debug_assert_eq!(op, Op::PSLLDQ, "is_shift admitted something with no arm");
+            let n = count as usize;
+            let mut out = [0u8; 16];
+            for (i, o) in out.iter_mut().enumerate() {
+                if i >= n {
+                    *o = byte_lane(v, i - n);
+                }
+            }
+            of_bytes(out)
+        }
+    }
+}
+
+/// Every packed-integer operation that combines two 128-bit values.
+///
+/// `imm` is the third operand where there is one and is ignored otherwise. The
+/// saturating forms are written with Rust's `saturating_*`, which is exactly
+/// the architecture's rule at each width — clamp to the lane type's range —
+/// and the wrapping forms with `wrapping_*`, because guest arithmetic wraps by
+/// definition (CLAUDE.md, "Arithmetic").
+#[allow(clippy::too_many_lines)]
+fn packed(op: Op, dst: [u64; 2], src: [u64; 2], imm: u8) -> [u64; 2] {
+    match op {
+        // -- Addition and subtraction ------------------------------------
+        Op::PADDB => map_bytes(dst, src, u8::wrapping_add),
+        Op::PADDW => map_words(dst, src, u16::wrapping_add),
+        Op::PADDD => map_dwords(dst, src, u32::wrapping_add),
+        Op::PADDQ => map_qwords(dst, src, u64::wrapping_add),
+        Op::PSUBB => map_bytes(dst, src, u8::wrapping_sub),
+        Op::PSUBW => map_words(dst, src, u16::wrapping_sub),
+        Op::PSUBD => map_dwords(dst, src, u32::wrapping_sub),
+        Op::PSUBQ => map_qwords(dst, src, u64::wrapping_sub),
+        Op::PADDSB => map_bytes(dst, src, |a, b| (a as i8).saturating_add(b as i8) as u8),
+        Op::PADDSW => map_words(dst, src, |a, b| (a as i16).saturating_add(b as i16) as u16),
+        Op::PADDUSB => map_bytes(dst, src, u8::saturating_add),
+        Op::PADDUSW => map_words(dst, src, u16::saturating_add),
+        Op::PSUBSB => map_bytes(dst, src, |a, b| (a as i8).saturating_sub(b as i8) as u8),
+        Op::PSUBSW => map_words(dst, src, |a, b| (a as i16).saturating_sub(b as i16) as u16),
+        Op::PSUBUSB => map_bytes(dst, src, u8::saturating_sub),
+        Op::PSUBUSW => map_words(dst, src, u16::saturating_sub),
+
+        // -- Comparison: a lane of ones or a lane of zeros ---------------
+        Op::PCMPEQB => map_bytes(dst, src, |a, b| if a == b { 0xff } else { 0 }),
+        Op::PCMPEQW => map_words(dst, src, |a, b| if a == b { 0xffff } else { 0 }),
+        Op::PCMPEQD => map_dwords(dst, src, |a, b| if a == b { 0xffff_ffff } else { 0 }),
+        Op::PCMPGTB => map_bytes(
+            dst,
+            src,
+            |a, b| {
+                if (a as i8) > (b as i8) { 0xff } else { 0 }
+            },
+        ),
+        Op::PCMPGTW => map_words(
+            dst,
+            src,
+            |a, b| {
+                if (a as i16) > (b as i16) { 0xffff } else { 0 }
+            },
+        ),
+        Op::PCMPGTD => map_dwords(dst, src, |a, b| {
+            if (a as i32) > (b as i32) {
+                0xffff_ffff
+            } else {
+                0
+            }
+        }),
+
+        // -- Minimum, maximum and average --------------------------------
+        //
+        // SSE2 has exactly these four: unsigned bytes and signed words. The
+        // other six combinations arrived with SSE4.1 and are deliberately
+        // absent, because a part that answers them without setting the
+        // `CPUID` bit is lying about what it is.
+        Op::PMINUB => map_bytes(dst, src, core::cmp::min),
+        Op::PMAXUB => map_bytes(dst, src, core::cmp::max),
+        Op::PMINSW => map_words(dst, src, |a, b| (a as i16).min(b as i16) as u16),
+        Op::PMAXSW => map_words(dst, src, |a, b| (a as i16).max(b as i16) as u16),
+        // Rounded **up**, which is why the sum is computed one bit wider: the
+        // `+1` is what distinguishes an average from a shifted sum.
+        Op::PAVGB => map_bytes(dst, src, |a, b| {
+            ((u16::from(a) + u16::from(b) + 1) >> 1) as u8
+        }),
+        Op::PAVGW => map_words(dst, src, |a, b| {
+            ((u32::from(a) + u32::from(b) + 1) >> 1) as u16
+        }),
+
+        // -- Multiplication ----------------------------------------------
+        Op::PMULLW => map_words(dst, src, u16::wrapping_mul),
+        Op::PMULHW => map_words(dst, src, |a, b| {
+            ((i32::from(a as i16) * i32::from(b as i16)) >> 16) as u16
+        }),
+        Op::PMULHUW => map_words(dst, src, |a, b| {
+            ((u32::from(a) * u32::from(b)) >> 16) as u16
+        }),
+        // The *even* doublewords only, widened into the quadword lanes. The
+        // odd ones are not read at all, which is what makes this the
+        // instruction a wide multiply is built out of.
+        Op::PMULUDQ => [
+            u64::from(dword_lane(dst, 0)) * u64::from(dword_lane(src, 0)),
+            u64::from(dword_lane(dst, 2)) * u64::from(dword_lane(src, 2)),
+        ],
+        // Signed 16x16 products summed in adjacent pairs into a doubleword.
+        // The sum wraps rather than saturating, and the one case that reaches
+        // the wrap — two products of `0x8000 * 0x8000` — is defined to give
+        // `0x8000_0000`, which is what a wrapping `i32` add produces.
+        Op::PMADDWD => {
+            let mut out = [0u32; 4];
+            for (i, o) in out.iter_mut().enumerate() {
+                let lo = i32::from(word_lane(dst, 2 * i) as i16)
+                    * i32::from(word_lane(src, 2 * i) as i16);
+                let hi = i32::from(word_lane(dst, 2 * i + 1) as i16)
+                    * i32::from(word_lane(src, 2 * i + 1) as i16);
+                *o = lo.wrapping_add(hi) as u32;
+            }
+            of_dwords(out)
+        }
+        // The sum of eight absolute byte differences, one per quadword half,
+        // landing in that half's low word with the rest cleared.
+        Op::PSADBW => {
+            let mut out = [0u64; 2];
+            for (half, o) in out.iter_mut().enumerate() {
+                let mut sum = 0u64;
+                for i in 0..8 {
+                    let a = byte_lane(dst, half * 8 + i);
+                    let b = byte_lane(src, half * 8 + i);
+                    sum += u64::from(a.abs_diff(b));
+                }
+                *o = sum;
+            }
+            out
+        }
+
+        // -- Packing, with saturation ------------------------------------
+        //
+        // The destination supplies the low half of the result and the source
+        // the high half, in all three. Getting that order backwards is the
+        // classic mistake, and it is why each is written as one pass over the
+        // concatenation rather than as two loops.
+        Op::PACKSSWB => {
+            let mut out = [0u8; 16];
+            for (i, o) in out.iter_mut().enumerate() {
+                let w = if i < 8 {
+                    word_lane(dst, i)
+                } else {
+                    word_lane(src, i - 8)
+                };
+                *o = (w as i16).clamp(-128, 127) as i8 as u8;
+            }
+            of_bytes(out)
+        }
+        Op::PACKUSWB => {
+            let mut out = [0u8; 16];
+            for (i, o) in out.iter_mut().enumerate() {
+                let w = if i < 8 {
+                    word_lane(dst, i)
+                } else {
+                    word_lane(src, i - 8)
+                };
+                // A *signed* source saturated to an unsigned byte: negative
+                // becomes zero, and anything past 255 becomes 255.
+                *o = (w as i16).clamp(0, 255) as u8;
+            }
+            of_bytes(out)
+        }
+        Op::PACKSSDW => {
+            let mut out = [0u16; 8];
+            for (i, o) in out.iter_mut().enumerate() {
+                let d = if i < 4 {
+                    dword_lane(dst, i)
+                } else {
+                    dword_lane(src, i - 4)
+                };
+                *o = (d as i32).clamp(-32768, 32767) as i16 as u16;
+            }
+            of_words(out)
+        }
+
+        // -- Interleaving -------------------------------------------------
+        Op::PUNPCKLBW | Op::PUNPCKHBW => {
+            let base = if op == Op::PUNPCKLBW { 0 } else { 8 };
+            let mut out = [0u8; 16];
+            for (i, o) in out.iter_mut().enumerate() {
+                let lane = base + i / 2;
+                *o = if i % 2 == 0 {
+                    byte_lane(dst, lane)
+                } else {
+                    byte_lane(src, lane)
+                };
+            }
+            of_bytes(out)
+        }
+        Op::PUNPCKLWD | Op::PUNPCKHWD => {
+            let base = if op == Op::PUNPCKLWD { 0 } else { 4 };
+            let mut out = [0u16; 8];
+            for (i, o) in out.iter_mut().enumerate() {
+                let lane = base + i / 2;
+                *o = if i % 2 == 0 {
+                    word_lane(dst, lane)
+                } else {
+                    word_lane(src, lane)
+                };
+            }
+            of_words(out)
+        }
+        Op::PUNPCKLDQ | Op::PUNPCKHDQ => {
+            let base = if op == Op::PUNPCKLDQ { 0 } else { 2 };
+            let mut out = [0u32; 4];
+            for (i, o) in out.iter_mut().enumerate() {
+                let lane = base + i / 2;
+                *o = if i % 2 == 0 {
+                    dword_lane(dst, lane)
+                } else {
+                    dword_lane(src, lane)
+                };
+            }
+            of_dwords(out)
+        }
+        Op::PUNPCKLQDQ => [dst[0], src[0]],
+        Op::PUNPCKHQDQ => [dst[1], src[1]],
+
+        // -- Permutation under an immediate --------------------------------
+        Op::PSHUFD => {
+            let mut out = [0u32; 4];
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = dword_lane(src, ((imm >> (2 * i)) & 3) as usize);
+            }
+            of_dwords(out)
+        }
+        // The half not named is *copied*, not zeroed — which is the whole
+        // reason two instructions exist where one shuffle of eight words
+        // would have done.
+        Op::PSHUFLW => {
+            let mut out = [0u16; 8];
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = if i < 4 {
+                    word_lane(src, ((imm >> (2 * i)) & 3) as usize)
+                } else {
+                    word_lane(src, i)
+                };
+            }
+            of_words(out)
+        }
+        // The wildcard is `PSHUFHW` and nothing else, which a debug build
+        // asserts: a packed-integer operation added to `is_sse2_packed_int`
+        // and forgotten here would otherwise become a word shuffle silently.
+        _ => {
+            debug_assert_eq!(op, Op::PSHUFHW, "a packed-integer operation has no arm");
+            let mut out = [0u16; 8];
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = if i < 4 {
+                    word_lane(src, i)
+                } else {
+                    word_lane(src, 4 + ((imm >> (2 * (i - 4))) & 3) as usize)
+                };
+            }
+            of_words(out)
+        }
     }
 }

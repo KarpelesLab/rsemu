@@ -5584,6 +5584,444 @@ mod fp {
         }
         assert_eq!(bytes, again.to_vec().unwrap());
     }
+
+    // -- SSE2's packed-integer half --------------------------------------
+    //
+    // Every expected value below is arithmetic that can be checked by hand, or
+    // a lane order taken from the instruction's page in *Intel SDM* volume 2.
+    // What made these worth writing is the reason they exist at all: `CPUID`
+    // leaf 1 has claimed `SSE2` since the feature bit landed, and until now
+    // `66 0F 60`-`76` and `66 0F D4`-`FE` raised `#UD` — so a statically linked
+    // glibc binary, whose startup runs `PUNPCKLDQ` inside the first hundred
+    // instructions, took an invalid-opcode exception it had no reason to
+    // expect.
+
+    /// Load `xmm0` and `xmm1`, run one two-byte instruction, and read `xmm0`.
+    fn packed2(prefix: u8, opcode: u8, a: [u64; 2], b: [u64; 2]) -> [u64; 2] {
+        let pc = ssepc();
+        let mut sse = Sse::new();
+        sse.set(0, a);
+        sse.set(1, b);
+        pc.cpu.set_sse(sse);
+        run(&pc, &[prefix, 0x0f, opcode, 0xc1, 0xf4]);
+        pc.cpu.sse().get(0)
+    }
+
+    /// The same, with an immediate third operand.
+    fn packed3(prefix: u8, opcode: u8, a: [u64; 2], b: [u64; 2], imm: u8) -> [u64; 2] {
+        let pc = ssepc();
+        let mut sse = Sse::new();
+        sse.set(0, a);
+        sse.set(1, b);
+        pc.cpu.set_sse(sse);
+        run(&pc, &[prefix, 0x0f, opcode, 0xc1, imm, 0xf4]);
+        pc.cpu.sse().get(0)
+    }
+
+    #[test]
+    fn punpckldq_is_the_instruction_a_static_glibc_start_up_runs() {
+        // `66 0F 62`: the low doubleword of each operand, then the second, in
+        // destination-then-source order. This is the encoding that stopped a
+        // real guest, so it gets its own test rather than a row in a table.
+        assert_eq!(
+            packed2(
+                0x66,
+                0x62,
+                [0x1111_1111_0000_0000, 0x3333_3333_2222_2222],
+                [0xbbbb_bbbb_aaaa_aaaa, 0xdddd_dddd_cccc_cccc],
+            ),
+            [0xaaaa_aaaa_0000_0000, 0xbbbb_bbbb_1111_1111],
+        );
+    }
+
+    #[test]
+    fn the_packed_adds_and_subtracts_wrap_or_saturate_as_the_mnemonic_says() {
+        let ones = [0x0101_0101_0101_0101u64; 2];
+        // `PADDB` wraps: 0xff + 1 is 0x00.
+        assert_eq!(
+            packed2(0x66, 0xfc, [u64::MAX; 2], ones),
+            [0; 2],
+            "paddb wraps"
+        );
+        // `PADDUSB` clamps at 0xff instead.
+        assert_eq!(
+            packed2(0x66, 0xdc, [u64::MAX; 2], ones),
+            [u64::MAX; 2],
+            "paddusb saturates"
+        );
+        // `PADDSB` clamps at the *signed* limits: 0x7f + 1 is 0x7f.
+        assert_eq!(
+            packed2(0x66, 0xec, [0x7f7f_7f7f_7f7f_7f7f; 2], ones),
+            [0x7f7f_7f7f_7f7f_7f7f; 2],
+            "paddsb saturates"
+        );
+        // `PSUBUSB` clamps at zero: 0 - 1 is 0, not 0xff.
+        assert_eq!(packed2(0x66, 0xd8, [0; 2], ones), [0; 2], "psubusb");
+        assert_eq!(
+            packed2(0x66, 0xf8, [0; 2], ones),
+            [u64::MAX; 2],
+            "psubb wraps"
+        );
+        // The wide lanes: 64-bit `PADDQ` carries across the whole quadword.
+        assert_eq!(
+            packed2(0x66, 0xd4, [u64::MAX, 0], [1, 1]),
+            [0, 1],
+            "paddq does not carry between lanes"
+        );
+    }
+
+    #[test]
+    fn the_packed_compares_write_a_lane_of_ones_or_a_lane_of_zeros() {
+        // `PCMPEQB`, the instruction every SSE2 `strlen` is built on.
+        assert_eq!(
+            packed2(
+                0x66,
+                0x74,
+                [0x0000_0000_0000_4142, 0],
+                [0x0000_0000_0000_4142, 0]
+            ),
+            [0xffff_ffff_ffff_ffff, 0xffff_ffff_ffff_ffff],
+            "every byte matched, including the fourteen zeros"
+        );
+        // `PCMPGTB` is *signed*: 0xff is -1 and is not greater than 0.
+        assert_eq!(
+            packed2(0x66, 0x64, [u64::MAX; 2], [0; 2]),
+            [0; 2],
+            "-1 is not greater than 0"
+        );
+        assert_eq!(
+            packed2(0x66, 0x64, [0x0101_0101_0101_0101; 2], [0; 2]),
+            [u64::MAX; 2],
+            "but 1 is"
+        );
+    }
+
+    #[test]
+    fn pmovmskb_gathers_sixteen_sign_bits_and_pcmpeqb_feeds_it() {
+        let pc = ssepc();
+        let mut sse = Sse::new();
+        // Bytes 0 and 15 have their top bit set; nothing else does.
+        sse.set(1, [0x0000_0000_0000_0080, 0x8000_0000_0000_0000]);
+        pc.cpu.set_sse(sse);
+        run(&pc, &[0x66, 0x0f, 0xd7, 0xc1, 0xf4]); // pmovmskb eax, xmm1
+        assert_eq!(pc.regs().rax, 0b1000_0000_0000_0001);
+    }
+
+    #[test]
+    fn the_shift_groups_take_their_count_from_the_immediate_and_the_register() {
+        // `66 0F 71 /2 ib` — group 12, extension 2: `PSRLW xmm1, 4`.
+        let pc = ssepc();
+        let mut sse = Sse::new();
+        sse.set(1, [0xf000_0f00_00f0_000f; 2]);
+        pc.cpu.set_sse(sse);
+        run(&pc, &[0x66, 0x0f, 0x71, 0xd1, 0x04, 0xf4]);
+        assert_eq!(pc.cpu.sse().get(1), [0x0f00_00f0_000f_0000; 2]);
+
+        // And the register form, `66 0F D1`, which takes the whole low
+        // quadword of the source as the count.
+        assert_eq!(
+            packed2(0x66, 0xd1, [0xf000_0f00_00f0_000f; 2], [4, 0]),
+            [0x0f00_00f0_000f_0000; 2],
+        );
+        // A count past the lane width clears the lane rather than wrapping
+        // into a shift of `count % 16`.
+        assert_eq!(
+            packed2(0x66, 0xd1, [u64::MAX; 2], [16, 0]),
+            [0; 2],
+            "a count of 16 clears a word lane"
+        );
+        assert_eq!(
+            packed2(0x66, 0xd1, [u64::MAX; 2], [0x1_0000_0000, 0]),
+            [0; 2],
+            "and so does one that does not fit in five bits"
+        );
+        // An *arithmetic* shift saturates its count instead: the lane fills
+        // with sign bits.
+        assert_eq!(
+            packed2(0x66, 0xe1, [0x8000_8000_8000_8000; 2], [99, 0]),
+            [u64::MAX; 2],
+            "psraw by 99 is psraw by 15"
+        );
+    }
+
+    #[test]
+    fn the_byte_shifts_move_the_whole_register_and_have_no_mmx_form() {
+        // `66 0F 73 /3 ib` is `PSRLDQ xmm1, 1`; `/7` is `PSLLDQ`.
+        let shift = |ext: u8, imm: u8| {
+            let pc = ssepc();
+            let mut sse = Sse::new();
+            sse.set(1, [0x0807_0605_0403_0201, 0x100f_0e0d_0c0b_0a09]);
+            pc.cpu.set_sse(sse);
+            run(&pc, &[0x66, 0x0f, 0x73, 0xc1 | (ext << 3), imm, 0xf4]);
+            pc.cpu.sse().get(1)
+        };
+        assert_eq!(
+            shift(3, 1),
+            [0x0908_0706_0504_0302, 0x0010_0f0e_0d0c_0b0a],
+            "psrldq by one byte crosses the quadword boundary"
+        );
+        assert_eq!(
+            shift(7, 1),
+            [0x0706_0504_0302_0100, 0x0f0e_0d0c_0b0a_0908],
+            "and so does pslldq"
+        );
+        assert_eq!(shift(3, 16), [0; 2], "a count of sixteen clears it");
+        assert_eq!(shift(3, 255), [0; 2], "and so does any larger one");
+    }
+
+    #[test]
+    fn the_shift_groups_have_no_memory_form_at_all() {
+        // `mod != 11` names an address, and there is nothing at it to shift:
+        // the operand *is* the register the `r/m` field selects. Hardware
+        // raises `#UD`, and a decoder that resolved the group on the `reg`
+        // field alone would happily execute this.
+        let pc = ssepc();
+        pc.idt(6, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        let mut code = alloc::vec![0x66, 0x0f, 0x71];
+        code.extend_from_slice(&disp32(2, fpat::DATA));
+        code.push(0x04);
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(pc.regs().rip, HANDLED);
+    }
+
+    #[test]
+    fn the_packing_instructions_saturate_and_the_destination_supplies_the_low_half() {
+        // `PACKSSWB`: eight words from the destination into bytes 0-7 and
+        // eight from the source into bytes 8-15, each clamped to a signed
+        // byte. 0x0100 is 256, which clamps to 127; 0xff00 is -256, to -128.
+        assert_eq!(
+            packed2(
+                0x66,
+                0x63,
+                [0x0100_0100_0100_0100; 2],
+                [0xff00_ff00_ff00_ff00; 2]
+            ),
+            [0x7f7f_7f7f_7f7f_7f7f, 0x8080_8080_8080_8080],
+        );
+        // `PACKUSWB` reads the same signed words and clamps them to *unsigned*
+        // bytes, so the negative half becomes zero rather than 0x80.
+        assert_eq!(
+            packed2(
+                0x66,
+                0x67,
+                [0x0100_0100_0100_0100; 2],
+                [0xff00_ff00_ff00_ff00; 2]
+            ),
+            [0xffff_ffff_ffff_ffff, 0],
+        );
+    }
+
+    #[test]
+    fn the_multiplies_split_the_product_the_way_their_names_say() {
+        // 0x4000 * 0x0004 = 0x1_0000: the low half is zero and the high half
+        // is one, so the pair of instructions recovers the whole product.
+        let a = [0x4000_4000_4000_4000u64; 2];
+        let b = [0x0004_0004_0004_0004u64; 2];
+        assert_eq!(packed2(0x66, 0xd5, a, b), [0; 2], "pmullw: the low halves");
+        assert_eq!(
+            packed2(0x66, 0xe5, a, b),
+            [0x0001_0001_0001_0001; 2],
+            "pmulhw: the high halves"
+        );
+        // `PMULHW` is signed and `PMULHUW` is not: -1 * -1 is 1, whose high
+        // half is zero, while 0xffff * 0xffff is 0xfffe0001.
+        assert_eq!(packed2(0x66, 0xe5, [u64::MAX; 2], [u64::MAX; 2]), [0; 2]);
+        assert_eq!(
+            packed2(0x66, 0xe4, [u64::MAX; 2], [u64::MAX; 2]),
+            [0xfffe_fffe_fffe_fffe; 2],
+        );
+        // `PMULUDQ` reads only the even doublewords and widens.
+        assert_eq!(
+            packed2(
+                0x66,
+                0xf4,
+                [0xdead_beef_0000_0003, 0xdead_beef_0000_0005],
+                [0xdead_beef_0000_0007, 0xdead_beef_0000_000b],
+            ),
+            [21, 55],
+        );
+        // `PMADDWD`: two signed products summed into each doubleword.
+        assert_eq!(
+            packed2(
+                0x66,
+                0xf5,
+                [0x0002_0003_0004_0005; 2],
+                [0x0006_0007_0008_0009; 2]
+            ),
+            [0x0000_0021_0000_004d; 2],
+            "5*9+4*8 = 77, and 3*7+2*6 = 33"
+        );
+    }
+
+    #[test]
+    fn psadbw_sums_eight_absolute_differences_into_each_halfs_low_word() {
+        assert_eq!(
+            packed2(0x66, 0xf6, [0; 2], [0x0101_0101_0101_0101; 2]),
+            [8, 8],
+        );
+        // The order of the operands does not matter, because it is an
+        // *absolute* difference.
+        assert_eq!(
+            packed2(0x66, 0xf6, [0x0101_0101_0101_0101; 2], [0; 2]),
+            [8, 8],
+        );
+    }
+
+    #[test]
+    fn pshufd_permutes_four_doublewords_and_the_two_word_shuffles_copy_the_half_they_do_not_name() {
+        let src = [0x1111_1111_0000_0000u64, 0x3333_3333_2222_2222];
+        // 0b00_01_10_11: reverse the four doublewords.
+        assert_eq!(
+            packed3(0x66, 0x70, [0; 2], src, 0b00_01_10_11),
+            [0x2222_2222_3333_3333, 0x0000_0000_1111_1111],
+        );
+        // `F2 0F 70` shuffles the low four words and copies the high quadword.
+        let words = [0x3333_2222_1111_0000u64, 0x7777_6666_5555_4444];
+        assert_eq!(
+            packed3(0xf2, 0x70, [0; 2], words, 0b00_01_10_11),
+            [0x0000_1111_2222_3333, 0x7777_6666_5555_4444],
+        );
+        // `F3 0F 70` does the other half, and copies the low quadword.
+        assert_eq!(
+            packed3(0xf3, 0x70, [0; 2], words, 0b00_01_10_11),
+            [0x3333_2222_1111_0000, 0x4444_5555_6666_7777],
+        );
+    }
+
+    #[test]
+    fn pinsrw_and_pextrw_move_one_word_between_the_two_register_files() {
+        let pc = ssepc();
+        let mut sse = Sse::new();
+        sse.set(0, [0; 2]);
+        pc.cpu.set_sse(sse);
+        // mov eax, 0xbeef ; pinsrw xmm0, eax, 5 ; pextrw ebx, xmm0, 5
+        let mut code = alloc::vec![0xb8, 0xef, 0xbe, 0x00, 0x00];
+        code.extend_from_slice(&[0x66, 0x0f, 0xc4, 0xc0, 0x05]);
+        code.extend_from_slice(&[0x66, 0x0f, 0xc5, 0xd8, 0x05]);
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(pc.cpu.sse().get(0), [0, 0x0000_0000_beef_0000]);
+        assert_eq!(pc.regs().rbx, 0xbeef, "and zero-extended on the way back");
+    }
+
+    #[test]
+    fn the_interleaves_take_alternate_lanes_starting_with_the_destination() {
+        let a = [0x0706_0504_0302_0100u64, 0x0f0e_0d0c_0b0a_0908];
+        let b = [0x1716_1514_1312_1110u64, 0x1f1e_1d1c_1b1a_1918];
+        // `PUNPCKLBW`: d0 s0 d1 s1 …
+        assert_eq!(
+            packed2(0x66, 0x60, a, b),
+            [0x1303_1202_1101_1000, 0x1707_1606_1505_1404],
+        );
+        // `PUNPCKHBW` reads the high half of each.
+        assert_eq!(
+            packed2(0x66, 0x68, a, b),
+            [0x1b0b_1a0a_1909_1808, 0x1f0f_1e0e_1d0d_1c0c],
+        );
+        // And the quadword forms, which are just a selection.
+        assert_eq!(packed2(0x66, 0x6c, a, b), [a[0], b[0]]);
+        assert_eq!(packed2(0x66, 0x6d, a, b), [a[1], b[1]]);
+    }
+
+    #[test]
+    fn the_min_max_and_average_forms_are_the_four_sse2_has_and_not_six_more() {
+        assert_eq!(
+            packed2(
+                0x66,
+                0xda,
+                [0x00ff_00ff_00ff_00ff; 2],
+                [0x0f0f_0f0f_0f0f_0f0f; 2]
+            ),
+            [0x000f_000f_000f_000f; 2],
+            "pminub is unsigned"
+        );
+        assert_eq!(
+            packed2(0x66, 0xea, [u64::MAX; 2], [0; 2]),
+            [u64::MAX; 2],
+            "pminsw is signed, and -1 is less than 0"
+        );
+        // `PAVGB` rounds up: (0 + 1 + 1) / 2 is 1.
+        assert_eq!(
+            packed2(0x66, 0xe0, [0; 2], [0x0101_0101_0101_0101; 2]),
+            [0x0101_0101_0101_0101; 2],
+        );
+        // And it does so at nine bits, so 0xff and 0xff average to 0xff
+        // rather than overflowing to zero.
+        assert_eq!(
+            packed2(0x66, 0xe0, [u64::MAX; 2], [u64::MAX; 2]),
+            [u64::MAX; 2]
+        );
+    }
+
+    #[test]
+    fn movntdq_is_an_aligned_store_and_has_no_register_form() {
+        let pc = ssepc();
+        let mut sse = Sse::new();
+        sse.set(0, [0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210]);
+        pc.cpu.set_sse(sse);
+        let mut code = alloc::vec![0x66, 0x0f, 0xe7];
+        code.extend_from_slice(&disp32(0, fpat::DATA));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(read64(&pc, fpat::DATA), 0x0123_4567_89ab_cdef);
+        assert_eq!(read64(&pc, fpat::DATA + 8), 0xfedc_ba98_7654_3210);
+
+        // Misaligned is `#GP(0)`, exactly as `MOVDQA` is: the aligned form
+        // exists so that the check is a checked assertion.
+        let pc = ssepc();
+        pc.idt(13, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        let mut code = alloc::vec![0x66, 0x0f, 0xe7];
+        code.extend_from_slice(&disp32(0, fpat::ODD));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(pc.regs().rip, HANDLED);
+    }
+
+    #[test]
+    fn a_part_without_sse2_refuses_the_packed_integer_half() {
+        // `ROADMAP.md` §6.1.1: an instruction that is absent must trap as
+        // undefined. `CPUID` on this part does not set the `SSE2` bit, and a
+        // guest that probes by executing the encoding has to find that out.
+        let features = Features {
+            sse2: false,
+            long: false,
+            nx: false,
+            syscall: false,
+            ..Features::X86_64
+        };
+        assert!(features.validate().is_ok());
+        let pc = Pc::with_features(Variant::X86_64, features);
+        pc.start_protected();
+        let mut sys = pc.cpu.sys();
+        sys.cr4 |= cr4::OSFXSR | cr4::OSXMMEXCPT;
+        pc.cpu.set_sys(sys);
+        pc.idt(6, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        run(&pc, &[0x66, 0x0f, 0x62, 0xc1, 0xf4]); // punpckldq xmm0, xmm1
+        assert_eq!(pc.regs().rip, HANDLED, "#UD, not an execution");
+    }
+
+    #[test]
+    fn the_disassembler_names_every_packed_integer_encoding_it_decodes() {
+        // The generator emits one description for decode, execution and
+        // disassembly (CLAUDE.md, "CPU cores"), so this is the check that the
+        // rows added to the table are reachable from all three.
+        let pc = ssepc();
+        let listing = |bytes: &[u8]| {
+            pc.write(at::CODE0, bytes);
+            let out = pc.cpu.disassemble(0x08, at::CODE0, 1);
+            alloc::format!("{}", out[0])
+        };
+        assert!(listing(&[0x66, 0x0f, 0x62, 0xc1]).ends_with("punpckldq xmm0, xmm1"));
+        assert!(listing(&[0x66, 0x0f, 0xfe, 0xc1]).ends_with("paddd xmm0, xmm1"));
+        assert!(listing(&[0x66, 0x0f, 0x71, 0xd1, 0x04]).ends_with("psrlw xmm1, 0x4"));
+        assert!(listing(&[0x66, 0x0f, 0x73, 0xf9, 0x01]).ends_with("pslldq xmm1, 0x1"));
+        assert!(listing(&[0x66, 0x0f, 0xd7, 0xc1]).ends_with("pmovmskb eax, xmm1"));
+        assert!(listing(&[0xf3, 0x0f, 0x70, 0xc1, 0x1b]).ends_with("pshufhw xmm0, xmm1, 0x1b"));
+    }
 }
 
 // ===========================================================================
@@ -5604,7 +6042,7 @@ mod multiprocessor {
     use crate::core::state::StateReader;
     use crate::core::sync::{AtomicU64, Ordering};
     use crate::core::wire::{LocalController, Startup};
-    use crate::cpu::x86::prot::{apic_base, cr4};
+    use crate::cpu::x86::prot::{apic_base, cr4, msr, mtrr};
 
     /// The page a Start-Up names in these tests: linear `0x8000`.
     const PAGE: u8 = 0x08;
@@ -6226,5 +6664,248 @@ mod multiprocessor {
         pc.cpu.step();
         pc.cpu.step();
         assert_ne!(pc.regs().rdx & (1 << 9), 0, "and one wired says so");
+    }
+
+    // -- The memory-type range registers ---------------------------------
+    //
+    // *Intel SDM* volume 3A §12.11 and volume 4 Table 2-2. What made these
+    // worth having is written up on `prot::mtrr`: with `CPUID`'s `MTRR` bit
+    // clear, Linux reports `MTRRs disabled (not available)` and `pmd_set_huge`
+    // then refuses every 2 MiB mapping, so a 64-bit kernel loses its large
+    // pages on a part that claims long mode.
+
+    /// A part with the memory-type range registers: the `x86-64` preset, which
+    /// is where they belong.
+    fn pc_mtrr() -> Pc {
+        let pc = Pc::new(Variant::X86_64);
+        pc.start_protected();
+        pc
+    }
+
+    /// `mov ecx, index ; mov eax, lo ; mov edx, hi ; wrmsr`, stepped exactly
+    /// four times.
+    ///
+    /// Stepped rather than run to a `hlt`, because a halted core answers every
+    /// later `step` with zero and a second program would then quietly not run
+    /// at all — which is a way to write a passing test that measures nothing.
+    fn wrmsr(pc: &Pc, index: u32, value: u64) {
+        let mut code = alloc::vec![0xb9];
+        code.extend_from_slice(&index.to_le_bytes());
+        code.push(0xb8);
+        code.extend_from_slice(&(value as u32).to_le_bytes());
+        code.push(0xba);
+        code.extend_from_slice(&((value >> 32) as u32).to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x30]);
+        pc.write(at::CODE0, &code);
+        set_rip(pc, at::CODE0);
+        for _ in 0..4 {
+            pc.cpu.step();
+        }
+    }
+
+    /// `mov ecx, index ; rdmsr`, stepped twice, with `EDX:EAX` reassembled.
+    fn rdmsr(pc: &Pc, index: u32) -> u64 {
+        let mut code = alloc::vec![0xb9];
+        code.extend_from_slice(&index.to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x32]);
+        pc.write(at::CODE0, &code);
+        set_rip(pc, at::CODE0);
+        pc.cpu.step();
+        pc.cpu.step();
+        let r = pc.regs();
+        u64::from(r.rax as u32) | (u64::from(r.rdx as u32) << 32)
+    }
+
+    #[test]
+    fn every_long_mode_part_has_the_memory_type_range_registers() {
+        // Not a preference: `Features::validate` refuses the combination,
+        // because `CPUID` leaf 1 has set the `MTRR` bit on every part since
+        // the Pentium Pro and a 64-bit kernel that finds it clear concludes
+        // its firmware left the memory map undescribed.
+        let impossible = Features {
+            mtrr: false,
+            ..Features::X86_64
+        };
+        assert!(impossible.validate().is_err(), "long mode needs MTRRs");
+        // And a part with the ranges but no `RDMSR` to reach them is refused
+        // for the reason that is not a part either.
+        let impossible = Features {
+            mtrr: true,
+            ..Features::NONE
+        };
+        assert!(impossible.validate().is_err());
+    }
+
+    #[test]
+    fn cpuid_reports_the_mtrr_bit_and_mtrrcap_says_how_many_there_are() {
+        let pc = pc_mtrr();
+        // mov eax, 1 ; cpuid
+        pc.write(at::CODE0, &[0xb8, 1, 0, 0, 0, 0x0f, 0xa2, 0xf4]);
+        pc.run(20);
+        assert_ne!(pc.regs().rdx & (1 << 12), 0, "leaf 1 should report MTRR");
+
+        let pc = pc_mtrr();
+        let cap = rdmsr(&pc, msr::MTRRCAP);
+        assert_eq!(cap & 0xff, 8, "eight variable ranges");
+        assert_ne!(cap & mtrr::FIX, 0, "and the fixed ones");
+        assert_ne!(cap & mtrr::WC, 0, "write-combining is an available type");
+        assert_eq!(cap & (1 << 11), 0, "but there is no SMRR: no SMM here");
+    }
+
+    #[test]
+    fn the_capability_register_is_read_only() {
+        let pc = pc_mtrr();
+        pc.idt(13, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        wrmsr(&pc, msr::MTRRCAP, 0);
+        assert_eq!(pc.regs().rip, HANDLER, "#GP(0), not a stored value");
+    }
+
+    #[test]
+    fn a_range_written_reads_back_and_survives_a_reset_of_nothing_else() {
+        let pc = pc_mtrr();
+        // The shape firmware writes: 0-2 GiB write-back, enabled.
+        wrmsr(&pc, msr::MTRR_PHYSBASE0, 6);
+        wrmsr(
+            &pc,
+            msr::MTRR_PHYSBASE0 + 1,
+            0xff_8000_0000 | mtrr::MASK_VALID,
+        );
+        wrmsr(&pc, msr::MTRR_DEF_TYPE, mtrr::DEF_E | mtrr::DEF_FE);
+        assert_eq!(rdmsr(&pc, msr::MTRR_PHYSBASE0), 6);
+        assert_eq!(
+            rdmsr(&pc, msr::MTRR_PHYSBASE0 + 1),
+            0xff_8000_0000 | mtrr::MASK_VALID
+        );
+        assert_eq!(
+            rdmsr(&pc, msr::MTRR_DEF_TYPE),
+            mtrr::DEF_E | mtrr::DEF_FE,
+            "and the enables"
+        );
+        // The seventh range is there too, which is what `VCNT` promised.
+        wrmsr(&pc, msr::MTRR_PHYSBASE0 + 14, 0x1000 | 1);
+        assert_eq!(rdmsr(&pc, msr::MTRR_PHYSBASE0 + 14), 0x1000 | 1);
+        // And the register one past the last is not.
+        pc.idt(13, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        rdmsr(&pc, msr::MTRR_PHYS_END);
+        assert_eq!(pc.regs().rip, HANDLER, "eight ranges, not nine");
+    }
+
+    #[test]
+    fn the_fixed_ranges_are_eleven_registers_at_three_runs_of_addresses() {
+        let pc = pc_mtrr();
+        pc.idt(13, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        // All write-back, which is what firmware leaves the first megabyte as
+        // once it has finished shadowing itself.
+        for index in [
+            msr::MTRR_FIX64K,
+            msr::MTRR_FIX16K,
+            msr::MTRR_FIX16K + 1,
+            msr::MTRR_FIX4K,
+            msr::MTRR_FIX4K + 7,
+        ] {
+            wrmsr(&pc, index, 0x0606_0606_0606_0606);
+            assert_eq!(rdmsr(&pc, index), 0x0606_0606_0606_0606, "{index:#x}");
+        }
+        // The gaps between the runs are not registers, and neither is the one
+        // past the last 4 KiB range.
+        for index in [
+            msr::MTRR_FIX16K + 2,
+            msr::MTRR_FIX4K - 1,
+            msr::MTRR_FIX4K + 8,
+        ] {
+            rdmsr(&pc, index);
+            assert_eq!(pc.regs().rip, HANDLER, "{index:#x} is not a register");
+        }
+    }
+
+    #[test]
+    fn a_reserved_bit_or_an_undefined_memory_type_is_refused() {
+        // The rule `IA32_APIC_BASE` and `IA32_MISC_ENABLE` already follow: a
+        // reserved bit accepted is a feature a guest thinks it turned on, and
+        // an undefined type accepted is how software would fail to discover
+        // which types a processor has.
+        let pc = pc_mtrr();
+        pc.idt(13, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        let faults = |value: u64, index: u32| {
+            wrmsr(&pc, index, value);
+            pc.regs().rip == HANDLER
+        };
+        assert!(faults(2, msr::MTRR_PHYSBASE0), "type 2 is reserved");
+        assert!(faults(3, msr::MTRR_PHYSBASE0), "and so is type 3");
+        assert!(faults(7, msr::MTRR_PHYSBASE0), "and everything above 6");
+        assert!(faults(0x100, msr::MTRR_PHYSBASE0), "bits 11:8 are reserved");
+        assert!(
+            faults(0x0100_0000_0000, msr::MTRR_PHYSBASE0),
+            "and so is every bit above the 40 CPUID reports"
+        );
+        assert!(
+            faults(0x0100_0000_0000, msr::MTRR_PHYSBASE0 + 1),
+            "the mask has the same width"
+        );
+        assert!(faults(1 << 12, msr::MTRR_DEF_TYPE), "def-type bit 12");
+        assert!(faults(7, msr::MTRR_DEF_TYPE), "and its type field too");
+        assert!(
+            faults(0x0606_0606_0606_0602, msr::MTRR_FIX64K),
+            "one bad byte in eight refuses the whole write"
+        );
+        assert_eq!(
+            rdmsr(&pc, msr::MTRR_FIX64K),
+            0,
+            "and stores none of the other seven"
+        );
+    }
+
+    #[test]
+    fn a_part_without_the_feature_has_no_such_registers_at_all() {
+        // `pc_msr` is a 486 with model-specific registers and no MTRRs, which
+        // is a part that shipped. Reading one has to be `#GP(0)` rather than a
+        // plausible zero, because that is how a guest tells "absent" from
+        // "present and disabled".
+        let pc = pc_msr();
+        pc.start_protected();
+        pc.idt(13, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        rdmsr(&pc, msr::MTRRCAP);
+        assert_eq!(pc.regs().rip, HANDLER);
+    }
+
+    #[test]
+    fn the_ranges_are_in_the_snapshot_because_a_guest_reads_back_what_it_wrote() {
+        let pc = pc_mtrr();
+        wrmsr(&pc, msr::MTRR_PHYSBASE0, 6);
+        wrmsr(
+            &pc,
+            msr::MTRR_PHYSBASE0 + 1,
+            0xff_8000_0000 | mtrr::MASK_VALID,
+        );
+        wrmsr(&pc, msr::MTRR_FIX4K + 3, 0x0505_0505_0505_0505);
+        wrmsr(&pc, msr::MTRR_DEF_TYPE, mtrr::DEF_E);
+        let before = pc.cpu.sys();
+
+        let mut shape = MachineShape::new();
+        shape.add_device("/cpu0", "cpu.x86").unwrap();
+        let mut writer = StateWriter::new(shape);
+        {
+            let mut chunk = writer
+                .chunk("/cpu0", "cpu.x86", crate::cpu::x86::CLASS.version)
+                .unwrap();
+            pc.cpu.save(&mut chunk).unwrap();
+        }
+        let bytes = writer.to_vec().unwrap();
+
+        let restored = pc_mtrr();
+        let reader = StateReader::new(&bytes).unwrap();
+        let (_, _, data) = reader.load_raw("/cpu0").unwrap();
+        let mut chunk = ChunkReader::new(data);
+        restored.cpu.load(&mut chunk).unwrap();
+        chunk.end().unwrap();
+        let after = restored.cpu.sys();
+        assert_eq!(after.mtrr_var, before.mtrr_var);
+        assert_eq!(after.mtrr_fix, before.mtrr_fix);
+        assert_eq!(after.mtrr_def_type, before.mtrr_def_type);
     }
 }
