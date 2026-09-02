@@ -595,7 +595,7 @@ pub mod cr4 {
     pub const VME: u64 = 1 << 0;
     /// Protected-mode virtual interrupts. Storage only.
     pub const PVI: u64 = 1 << 1;
-    /// Time-stamp disable: `RDTSC` becomes privileged. Storage only.
+    /// Time-stamp disable: `RDTSC` becomes privileged outside ring 0.
     pub const TSD: u64 = 1 << 2;
     /// Debugging extensions. Storage only.
     pub const DE: u64 = 1 << 3;
@@ -650,6 +650,19 @@ pub mod efer {
 /// probe. Inventing a zero for every address is how an emulator convinces a
 /// kernel that a feature exists.
 pub mod msr {
+    /// `IA32_TIME_STAMP_COUNTER`, the counter `RDTSC` reads.
+    ///
+    /// *Intel SDM* volume 4 Table 2-2, and volume 3 §17.17 for the counter
+    /// itself.
+    pub const TSC: u32 = 0x10;
+    /// `IA32_APIC_BASE`: the local APIC's enable bit, its bootstrap-processor
+    /// flag, and the physical address of its register page.
+    ///
+    /// *Intel SDM* volume 3A §10.4.4 and volume 4 Table 2-2. The one register
+    /// here whose state does not live in this core: see
+    /// [`apic_base`](super::apic_base) and
+    /// [`LocalController`](crate::core::wire::LocalController).
+    pub const APIC_BASE: u32 = 0x1b;
     /// `IA32_EFER`.
     pub const EFER: u32 = 0xc000_0080;
     /// `IA32_STAR`.
@@ -666,6 +679,37 @@ pub mod msr {
     pub const GS_BASE: u32 = 0xc000_0101;
     /// `IA32_KERNEL_GS_BASE`.
     pub const KERNEL_GS_BASE: u32 = 0xc000_0102;
+}
+
+/// The fields of [`msr::APIC_BASE`].
+///
+/// *Intel SDM* volume 3A §10.4.4, figure "IA32_APIC_BASE MSR".
+pub mod apic_base {
+    /// Bit 8: this processor is the bootstrap processor.
+    ///
+    /// Read-only. Which processor came out of the power-up arbitration first
+    /// is not something software gets to change afterwards, and a `WRMSR` that
+    /// tried would be rewriting history rather than hardware.
+    pub const BSP: u64 = 1 << 8;
+    /// Bit 10: x2APIC mode. Not implemented — its register set is a different
+    /// interface, not a flag — so a write that sets it raises `#GP`.
+    pub const X2APIC: u64 = 1 << 10;
+    /// Bit 11: the global enable. Clearing it makes the local APIC transparent,
+    /// with `LINT0` becoming the processor's `INTR` and `LINT1` its `NMI`
+    /// (SDM Vol 3A §10.4.3).
+    pub const ENABLE: u64 = 1 << 11;
+    /// Bits 12 up to the physical address width, which is the 40 bits `CPUID`
+    /// leaf `8000_0008` reports here: the register page's physical address.
+    ///
+    /// **Reported, not obeyed.** Moving the window is a retopology of the
+    /// address space, and a device does not get to do that to itself — a
+    /// machine file's `map` places the page. A guest that writes a different
+    /// base reads it back and finds the registers where they were.
+    pub const BASE: u64 = 0x0000_00ff_ffff_f000;
+
+    /// The bits a `WRMSR` may set. Everything else is reserved, and a reserved
+    /// bit written raises `#GP(0)` rather than being dropped.
+    pub const WRITABLE: u64 = ENABLE | BASE;
 }
 
 /// Whether an address is canonical: bits 63-48 must all equal bit 47.
@@ -2625,7 +2669,44 @@ impl Exec<'_> {
         self.msr_write(index, value)
     }
 
+    /// `RDTSC`: the time-stamp counter into `EDX:EAX`.
+    ///
+    /// The counter is [`State::cycles`](super::exec::State::cycles), which is
+    /// this core's own clock count — documented timing rather than measured
+    /// timing, as the module documentation says of every cycle figure here.
+    /// `CPUID` has always reported the `TSC` bit alongside `MSR`; until this
+    /// existed that claim was a lie, and a guest that calibrated against it got
+    /// an invalid-opcode exception.
+    ///
+    /// # Errors
+    ///
+    /// `#UD` on a part with no time-stamp counter, and `#GP(0)` outside ring 0
+    /// while `CR4.TSD` is set (*Intel SDM* volume 3 §2.5).
+    pub(super) fn rdtsc(&mut self) -> Ex<()> {
+        if !self.cfg.features.msr {
+            return Err(Fault::bare(VEC_UD));
+        }
+        if self.state.sys.cr4 & cr4::TSD != 0 {
+            self.require_ring0()?;
+        }
+        let tsc = self.state.cycles;
+        self.state.regs.set_dword(0, tsc as u32);
+        self.state.regs.set_dword(2, (tsc >> 32) as u32);
+        Ok(())
+    }
+
     fn msr_read(&mut self, index: u32) -> Ex<u64> {
+        // The two registers whose state is not in `Sys`, first: the counter,
+        // and the one that lives in this core's own interrupt controller.
+        match index {
+            msr::TSC => return Ok(self.state.cycles),
+            // `#GP` rather than a plausible zero when no local controller is
+            // wired: a core with no APIC does not have this register, and a
+            // guest that read zero would conclude its APIC was disabled rather
+            // than absent.
+            msr::APIC_BASE => return self.lines.base_register().ok_or(Fault::gp(0)),
+            _ => {}
+        }
         let sys = &self.state.sys;
         let value = match index {
             msr::EFER if self.cfg.features.long => sys.efer,
@@ -2643,6 +2724,38 @@ impl Exec<'_> {
 
     fn msr_write(&mut self, index: u32, value: u64) -> Ex<()> {
         match index {
+            // Writing the counter is what a hypervisor or a firmware
+            // synchronising two processors does (*Intel SDM* volume 3 §17.17.3).
+            // It moves the count this core charges against, which is the same
+            // counter `RDTSC` reads, so the two cannot disagree.
+            msr::TSC => {
+                self.state.cycles = value;
+                Ok(())
+            }
+            // The base-address field is stored and reported but does not move
+            // the window — `apic_base::BASE` says why — so this is not a
+            // retopology, it is a write into the controller's own state.
+            msr::APIC_BASE => {
+                // Everything outside these three fields is reserved, and
+                // `apic_base::X2APIC` is deliberately among them: x2APIC is a
+                // different register interface rather than a flag, so a write
+                // that tried to enable it is refused. That is what lets a guest
+                // *probe* for x2APIC instead of believing it turned it on.
+                if value & !(apic_base::WRITABLE | apic_base::BSP) != 0 {
+                    return Err(Fault::gp(0));
+                }
+                let Some(current) = self.lines.base_register() else {
+                    return Err(Fault::gp(0));
+                };
+                // The bootstrap-processor flag is read-only: whatever software
+                // wrote there is discarded and the controller's own bit kept,
+                // exactly as `EFER.LMA` is handled below.
+                let merged = (value & apic_base::WRITABLE) | (current & apic_base::BSP);
+                if !self.lines.set_base_register(merged) {
+                    return Err(Fault::gp(0));
+                }
+                Ok(())
+            }
             msr::EFER if self.cfg.features.long => {
                 // `LME` may not be changed while paging is on: the transition
                 // is defined only across a `CR0.PG` edge, and allowing it

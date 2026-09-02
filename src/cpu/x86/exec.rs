@@ -320,6 +320,14 @@ pub(super) struct State {
     pub shutdown: bool,
     /// A reset was requested and its sequence has not run yet.
     pub reset_pending: bool,
+    /// The processor is stopped awaiting a Start-Up.
+    ///
+    /// Where an INIT leaves an application processor, and the one halt nothing
+    /// but a Start-Up ends: an `INTR` or an `NMI` arriving here stays pending
+    /// rather than being taken (SDM Vol 3A §8.4.2, *MultiProcessor
+    /// Specification* v1.4 §B.4). Distinct from [`halted`](State::halted),
+    /// which any interrupt leaves.
+    pub wait_for_sipi: bool,
     /// Interrupts are inhibited for the next instruction.
     ///
     /// Set by `MOV SS,x`, `POP SS`, `LSS` and `STI` so that the `SS:ESP` pair
@@ -370,6 +378,7 @@ impl State {
             halted: false,
             shutdown: false,
             reset_pending: true,
+            wait_for_sipi: false,
             int_shadow: false,
             queue: Queue::new(variant),
             open_bus: 0,
@@ -506,6 +515,35 @@ impl<'a> Exec<'a> {
         if self.state.reset_pending {
             self.reset_sequence();
             return self.used;
+        }
+        // INIT outranks everything below it and is outranked by `RESET`, which
+        // is the ordering of Table 9-1's three columns: the greater restart
+        // subsumes the lesser. Both latches live outside the execution lock, so
+        // this is where they become state — the same shape as the `reset` pin.
+        if self.lines.take_init_request() {
+            self.init_sequence();
+            return self.used;
+        }
+        // The processor is held in reset for as long as the line is asserted
+        // (SDM Vol 3A §10.6.1's level-triggered pair). Charging nothing is what
+        // tells the scheduler to stop rather than spin.
+        if self.lines.init_held() {
+            return 0;
+        }
+        // A Start-Up ends the wait, and is ignored by a processor that is not
+        // in it — which is why the specification's algorithm sends two of them
+        // and does not care that the second is redundant (MP spec §B.4).
+        if let Some(page) = self.lines.take_startup()
+            && self.state.wait_for_sipi
+        {
+            self.startup_sequence(page);
+            return self.used;
+        }
+        if self.state.wait_for_sipi {
+            // Nothing but a Start-Up leaves this state: an `INTR` or an `NMI`
+            // that arrives stays pending on the pin, which is why this is
+            // checked above them rather than beside `halted` below.
+            return 0;
         }
         if self.state.shutdown {
             // A triple fault stops the processor until `RESET`. Charging
@@ -1238,6 +1276,10 @@ impl<'a> Exec<'a> {
         self.state.halted = false;
         self.state.shutdown = false;
         self.state.int_shadow = false;
+        // A `RESET` outranks an INIT rather than being a stronger flavour of
+        // it: this processor is going to the reset vector, not waiting to be
+        // told where to go.
+        self.state.wait_for_sipi = false;
         let variant = self.variant();
         if variant.is_32bit() {
             let keep = self.state.regs;
@@ -1264,6 +1306,78 @@ impl<'a> Exec<'a> {
             regs.ss = 0;
             regs.eflags = flags::RESERVED_SET;
         }
+        self.state.queue.flush();
+        self.charge(RESET_CLOCKS);
+    }
+
+    /// The INIT sequence.
+    ///
+    /// The third column of *Intel SDM* Vol 3A Table 9-1, "IA-32 Processor
+    /// States Following Power-up, Reset, or INIT". Architecturally it is a
+    /// reset that keeps a short list of things — and every item on that list is
+    /// one this core either does not model at all or models here:
+    ///
+    /// * **The x87 and SSE register files, `MXCSR` and the tag word are
+    ///   unchanged.** A *power-up* zeroes them; an INIT does not, so a
+    ///   processor restarted by its neighbour comes back with whatever was on
+    ///   its stack.
+    /// * **The time-stamp counter is unchanged**, which is [`State::cycles`]
+    ///   here — an INIT that reset it would make a guest's calibration loop
+    ///   disagree with the wall it was calibrated against.
+    /// * Caches, write buffers, machine-check banks and the memory type range
+    ///   registers are unchanged. None of them is modelled, so nothing to do.
+    ///
+    /// Which is why this is [`reset_sequence`](Exec::reset_sequence) plus one
+    /// flag rather than a second sequence beside it: everything Table 9-1's
+    /// INIT column preserves, the *sequence* preserves already. What zeroes the
+    /// register files is a cold
+    /// [`Device::reset`](crate::core::device::Device::reset) — the power-up
+    /// column — and that is a different entry point. Two sequences that agreed
+    /// field for field would be two places to keep in step, and the second one
+    /// would drift.
+    ///
+    /// **Where it leaves the processor is the whole difference.** A reset
+    /// restarts at the reset vector; an INIT stops the processor in the
+    /// wait-for-SIPI state, from which nothing but a Start-Up moves it
+    /// ([`startup_sequence`](Exec::startup_sequence), and the *MultiProcessor
+    /// Specification* v1.4 §B.4 for why those are two separate messages).
+    ///
+    /// The translation-lookaside buffer is the one deliberate departure: the
+    /// table says it survives an INIT, and `reset_sequence` flushes it. A TLB
+    /// emptier than the hardware's is never architecturally visible — every
+    /// entry it drops is one the walk regenerates — and keeping stale entries
+    /// across a sequence that has just zeroed `CR3` would be.
+    fn init_sequence(&mut self) {
+        self.reset_sequence();
+        self.state.wait_for_sipi = true;
+    }
+
+    /// The Start-Up sequence: begin executing at `CS:IP = page << 8 : 0`.
+    ///
+    /// *MultiProcessor Specification* v1.4 §B.4 and *Intel SDM* Vol 3A §8.4.3:
+    /// the Start-Up message's vector names a page, the processor loads it into
+    /// `CS` as a real-mode selector — so the *cached base* is `page << 12` and
+    /// the first fetch is from physical `000PP000H` — and clears `EIP`.
+    /// **Nothing else changes**: the descriptor's limit and access rights are
+    /// the ones the INIT left, which is why an application processor starts in
+    /// real mode however the bootstrap processor is running.
+    ///
+    /// The clock figure is the reset sequence's, because no manual gives one
+    /// for a Start-Up and it happens once per processor per boot. What must not
+    /// be zero is the *charge*: a step that charges nothing is how this core
+    /// tells a scheduler it has stopped, and a processor that has just been
+    /// started has not.
+    fn startup_sequence(&mut self, page: u8) {
+        self.state.wait_for_sipi = false;
+        self.state.halted = false;
+        self.state.shutdown = false;
+        self.state.int_shadow = false;
+        let selector = u16::from(page) << 8;
+        self.state.regs.cs = selector;
+        self.state.regs.rip = 0;
+        let entry = self.state.sys.seg_mut(seg::CS);
+        entry.selector = selector;
+        entry.base = u64::from(page) << 12;
         self.state.queue.flush();
         self.charge(RESET_CLOCKS);
     }
@@ -1699,6 +1813,7 @@ impl<'a> Exec<'a> {
                 self.write_arg(f, insn.dst, f.opsize, value)?;
             }
             Op::RDMSR => self.rdmsr()?,
+            Op::RDTSC => self.rdtsc()?,
             Op::WRMSR => self.wrmsr()?,
             Op::SYSCALL => self.syscall()?,
             Op::SYSRET => self.sysret(f.opsize)?,
@@ -3246,6 +3361,16 @@ impl<'a> Exec<'a> {
         }
         if features.pae {
             edx1 |= 1 << 6; // PAE
+        }
+        // APIC: an on-chip local interrupt controller. Not a `Features` bit,
+        // because it is not a property of the *part* — it is whether the board
+        // wired one to this core, which is what a local APIC is in this tree
+        // (`core::wire`'s `LocalController`). A guest told it has one goes
+        // looking for `IA32_APIC_BASE`, and on a machine with no controller
+        // that register raises `#GP`; the two answers agree because they are
+        // the same fact.
+        if self.lines.has_local_controller() {
+            edx1 |= 1 << 9;
         }
         if features.pse {
             edx1 |= 1 << 3; // PSE: 4 MiB pages

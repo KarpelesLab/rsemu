@@ -41,7 +41,7 @@ use crate::core::sched::{Budget, Consumed, LazyHandle, TickCursor};
 use crate::core::space::{RegionRef, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter};
 use crate::core::sync::AtomicU64;
-use crate::core::wire::{DmaPeripheral, IntAck, WireId, WireSink, WireSource};
+use crate::core::wire::{DmaPeripheral, IntAck, LocalController, WireId, WireSink, WireSource};
 
 /// How deep a reset goes.
 ///
@@ -524,6 +524,25 @@ pub trait Device: Send + Sync + fmt::Debug {
     /// is unmasked and the request arrives. Weak, for the same reason
     /// [`attach_int_ack`](Device::attach_int_ack) is.
     fn attach_dma_peripheral(&self, _port: &str, _peer: Weak<dyn DmaPeripheral>) {}
+
+    /// The processor-side interface this device offers on output pin `port`.
+    ///
+    /// A controller that is *part of* a processor — an x86 local APIC, a GIC
+    /// CPU interface — returns one here, and the realizer hands it to every
+    /// sink on that net exactly as it hands out an
+    /// [`int_ack`](Device::int_ack). [`LocalController`] says what travels
+    /// along it and why a wire cannot carry it. As with `int_ack`, **the device
+    /// must own the `Arc`**: what reaches the processor is a `Weak`.
+    fn local_controller(&self, _port: &str) -> Option<Arc<dyn LocalController>> {
+        None
+    }
+
+    /// Told which controller belongs to this processor, on input pin `port`.
+    ///
+    /// A CPU keeps this and asks it at each instruction boundary whether it has
+    /// been sent an INIT or a Start-Up. Weak, for the same reason
+    /// [`attach_int_ack`](Device::attach_int_ack) is.
+    fn attach_local_controller(&self, _port: &str, _peer: Weak<dyn LocalController>) {}
 
     /// Announce the level `port` idles at — the realize sweep (§4.3).
     ///

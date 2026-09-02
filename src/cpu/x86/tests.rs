@@ -5421,3 +5421,514 @@ mod fp {
         assert_eq!(bytes, again.to_vec().unwrap());
     }
 }
+
+// ===========================================================================
+// Multiprocessing: INIT, Start-Up, and the model-specific registers
+// ===========================================================================
+
+/// The two restarts that are not `RESET`, and the register file that names
+/// state living outside the processor.
+///
+/// Written from the *Intel SDM* volume 3A Table 9-1 (what an INIT resets),
+/// §8.4.3 and the *MultiProcessor Specification* v1.4 §B.4 (where a Start-Up
+/// leaves a processor), §10.4.4 (`IA32_APIC_BASE`), and volume 4's MSR tables.
+/// `tests/pc_apic_smp.rs` is the same thing driven by a *guest*: a bootstrap
+/// processor executing the specification's three writes to its own interrupt
+/// command register, with nothing supplied by hand.
+mod multiprocessor {
+    use super::*;
+    use crate::core::state::StateReader;
+    use crate::core::sync::{AtomicU64, Ordering};
+    use crate::core::wire::{LocalController, Startup};
+    use crate::cpu::x86::prot::{apic_base, cr4};
+
+    /// The page a Start-Up names in these tests: linear `0x8000`.
+    const PAGE: u8 = 0x08;
+
+    /// Where the fault handlers in this module sit, inside the ring-0 code
+    /// segment the other protected-mode tests use.
+    const HANDLER: u64 = 0x3100;
+
+    /// Point the core at `rip` without disturbing anything else.
+    fn set_rip(pc: &Pc, rip: u64) {
+        let mut regs = pc.cpu.regs();
+        regs.rip = rip;
+        pc.cpu.set_regs(regs);
+    }
+
+    /// Enable maskable interrupts.
+    fn set_if(pc: &Pc) {
+        let mut regs = pc.cpu.regs();
+        regs.eflags |= flags::IF;
+        pc.cpu.set_regs(regs);
+    }
+
+    /// A 486 with `CR4` and the model-specific registers switched on: a
+    /// Pentium-class part in everything these tests touch.
+    ///
+    /// The lattice rather than the ladder (`ROADMAP.md` §6.1.1). A machine file
+    /// says the same thing with `msr = true`, and a board with a local APIC has
+    /// to: the APIC's own base register is an MSR.
+    fn pc_msr() -> Pc {
+        let mut features = Variant::I80486.features();
+        features.cr4 = true;
+        features.msr = true;
+        Pc::with_features(Variant::I80486, features)
+    }
+
+    #[test]
+    fn an_init_is_a_reset_that_stops_at_wait_for_sipi() {
+        let pc = pc386();
+        pc.start_protected();
+        pc.cpu.step();
+        assert!(pc.cpu.sys().protected(), "there is something to lose");
+        let cycles = pc.cpu.cycles();
+
+        pc.cpu.request_init();
+        assert!(pc.cpu.init_requested());
+        let charged = pc.cpu.step();
+
+        assert!(charged > 0, "the sequence itself is charged for");
+        assert!(
+            !pc.cpu.sys().protected(),
+            "an INIT puts CR0 back to its reset value (Table 9-1)"
+        );
+        assert_eq!(pc.cpu.regs().cs, 0xf000);
+        assert_eq!(pc.cpu.regs().rip, 0xfff0);
+        assert!(
+            pc.cpu.cycles() > cycles,
+            "the time-stamp counter is not reset by an INIT, only added to"
+        );
+        assert!(
+            pc.cpu.is_waiting_for_startup(),
+            "and it stops there rather than fetching from the reset vector"
+        );
+        assert_eq!(pc.cpu.step(), 0, "which is a full stop");
+    }
+
+    #[test]
+    fn a_reset_and_an_init_differ_in_where_they_leave_the_processor() {
+        // The distinction the whole seam exists for: `RESET` restarts at the
+        // reset vector, INIT waits to be told where to start.
+        let reset = pc386();
+        reset.start_protected();
+        reset.cpu.request_reset();
+        reset.cpu.step();
+        assert!(!reset.cpu.is_waiting_for_startup());
+        assert!(reset.cpu.step() > 0, "it is fetching");
+
+        let init = pc386();
+        init.start_protected();
+        init.cpu.request_init();
+        init.cpu.step();
+        assert!(init.cpu.is_waiting_for_startup());
+        assert_eq!(init.cpu.step(), 0, "it is not");
+    }
+
+    #[test]
+    fn a_start_up_begins_execution_at_the_page_it_names() {
+        let pc = pc386();
+        pc.start_protected();
+        // inc eax ; jmp $ — sixteen-bit code, because a Start-Up leaves the
+        // processor in real mode however the sender was running.
+        pc.write(u64::from(PAGE) << 12, &[0x40, 0xeb, 0xfe]);
+
+        pc.cpu.request_init();
+        pc.cpu.step();
+        pc.cpu.start_up(PAGE);
+        assert!(pc.cpu.step() > 0, "the Start-Up sequence runs");
+
+        assert_eq!(pc.cpu.regs().cs, u16::from(PAGE) << 8);
+        assert_eq!(pc.cpu.regs().rip, 0);
+        assert_eq!(
+            pc.cpu.sys().segs[usize::from(isa::seg::CS)].base,
+            u64::from(PAGE) << 12,
+            "the cached base is page << 12, so the fetch is from 000PP000H"
+        );
+        assert!(!pc.cpu.is_waiting_for_startup());
+
+        pc.cpu.step();
+        assert_eq!(pc.regs().rax & 0xffff_ffff, 1, "and it executed the page");
+    }
+
+    #[test]
+    fn a_start_up_to_a_processor_that_is_not_waiting_is_ignored() {
+        // Which is why the specification's algorithm sends two of them and does
+        // not care that the second is redundant (§B.4).
+        let pc = pc386();
+        pc.start_protected();
+        pc.write(at::CODE0, &[0x40, 0xeb, 0xfe]); // inc eax ; jmp $
+        pc.cpu.start_up(PAGE);
+        pc.cpu.step();
+        assert_eq!(pc.regs().rax & 0xffff_ffff, 1);
+        assert_ne!(pc.cpu.regs().cs, u16::from(PAGE) << 8);
+    }
+
+    #[test]
+    fn an_interrupt_does_not_leave_the_wait_for_sipi_state() {
+        // The difference between this halt and a `HLT`, which any interrupt
+        // ends (SDM Vol 3A §8.4.2).
+        let pc = pc386();
+        pc.start_protected();
+        pc.cpu.request_init();
+        pc.cpu.step();
+
+        pc.cpu.set_intr_vector(0x42);
+        pc.cpu.set_intr(true);
+        set_if(&pc);
+        assert_eq!(pc.cpu.step(), 0, "the request stays pending on the pin");
+        assert!(pc.cpu.is_waiting_for_startup());
+
+        pc.cpu.pulse_nmi();
+        assert_eq!(pc.cpu.step(), 0, "and so does an NMI");
+        assert!(pc.cpu.nmi_pending(), "which is still latched");
+    }
+
+    #[test]
+    fn the_init_pin_holds_the_processor_in_reset_while_it_is_asserted() {
+        use crate::core::wire::{Level, Wire, WireId};
+
+        let pc = pc386();
+        pc.start_protected();
+        pc.write(u64::from(PAGE) << 12, &[0x40, 0xeb, 0xfe]);
+
+        let src = WireId(1);
+        let pin = pc.cpu.sink("init", &[src]).expect("a 386 has an INIT pin");
+        assert!(
+            !pc.cpu.init_held(),
+            "a fresh net sits low, and low is de-asserted: nothing invented"
+        );
+        let wire = Wire::builder()
+            .source(src)
+            .sink_weak(Arc::downgrade(&pin.sink), pin.line)
+            .build();
+
+        wire.set(src, Level::High);
+        assert!(pc.cpu.init_held());
+        assert!(pc.cpu.step() > 0, "the rising edge runs the sequence");
+        assert!(pc.cpu.is_waiting_for_startup());
+        // Held: even a Start-Up does not start it while the line is up, which
+        // is what a *level*-triggered INIT means.
+        pc.cpu.start_up(PAGE);
+        assert_eq!(pc.cpu.step(), 0);
+        assert!(pc.cpu.is_waiting_for_startup());
+
+        wire.set(src, Level::Low);
+        assert!(!pc.cpu.init_held());
+        assert!(pc.cpu.step() > 0, "and now the Start-Up is taken");
+        assert_eq!(pc.cpu.regs().cs, u16::from(PAGE) << 8);
+    }
+
+    #[test]
+    fn a_reset_outranks_an_init_that_has_not_run_yet() {
+        // The greater restart subsumes the lesser: a processor that has just
+        // been reset is not owed the sequence that would put it where reset
+        // already put it.
+        let pc = pc386();
+        pc.start_protected();
+        pc.cpu.request_init();
+        Device::reset(&*pc.cpu, ResetKind::Warm);
+        assert!(!pc.cpu.init_requested(), "the latch went with the reset");
+        pc.cpu.step();
+        assert!(!pc.cpu.is_waiting_for_startup());
+    }
+
+    #[test]
+    fn a_sixteen_bit_part_has_no_init_pin() {
+        // It arrived with the parts that could be a second processor. A machine
+        // file naming one on an 8088 is told so rather than given a pin that
+        // does nothing.
+        let m = machine();
+        assert!(
+            m.cpu
+                .sink("init", &[crate::core::wire::WireId(1)])
+                .is_none()
+        );
+        let pc = pc386();
+        assert!(
+            pc.cpu
+                .sink("init", &[crate::core::wire::WireId(1)])
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn the_multiprocessor_state_round_trips_through_a_snapshot() {
+        let pc = pc386();
+        pc.start_protected();
+        pc.cpu.request_init();
+        pc.cpu.step();
+        pc.cpu.start_up(PAGE);
+        assert!(pc.cpu.is_waiting_for_startup());
+
+        let mut shape = MachineShape::new();
+        shape.add_device("/cpu0", "cpu.x86").unwrap();
+        let mut writer = StateWriter::new(shape);
+        {
+            let mut chunk = writer.chunk("/cpu0", "cpu.x86", 6).unwrap();
+            pc.cpu.save(&mut chunk).unwrap();
+        }
+        let bytes = writer.to_vec().unwrap();
+
+        // Wreck it: a cold reset is the one thing that clears both.
+        Device::reset(&*pc.cpu, ResetKind::Cold);
+        assert!(!pc.cpu.is_waiting_for_startup());
+
+        let reader = StateReader::new(&bytes).unwrap();
+        let (_, _, data) = reader.load_raw("/cpu0").unwrap();
+        let mut chunk = ChunkReader::new(data);
+        pc.cpu.load(&mut chunk).unwrap();
+        // Nothing left over: the multiprocessor block is the end of the chunk,
+        // so a mismatched layout shows up here rather than silently.
+        chunk.end().unwrap();
+        assert!(pc.cpu.is_waiting_for_startup(), "still waiting");
+
+        // A second save is byte-identical, which is what "an identical state
+        // hash" means for a chunk this shape — and the Start-Up the first one
+        // recorded is still latched, so the restored processor starts.
+        let mut shape = MachineShape::new();
+        shape.add_device("/cpu0", "cpu.x86").unwrap();
+        let mut again = StateWriter::new(shape);
+        {
+            let mut chunk = again.chunk("/cpu0", "cpu.x86", 6).unwrap();
+            pc.cpu.save(&mut chunk).unwrap();
+        }
+        assert_eq!(bytes, again.to_vec().unwrap());
+
+        pc.cpu.step();
+        assert_eq!(pc.cpu.regs().cs, u16::from(PAGE) << 8);
+    }
+
+    // -- The model-specific registers --------------------------------------
+
+    #[test]
+    fn an_unimplemented_model_specific_register_faults() {
+        // `#GP(0)`, never a zero: a guest that reads zero from an MSR that does
+        // not exist concludes the feature is present and disabled, and
+        // misbehaves a long way from here (SDM Vol 4, and volume 3 §2.5's
+        // description of `RDMSR`).
+        let pc = pc_msr();
+        pc.start_protected();
+        pc.idt(13, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]); // hlt
+        // mov ecx, 0xdeadbeef ; rdmsr
+        pc.write(at::CODE0, &[0xb9, 0xef, 0xbe, 0xad, 0xde, 0x0f, 0x32]);
+        pc.cpu.step();
+        pc.cpu.step();
+        assert_eq!(pc.cpu.regs().rip, HANDLER, "#GP(0), not a zero");
+    }
+
+    #[test]
+    fn a_write_to_an_unimplemented_model_specific_register_faults() {
+        let pc = pc_msr();
+        pc.start_protected();
+        pc.idt(13, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        // mov ecx, 0xdeadbeef ; xor eax, eax ; xor edx, edx ; wrmsr
+        pc.write(
+            at::CODE0,
+            &[
+                0xb9, 0xef, 0xbe, 0xad, 0xde, 0x31, 0xc0, 0x31, 0xd2, 0x0f, 0x30,
+            ],
+        );
+        for _ in 0..4 {
+            pc.cpu.step();
+        }
+        assert_eq!(pc.cpu.regs().rip, HANDLER);
+    }
+
+    #[test]
+    fn the_time_stamp_counter_is_readable_two_ways_and_writable_one() {
+        let pc = pc_msr();
+        pc.start_protected();
+        // rdtsc ; mov ecx, IA32_TSC ; rdmsr
+        pc.write(at::CODE0, &[0x0f, 0x31, 0xb9, 0x10, 0, 0, 0, 0x0f, 0x32]);
+        pc.cpu.step();
+        let by_rdtsc = pc.regs().rax & 0xffff_ffff;
+        assert!(by_rdtsc > 0, "the counter is this core's own cycle count");
+        pc.cpu.step();
+        pc.cpu.step();
+        assert!(
+            pc.regs().rax & 0xffff_ffff > by_rdtsc,
+            "and `RDMSR` of 0x10 reads the same counter, which has moved on"
+        );
+
+        // Writing it moves the counter both of them read (SDM Vol 3 §17.17.3).
+        // mov ecx, IA32_TSC ; mov eax, 0x1000 ; xor edx, edx ; wrmsr ; rdtsc
+        pc.write(
+            at::CODE0,
+            &[
+                0xb9, 0x10, 0, 0, 0, 0xb8, 0x00, 0x10, 0, 0, 0x31, 0xd2, 0x0f, 0x30, 0x0f, 0x31,
+            ],
+        );
+        set_rip(&pc, at::CODE0);
+        for _ in 0..5 {
+            pc.cpu.step();
+        }
+        let after = pc.regs().rax & 0xffff_ffff;
+        assert!(
+            (0x1000..0x1100).contains(&after),
+            "the counter restarted from what was written, not from where it was"
+        );
+    }
+
+    #[test]
+    fn rdtsc_is_privileged_only_while_cr4_tsd_is_set() {
+        // *Intel SDM* volume 3 §2.5. Until this existed, `CPUID` reported the
+        // `TSC` bit and `RDTSC` raised `#UD`, which is the kind of lie the
+        // `cpuid` doc comment says it does not tell.
+        let pc = pc_msr();
+        pc.start_protected();
+        let mut sys = pc.cpu.sys();
+        sys.cr4 |= cr4::TSD;
+        pc.cpu.set_sys(sys);
+        pc.write(at::CODE0, &[0x0f, 0x31]);
+        pc.cpu.step();
+        assert!(
+            pc.regs().rax & 0xffff_ffff > 0,
+            "ring 0 reads it however `TSD` is set"
+        );
+    }
+
+    #[test]
+    fn a_part_with_no_model_specific_registers_raises_ud() {
+        // A 486 has neither instruction, and the check is at execution rather
+        // than in the table: the row decodes, the feature decides.
+        let pc = pc386();
+        pc.start_protected();
+        pc.idt(6, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        pc.write(at::CODE0, &[0x0f, 0x31]); // rdtsc
+        pc.cpu.step();
+        assert_eq!(pc.cpu.regs().rip, HANDLER, "#UD");
+    }
+
+    /// A local controller with nothing to report and a base register that says
+    /// what it was set to, which is all `IA32_APIC_BASE` needs from one.
+    #[derive(Debug)]
+    struct Controller {
+        base: AtomicU64,
+    }
+
+    impl LocalController for Controller {
+        fn take_startup(&self) -> Startup {
+            Startup::NONE
+        }
+
+        fn base_register(&self) -> u64 {
+            self.base.load(Ordering::Acquire)
+        }
+
+        fn set_base_register(&self, value: u64) {
+            self.base.store(value, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn ia32_apic_base_faults_on_a_processor_with_no_local_controller() {
+        // The register is the controller's, not the core's: a board that wired
+        // no APIC does not have it, and `#GP` is the honest answer. `CPUID`'s
+        // `APIC` bit is clear on the same machine, so the two agree.
+        let pc = pc_msr();
+        pc.start_protected();
+        pc.idt(13, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        pc.write(at::CODE0, &[0xb9, 0x1b, 0, 0, 0, 0x0f, 0x32]);
+        pc.cpu.step();
+        pc.cpu.step();
+        assert_eq!(pc.cpu.regs().rip, HANDLER);
+    }
+
+    #[test]
+    fn ia32_apic_base_reads_and_writes_the_controller_that_owns_it() {
+        let pc = pc_msr();
+        let intc = Arc::new(Controller {
+            base: AtomicU64::new(0xfee0_0000 | apic_base::ENABLE | apic_base::BSP),
+        });
+        let peer: Arc<dyn LocalController> = intc.clone();
+        pc.cpu
+            .attach_local_controller("intr", Arc::downgrade(&peer));
+        pc.start_protected();
+
+        // mov ecx, 0x1b ; rdmsr
+        pc.write(at::CODE0, &[0xb9, 0x1b, 0, 0, 0, 0x0f, 0x32]);
+        pc.cpu.step();
+        pc.cpu.step();
+        assert_eq!(pc.regs().rax & 0xffff_ffff, 0xfee0_0900);
+        assert_eq!(pc.regs().rdx & 0xffff_ffff, 0);
+
+        // Clearing the enable bit reaches the controller.
+        // mov ecx, 0x1b ; mov eax, 0xfee00000 ; xor edx, edx ; wrmsr
+        pc.write(
+            at::CODE0,
+            &[
+                0xb9, 0x1b, 0, 0, 0, 0xb8, 0x00, 0x00, 0xe0, 0xfe, 0x31, 0xd2, 0x0f, 0x30,
+            ],
+        );
+        set_rip(&pc, at::CODE0);
+        for _ in 0..4 {
+            pc.cpu.step();
+        }
+        assert_eq!(
+            intc.base.load(Ordering::Acquire),
+            0xfee0_0000 | apic_base::BSP,
+            "the enable bit is gone and the bootstrap flag, which is read-only, \
+             is not"
+        );
+    }
+
+    #[test]
+    fn a_reserved_bit_in_ia32_apic_base_faults() {
+        let pc = pc_msr();
+        let intc = Arc::new(Controller {
+            base: AtomicU64::new(0xfee0_0000 | apic_base::ENABLE),
+        });
+        let peer: Arc<dyn LocalController> = intc.clone();
+        pc.cpu
+            .attach_local_controller("intr", Arc::downgrade(&peer));
+        pc.start_protected();
+        pc.idt(13, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        // mov ecx, 0x1b ; mov eax, 0xfee00401 ; xor edx, edx ; wrmsr — bit 0 is
+        // reserved and bit 10 is x2APIC, which this does not implement.
+        pc.write(
+            at::CODE0,
+            &[
+                0xb9, 0x1b, 0, 0, 0, 0xb8, 0x01, 0x04, 0xe0, 0xfe, 0x31, 0xd2, 0x0f, 0x30,
+            ],
+        );
+        for _ in 0..4 {
+            pc.cpu.step();
+        }
+        assert_eq!(pc.cpu.regs().rip, HANDLER);
+        assert_eq!(
+            intc.base.load(Ordering::Acquire) & 1,
+            0,
+            "and nothing was written"
+        );
+    }
+
+    #[test]
+    fn cpuid_reports_an_apic_only_when_one_is_wired() {
+        let pc = pc_msr();
+        pc.start_protected();
+        // mov eax, 1 ; cpuid
+        pc.write(at::CODE0, &[0xb8, 1, 0, 0, 0, 0x0f, 0xa2]);
+        pc.cpu.step();
+        pc.cpu.step();
+        assert_eq!(pc.regs().rdx & (1 << 9), 0, "no controller, no APIC bit");
+
+        let pc = pc_msr();
+        let intc = Arc::new(Controller {
+            base: AtomicU64::new(0xfee0_0000 | apic_base::ENABLE),
+        });
+        let peer: Arc<dyn LocalController> = intc.clone();
+        pc.cpu
+            .attach_local_controller("intr", Arc::downgrade(&peer));
+        pc.start_protected();
+        pc.write(at::CODE0, &[0xb8, 1, 0, 0, 0, 0x0f, 0xa2]);
+        pc.cpu.step();
+        pc.cpu.step();
+        assert_ne!(pc.regs().rdx & (1 << 9), 0, "and one wired says so");
+    }
+}

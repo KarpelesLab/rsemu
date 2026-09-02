@@ -601,6 +601,94 @@ impl IntAckHandlers {
     }
 }
 
+/// A processor's own interrupt controller, from the processor's side.
+///
+/// [`IntAck`] covers the controller that hangs *off* a pin. This covers the one
+/// that is part of the processor: an x86 local APIC, an ARM GIC CPU interface,
+/// a RISC-V CLIC. Two things a core cannot model without such a link, and
+/// neither of them is a level a wire could carry:
+///
+/// * **Where a processor is started.** An x86 application processor is held in
+///   a wait-for-SIPI state and begins executing at a page a Start-Up *message*
+///   names (*MultiProcessor Specification* v1.4 §B.4, Intel SDM Vol 3A §8.4.3).
+///   `RESET` restarts it at the reset vector, which is a different thing, so
+///   the startup page has to arrive by a route that can carry eight bits.
+/// * **The register that enables the controller.** `IA32_APIC_BASE` is a
+///   *processor* register — `RDMSR`/`WRMSR` reach it — naming state that lives
+///   in the *controller* (SDM Vol 3A §10.4.3). Clearing its enable bit makes
+///   the controller transparent, and only the controller can do that to itself.
+///
+/// Wired exactly as [`IntAck`] is, and for the same reasons: the controller
+/// offers one on the pin it drives with
+/// [`Device::local_controller`](crate::core::device::Device::local_controller),
+/// the realizer hands it to every sink on that net with
+/// [`Device::attach_local_controller`](crate::core::device::Device::attach_local_controller),
+/// and the processor keeps a [`Weak`] reference, because the machine owns
+/// devices and a wire merely refers to them (§4.3's weak edge).
+pub trait LocalController: Send + Sync + fmt::Debug {
+    /// What the controller has for its processor at an instruction boundary.
+    ///
+    /// **Consuming**: a [`Startup::page`] reported once is not reported again,
+    /// which is what makes a Start-Up a one-shot event rather than a level.
+    ///
+    /// Called from the processor's execution path once per instruction with no
+    /// lock held on its side, so an implementation is free to take its own.
+    fn take_startup(&self) -> Startup;
+
+    /// The controller's own base and enable register, as the processor reads
+    /// it — `IA32_APIC_BASE` on an x86.
+    ///
+    /// Defaulted to zero for a controller with no such register. A processor
+    /// should treat that as "there is no register here" rather than reading a
+    /// plausible zero back to a guest.
+    fn base_register(&self) -> u64 {
+        0
+    }
+
+    /// Write it.
+    ///
+    /// The processor has already rejected the values *it* knows are invalid —
+    /// reserved bits above its own physical address width, and any read-only
+    /// field — so what arrives here is a value the controller is expected to
+    /// take.
+    fn set_base_register(&self, _value: u64) {}
+}
+
+/// What a [`LocalController`] hands its processor at an instruction boundary.
+///
+/// Three separate facts rather than one enumeration, because a single ask can
+/// legitimately report all three: an INIT accepted, the line already dropped
+/// again, and a Start-Up latched behind it. That is precisely the sequence the
+/// *MultiProcessor Specification* v1.4 §B.4 prescribes, and a processor that
+/// was not running while it happened sees the whole of it in one ask.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Startup {
+    /// An INIT has been accepted since the last ask: the processor performs its
+    /// INIT reset and enters the wait-for-SIPI state.
+    pub init: bool,
+    /// The INIT line is *still* asserted, so the processor stays in reset
+    /// rather than executing (SDM Vol 3A §10.6.1's level-triggered pair).
+    pub held: bool,
+    /// The page a Start-Up named. The processor leaves wait-for-SIPI and begins
+    /// executing at `CS:IP = page << 8 : 0`.
+    pub page: Option<u8>,
+}
+
+impl Startup {
+    /// Nothing to report.
+    pub const NONE: Startup = Startup {
+        init: false,
+        held: false,
+        page: None,
+    };
+
+    /// Whether this reports anything at all.
+    #[must_use]
+    pub const fn is_none(self) -> bool {
+        !self.init && !self.held && self.page.is_none()
+    }
+}
+
 /// The data half of a DMA request line.
 ///
 /// `DRQ` is a wire and carries a level, but the transfer that level asks for
