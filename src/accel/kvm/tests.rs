@@ -14,7 +14,7 @@
 //! deterministic threading mode.
 
 use super::*;
-use crate::accel::mem::HostPages;
+use crate::core::space::RamStore;
 use crate::core::space::{AccessConstraints, AddressSpace, MemOps, MemResult, Region, RegionRef};
 use crate::core::sync::Mutex as SyncMutex;
 use alloc::vec;
@@ -72,7 +72,7 @@ impl Recorder {
 struct Guest {
     _kvm: Kvm,
     vm: Vm,
-    ram: Arc<HostPages>,
+    ram: Arc<RamStore>,
     mem: Arc<AddressSpace>,
     io: Arc<AddressSpace>,
     /// The next vCPU id to hand out. KVM refuses to create the same id twice
@@ -91,11 +91,13 @@ const MMIO_BASE: u64 = 0x8000;
 impl Guest {
     fn new(kvm: Kvm) -> Guest {
         let vm = kvm.create_vm().expect("KVM_CREATE_VM");
-        let ram = Arc::new(HostPages::new(2 * PAGE_SIZE).expect("guest RAM"));
+        let ram = Arc::new(RamStore::new(2 * PAGE_SIZE));
         vm.set_memory_region(0, 0, &ram).expect("memory slot 0");
 
         let mem = Arc::new(AddressSpace::new("mem", 20));
-        mem.topology().map(ram.region(), 0).expect("map RAM");
+        mem.topology()
+            .map(Arc::new(Region::ram("ram", Arc::clone(&ram))), 0)
+            .expect("map RAM");
 
         let io = Arc::new(AddressSpace::new("io", 16));
         Guest {
@@ -201,7 +203,7 @@ fn the_ioc_encoding_places_each_field_where_the_kernel_looks_for_it() {
 fn an_unaligned_memory_region_is_refused_before_the_ioctl() {
     let Some(kvm) = kvm() else { return };
     let vm = kvm.create_vm().expect("KVM_CREATE_VM");
-    let ram = Arc::new(HostPages::new(PAGE_SIZE).expect("guest RAM"));
+    let ram = Arc::new(RamStore::new(PAGE_SIZE));
     let err = vm.set_memory_region(0, 0x800, &ram).unwrap_err();
     assert!(matches!(err, AccelError::Unsupported(_)), "{err}");
     assert!(vm.memory_regions().is_empty());
@@ -223,12 +225,12 @@ fn dev_kvm_reports_the_api_version_this_code_was_written_against() {
 fn a_memory_region_is_installed_where_it_was_asked_for() {
     let Some(kvm) = kvm() else { return };
     let vm = kvm.create_vm().expect("KVM_CREATE_VM");
-    let ram = Arc::new(HostPages::new(2 * PAGE_SIZE).expect("guest RAM"));
+    let ram = Arc::new(RamStore::new(2 * PAGE_SIZE));
     vm.set_memory_region(0, 0, &ram).expect("slot 0");
     assert_eq!(vm.memory_regions(), vec![(0, 0, 2 * PAGE_SIZE)]);
 
     // Replacing a slot replaces the record rather than appending to it.
-    let more = Arc::new(HostPages::new(PAGE_SIZE).expect("guest RAM"));
+    let more = Arc::new(RamStore::new(PAGE_SIZE));
     vm.set_memory_region(0, 0x10_0000, &more).expect("slot 0");
     assert_eq!(vm.memory_regions(), vec![(0, 0x10_0000, PAGE_SIZE)]);
 }
@@ -610,6 +612,150 @@ fn the_interpreters_state_loads_into_a_vcpu_and_runs() {
     let run = vcpu.run_until_exit(64).expect("the guest runs");
     assert_eq!(run.exit.expect("halted").reason, ExitReason::HALT);
     assert_eq!(uart.writes.lock().clone(), vec![(0, 0x42)]);
+}
+
+/// The state phase 7 named as missing, carried through real hardware.
+///
+/// `KVM_SET_MSRS`, `KVM_SET_DEBUGREGS` and `KVM_SET_FPU` on the way in;
+/// `KVM_GET_*` on the way out; and a *second* interpreter at the far end, so
+/// that what is compared is what the accelerator kept rather than what this
+/// test remembered.
+#[cfg(feature = "cpu-x86")]
+#[test]
+fn the_syscall_msrs_the_debug_registers_and_the_fpu_survive_hardware() {
+    use crate::accel::state;
+    use crate::cpu::x86::fpu::{Sse, X87};
+    use crate::cpu::x86::{Config, X86};
+
+    let Some(kvm) = kvm() else { return };
+    let guest = Guest::new(kvm);
+    let vcpu = guest.vcpu_at(&[0xf4]); // hlt
+
+    let cpu = X86::new(Config::I80486);
+    cpu.attach_space(Arc::clone(&guest.mem));
+    cpu.attach_io_space(Arc::clone(&guest.io));
+    cpu.step();
+    // Start from the vCPU's own state so that `CR0`'s fixed bits are the
+    // host's, then change only the things this test is about.
+    state::store_from_vcpu(&vcpu, &cpu).expect("KVM to the interpreter");
+
+    let mut sys = cpu.sys();
+    sys.star = 0x0023_0010_0000_0000;
+    sys.lstar = 0xffff_8000_0010_0000;
+    sys.cstar = 0xffff_8000_0010_1000;
+    sys.sfmask = 0x0004_7700;
+    sys.kernel_gs_base = 0xffff_8880_0000_0000;
+    sys.dr[0] = 0x0040_1000;
+    sys.dr[7] = 0x0000_0405;
+    cpu.set_sys(sys);
+
+    let mut x87 = X87::new();
+    x87.control = 0x027f;
+    x87.regs[0] = crate::float::x87::F80::new(0x4000, 1 << 63);
+    x87.tag = 0xfffc; // register 0 valid, the rest empty
+    cpu.set_x87(x87);
+    let mut sse = Sse::new();
+    sse.xmm[3] = [0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210];
+    cpu.set_sse(sse);
+
+    state::load_into_vcpu(&cpu, &vcpu).expect("the interpreter to KVM");
+    {
+        let a = vcpu.fpu().unwrap();
+        let b = state::fpu_to_kvm(&cpu.x87(), &cpu.sse());
+        if a != b {
+            std::eprintln!("HW  {a:#x?}");
+            std::eprintln!("OUR {b:#x?}");
+        }
+    }
+    assert_eq!(
+        state::differs(&vcpu, &cpu).expect("compare"),
+        None,
+        "the two engines disagree right after a load"
+    );
+
+    // A fresh interpreter, so nothing survives except through the hypervisor.
+    let far = X86::new(Config::I80486);
+    far.attach_space(Arc::clone(&guest.mem));
+    far.attach_io_space(Arc::clone(&guest.io));
+    far.step();
+    state::store_from_vcpu(&vcpu, &far).expect("hardware to the far end");
+
+    let got = far.sys();
+    assert_eq!(got.lstar, 0xffff_8000_0010_0000, "LSTAR crossed");
+    assert_eq!(got.star, 0x0023_0010_0000_0000);
+    assert_eq!(got.cstar, 0xffff_8000_0010_1000);
+    assert_eq!(got.sfmask, 0x0004_7700);
+    assert_eq!(got.kernel_gs_base, 0xffff_8880_0000_0000);
+    assert_eq!(got.dr[0], 0x0040_1000);
+    assert_eq!(got.dr[7], 0x0000_0405);
+    assert_eq!(far.x87().control, 0x027f);
+    assert_eq!(far.x87().regs[0], x87.regs[0]);
+    assert_eq!(far.x87().tag, 0xfffc);
+    assert_eq!(far.sse().xmm[3], sse.xmm[3]);
+
+    // **`MXCSR` is the one field that does not go *in*.** `KVM_GET_FPU`
+    // reports it and `KVM_SET_FPU` does not write it, so what comes back is
+    // whatever the vCPU already had rather than what was loaded. Asserted
+    // rather than glossed, because a future kernel that fixes it should make
+    // this test say so instead of silently starting to pass a claim the
+    // module documentation no longer makes.
+    assert_ne!(
+        far.sse().mxcsr,
+        sse.mxcsr,
+        "if this now agrees, KVM_SET_FPU has grown an MXCSR write and \
+         `accel::state`'s documented gap has closed"
+    );
+}
+
+/// The counter is *carried* even though neither engine can hand it to the
+/// other, and the type says which of those two things is true.
+#[cfg(feature = "cpu-x86")]
+#[test]
+fn the_time_stamp_counter_is_carried_and_admits_it_cannot_be_applied() {
+    use crate::accel::state::ArchState;
+    use crate::cpu::x86::{Config, X86};
+
+    let Some(kvm) = kvm() else { return };
+    let guest = Guest::new(kvm);
+    let vcpu = guest.vcpu_at(&[0xf4]);
+
+    let from_hardware = ArchState::from_vcpu(&vcpu).expect("read the vCPU");
+    assert!(
+        from_hardware.tsc.is_some(),
+        "the accelerator knows what RDTSC would read"
+    );
+    assert!(
+        guest.vm.tsc_khz().is_ok(),
+        "and at what rate it advances, which is the other half"
+    );
+
+    let cpu = X86::new(Config::I80486);
+    assert!(
+        ArchState::from_interpreter(&cpu).tsc.is_none(),
+        "the interpreter's counter is a retired-cycle count, not a TSC, and \
+         saying otherwise would be the quiet lie this module exists to avoid"
+    );
+}
+
+/// A ROM is a **read-only** slot, so hardware fetches from it and a write to
+/// it leaves as MMIO.
+#[test]
+fn firmware_is_a_read_only_slot_and_a_write_to_it_still_reaches_the_model() {
+    let Some(kvm) = kvm() else { return };
+    let vm = kvm.create_vm().expect("KVM_CREATE_VM");
+    if !vm.has_readonly_mem() {
+        return;
+    }
+    let rom = Arc::new(crate::core::space::RomStore::new(vec![
+        0xf4u8;
+        PAGE_SIZE as usize
+    ]));
+    vm.set_rom_region(0, 0xf000_0000, &rom).expect("a ROM slot");
+    let installed = vm.memory_regions();
+    assert_eq!(installed, vec![(0, 0xf000_0000, PAGE_SIZE)]);
+    // The address the kernel was given is the store's own allocation, which
+    // before this round could not be page aligned at all.
+    assert_eq!(rom.host_addr() % PAGE_SIZE, 0);
 }
 
 // ---------------------------------------------------------------------------

@@ -32,17 +32,42 @@
 //!   register file reached through its own concrete type. So "the same seam the
 //!   interpreter uses" is two traits and a convention, not one trait.
 //! * **`engine = "kvm"` is not a machine-file property yet.** Every core in the
-//!   crate accepts `engine` and rejects anything but `"interp"`. Wiring this
+//!   crate accepts `engine` and rejects anything but `"interp"`, in
+//!   `cpu::x86`'s property reader *and* in its validator schema. Wiring this
 //!   backend in as a device class means editing `src/cpu/x86/`, which this
-//!   round deliberately does not touch.
+//!   round deliberately does not touch. The supported way in without editing
+//!   it is
+//!   [`Bindings::replace`](crate::machine::Bindings::replace), which lets a
+//!   host construct something else for the `cpu.x86` class — that is where an
+//!   accelerated CPU *device* will go.
 //! * **[`ThreadingMode::Accel`](crate::core::sched::ThreadingMode::Accel) is
 //!   unimplemented in the scheduler**, which refuses it with
 //!   `SchedError::ModeUnimplemented`. That refusal is load-bearing and is left
 //!   standing.
+//! * **No interrupt reaches an accelerated guest on a board.** The vector
+//!   comes from the board's 8259A or local APIC on an *acknowledge cycle*
+//!   ([`IntAck`](crate::core::wire::IntAck)), and only a CPU device is on the
+//!   receiving end of that wire. [`kvm::Vcpu::inject`] and
+//!   [`kvm::Vcpu::request_interrupt_window`] are the hypervisor half and are
+//!   here; the board half needs the CPU device above.
 //!
-//! So this module is the backend and its two adapters, complete and tested on
-//! its own; the machine-layer wiring is a separate, larger change to files
-//! other work is in the middle of.
+//! # A board, not a harness
+//!
+//! [`board`] closes the gap phase 7 named: it takes an
+//! [`AddressSpace`](crate::core::space::AddressSpace) — a real one, from a real
+//! `.machine` file — and installs everything in its flat view that can be a
+//! memory slot, RAM read/write and ROM read-only. That became possible when
+//! [`RamStore`](crate::core::space::RamStore) and
+//! [`RomStore`](crate::core::space::RomStore) gained host-page-aligned
+//! allocations, which is the one `src/core/` change this phase needed: before
+//! it, a board's declared `ram` had allocation alignment **1** and
+//! `KVM_SET_USER_MEMORY_REGION` rejected it outright.
+//!
+//! There is consequently **no accel-private RAM type any more**. An earlier
+//! round had one, `accel::mem::HostPages`, an anonymous `mmap` with the same
+//! byte-offset API; it existed only because `RamStore` could not be a slot,
+//! and keeping it would have meant two kinds of guest memory and boards that
+//! were accelerable and boards that were not.
 //!
 //! # Determinism
 //!
@@ -60,10 +85,17 @@
 //! | Site | Where | What |
 //! | --- | --- | --- |
 //! | the raw-syscall accel backends | [`sys`] | one `asm!` block, plus the wrappers that establish what each kernel entry point needs |
-//! | the RAM host-pointer fast path | [`sys::Mapping::cells`] | one `from_raw_parts`, shared by guest RAM and the `kvm_run` page |
+//! | the RAM host-pointer fast path | [`sys::Mapping::cells`] | one `from_raw_parts`, for the `kvm_run` page |
 //!
 //! No seventh site is created and neither existing one is widened. Every block
 //! carries a `// SAFETY:` comment naming its invariant and who upholds it.
+//!
+//! Worth noting what page-aligning `RamStore` did *not* cost: nothing.
+//! `core::space` reports a host address as a `u64` obtained from
+//! `Vec::as_ptr`, which is safe, and the only code that dereferences it is a
+//! kernel that was handed it — so the store that a guest's hardware writes
+//! directly still contains **no `unsafe` at all**, and this subsystem's count
+//! of files that opt back in is unchanged.
 //!
 //! # Portability
 //!
@@ -77,8 +109,8 @@
 
 use core::fmt;
 
+pub mod board;
 pub mod kvm;
-pub mod mem;
 pub mod sys;
 
 #[cfg(feature = "cpu-x86")]
