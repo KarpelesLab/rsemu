@@ -758,6 +758,30 @@ fn firmware_is_a_read_only_slot_and_a_write_to_it_still_reaches_the_model() {
     assert_eq!(rom.host_addr() % PAGE_SIZE, 0);
 }
 
+/// An empty store is refused rather than turned into a slot deletion.
+///
+/// `memory_size = 0` is how the ABI spells *delete this slot*, and zero is a
+/// multiple of the page size, so the alignment check alone would have let an
+/// empty region through and quietly removed whatever was at that index.
+#[test]
+fn an_empty_backing_store_does_not_delete_a_slot_by_accident() {
+    let Some(kvm) = kvm() else { return };
+    let vm = kvm.create_vm().expect("KVM_CREATE_VM");
+    let ram = Arc::new(RamStore::new(PAGE_SIZE));
+    vm.set_memory_region(0, 0, &ram).expect("a real slot");
+
+    let empty = Arc::new(RamStore::new(0));
+    assert!(matches!(
+        vm.set_memory_region(0, 0, &empty),
+        Err(AccelError::Unsupported(_))
+    ));
+    assert_eq!(
+        vm.memory_regions(),
+        vec![(0, 0, PAGE_SIZE)],
+        "and the slot that was there is still there"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // the honest summary
 // ---------------------------------------------------------------------------

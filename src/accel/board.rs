@@ -240,7 +240,6 @@ pub fn install_space(vm: &Vm, space: &AddressSpace, first_slot: u32) -> AccelRes
 /// [`AccelError::Unsupported`](super::AccelError::Unsupported) if the machine
 /// has no space of that name, and whatever [`install_space`] returns
 /// otherwise.
-#[cfg(feature = "std")]
 pub fn install_machine(
     vm: &Vm,
     machine: &crate::machine::Machine,

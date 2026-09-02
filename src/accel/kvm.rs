@@ -925,9 +925,6 @@ impl Vm {
                 "this kernel has no KVM_CAP_READONLY_MEM, so a ROM cannot be a memory slot",
             ));
         }
-        if store.is_empty() {
-            return Err(AccelError::Unsupported("an empty ROM cannot be a slot"));
-        }
         self.set_region(index, guest_phys_addr, Backing::rom(store))
     }
 
@@ -946,6 +943,15 @@ impl Vm {
         if !backing.is_writable() && !self.readonly_mem {
             return Err(AccelError::Unsupported(
                 "this kernel has no KVM_CAP_READONLY_MEM, so a ROM cannot be a memory slot",
+            ));
+        }
+        // Zero is a multiple of the page size, so the size check below would
+        // let an empty store through — and a zero `memory_size` is how the ABI
+        // spells *delete this slot*. Installing nothing must not quietly
+        // remove something.
+        if backing.is_empty() {
+            return Err(AccelError::Unsupported(
+                "an empty backing store: a zero-length region is the ABI's way of deleting a slot",
             ));
         }
         if !guest_phys_addr.is_multiple_of(PAGE_SIZE) || !backing.len().is_multiple_of(PAGE_SIZE) {
