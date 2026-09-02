@@ -471,12 +471,15 @@ fn a_compare_against_memory_still_makes_its_bus_cycle() {
 }
 
 #[test]
-fn a_pop_into_a_stack_relative_address_uses_the_stack_pointer_it_started_with() {
+fn a_pop_into_a_stack_relative_address_uses_the_stack_pointer_it_ends_with() {
     // The one instruction in the subset that rebinds a register and *then*
-    // reaches memory. `Exec::prepare_ea` computes the effective address before
-    // execution, so `pop [esp+4]` stores through the `ESP` the instruction
-    // began with; an address computed lazily at the store would use the one the
-    // pop had just moved, and land four bytes away.
+    // reaches memory, and the one place the architecture asks for the address
+    // to be computed late. *Intel SDM* volume 2, `POP`: "If the ESP register is
+    // used as a base register for addressing a destination operand in memory,
+    // the POP instruction computes the effective address of the operand after
+    // it increments the ESP register." So `pop [esp+4]` stores four bytes above
+    // where the address taken at the start of the instruction points, and both
+    // engines have to agree about which.
     //
     // Written by hand rather than generated, because the corpus keeps `ESP`
     // out of its operands on purpose: a random stack pointer makes every push

@@ -1808,12 +1808,13 @@ impl<'a> Lifter<'a> {
 
         // The effective address is computed **before** execution, from the
         // register file as it stands at the start of the instruction — which is
-        // where `Exec::prepare_ea` sits, and it is not a detail: `pop [esp+4]`
-        // moves the stack pointer and then stores, and an address computed
-        // lazily at the store would use the *new* `ESP`. Nothing else in the
-        // subset rebinds a register before it reaches memory, which is exactly
-        // the kind of "nothing else" that stops being true one instruction
-        // later.
+        // where `Exec::prepare_ea` sits, and it is not a detail: `push [esp]`
+        // reads its operand and then moves the pointer, so the address is the
+        // one the instruction began with. `POP` is the exception the
+        // architecture makes and `Plan::Pop` handles it by dropping this
+        // cache; nothing else in the subset rebinds a register before it
+        // reaches memory, which is exactly the kind of "nothing else" that
+        // stops being true one instruction later.
         if Self::touches_memory(f) {
             let _ = self.ea(f);
         }
@@ -2161,6 +2162,17 @@ impl<'a> Lifter<'a> {
             }
             Plan::Pop => {
                 let v = self.pop(f.opsize);
+                // The one place the pre-computed address has to be thrown
+                // away. *Intel SDM* volume 2, `POP`: a destination addressed
+                // through the stack pointer is computed **after** the
+                // increment, so `pop [esp+4]` stores four bytes above where
+                // the address taken at the start of the instruction points.
+                // Dropping the cache here makes `write_arg` recompute from the
+                // stack pointer `pop` has just moved, which is what
+                // `Exec::POP` does on the other side of the differential.
+                if Self::is_memory(f, insn.dst) {
+                    self.ea = None;
+                }
                 if !self.write_arg(f, insn.dst, f.opsize, v) {
                     return Flow::Rejected;
                 }
