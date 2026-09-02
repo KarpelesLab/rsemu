@@ -100,16 +100,20 @@ RUN OPTIONS:
                         machine that opens exactly one is picked up on its own,
                         so `rsemu run apple1` is interactive already
     --headless          Do not attach a terminal, whatever the machine opened
-    --screenshot <file> Write the machine's display to a PNG when the run ends.
-                        Needs a build with `display-png` and a machine with a
-                        display; a machine with neither says so rather than
-                        writing nothing
+    --screenshot <file> Write the machine's display to a PNG when the run ends,
+                        however the run was driven -- headless, with a console
+                        attached, under a debugger, or serving VNC. Needs a
+                        build with `display-png` and a machine with a display;
+                        a machine with neither is refused before it starts,
+                        rather than running and writing nothing
     --record-audio <f>  Write the machine's sound to a RIFF/WAVE file when the
-                        run ends. Needs a machine with an audio device: a NES,
-                        a Game Boy or a Master System. The device is drained as
-                        the run goes, so a recording is as long as the run and
-                        there is no cap; if a ring ever did overflow the file
-                        says how much it lost rather than shortening quietly
+                        run ends, again however it was driven. Needs a machine
+                        with an audio device: a NES, a Game Boy or a Master
+                        System, and a machine with none is refused before it
+                        starts. The device is drained as the run goes, so a
+                        recording is as long as the run and there is no cap; if
+                        a ring ever did overflow the file says how much it lost
+                        rather than shortening quietly
     --audio-rate <hz>   Sample rate for --record-audio (default 44100)
 
     --gdb <addr>        Listen for GDB on <addr> and hold the machine stopped
@@ -480,6 +484,29 @@ fn run(args: &[String]) -> ExitCode {
         describe_machine(&machine);
     }
 
+    // What the run owes the user, resolved *before* it starts and taken exactly
+    // once. Every part of that is forced:
+    //
+    // * the display and the sound chip are handed over by
+    //   [`Captured::take`](rsemu::core::hosts::Captured::take), which empties
+    //   the table — so a screenshot and a VNC session cannot each go and fetch
+    //   their own, and whoever asks second gets "this machine has no display";
+    // * a console sound chip's output ring holds a fraction of a second, so a
+    //   recording is drained as the run goes rather than lifted out at the end
+    //   (`open_recording`), and every loop below therefore needs the stream in
+    //   its hand before it starts;
+    // * and a flag that *cannot* be honoured says so now rather than after a
+    //   person has watched an emulator run for an hour.
+    // `mut` for the VNC branch, which takes the box rather than borrowing it;
+    // a build without that feature never moves out of it.
+    #[allow(unused_mut)]
+    let mut scanout = take_scanout(&options.realize.hosts, &machine);
+    let mut audio = open_recording(&parsed, &options.realize.hosts, &machine);
+    if let Err(e) = check_outputs(&parsed, scanout.is_some(), audio.is_some()) {
+        eprintln!("rsemu: {e}");
+        return finish(&machine, ExitCode::from(2));
+    }
+
     // A debugger, if one was asked for, owns when the machine advances — so it
     // is checked before the console loop, which would otherwise own that.
     #[cfg(feature = "gdb")]
@@ -491,15 +518,29 @@ fn run(args: &[String]) -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        let status = debug_session(&mut machine, &addr, port.as_ref(), &parsed);
-        return finish(&machine, status);
+        let status = debug_session(&mut machine, &addr, port.as_ref(), &parsed, audio.as_mut());
+        return deliver(
+            &machine,
+            &parsed,
+            scanout.as_deref(),
+            audio.as_ref(),
+            status,
+        );
     }
 
     // A remote frontend owns when the machine advances, for the same reason a
-    // debugger does — so it is checked before the console loop.
+    // debugger does — so it is checked before the console loop. It is the one
+    // branch that delivers its own outputs, because the session owns the screen
+    // and the sound it was handed for as long as it runs.
     #[cfg(feature = "vnc")]
     if parsed.vnc.is_some() {
-        let status = vnc_session(&mut machine, &parsed, &options.realize.hosts);
+        let status = vnc_session(
+            &mut machine,
+            &parsed,
+            &options.realize.hosts,
+            scanout.take(),
+            audio.take(),
+        );
         return finish(&machine, status);
     }
 
@@ -511,32 +552,104 @@ fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
         Ok(Some(port)) => {
-            let status = interact(&mut machine, &port, &parsed);
-            return finish(&machine, status);
+            let status = interact(&mut machine, &port, &parsed, audio.as_mut());
+            return deliver(
+                &machine,
+                &parsed,
+                scanout.as_deref(),
+                audio.as_ref(),
+                status,
+            );
         }
         Ok(None) => {}
     }
 
-    // The sound path opens before the run, not after it: a console's output ring
-    // holds a fraction of a second, so a recording has to be taken as the run
-    // goes rather than lifted out at the end. `open_recording` says why.
-    let mut audio = open_recording(&parsed, &options.realize.hosts, &machine);
     if let Err(e) = run_headless(&mut machine, parsed.span, audio.as_mut()) {
         eprintln!("rsemu: {e}");
         summarise(&machine);
-        write_screenshot(&parsed, &options.realize.hosts, &machine);
-        write_recording(&parsed, audio.as_ref());
-        return finish(&machine, ExitCode::FAILURE);
+        return deliver(
+            &machine,
+            &parsed,
+            scanout.as_deref(),
+            audio.as_ref(),
+            ExitCode::FAILURE,
+        );
     }
     summarise(&machine);
-    // Both, always: a `--screenshot` that failed must not be the reason a
-    // recording is silently skipped.
-    let drew = write_screenshot(&parsed, &options.realize.hosts, &machine);
-    let played = write_recording(&parsed, audio.as_ref());
-    if !drew || !played {
-        return finish(&machine, ExitCode::FAILURE);
+    deliver(
+        &machine,
+        &parsed,
+        scanout.as_deref(),
+        audio.as_ref(),
+        ExitCode::SUCCESS,
+    )
+}
+
+/// Hand over what the run produced, whichever loop drove it.
+///
+/// **Both files, always**: a `--screenshot` that failed must not be the reason
+/// a recording is silently skipped, and neither failure may skip the drive
+/// flush [`finish`] performs.
+fn deliver(
+    machine: &Machine,
+    args: &RunArgs,
+    scanout: Option<&dyn rsemu::host::display::Scanout>,
+    audio: Option<&rsemu::host::audio::AudioStream>,
+    status: ExitCode,
+) -> ExitCode {
+    let drew = write_screenshot(args, scanout);
+    let played = write_recording(args, audio);
+    let status = if drew && played {
+        status
+    } else {
+        ExitCode::FAILURE
+    };
+    finish(machine, status)
+}
+
+/// Whether the flags that produce a file can produce one at all.
+///
+/// Checked once the machine exists and before it runs: both answers depend on
+/// what the description built, and neither improves by waiting.
+///
+/// **A flag that cannot be honoured is refused, not ignored.** `--screenshot`
+/// and `--record-audio` used to reach the end of a *headless* run and fail
+/// there, and to be dropped on the floor by every other loop — so
+/// `rsemu run pc-at --screenshot x.png` exited zero having written nothing, and
+/// adding `--headless` to the same command line wrote a PNG. Whether a terminal
+/// happened to be attached is not a thing a person asking for a picture is
+/// thinking about, and exiting zero having done none of what was asked is the
+/// one behaviour with nothing to be said for it.
+///
+/// The cost is that a console-only machine changes answer: `rsemu run apple1
+/// --screenshot x.png` now exits 2 saying it has no display, where before it
+/// ran happily and wrote nothing. That is the same answer `--headless` has
+/// always given it (`tests/cli_screenshot.rs`), arriving before the run instead
+/// of after it.
+fn check_outputs(args: &RunArgs, display: bool, audio: bool) -> Result<(), String> {
+    let _ = display;
+    if let Some(path) = &args.screenshot {
+        #[cfg(not(feature = "display-png"))]
+        return Err(format!(
+            "--screenshot {path}: this build has no PNG encoder; rebuild with the \
+             `display-png` feature"
+        ));
+        #[cfg(feature = "display-png")]
+        if !display {
+            return Err(format!(
+                "--screenshot {path}: this machine has no display, so there is no picture to \
+                 write"
+            ));
+        }
     }
-    finish(&machine, ExitCode::SUCCESS)
+    if let Some(path) = &args.record_audio
+        && !audio
+    {
+        return Err(format!(
+            "--record-audio {path}: this machine has no audio device this build can hear"
+        ));
+    }
+    Ok(())
 }
 
 /// End a run: push what the guest wrote out to the host, and report.
@@ -738,10 +851,14 @@ fn ring_for(args: &RunArgs) -> u64 {
 /// (`host::display::lcd`). Every other adapter ignores it, which is why it is
 /// `unused_variables` on a build with none of them.
 ///
-/// Only the PNG path calls it, so a build without an encoder has no use for it
-/// — and the compiler is right to say so rather than being told to be quiet
-/// about a function that might one day be called.
-#[cfg(any(feature = "display-png", feature = "vnc"))]
+/// Called once per run, before the loops, because [`Captured::take`] empties
+/// the table: two callers each fetching their own would leave the second one
+/// believing the machine has no display. So `run` takes it and hands out a
+/// borrow — or, to the VNC session, the box itself.
+///
+/// A build with no display adapter in it compiles to `None`, which is the right
+/// answer rather than an absent function: `--screenshot` on such a build has to
+/// say something, and the something is decided by `check_outputs`.
 #[allow(unused_variables)]
 fn take_scanout(
     hosts: &HostObjects,
@@ -779,24 +896,30 @@ fn take_scanout(
 /// Returns true when nothing was asked for. A `--screenshot` that could not be
 /// honoured is an error rather than a silence: the user asked for a file and
 /// there has to be one, or a reason.
-fn write_screenshot(args: &RunArgs, hosts: &HostObjects, machine: &Machine) -> bool {
+///
+/// The screen arrives as an argument rather than being fetched from the host
+/// table, because by now somebody else may be holding it — a VNC session is,
+/// for as long as it runs. `check_outputs` has already refused the two cases
+/// this cannot serve, so the arms below are what is left: an encoder that
+/// failed, and a file that would not open.
+fn write_screenshot(args: &RunArgs, scanout: Option<&dyn rsemu::host::display::Scanout>) -> bool {
     let Some(path) = args.screenshot.as_deref() else {
         return true;
     };
     #[cfg(not(feature = "display-png"))]
     {
-        let _ = (path, hosts, machine);
+        let _ = (path, scanout);
         eprintln!("rsemu: --screenshot needs a build with the `display-png` feature");
         false
     }
     #[cfg(feature = "display-png")]
     {
         use rsemu::host::display::{Surface, png};
-        let Some(scanout) = take_scanout(hosts, machine) else {
+        let Some(scanout) = scanout else {
             eprintln!("rsemu: --screenshot: this machine has no display");
             return false;
         };
-        let mut surface = Surface::for_scanout(scanout.as_ref());
+        let mut surface = Surface::for_scanout(scanout);
         scanout.capture(&mut surface);
         let bytes = match png::encode(&surface) {
             Ok(b) => b,
@@ -880,8 +1003,13 @@ const DRAIN_SLICE: GlobalTime = GlobalTime::from_nanos(10_000_000);
 /// *driven* and not in what it does — see [`DRAIN_SLICE`].
 ///
 /// `None` when nothing was asked for, and also when this machine has no audio
-/// device: the diagnostic for the second case belongs to `write_recording`,
-/// which is where the user's request either produces a file or a reason.
+/// device — `check_outputs` turns the second of those into a refusal, before
+/// the run rather than after it.
+///
+/// Every loop gets one, not just the headless one: a console, a debugger and a
+/// VNC session all advance the machine in slices no longer than
+/// [`DRAIN_SLICE`], so all three can drain a ring that holds a quarter of a
+/// second.
 fn open_recording(
     args: &RunArgs,
     hosts: &HostObjects,
@@ -925,7 +1053,9 @@ fn run_headless(
 /// as a success.
 ///
 /// Returns true when nothing was asked for. As with `--screenshot`, a
-/// recording that could not be made is an error rather than a silence.
+/// recording that could not be made is an error rather than a silence — and as
+/// with `--screenshot`, the case that has nothing to record was refused before
+/// the run by `check_outputs`.
 fn write_recording(args: &RunArgs, stream: Option<&rsemu::host::audio::AudioStream>) -> bool {
     let Some(path) = args.record_audio.as_deref() else {
         return true;
@@ -995,6 +1125,7 @@ fn debug_session(
     addr: &str,
     port: Option<&Arc<CharPort>>,
     args: &RunArgs,
+    mut audio: Option<&mut rsemu::host::audio::AudioStream>,
 ) -> ExitCode {
     use rsemu::host::gdb::{ExitReason, GdbServer};
 
@@ -1055,6 +1186,13 @@ fn debug_session(
 
     let terminal = port.map(|_| Terminal::open());
     let status = match rsemu::host::gdb::serve(machine, &mut server, |_| {
+        // Once a turn, which under a client that has said `continue` is once
+        // per free-running slice — ten milliseconds of virtual time, the same
+        // bound `DRAIN_SLICE` is chosen for. A halted machine produces no
+        // samples, so a session spent single-stepping simply drains nothing.
+        if let Some(stream) = audio.as_mut() {
+            stream.pull();
+        }
         if let (Some(term), Some(port)) = (terminal.as_ref(), port) {
             term.pump(port);
             if term.interrupted() {
@@ -1140,7 +1278,17 @@ const IDLE_SLICES: u32 = 200;
 /// use. Nothing below `host/` reads a clock (`CLAUDE.md`); this is `host/`'s
 /// job, and it is why an Apple 1 here feels like an Apple 1 rather than
 /// finishing a screenful of output before the terminal has drawn a line.
-fn interact(machine: &mut Machine, port: &CharPort, args: &RunArgs) -> ExitCode {
+///
+/// `audio` is drained once a slice, if `--record-audio` was given. That costs
+/// nothing to arrange here because [`SLICE`] and [`DRAIN_SLICE`] are the same
+/// ten milliseconds of virtual time — this loop was already cut finely enough
+/// for the shallowest ring in the tree, it simply was not emptying it.
+fn interact(
+    machine: &mut Machine,
+    port: &CharPort,
+    args: &RunArgs,
+    mut audio: Option<&mut rsemu::host::audio::AudioStream>,
+) -> ExitCode {
     let term = Terminal::open();
     if !args.quiet {
         if term.is_raw() {
@@ -1174,6 +1322,9 @@ fn interact(machine: &mut Machine, port: &CharPort, args: &RunArgs) -> ExitCode 
             break ExitCode::FAILURE;
         }
         moved += term.pump(port);
+        if let Some(stream) = audio.as_mut() {
+            stream.pull();
+        }
 
         // A script on stdin has an end; a person does not. Once the input is
         // exhausted *and* the machine has gone quiet, there is nobody left to
@@ -1219,11 +1370,17 @@ fn interact(machine: &mut Machine, port: &CharPort, args: &RunArgs) -> ExitCode 
 /// pad port is what `nes.ports` opens; a machine with a serial console does not
 /// get scan codes typed into it, because a serial console is not a keyboard.
 #[cfg(feature = "vnc")]
-fn vnc_session(machine: &mut Machine, args: &RunArgs, hosts: &HostObjects) -> ExitCode {
+fn vnc_session(
+    machine: &mut Machine,
+    args: &RunArgs,
+    hosts: &HostObjects,
+    scanout: Option<Box<dyn rsemu::host::display::Scanout>>,
+    audio: Option<rsemu::host::audio::AudioStream>,
+) -> ExitCode {
     use rsemu::host::vnc::{VncServer, VncSession};
 
     let addr = args.vnc.as_deref().unwrap_or(":5900");
-    let Some(scanout) = take_scanout(hosts, machine) else {
+    let Some(scanout) = scanout else {
         eprintln!("rsemu: --vnc: this machine has no display to serve");
         return ExitCode::from(2);
     };
@@ -1306,19 +1463,10 @@ fn vnc_session(machine: &mut Machine, args: &RunArgs, hosts: &HostObjects) -> Ex
     // "make the ring big enough for the whole run" argument stops applying**:
     // the session drains the device every slice, so the ring holds one frame's
     // worth rather than the whole run and a recording is no longer capped at
-    // about eighteen seconds. The queue limit is lifted for the same reason
-    // `write_recording` lifts it — nothing may be trimmed on the way to a file.
-    if args.record_audio.is_some() {
-        let Some(source) = take_audio(hosts, machine) else {
-            eprintln!("rsemu: --record-audio: this machine has no audio device");
-            return ExitCode::from(2);
-        };
-        let mut stream = rsemu::host::audio::AudioStream::new(
-            source,
-            args.audio_rate,
-            rsemu::host::audio::SampleFormat::S16,
-        );
-        stream.set_limit_frames(u64::MAX);
+    // about eighteen seconds. The stream itself is opened by `open_recording`
+    // like every other loop's, so all four of them lift the queue limit, warn
+    // about dropped samples and print the same line.
+    if let Some(stream) = audio {
         session = session.with_audio(stream);
     }
 
@@ -1352,25 +1500,19 @@ fn vnc_session(machine: &mut Machine, args: &RunArgs, hosts: &HostObjects) -> Ex
             return ExitCode::FAILURE;
         }
     }
-    if let (Some(path), Some(stream)) = (&args.record_audio, session.audio()) {
-        let bytes = rsemu::host::audio::wav::encode(stream.info(), stream.buffer());
-        if let Err(e) = std::fs::write(path, &bytes) {
-            eprintln!("rsemu: --record-audio {path}: {e}");
-            return ExitCode::FAILURE;
-        }
-        if !args.quiet {
-            let frames = stream.buffer().frames();
-            println!(
-                "audio       {path} ({} Hz, {frames} frames, {} bytes)",
-                args.audio_rate,
-                bytes.len()
-            );
-        }
-    }
     if !args.quiet {
         summarise(machine);
     }
-    ExitCode::SUCCESS
+    // The same two writers every other loop ends with. The session still holds
+    // the screen it was handed, so the picture comes from there rather than
+    // from the host table, which it emptied on the way in.
+    let drew = write_screenshot(args, Some(session.scanout()));
+    let played = write_recording(args, session.audio());
+    if drew && played {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 /// A machine description by path, or by catalog name.

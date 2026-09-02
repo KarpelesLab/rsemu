@@ -174,6 +174,73 @@ fn a_console_still_gets_its_screenshot() {
     let _ = std::fs::remove_file(&cart);
 }
 
+/// A machine with a **console** gets its screenshot too.
+///
+/// This is the defect the flag was silently losing to: `rsemu run` hands a
+/// machine that opened a character port to the console loop, and that loop
+/// returned without ever reaching `--screenshot`. So
+/// `rsemu run pc-at --screenshot x.png` exited zero having written nothing,
+/// while adding `--headless` to the same command line wrote a PNG — the flag
+/// meant two different things depending on whether the board happened to have
+/// a keyboard controller on it.
+///
+/// A PC is the machine that shows it: `pc.kbc` opens the port, so this run goes
+/// through the console loop, and there is a VGA behind it to photograph.
+#[cfg(feature = "machine-pc-at")]
+#[test]
+fn a_console_does_not_swallow_the_screenshot() {
+    let png = scratch("pc-at.png");
+    let _ = std::fs::remove_file(&png);
+
+    // No `--headless`: the point is that a terminal was attached and the
+    // picture came out anyway. `--for` ends the run, because a console session
+    // otherwise waits for a person.
+    let (ok, stderr) = run(&[
+        "run",
+        "pc-at",
+        "--screenshot",
+        png.to_str().expect("a UTF-8 scratch path"),
+        "--for",
+        "500ms",
+        "-q",
+    ]);
+    assert!(ok, "rsemu run pc-at --screenshot failed: {stderr}");
+
+    let bytes = std::fs::read(&png).expect("--screenshot wrote a file");
+    // 720x400 is the 9-dot text mode a PC powers up in.
+    assert_eq!(png_geometry(&bytes), (720, 400));
+
+    let _ = std::fs::remove_file(&png);
+}
+
+/// A machine with a console and **no** display refuses the flag, before the run
+/// rather than after it.
+///
+/// The other half of the same decision, and the half that costs something: an
+/// Apple 1 has a character port and no scanout, so this command line used to
+/// run happily and exit zero. It now exits non-zero and says why — the same
+/// answer `--headless` has always given a machine with no display, arriving
+/// before the run instead of after it, because there is nothing to be gained by
+/// letting somebody watch an emulator for an hour first.
+#[cfg(feature = "machine-apple1")]
+#[test]
+fn a_console_only_machine_refuses_a_screenshot() {
+    let png = scratch("apple1.png");
+    let _ = std::fs::remove_file(&png);
+    let (ok, stderr) = run(&[
+        "run",
+        "apple1",
+        "--screenshot",
+        png.to_str().expect("a UTF-8 scratch path"),
+        "--for",
+        "50ms",
+        "-q",
+    ]);
+    assert!(!ok, "a screenshot that cannot be taken is a failing run");
+    assert!(stderr.contains("no display"), "{stderr}");
+    assert!(!png.exists(), "and nothing was written");
+}
+
 /// A machine with no display at all still says so, rather than writing an empty
 /// file or claiming success.
 #[cfg(feature = "machine-z80-mini")]

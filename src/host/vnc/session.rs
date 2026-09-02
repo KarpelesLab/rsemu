@@ -239,6 +239,18 @@ impl VncSession {
         &self.server
     }
 
+    /// The screen this session was handed.
+    ///
+    /// A machine has one display and
+    /// [`Captured::take`](crate::core::hosts::Captured::take) hands it over
+    /// once, so a session is its sole owner for as long as it lives. A caller
+    /// that also wants a still of it — `rsemu run --vnc --screenshot` — has to
+    /// ask the session rather than the host table, which by then is empty.
+    #[must_use]
+    pub fn scanout(&self) -> &dyn Scanout {
+        self.scanout.as_ref()
+    }
+
     /// Prepare a machine for a live session: a host clock, and real-time pacing.
     ///
     /// Separate from [`run`](VncSession::run) so a caller driving the loop

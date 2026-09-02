@@ -335,3 +335,35 @@ fn a_nes_recording_is_still_as_long_as_the_run() {
     let _ = std::fs::remove_file(&wav_path);
     let _ = std::fs::remove_file(&cart);
 }
+
+// ---------------------------------------------------------------------------
+// The machine that cannot be recorded
+// ---------------------------------------------------------------------------
+
+/// A machine with no sound chip refuses `--record-audio` rather than ignoring
+/// it.
+///
+/// A PC is the case that was silently wrong: it opens a character port, so
+/// `rsemu run` handed it to the console loop, and that loop reached neither the
+/// drain nor the writer — `rsemu run pc-at --record-audio x.wav` exited zero
+/// having written nothing at all. The refusal now comes from `check_outputs`,
+/// before the run, and it is the same refusal a headless machine with no sound
+/// chip gets.
+#[cfg(feature = "machine-pc-at")]
+#[test]
+fn a_machine_with_no_sound_chip_says_so() {
+    let wav_path = scratch("pc-at.wav");
+    let _ = std::fs::remove_file(&wav_path);
+    let (ok, _stdout, stderr) = run(&[
+        "run",
+        "pc-at",
+        "--record-audio",
+        wav_path.to_str().expect("a UTF-8 scratch path"),
+        "--for",
+        "50ms",
+        "-q",
+    ]);
+    assert!(!ok, "a recording that cannot be made is a failing run");
+    assert!(stderr.contains("no audio device"), "{stderr}");
+    assert!(!wav_path.exists(), "and nothing was written");
+}
