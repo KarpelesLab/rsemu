@@ -1694,3 +1694,1005 @@ fn the_access_trap_covers_fpcr_and_fpsr_as_well() {
     assert_eq!(h.cpu.sysregs().esr_el1, 0);
     assert_eq!(h.cpu.x(0), Config::cortex_a53().midr);
 }
+
+// ---------------------------------------------------------------------------
+// Advanced SIMD
+// ---------------------------------------------------------------------------
+//
+// Every encoding below was assembled by `llvm-mc -triple=aarch64` and pasted
+// in, rather than built from the masks in `isa.rs` — a word derived from the
+// table cannot disagree with the table, and would test nothing about it. The
+// *values* are ours, transcribed from DDI 0487 chapter C7, and the module
+// documentation of `conformance.rs` says what that is and is not worth.
+//
+// The cases here are the ones a plausible implementation gets wrong: a carry
+// crossing a lane boundary, a compare writing `1` instead of a mask, `Q`
+// meaning three different things, `INS` merging where every other write
+// replaces, `TBL` zeroing where `TBX` keeps, and the four arrangements the
+// architecture reserves.
+
+/// `add v0.16b, v1.16b, v2.16b`.
+const ADD_16B: u32 = 0x4e22_8420;
+/// `add v0.2d, v1.2d, v2.2d`.
+const ADD_2D: u32 = 0x4ee2_8420;
+/// `add v0.4s, v1.4s, v2.4s`.
+const ADD_4S: u32 = 0x4ea2_8420;
+/// `sub v0.8h, v1.8h, v2.8h`.
+const SUB_8H: u32 = 0x6e62_8420;
+/// `mul v0.4s, v1.4s, v2.4s`.
+const MUL_4S: u32 = 0x4ea2_9c20;
+/// `cmgt v0.4s, v1.4s, v2.4s`.
+const CMGT_4S: u32 = 0x4ea2_3420;
+/// `cmhi v0.4s, v1.4s, v2.4s`.
+const CMHI_4S: u32 = 0x6ea2_3420;
+/// `bsl v0.16b, v1.16b, v2.16b`.
+const BSL: u32 = 0x6e62_1c20;
+/// `bit v0.16b, v1.16b, v2.16b`.
+const BIT: u32 = 0x6ea2_1c20;
+/// `bif v0.16b, v1.16b, v2.16b`.
+const BIF: u32 = 0x6ee2_1c20;
+/// `movi d0, #0` — the encoding LLVM uses for a floating-point zero.
+const MOVI_D0: u32 = 0x2f00_e400;
+/// `movi v0.4s, #1, lsl #24`.
+const MOVI_4S_LSL24: u32 = 0x4f00_6420;
+/// `movi v0.4s, #255, msl #8`.
+const MOVI_4S_MSL8: u32 = 0x4f07_c7e0;
+/// `mvni v0.8h, #16`.
+const MVNI_8H: u32 = 0x6f00_8600;
+/// `movi v0.2d, #0x0000_0000_0000_00ff`.
+const MOVI_2D: u32 = 0x6f00_e420;
+/// `fmov v0.2d, #1.0`.
+const FMOV_2D: u32 = 0x6f03_f600;
+/// `orr v0.4s, #16, lsl #8`.
+const ORR_IMM_4S: u32 = 0x4f00_3600;
+/// `bic v0.4s, #255`.
+const BIC_IMM_4S: u32 = 0x6f07_17e0;
+/// `dup v0.4s, v1.s[3]`.
+const DUP_ELEM: u32 = 0x4e1c_0420;
+/// `dup v0.2d, x1`.
+const DUP_GEN: u32 = 0x4e08_0c20;
+/// `ins v0.b[5], w1`.
+const INS_GEN: u32 = 0x4e0b_1c20;
+/// `ins v0.d[1], v1.d[0]`.
+const INS_ELEM: u32 = 0x6e18_0420;
+/// `umov w0, v1.s[2]`.
+const UMOV: u32 = 0x0e14_3c20;
+/// `smov x0, v1.b[7]`.
+const SMOV: u32 = 0x4e0f_2c20;
+/// `zip1 v0.4s, v1.4s, v2.4s`.
+const ZIP1: u32 = 0x4e82_3820;
+/// `zip2 v0.4s, v1.4s, v2.4s`.
+const ZIP2: u32 = 0x4e82_7820;
+/// `uzp1 v0.4s, v1.4s, v2.4s`.
+const UZP1: u32 = 0x4e82_1820;
+/// `trn1 v0.4s, v1.4s, v2.4s`.
+const TRN1: u32 = 0x4e82_2820;
+/// `ext v0.16b, v1.16b, v2.16b, #5`.
+const EXT: u32 = 0x6e02_2820;
+/// `tbl v0.16b, { v1.16b }, v2.16b`.
+const TBL: u32 = 0x4e02_0020;
+/// `tbx v0.16b, { v1.16b, v2.16b }, v3.16b`.
+const TBX: u32 = 0x4e03_3020;
+/// `addv s0, v1.4s`.
+const ADDV_4S: u32 = 0x4eb1_b820;
+/// `saddlv h0, v1.8b`.
+const SADDLV_8B: u32 = 0x0e30_3820;
+/// `xtn v0.4h, v1.4s` and `xtn2 v0.8h, v1.4s`.
+const XTN: u32 = 0x0e61_2820;
+const XTN2: u32 = 0x4e61_2820;
+/// `fcvtl v0.2d, v1.2s` and `fcvtl2 v0.2d, v1.4s`.
+const FCVTL: u32 = 0x0e61_7820;
+const FCVTL2: u32 = 0x4e61_7820;
+/// `ushll v0.8h, v1.8b, #3`.
+const USHLL: u32 = 0x2f0b_a420;
+/// `shrn v0.8b, v1.8h, #4`.
+const SHRN: u32 = 0x0f0c_8420;
+/// `sshr v0.4s, v1.4s, #32` — a shift by the whole element width.
+const SSHR_32: u32 = 0x4f20_0420;
+/// `ushr v0.16b, v1.16b, #8` — likewise, unsigned.
+const USHR_8: u32 = 0x6f08_0420;
+/// `shl v0.2d, v1.2d, #63`.
+const SHL_63: u32 = 0x4f7f_5420;
+/// `sshl v0.4s, v1.4s, v2.4s`.
+const SSHL: u32 = 0x4ea2_4420;
+/// `umull v0.8h, v1.8b, v2.8b`.
+const UMULL: u32 = 0x2e22_c020;
+/// `uaddw v0.8h, v1.8h, v2.8b`.
+const UADDW: u32 = 0x2e22_1020;
+/// `fadd v0.4s, v1.4s, v2.4s`.
+const FADD_4S: u32 = 0x4e22_d420;
+/// `fdiv v0.2d, v1.2d, v2.2d`.
+const FDIV_2D: u32 = 0x6e62_fc20;
+/// `fmla v0.2d, v1.2d, v2.2d`.
+const FMLA_2D: u32 = 0x4e62_cc20;
+/// `fcmgt v0.4s, v1.4s, v2.4s` and `fcmeq v0.4s, v1.4s, v2.4s`.
+const FCMGT_4S: u32 = 0x6ea2_e420;
+const FCMEQ_4S: u32 = 0x4e22_e420;
+/// `faddp v0.4s, v1.4s, v2.4s`.
+const FADDP_4S: u32 = 0x6e22_d420;
+/// `fneg v0.4s, v1.4s`.
+const FNEG_4S: u32 = 0x6ea0_f820;
+/// `fcvtzs v0.4s, v1.4s` and `ucvtf v0.4s, v1.4s`.
+const FCVTZS_4S: u32 = 0x4ea1_b820;
+const UCVTF_4S: u32 = 0x6e21_d820;
+/// `fcmgt v0.4s, v1.4s, #0.0`.
+const FCMGT_ZERO_4S: u32 = 0x4ea0_c820;
+/// `neg v0.2d, v1.2d` and `abs v0.4s, v1.4s`.
+const NEG_2D: u32 = 0x6ee0_b820;
+const ABS_4S: u32 = 0x4ea0_b820;
+/// `not v0.16b, v1.16b`, `rbit v0.16b, v1.16b`, `cnt v0.16b, v1.16b`.
+const NOT_16B: u32 = 0x6e20_5820;
+const RBIT_16B: u32 = 0x6e60_5820;
+const CNT_16B: u32 = 0x4e20_5820;
+/// `rev64 v0.16b, v1.16b`.
+const REV64_16B: u32 = 0x4e20_0820;
+/// `cls v0.4s, v1.4s` and `clz v0.4s, v1.4s`.
+const CLS_4S: u32 = 0x4ea0_4820;
+const CLZ_4S: u32 = 0x6ea0_4820;
+/// `fmul v0.4s, v1.4s, v2.s[3]`.
+const FMUL_ELEM: u32 = 0x4fa2_9820;
+/// `ld1 { v0.16b }, [x1]`.
+const LD1_16B: u32 = 0x4c40_7020;
+/// `ld4 { v0.4s, v1.4s, v2.4s, v3.4s }, [x1]`.
+const LD4_4S: u32 = 0x4c40_0820;
+/// `st4 { v0.4s, v1.4s, v2.4s, v3.4s }, [x1], x2`.
+const ST4_4S_POST: u32 = 0x4c82_0820;
+/// `st1 { v0.d }[1], [x1]` — the encoding LLVM uses to spill a high half.
+const ST1_D1: u32 = 0x4d00_8420;
+/// `ld1 { v0.s }[2], [x1], #4`.
+const LD1_S2_POST: u32 = 0x4ddf_8020;
+/// `ld1r { v0.4s }, [x1]`.
+const LD1R_4S: u32 = 0x4d40_c820;
+/// `ld2r { v0.8b, v1.8b }, [x1]`.
+const LD2R_8B: u32 = 0x0d60_c020;
+/// `addp d0, v1.2d`.
+const ADDP_D: u32 = 0x5ef1_b820;
+/// `mov d0, v1.d[1]`.
+const DUP_SCALAR: u32 = 0x5e18_0420;
+/// `fcmge d0, d1, d2`.
+const FCMGE_D: u32 = 0x7e62_e420;
+
+/// A harness with SIMD&FP access already enabled, which is where every test
+/// below starts: `CPACR_EL1` gates the whole register file, and proving that
+/// once is enough.
+fn simd(program: &[u32]) -> Harness {
+    let h = Harness::new(Config::neoverse_n1(), program);
+    enable_fp(&h);
+    h
+}
+
+/// Every word above must decode to the row its comment names — and, more to
+/// the point, to *a* row: the table's masks were computed by hand, and these
+/// words were not.
+#[test]
+fn the_advanced_simd_encodings_decode() {
+    let words = [
+        ADD_16B,
+        ADD_2D,
+        ADD_4S,
+        SUB_8H,
+        MUL_4S,
+        CMGT_4S,
+        CMHI_4S,
+        BSL,
+        BIT,
+        BIF,
+        MOVI_D0,
+        MOVI_4S_LSL24,
+        MOVI_4S_MSL8,
+        MVNI_8H,
+        MOVI_2D,
+        FMOV_2D,
+        ORR_IMM_4S,
+        BIC_IMM_4S,
+        DUP_ELEM,
+        DUP_GEN,
+        INS_GEN,
+        INS_ELEM,
+        UMOV,
+        SMOV,
+        ZIP1,
+        ZIP2,
+        UZP1,
+        TRN1,
+        EXT,
+        TBL,
+        TBX,
+        ADDV_4S,
+        SADDLV_8B,
+        XTN,
+        XTN2,
+        FCVTL,
+        FCVTL2,
+        USHLL,
+        SHRN,
+        SSHR_32,
+        USHR_8,
+        SHL_63,
+        SSHL,
+        UMULL,
+        UADDW,
+        FADD_4S,
+        FDIV_2D,
+        FMLA_2D,
+        FCMGT_4S,
+        FCMEQ_4S,
+        FADDP_4S,
+        FNEG_4S,
+        FCVTZS_4S,
+        UCVTF_4S,
+        FCMGT_ZERO_4S,
+        NEG_2D,
+        ABS_4S,
+        NOT_16B,
+        RBIT_16B,
+        CNT_16B,
+        REV64_16B,
+        CLS_4S,
+        CLZ_4S,
+        FMUL_ELEM,
+        LD1_16B,
+        LD4_4S,
+        ST4_4S_POST,
+        ST1_D1,
+        LD1_S2_POST,
+        LD1R_4S,
+        LD2R_8B,
+        ADDP_D,
+        DUP_SCALAR,
+        FCMGE_D,
+    ];
+    for word in words {
+        let insn = super::isa::decode(word, Features::ALL)
+            .unwrap_or_else(|| panic!("{word:08x} did not decode"));
+        assert_eq!(insn.feat, super::isa::Feat::AdvSimd, "{word:08x}");
+    }
+}
+
+/// The whole family is one feature, and a part without it must raise
+/// `UNDEFINED` — the way a guest finds out.
+#[test]
+fn advanced_simd_exists_only_on_a_part_that_has_it() {
+    let bare = Config::armv8_0();
+    assert!(!bare.features.advsimd);
+    assert!(super::isa::decode(ADD_4S, bare.features).is_none());
+    // `ID_AA64PFR0_EL1.AdvSIMD` is bits 23:20, `0b1111` not implemented.
+    assert_eq!((bare.id_aa64pfr0() >> 20) & 0xf, 0xf);
+    assert_eq!((Config::cortex_a53().id_aa64pfr0() >> 20) & 0xf, 0);
+
+    let h = Harness::new(bare, &[ADD_4S]);
+    enable_fp(&h);
+    h.steps(1);
+    assert_eq!(h.cpu.sysregs().esr_el1 >> 26, ec::UNKNOWN);
+}
+
+/// DDI 0487 D17.2.67 requires `ID_AA64PFR0_EL1.FP` and `.AdvSIMD` to hold the
+/// same value: a part has both or neither. This core reported an impossible
+/// combination for one round, deliberately, because it had scalar floating
+/// point and no vector instructions. It no longer does, and this is what
+/// keeps the two flags from drifting apart again.
+#[test]
+fn every_part_agrees_about_fp_and_advsimd() {
+    for (name, build) in Config::PARTS {
+        let cfg = build();
+        assert_eq!(
+            cfg.features.fp, cfg.features.advsimd,
+            "{name} has floating point and Advanced SIMD in disagreement"
+        );
+        let pfr0 = cfg.id_aa64pfr0();
+        assert_eq!(
+            (pfr0 >> 16) & 0xf,
+            (pfr0 >> 20) & 0xf,
+            "{name} reports FP and AdvSIMD differently"
+        );
+    }
+}
+
+/// `CPACR_EL1.FPEN` is a trap on the *register file*, so it covers the vector
+/// instructions exactly as it covers the scalar ones — with exception class
+/// 0x07 rather than `UNKNOWN`, which is how a kernel tells "this process
+/// started using the FPU" from "this process executed rubbish".
+#[test]
+fn the_access_trap_covers_advanced_simd() {
+    let h = Harness::new(Config::neoverse_n1(), &[ADD_4S]);
+    let mut regs = h.cpu.sysregs();
+    regs.vbar_el1 = 0x2000;
+    h.cpu.set_sysregs(regs);
+    h.steps(1);
+    assert_eq!(h.cpu.sysregs().esr_el1 >> 26, ec::FP_ACCESS);
+}
+
+/// A lane is an independent adder. The case that catches a 64-bit add wearing
+/// a vector costume is a carry that would cross a boundary: `0xff + 0x01` in
+/// every byte must stay `0x00` in every byte.
+#[test]
+fn a_carry_does_not_cross_a_lane_boundary() {
+    let h = simd(&[ADD_16B, ADD_4S, SUB_8H]);
+    h.cpu.set_v(1, u128::MAX);
+    h.cpu.set_v(2, 0x0101_0101_0101_0101_0101_0101_0101_0101);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0, "sixteen independent byte adders");
+
+    h.cpu.set_v(1, 0xffff_ffff_0000_0001_ffff_ffff_0000_0001);
+    h.cpu.set_v(2, 0x0000_0001_0000_0001_0000_0001_0000_0001);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0000_0000_0000_0002_0000_0000_0000_0002);
+
+    h.cpu.set_v(1, 0);
+    h.cpu.set_v(2, 0x0001_0001_0001_0001_0001_0001_0001_0001);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), u128::MAX, "0 - 1 in each halfword");
+}
+
+/// A 64-bit operation zeroes the top half of its destination; a 128-bit one
+/// does not. DDI 0487 C1.2.2, and it is guest-visible.
+#[test]
+fn a_sixty_four_bit_operation_zeroes_the_top_half() {
+    // `add v0.8b, v1.8b, v2.8b` is `ADD_16B` with `Q` clear.
+    let h = simd(&[ADD_16B & !(1 << 30), ADD_16B]);
+    h.cpu.set_v(0, u128::MAX);
+    h.cpu.set_v(1, 0x1111_1111_1111_1111_1111_1111_1111_1111);
+    h.cpu.set_v(2, 0x2222_2222_2222_2222_2222_2222_2222_2222);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x3333_3333_3333_3333);
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0x3333_3333_3333_3333_3333_3333_3333_3333,
+        "the 128-bit form fills the register"
+    );
+}
+
+/// A vector compare writes a *mask* of all ones, not a one. Software feeds it
+/// straight into `AND` and `BSL`, so a boolean here would be silently wrong
+/// everywhere but a test for `!= 0`.
+#[test]
+fn a_compare_writes_a_mask_rather_than_a_boolean() {
+    let h = simd(&[CMGT_4S, CMHI_4S]);
+    // Signed: -1 is greater than -2 and not greater than 1.
+    h.cpu.set_v(1, 0x0000_0001_ffff_ffff_ffff_ffff_0000_0002);
+    h.cpu.set_v(2, 0x0000_0002_ffff_fffe_0000_0001_0000_0001);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0000_0000_ffff_ffff_0000_0000_ffff_ffff);
+    // Unsigned: the same operands answer differently, which is the whole
+    // reason there are two instructions.
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0000_0000_ffff_ffff_ffff_ffff_ffff_ffff);
+}
+
+/// The three bitwise inserts differ only in where the mask comes from, and
+/// mixing them up gives code that works whenever the mask happens to be all
+/// ones. DDI 0487 C7: `BSL` takes it from the destination, `BIT` and `BIF`
+/// from the second source, and `BIF` inverts it.
+#[test]
+fn the_bitwise_selects_take_their_mask_from_different_places() {
+    let (a, b, d) = (0x00ff_u128, 0xff00_u128, 0x0f0f_u128);
+    for (word, want) in [
+        // BSL: pick `a` where `d` is set, `b` where it is clear.
+        (BSL, (a & d) | (b & !d)),
+        // BIT: insert `a` into `d` where `b` is set.
+        (BIT, (a & b) | (d & !b)),
+        // BIF: insert `a` into `d` where `b` is clear.
+        (BIF, (a & !b) | (d & b)),
+    ] {
+        let h = simd(&[word]);
+        h.cpu.set_v(0, d);
+        h.cpu.set_v(1, a);
+        h.cpu.set_v(2, b);
+        h.steps(1);
+        assert_eq!(h.cpu.v(0), want, "{word:08x}");
+    }
+}
+
+/// `AdvSIMDExpandImm`, against the four shapes `cmode` names: a shifted byte,
+/// a byte shifted with *ones* underneath it, the inverted form, and the
+/// bytemask that makes `MOVI Dd, #0` — the encoding this whole round exists
+/// to be able to run.
+#[test]
+fn the_modified_immediate_expands_as_the_pseudocode_says() {
+    let cases: &[(u32, u128)] = &[
+        (MOVI_D0, 0),
+        (MOVI_4S_LSL24, 0x0100_0000_0100_0000_0100_0000_0100_0000),
+        // `MSL #8`: the immediate is shifted left and *ones* shift in.
+        (MOVI_4S_MSL8, 0x0000_ffff_0000_ffff_0000_ffff_0000_ffff),
+        (MVNI_8H, 0xffef_ffef_ffef_ffef_ffef_ffef_ffef_ffef),
+        (MOVI_2D, 0x0000_0000_0000_00ff_0000_0000_0000_00ff),
+        // `FMOV Vd.2D, #1.0` expands the eight bits per precision.
+        (FMOV_2D, 0x3ff0_0000_0000_0000_3ff0_0000_0000_0000),
+    ];
+    for (word, want) in cases {
+        let h = simd(&[*word]);
+        h.cpu.set_v(0, u128::MAX);
+        h.steps(1);
+        assert_eq!(h.cpu.v(0), *want, "{word:08x}");
+    }
+
+    // The immediate forms of `ORR` and `BIC` read the destination.
+    let h = simd(&[ORR_IMM_4S, BIC_IMM_4S]);
+    h.cpu.set_v(0, 0);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0000_1000_0000_1000_0000_1000_0000_1000);
+    h.cpu.set_v(0, u128::MAX);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0xffff_ff00_ffff_ff00_ffff_ff00_ffff_ff00);
+}
+
+/// `INS` is the one vector write that merges rather than replacing, which is
+/// why it has its own encoding; `DUP` replaces; `UMOV` zero-extends and
+/// `SMOV` sign-extends the same bits.
+#[test]
+fn the_lane_moves_merge_extend_and_replicate() {
+    let h = simd(&[DUP_ELEM, DUP_GEN, INS_GEN, INS_ELEM, UMOV, SMOV]);
+    h.cpu.set_v(1, 0xdead_beef_0000_0000_0000_0000_0000_0000);
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0xdead_beef_dead_beef_dead_beef_dead_beef,
+        "DUP from V1.S[3]"
+    );
+
+    h.cpu.set_x(1, 0x0123_4567_89ab_cdef);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+
+    // `INS V0.B[5], W1` leaves every other byte alone.
+    h.cpu.set_v(0, 0);
+    h.cpu.set_x(1, 0xff);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0xff << 40, "byte five and nothing else");
+
+    // `INS V0.D[1], V1.D[0]` likewise.
+    h.cpu.set_v(0, 0x1111_1111_1111_1111);
+    h.cpu.set_v(1, 0x2222_2222_2222_2222);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x2222_2222_2222_2222_1111_1111_1111_1111);
+
+    // `UMOV W0, V1.S[2]` zero-extends; `SMOV X0, V1.B[7]` sign-extends.
+    h.cpu.set_v(1, 0x0000_0000_8000_0000_ff00_0000_0000_0000);
+    h.steps(1);
+    assert_eq!(h.cpu.x(0), 0x8000_0000);
+    h.steps(1);
+    assert_eq!(h.cpu.x(0), u64::MAX, "the byte was 0xff");
+}
+
+/// The permutes, against the shapes DDI 0487 draws: `ZIP` interleaves halves,
+/// `UZP` takes alternate lanes of the concatenation, `TRN` takes alternate
+/// lanes of each source.
+#[test]
+fn the_permutes_interleave_as_the_manual_draws_them() {
+    let a = 0x0000_0003_0000_0002_0000_0001_0000_0000u128;
+    let b = 0x0000_0013_0000_0012_0000_0011_0000_0010u128;
+    for (word, want) in [
+        (ZIP1, 0x0000_0011_0000_0001_0000_0010_0000_0000u128),
+        (ZIP2, 0x0000_0013_0000_0003_0000_0012_0000_0002u128),
+        (UZP1, 0x0000_0012_0000_0010_0000_0002_0000_0000u128),
+        (TRN1, 0x0000_0012_0000_0002_0000_0010_0000_0000u128),
+    ] {
+        let h = simd(&[word]);
+        h.cpu.set_v(1, a);
+        h.cpu.set_v(2, b);
+        h.steps(1);
+        assert_eq!(h.cpu.v(0), want, "{word:08x}");
+    }
+}
+
+/// `EXT` slides a byte window across the pair `Vn`:`Vm`.
+#[test]
+fn ext_slides_a_window_across_the_register_pair() {
+    let h = simd(&[EXT]);
+    h.cpu.set_v(1, 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100);
+    h.cpu.set_v(2, 0x1f1e_1d1c_1b1a_1918_1716_1514_1312_1110);
+    h.steps(1);
+    // Sixteen bytes starting at offset five of the concatenation.
+    assert_eq!(h.cpu.v(0), 0x1413_1211_100f_0e0d_0c0b_0a09_0807_0605);
+}
+
+/// `TBL` writes zero where the index is out of the table; `TBX` leaves the
+/// destination alone there. That single difference is the whole reason both
+/// exist, and an implementation that treated them alike would pass every test
+/// whose indices are all in range.
+#[test]
+fn tbl_zeroes_out_of_range_and_tbx_keeps() {
+    let h = simd(&[TBL]);
+    h.cpu.set_v(0, u128::MAX);
+    h.cpu.set_v(1, 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100);
+    // Byte 0 selects table entry 0; byte 1 selects entry 16, which is past
+    // the end of a one-register table.
+    h.cpu.set_v(2, 0x1000);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0) & 0xffff, 0x0000, "out of range reads as zero");
+
+    let h = simd(&[TBX]);
+    h.cpu.set_v(0, u128::MAX);
+    // A two-register table whose entry `n` holds `n`, so a lookup that
+    // succeeds is visible as the index it was given.
+    h.cpu.set_v(1, 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100);
+    h.cpu.set_v(2, 0x1f1e_1d1c_1b1a_1918_1716_1514_1312_1110);
+    // The index register of a two-register `TBX` is `Vm`, which is `V3`.
+    h.cpu.set_v(3, 0x1f1f_1f1f_1f1f_1f1f_1f1f_1f1f_1f1f_2120);
+    h.steps(1);
+    // Entries 32 and 33 are past the end of a two-register table, so `TBX`
+    // keeps what the destination held — which is where it differs from `TBL`.
+    assert_eq!(h.cpu.v(0) & 0xffff, 0xffff);
+    assert_eq!(
+        h.cpu.v(0) >> 16 & 0xff,
+        0x1f,
+        "an index that is in range still reads the table"
+    );
+}
+
+/// The reductions: `ADDV` folds the lanes at their own width and wraps there,
+/// while `SADDLV` folds them into a lane twice as wide and does not.
+#[test]
+fn the_reductions_differ_in_where_they_wrap() {
+    let h = simd(&[ADDV_4S, SADDLV_8B]);
+    h.cpu.set_v(1, 0x0000_0004_0000_0003_0000_0002_0000_0001);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 10);
+
+    // Eight bytes of 0x80 sum to 0x400 signed, which does not fit in a byte
+    // and does fit in the halfword `SADDLV` writes.
+    h.cpu.set_v(1, 0x8080_8080_8080_8080);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0xfc00, "-1024 in sixteen bits");
+}
+
+/// `Q` means three different things, and this is the test that says so: on a
+/// narrowing operation it picks the half of the *destination* to write, and
+/// on a widening one the half of the *source* to read.
+#[test]
+fn q_selects_a_destination_half_when_narrowing_and_a_source_half_when_widening() {
+    let h = simd(&[XTN, XTN2]);
+    h.cpu.set_v(0, u128::MAX);
+    h.cpu.set_v(1, 0xdddd_4444_cccc_3333_bbbb_2222_aaaa_1111);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x4444_3333_2222_1111, "XTN clears the top half");
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0x4444_3333_2222_1111_4444_3333_2222_1111,
+        "XTN2 fills the top half and keeps the bottom"
+    );
+
+    // `FCVTL` reads the low half of its source, `FCVTL2` the high one — and
+    // 1.0 in `binary32` is 0x3f800000, in `binary64` 0x3ff0000000000000.
+    let h = simd(&[FCVTL, FCVTL2]);
+    h.cpu.set_v(1, 0x4000_0000_c000_0000_bf80_0000_3f80_0000);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0xbff0_0000_0000_0000_3ff0_0000_0000_0000);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x4000_0000_0000_0000_c000_0000_0000_0000);
+}
+
+/// A shift by an immediate takes its element width from `immh`, and the
+/// architecture allows a right shift by the *whole* element — which Rust's
+/// shift operators do not, so it is the case an obvious implementation
+/// panics on in debug and wraps on in release.
+#[test]
+fn a_shift_by_the_whole_element_width_is_allowed() {
+    let h = simd(&[SSHR_32, USHR_8, SHL_63]);
+    h.cpu.set_v(1, 0x8000_0000_7fff_ffff_8000_0000_0000_0001);
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0xffff_ffff_0000_0000_ffff_ffff_0000_0000,
+        "an arithmetic shift by 32 leaves the sign in every bit"
+    );
+
+    h.cpu.set_v(1, u128::MAX);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0, "a logical shift by 8 empties every byte");
+
+    h.cpu.set_v(1, 0x0000_0000_0000_0003_0000_0000_0000_0001);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x8000_0000_0000_0000_8000_0000_0000_0000);
+
+    // `SRI Vd.2D, Vn.2D, #64` is the same case for the *insert*, where the
+    // mask of kept bits is what the shift has no answer for.
+    let h = simd(&[0x6f40_4420]);
+    h.cpu.set_v(0, u128::MAX);
+    h.cpu.set_v(1, u128::MAX);
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        u128::MAX,
+        "a shift by the whole width inserts nothing and keeps everything"
+    );
+}
+
+/// `SSHL` shifts left or right depending on the *sign of a byte* in the
+/// second operand, which is why A64 has no vector shift-right-by-register.
+#[test]
+fn sshl_shifts_right_when_its_amount_is_negative() {
+    let h = simd(&[SSHL]);
+    h.cpu.set_v(1, 0x0000_0010_0000_0010_ffff_fff0_0000_0010);
+    // +2, -2, -2, and -33 — an amount past the element width, which
+    // saturates to the sign rather than wrapping.
+    h.cpu.set_v(2, 0x0000_0002_ffff_fffe_ffff_fffe_ffff_ffdf);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0000_0040_0000_0004_ffff_fffc_0000_0000);
+}
+
+/// The widening three-register forms: `Q` picks the half of the narrow
+/// sources, and `UADDW` reads its first source wide while `UMULL` reads both
+/// narrow.
+#[test]
+fn the_widening_forms_read_the_half_q_selects() {
+    let h = simd(&[UMULL, UADDW]);
+    h.cpu.set_v(1, 0x0000_0000_0000_0000_0201_0201_0201_0201);
+    h.cpu.set_v(2, 0x0000_0000_0000_0000_0304_0304_0304_0304);
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0x0006_0004_0006_0004_0006_0004_0006_0004,
+        "eight byte products in eight halfwords"
+    );
+
+    h.cpu.set_v(1, 0x00ff_00ff_00ff_00ff_00ff_00ff_00ff_00ff);
+    h.cpu.set_v(2, 0x0000_0000_0000_0000_0101_0101_0101_0101);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0100_0100_0100_0100_0100_0100_0100_0100);
+}
+
+/// Floating point lanewise, through the same `crate::float` the scalar
+/// instructions use — and one set of `FPSR` flags for the whole vector, not
+/// one per lane.
+#[test]
+fn lanewise_floating_point_accumulates_one_set_of_flags() {
+    let h = simd(&[FADD_4S, FDIV_2D, FMLA_2D, FNEG_4S]);
+    // 1.0 + 2.0 in every lane.
+    h.cpu.set_v(1, 0x3f80_0000_3f80_0000_3f80_0000_3f80_0000);
+    h.cpu.set_v(2, 0x4000_0000_4000_0000_4000_0000_4000_0000);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x4040_0000_4040_0000_4040_0000_4040_0000);
+
+    // 1.0 / 0.0 in one lane and 1.0 / 2.0 in the other: the division by zero
+    // is sticky for the whole instruction.
+    h.cpu
+        .set_v(1, u128::from(d(1.0)) << 64 | u128::from(d(1.0)));
+    h.cpu.set_v(2, u128::from(d(2.0)) << 64);
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        (u128::from(d(0.5)) << 64) | u128::from(d(f64::INFINITY))
+    );
+    assert_ne!(h.cpu.sysregs().fpsr & 0b10, 0, "FPSR.DZC is set");
+
+    // `FMLA` reads the destination as the addend and is *fused*: the product
+    // of two values whose exact result needs 106 bits rounds once.
+    h.cpu.set_v(0, u128::from(d(1.0)));
+    h.cpu.set_v(1, u128::from(d(3.0)));
+    h.cpu.set_v(2, u128::from(d(4.0)));
+    h.steps(1);
+    assert_eq!(h.cpu.v(0) as u64, d(13.0));
+
+    h.cpu.set_v(1, 0x3f80_0000_bf80_0000_0000_0000_8000_0000);
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0xbf80_0000_3f80_0000_8000_0000_0000_0000,
+        "FNEG flips the sign bit and nothing else, zeroes included"
+    );
+}
+
+/// The lanewise comparisons are *predicates*, so they write a mask and leave
+/// `NZCV` alone — and `FCMEQ` is quiet on a NaN where `FCMGT` signals, which
+/// is IEEE 754 §5.11 and not a detail Arm invented.
+#[test]
+fn a_lanewise_compare_writes_a_mask_and_leaves_the_flags_alone() {
+    let nan = 0x7fc0_0000u128;
+    let one = 0x3f80_0000u128;
+    let h = simd(&[FCMGT_4S, FCMEQ_4S, FCMGT_ZERO_4S]);
+    h.cpu.set_v(1, (one << 96) | (nan << 64) | one);
+    h.cpu.set_v(2, one << 96);
+    let before = h.flags();
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0000_0000_0000_0000_0000_0000_ffff_ffff);
+    assert_eq!(h.flags(), before, "a vector compare does not touch NZCV");
+    assert_ne!(h.cpu.sysregs().fpsr & 1, 0, "FCMGT signals on a quiet NaN");
+
+    let mut regs = h.cpu.sysregs();
+    regs.fpsr = 0;
+    h.cpu.set_sysregs(regs);
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0xffff_ffff_0000_0000_ffff_ffff_0000_0000,
+        "lane one is zero against zero, which compares equal"
+    );
+    assert_eq!(h.cpu.sysregs().fpsr & 1, 0, "FCMEQ is quiet");
+
+    h.cpu.set_v(1, (one << 96) | 0x8000_0000);
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0xffff_ffff_0000_0000_0000_0000_0000_0000,
+        "negative zero is not greater than zero"
+    );
+}
+
+/// The lanewise conversions, both directions, saturating at the ends the way
+/// the scalar ones do.
+#[test]
+fn the_lanewise_conversions_saturate_at_the_ends() {
+    let h = simd(&[FCVTZS_4S, UCVTF_4S]);
+    h.cpu.set_v(
+        1,
+        // 1.5, -1.5, +inf, -inf
+        0xff80_0000_7f80_0000_bfc0_0000_3fc0_0000,
+    );
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x8000_0000_7fff_ffff_ffff_ffff_0000_0001);
+
+    h.cpu.set_v(1, 0x0000_0000_0000_0001_0000_0000_0000_0000);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0000_0000_3f80_0000_0000_0000_0000_0000);
+}
+
+/// The two-register integer miscellany, each on the case that separates it
+/// from a plausible neighbour.
+#[test]
+fn the_bit_counters_and_reversals() {
+    let h = simd(&[
+        NOT_16B, RBIT_16B, CNT_16B, REV64_16B, CLS_4S, CLZ_4S, ABS_4S, NEG_2D,
+    ]);
+    h.cpu.set_v(1, 0x0f0f_0f0f_0f0f_0f0f_0f0f_0f0f_0f0f_0f0f);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0xf0f0_f0f0_f0f0_f0f0_f0f0_f0f0_f0f0_f0f0);
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0xf0f0_f0f0_f0f0_f0f0_f0f0_f0f0_f0f0_f0f0,
+        "RBIT reverses within each byte, so 0x0f becomes 0xf0"
+    );
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0x0404_0404_0404_0404_0404_0404_0404_0404,
+        "four set bits in every byte"
+    );
+
+    h.cpu.set_v(1, 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100);
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0x0809_0a0b_0c0d_0e0f_0001_0203_0405_0607,
+        "REV64 reverses the bytes within each doubleword"
+    );
+
+    // `CLS` counts the bits after the sign that match it; `CLZ` counts zeroes.
+    h.cpu.set_v(1, 0x0000_0001_ffff_ffff_8000_0000_0000_0000);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0000_001e_0000_001f_0000_0000_0000_001f);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0000_001f_0000_0000_0000_0000_0000_0020);
+
+    // `ABS` of `i32::MIN` is `i32::MIN`: the negation wraps, as guest
+    // arithmetic does.
+    h.cpu.set_v(1, 0x8000_0000_ffff_ffff_0000_0005_7fff_ffff);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x8000_0000_0000_0001_0000_0005_7fff_ffff);
+
+    h.cpu.set_v(1, 0x0000_0000_0000_0002_ffff_ffff_ffff_ffff);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0xffff_ffff_ffff_fffe_0000_0000_0000_0001);
+}
+
+/// The arrangements the architecture reserves. Each of these decodes and must
+/// then raise `UNDEFINED`, because "reserved" is a property of the operand
+/// shape rather than of the encoding — a mask cannot express it.
+#[test]
+fn the_reserved_arrangements_are_undefined() {
+    // `V0.1D`: a lanewise operation on a single 64-bit lane.
+    let add_1d = ADD_2D & !(1 << 30);
+    // `MUL V0.2D`: there is no doubleword multiply.
+    let mul_2d = MUL_4S | (1 << 23);
+    // `INS` with `Q` clear: the instruction writes a lane of a 128-bit
+    // register and the encoding fixes `Q`.
+    let ins_q0 = INS_GEN & !(1 << 30);
+    for word in [add_1d, mul_2d, ins_q0] {
+        assert!(
+            super::isa::decode(word, Features::ALL).is_some() || word == ins_q0,
+            "{word:08x} should still decode"
+        );
+        let h = simd(&[word]);
+        h.steps(1);
+        assert_eq!(
+            h.cpu.sysregs().esr_el1 >> 26,
+            ec::UNKNOWN,
+            "{word:08x} should be UNDEFINED"
+        );
+    }
+}
+
+/// The scalar SIMD forms are the lanewise rules over one lane, and they zero
+/// the rest of the destination like every other scalar write.
+#[test]
+fn the_scalar_forms_are_one_lane_of_the_vector_ones() {
+    let h = simd(&[ADDP_D, DUP_SCALAR, FCMGE_D]);
+    h.cpu.set_v(0, u128::MAX);
+    h.cpu.set_v(1, 0x0000_0000_0000_0007_0000_0000_0000_0003);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 10, "the two doubleword lanes, added");
+
+    h.cpu.set_v(0, u128::MAX);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 7, "MOV D0, V1.D[1]");
+
+    h.cpu.set_v(1, u128::from(d(2.0)));
+    h.cpu.set_v(2, u128::from(d(2.0)));
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), u128::from(u64::MAX), "a mask, in a D register");
+}
+
+/// `LD1` moves whole registers; `LD4` de-interleaves; `ST4` puts it back; and
+/// the post-indexed immediate is always the number of bytes moved, which is
+/// why the encoding does not carry one.
+#[test]
+fn the_structure_loads_interleave_and_the_stores_undo_it() {
+    let h = simd(&[LD1_16B, LD4_4S, ST4_4S_POST]);
+    h.cpu.set_x(1, 0x1000);
+    for i in 0..16u64 {
+        h.write64(
+            0x1000 + 8 * i,
+            0x0706_0504_0302_0100 + 0x0808_0808_0808_0808 * i,
+        );
+    }
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100);
+
+    // Sixteen words, de-interleaved four ways: V0 takes words 0, 4, 8, 12.
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x3332_3130_2322_2120_1312_1110_0302_0100);
+    assert_eq!(h.cpu.v(3), 0x3f3e_3d3c_2f2e_2d2c_1f1e_1d1c_0f0e_0d0c);
+
+    // Store it all back somewhere else and the memory must match.
+    h.cpu.set_x(1, 0x2000);
+    h.cpu.set_x(2, 0x40);
+    h.steps(1);
+    assert_eq!(h.cpu.x(1), 0x2040, "the post-index came from X2");
+    // Four registers of sixteen bytes: sixty-four, and not a byte more.
+    for i in 0..8u64 {
+        assert_eq!(
+            h.read64(0x1000 + 8 * i),
+            h.read64(0x2000 + 8 * i),
+            "doubleword {i}"
+        );
+    }
+    assert_eq!(h.read64(0x2040), 0, "the store stopped at sixty-four bytes");
+}
+
+/// The single-element accesses: one lane in and out of memory, and the
+/// replicating load that fills every lane from one element.
+#[test]
+fn the_single_element_accesses_touch_one_lane() {
+    let h = simd(&[ST1_D1, LD1_S2_POST, LD1R_4S, LD2R_8B]);
+    h.cpu.set_x(1, 0x1000);
+    h.cpu.set_v(0, 0xdead_beef_cafe_f00d_0123_4567_89ab_cdef);
+    h.steps(1);
+    assert_eq!(
+        h.read64(0x1000),
+        0xdead_beef_cafe_f00d,
+        "the high half only"
+    );
+
+    h.cpu.set_x(1, 0x1000);
+    h.cpu.set_v(0, 0);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0xcafe_f00d_0000_0000_0000_0000);
+    assert_eq!(h.cpu.x(1), 0x1004, "the immediate is the element size");
+
+    h.cpu.set_x(1, 0x1000);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0xcafe_f00d_cafe_f00d_cafe_f00d_cafe_f00d);
+
+    // `LD2R` fills two registers from two consecutive elements.
+    h.cpu.set_x(1, 0x1000);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0d0d_0d0d_0d0d_0d0d);
+    assert_eq!(h.cpu.v(1), 0xf0f0_f0f0_f0f0_f0f0);
+}
+
+/// The disassembler prints an arrangement, and prints `?` where the
+/// architecture reserves one — the same honesty the scalar side shows for an
+/// unallocated `ptype`.
+#[test]
+fn the_disassembler_names_the_arrangement() {
+    let cases: &[(u32, &str)] = &[
+        (ADD_4S, "add\tv0.4s, v1.4s, v2.4s"),
+        (ADD_2D, "add\tv0.2d, v1.2d, v2.2d"),
+        (MOVI_D0, "movi\td0, #0x0"),
+        (MOVI_4S_LSL24, "movi\tv0.4s, #0x1, lsl #24"),
+        (MOVI_4S_MSL8, "movi\tv0.4s, #0xff, msl #8"),
+        (DUP_ELEM, "dup\tv0.4s, v1.s[3]"),
+        (UMOV, "umov\tw0, v1.s[2]"),
+        (XTN2, "xtn2\tv0.8h, v1.4s"),
+        (FCVTL2, "fcvtl2\tv0.2d, v1.4s"),
+        (EXT, "ext\tv0.16b, v1.16b, v2.16b, #0x5"),
+        (TBX, "tbx\tv0.16b, { v1.16b, v2.16b }, v3.16b"),
+        (LD4_4S, "ld4\t{ v0.4s, v1.4s, v2.4s, v3.4s }, [x1]"),
+        (ST1_D1, "st1\t{ v0.d }[1], [x1]"),
+        (LD1R_4S, "ld1r\t{ v0.4s }, [x1]"),
+        (ADDP_D, "addp\td0, v1.2d"),
+        (FMUL_ELEM, "fmul\tv0.4s, v1.4s, v2.s[3]"),
+        // A reserved arrangement: the row decoded and the shape does not
+        // exist, so the operands say so rather than inventing one.
+        (ADD_2D & !(1 << 30), "add\tv0.?, v1.?, v2.?"),
+    ];
+    for (word, want) in cases {
+        let text = super::disasm::disassemble(*word, 0, Features::ALL).text;
+        assert_eq!(&text, want, "{word:08x}");
+    }
+}
+
+/// Every Advanced SIMD encoding must either execute or raise `UNDEFINED` —
+/// and in particular must not panic.
+///
+/// An interpreter that panics turns a guest's bad instruction into a host
+/// crash, and this family is where that is easiest to write: three of its
+/// encoding groups allow a shift by the *whole* element width, which Rust's
+/// shift operators do not, and `SRI Vd.2D, Vn.2D, #64` was doing exactly that
+/// until this test existed.
+///
+/// Enumerated from the table rather than sampled at random, which is what
+/// makes it find that: every row is executed with each of its free fields all
+/// zero, all one, and one bit at a time — so the extreme `immh`, the reserved
+/// `size` and the out-of-range lane index are all reached by construction
+/// rather than by luck. Deterministic and a few thousand words, so it runs on
+/// every commit instead of being a fuzz target nobody sets up.
+#[test]
+fn no_advanced_simd_encoding_panics() {
+    let h = simd(&[NOP]);
+    let mut regs = h.cpu.sysregs();
+    regs.vbar_el1 = 0x8000;
+    h.cpu.set_sysregs(regs);
+    // Recognisable patterns rather than zero, so a lane index selects
+    // something and a shift amount is not always the same.
+    for i in 0..32u32 {
+        h.cpu.set_v(
+            i,
+            (u128::from(i) << 96) | 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100,
+        );
+        h.cpu.set_x(i, 0x1000 + u64::from(i) * 8);
+    }
+
+    let mut fills = alloc::vec::Vec::new();
+    fills.push(0u32);
+    fills.push(u32::MAX);
+    for bit in 0..32 {
+        fills.push(1 << bit);
+        fills.push(!(1u32 << bit));
+    }
+    // Pairs as well as single bits: one bit alone rarely reaches a legal
+    // operand, because most of these encodings need `Q` set before the rest
+    // of the word means anything. `SRI Vd.2D, Vn.2D, #64` is exactly that —
+    // `immh` at its maximum *and* `Q` — and a single-bit sweep misses it.
+    for a in 0..32 {
+        for b in (a + 1)..32 {
+            fills.push((1u32 << a) | (1 << b));
+        }
+    }
+    let mut state = 0x2026_0903u32;
+    for _ in 0..16 {
+        state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        fills.push(state.rotate_left(7) ^ state);
+    }
+
+    let mut executed = 0usize;
+    for row in super::isa::TABLE {
+        if row.feat != super::isa::Feat::AdvSimd {
+            continue;
+        }
+        for fill in &fills {
+            let word = row.bits | (fill & !row.mask);
+            h.write32(0, word);
+            h.cpu.set_pc(0);
+            h.cpu.step();
+            executed += 1;
+        }
+    }
+    assert!(
+        executed > 100_000,
+        "the sweep covered only {executed} words, so the table lost its rows"
+    );
+}

@@ -764,6 +764,7 @@ mod tests {
     fn no_host_float_on_the_guest_path() {
         let sources = [
             ("fp.rs", include_str!("fp.rs")),
+            ("simd.rs", include_str!("simd.rs")),
             ("exec.rs", include_str!("exec.rs")),
         ];
         for (name, src) in sources {

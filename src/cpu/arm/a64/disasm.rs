@@ -25,7 +25,7 @@ use core::fmt;
 use core::fmt::Write as _;
 
 use super::isa::{self, Fmt, Suffix};
-use super::{fp, sysreg};
+use super::{fp, simd, sysreg};
 
 /// Why a listing has a hole in it.
 ///
@@ -191,6 +191,209 @@ fn extend_tail(word: u32, amount: u32, default_option: u32) -> String {
     }
 }
 
+/// A vector register and its arrangement — `v3.4s`.
+///
+/// An arrangement the architecture reserves prints as `v3.?`, which is what a
+/// listing of a word that will raise `UNDEFINED` should say: the row decoded,
+/// and the shape it names does not exist.
+fn varr(index: u32, arr: Option<simd::Arrangement>) -> String {
+    match arr {
+        Some(a) => format!("v{index}.{}", a.name()),
+        None => format!("v{index}.?"),
+    }
+}
+
+/// One lane of a vector register — `v3.s[2]`.
+fn vlane(index: u32, esize: u32, lane: u32) -> String {
+    if esize > 3 {
+        return format!("v{index}.?[{lane}]");
+    }
+    format!("v{index}.{}[{lane}]", simd::elem_letter(esize))
+}
+
+/// The element width and lane index an `imm5` field names.
+///
+/// A zero low nibble names no width, so this reports `4` — which every caller
+/// prints as `?` rather than guessing, since the interpreter will raise
+/// `UNDEFINED` on the same word.
+fn lane_of(word: u32) -> (u32, u32) {
+    let imm5 = isa::simd_imm5(word);
+    if imm5 & 0xf == 0 {
+        return (4, 0);
+    }
+    let esize = imm5.trailing_zeros();
+    (esize, imm5 >> (esize + 1))
+}
+
+/// The `8B`/`16B` arrangement of the operations that have no element width.
+fn byte_arr(q: bool) -> Option<simd::Arrangement> {
+    Some(simd::Arrangement {
+        esize: 0,
+        lanes: if q { 16 } else { 8 },
+    })
+}
+
+/// The arrangement of a three-register operation, which comes from a
+/// different field in each of the three groups.
+fn three_same_arr(word: u32, fmt: Fmt) -> Option<simd::Arrangement> {
+    match fmt {
+        Fmt::VecThreeSameLog => byte_arr(isa::q(word)),
+        Fmt::VecThreeSameFp => simd::Arrangement::from_sz(isa::simd_sz(word), isa::q(word)),
+        _ => simd::Arrangement::from_size(isa::simd_size(word), isa::q(word)),
+    }
+}
+
+/// The same for a two-register operation.
+///
+/// `NOT`, `RBIT` and `CNT` are the exception: their `size` field selects the
+/// operation rather than an element width, and all three print `8B` or `16B`.
+fn two_misc_arr(word: u32, fmt: Fmt, op: isa::Op) -> Option<simd::Arrangement> {
+    if matches!(op, isa::Op::NotVec | isa::Op::RbitVec | isa::Op::CntVec) {
+        return byte_arr(isa::q(word));
+    }
+    if fmt == Fmt::VecTwoMiscFp {
+        simd::Arrangement::from_sz(isa::simd_sz(word), isa::q(word))
+    } else {
+        simd::Arrangement::from_size(isa::simd_size(word), isa::q(word))
+    }
+}
+
+/// The element width and the `immh`:`immb` value of a shift by an immediate.
+fn shift_of(word: u32) -> (u32, u32) {
+    let immhb = isa::simd_immhb(word);
+    let immh = immhb >> 3;
+    if immh == 0 {
+        return (0, immhb);
+    }
+    (31 - immh.leading_zeros(), immhb)
+}
+
+/// The `, lsl #8` or `, msl #16` tail a modified immediate's `cmode` names.
+fn mod_imm_shift(cmode: u32) -> String {
+    match (cmode >> 1) & 7 {
+        0b000 | 0b100 => String::new(),
+        0b001 | 0b101 => ", lsl #8".to_string(),
+        0b010 => ", lsl #16".to_string(),
+        0b011 => ", lsl #24".to_string(),
+        0b110 => {
+            if cmode & 1 == 0 {
+                ", msl #8".to_string()
+            } else {
+                ", msl #16".to_string()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// Whether a scalar SIMD operation is a floating-point one, and therefore
+/// takes its width from `sz` rather than being a doubleword.
+fn fp_scalar(op: isa::Op) -> bool {
+    matches!(
+        op,
+        isa::Op::FcmeqScalar
+            | isa::Op::FcmgeScalar
+            | isa::Op::FcmgtScalar
+            | isa::Op::FabdScalar
+            | isa::Op::FcmeqZeroScalar
+            | isa::Op::FcmgeZeroScalar
+            | isa::Op::FcmgtZeroScalar
+            | isa::Op::FcmleZeroScalar
+            | isa::Op::FcmltZeroScalar
+            | isa::Op::FaddpScalar
+            | isa::Op::FmaxpScalar
+            | isa::Op::FminpScalar
+    )
+}
+
+/// The register letter a scalar SIMD operation prints.
+fn scalar_letter(word: u32, op: isa::Op) -> char {
+    if fp_scalar(op) {
+        simd::elem_letter(2 + u32::from(isa::simd_sz(word)))
+    } else {
+        'd'
+    }
+}
+
+/// The `{ v0.4s, v1.4s }` list of a multiple-structures access.
+fn struct_multi_list(word: u32, t: u32) -> String {
+    let Some((repeats, selem)) = isa::struct_shape(isa::field(word, 15, 12)) else {
+        return "{ ? }".to_string();
+    };
+    let arr = simd::Arrangement::whole(isa::field(word, 11, 10), isa::q(word));
+    let mut out = String::from("{ ");
+    for i in 0..repeats * selem {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&varr((t + i) % 32, arr));
+    }
+    out.push_str(" }");
+    out
+}
+
+/// The `{ v0.s, v1.s }[2]` list of a single-element access, or the
+/// `{ v0.4s }` of a replicating load.
+fn struct_single_list(word: u32, t: u32) -> String {
+    let selem = isa::struct_single_selem(word);
+    let mut out = String::from("{ ");
+    if isa::field(word, 15, 14) == 0b11 {
+        let arr = simd::Arrangement::whole(isa::field(word, 11, 10), isa::q(word));
+        for i in 0..selem {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&varr((t + i) % 32, arr));
+        }
+        out.push_str(" }");
+        return out;
+    }
+    let shape = isa::struct_single_shape(word);
+    for i in 0..selem {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        match shape {
+            Some((esize, _)) => {
+                let _ = write!(out, "v{}.{}", (t + i) % 32, simd::elem_letter(esize));
+            }
+            None => {
+                let _ = write!(out, "v{}.?", (t + i) % 32);
+            }
+        }
+    }
+    out.push_str(" }");
+    match shape {
+        Some((_, index)) => {
+            let _ = write!(out, "[{index}]");
+        }
+        None => out.push_str("[?]"),
+    }
+    out
+}
+
+/// How many bytes a structure access moves, which is also the immediate its
+/// post-indexed form adds.
+fn struct_bytes(word: u32, single: bool) -> u64 {
+    if single {
+        let selem = u64::from(isa::struct_single_selem(word));
+        let ebytes = if isa::field(word, 15, 14) == 0b11 {
+            1u64 << isa::field(word, 11, 10)
+        } else {
+            match isa::struct_single_shape(word) {
+                Some((esize, _)) => 1u64 << esize,
+                None => 0,
+            }
+        };
+        return selem * ebytes;
+    }
+    let Some((repeats, selem)) = isa::struct_shape(isa::field(word, 15, 12)) else {
+        return 0;
+    };
+    let bytes = if isa::q(word) { 16u64 } else { 8 };
+    u64::from(repeats * selem) * bytes
+}
+
 /// Disassemble one instruction word at `pc`.
 ///
 /// `features` is the core's, because an encoding whose feature is absent is
@@ -214,6 +417,14 @@ pub fn disassemble(word: u32, pc: u64, features: isa::Features) -> Disassembled 
         Suffix::None => {}
         Suffix::Cond => {
             let _ = write!(text, ".{}", isa::cond_lo(word));
+        }
+        Suffix::Wide => {
+            // The `2` of `XTN2`, `FCVTL2`, `UMULL2`: `Q` says which half of
+            // the wide operand the instruction touches, and the mnemonic
+            // column cannot carry a bit.
+            if isa::q(word) {
+                text.push('2');
+            }
         }
         Suffix::Order => {
             // The acquire and release bits sit at different places on the two
@@ -804,6 +1015,406 @@ pub fn disassemble(word: u32, pc: u64, features: isa::Features) -> Disassembled 
                 }
                 _ => {
                     let _ = write!(ops, "{pair}, [{base}, {}]!", imm(offset));
+                }
+            }
+        }
+
+        // -- Advanced SIMD ------------------------------------------------
+        //
+        // A vector operand prints its *arrangement*, and the arrangement is
+        // not always in the same field — so each arm asks `isa` for the field
+        // its encoding group uses and `simd` for the letters, which is the
+        // same split the interpreter makes.
+        Fmt::VecModImm => {
+            let esize = match insn.op {
+                isa::Op::MoviByte => 0,
+                isa::Op::MoviShiftH
+                | isa::Op::MvniShiftH
+                | isa::Op::OrrVecImmH
+                | isa::Op::BicVecImmH => 1,
+                isa::Op::MoviWide | isa::Op::FmovVecD => 3,
+                _ => 2,
+            };
+            let cmode = isa::simd_cmode(word);
+            let imm8 = isa::simd_imm8(word);
+            // `MOVI Dd, #imm` is the one modified-immediate form with a
+            // scalar destination — and it is the encoding LLVM reaches for to
+            // materialise a floating-point zero.
+            let dest = if insn.op == isa::Op::MoviWide && !isa::q(word) {
+                format!("d{d}")
+            } else {
+                varr(d, simd::Arrangement::from_size(esize, isa::q(word)))
+            };
+            // Three of the fourteen forms print the *expanded* value rather
+            // than the eight bits: the two `FMOV`s, whose immediate is a
+            // floating-point number the encoding compresses, and the 64-bit
+            // `MOVI`, whose eight bits are a bytemask. The other eleven print
+            // the byte and its shift, which is what an assembler takes back.
+            let expanded = matches!(
+                insn.op,
+                isa::Op::FmovVecS | isa::Op::FmovVecD | isa::Op::MoviWide
+            );
+            if expanded {
+                // In hex rather than as a decimal: a float here would need a
+                // formatter this crate has no host floating point to write.
+                let whole = simd::expand_imm(isa::bit(word, 29), cmode, imm8).unwrap_or(0);
+                let value = if esize >= 3 {
+                    whole
+                } else {
+                    whole & u64::from(u32::MAX)
+                };
+                let _ = write!(ops, "{dest}, #0x{value:x}");
+            } else {
+                let _ = write!(ops, "{dest}, #0x{imm8:x}{}", mod_imm_shift(cmode));
+            }
+        }
+        Fmt::VecDupElem => {
+            let (esize, index) = lane_of(word);
+            let _ = write!(
+                ops,
+                "{}, {}",
+                varr(d, simd::Arrangement::from_size(esize, isa::q(word))),
+                vlane(n, esize, index)
+            );
+        }
+        Fmt::VecDupGen => {
+            let (esize, _) = lane_of(word);
+            let _ = write!(
+                ops,
+                "{}, {}",
+                varr(d, simd::Arrangement::from_size(esize, isa::q(word))),
+                reg(n, if esize == 3 { 64 } else { 32 }, false)
+            );
+        }
+        Fmt::VecToGp => {
+            let (esize, index) = lane_of(word);
+            let _ = write!(
+                ops,
+                "{}, {}",
+                reg(d, if isa::q(word) { 64 } else { 32 }, false),
+                vlane(n, esize, index)
+            );
+        }
+        Fmt::VecInsGen => {
+            let (esize, index) = lane_of(word);
+            let _ = write!(
+                ops,
+                "{}, {}",
+                vlane(d, esize, index),
+                reg(n, if esize == 3 { 64 } else { 32 }, false)
+            );
+        }
+        Fmt::VecInsElem => {
+            let (esize, index) = lane_of(word);
+            let _ = write!(
+                ops,
+                "{}, {}",
+                vlane(d, esize, index),
+                vlane(n, esize, isa::simd_imm4(word) >> esize)
+            );
+        }
+        Fmt::VecThreeSame | Fmt::VecThreeSameFp | Fmt::VecThreeSameLog => {
+            let arr = three_same_arr(word, insn.fmt);
+            let _ = write!(ops, "{}, {}, {}", varr(d, arr), varr(n, arr), varr(m, arr));
+        }
+        Fmt::VecTwoMisc | Fmt::VecTwoMiscFp => {
+            let arr = two_misc_arr(word, insn.fmt, insn.op);
+            let _ = write!(ops, "{}, {}", varr(d, arr), varr(n, arr));
+        }
+        Fmt::VecCmpZero => {
+            let arr = simd::Arrangement::from_size(isa::simd_size(word), isa::q(word));
+            let _ = write!(ops, "{}, {}, #0", varr(d, arr), varr(n, arr));
+        }
+        Fmt::VecCmpZeroFp => {
+            let arr = simd::Arrangement::from_sz(isa::simd_sz(word), isa::q(word));
+            let _ = write!(ops, "{}, {}, #0.0", varr(d, arr), varr(n, arr));
+        }
+        Fmt::VecNarrow => {
+            // `XTN` takes the destination width from `size` and `FCVTN` from
+            // `sz`, one field lower — the two groups share an encoding but
+            // not a field, which is why the destination is computed here and
+            // not in a shared helper.
+            let dst = if insn.op == isa::Op::XtnVec {
+                isa::simd_size(word)
+            } else {
+                1 + u32::from(isa::simd_sz(word))
+            };
+            let lanes = 64 / (8 << dst);
+            let _ = write!(
+                ops,
+                "{}, {}",
+                varr(
+                    d,
+                    simd::Arrangement::from_size(dst, isa::q(word)).map(|_| {
+                        simd::Arrangement {
+                            esize: dst,
+                            lanes: lanes * (1 + u32::from(isa::q(word))),
+                        }
+                    })
+                ),
+                varr(
+                    n,
+                    Some(simd::Arrangement {
+                        esize: dst + 1,
+                        lanes,
+                    })
+                )
+            );
+        }
+        Fmt::VecWiden => {
+            let src = 1 + u32::from(isa::simd_sz(word));
+            let lanes = 64 / (8 << src);
+            let _ = write!(
+                ops,
+                "{}, {}",
+                varr(
+                    d,
+                    Some(simd::Arrangement {
+                        esize: src + 1,
+                        lanes,
+                    })
+                ),
+                varr(
+                    n,
+                    Some(simd::Arrangement {
+                        esize: src,
+                        lanes: lanes * (1 + u32::from(isa::q(word))),
+                    })
+                )
+            );
+        }
+        Fmt::VecAcross | Fmt::VecAcrossFp => {
+            let (arr, dst) = if insn.fmt == Fmt::VecAcrossFp {
+                (
+                    simd::Arrangement::from_sz(isa::simd_sz(word), isa::q(word)),
+                    2,
+                )
+            } else {
+                let size = isa::simd_size(word);
+                let widening = matches!(insn.op, isa::Op::SaddlvVec | isa::Op::UaddlvVec);
+                (
+                    simd::Arrangement::from_size(size, isa::q(word)),
+                    size + u32::from(widening),
+                )
+            };
+            let _ = write!(ops, "{}{d}, {}", simd::elem_letter(dst), varr(n, arr));
+        }
+        Fmt::VecExt => {
+            let arr = byte_arr(isa::q(word));
+            let _ = write!(
+                ops,
+                "{}, {}, {}, #0x{:x}",
+                varr(d, arr),
+                varr(n, arr),
+                varr(m, arr),
+                isa::simd_imm4(word)
+            );
+        }
+        Fmt::VecTable => {
+            let arr = byte_arr(isa::q(word));
+            let mut table = String::from("{ ");
+            for i in 0..=isa::field(word, 14, 13) {
+                if i > 0 {
+                    table.push_str(", ");
+                }
+                let _ = write!(table, "v{}.16b", (n + i) % 32);
+            }
+            table.push_str(" }");
+            let _ = write!(ops, "{}, {table}, {}", varr(d, arr), varr(m, arr));
+        }
+        Fmt::VecShiftImm => {
+            let (esize, immhb) = shift_of(word);
+            // The fixed-point conversions exist only at the two widths that
+            // are floating-point formats; `immh` naming a byte or a halfword
+            // is reserved there even though it is a shift everywhere else.
+            let fixed = matches!(
+                insn.op,
+                isa::Op::ScvtfFixVec
+                    | isa::Op::UcvtfFixVec
+                    | isa::Op::FcvtzsFixVec
+                    | isa::Op::FcvtzuFixVec
+            );
+            let arr = if fixed && esize < 2 {
+                None
+            } else {
+                simd::Arrangement::from_size(esize, isa::q(word))
+            };
+            let bits = 8 << esize;
+            let amount = if matches!(insn.op, isa::Op::ShlVec | isa::Op::SliVec) {
+                immhb.wrapping_sub(bits)
+            } else {
+                (2 * bits).wrapping_sub(immhb)
+            };
+            let _ = write!(ops, "{}, {}, #{amount}", varr(d, arr), varr(n, arr));
+        }
+        Fmt::VecShiftLong => {
+            let (esize, immhb) = shift_of(word);
+            let lanes = 64 / (8 << esize);
+            let _ = write!(
+                ops,
+                "{}, {}, #{}",
+                varr(
+                    d,
+                    Some(simd::Arrangement {
+                        esize: esize + 1,
+                        lanes
+                    })
+                ),
+                varr(
+                    n,
+                    Some(simd::Arrangement {
+                        esize,
+                        lanes: lanes * (1 + u32::from(isa::q(word)))
+                    })
+                ),
+                immhb.wrapping_sub(8 << esize)
+            );
+        }
+        Fmt::VecShiftNarrow => {
+            let (esize, immhb) = shift_of(word);
+            let lanes = 64 / (8 << esize);
+            let _ = write!(
+                ops,
+                "{}, {}, #{}",
+                varr(
+                    d,
+                    Some(simd::Arrangement {
+                        esize,
+                        lanes: lanes * (1 + u32::from(isa::q(word)))
+                    })
+                ),
+                varr(
+                    n,
+                    Some(simd::Arrangement {
+                        esize: esize + 1,
+                        lanes
+                    })
+                ),
+                (16u32 << esize).wrapping_sub(immhb)
+            );
+        }
+        Fmt::VecThreeDiff | Fmt::VecThreeWide => {
+            let src = isa::simd_size(word);
+            let lanes = 64 / (8 << src);
+            let wide = simd::Arrangement {
+                esize: src + 1,
+                lanes,
+            };
+            let narrow = simd::Arrangement {
+                esize: src,
+                lanes: lanes * (1 + u32::from(isa::q(word))),
+            };
+            let first = if insn.fmt == Fmt::VecThreeWide {
+                wide
+            } else {
+                narrow
+            };
+            let _ = write!(
+                ops,
+                "{}, {}, {}",
+                varr(d, Some(wide)),
+                varr(n, Some(first)),
+                varr(m, Some(narrow))
+            );
+        }
+        Fmt::VecByElem => {
+            let floating = matches!(
+                insn.op,
+                isa::Op::FmulElem | isa::Op::FmlaElem | isa::Op::FmlsElem
+            );
+            let l = u32::from(isa::bit(word, 21));
+            let h = u32::from(isa::bit(word, 11));
+            let m_bit = u32::from(isa::bit(word, 20));
+            let (arr, esize, index, source) = if floating {
+                let arr = simd::Arrangement::from_sz(isa::simd_sz(word), isa::q(word));
+                let esize = 2 + u32::from(isa::simd_sz(word));
+                let index = if isa::simd_sz(word) { h } else { (h << 1) | l };
+                (arr, esize, index, m)
+            } else {
+                let size = isa::simd_size(word);
+                // Only a halfword or a word element has an indexed form; the
+                // other two `size` values are reserved, so there is no
+                // arrangement to print.
+                let arr = if matches!(size, 1 | 2) {
+                    simd::Arrangement::from_size(size, isa::q(word))
+                } else {
+                    None
+                };
+                if size == 1 {
+                    (
+                        arr,
+                        size,
+                        (h << 2) | (l << 1) | m_bit,
+                        isa::field(word, 19, 16),
+                    )
+                } else {
+                    (arr, size, (h << 1) | l, m)
+                }
+            };
+            let _ = write!(
+                ops,
+                "{}, {}, {}",
+                varr(d, arr),
+                varr(n, arr),
+                vlane(source, esize, index)
+            );
+        }
+        Fmt::SimdScalarTwo | Fmt::SimdScalarThree | Fmt::SimdScalarCmpZero => {
+            let letter = scalar_letter(word, insn.op);
+            if insn.op == isa::Op::DupElemScalar {
+                let (esize, index) = lane_of(word);
+                let _ = write!(
+                    ops,
+                    "{}{d}, {}",
+                    simd::elem_letter(esize),
+                    vlane(n, esize, index)
+                );
+            } else if insn.fmt == Fmt::SimdScalarThree {
+                let _ = write!(ops, "{letter}{d}, {letter}{n}, {letter}{m}");
+            } else if insn.fmt == Fmt::SimdScalarCmpZero {
+                let zero = if letter == 'd' && !fp_scalar(insn.op) {
+                    "#0"
+                } else {
+                    "#0.0"
+                };
+                let _ = write!(ops, "{letter}{d}, {letter}{n}, {zero}");
+            } else {
+                let _ = write!(ops, "{letter}{d}, {letter}{n}");
+            }
+        }
+        Fmt::SimdScalarPair => {
+            let letter = scalar_letter(word, insn.op);
+            let esize = if insn.op == isa::Op::AddpScalar {
+                3
+            } else {
+                2 + u32::from(isa::simd_sz(word))
+            };
+            let _ = write!(
+                ops,
+                "{letter}{d}, {}",
+                varr(n, Some(simd::Arrangement { esize, lanes: 2 }))
+            );
+        }
+        Fmt::LdStStruct
+        | Fmt::LdStStructPost
+        | Fmt::LdStStructSingle
+        | Fmt::LdStStructSinglePost => {
+            let base = reg(n, 64, rn_sp);
+            let single = matches!(insn.fmt, Fmt::LdStStructSingle | Fmt::LdStStructSinglePost);
+            let list = if single {
+                struct_single_list(word, d)
+            } else {
+                struct_multi_list(word, d)
+            };
+            let _ = write!(ops, "{list}, [{base}]");
+            if matches!(insn.fmt, Fmt::LdStStructPost | Fmt::LdStStructSinglePost) {
+                if m == 31 {
+                    // The immediate is always the transfer size, so the
+                    // disassembler prints what the instruction will actually
+                    // add rather than a field it does not have.
+                    let _ = write!(ops, ", #0x{:x}", struct_bytes(word, single));
+                } else {
+                    let _ = write!(ops, ", {}", reg(m, 64, false));
                 }
             }
         }

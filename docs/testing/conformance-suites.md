@@ -161,7 +161,7 @@ is the `rust-lld` inside the Rust toolchain. Each runs to a `BRK #0` and
 reports through `x0`–`x3`; `src/cpu/arm/a64/conformance.rs` is the runner.
 
 Generating a corpus removes the *licensing* problem completely and does not by
-itself remove the *evidence* problem, so two of the five guests take their
+itself remove the *evidence* problem, so several of the guests take their
 expected values from somewhere that is not this project:
 
 - **`rustc`'s constant evaluator as a floating-point oracle.** Each expectation
@@ -176,6 +176,17 @@ expected values from somewhere that is not this project:
 
 `fp_rules.rs` and the second half of `memory.rs` are directed tests
 transcribed from DDI 0487 rather than conformance evidence, and they say so.
+
+`fp_natural.rs` is the same oracle applied to **ordinary** compiled
+floating-point code: literal constants, accumulators starting at `0.0`, and
+arrays long enough that the vectoriser takes an interest. That guest could not
+exist until Advanced SIMD did — LLVM materialises a floating-point zero with
+`MOVI Dd, #0`, a vector encoding — and it is where the vector arithmetic gets a
+real oracle, because a vectorised loop and `rustc_apfloat` evaluating the
+scalar one are two independent computations of the same function. What that
+does *not* cover is listed in `conformance.rs`: the permutes, `TBL`, the
+structure loads and everything else no compiler emits are directed tests, and
+the decode side is covered separately by a differential against `llvm-mc`.
 
 ## Framework-level testing
 
