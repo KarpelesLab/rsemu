@@ -382,7 +382,13 @@ impl RamStore {
         if end > self.len {
             return None;
         }
-        let base = usize::try_from(offset).ok()?;
+        // `self.base` is the alignment slack that precedes guest byte zero, so
+        // a guest offset is *not* an index into `cells` — every other accessor
+        // goes through `self.base + at` and this one must too. Getting it wrong
+        // is silent: the compiled fast path reads a valid, wrong address inside
+        // the same allocation, and only a differential against the interpreter
+        // says so.
+        let base = self.base.checked_add(usize::try_from(offset).ok()?)?;
         // Indexing, then a reference-to-pointer cast: both safe, and the index
         // is in range because `self.len` bounds it and fits a `usize` by
         // construction. A zero-length request at the very end of the store
