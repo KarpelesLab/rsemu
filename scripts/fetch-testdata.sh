@@ -116,20 +116,25 @@ readonly DEBIAN_PACKAGES="https://deb.debian.org/debian/dists/trixie/main/binary
 # against **musl** rather than glibc.
 #
 # Debian ships an amd64 `busybox-static` and it is the obvious choice, but it
-# is linked against glibc, and glibc's static startup runs `PUNPCKLDQ`
+# is linked against glibc, and glibc's static startup ran `PUNPCKLDQ`
 # (`66 0F 62`) about a hundred instructions into userspace, packing two CPUID
-# results into one XMM register. rsemu's x86 core advertises SSE2 in
-# `CPUID.01H:EDX[26]` and does not decode that opcode, so a glibc init dies of
-# `#UD` before it prints anything:
+# results into one XMM register. rsemu's x86 core advertised SSE2 in
+# `CPUID.01H:EDX[26]` and did not decode that opcode, so a glibc init died of
+# `#UD` before it printed anything:
 #
 #     Run /init as init process
 #     traps: init[1] trap invalid opcode ip:4a80b6 ... in busybox
 #     Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000004
 #
 # musl's startup does not use the packed-integer half of SSE2 at all, so this
-# build reaches a shell on the same core. When the core grows those opcodes
-# either binary will do; until then this one is the fixture, and the reason is
-# written here rather than rediscovered.
+# build reached a shell on the same core, and it stayed the fixture.
+#
+# **The core has those opcodes now** -- the whole packed-integer half of SSE2,
+# gated on `Features::sse2` -- so the reason for preferring musl is gone in
+# principle. The fixture stays here until a glibc-linked userspace has actually
+# been run end to end on `pc64`, because "the encodings it stopped on now
+# decode" and "it boots" are different claims and only the first has been
+# measured. Whoever measures the second should swap this entry and say so.
 #
 # 1.35.0 is a released build that upstream does not rebuild, so a checksum
 # mismatch means the wrong file. Fatal. GPL-2.0, FETCH-ONLY, on exactly the
