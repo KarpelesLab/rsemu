@@ -586,3 +586,132 @@ fn listening_does_not_change_the_machine() {
     );
     assert_eq!(listened.now().as_nanos(), ignored.now().as_nanos());
 }
+
+/// The same property for a Game Boy, and a **stronger** version of it.
+///
+/// The NES comparison above installs the interception on both machines and
+/// differs only in whether anybody drains. This one differs in whether the
+/// interception is installed at all — which is the thing worth checking here,
+/// because `gb::capture::install` does something the NES's does not: it turns
+/// the chip's `record` flag on, and `machines/gameboy.machine` defaults it off.
+/// If that flag could reach architectural state, the two hashes would part.
+#[cfg(all(feature = "cpu-sm83", feature = "dev-gb"))]
+#[test]
+fn recording_a_game_boy_does_not_change_it() {
+    use crate::core::clock::GlobalTime;
+    use crate::host::audio::gb::capture;
+    use crate::machine::{BuildOptions, catalog};
+
+    /// An SM83, a ROM, work RAM and the sound chip. No timer, so the frame
+    /// sequencer never steps and the envelope holds — which is fine and in fact
+    /// convenient: the tone generator runs off the crystal either way, so the
+    /// chip makes a steady noise for as long as the comparison lasts.
+    const BOARD: &str = r#"
+    machine "gb-apu" {
+      osc master = 4194304 Hz
+      space mem { width = 16, unassigned = read-as-ones }
+      object cpu "cpu.sm83" { clock = master / 4, space = mem, post-boot = true }
+      object boot "rom" { size = 32K, image = "firmware" }
+      object wram "ram" { size = 8K }
+      object apu "gb.apu" { clock = master }
+      map mem 0x0000 size 0x8000 = boot
+      map mem 0xc000 size 0x2000 = wram
+      map mem 0xff10 size 0x0030 = apu
+    }
+    "#;
+
+    /// Switch the chip on, open both sides at full volume, and trigger channel
+    /// one on a mid-range note.
+    ///
+    /// ```text
+    ///   3e 80  e0 26   ld a,$80 ; ldh ($26),a   NR52: sound on
+    ///   3e ff  e0 25   ld a,$ff ; ldh ($25),a   NR51: every channel, both sides
+    ///   3e 77  e0 24   ld a,$77 ; ldh ($24),a   NR50: full volume, both sides
+    ///   3e 80  e0 11   ld a,$80 ; ldh ($11),a   NR11: 50% duty
+    ///   3e f0  e0 12   ld a,$f0 ; ldh ($12),a   NR12: initial volume 15
+    ///   3e 00  e0 13   ld a,$00 ; ldh ($13),a   NR13: frequency low
+    ///   3e 87  e0 14   ld a,$87 ; ldh ($14),a   NR14: trigger, frequency high
+    ///   18 fe          jr $                     and let it ring
+    /// ```
+    ///
+    /// Register names and bit layouts: Pan Docs, "Audio Registers".
+    const PROGRAM: [u8; 30] = [
+        0x3e, 0x80, 0xe0, 0x26, 0x3e, 0xff, 0xe0, 0x25, 0x3e, 0x77, 0xe0, 0x24, 0x3e, 0x80, 0xe0,
+        0x11, 0x3e, 0xf0, 0xe0, 0x12, 0x3e, 0x00, 0xe0, 0x13, 0x3e, 0x87, 0xe0, 0x14, 0x18, 0xfe,
+    ];
+
+    fn rom() -> Vec<u8> {
+        let mut image = alloc::vec![0u8; 0x8000];
+        image[0x0100..0x0100 + PROGRAM.len()].copy_from_slice(&PROGRAM);
+        image
+    }
+
+    /// Build the board, optionally with the audio interception on it.
+    fn build(
+        listening: bool,
+    ) -> (
+        crate::machine::Machine,
+        alloc::sync::Arc<crate::core::HostObjects>,
+    ) {
+        let image = rom();
+        let mut options = BuildOptions::new()
+            .with_classes(catalog::classes())
+            .with_bindings(catalog::bindings().expect("this build's bindings"));
+        options.realize.media.insert("firmware", image.as_slice());
+        if listening {
+            capture::install(&mut options).expect("the interception installs");
+        }
+        let registry = catalog::registry().expect("this build's registry");
+        let machine = crate::machine::build("gb-apu.machine", BOARD, &registry, &options)
+            .expect("a board with a sound chip on it");
+        let hosts = alloc::sync::Arc::clone(&options.realize.hosts);
+        (machine, hosts)
+    }
+
+    // A DMG frame is 70,224 dots at 4.194304 MHz — the cadence every front end
+    // in this tree runs at, and the same one the NES comparison uses in its own
+    // units. Both machines are stepped identically; that is the point.
+    let step = GlobalTime::from_nanos(16_742_706);
+    const STEPS: u32 = 20;
+
+    let (mut listened, hosts) = build(true);
+    let source = capture::take(&hosts, &listened).expect("the machine has an APU");
+    // The rate came out of the clock forest, not out of a constant.
+    assert_eq!(
+        (source.info().rate_num, source.info().rate_den),
+        (32_768, 1),
+        "4194304 / 128, resolved from the machine"
+    );
+    let mut stream = AudioStream::new(Box::new(source), 48_000, SampleFormat::S16);
+    for _ in 0..STEPS {
+        listened.run_for(step).expect("a frame");
+        stream.pull();
+    }
+
+    let (mut ignored, _) = build(false);
+    for _ in 0..STEPS {
+        ignored.run_for(step).expect("a frame");
+    }
+
+    // Twenty frames is a third of a second, which at 48 kHz is about 16,000
+    // output frames. Well under the DMG's 8,192-frame ring per pull, so nothing
+    // was dropped on the way.
+    assert!(
+        stream.produced() > 14_000,
+        "a third of a second gave {} frames",
+        stream.produced()
+    );
+    // And it is a noise rather than a silence: a triggered square at full
+    // volume leaves the mixer well away from zero.
+    let loud = (0..stream.buffer().frames())
+        .filter_map(|f| stream.buffer().sample(f, 0))
+        .any(|s| s.abs() > 1_000);
+    assert!(loud, "the chip was triggered and should be audible");
+
+    assert_eq!(
+        listened.state_hash().expect("a hash"),
+        ignored.state_hash().expect("a hash"),
+        "recording moved architectural state"
+    );
+    assert_eq!(listened.now().as_nanos(), ignored.now().as_nanos());
+}

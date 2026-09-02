@@ -58,7 +58,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use super::{AudioSource, Pole, SampleFormat, StreamInfo};
+use super::{AudioSource, Pole, SampleFormat, StreamInfo, gcd};
 use crate::core::sync::{LockRank, Mutex};
 use crate::dev::apu::Apu;
 
@@ -136,20 +136,6 @@ impl AudioSource for NesAudio {
     fn dropped(&self) -> u64 {
         self.apu.samples_dropped()
     }
-}
-
-/// Greatest common divisor, so the rate is reported in lowest terms.
-///
-/// Reducing is not cosmetic: [`resample`](super::resample) multiplies the
-/// denominator by the host rate, and an unreduced 236 250 000 / 264 would push
-/// that product 24 times further up the `u64` range for nothing.
-const fn gcd(mut a: u64, mut b: u64) -> u64 {
-    while b != 0 {
-        let t = a % b;
-        a = b;
-        b = t;
-    }
-    if a == 0 { 1 } else { a }
 }
 
 /// The interception that gets a host an `Arc<Apu>` out of a described machine.

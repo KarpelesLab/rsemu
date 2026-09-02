@@ -87,6 +87,16 @@ use alloc::vec::Vec;
 
 use crate::core::sync::{Global, LockRank};
 
+/// Whichever console's controllers a machine has, behind one host mask.
+///
+/// `host::input`'s, not this module's: [`rsemu_set_buttons`] and a VNC client
+/// press the same eight named bits, and translating them onto a console's pins
+/// is one job with one answer. It lived here first, which is why the doc
+/// comment about the Game Boy's reversed matrix and the Master System's Pause
+/// switch is over there now — with the code that does it.
+#[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+use crate::host::input::Pads;
+
 /// Length in bytes of the string [`rsemu_version_ptr`] points at.
 ///
 /// The pair is the minimal ABI for returning a string without an allocator
@@ -243,140 +253,6 @@ impl State {
             info.height,
         );
         self.scanout = Some(scanout);
-    }
-}
-
-/// Whichever console's controllers this machine has, behind one host mask.
-///
-/// [`rsemu_set_buttons`] speaks **one** button order for every machine — the
-/// eight named bits `web/src/rsemu.js` calls `BUTTONS`, which are the NES
-/// shift register's because that is the console the seam was written for. No
-/// two of these consoles agree on a bit order, and none of them is going to:
-/// the Game Boy's matrix reads its four columns out in the opposite direction
-/// and the Master System's pad has six lines and no Select at all. Translating
-/// is therefore a *host* job, exactly as turning a palette index into a colour
-/// is, and this enum is where it happens — a page presses "A" and each console
-/// receives whatever "A" is wired to on its own pins.
-///
-/// A build with no controller device at all has no variants here, which is why
-/// every use of it carries the same `any(...)` gate the field does.
-#[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
-enum Pads {
-    /// Two NES ports, in the shift register's own order — no translation.
-    #[cfg(feature = "dev-nes-io")]
-    Nes(alloc::sync::Arc<crate::dev::nes::input::Pad>),
-    /// The Game Boy's one matrix.
-    #[cfg(feature = "dev-gb")]
-    Gb(alloc::sync::Arc<crate::dev::gb::joypad::GbPad>),
-    /// Two Master System ports, plus the console's own Pause button.
-    #[cfg(feature = "dev-sms")]
-    Sms(alloc::sync::Arc<crate::dev::sms::io::SmsPads>),
-}
-
-#[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
-impl Pads {
-    /// Apply the host mask for `port`.
-    fn set(&self, port: usize, mask: u8) {
-        match self {
-            #[cfg(feature = "dev-nes-io")]
-            Pads::Nes(pad) => pad.set(port, mask),
-            // One pad, so port 1 is nobody: a Game Boy has a single matrix and
-            // pressing a second controller on it would be inventing hardware.
-            //
-            // Bit order (Pan Docs, "Joypad Input", and `dev::gb::joypad`):
-            // 0 Right, 1 Left, 2 Up, 3 Down, 4 A, 5 B, 6 Select, 7 Start.
-            #[cfg(feature = "dev-gb")]
-            Pads::Gb(pad) => {
-                if port != 0 {
-                    return;
-                }
-                let mut out = 0u8;
-                for (from, to) in [
-                    (0x01, 0), // Right
-                    (0x02, 1), // Left
-                    (0x08, 2), // Up
-                    (0x04, 3), // Down
-                    (0x80, 4), // A
-                    (0x40, 5), // B
-                    (0x20, 6), // Select
-                    (0x10, 7), // Start
-                ] {
-                    if mask & from != 0 {
-                        out |= 1 << to;
-                    }
-                }
-                pad.set_buttons(out);
-            }
-            // Six lines a pad (`dev::sms::io::Button`): 0 Up, 1 Down, 2 Left,
-            // 3 Right, 4 button 1, 5 button 2. A and B become the two buttons
-            // the console actually has.
-            //
-            // **Start is the Pause button**, which is not on the pad at all —
-            // it is a switch on the console driving `/NMI`. Holding it is
-            // correct rather than approximate: the pin latches the rising edge,
-            // so one press is one interrupt however long a thumb rests on it.
-            // Select has nowhere to go, and inventing a seventh line for it
-            // would be worse than dropping it.
-            #[cfg(feature = "dev-sms")]
-            Pads::Sms(pads) => {
-                let mut out = 0u8;
-                for (from, to) in [
-                    (0x08, 0), // Up
-                    (0x04, 1), // Down
-                    (0x02, 2), // Left
-                    (0x01, 3), // Right
-                    (0x80, 4), // button 1
-                    (0x40, 5), // button 2
-                ] {
-                    if mask & from != 0 {
-                        out |= 1 << to;
-                    }
-                }
-                pads.set_buttons(port, out);
-                if port == 0 {
-                    pads.set_pause(mask & 0x10 != 0);
-                }
-            }
-        }
-    }
-
-    /// Whatever this build's machine opened, found by name in `hosts`.
-    ///
-    /// The same name-based seam the console uses, and the *only* input door:
-    /// each family's `pads` module is what a recorder registers as a channel,
-    /// so a button pressed here is a button a replay reproduces.
-    fn take(hosts: &crate::core::hosts::HostObjects) -> Option<Pads> {
-        #[cfg(feature = "dev-nes-io")]
-        {
-            use crate::dev::nes::input::pads;
-            if let Some(pad) = pads::names(hosts)
-                .first()
-                .and_then(|n| pads::get(hosts, n).ok().flatten())
-            {
-                return Some(Pads::Nes(pad));
-            }
-        }
-        #[cfg(feature = "dev-gb")]
-        {
-            use crate::dev::gb::joypad::pads;
-            if let Some(pad) = pads::names(hosts)
-                .first()
-                .and_then(|n| pads::get(hosts, n).ok().flatten())
-            {
-                return Some(Pads::Gb(pad));
-            }
-        }
-        #[cfg(feature = "dev-sms")]
-        {
-            use crate::dev::sms::io::pads;
-            if let Some(pad) = pads::names(hosts)
-                .first()
-                .and_then(|n| pads::get(hosts, n).ok().flatten())
-            {
-                return Some(Pads::Sms(pad));
-            }
-        }
-        None
     }
 }
 
@@ -712,6 +588,18 @@ fn boot_with(index: u32, media: Media) -> u32 {
         ) {
             return fail(state, e);
         }
+        // The two console chips have a fixed ring instead of a sized one — a
+        // quarter of a second on a Game Boy, a third on a Master System — so
+        // there is nothing to size and the interception's one effect is to turn
+        // recording on. A frame is sixty times inside the shallower of those.
+        #[cfg(feature = "dev-gb")]
+        if let Err(e) = crate::host::audio::gb::capture::install(&mut options) {
+            return fail(state, e);
+        }
+        #[cfg(feature = "dev-sms")]
+        if let Err(e) = crate::host::audio::sms::capture::install(&mut options) {
+            return fail(state, e);
+        }
 
         let machine = match crate::machine::build(entry.name, entry.source, &registry, &options) {
             Ok(m) => m,
@@ -751,6 +639,30 @@ fn boot_with(index: u32, media: Media) -> u32 {
         // converts.
         #[cfg(feature = "dev-nes-apu")]
         if let Some(source) = crate::host::audio::nes::capture::take(&hosts) {
+            state.audio = Some(crate::host::audio::AudioStream::new(
+                alloc::boxed::Box::new(source),
+                state.audio_rate,
+                crate::host::audio::SampleFormat::F32,
+            ));
+        }
+        // Both of these are taken *after* the build and with the machine in
+        // hand, because neither chip knows its own sample rate: it is its clock
+        // domain's frequency over a constant, and a Master System's is not even
+        // the same between regions.
+        #[cfg(feature = "dev-gb")]
+        if state.audio.is_none()
+            && let Some(source) = crate::host::audio::gb::capture::take(&hosts, &machine)
+        {
+            state.audio = Some(crate::host::audio::AudioStream::new(
+                alloc::boxed::Box::new(source),
+                state.audio_rate,
+                crate::host::audio::SampleFormat::F32,
+            ));
+        }
+        #[cfg(feature = "dev-sms")]
+        if state.audio.is_none()
+            && let Some(source) = crate::host::audio::sms::capture::take(&hosts, &machine)
+        {
             state.audio = Some(crate::host::audio::AudioStream::new(
                 alloc::boxed::Box::new(source),
                 state.audio_rate,

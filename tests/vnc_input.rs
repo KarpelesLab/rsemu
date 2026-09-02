@@ -36,7 +36,12 @@ use rsemu::host::input::{self, Feed, InputEvent, Keysym};
 // A build with `vnc` but no keyboard and no pad still runs the payload tests
 // below, and must not carry imports for the guests it does not have — the
 // feature sweep builds exactly that combination with warnings denied.
-#[cfg(any(all(feature = "cpu-x86", feature = "dev-pc"), feature = "dev-nes-io"))]
+#[cfg(any(
+    all(feature = "cpu-x86", feature = "dev-pc"),
+    feature = "dev-nes-io",
+    all(feature = "cpu-sm83", feature = "dev-gb"),
+    all(feature = "cpu-z80", feature = "dev-sms")
+))]
 use rsemu::host::input::InputSink;
 use std::sync::Arc;
 
@@ -234,7 +239,7 @@ fn a_key_held_in_a_client_holds_a_button_on_a_controller() {
     use rsemu::core::space::MemAttrs;
     use rsemu::core::value::Width;
     use rsemu::dev::nes::input::{Pad, buttons, pads};
-    use rsemu::host::input::PadSink;
+    use rsemu::host::input::{PadSink, Pads};
     use std::sync::Arc;
 
     let options = rsemu::machine::BuildOptions::new()
@@ -245,7 +250,7 @@ fn a_key_held_in_a_client_holds_a_button_on_a_controller() {
         .expect("a board with two controller ports");
     let pad: Arc<Pad> =
         pads::open(&options.realize.hosts, "nes-pads").expect("the ports opened their pad seam");
-    let sink = PadSink::new(Arc::clone(&pad), 0);
+    let sink = PadSink::new(Pads::Nes(Arc::clone(&pad)), 0);
 
     // What a VNC client sends when someone holds the right arrow and X.
     sink.deliver(InputEvent::Key {
@@ -285,6 +290,247 @@ fn a_key_held_in_a_client_holds_a_button_on_a_controller() {
         down: false,
     });
     assert_eq!(pad.get(0), buttons::A);
+}
+
+// ---------------------------------------------------------------------------
+// the other two consoles
+// ---------------------------------------------------------------------------
+
+/// Advance `machine` a slice at a time until the guest's sentinel reads `want`,
+/// and return whatever it says at the end.
+///
+/// A bounded loop rather than one slice, for the same reason the 8086 above gets
+/// sixty-four turns: the press lands at the next scheduling-round boundary and
+/// the guest reaches its next poll a few instructions after that, so "one slice"
+/// would be asserting a coincidence about the quantum rather than about input.
+#[cfg(any(
+    all(feature = "cpu-sm83", feature = "dev-gb"),
+    all(feature = "cpu-z80", feature = "dev-sms")
+))]
+fn poll_until(
+    machine: &mut rsemu::machine::Machine,
+    step: GlobalTime,
+    peek: &dyn Fn(&rsemu::machine::Machine) -> u8,
+    want: u8,
+) -> u8 {
+    for _ in 0..64 {
+        let deadline = machine.now().saturating_add(step);
+        machine.run_until(deadline).expect("the guest runs");
+        if peek(machine) == want {
+            break;
+        }
+    }
+    peek(machine)
+}
+
+/// The defect these two tests exist for.
+///
+/// A Game Boy and a Master System file their controller port under the *same*
+/// host kind a NES does — `pad` — so the frontend loop that listed that kind
+/// and then asked for a NES-typed pad got their names and failed the downcast
+/// in silence. A picture, and no buttons. So what is exercised here is
+/// [`PadSink::open`], which is the discovery that replaced it: the sink is
+/// found the way `rsemu --vnc` finds it, and nothing in the test names a
+/// concrete pad type.
+///
+/// And what asserts it worked is the **guest**, polling its own port in a loop,
+/// exactly as the 8086 above executes `IN AL, 60h`. A pad the host can read
+/// back is not evidence; a guest instruction that saw the press is.
+#[cfg(all(feature = "cpu-sm83", feature = "dev-gb"))]
+const GB_PAD: &str = r#"
+machine "gb-pad" {
+  osc master = 4194304 Hz
+  space cpubus { width = 16, unassigned = read-as-ones }
+  object cpu "cpu.sm83" { clock = master / 4, space = cpubus, post-boot = true }
+  object cart "rom" { size = 32K, image = "cart" }
+  object wram "ram" { size = 8K }
+  object pad "gb.joypad" { pad = "gb-joypad" }
+  map cpubus 0x0000 size 32K     = cart
+  map cpubus 0xc000 size 8K      = wram
+  map cpubus 0xff00 size 0x0001  = pad
+}
+"#;
+
+/// The guest program, at `$0100` — where an SM83 with `post-boot = true` starts.
+///
+/// ```text
+///   3E 10        ld   a, $10      ; P14 high, P15 low: select the action row
+///   E0 00        ldh  ($00), a    ; $FF00
+///   F0 00        ldh  a, ($00)    ; and read it straight back
+///   E6 0F        and  $0f         ; the four button lines, active low
+///   EA 00 C0     ld   ($C000), a  ; where the test looks
+///   18 F3        jr   -13         ; round again, forever
+/// ```
+///
+/// A loop rather than a one-shot: a pad is a *level*, so the interesting claim
+/// is that the guest's next poll sees the press — which means it has to keep
+/// polling. Pan Docs, "Joypad Input", for the register.
+#[cfg(all(feature = "cpu-sm83", feature = "dev-gb"))]
+const GB_PROGRAM: [u8; 13] = [
+    0x3e, 0x10, 0xe0, 0x00, 0xf0, 0x00, 0xe6, 0x0f, 0xea, 0x00, 0xc0, 0x18, 0xf3,
+];
+
+/// The board, and the host-object table it was built against.
+///
+/// The table is what a frontend is handed after the build; every pad in this
+/// file is found in it by kind and name, never by reaching into the machine.
+#[cfg(all(feature = "cpu-sm83", feature = "dev-gb"))]
+fn a_game_boy() -> (
+    rsemu::machine::Machine,
+    std::sync::Arc<rsemu::core::hosts::HostObjects>,
+) {
+    let mut cart = vec![0xffu8; 0x8000];
+    cart[0x0100..0x0100 + GB_PROGRAM.len()].copy_from_slice(&GB_PROGRAM);
+
+    let mut options = rsemu::machine::BuildOptions::new()
+        .with_classes(rsemu::machine::catalog::classes())
+        .with_bindings(rsemu::machine::catalog::bindings().expect("this build's bindings"));
+    options.realize.media.insert("cart", cart.as_slice());
+    let registry = rsemu::machine::catalog::registry().expect("this build's registry");
+    let machine = rsemu::machine::build("gb-pad.machine", GB_PAD, &registry, &options)
+        .expect("a board with a joypad on it");
+    let hosts = Arc::clone(&options.realize.hosts);
+    (machine, hosts)
+}
+
+/// The low nibble of `$FF00` as the guest last stored it.
+#[cfg(all(feature = "cpu-sm83", feature = "dev-gb"))]
+fn gb_peek(machine: &rsemu::machine::Machine) -> u8 {
+    use rsemu::core::space::MemAttrs;
+    use rsemu::core::value::Width;
+    machine
+        .space("cpubus")
+        .expect("the CPU bus")
+        .read(0xc000, Width::U8, MemAttrs::DEBUG)
+        .expect("a mapped byte") as u8
+}
+
+#[cfg(all(feature = "cpu-sm83", feature = "dev-gb"))]
+#[test]
+fn a_key_held_in_a_client_is_polled_by_a_game_boy() {
+    use rsemu::host::input::PadSink;
+
+    let (mut machine, hosts) = a_game_boy();
+
+    // Exactly what `rsemu --vnc` does, and the whole point: no console-specific
+    // type is named here.
+    let sink = PadSink::open(&hosts, 0).expect("the joypad opened its pad port");
+
+    let peek = gb_peek;
+    let step = GlobalTime::from_nanos(1_000_000);
+    machine.run_until(step).expect("the guest starts");
+    assert_eq!(peek(&machine), 0x0f, "four lines high: nobody is pressing");
+
+    // What a VNC client sends when someone holds X — the A button, by the host
+    // layout every emulator has used since the 1990s.
+    sink.deliver(InputEvent::Key {
+        keysym: Keysym::from_ascii(b'x'),
+        down: true,
+    });
+    assert_eq!(
+        poll_until(&mut machine, step, &peek, 0x0e),
+        0x0e,
+        "the guest's own read of $FF00 pulled A low"
+    );
+
+    // Level, not edge: releasing is visible at the guest's next poll and
+    // nowhere else.
+    sink.deliver(InputEvent::Key {
+        keysym: Keysym::from_ascii(b'x'),
+        down: false,
+    });
+    assert_eq!(poll_until(&mut machine, step, &peek, 0x0f), 0x0f);
+}
+
+/// The Master System's controller ports, on the Z80's separate I/O space.
+#[cfg(all(feature = "cpu-z80", feature = "dev-sms"))]
+const SMS_PAD: &str = r#"
+machine "sms-pad" {
+  osc master = 10738635 Hz
+  space mem  { width = 16, unassigned = open-bus }
+  space port { width = 16, unassigned = open-bus }
+  object cpu "cpu.z80" { clock = master / 3, space = mem, iospace = "port" }
+  object cart "rom" { size = 16K, image = "cart" }
+  object wram "ram" { size = 8K }
+  object io "sms.io" { region = "export", pads = "sms-pads" }
+  map mem  0x0000 size 16K     = cart
+  map mem  0xc000 size 8K      = wram
+  map port 0x00dc size 0x0002  = io.pads
+}
+"#;
+
+/// The guest program, at the Z80's reset vector.
+///
+/// ```text
+///   01 DC 00     ld   bc, $00DC   ; B is A8-A15 on an `IN r,(C)`
+///   ED 78        in   a, (c)      ; so the port address is exactly $00DC
+///   32 00 C0     ld   ($C000), a
+///   18 F6        jr   -10         ; round again, forever
+/// ```
+///
+/// `IN A,(n)` would have put the accumulator on the high address byte, which is
+/// why the real console mirrors its ports across all 256 pages; `IN r,(C)` lets
+/// this board map two bytes and mean it.
+#[cfg(all(feature = "cpu-z80", feature = "dev-sms"))]
+const SMS_PROGRAM: [u8; 10] = [0x01, 0xdc, 0x00, 0xed, 0x78, 0x32, 0x00, 0xc0, 0x18, 0xf6];
+
+#[cfg(all(feature = "cpu-z80", feature = "dev-sms"))]
+#[test]
+fn a_key_held_in_a_client_is_polled_by_a_master_system() {
+    use rsemu::core::space::MemAttrs;
+    use rsemu::core::value::Width;
+    use rsemu::host::input::PadSink;
+
+    let mut cart = vec![0xffu8; 0x4000];
+    cart[..SMS_PROGRAM.len()].copy_from_slice(&SMS_PROGRAM);
+
+    let mut options = rsemu::machine::BuildOptions::new()
+        .with_classes(rsemu::machine::catalog::classes())
+        .with_bindings(rsemu::machine::catalog::bindings().expect("this build's bindings"));
+    options.realize.media.insert("cart", cart.as_slice());
+    let registry = rsemu::machine::catalog::registry().expect("this build's registry");
+    let mut machine = rsemu::machine::build("sms-pad.machine", SMS_PAD, &registry, &options)
+        .expect("a board with two controller ports");
+
+    let sink = PadSink::open(&options.realize.hosts, 0).expect("the I/O chip opened its pad port");
+
+    let peek = |m: &rsemu::machine::Machine| {
+        m.space("mem")
+            .expect("the memory space")
+            .read(0xc000, Width::U8, MemAttrs::DEBUG)
+            .expect("a mapped byte") as u8
+    };
+
+    let step = GlobalTime::from_nanos(1_000_000);
+    machine.run_until(step).expect("the guest starts");
+    assert_eq!(
+        peek(&machine),
+        0xff,
+        "every line pulled up: nobody is pressing"
+    );
+
+    sink.deliver(InputEvent::Key {
+        keysym: Keysym::from_ascii(b'x'),
+        down: true,
+    });
+    assert_eq!(
+        poll_until(&mut machine, step, &peek, 0xef),
+        0xef,
+        "the guest's own IN A,(C) saw TL low — the console's button 1"
+    );
+
+    // Start is not on this pad at all: it is the Pause switch on the console,
+    // driving /NMI. So it must not appear at $DC — and the button that is held
+    // must still be the only line down.
+    sink.deliver(InputEvent::Key {
+        keysym: Keysym::RETURN,
+        down: true,
+    });
+    assert_eq!(
+        poll_until(&mut machine, step, &peek, 0xef),
+        0xef,
+        "and nothing else moved"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -422,6 +668,115 @@ mod determinism {
             0x1c,
             "and the guest executed on the replayed bytes"
         );
+        assert_eq!(replay.cursor(), 3, "every recorded payload was delivered");
+    }
+}
+
+/// The same two claims, for a console's pad rather than a PC's keyboard.
+///
+/// `tests/joypad_replay.rs` already proves a Game Boy replays bit for bit
+/// through **its own** channel, `pad:gb-joypad`. This is the other door: a VNC
+/// client's keysyms on `input:vnc`, translated to the console's matrix by
+/// [`PadSink`](rsemu::host::input::PadSink) at delivery time. A translation that
+/// happened at *post* time instead would record the wrong thing and replay
+/// differently, and this is what would notice.
+#[cfg(all(feature = "cpu-sm83", feature = "dev-gb"))]
+mod console_determinism {
+    use super::*;
+    use rsemu::core::record::Recorder;
+    use rsemu::host::input::PadSink;
+
+    /// A millisecond a turn, twenty-four turns — the same cadence the PC above
+    /// is driven at.
+    const SLICE: GlobalTime = GlobalTime::from_nanos(1_000_000);
+
+    /// A Game Boy whose joypad is the far end of the `input:vnc` channel.
+    fn a_recorded_game_boy(recorder: &Arc<Recorder>) -> rsemu::machine::Machine {
+        let (mut machine, hosts) = a_game_boy();
+        let feed = Arc::new(Feed::new());
+        feed.attach(Arc::new(
+            PadSink::open(&hosts, 0).expect("the joypad opened its pad port"),
+        ));
+        recorder
+            .register(input::channel(input::DEFAULT_STREAM), input::sink(&feed))
+            .expect("a fresh recorder takes channels");
+        machine
+            .set_recorder(Arc::clone(recorder))
+            .expect("a deterministic machine records");
+        machine
+    }
+
+    /// What a client sent, as `(turn, keysym, down)`.
+    const SCRIPT: [(u32, Keysym, bool); 4] = [
+        (3, Keysym::from_ascii(b'x'), true),
+        (5, Keysym::LEFT, true),
+        (9, Keysym::from_ascii(b'x'), false),
+        (9, Keysym::from_ascii(b'z'), true),
+    ];
+
+    fn drive(machine: &mut rsemu::machine::Machine, recorder: &Recorder, pressing: bool) -> u64 {
+        let channel = input::channel(input::DEFAULT_STREAM);
+        for turn in 0..24u32 {
+            if pressing {
+                let mut payload = Vec::new();
+                for (at, keysym, down) in &SCRIPT {
+                    if *at == turn {
+                        payload.extend_from_slice(
+                            &InputEvent::Key {
+                                keysym: *keysym,
+                                down: *down,
+                            }
+                            .encode(),
+                        );
+                    }
+                }
+                if !payload.is_empty() {
+                    recorder
+                        .post(&channel, &payload)
+                        .expect("a registered channel");
+                }
+            }
+            let deadline = machine.now().saturating_add(SLICE);
+            machine.run_until(deadline).expect("the guest runs");
+        }
+        machine.state_hash().expect("a hash of a deterministic run")
+    }
+
+    #[test]
+    fn pressing_a_button_changes_where_a_game_boy_ends_up() {
+        let quiet_recorder = Arc::new(Recorder::recording());
+        let mut quiet = a_recorded_game_boy(&quiet_recorder);
+        let silent = drive(&mut quiet, &quiet_recorder, false);
+        assert_eq!(gb_peek(&quiet), 0x0f, "nobody pressed anything");
+
+        let recorder = Arc::new(Recorder::recording());
+        let mut machine = a_recorded_game_boy(&recorder);
+        let pressed = drive(&mut machine, &recorder, true);
+        // A and Left were pressed, A released, B pressed. The action row is the
+        // one selected, so what the guest last stored is B down and A up.
+        assert_eq!(gb_peek(&machine), 0x0d, "the guest polled B down");
+        assert_ne!(silent, pressed);
+    }
+
+    #[test]
+    fn a_recorded_console_session_replays_to_an_identical_state_hash() {
+        let recorder = Arc::new(Recorder::recording());
+        let mut machine = a_recorded_game_boy(&recorder);
+        let recorded = drive(&mut machine, &recorder, true);
+        let recorded_at = machine.now();
+
+        let bytes = recorder.log().encode().expect("a recording encodes");
+        let log = InputLog::decode(&bytes).expect("our own bytes");
+        assert_eq!(log.len(), 3, "two of the four events shared a turn");
+        assert_eq!(log.events()[0].channel.to_string(), "input:vnc");
+
+        let replay = Arc::new(Recorder::replaying(log));
+        let mut replayed = a_recorded_game_boy(&replay);
+        let hash = drive(&mut replayed, &replay, false);
+
+        assert_eq!(replayed.now(), recorded_at, "the same instant");
+        assert_eq!(hash, recorded, "the same machine, bit for bit");
+        assert_eq!(gb_peek(&replayed), 0x0d, "and the guest polled the replay");
         assert_eq!(replay.cursor(), 3, "every recorded payload was delivered");
     }
 }

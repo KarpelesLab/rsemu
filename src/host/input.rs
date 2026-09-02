@@ -738,20 +738,51 @@ impl InputSink for KeyboardSink {
 }
 
 // ---------------------------------------------------------------------------
-// the NES pad
+// the game pad
 // ---------------------------------------------------------------------------
 
-/// Which NES button a keysym is, for [`PadSink`].
+/// The eight buttons the host seam speaks, whichever console is listening.
+///
+/// One vocabulary for every machine, and it is the NES shift register's — A
+/// first out at bit 7, right last at bit 0 — because that is the console the
+/// seam was written for and `web/src/rsemu.js`'s `BUTTONS` already publishes it
+/// to a page under those names. No two of these consoles agree on a bit order
+/// and none of them is going to, so *some* order has to be the currency and the
+/// rest translate ([`Pads::set`]).
+///
+/// Deliberately not `dev::nes::input::buttons` re-exported: this is a host
+/// convention and has to exist in a build with no NES in it at all. A test
+/// below asserts the two agree bit for bit wherever both exist, which is the
+/// only relationship between them that matters.
+pub mod buttons {
+    /// The A button — the first bit out of a NES shift register.
+    pub const A: u8 = 0x80;
+    /// The B button.
+    pub const B: u8 = 0x40;
+    /// Select.
+    pub const SELECT: u8 = 0x20;
+    /// Start.
+    pub const START: u8 = 0x10;
+    /// D-pad up.
+    pub const UP: u8 = 0x08;
+    /// D-pad down.
+    pub const DOWN: u8 = 0x04;
+    /// D-pad left.
+    pub const LEFT: u8 = 0x02;
+    /// D-pad right — the last bit out.
+    pub const RIGHT: u8 = 0x01;
+    /// Nothing held.
+    pub const NONE: u8 = 0x00;
+}
+
+/// Which host button a keysym is, for [`PadSink`].
 ///
 /// The arrow keys, `Z` and `X` for B and A, Return for Start and either Shift
-/// for Select — the layout every NES emulator has used since the 1990s, which
-/// makes it the one a person will try first. It is a *host* convention rather
-/// than a hardware fact, which is why it lives here and not in `dev/nes`.
-#[cfg(feature = "dev-nes-io")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-io")))]
+/// for Select — the layout every console emulator has used since the 1990s,
+/// which makes it the one a person will try first. It is a *host* convention
+/// rather than a hardware fact, which is why it lives here and not in `dev/`.
 #[must_use]
-pub const fn nes_button(keysym: Keysym) -> Option<u8> {
-    use crate::dev::nes::input::buttons;
+pub const fn button(keysym: Keysym) -> Option<u8> {
     match keysym.0 {
         0xff52 => Some(buttons::UP),
         0xff54 => Some(buttons::DOWN),
@@ -765,41 +796,203 @@ pub const fn nes_button(keysym: Keysym) -> Option<u8> {
     }
 }
 
-/// An [`InputSink`] that holds buttons down on a NES controller.
+/// Whichever console's controllers this machine has, behind one host mask.
 ///
-/// Level rather than edge: the pad is a shift register the console samples, so
-/// what the sink keeps is the held mask, and the guest reads whatever is set
-/// when it strobes.
-#[cfg(feature = "dev-nes-io")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dev-nes-io")))]
+/// Translating [`buttons`] onto a console's own pins is a *host* job, exactly
+/// as turning a palette index into a colour is: a person presses "A" and each
+/// console receives whatever "A" is wired to. This enum is where that happens,
+/// and it is the translation `wasm::rsemu_set_buttons` performs — the same code
+/// now, rather than a second copy of it that could drift.
+///
+/// A build with no controller device at all has no variants here, which is why
+/// every use of it carries the same `any(...)` gate.
+#[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms")))
+)]
+#[derive(Debug, Clone)]
+pub enum Pads {
+    /// Two NES ports, in the shift register's own order — no translation.
+    #[cfg(feature = "dev-nes-io")]
+    Nes(Arc<crate::dev::nes::input::Pad>),
+    /// The Game Boy's one matrix.
+    #[cfg(feature = "dev-gb")]
+    Gb(Arc<crate::dev::gb::joypad::GbPad>),
+    /// Two Master System ports, plus the console's own Pause button.
+    #[cfg(feature = "dev-sms")]
+    Sms(Arc<crate::dev::sms::io::SmsPads>),
+}
+
+#[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+impl Pads {
+    /// Apply the host mask for controller `port`.
+    pub fn set(&self, port: usize, mask: u8) {
+        match self {
+            #[cfg(feature = "dev-nes-io")]
+            Pads::Nes(pad) => pad.set(port, mask),
+            // One pad, so port 1 is nobody: a Game Boy has a single matrix and
+            // pressing a second controller on it would be inventing hardware.
+            //
+            // Bit order (Pan Docs, "Joypad Input", and `dev::gb::joypad`):
+            // 0 Right, 1 Left, 2 Up, 3 Down, 4 A, 5 B, 6 Select, 7 Start.
+            #[cfg(feature = "dev-gb")]
+            Pads::Gb(pad) => {
+                if port != 0 {
+                    return;
+                }
+                let mut out = 0u8;
+                for (from, to) in [
+                    (buttons::RIGHT, 0),
+                    (buttons::LEFT, 1),
+                    (buttons::UP, 2),
+                    (buttons::DOWN, 3),
+                    (buttons::A, 4),
+                    (buttons::B, 5),
+                    (buttons::SELECT, 6),
+                    (buttons::START, 7),
+                ] {
+                    if mask & from != 0 {
+                        out |= 1 << to;
+                    }
+                }
+                pad.set_buttons(out);
+            }
+            // Six lines a pad (`dev::sms::io::Button`): 0 Up, 1 Down, 2 Left,
+            // 3 Right, 4 button 1, 5 button 2. A and B become the two buttons
+            // the console actually has.
+            //
+            // **Start is the Pause button**, which is not on the pad at all —
+            // it is a switch on the console driving `/NMI`. Holding it is
+            // correct rather than approximate: the pin latches the rising edge,
+            // so one press is one interrupt however long a thumb rests on it.
+            // Select has nowhere to go, and inventing a seventh line for it
+            // would be worse than dropping it.
+            #[cfg(feature = "dev-sms")]
+            Pads::Sms(pads) => {
+                let mut out = 0u8;
+                for (from, to) in [
+                    (buttons::UP, 0),
+                    (buttons::DOWN, 1),
+                    (buttons::LEFT, 2),
+                    (buttons::RIGHT, 3),
+                    (buttons::A, 4),
+                    (buttons::B, 5),
+                ] {
+                    if mask & from != 0 {
+                        out |= 1 << to;
+                    }
+                }
+                pads.set_buttons(port, out);
+                if port == 0 {
+                    pads.set_pause(mask & buttons::START != 0);
+                }
+            }
+        }
+    }
+
+    /// Whatever this build's machine opened, found by name in `hosts`.
+    ///
+    /// The same name-based seam each console uses, and the **only** input door:
+    /// each family's `pads` module is what a recorder registers as a channel, so
+    /// a button pressed through this is a button a replay reproduces.
+    ///
+    /// All three families file their port under the same
+    /// [`HostKind`] — `pad`. So listing that kind
+    /// and hoping a NES-typed `get` succeeds is exactly the defect this
+    /// function exists to remove — the downcast fails for a Game Boy, quietly,
+    /// and the guest never sees a button. Each family is asked for *its own*
+    /// type instead, and the first that answers wins: no machine has two
+    /// consoles' controllers on it.
+    #[must_use]
+    pub fn take(hosts: &crate::core::hosts::HostObjects) -> Option<Pads> {
+        #[cfg(feature = "dev-nes-io")]
+        {
+            use crate::dev::nes::input::pads;
+            if let Some(pad) = pads::names(hosts)
+                .iter()
+                .find_map(|n| pads::get(hosts, n).ok().flatten())
+            {
+                return Some(Pads::Nes(pad));
+            }
+        }
+        #[cfg(feature = "dev-gb")]
+        {
+            use crate::dev::gb::joypad::pads;
+            if let Some(pad) = pads::names(hosts)
+                .iter()
+                .find_map(|n| pads::get(hosts, n).ok().flatten())
+            {
+                return Some(Pads::Gb(pad));
+            }
+        }
+        #[cfg(feature = "dev-sms")]
+        {
+            use crate::dev::sms::io::pads;
+            if let Some(pads) = pads::names(hosts)
+                .iter()
+                .find_map(|n| pads::get(hosts, n).ok().flatten())
+            {
+                return Some(Pads::Sms(pads));
+            }
+        }
+        None
+    }
+}
+
+/// An [`InputSink`] that holds buttons down on a console's controller.
+///
+/// Level rather than edge: a pad is a latch the console samples, so what the
+/// sink keeps is the held mask, and the guest reads whatever is set when it
+/// strobes.
+#[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms")))
+)]
 #[derive(Debug)]
 pub struct PadSink {
-    pad: Arc<crate::dev::nes::input::Pad>,
+    pads: Pads,
     port: usize,
     held: core::sync::atomic::AtomicU8,
 }
 
-#[cfg(feature = "dev-nes-io")]
+#[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
 impl PadSink {
-    /// Drive controller `port` (0 or 1) of `pad`.
+    /// Drive controller `port` of `pads`.
     #[must_use]
-    pub fn new(pad: Arc<crate::dev::nes::input::Pad>, port: usize) -> PadSink {
+    pub fn new(pads: Pads, port: usize) -> PadSink {
         PadSink {
-            pad,
+            pads,
             port,
-            held: core::sync::atomic::AtomicU8::new(0),
+            held: core::sync::atomic::AtomicU8::new(buttons::NONE),
         }
+    }
+
+    /// Drive controller `port` of whatever this build's machine opened.
+    ///
+    /// `None` for a machine with no controllers — a serial console, a bare
+    /// display panel — which is not an error and must not be reported as one.
+    #[must_use]
+    pub fn open(hosts: &crate::core::hosts::HostObjects, port: usize) -> Option<PadSink> {
+        Pads::take(hosts).map(|pads| PadSink::new(pads, port))
+    }
+
+    /// Which buttons this sink is holding.
+    #[must_use]
+    pub fn held(&self) -> u8 {
+        self.held.load(core::sync::atomic::Ordering::Relaxed)
     }
 }
 
-#[cfg(feature = "dev-nes-io")]
+#[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
 impl InputSink for PadSink {
     fn deliver(&self, event: InputEvent) {
         use core::sync::atomic::Ordering;
         let InputEvent::Key { keysym, down } = event else {
             return;
         };
-        let Some(bit) = nes_button(keysym) else {
+        let Some(bit) = button(keysym) else {
             return;
         };
         let previous = self.held.load(Ordering::Relaxed);
@@ -809,7 +1002,7 @@ impl InputSink for PadSink {
             previous & !bit
         };
         self.held.store(next, Ordering::Relaxed);
-        self.pad.set(self.port, next);
+        self.pads.set(self.port, next);
     }
 }
 
@@ -1044,12 +1237,46 @@ mod tests {
         assert_eq!(port.pending_input(), 0);
     }
 
+    /// The host vocabulary and the NES's are the same eight bits, and the NES
+    /// arm of [`Pads::set`] passes a mask through untranslated on the strength
+    /// of it. If they ever disagree, that arm becomes silently wrong — so this
+    /// is the assertion that keeps the shortcut honest.
+    #[cfg(feature = "dev-nes-io")]
+    #[test]
+    fn the_host_button_order_is_the_nes_shift_registers() {
+        use crate::dev::nes::input::buttons as nes;
+        assert_eq!(
+            [
+                buttons::A,
+                buttons::B,
+                buttons::SELECT,
+                buttons::START,
+                buttons::UP,
+                buttons::DOWN,
+                buttons::LEFT,
+                buttons::RIGHT,
+                buttons::NONE
+            ],
+            [
+                nes::A,
+                nes::B,
+                nes::SELECT,
+                nes::START,
+                nes::UP,
+                nes::DOWN,
+                nes::LEFT,
+                nes::RIGHT,
+                nes::NONE
+            ]
+        );
+    }
+
     #[cfg(feature = "dev-nes-io")]
     #[test]
     fn a_pad_holds_what_is_pressed_and_releases_what_is_not() {
         use crate::dev::nes::input::{Pad, buttons};
         let pad = Arc::new(Pad::new());
-        let sink = PadSink::new(pad.clone(), 0);
+        let sink = PadSink::new(Pads::Nes(pad.clone()), 0);
         sink.deliver(InputEvent::Key {
             keysym: Keysym::from_ascii(b'x'),
             down: true,
@@ -1067,12 +1294,89 @@ mod tests {
         assert_eq!(pad.get(1), buttons::NONE, "the other port is untouched");
     }
 
+    /// The Game Boy's matrix reads its columns out in the opposite direction to
+    /// the NES's shift register, so a mask handed straight through would put
+    /// A on Right. Pan Docs, "Joypad Input".
+    #[cfg(feature = "dev-gb")]
+    #[test]
+    fn a_game_boy_gets_its_own_bit_order() {
+        use crate::dev::gb::joypad::{Button, GbPad};
+        let pad = Arc::new(GbPad::new());
+        let sink = PadSink::new(Pads::Gb(pad.clone()), 0);
+        sink.deliver(InputEvent::Key {
+            keysym: Keysym::from_ascii(b'x'),
+            down: true,
+        });
+        sink.deliver(InputEvent::Key {
+            keysym: Keysym::LEFT,
+            down: true,
+        });
+        assert_eq!(
+            pad.buttons(),
+            (1 << Button::A.bit()) | (1 << Button::Left.bit())
+        );
+        // The Game Boy has one pad. Pressing a second controller on it would be
+        // inventing hardware, so port 1 changes nothing.
+        let second = PadSink::new(Pads::Gb(pad.clone()), 1);
+        second.deliver(InputEvent::Key {
+            keysym: Keysym::UP,
+            down: true,
+        });
+        assert_eq!(
+            pad.buttons(),
+            (1 << Button::A.bit()) | (1 << Button::Left.bit())
+        );
+    }
+
+    /// The Master System's pad has six lines and no Select, and its Start is the
+    /// console's own Pause switch on `/NMI` rather than a line on the pad.
+    #[cfg(feature = "dev-sms")]
+    #[test]
+    fn a_master_system_start_is_the_consoles_pause_switch() {
+        use crate::core::wire::{Level, Wire, WireId, WireSource};
+        use crate::dev::sms::io::{Button, Nationalisation, SmsIo, SmsPads};
+
+        let pads = Arc::new(SmsPads::new(Nationalisation::Export));
+        // The Pause pin has no getter on the pad port, so the only way to see it
+        // is to be the thing it drives — which is what the console's `/NMI` net
+        // is, and the chip is what connects to it.
+        let chip = SmsIo::with_pads(Arc::clone(&pads));
+        let nmi = WireId::new(1);
+        let pause = WireSource::new(Arc::new(Wire::builder().source(nmi).build()), nmi);
+        chip.attach_pause(pause.clone());
+        assert_eq!(pause.level(), Level::Low, "nothing held out of reset");
+
+        let sink = PadSink::new(Pads::Sms(pads.clone()), 0);
+        sink.deliver(InputEvent::Key {
+            keysym: Keysym::from_ascii(b'x'),
+            down: true,
+        });
+        assert_eq!(pads.buttons(0), 1 << Button::One.bit());
+        // Select has nowhere to go on this console and is dropped rather than
+        // invented onto a seventh line.
+        sink.deliver(InputEvent::Key {
+            keysym: Keysym::SHIFT_L,
+            down: true,
+        });
+        assert_eq!(pads.buttons(0), 1 << Button::One.bit());
+        sink.deliver(InputEvent::Key {
+            keysym: Keysym::RETURN,
+            down: true,
+        });
+        assert_eq!(pause.level(), Level::High, "Return is the Pause switch");
+        assert_eq!(
+            pads.buttons(0),
+            1 << Button::One.bit(),
+            "and it is not a line on the pad"
+        );
+    }
+
     #[test]
     fn every_sink_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<KeyboardSink>();
         assert_send_sync::<Feed>();
-        #[cfg(feature = "dev-nes-io")]
+        #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
         assert_send_sync::<PadSink>();
     }
 }
