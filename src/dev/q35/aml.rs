@@ -317,6 +317,31 @@ mod tests {
     }
 
     #[test]
+    fn a_package_length_decodes_back_to_itself_at_every_width() {
+        // §20.2.4's field counts itself, so the only check that means anything
+        // is a round trip: decode what was encoded and get the total back. The
+        // sizes below straddle both boundaries, and the largest is the shape a
+        // `_PRT` with one row per device number and pin actually reaches — over
+        // a kilobyte, which is the two-byte field.
+        for len in [0usize, 1, 61, 62, 63, 64, 4090, 4091, 4092, 5000, 70_000] {
+            let encoded = pkg_length(len);
+            let follow = usize::from(encoded[0] >> 6);
+            assert_eq!(encoded.len(), follow + 1, "len {len}");
+            let total = if follow == 0 {
+                usize::from(encoded[0])
+            } else {
+                assert_eq!(encoded[0] & 0x30, 0, "bits 5:4 are zero when bytes follow");
+                let mut total = usize::from(encoded[0] & 0x0f);
+                for (i, byte) in encoded[1..].iter().enumerate() {
+                    total |= usize::from(*byte) << (4 + 8 * i);
+                }
+                total
+            };
+            assert_eq!(total, len + encoded.len(), "len {len}");
+        }
+    }
+
+    #[test]
     fn a_name_segment_is_four_characters_padded_with_underscores() {
         assert_eq!(&name_seg("_S5_"), b"_S5_");
         assert_eq!(&name_seg("PCI0"), b"PCI0");

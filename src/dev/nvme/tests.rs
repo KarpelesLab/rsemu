@@ -799,3 +799,16 @@ fn arbitrary_traffic_terminates() {
         }
     }
 }
+
+#[test]
+fn the_interrupt_pin_register_names_the_pin_the_controller_drives() {
+    // Two places state one fact — the hardwired Interrupt Pin register (Rev 2.1
+    // §6.2.4) and the `Intx` the controller actually drives — and nothing else
+    // would notice them drifting apart. A function that told firmware `INTA#`
+    // and then drove `INTB#` would land on the wrong router input, on a board
+    // whose swizzle rotates by device number.
+    let rig = rig();
+    let config = Function::fresh_config(0x1b36, 0x0010, 0);
+    assert_eq!(config.byte(config::INTERRUPT_PIN), rig.ctrl.intx().pin().0);
+    assert_eq!(rig.ctrl.intx().pin(), crate::bus::pci::IntxPin::A);
+}

@@ -4,6 +4,7 @@
 use super::*;
 
 use alloc::string::ToString;
+use alloc::vec;
 
 use crate::core::space::{AddressSpace, Perms, Region, UnassignedPolicy};
 use crate::core::value::Width;
@@ -346,7 +347,8 @@ fn an_access_straddling_the_end_of_confdata_is_refused() {
 
 #[test]
 fn the_latch_survives_a_round_trip_and_a_reset_clears_it() {
-    let ports = ConfigPorts::new(Arc::new(PciBus::new()));
+    let bus = Arc::new(PciBus::new());
+    let ports = ConfigPorts::new(Arc::clone(&bus));
     ports.set_address(0xffff_ffff);
     assert_eq!(
         ports.address(),
@@ -679,4 +681,247 @@ fn the_latches_round_trip_and_a_reset_clears_them() {
     restored.reset();
     assert_eq!(bar_dword(&restored, config::BAR0), 0);
     assert_eq!(bar_dword(&restored, config::EXPANSION_ROM), 0);
+}
+
+// ---------------------------------------------------------------------------
+// INTx#
+// ---------------------------------------------------------------------------
+
+/// A south bridge, reduced to the one thing this file can check: it remembers
+/// what it was told, and it never asks the fabric anything.
+#[derive(Debug)]
+struct Router {
+    levels: Mutex<[Level; INTX_LINES as usize]>,
+    changes: Mutex<Vec<(u8, Level)>>,
+}
+
+impl Router {
+    fn new() -> Arc<Router> {
+        Arc::new(Router {
+            levels: Mutex::with_rank(LockRank::DEVICE, [Level::Low; INTX_LINES as usize]),
+            changes: Mutex::with_rank(LockRank::LEAF, Vec::new()),
+        })
+    }
+
+    fn level(&self, line: u8) -> Level {
+        self.levels.lock()[line as usize]
+    }
+}
+
+impl IntxSink for Router {
+    fn intx_changed(&self, line: u8, level: Level) {
+        self.levels.lock()[line as usize] = level;
+        self.changes.lock().push((line, level));
+    }
+}
+
+/// A function at `device` driving `pin`, plugged into `bus`.
+fn pinned(bus: &Arc<PciBus>, device: u8, pin: IntxPin) -> Intx {
+    let at = Bdf::new(0, device, 0).expect("a legal device number");
+    let intx = Intx::new(pin);
+    intx.plug(bus, at);
+    intx
+}
+
+#[test]
+fn the_swizzle_rotates_by_device_number() {
+    // PCI-to-PCI Bridge 1.1 Table 9-1, written out: four devices each driving
+    // nothing but `INTA#` land on four different nets, and the rotation is by
+    // device number.
+    for device in 0..=MAX_DEVICE {
+        let at = Bdf::new(0, device, 0).expect("a legal device number");
+        assert_eq!(swizzle(at, IntxPin::A), Some(device % 4));
+        assert_eq!(swizzle(at, IntxPin::B), Some((device + 1) % 4));
+        assert_eq!(swizzle(at, IntxPin::C), Some((device + 2) % 4));
+        assert_eq!(swizzle(at, IntxPin::D), Some((device + 3) % 4));
+        // A function that has no pin reaches no net, whatever its number.
+        assert_eq!(swizzle(at, IntxPin::NONE), None);
+        assert_eq!(swizzle(at, IntxPin(0xff)), None);
+    }
+    // The function number is not part of it: two functions of one device with
+    // the same pin are on the same net, which is what makes them share.
+    let a = Bdf::new(0, 4, 0).expect("f0");
+    let b = Bdf::new(0, 4, 7).expect("f7");
+    assert_eq!(swizzle(a, IntxPin::A), swizzle(b, IntxPin::A));
+}
+
+#[test]
+fn a_shared_net_stays_asserted_until_the_last_driver_lets_go() {
+    // Rev 2.1 §2.2.6: the pins are open drain. Two functions on one net is the
+    // whole difficulty, and it is why the fabric keeps the set of drivers
+    // rather than a level.
+    let bus = Arc::new(PciBus::new());
+    let router = Router::new();
+    bus.set_intx_sink(Arc::downgrade(&router) as Weak<dyn IntxSink>);
+
+    // Device 4 pin A and device 8 pin A both swizzle onto net 0.
+    let first = pinned(&bus, 4, IntxPin::A);
+    let second = pinned(&bus, 8, IntxPin::A);
+    assert_eq!(swizzle(Bdf::new(0, 8, 0).unwrap(), IntxPin::A), Some(0));
+
+    first.set(Level::High);
+    assert_eq!(router.level(0), Level::High);
+    second.set(Level::High);
+    assert_eq!(router.level(0), Level::High);
+    assert_eq!(
+        bus.intx_drivers(0),
+        vec![
+            Bdf::new(0, 4, 0).expect("f0"),
+            Bdf::new(0, 8, 0).expect("f0")
+        ],
+        "and the fabric can say which two"
+    );
+
+    first.set(Level::Low);
+    assert_eq!(
+        router.level(0),
+        Level::High,
+        "one function releasing does not release the net"
+    );
+    second.set(Level::Low);
+    assert_eq!(router.level(0), Level::Low);
+
+    // And the sink was told once per *change*, not once per call: a level that
+    // did not move is not an event, or a shared line would look like an edge.
+    // The four that come first are the realize sweep, which announces every
+    // net whether it moved or not.
+    assert_eq!(
+        *router.changes.lock(),
+        vec![
+            (0, Level::Low),
+            (1, Level::Low),
+            (2, Level::Low),
+            (3, Level::Low),
+            (0, Level::High),
+            (0, Level::Low)
+        ]
+    );
+}
+
+#[test]
+fn a_sink_installed_late_is_told_where_the_nets_already_are() {
+    // `ROADMAP.md` §4.3: realize sweeps the graph, because an undriven wire
+    // sits low and a machine that skipped the sweep comes up with interrupt
+    // lines that are wrong on some paths only.
+    let bus = Arc::new(PciBus::new());
+    let intx = pinned(&bus, 1, IntxPin::A);
+    intx.set(Level::High);
+
+    let router = Router::new();
+    bus.set_intx_sink(Arc::downgrade(&router) as Weak<dyn IntxSink>);
+    assert_eq!(router.level(1), Level::High, "device 1 pin A is net 1");
+    assert_eq!(router.level(0), Level::Low);
+    assert_eq!(router.level(2), Level::Low);
+    assert_eq!(router.level(3), Level::Low);
+}
+
+#[test]
+fn a_pin_plugged_in_while_asserted_brings_its_level_with_it() {
+    // A device may raise its interrupt before it is realized — a snapshot load
+    // does exactly that — so plugging in is an announcement, not a reset.
+    let bus = Arc::new(PciBus::new());
+    let router = Router::new();
+    bus.set_intx_sink(Arc::downgrade(&router) as Weak<dyn IntxSink>);
+
+    let intx = Intx::new(IntxPin::B);
+    intx.set(Level::High);
+    assert_eq!(router.level(0), Level::Low, "it is not on the bus yet");
+    intx.plug(&bus, Bdf::new(0, 3, 0).expect("device 3"));
+    assert_eq!(router.level(0), Level::High, "device 3 pin B is net 0");
+
+    // And unplugging releases the net rather than stranding it low for ever.
+    intx.unplug();
+    assert_eq!(router.level(0), Level::Low);
+}
+
+#[test]
+fn a_pin_drives_the_board_wire_and_the_fabric_together() {
+    // The same pin at two points on the board: the card edge, which a machine
+    // with no router wires straight to an interrupt controller, and the net,
+    // which a machine with one collects.
+    use crate::core::wire::{FanIn, Resolve, Wire, WireId, WireIdAllocator, WireSink};
+
+    #[derive(Debug)]
+    struct Watch {
+        inputs: FanIn,
+        level: Mutex<Level>,
+    }
+
+    impl WireSink for Watch {
+        fn set_level(&self, src: WireId, _line: u32, level: Level) {
+            self.inputs.set(src, level);
+            *self.level.lock() = self.inputs.resolve(Resolve::Or);
+        }
+    }
+
+    let bus = Arc::new(PciBus::new());
+    let router = Router::new();
+    bus.set_intx_sink(Arc::downgrade(&router) as Weak<dyn IntxSink>);
+    let intx = pinned(&bus, 0, IntxPin::A);
+
+    let ids = WireIdAllocator::new();
+    let id = ids.alloc();
+    let watch = Arc::new(Watch {
+        inputs: FanIn::new(&[id]),
+        level: Mutex::with_rank(LockRank::LEAF, Level::Low),
+    });
+    let wire = Arc::new(
+        Wire::builder()
+            .source(id)
+            .sink(Arc::clone(&watch) as Arc<dyn WireSink>, 0)
+            .build(),
+    );
+    intx.connect(WireSource::new(wire, id));
+
+    intx.set(Level::High);
+    assert_eq!(*watch.level.lock(), Level::High, "the wire followed");
+    assert_eq!(router.level(0), Level::High, "and so did the net");
+    intx.set(Level::Low);
+    assert_eq!(*watch.level.lock(), Level::Low);
+    assert_eq!(router.level(0), Level::Low);
+}
+
+#[test]
+fn detaching_a_function_releases_the_net_it_was_holding() {
+    let bus = Arc::new(PciBus::new());
+    let router = Router::new();
+    bus.set_intx_sink(Arc::downgrade(&router) as Weak<dyn IntxSink>);
+    let at = Bdf::new(0, 2, 0).expect("device 2");
+    bus.attach(at, Recorder::new() as Arc<dyn PciFunction>)
+        .expect("nothing is there yet");
+    let intx = Intx::new(IntxPin::A);
+    intx.plug(&bus, at);
+    intx.set(Level::High);
+    assert_eq!(router.level(2), Level::High);
+
+    assert!(bus.detach(at));
+    assert_eq!(
+        router.level(2),
+        Level::Low,
+        "a card that is gone is not still pulling the line down"
+    );
+}
+
+#[test]
+fn ports_whose_fabric_is_gone_master_abort() {
+    // `ConfigPorts` holds its fabric weakly so that a host bridge can keep the
+    // ports in its own register file without leaking the machine. The price is
+    // this case, and it has to be the answer a bus gives for nothing being
+    // there.
+    let ports = {
+        let bus = Arc::new(PciBus::new());
+        bus.attach(Bdf::default(), Recorder::new() as Arc<dyn PciFunction>)
+            .expect("nothing is there yet");
+        ConfigPorts::new(bus)
+    };
+    assert!(ports.bus().is_none());
+    ports.set_address(CONFIG_ENABLE);
+    let mut dst = [0u8; 4];
+    ports
+        .read(4, &mut dst, MemAttrs::DEFAULT)
+        .expect("a decoded port");
+    assert_eq!(dst, [0xff; 4], "a master abort reads as ones");
+    ports
+        .write(4, &[0x12, 0x34, 0x56, 0x78], MemAttrs::DEFAULT)
+        .expect("an unclaimed write is not an error");
 }

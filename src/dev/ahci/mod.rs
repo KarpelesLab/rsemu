@@ -98,6 +98,12 @@ pub const DEFAULT_BAY_PREFIX: &str = "sata";
 pub mod pin {
     /// The interrupt output: `INTA#`, level triggered, asserted while `GHC.IE`
     /// is set and any implemented port has an enabled interrupt pending.
+    ///
+    /// The **same pin** the adapter drives onto its bus's interrupt net, taken
+    /// off the card edge instead: a board with an interrupt router collects the
+    /// net and leaves this unwired, and a board without one — the `ahci-mini`
+    /// case — wires it straight to an interrupt controller. See
+    /// [`Intx`](crate::bus::pci::Intx).
     pub const IRQ: &str = "irq";
 }
 
@@ -487,7 +493,13 @@ impl Device for Ahci {
         // The one outward action: announcing itself onto the fabric. Nothing
         // observable happened before this (`CLAUDE.md`, two-phase construction).
         self.bus
-            .attach(self.at, Arc::clone(&self.regs) as Arc<dyn PciFunction>)
+            .attach(self.at, Arc::clone(&self.regs) as Arc<dyn PciFunction>)?;
+        // And plugging `INTA#` in, which can only happen now: a function that
+        // is not on the fabric has no device number, and the device number is
+        // what decides which of the bus's four interrupt nets the pin reaches
+        // (`bus::pci::swizzle`).
+        self.hba.intx().plug(&self.bus, self.at);
+        Ok(())
     }
 
     fn reset(&self, _kind: ResetKind) {

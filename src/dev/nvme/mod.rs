@@ -118,6 +118,13 @@ pub mod pin {
     /// The interrupt output: `INTA#`, level-triggered, asserted while any
     /// completion queue holds an entry the host has not acknowledged (NVMe
     /// §7.5.1.1).
+    ///
+    /// The **same pin** the controller drives onto its bus's interrupt net,
+    /// taken off the card edge instead: a board with an interrupt router
+    /// collects the net and leaves this unwired, and a board without one — the
+    /// `nvme-mini` case, and every embedded design with a single device on the
+    /// bus — wires it straight to an interrupt controller. See
+    /// [`Intx`](crate::bus::pci::Intx).
     pub const IRQ: &str = "irq";
 }
 
@@ -628,7 +635,13 @@ impl Device for Nvme {
         // The one outward action: announcing itself onto the fabric. Nothing
         // observable happened before this (`CLAUDE.md`, two-phase construction).
         self.bus
-            .attach(self.at, Arc::clone(&self.regs) as Arc<dyn PciFunction>)
+            .attach(self.at, Arc::clone(&self.regs) as Arc<dyn PciFunction>)?;
+        // And plugging `INTA#` in, which can only happen now: a function that
+        // is not on the fabric has no device number, and the device number is
+        // what decides which of the bus's four interrupt nets the pin reaches
+        // (`bus::pci::swizzle`).
+        self.ctrl.intx().plug(&self.bus, self.at);
+        Ok(())
     }
 
     fn reset(&self, _kind: ResetKind) {

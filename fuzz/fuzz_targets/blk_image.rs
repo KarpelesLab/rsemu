@@ -86,7 +86,7 @@ use rsemu::core::hosts::HostObjects;
 use rsemu::core::props::{Media, Props, Value};
 use rsemu::core::state::{ChunkReader, MachineShape, Migrations, StateReader, StateWriter};
 use rsemu::dev::ata::disk::{self, DiskDevice, Reg, SECTOR, cmd};
-use rsemu::dev::ata::{Medium, Snapshot};
+use rsemu::dev::medium::{Medium, Snapshot};
 use rsemu::dev::blk::{Image, ImageOptions};
 use std::path::PathBuf;
 use std::sync::Arc;

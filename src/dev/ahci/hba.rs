@@ -145,6 +145,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt;
 
+use crate::bus::pci::{Intx, IntxPin};
 use crate::core::error::{BusError, Result};
 use crate::core::space::{
     AccessConstraints, AddressSpace, MemAttrs, MemOps, MemResult, RequesterId,
@@ -487,14 +488,12 @@ impl State {
 /// What the transport hands the adapter, at [`LockRank::WIRE`].
 struct Link {
     space: Option<Weak<AddressSpace>>,
-    irq: Option<WireSource>,
 }
 
 impl fmt::Debug for Link {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Link")
             .field("space", &self.space.as_ref().map(|s| s.strong_count()))
-            .field("irq", &self.irq.is_some())
             .finish()
     }
 }
@@ -515,6 +514,13 @@ pub struct Hba {
     /// The transport's contributions, at [`LockRank::WIRE`]: cloned out and the
     /// guard dropped before any of them is used.
     link: Mutex<Link>,
+    /// The `INTA#` pin this function drives (*PCI Local Bus Specification*
+    /// Rev 2.1 §6.2.4 for the register that names it, §2.2.6 for the pin).
+    ///
+    /// Which interrupt net on the bus the pin reaches depends on the device
+    /// number the fabric assigned, so the swizzle lives there and this owns
+    /// only the pin — [`Intx`] argues the split.
+    intx: Intx,
     /// The identity this adapter's own accesses carry, so a bus fault names the
     /// master rather than the CPU that wrote `PxCI`.
     requester: AtomicU32,
@@ -576,13 +582,8 @@ impl Hba {
         Hba {
             ports,
             state: Mutex::with_rank(AHCI_RANK, State::new()),
-            link: Mutex::with_rank(
-                LockRank::WIRE,
-                Link {
-                    space: None,
-                    irq: None,
-                },
-            ),
+            link: Mutex::with_rank(LockRank::WIRE, Link { space: None }),
+            intx: Intx::new(IntxPin::A),
             requester: AtomicU32::new(RequesterId::ANONYMOUS.0),
             irq_level: AtomicU32::new(0),
             master: AtomicBool::new(false),
@@ -612,9 +613,20 @@ impl Hba {
         self.requester.store(requester.0, Ordering::Relaxed);
     }
 
-    /// Connect the `INTx#` output.
+    /// The `INTx#` pin this function drives.
+    ///
+    /// `INTA#`: §6.2.4 lets a single-function device use no other, and which
+    /// interrupt net on the bus that reaches is the fabric's arithmetic rather
+    /// than this adapter's — see [`Intx`].
+    #[must_use]
+    pub fn intx(&self) -> &Intx {
+        &self.intx
+    }
+
+    /// Bring the `INTx#` pin out to the board as a wire, for a machine with no
+    /// interrupt router to collect it.
     pub fn connect_irq(&self, source: WireSource) {
-        self.link.lock().irq = Some(source);
+        self.intx.connect(source);
         self.refresh_irq();
     }
 
@@ -693,11 +705,12 @@ impl Hba {
             state.ghc & GHC_IE != 0 && is != 0
         };
         self.irq_level.store(u32::from(pending), Ordering::Relaxed);
-        let level = self.irq_level();
-        let out = self.link.lock().irq.clone();
-        if let Some(out) = out {
-            out.set(level);
-        }
+        // The state lock is released before the pin is touched, and it has to
+        // be: driving the pin reaches an interrupt router, an interrupt
+        // controller and possibly a sibling on this same bus, and the fabric's
+        // net state sits at `INTX_RANK`, which is *above* `AHCI_RANK` in the
+        // ladder.
+        self.intx.set(self.irq_level());
     }
 
     /// Back to the power-on state: `PCIRST#` or the machine's reset.

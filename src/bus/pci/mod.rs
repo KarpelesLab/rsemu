@@ -27,6 +27,15 @@
 //! *moves*, from inside a configuration write — and [`bar`]'s module docs carry
 //! that argument.
 //!
+//! [`Intx`] is the sixth: a function's `INTA#`-`INTD#` pin. It is split across
+//! three objects because the hardware is — the function owns the pin, the
+//! fabric owns the four shared nets and the [`swizzle`] that says which one a
+//! pin reaches, and the board owns what those nets are connected to. [`Intx`]'s
+//! own documentation argues each third, and the argument matters: put the whole
+//! thing in the function and the swizzle has nowhere to read a device number
+//! from; put it in the board's wire graph and every machine file gets to spell
+//! the rotation out for itself, wrongly.
+//!
 //! # Finding each other
 //!
 //! As in [`crate::bus::spi`] and [`crate::bus::i2c`]: a host bridge and the
@@ -41,8 +50,13 @@
 //!   and place one; mapping it is refused, because a configuration cycle
 //!   travels through the I/O space and so the try-lock that saves every other
 //!   case cannot help. [`bar`]'s module docs spell it out.
-//! * **Interrupt routing.** `INTA#`-`INTD#` and the `PIRQ` swizzle belong to a
-//!   south bridge, and there is not one.
+//! * **A board whose traces are not the standard rotation.** [`swizzle`] is the
+//!   PCI-to-PCI Bridge specification's, applied to every device number on the
+//!   bus. A board that wired its slots differently — and a real one may — has
+//!   no way to say so yet.
+//! * **Message-signalled interrupts.** No function in this tree has the
+//!   capability, and `MSI` is a memory write rather than a pin, so it belongs
+//!   to whichever function grows one first rather than here.
 //! * **Type 1 cycles and PCI-to-PCI bridges.** [`Bdf`] carries a bus number so
 //!   that a second bus is expressible, but nothing forwards a cycle to one and
 //!   so nothing here pretends to.
@@ -55,10 +69,14 @@
 //!
 //! * *PCI Local Bus Specification, Revision 2.1* — §6.1 for the layout of
 //!   configuration space and §6.2 for the Type 00h header's fields, with
-//!   §6.2.2 for the Command register's space-enable bits and §6.2.5.1 and
-//!   §6.2.5.2 for the base address and expansion ROM registers; §3.7.4.1 for
-//!   Configuration Mechanism #1, the `0xcf8`/`0xcfc` pair; Appendix D for the
-//!   class codes.
+//!   §6.2.2 for the Command register's space-enable bits, §6.2.4 for the
+//!   Interrupt Line and Interrupt Pin registers, and §6.2.5.1 and §6.2.5.2 for
+//!   the base address and expansion ROM registers; §2.2.6 for the `INTA#`-
+//!   `INTD#` pins themselves, which is where level-sensitive and open-drain
+//!   come from; §3.7.4.1 for Configuration Mechanism #1, the `0xcf8`/`0xcfc`
+//!   pair; Appendix D for the class codes.
+//! * *PCI-to-PCI Bridge Architecture Specification, Revision 1.1* — §9.1 and
+//!   Table 9-1 for the interrupt swizzle.
 //! * *Intel 440FX PCIset: 82441FX PCI and Memory Controller (PMC) and 82442FX
 //!   Data Bus Accelerator (DBX)*, order number 290549-001 — §3.1.1 and §3.1.2
 //!   for `CONFADD` and `CONFDATA` as an actual host bridge implements them, and
@@ -73,17 +91,19 @@ mod tests;
 
 pub use bar::{Bar, BarKind, Bars};
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::core::error::{BusError, Error, Result};
 use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult};
 use crate::core::sync::{LockRank, Mutex};
 use crate::core::value::{Endian, Width};
+use crate::core::wire::{Level, WireSource};
 
 // ---------------------------------------------------------------------------
 // addressing
@@ -210,6 +230,7 @@ pub trait PciFunction: fmt::Debug + Send + Sync {
 /// one direction calls travel.
 pub struct PciBus {
     functions: Mutex<BTreeMap<Bdf, Arc<dyn PciFunction>>>,
+    intx: Mutex<IntxNets>,
 }
 
 impl fmt::Debug for PciBus {
@@ -218,6 +239,10 @@ impl fmt::Debug for PciBus {
         match self.functions.try_lock() {
             Some(map) => s.field("functions", &map.len()),
             None => s.field("functions", &"<in use>"),
+        };
+        match self.intx.try_lock() {
+            Some(nets) => s.field("intx", &nets.asserting.len()),
+            None => s.field("intx", &"<in use>"),
         };
         s.finish()
     }
@@ -235,6 +260,7 @@ impl PciBus {
     pub fn new() -> PciBus {
         PciBus {
             functions: Mutex::with_rank(LockRank::DEVICE, BTreeMap::new()),
+            intx: Mutex::with_rank(INTX_RANK, IntxNets::default()),
         }
     }
 
@@ -258,8 +284,17 @@ impl PciBus {
     }
 
     /// Forget whatever is at `at`, reporting whether there was anything.
+    ///
+    /// A function that goes away stops driving its interrupt pin, which is what
+    /// [`release_intx`](PciBus::release_intx) is called for here: an open-drain
+    /// net that kept a departed card's assertion would leave the line down for
+    /// ever, and there would be nothing left to lift it.
     pub fn detach(&self, at: Bdf) -> bool {
-        self.functions.lock().remove(&at).is_some()
+        let gone = self.functions.lock().remove(&at).is_some();
+        if gone {
+            self.release_intx(at);
+        }
+        gone
     }
 
     /// The function at `at`, if there is one.
@@ -294,6 +329,384 @@ impl PciBus {
     pub fn config_write(&self, at: Bdf, offset: u16, src: &[u8], attrs: MemAttrs) {
         if let Some(f) = self.function(at) {
             f.config_write(offset, src, attrs);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// INTx#: the interrupt pins
+// ---------------------------------------------------------------------------
+
+/// How many interrupt nets a PCI bus has: `INTA#`, `INTB#`, `INTC#`, `INTD#`.
+///
+/// *PCI Local Bus Specification* Rev 2.1 §2.2.6, which also states the two
+/// facts that decide everything else in this section: the pins are **level
+/// sensitive, asserted low**, and they are **open drain** — so several
+/// functions may share one net, and the net stays asserted until the last of
+/// them lets go.
+pub const INTX_LINES: u8 = 4;
+
+/// Which interrupt pin a function drives: the value of its Interrupt Pin
+/// register.
+///
+/// An extensible enumeration in the `pktkit` style (`CLAUDE.md`) rather than a
+/// Rust `enum`, because it *is* a hardware register byte — Rev 2.1 §6.2.4 gives
+/// 0 for a function that has no interrupt and 1-4 for `INTA#`-`INTD#`, and
+/// leaves the rest undefined rather than illegal. Eight bits rather than the
+/// convention's `u16` because the register is eight bits.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct IntxPin(pub u8);
+
+impl IntxPin {
+    /// This function has no interrupt pin (§6.2.4).
+    pub const NONE: IntxPin = IntxPin(0);
+    /// `INTA#`, which is the only pin a single-function device may use
+    /// (§2.2.6).
+    pub const A: IntxPin = IntxPin(1);
+    /// `INTB#`.
+    pub const B: IntxPin = IntxPin(2);
+    /// `INTC#`.
+    pub const C: IntxPin = IntxPin(3);
+    /// `INTD#`.
+    pub const D: IntxPin = IntxPin(4);
+
+    /// The pin as an index 0-3, or `None` for [`IntxPin::NONE`] and for a value
+    /// no specification defines.
+    #[must_use]
+    pub const fn index(self) -> Option<u8> {
+        match self.0 {
+            1..=4 => Some(self.0 - 1),
+            _ => None,
+        }
+    }
+}
+
+/// Which bus interrupt net a function's pin lands on: **the swizzle**.
+///
+/// *PCI-to-PCI Bridge Architecture Specification* Revision 1.1 §9.1 and its
+/// Table 9-1: the interrupt pins of the devices behind a bridge are rotated by
+/// device number on the way to the bridge's own, so device 0's `INTA#` is the
+/// bridge's `INTA#`, device 1's `INTA#` is its `INTB#`, and so on modulo four.
+/// A system board applies the same rotation to the connectors on its root bus,
+/// which is why four cards that each drive nothing but their own `INTA#` — and
+/// §2.2.6 says a single-function device may drive nothing else — still arrive
+/// on four different router inputs instead of piling onto one.
+///
+/// `None` for a function that drives no pin.
+///
+/// The rotation is exact rather than approximate: a device number is five bits
+/// and 32 is a multiple of four, so `device % 4` is well defined however the
+/// number was assigned.
+#[must_use]
+pub fn swizzle(at: Bdf, pin: IntxPin) -> Option<u8> {
+    let index = pin.index()?;
+    Some(at.device.wrapping_add(index) % INTX_LINES)
+}
+
+/// What the four bus interrupt nets are connected to.
+///
+/// One object rather than four wires, and the level is *given* rather than
+/// asked for: a sink may not invent a level for an input pin, and a shared
+/// open-drain net has no level of its own until every driver on it has been
+/// counted. [`PciBus`] does that counting and hands over the result.
+pub trait IntxSink: fmt::Debug + Send + Sync {
+    /// Net `line` — 0 for `INTA#` through 3 for `INTD#` — is now at `level`.
+    ///
+    /// Called with no fabric lock held, so an implementor may do anything from
+    /// inside it, including driving a wire that re-enters another function on
+    /// this same bus.
+    fn intx_changed(&self, line: u8, level: Level);
+}
+
+/// Where the interrupt nets' state sits in the ranked lock order.
+///
+/// **Below [`LockRank::BUS`] and above [`LockRank::DEVICE`]**, and forced
+/// rather than chosen, for the reason the APIC bus roster's own rank gives:
+/// `src/core/space.rs` states that a CPU holds a `BUS`-ranked lock across the
+/// accesses it issues, so anything a guest access can reach must rank under
+/// `BUS` — and a function raises its interrupt from inside a register write.
+/// It ranks *above* `DEVICE` because delivery re-enters peers: the asserting
+/// function has released its own state lock by then, and the sink takes its own
+/// inside [`IntxSink::intx_changed`].
+///
+/// A number distinct from the APIC roster's `0x4c60` and the drive bays'
+/// `0x4c41` so that a board holding two of them gets a deterministic order
+/// rather than a deadlock.
+pub const INTX_RANK: LockRank = LockRank::new(0x4c70);
+
+/// Which functions are pulling which net down, and who to tell.
+#[derive(Debug, Default)]
+struct IntxNets {
+    /// The `(net, function)` pairs currently asserting.
+    ///
+    /// A set of *drivers* rather than a level per net, because that is the one
+    /// representation in which "the line stays asserted until both functions
+    /// deassert" is true by construction instead of by careful bookkeeping.
+    /// Ordered, so a listing is deterministic (`CLAUDE.md`).
+    asserting: BTreeSet<(u8, Bdf)>,
+    /// The south bridge, weakly: the fabric outlives it, and a strong handle
+    /// would be the second half of a cycle.
+    sink: Option<Weak<dyn IntxSink>>,
+}
+
+impl IntxNets {
+    /// Whether anything is pulling `line` down.
+    fn level(&self, line: u8) -> Level {
+        let low = (line, Bdf::default());
+        let high = (line.saturating_add(1), Bdf::default());
+        Level::from_bool(self.asserting.range(low..high).next().is_some())
+    }
+}
+
+impl PciBus {
+    /// Install what the four interrupt nets reach, and tell it where they are.
+    ///
+    /// Weak, and the caller keeps the sink alive — a south bridge is owned by
+    /// the machine, and the fabric owns the functions that drive it, so a
+    /// strong handle here would close `fabric → sink → fabric`.
+    ///
+    /// The announcement is not a nicety. `ROADMAP.md` §4.3 requires realize to
+    /// sweep the graph, "or interrupt lines come up wrong on some machines and
+    /// only on some paths"; a sink installed after a function has already
+    /// asserted would otherwise never hear about it.
+    ///
+    /// One sink, and the last registration wins — a fabric has one place its
+    /// interrupt nets terminate, as a board has one south bridge.
+    pub fn set_intx_sink(&self, sink: Weak<dyn IntxSink>) {
+        let levels = {
+            let mut nets = self.intx.lock();
+            nets.sink = Some(sink);
+            let mut levels = [Level::Low; INTX_LINES as usize];
+            for (line, slot) in levels.iter_mut().enumerate() {
+                *slot = nets.level(line as u8);
+            }
+            levels
+        };
+        // Outside the lock, because the sink drives wires from inside this.
+        self.announce_intx(&levels);
+    }
+
+    /// The level net `line` is at.
+    #[must_use]
+    pub fn intx_level(&self, line: u8) -> Level {
+        self.intx.lock().level(line)
+    }
+
+    /// Every function currently asserting `line`, in address order.
+    ///
+    /// For a monitor and for a test that wants to say *which* two functions are
+    /// sharing a line rather than only that one of them is.
+    #[must_use]
+    pub fn intx_drivers(&self, line: u8) -> Vec<Bdf> {
+        let nets = self.intx.lock();
+        let low = (line, Bdf::default());
+        let high = (line.saturating_add(1), Bdf::default());
+        nets.asserting.range(low..high).map(|(_, at)| *at).collect()
+    }
+
+    /// The function at `at` drives its `pin` to `level`.
+    ///
+    /// The swizzle happens here, which is the whole reason this is the fabric's
+    /// method and not the function's: a function knows which of its own four
+    /// pins it drives and cannot know its device number, because the fabric is
+    /// what assigned it.
+    ///
+    /// A function with [`IntxPin::NONE`] is silently ignored — it has no pin to
+    /// drive, and refusing would make every caller check first.
+    pub fn set_intx(&self, at: Bdf, pin: IntxPin, level: Level) {
+        let Some(line) = swizzle(at, pin) else {
+            return;
+        };
+        let (changed, now, sink) = {
+            let mut nets = self.intx.lock();
+            let before = nets.level(line);
+            if level.is_high() {
+                nets.asserting.insert((line, at));
+            } else {
+                nets.asserting.remove(&(line, at));
+            }
+            let after = nets.level(line);
+            (before != after, after, nets.sink.clone())
+        };
+        // The lock is released before the sink is called, per the re-entrancy
+        // contract: `intx_changed` drives a wire, and that wire reaches an
+        // interrupt controller, a processor, and on the way back possibly a
+        // sibling on this very bus.
+        if changed && let Some(sink) = sink.and_then(|s| s.upgrade()) {
+            sink.intx_changed(line, now);
+        }
+    }
+
+    /// Drop every assertion the function at `at` is making.
+    ///
+    /// What [`detach`](PciBus::detach) calls, and what a function calls when it
+    /// is unplugged from the fabric while still asserting.
+    pub fn release_intx(&self, at: Bdf) {
+        let (dropped, sink) = {
+            let mut nets = self.intx.lock();
+            let mut dropped = Vec::new();
+            for line in 0..INTX_LINES {
+                let before = nets.level(line);
+                if nets.asserting.remove(&(line, at)) && before != nets.level(line) {
+                    dropped.push(line);
+                }
+            }
+            (dropped, nets.sink.clone())
+        };
+        if dropped.is_empty() {
+            return;
+        }
+        if let Some(sink) = sink.and_then(|s| s.upgrade()) {
+            for line in dropped {
+                sink.intx_changed(line, Level::Low);
+            }
+        }
+    }
+
+    /// Tell the sink all four levels, with no lock held.
+    fn announce_intx(&self, levels: &[Level; INTX_LINES as usize]) {
+        let sink = self.intx.lock().sink.clone();
+        if let Some(sink) = sink.and_then(|s| s.upgrade()) {
+            for (line, level) in levels.iter().enumerate() {
+                sink.intx_changed(line as u8, *level);
+            }
+        }
+    }
+}
+
+/// One function's `INTx#` pin.
+///
+/// # Where the pin lives, and why it is here
+///
+/// Three objects each hold the part of this they can actually know, which is
+/// also how the hardware divides it:
+///
+/// * **The function** owns the pin. Rev 2.1 §6.2.4 puts the Interrupt Pin
+///   register in configuration space, per function, so the function is the only
+///   thing that can honestly answer *which* pin it drives — and it is the only
+///   thing that knows when its own condition is asserted.
+/// * **The fabric** owns the net. `INTA#` is not a wire from one function to
+///   one router input: it is one of four nets shared by every device on the
+///   bus, and which net a function reaches depends on its **device number**,
+///   which the fabric assigned and the function has never been told. So
+///   [`swizzle`] is [`PciBus`]'s arithmetic, not this type's.
+/// * **The board** owns what the nets reach — an [`IntxSink`] on a machine with
+///   a south bridge, and on a machine without one the [`WireSource`] below,
+///   which is the same pin taken straight off the card edge to an interrupt
+///   controller. Both are true statements about one pin at two points on the
+///   board, which is why this object drives both and neither is a special case.
+///
+/// The alternative — a wire per function drawn in the machine file — puts the
+/// swizzle in the board author's arithmetic, where it can be silently wrong and
+/// where the ACPI `_PRT` generator cannot read it back.
+///
+/// # Level, not edge
+///
+/// [`set`](Intx::set) takes the level the function's condition is *currently*
+/// at and is called every time that condition is re-derived, exactly like the
+/// [`WireSource`] it replaces. It never pulses: §2.2.6's pin is a level, and a
+/// device that pulsed it would work until two devices shared a net.
+pub struct Intx {
+    /// Which of the four pins this function drives. Fixed at construction, as
+    /// the read-only register it mirrors is.
+    pin: IntxPin,
+    /// The fabric and the address this function answers at, once it has been
+    /// [`plug`](Intx::plug)ged in. **Weak**: the fabric holds every function on
+    /// it, and this is reachable from one.
+    plug: Mutex<Option<(Weak<PciBus>, Bdf)>>,
+    /// The same pin brought out to the board as an ordinary wire, for a machine
+    /// with no interrupt router.
+    wire: Mutex<Option<WireSource>>,
+    /// The level the pin is being held at, so a `Status` register's Interrupt
+    /// Status bit and a monitor can read it without disturbing anything.
+    level: AtomicBool,
+}
+
+impl fmt::Debug for Intx {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Intx")
+            .field("pin", &self.pin)
+            .field("level", &self.level())
+            .field("plugged", &self.plug.try_lock().map(|p| p.is_some()))
+            .finish()
+    }
+}
+
+impl Intx {
+    /// A pin, driving nothing yet.
+    ///
+    /// Both mutexes are at [`LockRank::WIRE`], which is what they are: each is
+    /// read, cloned out and released before anything is driven, so nothing here
+    /// is ever held across a call into another device.
+    #[must_use]
+    pub fn new(pin: IntxPin) -> Intx {
+        Intx {
+            pin,
+            plug: Mutex::with_rank(LockRank::WIRE, None),
+            wire: Mutex::with_rank(LockRank::WIRE, None),
+            level: AtomicBool::new(false),
+        }
+    }
+
+    /// Which pin this is.
+    #[must_use]
+    pub fn pin(&self) -> IntxPin {
+        self.pin
+    }
+
+    /// The level the pin is being held at.
+    #[must_use]
+    pub fn level(&self) -> Level {
+        Level::from_bool(self.level.load(Ordering::Relaxed))
+    }
+
+    /// Plug the pin into `bus` at `at`, and drive the net with whatever level
+    /// it is already at.
+    ///
+    /// Called from `Device::realize` beside [`PciBus::attach`], because a
+    /// function that is not on the fabric has no device number and therefore no
+    /// net.
+    pub fn plug(&self, bus: &Arc<PciBus>, at: Bdf) {
+        *self.plug.lock() = Some((Arc::downgrade(bus), at));
+        bus.set_intx(at, self.pin, self.level());
+    }
+
+    /// Unplug the pin, releasing the net first.
+    pub fn unplug(&self) {
+        let plug = self.plug.lock().take();
+        if let Some((bus, at)) = plug
+            && let Some(bus) = bus.upgrade()
+        {
+            bus.release_intx(at);
+        }
+    }
+
+    /// Bring the pin out to the board as a wire as well.
+    pub fn connect(&self, source: WireSource) {
+        *self.wire.lock() = Some(source);
+        self.drive();
+    }
+
+    /// The pin's condition is now `level`.
+    pub fn set(&self, level: Level) {
+        self.level.store(level.is_high(), Ordering::Relaxed);
+        self.drive();
+    }
+
+    /// Put both destinations where [`level`](Intx::level) says, with no lock
+    /// held while either is called.
+    fn drive(&self) {
+        let level = self.level();
+        let plug = self.plug.lock().clone();
+        let wire = self.wire.lock().clone();
+        if let Some((bus, at)) = plug
+            && let Some(bus) = bus.upgrade()
+        {
+            bus.set_intx(at, self.pin, level);
+        }
+        if let Some(wire) = wire {
+            wire.set(level);
         }
     }
 }
@@ -335,9 +748,28 @@ const CONFADD_MASK: u32 = CONFIG_ENABLE | 0x00ff_fffc;
 ///   of the *I/O address* select which bytes inside it. Firmware reads a vendor
 ///   ID as a word at `0xcfc` and a header type as a byte at `0xcfe`, so a model
 ///   that answered only Dwords would fail immediately.
+///
+/// # The fabric handle is **weak**, and that is not an optimisation
+///
+/// A host bridge is itself a function on the bus it bridges, so the natural
+/// filing — put the ports in the bridge's register file, where the rest of its
+/// registers are — closes a reference cycle: the fabric holds every function
+/// strongly, the register file would hold the ports, and the ports would hold
+/// the fabric. Nothing collects that, and the whole machine leaks. It has been
+/// found twice by LeakSanitizer under two different fuzz targets, once in
+/// [`crate::dev::q35::mch`] and once in [`crate::dev::pc::pmc`], and each was
+/// fixed by moving the ports out to the `Device` — a fix that has to be
+/// remembered every time someone writes a third host bridge.
+///
+/// So the weak handle is here instead, where it is remembered once. **The
+/// owner must keep the fabric alive**, which every caller does anyway: a build
+/// files its fabrics in its [`HostObjects`](crate::core::hosts::HostObjects)
+/// under [`buses`], and a host bridge device holds its own `Arc<PciBus>`. With
+/// the fabric gone the ports decode nothing — a read is all ones, which is what
+/// a master abort gives, and a write goes nowhere.
 #[derive(Debug)]
 pub struct ConfigPorts {
-    bus: Arc<PciBus>,
+    bus: Weak<PciBus>,
     /// The `CONFADD` latch. At [`LockRank::LEAF`]: it is read and released
     /// before the fabric is touched, so nothing is held across the call into a
     /// function.
@@ -350,19 +782,23 @@ pub struct ConfigPorts {
 
 impl ConfigPorts {
     /// The port pair onto `bus`.
+    ///
+    /// The handle taken is **weak**; see the type's own documentation for why,
+    /// and note the consequence — a caller that hands over the only strong
+    /// reference gets ports that decode nothing.
     #[must_use]
     pub fn new(bus: Arc<PciBus>) -> ConfigPorts {
         ConfigPorts {
-            bus,
+            bus: Arc::downgrade(&bus),
             address: Mutex::with_rank(LockRank::LEAF, 0),
             passthrough: Mutex::with_rank(LockRank::LEAF, None),
         }
     }
 
-    /// The fabric these ports reach.
+    /// The fabric these ports reach, if it still exists.
     #[must_use]
-    pub fn bus(&self) -> &Arc<PciBus> {
-        &self.bus
+    pub fn bus(&self) -> Option<Arc<PciBus>> {
+        self.bus.upgrade()
     }
 
     /// Install what a byte or word reference inside `CONFADD` reaches.
@@ -458,11 +894,11 @@ impl MemOps for ConfigPorts {
         if offset - 4 + len > 4 {
             return Err(BusError::BadAccess);
         }
-        match self.target(offset - 4) {
-            // No enabled cycle: the ports are just I/O space with nothing
-            // behind them, which reads as ones.
-            None => dst.fill(0xff),
-            Some((bdf, register)) => self.bus.config_read(bdf, register, dst, attrs),
+        match (self.target(offset - 4), self.bus()) {
+            // No enabled cycle, or no fabric left to run one on: the ports are
+            // just I/O space with nothing behind them, which reads as ones.
+            (Some((bdf, register)), Some(bus)) => bus.config_read(bdf, register, dst, attrs),
+            _ => dst.fill(0xff),
         }
         Ok(())
     }
@@ -500,8 +936,10 @@ impl MemOps for ConfigPorts {
         if offset - 4 + len > 4 {
             return Err(BusError::BadAccess);
         }
-        if let Some((bdf, register)) = self.target(offset - 4) {
-            self.bus.config_write(bdf, register, src, attrs);
+        if let Some((bdf, register)) = self.target(offset - 4)
+            && let Some(bus) = self.bus()
+        {
+            bus.config_write(bdf, register, src, attrs);
         }
         Ok(())
     }

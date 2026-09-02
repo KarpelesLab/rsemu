@@ -23,11 +23,20 @@
 //!
 //! 1. **A PCI function to find.** Class code `060100h` at `00:1f.0`, which is
 //!    how software recognises the chipset at all.
-//! 2. **PCI interrupt routing.** `PIRQ[A-H]` come in from the fabric and are
-//!    steered onto ISA interrupt lines by eight registers. That is the job the
-//!    `pc-at` board has no answer for — [`crate::bus::pci`]'s module docs list
-//!    interrupt routing under "not here yet, because a south bridge belongs to
-//!    it and there is not one". This is the south bridge.
+//! 2. **PCI interrupt routing.** `PIRQ[A-H]` come in and are steered onto ISA
+//!    interrupt lines by eight registers. That is the job the `pc-at` board has
+//!    no answer for, and this is the south bridge.
+//!
+//!    Where the eight inputs come from is worth being precise about, because
+//!    they come from two places. Four of them are the **fabric's own interrupt
+//!    nets**: a function drives its `INTA#`-`INTD#` pin, [`crate::bus::pci`]
+//!    swizzles it by device number onto one of four nets, and this function
+//!    registers as that fabric's [`IntxSink`] — which is what `bus = "pci0"` on
+//!    this object means, and why a q35 board needs no wire between a card and
+//!    its router. All eight are also ordinary wire sinks a machine file may
+//!    drive, for a board with something else to hang on one, and a pin driven
+//!    from both is the wired-OR of the two: `PIRQ` is a shared, level-sensitive
+//!    line and modelling that is the whole difficulty.
 //! 3. **The ACPI register block**, decoded at whatever `PMBASE` says
 //!    ([`super::pm`]).
 //!
@@ -160,9 +169,9 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::bus::pci::{Bdf, ConfigSpace, PciBus, PciFunction, buses, config};
+use crate::bus::pci::{Bdf, ConfigSpace, INTX_LINES, IntxSink, PciBus, PciFunction, buses, config};
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
-use crate::core::props::{Props, ValueKind};
+use crate::core::props::{Props, Value, ValueKind};
 use crate::core::sched::LazyHandle;
 use crate::core::space::{
     AddressSpace, Mapping, MappingId, MemAttrs, MemOps, Perms, Region, RegionRef,
@@ -241,6 +250,30 @@ const fn routed_irq(encoding: u8) -> Option<u8> {
 /// The eleven interrupts a `PIRQ` can be routed to, in order.
 pub const ROUTABLE: [u8; 11] = [3, 4, 5, 6, 7, 9, 10, 11, 12, 14, 15];
 
+/// The `PIRQ[n]_ROUT` byte that routes a `PIRQ` to ISA interrupt `irq`, or
+/// `None` if §13.1.17's table has no encoding for it.
+///
+/// The inverse of [`routed_irq`], and the two are asserted to agree over the
+/// whole byte in this module's tests — a routing table with a hole in one
+/// direction only is exactly the bug that puts an interrupt somewhere nobody
+/// is listening.
+pub(super) const fn route_encoding(irq: u8) -> Option<u8> {
+    match irq {
+        3 => Some(0b0011),
+        4 => Some(0b0100),
+        5 => Some(0b0101),
+        6 => Some(0b0110),
+        7 => Some(0b0111),
+        9 => Some(0b1001),
+        10 => Some(0b1010),
+        11 => Some(0b1011),
+        12 => Some(0b1100),
+        14 => Some(0b1110),
+        15 => Some(0b1111),
+        _ => None,
+    }
+}
+
 /// The interrupt each `SCI_IRQ_SEL` encoding names, or `None` for the reserved
 /// one (§13.1.14's table).
 const fn sci_irq(encoding: u8) -> Option<u8> {
@@ -256,6 +289,29 @@ const fn sci_irq(encoding: u8) -> Option<u8> {
 
 /// The five interrupts an SCI can appear on, in order.
 pub const SCI_LINES: [u8; 5] = [9, 10, 11, 20, 21];
+
+/// The configuration offset of `PIRQ[index]_ROUT`, A through H.
+///
+/// Two disjoint runs of four (§13.1.17 and §13.1.19), which is the kind of
+/// detail a second reader of the register file would get subtly wrong.
+#[must_use]
+pub const fn pirq_rout(index: usize) -> u16 {
+    if index < 4 {
+        PIRQ_ABCD + index as u16
+    } else {
+        PIRQ_EFGH + (index as u16 - 4)
+    }
+}
+
+/// The ISA interrupt a `PIRQ[n]_ROUT` byte routes its input to, or `None` if it
+/// routes nowhere — bit 7 set, or a reserved encoding (§13.1.17).
+#[must_use]
+pub const fn pirq_destination(byte: u8) -> Option<u8> {
+    if byte & PIRQ_DISABLE != 0 {
+        return None;
+    }
+    routed_irq(byte)
+}
 
 /// Where the ACPI window went.
 #[derive(Debug, Clone)]
@@ -274,9 +330,21 @@ struct Registers {
     pmbase: Mutex<u32>,
     /// `RCBA`'s latch, for the same reason. [`LockRank::LEAF`].
     rcba: Mutex<u32>,
-    /// The level each `PIRQ` input is being driven at. [`LockRank::LEAF`], and
-    /// read out before any pin is driven.
+    /// The level each `PIRQ` input is being driven at **by a wire**.
+    /// [`LockRank::LEAF`], and read out before any pin is driven.
     pirq_in: Mutex<[bool; PIRQS]>,
+    /// The level each of the fabric's four interrupt nets is at.
+    ///
+    /// Separate from `pirq_in` because they are separate drivers of the same
+    /// four pins and a shared line must know which of its drivers let go —
+    /// `ROADMAP.md` §4.3's argument for why `set_level` carries a source, one
+    /// level up. On this chipset the nets land on `PIRQ[A-D]` with no
+    /// rotation: an ICH9 can steer an internal function's `INTx#` onto any of
+    /// the eight through the `D<n>IR` registers in the root complex register
+    /// block `RCBA` names, and that block is not modelled, so the identity
+    /// mapping is what this part does. Derived from what the functions on the
+    /// bus are driving, so never serialized. [`LockRank::LEAF`].
+    pirq_bus: Mutex<[bool; INTX_LINES as usize]>,
     /// The eleven ISA outputs, in [`ROUTABLE`] order. [`LockRank::LEAF`].
     irq_out: Mutex<[Option<WireSource>; ROUTABLE.len()]>,
     /// The five SCI outputs, in [`SCI_LINES`] order. [`LockRank::LEAF`].
@@ -332,7 +400,7 @@ fn drive(out: &Option<WireSource>, level: Level) {
 
 impl Registers {
     /// The header this part hardwires, from Table 13-1 and §13.1.1-§13.1.10.
-    fn fresh_config(device_id: u16, revision: u8) -> ConfigSpace {
+    fn fresh_config(device_id: u16, revision: u8, pirq: &[u8; PIRQS]) -> ConfigSpace {
         let mut c = ConfigSpace::new();
         c.hardwire(config::VENDOR_ID, u32::from(config::VENDOR_INTEL), 2);
         c.hardwire(config::DEVICE_ID, u32::from(device_id), 2);
@@ -362,26 +430,32 @@ impl Registers {
         // A board powers up with no PCI interrupt reaching a controller at all,
         // which is why §13.1.17 adds "BIOS must program this bit to 0 during
         // POST for any of the PIRQs that are being used".
-        for i in 0..4u16 {
-            c.set_byte(PIRQ_ABCD + i, PIRQ_DISABLE);
-            c.set_byte(PIRQ_EFGH + i, PIRQ_DISABLE);
+        //
+        // A board may state a different power-up value with `pirq-routes`, and
+        // `CLASS`'s summary says why that is a stand-in for firmware rather
+        // than a correction to the datasheet.
+        for i in 0..4usize {
+            c.set_byte(PIRQ_ABCD + i as u16, pirq[i]);
+            c.set_byte(PIRQ_EFGH + i as u16, pirq[i + 4]);
         }
         c
     }
 
     /// The `PIRQ[n]_ROUT` byte for input `index`, A-H.
     fn pirq_route(config: &ConfigSpace, index: usize) -> u8 {
-        let at = if index < 4 {
-            PIRQ_ABCD + index as u16
-        } else {
-            PIRQ_EFGH + (index - 4) as u16
-        };
-        config.byte(at)
+        config.byte(pirq_rout(index))
     }
 
     /// The level each ISA output should be at, in [`ROUTABLE`] order.
     fn irq_levels(&self) -> [Level; ROUTABLE.len()] {
-        let inputs = *self.pirq_in.lock();
+        let mut inputs = *self.pirq_in.lock();
+        let nets = *self.pirq_bus.lock();
+        // Wired-OR with the fabric's own nets: a `PIRQ` pin driven by a card
+        // through the bus and by a wire from elsewhere on the board is one
+        // shared line, and it stays asserted while either holds it.
+        for (slot, net) in nets.iter().enumerate() {
+            inputs[slot] |= *net;
+        }
         let config = self.config.lock();
         let mut high = [false; ROUTABLE.len()];
         for (index, asserted) in inputs.iter().enumerate() {
@@ -594,6 +668,25 @@ impl PciFunction for Registers {
     }
 }
 
+impl IntxSink for Registers {
+    fn intx_changed(&self, line: u8, level: Level) {
+        {
+            let mut nets = self.pirq_bus.lock();
+            let Some(slot) = nets.get_mut(line as usize) else {
+                return;
+            };
+            let asserted = level == Level::High;
+            if *slot == asserted {
+                return;
+            }
+            *slot = asserted;
+        }
+        // The lock is released first: driving these outputs reaches an 8259A,
+        // an I/O APIC and a processor.
+        self.drive_outputs();
+    }
+}
+
 impl SciSink for Registers {
     fn sci_changed(&self) {
         // The block computes the condition; which of five pins it appears on
@@ -631,6 +724,9 @@ pub struct Lpc {
     /// [`CLASS`]'s property summary.
     reset_pmbase: u32,
     reset_acpi_en: bool,
+    /// The eight `PIRQ[n]_ROUT` bytes the bridge comes out of reset holding.
+    /// See [`CLASS`]'s property summary for why a board may want to state one.
+    reset_pirq: [u8; PIRQS],
     /// The name of the address space the ACPI window goes in.
     iospace: String,
     /// The sinks handed out by [`Device::sink`], kept alive here: a net holds
@@ -662,6 +758,7 @@ impl Lpc {
         let revision = r.or_range("revision", 0u64, 0..=255)?;
         let iospace = r.or_str("iospace", "port")?.to_string();
         let pm_base = r.or_size("pm-base", 0)?;
+        let routes = r.optional_list("pirq-routes")?.map(<[Value]>::to_vec);
         r.finish()?;
         if pm_base > 0xffff || pm_base % u64::from(pm::BLOCK_LEN as u32) != 0 {
             return Err(Error::Config {
@@ -673,6 +770,38 @@ impl Lpc {
                 ),
             });
         }
+        let mut pirq = [PIRQ_DISABLE; PIRQS];
+        if let Some(routes) = routes {
+            if routes.len() > PIRQS {
+                return Err(Error::Config {
+                    at: CLASS_NAME.to_string(),
+                    message: alloc::format!(
+                        "`pirq-routes` is one ISA interrupt per PIRQ input and there are {PIRQS} \
+                         of them (PIRQ[A-H]), so a list of {} cannot be one",
+                        routes.len()
+                    ),
+                });
+            }
+            for (slot, value) in pirq.iter_mut().zip(routes.iter()) {
+                let irq = value.to_uint("pirq-routes")?;
+                if irq == 0 {
+                    // The datasheet's own power-up value: not routed at all.
+                    continue;
+                }
+                let encoding = u8::try_from(irq).ok().and_then(route_encoding);
+                let Some(encoding) = encoding else {
+                    return Err(Error::Config {
+                        at: CLASS_NAME.to_string(),
+                        message: alloc::format!(
+                            "§13.1.17's IRQ Routing field can name {ROUTABLE:?} and nothing else, \
+                             so a PIRQ cannot come up routed to IRQ{irq}; 0 leaves it unrouted, \
+                             which is the datasheet's own default"
+                        ),
+                    });
+                };
+                *slot = encoding;
+            }
+        }
         let bus = buses::attach(props, &bus_name)?;
         let at = Bdf::new(0, device as u8, 0)?;
         Ok(Lpc::with_bus(
@@ -681,6 +810,7 @@ impl Lpc {
             device_id as u16,
             revision as u8,
             pm_base as u32,
+            pirq,
             iospace,
         ))
     }
@@ -693,6 +823,7 @@ impl Lpc {
         device_id: u16,
         revision: u8,
         pm_base: u32,
+        pirq: [u8; PIRQS],
         iospace: String,
     ) -> Lpc {
         let acpi = pm::block();
@@ -702,7 +833,7 @@ impl Lpc {
             Arc::clone(&acpi) as Arc<dyn MemOps>,
         ));
         let reset_acpi_en = pm_base != 0;
-        let mut config = Registers::fresh_config(device_id, revision);
+        let mut config = Registers::fresh_config(device_id, revision, &pirq);
         if reset_acpi_en {
             config.set_byte(ACPI_CNTL, ACPI_EN);
         }
@@ -711,6 +842,7 @@ impl Lpc {
             pmbase: Mutex::with_rank(LockRank::LEAF, pm_base & PMBASE_MASK),
             rcba: Mutex::with_rank(LockRank::LEAF, 0),
             pirq_in: Mutex::with_rank(LockRank::LEAF, [false; PIRQS]),
+            pirq_bus: Mutex::with_rank(LockRank::LEAF, [false; INTX_LINES as usize]),
             irq_out: Mutex::with_rank(LockRank::LEAF, [const { None }; ROUTABLE.len()]),
             sci_out: Mutex::with_rank(LockRank::LEAF, [const { None }; SCI_LINES.len()]),
             acpi,
@@ -731,6 +863,7 @@ impl Lpc {
             revision,
             reset_pmbase: pm_base & PMBASE_MASK,
             reset_acpi_en,
+            reset_pirq: pirq,
             iospace,
             pins: Mutex::with_rank(LockRank::LEAF, Vec::new()),
         }
@@ -808,6 +941,16 @@ pub static CLASS: DeviceClass = DeviceClass {
             summary: "the address space the ACPI window is decoded in (default `port`)",
         },
         PropertySpec {
+            name: "pirq-routes",
+            kind: ValueKind::List,
+            required: false,
+            summary: "the ISA interrupt each of PIRQ[A-H] comes out of reset routed to, as a \
+                      list of up to eight — a stand-in for the POST §13.1.17 requires (\"BIOS \
+                      must program this bit to 0 during POST for any of the PIRQs that are being \
+                      used\") on a board with no firmware that does it; 0, and the default, is \
+                      the datasheet's own 80h, which routes nothing",
+        },
+        PropertySpec {
             name: "pm-base",
             kind: ValueKind::Size,
             required: false,
@@ -838,13 +981,21 @@ impl Device for Lpc {
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
         // The one outward action: announcing itself onto the fabric.
         self.bus
-            .attach(self.at, Arc::clone(&self.regs) as Arc<dyn PciFunction>)
+            .attach(self.at, Arc::clone(&self.regs) as Arc<dyn PciFunction>)?;
+        // And claiming the fabric's four interrupt nets, which is the other
+        // half of what makes this a south bridge: a function's `INTx#` reaches
+        // the bus, the bus swizzles it onto one of `INTA#`-`INTD#`, and those
+        // arrive here as `PIRQ[A-D]`. Weak, and announced immediately — a
+        // card may already be asserting (`ROADMAP.md` §4.3's realize sweep).
+        self.bus
+            .set_intx_sink(Arc::downgrade(&self.regs) as Weak<dyn IntxSink>);
+        Ok(())
     }
 
     fn reset(&self, _kind: ResetKind) {
         {
             let mut c = self.regs.config.lock();
-            *c = Registers::fresh_config(self.device_id, self.revision);
+            *c = Registers::fresh_config(self.device_id, self.revision, &self.reset_pirq);
             if self.reset_acpi_en {
                 c.set_byte(ACPI_CNTL, ACPI_EN);
             }
@@ -979,7 +1130,7 @@ impl Device for Lpc {
         let tick = r.read_u64()?;
         {
             let mut c = self.regs.config.lock();
-            *c = Registers::fresh_config(self.device_id, self.revision);
+            *c = Registers::fresh_config(self.device_id, self.revision, &self.reset_pirq);
             c.restore(config);
             // Masked exactly as a guest write is, so a hand-written snapshot
             // cannot install bits the hardware could never hold.
@@ -1045,6 +1196,7 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("revision", ValueKind::Uint).range(0, 255))
         .prop(PropSchema::new("iospace", ValueKind::Str))
         .prop(PropSchema::new("pm-base", ValueKind::Size))
+        .prop(PropSchema::new("pirq-routes", ValueKind::List))
         .region("acpi");
     for name in [
         "pirqa", "pirqb", "pirqc", "pirqd", "pirqe", "pirqf", "pirqg", "pirqh",

@@ -624,16 +624,20 @@ pub struct Mch {
     regs: Arc<Registers>,
     /// The `0xcf8`/`0xcfc` window, which owns the `CONFADD` latch.
     ///
-    /// Held by the **device** rather than by [`Registers`], and that is not a
-    /// filing decision — it is what keeps the object graph acyclic.
-    /// [`ConfigPorts`] holds its fabric strongly, the fabric holds every
-    /// function on it strongly, and `Registers` *is* a function on this fabric;
-    /// putting the ports inside it would close the loop
-    /// `fabric → registers → ports → fabric`, which is a leak that nothing ever
-    /// collects. `Mch` is owned by the machine and is not on the bus, so the
-    /// same handle here is a plain edge. LeakSanitizer found this through the
-    /// `q35_chipset` fuzz target; [`super::ecam::Ecam`]'s own weak handle is
-    /// the other half of the same problem.
+    /// Held by the **device** rather than by [`Registers`], which was once the
+    /// thing keeping this object graph acyclic: the fabric holds every function
+    /// on it strongly and `Registers` *is* a function on this fabric, so ports
+    /// inside it closed the loop `fabric → registers → ports → fabric` — a leak
+    /// nothing ever collected, found by LeakSanitizer through the
+    /// `q35_chipset` fuzz target.
+    ///
+    /// [`ConfigPorts`] now holds its fabric **weakly**, so the loop cannot form
+    /// wherever the ports are filed and the same bug in `pc::pmc` went away
+    /// with it. The placement stays because it is also the honest one — the
+    /// `0xcf8` window is the bridge's decode and not one of its configuration
+    /// registers — and because something has to keep the fabric alive, which
+    /// the `bus` handle below does. [`super::ecam::Ecam`]'s own weak handle is
+    /// the other half of the same story.
     ports: Arc<ConfigPorts>,
     bus: Arc<PciBus>,
     at: Bdf,
