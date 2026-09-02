@@ -41,6 +41,13 @@
 //!   backend refuses to compile), and before a [`Opcode::GET_SLOT`] that reads
 //!   a slot the pending boundary shadows.
 //! * A [`BusError::Retry`] after a commit is rejected rather than delivered.
+//!
+//! The first two are **deferred, not batched**, and the distinction is the
+//! whole of `flush_thunk`: generated code emits nothing at a charge or a
+//! boundary, and the calls happen — same count, same arguments, same order —
+//! at the next point the host could observe anything. See
+//! [`compile`](mod@super::compile)'s "Deferred bookkeeping" for why the range a
+//! flush is handed is exactly the set of instructions that ran.
 
 #![allow(unsafe_code)]
 
@@ -96,6 +103,25 @@ const fn error_of(code: u64) -> BusError {
     }
 }
 
+/// One deferred bookkeeping event: what an [`Opcode::CHARGE`] or an
+/// [`Opcode::INSN_START`] does when its region is replayed.
+///
+/// A compiled block carries these in a dense array rather than having
+/// `flush_thunk` read the IR again, and the difference is not tidiness. An
+/// [`Inst`](crate::ir::Inst) is wide — an `Option<Const>` alone is thirty-two
+/// bytes — so re-walking a 215-instruction block on every one of the hundred
+/// thousand times a hot trace runs streams megabytes of cold data past the
+/// cache. That was measured, as a **25% loss** against the code this replaced,
+/// which is the whole reason this type exists: sixteen bytes per event, in
+/// order, and only the events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event {
+    /// [`IrHost::charge`], with the tick count [`Opcode::CHARGE`] carried.
+    Charge(u64),
+    /// [`IrHost::insn_start`], by index into [`Block::marks`].
+    Boundary(u32),
+}
+
 /// The execution context a compiled block runs against.
 ///
 /// Every field is a `u64` or a pointer, so generated code writes each one with
@@ -140,9 +166,23 @@ pub struct Ctx {
     pub published: u64,
     /// Loads served entirely from an inlined TLB probe.
     pub fast_hits: u64,
+    /// The compiled block's deferred bookkeeping, in instruction order.
+    ///
+    /// Generated code never names this — it passes a *range* into it — so it
+    /// sits past every offset [`off`] declares.
+    pub events: *const Event,
+    /// How many [`Ctx::events`] there are, so a range can be clamped.
+    pub event_count: u64,
 }
 
 /// Byte offsets into [`Ctx`], as generated code bakes them in.
+///
+/// Six fields have no entry, and their absence is the shape of this backend
+/// rather than an oversight: [`Ctx::ticks`], [`Ctx::retired`],
+/// [`Ctx::boundaries`], [`Ctx::boundary_pc`], [`Ctx::mark`] and
+/// [`Ctx::published`] are written only by `flush_thunk`, in Rust, through
+/// the struct. Generated code stopped naming them when the bookkeeping moved
+/// there.
 pub mod off {
     /// [`Ctx::temps`](super::Ctx::temps).
     pub const TEMPS: i32 = 0;
@@ -156,24 +196,12 @@ pub mod off {
     pub const TAG_BITS: i32 = 48;
     /// [`Ctx::out_pc`](super::Ctx::out_pc).
     pub const OUT_PC: i32 = 56;
-    /// [`Ctx::ticks`](super::Ctx::ticks).
-    pub const TICKS: i32 = 64;
-    /// [`Ctx::retired`](super::Ctx::retired).
-    pub const RETIRED: i32 = 72;
-    /// [`Ctx::boundaries`](super::Ctx::boundaries).
-    pub const BOUNDARIES: i32 = 80;
-    /// [`Ctx::boundary_pc`](super::Ctx::boundary_pc).
-    pub const BOUNDARY_PC: i32 = 88;
-    /// [`Ctx::mark`](super::Ctx::mark).
-    pub const MARK: i32 = 96;
     /// [`Ctx::fault_at`](super::Ctx::fault_at).
     pub const FAULT_AT: i32 = 104;
     /// [`Ctx::fault_error`](super::Ctx::fault_error).
     pub const FAULT_ERROR: i32 = 112;
     /// [`Ctx::committed`](super::Ctx::committed).
     pub const COMMITTED: i32 = 120;
-    /// [`Ctx::published`](super::Ctx::published).
-    pub const PUBLISHED: i32 = 128;
     /// [`Ctx::fast_hits`](super::Ctx::fast_hits).
     pub const FAST_HITS: i32 = 136;
 }
@@ -183,13 +211,15 @@ pub mod off {
 /// Indirect through a table rather than an immediate call address, because the
 /// addresses are monomorphized per `H` and a block compiled for one host must
 /// be runnable against another of the same type without being compiled again.
+///
+/// [`IrHost::charge`] and [`IrHost::insn_start`] have no slot here any more.
+/// Generated code never calls either one: both are reached from
+/// [`Vtable::flush`], once per region rather than once per guest instruction.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Vtable {
-    /// [`IrHost::charge`].
-    pub charge: unsafe extern "sysv64" fn(*mut c_void, u64),
-    /// [`IrHost::insn_start`], by mark index.
-    pub insn_start: unsafe extern "sysv64" fn(*mut c_void, u64),
+    /// Replay a range of the block's charges and boundaries.
+    pub flush: unsafe extern "sysv64" fn(*mut c_void, u64, u64),
     /// [`IrHost::read_slot`], publishing first if the slot is shadowed.
     pub get_slot: unsafe extern "sysv64" fn(*mut c_void, u64) -> u64,
     /// [`IrHost::load`]. Returns an error code; the value goes to `out`.
@@ -202,18 +232,16 @@ pub struct Vtable {
 
 /// Byte offsets into [`Vtable`], as generated code bakes them in.
 pub mod vt {
-    /// [`Vtable::charge`](super::Vtable::charge).
-    pub const CHARGE: i32 = 0;
-    /// [`Vtable::insn_start`](super::Vtable::insn_start).
-    pub const INSN_START: i32 = 8;
+    /// [`Vtable::flush`](super::Vtable::flush).
+    pub const FLUSH: i32 = 0;
     /// [`Vtable::get_slot`](super::Vtable::get_slot).
-    pub const GET_SLOT: i32 = 16;
+    pub const GET_SLOT: i32 = 8;
     /// [`Vtable::load`](super::Vtable::load).
-    pub const LOAD: i32 = 24;
+    pub const LOAD: i32 = 16;
     /// [`Vtable::store`](super::Vtable::store).
-    pub const STORE: i32 = 32;
+    pub const STORE: i32 = 24;
     /// [`Vtable::fast_tick`](super::Vtable::fast_tick).
-    pub const FAST_TICK: i32 = 40;
+    pub const FAST_TICK: i32 = 32;
 }
 
 /// Reconstitute the context a thunk was handed.
@@ -290,33 +318,83 @@ fn shadowed(c: &Ctx, block: &Block, slot: RegSlot) -> bool {
         .is_some_and(|mark| mark.live.iter().any(|&(s, _)| s == slot))
 }
 
-unsafe extern "sysv64" fn charge_thunk<H: IrHost + FastMem>(raw: *mut c_void, ticks: u64) {
+/// Replay instructions `lo .. hi` of the block: its charges and its
+/// boundaries, to the context and to the host.
+///
+/// The one thunk on the hot path, and the reason the hot path has so little
+/// left on it. This is `ir::Interp`'s [`Opcode::CHARGE`] and
+/// [`Opcode::INSN_START`] arms **moved**, not batched: the same calls, with
+/// the same arguments, in the same order. Generated code contributes only the
+/// range, which it knows statically — see
+/// [`compile`](super::compile)'s "Deferred bookkeeping" for why a static range
+/// is exactly the set of instructions that ran.
+///
+/// A host cannot tell the difference, because nothing it can observe happens
+/// between an instruction and its replay: between two flush points generated
+/// code touches only the temporary frame and this context, and every other
+/// thunk — a load, a store, a slot read, an inlined access's tick — has a
+/// flush emitted ahead of it.
+unsafe extern "sysv64" fn flush_thunk<H: IrHost + FastMem>(raw: *mut c_void, lo: u64, hi: u64) {
     // SAFETY: `raw` is the context `Engine::run` entered generated code with,
-    // and `c.host` is the `&mut H` it was called with; both are live for the
-    // whole call. See `ctx` and `host_of`.
-    unsafe {
-        let c = ctx(raw);
-        host_of::<H>(c).charge(ticks);
-    }
-}
-
-unsafe extern "sysv64" fn insn_start_thunk<H: IrHost + FastMem>(raw: *mut c_void, index: u64) {
-    // SAFETY: as `charge_thunk`, plus `c.block` — set from the `&Block` the
-    // engine holds for the whole call. The index came from the block's own
-    // `INSN_START` instruction, and is checked against `marks()` anyway.
+    // `c.host` is the `&mut H` it was called with, `c.block` is the `&Block`
+    // it holds for the whole call, and `c.events` points at the `Box<[Event]>`
+    // the `Compiled` owns for at least as long as its code. All four are live
+    // for the whole call and name four distinct objects, so the `&mut Ctx`,
+    // the `&mut H`, the `&Block` and the `&[Event]` here do not alias. See
+    // `ctx` and `host_of`. The range is clamped rather than trusted.
     unsafe {
         let c = ctx(raw);
         let block = &*c.block;
-        let Ok(index) = usize::try_from(index) else {
-            return;
-        };
-        let Some(mark) = block.marks().get(index) else {
-            return;
-        };
-        // A copy, so the host's `&mut` borrow does not overlap the block's.
-        let mark: &InsnStart = mark;
-        let host = host_of::<H>(c);
-        host.insn_start(mark);
+        let all = core::slice::from_raw_parts(c.events, c.event_count as usize);
+        let hi = (hi as usize).min(all.len());
+        // Clamped to `hi`, not to the table. `compile` never emits a reversed
+        // range — `plan` only ever hands out `(region, here)` with
+        // `region < here` — so the two clamps are the same function on every
+        // input generated code can produce, and a mutation between them
+        // survives every test. Recorded rather than tuned away, because they
+        // are *not* the same function on a range that never happens: clamping
+        // to the table would leave `lo > hi` and index a backwards slice.
+        // This is the arm that answers a corrupted immediate with nothing
+        // rather than with a panic in generated-code territory.
+        let lo = (lo as usize).min(hi);
+        for event in &all[lo..hi] {
+            match *event {
+                Event::Charge(ticks) => {
+                    // The context first, then the host — and the order is
+                    // *unobservable*, which is worth writing down because a
+                    // mutation that swaps it survives every test in the tree.
+                    // `IrHost::charge` is handed a `u64` and nothing else; the
+                    // context is a local of `Engine::run` whose only pointer
+                    // lives in generated code's argument register and in this
+                    // thunk's own parameter, so an `H` cannot reach it to read
+                    // or to write. Two writes to disjoint objects with no
+                    // intervening read commute. The order kept is `Interp`'s.
+                    c.ticks = c.ticks.wrapping_add(ticks);
+                    c.committed = 1;
+                    host_of::<H>(c).charge(ticks);
+                }
+                Event::Boundary(index) => {
+                    // `compile` refuses a marker pointing at no record, so the
+                    // skip is unreachable rather than a boundary lost.
+                    let Some(mark) = block.marks().get(index as usize) else {
+                        continue;
+                    };
+                    let mark: &InsnStart = mark;
+                    c.mark = i64::from(index);
+                    c.published = 0;
+                    c.boundaries = c.boundaries.wrapping_add(1);
+                    c.boundary_pc = mark.pc;
+                    // The charged count rather than `mark.ticks`, exactly as
+                    // `Interp` does it: the static column undercounts once an
+                    // access in this block has spent a data-dependent tick.
+                    c.retired = c.ticks;
+                    // Restart granularity is the guest instruction, so the
+                    // previous one's commits stop blocking a retry here.
+                    c.committed = 0;
+                    host_of::<H>(c).insn_start(mark);
+                }
+            }
+        }
     }
 }
 
@@ -392,8 +470,7 @@ impl Vtable {
     #[must_use]
     pub fn of<H: IrHost + FastMem>() -> Vtable {
         Vtable {
-            charge: charge_thunk::<H>,
-            insn_start: insn_start_thunk::<H>,
+            flush: flush_thunk::<H>,
             get_slot: get_slot_thunk::<H>,
             load: load_thunk::<H>,
             store: store_thunk::<H>,
@@ -612,6 +689,10 @@ impl Engine {
         }
         let compiled = &self.arena[code.index as usize];
         let offset = compiled.offset();
+        // The deferred bookkeeping, taken as a raw slice: the `Box`'s
+        // allocation does not move while `self` is borrowed across the call.
+        let events = compiled.events();
+        let (events, event_count) = (events.as_ptr(), events.len() as u64);
         self.last = Some(code);
         self.temps.clear();
         self.temps.resize(block.temp_count(), 0);
@@ -640,6 +721,8 @@ impl Engine {
             committed: 0,
             published: 1,
             fast_hits: 0,
+            events,
+            event_count,
         };
 
         // SAFETY: `offset` names the first byte of a function this buffer
@@ -720,34 +803,33 @@ mod tests {
         assert_eq!(core::mem::offset_of!(Ctx, tlb_mask) as i32, off::TLB_MASK);
         assert_eq!(core::mem::offset_of!(Ctx, tag_bits) as i32, off::TAG_BITS);
         assert_eq!(core::mem::offset_of!(Ctx, out_pc) as i32, off::OUT_PC);
-        assert_eq!(core::mem::offset_of!(Ctx, ticks) as i32, off::TICKS);
-        assert_eq!(core::mem::offset_of!(Ctx, retired) as i32, off::RETIRED);
-        assert_eq!(
-            core::mem::offset_of!(Ctx, boundaries) as i32,
-            off::BOUNDARIES
-        );
-        assert_eq!(
-            core::mem::offset_of!(Ctx, boundary_pc) as i32,
-            off::BOUNDARY_PC
-        );
-        assert_eq!(core::mem::offset_of!(Ctx, mark) as i32, off::MARK);
         assert_eq!(core::mem::offset_of!(Ctx, fault_at) as i32, off::FAULT_AT);
         assert_eq!(
             core::mem::offset_of!(Ctx, fault_error) as i32,
             off::FAULT_ERROR
         );
         assert_eq!(core::mem::offset_of!(Ctx, committed) as i32, off::COMMITTED);
-        assert_eq!(core::mem::offset_of!(Ctx, published) as i32, off::PUBLISHED);
         assert_eq!(core::mem::offset_of!(Ctx, fast_hits) as i32, off::FAST_HITS);
+        // The deferred bookkeeping sits past every declared offset, which is
+        // what lets it be added without moving anything generated code names.
+        assert!(core::mem::offset_of!(Ctx, events) > off::FAST_HITS as usize);
+
+        // The six the bookkeeping took back are still where a displacement
+        // *would* have reached them. They are asserted anyway, and not out of
+        // symmetry: `committed` and `fast_hits` sit past all six, so a field
+        // that moved would move those two with it, and the arithmetic that
+        // says it does not belongs somewhere a reader can check it.
+        assert_eq!(core::mem::offset_of!(Ctx, ticks), 64);
+        assert_eq!(core::mem::offset_of!(Ctx, retired), 72);
+        assert_eq!(core::mem::offset_of!(Ctx, boundaries), 80);
+        assert_eq!(core::mem::offset_of!(Ctx, boundary_pc), 88);
+        assert_eq!(core::mem::offset_of!(Ctx, mark), 96);
+        assert_eq!(core::mem::offset_of!(Ctx, published), 128);
     }
 
     #[test]
     fn the_thunk_table_layout_is_the_one_generated_code_indexes() {
-        assert_eq!(core::mem::offset_of!(Vtable, charge) as i32, vt::CHARGE);
-        assert_eq!(
-            core::mem::offset_of!(Vtable, insn_start) as i32,
-            vt::INSN_START
-        );
+        assert_eq!(core::mem::offset_of!(Vtable, flush) as i32, vt::FLUSH);
         assert_eq!(core::mem::offset_of!(Vtable, get_slot) as i32, vt::GET_SLOT);
         assert_eq!(core::mem::offset_of!(Vtable, load) as i32, vt::LOAD);
         assert_eq!(core::mem::offset_of!(Vtable, store) as i32, vt::STORE);

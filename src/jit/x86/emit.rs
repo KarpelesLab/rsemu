@@ -272,6 +272,18 @@ impl Asm {
         self.code.extend_from_slice(&value.to_le_bytes());
     }
 
+    /// `mov r32, imm32`, which zero-extends into the whole 64-bit register.
+    ///
+    /// Half the bytes of [`Asm::mov_ri`] for the small non-negative constants
+    /// generated code is full of — a slot number, an instruction index — and
+    /// the zero extension is what makes it a whole answer rather than a
+    /// truncation the caller has to think about.
+    pub fn mov_ri32(&mut self, dst: Reg, value: u32) {
+        self.rex(false, 0, dst.high());
+        self.byte(0xb8 + dst.low());
+        self.code.extend_from_slice(&value.to_le_bytes());
+    }
+
     /// `mov dst, src`, 64-bit.
     pub fn mov_rr(&mut self, dst: Reg, src: Reg) {
         self.rex(true, src.high(), dst.high());
@@ -364,6 +376,19 @@ impl Asm {
         self.rex(true, 0, dst.high());
         self.byte(0x81);
         self.modrm_rr(op as u8, dst.low());
+        self.imm32(value);
+    }
+
+    /// `op qword [base + disp], imm32`, 64-bit with the immediate
+    /// sign-extended — a read-modify-write in one instruction.
+    ///
+    /// What a counter in the execution context is bumped with. The three
+    /// instruction form it replaces also destroyed a scratch register, which
+    /// is the part that stopped being free once the allocator wanted them.
+    pub fn alu_mi(&mut self, op: Alu, base: Reg, disp: i32, value: i32) {
+        self.rex(true, 0, base.high());
+        self.byte(0x81);
+        self.modrm_mem(op as u8, base, disp);
         self.imm32(value);
     }
 
@@ -630,6 +655,24 @@ mod tests {
         let mut a = Asm::new();
         a.call_m(Reg::R14, 0x10);
         assert_eq!(a.code(), &[0x41, 0xff, 0x96, 0x10, 0x00, 0x00, 0x00]);
+
+        // `mov esi, 7` — no REX, and the zero extension is the encoding's.
+        let mut a = Asm::new();
+        a.mov_ri32(Reg::Rsi, 7);
+        assert_eq!(a.code(), &[0xbe, 0x07, 0x00, 0x00, 0x00]);
+        let mut a = Asm::new();
+        a.mov_ri32(Reg::R9, 0x1234);
+        assert_eq!(a.code(), &[0x41, 0xb9, 0x34, 0x12, 0x00, 0x00]);
+
+        // `add qword [rbx + 0x88], 1`.
+        let mut a = Asm::new();
+        a.alu_mi(Alu::Add, Reg::Rbx, 0x88, 1);
+        assert_eq!(
+            a.code(),
+            &[
+                0x48, 0x81, 0x83, 0x88, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00
+            ]
+        );
 
         let mut a = Asm::new();
         a.load_zx(Reg::Rax, Reg::Rdx, 0, 1);

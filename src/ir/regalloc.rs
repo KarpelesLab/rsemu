@@ -54,6 +54,17 @@
 //! costs a register on nearly every interval in a block, which on three saved
 //! registers is most of the allocation.
 //!
+//! **A call in the *gap* before an instruction is the other case, and it is
+//! not the same one.** A backend may emit a call that runs before the
+//! instruction it belongs to has read anything — the x86-64 backend replays
+//! its deferred tick bookkeeping that way, once per region rather than once
+//! per guest instruction. Such a call clobbers an interval that is merely
+//! *read* at that instruction, which the rule above deliberately lets keep a
+//! volatile register. So [`CallSites`] carries the two separately and
+//! [`crosses`] tests `start < gap <= end` for one and `start < call < end` for
+//! the other. Collapsing them into one array is safe in exactly one direction
+//! and wrong in the other, which is why they are not one array.
+//!
 //! ## 3. What "spilled" means here, and what it does not
 //!
 //! A spilled temporary lives in its frame slot for the **whole** block rather
@@ -116,6 +127,25 @@ pub struct RegBanks<'a> {
     pub saved: &'a [u8],
     /// Registers a call into the host may clobber.
     pub volatile: &'a [u8],
+}
+
+/// Where a backend's lowering calls into the host, per instruction.
+///
+/// Two arrays because a call's *position within* an instruction's lowering
+/// changes which intervals it can destroy — see rule 2 in the module docs. A
+/// short or missing entry is read as *no call*, so a backend that miscounts
+/// loses an allocation rather than correctness; it is also the one input this
+/// module cannot check for itself, which is why the x86-64 backend derives
+/// both arrays from one expression each and asserts them against the bytes it
+/// emitted.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CallSites<'a> {
+    /// `inside[i]`: instruction `i`'s lowering calls out *after* reading its
+    /// operands and *before* writing its results.
+    pub inside: &'a [bool],
+    /// `before[i]`: a call runs in the gap ahead of instruction `i`, before it
+    /// has read anything at all.
+    pub before: &'a [bool],
 }
 
 /// One block's assignment: a [`Home`] per temporary.
@@ -184,18 +214,15 @@ impl Allocation {
 
 /// Assign every temporary a home.
 ///
-/// `calls[i]` says whether the backend's lowering of instruction `i` contains
-/// a call that clobbers the volatile bank. A short or missing entry is read as
-/// *no call*, so a backend that miscounts loses an allocation rather than
-/// correctness — except that it is exactly the input this cannot check, which
-/// is why the x86 backend derives it from one `match` over the opcode and
-/// asserts the match against its own lowering.
+/// `sites` says where the backend's lowerings call into the host — see
+/// [`CallSites`], and rule 2 in the module docs for why one array would not
+/// have been enough.
 #[must_use]
 pub fn linear_scan(
     block: &Block,
     live: &Liveness,
     banks: &RegBanks<'_>,
-    calls: &[bool],
+    sites: &CallSites<'_>,
 ) -> Allocation {
     let n = block.temp_count();
     let mut alloc = Allocation {
@@ -209,7 +236,8 @@ pub fn linear_scan(
     }
 
     let pinned = pinned(block, live, n);
-    let calls_before = prefix(calls, block.insts().len());
+    let inside = prefix(sites.inside, block.insts().len());
+    let gaps = prefix(sites.before, block.insts().len());
 
     let saved = mask_of(banks.saved);
     let volatile = mask_of(banks.volatile);
@@ -251,7 +279,7 @@ pub fn linear_scan(
         // A value that outlives a call has one bank; one that does not prefers
         // the other, so the scarce bank stays free for the values with no
         // alternative.
-        let crosses = crosses_a_call(&calls_before, start, end);
+        let crosses = crosses(&inside, &gaps, start, end);
         let class = if crosses { saved } else { saved | volatile };
         let order = if crosses {
             [saved, 0]
@@ -358,16 +386,26 @@ fn prefix(calls: &[bool], len: usize) -> Vec<u32> {
     out
 }
 
-/// Whether a call falls strictly between `start` and `end`.
-fn crosses_a_call(before: &[u32], start: u32, end: u32) -> bool {
-    let lo = (start as usize).saturating_add(1);
-    let hi = end as usize;
-    if hi <= lo || before.is_empty() {
+/// Whether any call can destroy a value held from `start` to `end`.
+///
+/// Two windows, and the asymmetry is the whole point (module docs, rule 2): a
+/// call *within* an instruction runs between that instruction's reads and its
+/// writes, so only `start < i < end` reaches the value; a call in the *gap*
+/// ahead of an instruction runs before its reads, so `start < i <= end` does.
+fn crosses(inside: &[u32], gaps: &[u32], start: u32, end: u32) -> bool {
+    any(inside, start + 1, end) || any(gaps, start + 1, end + 1)
+}
+
+/// Whether `counts` records anything in `[lo, hi)`, where `counts[i]` is the
+/// number of marked instructions below `i`.
+fn any(counts: &[u32], lo: u32, hi: u32) -> bool {
+    if counts.is_empty() || hi <= lo {
         return false;
     }
-    let hi = hi.min(before.len() - 1);
-    let lo = lo.min(hi);
-    before[hi] > before[lo]
+    let top = counts.len() - 1;
+    let hi = (hi as usize).min(top);
+    let lo = (lo as usize).min(hi);
+    counts[hi] > counts[lo]
 }
 
 /// The temporaries that must stay in the frame whatever the intervals say.
@@ -457,8 +495,12 @@ mod tests {
     }
 
     fn run(block: &Block, calls: &[bool]) -> Allocation {
+        run_with(block, calls, &[])
+    }
+
+    fn run_with(block: &Block, inside: &[bool], before: &[bool]) -> Allocation {
         let live = Liveness::compute(block);
-        linear_scan(block, &live, &banks(), calls)
+        linear_scan(block, &live, &banks(), &CallSites { inside, before })
     }
 
     #[test]
@@ -591,6 +633,41 @@ mod tests {
             alloc.home(hi),
             "both results of one instruction took the same register: {alloc:?}"
         );
+    }
+
+    #[test]
+    fn a_value_read_at_an_instruction_a_call_runs_ahead_of_takes_a_saved_register() {
+        // The asymmetry rule 2 states, in the one shape that separates the two
+        // arrays: `x` is defined at one instruction and *read* at the next, and
+        // a call runs in the gap between them. Recorded as `inside` the reader
+        // it would not cross — an operand is read before its instruction's own
+        // call — so the volatile bank would look safe and the callee would
+        // destroy the value. Recorded as `before`, it crosses.
+        let mut b = BlockBuilder::new(0, 0);
+        b.insn_start(mark(0, &[]));
+        let x = b.imm(Type::I64, Const::Int(1));
+        let y = b.unary(Opcode::NEG, Type::I64, x);
+        b.insn_start(mark(4, &[(RegSlot(0), y)]));
+        b.exit_tb();
+        let block = b.finish();
+        let n = block.insts().len();
+
+        // The reader is instruction 2. As an `inside` call it does not reach
+        // `x`, whose interval ends there.
+        let mut inside = vec![false; n];
+        inside[2] = true;
+        let Home::Reg(r) = run_with(&block, &inside, &[]).home(x) else {
+            panic!("x should have a register");
+        };
+        assert!(VOLATILE.contains(&r), "r{r} was not the volatile bank");
+
+        // The same call in the gap ahead of instruction 2 does reach it.
+        let mut before = vec![false; n];
+        before[2] = true;
+        let Home::Reg(r) = run_with(&block, &[], &before).home(x) else {
+            panic!("x should still have a register");
+        };
+        assert!(SAVED.contains(&r), "a value a gap call crosses took r{r}");
     }
 
     #[test]

@@ -45,6 +45,66 @@
 //! boundary or a host has thirty-two of them; it is not this frontend on this
 //! host, and [`Allocation::frame_backed`] is where the decision is stated.
 //!
+//! ## Deferred bookkeeping, which is where the guest instructions went
+//!
+//! A lifted RV64I trace is mostly bookkeeping: 130 of its 215 IR instructions
+//! were call sites, because every guest instruction is an
+//! [`Opcode::INSN_START`] and an [`Opcode::CHARGE`] and both used to be a
+//! thunk call with a fistful of context stores around it. Neither emits a
+//! single byte now. They are **replayed** instead, by
+//! [`rt`](super::rt)'s `flush_thunk` — one call per *region* — and a region is
+//! usually the whole block.
+//!
+//! What makes a static range the right answer is a property of the block
+//! rather than an assumption about it. A flush is emitted ahead of every
+//! instruction whose lowering can let the host observe anything — a load, a
+//! store, a slot read — ahead of every terminator, ahead of every
+//! [`Opcode::BRCOND`], and ahead of every instruction a `brcond` targets. Each
+//! of those also **starts** a region. So no branch and no branch target lies
+//! strictly inside a region, every path that reaches a flush entered its
+//! region at the top, and the events in `[region, here)` are exactly the ones
+//! that ran. A branch lands *after* the flush at its target — that is
+//! what `Compiler::starts` records — so the taken path arrives with nothing
+//! pending and the fall-through arrives having replayed the range the branch
+//! skipped.
+//!
+//! Nothing is batched and nothing is reordered: the replay makes the same
+//! calls, with the same arguments, in the same order `ir::Interp` makes them,
+//! and it writes the same context fields — [`Ctx::ticks`](super::rt::Ctx),
+//! `retired`, `boundaries`, `boundary_pc`, `mark`, `committed`, `published`.
+//! A fault therefore still reports the interpreter's exact tick count: the
+//! faulting access is a call site, so its region was replayed *before* the
+//! access was attempted, and `retired` is the charged count as of the last
+//! boundary the run actually passed.
+//!
+//! The two things generated code still writes itself are `committed`, which a
+//! store and a volatile load set after their flush, and `fast_hits`. That is
+//! the whole of a guest instruction's per-instruction cost now: nothing.
+//!
+//! ### What it costs, which is in the allocator
+//!
+//! A flush is a call in the *gap* ahead of an instruction, so a value whose
+//! **last use** is that instruction's operand — a branch condition, a load's
+//! address — needs a callee-saved register where rule 2's "strictly between"
+//! deliberately let it keep a volatile one, and there are three of those.
+//!
+//! `benches/jit_dispatch.rs` never pays it: RV64I traces gained 1.11–1.50×,
+//! and the allocator's own margin over [`Regs::Frame`] went **up**, because
+//! the bookkeeping it used to be measured through is gone. Where it could
+//! bite is `benches/x86_dispatch.rs`'s `branchy` and `load-heavy`, which put a
+//! `brcond` or an access at nearly every guest instruction. Measured twice
+//! against the same baseline, those two came out at 0.94–0.95× and at
+//! 1.02–1.07×, which is the machine's spread rather than a number: call them
+//! flat, and note that `alu-loop`, `memcpy` and `chain` gained 1.06–1.26× in
+//! both runs. The mechanism is real even where the measurement is not, so it
+//! is written down rather than assumed away.
+//!
+//! Moving a `brcond`'s flush onto the branch's **taken edge**, as an
+//! out-of-line pad, would take the gap call off the condition's interval and
+//! is the obvious next thing to try. It is not obviously a win, which is why
+//! it is a measurement and not a patch: in a superblock the taken edge is the
+//! one that stays in the trace, so the pad would land on the hot path.
+//!
 //! Values are held **canonically masked to their type**, exactly as
 //! `ir::Interp` holds them: an `i32` temporary never carries bits above 32 and
 //! an `i1` never carries bits above 1. Every op therefore assumes canonical
@@ -72,11 +132,12 @@
 //! across `note_fast_load`.
 //!
 //! Seven registers is the ceiling, and it is worth knowing why it is so low.
-//! Generated code calls into the host at every `charge`, every `insn_start`,
-//! every `get_slot` and on every access — on a lifted RV64I trace that is 130
-//! call sites in 215 IR instructions — so anything that outlives a guest
-//! instruction needs a callee-saved register, and System V has six of which
-//! two are already the context and the frame.
+//! Generated code still calls into the host at every `get_slot`, on every
+//! access, and at each region's flush, so anything that outlives one of those
+//! needs a callee-saved register, and System V has six of which two are
+//! already the context and the frame. The ceiling has not moved; what moved is
+//! how many calls a block has, which the deferred bookkeeping cut from two per
+//! guest instruction to roughly one per block.
 //!
 //! # Out-of-range shifts
 //!
@@ -97,18 +158,19 @@
 //! with an explicit zero case, so the generated code runs on any x86-64.
 
 use alloc::boxed::Box;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::core::value::Width;
 use crate::ir::{
-    AccessKind, Allocation, Block, Cond, Home, Inst, Liveness, MemOp, MemSpace, Opcode, RegBanks,
-    Sign, Temp, Type, bitfield_parts, linear_scan,
+    AccessKind, Allocation, Block, CallSites, Cond, Home, Inst, Liveness, MemOp, MemSpace, Opcode,
+    RegBanks, Sign, Temp, Type, bitfield_parts, linear_scan,
 };
 use crate::jit::PAGE_MASK;
 use crate::jit::tlb::FastSet;
 
 use super::emit::{Alu, Asm, Cc, Fixup, Reg, Shift};
-use super::rt::{off, status, vt};
+use super::rt::{Event, off, status, vt};
 
 /// Why a block was not compiled.
 ///
@@ -225,6 +287,12 @@ pub struct Compiled {
     /// naming freed memory.
     #[allow(dead_code)]
     mems: Box<[MemOp]>,
+    /// The block's deferred bookkeeping, in instruction order.
+    ///
+    /// A `Box<[Event]>` for the same reason [`Compiled::mems`] is one: the
+    /// runtime is handed a pointer into it and a range, and a `Vec` that were
+    /// ever pushed to would move the allocation under a running block.
+    events: Box<[Event]>,
     /// Where the register allocator put every temporary.
     ///
     /// Carried forward because the *runtime* needs it and cannot re-derive it:
@@ -250,6 +318,14 @@ impl Compiled {
     #[must_use]
     pub fn offset(&self) -> u64 {
         self.offset
+    }
+
+    /// The bookkeeping a flush replays, which the runtime hands generated code
+    /// a range into.
+    #[inline]
+    #[must_use]
+    pub fn events(&self) -> &[Event] {
+        &self.events
     }
 
     /// The same block, recorded as living at `offset`.
@@ -372,20 +448,104 @@ const fn reg_of(n: u8) -> Reg {
     }
 }
 
-/// Whether this backend's lowering of `op` contains a thunk call.
+/// Whether this backend's lowering of `op` calls into the host *after*
+/// reading its operands and *before* writing its results.
 ///
-/// The input [`linear_scan`] cannot check for itself, so it is one expression
-/// that can be read against the lowerings — and
+/// One of the two inputs [`linear_scan`] cannot check for itself, so it is one
+/// expression that can be read against the lowerings — and
 /// `the_call_map_the_allocator_is_given_matches_what_the_lowerings_emit`
 /// asserts it against the emitted bytes rather than against this list.
-const fn calls_out(op: Opcode) -> bool {
+///
+/// `charge` and `insn_start` are **not** here any more, and that is not an
+/// omission: neither emits an instruction. Their call is the region's flush,
+/// which is [`CallSites::before`] instead, because it runs ahead of the
+/// instruction it is attached to rather than inside it.
+const fn calls_inside(op: Opcode) -> bool {
     matches!(
         op,
         // Every access has a slow path with a call on it, whether or not the
         // fast path is taken at run time, and the fast path has its own call
         // to `note_fast_load`.
-        Opcode::LD | Opcode::ST | Opcode::GET_SLOT | Opcode::CHARGE | Opcode::INSN_START
+        Opcode::LD | Opcode::ST | Opcode::GET_SLOT
     )
+}
+
+/// The deferred bookkeeping of one block, and where each region of it is
+/// replayed.
+#[derive(Debug)]
+struct Plan {
+    /// Every [`Opcode::CHARGE`] and [`Opcode::INSN_START`] the block contains,
+    /// in instruction order — the array [`Event`] documents.
+    events: Vec<Event>,
+    /// `at[i]` is the half-open range of [`Plan::events`] a flush emitted in
+    /// the gap ahead of instruction `i` replays, and `None` when no flush is
+    /// emitted there — the common case, because a region with nothing in it
+    /// has nothing to replay.
+    at: Vec<Option<(u32, u32)>>,
+}
+
+/// Collect a block's bookkeeping and decide where to replay it.
+///
+/// See the module docs for why a static range is exactly what ran. The rule is
+/// one pass: an instruction is a **region boundary** when it can let the host
+/// observe something ([`calls_inside`]), when it is a terminator, when it is a
+/// `brcond`, or when a `brcond` targets it. At a boundary the pending range is
+/// flushed if it holds anything, and a new region starts at that instruction
+/// whether or not anything was flushed — dropping an empty range loses
+/// nothing, and it is what keeps the two sides of a branch agreeing about
+/// where their region began.
+///
+/// # Errors
+///
+/// [`Refusal`] for a charge with no tick count or a boundary marker that
+/// points at no record. Refused here rather than replayed as a charge of zero
+/// or a boundary that never happens: the interpreter reports such a block as
+/// an error, and the two engines have to agree about that too.
+fn plan(block: &Block) -> Result<Plan, Refusal> {
+    let insts = block.insts();
+    let n = insts.len();
+    let mut target = vec![false; n];
+    for inst in insts {
+        if inst.op == Opcode::BRCOND
+            && let Some(slot) = target.get_mut(inst.aux as usize)
+        {
+            *slot = true;
+        }
+    }
+    let mut events: Vec<Event> = Vec::new();
+    let mut at = vec![None; n];
+    let mut region = 0u32;
+    for (i, inst) in insts.iter().enumerate() {
+        let op = inst.op;
+        if target[i] || calls_inside(op) || op == Opcode::BRCOND || op.is_terminator() {
+            let here = events.len() as u32;
+            if here > region {
+                at[i] = Some((region, here));
+            }
+            region = here;
+        }
+        match op {
+            Opcode::CHARGE => {
+                let ticks = inst
+                    .imm
+                    .ok_or(Refusal::Shape("a charge needs a tick count"))?
+                    .bits() as u64;
+                events.push(Event::Charge(ticks));
+            }
+            Opcode::INSN_START => {
+                block
+                    .marks()
+                    .get(inst.aux as usize)
+                    .ok_or(Refusal::Shape("the boundary marker points at no record"))?;
+                events.push(Event::Boundary(inst.aux));
+            }
+            _ => {}
+        }
+    }
+    // One event per instruction at most, and `Compiler::new` has already
+    // refused a block whose instruction count does not fit in an `i32`, so
+    // every index a flush carries is a `u32` that fits.
+    Ok(Plan { events, at })
 }
 
 /// The `mem` table, collected before anything is emitted so its addresses are
@@ -410,8 +570,11 @@ struct Compiler<'a> {
     alloc: Allocation,
     /// The next descriptor to hand out, in the order [`descriptors`] collected.
     next_mem: usize,
-    /// Where each IR instruction's code begins.
+    /// Where each IR instruction's code begins — **after** any flush emitted
+    /// ahead of it, because that is where a branch has to land.
     starts: Vec<usize>,
+    /// The deferred bookkeeping and where it is replayed, from [`plan`].
+    plan: Plan,
     /// Branches whose target is an IR instruction index.
     branches: Vec<(Fixup, usize)>,
     /// Jumps to the epilogue.
@@ -445,11 +608,19 @@ impl<'a> Compiler<'a> {
         {
             return Err(Refusal::Shape("the block has too many temporaries"));
         }
+        // Every instruction index reaches generated code as an immediate —
+        // a fault's `at`, a flush's range — so the whole block has to fit in
+        // one.
+        if i32::try_from(block.insts().len()).is_err() {
+            return Err(Refusal::Shape("the block is too long"));
+        }
+        let plan = plan(block)?;
         let alloc = match regs {
             Regs::Frame => Allocation::none(block),
             Regs::Scan => {
                 let live = Liveness::compute(block);
-                let calls: Vec<bool> = block.insts().iter().map(|i| calls_out(i.op)).collect();
+                let inside: Vec<bool> = block.insts().iter().map(|i| calls_inside(i.op)).collect();
+                let before: Vec<bool> = plan.at.iter().map(Option::is_some).collect();
                 linear_scan(
                     block,
                     &live,
@@ -457,7 +628,10 @@ impl<'a> Compiler<'a> {
                         saved: &SAVED,
                         volatile: &VOLATILE,
                     },
-                    &calls,
+                    &CallSites {
+                        inside: &inside,
+                        before: &before,
+                    },
                 )
             }
         };
@@ -468,6 +642,7 @@ impl<'a> Compiler<'a> {
             alloc,
             next_mem: 0,
             starts: Vec::with_capacity(block.insts().len()),
+            plan,
             branches: Vec::new(),
             exits: Vec::new(),
         })
@@ -480,6 +655,11 @@ impl<'a> Compiler<'a> {
         }
         self.prologue();
         for (at, inst) in insts.iter().enumerate() {
+            // Before the position a branch lands on, so the taken path skips
+            // the range it did not execute — see the module docs.
+            if let Some((lo, hi)) = self.plan.at[at] {
+                self.flush(lo, hi);
+            }
             self.starts.push(self.asm.here());
             self.inst(at, inst)?;
         }
@@ -491,6 +671,7 @@ impl<'a> Compiler<'a> {
         Ok(Compiled {
             code: self.asm.finish(),
             mems: self.mems,
+            events: self.plan.events.into_boxed_slice(),
             alloc: self.alloc,
             offset: 0,
         })
@@ -747,15 +928,30 @@ impl<'a> Compiler<'a> {
         self.asm.mov_rr(Reg::Rdi, Reg::Rbx);
     }
 
-    /// Add one to a `u64` context field.
+    /// Add one to a `u64` context field, in one instruction and without
+    /// destroying a register.
     fn bump(&mut self, field: i32) {
-        self.asm.mov_rm(Reg::Rax, Reg::Rbx, field);
-        self.asm.alu_ri(Alu::Add, Reg::Rax, 1);
-        self.asm.mov_mr(Reg::Rbx, field, Reg::Rax);
+        self.asm.alu_mi(Alu::Add, Reg::Rbx, field, 1);
+    }
+
+    /// Replay events `lo .. hi`: the region's charges and boundaries.
+    ///
+    /// See the module docs for why the range is exactly what ran, and
+    /// [`rt`](super::rt)'s `flush_thunk` for what it does with it.
+    fn flush(&mut self, lo: u32, hi: u32) {
+        self.ctx_to_rdi();
+        self.asm.mov_ri32(Reg::Rsi, lo);
+        self.asm.mov_ri32(Reg::Rdx, hi);
+        self.call(vt::FLUSH);
     }
 
     /// The sequence a faulting access jumps to: record where and why, and
     /// leave. `rax` holds the error code on entry.
+    ///
+    /// No flush: this is only ever emitted inside a load or a store, which is
+    /// a region boundary, so everything up to the faulting access has already
+    /// been replayed — which is exactly what makes the fault's reported tick
+    /// count the interpreter's.
     fn fault(&mut self, at: usize) -> Result<(), Refusal> {
         let at = i32::try_from(at).map_err(|_| Refusal::Shape("the block is too long"))?;
         self.asm.mov_mr(Reg::Rbx, off::FAULT_ERROR, Reg::Rax);
@@ -788,7 +984,7 @@ impl<'a> Compiler<'a> {
             }
             Opcode::GET_SLOT => {
                 self.ctx_to_rdi();
-                self.asm.mov_ri(Reg::Rsi, u64::from(inst.aux & 0xffff));
+                self.asm.mov_ri32(Reg::Rsi, inst.aux & 0xffff);
                 self.call(vt::GET_SLOT);
                 self.write(inst, Reg::Rax)?;
             }
@@ -989,45 +1185,10 @@ impl<'a> Compiler<'a> {
             Opcode::BRCOND => self.brcond(at, inst, w)?,
             Opcode::LD => self.load(at, inst)?,
             Opcode::ST => self.store(at, inst)?,
-            Opcode::CHARGE => {
-                let ticks = inst
-                    .imm
-                    .ok_or(Refusal::Shape("a charge needs a tick count"))?
-                    .bits() as u64;
-                // Exactly what `Interp` does, in the same order: the running
-                // count, the commit flag, then the host — unbatched, because
-                // the count is hashed output rather than a budget.
-                self.asm.mov_rm(Reg::Rax, Reg::Rbx, off::TICKS);
-                self.asm.mov_ri(Reg::Rdx, ticks);
-                self.asm.alu_rr(Alu::Add, Reg::Rax, Reg::Rdx);
-                self.asm.mov_mr(Reg::Rbx, off::TICKS, Reg::Rax);
-                self.asm.mov_mi(Reg::Rbx, off::COMMITTED, 1);
-                self.ctx_to_rdi();
-                self.asm.mov_ri(Reg::Rsi, ticks);
-                self.call(vt::CHARGE);
-            }
-            Opcode::INSN_START => {
-                let index = inst.aux;
-                let mark = self
-                    .block
-                    .marks()
-                    .get(index as usize)
-                    .ok_or(Refusal::Shape("the boundary marker points at no record"))?;
-                let pc = mark.pc;
-                let index32 =
-                    i32::try_from(index).map_err(|_| Refusal::Shape("too many boundaries"))?;
-                self.asm.mov_mi(Reg::Rbx, off::MARK, index32);
-                self.asm.mov_mi(Reg::Rbx, off::PUBLISHED, 0);
-                self.bump(off::BOUNDARIES);
-                self.asm.mov_ri(Reg::Rax, pc);
-                self.asm.mov_mr(Reg::Rbx, off::BOUNDARY_PC, Reg::Rax);
-                self.asm.mov_rm(Reg::Rax, Reg::Rbx, off::TICKS);
-                self.asm.mov_mr(Reg::Rbx, off::RETIRED, Reg::Rax);
-                self.asm.mov_mi(Reg::Rbx, off::COMMITTED, 0);
-                self.ctx_to_rdi();
-                self.asm.mov_ri(Reg::Rsi, u64::from(index));
-                self.call(vt::INSN_START);
-            }
+            // Both of these emit **nothing**. Everything they do is an
+            // [`Event`] in the region's flush — see the module docs — and
+            // [`plan`] is where a malformed one is refused.
+            Opcode::CHARGE | Opcode::INSN_START => {}
             Opcode::GOTO_TB => {
                 let pc = inst
                     .imm

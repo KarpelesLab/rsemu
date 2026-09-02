@@ -88,9 +88,9 @@ use libfuzzer_sys::fuzz_target;
 
 use rsemu::core::value::Width;
 use rsemu::ir::{
-    AccessKind, Align, Block, BlockBuilder, Cond, Const, Endian, Home, InsnStart, Liveness, MemOp,
-    MemSpace, Opcode, RegBanks, RegSlot, SegId, Sign, Temp, Type, eliminate_dead_code, linear_scan,
-    verify,
+    AccessKind, Align, Block, BlockBuilder, CallSites, Cond, Const, Endian, Home, InsnStart,
+    Liveness, MemOp, MemSpace, Opcode, RegBanks, RegSlot, SegId, Sign, Temp, Type,
+    eliminate_dead_code, linear_scan, verify,
 };
 
 /// How many selectors one input may drive. A block a frontend builds is tens
@@ -556,16 +556,30 @@ fuzz_target!(|data: &[u8]| {
     // Three properties, each of which is a silent miscompile rather than a
     // crash when it stops holding.
     let live = Liveness::compute(&block);
-    let calls: Vec<bool> = block
+    let inside: Vec<bool> = block
         .insts()
         .iter()
         .map(|i| matches!(i.op, Opcode::LD | Opcode::ST | Opcode::CALL_HELPER))
         .collect();
+    // The other half of `CallSites`: a call in the *gap* ahead of an
+    // instruction, which is what the x86-64 backend's deferred bookkeeping
+    // emits. Placed at the terminators and the branches, which is where that
+    // backend places it, so the fuzzer reaches the arm the interval rule
+    // treats differently rather than only the one it always had.
+    let before: Vec<bool> = block
+        .insts()
+        .iter()
+        .map(|i| i.op == Opcode::BRCOND || i.op.is_terminator())
+        .collect();
+    let sites = CallSites {
+        inside: &inside,
+        before: &before,
+    };
     let banks = RegBanks {
         saved: &[0, 1, 2],
         volatile: &[3, 4, 5, 6],
     };
-    let alloc = linear_scan(&block, &live, &banks, &calls);
+    let alloc = linear_scan(&block, &live, &banks, &sites);
 
     // 1. The same block allocates the same way every time. Register
     //    assignment decides guest-visible state, so a hashed iteration order
@@ -573,7 +587,7 @@ fuzz_target!(|data: &[u8]| {
     //    identity (`ROADMAP.md` §0).
     assert_eq!(
         alloc,
-        linear_scan(&block, &live, &banks, &calls),
+        linear_scan(&block, &live, &banks, &sites),
         "the allocation is not reproducible"
     );
 
