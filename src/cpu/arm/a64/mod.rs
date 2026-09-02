@@ -81,7 +81,14 @@
 //! `UNDEFINED`), AArch32 at any level, the generic timer, `LDXP`/`STXP`, the
 //! unprivileged `LDTR`/`STTR` family, pointer authentication, MTE, SVE,
 //! big-endian data, and the `DC ZVA` block operation — `DCZID_EL0.DZP` says
-//! so.
+//! so.//!
+//! # Accuracy
+//!
+//! `conformance` runs a suite this repository **builds** rather than fetches,
+//! because no usable AArch64 corpus exists; its module documentation says what
+//! that does and does not prove. The instruction table has also been diffed
+//! against `llvm-mc` over a sample of the encoding space, which is what found
+//! the missing `LDNP`/`STNP` rows.
 
 //!
 //! # Timing
@@ -109,6 +116,15 @@ pub mod sysreg;
 
 #[cfg(test)]
 mod tests;
+
+// The conformance corpus is built by a script into a directory named by an
+// environment variable, and the runner reads it off the filesystem — so it is
+// a `std` test even though the core it exercises is not.
+#[cfg(all(test, feature = "std"))]
+mod conformance;
+
+#[cfg(all(test, feature = "std"))]
+mod elf;
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};

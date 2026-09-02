@@ -211,6 +211,60 @@ already made once.
 
 **Gate (`ROADMAP.md` §13):** phase 5, alongside booting Linux on `riscv-virt`.
 
+## AArch64 — `a64-tests`, the suite we build
+
+MIT, ours: the guests are `tests/a64/*.rs`. **Nothing is downloaded**, because
+there is nothing usable to download — SingleStepTests has no AArch64
+repository, Arm's Architecture Validation Suite is licensed to implementers,
+`rems-project/sail-arm` is a model rather than a corpus, and
+`kvm-unit-tests`'s arm64 target is GPL-2.0 *and* a machine gate rather than a
+core one.
+
+```sh
+scripts/fetch-testdata.sh a64-tests
+RSEMU_A64_TESTS=testdata/a64-tests \
+    cargo test --all-features a64_conformance -- --nocapture
+```
+
+The only tool is `rustc` with the `aarch64-unknown-none` target installed
+(`rustup target add aarch64-unknown-none`). That target's linker is the
+`rust-lld` inside the toolchain, so there is no C toolchain anywhere in this
+path — which is why, unlike `riscv-arch-test`, this suite is cheap enough to
+run anywhere.
+
+Each guest runs to a `BRK #0` and reports through `x0`–`x3`: zero for success,
+otherwise a case number, what it produced, what it should have produced, and a
+subtest tag. The core is run with `BREAKPOINT`, `FAULT` and `SYSCALL` armed, so
+an unexpected `UNDEFINED` **leaves the core** and the runner prints the
+faulting address, `ESR_EL1`, and the instruction disassembled — which is how
+the missing Advanced SIMD `MOVI Dd, #0` in an early build of `fp_rules` was
+diagnosed in one line.
+
+**Generating a corpus removes the licensing problem completely. It does not by
+itself remove the evidence problem**, so two of the five guests take their
+expectations from outside this project:
+
+| Guest | Expectations come from |
+| --- | --- |
+| `fp_arith` | `rustc`'s constant evaluator (`rustc_apfloat`, a port of LLVM's `APFloat`) — an independent IEEE-754 implementation. Correctly-rounded operations are unique, so a disagreement means one of the two is wrong. Thirty-odd hand-chosen operand pairs |
+| `fp_random` | the same oracle over a **generated** sweep: a const-evaluated LCG shaped so zeros, subnormals, infinities and NaNs each appear a few percent of the time. 8 000 `binary64` vectors and 4 000 `binary32` ones — still two orders of magnitude short of a SingleStepTests corpus, which is why the file says so |
+| `fp_convert` | the same, for `as` casts: Rust's float→int cast saturates with NaN→0, which is exactly `FCVTZS`/`FCVTZU`, so LLVM emits the bare instruction |
+| `integer` | `rustc` again for the arithmetic — but the value is the *instruction selection*, which nobody here chose: `SDIV`+`MSUB`, `UMULH`+`MADD`+`ADCS`, `RBIT`+`CLZ`, and several hundred instructions of `compiler_builtins` for a `u128` divide |
+| `memory` | properties (a byte written is the byte), plus DDI 0487 B2.9 for the exclusive-monitor cases |
+| `fp_rules` | **ours**, transcribed from DDI 0487: the rounding modes, `FPSR`'s sticky flags, `FCMP`'s four-way `NZCV`, `FPMulAdd`'s NaN order. Directed tests that happen to run in a guest, not conformance evidence — the file says so at the top |
+
+| Variable | Effect |
+| --- | --- |
+| `RSEMU_A64_TESTS=/path` | where the built guests are; without it the test prints how to build them and passes |
+| `RSEMU_A64_TESTS_ONLY=fp_arith,memory` | run only the guests whose name contains one of these |
+
+**6 of 6** as of the commit that added floating point, with an empty ledger.
+The ledger is a `const` list in `src/cpu/arm/a64/conformance.rs` rather than a
+file under `ledgers/`, because this suite's runner lives in the crate beside
+the core it measures; it is enforced both ways round like every other one here.
+
+**Gate (`ROADMAP.md` §13):** phases 6–8, alongside the ARM JIT frontend.
+
 ## The known-failures ledger
 
 Each suite has a ledger under

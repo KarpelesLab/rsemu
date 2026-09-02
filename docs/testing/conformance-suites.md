@@ -137,11 +137,44 @@ repeated here — they drifted once already.
 
 | Milestone | Suites |
 | --- | --- |
+| AArch64 (`a64-mini`) | `a64-tests` — the suite this repository *builds* rather than fetches, because no usable AArch64 corpus exists. See below |
 | NES | SingleStepTests 65x02 (documented opcodes 100 %; the analog unstable ones ledgered separately), `nestest` trace-identical, blargg `cpu_instrs` + `instr_timing`, AccuracyCoin (licence permitting) |
 | Game Boy / SMS | `mooneye-test-suite` acceptance, blargg GB, `zexall` |
 | RISC-V `virt` | `riscv-tests`, `riscv-arch-test` (in-tree runner, Sail as the reference — no RISCOF), Linux boot to shell |
 | PC | `test386.asm`, SingleStepTests 8088, then real-OS boots (FreeDOS → Win 3.11 → Win 95 → Linux → Win XP) |
 | SMP emulation | `kvm-unit-tests` atomics/barriers, plus memory-model litmus tests ([`../techniques/memory-models.md`](../techniques/memory-models.md)) |
+
+## The AArch64 exception: a corpus we generate
+
+There is no AArch64 corpus this project can use. SingleStepTests has no
+AArch64 repository; Arm's Architecture Validation Suite is licensed to
+implementers; `rems-project/sail-arm` is permissive but is a *model* needing a
+Sail/OCaml toolchain rather than a downloadable corpus; and `kvm-unit-tests`
+has an arm64 target but is GPL-2.0 and is a machine gate rather than a core
+one.
+
+So `scripts/fetch-testdata.sh a64-tests` **builds** a suite instead. The guests
+are `tests/a64/*.rs` — ours, MIT — compiled by `rustc --target
+aarch64-unknown-none`, which needs no C toolchain because that target's linker
+is the `rust-lld` inside the Rust toolchain. Each runs to a `BRK #0` and
+reports through `x0`–`x3`; `src/cpu/arm/a64/conformance.rs` is the runner.
+
+Generating a corpus removes the *licensing* problem completely and does not by
+itself remove the *evidence* problem, so two of the five guests take their
+expected values from somewhere that is not this project:
+
+- **`rustc`'s constant evaluator as a floating-point oracle.** Each expectation
+  in `fp_arith.rs` and `fp_convert.rs` is computed on the host at compile time
+  by `rustc_apfloat` — a port of LLVM's `APFloat`, sharing no code with
+  `src/float` — and computed again at run time by the guest, where
+  `core::hint::black_box` forces real `FADD`/`FCVTZS` instructions. IEEE 754
+  §5.1 makes those operations correctly rounded and therefore unique, so a
+  disagreement means one of two independent implementations is wrong.
+- **LLVM's instruction selector as an encoding generator.** The guests are
+  ordinary Rust and nobody here chose which instructions they contain.
+
+`fp_rules.rs` and the second half of `memory.rs` are directed tests
+transcribed from DDI 0487 rather than conformance evidence, and they say so.
 
 ## Framework-level testing
 
