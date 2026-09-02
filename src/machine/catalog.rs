@@ -305,6 +305,25 @@ pub static Q35: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/q35.machine"),
 };
 
+/// A PC with a long-mode processor and a kernel loaded straight into it.
+///
+/// No firmware, no boot loader, no disk: a `bzImage` bound to the `kernel`
+/// slot is written into memory and entered at its own 32-bit entry point
+/// (`crate::dev::linuxboot`), which is the shortest path from power-on to a
+/// modern kernel's own console output and therefore the shortest path to
+/// finding out what `ROADMAP.md` phase 6b's core still cannot do.
+///
+/// The console is a 16550 on the character seam, so `console=ttyS0` is where
+/// everything the guest says comes out.
+#[cfg(feature = "machine-pc64")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-pc64")))]
+pub static PC64: CatalogEntry = CatalogEntry {
+    name: "pc64",
+    summary: "a long-mode PC with no firmware: 8259As, 8254, MC146818, 16550, and a Linux kernel",
+    media: &["kernel", "initrd"],
+    source: include_str!("../../machines/pc64.machine"),
+};
+
 /// An STM32F407VGT6 microcontroller, when this build has a Cortex-M core.
 ///
 /// A real part rather than a synthetic board: the microcontroller on ST's own
@@ -501,6 +520,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&PC_APIC);
     #[cfg(feature = "machine-q35")]
     out.push(&Q35);
+    #[cfg(feature = "machine-pc64")]
+    out.push(&PC64);
     #[cfg(feature = "machine-nes")]
     out.push(&NES_NTSC);
     #[cfg(feature = "machine-nes")]
@@ -676,6 +697,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::pc::register(&mut reg)?;
     #[cfg(feature = "dev-q35")]
     crate::dev::q35::register(&mut reg)?;
+    #[cfg(feature = "dev-linuxboot")]
+    crate::dev::linuxboot::register(&mut reg)?;
     #[cfg(feature = "bus-spi")]
     crate::bus::spi::controller::register(&mut reg)?;
     #[cfg(feature = "dev-st7272a")]
@@ -780,6 +803,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::pc::bind(&mut b)?;
     #[cfg(feature = "dev-q35")]
     crate::dev::q35::bind(&mut b)?;
+    #[cfg(feature = "dev-linuxboot")]
+    crate::dev::linuxboot::bind(&mut b)?;
     #[cfg(feature = "bus-spi")]
     crate::bus::spi::controller::bind(&mut b)?;
     #[cfg(feature = "dev-st7272a")]
@@ -912,6 +937,8 @@ pub fn classes() -> ClassTable {
     for schema in crate::dev::q35::schemas() {
         table.insert(schema);
     }
+    #[cfg(feature = "dev-linuxboot")]
+    table.insert(crate::dev::linuxboot::schema());
     #[cfg(feature = "dev-lcdc")]
     for schema in crate::dev::lcd::schemas() {
         table.insert(schema);
@@ -1693,6 +1720,13 @@ mod tests {
             ("q35", "vgabios") => blank(32 * 1024),
             #[cfg(feature = "machine-q35")]
             ("q35", "hd0" | "hd1") => &[],
+            // No kernel and no ramdisk. An unbound `kernel` slot is a machine
+            // with nothing to boot, which the loader treats as nothing to do
+            // rather than as an error — so this proves the board realizes
+            // without a 12 MiB fixture nobody could commit. `tests/pc64_linux`
+            // is where a real one runs, behind `RSEMU_KERNEL`.
+            #[cfg(feature = "machine-pc64")]
+            ("pc64", "kernel" | "initrd") => &[],
             (m, other) => panic!("no fixture for `{m}`'s media slot `{other}`"),
         }
     }

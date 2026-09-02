@@ -1011,6 +1011,20 @@ dev-q35 = ["dev-pc", "bus-pci"]
 # `unsafe`, no dependencies.
 dev-ata-disk = ["dev-medium"]
 
+# Entering a Linux/x86 kernel with no firmware in between (src/dev/linuxboot.rs):
+# the Linux/x86 boot protocol as a device. It parses a `bzImage`'s setup header,
+# writes the protected-mode kernel to its own `code32_start`, builds the zero
+# page — the setup header the image carries, the command line, the ramdisk and
+# an e820 map — and publishes a `reset` region holding the far jump to an
+# eleven-instruction stub that puts the processor in flat protected mode and
+# jumps to the kernel. That is what makes a modern kernel reachable without a
+# BIOS, a boot sector and a boot loader, and it is the same short circuit
+# `riscv.loader` is on the other board. The protocol is an ABI between a loader
+# and an image, read out of a real bzImage and cross-checked against `file(1)`;
+# no kernel source was consulted (ROADMAP.md §1). `no_std + alloc`, no
+# dependencies.
+dev-linuxboot = []
+
 # What a drive's platter *is* (src/dev/medium.rs): the `Medium` trait -- capacity,
 # bytes by offset, flush, read-only, and a snapshot policy -- plus the media slot
 # a run installs one into, which is the other half of `--drive hd0=disk.qcow2`.
@@ -1211,6 +1225,22 @@ machine-q35 = [
   "dev-pc-ide",
   "dev-ata-disk",
 ]
+
+# The pc64 board (machines/pc64.machine): a PC with a long-mode processor and no
+# firmware at all. A `bzImage` bound to the `kernel` media slot is written into
+# memory and entered at its 32-bit entry point, so the first thing that executes
+# after the reset vector is the kernel's own decompressor. Two 8259As, an 8254,
+# an MC146818 and a 16550 console, and nothing else: everything on it is
+# something a kernel's early boot touches. This is where `ROADMAP.md` phase 6b's
+# core meets a modern guest. Adds no dependencies.
+#
+# `dev-riscv` is here for **one device**: the 16550, whose class is `uart.ns16550`
+# and which lives under `dev/riscv/` because the `virt` board was the first
+# machine to want one. Its own module docs call that placement provisional and
+# name the fix -- move it to `dev/uart/` the day a second board wants it, which
+# is today. Not done here because the move also has to cfg-gate its device-tree
+# `DtSource` impl, and that is a RISC-V change riding on an x86 commit.
+machine-pc64 = ["cpu-x86", "dev-pc", "dev-riscv", "dev-linuxboot"]
 
 # The in-house legacy PC BIOS (src/fw/pcbios): a 64 KiB real-mode ROM image
 # this crate assembles itself, so `pc-at` boots with nothing supplied from

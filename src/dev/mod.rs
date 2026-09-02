@@ -24,6 +24,7 @@
 //! | [`pc`] | `dev-pc` | an IBM PC/AT board's chips: 8259A, 8254, 8042, MC146818, 8237A, the firmware socket |
 //! | [`ppu`] | `dev-nes-ppu` | the RP2C02 picture unit: the per-dot pipeline |
 //! | [`lcd`] | `dev-lcdc` | a generic RGB scanout engine: framebuffer in, `Scanout` out |
+//! | [`linuxboot`] | `dev-linuxboot` | the Linux/x86 boot protocol: a bzImage into memory and a stub that enters it |
 //! | [`sitronix`] | `dev-st7272a` | the ST7272A TFT panel driver: SPI register configuration, no pixel path |
 //! | [`stm32`] | `dev-stm32` | STM32 peripherals: a GPIO port and a USART |
 //! | [`q35`] | `dev-q35` | the q35 chipset: an 82Q35 (G)MCH, an ICH9 LPC bridge, ECAM, and the ACPI table generator |
@@ -106,6 +107,10 @@ pub mod ppu;
 #[cfg(feature = "dev-lcdc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-lcdc")))]
 pub mod lcd;
+
+#[cfg(feature = "dev-linuxboot")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-linuxboot")))]
+pub mod linuxboot;
 
 #[cfg(feature = "dev-st7272a")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-st7272a")))]
