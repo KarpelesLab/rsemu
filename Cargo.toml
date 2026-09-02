@@ -968,14 +968,20 @@ machine-pc-at = [
 ]
 
 # The same lineage stripped to its interrupt path (machines/pc-apic.machine):
-# an x86, the two cascaded 8259As, a local APIC, an I/O APIC and an HPET, and
-# nothing else -- no video, no disks, no PCI, no DMA. `machine-pc-at` carries
-# all of those parts too, so this is not "the board with an APIC" but the board
-# with *only* what an APIC question involves, which is what makes a failure in
-# `tests/pc_apic.rs` name the interrupt controller rather than the bus it shared.
-# The structural difference is one wire: the master 8259A reaches `LINT0`
-# directly rather than through an IMCR, so this board is in the MP
-# specification's virtual-wire mode from the first instruction. Adds no
+# **two** x86s with a local APIC each, the two cascaded 8259As, an I/O APIC and
+# an HPET, and nothing else -- no video, no disks, no PCI, no DMA.
+# `machine-pc-at` carries all of those parts too, so this is not "the board with
+# an APIC" but the board with *only* what an APIC question involves, which is
+# what makes a failure in `tests/pc_apic.rs` name the interrupt controller
+# rather than the bus it shared.
+#
+# It is also the tree's multiprocessor board. The second processor is an
+# application processor and never executes the reset vector: its local APIC
+# parks it in wait-for-SIPI at power-up, as the MP initialization protocol does,
+# so firmware starts it with that specification's INIT/Start-Up sequence or it
+# does not run at all. The other structural difference from `pc-at` is one wire:
+# the master 8259A reaches `LINT0` directly rather than through an IMCR, so this
+# board is in virtual-wire mode from the first instruction. Adds no
 # dependencies.
 machine-pc-apic = ["cpu-x86", "dev-pc", "dev-pc-apic", "dev-pc-hpet"]
 
