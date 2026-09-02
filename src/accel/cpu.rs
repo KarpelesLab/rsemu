@@ -30,7 +30,7 @@
 //! # The shape: an interpreter shell with a hypervisor underneath
 //!
 //! [`AccelCpu`] owns a real [`X86`], and that is the design rather than an
-//! implementation detail. `cpu.x86` is eighteen properties, five input pins,
+//! implementation detail. `cpu.x86` is nineteen properties, five input pins,
 //! the [`IntAck`] and [`LocalController`] seams and a snapshot chunk at
 //! **version 7**; a second implementation of all of that would be a second
 //! thing to keep in step, and the first field to drift would be the one the
