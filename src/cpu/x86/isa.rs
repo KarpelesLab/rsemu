@@ -736,6 +736,7 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("MUL", "mul"),
     ("NEG", "neg"),
     ("NOP", "nop"),
+    ("NOPR", "nop"),
     ("NOT", "not"),
     ("OR", "or"),
     ("OUT", "out"),
@@ -1097,6 +1098,7 @@ define_ops! {
     MUL = "unsigned multiply",
     NEG = "two's complement negate",
     NOP = "no operation (the XCHG AX,AX encoding)",
+    NOPR = "no operation (the reserved-NOP space at 0F 18-0F 1F, ENDBR64 among it)",
     NOT = "one's complement",
     OR = "bitwise OR",
     OUT = "write a byte or word to an I/O port",
@@ -2498,6 +2500,40 @@ const SECONDARY: ([Insn; 256], [bool; 256]) = opmap! {
     0x02 LAR   Gv   Ev   None   Documented;
     0x03 LSL   Gv   Ev   None   Documented;
     0x06 CLTS  None None None   Documented;
+
+    // The **reserved-NOP space**: `0F 18` through `0F 1F`, plus `0F 0D`.
+    //
+    // The *Intel SDM* volume 2 Appendix A prints "NOP Ev" for `0F 19`-`0F 1F`
+    // outright, `Grp16` for `0F 18` (the four `PREFETCH` hints and four
+    // reserved encodings, all architecturally hints) and `Grp P` for `0F 0D`
+    // (`PREFETCHW` where 3DNow prefetch exists, a NOP where it does not). Each
+    // takes a ModRM byte and its displacement and does nothing, which is why
+    // one row covers all of it: the operand is decoded so the instruction has
+    // the right length, and never accessed.
+    //
+    // Two things in circulation land here and neither is optional. `0F 1F /0`
+    // is *the* multi-byte NOP a compiler pads with, so it is on every fifth
+    // line of a 64-bit kernel. And `F3 0F 1E FA` is `ENDBR64`, which begins
+    // every function of a kernel built with indirect-branch tracking — on a
+    // processor without CET it is exactly a NOP, and the `F3` map inherits
+    // this row rather than needing one of its own. A core that raises `#UD`
+    // here reaches the kernel's first function and triple-faults, which is
+    // what this core did (`tests/pc64_linux.rs`).
+    //
+    // Not gated on a feature: these are `#UD` on a 386 and a 486, and this
+    // table is the 386's. The gate would be a `Features` bit meaning "P6 or
+    // later", which does not exist and which nothing else would use — and the
+    // hardware corpus cannot see the difference either way, because
+    // `SingleStepTests/8088` has no `0F` file at all.
+    0x0d NOPR  Ev   None None   Documented;
+    0x18 NOPR  Ev   None None   Documented;
+    0x19 NOPR  Ev   None None   Documented;
+    0x1a NOPR  Ev   None None   Documented;
+    0x1b NOPR  Ev   None None   Documented;
+    0x1c NOPR  Ev   None None   Documented;
+    0x1d NOPR  Ev   None None   Documented;
+    0x1e NOPR  Ev   None None   Documented;
+    0x1f NOPR  Ev   None None   Documented;
     0x08 INVD  None None None   Documented;
     0x09 WBINVD None None None  Documented;
 

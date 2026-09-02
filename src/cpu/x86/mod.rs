@@ -2758,7 +2758,9 @@ pub static CLASS: DeviceClass = DeviceClass {
     //    `XMM` registers and `MXCSR`.
     // 6: the multiprocessor block — the wait-for-SIPI state, the two `INIT`
     //    levels, the INIT latch and the Start-Up page.
-    version: 6,
+    // 7: `IA32_MISC_ENABLE`, whose execute-disable lock decides what `CPUID`
+    //    reports about `NX` and is therefore guest-visible state.
+    version: 7,
     summary: "Intel x86 CPU core: 8086/8088 real mode, 80386/80486 protected mode, or x86-64",
     properties: &[
         PropertySpec {
@@ -3197,6 +3199,14 @@ impl Device for X86 {
         let page = self.lines.startup_pending();
         w.write_bool(page.is_some())?;
         w.write_u8(page.unwrap_or(0))?;
+        // `IA32_MISC_ENABLE`, appended for the reason the three blocks before
+        // it were: everything ahead of it keeps the offset it had, so
+        // `host::gdb::arch`'s indexing into the first sixty-four bytes is
+        // untouched. It is one register rather than a block because it is the
+        // only model-specific register this core has that is not already in
+        // the long-mode block — and it is not in there because a part can have
+        // it without having long mode.
+        w.write_u64(state.sys.misc_enable)?;
         Ok(())
     }
 
@@ -3346,6 +3356,7 @@ impl Device for X86 {
         let has_startup = r.read_bool()?;
         let startup_page = r.read_u8()?;
         let startup = has_startup.then_some(startup_page);
+        state.sys.misc_enable = r.read_u64()?;
         // The translation-lookaside buffer is derived, so it is not in the
         // snapshot and starts empty — which is correct rather than merely
         // convenient, because the page tables it would cache have just been
@@ -3425,13 +3436,29 @@ pub fn schemas() -> Vec<crate::machine::validate::ClassSchema> {
 
 /// One class's schema. The two differ only in the name and in what
 /// "unspecified" means for `variant`, which the validator does not police.
+///
+/// The property list is **read out of [`CLASS`]** rather than written a second
+/// time. Two lists drifted apart exactly once and it cost a release: the
+/// constructor accepted all fifteen extension overrides while the validator
+/// knew about four properties, so `long = true` in a machine file was rejected
+/// with "unknown property" before the core ever saw it — the lattice was
+/// implemented and unreachable. One list cannot disagree with itself.
 fn schema_for(name: &'static str) -> crate::machine::validate::ClassSchema {
     use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
-    ClassSchema::new(name)
-        .prop(PropSchema::new("variant", ValueKind::Str).values(Variant::NAMES))
-        .prop(PropSchema::new("model", ValueKind::Str).values(Variant::NAMES))
-        .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
-        .prop(PropSchema::new("iospace", ValueKind::Str))
+    let mut schema = ClassSchema::new(name);
+    for spec in CLASS.properties {
+        let prop = PropSchema::new(spec.name, spec.kind);
+        // The only two whose *values* are constrained beyond their type. A
+        // `values` list on a bool would be meaningless, and the extension
+        // overrides are all bools.
+        let prop = match spec.name {
+            "variant" | "model" => prop.values(Variant::NAMES),
+            "engine" => prop.values(&["interp"]),
+            _ => prop,
+        };
+        schema = schema.prop(prop);
+    }
+    schema
         // Inputs only: the outputs a real part has — `M/IO`, `LOCK`, the
         // `INTA` strobes — are the address space's business or the acknowledge
         // cycle's, not a wire's.

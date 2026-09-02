@@ -1,0 +1,245 @@
+# pc64 — a PC with a long-mode processor and a kernel loaded straight into it.
+#
+#   rsemu run pc64 --media kernel=bzImage
+#   rsemu run pc64 --media kernel=bzImage --media initrd=initramfs.cpio.gz
+#
+# # What this board is for
+#
+# `pc-at` and `q35` are boards for *firmware*: they have a ROM socket, a video
+# adapter and a disk, and what runs on them starts at 0xfffffff0 in real mode.
+# This one is a board for a **kernel**. It has no firmware at all — the object
+# at the bottom of this file writes a `bzImage` into memory and enters it at
+# its own 32-bit entry point, which is the one interface a Linux kernel offers
+# to something that is not a BIOS (`src/dev/linuxboot.rs`).
+#
+# That makes it the smallest machine that can answer `ROADMAP.md` phase 6b's
+# real question — *does the x86 core survive a modern kernel's early boot* —
+# without also being a test of a boot loader, a partition table and an option
+# ROM. The processor is a `x86-64`, which is the whole point: the kernel's
+# decompressor builds page tables, sets `EFER.LME`, enters long mode and
+# decompresses itself before it has printed a single character, so anything
+# that reaches the first line of output has already exercised most of what 6b
+# added to the core.
+#
+# # The device set, and what each is here for
+#
+# Eight objects, and each earns its place by something the kernel does:
+#
+#   * **Two 8259As**, because the kernel needs somewhere for IRQ0 to land. No
+#     APIC: with no ACPI tables and no MP table on this board there is nothing
+#     to tell the kernel how interrupts are routed, so it stays in PIC mode —
+#     and `CPUID`'s APIC bit follows the board rather than the part (it is set
+#     only when a local controller is wired to the core), so the two agree.
+#   * **An 8254**, for the tick, and because `quick_pit_calibrate` is one of
+#     the first things the kernel does with the hardware.
+#   * **The system control ports**, because that calibration gates counter 2
+#     through port 0x61 and reads its output back in bit 5.
+#   * **An MC146818**, because the kernel reads the wall clock from CMOS.
+#   * **A 16550**, because it is the console. `console=ttyS0` is how a kernel
+#     with no video adapter says anything at all, and every line this board has
+#     ever been seen to produce came out of it.
+#
+# What is deliberately absent: no 8042 (nothing types), no video (the console
+# is the serial line), no DMA controller, no IDE, no PCI. Each would be a
+# second thing being tested.
+#
+# # Sources
+#
+# The same data sheets `machines/pc-at.machine` cites for the chips — the Intel
+# 8259A, 8254 and MC146818 data sheets and the IBM PC/AT Technical Reference —
+# and the PC16550D data sheet for the UART. The kernel image is *data*: it is
+# loaded and run, never read as source (`ROADMAP.md` §1).
+
+machine "pc64" {
+  # -- parameters -------------------------------------------------------------
+
+  # Base memory: the 640 KiB below the video hole, which is where the loader
+  # puts the zero page, the command line and its mode-switch stub.
+  param basemem = 640K
+
+  # Extended memory, from 1 MiB up. A current kernel wants `init_size` — around
+  # 54 MiB for a distribution build — clear above its load address before it
+  # can decompress, and an initramfs on top of that. 256 MiB is comfortable and
+  # is what the loader's e820 map describes; the machine refuses to build if
+  # the kernel bound to it does not fit.
+  param extmem = 256M
+
+  # The kernel command line. `console=ttyS0` is what makes the 16550 below the
+  # console, and `earlyprintk=` is what makes the *decompressor* talk to it —
+  # the two are separate mechanisms, and the second is the one that reports a
+  # failure before the kernel proper is running.
+  #
+  # `nokaslr` is not a preference, and it is the most interesting line on this
+  # board. Address-space randomisation draws its entropy partly from the 8254,
+  # by issuing a read-back command and spinning until the **null-count** bit in
+  # the status byte goes clear. That bit is set by a control-word write and
+  # cleared when a count is actually loaded (Intel 8254 data sheet, "Read-Back
+  # Command"), so on a machine where nothing has ever programmed counter 0 it
+  # never clears — and there is no firmware on this board to have programmed
+  # it. A kernel that randomises therefore spins in the decompressor forever,
+  # before it has printed anything. Both parts of that are correct behaviour;
+  # the combination is what a board with no BIOS produces, and this is the
+  # line that says so. Determinism wants it anyway (CLAUDE.md).
+  param cmdline = "console=ttyS0,115200 earlyprintk=ttyS0,115200 nokaslr"
+
+  # Which host character port the console attaches to, so two of these can run
+  # in one process without writing over each other.
+  param console = "console"
+
+  # The date and time the RTC starts at. A device may never read the host clock
+  # (CLAUDE.md, determinism), so it is declared.
+  param time = "2026-01-01T00:00:00"
+
+  # -- crystals ---------------------------------------------------------------
+
+  # The processor. 100 MHz for a part that would really have run at ten times
+  # that, and the number is not decoration: `udelay` spins for a number of
+  # cycles derived from this, so a slower core is a shorter spin and a cheaper
+  # boot. Nothing architectural depends on it.
+  osc cpu = 100000000 Hz
+
+  # The 8254's input: 14.31818 MHz / 12, which is not an integer number of
+  # hertz. Every PC timing loop ever written is calibrated against it.
+  osc pit = 105000000/88 Hz
+
+  # The RTC's watch crystal.
+  osc rtc = 32768 Hz
+
+  # The UART's. 1.8432 MHz divided by sixteen is the character rate at the
+  # highest speed the chip runs, and one tick of the device's domain is one
+  # opportunity to move one byte.
+  osc uartclk = 1843200 Hz
+
+  # -- address spaces ---------------------------------------------------------
+
+  # 64 bits, because the processor is. `unassigned = read-as-ones` is the ISA
+  # bus's own behaviour and what a probe for an absent chip expects — the
+  # kernel's i8042 probe finds 0xff at 0x60 and 0x64 and gives up, which is the
+  # correct outcome for a board with no keyboard controller.
+  space mem  { width = 64, unassigned = read-as-ones }
+  space port { width = 16, unassigned = read-as-ones }
+
+  # -- the processor ----------------------------------------------------------
+  #
+  # `variant = "x86-64"` is a *preset* (`ROADMAP.md` §6.1.1): it expands to the
+  # point in the extension lattice every part that implements long mode has to
+  # be at — CR4, the model-specific registers, PAE, four-level paging, NX,
+  # SYSCALL, CMOV, PSE, PGE, x87, CX8, FXSR, SSE and SSE2. Any of them can be
+  # switched off here by name to model a part that lacked it, and a combination
+  # no part could have is refused with the missing prerequisite named.
+  object cpu0 "cpu.x86" {
+    clock   = cpu
+    space   = mem
+    iospace = "port"
+    variant = "x86-64"
+    engine  = "interp"
+  }
+
+  # -- memory -----------------------------------------------------------------
+  #
+  # Declared before anything that writes into memory: `Machine::reset` runs
+  # devices in declaration order and a cold reset zeroes RAM, so the loader at
+  # the bottom of this file must run after these.
+  #
+  # Two objects with a hole between them, exactly as on `pc-at`: 0xa0000 to
+  # 0xfffff is where a video adapter and a firmware ROM would be, and the e820
+  # map the loader builds calls that span reserved so the kernel leaves it
+  # alone.
+  object ram_low  "ram" { size = basemem }
+  object ram_high "ram" { size = extmem }
+
+  # -- interrupts -------------------------------------------------------------
+  #
+  # Two 8259As, the slave cascaded onto the master's IR2. The master's INT goes
+  # straight to the processor — there is no APIC on this board and therefore no
+  # IMCR to switch between two paths.
+  object pic1 "pc.pic" { mode = "master" }
+  object pic2 "pc.pic" { mode = "slave" }
+
+  # -- the timer --------------------------------------------------------------
+  object pit0 "pc.pit" { clock = pit }
+
+  # -- the system control ports -----------------------------------------------
+  #
+  # Not a chip: latches and gates on the board. Port B at 0x61 gates counter 2
+  # and reads its output back, which is the path a calibration loop takes.
+  object sysctl "pc.sysctl" {}
+
+  # -- the real-time clock ----------------------------------------------------
+  #
+  # The memory sizes are written here as well as being the `ram` objects' sizes
+  # because a device cannot read the machine's memory map. The same duplication
+  # `pc-at` documents, with the same reason.
+  object cmos "pc.rtc" {
+    clock   = rtc
+    time    = time
+    basemem = basemem
+    extmem  = extmem
+  }
+
+  # -- the console ------------------------------------------------------------
+  object uart "uart.ns16550" {
+    clock     = uartclk / 16
+    port      = console
+    frequency = 1843200
+  }
+
+  # -- what gets loaded -------------------------------------------------------
+  #
+  # Last, and that is load-bearing for the same reason `riscv-virt` puts its
+  # loaders last: a cold reset zeroes RAM, and anything written before that
+  # reset would be erased by it.
+  #
+  # `extmem` is repeated here because this is what builds the e820 map, and a
+  # kernel believes the map rather than the machine. One parameter, so the two
+  # cannot disagree.
+  object boot "x86.linuxboot" {
+    space   = mem
+    kernel  = "kernel"
+    initrd  = "initrd"
+    cmdline = cmdline
+    basemem = basemem
+    extmem  = extmem
+  }
+
+  # -- the memory map ---------------------------------------------------------
+  map mem 0x00000000 size basemem = ram_low
+  map mem 0x00100000 size extmem  = ram_high
+
+  # The reset vector, and the only thing in this machine above 4 GiB minus a
+  # page. A processor fetches its first instruction from 0xfffffff0 with CS's
+  # cached base still at 0xffff0000; the sixteen bytes there are a far jump to
+  # the loader's stub in low memory, which is the only instruction that can
+  # change that base.
+  map mem 0x100000000 - 16 size 16 = boot.reset
+
+  # -- the I/O map ------------------------------------------------------------
+  map port 0x0020 size 0x0002 = pic1.regs     # master 8259A
+  map port 0x0040 size 0x0004 = pit0.regs     # 8254
+  map port 0x0061 size 0x0001 = sysctl.portb  # speaker, timer 2 out, refresh
+  map port 0x0070 size 0x0002 = cmos.regs     # RTC index (with the NMI mask)
+  map port 0x0092 size 0x0001 = sysctl.porta  # fast A20 and fast reset
+  map port 0x00a0 size 0x0002 = pic2.regs     # slave 8259A
+  map port 0x03f8 size 0x0008 = uart.regs     # COM1
+  map port 0x04d0 size 0x0001 = pic1.elcr     # edge/level control, master
+  map port 0x04d1 size 0x0001 = pic2.elcr     # edge/level control, slave
+
+  # -- the wires --------------------------------------------------------------
+  wire pic2.int     -> pic1.ir2
+  wire pic1.int     -> cpu0.intr
+  wire pit0.out0    -> pic1.ir0   # the system tick
+  wire uart.irq     -> pic1.ir4   # COM1
+  wire cmos.irq     -> pic2.ir0   # IRQ8, the RTC
+
+  # Counter 2 and port B, the calibration path.
+  wire sysctl.gate2 -> pit0.gate2
+  wire pit0.out2    -> sysctl.timer2
+  wire pit0.out1    -> sysctl.refresh
+
+  # Reset, from the chipset's fast port. **A20 is deliberately not wired**: a
+  # net with a driver comes up low and a low `a20` pin shuts the gate, and
+  # nothing on this board ever opens it — the kernel is in protected mode four
+  # instructions after reset and never asks. An unwired pin is a permanently
+  # connected address line, which is the machine we want.
+  wire sysctl.reset -> cpu0.reset
+}

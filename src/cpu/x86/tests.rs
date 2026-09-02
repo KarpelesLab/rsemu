@@ -881,6 +881,71 @@ fn binding_a_core_with_no_address_space_is_a_machine_error() {
     assert!(text.contains("address space"), "{text}");
 }
 
+/// A machine file may reach every extension the constructor accepts.
+///
+/// The regression this exists for: the constructor read fifteen extension
+/// overrides and the validator's schema listed four properties, so
+/// `long = true` was rejected with "unknown property" before the core saw it.
+/// The lattice was implemented and unreachable. `schema_for` now reads
+/// `CLASS.properties`, so this asserts the two lists are the same list.
+#[test]
+fn a_machine_file_can_reach_every_extension_the_core_accepts() {
+    for spec in super::CLASS.properties {
+        let mut names = alloc::vec::Vec::new();
+        for schema in super::schemas() {
+            if schema.class == "cpu.x86" {
+                names.extend(schema.props.iter().map(|p| p.name.clone()));
+            }
+        }
+        assert!(
+            names.iter().any(|n| n == spec.name),
+            "the validator does not know about `{}`, which the constructor reads",
+            spec.name
+        );
+    }
+}
+
+/// And the value actually arrives: a 486 told it has `CR4` and the
+/// model-specific registers is a Pentium-class part, which is a real
+/// configuration and not a variant.
+#[test]
+fn an_extension_named_in_a_machine_file_reaches_the_core() {
+    let (registry, mut options) = options_with_the_core();
+    let kept: Arc<crate::core::Captured<X86>> = Arc::new(crate::core::Captured::new());
+    let mine = Arc::clone(&kept);
+    options.bindings.replace("cpu.x86", move |props| {
+        let cpu = Arc::new(X86::from_props_defaulting(props, super::Variant::I80486)?);
+        mine.push(&cpu);
+        Ok(cpu)
+    });
+    let text = "machine \"m\" {\n  osc x = 1000000 Hz\n  space mem { width = 32 }\n  \
+                object dram \"ram\" { size = 4K }\n  \
+                object cpu \"cpu.x86\" { clock = x, space = mem, variant = \"80486\", \
+                cr4 = true, msr = true, cx8 = true, pse = true }\n  \
+                map mem 0 size 4K = dram\n}\n";
+    crate::machine::build("t.machine", text, &registry, &options).expect("it builds");
+    let cpu = kept.take().expect("the constructor kept a handle");
+    let features = cpu.config().features;
+    assert!(features.cr4 && features.msr && features.cx8 && features.pse);
+    assert!(!features.long, "nothing turned long mode on");
+}
+
+/// An extension set no part could have is refused by the *core*, with the
+/// prerequisite named — not by the validator, which only knows types.
+#[test]
+fn an_impossible_extension_set_is_refused_with_the_missing_prerequisite() {
+    let (registry, options) = options_with_the_core();
+    let text = "machine \"m\" {\n  osc x = 1000000 Hz\n  space mem { width = 32 }\n  \
+                object dram \"ram\" { size = 4K }\n  \
+                object cpu \"cpu.x86\" { clock = x, space = mem, variant = \"x86-64\", \
+                sse2 = false }\n  \
+                map mem 0 size 4K = dram\n}\n";
+    let err = crate::machine::build("t.machine", text, &registry, &options)
+        .expect_err("a long-mode part without SSE2 is not a processor anyone shipped");
+    let text = alloc::format!("{err}");
+    assert!(text.contains("sse2"), "{text}");
+}
+
 #[test]
 fn an_iospace_that_names_nothing_is_a_machine_error() {
     let (registry, options) = options_with_the_core();
@@ -3348,6 +3413,105 @@ mod long_mode {
     }
 
     #[test]
+    fn a_pop_to_the_stack_addresses_its_destination_after_the_increment() {
+        // *Intel SDM* volume 2, `POP`: "If the ESP register is used as a base
+        // register for addressing a destination operand in memory, the POP
+        // instruction computes the effective address of the operand after it
+        // increments the ESP register."
+        //
+        // `pushf` / `pop 0x10(%rsp)` is how gcc writes `local_irq_save` on
+        // x86-64, and it is the encoding that found this: with the address
+        // taken before the increment the flags land eight bytes low, on top of
+        // whatever local is there. A Linux kernel loses a function argument
+        // that way and dies sixteen instructions later.
+        //
+        //   mov rsp, MARK+0x80 ; push rax ; pushf ; pop 0x10(%rsp) ; hlt
+        let mut code = alloc::vec![0x48u8, 0xc7, 0xc4];
+        code.extend_from_slice(&((la::MARK + 0x80) as u32).to_le_bytes());
+        code.extend_from_slice(&[
+            0x50, // push rax   — rsp is now MARK+0x78
+            0x9c, // pushf      — rsp is now MARK+0x70
+            0x8f, 0x44, 0x24, 0x10, // pop 0x10(%rsp)
+            0xf4, // hlt
+        ]);
+        let pc = run64(&code);
+        // The pop leaves RSP at MARK+0x78, so `0x10(%rsp)` is MARK+0x88 — and
+        // *not* MARK+0x80, which is where the pre-increment address points.
+        assert_eq!(pc.cpu.regs().rsp, la::MARK + 0x78);
+        assert_eq!(
+            pc.read64(la::MARK + 0x88) & 0xffff,
+            u64::from(pc.cpu.regs().eflags & 0xffff),
+            "the flags landed at the post-increment address"
+        );
+        assert_eq!(
+            pc.read64(la::MARK + 0x80),
+            0,
+            "and nothing was written eight bytes below it"
+        );
+    }
+
+    #[test]
+    fn a_control_register_read_is_sixty_four_bits_wide_with_no_rex_prefix() {
+        // *Intel SDM* volume 2, `MOV — Move to/from Control Registers`: in
+        // 64-bit mode the operand size is 64 bits, `REX.W` is ignored, and a
+        // `66` prefix cannot narrow it. So `0F 20 D0` — three bytes, no prefix
+        // — moves the whole of `CR2` into `RAX`.
+        //
+        // This was thirty-two bits, and the way it showed is worth recording:
+        // a 64-bit Linux reads `CR2` in its early page-fault handler and
+        // subtracts `PAGE_OFFSET` to get a physical address. With the top half
+        // missing the subtraction underflows, the result looks larger than the
+        // machine's physical address space, the handler declines to map the
+        // page, and the kernel halts in a loop before it has a console — total
+        // silence, forty seconds into a boot (`tests/pc64_linux.rs`).
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        let mut sys = pc.cpu.sys();
+        sys.cr2 = 0xffff_8880_0000_7000;
+        pc.cpu.set_sys(sys);
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        // mov rax, cr2 ; mov rbx, cr3 ; hlt
+        pc.write(la::CODE64, &[0x0f, 0x20, 0xd0, 0x0f, 0x20, 0xdb, 0xf4]);
+        let steps = pc.run(200);
+        assert!(steps < 200, "it halted");
+        assert_eq!(
+            pc.cpu.regs().rax,
+            0xffff_8880_0000_7000,
+            "the whole of CR2, not its low half"
+        );
+        assert_eq!(
+            pc.cpu.regs().rbx,
+            la::PML4,
+            "and CR3 likewise, which is how a guest finds its own tables"
+        );
+    }
+
+    #[test]
+    fn a_null_stack_selector_is_legal_in_sixty_four_bit_mode_and_the_stack_works() {
+        // *Intel SDM* volume 3 §5.4.1, "NULL Segment Selector Checking": in
+        // 64-bit mode below ring 3, `SS` may hold a null selector — it has no
+        // base and no limit there, and the selector is kept for its privilege
+        // level. The first thing a 64-bit Linux does after its long jump is
+        // load all six segment registers with zero, so a core that refuses
+        // this takes a `#GP` with no interrupt descriptor table loaded, which
+        // is a triple fault ten instructions into the kernel.
+        //
+        //   xor eax, eax ; mov ss, ax ; mov esp, MARK+8 ; push rax ; hlt
+        let mut code = alloc::vec![0x31u8, 0xc0, 0x8e, 0xd0, 0xbc];
+        code.extend_from_slice(&((la::MARK + 8) as u32).to_le_bytes());
+        code.extend_from_slice(&[0x50, 0xf4]);
+        let pc = run64(&code);
+        assert_eq!(pc.cpu.regs().ss, 0, "the null selector is in SS");
+        assert_eq!(
+            pc.cpu.regs().rsp,
+            la::MARK,
+            "and the push went through it rather than faulting"
+        );
+        assert_eq!(pc.read64(la::MARK), 0);
+    }
+
+    #[test]
     fn a_guest_enters_long_mode_and_executes_64_bit_code() {
         // The whole point of the exercise. Nothing below is set up from
         // outside except the tables in memory: the processor starts in 32-bit
@@ -5788,6 +5952,138 @@ mod multiprocessor {
             pc.regs().rax & 0xffff_ffff > 0,
             "ring 0 reads it however `TSD` is set"
         );
+    }
+
+    #[test]
+    fn ia32_misc_enable_comes_up_with_fast_strings_and_takes_the_two_bits_it_has() {
+        // *Intel SDM* volume 4 Table 2-2. The register exists wherever
+        // model-specific registers do, and a `#GP` for it is what stopped a
+        // 64-bit Linux dead: its processor check reads this address before it
+        // has an interrupt descriptor table, so the fault is a triple fault
+        // with nothing printed.
+        let pc = pc_msr();
+        pc.start_protected();
+        // mov ecx, 0x1a0 ; rdmsr
+        pc.write(at::CODE0, &[0xb9, 0xa0, 0x01, 0, 0, 0x0f, 0x32]);
+        pc.cpu.step();
+        pc.cpu.step();
+        assert_eq!(
+            pc.regs().rax & 0xffff_ffff,
+            1,
+            "fast strings enabled, which is what every part it exists on \
+             comes out of reset with"
+        );
+        assert_eq!(
+            pc.regs().rdx & 0xffff_ffff,
+            0,
+            "and nothing in the top half"
+        );
+
+        // Setting the execute-disable lock is the one write with a
+        // consequence, and it is refused unless the bit is one of the two.
+        // mov ecx, 0x1a0 ; xor eax, eax ; mov edx, 4 ; wrmsr
+        pc.write(
+            at::CODE0,
+            &[
+                0xb9, 0xa0, 0x01, 0, 0, 0x31, 0xc0, 0xba, 0x04, 0, 0, 0, 0x0f, 0x30,
+            ],
+        );
+        set_rip(&pc, at::CODE0);
+        for _ in 0..4 {
+            pc.cpu.step();
+        }
+        assert_eq!(
+            pc.cpu.sys().misc_enable,
+            1 << 34,
+            "the lock is set and fast strings was cleared by the same write"
+        );
+    }
+
+    #[test]
+    fn a_reserved_bit_of_ia32_misc_enable_is_refused_rather_than_stored() {
+        // The same rule `IA32_APIC_BASE` follows: a bit that controls a
+        // feature this core does not have would be a knob connected to
+        // nothing.
+        let pc = pc_msr();
+        pc.start_protected();
+        pc.idt(13, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        // mov ecx, 0x1a0 ; mov eax, 8 ; xor edx, edx ; wrmsr
+        pc.write(
+            at::CODE0,
+            &[
+                0xb9, 0xa0, 0x01, 0, 0, 0xb8, 0x08, 0, 0, 0, 0x31, 0xd2, 0x0f, 0x30,
+            ],
+        );
+        for _ in 0..4 {
+            pc.cpu.step();
+        }
+        assert_eq!(pc.cpu.regs().rip, HANDLER, "#GP(0)");
+        assert_eq!(pc.cpu.sys().misc_enable, 1, "and nothing was stored");
+    }
+
+    #[test]
+    fn the_microcode_revision_reads_zero_and_takes_the_write_that_clears_it() {
+        // *Intel SDM* volume 3 §10.11.2's ritual: write zero, `CPUID` leaf 1,
+        // read the high doubleword. Both halves have to work, and the answer
+        // is zero because no microcode update has been loaded — which is a
+        // fact about this processor rather than a stand-in for one.
+        let pc = pc_msr();
+        pc.start_protected();
+        // mov ecx, 0x8b ; xor eax, eax ; xor edx, edx ; wrmsr ; rdmsr
+        pc.write(
+            at::CODE0,
+            &[
+                0xb9, 0x8b, 0, 0, 0, 0x31, 0xc0, 0x31, 0xd2, 0x0f, 0x30, 0x0f, 0x32,
+            ],
+        );
+        for _ in 0..5 {
+            pc.cpu.step();
+        }
+        assert_eq!(pc.regs().rax & 0xffff_ffff, 0);
+        assert_eq!(pc.regs().rdx & 0xffff_ffff, 0, "no update is loaded");
+    }
+
+    #[test]
+    fn the_reserved_nop_space_decodes_its_operand_and_touches_nothing() {
+        // `0F 18`-`0F 1F`, which the *Intel SDM* volume 2 Appendix A prints as
+        // `NOP Ev`. Two of them are load-bearing on a modern guest: `0F 1F /0`
+        // is the multi-byte NOP a compiler pads with, and `F3 0F 1E FA` is
+        // `ENDBR64`, which begins every function of a kernel built with
+        // indirect-branch tracking.
+        let pc = pc386();
+        pc.start_protected();
+        pc.write(
+            at::CODE0,
+            &[
+                0x0f, 0x1f, 0x40, 0x00, // nop dword [eax+0]
+                0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+                // prefetchnta [0xf0000000] — an address nothing answers, which
+                // is the assertion: a hint reads no memory, so this cannot
+                // fault however unmapped its operand is.
+                0x0f, 0x18, 0x05, 0x00, 0x00, 0x00, 0xf0,
+            ],
+        );
+        let before = pc.regs();
+        pc.cpu.step();
+        assert_eq!(pc.cpu.regs().rip, at::CODE0 + 4, "four bytes consumed");
+        pc.cpu.step();
+        assert_eq!(pc.cpu.regs().rip, at::CODE0 + 8, "and four more");
+        pc.cpu.step();
+        assert_eq!(pc.cpu.regs().rip, at::CODE0 + 15);
+        let after = pc.regs();
+        assert_eq!(
+            (after.rax, after.rbx, after.rcx, after.rdx, after.eflags),
+            (
+                before.rax,
+                before.rbx,
+                before.rcx,
+                before.rdx,
+                before.eflags
+            ),
+            "a hint changes nothing"
+        );
+        assert_eq!(pc.cpu.bus_faults(), (0, 0), "and reads no memory");
     }
 
     #[test]

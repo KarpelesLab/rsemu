@@ -655,6 +655,14 @@ pub mod msr {
     /// *Intel SDM* volume 4 Table 2-2, and volume 3 §17.17 for the counter
     /// itself.
     pub const TSC: u32 = 0x10;
+    /// `IA32_BIOS_SIGN_ID`: the revision of the microcode update in force.
+    ///
+    /// *Intel SDM* volume 3 §10.11.2. Software reads it by the ritual that
+    /// section prescribes -- write zero, execute `CPUID` leaf 1, read the high
+    /// doubleword -- and this core answers **zero**, which is what a processor
+    /// running with no update loaded reports. That is a fact rather than a
+    /// stand-in: nothing here loads microcode, and there is no revision.
+    pub const BIOS_SIGN_ID: u32 = 0x8b;
     /// `IA32_APIC_BASE`: the local APIC's enable bit, its bootstrap-processor
     /// flag, and the physical address of its register page.
     ///
@@ -663,6 +671,20 @@ pub mod msr {
     /// [`apic_base`](super::apic_base) and
     /// [`LocalController`](crate::core::wire::LocalController).
     pub const APIC_BASE: u32 = 0x1b;
+    /// `IA32_MISC_ENABLE`: the architectural feature-control register.
+    ///
+    /// *Intel SDM* volume 4 Table 2-2. Present on every Intel part from the P6
+    /// family on, which is why it is gated on
+    /// [`Features::msr`](super::super::Features::msr) rather than on anything
+    /// finer: this core has no bit that says "P6 or later", and every part it
+    /// can be configured as that has model-specific registers at all also has
+    /// this one.
+    ///
+    /// It is modelled because a 64-bit Linux reads it *before it has an
+    /// interrupt descriptor table* -- the decompressor's processor check
+    /// clears the execute-disable lock through it -- so a `#GP` for an
+    /// unimplemented address becomes a triple fault with no output at all.
+    pub const MISC_ENABLE: u32 = 0x1a0;
     /// `IA32_EFER`.
     pub const EFER: u32 = 0xc000_0080;
     /// `IA32_STAR`.
@@ -710,6 +732,38 @@ pub mod apic_base {
     /// The bits a `WRMSR` may set. Everything else is reserved, and a reserved
     /// bit written raises `#GP(0)` rather than being dropped.
     pub const WRITABLE: u64 = ENABLE | BASE;
+}
+
+/// The fields of [`msr::MISC_ENABLE`] this core implements.
+///
+/// Two of the several the *Intel SDM* defines, and the rest are refused rather
+/// than stored: a bit that controls a feature this core does not have would be
+/// a knob connected to nothing, and a guest that set one and believed it is
+/// what `ROADMAP.md` §0 asks emulators not to do.
+pub mod misc_enable {
+    /// Bit 0: fast-strings enable -- whether `REP MOVS` and `REP STOS` use the
+    /// processor's wide-move path.
+    ///
+    /// Set out of reset, which is what every part it exists on comes up with,
+    /// and stored rather than obeyed: this core's string operations move a
+    /// byte at a time whatever it says, and the *result* is identical either
+    /// way. Only the timing differs, and this core's timing is documented
+    /// rather than measured (see the module docs).
+    pub const FAST_STRINGS: u64 = 1 << 0;
+    /// Bit 34: execute-disable lock -- when set, `CPUID` stops reporting the
+    /// no-execute page bit.
+    ///
+    /// Obeyed, and it is the reason this register is modelled at all: firmware
+    /// on some parts sets it, and an operating system clears it before it
+    /// looks for `NX`.
+    pub const XD_DISABLE: u64 = 1 << 34;
+
+    /// What this core comes out of reset with.
+    pub const RESET: u64 = FAST_STRINGS;
+
+    /// The bits a `WRMSR` may set; anything else raises `#GP(0)`, as it does
+    /// for the reserved bits of [`super::apic_base`].
+    pub const WRITABLE: u64 = FAST_STRINGS | XD_DISABLE;
 }
 
 /// Whether an address is canonical: bits 63-48 must all equal bit 47.
@@ -771,6 +825,12 @@ pub struct Sys {
     /// how long mode came to be armed by a `WRMSR` and entered by a write
     /// to `CR0`.
     pub efer: u64,
+    /// `IA32_MISC_ENABLE`: the architectural feature-control register.
+    ///
+    /// Here beside `efer` for the reason `efer` is here: it is a
+    /// model-specific register whose state belongs to the processor. See
+    /// [`misc_enable`] for the two bits that mean anything.
+    pub misc_enable: u64,
     /// `IA32_FS_BASE`: the base `FS` uses in 64-bit mode.
     pub fs_base: u64,
     /// `IA32_GS_BASE`: the base `GS` uses in 64-bit mode.
@@ -829,6 +889,7 @@ impl Sys {
             cr3: 0,
             cr4: 0,
             efer: 0,
+            misc_enable: misc_enable::RESET,
             fs_base: 0,
             gs_base: 0,
             kernel_gs_base: 0,
@@ -1225,6 +1286,27 @@ impl Exec<'_> {
             // The stack is the one segment that may not be null, must be
             // writable, and must be at exactly the current privilege level.
             if sel.is_null() {
+                // Except in 64-bit mode below ring 3, where it may: `SS` has
+                // no base and no limit there, and what the selector is kept
+                // for is its privilege level (*Intel SDM* volume 3 §5.4.1,
+                // "NULL Segment Selector Checking"). The first thing a 64-bit
+                // Linux does after its long jump is load all six segment
+                // registers with zero, so a core that refuses this one takes a
+                // `#GP` with no interrupt descriptor table loaded — which is a
+                // triple fault, ten instructions into the kernel, with nothing
+                // printed. The same rule the long-mode `IRET` below already
+                // follows for a null stack selector popped off the frame.
+                if self.state.sys.sixty_four() && cpl != 3 {
+                    *self.state.sys.seg_mut(index) = SegReg {
+                        selector,
+                        base: 0,
+                        limit: 0,
+                        ar: ar::PRESENT | ar::S | ar::RW | ar::ACCESSED,
+                    };
+                    self.state.regs.ss = selector;
+                    self.state.int_shadow = true;
+                    return Ok(());
+                }
                 return Err(Fault::gp(0));
             }
             let desc = self.descriptor(selector, VEC_GP)?;
@@ -2710,6 +2792,10 @@ impl Exec<'_> {
         let sys = &self.state.sys;
         let value = match index {
             msr::EFER if self.cfg.features.long => sys.efer,
+            msr::MISC_ENABLE => sys.misc_enable,
+            // The revision of the microcode update in force, in the high
+            // doubleword. There is none, so it is zero -- see the constant.
+            msr::BIOS_SIGN_ID => 0,
             msr::STAR if self.cfg.features.syscall => sys.star,
             msr::LSTAR if self.cfg.features.syscall => sys.lstar,
             msr::CSTAR if self.cfg.features.syscall => sys.cstar,
@@ -2756,6 +2842,21 @@ impl Exec<'_> {
                 }
                 Ok(())
             }
+            msr::MISC_ENABLE => {
+                // Strict about the bits it does not have, exactly as
+                // `IA32_APIC_BASE` above is: a reserved bit accepted here is a
+                // feature a guest thinks it turned on.
+                if value & !misc_enable::WRITABLE != 0 {
+                    return Err(Fault::gp(0));
+                }
+                self.state.sys.misc_enable = value;
+                Ok(())
+            }
+            // Write-to-clear, and there is nothing to clear. *Intel SDM*
+            // volume 3 §10.11.2 has software write zero here before the
+            // `CPUID` that loads the revision, so the write is part of an
+            // ordinary read and must not fault.
+            msr::BIOS_SIGN_ID => Ok(()),
             msr::EFER if self.cfg.features.long => {
                 // `LME` may not be changed while paging is on: the transition
                 // is defined only across a `CR0.PG` edge, and allowing it
