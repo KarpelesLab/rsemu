@@ -35,7 +35,14 @@ datasheet, which are free.
   one, with the ECAM window as an alias into it for PCIe.
 - Interrupt routing goes through two eras: legacy INTx (with the swizzle across
   bridges) and MSI/MSI-X (a memory write to an address the OS programs). Both
-  are needed; MSI is much easier to model correctly.
+  are needed; MSI is much easier to model correctly. **INTx is implemented**:
+  `bus::pci::Intx` is a function's pin, `bus::pci::swizzle` is the rotation by
+  device number (PCI-to-PCI Bridge 1.1 §9.1), and the fabric resolves the four
+  shared, level-sensitive, open-drain nets and hands them to whatever registered
+  as its `IntxSink` — an ICH9's `PIRQ` routers, on the q35 board. The set of
+  asserting functions is kept rather than a level per net, because "the line
+  stays down until the last driver lets go" is the whole difficulty. MSI is not
+  implemented: no function in the tree has the capability yet.
 - Bus mastering means a device performs DMA — through **its own address space**,
   not the CPU's. See the per-master address space requirement in §4.1.
 
