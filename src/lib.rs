@@ -218,6 +218,12 @@ pub fn build_info() -> alloc::string::String {
     if cfg!(feature = "machine-pc-at") {
         features.push("machine-pc-at");
     }
+    if cfg!(feature = "dev-q35") {
+        features.push("dev-q35");
+    }
+    if cfg!(feature = "machine-q35") {
+        features.push("machine-q35");
+    }
     if cfg!(feature = "jit") {
         features.push("jit");
     }

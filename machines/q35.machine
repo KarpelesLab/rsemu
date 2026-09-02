@@ -1,0 +1,502 @@
+# A q35-class PC: an Intel 82Q35 (G)MCH and an ICH9, with ACPI.
+#
+#   rsemu run q35 --hd0 disk.img
+#   rsemu run q35 --bios OVMF.fd
+#
+# # What this board is, against `pc-at`
+#
+# The same *parts*, behind a different *chipset*. Every chip below the chipset
+# section is the one `machines/pc-at.machine` uses, at the address the AT put
+# it: two 8259As, an 8254, an MC146818, an 8042, two 8237As, a local APIC, an
+# I/O APIC and an HPET. A q35 has all of them, because an ICH9 has all of them,
+# and re-describing them would be describing the same silicon twice.
+#
+# What changes is the four things that make a machine recognisable to software
+# written this century, and each of them is why a step of a modern boot works:
+#
+#   * **ECAM.** The (G)MCH's `PCIEXBAR` publishes a window of memory in which
+#     the address *is* the configuration address, so a function's whole 4 KiB
+#     of configuration space is reachable rather than the 256 bytes
+#     0xcf8/0xcfc can name. Intel 3 Series datasheet (316966-002) §5.1.16.
+#   * **PAM at 0x90-0x96** rather than 0x59-0x5f. Same thirteen windows, same
+#     encoding, different register file — a firmware that shadows itself on a
+#     440FX writes the wrong offsets here and finds its own f-segment is still
+#     ROM. §5.1.18-§5.1.24.
+#   * **PCI interrupt routing.** The ICH9's eight `PIRQ[A-H]` routers steer a
+#     PCI function's interrupt onto an ISA line. `pc-at` has no answer for that
+#     at all — `src/bus/pci` says so out loud — and it is what an operating
+#     system needs before a PCI device's interrupt reaches anything.
+#   * **ACPI.** The register block at `PMBASE`, and the tables. A modern kernel
+#     will not enumerate a q35 without an RSDP, an XSDT, a FADT and a MADT, and
+#     will not find its interrupt routing without the last of those.
+#
+# # The tables are generated, not written
+#
+# `q35.acpi` walks the machine that was actually realized and reads every
+# address out of it — where the local APIC's page is mapped, where the I/O
+# APIC's is, where `PCIEXBAR` put the ECAM window, where `PMBASE` put the ACPI
+# register block, and what the local APIC's own ID register says. That is the
+# same discipline `machines/riscv-virt.machine` applies to its device tree, and
+# it is a test of the board rather than a convenience: if the tables can be
+# produced mechanically from the topology, the topology is well formed.
+#
+# The three things it *cannot* read out of the machine are declared on that
+# object, each with the reason beside it.
+#
+# # Sources
+#
+# The Intel 3 Series Express Chipset Family Datasheet, order number 316966-002,
+# for the (G)MCH; the Intel I/O Controller Hub 9 (ICH9) Family Datasheet, order
+# number 316972-004, for the south bridge; the ACPI Specification revision 6.5
+# for the tables; and, for every legacy part below, the same sources
+# `machines/pc-at.machine` cites — the IBM PC/AT Technical Reference, the Intel
+# and Motorola data sheets, and Ralf Brown's Interrupt List.
+#
+# **No emulator source and no firmware source was consulted** (ROADMAP.md §1).
+
+machine "q35" {
+  # -- parameters -------------------------------------------------------------
+
+  # Base memory: the 640 KiB below the video hole. The AT's number, and still
+  # the AT's number on a q35, because the hole is where the hole is.
+  param basemem = 640K
+
+  # Extended memory, from 0x100000 up. 128 MiB is enough for a kernel to
+  # decompress into and small enough that a test does not pay for it.
+  param extmem  = 128M
+
+  # The system BIOS socket. 64 KiB at 0xf0000, and *not* the 128 KiB `pc-at`
+  # gives it: the 64 KiB between 0xe0000 and 0xefffff is where the ACPI tables
+  # go, for the reason the `acpi` object below spells out. rsemu's own BIOS is
+  # 64 KiB, so it fits exactly and its reset vector lands at 0xffff0.
+  param biosbase = 0xf0000
+  param biossize = 64K
+
+  # The video option ROM window, where a scan for `0x55 0xaa` starts.
+  param vgabase = 0xc0000
+  param vgasize = 64K
+
+  # Where the ACPI tables are staged. ACPI §5.2.5.1 has an operating system
+  # search "the BIOS read-only memory space between 0E0000h and 0FFFFFh" on
+  # 16-byte boundaries for the RSDP, and this is the low edge of it.
+  param acpibase = 0xe0000
+  param acpisize = 64K
+
+  # Where `PCIEXBAR` comes out of reset pointing, with its enable bit set.
+  #
+  # **This is a stand-in for firmware.** §5.1.16's own default is this address
+  # with the enable *clear*, and a firmware programs it during initialisation.
+  # rsemu's own BIOS does not, so the board pre-programs it and says so; a
+  # firmware that writes the register moves the window and the tables follow,
+  # because they are generated from where it actually ended up. Set it to 0 to
+  # get the datasheet's behaviour, and nothing decodes until firmware acts.
+  param ecambase = 0xe0000000
+
+  # Where `PMBASE` comes out of reset pointing, with `ACPI_EN` set. The same
+  # stand-in, for the same reason (ICH9 §13.1.13, §13.1.14): 0x600 is a
+  # 128-byte boundary in a part of the I/O map no chip on this board decodes.
+  #
+  # It is written **once** and read by two objects — the bridge that decodes
+  # the window and the generator that names it in the FADT. That is the same
+  # seam `pc-at` has between its `ram` sizes and its CMOS, and the same answer:
+  # one parameter, so the two cannot disagree.
+  param pmbase = 0x600
+
+  # Which host character port the keyboard's scan codes arrive on.
+  param keyboard = "keyboard"
+
+  # The two drive bays on the primary IDE channel. Zero is an empty bay.
+  param hd0size = 0
+  param hd1size = 0
+
+  # The date and time the RTC starts at. A device may never read the host clock
+  # (CLAUDE.md, determinism), so it is declared.
+  param time = "2026-01-01T00:00:00"
+
+  # -- crystals ---------------------------------------------------------------
+  #
+  # `pc-at`'s eight, plus one: the power-management timer's, which is the ninth
+  # can and the one that makes this board's ACPI honest.
+
+  osc cpu  = 25000000 Hz
+  osc pit  = 105000000/88 Hz
+  osc rtc  = 32768 Hz
+  osc dot  = 28322000 Hz
+  osc kbd  = 12000000 Hz
+  osc bus  = 100000000 Hz
+  osc hpet = 10000000 Hz
+
+  # The ACPI power-management timer. ICH9 §13.8.3.4 names it exactly: "This
+  # counter runs off a 3.579545 MHz clock (14.31818 MHz divided by 4)." Written
+  # as the division rather than the quotient, because 14.31818 MHz is not an
+  # integer number of hertz either — it is 315/22 MHz, the same colour-burst
+  # crystal the 8254 hangs off — and the language takes rational literals so
+  # that the ratio stays exact. 315000000/88 Hz is 3.579545454... MHz.
+  osc pmtmr = 315000000/88 Hz
+
+  # -- address spaces ---------------------------------------------------------
+
+  space mem  { width = 32, unassigned = read-as-ones }
+  space port { width = 16, unassigned = read-as-ones }
+
+  # -- the processor ----------------------------------------------------------
+  #
+  # An 80486, as `pc-at` has, and that is this board's honest limit today:
+  # ROADMAP.md phase 6b's gate is a modern distribution booting to a desktop,
+  # and that needs long mode, SSE and SMP, none of which this core has yet. The
+  # chipset below is what a 6b board needs *around* the processor, and it is
+  # buildable and testable before the core catches up — which is the point of
+  # landing it separately.
+  object cpu0 "cpu.x86" {
+    clock   = cpu
+    space   = mem
+    iospace = "port"
+    model   = "80486"
+    engine  = "interp"
+  }
+
+  # -- memory -----------------------------------------------------------------
+
+  object ram_low  "ram" { size = basemem }
+  object ram_high "ram" { size = extmem }
+
+  # -- the north bridge -------------------------------------------------------
+  #
+  # An Intel 82Q35 (G)MCH: device 0, function 0. It brings three things with it
+  # — the 0xcf8/0xcfc window, the PAM registers that shadow 0xc0000-0xfffff, and
+  # `PCIEXBAR`, which places the ECAM window in `mem` rather than being mapped
+  # by a `map` statement below. A register that moves a window has to own the
+  # mapping, which is why `space = mem` is here and why there is no
+  # `map mem … = mch.ecam`.
+  #
+  # `passthrough = sysctl` is the same chipset fact `pc-at` documents: 0xcf8's
+  # four bytes are the north bridge's for a Dword access, while 0xcf9 — the
+  # reset control register — is the *south* bridge's for a byte access. The
+  # bridge holds all four and hands the narrow ones on.
+  # `clock = bus` is not decoration either, and the reason is subtle enough to
+  # be worth the line. A configuration write that moves a window can only
+  # retopologise a space the access is not already inside — and a q35 firmware
+  # reaches configuration space through ECAM, which is *in* the memory space,
+  # so a PAM write through it can never be applied by another configuration
+  # access. The bridge asks the scheduler for a tick when it owes a retopology,
+  # and applies it there. `src/dev/q35/mch.rs` has the long form. The front-side
+  # bus is what a (G)MCH is clocked by, so this is the board's own crystal.
+  # `device-id = 0x29c0` is the **82G33/82P35** (G)MCH and not the 82Q35 this
+  # board is named after, and the reason is a measurement rather than a
+  # preference. Datasheet §5.1.2 lists three identifications for one part
+  # family — `29B0h` for the 82Q35, `29C0h` for the 82G33/82P35, `29D0h` for the
+  # 82Q33 — and Table 5-1 prints `29C0h` as the register map's own default
+  # value. With `29B0h` a current third-party firmware does not recognise the
+  # bridge at all and stops eighty thousand cycles in, saying so:
+  #
+  #     Unable to unlock ram - bridge not found
+  #     RamSize: 0x00000000 [cmos]
+  #
+  # With `29C0h` the same image runs a complete POST on this board, programs
+  # `PCIEXBAR` itself, enumerates through the window it made, and reaches its
+  # boot prompt. `tests/q35_board.rs` runs that measurement and prints the log.
+  #
+  # So the board presents the identification the world recognises and says out
+  # loud that it is doing so. Every register modelled here is common to the
+  # family, so this is a label rather than a different part; a board that wants
+  # the 82Q35's number can write `device-id = 0x29b0` and find out what its own
+  # firmware makes of it.
+  object mch "q35.mch" {
+    device-id   = 0x29c0
+    clock       = bus
+    space       = mem
+    bus         = "pci0"
+    ecam        = ecambase
+    passthrough = sysctl
+  }
+
+  # -- the south bridge -------------------------------------------------------
+  #
+  # An ICH9 LPC interface bridge: device 31, function 0. Everything legacy on
+  # this board is behind it on real silicon; here it contributes the two things
+  # that are not chips of their own — the `PIRQ` routers and the ACPI register
+  # block — and the chips themselves are the objects below.
+  #
+  # `device-id` is **required and has no default**, and that is deliberate. The
+  # ICH9 datasheet §13.1.2 does not give the value: it says "Refer to the Intel
+  # I/O Controller Hub (ICH9) Family Specification Update for the value of the
+  # Device ID Register", and that Specification Update (316973) could not be
+  # retrieved from any public mirror. So the number below is **this board's
+  # claim and not a datasheet citation**: 0x2918 is what an 82801IB ICH9 is
+  # widely reported to answer, nothing on this board depends on it — software
+  # finds the chipset by class code 060100h and its ACPI hardware through the
+  # FADT — and a machine file is the right place for a number whose provenance
+  # is weaker than a datasheet's, because it is the one place a reader looking
+  # for it will look. Change it if you have the document.
+  # `clock = pmtmr` is not decoration: the ACPI power-management timer lives in
+  # this function, and it is a lazily advanced device that counts its own
+  # domain's ticks one for one. Without a domain the realizer refuses the
+  # object, which is the right answer — a timer with no clock is not a timer.
+  object lpc "q35.lpc" {
+    clock     = pmtmr
+    bus       = "pci0"
+    iospace   = "port"
+    device-id = 0x2918
+    pm-base   = pmbase
+  }
+
+  # -- the ACPI tables --------------------------------------------------------
+  #
+  # Generated at reset from the realized machine. Three things it cannot read
+  # out of the topology and therefore takes here:
+  #
+  #   `cpus`       — a processor is not a region in any address space, and
+  #                  `core::device` keeps `Any` out of the supertrait chain, so
+  #                  there is no route from a `dyn Device` to a CPU. The same
+  #                  limitation `riscv-virt`'s device tree has for harts. The
+  #                  bootstrap processor's APIC id *is* read, from its own ID
+  #                  register, and this number only says how many.
+  #   `ioapic-id`  — the I/O APIC's id lives behind an index/data register pair,
+  #                  and reaching it means writing the index, which a debug read
+  #                  may not do. It has to agree with `ioapic`'s `id` below.
+  #   `sci-irq`    — which of five interrupts the SCI appears on is
+  #                  `ACPI_CNTL[2:0]`'s choice, made by firmware after this
+  #                  table is written. 9 is the reset default, and the wire
+  #                  below is its other half.
+  #
+  # `space` and `iospace` are both named because the tables describe both: the
+  # MADT and MCFG name memory addresses, the FADT names I/O ports.
+  object acpi "q35.acpi" {
+    space      = mem
+    iospace    = "port"
+    size       = acpisize
+    cpus       = 1
+    ioapic-id  = 1
+    sci-irq    = 9
+  }
+
+  # -- interrupts -------------------------------------------------------------
+  #
+  # `pc-at`'s, unchanged: two 8259As with the slave cascaded onto the master's
+  # IR2, a local APIC, an I/O APIC, and the MP specification's IMCR deciding
+  # which path the master's INT takes.
+  object pic1   "pc.pic"    { mode = "master" }
+  object pic2   "pc.pic"    { mode = "slave" }
+  object lapic0 "pc.lapic"  { clock = bus, id = 0, bus = "apic" }
+  object ioapic "pc.ioapic" { id = 1, bus = "apic" }
+  object imcr   "pc.imcr"   {}
+
+  # -- the timers -------------------------------------------------------------
+
+  object pit0 "pc.pit" { clock = pit }
+
+  # The HPET's three comparators, on I/O APIC inputs **16, 17 and 18** rather
+  # than `pc-at`'s 20, 21 and 22. The reason is one line further down: the SCI
+  # can be steered onto I/O APIC input 20 or 21 by `ACPI_CNTL[2:0]`, and two
+  # unrelated sources wire-ORed onto one input would be a board nobody could
+  # debug. 16-18 are equally free — no ISA line reaches them either.
+  object hpet0 "pc.hpet" {
+    clock  = hpet
+    period = 100000000
+    route0 = 16
+    route1 = 17
+    route2 = 18
+  }
+
+  # -- the real-time clock and CMOS -------------------------------------------
+
+  object cmos "pc.rtc" {
+    clock   = rtc
+    time    = time
+    basemem = basemem
+    extmem  = extmem
+  }
+
+  # -- the rest of the legacy set ---------------------------------------------
+
+  object kbc    "pc.kbc"    { clock = kbd / 12000, port = keyboard }
+  object sysctl "pc.sysctl" {}
+  object dma1   "pc.dma"    { space = mem, mode = "byte", base = 0 }
+  object dma2   "pc.dma"    { space = mem, mode = "word", base = 4 }
+
+  # -- video ------------------------------------------------------------------
+
+  object vga     "pc.video"    { clock = dot / 9, dot-clock = 28322000 }
+  object vgacard "pc.vga-pci"  {
+    space  = mem
+    bus    = "pci0"
+    device = 2
+    image  = "vgabios"
+  }
+
+  # -- the hard disks and the IDE channels ------------------------------------
+
+  object hd0 "ata.disk" { image = "hd0", size = hd0size, bay = "ide0-master" }
+  object hd1 "ata.disk" { image = "hd1", size = hd1size, bay = "ide0-slave" }
+
+  object ide0 "pc.ide" { master = "ide0-master", slave = "ide0-slave" }
+  object ide1 "pc.ide" { master = "ide1-master", slave = "ide1-slave" }
+
+  # -- firmware ---------------------------------------------------------------
+  #
+  # The `bios` slot defaults to rsemu's own 64 KiB image and `--bios` displaces
+  # it. `align = "top"` puts the reset vector at the top of the socket; with a
+  # 64 KiB socket and a 64 KiB image the alignment is moot, and it is written
+  # anyway so a smaller image still lands where a processor looks.
+  object bios   "pc.rom" { image = "bios",    size = biossize, align = "top" }
+  object vgarom "pc.rom" { image = "vgabios", size = vgasize,  align = "bottom" }
+
+  # -- the memory map ---------------------------------------------------------
+  #
+  # 0x00000    base RAM, up to the video hole
+  # 0xb8000    the colour text page
+  # 0xc0000    the video option ROM
+  # 0xe0000    the ACPI tables
+  # 0xf0000    the system BIOS
+  # 0x100000   extended memory
+  # 0xfec00000 the I/O APIC, 0xfed00000 the HPET, 0xfee00000 the local APIC
+  # 0xffff0000 the system BIOS again, for the reset vector
+  #
+  # The ECAM window is **not** here, and that is the point of it: `PCIEXBAR`
+  # places it, and a firmware that moves the register moves the window.
+  map mem 0x00000000 size basemem  = ram_low
+  map mem 0x000b8000 size 0x8000   = vga.vram
+  map mem vgabase    size vgasize  = vgarom
+  map mem acpibase   size acpisize = acpi.tables
+  map mem biosbase   size biossize = bios
+  map mem 0x00100000 size extmem   = ram_high
+
+  map mem 0xfec00000 size 0x0020   = ioapic.regs   # 82093AA §3.1
+  map mem 0xfed00000 size 0x0400   = hpet0.regs    # HPET spec §3.2.4
+  map mem 0xfee00000 size 0x1000   = lapic0.regs   # SDM Vol 3A §10.4.4
+
+  map mem 0x100000000 - biossize size biossize = bios
+
+  # -- the I/O map ------------------------------------------------------------
+  #
+  # The AT's, unchanged. A q35 decodes every one of these, because an ICH9 does.
+  # The ACPI register block is **not** here: `PMBASE` places it, exactly as
+  # `PCIEXBAR` places the ECAM window.
+  map port 0x0000 size 0x0010 = dma1.regs
+  map port 0x0020 size 0x0002 = pic1.regs
+  map port 0x0022 size 0x0002 = imcr.regs
+  map port 0x0040 size 0x0004 = pit0.regs
+  map port 0x0060 size 0x0001 = kbc.data
+  map port 0x0061 size 0x0001 = sysctl.portb
+  map port 0x0064 size 0x0001 = kbc.cmd
+  map port 0x0070 size 0x0002 = cmos.regs
+  map port 0x0080 size 0x0008 = alias(dma1.pages, 0)
+  map port 0x0088 size 0x0008 = alias(dma2.pages, 8)
+  map port 0x0092 size 0x0001 = sysctl.porta
+  map port 0x00a0 size 0x0002 = pic2.regs
+  map port 0x00c0 size 0x0020 = dma2.regs
+  map port 0x03b4 size 0x0002 = vga.crtc-mono
+  map port 0x03c0 size 0x0010 = vga.vga
+  map port 0x03d4 size 0x0002 = vga.crtc-colour
+  map port 0x03d8 size 0x0002 = vga.mode
+  map port 0x03da size 0x0001 = vga.status
+  map port 0x0170 size 0x0008 = ide1.regs
+  map port 0x01f0 size 0x0008 = ide0.regs
+  map port 0x0376 size 0x0001 = ide1.ctl
+  map port 0x03f6 size 0x0001 = ide0.ctl
+  map port 0x04d0 size 0x0001 = pic1.elcr
+  map port 0x04d1 size 0x0001 = pic2.elcr
+
+  # PCI configuration mechanism #1, and the reset control register at 0xcf9
+  # inside it, handed on to `sysctl` through the north bridge's pass-through.
+  # ECAM does not replace this window — a q35 has both, and every firmware
+  # starts here.
+  map port 0x0cf8 size 0x0008 = mch.config
+
+  # -- the wires --------------------------------------------------------------
+  #
+  # The interrupt tree, unchanged from `pc-at`: the slave cascades onto the
+  # master's IR2, the master's INT reaches the processor through the IMCR, and
+  # the local APIC's own output is wire-ORed onto the same pin. The order of
+  # the two `cpu0.intr` drivers is load bearing — the IMCR is asked for an
+  # acknowledge first and declines when the register says the APIC owns the pin.
+  wire pic2.int    -> pic1.ir2
+  wire pic1.int    -> imcr.int
+  wire imcr.intr   -> cpu0.intr
+  wire imcr.lint0  -> lapic0.lint0
+  wire lapic0.intr -> cpu0.intr
+  wire lapic0.nmi  -> cpu0.nmi
+
+  # Every legacy line lands twice, on the 8259A input it has always had and on
+  # the I/O APIC input the MP specification assigns it. IRQ0 is the exception:
+  # the 8254's output reaches I/O APIC input **2**, and the MADT's interrupt
+  # source override is the other half of this line.
+  wire pit0.out0   -> pic1.ir0
+  wire pit0.out0   -> ioapic.irq2
+  wire kbc.irq1    -> pic1.ir1
+  wire kbc.irq1    -> ioapic.irq1
+  wire ide0.irq    -> pic2.ir6
+  wire ide0.irq    -> ioapic.irq14
+  wire ide1.irq    -> pic2.ir7
+  wire ide1.irq    -> ioapic.irq15
+  wire cmos.irq    -> pic2.ir0
+  wire cmos.irq    -> ioapic.irq8
+  wire kbc.irq12   -> pic2.ir4
+  wire kbc.irq12   -> ioapic.irq12
+
+  wire hpet0.t0    -> ioapic.irq16
+  wire hpet0.t1    -> ioapic.irq17
+  wire hpet0.t2    -> ioapic.irq18
+
+  # The SCI. `ACPI_CNTL[2:0]` picks one of five destinations and the bridge
+  # drives one pin per destination, so all five are wired and at most one is
+  # ever high — the shape `pc.imcr` uses, and for the same reason: switching the
+  # selection with the SCI asserted must not strand a level high for ever.
+  #
+  # IRQ9, IRQ10 and IRQ11 are on the slave 8259A's IR1, IR2 and IR3, and on the
+  # I/O APIC inputs of the same number. IRQ20 and IRQ21 are I/O APIC only, which
+  # is what the datasheet means by "Only available if APIC enabled".
+  wire lpc.sci9    -> pic2.ir1
+  wire lpc.sci9    -> ioapic.irq9
+  wire lpc.sci10   -> pic2.ir2
+  wire lpc.sci10   -> ioapic.irq10
+  wire lpc.sci11   -> pic2.ir3
+  wire lpc.sci11   -> ioapic.irq11
+  wire lpc.sci20   -> ioapic.irq20
+  wire lpc.sci21   -> ioapic.irq21
+
+  # The `PIRQ` routers' eleven outputs. Every one is wired, to the 8259A input
+  # it names and to the I/O APIC input of the same number, because which of them
+  # a given PCI function ends up on is a run-time decision made by whatever
+  # firmware writes `PIRQ[n]_ROUT`. Nothing drives the eight `PIRQ` *inputs*
+  # yet: no PCI function in this tree publishes an `INTA#` pin, and the board
+  # cannot wire what does not exist. That is the next thing this board needs,
+  # and it is a change to the PCI functions rather than to the chipset.
+  wire lpc.irq3    -> pic1.ir3
+  wire lpc.irq3    -> ioapic.irq3
+  wire lpc.irq4    -> pic1.ir4
+  wire lpc.irq4    -> ioapic.irq4
+  wire lpc.irq5    -> pic1.ir5
+  wire lpc.irq5    -> ioapic.irq5
+  wire lpc.irq6    -> pic1.ir6
+  wire lpc.irq6    -> ioapic.irq6
+  wire lpc.irq7    -> pic1.ir7
+  wire lpc.irq7    -> ioapic.irq7
+  wire lpc.irq10   -> pic2.ir2
+  wire lpc.irq10   -> ioapic.irq10
+  wire lpc.irq11   -> pic2.ir3
+  wire lpc.irq11   -> ioapic.irq11
+  wire lpc.irq12   -> pic2.ir4
+  wire lpc.irq12   -> ioapic.irq12
+  wire lpc.irq14   -> pic2.ir6
+  wire lpc.irq14   -> ioapic.irq14
+  wire lpc.irq15   -> pic2.ir7
+  wire lpc.irq15   -> ioapic.irq15
+
+  # `lpc.irq9` is deliberately absent from the list above: IRQ9 is where the
+  # SCI's default selection lands, and giving the router a second driver on the
+  # same net would make an SCI and a shared PCI interrupt indistinguishable.
+  # Route a PCI function to IRQ9 by adding the two wires here and accepting the
+  # sharing, which is what a real board does.
+
+  # The timer's counter 2 and the board's port B.
+  wire sysctl.gate2 -> pit0.gate2
+  wire pit0.out2    -> sysctl.timer2
+  wire pit0.out1    -> sysctl.refresh
+
+  # A20 and reset, each with two drivers.
+  wire kbc.a20      -> cpu0.a20
+  wire sysctl.a20   -> cpu0.a20
+  wire kbc.reset    -> cpu0.reset
+  wire sysctl.reset -> cpu0.reset
+}
