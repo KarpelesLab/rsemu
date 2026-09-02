@@ -23,6 +23,15 @@ drivers, which is the usual trap.
   optimisation for later.
 - virtio-net is a `pktkit::L2Device`; virtio-blk sits on `fstool::BlockDevice`.
   Neither needs transport-specific code.
+- **virtio-blk reaches `fstool` through `dev::ata::Medium`, not directly.**
+  `src/dev/riscv/virtio` is `no_std` and `fstool` is a `std` crate, so the
+  device holds the narrow `&self` trait and `dev/blk` adapts that to a
+  `BlockDevice` behind a lock — the same seam an ATA drive's platter and an
+  NVMe namespace use, and the reason `--drive disk=root.qcow2` works on all
+  three ([`storage.md`](storage.md)). The alternative, a `Vec<u8>` in the
+  device, is what was there before: it cost the whole capacity in host memory,
+  had no snapshot policy, and let a guest-supplied descriptor length reach an
+  allocator.
 
 ## ⚠ Do not consult
 

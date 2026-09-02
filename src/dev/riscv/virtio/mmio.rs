@@ -41,12 +41,18 @@
 //! of `ROADMAP.md` §4.7 taken at its word: the transport's state lock is
 //! released *before* the backend is called, because the backend performs DMA
 //! through the same address space the notify arrived on.
+//!
+//! And because it is the *same* address space, a driver can point a descriptor
+//! at this device's own registers and be re-entered from inside a transfer. So
+//! the work is **iterative, not recursive**, exactly as `dev/nvme`'s doorbell
+//! engine is: the transport's notify path argues it where it bites.
 
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt;
+use core::sync::atomic::{self, AtomicBool, AtomicU64};
 
 use crate::core::device::{Device, DeviceClass, RealizeCtx, ResetKind};
 use crate::core::error::{BusError, Error, Result};
@@ -149,7 +155,20 @@ struct Registers {
     /// can be taken with nothing else held.
     links: Mutex<Links>,
     backend: Arc<dyn Backend>,
+    /// Queues with a notification outstanding, one bit each.
+    ///
+    /// Derived state: it is what a `QueueNotify` write leaves behind for the
+    /// engine to pick up, and it is empty whenever the engine is not running,
+    /// so it is never serialized. See [`Registers::notify`].
+    pending: AtomicU64,
+    /// Whether a [`notify`](Registers::notify) pass is already in progress.
+    engine: AtomicBool,
 }
+
+/// The most queues one virtio device can have here, because [`Registers`]
+/// tracks outstanding notifications in a `u64`. Every device in this tree has
+/// one; `VIRTIO_BLK_F_MQ` and a multiqueue NIC are what would push at it.
+const MAX_QUEUES: usize = u64::BITS as usize;
 
 /// What the machine gave this device.
 #[derive(Debug, Default)]
@@ -185,11 +204,13 @@ impl VirtioMmio {
     /// Wrap `backend` in the MMIO transport.
     #[must_use]
     pub fn new(backend: Arc<dyn Backend>, class: &'static DeviceClass) -> VirtioMmio {
-        let queues = backend.queue_count();
+        let queues = backend.queue_count().min(MAX_QUEUES);
         let regs = Arc::new(Registers {
             state: Mutex::with_rank(LockRank::DEVICE, State::new(queues)),
             links: Mutex::with_rank(LockRank::LEAF, Links::default()),
             backend,
+            pending: AtomicU64::new(0),
+            engine: AtomicBool::new(false),
         });
         let region: RegionRef = Arc::new(Region::io(
             "virtio.mmio",
@@ -274,24 +295,92 @@ impl Registers {
         }
     }
 
-    /// Run every chain the driver has made available on `index`.
+    /// Run every chain the driver has made available on `index`, and on
+    /// whatever else is asked for while that is happening.
     ///
-    /// The state lock is taken twice and held across nothing: the backend does
-    /// DMA through the same space this notify arrived on (§4.7).
+    /// # Why this is a loop and not a call
+    ///
+    /// The register block is in the address space this device masters, so a
+    /// driver can point a descriptor at this device's own `QueueNotify` — and
+    /// then the backend's write into that buffer re-enters this function from
+    /// inside itself. It is not exotic: a `VIRTIO_BLK_T_IN` of a blank sector
+    /// into a four-byte writable descriptor aimed at `0x…050` writes four
+    /// zero bytes, and zero is a legal queue index. The device's position in
+    /// the available ring is not committed until the pass ends, so the nested
+    /// call would re-run the same chain, and the recursion has no bottom.
+    ///
+    /// The answer is the one `core::wire` already gives for a re-entrant level
+    /// change and `dev/nvme` gives for a re-entrant doorbell: the work is
+    /// **iterative, not recursive**. A notify records its queue and returns if
+    /// a pass is already running; the running pass re-reads what has been
+    /// recorded after every queue it drains. Depth is one whatever the guest
+    /// builds.
+    ///
+    /// It is also what makes two harts notifying at once correct rather than
+    /// merely lucky: the second records its queue and returns, and the first
+    /// serves it. A driver already has to wait for the used ring rather than
+    /// for the store to retire (§2.7.8), so that is not a promise being broken.
+    ///
+    /// No lock is held across any of it. The state lock is taken in short
+    /// sections and released before the backend runs, because the backend does
+    /// DMA through the same space this notify arrived on (`ROADMAP.md` §4.7).
     fn notify(&self, index: u32) {
+        if index as usize >= self.backend.queue_count().min(MAX_QUEUES) {
+            // No such queue: nothing to record, and `live_queue` would refuse
+            // it anyway.
+            return;
+        }
+        self.pending
+            .fetch_or(1u64 << index, atomic::Ordering::Relaxed);
+        if self.engine.swap(true, atomic::Ordering::Acquire) {
+            return;
+        }
+
+        let mut worked = false;
+        loop {
+            let mask = self.pending.swap(0, atomic::Ordering::Relaxed);
+            if mask != 0 {
+                for queue in 0..MAX_QUEUES as u32 {
+                    if mask & (1u64 << queue) != 0 {
+                        worked |= self.run_queue(queue);
+                    }
+                }
+                continue;
+            }
+            // Nothing left. Stand down — and then look once more, because a
+            // notify that arrived between the swap above and this store saw
+            // the engine running and left its bit for somebody.
+            self.engine.store(false, atomic::Ordering::Release);
+            if self.pending.load(atomic::Ordering::Relaxed) == 0 {
+                break;
+            }
+            if self.engine.swap(true, atomic::Ordering::Acquire) {
+                // Somebody else took the pass over. It will see the bit.
+                break;
+            }
+        }
+
+        if worked {
+            let raise = self.state.lock().interrupt_status != 0;
+            self.drive(raise);
+        }
+    }
+
+    /// Drain queue `index`, returning whether anything was completed.
+    fn run_queue(&self, index: u32) -> bool {
         let (space, requester) = {
             let links = self.links.lock();
             (links.space.clone(), links.requester)
         };
         let Some(space) = space else {
-            return;
+            return false;
         };
         let Some(queue) = self.live_queue(index) else {
-            return;
+            return false;
         };
         let q = Queue::new(queue.layout, &space, requester);
         let Ok(avail) = q.avail_idx() else {
-            return;
+            return false;
         };
 
         let mut last = queue.last_avail;
@@ -316,21 +405,22 @@ impl Registers {
             did_work = true;
         }
 
-        let raise = {
-            let mut state = self.state.lock();
-            let Some(slot) = state.queues.get_mut(index as usize) else {
-                return;
-            };
+        let mut state = self.state.lock();
+        let Some(slot) = state.queues.get_mut(index as usize) else {
+            return false;
+        };
+        // Only if this is still the queue that was drained. A `Status` write
+        // of zero reached from inside `handle` — the register block is in the
+        // space this device masters — resets every queue, and writing a
+        // position back into a queue that no longer exists would resurrect it.
+        if slot.layout == queue.layout {
             slot.last_avail = last;
             slot.used_idx = used;
-            if did_work {
-                state.interrupt_status |= INT_USED_BUFFER;
-            }
-            state.interrupt_status != 0
-        };
-        if did_work {
-            self.drive(raise);
         }
+        if did_work {
+            state.interrupt_status |= INT_USED_BUFFER;
+        }
+        did_work
     }
 
     /// The queue `index`, if the driver has finished setting it up and the
@@ -350,6 +440,12 @@ impl Registers {
             let mut state = self.state.lock();
             *state = State::new(state.queues.len());
         }
+        // Outstanding notifications go with the queues they named. `engine` is
+        // deliberately left alone: it belongs to whichever call frame is
+        // running the pass, and a reset reached from inside one (a `Status`
+        // write of zero through a descriptor) must not hand a second frame the
+        // right to run.
+        self.pending.store(0, atomic::Ordering::Relaxed);
         self.backend.reset();
         self.drive(false);
     }
@@ -978,6 +1074,110 @@ mod tests {
                 .write(0x070, &[0u8; 4], MemAttrs::DEBUG)
                 .is_err(),
             "and a debug write is refused outright"
+        );
+    }
+
+    /// A backend that writes four zero bytes into the chain — which is a
+    /// `QueueNotify` of queue 0 if the driver aimed the descriptor at this
+    /// device's own register block.
+    #[derive(Debug, Default)]
+    struct Zeros {
+        calls: Mutex<u32>,
+    }
+
+    impl Backend for Zeros {
+        fn device_id(&self) -> u32 {
+            0xfeed
+        }
+
+        fn queue_count(&self) -> usize {
+            1
+        }
+
+        fn config_read(&self, _offset: u64, dst: &mut [u8]) {
+            dst.fill(0);
+        }
+
+        fn handle(&self, _queue: usize, q: &Queue<'_>, chain: &[Descriptor]) -> u32 {
+            *self.calls.lock() += 1;
+            q.write_chain(chain, 0, &[0u8; 4]).unwrap_or(0) as u32
+        }
+
+        fn reset(&self) {}
+    }
+
+    #[test]
+    fn a_descriptor_aimed_at_this_devices_own_doorbell_does_not_recurse() {
+        // The register block is in the address space this device masters, so a
+        // driver can point a writable descriptor at `QueueNotify` and be
+        // re-entered from inside its own transfer. Four zero bytes of disk data
+        // are a notify of queue 0, which is not an exotic value: it is what a
+        // blank sector holds. The device's position in the available ring is
+        // not committed until the pass ends, so a recursive engine would re-run
+        // the same chain for ever.
+        let zeros = Arc::new(Zeros::default());
+        let device = VirtioMmio::new(Arc::clone(&zeros) as Arc<dyn Backend>, &ECHO_CLASS);
+        let space = AddressSpace::new("mem", 64);
+        space
+            .topology()
+            .map(CoreRegion::ram("ram", Arc::new(RamStore::new(0x1_0000))), 0)
+            .unwrap();
+        // The device, in the space it masters.
+        const SELF: u64 = 0x2_0000;
+        space
+            .topology()
+            .map(device.region("").expect("a register window"), SELF)
+            .unwrap();
+        let space = Arc::new(space);
+        device.attach_space(Arc::clone(&space), RequesterId(3));
+
+        let poke = |at: u64, width: W, value: u64| {
+            space.write(at, width, value, MemAttrs::DEFAULT).unwrap();
+        };
+        let set = |off: u64, value: u32| {
+            poke(SELF + off, W::U32, u64::from(value));
+        };
+
+        set(0x070, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
+        set(0x024, 1);
+        set(0x020, 1);
+        set(
+            0x070,
+            STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK,
+        );
+        set(0x030, 0);
+        set(0x038, 8);
+        set(0x080, DESC as u32);
+        set(0x090, AVAIL as u32);
+        set(0x0a0, USED as u32);
+        set(0x044, 1);
+        set(
+            0x070,
+            STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK,
+        );
+
+        // One writable descriptor, four bytes, aimed at `QueueNotify`.
+        poke(DESC, W::U64, SELF + 0x050);
+        poke(DESC + 8, W::U32, 4);
+        poke(
+            DESC + 12,
+            W::U16,
+            u64::from(super::super::queue::DESC_F_WRITE),
+        );
+        poke(DESC + 14, W::U16, 0);
+        poke(AVAIL + 4, W::U16, 0);
+        poke(AVAIL + 2, W::U16, 1);
+
+        set(0x050, 0);
+        assert_eq!(
+            *zeros.calls.lock(),
+            1,
+            "the chain ran once; the re-entrant notify found the engine busy"
+        );
+        assert_eq!(
+            space.read(USED + 2, W::U16, MemAttrs::DEBUG).unwrap(),
+            1,
+            "and it was completed exactly once"
         );
     }
 

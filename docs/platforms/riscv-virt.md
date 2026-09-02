@@ -108,7 +108,66 @@ $ RSEMU_RISCV_INITRD=$TD/initramfs-virtio.cpio RSEMU_RISCV_DISK=$TD/disk.img …
 ```
 
 `--disk` / `RSEMU_RISCV_DISK` binds the `disk` media slot, which is the front of
-the disk; the `storage` parameter pads it out with zeroes.
+the disk; the `storage` parameter pads it out with zeroes. That is the
+media-slot path: bytes, copied into a `RamStore`, `no_std`, and what a wasm
+build runs on.
+
+## Booting off a qcow2
+
+The other path backs the same slot with a host **file**. `virtio.blk` stores
+its bytes behind `dev::ata::Medium`, the seam an ATA drive's platter and an
+NVMe namespace already use, so `--drive` works here for the reason it works
+there and no image format is parsed in rsemu — sparse raw, qcow2, DMG and LUKS
+all come from `fstool`.
+
+```console
+$ rsemu run riscv-virt --media firmware=fw.bin --drive disk=root.qcow2,new=64M
+```
+
+The medium brings its own capacity, so `storage` is ignored and the guest sees
+the image's size; a 16 GiB disk costs 16 GiB of *disk* and nothing in host
+memory until the guest touches it. Guest writes go into the file, so the next
+run is a reboot of the last one — and a machine snapshot **references** the
+image (flushing it first) rather than copying it, which is what
+[`storage.md`](../buses/storage.md) argues at length.
+
+`RSEMU_RISCV_DRIVE` is the same thing for the test harness, with
+`RSEMU_RISCV_DRIVE_NEW=<size>` to create the image and `RSEMU_RISCV_DRIVE_RO`
+to open it read-only (which the device reports as `VIRTIO_BLK_F_RO`, so the
+guest finds out before it tries):
+
+```console
+$ RSEMU_RISCV_FIRMWARE=$TD/fw_jump.bin \
+  RSEMU_RISCV_PAYLOAD=0x80200000:$TD/linux \
+  RSEMU_RISCV_INITRD=$TD/initramfs-virtio.cpio \
+  RSEMU_RISCV_DRIVE=$TD/root.qcow2 RSEMU_RISCV_DRIVE_NEW=64M \
+  RSEMU_RISCV_RAM=512M RSEMU_RISCV_QUANTA=6000000 \
+  RSEMU_RISCV_BOOTARGS='console=ttyS0 earlycon=sbi' \
+      cargo test --release --all-features firmware_from_the --lib -- --nocapture
+…
+[  225.340000] virtio_blk virtio0: [vda] 131072 512-byte logical blocks (67.1 MB/64.0 MiB)
+```
+
+64 MiB rather than the board's `storage = 16M`, which is the whole point: the
+guest is reading the image's geometry, not the machine file's. Two runs against
+that image are a write and a reboot:
+
+```console
+rsemu# echo rsemu-qcow2-round-trip | dd of=/dev/vda bs=512 count=1 conv=sync,fsync
+WROTE-OK
+… second run, same qcow2, no RSEMU_RISCV_DRIVE_NEW …
+rsemu# head -c 22 /dev/vda
+rsemu-qcow2-round-trip
+```
+
+**`fsync`, not `sync`.** A guest write is durable in the image when the guest
+asks for it to be — `VIRTIO_BLK_T_FLUSH`, which is what `dd conv=fsync` and
+`fsync(2)` on the device produce — and `sync(1)` alone is not that. Linux
+writes a bare block device's dirty pages back on `sync(2)` but issues the
+device cache flush from `blkdev_fsync`, so with `sync` alone the data cluster
+reaches the qcow2 and the L2 entry that finds it does not; the next open sees a
+hole. That is the flush contract working as specified rather than a defect, but
+it is sharp, and nothing yet flushes an image when a *run* ends.
 
 ## Booting UEFI
 

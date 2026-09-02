@@ -1537,6 +1537,15 @@ adapter, and sparse raw, qcow2, DMG, DiskCopy 4.2 and LUKS all work through
 machine snapshot (flushing it first) rather than copying it; `capture` and
 `refuse` are the other two policies and the choice is explicit.
 
+**All three storage devices are on that seam.** `nvme.controller`'s namespace
+and `virtio.blk`'s disk are `Medium`s too, so `--drive nvme0=disk.qcow2` and
+`--drive disk=root.qcow2` mean what `--drive hd0=disk.qcow2` means, and
+`riscv-virt` boots Linux off a qcow2 that stays on disk. The seam's *home* is
+the loose end: it lives under `dev/ata` because ATA wanted it first, which
+makes `dev-riscv` and `dev-nvme` depend on `dev-ata-disk` for a trait rather
+than for a command set. Moving `medium.rs` to a neutral module under its own
+feature is a rename, and it is what §3's crate-shape rule asks for.
+
 What rsemu adds on top: the remaining image formats (`vmdk`, `vhdx`, `vdi`) —
 which are new `BlockDevice` backends and so belong beside the ones they sit next
 to, in `fstool`, not layered over them in rsemu — copy-on-write overlays and

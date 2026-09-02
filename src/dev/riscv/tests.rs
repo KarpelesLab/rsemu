@@ -926,6 +926,16 @@ fn unescape(text: &str) -> String {
 /// by `/chosen/linux,initrd-start`. `scripts/fetch-testdata.sh initramfs`
 /// builds one that boots to a busybox shell.
 ///
+/// `RSEMU_RISCV_DRIVE` backs the `disk` media slot with a host **file** rather
+/// than with bytes — `--drive disk=root.qcow2`, in environment-variable form —
+/// so the guest's root filesystem can be a sparse qcow2 that stays on disk
+/// instead of a copy of it in host memory. `fstool` picks the backend from the
+/// file's own contents, so raw, qcow2, DMG and LUKS all work, and the guest's
+/// writes go back into that file: a run is a reboot of the previous one.
+/// `RSEMU_RISCV_DRIVE_RO` opens it read-only, which the device reports as
+/// `VIRTIO_BLK_F_RO` so the guest finds out before it tries. It wins over
+/// `RSEMU_RISCV_DISK`, which stays the media-slot path.
+///
 /// `RSEMU_RISCV_INPUT` types at the guest: one `marker=>text` step per line,
 /// where `text` takes `\n`, `\r`, `\t` and `\\`. Each step waits for its marker
 /// in the guest's output and then feeds its text to the console. A prompt that
@@ -1006,6 +1016,44 @@ fn firmware_from_the_environment_reaches_its_console() {
             std::env::var("RSEMU_RISCV_BOOTARGS")
                 .unwrap_or_else(|_| String::from("console=ttyS0 earlycon=sbi")),
         );
+    // `RSEMU_RISCV_DRIVE` backs the `disk` media slot with a host *file*
+    // instead of with bytes: exactly what `--drive disk=root.qcow2` does, and
+    // the reason a guest can root off a qcow2 that stays on disk. It wins over
+    // `RSEMU_RISCV_DISK`, which stays the media-slot path (`no_std`, and what
+    // wasm runs on).
+    #[cfg(feature = "dev-blk")]
+    if let Ok(path) = std::env::var("RSEMU_RISCV_DRIVE") {
+        let read_only = std::env::var("RSEMU_RISCV_DRIVE_RO").is_ok();
+        let mut opts = crate::dev::blk::ImageOptions::new().read_only(read_only);
+        // `--drive disk=…,new=<size>` in environment-variable form: make the
+        // image instead of opening one, so a first run has something to boot
+        // off. `fstool` picks the backend from the extension, so `.qcow2` is a
+        // qcow2 and anything else a sparse raw file.
+        if let Ok(size) = std::env::var("RSEMU_RISCV_DRIVE_NEW") {
+            let (digits, scale) = match size.as_bytes().last() {
+                Some(b'K' | b'k') => (&size[..size.len() - 1], 1024),
+                Some(b'M' | b'm') => (&size[..size.len() - 1], 1024 * 1024),
+                Some(b'G' | b'g') => (&size[..size.len() - 1], 1024 * 1024 * 1024),
+                _ => (size.as_str(), 1),
+            };
+            let bytes: u64 = digits
+                .trim()
+                .parse()
+                .unwrap_or_else(|e| panic!("`{size}` is not a size: {e}"));
+            opts = opts.create(bytes * scale);
+        }
+        let image = crate::dev::blk::Image::open(std::path::Path::new(&path), &opts)
+            .unwrap_or_else(|e| panic!("cannot open {path}: {e}"));
+        eprintln!(
+            "RSEMU_RISCV_DRIVE: {} ({} bytes{})",
+            image.describe(),
+            crate::dev::ata::Medium::capacity(&image),
+            if read_only { ", read-only" } else { "" }
+        );
+        crate::dev::blk::install(&options.realize.hosts, "disk", alloc::sync::Arc::new(image))
+            .expect("nothing else claimed the `disk` media slot");
+    }
+
     let mut source = String::from(entry.source);
     for (i, (addr, bytes)) in payloads.iter().enumerate() {
         let slot = alloc::format!("payload{i}");

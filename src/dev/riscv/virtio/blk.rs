@@ -3,9 +3,10 @@
 //! # Source
 //!
 //! *Virtual I/O Device (VIRTIO) Version 1.2*, OASIS Standard, §5.2 ("Block
-//! Device"): device ID 2, the configuration layout, the request header, and
-//! the one-byte status that ends every request. No driver source was read —
-//! see [`queue`](super::queue).
+//! Device"): device ID 2 (§5.2.1), the one request virtqueue (§5.2.2), the
+//! feature bits (§5.2.3), the `capacity` configuration field (§5.2.4), and the
+//! request header, payload and one-byte status that make up a request
+//! (§5.2.6). No driver source was read — see [`queue`](super::queue).
 //!
 //! # A request
 //!
@@ -20,23 +21,45 @@
 //!   writable   one status byte: 0 ok, 1 I/O error, 2 unsupported
 //! ```
 //!
-//! # The backing store
+//! # The backing store is a `Medium`
 //!
-//! A byte vector, in memory, sized by the machine file or filled from a media
-//! image. `ROADMAP.md` §7.1 puts real storage on `fstool::BlockDevice` — qcow2,
-//! partition tables, filesystems, crash injection — and that is where this
-//! goes; the trait is `std` and feature-gated, so it cannot land in a `no_std`
-//! module. What is here is enough to boot a root filesystem out of a ramdisk
-//! image and to prove the transport, and it is deliberately not more.
+//! The same seam an [`AtaDisk`](crate::dev::ata::AtaDisk)'s platter and an NVMe
+//! namespace use — [`dev::ata::Medium`](crate::dev::ata::Medium) — and for the
+//! same three reasons. A [`RamStore`](crate::core::space::RamStore) is what a
+//! machine file's media slot gives, which is `no_std` and is what a wasm build
+//! runs on; a [`dev::blk::Image`](crate::dev::blk) is a host file through
+//! `fstool::BlockDevice`, so `rsemu run riscv-virt --drive disk=root.qcow2`
+//! boots off a sparse image that stays on disk rather than a copy of it in
+//! host memory; and the snapshot policy arrives with the medium instead of
+//! being decided here (`ROADMAP.md` §7.1).
+//!
+//! This module names neither `std` nor `fstool`: it sees the trait, and the
+//! trait is `no_std`. That is the whole reason the seam lives on the side that
+//! cannot see `std`.
+//!
+//! # Bounds
+//!
+//! Every length in a request is guest-supplied, and two of them used to reach
+//! an allocator directly. They do not now: a transfer is range-checked against
+//! the medium in `u64` **before** anything is allocated, and then moved in
+//! 64 KiB pieces, so a chain claiming a terabyte costs one 64 KiB
+//! buffer and one `VIRTIO_BLK_S_IOERR`. `dev/nvme` bounds its PRP walks for
+//! the same reason and argues it in the same words.
+//!
+//! # Time
+//!
+//! A medium access takes **zero guest time**, whether it is a memcpy or a
+//! `pread` five levels into a qcow2's backing chain. If the host's actual
+//! latency reached the guest's timeline, two runs of one machine would diverge
+//! on how warm the page cache was (`docs/buses/storage.md`).
 
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::fmt;
 
 use crate::core::error::{Error, Result};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::core::sync::{LockRank, Mutex};
+use crate::dev::ata::{Medium, Snapshot};
 
 use super::queue::{Descriptor, Queue};
 use super::{Backend, DEVICE_ID_BLOCK};
@@ -47,6 +70,15 @@ pub const SECTOR_SIZE: u64 = 512;
 
 /// The request header: type, a reserved word, and the starting sector.
 const HEADER_LEN: u64 = 16;
+
+/// How much of a transfer is staged at a time.
+///
+/// A request's payload length is whatever the guest's descriptors add up to,
+/// which is a queue's worth of `u32` lengths. Staging the whole of it would
+/// let a driver ask for an allocation of any size it can describe; a chunk
+/// bounds that to one buffer whatever the request claims, and costs nothing on
+/// the requests a real driver issues, which are a page or two.
+const CHUNK: u64 = 64 * 1024;
 
 /// `VIRTIO_BLK_T_IN` — read from the device.
 const T_IN: u32 = 0;
@@ -64,73 +96,173 @@ const S_IOERR: u8 = 1;
 /// `VIRTIO_BLK_S_UNSUPP`.
 const S_UNSUPP: u8 = 2;
 
+/// `VIRTIO_BLK_F_RO` (§5.2.3, bit 5): the device is read-only.
+///
+/// Offered only when it is true. Telling a guest it may write and then failing
+/// every write is worse than an honest read-only disk — the same argument
+/// `ata.disk` makes about the `IDENTIFY` it reports.
+const F_RO: u64 = 1 << 5;
+
+/// `VIRTIO_BLK_F_FLUSH` (§5.2.3, bit 9): the device honours a cache flush.
+///
+/// Always offered, because it is always true and it stopped being *trivially*
+/// true when the medium became a file. A write reaches the medium inside the
+/// call that carried it, but "reached the medium" and "is durable" are
+/// different claims once there is a host page cache in between, and
+/// `VIRTIO_BLK_T_FLUSH` is how a guest filesystem asks for the second one
+/// (§5.2.6).
+const F_FLUSH: u64 = 1 << 9;
+
 /// How many bytes the serial number occupies in a `GET_ID` reply (§5.2.6).
 const ID_BYTES: usize = 20;
-
-/// The disk image.
-struct Disk {
-    bytes: Mutex<Vec<u8>>,
-    serial: String,
-    read_only: bool,
-}
-
-impl fmt::Debug for Disk {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Disk")
-            .field("serial", &self.serial)
-            .field("read_only", &self.read_only)
-            .field("bytes", &self.bytes.try_lock().map(|b| b.len()))
-            .finish()
-    }
-}
 
 /// A virtio block device.
 #[derive(Debug)]
 pub struct VirtioBlk {
-    disk: Arc<Disk>,
+    media: Arc<dyn Medium>,
+    serial: String,
+    read_only: bool,
+    /// The medium's capacity in bytes, read once: [`Medium::capacity`] is
+    /// fixed for the life of the device, and a `config_read` should not take
+    /// an image's lock to learn something that cannot change.
+    bytes: u64,
 }
 
 impl VirtioBlk {
-    /// A device backed by `image`, rounded up to a whole number of sectors.
-    #[must_use]
-    pub fn new(image: Vec<u8>, serial: String, read_only: bool) -> VirtioBlk {
-        let mut bytes = image;
-        // A capacity is in whole sectors, so a short tail would be a sector the
-        // guest can address and only partly read.
-        let padded = bytes.len().next_multiple_of(SECTOR_SIZE as usize);
-        bytes.resize(padded, 0);
-        VirtioBlk {
-            disk: Arc::new(Disk {
-                bytes: Mutex::with_rank(LockRank::DEVICE, bytes),
-                serial,
-                read_only,
-            }),
+    /// A device over `media`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] if the medium is empty or
+    /// does not hold a whole number of 512-byte sectors — `capacity` is
+    /// counted in them (§5.2.4), so a short tail would be a sector the guest
+    /// can address and only partly read.
+    pub fn new(media: Arc<dyn Medium>, serial: String, read_only: bool) -> Result<VirtioBlk> {
+        let bytes = media.capacity();
+        if bytes == 0 || !bytes.is_multiple_of(SECTOR_SIZE) {
+            return Err(Error::Config {
+                at: String::from(super::BLK_CLASS_NAME),
+                message: alloc::format!(
+                    "a virtio disk holds a whole number of {SECTOR_SIZE}-byte sectors, and \
+                     {bytes} byte(s) is not a whole number of them"
+                ),
+            });
         }
+        Ok(VirtioBlk {
+            read_only: read_only || media.is_read_only(),
+            media,
+            serial,
+            bytes,
+        })
     }
 
     /// How many 512-byte sectors the guest sees.
     #[must_use]
     pub fn capacity(&self) -> u64 {
-        self.disk.bytes.lock().len() as u64 / SECTOR_SIZE
+        self.bytes / SECTOR_SIZE
     }
 
-    /// A copy of the medium, for a test that wants to check what was written.
+    /// The medium behind the device, for a host that wants to check what a
+    /// guest wrote without going back through the virtqueue.
     #[must_use]
-    pub fn contents(&self) -> Vec<u8> {
-        self.disk.bytes.lock().clone()
+    pub fn medium(&self) -> &Arc<dyn Medium> {
+        &self.media
     }
 
     /// Whether writes are refused.
     #[must_use]
     pub fn is_read_only(&self) -> bool {
-        self.disk.read_only
+        self.read_only
+    }
+
+    /// Every byte on the medium, for a [`Snapshot::Capture`] chunk.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::State`] if the medium could not be
+    /// read.
+    pub fn contents(&self) -> Result<Vec<u8>> {
+        let mut out = alloc::vec![0u8; self.bytes as usize];
+        self.media
+            .read_at(0, &mut out)
+            .map_err(|e| Error::State(alloc::format!("virtio disk: {e}")))?;
+        Ok(out)
+    }
+
+    /// The byte offset `len` bytes at `sector` start at, or `None` if the range
+    /// runs off the end of the medium.
+    ///
+    /// In `u64` throughout and checked before any of it becomes a length: a
+    /// guest picks both numbers, and `sector * 512 + len` is exactly where a
+    /// 64-bit guest on a 32-bit host bites (`docs/buses/storage.md`).
+    fn range(&self, sector: u64, len: u64) -> Option<u64> {
+        let at = sector.checked_mul(SECTOR_SIZE)?;
+        let end = at.checked_add(len)?;
+        (end <= self.bytes).then_some(at)
+    }
+
+    /// `VIRTIO_BLK_T_IN`: medium to chain.
+    ///
+    /// A chunk is read out of the medium and *then* placed in guest memory,
+    /// never both at once: the medium's own lock is not held across a bus
+    /// master's access to the space it masters (`ROADMAP.md` §4.7).
+    fn read_in(&self, q: &Queue<'_>, chain: &[Descriptor], sector: u64, len: u64) -> (u8, u64) {
+        let Some(at) = self.range(sector, len) else {
+            return (S_IOERR, 0);
+        };
+        let mut buf = alloc::vec![0u8; CHUNK.min(len) as usize];
+        let mut done = 0u64;
+        while done < len {
+            let take = CHUNK.min(len - done) as usize;
+            let part = &mut buf[..take];
+            if self.media.read_at(at + done, part).is_err() {
+                return (S_IOERR, done);
+            }
+            match q.write_chain(chain, done, part) {
+                Ok(n) => {
+                    done += n as u64;
+                    if n < take {
+                        // Guest memory refused part of a buffer the chain's own
+                        // descriptors claimed was there.
+                        return (S_IOERR, done);
+                    }
+                }
+                Err(_) => return (S_IOERR, done),
+            }
+        }
+        (S_OK, done)
+    }
+
+    /// `VIRTIO_BLK_T_OUT`: chain to medium.
+    fn write_out(&self, q: &Queue<'_>, chain: &[Descriptor], sector: u64, len: u64) -> (u8, u64) {
+        if self.read_only {
+            return (S_IOERR, 0);
+        }
+        let Some(at) = self.range(sector, len) else {
+            return (S_IOERR, 0);
+        };
+        let mut buf = alloc::vec![0u8; CHUNK.min(len) as usize];
+        let mut done = 0u64;
+        while done < len {
+            let take = CHUNK.min(len - done) as usize;
+            let part = &mut buf[..take];
+            if q.read_chain(chain, HEADER_LEN + done, part).unwrap_or(0) < take {
+                return (S_IOERR, 0);
+            }
+            if self.media.write_at(at + done, part).is_err() {
+                return (S_IOERR, 0);
+            }
+            done += take as u64;
+        }
+        (S_OK, 0)
     }
 
     /// Serve one request chain, returning the status byte and how many payload
     /// bytes were written into the chain.
     fn serve(&self, q: &Queue<'_>, chain: &[Descriptor]) -> (u8, u64) {
         let writable = Queue::writable_len(chain);
-        if writable == 0 || Queue::readable_len(chain) < HEADER_LEN {
+        let readable = Queue::readable_len(chain);
+        if writable == 0 || readable < HEADER_LEN {
             // Not a request at all. There is nowhere to put a status byte, so
             // the chain is simply completed with nothing written.
             return (S_OK, 0);
@@ -148,53 +280,19 @@ impl VirtioBlk {
         let payload = writable - 1;
 
         match kind {
-            T_IN => {
-                let mut buf = alloc::vec![0u8; payload as usize];
-                {
-                    let disk = self.disk.bytes.lock();
-                    let Some(at) = sector.checked_mul(SECTOR_SIZE) else {
-                        return (S_IOERR, 0);
-                    };
-                    let Ok(at) = usize::try_from(at) else {
-                        return (S_IOERR, 0);
-                    };
-                    let Some(slice) = disk.get(at..at + buf.len()) else {
-                        return (S_IOERR, 0);
-                    };
-                    buf.copy_from_slice(slice);
-                }
-                match q.write_chain(chain, 0, &buf) {
-                    Ok(n) => (S_OK, n as u64),
-                    Err(_) => (S_IOERR, 0),
-                }
-            }
-            T_OUT => {
-                if self.disk.read_only {
-                    return (S_IOERR, 0);
-                }
-                let want = Queue::readable_len(chain) - HEADER_LEN;
-                let mut buf = alloc::vec![0u8; want as usize];
-                if q.read_chain(chain, HEADER_LEN, &mut buf).unwrap_or(0) < buf.len() {
-                    return (S_IOERR, 0);
-                }
-                let mut disk = self.disk.bytes.lock();
-                let Some(at) = sector.checked_mul(SECTOR_SIZE) else {
-                    return (S_IOERR, 0);
-                };
-                let Ok(at) = usize::try_from(at) else {
-                    return (S_IOERR, 0);
-                };
-                let Some(slice) = disk.get_mut(at..at + buf.len()) else {
-                    return (S_IOERR, 0);
-                };
-                slice.copy_from_slice(&buf);
-                (S_OK, 0)
-            }
-            // Nothing is cached, so a flush has nothing to do and succeeds.
-            T_FLUSH => (S_OK, 0),
+            T_IN => self.read_in(q, chain, sector, payload),
+            T_OUT => self.write_out(q, chain, sector, readable - HEADER_LEN),
+            // §5.2.6: what the guest is asking for is durability, and with a
+            // file behind the medium that is a real `fsync` rather than a
+            // no-op. A `RamStore` took the write in the call that carried it
+            // and answers immediately.
+            T_FLUSH => match self.media.flush() {
+                Ok(()) => (S_OK, 0),
+                Err(_) => (S_IOERR, 0),
+            },
             T_GET_ID => {
                 let mut id = [0u8; ID_BYTES];
-                let serial = self.disk.serial.as_bytes();
+                let serial = self.serial.as_bytes();
                 let take = serial.len().min(ID_BYTES);
                 id[..take].copy_from_slice(&serial[..take]);
                 let take = (payload as usize).min(ID_BYTES);
@@ -220,11 +318,12 @@ impl Backend for VirtioBlk {
     }
 
     fn features(&self) -> u64 {
-        // Nothing beyond `VIRTIO_F_VERSION_1`, which the transport adds. Every
-        // §5.2.3 feature is optional, and a device that offers none is a device
-        // whose driver takes the simple path — which is the path that is easy
-        // to be sure about.
-        0
+        // Two of §5.2.3's bits, and only the two this device can keep its word
+        // about. The rest of that section — segment limits, geometry,
+        // topology, discard, multiqueue — describes promises nothing here
+        // makes, and offering a bit a driver then relies on is worse than
+        // offering none.
+        F_FLUSH | if self.read_only { F_RO } else { 0 }
     }
 
     fn config_read(&self, offset: u64, dst: &mut [u8]) {
@@ -259,264 +358,66 @@ impl Backend for VirtioBlk {
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
-        // The medium is architectural state: a guest that wrote to it and then
-        // restored a snapshot must see what the snapshot saw, or its
-        // filesystem is corrupt (`ROADMAP.md` §4.5, "storage is snapshotted
-        // with the machine or not at all").
-        w.write_bytes(&self.disk.bytes.lock())
+        // On the terms the medium itself sets, which is the decision
+        // `ata.disk` and `nvme.controller` both take and for the same reasons
+        // ([`Snapshot`]). A `RamStore` captures, so the encoding of a
+        // media-slot disk is byte for byte what it was before this device had
+        // a seam at all, and its state hash is unchanged.
+        match self.media.snapshot() {
+            Snapshot::Capture => w.write_bytes(&self.contents()?),
+            Snapshot::Reference => {
+                // Flush *first*: the reference is only worth anything if the
+                // file on disk holds what the guest had written by the moment
+                // the snapshot was taken.
+                self.media
+                    .flush()
+                    .map_err(|e| Error::State(alloc::format!("virtio disk: {e}")))?;
+                w.write_bytes(self.media.describe().as_bytes())
+            }
+            Snapshot::Refuse => Err(Error::State(alloc::format!(
+                "this virtio disk's medium ({}) refuses to be snapshotted",
+                self.media.describe()
+            ))),
+        }
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
         let bytes: &[u8] = r.read_bytes()?;
-        let mut disk = self.disk.bytes.lock();
-        if bytes.len() != disk.len() {
-            return Err(Error::State(alloc::format!(
-                "snapshot has a {}-byte disk, this device has {}",
-                bytes.len(),
-                disk.len()
-            )));
+        match self.media.snapshot() {
+            Snapshot::Capture => {
+                if bytes.len() as u64 != self.bytes {
+                    return Err(Error::State(alloc::format!(
+                        "snapshot has a {}-byte disk, this device has {}",
+                        bytes.len(),
+                        self.bytes
+                    )));
+                }
+                self.media
+                    .write_at(0, bytes)
+                    .map_err(|e| Error::State(alloc::format!("virtio disk: {e}")))
+            }
+            Snapshot::Reference => {
+                // The bytes are still in the image file; what the chunk holds
+                // is *which* image, and the check is that it is still that one.
+                // A snapshot taken of a capturing disk lands here as a
+                // mismatched identity rather than as a silent misread.
+                let want = self.media.describe();
+                if bytes != want.as_bytes() {
+                    return Err(Error::State(alloc::format!(
+                        "the snapshot references a different medium: it names `{}` and this \
+                         disk holds `{want}`",
+                        String::from_utf8_lossy(&bytes[..bytes.len().min(120)])
+                    )));
+                }
+                Ok(())
+            }
+            Snapshot::Refuse => Err(Error::State(alloc::format!(
+                "this virtio disk's medium ({}) refuses to be snapshotted",
+                self.media.describe()
+            ))),
         }
-        disk.clear();
-        disk.extend_from_slice(bytes);
-        Ok(())
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core::space::{AddressSpace, MemAttrs, RamStore, Region, RequesterId};
-    use crate::core::value::Width;
-    use crate::dev::riscv::virtio::queue::{DESC_F_NEXT, DESC_F_WRITE, Layout};
-
-    const DESC: u64 = 0x1000;
-    const AVAIL: u64 = 0x2000;
-    const USED: u64 = 0x3000;
-    const HDR: u64 = 0x5000;
-    const DATA: u64 = 0x6000;
-    const STATUS: u64 = 0x7000;
-
-    struct Guest {
-        space: AddressSpace,
-        layout: Layout,
-    }
-
-    impl Guest {
-        fn new() -> Guest {
-            let space = AddressSpace::new("mem", 64);
-            space
-                .topology()
-                .map(Region::ram("ram", Arc::new(RamStore::new(0x1_0000))), 0)
-                .unwrap();
-            Guest {
-                space,
-                layout: Layout {
-                    size: 8,
-                    desc: DESC,
-                    avail: AVAIL,
-                    used: USED,
-                    ready: true,
-                },
-            }
-        }
-
-        fn queue(&self) -> Queue<'_> {
-            Queue::new(self.layout, &self.space, RequesterId(1))
-        }
-
-        fn poke(&self, at: u64, width: Width, value: u64) {
-            self.space
-                .write(at, width, value, MemAttrs::DEFAULT)
-                .unwrap();
-        }
-
-        fn peek(&self, at: u64, width: Width) -> u64 {
-            self.space.read(at, width, MemAttrs::DEBUG).unwrap()
-        }
-
-        fn desc(&self, index: u64, addr: u64, len: u32, flags: u16, next: u16) {
-            let at = DESC + index * 16;
-            self.poke(at, Width::U64, addr);
-            self.poke(at + 8, Width::U32, u64::from(len));
-            self.poke(at + 12, Width::U16, u64::from(flags));
-            self.poke(at + 14, Width::U16, u64::from(next));
-        }
-
-        /// A three-descriptor request: header, data, status.
-        fn request(&self, kind: u32, sector: u64, data_len: u32, data_writable: bool) {
-            self.poke(HDR, Width::U32, u64::from(kind));
-            self.poke(HDR + 4, Width::U32, 0);
-            self.poke(HDR + 8, Width::U64, sector);
-            self.desc(0, HDR, HEADER_LEN as u32, DESC_F_NEXT, 1);
-            let data_flags = DESC_F_NEXT | if data_writable { DESC_F_WRITE } else { 0 };
-            self.desc(1, DATA, data_len, data_flags, 2);
-            self.desc(2, STATUS, 1, DESC_F_WRITE, 0);
-        }
-
-        fn chain(&self) -> Vec<Descriptor> {
-            self.queue().chain(0).unwrap()
-        }
-    }
-
-    fn disk(sectors: usize) -> VirtioBlk {
-        let mut image = alloc::vec![0u8; sectors * SECTOR_SIZE as usize];
-        for (i, byte) in image.iter_mut().enumerate() {
-            *byte = (i % 251) as u8;
-        }
-        VirtioBlk::new(image, String::from("rsemu-test"), false)
-    }
-
-    #[test]
-    fn the_capacity_is_reported_in_sectors() {
-        let d = disk(4);
-        assert_eq!(d.capacity(), 4);
-        let mut config = [0u8; 8];
-        d.config_read(0, &mut config);
-        assert_eq!(u64::from_le_bytes(config), 4);
-        // A short image is rounded up rather than leaving a partial sector.
-        assert_eq!(
-            VirtioBlk::new(alloc::vec![0; 1], String::new(), false).capacity(),
-            1
-        );
-    }
-
-    #[test]
-    fn a_read_returns_the_sector_and_a_good_status() {
-        let g = Guest::new();
-        let d = disk(4);
-        g.request(T_IN, 1, SECTOR_SIZE as u32, true);
-        let chain = g.chain();
-        let written = d.handle(0, &g.queue(), &chain);
-        assert_eq!(written, SECTOR_SIZE as u32 + 1, "the data plus the status");
-        assert_eq!(g.peek(STATUS, Width::U8) as u8, S_OK);
-        // Sector 1 starts at byte 512 of the image, which the fixture filled
-        // with `i % 251`.
-        assert_eq!(g.peek(DATA, Width::U8) as u8, (512 % 251) as u8);
-    }
-
-    #[test]
-    fn a_write_lands_on_the_medium() {
-        let g = Guest::new();
-        let d = disk(4);
-        for i in 0..SECTOR_SIZE {
-            g.poke(DATA + i, Width::U8, 0xa5);
-        }
-        g.request(T_OUT, 2, SECTOR_SIZE as u32, false);
-        let chain = g.chain();
-        assert_eq!(d.handle(0, &g.queue(), &chain), 1, "just the status byte");
-        assert_eq!(g.peek(STATUS, Width::U8) as u8, S_OK);
-        assert_eq!(d.contents()[1024], 0xa5);
-        assert_eq!(d.contents()[1024 + 511], 0xa5);
-        assert_eq!(
-            d.contents()[1024 + 512],
-            (1536 % 251) as u8,
-            "and no further"
-        );
-    }
-
-    #[test]
-    fn a_read_past_the_end_reports_an_io_error_rather_than_reading_something() {
-        let g = Guest::new();
-        let d = disk(2);
-        g.request(T_IN, 99, SECTOR_SIZE as u32, true);
-        let chain = g.chain();
-        d.handle(0, &g.queue(), &chain);
-        assert_eq!(g.peek(STATUS, Width::U8) as u8, S_IOERR);
-    }
-
-    #[test]
-    fn a_write_to_a_read_only_device_is_refused() {
-        let g = Guest::new();
-        let d = VirtioBlk::new(alloc::vec![0u8; 1024], String::new(), true);
-        g.request(T_OUT, 0, SECTOR_SIZE as u32, false);
-        let chain = g.chain();
-        d.handle(0, &g.queue(), &chain);
-        assert_eq!(g.peek(STATUS, Width::U8) as u8, S_IOERR);
-        assert!(d.is_read_only());
-    }
-
-    #[test]
-    fn an_unknown_request_type_is_reported_as_unsupported() {
-        let g = Guest::new();
-        let d = disk(2);
-        g.request(0x1234, 0, 8, true);
-        let chain = g.chain();
-        d.handle(0, &g.queue(), &chain);
-        assert_eq!(g.peek(STATUS, Width::U8) as u8, S_UNSUPP);
-    }
-
-    #[test]
-    fn get_id_returns_the_serial_padded_to_twenty_bytes() {
-        let g = Guest::new();
-        let d = disk(2);
-        g.request(T_GET_ID, 0, ID_BYTES as u32, true);
-        let chain = g.chain();
-        d.handle(0, &g.queue(), &chain);
-        assert_eq!(g.peek(STATUS, Width::U8) as u8, S_OK);
-        let mut id = [0u8; ID_BYTES];
-        for (i, byte) in id.iter_mut().enumerate() {
-            *byte = g.peek(DATA + i as u64, Width::U8) as u8;
-        }
-        assert_eq!(&id[..10], b"rsemu-test");
-        assert_eq!(id[10], 0, "and the rest is padding");
-    }
-
-    #[test]
-    fn a_flush_succeeds_because_nothing_is_cached() {
-        let g = Guest::new();
-        let d = disk(2);
-        g.request(T_FLUSH, 0, 1, true);
-        let chain = g.chain();
-        d.handle(0, &g.queue(), &chain);
-        assert_eq!(g.peek(STATUS, Width::U8) as u8, S_OK);
-    }
-
-    #[test]
-    fn a_chain_with_no_status_byte_is_completed_rather_than_faulting() {
-        // Nothing here trusts the guest: a driver that offers a chain with no
-        // writable descriptor at all must not take the emulator with it.
-        let g = Guest::new();
-        let d = disk(2);
-        g.desc(0, HDR, HEADER_LEN as u32, 0, 0);
-        let chain = g.chain();
-        assert_eq!(d.handle(0, &g.queue(), &chain), 0);
-    }
-
-    #[test]
-    fn a_snapshot_carries_the_medium() {
-        use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
-
-        let g = Guest::new();
-        let saved = disk(2);
-        for i in 0..SECTOR_SIZE {
-            g.poke(DATA + i, Width::U8, 0x5a);
-        }
-        g.request(T_OUT, 0, SECTOR_SIZE as u32, false);
-        let chain = g.chain();
-        saved.handle(0, &g.queue(), &chain);
-
-        let mut shape = MachineShape::new();
-        shape.add_device("disk", "virtio.blk").unwrap();
-        let mut w = StateWriter::new(shape);
-        {
-            let mut chunk = w.chunk("disk", "virtio.blk", 1).unwrap();
-            saved.save(&mut chunk).unwrap();
-        }
-        let bytes = w.to_vec().unwrap();
-
-        let restored = disk(2);
-        let reader = StateReader::new(&bytes).unwrap();
-        let chunk = reader
-            .load("disk", "virtio.blk", 1, &Migrations::new())
-            .unwrap();
-        restored.load(&mut chunk.reader()).unwrap();
-        assert_eq!(restored.contents()[0], 0x5a);
-
-        // A disk of a different size is refused rather than truncated.
-        let other = disk(4);
-        let chunk = reader
-            .load("disk", "virtio.blk", 1, &Migrations::new())
-            .unwrap();
-        assert!(other.load(&mut chunk.reader()).is_err());
-    }
-}
+mod tests;
