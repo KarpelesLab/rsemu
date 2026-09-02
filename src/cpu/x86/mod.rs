@@ -79,7 +79,11 @@
 //! rounding, flush-to-zero and denormals-are-zero bits mapped onto
 //! [`crate::float::Env`], the scalar and packed single- and double-precision
 //! arithmetic, the compares that write `EFLAGS` and the ones that write a
-//! lane mask, the conversions, the shuffles, and `FXSAVE`/`FXRSTOR`.
+//! lane mask, the conversions, the shuffles, SSE2's whole packed-**integer**
+//! half — the adds and subtracts at four widths with and without saturation,
+//! the compares, the packs and unpacks, the shifts by an immediate and by a
+//! register, the multiplies, `PSADBW`, `PSHUFD` and the two half-register word
+//! shuffles, `PMOVMSKB`, `PINSRW`/`PEXTRW` — and `FXSAVE`/`FXRSTOR`.
 //! `CR4.OSFXSR` and `CR4.OSXMMEXCPT` now decide something: without the first
 //! an SSE instruction is `#UD`, and without the second an unmasked SIMD
 //! exception is `#UD` rather than `#XM`.

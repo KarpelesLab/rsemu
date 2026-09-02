@@ -578,6 +578,19 @@ pub enum Grp {
     /// and the three fences. The one group whose extension means a *memory*
     /// instruction with `mod != 11` and a fence with `mod == 11`.
     Grp15,
+    /// `66 0F 71`: Intel's group 12 — `PSRLW`, `PSRAW` and `PSLLW` by an
+    /// immediate count.
+    ///
+    /// One of the three groups whose every member is a *register* form: the
+    /// count is the immediate byte and the operand is the register being
+    /// shifted, so `mod != 11` is not an encoding at all and
+    /// [`resolve_modrm`] refuses it.
+    Grp12,
+    /// `66 0F 72`: Intel's group 13 — the doubleword shifts.
+    Grp13,
+    /// `66 0F 73`: Intel's group 14 — the quadword shifts, plus `PSRLDQ` and
+    /// `PSLLDQ`, which shift the whole 128-bit register by whole *bytes*.
+    Grp14,
     /// `D8`-`DF`: the x87 escapes.
     ///
     /// Two-dimensional in a way no other group is: with `mod != 11` the ModRM
@@ -1028,6 +1041,69 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("UNPCKLPS", "unpcklps"),
     ("XORPD", "xorpd"),
     ("XORPS", "xorps"),
+    // SSE2's packed-integer half.
+    ("MOVNTDQ", "movntdq"),
+    ("PACKSSDW", "packssdw"),
+    ("PACKSSWB", "packsswb"),
+    ("PACKUSWB", "packuswb"),
+    ("PADDB", "paddb"),
+    ("PADDD", "paddd"),
+    ("PADDQ", "paddq"),
+    ("PADDSB", "paddsb"),
+    ("PADDSW", "paddsw"),
+    ("PADDUSB", "paddusb"),
+    ("PADDUSW", "paddusw"),
+    ("PADDW", "paddw"),
+    ("PAVGB", "pavgb"),
+    ("PAVGW", "pavgw"),
+    ("PCMPEQB", "pcmpeqb"),
+    ("PCMPEQD", "pcmpeqd"),
+    ("PCMPEQW", "pcmpeqw"),
+    ("PCMPGTB", "pcmpgtb"),
+    ("PCMPGTD", "pcmpgtd"),
+    ("PCMPGTW", "pcmpgtw"),
+    ("PEXTRW", "pextrw"),
+    ("PINSRW", "pinsrw"),
+    ("PMADDWD", "pmaddwd"),
+    ("PMAXSW", "pmaxsw"),
+    ("PMAXUB", "pmaxub"),
+    ("PMINSW", "pminsw"),
+    ("PMINUB", "pminub"),
+    ("PMOVMSKB", "pmovmskb"),
+    ("PMULHUW", "pmulhuw"),
+    ("PMULHW", "pmulhw"),
+    ("PMULLW", "pmullw"),
+    ("PMULUDQ", "pmuludq"),
+    ("PSADBW", "psadbw"),
+    ("PSHUFD", "pshufd"),
+    ("PSHUFHW", "pshufhw"),
+    ("PSHUFLW", "pshuflw"),
+    ("PSLLD", "pslld"),
+    ("PSLLDQ", "pslldq"),
+    ("PSLLQ", "psllq"),
+    ("PSLLW", "psllw"),
+    ("PSRAD", "psrad"),
+    ("PSRAW", "psraw"),
+    ("PSRLD", "psrld"),
+    ("PSRLDQ", "psrldq"),
+    ("PSRLQ", "psrlq"),
+    ("PSRLW", "psrlw"),
+    ("PSUBB", "psubb"),
+    ("PSUBD", "psubd"),
+    ("PSUBQ", "psubq"),
+    ("PSUBSB", "psubsb"),
+    ("PSUBSW", "psubsw"),
+    ("PSUBUSB", "psubusb"),
+    ("PSUBUSW", "psubusw"),
+    ("PSUBW", "psubw"),
+    ("PUNPCKHBW", "punpckhbw"),
+    ("PUNPCKHDQ", "punpckhdq"),
+    ("PUNPCKHQDQ", "punpckhqdq"),
+    ("PUNPCKHWD", "punpckhwd"),
+    ("PUNPCKLBW", "punpcklbw"),
+    ("PUNPCKLDQ", "punpckldq"),
+    ("PUNPCKLQDQ", "punpcklqdq"),
+    ("PUNPCKLWD", "punpcklwd"),
 ];
 
 define_ops! {
@@ -1405,6 +1481,70 @@ define_ops! {
     UNPCKLPS = "interleave the low singles",
     XORPD = "bitwise exclusive OR of packed doubles",
     XORPS = "bitwise exclusive OR of packed singles",
+
+    // ---- SSE2's packed-integer half --------------------------------------
+    MOVNTDQ = "store a double quadword bypassing the cache",
+    PACKSSDW = "pack doublewords into words with signed saturation",
+    PACKSSWB = "pack words into bytes with signed saturation",
+    PACKUSWB = "pack words into bytes with unsigned saturation",
+    PADDB = "add packed bytes",
+    PADDD = "add packed doublewords",
+    PADDQ = "add packed quadwords",
+    PADDSB = "add packed bytes with signed saturation",
+    PADDSW = "add packed words with signed saturation",
+    PADDUSB = "add packed bytes with unsigned saturation",
+    PADDUSW = "add packed words with unsigned saturation",
+    PADDW = "add packed words",
+    PAVGB = "average packed unsigned bytes, rounding up",
+    PAVGW = "average packed unsigned words, rounding up",
+    PCMPEQB = "compare packed bytes for equality",
+    PCMPEQD = "compare packed doublewords for equality",
+    PCMPEQW = "compare packed words for equality",
+    PCMPGTB = "compare packed signed bytes for greater than",
+    PCMPGTD = "compare packed signed doublewords for greater than",
+    PCMPGTW = "compare packed signed words for greater than",
+    PEXTRW = "extract one word into a general register",
+    PINSRW = "insert one word from a general register or memory",
+    PMADDWD = "multiply packed signed words and add adjacent pairs",
+    PMAXSW = "the larger of each pair of signed words",
+    PMAXUB = "the larger of each pair of unsigned bytes",
+    PMINSW = "the smaller of each pair of signed words",
+    PMINUB = "the smaller of each pair of unsigned bytes",
+    PMOVMSKB = "the sign bits of sixteen bytes, into a general register",
+    PMULHUW = "the high halves of unsigned word products",
+    PMULHW = "the high halves of signed word products",
+    PMULLW = "the low halves of word products",
+    PMULUDQ = "multiply the even unsigned doublewords into quadwords",
+    PSADBW = "the sums of absolute byte differences, one per half",
+    PSHUFD = "permute four doublewords under an immediate",
+    PSHUFHW = "permute the high four words under an immediate",
+    PSHUFLW = "permute the low four words under an immediate",
+    PSLLD = "shift packed doublewords left, shifting in zeros",
+    PSLLDQ = "shift the whole register left by whole bytes",
+    PSLLQ = "shift packed quadwords left, shifting in zeros",
+    PSLLW = "shift packed words left, shifting in zeros",
+    PSRAD = "shift packed doublewords right, shifting in the sign",
+    PSRAW = "shift packed words right, shifting in the sign",
+    PSRLD = "shift packed doublewords right, shifting in zeros",
+    PSRLDQ = "shift the whole register right by whole bytes",
+    PSRLQ = "shift packed quadwords right, shifting in zeros",
+    PSRLW = "shift packed words right, shifting in zeros",
+    PSUBB = "subtract packed bytes",
+    PSUBD = "subtract packed doublewords",
+    PSUBQ = "subtract packed quadwords",
+    PSUBSB = "subtract packed bytes with signed saturation",
+    PSUBSW = "subtract packed words with signed saturation",
+    PSUBUSB = "subtract packed bytes with unsigned saturation",
+    PSUBUSW = "subtract packed words with unsigned saturation",
+    PSUBW = "subtract packed words",
+    PUNPCKHBW = "interleave the high bytes",
+    PUNPCKHDQ = "interleave the high doublewords",
+    PUNPCKHQDQ = "interleave the high quadwords",
+    PUNPCKHWD = "interleave the high words",
+    PUNPCKLBW = "interleave the low bytes",
+    PUNPCKLDQ = "interleave the low doublewords",
+    PUNPCKLQDQ = "interleave the low quadwords",
+    PUNPCKLWD = "interleave the low words",
 }
 
 impl Op {
@@ -1793,6 +1933,146 @@ impl Op {
                 | Op::UNPCKLPS
                 | Op::XORPD
                 | Op::XORPS
+                | Op::MOVNTDQ
+                | Op::PACKSSDW
+                | Op::PACKSSWB
+                | Op::PACKUSWB
+                | Op::PADDB
+                | Op::PADDD
+                | Op::PADDQ
+                | Op::PADDSB
+                | Op::PADDSW
+                | Op::PADDUSB
+                | Op::PADDUSW
+                | Op::PADDW
+                | Op::PAVGB
+                | Op::PAVGW
+                | Op::PCMPEQB
+                | Op::PCMPEQD
+                | Op::PCMPEQW
+                | Op::PCMPGTB
+                | Op::PCMPGTD
+                | Op::PCMPGTW
+                | Op::PEXTRW
+                | Op::PINSRW
+                | Op::PMADDWD
+                | Op::PMAXSW
+                | Op::PMAXUB
+                | Op::PMINSW
+                | Op::PMINUB
+                | Op::PMOVMSKB
+                | Op::PMULHUW
+                | Op::PMULHW
+                | Op::PMULLW
+                | Op::PMULUDQ
+                | Op::PSADBW
+                | Op::PSHUFD
+                | Op::PSHUFHW
+                | Op::PSHUFLW
+                | Op::PSLLD
+                | Op::PSLLDQ
+                | Op::PSLLQ
+                | Op::PSLLW
+                | Op::PSRAD
+                | Op::PSRAW
+                | Op::PSRLD
+                | Op::PSRLDQ
+                | Op::PSRLQ
+                | Op::PSRLW
+                | Op::PSUBB
+                | Op::PSUBD
+                | Op::PSUBQ
+                | Op::PSUBSB
+                | Op::PSUBSW
+                | Op::PSUBUSB
+                | Op::PSUBUSW
+                | Op::PSUBW
+                | Op::PUNPCKHBW
+                | Op::PUNPCKHDQ
+                | Op::PUNPCKHQDQ
+                | Op::PUNPCKHWD
+                | Op::PUNPCKLBW
+                | Op::PUNPCKLDQ
+                | Op::PUNPCKLQDQ
+                | Op::PUNPCKLWD
+        )
+    }
+
+    /// Whether this is SSE2's **packed-integer** half.
+    ///
+    /// Split out from [`Op::is_sse`] because it is the half a part can be
+    /// configured without: `Features::sse2` gates it, and a core built without
+    /// that bit must raise `#UD` for every one of these rather than execute an
+    /// instruction whose `CPUID` bit it does not set (`ROADMAP.md` §6.1.1 —
+    /// decode is gated per entry, not per core). The interpreter's SSE gate
+    /// and its packed-integer executor read this one list, so an operation
+    /// cannot be executable and ungated.
+    #[must_use]
+    pub const fn is_sse2_packed_int(self) -> bool {
+        matches!(
+            self,
+            Op::MOVNTDQ
+                | Op::PACKSSDW
+                | Op::PACKSSWB
+                | Op::PACKUSWB
+                | Op::PADDB
+                | Op::PADDD
+                | Op::PADDQ
+                | Op::PADDSB
+                | Op::PADDSW
+                | Op::PADDUSB
+                | Op::PADDUSW
+                | Op::PADDW
+                | Op::PAVGB
+                | Op::PAVGW
+                | Op::PCMPEQB
+                | Op::PCMPEQD
+                | Op::PCMPEQW
+                | Op::PCMPGTB
+                | Op::PCMPGTD
+                | Op::PCMPGTW
+                | Op::PEXTRW
+                | Op::PINSRW
+                | Op::PMADDWD
+                | Op::PMAXSW
+                | Op::PMAXUB
+                | Op::PMINSW
+                | Op::PMINUB
+                | Op::PMOVMSKB
+                | Op::PMULHUW
+                | Op::PMULHW
+                | Op::PMULLW
+                | Op::PMULUDQ
+                | Op::PSADBW
+                | Op::PSHUFD
+                | Op::PSHUFHW
+                | Op::PSHUFLW
+                | Op::PSLLD
+                | Op::PSLLDQ
+                | Op::PSLLQ
+                | Op::PSLLW
+                | Op::PSRAD
+                | Op::PSRAW
+                | Op::PSRLD
+                | Op::PSRLDQ
+                | Op::PSRLQ
+                | Op::PSRLW
+                | Op::PSUBB
+                | Op::PSUBD
+                | Op::PSUBQ
+                | Op::PSUBSB
+                | Op::PSUBSW
+                | Op::PSUBUSB
+                | Op::PSUBUSW
+                | Op::PSUBW
+                | Op::PUNPCKHBW
+                | Op::PUNPCKHDQ
+                | Op::PUNPCKHQDQ
+                | Op::PUNPCKHWD
+                | Op::PUNPCKLBW
+                | Op::PUNPCKLDQ
+                | Op::PUNPCKLQDQ
+                | Op::PUNPCKLWD
         )
     }
 
@@ -2739,17 +3019,84 @@ const SECONDARY_66: ([Insn; 256], [bool; 256]) = opmap! {
     0x5d MINPD    Vx Wx None   Documented;
     0x5e DIVPD    Vx Wx None   Documented;
     0x5f MAXPD    Vx Wx None   Documented;
+    0x60 PUNPCKLBW  Vx Wx None   Documented;
+    0x61 PUNPCKLWD  Vx Wx None   Documented;
+    0x62 PUNPCKLDQ  Vx Wx None   Documented;
+    0x63 PACKSSWB   Vx Wx None   Documented;
+    0x64 PCMPGTB    Vx Wx None   Documented;
+    0x65 PCMPGTW    Vx Wx None   Documented;
+    0x66 PCMPGTD    Vx Wx None   Documented;
+    0x67 PACKUSWB   Vx Wx None   Documented;
+    0x68 PUNPCKHBW  Vx Wx None   Documented;
+    0x69 PUNPCKHWD  Vx Wx None   Documented;
+    0x6a PUNPCKHDQ  Vx Wx None   Documented;
+    0x6b PACKSSDW   Vx Wx None   Documented;
+    0x6c PUNPCKLQDQ Vx Wx None   Documented;
+    0x6d PUNPCKHQDQ Vx Wx None   Documented;
     0x6e MOVD     Vx Ey None   Documented;
     0x6f MOVDQA   Vx Wx None   Documented;
+    0x70 PSHUFD     Vx Wx +Ib None Documented;
+    // The three shift-by-immediate groups. Every one of them is a register
+    // form only: the count is the immediate and there is nowhere for a memory
+    // operand to go, which is why `mod != 11` is not an encoding.
+    0x71 PSRLW      Ux Ib  Grp12  Documented;
+    0x72 PSRLD      Ux Ib  Grp13  Documented;
+    0x73 PSRLQ      Ux Ib  Grp14  Documented;
+    0x74 PCMPEQB    Vx Wx None   Documented;
+    0x75 PCMPEQW    Vx Wx None   Documented;
+    0x76 PCMPEQD    Vx Wx None   Documented;
     0x7e MOVD     Ey Vx None   Documented;
     0x7f MOVDQA   Wx Vx None   Documented;
     0xc2 CMPPD    Vx Wx +Ib None Documented;
+    0xc4 PINSRW     Vx Ew +Ib None Documented;
+    0xc5 PEXTRW     Gy Ux +Ib None Documented;
     0xc6 SHUFPD   Vx Wx +Ib None Documented;
+    0xd1 PSRLW      Vx Wx None   Documented;
+    0xd2 PSRLD      Vx Wx None   Documented;
+    0xd3 PSRLQ      Vx Wx None   Documented;
+    0xd4 PADDQ      Vx Wx None   Documented;
+    0xd5 PMULLW     Vx Wx None   Documented;
     0xd6 MOVQ     Wq Vx None   Documented;
+    0xd7 PMOVMSKB   Gy Ux None   Documented;
+    0xd8 PSUBUSB    Vx Wx None   Documented;
+    0xd9 PSUBUSW    Vx Wx None   Documented;
+    0xda PMINUB     Vx Wx None   Documented;
     0xdb PAND     Vx Wx None   Documented;
+    0xdc PADDUSB    Vx Wx None   Documented;
+    0xdd PADDUSW    Vx Wx None   Documented;
+    0xde PMAXUB     Vx Wx None   Documented;
     0xdf PANDN    Vx Wx None   Documented;
+    0xe0 PAVGB      Vx Wx None   Documented;
+    0xe1 PSRAW      Vx Wx None   Documented;
+    0xe2 PSRAD      Vx Wx None   Documented;
+    0xe3 PAVGW      Vx Wx None   Documented;
+    0xe4 PMULHUW    Vx Wx None   Documented;
+    0xe5 PMULHW     Vx Wx None   Documented;
+    // A non-temporal store is an ordinary one here: there is no cache to
+    // bypass, and the architecture guarantees only weaker ordering, which a
+    // single-bus core already satisfies.
+    0xe7 MOVNTDQ    Wx Vx None   Documented;
+    0xe8 PSUBSB     Vx Wx None   Documented;
+    0xe9 PSUBSW     Vx Wx None   Documented;
+    0xea PMINSW     Vx Wx None   Documented;
     0xeb POR      Vx Wx None   Documented;
+    0xec PADDSB     Vx Wx None   Documented;
+    0xed PADDSW     Vx Wx None   Documented;
+    0xee PMAXSW     Vx Wx None   Documented;
     0xef PXOR     Vx Wx None   Documented;
+    0xf1 PSLLW      Vx Wx None   Documented;
+    0xf2 PSLLD      Vx Wx None   Documented;
+    0xf3 PSLLQ      Vx Wx None   Documented;
+    0xf4 PMULUDQ    Vx Wx None   Documented;
+    0xf5 PMADDWD    Vx Wx None   Documented;
+    0xf6 PSADBW     Vx Wx None   Documented;
+    0xf8 PSUBB      Vx Wx None   Documented;
+    0xf9 PSUBW      Vx Wx None   Documented;
+    0xfa PSUBD      Vx Wx None   Documented;
+    0xfb PSUBQ      Vx Wx None   Documented;
+    0xfc PADDB      Vx Wx None   Documented;
+    0xfd PADDW      Vx Wx None   Documented;
+    0xfe PADDD      Vx Wx None   Documented;
 };
 
 /// The two-byte map with a `66` mandatory prefix.
@@ -2776,6 +3123,7 @@ const SECONDARY_F3: ([Insn; 256], [bool; 256]) = opmap! {
     0x5e DIVSS     Vx Wd None Documented;
     0x5f MAXSS     Vx Wd None Documented;
     0x6f MOVDQU    Vx Wx None Documented;
+    0x70 PSHUFHW   Vx Wx +Ib None Documented;
     // `F3 0F 7E` reads a quadword and **zeroes the upper half** of the
     // destination, which is what makes it different from `66 0F D6` writing
     // the same quadword the other way.
@@ -2807,6 +3155,7 @@ const SECONDARY_F2: ([Insn; 256], [bool; 256]) = opmap! {
     0x5d MINSD     Vx Wq None Documented;
     0x5e DIVSD     Vx Wq None Documented;
     0x5f MAXSD     Vx Wq None Documented;
+    0x70 PSHUFLW   Vx Wx +Ib None Documented;
     0xc2 CMPSD     Vx Wq +Ib None Documented;
 };
 
@@ -3020,6 +3369,44 @@ pub static GROUP9: [Insn; 8] = {
     t
 };
 
+/// `66 0F 71`: Intel's group 12 — the word shifts by an immediate count.
+///
+/// The three assigned extensions are 2, 4 and 6, and the gaps between them are
+/// not an accident: the odd extensions are where a three-operand VEX form
+/// later put its second source, and on an SSE2 part they are simply not
+/// instructions.
+pub static GROUP12: [Insn; 8] = {
+    let mut t = [UNASSIGNED; 8];
+    t[2] = Insn::new(Op::PSRLW, Arg::Ux, Arg::Ib, Grp::None, Class::Documented);
+    t[4] = Insn::new(Op::PSRAW, Arg::Ux, Arg::Ib, Grp::None, Class::Documented);
+    t[6] = Insn::new(Op::PSLLW, Arg::Ux, Arg::Ib, Grp::None, Class::Documented);
+    t
+};
+
+/// `66 0F 72`: Intel's group 13 — the doubleword shifts by an immediate.
+pub static GROUP13: [Insn; 8] = {
+    let mut t = [UNASSIGNED; 8];
+    t[2] = Insn::new(Op::PSRLD, Arg::Ux, Arg::Ib, Grp::None, Class::Documented);
+    t[4] = Insn::new(Op::PSRAD, Arg::Ux, Arg::Ib, Grp::None, Class::Documented);
+    t[6] = Insn::new(Op::PSLLD, Arg::Ux, Arg::Ib, Grp::None, Class::Documented);
+    t
+};
+
+/// `66 0F 73`: Intel's group 14 — the quadword shifts, and the two that shift
+/// the whole register by whole bytes.
+///
+/// `PSRLDQ` and `PSLLDQ` exist only in the `66` map — there is no MMX form,
+/// because there is no 128-bit MMX register to shift — and they are the reason
+/// this group has four assigned extensions where the other two have three.
+pub static GROUP14: [Insn; 8] = {
+    let mut t = [UNASSIGNED; 8];
+    t[2] = Insn::new(Op::PSRLQ, Arg::Ux, Arg::Ib, Grp::None, Class::Documented);
+    t[3] = Insn::new(Op::PSRLDQ, Arg::Ux, Arg::Ib, Grp::None, Class::Documented);
+    t[6] = Insn::new(Op::PSLLQ, Arg::Ux, Arg::Ib, Grp::None, Class::Documented);
+    t[7] = Insn::new(Op::PSLLDQ, Arg::Ux, Arg::Ib, Grp::None, Class::Documented);
+    t
+};
+
 /// `0F AE` with `mod != 11`: Intel's group 15's memory forms.
 pub static GROUP15: [Insn; 8] = [
     Insn::new(
@@ -3121,6 +3508,19 @@ pub const fn resolve_modrm(map: Gen, insn: Insn, opcode: u8, two_byte: bool, mod
                 GROUP15_REG[idx]
             } else {
                 GROUP15[idx]
+            }
+        }
+        // The three shift-by-immediate groups have no memory form: the shifted
+        // operand is the destination and the count is the immediate, so a
+        // `mod != 11` encoding names an address nothing would read.
+        Grp::Grp12 | Grp::Grp13 | Grp::Grp14 => {
+            if modrm.md != 3 {
+                return UNASSIGNED;
+            }
+            match insn.group {
+                Grp::Grp12 => GROUP12[idx],
+                Grp::Grp13 => GROUP13[idx],
+                _ => GROUP14[idx],
             }
         }
         Grp::ModAlt => {
@@ -3488,6 +3888,9 @@ pub const fn resolve_as(map: Gen, insn: Insn, reg: u8) -> Insn {
         // mode field — so the row is handed back unchanged and
         // [`resolve_modrm`] finishes the job.
         Grp::X87 | Grp::Grp9 | Grp::Grp15 | Grp::ModAlt => insn,
+        // Likewise: these three are register-only, so the mode field decides
+        // whether the encoding exists at all and [`resolve_modrm`] answers.
+        Grp::Grp12 | Grp::Grp13 | Grp::Grp14 => insn,
     }
 }
 
@@ -4310,6 +4713,9 @@ mod tests {
                 || GROUP9.iter().any(|i| i.op == op)
                 || GROUP15.iter().any(|i| i.op == op)
                 || GROUP15_REG.iter().any(|i| i.op == op)
+                || GROUP12.iter().any(|i| i.op == op)
+                || GROUP13.iter().any(|i| i.op == op)
+                || GROUP14.iter().any(|i| i.op == op)
                 || TABLE_0F_66.iter().any(|i| i.op == op)
                 || TABLE_0F_F3.iter().any(|i| i.op == op)
                 || TABLE_0F_F2.iter().any(|i| i.op == op)
