@@ -245,6 +245,15 @@ pub mod differential;
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-x86-lift")))]
 pub mod lift;
 
+// The translated execution engine needs the frontend *and* the translation
+// runtime, so it is the intersection rather than either one.
+#[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+mod engine;
+
+#[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "cpu-x86-lift", feature = "jit"))))]
+pub use engine::Stats as JitStats;
+
 mod fpexec;
 pub mod fpu;
 pub mod isa;
@@ -2043,12 +2052,72 @@ impl Lines {
     }
 }
 
+/// Which execution engine a core runs on.
+///
+/// A **speed knob and never a semantic one**: all three run the same guest,
+/// stop on the same instruction, charge the same clocks and hash to the same
+/// machine (`ROADMAP.md` section 0). `tests/x86_engines.rs` is that claim on a
+/// whole board; `cpu::x86::engine` is what it costs to keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Engine {
+    /// `Exec::step`, one guest instruction at a time. The oracle, and the
+    /// default.
+    #[default]
+    Interp,
+    /// Blocks lifted by [`lift`] and executed through `jit::Dispatcher`, with
+    /// its block cache, its chained exits and its self-modifying-code
+    /// invalidation, on the portable IR interpreter.
+    ///
+    /// **The variant only exists in a build with `cpu-x86-lift` and `jit`**, so
+    /// a build that cannot run this engine cannot be asked to and quietly give
+    /// something else: a machine file naming it is refused with a message
+    /// naming the features, and the Rust API does not compile. An engine that
+    /// is not the one you asked for is a measurement that quietly means
+    /// nothing.
+    #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "cpu-x86-lift", feature = "jit"))))]
+    Jit,
+    /// [`Jit`](Engine::Jit), with the **host code generator** attached:
+    /// `jit::x86`, which emits x86-64 machine code for a block.
+    ///
+    /// A separate value rather than what `jit` does where it can, for the
+    /// reason `cpu::riscv::Engine` gives: a build without `jit-x86`, or a host
+    /// that is not x86-64 Linux, runs the same guest on the portable backend,
+    /// and a benchmark that could not tell which it got would be measuring
+    /// whichever it happened to have.
+    #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "cpu-x86-lift", feature = "jit"))))]
+    JitHost,
+}
+
+#[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+impl Engine {
+    /// Whether this engine runs blocks through the translation runtime.
+    const fn translates(self) -> bool {
+        matches!(self, Engine::Jit | Engine::JitHost)
+    }
+}
+
+/// The values a machine file's `engine` property takes.
+///
+/// Named in every build, whatever the features, so that a description
+/// validates identically everywhere and a build that cannot run one refuses it
+/// by name rather than by "expected one of `interp`".
+const ENGINES: &[&str] = &["interp", "jit", "jit-host"];
+
 /// Everything the interpreter needs to mutate, behind one lock.
 #[derive(Debug)]
 struct Session {
     state: State,
     memory: Option<Arc<AddressSpace>>,
     io: Option<Arc<AddressSpace>>,
+    /// The translation state, built on the first block and thrown away by a
+    /// reset or a restore. **Derived state in the strict sense**
+    /// (`ROADMAP.md` section 4.5): it is not in the snapshot, which is what
+    /// makes one interchangeable between engines and with `accel::state`.
+    #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+    jit: Option<Box<engine::Jit>>,
 }
 
 /// An Intel 8086 or 8088 core.
@@ -2087,6 +2156,12 @@ pub struct X86 {
     /// The name of the address space `IN` and `OUT` reach, from the `iospace`
     /// property. Resolved in `bind`, because spaces do not exist before then.
     iospace: String,
+    /// Which execution engine this core runs on.
+    ///
+    /// Not in the snapshot, deliberately: the engines are indistinguishable to
+    /// the guest, so a snapshot taken under one restores under the other and
+    /// carries on identically (`tests/x86_engines.rs`).
+    engine: Engine,
     session: sync::Mutex<Session>,
     /// The strong end of every pin this core has handed to a wire.
     ///
@@ -2111,12 +2186,15 @@ impl X86 {
             lines: Arc::new(Lines::default()),
             requester: AtomicU32::new(cfg.requester.0),
             iospace: String::new(),
+            engine: Engine::Interp,
             session: sync::Mutex::with_rank(
                 LockRank::BUS,
                 Session {
                     state: State::new(cfg.variant),
                     memory: None,
                     io: None,
+                    #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+                    jit: None,
                 },
             ),
             pins: sync::Mutex::new(Vec::new()),
@@ -2154,10 +2232,29 @@ impl X86 {
                 .ok_or_else(|| Error::Property(alloc::format!("unknown x86 model `{name}`")))?,
             None => Variant::from_name(variant).expect("the enum listed above"),
         };
-        // Accepted and ignored: there is one engine until phase 5, and a
-        // machine file that names it should not need editing when the second
-        // one lands.
-        let _engine = r.or_enum("engine", "interp", &["interp"])?;
+        // Named in every build, so a machine file validates the same
+        // everywhere and a build that cannot run one says *why* rather than
+        // "expected one of `interp`".
+        let want = r.or_enum("engine", "interp", ENGINES)?;
+        let want_jit = want != "interp";
+        #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+        let engine = match want {
+            "jit-host" => Engine::JitHost,
+            "jit" => Engine::Jit,
+            _ => Engine::Interp,
+        };
+        #[cfg(not(all(feature = "cpu-x86-lift", feature = "jit")))]
+        let engine = Engine::Interp;
+        #[cfg(not(all(feature = "cpu-x86-lift", feature = "jit")))]
+        if want_jit {
+            return Err(Error::Property(String::from(
+                "`engine = \"jit\"` needs a build with the `cpu-x86-lift` and `jit` \
+                 features; this one has only the interpreter. Refused rather than \
+                 interpreted silently, because an engine that is not the one you asked \
+                 for is a measurement that quietly means nothing",
+            )));
+        }
+        let _ = want_jit;
         // `space =` is structural and there is exactly one of it, so the
         // *second* address space is named by an ordinary string property and
         // looked up with `BindCtx::space_named`.
@@ -2202,7 +2299,38 @@ impl X86 {
             requester: RequesterId::ANONYMOUS,
         });
         cpu.iospace = iospace;
+        cpu.engine = engine;
         Ok(cpu)
+    }
+
+    /// The same core, running on `engine`.
+    ///
+    /// A consuming builder because an engine is chosen when a core is built,
+    /// like every other construction property; a machine file says
+    /// `engine = "jit"` and reaches the same place through
+    /// [`from_props`](X86::from_props).
+    #[must_use]
+    pub fn with_engine(mut self, engine: Engine) -> X86 {
+        self.engine = engine;
+        self
+    }
+
+    /// Which execution engine this core runs on.
+    #[must_use]
+    pub fn engine(&self) -> Engine {
+        self.engine
+    }
+
+    /// What the translation engine has done, on a core running one that has
+    /// run at least once.
+    ///
+    /// See [`JitStats`]: the interesting number is how much of the guest ran
+    /// as blocks rather than how fast it went.
+    #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "cpu-x86-lift", feature = "jit"))))]
+    #[must_use]
+    pub fn jit_stats(&self) -> Option<JitStats> {
+        self.session.lock().jit.as_ref().map(|jit| jit.stats())
     }
 
     /// The same core under the other class name.
@@ -2271,7 +2399,14 @@ impl X86 {
     /// assembly layer; when `RealizeCtx` grows space accessors this moves into
     /// [`Device::realize`] and the method stays as the way a test wires one up.
     pub fn attach_space(&self, space: Arc<AddressSpace>) {
-        self.session.lock().memory = Some(space);
+        let mut session = self.session.lock();
+        session.memory = Some(space);
+        // Every translation was lifted out of the space that is being
+        // replaced, so none of them describes this one.
+        #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+        if let Some(jit) = session.jit.as_mut() {
+            jit.flush();
+        }
     }
 
     /// Give the core the **separate** I/O address space `IN` and `OUT` reach.
@@ -2629,7 +2764,14 @@ impl X86 {
         let reset = self.lines.take_reset_request();
         let cfg = self.config();
         let mut session = self.session.lock();
-        let Session { state, memory, io } = &mut *session;
+        let Session {
+            state,
+            memory,
+            io,
+            #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+            jit,
+            ..
+        } = &mut *session;
         // The `reset` pin latches outside the lock; this is where the latch
         // becomes execution state, and it happens before the step so a pulse is
         // honoured at the very next instruction boundary.
@@ -2638,7 +2780,68 @@ impl X86 {
             return 0;
         };
         let io = io.clone();
+        #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+        {
+            // One instruction, interpreted, and whatever it wrote handed to
+            // the block cache. A core whose blocks were invalidated only by
+            // `advance` would serve a stale one to anything that mixes this
+            // entry point with the run loop -- a monitor stepping, a test
+            // driving the core by hand.
+            let mut exec = Exec::new(state, &memory, io.as_deref(), &cfg, &self.lines);
+            let used = exec.step();
+            if let Some(jit) = jit.as_mut() {
+                jit.note_writes(&mut exec);
+            }
+            used
+        }
+        #[cfg(not(all(feature = "cpu-x86-lift", feature = "jit")))]
         Exec::new(state, &memory, io.as_deref(), &cfg, &self.lines).step()
+    }
+
+    /// Advance the core by one *unit of the configured engine*: one
+    /// instruction under [`Engine::Interp`], one chain of translated blocks --
+    /// or one instruction, where a block would be wrong -- under either JIT
+    /// engine.
+    ///
+    /// `remaining` is what is left of the caller's budget, and it is not
+    /// advisory: a block whose worst case does not fit is not run, so the core
+    /// stops where an interpreted core would stop and carries the same
+    /// `State::debt`. See `engine`'s module documentation for why that matters
+    /// as far as the machine's state hash.
+    #[allow(unused_variables)]
+    fn advance(&self, remaining: u64) -> u64 {
+        #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+        if self.engine.translates() {
+            self.lines.poll_intc();
+            let reset = self.lines.take_reset_request();
+            let cfg = self.config();
+            let mut session = self.session.lock();
+            session.state.reset_pending |= reset;
+            if session.jit.is_none() {
+                session.jit = Some(Box::new(engine::Jit::new(self.engine == Engine::JitHost)));
+            }
+            let Session {
+                state,
+                memory,
+                io,
+                jit,
+            } = &mut *session;
+            let Some(memory) = memory.clone() else {
+                return 0;
+            };
+            let io = io.clone();
+            let jit = jit.as_mut().expect("just installed");
+            return engine::advance(
+                jit,
+                state,
+                &memory,
+                io.as_deref(),
+                &cfg,
+                &self.lines,
+                remaining,
+            );
+        }
+        self.step()
     }
 
     /// Execute until at least `budget` cycles have been charged.
@@ -2653,7 +2856,7 @@ impl X86 {
     pub fn run(&self, budget: u64) -> u64 {
         let mut used = 0;
         while used < budget {
-            let n = self.step();
+            let n = self.advance(budget - used);
             if n == 0 {
                 break;
             }
@@ -2682,7 +2885,7 @@ impl X86 {
         let allowance = ticks - owed;
         let mut used = 0u64;
         while used < allowance {
-            let n = self.step();
+            let n = self.advance(allowance - used);
             if n == 0 {
                 // Halted with nothing pending, shut down, or no address space.
                 // Either way retrying would spin — but the budget is still
@@ -2932,7 +3135,9 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "engine",
             kind: ValueKind::Str,
             required: false,
-            summary: "which execution engine; only `interp` exists until phase 5",
+            summary: "which execution engine: `interp`, `jit` (the translation runtime), \
+                      or `jit-host` (the same, with the host code generator). Both JIT \
+                      values need `cpu-x86-lift` and `jit`",
         },
         PropertySpec {
             name: "iospace",
@@ -3068,6 +3273,13 @@ impl Device for X86 {
 
     fn reset(&self, kind: ResetKind) {
         let mut session = self.session.lock();
+        // Derived state, and a reset is one of the two events that invalidates
+        // all of it: RAM is about to be zeroed under a cold reset, and the
+        // bytes every cached block was lifted from go with it.
+        #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+        if let Some(jit) = session.jit.as_mut() {
+            jit.flush();
+        }
         if kind == ResetKind::Cold {
             session.state = State::new(self.cfg.variant);
         } else {
@@ -3288,6 +3500,15 @@ impl Device for X86 {
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
+        // The other event that invalidates every translation: guest memory is
+        // about to be replaced wholesale by the rest of the restore, and a
+        // block cache filled from the *old* RAM describes a machine that no
+        // longer exists. This is what makes a snapshot interchangeable between
+        // the engines rather than merely loadable by them.
+        #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+        if let Some(jit) = self.session.lock().jit.as_mut() {
+            jit.flush();
+        }
         let mut state = State::new(self.cfg.variant);
         for reg in Reg::ALL {
             let value = r.read_u32()?;
@@ -3537,7 +3758,7 @@ fn schema_for(name: &'static str) -> crate::machine::validate::ClassSchema {
         // overrides are all bools.
         let prop = match spec.name {
             "variant" | "model" => prop.values(Variant::NAMES),
-            "engine" => prop.values(&["interp"]),
+            "engine" => prop.values(ENGINES),
             _ => prop,
         };
         schema = schema.prop(prop);
