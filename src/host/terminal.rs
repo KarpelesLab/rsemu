@@ -158,7 +158,28 @@ impl Terminal {
     /// Returns how many bytes moved, in both directions together. A run loop
     /// with a script on its stdin uses that plus [`at_eof`](Terminal::at_eof)
     /// to know when there is nothing left to do.
+    ///
+    /// **A recorded session does not use this one.** Feeding the port here
+    /// decides *when* a keystroke arrives, and that instant would be a host
+    /// scheduling artefact rather than a point on the guest's timeline — the
+    /// thing [`core::record`](crate::core::record) exists to stop. A caller
+    /// with a recorder attached posts through
+    /// [`typed`](Terminal::typed) instead and lets the machine deliver at a
+    /// round boundary; [`printed`](Terminal::printed) is the other half, and is
+    /// the same either way because output is not input.
     pub fn pump(&self, port: &CharPort) -> usize {
+        self.typed(|bytes| port.feed(bytes)) + self.printed(port)
+    }
+
+    /// Hand whatever the user has typed to `take`, a chunk at a time.
+    ///
+    /// The input half of [`pump`](Terminal::pump), split out so a recorded
+    /// session can post the bytes to a
+    /// [`Recorder`](crate::core::record::Recorder) rather than push them into a
+    /// port. `take` reports how many of the chunk it accepted, which is what
+    /// the return value adds up — a run loop uses it to notice that a piped
+    /// script has gone quiet.
+    pub fn typed(&self, mut take: impl FnMut(&[u8]) -> usize) -> usize {
         let mut moved = 0;
         let mut buf = [0u8; 256];
         loop {
@@ -166,13 +187,24 @@ impl Terminal {
             if n == 0 {
                 break;
             }
-            moved += port.feed(&buf[..n]);
+            moved += take(&buf[..n]);
         }
+        moved
+    }
+
+    /// Put whatever the guest printed on the screen, returning how many bytes
+    /// went.
+    ///
+    /// The output half of [`pump`](Terminal::pump). Nothing about this half
+    /// changes under a recording: what the guest wrote is a function of the
+    /// machine, not an input to it.
+    pub fn printed(&self, port: &CharPort) -> usize {
         let out = port.drain();
-        if !out.is_empty() {
-            moved += self.write(&out);
-            self.flush();
+        if out.is_empty() {
+            return 0;
         }
+        let moved = self.write(&out);
+        self.flush();
         moved
     }
 

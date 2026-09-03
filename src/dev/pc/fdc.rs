@@ -1440,7 +1440,7 @@ pub mod drives {
     use crate::core::sync::{LockRank, Mutex};
 
     /// The kind a floppy drive is filed under in a build's `HostObjects`.
-    pub const KIND: HostKind = HostKind::new("floppy-drive");
+    pub const KIND: HostKind = HostKind::rendezvous("floppy-drive");
 
     /// The name a controller files itself under when a machine file does not
     /// say. `fd0`, which is what the first diskette drive has been called for

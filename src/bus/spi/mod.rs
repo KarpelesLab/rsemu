@@ -750,7 +750,7 @@ pub mod buses {
 
     /// The kind an SPI bus is filed under in a build's
     /// [`HostObjects`].
-    pub const KIND: HostKind = HostKind::new("spi-bus");
+    pub const KIND: HostKind = HostKind::rendezvous("spi-bus");
 
     /// The an SPI bus `name` refers to in `hosts`, creating it on first mention.
     ///

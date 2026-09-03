@@ -7,8 +7,8 @@
 //! is the entire difference between two runs. RSMON, rsemu's own monitor, sits
 //! in the ROM socket, so the test needs no image of unclear provenance.
 //!
-//! Five things are proved here, and the first is the one that makes the other
-//! four mean anything:
+//! Six things are proved here, and the first is the one that makes the other
+//! five mean anything:
 //!
 //! 1. **The input matters.** A run with keystrokes and a run without reach
 //!    different state hashes. Without this the rest is a test that two empty
@@ -20,18 +20,23 @@
 //!    to an earlier instant, run forward again, arrive at the same number.
 //! 4. **A device cannot bypass the seam.** A sealed host-object table refuses
 //!    to build a board whose input the recorder has no channel for, naming it.
-//! 5. **A frozen recording replays to a pinned state.** The bytes and the
+//! 5. **And the seal is actually engaged.** Given a recorder,
+//!    `machine::realize` seals the table itself and wires the console the PIA
+//!    opened — a port nothing outside the machine file names — so the recording
+//!    a caller who knew nothing about this board took still replays to the same
+//!    hash. That is the case `rsemu run … --record-input` is.
+//! 6. **A frozen recording replays to a pinned state.** The bytes and the
 //!    resulting hash are constants in this file, so the comparison crosses
 //!    runs, builds and machines rather than staying inside one process.
 //!
 //! Everything needs a machine, so the whole file is gated on `machine-apple1`.
 //!
-//! # What the fifth one can and cannot prove
+//! # What the last one can and cannot prove
 //!
 //! Phase 9's gate is *"a recorded session replayed bit-identically on a
-//! different host"*, and 1–4 do not test it however green they are: each
+//! different host"*, and 1–5 do not test it however green they are: each
 //! records and replays inside one process, so a host that disagreed with every
-//! other host would still pass all four as long as it disagreed with itself
+//! other host would still pass all five as long as it disagreed with itself
 //! consistently. Nothing here compared a result against anything that came from
 //! outside the run.
 //!
@@ -60,7 +65,7 @@ use std::sync::Arc;
 use rsemu::core::clock::GlobalTime;
 use rsemu::core::device::ResetKind;
 use rsemu::core::hosts::{HostKind, HostObjects};
-use rsemu::core::record::{Channel, FnSink, InputSink, NullSink, Recorder};
+use rsemu::core::record::{Channel, InputSink, NullSink, Recorder};
 use rsemu::core::sched::ThreadingMode;
 use rsemu::host::chardev::{CharPort, ports};
 use rsemu::machine::{Machine, Timeline, catalog};
@@ -79,18 +84,13 @@ fn console_channel() -> Channel {
 /// A sink that feeds a character port, and drops what it is holding on a
 /// rewind.
 ///
-/// The whole adapter between `core::record` and `host::chardev`: two closures.
-/// The rewind half matters — bytes queued at the rewind target are re-delivered
-/// from the log, so a port that kept them would hand the guest each one twice.
+/// `host::chardev::ports::sink`, which this file used to write out by hand
+/// because the module shipped no pair. That was the gap: a test recorded a
+/// console fine with two closures of its own while the CLI's console was
+/// unrecorded, and nothing failed. The one-line form is here so these tests
+/// exercise the shipped adapter rather than a copy of it.
 fn port_sink(port: &Arc<CharPort>) -> Arc<dyn InputSink> {
-    let feeding = Arc::clone(port);
-    let clearing = Arc::clone(port);
-    Arc::new(
-        FnSink::new("chardev:console", move |bytes: &[u8]| {
-            feeding.feed(bytes);
-        })
-        .on_rewind(move || clearing.clear()),
-    )
+    ports::sink(port)
 }
 
 /// An Apple 1 with RSMON in its ROM socket, plus the host-object table its
@@ -111,6 +111,28 @@ fn apple1_with_hosts(mode: ThreadingMode, hosts: Arc<HostObjects>) -> (Machine, 
     let registry = catalog::registry().expect("a registry");
     let machine = rsemu::machine::build(entry.name, entry.source, &registry, &options)
         .expect("the board realizes");
+    (machine, hosts)
+}
+
+/// The same board, built **onto** `recorder` — which is what `rsemu run …
+/// --record-input` does and what every other test here does by hand.
+///
+/// Nothing names the console. `machine::realize` seals the host-object table
+/// once the devices have been constructed, and the seal asks the `chardev` kind
+/// itself where a recorded payload goes.
+fn apple1_onto(recorder: &Arc<Recorder>) -> (Machine, Arc<HostObjects>) {
+    let entry = catalog::machine("apple1").expect("this build ships apple1");
+    let mut options = catalog::build_options().expect("the catalog agrees with itself");
+    options
+        .realize
+        .media
+        .insert("rom", rsemu::dev::apple1::RSMON.as_slice());
+    let hosts = Arc::new(HostObjects::new());
+    options.realize.hosts = Arc::clone(&hosts);
+    options.realize.recorder = Some(Arc::clone(recorder));
+    let registry = catalog::registry().expect("a registry");
+    let machine = rsemu::machine::build(entry.name, entry.source, &registry, &options)
+        .expect("the board realizes onto the recorder");
     (machine, hosts)
 }
 
@@ -484,7 +506,93 @@ fn an_unknown_host_kind_is_refused_too() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. the other host
+// 5. the enforcement, engaged
+// ---------------------------------------------------------------------------
+
+/// The seal on the real path: a board is built *onto* a recorder and its
+/// console is recorded, with nothing outside the machine file naming it.
+///
+/// Every other test in this file registers `chardev:console` by hand, which is
+/// fine for a test and impossible for `rsemu run`: the port's name comes out of
+/// the machine description, so a binary that had to know it could only ever
+/// record a frontend. That is why `--record-input` used to require `--vnc` and
+/// record no keystrokes.
+#[test]
+fn realize_wires_a_console_nobody_named_and_the_recording_replays() {
+    let recorder = Arc::new(Recorder::recording());
+    let (mut machine, hosts) = apple1_onto(&recorder);
+    assert!(hosts.is_sealed(), "realize sealed the table");
+    assert!(
+        recorder.knows(&console_channel()),
+        "and wired the console the PIA opened, unprompted"
+    );
+    assert!(
+        !recorder.is_sealed(),
+        "a frontend registered after the build still gets a channel"
+    );
+
+    let port = ports::open(&hosts, CONSOLE).expect("the port the device opened");
+    machine.reset(ResetKind::Cold);
+    let (recorded_hash, recorded_output) = drive(&mut machine, &port, &recorder, &TYPED);
+    assert!(!recorded_output.is_empty(), "the guest printed something");
+
+    let bytes = recorder.log().encode().expect("a recording encodes");
+    let log = rsemu::core::record::InputLog::decode(&bytes).expect("and decodes");
+    assert_eq!(
+        log.len(),
+        TYPED.iter().filter(|k| !k.is_empty()).count(),
+        "every keystroke reached the log through a channel nobody registered"
+    );
+
+    // And back in, the same way round: a replaying recorder in the options.
+    let replay = Arc::new(Recorder::replaying(log));
+    let (mut replayed, hosts) = apple1_onto(&replay);
+    let replay_port = ports::open(&hosts, CONSOLE).expect("the port the device opened");
+    replayed.reset(ResetKind::Cold);
+    let (replayed_hash, replayed_output) = drive(
+        &mut replayed,
+        &replay_port,
+        &replay,
+        &[b"", b"", b"", b"", b""],
+    );
+
+    assert_eq!(
+        replayed_hash, recorded_hash,
+        "the same machine, bit for bit"
+    );
+    assert_eq!(replayed_output, recorded_output, "and the same screen");
+}
+
+/// A board realized onto a recorder in a threading mode that cannot be replayed
+/// fails at build time.
+///
+/// `Machine::set_recorder` has always refused this; what is new is that realize
+/// makes the call, so the refusal arrives before the machine exists rather than
+/// after a caller has assembled one and gone looking for the seam.
+#[test]
+fn a_parallel_board_cannot_be_built_onto_a_recorder() {
+    let entry = catalog::machine("apple1").expect("this build ships apple1");
+    let mut options = catalog::build_options().expect("the catalog agrees with itself");
+    options.realize.scheduler.mode = ThreadingMode::Parallel;
+    options
+        .realize
+        .media
+        .insert("rom", rsemu::dev::apple1::RSMON.as_slice());
+    options.realize.hosts = Arc::new(HostObjects::new());
+    options.realize.recorder = Some(Arc::new(Recorder::recording()));
+    let registry = catalog::registry().expect("a registry");
+
+    let err = rsemu::machine::build(entry.name, entry.source, &registry, &options)
+        .expect_err("a parallel run cannot be recorded");
+    let text = format!("{err}");
+    assert!(
+        text.contains("cannot be replayed"),
+        "the refusal says why: {text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. the other host
 // ---------------------------------------------------------------------------
 
 /// A recording of exactly the session above, frozen as bytes.

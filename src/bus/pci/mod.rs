@@ -1174,7 +1174,7 @@ pub mod buses {
     use crate::core::props::Props;
 
     /// The kind a PCI fabric is filed under in a build's [`HostObjects`].
-    pub const KIND: HostKind = HostKind::new("pci-bus");
+    pub const KIND: HostKind = HostKind::rendezvous("pci-bus");
 
     /// The fabric `name` refers to in `hosts`, creating it on first mention.
     ///

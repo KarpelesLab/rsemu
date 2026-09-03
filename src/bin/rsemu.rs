@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use rsemu::core::HostObjects;
 use rsemu::core::clock::GlobalTime;
+use rsemu::core::record::Recorder;
 use rsemu::core::sched::ThreadingMode;
 use rsemu::host::chardev::{CharDevice, CharPort, ports};
 use rsemu::host::terminal::Terminal;
@@ -115,6 +116,19 @@ RUN OPTIONS:
                         a ring ever did overflow the file says how much it lost
                         rather than shortening quietly
     --audio-rate <hz>   Sample rate for --record-audio (default 44100)
+    --record-input <f>  Write every input that crossed into the machine, and
+                        the virtual instant it was delivered at, to <f>. The
+                        host-object table is sealed for the build, so every
+                        input door the board opens -- a console, a controller,
+                        a network port -- is recorded, and a board with an
+                        input nothing can record refuses to build rather than
+                        producing a log with a stream missing. Needs
+                        deterministic threading, because nothing else replays
+    --replay-input <f>  Drive the machine from <f> instead of from the keyboard
+                        or the network, at the instants it records. Live input
+                        is discarded, so the run is the recorded one, bit for
+                        bit; a recording of a differently shaped board is
+                        refused with a diff
 
     --gdb <addr>        Listen for GDB on <addr> and hold the machine stopped
                         until it attaches. `1234`, `:1234` and `host:1234` all
@@ -126,11 +140,6 @@ RUN OPTIONS:
                         `5900`, `:5900` and `host:5900` all work; a bare port
                         binds the loopback interface only, because there is no
                         authentication. The machine runs at wall-clock speed
-    --record-input <f>  With --vnc, write every input event and the virtual
-                        instant it was delivered at to <f>
-    --replay-input <f>  With --vnc, take input from <f> instead of from the
-                        network, at the instants it records. The run is then
-                        the recorded one, bit for bit
     -q, --quiet         Only print the summary
 
 OPTIONS:
@@ -307,10 +316,14 @@ struct RunArgs {
     #[cfg(feature = "vnc")]
     vnc: Option<String>,
     /// Where to write the input log, if `--record-input` was given.
-    #[cfg(feature = "vnc")]
+    ///
+    /// Not VNC's any more. The recorder these two build is put in
+    /// `RealizeOptions::recorder`, so `machine::realize` seals the
+    /// host-object table against it and wires every input door the board opened
+    /// — a console included, which is what made `--record-input` on a terminal
+    /// session record nothing at all.
     record_input: Option<String>,
     /// Where to read one from, if `--replay-input` was given.
-    #[cfg(feature = "vnc")]
     replay_input: Option<String>,
 }
 
@@ -436,6 +449,20 @@ fn run(args: &[String]) -> ExitCode {
         return fail(&e);
     }
 
+    // The record/replay seam, opened **before** the build rather than attached
+    // after it. That is the whole difference between a mechanism and an engaged
+    // one: `machine::realize` seals the host-object table against this recorder
+    // once every device has been constructed, so a console the machine file
+    // named — which this binary cannot know the name of — is wired to it, and a
+    // board with an input nothing can record refuses to build.
+    let recorder = match open_recorder(&parsed) {
+        Ok(r) => r,
+        Err(status) => return status,
+    };
+    if let Some(recorder) = &recorder {
+        options.realize.recorder = Some(Arc::clone(recorder));
+    }
+
     let registry = match catalog::registry() {
         Ok(r) => r,
         Err(e) => return fail(&e),
@@ -517,14 +544,15 @@ fn run(args: &[String]) -> ExitCode {
     // is checked before the console loop, which would otherwise own that.
     #[cfg(feature = "gdb")]
     if let Some(addr) = parsed.gdb.clone() {
-        let port = match console_port(&parsed, &options.realize.hosts) {
-            Ok(port) => port,
+        let console = match console_port(&parsed, &options.realize.hosts) {
+            Ok(console) => console,
             Err(e) => {
                 eprintln!("rsemu: {e}");
                 return ExitCode::from(2);
             }
         };
-        let status = debug_session(&mut machine, &addr, port.as_ref(), &parsed, audio.as_mut());
+        let port = console.as_ref().map(|c| &c.port);
+        let status = debug_session(&mut machine, &addr, port, &parsed, audio.as_mut());
         return deliver(
             &machine,
             &parsed,
@@ -557,8 +585,8 @@ fn run(args: &[String]) -> ExitCode {
             eprintln!("rsemu: {e}");
             return ExitCode::from(2);
         }
-        Ok(Some(port)) => {
-            let status = interact(&mut machine, &port, &parsed, audio.as_mut());
+        Ok(Some(console)) => {
+            let status = interact(&mut machine, &console, &parsed, audio.as_mut());
             return deliver(
                 &machine,
                 &parsed,
@@ -605,12 +633,74 @@ fn deliver(
 ) -> ExitCode {
     let drew = write_screenshot(args, scanout);
     let played = write_recording(args, audio);
-    let status = if drew && played {
+    let logged = write_input_log(args, machine.recorder());
+    let status = if drew && played && logged {
         status
     } else {
         ExitCode::FAILURE
     };
     finish(machine, status)
+}
+
+/// Open the record/replay seam the flags asked for, if either did.
+///
+/// Before the build, because that is when it has to exist: the recorder goes
+/// into `RealizeOptions::recorder` and `machine::realize` seals the
+/// host-object table against it, which is what wires a board's console and
+/// controllers up without this binary having to know their names. Attaching one
+/// afterwards — which is all `--vnc --record-input` used to do — records
+/// whatever the frontend saw and nothing else.
+fn open_recorder(args: &RunArgs) -> Result<Option<Arc<Recorder>>, ExitCode> {
+    match (&args.record_input, &args.replay_input) {
+        (Some(_), Some(_)) => {
+            eprintln!("rsemu: --record-input and --replay-input are mutually exclusive");
+            Err(ExitCode::from(2))
+        }
+        (Some(_), None) => Ok(Some(Arc::new(Recorder::recording()))),
+        (None, Some(path)) => {
+            let bytes = std::fs::read(path).map_err(|e| {
+                eprintln!("rsemu: --replay-input: cannot read {path}: {e}");
+                ExitCode::FAILURE
+            })?;
+            let log = rsemu::core::record::InputLog::decode(&bytes).map_err(|e| {
+                eprintln!("rsemu: --replay-input {path}: {e}");
+                ExitCode::from(2)
+            })?;
+            if !args.quiet {
+                eprintln!("  replaying {} input events from {path}", log.len());
+            }
+            Ok(Some(Arc::new(Recorder::replaying(log))))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// Write `--record-input`'s log, reporting whether the run should still count
+/// as a success.
+///
+/// The same shape as `write_recording` and for the same reason: a run that
+/// was asked for a recording and could not write one has not done what it was
+/// asked, whichever loop drove it.
+fn write_input_log(args: &RunArgs, recorder: Option<&Arc<Recorder>>) -> bool {
+    let Some(path) = args.record_input.as_deref() else {
+        return true;
+    };
+    let Some(recorder) = recorder else {
+        eprintln!("rsemu: --record-input {path}: no recorder was attached to this machine");
+        return false;
+    };
+    let bytes = match recorder.log().encode() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("rsemu: --record-input {path}: {e}");
+            return false;
+        }
+    };
+    if let Err(e) = std::fs::write(path, bytes) {
+        eprintln!("rsemu: --record-input {path}: {e}");
+        return false;
+    }
+    true
 }
 
 /// Whether the flags that produce a file can produce one at all.
@@ -1235,11 +1325,16 @@ fn debug_session(
 /// open in `hosts` — the table that build used, and nobody else's. One is
 /// unambiguous; several need `--console` to choose between them, because
 /// guessing would put the keyboard on the wrong device.
-fn console_port(args: &RunArgs, hosts: &HostObjects) -> Result<Option<Arc<CharPort>>, String> {
+fn console_port(args: &RunArgs, hosts: &HostObjects) -> Result<Option<Console>, String> {
     if args.headless {
         return Ok(None);
     }
-    let opened = |name: &str| ports::get(hosts, name).ok().flatten();
+    let opened = |name: &str| {
+        ports::get(hosts, name).ok().flatten().map(|port| Console {
+            name: name.to_string(),
+            port,
+        })
+    };
     if let Some(name) = &args.console {
         return opened(name).map(Some).ok_or_else(|| {
             format!(
@@ -1258,6 +1353,18 @@ fn console_port(args: &RunArgs, hosts: &HostObjects) -> Result<Option<Arc<CharPo
             list(&names)
         )),
     }
+}
+
+/// The character port a terminal was attached to, and the name it answers to.
+///
+/// The name is not decoration: it is half of the port's record/replay channel
+/// (`chardev:console`), and a recorded session posts what the user typed on
+/// that channel instead of pushing it into the port. Nothing outside the
+/// machine file knows it — which is exactly why the seal has to do the wiring
+/// and this loop only has to find the name afterwards.
+struct Console {
+    name: String,
+    port: Arc<CharPort>,
 }
 
 /// `a`, `b` and `c`, or "none".
@@ -1297,10 +1404,34 @@ const IDLE_SLICES: u32 = 200;
 /// for the shallowest ring in the tree, it simply was not emptying it.
 fn interact(
     machine: &mut Machine,
-    port: &CharPort,
+    console: &Console,
     args: &RunArgs,
     mut audio: Option<&mut rsemu::host::audio::AudioStream>,
 ) -> ExitCode {
+    let port = &console.port;
+    // How a keystroke reaches the guest, and the one place a console session
+    // differs under a recording. With no recorder the terminal feeds the port
+    // directly, as it always has. With one, the bytes are *posted* and the
+    // machine delivers them at its next round boundary, so the instant they
+    // arrive at is a point on the guest's timeline rather than an artefact of
+    // when this loop happened to run — and in `--replay-input` the post is
+    // discarded, so live typing cannot quietly turn a replay into a new run.
+    let recorded = machine
+        .recorder()
+        .map(|recorder| (Arc::clone(recorder), ports::channel(&console.name)))
+        .filter(|(recorder, channel)| recorder.knows(channel));
+    let typed = |bytes: &[u8]| -> usize {
+        match &recorded {
+            Some((recorder, channel)) => match recorder.post(channel, bytes) {
+                Ok(_) => bytes.len(),
+                Err(e) => {
+                    eprintln!("\r\nrsemu: {e}");
+                    0
+                }
+            },
+            None => port.feed(bytes),
+        }
+    };
     let term = Terminal::open();
     if !args.quiet {
         if term.is_raw() {
@@ -1328,12 +1459,12 @@ fn interact(
         if deadline.is_some_and(|d| machine.now() >= d) {
             break ExitCode::SUCCESS;
         }
-        let mut moved = term.pump(port);
+        let mut moved = term.typed(typed) + term.printed(port);
         if let Err(e) = machine.run_until(machine.now().saturating_add(SLICE)) {
             eprintln!("\r\nrsemu: {e}");
             break ExitCode::FAILURE;
         }
-        moved += term.pump(port);
+        moved += term.typed(typed) + term.printed(port);
         if let Some(stream) = audio.as_mut() {
             stream.pull();
         }
@@ -1436,47 +1567,20 @@ fn vnc_session(
         session = session.with_sink(Arc::new(mouse));
     }
 
-    // Recording and replaying are `core::record`'s, not this frontend's: what
-    // the flags do is attach a recorder to the machine and register the
-    // session's channel with it. The instant each event lands at is then the
-    // machine's own round boundary rather than anything decided out here.
-    let recorder = match (&args.record_input, &args.replay_input) {
-        (Some(_), Some(_)) => {
-            eprintln!("rsemu: --record-input and --replay-input are mutually exclusive");
-            return ExitCode::from(2);
-        }
-        (Some(_), None) => Some(Arc::new(rsemu::core::record::Recorder::recording())),
-        (None, Some(path)) => match std::fs::read(path) {
-            Ok(bytes) => match rsemu::core::record::InputLog::decode(&bytes) {
-                Ok(log) => {
-                    if !args.quiet {
-                        eprintln!("  replaying {} input events from {path}", log.len());
-                    }
-                    Some(Arc::new(rsemu::core::record::Recorder::replaying(log)))
-                }
-                Err(e) => {
-                    eprintln!("rsemu: --replay-input {path}: {e}");
-                    return ExitCode::from(2);
-                }
-            },
-            Err(e) => {
-                eprintln!("rsemu: --replay-input: cannot read {path}: {e}");
-                return ExitCode::FAILURE;
-            }
-        },
-        (None, None) => None,
-    };
-    if let Some(recorder) = &recorder {
-        if let Err(e) = session.attach(recorder) {
-            eprintln!("rsemu: {e}");
-            return ExitCode::FAILURE;
-        }
-        // Refused outright under parallel threading, because a recording of one
-        // could not be replayed (ROADMAP.md §4.2).
-        if let Err(e) = machine.set_recorder(Arc::clone(recorder)) {
-            eprintln!("rsemu: {e}");
-            return ExitCode::from(2);
-        }
+    // Recording and replaying are `core::record`'s, not this frontend's, and
+    // the recorder is already attached: `run` opened it before the build so
+    // that `machine::realize` could seal the host-object table onto it — which
+    // is what gets this board's console and controllers into the log without
+    // this function naming any of them. What is left here is the one channel
+    // with *no* host object behind it, the frontend's own, which cannot be
+    // registered any earlier because a session cannot exist before the machine
+    // it draws. The recorder's channel list stays open until the first round
+    // boundary for exactly this case.
+    if let Some(recorder) = machine.recorder().map(Arc::clone)
+        && let Err(e) = session.attach(&recorder)
+    {
+        eprintln!("rsemu: {e}");
+        return ExitCode::FAILURE;
     }
 
     // Sound, if the user asked for it. **This is where the headless
@@ -1507,19 +1611,7 @@ fn vnc_session(
         eprintln!("rsemu: {e}");
         return ExitCode::FAILURE;
     }
-    if let (Some(path), Some(recorder)) = (&args.record_input, &recorder) {
-        let bytes = match recorder.log().encode() {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                eprintln!("rsemu: --record-input {path}: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        if let Err(e) = std::fs::write(path, bytes) {
-            eprintln!("rsemu: --record-input {path}: {e}");
-            return ExitCode::FAILURE;
-        }
-    }
+    let logged = write_input_log(args, machine.recorder());
     if !args.quiet {
         summarise(machine);
     }
@@ -1528,7 +1620,7 @@ fn vnc_session(
     // from the host table, which it emptied on the way in.
     let drew = write_screenshot(args, Some(session.scanout()));
     let played = write_recording(args, session.audio());
-    if drew && played {
+    if drew && played && logged {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -1677,9 +1769,7 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         gdb: None,
         #[cfg(feature = "vnc")]
         vnc: None,
-        #[cfg(feature = "vnc")]
         record_input: None,
-        #[cfg(feature = "vnc")]
         replay_input: None,
     };
     let mut i = 0;
@@ -1735,9 +1825,7 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             "--gdb" => out.gdb = Some(value(arg)?),
             #[cfg(feature = "vnc")]
             "--vnc" => out.vnc = Some(value(arg)?),
-            #[cfg(feature = "vnc")]
             "--record-input" => out.record_input = Some(value(arg)?),
-            #[cfg(feature = "vnc")]
             "--replay-input" => out.replay_input = Some(value(arg)?),
             "--console" => out.console = Some(value(arg)?),
             "--headless" => out.headless = true,
