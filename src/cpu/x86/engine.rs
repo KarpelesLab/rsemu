@@ -1657,9 +1657,14 @@ mod tests {
     /// **stack** segment rather than `DS` — so with the two segments at
     /// different bases the bytes land somewhere a `DS` access would never
     /// reach, and guest RAM says which one happened.
+    /// `EBX` **accumulates** what the load read, for the reason
+    /// [`WORLD_A`] spells out: a register the loop merely overwrites is
+    /// repaired by the interpreter's own next instruction at the end of a
+    /// quantum, and the comparison then agrees while the engine has been
+    /// reading through the wrong segment all along.
     const THROUGH_SS: [u8; 10] = [
         0x89, 0x04, 0x24, // mov [esp], eax
-        0x8b, 0x1c, 0x24, // mov ebx, [esp]
+        0x03, 0x1c, 0x24, // add ebx, [esp]
         0xff, 0xc0, // inc eax
         0xeb, 0xf6, // jmp back to the top
     ];
@@ -1693,6 +1698,14 @@ mod tests {
             );
             memory_agrees(&ram_a, &ram_b, n);
         }
+        assert!(
+            jit.jit_stats().expect("statistics").blocks > 0,
+            "no block ran, so the host's segment handling was never reached"
+        );
+        assert!(
+            interp.regs().qword(3) > 0x1000,
+            "the fixture never accumulated anything"
+        );
     }
 
     /// A loop that rewrites the immediate of its own first instruction.
@@ -1725,6 +1738,36 @@ mod tests {
         agree(&Case::new(SELF_MODIFYING.to_vec()), 8_000, 12);
         agree(&Case::new(SELF_MODIFYING.to_vec()).paged(), 8_000, 12);
         agree(&Case::new(SELF_MODIFYING.to_vec()).long(), 8_000, 12);
+    }
+
+    #[test]
+    fn a_non_canonical_program_counter_is_the_interpreters_general_protection() {
+        // `Exec::fetch_at` checks the canonical form *before* it translates
+        // anything and raises `#GP(0)` rather than `#PF`, so a boundary that
+        // went straight to the page tables would translate an address the
+        // processor never had — and here it would succeed, because the low
+        // forty-eight bits of this one are the window the fixture maps.
+        let case = busy(2);
+        let (space_a, _a) = differential::machine(&case);
+        let (space_b, _b) = differential::machine(&case);
+        let interp = core(&case, space_a, Engine::Interp);
+        let jit = core(&case, space_b, Engine::JitHost);
+        for cpu in [&interp, &jit] {
+            let mut regs = cpu.regs();
+            regs.rip = (1u64 << 48) | differential::BASE;
+            cpu.set_regs(regs);
+        }
+        for n in 0..4 {
+            assert_eq!(interp.run_budget(6_000), jit.run_budget(6_000));
+            assert_eq!(interp.regs().rip, jit.regs().rip, "quantum {n}: RIP");
+            assert_eq!(interp.cycles(), jit.cycles(), "quantum {n}: the clock");
+            assert_eq!(interp.sys().cr2, jit.sys().cr2, "quantum {n}: CR2");
+            assert_eq!(interp.is_halted(), jit.is_halted(), "quantum {n}: halted");
+        }
+        assert!(
+            interp.is_halted(),
+            "the fixture never faulted, so it tested nothing"
+        );
     }
 
     #[test]
