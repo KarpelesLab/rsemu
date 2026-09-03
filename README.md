@@ -265,7 +265,15 @@ cargo test --all-features
 cargo run -- --version
 
 cargo build --no-default-features   # no_std core, as CI checks it
+
+scripts/check.sh         # everything CI gates on, per commit
+scripts/check.sh --all   # plus the full per-feature sweep (long)
 ```
+
+`scripts/check.sh` is the whole CI workflow as one command, so "I ran the
+tests" and "CI is green" stop being different claims. It prints one marked
+summary at the end and exits non-zero if any stage failed; `--list` names the
+stages and any of them runs alone.
 
 WebAssembly — no `wasm-bindgen`; the module is instantiated directly and
 strings cross as a pointer/length pair read from exported memory:

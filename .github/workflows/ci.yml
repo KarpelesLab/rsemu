@@ -9,6 +9,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # A CI job compiles each configuration exactly once, so an incremental cache
+  # is written and never read. It is not free: locally, where the same commands
+  # run over and over across worktrees, `target/debug/incremental` reached
+  # 246 GB — larger than every compiled artifact in the tree put together. Off
+  # everywhere, and `scripts/check.sh` sets the same.
+  CARGO_INCREMENTAL: 0
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -35,6 +41,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # The other half of the matrix, and the one ROADMAP §0 cares about: a
+      # lint that only fires when `std` is absent is invisible to the run
+      # above, which has every feature on. Cheap — the crate is much smaller
+      # with the defaults dropped.
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
 
   docs:
     name: rustdoc
@@ -100,12 +111,24 @@ jobs:
       - run: cargo test --no-default-features
 
   features:
-    name: feature sweep
+    # Six shards of the same sweep. Sequentially this was a hundred and one
+    # `cargo test` runs on one runner; split, it is the same CPU-minutes in a
+    # sixth of the wall time, which is what buys room for the combination job
+    # below without the workflow getting slower.
+    name: feature sweep ${{ matrix.shard }}/6
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Each shard compiles a different set, so one shared cache key would
+          # have six jobs overwriting each other's entry every run.
+          key: sweep-${{ matrix.shard }}
       # Cargo features are additive-only, so a component that silently needs a
       # sibling feature passes --all-features forever and breaks for the first
       # user who picks a narrow set. Build each feature alone.
@@ -114,11 +137,12 @@ jobs:
         # list silently stops covering the feature added after it was written,
         # which is exactly the feature most likely to have the bug.
         run: |
-          set -euo pipefail
-          cargo build --no-default-features
-          feats=$(cargo metadata --no-deps --format-version 1 | python3 -c \
-            "import json,sys; print(' '.join(sorted(f for f in json.load(sys.stdin)['packages'][0]['features'] if f != 'default')))")
-          echo "sweeping: $feats"
+          set -uo pipefail
+          df -h .
+          cargo build --no-default-features || exit 1
+          feats=$(python3 scripts/feature-matrix.py features | awk "NR % 6 == ${{ matrix.shard }} % 6")
+          echo "shard ${{ matrix.shard }}/6 sweeping: $feats"
+          failed=""
           for f in $feats; do
             echo "::group::$f"
             # `cargo test`, not `check`: three bugs shipped past a
@@ -133,9 +157,78 @@ jobs:
             # deterministic: the `single` backend's locks were racy under
             # libtest's threads, so this job would have been a flake
             # generator. See `core::sync`'s `single` module.
-            cargo test --no-default-features --features "$f"
+            cargo test --no-default-features --features "$f" || failed="$failed $f"
+            # Every feature set has its own metadata hash, so no iteration can
+            # reuse the previous one's artifacts — they only pile up, and a
+            # hundred of them is tens of gigabytes against a runner's fourteen.
+            # Dropping this crate's artifacts costs nothing that would have
+            # been reused and makes the sweep's disk use O(1) instead of
+            # O(features). A build that dies on a full disk fails exactly like
+            # a build that is broken, which is the worst kind of red.
+            cargo clean -p rsemu || true
             echo "::endgroup::"
           done
+          # Every failure, not the first: the point of a sweep is the list of
+          # what is broken. `::error::` puts each one in the run's annotations,
+          # at the top of the page, because a summary line at the end of forty
+          # thousand lines of log has already been missed twice -- and both
+          # times the thing missed was a `std`-only construct in a `no_std`
+          # feature, which no other job in this workflow can see.
+          df -h .
+          if [ -n "$failed" ]; then
+            for f in $failed; do
+              echo "::error title=feature sweep::--no-default-features --features $f FAILED"
+            done
+            echo "SWEEP FAILED:$failed"
+            exit 1
+          fi
+          echo "sweep shard ${{ matrix.shard }} ok"
+
+  feature-combinations:
+    name: feature combinations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: combos
+      # The gap the sweep above cannot close on its own, stated exactly,
+      # because it is easy to overstate. Cargo features are additive, so
+      # `--all-features` compiles every conjunction of them: no gated code in
+      # this crate is *uncompiled*. But `--all-features` also turns `std` on,
+      # and the sweep -- the only job that builds without `std` -- never turns
+      # two features on at once. So code gated on a *pair* of `no_std`
+      # features has only ever been compiled with `std` present, and a `std`
+      # -only construct in it reaches master exactly the way one did twice
+      # already (`fw-pcbios`, `cpu-arm-a64`). `src/cpu/riscv/engine.rs`
+      # (`all(cpu-riscv-lift, jit)`) is one of thirty-four such gates.
+      #
+      # The pairs are derived from the tree by `scripts/feature-matrix.py` --
+      # from `cfg` predicates *and* from module nesting, so a `#[cfg(A)] mod`
+      # containing a `#[cfg(B)]` item counts too -- and never listed here,
+      # because a list stops covering the gate added after it was written.
+      # They are then merged into as few builds as cover them: the union of
+      # two `no_std` sets is still `no_std`, and turning more features on
+      # cannot stop a gate from compiling.
+      - name: derive and build the combinations
+        run: |
+          set -uo pipefail
+          python3 scripts/feature-matrix.py plan
+          failed=""
+          while read -r set_; do
+            [ -n "$set_" ] || continue
+            echo "::group::$set_"
+            cargo test --no-default-features --features "$set_" || failed="$failed $set_"
+            cargo clean -p rsemu || true
+            echo "::endgroup::"
+          done < <(python3 scripts/feature-matrix.py merged)
+          if [ -n "$failed" ]; then
+            for f in $failed; do
+              echo "::error title=feature combination::--no-default-features --features $f FAILED"
+            done
+            exit 1
+          fi
 
   deps:
     name: dependency policy
@@ -143,17 +236,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      # The default build pulls in nothing at all (ROADMAP.md §0). Permitted
-      # dependencies are first-party and feature-gated; this asserts the floor.
-      - name: default build has no dependencies
-        run: |
-          set -euo pipefail
-          cargo tree --edges normal --prefix none | sort -u > /tmp/tree.txt
-          cat /tmp/tree.txt
-          if [ "$(wc -l < /tmp/tree.txt)" -ne 1 ]; then
-            echo "::error::default build gained a dependency"
-            exit 1
-          fi
+      # Both halves of the rule. The default build pulls in nothing at all, and
+      # the *feature-enabled* tree is inspected too — ROADMAP §0 says it is
+      # checked and, until now, only the default half was. The script says what
+      # it gates on and what it merely reports, and why; `scripts/check.sh`
+      # runs the same file, so the local answer and this one cannot differ.
+      - name: dependency policy
+        run: ./scripts/deps-policy.sh
 
   wasm:
     name: wasm (${{ matrix.target }})

@@ -26,7 +26,15 @@
 //! [`LockRank::BUS`]: rsemu::core::sync::LockRank::BUS
 //! [`Machine::state_hash`]: rsemu::machine::Machine::state_hash
 
-#![cfg(all(feature = "cpu-riscv", feature = "cpu-mos6502"))]
+// `std` as well as the two cores, because `parallel` is a threading mode and a
+// `no_std` build has no threads: `core::sync`'s `single` backend builds a pool
+// with zero workers, and this file's first assertion then fails with "this host
+// refused a worker thread", blaming the machine for what is a build
+// configuration. Nothing had ever built it that way — no single-feature build
+// compiles this file and `--all-features` has `std` — until
+// `scripts/feature-matrix.py` derived `cpu-mos6502,cpu-riscv` as a combination
+// the sweep never covered.
+#![cfg(all(feature = "cpu-riscv", feature = "cpu-mos6502", feature = "std"))]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

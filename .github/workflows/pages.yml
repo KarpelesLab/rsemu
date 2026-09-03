@@ -31,6 +31,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Written once, read never — see the note in ci.yml.
+  CARGO_INCREMENTAL: 0
 
 jobs:
   build:

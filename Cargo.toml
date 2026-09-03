@@ -1545,6 +1545,35 @@ arithmetic_side_effects = "allow"
 lto           = "thin"
 codegen-units = 1
 
+# Full DWARF is the default for a debug build, and for this crate that default
+# is expensive in a way nobody was watching. `cargo test --all-features` writes
+# a 193 MB rlib and then *copies* its debug info into each of some sixty test
+# binaries at ~120 MB apiece: 7.5 GB of artifacts, of which the code is a small
+# fraction. Multiply by the feature sweep, which builds a hundred more feature
+# sets that share nothing, and a single checkout's `target/` reached 505 GB.
+#
+# `line-tables-only` keeps the half of that information anyone here actually
+# uses — a panic's file and line, and a readable backtrace — and drops the
+# variable, type and scope descriptions a Rust-level debugger session would
+# want. Debugging rsemu itself in gdb is rare (what gets debugged is the
+# *guest*, through our own gdbstub, which reads guest state and not DWARF), and
+# `--profile dev-debug` below restores the full description for the times it is
+# not. Nothing about correctness changes: this is the description of the code,
+# not the code.
+[profile.dev]
+debug = "line-tables-only"
+
+# A dependency's internals are never what is being debugged, and there are only
+# three of them, all first-party and all optional.
+[profile.dev.package."*"]
+debug = false
+
+# `cargo test --profile dev-debug` when you do want to point a debugger at
+# rsemu's own code. Identical to the old default in every respect.
+[profile.dev-debug]
+inherits = "dev"
+debug    = true
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

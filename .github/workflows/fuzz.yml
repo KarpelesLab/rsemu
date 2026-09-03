@@ -18,6 +18,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Written once, read never — see the note in ci.yml.
+  CARGO_INCREMENTAL: 0
 
 concurrency:
   group: fuzz
@@ -49,12 +51,25 @@ jobs:
       - name: smoke each target
         # The committed corpus is passed read-only as a second input so a run
         # never rewrites the curated seeds.
+        #
+        # `cargo fuzz list`, not a list written here. The hand-written one named
+        # five targets and the tree has twenty-three: eighteen of them were
+        # built by the step above and then never run, so the drift this job
+        # exists to detect was going undetected for exactly the targets added
+        # after somebody last edited this line. Thirty seconds each rather than
+        # sixty keeps the job about where it was (five minutes becomes roughly
+        # twelve) — neither number finds a bug a real campaign would, and
+        # `fuzz/README.md` has that command.
         run: |
           set -euxo pipefail
-          for t in machine_parser state_decoder state_roundtrip flash_cfi ir_verify; do
+          for t in $(cargo fuzz list); do
             mkdir -p "/tmp/corpus-$t"
-            cargo fuzz run "$t" "/tmp/corpus-$t" "fuzz/corpus/$t" -- \
-              -max_total_time=60 -timeout=10
+            # Twelve of the twenty-three have committed seeds; libFuzzer treats
+            # a missing input directory as an error rather than as an empty one.
+            seeds=""
+            [ -d "fuzz/corpus/$t" ] && seeds="fuzz/corpus/$t"
+            cargo fuzz run "$t" "/tmp/corpus-$t" $seeds -- \
+              -max_total_time=30 -timeout=10
           done
       - uses: actions/upload-artifact@v5
         if: failure()

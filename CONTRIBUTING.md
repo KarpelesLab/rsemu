@@ -110,6 +110,18 @@ by someone who was not in the room.
   `cargo tree`. Only first-party Karpelès Lab crates, feature-gated.
 - `cargo fmt` and `cargo clippy -D warnings` must be clean, across the whole
   target matrix — native, `no_std`, and both wasm configurations.
+- **`scripts/check.sh` runs what CI runs**, so the two are the same claim. With
+  no arguments it does the per-commit set — formatting, both clippy
+  configurations, rustdoc, the dependency floor, the three test configurations,
+  the three wasm targets, and the derived feature-*combination* builds — and
+  prints one marked summary at the end. `--all` adds the full per-feature
+  sweep, which is long; `--list` names the stages, and any of them can be run
+  alone. Nothing in it parses test output: a step's verdict is its exit status,
+  because `test result: ok. N passed; M failed` has the failure count in field
+  six and a gate that counted field seven once let a red build through.
+- `scripts/feature-matrix.py plan` explains why the combination builds exist
+  and what they cover. Adding a `#[cfg(all(feature = …, feature = …))]` needs
+  no change there — the pairs are read out of the tree, never listed.
 - New devices ship with a snapshot round-trip test; new CPU cores ship with
   their conformance suite.
 - By submitting a patch you confirm you have the right to license it under MIT

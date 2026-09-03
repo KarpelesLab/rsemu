@@ -481,22 +481,37 @@ fn thumb1_matches_the_aprofile_core() {
         }
     }
 
-    for failure in &failures {
-        std::println!("FAIL {failure}");
+    // The summary is evidence, not the test — the assertion below is the
+    // test — and a `no_std` build has no console to put it on. This module is
+    // gated on `cpu-arm-v7m` and `cpu-arm-aprofile`, both of which are
+    // `no_std`, so it is compiled by `--no-default-features --features
+    // cpu-arm-v7m,cpu-arm-aprofile`, where `std::println!` does not resolve.
+    // That build did not exist until `scripts/feature-matrix.py` derived it:
+    // no single-feature build compiles this file and `--all-features` has
+    // `std`, so for the life of the file the only builds that saw it had a
+    // `std` to print to.
+    #[cfg(feature = "std")]
+    {
+        for failure in &failures {
+            std::println!("FAIL {failure}");
+        }
+        std::println!(
+            "differential vs cpu::arm::aprofile: {compared} encodings compared, \
+             {} classified as divergent ({} new in v7-M, {} exception model, \
+             {} interworking, {} STM base-in-list, {} empty list, \
+             {} thirty-two-bit in v7-M)",
+            diverged.iter().sum::<usize>(),
+            diverged[Why::NewInV7m as usize],
+            diverged[Why::Exception as usize],
+            diverged[Why::Interworking as usize],
+            diverged[Why::BaseInList as usize],
+            diverged[Why::EmptyList as usize],
+            diverged[Why::Wide as usize],
+        );
     }
-    std::println!(
-        "differential vs cpu::arm::aprofile: {compared} encodings compared, \
-         {} classified as divergent ({} new in v7-M, {} exception model, \
-         {} interworking, {} STM base-in-list, {} empty list, \
-         {} thirty-two-bit in v7-M)",
-        diverged.iter().sum::<usize>(),
-        diverged[Why::NewInV7m as usize],
-        diverged[Why::Exception as usize],
-        diverged[Why::Interworking as usize],
-        diverged[Why::BaseInList as usize],
-        diverged[Why::EmptyList as usize],
-        diverged[Why::Wide as usize],
-    );
+    #[cfg(not(feature = "std"))]
+    let _ = (compared, diverged);
+
     assert!(
         failures.is_empty(),
         "{} differential failures",
