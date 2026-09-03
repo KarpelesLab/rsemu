@@ -437,25 +437,9 @@ pub fn pmp_allows(csrs: &Csrs, addr: u64, len: u64, kind: Access, mode: Priv) ->
     let mut matched = None;
     for i in 0..csrs.pmp_count {
         let cfg = csrs.pmpcfg[i];
-        let a = (cfg >> 3) & 3;
-        if a == 0 {
+        let Some((lo, hi)) = pmp_range(csrs, i) else {
             continue;
-        }
-        let (lo, hi) = match a {
-            // TOR: the previous entry's address is the bottom of the range.
-            1 => {
-                let lo = if i == 0 { 0 } else { csrs.pmpaddr[i - 1] << 2 };
-                (lo, csrs.pmpaddr[i] << 2)
-            }
-            2 => {
-                let base = csrs.pmpaddr[i] << 2;
-                (base, base + 4)
-            }
-            _ => napot(csrs.pmpaddr[i]),
         };
-        if hi <= lo {
-            continue;
-        }
         // An access that straddles the edge of a region is refused rather than
         // split: the specification requires the whole access to match one
         // entry.
@@ -487,6 +471,70 @@ pub fn pmp_allows(csrs: &Csrs, addr: u64, len: u64, kind: Access, mode: Priv) ->
         // else if PMP is not implemented at all.
         None => mode == Priv::Machine || csrs.pmp_count == 0,
     }
+}
+
+/// Entry `i`'s half-open physical range, or `None` when it matches nothing.
+///
+/// `A = OFF` matches nothing, and so does a TOR entry whose top is not above
+/// its bottom. Written once because [`pmp_allows`] and [`pmp_page_uniform`]
+/// must agree about every edge: the second exists to say that the first gives
+/// one answer for a whole page, and two copies of the decoding are two
+/// opportunities for it to be wrong about that.
+fn pmp_range(csrs: &Csrs, i: usize) -> Option<(u64, u64)> {
+    let cfg = csrs.pmpcfg[i];
+    let (lo, hi) = match (cfg >> 3) & 3 {
+        0 => return None,
+        // TOR: the previous entry's address is the bottom of the range.
+        1 => {
+            let lo = if i == 0 { 0 } else { csrs.pmpaddr[i - 1] << 2 };
+            (lo, csrs.pmpaddr[i] << 2)
+        }
+        2 => {
+            let base = csrs.pmpaddr[i] << 2;
+            (base, base + 4)
+        }
+        _ => napot(csrs.pmpaddr[i]),
+    };
+    (hi > lo).then_some((lo, hi))
+}
+
+/// Whether PMP gives the *same* answer for every access inside one page.
+///
+/// [`pmp_allows`] asked about a whole page is not this question, and the
+/// difference is a silent wrong answer rather than a slow one. Its loop takes
+/// the **first** entry that contains the access's start, and an entry that
+/// lies wholly *inside* the page contains neither the page's first byte nor
+/// its last — so it is skipped for the page and matched for an access in the
+/// middle of it. A page-wide grant can therefore sit in front of a byte-wide
+/// refusal.
+///
+/// So the condition here is stronger: no active entry may **partially** overlap
+/// the page. With that, every access inside the page reaches the same entry the
+/// page-wide question reached, and its answer is the page-wide answer.
+///
+/// This is what a caller needs before it may cache "this page is fast" —
+/// [`Tlb`]'s shadow does, because the compiled fast path skips the PMP check
+/// entirely and a page PMP is not uniform over cannot be cached at all.
+#[must_use]
+pub fn pmp_page_uniform(csrs: &Csrs, page: u64, kind: Access, mode: Priv) -> bool {
+    let end = match page.checked_add(PAGE_SIZE) {
+        Some(end) => end,
+        None => return false,
+    };
+    for i in 0..csrs.pmp_count {
+        let Some((lo, hi)) = pmp_range(csrs, i) else {
+            continue;
+        };
+        // Disjoint is fine; containing the page is fine; anything else is an
+        // edge inside the page.
+        if hi <= page || lo >= end {
+            continue;
+        }
+        if lo > page || hi < end {
+            return false;
+        }
+    }
+    pmp_allows(csrs, page, PAGE_SIZE, kind, mode)
 }
 
 /// Decode a NAPOT `pmpaddr` into a half-open physical range.
@@ -531,6 +579,10 @@ pub struct Tlb {
     slots: [[Entry; TLB_ENTRIES]; 3],
     hits: u64,
     misses: u64,
+    /// The host half of the same answers, for a code generator that inlines a
+    /// load. See [`Tlb::attach_shadow`].
+    #[cfg(feature = "jit")]
+    shadow: Option<alloc::boxed::Box<crate::jit::Tlb>>,
 }
 
 impl Default for Tlb {
@@ -547,6 +599,8 @@ impl Tlb {
             slots: [[Entry::default(); TLB_ENTRIES]; 3],
             hits: 0,
             misses: 0,
+            #[cfg(feature = "jit")]
+            shadow: None,
         }
     }
 
@@ -557,6 +611,65 @@ impl Tlb {
     /// for a snapshot restore.
     pub fn flush(&mut self) {
         self.slots = [[Entry::default(); TLB_ENTRIES]; 3];
+        // The shadow is only ever as live as this table is, so it goes with
+        // it. Losing it costs a refill; keeping it after a flush would let a
+        // compiled load skip a walk this table would have charged for.
+        #[cfg(feature = "jit")]
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.flush();
+        }
+    }
+
+    /// Give this TLB a [`jit::Tlb`](crate::jit::Tlb) shadow over `space`.
+    ///
+    /// # What the shadow is
+    ///
+    /// This table answers *virtual page → physical page*, which is half of what
+    /// a compiled load needs; the other half is *physical page → host address*,
+    /// and that is what `jit::Tlb` caches. The shadow is that second half,
+    /// indexed by the **same** virtual page, in the same slot, so that a
+    /// compiled load can go from a guest address to a host one in a mask, a
+    /// compare and an add — `ROADMAP.md` §9.1's first mechanism, inlined.
+    ///
+    /// # Why it has to be here rather than beside the engine
+    ///
+    /// A compiled load that hits the shadow charges **one** tick and skips the
+    /// walk. That is only right if this table would have hit too, so the two
+    /// have to stay in lockstep — and lockstep is a property of *every* path
+    /// that can insert here, not only of the translated one. An interpreted
+    /// `amoadd` inserts, a trap handler outside the lifted subset inserts, a
+    /// debugger's single step inserts; each of those evicts a slot, and a
+    /// shadow living next to the engine would not hear about any of them.
+    /// Owning it here means `Exec::translate` maintains both at once and there
+    /// is no other way in.
+    ///
+    /// The two are the same size for the same reason: the slot a page lands in
+    /// must be the same slot in both, or an eviction here would leave a shadow
+    /// entry alive that promises a hit this table no longer has.
+    #[cfg(feature = "jit")]
+    pub fn attach_shadow(&mut self, space: alloc::sync::Arc<crate::core::space::AddressSpace>) {
+        let shadow = crate::jit::Tlb::with_entries(space, TLB_ENTRIES as u64);
+        debug_assert_eq!(
+            shadow.entries(),
+            TLB_ENTRIES as u64,
+            "the shadow must index exactly as this table does"
+        );
+        self.shadow = Some(alloc::boxed::Box::new(shadow));
+    }
+
+    /// The shadow, if one was attached.
+    #[cfg(feature = "jit")]
+    #[inline]
+    pub fn shadow_mut(&mut self) -> Option<&mut crate::jit::Tlb> {
+        self.shadow.as_deref_mut()
+    }
+
+    /// Whether a shadow is attached.
+    #[cfg(feature = "jit")]
+    #[inline]
+    #[must_use]
+    pub fn has_shadow(&self) -> bool {
+        self.shadow.is_some()
     }
 
     /// How many lookups hit and how many missed, for `rsemu` statistics.
@@ -943,6 +1056,208 @@ mod tests {
         csrs.pmpcfg[0] = 0x80 | 0b0001_1001; // locked, NAPOT, read-only
         assert!(pmp_allows(&csrs, 0x1000, 4, Access::Load, Priv::Machine));
         assert!(!pmp_allows(&csrs, 0x1000, 4, Access::Store, Priv::Machine));
+    }
+
+    #[test]
+    fn a_page_with_an_entry_inside_it_is_not_uniform_even_when_the_page_is_allowed() {
+        // The exact hazard `pmp_page_uniform` exists for, and the reason
+        // asking `pmp_allows` about the whole page is not the same question.
+        // An entry lying *wholly inside* the page contains neither its first
+        // byte nor its last, so `pmp_allows`'s loop skips it for the page and
+        // matches it for an access in the middle — a page-wide grant sitting
+        // in front of a byte-wide refusal.
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
+        // Entry 0: sixteen bytes at 0x8000_1010 — strictly inside the page,
+        // touching neither its first byte nor its last — with no permissions.
+        csrs.pmpaddr[0] = (0x8000_1010u64 >> 2) | 1;
+        csrs.pmpcfg[0] = 0b0001_1000; // NAPOT, no R/W/X
+        // Entry 1: everything, readable.
+        csrs.pmpaddr[1] = u64::MAX >> 10;
+        csrs.pmpcfg[1] = 0b0001_1001; // NAPOT, R
+        let page = 0x8000_1000;
+        assert!(
+            pmp_allows(&csrs, page, PAGE_SIZE, Access::Load, Priv::Supervisor),
+            "the page-wide question falls through to the entry that grants"
+        );
+        assert!(
+            !pmp_allows(&csrs, page + 0x10, 4, Access::Load, Priv::Supervisor),
+            "but an access inside it reaches the entry that refuses"
+        );
+        assert!(
+            !pmp_page_uniform(&csrs, page, Access::Load, Priv::Supervisor),
+            "so the page must never be cached as fast"
+        );
+    }
+
+    #[test]
+    fn a_page_an_entry_only_half_covers_is_not_uniform_either() {
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
+        // A TOR entry ending in the middle of the page: readable below, and
+        // nothing matches above.
+        csrs.pmpaddr[0] = (0x8000_1800u64) >> 2;
+        csrs.pmpcfg[0] = 0b0000_1001; // TOR, R
+        assert!(!pmp_page_uniform(
+            &csrs,
+            0x8000_1000,
+            Access::Load,
+            Priv::Supervisor
+        ));
+        // The page below it is wholly inside, so that one is uniform.
+        assert!(pmp_page_uniform(
+            &csrs,
+            0x8000_0000,
+            Access::Load,
+            Priv::Supervisor
+        ));
+    }
+
+    #[test]
+    fn a_uniform_page_answers_the_same_way_everywhere_in_it() {
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
+        csrs.pmpaddr[0] = u64::MAX >> 10;
+        csrs.pmpcfg[0] = 0b0001_1001; // NAPOT over everything, read-only
+        let page = 0x8000_2000;
+        assert!(pmp_page_uniform(
+            &csrs,
+            page,
+            Access::Load,
+            Priv::Supervisor
+        ));
+        for off in [0, 8, PAGE_SIZE - 8] {
+            assert!(pmp_allows(
+                &csrs,
+                page + off,
+                8,
+                Access::Load,
+                Priv::Supervisor
+            ));
+        }
+        // Uniform is not the same as allowed: a store is refused everywhere in
+        // the same page, and the shadow must not cache that as fast either.
+        assert!(!pmp_page_uniform(
+            &csrs,
+            page,
+            Access::Store,
+            Priv::Supervisor
+        ));
+    }
+
+    #[test]
+    fn an_entry_that_only_touches_a_page_does_not_make_it_non_uniform() {
+        // The other edge of the same test, and the one a *conservative*
+        // mistake hides in: an entry that stops exactly where the page starts,
+        // or starts exactly where it ends, overlaps nothing. Refusing those
+        // costs no correctness and is therefore invisible to every agreement
+        // test — it just quietly turns the fast path off for the page next to
+        // every PMP region a firmware configures, which on this board is the
+        // page next to everything OpenSBI locks down.
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
+        let page = 0x8000_1000;
+        // Entry 0: TOR ending exactly at the page's first byte.
+        csrs.pmpaddr[0] = page >> 2;
+        csrs.pmpcfg[0] = 0b0000_1001; // TOR, R
+        // Entry 1: NA4 at exactly the page's end, so it starts where the page
+        // stops.
+        csrs.pmpaddr[1] = (page + PAGE_SIZE) >> 2;
+        csrs.pmpcfg[1] = 0b0001_0001; // NA4, R
+        // Entry 2: everything, so the page itself has a granting match.
+        csrs.pmpaddr[2] = u64::MAX >> 10;
+        csrs.pmpcfg[2] = 0b0001_1001; // NAPOT, R
+        assert!(
+            pmp_page_uniform(&csrs, page, Access::Load, Priv::Supervisor),
+            "an adjacent entry is not an overlapping one"
+        );
+    }
+
+    #[test]
+    fn an_empty_pmp_range_is_no_range_at_all() {
+        // A TOR entry whose top is not above its bottom matches nothing —
+        // `pmp_allows` has always skipped it. `pmp_page_uniform` has to skip
+        // it too, or an empty range that happens to sit inside a page turns
+        // the fast path off for it forever, silently and for no reason.
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
+        let page = 0x8000_1000;
+        // A TOR entry at the same address as the one below it: an empty range,
+        // strictly inside the page.
+        csrs.pmpaddr[0] = (page + 0x100) >> 2;
+        csrs.pmpcfg[0] = 0; // A = OFF, so entry 1's bottom is entry 0's address
+        csrs.pmpaddr[1] = (page + 0x100) >> 2;
+        csrs.pmpcfg[1] = 0b0000_1001; // TOR, R -- range is [x, x), empty
+        csrs.pmpaddr[2] = u64::MAX >> 10;
+        csrs.pmpcfg[2] = 0b0001_1001; // NAPOT over everything, R
+        assert_eq!(pmp_range(&csrs, 1), None, "an empty range matches nothing");
+        assert!(
+            pmp_page_uniform(&csrs, page, Access::Load, Priv::Supervisor),
+            "and so cannot be the thing that makes a page non-uniform"
+        );
+    }
+
+    #[test]
+    fn a_hart_with_no_pmp_entries_calls_every_page_uniform() {
+        let csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, 0);
+        assert!(pmp_page_uniform(&csrs, 0, Access::Load, Priv::Supervisor));
+        // And a hart with entries but none configured refuses S-mode
+        // everywhere — uniformly, but as a refusal.
+        let csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
+        assert!(!pmp_page_uniform(&csrs, 0, Access::Load, Priv::Supervisor));
+        assert!(pmp_page_uniform(&csrs, 0, Access::Load, Priv::Machine));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn the_shadow_indexes_exactly_as_this_table_does() {
+        // The lockstep the compiled fast path's single tick rests on: a page
+        // must land in the same slot in both, or an eviction here leaves a
+        // shadow entry alive that promises a hit this table no longer has.
+        use crate::core::space::AddressSpace;
+        use alloc::sync::Arc;
+        let space = Arc::new(AddressSpace::new("mem", 64));
+        let mut tlb = Tlb::new();
+        assert!(!tlb.has_shadow());
+        tlb.attach_shadow(space);
+        let shadow = tlb.shadow_mut().expect("just attached");
+        assert_eq!(shadow.entries(), TLB_ENTRIES as u64);
+        // And the index is the same function of the page in both.
+        assert_eq!(crate::jit::PAGE_SIZE, PAGE_SIZE);
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn a_flush_of_this_table_empties_the_shadow_with_it() {
+        // A flush is not a generation bump: `Tlb::flush` is what a reset, a
+        // debugger's CSR write and a snapshot restore do, and none of them has
+        // to move `translation_gen`. So a shadow entry that outlived one would
+        // still *match* its tag while the entry it stands for is gone — a
+        // compiled load charging one tick where the interpreter walks, and, if
+        // the restored `satp` maps the page somewhere else, reading the wrong
+        // physical page outright.
+        use crate::core::space::{AddressSpace, RamStore, Region};
+        use crate::ir::AccessKind;
+        use alloc::sync::Arc;
+        let ram = Arc::new(RamStore::new(0x4000));
+        let space = AddressSpace::new("mem", 64);
+        space
+            .topology()
+            .map(Region::ram("ram", ram), 0)
+            .expect("nothing else is mapped");
+        let mut tlb = Tlb::new();
+        tlb.attach_shadow(Arc::new(space));
+        let ctx = crate::jit::Context {
+            level: Priv::Supervisor.bits() as u8,
+            translating: true,
+        };
+        let shadow = tlb.shadow_mut().expect("just attached");
+        shadow.fill(AccessKind::Load, 0, 0, ctx);
+        assert!(
+            shadow.caches(AccessKind::Load, 0, ctx),
+            "the fixture never cached the page it is about to flush"
+        );
+        tlb.flush();
+        let shadow = tlb.shadow_mut().expect("the shadow survives a flush");
+        assert!(
+            !shadow.caches(AccessKind::Load, 0, ctx),
+            "its contents did not"
+        );
     }
 
     #[test]

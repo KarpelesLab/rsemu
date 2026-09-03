@@ -698,10 +698,9 @@ impl StoreLog for BenchHost {
 /// is checked there, on the same code path.
 impl FastMem for BenchHost {
     fn load_plan(&mut self) -> Option<LoadPlan> {
-        self.tlb.as_ref().map(|tlb| LoadPlan {
-            set: tlb.fast_set(AccessKind::Load),
-            ctx: MACHINE,
-        })
+        self.tlb
+            .as_ref()
+            .map(|tlb| tlb.plan(AccessKind::Load, MACHINE))
     }
 }
 

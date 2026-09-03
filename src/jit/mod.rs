@@ -20,6 +20,14 @@
 //! engines are alternatives rather than a switch, and the interpreter stays
 //! the oracle either way.
 //!
+//! The first mechanism's *"inlined into generated code"* clause is
+//! [`LoadPlan`]'s job — what a host offers and what [`x86`] reads — and it is
+//! reached from a real guest: `cpu::riscv::mmu`'s `Tlb::attach_shadow` puts one
+//! of these tables inside the hart's own translation cache, so the two evict
+//! together and an inlined load is a load whose walk has already been charged
+//! for. [`FastMem`] has the argument; the interesting half of it is what a host
+//! with a *guest* MMU owes on top of a bare one.
+//!
 //! §9.1's **fourth** mechanism — *"superblocks / traces — merge across direct
 //! branches, keep guest registers in host registers across block boundaries
 //! within a trace"* — is not here, and that is where it belongs: merging is a
@@ -125,4 +133,6 @@ pub use dispatch::{
     DirtyPages, DispatchStats, Dispatcher, Entry, Frontend, Run, Stop, StoreLog, Translation,
 };
 pub use fast::{FastMem, LoadPlan};
-pub use tlb::{Context, DEFAULT_ENTRIES, Epoch, FastSet, PAGE_MASK, PAGE_SIZE, Tlb, TlbStats};
+pub use tlb::{
+    Context, DEFAULT_ENTRIES, Epoch, FastSet, PAGE_MASK, PAGE_SIZE, STAMP_BITS, Tlb, TlbStats,
+};

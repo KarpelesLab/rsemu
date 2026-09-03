@@ -68,34 +68,46 @@ board on each and compares `Machine::state_hash` at ten checkpoints, then moves
 a snapshot between engines in both directions.
 
 It holds on a real guest too. OpenSBI plus a Debian riscv64 kernel and a busybox
-initramfs, 512 MiB, four minutes of virtual time — well past the shell prompt —
-one binary, `--headless` so nothing is rate-limited to the wall clock:
+initramfs, 512 MiB, one binary, `--headless` so nothing is rate-limited to the
+wall clock — over sixty seconds of virtual time, which is the boot, and over
+four minutes, which is well past the shell prompt:
 
-| `engine` | wall clock | vs `interp` | state hash |
+| `engine` | 60 s of guest time | 240 s of guest time | state hash (240 s) |
 | --- | --- | --- | --- |
-| `interp` | 150.6 s | — | `0xf86f099b07119370` |
-| `jit` | 115.6 s | **1.30×** | `0xf86f099b07119370` |
-| `jit-host` | 87.6 s | **1.72×** | `0xf86f099b07119370` |
+| `interp` | 36.6 s | 156.9 s | `0x267fac762c374054` |
+| `jit` | 25.2 s (**1.45×**) | 120.4 s (**1.30×**) | `0x267fac762c374054` |
+| `jit-host` | 14.9 s (**2.45×**) | 68.7 s (**2.28×**) | `0x267fac762c374054` |
 
 The host code generator used to *lose* to the portable one on this guest, at
-0.50×, and neither thing that fixed it was the code it emits. **Blocks are
-chained now** — 86% of them are reached by following a patched exit, where the
-count was previously zero in every run — and **a compile stopped costing
+0.50×, and none of the three things that fixed it was the code it emits.
+**Blocks are chained** — 86% of them are reached by following a patched exit,
+where the count was previously zero in every run. **A compile stopped costing
 144 µs**, which is what two `mprotect` calls over a 256 MiB code buffer had
 been costing before `jit::x86::buf` learned to flip a page-sized window
-instead. 1.72× is still not the 8–22× the code generator measures on a
-benchmark, because the inlined TLB fast path is out of reach from a hart:
-every guest access costs a call whichever engine runs it.
+instead. And **a guest load stopped costing a call**: the software TLB's fast
+path is inlined into generated code now that a hart publishes a `LoadPlan`, so
+97.3% of compiled loads are a mask, a compare, an add and a `mov` rather than a
+trip through the hart's translation and PMP. That last one is worth 13% —
+78.9 s to 68.7 s over the four minutes — against 20% fewer host instructions
+executed, which is the usual gap between an instruction count and a clock.
 [`src/cpu/riscv/engine.rs`](../../src/cpu/riscv/engine.rs) has the reasoning and
 the measurements behind every one of those claims, including what it costs to
-keep the engines identical.
+keep the engines identical, and `src/jit/fast.rs` has the argument for why a
+*paged* hart may publish a plan at all.
 
 **Measure the interpreter in the same sweep as the engines it is the control
 for.** This is a shared machine, and a 150-second run of the same binary
-varied by 12% between sweeps run twenty minutes apart — larger than the effect
-being measured. The table above is the median of an interleaved
-three-rep sweep whose nine runs spread by 0.5%; a before-and-after taken from
-two different sittings is not evidence.
+varied by 12% between sweeps run twenty minutes apart — larger than most of the
+effects being measured. Each table above is the median of an interleaved
+three-rep sweep, and a before-and-after taken from two different sittings is
+not evidence. Interleave the *binaries* too when the change is to one engine:
+the 13% the inlined fast path is worth was measured with the old and the new
+`jit-host` in the same sweep. An earlier sweep of the same two binaries, on the
+host CPU this machine had before, read anywhere from 3.6% to 9.4% depending on
+what else was running — same code, same guest, same instruction counts. When a
+machine is busy, prefer the median of the *per-rep ratios* to the ratio of the
+medians: they agree here (13.8% against 12.9%) and the first degrades more
+gracefully.
 
 A build without `cpu-riscv-lift` and `jit` **refuses** both JIT values with a
 message saying which features it wants, rather than interpreting quietly — an

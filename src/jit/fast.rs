@@ -24,6 +24,32 @@
 //! calls [`IrHost::load`](crate::ir::IrHost::load) and gets the host's answer,
 //! including the fill that makes the *next* access fast.
 //!
+//! # What a host with a *guest* MMU owes on top of that
+//!
+//! A bare-mode host publishes a plan and is done: an aligned load of plain RAM
+//! costs one bus cycle whether it was cached or not. A **paged** host does
+//! not, and the reason this seam went unimplemented on the one core that
+//! matters for a year is worth stating, because the obvious reading of it is
+//! wrong.
+//!
+//! The obvious reading is that a walk cannot be skipped per access, so a paged
+//! host can never publish. But the plan is not per access — it is **per page**,
+//! and the entry is written by the miss that walked. The condition is
+//! therefore not *"no walk is owed"* but *"a hit here implies a hit in the
+//! table that owes the walk"*, and a host makes that true by writing this
+//! table in lockstep with its own translation cache: same index, same page,
+//! same moment, so an eviction there is an eviction here. `cpu::riscv::mmu`'s
+//! `Tlb::attach_shadow` is that, and the tick
+//! [`FastMem::note_fast_load`] charges is then the whole of what an inlined
+//! load still owes.
+//!
+//! Two more things belong to the host rather than to this table, and both are
+//! silent when they are wrong: a **protection check the topology knows nothing
+//! about** (RISC-V's PMP, whose answer may differ within one page — see
+//! `mmu::pmp_page_uniform`), and the guest's own **fence**, which is
+//! [`Epoch::translation`](crate::jit::Epoch::translation) and rides in the tag
+//! rather than costing a flush.
+//!
 //! # Not implementing this is the default
 //!
 //! Both methods are defaulted, so a host that has no TLB — a `no_std` board, a
@@ -33,7 +59,7 @@
 //! its own loads would make compiled and interpreted execution disagree, which
 //! is the one thing this crate does not tolerate.
 
-use crate::jit::tlb::{Context, FastSet};
+use crate::jit::tlb::FastSet;
 
 /// The parts of a host's memory path a backend may inline.
 #[derive(Debug, Clone, Copy)]
@@ -42,11 +68,16 @@ pub struct LoadPlan {
     ///
     /// Valid for as long as the borrow it came from, and until the TLB is
     /// flushed. A flush comes from [`Tlb::sync`](crate::jit::Tlb::sync), which
-    /// a dispatcher calls at a block boundary — never inside one — so a plan
-    /// taken at the top of a block stays good for that block.
+    /// a host calls at a block boundary — never inside one — so a plan taken
+    /// at the top of a block stays good for that block.
     pub set: FastSet,
-    /// The world those loads happen in, which the tag carries.
-    pub ctx: Context,
+    /// Everything a hit's tag carries besides the page number: the world those
+    /// loads happen in, and the stamp of the guest MMU's generation.
+    ///
+    /// [`Tlb::tag_bits`](crate::jit::Tlb::tag_bits) is what produces it, and a
+    /// backend must load it per block rather than bake it in: the stamp moves
+    /// every time the guest fences its translations.
+    pub tag: u64,
 }
 
 /// A host whose loads a backend may serve without calling it.

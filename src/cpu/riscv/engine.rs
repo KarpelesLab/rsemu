@@ -25,7 +25,11 @@
 //!   agrees, *the* memory path. A second implementation would have to
 //!   reproduce the misaligned split, the per-byte translation, the PMP check
 //!   and a walk's tick cost, and `differential`'s own host is the evidence
-//!   that reproducing them is a job rather than a line.
+//!   that reproducing them is a job rather than a line. The one thing that
+//!   does *not* take that path is an aligned load of plain RAM whose
+//!   translation this hart's TLB already holds, which compiled code serves
+//!   inline — and the whole of [`FastMem`] below is the argument that those
+//!   two are the same thing.
 //! * **The entry fetch translation happens on every block execution**, not
 //!   once at lift time. A translated block skips the fetch, but the
 //!   interpreter's first fetch *translates*, and a translation that misses the
@@ -56,29 +60,33 @@
 //!
 //! On the guest this exists for — `machines/riscv-virt.machine` booting
 //! OpenSBI 1.6 and a Debian RISC-V `Image` with a busybox initramfs, 512 MiB of
-//! DRAM, **four minutes of virtual time**, so well past the shell prompt — one
-//! binary, three engines, back to back:
+//! DRAM, `--headless` — one binary, three engines, over two spans of guest
+//! time: sixty seconds, which is the boot, and four minutes, which is well
+//! past the shell prompt:
 //!
-//! | `engine` | wall clock | vs the interpreter |
+//! | `engine` | 60 s of guest time | 240 s of guest time |
 //! | --- | --- | --- |
-//! | `interp` | 150.6 s | — |
-//! | `jit` | 115.6 s | **1.30×** |
-//! | `jit-host` | 87.6 s | **1.72×** |
+//! | `interp` | 36.6 s | 156.9 s |
+//! | `jit` | 25.2 s (1.45×) | 120.4 s (1.30×) |
+//! | `jit-host` | **14.9 s (2.45×)** | **68.7 s (2.28×)** |
 //!
-//! Median of three **interleaved** reps — one of each engine, in turn, three
-//! times over — because the interpreter is the control and a control measured
-//! in a different sitting is not one. The nine runs spread by 0.5%; two sweeps
-//! of the *same* binary taken twenty minutes apart on this machine differed by
-//! 12%.
+//! Median of six **interleaved** reps at sixty seconds and three at four
+//! minutes — one of each engine, in turn, round and round — because the
+//! interpreter is the control and a control measured in a different sitting is
+//! not one. Not merely good practice: this table's predecessor was taken on a
+//! different host CPU, where the same binary varied by 12% between sweeps
+//! twenty minutes apart, which was larger than most of the effects below.
+//! Numbers from two sittings cannot be reconciled, only re-measured.
 //!
 //! All three end on the same guest state, byte for byte:
-//! `state hash 0xf86f099b07119370`. `tests/riscv_virt_engines.rs` asserts that
-//! equality on every commit, on a cheaper guest.
+//! `state hash 0x267fac762c374054` at four minutes.
+//! `tests/riscv_virt_engines.rs` asserts that equality on every commit, on a
+//! cheaper guest.
 //!
 //! **The host code generator used to lose to the portable one**, at 0.50× the
-//! interpreter, and what fixed it was not the code it emits. Two things were.
+//! interpreter. Three things fixed it, and none of them was the code it emits.
 //!
-//! **Blocks are chained now.** [`Frontend::enter`] is the hook that allows it,
+//! **Blocks are chained.** [`Frontend::enter`] is the hook that allows it,
 //! [`CHAIN`] is how far, and on this guest **86% of blocks are reached by
 //! following a patched exit** — 43.2 million of 50.0 million over sixty
 //! seconds of guest time, against a `chained` count that was previously zero
@@ -86,25 +94,39 @@
 //! everything around a four-instruction block that a one-block call had to
 //! pay in full.
 //!
-//! **And a compile stopped costing 144 µs.** The 256 MiB code buffer this
-//! engine asks for was being `mprotect`ed end to end twice per compiled block
-//! — 433 600 cycles a block, against 13 850 for the code generation it was
+//! **A compile stopped costing 144 µs.** The 256 MiB code buffer this engine
+//! asks for was being `mprotect`ed end to end twice per compiled block —
+//! 433 600 cycles a block, against 13 850 for the code generation it was
 //! protecting. `jit::x86::buf` flips a page-sized window instead, and the same
 //! sixty seconds of guest time went from **25.6 billion cycles in `mprotect`
-//! to 1.3 billion**. The two fixes of the previous round were fighting each
-//! other: the buffer was grown to stop resets, and growing it made every flip
-//! proportionally slower.
+//! to 1.3 billion**.
+//!
+//! **And a guest load stopped costing a call.** The last of `ROADMAP.md` §9's
+//! four mechanisms — the software TLB, *inlined* — is reached from a hart now
+//! that this one publishes a [`LoadPlan`](crate::jit::LoadPlan); [`FastMem`]
+//! below is what it may cover and why. Over three seconds of this guest's boot
+//! the backend serves **3 250 549 of 3 340 050 compiled loads inline, 97.3%**,
+//! and the host instructions the whole run executes fall from 18.17 billion to
+//! 16.09 billion. Set beside the run's fixed tail — the CLI hashes 512 MiB of
+//! guest RAM when it ends, which is 7.76 billion of either figure and has
+//! nothing to do with the engine — the emulation itself went from 10.42
+//! billion instructions to 8.34, **20% fewer**. It is worth 13% of the wall
+//! clock rather than 20% (78.9 s to 68.7 s over four minutes), which is the
+//! usual gap between an instruction count and a clock: what was removed —
+//! `pmp_allows`, the flat-view walk, `AddressSpace::read` — is branch-heavy
+//! ALU work, and what replaced it is a dependent load out of an 8 KiB table.
 //!
 //! What is left is honest and worth knowing. The compiled path's *execution*
 //! was never the problem — measured over the same run it costs 768 cycles a
 //! block against the IR interpreter's 896, so it was ahead before compilation
-//! was counted. And the speedup is 1.72×, not the 8–22× the code generator
-//! measures on a benchmark, because the last of `ROADMAP.md` §9's four
-//! mechanisms is still out of reach: no [`LoadPlan`](crate::jit::LoadPlan) is
-//! published (see [`FastMem`] below), so a guest access costs a call whichever
-//! engine runs it. A block here lifts to about forty-seven IR instructions and
+//! was counted. A block here lifts to about forty-seven IR instructions and
 //! compiles to 949 bytes of host code; 59 269 of them are compiled in sixty
-//! seconds and none is refused.
+//! seconds and none is refused. And what the profile now says costs most, over
+//! that same three seconds, is not the load path at all: 13.3 million calls
+//! into `jit::x86::rt`'s flush thunk (1.16 billion instructions), the stores
+//! this backend deliberately does not inline (1.6 billion across the write
+//! path), and the PMP check the *fetch* and *store* translations still make
+//! (1.46 billion).
 //!
 //! # What is checked at a block boundary rather than at an instruction
 //!
@@ -165,8 +187,8 @@ use crate::core::space::{AddressSpace, MemAttrs, MemResult};
 use crate::core::value::Width;
 use crate::ir::{Block, InsnStart, IrHost, MemOp, Opcode, RegSlot, verify};
 use crate::jit::{
-    BlockCache, DirtyPages, Dispatcher, Entry, Epoch, FastMem, Frontend, PAGE_MASK, Stop, StoreLog,
-    Translation,
+    BlockCache, DirtyPages, Dispatcher, Entry, Epoch, FastMem, Frontend, LoadPlan, PAGE_MASK, Stop,
+    StoreLog, Translation,
 };
 
 use super::Config;
@@ -315,6 +337,25 @@ impl Jit {
     pub(super) fn stats(&self) -> (u64, u64) {
         let s = self.disp.stats();
         (s.blocks, s.compiled)
+    }
+
+    /// Whether this engine can use a [`mmu::Tlb`] shadow.
+    ///
+    /// Only the host code generator inlines a load ([`FastMem`]); the portable
+    /// backend calls [`IrHost::load`] for every access, so a shadow attached
+    /// for it would be filled and never read. The shadow is not free — a fill
+    /// probes the flat view — so it is asked for by the one engine that reads
+    /// it, and a `jit-host` that fell back to the portable backend because the
+    /// host is not x86-64 Linux does not ask.
+    pub(super) fn wants_shadow(&self) -> bool {
+        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        {
+            self.disp.backend().is_some()
+        }
+        #[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
+        {
+            false
+        }
     }
 }
 
@@ -1002,21 +1043,56 @@ impl StoreLog for Host<'_, '_> {
     }
 }
 
-/// No inlined fast path, deliberately.
+/// The inlined fast path, and exactly what a plan may cover.
 ///
 /// A backend that inlines a load skips [`IrHost::load`] entirely — and with it
-/// this hart's page-table walk, its PMP check, and the ticks both spend. The
-/// only world in which those are free is one with translation off and no PMP
-/// entry that could refuse, and a plan whose validity is decided per access is
-/// not a plan. `jit::fast`'s own documentation says not publishing one is the
-/// honest default; the price is a call per guest access, which is what the
-/// interpreter pays anyway.
-impl FastMem for Host<'_, '_> {}
+/// this hart's page-table walk, its PMP check, and the ticks both spend. That
+/// used to be the argument for publishing nothing: a walk cannot be skipped
+/// per access, so a plan whose validity is decided per access is not a plan.
+///
+/// **The plan is not per access. It is per page, and it is decided by the
+/// table the walk already filled.** `mmu::Tlb` gained a shadow
+/// ([`mmu::Tlb::attach_shadow`]) which `Exec::translate` writes in the same
+/// breath as its own entry, at the same index, for the same virtual page. So a
+/// shadow entry exists only where this hart's TLB *also* holds the
+/// translation, and an inlined load that hits one is a load whose walk had
+/// already been performed and charged for — which is why the whole cost it
+/// still owes is the one tick [`FastMem::note_fast_load`] charges.
+///
+/// The three things the compiled path cannot do are therefore done once, at
+/// fill time, rather than never:
+///
+/// * the **walk**, by the hart, on the miss that filled the entry — and the
+///   entry dies with the hart's own, because both are written by the same
+///   eviction and both carry `Csrs::translation_gen`;
+/// * **PMP**, whose answer must be uniform over the whole page before the page
+///   may be cached at all (`mmu::pmp_page_uniform`) — a page it refuses is
+///   remembered as slow, and a page it answers unevenly over is never cached;
+/// * the **fault**, which cannot arise: an entry exists only over plain
+///   little-endian RAM covering its whole page, with the permissions the slow
+///   path checks and no constraint left to apply (`jit::Tlb::fill`).
+///
+/// Everything a plan does not cover still calls [`IrHost::load`] and gets this
+/// hart's answer — a store, a fetch, a misaligned access, an access to a
+/// device, a page whose translation has been evicted, and every access at all
+/// on a build without a shadow.
+impl FastMem for Host<'_, '_> {
+    fn load_plan(&mut self) -> Option<LoadPlan> {
+        self.exec.load_plan()
+    }
+
+    fn note_fast_load(&mut self) {
+        // `Exec::read_once`, with the translation known cached and the access
+        // itself already done: one bus access is one cycle, and the walk was
+        // charged when the entry was filled.
+        self.exec.charge();
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::space::{RamStore, Region};
+    use crate::core::space::{Mapping, RamStore, Region};
     use crate::cpu::riscv::{Engine, Hart};
 
     /// How much RAM a test hart gets, at address zero.
@@ -1340,6 +1416,61 @@ mod tests {
             }
             b.state.pc = 0x1000 - (lift::MAX_INSNS as u64) * 4;
             b
+        }
+
+        /// The same bench with the host code generator, and with the shadow
+        /// the inlined fast path probes.
+        ///
+        /// Both, together, because they are one mechanism: the portable
+        /// backend never reads a shadow and the code generator can only reach
+        /// one that this hart's own TLB is keeping in lockstep.
+        fn with_host_code(mut self) -> Bench {
+            self.jit = Jit::new(true);
+            if self.jit.wants_shadow() {
+                self.tlb.attach_shadow(Arc::clone(&self.space));
+            }
+            self
+        }
+
+        /// What the shadow has been asked to do.
+        ///
+        /// The counters, not the timing: a fixture whose two pages evict each
+        /// other never serves a load inline at all, so `fast_loads` cannot say
+        /// whether it reached the arm it was built for. These can.
+        fn shadow_stats(&mut self) -> crate::jit::TlbStats {
+            self.tlb
+                .shadow_mut()
+                .map_or_else(Default::default, |s| s.stats())
+        }
+
+        /// How many guest loads the compiled path served without a call.
+        ///
+        /// Zero on a host with no code generator, which is why every test that
+        /// asserts a *positive* count is gated on having one: a fixture that
+        /// silently reaches nothing is worse than no fixture.
+        fn fast_loads(&self) -> u64 {
+            #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+            {
+                self.jit
+                    .disp
+                    .backend()
+                    .map_or(0, |engine| engine.stats().fast_loads)
+            }
+            #[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
+            {
+                0
+            }
+        }
+
+        /// Map one more virtual page, at `vpn`, onto physical `phys`.
+        ///
+        /// [`Bench::paged`]'s tables are three levels with the leaf table at
+        /// 0x3000, and every `vpn` below 512 indexes it directly — so a second
+        /// page is one write.
+        fn map_page(&self, vpn: u64, phys: u64) {
+            use super::super::mmu::pte;
+            let leaf = pte::V | pte::R | pte::W | pte::X | pte::A | pte::D;
+            self.poke(0x3000 + vpn * 8, ((phys >> 12) << 10) | leaf);
         }
 
         /// Run `engine` until the guest takes a trap, and say what it cost.
@@ -1676,6 +1807,59 @@ mod tests {
     }
 
     #[test]
+    fn a_remap_under_a_warm_shadow_is_not_served_from_the_old_store() {
+        // The one path on which a stale shadow entry is *wrong bytes* rather
+        // than a wrong tick, and the reason the plan is resynchronised at
+        // every block boundary rather than only where the table is filled.
+        //
+        // A retopology does not flush the hart's own TLB — nothing about a
+        // guest translation changed — so the load after it **hits** that TLB
+        // and never reaches `refresh_shadow`, which is where the other sync
+        // lives. If the plan a block publishes were not synchronised too, the
+        // inlined probe would match an entry whose host address still points
+        // into the store that used to be there. The old store is still
+        // allocated, so there is no fault to notice: the guest simply reads
+        // the bytes it read before the remap.
+        // The data lives in a region of its own, so the remap can replace what
+        // the load reads without also replacing the code that reads it.
+        let mut b = Bench::new(&REMOTE_LOAD).with_host_code();
+        let first_store = Arc::new(RamStore::new(0x1000));
+        for i in 0..8u64 {
+            first_store.write_u8(i, 0x11).expect("in range");
+        }
+        let id = b
+            .space
+            .topology()
+            .map(Region::ram("data", first_store), DATA)
+            .expect("that address is free");
+        for _ in 0..8 {
+            b.advance(10_000);
+        }
+        assert_eq!(
+            b.state.x[28], 0x1111_1111_1111_1111,
+            "the fixture never read the region it is about to replace"
+        );
+        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        assert!(b.fast_loads() > 0, "the shadow was never warm");
+        // Put different bytes behind the very page the shadow has cached.
+        let replacement = Arc::new(RamStore::new(0x1000));
+        for i in 0..8u64 {
+            replacement.write_u8(i, 0xa5).expect("in range");
+        }
+        b.space
+            .topology()
+            .replace(id, Mapping::new(Region::ram("swapped", replacement), DATA))
+            .expect("the same span, a different store");
+        for _ in 0..8 {
+            b.advance(10_000);
+        }
+        assert_eq!(
+            b.state.x[28], 0xa5a5_a5a5_a5a5_a5a5,
+            "the compiled hart read the store the remap replaced"
+        );
+    }
+
+    #[test]
     fn the_safe_point_bound_is_the_number_the_documentation_states() {
         // `CHAIN` is a tunable and this is not a second opinion about its
         // value: it is the claim that goes with it. `ROADMAP.md` §4.7's flag
@@ -1827,5 +2011,366 @@ mod tests {
         assert_eq!(costs.get(0x1002, 7), None, "a different pc");
         costs.clear();
         assert_eq!(costs.get(0x1000, 7), None);
+    }
+
+    // -----------------------------------------------------------------
+    // The inlined fast path
+    // -----------------------------------------------------------------
+
+    /// `x7 = 0`, then a load from virtual zero in a tight loop.
+    ///
+    /// Virtual page zero is the page [`Bench::paged`] maps, so the load reads
+    /// the code it is running — which is exactly what makes this a load of
+    /// plain RAM through a translation the hart's TLB holds. No store, so the
+    /// block never invalidates itself and the loop is a trace.
+    const PAGED_LOAD: [u32; 3] = [
+        0x0000_0393, // addi x7, x0, 0
+        0x0003_be03, // ld   x28, 0(x7)   ; the loop starts here
+        0xffdf_f06f, // jal  x0, -4
+    ];
+
+    /// Two loads a megabyte apart, so they collide in one TLB slot.
+    ///
+    /// 256 pages is [`mmu::TLB_ENTRIES`], and both tables index a page by the
+    /// same low bits — so each load evicts the other's translation and every
+    /// one of them walks. That is the fixture the whole lockstep argument
+    /// turns on: a shadow that did *not* evict in step with the hart's own TLB
+    /// would keep both entries, serve both loads inline, and charge one tick
+    /// where the interpreter charges a walk as well.
+    const PAGED_COLLIDE: [u32; 5] = [
+        0x0000_0393, // addi x7, x0, 0
+        0x0010_0437, // lui  x8, 0x100    ; x8 = 0x100000, vpn 256
+        0x0003_be03, // ld   x28, 0(x7)   ; the loop starts here
+        0x0004_3e83, // ld   x29, 0(x8)
+        0xff9f_f06f, // jal  x0, -8
+    ];
+
+    /// Run `program` on a paged hart under both engines and assert they agree
+    /// on every column a guest can see — the cycle count above all, because
+    /// that is the one an inlined load is most able to get wrong.
+    ///
+    /// Returns the compiled bench, so a caller can go on to ask whether the
+    /// path it meant to test was reached at all.
+    fn paged_engines_agree(fixture: fn() -> Bench, calls: usize) -> Bench {
+        let mut jit = fixture().with_host_code();
+        for _ in 0..calls {
+            jit.advance(10_000);
+        }
+        assert!(jit.state.csrs.minstret > 0, "the compiled hart ran nothing");
+        let mut interp = fixture();
+        while interp.state.csrs.minstret < jit.state.csrs.minstret {
+            interp.step();
+        }
+        assert_eq!(
+            interp.state.csrs.minstret, jit.state.csrs.minstret,
+            "the two harts retired different instructions"
+        );
+        assert_eq!(
+            interp.state.cycles, jit.state.cycles,
+            "the compiled hart charged a different number of bus cycles"
+        );
+        assert_eq!(interp.state.x, jit.state.x, "registers");
+        assert_eq!(interp.state.pc, jit.state.pc, "pc");
+        jit
+    }
+
+    /// [`PAGED_COLLIDE`] with its second page mapped, a megabyte up.
+    fn paged_collide() -> Bench {
+        let b = Bench::paged(&PAGED_COLLIDE);
+        b.map_page(mmu::TLB_ENTRIES as u64, 0x5000);
+        b
+    }
+
+    /// [`PAGED_LOAD`] on the page [`Bench::paged`] already maps.
+    fn paged_load() -> Bench {
+        Bench::paged(&PAGED_LOAD)
+    }
+
+    /// [`paged_collide`] with PMP made non-uniform over **one** of its two
+    /// pages.
+    ///
+    /// The two pages share a TLB slot, so each load evicts the other's
+    /// translation; one of them can be cached and the other cannot. That is
+    /// the combination a page the shadow *refuses* has to survive: refusing is
+    /// not "leave the slot alone", it is "write the slot, saying no". A
+    /// refusal that skipped the write would leave the **other** page's entry
+    /// sitting in it — live, matching its own tag, and standing for a
+    /// translation this hart's TLB has just evicted.
+    ///
+    /// Entry 0 lies strictly inside physical 0x4000 and grants everything the
+    /// guest actually does, so nothing traps and nothing changes except which
+    /// of the two pages may be served inline.
+    fn paged_collide_split_pmp() -> Bench {
+        use super::super::csr::{PMP_ENTRIES, Priv};
+        let mut b = paged_collide();
+        b.cfg.pmp_count = PMP_ENTRIES;
+        b.state = State::new(&b.cfg);
+        b.state.csrs.satp = (8 << 60) | (0x1000 >> 12);
+        b.state.csrs.priv_mode = Priv::Supervisor;
+        b.state.pc = 0;
+        b.state.csrs.pmpaddr[0] = (0x4010u64 >> 2) | 1; // 16 bytes at 0x4010
+        b.state.csrs.pmpcfg[0] = 0b0001_1111; // NAPOT, R, W and X
+        b.state.csrs.pmpaddr[1] = u64::MAX >> 10; // everything else
+        b.state.csrs.pmpcfg[1] = 0b0001_1111; // NAPOT, R, W and X
+        b
+    }
+
+    /// `x7 = 0`, then a load from a fixed address in a tight loop, in **bare
+    /// mode** — no `satp`, no walk, no page table.
+    ///
+    /// A bare hart reaches [`Exec::refresh_shadow`] down its other arm: the
+    /// hart's own TLB is not consulted at all, so there is no eviction to be
+    /// in lockstep with and the shadow is filled on demand instead. Nothing
+    /// tested that arm until a mutant that disabled it walked out.
+    const BARE_LOAD: [u32; 3] = [
+        0x0000_0393, // addi x7, x0, 0
+        0x0003_be03, // ld   x28, 0(x7)   ; the loop starts here
+        0xffdf_f06f, // jal  x0, -4
+    ];
+
+    /// Where [`REMOTE_LOAD`] reads from: a region of its own, clear of the
+    /// code, so a remap can replace one without the other.
+    const DATA: u64 = 0x2_0000;
+
+    /// [`BARE_LOAD`], reading from [`DATA`] instead of from its own code page.
+    const REMOTE_LOAD: [u32; 3] = [
+        0x0002_03b7, // lui  x7, 0x20      ; x7 = 0x20000
+        0x0003_be03, // ld   x28, 0(x7)    ; the loop starts here
+        0xffdf_f06f, // jal  x0, -4
+    ];
+
+    #[test]
+    fn a_bare_load_is_served_inline_too() {
+        // Bare mode is the *easy* half of the argument — one bus cycle whether
+        // the resolution was cached or not, because there is no walk to skip —
+        // and it was the half with no test. Both that it happens and that it
+        // costs the same are asserted, because a fill on the wrong arm shows
+        // up only as a fast path that quietly never fires.
+        let mut jit = Bench::new(&BARE_LOAD).with_host_code();
+        for _ in 0..8 {
+            jit.advance(10_000);
+        }
+        assert!(jit.state.csrs.minstret > 0, "the compiled hart ran nothing");
+        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        assert!(
+            jit.fast_loads() > 0,
+            "a bare hart never served a load inline"
+        );
+        let mut interp = Bench::new(&BARE_LOAD);
+        while interp.state.csrs.minstret < jit.state.csrs.minstret {
+            interp.step();
+        }
+        assert_eq!(interp.state.csrs.minstret, jit.state.csrs.minstret);
+        assert_eq!(
+            interp.state.cycles, jit.state.cycles,
+            "the compiled hart charged a different number of bus cycles"
+        );
+        assert_eq!(interp.state.x, jit.state.x, "registers");
+        // And the page really was resolved once rather than on every access:
+        // the bare arm asks the flat view only when the slot is empty. Only
+        // where there is a shadow at all — a build or a host without a code
+        // generator attaches none, and a table nothing reads is a cost with no
+        // benefit (`Jit::wants_shadow`).
+        let stats = jit.shadow_stats();
+        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        {
+            assert!(stats.fills > 0, "nothing was ever cached");
+            assert!(
+                stats.fills < jit.state.csrs.minstret,
+                "the bare arm re-resolved the page on every access"
+            );
+        }
+        let _ = stats;
+    }
+
+    /// A machine-mode hart whose **loads** translate and whose fetches do not.
+    ///
+    /// `MPRV` with `MPP = S` is how firmware reads a supervisor's memory, and
+    /// it is the one configuration in which `effective_priv` gives a different
+    /// answer for a fetch than for a load. The distinction is not cosmetic:
+    /// the plan a block publishes and the tag a fill writes have to agree
+    /// about *which* answer, or a load under `MPRV` probes with the tag a
+    /// plain machine-mode load left behind — same address, no translation,
+    /// different physical page, no fault. Wrong bytes, silently.
+    ///
+    /// The program loads from virtual zero, which S-mode maps to physical
+    /// 0x4000 while machine mode would read the reset vector at zero. So the
+    /// two answers are distinguishable in the register file, not merely in the
+    /// cycle count.
+    fn mprv_bench() -> Bench {
+        use super::super::csr::{Priv, status};
+        let mut b = Bench::paged(&PAGED_LOAD);
+        // Machine mode, but MPRV is set and MPP is Supervisor, so a *load*
+        // translates through `satp` and a fetch does not.
+        b.state.csrs.priv_mode = Priv::Machine;
+        b.state.csrs.mstatus |= status::MPRV;
+        b.state.csrs.mstatus = (b.state.csrs.mstatus & !status::MPP)
+            | ((Priv::Supervisor.bits()) << status::MPP_SHIFT);
+        // The code has to be fetched *untranslated*, so it goes at physical
+        // zero as well as at 0x4000 where the page table points.
+        for (i, word) in PAGED_LOAD.iter().enumerate() {
+            b.poke((i as u64) * 4, u64::from(*word));
+        }
+        b.state.pc = 0;
+        b
+    }
+
+    #[test]
+    fn a_load_under_mprv_is_tagged_with_the_privilege_it_actually_translates_in() {
+        let mut jit = mprv_bench().with_host_code();
+        for _ in 0..8 {
+            jit.advance(10_000);
+        }
+        assert!(jit.state.csrs.minstret > 0, "the compiled hart ran nothing");
+        let mut interp = mprv_bench();
+        while interp.state.csrs.minstret < jit.state.csrs.minstret {
+            interp.step();
+        }
+        assert_eq!(interp.state.csrs.minstret, jit.state.csrs.minstret);
+        assert_eq!(
+            interp.state.cycles, jit.state.cycles,
+            "the compiled hart charged a different number of bus cycles"
+        );
+        assert_eq!(
+            interp.state.x, jit.state.x,
+            "the compiled hart read different bytes"
+        );
+        // The fixture is only a test of the tag if the load really did
+        // translate: virtual zero resolves to physical 0x4000, whose first
+        // word is the program, not the reset vector at physical zero.
+        assert_eq!(
+            jit.state.x[28] & 0xffff_ffff,
+            u64::from(PAGED_LOAD[0]),
+            "the load did not go through the page table"
+        );
+        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        assert!(
+            jit.fast_loads() > 0,
+            "the fixture never reached the inlined path"
+        );
+    }
+
+    #[test]
+    fn a_paged_load_is_served_inline_and_costs_what_the_interpreter_charged() {
+        let jit = paged_engines_agree(paged_load, 8);
+        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        assert!(
+            jit.fast_loads() > 0,
+            "the fixture never reached the path it exists to test"
+        );
+        let _ = jit;
+    }
+
+    #[test]
+    fn a_translation_the_hart_evicted_is_not_served_inline() {
+        // Two pages one slot apart. The agreement is the assertion — if the
+        // shadow outlived the hart's own entry, the compiled hart would charge
+        // one tick for a load the interpreter walks for, and `cycles` would
+        // part company.
+        let jit = paged_engines_agree(paged_collide, 8);
+        assert_ne!(jit.state.x[28], 0, "the first load read the code page");
+        assert_eq!(jit.state.x[8], 0x10_0000, "the second page was addressed");
+    }
+
+    /// [`Bench::paged`] with PMP on and an entry lying *wholly inside* the
+    /// page the load reads.
+    ///
+    /// Everything the guest does is still permitted — the point is that the
+    /// answer is reached through two different entries depending on where in
+    /// the page you ask, and the compiled path cannot see which.
+    fn paged_with_split_pmp() -> Bench {
+        use super::super::csr::{PMP_ENTRIES, Priv};
+        let mut b = Bench::paged(&PAGED_LOAD);
+        b.cfg.pmp_count = PMP_ENTRIES;
+        b.state = State::new(&b.cfg);
+        b.state.csrs.satp = (8 << 60) | (0x1000 >> 12);
+        b.state.csrs.priv_mode = Priv::Supervisor;
+        b.state.pc = 0;
+        // Strictly inside the page, touching neither end of it — the case
+        // `pmp_allows` asked about the whole page cannot see.
+        b.state.csrs.pmpaddr[0] = (0x4010u64 >> 2) | 1; // 16 bytes at 0x4010
+        b.state.csrs.pmpcfg[0] = 0b0001_1101; // NAPOT, R and X
+        b.state.csrs.pmpaddr[1] = u64::MAX >> 10; // everything else
+        b.state.csrs.pmpcfg[1] = 0b0001_1111; // NAPOT, R, W and X
+        b
+    }
+
+    #[test]
+    fn a_page_the_shadow_refuses_still_evicts_what_shared_its_slot() {
+        // One page cacheable, one not, both in the same slot. If a refusal
+        // left the slot as it found it, the cacheable page's entry would
+        // outlive the translation it stands for and the compiled hart would
+        // serve a load the interpreter walks for. The cycle counts are the
+        // assertion.
+        let mut jit = paged_engines_agree(paged_collide_split_pmp, 8);
+        assert_eq!(jit.state.csrs.mcause, 0, "the guest trapped");
+        // And the fixture really is the mixed case, which the timing cannot
+        // show: these two pages evict each other every iteration, so *neither*
+        // is ever served inline and `fast_loads` is zero either way. What
+        // matters is that both arms of `refresh_shadow` ran — some page was
+        // cached, some page was refused — because a refusal that never
+        // happened cannot fail to evict.
+        let stats = jit.shadow_stats();
+        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        {
+            assert!(stats.refused > 0, "no page was ever refused");
+            assert!(
+                stats.fills > stats.refused,
+                "no page was ever cacheable, so nothing was refused *against*"
+            );
+        }
+        let _ = stats;
+    }
+
+    #[test]
+    fn a_page_pmp_does_not_answer_uniformly_over_is_never_served_inline() {
+        let mut jit = paged_with_split_pmp().with_host_code();
+        for _ in 0..8 {
+            jit.advance(10_000);
+        }
+        assert!(jit.state.csrs.minstret > 0, "the compiled hart ran nothing");
+        assert_eq!(
+            jit.fast_loads(),
+            0,
+            "a page PMP is not uniform over must never be served inline"
+        );
+        // And it is a refusal to go fast, not a refusal to run: the guest took
+        // no trap and reached the same state a purely interpreted one would.
+        assert_eq!(jit.state.csrs.mcause, 0, "the guest trapped");
+        let mut interp = paged_with_split_pmp();
+        while interp.state.csrs.minstret < jit.state.csrs.minstret {
+            interp.step();
+        }
+        assert_eq!(interp.state.csrs.minstret, jit.state.csrs.minstret);
+        assert_eq!(interp.state.cycles, jit.state.cycles);
+        assert_eq!(interp.state.x, jit.state.x);
+    }
+
+    #[test]
+    fn a_hart_without_a_code_generator_never_grows_a_shadow() {
+        // The shadow is not free — a fill probes the flat view — and only the
+        // host code generator reads one. The portable backend must not pay for
+        // a table nothing looks at.
+        let plain = hart(Engine::Jit, &LOOP);
+        for _ in 0..8 {
+            plain.run_budget(1000);
+        }
+        assert!(!plain.has_shadow(), "`jit` asked for a shadow");
+        let host = hart(Engine::JitHost, &LOOP);
+        for _ in 0..8 {
+            host.run_budget(1000);
+        }
+        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        assert!(host.has_shadow(), "`jit-host` did not ask for one");
+        #[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
+        assert!(
+            !host.has_shadow(),
+            "no backend on this host, so nothing reads a shadow"
+        );
+        let interp = hart(Engine::Interp, &LOOP);
+        for _ in 0..8 {
+            interp.run_budget(1000);
+        }
+        assert!(!interp.has_shadow(), "the oracle asked for a shadow");
     }
 }
