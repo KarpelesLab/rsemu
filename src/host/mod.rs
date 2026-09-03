@@ -13,6 +13,7 @@
 //! | [`audio`] | no | the audio seam: a guest's samples, converted and rate-matched |
 //! | [`input`] | no | the input seam: keys and pointer, at a virtual instant |
 //! | `clock` | yes | the host's monotonic clock, which only the rate controller reads |
+//! | [`signal`] | yes | `SIGINT`, `SIGTERM` and `SIGHUP`, turned into a flag a run loop reads |
 //! | `listen` | yes | where a remote frontend binds, and the loopback-by-default rule |
 //! | `gdb` | yes | the GDB remote serial protocol over TCP (§8) |
 //! | `vnc` | yes | the RFB protocol over TCP: a screen and a keyboard (§8) |
@@ -38,6 +39,10 @@ pub mod clock;
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub mod listen;
+
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+pub mod signal;
 
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]

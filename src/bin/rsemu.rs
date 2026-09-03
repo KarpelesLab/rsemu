@@ -315,6 +315,12 @@ struct RunArgs {
 }
 
 fn run(args: &[String]) -> ExitCode {
+    // Before anything is opened, so that every path from here to `finish` is
+    // one a Ctrl-C ends *through* rather than *around*. `Unavailable` is not an
+    // error: a host with no facility for it keeps the disposition it always
+    // had, which is what happened before this existed.
+    let _ = rsemu::host::signal::arm();
+
     let parsed = match parse_run(args) {
         Ok(a) => a,
         Err(e) => {
@@ -656,6 +662,41 @@ fn check_outputs(args: &RunArgs, display: bool, audio: bool) -> Result<(), Strin
         ));
     }
     Ok(())
+}
+
+/// Whether the host has asked this run to stop — and, if it has, the
+/// machine's own request that it do so.
+///
+/// **This is the main-path half of the signal path.** `host::signal`'s handler
+/// stores a signal number and returns; every decision is here, at a point one
+/// of the four run loops was already going to pause at. Nothing in this
+/// function runs in async-signal context.
+///
+/// What it does with the answer is
+/// [`SafePoint::request`](rsemu::core::sched::SafePoint::request), which is
+/// `ROADMAP.md` §4.7's own call: a signal *asks* the machine to stop through
+/// the mechanism that already exists — a generation bump and a world exit flag
+/// every runnable checks at its next block boundary — rather than performing a
+/// stop of its own. A stop a wasm build could not express is not a stop this
+/// binary may invent.
+///
+/// The request is made only where the run ends immediately afterwards. A
+/// machine that carried on would have seen a raised exit flag and a bumped
+/// generation, and what a deterministic run hashes to is not something a host
+/// signal is allowed to change.
+fn interrupted(machine: &Machine) -> bool {
+    let Some(signal) = rsemu::host::signal::caught() else {
+        return false;
+    };
+    // Once, however many loops ask: the four of them each ask once, but a
+    // predicate is a predicate and one that printed per call would be noise.
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        // A leading return in case a raw-mode console left the cursor mid-line.
+        eprintln!("\rrsemu: {signal} — stopping, and flushing what the guest wrote");
+    }
+    machine.safe_point().request();
+    true
 }
 
 /// End a run: push what the guest wrote out to the host, and report.
@@ -1038,26 +1079,35 @@ fn open_recording(
 }
 
 /// Run the machine for `span`, draining `audio` as it goes if anything is
-/// listening.
+/// listening, and stopping early if the host asks.
 ///
-/// One `run_for` when nobody is: a run with no recording is driven exactly as it
-/// always was, so this cannot change what an ordinary `rsemu run` does.
+/// **Sliced whether or not anything is recording**, which it did not used to
+/// be: the no-audio path was one `run_for` for the whole span, and a
+/// `--for 8h` inside a single call has no boundary at which a `SIGINT` could
+/// be noticed. `Machine::run_for` is additive (§11.6) — the same span taken in
+/// pieces reaches the same state, which `tests/run_for_additive.rs` asserts and
+/// `tests/cli_record_audio.rs` asserts again by hashing this very loop against
+/// an unsliced run — so cutting it costs the run nothing and buys it an exit.
 fn run_headless(
     machine: &mut Machine,
     span: GlobalTime,
-    audio: Option<&mut rsemu::host::audio::AudioStream>,
+    mut audio: Option<&mut rsemu::host::audio::AudioStream>,
 ) -> rsemu::Result<()> {
-    let Some(stream) = audio else {
-        return machine.run_for(span);
-    };
     let end = machine.now().saturating_add(span);
     while machine.now() < end {
+        if interrupted(machine) {
+            break;
+        }
         let next = end.min(machine.now().saturating_add(DRAIN_SLICE));
         machine.run_until(next)?;
-        stream.pull();
+        if let Some(stream) = audio.as_mut() {
+            stream.pull();
+        }
     }
     // Whatever the last slice left in the ring.
-    stream.pull();
+    if let Some(stream) = audio.as_mut() {
+        stream.pull();
+    }
     Ok(())
 }
 
@@ -1197,7 +1247,13 @@ fn debug_session(
     }
 
     let terminal = port.map(|_| Terminal::open());
-    let status = match rsemu::host::gdb::serve(machine, &mut server, |_| {
+    let status = match rsemu::host::gdb::serve(machine, &mut server, |m| {
+        // A debugger owns when the machine advances, but not whether the
+        // process may be asked to stop: `SIGTERM` ends a session that no
+        // client is driving just as it ends a free-running one.
+        if interrupted(m) {
+            return false;
+        }
         // Once a turn, which under a client that has said `continue` is once
         // per free-running slice — ten milliseconds of virtual time, the same
         // bound `DRAIN_SLICE` is chosen for. A halted machine produces no
@@ -1322,7 +1378,11 @@ fn interact(
     let mut idle = 0u32;
 
     let status = loop {
-        if term.interrupted() {
+        // Two mechanisms for one keystroke, and they cover disjoint cases: in
+        // raw mode the kernel hands Ctrl-C to the guest as a byte and the
+        // terminal eats it, and in cooked mode it is a `SIGINT` the terminal
+        // never sees. `SIGTERM` and `SIGHUP` only ever arrive the second way.
+        if term.interrupted() || interrupted(machine) {
             break ExitCode::SUCCESS;
         }
         if deadline.is_some_and(|d| machine.now() >= d) {
@@ -1499,7 +1559,7 @@ fn vnc_session(
         .span_given
         .then(|| machine.now().saturating_add(args.span));
     let status = session.run(machine, |m| {
-        !term.interrupted() && !deadline.is_some_and(|d| m.now() >= d)
+        !term.interrupted() && !interrupted(m) && !deadline.is_some_and(|d| m.now() >= d)
     });
     drop(term);
 
