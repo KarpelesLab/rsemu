@@ -89,6 +89,11 @@ fuzz_target!(|data: &[u8]| {
         Flags::Elide
     };
     let cached = policies & 0x10 != 0;
+    // The fourth world: `CR0.PG` set, every linear address naming a different
+    // physical page, the memory path the interpreter's own, and the block keyed
+    // on the page its entry translation resolved to. `Case::paged` forces the
+    // part and the store policy that world requires.
+    let paged = policies & 0x20 != 0;
 
     let available = (data.len() - HEADER) / STRIDE;
     let want = 1 + usize::from(data[1]) % MAX_INSNS;
@@ -114,7 +119,8 @@ fuzz_target!(|data: &[u8]| {
     // program stops cleanly instead of executing the data window.
     program.push(0xf4);
 
-    let mut case = Case::seeded(program).with_shape(shape).with_smc(smc).with_flags(flags);
+    let seeded = Case::seeded(program).with_shape(shape).with_smc(smc).with_flags(flags);
+    let mut case = if paged { seeded.paged() } else { seeded };
     // A third of the register file comes from the input, so a generated program
     // meets values it did not compute — the boundary conditions of every flag
     // live at the edges of a register, not in the middle.
