@@ -1264,7 +1264,7 @@ impl Lifter {
 }
 
 #[cfg(feature = "jit")]
-impl Frontend for Lifter {
+impl<H: ?Sized> Frontend<H> for Lifter {
     fn epoch(&mut self) -> Epoch {
         // Nothing in the lifted subset can change the world — no segment load,
         // no `CR0` write, no `LGDT` — so the world generation never moves and

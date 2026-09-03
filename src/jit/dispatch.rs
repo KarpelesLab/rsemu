@@ -9,10 +9,22 @@
 //!
 //! Nothing here knows what a RISC-V is. A guest supplies a [`Frontend`] —
 //! which world it is in ([`Frontend::key`], [`Frontend::epoch`]), how to lift
-//! one block ([`Frontend::translate`]), and which slot the guest PC lands in
-//! at a block exit ([`Frontend::pc_slot`]) — and an
-//! [`IrHost`](crate::ir::IrHost) that also implements [`StoreLog`], so guest
-//! writes can be matched against cached translations.
+//! one block ([`Frontend::translate`]), what a block owes before it runs
+//! ([`Frontend::enter`]), and which slot the guest PC lands in at a block exit
+//! ([`Frontend::pc_slot`]) — and an [`IrHost`](crate::ir::IrHost) that also
+//! implements [`StoreLog`], so guest writes can be matched against cached
+//! translations.
+//!
+//! [`Frontend::enter`] is the one that makes chaining reachable, and it is
+//! worth saying why a *cache* needed a hook at all. Following a patched exit
+//! skips the hash lookup, which was never the expensive part; what it really
+//! skips is everything a caller does *between* two `Dispatcher::run` calls.
+//! But a guest whose instruction fetch translates owes that translation on
+//! every block execution — a cached block that skipped it would cost fewer
+//! ticks than the uncached one it replaced — so before this hook existed the
+//! only honest budget was one block, and `DispatchStats::chained` was zero in
+//! every run of a real guest. Now it is called once per block iteration, the
+//! chained ones included.
 //!
 //! # Why self-modifying code is reported rather than intercepted
 //!
@@ -86,13 +98,67 @@ pub struct Translation {
     pub insns: usize,
 }
 
+/// What a frontend says when a block boundary is reached.
+///
+/// The answer to [`Frontend::enter`]. `Leave` is not an error and not a fault:
+/// it is a guest whose *next* block should not run — the instruction at that
+/// PC is outside the lifted subset, or the block's worst case does not fit
+/// what is left of the caller's budget, or entering it trapped. The dispatcher
+/// stops with [`Stop::Declined`], and what that means is the frontend's own
+/// business; for a CPU core it means its own interpreter takes over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Entry {
+    /// Execute the block at this PC.
+    Ready,
+    /// Do not. Stop the run here, with the guest at this PC.
+    Leave,
+}
+
 /// What a dispatcher needs from a guest.
-pub trait Frontend {
+///
+/// Generic over the host, and *only* so that [`Frontend::enter`] can be handed
+/// it. Entering a block is a hart action — it translates the entry fetch, it
+/// may walk a page table, it charges for the walk and it can trap — and the
+/// state all four of those need belongs to the [`IrHost`], not to the lifter.
+/// Every other method ignores the parameter, which is why a frontend with
+/// nothing to do at a boundary reads `impl<H> Frontend<H> for …`.
+pub trait Frontend<H: ?Sized> {
     /// The counters this guest's translations are stale against.
     ///
-    /// Read at the start of every [`Dispatcher::run`], so a stop-the-world
-    /// retopology is observed at a block boundary rather than after it.
+    /// Read at **every** block boundary, not once per [`Dispatcher::run`], so
+    /// a stop-the-world retopology is observed before the next block rather
+    /// than after the chain that followed it. It is therefore on the hot path:
+    /// answer it with an atomic load, not with a lock or a walk.
     fn epoch(&mut self) -> Epoch;
+
+    /// Everything a block owes *before* it runs, on every execution.
+    ///
+    /// Called once per block iteration — including the chained ones, which is
+    /// the whole reason it exists. A translated block skips its own entry
+    /// fetch, but a guest whose fetch *translates* still owes that translation
+    /// every time the block runs: a cached block that skipped it would cost
+    /// fewer ticks than the uncached one it replaced, and the two engines
+    /// would stop agreeing on the cycle counter (`ROADMAP.md` §0). Without a
+    /// hook here a dispatcher can only be driven one block at a time, which is
+    /// what gave up §9's second mechanism — `chained: 0` in every run of a
+    /// real guest, on the one machine the JIT exists for.
+    ///
+    /// It runs **after** the budget and safe-point checks and **before**
+    /// [`Frontend::key`], so a frontend may compute the key here out of what
+    /// the entry resolved to. The RISC-V engine does exactly that: a block is
+    /// keyed on the physical page its entry translation just produced.
+    ///
+    /// The default is [`Entry::Ready`]. A guest with nothing to do at a
+    /// boundary says so by not implementing this.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the frontend says. A dispatcher does not try to recover — an
+    /// ordinary guest condition is [`Entry::Leave`] rather than an error.
+    fn enter(&mut self, pc: u64, host: &mut H) -> Result<Entry> {
+        let _ = (pc, host);
+        Ok(Entry::Ready)
+    }
 
     /// The rest of the cache key beside the guest PC — the value the frontend
     /// puts in [`Block::key`](crate::ir::Block::key).
@@ -193,6 +259,9 @@ pub enum Stop {
         /// The guest PC.
         pc: u64,
     },
+    /// [`Frontend::enter`] answered [`Entry::Leave`]: the block at
+    /// [`Run::pc`] was not entered, and why is the frontend's own business.
+    Declined,
 }
 
 /// What a run did.
@@ -354,12 +423,9 @@ impl Dispatcher {
         budget: usize,
     ) -> Result<Run>
     where
-        F: Frontend + ?Sized,
+        F: Frontend<H> + ?Sized,
         H: IrHost + StoreLog + FastMem,
     {
-        if self.cache.sync(front.epoch()) {
-            self.stats.resyncs += 1;
-        }
         let pc_slot = front.pc_slot();
         let mut from: Option<BlockId> = None;
         let mut blocks = 0usize;
@@ -371,6 +437,26 @@ impl Dispatcher {
             }
             if self.exit.as_ref().is_some_and(ExitFlag::raised) {
                 break Stop::Exit;
+            }
+            // Per block, not per run. A guest store can remap an address
+            // space, a store ends its block, and a chained successor would
+            // otherwise be served out of a cache lifted through the topology
+            // that store replaced — a window that did not exist while a run
+            // was one block long. The predecessor goes with it: a flush
+            // retires every id, so following a link from before one would
+            // reach whatever took the slot.
+            if self.cache.sync(front.epoch()) {
+                self.stats.resyncs += 1;
+                from = None;
+            }
+            // What this block owes before it exists as far as this loop is
+            // concerned: the entry translation, and whatever else the guest
+            // decides at a boundary. It is inside the loop rather than before
+            // it because a *chained* successor owes exactly the same thing,
+            // and a dispatcher that only charged the first block would make a
+            // chain cheaper than the blocks it replaced.
+            if front.enter(pc, host)? == Entry::Leave {
+                break Stop::Declined;
             }
 
             let key = front.key();
@@ -546,7 +632,7 @@ mod tests {
         translated: Vec<u64>,
     }
 
-    impl Frontend for Chain {
+    impl<H: ?Sized> Frontend<H> for Chain {
         fn epoch(&mut self) -> Epoch {
             self.epoch
         }
@@ -751,7 +837,7 @@ mod tests {
         epoch: Epoch,
     }
 
-    impl Frontend for Traces {
+    impl<H: ?Sized> Frontend<H> for Traces {
         fn epoch(&mut self) -> Epoch {
             self.epoch
         }
@@ -887,6 +973,182 @@ mod tests {
         d.run(&mut f, &mut h, 0x1000, 20).expect("runs");
         assert_eq!(d.stats().resyncs, 1);
         assert_eq!(d.stats().translated, 8, "every block was lifted again");
+    }
+
+    /// A [`Chain`] that records every PC it was entered at and refuses to
+    /// enter the `limit`th.
+    struct Gate {
+        chain: Chain,
+        seen: Vec<u64>,
+        limit: usize,
+    }
+
+    impl<H: ?Sized> Frontend<H> for Gate {
+        fn epoch(&mut self) -> Epoch {
+            Frontend::<H>::epoch(&mut self.chain)
+        }
+        fn enter(&mut self, pc: u64, _host: &mut H) -> Result<Entry> {
+            self.seen.push(pc);
+            Ok(if self.seen.len() > self.limit {
+                Entry::Leave
+            } else {
+                Entry::Ready
+            })
+        }
+        fn key(&mut self) -> u64 {
+            Frontend::<H>::key(&mut self.chain)
+        }
+        fn pc_slot(&self) -> RegSlot {
+            Frontend::<H>::pc_slot(&self.chain)
+        }
+        fn translate(&mut self, pc: u64) -> Result<Translation> {
+            Frontend::<H>::translate(&mut self.chain, pc)
+        }
+    }
+
+    #[test]
+    fn a_boundary_hook_is_called_once_per_block_chained_or_not() {
+        // The property `cpu::riscv::engine` depends on for its cycle counter:
+        // a chained successor is entered exactly as an unchained one is, so a
+        // guest that charges for its entry fetch charges the same whichever
+        // way the block was reached.
+        let mut d = Dispatcher::with_cache(BlockCache::with_capacity(64));
+        let mut f = Gate {
+            chain: chain(4, 0x1010),
+            seen: Vec::new(),
+            limit: usize::MAX,
+        };
+        let mut h = Host::default();
+        let run = d.run(&mut f, &mut h, 0x1000, 40).expect("runs");
+        assert_eq!(run.blocks, 40);
+        assert_eq!(f.seen.len(), 40, "one entry per block, chained included");
+        assert!(d.stats().chained > 0, "and chaining really happened");
+        // The PCs are the ones the blocks ran at, in order, round the loop.
+        assert_eq!(&f.seen[..5], &[0x1000, 0x1004, 0x1008, 0x100c, 0x1000]);
+    }
+
+    /// A frontend that computes its key in `enter`, as the RISC-V engine does,
+    /// and records what `key` was asked for and whether `enter` had run.
+    struct Ordered {
+        chain: Chain,
+        entered: Option<u64>,
+        asked: Vec<(Option<u64>, u64)>,
+    }
+
+    impl<H: ?Sized> Frontend<H> for Ordered {
+        fn epoch(&mut self) -> Epoch {
+            self.chain.epoch
+        }
+        fn enter(&mut self, pc: u64, _host: &mut H) -> Result<Entry> {
+            self.entered = Some(pc);
+            Ok(Entry::Ready)
+        }
+        fn key(&mut self) -> u64 {
+            let key = self.entered.unwrap_or(u64::MAX);
+            self.asked.push((self.entered, key));
+            key
+        }
+        fn pc_slot(&self) -> RegSlot {
+            Frontend::<H>::pc_slot(&self.chain)
+        }
+        fn translate(&mut self, pc: u64) -> Result<Translation> {
+            Frontend::<H>::translate(&mut self.chain, pc)
+        }
+    }
+
+    #[test]
+    fn a_boundary_hook_runs_before_the_key_it_computes_is_read() {
+        // The order is documented and load-bearing: `cpu::riscv::engine`
+        // resolves its entry fetch to a physical page in `enter` and *is* that
+        // page in `key`. Asked the other way round, every block would be
+        // cached under its predecessor's world — which on a guest whose blocks
+        // share a page is invisible until one of them does not.
+        let mut d = Dispatcher::with_cache(BlockCache::with_capacity(64));
+        let mut f = Ordered {
+            chain: chain(4, 0x1010),
+            entered: None,
+            asked: Vec::new(),
+        };
+        let mut h = Host::default();
+        let run = d.run(&mut f, &mut h, 0x1000, 12).expect("runs");
+        assert_eq!(run.blocks, 12);
+        assert_eq!(f.asked.len(), 12, "one key per block");
+        assert!(
+            f.asked.iter().all(|&(entered, key)| entered == Some(key)),
+            "`key` was asked before `enter` set it: {:?}",
+            f.asked
+        );
+    }
+
+    #[test]
+    fn a_frontend_that_declines_a_boundary_stops_the_run_there() {
+        let mut d = Dispatcher::with_cache(BlockCache::with_capacity(64));
+        let mut f = Gate {
+            chain: chain(4, 0x1010),
+            seen: Vec::new(),
+            limit: 3,
+        };
+        let mut h = Host::default();
+        let run = d.run(&mut f, &mut h, 0x1000, 40).expect("runs");
+        assert_eq!(run.stop, Stop::Declined);
+        assert_eq!(run.blocks, 3, "the declined block did not run");
+        assert_eq!(run.insns, 3);
+        assert_eq!(run.pc, 0x100c, "and the guest is left standing at it");
+        assert_eq!(h.ticks, 3, "the declined block charged nothing");
+    }
+
+    /// A [`Chain`] whose topology generation moves partway through a run.
+    struct Shifting {
+        chain: Chain,
+        seen: usize,
+        at: usize,
+    }
+
+    impl<H: ?Sized> Frontend<H> for Shifting {
+        fn epoch(&mut self) -> Epoch {
+            self.seen += 1;
+            if self.seen > self.at {
+                self.chain.epoch.topology = 1;
+            }
+            self.chain.epoch
+        }
+        fn key(&mut self) -> u64 {
+            Frontend::<H>::key(&mut self.chain)
+        }
+        fn pc_slot(&self) -> RegSlot {
+            Frontend::<H>::pc_slot(&self.chain)
+        }
+        fn translate(&mut self, pc: u64) -> Result<Translation> {
+            Frontend::<H>::translate(&mut self.chain, pc)
+        }
+    }
+
+    #[test]
+    fn a_retopology_partway_through_a_run_is_seen_before_the_next_block() {
+        // The window chaining opens and this closes: a guest store can remap
+        // an address space, a store ends its block, and the *next* block of
+        // the chain would otherwise come out of a cache lifted through the
+        // topology that store replaced. The epoch is therefore read at every
+        // boundary rather than once per run.
+        let mut d = Dispatcher::with_cache(BlockCache::with_capacity(64));
+        let mut f = Shifting {
+            chain: chain(4, 0x1010),
+            seen: 0,
+            at: 5,
+        };
+        let mut h = Host::default();
+        let run = d.run(&mut f, &mut h, 0x1000, 20).expect("runs");
+        assert_eq!(run.blocks, 20, "the run still finishes");
+        assert_eq!(d.stats().resyncs, 1, "and resynchronised inside it");
+        assert_eq!(
+            d.stats().translated,
+            8,
+            "four blocks before the flush and four after"
+        );
+        // The predecessor is dropped with the cache, so no link is followed
+        // into a slot the flush retired.
+        assert_eq!(d.cache_stats().stale_links, 0);
+        d.cache().check().expect("consistent");
     }
 
     #[test]

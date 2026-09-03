@@ -1230,7 +1230,7 @@ impl Lifter {
 }
 
 #[cfg(feature = "jit")]
-impl Frontend for Lifter {
+impl<H: ?Sized> Frontend<H> for Lifter {
     fn epoch(&mut self) -> Epoch {
         // `satp` is bare on this hart and nothing in the lifted subset can
         // write it, so the translation half is fixed at zero and the topology

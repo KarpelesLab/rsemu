@@ -547,7 +547,7 @@ impl Lifter {
     }
 }
 
-impl Frontend for Lifter {
+impl<H: ?Sized> Frontend<H> for Lifter {
     fn epoch(&mut self) -> Epoch {
         Epoch {
             topology: self.space.generation(),

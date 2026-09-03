@@ -73,20 +73,29 @@ one binary, `--headless` so nothing is rate-limited to the wall clock:
 
 | `engine` | wall clock | vs `interp` | state hash |
 | --- | --- | --- | --- |
-| `interp` | 150.3 s | — | `0xf86f099b07119370` |
-| `jit` | 121.2 s | **1.24×** | `0xf86f099b07119370` |
-| `jit-host` | 299.1 s | 0.50× | `0xf86f099b07119370` |
+| `interp` | 150.6 s | — | `0xf86f099b07119370` |
+| `jit` | 115.6 s | **1.30×** | `0xf86f099b07119370` |
+| `jit-host` | 87.6 s | **1.72×** | `0xf86f099b07119370` |
 
-Two honest notes on that table. The **host code generator currently costs more
-than it saves**, which is exactly why it is a separate value rather than what
-`jit` does wherever it can: a block on this guest is about four guest
-instructions long, and the per-instruction bookkeeping the compiled path calls
-back into the host for outweighs the arithmetic it saves. And **1.24× is not
-the 8–22× the code generator measures on a benchmark**, because block chaining
-and the inlined TLB fast path are both out of reach from a hart today.
+The host code generator used to *lose* to the portable one on this guest, at
+0.50×, and neither thing that fixed it was the code it emits. **Blocks are
+chained now** — 86% of them are reached by following a patched exit, where the
+count was previously zero in every run — and **a compile stopped costing
+144 µs**, which is what two `mprotect` calls over a 256 MiB code buffer had
+been costing before `jit::x86::buf` learned to flip a page-sized window
+instead. 1.72× is still not the 8–22× the code generator measures on a
+benchmark, because the inlined TLB fast path is out of reach from a hart:
+every guest access costs a call whichever engine runs it.
 [`src/cpu/riscv/engine.rs`](../../src/cpu/riscv/engine.rs) has the reasoning and
 the measurements behind every one of those claims, including what it costs to
 keep the engines identical.
+
+**Measure the interpreter in the same sweep as the engines it is the control
+for.** This is a shared machine, and a 150-second run of the same binary
+varied by 12% between sweeps run twenty minutes apart — larger than the effect
+being measured. The table above is the median of an interleaved
+three-rep sweep whose nine runs spread by 0.5%; a before-and-after taken from
+two different sittings is not evidence.
 
 A build without `cpu-riscv-lift` and `jit` **refuses** both JIT values with a
 message saying which features it wants, rather than interpreting quietly — an
