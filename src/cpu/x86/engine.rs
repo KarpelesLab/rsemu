@@ -565,6 +565,11 @@ fn narrow_state_is_clean(state: &State) -> bool {
 struct Admitted {
     world: World,
     key: u64,
+    /// What a store does to the block it is in. Decided here rather than at
+    /// each of the two places that need it -- the cache key and the lift --
+    /// because a key that says one policy over a block lifted under the other
+    /// is a cache that cannot be wrong twice in the same direction.
+    smc: Smc,
     /// The linear page the block is bounded by, and the physical frame the
     /// entry translation resolved it to. Equal with `CR0.PG` clear.
     linear_page: u64,
@@ -693,6 +698,7 @@ fn admit(at: &mut Boundary, exec: &mut Exec<'_>, pc: u64, remaining: u64) -> Adm
     Admit::Ready(Box::new(Admitted {
         world,
         key,
+        smc,
         linear_page: linear & !PAGE_MASK,
         frame,
         access: per_access(bus, paged),
@@ -1046,8 +1052,15 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
             };
             space.read(at, Width::U8, attrs).ok().map(|v| v as u8)
         };
-        let smc = if paged { Smc::EndBlock } else { Smc::Guard };
-        let lifted = lift::lift(&self.at.world, pc, &mut src, MAX_INSNS, SHAPE, smc, FLAGS)?;
+        let lifted = lift::lift(
+            &self.at.world,
+            pc,
+            &mut src,
+            MAX_INSNS,
+            SHAPE,
+            self.at.smc,
+            FLAGS,
+        )?;
         if self.rejected.is_none()
             && let Err(e) = verify(&lifted.block)
         {
@@ -1263,11 +1276,30 @@ mod tests {
     /// would not have puts the two cores on different instructions for the
     /// rest of the run, and `State::debt` is what records that.
     fn agree_on(case: &Case, engine: Engine, budget: u64, quanta: usize) -> X86 {
+        agree_poking(case, engine, budget, quanta, |_, _| {})
+    }
+
+    /// The same, with `poke` applied to **both** cores before each quantum.
+    ///
+    /// Everything the interpreter decides before it decodes — a pending reset,
+    /// an `NMI`, a maskable interrupt, the trap flag — arrives from outside the
+    /// register file, so a comparison that can only run a program cannot reach
+    /// any of it. This is how: whatever `poke` does to one core it does to the
+    /// other, at the same instant in each one's own run.
+    fn agree_poking(
+        case: &Case,
+        engine: Engine,
+        budget: u64,
+        quanta: usize,
+        poke: impl Fn(&X86, usize),
+    ) -> X86 {
         let (space_a, ram_a) = differential::machine(case);
         let (space_b, ram_b) = differential::machine(case);
         let interp = core(case, space_a, Engine::Interp);
         let jit = core(case, space_b, engine);
         for n in 0..quanta {
+            poke(&interp, n);
+            poke(&jit, n);
             let a = interp.run_budget(budget);
             let b = jit.run_budget(budget);
             assert_eq!(
@@ -1304,6 +1336,15 @@ mod tests {
                 jit.is_halted(),
                 "quantum {n}: whether the core stopped"
             );
+            // `CR2` is latched by a page fault and by nothing else, so it says
+            // whether a *translation* went wrong somewhere neither the
+            // registers nor the clock would show.
+            assert_eq!(
+                interp.sys().cr2,
+                jit.sys().cr2,
+                "quantum {n}: the faulting linear address"
+            );
+            assert_eq!(interp.sys().cr3, jit.sys().cr3, "quantum {n}: CR3");
             assert_eq!(
                 open_bus(&interp),
                 open_bus(&jit),
@@ -1334,6 +1375,47 @@ mod tests {
     fn agree(case: &Case, budget: u64, quanta: usize) -> X86 {
         agree_on(case, Engine::Jit, budget, quanta);
         agree_on(case, Engine::JitHost, budget, quanta)
+    }
+
+    /// A loop that never ends, so a run of many quanta is many quanta of
+    /// *guest* rather than a halted processor being compared with itself.
+    ///
+    /// ```text
+    ///   mov eax, [ecx]        ; a load
+    ///   add eax, 1            ; every flag
+    ///   mov [ecx], eax        ; a store, which under paging ends the block
+    ///   mov ebx, [edx+4]
+    ///   add ebx, eax
+    ///   mov [edx+4], ebx
+    ///   shl ebx, 3
+    ///   cmp eax, 0x1000
+    ///   jne top               ; the back edge a trace merges
+    ///   jmp top
+    /// ```
+    ///
+    /// `ECX` and `EDX` are two of the pointers `Case::seeded` aims at the data
+    /// window, so the same bytes run in all three worlds.
+    const BUSY_LOOP: [u8; 27] = [
+        0x8b, 0x01, // mov eax, [ecx]
+        0x83, 0xc0, 0x01, // add eax, 1
+        0x89, 0x01, // mov [ecx], eax
+        0x8b, 0x5a, 0x04, // mov ebx, [edx+4]
+        0x01, 0xc3, // add ebx, eax
+        0x89, 0x5a, 0x04, // mov [edx+4], ebx
+        0xc1, 0xe3, 0x03, // shl ebx, 3
+        0x3d, 0x00, 0x10, 0x00, 0x00, // cmp eax, 0x1000
+        0x75, 0xe7, // jne top
+        0xeb, 0xe5, // jmp top
+    ];
+
+    /// [`BUSY_LOOP`] in the flat world, the paged one and long mode.
+    fn busy(world: usize) -> Case {
+        let case = Case::seeded(BUSY_LOOP.to_vec());
+        match world {
+            0 => case,
+            1 => case.paged(),
+            _ => case.long(),
+        }
     }
 
     /// A generated program, which is what the differential corpus runs.
@@ -1385,27 +1467,6 @@ mod tests {
     }
 
     #[test]
-    fn a_store_into_the_running_page_is_honoured_by_the_next_block() {
-        // `mov [ebx], al` where `ebx` points at the code itself. The block was
-        // lifted from those bytes, so both engines must execute what the store
-        // left rather than what was there — which under `Smc::Guard` is the
-        // in-block page test and under `Smc::EndBlock` the page drain at the
-        // next boundary.
-        let program = alloc::vec![
-            0xb8, 0x90, 0x90, 0x90, 0x90, // mov eax, 0x90909090
-            0x88, 0x03, // mov [ebx], al
-            0x40, // inc eax
-            0xeb, 0xf7, // jmp back to the top
-        ];
-        let mut case = Case::seeded(program);
-        // `ebx` at the fourth byte of the program: the immediate of the `mov`
-        // the loop starts with, which is inside the block being executed.
-        case.regs[3] = differential::BASE + 2;
-        case.pointers = 0;
-        agree(&case, 8_000, 6);
-    }
-
-    #[test]
     fn an_instruction_outside_the_subset_is_interpreted_and_charged_the_same() {
         // `cli`, `sti` and `pushf`/`popf` are all outside the lifted subset, so
         // every pass round this loop leaves the block cache and comes back —
@@ -1421,6 +1482,249 @@ mod tests {
         let mut case = Case::seeded(program);
         case.regs[3] = 0;
         agree(&case, 8_000, 6);
+    }
+
+    #[test]
+    fn the_agreement_holds_at_the_budgets_the_block_bound_decides() {
+        // Between [`worst_bound`] and a few times it is where a block's
+        // *recorded* cost is what admits it, so a bound that understates what
+        // the block can spend lets one run past the budget where an
+        // instruction would not have — and the two engines then stop on
+        // different instructions with different `State::debt` for the rest of
+        // the run. Neither a large budget (everything fits) nor a tiny one
+        // (nothing does) reaches that.
+        //
+        // The fixture is [`BUSY_LOOP`] rather than a generated program for a
+        // reason worth writing down: a generated case runs twenty-four
+        // instructions and halts, so every quantum after the first compares a
+        // stopped processor with itself and the budget never decides anything.
+        // That is how three bound mutations survived a sweep that looked
+        // thorough.
+        for budget in [1_400u64, 1_900, 2_600, 3_400, 4_200, 5_600, 7_000] {
+            for world in 0..3 {
+                agree_on(&busy(world), Engine::Jit, budget, 24);
+                agree_on(&busy(world), Engine::JitHost, budget, 24);
+            }
+        }
+    }
+
+    /// `EFLAGS` with the trap flag set, which makes every instruction a
+    /// single-step exception.
+    fn with_trap_flag(case: Case) -> Case {
+        case.with_eflags(flags::ALWAYS_SET | flags::TF)
+    }
+
+    #[test]
+    fn the_trap_flag_takes_the_instruction_away_from_the_block() {
+        // `Exec::step` samples `TF` before it decodes and delivers the debug
+        // exception *after* the instruction, so a block of sixteen would trap
+        // fifteen instructions late. The interrupt table's limit is zero here,
+        // so the first one shuts the processor down — at a cycle count both
+        // engines have to agree on.
+        agree(&with_trap_flag(busy(0)), 8_000, 4);
+        agree(&with_trap_flag(busy(2)), 8_000, 4);
+    }
+
+    #[test]
+    fn a_pending_interrupt_is_taken_at_the_instruction_the_interpreter_takes_it_at() {
+        // Three pins, each raised part-way through a run on both cores at the
+        // same instant: a maskable interrupt with `IF` set, a non-maskable
+        // one, and a reset request. Every one of them is something
+        // `Exec::step` acts on before it decodes, and a block admitted with
+        // one pending would take it up to sixteen instructions late.
+        let case = busy(0).with_eflags(flags::ALWAYS_SET | flags::IF);
+        for engine in [Engine::Jit, Engine::JitHost] {
+            agree_poking(&case, engine, 4_000, 8, |cpu, n| {
+                if n == 2 {
+                    cpu.set_intr_vector(0x20);
+                    cpu.set_intr(true);
+                }
+            });
+            agree_poking(&case, engine, 4_000, 8, |cpu, n| {
+                if n == 2 {
+                    cpu.pulse_nmi();
+                }
+            });
+            agree_poking(&case, engine, 4_000, 8, |cpu, n| {
+                if n == 2 {
+                    cpu.request_reset();
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn a_narrow_world_with_a_dirty_upper_half_is_left_to_the_interpreter() {
+        // The precondition `lift::Lifter::read_reg` has below long mode: it
+        // reads a 32-bit operand as the whole slot, while `Regs::dword`
+        // truncates. Compatibility mode is where the two stop agreeing, and
+        // this is that state written down — a 64-bit kernel's leftovers still
+        // in the file when a 32-bit code segment runs.
+        let case = seeded(0x7c3a);
+        let (space_a, ram_a) = differential::machine(&case);
+        let (space_b, ram_b) = differential::machine(&case);
+        let interp = core(&case, space_a, Engine::Interp);
+        let jit = core(&case, space_b, Engine::JitHost);
+        for cpu in [&interp, &jit] {
+            let mut regs = cpu.regs();
+            for n in [0u8, 1, 2, 5, 6, 7] {
+                regs.set_qword(n, regs.qword(n) | 0x0000_00ff_0000_0000);
+            }
+            cpu.set_regs(regs);
+        }
+        for n in 0..8 {
+            assert_eq!(interp.run_budget(8_000), jit.run_budget(8_000));
+            let (want, got) = (interp.regs(), jit.regs());
+            for r in 0..16u8 {
+                assert_eq!(want.qword(r), got.qword(r), "quantum {n}, register {r}");
+            }
+            assert_eq!(want.eflags, got.eflags, "quantum {n}: EFLAGS");
+            assert_eq!(interp.cycles(), jit.cycles(), "quantum {n}: the clock");
+            memory_agrees(&ram_a, &ram_b, n);
+        }
+    }
+
+    /// Two programs at the same `EIP` in two different code segments.
+    ///
+    /// `A` and `B` differ only in the constant they load, and each is a loop,
+    /// so which one a core is executing is visible in `EAX` forever.
+    /// `add eax, imm8` closed by a `jmp` back to itself: the constant
+    /// **accumulates**, so which code segment's block ran is visible in `EAX`
+    /// however many instructions the interpreter takes afterwards.
+    ///
+    /// A `mov` of the constant would not do, and the first draft of this test
+    /// was one: the interpreter's own instruction at the end of a quantum
+    /// wrote the *right* answer over the stale block's wrong one, and the
+    /// fixture reported agreement while the engine served a translation from a
+    /// code segment that no longer existed.
+    const WORLD_A: [u8; 5] = [0x83, 0xc0, 0x11, 0xeb, 0xfb];
+    const WORLD_B: [u8; 5] = [0x83, 0xc0, 0x22, 0xeb, 0xfb];
+
+    #[test]
+    fn a_block_lifted_in_one_world_is_not_served_in_another() {
+        // `lift::key` folds `World::generation` into the cache key under
+        // `Origin::Flat`, and nothing in the crate keeps that counter —
+        // `Boundary::world_of` does, by comparing. A counter that never moved
+        // would serve `WORLD_A`'s block at `EIP` zero after `CS.base` had been
+        // moved to `WORLD_B`, which is a stale translation with no store to
+        // invalidate it and no page to invalidate it by.
+        let case = Case::new(WORLD_A.to_vec());
+        let (space_a, _a) = differential::machine(&case);
+        let (space_b, _b) = differential::machine(&case);
+        for space in [&space_a, &space_b] {
+            for (n, byte) in WORLD_B.iter().enumerate() {
+                space
+                    .write(
+                        differential::BASE + 0x2000 + n as u64,
+                        Width::U8,
+                        u64::from(*byte),
+                        MemAttrs::DEFAULT,
+                    )
+                    .expect("in RAM");
+            }
+        }
+        let interp = core(&case, space_a, Engine::Interp);
+        let jit = core(&case, space_b, Engine::JitHost);
+        for (world, base) in [(0u64, 0u64), (1, 0x2000)] {
+            for cpu in [&interp, &jit] {
+                let mut sys = cpu.sys();
+                sys.segs[usize::from(seg::CS)].base = differential::BASE + base;
+                cpu.set_sys(sys);
+                let mut regs = cpu.regs();
+                regs.rip = 0;
+                cpu.set_regs(regs);
+            }
+            for n in 0..6 {
+                assert_eq!(interp.run_budget(6_000), jit.run_budget(6_000));
+                assert_eq!(
+                    interp.regs().qword(0),
+                    jit.regs().qword(0),
+                    "world {world}, quantum {n}: the constant the loop loads says which \
+                     code segment's block ran"
+                );
+                assert_eq!(interp.cycles(), jit.cycles());
+            }
+        }
+        assert!(
+            interp.regs().qword(0) > 0x1000,
+            "the fixture never ran for long enough to accumulate anything"
+        );
+    }
+
+    /// A loop that stores through `SS` and loads it back.
+    ///
+    /// `89 04 24` and `8b 1c 24` use `ESP` as a SIB base, which selects the
+    /// **stack** segment rather than `DS` — so with the two segments at
+    /// different bases the bytes land somewhere a `DS` access would never
+    /// reach, and guest RAM says which one happened.
+    const THROUGH_SS: [u8; 10] = [
+        0x89, 0x04, 0x24, // mov [esp], eax
+        0x8b, 0x1c, 0x24, // mov ebx, [esp]
+        0xff, 0xc0, // inc eax
+        0xeb, 0xf6, // jmp back to the top
+    ];
+
+    #[test]
+    fn an_access_goes_through_the_segment_the_frontend_named() {
+        // `MemOp::seg` carries the register rather than the frontend folding a
+        // base in, because the fault differs by register and the base is
+        // hidden state. A host that ignored it would be right on every machine
+        // whose segments share a base, which is every fixture in
+        // `differential` — so this one moves `SS`.
+        // `EAX` starts at something that is not zero, because guest RAM starts
+        // at zero and a store of zero to the wrong address is invisible in it.
+        let case = Case::new(THROUGH_SS.to_vec()).with_reg(0, 0x1234_5678);
+        let (space_a, ram_a) = differential::machine(&case);
+        let (space_b, ram_b) = differential::machine(&case);
+        let interp = core(&case, space_a, Engine::Interp);
+        let jit = core(&case, space_b, Engine::JitHost);
+        for cpu in [&interp, &jit] {
+            let mut sys = cpu.sys();
+            sys.segs[usize::from(seg::SS)].base = differential::BASE + 0x1000;
+            cpu.set_sys(sys);
+        }
+        for n in 0..8 {
+            assert_eq!(interp.run_budget(6_000), jit.run_budget(6_000));
+            assert_eq!(interp.cycles(), jit.cycles(), "quantum {n}: the clock");
+            assert_eq!(
+                interp.regs().qword(3),
+                jit.regs().qword(3),
+                "quantum {n}: what the load read back says which segment it went through"
+            );
+            memory_agrees(&ram_a, &ram_b, n);
+        }
+    }
+
+    /// A loop that rewrites the immediate of its own first instruction.
+    ///
+    /// ```text
+    ///   b8 05 00 00 00      mov eax, 5        ; the byte at +1 is the target
+    ///   83 c0 01            add eax, 1
+    ///   a3 00 11 00 00      mov [0x1100], eax ; a store on another page
+    ///   88 05 01 00 00 00   mov [0x1], al     ; and one into this very block
+    ///   eb eb               jmp back
+    /// ```
+    ///
+    /// Every pass reads the immediate the pass before it wrote, so a stale
+    /// translation is visible in `EAX` immediately and in guest RAM after it.
+    const SELF_MODIFYING: [u8; 21] = [
+        0xb8, 0x05, 0x00, 0x00, 0x00, // mov eax, 5
+        0x83, 0xc0, 0x01, // add eax, 1
+        0xa3, 0x00, 0x11, 0x00, 0x00, // mov [0x1100], eax
+        0x88, 0x05, 0x01, 0x00, 0x00, 0x00, // mov [0x1], al
+        0xeb, 0xeb, // jmp back to the top
+    ];
+
+    #[test]
+    fn a_store_into_the_running_page_is_honoured_by_the_next_block() {
+        // Both policies, because they are different mechanisms: with paging
+        // off the block carries an in-block guard on the store's linear page,
+        // and under paging the store is the last instruction in its block and
+        // the dispatcher's page drain is what catches it. Both ends of the
+        // second are physical, which is the part a linear guard could not be.
+        agree(&Case::new(SELF_MODIFYING.to_vec()), 8_000, 12);
+        agree(&Case::new(SELF_MODIFYING.to_vec()).paged(), 8_000, 12);
+        agree(&Case::new(SELF_MODIFYING.to_vec()).long(), 8_000, 12);
     }
 
     #[test]
