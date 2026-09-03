@@ -102,6 +102,7 @@ use crate::core::space::{
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicBool, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
+use crate::dev::medium::{self, Medium, Snapshot};
 use crate::machine::realize::Instance;
 use crate::machine::validate::{ClassSchema, PropSchema};
 
@@ -509,6 +510,14 @@ pub struct Array {
     /// lock entirely. Firmware executes from flash, and a lock per instruction
     /// fetch is not a cost this device gets to impose.
     all_array: AtomicBool,
+    /// Whether a program or an erase has changed the array since the contents
+    /// last reached a [`Medium`](crate::dev::medium::Medium).
+    ///
+    /// A NOR part is storage, and storage that is never written back is a run
+    /// whose guest kept nothing. This is what [`Cfi::flush`](Device::flush)
+    /// tests before it moves megabytes: an image bank that nothing programmed
+    /// costs a boolean rather than a copy.
+    dirty: AtomicBool,
     /// The CFI query table of one device, indexed by query offset.
     query: Vec<u8>,
     manufacturer: u16,
@@ -576,6 +585,7 @@ impl Array {
             array,
             chips: Mutex::with_rank(LockRank::DEVICE, chips),
             all_array: AtomicBool::new(true),
+            dirty: AtomicBool::new(false),
             query,
             manufacturer,
             device_id,
@@ -638,6 +648,22 @@ impl Array {
     #[must_use]
     pub fn is_reading_array(&self) -> bool {
         self.all_array.load(Ordering::Relaxed)
+    }
+
+    /// Whether a program or an erase has changed the array since the last
+    /// [`mark_clean`](Array::mark_clean).
+    ///
+    /// [`load_image`](Array::load_image) deliberately does **not** set it: an
+    /// image being put into a part is where the bytes came *from*, and writing
+    /// them straight back out again would rewrite a file nothing had changed.
+    #[must_use]
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Relaxed)
+    }
+
+    /// Say that the contents have reached wherever they are kept.
+    pub fn mark_clean(&self) {
+        self.dirty.store(false, Ordering::Relaxed);
     }
 
     /// Put every device back the way it powers up.
@@ -864,6 +890,7 @@ impl Array {
             chip.status |= SR_LOCK_ERROR | SR_PROGRAM_ERROR;
             return;
         }
+        self.dirty.store(true, Ordering::Relaxed);
         for i in 0..self.geom.device_width() {
             let at = offset + i;
             let Ok(old) = self.array.read_u8(at) else {
@@ -893,6 +920,7 @@ impl Array {
             chip.status |= SR_LOCK_ERROR | SR_ERASE_ERROR;
             return;
         }
+        self.dirty.store(true, Ordering::Relaxed);
         let dw = self.geom.device_width();
         let stride = self.geom.bus_width();
         // `offset` is this device's own lane address, and it is a whole number
@@ -915,8 +943,12 @@ impl Array {
 
     // -- snapshots ---------------------------------------------------------
 
-    fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
-        w.write_bytes(&self.contents())?;
+    /// Everything except the contents: the command state machines.
+    ///
+    /// The contents are *not* here, because what to do about them is the
+    /// medium's policy (`dev::medium::Snapshot`) and belongs to [`Cfi`]. The
+    /// state below is the part's own and is captured whichever policy applies.
+    fn save_state(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
         let chips = self.chips.lock();
         w.write_seq_len(chips.len() as u64)?;
         for chip in chips.iter() {
@@ -939,8 +971,8 @@ impl Array {
         Ok(())
     }
 
-    fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
-        let bytes: &[u8] = r.read_bytes()?;
+    /// Put a captured array back, checking it is this part's size.
+    fn restore_contents(&self, bytes: &[u8]) -> Result<()> {
         if bytes.len() as u64 != self.geom.size() {
             return Err(Error::State(format!(
                 "snapshot has {} byte(s) of flash, this part has {}",
@@ -951,6 +983,12 @@ impl Array {
         self.array
             .write_at(0, bytes)
             .map_err(|_| Error::State(String::from("the flash array refused the snapshot")))?;
+        Ok(())
+    }
+
+    /// The command state machines, as [`save_state`](Array::save_state) wrote
+    /// them.
+    fn load_state(&self, r: &mut ChunkReader<'_>) -> Result<()> {
         let lanes = r.read_seq_len(1)?;
         let mut chips = self.chips.lock();
         if lanes != chips.len() as u64 {
@@ -1170,11 +1208,48 @@ fn log2(value: u64) -> u8 {
 // the device
 // ---------------------------------------------------------------------------
 
+/// How many bytes move between the array and a medium at a time.
+///
+/// 64 KiB: big enough that a 32 MiB bank is five hundred calls rather than
+/// eight million, and small enough that loading one never allocates a copy of
+/// the whole part.
+const LOAD_CHUNK: u64 = 64 * 1024;
+
+/// The window an [`Array`] answers behind.
+fn region_for(array: &Arc<Array>) -> RegionRef {
+    Arc::new(Region::io(
+        CLASS_NAME,
+        array.geometry().size(),
+        Arc::clone(array) as Arc<dyn MemOps>,
+    ))
+}
+
 /// A CFI NOR flash part, or a set of them interleaved on one bus.
+///
+/// # Where the bytes live between runs
+///
+/// A part a guest *writes* is a storage device, and storage that only ever
+/// reads is a machine whose guest keeps nothing. So the contents can come from,
+/// and go back to, a [`Medium`] — the same seam `ata.disk` and `virtio.blk`
+/// store their bytes behind, installed by the run under the media slot's own
+/// name:
+///
+/// ```console
+/// rsemu run q35-uefi --flash0 OVMF_CODE.fd --drive flash1=OVMF_VARS.fd
+/// ```
+///
+/// The medium **wins over the media table**, exactly as it does for a drive: a
+/// run that named a file meant it. [`Device::flush`] writes the array back at
+/// the end of the run, and only when a program or an erase has actually changed
+/// it — so a `readonly` firmware bank costs a boolean and a variable store that
+/// a guest never wrote costs the same.
 #[derive(Debug)]
 pub struct Cfi {
     array: Arc<Array>,
     region: RegionRef,
+    /// Where the contents came from and where [`flush`](Device::flush) puts
+    /// them back. `None` is a part whose bytes live only in this process.
+    media: Option<Arc<dyn Medium>>,
 }
 
 impl Cfi {
@@ -1197,10 +1272,18 @@ impl Cfi {
         let device_id = r.or_range("device", 0u64, 0..=0xffff)?;
         let read_only = r.or("readonly", false)?;
         let power_up_locked = r.or("locked", true)?;
-        let image = r
-            .optional_media("image")?
-            .map(crate::core::props::Media::to_bytes);
+        let media = r.optional_media("image")?;
+        let slot = media.map(crate::core::props::Media::name);
+        let image = media.map(crate::core::props::Media::to_bytes);
         r.finish()?;
+
+        // A medium the *host* installed under this bank's media slot name —
+        // `--drive flash1=vars.fd`. It wins over the media table's bytes, the
+        // way it does for a drive, because a run that named a file meant it.
+        let supplied = match (props.hosts(), slot) {
+            (Some(hosts), Some(name)) => medium::get(hosts, name)?.and_then(|slot| slot.take()),
+            _ => None,
+        };
 
         let geom = match blocks {
             Some(list) => Geometry::new(block_regions(&list)?, width, interleave)?,
@@ -1219,7 +1302,31 @@ impl Cfi {
             power_up_locked,
             read_only,
         )?);
-        if let Some(image) = image {
+        // The medium first, because it wins; the media table's bytes otherwise.
+        if let Some(medium) = &supplied {
+            // Exactly the bank's size, and not merely no larger. `flush` writes
+            // the *whole* array back, so a medium that could not receive all of
+            // it would silently keep a prefix — and a bank that came up half
+            // erased because the file was short is a firmware that boots once
+            // and never again. Say so at construction instead.
+            if medium.capacity() != size {
+                return Err(config(format!(
+                    "the medium bound to this bank holds {} byte(s) and the flash is {size}; a \
+                     bank and its backing file are the same size or neither can be written back",
+                    medium.capacity()
+                )));
+            }
+            let mut chunk = alloc::vec![0u8; LOAD_CHUNK.min(size) as usize];
+            let mut at = 0u64;
+            while at < size {
+                let take = LOAD_CHUNK.min(size - at) as usize;
+                medium
+                    .read_at(at, &mut chunk[..take])
+                    .map_err(|e| medium::error_at(at, e))?;
+                array.load_image(at, &chunk[..take])?;
+                at += take as u64;
+            }
+        } else if let Some(image) = image {
             if image.len() as u64 > size {
                 return Err(config(format!(
                     "the bound image is {} byte(s) and the flash is {size}",
@@ -1228,18 +1335,90 @@ impl Cfi {
             }
             array.load_image(0, &image)?;
         }
-        Ok(Cfi::from_array(array))
+        Ok(Cfi {
+            region: region_for(&array),
+            array,
+            media: supplied,
+        })
     }
 
     /// Wrap an array that has already been built.
+    ///
+    /// No medium: the bytes live in this process and nothing writes them back.
     #[must_use]
     pub fn from_array(array: Arc<Array>) -> Cfi {
-        let region: RegionRef = Arc::new(Region::io(
-            CLASS_NAME,
-            array.geometry().size(),
-            Arc::clone(&array) as Arc<dyn MemOps>,
-        ));
-        Cfi { array, region }
+        Cfi {
+            region: region_for(&array),
+            array,
+            media: None,
+        }
+    }
+
+    /// The medium the contents came from, if the run installed one.
+    #[must_use]
+    pub fn medium(&self) -> Option<&Arc<dyn Medium>> {
+        self.media.as_ref()
+    }
+
+    /// Write the array back to its medium, if it has one and anything changed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::State`] if the medium refused a write or the flush.
+    pub fn write_back(&self) -> Result<()> {
+        let Some(media) = &self.media else {
+            return Ok(());
+        };
+        if !self.array.is_dirty() {
+            return Ok(());
+        }
+        if media.is_read_only() {
+            return Err(Error::State(format!(
+                "this flash bank's medium ({}) is read only and the guest programmed it",
+                media.describe()
+            )));
+        }
+        let size = self.array.geometry().size();
+        let mut chunk = alloc::vec![0u8; LOAD_CHUNK.min(size) as usize];
+        let mut at = 0u64;
+        while at < size {
+            let take = LOAD_CHUNK.min(size - at) as usize;
+            self.array.read_contents(at, &mut chunk[..take])?;
+            media
+                .write_at(at, &chunk[..take])
+                .map_err(|e| medium::error_at(at, e))?;
+            at += take as u64;
+        }
+        media.flush().map_err(|e| medium::error_at(0, e))?;
+        self.array.mark_clean();
+        Ok(())
+    }
+
+    /// Fill the array from the medium again, as construction did.
+    ///
+    /// What restoring a [`Snapshot::Reference`] chunk means for a part whose
+    /// array is a *copy* of the medium rather than the medium itself.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::State`] if the medium refused a read.
+    pub fn reload_from_medium(&self) -> Result<()> {
+        let Some(media) = &self.media else {
+            return Ok(());
+        };
+        let size = self.array.geometry().size();
+        let mut chunk = alloc::vec![0u8; LOAD_CHUNK.min(size) as usize];
+        let mut at = 0u64;
+        while at < size {
+            let take = LOAD_CHUNK.min(size - at) as usize;
+            media
+                .read_at(at, &mut chunk[..take])
+                .map_err(|e| medium::error_at(at, e))?;
+            self.array.load_image(at, &chunk[..take])?;
+            at += take as u64;
+        }
+        self.array.mark_clean();
+        Ok(())
     }
 
     /// The parts behind the window.
@@ -1388,12 +1567,83 @@ impl Device for Cfi {
         self.array.reset();
     }
 
+    fn flush(&self) -> Result<()> {
+        // What a guest asking would have got, without one asking: the run is
+        // over and nothing else will program these bytes. A `flash.cfi` that
+        // did not implement this would lose every variable the guest wrote and
+        // never barriered, which is the defect `dev/usb/storage.rs` was fixed
+        // for and the reason this is here rather than in the front end.
+        self.write_back()
+    }
+
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
-        self.array.save(w)
+        // What the contents chunk *is* belongs to the medium, not to the part:
+        // a `RamStore` behind a media slot says capture, a host file says
+        // reference, and something that cannot be snapshotted at all says so.
+        match self
+            .media
+            .as_ref()
+            .map_or(Snapshot::Capture, |m| m.snapshot())
+        {
+            Snapshot::Capture => w.write_bytes(&self.array.contents())?,
+            Snapshot::Reference => {
+                // Write back *first*, for the reason `ata.disk` gives: the
+                // reference is only worth anything if the file holds what the
+                // guest had programmed at the instant the snapshot was taken.
+                self.write_back()?;
+                let describe = self
+                    .media
+                    .as_ref()
+                    .map_or_else(String::new, |m| m.describe());
+                w.write_bytes(describe.as_bytes())?;
+            }
+            Snapshot::Refuse => {
+                return Err(Error::State(format!(
+                    "this flash bank's medium ({}) refuses to be snapshotted",
+                    self.media
+                        .as_ref()
+                        .map_or_else(String::new, |m| m.describe())
+                )));
+            }
+        }
+        self.array.save_state(w)
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
-        self.array.load(r)
+        let bytes: &[u8] = r.read_bytes()?;
+        match self
+            .media
+            .as_ref()
+            .map_or(Snapshot::Capture, |m| m.snapshot())
+        {
+            Snapshot::Capture => self.array.restore_contents(bytes)?,
+            Snapshot::Reference => {
+                // The chunk holds *which* medium, and the bytes are still in
+                // it. A snapshot taken of a capturing bank lands here as a
+                // mismatched identity rather than as a silent misread.
+                let want = self
+                    .media
+                    .as_ref()
+                    .map_or_else(String::new, |m| m.describe());
+                if bytes != want.as_bytes() {
+                    return Err(Error::State(format!(
+                        "the snapshot references a different medium: it names `{}` and this \
+                         bank holds `{want}`",
+                        String::from_utf8_lossy(&bytes[..bytes.len().min(120)])
+                    )));
+                }
+                self.reload_from_medium()?;
+            }
+            Snapshot::Refuse => {
+                return Err(Error::State(format!(
+                    "this flash bank's medium ({}) refuses to be snapshotted",
+                    self.media
+                        .as_ref()
+                        .map_or_else(String::new, |m| m.describe())
+                )));
+            }
+        }
+        self.array.load_state(r)
     }
 
     fn region(&self, name: &str) -> Option<RegionRef> {

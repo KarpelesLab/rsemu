@@ -586,3 +586,173 @@ fn the_class_publishes_one_window_and_a_schema_that_matches_it() {
         );
     }
 }
+
+// -- the medium -------------------------------------------------------------
+//
+// A part a guest *writes* is a storage device, and the seam its bytes live
+// behind is `dev::medium`. These are the three things that has to get right:
+// the contents come out of the medium, `Device::flush` puts them back, and a
+// snapshot does whatever the medium's policy says.
+
+/// Build a bank whose media slot has `medium` installed under it.
+fn banked(medium: Arc<dyn Medium>, size: u64) -> Result<Cfi> {
+    use crate::core::hosts::HostObjects;
+
+    let hosts = Arc::new(HostObjects::new());
+    crate::dev::medium::install(&hosts, "flash1", medium).expect("nothing else claimed the slot");
+    Cfi::new(
+        &Props::new()
+            .with("size", Value::Size(size))
+            .with("block", Value::Size(0x1000))
+            .with("width", Value::Uint(1))
+            .with("interleave", Value::Uint(1))
+            .with("locked", Value::Bool(false))
+            .with(
+                "image",
+                Value::Media(crate::core::props::Media::new("flash1", Vec::new())),
+            )
+            .with_hosts(hosts),
+    )
+}
+
+/// A byte-wide bank's word program, which is what EDK II's `OvmfPkg` driver
+/// issues: one byte of setup, one byte of data.
+fn byte_program(cfi: &Cfi, offset: u64, value: u8) {
+    cfi.array()
+        .write(offset, &[0x10], MemAttrs::DEFAULT)
+        .expect("a byte write is a legal bus cycle on an x8 part");
+    cfi.array()
+        .write(offset, &[value], MemAttrs::DEFAULT)
+        .expect("and so is the datum");
+    cfi.array()
+        .write(offset, &[0xff], MemAttrs::DEFAULT)
+        .expect("read array");
+}
+
+#[test]
+fn the_contents_come_out_of_a_bound_medium_and_flush_puts_them_back() {
+    let store = Arc::new(RamStore::new(0x2000));
+    store.fill(0, 0x2000, 0xff).expect("erased");
+    store.write_at(0, b"rsemu-vars").expect("inside");
+    let medium: Arc<dyn Medium> = store.clone();
+    let cfi = banked(Arc::clone(&medium), 0x2000).expect("a bank the size of its medium");
+
+    // Construction filled the array from the medium rather than from the media
+    // table, which held nothing at all.
+    assert_eq!(&contents(&cfi, 0, 10), b"rsemu-vars");
+
+    // Nothing has been programmed, so a flush must not write: a firmware bank
+    // that rewrote its own file every run would rewrite a `readonly` image too.
+    assert!(!cfi.array().is_dirty());
+    cfi.flush().expect("a clean bank flushes to nothing");
+
+    // Program a byte the way the driver does — bits only ever clear, so `0x00`
+    // over `0x72` is `0x00` — and flush.
+    byte_program(&cfi, 0, 0x00);
+    assert!(cfi.array().is_dirty(), "a program dirties the bank");
+    cfi.flush().expect("the medium takes it");
+    assert!(!cfi.array().is_dirty(), "and flushing marks it clean");
+
+    let mut back = [0u8; 10];
+    medium.read_at(0, &mut back).expect("inside");
+    assert_eq!(
+        &back, b"\0semu-vars",
+        "the guest's program reached the medium, which is what a reboot reads"
+    );
+}
+
+#[test]
+fn a_medium_that_is_not_the_banks_size_is_refused_at_construction() {
+    let store: Arc<dyn Medium> = Arc::new(RamStore::new(0x1000));
+    let e = banked(store, 0x2000)
+        .expect_err("half a bank cannot receive a whole one")
+        .to_string();
+    assert!(e.contains("4096") && e.contains("8192"), "{e}");
+}
+
+#[test]
+fn a_bank_with_no_medium_flushes_to_nothing_and_captures_its_bytes() {
+    // The shape every board had before a medium could be bound, and the one
+    // `machines/riscv-virt.machine` still uses: bytes from the media table.
+    let cfi = flash(4, 0x1000);
+    word_program(&cfi, 0x20, 0x1234_5678);
+    read_array(&cfi);
+    cfi.flush().expect("nothing to write back to");
+    let bytes = snapshot(&cfi);
+    let other = flash(4, 0x1000);
+    restore(&other, &bytes);
+    assert_eq!(peek(&other, 0x20), 0x1234_5678, "capture is still capture");
+}
+
+/// A medium that answers [`Snapshot::Reference`], as a host file does.
+#[derive(Debug)]
+struct Referenced {
+    store: RamStore,
+    name: &'static str,
+}
+
+impl Medium for Referenced {
+    fn capacity(&self) -> u64 {
+        self.store.len()
+    }
+
+    fn read_at(&self, offset: u64, dst: &mut [u8]) -> MemResult {
+        self.store.read_at(offset, dst)
+    }
+
+    fn write_at(&self, offset: u64, src: &[u8]) -> MemResult {
+        self.store.write_at(offset, src)
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot::Reference
+    }
+
+    fn describe(&self) -> String {
+        String::from(self.name)
+    }
+}
+
+#[test]
+fn a_referencing_medium_puts_its_identity_in_the_chunk_and_flushes_first() {
+    let store = RamStore::new(0x2000);
+    store.fill(0, 0x2000, 0xff).expect("erased");
+    let medium: Arc<dyn Medium> = Arc::new(Referenced {
+        store,
+        name: "raw:/tmp/vars.fd:8192",
+    });
+    let cfi = banked(Arc::clone(&medium), 0x2000).expect("a bank");
+    byte_program(&cfi, 4, 0xa5);
+
+    let bytes = snapshot(&cfi);
+    // The save had to write back before it wrote the reference, or the file the
+    // chunk names would not hold what the guest had programmed.
+    let mut back = [0u8; 1];
+    medium.read_at(4, &mut back).expect("inside");
+    assert_eq!(back[0], 0xa5, "saving a reference flushes first");
+
+    // Restoring into a bank on the *same* medium works and re-reads it; one on
+    // a different medium is refused by name rather than misread.
+    let same = banked(Arc::clone(&medium), 0x2000).expect("a bank");
+    restore(&same, &bytes);
+    assert_eq!(contents(&same, 4, 1)[0], 0xa5);
+
+    let elsewhere: Arc<dyn Medium> = Arc::new(Referenced {
+        store: {
+            let s = RamStore::new(0x2000);
+            s.fill(0, 0x2000, 0xff).expect("erased");
+            s
+        },
+        name: "raw:/tmp/other.fd:8192",
+    });
+    let other = banked(elsewhere, 0x2000).expect("a bank");
+    let reader = StateReader::new(&bytes).expect("a snapshot");
+    let chunk = reader
+        .load("flash", CLASS.name, CLASS.version, &Migrations::new())
+        .expect("the chunk is there");
+    let e = other
+        .load(&mut chunk.reader())
+        .expect_err("a different file")
+        .to_string();
+    assert!(e.contains("other.fd") && e.contains("vars.fd"), "{e}");
+}

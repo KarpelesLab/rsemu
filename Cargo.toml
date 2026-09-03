@@ -830,7 +830,12 @@ dev-riscv = ["dev-medium", "dev-uart-ns16550"]
 #
 # This is the device a UEFI build needs to *keep* a variable: the write path is
 # what installs `gEfiVariableWriteArchProtocolGuid`, and RAM cannot provide it.
-dev-flash-cfi = []
+#
+# `dev-medium` because a part a guest *writes* is a storage device: the contents
+# can be backed by a host file through the same seam `ata.disk` uses, and
+# `Device::flush` writes them back at the end of a run. That feature is empty --
+# it adds no dependency and pulls in one `no_std` module.
+dev-flash-cfi = ["dev-medium"]
 
 # An SD memory card (src/dev/sd): the protocol, not a controller. The command
 # set (CMD0/CMD8/ACMD41 initialisation, CMD2/CMD3 identification, CMD7 select,
