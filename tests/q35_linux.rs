@@ -276,6 +276,122 @@ fn the_board_comes_up_in_acpi_mode_because_no_firmware_can_put_it_there() {
     assert_eq!(cnt & 1, 1, "PM1_CNT.SCI_EN, ICH9 §13.8.3.3");
 }
 
+/// `LEG_RT_CNF` takes IRQ0 off the 8254 and gives it to HPET comparator 0.
+///
+/// This is the board's own multiplexer, asked without a kernel. The kernel boot
+/// at the bottom of this file exercises it too, but that one is gated on
+/// `RSEMU_KERNEL` and takes five minutes; this asks the same question of the
+/// shipped machine file in a few milliseconds of virtual time, and it is what
+/// stands between the wiring and a quiet deletion.
+///
+/// The observable is the master 8259A's **interrupt request register**, which a
+/// read of port 0x20 returns when the last OCW3 did not select ISR. It latches
+/// a request whether or not the line is masked, which is what makes it usable
+/// here: nothing has to be allowed through to the processor, and the
+/// processor's own interrupt flag is clear throughout.
+///
+/// Sources: IA-PC HPET Specification rev 1.0a §2.3.5 for what the bit selects,
+/// the Intel 8254 data sheet for mode 2, and the 8259A data sheet for OCW3.
+#[test]
+fn the_legacy_replacement_route_moves_irq0_from_the_8254_to_the_hpet() {
+    /// The HPET's general configuration register, and its two bits.
+    const HPET_CONF: u64 = 0xfed0_0010;
+    const HPET_ENABLE: u64 = 1 << 0;
+    const HPET_LEGACY: u64 = 1 << 1;
+    /// Comparator 0's configuration register, its enable, and the comparator.
+    const HPET_T0_CONF: u64 = 0xfed0_0100;
+    const HPET_T0_ENABLE: u64 = 1 << 2;
+    const HPET_T0_COMPARATOR: u64 = 0xfed0_0108;
+    /// The main counter.
+    const HPET_COUNTER: u64 = 0xfed0_00f0;
+    /// How many counts of each timer one half of this test waits for.
+    const BUDGET_NS: u64 = 5_000_000;
+
+    let mut m = bare_board();
+
+    // Put the master 8259A into a known state. The initialization sequence also
+    // recomputes the request register from the pins it can see, which is how
+    // this test drops a latched request between the two halves below — an
+    // 8259A has no other way to lower one without an acknowledge cycle.
+    let init_master = |m: &Machine| {
+        let port = m.space("port").expect("the board declares `port`");
+        for (at, value) in [
+            (0x20u64, 0x11u64), // ICW1: edge triggered, ICW4 to follow
+            (0x21, 0x08),       // ICW2: vector base
+            (0x21, 0x04),       // ICW3: a slave on IR2
+            (0x21, 0x01),       // ICW4: 8086 mode
+            (0x21, 0xff),       // OCW1: every line masked, which IRR ignores
+        ] {
+            port.write(at, Width::U8, value, MemAttrs::DEFAULT)
+                .expect("the master 8259A decodes 0x20 and 0x21");
+        }
+    };
+    let irr = |m: &Machine| {
+        m.space("port")
+            .expect("the board declares `port`")
+            .read(0x20, Width::U8, MemAttrs::DEFAULT)
+            .expect("a read of port 0x20 answers with IRR") as u8
+    };
+    let poke = |m: &Machine, at: u64, value: u64| {
+        m.space("mem")
+            .expect("the board declares `mem`")
+            .write(at, Width::U32, value, MemAttrs::DEFAULT)
+            .unwrap_or_else(|e| panic!("write of {at:#x} faulted: {e:?}"));
+    };
+
+    // -- the line as it is on every PC that has ever booted -------------------
+    //
+    // Counter 0 in mode 2 at a rate that gives several periods inside the
+    // budget: the 8254 runs at 105/88 MHz, so 1000 counts is about 838
+    // microseconds.
+    init_master(&m);
+    assert_eq!(irr(&m) & 1, 0, "nothing has asked for IRQ0 yet");
+    {
+        let port = m.space("port").expect("the board declares `port`");
+        for (at, value) in [(0x43u64, 0x34u64), (0x40, 1000 & 0xff), (0x40, 1000 >> 8)] {
+            port.write(at, Width::U8, value, MemAttrs::DEFAULT)
+                .expect("the 8254 decodes 0x40-0x43");
+        }
+    }
+    let _ = m.run_for(GlobalTime::from_nanos(BUDGET_NS));
+    assert_eq!(
+        irr(&m) & 1,
+        1,
+        "with LEG_RT_CNF clear the 8254's counter 0 owns IRQ0"
+    );
+
+    // -- and the line once the HPET takes it over -----------------------------
+    //
+    // `LEG_RT_CNF` set, the counter left running exactly as it was. The 8254 is
+    // now disconnected, so a fresh initialization must find nothing on IR0 and
+    // must still find nothing after several more of the counter's periods.
+    poke(&m, HPET_CONF, HPET_ENABLE | HPET_LEGACY);
+    init_master(&m);
+    assert_eq!(irr(&m) & 1, 0, "the initialization dropped the latch");
+    let _ = m.run_for(GlobalTime::from_nanos(BUDGET_NS));
+    assert_eq!(
+        irr(&m) & 1,
+        0,
+        "the 8254 is still counting and must no longer reach IRQ0"
+    );
+
+    // Comparator 0, one shot, a hundred microseconds out: a 10 MHz counter, so
+    // 1000 ticks. This is the half that says the HPET has the line rather than
+    // that nobody has it.
+    let now = u64::from(read32(
+        m.space("mem").expect("the board declares `mem`"),
+        HPET_COUNTER,
+    ));
+    poke(&m, HPET_T0_COMPARATOR, now + 1000);
+    poke(&m, HPET_T0_CONF, HPET_T0_ENABLE);
+    let _ = m.run_for(GlobalTime::from_nanos(BUDGET_NS));
+    assert_eq!(
+        irr(&m) & 1,
+        1,
+        "with LEG_RT_CNF set comparator 0 drives IRQ0, and nothing else does"
+    );
+}
+
 /// The controller is on the bus at the address the machine file names, and it
 /// is reachable through both routes to configuration space.
 #[test]
