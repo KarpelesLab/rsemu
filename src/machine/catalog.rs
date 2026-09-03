@@ -571,6 +571,23 @@ pub static A64_MINI: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/a64-mini.machine"),
 };
 
+/// The AArch64 `virt` board, when this build has a core and the board's chips.
+///
+/// The board an `arm64` Linux kernel is pointed at. The `kernel` slot takes a
+/// flat `Image` — not a `vmlinuz` and not a bzImage — and the `initrd` slot a
+/// cpio archive; the device tree the guest is handed in `x0` is generated from
+/// the realized machine rather than shipped (`docs/platforms/arm64-virt.md`).
+#[cfg(feature = "machine-arm64-virt")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-arm64-virt")))]
+pub static ARM64_VIRT: CatalogEntry = CatalogEntry {
+    name: "arm64-virt",
+    summary: "AArch64 `virt`: a Cortex-A53-class core, GICv2, PL011, PSCI, DTB",
+    // Only `kernel` is needed to come up; `initrd` is what a kernel that has
+    // to find a root filesystem wants, and unbound means no ramdisk.
+    media: &["kernel", "initrd"],
+    source: include_str!("../../machines/arm64-virt.machine"),
+};
+
 /// Every machine this build can realize, in catalog order.
 // One `#[cfg]`-gated push per shipped machine, which is what the lint is
 // complaining about: a `vec![]` literal cannot carry an attribute on one of its
@@ -584,6 +601,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&APPLE1);
     #[cfg(feature = "machine-a64-mini")]
     out.push(&A64_MINI);
+    #[cfg(feature = "machine-arm64-virt")]
+    out.push(&ARM64_VIRT);
     #[cfg(feature = "machine-arm926")]
     out.push(&ARM926);
     #[cfg(feature = "machine-beneater")]
@@ -757,6 +776,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::apple1::register(&mut reg)?;
     #[cfg(feature = "cpu-arm-a64")]
     crate::cpu::arm::a64::register(&mut reg)?;
+    #[cfg(feature = "dev-arm")]
+    crate::dev::arm::register(&mut reg)?;
     #[cfg(feature = "cpu-arm-aprofile")]
     crate::cpu::arm::aprofile::register(&mut reg)?;
     #[cfg(feature = "cpu-arm-v7m")]
@@ -867,6 +888,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::apple1::bind(&mut b)?;
     #[cfg(feature = "cpu-arm-a64")]
     crate::cpu::arm::a64::bind(&mut b)?;
+    #[cfg(feature = "dev-arm")]
+    crate::dev::arm::bind(&mut b)?;
     #[cfg(feature = "cpu-arm-aprofile")]
     crate::cpu::arm::aprofile::bind(&mut b)?;
     #[cfg(feature = "cpu-arm-v7m")]
@@ -972,6 +995,10 @@ pub fn classes() -> ClassTable {
     }
     #[cfg(feature = "cpu-arm-a64")]
     table.insert(crate::cpu::arm::a64::schema());
+    #[cfg(feature = "dev-arm")]
+    for schema in crate::dev::arm::schemas() {
+        table.insert(schema);
+    }
     #[cfg(feature = "cpu-arm-aprofile")]
     table.insert(crate::cpu::arm::aprofile::schema());
     #[cfg(feature = "cpu-arm-v7m")]
@@ -1732,6 +1759,32 @@ mod tests {
             // `tests/arm926_board.rs` supplies the one that does something.
             #[cfg(feature = "machine-arm926")]
             ("arm926", "firmware") => &[0xfe, 0xff, 0xff, 0xea],
+            // The smallest thing `arm.loader`'s `format = "arm64"` accepts: a
+            // 64-byte AArch64 `Image` header whose `code0` branches over it,
+            // and `B .` on the far side. A bare `B .` would be *refused* here
+            // rather than loaded, which is the point — this board checks the
+            // header, and the check is what stops a `vmlinuz` being entered at
+            // its gzip magic. `tests/a64_linux.rs` supplies a real kernel,
+            // behind `RSEMU_ARM64_KERNEL`.
+            #[cfg(feature = "machine-arm64-virt")]
+            ("arm64-virt", "kernel") => &[
+                0x10, 0x00, 0x00, 0x14, // code0: b .+0x40, over the header
+                0x00, 0x00, 0x00, 0x00, // code1
+                0, 0, 0, 0, 0, 0, 0, 0, // text_offset: 0, a relocatable kernel
+                0x00, 0x10, 0, 0, 0, 0, 0, 0, // image_size: 4 KiB
+                0, 0, 0, 0, 0, 0, 0, 0, // flags: little-endian, 4 KiB pages
+                0, 0, 0, 0, 0, 0, 0, 0, // res2
+                0, 0, 0, 0, 0, 0, 0, 0, // res3
+                0, 0, 0, 0, 0, 0, 0, 0, // res4
+                0x41, 0x52, 0x4d, 0x64, // magic: "ARM\x64"
+                0, 0, 0, 0, // res5
+                0x00, 0x00, 0x00, 0x14, // b .
+            ],
+            // No ramdisk, which is what a bare-metal boot has: the `initrd`
+            // loader writes nothing for an empty image and the boot ROM leaves
+            // `/chosen` without the two `linux,initrd-*` properties.
+            #[cfg(feature = "machine-arm64-virt")]
+            ("arm64-virt", "initrd") => &[],
             // The two words a Cortex-M4 fetches out of reset — an initial
             // stack pointer at the top of SRAM and a reset vector, with bit 0
             // set because there is no ARM state to interwork to — followed by

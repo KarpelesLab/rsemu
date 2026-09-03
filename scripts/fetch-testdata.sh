@@ -105,6 +105,15 @@ readonly LINUX_IMAGE_URL="https://deb.debian.org/debian/dists/trixie/main/instal
 readonly BUSYBOX_DEB="https://deb.debian.org/debian/pool/main/b/busybox/busybox-static_1.37.0-6+b8_riscv64.deb"
 readonly BUSYBOX_DEB_SHA="1a41dc2cb6c45f2d9a3dd1dcd027d888400c8f51e958a9b9b9fd2922f8735b86"
 readonly BUSYBOX_MEMBER="./usr/bin/busybox"
+
+# The arm64 half of the same two fixtures, for machines/arm64-virt.machine.
+# Debian's installer kernel is a flat AArch64 `Image` -- not a vmlinuz and not
+# an EFI zboot image -- which is exactly what `arm.loader` wants; the busybox
+# is the same package built for arm64. Both are GPL-2.0: FETCH-ONLY.
+readonly ARM64_LINUX_IMAGE_URL="https://deb.debian.org/debian/dists/trixie/main/installer-arm64/current/images/netboot/debian-installer/arm64/linux"
+readonly BUSYBOX_ARM64_DEB="https://deb.debian.org/debian/pool/main/b/busybox/busybox-static_1.37.0-6+b8_arm64.deb"
+readonly BUSYBOX_ARM64_SHA="6d144e5012d47ec3a6f2102ba6fac644ad34c989373fed30c1bb7264f5cd3616"
+readonly DEBIAN_PACKAGES_ARM64="https://deb.debian.org/debian/dists/trixie/main/binary-arm64/Packages.gz"
 # Debian's pool keeps only the current build of a binary package, so the URL
 # above stops resolving the next time busybox is rebuilt. This is where the
 # name is looked up when that happens — and it is also how the kernel package
@@ -836,6 +845,112 @@ Consumed by RSEMU_RISCV_PAYLOAD in src/dev/riscv/tests.rs."
 	note "      RSEMU_RISCV_PAYLOAD=0x80200000:${target} \\"
 	note "      RSEMU_RISCV_RAM=1G RSEMU_RISCV_QUANTA=4000000 \\"
 	note "          cargo test --release --all-features firmware_from_the --lib -- --nocapture"
+}
+
+# ---------------------------------------------------------------------------
+# arm64: a kernel and a root filesystem for machines/arm64-virt.machine
+# ---------------------------------------------------------------------------
+
+fetch_arm64_linux() {
+	need curl
+	local dest="${DEST_ROOT}/arm64"
+	local target="${dest}/linux"
+	mkdir -p "$dest"
+
+	if [ "$FORCE" = 0 ] && [ -s "$target" ]; then
+		ok "arm64 linux already present ($(wc -c <"$target" | tr -d ' ') bytes)"
+	else
+		note "  downloading the arm64 linux Image (about 36 MiB) ..."
+		download "$ARM64_LINUX_IMAGE_URL" "$target"
+	fi
+
+	# No checksum: Debian rebuilds the installer kernel and pinning one would
+	# make this script fail every point release. The header is the check that
+	# matters anyway -- an AArch64 `Image` carries the four bytes "ARM\x64" at
+	# offset 0x38, which an HTML error page does not.
+	local magic
+	magic="$(dd if="$target" bs=1 skip=56 count=4 2>/dev/null || true)"
+	if [ "$magic" != "ARMd" ]; then
+		rm -f "$target"
+		die "that is not an AArch64 Linux Image: no ARM\\x64 magic at offset 0x38"
+	fi
+	ok "arm64 linux ($(wc -c <"$target" | tr -d ' ') bytes)"
+	linux_notice "$dest" "Debian installer arm64 kernel
+${ARM64_LINUX_IMAGE_URL}
+
+Licence: GPL-2.0. FETCH-ONLY -- running it as an emulated guest is ordinary
+use; committing it to this repository would be redistribution under its terms
+(ROADMAP.md section 1).
+
+A flat AArch64 \`Image\`: a 64-byte header, then the kernel. rsemu's
+\`arm.loader\` reads that header, refuses anything that is not one, and puts it
+2 MiB into DRAM, which is where a kernel with \`text_offset = 0\` asks to be.
+
+Consumed by RSEMU_ARM64_KERNEL in tests/a64_linux.rs."
+	arm64_hint "$dest"
+}
+
+arm64_hint() {
+	local dest="$1"
+	note ""
+	note "  Boot it:"
+	note "      RSEMU_ARM64_KERNEL=${dest}/linux \\"
+	note "      RSEMU_ARM64_INITRD=${dest}/initramfs.cpio \\"
+	note "          cargo test --release --features machine-arm64-virt \\"
+	note "              --test a64_linux -- --nocapture"
+}
+
+# The arm64 busybox binary, unpacked into <scratch dir>. Sets BUSYBOX_BIN, as
+# `busybox_binary` does and for the same reason.
+busybox_arm64_binary() {
+	local work="$1" url="$BUSYBOX_ARM64_DEB"
+	if ! curl --fail --silent --head --location "$url" >/dev/null 2>&1; then
+		need gzip
+		warn "the pinned arm64 busybox-static build is gone from the pool; asking the index"
+		local filename
+		filename="$(curl --fail --silent --location "$DEBIAN_PACKAGES_ARM64" | gzip -cd |
+			awk '/^Package: busybox-static$/ { found = 1 }
+			     found && /^Filename: / { print $2; exit }')"
+		[ -n "$filename" ] || die "busybox-static is not in ${DEBIAN_PACKAGES_ARM64}"
+		url="https://deb.debian.org/debian/${filename}"
+		note "  downloading $(basename -- "$url") ..."
+		download "$url" "${work}/busybox.deb"
+	else
+		# Advisory rather than fatal: Debian rebuilds busybox, and a rebuild
+		# under the same file name is a new binary rather than a wrong one.
+		fetch_verified "$url" "${work}/busybox.deb" "$BUSYBOX_ARM64_SHA" advisory
+	fi
+	( cd "$work" && ar x busybox.deb data.tar.xz ) || die "that .deb is not an ar archive"
+	tar -xf "${work}/data.tar.xz" -C "$work" "$BUSYBOX_MEMBER" 2>/dev/null ||
+		die "no ${BUSYBOX_MEMBER} in the package; upstream may have moved it"
+	rm -f "${work}/data.tar.xz" "${work}/busybox.deb"
+	local bb="${work}/${BUSYBOX_MEMBER}"
+
+	# 183 is EM_AARCH64. The wrong architecture would otherwise show up as a
+	# kernel panic ten minutes into a boot rather than here.
+	elf_is "$bb" 183 "AArch64"
+	BUSYBOX_BIN="$bb"
+}
+
+fetch_arm64_initramfs() {
+	need curl
+	need tar
+	need ar
+	local dest="${DEST_ROOT}/arm64"
+	local target="${dest}/initramfs.cpio"
+	mkdir -p "$dest"
+
+	local work="${dest}/.initramfs"
+	rm -rf "$work"
+	mkdir -p "$work"
+
+	busybox_arm64_binary "$work"
+	build_initramfs "$target" "$BUSYBOX_BIN" "$work"
+	rm -rf "$work"
+
+	ok "$(basename -- "$target") ($(wc -c <"$target" | tr -d ' ') bytes)"
+	initramfs_notice "$dest"
+	arm64_hint "$dest"
 }
 
 # ---------------------------------------------------------------------------
@@ -1755,6 +1870,11 @@ Suites:
   initramfs-virtio
                  the same archive with the kernel's own virtio-mmio and
                  virtio-blk modules in it, plus a disk image to read
+  arm64-linux    an AArch64 Linux Image to boot on arm64-virt (GPL-2.0,
+                 FETCH-ONLY). A flat `Image`, which is what arm.loader wants.
+  arm64-initramfs
+                 a busybox root filesystem for it, built here around Debian's
+                 arm64 busybox-static (GPL-2.0, FETCH-ONLY)
   initramfs-x86  the same archive built around busybox.net's own x86-64
                  static build, for the pc64 and q35-linux boards (GPL-2.0,
                  FETCH-ONLY). The kernel it boots under is yours: no bzImage
@@ -1791,7 +1911,7 @@ list_present() {
 	fi
 	local suite
 	for suite in sst-65x02 mips-r3000 nestest accuracycoin gb-blargg gb-mooneye \
-		sms-zexall apple1 riscv riscv-arch-test a64-tests freedos x86; do
+		sms-zexall apple1 riscv riscv-arch-test a64-tests arm64 freedos x86; do
 		if [ -d "${DEST_ROOT}/${suite}" ]; then
 			printf '  %-14s %s\n' "$suite" \
 				"$(du -sh "${DEST_ROOT}/${suite}" 2>/dev/null | cut -f1) present"
@@ -1848,6 +1968,8 @@ for suite in "${SUITES[@]}"; do
 		riscv-arch-test|arch-test|act) fetch_arch_test ;;
 		edk2|uefi) fetch_edk2 ;;
 		linux|kernel) fetch_linux ;;
+		arm64-linux|arm64) fetch_arm64_linux ;;
+		arm64-initramfs|arm64-rootfs) fetch_arm64_initramfs ;;
 		initramfs|rootfs) fetch_initramfs ;;
 		initramfs-virtio|virtio) fetch_initramfs_virtio ;;
 		initramfs-x86|x86) fetch_initramfs_x86 ;;

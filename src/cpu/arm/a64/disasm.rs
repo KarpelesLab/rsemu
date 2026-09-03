@@ -624,7 +624,12 @@ pub fn disassemble(word: u32, pc: u64, features: isa::Features) -> Disassembled 
                 );
             }
         }
-        Fmt::LdStUImm | Fmt::LdStUnscaled | Fmt::LdStPost | Fmt::LdStPre | Fmt::LdStRegOff => {
+        Fmt::LdStUImm
+        | Fmt::LdStUnscaled
+        | Fmt::LdStUnpriv
+        | Fmt::LdStPost
+        | Fmt::LdStPre
+        | Fmt::LdStRegOff => {
             let size = isa::ls_size(word);
             let dest = match isa::ls_access(size, isa::ls_opc(word)) {
                 Some(isa::LsAccess::Store { bytes }) => {
@@ -645,7 +650,7 @@ pub fn disassemble(word: u32, pc: u64, features: isa::Features) -> Disassembled 
                         let _ = write!(ops, "{dest}, [{base}, #0x{offset:x}]");
                     }
                 }
-                Fmt::LdStUnscaled => {
+                Fmt::LdStUnscaled | Fmt::LdStUnpriv => {
                     let offset = isa::imm9(word);
                     if offset == 0 {
                         let _ = write!(ops, "{dest}, [{base}]");
