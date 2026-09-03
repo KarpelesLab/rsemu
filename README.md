@@ -246,6 +246,16 @@ that round's instant. So `--record-input` and `--replay-input` reproduce a
 session bit for bit, which `tests/vnc_input.rs` asserts by comparing state
 hashes — against a run nobody typed at, which reaches a different one.
 
+Those two flags are not the frontend's. `--record-input` seals the board's
+**host-object table** for the build, so every door a device opens — a console,
+a controller, a network port — is wired to the recorder before the machine has
+executed an instruction, and a board with an input that nothing can record
+*refuses to build* rather than producing a log with a stream quietly missing
+from it. `printf 'E000.E00F\r' | rsemu run apple1 --for 1s --record-input
+session.trace` records a terminal session, and `rsemu run apple1 --for 1s
+--replay-input session.trace` types it again on a machine with nothing on its
+stdin, arriving at the same state hash.
+
 There is **sound**, too. The audio seam mirrors the display one: a device emits
 what the silicon does — the RP2A03 emits an unsigned level out of a non-linear
 DAC pair at 894 886.36… Hz — and the host applies the board's own RC network,

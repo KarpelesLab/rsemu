@@ -1242,7 +1242,7 @@ pub mod buses {
     use crate::core::props::Props;
 
     /// The kind a USB bus is filed under in a build's [`HostObjects`].
-    pub const KIND: HostKind = HostKind::new("usb-bus");
+    pub const KIND: HostKind = HostKind::rendezvous("usb-bus");
 
     /// The bus called `name` in `hosts`, creating it with `ports` ports if this
     /// is the first mention.

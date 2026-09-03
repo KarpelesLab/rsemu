@@ -51,7 +51,7 @@ pub mod slots {
     use crate::core::sync::{LockRank, Mutex};
 
     /// The kind a card slot is filed under in a build's [`HostObjects`].
-    pub const KIND: HostKind = HostKind::new("sd-slot");
+    pub const KIND: HostKind = HostKind::rendezvous("sd-slot");
 
     /// Where a card socket's lock sits in the ranked order.
     ///

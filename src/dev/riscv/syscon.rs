@@ -127,7 +127,7 @@ pub mod signals {
 
     /// The kind a power signal is filed under in a build's
     /// [`HostObjects`].
-    pub const KIND: HostKind = HostKind::new("signal");
+    pub const KIND: HostKind = HostKind::rendezvous("signal");
 
     /// The a power signal `name` refers to in `hosts`, creating it on first mention.
     ///

@@ -922,7 +922,7 @@ pub mod buses {
     use crate::core::props::Props;
 
     /// The kind an I²C bus is filed under in a build's [`HostObjects`].
-    pub const KIND: HostKind = HostKind::new("i2c-bus");
+    pub const KIND: HostKind = HostKind::rendezvous("i2c-bus");
 
     /// The I²C bus `name` refers to in `hosts`, creating it on first mention.
     ///

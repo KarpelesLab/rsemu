@@ -23,17 +23,18 @@
 //!
 //! | Input | Status |
 //! | --- | --- |
-//! | A frontend's keys and pointer | **through here** — `host::input` posts twelve-byte records on `input:vnc`, and `host::vnc::session` is the **only** [`Recorder::register`] call site in `src/`. A USB HID pointer rides the same channel |
-//! | Gamepad buttons | **registerable, registered only by tests** — a NES pad table, a Game Boy `GbPad` and a Master System `SmsPads` are host objects under `pad:` and each ships a `channel()`/`sink()` pair; `tests/joypad_replay.rs` wires them and nothing in `src/` does |
-//! | Network frames | **registerable, registered only by tests** — `dev::net::link::ports` ships the pair and `tests/ne2000_board.rs` wires it. A `PktkitLink` built the other way holds a *private* port that is not in the table at all, and its own docs call that the unrecorded form of the same path |
-//! | Keystrokes and terminal bytes | **not through here today.** A character port *is* a host object, so a sealed table would refuse the board — but `host::chardev` ships no `channel()`/`sink()` pair, `host::terminal`'s pump feeds the port directly, and `tests/record_replay.rs` hand-rolls the two closures locally. The gap is two functions beside `ports::open`, and until they exist the CLI's own console is unrecorded |
+//! | A frontend's keys and pointer | **through here** — `host::input` posts twelve-byte records on `input:vnc`, registered by `host::vnc::session`. A USB HID pointer rides the same channel. The one channel with no host object behind it, so it is also the one the *table* cannot wire |
+//! | Keystrokes and terminal bytes | **through here** — `host::chardev::ports` ships the `channel()`/`sink()` pair, `HostKind::door` carries the factory, and `rsemu run … --record-input` on a console records and replays it. The pair did not exist and the CLI's console was unrecorded; nothing failed, which is the argument this module makes for the seal |
+//! | Gamepad buttons | **through here** — a NES `Pad`, a Game Boy `GbPad` and a Master System `SmsPads` are host objects under `pad:` and each now ships the pair. The NES one did not, and this table used to claim all three did: the invisible skip, in this file, about this file |
+//! | Network frames | **through here** — `dev::net::link::ports` ships the pair. A `PktkitLink` built the other way holds a *private* port that is not in the table at all, and its own docs call that the unrecorded form of the same path |
 //! | Guest-visible randomness | already deterministic: `virtio-rng` is a seeded SplitMix64, and says so in its own docs |
 //! | The real-time clock | already deterministic: the MC146818 takes its epoch from a `time` property and advances from its own clock domain, never the host's |
 //! | The host wall clock | not guest-visible: `HostClock` is injected into the scheduler from above the `std` line and only feeds `Pace::Wait` |
 //! | Host file I/O **completion** | nothing to timestamp — every block backend completes inside the guest access that issued it. When one becomes asynchronous, its completion is a channel |
 //! | Host file I/O **content** | **not covered, and this is not a timing question.** A drive's bytes are host state outside the recording: a replay against an image the host has since edited diverges, and nothing checks that it is the same image. A medium snapshotted by *reference* compares an identity string, never contents (`machine::Timeline` has the rewind half of this) |
-//! | A debugger writing guest state | **not covered** — `host::gdb` lets a TCP peer set registers and memory mid-run. It is a deliberate power rather than an oversight, but a session debugged and recorded at once is not replayable and nothing says so |
+//! | A debugger writing guest state | **not covered** — `host::gdb` lets a TCP peer set registers and memory mid-run. It is a deliberate power rather than an oversight, but a session debugged and recorded at once is not replayable and nothing says so. `rsemu run --gdb` also pumps the console straight into the port between the debugger's turns, so those keystrokes miss the seam even though the board was sealed |
 //! | Constructor interception | **not covered** — `Bindings::replace` swaps a class for another at build time, which is how `accel` substitutes a KVM core. A build-time door parallel to the host-object table, and the reason an accelerated board is out of scope for replay twice over |
+//! | A frontend pressing a *captured* device | **covered sideways.** `host::input::MouseSink` reaches a concrete `HidMouse` out of a [`Captured`](crate::core::hosts::Captured) table and pushes reports into it. What it pushes is recorded — on `input:vnc`, the frontend's channel — but the capture table itself is a `HostKind::rendezvous` and the seal does not check it, so a *different* host doing the same thing without posting first would not be caught |
 //! | Thread interleaving under `parallel` | **cannot go through here**, which is why replay is deterministic-mode only — see below |
 //!
 //! # The chokepoint is the host-object table, not the device
@@ -58,59 +59,76 @@
 //!
 //! So enforcement is a property of that table rather than of each device.
 //! [`HostObjects::seal`](crate::core::hosts::HostObjects::seal) puts a recorder
-//! in front of it: from that point on, opening a host object whose channel the
-//! recorder has not registered is
-//! [`Error::Config`] naming the channel, at
-//! *build* time, before the machine has executed an instruction. A device that
-//! reaches for the host without declaring itself does not get a mis-recorded
-//! run; it gets a machine that refuses to realize.
+//! in front of it, at *build* time, before the machine has executed an
+//! instruction: every input door the board opened is wired to the recorder, and
+//! one that cannot be — because nothing says where its payloads go — is
+//! [`Error::Config`] naming the object. A device that reaches for the host
+//! without declaring itself does not get a mis-recorded run; it gets a machine
+//! that refuses to realize.
 //!
-//! ## The seal is a mechanism, and nothing in `src/` turns it on
+//! ## The seal is engaged, and what it took was telling the kinds apart
 //!
-//! Stated plainly because the paragraph above reads like a description of what
-//! the product does, and it is a description of what the product *can* do.
-//! Every `seal` call site in the tree is a test. `machine::realize` carries the
-//! table into every device's `Props` and never seals it; the binary builds a
-//! recorder, attaches a VNC session and calls `Machine::set_recorder` without
-//! sealing. A board therefore realizes whether or not its inputs are declared,
-//! and `--record-input` on a machine with a console records the VNC events and
-//! not the console.
+//! This section used to say the opposite, at length: the paragraph above read
+//! like a description of what the product did and was a description of what it
+//! *could* do, because every `seal` call site in the tree was a test.
 //!
-//! There is a structural reason it has stayed opt-in, and it is worth naming
-//! because it is the thing to fix rather than a preference:
-//! **[`HostKind`] files three different things under one name space**, and the
-//! seal checks all of them alike:
+//! The structural reason it stayed opt-in was that [`HostKind`] filed three
+//! unrelated things under one name space and the seal checked all of them
+//! alike:
 //!
-//! * **Doors that are channels** — `chardev`, `pad`, `netdev`, `capture`. An
-//!   input arrives as bytes at an instant, so it can be logged and re-delivered,
-//!   and demanding a channel for one is exactly right.
+//! * **Doors** — `chardev`, `pad`, `netdev`. An input arrives as bytes at an
+//!   instant, so it can be logged and re-delivered, and demanding a channel for
+//!   one is exactly right.
 //! * **Rendezvous inside the machine** — `pci-bus`, `usb-bus`, `i2c-bus`,
 //!   `spi-bus`, `ata-bay`, `sd-slot`, `floppy-drive`, `apic-bus`, `signal`,
-//!   `riscv.dt`. How two devices find each other. Nothing crosses from the host
-//!   at all, so there is nothing to record and nothing to demand.
+//!   `riscv.dt`, and `capture`. How two ends of one build find each other, or
+//!   how the host takes a handle on something to *read*. Nothing crosses from
+//!   the host, so there is nothing to record and nothing to demand.
 //! * **A door that cannot be a channel** — `medium`. Host bytes really do cross
 //!   here, but the guest *pulls* them a sector at a time rather than receiving
 //!   them at an instant, so no `(instant, payload)` log describes it. What that
 //!   needs is an identity check on the image, which is `dev::medium`'s
-//!   `Snapshot::Reference` — and a weak one, as the table above says — not a
-//!   channel.
+//!   `Snapshot::Reference` — and a weak one, as the table above says.
 //!
-//! Only the first group belongs to the seal, and it holds all three, so sealing
-//! any board with a PCI or USB bus in it fails on an object that was never an
-//! input. The seal works on the Apple 1, the Game Boy and a two-device NIC
-//! board, which is exactly the set of boards the tests seal.
+//! Only the first group belongs to the seal, and it held all three, so sealing
+//! any board with a PCI or USB bus in it failed on an object that was never an
+//! input. A kind now says which it is — [`HostKind::new`] (a door nobody has
+//! classified), [`HostKind::door`] (one that ships a sink),
+//! [`HostKind::rendezvous`], [`HostKind::pulled`] — and the **unclassified
+//! default is the strict one**, so a kind whose author has not thought about
+//! this stops a recorded build instead of quietly missing from the log.
 //!
-//! The fix is a mark on the kind — `HostKind::door()` beside `HostKind::new()`,
-//! with `seal` checking only the doors — and it touches every kind's definition
-//! site across `bus/` and `dev/`, so it is described here rather than made
-//! here. `tests::the_seal_cannot_tell_a_door_from_a_rendezvous` pins the
-//! current behaviour so the change has something to flip.
+//! [`HostKind::new`]: crate::core::hosts::HostKind::new
+//! [`HostKind::door`]: crate::core::hosts::HostKind::door
+//! [`HostKind::rendezvous`]: crate::core::hosts::HostKind::rendezvous
+//! [`HostKind::pulled`]: crate::core::hosts::HostKind::pulled
 //!
-//! What the seal does **not** stop even once it is on is a device that
-//! manufactures non-determinism internally — a device calling the host clock in
-//! its own read path would never touch this table. Nothing in the type system
-//! stops that; what stops it is that `no_std` is the default for `dev/`, CI
-//! builds `--no-default-features`, and such a device would not compile there.
+//! With that, `machine::realize` seals. Given a
+//! [`RealizeOptions::recorder`](crate::machine::RealizeOptions::recorder) it
+//! seals the host-object table **between the two construction phases** — after
+//! every device's `new(props)` has opened what it wants and before any of them
+//! has acted — and the seal then does three things to each open object: skips a
+//! rendezvous, leaves a door the caller already registered alone, and wires a
+//! door the caller did not by asking the door's own module for a sink. A door
+//! whose module ships no sink is where the build stops.
+//!
+//! That last part is what makes the CLI work. `rsemu run … --record-input`
+//! cannot know that this board's console is called `console` and that one's is
+//! called `keyboard` — the name comes out of a machine file — so a binary that
+//! had to register channels by hand could only ever record the frontend, which
+//! is precisely what `--record-input` used to do. It records a console now, and
+//! `--replay-input` drives one, on a board the binary knows nothing about.
+//!
+//! The escape hatch is that the recorder is an `Option`. A machine nobody is
+//! recording is built against an open table, exactly as before; sealing
+//! unconditionally would refuse a board the moment a device grew an input, for
+//! a run with no interest in replaying.
+//!
+//! What the seal does **not** stop, even now, is a device that manufactures
+//! non-determinism internally — a device calling the host clock in its own read
+//! path would never touch this table. Nothing in the type system stops that;
+//! what stops it is that `no_std` is the default for `dev/`, CI builds
+//! `--no-default-features`, and such a device would not compile there.
 //!
 //! # Delivery happens at a round boundary, and only there
 //!
@@ -251,10 +269,14 @@
 //!    [`HostObjects`](crate::core::hosts::HostObjects)** — which a device does
 //!    already, through `Props::host`, or it has no way to reach the host at all.
 //! 2. **Ship a `channel()` and a `sink()` beside the `open()`**, in the same
-//!    module, so a caller can wire the two together without knowing what the
-//!    object is. This is the step that gets skipped: `chardev` has an `open`
-//!    and no pair, so the CLI's console is unrecorded while a test that writes
-//!    the two closures by hand records it fine. A pair is ten lines.
+//!    module, and declare the kind with
+//!    [`HostKind::door`](crate::core::hosts::HostKind::door) so the table can
+//!    reach the `sink()` through the erased handle it holds. This is the step
+//!    that got skipped — `chardev` and the NES pad each had an `open()` and no
+//!    pair, and the section above claimed otherwise about one of them — and it
+//!    is now the step that **stops a recorded build**: a door with no sink is
+//!    [`Error::Config`] naming the object and saying which two functions to
+//!    write. A pair is ten lines.
 //! 3. **Register a rewind hook if the object queues bytes the guest has not
 //!    read yet**, and none if it holds a level — a held-button mask is
 //!    architectural state the snapshot already carries.
@@ -263,9 +285,13 @@
 //!    there is no recorder" has two paths, and the recorded one is the one
 //!    nobody exercises.
 //!
-//! None of that is enforced. Step 2's absence is invisible — nothing fails, the
-//! recording is simply short — which is the argument for the seal being on by
-//! default rather than opt-in.
+//! Steps 1 and 2 are enforced, under a recording, by the seal: 1 because a
+//! device that does not open through the table has no host to reach, and 2
+//! because a door with no sink refuses to build. Steps 3 and 4 are not, and
+//! cannot be from here — a missing rewind hook shows up as a byte delivered
+//! twice after a rewind, and a device that keeps a private path around the
+//! recorder is a device with two paths, of which the recorded one is the one
+//! nobody exercises.
 //!
 //! # The recording is a file, so it is a parser
 //!
@@ -859,17 +885,18 @@ impl Recorder {
     ///
     /// # Errors
     ///
-    /// [`Error::Config`] if the recorder has been sealed onto a host-object
-    /// table. Registration is a build-time act; a channel appearing after the
-    /// machine is running would silently have missed everything before it.
+    /// [`Error::Config`] if the recorder has been [sealed](Recorder::seal),
+    /// which the first [`deliver`](Recorder::deliver) does. Registration is a
+    /// build-time act; a channel appearing after the machine has run would
+    /// silently have missed everything before it.
     pub fn register(&self, channel: Channel, sink: Arc<dyn InputSink>) -> Result<()> {
         let mut state = self.state.lock();
         if state.sealed {
             return Err(Error::Config {
                 at: channel.to_string(),
                 message: String::from(
-                    "a channel cannot be registered after the recorder is sealed onto a \
-                     host-object table: register every channel before the machine is built",
+                    "a channel cannot be registered after the machine has started \
+                     delivering input: register every channel before the first run",
                 ),
             });
         }
@@ -891,9 +918,16 @@ impl Recorder {
 
     /// Stop accepting new channels.
     ///
-    /// Called by [`HostObjects::seal`](crate::core::hosts::HostObjects::seal).
-    /// Separate from sealing the table so a recorder used without one — a unit
-    /// test, a replay with no machine — is not forced through it.
+    /// The first [`deliver`](Recorder::deliver) does this, which is where
+    /// [`register`](Recorder::register)'s reason actually bites: a channel is
+    /// harmless until the machine has run, and useless afterwards. It stays
+    /// public for a caller that wants the list closed sooner.
+    ///
+    /// Deliberately *not* done by
+    /// [`HostObjects::seal`](crate::core::hosts::HostObjects::seal), which it
+    /// used to be. A frontend that draws the machine cannot exist until the
+    /// machine does, so its channel is registered after the build — and
+    /// `machine::realize` seals the table during the build.
     pub fn seal(&self) {
         self.state.lock().sealed = true;
     }
@@ -960,6 +994,11 @@ impl Recorder {
         // Phase one, under the lock: decide what goes out, and to whom.
         let batch: Vec<(Arc<dyn InputSink>, Vec<u8>)> = {
             let mut state = self.state.lock();
+            // The channel list closes here rather than when a host-object table
+            // is sealed: from this instant a new channel would be one that had
+            // missed everything already delivered, which is the thing
+            // `register` refuses.
+            state.sealed = true;
             match self.mode {
                 Mode::Record => {
                     let drained = core::mem::take(&mut state.pending);

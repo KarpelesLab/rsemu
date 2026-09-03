@@ -137,7 +137,7 @@ pub mod bus {
     use crate::core::sync::{LockRank, Mutex};
 
     /// The kind an APIC bus is filed under in a build's `HostObjects`.
-    pub const KIND: HostKind = HostKind::new("apic-bus");
+    pub const KIND: HostKind = HostKind::rendezvous("apic-bus");
 
     /// The bus name an APIC gets when a machine description does not say.
     pub const DEFAULT_NAME: &str = "apic";

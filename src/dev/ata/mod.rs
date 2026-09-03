@@ -101,7 +101,7 @@ pub mod bays {
     use crate::core::sync::{LockRank, Mutex};
 
     /// The kind a drive bay is filed under in a build's [`HostObjects`].
-    pub const KIND: HostKind = HostKind::new("ata-bay");
+    pub const KIND: HostKind = HostKind::rendezvous("ata-bay");
 
     /// Where a drive bay's lock sits in the ranked order.
     ///

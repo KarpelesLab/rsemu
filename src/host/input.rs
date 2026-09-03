@@ -308,7 +308,17 @@ pub fn deliver_all(sinks: &[Box<dyn InputSink>], event: InputEvent) {
 ///
 /// Not a [`HostObjects`](crate::core::hosts::HostObjects) kind: nothing is
 /// filed under it, because there is no object for a device to open — see the
-/// module docs.
+/// module docs. It is the one kind that is a channel and not a table entry,
+/// which is also why the host-object seal cannot reach this stream: a frontend
+/// is not part of the machine, so nothing about the board says it should be
+/// there.
+///
+/// Declared with [`HostKind::new`], the strict default, rather than
+/// [`HostKind::door`]: if an object ever were filed under `input` it would be
+/// something nobody has thought about, and a sealed table should say so instead
+/// of wiring it to a sink that does not fit.
+///
+/// [`HostKind::door`]: crate::core::hosts::HostKind::door
 pub const KIND: HostKind = HostKind::new("input");
 
 /// The stream name a frontend gets when it asks for nothing better.

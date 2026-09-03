@@ -457,37 +457,59 @@ fn sealing_a_populated_table_checks_what_is_already_open() {
     assert!(!hosts.is_sealed(), "a refused seal leaves the table open");
 }
 
+/// A table seal does *not* close the channel list; the first delivery does.
+///
+/// It used to, and that made the mechanism unusable on the one path that
+/// matters: a frontend cannot exist before the machine it draws, so `--vnc
+/// --record-input` registers `input:vnc` after the build — which is after
+/// `machine::realize` has sealed the table. Nothing is lost by waiting, because
+/// [`Recorder::register`]'s own reason for refusing is that a late channel
+/// "would silently have missed everything before it", and before the first
+/// round boundary there is nothing to have missed.
 #[test]
-fn a_sealed_recorder_takes_no_more_channels() {
+fn the_channel_list_closes_at_the_first_delivery_not_at_the_seal() {
     let recorder = Arc::new(Recorder::recording());
     let hosts = HostObjects::new();
     hosts.seal(Arc::clone(&recorder)).unwrap();
-    assert!(recorder.is_sealed());
+    assert!(!recorder.is_sealed(), "a sealed table is not a sealed list");
+
+    recorder
+        .register(console(), Arc::new(NullSink) as Arc<dyn InputSink>)
+        .expect("a frontend attached after the build still gets its channel");
+
+    recorder.deliver(t(1_000)).unwrap();
+    assert!(recorder.is_sealed(), "the first round boundary closes it");
     assert!(
         recorder
-            .register(console(), Arc::new(NullSink) as Arc<dyn InputSink>)
+            .register(
+                Channel::new(CHARDEV, "late"),
+                Arc::new(NullSink) as Arc<dyn InputSink>
+            )
             .is_err(),
-        "the two lists cannot drift after the seal"
+        "and after that a channel would have missed everything already delivered"
     );
 }
 
-/// The seal's reach, pinned — including the half that is wrong.
+/// The seal's reach, now that a kind says what it is.
 ///
-/// [`HostObjects`] files three unrelated things under one `(kind, name)` space:
-/// doors that are channels, which must be declared; rendezvous inside the
-/// machine, where nothing crosses from the host at all; and `medium`, a door
-/// whose bytes the guest *pulls* a sector at a time, so no `(instant, payload)`
-/// log could describe it. A `pci-bus` is not non-deterministic, cannot be a
-/// channel, and has nothing to record — yet a sealed table refuses it exactly
-/// as it refuses an undeclared keyboard.
+/// [`HostObjects`] files three unrelated things under one `(kind, name)` space,
+/// and until [`HostKind`] carried a role the seal checked all three alike: a
+/// `pci-bus` is not non-deterministic, cannot be a channel and has nothing to
+/// record, yet a sealed table refused it exactly as it refused an undeclared
+/// keyboard. That is why nothing in `src/` sealed anything — sealing any board
+/// with a PCI or USB bus in it failed on an object that was never an input.
 ///
-/// That is why no board in `src/` is sealed: sealing anything with a PCI or USB
-/// bus in it fails on an object that was never an input. The assertion below is
-/// therefore a *characterisation* of a defect rather than a guarantee, and it
-/// is here so that marking kinds as doors has something to flip. When it does,
-/// this test's second half inverts and its first half stays.
+/// The three, and what the seal now does with each:
+///
+/// * a **door** — host input as `(instant, payload)`. Refused unless declared,
+///   which is the whole point;
+/// * a **rendezvous** — how two devices inside one build find each other.
+///   Ignored;
+/// * **pulled** — `medium`, where host bytes really do cross but the guest asks
+///   for a sector rather than receiving one, so no `(instant, payload)` log
+///   could describe it. Ignored, and still a hole.
 #[test]
-fn the_seal_cannot_tell_a_door_from_a_rendezvous() {
+fn the_seal_tells_a_door_from_a_rendezvous() {
     let recorder = Arc::new(Recorder::recording());
     let hosts = HostObjects::new();
     hosts.seal(Arc::clone(&recorder)).unwrap();
@@ -499,8 +521,8 @@ fn the_seal_cannot_tell_a_door_from_a_rendezvous() {
         "an undeclared input is what the seal exists to catch"
     );
 
-    // A rendezvous. Refusing this catches nothing and costs the seal every
-    // board above the smallest.
+    // A rendezvous. Refusing this caught nothing and cost the seal every board
+    // above the smallest.
     for rendezvous in [
         "pci-bus",
         "usb-bus",
@@ -512,21 +534,73 @@ fn the_seal_cannot_tell_a_door_from_a_rendezvous() {
         "apic-bus",
         "signal",
         "riscv.dt",
+        "capture",
     ] {
-        assert!(
-            hosts.open(HostKind::new(rendezvous), "0", || 1u32).is_err(),
-            "`{rendezvous}` is how two devices find each other, not an input, \
-             and the seal refuses it anyway"
-        );
+        hosts
+            .open(HostKind::rendezvous(rendezvous), "0", || 1u32)
+            .unwrap_or_else(|e| {
+                panic!("`{rendezvous}` is how two ends of one build meet, not an input: {e}")
+            });
     }
 
     // And the third kind: host bytes really do cross at a `medium`, but the
     // guest pulls them a sector at a time, so there is no channel to declare
-    // and the seal is demanding something that cannot exist.
+    // and demanding one would mean no board with a disk could be sealed.
+    hosts
+        .open(HostKind::pulled("medium"), "hd0", || 1u32)
+        .expect("a drive's image has no `(instant, payload)` shape to declare");
+}
+
+/// A door whose module ships a `sink()` wires itself; one that does not is
+/// refused, and says which two functions to write.
+///
+/// This is the pair that decides whether any of this was worth doing.
+/// `core::record` lists four things a new device must do to be covered and
+/// says step 2 — ship `channel()` and `sink()` beside `open()` — is the one
+/// that gets skipped invisibly. Under a sealed table it is now the one that
+/// stops the build.
+#[test]
+fn a_door_that_can_feed_itself_is_wired_and_one_that_cannot_is_refused() {
+    /// The ten lines a door's module owes the seam, as a `HostKind` carries
+    /// them.
+    fn feed(object: &Arc<dyn core::any::Any + Send + Sync>) -> Option<Arc<dyn InputSink>> {
+        let thing = Arc::clone(object).downcast::<Recording>().ok()?;
+        Some(thing as Arc<dyn InputSink>)
+    }
+    const WIRED: HostKind = HostKind::door("test.wired", feed);
+    const BARE: HostKind = HostKind::new("test.bare");
+
+    // A door that knows where its payloads go is registered by the seal, so a
+    // caller that never heard of it still records it.
+    let hosts = HostObjects::new();
+    let sink = hosts.open(WIRED, "console", Recording::default).unwrap();
+    let recorder = Arc::new(Recorder::recording());
+    hosts.seal(Arc::clone(&recorder)).unwrap();
+
+    let channel = Channel::new(WIRED, "console");
+    assert!(recorder.knows(&channel), "the seal wired it");
+    recorder.post(&channel, b"typed").unwrap();
+    recorder.deliver(t(1_000)).unwrap();
+    assert_eq!(
+        sink.payloads(),
+        [b"typed".to_vec()],
+        "and it reaches the object"
+    );
+
+    // A door whose module never shipped the pair is where the build stops.
+    let hosts = HostObjects::new();
+    hosts.open(BARE, "thermometer", || 1u32).unwrap();
+    let err = hosts
+        .seal(Arc::new(Recorder::recording()))
+        .expect_err("nothing can say where this one's payloads go");
     assert!(
-        hosts.open(HostKind::new("medium"), "hd0", || 1u32).is_err(),
-        "a drive's image is a door with no `(instant, payload)` shape, and \
-         refusing it means no board with a disk can be sealed"
+        matches!(&err, Error::Config { at, .. } if at == "test.bare:thermometer"),
+        "the refusal names the object: {err}"
+    );
+    let text = alloc::format!("{err}");
+    assert!(
+        text.contains("`channel()`") && text.contains("`sink()`"),
+        "and says which two functions to write: {text}"
     );
 }
 

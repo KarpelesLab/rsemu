@@ -257,13 +257,24 @@ pub mod ports {
     use alloc::sync::Arc;
     use alloc::vec::Vec;
 
+    use core::any::Any;
+
     use crate::core::error::Result;
     use crate::core::hosts::{HostKind, HostObjects};
     use crate::core::props::Props;
+    use crate::core::record::{Channel, FnSink, InputSink};
 
     /// The kind a character port is filed under in a build's
     /// [`HostObjects`].
-    pub const KIND: HostKind = HostKind::new("chardev");
+    ///
+    /// A [door](HostKind::door): what a person types at a console is
+    /// non-deterministic input, and this is the object it crosses at. The
+    /// factory is what lets
+    /// [`HostObjects::seal`](crate::core::hosts::HostObjects::seal) wire a
+    /// console to a recorder without the caller having to know the port's name
+    /// — which is exactly what `rsemu run … --record-input` cannot know, since
+    /// the name comes out of the machine file.
+    pub const KIND: HostKind = HostKind::door("chardev", make_sink);
 
     /// The a character port `name` refers to in `hosts`, creating it on first mention.
     ///
@@ -316,6 +327,48 @@ pub mod ports {
     #[must_use]
     pub fn names(hosts: &HostObjects) -> Vec<String> {
         hosts.names(KIND)
+    }
+
+    /// The record/replay channel the port called `name` receives on.
+    ///
+    /// `chardev:console`, which is the same `(kind, name)` pair the host-object
+    /// table files the port under — so a board whose console has no channel is
+    /// named by this string when
+    /// [`HostObjects::seal`](crate::core::hosts::HostObjects::seal) refuses it.
+    #[must_use]
+    pub fn channel(name: &str) -> Channel {
+        Channel::new(KIND, name)
+    }
+
+    /// The [`InputSink`] that feeds a recorded payload to `port`.
+    ///
+    /// The whole adapter between [`core::record`](crate::core::record) and this
+    /// module, and the ten lines whose absence meant the CLI's own console was
+    /// unrecorded while a test that wrote these two closures by hand recorded
+    /// one fine (`core::record`, "what a *new* device has to do").
+    ///
+    /// The rewind hook matters: bytes queued at the rewind target are
+    /// re-delivered from the log on the way forward, so a port that kept them
+    /// would hand the guest each one twice.
+    #[must_use]
+    pub fn sink(port: &Arc<CharPort>) -> Arc<dyn InputSink> {
+        let feeding = Arc::clone(port);
+        let clearing = Arc::clone(port);
+        Arc::new(
+            FnSink::new("chardev", move |bytes: &[u8]| {
+                feeding.feed(bytes);
+            })
+            .on_rewind(move || clearing.clear()),
+        )
+    }
+
+    /// [`sink`], reached through the erased handle the host-object table holds.
+    ///
+    /// What [`KIND`] carries so a sealed table can wire a console it was never
+    /// told about. `None` means something that is not a [`CharPort`] is filed
+    /// under `chardev`, which is two modules claiming one kind name.
+    fn make_sink(object: &Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn InputSink>> {
+        Some(sink(&Arc::clone(object).downcast::<CharPort>().ok()?))
     }
 }
 

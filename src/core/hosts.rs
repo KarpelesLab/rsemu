@@ -46,13 +46,23 @@
 //!
 //! # The table is also where the record/replay seam is enforced
 //!
-//! A host object is the *only* door from the host into a machine — and that
-//! includes the [`Captured`] table, which is how a host reaches a concrete
-//! device to press its buttons directly. So checking every object against a
-//! recorder's registered channels is checking every non-deterministic input,
-//! once, in one place, rather than trusting each device to declare its own.
-//! [`HostObjects::seal`] is that check and
-//! [`core::record`](crate::core::record) argues why it belongs here.
+//! A host object is the *only* door a **device** has onto the host, so checking
+//! every object against a recorder's registered channels is checking every
+//! non-deterministic input a device can take, once, in one place, rather than
+//! trusting each device to declare its own. [`HostObjects::seal`] is that check
+//! and [`core::record`](crate::core::record) argues why it belongs here.
+//!
+//! Not every entry is such a door, which is the thing that kept the check
+//! switched off. A PCI fabric, a drive bay and an APIC bus are filed here too,
+//! and they are how two ends of one *build* find each other — nothing crosses
+//! from the host at all — so a seal that demanded a channel for one refused
+//! every board above the smallest. [`HostKind`] carries the distinction now,
+//! and its own documentation has the four cases.
+//!
+//! [`machine::realize`](mod@crate::machine::realize) is what turns it on:
+//! given a recorder it seals between constructing the devices and realizing
+//! them, which is late enough that the doors are open and early enough that
+//! nothing has acted.
 //!
 //! # Ordering
 //!
@@ -69,23 +79,120 @@ use core::any::Any;
 use core::fmt;
 
 use crate::core::error::{Error, Result};
-use crate::core::record::{Channel, Recorder};
+use crate::core::record::{Channel, InputSink, Recorder};
 use crate::core::sync::{LockRank, Mutex};
 
 /// What sort of host object a name refers to.
 ///
-/// An extensible enumeration in the `pktkit` style (`CLAUDE.md`) rather than a
-/// Rust `enum`, because the kinds are declared by the feature-gated modules
-/// that own them: [`chardev::ports`](crate::host::chardev::ports) declares
-/// `chardev`, the NES input port declares `pad`, and a build with neither has
-/// no opinion about either.
+/// A newtype over a `&'static str` rather than a Rust `enum`, because the kinds
+/// are declared by the feature-gated modules that own them:
+/// [`chardev::ports`](crate::host::chardev::ports) declares `chardev`, the NES
+/// input port declares `pad`, and a build with neither has no opinion about
+/// either.
 ///
 /// The kind also fixes the *type* stored under it. Two modules must not claim
 /// one kind name; [`HostObjects::open`] reports the collision rather than
 /// handing back a pad where a character port was wanted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub struct HostKind(pub &'static str);
+///
+/// # A kind carries its role, and the default is the strict one
+///
+/// One name space held three unrelated things and the
+/// [seal](HostObjects::seal) checked all of them alike, so sealing any board
+/// with a PCI bus in it failed on an object that was never an input. The role
+/// is now part of the kind:
+///
+/// | constructor | what it means | a sealed table |
+/// | --- | --- | --- |
+/// | [`new`](HostKind::new) | a door, with no [`InputSink`] to put a recorded payload back through | **refuses it**, saying what to add |
+/// | [`door`](HostKind::door) | a door that knows how to feed itself | wires it to the recorder |
+/// | [`rendezvous`](HostKind::rendezvous) | two ends of one build meeting; nothing non-deterministic crosses in | ignores it |
+/// | [`pulled`](HostKind::pulled) | host bytes that the *guest* asks for, a sector at a time | ignores it, and it stays a hole |
+///
+/// **[`new`] is a door on purpose.** A kind whose author has not thought about
+/// the record/replay seam is exactly the kind that should stop a recorded
+/// build, and the message names the two functions to write. Marking a kind as
+/// carrying no input is a deliberate act, not a default.
+///
+/// [`new`]: HostKind::new
+#[derive(Clone, Copy)]
+pub struct HostKind {
+    /// The name, and the whole of this type's identity — see the `PartialEq`
+    /// impl below.
+    name: &'static str,
+    /// What the record/replay seam should do about objects filed under it.
+    role: Role,
+}
+
+/// Turn a stored host object into the [`InputSink`] a recorded payload is
+/// delivered through.
+///
+/// A plain `fn` pointer so a [`HostKind`] stays a `const`, and it takes the
+/// erased `Arc` the table holds because `core::hosts` cannot name a `CharPort`
+/// or a `NetPort` — the module that declares the kind does the downcast, which
+/// is the same module that already ships `open()` and `sink()`.
+///
+/// `None` back means the object under that name is not the type the kind's
+/// owner expected, which is the collision [`HostObjects::open`] reports.
+pub type SinkFactory = fn(&Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn InputSink>>;
+
+/// What the record/replay seam does about a kind. See [`HostKind`].
+#[derive(Clone, Copy)]
+enum Role {
+    /// Host input crosses here as `(instant, payload)`, with a way to put a
+    /// recorded payload back if the declaring module supplied one.
+    Door(Option<SinkFactory>),
+    /// Two ends of one build finding each other. Nothing crosses from the host.
+    Rendezvous,
+    /// Host bytes the guest pulls rather than receives.
+    Pulled,
+}
+
+// By hand, because deriving it would print the sink factory's *address* — a
+// number that moves between builds, into whatever failing test or diagnostic
+// printed the kind. The role's word is the useful half anyway.
+impl fmt::Debug for HostKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let role = match self.role {
+            Role::Door(Some(_)) => "door",
+            Role::Door(None) => "door, no sink",
+            Role::Rendezvous => "rendezvous",
+            Role::Pulled => "pulled",
+        };
+        write!(f, "HostKind({}, {role})", self.name)
+    }
+}
+
+// Identity is the **name alone**, deliberately and by hand rather than by
+// derive. The table keys on `(HostKind, String)` and a channel is built from
+// `kind.as_str()`, so a kind that compared its role too would file
+// `HostKind::new("pad")` and `HostKind::door("pad", …)` under two different
+// slots and a lookup would miss. Two modules declaring one kind name must agree
+// about its role; they cannot disagree about its identity.
+impl PartialEq for HostKind {
+    fn eq(&self, other: &HostKind) -> bool {
+        self.name == other.name
+    }
+}
+
+impl Eq for HostKind {}
+
+impl PartialOrd for HostKind {
+    fn partial_cmp(&self, other: &HostKind) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HostKind {
+    fn cmp(&self, other: &HostKind) -> core::cmp::Ordering {
+        self.name.cmp(other.name)
+    }
+}
+
+impl core::hash::Hash for HostKind {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
+}
 
 impl HostKind {
     /// The kind a build's [`Captured`] tables are filed under, keyed by the
@@ -95,24 +202,104 @@ impl HostKind {
     /// already separates a captured PPU from a captured VDP, and a shared kind
     /// means a host can ask what a build captured without knowing which module
     /// installed the interception.
-    pub const CAPTURE: HostKind = HostKind("capture");
+    ///
+    /// A **rendezvous**, which is the one classification here that is a
+    /// judgement rather than a reading. What a capture table carries out is a
+    /// framebuffer or an audio ring, and that is output. What a frontend
+    /// pushes *in* through one — `host::input::MouseSink` moving a captured HID
+    /// mouse — is recorded on the frontend's own channel (`input:vnc`), not on
+    /// one named after the capture, because a frontend is not part of the
+    /// machine. Calling it a door would demand a `capture:nes.ppu` channel that
+    /// nothing could ever sink, and no board with a screen could be recorded.
+    pub const CAPTURE: HostKind = HostKind::rendezvous("capture");
 
-    /// A kind from its name.
+    /// A kind whose role nobody has stated: **a door with no sink**.
+    ///
+    /// The strict default. A sealed table refuses an object filed under one,
+    /// because a kind nobody has classified is a kind nobody has thought about
+    /// the recording of. Fixing that is either
+    /// [`door`](HostKind::door) — ship a `channel()` and a `sink()` beside the
+    /// `open()`, ten lines — or [`rendezvous`](HostKind::rendezvous), if
+    /// nothing non-deterministic crosses here at all.
     #[must_use]
     pub const fn new(name: &'static str) -> HostKind {
-        HostKind(name)
+        HostKind {
+            name,
+            role: Role::Door(None),
+        }
+    }
+
+    /// A door that can put a recorded payload back where it came from.
+    ///
+    /// `sink` is what [`HostObjects::seal`] calls to wire the object to the
+    /// recorder, so a board whose console or joypad the caller did not think to
+    /// declare is recorded anyway rather than refused.
+    #[must_use]
+    pub const fn door(name: &'static str, sink: SinkFactory) -> HostKind {
+        HostKind {
+            name,
+            role: Role::Door(Some(sink)),
+        }
+    }
+
+    /// A kind by which two ends of one build find each other.
+    ///
+    /// A PCI fabric, a drive bay, an APIC bus, a device-tree registry, a power
+    /// signal the guest asserts outward. Nothing non-deterministic crosses into
+    /// the machine here, so there is nothing to record and a sealed table has
+    /// no business refusing one.
+    #[must_use]
+    pub const fn rendezvous(name: &'static str) -> HostKind {
+        HostKind {
+            name,
+            role: Role::Rendezvous,
+        }
+    }
+
+    /// A door whose bytes the guest **pulls**, so no `(instant, payload)` log
+    /// describes it.
+    ///
+    /// `medium` is the only one: a drive's image really is host state crossing
+    /// into a machine, but the guest asks for a sector when it wants one rather
+    /// than receiving it at an instant. What that needs is an identity check on
+    /// the image — `dev::medium`'s `Snapshot::Reference` — not a channel. A
+    /// sealed table passes it, and [`core::record`](crate::core::record)'s
+    /// table of what is covered still lists it as a hole, which it is.
+    #[must_use]
+    pub const fn pulled(name: &'static str) -> HostKind {
+        HostKind {
+            name,
+            role: Role::Pulled,
+        }
     }
 
     /// The name, for a diagnostic.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
-        self.0
+        self.name
+    }
+
+    /// Whether host input crosses at objects of this kind, so that a sealed
+    /// table demands a channel for each of them.
+    #[must_use]
+    pub const fn is_door(self) -> bool {
+        matches!(self.role, Role::Door(_))
+    }
+
+    /// How to build the [`InputSink`] for an object of this kind, if the module
+    /// that declared it said.
+    #[must_use]
+    pub const fn sink_factory(self) -> Option<SinkFactory> {
+        match self.role {
+            Role::Door(sink) => sink,
+            Role::Rendezvous | Role::Pulled => None,
+        }
     }
 }
 
 impl fmt::Display for HostKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0)
+        f.write_str(self.name)
     }
 }
 
@@ -284,32 +471,70 @@ impl HostObjects {
         Ok(())
     }
 
-    /// Refuse any host object the recorder has not registered as a channel.
+    /// Wire every door this table holds to `recorder`, then refuse any that is
+    /// still undeclared.
     ///
-    /// The enforcement half of the record/replay seam. Call it *before* the
-    /// machine is built: every device opens its host objects from `new(props)`,
-    /// so a board with an unrecorded input fails to realize rather than
-    /// producing a recording that is quietly missing a stream.
+    /// The enforcement half of the record/replay seam, and the reason
+    /// [`machine::realize`](mod@crate::machine::realize) does this after
+    /// constructing a board rather than before: by then every device has opened
+    /// the host objects it wants, so the doors among them can be *wired* rather
+    /// than merely counted.
     ///
-    /// The recorder is sealed too, so the two lists cannot drift: after this,
-    /// neither a new channel nor a new host object can appear.
+    /// Three things happen to each open object, in this order:
     ///
-    /// Sealing an already-populated table is allowed and checks what is already
-    /// there, so a caller that builds first and seals second still gets the
-    /// diagnostic — one round late, but before the first round runs.
+    /// * a [rendezvous](HostKind::rendezvous) or a [pulled](HostKind::pulled)
+    ///   kind is skipped — a PCI fabric is not an input, and demanding a
+    ///   channel for one is what kept this mechanism switched off;
+    /// * a [door](HostKind::door) the recorder already knows is left alone, so
+    ///   a caller that registered its own sink keeps it;
+    /// * a door the recorder does not know is registered with the sink its own
+    ///   module supplied — or, if that module supplied none, the seal fails
+    ///   naming it.
+    ///
+    /// Afterwards the table is closed: opening a door the recorder still does
+    /// not know is [`Error::Config`], so a caller that seals an **empty** table
+    /// and then builds gets the strict form — every input must have been
+    /// declared up front, and the board refuses to build otherwise. Both flows
+    /// are used; `tests/record_replay.rs` has each.
+    ///
+    /// The recorder is *not* sealed here. Its channel list closes at the first
+    /// [`Recorder::deliver`](crate::core::record::Recorder::deliver), which is
+    /// the moment [`Recorder::register`]'s own reason bites — a channel added
+    /// after the machine has run would silently have missed everything before
+    /// it — and it leaves room for a frontend that can only be built once the
+    /// machine it draws exists.
+    ///
+    /// [`Recorder::register`]: crate::core::record::Recorder::register
     ///
     /// # Errors
     ///
-    /// [`Error::Config`] naming the first host object already open that the
-    /// recorder does not know about.
+    /// [`Error::Config`] naming the first door already open that the recorder
+    /// does not know and cannot be taught.
     pub fn seal(&self, recorder: Arc<Recorder>) -> Result<()> {
-        let open: Vec<(HostKind, String)> = self.entries.lock().keys().cloned().collect();
-        for (kind, name) in &open {
-            if !recorder.knows(&Channel::new(*kind, name)) {
-                return Err(unrecorded(*kind, name));
+        // Cloned out before anything else is locked: `Recorder::register` takes
+        // its own lock, and two leaf locks may not be nested.
+        let open: Vec<((HostKind, String), Arc<dyn Any + Send + Sync>)> = self
+            .entries
+            .lock()
+            .iter()
+            .map(|(key, object)| (key.clone(), Arc::clone(object)))
+            .collect();
+        for ((kind, name), object) in &open {
+            if !kind.is_door() {
+                continue;
             }
+            let channel = Channel::new(*kind, name);
+            if recorder.knows(&channel) {
+                continue;
+            }
+            let Some(make) = kind.sink_factory() else {
+                return Err(unrecorded(*kind, name));
+            };
+            let Some(sink) = make(object) else {
+                return Err(mistyped(*kind, name));
+            };
+            recorder.register(channel, sink)?;
         }
-        recorder.seal();
         *self.policy.lock() = InputPolicy::Sealed(recorder);
         Ok(())
     }
@@ -330,6 +555,12 @@ impl HostObjects {
     /// The policy check, run before any entry is touched so the two leaf locks
     /// are never held at once.
     fn check_policy(&self, kind: HostKind, name: &str) -> Result<()> {
+        // A rendezvous is not an input. Checking one is what made sealing any
+        // board with a PCI or USB bus impossible, and it is answered before the
+        // policy lock is even taken.
+        if !kind.is_door() {
+            return Ok(());
+        }
         // Cloned out rather than held: `Recorder::knows` takes its own lock, and
         // a leaf lock may not be held while another is acquired.
         let recorder = match &*self.policy.lock() {
@@ -389,8 +620,27 @@ fn unrecorded(kind: HostKind, name: &str) -> Error {
         message: String::from(
             "this host object would carry non-deterministic input into a machine whose \
              recorder has no channel for it, so the run could not be replayed \
-             (CLAUDE.md, determinism). Register the channel with the recorder before \
-             building the machine, or do not seal the host-object table",
+             (CLAUDE.md, determinism). Ship a `channel()` and a `sink()` beside this \
+             kind's `open()` and declare it with `HostKind::door`, or register the \
+             channel with the recorder before building the machine. If nothing \
+             non-deterministic crosses here, the kind is a `HostKind::rendezvous`",
+        ),
+    }
+}
+
+/// The diagnostic for a door whose own sink factory did not recognise the
+/// object filed under it.
+///
+/// Two modules claiming one kind name, seen from the seal rather than from
+/// [`HostObjects::open`]: the object is of the other module's type, so the
+/// factory this kind carries cannot make a sink for it.
+fn mistyped(kind: HostKind, name: &str) -> Error {
+    Error::Config {
+        at: format!("{kind}:{name}"),
+        message: String::from(
+            "the module that declared this host-object kind does not recognise the object \
+             open under this name, so it cannot say where a recorded payload goes: two \
+             modules have claimed one kind name",
         ),
     }
 }
