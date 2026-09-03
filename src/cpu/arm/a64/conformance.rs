@@ -99,6 +99,35 @@
 //!   stores, nothing this core accepts is rejected by `llvm-mc`. That is a
 //!   check on the masks, and it says nothing about the semantics.
 //!
+//!   The load/store-exclusive group and the `MRS`/`MSR` space were swept the
+//!   same way when the exclusive pair and the generic timer landed: 265 536
+//!   words of the exclusive group — an **enumerated** sweep over every
+//!   combination of `size`, `o2`, `L`, `o1`, `o0`, `Rs` and `Rt2`, plus 200 000
+//!   random ones — and 131 072 covering every `op0`/`op1`/`CRn`/`CRm`/`op2` in
+//!   both directions. Nothing over-accepted, and this time the *text* was
+//!   compared too, for every exclusive pair and every system register the table
+//!   names. That found `CTR_EL0` and `DCZID_EL0` accepting an `MSR`.
+//!
+//! # The timer guest, and what it is not
+//!
+//! `timer.rs` is the second guest after `fp_rules.rs` whose expectations are
+//! **ours** rather than an oracle's, and for the same reason: nothing in
+//! ordinary Rust reaches `CNTP_CTL_EL0`, so there is no compiler choosing the
+//! encodings and no second implementation computing the answer. What it proves
+//! is the *route* — a vector table the guest installed, an interrupt handler it
+//! `ERET`s out of, a `WFI` that ends because a comparator was reached, an
+//! excursion to EL0 and an interrupt taken to get back, and a trapped `MRS`
+//! whose syndrome the handler reads and acts on. The pair exclusives in
+//! `memory.rs` are in the same position and say so: `AtomicU128` is unstable,
+//! this corpus is built with the pinned stable toolchain, and no stable
+//! construct lowers to a sixteen-byte atomic.
+//!
+//! Both were checked by mutation rather than by assertion: breaking
+//! `CNTKCTL_EL1`'s gate, zero-extending a `TVAL` write, and narrowing the
+//! reservation granule to the exact address each make a named case of a named
+//! guest fail. Making the timer comparison unsigned does **not** — that is only
+//! visible across the counter's wrap, 2⁶⁴ counts away, and it is a unit test.
+//!
 //! # Running it
 //!
 //! ```text
@@ -174,7 +203,8 @@ const ACCESS_LIMIT: u64 = 40_000_000;
 /// **This list is empty.** At the commit that added this file, all six
 /// binaries passed — 12 000 differentially-checked floating-point vectors
 /// among them — and it stayed empty when the seventh, `fp_natural`, arrived
-/// with the Advanced SIMD slice.
+/// with the Advanced SIMD slice, and again when the eighth, `timer`, arrived
+/// with the generic timer.
 const LEDGER: &[(&str, &str)] = &[];
 
 // ---------------------------------------------------------------------------

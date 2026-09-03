@@ -54,14 +54,41 @@
 # this map.
 #
 # ---------------------------------------------------------------------------
-# Nothing raises an interrupt here
+# Nothing outside the core raises an interrupt -- but the timer inside it does
 # ---------------------------------------------------------------------------
 #
 # The core has `cpu.irq` and `cpu.fiq` inputs, which a real board drives from a
 # GIC. There is no GIC on this board and no other interrupt source, so neither
-# is wired: a net with no driver would be two lines saying nothing. A guest can
-# still exercise its own vector table through `SVC` and `BRK`, which is what
-# tests/a64_mini_board.rs does.
+# is wired: a net with no driver would be two lines saying nothing.
+#
+# The **generic timer** is not one of those inputs. It is part of the core, the
+# way the `PMU` and the vector table are, and its output goes to `IRQ` inside
+# the core rather than across the board. On a real SoC it would be a private
+# peripheral interrupt into a GIC and the GIC would drive `nIRQ`; with no GIC
+# there is nothing between the two ends of that wire, so a guest here arms
+# `CNTP_CTL_EL0`, clears `PSTATE.I` and takes an interrupt into its own vector
+# table with nothing else on the board moving. That is what
+# tests/a64_mini_board.rs does, along with `SVC` and `BRK`.
+#
+# ---------------------------------------------------------------------------
+# What the counter counts, and why the board owes two numbers
+# ---------------------------------------------------------------------------
+#
+# `CNTPCT_EL0` advances in virtual time, and the virtual time this core owns is
+# its own domain's tick counter -- one tick per bus access, on `sysclk`. So the
+# board says how many of those make one count (`cntdiv`) and what to tell the
+# guest that rate is in hertz (`cntfrq`), and the two have to agree: `cntfrq *
+# cntdiv` is the frequency of the domain the core is on.
+#
+# They agree here because only one of them is written down. `cntdiv` is
+# *derived* -- `cpu-hz / cntfrq` -- so changing either parameter keeps the pair
+# consistent, and a value that does not divide exactly is a board that has to
+# be looked at rather than a counter that quietly runs slow.
+#
+# 100 MHz is a real number rather than a round one: it is in the range Arm
+# recommends for the system counter (1 to 50 MHz nominal, higher permitted) and
+# is what several Armv8 SoCs actually use. Nothing architectural depends on it,
+# which is exactly why the board rather than the core decides it.
 #
 # ---------------------------------------------------------------------------
 # Floating point starts switched off, and that is the architecture
@@ -104,12 +131,21 @@ machine "a64-mini" {
   param periph      = 0x09000000
   param periph-size = 64K
 
+  # How fast the core's clock domain runs, and how fast the generic timer's
+  # system counter runs. See the note above: `cntdiv` is derived from the pair
+  # rather than written down, so they cannot drift apart.
+  param cpu-hz = 1000000000
+  param cntfrq = 100000000
+
   # -- the crystal -----------------------------------------------------------
   #
   # One oscillator: everything on this board descends from the same can, so
-  # every ratio on it is exact (ROADMAP.md 4.2). Arm defines no instruction
-  # timing at all, so this sets the wall-clock rate and nothing architectural.
-  osc sysclk = 1000000000 Hz
+  # every ratio on it is exact (ROADMAP.md 4.2) -- the generic timer's counter
+  # included, which is a plain integer divisor of the core's own ticks and
+  # therefore exact by construction rather than by accumulating a residual.
+  # Arm defines no instruction timing at all, so this sets the wall-clock rate
+  # and nothing architectural.
+  osc sysclk = cpu-hz Hz
 
   # -- the bus ---------------------------------------------------------------
   #
@@ -130,6 +166,11 @@ machine "a64-mini" {
     # is "processor 0 of cluster 0" - the value a single-core board must give,
     # and the one an SMP guest reads to tell cores apart.
     mpidr  = 0x80000000
+    # The generic timer. `cntfrq` is only what `CNTFRQ_EL0` reports -- on real
+    # silicon firmware writes that register and nothing checks it -- while
+    # `cntdiv` is what the counter actually does.
+    cntfrq = cntfrq
+    cntdiv = cpu-hz / cntfrq
   }
 
   # -- memory ----------------------------------------------------------------

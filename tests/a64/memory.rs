@@ -1,4 +1,5 @@
-// A64 conformance: loads, stores, the exclusive monitor, and unaligned access.
+// A64 conformance: loads, stores, the exclusive monitor and its pair form, and
+// unaligned access.
 //
 // Copyright (c) Karpeles Lab Inc. MIT. Written from DDI 0487; no emulator
 // source of any licence was consulted.
@@ -18,6 +19,19 @@
 // The reservation-granule cases at the end are the exception: those are read
 // off DDI 0487 B2.9 and are ours, and they are the ones that would catch an
 // exclusive monitor implemented as a plain flag.
+//
+// ---------------------------------------------------------------------------
+// Why `LDXP`/`STXP` are hand-written here when nothing else is
+// ---------------------------------------------------------------------------
+//
+// The pair exclusives are what a 128-bit atomic compiles to on a part without
+// `FEAT_LSE`, and that would have been the ideal route to them: LLVM's choice,
+// not ours. It is not available. `AtomicU128` is behind the unstable
+// `integer_atomics` feature, this corpus is built with the pinned **stable**
+// toolchain, and no stable Rust construct lowers to a sixteen-byte atomic. So
+// the pair cases below are inline assembly and their expectations are ours,
+// from DDI 0487 B2.9 — the same standing as the reservation-granule cases they
+// sit beside, and stated here rather than left to be assumed.
 
 #![no_std]
 #![no_main]
@@ -50,6 +64,47 @@ fn poke(at: usize, value: u8) {
 /// The base of the scratch area as a mutable pointer.
 fn base() -> *mut u8 {
     unsafe { addr_of_mut!((*addr_of_mut!(SCRATCH)).0) }.cast::<u8>()
+}
+
+/// A 128-bit compare-and-swap out of `LDAXP`/`STLXP`, with the retry the
+/// architecture requires: a `STLXP` may fail spuriously, so a loop that gave up
+/// on the first failure would be a compare-and-swap that sometimes lies.
+///
+/// Returns whether the swap happened.
+unsafe fn cas128(at: *mut u64, expect: (u64, u64), new: (u64, u64)) -> bool {
+    loop {
+        let (lo, hi, status): (u64, u64, u64);
+        unsafe {
+            core::arch::asm!(
+                "ldaxp {lo}, {hi}, [{p}]",
+                "cmp   {lo}, {elo}",
+                "ccmp  {hi}, {ehi}, #0, eq",
+                "b.ne  2f",
+                "stlxp {status:w}, {nlo}, {nhi}, [{p}]",
+                "b     3f",
+                "2:",
+                "clrex",
+                "mov   {status}, #2",   // "the comparison failed"
+                "3:",
+                p = in(reg) at,
+                lo = out(reg) lo,
+                hi = out(reg) hi,
+                elo = in(reg) expect.0,
+                ehi = in(reg) expect.1,
+                nlo = in(reg) new.0,
+                nhi = in(reg) new.1,
+                status = out(reg) status,
+                options(nostack),
+            );
+        }
+        match status {
+            0 => return true,
+            2 => return false,
+            _ => {
+                let _ = (lo, hi);
+            }
+        }
+    }
 }
 
 fn run() -> Report {
@@ -251,6 +306,165 @@ fn run() -> Report {
         }
         if read_volatile(slot) != 400 {
             return (6, read_volatile(slot), 400, 6);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The exclusive *pair* (DDI 0487 B2.9, C6.2)
+    // ------------------------------------------------------------------
+    //
+    // Sixteen bytes, single-copy atomic, and the only 128-bit atomic an
+    // Armv8.0 part has. Written in assembly for the reason at the top of this
+    // file.
+    let wide = base().cast::<u64>();
+    unsafe {
+        write_volatile(wide, 0x1111_2222_3333_4444);
+        write_volatile(wide.add(1), 0x5555_6666_7777_8888);
+
+        // The pair arrives in address order: `Rt` from the low doubleword,
+        // `Rt2` from the high one. An implementation that swapped them would
+        // still round-trip a store, so the *read* is what pins the order.
+        let (lo, hi, status): (u64, u64, u64);
+        core::arch::asm!(
+            "ldxp {lo}, {hi}, [{p}]",
+            "stxp {status:w}, {nlo}, {nhi}, [{p}]",
+            p = in(reg) wide,
+            lo = out(reg) lo,
+            hi = out(reg) hi,
+            nlo = in(reg) 0xaaaa_bbbb_cccc_ddddu64,
+            nhi = in(reg) 0x0102_0304_0506_0708u64,
+            status = out(reg) status,
+            options(nostack),
+        );
+        if lo != 0x1111_2222_3333_4444 {
+            return (8, lo, 0x1111_2222_3333_4444, 0);
+        }
+        if hi != 0x5555_6666_7777_8888 {
+            return (8, hi, 0x5555_6666_7777_8888, 1);
+        }
+        if status != 0 {
+            return (8, status, 0, 2);
+        }
+        if read_volatile(wide) != 0xaaaa_bbbb_cccc_dddd {
+            return (8, read_volatile(wide), 0xaaaa_bbbb_cccc_dddd, 3);
+        }
+        if read_volatile(wide.add(1)) != 0x0102_0304_0506_0708 {
+            return (8, read_volatile(wide.add(1)), 0x0102_0304_0506_0708, 4);
+        }
+
+        // A store into the *upper* half of the pair breaks the reservation.
+        // This is the case an implementation that watched only the address the
+        // `LDXP` named would get wrong, and it would get it wrong silently:
+        // the retry loop it belongs to would simply never retry.
+        let status: u64;
+        core::arch::asm!(
+            "ldxp {lo}, {hi}, [{p}]",
+            "str {other}, [{p}, #8]",
+            "stxp {status:w}, {nlo}, {nhi}, [{p}]",
+            p = in(reg) wide,
+            lo = out(reg) _,
+            hi = out(reg) _,
+            other = in(reg) 0x9999_9999_9999_9999u64,
+            nlo = in(reg) 0u64,
+            nhi = in(reg) 0u64,
+            status = out(reg) status,
+            options(nostack),
+        );
+        if status != 1 {
+            return (9, status, 1, 0);
+        }
+        if read_volatile(wide) != 0xaaaa_bbbb_cccc_dddd {
+            return (9, read_volatile(wide), 0xaaaa_bbbb_cccc_dddd, 1);
+        }
+        if read_volatile(wide.add(1)) != 0x9999_9999_9999_9999 {
+            return (9, read_volatile(wide.add(1)), 0x9999_9999_9999_9999, 2);
+        }
+
+        // The word pair: eight bytes, two four-byte elements, and a status
+        // register that is 32 bits whatever the pair's width is.
+        write_volatile(wide, 0);
+        let (a, b, status): (u64, u64, u64);
+        core::arch::asm!(
+            "ldxp {a:w}, {b:w}, [{p}]",
+            "stxp {status:w}, {na:w}, {nb:w}, [{p}]",
+            p = in(reg) wide,
+            a = out(reg) a,
+            b = out(reg) b,
+            na = in(reg) 0x1234_5678u64,
+            nb = in(reg) 0x9abc_def0u64,
+            status = out(reg) status,
+            options(nostack),
+        );
+        if a != 0 || b != 0 {
+            return (10, a, b, 0);
+        }
+        if status != 0 {
+            return (10, status, 0, 1);
+        }
+        if read_volatile(wide) != 0x9abc_def0_1234_5678 {
+            return (10, read_volatile(wide), 0x9abc_def0_1234_5678, 2);
+        }
+
+        // `CLREX` clears a pair's reservation exactly as it does a single
+        // register's.
+        let status: u64;
+        core::arch::asm!(
+            "ldxp {lo}, {hi}, [{p}]",
+            "clrex",
+            "stxp {status:w}, {nlo}, {nhi}, [{p}]",
+            p = in(reg) wide,
+            lo = out(reg) _,
+            hi = out(reg) _,
+            nlo = in(reg) 0u64,
+            nhi = in(reg) 0u64,
+            status = out(reg) status,
+            options(nostack),
+        );
+        if status != 1 {
+            return (11, status, 1, 0);
+        }
+        if read_volatile(wide) != 0x9abc_def0_1234_5678 {
+            return (11, read_volatile(wide), 0x9abc_def0_1234_5678, 1);
+        }
+
+        // The acquire/release spellings are the same instruction with the same
+        // result on one core; they exist so a retry loop can be written with
+        // the ordering a real one needs.
+        let status: u64;
+        core::arch::asm!(
+            "ldaxp {lo}, {hi}, [{p}]",
+            "stlxp {status:w}, {nlo}, {nhi}, [{p}]",
+            p = in(reg) wide,
+            lo = out(reg) _,
+            hi = out(reg) _,
+            nlo = in(reg) 0x0f0f_0f0f_0f0f_0f0fu64,
+            nhi = in(reg) 0xf0f0_f0f0_f0f0_f0f0u64,
+            status = out(reg) status,
+            options(nostack),
+        );
+        if status != 0 {
+            return (12, status, 0, 0);
+        }
+        if read_volatile(wide) != 0x0f0f_0f0f_0f0f_0f0f {
+            return (12, read_volatile(wide), 0x0f0f_0f0f_0f0f_0f0f, 1);
+        }
+        if read_volatile(wide.add(1)) != 0xf0f0_f0f0_f0f0_f0f0 {
+            return (12, read_volatile(wide.add(1)), 0xf0f0_f0f0_f0f0_f0f0, 2);
+        }
+
+        // A 128-bit compare-and-swap, written the way an Armv8.0 part has to
+        // write one: the retry loop `AtomicU128::compare_exchange` would have
+        // compiled to if this corpus could name it.
+        write_volatile(wide, 1);
+        write_volatile(wide.add(1), 2);
+        let swapped = cas128(wide, (1, 2), (3, 4));
+        if !swapped || read_volatile(wide) != 3 || read_volatile(wide.add(1)) != 4 {
+            return (13, read_volatile(wide), 3, u64::from(swapped));
+        }
+        // ...and one that must fail, leaving both halves alone.
+        let swapped = cas128(wide, (99, 99), (5, 6));
+        if swapped || read_volatile(wide) != 3 || read_volatile(wide.add(1)) != 4 {
+            return (13, read_volatile(wide), 3, 10);
         }
     }
 
