@@ -128,19 +128,13 @@ machine "q35-linux" {
   # firmware**, so it is back, and the line has to be here. Determinism wants
   # it anyway (CLAUDE.md).
   #
-  # `nolapic` is **not** here and, measured today, a run needs it. Two device
-  # models deliver no interrupt on paths this board is the first guest to use:
-  # a local APIC timer in periodic mode, and an edge-triggered I/O APIC
-  # redirection entry — which is what an interrupt source override for the 8254
-  # is. With the line below a current kernel panics with
-  # `IO-APIC + timer doesn't work!`; with `nolapic` added it stays in PIC mode
-  # and reaches userspace. `docs/platforms/q35-linux.md` has both logs.
-  #
-  # It stays out of the default anyway, and that is a deliberate choice rather
-  # than an oversight. The board really does have both APICs and really does
-  # publish a MADT describing them; a default command line that hid two device
-  # defects would put them where nobody looks, and when they are fixed this
-  # line starts working with no change here.
+  # There is **nothing else here**, and that is the measurement worth keeping:
+  # no `nolapic`, no `noapic`, no `hpet=disable`. A current kernel takes the
+  # symmetric I/O path on this line — MADT, I/O APIC, local APIC timer, the
+  # HPET as the tick through its legacy replacement route — and reaches its
+  # own root-filesystem mount. Each of those three words was needed at some
+  # point and none is now; `docs/platforms/q35-linux.md` says what each was
+  # hiding and what fixed it.
   param cmdline = "console=ttyS0,115200 earlyprintk=ttyS0,115200 nokaslr"
 
   # Where the ACPI tables are staged. ACPI §5.2.5.1 has an operating system
@@ -317,7 +311,9 @@ machine "q35-linux" {
   object pit0 "pc.pit" { clock = pit }
 
   # The HPET's three comparators on I/O APIC inputs 16, 17 and 18, off the
-  # inputs the SCI can be steered onto. `q35` explains the choice.
+  # inputs the SCI can be steered onto. `q35` explains the choice. Comparators
+  # 0 and 1 leave those inputs for IRQ0 and IRQ8 while the legacy replacement
+  # route is set, which is the block after this one.
   object hpet0 "pc.hpet" {
     clock  = hpet
     period = 100000000
@@ -325,6 +321,47 @@ machine "q35-linux" {
     route1 = 17
     route2 = 18
   }
+
+  # -- the legacy replacement route -------------------------------------------
+  #
+  # The gate the IA-PC HPET specification §2.3.5 describes, built out of the
+  # combinators `ROADMAP.md` §4.3 ships. `LEG_RT_CNF` is not a register in any
+  # one chip: it is a **board-level multiplexer** between three of them, and
+  # the specification says exactly what it selects.
+  #
+  #   | `LEG_RT_CNF` | IRQ0 / I/O APIC input 2 | IRQ8 / I/O APIC input 8 |
+  #   | --- | --- | --- |
+  #   | clear | the 8254's counter 0     | the RTC's periodic interrupt |
+  #   | set   | the HPET's comparator 0  | the HPET's comparator 1      |
+  #
+  # and while it is set comparators 0 and 1 stop driving the inputs their
+  # `Tn_INT_ROUTE_CNF` names — which is why there are five gates here and not
+  # three. `pc.hpet` reports the bit on its `legacy` output pin (it may not
+  # reach across a pin and disconnect a sibling), announced from state on the
+  # realize sweep and after a restore, and everything below is the board.
+  #
+  # **This is load bearing on this board and not decoration.** Linux's
+  # `hpet_time_init()` programs the 8254 *only if* `hpet_enable()` fails; when
+  # it succeeds it sets `LEG_RT_CNF` and expects comparator 0 on IRQ0 instead.
+  # Without these gates counter 0 is never loaded and nothing at all drives
+  # IRQ0, so `check_timer()` finds no tick on I/O APIC input 2 and panics with
+  # `IO-APIC + timer doesn't work!` — and its `8254 timer not connected to
+  # IO-APIC` was literally true. `docs/platforms/q35-linux.md` has the log.
+  object legoff "wire.not" {}
+
+  # The two chips the HPET displaces, each held on its line only while the bit
+  # is clear.
+  object pitgate "wire.and" { inputs = 2 }
+  object rtcgate "wire.and" { inputs = 2 }
+
+  # The two comparators that take those lines over while it is set.
+  object hpetir0 "wire.and" { inputs = 2 }
+  object hpetir8 "wire.and" { inputs = 2 }
+
+  # And comparator 0 and 1 on their own routes, which they abandon while it is
+  # set. Comparator 2 keeps its route unconditionally and needs no gate.
+  object hpetr0 "wire.and" { inputs = 2 }
+  object hpetr1 "wire.and" { inputs = 2 }
 
   # -- the real-time clock and CMOS -------------------------------------------
   #
@@ -456,19 +493,56 @@ machine "q35-linux" {
   wire lapic0.nmi  -> cpu0.nmi
 
   # The legacy lines land twice, on the 8259A input they have always had and on
-  # the I/O APIC input the MP specification assigns them. IRQ0 is the
-  # exception: the 8254's output reaches I/O APIC input **2**, and the MADT's
-  # interrupt source override is the other half of that.
-  wire pit0.out0   -> pic1.ir0
-  wire pit0.out0   -> ioapic.irq2
-  wire cmos.irq    -> pic2.ir0
-  wire cmos.irq    -> ioapic.irq8
+  # the I/O APIC input the MP specification assigns them.
   wire com1.irq    -> pic1.ir4
   wire com1.irq    -> ioapic.irq4
 
-  wire hpet0.t0    -> ioapic.irq16
-  wire hpet0.t1    -> ioapic.irq17
-  wire hpet0.t2    -> ioapic.irq18
+  # IRQ0 and IRQ8, through the multiplexer the HPET's `LEG_RT_CNF` is. The
+  # object block above says why; here is only the wiring. `legoff` inverts the
+  # bit, so its output is high exactly while the two legacy chips own the two
+  # lines.
+  #
+  # IRQ0 is the one line whose two halves do not carry the same number: it
+  # reaches I/O APIC input **2** rather than 0, whichever chip is driving it,
+  # and the MADT's interrupt source override is the other half of that.
+  wire hpet0.legacy -> legoff.in
+
+  wire legoff.out   -> pitgate.in0
+  wire pit0.out0    -> pitgate.in1
+  wire pitgate.out  -> pic1.ir0
+  wire pitgate.out  -> ioapic.irq2
+
+  wire legoff.out   -> rtcgate.in0
+  wire cmos.irq     -> rtcgate.in1
+  wire rtcgate.out  -> pic2.ir0
+  wire rtcgate.out  -> ioapic.irq8
+
+  # The other half of each multiplexer: the two comparators, driving the same
+  # two nets. Two sources on one net is §4.3's wired-OR and it is the right
+  # shape here — at most one side of a multiplexer is ever enabled, so the
+  # resolve never has to arbitrate between them.
+  wire hpet0.legacy -> hpetir0.in0
+  wire hpet0.t0     -> hpetir0.in1
+  wire hpetir0.out  -> pic1.ir0
+  wire hpetir0.out  -> ioapic.irq2
+
+  wire hpet0.legacy -> hpetir8.in0
+  wire hpet0.t1     -> hpetir8.in1
+  wire hpetir8.out  -> pic2.ir0
+  wire hpetir8.out  -> ioapic.irq8
+
+  # Comparators 0 and 1 on the inputs their route fields name, which they hold
+  # only while the legacy replacement route is off. Comparator 2 is never
+  # displaced, so it is wired straight through.
+  wire legoff.out   -> hpetr0.in0
+  wire hpet0.t0     -> hpetr0.in1
+  wire hpetr0.out   -> ioapic.irq16
+
+  wire legoff.out   -> hpetr1.in0
+  wire hpet0.t1     -> hpetr1.in1
+  wire hpetr1.out   -> ioapic.irq17
+
+  wire hpet0.t2     -> ioapic.irq18
 
   # The SCI. `ACPI_CNTL[2:0]` picks one of five destinations and the bridge
   # drives one pin per destination, so all five are wired and at most one is
