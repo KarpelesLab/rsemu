@@ -157,6 +157,10 @@
 //! links into emulator trees; they were not followed and their domains were
 //! excluded from the search.
 
+#[cfg(feature = "dev-usb-xhci-pci")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-usb-xhci-pci")))]
+pub mod pci;
+
 #[cfg(test)]
 mod tests;
 
@@ -865,6 +869,21 @@ pub struct Xhci {
     /// from inside one of this controller's own guest-memory accesses records
     /// its work and returns, and the outermost `run()` picks it up.
     busy: AtomicBool,
+    /// Whether the transport permits this controller to master the bus.
+    ///
+    /// True out of reset, because a controller soldered to an SoC's internal
+    /// bus has nothing that could say otherwise — the boards in `machines/`
+    /// that map this register block directly never touch it. A **PCI**
+    /// function does: *PCI Local Bus Specification* Rev 2.1 §6.2.2's Bus Master
+    /// Enable is clear at reset and a function whose `COMMAND[2]` is clear may
+    /// not generate a cycle, so [`pci`] drives this from the Command register
+    /// and the engine fetches nothing until firmware sets it.
+    ///
+    /// It gates [`Xhci::space`] rather than each walk, which is the one place
+    /// every DMA in this file goes through — a fetch, a context read, a
+    /// writeback, an event post and the segment-table load all ask for the
+    /// space first and all already do nothing when there is none.
+    master: AtomicBool,
 }
 
 /// "Nothing scheduled", as [`Xhci::next_event`] spells it.
@@ -930,6 +949,7 @@ impl Xhci {
             irq_level: AtomicU32::new(0),
             lazy: Mutex::with_rank(LockRank::WIRE, None),
             busy: AtomicBool::new(false),
+            master: AtomicBool::new(true),
         }
     }
 
@@ -999,8 +1019,28 @@ impl Xhci {
         *self.lazy.lock() = Some(handle);
     }
 
-    /// The space this controller masters, if it still exists.
+    /// Whether the transport permits this controller to master the bus.
+    ///
+    /// Set by a transport that has such a bit — [`pci`]'s `COMMAND[2]` — and
+    /// left alone by one that does not. Not part of the snapshot: it is the
+    /// Command register said twice, and the transport re-derives it on load
+    /// (`CLAUDE.md`, derived state).
+    pub fn set_master(&self, allowed: bool) {
+        self.master.store(allowed, Ordering::Relaxed);
+    }
+
+    /// Whether this controller may currently fetch.
+    #[must_use]
+    pub fn is_master(&self) -> bool {
+        self.master.load(Ordering::Relaxed)
+    }
+
+    /// The space this controller masters, if it still exists and it is allowed
+    /// to.
     fn space(&self) -> Option<Arc<AddressSpace>> {
+        if !self.master.load(Ordering::Relaxed) {
+            return None;
+        }
         self.space.lock().as_ref().and_then(Weak::upgrade)
     }
 
@@ -3254,10 +3294,7 @@ impl XhciController {
     #[must_use]
     pub fn with_bus(bus: Arc<UsbBus>, params: Params) -> XhciController {
         let xhci = Arc::new(Xhci::new(bus, params));
-        let port = Arc::new(XhciPort {
-            xhci: Arc::clone(&xhci),
-        });
-        let region = Arc::new(Region::io("xhci", REGISTER_BYTES, port as Arc<dyn MemOps>));
+        let region = register_region(&xhci, "xhci", REGISTER_BYTES);
         XhciController { xhci, region }
     }
 
@@ -3273,6 +3310,29 @@ pub mod pin {
     /// The interrupt output. Level-triggered, and the AND of `USBCMD.INTE`,
     /// `IMAN.IE` and `IMAN.IP` (xHCI 1.2 §4.17.3).
     pub const IRQ: &str = "irq";
+}
+
+/// The register block of `xhci`, as something an address space dispatches to.
+///
+/// `len` is how much address space the block claims. [`REGISTER_BYTES`] is what
+/// it needs; a **base address register** takes a power of two and nothing else
+/// (*PCI Local Bus Specification* Rev 2.1 §6.2.5.1), so [`pci`] asks for the
+/// next one up. The tail costs nothing: §5.5 and §5.6 make every dword past the
+/// last interrupter reserved, and this block already reads reserved space as
+/// zero and ignores writes to it.
+///
+/// A `len` below [`REGISTER_BYTES`] would hide registers, so it is raised
+/// rather than honoured.
+#[must_use]
+pub fn register_region(xhci: &Arc<Xhci>, name: &str, len: u64) -> RegionRef {
+    let port = Arc::new(XhciPort {
+        xhci: Arc::clone(xhci),
+    });
+    Arc::new(Region::io(
+        name,
+        len.max(REGISTER_BYTES),
+        port as Arc<dyn MemOps>,
+    ))
 }
 
 /// The xHCI register block, as something an address space dispatches to.
