@@ -19,6 +19,8 @@
 //! 3. **The integer element operations**, which have no scalar counterpart in
 //!    this core at all: A64's general registers do not have a `SMAX`, so
 //!    lanewise `SMAX` cannot be borrowed from anywhere.
+//! 4. **Saturation**, which is the same kind of thing and is listed separately
+//!    because it has an *observable* of its own — see below.
 //!
 //! # Why the arrangement is a type and not two `u32`s
 //!
@@ -45,12 +47,28 @@
 //! and the disassembler appends it from `Q` — the one place a vector mnemonic
 //! is not wholly the row's.
 //!
+//! # Saturation is a *cumulative* operation, not a lanewise one
+//!
+//! Every saturating operation in this file returns `(value, saturated)` rather
+//! than a value, and that is not a convenience. `FPSR.QC` is a single sticky
+//! bit for the whole register file: a guest that adds sixteen byte pairs and
+//! reads `QC` learns that *some* lane clamped, which is information no lane's
+//! result carries — a clamped byte is indistinguishable from one that landed
+//! on `0x7f` honestly. So the boolean has to travel out of the arithmetic and
+//! into the interpreter, which ORs it into `FPSR`.
+//!
+//! Which is also why this group is worth landing as one piece. `QC` was
+//! writable, readable and set by nothing at all, and an instruction added
+//! without it would have been a second lie on top of the first.
+//!
 //! # What is deliberately absent
 //!
-//! The saturating arithmetic (`SQADD`, `SQSHL`, `SQXTN` and relatives, and
-//! therefore `FPSR.QC`), the rounding variants (`SRSHR`, `RSHRN`, `URHADD`),
-//! polynomial multiply, the reciprocal-estimate family (`FRECPE`, `FRSQRTE`,
-//! `FRECPS`, `FRSQRTS`, `FMULX`), `FEAT_FP16` arithmetic, the halving adds,
+//! Polynomial multiply, the reciprocal-estimate family (`FRECPE`, `FRSQRTE`,
+//! `FRECPS`, `FRSQRTS`, `FMULX`), `FEAT_FP16` arithmetic, the pairwise
+//! long adds (`SADDLP`, `UADALP`), `SHLL`, the halving-narrow three-different
+//! family (`ADDHN`, `RADDHN`, `SUBHN`, `RSUBHN`), the absolute-difference-long
+//! group (`SABAL`, `UABDL`), the saturating **by-element** forms
+//! (`SQDMULH`/`SQRDMULH`/`SQDMULL` and relatives with a lane index),
 //! `LD2`/`LD3`/`LD4` of a *single* structure and the replicating loads other
 //! than `LD1R`, and everything Armv8.1 and later added. Each is absent from
 //! the table, so each raises `UNDEFINED` rather than being quietly wrong.
@@ -191,13 +209,19 @@ impl Arrangement {
 }
 
 /// The letter naming an element width — the `S` in `V0.S[2]`.
+///
+/// `?` above a doubleword rather than a fifth letter there is not: a
+/// narrowing or widening format computes `esize ± 1` from a field the
+/// architecture reserves at one end, and printing `d` for a width that does
+/// not exist would make a reserved encoding look like a legal one.
 #[must_use]
 pub const fn elem_letter(esize: u32) -> char {
     match esize {
         0 => 'b',
         1 => 'h',
         2 => 's',
-        _ => 'd',
+        3 => 'd',
+        _ => '?',
     }
 }
 
@@ -452,28 +476,14 @@ pub const fn neg(esize: u32, a: u64) -> u64 {
 /// right by a register: `USHL` with a negated amount is it. The shift amount
 /// is the low eight bits of the second operand read as a signed byte,
 /// whatever the element width.
+///
+/// The body is [`shift_reg`] with neither rounding nor saturation, because
+/// `SSHL`/`USHL` are the corner of one rule that `SRSHL` and `SQSHL` fill in
+/// — see [`shift_by`].
+#[inline]
 #[must_use]
 pub const fn shl_reg(esize: u32, a: u64, b: u64, signed: bool) -> u64 {
-    let bits = 8i32 << esize;
-    let amount = ((b & 0xff) as u8) as i8 as i32;
-    if amount >= 0 {
-        if amount >= bits {
-            0
-        } else {
-            trunc(a << amount, esize)
-        }
-    } else {
-        let shift = -amount;
-        if signed {
-            let value = sext(a, esize);
-            let shift = if shift >= bits { bits - 1 } else { shift };
-            trunc((value >> shift) as u64, esize)
-        } else if shift >= bits {
-            0
-        } else {
-            trunc(a, esize) >> shift
-        }
-    }
+    shift_reg(esize, a, b, signed, false, SatTo::Wrap).0
 }
 
 /// Lanewise signed greater-than, as a mask.
@@ -595,6 +605,306 @@ pub const fn rev_within(value: u64, esize: u32, group: u32) -> u64 {
         i += 1;
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Saturation, and the flag that records it
+// ---------------------------------------------------------------------------
+
+/// Where a result is clamped, and to what signedness.
+///
+/// The A64 narrowing families differ only in this and in how they read their
+/// source: `SHRN` wraps, `SQSHRN` clamps to a signed range, and `SQSHRUN`
+/// reads a *signed* source and clamps to an unsigned one. Naming the bound
+/// rather than passing two booleans is what keeps `SQSHRUN` from being written
+/// as "unsigned, but signed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SatTo {
+    /// No clamp: the low bits of the exact result, which is what `SHRN`,
+    /// `XTN`, `SSHL` and `USHL` do.
+    Wrap,
+    /// Clamp to `-2^(N-1) ..= 2^(N-1)-1`.
+    Signed,
+    /// Clamp to `0 ..= 2^N-1`.
+    Unsigned,
+}
+
+impl SatTo {
+    /// Clamp the exact result `x` into an `esize`-wide element, reporting
+    /// whether it was out of range.
+    ///
+    /// DDI 0487's `SatQ`, and the boolean is the whole reason every operation
+    /// below returns a pair: it is what sets `FPSR.QC`, and a guest reads `QC`
+    /// to learn that a lane it cannot otherwise see was clamped. Dropping the
+    /// bit would leave the flag exactly as dead as it was before this group
+    /// landed.
+    #[must_use]
+    pub const fn apply(self, x: i128, esize: u32) -> (u64, bool) {
+        let bits = 8u32 << esize;
+        match self {
+            SatTo::Wrap => (trunc(x as u64, esize), false),
+            SatTo::Signed => {
+                let max = (1i128 << (bits - 1)) - 1;
+                let min = -(1i128 << (bits - 1));
+                if x > max {
+                    (trunc(max as u64, esize), true)
+                } else if x < min {
+                    (trunc(min as u64, esize), true)
+                } else {
+                    (trunc(x as u64, esize), false)
+                }
+            }
+            SatTo::Unsigned => {
+                let max = (1i128 << bits) - 1;
+                if x > max {
+                    (trunc(max as u64, esize), true)
+                } else if x < 0 {
+                    (0, true)
+                } else {
+                    (trunc(x as u64, esize), false)
+                }
+            }
+        }
+    }
+}
+
+/// Read an `esize`-wide element as an unbounded integer.
+///
+/// `i128` rather than `i64` because that is what "unbounded" has to mean here:
+/// the sum of two doublewords, and the doubled product of two words, both
+/// leave 64 bits, and the value that does not fit is the whole subject of a
+/// saturating operation.
+#[inline]
+#[must_use]
+pub const fn value_of(x: u64, esize: u32, signed: bool) -> i128 {
+    if signed {
+        sext(x, esize) as i128
+    } else {
+        trunc(x, esize) as i128
+    }
+}
+
+/// `SQADD`: a signed add, clamped.
+#[inline]
+#[must_use]
+pub const fn sqadd(esize: u32, a: u64, b: u64) -> (u64, bool) {
+    SatTo::Signed.apply(value_of(a, esize, true) + value_of(b, esize, true), esize)
+}
+
+/// `UQADD`: an unsigned add, clamped.
+#[inline]
+#[must_use]
+pub const fn uqadd(esize: u32, a: u64, b: u64) -> (u64, bool) {
+    SatTo::Unsigned.apply(value_of(a, esize, false) + value_of(b, esize, false), esize)
+}
+
+/// `SQSUB`: a signed subtract, clamped.
+#[inline]
+#[must_use]
+pub const fn sqsub(esize: u32, a: u64, b: u64) -> (u64, bool) {
+    SatTo::Signed.apply(value_of(a, esize, true) - value_of(b, esize, true), esize)
+}
+
+/// `UQSUB`: an unsigned subtract, clamped — and the clamp at zero is the whole
+/// instruction, because an unsigned difference has nowhere else to go.
+#[inline]
+#[must_use]
+pub const fn uqsub(esize: u32, a: u64, b: u64) -> (u64, bool) {
+    SatTo::Unsigned.apply(value_of(a, esize, false) - value_of(b, esize, false), esize)
+}
+
+/// `SUQADD`: add an **unsigned** source to a **signed** accumulator, clamped
+/// signed.
+///
+/// The two operands are read with different signednesses, which is why this is
+/// not [`sqadd`] with its arguments swapped: `acc` is the destination
+/// register, read as signed, and `x` is `Vn`, read as unsigned.
+#[inline]
+#[must_use]
+pub const fn suqadd(esize: u32, acc: u64, x: u64) -> (u64, bool) {
+    SatTo::Signed.apply(
+        value_of(acc, esize, true) + value_of(x, esize, false),
+        esize,
+    )
+}
+
+/// `USQADD`: the mirror image — a **signed** source into an **unsigned**
+/// accumulator, clamped unsigned.
+#[inline]
+#[must_use]
+pub const fn usqadd(esize: u32, acc: u64, x: u64) -> (u64, bool) {
+    SatTo::Unsigned.apply(
+        value_of(acc, esize, false) + value_of(x, esize, true),
+        esize,
+    )
+}
+
+/// `SQABS`: absolute value, clamped.
+///
+/// It saturates at exactly one input — the most negative value, whose absolute
+/// value is one past the widest positive one — and that input is the only
+/// thing separating it from [`abs`].
+#[inline]
+#[must_use]
+pub const fn sqabs(esize: u32, a: u64) -> (u64, bool) {
+    let value = value_of(a, esize, true);
+    let magnitude = if value < 0 { -value } else { value };
+    SatTo::Signed.apply(magnitude, esize)
+}
+
+/// `SQNEG`: negate, clamped. Saturates at the same single input as [`sqabs`].
+#[inline]
+#[must_use]
+pub const fn sqneg(esize: u32, a: u64) -> (u64, bool) {
+    SatTo::Signed.apply(-value_of(a, esize, true), esize)
+}
+
+/// The shift-by-an-amount rule shared by eight instructions.
+///
+/// DDI 0487 states `SSHL`, `USHL`, `SRSHL`, `URSHL`, `SQSHL`, `UQSHL`,
+/// `SQRSHL` and `UQRSHL` as one piece of pseudocode with three switches, and
+/// they are one function here for the same reason: the rounding constant is
+/// added to the *unbounded* value before the shift, and the saturation applies
+/// to the *unbounded* result after it. Eight separate bodies is how the
+/// rounding ends up on the wrong side of the shift.
+///
+/// A negative `amount` is a shift right, which can neither overflow nor lose
+/// its sign, so the `to` bound only ever fires on a left shift.
+#[must_use]
+pub const fn shift_by(
+    esize: u32,
+    a: u64,
+    amount: i32,
+    signed: bool,
+    rounding: bool,
+    to: SatTo,
+) -> (u64, bool) {
+    let bits = 8i32 << esize;
+    let value = value_of(a, esize, signed);
+    if amount >= 0 {
+        if value == 0 {
+            return (0, false);
+        }
+        if amount >= bits {
+            // Every significant bit has left the element, so the exact result
+            // is out of range in whichever direction the value pointed.
+            return match to {
+                SatTo::Wrap => (0, false),
+                _ => to.apply(if value > 0 { i128::MAX } else { i128::MIN }, esize),
+            };
+        }
+        return to.apply(value << amount, esize);
+    }
+    // Clamped at 127 because a shift amount is a *signed byte* and can name
+    // -128, where `1 << (sh - 1)` would leave `i128`. The answer is the same
+    // at every amount past the element width: nothing survives the shift.
+    let sh = if amount <= -127 {
+        127u32
+    } else {
+        (-amount) as u32
+    };
+    let round = if rounding { 1i128 << (sh - 1) } else { 0 };
+    to.apply((value + round) >> sh, esize)
+}
+
+/// The same, taking the amount from the low signed byte of a second operand —
+/// which is how A64 spells it, whatever the element width.
+#[inline]
+#[must_use]
+pub const fn shift_reg(
+    esize: u32,
+    a: u64,
+    b: u64,
+    signed: bool,
+    rounding: bool,
+    to: SatTo,
+) -> (u64, bool) {
+    let amount = ((b & 0xff) as u8) as i8 as i32;
+    shift_by(esize, a, amount, signed, rounding, to)
+}
+
+/// `SHADD`/`UHADD`/`SRHADD`/`URHADD`/`SHSUB`/`UHSUB`: a sum or difference kept
+/// at the element width by shifting it right one place rather than by
+/// discarding the carry.
+///
+/// None of the six can leave the element's range, so **none of them touches
+/// `FPSR.QC`** — which is why this returns a plain value while everything else
+/// in this section returns a pair. `SRHADD`/`URHADD` are here for the
+/// rounding, not for a saturation they do not do.
+#[must_use]
+pub const fn halve(
+    esize: u32,
+    a: u64,
+    b: u64,
+    signed: bool,
+    rounding: bool,
+    subtract: bool,
+) -> u64 {
+    let x = value_of(a, esize, signed);
+    let y = value_of(b, esize, signed);
+    let exact = if subtract {
+        x - y
+    } else {
+        x + y + (rounding as i128)
+    };
+    trunc((exact >> 1) as u64, esize)
+}
+
+/// `SQDMULH`/`SQRDMULH`: the top half of a **doubled** signed product.
+///
+/// The doubling is what makes it saturate at all. `-2^(N-1)` times itself is
+/// `2^(2N-2)`; doubling that gives `2^(2N-1)`, whose top half is `2^(N-1)` —
+/// exactly one past the widest positive element. That single input pair is the
+/// whole difference between this and a plain multiply-returning-high, and it is
+/// the case a test has to contain.
+#[must_use]
+pub const fn sqdmulh(esize: u32, a: u64, b: u64, rounding: bool) -> (u64, bool) {
+    let bits = 8u32 << esize;
+    let doubled = 2 * value_of(a, esize, true) * value_of(b, esize, true);
+    let product = if rounding {
+        doubled + (1i128 << (bits - 1))
+    } else {
+        doubled
+    };
+    SatTo::Signed.apply(product >> bits, esize)
+}
+
+/// `SQDMULL`: a doubled signed product in an element twice as wide.
+///
+/// `esize` is the **source** width. The only input that saturates is the pair
+/// of most-negative values, for the same reason as [`sqdmulh`].
+#[inline]
+#[must_use]
+pub const fn sqdmull(esize: u32, a: u64, b: u64) -> (u64, bool) {
+    SatTo::Signed.apply(
+        2 * value_of(a, esize, true) * value_of(b, esize, true),
+        esize + 1,
+    )
+}
+
+/// The shift-right-and-narrow rule, from `SHRN` through `SQRSHRUN` — and the
+/// extract-narrows, which are this at `shift == 0`.
+///
+/// `esize` is the **destination** width and the source is one width wider,
+/// which is what "narrow" means here. `signed` says how the source is read and
+/// `to` says how the destination is bounded; the two are independent because
+/// `SQSHRUN` reads signed and writes unsigned.
+#[must_use]
+pub const fn shift_narrow(
+    esize: u32,
+    a: u64,
+    shift: u32,
+    signed: bool,
+    rounding: bool,
+    to: SatTo,
+) -> (u64, bool) {
+    let value = value_of(a, esize + 1, signed);
+    let round = if rounding && shift > 0 {
+        1i128 << (shift - 1)
+    } else {
+        0
+    };
+    to.apply((value + round) >> shift, esize)
 }
 
 // ---------------------------------------------------------------------------
@@ -816,6 +1126,499 @@ mod tests {
         assert_eq!(mask_of(false, 3), 0);
         assert_eq!(cmgt(0, 0x7f, 0x80), 0xff, "signed: 127 > -128");
         assert_eq!(cmhi(0, 0x7f, 0x80), 0, "unsigned: 127 is not above 128");
+    }
+
+    // -----------------------------------------------------------------
+    // Saturation, against an oracle that is not this file
+    //
+    // Unlike the floating-point side, this group has a real one on the host:
+    // `i8::saturating_add` and its relatives are the same function, written by
+    // somebody else, and `checked_*` says whether the ideal result fit — which
+    // is exactly `FPSR.QC`'s input. Where the standard library has no
+    // equivalent (the doubling multiplies, the rounding shifts) the oracle
+    // below is the manual's formula evaluated at a **wider integer type**,
+    // which catches a truncation or an off-by-one in the real path but is not
+    // an independent implementation, and is not claimed to be.
+    // -----------------------------------------------------------------
+
+    /// Every pair of bytes, four operations, value and flag.
+    ///
+    /// Exhaustive rather than sampled because it is only 65 536 pairs and
+    /// because the interesting inputs of a saturating add are exactly the ones
+    /// a sample misses.
+    #[test]
+    fn the_saturating_adds_agree_with_the_host_at_every_byte_pair() {
+        for a in 0..=255u32 {
+            for b in 0..=255u32 {
+                let (x, y) = (u64::from(a), u64::from(b));
+                let (sa, sb) = (a as u8 as i8, b as u8 as i8);
+                let (ua, ub) = (a as u8, b as u8);
+
+                let (value, sat) = sqadd(0, x, y);
+                assert_eq!(value, u64::from(sa.saturating_add(sb) as u8));
+                assert_eq!(sat, sa.checked_add(sb).is_none());
+
+                let (value, sat) = uqadd(0, x, y);
+                assert_eq!(value, u64::from(ua.saturating_add(ub)));
+                assert_eq!(sat, ua.checked_add(ub).is_none());
+
+                let (value, sat) = sqsub(0, x, y);
+                assert_eq!(value, u64::from(sa.saturating_sub(sb) as u8));
+                assert_eq!(sat, sa.checked_sub(sb).is_none());
+
+                let (value, sat) = uqsub(0, x, y);
+                assert_eq!(value, u64::from(ua.saturating_sub(ub)));
+                assert_eq!(sat, ua.checked_sub(ub).is_none());
+            }
+        }
+    }
+
+    /// The same four at the doubleword, where the host type is the whole
+    /// element and the implementation's `i128` intermediate is the only thing
+    /// between them.
+    #[test]
+    fn the_saturating_adds_agree_with_the_host_at_the_doubleword() {
+        const EDGES: &[u64] = &[
+            0,
+            1,
+            2,
+            0x7fff_ffff_ffff_fffe,
+            0x7fff_ffff_ffff_ffff,
+            0x8000_0000_0000_0000,
+            0x8000_0000_0000_0001,
+            u64::MAX,
+            u64::MAX - 1,
+            0x1234_5678_9abc_def0,
+        ];
+        for &x in EDGES {
+            for &y in EDGES {
+                let (sa, sb) = (x as i64, y as i64);
+                assert_eq!(
+                    sqadd(3, x, y),
+                    (sa.saturating_add(sb) as u64, sa.checked_add(sb).is_none())
+                );
+                assert_eq!(
+                    uqadd(3, x, y),
+                    (x.saturating_add(y), x.checked_add(y).is_none())
+                );
+                assert_eq!(
+                    sqsub(3, x, y),
+                    (sa.saturating_sub(sb) as u64, sa.checked_sub(sb).is_none())
+                );
+                assert_eq!(
+                    uqsub(3, x, y),
+                    (x.saturating_sub(y), x.checked_sub(y).is_none())
+                );
+            }
+        }
+    }
+
+    /// `SUQADD` and `USQADD` read their two operands with *different*
+    /// signednesses, and swapping them is invisible on most inputs: it shows
+    /// only where one operand's top bit is set. Exhaustive at the byte, which
+    /// contains every such case.
+    #[test]
+    fn the_mixed_signedness_accumulates_read_each_operand_its_own_way() {
+        for acc in 0..=255u32 {
+            for src in 0..=255u32 {
+                // SUQADD: a signed accumulator, an unsigned addend, a signed
+                // clamp.
+                let exact = i32::from(acc as u8 as i8) + i32::from(src as u8);
+                let (value, sat) = suqadd(0, u64::from(acc), u64::from(src));
+                assert_eq!(value, u64::from(exact.clamp(-128, 127) as u8));
+                assert_eq!(sat, !(-128..=127).contains(&exact));
+
+                // USQADD: an unsigned accumulator, a signed addend, an
+                // unsigned clamp — which is the one that can go *below* zero.
+                let exact = i32::from(acc as u8) + i32::from(src as u8 as i8);
+                let (value, sat) = usqadd(0, u64::from(acc), u64::from(src));
+                assert_eq!(value, u64::from(exact.clamp(0, 255) as u8));
+                assert_eq!(sat, !(0..=255).contains(&exact));
+            }
+        }
+    }
+
+    /// `SQABS` and `SQNEG` saturate at exactly one input, and it is the one an
+    /// implementation that reuses [`abs`] silently gets wrong: `wrapping_abs`
+    /// of the most negative value is itself.
+    #[test]
+    fn the_saturating_abs_and_neg_clamp_only_at_the_most_negative() {
+        for a in 0..=255u32 {
+            let value = a as u8 as i8;
+            let x = u64::from(a);
+            assert_eq!(
+                sqabs(0, x),
+                (
+                    u64::from(value.saturating_abs() as u8),
+                    value.checked_abs().is_none()
+                )
+            );
+            assert_eq!(
+                sqneg(0, x),
+                (
+                    u64::from(value.saturating_neg() as u8),
+                    value.checked_neg().is_none()
+                )
+            );
+        }
+        // And at the doubleword, where the sign bit is the register's own.
+        assert_eq!(sqabs(3, 1 << 63), (i64::MAX as u64, true));
+        assert_eq!(sqneg(3, 1 << 63), (i64::MAX as u64, true));
+        assert_eq!(sqneg(3, 1), ((-1i64) as u64, false));
+    }
+
+    /// The eight shifts, at every byte and every amount a byte can name that
+    /// is not a no-op — evaluated against the same rule at sixteen bits, where
+    /// nothing overflows and the clamp is explicit.
+    #[test]
+    fn the_shifts_round_before_they_shift_and_clamp_after() {
+        for a in 0..=255u32 {
+            for amount in -9i32..=9 {
+                let x = u64::from(a);
+                let b = u64::from(amount as i8 as u8);
+                let signed = i32::from(a as u8 as i8);
+                let unsigned = i32::from(a as u8);
+                // The rounding constant belongs to the *right* shift only.
+                let round = if amount < 0 { 1 << (-amount - 1) } else { 0 };
+                let shift = |v: i32, round: i32| -> i32 {
+                    if amount >= 0 {
+                        if amount >= 31 { 0 } else { v << amount }
+                    } else {
+                        (v + round) >> (-amount).min(31)
+                    }
+                };
+
+                let plain = shift(signed, 0);
+                assert_eq!(
+                    shift_reg(0, x, b, true, false, SatTo::Wrap).0,
+                    u64::from(plain as u8),
+                    "SSHL {a:#x} by {amount}"
+                );
+                let rounded = shift(signed, round);
+                assert_eq!(
+                    shift_reg(0, x, b, true, true, SatTo::Wrap).0,
+                    u64::from(rounded as u8),
+                    "SRSHL {a:#x} by {amount}"
+                );
+                assert_eq!(
+                    shift_reg(0, x, b, true, false, SatTo::Signed),
+                    (
+                        u64::from(plain.clamp(-128, 127) as u8),
+                        !(-128..=127).contains(&plain)
+                    ),
+                    "SQSHL {a:#x} by {amount}"
+                );
+                assert_eq!(
+                    shift_reg(0, x, b, true, true, SatTo::Signed),
+                    (
+                        u64::from(rounded.clamp(-128, 127) as u8),
+                        !(-128..=127).contains(&rounded)
+                    ),
+                    "SQRSHL {a:#x} by {amount}"
+                );
+
+                let plain = shift(unsigned, 0);
+                assert_eq!(
+                    shift_reg(0, x, b, false, false, SatTo::Wrap).0,
+                    u64::from(plain as u8),
+                    "USHL {a:#x} by {amount}"
+                );
+                let rounded = shift(unsigned, round);
+                assert_eq!(
+                    shift_reg(0, x, b, false, true, SatTo::Wrap).0,
+                    u64::from(rounded as u8),
+                    "URSHL {a:#x} by {amount}"
+                );
+                assert_eq!(
+                    shift_reg(0, x, b, false, false, SatTo::Unsigned),
+                    (
+                        u64::from(plain.clamp(0, 255) as u8),
+                        !(0..=255).contains(&plain)
+                    ),
+                    "UQSHL {a:#x} by {amount}"
+                );
+                assert_eq!(
+                    shift_reg(0, x, b, false, true, SatTo::Unsigned),
+                    (
+                        u64::from(rounded.clamp(0, 255) as u8),
+                        !(0..=255).contains(&rounded)
+                    ),
+                    "UQRSHL {a:#x} by {amount}"
+                );
+                // `SQSHLU` is the asymmetric one: a signed source, an unsigned
+                // clamp, so every negative input saturates to zero.
+                let plain = shift(signed, 0);
+                assert_eq!(
+                    shift_reg(0, x, b, true, false, SatTo::Unsigned),
+                    (
+                        u64::from(plain.clamp(0, 255) as u8),
+                        !(0..=255).contains(&plain)
+                    ),
+                    "SQSHLU {a:#x} by {amount}"
+                );
+            }
+        }
+    }
+
+    /// A shift amount is a *signed byte*, so -128 is reachable — and the
+    /// rounding constant it names, `1 << 127`, is one place beyond what an
+    /// `i128` holds. Everything past the element width gives the same answer,
+    /// which is what makes clamping the amount safe rather than approximate.
+    ///
+    /// The three expectations below were all written wrong the first time, and
+    /// the manual's pseudocode is why: the rounding constant is added to the
+    /// *value* before the shift, so a rounding right shift of all-ones is
+    /// **not** all-ones or zero by symmetry — it is whatever
+    /// `(value + 2^(sh-1)) >> sh` comes to, which rounds -1 up to 0 and
+    /// `0xffff_ffff_ffff_ffff` up to 1.
+    #[test]
+    fn a_shift_amount_of_minus_one_hundred_and_twenty_eight_is_reachable() {
+        for esize in 0..4u32 {
+            let bits = 8i32 << esize;
+            for amount in [-128i32, -127, -100, -65, -64, -bits] {
+                let b = u64::from(amount as i8 as u8);
+                // Unsigned and not rounding: every bit has left the element.
+                assert_eq!(
+                    shift_reg(esize, u64::MAX, b, false, false, SatTo::Wrap).0,
+                    0
+                );
+                // Signed and not rounding: -1 stays -1 however far it goes.
+                assert_eq!(
+                    shift_reg(esize, u64::MAX, b, true, false, SatTo::Wrap).0,
+                    trunc(u64::MAX, esize)
+                );
+                // Signed *and* rounding: -1 rounds up to zero.
+                assert_eq!(shift_reg(esize, u64::MAX, b, true, true, SatTo::Wrap).0, 0);
+                // Unsigned and rounding: all-ones is one below the element's
+                // modulus, so it rounds up to 1 at exactly the element width
+                // and to 0 at anything wider.
+                let want = u64::from(amount == -bits);
+                assert_eq!(
+                    shift_reg(esize, u64::MAX, b, false, true, SatTo::Wrap).0,
+                    want,
+                    "URSHL all-ones by {amount} at esize {esize}"
+                );
+            }
+        }
+        // A left shift by the whole width is zero when it wraps and a clamp
+        // when it saturates — and zero either way if the value was zero.
+        assert_eq!(shift_by(0, 1, 8, false, false, SatTo::Wrap), (0, false));
+        assert_eq!(shift_by(0, 1, 8, true, false, SatTo::Signed), (127, true));
+        assert_eq!(shift_by(0, 0, 100, true, false, SatTo::Signed), (0, false));
+    }
+
+    /// The halving adds keep the carry that an ordinary add throws away, and
+    /// **none of them saturates** — which is why they are the six operations
+    /// in this section that return a value rather than a pair.
+    #[test]
+    fn the_halving_adds_keep_the_carry_and_never_saturate() {
+        for a in 0..=255u32 {
+            for b in 0..=255u32 {
+                let (x, y) = (u64::from(a), u64::from(b));
+                let (sa, sb) = (i32::from(a as u8 as i8), i32::from(b as u8 as i8));
+                let (ua, ub) = (i32::from(a as u8), i32::from(b as u8));
+                assert_eq!(
+                    halve(0, x, y, true, false, false),
+                    ((sa + sb) >> 1) as u64 & 0xff
+                );
+                assert_eq!(
+                    halve(0, x, y, false, false, false),
+                    ((ua + ub) >> 1) as u64 & 0xff
+                );
+                assert_eq!(
+                    halve(0, x, y, true, true, false),
+                    ((sa + sb + 1) >> 1) as u64 & 0xff
+                );
+                assert_eq!(
+                    halve(0, x, y, false, true, false),
+                    ((ua + ub + 1) >> 1) as u64 & 0xff
+                );
+                assert_eq!(
+                    halve(0, x, y, true, false, true),
+                    ((sa - sb) >> 1) as u64 & 0xff
+                );
+                assert_eq!(
+                    halve(0, x, y, false, false, true),
+                    ((ua - ub) >> 1) as u64 & 0xff
+                );
+            }
+        }
+        // `UHADD` of two maxima is the case that shows the carry is kept:
+        // 0xff + 0xff halved is 0xff, not 0x7f.
+        assert_eq!(halve(0, 0xff, 0xff, false, false, false), 0xff);
+    }
+
+    /// The doubling multiplies, against the host's `saturating_mul` at twice
+    /// the width — which is a genuine oracle for the *long* form, because
+    /// `(a as i64).saturating_mul(b as i64).saturating_mul(2)` is exactly
+    /// `SignedSat(2 * a * b, 64)` and is somebody else's code.
+    #[test]
+    fn the_doubling_multiplies_saturate_only_at_the_two_extremes() {
+        const EDGES: &[i32] = &[
+            0,
+            1,
+            -1,
+            2,
+            -2,
+            32767,
+            -32768,
+            i32::MAX,
+            i32::MIN,
+            0x1234_5678,
+            -0x1234_5678,
+        ];
+        // 16 -> 32, where `i64` holds the doubled product exactly and no
+        // clamp happens before the architecture's own. Saturating the oracle
+        // *first* is precisely the bug this expectation started with: the
+        // pre-clamped product's top half is 0x7fff, which looks like an
+        // honest result rather than a saturated one.
+        for &a in EDGES {
+            for &b in EDGES {
+                let (a, b) = (a as i16, b as i16);
+                let (x, y) = (u64::from(a as u16), u64::from(b as u16));
+                let exact = 2 * i64::from(a) * i64::from(b);
+                let bounded = |v: i64| -> (u64, bool) {
+                    (
+                        v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as u32 as u64,
+                        !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&v),
+                    )
+                };
+                assert_eq!(sqdmull(1, x, y), bounded(exact));
+                let narrow = |v: i64| -> (u64, bool) {
+                    (
+                        v.clamp(-32768, 32767) as i16 as u16 as u64,
+                        !(-32768..=32767).contains(&v),
+                    )
+                };
+                assert_eq!(sqdmulh(1, x, y, false), narrow(exact >> 16));
+                assert_eq!(sqdmulh(1, x, y, true), narrow((exact + (1 << 15)) >> 16));
+            }
+        }
+        // 32 -> 64, where only the pair of most negative values saturates.
+        for &a in EDGES {
+            for &b in EDGES {
+                let (x, y) = (u64::from(a as u32), u64::from(b as u32));
+                let exact = i64::from(a).saturating_mul(i64::from(b)).saturating_mul(2);
+                assert_eq!(
+                    sqdmull(2, x, y),
+                    (exact as u64, a == i32::MIN && b == i32::MIN)
+                );
+            }
+        }
+    }
+
+    /// The narrowing family, halfword to byte, at every source value and every
+    /// shift — the group where a signed source and an unsigned destination
+    /// meet, and where an implementation that reads the source at the
+    /// destination's width loses the top half silently.
+    #[test]
+    fn the_narrowing_shifts_read_a_wide_source_and_bound_a_narrow_result() {
+        for a in 0..=0xffffu32 {
+            for shift in 0..=8u32 {
+                let x = u64::from(a);
+                let signed = i32::from(a as u16 as i16);
+                let unsigned = i32::from(a as u16);
+                let round = if shift > 0 { 1 << (shift - 1) } else { 0 };
+
+                // SHRN / RSHRN: no bound at all.
+                assert_eq!(
+                    shift_narrow(0, x, shift, false, false, SatTo::Wrap).0,
+                    ((unsigned >> shift) & 0xff) as u64
+                );
+                assert_eq!(
+                    shift_narrow(0, x, shift, false, true, SatTo::Wrap).0,
+                    (((unsigned + round) >> shift) & 0xff) as u64
+                );
+                // SQSHRN / SQRSHRN: a signed source, a signed byte.
+                let exact = signed >> shift;
+                assert_eq!(
+                    shift_narrow(0, x, shift, true, false, SatTo::Signed),
+                    (
+                        exact.clamp(-128, 127) as u8 as u64,
+                        !(-128..=127).contains(&exact)
+                    )
+                );
+                let exact = (signed + round) >> shift;
+                assert_eq!(
+                    shift_narrow(0, x, shift, true, true, SatTo::Signed),
+                    (
+                        exact.clamp(-128, 127) as u8 as u64,
+                        !(-128..=127).contains(&exact)
+                    )
+                );
+                // UQSHRN: an unsigned source, an unsigned byte.
+                let exact = unsigned >> shift;
+                assert_eq!(
+                    shift_narrow(0, x, shift, false, false, SatTo::Unsigned),
+                    (exact.clamp(0, 255) as u64, exact > 255)
+                );
+                // SQSHRUN: the asymmetric one — signed in, unsigned out, so a
+                // negative source saturates to zero rather than wrapping to a
+                // large byte.
+                let exact = signed >> shift;
+                assert_eq!(
+                    shift_narrow(0, x, shift, true, false, SatTo::Unsigned),
+                    (exact.clamp(0, 255) as u64, !(0..=255).contains(&exact))
+                );
+            }
+        }
+    }
+
+    /// The extract-narrows are the narrowing shifts by nothing, and the three
+    /// of them differ only in how the source is read and where it is bounded.
+    #[test]
+    fn the_extract_narrows_are_a_narrowing_shift_of_zero() {
+        // SQXTN: 0x1234 does not fit a signed byte.
+        assert_eq!(
+            shift_narrow(0, 0x1234, 0, true, false, SatTo::Signed),
+            (127, true)
+        );
+        assert_eq!(
+            shift_narrow(0, 0xffff, 0, true, false, SatTo::Signed),
+            (0xff, false),
+            "-1 fits"
+        );
+        // UQXTN reads the same bits as 65535, which does not fit.
+        assert_eq!(
+            shift_narrow(0, 0xffff, 0, false, false, SatTo::Unsigned),
+            (0xff, true)
+        );
+        // SQXTUN reads -1 and clamps it to zero.
+        assert_eq!(
+            shift_narrow(0, 0xffff, 0, true, false, SatTo::Unsigned),
+            (0, true)
+        );
+        // And at the widest pair, a doubleword down to a word.
+        assert_eq!(
+            shift_narrow(2, 0x8000_0000_0000_0000, 0, true, false, SatTo::Signed),
+            (0x8000_0000, true)
+        );
+        assert_eq!(
+            shift_narrow(2, 0xffff_ffff, 0, false, false, SatTo::Unsigned),
+            (0xffff_ffff, false),
+            "the widest word fits a word"
+        );
+    }
+
+    /// The bounds themselves, at the doubleword, where the obvious
+    /// `(1 << bits) - 1` overflows and a `u64` cannot hold the signed range.
+    #[test]
+    fn the_bounds_are_right_at_the_widest_element() {
+        assert_eq!(SatTo::Signed.apply(i128::MAX, 3), (i64::MAX as u64, true));
+        assert_eq!(SatTo::Signed.apply(i128::MIN, 3), (i64::MIN as u64, true));
+        assert_eq!(SatTo::Unsigned.apply(i128::MAX, 3), (u64::MAX, true));
+        assert_eq!(SatTo::Unsigned.apply(-1, 3), (0, true));
+        assert_eq!(
+            SatTo::Unsigned.apply(i128::from(u64::MAX), 3),
+            (u64::MAX, false)
+        );
+        assert_eq!(
+            SatTo::Signed.apply(i128::from(i64::MIN), 3),
+            (i64::MIN as u64, false)
+        );
+        // Wrapping keeps the low bits and never reports a saturation, which is
+        // what makes `SHRN` and `SSHL` members of the same family.
+        assert_eq!(SatTo::Wrap.apply(0x1234, 0), (0x34, false));
     }
 
     /// `FABD` is one operation rather than a subtract and an `FABS`, and the

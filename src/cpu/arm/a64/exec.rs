@@ -1940,6 +1940,20 @@ impl<'a> Exec<'a> {
         fp::accumulate(&mut self.st.sys.fpsr, flags);
     }
 
+    /// Record a saturation in `FPSR.QC`.
+    ///
+    /// One bit for the whole instruction, not one per lane: DDI 0487 says
+    /// `FPSR.QC` is set if *any* element saturated, and that is the only thing
+    /// a guest can learn about a lane whose clamped result is indistinguishable
+    /// from an honest one. Sticky like the exception flags, so it survives
+    /// until the guest writes `FPSR`.
+    #[inline]
+    fn set_qc(&mut self, saturated: bool) {
+        if saturated {
+            self.st.sys.fpsr |= fp::fpsr::QC;
+        }
+    }
+
     /// Everything with `Feat::Fp` in the table, once the access check passed.
     fn fp_execute(&mut self, word: u32, op: Op, fmt: Fmt) -> Result<(), Trap> {
         if fmt.is_fp_load_store() {
@@ -2461,13 +2475,19 @@ impl<'a> Exec<'a> {
             Fmt::VecTable => self.simd_table(word, op),
             Fmt::VecShiftImm => self.simd_shift_imm(word, op),
             Fmt::VecShiftLong => self.simd_shift_long(word, op),
-            Fmt::VecShiftNarrow => self.simd_shift_narrow(word),
+            Fmt::VecShiftNarrow => self.simd_shift_narrow(word, op),
             Fmt::VecThreeDiff | Fmt::VecThreeWide => self.simd_three_diff(word, op, fmt),
             Fmt::VecByElem => self.simd_by_elem(word, op),
             Fmt::SimdScalarThree
             | Fmt::SimdScalarTwo
             | Fmt::SimdScalarCmpZero
             | Fmt::SimdScalarPair => self.simd_scalar(word, op, fmt),
+            Fmt::SimdScalarThreeSz
+            | Fmt::SimdScalarTwoSz
+            | Fmt::SimdScalarNarrow
+            | Fmt::SimdScalarDiff
+            | Fmt::SimdScalarShift
+            | Fmt::SimdScalarShiftNarrow => self.simd_scalar_sat(word, op, fmt),
             // Every `Feat::AdvSimd` row is one of the formats above; a new row
             // with a format nothing here handles is a gap rather than a
             // silent no-op.
@@ -2623,6 +2643,25 @@ impl<'a> Exec<'a> {
         let d = isa::rd(word);
         let a = self.st.v.q(isa::rn(word));
         let b = self.st.v.q(isa::rm(word));
+
+        // The saturating and halving rows first, because they are the ones
+        // that return two things: a value and whether it was clamped.
+        if let Some(kind) = sat_op(op) {
+            if sat_width_reserved(kind, e) {
+                return Err(Trap::undefined());
+            }
+            let mut saturated = false;
+            let mut out = 0u128;
+            for lane in 0..arr.lanes {
+                let (value, q) =
+                    sat_eval(kind, e, simd::elem(a, e, lane), simd::elem(b, e, lane), 0);
+                saturated |= q;
+                out = simd::set_elem(out, e, lane, value);
+            }
+            self.set_qc(saturated);
+            self.vset(d, arr, out);
+            return Ok(());
+        }
 
         // The permutes read their two sources as a shape rather than
         // lanewise, so they cannot be a lane function.
@@ -2814,6 +2853,30 @@ impl<'a> Exec<'a> {
         let d = isa::rd(word);
         let a = self.st.v.q(isa::rn(word));
 
+        // `SUQADD`, `USQADD`, `SQABS` and `SQNEG` are two-register forms of the
+        // same lane rules the three-same group uses, and the first two read
+        // the destination as their accumulator — which is the operand a
+        // reading that treats `Vn` as "the source" puts in the wrong place.
+        if let Some(kind) = sat_op(op) {
+            let current = self.st.v.q(d);
+            let mut saturated = false;
+            let mut out = 0u128;
+            for lane in 0..arr.lanes {
+                let (value, q) = sat_eval(
+                    kind,
+                    e,
+                    simd::elem(a, e, lane),
+                    0,
+                    simd::elem(current, e, lane),
+                );
+                saturated |= q;
+                out = simd::set_elem(out, e, lane, value);
+            }
+            self.set_qc(saturated);
+            self.vset(d, arr, out);
+            return Ok(());
+        }
+
         // `REV64`, `REV32` and `REV16` reverse the elements inside a
         // container, and the element must be narrower than the container —
         // `REV16 V0.4S` reverses nothing and is unallocated rather than a
@@ -2971,10 +3034,15 @@ impl<'a> Exec<'a> {
         Ok(())
     }
 
-    /// `XTN`/`XTN2` and `FCVTN`/`FCVTN2`: a result half as wide as its source,
-    /// written into the half of the destination `Q` selects.
+    /// A result half as wide as its source, written into the half of the
+    /// destination `Q` selects: `XTN`, the three saturating extract-narrows,
+    /// and `FCVTN`.
     fn simd_narrow(&mut self, word: u32, op: Op) -> Result<(), Trap> {
-        let (dst, src) = if op == Op::XtnVec {
+        // `FCVTN` takes its destination width from `sz`; the four integer
+        // narrows — `XTN` and the three saturating extracts — take it from
+        // `size`, one field wider.
+        let integer = op != Op::FcvtnVec;
+        let (dst, src) = if integer {
             let size = isa::simd_size(word);
             if size > 2 {
                 return Err(Trap::undefined());
@@ -2984,14 +3052,21 @@ impl<'a> Exec<'a> {
             let sz = u32::from(isa::simd_sz(word));
             (1 + sz, 2 + sz)
         };
+        let rule = narrow_rule(op);
         let lanes = 64 / (8 << dst);
         let a = self.st.v.q(isa::rn(word));
         let mut half = 0u128;
         let mut flags = Flags::NONE;
+        let mut saturated = false;
         for lane in 0..lanes {
             let x = simd::elem(a, src, lane);
-            let value = if op == Op::XtnVec {
-                simd::trunc(x, dst)
+            let value = if let Some((signed, rounding, to)) = rule {
+                // An extract-narrow is a narrowing shift by nothing, which is
+                // why it is the same function: the only thing `SQXTN` adds to
+                // `XTN` is the bound, and the bound is a parameter.
+                let (value, q) = simd::shift_narrow(dst, x, 0, signed, rounding, to);
+                saturated |= q;
+                value
             } else {
                 let (from, to) = (prec_of(src)?, prec_of(dst)?);
                 let (value, f) = fp::convert(from, to, x, self.st.sys.fpcr);
@@ -3001,6 +3076,7 @@ impl<'a> Exec<'a> {
             half = simd::set_elem(half, dst, lane, value);
         }
         self.set_fp_flags(flags);
+        self.set_qc(saturated);
         self.write_half(isa::rd(word), isa::q(word), half);
         Ok(())
     }
@@ -3198,12 +3274,33 @@ impl<'a> Exec<'a> {
             .prec()
             .map(|prec| (prec, fp::env(self.st.sys.fpcr, prec)));
         let mut flags = Flags::NONE;
+        let mut saturated = false;
         let mut out = 0u128;
         for lane in 0..arr.lanes {
             let x = simd::elem(a, e, lane);
             let acc = simd::elem(current, e, lane);
             let value = match op {
                 Op::ShlVec => simd::trunc(x << (immhb - bits), e),
+                Op::SqshlImmVec | Op::UqshlImmVec | Op::SqshluImmVec => {
+                    let (signed, to) = shift_left_rule(op).ok_or_else(Trap::undefined)?;
+                    let (value, q) = simd::shift_by(e, x, (immhb - bits) as i32, signed, false, to);
+                    saturated |= q;
+                    value
+                }
+                Op::SrshrVec | Op::UrshrVec | Op::SrsraVec | Op::UrsraVec => {
+                    // The rounding constant is added before the shift, so this
+                    // is not `SSHR` with a `+1` afterwards: at a shift of the
+                    // whole element width the constant is the only thing left.
+                    let shift = 2 * bits - immhb;
+                    let signed = matches!(op, Op::SrshrVec | Op::SrsraVec);
+                    let (shifted, _) =
+                        simd::shift_by(e, x, -(shift as i32), signed, true, simd::SatTo::Wrap);
+                    if matches!(op, Op::SrsraVec | Op::UrsraVec) {
+                        simd::add(e, acc, shifted)
+                    } else {
+                        shifted
+                    }
+                }
                 Op::SliVec => {
                     let shift = immhb - bits;
                     let kept = simd::trunc(u64::MAX << shift, e);
@@ -3242,6 +3339,7 @@ impl<'a> Exec<'a> {
             out = simd::set_elem(out, e, lane, value);
         }
         self.set_fp_flags(flags);
+        self.set_qc(saturated);
         self.vset(d, arr, out);
         Ok(())
     }
@@ -3273,22 +3371,31 @@ impl<'a> Exec<'a> {
         Ok(())
     }
 
-    /// `SHRN`/`SHRN2`: a shift right into elements half as wide.
-    fn simd_shift_narrow(&mut self, word: u32) -> Result<(), Trap> {
+    /// `SHRN`/`SHRN2` and the seven other shift-right-and-narrow spellings.
+    ///
+    /// `immh` naming a doubleword is reserved throughout: the destination
+    /// would be a doubleword and the source a quadword, and there is no
+    /// 128-bit element.
+    fn simd_shift_narrow(&mut self, word: u32, op: Op) -> Result<(), Trap> {
         let (dst, immhb) = Self::shift_width(word)?;
         if dst == 3 {
             return Err(Trap::undefined());
         }
+        let (signed, rounding, to) = narrow_rule(op).ok_or_else(Trap::undefined)?;
         let src = dst + 1;
         let bits = 8 << dst;
         let shift = 2 * bits - immhb;
         let lanes = 64 / bits;
         let a = self.st.v.q(isa::rn(word));
         let mut half = 0u128;
+        let mut saturated = false;
         for lane in 0..lanes {
             let x = simd::elem(a, src, lane);
-            half = simd::set_elem(half, dst, lane, simd::trunc(x >> shift, dst));
+            let (value, q) = simd::shift_narrow(dst, x, shift, signed, rounding, to);
+            saturated |= q;
+            half = simd::set_elem(half, dst, lane, value);
         }
+        self.set_qc(saturated);
         self.write_half(isa::rd(word), isa::q(word), half);
         Ok(())
     }
@@ -3298,6 +3405,13 @@ impl<'a> Exec<'a> {
     fn simd_three_diff(&mut self, word: u32, op: Op, fmt: Fmt) -> Result<(), Trap> {
         let src = isa::simd_size(word);
         if src > 2 {
+            return Err(Trap::undefined());
+        }
+        let doubling = matches!(op, Op::SqdmullVec | Op::SqdmlalVec | Op::SqdmlslVec);
+        // A doubled product of two bytes needs seventeen bits, so the byte
+        // source has no doubling form: `size == 0b00` is reserved for these
+        // three and allocated for every other row in the group.
+        if doubling && src == 0 {
             return Err(Trap::undefined());
         }
         let dst = src + 1;
@@ -3325,17 +3439,41 @@ impl<'a> Exec<'a> {
             }
         };
         let mut out = 0u128;
+        let mut saturated = false;
         for lane in 0..lanes {
+            let raw_x = simd::elem(a, src, lane + offset);
+            let raw_y = simd::elem(b, src, lane + offset);
             // The wide form reads `Vn` at the destination width and `Vm` at
             // the source width, which is the whole difference between
             // `UADDL` and `UADDW`.
             let x = if fmt == Fmt::VecThreeWide {
                 simd::elem(a, dst, lane)
             } else {
-                widen(simd::elem(a, src, lane + offset))
+                widen(raw_x)
             };
-            let y = widen(simd::elem(b, src, lane + offset));
+            let y = widen(raw_y);
             let value = match op {
+                Op::SqdmullVec | Op::SqdmlalVec | Op::SqdmlslVec => {
+                    // Two saturations, in this order: the doubled product is
+                    // clamped first, and the accumulation into `Vd` is clamped
+                    // again. Either one sets `QC`.
+                    let (product, q) = simd::sqdmull(src, raw_x, raw_y);
+                    saturated |= q;
+                    if op == Op::SqdmullVec {
+                        product
+                    } else {
+                        let acc = simd::value_of(simd::elem(current, dst, lane), dst, true);
+                        let p = simd::value_of(product, dst, true);
+                        let exact = if op == Op::SqdmlalVec {
+                            acc + p
+                        } else {
+                            acc - p
+                        };
+                        let (value, q) = simd::SatTo::Signed.apply(exact, dst);
+                        saturated |= q;
+                        value
+                    }
+                }
                 Op::SaddlVec | Op::UaddlVec | Op::SaddwVec | Op::UaddwVec => simd::add(dst, x, y),
                 Op::SsublVec | Op::UsublVec | Op::SsubwVec | Op::UsubwVec => simd::sub(dst, x, y),
                 Op::SmullVec | Op::UmullVec => simd::mul(dst, x, y),
@@ -3349,6 +3487,7 @@ impl<'a> Exec<'a> {
             };
             out = simd::set_elem(out, dst, lane, value);
         }
+        self.set_qc(saturated);
         self.st.v.set_q(d, out);
         Ok(())
     }
@@ -3510,6 +3649,98 @@ impl<'a> Exec<'a> {
         };
         self.set_fp_flags(flags);
         self.st.v.write(d, bytes, value);
+        Ok(())
+    }
+
+    /// The scalar saturating forms: one lane, a width the *encoding* names,
+    /// and a destination that zeroes the rest of its register.
+    ///
+    /// Separate from [`Self::simd_scalar`] because those rows pin `size` at
+    /// `0b11` — the architecture gives `ADD`, `CMGT` and the rest a doubleword
+    /// scalar and nothing narrower — while every row here has four widths, and
+    /// the byte is the interesting one: `SQADD B0, B1, B2` clamping at 127 is
+    /// the whole reason the encoding exists.
+    fn simd_scalar_sat(&mut self, word: u32, op: Op, fmt: Fmt) -> Result<(), Trap> {
+        let d = isa::rd(word);
+        let n = isa::rn(word);
+        match fmt {
+            Fmt::SimdScalarThreeSz | Fmt::SimdScalarTwoSz => {
+                let e = isa::simd_size(word);
+                let kind = sat_op(op).ok_or_else(Trap::undefined)?;
+                if sat_width_reserved(kind, e) {
+                    return Err(Trap::undefined());
+                }
+                let bytes = 1u64 << e;
+                let x = self.st.v.read(n, bytes);
+                let y = if fmt == Fmt::SimdScalarThreeSz {
+                    self.st.v.read(isa::rm(word), bytes)
+                } else {
+                    0
+                };
+                let acc = self.st.v.read(d, bytes);
+                let (value, saturated) = sat_eval(kind, e, x, y, acc);
+                self.set_qc(saturated);
+                self.st.v.write(d, bytes, value);
+            }
+            Fmt::SimdScalarNarrow | Fmt::SimdScalarShiftNarrow => {
+                // The two differ only in where the destination width and the
+                // shift come from: `size` and nothing for an extract-narrow,
+                // `immh`:`immb` for a shift.
+                let (dst, shift) = if fmt == Fmt::SimdScalarNarrow {
+                    (isa::simd_size(word), 0)
+                } else {
+                    let (dst, immhb) = Self::shift_width(word)?;
+                    (dst, (16u32 << dst) - immhb)
+                };
+                if dst > 2 {
+                    return Err(Trap::undefined());
+                }
+                let (signed, rounding, to) = narrow_rule(op).ok_or_else(Trap::undefined)?;
+                let x = self.st.v.read(n, 1u64 << (dst + 1));
+                let (value, saturated) = simd::shift_narrow(dst, x, shift, signed, rounding, to);
+                self.set_qc(saturated);
+                self.st.v.write(d, 1u64 << dst, value);
+            }
+            Fmt::SimdScalarShift => {
+                let (e, immhb) = Self::shift_width(word)?;
+                let (signed, to) = shift_left_rule(op).ok_or_else(Trap::undefined)?;
+                let bits = 8u32 << e;
+                let x = self.st.v.read(n, 1u64 << e);
+                let (value, saturated) =
+                    simd::shift_by(e, x, (immhb - bits) as i32, signed, false, to);
+                self.set_qc(saturated);
+                self.st.v.write(d, 1u64 << e, value);
+            }
+            _ => {
+                // `SQDMULL`, `SQDMLAL`, `SQDMLSL`: a doubled product one width
+                // wider than its sources, with the same two saturations in the
+                // same order as the vector form.
+                let src = isa::simd_size(word);
+                if src == 0 || src > 2 {
+                    return Err(Trap::undefined());
+                }
+                let dst = src + 1;
+                let x = self.st.v.read(n, 1u64 << src);
+                let y = self.st.v.read(isa::rm(word), 1u64 << src);
+                let (product, mut saturated) = simd::sqdmull(src, x, y);
+                let value = if op == Op::SqdmullScalar {
+                    product
+                } else {
+                    let acc = simd::value_of(self.st.v.read(d, 1u64 << dst), dst, true);
+                    let p = simd::value_of(product, dst, true);
+                    let exact = if op == Op::SqdmlalScalar {
+                        acc + p
+                    } else {
+                        acc - p
+                    };
+                    let (value, q) = simd::SatTo::Signed.apply(exact, dst);
+                    saturated |= q;
+                    value
+                };
+                self.set_qc(saturated);
+                self.st.v.write(d, 1u64 << dst, value);
+            }
+        }
         Ok(())
     }
 
@@ -3696,6 +3927,260 @@ fn prec_of(esize: u32) -> Result<fp::Prec, Trap> {
         3 => Ok(fp::Prec::Double),
         _ => Err(Trap::undefined()),
     }
+}
+
+/// The saturating and rounding lane operations, named independently of the
+/// encoding that produced one.
+///
+/// `SQADD V0.16B, V1.16B, V2.16B` and `SQADD B0, B1, B2` are the same
+/// arithmetic over a different number of lanes, and the table gives them
+/// different [`Op`]s because a row describes an *encoding*. Collapsing the two
+/// here is what keeps one rule from being written twice — the same reason
+/// `isa.rs` refuses to state the instruction set once for decode and again for
+/// disassembly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SatOp {
+    /// `SQADD`, `UQADD`, `SQSUB`, `UQSUB`.
+    AddSub {
+        /// Read both operands and bound the result unsigned.
+        unsigned: bool,
+        /// Subtract rather than add.
+        subtract: bool,
+    },
+    /// `SUQADD`, `USQADD`: the destination is the accumulator, and the two
+    /// operands are read with *different* signednesses.
+    Accumulate {
+        /// `USQADD`: an unsigned accumulator taking a signed value.
+        unsigned: bool,
+    },
+    /// `SQABS`, `SQNEG`.
+    AbsNeg {
+        /// `SQNEG` rather than `SQABS`.
+        negate: bool,
+    },
+    /// The eight shift-by-a-register forms, from `SSHL` to `UQRSHL`.
+    Shift {
+        /// Read the value unsigned.
+        unsigned: bool,
+        /// Add the rounding constant before shifting right.
+        rounding: bool,
+        /// How a left shift's result is bounded.
+        to: simd::SatTo,
+    },
+    /// The six halving adds and subtracts, which cannot saturate.
+    Halve {
+        /// Read both operands unsigned.
+        unsigned: bool,
+        /// `SRHADD`/`URHADD`.
+        rounding: bool,
+        /// `SHSUB`/`UHSUB`.
+        subtract: bool,
+    },
+    /// `SQDMULH`, `SQRDMULH`.
+    MulHigh {
+        /// `SQRDMULH`.
+        rounding: bool,
+    },
+}
+
+/// Which lane rule a three-same or two-misc row names, vector or scalar.
+fn sat_op(op: Op) -> Option<SatOp> {
+    use simd::SatTo::{Signed, Unsigned};
+    Some(match op {
+        Op::SqaddVec | Op::SqaddScalar => SatOp::AddSub {
+            unsigned: false,
+            subtract: false,
+        },
+        Op::UqaddVec | Op::UqaddScalar => SatOp::AddSub {
+            unsigned: true,
+            subtract: false,
+        },
+        Op::SqsubVec | Op::SqsubScalar => SatOp::AddSub {
+            unsigned: false,
+            subtract: true,
+        },
+        Op::UqsubVec | Op::UqsubScalar => SatOp::AddSub {
+            unsigned: true,
+            subtract: true,
+        },
+        Op::SuqaddVec | Op::SuqaddScalar => SatOp::Accumulate { unsigned: false },
+        Op::UsqaddVec | Op::UsqaddScalar => SatOp::Accumulate { unsigned: true },
+        Op::SqabsVec | Op::SqabsScalar => SatOp::AbsNeg { negate: false },
+        Op::SqnegVec | Op::SqnegScalar => SatOp::AbsNeg { negate: true },
+        Op::SqshlVec | Op::SqshlScalar => SatOp::Shift {
+            unsigned: false,
+            rounding: false,
+            to: Signed,
+        },
+        Op::UqshlVec | Op::UqshlScalar => SatOp::Shift {
+            unsigned: true,
+            rounding: false,
+            to: Unsigned,
+        },
+        Op::SqrshlVec | Op::SqrshlScalar => SatOp::Shift {
+            unsigned: false,
+            rounding: true,
+            to: Signed,
+        },
+        Op::UqrshlVec | Op::UqrshlScalar => SatOp::Shift {
+            unsigned: true,
+            rounding: true,
+            to: Unsigned,
+        },
+        Op::SrshlVec | Op::SrshlScalar => SatOp::Shift {
+            unsigned: false,
+            rounding: true,
+            to: simd::SatTo::Wrap,
+        },
+        Op::UrshlVec | Op::UrshlScalar => SatOp::Shift {
+            unsigned: true,
+            rounding: true,
+            to: simd::SatTo::Wrap,
+        },
+        Op::SshlScalar => SatOp::Shift {
+            unsigned: false,
+            rounding: false,
+            to: simd::SatTo::Wrap,
+        },
+        Op::UshlScalar => SatOp::Shift {
+            unsigned: true,
+            rounding: false,
+            to: simd::SatTo::Wrap,
+        },
+        Op::ShaddVec => SatOp::Halve {
+            unsigned: false,
+            rounding: false,
+            subtract: false,
+        },
+        Op::UhaddVec => SatOp::Halve {
+            unsigned: true,
+            rounding: false,
+            subtract: false,
+        },
+        Op::SrhaddVec => SatOp::Halve {
+            unsigned: false,
+            rounding: true,
+            subtract: false,
+        },
+        Op::UrhaddVec => SatOp::Halve {
+            unsigned: true,
+            rounding: true,
+            subtract: false,
+        },
+        Op::ShsubVec => SatOp::Halve {
+            unsigned: false,
+            rounding: false,
+            subtract: true,
+        },
+        Op::UhsubVec => SatOp::Halve {
+            unsigned: true,
+            rounding: false,
+            subtract: true,
+        },
+        Op::SqdmulhVec | Op::SqdmulhScalar => SatOp::MulHigh { rounding: false },
+        Op::SqrdmulhVec | Op::SqrdmulhScalar => SatOp::MulHigh { rounding: true },
+        _ => return None,
+    })
+}
+
+/// One lane, given the source elements and the destination's current one.
+///
+/// `x` is `Vn`'s element, `y` is `Vm`'s (zero where the operation has one
+/// source) and `acc` is `Vd`'s — which only the accumulating forms read, and
+/// which is where `SUQADD` gets the operand a naive reading puts in `x`.
+fn sat_eval(kind: SatOp, esize: u32, x: u64, y: u64, acc: u64) -> (u64, bool) {
+    match kind {
+        SatOp::AddSub { unsigned, subtract } => match (unsigned, subtract) {
+            (false, false) => simd::sqadd(esize, x, y),
+            (true, false) => simd::uqadd(esize, x, y),
+            (false, true) => simd::sqsub(esize, x, y),
+            (true, true) => simd::uqsub(esize, x, y),
+        },
+        SatOp::Accumulate { unsigned } => {
+            if unsigned {
+                simd::usqadd(esize, acc, x)
+            } else {
+                simd::suqadd(esize, acc, x)
+            }
+        }
+        SatOp::AbsNeg { negate } => {
+            if negate {
+                simd::sqneg(esize, x)
+            } else {
+                simd::sqabs(esize, x)
+            }
+        }
+        SatOp::Shift {
+            unsigned,
+            rounding,
+            to,
+        } => simd::shift_reg(esize, x, y, !unsigned, rounding, to),
+        SatOp::Halve {
+            unsigned,
+            rounding,
+            subtract,
+        } => (
+            simd::halve(esize, x, y, !unsigned, rounding, subtract),
+            false,
+        ),
+        SatOp::MulHigh { rounding } => simd::sqdmulh(esize, x, y, rounding),
+    }
+}
+
+/// Which element widths an operation does not have.
+///
+/// Two rules, not a list of thirty rows. The halving adds have no doubleword
+/// form for the same reason `SMAX` does not — A64 never gave them one — and
+/// the doubling multiply-highs exist only at the two widths whose doubled
+/// product still fits a lane pair, so a byte and a doubleword are both
+/// reserved.
+fn sat_width_reserved(kind: SatOp, esize: u32) -> bool {
+    match kind {
+        SatOp::Halve { .. } => esize == 3,
+        SatOp::MulHigh { .. } => esize == 0 || esize == 3,
+        _ => false,
+    }
+}
+
+/// How a narrowing operation reads its source, whether it rounds, and how its
+/// result is bounded.
+///
+/// One table for three encoding groups — the extract-narrows, the narrowing
+/// shifts and their scalar twins — because the only thing that varies across
+/// all of them is this triple. `SQSHRUN` is why the source's signedness and
+/// the destination's bound are separate: it reads signed and writes unsigned,
+/// which a single `unsigned` flag cannot say.
+fn narrow_rule(op: Op) -> Option<(bool, bool, simd::SatTo)> {
+    use simd::SatTo::{Signed, Unsigned, Wrap};
+    Some(match op {
+        Op::XtnVec | Op::ShrnVec => (false, false, Wrap),
+        Op::RshrnVec => (false, true, Wrap),
+        Op::SqxtnVec | Op::SqxtnScalar | Op::SqshrnVec | Op::SqshrnScalar => (true, false, Signed),
+        Op::SqrshrnVec | Op::SqrshrnScalar => (true, true, Signed),
+        Op::UqxtnVec | Op::UqxtnScalar | Op::UqshrnVec | Op::UqshrnScalar => {
+            (false, false, Unsigned)
+        }
+        Op::UqrshrnVec | Op::UqrshrnScalar => (false, true, Unsigned),
+        Op::SqxtunVec | Op::SqxtunScalar | Op::SqshrunVec | Op::SqshrunScalar => {
+            (true, false, Unsigned)
+        }
+        Op::SqrshrunVec | Op::SqrshrunScalar => (true, true, Unsigned),
+        _ => return None,
+    })
+}
+
+/// How a saturating shift *left* by an immediate reads its source and bounds
+/// its result.
+///
+/// `SQSHLU` is the reason this is a pair rather than one flag, and it is the
+/// same asymmetry as `SQSHRUN`'s: a signed source, an unsigned destination.
+fn shift_left_rule(op: Op) -> Option<(bool, simd::SatTo)> {
+    Some(match op {
+        Op::SqshlImmVec | Op::SqshlImmScalar => (true, simd::SatTo::Signed),
+        Op::UqshlImmVec | Op::UqshlImmScalar => (false, simd::SatTo::Unsigned),
+        Op::SqshluImmVec | Op::SqshluImmScalar => (true, simd::SatTo::Unsigned),
+        _ => return None,
+    })
 }
 
 /// A right shift of one element by an amount that may equal its width.

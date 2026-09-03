@@ -238,6 +238,8 @@ scripts/fetch-testdata.sh initramfs-x86
 RSEMU_KERNEL=/boot/vmlinuz \
 RSEMU_INITRD=testdata/x86/initramfs-x86.cpio \
 RSEMU_KERNEL_MS=3000000 \
+RSEMU_KERNEL_INPUT='rsemu# =>head -c 40 /dev/nvme0n1\n' \
+RSEMU_KERNEL_STOP_AT='LBA 0' \
     cargo test --release --features machine-q35-linux --test q35_linux -- --nocapture
 ```
 
@@ -276,6 +278,10 @@ The board's own half of the boot, which is the part this page is about:
 [  306.737476] serial8250: ttyS0 at I/O 0x3f8 (irq = 4, base_baud = 115200) is a 16550A
 [  319.301970] nvme nvme0: pci function 0000:00:04.0
 [  319.317778] nvme 0000:00:04.0: enabling device (0000 -> 0002)
+[  322.201066] rtc_cmos rtc_cmos: setting system clock to 2026-01-01T00:12:23 UTC
+[  322.237990] nvme nvme0: 1/0/0 default/read/poll queues
+[ 2076.993539] Freeing unused kernel image (initmem) memory: 3912K
+[ 2374.773912] Run /init as init process
 ```
 
 Each of those is the board answering rather than a constant: the RSDP found by
@@ -286,8 +292,12 @@ through the HPET table; both interrupt source overrides are generated from the
 board's own wiring, and the first of them is IRQ0's offset to global system
 interrupt 2; `PIT calibration matches HPET` is two independent clocks in this
 machine agreeing at the first attempt; the root bridge and its IRQ routing are
-the DSDT; and the last two lines are the kernel's own NVMe driver binding to a
-controller it found by class code.
+the DSDT; `setting system clock to 2026-01-01T00:12:23` is the board's `time`
+parameter plus twelve minutes of its own emulated wall clock, read back out of
+the RTC by a driver; and the four lines after `Using ACPI for IRQ routing` are
+the kernel's own NVMe driver binding to a controller it found by class code,
+taking its **level-triggered interrupt through the I/O APIC**, and building the
+queue it reads a disk with.
 
 **The two lines that matter most are the ones that are not there.** After
 `..TIMER: vector=0x30 apic1=0 pin1=2` there is no `..MP-BIOS bug: 8254 timer
@@ -299,48 +309,46 @@ by HPET comparator 0 through the gate, and went on.
 side: with `LEG_RT_CNF` set it expects comparator 0 on 2 and comparator 1 on 8,
 and that is exactly what the multiplexer now puts there.
 
-### And what a run with `noapic` does
+### What `noapic` was for, and why it is no longer a second mode
 
-The same kernel, the same board and the same controller, one word added:
+This page used to carry a second run here: the same kernel, the same board and
+the same controller with `noapic` added, which reached userspace while the
+default line did not.
 
 ```text
 RSEMU_KERNEL_CMDLINE='console=ttyS0,115200 nokaslr cryptomgr.notests noapic'
 ```
 
-reaches **userspace**. The interrupt tree is the 8259A pair driving `INTR`
-through the IMCR, the NVMe probe finishes, and busybox comes up:
+That run is worth keeping in the record, because **it is what located the last
+defect**. With the I/O APIC out of the picture — the 8259A pair driving `INTR`
+through the IMCR — the NVMe probe finished and busybox came up, which said the
+gap was neither the controller model nor the driver nor a machine merely too
+slow. The 8259A has no polarity bit; the I/O APIC has one, and was applying it.
+The next section has the rest.
+
+It is no longer a *mode*. The default line reaches the same place:
 
 ```text
-[  333.602018] nvme nvme0: pci function 0000:00:04.0
-[  333.617639] nvme 0000:00:04.0: enabling device (0000 -> 0002)
-[  336.458101] rtc_cmos rtc_cmos: setting system clock to 2026-01-01T00:12:37 UTC
-[  336.561399] nvme nvme0: 1/0/0 default/read/poll queues
-[ 2089.880754] Freeing unused kernel image (initmem) memory: 3912K
-[ 2385.351045] Run /init as init process
+[ 2374.773912] Run /init as init process
+
+rsemu initramfs on Linux 6.6.67-gentoo-x86_64 x86_64
 rsemu# head -c 40 /dev/nvme0n1
 rsemu q35-linux nvme namespace, LBA 0
 ```
 
 That last line is **forty bytes off the medium**, read by busybox through a
 block device the kernel's own driver created. It is the board's whole stack
-answering at once: PCI enumeration, an MSI-less interrupt through the 8259A
-pair, an admin queue pair, an I/O queue pair, `Identify` for the controller and
-for the namespace, and a read command whose data landed where the PRP list
-said. Nothing here is a constant in a test.
+answering at once: PCI enumeration, an MSI-less **level-triggered interrupt
+through the I/O APIC**, an admin queue pair, an I/O queue pair, `Identify` for
+the controller and for the namespace, and a read command whose data landed
+where the PRP list said. Nothing here is a constant in a test.
 
-`setting system clock to 2026-01-01T00:12:41` is the board's `time` parameter
-plus twelve minutes of its own emulated wall clock, read back out of the RTC by
-a driver — one more thing that is the machine answering rather than a constant.
+## Where it stopped, and what was in the way
 
-Two *modes* of one board, then, rather than two boards — and the two things
-that separate them are the whole of the next section.
-
-## Where it stops, and what is in the way
-
-**One thing now.** This page has named four obstacles over its life and three
-of them are gone: two were refuted rather than fixed (their real causes were
-the 8259A acknowledge defect and the missing HPET route), and the third — the
-namespace — was a controller defect, fixed below.
+**Nothing now.** This page has named four obstacles over its life and all four
+are gone: two were refuted rather than fixed (their real causes were the 8259A
+acknowledge defect and the missing HPET route), one was a controller defect,
+and the last was a single bit in an I/O APIC redirection entry.
 
 ### Fixed: the namespace is published
 
@@ -356,22 +364,14 @@ Both are answered now (`src/dev/nvme/ctrl.rs`), the namespace carries a UUID
 derived from the identity the controller already publishes, and the run above
 is the result.
 
-### Open: with the I/O APIC in use, `request_threaded_irq` does not return
+### Fixed: the polarity bit an I/O APIC must not apply
 
-On the default command line the boot gets as far as
-`nvme 0000:00:04.0: enabling device` and then the worker registering the
-controller's interrupt handler stops making forward progress. Sampled every 28
-virtual seconds for the rest of the run, the guest is always at the same
-instruction:
+On the default command line the boot used to reach
+`nvme 0000:00:04.0: enabling device` and stop. Sampled every 28 virtual seconds
+for the rest of the run, the guest was always at the same instruction:
 
 ```text
-watchdog: BUG: soft lockup - CPU#0 stuck for 26s! [kworker/u2:0:11]
-RIP: 0010:handle_softirqs+0x8b/0x2d0
- <IRQ>
- ? sysvec_apic_timer_interrupt+0x39/0x90
- irq_exit_rcu+0xac/0xd0
- sysvec_apic_timer_interrupt+0x72/0x90
- </IRQ>
+watchdog: BUG: soft lockup - CPU#0 stuck for 678s! [kworker/u2:0:11]
  <TASK>
  RIP: 0010:_raw_spin_unlock_irqrestore+0x1c/0x30
  __setup_irq+0x450/0x690
@@ -384,18 +384,67 @@ RIP: 0010:handle_softirqs+0x8b/0x2d0
 ```
 
 `_raw_spin_unlock_irqrestore+0x1c` is the `sti` at the end of `__setup_irq`'s
-critical section, and every sample catches the guest being interrupted there
-and never getting past it.
+critical section. **`noapic` was the control**: the same board, the same image
+and the same controller got through `request_threaded_irq` and on to
+`Run /init` with the I/O APIC out of the picture, which is what made this a
+finding rather than a guess.
 
-**`noapic` is the control, and it is what makes this a finding rather than a
-guess.** The same board, the same kernel image and the same controller get
-through `request_threaded_irq` and on to `Run /init` when the I/O APIC is out
-of the picture — so this is not the controller model, not the driver, and not
-simply a machine too slow to finish. What is left is the path an interrupt
-takes from a level-triggered I/O APIC redirection entry through the local APIC
-and back, at the moment `irq_startup()` unmasks an entry for a line the
-controller may already be holding. `tests/pc_apic.rs` is where the coverage for
-that belongs.
+`tests/q35_linux.rs`'s `report_apics` is what settled it — the redirection
+table and the local APIC's request registers, read out of the machine with
+`MemAttrs::DEBUG` after the run:
+
+```text
+q35-linux:   irq9  01000000_00008820 vector=0x20 level high open
+q35-linux:   irq11 01000000_0000e822 vector=0x22 level low  open remote-irr
+q35-linux:   isr=00000000_..._00000000
+q35-linux:   irr=00000000_..._00000004_00000000
+```
+
+Input 11 is where this board's `pirq-routes` put device 4's `INTA#`. The entry
+is level-triggered, **active low**, unmasked, holding remote IRR, and the local
+APIC has its vector requested with nothing in service. That is an interrupt
+storm caught mid-cycle, and it starts the instant `irq_startup()` unmasks the
+entry.
+
+The bit is the whole defect. An operating system programs *every* PCI interrupt
+level-triggered and active low, because PCI Local Bus 3.0 §2.2.6 defines
+`INTA#`-`INTD#` that way; and `src/dev/pc/ioapic.rs` was exclusive-oring that
+polarity bit into the level its input net resolved to (82093AA §3.2.4 bit 13,
+`INTPOL`). But a `core::wire` net carries an **assertion**, not a voltage: a
+fresh fan-in holds every source low, `Resolve::Or` resolves an idle net low,
+and `ROADMAP.md` §4.3 states outright that an undriven wire sits low. Every
+driver in the tree agrees — `q35.lpc` reads `PIRQ[n]#`, an active-low pin on
+the silicon, as asserted when its net is *high*.
+
+So the exclusive-or did not model an active-low input; it made one impossible.
+The idle line read as asserted, the entry latched remote IRR and sent, the
+processor took the vector and ended it, the end-of-interrupt cleared remote IRR,
+the condition was still true by inspection, and it sent again — for ever. The
+`sti` that let the first one in was the last instruction that guest ever nearly
+retired. The 8259A has no polarity bit, which is exactly why `noapic` booted.
+
+The polarity bit is now recorded and reported and not applied; the same is true
+of bit 13 of a local APIC's LINT entries, where an idle `ExtINT` LINT0 reading
+as asserted would have been the same failure with an 8259A on the far side. A
+board that genuinely needs an inverted input says so once, with the `wire.not`
+§4.3 ships — which is where an inversion belongs, on the board rather than in
+every part that has a polarity bit.
+
+The entry after the fix, from the run at the top of this page:
+
+```text
+q35-linux:   irq11 01000000_0000a822 vector=0x22 level low  open
+```
+
+Same entry, same polarity bit reading back, no remote IRR — and a shell.
+
+Three tests hold it. `tests/pc_apic.rs`'s
+`a_level_entry_programmed_active_low_waits_for_its_device` drives a real guest
+through the whole lifecycle and counts interrupts: **zero** before its device
+asserts and **one** after, where the old code counted 64 and 441.
+`tests/q35_linux.rs` writes the entry the kernel wrote, on the shipped board,
+with the controller idle, and asserts the local APIC stays quiet. And
+`src/dev/pc/ioapic.rs` has the unit test that used to assert the opposite.
 
 ### What the soft lockups are, and are not
 
@@ -438,6 +487,16 @@ device model for something the board file never wired. `tests/pc_apic.rs`
 exists partly because of that: it drives each delivery path from Rust, on a
 board whose wiring is written down beside it, so "the device does not deliver"
 and "the board does not route" stop being the same observation.
+
+The fourth item — the polarity bit — is the one that was filed *from a probe*,
+and it is the shortest entry on this page for that reason. `report_apics` read
+the redirection table and the local APIC's request registers out of the stopped
+machine, one line said `level low ... remote-irr` with the vector requested and
+nothing in service, and that was the diagnosis. Nothing was inferred from a
+backtrace. It is also worth noting what the backtrace *would* have said: the
+frame the earlier reading leaned on, `nvme_wait_ready`, is `?`-prefixed — an
+unreliable leftover stack word, not a live frame — and this controller sets
+`CSTS.RDY` synchronously and never polls.
 
 ## Sources
 

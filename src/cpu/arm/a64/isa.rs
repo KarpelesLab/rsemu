@@ -630,6 +630,27 @@ pub enum Fmt {
     SimdScalarThree,
     /// `<V>d, <V>n` — a scalar SIMD two-register operation.
     SimdScalarTwo,
+    /// `<V>d, <V>n, <V>m` where `<V>` is `B`, `H`, `S` or `D` from `size`.
+    ///
+    /// Separate from [`Fmt::SimdScalarThree`], whose rows pin `size` at `0b11`
+    /// because the architecture gives those operations a doubleword form and
+    /// nothing else. The saturating scalars have all four widths, and the
+    /// width is in the encoding rather than in the row — which is exactly the
+    /// distinction a format exists to carry.
+    SimdScalarThreeSz,
+    /// `<V>d, <V>n` with the width from `size`.
+    SimdScalarTwoSz,
+    /// `<Vb>d, <Va>n` — a narrowing scalar, whose destination width is `size`
+    /// and whose source is one width wider (`SQXTN B0, H1`).
+    SimdScalarNarrow,
+    /// `<Va>d, <Vb>n, <Vb>m` — a widening scalar, whose sources are `size`
+    /// wide and whose destination is one wider (`SQDMULL S0, H1, H2`).
+    SimdScalarDiff,
+    /// `<V>d, <V>n, #shift` — a scalar shift by an immediate, whose width
+    /// comes from `immh`.
+    SimdScalarShift,
+    /// `<Vb>d, <Va>n, #shift` — a narrowing scalar shift by an immediate.
+    SimdScalarShiftNarrow,
     /// `<V>d, <V>n, #0` / `#0.0` — a scalar SIMD compare against zero.
     SimdScalarCmpZero,
     /// `<V>d, Vn.<T>` — a scalar SIMD pairwise reduction (`ADDP D0, V1.2D`).
@@ -1319,6 +1340,31 @@ a64! {
     0xbf20fc00 0x2e20ac00 UminpVec "uminp" VecThreeSame AdvSimd "pairwise unsigned minimum";
     0xbf20fc00 0x0e20bc00 AddpVec "addp" VecThreeSame AdvSimd "pairwise add";
 
+    // -- Advanced SIMD: three registers of the same shape, saturating and ----
+    // -- rounding ------------------------------------------------------------
+    //
+    // The halving and rounding-halving adds keep a sum inside the element by
+    // shifting it right rather than by clamping, so they set no flag; every
+    // `Q`-prefixed row below can clamp, and each one that does sets `FPSR.QC`.
+    0xbf20fc00 0x0e200400 ShaddVec "shadd" VecThreeSame AdvSimd "add lanes signed and halve the result";
+    0xbf20fc00 0x2e200400 UhaddVec "uhadd" VecThreeSame AdvSimd "add lanes unsigned and halve the result";
+    0xbf20fc00 0x0e200c00 SqaddVec "sqadd" VecThreeSame AdvSimd "add lanes signed, saturating";
+    0xbf20fc00 0x2e200c00 UqaddVec "uqadd" VecThreeSame AdvSimd "add lanes unsigned, saturating";
+    0xbf20fc00 0x0e201400 SrhaddVec "srhadd" VecThreeSame AdvSimd "add lanes signed and halve the result, rounding";
+    0xbf20fc00 0x2e201400 UrhaddVec "urhadd" VecThreeSame AdvSimd "add lanes unsigned and halve the result, rounding";
+    0xbf20fc00 0x0e202400 ShsubVec "shsub" VecThreeSame AdvSimd "subtract lanes signed and halve the result";
+    0xbf20fc00 0x2e202400 UhsubVec "uhsub" VecThreeSame AdvSimd "subtract lanes unsigned and halve the result";
+    0xbf20fc00 0x0e202c00 SqsubVec "sqsub" VecThreeSame AdvSimd "subtract lanes signed, saturating";
+    0xbf20fc00 0x2e202c00 UqsubVec "uqsub" VecThreeSame AdvSimd "subtract lanes unsigned, saturating";
+    0xbf20fc00 0x0e204c00 SqshlVec "sqshl" VecThreeSame AdvSimd "shift lanes left signed by a register amount, saturating";
+    0xbf20fc00 0x2e204c00 UqshlVec "uqshl" VecThreeSame AdvSimd "shift lanes left unsigned by a register amount, saturating";
+    0xbf20fc00 0x0e205400 SrshlVec "srshl" VecThreeSame AdvSimd "shift lanes signed by a register amount, rounding";
+    0xbf20fc00 0x2e205400 UrshlVec "urshl" VecThreeSame AdvSimd "shift lanes unsigned by a register amount, rounding";
+    0xbf20fc00 0x0e205c00 SqrshlVec "sqrshl" VecThreeSame AdvSimd "shift lanes signed by a register amount, rounding and saturating";
+    0xbf20fc00 0x2e205c00 UqrshlVec "uqrshl" VecThreeSame AdvSimd "shift lanes unsigned by a register amount, rounding and saturating";
+    0xbf20fc00 0x0e20b400 SqdmulhVec "sqdmulh" VecThreeSame AdvSimd "the high half of a doubled signed product, saturating";
+    0xbf20fc00 0x2e20b400 SqrdmulhVec "sqrdmulh" VecThreeSame AdvSimd "the high half of a doubled signed product, rounding and saturating";
+
     // -- Advanced SIMD: three registers of the same shape, bitwise -----------
     0xbfe0fc00 0x0e201c00 AndVec "and" VecThreeSameLog AdvSimd "bitwise AND";
     0xbfe0fc00 0x0e601c00 BicVec "bic" VecThreeSameLog AdvSimd "bitwise AND with an inverted register";
@@ -1368,7 +1414,14 @@ a64! {
     0xbf3ffc00 0x2e209800 CmleZeroVec "cmle" VecCmpZero AdvSimd "compare lanes less than or equal to zero";
     0xbf3ffc00 0x0e20b800 AbsVec "abs" VecTwoMisc AdvSimd "absolute value lanewise";
     0xbf3ffc00 0x2e20b800 NegVec "neg" VecTwoMisc AdvSimd "negate lanewise";
+    0xbf3ffc00 0x0e203800 SuqaddVec "suqadd" VecTwoMisc AdvSimd "accumulate an unsigned value into a signed lane, saturating";
+    0xbf3ffc00 0x2e203800 UsqaddVec "usqadd" VecTwoMisc AdvSimd "accumulate a signed value into an unsigned lane, saturating";
+    0xbf3ffc00 0x0e207800 SqabsVec "sqabs" VecTwoMisc AdvSimd "absolute value lanewise, saturating";
+    0xbf3ffc00 0x2e207800 SqnegVec "sqneg" VecTwoMisc AdvSimd "negate lanewise, saturating";
     0xbf3ffc00 0x0e212800 XtnVec "xtn" VecNarrow AdvSimd "extract the low half of each lane";
+    0xbf3ffc00 0x2e212800 SqxtunVec "sqxtun" VecNarrow AdvSimd "extract narrower lanes from signed ones, saturating unsigned";
+    0xbf3ffc00 0x0e214800 SqxtnVec "sqxtn" VecNarrow AdvSimd "extract narrower lanes, saturating signed";
+    0xbf3ffc00 0x2e214800 UqxtnVec "uqxtn" VecNarrow AdvSimd "extract narrower lanes, saturating unsigned";
     0xbfbffc00 0x0e216800 FcvtnVec "fcvtn" VecNarrow AdvSimd "convert lanes to a narrower floating-point format";
     0xbfbffc00 0x0e217800 FcvtlVec "fcvtl" VecWiden AdvSimd "convert lanes to a wider floating-point format";
     0xbfbffc00 0x0ea0c800 FcmgtZeroVec "fcmgt" VecCmpZeroFp AdvSimd "compare lanes greater than zero";
@@ -1438,6 +1491,9 @@ a64! {
     0xbf20fc00 0x2e20a000 UmlslVec "umlsl" VecThreeDiff AdvSimd "unsigned multiply-subtract from wider lanes";
     0xbf20fc00 0x0e20c000 SmullVec "smull" VecThreeDiff AdvSimd "signed multiply into wider lanes";
     0xbf20fc00 0x2e20c000 UmullVec "umull" VecThreeDiff AdvSimd "unsigned multiply into wider lanes";
+    0xbf20fc00 0x0e209000 SqdmlalVec "sqdmlal" VecThreeDiff AdvSimd "doubled signed multiply-accumulate into wider lanes, saturating";
+    0xbf20fc00 0x0e20b000 SqdmlslVec "sqdmlsl" VecThreeDiff AdvSimd "doubled signed multiply-subtract from wider lanes, saturating";
+    0xbf20fc00 0x0e20d000 SqdmullVec "sqdmull" VecThreeDiff AdvSimd "doubled signed multiply into wider lanes, saturating";
 
     // -- Advanced SIMD: shift by an immediate --------------------------------
     0xbf80fc00 0x0f000400 SshrVec "sshr" VecShiftImm AdvSimd "shift lanes right, signed";
@@ -1447,7 +1503,21 @@ a64! {
     0xbf80fc00 0x2f004400 SriVec "sri" VecShiftImm AdvSimd "shift lanes right and insert";
     0xbf80fc00 0x0f005400 ShlVec "shl" VecShiftImm AdvSimd "shift lanes left";
     0xbf80fc00 0x2f005400 SliVec "sli" VecShiftImm AdvSimd "shift lanes left and insert";
+    0xbf80fc00 0x0f002400 SrshrVec "srshr" VecShiftImm AdvSimd "shift lanes right, signed and rounding";
+    0xbf80fc00 0x2f002400 UrshrVec "urshr" VecShiftImm AdvSimd "shift lanes right, unsigned and rounding";
+    0xbf80fc00 0x0f003400 SrsraVec "srsra" VecShiftImm AdvSimd "shift lanes right signed and rounding, and accumulate";
+    0xbf80fc00 0x2f003400 UrsraVec "ursra" VecShiftImm AdvSimd "shift lanes right unsigned and rounding, and accumulate";
+    0xbf80fc00 0x2f006400 SqshluImmVec "sqshlu" VecShiftImm AdvSimd "shift signed lanes left, saturating unsigned";
+    0xbf80fc00 0x0f007400 SqshlImmVec "sqshl" VecShiftImm AdvSimd "shift lanes left signed, saturating";
+    0xbf80fc00 0x2f007400 UqshlImmVec "uqshl" VecShiftImm AdvSimd "shift lanes left unsigned, saturating";
     0xbf80fc00 0x0f008400 ShrnVec "shrn" VecShiftNarrow AdvSimd "shift right and narrow";
+    0xbf80fc00 0x2f008400 SqshrunVec "sqshrun" VecShiftNarrow AdvSimd "shift signed lanes right and narrow, saturating unsigned";
+    0xbf80fc00 0x0f008c00 RshrnVec "rshrn" VecShiftNarrow AdvSimd "shift right and narrow, rounding";
+    0xbf80fc00 0x2f008c00 SqrshrunVec "sqrshrun" VecShiftNarrow AdvSimd "shift signed lanes right and narrow, rounding and saturating unsigned";
+    0xbf80fc00 0x0f009400 SqshrnVec "sqshrn" VecShiftNarrow AdvSimd "shift lanes right and narrow, saturating signed";
+    0xbf80fc00 0x2f009400 UqshrnVec "uqshrn" VecShiftNarrow AdvSimd "shift lanes right and narrow, saturating unsigned";
+    0xbf80fc00 0x0f009c00 SqrshrnVec "sqrshrn" VecShiftNarrow AdvSimd "shift lanes right and narrow, rounding and saturating signed";
+    0xbf80fc00 0x2f009c00 UqrshrnVec "uqrshrn" VecShiftNarrow AdvSimd "shift lanes right and narrow, rounding and saturating unsigned";
     0xbf80fc00 0x0f00a400 SshllVec "sshll" VecShiftLong AdvSimd "shift left signed into wider lanes";
     0xbf80fc00 0x2f00a400 UshllVec "ushll" VecShiftLong AdvSimd "shift left unsigned into wider lanes";
     0xbf80fc00 0x0f00e400 ScvtfFixVec "scvtf" VecShiftImm AdvSimd "convert signed fixed-point lanes to floating point";
@@ -1492,6 +1562,50 @@ a64! {
     0xffbffc00 0x7e30d800 FaddpScalar "faddp" SimdScalarPair AdvSimd "add the two lanes of a vector";
     0xffbffc00 0x7e30f800 FmaxpScalar "fmaxp" SimdScalarPair AdvSimd "maximum of the two lanes of a vector";
     0xffbffc00 0x7eb0f800 FminpScalar "fminp" SimdScalarPair AdvSimd "minimum of the two lanes of a vector";
+
+    // -- Advanced SIMD: the scalar saturating forms --------------------------
+    //
+    // These are the ones a compiler reaches for. Unlike the scalar rows above,
+    // whose `size` the table pins at `0b11` because A64 gives them a
+    // doubleword form and nothing else, every row here carries a live `size`:
+    // `SQADD B0, B1, B2` is as real as `SQADD D0, D1, D2`, and clamping at the
+    // byte is the point of it.
+    0xff20fc00 0x5e200c00 SqaddScalar "sqadd" SimdScalarThreeSz AdvSimd "add two scalars signed, saturating";
+    0xff20fc00 0x7e200c00 UqaddScalar "uqadd" SimdScalarThreeSz AdvSimd "add two scalars unsigned, saturating";
+    0xff20fc00 0x5e202c00 SqsubScalar "sqsub" SimdScalarThreeSz AdvSimd "subtract two scalars signed, saturating";
+    0xff20fc00 0x7e202c00 UqsubScalar "uqsub" SimdScalarThreeSz AdvSimd "subtract two scalars unsigned, saturating";
+    // The four non-saturating shifts complete the family, and unlike their
+    // neighbours here they *are* doubleword-only — so their rows pin `size`,
+    // and the format still reads the width out of it rather than assuming.
+    0xffe0fc00 0x5ee04400 SshlScalar "sshl" SimdScalarThreeSz AdvSimd "shift a scalar left signed by a register amount";
+    0xffe0fc00 0x7ee04400 UshlScalar "ushl" SimdScalarThreeSz AdvSimd "shift a scalar left unsigned by a register amount";
+    0xffe0fc00 0x5ee05400 SrshlScalar "srshl" SimdScalarThreeSz AdvSimd "shift a scalar signed by a register amount, rounding";
+    0xffe0fc00 0x7ee05400 UrshlScalar "urshl" SimdScalarThreeSz AdvSimd "shift a scalar unsigned by a register amount, rounding";
+    0xff20fc00 0x5e204c00 SqshlScalar "sqshl" SimdScalarThreeSz AdvSimd "shift a scalar left signed by a register amount, saturating";
+    0xff20fc00 0x7e204c00 UqshlScalar "uqshl" SimdScalarThreeSz AdvSimd "shift a scalar left unsigned by a register amount, saturating";
+    0xff20fc00 0x5e205c00 SqrshlScalar "sqrshl" SimdScalarThreeSz AdvSimd "shift a scalar signed by a register amount, rounding and saturating";
+    0xff20fc00 0x7e205c00 UqrshlScalar "uqrshl" SimdScalarThreeSz AdvSimd "shift a scalar unsigned by a register amount, rounding and saturating";
+    0xff20fc00 0x5e20b400 SqdmulhScalar "sqdmulh" SimdScalarThreeSz AdvSimd "the high half of a doubled signed product, saturating";
+    0xff20fc00 0x7e20b400 SqrdmulhScalar "sqrdmulh" SimdScalarThreeSz AdvSimd "the high half of a doubled signed product, rounding and saturating";
+    0xff3ffc00 0x5e203800 SuqaddScalar "suqadd" SimdScalarTwoSz AdvSimd "accumulate an unsigned value into a signed scalar, saturating";
+    0xff3ffc00 0x7e203800 UsqaddScalar "usqadd" SimdScalarTwoSz AdvSimd "accumulate a signed value into an unsigned scalar, saturating";
+    0xff3ffc00 0x5e207800 SqabsScalar "sqabs" SimdScalarTwoSz AdvSimd "absolute value of a scalar, saturating";
+    0xff3ffc00 0x7e207800 SqnegScalar "sqneg" SimdScalarTwoSz AdvSimd "negate a scalar, saturating";
+    0xff3ffc00 0x7e212800 SqxtunScalar "sqxtun" SimdScalarNarrow AdvSimd "narrow a signed scalar, saturating unsigned";
+    0xff3ffc00 0x5e214800 SqxtnScalar "sqxtn" SimdScalarNarrow AdvSimd "narrow a scalar, saturating signed";
+    0xff3ffc00 0x7e214800 UqxtnScalar "uqxtn" SimdScalarNarrow AdvSimd "narrow a scalar, saturating unsigned";
+    0xff20fc00 0x5e209000 SqdmlalScalar "sqdmlal" SimdScalarDiff AdvSimd "doubled signed multiply-accumulate into a wider scalar, saturating";
+    0xff20fc00 0x5e20b000 SqdmlslScalar "sqdmlsl" SimdScalarDiff AdvSimd "doubled signed multiply-subtract from a wider scalar, saturating";
+    0xff20fc00 0x5e20d000 SqdmullScalar "sqdmull" SimdScalarDiff AdvSimd "doubled signed multiply into a wider scalar, saturating";
+    0xff80fc00 0x7f006400 SqshluImmScalar "sqshlu" SimdScalarShift AdvSimd "shift a signed scalar left, saturating unsigned";
+    0xff80fc00 0x5f007400 SqshlImmScalar "sqshl" SimdScalarShift AdvSimd "shift a scalar left signed, saturating";
+    0xff80fc00 0x7f007400 UqshlImmScalar "uqshl" SimdScalarShift AdvSimd "shift a scalar left unsigned, saturating";
+    0xff80fc00 0x7f008400 SqshrunScalar "sqshrun" SimdScalarShiftNarrow AdvSimd "shift a signed scalar right and narrow, saturating unsigned";
+    0xff80fc00 0x7f008c00 SqrshrunScalar "sqrshrun" SimdScalarShiftNarrow AdvSimd "shift a signed scalar right and narrow, rounding and saturating unsigned";
+    0xff80fc00 0x5f009400 SqshrnScalar "sqshrn" SimdScalarShiftNarrow AdvSimd "shift a scalar right and narrow, saturating signed";
+    0xff80fc00 0x7f009400 UqshrnScalar "uqshrn" SimdScalarShiftNarrow AdvSimd "shift a scalar right and narrow, saturating unsigned";
+    0xff80fc00 0x5f009c00 SqrshrnScalar "sqrshrn" SimdScalarShiftNarrow AdvSimd "shift a scalar right and narrow, rounding and saturating signed";
+    0xff80fc00 0x7f009c00 UqrshrnScalar "uqrshrn" SimdScalarShiftNarrow AdvSimd "shift a scalar right and narrow, rounding and saturating unsigned";
 
     // -- Advanced SIMD: structure loads and stores ---------------------------
     0xbffff000 0x0c000000 St4Multi "st4" LdStStruct AdvSimd "store four-register structure";

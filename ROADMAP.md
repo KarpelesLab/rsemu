@@ -148,7 +148,7 @@ These are decided. Do not relitigate them mid-implementation.
   RustCrypto, libc), so CI checks the *feature-enabled* dependency tree, not
   just the default.
 - **`unsafe` is quarantined.** Crate-wide `unsafe_code = "deny"` (not `forbid`).
-  Exactly **six** subsystems may opt back in with a scoped
+  Exactly **seven** subsystems may opt back in with a scoped
   `#[allow(unsafe_code)]` + a `// SAFETY:` comment: the RAM host-pointer fast
   path, the JIT code buffer (W^X `mmap`/`mprotect`), the raw-syscall accel
   backends (KVM ioctls), the C ABI module, the **`core::sync` `single` backend**
@@ -160,8 +160,18 @@ These are decided. Do not relitigate them mid-implementation.
   them), and **per-CPU execution state**
   (the register file lives behind an `UnsafeCell` guarded by an
   exclusive-execution token from the scheduler; a lock per instruction cannot
-  reach the phase-5 throughput gate). Everything else is safe Rust. **Six is the
-  ceiling** — a seventh is a design review, not a commit.
+  reach the phase-5 throughput gate), and the **host signal disposition**
+  (`sigaction` by raw syscall: `std` has no signal API, a disposition is this
+  process's own state so there is no external program to shell out to, and
+  `libc` is outside §14 — x86-64 Linux only, every other target keeps the
+  disposition it had). Everything else is safe Rust. **Seven is the ceiling**
+  — an eighth is a design review, not a commit.
+
+  The seventh was added in that spirit rather than by drift: refusing it did
+  not buy a safer implementation, it kept a data-loss defect, because Ctrl-C on
+  a headless run bypassed `finish()` and a qcow2 lost the L1/L2 metadata that
+  finds its own data clusters. Weigh an eighth by the same question — what is
+  actually lost by saying no?
 - **Determinism is a first-class mode, not an afterthought.** A machine run in
   deterministic mode must produce a bit-identical state hash across runs, hosts,
   and — for the same guest architecture — across the interpreter and the JIT.
@@ -433,7 +443,7 @@ is not actually usable. That is worth more to rsemu than the code would be.
   §9.1 specifies, and it should *be* §9.1's implementation rather than a second
   one.
 - **KVM and HVF**, which are §10's backends. nixvm's four `unsafe` sites map
-  onto rsemu's six sanctioned ones — KVM and HVF onto the raw-syscall accel
+  onto rsemu's seven sanctioned ones — KVM and HVF onto the raw-syscall accel
   backends, page-aligned guest-RAM allocation onto the RAM host-pointer fast
   path, `*at(2)` passthrough onto `ffi`, and that last one stays in nixvm
   anyway. **No seventh site is created**, and any change to that is a design

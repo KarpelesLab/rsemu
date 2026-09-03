@@ -13,7 +13,7 @@
 //! | | oracle | subject |
 //! | --- | --- | --- |
 //! | engine | [`X86::step`], `insns` times | [`lift`] → [`verify`] → [`Interp`] |
-//! | registers | `EAX`..`EDI` and `EIP` | the slots the block materialized |
+//! | registers | `RAX`..`RDI`, `R8`..`R15` and the program counter, all sixty-four bits | the slots the block materialized |
 //! | **flags** | `EFLAGS`, every bit | the six flag slots plus `EFLAGS_REST`, reassembled |
 //! | ticks | `X86::cycles` | the sum of the charges the block made |
 //! | the static column | — | [`InsnStart::ticks`] at the exit, plus what the accesses spent |
@@ -73,6 +73,25 @@
 //! the page table, and `memory` compares those along with the rest, so the
 //! **accessed and dirty bits both engines wrote are a compared column** rather
 //! than an assumption.
+//!
+//! [`Case::long`] is the third, and it is the second plus what long mode
+//! requires: `CR4.PAE`, `EFER.LME` with the `LMA` the processor sets, and a
+//! code segment with its `L` bit set. The walk becomes four levels of
+//! eight-byte entries, `CS`, `DS`, `ES` and `SS` lose their bases by
+//! definition, and — the part that makes it a test rather than a re-run — the
+//! data window moves to [`HIGH`], two and a half tebibytes up, with a
+//! different index at each of the top three levels of the walk. **Every
+//! address the corpus computes there is one only sixty-four bits can hold**,
+//! which is what separates a correct 64-bit address computation from one that
+//! masks its answer to thirty-two: a case whose whole window fits below 2^32
+//! cannot tell them apart, and the mask survived deliberate injection until
+//! the window moved.
+//!
+//! The code stays at [`BASE`], so the four guest frames are mapped **twice**,
+//! and that is deliberate as well: two linear pages naming one physical page
+//! is exactly the arrangement the in-block store guard cannot see, and
+//! `a_store_through_the_other_mapping_of_the_code_page_is_honoured` drives a
+//! store through the far alias into the running block's own frame.
 //!
 //! # Why the host here re-implements the memory path, and where it stops
 //!
@@ -174,10 +193,15 @@
 //!   back rather than delivering it.
 //! * **Anything outside the lifted subset**, which ends the block by
 //!   construction — so it is not skipped, it simply is not reached.
-//! * **Real mode, long mode, the segment loads and paging on a part with one
-//!   translation buffer**, none of which [`lift::World::of`] accepts. Paging
-//!   on a part with two is covered — see [`Case::paged`] — and is the world
-//!   this list named first for three rounds.
+//! * **Real mode, compatibility mode's 16-bit code segments, the segment loads
+//!   and paging on a part with one translation buffer**, none of which
+//!   [`lift::World::of`] accepts. Paging on a part with two is covered — see
+//!   [`Case::paged`] — and so is long mode, which this list named for four
+//!   rounds; see [`Case::long`].
+//! * **The three computed near transfers in long mode.** `RET`, `JMP r/m` and
+//!   `CALL r/m` end a block there rather than being lifted, because a
+//!   non-canonical target is a `#GP` at the transfer that a block cannot
+//!   deliver — so they are not skipped, they are the interpreter's.
 
 use alloc::format;
 use alloc::string::String;
@@ -192,15 +216,15 @@ use crate::core::space::{AddressSpace, MemAttrs, MemResult, RamStore, Region};
 use crate::ir::{InsnStart, Interp, IrHost, MemOp, Outcome, RegSlot, verify};
 
 use super::exec::{Exec, State};
-use super::isa::seg;
+use super::isa::{Bits, seg};
 use super::lift::{
-    self, ARITH_MASK, EFLAGS_REST, EIP, FLAG_BITS, FLAG_SLOTS, Flags, Origin, SLOT_COUNT, Shape,
+    self, ARITH_MASK, EFLAGS_REST, FLAG_BITS, FLAG_SLOTS, Flags, Origin, RIP, SLOT_COUNT, Shape,
     Smc, World, r_slot,
 };
 #[cfg(any(feature = "jit", test))]
 use super::paging::debug_translate;
 use super::paging::{Access, pte};
-use super::prot::{SegReg, Sys, ar, cr0};
+use super::prot::{SegReg, Sys, ar, cr0, cr4, efer};
 use super::{Config, Lines, Regs, Variant, X86, flags};
 
 #[cfg(feature = "jit")]
@@ -247,11 +271,58 @@ pub const STACK: u64 = DATA + 0x800;
 /// than an assumption.
 pub const PAGED_RAM_SIZE: u64 = 8 * 4096;
 
-/// Where the page directory sits, physically.
+/// How much physical RAM a **long-mode** case gets: twelve pages.
+///
+/// Eight of them are laid out as [`PAGED_RAM_SIZE`] describes — four tables
+/// and the four guest pages — and three more hold a second chain of tables
+/// that maps the same four frames a second time, at [`HIGH`]. The twelfth is
+/// slack, so the number is a round one.
+pub const LONG_RAM_SIZE: u64 = 12 * 4096;
+
+/// Where a long-mode case's data window is, **linearly**.
+///
+/// Two and a half tebibytes up, with a different index at each of the top
+/// three levels of the walk, which is the whole point: a 32-bit case cannot
+/// tell a correct 64-bit address computation from one that masks its answer to
+/// thirty-two bits, because every address it forms fits in thirty-two anyway.
+/// So a long-mode case puts its pointer registers and its stack here and every
+/// address the corpus computes is one only sixty-four bits can hold.
+///
+/// The code stays at [`BASE`] — a block is bounded by its page and the entry
+/// translation is what names it, so moving the program would test the same
+/// thing twice — which makes the two windows **aliases of one set of physical
+/// frames**. That is deliberate too: two linear pages naming one physical page
+/// is exactly the arrangement the in-block store guard could not see, and the
+/// reason [`Smc::Guard`] is refused under paging.
+pub const HIGH: u64 = 0x0000_0280_c040_0000;
+
+/// Where the high window's page-directory-pointer table sits, physically.
+pub const PDPT_HIGH: u64 = BASE + 0x8000;
+/// Where the high window's page directory sits, physically.
+pub const PDIR_HIGH: u64 = BASE + 0x9000;
+/// Where the high window's page table sits, physically.
+pub const PTAB_HIGH: u64 = BASE + 0xa000;
+
+/// Where the page directory sits, physically, in a legacy two-level case.
 pub const PDIR: u64 = BASE;
 
-/// Where the one page table sits, physically.
+/// Where the one page table sits, physically, in a legacy two-level case.
 pub const PTAB: u64 = BASE + 0x1000;
+
+/// Where the four-level walk's top table sits, physically.
+///
+/// IA-32e paging is four levels of 8-byte entries and long mode requires it
+/// (*Intel SDM* volume 3 §9.8.5), so a 64-bit case needs four tables where a
+/// legacy one needs two. They occupy the four physical pages below
+/// [`PAGED_PROGRAM`] — the same four the legacy layout uses two of and leaves
+/// two of as the gap that keeps linear and physical from coinciding.
+pub const PML4: u64 = BASE;
+/// Where the page-directory-pointer table sits, physically.
+pub const PDPT: u64 = BASE + 0x1000;
+/// Where the page directory sits, physically, in a four-level case.
+pub const PDIR64: u64 = BASE + 0x2000;
+/// Where the one page table sits, physically, in a four-level case.
+pub const PTAB64: u64 = BASE + 0x3000;
 
 /// The physical page linear [`BASE`] is mapped to in a paged case.
 ///
@@ -270,6 +341,9 @@ const DATA_SEL: u16 = 0x10;
 const CODE32: u32 = ar::PRESENT | ar::S | ar::CODE | ar::RW | ar::ACCESSED | ar::DB;
 /// A 32-bit ring-0 data segment: present, writable, `B` set.
 const DATA32: u32 = ar::PRESENT | ar::S | ar::RW | ar::ACCESSED | ar::DB;
+/// A 64-bit ring-0 code segment: `L` set and `D` **clear**, which is the one
+/// combination that means 64-bit mode — `L` with `D` is reserved.
+const CODE64: u32 = ar::PRESENT | ar::S | ar::CODE | ar::RW | ar::ACCESSED | ar::L | ar::GRANULAR;
 
 /// One differential case: a program, the state it starts with, and the three
 /// lifter policies it is lifted under.
@@ -279,12 +353,27 @@ pub struct Case {
     pub variant: Variant,
     /// The instruction bytes, loaded at [`BASE`] and entered at `CS:BASE`.
     pub program: Vec<u8>,
-    /// The initial `EAX`..`EDI`, in ModRM order. `ESP` is overwritten with
-    /// [`STACK`] unless [`Case::keep_esp`] is set, because a random stack
-    /// pointer makes every push a fault and measures the trap path instead of
-    /// the lifter.
-    pub regs: [u32; 8],
-    /// Whether [`Case::regs`]'s `ESP` is used as given.
+    /// The initial `RAX`..`RDI` then `R8`..`R15`, in ModRM order. The stack
+    /// pointer is overwritten with [`STACK`] unless [`Case::keep_esp`] is set,
+    /// because a random stack pointer makes every push a fault and measures
+    /// the trap path instead of the lifter.
+    ///
+    /// Sixteen and sixty-four bits wide whatever the case, because the *host*
+    /// is: a 32-bit case simply never binds the top eight, and both engines
+    /// start them from the same numbers so they stay equal by not being
+    /// touched.
+    pub regs: [u64; 16],
+    /// Which of [`Case::regs`] hold an **offset into the data window** rather
+    /// than a value, as a bitmask over the register numbers.
+    ///
+    /// The window is reached through a segment with a base of [`BASE`] below
+    /// long mode and through a flat address space in it — 64-bit mode gives
+    /// `DS`, `ES` and `SS` a base of zero by definition — so the same case
+    /// needs a different number in a pointer register depending on the world.
+    /// Recording *which* registers are pointers is how one seeded case can be
+    /// run in both, and it is why [`Case::with_reg`] clears the bit it writes.
+    pub pointers: u16,
+    /// Whether [`Case::regs`]'s stack pointer is used as given.
     pub keep_esp: bool,
     /// The initial `EFLAGS`, before normalisation.
     pub eflags: u32,
@@ -306,6 +395,14 @@ pub struct Case {
     /// this module's, and the block is keyed on the page its entry resolved
     /// to. See [`Case::paged`].
     pub paged: bool,
+    /// Whether this case runs in **64-bit mode**.
+    ///
+    /// The fifth world, and the one that is not optional about the fourth: a
+    /// processor in long mode is a processor with paging on, always, because
+    /// `EFER.LMA` is set only when `CR0.PG` goes on with `EFER.LME` and
+    /// IA-32e paging requires `CR4.PAE` (*Intel SDM* volume 3 §9.8.5). See
+    /// [`Case::long`].
+    pub long: bool,
 }
 
 impl Case {
@@ -315,13 +412,15 @@ impl Case {
         Case {
             variant: Variant::I80386,
             program,
-            regs: [0; 8],
+            regs: [0; 16],
+            pointers: 0,
             keep_esp: false,
             eflags: flags::ALWAYS_SET,
             shape: Shape::default(),
             smc: Smc::default(),
             flags: Flags::default(),
             paged: false,
+            long: false,
         }
     }
 
@@ -329,7 +428,13 @@ impl Case {
     /// two engines are compared over.
     #[must_use]
     pub const fn ram_size(&self) -> u64 {
-        if self.paged { PAGED_RAM_SIZE } else { RAM_SIZE }
+        if self.long {
+            LONG_RAM_SIZE
+        } else if self.paged {
+            PAGED_RAM_SIZE
+        } else {
+            RAM_SIZE
+        }
     }
 
     /// Where the program is loaded, as an offset into that RAM.
@@ -351,15 +456,28 @@ impl Case {
     #[must_use]
     pub fn seeded(program: Vec<u8>) -> Case {
         let mut case = Case::new(program);
-        case.regs[0] = (DATA + 0x101) as u32;
-        case.regs[1] = (DATA + 0x300) as u32;
-        case.regs[2] = (DATA + 0x1000) as u32;
-        case.regs[3] = (DATA + 0x1800) as u32;
+        case.regs[0] = DATA + 0x101;
+        case.regs[1] = DATA + 0x300;
+        case.regs[2] = DATA + 0x1000;
+        case.regs[3] = DATA + 0x1800;
+        // The same four again in the half only a `REX` prefix can name, so a
+        // 64-bit generated program has somewhere to point too. In a 32-bit
+        // case nothing can decode a register number above seven, so these are
+        // eight numbers both engines start with and neither ever touches.
+        case.regs[8] = DATA + 0x201;
+        case.regs[9] = DATA + 0x480;
+        case.regs[10] = DATA + 0xc00;
+        case.regs[11] = DATA + 0x1400;
+        case.pointers = 0b0000_1111_0000_1111;
         // Something in every other register, so a generated program reuses a
         // value rather than reading a fresh zero every time.
         case.regs[5] = 0x8000_0001;
         case.regs[6] = 0x0000_ffff;
         case.regs[7] = 0x7fff_ffff;
+        case.regs[12] = 0x8000_0000_0000_0001;
+        case.regs[13] = 0x0000_0000_ffff_ffff;
+        case.regs[14] = 0x7fff_ffff_ffff_ffff;
+        case.regs[15] = 0x1234_5678_9abc_def0;
         case
     }
 
@@ -385,10 +503,14 @@ impl Case {
     }
 
     /// The same case with a register preset.
+    ///
+    /// The register stops being a data-window pointer, because a caller that
+    /// writes a number down means that number in both worlds.
     #[must_use]
-    pub const fn with_reg(mut self, n: usize, value: u32) -> Case {
-        if n < 8 {
+    pub const fn with_reg(mut self, n: usize, value: u64) -> Case {
+        if n < 16 {
             self.regs[n] = value;
+            self.pointers &= !(1u16 << n);
         }
         self
     }
@@ -421,11 +543,62 @@ impl Case {
         self
     }
 
+    /// The same case in **64-bit mode**, which forces paging with it.
+    ///
+    /// Not a sixth policy but a fifth world, and the one whose prerequisites
+    /// are not a matter of taste: long mode is [`Case::paged`] plus
+    /// `CR4.PAE`, `EFER.LME` and a code segment with its `L` bit set, and a
+    /// processor cannot be in it with paging off. So this calls
+    /// [`Case::paged`] rather than asking a caller to remember to.
+    ///
+    /// What changes for a program, beyond the sixteen registers and the `REX`
+    /// prefix that names them: `CS`, `DS`, `ES` and `SS` have a base of zero
+    /// however their descriptors read, so a pointer register holds a **linear**
+    /// address rather than an offset — which is what [`Case::pointers`] exists
+    /// to say.
+    #[must_use]
+    pub const fn long(mut self) -> Case {
+        self.long = true;
+        self = self.paged();
+        self
+    }
+
+    /// What a data-window offset has to be added to before a guest register
+    /// can hold it.
+    ///
+    /// The data segments' base below long mode, and [`HIGH`] in it — where
+    /// there is no segment base and a linear address is the whole answer.
+    #[must_use]
+    pub const fn data_base(&self) -> u64 {
+        if self.long { HIGH } else { 0 }
+    }
+
     /// The register file this case actually starts with.
-    fn start_regs(&self) -> [u32; 8] {
+    ///
+    /// **Narrowed to the world's own width**, which is the same kind of
+    /// normalisation `Case::start_eflags` performs and is not cosmetic: a
+    /// 32-bit guest cannot have anything above 2^32 in a register — every
+    /// doubleword write zero-extends and every narrower one preserves a top
+    /// half that started at zero — and [`lift`]'s slot invariant is that a
+    /// slot *holds the architectural register*, so a 32-bit read of one is the
+    /// slot itself with no field taken out of it. Seeding a 32-bit case with a
+    /// wider number would put the lifter and the interpreter on two different
+    /// values and report it as a frontend divergence. The fuzz target builds
+    /// register values out of its input, so this is reachable rather than
+    /// theoretical.
+    #[must_use]
+    pub fn start_regs(&self) -> [u64; 16] {
         let mut regs = self.regs;
+        let base = self.data_base();
+        let width = if self.long { u64::MAX } else { 0xffff_ffff };
+        for (n, value) in regs.iter_mut().enumerate() {
+            if self.pointers & (1 << n) != 0 {
+                *value = value.wrapping_add(base);
+            }
+            *value &= width;
+        }
         if !self.keep_esp {
-            regs[4] = STACK as u32;
+            regs[4] = STACK.wrapping_add(base) & width;
         }
         regs
     }
@@ -596,7 +769,7 @@ pub fn compare(case: &Case) -> Result<Verdict, Divergence> {
         ));
     }
 
-    let pc = host.slot(EIP);
+    let pc = host.slot(RIP);
     state(case, &cpu, &host, pc, "the lifted block", false)?;
 
     // The cumulative column the block publishes at its boundaries is *static*
@@ -648,15 +821,21 @@ fn state(
 ) -> Result<(), Divergence> {
     let regs = cpu.regs();
     let when = if at_fault { " at the fault" } else { "" };
-    for n in 0..8u8 {
-        let want = regs.dword(n);
-        let got = host.slot(r_slot(n)) as u32;
+    let names = if case.long { REG_NAMES64 } else { REG_NAMES };
+    // All sixteen, at their full width, in both worlds. A 32-bit case cannot
+    // decode a register number above seven and cannot leave anything in the
+    // top half of one below it — `Regs::set_dword` zero-extends — so comparing
+    // sixty-four bits of sixteen registers there is the same assertion said
+    // more strongly, and it is one comparison rather than two.
+    for n in 0..16u8 {
+        let want = regs.qword(n);
+        let got = host.slot(r_slot(n));
         if want != got {
             return Err(diverged(
                 case,
                 format!(
-                    "{}{when}: the interpreter says {want:#010x}, {what} says {got:#010x}",
-                    REG_NAMES[n as usize]
+                    "{}{when}: the interpreter says {want:#018x}, {what} says {got:#018x}",
+                    names[n as usize]
                 ),
             ));
         }
@@ -668,12 +847,15 @@ fn state(
     // `Fault::pc` instead. A frontend that bound it at every boundary would
     // spend a constant move per guest instruction to say what the boundary
     // record already says.
-    let want_pc = regs.rip as u32;
-    let got_pc = pc as u32;
+    let want_pc = regs.rip;
+    let got_pc = pc;
     if want_pc != got_pc {
         return Err(diverged(
             case,
-            format!("eip{when}: the interpreter says {want_pc:#010x}, {what} says {got_pc:#010x}"),
+            format!(
+                "{}{when}: the interpreter says {want_pc:#018x}, {what} says {got_pc:#018x}",
+                if case.long { "rip" } else { "eip" }
+            ),
         ));
     }
 
@@ -756,7 +938,16 @@ fn name_flags(mask: u32) -> String {
     out
 }
 
-const REG_NAMES: [&str; 8] = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"];
+const REG_NAMES: [&str; 16] = [
+    "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "r8", "r9", "r10", "r11", "r12", "r13",
+    "r14", "r15",
+];
+
+/// The same sixteen as long mode names them.
+const REG_NAMES64: [&str; 16] = [
+    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13",
+    "r14", "r15",
+];
 
 /// Build the report for a disagreement, disassembling the program into it.
 fn diverged(case: &Case, what: String) -> Divergence {
@@ -764,7 +955,7 @@ fn diverged(case: &Case, what: String) -> Divergence {
     let bytes = &case.program;
     let listing = super::disasm::disassemble_run_as(
         case.variant.map(),
-        super::isa::Bits::B32,
+        world(case).bits,
         CODE_SEL,
         BASE,
         32,
@@ -779,17 +970,20 @@ fn diverged(case: &Case, what: String) -> Divergence {
         program.push_str(&format!("  {:#010x}  {line}\n", line.ip));
     }
     let regs = case.start_regs();
+    let names = if case.long { REG_NAMES64 } else { REG_NAMES };
     for (n, value) in regs.iter().enumerate() {
         if *value != 0 {
-            program.push_str(&format!("  {} = {value:#010x}\n", REG_NAMES[n]));
+            program.push_str(&format!("  {} = {value:#018x}\n", names[n]));
         }
     }
     program.push_str(&format!(
-        "  eflags = {:#010x}  shape {:?}  smc {:?}  flags {:?}\n",
+        "  eflags = {:#010x}  shape {:?}  smc {:?}  flags {:?}  world {:?}{}\n",
         case.start_eflags(),
         case.shape,
         case.smc,
-        case.flags
+        case.flags,
+        world(case).bits,
+        if case.paged { " paged" } else { "" },
     ));
     Divergence { what, program }
 }
@@ -811,12 +1005,19 @@ pub fn config(case: &Case) -> Config {
 #[must_use]
 pub fn world(case: &Case) -> World {
     // Flat code, based data. `CS` is the odd one out and has to be written
-    // down as such: the code lives at linear [`BASE`] because `EIP` starts
-    // there, not because the segment moves it.
-    let mut seg_base = [BASE; seg::COUNT];
+    // down as such: the code lives at linear [`BASE`] because the program
+    // counter starts there, not because the segment moves it.
+    //
+    // In 64-bit mode every one of the six is flat, and that is the
+    // architecture's answer rather than this machine's: `CS`, `DS`, `ES` and
+    // `SS` are treated as having a base of zero whatever their descriptors
+    // hold, and `FS` and `GS` take theirs from an MSR this harness leaves at
+    // zero (*Intel SDM* volume 3 §3.4.4).
+    let mut seg_base = [if case.long { 0 } else { BASE }; seg::COUNT];
     seg_base[usize::from(seg::CS)] = 0;
     World {
         variant: case.variant,
+        bits: if case.long { Bits::B64 } else { Bits::B32 },
         cs_base: 0,
         seg_base,
         // A 386 and a 486 both have `CMOVcc` clear by default, and `Exec`
@@ -843,6 +1044,64 @@ fn put_entry(ram: &RamStore, phys: u64, value: u32) {
     for i in 0..4u64 {
         ram.write_u8(phys - BASE + i, (value >> (8 * i as u32)) as u8)
             .expect("a table entry is inside the region");
+    }
+}
+
+/// The eight-byte entry `value` at physical address `phys`, which is what
+/// every level of an IA-32e walk holds.
+fn put_entry64(ram: &RamStore, phys: u64, value: u64) {
+    for i in 0..8u64 {
+        ram.write_u8(phys - BASE + i, (value >> (8 * i as u32)) as u8)
+            .expect("a table entry is inside the region");
+    }
+}
+
+/// Map the four guest pages through the **four-level** walk long mode
+/// requires.
+///
+/// One entry per level down to a page table that maps the four pages one at a
+/// time — deliberately not a 2 MiB large page, because a large page has no
+/// page table and this harness wants the walk to be four reads deep and the
+/// accessed and dirty bits to land in an entry that maps exactly one page.
+///
+/// Supervisor, present and writable, with accessed and dirty clear, for the
+/// same reasons [`map_pages`] gives.
+fn map_pages64(ram: &RamStore) {
+    let table = pte::PRESENT | pte::WRITABLE;
+    // The low window, where the code is.
+    put_entry64(ram, PML4 + 8 * ((BASE >> 39) & 0x1ff), PDPT | table);
+    put_entry64(ram, PDPT + 8 * ((BASE >> 30) & 0x1ff), PDIR64 | table);
+    put_entry64(ram, PDIR64 + 8 * ((BASE >> 21) & 0x1ff), PTAB64 | table);
+    let first = (BASE >> 12) & 0x1ff;
+    for k in 0..RAM_SIZE / 4096 {
+        put_entry64(
+            ram,
+            PTAB64 + 8 * (first + k),
+            (PAGED_PROGRAM + k * 4096) | table,
+        );
+    }
+    // The high window, at [`HIGH`], onto the **same four frames**. A separate
+    // chain from the top level down, because two and a half tebibytes up is a
+    // different entry of every table on the way — which is what makes an
+    // address here one that only sixty-four bits can hold.
+    put_entry64(ram, PML4 + 8 * ((HIGH >> 39) & 0x1ff), PDPT_HIGH | table);
+    put_entry64(
+        ram,
+        PDPT_HIGH + 8 * ((HIGH >> 30) & 0x1ff),
+        PDIR_HIGH | table,
+    );
+    put_entry64(
+        ram,
+        PDIR_HIGH + 8 * ((HIGH >> 21) & 0x1ff),
+        PTAB_HIGH | table,
+    );
+    let first = (HIGH >> 12) & 0x1ff;
+    for k in 0..RAM_SIZE / 4096 {
+        put_entry64(
+            ram,
+            PTAB_HIGH + 8 * (first + k),
+            (PAGED_PROGRAM + k * 4096) | table,
+        );
     }
 }
 
@@ -890,7 +1149,9 @@ pub fn machine(case: &Case) -> (Arc<AddressSpace>, Arc<RamStore>) {
     // happens to hold.
     ram.write_u8(at + case.program.len() as u64, 0xf4)
         .expect("the terminator fits");
-    if case.paged {
+    if case.long {
+        map_pages64(&ram);
+    } else if case.paged {
         map_pages(&ram);
     }
     let space = AddressSpace::new("mem", 32);
@@ -922,17 +1183,39 @@ pub fn system(case: &Case) -> Sys {
         selector: CODE_SEL,
         base: 0,
         limit: 0xffff_ffff,
-        ar: CODE32,
+        ar: if case.long { CODE64 } else { CODE32 },
     };
     for index in [seg::DS, seg::ES, seg::SS, seg::FS, seg::GS] {
         sys.segs[usize::from(index)] = SegReg {
             selector: DATA_SEL,
-            base: BASE,
-            limit: (RAM_SIZE - 1) as u32,
+            // 64-bit mode gives the data segments a base of zero and no limit
+            // whatever the descriptor says, so writing the limit down here
+            // would be writing down something nothing reads. The **fault** a
+            // 64-bit case takes on an address outside the window is a `#PF`
+            // from an unmapped page rather than a `#GP` from a segment limit,
+            // which is a different vector and the same compared column: both
+            // engines stop at the same instruction in the same state.
+            base: if case.long { 0 } else { BASE },
+            limit: if case.long {
+                0xffff_ffff
+            } else {
+                (RAM_SIZE - 1) as u32
+            },
             ar: DATA32,
         };
     }
-    if case.paged {
+    if case.long {
+        // The order is the manual's, minus the guest instructions that would
+        // have performed it: `CR4.PAE`, `CR3`, `EFER.LME`, then `CR0.PG` —
+        // at which point *the processor* sets `EFER.LMA`. This harness sets
+        // both bits itself because it builds the state rather than reaching
+        // it, and `cpu::x86::tests` is where the transition is executed as
+        // real instructions.
+        sys.cr4 |= cr4::PAE;
+        sys.cr3 = PML4;
+        sys.efer |= efer::LME | efer::LMA;
+        sys.cr0 |= cr0::PG;
+    } else if case.paged {
         // `CR4.PAE` stays clear, so this is the two-level walk a 32-bit guest
         // uses whatever the part is wide enough to do — `Mode::Legacy`, four
         // bytes an entry, one directory and one table.
@@ -961,7 +1244,7 @@ pub fn oracle(case: &Case, space: Arc<AddressSpace>) -> X86 {
     regs.gs = DATA_SEL;
     let start = case.start_regs();
     for (n, value) in start.iter().enumerate() {
-        regs.set_dword(n as u8, *value);
+        regs.set_qword(n as u8, *value);
     }
     regs.rip = BASE;
     regs.eflags = case.start_eflags();
@@ -1098,9 +1381,9 @@ impl Host {
         let mut slots = [0u64; SLOT_COUNT as usize];
         let start = case.start_regs();
         for (n, value) in start.iter().enumerate() {
-            slots[n] = u64::from(*value);
+            slots[n] = *value;
         }
-        slots[EIP.0 as usize] = BASE;
+        slots[RIP.0 as usize] = BASE;
         let eflags = case.start_eflags();
         for (i, bit) in FLAG_BITS.iter().enumerate() {
             slots[FLAG_SLOTS[i].0 as usize] = u64::from(eflags & bit != 0);
@@ -1666,7 +1949,7 @@ impl Frontend<CachedHost> for Lifter {
     }
 
     fn pc_slot(&self) -> RegSlot {
-        EIP
+        RIP
     }
 
     fn translate(&mut self, pc: u64) -> crate::core::error::Result<Translation> {
@@ -2066,6 +2349,253 @@ pub fn synthesize(form: u32, fields: u32) -> Vec<u8> {
     }
 }
 
+/// The register numbers [`synthesize64`] writes to.
+///
+/// Fifteen, not sixteen: `RSP` is left alone for the reason [`SYNTH_REGS`]
+/// gives, and `R8`-`R15` are in because a corpus that never named them would
+/// leave half the register file — and the whole of `REX.R` and `REX.B` —
+/// untested.
+pub const SYNTH_REGS64: [u8; 15] = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+/// The registers [`Case::seeded`] points into the data window.
+///
+/// Eight of them in long mode rather than four, so `REX.B` reaches a base
+/// register that holds something usable rather than a value that faults.
+pub const SYNTH_BASES64: [u8; 8] = [0, 1, 2, 3, 8, 9, 10, 11];
+
+/// Where a `RIP`-relative operand is aimed, as a displacement from the
+/// instruction after it.
+///
+/// The second page of the window, which is data: a program is at most a couple
+/// of hundred bytes and starts at [`BASE`], so `RIP` plus anything in this
+/// range lands inside the four mapped pages and outside the code page. Aiming
+/// it at the code page would be a self-modifying-code case pretending to be an
+/// addressing-mode one.
+const RIP_WINDOW: u32 = 0x1000;
+
+/// Encode one instruction from inside the lifter's **long-mode** subset.
+///
+/// The 64-bit counterpart of [`synthesize`], written out rather than derived
+/// from it by prefixing a `REX`: three of that function's forms mean something
+/// else in long mode — `40`-`4f` *are* the prefix, so `INC r32` and `DEC r32`
+/// have to be encoded through group `FF`, and `B8+r` with `REX.W` takes an
+/// eight-byte immediate that would swallow the next instruction — and three
+/// addressing modes exist here that have no 32-bit spelling at all.
+///
+/// What it covers that [`synthesize`] cannot:
+///
+/// * **`REX` itself**, on nearly every instruction, including the `40` that
+///   sets no bit and still renames `AH` to `SPL`;
+/// * **`R8`-`R15`**, as operands, as memory bases and as byte registers;
+/// * **a 64-bit operand size**, where `ADD`'s carry has no bit above it,
+///   a shift count is masked to six bits rather than five, and `MUL` needs a
+///   double-width product;
+/// * **a 32-bit operand size in long mode**, which zero-extends into the whole
+///   register where a byte or word write preserves what is above it — half the
+///   arithmetic forms drop `REX.W` for exactly that;
+/// * **`RIP`-relative addressing**, whose effective address depends on the
+///   instruction's own length.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn synthesize64(form: u32, fields: u32) -> Vec<u8> {
+    let reg = SYNTH_REGS64[(fields % 15) as usize];
+    let rm = SYNTH_REGS64[((fields >> 4) % 15) as usize];
+    let base = SYNTH_BASES64[((fields >> 8) & 7) as usize];
+    let disp = (((fields >> 12) & 0x7f) as i32 - 64) as i8;
+    let imm8 = (fields >> 16) as u8;
+    let imm32 = fields.rotate_left(11);
+    let cc = ((fields >> 20) & 15) as u8;
+    let ext = (fields >> 24) as u8 & 7;
+    // Halfword-granular and small, so a taken branch lands on a real
+    // instruction boundary more often than not and never leaves the page.
+    let rel = ((((fields >> 24) & 0x1f) as i32) - 16) as i8;
+    // Whether this form widens its operand. Left to the generator rather than
+    // fixed, because *both* answers are interesting in long mode: with
+    // `REX.W` the operand is the one the IR has no carry bit above, and
+    // without it the write zeroes the upper half.
+    let wide = (fields >> 23) & 1 == 1;
+    let rip = (RIP_WINDOW + ((fields >> 12) & 0x7f8)) as i32;
+
+    // `REX` is emitted on nearly everything, `40` included: it is a prefix
+    // with no operand of its own and it still changes what a byte-sized
+    // register number four means.
+    let rex = |w: bool, r: u8, b: u8| 0x40 | (u8::from(w) << 3) | ((r >> 3) << 2) | (b >> 3);
+    // `mod=11` — both operands are registers.
+    let rr =
+        |w: bool, op: u8, r: u8, m: u8| vec![rex(w, r, m), op, 0xc0 | ((r & 7) << 3) | (m & 7)];
+    // `mod=01` — a base register and an 8-bit displacement. Every base in
+    // `SYNTH_BASES64` has a low field of 0-3, so none of them needs a SIB byte
+    // and none of them is the `RBP` encoding.
+    let rmd = |w: bool, op: u8, r: u8, b: u8, d: i8| {
+        vec![rex(w, r, b), op, 0x40 | ((r & 7) << 3) | (b & 7), d as u8]
+    };
+    // `mod=00`, `r/m=101` — `RIP` plus a 32-bit displacement.
+    let riprel = |op: u8, r: u8, d: i32| {
+        let mut out = vec![rex(true, r, 0), op, ((r & 7) << 3) | 5];
+        out.extend_from_slice(&d.to_le_bytes());
+        out
+    };
+    // A group encoding with the extension in the `reg` field.
+    let group = |w: bool, op: u8, n: u8, m: u8| vec![rex(w, 0, m), op, 0xc0 | (n << 3) | (m & 7)];
+
+    match form % 53 {
+        // -- the ALU, register to register, at both operand sizes -----------
+        0 => rr(true, 0x01, reg, rm),  // add r/m64, r64
+        1 => rr(wide, 0x03, reg, rm),  // add r, r/m
+        2 => rr(false, 0x00, reg, rm), // add r/m8, r8 — `REX` byte registers
+        3 => rr(wide, 0x09, reg, rm),  // or
+        4 => rr(true, 0x11, reg, rm),  // adc
+        5 => rr(true, 0x19, reg, rm),  // sbb
+        6 => rr(wide, 0x21, reg, rm),  // and
+        7 => rr(true, 0x29, reg, rm),  // sub
+        8 => rr(wide, 0x31, reg, rm),  // xor
+        9 => rr(true, 0x39, reg, rm),  // cmp
+        10 => rr(true, 0x85, reg, rm), // test
+        // -- the ALU against memory ----------------------------------------
+        11 => rmd(true, 0x01, reg, base, disp),
+        12 => rmd(wide, 0x03, reg, base, disp),
+        13 => rmd(true, 0x29, reg, base, disp),
+        14 => rmd(wide, 0x33, reg, base, disp),
+        15 => rmd(true, 0x89, reg, base, disp), // mov [base+d], r64
+        16 => rmd(true, 0x8b, reg, base, disp), // mov r64, [base+d]
+        17 => rmd(false, 0x88, reg, base, disp), // mov [base+d], r8
+        18 => rmd(false, 0x8a, reg, base, disp), // mov r8, [base+d]
+        19 => rmd(true, 0x8d, reg, base, disp), // lea
+        // -- immediates -----------------------------------------------------
+        20 => {
+            // group 81 /n imm32, sign-extended to sixty-four bits
+            let mut out = group(true, 0x81, ext, rm);
+            out.extend_from_slice(&imm32.to_le_bytes());
+            out
+        }
+        21 => {
+            // group 83 /n imm8, sign-extended
+            let mut out = group(wide, 0x83, ext, rm);
+            out.push(imm8);
+            out
+        }
+        22 => {
+            // mov r64, imm32 — sign-extended. `B8+r` with `REX.W` takes an
+            // eight-byte immediate instead, which would swallow the next
+            // instruction out of a generated stream.
+            let mut out = group(true, 0xc7, 0, rm);
+            out.extend_from_slice(&imm32.to_le_bytes());
+            out
+        }
+        23 => vec![rex(false, 0, reg), 0xb0 | (reg & 7), imm8], // mov r8, imm8
+        // `40+r` is the `REX` prefix in long mode, so the increments moved
+        // into group `FF`.
+        24 => group(true, 0xff, 0, rm), // inc r/m64
+        25 => group(wide, 0xff, 1, rm), // dec r/m
+        // -- shifts and rotates ---------------------------------------------
+        26 => {
+            // A count of up to sixty-three, which is the mask a 64-bit operand
+            // uses where every narrower one masks to five bits.
+            let mut out = group(true, 0xc1, ext, rm);
+            out.push(imm8 & 0x3f);
+            out
+        }
+        27 => group(true, 0xd1, ext, rm),
+        28 => group(true, 0xd3, ext, rm),
+        29 => group(false, 0xc0, ext, rm), // the byte forms
+        // -- multiplies -----------------------------------------------------
+        30 => group(true, 0xf7, 4, rm),  // mul r/m64
+        31 => group(true, 0xf7, 5, rm),  // imul r/m64
+        32 => group(false, 0xf6, 4, rm), // mul r/m8
+        33 => {
+            let mut out = vec![rex(true, reg, rm), 0x0f, 0xaf];
+            out.push(0xc0 | ((reg & 7) << 3) | (rm & 7));
+            out
+        }
+        34 => {
+            let mut out = rr(true, 0x6b, reg, rm); // imul r64, r/m64, imm8
+            out.push(imm8);
+            out
+        }
+        // -- the unary group ------------------------------------------------
+        35 => group(true, 0xf7, 2, rm), // not
+        36 => group(wide, 0xf7, 3, rm), // neg
+        // -- extensions and bit scans ---------------------------------------
+        37 => {
+            let mut out = vec![rex(true, reg, rm), 0x0f, 0xb6]; // movzx r64, r/m8
+            out.push(0xc0 | ((reg & 7) << 3) | (rm & 7));
+            out
+        }
+        38 => {
+            let mut out = vec![rex(true, reg, rm), 0x0f, 0xbe]; // movsx r64, r/m8
+            out.push(0xc0 | ((reg & 7) << 3) | (rm & 7));
+            out
+        }
+        39 => {
+            let mut out = vec![rex(true, reg, rm), 0x0f, 0xbc]; // bsf
+            out.push(0xc0 | ((reg & 7) << 3) | (rm & 7));
+            out
+        }
+        40 => {
+            let mut out = vec![rex(true, reg, rm), 0x0f, 0xbd]; // bsr
+            out.push(0xc0 | ((reg & 7) << 3) | (rm & 7));
+            out
+        }
+        // -- the condition codes, read three different ways -----------------
+        41 => vec![0x70 | cc, rel as u8], // jcc rel8
+        42 => {
+            let mut out = vec![rex(false, 0, rm), 0x0f, 0x90 | cc]; // setcc r/m8
+            out.push(0xc0 | (rm & 7));
+            out
+        }
+        43 => {
+            let mut out = vec![rex(true, reg, rm), 0x0f, 0x40 | cc]; // cmovcc
+            out.push(0xc0 | ((reg & 7) << 3) | (rm & 7));
+            out
+        }
+        // -- the stack, which is eight bytes wide here whatever the prefix --
+        44 => vec![
+            rex(false, 0, reg),
+            0x50 | (reg & 7),
+            rex(false, 0, rm),
+            0x58 | (rm & 7),
+        ],
+        // -- a load whose only consumer is the flags ------------------------
+        45 => rmd(true, 0x3b, reg, base, disp), // cmp r64, [base+d]
+        46 => rmd(true, 0x39, reg, base, disp), // cmp [base+d], r64
+        47 => rmd(wide, 0x85, reg, base, disp), // test [base+d], r
+        // -- `RIP`-relative addressing, which has no 32-bit spelling --------
+        48 => riprel(0x8b, reg, rip), // mov r64, [rip+d]
+        49 => riprel(0x89, reg, rip), // mov [rip+d], r64
+        50 => riprel(0x8d, reg, rip), // lea r64, [rip+d]
+        51 => {
+            let mut out = vec![rex(true, reg, rm), 0x63]; // movsxd r64, r/m32
+            out.push(0xc0 | ((reg & 7) << 3) | (rm & 7));
+            out
+        }
+        _ => match (fields >> 28) & 7 {
+            0 => vec![0xf8],                                      // clc
+            1 => vec![0xf9],                                      // stc
+            2 => vec![0xf5],                                      // cmc
+            3 => vec![0x9f],                                      // lahf
+            4 => vec![0x9e],                                      // sahf
+            5 => vec![0x48, 0x98],                                // cdqe
+            6 => vec![0x48, 0x99],                                // cqo
+            _ => vec![rex(wide, 0, reg), 0x0f, 0xc8 | (reg & 7)], // bswap
+        },
+    }
+}
+
+/// A whole long-mode program of `len` generated instructions, from the same
+/// seeded generator [`program`] uses.
+#[must_use]
+pub fn program64(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed;
+    let mut out = Vec::new();
+    for _ in 0..len {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        out.extend_from_slice(&synthesize64((state >> 40) as u32, state as u32));
+    }
+    out
+}
+
 /// A whole program of `len` generated instructions, from a seeded generator.
 ///
 /// The generator is a 64-bit linear congruential sequence — Knuth's MMIX
@@ -2098,7 +2628,11 @@ mod tests {
     /// because the subject was told what the oracle was doing.
     #[test]
     fn a_hand_written_world_is_the_one_world_of_finds() {
-        for case in [Case::new(vec![0xf4]), Case::new(vec![0xf4]).paged()] {
+        for case in [
+            Case::new(vec![0xf4]),
+            Case::new(vec![0xf4]).paged(),
+            Case::new(vec![0xf4]).long(),
+        ] {
             let (space, _ram) = machine(&case);
             let cpu = oracle(&case, space);
             let want = world(&case);
@@ -2178,7 +2712,7 @@ mod tests {
         assert_eq!(u64::from(code) & pte::ACCESSED, pte::ACCESSED);
         assert_eq!(u64::from(code) & pte::DIRTY, 0);
         // The data page — the one `EBX` points into — written, so both.
-        let touched = BASE + u64::from(case.start_regs()[3]);
+        let touched = BASE + case.start_regs()[3];
         let data = ram
             .read_u8(PTAB - BASE + 4 * ((touched >> 12) & 0x3ff))
             .unwrap();
@@ -2186,6 +2720,116 @@ mod tests {
             u64::from(data) & (pte::ACCESSED | pte::DIRTY),
             pte::ACCESSED | pte::DIRTY
         );
+    }
+
+    /// The fifth world: long mode, which is the fourth plus `CR4.PAE`,
+    /// `EFER.LME` and a code segment with its `L` bit set.
+    ///
+    /// `48` in front of each instruction is `REX.W`, so every operand here is
+    /// sixty-four bits wide — the width at which `ADD`'s carry has no bit
+    /// above it to be read from and at which a `MUL` needs a double-width
+    /// product the IR has one opcode for.
+    #[test]
+    fn a_long_mode_case_agrees_with_the_interpreter() {
+        // mov rax, [rbx] ; add rax, rcx ; mov [rbx+8], rax ; hlt
+        let program = vec![
+            0x48, 0x8b, 0x03, 0x48, 0x01, 0xc8, 0x48, 0x89, 0x43, 0x08, 0xf4,
+        ];
+        let case = Case::seeded(program).long();
+        match compare(&case) {
+            Ok(v) => assert!(matches!(v, Verdict::Agreed { insns: 3, .. }), "{v:?}"),
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// The registers `REX` invented, which a 32-bit encoding cannot name at
+    /// all — and the four-level walk that reaches them.
+    #[test]
+    fn the_upper_eight_registers_are_reachable_and_compared() {
+        // mov r12, [r11] ; add r12, r13 ; mov [r11+8], r12 ; hlt
+        let program = vec![
+            0x4d, 0x8b, 0x23, 0x4d, 0x01, 0xec, 0x4d, 0x89, 0x63, 0x08, 0xf4,
+        ];
+        let case = Case::seeded(program).long();
+        match compare(&case) {
+            Ok(v) => assert!(matches!(v, Verdict::Agreed { insns: 3, .. }), "{v:?}"),
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// A 64-bit `MUL`, whose product does not fit in one temporary.
+    ///
+    /// The instruction [`lift`]'s "What the IR could not say" named as the one
+    /// that would reach [`Opcode::MULU2`](crate::ir::Opcode::MULU2), and the
+    /// reason it stayed unexercised for three rounds.
+    #[test]
+    fn a_sixty_four_bit_multiply_agrees_in_both_halves() {
+        for (a, b) in [
+            (0x1234_5678_9abc_def0u64, 0xfedc_ba98_7654_3210u64),
+            (u64::MAX, u64::MAX),
+            (1 << 63, 3),
+            (0, 0x55),
+        ] {
+            for op in [0xe3u8, 0xeb] {
+                // mul rbx / imul rbx, then hlt.
+                let program = vec![0x48, 0xf7, op, 0xf4];
+                let case = Case::new(program)
+                    .with_reg(0, a)
+                    .with_reg(3, b)
+                    .with_reg(2, 0x0bad_0bad_0bad_0bad)
+                    .long();
+                match compare(&case) {
+                    Ok(v) => assert!(matches!(v, Verdict::Agreed { insns: 1, .. }), "{v:?}"),
+                    Err(e) => panic!("{a:#x} * {b:#x} ({op:#x}): {e}"),
+                }
+            }
+        }
+    }
+
+    /// `RIP`-relative addressing: the one mode whose effective address depends
+    /// on the instruction's own length.
+    #[test]
+    fn a_rip_relative_operand_agrees() {
+        // mov rax, [rip+0x1000] ; mov [rip+0x1008], rax ; hlt
+        let mut program = vec![0x48, 0x8b, 0x05];
+        program.extend_from_slice(&0x1000u32.to_le_bytes());
+        program.extend_from_slice(&[0x48, 0x89, 0x05]);
+        program.extend_from_slice(&0x1008u32.to_le_bytes());
+        program.push(0xf4);
+        let case = Case::seeded(program).long();
+        match compare(&case) {
+            Ok(v) => assert!(matches!(v, Verdict::Agreed { insns: 2, .. }), "{v:?}"),
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// A 32-bit case cannot start with a register wider than the world it runs
+    /// in, however wide the field holding it is.
+    ///
+    /// [`Case::regs`] is sixty-four bits because the host is, and the fuzz
+    /// target fills registers from its input — so a number above 2^32 in a
+    /// 32-bit case is reachable. It would put the two engines on different
+    /// values, because [`lift`]'s slot invariant is that a slot holds the
+    /// architectural register and a 32-bit read of one is therefore the whole
+    /// slot, while `Regs::dword` truncates. That is a harness bug that would
+    /// be reported as a frontend divergence, which is the worst shape a
+    /// harness bug can have.
+    #[test]
+    fn a_narrow_world_narrows_the_registers_it_starts_with() {
+        let wide = 0x1234_5678_9abc_def0u64;
+        let flat = Case::new(vec![0x01, 0xc8, 0xf4])
+            .with_reg(0, wide)
+            .with_reg(1, wide);
+        assert_eq!(flat.start_regs()[0], 0x9abc_def0);
+        // And it does not narrow the world that can hold it.
+        let long = Case::new(vec![0xf4]).with_reg(0, wide).long();
+        assert_eq!(long.start_regs()[0], wide);
+        // The two engines then agree, which is the property the narrowing is
+        // for rather than the narrowing itself.
+        match compare(&flat) {
+            Ok(v) => assert!(matches!(v, Verdict::Agreed { insns: 1, .. }), "{v:?}"),
+            Err(e) => panic!("{e}"),
+        }
     }
 
     #[test]
@@ -2278,7 +2922,25 @@ mod tests {
         for form in 0..64u32 {
             for fields in [0u32, 0x1234_5678, u32::MAX, 0x8000_0001] {
                 assert!(!synthesize(form, fields).is_empty(), "{form}/{fields:#x}");
+                assert!(
+                    !synthesize64(form, fields).is_empty(),
+                    "64 {form}/{fields:#x}"
+                );
             }
         }
+    }
+
+    /// The long-mode generator has to produce programs the frontend actually
+    /// lifts, or a sweep over it passes while measuring nothing.
+    #[test]
+    fn the_long_mode_generator_produces_programs_the_frontend_lifts() {
+        let mut lifted = 0usize;
+        for n in 0..200u64 {
+            let case = Case::seeded(program64(0x6400_0000 + n, 6)).long();
+            if let Ok(Verdict::Agreed { insns, .. } | Verdict::Trapped { insns }) = compare(&case) {
+                lifted += insns;
+            }
+        }
+        assert!(lifted > 400, "only {lifted} guest instructions were lifted");
     }
 }

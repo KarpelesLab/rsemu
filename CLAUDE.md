@@ -91,12 +91,22 @@ Roadmap §1 has the long form. When in doubt, ask **before** reading.
 
 ## `unsafe`
 
-- Crate-wide `unsafe_code = "deny"` (not `forbid`), so **six** subsystems can
+- Crate-wide `unsafe_code = "deny"` (not `forbid`), so **seven** subsystems can
   opt back in with a scoped `#[allow(unsafe_code)]`: the RAM host-pointer fast
   path, the JIT code buffer, the raw-syscall accel backends, `ffi`, the
-  `core::sync` `single` backend (`RefCell` is not `Sync`), and per-CPU execution
-  state (a lock per instruction cannot hit the throughput gate). Six is the
-  ceiling; a seventh is a design review, not a commit.
+  `core::sync` `single` backend (`RefCell` is not `Sync`), per-CPU execution
+  state (a lock per instruction cannot hit the throughput gate), and the **host
+  signal disposition** (`sigaction`; x86-64 Linux only, every other target gets
+  `Arming::Unavailable` and keeps the disposition it had). Seven is the ceiling;
+  an eighth is a design review, not a commit.
+- The seventh was added deliberately and is the worked example of how that
+  review goes. `std` has no signal API; a disposition is *this process's own*
+  state, so there is no external program to shell out to the way `terminal.rs`
+  reaches raw mode by running `stty`; and `libc` is outside the dependency
+  policy. The alternative was not a safer implementation, it was keeping a
+  data-loss defect — Ctrl-C on a headless run skipped `finish()`, so a qcow2
+  lost the L1/L2 metadata that finds its own data clusters. Weigh an eighth the
+  same way: what exactly is lost by refusing it?
 - Every `unsafe` block carries a `// SAFETY:` comment stating the invariant and
   who upholds it. No exceptions, including in the hot path.
 

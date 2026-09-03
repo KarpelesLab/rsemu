@@ -138,7 +138,7 @@ lifetime. The core reaches memory through an `AddressSpace` built from
 `Arc<dyn MemOps>` — shared, `Send + Sync`, `'static` — while the runner hands
 over a `&mut dyn Bus6502` that lives for one `step`. There is no safe way to
 put that borrow inside the `'static` `Arc`, and `unsafe` is not available: the
-six sanctioned sites are listed in `CLAUDE.md` and a test harness is not one of
+seven sanctioned sites are listed in `CLAUDE.md` and a test harness is not one of
 them. So the borrow stays where it is and the *core* moves — it runs on its own
 thread, and every access it makes becomes a message the calling thread services
 against the borrowed bus. One channel round trip per read; writes ride the

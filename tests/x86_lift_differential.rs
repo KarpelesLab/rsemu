@@ -14,7 +14,7 @@
 //! seed printed beside it, and a new failure is a real regression rather than a
 //! different draw.
 //!
-//! # Six frontends, not one
+//! # Six frontends, not one — in three worlds
 //!
 //! Every case runs under all three [`Shape`]s crossed with both [`Flags`]
 //! policies, because each of those emits **different IR from the same bytes**:
@@ -30,11 +30,20 @@
 //! disagreement between two of them is a frontend bug wherever it shows up.
 //! [`Smc`] is the third axis, exercised the same way by the self-modifying-code
 //! cases below.
+//!
+//! The whole cross product runs in each of the three **worlds** `World::of`
+//! accepts — 32-bit protected mode, the same with `CR0.PG` set, and long
+//! mode — and a world is not a seventh policy: it changes the *bytes*. `40`-`4f`
+//! are `INC` and `DEC` in two of them and the `REX` prefix in the third, the
+//! register file above seven exists only in the third, and three addressing
+//! modes have no spelling outside it. So the long-mode sweeps generate from
+//! [`synthesize64`] rather than from [`synthesize`]; a sweep that reused the
+//! 32-bit encodings would run and would be measuring the wrong instruction set.
 
 #![cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
 
 use rsemu::cpu::x86::differential::{
-    Case, Verdict, compare, compare_cached, measure_cached, synthesize,
+    Case, Verdict, compare, compare_cached, measure_cached, synthesize, synthesize64,
 };
 use rsemu::cpu::x86::lift::{Flags, Shape, Smc};
 
@@ -59,10 +68,33 @@ impl Lcg {
 /// One generated program of up to `len` instructions, terminated by a byte the
 /// lifter refuses so a run cannot fall off the end into the data window.
 fn generate(rng: &mut Lcg, len: usize) -> Vec<u8> {
+    generate_in(rng, len, World::Protected)
+}
+
+/// Which world a generated program is written for — this file's own name for
+/// the choice, not `lift::World`.
+///
+/// Not a policy: the two produce **different bytes**, because `40`-`4f` are
+/// `INC` and `DEC` in one and the `REX` prefix in the other, and three
+/// addressing modes exist in only one of them. Paging is *not* one of these,
+/// because it changes no encoding: a paged sweep runs the same bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum World {
+    /// 32-bit protected mode, with or without paging.
+    Protected,
+    /// Long mode, which is paged by construction.
+    Long,
+}
+
+fn generate_in(rng: &mut Lcg, len: usize, world: World) -> Vec<u8> {
     let mut out = Vec::new();
     for _ in 0..len {
         let bits = rng.next();
-        out.extend_from_slice(&synthesize((bits >> 40) as u32, bits as u32));
+        let (form, fields) = ((bits >> 40) as u32, bits as u32);
+        out.extend_from_slice(&match world {
+            World::Protected => synthesize(form, fields),
+            World::Long => synthesize64(form, fields),
+        });
     }
     // `HLT`: outside the subset, so the block ends cleanly rather than lifting
     // whatever the data window happens to hold.
@@ -118,6 +150,41 @@ fn sweep_in(seed: u64, count: usize, shape: Shape, flags: Flags, paged: bool) ->
                 "case {n} of seed {seed:#x} diverged under {shape:?}/{flags:?}{}:\n{e}",
                 if paged { "/paged" } else { "" }
             ),
+        }
+    }
+    cov
+}
+
+/// The same sweep in **long mode**, over a corpus written for it.
+///
+/// The corpus has to change with the world or the coverage claim is empty:
+/// `synthesize`'s bytes decode in long mode, but `40`-`4f` become a `REX`
+/// prefix on the instruction after them and the register file above seven is
+/// never named. [`synthesize64`] writes the encodings this world actually
+/// has — `REX` on nearly everything, `R8`-`R15`, a 64-bit operand size beside
+/// a 32-bit one, and `RIP`-relative addressing.
+fn sweep_long(seed: u64, count: usize, shape: Shape, flags: Flags) -> Coverage {
+    let mut rng = Lcg(seed);
+    let mut cov = Coverage::default();
+    for n in 0..count {
+        let len = 1 + (rng.next() % 12) as usize;
+        let case = Case::seeded(generate_in(&mut rng, len, World::Long))
+            .with_shape(shape)
+            .with_flags(flags)
+            .long();
+        match compare(&case) {
+            Ok(Verdict::Agreed { insns, .. }) => {
+                cov.agreed += 1;
+                cov.insns += insns;
+            }
+            Ok(Verdict::Trapped { insns }) => {
+                cov.trapped += 1;
+                cov.insns += insns;
+            }
+            Ok(Verdict::Nothing) => cov.nothing += 1,
+            Err(e) => {
+                panic!("long case {n} of seed {seed:#x} diverged under {shape:?}/{flags:?}:\n{e}")
+            }
         }
     }
     cov
@@ -257,6 +324,133 @@ fn paging_changes_the_clock_and_nothing_else() {
         tb > ta,
         "paging cost nothing ({ta} ticks unpaged, {tb} paged), so no page-table walk happened"
     );
+}
+
+/// The corpus in **long mode**, under all six shape-and-flag frontends.
+///
+/// The third of the three worlds, and the one paging was a prerequisite for
+/// rather than an alternative to: `EFER.LMA` is set only when `CR0.PG` goes on with
+/// `EFER.LME`, and IA-32e paging requires `CR4.PAE` (*Intel SDM* volume 3
+/// §9.8.5), so a processor in long mode is a processor with paging on. The
+/// walk here is therefore four levels of eight-byte entries rather than two of
+/// four, and every column the paged sweep compares is compared again over it.
+///
+/// What is new in this world, beyond the tables:
+///
+/// * **sixteen registers**, all sixty-four bits wide and all compared —
+///   `R8`-`R15` are unreachable without a `REX` prefix, so a 32-bit corpus
+///   cannot touch them;
+/// * **a 64-bit operand size**, at which `ADD`'s carry has no bit above it to
+///   be read from, a shift count masks to six bits rather than five, and
+///   `MUL`/`IMUL` need the double-width product `Opcode::MULU2`/`MULS2`
+///   carries — the two opcodes a 32-bit subset never reached;
+/// * **the doubleword write's zero-extension**, which is the opposite of what
+///   a byte or word write does to the bits above it, and which half the
+///   generated forms drop `REX.W` to exercise;
+/// * **`RIP`-relative addressing**, the one mode whose effective address
+///   depends on the instruction's own length.
+///
+/// What is *not* in this world is a computed near transfer: `RET`, `JMP r/m`
+/// and `CALL r/m` fault on a non-canonical target and a block cannot deliver
+/// that exception, so `lift` refuses them here and the interpreter takes them.
+#[test]
+fn the_same_corpus_agrees_in_long_mode() {
+    let mut total = Coverage::default();
+    for (n, shape) in [Shape::BasicBlock, Shape::Extended, Shape::Trace]
+        .into_iter()
+        .enumerate()
+    {
+        for (m, flags) in [Flags::Eager, Flags::Elide].into_iter().enumerate() {
+            let seed = 0x6400_0000 + (n as u64) * 16 + m as u64;
+            let cov = sweep_long(seed, 400, shape, flags);
+            assert!(
+                cov.agreed > 200,
+                "{shape:?}/{flags:?} long: only {} of 400 cases ran to completion ({} trapped, \
+                 {} lifted nothing)",
+                cov.agreed,
+                cov.trapped,
+                cov.nothing
+            );
+            total.agreed += cov.agreed;
+            total.trapped += cov.trapped;
+            total.nothing += cov.nothing;
+            total.insns += cov.insns;
+        }
+    }
+    assert!(
+        total.trapped > 0,
+        "no long-mode case reached a fault, so the precise-state column was never tested there"
+    );
+    assert!(
+        total.insns > 3_000,
+        "only {} guest instructions retired across the long-mode corpus",
+        total.insns
+    );
+}
+
+/// The long-mode corpus through the translation runtime rather than one block
+/// at a time.
+///
+/// The entry translation is a **four-level** walk here and it happens on every
+/// execution, including a block served from the cache and one reached by
+/// following a patched exit — so a block that skipped its walk the second time
+/// round is a tick divergence here and nowhere else.
+#[test]
+fn the_long_mode_corpus_agrees_through_the_cached_and_chained_runtime() {
+    let mut rng = Lcg(0x6400_beef);
+    let (mut agreed, mut trapped, mut nothing) = (0usize, 0usize, 0usize);
+    for n in 0..400 {
+        let len = 1 + (rng.next() % 12) as usize;
+        let case = Case::seeded(generate_in(&mut rng, len, World::Long)).long();
+        match compare_cached(&case, 32) {
+            Ok(Verdict::Agreed { .. }) => agreed += 1,
+            Ok(Verdict::Trapped { .. }) => trapped += 1,
+            Ok(Verdict::Nothing) => nothing += 1,
+            Err(e) => panic!("cached long case {n} diverged:\n{e}"),
+        }
+    }
+    assert!(
+        agreed > 200,
+        "only {agreed} of 400 cached long cases ran to completion ({trapped} trapped, {nothing} \
+         lifted nothing)"
+    );
+    assert!(trapped > 0, "no cached long case reached a fault");
+}
+
+/// A store into a running block's own page, in long mode.
+///
+/// The same mechanism the paged case proves, with the store's linear page and
+/// the block's physical page still different numbers and the registers now
+/// sixty-four bits wide.
+#[test]
+fn a_long_mode_store_into_a_running_blocks_own_page_is_honoured() {
+    for shape in [Shape::BasicBlock, Shape::Extended, Shape::Trace] {
+        // `mov [rax], bl` with RAX pointing at the instruction two ahead, then
+        // that instruction. `48 ff c6` is `inc rsi`, and `0xc7` turns it into
+        // `inc rdi`.
+        let program = vec![
+            0x88, 0x18, // mov [rax], bl
+            0x90, 0x90, // nop, nop
+            0x48, 0xff, 0xc6, // inc rsi — the byte at 6 is overwritten
+            0xf4,
+        ];
+        let case = Case::new(program)
+            .with_reg(0, rsemu::cpu::x86::differential::BASE + 6)
+            .with_reg(3, 0xc7)
+            .with_shape(shape)
+            .long();
+        let run = measure_cached(&case, 32).unwrap_or_else(|e| panic!("{shape:?} long: {e}"));
+        assert!(
+            matches!(run.verdict, Verdict::Agreed { .. }),
+            "{shape:?} long: {:?}",
+            run.verdict
+        );
+        assert!(
+            run.smc > 0,
+            "{shape:?} long: nothing was invalidated, so the store was never matched against the \
+             block's physical page"
+        );
+    }
 }
 
 #[test]
@@ -403,6 +597,102 @@ fn the_same_corpus_agrees_when_it_is_compiled_to_host_code() {
     );
 }
 
+/// A store that reaches a running block's own page **through the other linear
+/// mapping of it**.
+///
+/// The case the in-block store guard could never have handled, made real: a
+/// long-mode machine maps the four guest pages twice — once at `BASE`, where
+/// the code runs, and once at `HIGH`, where the corpus points its data — so a
+/// store through the high window into the low window's code page names one
+/// physical frame under two linear addresses two and a half tebibytes apart.
+/// A guard comparing linear pages would see the store miss the block's page
+/// and carry on executing bytes that no longer exist.
+///
+/// What makes it work is that both ends of the mechanism are physical:
+/// `Lifted::page` is the page the entry translation resolved to, and the host
+/// notes the physical address its store reached. The assertion that matters is
+/// the last one — without invalidation the block would run the instruction it
+/// was lifted from and the interpreter would run the one the store wrote.
+#[test]
+fn a_store_through_the_other_mapping_of_the_code_page_is_honoured() {
+    use rsemu::cpu::x86::differential::HIGH;
+
+    for shape in [Shape::BasicBlock, Shape::Extended, Shape::Trace] {
+        let program = vec![
+            0x88, 0x18, // mov [rax], bl
+            0x90, 0x90, // nop, nop
+            0x48, 0xff, 0xc6, // inc rsi — the byte at 6 is overwritten
+            0xf4,
+        ];
+        let case = Case::new(program)
+            // The *high* alias of the code page, not the address the block
+            // was entered at.
+            .with_reg(0, HIGH + 6)
+            .with_reg(3, 0xc7) // `48 ff c7` is `inc rdi`
+            .with_shape(shape)
+            .long();
+        let run = measure_cached(&case, 32).unwrap_or_else(|e| panic!("{shape:?} alias: {e}"));
+        assert!(
+            matches!(run.verdict, Verdict::Agreed { .. }),
+            "{shape:?} alias: {:?}",
+            run.verdict
+        );
+        assert!(
+            run.smc > 0,
+            "{shape:?} alias: the store through the other mapping never invalidated a \
+             translation, so the case is not testing what it says it is"
+        );
+    }
+}
+
+/// The **long-mode** corpus, executed as host code.
+///
+/// The only harness in the tree that reaches
+/// [`Opcode::MULU2`](rsemu::ir::Opcode::MULU2) and
+/// [`Opcode::MULS2`](rsemu::ir::Opcode::MULS2) from a real guest: a 64-bit
+/// `MUL` needs a double-width product, no 32-bit encoding produces one, and
+/// `jit::x86`'s `widening_multiply` had never been driven by anything but its
+/// own unit tests. It also puts a 64-bit operand through every lowering the
+/// 32-bit corpus only ever exercised at thirty-two — the popcount behind `PF`,
+/// the extract behind `AF`, both rotates through carry, `bswap`, `clz`, `ctz`
+/// and the shifts, at the width where an off-by-one in a mask is invisible in
+/// the narrower case.
+#[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn the_long_mode_corpus_agrees_when_it_is_compiled_to_host_code() {
+    use rsemu::cpu::x86::differential::measure_compiled;
+
+    let mut rng = Lcg(0x6400_beef);
+    let (mut agreed, mut trapped, mut nothing) = (0usize, 0usize, 0usize);
+    let (mut compiled, mut blocks) = (0u64, 0u64);
+    for n in 0..400 {
+        let len = 1 + (rng.next() % 12) as usize;
+        let case = Case::seeded(generate_in(&mut rng, len, World::Long)).long();
+        match measure_compiled(&case, 32) {
+            Ok(run) => {
+                compiled += run.compiled;
+                blocks += run.blocks as u64;
+                match run.verdict {
+                    Verdict::Agreed { .. } => agreed += 1,
+                    Verdict::Trapped { .. } => trapped += 1,
+                    Verdict::Nothing => nothing += 1,
+                }
+            }
+            Err(e) => panic!("compiled long case {n} diverged:\n{e}"),
+        }
+    }
+    assert!(
+        agreed > 200,
+        "only {agreed} of 400 compiled long cases ran to completion ({trapped} trapped, \
+         {nothing} lifted nothing)"
+    );
+    assert!(trapped > 0, "no compiled long case reached a fault");
+    assert!(
+        compiled * 2 > blocks,
+        "only {compiled} of {blocks} long-mode blocks were executed as host code"
+    );
+}
+
 /// A tight loop: `dec ecx` / `jnz` back to it, entered with a small count.
 ///
 /// Four bytes, wholly inside one page, and the shape that shows what merging
@@ -415,7 +705,7 @@ fn counted_loop(count: u32) -> Case {
         0x75, 0xfd, // 3: hlt
         0xf4,
     ];
-    Case::new(program).with_reg(1, count)
+    Case::new(program).with_reg(1, u64::from(count))
 }
 
 #[test]
@@ -544,7 +834,7 @@ fn an_access_past_the_segment_limit_faults_in_the_same_state_in_both_engines() {
     for shape in [Shape::BasicBlock, Shape::Extended, Shape::Trace] {
         for flags in [Flags::Eager, Flags::Elide] {
             let case = Case::seeded(program.clone())
-                .with_reg(0, (rsemu::cpu::x86::differential::RAM_SIZE - 1) as u32)
+                .with_reg(0, rsemu::cpu::x86::differential::RAM_SIZE - 1)
                 .with_shape(shape)
                 .with_flags(flags);
             let verdict = compare(&case).unwrap_or_else(|e| panic!("{shape:?}/{flags:?}: {e}"));
@@ -579,8 +869,8 @@ fn a_program_of_pure_flag_arithmetic_agrees_bit_for_bit() {
         for shape in [Shape::BasicBlock, Shape::Extended, Shape::Trace] {
             for flags in [Flags::Eager, Flags::Elide] {
                 let case = Case::seeded(program.clone())
-                    .with_reg(0, start)
-                    .with_reg(3, start.rotate_left(13))
+                    .with_reg(0, u64::from(start))
+                    .with_reg(3, u64::from(start.rotate_left(13)))
                     .with_shape(shape)
                     .with_flags(flags);
                 compare(&case).unwrap_or_else(|e| panic!("{start:#x}/{shape:?}/{flags:?}: {e}"));
@@ -625,7 +915,7 @@ fn a_shift_by_cl_agrees_at_every_count_including_zero() {
             let program = vec![0xd3, op, 0xf4];
             let case = Case::seeded(program)
                 .with_reg(0, 0x8123_4567)
-                .with_reg(1, count)
+                .with_reg(1, u64::from(count))
                 .with_eflags(0x0002 | 0x0001);
             compare(&case).unwrap_or_else(|e| panic!("d3 /{op:#x} by {count}: {e}"));
         }

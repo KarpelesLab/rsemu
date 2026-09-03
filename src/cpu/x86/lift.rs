@@ -8,8 +8,8 @@
 //!
 //! # The subset, exactly
 //!
-//! **32-bit protected mode, integer instructions, with or without paging.** A
-//! documented subset done
+//! **32-bit protected mode and 64-bit long mode, integer instructions, with or
+//! without paging.** A documented subset done
 //! exactly beats a broad one done approximately, so the world this frontend
 //! lifts in is checked rather than assumed — [`World::of`] refuses everything
 //! else — and within it the instruction list is closed:
@@ -28,6 +28,9 @@
 //!   `JMP rel8`/`rel32`/`r/m`, all sixteen `Jcc` in both encodings.
 //! * `CLC`, `STC`, `CMC`, `CLD`, `STD`.
 //!
+//! In long mode add `MOVSXD` and subtract the three **computed** near
+//! transfers — see "Long mode" below.
+//!
 //! Everything else ends the block with a terminator that hands the PC back to
 //! the interpreter, which stays the oracle (CLAUDE.md, "CPU cores"). The
 //! exclusions that are *decisions* rather than gaps:
@@ -35,8 +38,9 @@
 //! | Excluded | Why |
 //! | --- | --- |
 //! | x87, SSE, MMX | the IR has no vector ops (`ROADMAP.md` §9 adds them with the SIMD work) and tier-1 floating point is a helper call into soft-float that no x87 entry point exists for yet |
-//! | long mode, `REX` | a second operand-size and address-size lattice on top of the one below, **and a carry the IR cannot compute at this width** — see "Widening the world" |
+//! | `RET`, `JMP r/m`, `CALL r/m` **in long mode only** | `Exec::jump_near` raises `#GP(0)` on a non-canonical target, an exception *at* the transfer with the pre-instruction state restored, and a block whose branches all go forward over an exit cannot deliver it. Below long mode the flat 4 GiB `CS` [`World::of`] insists on discharges the check for every target at once, so the same three are in. A *static* target is examined at lift time instead (`static_target`) |
 //! | real mode and virtual-8086 | `segment << 4 + offset` with a *16-bit offset wrap* is a different address path in `exec`, checked against three million hardware vectors, and generalising it is how that accuracy gets lost |
+//! | compatibility mode's 16-bit code segments, and a `67` address-size prefix in either world | 16-bit addressing inside a 32-bit segment, and 32-bit addressing inside a 64-bit one, are each a second effective-address form for no guest that matters |
 //! | a unified translation buffer | paging itself is **in** the subset now ([`Origin::Paged`]); what is out is paging on a part whose instruction and data translations share one array, where a data operand evicts the code page and the *next fetch* pays for a walk no static analysis can place — see "Paging" |
 //! | [`Smc::Guard`] under paging | the in-block guard compares **linear** pages and two of them may alias one physical page. [`Smc::EndBlock`] is the answer, and [`lift`] refuses the other combination rather than emitting a check that can miss |
 //! | `DIV`, `IDIV` | `#DE` is an exception the block cannot deliver, and the undefined flags come out of `exec::cord`'s trial-subtraction **loop**, which a block with only forward branches cannot express |
@@ -44,7 +48,6 @@
 //! | `LOCK`, `XCHG` with memory | the IR's atomics carry no [`MemOp`], so a byte- or word-wide atomic has no type to name (`ir`'s "Known gaps") |
 //! | segment loads, `LES`/`LDS`/`LSS`, far transfers, `INT`, `IRET`, `HLT` | a descriptor load is a mode change, which `ir`'s decision 4 makes a helper call **and** a hard barrier |
 //! | `PUSHF`/`POPF` | they observe the packed word, and `POPF`'s `IOPL` and `POPF_FORBIDDEN` rules are privilege logic rather than arithmetic. `LAHF`/`SAHF` *are* lifted, so the packed low byte is not untested |
-//! | a `67` address-size prefix | 16-bit addressing inside a 32-bit segment is a second effective-address form for no guest that matters |
 //! | `RCL`/`RCR` by more than one | an N-bit rotate through carry is a loop. See "What the IR could not say" |
 //!
 //! This frontend is the **third** consumer of `isa`'s declarative rows, never a
@@ -300,7 +303,7 @@
 //! the same known gap `cpu::riscv::engine` states, from the same cause, and
 //! it is not made worse or better by paging.
 //!
-//! # Widening the world further: what long mode costs
+//! # Long mode
 //!
 //! **Paging was a prerequisite rather than an alternative**, which is worth
 //! stating because "long mode without paging" sounds like a smaller job and is
@@ -308,36 +311,79 @@
 //! `EFER.LME`, and IA-32e paging requires `CR4.PAE` (*Intel SDM* volume 3
 //! §9.8.5, *AMD64 Architecture Programmer's Manual* volume 2 §14.6). A
 //! processor in long mode is a processor with paging on, always. So the
-//! section above is the first half of this one.
+//! section above is the first half of this one, and the walk here is four
+//! levels of eight-byte entries rather than two of four.
 //!
-//! ## Long mode: `REX` is not the hard part either
+//! ## What it took, and what each of those turned out to be
 //!
-//! The register file and the prefix are mechanical — [`isa::decode_stream_as`]
-//! already decodes `Bits::B64`, because `exec` runs it. Four things behind
-//! them are not:
+//! The prefix and the register file are mechanical — [`isa::decode_stream_as`]
+//! already decodes `Bits::B64`, because `exec` runs it. Five things behind
+//! them were not, and the fifth was not on anyone's list:
 //!
 //! 1. ~~**The carry of a 64-bit `ADD` is bit 64, and there is no `i65`.**~~
-//!    **Done.** `Lifter::add` read `CF` off `self.bit(wide, bits)` — the bit
-//!    *above* the operand's width — which at a 64-bit operand size does not
-//!    exist and would have come out zero; `Lifter::sub` formed `b + borrow`
-//!    and compared against it, which wraps to zero on an all-ones subtrahend
-//!    and turns a borrow into no borrow. Both are now the unsigned-compare
-//!    formulation **at the operand's width** — `r < a || (r == a && carry)`
-//!    for an add, `a < b || (a == b && borrow)` for a subtract — which has no
-//!    width to be wrong at. That is a change to the arithmetic core rather
-//!    than a case beside it, so it is proved where every other flag is: the
-//!    two forms are equal at eight, sixteen and thirty-two bits, and
-//!    [`differential`](super::differential)'s corpus runs them.
-//! 2. **A 64-bit `MUL` needs [`Opcode::MULU2`]/[`Opcode::MULS2`]**, which
-//!    "What the IR could not say" below records as unexercised precisely
-//!    because a 32-bit subset never reaches them.
-//! 3. **The slot numbering doubles.** Sixteen general registers pushes `RIP`
+//!    **Done, before this round.** `Lifter::add` read `CF` off
+//!    `self.bit(wide, bits)` — the bit *above* the operand's width — which at
+//!    a 64-bit operand size does not exist and would have come out zero;
+//!    `Lifter::sub` formed `b + borrow` and compared against it, which wraps
+//!    to zero on an all-ones subtrahend and turns a borrow into no borrow.
+//!    Both are now the unsigned-compare formulation **at the operand's
+//!    width** — `r < a || (r == a && carry)` for an add,
+//!    `a < b || (a == b && borrow)` for a subtract — which has no width to be
+//!    wrong at.
+//!
+//!    **`SHL` had the same hole and it was still open.** Its carry was bit
+//!    `bits` of the unmasked product, which at sixty-four bits is the bit that
+//!    does not exist; it now comes off the *source* instead, as bit `64 - n`
+//!    of the operand for the `n` in 1..=63 a shift that writes anything can
+//!    have. Same bug, same shape, one function further along.
+//! 2. **A 64-bit `MUL` needs [`Opcode::MULU2`]/[`Opcode::MULS2`]**, the
+//!    double-width multiply "What the IR could not say" recorded as
+//!    unexercised precisely because a 32-bit subset never reaches it.
+//!    `Lifter::product` is where the two paths meet: below sixty-four bits
+//!    the halves are a mask and a shift of one [`Type::I64`] product, and at
+//!    sixty-four they are the two results of one op. `IMUL`'s "does the
+//!    product fit" test follows: `Exec` compares the truncated result
+//!    sign-extended against the full product, and with the halves in hand the
+//!    same statement is that the high half is the low half's sign fill — which
+//!    is the only one of the two forms that can be made at all when the
+//!    product is 128 bits and no temporary holds it.
+//! 3. **The slot numbering doubles.** Sixteen general registers pushed `RIP`
 //!    and the six flags up the numbering, which every consumer of
-//!    [`SLOT_COUNT`] and [`FLAG_SLOTS`] — [`differential`](super::differential)
-//!    included — reads.
+//!    [`SLOT_COUNT`] and [`FLAG_SLOTS`] reads — [`differential`](super::differential)
+//!    and `benches/x86_dispatch`, and **nothing else**. That last part is
+//!    worth writing down because it is the opposite of what a renumbering here
+//!    looks like it should touch: the numbering is this frontend's private
+//!    contract with its own host, so the x86 **snapshot** never sees it —
+//!    `cpu::x86`'s `save`/`load`, its chunk version, `host::gdb::arch`'s
+//!    `verified_version` and `accel::state` are all untouched by this file.
+//!    It is sixteen slots in *both* worlds rather than eight that become
+//!    sixteen: below long mode the decoder cannot produce a register number
+//!    above seven, so the top half is simply never bound, and one numbering
+//!    that always holds is cheaper than two that have to agree.
 //! 4. **`RIP`-relative addressing makes the effective address depend on the
-//!    instruction's own length**, and `Lifter`'s effective-address helper masks
-//!    every sum to thirty-two bits.
+//!    instruction's own length.** Both halves are lift-time constants, so the
+//!    whole address is one — see `Lifter::ea` — and the effective-address
+//!    helper's thirty-two-bit mask became [`World::addr_mask`], which is the
+//!    identity at sixty-four.
+//! 5. **A computed near transfer cannot be lifted here.** Not on the list, and
+//!    it is the one thing long mode *removes* from the subset: below it the
+//!    flat 4 GiB `CS` [`World::of`] insists on means a computed `RET` or
+//!    `JMP r/m` has no target to reject, and in it `Exec::jump_near` raises
+//!    `#GP(0)` on a non-canonical one — an exception at the transfer, with the
+//!    pre-instruction state restored, which a block with only forward branches
+//!    over an exit cannot deliver. A *static* target is checked at lift time
+//!    (`static_target`) and a computed one ends the block, so the
+//!    interpreter takes it. Making it liftable means a side exit taken before
+//!    any state is bound, which is expressible and is a separate change.
+//!
+//! ## Two masks that are not the same mask
+//!
+//! Worth separating because conflating them is a wrap bug: [`World::addr_mask`]
+//! is the width **addresses and the program counter** wrap at, and
+//! `count_mask` is how much of a **shift count** the operand looks at. The
+//! second is five bits at every operand size except sixty-four, where it is
+//! six — the one place in the instruction set where the mask is not a constant
+//! (*Intel SDM* volume 2, `SAL/SAR/SHL/SHR`).
 //!
 //! ## And it is not sufficient on its own
 //!
@@ -433,10 +479,15 @@
 //!
 //! | Slot | State | Held as |
 //! | --- | --- | --- |
-//! | `0..=7` | `EAX`..`EDI` in ModRM order ([`r_slot`]) | the 32-bit value, zero-extended |
-//! | `8` | `EIP` ([`EIP`]) | the 32-bit value |
-//! | `9..=14` | `CF PF AF ZF SF OF` ([`FLAG_SLOTS`]) | 0 or 1 |
-//! | `15` | everything else in `EFLAGS` ([`EFLAGS_REST`]) | `eflags & !`[`ARITH_MASK`] |
+//! | `0..=15` | `RAX`..`RDI` then `R8`..`R15` in ModRM order ([`r_slot`]) | the architectural register, zero-extended |
+//! | `16` | the program counter ([`RIP`]) | `EIP` below long mode, `RIP` in it |
+//! | `17..=22` | `CF PF AF ZF SF OF` ([`FLAG_SLOTS`]) | 0 or 1 |
+//! | `23` | everything else in `EFLAGS` ([`EFLAGS_REST`]) | `eflags & !`[`ARITH_MASK`] |
+//!
+//! Sixteen registers in both worlds. A 32-bit encoding cannot name a register
+//! number above seven — the decoder never sets a `REX` field there — so the
+//! top eight are simply never bound, and one numbering is cheaper than two
+//! that have to agree.
 //!
 //! Segment registers and their hidden descriptors have no slots because
 //! nothing in the subset writes one, and their bases are lift-time constants
@@ -463,22 +514,29 @@
 //!   for. The same gap the atomics have, from the same cause: there is no
 //!   `i8` or `i16`. `RCL`/`RCR` by one is therefore lifted by hand as a shift,
 //!   an or and a bit test, and by more than one is out of the subset.
-//! * **A 128-bit widening multiply is not needed and a 64-bit one is not
-//!   used.** Every product in a 32-bit subset fits in [`Type::I64`], so
-//!   [`Opcode::MULU2`] and [`Opcode::MULS2`] stay unexercised here; they would
-//!   be what a 64-bit `MUL` lowers to.
-//! * **Arithmetic is at [`Type::I64`] whatever the operand size**, because
-//!   `CF` is the bit *above* the operand's width and an `i32` add loses it.
-//!   The 8- and 16-bit forms would want an `i8`/`i16` and the 32-bit form an
-//!   `i33`; one type that holds all three is the honest answer, and every
-//!   result is masked back to its operand width before it becomes state.
+//! * ~~**A 128-bit widening multiply is not needed and a 64-bit one is not
+//!   used.**~~ Half of that is still true and the other half is not. Every
+//!   product in a *32-bit* subset fits in [`Type::I64`], so the narrow forms
+//!   still lower to one [`Opcode::MUL`] and a shift; a 64-bit `MUL` or `IMUL`
+//!   lowers to [`Opcode::MULU2`]/[`Opcode::MULS2`], which is what they were
+//!   put in the op list for. A **128-bit** widening multiply is still not
+//!   needed and `ir::interp` still refuses one, because no guest asks.
+//! * **Arithmetic is at [`Type::I64`] whatever the operand size.** It began
+//!   as a workaround — `CF` was the bit *above* the operand's width and an
+//!   `i32` add loses it — and the flags no longer need the extra bit, but the
+//!   choice is still the right one: every result is masked back to its operand
+//!   width before it becomes state, and at a 64-bit operand that mask is the
+//!   identity and `Lifter::mask_to` leaves it out. What the IR still cannot
+//!   say is an `i8` or an `i16`, which is why `RCL`/`RCR` and the atomics have
+//!   no type to name.
 //!
 //! # How this is known to be right
 //!
 //! It is not, on its own. [`differential`](super::differential) is the
-//! harness — one guest program through both engines, comparing the eight
-//! registers, `EIP`, all six flags, the tick count, the block's static tick
-//! column, guest RAM byte for byte, and whether both agreed about faulting —
+//! harness — one guest program through both engines, comparing all sixteen
+//! registers at their full width, the program counter, all six flags, the tick
+//! count, the block's static tick column, guest RAM byte for byte, and whether
+//! both agreed about faulting —
 //! driven from a generated corpus in `tests/x86_lift_differential.rs` and from
 //! `fuzz/fuzz_targets/x86_lift.rs`. The tests at the bottom of this file
 //! assert the *shape* of what is emitted; the harness asserts the meaning.
@@ -515,43 +573,51 @@ use super::{Config, Regs, Variant, flags};
 
 /// The slot holding general register `n`, in ModRM order.
 ///
-/// `0` is `EAX`, `4` is `ESP`, `7` is `EDI`. The value is the architectural
-/// 32-bit register, zero-extended into the slot.
+/// `0` is `RAX`, `4` is `RSP`, `7` is `RDI`, and `8`-`15` are `R8`-`R15`,
+/// which only a `REX` prefix can name. The value is the architectural
+/// register at the part's own width, zero-extended into the slot: thirty-two
+/// bits below long mode, sixty-four in it.
+///
+/// **Sixteen slots whatever the mode**, rather than eight that become sixteen.
+/// The numbering is in [`Block::key`] by way of nothing at all — it is the
+/// frontend's private contract with its host — so a host sized for eight and
+/// a block that names slot twelve is a panic rather than a divergence, and
+/// one numbering that always holds is cheaper than two that must agree.
 #[inline]
 #[must_use]
 pub const fn r_slot(n: u8) -> RegSlot {
-    RegSlot((n & 7) as u16)
+    RegSlot((n & 15) as u16)
 }
 
-/// The slot holding `EIP`.
+/// The slot holding the program counter — `EIP`, or `RIP` in long mode.
 ///
 /// Bound only at a block's exit boundary; at every other boundary the program
 /// counter is [`InsnStart::pc`] and a temporary for it would be a second
 /// source of truth.
-pub const EIP: RegSlot = RegSlot(8);
+pub const RIP: RegSlot = RegSlot(16);
 
 /// The carry flag.
-pub const CF: RegSlot = RegSlot(9);
+pub const CF: RegSlot = RegSlot(17);
 /// The parity flag.
-pub const PF: RegSlot = RegSlot(10);
+pub const PF: RegSlot = RegSlot(18);
 /// The auxiliary-carry flag.
-pub const AF: RegSlot = RegSlot(11);
+pub const AF: RegSlot = RegSlot(19);
 /// The zero flag.
-pub const ZF: RegSlot = RegSlot(12);
+pub const ZF: RegSlot = RegSlot(20);
 /// The sign flag.
-pub const SF: RegSlot = RegSlot(13);
+pub const SF: RegSlot = RegSlot(21);
 /// The overflow flag.
-pub const OF: RegSlot = RegSlot(14);
+pub const OF: RegSlot = RegSlot(22);
 
 /// Everything in `EFLAGS` that is not one of the six arithmetic flags.
 ///
 /// Held as `eflags & !`[`ARITH_MASK`], so the six that *are* modelled
 /// separately never appear twice. `CLD` and `STD` are the only instructions in
 /// the subset that write it, and `LAHF` the only one that reads it.
-pub const EFLAGS_REST: RegSlot = RegSlot(15);
+pub const EFLAGS_REST: RegSlot = RegSlot(23);
 
 /// One past the highest slot this frontend numbers.
-pub const SLOT_COUNT: u16 = 16;
+pub const SLOT_COUNT: u16 = 24;
 
 /// The six arithmetic flag slots, in this frontend's own order.
 pub const FLAG_SLOTS: [RegSlot; 6] = [CF, PF, AF, ZF, SF, OF];
@@ -651,20 +717,21 @@ impl Origin {
 
     /// The bits this origin contributes to [`key`], above the policies.
     ///
-    /// Bit 7 separates the two worlds, so a flat lift and a paged lift of the
-    /// same address never collide; above bit 8 sits the physical address or
+    /// Bit 8 separates the two worlds, so a flat lift and a paged lift of the
+    /// same address never collide; above bit 9 sits the physical address or
     /// the world generation.
     ///
-    /// Exact until either passes 2^56 — the bound
-    /// `cpu::riscv::lift::Origin::key_bits` states for the same encoding. For
-    /// the physical address that bound is unreachable rather than merely
-    /// distant: a page-table entry carries a 52-bit frame
+    /// Exact until either passes 2^55 — the bound
+    /// `cpu::riscv::lift::Origin::key_bits` states for the same encoding, one
+    /// bit lower here because [`key`] spends bit 7 on the code segment's
+    /// width. For the physical address that bound is unreachable rather than
+    /// merely distant: a page-table entry carries a 52-bit frame
     /// ([`pte::FRAME64`](super::paging::pte)), so no address this core can
     /// produce reaches it.
     const fn key_bits(self, generation: u64) -> u64 {
         match self {
-            Origin::Flat => generation.wrapping_shl(8),
-            Origin::Paged { phys } => (1 << 7) | phys.wrapping_shl(8),
+            Origin::Flat => generation.wrapping_shl(9),
+            Origin::Paged { phys } => (1 << 8) | phys.wrapping_shl(9),
         }
     }
 }
@@ -688,6 +755,14 @@ impl Origin {
 pub struct World {
     /// Which part this is: the opcode map, the clock table and the flag mask.
     pub variant: Variant,
+    /// The width the code segment is decoded at.
+    ///
+    /// [`Bits::B32`] for a 32-bit protected-mode segment and [`Bits::B64`] in
+    /// long mode; a 16-bit one is refused by [`World::of`]. It is not a policy
+    /// but a *fact about `CS`*, and it decides the decoder's defaults, the
+    /// width of every address the block computes, and how far the program
+    /// counter wraps — so it is in [`key`] beside the world generation.
+    pub bits: Bits,
     /// `CS.base`, added to `EIP` to reach the linear address of a fetch.
     pub cs_base: u64,
     /// The cached base of each of the six segment registers.
@@ -740,16 +815,33 @@ impl World {
         if !sys.protected() || regs.flag(flags::VM) {
             return None;
         }
-        // Long mode would need `REX` and a third operand-size lattice.
-        if sys.sixty_four() {
-            return None;
-        }
+        // Long mode is in the subset, and it is a *different* set of
+        // conditions rather than more of the same ones: `CS` has no base and
+        // no limit there, the stack pointer is `RSP` whatever any descriptor
+        // says, and the checks below about a flat 4 GiB code segment and a
+        // 32-bit stack are all statements about segmentation that 64-bit mode
+        // has already discharged (*Intel SDM* volume 3 §3.4.4). Whether the
+        // part has long mode at all is a property of the instance — `Exec`
+        // decodes `Bits::B64` only when `Features::long` is set — so it is
+        // asked of the configuration and not of the part number.
+        let long = cfg.features.long && sys.sixty_four();
         // Paging is in the subset, and the origin has to say the same thing
         // the control registers do: a caller that claimed `Origin::Flat` on a
         // paged core would get a block keyed as though a linear address were a
         // physical one, which is the stale-translation bug this type exists to
         // make unstatable.
         if sys.paging() != origin.paged() {
+            return None;
+        }
+        // A processor in long mode is a processor with paging on, always:
+        // `EFER.LMA` is set only when `CR0.PG` goes on with `EFER.LME`, and
+        // IA-32e paging requires `CR4.PAE` (*Intel SDM* volume 3 §9.8.5). The
+        // control-register writes maintain that, so this cannot fire from
+        // anything a guest did — it is here because it is what makes the
+        // translation-buffer refusal below reach *every* long-mode world, and
+        // an invariant a later check depends on is worth stating rather than
+        // inferring.
+        if long && !sys.paging() {
             return None;
         }
         // A part whose instruction and data translations share one array —
@@ -763,31 +855,47 @@ impl World {
             return None;
         }
         let cs = sys.seg(seg::CS);
-        // A 32-bit code segment: `Bits::B32` is what the decoder is driven
-        // with, and a 16-bit one would decode entirely differently.
-        if !cs.big() {
-            return None;
+        if !long {
+            // A 32-bit code segment: `Bits::B32` is what the decoder is driven
+            // with, and a 16-bit one would decode entirely differently.
+            if !cs.big() {
+                return None;
+            }
+            // A flat code segment. `Exec::jump_near` raises `#GP` for a target
+            // outside `CS`, and a *computed* transfer — `RET`, `JMP r/m` —
+            // would then need a conditional exception this IR cannot express.
+            // With a 4 GiB segment the check is discharged for every target at
+            // once. Long mode has no such trick, which is why a computed near
+            // transfer is out of the subset there rather than checked here —
+            // see [`classify`].
+            if cs.limit != 0xffff_ffff {
+                return None;
+            }
+            // A 32-bit stack. `Exec::set_sp` preserves the bits the stack's
+            // width does not reach, so a 16-bit stack makes every push a
+            // deposit and every pop a partial write. In 64-bit mode the stack
+            // pointer is `RSP` and no descriptor can say otherwise.
+            if !sys.seg(seg::SS).big() {
+                return None;
+            }
         }
-        // A flat code segment. `Exec::jump_near` raises `#GP` for a target
-        // outside `CS`, and a *computed* transfer — `RET`, `JMP r/m` — would
-        // then need a conditional exception this IR cannot express. With a
-        // 4 GiB segment the check is discharged for every target at once.
-        if cs.limit != 0xffff_ffff {
-            return None;
-        }
-        // A 32-bit stack. `Exec::set_sp` preserves the bits the stack's width
-        // does not reach, so a 16-bit stack makes every push a deposit and
-        // every pop a partial write.
-        if !sys.seg(seg::SS).big() {
-            return None;
-        }
+        // The six segment bases. In 64-bit mode four of them are *defined* to
+        // be zero however the descriptor cache still reads, and `FS` and `GS`
+        // take theirs from an MSR rather than from a descriptor — which is the
+        // rule `Exec::seg_linear` follows, so it is the rule here.
         let mut seg_base = [0u64; seg::COUNT];
         for (n, base) in seg_base.iter_mut().enumerate() {
-            *base = sys.seg(n as u8).base;
+            *base = match (long, n as u8) {
+                (true, seg::FS) => sys.fs_base,
+                (true, seg::GS) => sys.gs_base,
+                (true, _) => 0,
+                (false, sr) => sys.seg(sr).base,
+            };
         }
         Some(World {
             variant,
-            cs_base: cs.base,
+            bits: if long { Bits::B64 } else { Bits::B32 },
+            cs_base: if long { 0 } else { cs.base },
             seg_base,
             // A property of the *instance* rather than of the part number
             // (`ROADMAP.md` §6.1.1): `Exec` raises `#UD` for a `CMOVcc` when
@@ -821,6 +929,27 @@ impl World {
     #[must_use]
     pub const fn linear(&self, eip: u64) -> u64 {
         self.cs_base.wrapping_add(eip)
+    }
+
+    /// Whether this is long mode's world, which is the one question the rest
+    /// of the file asks of [`World::bits`].
+    #[inline]
+    #[must_use]
+    pub const fn long(&self) -> bool {
+        self.bits.is_64()
+    }
+
+    /// The mask an address — and the program counter — wraps at.
+    ///
+    /// Thirty-two bits below long mode and sixty-four in it. Every sum this
+    /// frontend forms is computed at [`Type::I64`] and masked with this at the
+    /// end, which is exact because each term is already inside the width;
+    /// widening first and never masking is the wrap bug CLAUDE.md's
+    /// "Arithmetic" section names.
+    #[inline]
+    #[must_use]
+    pub const fn addr_mask(&self) -> u64 {
+        if self.long() { u64::MAX } else { 0xffff_ffff }
     }
 }
 
@@ -958,6 +1087,12 @@ pub fn key(world: &World, shape: Shape, smc: Smc, flags: Flags) -> u64 {
         | flags.key_bits()
         | (u64::from(world.cmov) << 4)
         | (variant << 5)
+        // Bit 7: the code segment's width. One part runs both worlds — an
+        // x86-64 in 32-bit protected mode and the same part in long mode are
+        // the same `Variant` — and the same bytes at the same address decode
+        // to different instructions in each, so the number that names the part
+        // cannot name the world.
+        | (u64::from(world.long()) << 7)
         | world.origin.key_bits(world.generation)
 }
 
@@ -1084,7 +1219,10 @@ pub fn lift<S: InsnSource>(
     let mut lf = Lifter::new(world, entry_eip, shape, smc, flag_policy);
     let page = lf.page;
     let map = world.variant.map();
-    let mut eip = entry_eip & 0xffff_ffff;
+    // The program counter wraps where the mode says: `EIP` at thirty-two bits
+    // and `RIP` at sixty-four, which is what `Exec::fetch_byte` does with it.
+    let pc_mask = world.addr_mask();
+    let mut eip = entry_eip & pc_mask;
     let mut insns = 0usize;
 
     let stop = loop {
@@ -1103,7 +1241,7 @@ pub fn lift<S: InsnSource>(
         let mut off_page = false;
         let fields = {
             let src = &mut *src;
-            isa::decode_stream_as(map, Bits::B32, &mut || {
+            isa::decode_stream_as(map, world.bits, &mut || {
                 if at & !PAGE_MASK != page {
                     off_page = true;
                     return None;
@@ -1127,7 +1265,7 @@ pub fn lift<S: InsnSource>(
             break Stop::Unsupported;
         }
 
-        let next_eip = eip.wrapping_add(u64::from(fields.len)) & 0xffff_ffff;
+        let next_eip = eip.wrapping_add(u64::from(fields.len)) & pc_mask;
         match lf.insn(&fields, eip, next_eip) {
             Flow::Rejected => break Stop::Unsupported,
             Flow::Continue(next) => {
@@ -1349,7 +1487,10 @@ struct Lifter<'a> {
     /// **This is the trace's register allocation.** It survives a merged
     /// branch untouched, so a value computed before a `JMP` is still in a
     /// temporary after it rather than having gone out to a slot and come back.
-    r: [Option<Temp>; 8],
+    ///
+    /// Sixteen entries in both worlds. Below long mode the decoder cannot
+    /// produce a number above seven, so the top half is simply never bound.
+    r: [Option<Temp>; 16],
     /// Which temporary holds each of the six arithmetic flags.
     fl: [Option<Temp>; 6],
     /// Which temporary holds the rest of `EFLAGS`.
@@ -1360,6 +1501,10 @@ struct Lifter<'a> {
     bit1: Option<Temp>,
     /// The effective address of the instruction being lifted, computed once.
     ea: Option<(u8, Temp)>,
+    /// Where the instruction being lifted ends, which is the value `RIP` holds
+    /// while its effective address is computed — and therefore the base of a
+    /// `RIP`-relative operand.
+    next_pc: u64,
     /// Where a self-modifying-code exit inside this instruction resumes.
     resume: Resume,
     /// Ticks charged so far, counted from block entry.
@@ -1378,14 +1523,18 @@ impl<'a> Lifter<'a> {
             smc,
             policy,
             page: world.linear(entry_eip) & !PAGE_MASK,
-            b: BlockBuilder::new(entry_eip & 0xffff_ffff, key(world, shape, smc, policy)),
-            r: [None; 8],
+            b: BlockBuilder::new(
+                entry_eip & world.addr_mask(),
+                key(world, shape, smc, policy),
+            ),
+            r: [None; 16],
             fl: [None; 6],
             rest: None,
             zero: None,
             bit0: None,
             bit1: None,
             ea: None,
+            next_pc: 0,
             resume: Resume { at: 0, pc: None },
             ticks: 0,
             pc_out: None,
@@ -1474,6 +1623,21 @@ impl<'a> Lifter<'a> {
         self.b.binary(Opcode::AND, Type::I64, v, k)
     }
 
+    /// `v` narrowed to `mask`, which at sixty-four bits is `v` itself.
+    ///
+    /// Every temporary here is [`Type::I64`] whatever the operand size, so a
+    /// mask of all ones is the identity — and emitting it anyway would put an
+    /// `and` in front of every 64-bit result for dead-code elimination to
+    /// carry. The masks below 2^64 are load-bearing and are not optional; this
+    /// is the one that says nothing.
+    fn mask_to(&mut self, v: Temp, mask: u64) -> Temp {
+        if mask == u64::MAX {
+            v
+        } else {
+            self.and_const(v, mask)
+        }
+    }
+
     fn shl_const(&mut self, v: Temp, n: u32) -> Temp {
         let k = self.konst(u64::from(n));
         self.b.binary(Opcode::SHL, Type::I64, v, k)
@@ -1507,7 +1671,7 @@ impl<'a> Lifter<'a> {
     // -- guest state -----------------------------------------------------
 
     fn read_r(&mut self, n: u8) -> Temp {
-        let n = (n & 7) as usize;
+        let n = (n & 15) as usize;
         match self.r[n] {
             Some(t) => t,
             None => {
@@ -1519,7 +1683,7 @@ impl<'a> Lifter<'a> {
     }
 
     fn write_r(&mut self, n: u8, t: Temp) {
-        self.r[(n & 7) as usize] = Some(t);
+        self.r[(n & 15) as usize] = Some(t);
     }
 
     fn read_flag(&mut self, i: usize) -> Temp {
@@ -1548,14 +1712,22 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Read a general register at 1, 2 or 4 bytes.
+    /// Read a general register at 1, 2, 4 or 8 bytes.
     ///
-    /// The byte encoding is the one with no `REX` prefix, which this subset
-    /// never has: numbers 0-3 are `AL`-`BL` and 4-7 are `AH`-`BH`, so `AH` is
-    /// register four and not one — which is exactly why
-    /// [`Opcode::EXTRACT`]'s documentation names x86.
-    fn read_reg(&mut self, index: u8, size: u8) -> Temp {
+    /// `rex` decides what a byte-sized register number means, and it decides
+    /// nothing else. Without a `REX` prefix numbers 0-3 are `AL`-`BL` and 4-7
+    /// are `AH`-`BH`, so `AH` is register four and not one — which is exactly
+    /// why [`Opcode::EXTRACT`]'s documentation names x86. With **any** `REX`
+    /// prefix, including a `40` that sets no bit at all, the same four numbers
+    /// become `SPL`, `BPL`, `SIL` and `DIL` (*Intel SDM* volume 2 §2.2.1.2).
+    /// `Regs::read` takes the same flag for the same reason, and this mirrors
+    /// it because the differential comparison is against that function.
+    fn read_reg(&mut self, index: u8, size: u8, rex: bool) -> Temp {
         match size {
+            1 if rex => {
+                let whole = self.read_r(index);
+                self.extract(whole, 0, 8)
+            }
             1 => {
                 let pos = if index & 4 == 0 { 0 } else { 8 };
                 let whole = self.read_r(index & 3);
@@ -1565,17 +1737,35 @@ impl<'a> Lifter<'a> {
                 let whole = self.read_r(index);
                 self.extract(whole, 0, 16)
             }
+            // A slot holds the architectural register, so below long mode it
+            // *is* the doubleword and nothing has to be taken out of it. In
+            // long mode it is the quadword and a 32-bit read is a field of it.
+            4 if self.world.long() => {
+                let whole = self.read_r(index);
+                self.extract(whole, 0, 32)
+            }
             _ => self.read_r(index),
         }
     }
 
-    /// Write a general register at 1, 2 or 4 bytes.
+    /// Write a general register at 1, 2, 4 or 8 bytes.
     ///
-    /// A narrow write **preserves** the bits above it, which is the 386's rule
-    /// and not a convenience: `mov ax, 0` leaves the top of `EAX` alone, and
-    /// code that switches operand sizes depends on it.
-    fn write_reg(&mut self, index: u8, size: u8, value: Temp) {
+    /// A byte or word write **preserves** the bits above it, which is the
+    /// 386's rule and not a convenience: `mov ax, 0` leaves the top of `EAX`
+    /// alone, and code that switches operand sizes depends on it. A
+    /// **doubleword** write does the opposite and zeroes the upper half
+    /// (*Intel SDM* volume 1 §3.4.1.1), which is the asymmetry that makes
+    /// `mov eax, eax` a truncation in long mode — and it needs no case here,
+    /// because a value that becomes a register is already masked to its
+    /// operand's width and a rebinding of the whole slot is therefore already
+    /// the zero-extension.
+    fn write_reg(&mut self, index: u8, size: u8, rex: bool, value: Temp) {
         match size {
+            1 if rex => {
+                let old = self.read_r(index);
+                let merged = self.deposit(old, value, 0, 8);
+                self.write_r(index, merged);
+            }
             1 => {
                 let pos = if index & 4 == 0 { 0 } else { 8 };
                 let old = self.read_r(index & 3);
@@ -1713,7 +1903,7 @@ impl<'a> Lifter<'a> {
             None => self.konst(resume.at),
         };
         let mut live = self.live_state(0);
-        live.push((EIP, target));
+        live.push((RIP, target));
         self.b.insn_start(InsnStart {
             pc: resume.at,
             next_pc: resume.at,
@@ -1760,18 +1950,32 @@ impl<'a> Lifter<'a> {
     /// The effective address this instruction's memory operand names, computed
     /// once and cached for the instruction.
     ///
-    /// Every term is summed at [`Type::I64`] and the sum masked to thirty-two
-    /// bits at the end. That is exact rather than a shortcut: each term is
-    /// below 2^32, so the 64-bit sum's low thirty-two bits are the 32-bit
-    /// wrapping sum. What would *not* be exact is widening a term and never
-    /// masking the sum, which is the wrap bug CLAUDE.md's "Arithmetic" section
-    /// names.
+    /// Every term is summed at [`Type::I64`] and the sum masked to the address
+    /// size at the end. That is exact rather than a shortcut: each term is
+    /// already inside the width, so the 64-bit sum's low bits are the wrapping
+    /// sum at that width. What would *not* be exact is widening a term and
+    /// never masking the sum, which is the wrap bug CLAUDE.md's "Arithmetic"
+    /// section names — and at an address size of eight the mask is the
+    /// identity, so the sum is the answer.
+    ///
+    /// `RIP`-relative addressing is the one mode whose address depends on the
+    /// instruction's own **length**: `mod == 00` with `r/m == 101` stopped
+    /// being an absolute `disp32` in long mode and became the displacement
+    /// added to the address of the *next* instruction (*Intel SDM* volume 2
+    /// §2.2.1.6). Both halves are lift-time constants, so the whole address is
+    /// one — which is why it is a case here rather than a term summed with the
+    /// others, and why [`Lifter::next_pc`] exists at all.
     fn ea(&mut self, f: &Fields) -> (u8, Temp) {
         if let Some(cached) = self.ea {
             return cached;
         }
         let sr = f.mem_segment();
+        let mask = self.world.addr_mask();
         let addr = match f.modrm {
+            _ if f.rip_relative => {
+                let at = self.next_pc.wrapping_add(f.disp as i64 as u64) & mask;
+                self.konst(at)
+            }
             Some(m) if !m.is_register() => {
                 let mut terms: Option<Temp> = None;
                 if m.rm == 4 {
@@ -1805,7 +2009,7 @@ impl<'a> Lifter<'a> {
                     }
                     (None, d) => self.konst(d),
                 };
-                self.and_const(sum, 0xffff_ffff)
+                self.mask_to(sum, mask)
             }
             // `Ob`/`Ov`: the address is the immediate and there is no ModRM
             // byte at all. A ModRM byte that selects a *register* reaches here
@@ -1813,7 +2017,7 @@ impl<'a> Lifter<'a> {
             // field of three, which a 386 answers with the address it never
             // computed — and `Exec::ea` answers zero for the same reason.
             Some(_) => self.zero(),
-            None => self.konst(f.imm & 0xffff_ffff),
+            None => self.konst(f.imm & mask_of(f.addrsize)),
         };
         self.ea = Some((sr, addr));
         (sr, addr)
@@ -1830,18 +2034,23 @@ impl<'a> Lifter<'a> {
     fn read_arg(&mut self, f: &Fields, arg: Arg, size: u8) -> Option<Temp> {
         let t = match arg {
             Arg::Eb | Arg::Ev | Arg::Ew | Arg::Ed => match f.modrm {
-                Some(m) if m.is_register() => self.read_reg(f.rm_num(), size),
+                Some(m) if m.is_register() => self.read_reg(f.rm_num(), size, f.has_rex()),
                 _ => {
                     let (sr, addr) = self.ea(f);
                     self.mem_load(sr, addr, size)
                 }
             },
-            Arg::Gb | Arg::Gv | Arg::Gw => self.read_reg(f.reg_num(), size),
+            Arg::Gb | Arg::Gv | Arg::Gw => self.read_reg(f.reg_num(), size, f.has_rex()),
             Arg::Ib | Arg::Iw | Arg::Iv | Arg::Iz | Arg::Ibs => self.konst(f.imm & mask_of(size)),
-            Arg::Rb | Arg::Rv => self.read_reg(f.opcode_reg(), size),
-            Arg::Al => self.read_reg(0, 1),
-            Arg::Ax => self.read_reg(0, size),
-            Arg::Cl => self.read_reg(1, 1),
+            Arg::Rb | Arg::Rv => self.read_reg(f.opcode_reg(), size, f.has_rex()),
+            // `AL` and `CL` are named by the opcode rather than by a register
+            // field, so no `REX` bit reaches them and they are the legacy
+            // encoding whatever prefix the instruction carries — which is what
+            // `Exec::read_arg` says by reaching for `Regs::byte` there and for
+            // `Regs::read` everywhere else.
+            Arg::Al => self.read_reg(0, 1, false),
+            Arg::Ax => self.read_reg(0, size, f.has_rex()),
+            Arg::Cl => self.read_reg(1, 1, false),
             Arg::One => self.konst(1),
             // `LEA`'s operand is the address itself, never what is there.
             Arg::M => self.ea(f).1,
@@ -1858,17 +2067,17 @@ impl<'a> Lifter<'a> {
     fn write_arg(&mut self, f: &Fields, arg: Arg, size: u8, value: Temp) -> bool {
         match arg {
             Arg::Eb | Arg::Ev | Arg::Ew | Arg::Ed => match f.modrm {
-                Some(m) if m.is_register() => self.write_reg(f.rm_num(), size, value),
+                Some(m) if m.is_register() => self.write_reg(f.rm_num(), size, f.has_rex(), value),
                 _ => {
                     let (sr, addr) = self.ea(f);
                     self.mem_store(sr, addr, value, size);
                 }
             },
-            Arg::Gb | Arg::Gv | Arg::Gw => self.write_reg(f.reg_num(), size, value),
-            Arg::Rb | Arg::Rv => self.write_reg(f.opcode_reg(), size, value),
-            Arg::Al => self.write_reg(0, 1, value),
-            Arg::Ax => self.write_reg(0, size, value),
-            Arg::Cl => self.write_reg(1, 1, value),
+            Arg::Gb | Arg::Gv | Arg::Gw => self.write_reg(f.reg_num(), size, f.has_rex(), value),
+            Arg::Rb | Arg::Rv => self.write_reg(f.opcode_reg(), size, f.has_rex(), value),
+            Arg::Al => self.write_reg(0, 1, false, value),
+            Arg::Ax => self.write_reg(0, size, f.has_rex(), value),
+            Arg::Cl => self.write_reg(1, 1, false, value),
             Arg::Ob | Arg::Ov => {
                 let (sr, addr) = self.ea(f);
                 self.mem_store(sr, addr, value, size);
@@ -1943,7 +2152,7 @@ impl<'a> Lifter<'a> {
                 self.b.binary(Opcode::ADD, Type::I64, partial, c64)
             }
         };
-        let r = self.and_const(wide, mask);
+        let r = self.mask_to(wide, mask);
         // The carry out, as an unsigned comparison **at the operand's width**
         // rather than as the bit above it. `r < a`, or `r == a` with a carry
         // in — because the true sum is `r + CF * 2^n`, so the only way a
@@ -1988,7 +2197,7 @@ impl<'a> Lifter<'a> {
             }
         };
         let diff = self.b.binary(Opcode::SUB, Type::I64, a, rhs);
-        let r = self.and_const(diff, mask);
+        let r = self.mask_to(diff, mask);
         // The borrow out, at the operand's width and never through `rhs`.
         // `a < b + borrow` is the definition, and forming that sum is what
         // fails at sixty-four bits: an all-ones subtrahend with a borrow in
@@ -2088,7 +2297,8 @@ impl<'a> Lifter<'a> {
         let esp = self.read_r(4);
         let k = self.konst(u64::from(size));
         let moved = self.b.binary(Opcode::SUB, Type::I64, esp, k);
-        let sp = self.and_const(moved, 0xffff_ffff);
+        let mask = self.world.addr_mask();
+        let sp = self.mask_to(moved, mask);
         self.write_r(4, sp);
         self.mem_store(seg::SS, sp, value, size);
     }
@@ -2099,7 +2309,8 @@ impl<'a> Lifter<'a> {
         let value = self.mem_load(seg::SS, esp, size);
         let k = self.konst(u64::from(size));
         let moved = self.b.binary(Opcode::ADD, Type::I64, esp, k);
-        let sp = self.and_const(moved, 0xffff_ffff);
+        let mask = self.world.addr_mask();
+        let sp = self.mask_to(moved, mask);
         self.write_r(4, sp);
         value
     }
@@ -2111,6 +2322,11 @@ impl<'a> Lifter<'a> {
             return Flow::Rejected;
         };
         self.ea = None;
+        // `RIP` while an effective address is computed is the address of the
+        // *next* instruction — the decoder has consumed every byte, immediates
+        // included, before the address is formed — which is the value
+        // `Exec::ea64` reads out of the register.
+        self.next_pc = next_eip;
         self.resume = Resume {
             at: next_eip,
             pc: None,
@@ -2250,7 +2466,7 @@ impl<'a> Lifter<'a> {
                     return Flow::Rejected;
                 };
                 let inverted = self.b.unary(Opcode::NOT, Type::I64, a);
-                let r = self.and_const(inverted, mask_of(size));
+                let r = self.mask_to(inverted, mask_of(size));
                 if !self.write_arg(f, insn.dst, size, r) {
                     return Flow::Rejected;
                 }
@@ -2282,7 +2498,7 @@ impl<'a> Lifter<'a> {
                 };
                 let v = if signed {
                     let wide = self.sext(raw, u32::from(src_size) * 8);
-                    self.and_const(wide, mask_of(f.opsize))
+                    self.mask_to(wide, mask_of(f.opsize))
                 } else {
                     raw
                 };
@@ -2295,7 +2511,7 @@ impl<'a> Lifter<'a> {
                 let (_, addr) = self.ea(f);
                 // The address size decides how much of the address exists; the
                 // operand size decides how much of it is stored.
-                let v = self.and_const(addr, mask_of(f.opsize));
+                let v = self.mask_to(addr, mask_of(f.opsize));
                 if !self.write_arg(f, insn.dst, f.opsize, v) {
                     return Flow::Rejected;
                 }
@@ -2422,7 +2638,7 @@ impl<'a> Lifter<'a> {
                 let Some(t) = self.read_arg(f, insn.dst, f.opsize) else {
                     return Flow::Rejected;
                 };
-                let target = self.and_const(t, mask_of(f.opsize));
+                let target = self.mask_to(t, mask_of(f.opsize));
                 self.pc_out = Some(target);
                 Flow::Transfer
             }
@@ -2456,7 +2672,7 @@ impl<'a> Lifter<'a> {
                 let Some(raw) = self.read_arg(f, insn.dst, f.opsize) else {
                     return Flow::Rejected;
                 };
-                let target = self.and_const(raw, mask_of(f.opsize));
+                let target = self.mask_to(raw, mask_of(f.opsize));
                 self.resume = Resume {
                     at: next_eip,
                     pc: Some(target),
@@ -2472,10 +2688,11 @@ impl<'a> Lifter<'a> {
                     let esp = self.read_r(4);
                     let k = self.konst(extra);
                     let moved = self.b.binary(Opcode::ADD, Type::I64, esp, k);
-                    let sp = self.and_const(moved, 0xffff_ffff);
+                    let mask = self.world.addr_mask();
+                    let sp = self.mask_to(moved, mask);
                     self.write_r(4, sp);
                 }
-                let target = self.and_const(ip, mask_of(f.opsize));
+                let target = self.mask_to(ip, mask_of(f.opsize));
                 self.pc_out = Some(target);
                 Flow::Transfer
             }
@@ -2509,7 +2726,7 @@ impl<'a> Lifter<'a> {
                 let ebp = self.read_r(5);
                 self.write_r(4, ebp);
                 let v = self.pop(f.opsize);
-                self.write_reg(5, f.opsize, v);
+                self.write_reg(5, f.opsize, false, v);
                 Self::flow(next_eip, true, false)
             }
             Plan::Carry(set) => {
@@ -2542,11 +2759,11 @@ impl<'a> Lifter<'a> {
                     let wide = self.widen(bit);
                     ah = self.deposit(ah, wide, shift, 1);
                 }
-                self.write_reg(4, 1, ah);
+                self.write_reg(4, 1, false, ah);
                 Flow::Continue(next_eip)
             }
             Plan::Sahf => {
-                let ah = self.read_reg(4, 1);
+                let ah = self.read_reg(4, 1, false);
                 for (i, shift) in LOW_BYTE_LAYOUT {
                     let bit = self.bit(ah, shift);
                     self.write_flag(i, bit);
@@ -2554,42 +2771,50 @@ impl<'a> Lifter<'a> {
                 Flow::Continue(next_eip)
             }
             Plan::Cbw => {
-                let (from_bytes, to) = if f.opsize == 2 { (1u8, 2u8) } else { (2, 4) };
-                let src = self.read_reg(0, from_bytes);
+                // `CBW`, `CWDE` and `CDQE` are one opcode at three operand
+                // sizes: each sign-extends the *half* of the accumulator below
+                // the size it writes.
+                let (from_bytes, to) = match f.opsize {
+                    2 => (1u8, 2u8),
+                    4 => (2, 4),
+                    _ => (4, 8),
+                };
+                let src = self.read_reg(0, from_bytes, false);
                 let wide = self.sext(src, u32::from(from_bytes) * 8);
-                let v = self.and_const(wide, mask_of(to));
-                self.write_reg(0, to, v);
+                let v = self.mask_to(wide, mask_of(to));
+                self.write_reg(0, to, false, v);
                 Flow::Continue(next_eip)
             }
             Plan::Cwd => {
                 let bits = u32::from(f.opsize) * 8;
-                let acc = self.read_reg(0, f.opsize);
+                let acc = self.read_reg(0, f.opsize, false);
                 let sign = self.bit(acc, bits - 1);
                 let all = self.konst(mask_of(f.opsize));
                 let zero = self.zero();
                 let fill = self.b.emit(Opcode::MOVCOND, Type::I64, &[sign, all, zero]);
-                self.write_reg(2, f.opsize, fill);
+                self.write_reg(2, f.opsize, false, fill);
                 Flow::Continue(next_eip)
             }
             Plan::Bswap => {
                 let index = f.opcode_reg();
                 let v = self.read_r(index);
                 let dst = self.b.temp(Type::I64);
-                // Lane width 32: the swap happens within the low doubleword,
-                // which is the whole register on a 386. `Exec` performs the
-                // doubleword swap at every operand size below eight, so this
-                // does too.
+                // The lane is the operand: a doubleword swap at every operand
+                // size below eight — which is what `Exec` does, including at
+                // the 16-bit size the manual leaves undefined — and a quadword
+                // swap under `REX.W`.
+                let lane = if f.opsize == 8 { 64 } else { 32 };
                 self.b.emit_raw(
                     Opcode::BSWAP,
                     Type::I64,
                     Some(dst),
                     None,
                     &[v],
-                    Some(Const::Int(32)),
+                    Some(Const::Int(lane)),
                     None,
                     0,
                 );
-                let masked = self.and_const(dst, 0xffff_ffff);
+                let masked = self.mask_to(dst, if lane == 64 { u64::MAX } else { 0xffff_ffff });
                 self.write_r(index, masked);
                 Flow::Continue(next_eip)
             }
@@ -2633,8 +2858,11 @@ impl<'a> Lifter<'a> {
         let (n, nz) = match count {
             Count::Fixed(k) => (Amount::Fixed(k), None),
             Count::Cl => {
-                let cl = self.read_reg(1, 1);
-                let masked = self.and_const(cl, 31);
+                let cl = self.read_reg(1, 1, false);
+                // Five bits, or **six** at a 64-bit operand size — the one
+                // place the mask is not a constant (*Intel SDM* volume 2,
+                // `SAL/SAR/SHL/SHR`), and `Exec::shift` says the same thing.
+                let masked = self.and_const(cl, u64::from(count_mask(size)));
                 let zero = self.zero();
                 let nz = self.b.setcond(Cond::Ne, Type::I64, masked, zero);
                 (Amount::Dynamic(masked), Some(nz))
@@ -2706,11 +2934,24 @@ impl<'a> Lifter<'a> {
 
     fn shl(&mut self, a: Temp, n: Amount, bits: u32, mask: u64) -> Temp {
         let wide = self.shift_by(Opcode::SHL, a, n);
-        let r = self.and_const(wide, mask);
+        let r = self.mask_to(wide, mask);
         // The last bit shifted out is bit `bits` of the *unmasked* product,
         // which stays true when the count exceeds the operand width: the
         // product is then zero below `bits` as well.
-        let cf = self.bit(wide, bits);
+        //
+        // At a 64-bit operand that bit does not exist — the same hole the
+        // module docs describe in `ADD`'s carry — so it is read off the
+        // **source** instead: bit `64 - n` of `a`, for the `n` in 1..=63 that
+        // a shift writing anything can have. `complement` reduces modulo the
+        // width there, so the `n == 0` path a `CL` count can take stays a
+        // legal shift whose value the select below throws away.
+        let cf = if bits < 64 {
+            self.bit(wide, bits)
+        } else {
+            let up = self.complement(n, bits);
+            let out = self.shift_by(Opcode::SHR, a, up);
+            self.bit(out, 0)
+        };
         self.write_flag(F_CF, cf);
         let msb = self.bit(r, bits - 1);
         let of = self.b.binary(Opcode::XOR, Type::I1, msb, cf);
@@ -2720,13 +2961,13 @@ impl<'a> Lifter<'a> {
 
     fn shr(&mut self, a: Temp, n: Amount, bits: u32, mask: u64) -> Temp {
         let shifted = self.shift_by(Opcode::SHR, a, n);
-        let r = self.and_const(shifted, mask);
+        let r = self.mask_to(shifted, mask);
         // `CF` is bit `n - 1` of the source. The subtraction is masked so the
         // amount stays inside the type even on the discarded `n == 0` path of
         // the `CL` form, which the IR requires: an out-of-range shift is
         // *undefined*, so emitting one would let two backends disagree about a
         // value one of them throws away.
-        let below = self.amount_minus_one(n);
+        let below = self.amount_minus_one(n, bits);
         let out = self.shift_by(Opcode::SHR, a, below);
         let cf = self.bit(out, 0);
         self.write_flag(F_CF, cf);
@@ -2740,8 +2981,8 @@ impl<'a> Lifter<'a> {
     fn sar(&mut self, a: Temp, n: Amount, bits: u32, mask: u64) -> Temp {
         let wide = self.sext(a, bits);
         let shifted = self.shift_by(Opcode::SAR, wide, n);
-        let r = self.and_const(shifted, mask);
-        let below = self.amount_minus_one(n);
+        let r = self.mask_to(shifted, mask);
+        let below = self.amount_minus_one(n, bits);
         let out = self.shift_by(Opcode::SAR, wide, below);
         let cf = self.bit(out, 0);
         self.write_flag(F_CF, cf);
@@ -2757,7 +2998,7 @@ impl<'a> Lifter<'a> {
         let complement = self.complement(e, bits);
         let right = self.shift_by(Opcode::SHR, a, complement);
         let joined = self.b.binary(Opcode::OR, Type::I64, left, right);
-        let r = self.and_const(joined, mask);
+        let r = self.mask_to(joined, mask);
         // The bit that came round into position zero is the one that left the
         // top, which is the carry the last iteration set.
         let cf = self.bit(r, 0);
@@ -2774,7 +3015,7 @@ impl<'a> Lifter<'a> {
         let complement = self.complement(e, bits);
         let left = self.shift_by(Opcode::SHL, a, complement);
         let joined = self.b.binary(Opcode::OR, Type::I64, left, right);
-        let r = self.and_const(joined, mask);
+        let r = self.mask_to(joined, mask);
         let cf = self.bit(r, bits - 1);
         self.write_flag(F_CF, cf);
         let below = self.bit(r, bits - 2);
@@ -2793,7 +3034,7 @@ impl<'a> Lifter<'a> {
         let cin = self.widen(carry_in);
         let up = self.shl_const(a, 1);
         let joined = self.b.binary(Opcode::OR, Type::I64, up, cin);
-        let r = self.and_const(joined, mask);
+        let r = self.mask_to(joined, mask);
         let cf = self.bit(a, bits - 1);
         self.write_flag(F_CF, cf);
         let msb = self.bit(r, bits - 1);
@@ -2815,7 +3056,7 @@ impl<'a> Lifter<'a> {
         let top = self.shl_const(cin, bits - 1);
         let down = self.shr_const(a, 1);
         let joined = self.b.binary(Opcode::OR, Type::I64, down, top);
-        let r = self.and_const(joined, mask);
+        let r = self.mask_to(joined, mask);
         self.write_flag(F_CF, cf);
         r
     }
@@ -2833,13 +3074,18 @@ impl<'a> Lifter<'a> {
 
     /// `n - 1`, kept inside the type. See [`Lifter::shr`] for why the mask is
     /// not optional.
-    fn amount_minus_one(&mut self, n: Amount) -> Amount {
+    ///
+    /// The mask is the *count* mask rather than the operand's width: a count
+    /// of zero is masked round to 31 — or to 63 at a 64-bit operand — and the
+    /// shift it produces is legal and discarded, which is the whole point.
+    fn amount_minus_one(&mut self, n: Amount, bits: u32) -> Amount {
+        let wrap = if bits == 64 { 63 } else { 31 };
         match n {
             Amount::Fixed(k) => Amount::Fixed(k.saturating_sub(1)),
             Amount::Dynamic(t) => {
                 let one = self.konst(1);
                 let d = self.b.binary(Opcode::SUB, Type::I64, t, one);
-                Amount::Dynamic(self.and_const(d, 31))
+                Amount::Dynamic(self.and_const(d, wrap))
             }
         }
     }
@@ -2853,13 +3099,26 @@ impl<'a> Lifter<'a> {
     }
 
     /// `bits - n`, for an `n` already reduced below `bits`. The result is
-    /// between one and `bits`, which is always a legal shift at `i64`.
+    /// between one and `bits`, which is a legal shift at `i64` — except at
+    /// `bits == 64`, where a complement of sixty-four is not, so it is reduced
+    /// modulo the width there.
+    ///
+    /// That reduction is sound rather than merely convenient: the only `n`
+    /// that produces it is zero, and a rotate by zero has the source in the
+    /// other half of the `or` already, so `a >> 0` and `a >> 64` contribute
+    /// the same answer. It is applied only at sixty-four bits so that the IR
+    /// a 32-bit rotate lifts to is unchanged.
     fn complement(&mut self, n: Amount, bits: u32) -> Amount {
         match n {
-            Amount::Fixed(k) => Amount::Fixed(bits - k),
+            Amount::Fixed(k) => Amount::Fixed(if bits == 64 {
+                (bits - k) & 63
+            } else {
+                bits - k
+            }),
             Amount::Dynamic(t) => {
                 let k = self.konst(u64::from(bits));
-                Amount::Dynamic(self.b.binary(Opcode::SUB, Type::I64, k, t))
+                let d = self.b.binary(Opcode::SUB, Type::I64, k, t);
+                Amount::Dynamic(if bits == 64 { self.and_const(d, 63) } else { d })
             }
         }
     }
@@ -2880,38 +3139,63 @@ impl<'a> Lifter<'a> {
 
     // -- multiplies --------------------------------------------------------
 
-    /// One-operand `MUL` and `IMUL`.
+    /// Both halves of a product, at any operand size.
     ///
-    /// Both products fit in [`Type::I64`] at every operand size this subset
-    /// has, so no widening multiply is needed — see the module docs.
+    /// Below sixty-four bits the whole product fits in one [`Type::I64`] and
+    /// the halves are a mask and a shift. At sixty-four it does not, and the
+    /// answer is [`Opcode::MULU2`]/[`Opcode::MULS2`] — the double-width
+    /// multiply `ir`'s op list carries for exactly this and that a 32-bit
+    /// subset never reached. They take their sign from the opcode rather than
+    /// from sign-extended operands, which is why the two paths differ in more
+    /// than their width.
+    fn product(&mut self, a: Temp, b: Temp, signed: bool, size: u8) -> (Temp, Temp) {
+        let bits = u32::from(size) * 8;
+        let mask = mask_of(size);
+        if size == 8 {
+            let low = self.b.temp(Type::I64);
+            let high = self.b.temp(Type::I64);
+            let op = if signed { Opcode::MULS2 } else { Opcode::MULU2 };
+            self.b
+                .emit_raw(op, Type::I64, Some(low), Some(high), &[a, b], None, None, 0);
+            return (low, high);
+        }
+        let (a, b) = if signed {
+            let a = self.sext(a, bits);
+            let b = self.sext(b, bits);
+            (a, b)
+        } else {
+            (a, b)
+        };
+        let product = self.b.binary(Opcode::MUL, Type::I64, a, b);
+        let low = self.and_const(product, mask);
+        let shifted = self.shr_const(product, bits);
+        let high = self.and_const(shifted, mask);
+        (low, high)
+    }
+
+    /// One-operand `MUL` and `IMUL`.
     fn multiply(&mut self, f: &Fields, signed: bool, size: u8) -> bool {
         let bits = u32::from(size) * 8;
         let mask = mask_of(size);
         let Some(src) = self.read_arg(f, f.insn.dst, size) else {
             return false;
         };
-        let acc = self.read_reg(0, size);
-        let (a, b) = if signed {
-            let a = self.sext(acc, bits);
-            let b = self.sext(src, bits);
-            (a, b)
-        } else {
-            (acc, src)
-        };
-        let product = self.b.binary(Opcode::MUL, Type::I64, a, b);
-        let low = self.and_const(product, mask);
-        let shifted = self.shr_const(product, bits);
-        let high = self.and_const(shifted, mask);
+        // `Exec::multiply` reads the accumulator with `Regs::read(0, size,
+        // false)` — the legacy byte encoding whatever prefix the instruction
+        // carries — because `AL` is named by the opcode and no `REX` bit
+        // reaches it.
+        let acc = self.read_reg(0, size, false);
+        let (low, high) = self.product(acc, src, signed, size);
 
         if size == 1 {
             // A byte multiply's whole result is `AX`, not `AH:AL` as two
             // registers.
             let up = self.shl_const(high, 8);
             let word = self.b.binary(Opcode::OR, Type::I64, low, up);
-            self.write_reg(0, 2, word);
+            self.write_reg(0, 2, false, word);
         } else {
-            self.write_reg(0, size, low);
-            self.write_reg(2, size, high);
+            self.write_reg(0, size, false, low);
+            self.write_reg(2, size, false, high);
         }
 
         let overflow = if signed {
@@ -2956,7 +3240,7 @@ impl<'a> Lifter<'a> {
                 Some(t) => {
                     if width == 1 {
                         let wide = self.sext(t, 8);
-                        self.and_const(wide, mask)
+                        self.mask_to(wide, mask)
                     } else {
                         t
                     }
@@ -2964,15 +3248,18 @@ impl<'a> Lifter<'a> {
                 None => return false,
             }
         };
-        let a = self.sext(a_raw, bits);
-        let b = self.sext(b_raw, bits);
-        let product = self.b.binary(Opcode::MUL, Type::I64, a, b);
-        let truncated = self.and_const(product, mask);
-        let back = self.sext(truncated, bits);
-        let fits = self.b.setcond(Cond::Eq, Type::I64, back, product);
-        let spilled = self.b.unary(Opcode::NOT, Type::I1, fits);
-        let shifted = self.shr_const(product, bits);
-        let high = self.and_const(shifted, mask);
+        let (truncated, high) = self.product(a_raw, b_raw, true, size);
+        // Whether the whole product fits in the destination, which is the
+        // *only* thing `CF` and `OF` say here. `Exec` compares the truncated
+        // result sign-extended against the full product; with the halves in
+        // hand the same statement is that the high half is the low half's sign
+        // fill, and at sixty-four bits it is the only one of the two that can
+        // be made — the full product is 128 bits and no temporary holds it.
+        let sign = self.bit(truncated, bits - 1);
+        let all = self.konst(mask);
+        let zero = self.zero();
+        let fill = self.b.emit(Opcode::MOVCOND, Type::I64, &[sign, all, zero]);
+        let spilled = self.b.setcond(Cond::Ne, Type::I64, high, fill);
         self.mul_flags(high, size, spilled);
         self.write_arg(f, insn.dst, size, truncated)
     }
@@ -3006,7 +3293,7 @@ impl<'a> Lifter<'a> {
             None => self.konst(program_order_eip),
         };
         let mut live = self.live_state(0);
-        live.push((EIP, pc));
+        live.push((RIP, pc));
         let at = self.static_exit.unwrap_or(program_order_eip);
         self.b.insn_start(InsnStart {
             pc: at,
@@ -3028,6 +3315,15 @@ const LOW_BYTE_LAYOUT: [(usize, u32); 5] = [(F_CF, 0), (F_PF, 2), (F_AF, 4), (F_
 enum Amount {
     Fixed(u32),
     Dynamic(Temp),
+}
+
+/// How much of a shift count an operand of `size` bytes looks at.
+///
+/// Five bits everywhere except at a 64-bit operand, which looks at six. The
+/// one place the mask is not a constant, and `Exec::shift` says the same
+/// thing (*Intel SDM* volume 2, `SAL/SAR/SHL/SHR`).
+const fn count_mask(size: u8) -> u32 {
+    if size == 8 { 0x3f } else { 0x1f }
 }
 
 /// The mask of an operand of `size` bytes.
@@ -3053,20 +3349,32 @@ const fn mask_of(size: u8) -> u64 {
 #[allow(clippy::too_many_lines)]
 fn classify(world: &World, f: &Fields, next_eip: u64) -> Option<Plan> {
     let insn = f.insn;
+    let long = world.long();
     // A prefix that changes what an instruction *means* is out of the subset:
     // `LOCK` needs an atomic the IR cannot type at eight or sixteen bits, and a
     // repeat prefix is a loop — and in front of `DIV` on an 8088 it is an
     // undocumented sign inversion the hardware corpus exercises deliberately.
-    if f.lock || f.rep.is_some() || f.has_rex() {
+    //
+    // `REX` is a *different* kind of prefix and is in the subset: it renames
+    // the register fields and widens the operand, both of which the tables
+    // below already resolve. Outside long mode the byte is an `INC` or a `DEC`
+    // and the decoder never sets the field, so this is a statement about the
+    // world rather than a check that can fire.
+    if f.lock || f.rep.is_some() || (!long && f.has_rex()) {
         return None;
     }
-    // 16-bit addressing inside a 32-bit segment is a second effective-address
-    // form; 64-bit operands do not exist below long mode.
-    if f.addrsize != 4 || f.opsize == 8 {
+    // The address size the mode itself gives, and nothing else: 16-bit
+    // addressing inside a 32-bit segment and 32-bit addressing inside a 64-bit
+    // one are both a second effective-address form for no guest that matters.
+    if f.addrsize != if long { 8 } else { 4 } {
         return None;
     }
     let size = Lifter::width(f);
-    if !matches!(size, 1 | 2 | 4) {
+    if !matches!(size, 1 | 2 | 4 | 8) {
+        return None;
+    }
+    // A 64-bit operand does not exist below long mode.
+    if size == 8 && !long {
         return None;
     }
 
@@ -3095,6 +3403,15 @@ fn classify(world: &World, f: &Fields, next_eip: u64) -> Option<Plan> {
             signed: insn.op == Op::MOVSX,
             src_size: if matches!(insn.src, Arg::Eb) { 1 } else { 2 },
         },
+        // `MOVSXD` reclaimed `ARPL`'s encoding and its source is always a
+        // doubleword: without `REX.W` it is an expensive `mov r32, r/m32`, and
+        // `Exec` sign-extends only at an operand size of eight — so the plan
+        // takes its signedness from the operand size rather than from the
+        // mnemonic.
+        Op::MOVSXD => Plan::MovX {
+            signed: f.opsize == 8,
+            src_size: 4,
+        },
         Op::LEA => Plan::Lea,
         Op::ROL | Op::ROR | Op::RCL | Op::RCR | Op::SHL | Op::SHR | Op::SAR | Op::SETMO => {
             let count = match insn.src {
@@ -3110,7 +3427,7 @@ fn classify(world: &World, f: &Fields, next_eip: u64) -> Option<Plan> {
                     Count::Cl
                 }
                 _ => {
-                    let n = (f.imm & 0x1f) as u32;
+                    let n = (f.imm & u64::from(count_mask(size))) as u32;
                     if n == 0 {
                         // A 386 with a zero count does nothing at all — no
                         // flags, and no write-back either, so not even the
@@ -3162,35 +3479,44 @@ fn classify(world: &World, f: &Fields, next_eip: u64) -> Option<Plan> {
         Op::CBW => Plan::Cbw,
         Op::CWD => Plan::Cwd,
         Op::BSWAP => Plan::Bswap,
-        // `90` is a no-operation only without `REX.B`, which cannot be here.
+        // `90` with `REX.B` is architecturally `XCHG R8, RAX` rather than a
+        // no-operation, and `Exec` executes it as a `NOP` — the table has no
+        // `XCHG` row at `90`. That is an interpreter gap rather than a lifter
+        // one, and this plan reproduces it deliberately: the interpreter is
+        // the oracle, so the frontend agreeing with it is the contract and
+        // disagreeing would be a divergence rather than a fix. Fixing it is a
+        // change to `isa`'s table, and this comment is the note it needs.
         Op::NOP => Plan::Nop,
         Op::CALL => {
             // A near transfer masks its target to the operand size, so a `66`
-            // prefix would truncate `EIP` to sixteen bits — a real instruction,
-            // and one no 32-bit guest means.
-            if f.opsize != 4 {
+            // prefix would truncate the program counter to sixteen bits — a
+            // real instruction, and one no 32-bit or 64-bit guest means. The
+            // pointer width is the mode's: long mode makes `CALL`, `JMP`,
+            // `RET` and every `Jcc` default to a 64-bit operand and a `REX.W`
+            // in front of one is redundant rather than meaningful.
+            if f.opsize != pointer_bytes(long) {
                 return None;
             }
             match insn.dst {
                 Arg::Jv | Arg::Jb => Plan::CallRel {
-                    target: relative(f, next_eip),
+                    target: static_target(long, relative(f, next_eip))?,
                 },
-                _ => Plan::CallInd,
+                _ => computed_transfer(long, Plan::CallInd)?,
             }
         }
         Op::JMP => {
-            if f.opsize != 4 {
+            if f.opsize != pointer_bytes(long) {
                 return None;
             }
             match insn.dst {
                 Arg::Jv | Arg::Jb => Plan::JmpRel {
-                    target: relative(f, next_eip),
+                    target: static_target(long, relative(f, next_eip))?,
                 },
-                _ => Plan::JmpInd,
+                _ => computed_transfer(long, Plan::JmpInd)?,
             }
         }
         Op::RET => {
-            if f.opsize != 4 {
+            if f.opsize != pointer_bytes(long) {
                 return None;
             }
             let extra = if matches!(insn.dst, Arg::Iw | Arg::Iv | Arg::Iz) {
@@ -3198,15 +3524,15 @@ fn classify(world: &World, f: &Fields, next_eip: u64) -> Option<Plan> {
             } else {
                 0
             };
-            Plan::Ret { extra }
+            computed_transfer(long, Plan::Ret { extra })?
         }
         op if op.is_conditional_jump() => {
-            if f.opsize != 4 {
+            if f.opsize != pointer_bytes(long) {
                 return None;
             }
             Plan::Jcc {
                 cc: op.condition_code().unwrap_or(0),
-                target: relative(f, next_eip),
+                target: static_target(long, relative(f, next_eip))?,
             }
         }
         op if op.is_setcc() => Plan::SetCc(op.condition_code().unwrap_or(0)),
@@ -3221,6 +3547,40 @@ fn classify(world: &World, f: &Fields, next_eip: u64) -> Option<Plan> {
         _ => return None,
     };
     Some(plan)
+}
+
+/// The operand size a near transfer has: the mode's pointer width.
+const fn pointer_bytes(long: bool) -> u8 {
+    if long { 8 } else { 4 }
+}
+
+/// A statically known branch target, or `None` if long mode would fault on it.
+///
+/// `Exec::jump_near` raises `#GP(0)` for a target that is not canonical in
+/// 64-bit mode, where below long mode the flat 4 GiB `CS` [`World::of`]
+/// insists on discharges the equivalent check for every target at once. A
+/// *static* target can simply be examined, so it is — and a block that would
+/// have to deliver the exception is never built.
+fn static_target(long: bool, target: u64) -> Option<u64> {
+    if long && !super::prot::canonical(target) {
+        return None;
+    }
+    Some(target)
+}
+
+/// A near transfer to an address the block cannot know, admitted only where
+/// the target cannot fault.
+///
+/// `RET`, `JMP r/m` and `CALL r/m` in long mode transfer to a value read out
+/// of a register or off the stack, and `Exec::jump_near` raises `#GP(0)` when
+/// it is not canonical — an exception at the *transfer*, with the pre-
+/// instruction state restored, which a block whose branches all go forward
+/// over an exit cannot deliver. Below long mode the same instructions are in
+/// the subset because `CS` is required to be a flat 4 GiB segment and there is
+/// then no target to reject. This is the one place the two worlds differ in
+/// what they admit rather than in how they lift it.
+const fn computed_transfer(long: bool, plan: Plan) -> Option<Plan> {
+    if long { None } else { Some(plan) }
 }
 
 /// The target of a relative jump: the address of the *next* instruction plus
@@ -3247,6 +3607,7 @@ mod tests {
     fn flat_world() -> World {
         World {
             variant: Variant::I80386,
+            bits: Bits::B32,
             cs_base: 0,
             seg_base: [0; seg::COUNT],
             cmov: true,
@@ -3566,6 +3927,246 @@ mod tests {
     }
 
     // -- the subset ------------------------------------------------------
+
+    // -- long mode -------------------------------------------------------
+
+    /// A `Sys` in long mode: `EFER.LME` with `LMA`, `CR4.PAE`, `CR0.PG` and a
+    /// code segment with its `L` bit set.
+    fn long_sys() -> Sys {
+        let mut sys = liftable_sys();
+        sys.cr0 |= cr0::PG;
+        sys.cr4 |= crate::cpu::x86::prot::cr4::PAE;
+        sys.efer |= crate::cpu::x86::prot::efer::LME | crate::cpu::x86::prot::efer::LMA;
+        let cs = &mut sys.segs[usize::from(seg::CS)];
+        // `L` set and `D` clear, which is the one combination that means
+        // 64-bit mode; `L` with `D` is reserved.
+        cs.ar = (cs.ar & !ar::DB) | ar::L;
+        cs.base = 0x1000;
+        cs.limit = 0xffff;
+        sys.fs_base = 0x4444_0000_0000;
+        sys.gs_base = 0x5555_0000_0000;
+        sys
+    }
+
+    /// The world long mode puts a core in, and the four checks it discharges
+    /// rather than passes.
+    ///
+    /// `CS` here has a base and a limit that a 32-bit world would be refused
+    /// for, and neither matters: 64-bit mode gives `CS`, `DS`, `ES` and `SS` a
+    /// base of zero and no limit whatever their descriptors hold (*Intel SDM*
+    /// volume 3 §3.4.4). `FS` and `GS` keep a base, and it comes from an MSR.
+    #[test]
+    fn long_mode_is_a_world_the_frontend_lifts_and_segmentation_is_not_in_it() {
+        let regs = Regs::new();
+        let cfg = Config::I8088.with_variant(Variant::X86_64);
+        let origin = Origin::Paged { phys: 0x0020_0000 };
+        let world = World::of(&regs, &long_sys(), &cfg, true, 0, origin)
+            .expect("long mode is a world this frontend lifts");
+        assert_eq!(world.bits, Bits::B64);
+        assert!(world.long());
+        assert_eq!(world.addr_mask(), u64::MAX);
+        // The `CS` base is *not* carried, because 64-bit mode does not have
+        // one — a lifter that read the descriptor cache would put a stale
+        // 0x1000 in front of every fetch.
+        assert_eq!(world.cs_base, 0);
+        assert_eq!(world.linear(0x1234), 0x1234);
+        for sr in [seg::CS, seg::DS, seg::ES, seg::SS] {
+            assert_eq!(world.seg_base[usize::from(sr)], 0);
+        }
+        // `FS` and `GS` survive, with a base from an MSR rather than from a
+        // descriptor — which is why every 64-bit ABI puts thread-local storage
+        // behind them.
+        assert_eq!(world.seg_base[usize::from(seg::FS)], 0x4444_0000_0000);
+        assert_eq!(world.seg_base[usize::from(seg::GS)], 0x5555_0000_0000);
+    }
+
+    /// Long mode is refused on a part that does not have it, and outside it,
+    /// and — like every other paged world — when the origin disagrees with the
+    /// control registers.
+    #[test]
+    fn a_long_mode_world_needs_the_feature_the_mode_and_the_origin() {
+        let regs = Regs::new();
+        let paged = Origin::Paged { phys: 0x0020_0000 };
+        // A 386 has no long mode, and `Exec` decodes `Bits::B64` only when the
+        // *instance* says it has one — so a `Sys` claiming `LMA` on a part
+        // without the feature is a 32-bit world, and one whose code segment
+        // has neither `L` nor `D` is no world at all.
+        let old = Config::I8088.with_variant(Variant::I80386);
+        assert!(World::of(&regs, &long_sys(), &old, true, 0, paged).is_none());
+        // And in long mode the origin still has to say what `CR0.PG` says.
+        let cfg = Config::I8088.with_variant(Variant::X86_64);
+        assert!(World::of(&regs, &long_sys(), &cfg, true, 0, Origin::Flat).is_none());
+        // Compatibility mode — long mode active, `CS.L` clear — is the 32-bit
+        // world, not this one.
+        let mut compat = long_sys();
+        let cs = &mut compat.segs[usize::from(seg::CS)];
+        cs.ar = (cs.ar & !ar::L) | ar::DB;
+        cs.base = 0;
+        cs.limit = 0xffff_ffff;
+        let world =
+            World::of(&regs, &compat, &cfg, true, 0, paged).expect("compatibility mode lifts");
+        assert_eq!(world.bits, Bits::B32);
+    }
+
+    /// The same bytes at the same address are two different blocks in the two
+    /// worlds, so the code segment's width has to be in the key.
+    #[test]
+    fn the_cache_key_separates_the_two_code_segment_widths() {
+        let flat = flat_world();
+        let mut long = paged_world(0x0020_0000);
+        long.bits = Bits::B64;
+        let mut paged = paged_world(0x0020_0000);
+        paged.bits = Bits::B32;
+        let k = |w: &World| key(w, Shape::Trace, Smc::EndBlock, Flags::Elide);
+        assert_ne!(k(&long), k(&paged));
+        assert_ne!(k(&long), k(&flat));
+    }
+
+    /// A 64-bit lift, end to end: `REX.W`, a register only `REX.B` can name,
+    /// and the whole sixty-four bits of an address.
+    #[test]
+    fn a_rex_prefixed_instruction_lifts_at_sixty_four_bits() {
+        // add r8, [r9+0x10]  — 4d 03 41 10
+        let world = paged_world(0x0020_0000);
+        let mut world = world;
+        world.bits = Bits::B64;
+        let l = lift_at(
+            &world,
+            AT,
+            &[0x4d, 0x03, 0x41, 0x10],
+            Shape::default(),
+            Smc::EndBlock,
+            Flags::default(),
+        );
+        assert_eq!(l.insns, 1);
+        // The slots the boundary names are the extended registers', which a
+        // 32-bit encoding cannot reach at all.
+        let live: Vec<RegSlot> = l
+            .block
+            .marks()
+            .last()
+            .expect("an exit boundary")
+            .live
+            .iter()
+            .map(|(slot, _)| *slot)
+            .collect();
+        assert!(live.contains(&r_slot(8)), "{live:?}");
+        assert!(live.contains(&r_slot(9)), "{live:?}");
+        // And no thirty-two-bit mask was emitted for the address or the sum:
+        // at sixty-four bits every mask this frontend would apply is the
+        // identity, and `Lifter::mask_to` leaves it out.
+        assert!(
+            !l.block
+                .insts()
+                .iter()
+                .any(|i| i.imm == Some(Const::Int(0xffff_ffff))),
+            "a 64-bit lift masked something to thirty-two bits\n{}",
+            l.block
+        );
+    }
+
+    /// A 64-bit `MUL` lowers to the widening multiply, which is the opcode a
+    /// 32-bit subset never reaches.
+    #[test]
+    fn a_sixty_four_bit_multiply_uses_the_widening_opcode() {
+        let mut world = paged_world(0x0020_0000);
+        world.bits = Bits::B64;
+        for (bytes, op) in [
+            (&[0x48u8, 0xf7, 0xe3], Opcode::MULU2),
+            (&[0x48, 0xf7, 0xeb], Opcode::MULS2),
+        ] {
+            let l = lift_at(
+                &world,
+                AT,
+                bytes,
+                Shape::default(),
+                Smc::EndBlock,
+                Flags::default(),
+            );
+            assert_eq!(l.insns, 1);
+            assert_eq!(count(&l.block, op), 1, "{:?}\n{}", op.name(), l.block);
+            // Both halves are results of the one instruction, which is what
+            // `dst2` is for.
+            let inst = l
+                .block
+                .insts()
+                .iter()
+                .find(|i| i.op == op)
+                .expect("the multiply");
+            assert!(inst.dst.is_some() && inst.dst2.is_some());
+        }
+        // A 32-bit multiply still does not, because its product fits.
+        let l = plain(&[0xf7, 0xe3]);
+        assert_eq!(count(&l.block, Opcode::MULU2), 0);
+    }
+
+    /// A computed near transfer is out of the long-mode subset.
+    ///
+    /// `Exec::jump_near` raises `#GP(0)` on a non-canonical target and the
+    /// pre-instruction state is what a guest then observes — an exception *at*
+    /// the transfer, which a block whose branches all go forward over an exit
+    /// cannot deliver. Below long mode the same three instructions are in the
+    /// subset, because a flat 4 GiB `CS` leaves no target to reject.
+    #[test]
+    fn a_computed_near_transfer_is_out_of_the_subset_in_long_mode_only() {
+        let mut world = paged_world(0x0020_0000);
+        world.bits = Bits::B64;
+        for bytes in [
+            &[0xc3u8][..],     // ret
+            &[0xff, 0xe0][..], // jmp rax
+            &[0xff, 0xd0][..], // call rax
+        ] {
+            let l = lift_at(
+                &world,
+                AT,
+                bytes,
+                Shape::default(),
+                Smc::EndBlock,
+                Flags::default(),
+            );
+            assert_eq!(l.insns, 0, "{bytes:02x?} must not lift in long mode");
+            assert_eq!(l.stop, Stop::Unsupported);
+            // The same encoding in the 32-bit world is lifted.
+            let flat = plain(bytes);
+            assert_eq!(flat.insns, 1, "{bytes:02x?} lifts below long mode");
+        }
+    }
+
+    /// A rotate by `CL` at sixty-four bits reduces its complement, so no shift
+    /// the block emits is ever out of range for its type.
+    ///
+    /// Asserted by shape rather than differentially, and the reason is the one
+    /// [`Lifter::shr`]'s mask carries: an out-of-range shift is *undefined* in
+    /// the IR, both backends in the tree happen to reduce the amount modulo
+    /// the width, and a value one of them throws away is not observable
+    /// through either. The mask is what makes the block say what it means.
+    #[test]
+    fn a_sixty_four_bit_rotate_by_cl_keeps_every_shift_inside_its_type() {
+        let mut world = paged_world(0x0020_0000);
+        world.bits = Bits::B64;
+        // rol rax, cl — 48 d3 c0
+        let l = lift_at(
+            &world,
+            AT,
+            &[0x48, 0xd3, 0xc0],
+            Shape::default(),
+            Smc::EndBlock,
+            Flags::Eager,
+        );
+        assert_eq!(l.insns, 1);
+        // Two reductions modulo sixty-four: the count itself, and `64 - n`.
+        let sixty_three = l
+            .block
+            .insts()
+            .iter()
+            .filter(|i| i.imm == Some(Const::Int(63)))
+            .count();
+        assert!(
+            sixty_three >= 2,
+            "a 64-bit rotate by CL emitted {sixty_three} reductions\n{}",
+            l.block
+        );
+    }
 
     #[test]
     fn a_register_add_lifts_to_the_arithmetic_and_its_six_flags() {

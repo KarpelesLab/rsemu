@@ -149,7 +149,7 @@ use rsemu::core::value::Width;
 use rsemu::cpu::x86::differential::{self, BASE, Case, DATA, RAM_SIZE};
 use rsemu::cpu::x86::isa::seg;
 use rsemu::cpu::x86::lift::{
-    self, EIP, FLAG_BITS, FLAG_SLOTS, Flags, SLOT_COUNT, Shape, Smc, World, r_slot,
+    self, FLAG_BITS, FLAG_SLOTS, Flags, RIP, SLOT_COUNT, Shape, Smc, World, r_slot,
 };
 use rsemu::ir::{AccessKind, InsnStart, IrHost, MemOp, RegSlot};
 use rsemu::jit::{
@@ -405,17 +405,19 @@ fn workloads() -> Vec<Workload> {
         },
         Workload {
             name: "memcpy",
-            case: Case::new(copy).with_reg(6, SRC).with_reg(7, DST),
+            case: Case::new(copy)
+                .with_reg(6, u64::from(SRC))
+                .with_reg(7, u64::from(DST)),
         },
         Workload {
             name: "load-heavy",
             // Four pointers, three of them in a different page from the first,
             // so the TLB answers about several entries rather than one.
             case: Case::new(loads)
-                .with_reg(3, (DATA + 0x11) as u32)
-                .with_reg(1, (DATA + 0x400) as u32)
-                .with_reg(2, (DATA + 0x1000) as u32)
-                .with_reg(6, (DATA + 0x1800) as u32),
+                .with_reg(3, DATA + 0x11)
+                .with_reg(1, DATA + 0x400)
+                .with_reg(2, DATA + 0x1000)
+                .with_reg(6, DATA + 0x1800),
         },
         Workload {
             name: "branchy",
@@ -504,10 +506,10 @@ fn run_translated(w: &Workload, insns: u64, cfg: Config) -> Duration {
         cpu.step();
     }
     let regs = cpu.regs();
-    for n in 0..8u8 {
+    for n in 0..16u8 {
         assert_eq!(
-            regs.dword(n),
-            host.slots[r_slot(n).0 as usize] as u32,
+            regs.qword(n),
+            host.slots[r_slot(n).0 as usize],
             "{}: register {n} disagrees after {done} instructions under {cfg:?}",
             w.name
         );
@@ -555,7 +557,7 @@ impl<H: ?Sized> Frontend<H> for Lifter {
         lift::key(&self.world, self.cfg.shape, self.cfg.smc, self.cfg.flags)
     }
     fn pc_slot(&self) -> RegSlot {
-        EIP
+        RIP
     }
     fn translate(&mut self, pc: u64) -> Result<Translation> {
         let space = Arc::clone(&self.space);
@@ -602,11 +604,13 @@ impl BenchHost {
     fn new(case: &Case, space: Arc<AddressSpace>, tlb: bool) -> BenchHost {
         let world = differential::world(case);
         let mut slots = [0u64; SLOT_COUNT as usize];
-        for (n, value) in case.regs.iter().enumerate() {
-            slots[n] = u64::from(*value);
+        // The case's own answer rather than a second copy of it: `start_regs`
+        // is what the oracle and the differential host both begin from, and it
+        // is where the stack pointer and the data-window pointers are decided.
+        for (n, value) in case.start_regs().iter().enumerate() {
+            slots[n] = *value;
         }
-        slots[4] = differential::STACK;
-        slots[EIP.0 as usize] = BASE;
+        slots[RIP.0 as usize] = BASE;
         // The reserved bit, which `Regs::normalise_flags` forces on.
         slots[lift::EFLAGS_REST.0 as usize] = 0x0002;
         BenchHost {

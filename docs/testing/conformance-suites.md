@@ -174,18 +174,31 @@ expected values from somewhere that is not this project:
 - **LLVM's instruction selector as an encoding generator.** The guests are
   ordinary Rust and nobody here chose which instructions they contain.
 
-`fp_rules.rs`, `timer.rs` and the second half of `memory.rs` are directed tests
-transcribed from DDI 0487 rather than conformance evidence, and they say so.
-`timer.rs` and the exclusive-pair cases in `memory.rs` are there because the
-route to them through a compiler is closed: nothing in ordinary Rust reaches
+`sat.rs` is the same oracle again, and the cleanest instance of it:
+`i8::saturating_add` and its relatives *are* the operations `SQADD` and its
+family perform, they are the standard library's rather than this project's, and
+they are exactly defined — no rounding mode and no NaN payload to argue over.
+LLVM chose `SQADD`, `SQSUB`, `UQADD` and `UQSUB` at all four element widths for
+those loops. It did **not** choose `SQABS`/`SQNEG` for `saturating_abs` and
+`saturating_neg`, which lower to a compare-and-select, so those two have
+directed tests only; and nothing in ordinary Rust reaches `SUQADD`, `SQDMULH`,
+`SQXTUN`, the saturating shifts, or `FPSR.QC`.
+
+`fp_rules.rs`, `timer.rs`, the `FPSR.QC` half of `sat.rs` and the second half of
+`memory.rs` are directed tests transcribed from DDI 0487 rather than conformance
+evidence, and they say so. `timer.rs`, the `QC` cases in `sat.rs` and the
+exclusive-pair cases in `memory.rs` are there because the route to them through
+a compiler is closed: nothing in ordinary Rust reaches `FPSR.QC` or
 `CNTP_CTL_EL0`, and `AtomicU128` — which is what would lower to `LDXP`/`STXP`
 on a part without `FEAT_LSE` — is behind an unstable feature this pinned stable
 toolchain cannot use. What they buy instead of an oracle is the *route*: a
 vector table the guest installed, an `ERET` out of an interrupt handler, a
-`WFI` that ends because a comparator was reached, and a trapped `MRS` whose
-syndrome the handler acts on. Each was checked by **mutating the core** and
+`WFI` that ends because a comparator was reached, a trapped `MRS` whose
+syndrome the handler acts on, and an `MSR FPSR, XZR` before the instruction
+whose clamp is being observed. Each was checked by **mutating the core** and
 confirming a named case fails, which is the only way a directed test says
-anything about its own coverage.
+anything about its own coverage — and for `sat.rs` that exercise found two
+cases which could not fail, and fixed them.
 
 `fp_natural.rs` is the same oracle applied to **ordinary** compiled
 floating-point code: literal constants, accumulators starting at `0.0`, and

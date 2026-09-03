@@ -5,11 +5,12 @@ all client-side with nothing uploaded. It is also the harness that keeps the
 wasm target *exercised* rather than merely compiled — a target that builds but
 is never run is a target that quietly stops working.
 
-**Three of its machines need no ROM at all.** The module carries their images —
-rsemu's own monitors, one board's demonstration firmware, and the Woz Monitor of
-1976 — so the first thing on the page is a row of buttons rather than a file
-picker, and a visitor is typing at a 1976 monitor a few seconds after landing.
-The other three want a cartridge, which is the visitor's to supply.
+**Four of its machines need no file at all.** The module carries their images —
+rsemu's own monitors, one board's demonstration firmware, the Woz Monitor of
+1976, and rsemu's own legacy PC BIOS — so the first thing on the page is a row
+of buttons rather than a file picker, and a visitor is typing at a 1976 monitor,
+or watching a PC/AT post, a few seconds after landing. The other three want a
+cartridge, which is the visitor's to supply.
 
 It is a **Vue 3 application built by Vite**, published to
 <https://karpeleslab.github.io/rsemu/> by `.github/workflows/pages.yml`.
@@ -58,8 +59,8 @@ commit, because it is the boundary that must never rot.
 ### Why the `.wasm` lives in `public/`
 
 Vite copies `public/` to the site root **verbatim** — not hashed, not inlined,
-not transformed. That is exactly the treatment a 1.8 MB cargo build product
-wants. Nothing imports it, so Rollup never sees it, and the page fetches
+not transformed. That is exactly the treatment a three-megabyte cargo build
+product wants. Nothing imports it, so Rollup never sees it, and the page fetches
 `./rsemu.wasm` relative to itself.
 
 That relative fetch is also why `vite.config.js` sets `base: "./"`. The site is
@@ -99,7 +100,15 @@ Three layers, and it is what gates the Pages deploy:
    fake clock: two seconds of loop time, ~120 whole 256×240 blits, pause actually
    stopping the machine, step advancing exactly one frame, `Z` becoming
    controller bit `$80`, `FF00`↵ typed at RSMON coming back as a memory dump, and
-   the same at Wozmon through the page's own one-click path.
+   the same at Wozmon through the page's own one-click path. The PC/AT gets a
+   transcript of its own, read off the *picture*: after 240 frames the screen
+   has three lines of ink on it and nothing below them, and the nine-by-sixteen
+   block of pixels that is the `B` of `BIOS` on the banner is byte-identical to
+   the `B` of `Booting.` on the next line, and the two `o`s of `Booting.` to
+   each other. There is no font table and no OCR here — glyph *identity* is
+   what a screen full of words has and a test pattern does not. And
+   `decodeGuest` is checked on its own for all three line endings, because the
+   two it does not currently meet are the ones the next board will.
 
 Everything except the DOM, in other words. It does **not** prove Vue renders,
 that the layout works, or that anything is legible — nothing in this repository
@@ -124,25 +133,112 @@ the module it fetched, so this table describes the build rather than the page:
 | `apple1` | a console: RSMON, rsemu's own monitor | no |
 | `beneater-6502` | a serial console, and a choice of *two* monitors: RSMON, or the Woz Monitor of 1976 | no |
 | `spi-panel` | a picture with nothing uploaded: an RV32 board configures an ST7272A over SPI and paints a gradient | no |
+| `pc-at` | **firmware, running**: rsemu's own BIOS posts on the board's VGA at 720×400 | no — the `bios` slot takes your own image if you have one |
 
 The three that want a file sit in the same quadrant as each other and a
 different one from the rest: there is nothing to press until the visitor opens
 a cartridge, because rsemu ships none and never will (`ROADMAP.md` §1). The
-page says so — `bootHint` names the slot and the file picker is the only route
-in — and `check.mjs` proves the path anyway by generating a cartridge of its own
-for each of them.
+page says so — the picker puts the two quadrants in their own `<optgroup>`s,
+`bootHint` names the slot, and the file picker is the only route in — and
+`check.mjs` proves the path anyway by generating a cartridge of its own for
+each of them.
 
-What is deliberately **not** here, because the page would be worse for it: the
-bare boards (`z80-mini`, `m68k-mini`, `mips-mini`, `arm926`, `stm32f407`) want a
-firmware image and have neither a screen nor a console without one; `riscv-virt`
-wants a kernel or an SBI build and is the largest single thing this build could
-add; and the PC boards' BIOS is the user's to supply. `Cargo.toml`'s `demo`
-feature says the same thing where a reader will trip over it.
-
-The module is about **1.8 MB** (≈480 KB over the wire, gzipped). The Game Boy
-and the Master System cost **406 KB** of that between them — two CPU cores
-(SM83 and Z80) and two video chips, which is most of a console each; measured as
+The module is **3.05 MB** (≈775 KB over the wire, gzipped). The Game Boy and
+the Master System cost **406 KB** of that between them — two CPU cores (SM83
+and Z80) and two video chips, which is most of a console each; measured as
 1 416 362 bytes before and 1 822 234 after, both `--release` and unstripped.
+`pc-at` costs three times that again, and the next two sections are why.
+
+### `pc-at`, and what it costs
+
+This is the one board here that runs **firmware** rather than a monitor, and the
+only firmware rsemu ships or will: `fw-pcbios` assembles a 64 KiB real-mode ROM
+out of `src/fw/asm16`, with the MP, ACPI and SMBIOS tables generated from the
+machine description it is about to be put in. Every legacy PC BIOS anyone could
+otherwise reach for is GPL, and running one is fine while shipping one is not
+(`ROADMAP.md` phase 6a, and §1).
+
+With nothing uploaded, in a browser, it prints:
+
+```text
+rsemu BIOS, 639K base, 15360K extended
+Booting.
+No bootable device._
+```
+
+720×400 in two colours at the CRTC's own 70.09 Hz — `rsemu_frame_period_ns`
+reports 14 268 060 ns, so the page paces off the card rather than off the 60 Hz
+fallback. That is POST, a video BIOS handing back a mode, the tables being
+published, and `INT 19h` looking for a boot sector and not finding one, because
+nothing was uploaded. Bind your own image to the `bios` slot and it displaces
+rsemu's.
+
+**It costs 1 204 854 bytes**, and that number is what decided this whole list:
+1 844 822 before and 3 049 676 after, both `--release` and unstripped; 496 323
+and 774 438 gzipped, so ≈272 KB more over the wire. Roughly 520 KB of it is
+`cpu-x86`, which no cheaper x86 board avoids; about 350 KB is the chipset the
+machine file names — two 8259As, an 8254, an MC146818, an 8042, two 8237s, a
+VGA, a floppy controller, an IDE channel and a PCI host bridge, none of them
+optional, because `machines/pc-at.machine` names them all; and ~340 KB is the
+firmware assembler and its table generators, which enter the module only
+because something now calls them (`--features demo` without the wiring in
+`src/wasm.rs` measured 2 708 985 — a build that carried the board and could not
+have booted it).
+
+That is a 65% module and a 56% wire increase for one board, and it was still
+the right trade: it is the only entry in this catalog that boots firmware, and
+"a whole PC posting, client-side, with nothing uploaded" is a different claim
+from "a monitor prompt". One caveat worth knowing before pressing **Save to a
+file**: a `pc-at` snapshot is **16.7 MB**, because 16 MiB of guest RAM is in
+it. It works; it is just not a 200 KB NES state.
+
+### What is deliberately not here
+
+Measured the same way, each on top of the same baseline, `--release` and
+unstripped. (That baseline was 1 841 847 rather than the 1 844 822 above:
+these were taken before `src/wasm.rs` grew the two-armed `Builtin` and the
+empty-bay list, 2 975 bytes between them. Nothing here turns on that.)
+
+| Not added | Cost | Why not |
+| --- | --- | --- |
+| `riscv-virt` | +262 243 | wants a kernel or an SBI build, and rsemu ships neither |
+| `a64-mini` | +165 692 | wants a firmware image, and has neither a screen nor a console without one |
+| `m68k-mini` | +77 182 | same |
+| `mips-mini` | +60 648 | same |
+| `z80-mini` | +4 578 | same — and being nearly free is not a reason for a catalog row that cannot do anything |
+| `arm926`, `stm32f407` | — | same |
+| `q35` | +190 802 *on top of `pc-at`* | a second POST screen. Its `bios` slot does **not** in fact default to rsemu's image, whatever `Cargo.toml` used to say: neither `builtin_bios` in `src/bin/rsemu.rs` nor `builtin_media` in `src/ffi/abi.rs` has a `q35` arm |
+| `pc64`, `q35-linux` | +523 702 | they do reach a shell prompt on an uploaded `bzImage` — after several hundred *guest* seconds (`docs/platforms/pc64.md`), and with an initrd in a second media slot, which this ABI cannot bind |
+| `nvme-mini` | +358 717 | wants a disk image, and has neither a screen nor a console to show you it read it |
+| `xhci-pci-mini` | +466 147 | has no processor at all: it would realize, run, and be a black rectangle |
+| `ahci-mini`, `usb-mini`, `hub-mini`, `xhci-mini` | — | a firmware *and* a disk image, and nothing to look at either way |
+
+Two of those correct things this file used to say. `riscv-virt` is not "the
+largest single thing this build could add" any more — `pc-at` is, by more than
+three times. And the PC boards' BIOS is not the user's to supply any more; it
+is rsemu's, which is the entire reason `pc-at` is on the page.
+
+**What would change the answer.** A board that can reach a prompt in a browser
+without a file it does not have. Three specific things would do it, and none of
+them is in `web/`:
+
+* **A multi-slot media binding in the ABI.** `rsemu_boot` binds the uploaded
+  bytes to `entry.media.first()` and nothing else, so `pc-at` can take a BIOS
+  but not a boot floppy, and `pc64` cannot take a kernel *and* an initrd. A
+  `rsemu_stage_media(slot, len)` accumulating before `rsemu_boot` would give the
+  page "boot this floppy on rsemu's BIOS", which is the obvious next thing to
+  want from this board.
+* **A keyboard path.** `pc.kbc` opens a character port carrying **raw AT scan
+  codes**, so the page cannot type at a PC the way it types at an Apple 1.
+  `host::input`'s `KeyMap` (keysym → set-2 scan codes) and `KeyboardSink`
+  already exist for the VNC front end; one `rsemu_key(keysym, down)` export
+  would reuse both, and X11 keysyms for printable ASCII *are* the ASCII codes,
+  so the JavaScript side is nearly free. Until then `rsemu_has_console`
+  deliberately answers `0` for `pc-at` rather than putting a terminal pane in
+  front of a keyboard.
+* **A built-in demonstration program for one of the bare boards**, the way
+  `spi-panel` has one. `z80-mini` is 4.5 KB of module away from being on this
+  page; what it lacks is thirty bytes of Z80 to run.
 
 ## What is wired and what is not
 
@@ -156,6 +252,19 @@ and the Master System cost **406 KB** of that between them — two CPU cores
   `src/dev/wdc/wozmon.rs` and `docs/platforms/apple1.md` record the
   determination. Nothing of unclear provenance is shipped, and nothing is
   fetched at build time.
+
+  One of them is not a `&'static [u8]`. rsemu's BIOS is **assembled for the
+  board it is about to run in**, because its MP and ACPI tables describe that
+  machine's processors, so `machine::catalog::BuiltinImage` cannot hold it:
+  `src/wasm.rs` has a two-armed `Builtin` — static bytes, or this one — exactly
+  as `builtin_bios` in the CLI and `builtin_media` in the C ABI each do.
+* **Empty bays** — `machine::realize` refuses an *unbound* media slot, so a
+  PC's diskette drive, its video option-ROM socket and its second IDE bay have
+  to be bound as empty. `src/wasm.rs` binds the same eight slot names the CLI
+  does, for the same reason: a board that would not assemble without a floppy
+  in it describes no machine anyone owned. (`src/ffi/abi.rs` does not do this,
+  which is why building `pc-at` through the C ABI still fails on `vgabios`. Not
+  this page's bug, but the same one.)
 * **NES** — picture, yes: 256×240 RGBA at the machine's own frame rate, scaled
   by an integer factor and left hard-edged, with a 4:3 / 1:1 toggle because the
   ABI reports no pixel aspect. The keyboard is mapped to controller 1 and
@@ -171,6 +280,29 @@ and the Master System cost **406 KB** of that between them — two CPU cores
   because it offers a choice: RSMON, or Woz's monitor, whose prompt is a
   backslash and whose `FF00.FF0F` prints the bytes the *Apple-1 Operation
   Manual* prints. The console pane's help text follows whichever is running.
+* **`pc-at`** — the third display path, and the only one that is a *PC*:
+  `host::display::pc::capture` hands the module the VGA's scanout, which
+  reshapes itself when the guest sets a mode, so the page reads
+  `rsemu_frame_width` back after a frame and resizes its canvas from it.
+
+  It is also the machine that made the aspect toggle's *default* a decision.
+  4:3 is a **stretch** on every console here — a 256-pixel NES line becomes 320
+  CSS pixels and nothing is lost. On 720×400 it is a **squeeze**: a period VGA
+  monitor really did show those pixels narrower than they were tall, but it did
+  it in analogue, and a browser at integer scale 1 does it by throwing away two
+  columns in nine, which is most of a nine-pixel-wide glyph — the banner came
+  out as `rsevu ЗIOЁ`. So `defaultAspect` starts a picture at 1:1 when 4:3
+  would come out narrower than its own pixel count, and at 4:3 otherwise. Every
+  machine that was on this page before is unchanged by that rule (a Master
+  System is exactly 256 either way); the toggle still offers both and still
+  says which is which.
+
+  It has no console, and that is deliberate. `pc.kbc` opens a character port,
+  but every byte on it is a raw AT scan code in set 2 rather than a character
+  (`dev::pc::kbc`), so `src/wasm.rs` skips a port named `keyboard` when it looks
+  for one — the same line `src/bin/rsemu.rs` draws, by the same name. A terminal
+  pane in front of it would show an empty screen and send `0x41` for `A` meaning
+  the `9` key.
 * **`spi-panel`** — the second display path in the page, and the reason
   `rsemu_frame_ptr` is documented as RGBA rather than "whatever the adapter
   prefers": this board's scanout engine would rather hand out `RGB888`, and an
