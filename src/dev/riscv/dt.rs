@@ -293,7 +293,7 @@ impl Publications {
 }
 
 /// The kind a build's [`Publications`] is filed under.
-pub const KIND: HostKind = HostKind::new("riscv.dt");
+pub const KIND: HostKind = HostKind::rendezvous("riscv.dt");
 
 /// The name it is filed under: one per machine, so the name is a constant.
 const TABLE_NAME: &str = "dt";

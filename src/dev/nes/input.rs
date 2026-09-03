@@ -184,10 +184,11 @@ pub mod pads {
     use crate::core::error::Result;
     use crate::core::hosts::{HostKind, HostObjects};
     use crate::core::props::Props;
+    use crate::core::record::{Channel, FnSink, InputSink};
 
     /// The kind a pad port is filed under in a build's
     /// [`HostObjects`].
-    pub const KIND: HostKind = HostKind::new("pad");
+    pub const KIND: HostKind = HostKind::door("pad", make_sink);
 
     /// The a pad port `name` refers to in `hosts`, creating it on first mention.
     ///
@@ -240,6 +241,67 @@ pub mod pads {
     #[must_use]
     pub fn names(hosts: &HostObjects) -> Vec<String> {
         hosts.names(KIND)
+    }
+
+    /// How many bytes one recorded press is: controller 1, then controller 2.
+    ///
+    /// One byte per controller, which is `dev::sms::io::pads`'s shape without
+    /// its third byte — a Master System has two buttons on the console itself
+    /// and an NES-001 has none that reach the port. Both ports in one record
+    /// for the same reason either way: a console samples them off one strobe,
+    /// so what a recording holds is the state of both at that instant.
+    pub const RECORD_BYTES: usize = 2;
+
+    /// The record/replay channel the pads called `name` are pressed through.
+    ///
+    /// `pad:nes-pads`, which is the same `(kind, name)` pair the host-object
+    /// table files the port under — so a board whose controllers have no
+    /// channel is named by this string when
+    /// [`HostObjects::seal`](crate::core::hosts::HostObjects::seal) refuses it.
+    #[must_use]
+    pub fn channel(name: &str) -> Channel {
+        Channel::new(KIND, name)
+    }
+
+    /// The [`InputSink`] that applies a recorded payload to `pad`.
+    ///
+    /// [`RECORD_BYTES`] bytes: the held mask of controller 1 and then of
+    /// controller 2, in [`buttons`](super::buttons) order. Level rather than
+    /// edge, because that is what a 4021's parallel inputs are; a *press* is
+    /// two payloads, one with the bit set and one without.
+    ///
+    /// A longer payload is that state changing more than once and each group is
+    /// applied in turn; a short trailing group applies the bytes it has, so a
+    /// host that only ever touches controller 1 may post one byte.
+    ///
+    /// No rewind hook: a held mask is a level, and the level is part of the
+    /// machine snapshot a rewind restores.
+    ///
+    /// This pair did not exist, which is the failure `core::record` calls the
+    /// invisible one: `open()` shipped without it, nothing failed, and a
+    /// recorded NES session simply had no buttons in it.
+    #[must_use]
+    pub fn sink(pad: &Arc<Pad>) -> Arc<dyn InputSink> {
+        let pad = Arc::clone(pad);
+        Arc::new(FnSink::new("pad", move |payload: &[u8]| {
+            for group in payload.chunks(RECORD_BYTES) {
+                for (port, held) in group.iter().enumerate() {
+                    pad.set(port, *held);
+                }
+            }
+        }))
+    }
+
+    /// [`sink`], reached through the erased handle the host-object table holds.
+    ///
+    /// What [`KIND`] carries so that
+    /// [`HostObjects::seal`](crate::core::hosts::HostObjects::seal) can wire
+    /// this pad port to a recorder without the caller having to name it. `None`
+    /// means something that is not a [`Pad`] is filed under `pad` — two
+    /// modules claiming one kind name, which the seal reports rather than
+    /// guesses at.
+    fn make_sink(object: &Arc<dyn core::any::Any + Send + Sync>) -> Option<Arc<dyn InputSink>> {
+        Some(sink(&Arc::clone(object).downcast::<Pad>().ok()?))
     }
 }
 

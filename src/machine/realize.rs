@@ -18,17 +18,23 @@
 //! 3. **Construct** every device through the registry. Two-phase construction
 //!    (§4.4): this validates properties and allocates, and does nothing
 //!    observable.
-//! 4. **Realize** every device, in declaration order, draining its deferred
+//! 4. **Seal** the host-object table, if a
+//!    [recorder](RealizeOptions::recorder) was given: every input door the
+//!    devices opened is wired to it, and one that cannot be fails the build.
+//!    Here and nowhere else, because this is the only point at which the doors
+//!    are open and nothing has acted yet —
+//!    [`core::record`](crate::core::record) has the argument.
+//! 5. **Realize** every device, in declaration order, draining its deferred
 //!    actions after each. A failure here unrealizes what was already realized
 //!    and returns — a half-wired machine never escapes this function.
-//! 5. **Map** every `map` statement into its space, through
+//! 6. **Map** every `map` statement into its space, through
 //!    [`AddressSpace::topology`](crate::core::space::AddressSpace::topology).
 //!    Nothing about this step is final any more: a space stays retopologisable
 //!    after realize, which is what hot-plug and a BAR move need.
-//! 6. **Bind**: hand each device its clock domain and its address space.
-//! 7. **Wire** (§4.3): build one [`Wire`] per net, connect sinks weakly, hand
+//! 7. **Bind**: hand each device its clock domain and its address space.
+//! 8. **Wire** (§4.3): build one [`Wire`] per net, connect sinks weakly, hand
 //!    each driving pin its [`WireSource`].
-//! 8. **Reset** cold, then **sweep**: walk wire sources in topological order
+//! 9. **Reset** cold, then **sweep**: walk wire sources in topological order
 //!    and announce their levels, or the machine comes up with an inverter
 //!    idling low. The order is
 //!    [`validate::realize_order`](crate::machine::validate::realize_order)'s —
@@ -116,6 +122,7 @@ use crate::core::device::{
 use crate::core::error::{Error, Result};
 use crate::core::hosts::HostObjects;
 use crate::core::props::{Media, Props, Value, ValueKind};
+use crate::core::record::Recorder;
 use crate::core::registry::Registry;
 use crate::core::sched::{Scheduler, SchedulerConfig};
 use crate::core::space::{
@@ -566,6 +573,30 @@ pub struct RealizeOptions {
     /// [`Props::host`](crate::core::props::Props::host), and it is still here
     /// afterwards for the host that wants the other end.
     pub hosts: Arc<HostObjects>,
+    /// The record/replay seam to build this machine **onto**, if the caller is
+    /// recording or replaying one.
+    ///
+    /// This is what engages the enforcement rather than merely offering it.
+    /// Given one, realize seals [`hosts`](RealizeOptions::hosts) against it
+    /// once every device has been constructed and attaches it to the finished
+    /// machine, so:
+    ///
+    /// * every input door a device opened is wired to the recorder, whether or
+    ///   not the caller knew the board had one — which is how `rsemu run …
+    ///   --record-input` records a console whose port name comes out of the
+    ///   machine file;
+    /// * a door whose module ships no `sink()` **fails the build**, naming it,
+    ///   instead of producing a recording that is quietly missing a stream;
+    /// * and a board that is not in a deterministic threading mode fails too,
+    ///   because [`Machine::set_recorder`](crate::machine::Machine::set_recorder)
+    ///   refuses one.
+    ///
+    /// `None` is the escape hatch and the default: a machine nobody is
+    /// recording is built exactly as it always was, with an open table. The
+    /// alternative — sealing unconditionally — would refuse every board in the
+    /// tree the moment a device grew an input, for a run that had no interest
+    /// in replaying.
+    pub recorder: Option<Arc<Recorder>>,
 }
 
 impl RealizeOptions {
@@ -590,6 +621,14 @@ impl RealizeOptions {
     #[must_use]
     pub fn with_hosts(mut self, hosts: Arc<HostObjects>) -> Self {
         self.hosts = hosts;
+        self
+    }
+
+    /// Build onto `recorder`: seal the host-object table against it and attach
+    /// it to the machine. See [`recorder`](RealizeOptions::recorder).
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: Arc<Recorder>) -> Self {
+        self.recorder = Some(recorder);
         self
     }
 }
@@ -687,9 +726,26 @@ impl<'a> Realizer<'a> {
         self.build_spaces()?;
         self.build_clocks()?;
         self.construct()?;
+        // The record/replay seal, and the one step that happens *between* the
+        // two construction phases. It has to be after `construct`, because that
+        // is when a device opens the host objects it wants and the seal wires
+        // the doors among them to the recorder; and it has to be before
+        // `assemble`, because nothing observable may have happened when it
+        // refuses. Two-phase construction is what makes that window exist.
+        if let Some(recorder) = &self.options.recorder {
+            self.options.hosts.seal(Arc::clone(recorder))?;
+        }
         // From here on a failure has to undo what realize already did, so the
         // rest is wrapped: nothing observable may survive a failed realize.
-        match self.assemble() {
+        let built = self.assemble().and_then(|mut machine| {
+            if let Some(recorder) = &self.options.recorder {
+                // Refuses a non-deterministic threading mode, and diffs the
+                // shape a replayed recording was taken from.
+                machine.set_recorder(Arc::clone(recorder))?;
+            }
+            Ok(machine)
+        });
+        match built {
             Ok(machine) => Ok(machine),
             Err(e) => {
                 self.unrealize_all();

@@ -392,7 +392,7 @@ pub mod pads {
     use crate::core::record::{Channel, FnSink, InputSink};
 
     /// The kind a pad port is filed under in a build's [`HostObjects`].
-    pub const KIND: HostKind = HostKind::new("pad");
+    pub const KIND: HostKind = HostKind::door("pad", make_sink);
 
     /// The pad port `name` refers to in `hosts`, creating it on first mention.
     ///
@@ -440,6 +440,18 @@ pub mod pads {
     #[must_use]
     pub fn names(hosts: &HostObjects) -> Vec<String> {
         hosts.names(KIND)
+    }
+
+    /// [`sink`], reached through the erased handle the host-object table holds.
+    ///
+    /// What [`KIND`] carries so that
+    /// [`HostObjects::seal`](crate::core::hosts::HostObjects::seal) can wire
+    /// this pad port to a recorder without the caller having to name it. `None`
+    /// means something that is not a [`GbPad`] is filed under `pad` — two
+    /// modules claiming one kind name, which the seal reports rather than
+    /// guesses at.
+    fn make_sink(object: &Arc<dyn core::any::Any + Send + Sync>) -> Option<Arc<dyn InputSink>> {
+        Some(sink(&Arc::clone(object).downcast::<GbPad>().ok()?))
     }
 
     /// The record/replay channel the pad called `name` is pressed through.

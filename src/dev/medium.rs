@@ -201,7 +201,16 @@ impl Medium for RamStore {
 // ---------------------------------------------------------------------------
 
 /// The kind a drive medium is filed under in a build's [`HostObjects`].
-pub const KIND: HostKind = HostKind::new("medium");
+///
+/// [`pulled`](HostKind::pulled), which is the only use of that word in the
+/// tree and is a statement about a hole rather than about safety. Host bytes
+/// really do cross into a machine here — a drive's image is host state — but
+/// the guest asks for a sector when it wants one instead of receiving it at an
+/// instant, so no `(instant, payload)` log describes it and a sealed
+/// host-object table has nothing to demand. What this needs is an identity
+/// check on the image, which is [`Snapshot::Reference`] and a weak one;
+/// [`core::record`](crate::core::record)'s table lists it as uncovered.
+pub const KIND: HostKind = HostKind::pulled("medium");
 
 /// Where a medium slot's lock sits in the ranked order.
 ///
