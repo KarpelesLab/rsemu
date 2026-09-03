@@ -601,9 +601,9 @@ fn the_apic_timer_fires_at_a_tick_the_scheduler_chose() {
 /// "If the timer is set for periodic mode, the current-count register is
 /// automatically reloaded from the initial-count register whenever the
 /// current-count register reaches 0 and an interrupt is generated" (SDM Vol 3A
-/// §10.5.4). The count below is the whole assertion: 100 000 bus ticks of a
-/// 100 MHz crystal is a millisecond, so three and a half milliseconds of
-/// virtual time contains exactly three expiries — and the reload, not the
+/// §10.5.4). The count below is the whole assertion: [`TIMER_PERIOD`] bus ticks
+/// of a 100 MHz crystal is five milliseconds, so three and a half periods of
+/// virtual time contain exactly three expiries — and the reload, not the
 /// arming, produced two of them.
 #[test]
 fn a_periodic_apic_timer_interrupts_once_a_period() {
