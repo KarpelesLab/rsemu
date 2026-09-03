@@ -379,6 +379,63 @@ would close that gap. And the guest moves 512 bytes out to 8 MiB and back with
 `INT 15h AH=87h`, the one service that reaches above the first megabyte from
 real mode.
 
+### The tables an operating system enumerates the board through
+
+POST is not enough to make a second processor usable: something has to *say*
+it is there. The ROM carries the structures that do, as data, at `0xf8000` —
+inside the BIOS segment, which is the third of the three places the
+*MultiProcessor Specification* §4 allows and the second of ACPI §5.2.5.1's two:
+
+| At | Structure |
+| --- | --- |
+| `0xf8000` | the MP floating pointer, `_MP_` |
+| `0xf8010` | the MP configuration table, `PCMP` |
+| after it | the ACPI RSDP, then the DSDT, MADT, FADT, XSDT and RSDT |
+| after those | the SMBIOS entry point, `_SM_`, and its structure table |
+
+**Every field in them is read out of the machine description**, which is what
+makes them worth having rather than a decoration: the processors are the
+board's `cpu.x86` objects, each APIC ID comes from the `pc.lapic` wired to that
+processor, the local and I/O APIC addresses are where the file maps them, and
+the interrupt entries come from the board's own double wiring — `pit0.out0`
+goes to `pic1.ir0` *and* `ioapic.irq2`, which is exactly the statement "ISA IRQ0
+is global system interrupt 2" that an operating system needs and that no
+firmware can invent. `src/fw/pcbios/platform.rs` does the reading;
+`src/fw/pcbios/tables.rs` does the byte layout.
+
+`tests/pc_at_tables.rs` is a guest that walks them: it searches the segment on
+16-byte boundaries for `_MP_`, follows the pointer, checks the configuration
+table's checksum, steps through `ENTRY COUNT` entries, and then does the same
+through the RSDP and the RSDT to the MADT. On the shipped board it reports one
+processor from both tables. On the same file with a second processor added it
+reports **two**, from the same firmware source — and given the *stock* image it
+reports one, which is the assertion that the tables come from the machine and
+not from a constant. `tests/kvm_pc_at_smp.rs` goes one further: its boot sector
+takes the application processor's local APIC ID out of the configuration table
+and sends the Start-Up to that, so the processor that runs is the processor the
+table named.
+
+What is *not* published is as deliberate. There is no FACS and the FADT
+declares `HW_REDUCED_ACPI`, because an AT has no ACPI hardware register
+interface at all — no PM1 block, no power management timer, no SCI, no SMI
+command port — and revision 5 introduced that flag precisely so a table would
+not have to claim registers at address zero. The DSDT is an empty `\_SB`
+scope for the same reason, and there is no MCFG (this board's configuration
+space is the `0xcf8` port pair) and no HPET table (nothing describes a
+processor with it).
+
+One thing the tables say is true of every real machine and not yet true of
+this model, and it is worth knowing before an operating system finds it: both
+tables have room for **one** local APIC address, because on real silicon every
+processor reaches its own APIC at the same physical address. rsemu models each
+local APIC as a separate device with its own mapping, so a second processor's
+lands somewhere else — `0xfef00000` in `tests/kvm_pc_at_smp.rs`. An
+application processor that reads its own APIC ID through the architectural
+`0xfee00000` therefore reads the bootstrap processor's. Enumerating and
+starting the second processor works; code running on it that programs "its"
+APIC is programming the first one. The fix is a per-processor alias of one page
+in the board model, not in the firmware.
+
 ### FreeDOS boots
 
 `ROADMAP.md` phase 6a's gate, and it is met. `tests/pc_at_boot.rs` boots a
@@ -434,8 +491,13 @@ Two things the boot taught the firmware, neither predicted:
 - **No `INT 10h AH=11h`**, the character-generator group: `AL=30h` answers with
   a pointer to a font table and this ROM has no font in it, because the text is
   drawn by `pc.video`. FreeDOS calls it once while booting and does not mind.
-- **No PCI BIOS interface, no ACPI, no SMBIOS.** All three are phase-6a
-  deliverables and all three come after a boot.
+- **No PCI BIOS interface** (`INT 1Ah AH=B1h`), which is the one phase-6a
+  firmware deliverable still outstanding. **ACPI and SMBIOS are published**:
+  the ROM carries an MP 1.4 floating pointer and configuration table, an ACPI
+  RSDP/RSDT/XSDT/FADT/MADT/DSDT set and an SMBIOS structure table at
+  `0xf8000`, all generated from the machine description, so the processors the
+  board declares are the processors an operating system finds
+  (`src/fw/pcbios/tables.rs`, `tests/pc_at_tables.rs`).
 - **Text mode only**, because `pc.video` is a text-mode CRTC. `INT 10h AH=00h`
   records a graphics mode and changes nothing.
 - **`INT 10h AH=06h` scrolls the whole screen** when the line count is

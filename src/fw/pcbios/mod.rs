@@ -63,13 +63,27 @@
 //! | `INT 1Ah` | the tick count and the real-time clock |
 //! | `INT 08h`/`09h` | the timer and keyboard interrupt service routines |
 //!
+//! It also **publishes the tables an operating system enumerates the board
+//! through**, as data in the ROM at [`TABLES_OFFSET`]: an MP 1.4 floating
+//! pointer and configuration table, an ACPI RSDP with an RSDT, XSDT, FADT,
+//! MADT and DSDT, and an SMBIOS structure table. Every one of them is
+//! generated from the *machine description* — see [`platform`] for what is read
+//! out of it and [`tables`] for the byte layout — so a board with a second
+//! processor in it publishes a table with two, which is the whole point:
+//! `tests/kvm_pc_at_smp.rs` could start a second processor before this existed
+//! and no operating system could have found it.
+//!
 //! # What it does not do
 //!
 //! Named rather than discovered later:
 //!
-//! * **No PCI BIOS interface (`INT 1Ah AH=B1h`)** and no ACPI or SMBIOS tables.
-//!   `ROADMAP.md` phase 6a names all three; they come after a boot, and a boot
-//!   without them is the milestone.
+//! * **No PCI BIOS interface (`INT 1Ah AH=B1h`).** `ROADMAP.md` phase 6a names
+//!   it beside the tables above; unlike them it is a set of `INT 1Ah`
+//!   functions rather than a structure in memory, and nothing on this board
+//!   has asked for one.
+//! * **No FACS, no MCFG, no HPET table, and a nearly empty DSDT.** Each is a
+//!   claim about hardware this board does not have; [`tables`] says which and
+//!   why.
 //! * **`INT 15h AH=89h`, switch to protected mode, returns carry.** `AH=87h`
 //!   is here; handing the machine over permanently is not, and no guest needs
 //!   it — every one of them sets protected mode up itself.
@@ -98,9 +112,14 @@ use crate::fw::asm16::{AX, Asm, DS, Label, Mem, R16, SP, Sreg};
 
 mod disk;
 mod keyboard;
+pub mod platform;
 mod post;
 mod system;
+pub mod tables;
 mod video;
+
+pub use platform::Platform;
+pub use tables::Tables;
 
 #[cfg(test)]
 mod tests;
@@ -131,6 +150,16 @@ const BDA_SEGMENT: u16 = 0x0040;
 /// Where the POST stack lives — immediately below the boot sector's landing
 /// pad, so the two never overlap.
 const POST_STACK: u16 = 0x7c00;
+
+/// Where the MP, ACPI and SMBIOS tables are laid out inside the image.
+///
+/// Halfway up the socket: the code below occupies the first few kilobytes and
+/// asserts that it has not reached here, and the tables have the rest of the
+/// segment. The physical address that follows from it is `0xf8000`, which is
+/// inside every search window the three specifications define ([`tables`]) —
+/// being *inside the BIOS ROM* is the property that matters, not the
+/// particular offset.
+pub const TABLES_OFFSET: u16 = 0x8000;
 
 /// Where `IDENTIFY DEVICE` data is staged during POST. Below the stack and
 /// below the boot sector, and dead by the time either matters.
@@ -476,10 +505,15 @@ const MODEL_BYTE: u8 = 0xfc;
 /// jump.
 const RESET_VECTOR: u16 = 0xfff0;
 
-/// Assemble the ROM.
+/// Assemble the ROM for `machines/pc-at.machine` as it ships.
 ///
 /// Deterministic: the same source produces the same 65,536 bytes on every host,
 /// and this module's own tests assert it.
+///
+/// The tables it publishes describe [`Platform::at`] — one processor. A board
+/// with two needs [`image_for`] or [`image_for_machine`], because a table that
+/// says "one processor" on a two-processor board is how an operating system
+/// comes to run on half a machine.
 ///
 /// # Panics
 ///
@@ -488,6 +522,22 @@ const RESET_VECTOR: u16 = 0xfff0;
 /// cause, and both would otherwise ship as a ROM that does not boot.
 #[must_use]
 pub fn image() -> Vec<u8> {
+    image_for(&Platform::at())
+}
+
+/// Assemble the ROM for a board this firmware is about to be put in.
+///
+/// The code is the same in every image; what changes is the tables
+/// [`tables::generate`] lays into it, which is why this takes a [`Platform`]
+/// rather than a processor count: an operating system needs the APIC IDs, the
+/// I/O APIC and the interrupt assignments too, and all of them come from the
+/// same description.
+///
+/// # Panics
+///
+/// As [`image`].
+#[must_use]
+pub fn image_for(platform: &Platform) -> Vec<u8> {
     // 0xff, because that is what an erased EPROM holds and what this board's
     // `unassigned = read-as-ones` answers with: a jump into a gap then behaves
     // the same way whether the gap is inside the chip or outside it.
@@ -499,6 +549,24 @@ pub fn image() -> Vec<u8> {
     keyboard::emit(&mut a, &l);
     disk::emit(&mut a, &l);
     system::emit(&mut a, &l);
+
+    // The tables, as data. Nothing branches into them and POST does not copy
+    // them: an operating system finds them by searching this segment, which is
+    // where all three specifications say to look.
+    assert!(
+        a.here() <= TABLES_OFFSET,
+        "the firmware's code reached {:#06x} and would overwrite its own tables",
+        a.here()
+    );
+    let base = (u32::from(SEGMENT) << 4) + u32::from(TABLES_OFFSET);
+    let tables = tables::generate(base, platform);
+    assert!(
+        tables.bytes.len() <= usize::from(RESET_VECTOR - TABLES_OFFSET),
+        "the tables do not fit in the socket: {} bytes",
+        tables.bytes.len()
+    );
+    a.seek(TABLES_OFFSET);
+    a.db(&tables.bytes);
 
     // The reset vector and the identification bytes an AT puts in the last
     // sixteen. RBIL's `MEMORY.LST` and the AT's published memory map: the date
@@ -519,4 +587,26 @@ pub fn image() -> Vec<u8> {
         .fold(0u8, |acc, &b| acc.wrapping_add(b));
     bytes[SIZE - 1] = 0u8.wrapping_sub(sum);
     bytes
+}
+
+/// Assemble the ROM for the board `text` describes.
+///
+/// The form a caller who has a `.machine` file in hand wants: `rsemu run
+/// pc-at` takes this route, so a user who adds a second processor to their copy
+/// of the board gets firmware that says so.
+///
+/// The text is resolved with the description's *own* parameter defaults, which
+/// is the only thing a media slot can do — the image has to exist before
+/// [`crate::machine::build`] is called, so there is no resolved machine to take
+/// overrides from. A board whose processor count came from a `param` a caller
+/// overrides should resolve it itself and go through
+/// [`Platform::from_resolved`], which is public for exactly that.
+///
+/// # Errors
+///
+/// [`crate::Error::Config`] if `text` is not a machine description, or
+/// describes a board with no processor or no local APIC — see
+/// [`Platform::from_machine`].
+pub fn image_for_machine(file: &str, text: &str) -> crate::Result<Vec<u8>> {
+    Ok(image_for(&Platform::from_machine(file, text)?))
 }

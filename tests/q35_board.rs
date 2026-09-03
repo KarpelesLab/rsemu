@@ -950,8 +950,11 @@ fn listen(m: &Machine) -> Arc<DebugPort> {
 /// the whole `0xe0000`-`0xfffff` band, which is where this board stages its
 /// generated ACPI tables — so the board is told to give it up and put them at
 /// `0xd0000`. That is not a workaround: a firmware that fills the band is a
-/// firmware that publishes its own tables, and this board's generated set
-/// exists precisely because `src/fw/pcbios` does not yet.
+/// firmware that publishes its own tables, which is what any firmware in this
+/// socket does — `src/fw/pcbios` included, since it publishes its own set from
+/// inside its ROM at `0xf8000`. Where both are present the lower address wins
+/// the *ACPI* §5.2.5.1 search, and the device's set is the one that describes
+/// this chipset.
 ///
 /// # What this measured, at the time it was written
 ///
