@@ -32,7 +32,10 @@
 //!   insn    ff dd dd dd dd form selector, then the fields
 //! ```
 //!
-//! `form` and `fields` go straight to `differential::synthesize`, which turns
+//! `form` and `fields` go straight to `differential::synthesize` — or to
+//! `synthesize64` where the header asks for long mode, because the two worlds
+//! do not share encodings: `40`-`4f` are `INC` and `DEC` in one and the `REX`
+//! prefix in the other. Either turns
 //! any pair of numbers into an encoding *inside the lifted subset*. That bias
 //! is the whole point: a uniformly random byte is almost never the start of one
 //! of the hundred-odd encodings this frontend lifts, so an unbiased target
@@ -44,17 +47,19 @@
 //! `state_roundtrip` gives: a dependency bump must not reinterpret every
 //! committed seed.
 //!
-//! # Twelve frontends
+//! # Twelve frontends, in three worlds
 //!
 //! The header's first byte picks a [`Shape`], a [`Smc`] policy and a [`Flags`]
 //! policy, and whether the run goes through `compare` or through
 //! `compare_cached`. All of them are separate frontends in everything that
 //! matters — every one is in the block's cache key, and each emits different IR
-//! from the same bytes.
+//! from the same bytes. Two more bits pick the *world*: 32-bit protected mode,
+//! the same with `CR0.PG` set, or long mode — which is paged by construction,
+//! because `EFER.LMA` is set only when `CR0.PG` goes on with `EFER.LME`.
 
 use libfuzzer_sys::fuzz_target;
 
-use rsemu::cpu::x86::differential::{Case, compare, compare_cached, synthesize};
+use rsemu::cpu::x86::differential::{Case, compare, compare_cached, synthesize, synthesize64};
 use rsemu::cpu::x86::lift::{Flags, Shape, Smc};
 
 /// Bytes per synthesized instruction in the input encoding.
@@ -94,6 +99,12 @@ fuzz_target!(|data: &[u8]| {
     // on the page its entry translation resolved to. `Case::paged` forces the
     // part and the store policy that world requires.
     let paged = policies & 0x20 != 0;
+    // The fifth world: long mode, which is the fourth plus `CR4.PAE`,
+    // `EFER.LME` and a code segment with its `L` bit set — sixteen registers,
+    // a `REX` prefix, a 64-bit operand size and `RIP`-relative addressing. It
+    // needs its own encodings, because `40`-`4f` are `INC` and `DEC` in one
+    // world and the prefix in the other.
+    let long = policies & 0x40 != 0;
 
     let available = (data.len() - HEADER) / STRIDE;
     let want = 1 + usize::from(data[1]) % MAX_INSNS;
@@ -104,7 +115,11 @@ fuzz_target!(|data: &[u8]| {
         let at = HEADER + i * STRIDE;
         let form = u32::from(data[at]);
         let fields = u32::from_le_bytes([data[at + 1], data[at + 2], data[at + 3], data[at + 4]]);
-        let insn = synthesize(form, fields);
+        let insn = if long {
+            synthesize64(form, fields)
+        } else {
+            synthesize(form, fields)
+        };
         // A case's program lives in the first page, which the harness asserts
         // rather than tolerates.
         if program.len() + insn.len() >= 4000 {
@@ -120,11 +135,17 @@ fuzz_target!(|data: &[u8]| {
     program.push(0xf4);
 
     let seeded = Case::seeded(program).with_shape(shape).with_smc(smc).with_flags(flags);
-    let mut case = if paged { seeded.paged() } else { seeded };
+    let mut case = if long {
+        seeded.long()
+    } else if paged {
+        seeded.paged()
+    } else {
+        seeded
+    };
     // A third of the register file comes from the input, so a generated program
     // meets values it did not compute — the boundary conditions of every flag
     // live at the edges of a register, not in the middle.
-    case.regs[5] = u32::from(data[2]) << 24 | u32::from(data[3]);
+    case.regs[5] = u64::from(data[2]) << 56 | u64::from(data[3]);
     case.regs[6] = case.regs[5].rotate_left(11);
     case.regs[7] = !case.regs[5];
 
