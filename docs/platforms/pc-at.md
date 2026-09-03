@@ -424,17 +424,76 @@ scope for the same reason, and there is no MCFG (this board's configuration
 space is the `0xcf8` port pair) and no HPET table (nothing describes a
 processor with it).
 
+### The one page every processor has to see differently
+
 One thing the tables say is true of every real machine and not yet true of
 this model, and it is worth knowing before an operating system finds it: both
-tables have room for **one** local APIC address, because on real silicon every
-processor reaches its own APIC at the same physical address. rsemu models each
-local APIC as a separate device with its own mapping, so a second processor's
-lands somewhere else — `0xfef00000` in `tests/kvm_pc_at_smp.rs`. An
-application processor that reads its own APIC ID through the architectural
-`0xfee00000` therefore reads the bootstrap processor's. Enumerating and
-starting the second processor works; code running on it that programs "its"
-APIC is programming the first one. The fix is a per-processor alias of one page
-in the board model, not in the firmware.
+tables have room for **one** local APIC address (*MP* §4.2's `ADDRESS OF LOCAL
+APIC`, *ACPI* §5.2.12's Local Interrupt Controller Address), because on real
+silicon every processor reaches its own APIC at the same physical address.
+rsemu models each local APIC as a separate device with its own mapping, so a
+second processor's lands somewhere else — `0xfef00000` in
+`machines/pc-apic.machine` and in `tests/kvm_pc_at_smp.rs`. An application
+processor that reads its own APIC ID through the architectural `0xfee00000`
+therefore reads the bootstrap processor's. Enumerating and starting the second
+processor works; code running on it that programs "its" APIC is programming the
+first one.
+
+**This is why no `pc-at-smp.machine` is shipped.** `tests/kvm_pc_at_smp.rs`
+patches this file's text at run time to add the second processor, and says so
+where it does it. A board file would be a promise, and until the page is
+per-processor it would be a promise this model does not keep for any operating
+system that actually schedules on the second core.
+
+#### What it would take, since "a per-processor alias" is not one thing
+
+The obvious reading — teach `core::space` a mapping whose target depends on who
+is asking — is the expensive one and is not needed. Decode there is strictly
+`address → FlatEntry`: `RegionKind` is `Ram | Rom | Io | Alias | Container`,
+`FlatTarget` is `Ram | Rom | Io`, and nothing on the lookup path branches on
+the initiator, so a *mapping* keyed on the processor would mean a new region
+kind, a fourth flat target, and a branch on the hot path for something almost
+no board wants.
+
+It does not have to be a mapping, because **the initiator is already carried**.
+`MemAttrs` has a `RequesterId` field, `src/machine/realize.rs` allocates every
+object a distinct one at realize time, `cpu.x86` stamps its own on every access
+it makes, and both of KVM's exit paths rebuild the attributes with the vCPU's.
+That value reaches `MemOps::read` and `MemOps::write` at the leaf, unchanged,
+on the interpreter and under KVM alike. Nothing in the tree reads it back
+today; a per-processor APIC window would be its **first** consumer, which is
+precisely the "per-master filter" the field's own documentation says it exists
+for. So the window can be an ordinary device with an ordinary region that
+demultiplexes on `attrs.requester`, and `core::space` needs no change at all.
+
+Two smaller things are genuinely missing, and they are the whole of the work:
+
+1. **A device cannot learn a *peer's* requester id.** `BindCtx` answers
+   `requester()` for itself and `export(path, which)` for a neighbour's
+   published handle, but there is nothing that answers "what id does `cpu1`
+   stamp on its accesses?" — and a machine file must never write the number
+   down, because it is allocated by declaration order. The `peers` slice inside
+   `BindCtx` already carries it; this is an accessor, not a mechanism.
+2. **The firmware's survey has to keep working.** `platform.rs` derives the one
+   local APIC address in both tables from *where the bootstrap `pc.lapic`'s own
+   `regs` region is mapped*. Put the architectural page on a different object
+   and that survey reports the wrong address or fails outright — and
+   `tests/pc_at_tables.rs`'s negative control, the one that proves the tables
+   follow the machine, is exactly what catches it. Either the survey learns
+   about the window class, or the window is declared *over* a mapping the
+   bootstrap APIC still owns (`map … = target { priority = 1 }` is spellable
+   today).
+
+There is a third option and it may be the honest one: **decode the page on the
+processor.** On real silicon the APIC aperture is on the die and never reaches
+the bus at all, which is the actual reason every processor sees a different
+thing at one address. `cpu.x86` already holds the `LocalController` the wire
+seam handed it and already implements `IA32_APIC_BASE` — as *reported, not
+obeyed*, because moving the window is a retopology and a device does not get to
+do that to itself. A decode of `[APIC_BASE, +0x1000)` ahead of the bus would
+make the MSR obeyed, give every processor its own page at `0xfee00000`, and
+take the second page off the board entirely; the cost is one compare on the
+MMIO path and a board question moving into a CPU core.
 
 ### FreeDOS boots
 
