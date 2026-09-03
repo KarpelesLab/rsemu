@@ -38,6 +38,13 @@
 //! sources, an undriven pin sits low because that is what a fresh `FanIn`
 //! holds, and *every* recomputation runs from the pin levels rather than from a
 //! remembered decision.
+//!
+//! **A net here carries an assertion, not a voltage**, which is what decides
+//! the entry's input pin polarity bit: it is recorded and reported and it is
+//! *not* applied to the pin level. The reasoning is written out on
+//! `ENTRY_ACTIVE_LOW` below, and it is the difference between a board that
+//! boots and one whose processor stops retiring instructions the moment a
+//! driver unmasks a PCI interrupt.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -101,6 +108,31 @@ const ENTRY_LEVEL: u64 = 1 << 15;
 /// Its remote IRR (bit 14), read-only to software.
 const ENTRY_REMOTE_IRR: u64 = 1 << 14;
 /// Its input pin polarity (bit 13): set is active low.
+///
+/// **Recorded and reported, and deliberately not applied to the pin level.**
+/// The datasheet's bit describes the *electrical* sense of a physical pin
+/// (82093AA §3.2.4), and the pins this part is given are `core::wire` nets,
+/// which carry an **assertion**: a fresh `FanIn` holds every source low,
+/// `Resolve::Or` resolves an idle net low, and `ROADMAP.md` §4.3 states
+/// outright that an undriven wire sits low. Every driver in this tree agrees —
+/// `q35.lpc` reads `PIRQ[n]#`, an active-low pin on the silicon, as asserted
+/// when its net is *high*, and `dev/ppu` says the same of a 6502's `/NMI`.
+///
+/// So exclusive-oring this bit into the resolved net level does not model an
+/// active-low input; it makes one impossible. Nothing on any board here can
+/// hold a net high at idle, so an entry a guest programs active low is
+/// asserted from the instant it is unmasked — and for a level-triggered entry
+/// that is not one spurious interrupt but an unbounded stream of them, because
+/// remote IRR clears on every end-of-interrupt and the condition is still true
+/// (§3.2.4). The processor stops retiring instructions.
+///
+/// That is not hypothetical. PCI Local Bus 3.0 §2.2.6 makes `INTA#`-`INTD#`
+/// level-sensitive and active low, so a kernel programs *every* PCI interrupt's
+/// redirection entry that way, and `irq_startup()` unmasking the entry
+/// `_PRT` named was where `machines/q35-linux.machine` stopped booting.
+///
+/// A board that genuinely needs an inverted input says so once, with the
+/// `wire.not` §4.3 ships, which is where an inversion belongs.
 const ENTRY_ACTIVE_LOW: u64 = 1 << 13;
 /// Its delivery status (bit 12), read-only and always idle here.
 const ENTRY_DELIVERY_STATUS: u64 = 1 << 12;
@@ -109,10 +141,21 @@ const ENTRY_LOGICAL: u64 = 1 << 11;
 
 /// Which bits of an entry software may change.
 ///
-/// Delivery status and remote IRR are the part's, not the driver's; bits 17-55
-/// are reserved and read back as zero.
-const ENTRY_WRITABLE: u64 =
-    0xff00_0000_0000_0000 | (0x0001_ffff & !(ENTRY_DELIVERY_STATUS | ENTRY_REMOTE_IRR));
+/// Written out a field at a time, because the two the driver may *not* change
+/// sit in the middle of the ones it may: delivery status and remote IRR are the
+/// part's. Bits 17-55 are reserved and read back as zero; 63-56 are the
+/// destination.
+const ENTRY_WRITABLE: u64 = 0xff00_0000_0000_0000
+    | ENTRY_MASK
+    | ENTRY_LEVEL
+    | ENTRY_ACTIVE_LOW
+    | ENTRY_LOGICAL
+    // The delivery mode, bits 10-8, and the vector, bits 7-0.
+    | 0x0000_07ff;
+
+/// The invariant the field-at-a-time form above could silently lose: neither
+/// bit the part owns may be writable.
+const _: () = assert!(ENTRY_WRITABLE & (ENTRY_DELIVERY_STATUS | ENTRY_REMOTE_IRR) == 0);
 
 /// A redirection entry as it comes out of reset: masked, and nothing else
 /// (82093AA §3.2.4).
@@ -127,10 +170,9 @@ struct State {
     select: u8,
     /// The redirection table.
     redir: Vec<u64>,
-    /// What each input pin is doing, as a raw level before the entry's
-    /// polarity bit is applied. One bit per input, and **not** the same thing
-    /// as a pending request: an edge-triggered line that has already been
-    /// forwarded is still high.
+    /// What each input pin is doing, as its net resolved it. One bit per
+    /// input, and **not** the same thing as a pending request: an
+    /// edge-triggered line that has already been forwarded is still high.
     pins: u32,
 }
 
@@ -145,10 +187,13 @@ impl State {
         }
     }
 
-    /// Whether input `index` is asserting, which the entry's polarity decides.
+    /// Whether input `index` is asserting.
+    ///
+    /// The net's own level, and not the net's level exclusive-ored with the
+    /// entry's polarity bit — see `ENTRY_ACTIVE_LOW` for why the bit is
+    /// recorded rather than applied.
     fn asserted(&self, index: usize) -> bool {
-        let high = self.pins & (1 << index) != 0;
-        high != (self.redir[index] & ENTRY_ACTIVE_LOW != 0)
+        self.pins & (1 << index) != 0
     }
 
     /// The message entry `index` would send.
@@ -941,20 +986,95 @@ mod tests {
     }
 
     #[test]
-    fn an_active_low_entry_reads_the_pin_the_other_way_up() {
+    fn an_active_low_entry_still_reads_its_net_as_an_assertion() {
+        // This test used to assert the opposite, and asserting the opposite is
+        // what stopped `machines/q35-linux.machine` booting: a
+        // `core::wire` net carries an assertion rather than a voltage, and
+        // exclusive-oring the polarity bit into it makes an idle input read as
+        // asserted. See `ENTRY_ACTIVE_LOW`.
+        //
+        // A PCI interrupt is the case that matters, because PCI Local Bus 3.0
+        // §2.2.6 makes `INTx#` level-sensitive and active low and a kernel
+        // therefore programs every one of them this way.
         let b = bench();
         b.program(
             LINE,
             (ENTRY_ACTIVE_LOW as u32) | (ENTRY_LEVEL as u32) | u32::from(VECTOR),
             0,
         );
-        // The entry was written while the pin sat low, which for an active-low
-        // input *is* asserted, so it delivers on the spot.
+        assert!(
+            !b.requested(VECTOR),
+            "an unmasked level entry over an idle net must interrupt nobody"
+        );
+        assert_eq!(
+            b.io.entry(LINE).unwrap() & ENTRY_ACTIVE_LOW,
+            ENTRY_ACTIVE_LOW,
+            "and the bit the guest wrote still reads back"
+        );
+
+        // And the device asserting is what delivers it, once.
+        b.drive(LINE, Level::High);
         assert!(b.requested(VECTOR));
         assert_eq!(b.ack(), IntAckResponse::Vector(u32::from(VECTOR)));
-        b.drive(LINE, Level::High);
+        b.drive(LINE, Level::Low);
         b.eoi();
-        assert!(!b.requested(VECTOR), "and a high pin is idle");
+        assert!(!b.requested(VECTOR), "and a quiet device does not repeat");
+        assert_eq!(b.io.entry(LINE).unwrap() & ENTRY_REMOTE_IRR, 0);
+    }
+
+    /// The whole lifecycle, at the moment a driver unmasks a level-triggered
+    /// entry for a line its device may already be holding — which is what
+    /// `irq_startup()` does and where the `q35-linux` board stopped.
+    ///
+    /// Every transition the 82093AA datasheet §3.2.4 names, in order: masked
+    /// and asserted delivers nothing; the unmask delivers exactly one message
+    /// and latches remote IRR; the acknowledge moves it into the local APIC's
+    /// in-service register without the entry sending again; the
+    /// end-of-interrupt clears remote IRR and, the line still being held,
+    /// sends once more; and the device letting go is what finally ends it. The
+    /// count is the point — a level entry that re-sent on anything but an
+    /// end-of-interrupt would be an interrupt storm, and a processor in one
+    /// never retires another instruction.
+    #[test]
+    fn an_active_low_level_entry_delivers_once_per_end_of_interrupt_and_no_more() {
+        let low = (ENTRY_ACTIVE_LOW as u32) | (ENTRY_LEVEL as u32) | u32::from(VECTOR);
+        let b = bench();
+        b.program(LINE, (ENTRY_MASK as u32) | low, 0);
+
+        // The device asserts while the entry is still masked, which is the
+        // ordering a shared PCI interrupt makes ordinary.
+        b.drive(LINE, Level::High);
+        assert!(!b.requested(VECTOR), "masked");
+        assert_eq!(b.io.entry(LINE).unwrap() & ENTRY_REMOTE_IRR, 0);
+
+        // `irq_startup()`.
+        b.write_indirect(IDX_REDIR + 2 * LINE as u8, low);
+        assert!(b.requested(VECTOR), "the condition was true the whole time");
+        assert_eq!(
+            b.io.entry(LINE).unwrap() & ENTRY_REMOTE_IRR,
+            ENTRY_REMOTE_IRR
+        );
+
+        // Three round trips with the device still holding the line: one
+        // interrupt each, and never two.
+        for round in 0..3 {
+            assert_eq!(
+                b.ack(),
+                IntAckResponse::Vector(u32::from(VECTOR)),
+                "round {round}"
+            );
+            assert!(!b.requested(VECTOR), "round {round}: not while in service");
+            b.eoi();
+            assert!(b.requested(VECTOR), "round {round}: still asserting");
+        }
+
+        // The driver quiets the device, then ends the interrupt: the order a
+        // level-triggered handler has to use.
+        assert_eq!(b.ack(), IntAckResponse::Vector(u32::from(VECTOR)));
+        b.drive(LINE, Level::Low);
+        b.eoi();
+        assert!(!b.requested(VECTOR));
+        assert_eq!(b.io.entry(LINE).unwrap() & ENTRY_REMOTE_IRR, 0);
     }
 
     #[test]
