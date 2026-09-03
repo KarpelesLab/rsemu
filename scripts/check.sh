@@ -29,6 +29,7 @@
 #   test     --all-features, the default build, --no-default-features
 #   wasm     all three wasm targets, plus the browser cdylib
 #   combos   the derived no_std feature-*combination* builds (see below)
+#   crosshost  the replay gate on a second architecture (32-bit)
 #   sweep    every feature on its own — long; CI runs it on its own job
 #   fuzz     `cargo fuzz build` (needs a nightly and cargo-fuzz)
 #
@@ -51,7 +52,7 @@ export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
 export RUSTFLAGS="${RUSTFLAGS:--D warnings}"
 
-STAGES=(fast test wasm combos sweep fuzz)
+STAGES=(fast test wasm combos crosshost sweep fuzz)
 DEFAULT_STAGES=(fast test wasm combos)
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
@@ -198,6 +199,34 @@ stage_sweep() {
   done
   [ "$rc" -eq 0 ] && record "ok    feature sweep"
   return 0
+}
+
+# Phase 9's gate is "a recorded session replayed bit-identically on a *different
+# host*", and every other stage here runs on this one. `tests/record_replay.rs`
+# pins the recording and the resulting state hash as constants, so replaying
+# them under a second target is the whole test: same source, same constants,
+# different `usize`, different ABI, different code generator.
+#
+# i686 rather than aarch64 because it is the one installed target this machine
+# can also *run* -- a cross-compiled aarch64 binary needs an emulator that is
+# not assumed here. Skipped, not failed, when the target or its 32-bit runtime
+# is absent: a developer without them has lost nothing the CI matrix
+# (ubuntu/macos/windows) does not already check.
+stage_crosshost() {
+  local t=i686-unknown-linux-gnu
+  if ! rustc --print target-libdir --target "$t" >/dev/null 2>&1; then
+    record "skip  crosshost (target not installed: rustup target add $t)"
+    return 0
+  fi
+  local feats="std,machine-apple1"
+  if ! cargo build --target "$t" --no-default-features --features "$feats" \
+       >/dev/null 2>&1; then
+    record "skip  crosshost ($t does not link here: 32-bit runtime missing?)"
+    return 0
+  fi
+  run "crosshost replay ($t)" \
+    cargo test --target "$t" --no-default-features --features "$feats" \
+    --test record_replay
 }
 
 stage_fuzz() {
