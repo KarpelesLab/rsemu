@@ -408,8 +408,18 @@ machine "q35" {
 
   # -- firmware ---------------------------------------------------------------
   #
-  # The `bios` slot defaults to rsemu's own 64 KiB image and `--bios` displaces
-  # it. `align = "top"` puts the reset vector at the top of the socket; with a
+  # The `bios` slot is **empty unless bound** — `--bios` is how an image gets
+  # here. `builtin_bios` in `src/bin/rsemu.rs` matches the stem `pc-at` and
+  # nothing else, so this board does not get rsemu's own image by default, and
+  # it should not: that ROM's MP table describes a PC/AT, while `q35.acpi`
+  # publishes an ACPI set describing *this* machine as realized. A guest that
+  # found both would take the board's (ACPI 6.5 §5.2.5.1 searches the EBDA and
+  # then 0xE0000 upward, and the device's RSDP at 0xE0000 precedes a ROM's) —
+  # but a wrong MP table would still be sitting there for a legacy OS to trust.
+  # `tests/q35_board.rs` binds the image explicitly, which is the supported way
+  # to run it here.
+  #
+  # `align = "top"` puts the reset vector at the top of the socket; with a
   # 64 KiB socket and a 64 KiB image the alignment is moot, and it is written
   # anyway so a smaller image still lands where a processor looks.
   object bios   "pc.rom" { image = "bios",    size = biossize, align = "top" }
