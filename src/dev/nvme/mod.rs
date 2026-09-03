@@ -354,6 +354,10 @@ impl Nvme {
         let serial = r.or_str("serial", "RSEMU0000000000000001")?.to_string();
         let model = r.or_str("model", "RSEMU NVME CONTROLLER")?.to_string();
         let firmware = r.or_str("firmware", "1.0")?.to_string();
+        let uuid = match r.or_str("uuid", "")? {
+            "" => None,
+            text => Some(parse_uuid(text)?),
+        };
         let media = r.optional_media("image")?;
         let slot = media.map(crate::core::props::Media::name);
         let image = media.map(crate::core::props::Media::to_bytes);
@@ -434,6 +438,7 @@ impl Nvme {
                 model,
                 firmware,
                 io_queues: queues as u16,
+                uuid,
             },
         )
     }
@@ -622,9 +627,53 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "the firmware revision Identify Controller reports",
         },
+        PropertySpec {
+            name: "uuid",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "the namespace UUID the Identify Descriptor list reports (default: none,                       and the list comes back empty)",
+        },
     ],
     construct: |props| Ok(Box::new(Nvme::new(props)?)),
 };
+
+/// The sixteen bytes of a UUID written the way RFC 4122 §3 writes one.
+///
+/// `8-4-4-4-12` lower- or upper-case hexadecimal digits with four hyphens, and
+/// the bytes come out in the order they are written — which is the big-endian
+/// order NVMe §5.15.2.3 wants in the descriptor's `NID` field, so there is no
+/// swapping anywhere and a person can read the guest's `/dev/disk/by-id` entry
+/// straight off the machine file.
+fn parse_uuid(text: &str) -> Result<[u8; 16]> {
+    /// Where a hyphen belongs, counting hex digits seen.
+    const GROUPS: [usize; 4] = [8, 12, 16, 20];
+    let bad = || {
+        Error::Property(alloc::format!(
+            "{CLASS_NAME}: `uuid` is `{text}`, which is not one: RFC 4122 writes a UUID as \
+             8-4-4-4-12 hexadecimal digits, e.g. `2b1c9d3e-0000-4000-8000-000000000001`"
+        ))
+    };
+    let mut out = [0u8; 16];
+    let mut digits = 0usize;
+    for c in text.chars() {
+        if c == '-' {
+            if !GROUPS.contains(&digits) {
+                return Err(bad());
+            }
+            continue;
+        }
+        let nibble = c.to_digit(16).ok_or_else(bad)? as u8;
+        if digits >= 32 {
+            return Err(bad());
+        }
+        out[digits / 2] |= nibble << (4 * (1 - (digits % 2)));
+        digits += 1;
+    }
+    if digits != 32 || text.chars().filter(|c| *c == '-').count() != 4 {
+        return Err(bad());
+    }
+    Ok(out)
+}
 
 impl Device for Nvme {
     fn class(&self) -> &'static DeviceClass {
@@ -818,5 +867,6 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("serial", ValueKind::Str))
         .prop(PropSchema::new("model", ValueKind::Str))
         .prop(PropSchema::new("firmware", ValueKind::Str))
+        .prop(PropSchema::new("uuid", ValueKind::Str))
         .port(pin::IRQ, PortDir::Out)
 }
