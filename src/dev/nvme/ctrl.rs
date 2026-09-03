@@ -1273,11 +1273,24 @@ impl Controller {
     /// to lose power", and a controller that acknowledged it without making its
     /// writes durable would be lying about the one thing the notification is
     /// for.
+    ///
+    /// Which is why a flush that **fails** sets `CSTS.CFS`. There is no
+    /// completion queue entry for a shutdown notification, so §3.1.6's *"a
+    /// fatal controller error occurred that could not be communicated in the
+    /// appropriate Completion Queue"* is a literal description of this case,
+    /// and §10.5 is what the host does about it. `CSTS.SHST` still goes to
+    /// `10b` beside it: the shutdown processing did finish, and a host left
+    /// waiting for it would hang instead of reading the bit that tells it what
+    /// went wrong. Reporting only the completion — which is what this did — is
+    /// the lie the paragraph above says it must not tell.
     fn shutdown(&self) {
-        let _ = self.ns.media.flush();
+        let durable = self.ns.media.flush().is_ok();
         {
             let mut state = self.state.lock();
             state.csts = (state.csts & !CSTS_SHST_MASK) | CSTS_SHST_COMPLETE;
+            if !durable {
+                state.csts |= CSTS_CFS;
+            }
         }
         self.refresh_irq();
     }

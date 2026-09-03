@@ -85,7 +85,13 @@ fn rig() -> Rig {
     for lba in 0..BLOCKS {
         RamStore::write_at(&store, lba * LBA, &stamp(lba)).expect("the image fits");
     }
-    let ns = Namespace::new(Arc::clone(&store) as Arc<dyn Medium>, 9, false).expect("512-byte");
+    rig_on(Arc::clone(&store) as Arc<dyn Medium>, store)
+}
+
+/// The same rig over a medium the caller chose, so that a test can put a
+/// *failing* one behind the namespace and watch what the guest is told.
+fn rig_on(media: Arc<dyn Medium>, store: Arc<RamStore>) -> Rig {
+    let ns = Namespace::new(media, 9, false).expect("512-byte");
     let ctrl = Arc::new(Controller::new(ns, Params::default()));
 
     let space = Arc::new(AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::ONES));
@@ -972,5 +978,68 @@ fn a_configured_uuid_is_parsed_in_the_order_it_is_written() {
             super::parse_uuid(wrong).is_err(),
             "`{wrong}` was accepted as a UUID"
         );
+    }
+}
+
+/// The one thing a shutdown notification is *for*.
+///
+/// §3.1.5's shutdown is a durability barrier, and this controller's answer to
+/// one is the medium's own `flush`. When that fails there is no completion
+/// queue entry to report it in, which is §3.1.6's definition of `CSTS.CFS`;
+/// reporting `CSTS.SHST` complete on its own would tell the host its data is
+/// safe when it is not.
+#[test]
+fn a_shutdown_whose_flush_failed_says_so_rather_than_only_that_it_finished() {
+    let store = Arc::new(RamStore::new(BLOCKS * LBA));
+    let media: Arc<dyn Medium> = Arc::new(NoSync(Arc::clone(&store)));
+    let mut r = rig_on(media, store);
+    r.enable();
+
+    // A `Flush` command has a completion queue entry to fail in, and does.
+    assert_eq!(
+        r.io(0x00, 1, 0, 0, 0, 0),
+        0x0280,
+        "Media and Data Integrity Error: Write Fault (§4.6.1)"
+    );
+
+    // The shutdown notification has none, so `CSTS` carries it. `CC.SHN` is
+    // bits 15:14 and 01b is a normal shutdown, written as the literal word a
+    // driver sends rather than shifted into place from the model's constants.
+    r.set_reg(REG_CC, CC_ENABLE | (0b01 << 14));
+    let csts = r.reg(REG_CSTS);
+    assert_eq!(csts >> 2 & 0x3, 0b10, "CSTS.SHST: processing complete");
+    assert_eq!(csts & 0b10, 0b10, "CSTS.CFS: and it did not work");
+
+    // The same shutdown over a medium that *can* be made durable leaves
+    // `CSTS.CFS` clear, which is what makes the assertion above about the
+    // flush rather than about shutting down at all.
+    let mut ok = rig();
+    ok.enable();
+    ok.set_reg(REG_CC, CC_ENABLE | (0b01 << 14));
+    let csts = ok.reg(REG_CSTS);
+    assert_eq!(csts >> 2 & 0x3, 0b10, "CSTS.SHST: processing complete");
+    assert_eq!(csts & 0b10, 0, "CSTS.CFS");
+}
+
+/// A medium that takes writes and refuses to make them durable — a full
+/// filesystem, a failing disk, an `fsync` that came back `EIO`.
+#[derive(Debug)]
+struct NoSync(Arc<RamStore>);
+
+impl Medium for NoSync {
+    fn capacity(&self) -> u64 {
+        self.0.len()
+    }
+
+    fn read_at(&self, offset: u64, dst: &mut [u8]) -> crate::core::space::MemResult {
+        RamStore::read_at(&self.0, offset, dst)
+    }
+
+    fn write_at(&self, offset: u64, src: &[u8]) -> crate::core::space::MemResult {
+        RamStore::write_at(&self.0, offset, src)
+    }
+
+    fn flush(&self) -> crate::core::space::MemResult {
+        Err(crate::core::error::BusError::Unassigned)
     }
 }
