@@ -484,23 +484,6 @@ fn an_unknown_host_kind_is_refused_too() {
 }
 
 // ---------------------------------------------------------------------------
-// parallel
-// ---------------------------------------------------------------------------
-
-#[test]
-fn a_parallel_machine_refuses_a_recorder() {
-    let (mut machine, _hosts) = apple1(ThreadingMode::Parallel);
-    let err = machine
-        .set_recorder(Arc::new(Recorder::recording()))
-        .expect_err("a parallel run cannot be replayed");
-    let text = format!("{err}");
-    assert!(
-        text.contains("inside a round"),
-        "the refusal says what is not reproducible, not merely that something is not: {text}"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // 5. the other host
 // ---------------------------------------------------------------------------
 
@@ -697,4 +680,21 @@ fn a_recording_of_another_board_is_refused_with_a_diff() {
     machine
         .set_recorder(Arc::new(Recorder::replaying(bare)))
         .expect("an unshaped log is unknown provenance, not a wrong board");
+}
+
+// ---------------------------------------------------------------------------
+// parallel
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_parallel_machine_refuses_a_recorder() {
+    let (mut machine, _hosts) = apple1(ThreadingMode::Parallel);
+    let err = machine
+        .set_recorder(Arc::new(Recorder::recording()))
+        .expect_err("a parallel run cannot be replayed");
+    let text = format!("{err}");
+    assert!(
+        text.contains("inside a round"),
+        "the refusal says what is not reproducible, not merely that something is not: {text}"
+    );
 }

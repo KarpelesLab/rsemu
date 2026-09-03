@@ -473,11 +473,13 @@ fn a_sealed_recorder_takes_no_more_channels() {
 
 /// The seal's reach, pinned — including the half that is wrong.
 ///
-/// [`HostObjects`] files two unrelated things under one `(kind, name)` space:
-/// doors from the host, which are inputs and must be channels, and rendezvous
-/// inside the machine, which are how two devices find each other. A `pci-bus`
-/// is not non-deterministic, cannot be a channel, and has nothing to record —
-/// yet a sealed table refuses it exactly as it refuses an undeclared keyboard.
+/// [`HostObjects`] files three unrelated things under one `(kind, name)` space:
+/// doors that are channels, which must be declared; rendezvous inside the
+/// machine, where nothing crosses from the host at all; and `medium`, a door
+/// whose bytes the guest *pulls* a sector at a time, so no `(instant, payload)`
+/// log could describe it. A `pci-bus` is not non-deterministic, cannot be a
+/// channel, and has nothing to record — yet a sealed table refuses it exactly
+/// as it refuses an undeclared keyboard.
 ///
 /// That is why no board in `src/` is sealed: sealing anything with a PCI or USB
 /// bus in it fails on an object that was never an input. The assertion below is
@@ -509,7 +511,7 @@ fn the_seal_cannot_tell_a_door_from_a_rendezvous() {
         "floppy-drive",
         "apic-bus",
         "signal",
-        "medium",
+        "riscv.dt",
     ] {
         assert!(
             hosts.open(HostKind::new(rendezvous), "0", || 1u32).is_err(),
@@ -517,6 +519,15 @@ fn the_seal_cannot_tell_a_door_from_a_rendezvous() {
              and the seal refuses it anyway"
         );
     }
+
+    // And the third kind: host bytes really do cross at a `medium`, but the
+    // guest pulls them a sector at a time, so there is no channel to declare
+    // and the seal is demanding something that cannot exist.
+    assert!(
+        hosts.open(HostKind::new("medium"), "hd0", || 1u32).is_err(),
+        "a drive's image is a door with no `(instant, payload)` shape, and \
+         refusing it means no board with a disk can be sealed"
+    );
 }
 
 #[test]

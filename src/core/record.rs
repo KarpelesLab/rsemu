@@ -78,16 +78,27 @@
 //!
 //! There is a structural reason it has stayed opt-in, and it is worth naming
 //! because it is the thing to fix rather than a preference:
-//! **[`HostKind`] does not distinguish a door from the host from a rendezvous
-//! inside the machine**, and the seal checks all of them alike. Of the kinds in
-//! this tree only a handful — `chardev`, `pad`, `netdev`, `capture` — are host
-//! doors. The rest are how two devices find each other: `pci-bus`, `usb-bus`,
-//! `i2c-bus`, `spi-bus`, `ata-bay`, `sd-slot`, `floppy-drive`, `apic-bus`,
-//! `signal`, `riscv.dt`, and the `medium` a drive is fitted with. None of those
-//! is non-deterministic and none can be a channel, so sealing any board with a
-//! PCI or USB bus in it fails on an object that was never an input. The seal
-//! works on the Apple 1, the Game Boy and a two-device NIC board, which is
-//! exactly the set of boards the tests seal.
+//! **[`HostKind`] files three different things under one name space**, and the
+//! seal checks all of them alike:
+//!
+//! * **Doors that are channels** — `chardev`, `pad`, `netdev`, `capture`. An
+//!   input arrives as bytes at an instant, so it can be logged and re-delivered,
+//!   and demanding a channel for one is exactly right.
+//! * **Rendezvous inside the machine** — `pci-bus`, `usb-bus`, `i2c-bus`,
+//!   `spi-bus`, `ata-bay`, `sd-slot`, `floppy-drive`, `apic-bus`, `signal`,
+//!   `riscv.dt`. How two devices find each other. Nothing crosses from the host
+//!   at all, so there is nothing to record and nothing to demand.
+//! * **A door that cannot be a channel** — `medium`. Host bytes really do cross
+//!   here, but the guest *pulls* them a sector at a time rather than receiving
+//!   them at an instant, so no `(instant, payload)` log describes it. What that
+//!   needs is an identity check on the image, which is `dev::medium`'s
+//!   `Snapshot::Reference` — and a weak one, as the table above says — not a
+//!   channel.
+//!
+//! Only the first group belongs to the seal, and it holds all three, so sealing
+//! any board with a PCI or USB bus in it fails on an object that was never an
+//! input. The seal works on the Apple 1, the Game Boy and a two-device NIC
+//! board, which is exactly the set of boards the tests seal.
 //!
 //! The fix is a mark on the kind — `HostKind::door()` beside `HostKind::new()`,
 //! with `seal` checking only the doors — and it touches every kind's definition

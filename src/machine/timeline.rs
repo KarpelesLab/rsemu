@@ -103,10 +103,14 @@
 //!   work rather than rsemu-on-top work.
 //!
 //!   [`Timeline`] cannot check which row a machine is in, and that is
-//!   deliberate rather than missing: §15's first invariant is that no device
-//!   type appears in a `core::` signature, and a medium is a device type. The
-//!   check belongs to whoever chose the policy, which is whoever passed
-//!   `--drive …,snapshot=…`.
+//!   deliberate rather than missing: a `Snapshot` lives behind the
+//!   `dev-medium` feature and a timeline is a machine-layer object that links
+//!   no device at all. §15's first invariant — no device type in a framework
+//!   signature — is the reason, and asking a `Timeline` to know what a disk is
+//!   would be a worse trade than the caller checking a policy it chose. What
+//!   *does* reach here is the loud case: a `refuse` medium makes
+//!   [`Machine::save`](crate::machine::Machine::save) fail, so the first
+//!   snapshot refuses and no history is silently unrewindable.
 //!
 //! # Example
 //!
