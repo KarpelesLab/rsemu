@@ -328,6 +328,19 @@ libata driver was opened.**
   issues the device flush from `blkdev_fsync`, so `dd` without `conv=fsync`
   leaves a qcow2 with the data cluster written and the L2 entry that finds it
   still in the image's cache — a hole, not merely a stale sector.
+- **"Every way out" had to be made to include Ctrl-C.** A signal is not a
+  return from `main`, so for a while it was the one exit that walked past the
+  flush: `SIGINT` on a headless run took the process with it and left exactly
+  the hole described above. `host::signal` turns `SIGINT`, `SIGTERM` and
+  `SIGHUP` into a flag the four run loops read at a slice boundary, which then
+  asks the machine to stop through §4.7's safe point and falls out into
+  `finish`. `SIGQUIT` is left alone on purpose — an emulator wedged in a guest
+  loop is when somebody wants a core file — and a *second* signal of the same
+  kind still kills, so a run that never reaches a slice boundary is escapable.
+  `tests/cli_interrupt.rs` proves the data half against a `SIGKILL` control:
+  same run, same moment, and the killed one's sector is a hole while the
+  interrupted one's is the guest's bytes. What it does **not** cover is a
+  panic, which unwinds past `finish` with no `Drop` on `Image` to catch it.
 - I/O runs on the task pool, with completions delivered through the event queue
   at guest-derived virtual times (`ROADMAP.md` §4.7).
 - `fstool`'s `crash_inject` block device gives guest-filesystem robustness
