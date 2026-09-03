@@ -525,6 +525,15 @@ executes the guest's instructions between two of their accesses. About 600,000
 of those accesses leave hardware over a whole boot — 520,000 port accesses and
 80,000 MMIO — and every one is served by this board's own device models.
 
+The two runs were compared line for line: **279 of the accelerated run's 347
+console lines are byte-identical to the interpreted run's**, in the same order,
+and every milestone from the RSDP scan to `rsemu q35-linux nvme namespace,
+LBA 0` appears in both. The 68 that differ are all downstream of *who the
+processor is* — the model line, the speculative-execution mitigations, the
+`XSAVE` list, the PMU, the TLB geometry — because an accelerated `cpu.x86`
+reports the host's silicon rather than the `variant` this file declares. Not
+one of them is a device answering differently.
+
 Two things had to exist first, and both are in `src/accel/`:
 
 * **a `CPUID` table.** A vCPU that has never been given one answers every leaf

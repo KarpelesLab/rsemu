@@ -82,6 +82,43 @@
 //! host clock"*. That is this test's named next obstacle, and it is one level
 //! below `accel/`.
 //!
+//! # Do the two engines agree?
+//!
+//! `tests/riscv_virt_engines.rs` diffs 265 lines of identical console across
+//! three engines, and that is the standard. This board cannot quite meet it,
+//! for a reason worth stating rather than averaging away: **an accelerated
+//! processor is not the same part as an interpreted one.** `cpu::x86` answers
+//! `CPUID` from its declared `variant`; a vCPU answers from the host's silicon.
+//! So a kernel that boots on both takes different paths through its own feature
+//! dispatch and says so.
+//!
+//! Measured, on the same board with the same kernel, the same initramfs and the
+//! same command line — 2,561 seconds of guest time in 973 seconds of wall clock
+//! interpreted, against 35 seconds of guest time in 9 seconds of wall clock
+//! here:
+//!
+//! * **279 of the accelerated run's 347 console lines are byte-identical** to
+//!   the interpreted run's, in the same order, once the printk timestamp is
+//!   removed.
+//! * **Every milestone appears in both**, in order: the RSDP found by scanning
+//!   `0xe0000`, the MADT, `IOAPIC[0]`, the switch to symmetric I/O mode, the
+//!   PCI root bridge, `PCI: Using ACPI for IRQ routing`, `ttyS0`, the NVMe
+//!   function at `0000:00:04.0`, its queue pair, `Run /init as init process`,
+//!   the shell, and the signature read off the namespace.
+//! * The 68 lines that differ are **all** downstream of who the processor is —
+//!   the model line (`AMD 1a/08` against the interpreter's `Intel 06/0f`), the
+//!   speculative-execution mitigations, the `XSAVE` feature list, the PMU, the
+//!   TLB geometry — plus the timekeeping lines this file's `no_timer_check`
+//!   section explains. Not one of them is a device answering differently.
+//! * The interpreted run additionally prints two `soft lockup` backtraces,
+//!   which are *its* artefact: the guest's own watchdog notices that its
+//!   interpreter is slow.
+//!
+//! To reproduce, run this test and `tests/q35_linux.rs` with the same
+//! `RSEMU_KERNEL_CMDLINE` (the constant below) and `RSEMU_KERNEL_MS=3000000`
+//! on the interpreted one, and diff the `  | ` lines with the printk timestamp
+//! stripped.
+//!
 //! # What a run under this engine is not
 //!
 //! **Reproducible.** [`AccelCpus::open`] refuses a deterministic
