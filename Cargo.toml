@@ -655,6 +655,13 @@ jit-x86 = ["jit", "std"]
 # process model, an ELF loader. §2.1 puts those in `KarpelesLab/nixvm`, which
 # depends on this crate rather than being merged into it. Adds no dependencies
 # and is `no_std + alloc`, because the browser is a level-3 target too.
+#
+# That the four are *enough* is measured rather than asserted:
+# `src/usermode/proof.rs` is a `#[cfg(test)]` stand-in for that consumer — the
+# loader, the auxiliary vector, the syscall table and the sandbox policy,
+# written out longhand against the public API — and it runs a real statically
+# linked `riscv64` Linux binary to a `hello world` and exit 0. Nothing it
+# contains is compiled into a shipped build. `docs/system/usermode-abi.md`.
 usermode = []
 
 # The KVM acceleration backend (src/accel): running guest code on the host's

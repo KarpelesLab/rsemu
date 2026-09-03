@@ -48,6 +48,23 @@
 //!   modes, and a replay that reports the first divergence instead of
 //!   producing wrong output.
 //!
+//! # What that adds up to, measured
+//!
+//! The four pieces above are enough to run a **real statically linked Linux
+//! binary** — an ordinary `std` Rust `hello world` built for
+//! `riscv64gc-unknown-linux-musl`, which starts through `musl`'s
+//! `__libc_start_main`, finds its own program headers through the auxiliary
+//! vector, sets up thread-local storage, installs a stack-overflow handler,
+//! sizes a heap with `brk`, prints, and exits zero. Twenty-four syscalls, and
+//! the trace matches the same program's `strace` on the host one for one.
+//!
+//! None of the code that does that is in this module, and that is the result.
+//! The ELF loader, the syscall table, the descriptors and the errno values
+//! live in `src/usermode/proof.rs`, which is `#[cfg(test)]` and is the
+//! *consumer's* half written out longhand — §2.1's line, held, with a working
+//! program on the far side of it. `docs/system/usermode-abi.md` has the ABI
+//! sources, the host-filesystem policy and the trace comparison.
+//!
 //! # Driving it
 //!
 //! The loop is the consumer's; rsemu is pulled from, never called back into.
@@ -83,6 +100,12 @@ pub mod journal;
 pub mod mem;
 pub mod sched;
 
+/// The consumer's half, written out longhand so rsemu's half can be proven
+/// against a real binary. `#[cfg(test)]` and staying that way: §2.1 puts a
+/// syscall table, an ELF loader and a process model in the *consumer*, and
+/// this module exists to demonstrate that line is holdable, not to cross it.
+#[cfg(all(test, feature = "cpu-riscv"))]
+mod proof;
 #[cfg(test)]
 mod tests;
 
