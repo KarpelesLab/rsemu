@@ -646,6 +646,20 @@ pub struct Params {
     pub firmware: String,
     /// How many I/O queue pairs the controller allocates, 1-[`MAX_IO_QUEUES`].
     pub io_queues: u16,
+    /// The namespace's UUID (§5.15.2.4, `NIDT` 03h), or `None` to derive one.
+    ///
+    /// The namespace **must** have one. §7.11 requires a globally unique value
+    /// in the `EUI64` field, the `NGUID` field or a type 3h Namespace
+    /// Identification Descriptor, and *"if the EUI64 field is cleared to 0h and
+    /// the NGUID field is cleared to 0h, then the namespace shall support a
+    /// valid Namespace UUID"* — which is this controller, because an `EUI64` or
+    /// an `NGUID` would need an IEEE OUI this project does not have.
+    ///
+    /// `None` therefore means *derive one from this controller's identity*
+    /// rather than *report none*: see [`Controller::uuid`]. A machine
+    /// description that has an identity to assert sets it explicitly, and the
+    /// descriptor carries it in the big-endian order RFC 4122 defines.
+    pub uuid: Option<[u8; 16]>,
 }
 
 impl Default for Params {
@@ -657,6 +671,7 @@ impl Default for Params {
             model: String::from("RSEMU NVME CONTROLLER"),
             firmware: String::from("1.0"),
             io_queues: 4,
+            uuid: None,
         }
     }
 }
@@ -744,6 +759,98 @@ impl Controller {
         &self.params
     }
 
+    /// The namespace's UUID: what [`Params::uuid`] says, or one derived from
+    /// the identity this controller already reports.
+    ///
+    /// §7.11 leaves no room for a namespace with no unique identifier at all,
+    /// and a controller assembled from [`Params::default`] has to conform too,
+    /// so the fallback cannot be "none". It also cannot be *random*: two runs of
+    /// one machine file must produce the same guest, and a guest that finds its
+    /// disk under `/dev/disk/by-id` must find it there again after a restart
+    /// (`CLAUDE.md`, determinism). So it is a **function of the identity**:
+    /// vendor, subsystem vendor, serial, model and namespace, which are exactly
+    /// the fields `Identify Controller` publishes. Two controllers that report
+    /// themselves as the same part are the same part; give the second one its
+    /// own `serial` — as a manufacturer would — and the UUIDs diverge.
+    ///
+    /// The construction is FNV-1a over those fields, twice with different
+    /// offset bases (Fowler/Noll/Vo, public domain, non-cryptographic and not
+    /// claimed to be otherwise), and the result is stamped as a **version 8**
+    /// UUID: RFC 9562 §5.8 — the successor to the RFC 4122 NVMe cites — defines
+    /// version 8 as the one whose bits outside the version and variant fields
+    /// are vendor-assigned by an implementation-specific rule. That is a true
+    /// description of this; stamping version 4 would be claiming randomness
+    /// that is not here.
+    #[must_use]
+    pub fn uuid(&self) -> [u8; 16] {
+        if let Some(uuid) = self.params.uuid {
+            return uuid;
+        }
+        let mut out = [0u8; 16];
+        for (half, seed) in out.chunks_mut(8).zip([FNV_OFFSET, !FNV_OFFSET]) {
+            let mut h = seed;
+            for field in [
+                &self.params.vendor.to_be_bytes()[..],
+                &self.params.subsystem_vendor.to_be_bytes(),
+                self.params.serial.as_bytes(),
+                self.params.model.as_bytes(),
+                // The namespace this identifies, so a second one on the same
+                // controller could not collide with the first.
+                &1u32.to_be_bytes(),
+            ] {
+                // The separator matters: without it "AB" + "C" and "A" + "BC"
+                // are one string and two different configurations hash alike.
+                h = fnv1a(h, field);
+                h = fnv1a(h, &[0]);
+            }
+            half.copy_from_slice(&h.to_be_bytes());
+        }
+        // RFC 9562 §4: the version is the high nibble of octet 6, and the
+        // variant is the top two bits of octet 8, which must read `10b`.
+        out[6] = (out[6] & 0x0f) | 0x80;
+        out[8] = (out[8] & 0x3f) | 0x80;
+        out
+    }
+
+    /// The NVM Subsystem NVMe Qualified Name (§5.15.2.2, bytes 1023:768).
+    ///
+    /// **Mandatory** for a controller reporting revision 1.2.1 or later in `VS`,
+    /// which this one does, and a driver that finds it zeroed says so — that was
+    /// the defect.
+    ///
+    /// §7.9 defines two formats and this is the second one, verbatim: *"the
+    /// string `nqn`"*, *"the string `2014-08.org.nvmexpress:uuid:`"*, and the
+    /// namespace's UUID written as RFC 4122 writes one. It is the format §7.9
+    /// provides *"when there is not a naming authority"*, which is the honest
+    /// description of this project: registering a domain-based NQN would mean
+    /// asserting a domain we do not own inside every guest that reads it.
+    ///
+    /// 69 bytes including the terminator, against §7.9's maximum of 223.
+    #[must_use]
+    pub fn subnqn(&self) -> String {
+        let u = self.uuid();
+        alloc::format!(
+            "nqn.2014-08.org.nvmexpress:uuid:{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-\
+             {:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            u[0],
+            u[1],
+            u[2],
+            u[3],
+            u[4],
+            u[5],
+            u[6],
+            u[7],
+            u[8],
+            u[9],
+            u[10],
+            u[11],
+            u[12],
+            u[13],
+            u[14],
+            u[15]
+        )
+    }
+
     /// Give the controller the address space its queues live in, and the
     /// identity its own accesses carry.
     pub fn attach_space(&self, space: &Arc<AddressSpace>, requester: RequesterId) {
@@ -824,6 +931,25 @@ fn le64(bytes: &[u8]) -> u64 {
     let mut out = [0u8; 8];
     out.copy_from_slice(&bytes[..8]);
     u64::from_le_bytes(out)
+}
+
+/// The 64-bit FNV-1a offset basis.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// The 64-bit FNV-1a prime.
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// FNV-1a over `bytes`, continuing from `hash`.
+///
+/// Fowler/Noll/Vo, released into the public domain by its authors. Used here
+/// only to turn a controller's identity into a stable 128 bits — it is not a
+/// cryptographic hash and nothing here treats it as one.
+fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
+    let mut h = hash;
+    for byte in bytes {
+        h = (h ^ u64::from(*byte)).wrapping_mul(FNV_PRIME);
+    }
+    h
 }
 
 /// Copy `text` into `dst` as the space-padded ASCII an NVMe identify string is
@@ -1147,11 +1273,24 @@ impl Controller {
     /// to lose power", and a controller that acknowledged it without making its
     /// writes durable would be lying about the one thing the notification is
     /// for.
+    ///
+    /// Which is why a flush that **fails** sets `CSTS.CFS`. There is no
+    /// completion queue entry for a shutdown notification, so §3.1.6's *"a
+    /// fatal controller error occurred that could not be communicated in the
+    /// appropriate Completion Queue"* is a literal description of this case,
+    /// and §10.5 is what the host does about it. `CSTS.SHST` still goes to
+    /// `10b` beside it: the shutdown processing did finish, and a host left
+    /// waiting for it would hang instead of reading the bit that tells it what
+    /// went wrong. Reporting only the completion — which is what this did — is
+    /// the lie the paragraph above says it must not tell.
     fn shutdown(&self) {
-        let _ = self.ns.media.flush();
+        let durable = self.ns.media.flush().is_ok();
         {
             let mut state = self.state.lock();
             state.csts = (state.csts & !CSTS_SHST_MASK) | CSTS_SHST_COMPLETE;
+            if !durable {
+                state.csts |= CSTS_CFS;
+            }
         }
         self.refresh_irq();
     }
@@ -1717,6 +1856,15 @@ impl Controller {
                 }
                 list
             }
+            // CNS 03h: the Namespace Identification Descriptor list, which is
+            // **mandatory** from NVMe 1.3 onwards and this controller reports
+            // 1.4 in `VS`. §5.15.2.3 has it name an active namespace.
+            0x03 => {
+                if cmd.nsid != 1 {
+                    return (ST_INVALID_NAMESPACE, 0);
+                }
+                self.identify_ns_descs()
+            }
             _ => return (ST_INVALID_FIELD, 0),
         };
         (self.scatter(space, cmd, &data, self.page()), 0)
@@ -1823,6 +1971,39 @@ impl Controller {
         // VWC bit 0: a volatile write cache is present, so `Flush` means
         // something — the medium's own `flush`, which is what makes it true.
         d[525] = 1;
+        // SUBNQN, bytes 1023:768: a UTF-8 null-terminated NVMe Qualified Name,
+        // mandatory from revision 1.2.1 (§5.15.2.2) and therefore here.
+        let nqn = self.subnqn();
+        d[768..768 + nqn.len()].copy_from_slice(nqn.as_bytes());
+        d
+    }
+
+    /// The 4096-byte Namespace Identification Descriptor list (§5.15.2.4).
+    ///
+    /// A list of `NIDT`/`NIDL`/reserved/`NID` records, terminated by the first
+    /// one whose `NIDL` is zero — which, in a page that starts out zeroed, the
+    /// bytes after the last descriptor already are.
+    ///
+    /// One descriptor, and it is not optional: §5.15.2.4 is *"a controller
+    /// shall return at least one descriptor identifying the namespace"*, and
+    /// §7.11 narrows which one it can be here — a type 1h descriptor may only
+    /// be reported when `Identify Namespace`'s `EUI64` is non-zero and a type 2h
+    /// one only when its `NGUID` is, both of which need an IEEE OUI this project
+    /// does not have, so what is left is the UUID (type 3h). The bytes are the
+    /// big-endian order RFC 4122 writes a UUID in, which is also the order
+    /// §5.15.2.4 wants, so nothing is swapped on the way out.
+    ///
+    /// Answering at all is the defect this fixed: the command was refused with
+    /// Invalid Field, and a controller reporting 1.4 in `VS` has to support it.
+    fn identify_ns_descs(&self) -> Vec<u8> {
+        /// `NIDT` 03h: the namespace UUID.
+        const NIDT_UUID: u8 = 0x03;
+        let uuid = self.uuid();
+        let mut d = vec![0u8; IDENTIFY_LEN as usize];
+        d[0] = NIDT_UUID;
+        d[1] = uuid.len() as u8;
+        // Bytes 2 and 3 are reserved; the identifier itself follows.
+        d[4..4 + uuid.len()].copy_from_slice(&uuid);
         d
     }
 

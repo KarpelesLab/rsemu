@@ -85,7 +85,13 @@ fn rig() -> Rig {
     for lba in 0..BLOCKS {
         RamStore::write_at(&store, lba * LBA, &stamp(lba)).expect("the image fits");
     }
-    let ns = Namespace::new(Arc::clone(&store) as Arc<dyn Medium>, 9, false).expect("512-byte");
+    rig_on(Arc::clone(&store) as Arc<dyn Medium>, store)
+}
+
+/// The same rig over a medium the caller chose, so that a test can put a
+/// *failing* one behind the namespace and watch what the guest is told.
+fn rig_on(media: Arc<dyn Medium>, store: Arc<RamStore>) -> Rig {
+    let ns = Namespace::new(media, 9, false).expect("512-byte");
     let ctrl = Arc::new(Controller::new(ns, Params::default()));
 
     let space = Arc::new(AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::ONES));
@@ -820,4 +826,220 @@ fn the_interrupt_pin_register_names_the_pin_the_controller_drives() {
     let config = Function::fresh_config(0x1b36, 0x0010, 0);
     assert_eq!(config.byte(config::INTERRUPT_PIN), rig.ctrl.intx().pin().0);
     assert_eq!(rig.ctrl.intx().pin(), crate::bus::pci::IntxPin::A);
+}
+
+// ---------------------------------------------------------------------------
+// the identity §7.11 requires the namespace to have
+// ---------------------------------------------------------------------------
+
+/// A controller built from nothing but [`Params::default`] still has to be a
+/// conforming one, and §7.11 leaves it no way out of having an identifier.
+///
+/// > When creating a namespace, the controller shall indicate a globally unique
+/// > value in one or more of the following: a) the EUI64 field; b) the NGUID
+/// > field; or c) a Namespace Identification Descriptor with the Namespace
+/// > Identifier Type field set to 3h.
+///
+/// `Identify Namespace` reports `EUI64` and `NGUID` as zero here — neither can
+/// be invented without an IEEE OUI — so (c) is not one of three options, it is
+/// the only one left, and the UUID has to be there whether or not a machine
+/// file named one.
+#[test]
+fn a_namespace_has_a_uuid_even_when_nothing_configured_one() {
+    let r = rig();
+    let uuid = r.ctrl.uuid();
+    assert_ne!(uuid, [0u8; 16], "§7.11: a namespace with no identifier");
+
+    // RFC 9562 §4: the version is the high nibble of octet 6 and the variant is
+    // the top two bits of octet 8. Version 8 is *"custom"* — bits outside those
+    // two fields assigned by an implementation-specific rule — which is exactly
+    // what a value derived from the controller's identity is. Asserted as the
+    // literal nibble and bit pattern rather than recomputed.
+    assert_eq!(uuid[6] & 0xf0, 0x80, "RFC 9562 version 8");
+    assert_eq!(uuid[8] & 0xc0, 0x80, "RFC 9562 variant 10b");
+}
+
+/// The two properties the derivation exists to have: the same configuration
+/// gives the same identifier for ever, and a different one gives a different
+/// identifier.
+#[test]
+fn the_derived_uuid_is_a_function_of_the_identity_the_controller_publishes() {
+    fn uuid_for(params: Params) -> [u8; 16] {
+        let store = Arc::new(RamStore::new(BLOCKS * LBA));
+        let ns = Namespace::new(store as Arc<dyn Medium>, 9, false).expect("512-byte blocks");
+        Controller::new(ns, params).uuid()
+    }
+
+    let base = uuid_for(Params::default());
+    assert_eq!(
+        base,
+        uuid_for(Params::default()),
+        "two runs of one machine file must produce one guest (`CLAUDE.md`, determinism)"
+    );
+
+    // Every field that goes into it, moved one at a time.
+    for change in [
+        Params {
+            serial: String::from("RSEMU0000000000000002"),
+            ..Params::default()
+        },
+        Params {
+            model: String::from("RSEMU NVME CONTROLLER "),
+            ..Params::default()
+        },
+        Params {
+            vendor: 0x1b36,
+            ..Params::default()
+        },
+        Params {
+            subsystem_vendor: 0x1b36,
+            ..Params::default()
+        },
+    ] {
+        assert_ne!(
+            uuid_for(change.clone()),
+            base,
+            "two controllers reporting different identities share a namespace \
+             identifier: {change:?}"
+        );
+    }
+
+    // And an explicit one wins outright.
+    let named = [
+        0x2b, 0x1c, 0x9d, 0x3e, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01,
+    ];
+    assert_eq!(
+        uuid_for(Params {
+            uuid: Some(named),
+            ..Params::default()
+        }),
+        named
+    );
+}
+
+/// §7.9's second NQN format, spelled out: the string `nqn`, the string
+/// `2014-08.org.nvmexpress:uuid:`, and a UUID *"represented as a string
+/// formatted as `11111111-2222-3333-4444-555555555555`"*.
+#[test]
+fn the_subsystem_qualified_name_is_the_uuid_format_section_7_9_defines() {
+    let r = rig();
+    let nqn = r.ctrl.subnqn();
+    let uuid = r.ctrl.uuid();
+
+    let rest = nqn
+        .strip_prefix("nqn.2014-08.org.nvmexpress:uuid:")
+        .expect("§7.9's UUID-based format");
+    // 8-4-4-4-12, and the hexadecimal has to be the identifier the descriptor
+    // list reports — the two are one namespace or they are a bug.
+    let groups: Vec<&str> = rest.split('-').collect();
+    assert_eq!(
+        groups.iter().map(|g| g.len()).collect::<Vec<_>>(),
+        vec![8, 4, 4, 4, 12]
+    );
+    let flat: String = groups.concat();
+    let expect: String = uuid.iter().map(|b| alloc::format!("{b:02x}")).collect();
+    assert_eq!(flat, expect);
+
+    // §7.9: at most 223 bytes, and null terminated — the terminator being the
+    // zero the 256-byte field is left holding, which the board-level test reads
+    // back out of `Identify Controller` itself.
+    assert!(nqn.len() < 223, "§7.9 caps an NQN at 223 bytes");
+}
+
+/// A UUID a machine description wrote, taken apart the way RFC 4122 §3 puts one
+/// together — and every way of writing one that is not that, refused.
+#[test]
+fn a_configured_uuid_is_parsed_in_the_order_it_is_written() {
+    assert_eq!(
+        super::parse_uuid("f81d4fae-7dec-11d0-a765-00a0c91e6bf6").expect("RFC 4122 §3's example"),
+        [
+            0xf8, 0x1d, 0x4f, 0xae, 0x7d, 0xec, 0x11, 0xd0, 0xa7, 0x65, 0x00, 0xa0, 0xc9, 0x1e,
+            0x6b, 0xf6
+        ],
+        "§5.15.2.4 wants the big-endian order the text form already is, so \
+         nothing is swapped on the way in"
+    );
+    // Case is not part of the value (RFC 4122 §3).
+    assert_eq!(
+        super::parse_uuid("F81D4FAE-7DEC-11D0-A765-00A0C91E6BF6").expect("upper case"),
+        super::parse_uuid("f81d4fae-7dec-11d0-a765-00a0c91e6bf6").expect("lower case")
+    );
+    for wrong in [
+        "",
+        "f81d4fae7dec11d0a76500a0c91e6bf6",      // no hyphens
+        "f81d4fae-7dec-11d0-a765-00a0c91e6bf",   // one digit short
+        "f81d4fae-7dec-11d0-a765-00a0c91e6bf67", // one too many
+        "f81d4fa-e7dec-11d0-a765-00a0c91e6bf6",  // hyphens in the wrong place
+        "f81d4fae-7dec-11d0-a765-00a0c91e6bfg",  // not hexadecimal
+        "f81d4fae-7dec-11d0-a765-00a0c91e6bf6-", // a fifth hyphen
+    ] {
+        assert!(
+            super::parse_uuid(wrong).is_err(),
+            "`{wrong}` was accepted as a UUID"
+        );
+    }
+}
+
+/// The one thing a shutdown notification is *for*.
+///
+/// §3.1.5's shutdown is a durability barrier, and this controller's answer to
+/// one is the medium's own `flush`. When that fails there is no completion
+/// queue entry to report it in, which is §3.1.6's definition of `CSTS.CFS`;
+/// reporting `CSTS.SHST` complete on its own would tell the host its data is
+/// safe when it is not.
+#[test]
+fn a_shutdown_whose_flush_failed_says_so_rather_than_only_that_it_finished() {
+    let store = Arc::new(RamStore::new(BLOCKS * LBA));
+    let media: Arc<dyn Medium> = Arc::new(NoSync(Arc::clone(&store)));
+    let mut r = rig_on(media, store);
+    r.enable();
+
+    // A `Flush` command has a completion queue entry to fail in, and does.
+    assert_eq!(
+        r.io(0x00, 1, 0, 0, 0, 0),
+        0x0280,
+        "Media and Data Integrity Error: Write Fault (§4.6.1)"
+    );
+
+    // The shutdown notification has none, so `CSTS` carries it. `CC.SHN` is
+    // bits 15:14 and 01b is a normal shutdown, written as the literal word a
+    // driver sends rather than shifted into place from the model's constants.
+    r.set_reg(REG_CC, CC_ENABLE | (0b01 << 14));
+    let csts = r.reg(REG_CSTS);
+    assert_eq!(csts >> 2 & 0x3, 0b10, "CSTS.SHST: processing complete");
+    assert_eq!(csts & 0b10, 0b10, "CSTS.CFS: and it did not work");
+
+    // The same shutdown over a medium that *can* be made durable leaves
+    // `CSTS.CFS` clear, which is what makes the assertion above about the
+    // flush rather than about shutting down at all.
+    let mut ok = rig();
+    ok.enable();
+    ok.set_reg(REG_CC, CC_ENABLE | (0b01 << 14));
+    let csts = ok.reg(REG_CSTS);
+    assert_eq!(csts >> 2 & 0x3, 0b10, "CSTS.SHST: processing complete");
+    assert_eq!(csts & 0b10, 0, "CSTS.CFS");
+}
+
+/// A medium that takes writes and refuses to make them durable — a full
+/// filesystem, a failing disk, an `fsync` that came back `EIO`.
+#[derive(Debug)]
+struct NoSync(Arc<RamStore>);
+
+impl Medium for NoSync {
+    fn capacity(&self) -> u64 {
+        self.0.len()
+    }
+
+    fn read_at(&self, offset: u64, dst: &mut [u8]) -> crate::core::space::MemResult {
+        RamStore::read_at(&self.0, offset, dst)
+    }
+
+    fn write_at(&self, offset: u64, src: &[u8]) -> crate::core::space::MemResult {
+        RamStore::write_at(&self.0, offset, src)
+    }
+
+    fn flush(&self) -> crate::core::space::MemResult {
+        Err(crate::core::error::BusError::Unassigned)
+    }
 }

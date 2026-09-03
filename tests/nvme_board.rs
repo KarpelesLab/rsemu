@@ -1279,3 +1279,145 @@ fn a_shutdown_notification_flushes_and_says_so() {
     set_reg32(&m, REG_CC, 0);
     assert_eq!(reg32(&m, REG_CSTS) & CSTS_RDY, 0);
 }
+
+/// What a controller that reports 1.4 in `VS` has to answer, asked the way a
+/// driver asks it.
+///
+/// `VS` is a promise, not decoration: NVMe 1.4 §5.15.2.2 makes `SUBNQN`
+/// mandatory *"if the controller supports revision 1.2.1 or later as indicated
+/// in the Version register"*, and §5.15.2.4's Namespace Identification
+/// Descriptor list has been a command a controller must support since 1.3. Both
+/// were missing here, and a 6.6 kernel said so out loud on the `q35-linux`
+/// board — `missing or invalid SUBNQN field` and
+/// `Identify Descriptors failed (nsid=1, status=0x2)`, 0x2 being Invalid Field.
+///
+/// Every offset below is the specification's own, written as a literal.
+#[test]
+fn the_controller_answers_what_the_version_it_reports_makes_mandatory() {
+    /// `VS`, offset 08h (§3.1.2): major in 31:16, minor in 15:08, tertiary in
+    /// 07:00. 1.4.0.
+    const VERSION_1_4_0: u32 = 0x0001_0400;
+    /// `NIDT` 03h, the Namespace UUID (§5.15.2.4, Figure 249).
+    const NIDT_UUID: u8 = 0x03;
+    /// Its `NIDL`, in bytes. The figure fixes it at 10h.
+    const NIDL_UUID: u8 = 0x10;
+
+    let (m, _store, mut d) = ready();
+
+    assert_eq!(
+        reg32(&m, 0x08),
+        VERSION_1_4_0,
+        "`VS`: which revision's rules this controller is claiming"
+    );
+
+    // -- CNS 03h: the Namespace Identification Descriptor list ---------------
+    let cqe = d.admin(
+        &m,
+        Sqe {
+            opcode: 0x06,
+            nsid: 1,
+            prp1: DATA,
+            cdw10: 0x03,
+            ..Sqe::default()
+        },
+    );
+    assert_eq!(
+        cqe.status, 0,
+        "CNS 03h came back with a status: a 1.4 controller supports it"
+    );
+    let list = peek_bytes(&m, DATA, 4096);
+
+    // §7.11: a namespace shall have a globally unique value in EUI64, NGUID or
+    // a type 3h descriptor. Read the first two out of `Identify Namespace` — at
+    // 119:104 and 127:120, Figure 245 — so that which of the three this
+    // controller is relying on is established rather than assumed.
+    let cqe = d.admin(
+        &m,
+        Sqe {
+            opcode: 0x06,
+            nsid: 1,
+            prp1: DATA + 0x1000,
+            cdw10: 0x00,
+            ..Sqe::default()
+        },
+    );
+    assert_eq!(cqe.status, 0);
+    let ns = peek_bytes(&m, DATA + 0x1000, 4096);
+    assert_eq!(&ns[104..120], &[0u8; 16], "NGUID: no IEEE OUI to build one");
+    assert_eq!(&ns[120..128], &[0u8; 8], "EUI64: likewise");
+
+    // So the list must carry a type 3h descriptor, and §5.15.2.4's layout is
+    // NIDT at 0, NIDL at 1, two reserved bytes, then NIDL bytes of NID.
+    assert_eq!(
+        list[0], NIDT_UUID,
+        "NIDT: §7.11 leaves no other choice here"
+    );
+    assert_eq!(list[1], NIDL_UUID, "NIDL: a UUID is 16 bytes");
+    assert_eq!(&list[2..4], &[0, 0], "the two reserved bytes");
+    let uuid: [u8; 16] = list[4..20].try_into().expect("sixteen bytes");
+    assert_ne!(uuid, [0u8; 16], "a descriptor identifying nothing");
+    // *"the host shall interpret a Namespace Identifier Descriptor Length
+    // (NIDL) value of 0h as the end of the list"*, and the rest is cleared.
+    assert_eq!(list[21], 0, "NIDL of the descriptor after this one");
+    assert!(
+        list[20..].iter().all(|b| *b == 0),
+        "§5.15.2.4: all remaining bytes cleared to 0h"
+    );
+
+    // A namespace that is not there is Invalid Namespace or Format, not an
+    // empty page and not Invalid Field (§5.15.2.4 refers to §6.1.5).
+    let cqe = d.admin(
+        &m,
+        Sqe {
+            opcode: 0x06,
+            nsid: 2,
+            prp1: DATA + 0x2000,
+            cdw10: 0x03,
+            ..Sqe::default()
+        },
+    );
+    assert_eq!(cqe.status, 0x000b, "generic status 0Bh");
+
+    // -- SUBNQN, Identify Controller bytes 1023:768 --------------------------
+    let cqe = d.admin(
+        &m,
+        Sqe {
+            opcode: 0x06,
+            prp1: DATA + 0x3000,
+            cdw10: 0x01,
+            ..Sqe::default()
+        },
+    );
+    assert_eq!(cqe.status, 0);
+    let ctrl = peek_bytes(&m, DATA + 0x3000, 4096);
+    let field = &ctrl[768..1024];
+    let end = field
+        .iter()
+        .position(|b| *b == 0)
+        .expect("§5.15.2.2: a UTF-8 null-terminated string");
+    let nqn = std::str::from_utf8(&field[..end]).expect("§7.9: the encoding is UTF-8");
+    assert!(
+        end <= 223,
+        "§7.9 caps an NQN at 223 bytes, and this is {end}"
+    );
+    assert!(
+        field[end..].iter().all(|b| *b == 0),
+        "nothing after the terminator"
+    );
+
+    // §7.9's second format — for a subsystem with no naming authority — is the
+    // string `nqn`, the string `2014-08.org.nvmexpress:uuid:`, and a UUID
+    // *"represented as a string formatted as
+    // `11111111-2222-3333-4444-555555555555`"*. And the UUID in it has to be
+    // the one the descriptor list just reported: two structures describing one
+    // namespace that disagreed would be the bug this catches.
+    let expect: String = uuid
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let sep = if matches!(i, 4 | 6 | 8 | 10) { "-" } else { "" };
+            format!("{sep}{b:02x}")
+        })
+        .collect();
+    assert_eq!(nqn, format!("nqn.2014-08.org.nvmexpress:uuid:{expect}"));
+}
