@@ -356,9 +356,10 @@ fn raise_the_controllers_interrupt(m: &Machine) {
     poke32(m, BAR_BASE + 0x2c, 0);
     poke32(m, BAR_BASE + 0x30, ACQ as u32);
     poke32(m, BAR_BASE + 0x34, 0);
-    // §3.1.5: the NVM command set, 4 KiB pages, 64-byte submission entries,
-    // 16-byte completion entries, and go.
-    poke32(m, BAR_BASE + 0x14, 1 | (6 << 17) | (4 << 21));
+    // §3.1.5, as the literal register word a driver writes: `EN`, the NVM
+    // command set, 4 KiB pages, `IOSQES` 6 at bits 19:16 (64-byte submission
+    // entries) and `IOCQES` 4 at bits 23:20 (16-byte completion entries).
+    poke32(m, BAR_BASE + 0x14, 0x0046_0001);
     assert_eq!(
         peek32(m, BAR_BASE + 0x1c) & 1,
         1,

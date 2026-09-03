@@ -253,16 +253,22 @@ const REG_ACQ: u64 = 0x30;
 const CC_EN: u32 = 1 << 0;
 /// `CC.CSS`, bits 6:4: which command set.
 const CC_CSS_SHIFT: u32 = 4;
-/// `CC.MPS`, bits 11:7: the host memory page size is `2^(12 + MPS)`.
+/// `CC.MPS`, bits 10:07: the host memory page size is `2^(12 + MPS)`.
 const CC_MPS_SHIFT: u32 = 7;
-/// `CC.SHN`, bits 16:15: shutdown notification.
-const CC_SHN_SHIFT: u32 = 15;
-/// `CC.IOSQES`, bits 20:17: `2^n` bytes per submission queue entry.
-const CC_IOSQES_SHIFT: u32 = 17;
-/// `CC.IOCQES`, bits 24:21: `2^n` bytes per completion queue entry.
-const CC_IOCQES_SHIFT: u32 = 21;
+/// `CC.AMS`, bits 13:11: the arbitration mechanism.
+const CC_AMS_SHIFT: u32 = 11;
+/// `CC.SHN`, bits 15:14: shutdown notification.
+const CC_SHN_SHIFT: u32 = 14;
+/// `CC.IOSQES`, bits 19:16: `2^n` bytes per submission queue entry.
+const CC_IOSQES_SHIFT: u32 = 16;
+/// `CC.IOCQES`, bits 23:20: `2^n` bytes per completion queue entry.
+const CC_IOCQES_SHIFT: u32 = 20;
 /// Which bits of `CC` this controller implements; §3.1.5 hardwires the rest.
-const CC_MASK: u32 = 0x01ff_f8f1;
+///
+/// Bits 0 (`EN`), 6:04 (`CSS`), 10:07 (`MPS`), 13:11 (`AMS`), 15:14 (`SHN`),
+/// 19:16 (`IOSQES`) and 23:20 (`IOCQES`). Bits 3:01 and 31:24 are reserved and
+/// read as zero, so a write through them is dropped rather than stored.
+const CC_MASK: u32 = 0x00ff_fff1;
 
 // -- CSTS (§3.1.6) ----------------------------------------------------------
 
@@ -1088,6 +1094,9 @@ impl Controller {
         let iocqes = (state.cc >> CC_IOCQES_SHIFT) & 0xf;
         let mps = (state.cc >> CC_MPS_SHIFT) & 0xf;
         let css = (state.cc >> CC_CSS_SHIFT) & 0x7;
+        // `CAP.AMS` is zero here — round robin only — so 000b is the one
+        // arbitration mechanism a host may select (§3.1.1, §3.1.5).
+        let ams = (state.cc >> CC_AMS_SHIFT) & 0x7;
         // `ASQS` and `ACQS` are zero-based, and §3.1.8 makes 2 the minimum
         // queue size — so a stored zero means one entry, which is illegal.
         let asqs = (state.aqa & 0xfff) + 1;
@@ -1096,6 +1105,7 @@ impl Controller {
         let ok = iosqes == 6
             && iocqes == 4
             && css == 0
+            && ams == 0
             && mps <= 4
             && asqs >= 2
             && acqs >= 2

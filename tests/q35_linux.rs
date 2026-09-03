@@ -338,32 +338,28 @@ fn the_controllers_register_block_answers_where_a_kernel_puts_it() {
 /// The sequence Linux's own driver puts a controller through before it sends a
 /// command, replayed with the values it used on this board.
 ///
-/// **Ignored, and the ledger entry is here.** It fails, the reason is
-/// understood, and the file it is in is not this change's to edit.
-///
-/// The boot below reaches `nvme 0000:00:04.0: enabling device` and then the
-/// probe never finishes; the controller is left holding `CSTS = 0x2` —
-/// `CSTS.CFS` set, `CSTS.RDY` clear. This asks the same question in five
-/// seconds instead of five minutes, and answers it: `src/dev/nvme/ctrl.rs`
-/// places three `CC` fields one bit too high.
+/// This began as an `#[ignore]`d ledger entry: the boot below reached
+/// `nvme 0000:00:04.0: enabling device` and then the probe never finished, with
+/// the controller left holding `CSTS = 0x2` — `CSTS.CFS` set, `CSTS.RDY` clear.
+/// It asked the same question in five seconds instead of five minutes, and
+/// answered it: `src/dev/nvme/ctrl.rs` placed three `CC` fields one bit too
+/// high. It now runs.
 ///
 /// *NVM Express* base specification, `CC` (Figure "Controller Configuration"):
 /// `MPS` is bits **10:07**, `AMS` **13:11**, `SHN` **15:14**, `IOSQES`
-/// **19:16** and `IOCQES` **23:20**, with 31:24 reserved. `ctrl.rs` has
+/// **19:16** and `IOCQES` **23:20**, with 31:24 reserved. `ctrl.rs` had
 /// `CC_MPS_SHIFT` 7 over five bits, `CC_SHN_SHIFT` 15, `CC_IOSQES_SHIFT` 17
-/// and `CC_IOCQES_SHIFT` 21 — every field from `MPS` up is shifted one bit,
-/// and `CC_MASK` is `0x01ff_f8f1` where the specification's is `0x00ff_f8f1`.
+/// and `CC_IOCQES_SHIFT` 21 — every field from `SHN` up shifted one bit — and
+/// a `CC_MASK` of `0x01ff_f8f1` that dropped the top three bits of `MPS`.
 ///
 /// The guest's own value settles which layout is right. A 6.6 kernel writes
 /// `CC = 0x00460001`; read with the specification's field positions that is
 /// `IOSQES` 6 (64-byte submission entries) and `IOCQES` 4 (16-byte completion
-/// entries), which are the only two values NVMe defines. Read with `ctrl.rs`'s
-/// they are 3 and 2, `Controller::enable`'s `iosqes == 6 && iocqes == 4` is
-/// false, and the controller reports a fatal status instead of coming ready.
-///
-/// Un-ignore this with the shifts.
+/// entries), which are the only two values NVMe defines. Read with the old
+/// shifts they were 3 and 2, `Controller::enable`'s `iosqes == 6 && iocqes == 4`
+/// was false, and the controller reported a fatal status instead of coming
+/// ready.
 #[test]
-#[ignore = "src/dev/nvme/ctrl.rs places CC.IOSQES/IOCQES/SHN one bit too high; see the doc comment"]
 fn the_controller_comes_ready_for_the_configuration_a_current_kernel_writes() {
     /// Where the kernel's allocator put `BAR0` on this board.
     const BAR0: u64 = 0x1010_0000;

@@ -214,6 +214,30 @@ const REG_ACQ: u64 = 0x30;
 const CSTS_RDY: u32 = 1;
 const CSTS_CFS: u32 = 2;
 
+/// `CC` as a driver writes it to start a controller, **as a literal**.
+///
+/// *NVM Express* base specification, Figure "Controller Configuration": `EN`
+/// is bit 0, `CSS` bits 06:04, `MPS` 10:07, `AMS` 13:11, `SHN` 15:14, `IOSQES`
+/// 19:16 and `IOCQES` 23:20. So `0x0046_0001` is `EN` set, the NVM command set,
+/// 4 KiB pages, round-robin arbitration, no shutdown notification, 64-byte
+/// submission entries (`IOSQES` 6) and 16-byte completion entries (`IOCQES` 4)
+/// — the two entry sizes NVMe defines, and the word a Linux 6.6 kernel was
+/// measured writing to this controller.
+///
+/// It is spelled out rather than assembled from named shifts on purpose: a
+/// test that builds `CC` from the same constants the model decodes it with
+/// asserts only that the file agrees with itself, and passes just as happily
+/// with every field one bit out of place. That is precisely the defect this
+/// constant exists to catch.
+const CC_ENABLE: u32 = 0x0046_0001;
+
+/// The same, with `IOCQES` 5 — a 32-byte completion entry, which NVMe does not
+/// define and this controller must refuse.
+const CC_BAD_IOCQES: u32 = 0x0056_0001;
+
+/// `CC.SHN` = 01b, a normal shutdown: bits 15:14, so bit 14.
+const CC_SHN_NORMAL: u32 = 0x0000_4000;
+
 /// Where the queues live in the board's RAM.
 const ASQ: u64 = 0x0010_0000;
 const ACQ: u64 = 0x0010_1000;
@@ -407,8 +431,7 @@ fn enable(m: &Machine) {
     set_reg64(m, REG_ACQ, ACQ);
     // §3.1.5: the NVM command set, 4 KiB pages, 64-byte submission entries and
     // 16-byte completion entries, and go.
-    let cc = 1 | (6 << 17) | (4 << 21);
-    set_reg32(m, REG_CC, cc);
+    set_reg32(m, REG_CC, CC_ENABLE);
     for _ in 0..100 {
         if reg32(m, REG_CSTS) & CSTS_RDY != 0 {
             return;
@@ -535,7 +558,7 @@ fn the_controller_refuses_an_admin_queue_it_cannot_use() {
     set_reg32(&m, REG_AQA, 0x000f_000f);
     set_reg64(&m, REG_ASQ, ASQ + 8);
     set_reg64(&m, REG_ACQ, ACQ);
-    set_reg32(&m, REG_CC, 1 | (6 << 17) | (4 << 21));
+    set_reg32(&m, REG_CC, CC_ENABLE);
     let csts = reg32(&m, REG_CSTS);
     assert_eq!(csts & CSTS_RDY, 0, "it must not come ready");
     assert_eq!(csts & CSTS_CFS, CSTS_CFS, "and it must say why");
@@ -547,7 +570,7 @@ fn the_controller_refuses_an_admin_queue_it_cannot_use() {
     set_reg32(&m, REG_AQA, 0x000f_000f);
     set_reg64(&m, REG_ASQ, ASQ);
     set_reg64(&m, REG_ACQ, ACQ);
-    set_reg32(&m, REG_CC, 1 | (6 << 17) | (5 << 21));
+    set_reg32(&m, REG_CC, CC_BAD_IOCQES);
     assert_eq!(reg32(&m, REG_CSTS) & CSTS_RDY, 0);
 
     // And the configuration this test's driver actually uses works.
@@ -555,6 +578,121 @@ fn the_controller_refuses_an_admin_queue_it_cannot_use() {
     place_bar(&m);
     enable(&m);
     assert_eq!(reg32(&m, REG_CSTS), CSTS_RDY);
+}
+
+/// `CC` carries its fields where the *specification* puts them, decided by
+/// literal register words rather than by this file's own arithmetic.
+///
+/// The companion of [`CC_ENABLE`]. Each word below is chosen so that the same
+/// bit pattern means something different if a field sits one bit out of place,
+/// and the assertion is on what the controller *does* with it — so a model that
+/// agrees with a test that agrees with the model cannot make this pass.
+///
+/// *NVM Express* base specification, Figure "Controller Configuration": `EN` 0,
+/// `CSS` 06:04, `MPS` 10:07, `AMS` 13:11, `SHN` 15:14, `IOSQES` 19:16,
+/// `IOCQES` 23:20, and 31:24 reserved.
+#[test]
+fn cc_carries_its_fields_where_the_specification_puts_them() {
+    /// Ready the admin queue registers, which every case below needs.
+    fn queues(m: &Machine) {
+        set_reg32(
+            m,
+            REG_AQA,
+            (ADMIN_ENTRIES - 1) | ((ADMIN_ENTRIES - 1) << 16),
+        );
+        set_reg64(m, REG_ASQ, ASQ);
+        set_reg64(m, REG_ACQ, ACQ);
+    }
+
+    // The word a current Linux kernel writes. Read with the specification's
+    // field positions it is IOSQES 6 / IOCQES 4; one bit higher it is 3 and 2,
+    // neither of which NVMe defines, and the controller would refuse it.
+    let (m, _store) = board();
+    place_bar(&m);
+    queues(&m);
+    set_reg32(&m, REG_CC, CC_ENABLE);
+    let csts = reg32(&m, REG_CSTS);
+    assert_eq!(
+        csts & CSTS_CFS,
+        0,
+        "CC = {CC_ENABLE:#010x} is the configuration a Linux kernel writes and \
+         the controller reported a fatal status (CSTS = {csts:#010x})"
+    );
+    assert_eq!(csts & CSTS_RDY, CSTS_RDY, "and it must come ready");
+    // Every field in that word is implemented, so it reads back whole: a
+    // reserved-bit mask that swallowed part of one would show up here.
+    assert_eq!(
+        reg32(&m, REG_CC),
+        CC_ENABLE,
+        "CC reads back what was written"
+    );
+
+    // The mirror image: the word that would carry IOSQES 6 / IOCQES 4 if the
+    // fields sat one bit higher. Its real IOSQES is 12, which is not a size
+    // NVMe defines, so a controller reading CC correctly refuses it.
+    let (m, _store) = board();
+    place_bar(&m);
+    queues(&m);
+    set_reg32(&m, REG_CC, 1 | (6 << 17) | (4 << 21));
+    let csts = reg32(&m, REG_CSTS);
+    assert_eq!(
+        csts & CSTS_RDY,
+        0,
+        "IOSQES 12 is not a submission entry size"
+    );
+    assert_eq!(csts & CSTS_CFS, CSTS_CFS, "and CSTS.CFS says so");
+
+    // MPS is four bits at 10:07, and CAP.MPSMAX is 4 (64 KiB). MPS 5 asks for
+    // a 128 KiB page: refused. Its bits are 10:08, so a model that dropped the
+    // top of MPS as reserved would read this word as MPS 0 and come ready.
+    let (m, _store) = board();
+    place_bar(&m);
+    queues(&m);
+    set_reg32(&m, REG_CC, CC_ENABLE | (5 << 7));
+    let csts = reg32(&m, REG_CSTS);
+    assert_eq!(csts & CSTS_RDY, 0, "MPS 5 exceeds CAP.MPSMAX");
+    assert_eq!(csts & CSTS_CFS, CSTS_CFS, "and CSTS.CFS says so");
+
+    // AMS is 13:11, and CAP.AMS advertises round robin only, so 001b — the
+    // weighted round robin with urgent priority class — is refused.
+    let (m, _store) = board();
+    place_bar(&m);
+    queues(&m);
+    set_reg32(&m, REG_CC, CC_ENABLE | (1 << 11));
+    let csts = reg32(&m, REG_CSTS);
+    assert_eq!(csts & CSTS_RDY, 0, "AMS 001b is not advertised by CAP.AMS");
+    assert_eq!(csts & CSTS_CFS, CSTS_CFS, "and CSTS.CFS says so");
+
+    // SHN is 15:14, so a normal shutdown notification is bit 14, and §3.1.6
+    // answers it with SHST = 10b once the controller has processed it.
+    let (m, _store) = board();
+    place_bar(&m);
+    queues(&m);
+    set_reg32(&m, REG_CC, CC_ENABLE);
+    set_reg32(&m, REG_CC, CC_ENABLE | CC_SHN_NORMAL);
+    assert_eq!(
+        reg32(&m, REG_CSTS) >> 2 & 0x3,
+        0b10,
+        "CSTS.SHST: shutdown processing complete"
+    );
+    // Bit 15 alone is SHN = 10b, an abrupt shutdown, which is also a shutdown
+    // — while bit 16, the first reserved bit above SHN, is not a shutdown at
+    // all and must be dropped rather than stored.
+    let (m, _store) = board();
+    place_bar(&m);
+    queues(&m);
+    set_reg32(&m, REG_CC, CC_ENABLE);
+    set_reg32(&m, REG_CC, CC_ENABLE | (1 << 16));
+    assert_eq!(
+        reg32(&m, REG_CSTS) >> 2 & 0x3,
+        0,
+        "bit 16 is reserved: no shutdown, and CSTS.SHST stays 00b"
+    );
+    assert_eq!(
+        reg32(&m, REG_CC),
+        CC_ENABLE,
+        "and the reserved bit is not stored"
+    );
 }
 
 #[test]
@@ -1129,7 +1267,7 @@ fn a_shutdown_notification_flushes_and_says_so() {
 
     // CC.SHN = 01b, a normal shutdown.
     let cc = reg32(&m, REG_CC);
-    set_reg32(&m, REG_CC, cc | (1 << 15));
+    set_reg32(&m, REG_CC, cc | CC_SHN_NORMAL);
     // CSTS.SHST = 10b, shutdown processing complete (§3.1.6).
     assert_eq!(reg32(&m, REG_CSTS) >> 2 & 0x3, 0b10);
 
