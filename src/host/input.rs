@@ -1172,9 +1172,11 @@ pub mod mouse {
         /// The mouse this build constructed, the most recent one if there are
         /// several.
         ///
-        /// `None` when there is none, which is every machine in `machines/`
-        /// today: a USB controller and a display do not yet appear on the same
-        /// board.
+        /// `None` when there is none, which is most machines in `machines/`:
+        /// a board needs a USB controller and a display at once, and until
+        /// `usb.xhci-pci` gave a controller a PCI attachment none had both.
+        /// `xhci-pci-mini` is the first, and `tests/xhci_pci.rs` drives a
+        /// pointer through it from this very seam.
         #[must_use]
         pub fn take(hosts: &HostObjects) -> Option<Arc<HidMouse>> {
             hosts
