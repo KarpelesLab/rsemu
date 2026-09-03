@@ -102,6 +102,33 @@ const TIMER_VECTOR: u8 = 0x41;
 /// confused with it.
 const TIMER_COUNT: u32 = 100_000;
 
+/// What the guest loads into the APIC timer's initial count in *periodic* mode:
+/// five milliseconds on the same 100 MHz bus clock.
+///
+/// Five rather than one, and the runs below are budgeted in whole periods with
+/// most of a period to spare at each end. The delivery is exact — same run,
+/// same tick, every time — but it is observed at the scheduler's next slice
+/// rather than at the instant the count reaches zero, and a period on either
+/// side of every assertion keeps that slice out of the arithmetic. What is
+/// being asserted is that a periodic timer reloads, not what a slice is worth.
+const TIMER_PERIOD: u32 = 500_000;
+
+/// One period of either periodic source, in nanoseconds.
+const PERIOD_NS: u64 = 5_000_000;
+
+/// Which I/O APIC input the 8254's counter 0 is wired to, per
+/// `machines/pc-apic.machine` — and per the MultiProcessor Specification §5.1,
+/// which puts the 8254 on input **2** because input 0 is where an `ExtINT`
+/// entry for the whole 8259A cascade goes. It is the input a kernel's
+/// `..TIMER: vector=0x30 apic1=0 pin1=2` line names.
+const PIT_INPUT: u8 = 2;
+
+/// The 8254 divisor the firmware loads into counter 0. The board's 8254 crystal
+/// is 105/88 MHz, so 5966 counts is 5.0001 ms — near enough one [`PERIOD_NS`]
+/// that the two periodic sources can be budgeted the same way, and exact
+/// because the oscillator is a rational rather than a rounded float.
+const PIT_DIVISOR: u32 = 5966;
+
 /// Which I/O APIC input the HPET's first comparator is wired to, per
 /// `machines/pc-apic.machine`.
 const HPET_INPUT: u8 = 20;
@@ -109,6 +136,11 @@ const HPET_INPUT: u8 = 20;
 /// How many HPET ticks pass before the comparator matches. At 100 ns a tick,
 /// 1000 of them is 100 microseconds.
 const HPET_DELAY: u32 = 1_000;
+
+/// The period of the *edge-triggered* comparator, in HPET ticks: 50 000 of them
+/// at 100 ns is five milliseconds, the same interval [`TIMER_PERIOD`] gives the
+/// local APIC timer, so the two periodic sources below count the same thing.
+const HPET_PERIOD: u32 = 50_000;
 
 /// Append a little-endian 32-bit word.
 fn dw(out: &mut Vec<u8>, value: u32) {
@@ -128,9 +160,21 @@ fn store_at(out: &mut Vec<u8>, disp: u32, value: u32) {
 enum Source {
     /// An HPET comparator, level-triggered, routed through the I/O APIC.
     Hpet,
+    /// A *periodic* HPET comparator in edge-triggered mode, routed through an
+    /// I/O APIC redirection entry that is also edge-triggered — the other
+    /// trigger mode, and the one a PC's 8254 arrives on.
+    HpetEdge,
+    /// The **8254's** counter 0 in mode 2, on I/O APIC input 2 through an
+    /// edge-triggered entry: the exact path a Linux kernel checks in symmetric
+    /// I/O mode, and the one behind `MP-BIOS bug: 8254 timer not connected to
+    /// IO-APIC`.
+    Pit,
     /// The local APIC's own timer, one-shot, which reaches the processor
     /// without going near the I/O APIC.
     ApicTimer,
+    /// The same timer in periodic mode: one arming, an interrupt every period,
+    /// with no further register write from the guest.
+    ApicTimerPeriodic,
     /// No timer at all: the firmware starts the board's *second processor*
     /// instead, with the MultiProcessor Specification's three interrupt
     /// command register writes (v1.4 B.4).
@@ -204,8 +248,8 @@ fn firmware(source: Source) -> Vec<u8> {
     // IDT_BASE + 8 * vector. RAM comes out of a cold reset zeroed, so every
     // other entry is a not-present gate already.
     let vector = match source {
-        Source::Hpet => VECTOR,
-        Source::ApicTimer | Source::Smp => TIMER_VECTOR,
+        Source::Hpet | Source::HpetEdge | Source::Pit => VECTOR,
+        Source::ApicTimer | Source::ApicTimerPeriodic | Source::Smp => TIMER_VECTOR,
     };
     pm.push(0xbf); // mov edi, gate
     dw(&mut pm, IDT_BASE + 8 * u32::from(vector));
@@ -220,18 +264,25 @@ fn firmware(source: Source) -> Vec<u8> {
     pm.extend_from_slice(&[0x0f, 0x01, 0x1d]); // lidt [idt_ptr]
     dw(&mut pm, lin(OFF_IDT_PTR));
 
-    if source == Source::Hpet {
+    if matches!(source, Source::Hpet | Source::HpetEdge | Source::Pit) {
         // The I/O APIC. Two indirect writes per half: the index register, then
         // the data window. The high half first, so the entry is never briefly
         // unmasked with a destination nobody has written.
         pm.push(0xbf); // mov edi, 0xfec00000
         dw(&mut pm, 0xfec0_0000);
-        let index = 0x10 + 2 * u32::from(HPET_INPUT);
+        let input = if source == Source::Pit {
+            PIT_INPUT
+        } else {
+            HPET_INPUT
+        };
+        let index = 0x10 + 2 * u32::from(input);
         store_at(&mut pm, 0x00, index + 1);
         store_at(&mut pm, 0x10, 0); // destination: APIC ID 0, physical
         store_at(&mut pm, 0x00, index);
-        // Vector, level-triggered (bit 15), unmasked, fixed delivery to APIC 0.
-        store_at(&mut pm, 0x10, (1 << 15) | u32::from(VECTOR));
+        // Vector, unmasked, fixed delivery to APIC 0, and the trigger mode this
+        // source asks for: bit 15 set is level, clear is edge (82093AA §3.2.4).
+        let trigger = if source == Source::Hpet { 1 << 15 } else { 0 };
+        store_at(&mut pm, 0x10, trigger | u32::from(VECTOR));
     }
 
     // The local APIC: software-enable it, with 0xff as the spurious vector.
@@ -242,14 +293,31 @@ fn firmware(source: Source) -> Vec<u8> {
     store_at(&mut pm, 0xf0, 0x1ff);
 
     match source {
-        Source::ApicTimer => {
-            // Divide by one, a one-shot at `TIMER_VECTOR`, and the count that
-            // starts it. The order matters and is the architecture's: the LVT
-            // entry says where the interrupt goes, and "writing to the initial
-            // count register starts the timer" (SDM Vol 3A 10.5.4).
+        Source::ApicTimer | Source::ApicTimerPeriodic => {
+            // Divide by one, the timer entry at `TIMER_VECTOR`, and the count
+            // that starts it. The order matters and is the architecture's: the
+            // LVT entry says where the interrupt goes and in which mode, and
+            // "writing to the initial count register starts the timer" (SDM
+            // Vol 3A 10.5.4).
+            //
+            // Bits 18:17 of the timer entry are the mode: `00` one-shot, `01`
+            // periodic (SDM Vol 3A Figure 10-8). A periodic timer reloads the
+            // initial count itself, so this is the last register write the
+            // guest makes — every interrupt after the first comes from the
+            // part's own arithmetic.
+            let mode = if source == Source::ApicTimerPeriodic {
+                1 << 17
+            } else {
+                0
+            };
+            let count = if source == Source::ApicTimerPeriodic {
+                TIMER_PERIOD
+            } else {
+                TIMER_COUNT
+            };
             store_at(&mut pm, 0x3e0, 0b1011);
-            store_at(&mut pm, 0x320, u32::from(TIMER_VECTOR));
-            store_at(&mut pm, 0x380, TIMER_COUNT);
+            store_at(&mut pm, 0x320, mode | u32::from(TIMER_VECTOR));
+            store_at(&mut pm, 0x380, count);
         }
         Source::Smp => {
             // The other processor. First its trampoline, written into RAM as
@@ -295,6 +363,42 @@ fn firmware(source: Source) -> Vec<u8> {
             store_at(&mut pm, 0x10c, 0);
             store_at(&mut pm, 0x010, 1); // ENABLE_CNF
             store_at(&mut pm, 0x014, 0);
+        }
+        Source::HpetEdge => {
+            // The same comparator, *edge*-triggered and periodic:
+            // `Tn_INT_ENB_CNF` (bit 2) with `Tn_INT_TYPE_CNF` (bit 1) clear is
+            // the edge mode, `Tn_TYPE_CNF` (bit 3) is periodic, and
+            // `Tn_VAL_SET_CNF` (bit 6) makes the next comparator write set the
+            // accumulator as well as the period (IA-PC HPET §2.3.9).
+            //
+            // An edge-triggered comparator pulses its output line and leaves it
+            // low, so nothing here holds a level: every interrupt the guest
+            // takes below is a rising edge the redirection entry had to notice
+            // on its own.
+            pm.push(0xbf); // mov edi, 0xfed00000
+            dw(&mut pm, 0xfed0_0000);
+            store_at(&mut pm, 0x100, 0b100_1100);
+            store_at(&mut pm, 0x104, 0);
+            store_at(&mut pm, 0x108, HPET_PERIOD);
+            store_at(&mut pm, 0x10c, 0);
+            store_at(&mut pm, 0x010, 1); // ENABLE_CNF
+            store_at(&mut pm, 0x014, 0);
+        }
+        Source::Pit => {
+            // The 8254, programmed the way every PC operating system programs
+            // it for its tick: control word 34h is counter 0, both count bytes,
+            // **mode 2** (rate generator), binary; then the divisor, low byte
+            // first (Intel 8254 datasheet, "Mode 2" and the control word
+            // format).
+            //
+            // Mode 2 holds OUT high and takes it low for a single input clock
+            // at terminal count, so what arrives at the interrupt controller is
+            // a pulse and the interrupt is its rising edge. There is no level
+            // anywhere on this path for an entry to latch.
+            for byte in [0x34, (PIT_DIVISOR & 0xff) as u8, (PIT_DIVISOR >> 8) as u8] {
+                pm.extend_from_slice(&[0xb0, byte]); // mov al, imm8
+                pm.extend_from_slice(&[0xe6, if byte == 0x34 { 0x43 } else { 0x40 }]);
+            }
         }
     }
 
@@ -483,6 +587,191 @@ fn the_apic_timer_fires_at_a_tick_the_scheduler_chose() {
         1,
         "three milliseconds contains exactly one expiry of a one-shot"
     );
+}
+
+/// A periodic local APIC timer keeps interrupting after the first expiry.
+///
+/// The one-shot test above is the model, and *only* a one-shot: it arms a timer
+/// whose mode field is `00`, so nothing in this file ever exercised the reload.
+/// A guest that arms `01` — which is what a kernel does for its tick, and what
+/// `APIC delta adjusted to PM-Timer` is the calibration for — is asking for an
+/// interrupt every period with no further register write, and one interrupt is
+/// as wrong an answer as none.
+///
+/// "If the timer is set for periodic mode, the current-count register is
+/// automatically reloaded from the initial-count register whenever the
+/// current-count register reaches 0 and an interrupt is generated" (SDM Vol 3A
+/// §10.5.4). The count below is the whole assertion: [`TIMER_PERIOD`] bus ticks
+/// of a 100 MHz crystal is five milliseconds, so three and a half periods of
+/// virtual time contain exactly three expiries — and the reload, not the
+/// arming, produced two of them.
+#[test]
+fn a_periodic_apic_timer_interrupts_once_a_period() {
+    let count = interrupts_in(Source::ApicTimerPeriodic, 3 * PERIOD_NS + PERIOD_NS / 2);
+    assert!(
+        count > 1,
+        "a periodic timer delivered {count} interrupt(s): it never reloaded"
+    );
+    assert_eq!(
+        count, 3,
+        "three whole periods, and the reload made two of them"
+    );
+
+    // And the interval is the timer's own, not an artefact of how long the run
+    // was: half a period is no interrupt at all, and twice as long is twice as
+    // many.
+    assert_eq!(
+        interrupts_in(Source::ApicTimerPeriodic, PERIOD_NS / 2),
+        0,
+        "half a period of virtual time is not a period"
+    );
+    assert_eq!(
+        interrupts_in(Source::ApicTimerPeriodic, 6 * PERIOD_NS + PERIOD_NS / 2),
+        6,
+        "and six periods deliver six"
+    );
+
+    // The guest wrote the initial count once. A periodic timer that had run
+    // down to zero and stopped would read zero here; one that reloads is
+    // somewhere inside its period, and never above the count that was written.
+    let mut m = board(Source::ApicTimerPeriodic);
+    m.reset(ResetKind::Cold);
+    m.sweep();
+    m.run_for(GlobalTime::from_nanos(3 * PERIOD_NS + PERIOD_NS / 2))
+        .expect("the machine runs");
+    let mem = m.space("mem").expect("the memory space");
+    let current = mem
+        .read(0xfee0_0390, Width::U32, MemAttrs::DEFAULT)
+        .expect("the current count register") as u32;
+    assert!(
+        current > 0 && current <= TIMER_PERIOD,
+        "the current count is inside the period ({current})"
+    );
+    let initial = mem
+        .read(0xfee0_0380, Width::U32, MemAttrs::DEFAULT)
+        .expect("the initial count register") as u32;
+    assert_eq!(initial, TIMER_PERIOD, "and the initial count is untouched");
+}
+
+/// The determinism rule, on the periodic path.
+#[test]
+fn the_periodic_apic_timer_lands_in_the_same_place_every_run() {
+    let counts: Vec<u32> = (0..3)
+        .map(|_| interrupts_in(Source::ApicTimerPeriodic, 3 * PERIOD_NS + PERIOD_NS / 2))
+        .collect();
+    assert_eq!(counts, [3, 3, 3]);
+}
+
+/// An **edge-triggered** redirection entry delivers, and keeps delivering.
+///
+/// The level-triggered test above is the only delivery this file used to
+/// assert, and the two trigger modes are different code paths in the I/O APIC:
+/// a level is a condition the entry re-evaluates and latches remote IRR for,
+/// an edge is an event forwarded once with no latch (82093AA §3.2.4). A PC's
+/// 8254 arrives on an edge-triggered input, which is what makes this the mode a
+/// kernel checks first — `MP-BIOS bug: 8254 timer not connected to IO-APIC` is
+/// Linux having counted zero of these.
+///
+/// The comparator behind it is periodic and edge-triggered, so its output line
+/// pulses and returns low: nothing holds a level anywhere on this path, and
+/// every interrupt counted is a rising edge the entry noticed by itself.
+#[test]
+fn an_edge_triggered_redirection_entry_delivers_every_edge() {
+    let count = interrupts_in(Source::HpetEdge, 3 * PERIOD_NS + PERIOD_NS / 2);
+    assert!(
+        count > 0,
+        "an edge-triggered redirection entry delivered nothing"
+    );
+    assert!(
+        count > 1,
+        "the first edge arrived and no later one did ({count}): the entry is \
+         behaving like a level with remote IRR stuck"
+    );
+    assert_eq!(count, 3, "three whole periods, three rising edges taken");
+    assert_eq!(
+        interrupts_in(Source::HpetEdge, PERIOD_NS / 2),
+        0,
+        "and half a period is no edge at all"
+    );
+
+    // Where the level case latched remote IRR and needed the guest's
+    // end-of-interrupt to let go, this entry never latches it: an edge is an
+    // event, and there is no condition to hold.
+    let mut m = board(Source::HpetEdge);
+    m.reset(ResetKind::Cold);
+    m.sweep();
+    m.run_for(GlobalTime::from_nanos(3 * PERIOD_NS + PERIOD_NS / 2))
+        .expect("the machine runs");
+    let mem = m.space("mem").expect("the memory space");
+    let index = 0x10 + 2 * u32::from(HPET_INPUT);
+    mem.write(0xfec0_0000, Width::U32, u64::from(index), MemAttrs::DEFAULT)
+        .expect("the index register");
+    let entry = mem
+        .read(0xfec0_0010, Width::U32, MemAttrs::DEFAULT)
+        .expect("the data window") as u32;
+    assert_eq!(
+        entry & 0xff,
+        u32::from(VECTOR),
+        "the vector the guest wrote"
+    );
+    assert_eq!(entry & (1 << 15), 0, "the entry is edge-triggered");
+    assert_eq!(
+        entry & (1 << 14),
+        0,
+        "and an edge-triggered entry never latches remote IRR"
+    );
+    assert_eq!(entry & (1 << 16), 0, "with the entry still unmasked");
+}
+
+/// The **8254** reaching the processor through I/O APIC input 2 — the exact
+/// path a kernel checks first, and the one it names when it gives up.
+///
+/// `..TIMER: vector=0x30 apic1=0 pin1=2`, then `..MP-BIOS bug: 8254 timer not
+/// connected to IO-APIC`: Linux programs counter 0 as a rate generator, routes
+/// it through the redirection entry the MADT's interrupt source override names,
+/// and counts ticks. Every part of that is here — the same counter in the same
+/// mode on the same input through an entry with the same trigger mode — because
+/// a synthetic pulse from an HPET comparator is not quite the same claim as the
+/// chip a PC actually ticks on.
+///
+/// Mode 2 holds OUT high and drops it for a single input clock per period, so
+/// the interrupt is the *rising* edge at the end of that pulse: nothing on this
+/// path is a level, and nothing latches. Loading the counter takes OUT high
+/// from the low it idles at out of reset, which is one further rising edge and
+/// the first interrupt below — a real 8254 does exactly this, and it is why a
+/// PC's first tick arrives early.
+#[test]
+fn the_8254_reaches_the_processor_through_io_apic_input_2() {
+    // Half a period: the arming edge only.
+    assert_eq!(
+        interrupts_in(Source::Pit, PERIOD_NS / 2),
+        1,
+        "loading counter 0 takes OUT high, which is a rising edge on the input"
+    );
+    // Three whole periods on top of it.
+    assert_eq!(
+        interrupts_in(Source::Pit, 3 * PERIOD_NS + PERIOD_NS / 2),
+        4,
+        "the arming edge and one per period: an 8254 on an edge-triggered \
+         redirection entry keeps interrupting"
+    );
+}
+
+/// The level-triggered entry still works, unchanged, beside the edge one.
+///
+/// The pair is the point: `tests/q35_intx.rs` asserts a route by showing that
+/// what arrives changes when the routing changes, and this is the same shape.
+/// Both sources are the same comparator on the same input pin with the same
+/// vector; only the trigger mode differs, and both counts are what that mode
+/// says they should be.
+#[test]
+fn both_trigger_modes_deliver_and_they_are_not_the_same_path() {
+    // One-shot and level: one interrupt, and the entry held remote IRR until
+    // the guest ended it.
+    assert_eq!(interrupts_in(Source::Hpet, 5_000_000), 1);
+    // Periodic and edge, over a run long enough for two whole periods: more
+    // than one, because no latch was in the way.
+    assert!(interrupts_in(Source::HpetEdge, 2 * PERIOD_NS + PERIOD_NS / 2) > 1);
 }
 
 #[test]

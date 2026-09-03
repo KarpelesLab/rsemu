@@ -20,19 +20,57 @@
 //!
 //! RSEMU_KERNEL=/boot/vmlinuz \
 //! RSEMU_INITRD=testdata/x86/initramfs-x86.cpio \
-//! RSEMU_KERNEL_CMDLINE='console=ttyS0,115200 nokaslr cryptomgr.notests nolapic' \
+//! RSEMU_KERNEL_CMDLINE='console=ttyS0,115200 nokaslr cryptomgr.notests noapic' \
 //! RSEMU_KERNEL_MS=2500000 \
 //! RSEMU_KERNEL_INPUT='rsemu# =>head -c 40 /dev/nvme0n1\n' \
 //! RSEMU_KERNEL_STOP_AT='rsemu q35-linux nvme namespace' \
 //!     cargo test --release --features machine-q35-linux --test q35_linux -- --nocapture
 //! ```
 //!
-//! **That does not pass today**, and both reasons are written down rather than
-//! worked around. `nolapic` is there because two device models deliver no
-//! interrupt on paths this board is the first guest to use, and even with it
-//! the run stops inside the NVMe probe — see
-//! [`docs/platforms/q35-linux.md`](../docs/platforms/q35-linux.md) and the
-//! `#[ignore]`d test below, which reproduces the second in five seconds.
+//! **`noapic` is still on that command line**, and what it is standing in for
+//! has moved. Measured with a 6.6 kernel:
+//!
+//! * With `noapic` — the local APIC and its timer in use, interrupt lines
+//!   through the 8259A — the kernel now boots the whole way: every initcall,
+//!   `nvme nvme0: pci function 0000:00:04.0`, the admin queue, an I/O queue
+//!   pair (`1/0/0 default/read/poll queues`), and then the panic a run with no
+//!   initramfs has to end on, `VFS: Unable to mount root fs`. Two defects had
+//!   to go for that: `CC`'s field positions (the `#[ignore]`d ledger entry
+//!   below, now un-ignored and passing) and an acknowledge cycle that reached
+//!   the 8259A instead of the local APIC that was actually asserting
+//!   (`src/dev/pc/imcr.rs`).
+//! * With the board's **default** command line — symmetric I/O mode, the tick
+//!   routed through the I/O APIC — it still stops at
+//!   `..MP-BIOS bug: 8254 timer not connected to IO-APIC` and then
+//!   `Kernel panic - not syncing: IO-APIC + timer doesn't work!`.
+//!
+//! That last one is **not** the two APIC device models, which is where it was
+//! first filed. `tests/pc_apic.rs` now drives all three of the paths it was
+//! blamed on — a local APIC timer in periodic mode, an edge-triggered
+//! redirection entry, and the 8254 itself on I/O APIC input 2 through an
+//! edge-triggered entry — and every one of them delivers, on a board with the
+//! same wiring. The same firmware sequence the kernel performs, run on the
+//! `q35` board itself, takes its interrupts too.
+//!
+//! What is missing is a **route**, not a delivery. `pc.hpet` advertises
+//! `LEG_RT_CAP`, so Linux takes the legacy replacement route: `hpet_enable`
+//! registers the HPET as the global clock event, sets `LEG_RT_CNF`, and from
+//! then on expects **HPET timer 0** on IRQ0 — the 8259A's `IR0` and I/O APIC
+//! input 2 — with the 8254 disconnected. This board wires `hpet0.t0` to
+//! `ioapic.irq16` and leaves `pc.hpet`'s `legacy` output pin unconnected, so
+//! while that bit is set nothing at all drives IRQ0, the 8254 included. Hence
+//! `..MP-BIOS bug: 8254 timer not connected to IO-APIC` — a literally accurate
+//! complaint — and then all three fallbacks failing, because every one of them
+//! is another way of asking for IRQ0.
+//!
+//! Adding **`hpet=disable`** to the command line above proves it: Linux falls
+//! back to `pit_timer_init`, programs the 8254 itself, and the same run gets
+//! through `..TIMER: vector=0x30 apic1=0 pin1=2` with no `MP-BIOS bug` line and
+//! goes on booting. The fix is the board's — `pc.hpet`'s module documentation
+//! writes out the `wire.not`/`wire.and` gating a machine file needs — and it is
+//! what stands between this board and a default command line with nothing on
+//! it. [`docs/platforms/q35-linux.md`](../docs/platforms/q35-linux.md) is where
+//! the ledger lives.
 //!
 //! | Variable | What it does |
 //! | --- | --- |
@@ -338,32 +376,28 @@ fn the_controllers_register_block_answers_where_a_kernel_puts_it() {
 /// The sequence Linux's own driver puts a controller through before it sends a
 /// command, replayed with the values it used on this board.
 ///
-/// **Ignored, and the ledger entry is here.** It fails, the reason is
-/// understood, and the file it is in is not this change's to edit.
-///
-/// The boot below reaches `nvme 0000:00:04.0: enabling device` and then the
-/// probe never finishes; the controller is left holding `CSTS = 0x2` —
-/// `CSTS.CFS` set, `CSTS.RDY` clear. This asks the same question in five
-/// seconds instead of five minutes, and answers it: `src/dev/nvme/ctrl.rs`
-/// places three `CC` fields one bit too high.
+/// This began as an `#[ignore]`d ledger entry: the boot below reached
+/// `nvme 0000:00:04.0: enabling device` and then the probe never finished, with
+/// the controller left holding `CSTS = 0x2` — `CSTS.CFS` set, `CSTS.RDY` clear.
+/// It asked the same question in five seconds instead of five minutes, and
+/// answered it: `src/dev/nvme/ctrl.rs` placed three `CC` fields one bit too
+/// high. It now runs.
 ///
 /// *NVM Express* base specification, `CC` (Figure "Controller Configuration"):
 /// `MPS` is bits **10:07**, `AMS` **13:11**, `SHN` **15:14**, `IOSQES`
-/// **19:16** and `IOCQES` **23:20**, with 31:24 reserved. `ctrl.rs` has
+/// **19:16** and `IOCQES` **23:20**, with 31:24 reserved. `ctrl.rs` had
 /// `CC_MPS_SHIFT` 7 over five bits, `CC_SHN_SHIFT` 15, `CC_IOSQES_SHIFT` 17
-/// and `CC_IOCQES_SHIFT` 21 — every field from `MPS` up is shifted one bit,
-/// and `CC_MASK` is `0x01ff_f8f1` where the specification's is `0x00ff_f8f1`.
+/// and `CC_IOCQES_SHIFT` 21 — every field from `SHN` up shifted one bit — and
+/// a `CC_MASK` of `0x01ff_f8f1` that dropped the top three bits of `MPS`.
 ///
 /// The guest's own value settles which layout is right. A 6.6 kernel writes
 /// `CC = 0x00460001`; read with the specification's field positions that is
 /// `IOSQES` 6 (64-byte submission entries) and `IOCQES` 4 (16-byte completion
-/// entries), which are the only two values NVMe defines. Read with `ctrl.rs`'s
-/// they are 3 and 2, `Controller::enable`'s `iosqes == 6 && iocqes == 4` is
-/// false, and the controller reports a fatal status instead of coming ready.
-///
-/// Un-ignore this with the shifts.
+/// entries), which are the only two values NVMe defines. Read with the old
+/// shifts they were 3 and 2, `Controller::enable`'s `iosqes == 6 && iocqes == 4`
+/// was false, and the controller reported a fatal status instead of coming
+/// ready.
 #[test]
-#[ignore = "src/dev/nvme/ctrl.rs places CC.IOSQES/IOCQES/SHN one bit too high; see the doc comment"]
 fn the_controller_comes_ready_for_the_configuration_a_current_kernel_writes() {
     /// Where the kernel's allocator put `BAR0` on this board.
     const BAR0: u64 = 0x1010_0000;

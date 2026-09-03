@@ -180,6 +180,11 @@ impl Registers {
         self.state.lock().imcr & IMCR_VIA_APIC != 0
     }
 
+    /// Whether the 8259A on the input pin is currently driving `INT` high.
+    fn routing_something(&self) -> bool {
+        self.state.lock().asserted
+    }
+
     /// Put both outputs where the register and the input level say they belong.
     ///
     /// The unselected destination is driven **low**, not left alone: switching
@@ -248,12 +253,28 @@ impl Registers {
 
 /// One output's acknowledge forwarder.
 ///
-/// **Gated on the register**, and it has to be. A local APIC drives the same
-/// `INTR` net this device's direct path does, and it never declines a cycle —
-/// SDM Vol 3A §10.9 makes the spurious vector the defined answer to "you asked
-/// and there is nothing". So on a net with two controllers the one that is not
-/// currently routing anything must say so, or whichever the CPU happens to ask
-/// first wins and half the machine's interrupts arrive with the wrong vector.
+/// **Gated on the register and on the input pin**, and it has to be on both. A
+/// local APIC drives the same `INTR` net this device's direct path does, and it
+/// never declines a cycle — SDM Vol 3A §10.9 makes the spurious vector the
+/// defined answer to "you asked and there is nothing". So on a net with two
+/// controllers the one that is not currently routing anything must say so, or
+/// whichever the CPU happens to ask first wins and half the machine's
+/// interrupts arrive with the wrong vector.
+///
+/// The register alone does not decide that. In PIC mode this path *is* the
+/// selected route and still routes nothing while the 8259A's `INT` pin is low —
+/// and that is the ordinary state of a board whose local APIC has just
+/// delivered a message, because a 64-bit operating system never writes this
+/// register at all: Linux's `imcr_pic_to_apic` is `CONFIG_X86_32` only, and the
+/// MP specification's own `IMCRP` flag exists precisely because a board may not
+/// have an IMCR fitted. On the hardware the question does not arise — §3.6.2.1's
+/// PIC mode physically bypasses the APIC, so its `INTR` cannot be asserted while
+/// this path is selected — but rsemu's boards wire both drivers onto one net,
+/// and on such a net "am I the selected route" is not the same question as "is
+/// this acknowledge mine". A cycle that arrives while the 8259A is idle belongs
+/// to the other driver, and answering it with the spurious `IR7` of a
+/// controller that has nothing pending is how a kernel loses every interrupt it
+/// routes through an I/O APIC.
 #[derive(Debug)]
 struct AckPath {
     regs: Arc<Registers>,
@@ -263,7 +284,7 @@ struct AckPath {
 
 impl IntAck for AckPath {
     fn acknowledge(&self, cycle: IntAckCycle) -> IntAckResponse {
-        if self.regs.via_apic() != self.when_via_apic {
+        if self.regs.via_apic() != self.when_via_apic || !self.regs.routing_something() {
             return IntAckResponse::Declined;
         }
         self.regs.upstream.run(cycle)
@@ -706,6 +727,12 @@ mod tests {
         let intr = Device::int_ack(&w.imcr, "intr").expect("the direct path vectors");
         let lint0 = Device::int_ack(&w.imcr, "lint0").expect("the APIC path vectors");
 
+        // The 8259A is driving its `INT` pin, which is what makes the cycle
+        // below this device's to answer. With the pin low neither path answers
+        // at all, whatever the register says — see
+        // [`an_idle_8259a_answers_no_acknowledge_in_either_mode`].
+        w.drive_int(Level::High);
+
         // PIC mode: the direct path carries the vector and the APIC path
         // declines, so a local APIC sharing the processor's `INTR` net cannot
         // answer a cycle this device is the one driving.
@@ -732,6 +759,68 @@ mod tests {
         assert!(
             Device::int_ack(&w.imcr, "int").is_none(),
             "an input pin offers nothing"
+        );
+    }
+
+    /// An acknowledge that arrives while the 8259A is idle is not this device's
+    /// to answer, in **either** mode.
+    ///
+    /// The other half of the gate above, and the half a board notices. On the
+    /// hardware §3.6.2.1's PIC mode bypasses the APIC outright, so the local
+    /// APIC's `INTR` cannot be asserted while the direct path is selected and
+    /// the question never comes up. rsemu's PC boards wire both drivers onto one
+    /// `INTR` net, so it comes up constantly: a 64-bit operating system never
+    /// writes this register — Linux's `imcr_pic_to_apic` is `CONFIG_X86_32`
+    /// only, and the MP specification's `IMCRP` flag exists because a board may
+    /// have no IMCR at all — and every interrupt it routes through an I/O APIC
+    /// therefore arrives with the board still in PIC mode.
+    ///
+    /// Answering those cycles from the 8259A hands the processor the spurious
+    /// `IR7` of a controller with nothing pending, and the interrupt the local
+    /// APIC actually had is lost. That is one defect with two faces: a kernel
+    /// that routes its 8254 through an I/O APIC prints `MP-BIOS bug: 8254 timer
+    /// not connected to IO-APIC`, and a kernel that uses the local APIC's own
+    /// timer stops dead the moment it switches its tick over to it.
+    #[test]
+    fn an_idle_8259a_answers_no_acknowledge_in_either_mode() {
+        let w = wired();
+        let pic: Arc<dyn IntAck> = Arc::new(Stub8259(0x08));
+        Device::attach_int_ack(&w.imcr, "int", Arc::downgrade(&pic));
+        let intr = Device::int_ack(&w.imcr, "intr").expect("the direct path vectors");
+        let lint0 = Device::int_ack(&w.imcr, "lint0").expect("the APIC path vectors");
+
+        // PIC mode, the pin low: this device is the selected route and is
+        // routing nothing, so it declines and whoever else is on the net gets
+        // asked.
+        assert!(!w.imcr.via_apic(), "the power-on default");
+        assert_eq!(
+            intr.acknowledge(IntAckCycle::vector_only()),
+            IntAckResponse::Declined,
+            "the 8259A is not asserting, so this cycle is not its to answer"
+        );
+        assert_eq!(
+            lint0.acknowledge(IntAckCycle::vector_only()),
+            IntAckResponse::Declined
+        );
+
+        // The same in APIC mode, where the far end is a local APIC's `LINT0`.
+        set_imcr(&w.imcr, 0x01);
+        assert_eq!(
+            lint0.acknowledge(IntAckCycle::vector_only()),
+            IntAckResponse::Declined
+        );
+
+        // And the moment the 8259A does assert, the selected path answers
+        // again — the gate is the pin, not a latch that has to be cleared.
+        w.drive_int(Level::High);
+        assert_eq!(
+            lint0.acknowledge(IntAckCycle::vector_only()),
+            IntAckResponse::Vector(0x08)
+        );
+        w.drive_int(Level::Low);
+        assert_eq!(
+            lint0.acknowledge(IntAckCycle::vector_only()),
+            IntAckResponse::Declined
         );
     }
 

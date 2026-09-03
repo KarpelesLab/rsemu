@@ -40,6 +40,15 @@ const REG_AQA: u64 = 0x24;
 const REG_ASQ: u64 = 0x28;
 const REG_ACQ: u64 = 0x30;
 
+/// `CC` as a driver writes it to start a controller, spelled as the literal
+/// register word a Linux 6.6 kernel was measured writing: `EN`, `CSS` the NVM
+/// command set, `MPS` 0, `AMS` round robin, `SHN` none, `IOSQES` 6 and
+/// `IOCQES` 4 — bits 19:16 and 23:20 of the *NVM Express* base specification's
+/// Figure "Controller Configuration". Written out rather than shifted into
+/// place with [`super::ctrl`]'s own constants, which would make this file agree
+/// with the model however wrong they both were.
+const CC_ENABLE: u32 = 0x0046_0001;
+
 const ASQ: u64 = 0x0010_0000;
 const ACQ: u64 = 0x0010_1000;
 const IOSQ: u64 = 0x0010_2000;
@@ -162,7 +171,7 @@ impl Rig {
         self.set_reg(REG_AQA, (ADMIN_ENTRIES - 1) | ((ADMIN_ENTRIES - 1) << 16));
         self.set_reg64(REG_ASQ, ASQ);
         self.set_reg64(REG_ACQ, ACQ);
-        self.set_reg(REG_CC, 1 | (6 << 17) | (4 << 21));
+        self.set_reg(REG_CC, CC_ENABLE);
         assert_eq!(self.reg(REG_CSTS) & 0x3, 1, "ready, and not fatal");
         let cqe = self.admin(0x05, 0, IOCQ, 0, 1 | ((IO_ENTRIES - 1) << 16), 0x0003, 0);
         assert_eq!(cqe.2, 0, "Create I/O Completion Queue");
@@ -464,7 +473,7 @@ fn the_queue_commands_refuse_what_the_specification_says_they_refuse() {
     r.set_reg(REG_AQA, (ADMIN_ENTRIES - 1) | ((ADMIN_ENTRIES - 1) << 16));
     r.set_reg64(REG_ASQ, ASQ);
     r.set_reg64(REG_ACQ, ACQ);
-    r.set_reg(REG_CC, 1 | (6 << 17) | (4 << 21));
+    r.set_reg(REG_CC, CC_ENABLE);
 
     // A submission queue naming a completion queue that is not there (§5.4).
     let (_, _, status) = r.admin(0x01, 0, IOSQ, 0, 1 | (7 << 16), 0x0001 | (1 << 16), 0);
