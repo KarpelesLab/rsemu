@@ -47,9 +47,11 @@ use rsemu::machine::Machine;
 use rsemu::machine::build;
 use rsemu::machine::realize::Bindings;
 
-/// The I/O APIC's register page (82093AA §3.1) and the HPET's (spec §3.2.4).
+/// The I/O APIC's register page (82093AA §3.1), the HPET's (spec §3.2.4) and
+/// the local APIC's (SDM Vol 3A §10.4.4).
 const IOAPIC: u64 = 0xfec0_0000;
 const HPET: u64 = 0xfed0_0000;
+const LAPIC: u64 = 0xfee0_0000;
 
 fn board() -> (Machine, Arc<X86>) {
     let cpus: Arc<Captured<X86>> = Arc::new(Captured::new());
@@ -197,6 +199,76 @@ fn writing_the_imcr_takes_the_direct_path_away_and_gives_it_back() {
     set_imcr(&m, 0x00);
     assert!(cpu.intr_asserted(), "PIC mode restored the pending request");
     assert_eq!(cpu.acknowledge(), 0x08);
+}
+
+/// An interrupt the **local APIC** delivers reaches the processor with its own
+/// vector, on a board the guest has left in PIC mode.
+///
+/// The case a 64-bit operating system is always in. Linux's `imcr_pic_to_apic`
+/// is `CONFIG_X86_32` only and the MP specification's `IMCRP` flag exists
+/// because a board may have no IMCR fitted at all, so a modern kernel programs
+/// the I/O APIC, switches its tick to the local APIC timer, and *never writes
+/// this register*. Everything the APIC path delivers therefore arrives while
+/// the IMCR still says PIC mode.
+///
+/// On the hardware §3.6.2.1's PIC mode bypasses the APIC outright and the
+/// question cannot arise; here both drivers are on one `INTR` net, so it arises
+/// on every such interrupt, and the acknowledge has to reach the controller
+/// that is actually asserting. The 8259A below is initialized and fully masked
+/// — the ordinary state of one in symmetric I/O mode — so it has nothing
+/// pending, and a cycle answered from it would carry the spurious `IR7`, vector
+/// `0x0f`, instead of the vector the local APIC is holding.
+///
+/// The two symptoms that produced this test, on `q35-linux` with a 6.6 kernel
+/// and the board's default command line:
+/// `..MP-BIOS bug: 8254 timer not connected to IO-APIC` followed by
+/// `Kernel panic - not syncing: IO-APIC + timer doesn't work!`, and — with
+/// `noapic`, which keeps the local APIC and its timer — a boot that stops dead
+/// the moment the tick moves onto that timer. One defect, two faces: neither
+/// the I/O APIC's edge delivery nor the local APIC's periodic timer was at
+/// fault, and both are exercised on `pc-apic` in `tests/pc_apic.rs`.
+#[test]
+fn a_local_apic_interrupt_is_answered_by_the_local_apic_in_pic_mode() {
+    let (mut m, cpu) = board();
+
+    // The master 8259A as firmware leaves it, and then fully masked: vectors
+    // from 0x08, so its spurious answer would be 0x0f and is unmistakable.
+    outb(&m, 0x20, 0x11);
+    outb(&m, 0x21, 0x08);
+    outb(&m, 0x21, 0x04);
+    outb(&m, 0x21, 0x01);
+    outb(&m, 0x21, 0xff);
+    assert!(!cpu.intr_asserted(), "nothing is pending yet");
+    assert_eq!(inb(&m, 0x22), 0x00, "and the board is in PIC mode");
+
+    // Software-enable the local APIC (SDM Vol 3A §10.4.7.2) and send it an
+    // interrupt from the one source that needs no wire: an interrupt command
+    // register write with the *self* shorthand, bits 19:18 = 01b, vector 0x40.
+    poke32(&m, LAPIC + 0xf0, 0x1ff);
+    poke32(&m, LAPIC + 0x310, 0);
+    poke32(&m, LAPIC + 0x300, (1 << 18) | (1 << 14) | 0x40);
+
+    assert!(
+        cpu.intr_asserted(),
+        "the local APIC is not driving the processor's pin"
+    );
+    assert_eq!(
+        cpu.acknowledge(),
+        0x40,
+        "the acknowledge went to the 8259A, which has nothing pending, and the \
+         processor was handed its spurious vector instead of the local APIC's"
+    );
+
+    // And the 8259A still answers when it is the one asserting: unmask IR0 and
+    // let the 8254 tick.
+    outb(&m, 0x21, 0xfe);
+    outb(&m, 0x43, 0x34);
+    outb(&m, 0x40, 100);
+    outb(&m, 0x40, 0);
+    m.run_for(GlobalTime::from_nanos(1_000_000))
+        .expect("the machine runs");
+    assert!(cpu.intr_asserted(), "the tick reached the pin");
+    assert_eq!(cpu.acknowledge(), 0x08, "and it is the 8259A's vector");
 }
 
 #[test]
