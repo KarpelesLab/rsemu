@@ -25,6 +25,16 @@ the history and everything derived from it are contaminated.
 - **Permissive code is fine with attribution** (MIT/BSD/Apache/ISC). `../gones`
   is ours and MIT; its PPU/APU lineage is Michael Fogleman's MIT emulator —
   carry his copyright notice into any ported file.
+- **TianoCore EDK II is readable** — it is BSD-2-Clause-Patent, which is
+  permissive and MIT-compatible, so it is a *reference*, not a hazard: the one
+  substantial open firmware implementation that is not copyleft. Attribute what
+  you take, per the licence, and check the per-package headers before leaning on
+  a directory — the tree vendors third-party code under other terms (CryptoPkg
+  carries OpenSSL), and edk2-platforms is a separate repository with separate
+  licensing. SeaBIOS and coreboot (GPL) and QEMU's firmware stay forbidden.
+  `docs/README.md`'s exclusion table has said "use EDK II instead" all along;
+  it is written here because this is the file read first, and a brief that
+  grouped EDK II with SeaBIOS once cost an agent a source it was entitled to.
 - **Black-box use of a GPL program is fine.** Run it, benchmark it, diff its
   trace. Reading its source is not.
 - **Hardware behaviour is fact; an implementation of it is expression.** A cycle
