@@ -174,8 +174,18 @@ expected values from somewhere that is not this project:
 - **LLVM's instruction selector as an encoding generator.** The guests are
   ordinary Rust and nobody here chose which instructions they contain.
 
-`fp_rules.rs` and the second half of `memory.rs` are directed tests
+`fp_rules.rs`, `timer.rs` and the second half of `memory.rs` are directed tests
 transcribed from DDI 0487 rather than conformance evidence, and they say so.
+`timer.rs` and the exclusive-pair cases in `memory.rs` are there because the
+route to them through a compiler is closed: nothing in ordinary Rust reaches
+`CNTP_CTL_EL0`, and `AtomicU128` — which is what would lower to `LDXP`/`STXP`
+on a part without `FEAT_LSE` — is behind an unstable feature this pinned stable
+toolchain cannot use. What they buy instead of an oracle is the *route*: a
+vector table the guest installed, an `ERET` out of an interrupt handler, a
+`WFI` that ends because a comparator was reached, and a trapped `MRS` whose
+syndrome the handler acts on. Each was checked by **mutating the core** and
+confirming a named case fails, which is the only way a directed test says
+anything about its own coverage.
 
 `fp_natural.rs` is the same oracle applied to **ordinary** compiled
 floating-point code: literal constants, accumulators starting at `0.0`, and

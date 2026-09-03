@@ -175,8 +175,22 @@ pub enum Access {
     /// Readable and writable at EL0 as well: the `PSTATE` views and the
     /// thread pointer the C library keeps there.
     El0Rw,
-    /// Readable at EL0, writable only at EL1 — `TPIDRRO_EL0`.
+    /// Readable at EL0, writable only at EL1 — `TPIDRRO_EL0`, `CNTFRQ_EL0`.
     El0Ro,
+    /// Read-only at **every** level: `CTR_EL0`, `DCZID_EL0`, `CNTPCT_EL0`,
+    /// `CNTVCT_EL0`.
+    ///
+    /// Distinct from [`Access::El1Ro`], which is "EL1 may read it and EL0
+    /// cannot see it at all" — the `_EL1` identification registers. These are
+    /// the opposite shape: every level may read them and no level may write
+    /// them, because they report what the hardware *is* rather than holding
+    /// something software put there.
+    ///
+    /// The three read-only-ish variants are genuinely three, and collapsing
+    /// any pair of them silently breaks a register: `llvm-mc` has no writable
+    /// name for `CTR_EL0` and does have one for `TPIDRRO_EL0`, which is how
+    /// this distinction was checked rather than argued.
+    AllRo,
 }
 
 impl Access {
@@ -185,7 +199,7 @@ impl Access {
     pub const fn readable_at(self, el: El) -> bool {
         match self {
             Access::El1Rw | Access::El1Ro => matches!(el, El::El1),
-            Access::El0Rw | Access::El0Ro => true,
+            Access::El0Rw | Access::El0Ro | Access::AllRo => true,
         }
     }
 
@@ -194,14 +208,44 @@ impl Access {
     /// A read-only register is *not* a trap: DDI 0487 gives the identification
     /// registers no write behaviour at EL1, so a write there is UNDEFINED.
     /// That is what `false` here means, and the caller raises the exception.
+    ///
+    /// [`Access::El0Ro`] is read-only **at EL0 only**. `TPIDRRO_EL0` is the
+    /// register the name is about: the "RO" is the thread's view, and the
+    /// kernel writing it at EL1 is the entire purpose of the register. This
+    /// used to return `false` for it at both levels, so `msr tpidrro_el0, x0`
+    /// raised UNDEFINED on a core whose own table said the write was allowed.
     #[must_use]
     pub const fn writable_at(self, el: El) -> bool {
         match self {
-            Access::El1Rw => matches!(el, El::El1),
+            Access::El1Rw | Access::El0Ro => matches!(el, El::El1),
             Access::El0Rw => true,
-            Access::El1Ro | Access::El0Ro => false,
+            Access::El1Ro | Access::AllRo => false,
         }
     }
+}
+
+/// The `CNTKCTL_EL1` bits that decide what EL0 may reach of the generic timer.
+///
+/// DDI 0487 D11.2: an EL0 access to a counter or timer register that the
+/// matching bit does not permit is **trapped to EL1** with `ESR_EL1.EC` 0x18
+/// — not UNDEFINED. The difference matters: a kernel that wants to virtualise
+/// the counter for one process leaves the bit clear and emulates the read in
+/// its own handler, which it can only do if it is told which register was
+/// named. `CNTKCTL_EL1` resets to zero, so EL0 reaches none of it until a
+/// kernel says otherwise.
+pub mod cntkctl {
+    /// EL0 may read `CNTPCT_EL0` and `CNTFRQ_EL0`.
+    pub const EL0PCTEN: u64 = 1 << 0;
+    /// EL0 may read `CNTVCT_EL0`.
+    pub const EL0VCTEN: u64 = 1 << 1;
+    /// EL0 may reach the `CNTV_*` timer registers.
+    pub const EL0VTEN: u64 = 1 << 8;
+    /// EL0 may reach the `CNTP_*` timer registers.
+    pub const EL0PTEN: u64 = 1 << 9;
+    /// Every bit this core acts on. The rest of the register — the event
+    /// stream fields `EVNTEN`, `EVNTDIR` and `EVNTI` — is storage, because
+    /// this core has no event stream and `WFE` does not stall.
+    pub const ACTED_ON: u64 = EL0PCTEN | EL0VCTEN | EL0VTEN | EL0PTEN;
 }
 
 /// One row of the system-register description.
@@ -213,13 +257,20 @@ pub struct SysRegSpec {
     pub enc: u16,
     /// Who may read and write it.
     pub access: Access,
+    /// Which [`cntkctl`] bit EL0 additionally needs, or zero for a register
+    /// whose reach is decided by [`access`](SysRegSpec::access) alone.
+    ///
+    /// A column rather than more [`Access`] variants because the two are
+    /// genuinely independent axes: `CNTFRQ_EL0` and `TPIDRRO_EL0` have the
+    /// same permissions and only one of them is gated.
+    pub el0_gate: u64,
 }
 
 /// Declare the register identifier, its name, its summary and the lookup table
 /// from one list of rows.
 macro_rules! sysregs {
     ($($op0:literal $op1:literal $crn:literal $crm:literal $op2:literal
-       $reg:ident $name:literal $access:ident $summary:literal;)*) => {
+       $reg:ident $name:literal $access:ident $($gate:ident)? $summary:literal;)*) => {
         /// One system register this core implements.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         #[non_exhaustive]
@@ -255,6 +306,7 @@ macro_rules! sysregs {
                 reg: SysReg::$reg,
                 enc: enc($op0, $op1, $crn, $crm, $op2),
                 access: Access::$access,
+                el0_gate: 0 $(| cntkctl::$gate)?,
             },)*
         ];
     };
@@ -272,8 +324,8 @@ sysregs! {
     3 0  0 7 0 IdAa64Mmfr0  "id_aa64mmfr0_el1" El1Ro "which translation granules and address sizes are supported";
     3 0  0 7 1 IdAa64Mmfr1  "id_aa64mmfr1_el1" El1Ro "further memory-model identification";
     3 0  0 7 2 IdAa64Mmfr2  "id_aa64mmfr2_el1" El1Ro "further memory-model identification";
-    3 3  0 0 1 Ctr          "ctr_el0"          El0Ro "cache type: the line sizes software must respect";
-    3 3  0 0 7 Dczid        "dczid_el0"        El0Ro "the block size DC ZVA operates on, and whether it is allowed";
+    3 3  0 0 1 Ctr          "ctr_el0"          AllRo "cache type: the line sizes software must respect";
+    3 3  0 0 7 Dczid        "dczid_el0"        AllRo "the block size DC ZVA operates on, and whether it is allowed";
 
     // -- system control ------------------------------------------------------
     3 0  1 0 0 Sctlr        "sctlr_el1"   El1Rw "the EL1 system control register: MMU, alignment and cache enables";
@@ -314,6 +366,30 @@ sysregs! {
     3 0 13 0 4 TpidrEl1     "tpidr_el1"   El1Rw "a doubleword the kernel keeps per processor";
     3 3 13 0 2 TpidrEl0     "tpidr_el0"   El0Rw "a doubleword software keeps per thread";
     3 3 13 0 3 TpidrroEl0   "tpidrro_el0" El0Ro "a doubleword the kernel publishes to a thread";
+
+    // -- the generic timer ---------------------------------------------------
+    //
+    // The counter views are `AllRo` — every level reads them, no level
+    // writes them — while `CNTFRQ_EL0` is `El0Ro`, because the frequency is a
+    // *number firmware puts there* rather than something the hardware
+    // reports. That asymmetry is the architecture's and is the reason a guest
+    // that trusts `CNTFRQ_EL0` without firmware having programmed it reads a
+    // frequency nothing guarantees.
+    //
+    // The fourth column is the `CNTKCTL_EL1` bit EL0 additionally needs. All
+    // four reset clear, so out of reset EL0 reaches none of this and a
+    // `mrs x0, cntvct_el0` from userspace traps to EL1 — which is what a
+    // kernel that has not yet set up its `vDSO` wants.
+    3 3 14 0 0 Cntfrq       "cntfrq_el0"     El0Ro     EL0PCTEN "how fast the system counter counts, as firmware declared it";
+    3 3 14 0 1 Cntpct       "cntpct_el0"     AllRo     EL0PCTEN "the physical count: the system counter, read directly";
+    3 3 14 0 2 Cntvct       "cntvct_el0"     AllRo     EL0VCTEN "the virtual count, which without EL2 is the physical one";
+    3 0 14 1 0 Cntkctl      "cntkctl_el1"    El1Rw              "what EL0 may reach of the counter and the timers";
+    3 3 14 2 0 CntpTval     "cntp_tval_el0"  El0Rw     EL0PTEN  "how long until the EL1 physical timer fires, as a 32-bit countdown";
+    3 3 14 2 1 CntpCtl      "cntp_ctl_el0"   El0Rw     EL0PTEN  "the EL1 physical timer's enable, mask and status";
+    3 3 14 2 2 CntpCval     "cntp_cval_el0"  El0Rw     EL0PTEN  "the count at which the EL1 physical timer fires";
+    3 3 14 3 0 CntvTval     "cntv_tval_el0"  El0Rw     EL0VTEN  "how long until the EL1 virtual timer fires, as a 32-bit countdown";
+    3 3 14 3 1 CntvCtl      "cntv_ctl_el0"   El0Rw     EL0VTEN  "the EL1 virtual timer's enable, mask and status";
+    3 3 14 3 2 CntvCval     "cntv_cval_el0"  El0Rw     EL0VTEN  "the count at which the EL1 virtual timer fires";
 
     // -- debug ---------------------------------------------------------------
     2 0  0 2 2 Mdscr        "mdscr_el1"   El1Rw "the debug system control register";
@@ -399,6 +475,25 @@ pub struct SysRegs {
     pub fpcr: u64,
     /// `FPSR`.
     pub fpsr: u64,
+    /// `CNTFRQ_EL0`: the counter frequency firmware declared, in Hz.
+    ///
+    /// Guest state rather than configuration, because the architecture makes
+    /// it a register software writes. Its reset value comes from the board
+    /// (`Config::cntfrq`) so a guest that never programs it still reads the
+    /// truth, which real silicon does not promise.
+    pub cntfrq: u64,
+    /// `CNTKCTL_EL1`.
+    pub cntkctl: u64,
+    /// `CNTP_CTL_EL0`, holding only the two writable bits — `ISTATUS` is
+    /// computed from the counter on every read rather than stored, because a
+    /// stored status bit is one that can be stale.
+    pub cntp_ctl: u64,
+    /// `CNTP_CVAL_EL0`.
+    pub cntp_cval: u64,
+    /// `CNTV_CTL_EL0`, as [`cntp_ctl`](SysRegs::cntp_ctl).
+    pub cntv_ctl: u64,
+    /// `CNTV_CVAL_EL0`.
+    pub cntv_cval: u64,
     /// Bumped by anything that invalidates a cached translation, so the TLB
     /// beside this can drop its entries without being reached into.
     ///
@@ -427,6 +522,67 @@ pub mod sctlr {
     pub const EE: u64 = 1 << 25;
     /// EL0 endianness. Big-endian is not implemented.
     pub const E0E: u64 = 1 << 24;
+}
+
+/// The `CNTP_CTL_EL0` and `CNTV_CTL_EL0` bits.
+///
+/// DDI 0487 D11.2.4. `ISTATUS` is **read-only and computed**: it is the answer
+/// to a comparison against the counter, not a latch, so a timer whose
+/// comparator a guest moves past the count stops asserting on the same
+/// instruction rather than on the next write to the register.
+pub mod cntctl {
+    /// The timer is enabled.
+    pub const ENABLE: u64 = 1 << 0;
+    /// The timer's output is masked. Note the polarity: set means *masked*,
+    /// which is the opposite of `ENABLE` and is a standing source of
+    /// off-by-inversion in timer drivers.
+    pub const IMASK: u64 = 1 << 1;
+    /// The timer condition is met. Read-only.
+    pub const ISTATUS: u64 = 1 << 2;
+    /// The bits a guest may write.
+    pub const WRITABLE: u64 = ENABLE | IMASK;
+}
+
+/// Whether a timer with comparator `cval` has reached its deadline at `count`.
+///
+/// DDI 0487 D11.2.4 states the comparison as `Count - CompareValue >= 0` in
+/// **signed 64-bit** arithmetic, and the wording is load-bearing: an unsigned
+/// `count >= cval` gets every deadline that wraps the counter wrong, and a
+/// guest that sets a comparator just below the wrap point would see its timer
+/// fire immediately and then never again. The subtraction wraps and the
+/// *result* is read as signed, which makes the comparison a statement about
+/// the distance between two points rather than about their order.
+#[inline]
+#[must_use]
+pub const fn timer_condition_met(cval: u64, count: u64) -> bool {
+    count.wrapping_sub(cval) as i64 >= 0
+}
+
+/// What a `CNT{P,V}_CTL_EL0` read reports, with `ISTATUS` filled in.
+///
+/// `ISTATUS` reads as zero while `ENABLE` is clear, whatever the comparator
+/// says — the architecture is explicit, and it is why a disabled timer cannot
+/// be polled for "would it have fired".
+#[inline]
+#[must_use]
+pub const fn timer_ctl(ctl: u64, cval: u64, count: u64) -> u64 {
+    let stored = ctl & cntctl::WRITABLE;
+    if stored & cntctl::ENABLE != 0 && timer_condition_met(cval, count) {
+        stored | cntctl::ISTATUS
+    } else {
+        stored
+    }
+}
+
+/// Whether a timer is asserting its interrupt output.
+///
+/// `ENABLE && ISTATUS && !IMASK` — all three, which is the whole of the
+/// timer's outward behaviour.
+#[inline]
+#[must_use]
+pub const fn timer_output(ctl: u64, cval: u64, count: u64) -> bool {
+    let live = timer_ctl(ctl, cval, count);
+    live & cntctl::ISTATUS != 0 && live & cntctl::IMASK == 0
 }
 
 impl SysRegs {
@@ -472,6 +628,18 @@ impl SysRegs {
             // `FPCR` is entitled to assume nothing about but always gets here.
             fpcr: 0,
             fpsr: 0,
+            // DDI 0487 D11.2: `CNTFRQ_EL0` resets to an architecturally
+            // UNKNOWN value and `CNTP_CVAL_EL0`/`CNTV_CVAL_EL0` likewise; the
+            // two `CTL` registers reset with `ENABLE` clear, which is the part
+            // software depends on — a timer that fired on its own before a
+            // kernel had a vector table would be unrecoverable. `CNTFRQ_EL0`
+            // is overwritten from the board's `cntfrq` by `State::new`.
+            cntfrq: 0,
+            cntkctl: 0,
+            cntp_ctl: 0,
+            cntp_cval: 0,
+            cntv_ctl: 0,
+            cntv_cval: 0,
             translation_gen: 0,
         }
     }
@@ -529,6 +697,33 @@ impl SysRegs {
             0b01 => matches!(self.el, El::El0),
             0b11 => false,
             _ => true,
+        }
+    }
+
+    /// Whether either EL1 timer is asserting its interrupt at `count`.
+    ///
+    /// One function because the two timers are wired together here. On a real
+    /// SoC they are two private peripheral interrupts a GIC forwards
+    /// separately (PPI 30 and PPI 27); this core has no GIC, so both land on
+    /// the same internal `IRQ` and a handler tells them apart by reading
+    /// `ISTATUS`, exactly as it would with a shared line.
+    #[inline]
+    #[must_use]
+    pub const fn timer_irq(&self, count: u64) -> bool {
+        timer_output(self.cntp_ctl, self.cntp_cval, count)
+            || timer_output(self.cntv_ctl, self.cntv_cval, count)
+    }
+
+    /// Whether an EL0 access to `spec` is one `CNTKCTL_EL1` permits.
+    ///
+    /// Always true at EL1: the gate is about what a *thread* may reach, and
+    /// the kernel that owns the gate is never gated by it.
+    #[inline]
+    #[must_use]
+    pub const fn cnt_gate_open(&self, spec: &SysRegSpec) -> bool {
+        match self.el {
+            El::El1 => true,
+            El::El0 => spec.el0_gate == 0 || self.cntkctl & spec.el0_gate != 0,
         }
     }
 
@@ -593,6 +788,71 @@ impl Default for SysRegs {
 mod tests {
     use super::*;
 
+    /// Only the generic timer's counter and timer views are gated, and each by
+    /// the bit DDI 0487 D11.2 names. A gate on the wrong row would either open
+    /// something EL0 must not reach or shut something a `vDSO` needs.
+    #[test]
+    fn only_the_timer_rows_are_gated() {
+        for spec in SYSREGS {
+            let want = match spec.reg {
+                SysReg::Cntfrq | SysReg::Cntpct => cntkctl::EL0PCTEN,
+                SysReg::Cntvct => cntkctl::EL0VCTEN,
+                SysReg::CntpTval | SysReg::CntpCtl | SysReg::CntpCval => cntkctl::EL0PTEN,
+                SysReg::CntvTval | SysReg::CntvCtl | SysReg::CntvCval => cntkctl::EL0VTEN,
+                _ => 0,
+            };
+            assert_eq!(spec.el0_gate, want, "{:?} has the wrong EL0 gate", spec.reg);
+            assert_eq!(
+                spec.el0_gate & !cntkctl::ACTED_ON,
+                0,
+                "{:?} names a CNTKCTL_EL1 bit this core does not act on",
+                spec.reg
+            );
+        }
+    }
+
+    /// The three read-only shapes are three, and each row has the one the
+    /// architecture gives it. `El0Ro` is read-only *at EL0* — `TPIDRRO_EL0` is
+    /// the register the name is about, and a kernel writing it at EL1 is the
+    /// whole point of it — while `AllRo` is read-only everywhere.
+    #[test]
+    fn the_read_only_shapes_do_not_collapse_into_each_other() {
+        assert!(Access::El0Ro.writable_at(El::El1));
+        assert!(!Access::El0Ro.writable_at(El::El0));
+        assert!(!Access::AllRo.writable_at(El::El1));
+        assert!(Access::AllRo.readable_at(El::El0));
+        assert!(!Access::El1Ro.readable_at(El::El0));
+
+        let of = |reg| SYSREGS.iter().find(|s| s.reg == reg).unwrap().access;
+        assert_eq!(of(SysReg::TpidrroEl0), Access::El0Ro);
+        for reg in [SysReg::Ctr, SysReg::Dczid, SysReg::Cntpct, SysReg::Cntvct] {
+            assert_eq!(of(reg), Access::AllRo, "{reg:?} must be read-only at EL1");
+        }
+        assert_eq!(of(SysReg::Cntfrq), Access::El0Ro, "EL1 programs it");
+    }
+
+    /// `ISTATUS` is `ENABLE && (count - cval >= 0)` and the output is that with
+    /// `IMASK` clear — all three, and the table is small enough to write out.
+    #[test]
+    fn the_timer_output_needs_every_one_of_its_three_bits() {
+        use cntctl::{ENABLE, IMASK};
+        // Met, enabled, unmasked.
+        assert_eq!(timer_ctl(ENABLE, 10, 10), ENABLE | cntctl::ISTATUS);
+        assert!(timer_output(ENABLE, 10, 10));
+        // Masked: the status still reads, the output does not assert.
+        assert_eq!(
+            timer_ctl(ENABLE | IMASK, 10, 10),
+            ENABLE | IMASK | cntctl::ISTATUS
+        );
+        assert!(!timer_output(ENABLE | IMASK, 10, 10));
+        // Disabled: no status at all, whatever the comparator says.
+        assert_eq!(timer_ctl(0, 0, 1000), 0);
+        assert!(!timer_output(0, 0, 1000));
+        // Enabled but not yet met.
+        assert_eq!(timer_ctl(ENABLE, 1000, 10), ENABLE);
+        assert!(!timer_output(ENABLE, 1000, 10));
+    }
+
     #[test]
     fn encodings_are_unique() {
         for (i, a) in SYSREGS.iter().enumerate() {
@@ -618,6 +878,20 @@ mod tests {
         assert_eq!(lookup(key(0xd538_2040)).unwrap().reg, SysReg::Tcr);
         assert_eq!(lookup(key(0xd538_c000)).unwrap().reg, SysReg::Vbar);
         assert_eq!(lookup(key(0xd538_4020)).unwrap().reg, SysReg::Elr);
+        // The generic timer, every row of it. These are the encodings that
+        // decide whether a guest's `mrs x0, cntvct_el0` reaches the counter or
+        // is UNDEFINED, and getting one `CRm` wrong would be invisible to any
+        // test built out of this table.
+        assert_eq!(lookup(key(0xd53b_e000)).unwrap().reg, SysReg::Cntfrq);
+        assert_eq!(lookup(key(0xd53b_e020)).unwrap().reg, SysReg::Cntpct);
+        assert_eq!(lookup(key(0xd53b_e040)).unwrap().reg, SysReg::Cntvct);
+        assert_eq!(lookup(key(0xd538_e100)).unwrap().reg, SysReg::Cntkctl);
+        assert_eq!(lookup(key(0xd53b_e200)).unwrap().reg, SysReg::CntpTval);
+        assert_eq!(lookup(key(0xd53b_e220)).unwrap().reg, SysReg::CntpCtl);
+        assert_eq!(lookup(key(0xd53b_e240)).unwrap().reg, SysReg::CntpCval);
+        assert_eq!(lookup(key(0xd53b_e300)).unwrap().reg, SysReg::CntvTval);
+        assert_eq!(lookup(key(0xd53b_e320)).unwrap().reg, SysReg::CntvCtl);
+        assert_eq!(lookup(key(0xd53b_e340)).unwrap().reg, SysReg::CntvCval);
         assert_eq!(lookup(key(0xd538_5200)).unwrap().reg, SysReg::Esr);
         assert_eq!(lookup(key(0xd538_a200)).unwrap().reg, SysReg::Mair);
         assert_eq!(lookup(key(0xd53b_d040)).unwrap().reg, SysReg::TpidrEl0);

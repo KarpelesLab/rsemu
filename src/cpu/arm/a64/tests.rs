@@ -158,6 +158,22 @@ const fn ldxr_x(rt: u32, rn: u32) -> u32 {
 const fn stxr_x(rs: u32, rt: u32, rn: u32) -> u32 {
     0xc800_7c00 | (rs << 16) | (rn << 5) | rt
 }
+/// `LDXP Xt, Xt2, [Xn]`, whose `Rs` field reads as all ones.
+const fn ldxp_x(rt: u32, rt2: u32, rn: u32) -> u32 {
+    0xc87f_0000 | (rt2 << 10) | (rn << 5) | rt
+}
+/// `STXP Ws, Xt, Xt2, [Xn]`.
+const fn stxp_x(rs: u32, rt: u32, rt2: u32, rn: u32) -> u32 {
+    0xc820_0000 | (rs << 16) | (rt2 << 10) | (rn << 5) | rt
+}
+/// `LDXP Wt, Wt2, [Xn]`.
+const fn ldxp_w(rt: u32, rt2: u32, rn: u32) -> u32 {
+    0x887f_0000 | (rt2 << 10) | (rn << 5) | rt
+}
+/// `STXP Ws, Wt, Wt2, [Xn]`.
+const fn stxp_w(rs: u32, rt: u32, rt2: u32, rn: u32) -> u32 {
+    0x8820_0000 | (rs << 16) | (rt2 << 10) | (rn << 5) | rt
+}
 const fn cas_x(rs: u32, rt: u32, rn: u32) -> u32 {
     0xc8a0_7c00 | (rs << 16) | (rn << 5) | rt
 }
@@ -2722,4 +2738,579 @@ fn no_advanced_simd_encoding_panics() {
         executed > 100_000,
         "the sweep covered only {executed} words, so the table lost its rows"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The exclusive pair
+// ---------------------------------------------------------------------------
+//
+// Every encoding here was assembled by `llvm-mc -triple=aarch64` and the
+// decoder was diffed against it over the whole load/store-exclusive encoding
+// space — 265 536 words, nothing accepted here that llvm-mc rejects, and
+// identical disassembly on every accepted pair. What follows is the
+// *semantics*, which that diff says nothing about.
+
+/// The 64-bit pair is a sixteen-byte access: both doublewords arrive, in
+/// address order, and the reservation covers the whole of it.
+#[test]
+fn a_load_exclusive_pair_reads_both_halves_and_reserves_them() {
+    let h = Harness::a53(&[
+        movz(1, 0, 0x8000, 0),
+        ldxp_x(1, 2, 0),
+        stxp_x(3, 4, 5, 0),
+        ldxp_x(6, 7, 0),
+    ]);
+    h.write64(0x8000, 0x1111_2222_3333_4444);
+    h.write64(0x8008, 0x5555_6666_7777_8888);
+    h.cpu.set_x(4, 0xaaaa_aaaa_aaaa_aaaa);
+    h.cpu.set_x(5, 0xbbbb_bbbb_bbbb_bbbb);
+    h.steps(4);
+    assert_eq!(h.cpu.x(1), 0x1111_2222_3333_4444, "Rt is the low address");
+    assert_eq!(h.cpu.x(2), 0x5555_6666_7777_8888, "Rt2 is the high one");
+    assert_eq!(h.cpu.x(3), 0, "the store-exclusive pair succeeded");
+    assert_eq!(h.cpu.x(6), 0xaaaa_aaaa_aaaa_aaaa);
+    assert_eq!(h.cpu.x(7), 0xbbbb_bbbb_bbbb_bbbb);
+}
+
+/// A store into *either* half of the pair breaks the reservation. The second
+/// half is the interesting one: an implementation that watched only the
+/// address the `LDXP` named would let this succeed.
+#[test]
+fn a_store_to_the_far_half_of_a_pair_breaks_its_reservation() {
+    let h = Harness::a53(&[
+        movz(1, 0, 0x8000, 0),
+        ldxp_x(1, 2, 0),
+        str_x(9, 0, 8), // the *upper* doubleword of the pair
+        stxp_x(3, 4, 5, 0),
+    ]);
+    h.steps(4);
+    assert_eq!(h.cpu.x(3), 1, "the reservation was gone");
+    assert_eq!(h.read64(0x8000), 0, "and nothing was written");
+}
+
+/// The 32-bit pair is an eight-byte access with four-byte elements, and the
+/// status register is 32 bits whatever the pair's width is.
+#[test]
+fn a_word_pair_writes_two_words_and_leaves_the_rest_alone() {
+    let h = Harness::a53(&[movz(1, 0, 0x8000, 0), ldxp_w(1, 2, 0), stxp_w(3, 4, 5, 0)]);
+    h.write64(0x8000, 0xdddd_dddd_cccc_cccc);
+    h.cpu.set_x(4, 0xffff_ffff_1234_5678);
+    h.cpu.set_x(5, 0xffff_ffff_9abc_def0);
+    h.steps(3);
+    assert_eq!(h.cpu.x(1), 0xcccc_cccc, "zero-extended, not sign-extended");
+    assert_eq!(h.cpu.x(2), 0xdddd_dddd);
+    assert_eq!(h.cpu.x(3), 0);
+    assert_eq!(
+        h.read64(0x8000),
+        0x9abc_def0_1234_5678,
+        "only the low words of each source were stored"
+    );
+}
+
+/// DDI 0487 B2.9: an exclusive access is aligned to its **total** size. A
+/// 64-bit pair at an address that is eight-byte aligned but not sixteen is the
+/// case that separates "aligned to the element" from "aligned to the access",
+/// and it is the one that decides whether the whole pair fits in one
+/// reservation granule.
+#[test]
+fn a_doubleword_pair_needs_sixteen_byte_alignment() {
+    let h = Harness::a53(&[movz(1, 0, 0x8008, 0), ldxp_x(1, 2, 0)]);
+    let mut regs = h.cpu.sysregs();
+    regs.vbar_el1 = 0x4000;
+    assert_eq!(regs.sctlr & sctlr::A, 0, "alignment checking is off");
+    h.cpu.set_sysregs(regs);
+    h.steps(2);
+    assert_eq!(h.cpu.pc(), 0x4200, "a data abort");
+    assert_eq!(h.cpu.sysregs().esr_el1 & 0x3f, 0b100001);
+
+    // The same address is fine for a *word* pair, whose total size is eight.
+    let h = Harness::a53(&[movz(1, 0, 0x8008, 0), ldxp_w(1, 2, 0)]);
+    h.write64(0x8008, 0x0000_0009_0000_0007);
+    h.steps(2);
+    assert_eq!(h.cpu.x(1), 7);
+    assert_eq!(h.cpu.x(2), 9);
+}
+
+/// A failed `STXP` writes nothing at all — neither half — which is the
+/// property the whole retry loop is built on.
+#[test]
+fn a_failed_store_exclusive_pair_writes_neither_half() {
+    let h = Harness::a53(&[
+        movz(1, 0, 0x8000, 0),
+        stxp_x(3, 4, 5, 0), // no reservation was ever taken
+    ]);
+    h.cpu.set_x(4, 0xdead);
+    h.cpu.set_x(5, 0xbeef);
+    h.steps(2);
+    assert_eq!(h.cpu.x(3), 1);
+    assert_eq!(h.read64(0x8000), 0);
+    assert_eq!(h.read64(0x8008), 0);
+}
+
+/// The pair is a `Base` row: it is not `FEAT_LSE`, and it exists on a part
+/// that has no `CASP` precisely because that is the only 128-bit atomic such a
+/// part has.
+#[test]
+fn the_exclusive_pair_exists_on_an_armv8_0_part() {
+    let h = Harness::new(
+        Config::armv8_0(),
+        &[movz(1, 0, 0x8000, 0), ldxp_x(1, 2, 0), stxp_x(3, 4, 5, 0)],
+    );
+    h.steps(3);
+    assert_eq!(h.cpu.x(3), 0, "no exception, and the store succeeded");
+}
+
+/// The disassembler prints the pair the way an assembler spells it, which is
+/// not the shape of any other exclusive: `LDXP` has two destinations and no
+/// status register, `STXP` has three registers before the address, and the
+/// status is always 32 bits even when the pair is not. Every string below is
+/// `llvm-mc -triple=aarch64`'s own output for the word beside it.
+#[test]
+fn the_disassembler_spells_the_exclusive_pair() {
+    let text = |word: u32| super::disasm::disassemble(word, 0, Features::ALL).text;
+    assert_eq!(text(0x887f_0861), "ldxp	w1, w2, [x3]");
+    assert_eq!(text(0x887f_8861), "ldaxp	w1, w2, [x3]");
+    assert_eq!(text(0x8820_0861), "stxp	w0, w1, w2, [x3]");
+    assert_eq!(text(0x8820_8861), "stlxp	w0, w1, w2, [x3]");
+    assert_eq!(text(0xc87f_0861), "ldxp	x1, x2, [x3]");
+    assert_eq!(text(0xc87f_8861), "ldaxp	x1, x2, [x3]");
+    assert_eq!(text(0xc820_0861), "stxp	w0, x1, x2, [x3]");
+    assert_eq!(text(0xc820_8861), "stlxp	w0, x1, x2, [x3]");
+    // Register 31 in the base position is `SP`, not `XZR`.
+    assert_eq!(text(0xc87f_0be1), "ldxp	x1, x2, [sp]");
+    assert_eq!(text(0xc820_0be1), "stxp	w0, x1, x2, [sp]");
+}
+
+/// ...and it names every generic-timer register, which is what a monitor
+/// listing a kernel's tick setup prints.
+#[test]
+fn the_disassembler_names_the_timer_registers() {
+    let text = |word: u32| super::disasm::disassemble(word, 0, Features::ALL).text;
+    assert_eq!(text(0xd53b_e000), "mrs	x0, cntfrq_el0");
+    assert_eq!(text(0xd53b_e020), "mrs	x0, cntpct_el0");
+    assert_eq!(text(0xd53b_e040), "mrs	x0, cntvct_el0");
+    assert_eq!(text(0xd538_e100), "mrs	x0, cntkctl_el1");
+    assert_eq!(text(0xd53b_e200), "mrs	x0, cntp_tval_el0");
+    assert_eq!(text(0xd51b_e220), "msr	cntp_ctl_el0, x0");
+    assert_eq!(text(0xd51b_e240), "msr	cntp_cval_el0, x0");
+    assert_eq!(text(0xd51b_e33f), "msr	cntv_ctl_el0, xzr");
+}
+
+/// The pair encodings exist only for the 32-bit and 64-bit `size` values.
+#[test]
+fn there_is_no_byte_or_halfword_exclusive_pair() {
+    for size in [0u32, 1] {
+        let word = (size << 30) | 0x0820_0000;
+        assert!(
+            super::isa::decode(word, Features::ALL).is_none(),
+            "{word:#010x} is UNALLOCATED"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The generic timer
+// ---------------------------------------------------------------------------
+
+/// The `MSR` that arms the physical timer `n` counts from now, plus the `MRS`
+/// that reads its control register back.
+fn arm_physical_timer(counts: u32) -> [u32; 4] {
+    [
+        movz(1, 0, counts, 0),
+        msr(key(SysReg::CntpTval), 0),
+        movz(1, 1, 1, 0), // ENABLE, IMASK clear
+        msr(key(SysReg::CntpCtl), 1),
+    ]
+}
+
+/// The count is the core's own tick counter divided by `cntdiv`, and it is
+/// exactly that — not an approximation of it and not a host clock.
+#[test]
+fn the_counter_is_the_core_clock_divided() {
+    let cfg = Config::cortex_a53().with_counter(100_000_000, 4);
+    let h = Harness::new(
+        cfg,
+        &[mrs(key(SysReg::Cntpct), 0), mrs(key(SysReg::Cntfrq), 1)],
+    );
+    h.steps(2);
+    assert_eq!(h.cpu.x(0), h.cpu.cycles().wrapping_sub(1) / 4);
+    assert_eq!(h.cpu.x(1), 100_000_000, "CNTFRQ_EL0 is what the board said");
+    assert_eq!(h.cpu.counter(), h.cpu.cycles() / 4);
+}
+
+/// Without EL2 there is no `CNTVOFF_EL2`, so the virtual count *is* the
+/// physical one and their difference must be zero.
+#[test]
+fn the_virtual_count_equals_the_physical_one() {
+    let h = Harness::a53(&[mrs(key(SysReg::Cntpct), 0), mrs(key(SysReg::Cntvct), 1)]);
+    h.steps(2);
+    assert_eq!(h.cpu.x(1).wrapping_sub(h.cpu.x(0)), 1, "one access apart");
+    let regs = h.cpu.sysregs();
+    assert_eq!(regs.cntp_ctl, 0, "and neither timer is enabled at reset");
+    assert_eq!(regs.cntv_ctl, 0);
+}
+
+/// `TVAL` is a signed 32-bit countdown: writing it sets the comparator
+/// relative to *now*, and reading it back gives the distance that remains.
+#[test]
+fn a_tval_write_is_relative_and_a_tval_read_counts_down() {
+    let h = Harness::a53(&[
+        movz(1, 0, 1000, 0),
+        msr(key(SysReg::CntpTval), 0),
+        mrs(key(SysReg::CntpCval), 1),
+        mrs(key(SysReg::CntpTval), 2),
+    ]);
+    h.steps(2);
+    let at_write = h.cpu.counter();
+    h.steps(2);
+    assert_eq!(h.cpu.x(1), at_write + 1000, "CVAL is count + TVAL");
+    // Two more accesses have been charged since, so the countdown has moved.
+    assert_eq!(h.cpu.x(2), at_write + 1000 - h.cpu.counter());
+}
+
+/// `TVAL = -1` is a deadline one count in the past, which is how a driver asks
+/// for "fire immediately". Zero-extending the write instead would put the
+/// deadline four billion counts away and hang the guest.
+#[test]
+fn a_negative_tval_is_a_deadline_already_past() {
+    let h = Harness::a53(&[
+        movn(1, 0, 0, 0), // x0 = -1
+        msr(key(SysReg::CntpTval), 0),
+        mrs(key(SysReg::CntpCval), 1),
+    ]);
+    h.steps(2);
+    let at_write = h.cpu.counter();
+    h.steps(1);
+    assert_eq!(h.cpu.x(1), at_write.wrapping_sub(1));
+}
+
+/// The comparison is signed, so a comparator on the far side of the counter's
+/// wrap is *not* met. An unsigned `count >= cval` would say it was.
+#[test]
+fn the_timer_comparison_is_signed() {
+    use super::sysreg::timer_condition_met;
+    assert!(timer_condition_met(10, 10), "equal counts as met");
+    assert!(timer_condition_met(9, 10));
+    assert!(!timer_condition_met(11, 10));
+    // Half the counter away in each direction.
+    assert!(!timer_condition_met(1 << 63, 0), "far in the future");
+    assert!(timer_condition_met(u64::MAX, 0), "one count in the past");
+}
+
+/// The whole point: a timer that expires takes an IRQ into the guest's own
+/// vector table, without anything outside the core moving.
+#[test]
+fn an_expiring_timer_raises_an_irq_into_the_vector_table() {
+    let program = arm_physical_timer(8);
+    let mut full = program.to_vec();
+    full.push(b(0)); // spin here until the timer fires
+    let h = Harness::a53(&full);
+    let mut regs = h.cpu.sysregs();
+    regs.vbar_el1 = 0x4000;
+    regs.daif = 0;
+    h.cpu.set_sysregs(regs);
+    // Stop *at* the vector: past it is unwritten RAM, and a second exception
+    // would say nothing about the first.
+    for _ in 0..200 {
+        if h.cpu.pc() >= 0x4000 {
+            break;
+        }
+        h.steps(1);
+    }
+    assert_eq!(h.cpu.pc(), 0x4280, "the EL1h IRQ vector");
+    let regs = h.cpu.sysregs();
+    assert_eq!(regs.cntp_ctl, 0b001, "the stored bits are ENABLE alone");
+    assert_eq!(
+        super::sysreg::timer_ctl(regs.cntp_ctl, regs.cntp_cval, h.cpu.counter()),
+        0b101,
+        "and the register reads back with ISTATUS filled in"
+    );
+    assert_ne!(regs.daif & daif::I, 0, "and the entry masked interrupts");
+}
+
+/// `IMASK` gates the output without disarming the timer: `ISTATUS` still
+/// reports that the condition was met, which is how a driver polls one.
+#[test]
+fn imask_stops_the_interrupt_but_not_the_status_bit() {
+    let h = Harness::a53(&[
+        movn(1, 0, 0, 0),
+        msr(key(SysReg::CntpTval), 0), // already expired
+        movz(1, 1, 0b11, 0),           // ENABLE | IMASK
+        msr(key(SysReg::CntpCtl), 1),
+        mrs(key(SysReg::CntpCtl), 2),
+        NOP,
+        NOP,
+    ]);
+    let mut regs = h.cpu.sysregs();
+    regs.vbar_el1 = 0x4000;
+    regs.daif = 0;
+    h.cpu.set_sysregs(regs);
+    h.steps(7);
+    assert_eq!(h.cpu.x(2), 0b111, "ENABLE, IMASK and ISTATUS");
+    assert_eq!(h.cpu.pc(), 7 * 4, "no interrupt was taken");
+}
+
+/// `ISTATUS` is read-only and computed. A guest that reads the control
+/// register and writes it straight back must not store the status bit, or the
+/// bit would then never change.
+#[test]
+fn istatus_is_not_stored_by_a_write() {
+    let h = Harness::a53(&[
+        movz(1, 3, 0x1000, 0),
+        msr(key(SysReg::CntvCval), 3), // a deadline far in the future
+        movz(1, 0, 0b101, 0),          // ENABLE, and ISTATUS set by hand
+        msr(key(SysReg::CntvCtl), 0),
+        mrs(key(SysReg::CntvCtl), 1),
+    ]);
+    h.steps(5);
+    assert_eq!(h.cpu.sysregs().cntv_ctl, 0b001, "only ENABLE was kept");
+    assert_eq!(
+        h.cpu.x(1),
+        0b001,
+        "and the condition is not met, so no status"
+    );
+    let count = h.cpu.counter();
+    assert!(!h.cpu.sysregs().timer_irq(count), "nothing is asserted");
+}
+
+/// `ISTATUS` reads as zero while `ENABLE` is clear, whatever the comparator
+/// says — so a disabled timer cannot be polled for "would it have fired".
+#[test]
+fn a_disabled_timer_reports_no_status() {
+    let h = Harness::a53(&[
+        movn(1, 0, 0, 0),
+        msr(key(SysReg::CntpTval), 0), // a deadline in the past
+        mrs(key(SysReg::CntpCtl), 1),
+    ]);
+    h.steps(3);
+    assert_eq!(h.cpu.x(1), 0);
+}
+
+/// A stalled `WFI` wakes on its own timer. This is the line a kernel tick
+/// actually depends on: nothing outside the core moves, and the counter
+/// advances because the stall itself charges an access.
+#[test]
+fn wfi_wakes_on_the_generic_timer() {
+    let mut program = arm_physical_timer(6).to_vec();
+    program.push(0xd503_207f); // WFI
+    program.push(movz(1, 9, 0x1234, 0));
+    let h = Harness::a53(&program);
+    let mut regs = h.cpu.sysregs();
+    regs.vbar_el1 = 0x4000;
+    // Interrupts *masked*: DDI 0487 D1 wakes `WFI` on a pending interrupt even
+    // when `PSTATE.I` would stop it being taken, and this is the case that
+    // tells a wake-up event apart from an interrupt.
+    regs.daif = daif::ALL;
+    h.cpu.set_sysregs(regs);
+    h.steps(5);
+    assert!(h.cpu.is_waiting());
+    for _ in 0..50 {
+        if !h.cpu.is_waiting() {
+            break;
+        }
+        h.steps(1);
+    }
+    assert!(!h.cpu.is_waiting(), "the timer ended the stall");
+    assert_eq!(
+        h.cpu.pc(),
+        6 * 4,
+        "and the instruction after the WFI ran, rather than a vector: the \
+         wake-up event is not the interrupt, and PSTATE.I still masks it"
+    );
+}
+
+/// A `WFI` that is *interrupted* has still completed. The exception is taken
+/// and the stall is over, so an `ERET` back resumes at the instruction after
+/// the `WFI` rather than going to sleep again.
+///
+/// The interrupt used to be decided before the wake-up event, so `State::wfi`
+/// stayed set across the exception entry. The core mostly got away with it —
+/// the next step saw the same condition still asserted and cleared the flag on
+/// the way past, which is why `tests/a64/timer.rs` passes with the bug in
+/// place. It did not get away with it when the condition was gone by then, or
+/// when a snapshot was taken in that window: the restored core went to sleep
+/// at the instruction after the `WFI` and stayed there.
+///
+/// So this asserts the flag *at the instant the exception is taken*, which is
+/// the only place the difference is visible.
+#[test]
+fn a_wfi_ended_by_a_taken_interrupt_does_not_stall_again() {
+    let h = Harness::a53(&[0xd503_207f, movz(1, 9, 0x1234, 0), NOP]);
+    let mut regs = h.cpu.sysregs();
+    regs.vbar_el1 = 0x4000;
+    regs.daif = 0; // and this time the interrupt *is* taken
+    h.cpu.set_sysregs(regs);
+    h.steps(1);
+    assert!(h.cpu.is_waiting());
+
+    h.cpu.set_interrupt(super::Lines::IRQ, true);
+    h.steps(1);
+    assert_eq!(h.cpu.pc(), 0x4280, "the IRQ was taken");
+    assert!(
+        !h.cpu.is_waiting(),
+        "and the WFI is over, not merely deferred"
+    );
+    assert_eq!(
+        h.cpu.sysregs().elr_el1,
+        4,
+        "ELR is the instruction after the WFI"
+    );
+
+    // The handler returns, and the core goes on rather than back to sleep.
+    h.cpu.set_interrupt(super::Lines::IRQ, false);
+    h.write_program(0x4280, &[ERET]);
+    h.steps(1);
+    assert_eq!(h.cpu.pc(), 4);
+    h.steps(1);
+    assert_eq!(h.cpu.x(9), 0x1234, "the instruction after the WFI ran");
+}
+
+/// `CNTKCTL_EL1` resets to zero, so EL0 reaches none of the timer — and the
+/// refusal is a **trap** with `ESR_EL1.EC` 0x18 carrying the encoding, not an
+/// UNDEFINED. A kernel virtualising the counter reads the register it must
+/// emulate straight out of the syndrome.
+#[test]
+fn el0_cannot_read_the_counter_until_cntkctl_says_so() {
+    let h = Harness::a53(&[mrs(key(SysReg::Cntvct), 7), mrs(key(SysReg::Cntvct), 7)]);
+    let mut regs = h.cpu.sysregs();
+    regs.vbar_el1 = 0x4000;
+    regs.el = El::El0;
+    regs.spsel = false;
+    h.cpu.set_sysregs(regs);
+    h.steps(1);
+    assert_eq!(h.cpu.pc(), 0x4400, "the lower-EL synchronous vector");
+    let esr = h.cpu.sysregs().esr_el1;
+    assert_eq!(esr >> 26, ec::SYSREG, "trapped, not UNDEFINED");
+    let iss = esr & 0x01ff_ffff;
+    // DDI 0487 D17.2.37: Op0 21:20, Op2 19:17, Op1 16:14, CRn 13:10, Rt 9:5,
+    // CRm 4:1, Direction 0. `CNTVCT_EL0` is 3, 3, c14, c0, 2 and the
+    // destination is x7.
+    assert_eq!((iss >> 20) & 3, 3, "Op0");
+    assert_eq!((iss >> 17) & 7, 2, "Op2");
+    assert_eq!((iss >> 14) & 7, 3, "Op1");
+    assert_eq!((iss >> 10) & 0xf, 14, "CRn");
+    assert_eq!((iss >> 5) & 0x1f, 7, "Rt");
+    assert_eq!((iss >> 1) & 0xf, 0, "CRm");
+    assert_eq!(iss & 1, 1, "a read");
+    assert_eq!(h.cpu.sysregs().elr_el1, 0, "ELR points *at* the MRS");
+
+    // With the bit set it goes through, and the wrong bit does not do.
+    let mut regs = h.cpu.sysregs();
+    regs.el = El::El0;
+    regs.spsel = false;
+    regs.cntkctl = super::sysreg::cntkctl::EL0PCTEN;
+    h.cpu.set_sysregs(regs);
+    h.cpu.set_pc(0);
+    h.steps(1);
+    assert_eq!(h.cpu.pc(), 0x4400, "EL0PCTEN is the wrong gate for CNTVCT");
+
+    let mut regs = h.cpu.sysregs();
+    regs.el = El::El0;
+    regs.spsel = false;
+    regs.cntkctl = super::sysreg::cntkctl::EL0VCTEN;
+    h.cpu.set_sysregs(regs);
+    h.cpu.set_pc(0);
+    h.steps(1);
+    assert_eq!(h.cpu.pc(), 4, "and with EL0VCTEN it is an ordinary read");
+    assert_eq!(h.cpu.x(7), h.cpu.counter());
+}
+
+/// EL1 is never gated by `CNTKCTL_EL1` — the level that owns the gate is not
+/// subject to it.
+#[test]
+fn el1_reaches_the_timer_with_cntkctl_clear() {
+    let h = Harness::a53(&[mrs(key(SysReg::Cntvct), 0), mrs(key(SysReg::CntpCtl), 1)]);
+    assert_eq!(h.cpu.sysregs().cntkctl, 0);
+    h.steps(2);
+    assert_eq!(h.cpu.pc(), 8, "no trap");
+}
+
+/// `TPIDRRO_EL0` is the register whose name is about EL0: the kernel writing
+/// it at EL1 is the entire purpose of it. This used to raise UNDEFINED,
+/// because "read-only at EL0" and "read-only everywhere" were the same
+/// [`super::sysreg::Access`] variant.
+#[test]
+fn el1_may_write_the_read_only_thread_pointer() {
+    let h = Harness::a53(&[movz(1, 0, 0x1234, 0), msr(key(SysReg::TpidrroEl0), 0)]);
+    h.steps(2);
+    assert_eq!(h.cpu.pc(), 8, "no exception");
+    assert_eq!(h.cpu.sysregs().tpidrro_el0, 0x1234);
+}
+
+/// ...while a register that really is read-only at every level still refuses
+/// the write, which is what keeps the fix above from being a hole.
+#[test]
+fn nothing_may_write_the_cache_type_register() {
+    for reg in [SysReg::Ctr, SysReg::Dczid, SysReg::Cntpct, SysReg::Cntvct] {
+        let h = Harness::a53(&[msr(key(reg), 0)]);
+        let mut regs = h.cpu.sysregs();
+        regs.vbar_el1 = 0x4000;
+        h.cpu.set_sysregs(regs);
+        h.steps(1);
+        assert_eq!(h.cpu.pc(), 0x4200, "{reg:?} accepted a write");
+        assert_eq!(h.cpu.sysregs().esr_el1 >> 26, ec::UNKNOWN);
+    }
+}
+
+/// A `cntdiv` of zero would be a division by zero on the first `MRS`, so it is
+/// refused where the board says it rather than clamped where the guest would
+/// never see it.
+#[test]
+fn a_zero_counter_divisor_is_refused() {
+    let props = Props::new().with("cntdiv", 0u64);
+    let err = Cpu::from_props(&props).expect_err("cntdiv = 0 is refused");
+    assert!(alloc::format!("{err}").contains("cntdiv"), "{err}");
+}
+
+/// `CNTFRQ_EL0` is 32 bits wide, so a board naming a wider frequency is
+/// refused rather than handed to a guest that would read one value and write
+/// another back.
+#[test]
+fn a_counter_frequency_wider_than_the_register_is_refused() {
+    let props = Props::new().with("cntfrq", 1u64 << 33);
+    let err = Cpu::from_props(&props).expect_err("it does not fit in CNTFRQ_EL0");
+    assert!(alloc::format!("{err}").contains("cntfrq"), "{err}");
+
+    // A `Config` built by hand has nowhere to report to, so it is masked.
+    let h = Harness::new(
+        Config::cortex_a53().with_counter(1 << 33, 1),
+        &[mrs(key(SysReg::Cntfrq), 0)],
+    );
+    h.steps(1);
+    assert_eq!(h.cpu.x(0), 0);
+}
+
+/// The timer registers are guest state and go in the snapshot: a machine saved
+/// with a timer forty counts from firing must come back forty counts from
+/// firing, not a whole period from it.
+#[test]
+fn the_timer_survives_a_snapshot() -> Result<()> {
+    let h = Harness::new(
+        Config::cortex_a53().with_counter(24_000_000, 8),
+        &arm_physical_timer(4096),
+    );
+    let mut regs = h.cpu.sysregs();
+    regs.cntkctl = super::sysreg::cntkctl::EL0VCTEN;
+    h.cpu.set_sysregs(regs);
+    h.steps(4);
+    assert_ne!(h.cpu.sysregs().cntp_cval, 0);
+
+    let mut shape = MachineShape::new();
+    shape.add_device("cpu", CLASS.name)?;
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("cpu", CLASS.name, CLASS.version)?;
+        h.cpu.save(&mut chunk)?;
+    }
+    let bytes = w.to_vec()?;
+
+    let restored = Cpu::new(h.cpu.config());
+    let reader = StateReader::new(&bytes)?;
+    let chunk = reader.load("cpu", CLASS.name, CLASS.version, &Migrations::new())?;
+    let mut cr = chunk.reader();
+    restored.load(&mut cr)?;
+    cr.end()?;
+    assert_eq!(restored.sysregs(), h.cpu.sysregs());
+    assert_eq!(restored.counter(), h.cpu.counter());
+    Ok(())
 }

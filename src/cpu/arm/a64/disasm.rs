@@ -696,6 +696,32 @@ pub fn disassemble(word: u32, pc: u64, features: isa::Features) -> Disassembled 
                 reg(n, 64, rn_sp)
             );
         }
+        // The pair exclusives. `Rt2` is bits 14:10 — the field an ordinary
+        // pair load spends on `Rt2` as well, which is the one thing about
+        // these encodings that is not surprising. The status register of
+        // `STXP` is always 32 bits whatever the pair's width is, because it
+        // holds a zero or a one.
+        Fmt::LoadExclusivePair => {
+            let w = if isa::ls_size(word) == 3 { 64 } else { 32 };
+            let _ = write!(
+                ops,
+                "{}, {}, [{}]",
+                reg(d, w, false),
+                reg(isa::ra(word), w, false),
+                reg(n, 64, rn_sp)
+            );
+        }
+        Fmt::StoreExclusivePair => {
+            let w = if isa::ls_size(word) == 3 { 64 } else { 32 };
+            let _ = write!(
+                ops,
+                "{}, {}, {}, [{}]",
+                reg(m, 32, false),
+                reg(d, w, false),
+                reg(isa::ra(word), w, false),
+                reg(n, 64, rn_sp)
+            );
+        }
         Fmt::Atomic => {
             let bytes = 1u64 << isa::ls_size(word);
             let w = if bytes == 8 { 64 } else { 32 };

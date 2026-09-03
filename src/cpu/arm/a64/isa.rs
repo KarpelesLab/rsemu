@@ -476,6 +476,15 @@ pub enum Fmt {
     LdStExclusive,
     /// `Ws, Rt, [Rn|SP]` — `STXR`, whose first operand is the status result.
     StoreExclusive,
+    /// `Rt, Rt2, [Rn|SP]` — `LDXP`, the pair form.
+    ///
+    /// A format of its own rather than [`Fmt::LdStPairOff`] with a zero
+    /// offset: the pair *exclusives* have no offset field at all, and bits
+    /// 21:15 that a pair load spends on its immediate are the `o1` and `Rs`
+    /// fields here.
+    LoadExclusivePair,
+    /// `Ws, Rt, Rt2, [Rn|SP]` — `STXP`.
+    StoreExclusivePair,
     /// `Rs, Rt, [Rn|SP]` — an LSE atomic, with an ordering suffix.
     Atomic,
     /// `Rd|SP, Rn|SP, Rm{, extend {#amount}}`.
@@ -667,6 +676,8 @@ impl Fmt {
                 | Fmt::LdStPairPre
                 | Fmt::LdStExclusive
                 | Fmt::StoreExclusive
+                | Fmt::LoadExclusivePair
+                | Fmt::StoreExclusivePair
                 | Fmt::Atomic
                 | Fmt::LdStFpUImm
                 | Fmt::LdStFpUnscaled
@@ -1037,6 +1048,27 @@ a64! {
     0xffe08000 0xc8408000 LdaxrX "ldaxr"  LdStExclusive  Base "load a doubleword exclusively, with acquire";
     0xffe08000 0xc8808000 StlrX  "stlr"   LdStExclusive  Base "store a doubleword with release";
     0xffe08000 0xc8c08000 LdarX  "ldar"   LdStExclusive  Base "load a doubleword with acquire";
+
+    // -- Loads and stores: exclusive pairs ----------------------------------
+    //
+    // The same encoding group with `o1` (bit 21) set, which is why these share
+    // the mask above rather than needing one of their own. Only the 32-bit and
+    // 64-bit `size` values allocate a pair form -- `0x08200000` and
+    // `0x48200000` are UNALLOCATED, and because `size` is inside the mask the
+    // table refuses them without a rule saying so.
+    //
+    // The 64-bit form is the reason to have them at all: it is a **16-byte**
+    // single-copy-atomic access, and it is what a 128-bit compare-and-swap
+    // compiles to on a part without `FEAT_LSE` -- the `CASP` a Neoverse would
+    // use does not exist on a Cortex-A53.
+    0xffe08000 0x88200000 StxpW  "stxp"  StoreExclusivePair Base "store a pair of words exclusively";
+    0xffe08000 0x88208000 StlxpW "stlxp" StoreExclusivePair Base "store a pair of words exclusively, with release";
+    0xffe08000 0x88600000 LdxpW  "ldxp"  LoadExclusivePair  Base "load a pair of words exclusively";
+    0xffe08000 0x88608000 LdaxpW "ldaxp" LoadExclusivePair  Base "load a pair of words exclusively, with acquire";
+    0xffe08000 0xc8200000 StxpX  "stxp"  StoreExclusivePair Base "store a pair of doublewords exclusively";
+    0xffe08000 0xc8208000 StlxpX "stlxp" StoreExclusivePair Base "store a pair of doublewords exclusively, with release";
+    0xffe08000 0xc8600000 LdxpX  "ldxp"  LoadExclusivePair  Base "load a pair of doublewords exclusively";
+    0xffe08000 0xc8608000 LdaxpX "ldaxp" LoadExclusivePair  Base "load a pair of doublewords exclusively, with acquire";
 
     // -- FEAT_LSE: compare-and-swap and the atomic read-modify-writes -------
     //
@@ -2528,6 +2560,20 @@ mod tests {
             (0x9ac02000, Op::Lslv),
             (0x5ac00000, Op::Rbit),
             (0xdac00c00, Op::RevX),
+            // The exclusive pair, `llvm-mc -triple=aarch64` again. The `Rs`
+            // field of a load is all ones and is *not* in the mask, which is
+            // why these words are worth having: a mask that fixed it would
+            // still decode `ldxp x1, x2, [x3]` and reject everything a
+            // compiler emits alongside it.
+            (0x887f0861, Op::LdxpW),  // ldxp w1, w2, [x3]
+            (0x887f8861, Op::LdaxpW), // ldaxp w1, w2, [x3]
+            (0x88200861, Op::StxpW),  // stxp w0, w1, w2, [x3]
+            (0x88208861, Op::StlxpW), // stlxp w0, w1, w2, [x3]
+            (0xc87f0861, Op::LdxpX),  // ldxp x1, x2, [x3]
+            (0xc87f8861, Op::LdaxpX), // ldaxp x1, x2, [x3]
+            (0xc8200861, Op::StxpX),  // stxp w0, x1, x2, [x3]
+            (0xc8208861, Op::StlxpX), // stlxp w0, x1, x2, [x3]
+            (0xc87f0be1, Op::LdxpX),  // ldxp x1, x2, [sp]
             // The scalar floating-point rows, every word below assembled by
             // `llvm-mc -triple=aarch64` rather than derived from the masks
             // here — which is the only way this test says anything the table

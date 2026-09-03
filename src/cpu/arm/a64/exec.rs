@@ -35,8 +35,31 @@ use super::fp;
 use super::isa::{self, Fmt, LsAccess, Nzcv, Op, ShiftKind};
 use super::mmu::{self, Access, Tlb};
 use super::simd::{self, Arrangement, FpCmp};
-use super::sysreg::{self, El, SysReg, SysRegs, VectorKind, daif, ec, sctlr};
+use super::sysreg::{self, El, SysReg, SysRegs, VectorKind, cntctl, daif, ec, sctlr};
 use super::{Config, Lines};
+
+/// What a `CNT{P,V}_TVAL_EL0` read reports: the comparator minus the count,
+/// truncated to 32 bits.
+///
+/// DDI 0487 D11.2.5 defines `TimerValue` as a **signed 32-bit** countdown, so
+/// a deadline more than 2³¹ counts away reads as a negative number rather than
+/// as a large positive one. That is why Linux's `arch_timer` writes `TVAL`
+/// with a delta it knows is small and reads `CVAL` when it wants the truth.
+#[inline]
+const fn tval_of(cval: u64, count: u64) -> u64 {
+    cval.wrapping_sub(count) & 0xffff_ffff
+}
+
+/// What a `CNT{P,V}_TVAL_EL0` write means: `CVAL = count + SignExtend(TVAL)`.
+///
+/// The sign extension is the half an implementation forgets. `TVAL = -1` is a
+/// deadline one count in the *past* — which a driver writes deliberately, to
+/// make a timer fire at once — and zero-extending it instead would put the
+/// deadline four billion counts into the future and hang the guest.
+#[inline]
+const fn cval_of(tval: u64, count: u64) -> u64 {
+    count.wrapping_add(((tval as u32) as i32) as i64 as u64)
+}
 
 /// An exception the current instruction raised.
 ///
@@ -111,11 +134,22 @@ pub(super) struct State {
 impl State {
     /// The reset state for a given configuration.
     pub(super) fn new(cfg: &Config) -> State {
+        let mut sys = SysRegs::new();
+        // `CNTFRQ_EL0` is architecturally UNKNOWN at reset and firmware writes
+        // it. The board says what its firmware would have written, so a guest
+        // that skips that step still reads the truth here — which is a
+        // kindness real silicon does not extend, and the reason
+        // `tests/a64/timer.rs` programs it anyway.
+        // Masked, because `CNTFRQ_EL0` is a 32-bit field and a guest writing
+        // it back must get the value it read. `Cpu::from_props` refuses a
+        // wider one outright; this is the programmatic path, where a `Config`
+        // built by hand has nowhere to report an error to.
+        sys.cntfrq = cfg.cntfrq & 0xffff_ffff;
         State {
             x: [0; 31],
             v: fp::Vregs::new(),
             pc: cfg.reset_vector,
-            sys: SysRegs::new(),
+            sys,
             exclusive: None,
             cycles: 0,
             debt: 0,
@@ -224,22 +258,40 @@ impl<'a> Exec<'a> {
     /// always make progress, and a stalled core is visible through
     /// `State::wfi` rather than through a zero return.
     pub(super) fn step(&mut self) -> u64 {
+        // The stall is resolved **before** the interrupt, and the order is not
+        // cosmetic. DDI 0487 D1 makes `WFI` end on a *wake-up event*, which a
+        // pending interrupt is even when `PSTATE.I` would stop it being taken;
+        // whether the interrupt is then taken is a separate question with a
+        // separate answer.
+        //
+        // Deciding the interrupt first left `State::wfi` set *through* the
+        // exception entry, so between taking a tick and running the first
+        // instruction of its handler the core claimed to be stalled when it
+        // was not. It usually recovered — the next step found the same
+        // condition still asserted and cleared the flag on the way past —
+        // which is why the guest in `tests/a64/timer.rs` passes either way and
+        // why this is pinned by a unit test instead. It did not recover when
+        // the condition was gone by then: a pulsed interrupt line, or a
+        // snapshot taken in that window, which restored a core that went back
+        // to sleep at the instruction after the `WFI` and stayed there.
+        //
+        // The timer is a wake-up event too, and it is the one an idle kernel
+        // depends on: the core comes out of `WFI` because its own comparator
+        // was reached, not because anything outside it moved. The counter gets
+        // there because a stalled `WFI` still charges an access, so the stall
+        // is bounded by the comparator rather than by the quantum.
+        if self.st.wfi {
+            if self.lines.pending() == 0 && !self.timer_irq() {
+                self.charge();
+                return self.used;
+            }
+            self.st.wfi = false;
+        }
         if let Some(kind) = self.pending_interrupt() {
             let pc = self.st.pc;
             self.enter_exception(kind, None, None, pc);
             self.st.pc = self.next_pc;
             return self.used.max(1);
-        }
-        if self.st.wfi {
-            // The stall ends when an interrupt becomes pending, whether or not
-            // it is unmasked: DDI 0487 D1 makes `WFI` wake on a *WFI wake-up
-            // event*, and a pending interrupt is one even when `PSTATE.I`
-            // would stop it being taken.
-            if self.lines.pending() == 0 {
-                self.charge();
-                return self.used;
-            }
-            self.st.wfi = false;
         }
 
         self.this_pc = self.st.pc;
@@ -344,10 +396,44 @@ impl<'a> Exec<'a> {
         if pending & Lines::FIQ != 0 && (!masked_here || self.st.sys.daif & daif::F == 0) {
             return Some(VectorKind::Fiq);
         }
-        if pending & Lines::IRQ != 0 && (!masked_here || self.st.sys.daif & daif::I == 0) {
+        // The generic timer is wire-ORed onto `IRQ` rather than being a line
+        // of its own, because that is where it arrives on a real board: the
+        // timer drives a private peripheral interrupt into a GIC and the GIC
+        // drives `nIRQ`. There is no GIC here, so the OR happens in the core
+        // — and it is an OR, not an override, so a board that *does* drive
+        // `cpu.irq` keeps working while the timer is running.
+        let irq = pending & Lines::IRQ != 0 || self.timer_irq();
+        if irq && (!masked_here || self.st.sys.daif & daif::I == 0) {
             return Some(VectorKind::Irq);
         }
         None
+    }
+
+    // -----------------------------------------------------------------
+    // The generic timer
+    // -----------------------------------------------------------------
+
+    /// The system count now.
+    ///
+    /// `ROADMAP.md` §4.2's rule is that a device never reads a *host* clock,
+    /// and this does not: the count is the core's own domain tick counter
+    /// divided by an integer, which is virtual time and is exact. Nor does the
+    /// timer register a scheduler event, and that is not a shortcut — the only
+    /// consumer of its output is the core reading it here, once per
+    /// instruction and once per stalled `WFI`, so an event would be a message
+    /// this core posted to itself. It also keeps the count a pure function of
+    /// instructions executed, which a scheduler-published tick would not be:
+    /// `CNTPCT_EL0` would then depend on the quantum size and two runs with
+    /// different scheduling would hash differently.
+    #[inline]
+    fn counter(&self) -> u64 {
+        self.cfg.counter_at(self.st.cycles)
+    }
+
+    /// Whether the generic timer is asserting its interrupt.
+    #[inline]
+    fn timer_irq(&self) -> bool {
+        self.st.sys.timer_irq(self.counter())
     }
 
     /// Take an exception to EL1.
@@ -676,6 +762,9 @@ impl<'a> Exec<'a> {
         }
         match insn.fmt {
             Fmt::LdStExclusive | Fmt::StoreExclusive => return self.exclusive(word, insn.fmt),
+            Fmt::LoadExclusivePair | Fmt::StoreExclusivePair => {
+                return self.exclusive_pair(word, insn.fmt);
+            }
             Fmt::Atomic => return self.atomic(word, insn.op),
             _ => {}
         }
@@ -1282,6 +1371,9 @@ impl<'a> Exec<'a> {
             return Err(Trap::undefined());
         }
         self.check_fp_sysreg(spec.reg)?;
+        self.check_cnt_gate(spec, word, true)?;
+        // Read before the borrow below, because it needs `self.cfg` too.
+        let count = self.counter();
         let s = &self.st.sys;
         Ok(match spec.reg {
             SysReg::Midr => self.cfg.midr,
@@ -1324,6 +1416,20 @@ impl<'a> Exec<'a> {
             SysReg::Mdscr => s.mdscr,
             SysReg::Fpcr => s.fpcr,
             SysReg::Fpsr => s.fpsr,
+            SysReg::Cntfrq => s.cntfrq,
+            // Without EL2 there is no `CNTVOFF_EL2`, so the virtual count is
+            // the physical one. Reporting them as one value rather than
+            // keeping a second counter is not a simplification: the offset is
+            // architecturally zero when EL2 is not implemented, and a guest
+            // that computes `CNTVCT - CNTPCT` must get zero.
+            SysReg::Cntpct | SysReg::Cntvct => count,
+            SysReg::Cntkctl => s.cntkctl,
+            SysReg::CntpCtl => sysreg::timer_ctl(s.cntp_ctl, s.cntp_cval, count),
+            SysReg::CntpCval => s.cntp_cval,
+            SysReg::CntpTval => tval_of(s.cntp_cval, count),
+            SysReg::CntvCtl => sysreg::timer_ctl(s.cntv_ctl, s.cntv_cval, count),
+            SysReg::CntvCval => s.cntv_cval,
+            SysReg::CntvTval => tval_of(s.cntv_cval, count),
         })
     }
 
@@ -1339,6 +1445,8 @@ impl<'a> Exec<'a> {
             return Err(Trap::undefined());
         }
         self.check_fp_sysreg(spec.reg)?;
+        self.check_cnt_gate(spec, word, false)?;
+        let count = self.counter();
         // Anything that changes the translation regime invalidates every
         // cached translation. Bumping the generation is the whole
         // invalidation (`ROADMAP.md` §4.5).
@@ -1387,6 +1495,17 @@ impl<'a> Exec<'a> {
             // `fp::fpcr`'s documentation lists which, and why each is absent.
             SysReg::Fpcr => s.fpcr = value & fp::fpcr::WRITABLE,
             SysReg::Fpsr => s.fpsr = value & fp::fpsr::WRITABLE,
+            SysReg::Cntfrq => s.cntfrq = value & 0xffff_ffff,
+            SysReg::Cntkctl => s.cntkctl = value,
+            // `ISTATUS` is dropped on the way in: it is read-only, and a
+            // driver that reads the register, sets `ENABLE` and writes it back
+            // would otherwise store a status bit that then never changed.
+            SysReg::CntpCtl => s.cntp_ctl = value & cntctl::WRITABLE,
+            SysReg::CntpCval => s.cntp_cval = value,
+            SysReg::CntpTval => s.cntp_cval = cval_of(value, count),
+            SysReg::CntvCtl => s.cntv_ctl = value & cntctl::WRITABLE,
+            SysReg::CntvCval => s.cntv_cval = value,
+            SysReg::CntvTval => s.cntv_cval = cval_of(value, count),
             // Everything else in the table is read-only, and `writable_at`
             // already refused it.
             _ => return Err(Trap::undefined()),
@@ -1412,6 +1531,52 @@ impl<'a> Exec<'a> {
             return Err(self.fp_trap());
         }
         Ok(())
+    }
+
+    /// Refuse an EL0 access to a counter or timer register that
+    /// `CNTKCTL_EL1` does not permit.
+    ///
+    /// **Not UNDEFINED.** DDI 0487 D11.2 makes this a trap to EL1 with
+    /// `ESR_EL1.EC` 0x18, and the syndrome carries the whole encoding of the
+    /// instruction — `op0`, `op1`, `CRn`, `CRm`, `op2`, the destination
+    /// register and the direction. That is not decoration either: a kernel
+    /// that leaves `EL0VCTEN` clear so it can virtualise the counter for one
+    /// process has to know from the syndrome alone which register was named
+    /// and where to put the answer, because the faulting instruction is not
+    /// something it is expected to go and fetch.
+    ///
+    /// This core's first user of `EC 0x18`, and the reason the class was
+    /// declared before anything raised it.
+    fn check_cnt_gate(&self, spec: &sysreg::SysRegSpec, word: u32, read: bool) -> Result<(), Trap> {
+        if self.st.sys.cnt_gate_open(spec) {
+            return Ok(());
+        }
+        // The ISS field order is the architecture's and is not the order the
+        // instruction spells them in, which is exactly why it is written out.
+        let key = u64::from(spec.enc);
+        let op0 = (key >> 14) & 3;
+        let op1 = (key >> 11) & 7;
+        let crn = (key >> 7) & 0xf;
+        let crm = (key >> 3) & 0xf;
+        let op2 = key & 7;
+        let rt = u64::from(isa::rd(word));
+        let iss = (op0 << 20)
+            | (op2 << 17)
+            | (op1 << 14)
+            | (crn << 10)
+            | (rt << 5)
+            | (crm << 1)
+            | u64::from(read);
+        Err(Trap {
+            ec: ec::SYSREG,
+            iss,
+            far: None,
+            // The preferred return address is the trapped instruction itself:
+            // a handler that emulates the access advances `ELR_EL1` by four
+            // when it is done, and one that does not wants the guest to fault
+            // on the same instruction rather than to skip it.
+            advance: false,
+        })
     }
 
     /// `SYS` and `SYSL`: the `TLBI`, `DC` and `IC` aliases.
@@ -1605,6 +1770,72 @@ impl<'a> Exec<'a> {
             self.store(addr, bytes, value)?;
         }
         // The monitor is cleared by the attempt, successful or not.
+        self.st.exclusive = None;
+        self.write_reg(status_reg, 32, false, u64::from(!matched));
+        Ok(())
+    }
+
+    /// `LDXP`, `LDAXP`, `STXP` and `STLXP`: the exclusive **pair**.
+    ///
+    /// # What the pair form is for
+    ///
+    /// The 64-bit form is a 16-byte access, and it is the only way an Armv8.0
+    /// part reaches a 128-bit atomic: `CASP` is `FEAT_LSE` and a Cortex-A53
+    /// does not have it, so `AtomicU128::compare_exchange` on such a part is
+    /// an `LDAXP`/`STLXP` retry loop and nothing else. That is why the pair
+    /// belongs beside the single-register exclusives rather than after them.
+    ///
+    /// # Alignment is to the whole access
+    ///
+    /// DDI 0487 B2.9: an exclusive access must be aligned to its **total**
+    /// size, so 8 bytes for the `W` pair and 16 for the `X` pair — not to the
+    /// element. That is stricter than the single-register form at the same
+    /// element width, and it is what makes the whole access fit inside one
+    /// 16-byte reservation granule, which is in turn what lets one monitor
+    /// entry cover it.
+    ///
+    /// # Single-copy atomicity, honestly
+    ///
+    /// The architecture requires the 16-byte access to be single-copy atomic,
+    /// and this issues it as two eight-byte bus accesses because that is what
+    /// [`AddressSpace`] offers. Nothing can observe the difference here — one
+    /// core, one thread inside the execution lock, and the lock is held across
+    /// both halves — but a second core sharing this address space would be a
+    /// real weakening, and it is written down rather than left to be
+    /// discovered.
+    fn exclusive_pair(&mut self, word: u32, fmt: Fmt) -> Result<(), Trap> {
+        // `size` is 0b10 or 0b11 here; the table admits no other value.
+        let elem = 1u64 << isa::ls_size(word);
+        let total = elem * 2;
+        let width = if elem == 8 { 64 } else { 32 };
+        let t = isa::rd(word);
+        let t2 = isa::ra(word);
+        let n = isa::rn(word);
+        let addr = self.read_reg(n, 64, true);
+        let load = fmt == Fmt::LoadExclusivePair;
+        let kind = if load { Access::Load } else { Access::Store };
+        self.check_align(addr, total, kind, true)?;
+
+        if load {
+            let first = self.load(addr, elem)?;
+            let second = self.load(addr.wrapping_add(elem), elem)?;
+            // The reservation is taken only once both halves arrived: a fault
+            // on the second must leave the monitor exactly as it was, not
+            // watching a granule the guest never successfully read.
+            self.st.exclusive = Some(addr >> 4);
+            self.write_reg(t, width, false, first);
+            self.write_reg(t2, width, false, second);
+            return Ok(());
+        }
+
+        let status_reg = isa::rm(word);
+        let matched = self.st.exclusive == Some(addr >> 4);
+        if matched {
+            let first = self.read_reg(t, 64, false);
+            let second = self.read_reg(t2, 64, false);
+            self.store(addr, elem, first)?;
+            self.store(addr.wrapping_add(elem), elem, second)?;
+        }
         self.st.exclusive = None;
         self.write_reg(status_reg, 32, false, u64::from(!matched));
         Ok(())

@@ -54,6 +54,29 @@
 //! | the SIMD&FP register file, `FPCR`/`FPSR`, and Arm's IEEE rules | [`fp`] |
 //! | Advanced SIMD: arrangements, lanes, and the lanewise rules | [`simd`] |
 //!
+//! # The generic timer counts this core's own ticks
+//!
+//! `CNTPCT_EL0` is the core's domain tick counter — one tick per bus access —
+//! divided by [`Config::cntdiv`], an integer the board supplies. That is
+//! `ROADMAP.md` §4.2's exact intra-tree ratio: no residual, no absolute time,
+//! and no host clock anywhere near it.
+//!
+//! It also **registers no scheduler event**, which is worth stating because
+//! §4.2's rule ("a device never sleeps, never reads the wall clock, and never
+//! spawns a thread to tick itself — it registers an event") reads like it
+//! should. The rule exists so a device that must *act* at a future instant
+//! gets dispatched then, and so nothing samples the host clock. The generic
+//! timer is not a device beside the core; it is inside it, its only output is
+//! a line only this core samples, and this core already looks at it once per
+//! instruction and once per stalled `WFI`. An event would be a message the
+//! core posted to itself and then read back one instruction late.
+//!
+//! The counter being the core's own tick count rather than a scheduler-published
+//! one is also what keeps it deterministic: `CNTPCT_EL0` is a pure function of
+//! instructions executed, so two runs of one machine with different quantum
+//! sizes read the same counter and hash the same. A tick published by the
+//! scheduler would not have that property.
+//!
 //! # Floating point is software, and that is the point
 //!
 //! `ROADMAP.md` §9.1: guest floating point executed on *host* floating point
@@ -90,10 +113,12 @@
 //! storage), the reciprocal-estimate family, polynomial multiply, and the
 //! by-element long multiplies. `FEAT_FP16` arithmetic (half precision exists
 //! here only as a conversion format, which is Armv8.0-A), EL2 and EL3 (so
-//! `HVC` and `SMC` are `UNDEFINED`), AArch32 at any level, the generic timer,
-//! `LDXP`/`STXP`, the unprivileged `LDTR`/`STTR` family, pointer
-//! authentication, MTE, SVE, big-endian data, and the `DC ZVA` block operation
-//! — `DCZID_EL0.DZP` says so.
+//! `HVC` and `SMC` are `UNDEFINED`, and so `CNTVOFF_EL2` does not exist and
+//! the virtual count equals the physical one), AArch32 at any level, the
+//! unprivileged `LDTR`/`STTR` family, pointer authentication, MTE, SVE,
+//! big-endian data, and the `DC ZVA` block operation — `DCZID_EL0.DZP` says
+//! so. Of the generic timer, the event stream (`CNTKCTL_EL1.EVNT*`) is storage
+//! and `WFE` does not stall, so nothing drives it.
 //!
 //! # Accuracy
 //!
@@ -103,7 +128,13 @@
 //! against `llvm-mc` over a sample of the encoding space, which is what found
 //! the missing `LDNP`/`STNP` rows, and — over the Advanced SIMD space — a
 //! `FMUL` by element that decoded a bit it should have fixed, an `INS` that
-//! decoded with `Q` clear, and an `LD1R` that decoded with `S` set.
+//! decoded with `Q` clear, and an `LD1R` that decoded with `S` set. The
+//! load/store-exclusive group and the whole `MRS`/`MSR` encoding space have
+//! since been swept the same way — 396 608 words, nothing this core accepts
+//! that `llvm-mc` rejects, and identical text on every exclusive pair and every
+//! named system register. That sweep is what caught `CTR_EL0` and `DCZID_EL0`
+//! becoming writable when `Access::El0Ro` was corrected to let EL1 write
+//! `TPIDRRO_EL0`: `llvm-mc` has a writable name for one and not for the others.
 //!
 //! # Timing
 //!
@@ -221,6 +252,34 @@ pub struct Config {
     pub midr: u64,
     /// What `MPIDR_EL1` reports.
     pub mpidr: u64,
+    /// What `CNTFRQ_EL0` reports out of reset, in Hz.
+    ///
+    /// Architecturally UNKNOWN at reset and programmed by firmware, so this is
+    /// the board declaring what its firmware would have written. Zero is the
+    /// honest default for a core nobody told: a guest reading zero knows it
+    /// was not told, which is better than a plausible number it would divide
+    /// by.
+    pub cntfrq: u64,
+    /// How many of this core's ticks make one system-counter tick.
+    ///
+    /// # Why a divisor and not a frequency
+    ///
+    /// The counter has to advance in *virtual* time, and the only virtual
+    /// time this core owns is its own domain's tick counter — one tick per
+    /// bus access (`ROADMAP.md` §4.2: per-domain tick counters are the
+    /// authoritative time state). Deriving the count from that is an exact
+    /// integer division inside one oscillator tree, with no residual and no
+    /// absolute time anywhere: it is the same relationship the NES PPU has to
+    /// its CPU, and it is exact for the same reason.
+    ///
+    /// So the board owes two consistent numbers — `cntfrq × cntdiv` is the
+    /// frequency of the domain the core is on — and `machines/a64-mini.machine`
+    /// derives the second from the first rather than writing both, which is
+    /// the only way to keep them from drifting apart.
+    ///
+    /// Never zero; [`Cpu::from_props`] refuses it and
+    /// [`Config::with_counter`] saturates it.
+    pub cntdiv: u64,
     /// This core's identity in `MemAttrs::requester`.
     pub requester: RequesterId,
 }
@@ -259,6 +318,8 @@ impl Config {
             // can read.
             midr: 0x0000_0f00,
             mpidr: 0x8000_0000,
+            cntfrq: 0,
+            cntdiv: 1,
             requester: RequesterId::ANONYMOUS,
         }
     }
@@ -335,6 +396,29 @@ impl Config {
     pub const fn with_requester(mut self, id: RequesterId) -> Self {
         self.requester = id;
         self
+    }
+
+    /// The same configuration with a generic-timer rate.
+    ///
+    /// `div` is clamped to at least one: a counter that advanced zero core
+    /// ticks per count is a division by zero on the first `MRS`, and there is
+    /// no value of it a caller could have meant.
+    #[must_use]
+    pub const fn with_counter(mut self, hz: u64, div: u64) -> Self {
+        self.cntfrq = hz;
+        self.cntdiv = if div == 0 { 1 } else { div };
+        self
+    }
+
+    /// The system count at `cycles` core ticks.
+    ///
+    /// Floor division, so the count never runs ahead of the core and never
+    /// goes backwards. Both matter: a guest that reads the counter twice and
+    /// subtracts must not get a negative interval.
+    #[inline]
+    #[must_use]
+    pub const fn counter_at(&self, cycles: u64) -> u64 {
+        cycles / self.cntdiv
     }
 
     /// `ID_AA64ISAR0_EL1`, built from [`Config::features`].
@@ -528,17 +612,38 @@ impl Cpu {
         let part = r.or_enum("cpu", "cortex-a53", &names)?;
         let reset_vector = r.or("reset", 0u64)?;
         let mpidr = r.or("mpidr", 0x8000_0000u64)?;
+        let cntfrq = r.or("cntfrq", 0u64)?;
+        let cntdiv = r.or("cntdiv", 1u64)?;
         // Accepted, and for now only one value is: `ROADMAP.md` §5's example
         // writes `engine = "interp"`, and there is no A64 IR frontend yet.
         let _ = r.or_enum("engine", "interp", &["interp"])?;
         r.finish()?;
 
+        // `CNTFRQ_EL0` is a 32-bit field, so a board naming a wider frequency
+        // is naming one the guest could never write back — and it would read
+        // one value and write another, which is the sort of asymmetry a driver
+        // uses to decide the register is broken.
+        if cntfrq > u64::from(u32::MAX) {
+            return Err(Error::Property(alloc::format!(
+                "`cntfrq` is CNTFRQ_EL0, a 32-bit field, and {cntfrq} does not fit in one"
+            )));
+        }
+        // Refused rather than clamped: a board that wrote `cntdiv = 0` meant
+        // something, and silently reading it as 1 would give the guest a
+        // counter running a hundred times too fast with nothing to say so.
+        if cntdiv == 0 {
+            return Err(Error::Property(alloc::string::String::from(
+                "`cntdiv` is how many core ticks make one system-counter tick                  and cannot be zero",
+            )));
+        }
         let cfg = Config::by_name(part).ok_or_else(|| {
             Error::Property(alloc::format!("`cpu` names an unknown part `{part}`"))
         })?;
         Ok(Cpu::new(Config {
             reset_vector,
             mpidr,
+            cntfrq,
+            cntdiv,
             ..cfg
         }))
     }
@@ -665,6 +770,13 @@ impl Cpu {
     #[must_use]
     pub fn is_waiting(&self) -> bool {
         self.session.lock().state.wfi
+    }
+
+    /// The generic timer's system count now — what `CNTPCT_EL0` would read.
+    #[must_use]
+    pub fn counter(&self) -> u64 {
+        let cfg = self.effective_config();
+        cfg.counter_at(self.session.lock().state.cycles)
     }
 
     /// How many accesses the address space refused.
@@ -888,10 +1000,16 @@ impl Cpu {
 }
 
 /// The `cpu.arm.a64` device class.
+///
+/// Version 2: the snapshot chunk grew by the six generic-timer registers.
+/// Bumped rather than migrated, because a version-1 snapshot has no timer
+/// state to migrate *from* and restoring one into a core whose comparators
+/// then read as zero would be a machine that fires an interrupt it never armed.
 pub static CLASS: DeviceClass = DeviceClass {
     name: "cpu.arm.a64",
-    version: 1,
-    summary: "AArch64 A64 integer core with EL0/EL1, the VMSAv8-64 MMU and a disassembler",
+    version: 2,
+    summary: "AArch64 A64 integer core with EL0/EL1, the VMSAv8-64 MMU, \
+              the generic timer and a disassembler",
     properties: &[
         PropertySpec {
             name: "cpu",
@@ -910,6 +1028,19 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Uint,
             required: false,
             summary: "the value MPIDR_EL1 reports, which is how an SMP guest tells cores apart",
+        },
+        PropertySpec {
+            name: "cntfrq",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "what CNTFRQ_EL0 reports out of reset, in Hz (default 0: nobody said)",
+        },
+        PropertySpec {
+            name: "cntdiv",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "how many core ticks make one system-counter tick; \
+                      `cntfrq * cntdiv` is the core's clock rate (default 1)",
         },
         PropertySpec {
             name: "engine",
@@ -1104,7 +1235,7 @@ impl Device for Cpu {
 
 impl Cpu {
     /// How many 64-bit system-register words a snapshot carries.
-    const SYSREG_WORDS: usize = 24;
+    const SYSREG_WORDS: usize = 30;
 
     /// The system registers a snapshot carries, in a fixed order.
     ///
@@ -1142,6 +1273,16 @@ impl Cpu {
             s.mdscr,
             s.fpcr,
             s.fpsr,
+            // The generic timer. `CNTFRQ_EL0` is here rather than derived from
+            // the configuration because a guest may have written it, and a
+            // restore that quietly put the board's value back would undo a
+            // write the guest can read.
+            s.cntfrq,
+            s.cntkctl,
+            s.cntp_ctl,
+            s.cntp_cval,
+            s.cntv_ctl,
+            s.cntv_cval,
         ]
     }
 
@@ -1172,6 +1313,12 @@ impl Cpu {
             &mut s.mdscr,
             &mut s.fpcr,
             &mut s.fpsr,
+            &mut s.cntfrq,
+            &mut s.cntkctl,
+            &mut s.cntp_ctl,
+            &mut s.cntp_cval,
+            &mut s.cntv_ctl,
+            &mut s.cntv_cval,
         ];
         for (slot, value) in fields.into_iter().zip(w) {
             *slot = *value;
@@ -1254,6 +1401,8 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("cpu", ValueKind::Str).values(names.leak()))
         .prop(PropSchema::new("reset", ValueKind::Uint))
         .prop(PropSchema::new("mpidr", ValueKind::Uint))
+        .prop(PropSchema::new("cntfrq", ValueKind::Uint))
+        .prop(PropSchema::new("cntdiv", ValueKind::Uint))
         .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
         // Inputs only: this core drives no line.
         .port("irq", PortDir::In)
