@@ -41,6 +41,62 @@ hidden convention to reverse-engineer.
   [`Device::export`](../../src/core/device.rs), and it is named explicitly
   rather than searched for.
 
+## Choosing an execution engine
+
+`cpu.riscv` takes three, and this board makes it a parameter so one file runs
+all of them:
+
+```console
+$ rsemu run riscv-virt --media firmware=fw_payload.bin -p engine=jit
+```
+
+- **`interp`** — the interpreter, and the oracle everything else is measured
+  against. The default.
+- **`jit`** — the translation runtime in [`src/jit`](../../src/jit): guest
+  instructions lifted into IR blocks by
+  [`cpu::riscv::lift`](../../src/cpu/riscv/lift.rs), cached under
+  `(pc, physical page)`, executed by the portable IR backend. Runs everywhere
+  the crate does.
+- **`jit-host`** — the same runtime with the **host code generator** attached,
+  so blocks are lowered to machine code by
+  [`jit::x86`](../../src/jit/x86) on x86-64 Linux in a build with `jit-x86`.
+  Anywhere else it falls back to `jit`'s backend and answers identically.
+
+All three are **indistinguishable to the guest**, cycle counts included, and
+that is asserted rather than hoped: `tests/riscv_virt_engines.rs` runs this
+board on each and compares `Machine::state_hash` at ten checkpoints, then moves
+a snapshot between engines in both directions.
+
+It holds on a real guest too. OpenSBI plus a Debian riscv64 kernel and a busybox
+initramfs, 512 MiB, four minutes of virtual time — well past the shell prompt —
+one binary, `--headless` so nothing is rate-limited to the wall clock:
+
+| `engine` | wall clock | vs `interp` | state hash |
+| --- | --- | --- | --- |
+| `interp` | 150.3 s | — | `0xf86f099b07119370` |
+| `jit` | 121.2 s | **1.24×** | `0xf86f099b07119370` |
+| `jit-host` | 299.1 s | 0.50× | `0xf86f099b07119370` |
+
+Two honest notes on that table. The **host code generator currently costs more
+than it saves**, which is exactly why it is a separate value rather than what
+`jit` does wherever it can: a block on this guest is about four guest
+instructions long, and the per-instruction bookkeeping the compiled path calls
+back into the host for outweighs the arithmetic it saves. And **1.24× is not
+the 8–22× the code generator measures on a benchmark**, because block chaining
+and the inlined TLB fast path are both out of reach from a hart today.
+[`src/cpu/riscv/engine.rs`](../../src/cpu/riscv/engine.rs) has the reasoning and
+the measurements behind every one of those claims, including what it costs to
+keep the engines identical.
+
+A build without `cpu-riscv-lift` and `jit` **refuses** both JIT values with a
+message saying which features it wants, rather than interpreting quietly — an
+engine that silently is not the one you asked for is how a JIT stays unmeasured
+for a year. A build that *has* them but is not x86-64 Linux, or that lacks
+`jit-x86`, is a different case and **falls back**: `jit-host` runs the same
+blocks from the same cache on the portable backend. The first is a configuration
+error and the second is a portability property, so they are treated differently
+on purpose.
+
 ## Booting something real
 
 Everything below is fetched, never committed
