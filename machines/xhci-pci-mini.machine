@@ -1,0 +1,192 @@
+# xhci-pci-mini — the first board in this tree with a **screen and a mouse**.
+#
+#   rsemu run xhci-pci-mini --vnc :1
+#
+# RAM, a PCI host bridge, an 8259A, a VGA, and an **xHCI host controller as a
+# PCI function** with a USB HID mouse in its root port. It models no product.
+#
+# ---------------------------------------------------------------------------
+# Why it exists
+# ---------------------------------------------------------------------------
+#
+# `src/host/input.rs` could turn a VNC PointerEvent into a HID boot report and
+# had nowhere to send it: "**None** when there is none, which is every machine
+# in `machines/` today: a USB controller and a display do not yet appear on the
+# same board." That was not an oversight in the machine files. `usb-mini`,
+# `hub-mini` and `xhci-mini` are SoC-shaped boards whose controllers are mapped
+# at a fixed address, and every board with a display is a PC — and no USB
+# controller in this tree had a PCI attachment, so no `map` statement could
+# have joined them in a way a PC guest would ever find.
+#
+# `usb.xhci-pci` is that attachment, and this is the smallest board that shows
+# it working: a guest enumerates the fabric, finds class code `0C0330h`, sizes
+# the base address register, places the register block wherever it likes, sets
+# Memory Space and Bus Master, and drives a mouse.
+#
+# ---------------------------------------------------------------------------
+# What a shipped board needs instead
+# ---------------------------------------------------------------------------
+#
+# `pc-at`, `q35` and `q35-linux` already have every other part of this: a host
+# bridge, an interrupt router, a VGA and RAM. Carrying a USB port is two
+# objects and no wire —
+#
+#   object xhci "usb.xhci-pci" { space = mem, bus = "pci0", usb-bus = "usb0",
+#                                device = 6, ports = 2, slots = 8 }
+#   object mouse "usb.mouse"   { bus = "usb0", port = 0 }
+#
+# — because on a board with a south bridge the `INTA#` pin is collected by the
+# fabric's interrupt router (`q35.lpc`'s `PIRQ` registers) rather than taken off
+# the card edge, so `xhci.irq` stays unwired there and this board's one `wire`
+# line disappears. Pick a `device` number nothing else claims; on `q35` the
+# swizzle then decides which `PIRQ` the pin lands on, and the ACPI `_PRT`
+# generator reads it back out of the fabric rather than being told.
+#
+# ---------------------------------------------------------------------------
+# What is deliberately missing
+# ---------------------------------------------------------------------------
+#
+# **A processor.** Every register this board has is reached through an address
+# space, and a test or a monitor drives those directly — which is what
+# `tests/xhci_pci.rs` does, and it is the shape `machines/nvme-mini.machine`
+# argues for at length: a failure on a board with five objects is a failure in
+# the device, and a failure on a board with twenty is a bisection. `pc-at` is
+# where a guest executes.
+#
+# **An interrupt router.** This board takes `INTA#` off the card edge onto the
+# 8259A, which is what a machine with no south bridge does. The routed path —
+# the swizzle onto a `PIRQ` — is what a shipped board gets, and is asserted in
+# `src/dev/usb/xhci/pci/tests.rs` against a real `IntxSink`.
+
+machine "xhci-pci-mini" {
+  # How much RAM, at zero. The contexts, all four kinds of ring and every data
+  # buffer live in it.
+  param ram = 16M
+
+  # Where the VGA's colour text page sits, and how big it is.
+  param textbase = 0xb8000
+  param textsize = 0x8000
+
+  # -- the crystals ----------------------------------------------------------
+  #
+  # Two, because this board has two rates that are not related by an integer:
+  # the VGA's dot clock and the USB PHY's. 60 MHz is what a USB 2.0 PHY runs at,
+  # and 60 MHz / 8000 microframes a second is exactly 7500 ticks with no
+  # remainder — which is why the controller counts microframes in its own
+  # domain's ticks rather than in nanoseconds (ROADMAP.md §4.2).
+  osc dot    = 28322000 Hz
+  osc usbclk = 60000000 Hz
+
+  # -- the two spaces --------------------------------------------------------
+  #
+  # `read-as-ones` on both, which is what a PCI bus does with a master abort and
+  # what firmware relies on to discover an empty slot.
+  space mem  { width = 32, unassigned = read-as-ones }
+  space port { width = 16, unassigned = read-as-ones }
+
+  # -- memory ----------------------------------------------------------------
+  object dram "ram" { size = ram }
+
+  # -- the host bridge -------------------------------------------------------
+  #
+  # An 82441FX, here for one of its two jobs: `CONFADD`/`CONFDATA` at 0xcf8,
+  # which is how anything reaches configuration space on a machine with an I/O
+  # space. Its PAM shadow windows decode nothing until something programs them,
+  # which nothing on this board does.
+  object hb "pc.pmc" { space = mem, bus = "pci0" }
+
+  # -- the interrupt controller ----------------------------------------------
+  #
+  # A master 8259A with nothing cascaded onto it. Its `int` output is not wired:
+  # there is no processor to take it, and a test reads the request and
+  # in-service registers through `0x20` instead — which is what makes the
+  # acknowledgement visible rather than implied.
+  object pic "pc.pic" { mode = "master" }
+
+  # -- the display -----------------------------------------------------------
+  #
+  # A CRTC, a character buffer and a character generator. Text mode only, which
+  # is all that is needed to say this board *has* a screen: the picture comes
+  # out through the `host::display` scanout seam, so `--screenshot`, VNC and the
+  # browser all see what is in the text page. `dot-clock` repeats the domain's
+  # rate because the device derives its frame period from its own registers and
+  # `BindCtx` carries a clock domain but not the forest's picture of what that
+  # domain is rated at — the same seam `pc-at` notes.
+  object vga "pc.video" { clock = dot / 9, dot-clock = 28322000 }
+
+  # -- the host controller ---------------------------------------------------
+  #
+  # The whole point of the board. `space = mem` because it is a **bus master**:
+  # the Device Context Base Address Array, the contexts, all four kinds of ring
+  # and every data buffer are in this board's RAM and the controller reads and
+  # writes them itself. `COMMAND[2]` gates that, so a guest that forgets to set
+  # Bus Master Enable gets a controller that fetches nothing at all — which is
+  # the failure a real driver hits and one worth being able to reproduce.
+  #
+  # There is **no `map` line for it**: the register block is placed by its base
+  # address register, wherever the driver decides to put it. That is what a BAR
+  # is for and is why this board does not name an address.
+  #
+  # `bus` is the PCI fabric and `usb-bus` is the USB bus it is the root of. Two
+  # properties because they really are two buses.
+  object xhci "usb.xhci-pci" {
+    clock      = usbclk
+    space      = mem
+    bus        = "pci0"
+    usb-bus    = "usb0"
+    device     = 5
+    ports      = 2
+    slots      = 4
+    microframe = 7500
+  }
+
+  # -- the mouse -------------------------------------------------------------
+  #
+  # A HID boot-protocol mouse on root port 0. It masters nothing and has no
+  # register block: everything it does, it does by answering transactions the
+  # controller issues, which is why there is no `space` here and no `map` line.
+  #
+  # `full` speed, because that is what a mouse is. USB 2.0 §5.7.4 gives a
+  # full-speed interrupt endpoint a service interval in whole frames, which is
+  # the millisecond a boot mouse has always reported at; the device model picks
+  # its `bInterval` from the speed the board sets here. An xHCI root hub drives
+  # full speed itself rather than handing it to a companion controller, which is
+  # exactly the difference from `usb-mini`'s EHCI.
+  object mouse "usb.mouse" {
+    bus     = "usb0"
+    port    = 0
+    vendor  = 0x1234
+    product = 0x0002
+    speed   = "full"
+  }
+
+  # -- the memory map --------------------------------------------------------
+  #
+  # RAM and the text page. The controller's window is absent on purpose; see
+  # above.
+  map mem 0x00000000 size ram      = dram
+  map mem textbase   size textsize = vga.vram
+
+  # -- the I/O map -----------------------------------------------------------
+  map port 0x0020 size 0x0002 = pic.regs        # the 8259A
+  map port 0x03b4 size 0x0002 = vga.crtc-mono   # the CRTC, monochrome address
+  map port 0x03c0 size 0x0010 = vga.vga         # sequencer, DAC, attribute
+  map port 0x03d4 size 0x0002 = vga.crtc-colour # ...and its colour address,
+  map port 0x03d8 size 0x0002 = vga.mode        # CGA mode and colour select
+  map port 0x03da size 0x0001 = vga.status      # retrace, and the AC flip-flop
+  map port 0x04d0 size 0x0001 = pic.elcr        # edge/level control
+  map port 0x0cf8 size 0x0008 = hb.config       # configuration mechanism #1
+
+  # -- the wire --------------------------------------------------------------
+  #
+  # `INTA#` off the card edge, because this board has no interrupt router. It is
+  # **level triggered** twice over: PCI's pins are level-sensitive open drain
+  # (PCI Local Bus Specification Rev 2.1 §2.2.6), and xHCI's interrupt is the
+  # AND of `USBCMD.INTE`, `IMAN.IE` and `IMAN.IP` and stays asserted until
+  # software writes a one to `IMAN.IP` (xHCI 1.2 §4.17.3). So a driver must put
+  # IR5 into level mode through the edge/level control register at 0x4d0 — an
+  # edge-triggered input would latch one interrupt and miss every later one that
+  # arrived while the line was already low, which is the classic shared-PCI
+  # interrupt bug.
+  wire xhci.irq -> pic.ir5
+}

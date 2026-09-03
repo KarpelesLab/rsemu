@@ -212,6 +212,20 @@ against the same `Medium::read_at`. What a hub here still cannot do is carry a
 which is a second and larger deliverable, and the port says so by not enabling
 rather than by pretending.
 
+`xhci-pci-mini` is the first board here with a **screen and a mouse at once**,
+and the reason it could not exist before is one line of `dev/`: every USB
+controller in this tree was MMIO-attached only, so a PC guest — which finds a
+host controller by enumerating the bus for class code `0C0330h`, not by knowing
+an address — could never have found one. `usb.xhci-pci` is that attachment: the
+same xHCI engine behind a Type 00h configuration header, its register block on a
+64-bit base address register the guest sizes and places itself, and `INTA#` onto
+the fabric's shared level-triggered net. A driver enumerates it, enables Memory
+Space and Bus Master, addresses a HID boot mouse and pulls a report off its
+interrupt endpoint — a report that a VNC client's `PointerEvent` put there,
+through the input seam that until now had nowhere to deliver one. Bus Master
+Enable is not decoration: with `COMMAND[2]` clear the controller fetches
+*nothing*, and the test asserts it.
+
 The framework underneath is complete: address spaces with priority and
 mirroring, an oscillator forest with exact intra-tree ratios, wires, devices,
 snapshots, a typed export seam so one device can hand another a handle, and a

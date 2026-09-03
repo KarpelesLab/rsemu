@@ -488,6 +488,30 @@ dev-usb-msd = ["bus-usb", "dev-ata-disk"]
 # (ROADMAP.md §1). Needs `bus-usb`.
 dev-usb-xhci = ["bus-usb"]
 
+# The xHCI controller above as a **PCI function** (src/dev/usb/xhci/pci.rs):
+# `usb.xhci-pci`, class code 0C0330h, its register block behind a 64-bit memory
+# base address register and its interrupt on `INTA#`. That is what a PC guest
+# enumerates -- every USB controller in this tree before it was MMIO-attached
+# only, which is right for the SoCs they were written for and means no `pc-at`,
+# `q35` or `q35-linux` could carry one, so no board had a display and a USB
+# port at once and a guest could not have a mouse.
+#
+# The engine is unchanged and unforked: this is a Type 00h configuration header,
+# a BAR and a pin. The two Command bits a transport owns reach it through
+# setters -- `COMMAND[2]` (Bus Master Enable: a function that may not master the
+# bus fetches nothing, not a TRB and not a context) and `COMMAND[10]` (Interrupt
+# Disable) -- and the same `Xhci` still answers `machines/xhci-mini.machine`
+# with neither.
+#
+# Written from the xHCI 1.2c specification §5.2 (its PCI configuration
+# registers), the PCI Local Bus Specification Rev 2.1 §6.1/§6.2 for the header
+# and §6.2.5.1 for the base address registers, Rev 3.0 §6.2.2/§6.2.3 for
+# Interrupt Disable and Interrupt Status, and the PCI Code and ID Assignment
+# Specification for the class code; no emulator source was opened
+# (ROADMAP.md §1). Needs `dev-usb-xhci` for the engine and `bus-pci` for the
+# fabric.
+dev-usb-xhci-pci = ["dev-usb-xhci", "bus-pci"]
+
 # The Sitronix ST7272A (src/dev/sitronix): a 320RGBx240 dual-gate TFT panel
 # driver, configured over 3-wire SPI. Its **SPI carries registers only** —
 # power, gamma, contrast, brightness, scan direction, standby — while pixels
@@ -941,6 +965,24 @@ machine-usb-mini = ["cpu-riscv", "dev-riscv", "dev-usb-ehci", "dev-usb-msd"]
 # The `firmware` media slot takes the program the hart runs, and the `usb0` slot
 # takes the disk.
 machine-xhci-mini = ["cpu-riscv", "dev-riscv", "dev-usb-xhci", "dev-usb-msd"]
+
+# The `xhci-pci-mini` board (machines/xhci-pci-mini.machine plus the classes it
+# names): **the first board in this tree with a screen and a mouse at once**.
+# RAM, a PCI host bridge, an 8259A, a VGA, an xHCI as a PCI function, and a HID
+# boot mouse in its root port.
+#
+# It exists because `host::input::mouse::capture` could turn a VNC PointerEvent
+# into a HID report and had nowhere to send it -- every board with a display was
+# a PC and no USB controller had a PCI attachment, so no `map` statement could
+# join them in a way a guest would find. Here a driver enumerates the fabric,
+# matches class code 0C0330h, sizes the base address register, places the
+# register block where it likes, sets Memory Space and Bus Master, and reaches
+# the mouse. `tests/xhci_pci.rs` drives it.
+#
+# **No processor**, for the reason `nvme-mini` has none: every register is
+# reached through an address space and a test drives those directly, so a core
+# would mean shipping firmware and would prove nothing more about the transport.
+machine-xhci-pci-mini = ["dev-usb-xhci-pci", "dev-usb-hid", "dev-pc-pci", "dev-pc-video"]
 
 # The `hub-mini` board (machines/hub-mini.machine plus the classes it names):
 # `usb-mini` with a **hub** inserted between the EHCI and the disk, and nothing

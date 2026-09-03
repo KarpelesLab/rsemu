@@ -14,6 +14,7 @@
 //! | [`hid`] | `dev-usb-hid` | a USB HID boot-protocol mouse: the smallest device that proves the stack |
 //! | [`hub`] | `dev-usb-hub` | a USB 2.0 hub: downstream ports, the class requests of §11.24.2 and a status change endpoint — the device that makes the bus a tree |
 //! | [`xhci`] | `dev-usb-xhci` | an xHCI host controller: rings and contexts in guest RAM instead of linked lists, a command ring, an event ring with an ERST, and one interrupter |
+//! | [`xhci::pci`] | `dev-usb-xhci-pci` | the same controller as a **PCI function**: class code `0C0330h`, its register block behind a base address register, `INTA#` onto the fabric's shared net — the attachment that lets a PC board carry a USB port at all |
 //! | [`msd`] | `dev-usb-msd` | a USB mass storage device: Bulk-Only Transport and a SCSI command set over two bulk endpoints, backed by the same [`Medium`](crate::dev::medium::Medium) an ATA drive or an NVMe namespace reads |
 //!
 //! # The layering, and why it is the point
@@ -96,6 +97,8 @@ pub fn register(registry: &mut crate::core::Registry) -> crate::Result<()> {
     msd::register(registry)?;
     #[cfg(feature = "dev-usb-xhci")]
     xhci::register(registry)?;
+    #[cfg(feature = "dev-usb-xhci-pci")]
+    xhci::pci::register(registry)?;
     let _ = registry;
     Ok(())
 }
@@ -120,6 +123,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> crate::Result<()> {
     msd::bind(bindings)?;
     #[cfg(feature = "dev-usb-xhci")]
     xhci::bind(bindings)?;
+    #[cfg(feature = "dev-usb-xhci-pci")]
+    xhci::pci::bind(bindings)?;
     let _ = bindings;
     Ok(())
 }
@@ -147,5 +152,7 @@ pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
     out.push(msd::schema());
     #[cfg(feature = "dev-usb-xhci")]
     out.push(xhci::schema());
+    #[cfg(feature = "dev-usb-xhci-pci")]
+    out.push(xhci::pci::schema());
     out
 }

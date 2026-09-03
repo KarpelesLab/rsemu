@@ -18,13 +18,18 @@
 //!
 //! # What this does not claim
 //!
-//! **That a shipped machine has a mouse.** None does: `machines/usb-mini`,
-//! `hub-mini` and `xhci-mini` have controllers and no display, and every board
-//! with a display — the PCs, the consoles, `spi-panel` — has no USB. Nor is
-//! joining them a one-line edit to a machine file: neither `usb.ehci` nor
-//! `usb.xhci` has a PCI attachment, so a PC guest would never enumerate one.
-//! That is `dev/` work and it is described in this file so that whoever does it
-//! knows the host end is already waiting.
+//! **That a *shipped* machine has a mouse.** `machines/xhci-pci-mini` does —
+//! it was built for exactly this claim, and `tests/xhci_pci.rs` carries a
+//! `PointerEvent` through it to a report a guest reads off an interrupt
+//! endpoint — but the boards someone actually runs still do not. `usb-mini`,
+//! `hub-mini` and `xhci-mini` have controllers and no display; `pc-at`, `q35`
+//! and `q35-linux` have displays and, until someone adds the two objects
+//! `machines/xhci-pci-mini.machine` spells out, no USB.
+//!
+//! What is no longer true is the reason this file used to give for that:
+//! joining them *is* now a machine-file edit. `usb.xhci-pci` is the PCI
+//! attachment that was missing, so a PC guest enumerates class code `0C0330h`
+//! and finds a host controller.
 //!
 //! What `tests/usb_ehci.rs` already proves is the other half of the same wire:
 //! a guest executing RV32 instructions builds a periodic schedule, and

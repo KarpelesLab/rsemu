@@ -105,7 +105,7 @@ half-modelled controller can look like a working boot. Detection succeeding is
 the first thing that will change its behaviour, and the first thing that can
 regress it.
 
-## USB, as built (`bus-usb`, `dev-usb-ehci`, `dev-usb-chipidea`, `dev-usb-dwc2`, `dev-usb-hid`, `dev-usb-msd`, `dev-usb-xhci`, `dev-usb-hub`)
+## USB, as built (`bus-usb`, `dev-usb-ehci`, `dev-usb-chipidea`, `dev-usb-dwc2`, `dev-usb-hid`, `dev-usb-msd`, `dev-usb-xhci`, `dev-usb-xhci-pci`, `dev-usb-hub`)
 
 In the order they matter — and the order matters because the whole value of the
 arrangement is that the *next* controller reuses the first one unchanged. That
@@ -683,6 +683,79 @@ nothing vanishes.
 nothing else changed, which is what makes the comparison worth anything: the same
 hart, the same PLIC, the same disk, and the sector read over rings checked
 against the same `Medium::read_at` as the sector read over queue heads.
+
+#### 7.1 The same controller on a PCI bus (`src/dev/usb/xhci/pci.rs`, `dev-usb-xhci-pci`)
+
+Everything above this line was **MMIO-attached only**, and that was not a
+detail. A dwc2 is an SoC block, a ChipIdea is an SoC block, and `xhci-mini` maps
+the register file at an address the board wrote down — which is right for the
+parts they were written from, and wrong for every PC. A PC guest does not find a
+host controller at a known address. It enumerates the bus, matches **class code
+`0C0330h`**, sizes the function's base address register, puts the register block
+wherever it likes, sets Memory Space and Bus Master, and takes the interrupt off
+whichever router input the swizzle landed `INTA#` on.
+
+So no board could have a display and a USB port at once, and
+`host::input::mouse::capture` said so in as many words: *"`None` when there is
+none, which is every machine in `machines/` today: a USB controller and a
+display do not yet appear on the same board."* `tests/vnc_pointer.rs` had a
+whole pointer path — RFB `PointerEvent` in, HID boot report out — with nowhere
+to land it. **This is what it lands on.**
+
+`usb.xhci-pci` is a Type 00h configuration header, a BAR and a pin, and the
+engine is unchanged and unforked. The split is the one `dev-nvme` draws between
+`ctrl.rs` and its function, and it is falsifiable the same way: `pci.rs` holds
+no TRB, no context and no doorbell, and `xhci.rs` holds no configuration offset
+and no `Bdf`. The transport contributes exactly four things:
+
+* **BAR0**, a 64-bit non-prefetchable memory window (xHCI 1.2 §5.2). The
+  register block is 12 KiB and a BAR is a power of two (*PCI Local Bus
+  Specification* Rev 2.1 §6.2.5.1), so the window is 16 KiB and the tail reads
+  as the reserved space §5.5 already says it is.
+* **`COMMAND[2]`**, Bus Master Enable. This is the one that changes the engine,
+  and it changes it in a single place: `Xhci::space` — the one function every
+  DMA in the file goes through — returns `None` when mastering is off, so a
+  function that may not master the bus fetches *nothing*, not a command TRB and
+  not an Event Ring Segment Table entry. It defaults to on, so `xhci-mini`,
+  which has no such bit, is untouched.
+* **`COMMAND[10]`**, Interrupt Disable (Rev 3.0 §6.2.2), and `STATUS[3]`,
+  Interrupt Status (§6.2.3) — which are deliberately different questions. The
+  first gates the pin; the second reports the condition whatever the gate says,
+  and a driver that masked with one and expected the other to follow would poll
+  forever.
+* **The pin.** `bus::pci::Intx` publishes `INTA#` onto the fabric's shared,
+  level-sensitive, open-drain net *and* brings the same pin out to the board as
+  an ordinary wire, for a machine with no interrupt router.
+
+**The engine's interrupt reaches the pin through a `Wire`, and that is the one
+design decision worth arguing.** `dev-ahci`'s HBA owns its `Intx` directly, and
+this cannot: `Xhci` has to keep working on `xhci-mini`, where there is no PCI at
+all, so owning an `Intx` would make `dev-usb-xhci` require `bus-pci` and make
+that board link a fabric to wire one pin. A `Wire` is the mechanism the core
+already has for "this device's output is that device's input", it holds no
+rank-checked lock across the delivery, and it puts the `COMMAND[10]` masking
+exactly where the Command register is. The sink is held **weakly**, because the
+function holds the engine and the engine holds the wire.
+
+**Acknowledging an interrupt still costs three writes, not four.** Neither PCI
+bit joins §4.17's fixed sequence: `COMMAND[10]` touches none of the state, and
+`STATUS[3]` is read-only. `tests/xhci_pci.rs` asserts both directions, counts
+its eight events and eight interrupts separately, and asserts the case where
+they differ — one doorbell retiring two commands is two events and one
+interrupt, which is `usb_xhci.rs`'s nineteen-in-fifteen at its smallest.
+
+`machines/xhci-pci-mini.machine` is the board: RAM, a PCI host bridge, an 8259A,
+a **VGA** and a **HID mouse** behind the controller. A shipped board carries the
+same thing in two objects and no wire —
+
+```
+object xhci "usb.xhci-pci" { space = mem, bus = "pci0", usb-bus = "usb0",
+                             device = 6, ports = 2, slots = 8 }
+object mouse "usb.mouse"   { bus = "usb0", port = 0 }
+```
+
+— because `q35.lpc`'s `PIRQ` routers collect the net, so `xhci.irq` stays
+unwired there and the mini board's one `wire` line disappears.
 
 ### 8. A hub (`src/dev/usb/hub.rs`, `dev-usb-hub`)
 

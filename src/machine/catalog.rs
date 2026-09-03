@@ -478,6 +478,29 @@ pub static XHCI_MINI: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/xhci-mini.machine"),
 };
 
+/// The smallest board with a **screen and a mouse at once**, when this build
+/// has an xHCI PCI function and a HID mouse.
+///
+/// A synthetic board rather than a product: RAM, a PCI host bridge for the
+/// configuration ports, an 8259A for the completion interrupt, a VGA, an
+/// `usb.xhci-pci` and a `usb.mouse` in its root port. It exists because
+/// [`host::input::mouse::capture`](crate::host::input::mouse::capture) could
+/// turn a VNC PointerEvent into a HID boot report and had nowhere to send it:
+/// every board with a display was a PC, no USB controller had a PCI attachment,
+/// and joining them was therefore not a machine-file edit. Here a driver
+/// enumerates the fabric, matches class code `0C0330h`, sizes the base address
+/// register, places the register block where it likes, sets Memory Space and
+/// Bus Master, and reaches the mouse — which is what `pc-at` or `q35` would do
+/// with the same two objects added.
+#[cfg(feature = "machine-xhci-pci-mini")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-xhci-pci-mini")))]
+pub static XHCI_PCI_MINI: CatalogEntry = CatalogEntry {
+    name: "xhci-pci-mini",
+    summary: "a minimal PCI board with an xHCI function, a VGA and a USB mouse: RAM, a host               bridge, an 8259A",
+    media: &[],
+    source: include_str!("../../machines/xhci-pci-mini.machine"),
+};
+
 /// The same board again with a **hub** between the controller and the disk,
 /// when this build has one.
 ///
@@ -607,6 +630,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&USB_MINI);
     #[cfg(feature = "machine-xhci-mini")]
     out.push(&XHCI_MINI);
+    #[cfg(feature = "machine-xhci-pci-mini")]
+    out.push(&XHCI_PCI_MINI);
     #[cfg(feature = "machine-hub-mini")]
     out.push(&HUB_MINI);
     #[cfg(feature = "machine-z80-mini")]
