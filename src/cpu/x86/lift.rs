@@ -8,7 +8,8 @@
 //!
 //! # The subset, exactly
 //!
-//! **32-bit protected mode, integer instructions.** A documented subset done
+//! **32-bit protected mode, integer instructions, with or without paging.** A
+//! documented subset done
 //! exactly beats a broad one done approximately, so the world this frontend
 //! lifts in is checked rather than assumed — [`World::of`] refuses everything
 //! else — and within it the instruction list is closed:
@@ -36,7 +37,8 @@
 //! | x87, SSE, MMX | the IR has no vector ops (`ROADMAP.md` §9 adds them with the SIMD work) and tier-1 floating point is a helper call into soft-float that no x87 entry point exists for yet |
 //! | long mode, `REX` | a second operand-size and address-size lattice on top of the one below, **and a carry the IR cannot compute at this width** — see "Widening the world" |
 //! | real mode and virtual-8086 | `segment << 4 + offset` with a *16-bit offset wrap* is a different address path in `exec`, checked against three million hardware vectors, and generalising it is how that accuracy gets lost |
-//! | paging | **no longer the tick charge** — the interpreter's buffers are split, so the only fetch walk is the entry one — but the host has no translation for a block's data accesses, the self-modifying-code guard compares linear pages while the cache invalidates by physical ones, and the key carries no `CR3` — see "Widening the world" |
+//! | a unified translation buffer | paging itself is **in** the subset now ([`Origin::Paged`]); what is out is paging on a part whose instruction and data translations share one array, where a data operand evicts the code page and the *next fetch* pays for a walk no static analysis can place — see "Paging" |
+//! | [`Smc::Guard`] under paging | the in-block guard compares **linear** pages and two of them may alias one physical page. [`Smc::EndBlock`] is the answer, and [`lift`] refuses the other combination rather than emitting a check that can miss |
 //! | `DIV`, `IDIV` | `#DE` is an exception the block cannot deliver, and the undefined flags come out of `exec::cord`'s trial-subtraction **loop**, which a block with only forward branches cannot express |
 //! | the string primitives, `REP` | a loop inside a block; the IR's verifier rejects a backward [`Opcode::BRCOND`] because `ir::pass`'s liveness is a single backward walk |
 //! | `LOCK`, `XCHG` with memory | the IR's atomics carry no [`MemOp`], so a byte- or word-wide atomic has no type to name (`ir`'s "Known gaps") |
@@ -154,18 +156,20 @@
 //! Two structural rules follow:
 //!
 //! * **A block never leaves the linear page it started on.** Not the `EIP`
-//!   page: `CS.base` need not be page-aligned, and it is the *linear* page a
-//!   guest store is matched against (`jit::Translation::page` is guest-physical,
-//!   and with paging off physical is linear).
-//! * **Paging is out of the subset.** With paging on, a fetch may miss the
-//!   guest's own translation-lookaside buffer and charge a page-table walk,
-//!   which is two to four bus reads and possibly an accessed-bit write. Since
-//!   [`paging::Buffers`](super::paging::Buffers) split the interpreter's
-//!   fetch and data buffers, that walk can only happen at the block's
-//!   **entry** — a data operand can no longer evict the code page's
-//!   translation — so the charge is static again given one fact the caller
-//!   knows. What still keeps paging out is the rest of the machinery, and
-//!   "Widening the world" below lists it.
+//!   page: `CS.base` need not be page-aligned, and the linear page is what
+//!   bounds the bytes. What a guest store is matched against is the
+//!   **physical** page ([`Lifted::page`], and `jit::Translation::page`), which
+//!   with paging off is the same number.
+//! * **The entry fetch is the only fetch translation a block can need**, and
+//!   the caller charges it. With paging on a fetch may miss the guest's own
+//!   translation buffer and charge a page-table walk — two to four bus reads
+//!   and possibly an accessed-bit write — and the whole of a page-bounded
+//!   block translates through one entry. That holds only where the
+//!   instruction and data buffers are separate
+//!   ([`paging::Buffers`](super::paging::Buffers)), which is why
+//!   [`World::of`] refuses paging on a part where they are not: there a data
+//!   operand evicts the code page's translation and the *next* fetch pays for
+//!   a walk no static analysis of the block can place. See "Paging" below.
 //!
 //! ## Page-straddling instructions
 //!
@@ -186,79 +190,125 @@
 //! lifts nothing at all, reports zero instructions, and the dispatcher answers
 //! `Stop::Untranslatable` — which is the contract that already existed.
 //!
-//! # Widening the world: what long mode and paging would actually cost
+//! # Paging, and what naming a block under it costs
 //!
-//! Both refusals in [`World::of`] are the ones between this frontend and a
-//! 64-bit guest, since a 64-bit kernel is in long mode with paging on from the
-//! decompressor onward. They are written up here rather than left as two `if`
-//! statements, because in each case the reason in the table above is the
-//! *smaller* half of the problem and rediscovering the larger half is a day
-//! nobody needs to spend twice.
+//! Paging is **in** the world this frontend lifts, on a part whose translation
+//! buffers are split ([`paging::Buffers::Split`](super::paging::Buffers) — a
+//! Pentium and after, which here is [`Variant::X86_64`]). Getting there took
+//! four separate things, and the order below is the order they had to be done
+//! in rather than a list of features.
 //!
-//! ## Paging: the tick argument is settled, the rest of it is not
+//! **1. The tick charge.** A block never leaves its page, so the whole of it
+//! translates through one entry. What used to break that was a *second* walk
+//! inside the block: `paging::Tlb` was one 32-entry array indexed
+//! `page % 32` shared by fetches and data accesses, so a guest instruction
+//! whose data operand lay 128 KiB from the code page evicted the code page's
+//! own translation and the interpreter's *next* fetch re-walked and charged
+//! two to four bus reads for it, at a point no static analysis of the block
+//! could predict. That is fixed at the source rather than worked around here:
+//! the buffer is now two buffers, which is what every part since the Pentium
+//! has, and a 386 and a 486 keep the single buffer their manuals document —
+//! which is exactly why they are **not** in the paged world and
+//! [`World::of`] checks the arrangement rather than the part number.
 //!
-//! The obvious plan works as far as it goes. A block never leaves its page, so
-//! the whole of it translates through one entry; give [`World`] an origin
-//! carrying a translation generation the way `cpu::riscv::lift::Origin` does,
-//! fold it into [`key`], and require the caller to read the entry's bytes
-//! through `exec`'s own *fetch* path — which charges the walk, sets the
-//! accessed bit and checks execute permission — rather than through a debug
-//! walk. That accounts for a cold entry exactly.
+//! **2. Somewhere for a block's data accesses to be translated.** An IR
+//! `ld`/`st` carries a linear address; under paging somebody has to turn it
+//! into a physical one, charge the guest walk when it misses, and take the
+//! fall-through walk that sets a page's dirty bit on the first write. That
+//! somebody is the [`IrHost`](crate::ir::IrHost), and the answer is
+//! `cpu::riscv::engine`'s: **not a memory path that agrees with the
+//! interpreter's, the interpreter's**. `Exec::read_mem` and `Exec::write_mem`
+//! are what `Exec::step` itself calls — the segment check, the translation
+//! with its accessed and dirty bits, the page-crossing split, and the bus
+//! transaction, each charging through the same `Exec::charge`. A host that
+//! reimplemented them would have to reproduce a walk's tick cost and the
+//! accessed-bit write-back, and `differential`'s own host is the evidence
+//! that reproducing those is a job rather than a line. So this frontend asks
+//! for nothing new: the accesses it already emits are chargeable because each
+//! happens at an access the block really makes.
 //!
-//! What it did not account for, and what this section used to be about, was a
-//! **second** walk *inside* the block. `paging::Tlb` was one 32-entry array
-//! indexed `page % 32` shared by fetches and data accesses, so a guest
-//! instruction whose data operand lay 128 KiB from the code page evicted the
-//! code page's own translation and the interpreter's *next* fetch re-walked
-//! and charged two to four bus reads for it. A lifted block makes no fetches
-//! at all and could not charge that, at a point no static analysis of the
-//! block could predict.
+//! **3. The self-modifying-code guard cannot stay linear.** `jit::cache`'s
+//! slot records the guest-**physical** page the bytes were read from, and the
+//! [`Smc::Guard`] sequence below compares a store's **linear** page against
+//! the block's. With paging off those are the same number. With it on they
+//! are not: two linear pages may alias one physical page, so a store through
+//! the other mapping would miss a guard that can only see linear addresses,
+//! and one linear page names a different physical page after a `CR3` reload.
+//! A guard that can miss is worse than no guard, so under [`Origin::Paged`]
+//! [`lift`] **refuses** [`Smc::Guard`] and [`Smc::EndBlock`] is the policy: a
+//! store is the last guest instruction in its block, the dispatcher's
+//! page-drain at the next boundary is reached before anything the store
+//! changed can execute, and the drain is by physical page at both ends —
+//! [`Lifted::page`] is the physical page the entry resolved to, and a host
+//! notes the physical address its store reached.
 //!
-//! **That is fixed at the source rather than worked around here.** The buffer
-//! is now two buffers — [`paging::Buffers`](super::paging::Buffers) — which is
-//! what every part since the **Pentium** has, and what this core's `x86-64`
-//! therefore models; a 386 and a 486 keep the single buffer their manuals
-//! document, so their timing is unchanged to the clock. A data access can no
-//! longer index the instruction array, the only fetch translation a block can
-//! need is the one at its entry, and the *tick* half of this refusal is
-//! discharged. It was an accuracy fix in the interpreter that happened to
-//! remove a translator obstacle, not the other way round.
+//! **4. The key has to name the mapping, and a `CR3` generation is the wrong
+//! thing to name it with.** [`World::generation`] covers the segment bases;
+//! nothing bumps it when the page tables change, and `INVLPG`, a `CR3` write
+//! and an accessed-bit transition all change what the same `EIP` means. The
+//! obvious repair is a translation generation like `cpu::riscv::lift`'s
+//! `Origin::Paged { generation }` — and `cpu::riscv::engine` measured that
+//! being unusable on a real guest: Linux bumps its counter on every `SRET`
+//! and `MRET`, so a cache keyed on it missed every time and ran four times
+//! slower than the interpreter it replaced. What actually names a block is
+//! **the physical page its bytes came from**, which the entry translation has
+//! just resolved, and that is what [`Origin::Paged`] carries:
 //!
-//! ### What the refusal still rests on
+//! * a different mapping means different bytes, a different physical page and
+//!   a different key, so a stale block cannot be served;
+//! * the same physical page with its bytes rewritten is caught by the block
+//!   cache's own invalidation, which is already by physical page;
+//! * the same physical page with changed permissions is caught by the entry
+//!   translation, which is redone on every execution and faults before the
+//!   block runs;
+//! * every access inside the block translates live, through the core's MMU.
 //!
-//! Four things, none of them about ticks, and all of them outside this file:
+//! [`Origin::Paged`] carries the whole physical **address**, not its page:
+//! the twelve bits below the frame say which byte of it the entry is, and
+//! with a page-granular key a `CS` base moved by one page would give the same
+//! `EIP` a different offset in the same frame — different bytes, and a
+//! different distance to the end of the page — under one key.
 //!
-//! 1. **Nothing translates a block's data accesses.** `jit::tlb` caches the
-//!    *host* half of an access and says so: the caller is expected to have run
-//!    the guest's MMU already and to hand in both the virtual and the physical
-//!    address, which `cpu::riscv::mmu`'s caller does and no x86 host does.
-//!    Under paging an IR `ld`/`st` carries a linear address and there is
-//!    nobody to turn it into a physical one — or to charge the guest walk when
-//!    it misses, or to take the fall-through walk that sets a page's dirty bit
-//!    on the first write. Each of those *is* chargeable, because each happens
-//!    at an access the block really makes; it is a helper that does not exist,
-//!    not an accounting problem.
-//! 2. **The self-modifying-code guard compares linear pages and the cache
-//!    invalidates by physical ones.** `jit::cache`'s slot records "the
-//!    guest-physical page the bytes were read from", the [`Smc::Guard`]
-//!    sequence below compares the store's *linear* page against the block's,
-//!    and the note under "Self-modifying code" says why: with paging off the
-//!    two are the same number. With paging on they are not, two linear pages
-//!    may alias one physical page, and one linear page may name a different
-//!    physical page after a `CR3` reload. Both ends have to move to physical,
-//!    which means the guard needs the translation the block was lifted under.
-//! 3. **[`Block::key`] carries no `CR3` and no translation generation.**
-//!    [`World::generation`] covers the segment bases; nothing bumps it when the
-//!    page tables change, and `INVLPG`, a `CR3` write and an accessed-bit
-//!    transition all change what the same `EIP` means.
-//! 4. **No caller reads the entry page through the fetch path.** The contract
-//!    in the paragraph above is a contract nobody has written, and getting it
-//!    wrong is the failure mode that looks like a working JIT: the block is
-//!    correct and the clock is short by one walk per entry.
+//! It also subsumes `CS.base`, which is why [`World::generation`] is left out
+//! of a paged key rather than added to it: under [`Smc::EndBlock`] no segment
+//! base appears as a constant in the emitted IR at all — [`MemOp::seg`]
+//! carries the register and the host folds the base — so the only thing
+//! `CS.base` decides is *which bytes* the entry names, and the physical page
+//! it resolved to decides that exactly.
 //!
-//! The option this section used to list third — stop comparing ticks under
-//! paging — remains what it was: giving up the column the phase-5 state-hash
-//! gate is built on, and not an option.
+//! ## The contract a caller owes, which is the one that looks like a working JIT
+//!
+//! **The entry page must be read through the *fetch* path, on every execution
+//! of the block and not once at lift time.** `Exec::translate_access` with
+//! [`paging::Access::fetch`](super::paging::Access) is what charges the walk
+//! on a miss, sets the accessed bit and checks execute permission; a debug
+//! walk has deliberately none of those effects. A caller that lifts through
+//! the debug walk gets a block that is *correct* and a clock that is short by
+//! one walk per entry — which is the failure mode that passes every test that
+//! does not compare cycles. [`Origin::Paged`]'s field is the physical page
+//! that translation produced, so the two cannot come apart: there is nothing
+//! to key a paged block on except the answer the fetch path gave.
+//!
+//! `differential`'s `PagedHost` is that contract implemented, and
+//! `cpu::riscv::engine::admit` is the same contract on the other core.
+//!
+//! ## What paging still does not buy
+//!
+//! Bytes written by something that is **not** this core — a DMA engine
+//! filling a page cache, another CPU — are outside `jit::dispatch`'s
+//! contract, which is that a host accumulates the pages *it* wrote. That is
+//! the same known gap `cpu::riscv::engine` states, from the same cause, and
+//! it is not made worse or better by paging.
+//!
+//! # Widening the world further: what long mode costs
+//!
+//! **Paging was a prerequisite rather than an alternative**, which is worth
+//! stating because "long mode without paging" sounds like a smaller job and is
+//! not a machine: `EFER.LMA` is set only when `CR0.PG` goes on with
+//! `EFER.LME`, and IA-32e paging requires `CR4.PAE` (*Intel SDM* volume 3
+//! §9.8.5, *AMD64 Architecture Programmer's Manual* volume 2 §14.6). A
+//! processor in long mode is a processor with paging on, always. So the
+//! section above is the first half of this one.
 //!
 //! ## Long mode: `REX` is not the hard part either
 //!
@@ -266,17 +316,18 @@
 //! already decodes `Bits::B64`, because `exec` runs it. Four things behind
 //! them are not:
 //!
-//! 1. **The carry of a 64-bit `ADD` is bit 64, and there is no `i65`.**
-//!    `Lifter::add` computes `CF` as `self.bit(wide, bits)` at
-//!    [`Type::I64`], which is exactly why "Arithmetic is at [`Type::I64`]
-//!    whatever the operand size" is stated below as an invariant — and at a
-//!    64-bit operand size that bit does not exist and the flag would come out
-//!    zero. `Lifter::sub`'s `setcond(LtU, a, rhs)` survives without a
-//!    borrow in and fails with one, because `rhs = b + 1` wraps to zero on an
-//!    all-ones subtrahend. Both want the unsigned-compare formulation
-//!    (`CF = r < a` for an add, `a < b || (a == b && borrow)` for a subtract)
-//!    at the operand's width, which is a change to the arithmetic core rather
-//!    than a new case beside it.
+//! 1. ~~**The carry of a 64-bit `ADD` is bit 64, and there is no `i65`.**~~
+//!    **Done.** `Lifter::add` read `CF` off `self.bit(wide, bits)` — the bit
+//!    *above* the operand's width — which at a 64-bit operand size does not
+//!    exist and would have come out zero; `Lifter::sub` formed `b + borrow`
+//!    and compared against it, which wraps to zero on an all-ones subtrahend
+//!    and turns a borrow into no borrow. Both are now the unsigned-compare
+//!    formulation **at the operand's width** — `r < a || (r == a && carry)`
+//!    for an add, `a < b || (a == b && borrow)` for a subtract — which has no
+//!    width to be wrong at. That is a change to the arithmetic core rather
+//!    than a case beside it, so it is proved where every other flag is: the
+//!    two forms are equal at eight, sixteen and thirty-two bits, and
+//!    [`differential`](super::differential)'s corpus runs them.
 //! 2. **A 64-bit `MUL` needs [`Opcode::MULU2`]/[`Opcode::MULS2`]**, which
 //!    "What the IR could not say" below records as unexercised precisely
 //!    because a 32-bit subset never reaches them.
@@ -313,7 +364,11 @@
 //!   correct and it costs a block per store, which on x86 is expensive: a
 //!   store is not a rare instruction there the way it is in a register-rich
 //!   RISC.
-//! * [`Smc::Guard`] is the default. A store is an ordinary instruction, and
+//! * [`Smc::Guard`] is the default **with paging off**. Under
+//!   [`Origin::Paged`] it is refused rather than emitted: the comparison below
+//!   is in linear space, two linear pages may alias one physical page, and a
+//!   guard that can be walked past is worse than no guard. A store is an
+//!   ordinary instruction, and
 //!   after it the block tests the store's **linear** page against its own:
 //!
 //!   ```text
@@ -365,12 +420,14 @@
 //! register and flag by flag, against a snapshot of the interpreter taken
 //! before the same step.
 //!
-//! Since `CS` is required to be a flat 4 GiB segment (see [`World::of`]) and
-//! paging is out, the only fault a lifted instruction can take is a
-//! segment-limit or access-rights violation on a **data** operand — `#GP`
-//! through most registers and `#SS` through the stack, which is why
-//! [`MemOp::seg`] carries the register rather than the frontend folding the
-//! base into the address.
+//! Since `CS` is required to be a flat 4 GiB segment (see [`World::of`]), the
+//! only fault a lifted instruction can take is on a **data** operand: a
+//! segment-limit or access-rights violation — `#GP` through most registers and
+//! `#SS` through the stack, which is why [`MemOp::seg`] carries the register
+//! rather than the frontend folding the base into the address — and, under
+//! [`Origin::Paged`], a `#PF` from the host's own translation. All three
+//! arrive as one thing here, because the vector is the interpreter's business
+//! and what the block owes is the state *at* the instruction.
 //!
 //! # Guest state: the slot numbering
 //!
@@ -448,6 +505,7 @@ use crate::ir::{
 };
 
 use super::isa::{self, Arg, Bits, Fields, Op, seg};
+use super::paging::Buffers;
 use super::prot::Sys;
 use super::{Config, Regs, Variant, flags};
 
@@ -551,6 +609,66 @@ pub const MAX_INSNS: usize = 64;
 // The world a lift happens in
 // ---------------------------------------------------------------------------
 
+/// Which address space the entry `EIP` names, and what names the block in it.
+///
+/// The x86 analogue of `cpu::riscv::lift::Origin`, and the same two-armed
+/// shape for the same reason: a block lifted from a *virtual* address is valid
+/// only for the mapping it was lifted under, and the guest may change that
+/// mapping without changing any address.
+///
+/// What is deliberately **not** here is a translation generation. See the
+/// module docs, "Paging": `cpu::riscv::engine` measured a `CR3`-style counter
+/// being unusable on a real guest, and the physical page the entry translation
+/// resolved to is both narrower and exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// `CR0.PG` is clear: a linear address *is* a physical one, and the
+    /// entry `EIP` plus [`World::generation`] name the block on their own.
+    Flat,
+    /// `CR0.PG` is set, and the entry translated here.
+    Paged {
+        /// The **physical** address the entry `EIP`'s linear address resolved
+        /// to, through the *fetch* path. The whole address, not its page.
+        ///
+        /// The caller owes that path — see the module docs, "The contract a
+        /// caller owes". Its page is [`Lifted::page`], which is what a guest
+        /// store is matched against; the twelve bits below that are in
+        /// [`key`] too, and deliberately: the offset within the page decides
+        /// which bytes the entry names and how far the block may run before
+        /// it leaves the page, and two `CS` bases a page apart would
+        /// otherwise give one key to two different blocks.
+        phys: u64,
+    },
+}
+
+impl Origin {
+    /// Whether translation is on.
+    #[inline]
+    #[must_use]
+    pub const fn paged(self) -> bool {
+        matches!(self, Origin::Paged { .. })
+    }
+
+    /// The bits this origin contributes to [`key`], above the policies.
+    ///
+    /// Bit 7 separates the two worlds, so a flat lift and a paged lift of the
+    /// same address never collide; above bit 8 sits the physical address or
+    /// the world generation.
+    ///
+    /// Exact until either passes 2^56 — the bound
+    /// `cpu::riscv::lift::Origin::key_bits` states for the same encoding. For
+    /// the physical address that bound is unreachable rather than merely
+    /// distant: a page-table entry carries a 52-bit frame
+    /// ([`pte::FRAME64`](super::paging::pte)), so no address this core can
+    /// produce reaches it.
+    const fn key_bits(self, generation: u64) -> u64 {
+        match self {
+            Origin::Flat => generation.wrapping_shl(8),
+            Origin::Paged { phys } => (1 << 7) | phys.wrapping_shl(8),
+        }
+    }
+}
+
 /// Everything outside the instruction bytes that a lift depends on.
 ///
 /// The x86 analogue of `cpu::riscv::lift::Origin`, and larger for the reason
@@ -578,7 +696,12 @@ pub struct World {
     pub cmov: bool,
     /// A counter naming this world, bumped by whoever builds it whenever any
     /// field above changes. See the type's own documentation.
+    ///
+    /// Folded into [`key`] only under [`Origin::Flat`]: a paged block is named
+    /// by the physical page its bytes came from, which subsumes `CS.base`.
     pub generation: u64,
+    /// Which address space the entry `EIP` names.
+    pub origin: Origin,
 }
 
 impl World {
@@ -595,6 +718,7 @@ impl World {
         cfg: &Config,
         a20_open: bool,
         generation: u64,
+        origin: Origin,
     ) -> Option<World> {
         // The A20 gate folds bit 20 out of every *physical* address
         // (`Exec::masked`), so with it shut two linear pages a megabyte apart
@@ -620,15 +744,22 @@ impl World {
         if sys.sixty_four() {
             return None;
         }
-        // Paging. **No longer because a fetch's tick charge is unpredictable**
-        // — splitting the interpreter's instruction and data buffers
-        // (`paging::Buffers`) confined that to the block's entry, where the
-        // caller can charge it. What is left is outside this file: no host
-        // translates a block's data accesses, the self-modifying-code guard
-        // compares linear pages while the cache invalidates by physical ones,
-        // and `key` carries no `CR3`. See the module docs, "Widening the
-        // world", which lists all four.
-        if sys.paging() {
+        // Paging is in the subset, and the origin has to say the same thing
+        // the control registers do: a caller that claimed `Origin::Flat` on a
+        // paged core would get a block keyed as though a linear address were a
+        // physical one, which is the stale-translation bug this type exists to
+        // make unstatable.
+        if sys.paging() != origin.paged() {
+            return None;
+        }
+        // A part whose instruction and data translations share one array —
+        // a 386 and a 486 — puts a page-table walk in front of a *fetch* the
+        // block does not make, at a point no static analysis can predict: a
+        // data operand far enough from the code page evicts the code page's
+        // own translation and the next instruction fetch pays for the walk.
+        // The arrangement is asked about rather than the part number, because
+        // that is the fact the refusal is actually about.
+        if sys.paging() && !matches!(cfg.variant.buffers(), Buffers::Split) {
             return None;
         }
         let cs = sys.seg(seg::CS);
@@ -665,6 +796,7 @@ impl World {
             // instruction the interpreter refuses.
             cmov: cfg.features.cmov,
             generation,
+            origin,
         })
     }
 
@@ -749,9 +881,14 @@ impl Shape {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Smc {
     /// A store is the last guest instruction in its block.
+    ///
+    /// The only policy under [`Origin::Paged`], because the alternative
+    /// compares linear pages and two of them may alias one physical page.
     EndBlock,
     /// A store is an ordinary instruction, followed by a run-time test of its
     /// linear page against the block's own.
+    ///
+    /// The default, and refused by [`lift`] under [`Origin::Paged`].
     #[default]
     Guard,
 }
@@ -803,8 +940,17 @@ impl Flags {
 /// key itself would be a second copy of the answer.
 #[must_use]
 pub fn key(world: &World, shape: Shape, smc: Smc, flags: Flags) -> u64 {
+    // Two bits rather than one. Only three parts reach here — a 16-bit one is
+    // refused by `World::of` — and until paging landed a 386 and an x86-64
+    // both encoded as zero. That was not a bug, because the two agree on
+    // every input a block depends on (`Variant::map`, `bus_clocks`, and an
+    // `Op::clocks` table that does not vary by part), but it was one feature
+    // away from being one: they differ in their translation-buffer
+    // arrangement, which is exactly what decides whether a paged world is
+    // liftable at all. A separate number per part costs a bit.
     let variant = match world.variant {
         Variant::I80486 => 1u64,
+        Variant::X86_64 => 2u64,
         _ => 0u64,
     };
     shape.key_bits()
@@ -812,7 +958,7 @@ pub fn key(world: &World, shape: Shape, smc: Smc, flags: Flags) -> u64 {
         | flags.key_bits()
         | (u64::from(world.cmov) << 4)
         | (variant << 5)
-        | world.generation.wrapping_shl(8)
+        | world.origin.key_bits(world.generation)
 }
 
 // ---------------------------------------------------------------------------
@@ -876,9 +1022,22 @@ pub struct Lifted {
     /// taken. Anything that needs what retired counts boundaries instead —
     /// [`Interp::boundaries`](crate::ir::Interp::boundaries).
     pub insns: usize,
-    /// The linear page the bytes were read from — what a guest store is
+    /// The **physical** page the bytes were read from — what a guest store is
     /// matched against, and what `jit::Translation::page` wants.
+    ///
+    /// Under [`Origin::Flat`] that is the linear page, because a linear
+    /// address is a physical one with `CR0.PG` clear. Under [`Origin::Paged`]
+    /// it is the page of [`Origin::Paged`]'s address — the page the entry
+    /// resolved to — and it has to be physical at *both* ends, because
+    /// `jit::cache` invalidates by physical page and a host notes the physical
+    /// address its store reached.
     pub page: u64,
+    /// The linear page the block is bounded by.
+    ///
+    /// Equal to [`Lifted::page`] under [`Origin::Flat`]. Separate under
+    /// paging, where the two are different numbers and confusing them is the
+    /// stale-translation bug.
+    pub linear_page: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -898,7 +1057,10 @@ pub struct Lifted {
 /// # Errors
 ///
 /// [`Error::Unimplemented`] if `max_insns` is zero, which would produce a
-/// block a dispatcher must not cache.
+/// block a dispatcher must not cache, and if [`Smc::Guard`] is asked for under
+/// [`Origin::Paged`] — the in-block guard compares linear pages and two of
+/// them may alias one physical page, so it is refused rather than emitted with
+/// a hole in it. See the module docs, "Paging".
 pub fn lift<S: InsnSource>(
     world: &World,
     entry_eip: u64,
@@ -910,6 +1072,14 @@ pub fn lift<S: InsnSource>(
 ) -> Result<Lifted> {
     if max_insns == 0 {
         return Err(Error::Unimplemented("an x86 lift of zero instructions"));
+    }
+    // The guard is a comparison of linear pages and under paging two of them
+    // may name one physical page, so a store through the other mapping would
+    // slip past it. `Smc::EndBlock` is the policy that holds there.
+    if world.origin.paged() && matches!(smc, Smc::Guard) {
+        return Err(Error::Unimplemented(
+            "an x86 lift with the in-block store guard under paging",
+        ));
     }
     let mut lf = Lifter::new(world, entry_eip, shape, smc, flag_policy);
     let page = lf.page;
@@ -988,7 +1158,12 @@ pub fn lift<S: InsnSource>(
         block,
         stop,
         insns,
-        page,
+        // Physical at both ends: what a guest store is matched against.
+        page: match world.origin {
+            Origin::Flat => page,
+            Origin::Paged { phys } => phys & !PAGE_MASK,
+        },
+        linear_page: page,
     })
 }
 
@@ -1465,8 +1640,11 @@ impl<'a> Lifter<'a> {
             // violation is `#SS` where every other segment raises `#GP`.
             seg: Some(SegId(sr)),
             endian: Endian::Little,
-            // A misaligned access is one bus transaction on a 386 unless it
-            // crosses a page, and paging is out of the subset.
+            // Alignment is the *host's* business, not a constraint the block
+            // states: an unaligned access is one bus transaction unless it
+            // crosses a page, and only the host knows whether it did — under
+            // paging `Exec::linear_read` splits such an access into bytes and
+            // translates each one.
             align: Align::None,
             kind,
             // The access spends ticks and can fault, both guest-visible, so
@@ -1766,9 +1944,23 @@ impl<'a> Lifter<'a> {
             }
         };
         let r = self.and_const(wide, mask);
-        // The carry out is the bit *above* the operand's width, which is
-        // exactly why arithmetic here is at `i64` whatever the operand size.
-        let cf = self.bit(wide, bits);
+        // The carry out, as an unsigned comparison **at the operand's width**
+        // rather than as the bit above it. `r < a`, or `r == a` with a carry
+        // in — because the true sum is `r + CF * 2^n`, so the only way a
+        // wrapped sum equals its own addend is a carry in on an all-ones
+        // addend. Reading bit `n` of a wider sum says the same thing at eight,
+        // sixteen and thirty-two bits and **nothing at all at sixty-four**,
+        // where that bit does not exist and the flag would come out zero. This
+        // form has no such width, which is what makes a 64-bit `ADD` lift.
+        let lt = self.b.setcond(Cond::LtU, Type::I64, r, a);
+        let cf = match carry {
+            None => lt,
+            Some(c) => {
+                let eq = self.b.setcond(Cond::Eq, Type::I64, r, a);
+                let wrapped = self.b.binary(Opcode::AND, Type::I1, eq, c);
+                self.b.binary(Opcode::OR, Type::I1, lt, wrapped)
+            }
+        };
         self.write_flag(F_CF, cf);
         let ab = self.b.binary(Opcode::XOR, Type::I64, a, b);
         let abr = self.b.binary(Opcode::XOR, Type::I64, ab, r);
@@ -1797,10 +1989,21 @@ impl<'a> Lifter<'a> {
         };
         let diff = self.b.binary(Opcode::SUB, Type::I64, a, rhs);
         let r = self.and_const(diff, mask);
-        // `rhs` can be one above the operand's mask when a borrow comes in on
-        // an all-ones subtrahend, and comparing at sixty-four bits is what
-        // makes that come out as a borrow rather than as a wrap.
-        let cf = self.b.setcond(Cond::LtU, Type::I64, a, rhs);
+        // The borrow out, at the operand's width and never through `rhs`.
+        // `a < b + borrow` is the definition, and forming that sum is what
+        // fails at sixty-four bits: an all-ones subtrahend with a borrow in
+        // wraps `rhs` to zero and `a < 0` is false where the answer is a
+        // borrow. Split it instead — `a < b`, or `a == b` with a borrow in —
+        // which is the same statement with nothing to wrap.
+        let lt = self.b.setcond(Cond::LtU, Type::I64, a, b);
+        let cf = match borrow {
+            None => lt,
+            Some(c) => {
+                let eq = self.b.setcond(Cond::Eq, Type::I64, a, b);
+                let exact = self.b.binary(Opcode::AND, Type::I1, eq, c);
+                self.b.binary(Opcode::OR, Type::I1, lt, exact)
+            }
+        };
         self.write_flag(F_CF, cf);
         let ab = self.b.binary(Opcode::XOR, Type::I64, a, b);
         let abr = self.b.binary(Opcode::XOR, Type::I64, ab, r);
@@ -3048,6 +3251,17 @@ mod tests {
             seg_base: [0; seg::COUNT],
             cmov: true,
             generation: 0,
+            origin: Origin::Flat,
+        }
+    }
+
+    /// The same world with `CR0.PG` set, on the one part whose translation
+    /// buffers are split.
+    fn paged_world(phys: u64) -> World {
+        World {
+            variant: Variant::X86_64,
+            origin: Origin::Paged { phys },
+            ..flat_world()
         }
     }
 
@@ -3122,8 +3336,8 @@ mod tests {
         let sys = liftable_sys();
         let regs = Regs::new();
         let cfg = Config::I8088.with_variant(Variant::I80386);
-        let world =
-            World::of(&regs, &sys, &cfg, true, 7).expect("this is a world the frontend lifts");
+        let world = World::of(&regs, &sys, &cfg, true, 7, Origin::Flat)
+            .expect("this is a world the frontend lifts");
         assert_eq!(world.cs_base, 0);
         assert_eq!(world.seg_base[usize::from(seg::DS)], 0x4000);
         // `CMOVcc` is a property of the instance rather than of the part
@@ -3142,7 +3356,10 @@ mod tests {
         type Break = fn(&mut Sys);
         let cases: [(&str, Break); 4] = [
             ("real mode", |s| s.cr0 &= !cr0::PE),
-            ("paging", |s| s.cr0 |= cr0::PG),
+            // Paging while the caller claims `Origin::Flat`: the origin has
+            // to say what the control registers say, or a block gets keyed as
+            // though a linear address were a physical one.
+            ("paging claimed as flat", |s| s.cr0 |= cr0::PG),
             ("a 16-bit code segment", |s| {
                 s.segs[usize::from(seg::CS)].ar &= !ar::DB;
             }),
@@ -3154,7 +3371,7 @@ mod tests {
             let mut sys = liftable_sys();
             break_it(&mut sys);
             assert!(
-                World::of(&regs, &sys, &cfg, true, 0).is_none(),
+                World::of(&regs, &sys, &cfg, true, 0, Origin::Flat).is_none(),
                 "{what} must not be liftable"
             );
         }
@@ -3162,15 +3379,150 @@ mod tests {
         // partial write.
         let mut sys = liftable_sys();
         sys.segs[usize::from(seg::SS)].ar &= !ar::DB;
-        assert!(World::of(&regs, &sys, &cfg, true, 0).is_none());
+        assert!(World::of(&regs, &sys, &cfg, true, 0, Origin::Flat).is_none());
         // And a part with 16-bit registers has a different address path
         // entirely.
         let old = Config::I8088;
-        assert!(World::of(&regs, &liftable_sys(), &old, true, 0).is_none());
+        assert!(World::of(&regs, &liftable_sys(), &old, true, 0, Origin::Flat).is_none());
         // And a machine with the A20 gate shut aliases two linear pages onto
         // one physical one, which the self-modifying-code guard compares
         // linearly and would therefore miss.
-        assert!(World::of(&regs, &liftable_sys(), &cfg, false, 0).is_none());
+        assert!(World::of(&regs, &liftable_sys(), &cfg, false, 0, Origin::Flat).is_none());
+    }
+
+    /// Paging is in the subset on a part whose instruction and data
+    /// translations are separate arrays, and out of it on one where they share
+    /// an array — because there a data operand evicts the code page's own
+    /// translation and the *next instruction fetch* pays for a walk no static
+    /// analysis of the block can place.
+    ///
+    /// The condition is asked of the buffer arrangement rather than of the
+    /// part number, which is the fact it is actually about.
+    #[test]
+    fn paging_is_liftable_exactly_where_the_translation_buffers_are_split() {
+        let regs = Regs::new();
+        let mut sys = liftable_sys();
+        sys.cr0 |= cr0::PG;
+        let origin = Origin::Paged { phys: 0x0020_0000 };
+        for variant in [Variant::I80386, Variant::I80486] {
+            let cfg = Config::I8088.with_variant(variant);
+            assert_eq!(cfg.variant.buffers(), Buffers::Unified);
+            assert!(
+                World::of(&regs, &sys, &cfg, true, 0, origin).is_none(),
+                "{variant:?} has one buffer, so a paged block cannot charge its fetches"
+            );
+        }
+        let cfg = Config::I8088.with_variant(Variant::X86_64);
+        assert_eq!(cfg.variant.buffers(), Buffers::Split);
+        let world = World::of(&regs, &sys, &cfg, true, 0, origin)
+            .expect("a split-buffer part pages inside the subset");
+        assert_eq!(world.origin, origin);
+        // And the claim has to match the control registers in both
+        // directions: an unpaged core described as paged is refused too.
+        let flat = liftable_sys();
+        assert!(World::of(&regs, &flat, &cfg, true, 0, origin).is_none());
+    }
+
+    /// The in-block store guard compares **linear** pages, and under paging
+    /// two of them may name one physical page — so a store through the other
+    /// mapping walks past a guard that cannot see it. [`lift`] refuses the
+    /// combination rather than emitting a check with a hole in it.
+    #[test]
+    fn the_in_block_store_guard_is_refused_under_paging() {
+        let world = paged_world(0x0020_0000);
+        let mut src = Bytes(&[0x90], world.linear(AT));
+        assert!(
+            lift(
+                &world,
+                AT,
+                &mut src,
+                MAX_INSNS,
+                Shape::Trace,
+                Smc::Guard,
+                Flags::Elide
+            )
+            .is_err()
+        );
+        // `Smc::EndBlock` is the policy that holds there, and it lifts.
+        let mut src = Bytes(&[0x90], world.linear(AT));
+        assert!(
+            lift(
+                &world,
+                AT,
+                &mut src,
+                MAX_INSNS,
+                Shape::Trace,
+                Smc::EndBlock,
+                Flags::Elide
+            )
+            .is_ok()
+        );
+    }
+
+    /// A paged block reports the **physical** page its bytes came from, and
+    /// the linear page it was bounded by, and they are different numbers.
+    ///
+    /// Both ends of the invalidation have to be physical: `jit::cache` matches
+    /// a guest store against `Translation::page`, and a host notes the
+    /// physical address its store reached.
+    #[test]
+    fn a_paged_block_is_named_by_a_physical_page_and_bounded_by_a_linear_one() {
+        let phys = 0x0020_0000;
+        let world = paged_world(phys);
+        let mut src = Bytes(&[0x90, 0x90, 0xf4], world.linear(AT));
+        let lifted = lift(
+            &world,
+            AT,
+            &mut src,
+            MAX_INSNS,
+            Shape::Trace,
+            Smc::EndBlock,
+            Flags::Elide,
+        )
+        .expect("a paged world lifts");
+        verify(&lifted.block).expect("and verifies");
+        assert_eq!(lifted.page, phys);
+        assert_eq!(lifted.linear_page, AT);
+        assert_ne!(lifted.page, lifted.linear_page);
+        // With paging off the two are the same number, which is exactly why
+        // the distinction was invisible before.
+        let flat = plain(&[0x90, 0x90, 0xf4]);
+        assert_eq!(flat.page, flat.linear_page);
+    }
+
+    /// Two blocks at the same `EIP` under two different mappings are two
+    /// different keys, and a paged key is never a flat one.
+    ///
+    /// This is the whole of what stops a `CR3` reload serving a translation of
+    /// bytes that are no longer there. A translation *generation* would say
+    /// the same thing far more often than it needs to — `cpu::riscv::engine`
+    /// measured that being unusable on Linux — so the key carries the physical
+    /// address the entry resolved to instead.
+    ///
+    /// The **address**, not the page, and that is not tidiness: with a
+    /// page-granular key a `CS` base moved by a page maps the same `EIP` to a
+    /// different offset in the same frame, which is different bytes and a
+    /// different distance to the end of the page, under one key.
+    #[test]
+    fn a_paged_key_names_the_entry_address_and_never_collides_with_a_flat_one() {
+        let a = paged_world(0x0020_0000);
+        let b = paged_world(0x0030_0000);
+        let flat = flat_world();
+        let of = |w: &World| key(w, Shape::Trace, Smc::EndBlock, Flags::Elide);
+        assert_ne!(of(&a), of(&b), "a different mapping is a different block");
+        assert_ne!(of(&a), of(&flat));
+        // The same frame at a different offset is a different block too.
+        assert_ne!(of(&a), of(&paged_world(0x0020_0040)));
+        // A world generation moves a flat key and is deliberately *not* in a
+        // paged one: under `Smc::EndBlock` no segment base reaches the emitted
+        // IR, and which bytes the entry names is what the physical address
+        // says.
+        let mut moved = flat;
+        moved.generation = 1;
+        assert_ne!(of(&flat), of(&moved));
+        let mut same_entry = a;
+        same_entry.generation = 99;
+        assert_eq!(of(&a), of(&same_entry));
     }
 
     #[test]
@@ -3193,6 +3545,18 @@ mod tests {
         moved.generation = 1;
         assert!(keys.insert(key(&moved, Shape::Trace, Smc::Guard, Flags::Elide)));
         // and `CMOVcc` decides whether an encoding is in the subset at all.
+        // And a part is its own world: three of them reach here and each has
+        // its own number, so a block lifted for one is never served to
+        // another. A 386 and an x86-64 shared a number until paging landed.
+        let mut parts = alloc::collections::BTreeSet::new();
+        for variant in [Variant::I80386, Variant::I80486, Variant::X86_64] {
+            let mut part = w;
+            part.variant = variant;
+            assert!(
+                parts.insert(key(&part, Shape::Trace, Smc::Guard, Flags::Elide)),
+                "{variant:?}"
+            );
+        }
         let mut no_cmov = w.without_cmov();
         no_cmov.generation = 0;
         assert_ne!(

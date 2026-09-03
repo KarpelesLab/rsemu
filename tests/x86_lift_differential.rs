@@ -84,6 +84,18 @@ struct Coverage {
 }
 
 fn sweep(seed: u64, count: usize, shape: Shape, flags: Flags) -> Coverage {
+    sweep_in(seed, count, shape, flags, false)
+}
+
+/// The same sweep, in a chosen world.
+///
+/// `paged` puts `CR0.PG` on: the guest's linear addresses are unchanged and
+/// every one of them names a different physical page, the entry translation is
+/// charged on the way in, and each access walks the tables through the
+/// interpreter's own memory path. Every column stays the same, which is the
+/// point — a walk's ticks and the accessed and dirty bits it writes are both
+/// compared.
+fn sweep_in(seed: u64, count: usize, shape: Shape, flags: Flags, paged: bool) -> Coverage {
     let mut rng = Lcg(seed);
     let mut cov = Coverage::default();
     for n in 0..count {
@@ -91,6 +103,7 @@ fn sweep(seed: u64, count: usize, shape: Shape, flags: Flags) -> Coverage {
         let case = Case::seeded(generate(&mut rng, len))
             .with_shape(shape)
             .with_flags(flags);
+        let case = if paged { case.paged() } else { case };
         match compare(&case) {
             Ok(Verdict::Agreed { insns, .. }) => {
                 cov.agreed += 1;
@@ -101,7 +114,10 @@ fn sweep(seed: u64, count: usize, shape: Shape, flags: Flags) -> Coverage {
                 cov.insns += insns;
             }
             Ok(Verdict::Nothing) => cov.nothing += 1,
-            Err(e) => panic!("case {n} of seed {seed:#x} diverged under {shape:?}/{flags:?}:\n{e}"),
+            Err(e) => panic!(
+                "case {n} of seed {seed:#x} diverged under {shape:?}/{flags:?}{}:\n{e}",
+                if paged { "/paged" } else { "" }
+            ),
         }
     }
     cov
@@ -145,6 +161,104 @@ fn a_generated_corpus_agrees_with_the_interpreter_under_every_shape_and_flag_pol
     );
 }
 
+/// The corpus again, with `CR0.PG` set.
+///
+/// **A fourth world rather than a seventh policy**, and the reason it is here
+/// at all: `World::of` refused paging outright until this round, so every
+/// claim the harness made about the lifter was a claim about unpaged code.
+/// Widening the lifter's world without widening the corpus would have left
+/// the coverage claim empty.
+///
+/// What is different about a paged case, column by column:
+///
+/// * **the memory path is the interpreter's own** — `Exec::read_mem` and
+///   `Exec::write_mem`, the functions `Exec::step` calls — rather than this
+///   harness's segment check plus one bus cycle, because a walk's tick cost
+///   and its accessed-bit write-back are not things a second implementation
+///   should be trusted to reproduce;
+/// * **the entry fetch translation is charged on the way in**, on every block,
+///   which is the contract that otherwise looks like a working JIT with a
+///   clock short by one walk per entry;
+/// * **RAM is compared over the page tables too**, so the accessed and dirty
+///   bits both engines wrote are a compared column and not an assumption;
+/// * **the block is keyed on the physical page its entry resolved to**, and
+///   linear and physical are deliberately different numbers in this machine.
+///
+/// `Smc::EndBlock` is forced by `Case::paged`, because the in-block guard
+/// compares linear pages and two of them may alias one physical page — the
+/// lifter refuses the other combination.
+#[test]
+fn the_same_corpus_agrees_with_paging_on() {
+    let mut total = Coverage::default();
+    for (n, shape) in [Shape::BasicBlock, Shape::Extended, Shape::Trace]
+        .into_iter()
+        .enumerate()
+    {
+        for (m, flags) in [Flags::Eager, Flags::Elide].into_iter().enumerate() {
+            let seed = 0x9a6e_0000 + (n as u64) * 16 + m as u64;
+            let cov = sweep_in(seed, 400, shape, flags, true);
+            assert!(
+                cov.agreed > 200,
+                "{shape:?}/{flags:?} paged: only {} of 400 cases ran to completion ({} trapped, \
+                 {} lifted nothing)",
+                cov.agreed,
+                cov.trapped,
+                cov.nothing
+            );
+            total.agreed += cov.agreed;
+            total.trapped += cov.trapped;
+            total.nothing += cov.nothing;
+            total.insns += cov.insns;
+        }
+    }
+    assert!(
+        total.trapped > 0,
+        "no paged case reached a fault, so the precise-state column was never tested under paging"
+    );
+    assert!(
+        total.insns > 3_000,
+        "only {} guest instructions retired across the paged corpus",
+        total.insns
+    );
+}
+
+/// The same program, once with paging off and once with it on, must retire the
+/// same instructions and leave the same registers — and must **not** charge the
+/// same ticks, because a walk costs bus cycles.
+///
+/// The second half is what makes the first half worth asserting. A paged run
+/// that cost exactly what an unpaged one cost would mean no walk had happened,
+/// which is the shape of a JIT that skipped the entry translation.
+#[test]
+fn paging_changes_the_clock_and_nothing_else() {
+    // mov eax, [ebx] ; add eax, ecx ; mov [ebx+4], eax ; hlt
+    let program = vec![0x8b, 0x03, 0x01, 0xc8, 0x89, 0x43, 0x04, 0xf4];
+    let flat = Case::seeded(program.clone());
+    let paged = Case::seeded(program).paged();
+    let (a, b) = match (compare(&flat), compare(&paged)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (a, b) => panic!("{a:?}\n{b:?}"),
+    };
+    let (
+        Verdict::Agreed {
+            insns: ia,
+            ticks: ta,
+        },
+        Verdict::Agreed {
+            insns: ib,
+            ticks: tb,
+        },
+    ) = (a, b)
+    else {
+        panic!("both worlds run this program to completion");
+    };
+    assert_eq!(ia, ib, "the same program retires the same instructions");
+    assert!(
+        tb > ta,
+        "paging cost nothing ({ta} ticks unpaged, {tb} paged), so no page-table walk happened"
+    );
+}
+
 #[test]
 fn the_same_corpus_agrees_through_the_cached_and_chained_runtime() {
     // The second harness: many blocks, served from a cache, exits patched, the
@@ -168,6 +282,72 @@ fn the_same_corpus_agrees_through_the_cached_and_chained_runtime() {
          nothing)"
     );
     assert!(trapped > 0, "no cached case reached a fault");
+}
+
+/// The paged corpus through the translation runtime rather than one block at a
+/// time.
+///
+/// What this covers that [`the_same_corpus_agrees_with_paging_on`] cannot: the
+/// entry translation happens on **every** execution, including a block served
+/// from the cache and a block reached by following a patched exit, so a block
+/// that skipped its walk the second time round is a tick divergence here and
+/// nowhere else. The block is looked up under the key the entry translation
+/// just produced, which is the only place that key is exercised as a key.
+#[test]
+fn the_paged_corpus_agrees_through_the_cached_and_chained_runtime() {
+    let mut rng = Lcg(0x9a6e_beef);
+    let (mut agreed, mut trapped, mut nothing) = (0usize, 0usize, 0usize);
+    for n in 0..400 {
+        let len = 1 + (rng.next() % 12) as usize;
+        let case = Case::seeded(generate(&mut rng, len)).paged();
+        match compare_cached(&case, 32) {
+            Ok(Verdict::Agreed { .. }) => agreed += 1,
+            Ok(Verdict::Trapped { .. }) => trapped += 1,
+            Ok(Verdict::Nothing) => nothing += 1,
+            Err(e) => panic!("cached paged case {n} diverged:\n{e}"),
+        }
+    }
+    assert!(
+        agreed > 200,
+        "only {agreed} of 400 cached paged cases ran to completion ({trapped} trapped, {nothing} \
+         lifted nothing)"
+    );
+    assert!(trapped > 0, "no cached paged case reached a fault");
+}
+
+/// A store into a running block's own page, with paging on — where the store's
+/// **linear** page and the block's **physical** page are different numbers.
+///
+/// This is the case the in-block guard could not have handled and the reason
+/// `lift` refuses it under paging: the guard compares linear pages, and both
+/// ends of the real mechanism are physical. `Smc::EndBlock` puts the boundary
+/// where the store is, the host notes the physical page its store reached, and
+/// the cache invalidates the translation whose bytes came from that page.
+///
+/// The assertion that matters is the last one: without invalidation the block
+/// would run the instruction it was lifted from and the interpreter would run
+/// the one the store wrote, and the two engines would disagree about `ESI` and
+/// `EDI` — which is what this harness compares.
+#[test]
+fn a_paged_store_into_a_running_blocks_own_page_is_honoured() {
+    for shape in [Shape::BasicBlock, Shape::Extended, Shape::Trace] {
+        let case = Case::new(self_modifying())
+            .with_reg(0, 4)
+            .with_reg(3, 0x47)
+            .with_shape(shape)
+            .paged();
+        let run = measure_cached(&case, 32).unwrap_or_else(|e| panic!("{shape:?} paged: {e}"));
+        assert!(
+            matches!(run.verdict, Verdict::Agreed { .. }),
+            "{shape:?} paged: {:?}",
+            run.verdict
+        );
+        assert!(
+            run.smc > 0,
+            "{shape:?} paged: nothing was invalidated, so the store was never matched against the \
+             block's physical page"
+        );
+    }
 }
 
 /// The same corpus again, executed as **host code**.

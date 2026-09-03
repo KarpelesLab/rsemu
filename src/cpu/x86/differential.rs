@@ -51,7 +51,7 @@
 //!   stack, and the byte-for-byte RAM comparison would then have to know
 //!   about it.
 //!
-//! # The machine
+//! # The machine, and the second one beside it
 //!
 //! A 386 in 32-bit protected mode with paging off — the world
 //! [`lift::World::of`] accepts, and the one `pc-at` firmware and FreeDOS run
@@ -64,7 +64,17 @@
 //! unassigned address and the interpreter's open-bus path is never a source of
 //! disagreement.
 //!
-//! # Why the host here re-implements the memory path
+//! [`Case::paged`] is the second machine, and it is a **world** rather than a
+//! policy: `CR0.PG` set, on the one part whose translation buffers are split.
+//! The guest's linear addresses are exactly the same, and every one of them
+//! now names a different physical page — deliberately, because an identity map
+//! would leave every linear-versus-physical confusion invisible, and that is
+//! the class of bug paging adds. Four more pages hold the page directory and
+//! the page table, and `memory` compares those along with the rest, so the
+//! **accessed and dirty bits both engines wrote are a compared column** rather
+//! than an assumption.
+//!
+//! # Why the host here re-implements the memory path, and where it stops
 //!
 //! [`IrHost::load`] and [`IrHost::store`] are where a lifted block meets guest
 //! memory, and the interpreter's own path through them is private to a step in
@@ -81,6 +91,21 @@
 //! frontend is what is under test. The lifter's contribution is the
 //! [`MemOp`]'s size and its `SegId`, and a wrong one of those diverges here
 //! immediately.
+//!
+//! **Under paging it stops being defensible, so it stops.** A paged access has
+//! a translation in front of it, and that translation has a tick cost that
+//! depends on a buffer hit, an accessed bit, a dirty bit written by a
+//! fall-through walk on the first store to a page, and a per-byte split when
+//! the access crosses a page boundary. A second implementation of *that* would
+//! be a job rather than a line, and every one of its mistakes would be
+//! reported as a divergence in the lifter. So a paged host owns an `Mmu` and
+//! calls `Exec::read_mem` and `Exec::write_mem` — the functions `Exec::step`
+//! itself calls — which is the answer `cpu::riscv::engine` reached for the same
+//! reason.
+//!
+//! It also owes the entry fetch translation, on every execution of every
+//! block: see `Host::enter`, and [`lift`]'s module docs for why getting that
+//! wrong looks like a working JIT with a short clock.
 //!
 //! # Two harnesses, not one
 //!
@@ -149,8 +174,10 @@
 //!   back rather than delivering it.
 //! * **Anything outside the lifted subset**, which ends the block by
 //!   construction — so it is not skipped, it simply is not reached.
-//! * **Paging, real mode, long mode and the segment loads**, none of which
-//!   [`lift::World::of`] accepts.
+//! * **Real mode, long mode, the segment loads and paging on a part with one
+//!   translation buffer**, none of which [`lift::World::of`] accepts. Paging
+//!   on a part with two is covered — see [`Case::paged`] — and is the world
+//!   this list named first for three rounds.
 
 use alloc::format;
 use alloc::string::String;
@@ -158,17 +185,23 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+#[cfg(any(feature = "jit", test))]
+use crate::core::device::DebugTranslation;
 use crate::core::error::BusError;
 use crate::core::space::{AddressSpace, MemAttrs, MemResult, RamStore, Region};
 use crate::ir::{InsnStart, Interp, IrHost, MemOp, Outcome, RegSlot, verify};
 
+use super::exec::{Exec, State};
 use super::isa::seg;
 use super::lift::{
-    self, ARITH_MASK, EFLAGS_REST, EIP, FLAG_BITS, FLAG_SLOTS, Flags, SLOT_COUNT, Shape, Smc,
-    World, r_slot,
+    self, ARITH_MASK, EFLAGS_REST, EIP, FLAG_BITS, FLAG_SLOTS, Flags, Origin, SLOT_COUNT, Shape,
+    Smc, World, r_slot,
 };
+#[cfg(any(feature = "jit", test))]
+use super::paging::debug_translate;
+use super::paging::{Access, pte};
 use super::prot::{SegReg, Sys, ar, cr0};
-use super::{Config, Regs, Variant, X86, flags};
+use super::{Config, Lines, Regs, Variant, X86, flags};
 
 #[cfg(feature = "jit")]
 use crate::core::value::Width;
@@ -176,8 +209,8 @@ use crate::core::value::Width;
 use crate::ir::AccessKind;
 #[cfg(feature = "jit")]
 use crate::jit::{
-    BlockCache, Context as TlbContext, DirtyPages, Dispatcher, Epoch, FastMem, Frontend, Stop,
-    StoreLog, Tlb, Translation,
+    BlockCache, Context as TlbContext, DirtyPages, Dispatcher, Entry, Epoch, FastMem, Frontend,
+    Stop, StoreLog, Tlb, Translation,
 };
 
 /// Where a case's RAM is mapped, and where its program starts.
@@ -203,6 +236,30 @@ pub const DATA: u64 = 4096;
 /// In the middle of the data window with room on both sides, so a run of
 /// pushes reaches neither the code page below it nor the segment limit above.
 pub const STACK: u64 = DATA + 0x800;
+
+/// How much physical RAM a **paged** case gets: eight pages.
+///
+/// Four of them are the guest's — the same four [`RAM_SIZE`] describes, at the
+/// same *linear* addresses — and the other four hold the translation
+/// structures and the gap that keeps linear and physical from being the same
+/// number by accident. Everything in the region is compared byte for byte,
+/// which is what makes the accessed and dirty bits a compared column rather
+/// than an assumption.
+pub const PAGED_RAM_SIZE: u64 = 8 * 4096;
+
+/// Where the page directory sits, physically.
+pub const PDIR: u64 = BASE;
+
+/// Where the one page table sits, physically.
+pub const PTAB: u64 = BASE + 0x1000;
+
+/// The physical page linear [`BASE`] is mapped to in a paged case.
+///
+/// Deliberately **not** [`BASE`]: an identity map would leave every
+/// linear-versus-physical confusion invisible, which is the whole class of bug
+/// paging adds. The four guest pages sit at `PAGED_PROGRAM ..
+/// PAGED_PROGRAM + RAM_SIZE`.
+pub const PAGED_PROGRAM: u64 = BASE + 0x4000;
 
 /// The selector the flat code segment is loaded from.
 const CODE_SEL: u16 = 0x08;
@@ -241,6 +298,14 @@ pub struct Case {
     /// setting: they emit different IR from the same bytes, all of them are in
     /// the cache key, and all of them must agree with the one interpreter.
     pub flags: Flags,
+    /// Whether this case runs with `CR0.PG` set.
+    ///
+    /// A **fourth** world rather than a fourth policy: the guest's linear
+    /// addresses are unchanged and every one of them now names a different
+    /// physical page, the memory path is the interpreter's own rather than
+    /// this module's, and the block is keyed on the page its entry resolved
+    /// to. See [`Case::paged`].
+    pub paged: bool,
 }
 
 impl Case {
@@ -256,7 +321,24 @@ impl Case {
             shape: Shape::default(),
             smc: Smc::default(),
             flags: Flags::default(),
+            paged: false,
         }
+    }
+
+    /// How much physical RAM this case's machine has, and how much of it the
+    /// two engines are compared over.
+    #[must_use]
+    pub const fn ram_size(&self) -> u64 {
+        if self.paged { PAGED_RAM_SIZE } else { RAM_SIZE }
+    }
+
+    /// Where the program is loaded, as an offset into that RAM.
+    ///
+    /// Zero unless the case pages, where linear [`BASE`] is
+    /// [`PAGED_PROGRAM`].
+    #[must_use]
+    pub const fn program_offset(&self) -> u64 {
+        if self.paged { PAGED_PROGRAM - BASE } else { 0 }
     }
 
     /// A case whose `EAX`..`EBX` point into the data window, spread so that a
@@ -315,6 +397,27 @@ impl Case {
     #[must_use]
     pub const fn with_eflags(mut self, value: u32) -> Case {
         self.eflags = value;
+        self
+    }
+
+    /// The same case with paging on, which forces two other choices.
+    ///
+    /// * **The part becomes [`Variant::X86_64`]**, because paged code is only
+    ///   in the lifted subset on a part whose instruction and data
+    ///   translations are separate arrays — see
+    ///   [`World::of`](lift::World::of). A 386 and a 486 are refused there and
+    ///   would be refused here.
+    /// * **The store policy becomes [`Smc::EndBlock`]**, because
+    ///   [`Smc::Guard`] compares linear pages and [`lift`] refuses it under
+    ///   paging.
+    ///
+    /// Both are silent rather than assertions because the point of a
+    /// constructor is that the case it builds is one the frontend accepts.
+    #[must_use]
+    pub const fn paged(mut self) -> Case {
+        self.paged = true;
+        self.variant = Variant::X86_64;
+        self.smc = Smc::EndBlock;
         self
     }
 
@@ -431,6 +534,15 @@ pub fn compare(case: &Case) -> Result<Verdict, Divergence> {
     }
 
     let mut host = Host::new(case, subject_space);
+    // The entry fetch translation, before anything runs. See `Host::enter`:
+    // the block makes no fetches and still owes the one the interpreter's
+    // first fetch makes.
+    if host.enter(world.linear(BASE)).is_err() {
+        return Err(diverged(
+            case,
+            String::from("the entry page could not be translated through the fetch path"),
+        ));
+    }
     let mut interp = Interp::new();
     let outcome = interp
         .run(&lifted.block, &mut host)
@@ -599,7 +711,7 @@ fn state(
 
 /// Compare guest RAM byte for byte.
 fn memory(case: &Case, oracle: &RamStore, subject: &RamStore) -> Result<(), Divergence> {
-    for off in 0..RAM_SIZE {
+    for off in 0..case.ram_size() {
         let want = oracle.read_u8(off).unwrap_or(0);
         let got = subject.read_u8(off).unwrap_or(0);
         if want != got {
@@ -712,6 +824,52 @@ pub fn world(case: &Case) -> World {
         // lifter lifts an instruction the interpreter refuses.
         cmov: config(case).features.cmov,
         generation: 0,
+        // The physical page linear `BASE` resolves to, which is what names a
+        // paged block. Written down here and *derived* by the harness itself:
+        // `a_paged_entry_resolves_to_the_page_the_world_claims` asserts that
+        // the machine's own tables agree, which is the property that matters.
+        origin: if case.paged {
+            Origin::Paged {
+                phys: PAGED_PROGRAM,
+            }
+        } else {
+            Origin::Flat
+        },
+    }
+}
+
+/// The four-byte legacy page-table entry `value` at physical address `phys`.
+fn put_entry(ram: &RamStore, phys: u64, value: u32) {
+    for i in 0..4u64 {
+        ram.write_u8(phys - BASE + i, (value >> (8 * i as u32)) as u8)
+            .expect("a table entry is inside the region");
+    }
+}
+
+/// Map the four guest pages, in the two-level scheme a 32-bit `CR0.PG` with
+/// `CR4.PAE` clear puts in force.
+///
+/// Supervisor pages, present and writable — the harness runs at ring 0 — so
+/// nothing here faults for a *permission* reason and every page fault a case
+/// can take is one the case caused. The accessed and dirty bits start clear on
+/// purpose: the first fetch and the first write to each page are what set
+/// them, both engines must set exactly the same ones, and [`memory`] compares
+/// the tables along with everything else.
+fn map_pages(ram: &RamStore) {
+    let pde = BASE >> 22;
+    put_entry(
+        ram,
+        PDIR + 4 * pde,
+        (PTAB | pte::PRESENT | pte::WRITABLE) as u32,
+    );
+    let first = (BASE >> 12) & 0x3ff;
+    for k in 0..RAM_SIZE / 4096 {
+        let frame = PAGED_PROGRAM + k * 4096;
+        put_entry(
+            ram,
+            PTAB + 4 * (first + k),
+            (frame | pte::PRESENT | pte::WRITABLE) as u32,
+        );
     }
 }
 
@@ -721,15 +879,20 @@ pub fn world(case: &Case) -> World {
 /// machine would eventually measure a different one.
 #[must_use]
 pub fn machine(case: &Case) -> (Arc<AddressSpace>, Arc<RamStore>) {
-    let ram = Arc::new(RamStore::new(RAM_SIZE));
+    let ram = Arc::new(RamStore::new(case.ram_size()));
+    let at = case.program_offset();
     for (n, byte) in case.program.iter().enumerate() {
-        ram.write_u8(n as u64, *byte).expect("the program fits");
+        ram.write_u8(at + n as u64, *byte)
+            .expect("the program fits");
     }
     // A byte the lifter refuses, so a run that falls off the end of the
     // program stops cleanly rather than executing whatever the data window
     // happens to hold.
-    ram.write_u8(case.program.len() as u64, 0xf4)
+    ram.write_u8(at + case.program.len() as u64, 0xf4)
         .expect("the terminator fits");
+    if case.paged {
+        map_pages(&ram);
+    }
     let space = AddressSpace::new("mem", 32);
     space
         .topology()
@@ -738,15 +901,14 @@ pub fn machine(case: &Case) -> (Arc<AddressSpace>, Arc<RamStore>) {
     (Arc::new(space), ram)
 }
 
-/// A core already in the world [`world`] describes, with the reset sequence
-/// discharged and its interrupt table deliberately unusable.
+/// The system registers this case's machine runs with.
 ///
-/// See the module docs for why the table is unusable rather than absent.
+/// One factory, because two of them must agree exactly: the oracle is an
+/// [`X86`] and the subject's memory path is an `Exec` over its own
+/// `State`, and a difference in a segment limit or a `CR3` between them
+/// would show up as a divergence in the *lifter*.
 #[must_use]
-pub fn oracle(case: &Case, space: Arc<AddressSpace>) -> X86 {
-    let cpu = X86::new(config(case));
-    cpu.attach_space(space);
-
+pub fn system(case: &Case) -> Sys {
     let mut sys = Sys::reset();
     sys.cr0 |= cr0::PE;
     // Zero limit, on purpose: see the module docs. The first exception cannot
@@ -770,7 +932,25 @@ pub fn oracle(case: &Case, space: Arc<AddressSpace>) -> X86 {
             ar: DATA32,
         };
     }
-    cpu.set_sys(sys);
+    if case.paged {
+        // `CR4.PAE` stays clear, so this is the two-level walk a 32-bit guest
+        // uses whatever the part is wide enough to do — `Mode::Legacy`, four
+        // bytes an entry, one directory and one table.
+        sys.cr3 = PDIR;
+        sys.cr0 |= cr0::PG;
+    }
+    sys
+}
+
+/// A core already in the world [`world`] describes, with the reset sequence
+/// discharged and its interrupt table deliberately unusable.
+///
+/// See the module docs for why the table is unusable rather than absent.
+#[must_use]
+pub fn oracle(case: &Case, space: Arc<AddressSpace>) -> X86 {
+    let cpu = X86::new(config(case));
+    cpu.attach_space(space);
+    cpu.set_sys(system(case));
 
     let mut regs = Regs::new();
     regs.cs = CODE_SEL;
@@ -841,6 +1021,35 @@ impl Segments {
     }
 }
 
+/// What an entry translation cost, which is nothing at all when it failed.
+///
+/// **A failed entry translation is not the block's charge**, and getting that
+/// backwards is a double charge rather than a missing one. The runtime
+/// translates a block's entry *before* deciding to run it; when the
+/// translation faults the block does not run, the guest PC goes back to the
+/// interpreter, and the interpreter's own fetch walks those same tables and
+/// charges for them. A successful walk is different in exactly the way that
+/// matters: it filled the translation buffer, so the interpreter's fetch finds
+/// the entry and charges nothing.
+///
+/// Rolling the counter back is safe because a walk that fails writes nothing —
+/// `translate_access` returns before the accessed and dirty bits are written,
+/// on a missing entry and on a refused permission alike — so the only trace of
+/// it is the cycles, and `CR2`, which the interpreter is about to latch again
+/// itself.
+///
+/// Discovered by `the_paged_corpus_agrees_through_the_cached_and_chained_runtime`,
+/// on a case whose conditional jump left the mapped window: the block cache
+/// entered at an unmapped PC, charged the walk that failed there, and came out
+/// four ticks — one two-level walk — ahead of the interpreter.
+fn charge_of(state: &mut State, before: u64, ok: bool) -> u64 {
+    if !ok {
+        state.cycles = before;
+        return 0;
+    }
+    state.cycles.wrapping_sub(before)
+}
+
 /// The guest state a lifted block runs against.
 ///
 /// Slots rather than a register struct, because that is all the backend knows
@@ -857,6 +1066,31 @@ struct Host {
     /// Of those, the ones the accesses spent — the data-dependent half, which
     /// the frontend deliberately leaves out of [`InsnStart::ticks`].
     access_ticks: u64,
+    /// The interpreter's own memory path, present exactly when the case pages.
+    mmu: Option<Mmu>,
+}
+
+/// Enough of a core for [`Exec`] to exist over: the memory path under paging.
+///
+/// **Not a memory path that agrees with the interpreter's — the
+/// interpreter's.** `Exec::read_mem` and `Exec::write_mem` are what
+/// `Exec::step` itself calls, so the segment check, the translation with its
+/// accessed and dirty bits, the page-crossing split and the bus transaction
+/// are one implementation rather than two. That matters more under paging than
+/// anywhere else: a second implementation would have to reproduce a walk's
+/// tick cost, the order its entries are read in, and the rule that a write to
+/// a page whose dirty bit is clear takes the long way round even on a
+/// translation-buffer hit — and getting any of those wrong would be reported
+/// as a *lifter* divergence.
+///
+/// The unpaged path deliberately keeps [`Segments`] instead, because that is
+/// the harness this frontend's nineteen-of-twenty bug-injection score was
+/// measured with and changing it would be changing the instrument.
+#[derive(Debug)]
+struct Mmu {
+    state: State,
+    cfg: Config,
+    lines: Lines,
 }
 
 impl Host {
@@ -880,7 +1114,79 @@ impl Host {
             bus: u64::from(case.variant.bus_clocks()),
             ticks: 0,
             access_ticks: 0,
+            mmu: case.paged.then(|| Mmu::new(case)),
         }
+    }
+
+    /// The entry fetch translation this block owes, charged.
+    ///
+    /// **The contract the module docs of [`lift`] call the one that looks like
+    /// a working JIT.** A translated block makes no fetches, but the
+    /// instruction it replaced translated its first byte through the fetch
+    /// path — walking the tables on a buffer miss, charging two bus reads per
+    /// level and writing the accessed bit — and a block that skipped that
+    /// would run the same instructions for fewer ticks. So it happens here,
+    /// on every execution of every block, exactly as `cpu::riscv::engine`'s
+    /// `admit` does it, and the physical page it answers is what the block is
+    /// keyed on.
+    ///
+    /// The ticks land in [`Host::access_ticks`] rather than in the block's
+    /// static column, because the frontend cannot know at lift time whether
+    /// the buffer will hit.
+    fn enter(&mut self, linear: u64) -> MemResult<u64> {
+        let Host {
+            mmu,
+            space,
+            ticks,
+            access_ticks,
+            ..
+        } = self;
+        let Some(mmu) = mmu.as_mut() else {
+            // With `CR0.PG` clear a linear address is a physical one and there
+            // is nothing to translate, which is a different fact from there
+            // being nothing to charge.
+            return Ok(linear);
+        };
+        let before = mmu.state.cycles;
+        let user = mmu.state.regs.cs & 3 == 3;
+        let answer = {
+            let mut exec = Exec::new(&mut mmu.state, space, None, &mmu.cfg, &mmu.lines);
+            exec.translate_access(linear, Access::fetch(user))
+        };
+        let spent = charge_of(&mut mmu.state, before, answer.is_ok());
+        *ticks += spent;
+        *access_ticks += spent;
+        answer.map_err(|_| BusError::Protected)
+    }
+
+    /// One data access through the interpreter's own path.
+    fn paged_access(&mut self, mem: &MemOp, addr: u64, value: Option<u64>) -> MemResult<u64> {
+        let Host {
+            mmu,
+            space,
+            ticks,
+            access_ticks,
+            ..
+        } = self;
+        let mmu = mmu.as_mut().expect("only a paged host reaches here");
+        let sr = mem.seg.map_or(seg::DS, |s| s.0);
+        let size = mem.size.bytes() as u8;
+        let before = mmu.state.cycles;
+        let answer = {
+            let mut exec = Exec::new(&mut mmu.state, space, None, &mmu.cfg, &mmu.lines);
+            match value {
+                None => exec.read_mem(sr, addr, size),
+                Some(v) => exec.write_mem(sr, addr, size, v).map(|()| 0),
+            }
+        };
+        let spent = mmu.state.cycles.wrapping_sub(before);
+        *ticks += spent;
+        *access_ticks += spent;
+        // The IR carries one bus error and the vector is the interpreter's
+        // business: `#GP`, `#SS` and now `#PF` all arrive here as *a fault*,
+        // and what is compared is that both engines took one at the same
+        // instruction in the same state.
+        answer.map_err(|_| BusError::Protected)
     }
 
     fn slot(&self, slot: RegSlot) -> u64 {
@@ -904,6 +1210,9 @@ impl Host {
     }
 
     fn access(&mut self, mem: &MemOp, addr: u64, value: Option<u64>) -> MemResult<u64> {
+        if self.mmu.is_some() {
+            return self.paged_access(mem, addr, value);
+        }
         let sr = mem.seg.map_or(seg::DS, |s| s.0);
         let lin = self.segs.linear(sr, addr, mem.size.bytes())?;
         // Paging is out of the lifted subset, so a whole access is one bus
@@ -913,6 +1222,51 @@ impl Host {
         match value {
             None => self.space.read(lin, mem.size, self.attrs),
             Some(v) => self.space.write(lin, mem.size, v, self.attrs).map(|()| 0),
+        }
+    }
+}
+
+impl Mmu {
+    /// The interpreter's state, in the world [`system`] describes.
+    ///
+    /// Only the parts a memory access reads are meaningful: the system
+    /// registers, the translation buffers, the cycle counter, and `CS`'s
+    /// selector — whose low two bits are the privilege level every translation
+    /// consults. The general registers live in [`Host::slots`], because that
+    /// is all a lifted block knows about.
+    fn new(case: &Case) -> Mmu {
+        let cfg = config(case);
+        let mut state = State::new(cfg.variant);
+        state.sys = system(case);
+        state.regs.cs = CODE_SEL;
+        state.cycles = 0;
+        state.reset_pending = false;
+        Mmu {
+            state,
+            cfg,
+            lines: Lines::default(),
+        }
+    }
+
+    /// Where a linear address is — the whole physical address, not its page —
+    /// without touching anything.
+    ///
+    /// Wanted by the cached path, which logs a store by the physical page it
+    /// reached, and by the test that checks this machine's tables resolve the
+    /// entry to the page [`world`] claims. Neither exists in a build with no
+    /// `jit` and no tests, hence the gate.
+    ///
+    /// The self-modifying-code half needs the *physical* page a store reached
+    /// and `Exec::write_mem` does not report one. A debug walk answers it with
+    /// none of the side effects — no accessed bit, no `CR2`, no buffer fill,
+    /// no cycles — which is exactly right here: every one of those has already
+    /// happened, on the executing walk the store itself made.
+    #[cfg(any(feature = "jit", test))]
+    fn phys_of(&self, space: &AddressSpace, linear: u64) -> Option<u64> {
+        match debug_translate(&self.state.sys, self.cfg.features, space, linear) {
+            DebugTranslation::Identity => Some(linear),
+            DebugTranslation::Mapped(phys) => Some(phys),
+            DebugTranslation::Unmapped => None,
         }
     }
 }
@@ -1144,6 +1498,8 @@ impl HostView {
             bus: 0,
             ticks: self.ticks,
             access_ticks: self.access_ticks,
+            // A view, not a machine: nothing here performs an access.
+            mmu: None,
         }
     }
 }
@@ -1264,17 +1620,45 @@ impl Lifter {
 }
 
 #[cfg(feature = "jit")]
-impl<H: ?Sized> Frontend<H> for Lifter {
+impl Frontend<CachedHost> for Lifter {
     fn epoch(&mut self) -> Epoch {
         // Nothing in the lifted subset can change the world — no segment load,
-        // no `CR0` write, no `LGDT` — so the world generation never moves and
-        // the topology half is the only one that can. A dispatcher wired to a
-        // real machine bumps `World::generation` instead, and that lands in
-        // `Block::key` rather than here.
+        // no `CR0` write, no `LGDT`, no `MOV CR3` — so the world generation
+        // never moves and the topology half is the only one that can. A
+        // dispatcher wired to a real machine bumps `World::generation`
+        // instead, and that lands in `Block::key` rather than here; a paged
+        // one is named by the physical page `enter` resolves below, which is
+        // in `Block::key` too and for the same reason.
         Epoch {
             topology: self.space.generation(),
             translation: 0,
         }
+    }
+
+    /// The entry translation, on **every** execution of the block.
+    ///
+    /// This is the hook `cpu::riscv::engine` acquired for exactly this job,
+    /// and the contract `lift`'s module docs call the one that looks like a
+    /// working JIT: a cached block skips its own fetches, and the instruction
+    /// it replaced still translated its first byte through the fetch path,
+    /// walking the tables on a buffer miss and charging for the walk. Doing it
+    /// here rather than at lift time is what makes a served block cost what an
+    /// uncached one cost.
+    ///
+    /// It also *names* the block: the physical page this resolved to goes into
+    /// the world, and `Frontend::key` — which the dispatcher asks next — reads
+    /// it. There is deliberately no other way to obtain that number.
+    fn enter(&mut self, pc: u64, host: &mut CachedHost) -> crate::core::error::Result<Entry> {
+        let Origin::Paged { .. } = self.world.origin else {
+            return Ok(Entry::Ready);
+        };
+        let Ok(phys) = host.enter(self.world.linear(pc)) else {
+            // The entry page is not there. The interpreter is the oracle for
+            // what a `#PF` does next, so the run stops and hands the PC back.
+            return Ok(Entry::Leave);
+        };
+        self.world.origin = Origin::Paged { phys };
+        Ok(Entry::Ready)
     }
 
     fn key(&mut self) -> u64 {
@@ -1288,11 +1672,28 @@ impl<H: ?Sized> Frontend<H> for Lifter {
     fn translate(&mut self, pc: u64) -> crate::core::error::Result<Translation> {
         // Out of guest RAM, not out of the case's `Vec<u8>`: a store that
         // rewrote an instruction has to be visible here, or the whole
-        // self-modifying-code mechanism is untested. With paging off and a
-        // flat code segment this *is* the fetch path.
+        // self-modifying-code mechanism is untested.
+        //
+        // The lifter reads **linear** addresses and a block never leaves the
+        // page its entry is on, so under paging the one translation `enter`
+        // just made covers every byte it may read: the offset within the page
+        // is carried and the frame comes from the entry. That is a read-ahead
+        // of up to sixty-four instructions the guest has not asked for, which
+        // is why it is a plain physical read rather than a second walk — the
+        // walk, with its accessed bit and its charge, has already happened.
         let space = Arc::clone(&self.space);
         let attrs = self.attrs;
-        let mut src = |addr: u64| space.read(addr, Width::U8, attrs).ok().map(|v| v as u8);
+        let frame = match self.world.origin {
+            Origin::Flat => None,
+            Origin::Paged { phys } => Some(phys & !lift::PAGE_MASK),
+        };
+        let mut src = |addr: u64| {
+            let at = match frame {
+                None => addr,
+                Some(frame) => frame | (addr & lift::PAGE_MASK),
+            };
+            space.read(at, Width::U8, attrs).ok().map(|v| v as u8)
+        };
         let lifted = lift::lift(
             &self.world,
             pc,
@@ -1329,6 +1730,11 @@ struct CachedHost {
     bus: u64,
     ticks: u64,
     dirty: DirtyPages,
+    /// The address space, kept beside the software TLB because the paged path
+    /// reaches it through an [`Exec`] rather than through the table.
+    space: Arc<AddressSpace>,
+    /// The interpreter's own memory path, present exactly when the case pages.
+    mmu: Option<Mmu>,
 }
 
 /// The world a ring-0 access happens in, with paging off.
@@ -1344,16 +1750,91 @@ impl CachedHost {
         let seed = Host::new(case, Arc::clone(&space));
         CachedHost {
             slots: seed.slots,
-            tlb: Tlb::new(space),
+            tlb: Tlb::new(Arc::clone(&space)),
             attrs: MemAttrs::DEFAULT,
             segs: Segments::flat_data(),
             bus: u64::from(case.variant.bus_clocks()),
             ticks: 0,
             dirty: DirtyPages::new(),
+            space,
+            mmu: seed.mmu,
         }
     }
 
+    /// The entry fetch translation, charged — [`Host::enter`]'s contract, on
+    /// the path where it matters most.
+    ///
+    /// A cached block is served without being lifted again and a chained one
+    /// is reached without a lookup at all, so this is the only thing left that
+    /// still costs what the interpreter's first fetch cost. Skipping it is
+    /// precisely the bug that makes a second run of the same block cheaper
+    /// than its first.
+    fn enter(&mut self, linear: u64) -> MemResult<u64> {
+        let CachedHost {
+            mmu, space, ticks, ..
+        } = self;
+        let Some(mmu) = mmu.as_mut() else {
+            return Ok(linear);
+        };
+        let before = mmu.state.cycles;
+        let user = mmu.state.regs.cs & 3 == 3;
+        let answer = {
+            let mut exec = Exec::new(&mut mmu.state, space, None, &mmu.cfg, &mmu.lines);
+            exec.translate_access(linear, Access::fetch(user))
+        };
+        *ticks += charge_of(&mut mmu.state, before, answer.is_ok());
+        answer.map_err(|_| BusError::Protected)
+    }
+
+    /// One data access through the interpreter's path, with the store logged
+    /// by the **physical** page it reached.
+    ///
+    /// Both ends of the self-modifying-code mechanism are physical here, which
+    /// is what a linear guard could not be: `jit::cache` invalidates by the
+    /// page a translation's bytes came from, and under paging that is not the
+    /// page the store's address names.
+    fn paged_access(&mut self, mem: &MemOp, addr: u64, value: Option<u64>) -> MemResult<u64> {
+        let CachedHost {
+            mmu,
+            space,
+            ticks,
+            dirty,
+            ..
+        } = self;
+        let mmu = mmu.as_mut().expect("only a paged host reaches here");
+        let sr = mem.seg.map_or(seg::DS, |s| s.0);
+        let size = mem.size.bytes() as u8;
+        let before = mmu.state.cycles;
+        let (answer, lin) = {
+            let mut exec = Exec::new(&mut mmu.state, space, None, &mmu.cfg, &mmu.lines);
+            let lin = exec.seg_linear(sr, addr, u64::from(size), value.is_some());
+            let answer = match value {
+                None => exec.read_mem(sr, addr, size),
+                Some(v) => exec.write_mem(sr, addr, size, v).map(|()| 0),
+            };
+            (answer, lin)
+        };
+        *ticks += mmu.state.cycles.wrapping_sub(before);
+        if answer.is_ok()
+            && value.is_some()
+            && let Ok(lin) = lin
+        {
+            // The first and the last byte, because a store that crosses a page
+            // boundary lands in two frames that need not be adjacent — and
+            // `DirtyPages::note` takes a run of bytes in *one* frame.
+            for at in [lin, lin + u64::from(size) - 1] {
+                if let Some(phys) = mmu.phys_of(space, at) {
+                    dirty.note(phys, 1);
+                }
+            }
+        }
+        answer.map_err(|_| BusError::Protected)
+    }
+
     fn access(&mut self, mem: &MemOp, addr: u64, value: Option<u64>) -> MemResult<u64> {
+        if self.mmu.is_some() {
+            return self.paged_access(mem, addr, value);
+        }
         let sr = mem.seg.map_or(seg::DS, |s| s.0);
         let lin = self.segs.linear(sr, addr, mem.size.bytes())?;
         self.ticks += self.bus;
@@ -1617,12 +2098,94 @@ mod tests {
     /// because the subject was told what the oracle was doing.
     #[test]
     fn a_hand_written_world_is_the_one_world_of_finds() {
-        let case = Case::new(vec![0xf4]);
-        let (space, _ram) = machine(&case);
-        let cpu = oracle(&case, space);
-        let found = World::of(&cpu.regs(), &cpu.sys(), &config(&case), cpu.a20_open(), 0)
+        for case in [Case::new(vec![0xf4]), Case::new(vec![0xf4]).paged()] {
+            let (space, _ram) = machine(&case);
+            let cpu = oracle(&case, space);
+            let want = world(&case);
+            let found = World::of(
+                &cpu.regs(),
+                &cpu.sys(),
+                &config(&case),
+                cpu.a20_open(),
+                0,
+                want.origin,
+            )
             .expect("the harness builds a world the frontend lifts");
-        assert_eq!(found, world(&case));
+            assert_eq!(found, want);
+        }
+    }
+
+    /// The physical page [`world`] writes down must be the page the machine's
+    /// own tables resolve the entry to.
+    ///
+    /// The one claim in a paged case that is written by hand rather than
+    /// derived, and the one that would make every paged case pass for the
+    /// wrong reason: a block keyed on a page its bytes did not come from is
+    /// exactly the stale translation the key exists to prevent, and a harness
+    /// that agreed with itself would never notice.
+    #[test]
+    fn a_paged_entry_resolves_to_the_page_the_world_claims() {
+        let case = Case::new(vec![0xf4]).paged();
+        let (space, _ram) = machine(&case);
+        let mmu = Mmu::new(&case);
+        let phys = mmu
+            .phys_of(&space, world(&case).linear(BASE))
+            .expect("the entry page is mapped");
+        assert_eq!(phys & !0xfff, PAGED_PROGRAM);
+        assert_ne!(phys & !0xfff, BASE, "an identity map would test nothing");
+        assert_eq!(world(&case).origin, Origin::Paged { phys });
+    }
+
+    /// The paged world is a world the frontend lifts, and the interpreter
+    /// agrees with it instruction for instruction, flag for flag and tick for
+    /// tick — including the ticks the page-table walks cost and the accessed
+    /// and dirty bits they wrote, which [`memory`] compares along with the
+    /// rest of RAM.
+    #[test]
+    fn a_paged_case_agrees_with_the_interpreter() {
+        // mov eax, [ebx] ; add eax, ecx ; mov [ebx+4], eax ; hlt
+        let program = vec![0x8b, 0x03, 0x01, 0xc8, 0x89, 0x43, 0x04, 0xf4];
+        let case = Case::seeded(program).paged();
+        match compare(&case) {
+            Ok(v) => assert!(matches!(v, Verdict::Agreed { insns: 3, .. }), "{v:?}"),
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// A paged case really does write the accessed and dirty bits, so the
+    /// byte-for-byte memory comparison above is comparing something.
+    ///
+    /// Asserted separately because "both engines left RAM identical" is true
+    /// of a machine where neither engine touched a page table at all, and that
+    /// would be a harness measuring nothing.
+    #[test]
+    fn a_paged_case_writes_the_accessed_and_dirty_bits() {
+        let program = vec![0x8b, 0x03, 0x89, 0x43, 0x04, 0xf4];
+        let case = Case::seeded(program).paged();
+        let (space, ram) = machine(&case);
+        let before = ram
+            .read_u8(PTAB - BASE + 4 * ((BASE >> 12) & 0x3ff))
+            .unwrap();
+        assert_eq!(u64::from(before) & (pte::ACCESSED | pte::DIRTY), 0);
+        let cpu = oracle(&case, space);
+        for _ in 0..3 {
+            cpu.step();
+        }
+        // The code page: fetched, so accessed and not dirty.
+        let code = ram
+            .read_u8(PTAB - BASE + 4 * ((BASE >> 12) & 0x3ff))
+            .unwrap();
+        assert_eq!(u64::from(code) & pte::ACCESSED, pte::ACCESSED);
+        assert_eq!(u64::from(code) & pte::DIRTY, 0);
+        // The data page — the one `EBX` points into — written, so both.
+        let touched = BASE + u64::from(case.start_regs()[3]);
+        let data = ram
+            .read_u8(PTAB - BASE + 4 * ((touched >> 12) & 0x3ff))
+            .unwrap();
+        assert_eq!(
+            u64::from(data) & (pte::ACCESSED | pte::DIRTY),
+            pte::ACCESSED | pte::DIRTY
+        );
     }
 
     #[test]

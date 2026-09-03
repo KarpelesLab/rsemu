@@ -264,13 +264,19 @@ cpu-riscv-lift = ["cpu-riscv", "ir"]
 # a precise side exit — the *within-block* hook `jit::dispatch` records that an
 # x86 frontend would need.
 #
-# The subset is 32-bit protected mode with paging off: the ALU, MOV/MOVZX/
-# MOVSX/LEA, the shifts and rotates, MUL/IMUL, BSF/BSR, SETcc/CMOVcc, the
-# stack, and every near transfer of control. Deliberately **not** here: x87,
-# SSE, long mode, real mode, paging, DIV/IDIV, the string primitives, LOCK,
-# segment loads and the far transfers — each ends the block with a terminator
-# that hands the PC back to the interpreter, which stays the oracle
-# (CLAUDE.md, "CPU cores"). It reads the same declarative rows in `isa.rs`
+# The subset is 32-bit protected mode, with or without paging: the ALU, MOV/
+# MOVZX/MOVSX/LEA, the shifts and rotates, MUL/IMUL, BSF/BSR, SETcc/CMOVcc, the
+# stack, and every near transfer of control. Under paging a block is keyed on
+# the physical address its entry translation resolved to rather than on a CR3
+# generation, which is the same answer the RISC-V engine reached after
+# measuring a generation being unusable on a real guest; the caller owes the
+# entry fetch translation on every execution, and the in-block store guard is
+# refused because it compares linear pages. Deliberately **not** here: x87,
+# SSE, long mode, real mode, paging on a part whose instruction and data
+# translation buffers are one array (a 386 and a 486), DIV/IDIV, the string
+# primitives, LOCK, segment loads and the far transfers — each ends the block
+# with a terminator that hands the PC back to the interpreter, which stays the
+# oracle (CLAUDE.md, "CPU cores"). It reads the same declarative rows in `isa.rs`
 # that decode, execute and the disassembler read, so there is still one
 # description of the instruction set and not a second decoder. Needs `cpu-x86`
 # for the core and `ir` for the block types; `jit` adds the cached and chained
