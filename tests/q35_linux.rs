@@ -8,12 +8,12 @@
 //! socket was, and an NVM Express controller on the bus for the kernel to bind
 //! a driver to.
 //!
-//! Two tests are hermetic and always run — they are about what the board
-//! publishes before anything executes on it. The third is gated on
-//! `RSEMU_KERNEL`, exactly as `pc64_linux` is: point it at a `bzImage` and it
-//! runs one, and without it the test prints why and returns. No kernel is
-//! vendored, downloaded by `cargo test`, or required for it (`CLAUDE.md`,
-//! Testing).
+//! Every test but one is hermetic and always runs — they are about what the
+//! board publishes, and what its interrupt controllers do, before anything
+//! executes on it. The last is gated on `RSEMU_KERNEL`, exactly as
+//! `pc64_linux` is: point it at a `bzImage` and it runs one, and without it the
+//! test prints why and returns. No kernel is vendored, downloaded by
+//! `cargo test`, or required for it (`CLAUDE.md`, Testing).
 //!
 //! ```text
 //! scripts/fetch-testdata.sh initramfs-x86
@@ -22,7 +22,7 @@
 //! RSEMU_INITRD=testdata/x86/initramfs-x86.cpio \
 //! RSEMU_KERNEL_MS=3000000 \
 //! RSEMU_KERNEL_INPUT='rsemu# =>head -c 40 /dev/nvme0n1\n' \
-//! RSEMU_KERNEL_STOP_AT='rsemu q35-linux nvme namespace' \
+//! RSEMU_KERNEL_STOP_AT='LBA 0' \
 //!     cargo test --release --features machine-q35-linux --test q35_linux -- --nocapture
 //! ```
 //!
@@ -58,17 +58,41 @@
 //! [`docs/platforms/q35-linux.md`](../docs/platforms/q35-linux.md) has the
 //! whole ledger, including the two items that were refuted rather than fixed.
 //!
-//! **Where it stops today** is two places, and the doc has both. On the default
-//! line the boot reaches `nvme 0000:00:04.0: enabling device` and then the
-//! worker inside `request_threaded_irq` stops making forward progress — the
-//! sampled `RIP` never moves again. Adding `noapic` — the same board, the same
-//! image, the 8259A pair driving `INTR` through the IMCR — gets through that
-//! and all the way to `Run /init as init process` and a busybox shell, which is
-//! what says the remaining gap is in the I/O APIC path rather than in the
-//! controller or the driver. What that run then finds is the *other* stop:
-//! `nvme nvme0: Identify Descriptors failed (nsid=1, status=0x2)`, the model
-//! refusing `Identify` with `CNS = 03h`, so no namespace is published and
-//! `/dev/nvme0n1` does not exist. That one is `src/dev/nvme`.
+//! **It does not stop any more.** On that line, with the I/O APIC in use, a
+//! stock Gentoo 6.6.67 kernel now reaches userspace and reads off the disk:
+//!
+//! ```text
+//! Run /init as init process
+//!
+//! rsemu initramfs on Linux 6.6.67-gentoo-x86_64 x86_64
+//! rsemu# head -c 40 /dev/nvme0n1
+//! rsemu q35-linux nvme namespace, LBA 0
+//! ```
+//!
+//! What had stopped it was **one bit in a redirection entry**, and `noapic`
+//! being the control is what located it. The kernel programs a PCI interrupt
+//! level-triggered and **active low** — PCI Local Bus 3.0 §2.2.6 — and the I/O
+//! APIC was exclusive-oring that polarity bit into the level its input net
+//! resolved to. A `core::wire` net carries an *assertion*, not a voltage
+//! (`ROADMAP.md` §4.3: a fresh fan-in holds every source low and an undriven
+//! wire sits low), so the idle line read as asserted the instant
+//! `irq_startup()` unmasked the entry, and a level-triggered entry re-arms on
+//! every end-of-interrupt: the processor took the vector, ended it, took it
+//! again, and never retired the instruction after the `sti` that let it in.
+//! The 8259A has no polarity bit, which is exactly why `noapic` booted.
+//!
+//! `report_apics` below is where that was read off the machine — the entry the
+//! guest had written, and the local APIC's request register beside it:
+//!
+//! ```text
+//! q35-linux:   irq11 01000000_0000e822 vector=0x22 level low  open remote-irr
+//! q35-linux:   irr=..._00000004_00000000     isr=all zero
+//! ```
+//!
+//! `the_entry_a_kernel_writes_for_this_boards_disk_is_quiet_while_the_disk_is`
+//! asks the same question of the shipped board in milliseconds, and
+//! [`tests/pc_apic.rs`](pc_apic.rs) drives the whole level-triggered lifecycle
+//! through real guest instructions.
 //!
 //! | Variable | What it does |
 //! | --- | --- |
@@ -645,6 +669,152 @@ fn report_nvme(m: &Machine) {
     );
 }
 
+/// The redirection entry a kernel writes for this board's disk, on this board,
+/// with the disk quiet — and the local APIC that must therefore stay quiet too.
+///
+/// This is the boot below asked in a few milliseconds instead of sixteen
+/// minutes. The value written is the one the guest itself wrote, read back out
+/// of the part after a run that stopped inside `request_threaded_irq`:
+///
+/// ```text
+/// q35-linux:   irq11 01000000_0000e822 vector=0x22 level low  open remote-irr
+/// q35-linux:   irr=...  bit 0x22 set,  isr=0
+/// ```
+///
+/// Bit 15 is the trigger mode and bit 13 the input pin polarity — level, active
+/// low — because PCI Local Bus 3.0 §2.2.6 defines `INTA#`-`INTD#` that way and
+/// an operating system handed a global system interrupt by `_PRT` with no
+/// override programs every PCI interrupt so. The board's own `pirq-routes` put
+/// device 4's `INTA#` on IRQ11, and nothing else on the board drives that net
+/// while the controller is idle.
+///
+/// So after this write the local APIC must have nothing requested. An I/O APIC
+/// that exclusive-ored the polarity bit into the net level instead found the
+/// idle line asserted, latched remote IRR, and interrupted — and then again
+/// after every end-of-interrupt, which is a processor that never retires
+/// another instruction. `tests/pc_apic.rs` drives the whole lifecycle through
+/// real guest instructions; this one pins the number to *this* board's input.
+#[test]
+fn the_entry_a_kernel_writes_for_this_boards_disk_is_quiet_while_the_disk_is() {
+    /// The I/O APIC's register window, and the local APIC's page.
+    const IOAPIC: u64 = 0xfec0_0000;
+    const LAPIC: u64 = 0xfee0_0000;
+    /// Which input the board's `pirq-routes` put device 4's `INTA#` on.
+    const LINE: u64 = 11;
+    /// The vector the 6.6 kernel gave it, measured.
+    const VECTOR: u32 = 0x22;
+
+    let machine = bare_board();
+    let mem = machine.space("mem").expect("the board declares `mem`");
+    let poke = |at: u64, value: u32| {
+        mem.write(at, Width::U32, u64::from(value), MemAttrs::DEFAULT)
+            .unwrap_or_else(|e| panic!("write of {at:#x} faulted: {e:?}"));
+    };
+    let indirect = |index: u32| {
+        poke(IOAPIC, index);
+        read32(mem, IOAPIC + 0x10)
+    };
+
+    // The high half first — physical destination, APIC 0 — then the low half,
+    // which is the write that unmasks. That is the order a driver uses and the
+    // order the entry is never briefly live in.
+    poke(IOAPIC, 0x10 + 2 * LINE as u32 + 1);
+    poke(IOAPIC + 0x10, 0);
+    poke(IOAPIC, 0x10 + 2 * LINE as u32);
+    poke(IOAPIC + 0x10, (1 << 15) | (1 << 13) | VECTOR);
+
+    let irr = read32(mem, LAPIC + 0x200 + 0x10 * u64::from(VECTOR >> 5));
+    assert_eq!(
+        irr & (1 << (VECTOR & 31)),
+        0,
+        "unmasking the disk's redirection entry interrupted the processor \
+         with the controller idle: nothing is driving I/O APIC input {LINE} \
+         (local APIC IRR {irr:#010x})"
+    );
+    let entry = indirect(0x10 + 2 * LINE as u32);
+    assert_eq!(entry & (1 << 14), 0, "and the entry latched no remote IRR");
+    assert_eq!(
+        entry & (1 << 13),
+        1 << 13,
+        "while the polarity bit the guest wrote still reads back"
+    );
+}
+
+/// Where the guest left the two APICs, printed after a run.
+///
+/// The redirection table is the board's own record of what the kernel asked
+/// the I/O APIC for — vector, trigger mode, polarity, mask and remote IRR —
+/// and the local APIC's request, in-service and trigger-mode registers say
+/// what became of it. Both are read with `MemAttrs::DEBUG` except the I/O
+/// APIC's index register, which is half of a two-step protocol and has to be
+/// moved to reach the window at all; it is put back afterwards, so a guest
+/// caught mid-sequence sees nothing.
+fn report_apics(m: &Machine) {
+    /// The I/O APIC's register window and the local APIC's page, where this
+    /// board's machine file maps them.
+    const IOAPIC: u64 = 0xfec0_0000;
+    const LAPIC: u64 = 0xfee0_0000;
+
+    let mem = m.space("mem").expect("the board declares `mem`");
+    let debug = |at: u64| {
+        mem.read(at, Width::U32, MemAttrs::DEBUG)
+            .map_or(0xffff_ffffu32, |v| v as u32)
+    };
+    let select = |index: u32| {
+        mem.write(IOAPIC, Width::U32, u64::from(index), MemAttrs::DEFAULT)
+            .expect("the index register is a dword");
+    };
+    let saved = debug(IOAPIC);
+    select(1);
+    let version = debug(IOAPIC + 0x10);
+    let entries = ((version >> 16) & 0xff) + 1;
+    println!("q35-linux: ioapic version={version:#010x}");
+    for line in 0..entries {
+        select(0x10 + 2 * line);
+        let low = debug(IOAPIC + 0x10);
+        select(0x10 + 2 * line + 1);
+        let high = debug(IOAPIC + 0x10);
+        if low == 0x0001_0000 && high == 0 {
+            continue;
+        }
+        println!(
+            "q35-linux:   irq{line:<2} {high:08x}_{low:08x} vector={:#04x} {} {} {}{}",
+            low & 0xff,
+            if low & (1 << 15) != 0 {
+                "level"
+            } else {
+                "edge "
+            },
+            if low & (1 << 13) != 0 { "low " } else { "high" },
+            if low & (1 << 16) != 0 {
+                "masked"
+            } else {
+                "open"
+            },
+            if low & (1 << 14) != 0 {
+                " remote-irr"
+            } else {
+                ""
+            },
+        );
+    }
+    select(saved);
+    println!(
+        "q35-linux: lapic id={:#010x} svr={:#010x} tpr={:#010x} ppr={:#010x}",
+        debug(LAPIC + 0x20),
+        debug(LAPIC + 0xf0),
+        debug(LAPIC + 0x80),
+        debug(LAPIC + 0xa0)
+    );
+    for (name, base) in [("isr", 0x100u64), ("tmr", 0x180), ("irr", 0x200)] {
+        let words: Vec<String> = (0..8)
+            .rev()
+            .map(|i| format!("{:08x}", debug(LAPIC + base + 0x10 * i)))
+            .collect();
+        println!("q35-linux:   {name}={}", words.join("_"));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // and the kernel
 // ---------------------------------------------------------------------------
@@ -704,5 +874,6 @@ fn a_linux_kernel_boots_and_finds_the_disk_on_the_q35_linux_board() {
     );
     x86boot::report("q35-linux", &m, &cpu, &run, &script);
     report_nvme(&m);
+    report_apics(&m);
     x86boot::assert_booted(&run, &script);
 }

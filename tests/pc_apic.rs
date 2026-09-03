@@ -137,6 +137,16 @@ const HPET_INPUT: u8 = 20;
 /// 1000 of them is 100 microseconds.
 const HPET_DELAY: u32 = 1_000;
 
+/// How many HPET ticks pass before the *active-low* level test's comparator
+/// matches: 30 000 of them at 100 ns is three milliseconds.
+///
+/// Thirty times [`HPET_DELAY`], and the length is the point. That test asserts
+/// what happens *before* the device asserts, so it needs a window that is
+/// unambiguously after the firmware has unmasked the entry and set `IF` — a
+/// hundred microseconds is not, because the protected-mode setup ahead of it
+/// costs more than that.
+const HPET_LEVEL_LOW_DELAY: u32 = 30_000;
+
 /// The period of the *edge-triggered* comparator, in HPET ticks: 50 000 of them
 /// at 100 ns is five milliseconds, the same interval [`TIMER_PERIOD`] gives the
 /// local APIC timer, so the two periodic sources below count the same thing.
@@ -160,6 +170,19 @@ fn store_at(out: &mut Vec<u8>, disp: u32, value: u32) {
 enum Source {
     /// An HPET comparator, level-triggered, routed through the I/O APIC.
     Hpet,
+    /// The same comparator and the same level-triggered entry, with the entry's
+    /// **input pin polarity** bit set — active low, which is how PCI Local Bus
+    /// 3.0 §2.2.6 defines `INTA#`-`INTD#` and therefore how an operating system
+    /// programs the redirection entry for every PCI interrupt it is given.
+    ///
+    /// A `core::wire` net carries an assertion rather than a voltage
+    /// (`ROADMAP.md` §4.3: an undriven wire sits low), so this must behave
+    /// exactly as [`Source::Hpet`] does — nothing until the comparator matches,
+    /// one interrupt when it does. An I/O APIC that exclusive-ored the bit into
+    /// the pin level would instead find the idle line asserted the moment the
+    /// entry was unmasked, and a level-triggered entry re-arms on every
+    /// end-of-interrupt.
+    HpetLevelLow,
     /// A *periodic* HPET comparator in edge-triggered mode, routed through an
     /// I/O APIC redirection entry that is also edge-triggered — the other
     /// trigger mode, and the one a PC's 8254 arrives on.
@@ -248,7 +271,7 @@ fn firmware(source: Source) -> Vec<u8> {
     // IDT_BASE + 8 * vector. RAM comes out of a cold reset zeroed, so every
     // other entry is a not-present gate already.
     let vector = match source {
-        Source::Hpet | Source::HpetEdge | Source::Pit => VECTOR,
+        Source::Hpet | Source::HpetLevelLow | Source::HpetEdge | Source::Pit => VECTOR,
         Source::ApicTimer | Source::ApicTimerPeriodic | Source::Smp => TIMER_VECTOR,
     };
     pm.push(0xbf); // mov edi, gate
@@ -264,7 +287,10 @@ fn firmware(source: Source) -> Vec<u8> {
     pm.extend_from_slice(&[0x0f, 0x01, 0x1d]); // lidt [idt_ptr]
     dw(&mut pm, lin(OFF_IDT_PTR));
 
-    if matches!(source, Source::Hpet | Source::HpetEdge | Source::Pit) {
+    if matches!(
+        source,
+        Source::Hpet | Source::HpetLevelLow | Source::HpetEdge | Source::Pit
+    ) {
         // The I/O APIC. Two indirect writes per half: the index register, then
         // the data window. The high half first, so the entry is never briefly
         // unmasked with a destination nobody has written.
@@ -279,9 +305,14 @@ fn firmware(source: Source) -> Vec<u8> {
         store_at(&mut pm, 0x00, index + 1);
         store_at(&mut pm, 0x10, 0); // destination: APIC ID 0, physical
         store_at(&mut pm, 0x00, index);
-        // Vector, unmasked, fixed delivery to APIC 0, and the trigger mode this
-        // source asks for: bit 15 set is level, clear is edge (82093AA §3.2.4).
-        let trigger = if source == Source::Hpet { 1 << 15 } else { 0 };
+        // Vector, unmasked, fixed delivery to APIC 0, and the trigger mode and
+        // polarity this source asks for: bit 15 set is level and clear is
+        // edge, bit 13 set is active low (82093AA §3.2.4).
+        let trigger = match source {
+            Source::Hpet => 1 << 15,
+            Source::HpetLevelLow => (1 << 15) | (1 << 13),
+            _ => 0,
+        };
         store_at(&mut pm, 0x10, trigger | u32::from(VECTOR));
     }
 
@@ -352,14 +383,18 @@ fn firmware(source: Source) -> Vec<u8> {
             store_at(&mut pm, 0x300, 0x0000_8500);
             store_at(&mut pm, 0x300, 0x0000_0600 | u32::from(AP_PAGE));
         }
-        Source::Hpet => {
-            // Comparator 0 level-triggered and enabled, matching 1000 ticks
-            // from now, and then the main counter started.
+        Source::Hpet | Source::HpetLevelLow => {
+            // Comparator 0 level-triggered and enabled, matching a fixed number
+            // of ticks from now, and then the main counter started.
+            let delay = match source {
+                Source::HpetLevelLow => HPET_LEVEL_LOW_DELAY,
+                _ => HPET_DELAY,
+            };
             pm.push(0xbf); // mov edi, 0xfed00000
             dw(&mut pm, 0xfed0_0000);
             store_at(&mut pm, 0x100, 0b110); // Tn_INT_ENB_CNF | Tn_INT_TYPE_CNF
             store_at(&mut pm, 0x104, 0);
-            store_at(&mut pm, 0x108, HPET_DELAY);
+            store_at(&mut pm, 0x108, delay);
             store_at(&mut pm, 0x10c, 0);
             store_at(&mut pm, 0x010, 1); // ENABLE_CNF
             store_at(&mut pm, 0x014, 0);
@@ -414,7 +449,7 @@ fn firmware(source: Source) -> Vec<u8> {
     // never interrupt again; if the remote IRR were not held in the first
     // place, this handler would be re-entered before it finished.
     let mut handler: Vec<u8> = Vec::new();
-    if source == Source::Hpet {
+    if matches!(source, Source::Hpet | Source::HpetLevelLow) {
         handler.extend_from_slice(&[0xc7, 0x05]); // mov dword [0xfed00020], 1
         dw(&mut handler, 0xfed0_0020);
         dw(&mut handler, 1);
@@ -532,6 +567,72 @@ fn a_guest_driver_programs_the_io_apic_takes_the_interrupt_and_ends_it() {
         )
         .expect("the in-service register");
     assert_eq!(isr, 0);
+}
+
+/// A level-triggered entry programmed **active low** interrupts nobody until
+/// its device asserts — and then exactly once.
+///
+/// This is the whole `q35-linux` defect, asked of real x86 instructions on a
+/// board whose wiring is written down beside them.
+///
+/// PCI Local Bus 3.0 §2.2.6 makes `INTA#`-`INTD#` level-sensitive and active
+/// low, so an operating system programs bit 13 of the redirection entry for
+/// *every* PCI interrupt it is handed, and it does it inside `irq_startup()`
+/// with interrupts disabled — the entry is unmasked and the flags are restored
+/// a few instructions later. A `core::wire` net carries an assertion rather
+/// than a voltage (`ROADMAP.md` §4.3: a fresh fan-in holds every source low and
+/// an undriven wire sits low), so an I/O APIC that exclusive-ored bit 13 into
+/// the pin level found that idle line *asserted* the instant the entry was
+/// unmasked. For a level-triggered entry that is not one spurious interrupt: it
+/// latches remote IRR, the processor takes the vector, the end-of-interrupt
+/// clears remote IRR, the condition is still true by inspection, and it sends
+/// again (82093AA §3.2.4). The processor never retires the instruction it was
+/// about to.
+///
+/// Both halves are asserted, and the first is the one that fails against the
+/// old code: **zero** interrupts before the comparator matches, where a storm
+/// would have counted thousands, and **one** after it.
+#[test]
+fn a_level_entry_programmed_active_low_waits_for_its_device() {
+    // A millisecond is well past the firmware's `sti` and well short of the
+    // three the comparator needs, so this window is entirely "unmasked, and
+    // the device has not asserted".
+    assert_eq!(
+        interrupts_in(Source::HpetLevelLow, 1_000_000),
+        0,
+        "an unmasked level-triggered entry over an idle net interrupted the \
+         processor: the polarity bit is being applied to the net level, and a \
+         guest that unmasks a PCI interrupt never executes another instruction"
+    );
+    assert_eq!(
+        interrupts_in(Source::HpetLevelLow, 5_000_000),
+        1,
+        "and when the comparator does match, exactly one interrupt — the same \
+         answer the active-high entry gives, which is the point"
+    );
+
+    // The entry the guest wrote is still the entry it wrote: the polarity bit
+    // is recorded and reported, it is only not applied.
+    let mut m = board(Source::HpetLevelLow);
+    m.reset(ResetKind::Cold);
+    m.sweep();
+    m.run_for(GlobalTime::from_nanos(5_000_000))
+        .expect("the machine runs");
+    let mem = m.space("mem").expect("the memory space");
+    let index = 0x10 + 2 * u32::from(HPET_INPUT);
+    mem.write(0xfec0_0000, Width::U32, u64::from(index), MemAttrs::DEFAULT)
+        .expect("the index register");
+    let entry = mem
+        .read(0xfec0_0010, Width::U32, MemAttrs::DEFAULT)
+        .expect("the data window") as u32;
+    assert_eq!(entry & (1 << 13), 1 << 13, "the polarity bit reads back");
+    assert_eq!(entry & (1 << 15), 1 << 15, "level-triggered");
+    assert_eq!(entry & (1 << 16), 0, "still unmasked");
+    assert_eq!(
+        entry & (1 << 14),
+        0,
+        "and remote IRR is clear: the device let go and the guest ended it"
+    );
 }
 
 #[test]

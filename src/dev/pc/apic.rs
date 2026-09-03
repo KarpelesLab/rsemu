@@ -496,8 +496,15 @@ const LVT_MASK: u32 = 1 << 16;
 const LVT_LEVEL: u32 = 1 << 15;
 /// The remote IRR bit of a LINT entry (bit 14), read-only.
 const LVT_REMOTE_IRR: u32 = 1 << 14;
-/// The input pin polarity bit of a LINT entry (bit 13): set is active low.
-const LVT_ACTIVE_LOW: u32 = 1 << 13;
+// Bit 13, beside those two, is a LINT entry's input pin polarity, and it has no
+// constant because nothing applies it: a `core::wire` net carries an assertion
+// rather than a voltage, so exclusive-oring the bit into the pin level would
+// make an idle LINT pin read as asserted — and an idle LINT0 in `ExtINT` mode
+// that reads as asserted is a processor asking an 8259A for a vector it has not
+// got, for ever. `ioapic::ENTRY_ACTIVE_LOW` has the long form; `set_lint` below
+// is where this one would have been applied. The bit is still writable and
+// still reads back.
+
 /// The delivery status bit (bit 12), read-only and always idle here.
 const LVT_DELIVERY_STATUS: u32 = 1 << 12;
 /// The timer mode field of the timer entry (bits 17-18).
@@ -611,8 +618,8 @@ struct State {
     /// `IA32_APIC_BASE`. State without a writer in this build — see the module
     /// documentation — but it is architectural state and it snapshots.
     apic_base: u64,
-    /// What each of the two local interrupt pins is doing, as a raw pin level
-    /// before the entry's polarity bit is applied.
+    /// What each of the two local interrupt pins is doing, as its net resolved
+    /// it.
     lint_level: [bool; 2],
     /// Whether an `ExtINT` request is outstanding on LINT0.
     extint: bool,
@@ -1197,9 +1204,11 @@ impl Registers {
                     pending.nmi = high && !was;
                 }
             } else {
-                // The polarity bit says what an asserted pin looks like.
-                let asserted = high != (state.lvt[entry] & LVT_ACTIVE_LOW != 0);
-                let was_asserted = was != (state.lvt[entry] & LVT_ACTIVE_LOW != 0);
+                // The net's own level is the assertion. The entry's polarity
+                // bit (13) is not applied to it — see the note beside the LVT
+                // bit constants above.
+                let asserted = high;
+                let was_asserted = was;
                 let level = state.lvt[entry] & LVT_LEVEL != 0;
                 let edge = asserted && !was_asserted;
                 match state.lvt_delivery(entry) {
