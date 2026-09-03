@@ -1460,7 +1460,11 @@ machine-pc64 = ["cpu-x86", "dev-pc", "dev-uart-ns16550", "dev-linuxboot"]
 # replacement. Written from the chip data sheets, Ralf Brown's Interrupt List
 # and the Intel SDM; no firmware source was consulted. Brings `src/fw/asm16`,
 # a 16-bit x86 assembler in Rust, with it — there is no external assembler and
-# no build script. Adds no dependencies and is `no_std + alloc`.
+# no build script. It also publishes the tables an operating system enumerates
+# the board through — an MP 1.4 floating pointer and configuration table, an
+# ACPI RSDP/RSDT/XSDT/FADT/MADT/DSDT set, and SMBIOS — generated from the
+# machine description rather than written down, so a board with two processors
+# publishes two. Adds no dependencies and is `no_std + alloc`.
 fw-pcbios = []
 
 # The Motorola MC68000 core (src/cpu/m68k): an interpreter that models the

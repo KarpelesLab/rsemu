@@ -39,28 +39,29 @@
 //! firmware consequence, and this test is the evidence for taking it, not the
 //! taking of it.
 //!
-//! # What it does *not* buy, and this is the honest half
+//! # And the guest **finds** the second processor rather than assuming it
 //!
-//! **An operating system still will not find the second processor.**
-//! Enumeration is firmware's job — an MP specification floating pointer and
-//! configuration table in the `0xf0000` segment, or an ACPI RSDP and MADT —
-//! and [`rsemu::fw::pcbios`] writes neither. `src/dev/q35/acpi.rs` builds a
-//! MADT from a realized machine, so the table generator exists; what does not
-//! exist is a legacy BIOS that publishes one. So this test's guest starts the
-//! application processor **the way firmware would**, out of a boot sector it
-//! wrote itself, and what it proves is that *the board and the hypervisor are
-//! ready for the firmware that publishes the table* — not that FreeDOS, or
-//! anything else, would use it.
+//! This test used to say that an operating system could not find `cpu1`,
+//! because [`rsemu::fw::pcbios`] published no MP floating pointer and no MADT.
+//! It does now, generated from the machine description — including from the
+//! patched description below, which is what makes the second processor
+//! discoverable rather than merely present. So the boot sector no longer
+//! *knows* the application processor's local APIC ID: in protected mode it
+//! searches the BIOS segment for `_MP_` on 16-byte boundaries, follows the
+//! physical pointer to the `PCMP` configuration table, steps through its
+//! entries, and takes the local APIC ID of the first processor entry whose
+//! `BP` flag is clear (*MultiProcessor Specification* §4.1 and §4.3.1). That
+//! ID is what the Start-Up below is addressed to, and it is left at
+//! [`AP_ID_MARKER`] so a failure to find one is distinguishable from a failure
+//! to start one.
 //!
-//! Concretely, the three remaining pieces, in the order they would land:
+//! `tests/pc_at_tables.rs` is the same walk on the interpreter, on both a
+//! one-processor and a two-processor board; what this file adds is that the
+//! processor the table named then executes.
 //!
-//! 1. the six machine-file lines above, in `machines/pc-at.machine` (or a
-//!    `pc-at-smp.machine` beside it, if a one-processor AT is worth keeping);
-//! 2. an MP specification §4 floating pointer and configuration table in
-//!    `src/fw/pcbios`, listing the processors, the bus, the I/O APIC and the
-//!    interrupt assignments — the *only* new firmware code, and it is a table
-//!    rather than an algorithm;
-//! 3. nothing in `src/accel/`.
+//! The one piece still outstanding is the machine file: a second processor on
+//! the shipped board is a board decision, and this test patches the text
+//! rather than taking it.
 //!
 //! # Why the guest's spins are all `hlt`
 //!
@@ -176,6 +177,11 @@ const OFF_PM: u16 = 0x0090;
 const AP_TRAMPOLINE: u32 = 0x8000;
 const AP_PAGE: u8 = 0x08;
 
+/// Where the boot sector leaves the local APIC ID it read out of the MP
+/// configuration table. `0xff` means it found no application processor entry,
+/// which is a different failure from finding one that never started.
+const AP_ID_MARKER: u32 = 0x0508;
+
 /// Where each processor says it is alive, and what it says. Both in the block
 /// at 0x0500 that every PC has left free since 1981.
 const BSP_MARKER: u32 = 0x0500;
@@ -203,6 +209,118 @@ fn store_abs(out: &mut Vec<u8>, at: u32, value: u32) {
     out.extend_from_slice(&[0xc7, 0x05]);
     dw(out, at);
     dw(out, value);
+}
+
+/// A hand-assembled 32-bit fragment whose short jumps are patched afterwards.
+///
+/// The rest of this sector is written as literal opcode bytes, which is fine
+/// for straight-line code and unmaintainable for a loop: the walk below has six
+/// jumps and every one of their displacements would change whenever an
+/// instruction above it did. Labels are numbered rather than named because
+/// there are seven of them and this is a test.
+#[derive(Default)]
+struct Frag {
+    out: Vec<u8>,
+    marks: [Option<usize>; 8],
+    fixups: Vec<(usize, usize)>,
+}
+
+impl Frag {
+    /// Append literal opcode bytes.
+    fn emit(&mut self, bytes: &[u8]) -> &mut Frag {
+        self.out.extend_from_slice(bytes);
+        self
+    }
+
+    /// Bind label `id` here.
+    fn mark(&mut self, id: usize) -> &mut Frag {
+        assert!(self.marks[id].is_none(), "label {id} was bound twice");
+        self.marks[id] = Some(self.out.len());
+        self
+    }
+
+    /// A jump whose opcode is `opcode` and whose `rel8` names label `id`.
+    fn jump(&mut self, opcode: &[u8], id: usize) -> &mut Frag {
+        self.out.extend_from_slice(opcode);
+        self.fixups.push((self.out.len(), id));
+        self.out.push(0);
+        self
+    }
+
+    /// The bytes, with every displacement filled in.
+    fn finish(mut self) -> Vec<u8> {
+        for (at, id) in &self.fixups {
+            let target = self.marks[*id].expect("a jump to an unbound label");
+            // A `rel8` is measured from the end of the instruction, which is
+            // the byte after the displacement (*Intel SDM* Vol 2A, `Jcc`).
+            let rel = target as isize - (*at as isize + 1);
+            self.out[*at] = i8::try_from(rel).expect("a short jump") as u8;
+        }
+        self.out
+    }
+}
+
+/// Find the application processor's local APIC ID in the MP configuration
+/// table, leave it at [`AP_ID_MARKER`], and answer with it shifted into the
+/// interrupt command register's destination field in `EBX`.
+///
+/// *MultiProcessor Specification* §4.1: the floating pointer "must span a
+/// minimum of 16 contiguous bytes, beginning on a 16-byte boundary", and may be
+/// "in the BIOS ROM address space between 0F0000h and 0FFFFFh" — which is where
+/// [`rsemu::fw::pcbios`] puts it. §4.3: entries are stepped through until
+/// `ENTRY COUNT` is reached, twenty bytes for a processor entry and eight for
+/// every other type. §4.3.1: `CPU FLAGS` bit 1 is `BP`, set on the bootstrap
+/// processor.
+fn find_application_processor() -> Vec<u8> {
+    const SCAN: usize = 0;
+    const FOUND: usize = 1;
+    const WALK: usize = 2;
+    const OTHER: usize = 3;
+    const STEP: usize = 4;
+    const GOT: usize = 5;
+    const HAVE: usize = 6;
+
+    let mut f = Frag::default();
+    // mov esi, 0xf0000
+    f.emit(&[0xbe, 0x00, 0x00, 0x0f, 0x00]);
+    f.mark(SCAN);
+    // cmp dword [esi], "_MP_"
+    f.emit(&[0x81, 0x3e, 0x5f, 0x4d, 0x50, 0x5f]);
+    f.jump(&[0x74], FOUND); // je found
+    f.emit(&[0x83, 0xc6, 0x10]); // add esi, 16
+    f.emit(&[0x81, 0xfe, 0x00, 0x00, 0x10, 0x00]); // cmp esi, 0x100000
+    f.jump(&[0x72], SCAN); // jb scan
+    f.emit(&[0xb8, 0xff, 0x00, 0x00, 0x00]); // mov eax, 0xff
+    f.jump(&[0xeb], HAVE);
+
+    f.mark(FOUND);
+    f.emit(&[0x8b, 0x76, 0x04]); // mov esi, [esi+4]
+    f.emit(&[0x0f, 0xb7, 0x4e, 0x22]); // movzx ecx, word [esi+34]
+    f.emit(&[0x83, 0xc6, 0x2c]); // add esi, 44
+    f.mark(WALK);
+    f.emit(&[0x80, 0x3e, 0x00]); // cmp byte [esi], 0
+    f.jump(&[0x75], OTHER); // jne other
+    f.emit(&[0xf6, 0x46, 0x03, 0x02]); // test byte [esi+3], 2
+    f.jump(&[0x74], GOT); // jz got -- not the bootstrap processor
+    f.emit(&[0x83, 0xc6, 0x14]); // add esi, 20
+    f.jump(&[0xeb], STEP);
+    f.mark(OTHER);
+    f.emit(&[0x83, 0xc6, 0x08]); // add esi, 8
+    f.mark(STEP);
+    f.emit(&[0x49]); // dec ecx
+    f.jump(&[0x75], WALK); // jnz walk
+    f.emit(&[0xb8, 0xff, 0x00, 0x00, 0x00]); // mov eax, 0xff
+    f.jump(&[0xeb], HAVE);
+
+    f.mark(GOT);
+    f.emit(&[0x0f, 0xb6, 0x46, 0x01]); // movzx eax, byte [esi+1]
+    f.mark(HAVE);
+    f.emit(&[0xa3]); // mov [AP_ID_MARKER], eax
+    let mut out = f.finish();
+    dw(&mut out, AP_ID_MARKER);
+    out.extend_from_slice(&[0xc1, 0xe0, 0x18]); // shl eax, 24
+    out.extend_from_slice(&[0x89, 0xc3]); // mov ebx, eax
+    out
 }
 
 /// The application processor's real-mode trampoline, which the *guest* writes
@@ -304,6 +422,11 @@ fn bootable_diskette() -> Vec<u8> {
         );
     }
 
+    // Who to start, out of the firmware's own MP configuration table rather
+    // than out of this file. Leaves the destination half of the interrupt
+    // command register's value in `EBX`.
+    pm.extend_from_slice(&find_application_processor());
+
     // Software-enable this processor's local APIC, with 0xff as the spurious
     // vector: nothing it delivers — including an IPI it sends — is reliable
     // until this is written (*Intel SDM* Vol 3A §10.4.7.2).
@@ -313,7 +436,10 @@ fn bootable_diskette() -> Vec<u8> {
 
     // The *MultiProcessor Specification* §B.4 sequence: the destination half,
     // `INIT` assert, `INIT` de-assert, Start-Up carrying the page.
-    store_at(&mut pm, 0x310, 1 << 24);
+    //
+    // mov [edi+0x310], ebx — the destination the table named.
+    pm.extend_from_slice(&[0x89, 0x9f]);
+    dw(&mut pm, 0x310);
     store_at(&mut pm, 0x300, 0x0000_c500);
     store_at(&mut pm, 0x300, 0x0000_8500);
     store_at(&mut pm, 0x300, 0x0000_0600 | u32::from(AP_PAGE));
@@ -338,13 +464,20 @@ fn bootable_diskette() -> Vec<u8> {
 // the board
 // ---------------------------------------------------------------------------
 
-/// The build options: rsemu's own firmware and that diskette.
-fn options() -> BuildOptions {
+/// The build options: rsemu's own firmware, assembled **for this board**, and
+/// that diskette.
+///
+/// `image_for_machine` rather than `image`: the firmware's MP configuration
+/// table describes the machine the text names, so a board with a second
+/// processor in it gets a table with two processor entries — which is what the
+/// boot sector above then reads.
+fn options(text: &str) -> BuildOptions {
     let mut options = rsemu::machine::catalog::build_options().expect("this build's classes");
-    options
-        .realize
-        .media
-        .insert("bios", rsemu::fw::pcbios::image());
+    options.realize.media.insert(
+        "bios",
+        rsemu::fw::pcbios::image_for_machine("pc-at-smp.machine", text)
+            .expect("the two-processor board resolves"),
+    );
     options.realize.media.insert("vgabios", Vec::new());
     options.realize.media.insert("optionrom", vec![0u8; 65536]);
     options.realize.media.insert("floppy", bootable_diskette());
@@ -388,7 +521,7 @@ fn the_at_boots_its_own_firmware_and_starts_a_second_processor_in_hardware() {
     };
 
     let text = two_processor_at();
-    let mut opts = options();
+    let mut opts = options(&text);
     opts.realize.scheduler.mode = ThreadingMode::Parallel;
     accel.install(&mut opts.bindings);
     let registry = rsemu::machine::catalog::registry().expect("this build's registry");
@@ -439,6 +572,15 @@ fn the_at_boots_its_own_firmware_and_starts_a_second_processor_in_hardware() {
         "the boot sector never reached protected mode"
     );
 
+    // The guest found the application processor in the firmware's table rather
+    // than being told which one it was.
+    assert_eq!(
+        peek32(&m, u64::from(AP_ID_MARKER)),
+        1,
+        "the boot sector did not find an application processor entry in the MP \
+         configuration table"
+    );
+
     // And the second processor executed guest instructions in hardware.
     assert_eq!(
         peek32(&m, u64::from(AP_MARKER)) & 0xffff,
@@ -460,7 +602,7 @@ fn the_at_boots_its_own_firmware_and_starts_a_second_processor_in_hardware() {
 fn the_same_two_processor_at_boots_on_the_interpreter() {
     let text = two_processor_at();
     let registry = rsemu::machine::catalog::registry().expect("this build's registry");
-    let mut m = build("pc-at-smp.machine", &text, &registry, &options())
+    let mut m = build("pc-at-smp.machine", &text, &registry, &options(&text))
         .unwrap_or_else(|e| panic!("the two-processor AT does not realize: {e}"));
     m.reset(ResetKind::Cold);
     m.sweep();

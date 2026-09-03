@@ -936,7 +936,7 @@ fn build(config: &Config) -> crate::Result<Machine> {
             if config.media.iter().any(|(bound, _)| bound == slot) {
                 continue;
             }
-            if let Some(image) = builtin_media(entry.name, slot) {
+            if let Some(image) = builtin_media(entry.name, slot, name, source) {
                 options.realize.media.insert(*slot, image.as_slice());
             }
         }
@@ -952,16 +952,23 @@ fn build(config: &Config) -> crate::Result<Machine> {
 /// Mirrors the CLI's `builtin_bios`/`builtin_rom`, and for the same reason: a
 /// machine that demonstrates itself with no file from the user is the
 /// difference between an emulator someone can try and one they cannot.
-fn builtin_media(machine: &str, slot: &str) -> Option<Vec<u8>> {
+///
+/// `file` and `text` are the description being built: rsemu's own BIOS
+/// publishes MP and ACPI tables describing the board it is put in, so it is
+/// assembled from the same text the machine is.
+fn builtin_media(machine: &str, slot: &str, file: &str, text: &str) -> Option<Vec<u8>> {
     match (machine, slot) {
         #[cfg(all(feature = "fw-pcbios", feature = "machine-pc-at"))]
-        ("pc-at", "bios") => Some(crate::fw::pcbios::image()),
+        ("pc-at", "bios") => Some(
+            crate::fw::pcbios::image_for_machine(file, text)
+                .unwrap_or_else(|_| crate::fw::pcbios::image()),
+        ),
         #[cfg(feature = "dev-apple1")]
         ("apple1", "rom") => Some(crate::dev::apple1::RSMON.to_vec()),
         #[cfg(feature = "dev-wdc")]
         ("beneater-6502", "rom") => Some(crate::dev::wdc::RSMON_IMAGE.to_vec()),
         _ => {
-            let _ = (machine, slot);
+            let _ = (machine, slot, file, text);
             None
         }
     }

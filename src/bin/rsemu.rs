@@ -379,18 +379,14 @@ fn run(args: &[String]) -> ExitCode {
         }
     }
 
-    // A PC's system firmware, if this build has one and the user named none.
-    // `rsemu` ships exactly one piece of firmware and this is where it is
-    // offered (`fw::pcbios`); `--bios` still wins, because the slot is the
-    // user's and always will be (`docs/platforms/pc-at.md`).
-    if !images.iter().any(|(slot, _)| slot == "bios")
-        && let Some(image) = builtin_bios(&parsed.machine)
-    {
-        images.push((String::from("bios"), image));
-    }
-
     // A path wins over a catalog name, so a user editing a copy of a shipped
     // file gets their copy.
+    //
+    // Read *before* the firmware below is chosen, and that order is
+    // load-bearing rather than tidy: rsemu's own BIOS publishes MP and ACPI
+    // tables describing the board it is about to be put in, so it is assembled
+    // from this text (`fw::pcbios::image_for_machine`). A user who adds a
+    // second processor to their copy gets firmware that says so.
     let (name, source) = match load_description(&parsed.machine) {
         Ok(pair) => pair,
         Err(e) => {
@@ -398,6 +394,16 @@ fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // A PC's system firmware, if this build has one and the user named none.
+    // `rsemu` ships exactly one piece of firmware and this is where it is
+    // offered (`fw::pcbios`); `--bios` still wins, because the slot is the
+    // user's and always will be (`docs/platforms/pc-at.md`).
+    if !images.iter().any(|(slot, _)| slot == "bios")
+        && let Some(image) = builtin_bios(&parsed.machine, &name, &source)
+    {
+        images.push((String::from("bios"), image));
+    }
 
     let mut options = match catalog::build_options() {
         Ok(o) => o,
@@ -1583,7 +1589,13 @@ fn builtin_firmware(machine: &str) -> Option<Vec<u8>> {
 /// every legacy PC BIOS anyone could otherwise reach for is GPL, and running
 /// one is fine while shipping one is not. `--bios` overrides this, so pointing
 /// the board at a real image is still one flag.
-fn builtin_bios(machine: &str) -> Option<Vec<u8>> {
+///
+/// `file` and `text` are the description that is about to be built, because the
+/// firmware's MP and ACPI tables describe *that* board — a copy of `pc-at` with
+/// a second processor added gets a table with two processors in it. A
+/// description this firmware cannot read falls back to the shipped board's, so
+/// a table generator is never the reason a machine will not start.
+fn builtin_bios(machine: &str, file: &str, text: &str) -> Option<Vec<u8>> {
     let stem = machine
         .rsplit('/')
         .next()
@@ -1592,9 +1604,12 @@ fn builtin_bios(machine: &str) -> Option<Vec<u8>> {
         .unwrap_or_else(|| machine.rsplit('/').next().unwrap_or(machine));
     match stem {
         #[cfg(all(feature = "fw-pcbios", feature = "machine-pc-at"))]
-        "pc-at" => Some(rsemu::fw::pcbios::image()),
+        "pc-at" => Some(
+            rsemu::fw::pcbios::image_for_machine(file, text)
+                .unwrap_or_else(|_| rsemu::fw::pcbios::image()),
+        ),
         _ => {
-            let _ = stem;
+            let _ = (stem, file, text);
             None
         }
     }
