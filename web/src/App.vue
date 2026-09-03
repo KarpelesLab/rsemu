@@ -103,6 +103,27 @@ const quickStarts = computed(() =>
   machines.value.flatMap((m) => m.builtins.map((b) => ({ machine: m, image: b }))),
 );
 
+/** Whether this machine can be booted with nothing uploaded at all. */
+function selfSufficient(m) {
+  return m.builtins.length > 0 || !m.media;
+}
+
+// The catalog in two groups, which is the only division a visitor cares about
+// and the reason the picker is still readable now that it has nine entries in
+// it and will have more. `<optgroup>` rather than a search box or a second
+// component: it is one element, every browser has had it forever, and it costs
+// no dependency (web/README.md, "Third-party JavaScript").
+const catalogGroups = computed(() => [
+  {
+    label: "Runs with nothing uploaded",
+    machines: machines.value.filter(selfSufficient),
+  },
+  {
+    label: "Needs a file you supply",
+    machines: machines.value.filter((m) => !selfSufficient(m)),
+  },
+]);
+
 // A machine picked from the catalog defaults to its own first image, so
 // changing the selection never leaves the page asking for a file it could have
 // supplied itself.
@@ -122,6 +143,22 @@ const bootHint = computed(() => {
     ? `${rom.value.name} · ${bytes(rom.value.size)} ready for the “${m.media}” slot.`
     : `${m.name} loads a file into its “${m.media}” slot. Choose one, or drop it on the page.`;
 });
+
+/**
+ * Which pixel aspect to come up in for a picture this shape.
+ *
+ * 4:3 is a *stretch* on every console here — a 256-pixel NES line becomes 320
+ * CSS pixels, and nothing is lost. On a VGA's 720x400 it is a **squeeze**: the
+ * pixels really were narrower than they were tall, but a browser cannot do
+ * that the way a CRT did, and at integer scale 1 it throws away two columns in
+ * nine, which is most of a nine-pixel-wide glyph. So a picture whose 4:3 width
+ * would come out narrower than its own pixel count starts at 1:1 instead. The
+ * toggle is still there and still says what each one is; this only decides
+ * where it starts.
+ */
+function defaultAspect(width, height) {
+  return (height * 4) / 3 < width ? "pixel" : "tv";
+}
 
 function bytes(n) {
   if (n < 1024) return `${n} B`;
@@ -174,7 +211,7 @@ onMounted(async () => {
 
   // Default to a machine that runs with nothing uploaded, so a first-time
   // visitor has something to press rather than a file picker to satisfy.
-  const free = machines.value.find((m) => m.builtins.length > 0 || !m.media);
+  const free = machines.value.find(selfSufficient);
   chosen.value = (free ?? machines.value[0]).index;
   image.value = entry.value?.builtins.length ? 0 : FROM_FILE;
 
@@ -221,6 +258,7 @@ async function bootWith(m, b) {
   hasVideo.value = session.hasVideo;
   hasConsole.value = session.hasConsole;
   hasPad.value = session.hasPad;
+  aspect.value = defaultAspect(session.width, session.height);
   const on = b ? ` on ${b.name}` : rom.value ? ` — ${rom.value.name}` : "";
   say(`${m.name} running${on}.`);
   // A console machine is useless until it has focus, and asking the visitor to
@@ -362,10 +400,11 @@ function onStatePicked(event) {
       <div class="brand">
         <h1>rsemu<span class="brand-dim"> in the browser</span></h1>
         <p class="tagline">
-          A whole emulated machine, client-side. Several boot on ROMs compiled into this
-          page &mdash; including the Woz Monitor of 1976 &mdash; so there is something to
-          press before there is anything to open. Nothing is uploaded either way: a
-          cartridge you pick is read here, and a save state is a file this tab writes.
+          A whole emulated machine, client-side. Several boot on images compiled into
+          this page &mdash; the Woz Monitor of 1976, and rsemu's own PC BIOS posting on a
+          PC/AT &mdash; so there is something to press before there is anything to open.
+          Nothing is uploaded either way: a cartridge you pick is read here, and a save
+          state is a file this tab writes.
         </p>
       </div>
       <p class="build mono" :title="version || 'loading'">{{ version || "loading…" }}</p>
@@ -462,9 +501,13 @@ function onStatePicked(event) {
             <div class="field">
               <label for="machine">Catalog</label>
               <select id="machine" v-model.number="chosen" :disabled="phase !== 'ready'">
-                <option v-for="m in machines" :key="m.index" :value="m.index">
-                  {{ m.name }} — {{ m.summary }}
-                </option>
+                <template v-for="g in catalogGroups" :key="g.label">
+                  <optgroup v-if="g.machines.length" :label="g.label">
+                    <option v-for="m in g.machines" :key="m.index" :value="m.index">
+                      {{ m.name }} — {{ m.summary }}
+                    </option>
+                  </optgroup>
+                </template>
               </select>
             </div>
 
@@ -492,7 +535,7 @@ function onStatePicked(event) {
                 <span>{{ rom ? "Change file" : "Choose file" }}</span>
                 <input
                   type="file"
-                  accept=".nes,.gb,.gbc,.sms,.bin,.rom,application/octet-stream"
+                  accept=".nes,.gb,.gbc,.sms,.bin,.rom,.img,application/octet-stream"
                   aria-label="Cartridge or firmware image"
                   @change="onRomPicked"
                 />
@@ -634,10 +677,11 @@ function onStatePicked(event) {
       <p>
         The machine list is not written here &mdash; a machine is a feature set, so this
         page asks the module it fetched what is in it, and the same question gets the
-        images it carries. Those are rsemu's own monitors and one board's demonstration
-        firmware, plus Steve Wozniak's monitor of 1976, whose listing was published
-        without a copyright notice and is public domain. A cartridge is yours to supply,
-        which is why none is shipped here.
+        images it carries. Those are rsemu's own monitors, one board's demonstration
+        firmware and rsemu's own legacy PC BIOS, plus Steve Wozniak's monitor of 1976,
+        whose listing was published without a copyright notice and is public domain.
+        Nothing else is shipped: a cartridge, a kernel and a third party's BIOS are all
+        yours to supply, and the picker says which machines want one.
       </p>
       <p>
         The page deliberately does <em>not</em> need cross-origin isolation. Threaded

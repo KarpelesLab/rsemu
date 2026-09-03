@@ -200,6 +200,15 @@ export class Session {
     return Boolean(this.emu && this.emu.hasPad);
   }
 
+  /** The picture's shape right now, or zeros when there is no picture. */
+  get width() {
+    return this.hasVideo ? this.emu.width : 0;
+  }
+
+  get height() {
+    return this.hasVideo ? this.emu.height : 0;
+  }
+
   start() {
     if (this.raf) return;
     this.last = performance.now();
@@ -508,13 +517,25 @@ export class Session {
  * A 1970s console ends its lines with a bare carriage return and has no lower
  * case. Translating that is the backend's job — `host::terminal` does the same
  * thing for a real terminal — never the stream's.
+ *
+ * Three line endings, because this pane will eventually hold more than a 6502
+ * monitor: a bare CR (an Apple 1, Wozmon), a bare LF (a 16550 with a Unix-ish
+ * guest behind it), and CRLF (everything in between). A CR followed by an LF is
+ * **one** newline, which is why the previous byte is remembered; dropping LF
+ * outright, which is what this did, would have printed a serial console as one
+ * unbroken line the first time a board with a UART reached this page.
  */
 export function decodeGuest(bytes) {
   let out = "";
+  let wasCr = false;
   for (const byte of bytes) {
     const c = byte & 0x7f;
     if (c === 0x0d) out += "\n";
+    else if (c === 0x0a) {
+      if (!wasCr) out += "\n";
+    } else if (c === 0x09) out += "\t";
     else if (c >= 0x20 && c < 0x7f) out += String.fromCharCode(c);
+    wasCr = c === 0x0d;
   }
   return out;
 }

@@ -104,10 +104,10 @@ display-png = ["std", "dep:oxideav-png"]
 # offers. This is the feature set `web/README.md` builds; plain `wasm` stays
 # minimal so the CI wasm job keeps checking the boundary rather than the catalog.
 #
-# Six machines in two groups (eight catalog entries: the NES and the Master
+# Seven machines in two groups (nine catalog entries: the NES and the Master
 # System each ship an NTSC and a PAL file), and the selection rule is **what a
-# visitor can actually run**. Three of them boot on an image compiled into the
-# module, so the page has something to press before it has a file to open:
+# visitor can actually run**. Four of them boot on an image the module carries,
+# so the page has something to press before it has a file to open:
 #
 #   apple1              a console, RSMON built in, nothing to upload.
 #   beneater-6502       a serial console with *two* built-in monitors — RSMON,
@@ -116,6 +116,13 @@ display-png = ["std", "dep:oxideav-png"]
 #                       paints a gradient through a real SPI display path, and
 #                       it is what keeps `host::display::lcd` exercised in a
 #                       browser rather than only in a PNG test.
+#   pc-at               rsemu's *own* BIOS (`fw-pcbios`), assembled for this
+#                       board and posting on its VGA: "rsemu BIOS, 639K base,
+#                       15360K extended", then "No bootable device." because
+#                       nothing was uploaded. It is the only board here that
+#                       runs real firmware, and the only firmware rsemu ships
+#                       or will (ROADMAP.md phase 6a: the alternatives are all
+#                       GPL, and running one is fine while shipping one is not).
 #
 # The other three want a cartridge the visitor supplies, read in the page and
 # never uploaded:
@@ -126,11 +133,32 @@ display-png = ["std", "dep:oxideav-png"]
 #   sms-ntsc / sms-pal  a .sms, a Z80 with a separate I/O space, and the only
 #                       machine here with two controller ports.
 #
-# Deliberately absent, and each for a reason that would show on the page: the
-# bare boards — z80-mini, m68k-mini, mips-mini, arm926, stm32f407 — want a
-# firmware image and have neither a console nor a screen without one; riscv-virt
-# wants a kernel or an SBI build and is the single largest thing this list could
-# add; and the PC boards' BIOS is the user's to supply (ROADMAP.md §1).
+# **`pc-at` costs 1 204 854 bytes** — 1 844 822 before and 3 049 676 after,
+# both `--release` and unstripped; 496 323 and 774 438 gzipped, so ≈272 KB more
+# over the wire. That is a 65% module for one board and it was still the right
+# trade: it is the only entry in this whole catalog that boots firmware. About
+# 520 KB of it is `cpu-x86`, which no cheaper x86 board avoids; ~350 KB is the
+# chipset `machines/pc-at.machine` names, none of it optional; and ~340 KB is
+# the firmware assembler and its table generators, which enter the module only
+# because `src/wasm.rs` now calls them. `web/README.md` has the rest of the
+# numbers and the reasoning at length.
+#
+# Deliberately absent, and each for a reason that would show on the page. The
+# bare boards — z80-mini (+4 578 bytes), mips-mini (+60 648), m68k-mini
+# (+77 182), a64-mini (+165 692), arm926, stm32f407 — want a firmware image and
+# have neither a console nor a screen without one; z80-mini is nearly free and
+# still not worth a catalog row that cannot do anything. `riscv-virt` (+262 243)
+# wants a kernel or an SBI build — it is no longer "the largest thing this list
+# could add", `pc-at` is, by more than three times. `pc64` (+523 702) and
+# `q35-linux` do reach a shell prompt on an uploaded `bzImage`, but only after
+# several hundred *guest* seconds (docs/platforms/pc64.md) and only with an
+# initrd in a second media slot, which this ABI cannot bind. `q35` (+190 802 on
+# top of pc-at) would be a second POST screen, and its `bios` slot does not in
+# fact default to rsemu's image the way this file used to claim — neither
+# `builtin_bios` in src/bin/rsemu.rs nor `builtin_media` in src/ffi/abi.rs has a
+# q35 arm. The storage and USB boards (nvme-mini +358 717, xhci-pci-mini
+# +466 147, ahci-mini, usb-mini, hub-mini, xhci-mini) want a disk image *and* a
+# firmware and have nothing to look at either way.
 demo = [
     "wasm",
     "machine-nes",
@@ -141,6 +169,8 @@ demo = [
     "machine-spi-panel",
     "machine-gameboy",
     "machine-sms",
+    "machine-pc-at",
+    "fw-pcbios",
 ]
 
 # NES cartridges (src/dev/cart): iNES and NES 2.0 image parsing, the
