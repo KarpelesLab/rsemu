@@ -31,11 +31,11 @@
 //!   interpreter's first fetch *translates*, and a translation that misses the
 //!   hart's TLB walks and charges for the walk. A cached block that skipped it
 //!   would run the same instructions for fewer ticks the second time round.
-//!   That is also what bounds a dispatcher call to **one block**: [`Frontend`]
-//!   has no per-entry hook, so letting `Dispatcher::run` chain a successor
-//!   would skip that successor's entry translation. Block chaining is the one
-//!   §9 mechanism this engine gives up, and buying it back is a seam change
-//!   rather than a change here.
+//!   That used to bound a dispatcher call to **one block**, because
+//!   [`Frontend`] had no per-entry hook and a chained successor would have
+//!   skipped its own translation — so block chaining, `ROADMAP.md` §9's second
+//!   mechanism, never ran. It has one now ([`Frontend::enter`]), [`admit`] is
+//!   what it calls, and a call runs up to [`CHAIN`] blocks.
 //! * **A block never runs unless its worst case fits the budget left.**
 //!   Otherwise the guest's *stopping point* inside a scheduler quantum would
 //!   depend on the engine: an interpreter overruns its budget by one
@@ -43,7 +43,14 @@
 //!   `State::debt`, and both numbers are in the snapshot a machine's state
 //!   hash is taken over. So the tail of every quantum is interpreted and the
 //!   two engines stop on the same instruction with the same debt. [`Costs`] is
-//!   what keeps the bound tight enough for that tail to be short.
+//!   what keeps the bound tight enough for that tail to be short — and the
+//!   guard is asked once per block of a chain, against what the chain has
+//!   *left*, not once per [`advance`].
+//! * **A pending interrupt is looked for at every block boundary**, chained
+//!   ones included, which is what keeps a sixteen-block chain
+//!   indistinguishable from sixteen one-block calls. A store into the CLINT or
+//!   the PLIC ends its block by construction, so the interrupt it raises is
+//!   seen before the next block starts.
 //!
 //! # What it buys, measured
 //!
@@ -54,38 +61,50 @@
 //!
 //! | `engine` | wall clock | vs the interpreter |
 //! | --- | --- | --- |
-//! | `interp` | 150.3 s | — |
-//! | `jit` | 121.2 s | **1.24×** |
-//! | `jit-host` | 299.1 s | 0.50× |
+//! | `interp` | 150.6 s | — |
+//! | `jit` | 115.6 s | **1.30×** |
+//! | `jit-host` | 87.6 s | **1.72×** |
+//!
+//! Median of three **interleaved** reps — one of each engine, in turn, three
+//! times over — because the interpreter is the control and a control measured
+//! in a different sitting is not one. The nine runs spread by 0.5%; two sweeps
+//! of the *same* binary taken twenty minutes apart on this machine differed by
+//! 12%.
 //!
 //! All three end on the same guest state, byte for byte:
 //! `state hash 0xf86f099b07119370`. `tests/riscv_virt_engines.rs` asserts that
 //! equality on every commit, on a cheaper guest.
 //!
-//! Two things there are worth saying out loud rather than leaving to be
-//! rediscovered.
+//! **The host code generator used to lose to the portable one**, at 0.50× the
+//! interpreter, and what fixed it was not the code it emits. Two things were.
 //!
-//! **The host code generator currently costs more than it saves**, which is
-//! why it is a separate engine value rather than what `jit` does wherever it
-//! can. It is not the code it emits; it is what surrounds it. A block on this
-//! guest is about four guest instructions long — 293 million blocks for 2.4
-//! billion ticks — and per block the compiled path re-zeroes a temporary
-//! frame, builds a call context, and then calls back into the host across a C
-//! ABI for every `CHARGE`, every `INSN_START` and every guest access, where the
-//! IR interpreter's equivalents are monomorphized and inlined. Measured at
-//! roughly 0.8 µs a block over and above interpreting the same IR, with
-//! compilation itself accounted for separately (the run above compiles 162
-//! thousand blocks and resets its code buffer once). Per-*instruction*
-//! bookkeeping over four-instruction blocks is the whole of it.
+//! **Blocks are chained now.** [`Frontend::enter`] is the hook that allows it,
+//! [`CHAIN`] is how far, and on this guest **86% of blocks are reached by
+//! following a patched exit** — 43.2 million of 50.0 million over sixty
+//! seconds of guest time, against a `chained` count that was previously zero
+//! in every run. What that buys is not the hash lookup it skips; it is
+//! everything around a four-instruction block that a one-block call had to
+//! pay in full.
 //!
-//! **And the speedup is 1.24×, not the 8–22× the code generator measures on a
-//! benchmark**, because two of `ROADMAP.md` §9's four mechanisms are not
-//! reachable from here: blocks are not chained (above), and no
-//! [`LoadPlan`](crate::jit::LoadPlan) is published (see [`FastMem`] below), so
-//! a guest access costs a call whichever engine runs it. It is also worth
-//! knowing that the number moves with the guest's phase: over the first thirty
-//! seconds, which is firmware and early kernel, the same measurement gives
-//! 1.46×.
+//! **And a compile stopped costing 144 µs.** The 256 MiB code buffer this
+//! engine asks for was being `mprotect`ed end to end twice per compiled block
+//! — 433 600 cycles a block, against 13 850 for the code generation it was
+//! protecting. `jit::x86::buf` flips a page-sized window instead, and the same
+//! sixty seconds of guest time went from **25.6 billion cycles in `mprotect`
+//! to 1.3 billion**. The two fixes of the previous round were fighting each
+//! other: the buffer was grown to stop resets, and growing it made every flip
+//! proportionally slower.
+//!
+//! What is left is honest and worth knowing. The compiled path's *execution*
+//! was never the problem — measured over the same run it costs 768 cycles a
+//! block against the IR interpreter's 896, so it was ahead before compilation
+//! was counted. And the speedup is 1.72×, not the 8–22× the code generator
+//! measures on a benchmark, because the last of `ROADMAP.md` §9's four
+//! mechanisms is still out of reach: no [`LoadPlan`](crate::jit::LoadPlan) is
+//! published (see [`FastMem`] below), so a guest access costs a call whichever
+//! engine runs it. A block here lifts to about forty-seven IR instructions and
+//! compiles to 949 bytes of host code; 59 269 of them are compiled in sixty
+//! seconds and none is refused.
 //!
 //! # What is checked at a block boundary rather than at an instruction
 //!
@@ -97,9 +116,14 @@
 //! timer is a value another runnable publishes between quanta. What is left is
 //! a **load** from a device that raises an interrupt as a side effect of being
 //! read, which nothing on a `virt` board does — a PLIC claim and a 16550 `RBR`
-//! read both *lower* a line. Recorded here rather than discovered later. The
-//! safe-point flag has the same granularity for the same reason
-//! (`ROADMAP.md` §4.7), bounded by [`lift::MAX_INSNS`].
+//! read both *lower* a line. Recorded here rather than discovered later.
+//!
+//! The interrupt check is asked **per block**, and that is unchanged by
+//! chaining: [`admit`] runs it at every boundary, so a chain is as prompt as
+//! the one-block calls it replaced. The **safe-point flag** is not, and that
+//! is the price of chaining, stated rather than implied: `Hart::run_budget`
+//! tests it between calls to [`advance`], so it used to be honoured within one
+//! block and is now honoured within [`CHAIN`] of them. See that constant.
 //!
 //! # Self-modifying code, and the one case that is not covered
 //!
@@ -141,7 +165,7 @@ use crate::core::space::{AddressSpace, MemAttrs, MemResult};
 use crate::core::value::Width;
 use crate::ir::{Block, InsnStart, IrHost, MemOp, Opcode, RegSlot, verify};
 use crate::jit::{
-    BlockCache, DirtyPages, Dispatcher, Epoch, FastMem, Frontend, PAGE_MASK, Stop, StoreLog,
+    BlockCache, DirtyPages, Dispatcher, Entry, Epoch, FastMem, Frontend, PAGE_MASK, Stop, StoreLog,
     Translation,
 };
 
@@ -157,6 +181,36 @@ use super::mmu::{self, Access};
 /// a loop unrolls into one translation and a guest register stays in a
 /// temporary across the whole of it.
 const SHAPE: Shape = Shape::Trace;
+
+/// How many blocks one [`advance`] may chain before it hands control back.
+///
+/// `ROADMAP.md` §9's second mechanism is a block cache *"with block chaining
+/// (patch the exit jump directly to the successor)"*, and until
+/// [`Frontend::enter`] existed this engine could not use it: a chained
+/// successor would have skipped the entry translation every block owes, so the
+/// dispatcher had to be driven one block at a time and `DispatchStats::chained`
+/// was zero in every run of a real guest. It is not a hash lookup this buys
+/// back — that was never the expensive part — it is everything *around* a
+/// block: an `Exec`, a `Host` and its register-file copy in and out, a
+/// `Lifter`, a cache resynchronisation and a trip through `Hart::run_budget`,
+/// all of which a four-instruction block used to pay in full.
+///
+/// **What it costs is the safe point, and the new bound is stated rather than
+/// implied.** `Hart::run_budget` tests `ROADMAP.md` §4.7's exit flag between
+/// calls to [`advance`], so a raised flag used to be honoured within one block
+/// — at most [`lift::MAX_INSNS`] guest instructions. It is now honoured within
+/// at most `CHAIN` blocks, so **1 024 guest instructions**, and still within
+/// what is left of the quantum's tick budget, because every block of the chain
+/// is admitted against that budget by [`admit`] before it runs.
+/// `a_chain_is_bounded_by_the_stated_safe_point_number` asserts the block half
+/// of that, and `the_same_agreement_holds_over_budgets_a_block_does_not_fit_in`
+/// the tick half.
+///
+/// Sixteen rather than sixty-four because the curve is flat past it — the
+/// per-block cost being amortized is a fixed overhead, so the second block of
+/// a chain removes half of it and the sixteenth removes a fifteenth — and a
+/// safe point is worth more than the last percent.
+const CHAIN: usize = 16;
 
 /// The most bus accesses one Sv39 walk can make: three levels of descriptor
 /// reads and at most one accessed/dirty write-back.
@@ -190,19 +244,24 @@ const COST_SLOTS: usize = 65536;
 ///
 /// `jit::x86`'s own default is one mebibyte, sized against *"a block compiles
 /// to a few hundred bytes"*. A real guest says otherwise. A RISC-V block under
-/// Linux is about four guest instructions long — a store ends a block, and so
-/// does every instruction outside the lifted subset — and this backend emits
-/// roughly three kilobytes of host code for one, so [`BLOCKS`] live blocks want
-/// two hundred. The buffer is append-only and reclaimed only by a reset that
-/// throws every compiled block away, so undersizing it is not a small cost: at
-/// one mebibyte it reset **2 626 times in ten seconds of guest time** and
-/// compiled nineteen thousand blocks 886 000 times, and at 32 MiB it reset 111
-/// times in four minutes and compiled 1.59 million. At 256 MiB the same run
-/// resets once and compiles 162 thousand.
+/// Linux is a handful of guest instructions — a store ends a block, and so does
+/// every instruction outside the lifted subset — and lifts to about forty-seven
+/// IR instructions, which this backend emits **949 bytes** of host code for
+/// (measured over 59 269 compiles of a Linux boot). [`BLOCKS`] live blocks
+/// therefore want about sixty mebibytes, and the buffer is append-only and
+/// reclaimed only by a reset that throws every compiled block away, so
+/// undersizing it is not a small cost: at one mebibyte it reset **2 626 times
+/// in ten seconds of guest time** and compiled nineteen thousand blocks 886 000
+/// times, and at 32 MiB it reset 111 times in four minutes. At 256 MiB a
+/// four-minute boot writes about 225 MB and resets once.
 ///
 /// The mapping is anonymous, so what is not written is not resident, and it is
-/// only asked for at all by `engine = "jit-host"`. The cost of asking for too
-/// much is address space; the cost of asking for too little is measured above.
+/// only asked for at all by `engine = "jit-host"`. Asking for too much costs
+/// address space and **nothing per compile** — that last part is new, and it is
+/// why the number can stand: `jit::x86::buf` flips a page-sized window rather
+/// than the whole mapping, so a bigger buffer no longer makes every `mprotect`
+/// slower. It did, and the two together were the largest single cost in the
+/// compiled engine.
 #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
 const CODE_BUFFER: u64 = 256 << 20;
 
@@ -411,10 +470,108 @@ const fn key_origin(translating: bool, phys: u64) -> Origin {
 }
 
 // ---------------------------------------------------------------------------
+// Admitting a block
+// ---------------------------------------------------------------------------
+
+/// What entering a block resolved to, once it is going to run.
+///
+/// The entry translation names the block ([`key_origin`]) and bounds what the
+/// lifter may read, so it is carried rather than recomputed.
+#[derive(Debug, Clone, Copy)]
+struct Admitted {
+    origin: Origin,
+    key: u64,
+    /// The virtual page the entry PC is on, and the physical page it resolved
+    /// to. A block never leaves that page, so one translation covers every
+    /// byte the lifter may read.
+    page: u64,
+    base: u64,
+    /// What one guest access costs at worst, and what the entry fetch costs.
+    access: u64,
+    entry: u64,
+}
+
+/// Whether a block may run at `pc`, and what it costs to find out.
+#[derive(Debug)]
+enum Admit {
+    /// It may.
+    Ready(Admitted),
+    /// It may not, and the reason is one the interpreter answers: a pending
+    /// interrupt, a stalled `WFI`, an instruction outside the lifted subset,
+    /// or a worst case that does not fit what is left of the budget.
+    Interpret,
+    /// The entry fetch itself faulted.
+    Trap(Trap),
+}
+
+/// Everything a block owes before it runs — for the first block of a run and
+/// for every chained successor alike, which is the whole point of it being one
+/// function.
+///
+/// Three things happen here and the order is load-bearing.
+///
+/// **The interrupt check first.** A pending interrupt, a stalled `WFI` and an
+/// instruction outside the lifted subset are all the interpreter's, and
+/// `Exec::step` is how each is taken. Asking first is not an optimization:
+/// `step` takes the trap, and a block run instead would take it up to
+/// sixty-four instructions late. Asking it *per block* rather than per run is
+/// what keeps a chained run indistinguishable from a sequence of one-block
+/// ones: a store into the CLINT or the PLIC ends its block, and the interrupt
+/// it raises is seen at the very next boundary.
+///
+/// **Then the entry fetch translation**, charged exactly as the interpreter's
+/// first fetch charges it, and performed on every execution rather than at
+/// lift time, because a cached block must cost what an uncached one cost. Two
+/// bytes is the low halfword's width: `exec::fetch` translates for that first,
+/// and translates again for the high half, which then hits.
+///
+/// **Then the budget guard**, and it is after the translation because the
+/// translation is also what *names* the block. A guard that declined
+/// afterwards has not wasted the walk: the interpreter's own fetch then finds
+/// the entry this translation just filled, and charges exactly what it would
+/// have charged anyway.
+fn admit(cfg: &Config, costs: &Costs, exec: &mut Exec<'_>, pc: u64, remaining: u64) -> Admit {
+    if exec.pending_interrupt().is_some() || exec.st.wfi {
+        return Admit::Interpret;
+    }
+    let mode = exec.st.csrs.priv_mode;
+    let translating = mmu::translation_active(&exec.st.csrs, mode);
+    let phys = match exec.translate(pc, Access::Fetch, 2) {
+        Ok(phys) => phys,
+        Err(trap) => return Admit::Trap(trap),
+    };
+    let origin = key_origin(translating, phys);
+    let key = lift::key(cfg, origin, SHAPE);
+
+    // Known unliftable, or too big for what is left of the budget: either way
+    // the interpreter takes this instruction, and reaching it without a lift
+    // that fails at its first instruction is the whole point of remembering
+    // the first.
+    let bound = match costs.get(pc, key) {
+        Some(0) => return Admit::Interpret,
+        Some(bound) => bound,
+        None => worst_bound(cfg, translating),
+    };
+    if bound > remaining.saturating_sub(exec.used) {
+        return Admit::Interpret;
+    }
+
+    Admit::Ready(Admitted {
+        origin,
+        key,
+        page: pc & !PAGE_MASK,
+        base: phys & !PAGE_MASK,
+        access: per_access(cfg, translating),
+        entry: if translating { WALK_ACCESSES } else { 0 },
+    })
+}
+
+// ---------------------------------------------------------------------------
 // One step of the run loop
 // ---------------------------------------------------------------------------
 
-/// Execute one block, or — where a block would be wrong — one instruction.
+/// Execute a chain of blocks, or — where a block would be wrong — nothing, and
+/// leave the instruction to the interpreter.
 ///
 /// Reports the bus accesses charged and the [`Exit`] the step produced, in the
 /// same currency and with the same meaning as `Hart::step_to_exit`, so a run
@@ -422,7 +579,9 @@ const fn key_origin(translating: bool, phys: u64) -> Origin {
 ///
 /// `remaining` is what is left of the caller's budget. A block whose worst
 /// case does not fit is not run and the instruction is interpreted instead, so
-/// that the hart stops where an interpreted hart would stop.
+/// that the hart stops where an interpreted hart would stop — and that holds
+/// for every block of a chain, not only the first, because [`admit`] is asked
+/// again at each boundary with what the chain has spent so far deducted.
 ///
 /// # Panics
 ///
@@ -444,61 +603,23 @@ pub(super) fn advance(
 ) -> (u64, Option<Exit>) {
     let Jit { disp, costs } = jit;
     let mut exec = Exec::new(state, tlb, space, cfg, lines, exits);
-
-    // A pending interrupt, a stalled `WFI` and an instruction outside the
-    // lifted subset are all the interpreter's, and `Exec::step` is how each is
-    // taken. Asking first is not an optimization: `step` takes the trap, and a
-    // block run instead would take it up to sixty-four instructions late.
-    if exec.pending_interrupt().is_some() || exec.st.wfi {
-        return interpret(disp, costs, exec);
-    }
-
     let pc = exec.st.pc;
-    let mode = exec.st.csrs.priv_mode;
-    let translating = mmu::translation_active(&exec.st.csrs, mode);
 
-    // The entry fetch translation, charged exactly as the interpreter's first
-    // fetch charges it — and performed here, on every execution, rather than
-    // at lift time, because a cached block must cost what an uncached one
-    // cost. Two bytes is the low halfword's width: `exec::fetch` translates
-    // for that first, and translates again for the high half, which then hits.
-    //
-    // It happens before the budget guard because it is also what *names* the
-    // block. A guard that declined afterwards would not have wasted the walk:
-    // the interpreter's own fetch then finds the entry this translation just
-    // filled, and charges exactly what it would have charged anyway.
-    let phys = match exec.translate(pc, Access::Fetch, 2) {
-        Ok(phys) => phys,
-        Err(trap) => return deliver(disp, costs, exec, trap, pc, pc),
+    // The entry work for the *first* block, done here rather than through
+    // [`Frontend::enter`], because the overwhelmingly common answer on a real
+    // guest is "not a block at all" — an `amoadd`, a `csrrw`, an `ecall`,
+    // forty-two million of them in four minutes — and reaching the interpreter
+    // for one should not cost a frontend, a host and a dispatcher round trip.
+    // The dispatcher's first `enter` is then a no-op; see `Lifter::admitted`.
+    let at = match admit(cfg, costs, &mut exec, pc, remaining) {
+        Admit::Ready(at) => at,
+        Admit::Interpret => return interpret(disp, costs, exec),
+        Admit::Trap(trap) => return deliver(disp, costs, exec, trap, pc, pc),
     };
-    let origin = key_origin(translating, phys);
-    let key = lift::key(cfg, origin, SHAPE);
-
-    // Known unliftable, or too big for what is left of the budget: either way
-    // the interpreter takes this instruction, and reaching it without a
-    // dispatcher round trip is the whole point of remembering the first.
-    let bound = match costs.get(pc, key) {
-        Some(0) => return interpret(disp, costs, exec),
-        Some(bound) => bound,
-        None => worst_bound(cfg, translating),
-    };
-    if bound > remaining {
-        return interpret(disp, costs, exec);
-    }
 
     let mut front = Lifter {
         cfg,
-        origin,
-        key,
-        epoch: Epoch {
-            topology: space.generation(),
-            // Zero, and deliberately: `Epoch::translation` is what a cache
-            // keyed on the guest MMU's generation is stale against, and these
-            // blocks are not keyed on it — `key_origin` puts the physical page
-            // in the key instead, which is both narrower and exact. A
-            // generation here would ask for a full flush on every `SRET`.
-            translation: 0,
-        },
+        at,
         space,
         // Lifting reads *ahead* of the guest: up to sixty-four instructions it
         // has not asked for. A fetch is an ordinary access and a read-ahead is
@@ -509,34 +630,37 @@ pub(super) fn advance(
         // that happened above, through the fetch path, with its walk and its
         // accessed bit.
         attrs: MemAttrs::DEBUG.with_requester(cfg.requester),
-        page: pc & !PAGE_MASK,
-        base: phys & !PAGE_MASK,
         costs,
-        access: per_access(cfg, translating),
-        entry: if translating { WALK_ACCESSES } else { 0 },
+        remaining,
+        admitted: true,
+        entry_trap: None,
         rejected: None,
     };
 
     let mut host = Host::new(&mut exec, pc);
-    // One block, and one is the contract: the dispatcher has no hook between a
-    // block and its successor, and every block owes an entry translation.
-    let run = match disp.run(&mut front, &mut host, pc, 1) {
+    let run = match disp.run(&mut front, &mut host, pc, CHAIN) {
         Ok(run) => run,
         // The only refusal this frontend has is an RV32 configuration, which
         // the property reader rejects before a hart is built. Degrade rather
         // than fail the machine (`ROADMAP.md` §9).
         Err(_) => {
             drop(host);
+            let Lifter { costs, .. } = front;
             return interpret(disp, costs, exec);
         }
     };
     let Host {
         slots, trap, mark, ..
     } = host;
+    let Lifter {
+        costs,
+        entry_trap,
+        rejected,
+        ..
+    } = front;
     debug_assert!(
-        front.rejected.is_none(),
-        "the RISC-V frontend emitted a block the verifier rejects: {:?}",
-        front.rejected
+        rejected.is_none(),
+        "the RISC-V frontend emitted a block the verifier rejects: {rejected:?}"
     );
 
     if run.blocks == 0 {
@@ -575,9 +699,18 @@ pub(super) fn advance(
         Stop::Unsupported { op, at } => panic!(
             "the RISC-V frontend emitted {op} at index {at}, which the IR backend cannot execute"
         ),
-        // `Budget` is the ordinary end of a one-block run. `Exit` cannot
+        // A chained boundary whose entry fetch faulted. The instruction at
+        // `run.pc` has not started, so its own PC is both where the trap is
+        // taken and where it resumes — the same pair the prologue's `deliver`
+        // above passes, and the same one `Exec::step`'s fetch would produce.
+        Stop::Declined if entry_trap.is_some() => {
+            let trap = entry_trap.expect("just tested");
+            deliver(disp, costs, exec, trap, run.pc, run.pc)
+        }
+        // `Budget` ends a full chain, `Declined` a short one, and both leave
+        // the guest at `run.pc` for the run loop to pick up. `Exit` cannot
         // happen: no safe-point flag is given to the dispatcher, because the
-        // run loop above checks it at the same granularity.
+        // run loop above checks it between calls.
         _ => {
             exec.st.pc = cfg.xlen.trunc(run.pc);
             let used = exec.used;
@@ -654,19 +787,23 @@ fn drain(disp: &mut Dispatcher, costs: &mut Costs, exec: &mut Exec<'_>) {
 /// The RISC-V half of the dispatcher's contract, over a real hart.
 struct Lifter<'a> {
     cfg: &'a Config,
-    origin: Origin,
-    key: u64,
-    epoch: Epoch,
+    /// What the current block's entry resolved to — replaced at every
+    /// boundary by [`Lifter::enter`], because a chained successor is on its
+    /// own page, under its own key.
+    at: Admitted,
     space: &'a AddressSpace,
     attrs: MemAttrs,
-    /// The virtual page the entry PC is on, and the physical page it resolved
-    /// to. A block never leaves that page, so one translation covers every
-    /// byte the lifter may read.
-    page: u64,
-    base: u64,
     costs: &'a mut Costs,
-    access: u64,
-    entry: u64,
+    /// What [`advance`] was given, so a chained boundary can guard the next
+    /// block against what the chain has *left* rather than against the whole.
+    remaining: u64,
+    /// Whether [`advance`]'s prologue has already admitted the entry PC, so
+    /// the dispatcher's first `enter` neither translates nor charges twice.
+    /// Consumed by the first call and false ever after.
+    admitted: bool,
+    /// A trap raised by a *chained* boundary's entry fetch. The prologue's own
+    /// trap never lands here — it is delivered before a dispatcher exists.
+    entry_trap: Option<Trap>,
     /// The first block the verifier rejected, if any. A frontend bug rather
     /// than a guest one, so it is asserted on in a debug build and ignored in
     /// a release one — the block still runs, and the differential harness is
@@ -674,13 +811,50 @@ struct Lifter<'a> {
     rejected: Option<String>,
 }
 
-impl Frontend for Lifter<'_> {
+impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
     fn epoch(&mut self) -> Epoch {
-        self.epoch
+        Epoch {
+            // Read live, at every boundary: a chained successor must not be
+            // served out of a cache lifted through a topology a store in the
+            // block before it replaced. One relaxed atomic load.
+            topology: self.space.generation(),
+            // Zero, and deliberately: `Epoch::translation` is what a cache
+            // keyed on the guest MMU's generation is stale against, and these
+            // blocks are not keyed on it — `key_origin` puts the physical page
+            // in the key instead, which is both narrower and exact. A
+            // generation here would ask for a full flush on every `SRET`.
+            translation: 0,
+        }
+    }
+
+    fn enter(&mut self, pc: u64, host: &mut Host<'h, 'e>) -> Result<Entry> {
+        // The first block of a run was admitted by `advance` before this
+        // frontend existed, and admitting it twice would translate twice and
+        // charge the walk twice.
+        if core::mem::take(&mut self.admitted) {
+            return Ok(Entry::Ready);
+        }
+        // Registers live in the host's slots between the blocks of a chain and
+        // are written back only when the run ends. Nothing `admit` reads is
+        // one of them — it reads the CSR file, the hart's TLB and the tick
+        // counter — so a chained boundary sees the same world a fresh
+        // `advance` would have seen.
+        let entry = match admit(self.cfg, self.costs, host.exec, pc, self.remaining) {
+            Admit::Ready(at) => {
+                self.at = at;
+                Entry::Ready
+            }
+            Admit::Interpret => Entry::Leave,
+            Admit::Trap(trap) => {
+                self.entry_trap = Some(trap);
+                Entry::Leave
+            }
+        };
+        Ok(entry)
     }
 
     fn key(&mut self) -> u64 {
-        self.key
+        self.at.key
     }
 
     fn pc_slot(&self) -> RegSlot {
@@ -690,8 +864,8 @@ impl Frontend for Lifter<'_> {
     fn translate(&mut self, pc: u64) -> Result<Translation> {
         let space = self.space;
         let attrs = self.attrs;
-        let base = self.base;
-        let page = self.page;
+        let base = self.at.base;
+        let page = self.at.page;
         let mut src = |addr: u64| {
             // Outside the entry page there is no translation to read through,
             // so the lifter is told the bytes are unreadable and ends the
@@ -705,7 +879,14 @@ impl Frontend for Lifter<'_> {
                 .ok()
                 .map(|v| v as u16)
         };
-        let lifted = lift::lift(self.cfg, self.origin, pc, &mut src, lift::MAX_INSNS, SHAPE)?;
+        let lifted = lift::lift(
+            self.cfg,
+            self.at.origin,
+            pc,
+            &mut src,
+            lift::MAX_INSNS,
+            SHAPE,
+        )?;
         if self.rejected.is_none()
             && let Err(e) = verify(&lifted.block)
         {
@@ -714,11 +895,11 @@ impl Frontend for Lifter<'_> {
         // Zero when nothing could be lifted, which is what sends the next
         // pass straight to the interpreter instead of back through here.
         let bound = if lifted.insns > 0 {
-            block_bound(&lifted.block, self.access, self.entry)
+            block_bound(&lifted.block, self.at.access, self.at.entry)
         } else {
             0
         };
-        self.costs.put(pc, self.key, bound);
+        self.costs.put(pc, self.at.key, bound);
         Ok(Translation {
             page: base,
             insns: lifted.insns,
@@ -854,6 +1035,25 @@ mod tests {
         0xff5f_f06f, // jal   x0, -12
     ];
 
+    /// [`LOOP`] with its scratch word on a **different page** from its code.
+    ///
+    /// `LOOP` stores at 80, which is inside the page it was lifted from, so
+    /// every block invalidates itself, every pass re-lifts, and nothing is
+    /// ever chained. That makes it the right fixture for self-modifying code
+    /// and a useless one for the block cache — measured, on the way to writing
+    /// `a_chain_really_chains_now_that_a_boundary_has_a_hook`: 1 024 blocks,
+    /// 1 024 translations and 1 024 invalidations. `lui x7, 1` moves the
+    /// scratch word to 0x1050 and the loop starts behaving like code.
+    const FAR_LOOP: [u32; 7] = [
+        0x0000_13b7, // lui   x7, 1        ; x7 = 0x1000, the next page
+        0x0000_0293, // addi  x5, x0, 0
+        0x0010_0313, // addi  x6, x0, 1
+        0x0062_82b3, // add   x5, x5, x6   ; the loop starts here
+        0x0453_b823, // sd    x5, 80(x7)
+        0x0503_be03, // ld    x28, 80(x7)
+        0xff5f_f06f, // jal   x0, -12
+    ];
+
     /// A hart with `program` at zero and [`RAM`] bytes of RAM under it.
     fn hart(engine: Engine, program: &[u32]) -> Hart {
         let ram = Arc::new(RamStore::new(RAM));
@@ -934,6 +1134,18 @@ mod tests {
     }
 
     #[test]
+    fn a_chained_run_agrees_with_the_interpreter_on_every_column_too() {
+        // The columns `agree` compares are the ones a chain could move: the
+        // cycle counter, because a chained successor still owes its entry
+        // translation; the retired count, because it is now summed over
+        // several blocks; and the carried debt, because the budget guard is
+        // now asked once per block rather than once per `advance`.
+        let (interp, jit) = agree(&FAR_LOOP, 1000, 64);
+        assert!(interp.cycles() > 1000, "the run was too short to mean much");
+        assert_eq!(interp.x(28), jit.x(28), "the value reloaded from memory");
+    }
+
+    #[test]
     fn the_same_agreement_holds_over_budgets_a_block_does_not_fit_in() {
         // Twelve ticks is under the worst case of every block here, so the
         // budget guard interprets almost everything — which must give the same
@@ -981,6 +1193,553 @@ mod tests {
             0xff9f_f06f, // jal   x0, -8
         ];
         agree(&program, 1000, 32);
+    }
+
+    /// A block that ends by jumping past the end of RAM, so the *next*
+    /// boundary's entry fetch faults.
+    ///
+    /// The fault is at a chained boundary rather than in [`advance`]'s
+    /// prologue, which is the only way to reach [`Admit::Trap`] through
+    /// [`Frontend::enter`]. `mtvec` is zero, so the trap lands back at the top
+    /// and the fixture loops.
+    const FETCH_FAULT: [u32; 2] = [
+        0x0002_03b7, // lui  x7, 0x20     ; x7 = 0x20000, past the end of RAM
+        0x0003_8067, // jalr x0, 0(x7)
+    ];
+
+    /// [`FAR_LOOP`] with its load and store misaligned by one byte.
+    ///
+    /// `Config::misaligned` says this core performs them, byte by byte, and
+    /// each byte is a bus access — so one of these costs eight ticks where an
+    /// aligned one costs one, and a budget guard that assumed alignment would
+    /// admit a block into eight times too little budget.
+    const MISALIGNED: [u32; 7] = [
+        0x0000_13b7, // lui   x7, 1       ; x7 = 0x1000, the next page
+        0x0000_0293, // addi  x5, x0, 0
+        0x0010_0313, // addi  x6, x0, 1
+        0x0062_82b3, // add   x5, x5, x6  ; the loop starts here
+        0x0453_b8a3, // sd    x5, 81(x7)
+        0x0513_be03, // ld    x28, 81(x7)
+        0xff5f_f06f, // jal   x0, -12
+    ];
+
+    /// `addi x5, x5, 1` — one liftable instruction, used to fill a page.
+    const COUNT_UP: u32 = 0x0012_8293;
+
+    /// A hart taken apart, so that [`advance`] and [`admit`] can be driven
+    /// directly.
+    ///
+    /// `Hart` is the wrong instrument for three of the four answers [`admit`]
+    /// gives, and that is not an accident of its API: an interrupt arrives
+    /// over a wire, a `WFI` from an instruction, and a *cold* cost table only
+    /// exists before the first lift. Each is one line here.
+    struct Bench {
+        space: Arc<AddressSpace>,
+        cfg: Config,
+        state: State,
+        tlb: mmu::Tlb,
+        lines: Lines,
+        jit: Jit,
+    }
+
+    impl Bench {
+        /// `program` at address zero, [`RAM`] bytes of RAM under it.
+        fn new(program: &[u32]) -> Bench {
+            let ram = Arc::new(RamStore::new(RAM));
+            for (i, word) in program.iter().enumerate() {
+                for (j, byte) in word.to_le_bytes().iter().enumerate() {
+                    ram.write_u8((i * 4 + j) as u64, *byte).expect("in range");
+                }
+            }
+            let space = AddressSpace::new("mem", 64);
+            space
+                .topology()
+                .map(Region::ram("ram", ram), 0)
+                .expect("nothing else is mapped");
+            let cfg = Config::rv64gc().with_reset_vector(0);
+            Bench {
+                space: Arc::new(space),
+                state: State::new(&cfg),
+                cfg,
+                tlb: mmu::Tlb::new(),
+                lines: Lines::default(),
+                jit: Jit::new(false),
+            }
+        }
+
+        /// Write `value` into guest physical memory, for building page tables.
+        fn poke(&self, addr: u64, value: u64) {
+            for i in 0..8 {
+                self.space
+                    .write(
+                        addr + i,
+                        Width::U8,
+                        (value >> (8 * i)) & 0xff,
+                        MemAttrs::DEFAULT,
+                    )
+                    .expect("in RAM");
+            }
+        }
+
+        /// The same bench with Sv39 translation on, `program` at **physical**
+        /// `0x4000`, and virtual page zero mapped to it.
+        ///
+        /// Three levels, root at 0x1000, exactly as `mmu`'s own fixture builds
+        /// them. It exists because nothing else in `cargo test` runs a
+        /// **paged** JIT hart: the block key, the walk's tick cost and the
+        /// per-access split all take a different branch under translation, and
+        /// until this fixture every one of them was reached only by a Linux
+        /// guest nobody's `cargo test` downloads.
+        fn paged(program: &[u32]) -> Bench {
+            use super::super::mmu::pte;
+            let mut b = Bench::new(&[]);
+            // No PMP entries, as `mmu`'s own Sv39 fixture does it: with
+            // entries implemented and none configured, an S-mode access is
+            // denied and the walk under test never happens.
+            b.cfg.pmp_count = 0;
+            b.state = State::new(&b.cfg);
+            for (i, word) in program.iter().enumerate() {
+                b.poke(0x4000 + (i as u64) * 4, u64::from(*word));
+            }
+            let leaf = pte::V | pte::R | pte::X | pte::A;
+            b.poke(0x1000, ((0x2000 >> 12) << 10) | pte::V);
+            b.poke(0x2000, ((0x3000 >> 12) << 10) | pte::V);
+            b.poke(0x3000, ((0x4000 >> 12) << 10) | leaf);
+            b.state.csrs.satp = (8 << 60) | (0x1000 >> 12);
+            b.state.csrs.priv_mode = super::super::csr::Priv::Supervisor;
+            b.state.pc = 0;
+            b
+        }
+
+        /// [`Bench::paged`] with its whole mapped page full of [`COUNT_UP`].
+        ///
+        /// A block never leaves the page it started on ([`lift`]), so the last
+        /// block on this page ends *at the page boundary* and exits to
+        /// `0x1000` — which nothing maps. That makes the fault land at a
+        /// **chained** boundary, which is the only way to reach
+        /// [`Admit::Trap`] through [`Frontend::enter`].
+        ///
+        /// Two earlier shapes of this fixture reached the *prologue*'s trap
+        /// instead, and both are worth writing down because either mistake
+        /// silently tests nothing:
+        ///
+        /// * a `jalr` to an unmapped page — but `jalr` is outside the lifted
+        ///   subset, so the instruction before the jump is interpreted and the
+        ///   fault lands in the next `advance`'s prologue;
+        /// * entering at the *start* of the page — 1 024 instructions is
+        ///   exactly [`CHAIN`] × [`lift::MAX_INSNS`], so the chain runs out of
+        ///   budget on the boundary before the fault.
+        ///
+        /// Entering sixty-four instructions from the end makes the second
+        /// boundary of the first chain the faulting one, which is the arm.
+        fn paged_off_the_end() -> Bench {
+            let mut b = Bench::paged(&[]);
+            let pair = u64::from(COUNT_UP) | (u64::from(COUNT_UP) << 32);
+            for i in 0..512 {
+                b.poke(0x4000 + i * 8, pair);
+            }
+            b.state.pc = 0x1000 - (lift::MAX_INSNS as u64) * 4;
+            b
+        }
+
+        /// Run `engine` until the guest takes a trap, and say what it cost.
+        ///
+        /// The tick count *to the trap* is the measurement: delivering an
+        /// entry fault a round trip late walks the same faulting fetch twice,
+        /// and a walk that faults fills no TLB entry to make the second one
+        /// free.
+        fn run_until_trap(&mut self, engine: fn(&mut Bench, u64) -> u64) -> u64 {
+            let mut used = 0;
+            while self.state.csrs.mcause == 0 && used < 100_000 {
+                let n = engine(self, 100_000 - used);
+                if n == 0 {
+                    break;
+                }
+                used += n;
+            }
+            used
+        }
+
+        /// Ask [`admit`] what it would do at the current PC.
+        fn admit(&mut self, remaining: u64) -> Admit {
+            let Bench {
+                space,
+                cfg,
+                state,
+                tlb,
+                lines,
+                jit,
+            } = self;
+            let mut exec = Exec::new(state, tlb, space, cfg, lines, ExitMask::NONE);
+            let pc = exec.st.pc;
+            admit(cfg, &jit.costs, &mut exec, pc, remaining)
+        }
+
+        /// One [`advance`], reporting what it consumed.
+        fn advance(&mut self, budget: u64) -> u64 {
+            let Bench {
+                space,
+                cfg,
+                state,
+                tlb,
+                lines,
+                jit,
+            } = self;
+            advance(jit, state, tlb, space, cfg, lines, ExitMask::NONE, budget).0
+        }
+
+        /// One interpreted instruction, reporting what it consumed.
+        fn step(&mut self) -> u64 {
+            let Bench {
+                space,
+                cfg,
+                state,
+                tlb,
+                lines,
+                ..
+            } = self;
+            Exec::new(state, tlb, space, cfg, lines, ExitMask::NONE).step()
+        }
+    }
+
+    /// Drive [`advance`] directly, so the dispatcher's own statistics are
+    /// reachable — `Hart::jit_stats` reports only two of them.
+    ///
+    /// Returns the statistics and the ticks the run consumed.
+    fn drive(program: &[u32], budget: u64, calls: usize) -> (crate::jit::DispatchStats, u64) {
+        let mut b = Bench::new(program);
+        let mut used = 0;
+        for _ in 0..calls {
+            used += b.advance(budget);
+        }
+        (b.jit.disp.stats(), used)
+    }
+
+    #[test]
+    fn a_pending_interrupt_keeps_a_block_from_running_at_any_boundary() {
+        // `admit` asks this first, and asking it *per block* is the whole
+        // argument that a sixteen-block chain is as prompt as sixteen
+        // one-block calls: `Exec::step` is what takes the trap, and a block
+        // run instead would take it up to `lift::MAX_INSNS` instructions late.
+        use crate::cpu::riscv::csr::{irq, status};
+        let mut b = Bench::new(&FAR_LOOP);
+        assert!(
+            matches!(b.admit(u64::MAX), Admit::Ready(_)),
+            "the fixture has to be liftable, or this proves nothing"
+        );
+        b.state.csrs.mie |= irq::MTI;
+        b.state.csrs.mstatus |= status::MIE;
+        b.lines.set_pending(irq::MTI, true);
+        assert!(
+            matches!(b.admit(u64::MAX), Admit::Interpret),
+            "a hart with a pending machine timer interrupt must reach the \
+             interpreter, whatever is liftable at its PC"
+        );
+    }
+
+    #[test]
+    fn a_stalled_wfi_keeps_a_block_from_running_too() {
+        // The other half of the same guard. A `WFI` that has not been woken is
+        // not an instruction a block can retire past.
+        let mut b = Bench::new(&FAR_LOOP);
+        assert!(matches!(b.admit(u64::MAX), Admit::Ready(_)));
+        b.state.wfi = true;
+        assert!(matches!(b.admit(u64::MAX), Admit::Interpret));
+    }
+
+    #[test]
+    fn a_block_nothing_is_known_about_is_guarded_by_the_whole_worst_case() {
+        // The `None` arm of the cost lookup, which is every block's *first*
+        // execution. Guarding it with anything less than `worst_bound` lets a
+        // block spend more than the quantum had left, and the two engines then
+        // stop on different instructions with different debt — the divergence
+        // `ROADMAP.md` §0 forbids.
+        let worst = worst_bound(&Config::rv64gc(), false);
+        let mut b = Bench::new(&FAR_LOOP);
+        assert!(
+            matches!(b.admit(worst - 1), Admit::Interpret),
+            "a budget one short of the worst case must decline"
+        );
+        assert!(
+            matches!(b.admit(worst), Admit::Ready(_)),
+            "and exactly enough must be enough"
+        );
+    }
+
+    #[test]
+    fn a_remembered_cost_lets_a_block_run_in_a_budget_its_worst_case_would_not_fit() {
+        // What [`Costs`] is *for*: after one lift the guard knows this block
+        // spends a handful of ticks rather than the frontend's whole
+        // instruction limit, and a budget between the two admits it. A cost
+        // filed under the wrong key is a table that never answers, and the
+        // engine silently falls back to interpreting almost everything.
+        let worst = worst_bound(&Config::rv64gc(), false);
+        let mut b = Bench::new(&FAR_LOOP);
+        // Warm the table: one generous call, which lifts and files the cost.
+        b.advance(u64::MAX / 2);
+        let before = b.jit.disp.stats().blocks;
+        assert!(before > 0, "nothing ran, so nothing was costed");
+        // Now a budget the *worst* case does not fit but the real one does.
+        for _ in 0..8 {
+            b.advance(worst / 4);
+        }
+        assert!(
+            b.jit.disp.stats().blocks > before,
+            "no block ran under a budget its remembered cost fits: the cost \
+             table is not answering ({:?})",
+            b.jit.disp.stats()
+        );
+    }
+
+    #[test]
+    fn an_entry_fetch_that_faults_traps_where_the_interpreter_traps() {
+        // The `Admit::Trap` arm, and the only path that reaches it: a block
+        // that *ends* by jumping somewhere unmapped, so the fault happens at
+        // the next boundary of a chain rather than in `advance`'s prologue.
+        // Interpreting instead would walk and charge for the fetch twice —
+        // once here and once in `Exec::step` — because a faulting translation
+        // fills no TLB entry.
+        let (interp, jit) = agree(&FETCH_FAULT, 1000, 8);
+        assert_ne!(
+            interp.csrs().mcause,
+            0,
+            "the fixture never faulted, so it tests nothing"
+        );
+        assert_eq!(interp.csrs().mepc, jit.csrs().mepc);
+        assert_eq!(
+            interp.csrs().mtval,
+            jit.csrs().mtval,
+            "and the faulting address, which is the PC the chain jumped to"
+        );
+    }
+
+    #[test]
+    fn a_misaligned_access_is_costed_at_what_it_can_really_spend() {
+        // `per_access` says a misaligned access on this core is one bus cycle
+        // *per byte*, and the budget guard has to believe it: a block costed
+        // as though every access were aligned is admitted into a budget it
+        // then overruns. Every column of `agree` — cycles, debt, the stopping
+        // instruction — moves when that happens.
+        //
+        // Two things have to be true at once for the mis-costing to show, and
+        // getting either wrong lets the mutant walk out — both did, in turn:
+        //
+        // * the budget must sit **between** the wrong bound and the right one,
+        //   and those are *measured*, not guessed: this fixture's hot block is
+        //   four instructions with two accesses, so eight ticks of fetch plus
+        //   either two (an access costed as aligned) or sixteen. Ten and
+        //   twenty-four. Two budgets picked by eye fell outside that window
+        //   and the mutant walked out of both;
+        // * and the cost table must already **know** this block, because a
+        //   cold table answers `worst_bound` — 640 ticks — which no small
+        //   budget admits, so nothing is ever lifted and both engines
+        //   interpret everything in perfect agreement.
+        //
+        // And even inside the window the budget has to be one where the
+        // *interpreter* would stop somewhere else: at sixteen it runs the same
+        // four instructions and overruns to twenty-four exactly as the block
+        // does, because the last instruction is the expensive one. So the
+        // budget is swept rather than picked.
+        //
+        // So: warm at a budget everything fits, then squeeze.
+        for (engine, squeeze) in [Engine::Jit, Engine::JitHost]
+            .into_iter()
+            .flat_map(|e| [10, 12, 14, 18, 20, 22].map(|b| (e, b)))
+        {
+            let interp = hart(Engine::Interp, &MISALIGNED);
+            let jit = hart(engine, &MISALIGNED);
+            for _ in 0..8 {
+                assert_eq!(interp.run_budget(1000), jit.run_budget(1000));
+            }
+            for n in 0..200 {
+                assert_eq!(
+                    interp.run_budget(squeeze),
+                    jit.run_budget(squeeze),
+                    "quantum {n} under {engine:?} at a budget of {squeeze}"
+                );
+            }
+            assert_eq!(interp.cycles(), jit.cycles(), "the cycle counter");
+            assert_eq!(interp.cycle_debt(), jit.cycle_debt(), "the carried debt");
+            assert_eq!(interp.instret(), jit.instret(), "instructions retired");
+            for r in 0..32 {
+                assert_eq!(interp.x(r), jit.x(r), "x{r} under {engine:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_chained_entry_fetch_that_page_faults_traps_where_the_interpreter_traps() {
+        // The [`Admit::Trap`] arm, and the only hart that can reach it: in
+        // bare mode with no PMP `Exec::translate` cannot fail, so a bad PC
+        // faults later, in the *fetch*, and never through `admit` at all. A
+        // paged hart faults in the walk.
+        //
+        // The block here ends by jumping to a virtual page nothing maps, so
+        // the fault is at the chain's next boundary. Handing the PC back
+        // instead of delivering it there would walk and charge for the same
+        // fetch twice, because a faulting translation fills no TLB entry —
+        // which is a cycle-counter divergence, and `ROADMAP.md` §0 makes that
+        // a state-hash divergence.
+        let mut jit = Bench::paged_off_the_end();
+        let mut oracle = Bench::paged_off_the_end();
+        let jit_ticks = jit.run_until_trap(Bench::advance);
+        let oracle_ticks = oracle.run_until_trap(|b, _| b.step());
+        assert_ne!(
+            jit.state.csrs.mcause, 0,
+            "the fixture never faulted, so it tests nothing"
+        );
+        assert_eq!(jit.state.csrs.mcause, oracle.state.csrs.mcause, "the cause");
+        assert_eq!(
+            jit.state.csrs.mepc, oracle.state.csrs.mepc,
+            "mepc, which is the PC the chain fell through to and not the one \
+             it started at"
+        );
+        assert_eq!(jit.state.csrs.mtval, oracle.state.csrs.mtval, "mtval");
+        assert_eq!(
+            jit.state.csrs.minstret, oracle.state.csrs.minstret,
+            "instructions retired before the trap"
+        );
+        assert_eq!(
+            jit_ticks, oracle_ticks,
+            "and the ticks the trap cost to reach: a chained entry fault \
+             delivered a round trip late walks the same fetch twice"
+        );
+    }
+
+    #[test]
+    fn a_paged_block_is_named_by_the_physical_page_its_entry_resolved_to() {
+        // `key_origin`, which is the fix a Linux boot needed: keyed on
+        // `Csrs::translation_gen` the cache missed on every `SRET` and ran
+        // four times slower than the interpreter. Keyed on the physical page
+        // the entry translation just produced, it is exact — and until this
+        // fixture existed nothing but that Linux boot ever took the branch.
+        let mut b = Bench::paged(&FAR_LOOP);
+        let Admit::Ready(at) = b.admit(u64::MAX) else {
+            panic!("the mapped page must be liftable");
+        };
+        assert_eq!(at.base, 0x4000, "the bytes come from the mapped page");
+        assert_eq!(at.origin, Origin::Paged { generation: 0x4 });
+        assert_ne!(
+            at.key,
+            lift::key(&b.cfg, Origin::Bare, SHAPE),
+            "a paged block must not key identically to a bare one at the same PC"
+        );
+        assert_eq!(at.entry, WALK_ACCESSES, "and the walk is charged for");
+        assert_eq!(at.access, per_access(&b.cfg, true));
+
+        // The same virtual page, a different physical one. The bytes have
+        // changed, so the key must: a stale block must be unreachable rather
+        // than merely unlikely.
+        use super::super::mmu::pte;
+        b.poke(
+            0x3000,
+            ((0x5000 >> 12) << 10) | pte::V | pte::R | pte::X | pte::A,
+        );
+        b.tlb.flush();
+        let Admit::Ready(moved) = b.admit(u64::MAX) else {
+            panic!("still liftable");
+        };
+        assert_ne!(moved.key, at.key, "a remapped page is a different block");
+        assert_eq!(moved.base, 0x5000);
+    }
+
+    #[test]
+    fn a_topology_change_throws_the_translations_away() {
+        // `Frontend::epoch` is read at every boundary and answered from the
+        // address space's own generation. Answering it with a constant — or
+        // reading it once per run — leaves a chained successor executing a
+        // block lifted through a topology that no longer exists.
+        let mut b = Bench::new(&FAR_LOOP);
+        for _ in 0..8 {
+            b.advance(u64::MAX / 2);
+        }
+        let before = b.jit.disp.stats().translated;
+        let resyncs = b.jit.disp.stats().resyncs;
+        assert!(before > 0, "nothing was translated, so nothing can be lost");
+        b.space
+            .topology()
+            .map(
+                Region::ram("more", Arc::new(RamStore::new(0x1000))),
+                0x20000,
+            )
+            .expect("that address is free");
+        b.advance(u64::MAX / 2);
+        assert_eq!(
+            b.jit.disp.stats().resyncs,
+            resyncs + 1,
+            "the epoch move was missed"
+        );
+        assert!(
+            b.jit.disp.stats().translated > before,
+            "the cache survived a retopology"
+        );
+    }
+
+    #[test]
+    fn the_safe_point_bound_is_the_number_the_documentation_states() {
+        // `CHAIN` is a tunable and this is not a second opinion about its
+        // value: it is the claim that goes with it. `ROADMAP.md` §4.7's flag
+        // is tested between `advance` calls, so what one call may execute is
+        // the bound, and the docs say 1 024 guest instructions. Moving the
+        // constant without moving the claim is what this catches.
+        assert_eq!(CHAIN * lift::MAX_INSNS, 1024);
+    }
+
+    #[test]
+    fn a_chain_really_chains_now_that_a_boundary_has_a_hook() {
+        // The measurement this exists for: `DispatchStats::chained` was zero
+        // in *every* run of a real guest, because a dispatcher without
+        // `Frontend::enter` had to be driven one block at a time. `LOOP` is
+        // four blocks round a back edge, so after the first pass every edge is
+        // a patched exit.
+        let (stats, _) = drive(&FAR_LOOP, 100_000, 64);
+        assert!(stats.blocks > 64, "the run was too short to chain anything");
+        assert!(
+            stats.chained > 0,
+            "no block was reached by following a patched exit: {stats:?}"
+        );
+        // Per `advance` call, at most one block is looked up or translated and
+        // the rest are followed, so the chained share is the bulk of it.
+        assert!(
+            stats.chained > stats.blocks / 2,
+            "chaining is reaching only {} of {} blocks: {stats:?}",
+            stats.chained,
+            stats.blocks
+        );
+    }
+
+    #[test]
+    fn a_chain_is_bounded_by_the_stated_safe_point_number() {
+        // `Hart::run_budget` tests the safe-point flag between `advance`
+        // calls, so what one call may execute *is* the safe-point bound
+        // (`ROADMAP.md` §4.7). One call, an unbounded budget, and the answer
+        // must be `CHAIN` rather than "as many as the budget allowed".
+        let (stats, _) = drive(&FAR_LOOP, u64::MAX / 2, 1);
+        assert!(
+            stats.blocks <= CHAIN as u64,
+            "one advance ran {} blocks, and the safe point is stated as {CHAIN}",
+            stats.blocks
+        );
+        assert_eq!(
+            stats.blocks, CHAIN as u64,
+            "and a loop with nothing to decline should reach the bound exactly"
+        );
+    }
+
+    #[test]
+    fn a_chain_never_spends_more_than_the_budget_it_was_given() {
+        // The other half of the bound, and the one that keeps the two engines
+        // on the same instruction: every block of a chain is admitted against
+        // what the chain has *left*, not against what it started with. A
+        // budget one block cannot fit means no block runs at all.
+        for budget in [1, 4, 12, 64, 512] {
+            let (stats, used) = drive(&FAR_LOOP, budget, 1);
+            assert!(
+                used <= budget.max(1) + worst_bound(&Config::rv64gc(), false),
+                "a run given {budget} spent {used} over {} blocks",
+                stats.blocks
+            );
+        }
     }
 
     #[test]

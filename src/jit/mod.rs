@@ -122,7 +122,7 @@ pub mod x86;
 
 pub use cache::{BlockCache, BlockId, CacheStats, CodeRef, DEFAULT_CAPACITY, EXITS};
 pub use dispatch::{
-    DirtyPages, DispatchStats, Dispatcher, Frontend, Run, Stop, StoreLog, Translation,
+    DirtyPages, DispatchStats, Dispatcher, Entry, Frontend, Run, Stop, StoreLog, Translation,
 };
 pub use fast::{FastMem, LoadPlan};
 pub use tlb::{Context, DEFAULT_ENTRIES, Epoch, FastSet, PAGE_MASK, PAGE_SIZE, Tlb, TlbStats};
