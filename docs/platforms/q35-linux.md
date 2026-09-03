@@ -311,17 +311,22 @@ reaches **userspace**. The interrupt tree is the 8259A pair driving `INTR`
 through the IMCR, the NVMe probe finishes, and busybox comes up:
 
 ```text
-[  336.842411] nvme nvme0: pci function 0000:00:04.0
-[  336.857466] nvme 0000:00:04.0: enabling device (0000 -> 0002)
-[  338.926689] nvme nvme0: missing or invalid SUBNQN field.
-[  339.547129] rtc_cmos rtc_cmos: setting system clock to 2026-01-01T00:12:41 UTC
-[  339.844524] nvme nvme0: 1/0/0 default/read/poll queues
-[  340.463757] nvme nvme0: Identify Descriptors failed (nsid=1, status=0x2)
-[  423.660720] Freeing unused kernel image (initmem) memory: 3912K
-[  725.191061] Run /init as init process
+[  333.602018] nvme nvme0: pci function 0000:00:04.0
+[  333.617639] nvme 0000:00:04.0: enabling device (0000 -> 0002)
+[  336.458101] rtc_cmos rtc_cmos: setting system clock to 2026-01-01T00:12:37 UTC
+[  336.561399] nvme nvme0: 1/0/0 default/read/poll queues
+[ 2089.880754] Freeing unused kernel image (initmem) memory: 3912K
+[ 2385.351045] Run /init as init process
 rsemu# head -c 40 /dev/nvme0n1
-head: /dev/nvme0n1: No such file or directory
+rsemu q35-linux nvme namespace, LBA 0
 ```
+
+That last line is **forty bytes off the medium**, read by busybox through a
+block device the kernel's own driver created. It is the board's whole stack
+answering at once: PCI enumeration, an MSI-less interrupt through the 8259A
+pair, an admin queue pair, an I/O queue pair, `Identify` for the controller and
+for the namespace, and a read command whose data landed where the PRP list
+said. Nothing here is a constant in a test.
 
 `setting system clock to 2026-01-01T00:12:41` is the board's `time` parameter
 plus twelve minutes of its own emulated wall clock, read back out of the RTC by
@@ -332,27 +337,26 @@ that separate them are the whole of the next section.
 
 ## Where it stops, and what is in the way
 
-Two things now, and neither is the one this page used to name.
+**One thing now.** This page has named four obstacles over its life and three
+of them are gone: two were refuted rather than fixed (their real causes were
+the 8259A acknowledge defect and the missing HPET route), and the third — the
+namespace — was a controller defect, fixed below.
 
-### 1. The namespace is never published — `Identify` CNS 03h
+### Fixed: the namespace is published
 
-Visible on the `noapic` run above, which is the one that gets far enough to
-look. The controller is enumerated, addressed, enabled, brought ready, given an
-admin queue pair and one I/O queue pair — `1/0/0 default/read/poll queues` is
-the driver saying so — and then:
+This section used to say `/dev/nvme0n1` did not exist because the model
+refused `Identify` with `CNS = 03h`, the Namespace Identification Descriptor
+list, with status `0x2` *Invalid Field in Command*.
 
-```text
-nvme nvme0: Identify Descriptors failed (nsid=1, status=0x2)
-```
+It was not alone. The controller reports `VS = 1.4.0`, and NVM Express 1.4
+§5.15.2.2 also makes `SUBNQN` mandatory for any controller claiming 1.2.1 or
+later — that field read as zeroes, and the kernel said so out loud
+(`missing or invalid SUBNQN field`). One claim, two fields not backed by it.
+Both are answered now (`src/dev/nvme/ctrl.rs`), the namespace carries a UUID
+derived from the identity the controller already publishes, and the run above
+is the result.
 
-Status `0x2` is *Invalid Field in Command*: the model refuses the `Identify`
-with `CNS = 03h`, the **Namespace Identification Descriptor list**. No block
-device follows, so `/dev/nvme0n1` does not exist and nothing has been read off
-the medium. This is `src/dev/nvme`, not this board — `tests/nvme_board.rs`
-drives the register file and the queues from Rust and never asks for that
-`CNS`.
-
-### 2. With the I/O APIC in use, `request_threaded_irq` does not return
+### Open: with the I/O APIC in use, `request_threaded_irq` does not return
 
 On the default command line the boot gets as far as
 `nvme 0000:00:04.0: enabling device` and then the worker registering the
