@@ -216,6 +216,16 @@ through a gate on a toy board
 (`an_hpets_legacy_route_gates_a_timer_off_its_line`); what was missing was six
 objects and a wire block in one machine file.
 
+`the_legacy_replacement_route_moves_irq0_from_the_8254_to_the_hpet` in
+[`tests/q35_linux.rs`](../../tests/q35_linux.rs) asks the shipped board the same
+question hermetically, in five seconds rather than five minutes, so that the
+wiring cannot be deleted quietly: it programs the 8254's counter 0 and watches
+the master 8259A's request register, which latches whether or not the line is
+masked, then sets the bit and asserts that the 8254 stops reaching IRQ0 and
+comparator 0 starts. Checked against the machine file as it was before the
+gate, the middle assertion fails — which is the negative control that says the
+test is testing the board rather than agreeing with itself.
+
 ## What it was measured doing
 
 Every line below is a byte the guest itself wrote to its own serial port,
