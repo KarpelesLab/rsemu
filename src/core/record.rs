@@ -895,6 +895,26 @@ impl Recorder {
         self.state.lock().log.set_shape(shape);
     }
 
+    /// The shape the log carries: for a replay, the board the recording was
+    /// taken from.
+    ///
+    /// The half of "machine identity is a diff, not a boolean" that lives on
+    /// this side. A recording written by [`InputLog::encode`] has always
+    /// carried it; until
+    /// [`Machine::set_recorder`](crate::machine::Machine::set_recorder) read it
+    /// back, nothing ever compared it, and a recording of one board replayed
+    /// into another delivered its input to whatever device answered to the same
+    /// channel name.
+    ///
+    /// Empty for a log built by hand — a unit test, a fuzz case — which is why
+    /// the check is skipped rather than failed in that case: an empty shape is
+    /// *unknown provenance*, not a mismatch.
+    #[must_use]
+    pub fn shape(&self) -> MachineShape {
+        self.state.lock().log.shape().clone()
+    }
+
+
     /// How many logged events have been replayed.
     #[must_use]
     pub fn cursor(&self) -> usize {
