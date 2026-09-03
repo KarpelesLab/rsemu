@@ -88,6 +88,7 @@ the question never arises.
 | | |
 | --- | --- |
 | [`system/firmware-boot.md`](system/firmware-boot.md) | BIOS, UEFI, ACPI, SMBIOS, device tree, boot protocols |
+| [`system/usermode-abi.md`](system/usermode-abi.md) | Level 3: ELF loading, the auxiliary vector, the syscall ABI, and the sandbox policy |
 | [`system/debug-protocols.md`](system/debug-protocols.md) | GDB remote serial protocol, DWARF |
 | [`system/remote-display.md`](system/remote-display.md) | RFB/VNC, SPICE |
 

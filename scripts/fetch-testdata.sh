@@ -1722,6 +1722,70 @@ build_a64_tests() {
 	note "    RSEMU_A64_TESTS=${dest} cargo test --all-features a64_conformance -- --nocapture"
 }
 
+# The level-3 guest binaries: statically linked Linux programs that
+# `src/usermode/proof.rs` runs with no guest kernel under them.
+#
+# Built here rather than downloaded, for the same reason `a64-tests` is: the
+# source is one file in this repository and a compiler's output does not belong
+# in the tree. Everything comes out of the Rust toolchain -- the musl libc and
+# its startup files ship with the target, and the linker is the rust-lld inside
+# the toolchain -- so there is no C toolchain and no sysroot in this path.
+build_usermode_guests() {
+	need rustc
+
+	local src="${REPO_ROOT}/tests/usermode"
+	local dest="${DEST_ROOT}/usermode"
+	local target=riscv64gc-unknown-linux-musl
+	[ -d "$src" ] || die "${src} is missing; this is not an rsemu checkout"
+
+	if ! rustc --target "$target" --print target-libdir 2>/dev/null |
+		xargs -r test -d; then
+		die "the ${target} standard library is not installed
+  rustup target add ${target}"
+	fi
+
+	# rustc drives the link through `cc` for musl targets, and this host's `cc`
+	# is not a RISC-V one. rust-lld ships with the toolchain and is reached
+	# through its `ld.lld` alias, because plain `rust-lld` refuses to guess
+	# which flavour of linker it is being asked to be.
+	local host ld
+	host="$(rustc -vV | sed -n 's/^host: //p')"
+	ld="$(rustc --print sysroot)/lib/rustlib/${host}/bin/gcc-ld/ld.lld"
+	[ -x "$ld" ] || die "no rust-lld at ${ld}; install the llvm-tools component"
+
+	mkdir -p "$dest"
+	local guest name out built=0
+	for guest in "$src"/*.rs; do
+		name="$(basename "$guest" .rs)"
+		out="${dest}/${name}-riscv64"
+		if [ "$FORCE" != 1 ] && [ -f "$out" ] && [ "$out" -nt "$guest" ]; then
+			note "  $(basename "$out") is up to date"
+			built=$((built + 1))
+			continue
+		fi
+		note "  building ${name} for ${target} ..."
+		# -C debuginfo=0 -C strip=symbols: the loader reads program headers and
+		# nothing else, and the debug sections are twenty times the program.
+		rustc --edition 2024 \
+			--target "$target" \
+			-C target-feature=+crt-static \
+			-C link-self-contained=yes \
+			-C linker="$ld" \
+			-C linker-flavor=ld \
+			-C opt-level=1 \
+			-C debuginfo=0 \
+			-C strip=symbols \
+			--crate-name "$name" \
+			-o "$out" \
+			"$guest" || die "could not build ${name}"
+		built=$((built + 1))
+	done
+
+	[ "$built" -gt 0 ] || die "no guests under ${src}"
+	ok "usermode-guests: ${built} static binaries in ${dest}"
+	note "    cargo test --all-features usermode::proof -- --nocapture"
+}
+
 usage() {
 	cat <<'EOF'
 usage: scripts/fetch-testdata.sh [options] [suite ...]
@@ -1742,6 +1806,12 @@ Suites:
                  (`rustup target add aarch64-unknown-none`); the linker is the
                  rust-lld inside the toolchain, so there is no C toolchain in
                  this path. See src/cpu/arm/a64/conformance.rs.
+  usermode-guests  the level-3 guest programs this repository BUILDS: static
+                 Linux binaries that src/usermode/proof.rs runs with no guest
+                 kernel under them. Needs `rustc` with the
+                 riscv64gc-unknown-linux-musl target installed
+                 (`rustup target add riscv64gc-unknown-linux-musl`); musl and
+                 the linker both come from the Rust toolchain.
   riscv-arch-test  the RISC-V architectural certification tests (BSD-3-Clause).
                  Built rather than downloaded: needs clang and a RISC-V linker
                  (lld, or rustup's rust-lld), and fetches the Sail reference
@@ -1845,6 +1915,7 @@ for suite in "${SUITES[@]}"; do
 		freedos|dos) fetch_freedos ;;
 		opensbi|riscv) fetch_opensbi ;;
 		a64-tests|a64) build_a64_tests ;;
+		usermode-guests|usermode) build_usermode_guests ;;
 		riscv-arch-test|arch-test|act) fetch_arch_test ;;
 		edk2|uefi) fetch_edk2 ;;
 		linux|kernel) fetch_linux ;;
