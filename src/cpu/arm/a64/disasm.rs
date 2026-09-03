@@ -286,6 +286,27 @@ fn mod_imm_shift(cmode: u32) -> String {
     }
 }
 
+/// Whether a shift by an immediate shifts *left*, and so reads its amount as
+/// `immh:immb - esize` rather than `2 * esize - immh:immb`.
+///
+/// The two directions share an encoding field and differ only in how it is
+/// read, so a row that lands on the wrong side of this prints a shift of the
+/// right magnitude in the wrong place — which is exactly the kind of defect
+/// that survives a decode-only cross-check.
+fn left_shift(op: isa::Op) -> bool {
+    matches!(
+        op,
+        isa::Op::ShlVec
+            | isa::Op::SliVec
+            | isa::Op::SqshlImmVec
+            | isa::Op::UqshlImmVec
+            | isa::Op::SqshluImmVec
+            | isa::Op::SqshlImmScalar
+            | isa::Op::UqshlImmScalar
+            | isa::Op::SqshluImmScalar
+    )
+}
+
 /// Whether a scalar SIMD operation is a floating-point one, and therefore
 /// takes its width from `sz` rather than being a doubleword.
 fn fp_scalar(op: isa::Op) -> bool {
@@ -1156,14 +1177,15 @@ pub fn disassemble(word: u32, pc: u64, features: isa::Features) -> Disassembled 
             let _ = write!(ops, "{}, {}, #0.0", varr(d, arr), varr(n, arr));
         }
         Fmt::VecNarrow => {
-            // `XTN` takes the destination width from `size` and `FCVTN` from
-            // `sz`, one field lower — the two groups share an encoding but
-            // not a field, which is why the destination is computed here and
-            // not in a shared helper.
-            let dst = if insn.op == isa::Op::XtnVec {
-                isa::simd_size(word)
-            } else {
+            // The integer narrows — `XTN` and the three saturating ones —
+            // take the destination width from `size`, and `FCVTN` from `sz`,
+            // one field lower. The two groups share an encoding but not a
+            // field, which is why the destination is computed here and not in
+            // a shared helper.
+            let dst = if insn.op == isa::Op::FcvtnVec {
                 1 + u32::from(isa::simd_sz(word))
+            } else {
+                isa::simd_size(word)
             };
             let lanes = 64 / (8 << dst);
             let _ = write!(
@@ -1266,7 +1288,7 @@ pub fn disassemble(word: u32, pc: u64, features: isa::Features) -> Disassembled 
                 simd::Arrangement::from_size(esize, isa::q(word))
             };
             let bits = 8 << esize;
-            let amount = if matches!(insn.op, isa::Op::ShlVec | isa::Op::SliVec) {
+            let amount = if left_shift(insn.op) {
                 immhb.wrapping_sub(bits)
             } else {
                 (2 * bits).wrapping_sub(immhb)
@@ -1407,6 +1429,52 @@ pub fn disassemble(word: u32, pc: u64, features: isa::Features) -> Disassembled 
             } else {
                 let _ = write!(ops, "{letter}{d}, {letter}{n}");
             }
+        }
+        Fmt::SimdScalarThreeSz | Fmt::SimdScalarTwoSz => {
+            let letter = simd::elem_letter(isa::simd_size(word));
+            if insn.fmt == Fmt::SimdScalarThreeSz {
+                let _ = write!(ops, "{letter}{d}, {letter}{n}, {letter}{m}");
+            } else {
+                let _ = write!(ops, "{letter}{d}, {letter}{n}");
+            }
+        }
+        Fmt::SimdScalarNarrow => {
+            let dst = isa::simd_size(word);
+            let _ = write!(
+                ops,
+                "{}{d}, {}{n}",
+                simd::elem_letter(dst),
+                simd::elem_letter(dst + 1)
+            );
+        }
+        Fmt::SimdScalarDiff => {
+            let src = isa::simd_size(word);
+            let _ = write!(
+                ops,
+                "{}{d}, {}{n}, {}{m}",
+                simd::elem_letter(src + 1),
+                simd::elem_letter(src),
+                simd::elem_letter(src)
+            );
+        }
+        Fmt::SimdScalarShift => {
+            let (esize, immhb) = shift_of(word);
+            let letter = simd::elem_letter(esize);
+            let _ = write!(
+                ops,
+                "{letter}{d}, {letter}{n}, #{}",
+                immhb.wrapping_sub(8 << esize)
+            );
+        }
+        Fmt::SimdScalarShiftNarrow => {
+            let (esize, immhb) = shift_of(word);
+            let _ = write!(
+                ops,
+                "{}{d}, {}{n}, #{}",
+                simd::elem_letter(esize),
+                simd::elem_letter(esize + 1),
+                (16u32 << esize).wrapping_sub(immhb)
+            );
         }
         Fmt::SimdScalarPair => {
             let letter = scalar_letter(word, insn.op);

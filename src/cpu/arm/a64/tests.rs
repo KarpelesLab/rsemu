@@ -3314,3 +3314,656 @@ fn the_timer_survives_a_snapshot() -> Result<()> {
     assert_eq!(restored.counter(), h.cpu.counter());
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Saturating and rounding arithmetic, and `FPSR.QC`
+// ---------------------------------------------------------------------------
+//
+// Every word below is `llvm-mc -triple=aarch64`'s encoding of the assembly in
+// its doc comment. None of them was derived from the masks in `isa.rs`, which
+// is the only reason `the_saturating_encodings_decode` says anything those
+// masks do not already say about themselves.
+
+/// `sqadd v0.16b, v1.16b, v2.16b`.
+const SQADD_16B: u32 = 0x4e22_0c20;
+/// `uqadd v0.16b, v1.16b, v2.16b`.
+const UQADD_16B: u32 = 0x6e22_0c20;
+/// `sqsub v0.8h, v1.8h, v2.8h`.
+const SQSUB_8H: u32 = 0x4e62_2c20;
+/// `uqsub v0.4s, v1.4s, v2.4s`.
+const UQSUB_4S: u32 = 0x6ea2_2c20;
+/// `sqadd v0.2d, v1.2d, v2.2d`.
+const SQADD_2D: u32 = 0x4ee2_0c20;
+/// `srhadd v0.16b, v1.16b, v2.16b`.
+const SRHADD_16B: u32 = 0x4e22_1420;
+/// `urhadd v0.16b, v1.16b, v2.16b`.
+const URHADD_16B: u32 = 0x6e22_1420;
+/// `shadd v0.16b, v1.16b, v2.16b`.
+const SHADD_16B: u32 = 0x4e22_0420;
+/// `uhadd v0.16b, v1.16b, v2.16b`.
+const UHADD_16B: u32 = 0x6e22_0420;
+/// `shsub v0.16b, v1.16b, v2.16b`.
+const SHSUB_16B: u32 = 0x4e22_2420;
+/// `uhsub v0.16b, v1.16b, v2.16b`.
+const UHSUB_16B: u32 = 0x6e22_2420;
+/// `sqshl v0.16b, v1.16b, v2.16b`.
+const SQSHL_16B: u32 = 0x4e22_4c20;
+/// `uqshl v0.16b, v1.16b, v2.16b`.
+const UQSHL_16B: u32 = 0x6e22_4c20;
+/// `srshl v0.2d, v1.2d, v2.2d`.
+const SRSHL_2D: u32 = 0x4ee2_5420;
+/// `urshl v0.2d, v1.2d, v2.2d`.
+const URSHL_2D: u32 = 0x6ee2_5420;
+/// `sqrshl v0.16b, v1.16b, v2.16b`.
+const SQRSHL_16B: u32 = 0x4e22_5c20;
+/// `uqrshl v0.16b, v1.16b, v2.16b`.
+const UQRSHL_16B: u32 = 0x6e22_5c20;
+/// `sqdmulh v0.8h, v1.8h, v2.8h`.
+const SQDMULH_8H: u32 = 0x4e62_b420;
+/// `sqrdmulh v0.8h, v1.8h, v2.8h`.
+const SQRDMULH_8H: u32 = 0x6e62_b420;
+/// `suqadd v0.16b, v1.16b`.
+const SUQADD_16B: u32 = 0x4e20_3820;
+/// `usqadd v0.16b, v1.16b`.
+const USQADD_16B: u32 = 0x6e20_3820;
+/// `sqabs v0.16b, v1.16b`.
+const SQABS_16B: u32 = 0x4e20_7820;
+/// `sqneg v0.16b, v1.16b`.
+const SQNEG_16B: u32 = 0x6e20_7820;
+/// `sqxtn v0.8b, v1.8h`.
+const SQXTN_8B: u32 = 0x0e21_4820;
+/// `sqxtn2 v0.16b, v1.8h`.
+const SQXTN2_16B: u32 = 0x4e21_4820;
+/// `uqxtn v0.8b, v1.8h`.
+const UQXTN_8B: u32 = 0x2e21_4820;
+/// `sqxtun v0.8b, v1.8h`.
+const SQXTUN_8B: u32 = 0x2e21_2820;
+/// `sqshl v0.16b, v1.16b, #3`.
+const SQSHL_16B_IMM: u32 = 0x4f0b_7420;
+/// `uqshl v0.16b, v1.16b, #3`.
+const UQSHL_16B_IMM: u32 = 0x6f0b_7420;
+/// `sqshlu v0.16b, v1.16b, #3`.
+const SQSHLU_16B_IMM: u32 = 0x6f0b_6420;
+/// `srshr v0.16b, v1.16b, #3`.
+const SRSHR_16B_IMM: u32 = 0x4f0d_2420;
+/// `urshr v0.16b, v1.16b, #3`.
+const URSHR_16B_IMM: u32 = 0x6f0d_2420;
+/// `srsra v0.16b, v1.16b, #3`.
+const SRSRA_16B_IMM: u32 = 0x4f0d_3420;
+/// `ursra v0.16b, v1.16b, #3`.
+const URSRA_16B_IMM: u32 = 0x6f0d_3420;
+/// `rshrn v0.8b, v1.8h, #3`.
+const RSHRN_8B_IMM: u32 = 0x0f0d_8c20;
+/// `sqshrn v0.8b, v1.8h, #3`.
+const SQSHRN_8B_IMM: u32 = 0x0f0d_9420;
+/// `uqshrn v0.8b, v1.8h, #3`.
+const UQSHRN_8B_IMM: u32 = 0x2f0d_9420;
+/// `sqrshrn v0.8b, v1.8h, #3`.
+const SQRSHRN_8B_IMM: u32 = 0x0f0d_9c20;
+/// `uqrshrn v0.8b, v1.8h, #3`.
+const UQRSHRN_8B_IMM: u32 = 0x2f0d_9c20;
+/// `sqshrun v0.8b, v1.8h, #3`.
+const SQSHRUN_8B_IMM: u32 = 0x2f0d_8420;
+/// `sqrshrun v0.8b, v1.8h, #3`.
+const SQRSHRUN_8B_IMM: u32 = 0x2f0d_8c20;
+/// `sqdmull v0.4s, v1.4h, v2.4h`.
+const SQDMULL_4S: u32 = 0x0e62_d020;
+/// `sqdmull2 v0.4s, v1.8h, v2.8h`.
+const SQDMULL2_4S: u32 = 0x4e62_d020;
+/// `sqdmlal v0.4s, v1.4h, v2.4h`.
+const SQDMLAL_4S: u32 = 0x0e62_9020;
+/// `sqdmlsl v0.4s, v1.4h, v2.4h`.
+const SQDMLSL_4S: u32 = 0x0e62_b020;
+/// `sqadd b0, b1, b2`.
+const SQADD_B: u32 = 0x5e22_0c20;
+/// `uqadd b0, b1, b2`.
+const UQADD_B: u32 = 0x7e22_0c20;
+/// `sqadd d0, d1, d2`.
+const SQADD_D: u32 = 0x5ee2_0c20;
+/// `sqsub b0, b1, b2`.
+const SQSUB_B: u32 = 0x5e22_2c20;
+/// `sqshl b0, b1, b2`.
+const SQSHL_B: u32 = 0x5e22_4c20;
+/// `sqrshl h0, h1, h2`.
+const SQRSHL_H: u32 = 0x5e62_5c20;
+/// `uqrshl s0, s1, s2`.
+const UQRSHL_S: u32 = 0x7ea2_5c20;
+/// `sqdmulh h0, h1, h2`.
+const SQDMULH_H: u32 = 0x5e62_b420;
+/// `sqrdmulh s0, s1, s2`.
+const SQRDMULH_S: u32 = 0x7ea2_b420;
+/// `suqadd b0, b1`.
+const SUQADD_B: u32 = 0x5e20_3820;
+/// `usqadd b0, b1`.
+const USQADD_B: u32 = 0x7e20_3820;
+/// `sqabs b0, b1`.
+const SQABS_B: u32 = 0x5e20_7820;
+/// `sqneg d0, d1`.
+const SQNEG_D: u32 = 0x7ee0_7820;
+/// `sqxtn b0, h1`.
+const SQXTN_B: u32 = 0x5e21_4820;
+/// `uqxtn s0, d1`.
+const UQXTN_S: u32 = 0x7ea1_4820;
+/// `sqxtun h0, s1`.
+const SQXTUN_H: u32 = 0x7e61_2820;
+/// `sqdmull s0, h1, h2`.
+const SQDMULL_S: u32 = 0x5e62_d020;
+/// `sqdmlal d0, s1, s2`.
+const SQDMLAL_D: u32 = 0x5ea2_9020;
+/// `sqdmlsl s0, h1, h2`.
+const SQDMLSL_S: u32 = 0x5e62_b020;
+/// `sqshl b0, b1, #3`.
+const SQSHL_B_IMM: u32 = 0x5f0b_7420;
+/// `uqshl d0, d1, #3`.
+const UQSHL_D_IMM: u32 = 0x7f43_7420;
+/// `sqshlu h0, h1, #3`.
+const SQSHLU_H_IMM: u32 = 0x7f13_6420;
+/// `sqshrn b0, h1, #3`.
+const SQSHRN_B_IMM: u32 = 0x5f0d_9420;
+/// `uqshrn b0, h1, #3`.
+const UQSHRN_B_IMM: u32 = 0x7f0d_9420;
+/// `sqrshrn s0, d1, #3`.
+const SQRSHRN_S_IMM: u32 = 0x5f3d_9c20;
+/// `uqrshrn h0, s1, #3`.
+const UQRSHRN_H_IMM: u32 = 0x7f1d_9c20;
+/// `sqshrun b0, h1, #3`.
+const SQSHRUN_B_IMM: u32 = 0x7f0d_8420;
+/// `sqrshrun b0, h1, #3`.
+const SQRSHRUN_B_IMM: u32 = 0x7f0d_8c20;
+/// `sshl d0, d1, d2`.
+const SSHL_D: u32 = 0x5ee2_4420;
+/// `ushl d0, d1, d2`.
+const USHL_D: u32 = 0x7ee2_4420;
+/// `srshl d0, d1, d2`.
+const SRSHL_D: u32 = 0x5ee2_5420;
+/// `urshl d0, d1, d2`.
+const URSHL_D: u32 = 0x7ee2_5420;
+
+/// `FPSR.QC`, bit 27 — the flag this whole group exists around.
+const QC: u64 = super::fp::fpsr::QC;
+
+/// Every saturating and rounding encoding decodes, and to a row of the right
+/// feature.
+#[test]
+fn the_saturating_encodings_decode() {
+    let words = [
+        SQADD_16B,
+        UQADD_16B,
+        SQSUB_8H,
+        UQSUB_4S,
+        SQADD_2D,
+        SRHADD_16B,
+        URHADD_16B,
+        SHADD_16B,
+        UHADD_16B,
+        SHSUB_16B,
+        UHSUB_16B,
+        SQSHL_16B,
+        UQSHL_16B,
+        SRSHL_2D,
+        URSHL_2D,
+        SQRSHL_16B,
+        UQRSHL_16B,
+        SQDMULH_8H,
+        SQRDMULH_8H,
+        SUQADD_16B,
+        USQADD_16B,
+        SQABS_16B,
+        SQNEG_16B,
+        SQXTN_8B,
+        SQXTN2_16B,
+        UQXTN_8B,
+        SQXTUN_8B,
+        SQSHL_16B_IMM,
+        UQSHL_16B_IMM,
+        SQSHLU_16B_IMM,
+        SRSHR_16B_IMM,
+        URSHR_16B_IMM,
+        SRSRA_16B_IMM,
+        URSRA_16B_IMM,
+        RSHRN_8B_IMM,
+        SQSHRN_8B_IMM,
+        UQSHRN_8B_IMM,
+        SQRSHRN_8B_IMM,
+        UQRSHRN_8B_IMM,
+        SQSHRUN_8B_IMM,
+        SQRSHRUN_8B_IMM,
+        SQDMULL_4S,
+        SQDMULL2_4S,
+        SQDMLAL_4S,
+        SQDMLSL_4S,
+        SQADD_B,
+        UQADD_B,
+        SQADD_D,
+        SQSUB_B,
+        SQSHL_B,
+        SQRSHL_H,
+        UQRSHL_S,
+        SQDMULH_H,
+        SQRDMULH_S,
+        SUQADD_B,
+        USQADD_B,
+        SQABS_B,
+        SQNEG_D,
+        SQXTN_B,
+        UQXTN_S,
+        SQXTUN_H,
+        SQDMULL_S,
+        SQDMLAL_D,
+        SQDMLSL_S,
+        SQSHL_B_IMM,
+        UQSHL_D_IMM,
+        SQSHLU_H_IMM,
+        SQSHRN_B_IMM,
+        UQSHRN_B_IMM,
+        SQRSHRN_S_IMM,
+        UQRSHRN_H_IMM,
+        SQSHRUN_B_IMM,
+        SQRSHRUN_B_IMM,
+        SSHL_D,
+        USHL_D,
+        SRSHL_D,
+        URSHL_D,
+    ];
+    for word in words {
+        let insn = super::isa::decode(word, Features::ALL)
+            .unwrap_or_else(|| panic!("{word:08x} did not decode"));
+        assert_eq!(insn.feat, super::isa::Feat::AdvSimd, "{word:08x}");
+    }
+}
+
+/// ...and disassembles back to exactly the text `llvm-mc` printed for it.
+///
+/// The decode check above proves only that *a* row matched. This is the half
+/// that catches a row matching the wrong instruction, a width read out of the
+/// wrong field, and a shift amount computed in the wrong direction — the last
+/// of which is a real hazard here, because `SQSHL Vd, Vn, #3` and
+/// `SQSHRN Vd, Vn, #3` spell their amounts in one field read two ways.
+#[test]
+fn the_disassembler_spells_the_saturating_group() {
+    let cases: &[(u32, &str)] = &[
+        (SQADD_16B, "sqadd\tv0.16b, v1.16b, v2.16b"),
+        (UQADD_16B, "uqadd\tv0.16b, v1.16b, v2.16b"),
+        (SQSUB_8H, "sqsub\tv0.8h, v1.8h, v2.8h"),
+        (UQSUB_4S, "uqsub\tv0.4s, v1.4s, v2.4s"),
+        (SQADD_2D, "sqadd\tv0.2d, v1.2d, v2.2d"),
+        (SRHADD_16B, "srhadd\tv0.16b, v1.16b, v2.16b"),
+        (URHADD_16B, "urhadd\tv0.16b, v1.16b, v2.16b"),
+        (SHADD_16B, "shadd\tv0.16b, v1.16b, v2.16b"),
+        (UHADD_16B, "uhadd\tv0.16b, v1.16b, v2.16b"),
+        (SHSUB_16B, "shsub\tv0.16b, v1.16b, v2.16b"),
+        (UHSUB_16B, "uhsub\tv0.16b, v1.16b, v2.16b"),
+        (SQSHL_16B, "sqshl\tv0.16b, v1.16b, v2.16b"),
+        (UQSHL_16B, "uqshl\tv0.16b, v1.16b, v2.16b"),
+        (SRSHL_2D, "srshl\tv0.2d, v1.2d, v2.2d"),
+        (URSHL_2D, "urshl\tv0.2d, v1.2d, v2.2d"),
+        (SQRSHL_16B, "sqrshl\tv0.16b, v1.16b, v2.16b"),
+        (UQRSHL_16B, "uqrshl\tv0.16b, v1.16b, v2.16b"),
+        (SQDMULH_8H, "sqdmulh\tv0.8h, v1.8h, v2.8h"),
+        (SQRDMULH_8H, "sqrdmulh\tv0.8h, v1.8h, v2.8h"),
+        (SUQADD_16B, "suqadd\tv0.16b, v1.16b"),
+        (USQADD_16B, "usqadd\tv0.16b, v1.16b"),
+        (SQABS_16B, "sqabs\tv0.16b, v1.16b"),
+        (SQNEG_16B, "sqneg\tv0.16b, v1.16b"),
+        (SQXTN_8B, "sqxtn\tv0.8b, v1.8h"),
+        (SQXTN2_16B, "sqxtn2\tv0.16b, v1.8h"),
+        (UQXTN_8B, "uqxtn\tv0.8b, v1.8h"),
+        (SQXTUN_8B, "sqxtun\tv0.8b, v1.8h"),
+        (SQSHL_16B_IMM, "sqshl\tv0.16b, v1.16b, #3"),
+        (UQSHL_16B_IMM, "uqshl\tv0.16b, v1.16b, #3"),
+        (SQSHLU_16B_IMM, "sqshlu\tv0.16b, v1.16b, #3"),
+        (SRSHR_16B_IMM, "srshr\tv0.16b, v1.16b, #3"),
+        (URSHR_16B_IMM, "urshr\tv0.16b, v1.16b, #3"),
+        (SRSRA_16B_IMM, "srsra\tv0.16b, v1.16b, #3"),
+        (URSRA_16B_IMM, "ursra\tv0.16b, v1.16b, #3"),
+        (RSHRN_8B_IMM, "rshrn\tv0.8b, v1.8h, #3"),
+        (SQSHRN_8B_IMM, "sqshrn\tv0.8b, v1.8h, #3"),
+        (UQSHRN_8B_IMM, "uqshrn\tv0.8b, v1.8h, #3"),
+        (SQRSHRN_8B_IMM, "sqrshrn\tv0.8b, v1.8h, #3"),
+        (UQRSHRN_8B_IMM, "uqrshrn\tv0.8b, v1.8h, #3"),
+        (SQSHRUN_8B_IMM, "sqshrun\tv0.8b, v1.8h, #3"),
+        (SQRSHRUN_8B_IMM, "sqrshrun\tv0.8b, v1.8h, #3"),
+        (SQDMULL_4S, "sqdmull\tv0.4s, v1.4h, v2.4h"),
+        (SQDMULL2_4S, "sqdmull2\tv0.4s, v1.8h, v2.8h"),
+        (SQDMLAL_4S, "sqdmlal\tv0.4s, v1.4h, v2.4h"),
+        (SQDMLSL_4S, "sqdmlsl\tv0.4s, v1.4h, v2.4h"),
+        (SQADD_B, "sqadd\tb0, b1, b2"),
+        (UQADD_B, "uqadd\tb0, b1, b2"),
+        (SQADD_D, "sqadd\td0, d1, d2"),
+        (SQSUB_B, "sqsub\tb0, b1, b2"),
+        (SQSHL_B, "sqshl\tb0, b1, b2"),
+        (SQRSHL_H, "sqrshl\th0, h1, h2"),
+        (UQRSHL_S, "uqrshl\ts0, s1, s2"),
+        (SQDMULH_H, "sqdmulh\th0, h1, h2"),
+        (SQRDMULH_S, "sqrdmulh\ts0, s1, s2"),
+        (SUQADD_B, "suqadd\tb0, b1"),
+        (USQADD_B, "usqadd\tb0, b1"),
+        (SQABS_B, "sqabs\tb0, b1"),
+        (SQNEG_D, "sqneg\td0, d1"),
+        (SQXTN_B, "sqxtn\tb0, h1"),
+        (UQXTN_S, "uqxtn\ts0, d1"),
+        (SQXTUN_H, "sqxtun\th0, s1"),
+        (SQDMULL_S, "sqdmull\ts0, h1, h2"),
+        (SQDMLAL_D, "sqdmlal\td0, s1, s2"),
+        (SQDMLSL_S, "sqdmlsl\ts0, h1, h2"),
+        (SQSHL_B_IMM, "sqshl\tb0, b1, #3"),
+        (UQSHL_D_IMM, "uqshl\td0, d1, #3"),
+        (SQSHLU_H_IMM, "sqshlu\th0, h1, #3"),
+        (SQSHRN_B_IMM, "sqshrn\tb0, h1, #3"),
+        (UQSHRN_B_IMM, "uqshrn\tb0, h1, #3"),
+        (SQRSHRN_S_IMM, "sqrshrn\ts0, d1, #3"),
+        (UQRSHRN_H_IMM, "uqrshrn\th0, s1, #3"),
+        (SQSHRUN_B_IMM, "sqshrun\tb0, h1, #3"),
+        (SQRSHRUN_B_IMM, "sqrshrun\tb0, h1, #3"),
+        (SSHL_D, "sshl\td0, d1, d2"),
+        (USHL_D, "ushl\td0, d1, d2"),
+        (SRSHL_D, "srshl\td0, d1, d2"),
+        (URSHL_D, "urshl\td0, d1, d2"),
+    ];
+    for (word, want) in cases {
+        let text = super::disasm::disassemble(*word, 0, Features::ALL).text;
+        assert_eq!(&text, want, "{word:08x}");
+    }
+}
+
+/// `FPSR.QC` used to be storage: writable, readable, and set by nothing at
+/// all. This is what it means now.
+///
+/// Three properties, and each has been wrong in some implementation: the flag
+/// is set by a clamp and not by an add, it is **sticky** — a later instruction
+/// that does not saturate leaves it alone — and only a guest write to `FPSR`
+/// clears it.
+#[test]
+fn saturation_sets_the_cumulative_flag_and_only_a_write_clears_it() {
+    let h = simd(&[SQADD_16B, SQADD_16B, SQADD_16B]);
+    // 1 + 1 in every lane: no clamp, no flag.
+    h.cpu.set_v(1, 0x0101_0101_0101_0101_0101_0101_0101_0101);
+    h.cpu.set_v(2, 0x0101_0101_0101_0101_0101_0101_0101_0101);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0202_0202_0202_0202_0202_0202_0202_0202);
+    assert_eq!(h.cpu.sysregs().fpsr & QC, 0, "nothing clamped");
+
+    // 127 + 1 in the *top* lane only: the flag is cumulative over the whole
+    // register, so one lane of sixteen is enough to raise it — and that is the
+    // information no lane's result carries, because a clamped 0x7f and an
+    // honest 0x7f are the same byte.
+    h.cpu.set_v(1, 0x7f << 120);
+    h.cpu.set_v(2, 1 << 120);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0) >> 120, 0x7f, "clamped, not wrapped to -128");
+    assert_ne!(h.cpu.sysregs().fpsr & QC, 0, "QC is set");
+
+    // Sticky: an instruction that does not saturate does not clear it.
+    h.cpu.set_v(1, 0);
+    h.cpu.set_v(2, 0);
+    h.steps(1);
+    assert_ne!(h.cpu.sysregs().fpsr & QC, 0, "still set");
+
+    // Only a write to `FPSR` clears it, exactly like the exception flags.
+    let mut regs = h.cpu.sysregs();
+    regs.fpsr = 0;
+    h.cpu.set_sysregs(regs);
+    assert_eq!(h.cpu.sysregs().fpsr & QC, 0);
+}
+
+/// The halving and rounding-halving adds are in this group for the rounding
+/// and **must not** touch `QC`: they cannot leave the element's range, and a
+/// core that set the flag on them would make a guest's saturation check lie.
+#[test]
+fn the_halving_adds_never_raise_the_flag() {
+    let h = simd(&[UHADD_16B, SRHADD_16B, URHADD_16B, SHSUB_16B]);
+    let ones = u128::MAX;
+    h.cpu.set_v(1, ones);
+    h.cpu.set_v(2, ones);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), ones, "0xff + 0xff halved keeps the carry");
+    // 0x7f + 0x7f rounds to 0x7f, and truncating would give 0x7e.
+    h.cpu.set_v(1, 0x7f7f_7f7f_7f7f_7f7f_7f7f_7f7f_7f7f_7f7f);
+    h.cpu.set_v(2, 0x7f7f_7f7f_7f7f_7f7f_7f7f_7f7f_7f7f_7f7f);
+    h.steps(2);
+    assert_eq!(h.cpu.v(0), 0x7f7f_7f7f_7f7f_7f7f_7f7f_7f7f_7f7f_7f7f);
+    // `SHSUB` reads both operands signed, so 0 - (-128) is 128 and halving it
+    // gives 0x40. An unsigned reading would be 0 - 128 = -128, halved to 0xc0,
+    // which is the difference the operands are chosen to show.
+    h.cpu.set_v(1, 0);
+    h.cpu.set_v(2, 0x8080_8080_8080_8080_8080_8080_8080_8080);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x4040_4040_4040_4040_4040_4040_4040_4040);
+    assert_eq!(h.cpu.sysregs().fpsr & QC, 0, "no halving add sets QC");
+}
+
+/// The scalar forms clamp at the width the *encoding* names, not at the
+/// doubleword every other scalar row in this core uses.
+///
+/// This is the distinction `Fmt::SimdScalarThreeSz` exists for: `SQADD B0` and
+/// `SQADD D0` are the same row shape with a live `size`, and a core that read
+/// the width from the row would clamp a byte add at 2⁶³.
+#[test]
+fn a_scalar_saturating_add_clamps_at_the_width_its_encoding_names() {
+    let h = simd(&[SQADD_B, SQADD_D, UQADD_B, SQSUB_B]);
+    h.cpu.set_v(1, 0x7f);
+    h.cpu.set_v(2, 0x01);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x7f, "a byte clamps at 127");
+    assert_ne!(h.cpu.sysregs().fpsr & QC, 0);
+    // The same bit patterns as doublewords are nowhere near the boundary, and
+    // the result fills the low eight *bytes* — the rest of the register is
+    // zeroed, as every scalar SIMD write does.
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x80);
+    // Unsigned, the same 0x7f + 1 does not clamp at all.
+    let mut regs = h.cpu.sysregs();
+    regs.fpsr = 0;
+    h.cpu.set_sysregs(regs);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x80);
+    assert_eq!(h.cpu.sysregs().fpsr & QC, 0);
+    // And a signed subtract off the bottom clamps at -128.
+    h.cpu.set_v(1, 0x80);
+    h.cpu.set_v(2, 0x01);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x80, "-128 - 1 clamps at -128");
+    assert_ne!(h.cpu.sysregs().fpsr & QC, 0);
+}
+
+/// `SUQADD` reads the **destination** as its signed accumulator and `Vn` as an
+/// unsigned addend; `USQADD` reads them the other way round.
+///
+/// Swapping the two readings is invisible on more inputs than it looks: any
+/// pair whose two readings sum to the same number hides it, and `-1 + 254`
+/// against `255 + -2` is exactly such a pair. So each case below is chosen so
+/// that the swapped reading gives a *different* answer.
+#[test]
+fn the_mixed_signedness_accumulates_read_the_destination_as_the_accumulator() {
+    let h = simd(&[SUQADD_16B, SUQADD_16B, USQADD_16B, USQADD_16B]);
+    // Vd = -1 (signed), Vn = 2 (unsigned): -1 + 2 = 1. This is the case that
+    // separates the two readings — swapped, it would be 255 + 2 and clamp to
+    // 127 with the flag raised.
+    h.cpu.set_v(0, u128::MAX);
+    h.cpu.set_v(1, 0x0202_0202_0202_0202_0202_0202_0202_0202);
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0x0101_0101_0101_0101_0101_0101_0101_0101,
+        "signed accumulator, unsigned addend"
+    );
+    assert_eq!(h.cpu.sysregs().fpsr & QC, 0);
+    // Vd = -1 (signed), Vn = 0xfe (unsigned, 254): 253, which does *not* fit a
+    // signed byte, so it clamps to 127 and raises the flag. Note that this
+    // pair is symmetric — swapped it is 255 + -2, which is 253 as well — so it
+    // says something about the *clamp* and nothing about the reading. The
+    // conformance guest's first draft of this instruction had only a case of
+    // this shape, and the mutation run is what noticed.
+    h.cpu.set_v(0, u128::MAX);
+    h.cpu.set_v(1, 0xfefe_fefe_fefe_fefe_fefe_fefe_fefe_fefe);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x7f7f_7f7f_7f7f_7f7f_7f7f_7f7f_7f7f_7f7f);
+    assert_ne!(
+        h.cpu.sysregs().fpsr & QC,
+        0,
+        "253 does not fit a signed byte"
+    );
+    // `USQADD` is the mirror: Vd = 1 (unsigned), Vn = 0xff (signed, -1), so
+    // the sum is 0.
+    let mut regs = h.cpu.sysregs();
+    regs.fpsr = 0;
+    h.cpu.set_sysregs(regs);
+    h.cpu.set_v(0, 0x0101_0101_0101_0101_0101_0101_0101_0101);
+    h.cpu.set_v(1, u128::MAX);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0, "unsigned accumulator, signed addend");
+    assert_eq!(h.cpu.sysregs().fpsr & QC, 0);
+    // ...and one step further it clamps at *zero* rather than wrapping, which
+    // is the bound only an unsigned destination has.
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0);
+    assert_ne!(h.cpu.sysregs().fpsr & QC, 0, "0 + -1 clamps at zero");
+}
+
+/// The doubling multiply-high saturates at exactly one input pair, and it is
+/// the one a plain `(a * b) >> N` never reaches: `-2^(N-1)` squared, doubled,
+/// is one past the widest positive element.
+#[test]
+fn the_doubling_multiply_high_saturates_at_the_two_most_negative() {
+    let h = simd(&[SQDMULH_H, SQDMULH_H, SQRDMULH_S]);
+    h.cpu.set_v(1, 0x8000);
+    h.cpu.set_v(2, 0x8000);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x7fff, "clamped to the widest positive");
+    assert_ne!(h.cpu.sysregs().fpsr & QC, 0);
+    // One step away it is exact and raises nothing: 0x4000 * 0x8000 * 2 is
+    // -2^30, whose top halfword is 0xc000.
+    let mut regs = h.cpu.sysregs();
+    regs.fpsr = 0;
+    h.cpu.set_sysregs(regs);
+    h.cpu.set_v(1, 0x4000);
+    h.cpu.set_v(2, 0x8000);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0xc000);
+    assert_eq!(h.cpu.sysregs().fpsr & QC, 0);
+    // `SQRDMULH` adds half a lane before the shift, so its answer differs from
+    // `SQDMULH`'s at exactly the inputs whose doubled product lands on a half:
+    // 2^30 times 1, doubled, is 2^31, whose top word is 0 truncated and 1
+    // rounded. Multiplying by 2 instead would give 1 either way, which is a
+    // case that cannot fail.
+    h.cpu.set_v(1, 0x4000_0000);
+    h.cpu.set_v(2, 0x0000_0001);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 1, "rounded up from exactly a half");
+}
+
+/// `SQXTN` writes the low half of its destination and zeroes the top;
+/// `SQXTN2` writes the top half and *keeps* the low one. That is the same `Q`
+/// rule `XTN` follows, and it now has three more instructions relying on it.
+#[test]
+fn the_extract_narrows_choose_a_destination_half_and_clamp() {
+    let h = simd(&[SQXTN_8B, SQXTN2_16B, UQXTN_8B, SQXTUN_8B]);
+    // Eight halfwords: 0x1234 does not fit a signed byte, -1 does.
+    let source = 0x1234_1234_1234_1234_ffff_ffff_ffff_ffffu128;
+    h.cpu.set_v(1, source);
+    h.cpu.set_v(0, u128::MAX);
+    h.steps(1);
+    assert_eq!(
+        h.cpu.v(0),
+        0x7f7f_7f7f_ffff_ffff,
+        "the top four clamp, the low four are -1, and the top half is zeroed"
+    );
+    assert_ne!(h.cpu.sysregs().fpsr & QC, 0);
+    // `SQXTN2` merges into the half `Q` selects.
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x7f7f_7f7f_ffff_ffff_7f7f_7f7f_ffff_ffff);
+    // Unsigned reads the same bits as 0xffff, which does not fit a byte.
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0xffff_ffff_ffff_ffff);
+    // `SQXTUN` reads the source signed and bounds the result *unsigned*, so
+    // -1 clamps down to zero and 0x1234 clamps up to 255 — neither of which a
+    // single signedness flag can express, and both of which differ from what
+    // `SQXTN` above produced from the same bits.
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0xffff_ffff_0000_0000);
+}
+
+/// A saturating shift by an immediate shifts **left**, and a narrowing one
+/// shifts right — out of the same `immh`:`immb` field, read two different
+/// ways. Getting the direction wrong gives a shift of the right magnitude in
+/// the wrong direction, which no decode check can see.
+#[test]
+fn the_immediate_shifts_read_one_field_in_two_directions() {
+    let h = simd(&[SQSHL_16B_IMM, SQSHLU_16B_IMM, SQSHRN_8B_IMM, SRSHR_16B_IMM]);
+    // `SQSHL Vd.16B, Vn.16B, #3` of 0x11 is 0x88, which does not fit a signed
+    // byte, so it clamps to 0x7f.
+    h.cpu.set_v(1, 0x1111_1111_1111_1111_1111_1111_1111_1111);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x7f7f_7f7f_7f7f_7f7f_7f7f_7f7f_7f7f_7f7f);
+    assert_ne!(h.cpu.sysregs().fpsr & QC, 0);
+    // `SQSHLU` bounds the same value unsigned, so 0x88 fits.
+    let mut regs = h.cpu.sysregs();
+    regs.fpsr = 0;
+    h.cpu.set_sysregs(regs);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x8888_8888_8888_8888_8888_8888_8888_8888);
+    assert_eq!(h.cpu.sysregs().fpsr & QC, 0);
+    // `SQSHRN Vd.8B, Vn.8H, #3` shifts *right*: 0x1111 >> 3 is 0x222, which
+    // does not fit a signed byte.
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x7f7f_7f7f_7f7f_7f7f);
+    assert_ne!(h.cpu.sysregs().fpsr & QC, 0);
+    // `SRSHR` rounds and saturates at nothing. 0x1c shifted right three places
+    // is 3.5, which rounds to 4 and truncates to 3 — an input chosen so that
+    // dropping the rounding changes the answer.
+    h.cpu.set_v(1, 0x1c1c_1c1c_1c1c_1c1c_1c1c_1c1c_1c1c_1c1c);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x0404_0404_0404_0404_0404_0404_0404_0404);
+}
+
+/// The doubling long multiply saturates **twice**, in order: the product
+/// first, then the accumulation. A core that clamps only the sum gets the
+/// single input pair where the product itself overflows wrong.
+#[test]
+fn the_doubling_long_multiply_saturates_the_product_and_then_the_sum() {
+    let h = simd(&[SQDMULL_4S, SQDMLAL_4S, SQDMLSL_4S]);
+    // 0x8000 squared, doubled, is 2^31 — one past a signed word.
+    h.cpu.set_v(1, 0x8000_8000_8000_8000);
+    h.cpu.set_v(2, 0x8000_8000_8000_8000);
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x7fff_ffff_7fff_ffff_7fff_ffff_7fff_ffff);
+    assert_ne!(h.cpu.sysregs().fpsr & QC, 0);
+    // Accumulating that clamped product into an already-large destination
+    // clamps a second time.
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0x7fff_ffff_7fff_ffff_7fff_ffff_7fff_ffff);
+    // Subtracting the same clamped product from that destination is exact, so
+    // only the product's own saturation is in play here.
+    h.steps(1);
+    assert_eq!(h.cpu.v(0), 0);
+}
+
+/// The widths this group does not have, each `UNDEFINED` rather than quietly
+/// picking a shape. `llvm-mc` rejects every one of these words too, which is
+/// what the enumerated sweep over the group established.
+#[test]
+fn the_reserved_widths_of_the_saturating_group_are_undefined() {
+    // A doubleword halving add: there is no `SHADD Vd.2D`.
+    let doubleword = |word: u32| word | (3 << 22);
+    // `SQDMULH` exists at the halfword and the word only.
+    let byte = |word: u32| word & !(3 << 22);
+    let cases = [
+        doubleword(SHADD_16B),
+        doubleword(SRHADD_16B),
+        doubleword(SHSUB_16B),
+        doubleword(SQDMULH_H),
+        byte(SQDMULH_H),
+        byte(SQDMULL_4S),
+        doubleword(SQDMULL_4S),
+    ];
+    for word in cases {
+        assert!(
+            super::isa::decode(word, Features::ALL).is_none() || {
+                let h = simd(&[word]);
+                h.steps(1);
+                h.cpu.sysregs().esr_el1 >> 26 == ec::UNKNOWN
+            },
+            "{word:08x} should not execute"
+        );
+    }
+}
