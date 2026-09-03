@@ -108,6 +108,38 @@
 //!   compared too, for every exclusive pair and every system register the table
 //!   names. That found `CTR_EL0` and `DCZID_EL0` accepting an `MSR`.
 //!
+//! # The saturating guest, where the oracle is the standard library
+//!
+//! `sat.rs` is the third guest with a genuine oracle, and the cleanest of the
+//! three. `i8::saturating_add` and its relatives are exactly the operations
+//! `SQADD` and its family perform, they are somebody else's code, and they are
+//! *exactly* defined — no rounding mode, no NaN payload, nothing left to the
+//! implementation. So each expectation is computed twice: once on the host by
+//! `rustc`'s constant evaluator, and once in the guest, where the loops are
+//! long enough that LLVM lowers them to vectors. At the commit that added the
+//! file it chose `SQADD`, `SQSUB`, `UQADD` and `UQSUB` at **all four** element
+//! widths, `2D` included.
+//!
+//! Where it stops is worth naming. `saturating_abs` and `saturating_neg` do
+//! *not* lower to `SQABS`/`SQNEG` — LLVM emits a compare-and-select — so those
+//! two instructions have directed tests only, and the guest says so rather
+//! than counting its own kernels as coverage. Nothing in ordinary Rust reaches
+//! `SUQADD`, `SQDMULH`, `SQXTUN`, the saturating shifts or `FPSR.QC` at all.
+//!
+//! `FPSR.QC` in particular has no compiler route by construction: a saturating
+//! add in Rust returns the clamped value and no flag. So the guest's second
+//! half is directed, written from DDI 0487 and expressed in inline assembly —
+//! `MSR FPSR, XZR`, the instruction, `MRS Xt, FPSR` — and checked by
+//! **mutation**. Seven mutations, each making a named case fail: dropping the
+//! flag from the three-same group; letting the halving adds raise it; reading
+//! `SUQADD`'s two operands with the same signedness; adding the rounding
+//! constant after the shift instead of before it; dropping the doubling from
+//! `SQDMULH`; bounding `SQXTUN` signed; and reading a scalar's width from its
+//! row instead of from `size`. Two of those found a *test* that could not
+//! fail — a `SUQADD` case symmetric under the swap, and rounding operands that
+//! were fixed points of the mutation — which is the whole reason to run the
+//! exercise.
+//!
 //! # The timer guest, and what it is not
 //!
 //! `timer.rs` is the second guest after `fp_rules.rs` whose expectations are
@@ -203,8 +235,9 @@ const ACCESS_LIMIT: u64 = 40_000_000;
 /// **This list is empty.** At the commit that added this file, all six
 /// binaries passed — 12 000 differentially-checked floating-point vectors
 /// among them — and it stayed empty when the seventh, `fp_natural`, arrived
-/// with the Advanced SIMD slice, and again when the eighth, `timer`, arrived
-/// with the generic timer.
+/// with the Advanced SIMD slice, again when the eighth, `timer`, arrived with
+/// the generic timer, and again when the ninth, `sat`, arrived with the
+/// saturating arithmetic.
 const LEDGER: &[(&str, &str)] = &[];
 
 // ---------------------------------------------------------------------------

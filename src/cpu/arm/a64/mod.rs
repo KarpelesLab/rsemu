@@ -107,11 +107,24 @@
 //! Advanced SIMD encoding, so *scalar* floating-point code was not fully
 //! runnable without it.
 //!
+//! # `FPSR.QC` means something
+//!
+//! The saturating and rounding Advanced SIMD arithmetic is here — `SQADD` and
+//! its family, the halving and rounding-halving adds, the saturating shifts by
+//! a register and by an immediate, the narrowing shifts, the extract-narrows,
+//! the doubling multiplies, both vector and scalar — and it landed as one
+//! piece because of the flag rather than in spite of it. `FPSR.QC` was
+//! writable, readable and set by nothing at all, which is the same kind of
+//! untruth as an `ID_AA64PFR0_EL1` reporting floating point without SIMD; it
+//! is now set by every clamp and by nothing else, and the halving adds
+//! deliberately leave it alone.
+//!
 //! # What is deliberately absent
 //!
-//! The saturating and rounding SIMD arithmetic (and so `FPSR.QC` stays
-//! storage), the reciprocal-estimate family, polynomial multiply, and the
-//! by-element long multiplies. `FEAT_FP16` arithmetic (half precision exists
+//! The reciprocal-estimate family, polynomial multiply, the pairwise long
+//! adds, the halving-narrow three-different group (`ADDHN` and relatives), and
+//! the by-element multiplies other than the four already here — including the
+//! saturating by-element forms. `FEAT_FP16` arithmetic (half precision exists
 //! here only as a conversion format, which is Armv8.0-A), EL2 and EL3 (so
 //! `HVC` and `SMC` are `UNDEFINED`, and so `CNTVOFF_EL2` does not exist and
 //! the virtual count equals the physical one), AArch32 at any level, the
@@ -135,6 +148,16 @@
 //! named system register. That sweep is what caught `CTR_EL0` and `DCZID_EL0`
 //! becoming writable when `Access::El0Ro` was corrected to let EL1 write
 //! `TPIDRRO_EL0`: `llvm-mc` has a writable name for one and not for the others.
+//!
+//! The saturating group was swept the same way and **enumerated** rather than
+//! sampled: every `Q`, `U`, `size`, `opcode` and `immh`:`immb` of the
+//! three-same, two-misc, three-different and shift-by-immediate encodings,
+//! vector and scalar, over four register triples — 141 312 words. Nothing this
+//! core accepts is rejected, and every word both accept disassembles to
+//! `llvm-mc`'s own text, with no exception outside two conventions that
+//! predate the group (this core prints a modified immediate in hex, and spells
+//! `MVN` as the `NOT` the encoding names). The sweep is also what named the
+//! four scalar shifts `SSHL`/`USHL`/`SRSHL`/`URSHL`, which were missing.
 //!
 //! # Timing
 //!

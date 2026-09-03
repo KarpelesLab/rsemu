@@ -51,8 +51,13 @@
 //! * **`FPCR.FZ16` is RES0**, because half-precision *arithmetic*
 //!   (`FEAT_FP16`) is not implemented; half exists here only as a conversion
 //!   target, and Armv8.0-A has that unconditionally.
-//! * **`FPSR.QC`** (cumulative saturation) is storage: nothing here saturates,
-//!   because that is an Advanced SIMD integer property.
+//!
+//! `FPSR.QC` used to be on that list, described as storage because nothing
+//! saturated. It is not any more: the Advanced SIMD saturating arithmetic sets
+//! it, [`super::simd`] carries the bit out of every clamped operation, and the
+//! interpreter ORs it in beside these flags. It is *not* a [`float::Flags`],
+//! because it is not an IEEE exception — which is why [`accumulate`] does not
+//! mention it.
 //!
 //! # Sources
 //!
