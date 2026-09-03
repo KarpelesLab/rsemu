@@ -222,17 +222,15 @@ pub fn clear() {
 mod imp {
     //! `rt_sigaction`, by `syscall` instruction.
     //!
-    //! # This is a new `#[allow(unsafe_code)]` site, and it needs a decision
+    //! # This is the seventh `#[allow(unsafe_code)]` site, and it was reviewed
     //!
-    //! `ROADMAP.md` §0 names **six** subsystems that may opt back in — the RAM
-    //! host-pointer fast path, the JIT code buffer, the raw-syscall accel
-    //! backends, the C ABI module, the `core::sync` `single` backend, and
-    //! per-CPU execution state — and says *"six is the ceiling; a seventh is a
-    //! design review, not a commit"*. **A host signal disposition is none of
-    //! those six.** It is a seventh category, and §0's list has to name it or
-    //! this module has to go; the choice belongs to whoever owns that list,
-    //! not to this file, which is why the list is left alone here and the
-    //! discrepancy is written down instead.
+    //! `ROADMAP.md` §0 used to name **six** subsystems and say *"six is the
+    //! ceiling; a seventh is a design review, not a commit"*. A host signal
+    //! disposition was none of those six — it is a genuinely new category, not
+    //! the unused sixth slot (which is per-CPU execution state). That review
+    //! happened and the answer was to admit it: §0 and `CLAUDE.md` now name
+    //! seven, with this module as the seventh, and an *eighth* is the thing
+    //! that needs a review now. The ceiling moved deliberately and once.
     //!
     //! What can be argued on the merits is that nothing cheaper works. `std`
     //! has no signal API; a signal disposition is this process's own state, so

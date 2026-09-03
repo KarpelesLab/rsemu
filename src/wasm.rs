@@ -73,7 +73,7 @@
 //!
 //! # `unsafe` in this module
 //!
-//! This is the **C ABI boundary**, one of the six subsystems `ROADMAP.md` §0
+//! This is the **C ABI boundary**, one of the seven subsystems `ROADMAP.md` §0
 //! sanctions to opt back in. Two things here need it: `#[unsafe(no_mangle)]`,
 //! which edition 2024 classifies as an unsafe attribute because duplicate
 //! exported symbols are the linker's problem rather than the compiler's; and
