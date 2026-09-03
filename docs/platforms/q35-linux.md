@@ -506,8 +506,11 @@ file, the same kernel, the same initramfs and the same namespace signature,
 with the engine underneath `cpu0` replaced by a KVM vCPU
 (`Bindings::replace`, `src/accel/cpu.rs`), and it reaches the same line —
 `rsemu q35-linux nvme namespace, LBA 0`, read off the emulated controller by
-the kernel's own driver — in **35 seconds of guest time and about nine seconds
-of wall clock**. Roughly a hundredfold on the clock a person watches.
+the kernel's own driver — in **35 seconds of guest time and about ten seconds
+of wall clock**. Roughly a hundredfold on the clock a person watches. (The
+2,374 s above is the board's own command line; with the `no_timer_check` an
+accelerated run needs, the interpreted reference measured 2,561 s of guest time
+in 973 s of wall clock, and the accelerated one 35 s in 9-12 s.)
 
 ```text
 RSEMU_KERNEL=/boot/vmlinuz \

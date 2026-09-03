@@ -730,11 +730,12 @@ impl AccelCpu {
     /// may run any instant of it, and the choice is made per fetch by what
     /// the hardware is able to do.
     fn interpret_out_of_hardware(&self) -> bool {
+        // Asked once on the way in and once per interpreted instruction, and
+        // that is the whole cost on a board where every executable page is a
+        // slot: one page-table walk per slice, on the shell's own tables.
+        let mut in_hardware = self.fetch_in_hardware();
         let mut steps = 0u32;
-        while steps < MAX_INTERPRETED {
-            if self.fetch_in_hardware() {
-                break;
-            }
+        while !in_hardware && steps < MAX_INTERPRETED {
             // Zero cycles is the interpreter saying it is stopped, and a
             // stopped interpreter will not reach a memory slot by being asked
             // again.
@@ -743,13 +744,19 @@ impl AccelCpu {
             }
             steps += 1;
             self.dirty.store(true, Ordering::Release);
+            // A `HLT` or a restart sequence is not this loop's business, and
+            // the caller looks at both.
             if self.shell.is_halted() || self.sequence_owed() {
                 break;
             }
+            in_hardware = self.fetch_in_hardware();
         }
-        self.interpreted
-            .fetch_add(u64::from(steps), Ordering::Relaxed);
-        self.fetch_in_hardware()
+        if steps > 0 {
+            self.interpreted
+                .fetch_add(u64::from(steps), Ordering::Relaxed);
+            in_hardware = self.fetch_in_hardware();
+        }
+        in_hardware
     }
 
     /// One slice of guest execution. The body of [`Device::run`].

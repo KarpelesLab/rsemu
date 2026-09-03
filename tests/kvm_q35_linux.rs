@@ -6,8 +6,10 @@
 //! **2,374 seconds of guest time and about sixteen minutes of wall clock**.
 //! This is the same board, the same machine file, the same kernel and the same
 //! initramfs, with [`AccelCpus`] replacing what is underneath `cpu0` — and it
-//! reaches the same line in **35 seconds of guest time and about nine seconds
-//! of wall clock**, which is the whole point of `ROADMAP.md` §10.
+//! reaches the same line in **35 seconds of guest time and nine to twelve
+//! seconds of wall clock**, which is the whole point of `ROADMAP.md` §10. Run
+//! to run those numbers move, because nothing here is reproducible; the
+//! console is what does not.
 //!
 //! ```text
 //! RSEMU_KERNEL=/boot/vmlinuz \
@@ -94,8 +96,8 @@
 //!
 //! Measured, on the same board with the same kernel, the same initramfs and the
 //! same command line — 2,561 seconds of guest time in 973 seconds of wall clock
-//! interpreted, against 35 seconds of guest time in 9 seconds of wall clock
-//! here:
+//! interpreted, against 35 seconds of guest time in about 10 seconds of wall
+//! clock here:
 //!
 //! * **279 of the accelerated run's 347 console lines are byte-identical** to
 //!   the interpreted run's, in the same order, once the printk timestamp is
@@ -404,7 +406,7 @@ fn a_linux_kernel_boots_on_host_silicon_and_reads_the_disk() {
     );
     println!(
         "q35-linux/kvm: {} ms of guest time in {:.1} s of wall clock; the interpreted run of \
-         this board needs 2,374,000 ms and about sixteen minutes",
+         this board on this command line measured 2,561,473 ms and 973 s",
         run.at.as_nanos() / 1_000_000,
         wall.as_secs_f64()
     );
