@@ -20,57 +20,55 @@
 //!
 //! RSEMU_KERNEL=/boot/vmlinuz \
 //! RSEMU_INITRD=testdata/x86/initramfs-x86.cpio \
-//! RSEMU_KERNEL_CMDLINE='console=ttyS0,115200 nokaslr cryptomgr.notests noapic' \
-//! RSEMU_KERNEL_MS=2500000 \
+//! RSEMU_KERNEL_MS=3000000 \
 //! RSEMU_KERNEL_INPUT='rsemu# =>head -c 40 /dev/nvme0n1\n' \
 //! RSEMU_KERNEL_STOP_AT='rsemu q35-linux nvme namespace' \
 //!     cargo test --release --features machine-q35-linux --test q35_linux -- --nocapture
 //! ```
 //!
-//! **`noapic` is still on that command line**, and what it is standing in for
-//! has moved. Measured with a 6.6 kernel:
+//! **There is no `RSEMU_KERNEL_CMDLINE` on that command any more.** The board's
+//! own default line is what the kernel gets, and it carries no `nolapic`, no
+//! `noapic` and no `hpet=disable`. Measured with a 6.6 kernel, that line now
+//! takes the symmetric I/O path all the way through `check_timer()`:
 //!
-//! * With `noapic` — the local APIC and its timer in use, interrupt lines
-//!   through the 8259A — the kernel now boots the whole way: every initcall,
-//!   `nvme nvme0: pci function 0000:00:04.0`, the admin queue, an I/O queue
-//!   pair (`1/0/0 default/read/poll queues`), and then the panic a run with no
-//!   initramfs has to end on, `VFS: Unable to mount root fs`. Two defects had
-//!   to go for that: `CC`'s field positions (the `#[ignore]`d ledger entry
-//!   below, now un-ignored and passing) and an acknowledge cycle that reached
-//!   the 8259A instead of the local APIC that was actually asserting
-//!   (`src/dev/pc/imcr.rs`).
-//! * With the board's **default** command line — symmetric I/O mode, the tick
-//!   routed through the I/O APIC — it still stops at
-//!   `..MP-BIOS bug: 8254 timer not connected to IO-APIC` and then
-//!   `Kernel panic - not syncing: IO-APIC + timer doesn't work!`.
+//! ```text
+//! APIC: Switch to symmetric I/O mode setup
+//! ..TIMER: vector=0x30 apic1=0 pin1=2 apic2=-1 pin2=-1
+//! tsc: PIT calibration matches HPET. 1 loops
+//! ```
 //!
-//! That last one is **not** the two APIC device models, which is where it was
-//! first filed. `tests/pc_apic.rs` now drives all three of the paths it was
-//! blamed on — a local APIC timer in periodic mode, an edge-triggered
-//! redirection entry, and the 8254 itself on I/O APIC input 2 through an
-//! edge-triggered entry — and every one of them delivers, on a board with the
-//! same wiring. The same firmware sequence the kernel performs, run on the
-//! `q35` board itself, takes its interrupts too.
+//! with no `..MP-BIOS bug: 8254 timer not connected to IO-APIC` and no
+//! `Kernel panic - not syncing: IO-APIC + timer doesn't work!` after it.
 //!
-//! What is missing is a **route**, not a delivery. `pc.hpet` advertises
-//! `LEG_RT_CAP`, so Linux takes the legacy replacement route: `hpet_enable`
-//! registers the HPET as the global clock event, sets `LEG_RT_CNF`, and from
-//! then on expects **HPET timer 0** on IRQ0 — the 8259A's `IR0` and I/O APIC
-//! input 2 — with the 8254 disconnected. This board wires `hpet0.t0` to
-//! `ioapic.irq16` and leaves `pc.hpet`'s `legacy` output pin unconnected, so
-//! while that bit is set nothing at all drives IRQ0, the 8254 included. Hence
-//! `..MP-BIOS bug: 8254 timer not connected to IO-APIC` — a literally accurate
-//! complaint — and then all three fallbacks failing, because every one of them
-//! is another way of asking for IRQ0.
+//! What that panic had been was **a missing route, not a missing delivery**,
+//! and it was in this board's own machine file rather than in either APIC.
+//! `pc.hpet` advertises `LEG_RT_CAP`, so `hpet_enable()` takes the legacy
+//! replacement route: it registers the HPET as the global clock event, sets
+//! `LEG_RT_CNF`, and — the half that matters — Linux therefore never calls
+//! `pit_timer_init()`, because `hpet_time_init()` programs the 8254 only when
+//! `hpet_enable()` fails. From then on the tick is supposed to arrive from HPET
+//! comparator 0 on IRQ0, which is the 8259A's `IR0` and I/O APIC input 2. The
+//! board wired `hpet0.t0` to `ioapic.irq16` and left the `legacy` pin
+//! unconnected, so counter 0 was never loaded and comparator 0 was elsewhere:
+//! nothing at all drove IRQ0, and all three of the kernel's fallbacks failed
+//! because every one of them is another way of asking for it.
 //!
-//! Adding **`hpet=disable`** to the command line above proves it: Linux falls
-//! back to `pit_timer_init`, programs the 8254 itself, and the same run gets
-//! through `..TIMER: vector=0x30 apic1=0 pin1=2` with no `MP-BIOS bug` line and
-//! goes on booting. The fix is the board's — `pc.hpet`'s module documentation
-//! writes out the `wire.not`/`wire.and` gating a machine file needs — and it is
-//! what stands between this board and a default command line with nothing on
-//! it. [`docs/platforms/q35-linux.md`](../docs/platforms/q35-linux.md) is where
-//! the ledger lives.
+//! `machines/q35-linux.machine` now builds the multiplexer §2.3.5 describes out
+//! of one `wire.not` and five `wire.and`s.
+//! [`docs/platforms/q35-linux.md`](../docs/platforms/q35-linux.md) has the
+//! whole ledger, including the two items that were refuted rather than fixed.
+//!
+//! **Where it stops today** is two places, and the doc has both. On the default
+//! line the boot reaches `nvme 0000:00:04.0: enabling device` and then the
+//! worker inside `request_threaded_irq` stops making forward progress — the
+//! sampled `RIP` never moves again. Adding `noapic` — the same board, the same
+//! image, the 8259A pair driving `INTR` through the IMCR — gets through that
+//! and all the way to `Run /init as init process` and a busybox shell, which is
+//! what says the remaining gap is in the I/O APIC path rather than in the
+//! controller or the driver. What that run then finds is the *other* stop:
+//! `nvme nvme0: Identify Descriptors failed (nsid=1, status=0x2)`, the model
+//! refusing `Identify` with `CNS = 03h`, so no namespace is published and
+//! `/dev/nvme0n1` does not exist. That one is `src/dev/nvme`.
 //!
 //! | Variable | What it does |
 //! | --- | --- |

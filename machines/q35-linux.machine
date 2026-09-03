@@ -129,12 +129,13 @@ machine "q35-linux" {
   # it anyway (CLAUDE.md).
   #
   # There is **nothing else here**, and that is the measurement worth keeping:
-  # no `nolapic`, no `noapic`, no `hpet=disable`. A current kernel takes the
-  # symmetric I/O path on this line — MADT, I/O APIC, local APIC timer, the
-  # HPET as the tick through its legacy replacement route — and reaches its
-  # own root-filesystem mount. Each of those three words was needed at some
+  # no `nolapic`, no `noapic`, no `hpet=disable`. On this line a current kernel
+  # takes the symmetric I/O path — the MADT read, the IMCR switched, the I/O
+  # APIC programmed, and the tick arriving from the HPET through its legacy
+  # replacement route — instead of panicking in `check_timer()` the way it did
+  # while nothing drove IRQ0. Each of those three words was needed at some
   # point and none is now; `docs/platforms/q35-linux.md` says what each was
-  # hiding and what fixed it.
+  # hiding and what fixed it, and where the boot stops today.
   param cmdline = "console=ttyS0,115200 earlyprintk=ttyS0,115200 nokaslr"
 
   # Where the ACPI tables are staged. ACPI §5.2.5.1 has an operating system
