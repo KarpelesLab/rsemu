@@ -35,9 +35,9 @@
 
 use super::{
     EBDA_COMMAND, EBDA_FD_CMD, EBDA_FD_COUNT, EBDA_FD_CYLINDER, EBDA_FD_DONE, EBDA_FD_HEAD,
-    EBDA_FD_RESULT, EBDA_FD_SECTOR, EBDA_FD_SPT, EBDA_HD_CAPACITY, EBDA_HD_CYLINDERS,
-    EBDA_HD_FLAGS, EBDA_HD_HEADS, EBDA_HD_SECTORS, EBDA_LBA_HIGH, EBDA_LBA_LOW, F_AX, F_BX, F_CX,
-    F_DS, F_DX, F_ES, F_SI, Labels, clear_cf, ds_ebda, enter, leave, set_cf,
+    EBDA_FD_LENGTH, EBDA_FD_RESULT, EBDA_FD_SECTOR, EBDA_FD_SPT, EBDA_HD_CAPACITY,
+    EBDA_HD_CYLINDERS, EBDA_HD_FLAGS, EBDA_HD_HEADS, EBDA_HD_SECTORS, EBDA_LBA_HIGH, EBDA_LBA_LOW,
+    F_AX, F_BX, F_CX, F_DS, F_DX, F_ES, F_SI, Labels, clear_cf, ds_ebda, enter, leave, set_cf,
 };
 use crate::fw::asm16::{
     AH, AL, AX, Alu, Asm, BH, BL, BX, CH, CL, CS, CX, Cc, DH, DI, DL, DS, DX, ES, Mem, SI, Shift,
@@ -55,6 +55,23 @@ const FDC_MSR: u16 = 0x03f4;
 const FDC_DATA: u16 = 0x03f5;
 /// Its configuration control register, which selects the data rate.
 const FDC_CCR: u16 = 0x03f7;
+
+/// The `GPL` a `FORMAT A TRACK` command is given: the gap written between
+/// sectors while formatting, which is longer than the one a read steps over.
+///
+/// `0x54` is the value for a 3.5-inch 1.44 MB MFM track: the "gap length for
+/// format" field of the diskette parameter table, and what a DOS `FORMAT`
+/// writes. The µPD765A takes it as a parameter rather than deriving it, so it
+/// is the *format's* number rather than the chip's — and it is a constant here
+/// because this firmware publishes no `INT 1Eh` parameter table for a caller
+/// to have changed.
+const FORMAT_GAP: u8 = 0x54;
+
+/// The `D` byte a `FORMAT A TRACK` fills each new sector's data field with.
+///
+/// `0xF6` is what the PC has written into a freshly formatted sector since
+/// 1981, and what a filesystem driver treats as "never written".
+const FORMAT_FILLER: u8 = 0xf6;
 
 /// Emit `INT 13h` and the ATA routines POST shares with it.
 #[allow(clippy::too_many_lines)]
@@ -110,6 +127,7 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     let fd_write = a.label();
     let fd_params = a.label();
     let fd_kind = a.label();
+    let fd_format = a.label();
     a.alui8(Alu::CMP, DL, 0x00);
     a.jcc(Cc::NE, l.disk_fail);
     for (function, target) in [
@@ -118,6 +136,7 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
         (0x02, fd_read),
         (0x03, fd_write),
         (0x04, l.disk_ok),
+        (0x05, fd_format),
         (0x08, fd_params),
         (0x15, fd_kind),
     ] {
@@ -192,6 +211,7 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.movto8(Mem::abs(EBDA_FD_HEAD), AL);
     a.mov(BX, Mem::bp(F_BX));
     a.movsr(ES, Mem::bp(F_ES));
+    a.movmi(Mem::abs(EBDA_FD_LENGTH), 511);
     a.call(l.fd_geometry);
     a.call(l.fd_start);
     a.call(l.fd_seek);
@@ -233,6 +253,62 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.mov8(AL, Mem::abs(EBDA_FD_DONE));
     a.movto8(Mem::bp(F_AX), AL);
     a.jmp(l.disk_fail);
+
+    // AH=05h, format track. `AL` is how many sectors the track is to have,
+    // `CH` the cylinder, `DH` the head, and `ES:BX` points at four bytes per
+    // sector — C, H, R, N — which the controller reads *through the same DMA
+    // channel the data would use* (µPD765A data sheet, `FORMAT A TRACK`: "the
+    // ID field is supplied by the system", four bytes per sector, during the
+    // execution phase). So the transfer is memory-to-device, which is a
+    // write's direction, and `EBDA_FD_CMD` is set to the write command for
+    // `fd_dma`'s benefit even though the command issued below is neither.
+    //
+    // The cylinder is not a parameter of the chip's command: `FORMAT A TRACK`
+    // writes the track the head is *on*, so the seek is what selects it. That
+    // is why `fd_seek` runs before the command and not merely before the data.
+    //
+    // What this does not do is honour a caller's `N`: the command's own `N`
+    // parameter is 2, a 512-byte sector, because that is the only sector size
+    // this board's drive, this firmware's `fd_dma` and `pc.fdc` itself are
+    // written for — the model refuses any other size outright. A caller whose
+    // address-field list says otherwise gets a track of 512-byte sectors.
+    a.bind(fd_format);
+    a.mov(AX, Mem::bp(F_AX));
+    a.alui(Alu::AND, AX, 0x00ff);
+    a.jcc(Cc::E, l.disk_fail);
+    a.movto(Mem::abs(EBDA_FD_COUNT), AX);
+    // Four ID bytes per sector, less one, is what the 8237 counts down from.
+    a.shift(Shift::SHL, AX, 2);
+    a.dec(AX);
+    a.movto(Mem::abs(EBDA_FD_LENGTH), AX);
+    a.mov(CX, Mem::bp(F_CX));
+    a.movto8(Mem::abs(EBDA_FD_CYLINDER), CH);
+    a.mov8(AL, Mem::bp(F_DX + 1));
+    a.alui8(Alu::AND, AL, 0x01);
+    a.movto8(Mem::abs(EBDA_FD_HEAD), AL);
+    a.movmi8(Mem::abs(EBDA_FD_CMD), 0x45);
+    a.mov(BX, Mem::bp(F_BX));
+    a.movsr(ES, Mem::bp(F_ES));
+    a.call(l.fd_geometry);
+    a.call(l.fd_start);
+    a.call(l.fd_seek);
+    a.call(l.fd_dma);
+    a.movi8(AL, 0x4d); // FORMAT A TRACK, MFM
+    a.call(l.fd_out);
+    a.mov8(AL, Mem::abs(EBDA_FD_HEAD));
+    a.shift8(Shift::SHL, AL, 2);
+    a.call(l.fd_out);
+    a.movi8(AL, 0x02); // N = 2, a 512-byte sector
+    a.call(l.fd_out);
+    a.mov8(AL, Mem::abs(EBDA_FD_COUNT)); // SC, sectors per track
+    a.call(l.fd_out);
+    a.movi8(AL, FORMAT_GAP);
+    a.call(l.fd_out);
+    a.movi8(AL, FORMAT_FILLER);
+    a.call(l.fd_out);
+    a.call(l.fd_results);
+    a.jcc(Cc::B, l.disk_fail);
+    a.jmp(l.disk_ok);
 
     // AH=02h/03h. The two differ only in the command byte, so they share
     // everything up to it.
@@ -748,9 +824,12 @@ fn diskette(a: &mut Asm, l: &Labels) {
     a.out_al(0x81); // channel 2's page latch
     a.movi8(AL, 0x00);
     a.out_al(0x0c);
-    a.movi8(AL, 0xff); // 512 bytes, less one
+    // The count, low byte then high, out of the EBDA rather than as an
+    // immediate: a sector is 512 bytes and a `FORMAT TRACK` address-field list
+    // is four per sector, and both go through this channel.
+    a.mov(AX, Mem::abs(EBDA_FD_LENGTH));
     a.out_al(0x05);
-    a.movi8(AL, 0x01);
+    a.mov8(AL, AH);
     a.out_al(0x05);
     a.movi8(AL, 0x02); // unmask channel 2
     a.out_al(0x0a);
@@ -774,7 +853,6 @@ fn diskette(a: &mut Asm, l: &Labels) {
     a.push(CX);
     a.push(DI);
     let r_ok = a.label();
-    let r_out = a.label();
     a.mov8(AL, Mem::abs(EBDA_FD_CMD));
     a.call(l.fd_out);
     a.mov8(AL, Mem::abs(EBDA_FD_HEAD));
@@ -794,6 +872,21 @@ fn diskette(a: &mut Asm, l: &Labels) {
     a.call(l.fd_out);
     a.movi8(AL, 0xff); // DTL, ignored when N is non-zero
     a.call(l.fd_out);
+    a.call(l.fd_results);
+    a.pop(DI);
+    a.pop(CX);
+    a.pop(AX);
+    a.ret();
+
+    // -- fd_results: the result phase, and what it says ---------------------
+    //
+    // Seven bytes — `ST0`, `ST1`, `ST2`, `C`, `H`, `R`, `N` — and carry set
+    // unless `ST0`'s interrupt code is 00, which is also how a write or a
+    // format of a write-protected medium reports itself: the chip terminates
+    // abnormally and sets `ST1`'s not-writable bit (µPD765A data sheet, status
+    // register 1). Clobbers `AX`, `CX` and `DI`; both callers have saved them
+    // or are about to return through the interrupt frame.
+    a.bind(l.fd_results);
     a.movi(DI, EBDA_FD_RESULT);
     a.movi(CX, 7);
     let r_res = a.here_label();
@@ -806,13 +899,9 @@ fn diskette(a: &mut Asm, l: &Labels) {
     a.alui8(Alu::AND, AL, 0xc0);
     a.jcc(Cc::E, r_ok);
     a.stc();
-    a.jmp(r_out);
+    a.ret();
     a.bind(r_ok);
     a.clc();
-    a.bind(r_out);
-    a.pop(DI);
-    a.pop(CX);
-    a.pop(AX);
     a.ret();
 
     // -- fd_geometry --------------------------------------------------------

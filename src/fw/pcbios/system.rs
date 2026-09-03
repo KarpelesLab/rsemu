@@ -18,30 +18,18 @@
 
 use super::{
     BDA_EQUIPMENT, BDA_MEMSIZE, BDA_MOTOR, BDA_MOTOR_TIMEOUT, BDA_ROLLOVER, BDA_TICKS, E820_ENTRY,
-    EBDA_E820, EBDA_E820_COUNT, EBDA_GDTR, EBDA_SEGMENT, F_AX, F_CX, F_DX, FLAG_CF, Labels,
-    POST_STACK, clear_cf, ds_bda, enter, leave, load_seg, set_cf,
+    EBDA_E820, EBDA_E820_COUNT, EBDA_GDTR, EBDA_SEGMENT, F_AX, F_CX, F_DX, FLAG_CF, G_EAX, G_EBX,
+    G_ECX, G_EDX, G_ESI, G_FLAGS, Labels, POST_STACK, clear_cf, ds_bda, enter, leave, load_seg,
+    set_cf,
 };
 use crate::fw::asm16::{
     AH, AL, AX, Alu, Asm, BH, BL, BP, BX, CS, CX, Cc, DI, DL, DS, DX, ES, Mem, SI, SP, SS, Shift,
 };
 
-// The `INT 15h` frame. That handler alone uses `PUSHAD`, because `E820` is
-// specified in terms of `EAX`, `EBX`, `ECX` and `EDX` and a 16-bit `PUSHA`
-// would drop the halves the caller cares about. Four bytes per register, so
-// every offset differs from the `PUSHA` frame the other handlers use.
-
-/// The saved `ESI` — where `AH=87h`'s descriptor table is pointed at.
-const G_ESI: i32 = 4;
-/// The saved `EBX` — `E820`'s continuation index.
-const G_EBX: i32 = 16;
-/// The saved `EDX` — where `'SMAP'` arrives.
-const G_EDX: i32 = 20;
-/// The saved `ECX` — the caller's buffer size, and the length written back.
-const G_ECX: i32 = 24;
-/// The saved `EAX` — the function number, and `'SMAP'` on return.
-const G_EAX: i32 = 28;
-/// The caller's `FLAGS` in the `PUSHAD` frame.
-const G_FLAGS: i32 = 40;
+// `INT 15h` opens with `PUSHAD` and addresses its caller through the `G_*`
+// offsets [`super`] defines, because `E820` is specified in terms of `EAX`,
+// `EBX`, `ECX` and `EDX`. The PCI BIOS interface in `super::pci` does the
+// same, and for the same reason.
 
 /// The signature `E820` requires in `EDX` and answers with in `EAX`.
 const SMAP: u32 = 0x534d_4150;
@@ -352,7 +340,16 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.iret();
 
     // -- INT 1Ah -------------------------------------------------------------
+    //
+    // The clock functions and the PCI BIOS interface share a vector and share
+    // nothing else: `AH=B1h`'s functions are specified in terms of 32-bit
+    // registers, so they need the `PUSHAD` frame rather than the `PUSHA` one
+    // the clock uses. The test that separates them is made *before* the
+    // prologue, which costs nothing — `INT n` has already pushed the caller's
+    // `FLAGS` (SDM Vol. 2A, `INT n`), so the flags register is scratch here.
     a.bind(l.int1a);
+    a.alui8(Alu::CMP, AH, super::pci::PCI_FUNCTION);
+    a.jcc(Cc::E, l.int1a_pci);
     enter(a);
     ds_bda(a);
     let get_ticks = a.label();

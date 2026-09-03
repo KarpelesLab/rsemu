@@ -248,6 +248,15 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.alu32(Alu::ADD, AX, DX);
     a.movto32(Mem::abs(EBDA_E820 + 3 * E820_ENTRY + 8).seg(ES), AX);
 
+    // -- the PCI configuration window ----------------------------------------
+    //
+    // Before the option-ROM scan, not after: a PCI expansion ROM is entitled to
+    // call `INT 1Ah AH=B1h` to find the function it belongs to (*PCI Firmware
+    // Specification* 3.0 §3.2), and a video BIOS built for a PCI card does
+    // exactly that. The service has to answer by the time the first ROM is
+    // entered.
+    a.call(l.pci_detect);
+
     // -- option ROMs ---------------------------------------------------------
     //
     // PCI Firmware Specification 3.0 §5.2.2 and the ISA convention it inherits:

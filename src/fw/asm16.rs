@@ -1009,6 +1009,15 @@ impl Asm {
         self.db(&[0xed]);
     }
 
+    /// `IN EAX, DX` — `66 ED`, the same opcode under the operand-size prefix.
+    ///
+    /// The only way a 16-bit BIOS reads a 32-bit port, and PCI configuration
+    /// mechanism #1 has two of them (*PCI Local Bus Specification* §3.7.4.1:
+    /// `CONFIG_ADDRESS` "can only be accessed as a Dword").
+    pub fn in_eax_dx(&mut self) {
+        self.db(&[0x66, 0xed]);
+    }
+
     /// `OUT imm8, AL` — `E6 ib`.
     pub fn out_al(&mut self, port: u8) {
         self.db(&[0xe6, port]);
@@ -1022,6 +1031,11 @@ impl Asm {
     /// `OUT DX, AX` — `EF`.
     pub fn out_dx_ax(&mut self) {
         self.db(&[0xef]);
+    }
+
+    /// `OUT DX, EAX` — `66 EF`.
+    pub fn out_dx_eax(&mut self) {
+        self.db(&[0x66, 0xef]);
     }
 
     // -- system -------------------------------------------------------------
@@ -1130,6 +1144,12 @@ mod tests {
         );
         assert_eq!(one(|a| a.read_cr0(AX)), [0x0f, 0x20, 0xc0]);
         assert_eq!(one(|a| a.write_cr0(AX)), [0x0f, 0x22, 0xc0]);
+        // The 32-bit port pair, which is the same opcode as the 16-bit one
+        // under the operand-size prefix rather than an opcode of its own.
+        assert_eq!(one(|a| a.in_ax_dx()), [0xed]);
+        assert_eq!(one(|a| a.in_eax_dx()), [0x66, 0xed]);
+        assert_eq!(one(|a| a.out_dx_ax()), [0xef]);
+        assert_eq!(one(|a| a.out_dx_eax()), [0x66, 0xef]);
     }
 
     #[test]

@@ -540,23 +540,62 @@ Two things the boot taught the firmware, neither predicted:
   run here and block move is the service it asks for; it is exercised by the
   hermetic test's own boot sector rather than by FreeDOS.
 
+### The PCI BIOS interface
+
+`INT 1Ah AH=B1h`, the last of phase 6a's firmware list, and the service a
+DOS-era driver or a PCI option ROM uses to find a function on the bus without
+knowing how a configuration cycle is generated on this board.
+
+Implemented, over configuration mechanism #1: `B101h` installation check,
+`B102h` find by vendor and device, `B103h` find by class code, and
+`B108h`/`B109h`/`B10Ah` and `B10Bh`/`B10Ch`/`B10Dh` — read and write
+configuration space as a byte, a word or a Dword, with the register number
+range-checked and alignment-checked so a misaligned word gets
+`BAD_REGISTER_NUMBER` rather than the wrong two bytes.
+
+**POST probes for the mechanism rather than being told about it.**
+`CONFIG_ADDRESS` is a Dword register whose bits 30-24 read as zero, so writing
+the enable bit alone and reading back exactly the enable bit alone identifies a
+live window (*PCI Local Bus* §3.7.4.1); a board with no host bridge answers
+with ones and has no PCI BIOS. The probe puts the latch back to zero
+afterwards, so the byte at `0xcf9` — the reset control register, which this
+board's bridge passes through to `pc.sysctl` — is not left sitting behind an
+enabled configuration cycle. That is the one thing about this board a
+firmware can find out by *asking* rather than by reading the machine
+description, and it is why the answer is a probe and not a
+[`Platform`](../../src/fw/pcbios/platform.rs) field.
+
+`tests/pc_at_pci_bios.rs` is the evidence: a boot sector calls `B101h`, checks
+the `'PCI '` signature, finds the board's display adapter *twice* — once by the
+vendor and device identification `machines/pc-at.machine` gives it and once by
+its class code — reads its configuration space through the service and then
+**reads the same registers itself through `0xcf8`/`0xcfc`**, which is the check
+that the service is reporting the bus rather than reciting a constant. It also
+writes the host bridge's latency timer through `B10Bh` and sees the change
+through the ports. The negative control is the same firmware on the same board
+with the `0xcf8` window unmapped: every function, the installation check
+included, comes back with carry set.
+
+Refused, each with `FUNC_NOT_SUPPORTED` and a reason rather than an omission:
+`B106h` generate special cycle, because the fabric has no special-cycle path
+and the write would be a master abort no device sees; `B10Eh`/`B10Fh`, the
+`$PIR` interrupt routing table, because this board has no south bridge and
+therefore no routing to report; and the 32-bit BIOS32 service directory,
+because `src/fw/asm16.rs` emits 16-bit code and a `_32_` structure is found by
+a search, so publishing one that could not be entered would be worse than
+publishing none. The scan covers bus 0 and `B101h` says so in `CL`: a bus
+beyond 0 lives behind a PCI-to-PCI bridge whose bus numbers firmware assigns at
+POST, and nothing in the tree models one.
+
 ### What it does not do
 
-- **No diskette `FORMAT TRACK`** (`INT 13h AH=05h`). Reads and writes both go
-  the whole way — digital output register, four `SENSE INTERRUPT STATUS`
-  commands to clear the reset's ready-changed reports, `SPECIFY`, `SEEK`, an
-  8237 channel-2 programming and one `READ DATA` or `WRITE DATA` per sector —
-  and formatting is a different command phase that nothing which boots asks for.
-- **No `INT 10h AH=11h`**, the character-generator group: `AL=30h` answers with
-  a pointer to a font table and this ROM has no font in it, because the text is
-  drawn by `pc.video`. FreeDOS calls it once while booting and does not mind.
-- **No PCI BIOS interface** (`INT 1Ah AH=B1h`), which is the one phase-6a
-  firmware deliverable still outstanding. **ACPI and SMBIOS are published**:
-  the ROM carries an MP 1.4 floating pointer and configuration table, an ACPI
-  RSDP/RSDT/XSDT/FADT/MADT/DSDT set and an SMBIOS structure table at
-  `0xf8000`, all generated from the machine description, so the processors the
-  board declares are the processors an operating system finds
-  (`src/fw/pcbios/tables.rs`, `tests/pc_at_tables.rs`).
+- **No `INT 10h AH=11h`**, the character-generator group. `AL=30h` answers with
+  a pointer to *the font being displayed*, and on this board that font is
+  `pc.video`'s — the adapter draws the glyphs and there is no font in the ROM
+  at all. A copy here would answer with a different font from the one on the
+  screen, which is a worse answer than carry, and it would put a font's
+  provenance inside the firmware where `pc.video`'s original one is already
+  argued. FreeDOS calls it once while booting and does not mind.
 - **Text mode only**, because `pc.video` is a text-mode CRTC. `INT 10h AH=00h`
   records a graphics mode and changes nothing.
 - **`INT 10h AH=06h` scrolls the whole screen** when the line count is
@@ -564,6 +603,51 @@ Two things the boot taught the firmware, neither predicted:
   programs use it for.
 - **US layout, base scan codes only.** Extended (`E0`-prefixed) keys are
   dropped rather than half-decoded, and the lock states are not tracked.
+
+### Which boards actually reach this firmware
+
+Worth writing down, because it is easy to assume more than is true:
+
+- **`pc-at`** — the only board `rsemu run` offers it to. `builtin_bios` in
+  `src/bin/rsemu.rs` matches the machine's stem, and `pc-at` is the only stem
+  in the match; the image is assembled from *that* description, so a user who
+  edits their copy gets tables that describe their copy.
+- **`q35`** — only from `tests/q35_board.rs`, which puts the image in the
+  socket explicitly. `machines/q35.machine`'s firmware comment says the slot
+  "defaults to rsemu's own 64 KiB image", and on the command line it does not:
+  the default is offered per machine stem and `q35` is not one of them. Adding
+  it is a board decision rather than a firmware one, which is why it is
+  recorded here rather than taken.
+- **`pc-apic` does not reach it at all.** `machines/pc-apic.machine` has no
+  builtin and `tests/pc_apic.rs` assembles its own protected-mode stub by hand;
+  neither goes near `src/fw/pcbios`.
+
+**On `q35` there are two valid RSDPs, and the right one wins.** The board's
+`q35.acpi` device maps its generated tables at `0xe0000`, and this firmware
+lays its own at `0xf8000`. ACPI §5.2.5.1 has OSPM search the EBDA's first
+kilobyte and then `0xE0000`-`0xFFFFF` on 16-byte boundaries and take the first
+valid structure, which is the device's — and that is the one that should win,
+because it describes the machine *as realized*, with an MCFG for the ECAM
+window and a `_PRT` read out of the bridge's routing registers, while this
+firmware's set describes `pc-at`. The MP table at `0xf8000` has no competitor
+and is found; a legacy operating system on a q35 therefore gets an MP table
+from the ROM and an ACPI set from the board, which is the correct pairing
+rather than a coincidence.
+
+### Formatting a diskette
+
+`INT 13h AH=05h` is implemented, and the reason it was not — "formatting is a
+different command phase" — stopped being true once `pc.fdc` grew `FORMAT A
+TRACK`. The chip reads four ID bytes per sector out of memory through the same
+8237 channel the data would use, so the firmware's part is a seek (the command
+formats the track the head is *on*, and takes no cylinder parameter), a DMA
+programming whose length is four bytes per sector rather than 512, and six
+command bytes.
+
+`tests/pc_at_format.rs` runs it on the second head of cylinder 0 — a track this
+diskette does not use, so a bug there cannot destroy the boot sector the test is
+running from — and reads the same sector before and after: zeros become the
+`0xF6` filler, which nothing but a format that reached the drive can do.
 
 ### Two things the board does that the firmware found
 

@@ -22,6 +22,8 @@ datasheet, which are free.
 | --- | --- |
 | [OSDev: PCI](https://wiki.osdev.org/PCI) | Config space layout, enumeration, BAR decoding, the header types. Enough to implement a working PCI host bridge |
 | [OSDev: PCI Express](https://wiki.osdev.org/PCI_Express) | ECAM (memory-mapped config), extended config space |
+| PCI BIOS Specification 2.1 | `INT 1Ah AH=B1h`: the real-mode service a DOS-era driver or an option ROM finds a function and reads its config space through. Openly published, unlike the Local Bus specification, and what `src/fw/pcbios/pci.rs` is written from |
+| Ralf Brown's Interrupt List, `INT 1A/AH=B1h` | The same ABI as software in the field actually calls it — a catalogue of interfaces, with no implementation in it |
 | Device datasheets | Every PCI device's datasheet documents its own config space, BARs and capabilities — this is the authoritative source for the device you are modelling |
 
 ## Implementation notes
