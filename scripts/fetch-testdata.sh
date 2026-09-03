@@ -792,6 +792,75 @@ edk2_hint() {
 	note "          cargo test --release --all-features firmware_from_the --lib -- --nocapture"
 }
 
+# The OVMF build, for the q35-uefi board. Not downloaded either: a split
+# `_CODE.fd` / `_VARS.fd` pair ships in the distribution's edk2/ovmf package, and
+# copying the file already on the machine beats guessing at a mirror URL.
+# BSD-2-Clause-Patent, so it may be read as well as run; still not committed,
+# because the rule is about the repository rather than about any one file.
+#
+# Two search paths, because distributions disagree about where it goes:
+# /usr/share/edk2-ovmf (Fedora, Gentoo) and /usr/share/OVMF (Debian, Ubuntu).
+# `RSEMU_OVMF_DIR` overrides both.
+fetch_ovmf() {
+	local dest="${DEST_ROOT}/x86"
+	local dir found=""
+	mkdir -p "$dest"
+
+	for dir in ${RSEMU_OVMF_DIR:-} /usr/share/edk2-ovmf /usr/share/OVMF \
+		/usr/share/edk2/OvmfX64 /usr/share/qemu; do
+		[ -n "$dir" ] || continue
+		if [ -r "${dir}/OVMF_CODE.fd" ] && [ -r "${dir}/OVMF_VARS.fd" ]; then
+			found="$dir"
+			break
+		fi
+	done
+
+	if [ -z "$found" ]; then
+		note "  no OVMF_CODE.fd and OVMF_VARS.fd under any of the usual places"
+		note "  install your distribution's OVMF package (Debian/Ubuntu: ovmf;"
+		note "  Fedora: edk2-ovmf; Gentoo: sys-firmware/edk2-bin), or set"
+		note "  RSEMU_OVMF_DIR to wherever the two .fd files are."
+		return 0
+	fi
+
+	cp -f "${found}/OVMF_CODE.fd" "${dest}/OVMF_CODE.fd"
+	# The variable store is copied rather than used in place because the whole
+	# point of it is that the guest *writes* to it, and a run that scribbled on
+	# the system's copy would be a surprise.
+	cp -f "${found}/OVMF_VARS.fd" "${dest}/OVMF_VARS.fd"
+	chmod u+w "${dest}/OVMF_VARS.fd"
+
+	ok "OVMF_CODE.fd ($(wc -c <"${dest}/OVMF_CODE.fd" | tr -d ' ') bytes)"
+	ok "OVMF_VARS.fd ($(wc -c <"${dest}/OVMF_VARS.fd" | tr -d ' ') bytes)"
+	ovmf_notice "$dest" "$found"
+	ovmf_hint "$dest"
+}
+
+ovmf_notice() {
+	printf '%s\n' "OVMF (EDK II OvmfPkg, X64), copied from ${2}
+https://github.com/tianocore/edk2
+
+Licence: BSD-2-Clause-Patent. Permissive, so it may be read as well as run.
+Copied from a local firmware package rather than downloaded; nothing here is
+committed.
+
+Consumed by RSEMU_OVMF_CODE and RSEMU_OVMF_VARS in tests/q35_uefi.rs.
+docs/platforms/q35-uefi.md has the whole command line and says where it gets
+to." >"${1}/PROVENANCE-ovmf.txt"
+}
+
+ovmf_hint() {
+	local dest="$1"
+	note ""
+	note "  boot it with:"
+	note "      RSEMU_OVMF_CODE=${dest}/OVMF_CODE.fd \\"
+	note "      RSEMU_OVMF_VARS=${dest}/OVMF_VARS.fd \\"
+	note "      RSEMU_OVMF_VARS_OUT=${dest}/OVMF_VARS.fd \\"
+	note "      RSEMU_OVMF_MS=400000 \\"
+	note "          cargo test --release --features machine-q35-uefi \\"
+	note "              --test q35_uefi -- --nocapture"
+}
+
 fetch_linux() {
 	need curl
 	local dest="${DEST_ROOT}/riscv"
@@ -1749,6 +1818,9 @@ Suites:
                  minutes, which is why --all leaves it out.
   edk2           UEFI for riscv-virt, copied from the local qemu firmware
                  package (BSD-2-Clause-Patent; nothing to download)
+  ovmf           UEFI for q35-uefi: a split OVMF _CODE.fd / _VARS.fd pair,
+                 copied from the local edk2/ovmf package the same way
+                 (BSD-2-Clause-Patent; nothing to download)
   linux          riscv64 Linux Image to boot on it (GPL-2.0, FETCH-ONLY)
   initramfs      a busybox root filesystem for that kernel, built here around
                  Debian's riscv64 busybox-static (GPL-2.0, FETCH-ONLY)
@@ -1847,6 +1919,7 @@ for suite in "${SUITES[@]}"; do
 		a64-tests|a64) build_a64_tests ;;
 		riscv-arch-test|arch-test|act) fetch_arch_test ;;
 		edk2|uefi) fetch_edk2 ;;
+		ovmf|x86-uefi) fetch_ovmf ;;
 		linux|kernel) fetch_linux ;;
 		initramfs|rootfs) fetch_initramfs ;;
 		initramfs-virtio|virtio) fetch_initramfs_virtio ;;

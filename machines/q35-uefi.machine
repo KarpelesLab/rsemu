@@ -1,0 +1,402 @@
+# A q35-class PC that boots **UEFI out of flash**, the way a machine built this
+# century does.
+#
+#   rsemu run q35-uefi --flash0 OVMF_CODE.fd --flash1 OVMF_VARS.fd
+#   rsemu run q35-uefi --flash0 OVMF_CODE.fd --drive flash1=OVMF_VARS.fd
+#   rsemu run q35-uefi --flash0 edk2-x86_64-code.fd --flash1 edk2-i386-vars.fd \
+#       -p flash=4M -p vars=528K
+#
+# The second form is the one that makes a variable outlive the run: `--flash1`
+# copies bytes in and nothing takes them out again, while `--drive` binds the
+# bank to a host **file** through `dev/medium`, and `flash.cfi`'s `flush` writes
+# it back when the machine stops.
+#
+# # What this board is, against `q35`
+#
+# The same chipset, with the **firmware socket replaced by two banks of
+# parallel NOR flash**. `machines/q35.machine` has a `pc.rom` at `0xf0000` and
+# an alias of it at the top of the address space, which is a 1996 machine: a
+# mask ROM the processor executes and nothing writes. A UEFI machine has flash,
+# and the difference is not cosmetic — the variable store is the firmware's own
+# non-volatile memory, and a part that can only *clear* bits is what UEFI's
+# fault-tolerant write is built on top of (`src/dev/flash/cfi.rs`).
+#
+# This is the same arrangement `machines/riscv-virt.machine` already boots EDK
+# II from, one architecture over: a read-only code bank and a writable variable
+# bank, both `flash.cfi`, both filled from a media slot. What is x86-specific is
+# only *where they go* and *how wide they are* — see the `map` block and the
+# `flash.cfi` objects.
+#
+# # Where the banks go, and why it is not a choice
+#
+# An x86 processor fetches its first instruction from `0xfffffff0`, sixteen
+# bytes below the top of the address space (Intel SDM Vol. 3A §9.1.4). The code
+# bank therefore **ends at 4 GiB**, and the variable bank sits immediately below
+# it, so the pair is one contiguous run of flash whose top is the reset vector.
+# That is the layout every split OVMF build is compiled for, and it is why
+# `vars` and `flash` are sizes rather than addresses: the addresses fall out of
+# them.
+#
+#   0x100000000 - flash          the variable store, `vars` bytes
+#   0x100000000 - flash + vars   the firmware, `flash - vars` bytes
+#   0x100000000 - 16             the reset vector, at the top of the last block
+#
+# The defaults describe a **2 MiB** split OVMF: a 1920 KiB code image and a
+# 128 KiB variable store. A 4 MiB build is `-p flash=4M -p vars=528K`.
+#
+# # What is gone from `q35`, and why each one
+#
+#   * **The `pc.rom` sockets.** Replaced, as above. Nothing maps `0xf0000` any
+#     more: on a UEFI machine that band is neither ROM nor a table store, and
+#     leaving it open bus is the honest description.
+#   * **`q35.acpi`.** The firmware publishes its own ACPI set and hands the
+#     operating system an RSDP through the EFI configuration table (UEFI 2.10
+#     §4.6). A board that also staged a *generated* RSDP at `0xe0000` would be
+#     offering a legacy scan a second, different description of itself — the
+#     exact ambiguity `machines/q35.machine` warns about for the MP table, with
+#     the roles reversed. One machine, one set of tables, and here they are the
+#     firmware's.
+#   * **The video adapter and its option ROM.** EDK II's `QemuVideoDxe` binds
+#     three PCI identifications and none of them is ours, so a display adapter
+#     on this board would be a card nothing drives. The console is the 16550,
+#     which is what EDK II's `PlatformBootManagerLib` puts a terminal on and
+#     what every measurement in `docs/platforms/q35-uefi.md` is taken through.
+#   * **Both IDE channels and the 8237As.** A UEFI build reaches its disks
+#     through a PCI storage controller, not through `0x1f0`; each of these would
+#     be a second thing under test.
+#
+# # A20 is deliberately unwired
+#
+# The same decision `machines/q35-linux.machine` documents, for the same reason
+# and with a different guest. A net with a driver comes up low, and a low `a20`
+# pin shuts the gate; the firmware on `q35` opens it during POST. UEFI firmware
+# does not: its reset vector goes from real mode to long mode without ever
+# touching `0x92` or the 8042's output port, because the machines it is written
+# for come out of reset with A20 already connected. So the 8042 is here — a
+# `Ps2KeyboardDxe` that found open bus at `0x64` would spend its whole timeout
+# there — but its `a20` pin drives nothing, and an unwired pin is a permanently
+# connected address line.
+#
+# # Sources
+#
+# Intel 3 Series Express Chipset Family Datasheet (316966-002) for the (G)MCH;
+# Intel I/O Controller Hub 9 Family Datasheet (316972-004) for the south bridge;
+# Intel SDM Vol. 3A §9.1.4 for the reset state; the UEFI Specification 2.10 and
+# the PI Specification 1.8 for what a firmware expects of a platform; JEDEC
+# JESD68.01 and the Intel StrataFlash P30 datasheet for the flash. EDK II itself
+# (BSD-2-Clause-Patent, readable under `ROADMAP.md` §1) for which of those flash
+# commands `OvmfPkg`'s driver actually issues.
+#
+# **No emulator source was consulted** (ROADMAP.md §1).
+
+machine "q35-uefi" {
+  # -- parameters -------------------------------------------------------------
+
+  # Base memory: the 640 KiB below the video hole.
+  param basemem = 640K
+
+  # Extended memory, from 0x100000 up. UEFI is not a boot sector: the DXE core
+  # allocates a heap, decompresses a firmware volume into it and keeps every
+  # driver it dispatched resident, so 128 MiB is a floor rather than a generous
+  # number.
+  #
+  # It is also the number the firmware *reads*: `pc.rtc` publishes it in CMOS
+  # `0x34`/`0x35` as 64 KiB blocks above 16 MiB, which is the pair EDK II's
+  # `PlatformInitLib` sizes memory from and the only route to it on a board with
+  # no `fw_cfg`. `extmem = 128M` puts the top of low memory at `0x8100000`, and
+  # the firmware computes exactly that.
+  param extmem = 128M
+
+  # How much flash the board has in total, and how much of it is the variable
+  # store. Two sizes rather than two addresses because the addresses are fixed
+  # by the reset vector — see the header.
+  param flash = 2M
+  param vars  = 128K
+
+  # The erase-block size both banks are divided into. 4 KiB, which is what a
+  # split OVMF build is laid out in: its variable store, its fault-tolerant
+  # working block and that block's spare are each a whole number of these, and
+  # an erase that took more would destroy a neighbour.
+  param block = 4K
+
+  # Where `PCIEXBAR` comes out of reset pointing, with its enable bit set.
+  # Unlike on `q35` this is *not* purely a stand-in for firmware: EDK II's
+  # `PlatformPei` programs the register itself, to `PcdPciExpressBaseAddress`,
+  # which for a q35 is this address. The board pre-programming it means the
+  # window decodes before the firmware gets there and the firmware's own write
+  # is a no-op — so both orders work and neither is load bearing.
+  param ecambase = 0xe0000000
+
+  # Where `PMBASE` comes out of reset pointing, with `ACPI_EN` set. This one
+  # matters more than it looks: EDK II reads the ACPI power-management timer at
+  # `PcdAcpiPmBaseAddress + 8` for every `MicroSecondDelay`, and its
+  # `AcpiInitialization` only programs `PMBASE` when it finds `ACPI_EN` clear.
+  # 0x600 is both the arrangement `machines/q35.machine` uses and the address
+  # OVMF is built for, so the firmware finds the timer already running.
+  param pmbase = 0x600
+
+  # Which host character port the keyboard's scan codes arrive on.
+  param keyboard = "keyboard"
+
+  # And which one COM1 is, which is this board's only console.
+  param console = "console"
+
+  # The date and time the RTC starts at. A device may never read the host clock
+  # (CLAUDE.md, determinism), so it is declared.
+  param time = "2026-01-01T00:00:00"
+
+  # -- crystals ---------------------------------------------------------------
+  #
+  # `q35`'s, minus the dot clock a board with no video adapter has no use for.
+
+  osc cpu   = 25000000 Hz
+  osc pit   = 105000000/88 Hz
+  osc rtc   = 32768 Hz
+  osc kbd   = 12000000 Hz
+  osc bus   = 100000000 Hz
+  osc hpet  = 10000000 Hz
+  osc pmtmr = 315000000/88 Hz
+  osc uart  = 1843200 Hz
+
+  # -- address spaces ---------------------------------------------------------
+
+  space mem  { width = 64, unassigned = read-as-ones }
+  space port { width = 16, unassigned = read-as-ones }
+
+  # -- the processor ----------------------------------------------------------
+  #
+  # `variant = "x86-64"`, and on this board that is not a preference. A UEFI
+  # firmware's SEC phase leaves real mode within a few dozen instructions and is
+  # in **long mode** before it calls a single PEIM; everything after the reset
+  # vector is 64-bit code with paging on.
+  object cpu0 "cpu.x86" {
+    clock   = cpu
+    space   = mem
+    iospace = "port"
+    variant = "x86-64"
+    engine  = "interp"
+  }
+
+  # -- memory -----------------------------------------------------------------
+
+  object ram_low  "ram" { size = basemem }
+  object ram_high "ram" { size = extmem }
+
+  # -- the north bridge -------------------------------------------------------
+  #
+  # `machines/q35.machine`'s, unchanged, and its comment block is the long form.
+  # `device-id = 0x29c0` is the 82G33/82P35 identification the datasheet prints
+  # as the register file's own default — and EDK II's `PlatformInitLib`
+  # switches on exactly this value to decide it is looking at a q35 rather than
+  # an i440fx, so a board that answered anything else would be initialised as
+  # the wrong chipset.
+  object mch "q35.mch" {
+    device-id   = 0x29c0
+    clock       = bus
+    space       = mem
+    bus         = "pci0"
+    ecam        = ecambase
+    passthrough = sysctl
+  }
+
+  # -- the south bridge -------------------------------------------------------
+  #
+  # `machines/q35.machine`'s, unchanged.
+  object lpc "q35.lpc" {
+    clock       = pmtmr
+    bus         = "pci0"
+    iospace     = "port"
+    device-id   = 0x2918
+    pm-base     = pmbase
+    pirq-routes = [11, 10, 11, 10]
+  }
+
+  # -- interrupts -------------------------------------------------------------
+
+  object pic1   "pc.pic"    { mode = "master" }
+  object pic2   "pc.pic"    { mode = "slave" }
+  object lapic0 "pc.lapic"  { clock = bus, id = 0, bus = "apic" }
+  object ioapic "pc.ioapic" { id = 1, bus = "apic" }
+  object imcr   "pc.imcr"   {}
+
+  # -- the timers -------------------------------------------------------------
+
+  object pit0 "pc.pit" { clock = pit }
+
+  object hpet0 "pc.hpet" {
+    clock  = hpet
+    period = 100000000
+    route0 = 16
+    route1 = 17
+    route2 = 18
+  }
+
+  # -- the real-time clock and CMOS -------------------------------------------
+
+  object cmos "pc.rtc" {
+    clock   = rtc
+    time    = time
+    basemem = basemem
+    extmem  = extmem
+  }
+
+  # -- the rest of the legacy set ---------------------------------------------
+
+  object kbc    "pc.kbc"    { clock = kbd / 12000, port = keyboard }
+  object sysctl "pc.sysctl" {}
+
+  # -- the serial port --------------------------------------------------------
+  #
+  # COM1 at 0x3f8 on IRQ4, and this board's only console: EDK II's
+  # `PlatformBootManagerLib` puts a terminal on the ISA serial port, and the
+  # UEFI shell talks through it.
+  object com1 "uart.ns16550" {
+    clock     = uart / 16
+    port      = console
+    frequency = 1843200
+  }
+
+  # -- the flash --------------------------------------------------------------
+  #
+  # Two banks of parallel NOR, which is what makes a UEFI build able to *keep* a
+  # variable rather than merely read one. RAM at these addresses boots just as
+  # far and then cannot install `gEfiVariableWriteArchProtocolGuid`, because
+  # fault-tolerant write needs erase-and-program semantics memory has not got.
+  #
+  # `width = 1, interleave = 1` is the x86-specific half, and it is not a
+  # simplification. `machines/riscv-virt.machine` wires two x16 parts on a
+  # 32-bit bus because that is what its firmware's driver assumes; EDK II's
+  # `OvmfPkg` flash driver is written against a **byte-wide** part and issues
+  # every command as a single byte store, so a device whose command word was two
+  # bytes would reject each one as a misaligned access. One x8 part it is.
+  #
+  # `locked = false` is the other one. An Intel P30 powers up with every block
+  # locked and wants a `0x60`/`0xd0` unlock before a program or an erase; the
+  # `OvmfPkg` driver never issues one, so a board that came up locked would
+  # answer every variable write with SR.1 set. `machines/riscv-virt.machine`
+  # leaves the default alone because `VirtNorFlashDxe` *does* unlock.
+  #
+  # `flash0` is `readonly`: the bank a board boots from has `WP#` tied low, and
+  # firmware that is not meant to be guest-updatable should be refused rather
+  # than silently corrupted. `flash1` is not, and is the whole point — bind it
+  # with `--drive flash1=vars.fd` and what the guest programs is in the file
+  # when the run ends.
+  object flashcode "flash.cfi" {
+    size       = flash - vars
+    image      = "flash0"
+    block      = block
+    width      = 1
+    interleave = 1
+    locked     = false
+    readonly   = true
+  }
+
+  object flashvars "flash.cfi" {
+    size       = vars
+    image      = "flash1"
+    block      = block
+    width      = 1
+    interleave = 1
+    locked     = false
+  }
+
+  # -- the memory map ---------------------------------------------------------
+  #
+  # 0x00000     base RAM, up to the video hole
+  # 0x100000    extended memory
+  # 0xfec00000  the I/O APIC, 0xfed00000 the HPET, 0xfee00000 the local APIC
+  # 4G - flash  the variable store, then the firmware, then the reset vector
+  #
+  # The ECAM window is **not** here: `PCIEXBAR` places it.
+  map mem 0x00000000 size basemem = ram_low
+  map mem 0x00100000 size extmem  = ram_high
+
+  map mem 0xfec00000 size 0x0020 = ioapic.regs   # 82093AA §3.1
+  map mem 0xfed00000 size 0x0400 = hpet0.regs    # HPET spec §3.2.4
+  map mem 0xfee00000 size 0x1000 = lapic0.regs   # SDM Vol 3A §10.4.4
+
+  map mem 0x100000000 - flash        size vars         = flashvars
+  map mem 0x100000000 - flash + vars size flash - vars = flashcode
+
+  # -- the I/O map ------------------------------------------------------------
+  #
+  # The ACPI register block is not here: `PMBASE` places it.
+  map port 0x0020 size 0x0002 = pic1.regs
+  map port 0x0022 size 0x0002 = imcr.regs
+  map port 0x0040 size 0x0004 = pit0.regs
+  map port 0x0060 size 0x0001 = kbc.data
+  map port 0x0061 size 0x0001 = sysctl.portb
+  map port 0x0064 size 0x0001 = kbc.cmd
+  map port 0x0070 size 0x0002 = cmos.regs
+  map port 0x0092 size 0x0001 = sysctl.porta
+  map port 0x00a0 size 0x0002 = pic2.regs
+  map port 0x03f8 size 0x0008 = com1.regs
+  map port 0x04d0 size 0x0001 = pic1.elcr
+  map port 0x04d1 size 0x0001 = pic2.elcr
+  map port 0x0cf8 size 0x0008 = mch.config
+
+  # -- the wires --------------------------------------------------------------
+
+  wire pic2.int    -> pic1.ir2
+  wire pic1.int    -> imcr.int
+  wire imcr.intr   -> cpu0.intr
+  wire imcr.lint0  -> lapic0.lint0
+  wire lapic0.intr -> cpu0.intr
+  wire lapic0.nmi  -> cpu0.nmi
+
+  wire pit0.out0   -> pic1.ir0
+  wire pit0.out0   -> ioapic.irq2
+  wire kbc.irq1    -> pic1.ir1
+  wire kbc.irq1    -> ioapic.irq1
+  wire cmos.irq    -> pic2.ir0
+  wire cmos.irq    -> ioapic.irq8
+  wire kbc.irq12   -> pic2.ir4
+  wire kbc.irq12   -> ioapic.irq12
+
+  wire com1.irq    -> pic1.ir4
+  wire com1.irq    -> ioapic.irq4
+
+  wire hpet0.t0    -> ioapic.irq16
+  wire hpet0.t1    -> ioapic.irq17
+  wire hpet0.t2    -> ioapic.irq18
+
+  wire lpc.sci9    -> pic2.ir1
+  wire lpc.sci9    -> ioapic.irq9
+  wire lpc.sci10   -> pic2.ir2
+  wire lpc.sci10   -> ioapic.irq10
+  wire lpc.sci11   -> pic2.ir3
+  wire lpc.sci11   -> ioapic.irq11
+  wire lpc.sci20   -> ioapic.irq20
+  wire lpc.sci21   -> ioapic.irq21
+
+  wire lpc.irq3    -> pic1.ir3
+  wire lpc.irq3    -> ioapic.irq3
+  wire lpc.irq4    -> pic1.ir4
+  wire lpc.irq4    -> ioapic.irq4
+  wire lpc.irq5    -> pic1.ir5
+  wire lpc.irq5    -> ioapic.irq5
+  wire lpc.irq6    -> pic1.ir6
+  wire lpc.irq6    -> ioapic.irq6
+  wire lpc.irq7    -> pic1.ir7
+  wire lpc.irq7    -> ioapic.irq7
+  wire lpc.irq10   -> pic2.ir2
+  wire lpc.irq10   -> ioapic.irq10
+  wire lpc.irq11   -> pic2.ir3
+  wire lpc.irq11   -> ioapic.irq11
+  wire lpc.irq12   -> pic2.ir4
+  wire lpc.irq12   -> ioapic.irq12
+  wire lpc.irq14   -> pic2.ir6
+  wire lpc.irq14   -> ioapic.irq14
+  wire lpc.irq15   -> pic2.ir7
+  wire lpc.irq15   -> ioapic.irq15
+
+  wire sysctl.gate2 -> pit0.gate2
+  wire pit0.out2    -> sysctl.timer2
+  wire pit0.out1    -> sysctl.refresh
+
+  # Reset, from both the 8042's pulse and `0xcf9`. **A20 is not wired** — see
+  # the header. `kbc.a20` and `sysctl.a20` exist and drive nothing, so the
+  # address line stays connected however a guest programs the two chips.
+  wire kbc.reset    -> cpu0.reset
+  wire sysctl.reset -> cpu0.reset
+}
