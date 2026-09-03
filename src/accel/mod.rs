@@ -42,12 +42,14 @@
 //!   deliberately does not make them.
 //! * **[`ThreadingMode::Accel`](crate::core::sched::ThreadingMode::Accel) is
 //!   unimplemented in the scheduler**, which refuses it with
-//!   `SchedError::ModeUnimplemented`. That refusal is load-bearing and is left
-//!   standing, and it is what an accelerated board actually wants: under
-//!   [`Parallel`](crate::core::sched::ThreadingMode::Parallel) virtual time is
-//!   still the emulated grid, so a guest that runs for a host millisecond
-//!   between exits advances the board's clock by one budget, not by a
-//!   millisecond.
+//!   `SchedError::ModeUnimplemented`, so an accelerated board runs under
+//!   [`Parallel`](crate::core::sched::ThreadingMode::Parallel) — where virtual
+//!   time is still the emulated grid, so a guest that runs for a host
+//!   millisecond between exits advances the board's clock by one budget rather
+//!   than by a millisecond. **That is now the single thing standing between
+//!   this backend and an unmodified guest**, and it is worked out under
+//!   **Time** below; it was written here as a limitation and has since been
+//!   measured as a wall.
 //!
 //! What used to be on that list and no longer is:
 //!
@@ -63,6 +65,107 @@
 //!   slice and the restart sequences run on the interpreter the device carries,
 //!   which is how both engines get one implementation of *Intel SDM* Vol 3A
 //!   Table 9-1 rather than two.
+//! * **A stock Linux kernel boots to userspace on a board's own machine file.**
+//!   `tests/kvm_q35_linux.rs` runs `machines/q35-linux.machine` with a Gentoo
+//!   6.6.67 `bzImage` in its socket: the kernel enumerates the PCI bus, binds
+//!   the NVM Express driver, mounts an initramfs, reaches a shell and reads a
+//!   signature off the emulated namespace — **in about nine seconds of wall
+//!   clock against the interpreted run's sixteen minutes**. Two things had to
+//!   exist for that and both are in this module: a `CPUID` table
+//!   ([`kvm::board_cpuid`]) and an engine that can execute what hardware
+//!   cannot fetch ([`cpu::AccelCpu`]'s interpreter fallback). What still has to
+//!   be said on the kernel's command line, and why it is a statement about the
+//!   *scheduler* rather than about the board, is under **Time** below.
+//!
+//! # The interrupt controllers stay in userspace, and that is the decision
+//!
+//! KVM offers three arrangements, and this backend deliberately takes the one
+//! that looks like the most work:
+//!
+//! | arrangement | who owns the local APIC, I/O APIC and 8259A |
+//! | --- | --- |
+//! | `KVM_CREATE_IRQCHIP` | the kernel, all three, plus `KVM_CREATE_PIT2` for the 8254 |
+//! | `KVM_CAP_SPLIT_IRQCHIP` | the kernel owns the local APIC; userspace owns the rest |
+//! | **none** — what this is | **the board**: `pc.lapic`, `pc.ioapic`, `pc.pic`, `pc.imcr`, `pc.pit`, `pc.hpet` and the wires between them |
+//!
+//! **Because the board is the machine.** On `machines/q35-linux.machine` the
+//! interrupt path is not a detail a hypervisor could stand in for: the MADT is
+//! *generated from the devices that are actually there*, `_PRT` from the `PIRQ`
+//! routers the bridge is holding, IRQ0 arrives through a multiplexer built out
+//! of one `wire.not` and five `wire.and`s because that is what the HPET's
+//! `LEG_RT_CNF` bit is, and the IMCR decides which of two drivers owns `INTR`.
+//! An in-kernel local APIC would make the guest's APIC and the board's APIC two
+//! different objects — the table would describe one and the interrupts would
+//! come from the other, `Machine::save` would snapshot the wrong one, the
+//! monitor and the debugger would read the wrong one, and every route would
+//! have to be transcribed a second time into KVM's GSI routing table.
+//!
+//! Three consequences that are the point rather than side effects:
+//!
+//! * **One implementation is tested twice.** The I/O APIC's redirection-entry
+//!   polarity — level-triggered and active low, PCI Local Bus 3.0 §2.2.6 —
+//!   was wrong until this week, in `dev::pc::ioapic`. Under an in-kernel
+//!   irqchip that model would be dead code on an accelerated board and the
+//!   two engines would have stopped testing the same thing, which is precisely
+//!   what §4.6 asks them to do.
+//! * **The console comparison means something.** An accelerated run and an
+//!   interpreted run of one board can be compared line for line only if the
+//!   interrupt they are both waiting on came out of the same device.
+//! * **The snapshot needs no second architectural-state model.** A device's
+//!   chunk is the same chunk under either engine, so [`state`] has only the
+//!   *core* to carry. `KVM_GET_LAPIC`/`KVM_SET_LAPIC` translated into
+//!   `pc.lapic`'s chunk would be a second one — and `ROADMAP.md` phase 7 names
+//!   "LAPIC/x2APIC state" as part of the engine-independent model precisely
+//!   because it is not free.
+//!
+//! **What it costs, plainly.** Every APIC and I/O APIC access is an exit,
+//! including the end-of-interrupt at the close of every interrupt; there is no
+//! `irqfd`, no `ioeventfd`, no posted interrupt and no paravirtual EOI; and the
+//! local APIC's timer is a device on the board's virtual time rather than a
+//! host `hrtimer`. A whole `q35-linux` boot to a shell measures about 600,000
+//! guest entries, of which roughly 520,000 are port accesses and 80,000 are
+//! MMIO — and it still takes nine seconds. The split irqchip is the natural
+//! upgrade if that ever stops being true, and it is *only* available at the
+//! price named above.
+//!
+//! It is also why [`kvm::board_cpuid`] clears the x2APIC and TSC-deadline bits:
+//! the board's local APIC is a device that implements neither, and a processor
+//! must not advertise what the machine around it has not got.
+//!
+//! # Time, which is where this is still unfinished
+//!
+//! **Virtual time does not advance while a vCPU is inside `KVM_RUN`.** A
+//! scheduler round ends when every runnable returns; an accelerated processor
+//! returns when the *guest* exits; so a guest that runs without exiting holds
+//! the round and the board's clocks stand still for as long as it takes. A
+//! delay loop is exactly such a guest, and a kernel is full of them.
+//!
+//! Two things a stock Linux kernel does are that one fact, and both are
+//! written out in `tests/kvm_q35_linux.rs`: `hpet_counting()` reads the HPET
+//! counter twice within one round and finds it unmoved, and
+//! `timer_irq_works()` calls `mdelay()` between two reads of `jiffies` and
+//! finds no tick. The first disables the HPET and is self-correcting — the
+//! 8254 takes the tick over through the same multiplexer — and the second
+//! needs `no_timer_check` on the command line until the scheduler can advance
+//! virtual time under a running guest.
+//!
+//! That is [`ThreadingMode::Accel`](crate::core::sched::ThreadingMode::Accel)'s
+//! whole job — §4.2's *"CPUs run in hardware and virtual time is slaved to the
+//! host clock; the scheduler becomes a deadline service"* — and it is
+//! unimplemented one level below this module, in `core::sched`. Nothing in
+//! `accel/` can substitute for it: bounding a guest's execution needs either a
+//! host signal, which `CLAUDE.md` rules out, or a clock read, which a device
+//! may not make. The seam it would use already exists —
+//! [`RateController`](crate::core::sched::RateController),
+//! [`HostClock`](crate::core::sched::HostClock) and `Machine::set_host_clock`
+//! — and nothing in the run path calls it yet.
+//!
+//! The visible symptom in the meantime is that a guest's own time runs at a
+//! rate that has nothing to do with the board's. A kernel that calibrates its
+//! time-stamp counter against this board's ACPI timer measures the *host's*
+//! TSC against *virtual* microseconds and concludes it is on a 176 THz
+//! processor. It boots, it runs, and every delay it computes from that number
+//! is wrong by the same factor.
 //!
 //! # A board, not a harness
 //!
@@ -88,6 +191,23 @@
 //! and keeping it would have meant two kinds of guest memory and boards that
 //! were accelerable and boards that were not.
 //!
+//! # What a user gives up by asking for this
+//!
+//! Said in one place, because "faster" is the only half anyone reads.
+//!
+//! | given up | why, and what it means in practice |
+//! | --- | --- |
+//! | **Reproducibility** | instruction timing, the instant an interrupt is taken and the TSC all come from the host. [`kvm::Vcpu::into_runnable`] and [`cpu::AccelCpus::open`] *refuse* a deterministic [`ThreadingMode`](crate::core::sched::ThreadingMode) rather than trusting a caller to know. So: no record/replay, no rewind, and no state hash that would mean anything. |
+//! | **The board's timing** | see **Time** above. Guest work costs no virtual time, so a guest's idea of elapsed time and the board's diverge without bound, and anything a guest measures against a board clock — a calibration, a timeout, a baud rate — comes out wrong. Guest-visible *behaviour* is unaffected; guest-visible *timing* is not modelled at all. |
+//! | **The processor the machine file asked for** | `cpu::x86` answers `CPUID` from its declared [`Variant`](crate::cpu::x86::Variant); an accelerated one answers from the host's silicon, filtered by [`kvm::board_cpuid`]. A guest takes different paths through its own feature dispatch under the two engines and prints a different model name. |
+//! | **The A20 gate** | modelled inside the interpreter for want of anywhere else to put it, so a guest's *hardware* accesses are not masked ([`cpu`]). A board that closes the gate and relies on the megabyte wrap is a board to interpret. |
+//! | **Three fields of the snapshot** | a pending `NMI`, the `NMI` level and `halted` are this module's rather than the shell's, for want of a public setter; [`cpu`] names each and the one-line change that would end it. |
+//! | **A hard bound on stopping** | a guest that takes no exits is not preemptible, because the alternative is a host signal ([`kvm`]). |
+//!
+//! What is *not* given up: the memory map, the devices, the interrupt
+//! controllers, the wires, the ACPI tables, the snapshot format and the
+//! console. Those are the board, and they are the same board.
+//!
 //! # Determinism
 //!
 //! An accelerated run is **not reproducible**, and nothing here pretends
@@ -98,7 +218,7 @@
 //!
 //! # `unsafe`, and where it is
 //!
-//! Two of `ROADMAP.md` §0's six sanctioned subsystems meet here, and this
+//! Two of `ROADMAP.md` §0's seven sanctioned subsystems meet here, and this
 //! module uses **both and only those two**:
 //!
 //! | Site | Where | What |

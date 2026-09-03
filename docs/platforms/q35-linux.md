@@ -498,6 +498,82 @@ frame the earlier reading leaned on, `nvme_wait_ready`, is `?`-prefixed — an
 unreliable leftover stack word, not a live frame — and this controller sets
 `CSTS.RDY` synchronously and never polls.
 
+## The same board under KVM
+
+The run above is the *interpreted* one: 2,374 seconds of guest time and about
+sixteen minutes of wall clock. `tests/kvm_q35_linux.rs` is the same machine
+file, the same kernel, the same initramfs and the same namespace signature,
+with the engine underneath `cpu0` replaced by a KVM vCPU
+(`Bindings::replace`, `src/accel/cpu.rs`), and it reaches the same line —
+`rsemu q35-linux nvme namespace, LBA 0`, read off the emulated controller by
+the kernel's own driver — in **35 seconds of guest time and about nine seconds
+of wall clock**. Roughly a hundredfold on the clock a person watches.
+
+```text
+RSEMU_KERNEL=/boot/vmlinuz \
+RSEMU_INITRD=testdata/x86/initramfs-x86.cpio \
+RSEMU_KERNEL_INPUT='rsemu# =>head -c 40 /dev/nvme0n1\n' \
+RSEMU_KERNEL_STOP_AT='LBA 0' \
+    cargo test --release --features accel-kvm,machine-q35-linux \
+               --test kvm_q35_linux -- --nocapture
+```
+
+Nothing about the board changes. The memory map, the ACPI tables, the PCI
+enumeration, the `PIRQ` swizzle, the I/O APIC redirection entry and the NVMe
+controller are the same objects doing the same work; what changes is who
+executes the guest's instructions between two of their accesses. About 600,000
+of those accesses leave hardware over a whole boot — 520,000 port accesses and
+80,000 MMIO — and every one is served by this board's own device models.
+
+Two things had to exist first, and both are in `src/accel/`:
+
+* **a `CPUID` table.** A vCPU that has never been given one answers every leaf
+  with zeros, and this kernel checks the long-mode bit before it does anything
+  else. `KVM_GET_SUPPORTED_CPUID` filtered through `accel::kvm::board_cpuid`
+  is the processor's identity, and the filter is where the board gets a say:
+  x2APIC and the TSC-deadline timer come *out*, because `pc.lapic` implements
+  neither, and so do the host's paravirtual leaves, because a guest taking its
+  time from `kvmclock` is a guest reading the host's clock while every other
+  clock on this board is virtual time.
+* **an interpreter for the reset vector.** A hypervisor cannot fetch through an
+  MMIO exit, and this board's reset vector is a *device region* — sixteen
+  synthesised bytes of `x86.linuxboot` at `0xfffffff0`, because what lives
+  there is a loader rather than a ROM image. The far jump out of it runs on the
+  shell interpreter that every accelerated `cpu.x86` carries; everything after
+  it runs on silicon. One instruction, measured.
+
+### The one word the command line still needs
+
+`no_timer_check`, and it is a statement about the *scheduler* rather than about
+this board:
+
+> Virtual time does not advance while a vCPU is inside `KVM_RUN`.
+
+A scheduler round ends when every runnable returns, and an accelerated
+processor returns when the guest exits — so a guest that runs without exiting
+holds the round, and the board's clocks stand still for as long as it takes. A
+delay loop is exactly such a guest. Two of this kernel's checks are that one
+fact:
+
+| what the kernel prints | what it did |
+| --- | --- |
+| `hpet: Counter not counting. HPET disabled` | read `HPET_COUNTER`, spun 200,000 TSC cycles, read it again — both reads inside one round |
+| `..MP-BIOS bug: 8254 timer not connected to IO-APIC`, then a panic | `timer_irq_works()`: read `jiffies`, `mdelay()`, read `jiffies` — the delay loop takes no exits, so no tick arrived |
+
+Neither is a defect in the interrupt tree this page spent four obstacles
+getting right. The first is self-correcting: with the HPET disabled by the
+guest, `LEG_RT_CNF` stays clear and the tick arrives from the 8254 through the
+*other* side of the same multiplexer — which is a second, unplanned test of it.
+The second needs the word until `ThreadingMode::Accel` lands in
+`src/core/sched.rs` and slaves virtual time to the host clock, which is
+`ROADMAP.md` §4.2's own description of the mode.
+
+The same fact is why the guest's own sense of time is nonsense under
+acceleration: it calibrates the host's time-stamp counter against this board's
+virtual-time ACPI timer and reports a `176273.643 MHz processor`. It boots and
+it runs; every delay it computes from that number is wrong by the same factor.
+`src/accel/mod.rs` has the full list of what acceleration costs.
+
 ## Sources
 
 [`q35.md`](q35.md)'s and [`pc64.md`](pc64.md)'s, plus:

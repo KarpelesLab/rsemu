@@ -56,6 +56,9 @@ impl Errno {
     pub const EINTR: Errno = Errno(4);
     /// Bad file descriptor.
     pub const EBADF: Errno = Errno(9);
+    /// Argument list too long — what a `CPUID` table the kernel has more
+    /// entries for than the caller offered room for comes back as.
+    pub const E2BIG: Errno = Errno(7);
     /// Permission denied — `/dev/kvm` exists and this user is not in its group.
     pub const EACCES: Errno = Errno(13);
     /// No such device.
@@ -80,6 +83,7 @@ impl fmt::Display for Errno {
         let name = match *self {
             Errno::ENOENT => "ENOENT",
             Errno::EINTR => "EINTR",
+            Errno::E2BIG => "E2BIG",
             Errno::EBADF => "EBADF",
             Errno::EACCES => "EACCES",
             Errno::ENODEV => "ENODEV",

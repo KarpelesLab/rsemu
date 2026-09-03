@@ -30,6 +30,18 @@
 //! produces a request the kernel does not recognise, and the assertion turns
 //! that into a compile error rather than an `ENOTTY` at run time.
 //!
+//! # A vCPU is not a processor until it has been told what it is
+//!
+//! `KVM_CREATE_VCPU` produces a processor whose every `CPUID` leaf answers
+//! zero, and a guest reads that table before it does anything else: an x86-64
+//! kernel's own entry path checks the long-mode bit, and the kernel refuses
+//! `EFER.LME` for a guest whose `CPUID` does not claim long mode. So
+//! [`Vm::create_vcpu`] installs one — `KVM_GET_SUPPORTED_CPUID` from
+//! `/dev/kvm`, filtered by [`board_cpuid`], `KVM_SET_CPUID2` onto the vCPU
+//! before its first entry, which is also the last moment the kernel accepts
+//! one. The filter is where the board gets a say in what its processor claims
+//! to be, and [`board_cpuid`] argues each removal.
+//!
 //! # The exit flag, and why there is no signal here
 //!
 //! `CLAUDE.md`: *"Stopping the world … uses the safe-point protocol: a
@@ -219,6 +231,17 @@ const KVM_SET_DEBUGREGS: Req<KvmDebugregs> =
 const KVM_GET_MSRS: u64 = ioc(DIR_RW, 0x88, 8);
 /// See [`KVM_GET_MSRS`].
 const KVM_SET_MSRS: u64 = ioc(DIR_WRITE, 0x89, 8);
+
+/// `KVM_GET_SUPPORTED_CPUID`, on the `/dev/kvm` handle, and `KVM_SET_CPUID2`
+/// on a vCPU below it.
+///
+/// Both encode the size of `struct kvm_cpuid2`'s **header** — two `__u32` —
+/// for [`KVM_GET_MSRS`]'s reason: the structure ends in a flexible array and
+/// `nent` says how far into it the kernel may reach. So, like the MSR pair,
+/// they are plain `u64`s rather than [`Req`]s.
+const KVM_GET_SUPPORTED_CPUID: u64 = ioc(DIR_RW, 0x05, 8);
+/// See [`KVM_GET_SUPPORTED_CPUID`].
+const KVM_SET_CPUID2: u64 = ioc(DIR_WRITE, 0x90, 8);
 
 const _: () = assert!(
     PAGE_SIZE == HOST_PAGE,
@@ -481,6 +504,50 @@ struct KvmMsrs<const N: usize> {
     entries: [KvmMsrEntry; N],
 }
 
+/// One entry of `struct kvm_cpuid2`: what one `CPUID` leaf answers with.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvmCpuidEntry2 {
+    /// The leaf, as `CPUID` takes it in `EAX`.
+    pub function: u32,
+    /// The sub-leaf in `ECX`, meaningful when [`flags`](Self::flags) says so.
+    pub index: u32,
+    /// `KVM_CPUID_FLAG_*`: whether `index` matters, and whether this is the
+    /// significant entry of a stateful leaf.
+    pub flags: u32,
+    /// What the leaf answers in `EAX`.
+    pub eax: u32,
+    /// `EBX`.
+    pub ebx: u32,
+    /// `ECX`.
+    pub ecx: u32,
+    /// `EDX`.
+    pub edx: u32,
+    /// Padding the kernel requires to be zero.
+    pub padding: [u32; 3],
+}
+const _: () = assert!(size_of::<KvmCpuidEntry2>() == 40);
+
+/// `struct kvm_cpuid2`, with the flexible array given a length.
+///
+/// [`KvmMsrs`]'s shape and for its reason: `nent` bounds what the kernel
+/// touches, so the type *is* the header plus `N` entries.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct KvmCpuid2<const N: usize> {
+    nent: u32,
+    pad: u32,
+    entries: [KvmCpuidEntry2; N],
+}
+
+/// How many `CPUID` entries a table is read into.
+///
+/// `KVM_MAX_CPUID_ENTRIES` in the kernel, which has been 256 since 5.7 and 80
+/// before it. Asking for more than the kernel will write is harmless — it
+/// reports how many it wrote — and asking for fewer than it has is `E2BIG`,
+/// so the ceiling is the safe direction to err in.
+const CPUID_ENTRIES: usize = 256;
+
 /// Byte offsets into the `kvm_run` page.
 ///
 /// Read as a table rather than transcribed as a `#[repr(C)]` struct on
@@ -592,6 +659,21 @@ fn ioctl_msrs<const N: usize>(fd: &Fd, req: u64, arg: &mut KvmMsrs<N>) -> SysRes
     unsafe { sys::ioctl(fd, req, core::ptr::from_mut(arg) as u64) }
 }
 
+/// Perform `KVM_GET_SUPPORTED_CPUID` or `KVM_SET_CPUID2`.
+///
+/// Separate from [`ioctl_struct`] for [`ioctl_msrs`]'s reason: the two numbers
+/// encode the size of the header rather than of the argument.
+#[allow(unsafe_code)]
+fn ioctl_cpuid<const N: usize>(fd: &Fd, req: u64, arg: &mut KvmCpuid2<N>) -> SysResult<i64> {
+    // SAFETY: `req` is one of the two constants above, whose UAPI argument is
+    // `struct kvm_cpuid2`; `KvmCpuid2<N>` is its `#[repr(C)]` transcription
+    // with the flexible array given the length `arg.nent` reports, and both
+    // callers below set `nent` to `N` and never to more. The kernel therefore
+    // touches the header plus at most `N` entries, all of which are inside
+    // this live, aligned, uniquely borrowed value for the whole call.
+    unsafe { sys::ioctl(fd, req, core::ptr::from_mut(arg) as u64) }
+}
+
 fn sys_err(what: &'static str) -> impl Fn(Errno) -> AccelError {
     move |errno| AccelError::Sys { what, errno }
 }
@@ -685,6 +767,40 @@ impl Kvm {
         self.vcpu_mmap_size
     }
 
+    /// Every `CPUID` leaf this host's KVM will let a guest see.
+    ///
+    /// The kernel's own answer to *"what can I safely tell a guest about this
+    /// processor?"* — the host's leaves with the ones a hypervisor cannot
+    /// honour removed and the paravirtual ones added. It is not what a guest
+    /// is given; [`board_cpuid`] decides that.
+    ///
+    /// # Errors
+    ///
+    /// [`AccelError::Sys`] if the ioctl fails, and
+    /// [`AccelError::Unsupported`] if this host reports more leaves than
+    /// `CPUID_ENTRIES` — which would mean the table was truncated, and a
+    /// truncated `CPUID` is a different processor.
+    pub fn supported_cpuid(&self) -> AccelResult<Vec<KvmCpuidEntry2>> {
+        let mut table = alloc::boxed::Box::new(KvmCpuid2::<CPUID_ENTRIES> {
+            nent: CPUID_ENTRIES as u32,
+            pad: 0,
+            entries: [KvmCpuidEntry2::default(); CPUID_ENTRIES],
+        });
+        ioctl_cpuid(&self.fd, KVM_GET_SUPPORTED_CPUID, &mut table).map_err(
+            |errno| match errno {
+                Errno::E2BIG => AccelError::Unsupported(
+                    "this host reports more CPUID leaves than this backend reads",
+                ),
+                errno => AccelError::Sys {
+                    what: "KVM_GET_SUPPORTED_CPUID",
+                    errno,
+                },
+            },
+        )?;
+        let nent = (table.nent as usize).min(CPUID_ENTRIES);
+        Ok(table.entries[..nent].to_vec())
+    }
+
     /// Create a virtual machine.
     ///
     /// # Errors
@@ -696,6 +812,7 @@ impl Kvm {
         let vm = Vm {
             fd: Fd::from_raw(fd as i32),
             vcpu_mmap_size: self.vcpu_mmap_size,
+            cpuid: board_cpuid(&self.supported_cpuid()?),
             immediate_exit: self.check_extension(KVM_CAP_IMMEDIATE_EXIT) != 0,
             readonly_mem: self.check_extension(KVM_CAP_READONLY_MEM) != 0,
             slots: Mutex::with_rank(LockRank::MACHINE, Vec::new()),
@@ -703,6 +820,74 @@ impl Kvm {
         vm.prepare_x86()?;
         Ok(vm)
     }
+}
+
+// ---------------------------------------------------------------------------
+// what a board's processor says it is
+// ---------------------------------------------------------------------------
+
+/// `CPUID.01H:ECX[3]`, `MONITOR`/`MWAIT`.
+const CPUID1_ECX_MONITOR: u32 = 1 << 3;
+/// `CPUID.01H:ECX[21]`, x2APIC.
+const CPUID1_ECX_X2APIC: u32 = 1 << 21;
+/// `CPUID.01H:ECX[24]`, the local APIC's TSC-deadline timer mode.
+const CPUID1_ECX_TSC_DEADLINE: u32 = 1 << 24;
+/// `CPUID.01H:ECX[31]`, which no processor sets and every hypervisor does.
+const CPUID1_ECX_HYPERVISOR: u32 = 1 << 31;
+
+/// The `CPUID` leaves rsemu's own emulated hypervisor-interface range would
+/// occupy. Nothing publishes one; the range is dropped so that a *host's*
+/// paravirtual leaves cannot be mistaken for the board's.
+const PARAVIRT_LEAVES: core::ops::RangeInclusive<u32> = 0x4000_0000..=0x4000_00ff;
+
+/// What a board's processor reports, out of what this host's KVM supports.
+///
+/// A guest asks `CPUID` and then *uses what it is told*, so this table is the
+/// contract between the hypervisor and the rest of the machine — and three of
+/// the answers KVM offers describe facilities that live in this crate's
+/// **device models** rather than in the processor, and that those models do
+/// not have. They are removed here rather than discovered as a `#GP` in a
+/// kernel's timer setup:
+///
+/// | leaf | bit | why it goes |
+/// | --- | --- | --- |
+/// | `01H:ECX` | 21, x2APIC | `dev::pc::apic` is an xAPIC: the MSR window at `0x800` is not decoded and `IA32_APIC_BASE.EXTD` is refused (its module documentation says so). A guest told otherwise would enable a mode the board has not got. |
+/// | `01H:ECX` | 24, TSC-deadline | the same model's timer runs in one-shot and periodic mode only, *"because nothing here has a time-stamp counter to compare against"*. |
+/// | `01H:ECX` | 3, `MONITOR` | `MWAIT` is intercepted and retired as a no-op, so an idle loop built on it becomes a **spin** — and under [`ThreadingMode::Parallel`] a spinning guest holds up the whole board's virtual time. `HLT` leaves hardware and is what the board's idle path wants. |
+/// | `4000_0000H`-`4000_00FFH` | all | the host's *paravirtual* leaves. Advertising them invites a guest to take its time from `kvmclock` — the **host's** clock — while every other clock on the board is virtual time. One machine, one time base. |
+///
+/// Bit 31 of `01H:ECX` is *set*: the guest is being virtualized and telling it
+/// otherwise buys nothing. With the paravirtual leaves gone it finds no
+/// signature behind the bit, which is the same thing a guest under an
+/// unrecognised hypervisor sees and is a case every operating system handles.
+///
+/// # What this does **not** do, and it matters
+///
+/// It does not make an accelerated processor the same *part* as an interpreted
+/// one. `cpu::x86`'s own `CPUID` answers from its
+/// [`Variant`](crate::cpu::x86::Variant) — a declared point in the extension
+/// lattice — and this table answers from the silicon the host happens to have.
+/// A guest therefore sees a different processor under the two engines, takes
+/// different paths through its own feature dispatch, and prints a different
+/// model name. Deriving the table from `Variant` instead is the deliverable
+/// that would close it, and it is a change to `cpu::x86`'s feature model
+/// rather than to this file.
+///
+/// [`ThreadingMode::Parallel`]: crate::core::sched::ThreadingMode::Parallel
+#[must_use]
+pub fn board_cpuid(supported: &[KvmCpuidEntry2]) -> Vec<KvmCpuidEntry2> {
+    supported
+        .iter()
+        .filter(|entry| !PARAVIRT_LEAVES.contains(&entry.function))
+        .map(|entry| {
+            let mut entry = *entry;
+            if entry.function == 1 {
+                entry.ecx &= !(CPUID1_ECX_MONITOR | CPUID1_ECX_X2APIC | CPUID1_ECX_TSC_DEADLINE);
+                entry.ecx |= CPUID1_ECX_HYPERVISOR;
+            }
+            entry
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -714,6 +899,13 @@ impl Kvm {
 pub struct Vm {
     fd: Fd,
     vcpu_mmap_size: u64,
+    /// What every vCPU on this VM is told it is, decided once by
+    /// [`board_cpuid`] from what the host supports.
+    ///
+    /// Per VM rather than per vCPU because a board's processors are one part:
+    /// a guest that found two of them answering `CPUID` differently would be
+    /// looking at a machine nobody built.
+    cpuid: Vec<KvmCpuidEntry2>,
     immediate_exit: bool,
     readonly_mem: bool,
     /// The stores backing each slot, kept alive for as long as the kernel
@@ -1056,6 +1248,37 @@ impl Vm {
         Ok(khz as u64)
     }
 
+    /// What every vCPU on this VM answers `CPUID` with.
+    #[must_use]
+    pub fn cpuid(&self) -> &[KvmCpuidEntry2] {
+        &self.cpuid
+    }
+
+    /// Tell a freshly created vCPU what processor it is.
+    ///
+    /// **Before its first `KVM_RUN`, and it cannot wait.** A vCPU with no
+    /// `CPUID` table answers every leaf with zeros, and a guest that reads
+    /// zeros there is not looking at a processor: an x86-64 kernel's own
+    /// entry path checks the long-mode bit before anything else, and `EFER`'s
+    /// `LME` is refused by the kernel for a guest whose `CPUID` does not
+    /// claim long mode. The table is also refused *after* the vCPU has run,
+    /// which is the other half of why this is here and not later.
+    fn set_cpuid(&self, fd: &Fd) -> AccelResult<()> {
+        if self.cpuid.is_empty() {
+            return Ok(());
+        }
+        let mut table = alloc::boxed::Box::new(KvmCpuid2::<CPUID_ENTRIES> {
+            nent: self.cpuid.len().min(CPUID_ENTRIES) as u32,
+            pad: 0,
+            entries: [KvmCpuidEntry2::default(); CPUID_ENTRIES],
+        });
+        for (slot, entry) in table.entries.iter_mut().zip(self.cpuid.iter()) {
+            *slot = *entry;
+        }
+        ioctl_cpuid(fd, KVM_SET_CPUID2, &mut table).map_err(sys_err("KVM_SET_CPUID2"))?;
+        Ok(())
+    }
+
     /// Create a vCPU, mapping its shared `kvm_run` page.
     ///
     /// `memory` is the address space MMIO exits are routed into and `io` the
@@ -1076,6 +1299,7 @@ impl Vm {
             .map_err(sys_err("KVM_CREATE_VCPU"))?;
         #[allow(clippy::cast_possible_truncation)]
         let fd = Fd::from_raw(fd as i32);
+        self.set_cpuid(&fd)?;
         let run = sys::map_shared(&fd, self.vcpu_mmap_size, 0)
             .map_err(sys_err("mmap the kvm_run page"))?;
         Ok(Vcpu {
