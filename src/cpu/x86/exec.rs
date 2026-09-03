@@ -373,7 +373,7 @@ impl State {
             sys,
             x87: X87::new(),
             sse: Sse::new(),
-            tlb: Tlb::new(),
+            tlb: Tlb::new(variant.buffers()),
             cycles: 0,
             halted: false,
             shutdown: false,

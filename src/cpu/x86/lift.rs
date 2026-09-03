@@ -36,7 +36,7 @@
 //! | x87, SSE, MMX | the IR has no vector ops (`ROADMAP.md` §9 adds them with the SIMD work) and tier-1 floating point is a helper call into soft-float that no x87 entry point exists for yet |
 //! | long mode, `REX` | a second operand-size and address-size lattice on top of the one below, **and a carry the IR cannot compute at this width** — see "Widening the world" |
 //! | real mode and virtual-8086 | `segment << 4 + offset` with a *16-bit offset wrap* is a different address path in `exec`, checked against three million hardware vectors, and generalising it is how that accuracy gets lost |
-//! | paging | a fetch inside the block can charge a page-table walk, and **not only at the block's entry** — see "Widening the world" |
+//! | paging | **no longer the tick charge** — the interpreter's buffers are split, so the only fetch walk is the entry one — but the host has no translation for a block's data accesses, the self-modifying-code guard compares linear pages while the cache invalidates by physical ones, and the key carries no `CR3` — see "Widening the world" |
 //! | `DIV`, `IDIV` | `#DE` is an exception the block cannot deliver, and the undefined flags come out of `exec::cord`'s trial-subtraction **loop**, which a block with only forward branches cannot express |
 //! | the string primitives, `REP` | a loop inside a block; the IR's verifier rejects a backward [`Opcode::BRCOND`] because `ir::pass`'s liveness is a single backward walk |
 //! | `LOCK`, `XCHG` with memory | the IR's atomics carry no [`MemOp`], so a byte- or word-wide atomic has no type to name (`ir`'s "Known gaps") |
@@ -159,11 +159,13 @@
 //!   and with paging off physical is linear).
 //! * **Paging is out of the subset.** With paging on, a fetch may miss the
 //!   guest's own translation-lookaside buffer and charge a page-table walk,
-//!   which is two to four bus reads and possibly an accessed-bit write. Data
-//!   accesses would be fine — they charge through the host — so this is a
-//!   restriction on *fetch* alone, and it is the one that keeps every fetch
-//!   charge static. "Widening the world" below says exactly what it would
-//!   take to lift it, because the obvious answer is not enough.
+//!   which is two to four bus reads and possibly an accessed-bit write. Since
+//!   [`paging::Buffers`](super::paging::Buffers) split the interpreter's
+//!   fetch and data buffers, that walk can only happen at the block's
+//!   **entry** — a data operand can no longer evict the code page's
+//!   translation — so the charge is static again given one fact the caller
+//!   knows. What still keeps paging out is the rest of the machinery, and
+//!   "Widening the world" below lists it.
 //!
 //! ## Page-straddling instructions
 //!
@@ -193,7 +195,7 @@
 //! *smaller* half of the problem and rediscovering the larger half is a day
 //! nobody needs to spend twice.
 //!
-//! ## Paging: the entry walk is the easy part
+//! ## Paging: the tick argument is settled, the rest of it is not
 //!
 //! The obvious plan works as far as it goes. A block never leaves its page, so
 //! the whole of it translates through one entry; give [`World`] an origin
@@ -203,31 +205,60 @@
 //! accessed bit and checks execute permission — rather than through a debug
 //! walk. That accounts for a cold entry exactly.
 //!
-//! What it does not account for is a **second** walk *inside* the block, and
-//! there is one available: `paging::Tlb` is a single 32-entry array indexed
-//! `page % 32`, shared by fetches and data accesses, and `Exec::fetch_at` and
-//! `Exec::translate` both go through `translate_access` into it. So a guest
-//! instruction whose data operand lies 128 KiB from the code page evicts the
-//! code page's own translation, and the interpreter's *next* instruction fetch
-//! re-walks and charges for it. A lifted block makes no fetches at all and
-//! cannot charge that, so the two engines disagree on the tick column at a
-//! point no static analysis of the block can predict.
+//! What it did not account for, and what this section used to be about, was a
+//! **second** walk *inside* the block. `paging::Tlb` was one 32-entry array
+//! indexed `page % 32` shared by fetches and data accesses, so a guest
+//! instruction whose data operand lay 128 KiB from the code page evicted the
+//! code page's own translation and the interpreter's *next* fetch re-walked
+//! and charged two to four bus reads for it. A lifted block makes no fetches
+//! at all and could not charge that, at a point no static analysis of the
+//! block could predict.
 //!
-//! Three ways out, and the middle one is the one to take:
+//! **That is fixed at the source rather than worked around here.** The buffer
+//! is now two buffers — [`paging::Buffers`](super::paging::Buffers) — which is
+//! what every part since the **Pentium** has, and what this core's `x86-64`
+//! therefore models; a 386 and a 486 keep the single buffer their manuals
+//! document, so their timing is unchanged to the clock. A data access can no
+//! longer index the instruction array, the only fetch translation a block can
+//! need is the one at its entry, and the *tick* half of this refusal is
+//! discharged. It was an accuracy fix in the interpreter that happened to
+//! remove a translator obstacle, not the other way round.
 //!
-//! * Model the buffer's replacement inside the block. That is a second
-//!   implementation of `Tlb` in the IR, which is the thing this crate keeps
-//!   refusing to do for good reasons.
-//! * **Split the buffer into an instruction and a data half**, which is what
-//!   the hardware has had since the 486 and what the *Intel SDM* volume 3
-//!   §4.10.2 describes. A data access then cannot evict a code translation,
-//!   the only walk a block can charge is the entry one, and the plan above
-//!   becomes exact. It is an accuracy improvement in the interpreter rather
-//!   than a concession to the translator — but it *changes the virtual-time
-//!   total of every paged guest*, so it wants to land with a re-measured
-//!   `docs/platforms/pc64.md` boot beside it rather than on its own.
-//! * Stop comparing ticks under paging. That is giving up the column the
-//!   phase-5 state-hash gate is built on, and it is not an option.
+//! ### What the refusal still rests on
+//!
+//! Four things, none of them about ticks, and all of them outside this file:
+//!
+//! 1. **Nothing translates a block's data accesses.** `jit::tlb` caches the
+//!    *host* half of an access and says so: the caller is expected to have run
+//!    the guest's MMU already and to hand in both the virtual and the physical
+//!    address, which `cpu::riscv::mmu`'s caller does and no x86 host does.
+//!    Under paging an IR `ld`/`st` carries a linear address and there is
+//!    nobody to turn it into a physical one — or to charge the guest walk when
+//!    it misses, or to take the fall-through walk that sets a page's dirty bit
+//!    on the first write. Each of those *is* chargeable, because each happens
+//!    at an access the block really makes; it is a helper that does not exist,
+//!    not an accounting problem.
+//! 2. **The self-modifying-code guard compares linear pages and the cache
+//!    invalidates by physical ones.** `jit::cache`'s slot records "the
+//!    guest-physical page the bytes were read from", the [`Smc::Guard`]
+//!    sequence below compares the store's *linear* page against the block's,
+//!    and the note under "Self-modifying code" says why: with paging off the
+//!    two are the same number. With paging on they are not, two linear pages
+//!    may alias one physical page, and one linear page may name a different
+//!    physical page after a `CR3` reload. Both ends have to move to physical,
+//!    which means the guard needs the translation the block was lifted under.
+//! 3. **[`Block::key`] carries no `CR3` and no translation generation.**
+//!    [`World::generation`] covers the segment bases; nothing bumps it when the
+//!    page tables change, and `INVLPG`, a `CR3` write and an accessed-bit
+//!    transition all change what the same `EIP` means.
+//! 4. **No caller reads the entry page through the fetch path.** The contract
+//!    in the paragraph above is a contract nobody has written, and getting it
+//!    wrong is the failure mode that looks like a working JIT: the block is
+//!    correct and the clock is short by one walk per entry.
+//!
+//! The option this section used to list third — stop comparing ticks under
+//! paging — remains what it was: giving up the column the phase-5 state-hash
+//! gate is built on, and not an option.
 //!
 //! ## Long mode: `REX` is not the hard part either
 //!
@@ -589,8 +620,14 @@ impl World {
         if sys.sixty_four() {
             return None;
         }
-        // Paging would make an instruction fetch's tick charge depend on
-        // whether the guest's own TLB is warm. See the module docs, "Ticks".
+        // Paging. **No longer because a fetch's tick charge is unpredictable**
+        // — splitting the interpreter's instruction and data buffers
+        // (`paging::Buffers`) confined that to the block's entry, where the
+        // caller can charge it. What is left is outside this file: no host
+        // translates a block's data accesses, the self-modifying-code guard
+        // compares linear pages while the cache invalidates by physical ones,
+        // and `key` carries no `CR3`. See the module docs, "Widening the
+        // world", which lists all four.
         if sys.paging() {
             return None;
         }

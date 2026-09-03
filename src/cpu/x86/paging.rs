@@ -45,6 +45,16 @@
 //! a way that a demand-paging kernel notices. A model with one writes them
 //! once, which is what hardware does.
 //!
+//! There are **two** of them on a part that has two — see [`Buffers`] for
+//! which parts those are and where the numbers come from. One buffer is not a
+//! simplification of two: with a single array a data operand far enough from
+//! the code page throws the code page's translation out, and the *next
+//! instruction fetch* pays for a walk. That is what a 386 and a 486 do and it
+//! is modelled for them; it is not what anything since the Pentium does, and
+//! modelling it there cost more than fidelity — it put a walk at a point no
+//! static analysis of a translated block can predict, which is why
+//! [`super::lift`] refused paged code.
+//!
 //! The TLB is **derived state**: it is re-derivable from the page tables, so
 //! CLAUDE.md's rule applies and it is never serialized. It is flushed on every
 //! write to `CR3`, on `INVLPG`, on any change to `CR0.PG`, `CR0.WP`, `CR4.PAE`
@@ -217,13 +227,68 @@ impl Mode {
     }
 }
 
-/// How many entries the translation-lookaside buffer holds.
+/// How many entries the instruction buffer holds.
 ///
-/// A power of two so the index is a mask. Thirty-two entries is a 386's
-/// figure; the exact number is not architectural — software cannot count the
-/// entries, only observe that translations are cached at all — so this is a
-/// speed/footprint choice rather than a fidelity one.
-pub const TLB_ENTRIES: usize = 32;
+/// A power of two so the index is a mask. Thirty-two is the 386's figure, the
+/// 486's, and the Pentium's code-TLB figure; it is the one number that does
+/// not change across the parts this core spans.
+pub const ITLB_ENTRIES: usize = 32;
+
+/// How many entries the data buffer holds, on a part that has one.
+///
+/// Sixty-four, the Pentium's data-TLB figure. On a part with [`Buffers::Unified`]
+/// this array is never touched and every access indexes the instruction one, so
+/// a 386 and a 486 keep exactly the thirty-two slots they document.
+pub const DTLB_ENTRIES: usize = 64;
+
+/// How a part organizes its translation-lookaside buffers.
+///
+/// A property of the *part*, the way the clock table and the opcode map are,
+/// which is why it comes from [`super::Variant::buffers`] and **not** from
+/// [`super::Features`]: `ROADMAP.md` §6.1.1's lattice describes what software
+/// can ask for by name, and no `CPUID` leaf this core implements reports a TLB
+/// geometry. What software *can* observe is which translations survive a given
+/// access pattern — that is exactly what this changes, and it is timing rather
+/// than architecture.
+///
+/// Entry counts are not architectural either: nothing can count the entries,
+/// only notice that a walk happened. So the numbers below are fidelity to a
+/// documented part rather than something a guest may depend on, and the
+/// *organization* — one buffer or two — is the half that matters, because it
+/// decides whether a data access can throw away a code translation.
+///
+/// # Sources
+///
+/// * *Intel 80386 Programmer's Reference Manual* §5.2, "Translation Lookaside
+///   Buffer": **one** 32-entry, four-way set-associative buffer, consulted by
+///   every paged access.
+/// * *Intel486 Microprocessor Family Programmer's Reference Manual*, chapter 4
+///   (Memory Management), "Translation Lookaside Buffer": the same
+///   organization. The 486 added an on-chip cache — a **unified** one —
+///   `CR0.WP` and `INVLPG`; it did **not** add a second translation buffer.
+///   Worth stating plainly, because "since the 486" is the wrong answer that
+///   gets assumed: the split follows the split cache, and the split cache is
+///   a P5 change.
+/// * *Intel Pentium Processor Family Developer's Manual*, "Memory Management"
+///   and the cache organization it describes: the P5 splits the on-chip cache
+///   into a code half and a data half, and each half gets its **own** buffer —
+///   a 32-entry code TLB and a 64-entry data TLB for 4-KByte pages, with
+///   separate buffers again for 4-MByte pages. Every later part, Intel or AMD,
+///   has separate instruction and data buffers; *AMD64 Architecture
+///   Programmer's Manual* volume 2 §5.5 describes them as such for the part
+///   family [`super::Variant::X86_64`] models.
+/// * *Intel SDM* volume 3A §4.10.2 states the architectural rule that makes
+///   the difference invisible except through timing: the processor *may* cache
+///   translations, with no promise about how many, in what, or for how long.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Buffers {
+    /// One buffer for fetches and data alike: a 386, a 486, and — vacuously,
+    /// since they cannot page at all — the 16-bit parts.
+    Unified,
+    /// Separate instruction and data buffers: a Pentium and everything after
+    /// it, this core's `x86-64` included.
+    Split,
+}
 
 /// One cached translation, always of a 4 KiB region.
 ///
@@ -269,45 +334,102 @@ impl TlbEntry {
     }
 }
 
-/// A direct-mapped translation-lookaside buffer.
+/// Direct-mapped translation-lookaside buffers: one for fetches, one for data,
+/// or one for both on a part that has only one.
 ///
 /// Direct-mapped rather than associative because the replacement policy is not
 /// observable and a deterministic index keeps the whole thing reproducible:
 /// the same guest run evicts the same entries on every host, which is what
 /// `ROADMAP.md` §0 asks of everything in the emulation core.
+///
+/// # Why the halves are separate, which is not a micro-optimization
+///
+/// With one array, a data operand far enough from the code page evicts the
+/// code page's own translation, and the *next instruction fetch* re-walks and
+/// charges two to four bus reads for it. That is real on hardware with a
+/// unified buffer and it is why the 386 and the 486 keep it here. It is *not*
+/// real on anything since, and modelling it there costs more than fidelity:
+/// the walk lands at a point no static analysis of a block can predict, so
+/// [`super::lift`] cannot charge it and has to refuse paged code outright. On
+/// a part whose hardware has two buffers, a block's only fetch translation is
+/// the one at its entry.
+///
+/// Both halves live in this one type because `INVLPG`, a `CR3` reload and a
+/// topology change all reach *both*, and splitting them into two objects would
+/// make forgetting one of those a one-line mistake.
+///
+/// Derived state, and therefore never serialized (`CLAUDE.md`, Devices): the
+/// snapshot chunk carries no buffer and a restored machine simply re-walks.
 #[derive(Debug, Clone, Copy)]
 pub struct Tlb {
-    entries: [TlbEntry; TLB_ENTRIES],
+    /// Instruction translations — and, on [`Buffers::Unified`], data ones too.
+    insn: [TlbEntry; ITLB_ENTRIES],
+    /// Data translations. Untouched on [`Buffers::Unified`].
+    data: [TlbEntry; DTLB_ENTRIES],
+    /// Which of the two arrangements this part has.
+    buffers: Buffers,
     /// The address-space topology generation these translations were taken
     /// under. A remap invalidates them all.
     generation: u64,
 }
 
 impl Tlb {
-    /// An empty buffer.
+    /// An empty pair of buffers, arranged as `buffers` says.
     #[must_use]
-    pub const fn new() -> Tlb {
+    pub const fn new(buffers: Buffers) -> Tlb {
         Tlb {
-            entries: [TlbEntry::empty(); TLB_ENTRIES],
+            insn: [TlbEntry::empty(); ITLB_ENTRIES],
+            data: [TlbEntry::empty(); DTLB_ENTRIES],
+            buffers,
             generation: 0,
         }
     }
 
-    /// Discard every cached translation.
+    /// How this part's buffers are arranged.
+    #[must_use]
+    pub const fn buffers(&self) -> Buffers {
+        self.buffers
+    }
+
+    /// Whether an access of this kind uses the data array.
+    ///
+    /// The one place the arrangement is consulted: on a unified part every
+    /// access lands in [`Tlb::insn`](Tlb), which is the thirty-two-slot array
+    /// a 386 and a 486 document, so their behaviour is unchanged by this type
+    /// having a second one.
+    #[inline]
+    const fn in_data(&self, fetch: bool) -> bool {
+        !fetch && matches!(self.buffers, Buffers::Split)
+    }
+
+    /// Discard every cached translation, in both halves.
     pub const fn flush(&mut self) {
         let mut i = 0;
-        while i < TLB_ENTRIES {
-            self.entries[i] = TlbEntry::empty();
+        while i < ITLB_ENTRIES {
+            self.insn[i] = TlbEntry::empty();
+            i += 1;
+        }
+        let mut i = 0;
+        while i < DTLB_ENTRIES {
+            self.data[i] = TlbEntry::empty();
             i += 1;
         }
     }
 
     /// Discard the translation for one linear address, as `INVLPG` does.
+    ///
+    /// Both halves, because `INVLPG` invalidates *the* translation for a page
+    /// and the processor has no notion of invalidating only the data copy
+    /// (*Intel SDM* volume 2, `INVLPG`; volume 3A §4.10.4.1).
     pub const fn invalidate(&mut self, linear: u64) {
         let page = linear >> 12;
-        let slot = (page as usize) % TLB_ENTRIES;
-        if self.entries[slot].page == page {
-            self.entries[slot] = TlbEntry::empty();
+        let slot = (page as usize) % ITLB_ENTRIES;
+        if self.insn[slot].page == page {
+            self.insn[slot] = TlbEntry::empty();
+        }
+        let slot = (page as usize) % DTLB_ENTRIES;
+        if self.data[slot].page == page {
+            self.data[slot] = TlbEntry::empty();
         }
     }
 
@@ -323,12 +445,16 @@ impl Tlb {
         }
     }
 
-    /// Look one linear page up.
+    /// Look one linear page up in the half `fetch` selects.
     #[inline]
     #[must_use]
-    pub const fn get(&self, linear: u64) -> Option<TlbEntry> {
+    pub const fn get(&self, linear: u64, fetch: bool) -> Option<TlbEntry> {
         let page = linear >> 12;
-        let entry = self.entries[(page as usize) % TLB_ENTRIES];
+        let entry = if self.in_data(fetch) {
+            self.data[(page as usize) % DTLB_ENTRIES]
+        } else {
+            self.insn[(page as usize) % ITLB_ENTRIES]
+        };
         if entry.page == page {
             Some(entry)
         } else {
@@ -336,25 +462,22 @@ impl Tlb {
         }
     }
 
-    /// Record a translation.
-    pub const fn insert(&mut self, entry: TlbEntry) {
-        self.entries[(entry.page as usize) % TLB_ENTRIES] = entry;
+    /// Record a translation in the half `fetch` selects.
+    pub const fn insert(&mut self, entry: TlbEntry, fetch: bool) {
+        if self.in_data(fetch) {
+            self.data[(entry.page as usize) % DTLB_ENTRIES] = entry;
+        } else {
+            self.insn[(entry.page as usize) % ITLB_ENTRIES] = entry;
+        }
     }
 
-    /// How many entries hold a translation. Diagnostics only — software
-    /// cannot see this, and nothing guest-visible may depend on it.
+    /// How many entries hold a translation, across both halves. Diagnostics
+    /// only — software cannot see this, and nothing guest-visible may depend
+    /// on it.
     #[must_use]
     pub fn occupancy(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|e| e.page != TlbEntry::EMPTY)
-            .count()
-    }
-}
-
-impl Default for Tlb {
-    fn default() -> Self {
-        Tlb::new()
+        let live = |e: &&TlbEntry| e.page != TlbEntry::EMPTY;
+        self.insn.iter().filter(live).count() + self.data.iter().filter(live).count()
     }
 }
 
@@ -646,7 +769,7 @@ impl Exec<'_> {
         let write = access.write;
         let user = access.user;
 
-        if let Some(entry) = self.state.tlb.get(linear) {
+        if let Some(entry) = self.state.tlb.get(linear, access.fetch) {
             let allowed = (!user || entry.user)
                 && (!write || write_allowed(entry.writable, user, t.wp))
                 && !(access.fetch && entry.no_execute);
@@ -700,14 +823,17 @@ impl Exec<'_> {
         }
 
         let (_, leaf) = walked.leaf();
-        self.state.tlb.insert(TlbEntry {
-            page: linear >> 12,
-            frame: walked.phys & !0xfff,
-            user: walked.user,
-            writable: walked.writable,
-            no_execute: walked.no_execute,
-            dirty: leaf & pte::DIRTY != 0 || write,
-        });
+        self.state.tlb.insert(
+            TlbEntry {
+                page: linear >> 12,
+                frame: walked.phys & !0xfff,
+                user: walked.user,
+                writable: walked.writable,
+                no_execute: walked.no_execute,
+                dirty: leaf & pte::DIRTY != 0 || write,
+            },
+            access.fetch,
+        );
         Ok(walked.phys)
     }
 
@@ -797,28 +923,36 @@ mod tests {
         assert!(write_allowed(true, true, true));
     }
 
-    #[test]
-    fn a_lookup_misses_after_a_flush_and_after_an_invalidate() {
-        let mut tlb = Tlb::new();
-        let entry = TlbEntry {
-            page: 0x1_2345,
-            frame: 0x9000_0000,
+    /// An entry mapping `page` to a distinguishable frame.
+    fn entry_for(page: u64) -> TlbEntry {
+        TlbEntry {
+            page,
+            frame: page << 12 | 0x9000_0000,
             user: true,
             writable: true,
             no_execute: false,
             dirty: true,
-        };
-        tlb.insert(entry);
-        assert_eq!(tlb.get(0x1234_5678).map(|e| e.frame), Some(0x9000_0000));
+        }
+    }
+
+    #[test]
+    fn a_lookup_misses_after_a_flush_and_after_an_invalidate() {
+        let mut tlb = Tlb::new(Buffers::Split);
+        let entry = entry_for(0x1_2345);
+        tlb.insert(entry, false);
+        assert_eq!(
+            tlb.get(0x1234_5678, false).map(|e| e.frame),
+            Some(entry.frame)
+        );
         // A different page in the same slot is a miss, not a wrong hit.
         assert!(
-            tlb.get(0x1234_5678 + (TLB_ENTRIES as u64) * 0x1000)
+            tlb.get(0x1234_5678 + (DTLB_ENTRIES as u64) * 0x1000, false)
                 .is_none()
         );
         tlb.invalidate(0x1234_5000);
-        assert!(tlb.get(0x1234_5678).is_none());
+        assert!(tlb.get(0x1234_5678, false).is_none());
 
-        tlb.insert(entry);
+        tlb.insert(entry, false);
         assert_eq!(tlb.occupancy(), 1);
         tlb.flush();
         assert_eq!(tlb.occupancy(), 0);
@@ -826,21 +960,71 @@ mod tests {
 
     #[test]
     fn a_topology_change_invalidates_every_translation() {
-        let mut tlb = Tlb::new();
+        let mut tlb = Tlb::new(Buffers::Split);
         tlb.sync(7);
-        tlb.insert(TlbEntry {
-            page: 4,
-            frame: 0x4000,
-            user: false,
-            writable: true,
-            no_execute: false,
-            dirty: false,
-        });
-        assert!(tlb.get(0x4000).is_some());
+        tlb.insert(entry_for(4), true);
+        tlb.insert(entry_for(5), false);
+        assert!(tlb.get(0x4000, true).is_some());
         tlb.sync(7);
-        assert!(tlb.get(0x4000).is_some());
+        assert!(tlb.get(0x4000, true).is_some());
         tlb.sync(8);
-        assert!(tlb.get(0x4000).is_none());
+        // Both halves, not just the one the next access happens to use.
+        assert!(tlb.get(0x4000, true).is_none());
+        assert!(tlb.get(0x5000, false).is_none());
+    }
+
+    #[test]
+    fn a_split_buffer_lets_a_data_access_miss_without_evicting_the_code_page() {
+        // The whole point of the split, stated as the thing a lifted block
+        // depends on: a code translation survives any number of data accesses
+        // that collide with it in a unified index.
+        let mut tlb = Tlb::new(Buffers::Split);
+        let code = 0x10;
+        tlb.insert(entry_for(code), true);
+        for n in 1..8u64 {
+            // Pages that land in the *instruction* array's slot for `code`.
+            tlb.insert(entry_for(code + n * ITLB_ENTRIES as u64), false);
+        }
+        assert!(tlb.get(code << 12, true).is_some());
+    }
+
+    #[test]
+    fn a_unified_buffer_is_the_thirty_two_slot_array_a_386_documents() {
+        // A 386 and a 486 have one buffer, so the same access pattern *does*
+        // throw the code translation away — and the data half is never
+        // touched, so this really is the pre-split array and not a wider one.
+        let mut tlb = Tlb::new(Buffers::Unified);
+        let code = 0x10;
+        tlb.insert(entry_for(code), true);
+        tlb.insert(entry_for(code + ITLB_ENTRIES as u64), false);
+        assert!(tlb.get(code << 12, true).is_none());
+        assert_eq!(tlb.occupancy(), 1);
+        // And a data lookup finds what a fetch inserted, which is what "one
+        // buffer" means.
+        tlb.insert(entry_for(code), true);
+        assert!(tlb.get(code << 12, false).is_some());
+    }
+
+    #[test]
+    fn invlpg_reaches_both_halves() {
+        let mut tlb = Tlb::new(Buffers::Split);
+        // A page whose two slots differ: 0x21 % 32 == 1, 0x21 % 64 == 33.
+        let page = 0x21;
+        tlb.insert(entry_for(page), true);
+        tlb.insert(entry_for(page), false);
+        assert_eq!(tlb.occupancy(), 2);
+        tlb.invalidate(page << 12);
+        assert_eq!(tlb.occupancy(), 0);
+    }
+
+    #[test]
+    fn the_split_is_a_property_of_the_part_and_the_pentium_is_where_it_starts() {
+        use super::super::Variant;
+        // The 486 is the one that gets assumed wrong: it added an on-chip
+        // cache, `CR0.WP` and `INVLPG`, and kept the 386's single buffer.
+        assert_eq!(Variant::I80386.buffers(), Buffers::Unified);
+        assert_eq!(Variant::I80486.buffers(), Buffers::Unified);
+        assert_eq!(Variant::X86_64.buffers(), Buffers::Split);
     }
 
     /// Walk over a list of `(address, value)` pairs, so the four modes can be

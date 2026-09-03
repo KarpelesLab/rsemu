@@ -672,6 +672,29 @@ impl Variant {
         matches!(self, Variant::I80386 | Variant::I80486 | Variant::X86_64)
     }
 
+    /// How this part's translation-lookaside buffers are arranged.
+    ///
+    /// Here and not in [`Features`] on purpose: §6.1.1's lattice is what
+    /// *software* can ask for by name, and a TLB geometry is not in any
+    /// `CPUID` leaf this core implements — it is a microarchitectural fact
+    /// about the part, like [`Variant::map`] and the clock table. See
+    /// [`paging::Buffers`] for the manuals the two arrangements come from; the
+    /// short version is that the split arrived with the **Pentium**, so a 386
+    /// and a 486 have one buffer and everything this core calls `x86-64` has
+    /// two.
+    #[must_use]
+    pub const fn buffers(self) -> paging::Buffers {
+        match self {
+            // The 16-bit parts cannot page at all, so this answer is never
+            // consulted for them; saying `Unified` is the honest default
+            // rather than a claim about an 8086's non-existent buffer.
+            Variant::I8086 | Variant::I8088 | Variant::I80386 | Variant::I80486 => {
+                paging::Buffers::Unified
+            }
+            Variant::X86_64 => paging::Buffers::Split,
+        }
+    }
+
     /// The extensions this part has when nothing overrides them.
     ///
     /// A *preset*, in `ROADMAP.md` §6.1.1's sense: the public surface is a
