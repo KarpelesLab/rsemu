@@ -19,19 +19,20 @@
 //! that is the path `rsemu run` takes: `Machine::flush` walks every realized
 //! device and returns the first refusal.
 //!
-//! # What is not in the table, and why
+//! # Every board with a drive is in the table
 //!
-//! `usb.storage` (`src/dev/usb/msd.rs`). It has **no `Device::flush` at all**,
-//! so it inherits `core::device`'s no-op default and a file-backed USB stick is
-//! never synced at the end of a run — the medium is flushed only if the guest
-//! itself sends `SYNCHRONIZE CACHE`. That is a real gap and it is named here
-//! rather than quietly skipped; when it is closed, add `usb-mini` to
-//! [`BOARDS`] and this file needs no other change.
+//! `usb.storage` was the exception when this file was written: it had no
+//! `Device::flush` at all, inherited `core::device`'s no-op, and a file-backed
+//! USB stick was synced only when the guest itself sent `SYNCHRONIZE CACHE`.
+//! That gap was named here rather than skipped, and closing it needed one
+//! method and the `usb-mini` row below — which is the shape a ledger entry
+//! should have.
 
 #![cfg(any(
     feature = "machine-nvme-mini",
     feature = "machine-ahci-mini",
-    feature = "machine-riscv-virt"
+    feature = "machine-riscv-virt",
+    feature = "machine-usb-mini"
 ))]
 
 use std::sync::Arc;
@@ -83,6 +84,13 @@ const BOARDS: &[Board] = &[
         slot: "disk",
         device: "virtio.blk",
         empty: &["flash0", "flash1", "firmware", "initrd"],
+    },
+    #[cfg(feature = "machine-usb-mini")]
+    Board {
+        entry: &rsemu::machine::catalog::USB_MINI,
+        slot: "usb0",
+        device: "usb.storage",
+        empty: &["firmware"],
     },
 ];
 

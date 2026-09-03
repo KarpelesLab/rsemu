@@ -1824,6 +1824,22 @@ impl Device for UsbStorage {
         self.peripheral.bus_reset();
     }
 
+    fn flush(&self) -> Result<()> {
+        // The machine saying the run is over, which is a different question
+        // from the guest's `SYNCHRONIZE CACHE` (answered at `:1050`, where the
+        // command is decoded). A guest that never sent one promised nothing,
+        // but the writes it did send were accepted and are on this medium; on
+        // a qcow2 the metadata that finds those bytes lives in the same layer
+        // as the bytes, so dropping it leaves an image that is inconsistent
+        // rather than merely stale. Every other drive on the `Medium` seam
+        // overrides this; a USB stick was the one that did not, and inherited
+        // a no-op.
+        self.function
+            .media
+            .flush()
+            .map_err(|e| crate::dev::medium::error_at(0, e))
+    }
+
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
         // The medium's own policy first, on the same terms an NVMe namespace
         // and an AHCI port take it: a file-backed disk is *referenced* and a
