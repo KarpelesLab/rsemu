@@ -1198,6 +1198,7 @@ fn group_rows_and_primary_rows_share_one_description() {
 // Where a listing appears in a comment it is that assembler's output.
 
 use super::isa;
+use super::paging;
 use super::prot::{SegReg, Sys, ar, cr0, sys_type, tss32};
 
 /// Where the test machine puts things, so the numbers in each test mean
@@ -1645,6 +1646,111 @@ fn paging_translates_through_the_directory_and_the_table() {
     let pte = pc.read32(at::PTAB + 0x200 * 4);
     assert_eq!(pte & 0b110_0000, 0b110_0000, "accessed and dirty");
     assert_eq!(pc.read32(at::PDIR) & 0b10_0000, 0b10_0000, "accessed");
+}
+
+/// A part with the first 4 MiB identity-mapped, paging on, and a program that
+/// reads the same far linear address `reads` times before halting.
+///
+/// Returns the built machine and the clocks the program cost, so a caller can
+/// look at both the cycle column and the buffers afterwards.
+fn paged_far_read(variant: Variant, data: u64, reads: usize) -> (Pc, u64) {
+    let pc = Pc::new(variant);
+    pc.start_protected();
+    pc.write32(at::PDIR, at::PTAB | 0b111);
+    for page in 0..1024u64 {
+        pc.write32(at::PTAB + page * 4, (page << 12) | 0b111);
+    }
+    let mut sys = pc.cpu.sys();
+    sys.cr3 = at::PDIR;
+    sys.cr0 |= cr0::PG;
+    pc.cpu.set_sys(sys);
+
+    let mut code = Vec::new();
+    for _ in 0..reads {
+        // mov eax, [imm32] — six bytes of fetch and one four-byte load, all
+        // of them through the translation buffers.
+        code.push(0xa1);
+        code.extend_from_slice(&(data as u32).to_le_bytes());
+    }
+    code.push(0xf4);
+    pc.write(at::CODE0, &code);
+
+    let before = pc.cpu.cycles();
+    let steps = pc.run(reads + 4);
+    assert_eq!(
+        steps,
+        reads + 1,
+        "the program ran to its hlt and no further"
+    );
+    let cost = pc.cpu.cycles() - before;
+    (pc, cost)
+}
+
+#[test]
+fn a_far_data_operand_evicts_the_code_page_on_a_486_and_not_on_a_part_with_two_buffers() {
+    // The guest-visible consequence of `paging::Buffers`, measured in the one
+    // column that is hashed: clocks. A 386 and a 486 have **one** buffer
+    // (*Intel 80386 Programmer's Reference Manual* §5.2; *Intel486 …
+    // Programmer's Reference Manual* chapter 4), so an operand 128 KiB from
+    // the code page lands in the code page's slot, throws it out, and makes
+    // the next instruction fetch re-walk. Every part since the Pentium has
+    // two, so the same program costs the same as one reading the address a
+    // page along.
+    const READS: usize = 16;
+    let code_page = at::CODE0 >> 12;
+    let collides = (code_page + paging::ITLB_ENTRIES as u64) << 12;
+    let apart = (code_page + paging::ITLB_ENTRIES as u64 + 1) << 12;
+
+    let (unified, unified_collides) = paged_far_read(Variant::I80486, collides, READS);
+    let (_, unified_apart) = paged_far_read(Variant::I80486, apart, READS);
+    assert!(
+        unified_collides > unified_apart,
+        "one buffer: {unified_collides} clocks colliding against {unified_apart} apart"
+    );
+    // And the mechanism rather than the symptom: the two translations cannot
+    // both be held. The last thing the program did was fetch its `hlt`, so it
+    // is the *data* translation that is gone by the end — which is the same
+    // eviction seen from the other side.
+    assert!(
+        unified
+            .cpu
+            .session
+            .lock()
+            .state
+            .tlb
+            .get(collides, false)
+            .is_none(),
+        "one buffer: the fetch that followed the load threw the load out"
+    );
+
+    let (split, split_collides) = paged_far_read(Variant::X86_64, collides, READS);
+    let (_, split_apart) = paged_far_read(Variant::X86_64, apart, READS);
+    assert_eq!(
+        split_collides, split_apart,
+        "two buffers: a data operand cannot index the instruction array"
+    );
+    assert!(
+        split
+            .cpu
+            .session
+            .lock()
+            .state
+            .tlb
+            .get(at::CODE0, true)
+            .is_some(),
+        "the code page's translation survived every data access"
+    );
+    assert!(
+        split
+            .cpu
+            .session
+            .lock()
+            .state
+            .tlb
+            .get(collides, false)
+            .is_some(),
+        "and the data translation survived every fetch"
+    );
 }
 
 #[test]
