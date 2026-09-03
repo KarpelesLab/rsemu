@@ -110,14 +110,27 @@ pub struct Epoch {
     pub translation: u64,
 }
 
+/// How many low tag bits [`Epoch::translation`] rides in.
+///
+/// Seven, which is what is left of a 4 KiB page's twelve offset bits once
+/// [`Context`] and the valid bit have taken five. See [`Tlb::sync`] for why a
+/// *stamp* rather than a flush, and why seven bits are enough to be exact.
+pub const STAMP_BITS: u32 = 7;
+
+/// Where the stamp sits in a tag: above [`Context`], below the page number.
+const STAMP_SHIFT: u32 = 5;
+
+/// The stamp, masked to the bits it is allowed.
+const STAMP_MASK: u64 = (1 << STAMP_BITS) - 1;
+
 /// The part of a CPU's world that changes too often to flush on.
 ///
 /// Everything else — the ASID, `SUM`, `MXR`, which root page table is in
 /// force — bumps the guest's translation generation, so it lands in [`Epoch`]
-/// and costs a flush. Privilege does not: a supervisor guest changes it on
-/// every trap and every return, and flushing 12 288 entries per system call
-/// would cost more than the TLB saves. So it is tagged instead, exactly, in
-/// bits the page number does not use.
+/// and is *stamped* into the tag ([`STAMP_BITS`]). Privilege does not: a
+/// supervisor guest changes it on every trap and every return, and flushing
+/// 12 288 entries per system call would cost more than the TLB saves. So it is
+/// tagged instead, exactly, in bits the page number does not use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord, Hash)]
 pub struct Context {
     /// The guest's privilege level, as the guest numbers it.
@@ -143,18 +156,17 @@ impl Context {
         ((self.level as u64 & 7) << 2) | ((self.translating as u64) << 1)
     }
 
-    /// Everything a tag carries besides the page number: this context, and the
-    /// valid bit.
+    /// The context's own half of a tag: this context, and the valid bit.
     ///
-    /// Public because a **host code generator** bakes it into an immediate:
-    /// the inlined fast path builds `(addr & !PAGE_MASK) | tag_bits()` and
-    /// compares it against [`FastSet`]'s entry in one instruction, which is
-    /// `ROADMAP.md` §9.1's *"mask, compare, add, load"*. A backend that
-    /// derived the constant itself would be a second copy of this encoding.
+    /// **Not the whole tag.** The other half is the guest MMU's generation
+    /// stamp, which belongs to the table rather than to the context, so
+    /// [`Tlb::tag_bits`] is what a backend wants and this is what that method
+    /// is built from. Public because both halves are one encoding and a
+    /// second copy of either is how two of them drift apart.
     #[inline]
     #[must_use]
     pub const fn tag_bits(self) -> u64 {
-        self.bits() | 1
+        self.bits() | Entry::VALID
     }
 }
 
@@ -332,19 +344,46 @@ impl Tlb {
         self.epoch
     }
 
-    /// Adopt `epoch`, throwing everything away if it differs.
+    /// Adopt `epoch`, throwing everything away if it has moved far enough to
+    /// matter.
     ///
     /// Called at a block boundary — the same place a CPU checks its
     /// [`ExitFlag`](crate::core::sched::ExitFlag) — so that a stop-the-world
     /// retopology or an `SFENCE.VMA` is observed before the next access, not
     /// after it. Returns whether anything was thrown away.
+    ///
+    /// # Why a moving translation generation is not a flush
+    ///
+    /// [`Epoch::topology`] is rare, so a change there flushes. The guest MMU's
+    /// counter is not: on RISC-V it is bumped by every `SRET` and `MRET` and by
+    /// every `sstatus` write, because `SUM`, `MXR` and `MPRV` change what a
+    /// translation *permits*. A supervisor guest moves it thousands of times a
+    /// millisecond, and a memset of every entry that often costs more than the
+    /// table saves.
+    ///
+    /// So the counter is **stamped into the tag** instead, in [`STAMP_BITS`] of
+    /// the twelve a page offset leaves free — the same trick the hart's own TLB
+    /// plays with its generation, and the same one [`Context`] already plays
+    /// with privilege. A bump changes every live entry's tag and invalidates
+    /// the lot without touching them.
+    ///
+    /// Seven bits wrap, so the flush is not gone, only amortized: it happens
+    /// when `translation >> STAMP_BITS` changes, which bounds a stamp's reuse.
+    /// Every generation inside one such window has a distinct stamp, and
+    /// leaving the window empties the table, so no entry filled under one
+    /// generation can ever be hit under another. That is the whole soundness
+    /// argument, and it is why the flush cannot simply be dropped.
     pub fn sync(&mut self, epoch: Epoch) -> bool {
         if self.epoch == epoch {
             return false;
         }
+        let stale = self.epoch.topology != epoch.topology
+            || (self.epoch.translation >> STAMP_BITS) != (epoch.translation >> STAMP_BITS);
         self.epoch = epoch;
-        self.flush();
-        true
+        if stale {
+            self.flush();
+        }
+        stale
     }
 
     /// The topology half of the current epoch, read from the space itself.
@@ -509,7 +548,7 @@ impl Tlb {
     /// [`is_direct_ram`]: crate::core::space::FlatEntry::is_direct_ram
     pub fn fill(&mut self, kind: AccessKind, addr: u64, phys: u64, ctx: Context) {
         let index = self.index(addr);
-        let tag = tag(addr, ctx);
+        let tag = self.tag(addr, ctx);
         let entry = self.resolve(kind, addr, phys);
         if entry.store == Entry::SLOW {
             self.stats.refused += 1;
@@ -626,11 +665,88 @@ impl Tlb {
         }
     }
 
+    /// Everything a hit's tag carries besides the page number, as generated
+    /// code has to build it: [`Context::tag_bits`] and the stamp
+    /// [`Tlb::sync`] adopted.
+    ///
+    /// A backend loads this from its runtime context once per block and ORs it
+    /// into `addr & !PAGE_MASK`. The stamp is *not* a compile-time constant —
+    /// it moves every time the guest fences its own translations, and a block
+    /// outlives many of those — so a backend that baked it into an immediate
+    /// would serve a stale page after the first `SRET`.
+    #[inline]
+    #[must_use]
+    pub const fn tag_bits(&self, ctx: Context) -> u64 {
+        ctx.tag_bits() | ((self.epoch.translation & STAMP_MASK) << STAMP_SHIFT)
+    }
+
+    /// This set and this world, in the shape [`FastMem`] publishes.
+    ///
+    /// [`FastMem`]: crate::jit::FastMem
+    #[inline]
+    #[must_use]
+    pub fn plan(&self, kind: AccessKind, ctx: Context) -> super::LoadPlan {
+        super::LoadPlan {
+            set: self.fast_set(kind),
+            tag: self.tag_bits(ctx),
+        }
+    }
+
+    /// How many entries each set holds.
+    ///
+    /// Published because a caller that keeps this table in lockstep with
+    /// **its own** direct-mapped TLB has to agree with it about the index, and
+    /// two tables that disagree by a factor of two evict at different moments
+    /// — which is a wrong cycle count rather than a slow one. `cpu::riscv::mmu`
+    /// asserts the two numbers are the same.
+    #[inline]
+    #[must_use]
+    pub fn entries(&self) -> u64 {
+        self.mask + 1
+    }
+
+    /// Whether this page already has an entry under `ctx` — of either kind.
+    ///
+    /// A caller that fills on demand rather than on a signal from its own TLB
+    /// asks this first, because a [`Tlb::fill`] probes the flat view and that
+    /// is the expensive half. A page remembered as *uncacheable* answers true:
+    /// it has an entry, and re-resolving it is exactly what the marker exists
+    /// to avoid.
+    #[inline]
+    #[must_use]
+    pub fn caches(&self, kind: AccessKind, addr: u64, ctx: Context) -> bool {
+        self.sets[set_of(kind)][self.index(addr)].tag == self.tag(addr, ctx)
+    }
+
+    /// Record that this page has to go the slow way, without asking the space.
+    ///
+    /// [`Tlb::fill`] decides that from the *topology*; this is for a caller
+    /// whose own rules refuse a page the topology would have allowed — a RISC-V
+    /// hart whose PMP answers differently in different halves of it, say. It
+    /// still writes the slot, so a caller keeping this table in lockstep with
+    /// its own can use it wherever a fill would have gone.
+    pub fn refuse(&mut self, kind: AccessKind, addr: u64, ctx: Context) {
+        let index = self.index(addr);
+        let tag = self.tag(addr, ctx);
+        self.stats.refused += 1;
+        self.stats.fills += 1;
+        self.sets[set_of(kind)][index] = Entry {
+            tag,
+            ..Entry::empty()
+        };
+    }
+
+    /// The tag for a page under a context, in this table's current epoch.
+    #[inline]
+    const fn tag(&self, addr: u64, ctx: Context) -> u64 {
+        (addr & !PAGE_MASK) | self.tag_bits(ctx)
+    }
+
     /// Look one page up. Mask, compare, add — and nothing else.
     #[inline]
     fn probe(&self, kind: AccessKind, addr: u64, ctx: Context) -> Probe {
         let entry = &self.sets[set_of(kind)][self.index(addr)];
-        if entry.tag != tag(addr, ctx) {
+        if entry.tag != self.tag(addr, ctx) {
             return Probe::Miss;
         }
         if entry.store == Entry::SLOW {
@@ -701,12 +817,6 @@ const fn set_of(kind: AccessKind) -> usize {
         AccessKind::Load => 1,
         AccessKind::Store => 2,
     }
-}
-
-/// The tag for a page under a context.
-#[inline]
-const fn tag(addr: u64, ctx: Context) -> u64 {
-    (addr & !PAGE_MASK) | ctx.bits() | Entry::VALID
 }
 
 /// Whether a `width`-byte access at `addr` stays inside one page.
@@ -1103,39 +1213,161 @@ mod tests {
         assert_eq!(tlb.stats().misses, before + 1);
     }
 
-    #[test]
-    fn a_translation_generation_bump_invalidates_every_entry() {
-        let (mut tlb, _ram) = tlb();
-        let paged = Context {
-            level: 1,
-            translating: true,
-        };
-        let addr = BASE + 0x6000;
-        for _ in 0..2 {
-            let _ = tlb.read(
-                AccessKind::Load,
-                addr,
-                addr,
-                Width::U8,
-                paged,
-                MemAttrs::DEFAULT,
-            );
-        }
-        assert_eq!(tlb.stats().hits, 1);
-        // An SFENCE.VMA: the same virtual address now means something else.
-        let mut epoch = tlb.epoch();
-        epoch.translation += 1;
-        assert!(tlb.sync(epoch));
-        let before = tlb.stats().misses;
+    const PAGED: Context = Context {
+        level: 1,
+        translating: true,
+    };
+
+    /// Read one byte through `tlb` and say whether it hit.
+    fn hit(tlb: &mut Tlb, addr: u64, ctx: Context) -> bool {
+        let before = tlb.stats().hits;
         let _ = tlb.read(
             AccessKind::Load,
             addr,
             addr,
             Width::U8,
-            paged,
+            ctx,
             MemAttrs::DEFAULT,
         );
-        assert_eq!(tlb.stats().misses, before + 1);
+        tlb.stats().hits != before
+    }
+
+    #[test]
+    fn a_translation_generation_bump_invalidates_every_entry() {
+        let (mut tlb, _ram) = tlb();
+        let addr = BASE + 0x6000;
+        assert!(!hit(&mut tlb, addr, PAGED), "the first access fills");
+        assert!(hit(&mut tlb, addr, PAGED), "the second is served");
+        // An SFENCE.VMA: the same virtual address now means something else.
+        let mut epoch = tlb.epoch();
+        epoch.translation += 1;
+        // **Without a flush.** The generation is stamped into the tag, so one
+        // bump invalidates every entry by making every tag disagree — the same
+        // trick the hart's own TLB plays, and the reason a guest that fences
+        // on every trap return does not memset this table thousands of times a
+        // millisecond.
+        let flushed = tlb.sync(epoch);
+        assert!(!flushed, "a single bump must not throw the table away");
+        assert!(!hit(&mut tlb, addr, PAGED), "but the entry is gone");
+    }
+
+    #[test]
+    fn a_generation_that_outruns_the_stamp_does_flush() {
+        let (mut tlb, _ram) = tlb();
+        let addr = BASE + 0x6000;
+        assert!(!hit(&mut tlb, addr, PAGED));
+        assert!(hit(&mut tlb, addr, PAGED));
+        let flushes = tlb.stats().flushes;
+        // Seven bits wrap, so a stamp is only unique inside one window of
+        // 2^STAMP_BITS generations. Leaving the window is what stops an entry
+        // filled under generation `g` being hit under `g + 128`, and it is the
+        // whole soundness argument for stamping rather than flushing.
+        let mut epoch = tlb.epoch();
+        epoch.translation += 1 << STAMP_BITS;
+        assert!(tlb.sync(epoch), "leaving the window throws the table away");
+        assert_eq!(tlb.stats().flushes, flushes + 1);
+        assert!(!hit(&mut tlb, addr, PAGED));
+    }
+
+    #[test]
+    fn every_generation_in_one_window_gets_a_tag_of_its_own() {
+        // The claim the stamp rests on, asserted rather than reasoned about:
+        // inside a window no two generations produce the same tag, so no entry
+        // can be reached from a generation it was not filled under.
+        let (space, _ram) = space();
+        let mut tlb = Tlb::with_entries(space, 64);
+        let mut seen = Vec::new();
+        for g in 0..(1u64 << STAMP_BITS) {
+            tlb.sync(Epoch {
+                topology: tlb.epoch().topology,
+                translation: g,
+            });
+            let tag = tlb.tag(BASE, PAGED);
+            assert!(!seen.contains(&tag), "generation {g} reuses a tag");
+            // And the page number is untouched by any of it.
+            assert_eq!(tag & !PAGE_MASK, BASE);
+            seen.push(tag);
+        }
+        // And a generation far past the window still only ever writes the
+        // seven bits it is allowed. The counter is a `u64` and the guest moves
+        // it on every trap return, so by the time a Linux guest is at a shell
+        // it is in the millions — a stamp that did not mask would OR those
+        // bits straight into the **page number** of every tag, and since a tag
+        // is built by `|` rather than `+`, two different pages in one slot
+        // would then answer to the same tag. That is a wrong page's bytes, not
+        // a slow lookup, and it is the one mutation of this expression the
+        // loop above cannot see.
+        for g in [1u64 << STAMP_BITS, 1 << 20, u64::MAX] {
+            tlb.sync(Epoch {
+                topology: tlb.epoch().topology,
+                translation: g,
+            });
+            assert_eq!(
+                tlb.tag(BASE, PAGED) & !PAGE_MASK,
+                BASE,
+                "generation {g:#x} reached the page number"
+            );
+            assert_eq!(
+                tlb.tag_bits(PAGED) & !PAGE_MASK,
+                0,
+                "generation {g:#x} put a bit outside the page offset"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_page_is_remembered_rather_than_reprobed() {
+        // What a caller reaches for when its *own* rules refuse a page the
+        // topology would have allowed — a RISC-V hart whose PMP is not
+        // uniform over it. The slot is written, so a caller keeping this table
+        // in lockstep with its own may use it wherever a fill would have gone.
+        let (mut tlb, _ram) = tlb();
+        let addr = BASE + 0x3000;
+        assert!(!tlb.caches(AccessKind::Load, addr, PAGED));
+        tlb.refuse(AccessKind::Load, addr, PAGED);
+        assert!(tlb.caches(AccessKind::Load, addr, PAGED));
+        let slow = tlb.stats().slow;
+        assert!(!hit(&mut tlb, addr, PAGED), "and it is never served fast");
+        assert_eq!(tlb.stats().slow, slow + 1, "it went the slow way knowingly");
+        // A refusal is a page's answer, not a permanent one: the next epoch
+        // clears it like any other entry.
+        let mut epoch = tlb.epoch();
+        epoch.topology += 1;
+        assert!(tlb.sync(epoch));
+        assert!(!tlb.caches(AccessKind::Load, addr, PAGED));
+    }
+
+    #[test]
+    fn a_plan_names_the_set_and_the_whole_tag() {
+        // Generated code gets a base, a mask and a tag; nothing else, and
+        // nothing it has to re-derive. The tag it is given must be the one
+        // this table writes, or a compiled load misses every time — or worse,
+        // hits an entry from another world.
+        let (mut tlb, _ram) = tlb();
+        tlb.sync(Epoch {
+            topology: tlb.epoch().topology,
+            translation: 5,
+        });
+        let plan = tlb.plan(AccessKind::Load, PAGED);
+        assert_eq!(plan.set.base, tlb.fast_set(AccessKind::Load).base);
+        assert_eq!(plan.set.mask, tlb.mask);
+        assert_eq!(plan.tag, tlb.tag_bits(PAGED));
+        assert_eq!((BASE & !PAGE_MASK) | plan.tag, tlb.tag(BASE, PAGED));
+        // A different world is a different tag, in the bits a page offset
+        // leaves free and nowhere else.
+        assert_ne!(plan.tag, tlb.tag_bits(BARE));
+        assert_eq!(plan.tag & !PAGE_MASK, 0);
+    }
+
+    #[test]
+    fn a_table_says_how_many_entries_it_has() {
+        // A caller keeping this table in lockstep with its own direct-mapped
+        // TLB has to agree with it about the index, and it can only check that
+        // if the number is published.
+        let (space, _ram) = space();
+        assert_eq!(Tlb::with_entries(Arc::clone(&space), 256).entries(), 256);
+        // Rounded up to a power of two, as the constructor documents.
+        assert_eq!(Tlb::with_entries(space, 300).entries(), 512);
     }
 
     #[test]

@@ -709,7 +709,7 @@ impl Engine {
             block: core::ptr::from_ref(block),
             tlb_base: plan.map_or(core::ptr::null(), |p| p.set.base),
             tlb_mask: plan.map_or(0, |p| p.set.mask),
-            tag_bits: plan.map_or(0, |p| p.ctx.tag_bits()),
+            tag_bits: plan.map_or(0, |p| p.tag),
             out_pc: 0,
             ticks: 0,
             retired: 0,

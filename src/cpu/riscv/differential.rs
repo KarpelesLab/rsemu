@@ -1428,10 +1428,7 @@ impl StoreLog for CachedHost {
 #[cfg(feature = "jit")]
 impl FastMem for CachedHost {
     fn load_plan(&mut self) -> Option<LoadPlan> {
-        Some(LoadPlan {
-            set: self.tlb.fast_set(AccessKind::Load),
-            ctx: MACHINE,
-        })
+        Some(self.tlb.plan(AccessKind::Load, MACHINE))
     }
 
     fn note_fast_load(&mut self) {

@@ -179,10 +179,7 @@ impl IrHost for Scratch {
 
 impl FastMem for Scratch {
     fn load_plan(&mut self) -> Option<LoadPlan> {
-        self.inline.then(|| LoadPlan {
-            set: self.tlb.fast_set(AccessKind::Load),
-            ctx: WORLD,
-        })
+        self.inline.then(|| self.tlb.plan(AccessKind::Load, WORLD))
     }
 
     fn note_fast_load(&mut self) {

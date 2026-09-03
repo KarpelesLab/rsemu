@@ -477,9 +477,22 @@ impl<'a> Exec<'a> {
                 })?;
                 self.tlb
                     .insert(kind, vpn, asid, mode, generation, phys & !PAGE_MASK);
+                // The insert above has just replaced whatever this slot held,
+                // so the shadow's matching slot is replaced here and nowhere
+                // else. That is the lockstep the compiled fast path's single
+                // tick depends on: a shadow entry left behind by an eviction
+                // would promise a hit this TLB no longer has, and the walk it
+                // skipped is a walk the interpreter charges for.
+                #[cfg(feature = "jit")]
+                self.refresh_shadow(kind, vaddr, phys, mode, true);
                 phys
             }
         } else {
+            // Bare mode consults no entry and charges no walk, so there is no
+            // eviction to be in lockstep with: the shadow is filled on demand
+            // and the only cost a hit skips is the flat-view lookup.
+            #[cfg(feature = "jit")]
+            self.refresh_shadow(kind, vaddr, vaddr, mode, false);
             vaddr
         };
         // PMP applies to physical addresses in every mode, and a region may be
@@ -492,6 +505,91 @@ impl<'a> Exec<'a> {
             });
         }
         Ok(phys)
+    }
+
+    /// Write the shadow's slot for this page, so a compiled load may serve it.
+    ///
+    /// Loads only — the backend inlines nothing else (`jit::x86::compile`,
+    /// `Compiler::inlinable`) — and always a *write*, never a skip, on the
+    /// paged path, because the caller has just evicted the matching slot of
+    /// the hart's own TLB.
+    ///
+    /// Three things decide what is written, and each is a case where an
+    /// inlined load would otherwise answer differently from
+    /// [`Exec::read_once`]:
+    ///
+    /// * **PMP.** The compiled path does not check it. A page PMP does not
+    ///   answer uniformly over cannot be cached at all, and one it refuses
+    ///   outright is remembered as slow rather than left to be re-resolved.
+    /// * **The topology and the guest's own fence.** Both ride in
+    ///   [`jit::Epoch`](crate::jit::Epoch) and are read live here, so a fill
+    ///   never lands in a table that is stale in either — which matters
+    ///   because a hart is reachable through paths that never enter the
+    ///   dispatcher at all, `Hart::step` among them.
+    /// * **What is behind the page.** `jit::Tlb::fill` decides that, and its
+    ///   conditions are the ones a hit has to satisfy to be indistinguishable
+    ///   from the slow path.
+    #[cfg(feature = "jit")]
+    fn refresh_shadow(
+        &mut self,
+        kind: Access,
+        vaddr: u64,
+        phys: u64,
+        mode: Priv,
+        translating: bool,
+    ) {
+        use crate::ir::AccessKind;
+        if kind != Access::Load {
+            return;
+        }
+        let Exec { st, tlb, .. } = self;
+        let Some(shadow) = tlb.shadow_mut() else {
+            return;
+        };
+        let epoch = crate::jit::Epoch {
+            topology: shadow.topology_generation(),
+            translation: st.csrs.translation_gen,
+        };
+        shadow.sync(epoch);
+        let ctx = crate::jit::Context {
+            level: mode.bits() as u8,
+            translating,
+        };
+        // Bare mode reaches this on every access rather than on a miss, so the
+        // flat-view probe a fill costs is asked for only when there is nothing
+        // here yet. A page already remembered as uncacheable counts as here.
+        if !translating && shadow.caches(AccessKind::Load, vaddr, ctx) {
+            return;
+        }
+        if mmu::pmp_page_uniform(&st.csrs, phys & !PAGE_MASK, Access::Load, mode) {
+            shadow.fill(AccessKind::Load, vaddr, phys, ctx);
+        } else {
+            shadow.refuse(AccessKind::Load, vaddr, ctx);
+        }
+    }
+
+    /// The world this hart's loads happen in, as the shadow tags them.
+    ///
+    /// Read at a block boundary by `engine::Host::load_plan`, which is also
+    /// where the shadow is resynchronised — so the tag a block compares
+    /// against is the one the table is currently filling with.
+    #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
+    pub(super) fn load_plan(&mut self) -> Option<crate::jit::LoadPlan> {
+        use crate::ir::AccessKind;
+        let mode = self.effective_priv(Access::Load);
+        let translating = mmu::translation_active(&self.st.csrs, mode);
+        let ctx = crate::jit::Context {
+            level: mode.bits() as u8,
+            translating,
+        };
+        let Exec { st, tlb, .. } = self;
+        let shadow = tlb.shadow_mut()?;
+        let epoch = crate::jit::Epoch {
+            topology: shadow.topology_generation(),
+            translation: st.csrs.translation_gen,
+        };
+        shadow.sync(epoch);
+        Some(shadow.plan(AccessKind::Load, ctx))
     }
 
     /// One read that does not cross a page boundary.

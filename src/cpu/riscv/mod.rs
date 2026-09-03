@@ -618,7 +618,16 @@ impl Hart {
 
     /// Give the hart the address space it executes from.
     pub fn attach_space(&self, space: Arc<AddressSpace>) {
-        self.session.lock().space = Some(space);
+        let mut session = self.session.lock();
+        session.space = Some(space);
+        // Everything derived from the old space is now about the wrong one:
+        // the hart's translations, the shadow that carries host addresses out
+        // of it, and every block lifted through it.
+        session.tlb = Tlb::new();
+        #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
+        if let Some(jit) = session.jit.as_mut() {
+            jit.flush();
+        }
     }
 
     /// The address space this hart executes from, if one is attached.
@@ -742,6 +751,17 @@ impl Hart {
         self.session.lock().tlb.stats()
     }
 
+    /// Whether this hart's TLB carries the shadow the compiled fast path
+    /// probes.
+    ///
+    /// Only the engine that reads one asks for it, and the point of being able
+    /// to see that from outside is that a table nothing looks at is a cost
+    /// with no benefit.
+    #[cfg(all(test, feature = "jit"))]
+    pub(super) fn has_shadow(&self) -> bool {
+        self.session.lock().tlb.has_shadow()
+    }
+
     /// Drive one of the interrupt-pending bits directly.
     ///
     /// `mask` is one of the [`irq`] constants. This is the method a test or a
@@ -862,6 +882,18 @@ impl Hart {
             }
             if session.jit.is_none() {
                 session.jit = Some(Box::new(engine::Jit::new(self.engine == Engine::JitHost)));
+            }
+            // The shadow the compiled fast path probes, over the space this
+            // hart is on. It lives inside the hart's own TLB
+            // (`mmu::Tlb::attach_shadow`) because every path that evicts from
+            // that TLB has to evict from this one, and only some of them go
+            // through the engine — so it is also re-attached rather than
+            // assumed, since `attach_space` throws the whole TLB away.
+            if !session.tlb.has_shadow()
+                && session.jit.as_ref().is_some_and(|jit| jit.wants_shadow())
+                && let Some(space) = session.space.clone()
+            {
+                session.tlb.attach_shadow(space);
             }
             let Session {
                 state,
