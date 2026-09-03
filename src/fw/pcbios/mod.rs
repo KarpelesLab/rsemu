@@ -56,12 +56,21 @@
 //! | `INT 10h` | video: set mode, cursor, teletype, scroll, read and write cells, write string |
 //! | `INT 11h` | the equipment word |
 //! | `INT 12h` | base memory size |
-//! | `INT 13h` | disk: the IDE channel and the µPD765 both, read and write, plus the EDD subset |
+//! | `INT 13h` | disk: the IDE channel and the µPD765 both, read, write and format, plus the EDD subset |
 //! | `INT 15h` | `E820`, `E801`, `AH=88h` — the memory map — and `AH=87h`, block move |
 //! | `INT 16h` | keyboard, out of the buffer `INT 09h` fills |
 //! | `INT 19h` | the bootstrap loader |
-//! | `INT 1Ah` | the tick count and the real-time clock |
+//! | `INT 1Ah` | the tick count, the real-time clock, and the PCI BIOS interface (`AH=B1h`) |
 //! | `INT 08h`/`09h` | the timer and keyboard interrupt service routines |
+//!
+//! It also answers the **PCI BIOS interface** (*PCI BIOS Specification* 2.1)
+//! over configuration mechanism #1, so a driver or an option ROM can find a
+//! function by vendor and device or by class code and read and write its
+//! configuration space without knowing how a configuration cycle is generated
+//! here. `src/fw/pcbios/pci.rs` is that module, and it also argues which of
+//! the specification's functions are refused. POST *probes* for the mechanism
+//! rather than assuming it, so a board with no host bridge has no PCI BIOS and
+//! says so — `tests/pc_at_pci_bios.rs` runs both cases.
 //!
 //! It also **publishes the tables an operating system enumerates the board
 //! through**, as data in the ROM at [`TABLES_OFFSET`]: an MP 1.4 floating
@@ -77,10 +86,12 @@
 //!
 //! Named rather than discovered later:
 //!
-//! * **No PCI BIOS interface (`INT 1Ah AH=B1h`).** `ROADMAP.md` phase 6a names
-//!   it beside the tables above; unlike them it is a set of `INT 1Ah`
-//!   functions rather than a structure in memory, and nothing on this board
-//!   has asked for one.
+//! * **No `B106h`, `B10Eh` or `B10Fh` in the PCI BIOS interface**, and no
+//!   32-bit BIOS32 service directory. `src/fw/pcbios/pci.rs` argues each
+//!   refusal: a special cycle would be a configuration write nothing on the
+//!   fabric sees, an interrupt routing table would describe a south bridge
+//!   this board does not have, and a 32-bit entry point is not something a
+//!   16-bit assembler can emit.
 //! * **No FACS, no MCFG, no HPET table, and a nearly empty DSDT.** Each is a
 //!   claim about hardware this board does not have; [`tables`] says which and
 //!   why.
@@ -88,18 +99,18 @@
 //!   is here; handing the machine over permanently is not, and no guest needs
 //!   it — every one of them sets protected mode up itself.
 //! * **No `INT 10h AH=11h`**, the character-generator group. `AL=30h` answers
-//!   with a pointer to a font table, and this ROM has no font in it: the text
-//!   is drawn by `pc.video`, not by the firmware. Fabricating a pointer would
-//!   be worse than carry. FreeDOS calls it once while booting and does not
-//!   mind.
+//!   with a *pointer to the font being displayed*, and on this board that font
+//!   is `pc.video`'s: the adapter draws the glyphs, and there is no font in
+//!   this ROM at all. Putting a copy of one here would answer the question
+//!   with a different font from the one on the screen, which is a worse answer
+//!   than carry — and it would put a font's provenance inside the firmware
+//!   (`ROADMAP.md` §1), where `pc.video`'s original one is already argued.
+//!   FreeDOS calls it once while booting and does not mind.
 //! * **`INT 10h AH=06h` scrolls the whole screen** rather than the requested
 //!   rectangle when the line count is non-zero; the rectangle *is* honoured for
 //!   a clear (`AL=0`), which is the case programs actually use it for.
 //! * **Text mode only**, because `pc.video` is a text-mode CRTC. Setting a
 //!   graphics mode records the number and changes nothing.
-//! * **No diskette `FORMAT TRACK`** (`INT 13h AH=05h`). Reads and writes work;
-//!   formatting one is a different command phase and nothing that boots asks
-//!   for it, because a diskette that boots is already formatted.
 //! * **No serial, parallel, or PS/2 mouse services** (`INT 14h`, `INT 17h`,
 //!   `INT 15h AH=C2h`): the board has none of those devices.
 //! * **The keyboard is US-layout and set 1**, decoded from the translated codes
@@ -112,6 +123,7 @@ use crate::fw::asm16::{AX, Asm, DS, Label, Mem, R16, SP, Sreg};
 
 mod disk;
 mod keyboard;
+mod pci;
 pub mod platform;
 mod post;
 mod system;
@@ -278,6 +290,38 @@ const EBDA_FD_RESULT: u16 = EBDA_E820 + E820_ENTRY * 4;
 /// handler's stack frame is what `[bp+n]` names.
 const EBDA_GDTR: u16 = EBDA_FD_RESULT + 7;
 
+// -- the PCI BIOS interface's own scratch ------------------------------------
+//
+// POST writes [`EBDA_PCI_MECHANISM`]; the rest belong to a single `INT 1Ah
+// AH=B1h` call and are dead between calls. They live here rather than on the
+// stack because `pci`'s scan loop holds its cursor in `BX` and its accumulator
+// in `EAX`, and a 16-bit `PUSH` cannot save the latter.
+
+/// Which PCI configuration access mechanism POST found, as the byte
+/// `AH=B101h` answers with: `0x01` for mechanism #1, zero for none.
+const EBDA_PCI_MECHANISM: u16 = EBDA_GDTR + 6;
+/// What the scan compares each function against: a vendor/device pair, or a
+/// class code in the low three bytes (dword).
+const EBDA_PCI_MATCH: u16 = EBDA_PCI_MECHANISM + 2;
+/// How many further matches the caller's index still asks to skip (word).
+const EBDA_PCI_INDEX: u16 = EBDA_PCI_MATCH + 4;
+/// The vendor/device dword, held across the header-type read (dword).
+const EBDA_PCI_SAVE: u16 = EBDA_PCI_INDEX + 2;
+/// How far the scan advances after this function: one function, or eight to
+/// skip the rest of a single-function device.
+const EBDA_PCI_STEP: u16 = EBDA_PCI_SAVE + 4;
+/// Which comparison the scan is making: zero for vendor and device, one for a
+/// class code.
+const EBDA_PCI_MODE: u16 = EBDA_PCI_STEP + 1;
+
+/// How many bytes the next 8237 channel-2 transfer moves, less one — 511 for a
+/// sector, four per sector less one for a `FORMAT TRACK` address-field list.
+///
+/// Not beside the other diskette fields because that block runs up against the
+/// `E820` table at [`EBDA_E820`]; it is the diskette's for all that it lives
+/// here.
+const EBDA_FD_LENGTH: u16 = EBDA_PCI_MODE + 2;
+
 /// How many bytes one `E820` entry occupies: base, length, type.
 const E820_ENTRY: u16 = 20;
 
@@ -307,6 +351,27 @@ const F_ES: i32 = 16;
 const F_DS: i32 = 18;
 /// The caller's `FLAGS`, as `IRET` will restore them.
 const F_FLAGS: i32 = 24;
+
+// The `PUSHAD` frame. `INT 15h` and the PCI BIOS interface both open with
+// `push ds; push es; pushad`, because both are specified in terms of 32-bit
+// registers and a 16-bit `PUSHA` would drop the halves the caller cares about.
+// Four bytes per register, so every offset differs from the `PUSHA` frame
+// above.
+
+/// The saved `EDI` — where a configuration register number arrives.
+const G_EDI: i32 = 0;
+/// The saved `ESI` — `AH=87h`'s descriptor table, and a find function's index.
+const G_ESI: i32 = 4;
+/// The saved `EBX` — `E820`'s continuation index, and a bus/device pair.
+const G_EBX: i32 = 16;
+/// The saved `EDX` — where `'SMAP'` arrives, and where `'PCI '` goes back.
+const G_EDX: i32 = 20;
+/// The saved `ECX` — a buffer size, or a configuration register's value.
+const G_ECX: i32 = 24;
+/// The saved `EAX` — the function number, and the return code in `AH`.
+const G_EAX: i32 = 28;
+/// The caller's `FLAGS` in the `PUSHAD` frame.
+const G_FLAGS: i32 = 40;
 
 /// The carry flag's bit in `FLAGS` (SDM Vol. 1 §3.4.3).
 const FLAG_CF: u16 = 0x0001;
@@ -343,6 +408,7 @@ pub(crate) struct Labels {
     pub int18: Label,
     pub int19: Label,
     pub int1a: Label,
+    pub int1a_pci: Label,
 
     // video primitives
     pub putc: Label,
@@ -374,7 +440,14 @@ pub(crate) struct Labels {
     pub fd_seek: Label,
     pub fd_dma: Label,
     pub fd_xfer_one: Label,
+    pub fd_results: Label,
     pub fd_geometry: Label,
+
+    // the PCI BIOS interface
+    pub pci_detect: Label,
+    pub pci_select: Label,
+    pub pci_read_dword: Label,
+    pub pci_scan: Label,
 
     // POST helpers
     pub cmos_read: Label,
@@ -403,6 +476,7 @@ impl Labels {
             int18: a.label(),
             int19: a.label(),
             int1a: a.label(),
+            int1a_pci: a.label(),
             putc: a.label(),
             puts: a.label(),
             put_dec: a.label(),
@@ -426,7 +500,12 @@ impl Labels {
             fd_seek: a.label(),
             fd_dma: a.label(),
             fd_xfer_one: a.label(),
+            fd_results: a.label(),
             fd_geometry: a.label(),
+            pci_detect: a.label(),
+            pci_select: a.label(),
+            pci_read_dword: a.label(),
+            pci_scan: a.label(),
             cmos_read: a.label(),
             kbc_wait_write: a.label(),
             kbc_wait_read: a.label(),
@@ -549,6 +628,7 @@ pub fn image_for(platform: &Platform) -> Vec<u8> {
     keyboard::emit(&mut a, &l);
     disk::emit(&mut a, &l);
     system::emit(&mut a, &l);
+    pci::emit(&mut a, &l);
 
     // The tables, as data. Nothing branches into them and POST does not copy
     // them: an operating system finds them by searching this segment, which is
