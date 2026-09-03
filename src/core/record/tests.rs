@@ -471,6 +471,54 @@ fn a_sealed_recorder_takes_no_more_channels() {
     );
 }
 
+/// The seal's reach, pinned — including the half that is wrong.
+///
+/// [`HostObjects`] files two unrelated things under one `(kind, name)` space:
+/// doors from the host, which are inputs and must be channels, and rendezvous
+/// inside the machine, which are how two devices find each other. A `pci-bus`
+/// is not non-deterministic, cannot be a channel, and has nothing to record —
+/// yet a sealed table refuses it exactly as it refuses an undeclared keyboard.
+///
+/// That is why no board in `src/` is sealed: sealing anything with a PCI or USB
+/// bus in it fails on an object that was never an input. The assertion below is
+/// therefore a *characterisation* of a defect rather than a guarantee, and it
+/// is here so that marking kinds as doors has something to flip. When it does,
+/// this test's second half inverts and its first half stays.
+#[test]
+fn the_seal_cannot_tell_a_door_from_a_rendezvous() {
+    let recorder = Arc::new(Recorder::recording());
+    let hosts = HostObjects::new();
+    hosts.seal(Arc::clone(&recorder)).unwrap();
+
+    // A door. Refusing this is the point of the seal: an input the recorder
+    // does not know about would be missing from every recording.
+    assert!(
+        hosts.open(CHARDEV, "console", || 1u32).is_err(),
+        "an undeclared input is what the seal exists to catch"
+    );
+
+    // A rendezvous. Refusing this catches nothing and costs the seal every
+    // board above the smallest.
+    for rendezvous in [
+        "pci-bus",
+        "usb-bus",
+        "i2c-bus",
+        "spi-bus",
+        "ata-bay",
+        "sd-slot",
+        "floppy-drive",
+        "apic-bus",
+        "signal",
+        "medium",
+    ] {
+        assert!(
+            hosts.open(HostKind::new(rendezvous), "0", || 1u32).is_err(),
+            "`{rendezvous}` is how two devices find each other, not an input, \
+             and the seal refuses it anyway"
+        );
+    }
+}
+
 #[test]
 fn unsealing_gives_the_table_back() {
     let recorder = Arc::new(Recorder::recording());
