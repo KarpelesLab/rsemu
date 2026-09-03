@@ -569,6 +569,117 @@ fn a_journal_round_trips_through_a_snapshot() {
     assert_eq!(first.bytes, b"hello");
 }
 
+/// A recording is a file, so it is self-describing and it is a parser.
+///
+/// The same three properties `core::record`'s log has and this one did not:
+/// a magic that says what it is, a version that says which build wrote it, and
+/// exactly one valid encoding per recording. The third is the one replay rests
+/// on — two spellings of one journal would make "the same recording produces
+/// the same run" uncheckable by comparison.
+#[test]
+fn a_journal_recording_is_a_self_describing_file() {
+    let journal = Journal::with_mode(JournalMode::Record);
+    journal
+        .ask(GlobalTime::from_nanos(10), Tag(63), || {
+            Answer::with_bytes(5, b"hello".to_vec())
+        })
+        .unwrap();
+    journal
+        .ask(GlobalTime::from_nanos(20), Tag(78), || Answer::value(0))
+        .unwrap();
+
+    let bytes = journal.encode().unwrap();
+    assert_eq!(&bytes[..8], b"RSEMUJRN", "it says what it is");
+
+    let decoded = Journal::decode(&bytes).unwrap();
+    assert_eq!(decoded.len(), 2);
+    assert_eq!(
+        decoded.mode(),
+        JournalMode::Live,
+        "a decoded recording is a log, not a running replay: the mode is what \
+         you are doing with it"
+    );
+    assert_eq!(decoded.remaining(), 2, "and the cursor is at the start");
+    assert_eq!(
+        decoded.encode().unwrap(),
+        bytes,
+        "a recording has exactly one valid encoding"
+    );
+
+    // The reader refuses what it did not write, and says which thing was wrong.
+    assert!(Journal::decode(b"").is_err());
+    assert!(
+        Journal::decode(b"RSEMURPL\0\0\0\0\0").is_err(),
+        "not our magic"
+    );
+    let mut wrong_version = bytes.clone();
+    wrong_version[8] = 9;
+    assert!(Journal::decode(&wrong_version).is_err());
+    let mut unknown_tag = bytes.clone();
+    unknown_tag[12] = 0x7f;
+    assert!(Journal::decode(&unknown_tag).is_err());
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(Journal::decode(&trailing).is_err(), "trailing bytes");
+    for cut in 0..bytes.len() {
+        // Truncation at every offset: never a panic, always an error.
+        assert!(
+            Journal::decode(&bytes[..cut]).is_err(),
+            "truncated at {cut}"
+        );
+    }
+}
+
+/// The cursor is in the *snapshot* and not in the recording, and the two forms
+/// nest rather than duplicate.
+///
+/// This is the one place the two seams genuinely disagree about a design rule,
+/// and the disagreement is right: `core::record` re-derives its cursor by
+/// seeking the log to the restored instant, because an instant is its key.
+/// Here the key is sequence position and two answers may share an instant, so
+/// there is nothing to seek by and the cursor is architectural.
+#[test]
+fn a_journal_snapshot_carries_the_cursor_and_a_recording_does_not() {
+    let journal = Journal::with_mode(JournalMode::Record);
+    for i in 0..3u64 {
+        journal
+            .ask(GlobalTime::from_nanos(10 * (i + 1)), Tag(63), || {
+                Answer::value(i)
+            })
+            .unwrap();
+    }
+    journal.set_mode(JournalMode::Replay);
+    journal
+        .ask(GlobalTime::from_nanos(10), Tag(63), Answer::default)
+        .unwrap();
+    assert_eq!(journal.remaining(), 2);
+
+    // The recording does not know where replay had got to.
+    let fresh = Journal::decode(&journal.encode().unwrap()).unwrap();
+    assert_eq!(fresh.remaining(), 3);
+
+    // The snapshot does, and embeds the recording whole so the two cannot
+    // drift apart.
+    let mut snapshot: Vec<u8> = Vec::new();
+    journal.save(&mut snapshot).unwrap();
+    let resumed = Journal::new();
+    let mut source = crate::core::state::SliceSource::new(&snapshot);
+    resumed.load(&mut source).unwrap();
+    assert_eq!(
+        resumed.remaining(),
+        2,
+        "a paused run resumes where it paused"
+    );
+
+    // A cursor past the end of the log it is attached to is a corrupt
+    // snapshot, not a replay that has finished.
+    let mut forged = snapshot.clone();
+    forged[0] = 9;
+    let broken = Journal::new();
+    let mut source = crate::core::state::SliceSource::new(&forged);
+    assert!(broken.load(&mut source).is_err());
+}
+
 // ---------------------------------------------------------------------------
 // The thread set
 // ---------------------------------------------------------------------------
