@@ -433,6 +433,91 @@ for (const m of withImages) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 2c. The PC/AT, posting on rsemu's own BIOS
+// ---------------------------------------------------------------------------
+//
+// The other machines with a built-in image carry a *monitor*: a couple of
+// hundred bytes of 6502 that the catalog holds as a `&'static [u8]`. This one
+// carries **firmware**, assembled by the module for this board at the moment it
+// is asked for (`fw::pcbios::image_for_machine`), and it is the only entry in
+// the catalog that boots real firmware with nothing uploaded.
+//
+// There is no OCR here and no font table, so what is checked is the *shape* of
+// a POST screen and the identity of glyphs across it: the `B` of "BIOS" on the
+// banner is the same nine-by-sixteen block of ink as the `B` of "Booting.", and
+// the two `o`s of "Booting." are each other. A machine that hung, or drew a
+// test pattern, or scrolled, fails every one of them.
+
+// A build with `machine-pc-at` but not `fw-pcbios` is legal and carries no
+// image, so the board and the firmware are two separate questions here.
+const pcat = machines.find((m) => m.name === "pc-at");
+const pcbios = pcat?.builtins.find((b) => b.name === "rsemu-bios") ?? null;
+if (pcat && !pcbios) {
+  console.log("  SKIP pc-at is in this build without fw-pcbios, so it carries no firmware");
+}
+if (pcat && pcbios) {
+  check(pcbios.slot === "bios", "pc-at carries rsemu's own BIOS, for the `bios` slot");
+  emu.bootBuiltin(pcat.index, pcbios.index);
+  check(emu.running, "the PC/AT boots on it with nothing uploaded at all");
+  check(emu.hasVideo, "it has a picture");
+  // `pc.kbc` opens a character port, and every byte on it is a raw AT scan
+  // code rather than text — so it is a keyboard, not a console, and a page
+  // that put a terminal pane in front of it would show an empty screen.
+  check(!emu.hasConsole, "and no console: its one character port is a keyboard");
+  check(!emu.hasPad, "and no controllers");
+  check(emu.width === 720 && emu.height === 400, `VGA text: ${emu.width}x${emu.height}`);
+  const periodMs = Number(instance.exports.rsemu_frame_period_ns()) / 1e6;
+  check(
+    periodMs > 14 && periodMs < 15,
+    `${periodMs.toFixed(3)} ms a frame — the CRTC's own 70 Hz, not the 60 Hz fallback`,
+  );
+
+  for (let i = 0; i < 240; i++) emu.runFrame();
+
+  const W = emu.width;
+  const px = emu.bytes(instance.exports.rsemu_frame_ptr(), instance.exports.rsemu_frame_len());
+  const ink = (x, y) => {
+    const i = (y * W + x) * 4;
+    return Boolean(px[i] | px[i + 1] | px[i + 2]);
+  };
+  /** One 9x16 text cell's ink, as a string — a glyph fingerprint. */
+  const cell = (cx, cy) => {
+    let bits = "";
+    for (let y = 0; y < 16; y++) {
+      for (let x = 0; x < 9; x++) bits += ink(cx * 9 + x, cy * 16 + y) ? "1" : "0";
+    }
+    return bits;
+  };
+  const rowHasInk = (cy) => {
+    for (let cx = 0; cx < 80; cx++) if (cell(cx, cy).includes("1")) return true;
+    return false;
+  };
+
+  check(rowHasInk(0) && rowHasInk(1) && rowHasInk(2), "three lines of POST output");
+  // Row 3 is the cursor, which blinks, so it is deliberately not asserted on.
+  let below = 0;
+  for (let cy = 4; cy < 25; cy++) if (rowHasInk(cy)) below++;
+  check(below === 0, "and nothing below them — it posted, it did not scroll");
+
+  // "rsemu BIOS, ...K base, ...K extended" / "Booting." / "No bootable device."
+  check(cell(6, 0) === cell(0, 1), "the B of BIOS is the B of Booting.");
+  check(cell(1, 1) === cell(2, 1), "the two o's of Booting. are the same glyph");
+  check(cell(1, 2) === cell(1, 1), "and so is the o of No");
+  check(cell(0, 2) !== cell(0, 1), "N and B are not");
+  check(cell(0, 0) !== cell(0, 1), "nor r and B");
+
+  const hash = emu.stateHash();
+  const state = emu.save();
+  check(state.length > 0, `pc-at: save state is ${state.length} bytes`);
+  emu.runFrames(5);
+  check(emu.stateHash() !== hash, "pc-at: running changes the state hash");
+  emu.load(state);
+  check(emu.stateHash() === hash, "pc-at: and loading the snapshot restores it");
+  console.log(`  state hash after POST: ${hash}`);
+  emu.shutdown();
+}
+
 // And the one that is the whole point: Woz's monitor of 1976, answering in the
 // browser build. The bytes it prints are the ones the Apple-1 Operation
 // Manual's own listing holds at $FF00 — nobody at rsemu chose them — and
@@ -584,6 +669,30 @@ if (beneater && wozmon) {
   driver.shutdown();
 }
 
+// The PC/AT through the same driver, because its picture is not 256x240 and
+// the canvas has to follow: a board whose geometry the session got wrong would
+// blit a 720x400 frame into a 256x240 element and show a corner of a BIOS.
+if (pcat && pcbios) {
+  driver.boot(pcat, null, pcbios);
+  check(
+    fakeCanvas.width === 720 && fakeCanvas.height === 400,
+    `the driver sizes the canvas to the VGA: ${fakeCanvas.width}x${fakeCanvas.height}`,
+  );
+  const before = blits.length;
+  spin(2000);
+  const drew = blits.length - before;
+  // 70.09 Hz against a 60 Hz display and a four-frame catch-up cap, so two
+  // seconds is a hundred and twenty-odd whole frames rather than 140.
+  check(drew > 100 && drew < 160, `${drew} PC/AT blits in 2 s of loop time`);
+  const last = blits[blits.length - 1];
+  check(
+    last?.width === 720 && last?.height === 400 && last?.data.length === 720 * 400 * 4,
+    "each blit is a whole 720x400 RGBA frame",
+  );
+  check(!driver.hasConsole, "and the page draws no terminal pane for its keyboard port");
+  driver.shutdown();
+}
+
 if (apple1) {
   driver.boot(apple1, null);
   driver.consoleFocused = true;
@@ -597,6 +706,18 @@ if (apple1) {
   );
   driver.shutdown();
 }
+
+// The console pane's decoder, on its own. Every board on this page today ends a
+// line with a bare CR, so the other two endings have no machine here to
+// exercise them — which is exactly why they are asserted directly: the first
+// board with a 16550 on it would otherwise print as one unbroken line.
+const { decodeGuest } = await import("./src/session.js");
+const guest = (text) => Uint8Array.from(text, (c) => c.charCodeAt(0));
+check(decodeGuest(guest("A\rB")) === "A\nB", "a bare CR is a newline (an Apple 1)");
+check(decodeGuest(guest("A\nB")) === "A\nB", "a bare LF is a newline (a 16550)");
+check(decodeGuest(guest("A\r\nB")) === "A\nB", "and CRLF is one newline, not two");
+check(decodeGuest(guest("a\x00b\x07c")) === "abc", "control bytes are dropped");
+check(decodeGuest(guest("\xc1\xc2")) === "AB", "and bit 7 is the keyboard's, not the text's");
 
 console.log(failures === 0 ? "\nall checks passed" : `\n${failures} check(s) failed`);
 process.exit(failures === 0 ? 0 : 1);

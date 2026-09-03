@@ -243,6 +243,7 @@ impl State {
         feature = "dev-nes-ppu",
         feature = "dev-lcdc",
         feature = "dev-gb",
+        feature = "dev-pc-video",
         feature = "dev-sms"
     ))]
     fn attach_scanout(&mut self, scanout: alloc::boxed::Box<dyn crate::host::display::Scanout>) {
@@ -394,7 +395,7 @@ pub extern "C" fn rsemu_machine_builtin_name(index: u32, builtin: u32) -> usize 
     with_state(|state| {
         state.output.clear();
         if let Some(image) = builtin_image(index, builtin) {
-            state.output.extend_from_slice(image.name.as_bytes());
+            state.output.extend_from_slice(image.name().as_bytes());
         }
         state.output.len()
     })
@@ -407,7 +408,7 @@ pub extern "C" fn rsemu_machine_builtin_summary(index: u32, builtin: u32) -> usi
     with_state(|state| {
         state.output.clear();
         if let Some(image) = builtin_image(index, builtin) {
-            state.output.extend_from_slice(image.summary.as_bytes());
+            state.output.extend_from_slice(image.summary().as_bytes());
         }
         state.output.len()
     })
@@ -423,7 +424,7 @@ pub extern "C" fn rsemu_machine_builtin_slot(index: u32, builtin: u32) -> usize 
     with_state(|state| {
         state.output.clear();
         if let Some(image) = builtin_image(index, builtin) {
-            state.output.extend_from_slice(image.slot.as_bytes());
+            state.output.extend_from_slice(image.slot().as_bytes());
         }
         state.output.len()
     })
@@ -436,24 +437,130 @@ fn catalog_entry(index: u32) -> Option<&'static crate::machine::catalog::Catalog
         .copied()
 }
 
-/// The images this build carries for `entry`.
-fn builtins(
-    entry: &'static crate::machine::catalog::CatalogEntry,
-) -> &'static [crate::machine::catalog::BuiltinImage] {
-    crate::machine::catalog::builtins(entry.name)
+/// One image this build can boot a machine on with nothing uploaded.
+///
+/// Two kinds, because rsemu ships two kinds. A monitor is a couple of hundred
+/// bytes the catalog carries verbatim as a `&'static [u8]`. The legacy PC BIOS
+/// is **assembled for the board it is about to run in** — its MP, ACPI and
+/// SMBIOS tables describe *that* machine's processors and chips
+/// ([`crate::fw::pcbios`]) — so it does not exist until someone asks for it and
+/// cannot be a static slice.
+///
+/// The CLI (`builtin_bios` in `src/bin/rsemu.rs`) and the C ABI
+/// (`builtin_media` in `crate::ffi`) each have the same fork for the same
+/// reason. This is the browser's, and it is here rather than in
+/// `machine::catalog` because a generated image has no `'static` bytes for
+/// [`crate::machine::catalog::BuiltinImage`] to hold.
+#[derive(Debug, Clone, Copy)]
+enum Builtin {
+    /// An image the catalog carries as bytes.
+    Static(&'static crate::machine::catalog::BuiltinImage),
+    /// rsemu's own legacy PC BIOS, assembled for this machine description.
+    #[cfg(all(feature = "fw-pcbios", feature = "machine-pc-at"))]
+    PcBios,
+}
+
+impl Builtin {
+    /// How a host names it — the same names `rsemu run … --monitor` takes.
+    fn name(self) -> &'static str {
+        match self {
+            Builtin::Static(image) => image.name,
+            #[cfg(all(feature = "fw-pcbios", feature = "machine-pc-at"))]
+            Builtin::PcBios => "rsemu-bios",
+        }
+    }
+
+    /// One line about what it is, for a picker.
+    fn summary(self) -> &'static str {
+        match self {
+            Builtin::Static(image) => image.summary,
+            #[cfg(all(feature = "fw-pcbios", feature = "machine-pc-at"))]
+            Builtin::PcBios => {
+                "rsemu's own legacy PC BIOS: POST, the MP/ACPI/SMBIOS tables, and a boot attempt"
+            }
+        }
+    }
+
+    /// The media slot it fills.
+    fn slot(self) -> &'static str {
+        match self {
+            Builtin::Static(image) => image.slot,
+            #[cfg(all(feature = "fw-pcbios", feature = "machine-pc-at"))]
+            Builtin::PcBios => "bios",
+        }
+    }
+
+    /// The bytes, assembling them if this is the kind that is generated.
+    ///
+    /// `entry` is the description the firmware is being built *for*: a copy of
+    /// `pc-at` with a second processor in it gets a table with two processors
+    /// in it. A description this firmware cannot read falls back to the shipped
+    /// board's, exactly as the CLI does — a table generator is never the reason
+    /// a machine will not start.
+    fn bytes(
+        self,
+        entry: &'static crate::machine::catalog::CatalogEntry,
+    ) -> alloc::borrow::Cow<'static, [u8]> {
+        let _ = entry;
+        match self {
+            Builtin::Static(image) => alloc::borrow::Cow::Borrowed(image.bytes),
+            #[cfg(all(feature = "fw-pcbios", feature = "machine-pc-at"))]
+            Builtin::PcBios => alloc::borrow::Cow::Owned(
+                crate::fw::pcbios::image_for_machine(entry.name, entry.source)
+                    .unwrap_or_else(|_| crate::fw::pcbios::image()),
+            ),
+        }
+    }
+}
+
+/// The images this build can boot `entry` on, in the order a picker shows them.
+///
+/// A `Vec` rather than a slice because one of them is generated. This is a cold
+/// path — a page asks once, at load — so the allocation is not worth designing
+/// around.
+// `mut` only in a build that has the one generated image, exactly as
+// `machine::catalog::machines` is only `mut` in a build that has a machine.
+#[allow(unused_mut)]
+fn builtins(entry: &'static crate::machine::catalog::CatalogEntry) -> Vec<Builtin> {
+    let mut out: Vec<Builtin> = crate::machine::catalog::builtins(entry.name)
+        .iter()
+        .map(Builtin::Static)
+        .collect();
+    // The one board whose firmware rsemu ships. `ROADMAP.md` phase 6a: every
+    // other legacy PC BIOS anyone could reach for is GPL, and running one is
+    // fine while shipping one is not.
+    #[cfg(all(feature = "fw-pcbios", feature = "machine-pc-at"))]
+    if entry.name == "pc-at" {
+        out.push(Builtin::PcBios);
+    }
+    out
 }
 
 /// One built-in image, by machine index and image index.
-fn builtin_image(
-    index: u32,
-    builtin: u32,
-) -> Option<&'static crate::machine::catalog::BuiltinImage> {
-    builtins(catalog_entry(index)?).get(builtin as usize)
+fn builtin_image(index: u32, builtin: u32) -> Option<Builtin> {
+    builtins(catalog_entry(index)?)
+        .get(builtin as usize)
+        .copied()
 }
 
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
+
+/// The character port `pc.kbc` opens, which carries scan codes rather than
+/// text and is therefore never this module's console.
+const KEYBOARD_PORT: &str = "keyboard";
+
+/// Media slots whose unbound state is "empty", not "missing".
+///
+/// A PC's second IDE bay, its diskette drive and its video option-ROM socket
+/// are all ordinarily empty; a `riscv-virt`'s NOR banks are blank on a board
+/// straight from the factory. `machine::realize` refuses an unbound slot, so
+/// "empty" has to be said explicitly — with no bytes. The same list, and the
+/// same argument, as `src/bin/rsemu.rs`'s.
+const EMPTY_BAYS: &[&str] = &[
+    "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "floppy", "vgabios",
+];
 
 /// Where the media image a boot binds comes from.
 ///
@@ -518,6 +625,34 @@ fn boot_with(index: u32, media: Media) -> u32 {
         state.audio = None;
         state.hosts = None;
 
+        // The image has to outlive the build whichever way it was chosen: the
+        // uploaded one is copied out of the input buffer, the generated one is
+        // assembled here, and a static one already lives forever. One `Cow`
+        // covers all three, and it is bound **before** `options` so that it
+        // outlives the map that borrows it.
+        let binding: Option<(&'static str, alloc::borrow::Cow<'static, [u8]>)> = match media {
+            Media::Uploaded(len) => {
+                let Some(slot) = entry.media.first() else {
+                    return fail(state, "this machine takes no media");
+                };
+                let bytes = state.input.get(..len).unwrap_or(&[]).to_vec();
+                Some((*slot, alloc::borrow::Cow::Owned(bytes)))
+            }
+            Media::Builtin(which) => {
+                let Some(image) = builtins(entry).get(which as usize).copied() else {
+                    return fail(state, "this machine has no built-in image with that index");
+                };
+                Some((image.slot(), image.bytes(entry)))
+            }
+            // The same courtesy the CLI extends: a machine that ships an image
+            // and was given none boots on it, so an Apple 1 comes up with
+            // nothing uploaded and no ROM of unclear provenance.
+            Media::Default => builtins(entry)
+                .first()
+                .copied()
+                .map(|i| (i.slot(), i.bytes(entry))),
+        };
+
         let registry = match crate::machine::catalog::registry() {
             Ok(r) => r,
             Err(e) => return fail(state, e),
@@ -526,34 +661,20 @@ fn boot_with(index: u32, media: Media) -> u32 {
             Ok(o) => o,
             Err(e) => return fail(state, e),
         };
-
-        // The uploaded bytes have to outlive the build, and a built-in image
-        // already does — so both end up as one `(slot, bytes)` pair, with the
-        // `Vec` kept alive alongside it for the uploaded case.
-        let uploaded: Vec<u8> = match media {
-            Media::Uploaded(len) => state.input.get(..len).unwrap_or(&[]).to_vec(),
-            Media::Builtin(_) | Media::Default => Vec::new(),
-        };
-        let binding: Option<(&'static str, &[u8])> = match media {
-            Media::Uploaded(_) => {
-                let Some(slot) = entry.media.first() else {
-                    return fail(state, "this machine takes no media");
-                };
-                Some((*slot, uploaded.as_slice()))
+        if let Some((slot, bytes)) = &binding {
+            options.realize.media.insert(*slot, bytes.as_ref());
+        }
+        // An unbound slot is an error by design (`machine::realize`), so the
+        // empty bays have to be bound as empty. Same list and same argument as
+        // the CLI's: a PC with no diskette, no option ROM in the video socket
+        // and one empty IDE bay is an ordinary PC, and a board that refused to
+        // assemble without a floppy would be describing no machine anyone
+        // owned. Only slots this machine actually declares, and never the one
+        // the image above went into.
+        for slot in EMPTY_BAYS {
+            if entry.media.contains(slot) && binding.as_ref().is_none_or(|(s, _)| s != slot) {
+                options.realize.media.insert(*slot, &[][..]);
             }
-            Media::Builtin(which) => {
-                let Some(image) = builtins(entry).get(which as usize) else {
-                    return fail(state, "this machine has no built-in image with that index");
-                };
-                Some((image.slot, image.bytes))
-            }
-            // The same courtesy the CLI extends: a machine that ships an image
-            // and was given none boots on it, so an Apple 1 comes up with
-            // nothing uploaded and no ROM of unclear provenance.
-            Media::Default => builtins(entry).first().map(|i| (i.slot, i.bytes)),
-        };
-        if let Some((slot, bytes)) = binding {
-            options.realize.media.insert(slot, bytes);
         }
 
         // One arm per display family this build has, exactly like the
@@ -562,6 +683,10 @@ fn boot_with(index: u32, media: Media) -> u32 {
         // code rather than by booting the machine and seeing black.
         #[cfg(feature = "dev-nes-ppu")]
         if let Err(e) = crate::host::display::nes::capture::install(&mut options) {
+            return fail(state, e);
+        }
+        #[cfg(feature = "dev-pc-video")]
+        if let Err(e) = crate::host::display::pc::capture::install(&mut options) {
             return fail(state, e);
         }
         #[cfg(feature = "dev-lcdc")]
@@ -610,6 +735,16 @@ fn boot_with(index: u32, media: Media) -> u32 {
 
         #[cfg(feature = "dev-nes-ppu")]
         if let Some(scanout) = crate::host::display::nes::capture::take(&hosts) {
+            state.attach_scanout(alloc::boxed::Box::new(scanout));
+        }
+        // The PC's adapter reshapes itself when the guest sets a mode, so the
+        // surface this attaches is only the geometry the card powers up in —
+        // `rsemu_frame_width` answers whatever the last capture produced, and
+        // the page resizes its canvas from that.
+        #[cfg(feature = "dev-pc-video")]
+        if state.scanout.is_none()
+            && let Some(scanout) = crate::host::display::pc::capture::take(&hosts)
+        {
             state.attach_scanout(alloc::boxed::Box::new(scanout));
         }
         // The panel boards' engine, taken after the build because its frame
@@ -673,9 +808,17 @@ fn boot_with(index: u32, media: Media) -> u32 {
         // Whatever character port the machine's devices opened is the console.
         // One is unambiguous; a machine with several is not this ABI's problem
         // until one exists.
+        //
+        // Except `keyboard`, which is not a console: it is what `pc.kbc` opens,
+        // and **every byte on it is a raw AT scan code in set 2** rather than a
+        // character (`dev::pc::kbc`). A page that put it behind a terminal pane
+        // would show an empty screen and send `0x41` for `A` meaning the `9`
+        // key. `src/bin/rsemu.rs` draws the same line by the same name for the
+        // same reason, and the PC's output goes to its video adapter anyway.
         let names = crate::host::chardev::ports::names(&hosts);
         if let Some(port) = names
-            .first()
+            .iter()
+            .find(|n| n.as_str() != KEYBOARD_PORT)
             .and_then(|n| crate::host::chardev::ports::get(&hosts, n).ok().flatten())
         {
             state.console = Some(port);
@@ -1211,13 +1354,15 @@ mod tests {
 
     /// The catalog index of the machine called `name` in this build.
     ///
-    /// Only the `machine-beneater` tests name a machine and an image, so this
-    /// is dead code in a build without it -- and `--no-default-features
+    /// Only the per-machine transcript tests name a machine, so this is dead
+    /// code in a build with none of them -- and `--no-default-features
     /// --features wasm` is a real sweep configuration that compiles the ABI
     /// with an empty catalog.
     #[cfg(any(
         feature = "machine-beneater",
         feature = "machine-gameboy",
+        feature = "machine-pc-at",
+        feature = "machine-spi-panel",
         feature = "machine-sms"
     ))]
     fn machine_index(name: &str) -> u32 {
@@ -1421,6 +1566,81 @@ mod tests {
             seen.len()
         });
         assert!(colours > 1, "the panel drew one flat colour");
+        rsemu_shutdown();
+    }
+
+    /// The PC/AT posts on rsemu's own BIOS with nothing bound from outside.
+    ///
+    /// The only built-in image in this module that is *generated* rather than
+    /// carried: `fw::pcbios` assembles it for this board, because its MP and
+    /// ACPI tables describe this board's processors. Two things are being
+    /// claimed. First, that the boot succeeds at all — a PC declares five media
+    /// slots and `machine::realize` refuses an unbound one, so the empty bays
+    /// have to be bound as empty or `vgacard` will not assemble. Second, that
+    /// the firmware ran: the VGA is in text mode 3 at 720x400, three rows carry
+    /// ink and nothing below them does, and the nine-by-sixteen block of pixels
+    /// that is the `B` of `BIOS` on the banner is the same block as the `B` of
+    /// `Booting.` on the line below. No font table is consulted; glyph identity
+    /// is what a screen full of words has and a test pattern does not.
+    #[cfg(all(feature = "machine-pc-at", feature = "fw-pcbios"))]
+    #[test]
+    fn a_pc_at_posts_on_its_own_bios_through_the_abi() {
+        let _one = ONE_MACHINE.lock();
+        let machine = machine_index("pc-at");
+        assert_eq!(rsemu_boot_builtin(machine, 0), 1, "{}", {
+            rsemu_error();
+            out()
+        });
+        assert_eq!(rsemu_has_video(), 1);
+        // `pc.kbc` opens a character port, and every byte on it is a scan code
+        // rather than text — so this machine has a keyboard and not a console,
+        // and a page that put a terminal in front of it would be lying.
+        assert_eq!(rsemu_has_console(), 0);
+        assert_eq!(rsemu_has_pad(), 0);
+        assert_eq!((rsemu_frame_width(), rsemu_frame_height()), (720, 400));
+        // The CRTC's own rate, not the 60 Hz a machine with no display gets.
+        assert_ne!(rsemu_frame_period_ns(), DEFAULT_FRAME_NS);
+
+        for _ in 0..240 {
+            rsemu_run_frame();
+        }
+
+        // One 9x16 text cell's ink, as a bit string.
+        let cell = |cx: usize, cy: usize| -> String {
+            with_state(|state| {
+                let px = state.frame.pixels();
+                let w = state.frame.width() as usize;
+                let mut bits = String::new();
+                for y in 0..16 {
+                    for x in 0..9 {
+                        let i = ((cy * 16 + y) * w + cx * 9 + x) * 4;
+                        let lit = px[i] | px[i + 1] | px[i + 2] != 0;
+                        bits.push(if lit { '1' } else { '0' });
+                    }
+                }
+                bits
+            })
+        };
+        let row_has_ink = |cy: usize| (0..80).any(|cx| cell(cx, cy).contains('1'));
+
+        assert!(
+            row_has_ink(0) && row_has_ink(1) && row_has_ink(2),
+            "the BIOS printed fewer than its three lines"
+        );
+        // Row 3 is the cursor, and it blinks, so it is deliberately not asserted.
+        assert!(
+            (4..25).all(|cy| !row_has_ink(cy)),
+            "something below the POST output — it scrolled, or it is not a POST screen"
+        );
+        // "rsemu BIOS, …" over "Booting." over "No bootable device."
+        assert_eq!(
+            cell(6, 0),
+            cell(0, 1),
+            "the B of BIOS is not the B of Booting."
+        );
+        assert_eq!(cell(1, 1), cell(2, 1), "the two o's of Booting. differ");
+        assert_eq!(cell(1, 2), cell(1, 1), "the o of No is not that o");
+        assert_ne!(cell(0, 2), cell(0, 1), "N and B are the same glyph");
         rsemu_shutdown();
     }
 
