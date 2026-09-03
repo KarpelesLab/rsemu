@@ -471,6 +471,65 @@ fn a_sealed_recorder_takes_no_more_channels() {
     );
 }
 
+/// The seal's reach, pinned — including the half that is wrong.
+///
+/// [`HostObjects`] files three unrelated things under one `(kind, name)` space:
+/// doors that are channels, which must be declared; rendezvous inside the
+/// machine, where nothing crosses from the host at all; and `medium`, a door
+/// whose bytes the guest *pulls* a sector at a time, so no `(instant, payload)`
+/// log could describe it. A `pci-bus` is not non-deterministic, cannot be a
+/// channel, and has nothing to record — yet a sealed table refuses it exactly
+/// as it refuses an undeclared keyboard.
+///
+/// That is why no board in `src/` is sealed: sealing anything with a PCI or USB
+/// bus in it fails on an object that was never an input. The assertion below is
+/// therefore a *characterisation* of a defect rather than a guarantee, and it
+/// is here so that marking kinds as doors has something to flip. When it does,
+/// this test's second half inverts and its first half stays.
+#[test]
+fn the_seal_cannot_tell_a_door_from_a_rendezvous() {
+    let recorder = Arc::new(Recorder::recording());
+    let hosts = HostObjects::new();
+    hosts.seal(Arc::clone(&recorder)).unwrap();
+
+    // A door. Refusing this is the point of the seal: an input the recorder
+    // does not know about would be missing from every recording.
+    assert!(
+        hosts.open(CHARDEV, "console", || 1u32).is_err(),
+        "an undeclared input is what the seal exists to catch"
+    );
+
+    // A rendezvous. Refusing this catches nothing and costs the seal every
+    // board above the smallest.
+    for rendezvous in [
+        "pci-bus",
+        "usb-bus",
+        "i2c-bus",
+        "spi-bus",
+        "ata-bay",
+        "sd-slot",
+        "floppy-drive",
+        "apic-bus",
+        "signal",
+        "riscv.dt",
+    ] {
+        assert!(
+            hosts.open(HostKind::new(rendezvous), "0", || 1u32).is_err(),
+            "`{rendezvous}` is how two devices find each other, not an input, \
+             and the seal refuses it anyway"
+        );
+    }
+
+    // And the third kind: host bytes really do cross at a `medium`, but the
+    // guest pulls them a sector at a time, so there is no channel to declare
+    // and the seal is demanding something that cannot exist.
+    assert!(
+        hosts.open(HostKind::new("medium"), "hd0", || 1u32).is_err(),
+        "a drive's image is a door with no `(instant, payload)` shape, and \
+         refusing it means no board with a disk can be sealed"
+    );
+}
+
 #[test]
 fn unsealing_gives_the_table_back() {
     let recorder = Arc::new(Recorder::recording());

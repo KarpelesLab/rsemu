@@ -7,8 +7,8 @@
 //! is the entire difference between two runs. RSMON, rsemu's own monitor, sits
 //! in the ROM socket, so the test needs no image of unclear provenance.
 //!
-//! Four things are proved here, and the first is the one that makes the other
-//! three mean anything:
+//! Five things are proved here, and the first is the one that makes the other
+//! four mean anything:
 //!
 //! 1. **The input matters.** A run with keystrokes and a run without reach
 //!    different state hashes. Without this the rest is a test that two empty
@@ -20,8 +20,38 @@
 //!    to an earlier instant, run forward again, arrive at the same number.
 //! 4. **A device cannot bypass the seam.** A sealed host-object table refuses
 //!    to build a board whose input the recorder has no channel for, naming it.
+//! 5. **A frozen recording replays to a pinned state.** The bytes and the
+//!    resulting hash are constants in this file, so the comparison crosses
+//!    runs, builds and machines rather than staying inside one process.
 //!
 //! Everything needs a machine, so the whole file is gated on `machine-apple1`.
+//!
+//! # What the fifth one can and cannot prove
+//!
+//! Phase 9's gate is *"a recorded session replayed bit-identically on a
+//! different host"*, and 1–4 do not test it however green they are: each
+//! records and replays inside one process, so a host that disagreed with every
+//! other host would still pass all four as long as it disagreed with itself
+//! consistently. Nothing here compared a result against anything that came from
+//! outside the run.
+//!
+//! Pinning the artefact is what converts an existing but unexploited CI matrix
+//! into the gate. `cargo test --all-features` already runs on `ubuntu-latest`,
+//! `macos-latest` and `windows-latest` — three operating systems, two
+//! instruction sets, three linkers — and against a constant in the source those
+//! three become three hosts replaying one recording. This has also been run by
+//! hand on `i686-unknown-linux-gnu`, where `usize` is four bytes; the hash is
+//! the same, which is a stronger statement than a second 64-bit host would have
+//! made.
+//!
+//! What is still **not** proved, and cannot be from one machine: a big-endian
+//! host (none is buildable-and-runnable here), a host with a different
+//! floating-point environment reaching a guest that uses one, and any wasm
+//! target — CI *builds* all three wasm targets and runs none of them, because
+//! there is no wasm test runner in this repository. A `wasm32-wasip1` job under
+//! `wasmtime` would add the most: a genuinely different execution environment
+//! with a 32-bit address space, and this test would need no changes to be the
+//! thing it ran.
 
 #![cfg(all(feature = "machine-apple1", feature = "std"))]
 
@@ -451,6 +481,205 @@ fn an_unknown_host_kind_is_refused_too() {
         hosts.open(HostKind::new("net"), "eth0", || 0u32).is_err(),
         "a NIC's port is an input like any other"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 5. the other host
+// ---------------------------------------------------------------------------
+
+/// A recording of exactly the session above, frozen as bytes.
+///
+/// This is the artefact, not a re-derivation of it: 471 bytes that were
+/// produced by a run on some machine on some day and have been in the source
+/// ever since. Replaying it exercises `InputLog::decode` on a file rather than
+/// `InputLog::clone` on a live object, and — the point — it removes the
+/// recording run from the replay's causal chain entirely. Every other test here
+/// records and replays inside one process, so each would pass on a host that
+/// disagreed with every other host, as long as it disagreed with itself
+/// consistently.
+///
+/// It embeds the Apple 1's `MachineShape`, so a change to the board makes this
+/// fail with a shape diff. That is the correct failure — a recording of another
+/// machine — and regenerating it is the fix: record `TYPED` and print
+/// `recorder.log().encode()`.
+#[rustfmt::skip]
+const FROZEN_SESSION: &[u8] = &[
+    0x52, 0x53, 0x45, 0x4d, 0x55, 0x52, 0x50, 0x4c, 0x01, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x63, 0x70, 0x75, 0x0b, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x63, 0x70, 0x75, 0x2e, 0x6d, 0x6f, 0x73, 0x36, 0x35,
+    0x30, 0x32, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x69,
+    0x61, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x61, 0x70, 0x70,
+    0x6c, 0x65, 0x31, 0x2e, 0x70, 0x69, 0x61, 0x03, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x72, 0x6f, 0x6d, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x61, 0x70, 0x70, 0x6c, 0x65, 0x31, 0x2e, 0x72, 0x6f, 0x6d,
+    0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x77, 0x72, 0x61, 0x6d,
+    0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x72, 0x61, 0x6d, 0x03,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x63, 0x70, 0x75, 0x62, 0x75, 0x73, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x72, 0x61, 0x6d,
+    0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x63, 0x70, 0x75, 0x62,
+    0x75, 0x73, 0x10, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x6d, 0x69, 0x72, 0x72, 0x6f, 0x72, 0x28, 0x70, 0x69, 0x61,
+    0x29, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x63, 0x70, 0x75,
+    0x62, 0x75, 0x73, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x6d, 0x6f, 0x6e, 0x69, 0x74, 0x6f, 0x72, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x01, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x63, 0x68, 0x61, 0x72, 0x64, 0x65, 0x76, 0x07, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x63, 0x6f, 0x6e, 0x73, 0x6f, 0x6c,
+    0x65, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x0d, 0x01,
+    0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x63, 0x68, 0x61, 0x72, 0x64, 0x65, 0x76, 0x07, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x63, 0x6f, 0x6e, 0x73, 0x6f, 0x6c, 0x65, 0x0a, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x45, 0x30, 0x30, 0x30, 0x2e, 0x45,
+    0x30, 0x30, 0x46, 0x0d, 0x01, 0x98, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99,
+    0x99, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x63, 0x68, 0x61, 0x72, 0x64, 0x65, 0x76,
+    0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x63, 0x6f, 0x6e, 0x73,
+    0x6f, 0x6c, 0x65, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+    0x46, 0x0d, 0x00,
+];
+
+/// The state hash the board reaches after replaying [`FROZEN_SESSION`].
+///
+/// The whole cross-host gate is this constant. A hash compared against another
+/// hash computed in the same process proves reproducibility *on this host*; a
+/// hash compared against a number in the source proves it against every host
+/// that has ever run this test. CI runs `cargo test --all-features` on
+/// `ubuntu-latest`, `macos-latest` and `windows-latest` — three operating
+/// systems and two instruction sets — so the second host is already there and
+/// was simply never asked. It has also been run by hand on a 32-bit target
+/// (`cargo test --target i686-unknown-linux-gnu`), which is the interesting
+/// direction: `usize` is four bytes there, and a snapshot that had leaked one
+/// would not produce this number.
+const FROZEN_HASH: u64 = 0xe2c6_ef17_b01e_2bb7;
+
+/// The instant the replay ends at, in raw 2⁻⁶⁴-second units.
+///
+/// Pinned raw rather than in nanoseconds because it is not a whole number of
+/// them: five spans of 400 ms is two virtual seconds less two units, and
+/// `as_nanos` rounds that away.
+const FROZEN_END: u128 = 36_893_488_147_419_103_230;
+
+/// What the guest prints while [`FROZEN_SESSION`] replays.
+///
+/// The other half of the artefact, and the half a state hash cannot cover: a
+/// machine can reach the right state having said the wrong things on the way.
+const FROZEN_OUTPUT: &[u8] =
+    b"RSMON\r>0\r0000: 00 00 00 00 00 00 00 00\r>E000.E00F\rE00F: E0 E0 E0 E0 \
+      E0 E0 E0 E0\r>FF\r17FF: 17 17 17 17 ";
+
+#[test]
+fn a_recording_out_of_a_bug_report_replays_to_a_pinned_state() {
+    let log = rsemu::core::record::InputLog::decode(FROZEN_SESSION)
+        .expect("the frozen recording still parses");
+
+    let (mut machine, hosts) = apple1(ThreadingMode::Deterministic);
+    let port = ports::open(&hosts, CONSOLE).expect("the console port");
+    let replay = Arc::new(Recorder::replaying(log));
+    replay
+        .register(console_channel(), port_sink(&port))
+        .expect("a fresh recorder takes channels");
+    machine
+        .set_recorder(Arc::clone(&replay))
+        .expect("the recording is of this board");
+    machine.reset(ResetKind::Cold);
+
+    let (hash, printed) = drive(&mut machine, &port, &replay, &[b"", b"", b"", b"", b""]);
+
+    assert_eq!(
+        machine.now().raw(),
+        FROZEN_END,
+        "the replay ended somewhere else"
+    );
+    assert_eq!(
+        printed, FROZEN_OUTPUT,
+        "the guest said something different than it said when this was recorded"
+    );
+    assert_eq!(
+        hash, FROZEN_HASH,
+        "this build reached a different machine than the one in the source. \
+         Either determinism broke, or this host disagrees with the one that \
+         produced the constant — and which of those it is, is exactly what \
+         phase 9's gate asks. A deliberate change to the Apple 1, the 6502 or \
+         a snapshot format moves this number legitimately: re-record `TYPED` \
+         and update FROZEN_SESSION, FROZEN_HASH and FROZEN_OUTPUT together"
+    );
+}
+
+#[test]
+fn this_build_still_produces_the_frozen_recording() {
+    // The other direction, and what keeps the frozen artefact from rotting
+    // into a fossil nothing writes any more: recording the same session must
+    // reproduce those bytes exactly. It also pins the encoder itself as
+    // host-invariant — no `usize`, no pointer, no map iteration order.
+    let (mut machine, hosts) = apple1(ThreadingMode::Deterministic);
+    let port = ports::open(&hosts, CONSOLE).expect("the console port");
+    let recorder = Arc::new(Recorder::recording());
+    recorder
+        .register(console_channel(), port_sink(&port))
+        .expect("a fresh recorder takes channels");
+    machine
+        .set_recorder(Arc::clone(&recorder))
+        .expect("deterministic");
+    machine.reset(ResetKind::Cold);
+    drive(&mut machine, &port, &recorder, &TYPED);
+
+    let encoded = recorder.log().encode().expect("a recording encodes");
+    assert_eq!(
+        encoded.len(),
+        FROZEN_SESSION.len(),
+        "the recording changed length: {} bytes now, {} frozen",
+        encoded.len(),
+        FROZEN_SESSION.len()
+    );
+    assert!(
+        encoded == FROZEN_SESSION,
+        "this build writes a different recording of the same session"
+    );
+}
+
+#[test]
+fn a_recording_of_another_board_is_refused_with_a_diff() {
+    // What the shape in a recording is *for*. It has been written into every
+    // recording since the format existed and nothing read it back, so a
+    // recording of one machine replayed into another delivered its input to
+    // whatever device answered to the same channel name — a silently different
+    // run, which is the one outcome a replay must never produce.
+    let mut shape = rsemu::core::state::MachineShape::new();
+    shape
+        .add_device("cpu", "cpu.z80")
+        .expect("a shape takes a device");
+    let mut log = rsemu::core::record::InputLog::for_shape(shape);
+    log.push(rsemu::core::record::InputEvent {
+        at: GlobalTime::from_nanos(1_000_000),
+        channel: console_channel(),
+        payload: b"x".to_vec(),
+    })
+    .expect("an empty log takes an event");
+
+    let (mut machine, _hosts) = apple1(ThreadingMode::Deterministic);
+    let err = machine
+        .set_recorder(Arc::new(Recorder::replaying(log)))
+        .expect_err("that recording is not of this board");
+    let text = format!("{err}");
+    assert!(
+        text.contains("cpu.z80"),
+        "the refusal is a diff naming what moved, not a boolean: {text}"
+    );
+
+    // A log built by hand carries no shape at all, and unknown provenance is
+    // not a mismatch: a unit test and a fuzz case must still be replayable.
+    let bare = rsemu::core::record::InputLog::new();
+    machine
+        .set_recorder(Arc::new(Recorder::replaying(bare)))
+        .expect("an unshaped log is unknown provenance, not a wrong board");
 }
 
 // ---------------------------------------------------------------------------

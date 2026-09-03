@@ -70,15 +70,47 @@
 //!   instants, and the machine does not have the frontend's policy.
 //!
 //! * **Host handles: an open file, a socket, a disk image.** Neither rewound
-//!   nor rewindable here. A machine snapshot taken while a write-back cache
-//!   holds dirty blocks and restored without a matching disk snapshot restores
-//!   to a corrupt guest filesystem — §4.5 states that as the *atomicity rule*
-//!   and settles it in favour of "storage is snapshotted with the machine or
-//!   not at all". Until a block backend can snapshot itself, [`Timeline`]
-//!   rewinds the machine and leaves the backing store where it was, which is
-//!   sound for a read-only image and unsound for a writable one. The honest
-//!   statement is that this is a limitation of the *storage* layer rather than
-//!   of rewind, and it moves when §7.1's cache-flush contract lands.
+//!   nor rewindable *by this module* — but this used to say "a limitation of
+//!   the storage layer that moves when §7.1's cache-flush contract lands", and
+//!   half of it has now moved. What replaced it is better than a limitation: a
+//!   **policy**, chosen per drive, whose three positions a rewind treats
+//!   differently and visibly.
+//!
+//!   §4.5's atomicity rule is that storage is snapshotted with the machine or
+//!   not at all, and the failure it names is a snapshot taken while dirty
+//!   blocks are held. That failure is gone: a drive whose medium snapshots by
+//!   *reference* flushes it inside its own `save`, so the image on disk is
+//!   consistent with the instant a keyframe was taken, and `Machine::flush`
+//!   closes the same window at the end of a run. A `qcow2` L2 table that lives
+//!   in RAM until `sync` is exactly what that buys.
+//!
+//!   What a **rewind** does is then decided by the policy and not by this
+//!   module:
+//!
+//!   | policy | a rewind is |
+//!   | --- | --- |
+//!   | *capture* | **sound** — the bytes are inside the keyframe, and the restore writes them back over the medium |
+//!   | *refuse* | **impossible, loudly** — the first [`Timeline::snapshot`] fails, before any history exists to rewind through |
+//!   | *reference* | **unsound, silently** — the image is outside the snapshot, and the restore checks an identity string rather than the contents |
+//!
+//!   So the remaining hazard is one row wide, and it is the row a file-backed
+//!   writable image defaults to. A caller that wants rewind over a real disk
+//!   asks for *capture* and pays the capacity per keyframe; a caller that
+//!   cannot afford that gets *reference* and a rewind that restores the
+//!   machine's idea of the disk without restoring the disk. Closing that row
+//!   needs copy-on-write overlays — an image snapshot taken with the machine
+//!   snapshot — which §7.1 still lists as outstanding and which is `fstool`
+//!   work rather than rsemu-on-top work.
+//!
+//!   [`Timeline`] cannot check which row a machine is in, and that is
+//!   deliberate rather than missing: a `Snapshot` lives behind the
+//!   `dev-medium` feature and a timeline is a machine-layer object that links
+//!   no device at all. §15's first invariant — no device type in a framework
+//!   signature — is the reason, and asking a `Timeline` to know what a disk is
+//!   would be a worse trade than the caller checking a policy it chose. What
+//!   *does* reach here is the loud case: a `refuse` medium makes
+//!   [`Machine::save`](crate::machine::Machine::save) fail, so the first
+//!   snapshot refuses and no history is silently unrewindable.
 //!
 //! # Example
 //!

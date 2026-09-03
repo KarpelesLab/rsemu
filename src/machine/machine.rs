@@ -83,7 +83,7 @@ use alloc::vec::Vec;
 use crate::core::clock::{ClockForest, DomainId, GlobalTime};
 use crate::core::device::{Deferred, Device, DeviceClass, ResetKind};
 use crate::core::error::{Error, Result};
-use crate::core::record::Recorder;
+use crate::core::record::{Mode, Recorder};
 use crate::core::sched::{
     Budget, Consumed, Event, EventId, EventTarget, HostClock, LazyDevice, LazyId, QuantumReport,
     Runnable, RunnableId, Scheduler, SchedulerSnapshot,
@@ -892,6 +892,24 @@ impl Machine {
                      threading to record it"
                 ),
             });
+        }
+        // A replaying recorder arrived carrying the shape of the board its
+        // recording was taken from, and until now the line below simply
+        // overwrote it — so a recording of one machine replayed into another
+        // delivered its input to whatever device answered to the same channel
+        // name, which is the failure §4.5 says must be a diff. An empty shape
+        // is unknown provenance (a log built by hand) rather than a mismatch,
+        // and is not checked.
+        if recorder.mode() == Mode::Replay {
+            let recorded = recorder.shape();
+            if !recorded.is_empty() {
+                let diff = recorded.diff(&self.shape);
+                if !diff.is_empty() {
+                    return Err(Error::State(format!(
+                        "this recording was taken from a differently shaped machine: {diff}"
+                    )));
+                }
+            }
         }
         recorder.set_shape(self.shape.clone());
         self.recorder = Some(recorder);

@@ -12,28 +12,38 @@
 //! # What is actually non-deterministic in this tree
 //!
 //! Measured rather than assumed. A machine's state at instant *t* is a function
-//! of its initial state and of everything that crossed into it since, and
-//! almost everything in rsemu is already inside that function:
+//! of its initial state and of everything that crossed into it since, and most
+//! of rsemu is already inside that function.
+//!
+//! The list below was re-derived from the tree rather than carried forward,
+//! and re-deriving it moved four rows. **A "yes" here means the mechanism
+//! exists and something uses it**; where the mechanism exists and nothing in
+//! `src/` reaches for it, the row says so, because a seam that only tests use
+//! is a seam the product does not have.
 //!
 //! | Input | Status |
 //! | --- | --- |
-//! | Keystrokes and terminal bytes | **through here** — a character port is a host object, and a host object is a channel |
-//! | A frontend's keys and pointer | **through here** — `host::input` posts twelve-byte records on `input:vnc`; it used to keep its own `(instant, event)` log and no longer does |
-//! | Gamepad buttons | **through here** — a NES pad table, a Game Boy `GbPad` and a Master System `SmsPads` are all host objects under `pad:` |
-//! | Network frames | **through here** — a NIC's port is a host object, registered as a channel by `dev::net::link::ports`; the shape is exactly `(instant, frame bytes)` |
+//! | A frontend's keys and pointer | **through here** — `host::input` posts twelve-byte records on `input:vnc`, and `host::vnc::session` is the **only** [`Recorder::register`] call site in `src/`. A USB HID pointer rides the same channel |
+//! | Gamepad buttons | **registerable, registered only by tests** — a NES pad table, a Game Boy `GbPad` and a Master System `SmsPads` are host objects under `pad:` and each ships a `channel()`/`sink()` pair; `tests/joypad_replay.rs` wires them and nothing in `src/` does |
+//! | Network frames | **registerable, registered only by tests** — `dev::net::link::ports` ships the pair and `tests/ne2000_board.rs` wires it. A `PktkitLink` built the other way holds a *private* port that is not in the table at all, and its own docs call that the unrecorded form of the same path |
+//! | Keystrokes and terminal bytes | **not through here today.** A character port *is* a host object, so a sealed table would refuse the board — but `host::chardev` ships no `channel()`/`sink()` pair, `host::terminal`'s pump feeds the port directly, and `tests/record_replay.rs` hand-rolls the two closures locally. The gap is two functions beside `ports::open`, and until they exist the CLI's own console is unrecorded |
 //! | Guest-visible randomness | already deterministic: `virtio-rng` is a seeded SplitMix64, and says so in its own docs |
 //! | The real-time clock | already deterministic: the MC146818 takes its epoch from a `time` property and advances from its own clock domain, never the host's |
-//! | The host wall clock | not readable below `host/`: the only wall-clock read in the tree is the binary's rate controller |
-//! | Host file I/O completion | not asynchronous yet — every block backend here completes inside the guest access that issued it, so there is no completion to timestamp. When one becomes asynchronous, its completion is a channel |
+//! | The host wall clock | not guest-visible: `HostClock` is injected into the scheduler from above the `std` line and only feeds `Pace::Wait` |
+//! | Host file I/O **completion** | nothing to timestamp — every block backend completes inside the guest access that issued it. When one becomes asynchronous, its completion is a channel |
+//! | Host file I/O **content** | **not covered, and this is not a timing question.** A drive's bytes are host state outside the recording: a replay against an image the host has since edited diverges, and nothing checks that it is the same image. A medium snapshotted by *reference* compares an identity string, never contents (`machine::Timeline` has the rewind half of this) |
+//! | A debugger writing guest state | **not covered** — `host::gdb` lets a TCP peer set registers and memory mid-run. It is a deliberate power rather than an oversight, but a session debugged and recorded at once is not replayable and nothing says so |
+//! | Constructor interception | **not covered** — `Bindings::replace` swaps a class for another at build time, which is how `accel` substitutes a KVM core. A build-time door parallel to the host-object table, and the reason an accelerated board is out of scope for replay twice over |
 //! | Thread interleaving under `parallel` | **cannot go through here**, which is why replay is deterministic-mode only — see below |
 //!
 //! # The chokepoint is the host-object table, not the device
 //!
 //! The obvious design is a `Device` trait method, and it is the wrong one: a
 //! device that wants to cheat simply does not call it and nothing notices. The
-//! useful observation is that in this tree **there is exactly one door from the
-//! host into a machine**, and it is
-//! [`HostObjects`](crate::core::hosts::HostObjects):
+//! useful observation is that **every door a *device* has onto the host is
+//! [`HostObjects`](crate::core::hosts::HostObjects)** — the doors that are not
+//! are the frontend's, the debugger's and the embedder's, which the table above
+//! lists and none of which a device can reach:
 //!
 //! * a character port is opened by name through it;
 //! * a pad table is opened by name through it — including the Game Boy's and
@@ -55,12 +65,52 @@
 //! reaches for the host without declaring itself does not get a mis-recorded
 //! run; it gets a machine that refuses to realize.
 //!
-//! That is enforcement by construction for everything reachable today. What it
-//! does **not** stop is a device that manufactures non-determinism internally —
-//! a device calling the host clock in its own read path would never touch this
-//! table. Nothing in the type system stops that; what stops it is that `no_std`
-//! is the default for `dev/`, CI builds `--no-default-features`, and such a
-//! device would not compile there.
+//! ## The seal is a mechanism, and nothing in `src/` turns it on
+//!
+//! Stated plainly because the paragraph above reads like a description of what
+//! the product does, and it is a description of what the product *can* do.
+//! Every `seal` call site in the tree is a test. `machine::realize` carries the
+//! table into every device's `Props` and never seals it; the binary builds a
+//! recorder, attaches a VNC session and calls `Machine::set_recorder` without
+//! sealing. A board therefore realizes whether or not its inputs are declared,
+//! and `--record-input` on a machine with a console records the VNC events and
+//! not the console.
+//!
+//! There is a structural reason it has stayed opt-in, and it is worth naming
+//! because it is the thing to fix rather than a preference:
+//! **[`HostKind`] files three different things under one name space**, and the
+//! seal checks all of them alike:
+//!
+//! * **Doors that are channels** — `chardev`, `pad`, `netdev`, `capture`. An
+//!   input arrives as bytes at an instant, so it can be logged and re-delivered,
+//!   and demanding a channel for one is exactly right.
+//! * **Rendezvous inside the machine** — `pci-bus`, `usb-bus`, `i2c-bus`,
+//!   `spi-bus`, `ata-bay`, `sd-slot`, `floppy-drive`, `apic-bus`, `signal`,
+//!   `riscv.dt`. How two devices find each other. Nothing crosses from the host
+//!   at all, so there is nothing to record and nothing to demand.
+//! * **A door that cannot be a channel** — `medium`. Host bytes really do cross
+//!   here, but the guest *pulls* them a sector at a time rather than receiving
+//!   them at an instant, so no `(instant, payload)` log describes it. What that
+//!   needs is an identity check on the image, which is `dev::medium`'s
+//!   `Snapshot::Reference` — and a weak one, as the table above says — not a
+//!   channel.
+//!
+//! Only the first group belongs to the seal, and it holds all three, so sealing
+//! any board with a PCI or USB bus in it fails on an object that was never an
+//! input. The seal works on the Apple 1, the Game Boy and a two-device NIC
+//! board, which is exactly the set of boards the tests seal.
+//!
+//! The fix is a mark on the kind — `HostKind::door()` beside `HostKind::new()`,
+//! with `seal` checking only the doors — and it touches every kind's definition
+//! site across `bus/` and `dev/`, so it is described here rather than made
+//! here. `tests::the_seal_cannot_tell_a_door_from_a_rendezvous` pins the
+//! current behaviour so the change has something to flip.
+//!
+//! What the seal does **not** stop even once it is on is a device that
+//! manufactures non-determinism internally — a device calling the host clock in
+//! its own read path would never touch this table. Nothing in the type system
+//! stops that; what stops it is that `no_std` is the default for `dev/`, CI
+//! builds `--no-default-features`, and such a device would not compile there.
 //!
 //! # Delivery happens at a round boundary, and only there
 //!
@@ -129,11 +179,37 @@
 //! machine does with it. Forcing either into the other's shape would break the
 //! one it was forced into.
 //!
-//! What they should share, and now do, is the vocabulary — a
-//! [`GlobalTime`] stamp, a byte payload, an encoder over `core::state`'s
-//! [`Sink`] and [`Source`] — so a session that has both ends up with two
-//! sections of one file rather than two file formats. A third mechanism for
-//! either job is a design review, not a commit.
+//! That was written as a deferral — "a design review, not a commit" — and the
+//! review has now been held. **The split stands, and the reason is sharper
+//! than direction: each seam's key is the other's check.** Here the key is
+//! `(instant, channel)` and a channel with no sink is skipped, which is what
+//! makes `rsemu replay` work on a headless host with nothing attached. There
+//! the key is position in the sequence and a mismatched tag is a divergence
+//! reported at once. Swap them and each loses the property it exists for.
+//!
+//! The tempting unification is that [`Recorder::deliver`] is *itself* a pull —
+//! the machine asks "what arrived?" once per round — so input could be
+//! journalled as one question per round boundary. It could, and a recorded
+//! Apple 1 session would go from three entries to one per scheduling round
+//! unless empty answers were elided, which is instant-keying reintroduced; a
+//! round's *N* payloads across *M* channels would have to be re-encoded inside
+//! one answer's bytes; and the missing-sink tolerance would be gone.
+//! `usermode::journal` carries the argument in full from the other side.
+//!
+//! What they share, and as of this review actually do rather than aspire to,
+//! is the **vocabulary and the file discipline**: a [`GlobalTime`] stamp, a
+//! byte payload, an encoder over `core::state`'s [`Sink`] and [`Source`], a
+//! magic, a format version of its own, tagged entries, one canonical encoding,
+//! and a fuzz target holding the reader to it. The journal had none of the last
+//! five and now has all of them. A session that has both ends up with two
+//! sections of one vocabulary rather than two file formats.
+//!
+//! One asymmetry survives on purpose. A recording carries a
+//! [`MachineShape`] because a wrong board *silently accepts* input on a channel
+//! whose name happens to match; a journal carries no fingerprint because a
+//! wrong program diverges at the first question whose tag differs, which is a
+//! better check and comes for free. A third mechanism for either job is still a
+//! design review, not a commit.
 //!
 //! # How a device with a private mechanism adopts this
 //!
@@ -167,6 +243,30 @@
 //! A frame, a button and a keystroke are all payloads. None of them needed a
 //! second mechanism.
 //!
+//! ## What a *new* device has to do to be covered
+//!
+//! Four things, and only the first two are about this module:
+//!
+//! 1. **Open the host object through
+//!    [`HostObjects`](crate::core::hosts::HostObjects)** — which a device does
+//!    already, through `Props::host`, or it has no way to reach the host at all.
+//! 2. **Ship a `channel()` and a `sink()` beside the `open()`**, in the same
+//!    module, so a caller can wire the two together without knowing what the
+//!    object is. This is the step that gets skipped: `chardev` has an `open`
+//!    and no pair, so the CLI's console is unrecorded while a test that writes
+//!    the two closures by hand records it fine. A pair is ten lines.
+//! 3. **Register a rewind hook if the object queues bytes the guest has not
+//!    read yet**, and none if it holds a level — a held-button mask is
+//!    architectural state the snapshot already carries.
+//! 4. **Call [`Recorder::post`] from wherever the host thread arrives**, and
+//!    never deliver directly. A device that keeps a private path for "when
+//!    there is no recorder" has two paths, and the recorded one is the one
+//!    nobody exercises.
+//!
+//! None of that is enforced. Step 2's absence is invisible — nothing fails, the
+//! recording is simply short — which is the argument for the seal being on by
+//! default rather than opt-in.
+//!
 //! # The recording is a file, so it is a parser
 //!
 //! [`InputLog::encode`] and [`InputLog::decode`] use `core::state`'s
@@ -179,6 +279,34 @@
 //! never panics, never allocates against a claimed count, and enforces the one
 //! canonical ordering it writes, exactly as the snapshot reader does. `fuzz/`
 //! carries a target for it.
+//!
+//! That shape was **written and never read** until
+//! [`Machine::set_recorder`](crate::machine::Machine::set_recorder) started
+//! diffing it: it overwrote the recorded shape with the machine's own, so the
+//! sentence above described an intent rather than a check. It is a check now —
+//! [`Recorder::shape`] is the accessor — and an empty shape still means unknown
+//! provenance rather than a mismatch, so a log built by hand replays.
+//!
+//! # Cross-host replay
+//!
+//! The property the format exists for, and the one nothing tested: a recording
+//! written here replays *elsewhere*. Two runs inside one process agreeing
+//! proves reproducibility on this host and nothing about any other, however
+//! many times it is asserted.
+//!
+//! What makes it checkable is pinning the artefact rather than re-deriving it.
+//! `tests/record_replay.rs` holds a frozen recording and the state hash it
+//! replays to as constants, so the comparison crosses processes, builds and
+//! machines; CI already runs the test suite on three operating systems and two
+//! instruction sets, which makes those three hosts without a line of CI
+//! change. It has been checked by hand on a 32-bit target too, which is the
+//! informative direction: `usize` is four bytes there, and neither the
+//! encoding nor the hash moves.
+//!
+//! Everything in the format is chosen for that: fixed-width little-endian
+//! integers, a `u128` of raw 2⁻⁶⁴-second units rather than a rounded
+//! nanosecond count, `BTreeMap` rather than a hash map, lengths as `u64` rather
+//! than `usize`, and no float anywhere near the time path.
 //!
 //! # Example
 //!
@@ -893,6 +1021,25 @@ impl Recorder {
     /// Record the machine's shape on the log, so a replay can check it.
     pub fn set_shape(&self, shape: MachineShape) {
         self.state.lock().log.set_shape(shape);
+    }
+
+    /// The shape the log carries: for a replay, the board the recording was
+    /// taken from.
+    ///
+    /// The half of "machine identity is a diff, not a boolean" that lives on
+    /// this side. A recording written by [`InputLog::encode`] has always
+    /// carried it; until
+    /// [`Machine::set_recorder`](crate::machine::Machine::set_recorder) read it
+    /// back, nothing ever compared it, and a recording of one board replayed
+    /// into another delivered its input to whatever device answered to the same
+    /// channel name.
+    ///
+    /// Empty for a log built by hand — a unit test, a fuzz case — which is why
+    /// the check is skipped rather than failed in that case: an empty shape is
+    /// *unknown provenance*, not a mismatch.
+    #[must_use]
+    pub fn shape(&self) -> MachineShape {
+        self.state.lock().log.shape().clone()
     }
 
     /// How many logged events have been replayed.

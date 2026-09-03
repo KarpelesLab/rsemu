@@ -33,6 +33,8 @@ See [The phase-2 gate](#the-phase-2-gate) for the exact command.
 | `flash_cfi`       | `dev::flash::cfi` — the NOR flash MMIO surface and its snapshot chunk | a program only ever clears bits |
 | `ir_verify`       | `ir::verify` over arbitrary blocks, then `ir::eliminate_dead_code` and `ir::Liveness` | never panics; a block the verifier accepts survives elimination and still verifies |
 | `riscv_lift`      | `cpu::riscv::lift` → `ir::verify` → `ir::Interp`, against `cpu::riscv`'s interpreter | the lifted block and the interpreter agree on registers, PC, ticks, memory and faults |
+| `record_log`      | `core::record::InputLog` — a recorded session, plus the replay path that reads it | never panics; canonical encoding; a replay cursor always advances |
+| `journal_log`     | `usermode::journal::Journal` — the second seam's recording, and the snapshot form that embeds it | never panics; canonical encoding; the two forms agree |
 
 ### `machine_parser`
 

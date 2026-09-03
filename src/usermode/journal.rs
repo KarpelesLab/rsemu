@@ -49,13 +49,85 @@
 //! `connect` is a return code and nothing. The consumer decides what the
 //! scalar means — it does not have to be an errno, and this module does not
 //! know that Linux exists.
+//!
+//! # Why this is not [`core::record`](crate::core::record), reviewed
+//!
+//! Two modules in one tree both call themselves "the record/replay seam", and
+//! that is worth being sure about rather than merely comfortable with. The
+//! review was done; the split stands; here is the argument from this side, and
+//! `core::record` carries the other half.
+//!
+//! Neither subsumes the other, because **each one's key is the other's
+//! check**:
+//!
+//! | | `core::record` | here |
+//! | --- | --- | --- |
+//! | key | `(instant, channel)` | position in the sequence |
+//! | the other field | a channel with no sink is skipped, and the run is still faithful | a tag that does not match is a divergence, reported at once |
+//! | who initiates | the host, whenever it likes | the guest, mid-instruction |
+//! | delivery | pushed into a sink at a round boundary | returned to the caller at the call site |
+//! | a payload's size | bounded — a keystroke, a frame | whatever the guest asked to `read` |
+//! | the cursor | derived: seek the log by instant | architectural: nothing else names the position |
+//!
+//! The tempting unification is that `Recorder::deliver` is itself a pull — the
+//! machine asks "what arrived?" once per round — so input could be journalled
+//! as one question per round boundary. It could, and it would be worse in three
+//! measurable ways. A recorded Apple 1 session is three events and would become
+//! one entry per scheduling round, millions of them, unless empty answers were
+//! elided — which is instant-keying, reintroduced. A round delivers *N*
+//! payloads across *M* channels, so the channel dimension would have to be
+//! re-encoded inside an answer's bytes. And a journal cannot skip a question:
+//! `rsemu replay` on a headless host with no terminal attached is a thing
+//! people do, and `core::record` supports it precisely because a missing sink
+//! costs nothing.
+//!
+//! The converse is worse still. A syscall answer keyed on an instant needs two
+//! syscalls never to share one, which no clock design promises; and a recorder
+//! has no way to *return* a value to a blocked caller, only to push into a
+//! sink.
+//!
+//! So the mechanisms stay two. What is **not** allowed to stay two is the file
+//! format, and that is what changed at this review:
+//! [`Journal::encode`] now writes a magic, a version and tagged entries exactly
+//! as [`InputLog::encode`](crate::core::record::InputLog::encode) does, and
+//! [`Journal::decode`] is held to the same parser contract with a fuzz target
+//! of its own. A session that has both ends up with two sections of one
+//! vocabulary rather than two file formats, which was always the stated goal
+//! and until now was only a claim.
+//!
+//! One thing a recording carries and this does not: a
+//! [`MachineShape`](crate::core::state::MachineShape). A recording needs one
+//! because a wrong board *silently accepts* input on a channel whose name
+//! happens to match. A journal needs none because a wrong program diverges at
+//! the first question whose tag or instant differs, which is a better check
+//! than a fingerprint and comes for free.
 
 use alloc::vec::Vec;
 
 use crate::core::clock::GlobalTime;
 use crate::core::error::{Error, Result};
-use crate::core::state::{Sink, Source};
+use crate::core::state::{Sink, SliceSource, Source};
 use crate::core::sync::{self, LockRank};
+
+/// Magic at the start of every journal recording.
+///
+/// Deliberately distinct from `core::record`'s `RSEMURPL`: the two seams write
+/// two sections of one vocabulary, not two spellings of one section, and a
+/// reader handed the wrong one should say so rather than mis-parse it.
+const MAGIC: [u8; 8] = *b"RSEMUJRN";
+
+/// The journal recording's container format version.
+///
+/// Independent of both `core::state`'s `FORMAT_VERSION` and `core::record`'s
+/// [`LOG_FORMAT_VERSION`](crate::core::record::LOG_FORMAT_VERSION), because the
+/// three framings change for three different reasons.
+pub const JOURNAL_FORMAT_VERSION: u32 = 1;
+
+/// Tag byte introducing one more answer.
+const TAG_ANSWER: u8 = 0x01;
+
+/// Tag byte marking the end of the answer list.
+const TAG_END: u8 = 0x00;
 
 /// What a journal does with the answers that pass through it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -273,29 +345,136 @@ impl Journal {
         }
     }
 
-    /// Write the log.
+    /// Encode the recording: the trace file `rsemu record` would produce and
+    /// `rsemu replay` would take (§2's binary surface).
     ///
-    /// This is the trace file `rsemu record` would produce, and the input
-    /// `rsemu replay` would take (§2's binary surface). The mode is not
-    /// written: it is what you are *doing* with a log, not part of one.
+    /// Framed exactly as [`InputLog::encode`](crate::core::record::InputLog::encode)
+    /// is — magic, a format version of its own, tagged entries, an end tag —
+    /// so the two seams write two *sections* rather than two file formats. See
+    /// the module documentation for what is deliberately different.
+    ///
+    /// Neither the mode nor the cursor is written. Both are what you are
+    /// *doing* with a recording rather than part of one, and a cursor baked
+    /// into a distributable file would make a replay start wherever the
+    /// recorder happened to stop. [`Journal::save`] is the other form, for a
+    /// consumer snapshotting a run in progress.
+    ///
+    /// # Errors
+    ///
+    /// Only if a sink write fails, which for the `Vec<u8>` used here it cannot.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let inner = self.inner.lock();
+        let mut out: Vec<u8> = Vec::new();
+        out.write_all(&MAGIC)?;
+        out.write_u32(JOURNAL_FORMAT_VERSION)?;
+        for entry in &inner.entries {
+            out.write_u8(TAG_ANSWER)?;
+            out.write_u128(entry.at)?;
+            out.write_u32(entry.tag)?;
+            out.write_u64(entry.answer.value)?;
+            out.write_bytes(&entry.answer.bytes)?;
+        }
+        out.write_u8(TAG_END)?;
+        Ok(out)
+    }
+
+    /// Decode a recording into a fresh journal, in [`JournalMode::Live`] with
+    /// the cursor at the start.
+    ///
+    /// A parser on untrusted input, held to `core::state`'s contract: it never
+    /// panics, never trusts a length it has not compared against the bytes
+    /// remaining, never allocates against a claimed count, and rejects anything
+    /// that is not the one canonical form [`Journal::encode`] writes.
+    ///
+    /// It does **not** check that instants are non-descending, and that is a
+    /// difference from a recording rather than an omission: the key here is the
+    /// *order the questions arrive in*, the instant is a check against it, and
+    /// nothing in the design says two threads must ask in clock order.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::State`] naming what was expected: a bad magic, an unsupported
+    /// format version, an unknown tag, or trailing bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Journal> {
+        let mut src = SliceSource::new(bytes);
+        let magic = src.take(MAGIC.len())?;
+        if magic != MAGIC {
+            return Err(Error::State(alloc::format!(
+                "not a journal recording: magic {magic:02x?}, expected {MAGIC:02x?}"
+            )));
+        }
+        let format = src.read_u32()?;
+        if format != JOURNAL_FORMAT_VERSION {
+            return Err(Error::State(alloc::format!(
+                "journal format version {format} (this build reads {JOURNAL_FORMAT_VERSION})"
+            )));
+        }
+        let mut entries = Vec::new();
+        loop {
+            match src.read_u8()? {
+                TAG_END => break,
+                TAG_ANSWER => {
+                    let at = src.read_u128()?;
+                    let tag = src.read_u32()?;
+                    let value = src.read_u64()?;
+                    // Borrowed and bounds-checked against the input before it
+                    // is copied, so a claimed length cannot become a large
+                    // allocation. There is no size *limit* on an answer, and
+                    // that too is a difference from a recording: a keystroke
+                    // and an Ethernet frame have a natural ceiling, and what a
+                    // guest asked to `read` does not.
+                    let bytes = src.read_bytes()?.to_vec();
+                    entries.push(Entry {
+                        at,
+                        tag,
+                        answer: Answer { value, bytes },
+                    });
+                }
+                tag => {
+                    return Err(Error::State(alloc::format!(
+                        "unknown tag 0x{tag:02x} in a journal recording (expected 0x00 or 0x01)"
+                    )));
+                }
+            }
+        }
+        if src.remaining() != 0 {
+            return Err(Error::State(alloc::format!(
+                "{} trailing byte(s) after the end of a journal recording",
+                src.remaining()
+            )));
+        }
+        let journal = Journal::new();
+        journal.inner.lock().entries = entries;
+        Ok(journal)
+    }
+
+    /// Write the log **and where replay has got to**, for a consumer
+    /// snapshotting a run in progress.
+    ///
+    /// The other half of the split [`Journal::encode`] describes: this is state
+    /// rather than a file, so it carries the cursor. It embeds the encoded
+    /// recording whole, the way a recording embeds a machine shape, so the two
+    /// forms cannot drift apart.
+    ///
+    /// Note what is *not* possible here and is in
+    /// [`core::record`](crate::core::record): re-deriving the cursor on load.
+    /// A recorder seeks its log by the restored instant, because an instant is
+    /// a key there. Here the key is sequence position, two answers may share an
+    /// instant, and nothing in the guest's state names the position — so the
+    /// cursor is genuinely architectural for this seam and derived for that
+    /// one.
     ///
     /// # Errors
     ///
     /// If the sink fails.
     pub fn save<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<()> {
-        let inner = self.inner.lock();
-        sink.write_u64(inner.cursor as u64)?;
-        sink.write_seq_len(inner.entries.len() as u64)?;
-        for entry in &inner.entries {
-            sink.write_u128(entry.at)?;
-            sink.write_u32(entry.tag)?;
-            sink.write_u64(entry.answer.value)?;
-            sink.write_bytes(&entry.answer.bytes)?;
-        }
-        Ok(())
+        let cursor = self.inner.lock().cursor as u64;
+        let encoded = self.encode()?;
+        sink.write_u64(cursor)?;
+        sink.write_bytes(&encoded)
     }
 
-    /// Read a log back, replacing whatever this one holds.
+    /// Read a log and its cursor back, replacing whatever this one holds.
     ///
     /// # Errors
     ///
@@ -303,19 +482,9 @@ impl Journal {
     /// end of the log.
     pub fn load<'a, S: Source<'a> + ?Sized>(&self, source: &mut S) -> Result<()> {
         let cursor = source.read_u64()? as usize;
-        let count = source.read_seq_len(36)?;
-        let mut entries = Vec::new();
-        for _ in 0..count {
-            let at = source.read_u128()?;
-            let tag = source.read_u32()?;
-            let value = source.read_u64()?;
-            let bytes = source.read_bytes()?.to_vec();
-            entries.push(Entry {
-                at,
-                tag,
-                answer: Answer { value, bytes },
-            });
-        }
+        let encoded = source.read_bytes()?;
+        let decoded = Journal::decode(encoded)?;
+        let entries = core::mem::take(&mut decoded.inner.lock().entries);
         if cursor > entries.len() {
             return Err(Error::State(alloc::format!(
                 "a replay cursor of {cursor} is past the {} recorded answer(s)",
