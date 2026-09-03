@@ -273,7 +273,12 @@ machine "pc-apic" {
   wire kbc.irq12   -> ioapic.irq12
 
   # The HPET's three comparators, on the inputs its `routeN` properties
-  # advertise.
+  # advertise. The legacy replacement route — `LEG_RT_CNF` putting comparators
+  # 0 and 1 on IRQ0 and IRQ8 in place of the 8254 and the RTC — is a gate on
+  # the board and `machines/q35-linux.machine` builds it, out of `pc.hpet`'s
+  # `legacy` output pin and the §4.3 combinators. It is left out here for the
+  # reason `machines/pc-at.machine` writes out at the same place: nothing that
+  # runs on this board sets the bit.
   wire hpet0.t0    -> ioapic.irq20
   wire hpet0.t1    -> ioapic.irq21
   wire hpet0.t2    -> ioapic.irq22

@@ -20,57 +20,55 @@
 //!
 //! RSEMU_KERNEL=/boot/vmlinuz \
 //! RSEMU_INITRD=testdata/x86/initramfs-x86.cpio \
-//! RSEMU_KERNEL_CMDLINE='console=ttyS0,115200 nokaslr cryptomgr.notests noapic' \
-//! RSEMU_KERNEL_MS=2500000 \
+//! RSEMU_KERNEL_MS=3000000 \
 //! RSEMU_KERNEL_INPUT='rsemu# =>head -c 40 /dev/nvme0n1\n' \
 //! RSEMU_KERNEL_STOP_AT='rsemu q35-linux nvme namespace' \
 //!     cargo test --release --features machine-q35-linux --test q35_linux -- --nocapture
 //! ```
 //!
-//! **`noapic` is still on that command line**, and what it is standing in for
-//! has moved. Measured with a 6.6 kernel:
+//! **There is no `RSEMU_KERNEL_CMDLINE` on that command any more.** The board's
+//! own default line is what the kernel gets, and it carries no `nolapic`, no
+//! `noapic` and no `hpet=disable`. Measured with a 6.6 kernel, that line now
+//! takes the symmetric I/O path all the way through `check_timer()`:
 //!
-//! * With `noapic` — the local APIC and its timer in use, interrupt lines
-//!   through the 8259A — the kernel now boots the whole way: every initcall,
-//!   `nvme nvme0: pci function 0000:00:04.0`, the admin queue, an I/O queue
-//!   pair (`1/0/0 default/read/poll queues`), and then the panic a run with no
-//!   initramfs has to end on, `VFS: Unable to mount root fs`. Two defects had
-//!   to go for that: `CC`'s field positions (the `#[ignore]`d ledger entry
-//!   below, now un-ignored and passing) and an acknowledge cycle that reached
-//!   the 8259A instead of the local APIC that was actually asserting
-//!   (`src/dev/pc/imcr.rs`).
-//! * With the board's **default** command line — symmetric I/O mode, the tick
-//!   routed through the I/O APIC — it still stops at
-//!   `..MP-BIOS bug: 8254 timer not connected to IO-APIC` and then
-//!   `Kernel panic - not syncing: IO-APIC + timer doesn't work!`.
+//! ```text
+//! APIC: Switch to symmetric I/O mode setup
+//! ..TIMER: vector=0x30 apic1=0 pin1=2 apic2=-1 pin2=-1
+//! tsc: PIT calibration matches HPET. 1 loops
+//! ```
 //!
-//! That last one is **not** the two APIC device models, which is where it was
-//! first filed. `tests/pc_apic.rs` now drives all three of the paths it was
-//! blamed on — a local APIC timer in periodic mode, an edge-triggered
-//! redirection entry, and the 8254 itself on I/O APIC input 2 through an
-//! edge-triggered entry — and every one of them delivers, on a board with the
-//! same wiring. The same firmware sequence the kernel performs, run on the
-//! `q35` board itself, takes its interrupts too.
+//! with no `..MP-BIOS bug: 8254 timer not connected to IO-APIC` and no
+//! `Kernel panic - not syncing: IO-APIC + timer doesn't work!` after it.
 //!
-//! What is missing is a **route**, not a delivery. `pc.hpet` advertises
-//! `LEG_RT_CAP`, so Linux takes the legacy replacement route: `hpet_enable`
-//! registers the HPET as the global clock event, sets `LEG_RT_CNF`, and from
-//! then on expects **HPET timer 0** on IRQ0 — the 8259A's `IR0` and I/O APIC
-//! input 2 — with the 8254 disconnected. This board wires `hpet0.t0` to
-//! `ioapic.irq16` and leaves `pc.hpet`'s `legacy` output pin unconnected, so
-//! while that bit is set nothing at all drives IRQ0, the 8254 included. Hence
-//! `..MP-BIOS bug: 8254 timer not connected to IO-APIC` — a literally accurate
-//! complaint — and then all three fallbacks failing, because every one of them
-//! is another way of asking for IRQ0.
+//! What that panic had been was **a missing route, not a missing delivery**,
+//! and it was in this board's own machine file rather than in either APIC.
+//! `pc.hpet` advertises `LEG_RT_CAP`, so `hpet_enable()` takes the legacy
+//! replacement route: it registers the HPET as the global clock event, sets
+//! `LEG_RT_CNF`, and — the half that matters — Linux therefore never calls
+//! `pit_timer_init()`, because `hpet_time_init()` programs the 8254 only when
+//! `hpet_enable()` fails. From then on the tick is supposed to arrive from HPET
+//! comparator 0 on IRQ0, which is the 8259A's `IR0` and I/O APIC input 2. The
+//! board wired `hpet0.t0` to `ioapic.irq16` and left the `legacy` pin
+//! unconnected, so counter 0 was never loaded and comparator 0 was elsewhere:
+//! nothing at all drove IRQ0, and all three of the kernel's fallbacks failed
+//! because every one of them is another way of asking for it.
 //!
-//! Adding **`hpet=disable`** to the command line above proves it: Linux falls
-//! back to `pit_timer_init`, programs the 8254 itself, and the same run gets
-//! through `..TIMER: vector=0x30 apic1=0 pin1=2` with no `MP-BIOS bug` line and
-//! goes on booting. The fix is the board's — `pc.hpet`'s module documentation
-//! writes out the `wire.not`/`wire.and` gating a machine file needs — and it is
-//! what stands between this board and a default command line with nothing on
-//! it. [`docs/platforms/q35-linux.md`](../docs/platforms/q35-linux.md) is where
-//! the ledger lives.
+//! `machines/q35-linux.machine` now builds the multiplexer §2.3.5 describes out
+//! of one `wire.not` and five `wire.and`s.
+//! [`docs/platforms/q35-linux.md`](../docs/platforms/q35-linux.md) has the
+//! whole ledger, including the two items that were refuted rather than fixed.
+//!
+//! **Where it stops today** is two places, and the doc has both. On the default
+//! line the boot reaches `nvme 0000:00:04.0: enabling device` and then the
+//! worker inside `request_threaded_irq` stops making forward progress — the
+//! sampled `RIP` never moves again. Adding `noapic` — the same board, the same
+//! image, the 8259A pair driving `INTR` through the IMCR — gets through that
+//! and all the way to `Run /init as init process` and a busybox shell, which is
+//! what says the remaining gap is in the I/O APIC path rather than in the
+//! controller or the driver. What that run then finds is the *other* stop:
+//! `nvme nvme0: Identify Descriptors failed (nsid=1, status=0x2)`, the model
+//! refusing `Identify` with `CNS = 03h`, so no namespace is published and
+//! `/dev/nvme0n1` does not exist. That one is `src/dev/nvme`.
 //!
 //! | Variable | What it does |
 //! | --- | --- |
@@ -276,6 +274,122 @@ fn the_board_comes_up_in_acpi_mode_because_no_firmware_can_put_it_there() {
     // PMBASE is 0x600 and PM1_CNT is at offset 4 (ICH9 Table 13-11).
     let cnt = read32(port, 0x604);
     assert_eq!(cnt & 1, 1, "PM1_CNT.SCI_EN, ICH9 §13.8.3.3");
+}
+
+/// `LEG_RT_CNF` takes IRQ0 off the 8254 and gives it to HPET comparator 0.
+///
+/// This is the board's own multiplexer, asked without a kernel. The kernel boot
+/// at the bottom of this file exercises it too, but that one is gated on
+/// `RSEMU_KERNEL` and takes five minutes; this asks the same question of the
+/// shipped machine file in a few milliseconds of virtual time, and it is what
+/// stands between the wiring and a quiet deletion.
+///
+/// The observable is the master 8259A's **interrupt request register**, which a
+/// read of port 0x20 returns when the last OCW3 did not select ISR. It latches
+/// a request whether or not the line is masked, which is what makes it usable
+/// here: nothing has to be allowed through to the processor, and the
+/// processor's own interrupt flag is clear throughout.
+///
+/// Sources: IA-PC HPET Specification rev 1.0a §2.3.5 for what the bit selects,
+/// the Intel 8254 data sheet for mode 2, and the 8259A data sheet for OCW3.
+#[test]
+fn the_legacy_replacement_route_moves_irq0_from_the_8254_to_the_hpet() {
+    /// The HPET's general configuration register, and its two bits.
+    const HPET_CONF: u64 = 0xfed0_0010;
+    const HPET_ENABLE: u64 = 1 << 0;
+    const HPET_LEGACY: u64 = 1 << 1;
+    /// Comparator 0's configuration register, its enable, and the comparator.
+    const HPET_T0_CONF: u64 = 0xfed0_0100;
+    const HPET_T0_ENABLE: u64 = 1 << 2;
+    const HPET_T0_COMPARATOR: u64 = 0xfed0_0108;
+    /// The main counter.
+    const HPET_COUNTER: u64 = 0xfed0_00f0;
+    /// How many counts of each timer one half of this test waits for.
+    const BUDGET_NS: u64 = 5_000_000;
+
+    let mut m = bare_board();
+
+    // Put the master 8259A into a known state. The initialization sequence also
+    // recomputes the request register from the pins it can see, which is how
+    // this test drops a latched request between the two halves below — an
+    // 8259A has no other way to lower one without an acknowledge cycle.
+    let init_master = |m: &Machine| {
+        let port = m.space("port").expect("the board declares `port`");
+        for (at, value) in [
+            (0x20u64, 0x11u64), // ICW1: edge triggered, ICW4 to follow
+            (0x21, 0x08),       // ICW2: vector base
+            (0x21, 0x04),       // ICW3: a slave on IR2
+            (0x21, 0x01),       // ICW4: 8086 mode
+            (0x21, 0xff),       // OCW1: every line masked, which IRR ignores
+        ] {
+            port.write(at, Width::U8, value, MemAttrs::DEFAULT)
+                .expect("the master 8259A decodes 0x20 and 0x21");
+        }
+    };
+    let irr = |m: &Machine| {
+        m.space("port")
+            .expect("the board declares `port`")
+            .read(0x20, Width::U8, MemAttrs::DEFAULT)
+            .expect("a read of port 0x20 answers with IRR") as u8
+    };
+    let poke = |m: &Machine, at: u64, value: u64| {
+        m.space("mem")
+            .expect("the board declares `mem`")
+            .write(at, Width::U32, value, MemAttrs::DEFAULT)
+            .unwrap_or_else(|e| panic!("write of {at:#x} faulted: {e:?}"));
+    };
+
+    // -- the line as it is on every PC that has ever booted -------------------
+    //
+    // Counter 0 in mode 2 at a rate that gives several periods inside the
+    // budget: the 8254 runs at 105/88 MHz, so 1000 counts is about 838
+    // microseconds.
+    init_master(&m);
+    assert_eq!(irr(&m) & 1, 0, "nothing has asked for IRQ0 yet");
+    {
+        let port = m.space("port").expect("the board declares `port`");
+        for (at, value) in [(0x43u64, 0x34u64), (0x40, 1000 & 0xff), (0x40, 1000 >> 8)] {
+            port.write(at, Width::U8, value, MemAttrs::DEFAULT)
+                .expect("the 8254 decodes 0x40-0x43");
+        }
+    }
+    let _ = m.run_for(GlobalTime::from_nanos(BUDGET_NS));
+    assert_eq!(
+        irr(&m) & 1,
+        1,
+        "with LEG_RT_CNF clear the 8254's counter 0 owns IRQ0"
+    );
+
+    // -- and the line once the HPET takes it over -----------------------------
+    //
+    // `LEG_RT_CNF` set, the counter left running exactly as it was. The 8254 is
+    // now disconnected, so a fresh initialization must find nothing on IR0 and
+    // must still find nothing after several more of the counter's periods.
+    poke(&m, HPET_CONF, HPET_ENABLE | HPET_LEGACY);
+    init_master(&m);
+    assert_eq!(irr(&m) & 1, 0, "the initialization dropped the latch");
+    let _ = m.run_for(GlobalTime::from_nanos(BUDGET_NS));
+    assert_eq!(
+        irr(&m) & 1,
+        0,
+        "the 8254 is still counting and must no longer reach IRQ0"
+    );
+
+    // Comparator 0, one shot, a hundred microseconds out: a 10 MHz counter, so
+    // 1000 ticks. This is the half that says the HPET has the line rather than
+    // that nobody has it.
+    let now = u64::from(read32(
+        m.space("mem").expect("the board declares `mem`"),
+        HPET_COUNTER,
+    ));
+    poke(&m, HPET_T0_COMPARATOR, now + 1000);
+    poke(&m, HPET_T0_CONF, HPET_T0_ENABLE);
+    let _ = m.run_for(GlobalTime::from_nanos(BUDGET_NS));
+    assert_eq!(
+        irr(&m) & 1,
+        1,
+        "with LEG_RT_CNF set comparator 0 drives IRQ0, and nothing else does"
+    );
 }
 
 /// The controller is on the bus at the address the machine file names, and it

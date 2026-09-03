@@ -605,12 +605,18 @@ machine "pc-at" {
   #
   # What is *not* here is the legacy replacement route. Setting `LEG_RT_CNF` on
   # a real board disconnects the 8254 from IRQ0 and the RTC from IRQ8 and puts
-  # HPET timers 0 and 1 there instead — a gate between three chips, which is
-  # neither a register in the HPET nor one in the 8259A. The gates exist now
-  # (`wire.and` and `wire.not` are ordinary objects, ROADMAP.md §4.3), but the
-  # HPET has no output pin saying whether the bit is set, so there is nothing to
-  # wire their enable to. That pin is the remaining piece; until it exists the
-  # bit reads back and does nothing, which is what `pc.hpet` documents.
+  # HPET comparators 0 and 1 there instead — a gate between three chips, which
+  # is neither a register in the HPET nor one in the 8259A. Every piece of that
+  # now exists: `wire.and` and `wire.not` are ordinary objects (ROADMAP.md
+  # §4.3) and `pc.hpet` drives a `legacy` output pin reporting the bit, and
+  # `machines/q35-linux.machine` is the board that wires the whole multiplexer
+  # up, because a Linux kernel on it takes that route and stops dead without it.
+  #
+  # It is deliberately **not** wired here. Nothing that runs on an AT touches
+  # `LEG_RT_CNF` — this board's guest is its own firmware and DOS — so the
+  # gates would be six objects no test could reach, and each one is a device in
+  # the snapshot shape. Copy the block out of `q35-linux` the day a guest here
+  # sets the bit; until then the bit reads back and moves nothing.
   wire hpet0.t0    -> ioapic.irq20
   wire hpet0.t1    -> ioapic.irq21
   wire hpet0.t2    -> ioapic.irq22

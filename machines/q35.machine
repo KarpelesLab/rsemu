@@ -516,6 +516,12 @@ machine "q35" {
   wire com1.irq    -> pic1.ir4
   wire com1.irq    -> ioapic.irq4
 
+  # The HPET's three comparators. The legacy replacement route is not gated
+  # here — `machines/q35-linux.machine` is the board that needs it, because the
+  # kernel it carries sets `LEG_RT_CNF` and then expects comparator 0 on IRQ0;
+  # this board's guest is a firmware that never touches the register. That file
+  # has the multiplexer, built out of `pc.hpet`'s `legacy` pin and the §4.3
+  # combinators, and it is a block to copy rather than a thing to invent.
   wire hpet0.t0    -> ioapic.irq16
   wire hpet0.t1    -> ioapic.irq17
   wire hpet0.t2    -> ioapic.irq18

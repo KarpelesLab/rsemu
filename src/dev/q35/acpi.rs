@@ -878,10 +878,13 @@ pub fn madt(facts: &MachineFacts, cfg: &TableConfig) -> Option<Vec<u8>> {
         // Table 5.24: type 1, length 12.
         table.u8(1).u8(12).u8(cfg.ioapic_id).u8(0);
         table.u32(ioapic as u32).u32(cfg.gsi_base);
-        // Table 5.25: the 8254's output reaches input 2 rather than input 0,
-        // which the board's own `wire pit0.out0 -> ioapic.irq2` is the other
-        // half of. Without this entry an operating system loses its timer tick
-        // the moment it stops using the 8259A.
+        // Table 5.25: ISA IRQ0 reaches I/O APIC input 2 rather than input 0,
+        // which the board's own wiring onto `ioapic.irq2` is the other half of.
+        // Which *chip* drives it is not this entry's business and deliberately
+        // so: on `machines/q35-linux.machine` the HPET's `LEG_RT_CNF` swaps
+        // comparator 0 in for the 8254 there, and the offset is the same either
+        // way. Without this entry an operating system loses its timer tick the
+        // moment it stops using the 8259A.
         table.u8(2).u8(10).u8(0).u8(0);
         table.u32(cfg.gsi_base + 2);
         // Table 5.26: `00b` polarity and `00b` trigger mode, conforming to the
