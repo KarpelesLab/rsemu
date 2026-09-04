@@ -33,9 +33,17 @@
 //! | `RSEMU_OVMF_EXPECT` | a string the guest must have printed for the test to pass. |
 //! | `RSEMU_OVMF_INPUT` | `marker=>text` steps, one per line, typed at the console. |
 //! | `RSEMU_KERNEL_TRACE` | print where the processor is once per virtual millisecond. Shared with the kernel boots, because the run loop is. |
+//! | `RSEMU_ENGINE` | `interp`, `jit` or `jit-host`, overriding the machine file. |
+//! | `RSEMU_OVMF_DISASM` | a comma-separated list of guest addresses to disassemble after the run — for the address a firmware's own exception dump names. |
+//! | `RSEMU_OVMF_PROBE` | replay the boot and report the first exception the firmware takes, with the frame the processor pushed. Costs a second boot. |
+//! | `RSEMU_OVMF_PROBE_MS` | how far back that replay switches to one-instruction stepping (default 150). |
 //!
 //! **Everything printed as evidence is a byte the guest itself wrote to COM1.**
 //! The firmware is run, never read (`ROADMAP.md` §1).
+//!
+//! What it gets to is in [`docs/platforms/q35-uefi.md`](../docs/platforms/q35-uefi.md):
+//! a UEFI Shell prompt that answers what is typed at it, on all three engines,
+//! at the same virtual instant.
 
 #![cfg(all(
     feature = "cpu-x86",
@@ -82,7 +90,15 @@ fn bindings(cpus: &Arc<Captured<X86>>) -> Bindings {
     let mut b = rsemu::machine::catalog::bindings().expect("this build's bindings");
     let kept = Arc::clone(cpus);
     b.replace("cpu.x86", move |props| {
-        let cpu = Arc::new(X86::from_props_defaulting(props, Variant::X86_64)?);
+        // `RSEMU_ENGINE` overrides the machine file's `engine = "interp"`, the
+        // same way `tests/q35_linux.rs` does it and for the same reason: the
+        // three engines are a speed knob and never a semantic one
+        // (`ROADMAP.md` §0), and a whole UEFI boot is the widest thing there is
+        // to say so on.
+        let cpu = Arc::new(x86boot::with_engine_from_env(X86::from_props_defaulting(
+            props,
+            Variant::X86_64,
+        )?));
         kept.push(&cpu);
         Ok(cpu)
     });
@@ -322,7 +338,7 @@ fn a_uefi_firmware_from_the_environment_reaches_its_console() {
         TOP - (code.len() + vars.len()) as u64
     );
 
-    let (mut m, cpu, console) = match board(code, vars, &params) {
+    let (mut m, cpu, console) = match board(code.clone(), vars.clone(), &params) {
         Ok(built) => built,
         Err(e) => panic!("the board does not realize: {e}"),
     };
@@ -342,6 +358,8 @@ fn a_uefi_firmware_from_the_environment_reaches_its_console() {
     );
     x86boot::report("q35-uefi", &m, &cpu, &run, &script);
     report_chipset(&m);
+    report_disassembly(&m, &cpu);
+    probe_first_exception(&params, run.at);
     write_back_the_variable_store(&m);
     assert_reached_uefi(&run, &script);
 }
@@ -349,18 +367,23 @@ fn a_uefi_firmware_from_the_environment_reaches_its_console() {
 /// What a run of a UEFI firmware has to have shown to count.
 ///
 /// `x86boot::assert_booted` is the kernel's version of this and looks for
-/// `Linux version`. A firmware cannot be held to that, and the reason is worth
-/// stating rather than working around: **a `RELEASE` EDK II says nothing at all
-/// until its console driver comes up**, and its `DEBUG()` output goes to I/O
-/// port `0x402` behind a detect that this board fails, so a run that gets most
-/// of the way through DXE and a run that faulted in SEC print the same nothing.
-/// `docs/platforms/q35-uefi.md` has that ledger and what would change it.
+/// `Linux version`. A firmware cannot be held to a fixed string, because what
+/// it prints is the *build's* choice: a `RELEASE` EDK II says nothing at all
+/// until its console driver comes up, and its `DEBUG()` output goes to I/O port
+/// `0x402` behind a detect that this board fails.
 ///
-/// So the standing assertion is the one that is falsifiable today: the reset
+/// So the standing assertions are the two that hold for any image. The reset
 /// vector executed out of the flash and the processor reached **long mode**,
 /// which is SEC's whole job and which nothing but a working code bank can
-/// produce. `RSEMU_OVMF_EXPECT` adds a string the guest must have printed, for
-/// the day one does.
+/// produce; and the guest **said something on COM1**, which for an `OvmfPkg`
+/// build means BDS reached the terminal `PlatformBootManagerLib` puts on the
+/// serial port. That second one was not assertable until the exception path
+/// worked — `docs/platforms/q35-uefi.md` has the three architectural gaps that
+/// stood between this board and its shell, and the ledger of what is left.
+///
+/// `RSEMU_OVMF_EXPECT` adds a string the guest must have printed, and
+/// `RSEMU_OVMF_STOP_AT` with `RSEMU_OVMF_INPUT` turns the run into a
+/// conversation.
 fn assert_reached_uefi(run: &x86boot::Run, script: &Script) {
     assert!(
         run.protected,
@@ -375,13 +398,13 @@ fn assert_reached_uefi(run: &x86boot::Run, script: &Script) {
             run.text.contains(&want),
             "the guest never printed RSEMU_OVMF_EXPECT ({want:?})"
         );
-    } else if run.text.is_empty() {
-        println!(
-            "q35-uefi: the firmware printed nothing on COM1, which a RELEASE EDK II does until \
-             its console driver loads; docs/platforms/q35-uefi.md says how far it got and what \
-             stopped it"
-        );
     }
+    assert!(
+        !run.text.is_empty(),
+        "the firmware printed nothing on COM1; it never reached the terminal \
+         PlatformBootManagerLib puts on the serial port, and \
+         docs/platforms/q35-uefi.md says what that has meant before"
+    );
     assert_eq!(
         run.typed,
         script.steps.len(),
@@ -490,6 +513,16 @@ fn report_chipset(m: &Machine) {
         mem.read(0xfee0_00f0, Width::U32, MemAttrs::DEBUG)
             .unwrap_or(!0)
     );
+    // The task-priority register, which **is** `CR8` (SDM Vol 3A §11.8.6.1):
+    // the processor has no copy of its own, so this one byte is what a
+    // `MOV CR8` left behind and what a `MOV RAX, CR8` would read back. Zero
+    // here after a run that took an exception is itself a fact — EDK II's
+    // `CommonInterruptEntry` saves `CR8` and restores it.
+    println!(
+        "q35-uefi:   local APIC TPR  = {:#010x}",
+        mem.read(0xfee0_0080, Width::U32, MemAttrs::DEBUG)
+            .unwrap_or(!0)
+    );
     // And the flash: how many bytes of the variable store are no longer erased
     // is what says whether the variable driver ever wrote one.
     let length = |var: &str| -> u64 {
@@ -523,4 +556,222 @@ fn report_chipset(m: &Machine) {
         "q35-uefi:   variable store  = {programmed} byte(s) programmed ({shipped} as shipped), \
          log ends at {last:#08x}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// naming what stopped it
+// ---------------------------------------------------------------------------
+
+/// The first exception the firmware takes, and the instruction that raised it.
+///
+/// Opt-in through `RSEMU_OVMF_PROBE`, because it costs a second boot.
+///
+/// A `RELEASE` EDK II says nothing on any console this board has, so the only
+/// way to name what stopped it is to watch the processor. The trouble is that
+/// an exception whose handler faults on itself **destroys the evidence**: the
+/// recursion pushes frames until the stack walks out of the identity map, and
+/// on the way down it writes over the handler it was executing, so the
+/// post-mortem's disassembly at `RIP` is nonsense and the vector is lost.
+///
+/// So this re-runs the board — the machine is deterministic, which is what
+/// makes a second run the same run — up to `RSEMU_OVMF_PROBE_MS` (default 150)
+/// virtual milliseconds before the first run stopped making progress, and from
+/// there advances **one processor clock at a time**, reading the guest's own
+/// interrupt descriptor table whenever the register moves.
+///
+/// What it prints when the processor lands on one of that table's gates is the
+/// **frame the processor just pushed**, not the sample before it. The frame is
+/// the processor's own account of the fault — the faulting `CS:RIP`, the error
+/// code, the flags and the stack pointer — and it is right even when several
+/// instructions ran between two samples, which the sample before it is not.
+fn probe_first_exception(params: &[(&str, String)], stopped: GlobalTime) {
+    if std::env::var("RSEMU_OVMF_PROBE").is_err() {
+        return;
+    }
+    let (Ok(code_path), vars_path) = (
+        std::env::var("RSEMU_OVMF_CODE"),
+        std::env::var("RSEMU_OVMF_VARS").ok(),
+    ) else {
+        return;
+    };
+    let code = std::fs::read(&code_path).unwrap_or_default();
+    let vars = vars_path
+        .and_then(|p| std::fs::read(p).ok())
+        .unwrap_or_default();
+    let window: u64 = std::env::var("RSEMU_OVMF_PROBE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(150);
+    let Ok((mut m, cpu, _console)) = board(code, vars, params) else {
+        return;
+    };
+    let fine_from = stopped.as_nanos().saturating_sub(window * 1_000_000);
+    println!(
+        "q35-uefi: probe: replaying to {} ms, then one clock at a time",
+        fine_from / 1_000_000
+    );
+    while m.now().as_nanos() < fine_from {
+        if m.run_for(GlobalTime::from_nanos(1_000_000)).is_err() {
+            return;
+        }
+    }
+    /// How many exceptions to report before giving up on the run.
+    ///
+    /// One is the interesting number when a handler works; when it does not,
+    /// the second and third say so — and the first is still the one that
+    /// names what the firmware could not do.
+    const PROBE_DEPTH: usize = 4;
+
+    // One processor clock at 25 MHz. Every instruction costs at least one, and
+    // a core that has overspent its slice is held off until virtual time
+    // catches up — so no instruction boundary goes unsampled.
+    //
+    // Reached through `step_until` rather than `run_for`, and the difference is
+    // the whole probe: `run_for` **declines to split a scheduler round**, so a
+    // forty-nanosecond span inside a one-millisecond quantum runs the whole
+    // quantum and steps over everything in it. `step_until` is the debugger's
+    // entry point and cuts the round, which is what makes one sample one
+    // instruction.
+    const CLOCK_NS: u64 = 40;
+
+    let mut gates: Vec<u64> = Vec::new();
+    let mut table = (0u64, 0u32);
+    let mut prev = cpu.regs();
+    let mut inside = false;
+    let mut seen = 0usize;
+    while m.now() < stopped {
+        let next = GlobalTime::from_nanos(m.now().as_nanos() + CLOCK_NS);
+        if m.step_until(next).is_err() {
+            break;
+        }
+        let regs = cpu.regs();
+        if regs.rip == prev.rip && regs.rsp == prev.rsp {
+            continue;
+        }
+        // Borrowed inside the loop rather than outside it: stepping takes the
+        // machine by `&mut`, so a space held across the call would not compile.
+        let mem = m.space("mem").expect("the board declares `mem`");
+        let sys = cpu.sys();
+        if (sys.idtr.base, sys.idtr.limit) != table {
+            table = (sys.idtr.base, sys.idtr.limit);
+            gates = read_gates(&cpu, mem, table.0, table.1);
+        }
+        let hit = gates.iter().position(|gate| *gate == regs.rip);
+        if let Some(vector) = hit
+            && !inside
+        {
+            // The frame the processor has just pushed, which is the only
+            // account of the fault that survives: `RIP` in the sample before
+            // this one is the instruction that raised it *if* nothing else ran
+            // in between, and the frame says so without the *if*.
+            //
+            // Five or six eight-byte words, low to high: an error code for the
+            // vectors that have one, then `RIP`, `CS`, `RFLAGS`, `RSP`, `SS`
+            // (*Intel SDM* volume 3A §6.14.2 — long mode pushes `SS:RSP`
+            // whether or not the privilege level changed).
+            let word = |i: u64| -> u64 {
+                let at = regs.rsp + i * 8;
+                cpu.translate_debug(at)
+                    .phys(at)
+                    .and_then(|pa| mem.read(pa, Width::U64, MemAttrs::DEBUG).ok())
+                    .unwrap_or(0)
+            };
+            let has_error = matches!(vector, 8 | 10..=14 | 17 | 21 | 29 | 30);
+            let base = u64::from(has_error);
+            let (faulted, cs, rflags, rsp) =
+                (word(base), word(base + 1), word(base + 2), word(base + 3));
+            println!(
+                "q35-uefi: probe: {} ms: vector {vector} at handler {:#x}, faulting \
+                 {cs:#x}:{faulted:#x} err {:#x} rflags {rflags:#x} rsp {rsp:#x} cr2 {:#x}",
+                m.now().as_nanos() / 1_000_000,
+                regs.rip,
+                if has_error { word(0) } else { 0 },
+                sys.cr2
+            );
+            for line in cpu.disassemble(cs as u16, faulted, 1) {
+                println!("q35-uefi: probe:   {line}");
+            }
+            if let Some(pa) = cpu.translate_debug(faulted).phys(faulted) {
+                let hex: Vec<String> = (0..16)
+                    .map(|i| {
+                        mem.read(pa + i, Width::U8, MemAttrs::DEBUG)
+                            .map_or_else(|_| "??".to_string(), |b| format!("{b:02x}"))
+                    })
+                    .collect();
+                println!("q35-uefi: probe:   bytes {}", hex.join(" "));
+            }
+            println!(
+                "q35-uefi: probe:   the sample before it was {:#x}:{:#x} with rsp {:#x}",
+                prev.cs, prev.rip, prev.rsp
+            );
+            seen += 1;
+            // A handler that faults on itself is the interesting shape, so a
+            // few more are printed before the run is abandoned: the first
+            // frame names what the firmware could not do, and the second names
+            // what its handler could not do about it.
+            if seen >= PROBE_DEPTH {
+                return;
+            }
+        }
+        inside = hit.is_some();
+        prev = regs;
+    }
+    println!("q35-uefi: probe: no exception was taken in the window");
+}
+
+/// The entry point of each of the first thirty-two interrupt gates, read out of
+/// the guest's own table.
+///
+/// A 64-bit gate is sixteen bytes and its offset is split into three: bytes
+/// 0-1, bytes 6-7 and bytes 8-11 (*Intel SDM* volume 3A §6.14.1).
+fn read_gates(cpu: &X86, mem: &AddressSpace, base: u64, limit: u32) -> Vec<u64> {
+    let count = (u64::from(limit) + 1) / 16;
+    (0..count.min(32))
+        .map(|vector| {
+            let at = base + vector * 16;
+            let Some(pa) = cpu.translate_debug(at).phys(at) else {
+                return 0;
+            };
+            let read = |offset: u64, width: Width| {
+                mem.read(pa + offset, width, MemAttrs::DEBUG).unwrap_or(0)
+            };
+            read(0, Width::U16) | (read(6, Width::U16) << 16) | (read(8, Width::U32) << 32)
+        })
+        .collect()
+}
+
+/// Disassemble whatever `RSEMU_OVMF_DISASM` names, after the run.
+///
+/// A comma-separated list of guest addresses, hexadecimal. It exists because a
+/// firmware that *does* reach a console names its own faulting address and then
+/// keeps running: EDK II's exception handler prints `RIP - 00000000080C655D`
+/// and dead-loops, so the instruction is still sitting in memory when the run
+/// ends and there is nothing to catch in the act. Reading it back is a whole
+/// probe cheaper than replaying the boot.
+fn report_disassembly(m: &Machine, cpu: &X86) {
+    let Ok(list) = std::env::var("RSEMU_OVMF_DISASM") else {
+        return;
+    };
+    let mem = m.space("mem").expect("the board declares `mem`");
+    let cs = cpu.regs().cs;
+    for item in list.split(',').filter(|s| !s.trim().is_empty()) {
+        let text = item.trim().trim_start_matches("0x");
+        let Ok(at) = u64::from_str_radix(text, 16) else {
+            println!("q35-uefi: RSEMU_OVMF_DISASM: {item:?} is not a hexadecimal address");
+            continue;
+        };
+        println!("q35-uefi: what is at {at:#x}:");
+        for line in cpu.disassemble(cs, at, 6) {
+            println!("q35-uefi:   {line}");
+        }
+        if let Some(pa) = cpu.translate_debug(at).phys(at) {
+            let hex: Vec<String> = (0..24)
+                .map(|i| {
+                    mem.read(pa + i, Width::U8, MemAttrs::DEBUG)
+                        .map_or_else(|_| "??".to_string(), |b| format!("{b:02x}"))
+                })
+                .collect();
+            println!("q35-uefi:   bytes {}", hex.join(" "));
+        }
+    }
 }
