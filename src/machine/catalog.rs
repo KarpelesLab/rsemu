@@ -325,6 +325,26 @@ pub static Q35_LINUX: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/q35-linux.machine"),
 };
 
+/// The q35 chipset with **two banks of NOR flash** where the ROM socket was.
+///
+/// [`Q35`]'s board, with the `pc.rom` sockets replaced by a read-only firmware
+/// bank and a writable variable store, both `flash.cfi`, both ending at the top
+/// of the address space so that the last sixteen bytes of the code bank are the
+/// reset vector. That is the layout a split UEFI build — an OVMF `_CODE.fd`
+/// beside its `_VARS.fd` — is compiled for, and it is the same arrangement
+/// [`RISCV_VIRT`] already boots EDK II from one architecture over.
+///
+/// **No firmware is shipped and none can be.** `--flash0` and `--flash1` bind
+/// the two banks; `docs/platforms/q35-uefi.md` says where a run of one gets to.
+#[cfg(feature = "machine-q35-uefi")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-q35-uefi")))]
+pub static Q35_UEFI: CatalogEntry = CatalogEntry {
+    name: "q35-uefi",
+    summary: "a q35 that boots UEFI: ECAM, ICH9, APICs, HPET, and two NOR flash banks below 4 GiB",
+    media: &["flash0", "flash1"],
+    source: include_str!("../../machines/q35-uefi.machine"),
+};
+
 /// A PC with a long-mode processor and a kernel loaded straight into it.
 ///
 /// No firmware, no boot loader, no disk: a `bzImage` bound to the `kernel`
@@ -608,6 +628,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&Q35);
     #[cfg(feature = "machine-q35-linux")]
     out.push(&Q35_LINUX);
+    #[cfg(feature = "machine-q35-uefi")]
+    out.push(&Q35_UEFI);
     #[cfg(feature = "machine-pc64")]
     out.push(&PC64);
     #[cfg(feature = "machine-nes")]
@@ -1850,6 +1872,13 @@ mod tests {
             // image goes, behind `RSEMU_DISK`.
             #[cfg(feature = "machine-q35-linux")]
             ("q35-linux", "kernel" | "initrd" | "nvme0") => &[],
+            // Two blank NOR banks. A `flash.cfi` with no image is an erased
+            // part, which is a board with the sockets stuffed and nothing
+            // programmed into them — so this proves the board realizes without
+            // a 2 MiB firmware nobody could commit. `tests/q35_uefi` is where a
+            // real one runs, behind `RSEMU_OVMF_CODE`.
+            #[cfg(feature = "machine-q35-uefi")]
+            ("q35-uefi", "flash0" | "flash1") => &[],
             (m, other) => panic!("no fixture for `{m}`'s media slot `{other}`"),
         }
     }

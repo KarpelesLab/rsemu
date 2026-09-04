@@ -15,12 +15,22 @@
 //! than the array — and share nothing else, because a parallel part is an
 //! address window and a serial part is a frame on four wires.
 //!
-//! `no_std + alloc`, no dependencies. The backing store is a **media slot**,
-//! the same seam a firmware image or a NES cartridge arrives through, rather
-//! than `fstool`: the contents of a NOR part are a flat image with no partition
-//! table, no filesystem and no sector geometry, and binding one through the
-//! disk-image crate would drag `std` into a `no_std` device to gain nothing
-//! (`CLAUDE.md`, "`no_std`").
+//! `no_std + alloc`, no dependencies. The contents arrive through a **media
+//! slot** — the same seam a firmware image or a NES cartridge comes in on — and
+//! never through `fstool` directly: a NOR part's contents are a flat image with
+//! no partition table, no filesystem and no sector geometry, and parsing one
+//! here would drag `std` into a `no_std` device to gain nothing (`CLAUDE.md`,
+//! "`no_std`").
+//!
+//! [`cfi`] also takes a [`Medium`](crate::dev::medium::Medium) bound to that
+//! same slot name, because **a part a guest writes is a storage device**. That
+//! is what makes a UEFI variable survive a reboot rather than a run:
+//! `--drive flash1=OVMF_VARS.fd` puts the bank's bytes in a host file, and
+//! `Device::flush` writes them back when the run ends. The seam is
+//! `dev::medium`, so a snapshot obeys the same [`Snapshot`] policy every drive
+//! in the tree does.
+//!
+//! [`Snapshot`]: crate::dev::medium::Snapshot
 
 #[cfg(feature = "dev-flash-cfi")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-flash-cfi")))]

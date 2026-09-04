@@ -837,7 +837,12 @@ dev-riscv = ["dev-medium", "dev-uart-ns16550"]
 #
 # This is the device a UEFI build needs to *keep* a variable: the write path is
 # what installs `gEfiVariableWriteArchProtocolGuid`, and RAM cannot provide it.
-dev-flash-cfi = []
+#
+# `dev-medium` because a part a guest *writes* is a storage device: the contents
+# can be backed by a host file through the same seam `ata.disk` uses, and
+# `Device::flush` writes them back at the end of a run. That feature is empty --
+# it adds no dependency and pulls in one `no_std` module.
+dev-flash-cfi = ["dev-medium"]
 
 # An SD memory card (src/dev/sd): the protocol, not a controller. The command
 # set (CMD0/CMD8/ACMD41 initialisation, CMD2/CMD3 identification, CMD7 select,
@@ -1491,6 +1496,27 @@ machine-q35-linux = [
   "dev-pc-hpet",
   "dev-linuxboot",
   "dev-nvme",
+]
+
+# The q35-uefi board (machines/q35-uefi.machine): the q35 chipset with the ROM
+# socket replaced by **two banks of parallel NOR flash**, so the machine boots
+# UEFI instead of a BIOS. A read-only firmware bank and a writable variable
+# store, both `flash.cfi`, both ending at the top of the address space -- which
+# is where an x86 reset vector is, and therefore the layout every split OVMF
+# build is compiled for. The same arrangement `machine-riscv-virt` already boots
+# EDK II from; what is x86-specific is the addresses and a byte-wide bus.
+#
+# No video adapter, no IDE, no 8237As and no generated ACPI tables: a UEFI
+# firmware publishes its own tables and reaches its disks through PCI, and the
+# console is the 16550 EDK II puts a terminal on. What it gets you over
+# `machine-q35` is `dev-flash-cfi`; nothing else is added and no dependency is.
+machine-q35-uefi = [
+  "cpu-x86",
+  "dev-q35",
+  "dev-uart-ns16550",
+  "dev-pc-apic",
+  "dev-pc-hpet",
+  "dev-flash-cfi",
 ]
 
 # The pc64 board (machines/pc64.machine): a PC with a long-mode processor and no

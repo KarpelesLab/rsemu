@@ -17,6 +17,14 @@
 //! ordinary black-box observation there is (`ROADMAP.md` §1) — the image is
 //! run, never read, and never vendored.
 
+// Three test binaries include this module — `pc64_linux`, `q35_linux` and
+// `q35_uefi` — and each compiles its own copy of it. They use different
+// subsets: a firmware is not held to `assert_booted`'s "Linux version" and
+// spells its environment variables `RSEMU_OVMF_*` rather than reaching
+// `from_env`. Without this, the half a binary does not call is dead code in
+// that binary and `-D warnings` makes it a build failure.
+#![allow(dead_code)]
+
 use rsemu::core::clock::GlobalTime;
 use rsemu::core::space::MemAttrs;
 use rsemu::cpu::x86::X86;
@@ -53,7 +61,16 @@ impl Script {
     /// Read both variables. Neither set is a run that types nothing, which is
     /// what every run before this existed did.
     pub(crate) fn from_env() -> Script {
-        let steps = std::env::var("RSEMU_KERNEL_INPUT")
+        Script::from_vars("RSEMU_KERNEL_INPUT", "RSEMU_KERNEL_STOP_AT")
+    }
+
+    /// The same, from a pair of variables named by the caller.
+    ///
+    /// `tests/q35_uefi.rs` drives a firmware rather than a kernel and spells
+    /// its variables `RSEMU_OVMF_*`; the parsing is the same, so it is here
+    /// rather than copied.
+    pub(crate) fn from_vars(input: &str, stop_at: &str) -> Script {
+        let steps = std::env::var(input)
             .unwrap_or_default()
             .split('\n')
             .filter(|s| !s.trim().is_empty())
@@ -66,7 +83,7 @@ impl Script {
             .collect();
         Script {
             steps,
-            stop_at: std::env::var("RSEMU_KERNEL_STOP_AT").unwrap_or_default(),
+            stop_at: std::env::var(stop_at).unwrap_or_default(),
         }
     }
 
