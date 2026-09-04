@@ -594,6 +594,33 @@ and already correct.
 
 ## Where it stops, and what is still in the way
 
+### The exclusive monitor is core-local, and two cores need it not to be
+
+**`arm64-virt-smp` runs two processors, and the reservation each one keeps is
+private to it.** `cpu::arm::a64`'s `State::exclusive` — like `cpu::riscv`'s
+`reservation` — is per-core state, so a sibling's store does not break this
+core's reservation. An `stxr` the architecture *requires* to fail succeeds, and
+the sibling's update is lost.
+
+`core::space::MemAttrs::exclusive` already carries the flag and its own
+documentation says the monitor "lives with the CPU, not here". Nothing reads
+the flag back; a **global monitor on the address space** is what would, and it
+does not exist. This was found from the other direction — `usermode`'s threaded
+guest puts two cores on one `UserMemory` and loses increments measurably: an
+AArch64 `AtomicU32::fetch_add` loop (an `ldxr`/`stxr` pair, no `FEAT_LSE`)
+lands **32038 of 40000**, while the same program on RISC-V lands 40000 because
+LLVM emits a single `amoadd.d` there. Same defect, different compiler output.
+`usermode::proof`'s
+`a_reservation_is_core_local_so_two_threads_lose_an_update` is a hermetic
+reproducer on both architectures, written to fail when the monitor lands.
+
+**Why this board still boots**: a kernel's spinlocks are uncontended almost
+always, and both cores rarely reach the same lock inside one scheduler
+quantum. That is luck about timing, not a property of the model — so treat
+`arm64-virt-smp`'s green boot as evidence that bring-up, banking and IPIs work,
+and not as evidence that its atomics do.
+
+
 It did not stop, so this section is a list of what the board *has not got*
 rather than of what defeated it. In rough order of what the next person will
 want:

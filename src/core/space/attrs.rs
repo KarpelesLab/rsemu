@@ -167,6 +167,21 @@ pub struct MemAttrs {
     ///
     /// The core carries the flag; the monitor that implements the reservation
     /// lives with the CPU, not here.
+    ///
+    /// **That is only sound while one core owns an address space, and since
+    /// SMP landed it is not.** Every core keeps its reservation privately
+    /// (`cpu::riscv`'s `reservation`, `cpu::arm::a64`'s `exclusive`), so a
+    /// sibling's store does not break it: a `sc.d`/`stxr` the architecture
+    /// *requires* to fail succeeds, and the sibling's update is lost. Nothing
+    /// in the tree reads this flag back — a **global monitor on the address
+    /// space** is what would, and it does not exist yet.
+    ///
+    /// Reproduced hermetically on both architectures by
+    /// `a_reservation_is_core_local_so_two_threads_lose_an_update` in
+    /// `usermode::proof`, which is written to *fail* when the monitor lands
+    /// and says what to change it to. It reaches every multiprocessor board:
+    /// `arm64-virt-smp` and `pc-at-smp` both run kernel spinlocks built on
+    /// exactly this sequence.
     pub exclusive: bool,
     /// The access comes from a debugger, a monitor, or a snapshot, and **must
     /// have no side effects** — no FIFO pop, no status-bit clear, no pointer
