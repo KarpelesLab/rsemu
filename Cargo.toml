@@ -26,7 +26,7 @@ exclude       = ["/docs/local", "/.github"]
 oxideav-png = { version = "0.1", default-features = false, optional = true }
 
 # Disk images and the block-device seam under `dev/blk`: `fstool::BlockDevice`
-# plus sparse raw, qcow2, DMG, DiskCopy 4.2 and LUKS backends. First-party
+# plus sparse raw, qcow2, DMG and DiskCopy 4.2 backends. First-party
 # (Karpelès Lab, MIT) and named as a permitted dependency in CLAUDE.md;
 # `ROADMAP.md` §7.1 makes it *the* storage substrate, so rsemu adapts to it
 # rather than inventing a parallel block abstraction. `default-features =
@@ -34,6 +34,17 @@ oxideav-png = { version = "0.1", default-features = false, optional = true }
 # are the two a qcow2 with compressed clusters actually reads through, and both
 # come from `compcol`, which is permitted already. Optional, so the default
 # `cargo tree` is still only `rsemu`.
+#
+# **The encrypted containers are not enabled, and `ImageOptions::password` is
+# therefore inert.** `gzip` and `zstd` do not reach `fstool`'s `luks`,
+# `qcow2-crypto` or `dmg-encrypted`, so an encrypted image cannot be opened no
+# matter what password reaches `dev::blk::image`. That field is plumbed
+# (`image.rs:325`) against the day the features are turned on; until then it is
+# a promise this build does not keep, and it is written here rather than
+# discovered by someone whose disk will not unlock. Turning them on costs
+# `purecrypto` -- permitted -- **and `serde` + `serde_json`**, because a LUKS2
+# header is a JSON document. That is a deliberate trade for a machine that
+# actually needs an encrypted guest disk, not a default.
 fstool = { version = "0.4.25", default-features = false, features = [
   "gzip",
   "zstd",
@@ -1324,8 +1335,11 @@ dev-medium = []
 # snapshot does not write 16 GiB. Adds `fstool` (Karpelès Lab, MIT -- named as
 # a permitted dependency in CLAUDE.md) and with it the image formats: sparse
 # **raw**, **qcow2** (v2/v3, read/write, allocate-on-write, compressed
-# clusters, backing files, encryption), UDIF **DMG**, DiskCopy 4.2 and
-# **LUKS**. No format is parsed here and none should ever be -- ROADMAP.md
+# clusters, backing files), UDIF **DMG** and DiskCopy 4.2. **Not** the
+# encrypted containers: LUKS, qcow2 encryption and encrypted DMG are separate
+# `fstool` features this crate does not ask for, so `ImageOptions::password`
+# has nothing to unlock -- see the `fstool` dependency comment above for what
+# enabling them would cost. No format is parsed here and none should ever be -- ROADMAP.md
 # §7.1 puts controllers on `fstool::BlockDevice` "rather than on a parallel
 # rsemu invention", and this feature is about a hundred lines of adapter:
 # `&mut self` to `&self` behind a `core::sync` lock, `std::io::Error` to
