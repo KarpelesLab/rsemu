@@ -3369,9 +3369,10 @@ fn the_scheduler_budget_is_never_overshot_and_the_debt_is_paid_back() {
 mod long_mode {
     use super::*;
     use crate::core::state::StateReader;
+    use crate::core::wire::{LocalController, Startup};
     use crate::cpu::x86::Features;
     use crate::cpu::x86::paging::Mode;
-    use crate::cpu::x86::prot::{cr4, efer, msr};
+    use crate::cpu::x86::prot::{apic_base, cr4, efer, msr};
 
     /// Where the long-mode tests put their page tables and their code.
     ///
@@ -3591,6 +3592,276 @@ mod long_mode {
             la::PML4,
             "and CR3 likewise, which is how a guest finds its own tables"
         );
+    }
+
+    // -- CR8, the task-priority register ---------------------------------
+
+    /// Where these tests put the local APIC's register page.
+    ///
+    /// Inside the harness's RAM, so the "register page" is four bytes of
+    /// memory a test can poke and read back. That is the whole assertion:
+    /// `CR8` has no storage of its own, and every access to it has to land
+    /// *there*.
+    const APIC_PAGE: u64 = 0x30_0000;
+
+    /// The task-priority register's address, at offset `0x80` of that page —
+    /// *Intel SDM* volume 3A §11.4.4, table 11-1.
+    const TPR: u64 = APIC_PAGE + 0x80;
+
+    /// A local controller that does nothing but say where its registers are,
+    /// which is all `CR8` asks of one: the transfer itself goes through the
+    /// address space, exactly as a guest's own store to the page would.
+    #[derive(Debug)]
+    struct Apic {
+        base: u64,
+    }
+
+    impl LocalController for Apic {
+        fn take_startup(&self) -> Startup {
+            Startup::NONE
+        }
+
+        fn base_register(&self) -> u64 {
+            self.base
+        }
+    }
+
+    /// Bring a core into 64-bit mode with a local APIC wired at `APIC_PAGE`
+    /// and `tpr` already in its task-priority register, then run `code`.
+    ///
+    /// The controller comes back with the machine because the core holds only
+    /// a weak reference to it — dropping it here would unwire the APIC halfway
+    /// through the test.
+    fn run64_with_apic(tpr: u64, code: &[u8]) -> (Pc, Arc<dyn LocalController>) {
+        let pc = pc64();
+        let intc: Arc<dyn LocalController> = Arc::new(Apic {
+            base: APIC_PAGE | apic_base::ENABLE,
+        });
+        pc.cpu
+            .attach_local_controller("intr", Arc::downgrade(&intc));
+        pc.start_protected();
+        pc.prepare_long();
+        pc.write32(TPR, tpr);
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        pc.write(la::CODE64, code);
+        let steps = pc.run(200);
+        assert!(steps < 200, "the 64-bit program halted");
+        assert!(pc.cpu.sys().sixty_four(), "and did so in 64-bit mode");
+        (pc, intc)
+    }
+
+    #[test]
+    fn a_long_mode_interrupt_aligns_the_stack_frame_to_sixteen_bytes() {
+        // *Intel SDM* volume 3A §6.14.2, "Stack Frame": in IA-32e mode `RSP` is
+        // aligned **down** to a sixteen-byte boundary before the frame is
+        // pushed, and the value pushed is the unaligned one — so `IRETQ` puts
+        // the interrupted stack back exactly as it was and nothing outside the
+        // handler can tell.
+        //
+        // Not cosmetic. `FXSAVE` raises `#GP(0)` on an operand that is not
+        // sixteen-byte aligned, and EDK II's `CommonInterruptEntry` builds that
+        // operand out of `RSP`: without this a UEFI firmware's first exception
+        // handler faults on its own `FXSAVE`, faults again handling that, and
+        // recurses until the stack walks off the identity map.
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        pc.idt64(0x40, 0x18, la::HANDLER);
+        // mov rbx, rsp ; iretq
+        pc.write(la::HANDLER, &[0x48, 0x89, 0xe3, 0x48, 0xcf]);
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        // mov rsp, 0x27ff8 — deliberately eight bytes off a boundary, which is
+        // where an odd number of pushes leaves any real stack.
+        pc.write(
+            la::CODE64,
+            &[
+                0x48, 0xc7, 0xc4, 0xf8, 0x7f, 0x02, 0x00, // mov rsp, 0x27ff8
+                0xcd, 0x40, // int 0x40
+                0x48, 0x89, 0xe1, // mov rcx, rsp
+                0xf4,
+            ],
+        );
+        let steps = pc.run(200);
+        assert!(steps < 200, "the program halted");
+        let regs = pc.regs();
+        assert_eq!(
+            (regs.rbx + 40) % 16,
+            0,
+            "the five-word frame starts on a sixteen-byte boundary, so the \
+             handler's own stack is aligned the way the ABI it is written in \
+             assumes"
+        );
+        assert_eq!(
+            pc.read64(regs.rbx + 24),
+            0x2_7ff8,
+            "and the RSP the frame carries is the unaligned one the guest had"
+        );
+        assert_eq!(
+            regs.rcx, 0x2_7ff8,
+            "so IRETQ returns to the stack the interrupt found"
+        );
+    }
+
+    #[test]
+    fn cr8_reads_the_task_priority_class_out_of_the_local_apic() {
+        // `44 0f 20 c0` — `REX.R` is what turns `CR0` into `CR8`, and these
+        // are the four bytes EDK II's `CommonInterruptEntry` opens with: a
+        // UEFI firmware fills an `EFI_SYSTEM_CONTEXT_X64`, and that structure
+        // has `Cr8` in it. Until this existed the exception handler faulted on
+        // its own second instruction and recursed until the stack left the
+        // identity map (`docs/platforms/q35-uefi.md`).
+        //
+        // `0xb7` in the register is priority class `0xb` with sub-class `7`;
+        // `CR8` is the class alone (*Intel SDM* volume 3A §11.8.6.1).
+        let (pc, _intc) = run64_with_apic(0xb7, &[0x44, 0x0f, 0x20, 0xc0, 0xf4]);
+        assert_eq!(pc.regs().rax, 0xb, "TPR[7:4], not the whole register");
+    }
+
+    #[test]
+    fn a_write_to_cr8_lands_in_the_task_priority_register() {
+        // mov eax, 7 ; mov cr8, rax ; hlt
+        let (pc, _intc) = run64_with_apic(
+            0xb7,
+            &[0xb8, 0x07, 0x00, 0x00, 0x00, 0x44, 0x0f, 0x22, 0xc0, 0xf4],
+        );
+        assert_eq!(
+            pc.read32(TPR),
+            0x70,
+            "the class shifts into TPR[7:4] and the sub-class goes to zero with \
+             it, which is why the SDM tells software to use one route or the \
+             other and not both"
+        );
+    }
+
+    #[test]
+    fn cr8_and_the_apics_own_register_are_one_piece_of_state() {
+        // The alias, both ways, in one program — because a private four-bit
+        // register in `Sys` would pass the two tests above and fail this one,
+        // and a guest that set its priority through `CR8` and read it back
+        // through the APIC's page would then see an interrupt-delivery bug
+        // that was really a register bug.
+        let code = &[
+            // mov eax, 3 ; mov cr8, rax ; mov rax, cr8 ; mov ebx, eax
+            0xb8, 0x03, 0x00, 0x00, 0x00, //
+            0x44, 0x0f, 0x22, 0xc0, //
+            0x44, 0x0f, 0x20, 0xc0, //
+            0x89, 0xc3, //
+            // mov dword [0x300080], 0x90 — an ordinary guest store to the
+            // device's register page, which is the *other* route to the same
+            // register.
+            0xc7, 0x04, 0x25, 0x80, 0x00, 0x30, 0x00, 0x90, 0x00, 0x00, 0x00, //
+            // mov rcx, cr8 ; hlt
+            0x44, 0x0f, 0x20, 0xc1, //
+            0xf4,
+        ];
+        let (pc, _intc) = run64_with_apic(0, code);
+        let regs = pc.regs();
+        assert_eq!(regs.rbx, 3, "what `CR8` wrote is what `CR8` reads");
+        assert_eq!(
+            regs.rcx, 9,
+            "and a store to the APIC's own register moved `CR8` with it"
+        );
+        assert_eq!(pc.read32(TPR), 0x90, "there is one register, not two");
+    }
+
+    #[test]
+    fn a_task_priority_class_above_fifteen_is_a_general_protection_fault() {
+        // Bits 63:4 of `CR8` do not exist, and a write that names one is
+        // `#GP(0)` rather than a silent truncation (*Intel SDM* volume 3A
+        // §2.5). A guest that thought it was setting a class of sixteen finds
+        // out.
+        let pc = pc64();
+        let intc: Arc<dyn LocalController> = Arc::new(Apic {
+            base: APIC_PAGE | apic_base::ENABLE,
+        });
+        pc.cpu
+            .attach_local_controller("intr", Arc::downgrade(&intc));
+        pc.start_protected();
+        pc.prepare_long();
+        pc.write32(TPR, 0x20);
+        pc.idt64(13, 0x18, la::HANDLER);
+        // mov rbx, 42 ; hlt
+        pc.write(
+            la::HANDLER,
+            &[0x48, 0xc7, 0xc3, 0x2a, 0x00, 0x00, 0x00, 0xf4],
+        );
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        // mov eax, 0x10 ; mov cr8, rax ; hlt
+        pc.write(
+            la::CODE64,
+            &[0xb8, 0x10, 0x00, 0x00, 0x00, 0x44, 0x0f, 0x22, 0xc0, 0xf4],
+        );
+        pc.run(200);
+        assert_eq!(pc.regs().rbx, 42, "#GP(0) was delivered");
+        assert_eq!(
+            pc.read32(TPR),
+            0x20,
+            "and the refused write never reached the device"
+        );
+    }
+
+    #[test]
+    fn a_core_with_no_local_controller_has_a_task_priority_of_zero() {
+        // `CR8` is the APIC's register seen from the processor, so a board
+        // that wired no APIC has no priority class — and nothing that could be
+        // blocked by one, because its `INTR` comes from an 8259A whose
+        // priorities the processor never sees. It reads zero and a legal write
+        // has nowhere to go, which is a documented degenerate case rather than
+        // a fault: the instruction is architecturally valid in 64-bit mode.
+        //
+        // Contrast `ia32_apic_base_faults_on_a_processor_with_no_local_controller`:
+        // `IA32_APIC_BASE` is a register the *controller* owns, and a machine
+        // without one does not have it at all.
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        // mov eax, 5 ; mov cr8, rax ; mov rbx, cr8 ; hlt
+        let code = &[
+            0xb8, 0x05, 0x00, 0x00, 0x00, //
+            0x44, 0x0f, 0x22, 0xc0, //
+            0x44, 0x0f, 0x20, 0xd8, //
+            0xf4,
+        ];
+        pc.write(la::CODE64, code);
+        let steps = pc.run(200);
+        assert!(steps < 200, "no fault: the program reached its `hlt`");
+        assert_eq!(pc.regs().rbx, 0, "and read a priority class of zero");
+    }
+
+    #[test]
+    fn the_reserved_control_registers_are_still_invalid_opcodes() {
+        // `CR8` is the only index long mode added. `CR1`, `CR5`-`CR7` and
+        // `CR9`-`CR15` are reserved on every part there has ever been, and
+        // widening the fix past what the SDM licenses is how an emulator grows
+        // a fake instruction set.
+        //
+        // `44 0f 20 c8` is `mov rax, cr9`; without the prefix the same ModRM
+        // byte is `mov rax, cr1`, and `e8` names `cr5`.
+        for (bytes, name) in [
+            (&[0x44u8, 0x0f, 0x20, 0xc8, 0xf4][..], "cr9"),
+            (&[0x0fu8, 0x20, 0xc8, 0xf4][..], "cr1"),
+            (&[0x0fu8, 0x20, 0xe8, 0xf4][..], "cr5"),
+        ] {
+            let pc = pc64();
+            let intc: Arc<dyn LocalController> = Arc::new(Apic {
+                base: APIC_PAGE | apic_base::ENABLE,
+            });
+            pc.cpu
+                .attach_local_controller("intr", Arc::downgrade(&intc));
+            pc.start_protected();
+            pc.prepare_long();
+            pc.idt64(6, 0x18, la::HANDLER);
+            // mov rbx, 42 ; hlt
+            pc.write(
+                la::HANDLER,
+                &[0x48, 0xc7, 0xc3, 0x2a, 0x00, 0x00, 0x00, 0xf4],
+            );
+            pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+            pc.write(la::CODE64, bytes);
+            pc.run(200);
+            assert_eq!(pc.regs().rbx, 42, "{name} is #UD");
+        }
     }
 
     #[test]
