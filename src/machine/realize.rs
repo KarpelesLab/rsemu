@@ -170,6 +170,43 @@ impl<'a> BindCtx<'a> {
         self.requester
     }
 
+    /// The sibling device at `path`, as much of one as the machine layer shows.
+    ///
+    /// The companion to [`export`](BindCtx::export): that answers "give me the
+    /// handle `path` publishes", this answers "who *is* `path`". The fact on a
+    /// [`Peer`] that cannot be had any other way is its
+    /// [requester id](Peer::requester) — every object is allocated one at
+    /// realize time, **by declaration order**, so a machine file cannot write
+    /// the number down and a device that has to recognise another initiator's
+    /// accesses has nowhere else to learn it.
+    ///
+    /// A per-processor register window is the case that asked for it: one page,
+    /// decoded to a different device depending on which processor is reading,
+    /// which [`MemAttrs::requester`](crate::core::space::MemAttrs::requester)
+    /// has always carried to the leaf and nothing had yet read back.
+    ///
+    /// # Errors
+    ///
+    /// If nothing in the machine is called `path`. The message lists what the
+    /// machine does have, for the reason [`export`](BindCtx::export)'s does.
+    pub fn peer(&self, path: &str) -> Result<Peer<'a>> {
+        let Some(peer) = self.peers.iter().find(|b| b.path == path) else {
+            let names: Vec<&str> = self.peers.iter().map(|b| b.path.as_str()).collect();
+            return Err(config(
+                self.path,
+                format!(
+                    "names `{path}`, but this machine has no object called `{path}`; it has {}",
+                    list(&names)
+                ),
+            ));
+        };
+        Ok(Peer {
+            path: &peer.path,
+            class: peer.class,
+            requester: peer.requester,
+        })
+    }
+
     /// The clock domain the machine file gave it, if any.
     pub fn domain(&self) -> Option<DomainId> {
         self.domain
@@ -301,6 +338,37 @@ impl<'a> BindCtx<'a> {
                 format!("`{path}`'s {which} is not the type this device expects"),
             )
         })
+    }
+}
+
+/// A named neighbour, as much of one as the machine layer shows a device.
+///
+/// What [`BindCtx::peer`] answers with. Deliberately not the device itself: a
+/// `bind` gets a named handle ([`Export`]) or these three facts, never the
+/// device table, because a device that could reach into a sibling would be a
+/// machine graph nobody could read out of the file.
+#[derive(Debug, Clone, Copy)]
+pub struct Peer<'a> {
+    path: &'a str,
+    class: &'static DeviceClass,
+    requester: RequesterId,
+}
+
+impl<'a> Peer<'a> {
+    /// Its path — the name the machine file gave it.
+    pub fn path(&self) -> &'a str {
+        self.path
+    }
+
+    /// Its class, for a consumer that wants to say "that is not a processor".
+    pub fn class(&self) -> &'static DeviceClass {
+        self.class
+    }
+
+    /// The requester id its accesses carry in
+    /// [`MemAttrs`](crate::core::space::MemAttrs).
+    pub fn requester(&self) -> RequesterId {
+        self.requester
     }
 }
 

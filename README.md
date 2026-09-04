@@ -129,6 +129,14 @@ video BIOS — with user-supplied firmware paths in the QEMU style (`--bios`,
 `--vgabios`). A real BIOS completes POST on it, runs the video option ROM, sets
 a text mode and boots a diskette.
 
+`pc-at-smp` is the same board with **two processors**, and it differs by five
+lines — a second `cpu.x86`, a second local APIC, and one changed mapping. Both
+the MP configuration table and the ACPI MADT carry a single local-APIC address,
+because on silicon the register block is on the processor's own die; so
+`0xfee00000` decodes to a *window* that demultiplexes on which processor is
+asking, and each one reaches its own APIC through the one address an operating
+system uses on both.
+
 **No third-party firmware is shipped and none will be** — but there is now one
 of our own. `rsemu run pc-at --hd0 disk.img` boots with nothing supplied,
 because `src/fw/pcbios` is a minimal legacy BIOS written here: POST, the BIOS

@@ -254,6 +254,38 @@ pub static PC_AT: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/pc-at.machine"),
 };
 
+/// The same board with **two processors**.
+///
+/// `pc-at` address for address, plus a second `cpu.x86`, a second `pc.lapic`,
+/// and one changed mapping: `0xfee00000` decodes to `lapic0.window` rather than
+/// `lapic0.regs`, so each processor reaches *its own* local APIC through the
+/// single architectural address the MP configuration table and the ACPI MADT
+/// have room for.
+///
+/// That mapping is why this entry exists at all. Until the window did, a
+/// two-processor AT was a board an operating system could enumerate and start
+/// and then quietly mis-program — an application processor reading its own APIC
+/// ID at `0xfee00000` read the bootstrap processor's — so the tree shipped no
+/// such board and `tests/kvm_pc_at_smp.rs` patched the text at run time
+/// instead. `docs/platforms/pc-at.md` has the argument; `tests/pc_at_smp.rs`
+/// has the proof, including the negative control that fails on a board mapping
+/// `lapic0.regs`.
+///
+/// The second processor comes up parked in wait-for-SIPI, as the MP
+/// initialization protocol says (SDM Vol 3A §8.4.3), and runs only once
+/// firmware sends it the specification's INIT/Start-Up pair.
+///
+/// **No firmware is shipped**, exactly as `pc-at` ships none: the `bios` slot
+/// defaults to rsemu's own image and `--bios` displaces it.
+#[cfg(feature = "machine-pc-at-smp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-pc-at-smp")))]
+pub static PC_AT_SMP: CatalogEntry = CatalogEntry {
+    name: "pc-at-smp",
+    summary: "the PC/AT board with two processors, each reaching its own local APIC at 0xfee00000",
+    media: &["bios", "vgabios", "floppy", "hd0", "hd1"],
+    source: include_str!("../../machines/pc-at-smp.machine"),
+};
+
 /// The same lineage stripped to its interrupt path: **two** x86s with a local
 /// APIC each, the two 8259As, an I/O APIC and an HPET, and almost nothing else.
 ///
@@ -641,6 +673,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&NVME_MINI);
     #[cfg(feature = "machine-pc-at")]
     out.push(&PC_AT);
+    #[cfg(feature = "machine-pc-at-smp")]
+    out.push(&PC_AT_SMP);
     #[cfg(feature = "machine-pc-apic")]
     out.push(&PC_APIC);
     #[cfg(feature = "machine-q35")]
@@ -1902,6 +1936,16 @@ mod tests {
             // where a populated bay is exercised.
             #[cfg(feature = "machine-pc-at")]
             ("pc-at", "hd0" | "hd1") => &[],
+            // The two-processor board takes the same sockets, for the same
+            // reasons: it is `pc-at` with a second processor on it.
+            #[cfg(feature = "machine-pc-at-smp")]
+            ("pc-at-smp", "bios") => blank(128 * 1024),
+            #[cfg(feature = "machine-pc-at-smp")]
+            ("pc-at-smp", "vgabios") => blank(32 * 1024),
+            #[cfg(feature = "machine-pc-at-smp")]
+            ("pc-at-smp", "floppy") => blank(1_474_560),
+            #[cfg(feature = "machine-pc-at-smp")]
+            ("pc-at-smp", "hd0" | "hd1") => &[],
             #[cfg(feature = "machine-pc-apic")]
             ("pc-apic", "bios") => blank(128 * 1024),
             // The q35 board's BIOS socket is 64 KiB rather than `pc-at`'s 128,
@@ -1944,6 +1988,7 @@ mod tests {
     /// trade against threading a lifetime through the whole fixture table.
     #[cfg(any(
         feature = "machine-pc-at",
+        feature = "machine-pc-at-smp",
         feature = "machine-pc-apic",
         feature = "machine-q35"
     ))]

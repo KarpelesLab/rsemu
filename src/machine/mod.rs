@@ -102,7 +102,7 @@ pub use crate::machine::machine::Machine;
 pub use crate::machine::parser::parse;
 pub use crate::machine::rational::Rational;
 pub use crate::machine::realize::{
-    BindCtx, Bindings, Instance, MediaTable, RealizeOptions, SinkPin, realize, realize_with,
+    BindCtx, Bindings, Instance, MediaTable, Peer, RealizeOptions, SinkPin, realize, realize_with,
 };
 pub use crate::machine::resolver::{ResolveOptions, Resolved, resolve};
 pub use crate::machine::sources::{IncludeLoader, SourceMap};
