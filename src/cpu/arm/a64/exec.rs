@@ -668,6 +668,16 @@ impl<'a> Exec<'a> {
     /// Translate one virtual address, consulting and filling the TLB.
     pub(super) fn translate(&mut self, va: u64, kind: Access) -> Result<u64, mmu::Fault> {
         if !self.st.sys.mmu_enabled() {
+            // Bare mode reaches this on every access rather than on a miss, so
+            // the shadow's flat-view probe is asked for only where there is
+            // nothing cached yet — `refresh_shadow`'s own guard. Nothing here
+            // fills this core's TLB, and nothing needs to: with the MMU off no
+            // walk is owed, so an inlined access owes only its tick.
+            #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+            {
+                let el = self.st.sys.el;
+                self.refresh_shadow(kind, va, va, el, false);
+            }
             return Ok(va);
         }
         let vpn = va >> mmu::PAGE_BITS;
@@ -708,7 +718,138 @@ impl<'a> Exec<'a> {
             generation,
             t.pa & !mmu::PAGE_MASK,
         );
+        // In lockstep with the insert above, at the same index, for the same
+        // virtual page — which is the whole of what makes an inlined access
+        // indistinguishable from this one. A hit in the shadow then implies a
+        // hit here, so the walk it skips is a walk that has already happened
+        // and already been charged.
+        #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+        self.refresh_shadow(kind, va, t.pa, el, true);
         Ok(t.pa)
+    }
+
+    /// Write the shadow's slot for this page, so a compiled access may serve
+    /// it without calling back.
+    ///
+    /// Loads and stores only — the backend inlines nothing else
+    /// (`jit::x86::compile`, `Compiler::inlinable`) — and always a *write* on
+    /// the paged path, never a skip, because the caller has just replaced the
+    /// matching slot of this core's own TLB.
+    ///
+    /// The two sets are not interchangeable and are filled by the same code
+    /// for that reason: a store entry exists only because a walk **for a
+    /// store** succeeded, which is what checked the leaf's write permission
+    /// and `SCTLR_EL1.WXN`. Filling the store set from a load's walk would
+    /// lose both.
+    ///
+    /// What is *not* here is the part RISC-V needs and this core does not: a
+    /// protection check the page tables know nothing about. AArch64 has no
+    /// PMP, so a page the walk permits is a page the compiled path may reach,
+    /// and there is nothing left to refuse a page over.
+    #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+    fn refresh_shadow(&mut self, kind: Access, va: u64, phys: u64, el: El, translating: bool) {
+        let set = match kind {
+            Access::Load => crate::ir::AccessKind::Load,
+            Access::Store => crate::ir::AccessKind::Store,
+            // A fetch is never inlined, so a fetch entry would be a fill
+            // nothing reads.
+            Access::Fetch => return,
+        };
+        let generation = self.st.sys.translation_gen;
+        let Some(shadow) = self.tlb.shadow_mut() else {
+            return;
+        };
+        // Read live rather than remembered: this core is reachable through
+        // paths that never enter the dispatcher — `Cpu::step`, a monitor, a
+        // debugger — and a fill into a table that is stale in either counter
+        // would promise a hit that is not one.
+        let epoch = crate::jit::Epoch {
+            topology: shadow.topology_generation(),
+            translation: generation,
+        };
+        shadow.sync(epoch);
+        let ctx = crate::jit::Context {
+            level: el.bits() as u8,
+            translating,
+        };
+        if !translating && shadow.caches(set, va, ctx) {
+            return;
+        }
+        shadow.fill(set, va, phys, ctx);
+    }
+
+    /// The world this core's accesses happen in, as the shadow tags them.
+    ///
+    /// Read at a block boundary by the engine's [`FastMem`] implementation,
+    /// which is also where the shadow is resynchronised — so the tag a block
+    /// compares against is the one the table is currently filling with.
+    ///
+    /// [`FastMem`]: crate::jit::FastMem
+    ///
+    /// The exception level is the **current** one rather than the effective
+    /// one [`Exec::unpriv`] selects: `LDTR`/`STTR` are outside the lifted
+    /// subset, so no access inside a block can be an unprivileged one, and an
+    /// entry filled by an interpreted `LDTR` carries EL0's context and is
+    /// invisible to a block running at EL1.
+    #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+    pub(super) fn mem_plan(&mut self, kind: Access) -> Option<crate::jit::MemPlan> {
+        let set = match kind {
+            Access::Load => crate::ir::AccessKind::Load,
+            Access::Store => crate::ir::AccessKind::Store,
+            Access::Fetch => crate::ir::AccessKind::Fetch,
+        };
+        let ctx = crate::jit::Context {
+            level: self.st.sys.el.bits() as u8,
+            translating: self.st.sys.mmu_enabled(),
+        };
+        let generation = self.st.sys.translation_gen;
+        let shadow = self.tlb.shadow_mut()?;
+        let epoch = crate::jit::Epoch {
+            topology: shadow.topology_generation(),
+            translation: generation,
+        };
+        shadow.sync(epoch);
+        Some(shadow.plan(set, ctx))
+    }
+
+    /// Pay what a store the backend served itself still owes.
+    ///
+    /// `jit::x86` moved `bytes` bytes into guest RAM through the host address
+    /// the shadow's store entry carries, and did nothing else. This is
+    /// everything `Exec::write_once` does apart from moving them:
+    ///
+    /// * **the reservation**, broken by a store into the reserved sixteen-byte
+    ///   granule — the rule [`Exec::store`] applies before the write, applied
+    ///   after it here, which is unobservable because nothing runs in between
+    ///   and a `STXR` is a separate guest instruction that is not in the
+    ///   lifted subset anyway;
+    /// * **one tick**, because one bus access is one cycle and the walk was
+    ///   charged when the entry was filled;
+    /// * **the `RamStore`'s own dirty bitmap and the guest-physical dirty
+    ///   log**, which `jit::Tlb::note_fast_store` marks and reports — the
+    ///   first is the only record a framebuffer refresh or a live snapshot
+    ///   has, and the second is what invalidates a translation of a page the
+    ///   guest just rewrote.
+    ///
+    /// # Panics
+    ///
+    /// Never on a guest condition. A shadow entry that does not resolve to RAM
+    /// cannot have been used by generated code, which found a host address in
+    /// it one instruction earlier; reaching that arm is a code-generation bug,
+    /// and losing the dirty page silently would hide it.
+    #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+    pub(super) fn note_fast_store(&mut self, va: u64, bytes: u64) {
+        self.break_reservation(va);
+        self.charge();
+        let phys = self
+            .tlb
+            .shadow_mut()
+            .and_then(|shadow| shadow.note_fast_store(va, bytes));
+        let Some(phys) = phys else {
+            debug_assert!(false, "an inlined store used an entry that holds no RAM");
+            return;
+        };
+        self.note_write(phys);
     }
 
     /// The ASID currently in force, narrowed as `TCR_EL1.AS` says.

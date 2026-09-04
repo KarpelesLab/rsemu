@@ -267,26 +267,37 @@ real work rather than decompressing:
 
 | `engine` | 20 s of guest time |
 | --- | --- |
-| `interp` | 17.59 s |
-| `jit` | 11.67 s (**1.51×**) |
-| `jit-host` | **6.92 s (2.54×)** |
+| `interp` | 17.35 s |
+| `jit` | 11.21 s (**1.55×**) |
+| `jit-host` | **6.34 s (2.73×)** |
 
 Every cell is the median of three **interleaved** runs — one of each engine, in
 turn, round and round, because the interpreter is the control and a control
 measured in a different sitting is not one — and all nine finished on one state
-hash, `0x415f52aebd310878`, having charged 199 990 000 cycles. The translated
-runs executed 18 774 915 blocks; under `jit-host` the code generator compiled
-18 774 316 of them and refused 599, which are the blocks holding a `UDIV` or an
-`SDIV`, the two ops `jit::x86` does not lower.
+hash, `0x415f52aebd310878`, having charged 199 990 000 cycles.
 
-What is **not** here yet, and what the RISC-V board's equivalent section says
-bought it the most: a `MemPlan`. The software TLB's fast path is not inlined
-into generated code, because `cpu::arm::a64::mmu`'s `Tlb` has no `jit::Tlb`
-shadow to publish; every guest access on the compiled path still takes a call
-into the core's own translation.
-[`src/cpu/arm/a64/engine.rs`](../../src/cpu/arm/a64/engine.rs) has the argument
-for why nothing about AArch64 forbids one — no address tagging, and which
-`TTBR` a walk starts from is a pure function of the address.
+What the mechanisms did over that run:
+
+| | |
+| --- | --- |
+| blocks executed | 18 774 915 |
+| of those, compiled to host code | 18 774 316 (**99.997%**) |
+| of those, reached by a patched exit | 14 341 043 (76.4%) |
+| distinct blocks lifted | 16 655 |
+| guest instructions retired **inside** a block | 123 794 600 (**79.2%**) |
+| compiled loads served by an inlined TLB probe | 16 149 884 |
+| compiled stores served the same way | 10 535 057 |
+
+The 599 blocks the code generator refused are the ones holding a `UDIV` or an
+`SDIV`, the only two ops this frontend emits that `jit::x86` does not lower.
+The inlined probes — `ROADMAP.md` §9.1's first mechanism, the software TLB's
+fast path emitted into generated code rather than called into — are worth the
+last step of that ratio on their own: before `cpu::arm::a64::mmu`'s `Tlb` had a
+`jit::Tlb` shadow to publish, the same sweep put `jit-host` at 6.92 s and
+2.54×. [`src/cpu/arm/a64/engine.rs`](../../src/cpu/arm/a64/engine.rs) has the
+argument for what a plan may cover on this architecture, and the three things
+that looked as though they might forbid one — address tagging, the two `TTBR`s
+and granule selection — none of which does.
 
 
 ## Where it stops, and what is still in the way

@@ -1223,6 +1223,17 @@ impl Cpu {
             if session.jit.is_none() {
                 session.jit = Some(Box::new(engine::Jit::new(self.engine == Engine::JitHost)));
             }
+            // The compiled fast path's shadow, attached to this core's *own*
+            // TLB so the two evict together (`mmu::Tlb::attach_shadow`). It is
+            // asked for here rather than at construction because it needs the
+            // address space, which arrives with `attach_space`, and only the
+            // engine that reads it asks for it at all.
+            if !session.tlb.has_shadow()
+                && session.jit.as_ref().is_some_and(|jit| jit.wants_shadow())
+                && let Some(space) = session.space.clone()
+            {
+                session.tlb.attach_shadow(space);
+            }
             let Session {
                 state,
                 tlb,

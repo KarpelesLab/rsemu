@@ -501,6 +501,11 @@ pub struct Tlb {
     slots: [[Entry; TLB_ENTRIES]; 3],
     hits: u64,
     misses: u64,
+    /// A [`jit::Tlb`](crate::jit::Tlb) indexed exactly as this table is, so a
+    /// compiled access can resolve a guest address to a host one without
+    /// calling back. See [`Tlb::attach_shadow`].
+    #[cfg(feature = "jit")]
+    shadow: Option<alloc::boxed::Box<crate::jit::Tlb>>,
 }
 
 impl Default for Tlb {
@@ -517,12 +522,91 @@ impl Tlb {
             slots: [[Entry::default(); TLB_ENTRIES]; 3],
             hits: 0,
             misses: 0,
+            #[cfg(feature = "jit")]
+            shadow: None,
         }
     }
 
     /// Throw everything away.
     pub fn flush(&mut self) {
         self.slots = [[Entry::default(); TLB_ENTRIES]; 3];
+        // The shadow is only ever as live as this table is, so it goes with
+        // it: an entry that promised a hit here must not outlive the entry
+        // that made the promise.
+        #[cfg(feature = "jit")]
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.flush();
+        }
+    }
+
+    /// Give this TLB a [`jit::Tlb`](crate::jit::Tlb) shadow over `space`.
+    ///
+    /// # What the shadow is
+    ///
+    /// This table answers *virtual page to physical page*, which is half of
+    /// what a compiled load needs; the other half is *physical page to host
+    /// address*, and that is what `jit::Tlb` caches. The shadow is that second
+    /// half, indexed by the **same** virtual page in the **same** slot, so a
+    /// compiled access goes from a guest address to a host one in a mask, a
+    /// compare and an add — `ROADMAP.md` §9.1's first mechanism, inlined.
+    ///
+    /// # Why it lives here rather than beside the engine
+    ///
+    /// A compiled load that hits the shadow charges **one** tick and skips the
+    /// walk. That is only right if this table would have hit too, so the two
+    /// have to stay in lockstep — and lockstep is a property of *every* path
+    /// that can insert here, not only of the translated one. An interpreted
+    /// exclusive inserts, a trap handler outside the lifted subset inserts, a
+    /// debugger's single step inserts; each of those evicts a slot, and a
+    /// shadow living next to the engine would not hear about any of them.
+    /// Owning it here means `Exec::translate` maintains both at once and there
+    /// is no other way in.
+    ///
+    /// The two are the same size for the same reason: the slot a page lands in
+    /// must be the same slot in both, or an eviction here would leave a shadow
+    /// entry alive that promises a hit this table no longer has.
+    ///
+    /// # What AArch64 contributes that RISC-V does not
+    ///
+    /// The **ASID**. An entry here is tagged with it; an entry in the shadow is
+    /// not, and does not need to be, because an AArch64 ASID lives in
+    /// `TTBR0_EL1[63:48]` — so changing it is a `TTBR0_EL1` write, and a
+    /// `TTBR0_EL1` write bumps [`SysRegs::translation_gen`], which is the
+    /// counter both this table's tag and the shadow's stamp carry. The two go
+    /// stale together, which is what `jit::fast` asks for.
+    ///
+    /// Nothing else about this architecture needs handling: address tagging is
+    /// not implemented (an address carrying one falls in neither half and
+    /// faults), which `TTBR` a walk starts from is a pure function of the
+    /// address, and the 4 KiB granule is the only one this core accepts — so a
+    /// virtual page number here is a virtual page number there.
+    #[cfg(feature = "jit")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "jit")))]
+    pub fn attach_shadow(&mut self, space: alloc::sync::Arc<crate::core::space::AddressSpace>) {
+        let shadow = crate::jit::Tlb::with_entries(space, TLB_ENTRIES as u64);
+        debug_assert_eq!(
+            shadow.entries(),
+            TLB_ENTRIES as u64,
+            "the shadow must index exactly as this table does"
+        );
+        self.shadow = Some(alloc::boxed::Box::new(shadow));
+    }
+
+    /// The shadow, if one was attached.
+    #[cfg(feature = "jit")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "jit")))]
+    #[inline]
+    pub fn shadow_mut(&mut self) -> Option<&mut crate::jit::Tlb> {
+        self.shadow.as_deref_mut()
+    }
+
+    /// Whether a shadow is attached.
+    #[cfg(feature = "jit")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "jit")))]
+    #[inline]
+    #[must_use]
+    pub fn has_shadow(&self) -> bool {
+        self.shadow.is_some()
     }
 
     /// How many lookups hit and how many missed.

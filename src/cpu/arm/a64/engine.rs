@@ -58,23 +58,39 @@
 //!
 //! | `engine` | 20 s of guest time |
 //! | --- | --- |
-//! | `interp` | 17.59 s |
-//! | `jit` | 11.67 s (1.51×) |
-//! | `jit-host` | **6.92 s (2.54×)** |
+//! | `interp` | 17.35 s |
+//! | `jit` | 11.21 s (1.55×) |
+//! | `jit-host` | **6.34 s (2.73×)** |
 //!
 //! Median of three **interleaved** reps — one of each engine, in turn, round
 //! and round — because the interpreter is the control and a control measured
 //! in a different sitting is not one. All nine runs charged 199 990 000 cycles
 //! and finished on one state hash, `0x415f52aebd310878`.
 //!
-//! The translated runs executed **18 774 915** blocks. Under `jit-host` the
-//! code generator compiled 18 774 316 of them and refused 599 — the blocks
-//! holding a `UDIV` or an `SDIV`, which are the only two ops this frontend
-//! emits that `jit::x86` does not lower. That is 0.003% refused, and it is why
-//! [`lift`](super::lift) goes out of its way not to emit
-//! [`Opcode::ADDC`](crate::ir::Opcode::ADDC): the architecture's own
-//! `AddWithCarry` is refused too, and `CMP` is `SUBS`, so a lifter that used
-//! it would have had *every* block refused rather than six hundred.
+//! What the mechanisms did, over that run:
+//!
+//! | | |
+//! | --- | --- |
+//! | blocks executed | 18 774 915 |
+//! | of those, compiled to host code | 18 774 316 (**99.997%**) |
+//! | of those, reached by a patched exit | 14 341 043 (76.4%) |
+//! | distinct blocks lifted | 16 655 |
+//! | guest instructions retired **inside** a block | 123 794 600 (**79.2%**) |
+//! | compiled loads served by an inlined probe | 16 149 884 |
+//! | compiled stores served the same way | 10 535 057 |
+//! | translations a guest store invalidated | 7 801 |
+//!
+//! The 599 blocks the code generator refused are the ones holding a `UDIV` or
+//! an `SDIV`, which are the only two ops this frontend emits that `jit::x86`
+//! does not lower. That is 0.003%, and it is why [`lift`](super::lift) goes
+//! out of its way not to emit [`Opcode::ADDC`](crate::ir::Opcode::ADDC): the
+//! architecture's own `AddWithCarry` is refused too, and `CMP` is `SUBS`, so a
+//! lifter that used it would have had *every* block refused rather than six
+//! hundred.
+//!
+//! The inlined probes are worth the last step of that ratio on their own:
+//! before `mmu::Tlb` had a shadow to publish, the same sweep put `jit-host` at
+//! 6.92 s and **2.54×**.
 //!
 //! # What is checked at a block boundary rather than at an instruction
 //!
@@ -112,28 +128,30 @@
 //! address space for masters that are not the CPU, which `core::space` does
 //! not have.
 //!
-//! # What is deliberately not here
+//! # The inlined memory path, and the three AArch64 questions it raised
 //!
-//! **A [`MemPlan`](crate::jit::MemPlan).** `jit::fast` lets a host publish the
-//! software-TLB set its own accesses resolve through, so generated code can
-//! inline a load instead of calling back — worth 97.3% of compiled loads on
-//! the RISC-V engine. The condition is not *"no walk is owed"* but *"a hit in
-//! the published table implies a hit in the table that owes the walk"*, and a
-//! host makes that true by writing the two in lockstep.
+//! `jit::fast` lets a host publish the software-TLB set its own accesses
+//! resolve through, so generated code can inline a load instead of calling
+//! back. The condition is not *"no walk is owed"* but *"a hit in the published
+//! table implies a hit in the table that owes the walk"*, and a host makes
+//! that true by writing the two in lockstep — which is `mmu::Tlb`'s shadow,
+//! filled by `Exec::translate` at the same index for the same page.
 //!
-//! Nothing about AArch64 forbids it, and the three things that looked like
-//! they might all turn out not to:
+//! Three things about this architecture looked as though they might forbid it,
+//! and none does:
 //!
 //! * **`TCR_EL1.TBI`.** Address tagging would put two virtual addresses that
 //!   differ in their top byte on one page, so a shadow keyed on the tagged
 //!   address and a walk that ignored the tag would disagree. This core does
 //!   not implement `TBI` at all — `mmu`'s regime selection reads the full
 //!   64-bit address, and an address carrying a tag falls in neither half and
-//!   faults — so there is nothing to strip and nothing to get wrong.
+//!   takes a translation fault — so there is nothing to strip and nothing to
+//!   get wrong. If it is ever implemented, the tag must be stripped in exactly
+//!   one place and both tables must read it.
 //! * **The two `TTBR`s.** Which base a walk starts from is a pure function of
-//!   the virtual address, so it cannot change under a cached entry the way a
-//!   segment base can on x86. That is what makes AArch64 structurally closer
-//!   to RISC-V here than to the core that cannot publish a plan at all.
+//!   the virtual address, so it cannot change under a cached entry the way an
+//!   x86 segment base can. That is what makes AArch64 structurally closer to
+//!   RISC-V here than to the core that cannot publish a plan at all.
 //! * **Granule selection.** `TCR_EL1.TG0`/`TG1` could in principle name a
 //!   16 KiB or 64 KiB page, which `jit::Tlb`'s fixed 4 KiB index would then
 //!   sub-divide. This core implements only the 4 KiB granule and *faults* on a
@@ -142,19 +160,17 @@
 //!   is conservative rather than wrong.
 //!
 //! The **ASID** is the one that needed checking rather than dismissing, and it
-//! is already solved: `jit::Tlb` stamps `Epoch::translation` into the tag, and
-//! an AArch64 ASID lives in `TTBR0_EL1[63:48]`, so changing it is a `TTBR0`
-//! write and a `TTBR0` write bumps `SysRegs::translation_gen` — the same
-//! counter this core's own TLB is tagged with, and the same one a shadow would
-//! be. The two therefore go stale together, which is exactly the lockstep
-//! `jit::fast` asks for.
+//! turned out to be already solved: `jit::Tlb` stamps `Epoch::translation`
+//! into its tag, and an AArch64 ASID lives in `TTBR0_EL1[63:48]`, so changing
+//! it is a `TTBR0_EL1` write and a `TTBR0_EL1` write bumps
+//! `SysRegs::translation_gen` — the same counter this core's own TLB is tagged
+//! with. The two go stale together, which is exactly the lockstep `jit::fast`
+//! asks for.
 //!
-//! So what is missing is only the shadow itself: `mmu::Tlb` has no
-//! `attach_shadow`, and adding one is a change to the interpreter's own fill
-//! path — the hottest function in the core — which wants its own measurement
-//! rather than being smuggled in beside a frontend. It is the next thing to
-//! do, and on the RISC-V engine the equivalent was worth 97.3% of compiled
-//! loads and 99.8% of compiled stores.
+//! What AArch64 does *not* need is the half that cost the RISC-V engine the
+//! most care: a protection check the page tables know nothing about. There is
+//! no PMP here, so a page the walk permits is a page the compiled path may
+//! reach, and `refresh_shadow` has nothing to refuse a page over.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -167,14 +183,14 @@ use crate::core::space::{AddressSpace, MemAttrs, MemResult};
 use crate::core::value::Width;
 use crate::ir::{Block, InsnStart, IrHost, MemOp, Opcode, RegSlot, verify};
 use crate::jit::{
-    BlockCache, DirtyPages, Dispatcher, Entry, Epoch, FastMem, Frontend, PAGE_MASK, Stop, StoreLog,
-    Translation,
+    BlockCache, DirtyPages, Dispatcher, Entry, Epoch, FastMem, Frontend, MemPlan, PAGE_MASK, Stop,
+    StoreLog, Translation,
 };
 
 use super::exec::{Exec, State, Trap};
 use super::isa::Nzcv;
 use super::lift::{self, Origin, PC, SP, Shape, World};
-use super::mmu::Tlb;
+use super::mmu::{Access, Tlb};
 use super::sysreg::sctlr;
 use super::{Config, Lines};
 
@@ -310,6 +326,11 @@ pub struct Stats {
     pub retired: u64,
     /// Guest instructions the interpreter executed, one per call.
     pub interpreted: u64,
+    /// Compiled loads served from an **inlined** software-TLB probe, with no
+    /// call back into this core's memory path.
+    pub fast_loads: u64,
+    /// Compiled stores served the same way.
+    pub fast_stores: u64,
 }
 
 impl Jit {
@@ -356,6 +377,42 @@ impl Jit {
             smc_interpreted: self.smc,
             retired: self.retired,
             interpreted: self.interpreted,
+            fast_loads: self.fast().0,
+            fast_stores: self.fast().1,
+        }
+    }
+
+    /// What the host code generator's inlined probes served, if there is one.
+    fn fast(&self) -> (u64, u64) {
+        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        {
+            self.disp
+                .backend()
+                .map(crate::jit::x86::Engine::stats)
+                .map_or((0, 0), |s| (s.fast_loads, s.fast_stores))
+        }
+        #[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
+        {
+            (0, 0)
+        }
+    }
+
+    /// Whether this engine can use an `mmu::Tlb` shadow.
+    ///
+    /// Only the host code generator inlines an access ([`FastMem`]); the
+    /// portable backend calls [`IrHost::load`] for every one, so a shadow
+    /// attached for it would be filled and never read. The shadow is not free
+    /// — a fill probes the address space's flat view — so it is asked for by
+    /// the one engine that reads it, and a `jit-host` that fell back to the
+    /// portable backend because the host is not x86-64 Linux does not ask.
+    pub(super) fn wants_shadow(&self) -> bool {
+        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        {
+            self.disp.backend().is_some()
+        }
+        #[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
+        {
+            false
         }
     }
 
@@ -1055,12 +1112,65 @@ impl StoreLog for Host<'_, '_> {
     }
 }
 
-/// No inlined fast path, and the module docs say why: `mmu::Tlb` has no shadow
-/// for a backend to read, so every access takes the call and gets this core's
-/// answer. That is the honest default — a host that published a table it did
-/// not actually use for its own loads would make compiled and interpreted
-/// execution disagree, which is the one thing this crate does not tolerate.
-impl FastMem for Host<'_, '_> {}
+/// The inlined fast path, and exactly what a plan may cover.
+///
+/// A backend that inlines a load skips [`IrHost::load`] entirely — and with it
+/// this core's translation-table walk and the ticks it spends. That looks like
+/// the argument for publishing nothing: a walk cannot be skipped per access,
+/// so a plan whose validity is decided per access is not a plan.
+///
+/// **The plan is not per access. It is per page, and it is decided by the
+/// table the walk already filled.** `mmu::Tlb` has a shadow
+/// (`mmu::Tlb::attach_shadow`) that `Exec::translate` writes in the same
+/// breath as its own entry, at the same index, for the same virtual page. So a
+/// shadow entry exists only where this core's TLB *also* holds the
+/// translation, and an inlined access that hits one is an access whose walk
+/// had already been performed and charged for — which is why the whole cost it
+/// still owes is the one tick [`FastMem::note_fast_load`] charges.
+///
+/// Two things the compiled path cannot do are therefore done once, at fill
+/// time, rather than never:
+///
+/// * the **walk**, by this core, on the miss that filled the entry — and the
+///   entry dies with the core's own, because both are written by the same
+///   eviction and both carry `SysRegs::translation_gen`, which every `TLBI`
+///   and every write to `TTBR0_EL1`, `TTBR1_EL1`, `TCR_EL1` and `SCTLR_EL1`
+///   bumps, the ASID among them because it lives in `TTBR0_EL1[63:48]`;
+/// * the **fault**, which cannot arise: an entry exists only over plain
+///   little-endian RAM covering its whole page, with the permissions the slow
+///   path checks and no constraint left to apply (`jit::Tlb::fill`). AArch64
+///   has no PMP, so unlike RISC-V there is no second permission scheme left
+///   over for a page to be refused on.
+///
+/// Everything a plan does not cover still calls [`IrHost::load`] and gets this
+/// core's answer — a fetch, a misaligned access, an access to a device, an
+/// unprivileged `LDTR`, a page whose translation has been evicted, and every
+/// access at all on a build without a shadow.
+impl FastMem for Host<'_, '_> {
+    fn load_plan(&mut self) -> Option<MemPlan> {
+        self.exec.mem_plan(Access::Load)
+    }
+
+    fn note_fast_load(&mut self) {
+        // `Exec::read_once`, with the translation known cached and the access
+        // itself already done: one bus access is one cycle, and the walk was
+        // charged when the entry was filled.
+        self.exec.charge();
+    }
+
+    fn store_plan(&mut self) -> Option<MemPlan> {
+        self.exec.mem_plan(Access::Store)
+    }
+
+    fn note_fast_store(&mut self, addr: u64, bytes: u64) {
+        // `Exec::write_once` minus the bytes, and then the same move of
+        // `Exec::wrote` into this host's dirty log that `IrHost::store` makes
+        // — so a page written by a compiled store and one written by an
+        // interpreted store reach `StoreLog` by the same route.
+        self.exec.note_fast_store(addr, bytes);
+        self.note_writes();
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1235,6 +1345,26 @@ mod tests {
 
     #[test]
     fn a_block_that_writes_its_own_page_invalidates_its_translation() {
+        // Both JIT engines, and separately: under `jit-host` the store is
+        // **inlined**, so it reaches the block cache through
+        // `Exec::note_fast_store` rather than through `IrHost::store`, and a
+        // mutation pass found that path could stop reporting without anything
+        // noticing while the portable one still did.
+        for engine in [Engine::Jit, Engine::JitHost] {
+            let (_, jit) = agree_on(engine, &NEAR_LOOP, 4096, 8);
+            let stats = jit.jit_stats().expect("a jit core");
+            // Proportional rather than merely non-zero: under `jit-host` all
+            // but a handful of these stores are **inlined**, so a
+            // `note_fast_store` that stopped reporting its page would still
+            // leave the one or two that took the call — and `smc > 0` would
+            // hold while the mechanism was dead. A mutation pass found exactly
+            // that.
+            assert!(
+                stats.smc * 2 > stats.blocks,
+                "a store into the block's own page invalidated almost no \
+                 translation under {engine:?}: {stats:?}"
+            );
+        }
         let (_, jit) = agree(&NEAR_LOOP, 4096, 8);
         let stats = jit.jit_stats().expect("a jit core");
         // Correctness — the two engines agreeing — is what `agree` asserted.
@@ -1281,9 +1411,22 @@ mod tests {
                 .write(addr, Width::U64, value, MemAttrs::DEFAULT)
                 .expect("inside RAM");
         };
+        const L3: u64 = 0x2_2000;
         put(L1, L2 | desc::VALID | desc::TABLE);
         // A 2 MiB identity block at level 2, which covers all of this RAM.
         put(L2, desc::VALID | desc::AF);
+        // Level-2 entry 1: a table, so that virtual `RO_PAGE` can be a
+        // **read-only** 4 KiB page over physical 0x3_0000. `AP[2]` — bit 7 —
+        // is what makes it read-only at both levels.
+        put(L2 + 8, L3 | desc::VALID | desc::TABLE);
+        put(
+            L3,
+            0x3_0000 | desc::VALID | desc::TABLE | desc::AF | (2 << desc::AP_SHIFT),
+        );
+        // Level-3 entry 1: virtual `MOVED_PAGE`, writable, over physical
+        // 0x3_1000 — the page `a_remapping_after_a_tlbi_is_seen_by_a_compiled_load`
+        // moves out from under a cached translation.
+        put(L3 + 8, 0x3_1000 | desc::VALID | desc::TABLE | desc::AF);
         let mut sys = cpu.sysregs();
         sys.ttbr0 = L1;
         // T0SZ = T1SZ = 25 (39-bit halves), TG1 = 0b10 (the 4 KiB granule).
@@ -1469,6 +1612,270 @@ mod tests {
             );
             assert_eq!(interp.sysregs().far_el1, jit.sysregs().far_el1, "FAR_EL1");
             assert_eq!(interp.pc(), jit.pc(), "the pc under {engine:?}");
+        }
+    }
+
+    /// Whether this build has a host code generator, which is the only thing
+    /// that inlines an access.
+    const HOST_BACKEND: bool = cfg!(all(
+        feature = "jit-x86",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ));
+
+    /// The virtual page `enable_mmu` maps read-only.
+    const RO_PAGE: u64 = 0x20_0000;
+
+    /// The virtual page `enable_mmu` maps writably, and that a test remaps.
+    const MOVED_PAGE: u64 = 0x20_1000;
+
+    #[test]
+    fn a_compiled_store_to_a_read_only_page_faults() {
+        // The **load** set and the **store** set are not interchangeable, and
+        // this is the case that says so: a load fills the load set for this
+        // page, and a store served through that entry would write a page the
+        // walk refuses. A store entry exists only because a walk *for a store*
+        // succeeded, which is what checked `AP[2]`.
+        //
+        // Reached from a block, not from the interpreter: the load and the
+        // store are both in the lifted subset, and the store is compiled and
+        // would be inlined if its plan were the wrong one.
+        let program = [
+            0xd2a0_0407, // movz x7, #0x20, lsl #16   ; the read-only page
+            0xf940_00e5, // ldr  x5, [x7]             ; fills the load set
+            0xf900_00e5, // str  x5, [x7]             ; must fault
+            0x1400_0000, // b    .
+        ];
+        for engine in [Engine::Jit, Engine::JitHost] {
+            let interp = core(Engine::Interp, &program);
+            let jit = core(engine, &program);
+            enable_mmu(&interp);
+            enable_mmu(&jit);
+            for cpu in [&interp, &jit] {
+                let mut sys = cpu.sysregs();
+                sys.vbar_el1 = VBAR;
+                cpu.set_sysregs(sys);
+            }
+            for n in 0..3 {
+                assert_eq!(
+                    interp.run_budget(8192),
+                    jit.run_budget(8192),
+                    "quantum {n} under {engine:?}"
+                );
+            }
+            assert_ne!(interp.sysregs().esr_el1, 0, "the store faulted");
+            assert_eq!(
+                interp.sysregs().far_el1,
+                RO_PAGE,
+                "the faulting address is the read-only page"
+            );
+            assert_eq!(
+                interp.sysregs().esr_el1,
+                jit.sysregs().esr_el1,
+                "ESR_EL1 under {engine:?}: a compiled store went through a \
+                 page the walk refuses"
+            );
+            assert_eq!(interp.sysregs().far_el1, jit.sysregs().far_el1, "FAR_EL1");
+            assert_eq!(interp.cycles(), jit.cycles(), "cycles under {engine:?}");
+            // and the page really is untouched in both.
+            for cpu in [&interp, &jit] {
+                let space = cpu.space().expect("the core has its space");
+                assert_eq!(
+                    space
+                        .read(0x3_0000, Width::U64, MemAttrs::DEFAULT)
+                        .expect("mapped"),
+                    0,
+                    "a refused store wrote the page anyway, under {engine:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_remapping_after_a_tlbi_is_seen_by_a_compiled_load() {
+        // The shadow's stamp is `SysRegs::translation_gen`, which is what a
+        // `TLBI` and every write to `TTBR0_EL1`, `TTBR1_EL1`, `TCR_EL1` and
+        // `SCTLR_EL1` bump — and it is the *only* thing standing between a
+        // compiled load and a page the guest has since moved. A mutation pass
+        // found that a fill which stamped zero instead survived everything
+        // else in this file, because nothing else ever remapped a page under a
+        // cached translation.
+        let program = [
+            0xd282_0007, // movz x7, #0x1000
+            0xf2a0_0407, // movk x7, #0x20, lsl #16   ; x7 = MOVED_PAGE
+            0xf940_00e5, // ldr  x5, [x7]
+            0x17ff_ffff, // b    .-4                  ; so the load repeats
+        ];
+        for engine in [Engine::Jit, Engine::JitHost] {
+            let interp = core(Engine::Interp, &program);
+            let jit = core(engine, &program);
+            for cpu in [&interp, &jit] {
+                enable_mmu(cpu);
+                let space = cpu.space().expect("the core has its space");
+                space
+                    .write(0x3_1000, Width::U64, 0x1111, MemAttrs::DEFAULT)
+                    .expect("inside RAM");
+                space
+                    .write(0x3_2000, Width::U64, 0x2222, MemAttrs::DEFAULT)
+                    .expect("inside RAM");
+            }
+            for _ in 0..4 {
+                interp.run_budget(8192);
+                jit.run_budget(8192);
+            }
+            assert_eq!(interp.x(7), MOVED_PAGE, "the program addressed the page");
+            assert_eq!(interp.x(5), 0x1111, "the first mapping was read");
+            assert_eq!(interp.x(5), jit.x(5), "x5 under {engine:?}");
+
+            // Move the page and invalidate, exactly as a `TLBI` does: the
+            // generation is the whole of the invalidation here.
+            for cpu in [&interp, &jit] {
+                let space = cpu.space().expect("the core has its space");
+                space
+                    .write(
+                        0x2_2000 + 8,
+                        Width::U64,
+                        0x3_2000 | desc::VALID | desc::TABLE | desc::AF,
+                        MemAttrs::DEFAULT,
+                    )
+                    .expect("inside RAM");
+                let mut sys = cpu.sysregs();
+                sys.translation_gen = sys.translation_gen.wrapping_add(1);
+                cpu.set_sysregs(sys);
+            }
+            let before = jit.jit_stats().expect("a jit core").fast_loads;
+            for _ in 0..4 {
+                interp.run_budget(8192);
+                jit.run_budget(8192);
+            }
+            assert_eq!(interp.x(5), 0x2222, "the interpreter saw the new mapping");
+            assert_eq!(
+                interp.x(5),
+                jit.x(5),
+                "x5 under {engine:?}: a compiled load read a page the guest \
+                 had already moved out from under it"
+            );
+            assert_eq!(interp.cycles(), jit.cycles(), "cycles under {engine:?}");
+            // And the inlined path is live on *both* sides of the bump, which
+            // is what makes the comparison above about the stamp rather than
+            // about a shadow that quietly stopped working: a fill that stamped
+            // the wrong generation would be invisible to the plan, every
+            // access would take the call, and the answers would still agree.
+            let stats = jit.jit_stats().expect("a jit core");
+            if engine == Engine::JitHost && HOST_BACKEND {
+                assert!(before > 0, "nothing was inlined before the remap");
+                assert!(
+                    stats.fast_loads > before,
+                    "nothing was inlined after the remap: {stats:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_compiled_store_breaks_an_exclusive_reservation() {
+        // The exclusives are outside the lifted subset, so a `LDXR`/`STXR`
+        // pair is interpreted — but a **compiled** store between them still
+        // has to break the reservation, and an inlined one does not go through
+        // `Exec::store`, which is where that normally happens. A mutation pass
+        // found that dropping it from `Exec::note_fast_store` survived
+        // everything else here.
+        let program = [
+            0xd282_0007, // movz x7, #0x1000        ; the scratch page
+            0xc85f_7ce5, // ldxr x5, [x7]           ; interpreted; takes it
+            0x9100_04c6, // add  x6, x6, #1
+            0xf900_00e6, // str  x6, [x7]           ; compiled, and inlined
+            0xc808_7ce6, // stxr w8, x6, [x7]       ; interpreted; must fail
+            0x17ff_fffc, // b    .-16                ; round again, so the
+                         //                            store is inlined from
+                         //                            the second pass on
+        ];
+        for engine in [Engine::Jit, Engine::JitHost] {
+            let interp = core(Engine::Interp, &program);
+            let jit = core(engine, &program);
+            for _ in 0..4 {
+                interp.run_budget(4096);
+                jit.run_budget(4096);
+            }
+            assert_eq!(
+                interp.x(8),
+                1,
+                "the store-exclusive failed, because the store between the \
+                 pair broke the reservation"
+            );
+            assert_eq!(
+                interp.x(8),
+                jit.x(8),
+                "x8 under {engine:?}: a compiled store left the reservation \
+                 standing, so a `STXR` that must fail succeeded"
+            );
+            assert_eq!(interp.cycles(), jit.cycles(), "cycles under {engine:?}");
+            // The store has to be the *inlined* one, or this tests
+            // `Exec::store`'s reservation rule rather than
+            // `Exec::note_fast_store`'s — which is the one with no other
+            // coverage.
+            let stats = jit.jit_stats().expect("a jit core");
+            if engine == Engine::JitHost && HOST_BACKEND {
+                assert!(
+                    stats.fast_stores > 0,
+                    "the store between the pair was never inlined: {stats:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_compiled_access_is_served_from_the_inlined_probe() {
+        // The claim `FastMem` makes, asserted rather than assumed: a compiled
+        // load and a compiled store resolve through the shadow this core fills
+        // in lockstep with its own TLB, without calling back. Only the host
+        // code generator inlines anything, so the portable backend must have
+        // served none — which is the other half of the claim, because a
+        // non-zero count there would mean the number came from somewhere other
+        // than generated code.
+        for engine in [Engine::Jit, Engine::JitHost] {
+            for paged in [false, true] {
+                let interp = core(Engine::Interp, &LOOP);
+                let jit = core(engine, &LOOP);
+                if paged {
+                    enable_mmu(&interp);
+                    enable_mmu(&jit);
+                }
+                for n in 0..8 {
+                    assert_eq!(
+                        interp.run_budget(8192),
+                        jit.run_budget(8192),
+                        "quantum {n} under {engine:?}, paged {paged}"
+                    );
+                }
+                assert_eq!(
+                    interp.cycles(),
+                    jit.cycles(),
+                    "the cycle counter under {engine:?}, paged {paged}: an \
+                     inlined access must charge exactly what the call it \
+                     replaced charged"
+                );
+                for n in 0..31 {
+                    assert_eq!(interp.x(n), jit.x(n), "x{n} under {engine:?}");
+                }
+                let stats = jit.jit_stats().expect("a jit core");
+                if engine == Engine::JitHost && HOST_BACKEND {
+                    assert!(
+                        stats.fast_loads > 0,
+                        "no compiled load was inlined, paged {paged}: {stats:?}"
+                    );
+                    assert!(
+                        stats.fast_stores > 0,
+                        "no compiled store was inlined, paged {paged}: {stats:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        (stats.fast_loads, stats.fast_stores),
+                        (0, 0),
+                        "the portable backend inlines nothing: {stats:?}"
+                    );
+                }
+            }
         }
     }
 
