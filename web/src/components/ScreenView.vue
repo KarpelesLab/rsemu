@@ -15,9 +15,16 @@ const props = defineProps({
   aspect: { type: String, default: "tv" },
   paused: { type: Boolean, default: false },
   live: { type: Boolean, default: false },
+  /** Whether the guest takes keys, which is what makes the picture focusable. */
+  keyboard: { type: Boolean, default: false },
 });
 
-const emit = defineEmits(["ready"]);
+const emit = defineEmits(["ready", "focus", "blur"]);
+
+// A picture is not focusable unless there is something to type at. Giving
+// every canvas a tab stop would put a dead stop in the page's tab order for
+// the machines that have no keyboard, which is most of them.
+const focused = ref(false);
 
 const stage = ref(null);
 const canvas = ref(null);
@@ -77,13 +84,24 @@ defineExpose({ canvas });
         :width="width || 256"
         :height="height || 240"
         role="img"
+        :class="{ focused: keyboard && focused }"
+        :tabindex="keyboard ? 0 : undefined"
         :aria-label="`Emulated display, ${width} by ${height} pixels`"
+        @focus="((focused = true), emit('focus'))"
+        @blur="((focused = false), emit('blur'))"
       ></canvas>
       <div v-if="live && paused" class="paused-badge">Paused</div>
     </div>
     <p class="readout mono">
       {{ width }}&times;{{ height }} &middot; &times;{{ scale }}
       {{ aspect === "tv" ? "at 4:3" : "square pixels" }}
+    </p>
+    <p v-if="keyboard" class="readout">
+      <template v-if="focused">
+        Keys reach the guest's keyboard &mdash; make and break codes, as the wire carries
+        them.
+      </template>
+      <template v-else>Click the picture to type at it.</template>
     </p>
   </div>
 </template>
@@ -119,6 +137,12 @@ defineExpose({ canvas });
   image-rendering: crisp-edges;
   background: #000;
   border-radius: 2px;
+}
+
+.screen:focus-visible,
+.screen.focused {
+  outline: 2px solid var(--phosphor);
+  outline-offset: 3px;
 }
 
 .paused-badge {

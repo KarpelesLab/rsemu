@@ -34,6 +34,13 @@ const image = ref(FROM_FILE);
 let romBytes = null;
 const rom = ref(null); // { name, size } | null
 
+// The second bay. A boot binds one image to one slot, so a PC could be handed
+// either rsemu's own BIOS or a diskette and never both; `rsemu_stage_media`
+// fills the other slots, and this is the page's side of it. What is staged
+// lives in the module, so only a description of it is kept here.
+const bay = ref(0);
+const staged = ref([]); // [{ slot, name, size }]
+
 const booted = ref(false);
 // What is actually running, as opposed to what the picker is showing. The
 // console pane needs it: RSMON and the Woz Monitor take different commands.
@@ -41,6 +48,9 @@ const running = ref(null);
 const paused = ref(true);
 const hasVideo = ref(false);
 const hasConsole = ref(false);
+// Whether the guest takes *keys* rather than characters. A PC does; a monitor
+// does not, and nothing has both. It is what makes the picture focusable.
+const hasKeyboard = ref(false);
 // Whether the machine has controllers, which is not the same as having a
 // picture: a display panel with no game pad would otherwise get a d-pad drawn
 // for hardware it does not have.
@@ -129,19 +139,41 @@ const catalogGroups = computed(() => [
 // supplied itself.
 watch(entry, (m) => {
   image.value = m && m.builtins.length > 0 ? 0 : FROM_FILE;
+  // Staged media belongs to the machine it was staged for — the module keyed
+  // it by slot *name* and would refuse an unknown one at boot. Dropping it
+  // here is what keeps that from being a confusing error the visitor caused
+  // two clicks ago.
+  clearStaged();
+  bay.value = 0;
 });
+
+// Every media slot this machine has that the next boot will *not* fill
+// itself: a PC's diskette drive, its second IDE bay, its video option-ROM
+// socket. The boot's own slot is excluded because binding it twice is
+// ambiguous, and the module refuses it rather than picking one.
+const bootSlot = computed(() => {
+  const b = chosenImage.value;
+  if (b) return b.slot;
+  return fromFile.value && needsMedia.value ? (entry.value?.media ?? null) : null;
+});
+const spareSlots = computed(() =>
+  (entry.value?.slots ?? []).filter((s) => s.name !== bootSlot.value),
+);
 
 const bootHint = computed(() => {
   const m = entry.value;
   if (!m) return "";
+  const also = staged.value.length
+    ? ` Plus ${staged.value.map((s) => `${s.name} in “${s.slot}”`).join(", ")}.`
+    : "";
   const b = chosenImage.value;
   if (b) {
-    return `${b.name} is compiled into this page — nothing to upload. It goes in the “${b.slot}” slot: ${b.summary}.`;
+    return `${b.name} is compiled into this page — nothing to upload. It goes in the “${b.slot}” slot: ${b.summary}.${also}`;
   }
   if (!m.media) return `${m.name} takes no image at all.`;
   return rom.value
-    ? `${rom.value.name} · ${bytes(rom.value.size)} ready for the “${m.media}” slot.`
-    : `${m.name} loads a file into its “${m.media}” slot. Choose one, or drop it on the page.`;
+    ? `${rom.value.name} · ${bytes(rom.value.size)} ready for the “${m.media}” slot.${also}`
+    : `${m.name} loads a file into its “${m.media}” slot. Choose one, or drop it on the page.${also}`;
 });
 
 /**
@@ -257,6 +289,7 @@ async function bootWith(m, b) {
   running.value = { machine: m, image: b };
   hasVideo.value = session.hasVideo;
   hasConsole.value = session.hasConsole;
+  hasKeyboard.value = session.hasKeyboard;
   hasPad.value = session.hasPad;
   aspect.value = defaultAspect(session.width, session.height);
   const on = b ? ` on ${b.name}` : rom.value ? ` — ${rom.value.name}` : "";
@@ -318,6 +351,7 @@ function eject() {
   running.value = null;
   hasVideo.value = false;
   hasConsole.value = false;
+  hasKeyboard.value = false;
   hasPad.value = false;
   say("Machine shut down.");
 }
@@ -336,6 +370,35 @@ async function takeFile(file) {
 
 function onRomPicked(event) {
   takeFile(event.target.files?.[0]);
+}
+
+/** Put a file the visitor opened into one of the slots the boot leaves empty. */
+async function onBayPicked(event) {
+  const file = event.target.files?.[0];
+  event.target.value = ""; // so the same file can be staged again
+  if (!file) return;
+  const slot = spareSlots.value[bay.value];
+  if (!slot) return;
+  const image = new Uint8Array(await file.arrayBuffer());
+  try {
+    session.stageMedia(entry.value, slot, image);
+  } catch (e) {
+    say(String(e?.message ?? e), true);
+    return;
+  }
+  staged.value = [
+    ...staged.value.filter((s) => s.slot !== slot.name),
+    { slot: slot.name, name: file.name, size: image.length },
+  ];
+  say(
+    `${file.name}: ${bytes(image.length)} read into the “${slot.name}” slot. ` +
+      `Boot to run it. Nothing was uploaded.`,
+  );
+}
+
+function clearStaged() {
+  session.clearMedia();
+  staged.value = [];
 }
 
 function clearRom() {
@@ -434,7 +497,10 @@ function onStatePicked(event) {
             :aspect="aspect"
             :paused="paused"
             :live="booted"
+            :keyboard="hasKeyboard"
             @ready="onCanvas"
+            @focus="session.screenFocused = true"
+            @blur="session.screenFocused = false"
           />
 
           <TerminalView
@@ -542,6 +608,39 @@ function onStatePicked(event) {
               </label>
               <button v-if="rom" class="btn" type="button" @click="clearRom">Clear</button>
             </div>
+
+            <!-- The second bay. A boot fills one slot; this fills the rest, so
+                 a PC can come up on the BIOS this page carries with a diskette
+                 the visitor opened in the drive. -->
+            <fieldset v-if="spareSlots.length" class="images">
+              <legend>Also insert</legend>
+              <div class="row">
+                <select v-model.number="bay" aria-label="Media slot">
+                  <option v-for="(s, i) in spareSlots" :key="s.name" :value="i">
+                    {{ s.name }}
+                  </option>
+                </select>
+                <label class="file">
+                  <span>Choose file</span>
+                  <input
+                    type="file"
+                    accept=".img,.ima,.bin,.rom,.iso,application/octet-stream"
+                    aria-label="Image for the selected media slot"
+                    @change="onBayPicked"
+                  />
+                </label>
+              </div>
+              <p v-for="s in staged" :key="s.slot" class="hint mono">
+                {{ s.slot }} &larr; {{ s.name }} &middot; {{ bytes(s.size) }}
+              </p>
+              <button v-if="staged.length" class="btn" type="button" @click="clearStaged">
+                Eject staged media
+              </button>
+              <p v-else class="hint">
+                Read here, never uploaded. It survives a reboot, and it is bound alongside
+                whatever the boot above chooses.
+              </p>
+            </fieldset>
 
             <button class="btn btn-primary boot" type="button" :disabled="!canBoot" @click="boot">
               {{ booted ? "Reboot" : "Boot" }}

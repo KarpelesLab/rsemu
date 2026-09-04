@@ -241,7 +241,7 @@ the missing Advanced SIMD `MOVI Dd, #0` in an early build of `fp_rules` was
 diagnosed in one line.
 
 **Generating a corpus removes the licensing problem completely. It does not by
-itself remove the evidence problem**, so four of the six guests take their
+itself remove the evidence problem**, so most of the guests take their
 expectations from outside this project:
 
 | Guest | Expectations come from |
@@ -252,14 +252,18 @@ expectations from outside this project:
 | `integer` | `rustc` again for the arithmetic — but the value is the *instruction selection*, which nobody here chose: `SDIV`+`MSUB`, `UMULH`+`MADD`+`ADCS`, `RBIT`+`CLZ`, and several hundred instructions of `compiler_builtins` for a `u128` divide |
 | `memory` | properties (a byte written is the byte), plus DDI 0487 B2.9 for the exclusive-monitor cases |
 | `fp_rules` | **ours**, transcribed from DDI 0487: the rounding modes, `FPSR`'s sticky flags, `FCMP`'s four-way `NZCV`, `FPMulAdd`'s NaN order. Directed tests that happen to run in a guest, not conformance evidence — the file says so at the top |
+| `fp_natural` | `rustc` again, over the operand shapes ordinary code produces rather than the pathological ones `fp_arith` picks |
+| `sat` | `std`'s `saturating_*`, which is the same specification the A64 saturating arithmetic implements and a second implementation of it |
+| `timer` | **ours**, from DDI 0487 D11: the counter, both EL1 comparators, `CNTKCTL_EL1`'s EL0 trap. Directed, like `fp_rules`, and checked by mutation |
 
 | Variable | Effect |
 | --- | --- |
 | `RSEMU_A64_TESTS=/path` | where the built guests are; without it the test prints how to build them and passes |
 | `RSEMU_A64_TESTS_ONLY=fp_arith,memory` | run only the guests whose name contains one of these |
 
-**6 of 6** as of the commit that added floating point, with an empty ledger,
-over 243 949 charged bus accesses. The runner prints that number per guest and
+**9 of 9** with an empty ledger, over 393 763 charged bus accesses. (It was
+6 of 6 when this section was written; `fp_natural`, `sat` and `timer` joined
+it afterwards.) The runner prints that number per guest and
 asserts the total is non-zero: a pass count on its own cannot tell a clean run
 from a guest whose body was optimised away.
 

@@ -9,8 +9,9 @@ is never run is a target that quietly stops working.
 rsemu's own monitors, one board's demonstration firmware, the Woz Monitor of
 1976, and rsemu's own legacy PC BIOS — so the first thing on the page is a row
 of buttons rather than a file picker, and a visitor is typing at a 1976 monitor,
-or watching a PC/AT post, a few seconds after landing. The other three want a
-cartridge, which is the visitor's to supply.
+or watching a PC/AT post — and now typing at it, and booting a diskette on it —
+a few seconds after landing. The other three want a cartridge, which is the
+visitor's to supply.
 
 It is a **Vue 3 application built by Vite**, published to
 <https://karpeleslab.github.io/rsemu/> by `.github/workflows/pages.yml`.
@@ -110,6 +111,17 @@ Three layers, and it is what gates the Pages deploy:
    `decodeGuest` is checked on its own for all three line endings, because the
    two it does not currently meet are the ones the next board will.
 
+   The PC/AT gets a *second* transcript, and it is the negative of the first.
+   A 1.44 MB diskette is staged into the board's `floppy` slot and the firmware
+   is bound from the module — two slots, one boot — and then the third line's
+   first glyph has to be the `B` of `Booting.` rather than the `N` of `No
+   bootable device.`, because `INT 19h` found a `0x55 0xAA` and the sector's own
+   `INT 10h` printed one. Eject the diskette and the `N` comes back. The
+   keyboard is checked beside it, at both layers: `A` down and up through the
+   ABI, a key this keyboard has not got putting *nothing* on the wire, and then
+   the session's rule that keys reach a PC only while the picture has focus —
+   and that losing the window releases every key still down.
+
 Everything except the DOM, in other words. It does **not** prove Vue renders,
 that the layout works, or that anything is legible — nothing in this repository
 has a browser. That part still needs a human.
@@ -133,7 +145,7 @@ the module it fetched, so this table describes the build rather than the page:
 | `apple1` | a console: RSMON, rsemu's own monitor | no |
 | `beneater-6502` | a serial console, and a choice of *two* monitors: RSMON, or the Woz Monitor of 1976 | no |
 | `spi-panel` | a picture with nothing uploaded: an RV32 board configures an ST7272A over SPI and paints a gradient | no |
-| `pc-at` | **firmware, running**: rsemu's own BIOS posts on the board's VGA at 720×400 | no — the `bios` slot takes your own image if you have one |
+| `pc-at` | **firmware, running**: rsemu's own BIOS posts on the board's VGA at 720×400, and you can type at it and boot a diskette on it | no — the `bios` slot takes your own image if you have one, and the `floppy`, `hd0`, `hd1` and `vgabios` slots take one *as well* |
 
 The three that want a file sit in the same quadrant as each other and a
 different one from the rest: there is nothing to press until the visitor opens
@@ -143,7 +155,7 @@ page says so — the picker puts the two quadrants in their own `<optgroup>`s,
 `check.mjs` proves the path anyway by generating a cartridge of its own for
 each of them.
 
-The module is **3.05 MB** (≈775 KB over the wire, gzipped). The Game Boy and
+The module is **3.08 MB** (≈782 KB over the wire, gzipped). The Game Boy and
 the Master System cost **406 KB** of that between them — two CPU cores (SM83
 and Z80) and two video chips, which is most of a console each; measured as
 1 416 362 bytes before and 1 822 234 after, both `--release` and unstripped.
@@ -208,7 +220,9 @@ empty-bay list, 2 975 bytes between them. Nothing here turns on that.)
 | `z80-mini` | +4 578 | same — and being nearly free is not a reason for a catalog row that cannot do anything |
 | `arm926`, `stm32f407` | — | same |
 | `q35` | +190 802 *on top of `pc-at`* | a second POST screen. Its `bios` slot does **not** in fact default to rsemu's image, whatever `Cargo.toml` used to say: neither `builtin_bios` in `src/bin/rsemu.rs` nor `builtin_media` in `src/ffi/abi.rs` has a `q35` arm |
-| `pc64`, `q35-linux` | +523 702 | they do reach a shell prompt on an uploaded `bzImage` — after several hundred *guest* seconds (`docs/platforms/pc64.md`), and with an initrd in a second media slot, which this ABI cannot bind |
+| `pc64`, `q35-linux` | +523 702 together, +285 751 for `q35-linux` alone | they do reach a shell prompt on an uploaded `bzImage` — after several hundred *guest* seconds (`docs/platforms/pc64.md`), and on a stock kernel the visitor would have to find. The second media slot is no longer the obstacle (see below); the wall clock is |
+| `arm64-virt` | +362 417 | measured against the current baseline. Wants a Debian arm64 `Image` **and** an initramfs, neither of which rsemu ships; three minutes of *native* host time to reach busybox interpreted (`docs/platforms/arm64-virt.md`), and a browser is slower than that |
+| `q35-uefi` | +222 399 | measured against the current baseline. Wants an OVMF build copied off the visitor's own distribution, and the board **has no display and emits no serial output at all** — it would be a black rectangle that stops in the DXE dispatcher (`docs/platforms/q35-uefi.md`) |
 | `nvme-mini` | +358 717 | wants a disk image, and has neither a screen nor a console to show you it read it |
 | `xhci-pci-mini` | +466 147 | has no processor at all: it would realize, run, and be a black rectangle |
 | `ahci-mini`, `usb-mini`, `hub-mini`, `xhci-mini` | — | a firmware *and* a disk image, and nothing to look at either way |
@@ -219,26 +233,68 @@ three times. And the PC boards' BIOS is not the user's to supply any more; it
 is rsemu's, which is the entire reason `pc-at` is on the page.
 
 **What would change the answer.** A board that can reach a prompt in a browser
-without a file it does not have. Three specific things would do it, and none of
-them is in `web/`:
+without a file it does not have. Three specific things would do it. **Two are
+now built**, and neither was a board:
 
-* **A multi-slot media binding in the ABI.** `rsemu_boot` binds the uploaded
-  bytes to `entry.media.first()` and nothing else, so `pc-at` can take a BIOS
-  but not a boot floppy, and `pc64` cannot take a kernel *and* an initrd. A
-  `rsemu_stage_media(slot, len)` accumulating before `rsemu_boot` would give the
-  page "boot this floppy on rsemu's BIOS", which is the obvious next thing to
-  want from this board.
-* **A keyboard path.** `pc.kbc` opens a character port carrying **raw AT scan
-  codes**, so the page cannot type at a PC the way it types at an Apple 1.
-  `host::input`'s `KeyMap` (keysym → set-2 scan codes) and `KeyboardSink`
-  already exist for the VNC front end; one `rsemu_key(keysym, down)` export
-  would reuse both, and X11 keysyms for printable ASCII *are* the ASCII codes,
-  so the JavaScript side is nearly free. Until then `rsemu_has_console`
-  deliberately answers `0` for `pc-at` rather than putting a terminal pane in
-  front of a keyboard.
+* **A multi-slot media binding in the ABI — built.** `rsemu_boot` binds one
+  uploaded image to `entry.media.first()` and nothing else, so `pc-at` could
+  take a BIOS or a boot diskette and never both — and since the BIOS is the one
+  the module *carries*, "both" was the only interesting case.
+  `rsemu_stage_media(machine, slot, len)` fills the other slots before a boot,
+  and `rsemu_machine_media_count`/`_name` are how a page learns their names.
+  Rule 2 is intact: a slot is an *index*, resolved to its name inside the
+  module, so no string crosses in. A staged slot the booting machine has not
+  got, or one the boot binds itself, is **refused** rather than ignored — a
+  diskette quietly not in the drive is the failure the call exists to remove.
+* **A keyboard path — built.** `pc.kbc` opens a character port carrying **raw
+  AT scan codes**, so the page could not type at a PC the way it types at an
+  Apple 1. `rsemu_key(keysym, down)` hands one key transition to
+  `host::input::KeyboardSink`, which is the same object and the same
+  keysym→set-2 table the VNC front end uses — so a browser and a VNC client now
+  type at a PC through one piece of code. X11 keysyms for printable ASCII *are*
+  the ASCII codes, so `src/rsemu.js` needs a table only for the keys with names.
+  `rsemu_has_keyboard` is a different question from `rsemu_has_console` and on
+  a PC they are opposites. No machine in this build answers yes to both, but
+  nothing forbids one — a PC with a serial console would — so the page asks both
+  rather than inferring one from the other.
 * **A built-in demonstration program for one of the bare boards**, the way
   `spi-panel` has one. `z80-mini` is 4.5 KB of module away from being on this
-  page; what it lacks is thirty bytes of Z80 to run.
+  page; what it lacks is thirty bytes of Z80 to run. Still true, still not done.
+
+**The two together cost 6 142 bytes** — 3 072 043 before and 3 078 185 after,
+`--release` and unstripped; 2 122 more gzipped. That is 0.2% of the module for
+the difference between watching a PC post and *using* one, which is why they
+were worth more than any board in the table above: every one of those costs
+between forty and two hundred times as much and none of them can be typed at.
+
+### The second bay, and typing at a PC
+
+What the page does with them:
+
+* The **Also insert** field lists every slot the next boot will not fill
+  itself — for `pc-at` booting rsemu's BIOS that is `vgabios`, `floppy`, `hd0`
+  and `hd1` — and a file opened into one is staged, not uploaded. It survives a
+  reboot, so **Reboot** reboots the same diskette, and it is dropped when the
+  machine changes, because the module keyed it by slot name and would refuse an
+  unknown one at boot.
+* The **picture becomes focusable** on a machine with a keyboard, and only
+  then: `pc-at` is the only one of this build's nine catalog entries that has one,
+  and a canvas with a tab stop on every board would put a dead stop in the tab
+  order for the other eight. Keys reach the guest while
+  it has focus and not otherwise — a stronger rule than the console pane's, and
+  for a stronger reason: a PC wants Tab and the arrow keys, which are how the
+  rest of this page is navigated.
+* Both directions cross, because make and break codes are what the wire
+  carries. `session.js` keeps the set of keysyms it has sent down so that losing
+  the window can release every one — nothing on the module's side can know the
+  window went away, and a key left down is a key genuinely held.
+
+`src/wasm.rs` proves the pair end to end in its own tests, and `check.mjs`
+proves it again from JavaScript: a hand-encoded diskette whose boot sector
+teletypes one `B`, staged into `floppy`, booted under the firmware from the
+module, and then the third line of the POST screen has to *be* that `B` — the
+same nine-by-sixteen block of ink as the `B` of `Booting.` above it. Eject it
+and `No bootable device.` comes back. No font table at either end.
 
 ## What is wired and what is not
 
@@ -303,6 +359,13 @@ them is in `web/`:
   for one — the same line `src/bin/rsemu.rs` draws, by the same name. A terminal
   pane in front of it would show an empty screen and send `0x41` for `A` meaning
   the `9` key.
+
+  It does have a **keyboard**, which is that same port read as the hardware it
+  is. `rsemu_key` hands a keysym to `host::input::KeyboardSink`, which puts the
+  set-2 make or break codes on the wire, and the 8042 on the other end reads
+  them exactly as it would off a real keyboard's clock and data lines. So
+  `rsemu_has_console` still answers `0` for this board and `rsemu_has_keyboard`
+  answers `1`, and the page draws a focusable picture rather than a terminal.
 * **`spi-panel`** — the second display path in the page, and the reason
   `rsemu_frame_ptr` is documented as RGBA rather than "whatever the adapter
   prefers": this board's scanout engine would rather hand out `RGB888`, and an
@@ -361,7 +424,8 @@ repeating here:
 2. **Machines are named by index**, because a build is a feature set and the
    page has to ask what this one contains anyway. No string ever crosses in —
    and that holds for the built-in images too, which are an index within a
-   machine.
+   machine, and for the media slots `rsemu_stage_media` fills, which are
+   another.
 3. **One machine at a time.** A second instance is a second module.
 
 `src/rsemu.js` is unchanged by the move to Vue except for its location: it is

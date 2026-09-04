@@ -70,6 +70,34 @@ the question never arises.
 | [`platforms/arm64-virt.md`](platforms/arm64-virt.md) | The AArch64 `virt` board: a GICv2, a PL011, PSCI, and a generated device tree |
 | [`platforms/stm32f407.md`](platforms/stm32f407.md) | The `stm32f407` microcontroller board, its peripherals, and how an M-profile interrupt is wired |
 
+#### Which board boots what, and how far
+
+The pages above are one per board and each is a ledger of what is still in the
+way; this table is the thing you cannot get by reading seven of them, which is
+how they compare. **Every row is a measurement, not a gate**: no operating-system
+boot here runs in CI, because each needs a kernel or a firmware image rsemu does
+not ship (§1), and each is behind an environment variable that names one. The
+hermetic tests beside them — which do run on every `cargo test` — drive the same
+hardware with a guest this repository builds.
+
+| Board | CPU | Boots | How far, and what is in the way |
+| --- | --- | --- | --- |
+| [`riscv-virt`](platforms/riscv-virt.md) | RV64GC | OpenSBI 1.6, Linux 6.12, EDK II | **furthest of any board here.** Linux to a shell that echoes typed input, on a generated DTB, with the console handed over to our own 16550A and a virtio disk mounted; EDK II to an interactive `Shell>` prompt out of two CFI NOR banks, with a variable written in one run read back in the next |
+| [`arm64-virt`](platforms/arm64-virt.md) | AArch64 | Debian's arm64 kernel | a busybox shell, and `poweroff -f` typed at it stopping the machine through PSCI. **One core only** (the GICv2 cannot map a requester to a CPU interface), **no block device** (virtio-mmio here is reachable only from a RISC-V build), no RTC, no `EOImode`, no `AT S1E1R` |
+| [`pc-at`](platforms/pc-at.md) | i386-class | FreeDOS 1.3, on firmware this repo assembles | a live `COMMAND.COM` prompt. **The installer cannot be driven past its first keystroke** — `pc.kbc` delivers one and then goes silent |
+| [`q35`](platforms/q35.md) | x86-64 | a user-supplied PC firmware; rsemu's own BIOS | a firmware boot prompt, and a guest booted off IDE under our BIOS. **No operating system on the third-party path**; no SMP, no SMM, and S5 does not power off |
+| [`pc64`](platforms/pc64.md) | x86-64 | a stock Linux `bzImage`, entered directly | a shell that echoes typed input, on an initramfs — no PCI, so no other root is possible. Needs `cryptomgr.notests` on the command line |
+| [`q35-linux`](platforms/q35-linux.md) | x86-64 | the same, plus the chipset and a disk | a shell **on the board's own default command line**, reading bytes off an NVMe namespace through the kernel's own driver and a level-triggered interrupt. Its ledger is empty; **two of the four obstacles it named were refuted rather than fixed**, which is why the page is worth reading. Also the only board measured **under KVM**: the same boot in about ten seconds of wall clock against 973 interpreted, 279 of 347 console lines byte-identical — but needing `no_timer_check`, which the interpreted run does not |
+| [`q35-uefi`](platforms/q35-uefi.md) | x86-64 | a distribution's OVMF, out of NOR flash | the **DXE dispatcher**, and no further: it stops on `MOV RAX, CR8`, which this core raises `#UD` for. The board has no video and no `0x402` debug port, so the firmware prints nothing at all and that position is *inferred from register state* |
+
+Boards with no page here — `pc-apic`, `spi-flash`, `spi-panel`, `arm926`,
+`a64-mini`, `mips-mini`, `z80-mini`, `m68k-mini`, `ne2k-mini`, `nvme-mini`,
+`ahci-mini`, `usb-mini`, `xhci-mini`, `xhci-pci-mini`, `hub-mini` — are
+synthetic: the smallest machine that exercises one subsystem, described in
+`machines/*.machine` and in the `Cargo.toml` comment on their feature. They boot
+a guest this repository builds, and there is nothing about them a platform page
+would answer that the machine file does not.
+
 ### Buses
 | | |
 | --- | --- |

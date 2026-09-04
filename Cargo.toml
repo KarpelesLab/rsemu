@@ -123,6 +123,8 @@ display-png = ["std", "dep:oxideav-png"]
 #                       runs real firmware, and the only firmware rsemu ships
 #                       or will (ROADMAP.md phase 6a: the alternatives are all
 #                       GPL, and running one is fine while shipping one is not).
+#                       It is also the one you can *type* at and boot a diskette
+#                       on: `rsemu_key` and `rsemu_stage_media` landed with it.
 #
 # The other three want a cartridge the visitor supplies, read in the page and
 # never uploaded:
@@ -151,14 +153,20 @@ display-png = ["std", "dep:oxideav-png"]
 # wants a kernel or an SBI build — it is no longer "the largest thing this list
 # could add", `pc-at` is, by more than three times. `pc64` (+523 702) and
 # `q35-linux` do reach a shell prompt on an uploaded `bzImage`, but only after
-# several hundred *guest* seconds (docs/platforms/pc64.md) and only with an
-# initrd in a second media slot, which this ABI cannot bind. `q35` (+190 802 on
-# top of pc-at) would be a second POST screen, and its `bios` slot does not in
-# fact default to rsemu's image the way this file used to claim — neither
-# `builtin_bios` in src/bin/rsemu.rs nor `builtin_media` in src/ffi/abi.rs has a
-# q35 arm. The storage and USB boards (nvme-mini +358 717, xhci-pci-mini
-# +466 147, ahci-mini, usb-mini, hub-mini, xhci-mini) want a disk image *and* a
-# firmware and have nothing to look at either way.
+# several hundred *guest* seconds (docs/platforms/pc64.md), and only on a
+# stock kernel the visitor has to find. A second media slot is no longer the
+# obstacle there — `rsemu_stage_media` binds one, for 6 142 bytes of module —
+# but the wall clock still is. `q35` (+190 802 on top of pc-at) would be a
+# second POST screen, and its `bios` slot does not in fact default to rsemu's
+# image the way this file used to claim — neither `builtin_bios` in
+# src/bin/rsemu.rs nor `builtin_media` in src/ffi/abi.rs has a q35 arm.
+# `arm64-virt` (+362 417) wants a Debian arm64 `Image` *and* an initramfs and
+# takes three minutes of native host time to reach busybox interpreted, which a
+# browser cannot better; `q35-uefi` (+222 399) wants an OVMF copied off the
+# visitor's own distribution and has no display and no serial output at all, so
+# it would be a black rectangle. The storage and USB boards (nvme-mini
+# +358 717, xhci-pci-mini +466 147, ahci-mini, usb-mini, hub-mini, xhci-mini)
+# want a disk image *and* a firmware and have nothing to look at either way.
 demo = [
     "wasm",
     "machine-nes",

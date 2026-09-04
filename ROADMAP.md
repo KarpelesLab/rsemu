@@ -21,23 +21,32 @@ This roadmap defines the architecture, the phase order, and the acceptance gate
 for each phase. It is written to be executed top-to-bottom; every phase ships
 something a person can actually run (§2).
 
-> **Status (2026-08-31).** Phases 0-3 are done and phase 4 is well under way.
-> ~160k lines, 1,965 tests, one crate in `cargo tree`, `unsafe` still confined
-> to two of the six sanctioned sites (`core::sync`'s `single` backend and the
-> wasm C ABI).
+> **Status (2026-09-04).** Phases 0-4 are done, phase 5 has landed its IR *and*
+> a host JIT backend, phase 5b has its gate, phase 6a is met and 6b is close,
+> and phase 7 has a working KVM backend. ~417k lines of Rust across 411 files,
+> **5,012 tests** green under `--all-features`, one crate in `cargo tree`, and
+> `unsafe` in **five of the seven** sanctioned sites: `core::sync`'s `single`
+> backend, the C and wasm ABIs, the raw-syscall KVM backend, the JIT's code
+> buffer, and the host signal disposition. The RAM host-pointer fast path and
+> per-CPU execution state have still not needed theirs.
 >
-> **Nine CPU cores.** Where a public corpus exists the number is measured, not
+> **Ten CPU cores.** Where a public corpus exists the number is measured, not
 > asserted: MOS 6502 **2,560,000/2,560,000** with full bus traces, W65C02S
 > **2,530,025/2,540,000**, Z80 **1,604,000/1,604,000** plus `zexall` 67/67,
 > RISC-V RV64GC **409/409**, 8086/8088 **2,974,160/3,007,000** (the gap is one
-> microcode residue in the undefined flags after `IMUL`/`DIV`), and the 68000.
+> microcode residue in the undefined flags after `IMUL`/`DIV`), MIPS R3000A
+> **55,000/55,000**, and the 68000 across all 124 instruction files.
 > Where one does not, the substitute is named rather than glossed: ARMv5TE has
 > no public v5 corpus and leans on the ARM7TDMI v4T subset (§12); **ARMv7E-M**
 > is differentially tested against our own ARMv5TE across all 65,536 halfwords,
 > 83,597 identical and 13,683 divergences *asserted* rather than skipped; SM83
 > passes blargg's `cpu_instrs` and `instr_timing` **12/12** on the assembled
 > machine and Gekkio's acceptance suite **59/66**, with the other seven
-> ledgered and argued (three of them need a boot ROM we cannot ship).
+> ledgered and argued (three of them need a boot ROM we cannot ship). **A64**
+> has no corpus to download at all, so the suite is nine guests rsemu *builds*
+> for `aarch64-unknown-none`, four of them taking their expectations from
+> `rustc`'s own const-evaluator rather than from us: **9/9**, empty ledger,
+> 393,763 charged bus accesses.
 >
 > The x86 core now also covers the **80386 and 80486** — protected mode, the
 > descriptor tables and their hidden caches, privilege levels, gates, task
@@ -50,11 +59,21 @@ something a person can actually run (§2).
 > 32-bit instructions with no unexpected exception, stopping only where it waits
 > on a timer no machine has supplied yet.
 >
-> **Seven machines that run**, plus four synthetic boards. `nes-ntsc` and
+> **Thirty machine files**: fifteen consoles, computers and microcontrollers,
+> and fifteen synthetic boards. `nes-ntsc` and
 > `nes-pal` pass **AccuracyCoin 141/141** — the whole-machine gate, run
 > headlessly, with an empty known-failures ledger. Also `gameboy`; `apple1` and `beneater-6502`,
-> interactive over a terminal; and `riscv-virt`, which is the one that boots
-> real system software: **OpenSBI 1.6 completely**, on a device tree generated
+> interactive over a terminal. **Seven boards now boot software this project did
+> not write, on three architectures** — `riscv-virt`, `arm64-virt`, `pc-at`,
+> `q35`, `pc64`, `q35-linux` and `q35-uefi` — and each has a page under
+> `docs/platforms/` that is a ledger of what is still in the way rather than a
+> success report. None of those boots is in CI: each needs a kernel or a
+> firmware image §1 forbids shipping, so each is behind an environment variable,
+> with a hermetic test beside it that drives the same hardware with a guest this
+> repository builds.
+>
+> `riscv-virt` was the first and is still the furthest: **OpenSBI 1.6
+> completely**, on a device tree generated
 > from the realized machine rather than shipped, then **Linux 6.12 all the way
 > to a shell prompt that echoes what is typed at it** — every initcall, the
 > driver model, the console handover off the SBI earlycon onto our own 16550A,
@@ -64,6 +83,25 @@ something a person can actually run (§2).
 > and reads and writes it. And **EDK2 all the way to a UEFI shell prompt**, out
 > of two CFI NOR flash banks the board maps and the generated tree describes. The variable store is real flash, so a variable written in one run
 > is there in the next. Where each stops is written down, not rounded up.
+>
+> **`arm64-virt`** is the AArch64 board — GICv2, PL011, PSCI, a generated DTB —
+> and Debian's own arm64 kernel **boots to a busybox shell** on it, with
+> `poweroff -f` typed at that shell reaching `PSCI_SYSTEM_OFF` through an `SMC`
+> and stopping the machine. One core only: the GIC cannot yet map a requester to
+> a CPU interface, and there is no block device, because virtio-mmio in this tree
+> is reachable only from a build carrying the RISC-V board's chips.
+>
+> **The x86 side reached 6b's shape.** `pc64` and `q35-linux` enter a stock
+> `bzImage` directly and reach a shell; `q35-linux` does it **on the board's own
+> default command line**, and busybox reads bytes off an **NVMe** namespace
+> through the kernel's own driver, a `_CRS`-assigned BAR and a level-triggered
+> interrupt through the I/O APIC. `q35` runs a third-party PC firmware to a boot
+> prompt over ECAM with generated ACPI tables. `q35-uefi` puts a real OVMF in two
+> NOR banks below 4 GiB and reaches the **DXE dispatcher** — and no further: it
+> stops on `MOV RAX, CR8`, and since that board has no video and no `0x402`
+> debug port the firmware prints nothing at all, so even that position is
+> inferred from register state rather than read off a console.
+>
 > `pc-at` is in the catalog and **boots FreeDOS 1.3 to its installer prompt on
 > firmware this repository assembles from source** — phase 6a's gate. It sizes
 > 16 MiB of RAM, shadows itself out of ROM into RAM through an 82441FX host
@@ -94,14 +132,20 @@ something a person can actually run (§2).
 > denominator. Regenerated from the ROM's own menu, the honest progression is
 > **85/141 → 130/141 → 141/141**.
 >
-> The synthetic boards are `spi-panel`, `arm926`, `z80-mini` and `m68k-mini`:
-> minimum machines that exist so a subsystem has somewhere real to run. Each is
-> the smallest thing that exercises what it is named for — a display path over
-> SPI, an ARMv5TE core with a parameterised peripheral aperture, the Z80's
-> separate I/O space, a 68000 on a big-endian map.
+> The synthetic boards are minimum machines that exist so a subsystem has
+> somewhere real to run: each is the smallest thing that exercises what it is
+> named for — `spi-panel` and `spi-flash` for the two SPI paths, `arm926` and
+> `a64-mini` for the two ARM MMUs, `z80-mini` for the Z80's separate I/O space,
+> `m68k-mini` for a big-endian map, `mips-mini` for a board that maps *physical*
+> addresses, `pc-apic` for the SMP interrupt path, and `ne2k-mini`, `nvme-mini`,
+> `ahci-mini`, `usb-mini`, `xhci-mini`, `xhci-pci-mini` and `hub-mini` for one
+> controller each.
 >
 > Beyond the DSL front-to-back, the framework grew a **gdb stub**, a **scanout
-> seam** with a browser build at <https://karpeleslab.github.io/rsemu/>, and a
+> seam** with a browser build at <https://karpeleslab.github.io/rsemu/> that now
+> carries seven machines — four of them booting on an image the module itself
+> holds, including a PC/AT posting on rsemu's own BIOS that a visitor can type at
+> and boot a diskette on — and a
 > **typed export seam** (§4.4) so one device can hand another a handle — the
 > thing that had blocked the CLINT, and the reason Linux now gets a working
 > `time` CSR. Three mechanisms for that job appeared independently within a day
@@ -132,8 +176,35 @@ something a person can actually run (§2).
 > which is why a sample fetch inside a sprite copy costs it two cycles and not
 > four. And `$4017` is two registers on one address — the frame counter on a
 > write, controller two on a read — which `core::space` grew `Region::split`
-> and the DSL grew `split(reads, writes)` to say. Phase 5's IR and JIT have not
-> been started.
+> and the DSL grew `split(reads, writes)` to say.
+>
+> **Phase 5 is no longer a plan.** The IR, its verifier and its passes are in,
+> the portable backend runs everywhere including bare metal, and there is one
+> **host backend — x86-64 Linux**. RISC-V and x86 both have frontends, both
+> cores take `engine = "interp" | "jit" | "jit-host"`, and all three engines
+> reach identical state hashes at ten checkpoints with a snapshot restoring
+> *across* an engine switch. Measured on 240 s of RISC-V guest time and 900 s of
+> x86: `jit-host` at **2.15×** and **2.65×** over the interpreter — the RISC-V
+> figure having *fallen* from 2.28× because the interpreter it is measured
+> against got 1.27× faster — with **87.6%** of the x86 guest's instructions
+> retiring inside a translated block and 99.8%
+> of compiled RISC-V stores writing guest RAM inline. What is *not* done: the
+> aarch64 backend, the **wasm backend** (§11.4), and the tier-2 pipeline — the
+> browser still runs interpreted. Nor is the ≥100 MIPS half of the gate claimed,
+> because §11's reference host (`docs/bench-host.md`) is still unfilled and this
+> project's own rule is that a gate citing an unpopulated table has not been met.
+>
+> **Phase 5b has its gate.** A hand-built static musl Rust binary runs through
+> musl's `_start` on rv64 and exits 0 with no syscall refused, and the run
+> replays identically with the entropy source replaced by a panicking guard.
+>
+> **Phase 7 has a KVM backend**, Linux x86-64, raw `ioctl`s, no `libc`.
+> `q35-linux` boots the same stock kernel to a shell in **about ten seconds
+> against 973 interpreted**, 279 of 347 console lines byte-identical to the
+> interpreted run once the printk timestamp is removed, and **99.7-101.2% of
+> native** on a pure-execution workload against a gate of 80%. Not yet:
+> `ThreadingMode::Accel` (so an accelerated board runs `Parallel` and is not
+> reproducible), `engine = "kvm"` as a machine-file value, and HVF/WHPX.
 ---
 
 ## 0. Non-negotiables
@@ -1954,6 +2025,15 @@ exactly.
 A static browser demo page — the `fstool` `web/` + GitHub Pages pattern —
 shipping from phase 3: load a ROM, play it, take a save state, all client-side
 with nothing uploaded.
+
+**Done, and past its own brief.** Seven machines, four of which need no file at
+all because the module carries their image — including a PC/AT posting on
+rsemu's own BIOS, which a visitor can type at (`rsemu_key`, keysyms into
+`host::input`'s set-2 table) and boot a diskette on (`rsemu_stage_media`, a
+second media slot bound alongside the firmware). `web/README.md` measures what
+each machine costs in bytes and records why the boards that are *not* there are
+not; `web/check.mjs` verifies the module, the built site, the ABI and the frame
+loop headlessly, and gates the Pages deploy.
 
 ---
 
