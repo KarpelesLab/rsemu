@@ -20,6 +20,7 @@
 //! | `RSEMU_KERNEL_EXTMEM` | How much extended memory to give it, e.g. `512M`. |
 //! | `RSEMU_KERNEL_INPUT` | Types at the guest: one `marker=>text` step per line. |
 //! | `RSEMU_KERNEL_STOP_AT` | Ends the run when the guest prints this, rather than at the clock. |
+//! | `RSEMU_ENGINE` | `interp`, `jit` or `jit-host`, overriding what the machine file's `engine` property said. The three must produce byte-identical output and the same virtual time; what differs is the wall clock. |
 //!
 //! `RSEMU_KERNEL_INPUT` is `src/dev/riscv/tests.rs`'s `RSEMU_RISCV_INPUT` on
 //! this board, and it is here for the same reason: **a prompt that echoes what
@@ -111,7 +112,10 @@ fn bindings(cpus: &Arc<Captured<X86>>) -> Bindings {
     let mut b = rsemu::machine::catalog::bindings().expect("this build's bindings");
     let kept = Arc::clone(cpus);
     b.replace("cpu.x86", move |props| {
-        let cpu = Arc::new(X86::from_props_defaulting(props, Variant::X86_64)?);
+        let cpu = Arc::new(x86boot::with_engine_from_env(X86::from_props_defaulting(
+            props,
+            Variant::X86_64,
+        )?));
         kept.push(&cpu);
         Ok(cpu)
     });

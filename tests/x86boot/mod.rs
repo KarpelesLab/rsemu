@@ -31,6 +31,42 @@ use rsemu::cpu::x86::X86;
 use rsemu::host::chardev::CharPort;
 use rsemu::machine::Machine;
 
+/// The execution engine `RSEMU_ENGINE` asks for, applied to a core the board
+/// has just constructed.
+///
+/// **The shipped x86 machine files write `engine = "interp"` as a literal**
+/// rather than as a `param` the way `machines/riscv-virt.machine` does, so
+/// there is no way to ask a board for a different one from the command line.
+/// Until one of them grows the parameter this is how the three engines are
+/// compared on a real guest: the binding that constructs the core overrides
+/// what the property said.
+///
+/// Inert without the variable, which is what keeps `cargo test` measuring the
+/// engine the board asked for.
+#[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+pub(crate) fn with_engine_from_env(cpu: X86) -> X86 {
+    use rsemu::cpu::x86::Engine;
+    match std::env::var("RSEMU_ENGINE").as_deref() {
+        Ok("jit") => cpu.with_engine(Engine::Jit),
+        Ok("jit-host") => cpu.with_engine(Engine::JitHost),
+        Ok("interp") | Err(_) => cpu,
+        Ok(other) => panic!("RSEMU_ENGINE={other}: expected interp, jit or jit-host"),
+    }
+}
+
+/// The same, on a build with no translation runtime in it.
+#[cfg(not(all(feature = "cpu-x86-lift", feature = "jit")))]
+pub(crate) fn with_engine_from_env(cpu: X86) -> X86 {
+    if let Ok(name) = std::env::var("RSEMU_ENGINE")
+        && name != "interp"
+    {
+        panic!(
+            "RSEMU_ENGINE={name} needs a build with the `cpu-x86-lift` and `jit` features;              this one has only the interpreter"
+        );
+    }
+    cpu
+}
+
 /// Where a run stopped, and what the guest had said by then.
 pub(crate) struct Run {
     /// Everything the guest wrote to its serial port.
@@ -331,6 +367,31 @@ pub(crate) fn report(tag: &str, m: &Machine, cpu: &X86, run: &Run, script: &Scri
             } else {
                 format!("{:?}, and the guest never printed it", script.stop_at)
             }
+        );
+    }
+    #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
+    if let Some(s) = cpu.jit_stats() {
+        // The honest headline of a translated run: what fraction of the
+        // guest's own instructions were executed as blocks rather than handed
+        // back to the interpreter, which is what a lifted subset with real
+        // exclusions is worth.
+        let total = s.retired + s.interpreted;
+        println!(
+            "{tag}: engine {:?}: {} of {total} guest instructions retired in blocks \
+             ({:.1}%), {} interpreted",
+            cpu.engine(),
+            s.retired,
+            if total == 0 {
+                0.0
+            } else {
+                100.0 * s.retired as f64 / total as f64
+            },
+            s.interpreted,
+        );
+        println!(
+            "{tag}: {} blocks executed, {} compiled, {} chained, {} translated, \
+             {} invalidated by a guest store",
+            s.blocks, s.compiled, s.chained, s.translated, s.invalidated,
         );
     }
     let sys = cpu.sys();

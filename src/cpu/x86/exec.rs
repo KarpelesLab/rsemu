@@ -414,7 +414,43 @@ pub(super) struct Exec<'a> {
     /// How deep the exception delivery is: 0 while executing, 1 while
     /// delivering a fault, 2 while delivering a double fault.
     pub(super) nesting: u8,
+    /// The guest-**physical** pages this borrow has written, de-duplicated.
+    ///
+    /// The self-modifying-code hook `jit::dispatch` asks a host for: *the
+    /// pages this master wrote*, so that a translation lifted from one of them
+    /// is thrown away before the next block runs. x86 makes a coherent
+    /// instruction cache architectural, so it is not optional there — and it
+    /// is collected in [`Exec::phys_write`] rather than at the two call sites
+    /// above it, because that is the one funnel every guest write goes
+    /// through: a block's store, an interpreted instruction's store, a task
+    /// switch's, and the accessed/dirty write-back of a page-table walk.
+    ///
+    /// Physical and post-A20, because that is what the block cache matches
+    /// against — `cpu::x86::lift::Lifted::page` is physical at the other end.
+    /// Costs the interpreter one eight-way compare per bus write whether or
+    /// not this build has a translation runtime, which is noise beside the
+    /// address-space write it accompanies, and is not worth a second
+    /// `cfg`-gated field to avoid.
+    pub(super) wrote: [u64; WROTE_PAGES],
+    /// How many of [`Exec::wrote`] are live.
+    pub(super) wrote_n: u8,
+    /// Set when a write landed on a ninth distinct page, so the list is no
+    /// longer the whole truth and a translation cache must throw everything
+    /// away rather than trust it.
+    pub(super) wrote_over: bool,
 }
+
+/// How many distinct written pages one borrow remembers before it gives up and
+/// says *everything*.
+///
+/// Twenty-four. The widest thing one x86 instruction can do is two
+/// page-crossing eight-byte accesses — four data pages — under a four-level
+/// walk that sets an accessed bit at each level of each, which is at most
+/// twenty and in practice never more than three; an exception delivered on top
+/// of it pushes a frame into pages the walk has already named. The overflow
+/// flag is what makes the bound safe rather than merely generous, and the
+/// consumer's answer to it is to throw every translation away.
+pub(super) const WROTE_PAGES: usize = 24;
 
 impl<'a> Exec<'a> {
     /// Borrow a core for one step.
@@ -439,6 +475,27 @@ impl<'a> Exec<'a> {
             start_ip: 0,
             used: 0,
             nesting: 0,
+            wrote: [0; WROTE_PAGES],
+            wrote_n: 0,
+            wrote_over: false,
+        }
+    }
+
+    /// Remember the guest-physical page a write landed on.
+    ///
+    /// De-duplicated, because a page-crossing store makes up to eight writes
+    /// into two pages and a walk's write-back makes up to four into one.
+    #[inline]
+    fn note_write(&mut self, phys: u64) {
+        let page = phys & !0xfff;
+        if self.wrote[..self.wrote_n as usize].contains(&page) {
+            return;
+        }
+        if (self.wrote_n as usize) < WROTE_PAGES {
+            self.wrote[self.wrote_n as usize] = page;
+            self.wrote_n += 1;
+        } else {
+            self.wrote_over = true;
         }
     }
 
@@ -627,7 +684,7 @@ impl<'a> Exec<'a> {
     /// anything that faults while `#DF` itself is being delivered shuts the
     /// processor down — real silicon drives a `SHUTDOWN` bus cycle and waits
     /// for `RESET`, which the chipset is expected to notice.
-    fn deliver(&mut self, first: Fault) {
+    pub(super) fn deliver(&mut self, first: Fault) {
         let mut current = first;
         // Three attempts is the whole ladder: the event, the double fault, and
         // the shutdown that follows a fault during the double fault.
@@ -721,6 +778,7 @@ impl<'a> Exec<'a> {
         self.state.open_bus = (value >> ((size as u32 - 1) * 8)) as u8;
         let width = Self::width_of(size);
         let addr = self.masked(addr);
+        self.note_write(addr);
         if self.mem.write(addr, width, value, self.attrs).is_err() {
             self.state.faults = self.state.faults.wrapping_add(1);
             self.state.last_fault = addr;
