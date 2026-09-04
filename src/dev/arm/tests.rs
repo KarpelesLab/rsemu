@@ -34,6 +34,10 @@ const GICD: u64 = 0x0800_0000;
 const GICC: u64 = 0x0801_0000;
 /// The PL011.
 const UART: u64 = 0x0900_0000;
+/// The virtio-MMIO window the disk is behind.
+const BLK: u64 = 0x0a00_0000;
+/// The virtio-MMIO window the entropy source is behind.
+const RNG: u64 = 0x0a00_1000;
 
 // ---------------------------------------------------------------------------
 // A very small A64 assembler
@@ -184,9 +188,14 @@ fn board(kernel: &[u8]) -> Board {
         .expect("the catalog agrees with itself")
         .with_media("kernel", kernel)
         .with_media("initrd", &[][..])
+        .with_media("disk", &[][..])
         // Enough for the programs here, and small enough that the cold reset
         // that clears it is not the slowest part of the test.
-        .with_param("ram", String::from("8M"));
+        .with_param("ram", String::from("8M"))
+        // A blank disk that costs 64 KiB of host memory rather than the
+        // board's default 16 MiB: nothing here reads a sector, and every one
+        // of these tests would otherwise allocate and zero the whole platter.
+        .with_param("storage", String::from("64K"));
     let registry = catalog::registry().expect("the catalog agrees with itself");
     let machine = match crate::machine::build(entry.name, entry.source, &registry, &options) {
         Ok(m) => m,
@@ -320,6 +329,85 @@ fn the_uarts_interrupt_number_comes_out_of_the_wire() {
     assert!(
         dtb.windows(needle.len()).any(|w| w == needle),
         "the PL011's `interrupts` is not <0 1 4>"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// virtio
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_virtio_devices_are_discoverable_at_the_addresses_the_board_maps() {
+    // Not a driver — a driver is the guest's job — but every register a driver
+    // reads on the way in, checked from the outside, through the board's own
+    // address space. `dev::virtio` is shared with `riscv-virt` and this is what
+    // says the sharing reaches an AArch64 board rather than merely compiling
+    // for one.
+    let b = board(&spin());
+    let space = b.machine.space("mem").expect("one space");
+    let read = |at: u64| {
+        space
+            .read(at, Width::U32, MemAttrs::DEFAULT)
+            .expect("the transport answers")
+    };
+    assert_eq!(read(BLK) as u32, crate::dev::virtio::mmio::MAGIC);
+    assert_eq!(
+        read(BLK + 0x004),
+        u64::from(crate::dev::virtio::mmio::VERSION)
+    );
+    assert_eq!(
+        read(BLK + 0x008),
+        u64::from(crate::dev::virtio::DEVICE_ID_BLOCK)
+    );
+    // The configuration space reports the capacity in sectors — `storage`,
+    // which `board` sets to 64 KiB so that the platter is not the largest
+    // thing these tests allocate.
+    assert_eq!(
+        space
+            .read(BLK + 0x100, Width::U64, MemAttrs::DEFAULT)
+            .expect("capacity"),
+        64 * 1024 / 512
+    );
+    assert_eq!(
+        read(RNG + 0x008),
+        u64::from(crate::dev::virtio::DEVICE_ID_ENTROPY)
+    );
+}
+
+#[test]
+fn the_virtio_nodes_carry_the_gics_numbering_and_not_a_plics() {
+    // The whole point of keeping the *generator* per-architecture while
+    // sharing the transport: the same `dev::virtio` device that a RISC-V tree
+    // describes with a one-cell `interrupts` is described here in three cells,
+    // with the shared-peripheral base subtracted again. `wire blk.irq ->
+    // gic.spi2` is the only place `2` is written down.
+    let b = board(&spin());
+    let dtb = b.device_tree();
+    let cells = |spi: u32| -> Vec<u8> {
+        [0u32, spi, 4]
+            .iter()
+            .flat_map(|w| w.to_be_bytes())
+            .collect()
+    };
+    assert!(
+        dtb.windows(12).any(|w| w == cells(2)),
+        "the disk's `interrupts` is not <0 2 4>"
+    );
+    assert!(
+        dtb.windows(12).any(|w| w == cells(3)),
+        "the entropy source's `interrupts` is not <0 3 4>"
+    );
+    // And the node is at the address the `map` statement made, named the way
+    // the binding wants it.
+    let name = b"virtio_mmio@a000000\0";
+    assert!(
+        dtb.windows(name.len()).any(|w| w == name),
+        "no `virtio_mmio@a000000` node in the generated tree"
+    );
+    let compatible = b"virtio,mmio\0";
+    assert!(
+        dtb.windows(compatible.len()).any(|w| w == compatible),
+        "the node does not claim `virtio,mmio`"
     );
 }
 
@@ -549,7 +637,9 @@ fn a_kernel_that_is_not_an_image_is_refused_by_name() {
         .expect("the catalog agrees with itself")
         .with_media("kernel", &alloc::vec![0u8; 1024][..])
         .with_media("initrd", &[][..])
-        .with_param("ram", String::from("8M"));
+        .with_media("disk", &[][..])
+        .with_param("ram", String::from("8M"))
+        .with_param("storage", String::from("64K"));
     let registry = catalog::registry().expect("a registry");
     let e = crate::machine::build(entry.name, entry.source, &registry, &options)
         .expect_err("a kernel with no magic must be refused")

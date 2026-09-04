@@ -27,6 +27,12 @@ things that were missing:
 | a firmware interface | **PSCI** over `SMC`, in the core at [`src/cpu/arm/a64/psci.rs`](../../src/cpu/arm/a64/psci.rs), landing on [`src/dev/arm/power.rs`](../../src/dev/arm/power.rs) |
 | a way to describe itself | a **device tree generated from the realized machine**, [`src/dev/arm/dt.rs`](../../src/dev/arm/dt.rs) |
 
+A fifth arrived later and is not an AArch64 device at all: a **disk**. The
+board maps two [`virtio`](../buses/virtio.md) MMIO windows —
+[`src/dev/virtio`](../../src/dev/virtio), the same transport and the same two
+device models `riscv-virt` uses — so that a kernel on this board can find a
+root filesystem on a block device rather than only in a ramdisk.
+
 The layout is the conventional AArch64 `virt` one, and conventional is all it
 is — every address the guest uses comes out of the generated tree, so nothing
 outside this repository fixes any of these numbers.
@@ -36,6 +42,8 @@ outside this repository fixes any of these numbers.
   0x0800_0000  GIC distributor        (4 KiB)
   0x0801_0000  GIC CPU interface      (8 KiB)
   0x0900_0000  PL011                  (4 KiB)
+  0x0a00_0000  virtio-mmio: the disk  (4 KiB)
+  0x0a00_1000  virtio-mmio: entropy   (4 KiB)
   0x4000_0000  DRAM
   0x4020_0000  where the kernel is loaded and entered
 ```
@@ -229,26 +237,81 @@ timer counts this core's bus accesses divided by an integer, so `[ 1.12]` is
 what the kernel measured and not what a person waited.
 
 
+## Booting off the disk rather than out of the ramdisk
+
+The board had no block device until virtio moved out from under `dev/riscv/`
+into [`src/dev/virtio`](../../src/dev/virtio) behind `dev-virtio`. It has one
+now, and the difference is the difference between "a root filesystem the kernel
+unpacked into memory before any driver existed" and "a filesystem on a disk".
+
+Debian's kernel builds every part of that path as a module — `virtio_mmio`,
+`virtio_blk`, and `ext4`, which needs `jbd2`, `mbcache`, `crc16` and a `crc32c`
+shash of its own — so an initramfs is still what starts. It `insmod`s the
+seven, mounts `/dev/vda` and `switch_root`s, which is how a real Debian system
+boots. `scripts/fetch-testdata.sh arm64-rootfs` builds both fixtures: an ext4
+filesystem in `rootfs.img` and that initramfs.
+
+```
+scripts/fetch-testdata.sh arm64-linux arm64-initramfs arm64-rootfs
+
+RSEMU_ARM64_KERNEL=testdata/arm64/linux \
+RSEMU_ARM64_INITRD=testdata/arm64/initramfs.cpio \
+RSEMU_ARM64_ROOTFS_INITRD=testdata/arm64/initramfs-virtio.cpio \
+RSEMU_ARM64_DISK=testdata/arm64/rootfs.img \
+    cargo test --release --features machine-arm64-virt \
+        --test a64_linux -- --nocapture
+```
+
+Quoted from the console the test prints:
+
+```text
+[    1.096425] Run /init as init process
+[    1.327321] virtio_blk virtio0: 1/0/0 default/read/poll queues
+[    1.327848] virtio_blk virtio0: [vda] 131072 512-byte logical blocks (67.1 MB/64.0 MiB)
+
+rsemu initramfs on Linux 6.12.94+deb13-arm64 aarch64: mounting /dev/vda
+[    1.977836] EXT4-fs (vda): mounted filesystem 5253454d-5541-524d-3634-726f6f746673 r/w with ordered data mode. Quota mode: none.
+
+rsemu arm64-virt: this shell is running from an ext4 root filesystem on /dev/vda
+/dev/vda / ext4 rw,relatime 0 0
+
+
+BusyBox v1.37.0 (Debian 1:1.37.0-6+b8) built-in shell (ash)
+Enter 'help' for a list of built-in commands.
+
+sh: can't access tty; job control turned off
+rsemu-disk#
+```
+
+`virtio_blk virtio0` is the kernel's own driver binding to
+`dev::virtio::mmio`'s register block at `0x0a000000`, found through the
+`virtio_mmio@a000000` node the generator emitted; `131072 512-byte logical
+blocks` is the `storage` parameter the test set (64 MiB, against the machine
+file's default of 16) read back out of the device's configuration space;
+`/dev/vda / ext4` is `/proc/mounts` on the far side of `switch_root`, which is
+the guest's own statement that its root is the block device and that the
+ramdisk has been freed.
+
+**Six and a half minutes of wall time** for 2.0 seconds of guest time, against
+three for the ramdisk boot. The difference is not the disk: it is four
+megabytes of kernel modules being relocated and linked by a single interpreted
+core, and it is silent while it happens — which is what made
+`tests/a64_linux.rs`'s idle guard report it as a hang until the guard became a
+parameter.
+
+**One thing here is not a real disk and should be**: the test binds the image
+to the `disk` **media slot**, so the whole 64 MiB lives in host memory as a
+`RamStore`. The other contract — `--drive disk=root.qcow2`, a host file behind
+`dev::medium::Medium` — works on this board for the same reason it works on
+`riscv-virt`, and `tests/riscv_virtio_blk.rs` is the test that holds it. There
+is no AArch64 equivalent of that test yet; the device under it is the same
+object, which is the whole point of the move.
+
 ## Where it stops, and what is still in the way
 
 It did not stop, so this section is a list of what the board *has not got*
 rather than of what defeated it. In rough order of what the next person will
 want:
-
-### There is no block device, so the only root is a ramdisk
-
-`virtio-mmio` exists in this tree — [`src/dev/riscv/virtio`](../../src/dev/riscv/virtio),
-the transport plus a block device and an entropy source — and it is reachable
-only from a build with `dev-riscv` on. An AArch64 board cannot link a PLIC and
-a CLINT to get a disk, so this board has none, and its root filesystem is an
-initramfs the kernel unpacks.
-
-**The fix is the same one-commit-two-directories move as `fdt.rs`**:
-`src/dev/virtio/` behind a `dev-virtio` feature, which `dev-riscv` and `dev-arm`
-both depend on. virtio-MMIO is a transport specified by OASIS and has nothing
-to do with either architecture; the only reason it is where it is, is that the
-`virt` board was the first to want one. After that this board grows two `map`
-statements and two `wire`s and can boot off a disk.
 
 ### SMP needs a requester-to-CPU-interface map, and it is the GIC that needs it
 

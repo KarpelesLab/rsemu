@@ -3,13 +3,16 @@
 #   rsemu run arm64-virt --media kernel=Image
 #   rsemu run arm64-virt --media kernel=Image --media initrd=rootfs.cpio \
 #       -p ram=512M -p cmdline="console=ttyAMA0 rdinit=/init"
+#   rsemu run arm64-virt --media kernel=Image --drive disk=root.qcow2 \
+#       -p cmdline="console=ttyAMA0 root=/dev/vda rw"
 #
 # There is no such chip as a "virt". This is the board every AArch64 toolchain
 # and every AArch64 kernel already knows how to target: one core, a GICv2 for
-# interrupts, a PL011 for the console, PSCI for power, and a device tree that
-# says where all of it is. No PCI, no ACPI, no legacy — and no hidden
-# convention, because **the guest learns the whole layout from a device tree
-# rsemu generates from this file** (docs/platforms/arm64-virt.md).
+# interrupts, a PL011 for the console, PSCI for power, virtio-MMIO for storage
+# and entropy, and a device tree that says where all of it is. No PCI, no
+# ACPI, no legacy — and no hidden convention, because **the guest learns the
+# whole layout from a device tree rsemu generates from this file**
+# (docs/platforms/arm64-virt.md).
 #
 # The addresses below are not a protocol. Change one and the generated tree
 # changes with it, and the guest follows. They are the conventional AArch64
@@ -19,8 +22,8 @@
 # Sources: the ARM Generic Interrupt Controller Architecture Specification
 # v2.0, the PrimeCell UART (PL011) Technical Reference Manual, the Arm Power
 # State Coordination Interface (DEN 0022), the Arm Architecture Reference
-# Manual (DDI 0487) and the Devicetree Specification v0.4. Each device module
-# cites the sections it used.
+# Manual (DDI 0487), OASIS VIRTIO 1.2 and the Devicetree Specification v0.4.
+# Each device module cites the sections it used.
 #
 # ---------------------------------------------------------------------------
 # What this board has that `a64-mini` does not
@@ -96,6 +99,18 @@ machine "arm64-virt" {
   # Which character port the console attaches to, so two of these can run in
   # one process without typing at each other (`-p console=b`).
   param console = "console"
+
+  # The virtio disk's size. Whatever is bound to the `disk` media slot is the
+  # start of it, padded out to this with zeroes -- so `-p storage=64M` alone is
+  # a blank 64 MiB disk, and `--disk foo.img` alone is exactly that image.
+  #
+  # Ignored when the *run* backs that slot with a host file instead:
+  # `--drive disk=root.qcow2` installs a medium, the medium brings its own
+  # capacity, and the guest sees the image's size rather than this one. The two
+  # are different contracts and both are supported -- bytes in a slot are what
+  # a `no_std` or wasm build has, and a file is what keeps a 16 GiB disk out of
+  # host memory (docs/buses/storage.md).
+  param storage = 16M
 
   # Which named power signal a guest's PSCI request lands on, so two of these
   # can run in one process without stopping each other.
@@ -191,6 +206,38 @@ machine "arm64-virt" {
   # instead of watching a timeout.
   object pwr "arm.power" { signal = power }
 
+  # -- virtio ----------------------------------------------------------------
+  #
+  # Both are bus masters and walk their own descriptor rings, so both declare
+  # the space that DMA traverses (ROADMAP.md 4.4). Neither is an AArch64
+  # device: `virtio.blk` and `virtio.rng` are `src/dev/virtio`, the same two
+  # objects machines/riscv-virt.machine names, on a transport OASIS specifies
+  # and that mentions no architecture at all. What this board contributes is
+  # the two addresses below and the two interrupts, and the generated device
+  # tree is where the guest reads both.
+  #
+  # The disk's bytes come from the `disk` media slot, and the machine file says
+  # a slot name rather than a host path because a machine file is portable data
+  # describing a board. What is behind that name is the run's business:
+  #
+  #   rsemu run arm64-virt --disk rootfs.img          # bytes, copied into RAM
+  #   rsemu run arm64-virt --drive disk=root.qcow2    # a file, left on disk
+  object blk "virtio.blk" {
+    space  = mem
+    size   = storage
+    image  = "disk"
+    serial = "rsemu-virt-0"
+  }
+
+  object rng "virtio.rng" {
+    space = mem
+    # Deterministic by construction: the same seed gives the same bytes every
+    # run, because rsemu has no record/replay seam for host entropy yet and a
+    # machine that drew from one would not be reproducible (ROADMAP.md 0).
+    # This is not a security primitive and the device tree does not claim it is.
+    seed = 1
+  }
+
   # -- the reset vector and the device tree ----------------------------------
   #
   # Six instructions at zero and, just below them, a device tree generated from
@@ -223,6 +270,8 @@ machine "arm64-virt" {
   map mem 0x08000000 size 4K    = gic.dist  # GICD: enable, priority, target
   map mem 0x08010000 size 8K    = gic.cpu   # GICC: acknowledge, end of interrupt
   map mem 0x09000000 size 4K    = uart      # PL011
+  map mem 0x0a000000 size 4K    = blk       # virtio-mmio: the disk
+  map mem 0x0a001000 size 4K    = rng       # virtio-mmio: entropy
   map mem ram-base   size ram   = dram
 
   # -- interrupts ------------------------------------------------------------
@@ -235,6 +284,8 @@ machine "arm64-virt" {
   # is interrupt 27 and the tree says `<1 11 0xf08>`. The binding subtracts the
   # base again, which is the detail that makes a hand-written tree wrong.
   wire uart.irq   -> gic.spi1
+  wire blk.irq    -> gic.spi2
+  wire rng.irq    -> gic.spi3
   wire cpu.cntp   -> gic.ppi14   # the EL1 physical timer
   wire cpu.cntv   -> gic.ppi11   # the EL1 virtual timer, which a kernel at EL1 uses
   wire gic.irq0   -> cpu.irq

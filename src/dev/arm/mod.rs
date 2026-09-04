@@ -36,6 +36,7 @@
 //!   0x0800_0000  GIC distributor
 //!   0x0801_0000  GIC CPU interface
 //!   0x0900_0000  PL011 UART
+//!   0x0a00_0000  virtio-mmio (dev::virtio), one 4 KiB window each
 //!   0x4000_0000  DRAM
 //! ```
 //!
@@ -56,6 +57,19 @@
 //!   `ttyAMA0`, unpacks an initramfs, reaches `Run /init as init process` and
 //!   gets a prompt. Typing `poweroff` at that prompt stops the machine through
 //!   PSCI.
+//! * **Linux off a disk.** With `arm64-rootfs`'s two fixtures — an **ext4
+//!   filesystem** and an initramfs carrying the kernel's own `virtio_mmio`,
+//!   `virtio_blk` and `ext4` modules — the kernel claims the board's
+//!   [`virtio`](crate::dev::virtio) block device at `0x0a000000`, mounts
+//!   `/dev/vda` and `switch_root`s onto it. The shell that comes up is running
+//!   from the disk and the ramdisk has been freed:
+//!
+//!   ```text
+//!   [    1.339042] virtio_blk virtio0: [vda] 131072 512-byte logical blocks
+//!   [    2.077553] EXT4-fs (vda): mounted filesystem … ro with ordered data mode
+//!   rsemu arm64-virt: this shell is running from an ext4 root filesystem on /dev/vda
+//!   /dev/vda / ext4 ro,relatime 0 0
+//!   ```
 //!
 //! `docs/platforms/arm64-virt.md` has the transcript, the two core bugs the
 //! boot found, and the ledger of what is still in the way.

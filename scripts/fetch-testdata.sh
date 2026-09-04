@@ -969,6 +969,150 @@ arm64_hint() {
 	note "              --test a64_linux -- --nocapture"
 }
 
+arm64_rootfs_hint() {
+	local dest="$1"
+	note ""
+	note "  Boot it off the disk:"
+	note "      RSEMU_ARM64_KERNEL=${dest}/linux \\"
+	note "      RSEMU_ARM64_INITRD=${dest}/initramfs.cpio \\"
+	note "      RSEMU_ARM64_ROOTFS_INITRD=${dest}/initramfs-virtio.cpio \\"
+	note "      RSEMU_ARM64_DISK=${dest}/rootfs.img \\"
+	note "          cargo test --release --features machine-arm64-virt \\"
+	note "              --test a64_linux -- --nocapture"
+}
+
+# A real root filesystem for arm64-virt, on the board's virtio disk.
+#
+# `arm64-initramfs` gets a shell out of a ramdisk, which is a root filesystem
+# the kernel unpacks into memory before any driver exists. This is the other
+# thing: an **ext4 filesystem on a block device**, reached through the board's
+# `virtio.blk` at 0x0a000000.
+#
+# It takes two artefacts because the Debian kernel builds every part of the
+# path as a module -- `virtio_mmio`, `virtio_blk` and `ext4` (which itself
+# needs `jbd2`, `mbcache`, `crc16` and a `crc32c` shash). So an initramfs still
+# starts: it `insmod`s the seven in load order, mounts /dev/vda and
+# `switch_root`s.
+# After that the initramfs is freed and every path the guest resolves is on the
+# disk -- which is exactly how a real Debian system boots.
+fetch_arm64_rootfs() {
+	need curl
+	need tar
+	need ar
+	need xz
+	# e2fsprogs 1.43 and later can populate a filesystem from a directory
+	# without root and without a loop mount, which is the whole reason this
+	# fixture can be built by a script anybody can run.
+	need mke2fs
+	local dest="${DEST_ROOT}/arm64"
+	local image="${dest}/linux"
+	[ -s "$image" ] || die "fetch the kernel first: scripts/fetch-testdata.sh arm64-linux"
+
+	local work="${dest}/.rootfs"
+	rm -rf "$work"
+	mkdir -p "$work"
+
+	busybox_arm64_binary "$work"
+	local bb="$BUSYBOX_BIN"
+
+	local url
+	url="$(kernel_module_deb "$image" "$DEBIAN_PACKAGES_ARM64")"
+	note "  downloading $(basename -- "$url") (about 100 MiB) ..."
+	download "$url" "${work}/linux-image.deb"
+	( cd "$work" && ar x linux-image.deb data.tar.xz ) || die "that .deb is not an ar archive"
+
+	# In load order, and the order is the point: busybox's `insmod` resolves no
+	# dependencies, and `ext4` says `depends=jbd2,mbcache,crc16` in its own
+	# `.modinfo`. `crc32c_generic` is not in that list and is needed anyway --
+	# ext4 allocates a `crc32c` shash unconditionally in `ext4_fill_super`, so a
+	# kernel without one says `EXT4-fs (vda): Cannot load crc32c driver` and the
+	# mount fails whatever the filesystem's own feature flags say. A runtime
+	# `crypto_alloc_shash` by name is invisible to `depends=`, which is why this
+	# had to be found by booting rather than by reading.
+	#
+	# Named by glob rather than by path, because the version is in the path and
+	# has already been resolved once, and Debian has moved these between
+	# /lib/modules and /usr/lib/modules before.
+	local module member modules=()
+	for module in virtio_mmio virtio_blk crc32c_generic crc16 mbcache jbd2 ext4; do
+		member="$(tar -tf "${work}/data.tar.xz" |
+			grep -E "/${module}\.ko(\.xz)?\$" | head -1)"
+		[ -n "$member" ] || die "no ${module} in the kernel package"
+		tar -xf "${work}/data.tar.xz" -C "$work" "$member"
+		if [ "${member%.xz}" != "$member" ]; then
+			xz -df "${work}/${member}"
+			member="${member%.xz}"
+		fi
+		modules+=("${work}/${member}")
+	done
+	rm -f "${work}/data.tar.xz"
+
+	# -- the filesystem ------------------------------------------------------
+	local root="${work}/root"
+	mkdir -p "${root}/bin" "${root}/sbin" "${root}/dev" "${root}/proc" \
+		"${root}/sys" "${root}/etc" "${root}/root"
+	cp "$bb" "${root}/bin/busybox"
+	chmod 0755 "${root}/bin/busybox"
+	printf 'this shell is running from an ext4 root filesystem on /dev/vda\n' \
+		>"${root}/etc/rsemu-rootfs"
+
+	# PID 1 after the hand-over. `/proc/mounts` is printed because it is the
+	# thing being claimed: a line reading `/dev/vda / ext4` is the guest's own
+	# statement that its root is the block device and not a ramdisk.
+	cat >"${root}/sbin/init" <<'INIT'
+#!/bin/busybox sh
+# Every applet is reached through /bin/busybox rather than through the symlinks
+# `--install` makes, because a root that turned out to be mounted read-only
+# would have none of them and this script would then not be able to say so.
+/bin/busybox --install -s /bin 2>/dev/null
+/bin/busybox mount -t proc     proc     /proc
+/bin/busybox mount -t sysfs    sysfs    /sys
+/bin/busybox mount -t devtmpfs devtmpfs /dev
+/bin/busybox echo
+/bin/busybox echo "rsemu arm64-virt: $(/bin/busybox cat /etc/rsemu-rootfs)"
+/bin/busybox grep " / " /proc/mounts
+export PS1='rsemu-disk# '
+exec /bin/busybox sh
+INIT
+	chmod 0755 "${root}/sbin/init"
+
+	# 16 MiB in 1 KiB blocks, which is a few times what busybox needs and small
+	# enough that a test binds it as bytes. `SOURCE_DATE_EPOCH` and a fixed UUID
+	# are what make two runs of this script produce the same image: a fixture
+	# whose checksum moves on its own is a fixture that cannot be pinned.
+	local target="${dest}/rootfs.img"
+	rm -f "$target"
+	SOURCE_DATE_EPOCH=0 mke2fs -q -t ext4 -b 1024 -L rsemu-root \
+		-U 5253454d-5541-524d-3634-726f6f746673 \
+		-d "$root" "$target" 16384 ||
+		die "mke2fs would not build the root filesystem"
+	ok "rootfs.img ($(wc -c <"$target" | tr -d ' ') bytes, ext4)"
+
+	local cpio="${dest}/initramfs-virtio.cpio"
+	build_initramfs "$cpio" "$bb" "$work" switch-root "${modules[@]}"
+	rm -rf "$work"
+	ok "initramfs-virtio.cpio ($(wc -c <"$cpio" | tr -d ' ') bytes)"
+
+	printf '%s\n' "rootfs.img and initramfs-virtio.cpio -- an ext4 root for arm64-virt
+Built by scripts/fetch-testdata.sh out of two fetched GPL-2.0 binaries and
+nothing else: Debian's arm64 busybox-static, and the virtio_mmio, virtio_blk,
+crc32c_generic, crc16, mbcache, jbd2 and ext4 modules from the linux-image
+package matching the kernel in ./linux.
+
+Licence: GPL-2.0. FETCH-ONLY -- running these as an emulated guest is ordinary
+use; committing them here would be redistribution under their terms
+(ROADMAP.md section 1).
+
+The initramfs insmods the seven modules, mounts /dev/vda and switch_roots into
+it. Everything after that runs off the board's virtio block device.
+
+Consumed by RSEMU_ARM64_ROOTFS_INITRD and RSEMU_ARM64_DISK in
+tests/a64_linux.rs. The plain arm64-initramfs archive is a separate fixture and
+is what RSEMU_ARM64_INITRD wants." \
+		>"${dest}/PROVENANCE-rootfs.txt"
+	arm64_rootfs_hint "$dest"
+}
+
 # The arm64 busybox binary, unpacked into <scratch dir>. Sets BUSYBOX_BIN, as
 # `busybox_binary` does and for the same reason.
 busybox_arm64_binary() {
@@ -1014,7 +1158,7 @@ fetch_arm64_initramfs() {
 	mkdir -p "$work"
 
 	busybox_arm64_binary "$work"
-	build_initramfs "$target" "$BUSYBOX_BIN" "$work"
+	build_initramfs "$target" "$BUSYBOX_BIN" "$work" shell
 	rm -rf "$work"
 
 	ok "$(basename -- "$target") ($(wc -c <"$target" | tr -d ' ') bytes)"
@@ -1085,7 +1229,7 @@ busybox_url() {
 	need gzip
 	warn "the pinned busybox-static build is gone from the pool; asking the index"
 	local filename
-	filename="$(curl --fail --silent --location "$DEBIAN_PACKAGES" | gzip -cd |
+	filename="$(curl --fail --silent --location "$index" | gzip -cd |
 		awk '/^Package: busybox-static$/ { found = 1 }
 		     found && /^Filename: / { print $2; exit }')"
 	[ -n "$filename" ] || die "busybox-static is not in ${DEBIAN_PACKAGES}"
@@ -1156,7 +1300,7 @@ fetch_initramfs() {
 	mkdir -p "$work"
 
 	busybox_binary "$work"
-	build_initramfs "$target" "$BUSYBOX_BIN" "$work"
+	build_initramfs "$target" "$BUSYBOX_BIN" "$work" shell
 	rm -rf "$work"
 
 	ok "$(basename -- "$target") ($(wc -c <"$target" | tr -d ' ') bytes)"
@@ -1164,10 +1308,16 @@ fetch_initramfs() {
 	initramfs_hint "$dest" "$(basename -- "$target")"
 }
 
-# build_initramfs <target> <busybox> <scratch dir> [module.ko ...]
+# build_initramfs <target> <busybox> <scratch dir> <mode> [module.ko ...]
+#
+# `mode` is `shell` for an archive that reaches a prompt and stops there, or
+# `switch-root` for one that mounts /dev/vda and hands over to the `/sbin/init`
+# it finds on it. The second is what turns "Linux runs" into "Linux is running
+# off a disk": after `switch_root` the initramfs is freed and every path the
+# guest resolves is on the block device.
 build_initramfs() {
-	local target="$1" bb="$2" work="$3"
-	shift 3
+	local target="$1" bb="$2" work="$3" mode="$4"
+	shift 4
 
 	# PID 1. `--install -s` fills /bin with the applet symlinks, so the shell
 	# that follows has a userland rather than one binary; every mount is
@@ -1176,7 +1326,7 @@ build_initramfs() {
 	# no-op when /lib/modules is empty, which is the plain archive.
 	cat >"${work}/init" <<'INIT'
 #!/bin/sh
-# rsemu's initramfs init. Reaches a shell and nothing else.
+# rsemu's initramfs init.
 /bin/busybox --install -s /bin 2>/dev/null
 mount -t proc     proc     /proc 2>/dev/null
 mount -t sysfs    sysfs    /sys  2>/dev/null
@@ -1184,17 +1334,37 @@ mount -t devtmpfs devtmpfs /dev  2>/dev/null
 for module in /lib/modules/*.ko; do
 	[ -f "$module" ] && insmod "$module"
 done
+INIT
+	if [ "$mode" = switch-root ]; then
+		cat >>"${work}/init" <<'INIT'
+echo
+echo "rsemu initramfs on $(uname -srm): mounting /dev/vda"
+# Falling back to a shell rather than dying, so that this archive is a
+# superset of the plain one: a board with no root filesystem on its disk gets
+# the same prompt the plain archive gives, and the test that only wants a
+# prompt can be pointed at either.
+if mount -t ext4 /dev/vda /mnt; then
+	exec switch_root /mnt /sbin/init
+fi
+echo "rsemu initramfs: /dev/vda has no ext4 root, staying here"
+export PS1='rsemu# '
+exec /bin/sh
+INIT
+	else
+		cat >>"${work}/init" <<'INIT'
 echo
 echo "rsemu initramfs on $(uname -srm)"
 export PS1='rsemu# '
 exec /bin/sh
 INIT
+	fi
 
 	{
 		cpio_dir bin
 		cpio_dir dev
 		cpio_dir lib
 		cpio_dir lib/modules
+		cpio_dir mnt
 		cpio_dir proc
 		cpio_dir sys
 		cpio_file bin/busybox "$bb" 0755
@@ -1204,12 +1374,17 @@ INIT
 		# has mounted devtmpfs yet at the moment init is executed.
 		cpio_node dev/console 5 1
 		cpio_node dev/null 1 3
-		local module
-		# Order here is only the archive's; /init loads whatever it finds by
-		# glob, and either order works — the driver model binds a driver to a
-		# device whichever of the two arrives second.
+		local module index=0
+		# Numbered, because /init loads them by glob and busybox's `insmod`
+		# resolves no dependencies: `ext4` before `jbd2` is an unresolved symbol
+		# and a root filesystem that never mounts. Two virtio modules genuinely
+		# are order-independent — the driver model binds a driver to a device
+		# whichever of the two arrives second — but a rule that only sometimes
+		# matters is a rule that is wrong the first time it does.
 		for module in "$@"; do
-			cpio_file "lib/modules/$(basename -- "$module")" "$module" 0644
+			cpio_file "$(printf 'lib/modules/%02d-%s' "$index" "$(basename -- "$module")")" \
+				"$module" 0644
+			index=$(( index + 1 ))
 		done
 		cpio_file init "${work}/init" 0755
 		cpio_end
@@ -1224,17 +1399,17 @@ INIT
 # come from different places in the archive, so nothing else keeps them in
 # step. Every Linux image carries its own banner as a plain string.
 kernel_module_deb() {
-	local image="$1" version
+	local image="$1" index="${2:-$DEBIAN_PACKAGES}" version
 	version="$(grep -ao 'Linux version [^ ]*' "$image" | head -1 | cut -d' ' -f3)"
 	[ -n "$version" ] || die "no Linux version banner in ${image}"
 	note "  the fetched kernel is ${version}" >&2
 	need gzip
 	local filename
-	filename="$(curl --fail --silent --location "$DEBIAN_PACKAGES" | gzip -cd |
+	filename="$(curl --fail --silent --location "$index" | gzip -cd |
 		awk -v want="linux-image-${version}" '
 			$1 == "Package:" { pkg = $2 }
 			pkg == want && $1 == "Filename:" { print $2; exit }')"
-	[ -n "$filename" ] || die "no linux-image-${version} in ${DEBIAN_PACKAGES}
+	[ -n "$filename" ] || die "no linux-image-${version} in ${index}
   Its modules are what initramfs-virtio needs, and only the build that matches
   the kernel will load. Re-fetch the linux suite and try again."
 	printf 'https://deb.debian.org/debian/%s' "$filename"
@@ -1285,7 +1460,7 @@ fetch_initramfs_virtio() {
 	rm -f "${work}/data.tar.xz"
 
 	local target="${dest}/initramfs-virtio.cpio"
-	build_initramfs "$target" "$BUSYBOX_BIN" "$work" "${modules[@]}"
+	build_initramfs "$target" "$BUSYBOX_BIN" "$work" shell "${modules[@]}"
 	rm -rf "$work"
 	ok "initramfs-virtio.cpio ($(wc -c <"$target" | tr -d ' ') bytes)"
 
@@ -1316,7 +1491,7 @@ fetch_initramfs_x86() {
 	mkdir -p "$work"
 
 	busybox_x86_binary "$work"
-	build_initramfs "$target" "$BUSYBOX_BIN" "$work"
+	build_initramfs "$target" "$BUSYBOX_BIN" "$work" shell
 	rm -rf "$work"
 
 	ok "$(basename -- "$target") ($(wc -c <"$target" | tr -d ' ') bytes)"
@@ -2017,6 +2192,10 @@ Suites:
   arm64-initramfs
                  a busybox root filesystem for it, built here around Debian's
                  arm64 busybox-static (GPL-2.0, FETCH-ONLY)
+  arm64-rootfs   a real ext4 root filesystem on a disk image, plus the
+                 initramfs that insmods virtio_mmio, virtio_blk and ext4,
+                 mounts /dev/vda and switch_roots into it (GPL-2.0,
+                 FETCH-ONLY)
   initramfs-x86  the same archive built around busybox.net's own x86-64
                  static build, for the pc64 and q35-linux boards (GPL-2.0,
                  FETCH-ONLY). The kernel it boots under is yours: no bzImage
@@ -2113,7 +2292,8 @@ for suite in "${SUITES[@]}"; do
 		ovmf|x86-uefi) fetch_ovmf ;;
 		linux|kernel) fetch_linux ;;
 		arm64-linux|arm64) fetch_arm64_linux ;;
-		arm64-initramfs|arm64-rootfs) fetch_arm64_initramfs ;;
+		arm64-initramfs) fetch_arm64_initramfs ;;
+		arm64-rootfs|arm64-disk) fetch_arm64_rootfs ;;
 		initramfs|rootfs) fetch_initramfs ;;
 		initramfs-virtio|virtio) fetch_initramfs_virtio ;;
 		initramfs-x86|x86) fetch_initramfs_x86 ;;

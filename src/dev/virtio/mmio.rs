@@ -671,17 +671,27 @@ impl MemOps for Registers {
 // A flattened device tree is a *board's* mechanism, not virtio's: the node is
 // the same everywhere — `virtio,mmio` with a `reg` and an interrupt, because
 // §4.2 says so and says nothing about the architecture underneath — but the
-// generator that places it is the board's. So the transport carries one small
-// implementation per generator, behind the feature that provides it, exactly
-// as `dev::uart::ns16550` and `dev::flash::cfi` already do. A build with none
-// of them has a virtio device that describes itself to nobody, which is what a
-// board that hands out addresses some other way wants.
+// generator that places it is the board's, and the two of them number
+// interrupts differently enough that they are separate traits. So the
+// transport carries one small implementation per generator, behind the feature
+// that provides it, exactly as `dev::uart::ns16550` and `dev::flash::cfi`
+// already do. A build with none of them has a virtio device that describes
+// itself to nobody, which is what a board that hands out addresses some other
+// way wants.
 
 #[cfg(feature = "dev-riscv")]
 impl crate::dev::riscv::dt::DtSource for Registers {
     fn dt_spec(&self) -> crate::dev::riscv::dt::NodeSpec {
-        let mut spec =
-            crate::dev::riscv::dt::NodeSpec::peripheral("virtio_mmio", &["virtio,mmio"]);
+        let mut spec = crate::dev::riscv::dt::NodeSpec::peripheral("virtio_mmio", &["virtio,mmio"]);
+        spec.irq_wire = self.links.lock().irq_wire;
+        spec
+    }
+}
+
+#[cfg(feature = "dev-arm")]
+impl crate::dev::arm::dt::DtSource for Registers {
+    fn dt_spec(&self) -> crate::dev::arm::dt::NodeSpec {
+        let mut spec = crate::dev::arm::dt::NodeSpec::peripheral("virtio_mmio", &["virtio,mmio"]);
         spec.irq_wire = self.links.lock().irq_wire;
         spec
     }
@@ -692,14 +702,27 @@ impl Device for VirtioMmio {
         self.class
     }
 
-    #[cfg_attr(not(feature = "dev-riscv"), expect(unused_variables))]
+    #[cfg_attr(
+        not(any(feature = "dev-riscv", feature = "dev-arm")),
+        expect(unused_variables)
+    )]
     fn realize(&self, ctx: &mut RealizeCtx<'_>) -> Result<()> {
-        // What this region is, for the board's device-tree generator.
+        // What this region is, for whichever board's device-tree generator is
+        // in the build — both, in a build that has both. The two tables are
+        // separate host objects under separate kinds, and a machine only ever
+        // reads the one its own boot ROM was built against, so publishing into
+        // the other costs a weak pointer nobody follows.
         #[cfg(feature = "dev-riscv")]
         crate::dev::riscv::dt::publish(
             ctx.hosts(),
             &self.region,
             Arc::downgrade(&self.regs) as alloc::sync::Weak<dyn crate::dev::riscv::dt::DtSource>,
+        )?;
+        #[cfg(feature = "dev-arm")]
+        crate::dev::arm::dt::publish(
+            ctx.hosts(),
+            &self.region,
+            Arc::downgrade(&self.regs) as alloc::sync::Weak<dyn crate::dev::arm::dt::DtSource>,
         )?;
         Ok(())
     }
