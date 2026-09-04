@@ -184,6 +184,24 @@ pub mod psci;
 pub mod simd;
 pub mod sysreg;
 
+// The IR frontend needs both this core and `src/ir`, so it has its own feature
+// rather than riding on either (`ROADMAP.md` §9).
+#[cfg(feature = "cpu-arm-a64-lift")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-a64-lift")))]
+pub mod differential;
+#[cfg(feature = "cpu-arm-a64-lift")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-a64-lift")))]
+pub mod lift;
+
+// The translated execution engine needs the frontend *and* the translation
+// runtime, so it is gated on both rather than on either.
+#[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+mod engine;
+
+#[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-a64-lift")))]
+pub use engine::Stats as JitStats;
+
 #[cfg(test)]
 mod tests;
 
@@ -668,6 +686,48 @@ pub enum PowerRequest {
     Reboot = 2,
 }
 
+/// The values a machine file's `engine` property takes.
+///
+/// Named in every build, whatever the features, so that a description
+/// validates identically everywhere and a build that cannot run one refuses it
+/// by name rather than by "expected one of `interp`".
+const ENGINES: &[&str] = &["interp", "jit", "jit-host"];
+
+/// Which execution engine a core runs on.
+///
+/// Not in [`Config`] and not in the snapshot: a snapshot taken under one
+/// engine must restore under the other, and there is nothing engine-specific
+/// in one to interchange (`ROADMAP.md` §4.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Engine {
+    /// The interpreter: one instruction at a time, and the oracle everything
+    /// else is measured against (CLAUDE.md, "CPU cores").
+    #[default]
+    Interp,
+    /// The translation runtime, executing lifted blocks on the portable IR
+    /// interpreter: `ROADMAP.md` §9's software TLB, block cache, block
+    /// chaining and self-modifying-code detection, with no host code
+    /// generation.
+    #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-a64-lift")))]
+    Jit,
+    /// The same, with the host code generator attached where the build and the
+    /// host have one. A block the generator refuses runs on the portable
+    /// backend, so this is a speed knob and never a semantic one.
+    #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-a64-lift")))]
+    JitHost,
+}
+
+#[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+impl Engine {
+    /// Whether this engine runs blocks through the translation runtime.
+    const fn translates(self) -> bool {
+        matches!(self, Engine::Jit | Engine::JitHost)
+    }
+}
+
 /// Everything the interpreter mutates, behind one lock.
 #[derive(Debug)]
 struct Session {
@@ -676,6 +736,11 @@ struct Session {
     /// generation counter (`ROADMAP.md` §4.5).
     tlb: Tlb,
     space: Option<Arc<AddressSpace>>,
+    /// The translation state, built on first use because §4.4 says `new`
+    /// performs no outward action — and a 256 MiB code buffer is an outward
+    /// action.
+    #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+    jit: Option<Box<engine::Jit>>,
 }
 
 /// One AArch64 core.
@@ -689,6 +754,9 @@ struct Session {
 #[derive(Debug)]
 pub struct Cpu {
     cfg: Config,
+    /// Which execution engine this core runs on. Construction property, not
+    /// architectural state.
+    engine: Engine,
     lines: Arc<Lines>,
     session: sync::Mutex<Session>,
     /// Which architectural traps leave the core instead of vectoring into the
@@ -740,6 +808,7 @@ impl Cpu {
     #[must_use]
     pub fn new(cfg: Config) -> Cpu {
         Cpu {
+            engine: Engine::Interp,
             lines: Arc::new(Lines::default()),
             session: sync::Mutex::with_rank(
                 LockRank::BUS,
@@ -747,6 +816,8 @@ impl Cpu {
                     state: State::new(&cfg),
                     tlb: Tlb::new(),
                     space: None,
+                    #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+                    jit: None,
                 },
             ),
             exits: AtomicU32::new(ExitMask::NONE.bits()),
@@ -778,10 +849,31 @@ impl Cpu {
         // for it, and `a64-mini` never has.
         let conduit = r.or_enum("psci", "none", psci::Conduit::NAMES)?;
         let cpus = r.or_range("cpus", 1u64, 1..=256)?;
-        // Accepted, and for now only one value is: `ROADMAP.md` §5's example
-        // writes `engine = "interp"`, and there is no A64 IR frontend yet.
-        let _ = r.or_enum("engine", "interp", &["interp"])?;
+        // Every value is named in every build, so a machine file validates the
+        // same everywhere and a build that cannot run one says *why* rather
+        // than "expected one of `interp`".
+        let want = r.or_enum("engine", "interp", ENGINES)?;
+        let want_jit = want != "interp";
         r.finish()?;
+
+        #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+        let engine = match want {
+            "jit-host" => Engine::JitHost,
+            "jit" => Engine::Jit,
+            _ => Engine::Interp,
+        };
+        #[cfg(not(all(feature = "cpu-arm-a64-lift", feature = "jit")))]
+        let engine = Engine::Interp;
+        #[cfg(not(all(feature = "cpu-arm-a64-lift", feature = "jit")))]
+        if want_jit {
+            return Err(Error::Property(alloc::string::String::from(
+                "`engine = \"jit\"` needs a build with the `cpu-arm-a64-lift` and `jit` \
+                 features; this one has only the interpreter. Refused rather than \
+                 interpreted silently, because an engine that is not the one you asked \
+                 for is a measurement that quietly means nothing",
+            )));
+        }
+        let _ = want_jit;
 
         // `CNTFRQ_EL0` is a 32-bit field, so a board naming a wider frequency
         // is naming one the guest could never write back — and it would read
@@ -813,7 +905,39 @@ impl Cpu {
             psci,
             cpus,
             ..cfg
-        }))
+        })
+        .with_engine(engine))
+    }
+
+    /// The same core, running on `engine`.
+    ///
+    /// A consuming builder because an engine is chosen when a core is built,
+    /// like every other construction property; a machine file says
+    /// `engine = "jit"` and reaches the same place through
+    /// [`from_props`](Cpu::from_props).
+    #[must_use]
+    pub fn with_engine(mut self, engine: Engine) -> Cpu {
+        self.engine = engine;
+        self
+    }
+
+    /// Which execution engine this core runs on.
+    #[must_use]
+    pub fn engine(&self) -> Engine {
+        self.engine
+    }
+
+    /// What this core's translated engine has done, or `None` on a core
+    /// running the interpreter.
+    ///
+    /// A statistic and never a behaviour — the engines are indistinguishable
+    /// to the guest — but a backend whose coverage is unmeasured is a backend
+    /// whose coverage rots, which is why it is counted rather than assumed.
+    #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-a64-lift")))]
+    #[must_use]
+    pub fn jit_stats(&self) -> Option<JitStats> {
+        self.session.lock().jit.as_ref().map(|jit| jit.stats())
     }
 
     /// This core's configuration.
@@ -1000,12 +1124,27 @@ impl Cpu {
             session.tlb.flush();
         }
         let (used, exit) = {
-            let Session { state, tlb, space } = &mut *session;
+            let Session {
+                state,
+                tlb,
+                space,
+                #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+                    jit: _jit,
+            } = &mut *session;
             let Some(space) = space.clone() else {
                 return (0, None);
             };
             let mut exec = Exec::new(state, tlb, &space, &cfg, &self.lines, exits);
             let used = exec.step();
+            // What one interpreted instruction wrote, handed to the block
+            // cache. A core whose blocks were invalidated only by `advance`
+            // would serve a stale one to anything that mixes this entry point
+            // with the run loop — a monitor stepping, a test driving the core
+            // by hand.
+            #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+            if let Some(jit) = _jit.as_mut() {
+                jit.note_writes(&mut exec);
+            }
             (used, exec.take_exit())
         };
         // Everything outward happens **here**, with the execution lock
@@ -1059,11 +1198,68 @@ impl Cpu {
         }
     }
 
+    /// One step of the run loop, on whichever engine this core runs.
+    ///
+    /// `remaining` is what is left of the caller's budget, and it is binding
+    /// rather than advisory: a block whose worst case does not fit is not run
+    /// and the instruction is interpreted instead, so that the core stops on
+    /// the same instruction whichever engine drives it and carries the same
+    /// `State::debt` into the next quantum. Both numbers are in the snapshot a
+    /// machine's state hash is taken over.
+    #[allow(unused_variables)]
+    fn advance(&self, remaining: u64) -> (u64, Option<Exit>) {
+        #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+        if self.engine.translates() {
+            let cfg = self.effective_config();
+            let exits = self.exit_mask();
+            let mut session = self.session.lock();
+            if self.lines.take_reset_request() {
+                session.state = State::new(&cfg);
+                session.tlb.flush();
+                if let Some(jit) = session.jit.as_mut() {
+                    jit.flush();
+                }
+            }
+            if session.jit.is_none() {
+                session.jit = Some(Box::new(engine::Jit::new(self.engine == Engine::JitHost)));
+            }
+            // The compiled fast path's shadow, attached to this core's *own*
+            // TLB so the two evict together (`mmu::Tlb::attach_shadow`). It is
+            // asked for here rather than at construction because it needs the
+            // address space, which arrives with `attach_space`, and only the
+            // engine that reads it asks for it at all.
+            if !session.tlb.has_shadow()
+                && session.jit.as_ref().is_some_and(|jit| jit.wants_shadow())
+                && let Some(space) = session.space.clone()
+            {
+                session.tlb.attach_shadow(space);
+            }
+            let Session {
+                state,
+                tlb,
+                space,
+                jit,
+            } = &mut *session;
+            let Some(space) = space.clone() else {
+                return (0, None);
+            };
+            let jit = jit.as_mut().expect("just installed");
+            let out = engine::advance(jit, state, tlb, &space, &cfg, &self.lines, exits, remaining);
+            // Everything outward happens **here**, with the execution lock
+            // released — the same rule `step_to_exit` follows and for the same
+            // reason (CLAUDE.md, the re-entrancy contract).
+            drop(session);
+            self.drive_outputs();
+            return out;
+        }
+        self.step_to_exit()
+    }
+
     /// Execute until at least `budget` accesses have been charged.
     pub fn run(&self, budget: u64) -> u64 {
         let mut used = 0;
         while used < budget {
-            let n = self.step();
+            let n = self.advance(budget - used).0;
             if n == 0 {
                 break;
             }
@@ -1090,7 +1286,7 @@ impl Cpu {
         let allowance = ticks - owed;
         let mut used = 0u64;
         while used < allowance {
-            let n = self.step();
+            let n = self.advance(allowance - used).0;
             if n == 0 {
                 break;
             }
@@ -1131,7 +1327,7 @@ impl Cpu {
         let allowance = ticks - owed;
         let mut used = 0u64;
         while used < allowance {
-            let (n, exit) = self.step_to_exit();
+            let (n, exit) = self.advance(allowance - used);
             if n == 0 {
                 break;
             }
@@ -1265,7 +1461,9 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "engine",
             kind: ValueKind::Str,
             required: false,
-            summary: "which execution engine; only `interp` exists for A64",
+            summary: "which execution engine: `interp`, `jit` (the translation runtime), \
+                      or `jit-host` (the same, with the host code generator). Both JIT \
+                      values need `cpu-arm-a64-lift` and `jit`",
         },
         PropertySpec {
             name: "psci",
@@ -1681,7 +1879,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("mpidr", ValueKind::Uint))
         .prop(PropSchema::new("cntfrq", ValueKind::Uint))
         .prop(PropSchema::new("cntdiv", ValueKind::Uint))
-        .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
+        .prop(PropSchema::new("engine", ValueKind::Str).values(ENGINES))
         .prop(PropSchema::new("psci", ValueKind::Str).values(psci::Conduit::NAMES))
         .prop(PropSchema::new("cpus", ValueKind::Uint).range(1, 256))
         .port("irq", PortDir::In)

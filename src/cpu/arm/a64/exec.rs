@@ -96,6 +96,22 @@ impl Trap {
             advance: false,
         }
     }
+
+    /// A data abort at the current level with no more specific syndrome.
+    ///
+    /// The fallback the translated engine's fault path needs to be total.
+    /// Never reached in practice — `IrHost::load` and `IrHost::store` both
+    /// record the trap they raised, and a fault can come from nowhere else —
+    /// and it exists so that path has an answer rather than an `unwrap`.
+    #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+    pub(super) const fn data_abort_at(far: u64) -> Trap {
+        Trap {
+            ec: ec::DABT_SAME,
+            iss: 0,
+            far: Some(far),
+            advance: false,
+        }
+    }
 }
 
 /// The architectural state of one core.
@@ -207,10 +223,10 @@ pub(super) fn debug_translate(
 
 /// One step's worth of execution, borrowing everything it needs.
 pub(super) struct Exec<'a> {
-    st: &'a mut State,
+    pub(super) st: &'a mut State,
     tlb: &'a mut Tlb,
     space: &'a AddressSpace,
-    cfg: &'a Config,
+    pub(super) cfg: &'a Config,
     lines: &'a Lines,
     /// Which architectural traps leave the core instead of vectoring into the
     /// guest (`core::exec`). Empty for a level-1 machine.
@@ -229,11 +245,25 @@ pub(super) struct Exec<'a> {
     /// that is false in every other caller.
     unpriv: bool,
     /// Cycles charged by this step.
-    used: u64,
+    pub(super) used: u64,
     /// Where execution continues, unless a branch overrides it.
-    next_pc: u64,
+    pub(super) next_pc: u64,
     /// The address of the instruction being executed.
-    this_pc: u64,
+    pub(super) this_pc: u64,
+    /// The guest-**physical** pages this step wrote, de-duplicated.
+    ///
+    /// The self-modifying-code half of `jit::dispatch`'s contract: a host
+    /// accumulates the pages *it* wrote and the dispatcher drains them at the
+    /// next block boundary, so a store into a page a translation came from
+    /// invalidates that translation. Physical rather than virtual, because a
+    /// cached block is matched by the page its bytes came from.
+    ///
+    /// Four entries is provably enough for one instruction: the widest access
+    /// this core makes is a pair of doublewords at adjacent addresses, which
+    /// is sixteen contiguous bytes and therefore at most two pages.
+    pub(super) wrote: [u64; 4],
+    /// How many of [`Exec::wrote`] are live.
+    pub(super) wrote_n: u8,
 }
 
 impl<'a> Exec<'a> {
@@ -261,6 +291,8 @@ impl<'a> Exec<'a> {
             used: 0,
             next_pc: this_pc,
             this_pc,
+            wrote: [0; 4],
+            wrote_n: 0,
         }
     }
 
@@ -321,28 +353,46 @@ impl<'a> Exec<'a> {
         self.next_pc = self.st.pc.wrapping_add(4);
         match self.execute() {
             Ok(()) => self.st.pc = self.next_pc,
-            Err(trap) => match self.exit_for(&trap) {
-                Some(exit) => {
-                    self.st.pc = exit.resume_pc();
-                    self.exit = Some(exit);
-                }
-                None => {
-                    let ret = if trap.advance {
-                        self.this_pc.wrapping_add(4)
-                    } else {
-                        self.this_pc
-                    };
-                    self.enter_exception(
-                        VectorKind::Synchronous,
-                        Some((trap.ec, trap.iss)),
-                        trap.far,
-                        ret,
-                    );
-                    self.st.pc = self.next_pc;
-                }
-            },
+            Err(trap) => {
+                let (at, next) = (self.this_pc, self.next_pc);
+                self.take_trap(trap, at, next);
+            }
         }
         self.used.max(1)
+    }
+
+    /// Take `trap` as an instruction at `at` whose successor is `next` would:
+    /// out of the core when the [`ExitMask`] names it, into the guest's
+    /// handler otherwise, leaving `State::pc` where execution resumes.
+    ///
+    /// Factored out of [`Exec::step_once`] rather than duplicated because the
+    /// translated engine takes traps too — one raised by a block's memory
+    /// path, and one raised by the entry fetch of a chained block — and two
+    /// copies of the exception-entry rules is how the two engines stop
+    /// agreeing about `ELR_EL1`.
+    pub(super) fn take_trap(&mut self, trap: Trap, at: u64, next: u64) -> Option<Exit> {
+        self.this_pc = at;
+        self.next_pc = next;
+        match self.exit_for(&trap) {
+            Some(exit) => {
+                self.st.pc = exit.resume_pc();
+                self.exit = Some(exit);
+                Some(exit)
+            }
+            None => {
+                // DDI 0487 D1.10.1: an `SVC` returns past itself, while a
+                // fault re-executes the instruction that took it.
+                let ret = if trap.advance { at.wrapping_add(4) } else { at };
+                self.enter_exception(
+                    VectorKind::Synchronous,
+                    Some((trap.ec, trap.iss)),
+                    trap.far,
+                    ret,
+                );
+                self.st.pc = self.next_pc;
+                None
+            }
+        }
     }
 
     /// Take the exit this step produced, if it produced one.
@@ -394,7 +444,7 @@ impl<'a> Exec<'a> {
 
     /// Charge one bus access.
     #[inline]
-    fn charge(&mut self) {
+    pub(super) fn charge(&mut self) {
         self.used += 1;
         self.st.cycles = self.st.cycles.wrapping_add(1);
     }
@@ -410,7 +460,7 @@ impl<'a> Exec<'a> {
     /// and taken from EL0 is **not** maskable — getting that wrong gives a
     /// core where a userspace process can never be preempted, and the bug
     /// looks like a scheduler problem rather than a CPU one.
-    fn pending_interrupt(&self) -> Option<VectorKind> {
+    pub(super) fn pending_interrupt(&self) -> Option<VectorKind> {
         let pending = self.lines.pending();
         let masked_here = self.st.sys.el == El::El1;
         // FIQ before IRQ: the architecture leaves the order to the
@@ -475,7 +525,7 @@ impl<'a> Exec<'a> {
     ///
     /// [`Cpu::step_to_exit`]: super::Cpu::step_to_exit
     #[inline]
-    fn publish_timer_levels(&self) {
+    pub(super) fn publish_timer_levels(&self) {
         if self.lines.routed_timers() != 0 {
             self.lines
                 .set_timer_level(self.st.sys.timer_levels(self.counter()));
@@ -566,7 +616,7 @@ impl<'a> Exec<'a> {
     }
 
     /// Build an instruction-abort trap.
-    fn insn_abort(&self, va: u64, fault: mmu::Fault) -> Trap {
+    pub(super) fn insn_abort(&self, va: u64, fault: mmu::Fault) -> Trap {
         Trap {
             ec: self.iabt_class(),
             iss: fault.dfsc(),
@@ -616,8 +666,18 @@ impl<'a> Exec<'a> {
     // -----------------------------------------------------------------
 
     /// Translate one virtual address, consulting and filling the TLB.
-    fn translate(&mut self, va: u64, kind: Access) -> Result<u64, mmu::Fault> {
+    pub(super) fn translate(&mut self, va: u64, kind: Access) -> Result<u64, mmu::Fault> {
         if !self.st.sys.mmu_enabled() {
+            // Bare mode reaches this on every access rather than on a miss, so
+            // the shadow's flat-view probe is asked for only where there is
+            // nothing cached yet — `refresh_shadow`'s own guard. Nothing here
+            // fills this core's TLB, and nothing needs to: with the MMU off no
+            // walk is owed, so an inlined access owes only its tick.
+            #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+            {
+                let el = self.st.sys.el;
+                self.refresh_shadow(kind, va, va, el, false);
+            }
             return Ok(va);
         }
         let vpn = va >> mmu::PAGE_BITS;
@@ -658,7 +718,138 @@ impl<'a> Exec<'a> {
             generation,
             t.pa & !mmu::PAGE_MASK,
         );
+        // In lockstep with the insert above, at the same index, for the same
+        // virtual page — which is the whole of what makes an inlined access
+        // indistinguishable from this one. A hit in the shadow then implies a
+        // hit here, so the walk it skips is a walk that has already happened
+        // and already been charged.
+        #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+        self.refresh_shadow(kind, va, t.pa, el, true);
         Ok(t.pa)
+    }
+
+    /// Write the shadow's slot for this page, so a compiled access may serve
+    /// it without calling back.
+    ///
+    /// Loads and stores only — the backend inlines nothing else
+    /// (`jit::x86::compile`, `Compiler::inlinable`) — and always a *write* on
+    /// the paged path, never a skip, because the caller has just replaced the
+    /// matching slot of this core's own TLB.
+    ///
+    /// The two sets are not interchangeable and are filled by the same code
+    /// for that reason: a store entry exists only because a walk **for a
+    /// store** succeeded, which is what checked the leaf's write permission
+    /// and `SCTLR_EL1.WXN`. Filling the store set from a load's walk would
+    /// lose both.
+    ///
+    /// What is *not* here is the part RISC-V needs and this core does not: a
+    /// protection check the page tables know nothing about. AArch64 has no
+    /// PMP, so a page the walk permits is a page the compiled path may reach,
+    /// and there is nothing left to refuse a page over.
+    #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+    fn refresh_shadow(&mut self, kind: Access, va: u64, phys: u64, el: El, translating: bool) {
+        let set = match kind {
+            Access::Load => crate::ir::AccessKind::Load,
+            Access::Store => crate::ir::AccessKind::Store,
+            // A fetch is never inlined, so a fetch entry would be a fill
+            // nothing reads.
+            Access::Fetch => return,
+        };
+        let generation = self.st.sys.translation_gen;
+        let Some(shadow) = self.tlb.shadow_mut() else {
+            return;
+        };
+        // Read live rather than remembered: this core is reachable through
+        // paths that never enter the dispatcher — `Cpu::step`, a monitor, a
+        // debugger — and a fill into a table that is stale in either counter
+        // would promise a hit that is not one.
+        let epoch = crate::jit::Epoch {
+            topology: shadow.topology_generation(),
+            translation: generation,
+        };
+        shadow.sync(epoch);
+        let ctx = crate::jit::Context {
+            level: el.bits() as u8,
+            translating,
+        };
+        if !translating && shadow.caches(set, va, ctx) {
+            return;
+        }
+        shadow.fill(set, va, phys, ctx);
+    }
+
+    /// The world this core's accesses happen in, as the shadow tags them.
+    ///
+    /// Read at a block boundary by the engine's [`FastMem`] implementation,
+    /// which is also where the shadow is resynchronised — so the tag a block
+    /// compares against is the one the table is currently filling with.
+    ///
+    /// [`FastMem`]: crate::jit::FastMem
+    ///
+    /// The exception level is the **current** one rather than the effective
+    /// one [`Exec::unpriv`] selects: `LDTR`/`STTR` are outside the lifted
+    /// subset, so no access inside a block can be an unprivileged one, and an
+    /// entry filled by an interpreted `LDTR` carries EL0's context and is
+    /// invisible to a block running at EL1.
+    #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+    pub(super) fn mem_plan(&mut self, kind: Access) -> Option<crate::jit::MemPlan> {
+        let set = match kind {
+            Access::Load => crate::ir::AccessKind::Load,
+            Access::Store => crate::ir::AccessKind::Store,
+            Access::Fetch => crate::ir::AccessKind::Fetch,
+        };
+        let ctx = crate::jit::Context {
+            level: self.st.sys.el.bits() as u8,
+            translating: self.st.sys.mmu_enabled(),
+        };
+        let generation = self.st.sys.translation_gen;
+        let shadow = self.tlb.shadow_mut()?;
+        let epoch = crate::jit::Epoch {
+            topology: shadow.topology_generation(),
+            translation: generation,
+        };
+        shadow.sync(epoch);
+        Some(shadow.plan(set, ctx))
+    }
+
+    /// Pay what a store the backend served itself still owes.
+    ///
+    /// `jit::x86` moved `bytes` bytes into guest RAM through the host address
+    /// the shadow's store entry carries, and did nothing else. This is
+    /// everything `Exec::write_once` does apart from moving them:
+    ///
+    /// * **the reservation**, broken by a store into the reserved sixteen-byte
+    ///   granule — the rule [`Exec::store`] applies before the write, applied
+    ///   after it here, which is unobservable because nothing runs in between
+    ///   and a `STXR` is a separate guest instruction that is not in the
+    ///   lifted subset anyway;
+    /// * **one tick**, because one bus access is one cycle and the walk was
+    ///   charged when the entry was filled;
+    /// * **the `RamStore`'s own dirty bitmap and the guest-physical dirty
+    ///   log**, which `jit::Tlb::note_fast_store` marks and reports — the
+    ///   first is the only record a framebuffer refresh or a live snapshot
+    ///   has, and the second is what invalidates a translation of a page the
+    ///   guest just rewrote.
+    ///
+    /// # Panics
+    ///
+    /// Never on a guest condition. A shadow entry that does not resolve to RAM
+    /// cannot have been used by generated code, which found a host address in
+    /// it one instruction earlier; reaching that arm is a code-generation bug,
+    /// and losing the dirty page silently would hide it.
+    #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+    pub(super) fn note_fast_store(&mut self, va: u64, bytes: u64) {
+        self.break_reservation(va);
+        self.charge();
+        let phys = self
+            .tlb
+            .shadow_mut()
+            .and_then(|shadow| shadow.note_fast_store(va, bytes));
+        let Some(phys) = phys else {
+            debug_assert!(false, "an inlined store used an entry that holds no RAM");
+            return;
+        };
+        self.note_write(phys);
     }
 
     /// The ASID currently in force, narrowed as `TCR_EL1.AS` says.
@@ -701,6 +892,12 @@ impl<'a> Exec<'a> {
             .translate(va, Access::Store)
             .map_err(|f| self.data_abort(va, f, Access::Store))?;
         self.charge();
+        // Before the write rather than after it: what a store reaches is what
+        // invalidates a translation of those bytes, and a refused write is
+        // still a page the block cache is better off re-lifting than serving
+        // stale. Recorded whatever the bus said, for the same reason a split
+        // store that faults halfway still wrote its first half.
+        self.note_write(pa);
         match self.space.write(pa, width, value, self.attrs) {
             Ok(()) => Ok(()),
             Err(_) => {
@@ -732,7 +929,7 @@ impl<'a> Exec<'a> {
     ///
     /// Each byte is translated separately, so an access straddling a page
     /// boundary faults on the half that is actually unmapped.
-    fn load(&mut self, va: u64, bytes: u64) -> Result<u64, Trap> {
+    pub(super) fn load(&mut self, va: u64, bytes: u64) -> Result<u64, Trap> {
         self.check_align(va, bytes, Access::Load, false)?;
         if va.is_multiple_of(bytes) {
             let width = Width::from_bytes(bytes).ok_or_else(Trap::undefined)?;
@@ -747,7 +944,7 @@ impl<'a> Exec<'a> {
     }
 
     /// Store `bytes` bytes, splitting an unaligned access into bytes.
-    fn store(&mut self, va: u64, bytes: u64, value: u64) -> Result<(), Trap> {
+    pub(super) fn store(&mut self, va: u64, bytes: u64, value: u64) -> Result<(), Trap> {
         self.check_align(va, bytes, Access::Store, false)?;
         self.break_reservation(va);
         if va.is_multiple_of(bytes) {
@@ -769,6 +966,43 @@ impl<'a> Exec<'a> {
         {
             self.st.exclusive = None;
         }
+    }
+
+    /// Remember the guest-physical page a write landed on.
+    ///
+    /// De-duplicated against what is already there, because a split store
+    /// makes up to eight writes into at most two pages.
+    #[inline]
+    fn note_write(&mut self, phys: u64) {
+        let page = phys & !mmu::PAGE_MASK;
+        if self.wrote[..self.wrote_n as usize].contains(&page) {
+            return;
+        }
+        if (self.wrote_n as usize) < self.wrote.len() {
+            self.wrote[self.wrote_n as usize] = page;
+            self.wrote_n += 1;
+        }
+    }
+
+    /// Resolve `va` as an instruction fetch would, charging the walk.
+    ///
+    /// What the translated engine owes at every block boundary: the entry
+    /// translation a block skips but the instruction it replaced made. It is
+    /// the *fetch* path — execute permission, the same TLB, the same walk
+    /// charge — rather than `debug_translate`, whose whole purpose is to have
+    /// none of those effects, and it includes the PC alignment check because
+    /// `Exec::fetch` raises that before it translates anything.
+    pub(super) fn translate_fetch(&mut self, va: u64) -> Result<u64, Trap> {
+        if va & 3 != 0 {
+            return Err(Trap {
+                ec: ec::PC_ALIGN,
+                iss: 0,
+                far: Some(va),
+                advance: false,
+            });
+        }
+        self.translate(va, Access::Fetch)
+            .map_err(|f| self.insn_abort(va, f))
     }
 
     /// Fetch the instruction at `pc`.

@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std", "vnc", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-xhci", "dev-usb-xhci-pci", "dev-usb-dwc2", "dev-usb-hid", "dev-usb-hub", "dev-usb-msd", "dev-blk", "dev-ne2000", "dev-nvme", "dev-ahci", "dev-riscv", "dev-virtio", "dev-pc-apic", "dev-pc-hpet", "ir", "jit", "cpu-riscv-lift", "float", "dev-q35", "cpu-x86-lift", "usermode"]
+features         = ["std", "vnc", "dev-flash-cfi", "dev-usb-ehci", "dev-usb-xhci", "dev-usb-xhci-pci", "dev-usb-dwc2", "dev-usb-hid", "dev-usb-hub", "dev-usb-msd", "dev-blk", "dev-ne2000", "dev-nvme", "dev-ahci", "dev-riscv", "dev-virtio", "dev-pc-apic", "dev-pc-hpet", "ir", "jit", "cpu-riscv-lift", "float", "dev-q35", "cpu-x86-lift", "usermode", "cpu-arm-a64-lift"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -239,6 +239,21 @@ bench = false
 [[bin]]
 name  = "x86_lift"
 path  = "fuzz_targets/x86_lift.rs"
+test  = false
+doc   = false
+bench = false
+
+# The same question for the *third* frontend, whose hazard is neither of the
+# other two's. A64 has no flag-elision policy to get wrong, but `CMP` is
+# literally `SUBS`, so the carry rule — set when there was **no** borrow — is on
+# the path of every conditional branch in every program and a lifter that
+# inverted it would still pass anything that only read registers. The
+# comparison therefore adds `PSTATE.NZCV` whole *and* the stack pointer, which
+# is a slot rather than a register and is spelled by the same encoding that
+# spells `XZR` elsewhere.
+[[bin]]
+name  = "a64_lift"
+path  = "fuzz_targets/a64_lift.rs"
 test  = false
 doc   = false
 bench = false

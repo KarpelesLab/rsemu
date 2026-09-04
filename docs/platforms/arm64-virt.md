@@ -307,6 +307,78 @@ to the `disk` **media slot**, so the whole 64 MiB lives in host memory as a
 is no AArch64 equivalent of that test yet; the device under it is the same
 object, which is the whole point of the move.
 
+
+## Choosing an execution engine
+
+`cpu.arm.a64` takes three, and they are `interp`, `jit` and `jit-host` with the
+same meanings the other two cores give them:
+
+- **`interp`** — the interpreter, and the oracle everything else is measured
+  against. The default.
+- **`jit`** — the translation runtime in [`src/jit`](../../src/jit): guest
+  instructions lifted into IR blocks by
+  [`cpu::arm::a64::lift`](../../src/cpu/arm/a64/lift.rs), cached under
+  `(pc, physical page)`, executed by the portable IR backend. Runs everywhere
+  the crate does.
+- **`jit-host`** — the same runtime with the **host code generator** attached,
+  so blocks are lowered to machine code by [`jit::x86`](../../src/jit/x86) on
+  x86-64 Linux in a build with `jit-x86`. Anywhere else it falls back to
+  `jit`'s backend and answers identically.
+
+**This board's file writes `engine = "interp"` as a literal rather than as a
+`param`**, so `-p engine=jit` has nothing to override; reaching the other two
+from the command line wants the two-line change
+`param engine = "interp"` plus `engine = engine` in
+[`machines/arm64-virt.machine`](../../machines/arm64-virt.machine). Everything
+below was measured by building the same board programmatically and choosing the
+engine through `Cpu::with_engine`, which is the same path `from_props` reaches.
+
+All three are **indistinguishable to the guest**, cycle counts included, and
+that is asserted rather than hoped: `tests/a64_engines.rs` runs a minimal
+AArch64 board on each and compares `Machine::state_hash` at ten checkpoints,
+then moves a snapshot between engines in both directions;
+`cpu::arm::a64::engine`'s own tests do it for a bare core, a paged one, and one
+that takes an interrupt mid-run.
+
+It holds on a real guest too. The kernel and initramfs above, 512 MiB, over
+twenty seconds of virtual time — well past the point where the kernel is doing
+real work rather than decompressing:
+
+| `engine` | 20 s of guest time |
+| --- | --- |
+| `interp` | 17.35 s |
+| `jit` | 11.21 s (**1.55×**) |
+| `jit-host` | **6.34 s (2.73×)** |
+
+Every cell is the median of three **interleaved** runs — one of each engine, in
+turn, round and round, because the interpreter is the control and a control
+measured in a different sitting is not one — and all nine finished on one state
+hash, `0x415f52aebd310878`, having charged 199 990 000 cycles.
+
+What the mechanisms did over that run:
+
+| | |
+| --- | --- |
+| blocks executed | 18 774 915 |
+| of those, compiled to host code | 18 774 316 (**99.997%**) |
+| of those, reached by a patched exit | 14 341 043 (76.4%) |
+| distinct blocks lifted | 16 655 |
+| guest instructions retired **inside** a block | 123 794 600 (**79.2%**) |
+| compiled loads served by an inlined TLB probe | 16 149 884 |
+| compiled stores served the same way | 10 535 057 |
+
+The 599 blocks the code generator refused are the ones holding a `UDIV` or an
+`SDIV`, the only two ops this frontend emits that `jit::x86` does not lower.
+The inlined probes — `ROADMAP.md` §9.1's first mechanism, the software TLB's
+fast path emitted into generated code rather than called into — are worth the
+last step of that ratio on their own: before `cpu::arm::a64::mmu`'s `Tlb` had a
+`jit::Tlb` shadow to publish, the same sweep put `jit-host` at 6.92 s and
+2.54×. [`src/cpu/arm/a64/engine.rs`](../../src/cpu/arm/a64/engine.rs) has the
+argument for what a plan may cover on this architecture, and the three things
+that looked as though they might forbid one — address tagging, the two `TTBR`s
+and granule selection — none of which does.
+
+
 ## Where it stops, and what is still in the way
 
 It did not stop, so this section is a list of what the board *has not got*
