@@ -80,6 +80,13 @@ pub const DTB_OFFSET: u64 = 0x800;
 /// Where the entry address literal sits inside the ROM.
 const ENTRY_OFFSET: u64 = 0x38;
 
+/// Where the secondary processors' parking loop sits, in the reset vector's
+/// own 128-byte slot and just past the entry literal.
+///
+/// A board with one processor never emits it, so its ROM is byte-identical to
+/// the one this file generated before secondaries existed.
+const SECONDARY_OFFSET: u64 = 0x40;
+
 /// How far apart AArch64's sixteen exception vector slots are (DDI 0487
 /// D1.10.2): 128 bytes each, sixteen of them, 2 KiB in total.
 const VECTOR_STRIDE: u64 = 0x80;
@@ -172,6 +179,111 @@ pub mod asm {
     pub const fn b(words: i32) -> u32 {
         0x1400_0000 | ((words as u32) & 0x03ff_ffff)
     }
+
+    /// `MRS Xt, <system register>` (C6.2.194).
+    ///
+    /// The five fields that name a system register go in at 19:5, with `op0`
+    /// contributing only its low bit — the encoding has room for `op0` of 2
+    /// and 3 and nothing else.
+    #[must_use]
+    pub const fn mrs(rt: u32, op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> u32 {
+        0xd530_0000
+            | ((op0 & 1) << 19)
+            | ((op1 & 7) << 16)
+            | ((crn & 0xf) << 12)
+            | ((crm & 0xf) << 8)
+            | ((op2 & 7) << 5)
+            | rt
+    }
+
+    /// `MRS Xt, MPIDR_EL1` — op0 3, op1 0, CRn 0, CRm 0, op2 5 (D19.2.100).
+    #[must_use]
+    pub const fn mrs_mpidr(rt: u32) -> u32 {
+        mrs(rt, 3, 0, 0, 0, 5)
+    }
+
+    /// `AND Xd, Xn, #imm` — the 64-bit logical-immediate form (C6.2.11).
+    ///
+    /// The immediate is the `N:immr:imms` triple the architecture encodes
+    /// bitmasks with rather than a plain number; [`mask_low_bits`] builds the
+    /// one shape this module needs.
+    #[must_use]
+    pub const fn and_imm(rd: u32, rn: u32, n: u32, immr: u32, imms: u32) -> u32 {
+        0x9200_0000
+            | ((n & 1) << 22)
+            | ((immr & 0x3f) << 16)
+            | ((imms & 0x3f) << 10)
+            | (rn << 5)
+            | rd
+    }
+
+    /// The `(N, immr, imms)` triple for a mask of the low `bits` bits, which
+    /// is a run of ones ending at bit 0: `N = 1`, `immr = 0`, `imms = bits-1`
+    /// (DDI 0487 J1, `DecodeBitMasks`).
+    #[must_use]
+    pub const fn mask_low_bits(bits: u32) -> (u32, u32, u32) {
+        (1, 0, bits - 1)
+    }
+
+    /// `ADD Xd, Xn, Xm, LSL #shift` — the shifted-register form (C6.2.5).
+    #[must_use]
+    pub const fn add_lsl(rd: u32, rn: u32, rm: u32, shift: u32) -> u32 {
+        0x8b00_0000 | (rm << 16) | ((shift & 0x3f) << 10) | (rn << 5) | rd
+    }
+
+    /// `LDR Xt, [Xn]` — the unsigned-offset form with an offset of zero
+    /// (C6.2.132).
+    #[must_use]
+    pub const fn ldr_base(rt: u32, rn: u32) -> u32 {
+        0xf940_0000 | (rn << 5) | rt
+    }
+
+    /// `CBZ Xt, label`, `words` instructions away (C6.2.40).
+    #[must_use]
+    pub const fn cbz(rt: u32, words: i32) -> u32 {
+        0xb400_0000 | (((words as u32) & 0x0007_ffff) << 5) | rt
+    }
+
+    /// `CBNZ Xt, label`, `words` instructions away (C6.2.39).
+    #[must_use]
+    pub const fn cbnz(rt: u32, words: i32) -> u32 {
+        0xb500_0000 | (((words as u32) & 0x0007_ffff) << 5) | rt
+    }
+
+    /// `STR Xt, [Xn]` — the unsigned-offset form with an offset of zero
+    /// (C6.2.273). The counterpart of [`ldr_base`], and what writes a word of
+    /// a release table.
+    #[must_use]
+    pub const fn str_base(rt: u32, rn: u32) -> u32 {
+        0xf900_0000 | (rn << 5) | rt
+    }
+
+    /// `ADD Xd, Xn, #imm12` — the immediate form with no shift (C6.2.4).
+    #[must_use]
+    pub const fn add_imm(rd: u32, rn: u32, imm: u32) -> u32 {
+        0x9100_0000 | ((imm & 0xfff) << 10) | (rn << 5) | rd
+    }
+
+    /// `MOVZ`/`MOVK` for a whole 64-bit constant, low halfword first.
+    ///
+    /// Four instructions, always: a shorter sequence would depend on the
+    /// value, and a stub whose length moved with its operand is a stub whose
+    /// branch offsets move with it too.
+    #[must_use]
+    pub fn load64(rd: u32, value: u64) -> [u32; 4] {
+        [
+            movz(rd, (value & 0xffff) as u32),
+            movk(rd, ((value >> 16) & 0xffff) as u32, 16),
+            movk(rd, ((value >> 32) & 0xffff) as u32, 32),
+            movk(rd, ((value >> 48) & 0xffff) as u32, 48),
+        ]
+    }
+
+    /// `WFE` — wait for an event (C6.2.320).
+    #[must_use]
+    pub const fn wfe() -> u32 {
+        0xd503_205f
+    }
 }
 
 /// The image, and what it is built from.
@@ -261,6 +373,10 @@ impl BootRom {
         let psci = r
             .or_enum("psci", "smc", &["smc", "hvc", "none"])?
             .to_string();
+        let secondary = r
+            .or_enum("secondary", "psci", &["psci", "spin-table"])?
+            .to_string();
+        let release_addr = r.or_addr("release-addr", 0)?;
         let bootargs = r.or("bootargs", String::new())?;
         // The ramdisk is *described* here and *placed* by an `arm.loader`, so
         // the same media slot is named twice and its length is read out of the
@@ -306,6 +422,26 @@ impl BootRom {
         // which is what a kernel matches its `reg` properties against.
         let affinities: Vec<u64> = (0..cpus).map(|i| mpidr.wrapping_add(i)).collect();
 
+        // Every processor comes out of reset at the same address, so a board
+        // with more than one needs somewhere for the others to wait: one
+        // 64-bit word each, in RAM, zero until something releases them. The
+        // address cannot be guessed here — it has to be memory the board knows
+        // is free and the tree can reserve — so a multiprocessor board that
+        // does not give one is refused rather than parked on address zero.
+        if cpus > 1 && release_addr == 0 {
+            return Err(Error::Property(format!(
+                "property `release-addr`: this board has {cpus} processors and they all come out \
+                 of reset at the same address, so the ones that are not the boot processor need a \
+                 release table to wait on; give `release-addr` an address in RAM below the kernel"
+            )));
+        }
+        if !release_addr.is_multiple_of(8) {
+            return Err(Error::Property(format!(
+                "property `release-addr`: a release table is 64-bit words and the guest writes \
+                 them as such, so it must be 8-byte aligned; {release_addr:#x} is not"
+            )));
+        }
+
         let rom = Arc::new(Rom {
             contents: Mutex::with_rank(
                 LockRank::DEVICE,
@@ -335,11 +471,21 @@ impl BootRom {
                 cpus: CpuSpec {
                     mpidr: affinities,
                     compatible: cpu_compatible,
-                    enable_method: if psci == "none" {
-                        String::new()
-                    } else {
-                        String::from("psci")
+                    // What the *tree* says, which is a different question from
+                    // where a parked processor waits: the parking loop is the
+                    // same either way and `spin-table` is the method that
+                    // needs no firmware behind an instruction.
+                    enable_method: match (secondary.as_str(), psci.as_str()) {
+                        ("spin-table", _) => String::from("spin-table"),
+                        (_, "none") => String::new(),
+                        _ => String::from("psci"),
                     },
+                    release_addr: (secondary == "spin-table" && release_addr != 0)
+                        .then_some(release_addr),
+                    // Only a board with somewhere to park anything: a
+                    // one-processor board that names a table would reserve a
+                    // page of the guest's RAM for nobody.
+                    parked_at: (cpus > 1 && release_addr != 0).then_some(release_addr),
                 },
                 psci: match psci.as_str() {
                     "smc" => Some(Conduit::Smc),
@@ -380,24 +526,111 @@ impl BootRom {
             .unwrap_or_default()
     }
 
-    /// The six-instruction stub, followed by the entry address literal.
+    /// The six-instruction stub, followed by the entry address literal — and,
+    /// on a board with more than one processor, the three that pick a path and
+    /// the parking loop the other processors take.
+    ///
+    /// # Why the reset vector branches at all
+    ///
+    /// Every processor on this board comes out of reset at the same address,
+    /// because that is what a reset vector *is*. A stub that unconditionally
+    /// jumped to the kernel would therefore enter the kernel once per
+    /// processor, on all of them at once, which is not a boot. So the stub
+    /// reads `MPIDR_EL1`, and everything but affinity 0 goes to the parking
+    /// loop below and waits to be told where to go:
+    ///
+    /// ```text
+    ///   mrs  x9, mpidr_el1
+    ///   and  x9, x9, #0xff        ; Aff0, which is this board's cpu index
+    ///   cbnz x9, secondary
+    ///   ; … the primary path, unchanged …
+    /// secondary:
+    ///   movz x10, #<release-addr>  ; four halfwords
+    ///   add  x10, x10, x9, lsl #3  ; &table[index]
+    /// 1: wfe
+    ///   ldr  x11, [x10]
+    ///   cbz  x11, 1b
+    ///   mov  x0, #0 … x3, #0
+    ///   br   x11
+    /// ```
+    ///
+    /// That table is the board's **warm-boot entry point**: one 64-bit word
+    /// per processor, zero until somebody writes an address into it. Which is
+    /// exactly the shape a spin table has (`cpu-release-addr`, Devicetree
+    /// Specification v0.4 §3.8.1) *and* exactly what a PSCI `CPU_ON` would
+    /// have to write, so the two boot methods differ only in what the device
+    /// tree tells the guest.
     #[must_use]
     pub fn stub(&self) -> Vec<u8> {
-        let words = [
-            asm::adr(0, DTB_OFFSET as i32),
-            asm::movz(1, 0),
-            asm::movz(2, 0),
-            asm::movz(3, 0),
-            asm::ldr_literal(4, ENTRY_OFFSET as i32 - 0x10),
-            asm::br(4),
-        ];
-        let mut out = Vec::with_capacity(ENTRY_OFFSET as usize + 8);
-        for word in words {
+        let mut words: Vec<u32> = Vec::new();
+        if self.config.cpus.mpidr.len() > 1 {
+            words.push(asm::mrs_mpidr(9));
+            let (n, immr, imms) = asm::mask_low_bits(8);
+            words.push(asm::and_imm(9, 9, n, immr, imms));
+            // From here to the parking loop, in instructions.
+            let here = words.len() as i32;
+            words.push(asm::cbnz(9, (SECONDARY_OFFSET / 4) as i32 - here));
+        }
+        // Both PC-relative operands are measured from the instruction that
+        // carries them, so neither can be a constant once something may sit in
+        // front of them.
+        let adr_at = words.len() as u64 * 4;
+        words.push(asm::adr(0, (DTB_OFFSET - adr_at) as i32));
+        words.push(asm::movz(1, 0));
+        words.push(asm::movz(2, 0));
+        words.push(asm::movz(3, 0));
+        let ldr_at = words.len() as u64 * 4;
+        words.push(asm::ldr_literal(4, (ENTRY_OFFSET - ldr_at) as i32));
+        words.push(asm::br(4));
+
+        let mut out = Vec::with_capacity(SECONDARY_OFFSET as usize);
+        for word in &words {
             out.extend_from_slice(&word.to_le_bytes());
         }
         out.resize(ENTRY_OFFSET as usize, 0);
         out.extend_from_slice(&self.entry.to_le_bytes());
+        if self.config.cpus.mpidr.len() > 1 {
+            out.resize(SECONDARY_OFFSET as usize, 0);
+            for word in self.parking_loop() {
+                out.extend_from_slice(&word.to_le_bytes());
+            }
+        }
         out
+    }
+
+    /// The instructions a processor other than the first executes forever, or
+    /// until its word of the release table stops being zero.
+    ///
+    /// `x9` holds the processor's index on entry, which the reset vector has
+    /// already masked out of `MPIDR_EL1`.
+    #[must_use]
+    pub fn parking_loop(&self) -> Vec<u32> {
+        // `parked_at` and not `release_addr`: the first is where processors
+        // wait, the second is only whether the *tree* tells the guest about
+        // it. A `psci` board parks its secondaries on the same table and would
+        // otherwise be given address zero — which is the ROM, whose first word
+        // is not zero, so every secondary would branch into an instruction
+        // encoding the instant it looked.
+        let release = self.config.cpus.parked_at.unwrap_or(0);
+        let mut words: Vec<u32> = asm::load64(10, release).to_vec();
+        // Eight bytes per entry, so the index shifts left by three.
+        words.push(asm::add_lsl(10, 10, 9, 3));
+        // `WFE` is a hint and this core treats it as one, so the loop is
+        // correct whether or not anything ever signals an event — a released
+        // processor is one that read a non-zero word, not one that woke up.
+        let spin = words.len() as i32;
+        words.push(asm::wfe());
+        words.push(asm::ldr_base(11, 10));
+        words.push(asm::cbz(11, spin - (words.len() as i32)));
+        // The released processor enters with the same register state the
+        // primary one did, less the device tree: it is not the boot processor
+        // and has no argument.
+        words.push(asm::movz(0, 0));
+        words.push(asm::movz(1, 0));
+        words.push(asm::movz(2, 0));
+        words.push(asm::movz(3, 0));
+        words.push(asm::br(11));
+        words
     }
 
     /// The four instructions that fill each unused exception vector slot.
@@ -517,6 +750,20 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Uint,
             required: false,
             summary: "how many processors the tree describes (default 1)",
+        },
+        PropertySpec {
+            name: "secondary",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "how the tree says the other processors are started: `psci` or \
+                      `spin-table` (default `psci`)",
+        },
+        PropertySpec {
+            name: "release-addr",
+            kind: ValueKind::Addr,
+            required: false,
+            summary: "where the release table of one 64-bit word per processor lives; \
+                      required once `cpus` is more than one",
         },
         PropertySpec {
             name: "mpidr",
@@ -641,6 +888,8 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("size", ValueKind::Size))
         .prop(PropSchema::new("entry", ValueKind::Addr))
         .prop(PropSchema::new("cpus", ValueKind::Uint).range(1, 256))
+        .prop(PropSchema::new("secondary", ValueKind::Str).values(&["psci", "spin-table"]))
+        .prop(PropSchema::new("release-addr", ValueKind::Addr))
         .prop(PropSchema::new("mpidr", ValueKind::Uint))
         .prop(PropSchema::new("cpu-compatible", ValueKind::Str))
         .prop(PropSchema::new("psci", ValueKind::Str).values(&["smc", "hvc", "none"]))
@@ -703,6 +952,142 @@ mod tests {
             u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()),
             0x4020_0000
         );
+    }
+
+    /// A two-processor ROM with its release table a page into DRAM.
+    fn smp_rom() -> BootRom {
+        use crate::core::props::Value;
+        let props = Props::new()
+            .with("entry", Value::Addr(0x4020_0000))
+            .with("cpus", 2u64)
+            .with("secondary", "spin-table")
+            .with("release-addr", Value::Addr(0x4000_1000));
+        BootRom::new(&props).expect("a two-processor boot ROM")
+    }
+
+    #[test]
+    fn a_one_processor_rom_is_the_stub_it_always_was() {
+        // The regression that matters: `machines/arm64-virt.machine` boots a
+        // distribution kernel, and a second core must not change one byte of
+        // the ROM it resets into.
+        let rom = rom(0x4020_0000);
+        assert_eq!(rom.stub().len(), ENTRY_OFFSET as usize + 8);
+        assert_eq!(words(&rom).len(), (ENTRY_OFFSET / 4) as usize + 2);
+        assert_eq!(words(&rom)[0], asm::adr(0, DTB_OFFSET as i32));
+    }
+
+    #[test]
+    fn the_smp_encodings_are_the_ones_the_manual_gives() {
+        // Independently known encodings again, so the four instructions the
+        // parking loop needs are checked against DDI 0487 rather than against
+        // the functions that produced them.
+        assert_eq!(asm::mrs_mpidr(0), 0xd538_00a0, "mrs x0, mpidr_el1");
+        let (n, immr, imms) = asm::mask_low_bits(8);
+        assert_eq!(
+            asm::and_imm(0, 0, n, immr, imms),
+            0x9240_1c00,
+            "and x0, x0, #0xff"
+        );
+        assert_eq!(
+            asm::add_lsl(0, 0, 1, 3),
+            0x8b01_0c00,
+            "add x0, x0, x1, lsl #3"
+        );
+        assert_eq!(asm::ldr_base(0, 1), 0xf940_0020, "ldr x0, [x1]");
+        assert_eq!(asm::cbnz(0, 2), 0xb500_0040, "cbnz x0, .+8");
+        assert_eq!(asm::cbz(0, 2), 0xb400_0040, "cbz x0, .+8");
+        assert_eq!(asm::movk(0, 0, 48), 0xf2e0_0000, "movk x0, #0, lsl #48");
+        assert_eq!(asm::wfe(), 0xd503_205f);
+    }
+
+    #[test]
+    fn a_two_processor_reset_vector_sends_everything_but_affinity_zero_to_the_loop() {
+        let rom = smp_rom();
+        let w = words(&rom);
+        assert_eq!(w[0], asm::mrs_mpidr(9));
+        let (n, immr, imms) = asm::mask_low_bits(8);
+        assert_eq!(w[1], asm::and_imm(9, 9, n, immr, imms), "Aff0");
+        // The branch is taken to `SECONDARY_OFFSET`, counted from the branch.
+        assert_eq!(w[2], asm::cbnz(9, (SECONDARY_OFFSET / 4) as i32 - 2));
+        // And the primary path is the same six instructions, three words
+        // further on, with both PC-relative operands moved with them.
+        assert_eq!(w[3], asm::adr(0, (DTB_OFFSET - 0x0c) as i32));
+        assert_eq!(w[7], asm::ldr_literal(4, (ENTRY_OFFSET - 0x1c) as i32));
+        assert_eq!(w[8], asm::br(4));
+        let bytes = rom.stub();
+        let at = ENTRY_OFFSET as usize;
+        assert_eq!(
+            u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()),
+            0x4020_0000,
+            "the entry literal is still where the load points"
+        );
+    }
+
+    #[test]
+    fn the_parking_loop_waits_on_this_processors_word_of_the_release_table() {
+        let rom = smp_rom();
+        let loop_words = rom.parking_loop();
+        // The address is built a halfword at a time, low first.
+        assert_eq!(loop_words[0], asm::movz(10, 0x1000));
+        assert_eq!(loop_words[1], asm::movk(10, 0x4000, 16));
+        assert_eq!(loop_words[2], asm::movk(10, 0, 32));
+        assert_eq!(loop_words[3], asm::movk(10, 0, 48));
+        // Eight bytes an entry: the index in `x9` shifts left by three.
+        assert_eq!(loop_words[4], asm::add_lsl(10, 10, 9, 3));
+        assert_eq!(loop_words[5], asm::wfe());
+        assert_eq!(loop_words[6], asm::ldr_base(11, 10));
+        // Back two instructions, to the `wfe`.
+        assert_eq!(loop_words[7], asm::cbz(11, -2));
+        assert_eq!(*loop_words.last().unwrap(), asm::br(11));
+        // It fits in the reset vector's own slot, which is the only place it
+        // can be: every other slot is an exception vector.
+        assert!(SECONDARY_OFFSET + loop_words.len() as u64 * 4 <= VECTOR_STRIDE);
+        // And it is where the reset vector branches to.
+        let bytes = rom.stub();
+        let at = SECONDARY_OFFSET as usize;
+        assert_eq!(
+            u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()),
+            loop_words[0]
+        );
+    }
+
+    #[test]
+    fn a_psci_board_parks_its_secondaries_on_the_table_the_tree_does_not_mention() {
+        // The two questions are separate and getting them confused is a live
+        // defect: `secondary = "psci"` publishes no `cpu-release-addr`, but the
+        // processors still have to wait *somewhere*, and a parking loop given
+        // address zero would load the ROM's own first instruction word and
+        // branch to it.
+        use crate::core::props::Value;
+        let props = Props::new()
+            .with("cpus", 2u64)
+            .with("release-addr", Value::Addr(0x4000_1000));
+        let rom = BootRom::new(&props).expect("a two-processor PSCI board");
+        assert_eq!(rom.config.cpus.enable_method, "psci");
+        assert_eq!(rom.config.cpus.release_addr, None, "not in the tree");
+        assert_eq!(rom.config.cpus.parked_at, Some(0x4000_1000), "but real");
+        assert_eq!(rom.parking_loop()[0], asm::movz(10, 0x1000));
+        // And a board with one processor reserves nothing, because there is
+        // nothing waiting on it.
+        let props = Props::new().with("release-addr", Value::Addr(0x4000_1000));
+        let one = BootRom::new(&props).expect("one processor");
+        assert_eq!(one.config.cpus.parked_at, None);
+    }
+
+    #[test]
+    fn a_multiprocessor_rom_without_a_release_table_is_refused() {
+        // Two processors resetting to the same address and nowhere to park one
+        // of them is a board that enters the kernel twice.
+        let props = Props::new().with("cpus", 2u64);
+        let e = BootRom::new(&props)
+            .expect_err("no release table")
+            .to_string();
+        assert!(e.contains("release-addr"), "{e}");
+        // And a table a 64-bit store cannot land on squarely.
+        let props = Props::new()
+            .with("cpus", 2u64)
+            .with("release-addr", crate::core::props::Value::Addr(0x4000_1004));
+        assert!(BootRom::new(&props).is_err(), "misaligned");
     }
 
     #[test]

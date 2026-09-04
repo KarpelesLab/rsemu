@@ -1,0 +1,222 @@
+# The AArch64 `virt` board with two processors.
+#
+#   rsemu run arm64-virt-smp --media kernel=Image --media initrd=rootfs.cpio
+#
+# Everything here is `machines/arm64-virt.machine` — same addresses, same
+# GICv2, same PL011, same PSCI, same virtio, same generated device tree — with
+# a **second core** and the three things a second core needs. It is a separate
+# file rather than a `param` on that one for the reason `machines/pc-apic.machine`
+# is separate from `machines/pc-at.machine`: the description language declares
+# objects, and the number of them cannot come from a parameter. A one-core run
+# of this board would be a board with a spare core spinning in the boot ROM.
+#
+# Read `docs/platforms/arm64-virt.md` for the board; this header is only about
+# what the second core changes.
+#
+# ---------------------------------------------------------------------------
+# 1. The GIC has to know who is asking
+# ---------------------------------------------------------------------------
+#
+# A GICv2's low 32 interrupt ids are **banked**: interrupt 27 is a different
+# interrupt on each core, with its own enable bit, its own pending bit and its
+# own priority (IHI 0048 §4.1.3). So `GICD_ISENABLER0` answers differently
+# depending on which core reads it, and a distributor that stored one copy of
+# those registers would have two cores sharing one timer.
+#
+# The bus already carries who is asking — `MemAttrs::requester`, stamped by
+# `cpu.arm.a64` on every access it makes — and what was missing was the map
+# from a requester id to a CPU interface number. A requester id is allocated at
+# realize time by declaration order, so it cannot be written in a file; the
+# `processors` property below names the *objects* instead and the GIC resolves
+# them when the machine binds. `src/dev/pc/apic.rs` does the identical thing
+# for the architectural local-APIC page.
+#
+# ---------------------------------------------------------------------------
+# 2. Two cores means two generic timers, and four wires
+# ---------------------------------------------------------------------------
+#
+# The generic timer is a *private peripheral interrupt*: each core has its own,
+# and it arrives at that core's own bank of the distributor. Hence
+# `gic.cpu0ppi11` and `gic.cpu1ppi11` rather than one `gic.ppi11`. Wiring a
+# core's `cntv` out is also what takes the timer *out* of that core's internal
+# interrupt OR — a core that raised the interrupt both ways would hand a kernel
+# an interrupt its controller never saw, which it answers by reading
+# `GICC_IAR`, being told 1023, and taking it again forever.
+#
+# ---------------------------------------------------------------------------
+# 3. Both cores come out of reset at the same address
+# ---------------------------------------------------------------------------
+#
+# That is what a reset vector is. So the boot ROM's first three instructions
+# read `MPIDR_EL1` and send everything but affinity 0 to a parking loop, where
+# it waits on a **release table**: one 64-bit word per processor at
+# `release-addr`, zero until something writes an address into it, at which
+# point that processor jumps there with `x0`-`x3` clear.
+#
+# `secondary = "spin-table"` is the board telling the guest that table exists
+# and where it is (`cpu-release-addr`, Devicetree Specification v0.4 §3.8.1),
+# which is the boot method that needs nothing behind an `SMC`. The alternative
+# is PSCI `CPU_ON`, and this board cannot offer it yet: servicing one means
+# reaching a *sibling* core from inside the core executing the `SMC`, and
+# `cpu.arm.a64` has no route out for it. When it grows one, the mechanism it
+# will write to is this same table and `secondary = "psci"` becomes the
+# default here — `docs/platforms/arm64-virt.md` records exactly what the core
+# needs.
+#
+# The table sits a page above the bottom of DRAM, well below the kernel, and
+# the generated tree carries a memory reservation over that page so the
+# kernel's own allocator never hands it out.
+
+machine "arm64-virt-smp" {
+  param part = "cortex-a53"
+  param ram = 512M
+  param ram-base = 0x40000000
+  param kernel-addr = 0x40200000
+  param initrd-addr = 0x48000000
+
+  # Where the release table lives: one 64-bit word per processor, in DRAM,
+  # below the kernel and reserved in the generated tree. A literal for the same
+  # reason `kernel-addr` is one — a `param` default cannot do arithmetic on
+  # another parameter — so it moves with `ram-base` by hand or not at all.
+  param release-addr = 0x40001000
+
+  param cmdline = ""
+  param console = "console"
+  param storage = 16M
+  param power = "power"
+  param psci = "smc"
+  param cpu-hz = 1000000000
+  param cntfrq = 62500000
+  param engine = "interp"
+
+  osc sysclk  = cpu-hz Hz
+  osc uartclk = 24000000 Hz
+
+  space mem { width = 64 }
+
+  # -- the processors --------------------------------------------------------
+  #
+  # Identical but for `mpidr`, whose Aff0 field is what the reset vector reads
+  # to decide which of them is the boot processor and what a kernel matches the
+  # `reg` of each `cpu@N` node against. Bit 31 is RES1 on both.
+  object cpu0 "cpu.arm.a64" {
+    clock  = sysclk
+    space  = mem
+    engine = engine
+    cpu    = part
+    reset  = 0x00000000
+    mpidr  = 0x80000000
+    cntfrq = cntfrq
+    cntdiv = cpu-hz / cntfrq
+    psci   = psci
+    cpus   = 2
+  }
+
+  object cpu1 "cpu.arm.a64" {
+    clock  = sysclk
+    space  = mem
+    engine = engine
+    cpu    = part
+    reset  = 0x00000000
+    mpidr  = 0x80000001
+    cntfrq = cntfrq
+    cntdiv = cpu-hz / cntfrq
+    psci   = psci
+    cpus   = 2
+  }
+
+  object dram "ram" { size = ram }
+
+  # -- the interrupt controller ---------------------------------------------
+  #
+  # `processors` is the map the banked registers need; see the note above. Its
+  # order *is* the CPU interface order, so `cpu1` is interface 1 and `gic.irq1`
+  # is the line that reaches it.
+  object gic "arm.gic" {
+    cpus       = 2
+    spis       = 96
+    processors = [cpu0, cpu1]
+  }
+
+  object uart "uart.pl011" {
+    clock    = uartclk / 16
+    port     = console
+    clock-hz = 24000000
+  }
+
+  object pwr "arm.power" { signal = power }
+
+  object blk "virtio.blk" {
+    space  = mem
+    size   = storage
+    image  = "disk"
+    serial = "rsemu-virt-0"
+  }
+
+  object rng "virtio.rng" {
+    space = mem
+    seed  = 1
+  }
+
+  object boot "arm.boot" {
+    space        = mem
+    entry        = kernel-addr
+    cpus         = 2
+    mpidr        = 0x80000000
+    psci         = psci
+    secondary    = "spin-table"
+    release-addr = release-addr
+    bootargs     = cmdline
+    model        = "rsemu arm64-virt-smp"
+    apb-clock    = 24000000
+    initrd       = "initrd"
+    initrd-addr  = initrd-addr
+  }
+
+  # -- the memory map --------------------------------------------------------
+  map mem 0x00000000 size 64K   = boot
+  map mem 0x08000000 size 4K    = gic.dist
+  map mem 0x08010000 size 8K    = gic.cpu
+  map mem 0x09000000 size 4K    = uart
+  map mem 0x0a000000 size 4K    = blk
+  map mem 0x0a001000 size 4K    = rng
+  map mem ram-base   size ram   = dram
+
+  # -- interrupts ------------------------------------------------------------
+  wire uart.irq   -> gic.spi1
+  wire blk.irq    -> gic.spi2
+  wire rng.irq    -> gic.spi3
+
+  # One generic timer per core, each into its own bank of the distributor.
+  wire cpu0.cntp  -> gic.cpu0ppi14
+  wire cpu0.cntv  -> gic.cpu0ppi11
+  wire cpu1.cntp  -> gic.cpu1ppi14
+  wire cpu1.cntv  -> gic.cpu1ppi11
+
+  # And one `nIRQ` back per CPU interface.
+  wire gic.irq0   -> cpu0.irq
+  wire gic.irq1   -> cpu1.irq
+
+  # Either core can ask the machine to stop; the power controller wire-ORs
+  # them, and a reset reaches both.
+  wire cpu0.poweroff -> pwr.off
+  wire cpu1.poweroff -> pwr.off
+  wire cpu0.reboot   -> pwr.reboot
+  wire cpu1.reboot   -> pwr.reboot
+  wire pwr.reset     -> cpu0.reset
+  wire pwr.reset     -> cpu1.reset
+
+  # -- what gets loaded ------------------------------------------------------
+  object kernel "arm.loader" {
+    space  = mem
+    image  = "kernel"
+    addr   = kernel-addr
+    format = "arm64"
+  }
+
+  object initrd "arm.loader" {
+    space = mem
+    image = "initrd"
+    addr  = initrd-addr
+  }
+}

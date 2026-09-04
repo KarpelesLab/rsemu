@@ -183,7 +183,13 @@ struct Board {
 
 /// Build `arm64-virt` with `kernel` loaded.
 fn board(kernel: &[u8]) -> Board {
-    let entry = catalog::machine("arm64-virt").expect("this build ships it");
+    board_named("arm64-virt", kernel)
+}
+
+/// The same, for one of the board's variants: `arm64-virt-smp` is this file
+/// with a second core.
+fn board_named(name: &'static str, kernel: &[u8]) -> Board {
+    let entry = catalog::machine(name).expect("this build ships it");
     let options = catalog::build_options()
         .expect("the catalog agrees with itself")
         .with_media("kernel", kernel)
@@ -199,7 +205,7 @@ fn board(kernel: &[u8]) -> Board {
     let registry = catalog::registry().expect("the catalog agrees with itself");
     let machine = match crate::machine::build(entry.name, entry.source, &registry, &options) {
         Ok(m) => m,
-        Err(e) => panic!("arm64-virt does not build: {e}"),
+        Err(e) => panic!("{name} does not build: {e}"),
     };
     Board {
         console: ports::open(&options.realize.hosts, "console").expect("the PL011 opened it"),
@@ -315,6 +321,38 @@ fn the_trees_addresses_come_out_of_the_map_statements() {
     assert!(
         dtb.windows(needle.len()).any(|w| w == needle),
         "the GIC's two reg entries are not what the machine file mapped"
+    );
+}
+
+#[test]
+fn the_smp_board_describes_two_processors_and_where_the_second_one_waits() {
+    // `arm64-virt-smp` is the same file with a second core, and everything a
+    // guest has to be told about that core is in the generated tree.
+    let b = board_named("arm64-virt-smp", &spin());
+    let dtb = b.device_tree();
+    let text = super::dt::describe(&dtb).expect("the generator's own tree parses");
+    // Two processors, named by `MPIDR_EL1` affinity 0, each with a word of the
+    // release table and the boot method that says so.
+    assert!(text.contains("cpu@0 {"), "{text}");
+    assert!(text.contains("cpu@1 {"), "{text}");
+    assert!(text.contains("cpu-release-addr"), "{text}");
+    assert!(text.contains("enable-method"), "{text}");
+    // `machines/arm64-virt-smp.machine` puts the table at 0x40001000, so
+    // processor 1's word is eight bytes past it.
+    let needle = 0x4000_1008u64.to_be_bytes();
+    assert!(
+        dtb.windows(8).any(|w| w == needle),
+        "processor 1's `cpu-release-addr` is not a word past the table"
+    );
+    // And the page it lands in is reserved, or the kernel's own allocator
+    // hands out the memory a parked processor is reading.
+    let reservation: Vec<u8> = [0x4000_1000u64, 0x1000]
+        .iter()
+        .flat_map(|w| w.to_be_bytes())
+        .collect();
+    assert!(
+        dtb.windows(reservation.len()).any(|w| w == reservation),
+        "the release table's page is not in the memory reservation block"
     );
 }
 

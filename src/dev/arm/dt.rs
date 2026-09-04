@@ -227,9 +227,27 @@ pub struct CpuSpec {
     pub mpidr: Vec<u64>,
     /// The `compatible` string each `cpu@N` node carries.
     pub compatible: String,
-    /// The `enable-method`, or empty for a board that has none. `psci` is the
-    /// only one this board offers.
+    /// The `enable-method`, or empty for a board that has none: `psci` or
+    /// `spin-table`.
     pub enable_method: String,
+    /// The spin table's address, when [`enable_method`](CpuSpec::enable_method)
+    /// is `spin-table`.
+    ///
+    /// One 64-bit word per processor, starting here, and processor `i`'s
+    /// `cpu-release-addr` is `release_addr + 8i` (Devicetree Specification
+    /// v0.4 §3.8.1: "the physical address of a spin table entry that releases
+    /// a secondary CPU from its spin loop"). The generator also reserves the
+    /// page it lands in, because a table the kernel's own allocator can hand
+    /// out is a table that gets overwritten before it is read.
+    pub release_addr: Option<u64>,
+    /// Where processors other than the first are waiting, whatever the tree
+    /// says about how to start them.
+    ///
+    /// The same table as [`release_addr`](CpuSpec::release_addr) and a
+    /// different question: a `psci` board still parks its secondaries on one,
+    /// and still has to keep the kernel's allocator off it, even though the
+    /// tree does not tell the guest where it is.
+    pub parked_at: Option<u64>,
 }
 
 impl CpuSpec {
@@ -562,6 +580,14 @@ pub fn generate(dt: &Publications, space: &AddressSpace, cfg: &TreeConfig) -> Re
 
     let mut w = FdtWriter::new();
     w.set_boot_cpu(cfg.cpus.reg(0));
+    // The release table, before anything else is written: it is memory the
+    // guest must not allocate, because the processors waiting on it read it
+    // long after the kernel has taken the rest of DRAM. A whole page, since
+    // that is the granularity a guest reserves anything at.
+    if let Some(base) = cfg.cpus.parked_at {
+        let page = base & !0xfff;
+        w.reserve(page, 0x1000);
+    }
     w.begin_node("");
     w.prop_u32("#address-cells", 2);
     w.prop_u32("#size-cells", 2);
@@ -604,6 +630,13 @@ pub fn generate(dt: &Publications, space: &AddressSpace, cfg: &TreeConfig) -> Re
         w.prop_u32("reg", reg);
         if !cfg.cpus.enable_method.is_empty() {
             w.prop_str("enable-method", &cfg.cpus.enable_method);
+        }
+        // One word per processor, and the boot processor gets one too: it is
+        // not waiting on it, but a binding that is per-node reads better with
+        // no hole in it, and a kernel that looks at cpu@0's is told an address
+        // rather than nothing.
+        if let Some(base) = cfg.cpus.release_addr {
+            w.prop_u64("cpu-release-addr", base + 8 * index as u64);
         }
         w.end_node()?;
     }
@@ -817,6 +850,8 @@ mod tests {
             mpidr: alloc::vec![0x8000_0000, 0x8000_0001],
             compatible: String::from("arm,armv8"),
             enable_method: String::from("psci"),
+            release_addr: None,
+            parked_at: None,
         };
         assert_eq!(cpus.reg(0), 0);
         assert_eq!(cpus.reg(1), 1);

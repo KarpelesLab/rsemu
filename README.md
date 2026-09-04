@@ -93,11 +93,11 @@ quietly leaving the impression of a number.
 Every corpus is fetched by `scripts/fetch-testdata.sh`, never vendored, and
 gated behind an environment variable — a licensing rule as much as a size one.
 
-**Thirty machine files**, and `machines/` is where they live: a machine is
+**Thirty-one machine files**, and `machines/` is where they live: a machine is
 described rather than compiled in. Which of them exists in a given binary is a
 feature set, and `rsemu machines` lists what *your* build has.
 
-Fifteen are consoles, computers and microcontrollers; the other fifteen are
+Sixteen are consoles, computers and microcontrollers; the other fifteen are
 synthetic boards that exist so a subsystem has somewhere real to run.
 
 `nes-ntsc` and `nes-pal` pass **AccuracyCoin 141/141** — the whole-machine gate, run headlessly, with an
@@ -159,13 +159,26 @@ through an `SMC` and stops the machine, which is what the test asserts. About
 three minutes of host time for 1.12 seconds of guest time, interpreted, in a
 release build.
 
-`docs/platforms/arm64-virt.md` has the ledger, and it is long: one core only,
-because the GIC cannot yet map a requester to a CPU interface; no block device,
-because virtio-mmio in this tree is reachable only from a build with the RISC-V
-board's chips in it; no RTC, so `date` starts at the epoch; `GICC_CTLR.EOImode`
-unimplemented; the `AT S1E1R` family unimplemented; `CLIDR_EL1` zero, so the
-guest sees no caches. And one honest lie: the board asserts `psci = "smc"` on a
-core with no EL3, which is the single place it tells a guest something its own
+`arm64-virt-smp` is that board with a **second core**, and the same kernel
+reports `smp: Brought up 1 node, 2 CPUs` on it. Three different problems had to
+be solved for that: the GIC's banked registers now answer per
+`MemAttrs::requester` — the machine file names the processors and the ids are
+resolved when the machine binds, the same seam the local APIC's architectural
+page uses — each core's generic timer is wired into its own bank of the
+distributor, and the boot ROM's reset vector reads `MPIDR_EL1` and parks
+everything but the boot processor on a release table. At the shell,
+`/proc/interrupts` shows each processor's own timer count and the
+interprocessor interrupts that went between them; `/proc/stat` shows the second
+one running tasks.
+
+`docs/platforms/arm64-virt.md` has the ledger, and it is long: PSCI `CPU_ON` is
+not implemented, so the second core comes up off a spin table and cannot be
+turned off again — servicing one means reaching a *sibling* core from inside
+the one executing the `SMC`, and that page says exactly what the core would
+need; no RTC, so `date` starts at the epoch; `GICC_CTLR.EOImode` unimplemented;
+the `AT S1E1R` family unimplemented; `CLIDR_EL1` zero, so the guest sees no
+caches. And one honest lie: the board asserts `psci = "smc"` on a core with no
+EL3, which is the single place it tells a guest something its own
 identification registers deny.
 
 The x86 boards are five, and they divide by what starts first. `pc-at` is a

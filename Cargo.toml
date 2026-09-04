@@ -850,6 +850,12 @@ dev-arm = ["dev-fdt"]
 # The kernel goes into DRAM, the boot ROM hands it a generated device tree in
 # `x0`, and the console is a PL011. `docs/platforms/arm64-virt.md` has the
 # transcript and the ledger of what is still in the way.
+#
+# Two boards, not one: `arm64-virt-smp` is the same file with a second core,
+# and the same kernel reports `smp: Brought up 1 node, 2 CPUs` on it. One
+# feature, because the second board adds no class -- what it adds is a
+# requester-to-CPU-interface map in the GIC and a reset vector that parks
+# everything but the boot processor.
 machine-arm64-virt = ["cpu-arm-a64", "dev-arm", "dev-virtio"]
 
 # The `arm926` board (machines/arm926.machine plus the classes it names): a bare
