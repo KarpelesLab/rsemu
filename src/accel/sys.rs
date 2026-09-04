@@ -22,11 +22,22 @@
 //!   ABI.
 //! * `openat(2)`, `ioctl(2)`, `mmap(2)`, `munmap(2)`, `close(2)` man pages for
 //!   the argument order and the error set.
+//! * For the interval timer that bounds a guest entry ([`IntervalTimer`], and
+//!   [`preempt`](super::preempt) for why it exists): `timer_create(2)`,
+//!   `timer_settime(2)`, `timer_delete(2)` and `gettid(2)`. The kernel's
+//!   `struct sigevent` is **not** glibc's — the raw one is an eight-byte
+//!   `sigval_t`, then `sigev_signo` and `sigev_notify` as `int`s, then a union
+//!   whose first member is the thread id, padded to `SIGEV_MAX_SIZE` of 64
+//!   bytes (`include/uapi/asm-generic/siginfo.h`, where the preamble size is
+//!   `sizeof(int) * 2 + sizeof(sigval_t)`). `SIGEV_THREAD_ID` is 4 and
+//!   `CLOCK_MONOTONIC` is 1 (`include/uapi/linux/time.h`). The kernel's
+//!   `timer_t` is a plain `int` in the raw ABI, which is why nothing here is
+//!   pointer-sized.
 //!
 //! # `unsafe`
 //!
 //! This file is one of the two sanctioned sites this subsystem uses — *"the
-//! raw-syscall accel backends"* (`ROADMAP.md` §0's list of six). Every block
+//! raw-syscall accel backends"* (`ROADMAP.md` §0's list of seven). Every block
 //! carries its invariant. The shape was chosen to keep the count low: **one**
 //! `asm!` block, wrapped by small functions that each establish what one
 //! kernel entry point needs, so callers elsewhere in `accel/` write no
@@ -122,6 +133,10 @@ const SYS_CLOSE: u64 = 3;
 const SYS_MMAP: u64 = 9;
 const SYS_MUNMAP: u64 = 11;
 const SYS_IOCTL: u64 = 16;
+const SYS_GETTID: u64 = 186;
+const SYS_TIMER_CREATE: u64 = 222;
+const SYS_TIMER_SETTIME: u64 = 223;
+const SYS_TIMER_DELETE: u64 = 226;
 const SYS_OPENAT: u64 = 257;
 
 /// `AT_FDCWD`, the "relative to the working directory" pseudo-descriptor.
@@ -458,6 +473,188 @@ fn map(len: u64, flags: u64, fd: Option<&Fd>, offset: u64) -> SysResult<Mapping>
     })
 }
 
+// ---------------------------------------------------------------------------
+// per-thread interval timers
+// ---------------------------------------------------------------------------
+
+/// `CLOCK_MONOTONIC`. Not `CLOCK_REALTIME`: a preemption interval must not
+/// change length because somebody stepped the wall clock.
+const CLOCK_MONOTONIC: u64 = 1;
+
+/// `SIGEV_THREAD_ID`: deliver to the thread named in `sigev_notify_thread_id`
+/// rather than to the process, so a two-processor board's vCPUs get their own
+/// kicks instead of racing for one.
+const SIGEV_THREAD_ID: i32 = 4;
+
+/// A POSIX interval timer that signals **one thread**.
+///
+/// The kernel's `timer_t` is an `int` in the raw ABI (`__kernel_timer_t`);
+/// glibc's opaque pointer is its own wrapper and does not apply here.
+///
+/// Dropping it deletes the timer, so a thread that armed one and then went
+/// away leaves nothing behind to fire at a tid the kernel has reused.
+#[derive(Debug)]
+pub struct IntervalTimer(i32);
+
+/// The kernel's `struct sigevent`, x86-64.
+///
+/// `SIGEV_MAX_SIZE` is 64 bytes: an eight-byte `sigval_t`, two `int`s, and a
+/// twelve-`int` union whose first member is the thread id
+/// (`include/uapi/asm-generic/siginfo.h`). Written out as an array of bytes
+/// rather than as a struct with a padding array because only three fields
+/// carry anything and the rest must read as zero.
+#[repr(C, align(8))]
+struct Sigevent {
+    value: u64,
+    signo: i32,
+    notify: i32,
+    tid: i32,
+    pad: [i32; 11],
+}
+
+/// The kernel's `struct __kernel_itimerspec`: interval, then initial
+/// expiration, each a `timespec` of two 64-bit words.
+#[repr(C)]
+struct Itimerspec {
+    interval_sec: i64,
+    interval_nsec: i64,
+    value_sec: i64,
+    value_nsec: i64,
+}
+
+/// This thread's kernel thread id, which is what [`IntervalTimer::for_this_thread`]
+/// aims a timer at.
+#[must_use]
+#[allow(unsafe_code)]
+#[allow(clippy::cast_possible_truncation)]
+pub fn thread_id() -> i32 {
+    // SAFETY: `gettid` takes no arguments, dereferences nothing and cannot
+    // fail. There is nothing for a caller to establish.
+    let ret = unsafe { syscall6(SYS_GETTID, 0, 0, 0, 0, 0, 0) };
+    ret as i32
+}
+
+impl IntervalTimer {
+    /// Create a timer that delivers `signal` to **the calling thread**.
+    ///
+    /// Must be called on the thread that is to be interrupted: the target is
+    /// fixed at creation and there is no way to re-aim one afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `timer_create(2)` returns — `EAGAIN` if the process is at its
+    /// timer limit, `EINVAL` for a signal number the kernel will not take.
+    #[allow(unsafe_code)]
+    pub fn for_this_thread(signal: i32) -> SysResult<IntervalTimer> {
+        let event = Sigevent {
+            value: 0,
+            signo: signal,
+            notify: SIGEV_THREAD_ID,
+            tid: thread_id(),
+            pad: [0; 11],
+        };
+        let mut id: i32 = -1;
+        // SAFETY: `timer_create`'s second argument is a `struct sigevent` the
+        // kernel reads and its third an `int` the kernel writes; both locals
+        // are live, correctly typed and correctly aligned for the length of
+        // the call, and the kernel keeps no pointer into either. The first
+        // argument is a clock id the kernel validates itself.
+        let ret = unsafe {
+            syscall6(
+                SYS_TIMER_CREATE,
+                CLOCK_MONOTONIC,
+                (&raw const event) as u64,
+                (&raw mut id) as u64,
+                0,
+                0,
+                0,
+            )
+        };
+        decode(ret)?;
+        Ok(IntervalTimer(id))
+    }
+
+    /// Fire every `nanos` from now until [`IntervalTimer::disarm`].
+    ///
+    /// **Periodic rather than one-shot, deliberately.** A signal delivered in
+    /// the window between a userspace check and the entry it was meant to
+    /// prevent is consumed and lost; with an interval the next expiry recovers
+    /// it, so the bound holds without any of the signal-mask machinery a
+    /// one-shot design would need to close that race.
+    ///
+    /// A zero or sub-nanosecond interval is refused rather than silently
+    /// turned into "never", which is what the kernel would make of it.
+    ///
+    /// # Errors
+    ///
+    /// `EINVAL` for a zero interval; otherwise whatever `timer_settime(2)`
+    /// returns.
+    #[allow(unsafe_code)]
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn arm(&self, nanos: u64) -> SysResult<()> {
+        if nanos == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let sec = (nanos / 1_000_000_000) as i64;
+        let nsec = (nanos % 1_000_000_000) as i64;
+        let spec = Itimerspec {
+            interval_sec: sec,
+            interval_nsec: nsec,
+            value_sec: sec,
+            value_nsec: nsec,
+        };
+        self.settime(&spec)
+    }
+
+    /// Stop it firing. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `timer_settime(2)` returns.
+    pub fn disarm(&self) -> SysResult<()> {
+        self.settime(&Itimerspec {
+            interval_sec: 0,
+            interval_nsec: 0,
+            value_sec: 0,
+            value_nsec: 0,
+        })
+    }
+
+    #[allow(unsafe_code)]
+    fn settime(&self, spec: &Itimerspec) -> SysResult<()> {
+        // SAFETY: `timer_settime`'s third argument is a `struct itimerspec`
+        // the kernel reads; `spec` is a live, correctly typed and aligned
+        // borrow for the length of the call. The fourth is a null `old_value`,
+        // which the manual page documents as "do not report the previous
+        // setting" rather than as a pointer the kernel writes. `self.0` is a
+        // timer this process created and has not deleted, because deletion
+        // consumes the `IntervalTimer`.
+        let ret = unsafe {
+            syscall6(
+                SYS_TIMER_SETTIME,
+                u64::from(self.0 as u32),
+                0,
+                (spec as *const Itimerspec) as u64,
+                0,
+                0,
+                0,
+            )
+        };
+        decode(ret).map(|_| ())
+    }
+}
+
+impl Drop for IntervalTimer {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        // SAFETY: `timer_delete` takes one integer and dereferences nothing.
+        // `self.0` is this process's own timer id, obtained from a checked
+        // `timer_create` and deleted exactly once, since `IntervalTimer` is
+        // neither `Copy` nor `Clone`.
+        let _ = unsafe { syscall6(SYS_TIMER_DELETE, u64::from(self.0 as u32), 0, 0, 0, 0, 0) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,5 +711,45 @@ mod tests {
     fn a_descriptor_round_trips_through_a_real_open() {
         let fd = open(b"/dev/null\0", O_RDWR | O_CLOEXEC).expect("/dev/null opens");
         assert!(fd.raw() >= 0);
+    }
+
+    /// The transcription is right if the kernel accepts it, and the only way
+    /// to find out is to ask. `SIGEV_THREAD_ID` with a bad `_tid` is refused
+    /// with `EINVAL`, so a timer that is created at all is one whose structure
+    /// the kernel read the way this file laid it out.
+    #[test]
+    fn a_per_thread_timer_is_created_armed_and_deleted() {
+        assert!(thread_id() > 0, "gettid never fails");
+        // 36 is `Signal::PREEMPT`; this test does not install a disposition
+        // for it and does not arm long enough to be delivered before the
+        // disarm below, so nothing reaches the default action.
+        let timer = IntervalTimer::for_this_thread(36).expect("timer_create");
+        // An hour, so it cannot fire inside this test whatever the host is
+        // doing, and then off again.
+        assert_eq!(timer.arm(3_600_000_000_000), Ok(()));
+        assert_eq!(timer.disarm(), Ok(()));
+        // Idempotent, which is what the `Hold` guard relies on.
+        assert_eq!(timer.disarm(), Ok(()));
+        // And the drop deletes it; a second delete of the same id would be
+        // `EINVAL`, which is why `IntervalTimer` is neither `Copy` nor `Clone`.
+    }
+
+    /// A zero interval means *never* to the kernel and *no bound* to a caller,
+    /// which are opposite things. Refused before the syscall rather than
+    /// turned into a timer that silently does nothing.
+    #[test]
+    fn a_zero_interval_is_refused_before_the_syscall() {
+        let timer = IntervalTimer::for_this_thread(36).expect("timer_create");
+        assert_eq!(timer.arm(0), Err(Errno::EINVAL));
+    }
+
+    /// A signal number the kernel will not take is an error rather than a
+    /// timer that never fires.
+    #[test]
+    fn an_impossible_signal_is_refused_by_the_kernel() {
+        assert_eq!(
+            IntervalTimer::for_this_thread(1234).map(|_| ()),
+            Err(Errno::EINVAL)
+        );
     }
 }

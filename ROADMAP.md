@@ -887,8 +887,22 @@ snapshot header, since queued deadlines are meaningless without it.
     quantum. Required for record/replay and the regression suite.
   - `parallel` — thread per CPU with a rendezvous barrier per quantum. Fast,
     non-deterministic, the default for interactive use.
-  - `accel` — CPUs run in hardware (§10); virtual time is slaved to the host
-    clock and the scheduler becomes a deadline service.
+  - `accel` — **implemented.** CPUs run in hardware (§10); virtual time is
+    slaved to the host clock and the scheduler becomes a deadline service. It
+    is the `parallel` round with its *clock* replaced: a round's elapsed
+    virtual time is read off the injected `HostClock` rather than derived from
+    what the runnables reported, because an accelerated core has no guest tick
+    count to report. Two things follow and both are stated where they are done.
+    A caller's deadline no longer declines a round (§11.6's additivity is not
+    available once rounds are cut by the wall, and declining would mean never
+    entering the guest); and a guest that takes no exits is pulled out by a
+    host preemption timer in `accel/preempt.rs`, which is a *different*
+    mechanism from the safe-point protocol §4.7 forbids a signal in — a
+    preemption says "come back, time has moved" and the guest resumes, where a
+    safe point says "stay out until told". `machines/q35-linux.machine` boots a
+    stock Linux kernel on its own command line under this mode, and the guest's
+    own TSC calibration comes out at the host's real frequency instead of the
+    176,273 MHz it reported before.
 - **Rate control.** `realtime` (throttle to wall clock, with catch-up limits and
   frame pacing), `unbounded` (as fast as possible), `fixed-ratio` (2× slow for
   debugging).
@@ -1923,6 +1937,16 @@ caller's deadline inside a round does not shorten it — the round does not star
 virtual time moves to the deadline, and the round runs whole when the caller
 asks for more. The set of executed rounds is then the same however the run is
 sliced, which is the property, not a coincidence of these four workloads.
+
+**The one mode this does not apply to is `accel`**, and it is worth saying why
+rather than leaving the exception to be discovered. There a round's end comes
+from the host clock rather than from the machine, so the set of executed rounds
+depends on how fast the host was and additivity is not on offer at all. Given
+that, declining a round would buy nothing and cost everything: virtual time
+would move to the caller's deadline with the guest never entered, and a guest
+that is not entered is a machine that has stopped. So under `accel` the
+deadline bounds the *budgets* and the run loop's own `now < deadline` test —
+against a `now` that is the wall — is what honours it.
 
 **What it costs, stated plainly.** A run can return with up to one round of
 virtual time elapsed and not yet executed. Nothing is lost — budgets come from

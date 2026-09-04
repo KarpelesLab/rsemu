@@ -74,16 +74,25 @@
 //!    snapshot or a reset waits on [`SafePoint`](crate::core::sched::SafePoint),
 //!    and this backend reaches that state by returning from `run_to_exit`.
 //!
-//! What is genuinely given up, said plainly: **a guest that takes no exits is
-//! not preemptible by this mechanism.** A vCPU spinning in a register-only
-//! loop with interrupts masked will run until something else makes it exit,
-//! and there is nothing portable left to force one. The honest answers are the
-//! ones the guest already provides — a periodic timer interrupt, which every
-//! machine phase 6 boots has — and they bound the stop latency in practice
-//! without bounding it in theory. A backend that wanted a hard bound would
-//! need the host signal this project has ruled out, and the cost of ruling it
-//! out is exactly this paragraph. It is written down instead of being
-//! discovered.
+//! What this mechanism genuinely does not do, said plainly: **it cannot end a
+//! guest entry that is already under way.** A vCPU spinning in a
+//! register-only loop touches no device, so it reaches none of the three
+//! points above and the flag it would honour is never looked at. The stop
+//! therefore arrives at the next exit, which on any machine with a running
+//! timer is microseconds away — bounded in practice, unbounded in theory.
+//!
+//! That is a statement about *stopping the world*, and it is still true.
+//! What used to follow it — that a guest taking no exits is not preemptible
+//! at all, because forcing one would need the signal this project has ruled
+//! out — is no longer true, and [`preempt`](super::preempt) is why:
+//! [`Vcpu::set_preempt_nanos`] arms a per-thread interval timer for the length
+//! of a run loop, so an entry ends within a bounded span whether or not the
+//! guest cooperates. Its module documentation works through why every
+//! signal-free alternative fails and why the rule that forbids a signal here
+//! does not reach it. The two mechanisms are separate on purpose: a
+//! preemption is *"come back, time has moved"* and resumes immediately, while
+//! a safe point is *"stay out until told"*, and the exit flag remains the only
+//! thing that says the second.
 //!
 //! # Determinism
 //!
@@ -105,6 +114,7 @@ use crate::core::sched::{Budget, Consumed, ExitFlag, ThreadingMode};
 use crate::core::space::{AddressSpace, HOST_PAGE, MemAttrs, RamStore, RequesterId, RomStore};
 use crate::core::sync::{LockRank, Mutex};
 
+use super::preempt::Kicker;
 use super::sys::{self, Errno, Fd, PAGE_SIZE, SysResult};
 use super::{AccelError, AccelResult};
 
@@ -1312,6 +1322,10 @@ impl Vm {
             exit_flag: ExitFlag::default(),
             mask: Mutex::with_rank(LockRank::LEAF, ExitMask::NONE),
             stats: Mutex::with_rank(LockRank::LEAF, VcpuStats::default()),
+            // Off unless a caller asks. `ThreadingMode::Parallel` behaves
+            // exactly as it did; only `Accel` turns it on, because only `Accel`
+            // has anywhere to put the time a preemption hands back.
+            preempt: Kicker::new(0),
         })
     }
 }
@@ -1362,6 +1376,7 @@ pub struct Vcpu {
     exit_flag: ExitFlag,
     mask: Mutex<ExitMask>,
     stats: Mutex<VcpuStats>,
+    preempt: Kicker,
 }
 
 impl Vcpu {
@@ -1397,6 +1412,31 @@ impl Vcpu {
     #[must_use]
     pub fn exit_flag(&self) -> ExitFlag {
         self.exit_flag.clone()
+    }
+
+    /// Bound how long this vCPU may stay inside `KVM_RUN`, in nanoseconds.
+    ///
+    /// Zero — the default — is *no bound*, which is the behaviour every
+    /// earlier round had and what the module documentation's "a guest that
+    /// takes no exits is not preemptible" describes. A non-zero value arms a
+    /// per-thread interval timer for the length of each run loop; see
+    /// [`preempt`](super::preempt) for what forces the exit and why nothing
+    /// cheaper does.
+    ///
+    /// Only worth setting under
+    /// [`ThreadingMode::Accel`],
+    /// where the scheduler has somewhere to put the virtual time the guest
+    /// consumed. Under
+    /// [`Parallel`](crate::core::sched::ThreadingMode::Parallel) an early
+    /// return costs an entry and buys nothing.
+    pub fn set_preempt_nanos(&mut self, nanos: u64) {
+        self.preempt = Kicker::new(nanos);
+    }
+
+    /// The bound in force, in nanoseconds. Zero if there is none.
+    #[must_use]
+    pub const fn preempt_nanos(&self) -> u64 {
+        self.preempt.nanos()
     }
 
     /// The general-purpose registers.
@@ -1832,6 +1872,12 @@ impl Vcpu {
         max_entries: u64,
         intr: Option<&dyn IntrSource>,
     ) -> AccelResult<Run> {
+        // Armed for the length of the loop and disarmed by the guard, however
+        // this returns. A kick arrives as `RawExit::Interrupted` below, which
+        // is already the "nothing happened, resume unconditionally" path — so
+        // the only thing this changes is that a guest which takes no exits of
+        // its own now has one taken for it.
+        let _bound = self.preempt.hold();
         let mut entries = 0u64;
         loop {
             if entries >= max_entries {

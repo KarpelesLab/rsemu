@@ -53,8 +53,12 @@
 //!   `core::sync` task pool and joins them at the round's boundary — that join
 //!   is §4.2's rendezvous barrier — and gives up reproducibility for it,
 //!   which is why [`Machine::state_hash`](crate::machine::Machine::state_hash)
-//!   refuses in it. `accel` is named, has its extension point marked, and
-//!   returns an error rather than pretending.
+//!   refuses in it. [`ThreadingMode::Accel`] is that same round with its
+//!   *clock* replaced: virtual time is read off the injected [`HostClock`]
+//!   rather than derived from what the runnables reported, because an engine
+//!   whose guest runs on host silicon has no tick count to report. That is
+//!   §4.2's "the scheduler becomes a deadline service", and it is what lets a
+//!   stock kernel's delay loops mean something under acceleration.
 //! * **Safe points.** [`SafePoint`] is §4.7's stop-the-world protocol: a
 //!   generation counter and a per-runnable [`ExitFlag`], checked at block
 //!   boundaries, never a host signal. [`Scheduler::stop_the_world`] raises it
@@ -93,6 +97,10 @@
 //! it takes a [`HostClock`] **injected** at construction and implemented above
 //! the `std` line. That keeps the `no_std` and wasm builds compiling and keeps
 //! the clock mockable, which is what makes deterministic replay testable at all.
+//! [`ThreadingMode::Accel`] uses the same injected clock for a second purpose
+//! — as the *source* of elapsed time rather than as a throttle on it — and
+//! that is the whole of its access to the host: one trait, one method, one
+//! implementation, in `host/`.
 //!
 //! There is also no floating point, here or anywhere it reaches. Pacing
 //! arithmetic is integer nanoseconds and fixed-point [`GlobalTime`].
@@ -180,9 +188,13 @@ pub enum SchedError {
     /// than a bug — so there it waits out a bounded spin first and this is what
     /// is left when the wait expires.
     LazyDeviceBusy(LazyId),
-    /// The threading mode is recognised but not implemented in this build.
-    ModeUnimplemented(ThreadingMode),
-    /// Rate control needs a host clock and none was injected.
+    /// Rate control, or [`ThreadingMode::Accel`], needs a host clock and none
+    /// was injected.
+    ///
+    /// A policy failure for the first and a fatal one for the second:
+    /// `Accel` has no other source of elapsed time, and the alternative to
+    /// saying so would be a machine whose clocks run at a rate set by the
+    /// quantum.
     NoHostClock,
     /// A snapshot could not be restored into this scheduler.
     InvalidSnapshot(&'static str),
@@ -213,10 +225,9 @@ impl fmt::Display for SchedError {
                 "lazy device #{} is already being advanced further up the stack",
                 id.0
             ),
-            SchedError::ModeUnimplemented(m) => {
-                write!(f, "threading mode `{m}` is not implemented in this build")
-            }
-            SchedError::NoHostClock => f.write_str("rate control needs an injected host clock"),
+            SchedError::NoHostClock => f.write_str(
+                "no host clock was injected: rate control and `accel` threading both need one",
+            ),
             SchedError::InvalidSnapshot(why) => write!(f, "invalid scheduler snapshot: {why}"),
         }
     }
@@ -1322,10 +1333,56 @@ pub enum ThreadingMode {
     /// allows: the 6502 is about a tenth of the round's work, so Amdahl caps
     /// the board at roughly 1.1× and the implementation reaches it.
     Parallel,
-    /// CPUs run in hardware and virtual time is slaved to the host clock.
+    /// CPUs run in hardware and virtual time is slaved to the host clock
+    /// (§4.2).
     ///
-    /// The scheduler becomes a deadline service. Not implemented: it needs the
-    /// acceleration backends (`ROADMAP.md` §10).
+    /// Structurally [`ThreadingMode::Parallel`] — one job per runnable, the
+    /// same rendezvous at the round's end, the same non-reproducibility — with
+    /// **one** difference, which is the whole mode: a round's elapsed virtual
+    /// time is read off the injected [`HostClock`] instead of being computed
+    /// from what the runnables reported.
+    ///
+    /// # Why an accelerated board needs it and a parallel one does not
+    ///
+    /// A runnable's [`Consumed`] is a count of guest ticks, and an accelerated
+    /// core has none to give: a vCPU inside `KVM_RUN` executes an unknown
+    /// number of instructions in a knowable amount of *host* time. So it
+    /// returns its whole budget, which makes the board's clocks advance by one
+    /// quantum per round no matter how long the round took. Under `Parallel`
+    /// that is not a rounding error, it is a wall:
+    ///
+    /// * a guest that spins without exiting holds the round, and every clock
+    ///   on the board stops for as long as it spins — Linux's `hpet_counting()`
+    ///   reads the HPET counter twice inside one round and finds it unmoved,
+    ///   and `timer_irq_works()` waits out an `mdelay()` that no tick can
+    ///   interrupt, which panics `check_timer()`;
+    /// * a guest that calibrates the host's time-stamp counter against a board
+    ///   timer is measuring a real clock against a fictional one, and concludes
+    ///   it is on a 176 THz processor.
+    ///
+    /// Here the wall measures the round, so both come out right, and
+    /// `machines/q35-linux.machine` boots on its own command line.
+    ///
+    /// # What it requires, and what it gives up on top of `Parallel`
+    ///
+    /// * **A host clock must be injected** —
+    ///   [`Machine::set_host_clock`](crate::machine::Machine::set_host_clock),
+    ///   [`MonotonicClock`](crate::host::clock::MonotonicClock) — or every
+    ///   round fails with [`SchedError::NoHostClock`]. There is no fallback,
+    ///   because the fallback would be a guess.
+    /// * **A caller's deadline no longer declines a round.** Under `Parallel`
+    ///   a deadline falling inside a round defers the whole round, which is
+    ///   what makes [`Machine::run_for`](crate::machine::Machine::run_for)
+    ///   additive (§11.6). That property is not available once rounds are cut
+    ///   by the host clock, and declining would mean not entering the guest at
+    ///   all, so the deadline bounds the budgets instead.
+    /// * **Reported tick counts stop moving the clock.** An interpreted
+    ///   runnable sharing an accelerated board still gets a budget from its
+    ///   own tree's absolute position, but its tree is then dragged to the
+    ///   wall like everyone else's — so it executes at whatever rate the host
+    ///   can manage rather than at its declared frequency. A board with an
+    ///   interpreted core whose timing matters is a board to run in one of the
+    ///   other two modes.
     Accel,
 }
 
@@ -1964,6 +2021,29 @@ enum Cut {
     Yes,
 }
 
+/// Where a round's elapsed virtual time comes from.
+///
+/// The single difference between [`ThreadingMode::Parallel`] and
+/// [`ThreadingMode::Accel`], and the whole of §4.2's *"virtual time is slaved
+/// to the host clock and the scheduler becomes a deadline service"*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// The machine's own grid: a round ends at its natural target and every
+    /// tree advances by the ticks its runnable reported. What every mode but
+    /// one does, and the only thing a deterministic run can do.
+    Emulated,
+    /// The host clock: a round ends wherever the wall says it ended, and every
+    /// tree is dragged to that instant regardless of what anybody reported.
+    ///
+    /// For an engine whose progress is **not measurable in guest ticks**. A
+    /// vCPU inside `KVM_RUN` executes an unknown number of instructions in a
+    /// known amount of host time, so the host time is the only honest input —
+    /// and a report of "the whole budget", which is what an accelerated core
+    /// has to return, is fiction that would make the board's clocks run at a
+    /// rate set by the quantum rather than by anything real.
+    Host,
+}
+
 /// One runnable's job in flight: which slot it came out of, and the handle that
 /// gives the box back with what it consumed.
 ///
@@ -2026,6 +2106,18 @@ pub struct Scheduler {
     safe: SafePoint,
     rate: RateController,
     host_clock: Option<Box<dyn HostClock>>,
+    /// Where virtual time was last pinned to the host clock, for
+    /// [`ThreadingMode::Accel`]: the host reading and the virtual instant that
+    /// were level at that moment.
+    ///
+    /// Every later instant is computed from this pair rather than accumulated
+    /// round by round, so the two clocks cannot drift apart by more than one
+    /// rounding of [`GlobalTime::from_nanos`] however long the machine runs.
+    /// `None` until the first accelerated round, and cleared by
+    /// [`Scheduler::restore`] — a restored machine is at whatever instant its
+    /// snapshot says, and pinning it to a host reading taken before the load
+    /// would make the first round jump.
+    accel_anchor: Option<(u64, GlobalTime)>,
 }
 
 impl fmt::Debug for Scheduler {
@@ -2047,10 +2139,10 @@ impl Scheduler {
         let queue = EventQueue::new(config.granule_shift);
         let rate = RateController::new(config.rate);
         let quantum_nanos = whole_nanos(config.quantum);
-        // Only the parallel mode has anything to submit, and a pool of workers
-        // nobody uses is a pool of threads nobody uses.
-        let pool =
-            (config.mode == ThreadingMode::Parallel).then(|| Arc::new(Pool::new(config.workers)));
+        // Only the modes that dispatch have anything to submit, and a pool of
+        // workers nobody uses is a pool of threads nobody uses.
+        let pool = matches!(config.mode, ThreadingMode::Parallel | ThreadingMode::Accel)
+            .then(|| Arc::new(Pool::new(config.workers)));
         Scheduler {
             forest,
             queue,
@@ -2066,6 +2158,7 @@ impl Scheduler {
             safe: SafePoint::new(),
             rate,
             host_clock: None,
+            accel_anchor: None,
         }
     }
 
@@ -2089,8 +2182,10 @@ impl Scheduler {
 
     /// Whether an empty lazy slot can mean *another thread has it*.
     fn contended(&self) -> bool {
-        self.config.mode == ThreadingMode::Parallel
-            && self.pool.as_ref().is_some_and(|p| p.workers() > 0)
+        matches!(
+            self.config.mode,
+            ThreadingMode::Parallel | ThreadingMode::Accel
+        ) && self.pool.as_ref().is_some_and(|p| p.workers() > 0)
     }
 
     /// Re-derive [`LazySlot::contended`] after anything that can change the
@@ -2484,9 +2579,9 @@ impl Scheduler {
     ///
     /// # Errors
     ///
-    /// [`SchedError::ModeUnimplemented`] for a mode this build does not
-    /// implement, [`SchedError::BudgetExceeded`] if a runnable overran, or
-    /// [`SchedError::Clock`].
+    /// [`SchedError::BudgetExceeded`] if a runnable overran,
+    /// [`SchedError::NoHostClock`] under [`ThreadingMode::Accel`] with no
+    /// clock injected, or [`SchedError::Clock`].
     pub fn run_quantum(&mut self) -> SchedResult<QuantumReport> {
         self.run_quantum_until(GlobalTime::MAX)
     }
@@ -2544,12 +2639,8 @@ impl Scheduler {
     fn run_quantum_bounded(&mut self, limit: GlobalTime, cut: Cut) -> SchedResult<QuantumReport> {
         match self.config.mode {
             ThreadingMode::Deterministic => self.run_quantum_deterministic(limit, cut),
-            ThreadingMode::Parallel => self.run_quantum_parallel(limit, cut),
-            // Extension point: `accel` replaces the target computation below
-            // with a host-clock deadline and lets the hardware run. It needs
-            // seams that do not exist yet, and guessing at them here would be
-            // worse than saying so.
-            mode => Err(SchedError::ModeUnimplemented(mode)),
+            ThreadingMode::Parallel => self.run_quantum_dispatched(limit, cut, Source::Emulated),
+            ThreadingMode::Accel => self.run_quantum_dispatched(limit, cut, Source::Host),
         }
     }
 
@@ -2775,7 +2866,15 @@ impl Scheduler {
     }
 
     /// One round with a thread per runnable and a rendezvous barrier at the end
-    /// (`ROADMAP.md` §4.2's `parallel`).
+    /// (`ROADMAP.md` §4.2's `parallel`) — **and, with `source` set to
+    /// [`Source::Host`], §4.2's `accel`.**
+    ///
+    /// The two modes are one function because they differ in exactly one
+    /// thing: where the round's elapsed virtual time comes from. Everything
+    /// else — the reservation of a shared tree's units, the submission, the
+    /// barrier, the overrun check, the cursor arming — is the same code, and
+    /// writing it twice is how the two would drift apart. [`Source`] is the
+    /// difference, stated once.
     ///
     /// # What is the same as the deterministic round, and why
     ///
@@ -2825,14 +2924,54 @@ impl Scheduler {
     /// still carried through a snapshot, so a machine saved in parallel mode
     /// and restored in deterministic mode resumes its round-robin where the
     /// last deterministic round left it rather than at zero.
-    fn run_quantum_parallel(&mut self, limit: GlobalTime, cut: Cut) -> SchedResult<QuantumReport> {
+    fn run_quantum_dispatched(
+        &mut self,
+        limit: GlobalTime,
+        cut: Cut,
+        source: Source,
+    ) -> SchedResult<QuantumReport> {
         let from = self.now;
-        let natural = self.natural_target();
-        let target = match cut {
-            Cut::Yes => natural.min(limit),
-            Cut::No => natural,
+        // Not computed under `Source::Host`: it is unused there, and it walks
+        // every lazy slot on a path that now runs once per guest exit.
+        let natural = match source {
+            Source::Emulated => self.natural_target(),
+            Source::Host => from,
         };
-        if target > limit {
+        let target = match (source, cut) {
+            // Under acceleration the target is **only** an allowance: it sizes
+            // the budgets and nothing else, because where the round ends is
+            // read off the host clock afterwards. So it is a whole quantum
+            // ahead of `now`, and neither the natural target nor the caller's
+            // deadline may pull it in.
+            //
+            // Both would pull it all the way to `now`, and that is fatal
+            // rather than conservative. An event already due clamps
+            // [`Scheduler::natural_target`] to the present; a budget of zero
+            // ticks takes the runnable out of the round entirely; and a round
+            // that runs nothing still advances virtual time to the wall, so
+            // the device whose event was late reschedules into the past again
+            // and the machine never enters the guest a second time. The same
+            // goes for a deadline falling inside a round: declining it is what
+            // makes [`Machine::run_for`](crate::machine::Machine::run_for)
+            // additive (§11.6), and additivity is not on offer once rounds are
+            // cut by the wall — while *not entering the guest* is a machine
+            // that has stopped. The caller's deadline is honoured by the run
+            // loop above, which compares it against a `now` that is the wall.
+            // A zero quantum leaves this round with nothing to hand out. The
+            // other modes report that through their caller — a round that
+            // moves no virtual time is what
+            // [`Machine::run_until`](crate::machine::Machine::run_until) turns
+            // into "the scheduler quantum is zero" — and this one must reach
+            // the same place rather than spin the guest on an empty budget for
+            // ever, so it declines to move the clock too.
+            (Source::Host, _) if self.config.quantum.raw() == 0 => {
+                return self.close_round(from, from, Vec::new());
+            }
+            (Source::Host, _) => from.saturating_add(self.config.quantum),
+            (Source::Emulated, Cut::Yes) => natural.min(limit),
+            (Source::Emulated, Cut::No) => natural,
+        };
+        if source == Source::Emulated && target > limit {
             return self.decline_round(from, limit);
         }
 
@@ -2862,6 +3001,22 @@ impl Scheduler {
                 }
             }
         }
+
+        // The host reading that opens the round. Taken before anything runs so
+        // that the span it measures is exactly the span the guests were given.
+        let opened = match source {
+            Source::Host => {
+                let at = self.host_nanos()?;
+                // Anchored *here* rather than at the close, or the very first
+                // round would measure its own length as zero and virtual time
+                // would start one round behind the wall for ever.
+                if self.accel_anchor.is_none() {
+                    self.accel_anchor = Some((at, self.now));
+                }
+                Some(at)
+            }
+            Source::Emulated => None,
+        };
 
         self.arm_parallel_cursors();
 
@@ -2943,11 +3098,20 @@ impl Scheduler {
         let mut consumed = Vec::with_capacity(count);
         for index in 0..count {
             let used = used_by[index].unwrap_or_default();
-            self.record_consumption(index, allowed[index], used)?;
+            match source {
+                Source::Emulated => self.record_consumption(index, allowed[index], used)?,
+                // The overrun check still applies — a runnable that claims more
+                // than it was given is a bug in either mode — but the count is
+                // not what moves the clock here. See [`Source::Host`].
+                Source::Host => self.check_consumption(index, allowed[index], used)?,
+            }
             consumed.push((RunnableId(index as u32), used.ticks));
         }
 
-        self.close_round(from, target, consumed)
+        match opened {
+            Some(opened) => self.close_round_slaved(from, opened, consumed),
+            None => self.close_round(from, target, consumed),
+        }
     }
 
     /// Check a runnable's report and advance its domain by what it consumed.
@@ -2961,6 +3125,22 @@ impl Scheduler {
         allowed: u64,
         used: Consumed,
     ) -> SchedResult<()> {
+        self.check_consumption(index, allowed, used)?;
+        if used.ticks > 0 {
+            self.forest
+                .advance_domain(self.runnables[index].domain, used.ticks)?;
+        }
+        Ok(())
+    }
+
+    /// The half of [`Scheduler::record_consumption`] that is a *check* rather
+    /// than a clock advance.
+    ///
+    /// [`Source::Host`] keeps this and drops the other half: a runnable that
+    /// claims more than it was given is a bug whichever clock is in charge,
+    /// but under acceleration the count it returns is not the thing that moves
+    /// time.
+    fn check_consumption(&self, index: usize, allowed: u64, used: Consumed) -> SchedResult<()> {
         if used.ticks > allowed {
             return Err(SchedError::BudgetExceeded {
                 runnable: RunnableId(index as u32),
@@ -2968,11 +3148,104 @@ impl Scheduler {
                 consumed: used.ticks,
             });
         }
-        if used.ticks > 0 {
-            self.forest
-                .advance_domain(self.runnables[index].domain, used.ticks)?;
-        }
         Ok(())
+    }
+
+    /// The injected host clock's reading.
+    ///
+    /// # Errors
+    ///
+    /// [`SchedError::NoHostClock`] if none was injected. Under
+    /// [`ThreadingMode::Accel`] that is fatal rather than a degraded mode:
+    /// there is no other source of elapsed time, and a machine that guessed
+    /// would be the very thing this mode exists to stop.
+    fn host_nanos(&self) -> SchedResult<u64> {
+        Ok(self
+            .host_clock
+            .as_ref()
+            .ok_or(SchedError::NoHostClock)?
+            .monotonic_nanos())
+    }
+
+    /// Where virtual time stands, given a reading of the host clock.
+    ///
+    /// Computed from a single anchor rather than accumulated per round, so
+    /// nothing drifts: the answer is always
+    /// `anchor_virtual + (host − anchor_host)`, scaled by the rate policy.
+    /// [`RateControl::FixedRatio`] is honoured — a machine asked to run at
+    /// half speed does, because its clocks are told half as much time passed —
+    /// and every other policy is one-to-one, which is what makes a guest's own
+    /// calibration of the host's time-stamp counter against a board timer come
+    /// out right.
+    fn slaved_now(&mut self, host_nanos: u64) -> GlobalTime {
+        let (origin_host, origin_at) = match self.accel_anchor {
+            Some(anchor) => anchor,
+            None => {
+                let anchor = (host_nanos, self.now);
+                self.accel_anchor = Some(anchor);
+                anchor
+            }
+        };
+        let host_ns = host_nanos.saturating_sub(origin_host);
+        let virtual_ns = match self.rate.control() {
+            RateControl::FixedRatio { num, den } if den != 0 => {
+                u64::try_from((host_ns as u128) * (num as u128) / (den as u128)).unwrap_or(u64::MAX)
+            }
+            _ => host_ns,
+        };
+        origin_at.saturating_add(GlobalTime::from_nanos(virtual_ns))
+    }
+
+    /// The tail of an accelerated round: virtual time is whatever the host
+    /// clock says, and every tree is dragged there.
+    ///
+    /// Three things differ from [`Scheduler::close_round`], and each is the
+    /// mode's definition rather than an approximation:
+    ///
+    /// * **The target comes from the wall**, read after the guests ran rather
+    ///   than computed before them. Nothing else can measure what a vCPU did.
+    /// * **Every active tree is advanced absolutely**, not only the undriven
+    ///   ones. A tree whose runnable is a hypervisor client has no honest tick
+    ///   count to advance by, so its position comes from the same place as
+    ///   everyone else's. This is a cross-tree conversion, and it is the one
+    ///   §4.2 sanctions: there is no intra-tree alternative when the driving
+    ///   engine cannot count.
+    /// * **The round is never empty.** A host clock whose resolution swallowed
+    ///   the round would leave `now` where it was, and a run loop reads that as
+    ///   *virtual time did not advance* and stops. One nanosecond is below
+    ///   anything a guest can observe and is bounded by the anchor, which the
+    ///   next round measures from unchanged.
+    fn close_round_slaved(
+        &mut self,
+        from: GlobalTime,
+        opened: u64,
+        consumed: Vec<(RunnableId, u64)>,
+    ) -> SchedResult<QuantumReport> {
+        let closed = self.host_nanos()?;
+        let target = self
+            .slaved_now(closed.max(opened))
+            .max(from.saturating_add(GlobalTime::from_nanos(1)));
+        let oscillators: Vec<OscillatorId> = self.forest.oscillators().collect();
+        for osc in oscillators {
+            if !self.forest.is_active(osc)? {
+                continue;
+            }
+            // A no-op for a tree already past `target`, which is how a
+            // runnable that *can* count keeps whatever it counted.
+            self.forest.advance_to_global(osc, target)?;
+        }
+        self.now = target;
+        self.publish_lazy_positions();
+        let mut fired = Vec::new();
+        while let Some(e) = self.queue.pop_due(self.now) {
+            fired.push(e);
+        }
+        Ok(QuantumReport {
+            from,
+            to: self.now,
+            consumed,
+            fired,
+        })
     }
 
     /// Arm each runnable's cursor over the lazily-advanced devices on *its own*
@@ -3300,6 +3573,10 @@ impl Scheduler {
         self.now = snapshot.now;
         self.cursor = snapshot.cursor;
         self.publish_lazy_positions();
+        // A restored machine is at whatever instant its snapshot says. Keeping
+        // the old anchor would make the first accelerated round jump by the
+        // difference between the two, in whichever direction.
+        self.accel_anchor = None;
         if let Some(clock) = self.host_clock.as_ref() {
             let host_nanos = clock.monotonic_nanos();
             self.rate.reset(host_nanos, self.now);
@@ -3604,15 +3881,188 @@ mod tests {
         );
     }
 
+    // -- the accel mode -----------------------------------------------------
+
+    /// A host clock a test moves by hand, so an accelerated round's outcome is
+    /// a fact rather than a race.
+    #[derive(Debug, Clone, Default)]
+    struct StepClock(Arc<AtomicU64>);
+
+    impl StepClock {
+        fn advance(&self, nanos: u64) {
+            self.0.fetch_add(nanos, AtomicOrdering::Relaxed);
+        }
+    }
+
+    impl HostClock for StepClock {
+        fn monotonic_nanos(&self) -> u64 {
+            self.0.load(AtomicOrdering::Relaxed)
+        }
+    }
+
+    /// A runnable that moves the host clock while it "executes", which is what
+    /// a vCPU inside `KVM_RUN` does.
+    #[derive(Debug)]
+    struct Spinner {
+        clock: StepClock,
+        nanos: u64,
+    }
+
+    impl Runnable for Spinner {
+        fn run(&mut self, budget: Budget) -> Consumed {
+            self.clock.advance(self.nanos);
+            // What an accelerated core must report: the whole budget, because
+            // it cannot count guest ticks. Under `Emulated` that is what makes
+            // the board's clocks run at a rate set by the quantum.
+            Consumed::new(budget.ticks)
+        }
+    }
+
+    fn accel_scheduler(clock: &StepClock) -> (Scheduler, DomainId) {
+        let (mut sched, cpu, _ppu) = nes_scheduler_in(ThreadingMode::Accel, 0);
+        sched.set_host_clock(Box::new(clock.clone()));
+        (sched, cpu)
+    }
+
+    /// Without a clock there is no elapsed time, and guessing one is the whole
+    /// defect this mode exists to fix.
     #[test]
-    fn accel_refuses_rather_than_pretending() {
-        let (mut sched, cpu, _ppu) = nes_scheduler();
-        sched.config.mode = ThreadingMode::Accel;
+    fn accel_says_so_rather_than_inventing_a_clock() {
+        let (mut sched, cpu, _ppu) = nes_scheduler_in(ThreadingMode::Accel, 0);
         sched.add_runnable(cpu, Box::new(Cpu::default()));
-        assert_eq!(
-            sched.run_quantum().unwrap_err(),
-            SchedError::ModeUnimplemented(ThreadingMode::Accel)
+        assert_eq!(sched.run_quantum().unwrap_err(), SchedError::NoHostClock);
+    }
+
+    /// The mode's definition: a round is as long as the host clock says, and
+    /// **not** as long as the runnable claimed.
+    #[test]
+    fn accel_takes_a_rounds_length_from_the_host_clock() {
+        let clock = StepClock::default();
+        let (mut sched, cpu) = accel_scheduler(&clock);
+        sched.add_runnable(
+            cpu,
+            Box::new(Spinner {
+                clock: clock.clone(),
+                nanos: 4_000_000,
+            }),
         );
+        let report = sched.run_quantum().unwrap();
+        // Four milliseconds of wall, against a 1 ms quantum whose budget the
+        // runnable claimed in full. Under `Parallel` this round would have been
+        // exactly one quantum long however long the host took, which is the
+        // fact `hpet_counting()` and `timer_irq_works()` both trip over.
+        let span = report.to.as_nanos() - report.from.as_nanos();
+        assert!(
+            (3_999_990..=4_000_010).contains(&span),
+            "{span} ns of virtual time for 4 ms of host time"
+        );
+        // And the board's own clocks went with it, whole ticks of their own
+        // domain: the NES CPU is 1.789773 MHz, so four milliseconds is about
+        // 7 159 cycles rather than the 1 789 a 1 ms quantum would have given.
+        let ticks = sched.forest().ticks(cpu).unwrap();
+        assert!((7_100..7_200).contains(&ticks), "{ticks}");
+    }
+
+    /// Ten rounds of a millisecond each land on ten milliseconds, not on ten
+    /// milliseconds plus ten roundings: every instant is computed from one
+    /// anchor.
+    #[test]
+    fn accel_does_not_drift_across_rounds() {
+        let clock = StepClock::default();
+        let (mut sched, cpu) = accel_scheduler(&clock);
+        sched.add_runnable(
+            cpu,
+            Box::new(Spinner {
+                clock: clock.clone(),
+                nanos: 1_000_000,
+            }),
+        );
+        for _ in 0..10 {
+            sched.run_quantum().unwrap();
+        }
+        assert_eq!(sched.now(), GlobalTime::from_nanos(10_000_000));
+    }
+
+    /// A round the host clock did not notice still moves virtual time, because
+    /// a run loop reads *no advance* as a stalled machine and stops.
+    #[test]
+    fn accel_never_reports_a_round_of_no_length() {
+        let clock = StepClock::default();
+        let (mut sched, cpu) = accel_scheduler(&clock);
+        sched.add_runnable(cpu, Box::new(Cpu::default()));
+        let first = sched.run_quantum().unwrap();
+        assert!(first.to > first.from);
+        let second = sched.run_quantum().unwrap();
+        assert!(second.to > second.from);
+    }
+
+    /// A zero quantum reaches the same place it does in the other modes: a
+    /// round that moves nothing, which the run loop above reports as the
+    /// configuration error it is. Spinning the guest on an empty budget for
+    /// ever would be the alternative.
+    #[test]
+    fn accel_declines_a_zero_quantum_rather_than_spinning() {
+        let clock = StepClock::default();
+        let (mut sched, cpu, _ppu) = nes_scheduler_in(ThreadingMode::Accel, 0);
+        sched.config.quantum = GlobalTime::ZERO;
+        sched.set_host_clock(Box::new(clock.clone()));
+        sched.add_runnable(
+            cpu,
+            Box::new(Spinner {
+                clock: clock.clone(),
+                nanos: 1_000_000,
+            }),
+        );
+        let report = sched.run_quantum().unwrap();
+        assert_eq!(report.to, report.from);
+        assert!(report.consumed.is_empty(), "nothing may have run");
+    }
+
+    /// A deadline inside a round bounds the budgets instead of declining the
+    /// round: a guest that is never entered is a machine that has stopped.
+    #[test]
+    fn accel_runs_the_round_a_deadline_falls_inside() {
+        let clock = StepClock::default();
+        let (mut sched, cpu) = accel_scheduler(&clock);
+        sched.add_runnable(
+            cpu,
+            Box::new(Spinner {
+                clock: clock.clone(),
+                nanos: 2_000_000,
+            }),
+        );
+        // A tenth of the quantum. `Parallel` would decline this round outright.
+        let report = sched
+            .run_quantum_until(GlobalTime::from_nanos(100_000))
+            .unwrap();
+        assert_eq!(report.consumed.len(), 1);
+        assert!(report.consumed[0].1 > 0, "the runnable never ran");
+        // Two milliseconds, less the one unit `as_nanos` floors away.
+        assert!(report.to.as_nanos() >= 1_999_999, "{:?}", report.to);
+    }
+
+    /// `fixed-ratio` still means what it says: half speed is half as much
+    /// virtual time for the same wall.
+    #[test]
+    fn accel_honours_a_fixed_ratio() {
+        let clock = StepClock::default();
+        let (mut sched, cpu, _ppu) = nes_scheduler_in(ThreadingMode::Accel, 0);
+        sched.config.rate = RateControl::FixedRatio { num: 1, den: 2 };
+        sched.rate_controller_mut().set_control(
+            RateControl::FixedRatio { num: 1, den: 2 },
+            0,
+            GlobalTime::ZERO,
+        );
+        sched.set_host_clock(Box::new(clock.clone()));
+        sched.add_runnable(
+            cpu,
+            Box::new(Spinner {
+                clock: clock.clone(),
+                nanos: 4_000_000,
+            }),
+        );
+        sched.run_quantum().unwrap();
+        assert_eq!(sched.now(), GlobalTime::from_nanos(2_000_000));
     }
 
     // -- the parallel mode --------------------------------------------------

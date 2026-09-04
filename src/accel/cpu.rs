@@ -84,19 +84,22 @@
 //! until a host timer fires". This one does not have a host timer and does not
 //! want one:
 //!
-//! * **No clock.** Nothing here calls a clock of any kind. Virtual time comes
-//!   from the budget the scheduler hands `run`, and the budget is spent
-//!   whatever the host took, exactly as [`VcpuRunnable`](super::kvm::VcpuRunnable)
-//!   already does — the honest statement being that an accelerated guest's
-//!   progress is *not* measured in this clock domain, so pretending to measure
-//!   it would be worse than admitting it.
-//!   That cuts both ways and the cost is measured rather than assumed: because
-//!   a guest's *work* costs no virtual time, a guest that spins without exiting
-//!   stops the board's clocks entirely. A stock Linux kernel notices — its
-//!   `mdelay()` between two reads of `jiffies` sees no tick, and `check_timer()`
-//!   panics unless the command line says `no_timer_check`. `tests/kvm_q35_linux.rs`
-//!   has the whole diagnosis and [`accel`](crate::accel)'s **Time** section has
-//!   the fix, which is one level below this module.
+//! * **No clock.** Nothing here calls a clock of any kind, and that is still
+//!   true now that an accelerated board's virtual time *is* the host clock:
+//!   the reading is taken by the scheduler, through the
+//!   [`HostClock`](crate::core::sched::HostClock) it was injected with, at the
+//!   two ends of a round. This engine reports its whole
+//!   budget and lets the scheduler decide what that was worth in time, which
+//!   is the honest division — an accelerated guest's progress is not
+//!   measurable in this clock domain, so pretending to measure it here would
+//!   be worse than admitting it.
+//!   That used to cut the other way and the cost was measured rather than
+//!   assumed: under [`ThreadingMode::Parallel`], where the round's length
+//!   comes from the budget, a guest that spins without exiting stops the
+//!   board's clocks entirely, a stock Linux kernel's `mdelay()` between two
+//!   reads of `jiffies` sees no tick, and `check_timer()` panics unless the
+//!   command line says `no_timer_check`. Under [`ThreadingMode::Accel`] it
+//!   does not. `tests/kvm_q35_linux.rs` has the whole diagnosis.
 //! * **No sleep.** A halted guest is *parked*: `run` returns having consumed
 //!   its budget and having entered nothing. A `HLT` under a userspace
 //!   interrupt controller comes back as `KVM_EXIT_HLT` and the processor stays
@@ -104,15 +107,18 @@
 //!   guest can take it, which is the same predicate the interpreter uses.
 //! * **No thread.** The vCPU is entered on whichever thread the scheduler's
 //!   pool gave this runnable. Nothing here creates one.
-//! * **No signal.** The stop protocol is [`kvm`](super::kvm)'s: a per-CPU exit
-//!   flag written through to `KVM_CAP_IMMEDIATE_EXIT`. What that gives up —
-//!   *a guest taking no exits is not preemptible* — is inherited unchanged,
-//!   and on a board it has a sharper edge than the module documentation there
-//!   suggests: under [`ThreadingMode::Parallel`] the scheduler's round does not
-//!   end until every runnable returns, so a guest spinning with interrupts
-//!   masked and no memory-mapped access stops the *machine's* virtual time,
-//!   not only its own. [`ThreadingMode::Accel`] is the answer §4.2 designed and
-//!   the scheduler does not implement it yet.
+//! * **No signal in the stop protocol.** Stopping the world is still
+//!   [`kvm`](super::kvm)'s: a per-CPU exit flag written through to
+//!   `KVM_CAP_IMMEDIATE_EXIT`, checked between entries, never a signal. What
+//!   that gives up is unchanged — a stop arrives at the guest's next exit.
+//!   What *is* new is a **preemption interval** under
+//!   [`ThreadingMode::Accel`], which is a different mechanism for a different
+//!   question: not *"stay out until told"* but *"come back so the scheduler
+//!   can move virtual time"*, after which the guest resumes unaware. It does
+//!   use a host signal, in a Linux-only module, and
+//!   [`preempt`] argues why nothing signal-free can do the job
+//!   and why the rule that forbids one in the safe-point protocol does not
+//!   reach it.
 //!
 //! # Determinism
 //!
@@ -185,6 +191,7 @@ use crate::machine::{BindCtx, Bindings, Instance};
 
 use super::board::{self, Plan};
 use super::kvm::{IntrSource, Kvm, Vcpu, Vm};
+use super::preempt;
 use super::state;
 use super::{AccelError, AccelResult};
 
@@ -198,6 +205,22 @@ use super::{AccelError, AccelResult};
 /// guest that runs for milliseconds between exits and the cost of coming back
 /// out is a full architectural-state read.
 const MAX_ENTRIES: u64 = 4096;
+
+/// How many guest entries one call to [`Device::run`] makes under
+/// [`ThreadingMode::Accel`].
+///
+/// **One**, and that is the mode's contract rather than a conservative
+/// setting: under `Accel` the round's length *is* the interval over which
+/// virtual time stands still, so a slice that services a hundred device
+/// accesses is a hundred accesses that all see the same instant. Returning
+/// after each exit makes every guest access to every device see the wall clock
+/// as of that access, which is what a real machine does and what a kernel
+/// timing a `PIT` or an `HPET` against its own time-stamp counter needs.
+///
+/// It costs a scheduler round per exit — about 600,000 of them across a
+/// `q35-linux` boot — and that is measured in `tests/kvm_q35_linux.rs` rather
+/// than assumed.
+const ACCEL_ENTRIES: u64 = 1;
 
 /// How many guest instructions one call to [`Device::run`] interprets while
 /// the processor is fetching from something hardware cannot fetch from.
@@ -339,6 +362,7 @@ impl AccelCpus {
             dirty: AtomicBool::new(true),
             halted: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            resume: AtomicBool::new(false),
             entries: AtomicU64::new(0),
             interpreted: AtomicU64::new(0),
             failure: Mutex::new(None),
@@ -358,6 +382,34 @@ impl AccelCpus {
     #[must_use]
     pub const fn kvm(&self) -> &Kvm {
         &self.kvm
+    }
+
+    /// How many guest entries one slice makes, which the threading mode
+    /// decides.
+    ///
+    /// [`ThreadingMode::Accel`] returns after every exit so that virtual time
+    /// is re-read from the host clock before the next guest access reaches a
+    /// device; every other mode has no clock to re-read and amortises the
+    /// round over as many exits as it can.
+    #[must_use]
+    pub const fn max_entries(&self) -> u64 {
+        match self.mode {
+            ThreadingMode::Accel => ACCEL_ENTRIES,
+            _ => MAX_ENTRIES,
+        }
+    }
+
+    /// How long one of these processors may stay in hardware, in nanoseconds.
+    ///
+    /// Zero — no bound — in every mode but [`ThreadingMode::Accel`], where a
+    /// bound is what makes a guest's own delay loop cost virtual time. See
+    /// [`preempt`] for what enforces it.
+    #[must_use]
+    pub const fn preempt_nanos(&self) -> u64 {
+        match self.mode {
+            ThreadingMode::Accel => preempt::DEFAULT_NANOS,
+            _ => 0,
+        }
     }
 
     /// The threading mode this table was opened for.
@@ -523,6 +575,16 @@ pub struct AccelCpu {
     /// Whether the processor has stopped for good: a triple fault, or a
     /// backend failure. Cleared only by a reset.
     stopped: AtomicBool,
+    /// Whether the guest is mid-flight: the last slice ended because it ran
+    /// out of allowance rather than because the guest stopped.
+    ///
+    /// The next slice re-enters without asking where the processor is, which
+    /// is both faster and — since `ThreadingMode::Accel` can end a slice
+    /// *inside* an instruction — the only correct thing to do. See
+    /// [`slice`](AccelCpu::slice) for the boot failure that made it so.
+    /// Cleared by a reset, a snapshot load, and every exit that means the
+    /// guest stopped.
+    resume: AtomicBool,
     /// How many guest entries this processor has made. Diagnostics.
     entries: AtomicU64,
     /// How many instructions the shell has run because hardware could not.
@@ -673,6 +735,9 @@ impl AccelCpu {
             self.halted.store(false, Ordering::Release);
             self.stopped.store(false, Ordering::Release);
             self.dirty.store(true, Ordering::Release);
+            // The shell is ahead of the vCPU, so there is nothing mid-flight
+            // to resume.
+            self.resume.store(false, Ordering::Release);
         }
         !self.sequence_owed()
     }
@@ -744,6 +809,7 @@ impl AccelCpu {
             }
             steps += 1;
             self.dirty.store(true, Ordering::Release);
+            self.resume.store(false, Ordering::Release);
             // A `HLT` or a restart sequence is not this loop's business, and
             // the caller looks at both.
             if self.shell.is_halted() || self.sequence_owed() {
@@ -781,7 +847,21 @@ impl AccelCpu {
         // processor is still out there when its allowance runs out, this slice
         // is over rather than entering the guest at an address that would come
         // straight back out as an internal error.
-        if !self.interpret_out_of_hardware() {
+        //
+        // **Unless the last slice merely ran out of allowance**, in which case
+        // the guest is mid-flight and the only right thing to do is put it
+        // back. Asking the question again would be wrong as well as wasteful,
+        // and this is not theoretical: preemption made it a boot failure.
+        // [`fetch_phys`](AccelCpu::fetch_phys) walks *the guest's own page
+        // tables*, and a guest stopped in the middle of the `rep movsq` that
+        // relocates a Linux kernel is a guest whose tables are being
+        // overwritten as they are read. The walk answered `0x1002aa ->
+        // 0x200002aa`, which is not memory this board has, so the engine
+        // concluded hardware could not fetch, handed a perfectly healthy
+        // hardware guest to the interpreter, and the boot died there. Before
+        // `ThreadingMode::Accel` no slice ever ended inside an instruction, so
+        // the question was only ever asked where the answer was stable.
+        if !self.resume.load(Ordering::Acquire) && !self.interpret_out_of_hardware() {
             return Ok(());
         }
         if self.dirty.swap(false, Ordering::AcqRel) {
@@ -802,10 +882,17 @@ impl AccelCpu {
             }
             self.halted.store(false, Ordering::Release);
         }
-        let entries = ticks.clamp(1, MAX_ENTRIES);
+        let entries = ticks.clamp(1, self.host.max_entries());
         let run = vcpu.run_until_exit_with(entries, Some(self))?;
         self.entries
             .fetch_add(run.consumed.ticks, Ordering::Relaxed);
+        // No exit means the guest did not *stop*, it merely ran out of what it
+        // was given — its allowance of entries, or the preemption interval.
+        // The next slice puts it straight back rather than re-deriving where
+        // it is from state that may be mid-instruction. Anything else — a
+        // `HLT`, a shutdown, a fetch hardware could not make — is a real stop
+        // and the ordinary path below decides what it means.
+        self.resume.store(run.exit.is_none(), Ordering::Release);
         // The shell is made current before anything is decided about the exit,
         // so a `save` between rounds needs no cooperation from this module.
         state::store_from_vcpu(&vcpu, &self.shell)?;
@@ -974,6 +1061,7 @@ impl Device for AccelCpu {
         self.init_peer.store(false, Ordering::Release);
         self.halted.store(false, Ordering::Release);
         self.stopped.store(false, Ordering::Release);
+        self.resume.store(false, Ordering::Release);
         *self.failure.lock() = None;
         self.dirty.store(true, Ordering::Release);
     }
@@ -999,6 +1087,7 @@ impl Device for AccelCpu {
         // Whatever the vCPU has is now stale, and the next slice pushes.
         self.halted.store(false, Ordering::Release);
         self.stopped.store(false, Ordering::Release);
+        self.resume.store(false, Ordering::Release);
         self.dirty.store(true, Ordering::Release);
         Ok(())
     }
@@ -1041,6 +1130,10 @@ impl Instance for AccelCpu {
             .create_vcpu(self.id, Arc::clone(&memory), io)
             .map_err(fail)?;
         vcpu.set_requester(ctx.requester());
+        // What bounds a guest that takes no exits. Zero in every mode but
+        // `Accel`, where it is the difference between a `mdelay()` costing
+        // virtual time and stopping the board's clocks.
+        vcpu.set_preempt_nanos(self.host.preempt_nanos());
         *self.memory.lock() = Some(memory);
         *self.vcpu.lock() = Some(Arc::new(vcpu));
         Ok(())

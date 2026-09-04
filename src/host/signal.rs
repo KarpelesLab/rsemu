@@ -20,6 +20,12 @@
 //! | `SIGINT` (2) | Ctrl-C on a cooked terminal, or `kill -INT` | stop at the next slice boundary and flush |
 //! | `SIGTERM` (15) | `kill`, a supervisor, `systemctl stop` | the same |
 //! | `SIGHUP` (1) | the controlling terminal went away | the same: nobody is watching the console any more, but the disk still matters |
+//! | [`Signal::PREEMPT`] (36) | **this process's own timer**, armed by [`accel`](crate::accel) | nothing: the delivery *is* the effect, because it makes an in-flight `KVM_RUN` return `EINTR` |
+//!
+//! The fourth is not a shutdown and is armed separately, by [`arm_preempt`].
+//! It is the one signal rsemu *sends*, and it is here rather than in `accel/`
+//! for one reason: a signal disposition is the process's own state, and
+//! `ROADMAP.md` §0 sanctions exactly one place in the tree that writes one.
 //!
 //! **`SIGQUIT` is deliberately left alone.** Its conventional meaning is *quit
 //! and dump core*, and an emulator wedged in a guest loop is exactly when
@@ -130,6 +136,14 @@ impl Signal {
     pub const INT: Signal = Signal(2);
     /// The polite ask: `kill`, a supervisor, `systemctl stop`.
     pub const TERM: Signal = Signal(15);
+    /// The one rsemu *sends to itself*: a real-time signal that bounds how long
+    /// an accelerated vCPU may stay in hardware. See [`arm_preempt`].
+    ///
+    /// A real-time number rather than `SIGUSR1`, because `SIGUSR1` belongs to
+    /// whoever embeds this crate. The kernel's real-time range starts at 32 and
+    /// glibc keeps 32 and 33 for its own use, so 36 is comfortably inside the
+    /// range nothing else in an ordinary process claims.
+    pub const PREEMPT: Signal = Signal(36);
 
     /// Its short name, as `kill -l` prints it.
     #[must_use]
@@ -138,6 +152,7 @@ impl Signal {
             Signal::HUP => "SIGHUP",
             Signal::INT => "SIGINT",
             Signal::TERM => "SIGTERM",
+            Signal::PREEMPT => "SIGRTMIN+4",
             _ => "signal",
         }
     }
@@ -146,7 +161,7 @@ impl Signal {
 impl fmt::Display for Signal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Signal::HUP | Signal::INT | Signal::TERM => f.write_str(self.name()),
+            Signal::HUP | Signal::INT | Signal::TERM | Signal::PREEMPT => f.write_str(self.name()),
             Signal(n) => write!(f, "signal {n}"),
         }
     }
@@ -214,6 +229,44 @@ pub fn clear() {
     CAUGHT.store(0, Ordering::Relaxed);
 }
 
+/// How many [`Signal::PREEMPT`] deliveries this process has taken.
+///
+/// The only thing the preemption handler writes, and the evidence that an
+/// accelerated vCPU really was pulled out of hardware rather than having
+/// exited on its own.
+static PREEMPTIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Give [`Signal::PREEMPT`] a handler that does nothing at all.
+///
+/// # Why a disposition is needed for a signal nobody wants to handle
+///
+/// This one exists to be *delivered*, not to be acted on:
+/// [`accel`](crate::accel) bounds how long a vCPU stays inside `KVM_RUN` by
+/// asking the kernel to send it to the running thread, and the kernel's
+/// delivery is what makes `KVM_RUN` return `EINTR`. A signal with its
+/// **default** disposition would not do that — every real-time signal defaults
+/// to *terminate the process* — and an **ignored** one is discarded without
+/// ever becoming pending, so it would not interrupt anything either. A
+/// do-nothing handler is the only disposition that interrupts and survives.
+///
+/// Installed with `SA_RESTART` and **without** `SA_RESETHAND`: it fires
+/// thousands of times a second, so it has to persist, and every *other*
+/// system call in the thread must resume rather than fail. `KVM_RUN` is
+/// unaffected by `SA_RESTART` because the kernel returns a hard `-EINTR` for
+/// it rather than asking for a restart, which is exactly the asymmetry this
+/// relies on.
+///
+/// Idempotent, and [`Arming::Unavailable`] everywhere [`arm`] is.
+pub fn arm_preempt() -> Arming {
+    imp::arm_preempt()
+}
+
+/// How many times [`Signal::PREEMPT`] has been delivered to this process.
+#[must_use]
+pub fn preemptions() -> u64 {
+    PREEMPTIONS.load(Ordering::Relaxed)
+}
+
 // ---------------------------------------------------------------------------
 // x86-64 Linux: the raw system call
 // ---------------------------------------------------------------------------
@@ -251,7 +304,7 @@ mod imp {
 
     use core::sync::atomic::Ordering;
 
-    use super::{Arming, CAUGHT, SHUTDOWN, Signal};
+    use super::{Arming, CAUGHT, PREEMPTIONS, SHUTDOWN, Signal};
 
     /// `rt_sigaction`, x86-64 call 13.
     const SYS_RT_SIGACTION: u64 = 13;
@@ -288,6 +341,16 @@ mod imp {
     /// code in rsemu**: one relaxed store and a return.
     extern "C" fn handler(signal: i32) {
         CAUGHT.store(signal, Ordering::Relaxed);
+    }
+
+    /// What the kernel calls for [`Signal::PREEMPT`]: one relaxed increment.
+    ///
+    /// The *delivery* is the whole effect — it is what makes an in-flight
+    /// `KVM_RUN` return `EINTR` — so this counts and returns. Nothing reads
+    /// the count except diagnostics and the test that proves a spinning guest
+    /// really was interrupted.
+    extern "C" fn preempt_handler(_signal: i32) {
+        PREEMPTIONS.fetch_add(1, Ordering::Relaxed);
     }
 
     // The `rt_sigreturn` trampoline the kernel returns through. `global_asm!`
@@ -357,18 +420,28 @@ mod imp {
     /// `SIGSTOP` and nothing else this module asks for, so a refusal means the
     /// host is not what the module documentation claims.
     fn install(signal: Signal) -> bool {
+        install_with(signal, handler, SA_RESTORER | SA_RESTART | SA_RESETHAND)
+    }
+
+    /// Point one signal at one of this module's two handlers.
+    ///
+    /// The handler is chosen from the two `extern "C" fn`s above and never
+    /// from a caller, and the flags from the two constant expressions at the
+    /// call sites — so nothing outside this file can hand the kernel a pointer
+    /// or a disposition of its own.
+    fn install_with(signal: Signal, entry: extern "C" fn(i32), flags: u64) -> bool {
         let act = KernelSigaction {
-            handler: handler as *const () as u64,
-            flags: SA_RESTORER | SA_RESTART | SA_RESETHAND,
+            handler: entry as *const () as u64,
+            flags,
             restorer: rsemu_sigreturn as *const () as u64,
             // Nothing extra is blocked while the handler runs. It stores one
             // word; there is no critical section to protect.
             mask: 0,
         };
         // SAFETY: `act` is a live local of exactly the layout the kernel reads
-        // and it outlives the call, and `signal` is one of `SHUTDOWN` — none
-        // of which is `SIGKILL` or `SIGSTOP`. The kernel copies the structure
-        // and keeps no pointer into it.
+        // and it outlives the call, and `signal` is one of `SHUTDOWN` or
+        // `Signal::PREEMPT` — none of which is `SIGKILL` or `SIGSTOP`. The
+        // kernel copies the structure and keeps no pointer into it.
         let ret = unsafe { rt_sigaction(signal.0, &raw const act) };
         ret == 0
     }
@@ -380,6 +453,19 @@ mod imp {
             all &= install(*signal);
         }
         if all {
+            Arming::Installed
+        } else {
+            Arming::Unavailable
+        }
+    }
+
+    /// Give [`Signal::PREEMPT`] a handler that only counts.
+    ///
+    /// No `SA_RESETHAND`: this one fires for as long as an accelerated machine
+    /// runs, so a disposition that undid itself on the first delivery would
+    /// turn the second into a process kill.
+    pub(super) fn arm_preempt() -> Arming {
+        if install_with(Signal::PREEMPT, preempt_handler, SA_RESTORER | SA_RESTART) {
             Arming::Installed
         } else {
             Arming::Unavailable
@@ -406,11 +492,37 @@ mod imp {
     pub(super) fn arm() -> Arming {
         Arming::Unavailable
     }
+
+    pub(super) fn arm_preempt() -> Arming {
+        Arming::Unavailable
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The preemption disposition is separate from the shutdown one, survives
+    /// its own delivery, and counts.
+    ///
+    /// `SA_RESETHAND` on this one would turn the second kick into a process
+    /// kill, which is why [`arm_preempt`] does not set it — and why this test
+    /// arms twice and asserts the arming is still installed.
+    #[test]
+    fn the_preemption_signal_has_a_disposition_of_its_own() {
+        let armed = arm_preempt();
+        assert_eq!(armed, arm_preempt(), "arming is idempotent");
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        assert!(armed.is_installed(), "x86-64 Linux has rt_sigaction");
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        assert!(!armed.is_installed());
+        // It is not one of the shutdown signals, and arming it must not make
+        // `caught` claim a shutdown was asked for.
+        assert!(!SHUTDOWN.contains(&Signal::PREEMPT));
+        // The counter is separate from `CAUGHT` and only ever rises.
+        let n = preemptions();
+        assert!(preemptions() >= n);
+    }
 
     #[test]
     fn a_named_signal_prints_its_name_and_an_unnamed_one_its_number() {
