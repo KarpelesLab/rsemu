@@ -618,6 +618,90 @@ a board whose clocks only moved when it stopped running, so every delay it
 computed was wrong by about forty-four times. `src/accel/mod.rs` has the full
 list of what acceleration still costs.
 
+## Two processors
+
+`machines/q35-linux-smp.machine` is this board with a second one, and
+`tests/kvm_q35_linux_smp.rs` is a stock Gentoo 6.6.67 `bzImage` bringing it up:
+
+```text
+[    0.260994] smp: Bringing up secondary CPUs ...
+[    0.264411] smpboot: x86: Booting SMP configuration:
+[    0.267407] .... node  #0, CPUs:      #1
+[    0.271164] smp: Brought up 1 node, 2 CPUs
+[    0.279455] smpboot: Total of 2 processors activated (15974.13 BogoMIPS)
+```
+
+and `nproc` in the initramfs says `2`. On the board's own command line, in
+about **1.7 seconds of wall clock** to that line and 2.8 to the shell.
+
+The board is six lines different from this one, five of them
+`machines/pc-at-smp.machine`'s: a second `cpu.x86`, a second `pc.lapic` that
+names it with `cpu = cpu1`, the I/O APIC moved to id 2 out of `lapic1`'s way,
+the two wires from `lapic1` to the second processor's `INTR` and `NMI` pins,
+and — the one the board exists for — `0xfee00000` decoding to `lapic0.window`
+rather than `lapic0.regs`. The sixth is the one a q35 needs and an AT does not:
+`q35.acpi` is *told* `cpus = 2`, because a processor is not a region and the
+table survey cannot count them.
+
+### What was in the way, and the order it came off in
+
+This is worth writing down because the first diagnosis was right and the second
+fact was hiding behind it.
+
+The board was committed as a **reproduction** rather than a gate. Two
+processors, `nr_cpu_ids=2`, and the machine stopped advancing after 126 console
+lines — hundreds of lines before `smpboot` says anything. The control that came
+with it was the whole argument: mapping `lapic0.regs` at `0xfee00000` and
+`lapic1.regs` at a second address produced **the same 126 lines**, so whatever
+was in the way was not how the architectural page decoded. The attribution was
+*virtual time does not advance inside `KVM_RUN`*, and it named `accel/` and
+`core::sched` rather than `dev/pc/apic.rs`.
+
+That was correct, and the two changes
+[above](#the-word-the-command-line-no-longer-needs) — `ThreadingMode::Accel`
+and the preemption interval — are what fixed it. The reproduction had been
+running in `ThreadingMode::Parallel`, where neither applies.
+
+What the fix then exposed is that the window is load-bearing after all. With
+`RSEMU_SMP_NO_WINDOW=1` the same kernel now reaches userspace and says:
+
+```text
+[   10.260436] CPU1 failed to report alive state
+[   10.267325] smp: Brought up 1 node, 1 CPU
+```
+
+because the application processor read the bootstrap processor's APIC ID
+through a page that decodes to one register block for everybody. **The control
+now discriminates and it did not before**, and the reason it did not is that a
+machine whose clocks stand still never gets either mapping as far as
+`smpboot`. Two facts, one behind the other; the outer one had to go first, and
+while it was there the inner one was untestable rather than absent.
+
+### Selecting acceleration
+
+```text
+rsemu run q35-linux-smp --media kernel=/boot/vmlinuz \
+                        --media initrd=initramfs.cpio --accel kvm
+```
+
+`--accel kvm` is a **host** flag rather than a board property, and that is a
+decision rather than an accident. `engine` on a `cpu.x86` chooses between
+implementations of the *same* processor — `interp` and `jit` answer `CPUID`
+identically and `tests/x86_engines.rs` asserts their state hashes match — while
+a vCPU answers from the host's own silicon, cannot be replayed, and only exists
+on Linux/x86-64. A board file that named `kvm` would be a board that does not
+build on a Mac. So the file says `engine = interp` on both boards, both boards
+run either way, and what is accelerated is the *run*: `--accel kvm` opens the
+backend before the machine and replaces the binding for `cpu.x86`
+(`Bindings::replace`, `src/accel/cpu.rs`), leaving the text untouched and the
+two runs comparable.
+
+It implies `accel` threading, because the two are one decision: an accelerated
+board whose virtual time is not slaved to the wall is the failure the section
+above is about. `--threading` and `--accel` together are refused rather than
+one silently overruling the other, and `rsemu run` in that mode prints
+`state hash: not reproducible under “accel” threading` instead of a hash.
+
 ## Sources
 
 [`q35.md`](q35.md)'s and [`pc64.md`](pc64.md)'s, plus:

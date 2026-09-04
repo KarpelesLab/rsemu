@@ -95,6 +95,21 @@ RUN OPTIONS:
                         than one CPU, and NOT reproducible, so a state hash is
                         refused in it. N is the worker count; without it, one
                         per runnable, capped at what the host has
+    --accel <backend>   Run the machine's processors on the host's own silicon
+                        instead of interpreting them. `kvm` is the one backend,
+                        and it needs a build with `accel-kvm`, Linux, x86-64
+                        and a readable /dev/kvm. The machine file is used
+                        verbatim -- what changes is what is underneath its
+                        `cpu.x86` objects -- so the same board runs both ways
+                        and can be compared. It implies `accel` threading,
+                        where virtual time is read off the host clock rather
+                        than counted out of the board's oscillators, and it is
+                        therefore NOT reproducible: no state hash, no
+                        --record-input, and a guest that measures anything
+                        against the machine file gets host time.
+                        `rsemu run q35-linux --media kernel=bzImage --accel kvm`
+                        boots a stock kernel in about three seconds where the
+                        interpreter takes sixteen minutes
     --for <duration>    How much virtual time to run, as `1s`, `500ms`, `2m`
                         (default 1s, or forever with a console attached)
     --console <name>    Attach this terminal to a named character port. A
@@ -200,7 +215,7 @@ fn machines() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     for entry in machines {
-        println!("{:<12} {}", entry.name, entry.summary);
+        println!("{:<13} {}", entry.name, entry.summary);
         if !entry.media.is_empty() {
             let slots: Vec<String> = entry
                 .media
@@ -210,7 +225,7 @@ fn machines() -> ExitCode {
             // "media", not "needs": a slot with no default is an error naming
             // itself when the machine is built, and `apple1` binds its own
             // monitor ROM when nothing else does.
-            println!("{:<12} media {}", "", slots.join(", "));
+            println!("{:<13} media {}", "", slots.join(", "));
         }
     }
     ExitCode::SUCCESS
@@ -309,6 +324,18 @@ struct RunArgs {
     /// CPU" means and which the count is only known after the machine is
     /// built.
     threading: (ThreadingMode, Option<usize>),
+    /// Whether `--threading` was typed, so that `--accel` can refuse to
+    /// silently overrule it.
+    threading_given: bool,
+    /// Which acceleration backend to run the machine's processors on, if
+    /// `--accel` was given.
+    ///
+    /// A [`String`] rather than an enumeration because the set of backends is
+    /// a property of the *build* — `accel-kvm` on Linux/x86-64 is the only one
+    /// that exists — and a build without any still has to recognise the flag
+    /// and say why it cannot honour it, rather than answering "unknown
+    /// option".
+    accel: Option<String>,
     /// Where to listen for a debugger, if `--gdb` was given.
     #[cfg(feature = "gdb")]
     gdb: Option<String>,
@@ -390,8 +417,14 @@ fn run(args: &[String]) -> ExitCode {
     // an empty option-ROM socket are both ordinary configurations, and a board
     // that refused to assemble without a diskette would be describing no
     // machine anyone ever owned.
+    // `nvme0` is on the list for the same reason `hd0` is: an NVMe controller
+    // with no bytes bound is a drive whose capacity comes from the board's
+    // `disk` parameter and whose contents are zeroes, which is a blank disk
+    // and an ordinary machine. Without it `rsemu run q35-linux` refused to
+    // start over an empty bay it had been given no way to name — `--drive
+    // nvme0=…` was the only spelling that worked, and it needs a file.
     for slot in [
-        "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "floppy", "vgabios",
+        "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "floppy", "vgabios", "nvme0",
     ] {
         if !images.iter().any(|(bound, _)| bound == slot) {
             images.push((String::from(slot), Vec::new()));
@@ -438,6 +471,17 @@ fn run(args: &[String]) -> ExitCode {
         options = options.with_param(key.clone(), value.clone());
     }
     options.realize.scheduler.mode = parsed.threading.0;
+
+    // `--accel`. The backend is opened *before* the build and kept alive past
+    // it: `AccelCpus` replaces the binding for `cpu.x86`, so what the machine
+    // file's `object cpu0 "cpu.x86"` constructs is an accelerated processor
+    // rather than an interpreted one, and the board text is untouched. The
+    // host object holds its processors weakly, so this binding is what keeps
+    // the VM open for the length of the run (`accel::cpu`).
+    let _accel = match open_accel(&parsed, &mut options) {
+        Ok(handle) => handle,
+        Err(e) => return fail(&e),
+    };
 
     // A host gets a typed handle on a display device at the one moment the
     // concrete type exists: construction. Installed unconditionally rather than
@@ -1825,6 +1869,8 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         // Deterministic unless asked otherwise: reproducibility is the default
         // a person gets, and giving it up has to be a thing they typed.
         threading: (ThreadingMode::Deterministic, None),
+        threading_given: false,
+        accel: None,
         #[cfg(feature = "gdb")]
         gdb: None,
         #[cfg(feature = "vnc")]
@@ -1904,6 +1950,11 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             "--threading" => {
                 let text = value(arg)?;
                 out.threading = parse_threading(&text)?;
+                out.threading_given = true;
+            }
+            "--accel" => {
+                let text = value(arg)?;
+                out.accel = Some(parse_accel(&text)?);
             }
             "-q" | "--quiet" => out.quiet = true,
             other if other.starts_with('-') => {
@@ -1923,17 +1974,129 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             "run needs a machine; `rsemu machines` lists this build's catalog",
         ));
     }
+    // `--accel` decides the threading mode, because the two are one decision
+    // rather than two. `ThreadingMode::Accel` is what makes virtual time come
+    // off the host clock, and an accelerated board without it is the boot
+    // failure `tests/kvm_q35_linux.rs` documents at length: a guest that runs
+    // for a host millisecond between exits advances the board's clocks by
+    // nothing, so every delay loop in a kernel takes no virtual time and every
+    // frequency it calibrates comes out forty-four times too high.
+    //
+    // A `--threading` that was actually typed is therefore refused rather than
+    // overruled: a person who asked for `parallel` and got `accel` would have
+    // no way to tell.
+    if out.accel.is_some() {
+        if out.threading_given && out.threading.0 != ThreadingMode::Accel {
+            return Err(format!(
+                "--accel runs the machine in `accel` threading, where virtual time is read off \
+                 the host clock; --threading {} cannot also apply",
+                out.threading.0
+            ));
+        }
+        out.threading = (ThreadingMode::Accel, out.threading.1);
+    }
     Ok(out)
+}
+
+/// Which acceleration backend `--accel` named.
+///
+/// # Why this is a host flag and not `engine = "kvm"` in the machine file
+///
+/// `engine` became a board *parameter* this round so that every JIT the tree
+/// had grown was reachable from the command line, and the obvious next step
+/// looks like adding `"kvm"` to its list. It is the wrong place, for three
+/// reasons that are all the same reason:
+///
+/// * **A machine file describes a machine, not a host.** `engine = "jit"` and
+///   `engine = "interp"` are two implementations of the *same* processor —
+///   same `variant`, same `CPUID`, same answers, bit for bit, which is what
+///   `tests/x86_engines.rs` asserts. A vCPU is not: it answers `CPUID` from
+///   the host's silicon (`accel::kvm::board_cpuid`), it cannot be replayed,
+///   and its `Machine::state_hash` means nothing. Putting it in the file would
+///   make the file's promise depend on who opened it.
+/// * **It does not exist on most targets.** `accel` is `cfg`-gated to
+///   Linux/x86-64. A board file naming `kvm` would be a board that does not
+///   build on macOS, on wasm, or on an ARM host — and boards are the one part
+///   of this tree that is meant to be portable text.
+/// * **The backend is a host object.** An accelerated processor arrives
+///   through `Bindings::replace` from an `AccelCpus` opened *before* the
+///   machine exists (`accel::cpu`). `machine/` is `no_std` and cannot open
+///   `/dev/kvm`; something on this side of the seam has to, and this flag is
+///   that something.
+///
+/// So the board stays `q35-linux-smp` either way and the *run* is what is
+/// accelerated — which is also what makes `rsemu run q35-linux-smp` and
+/// `rsemu run q35-linux-smp --accel kvm` the same machine, one measured
+/// against the other.
+fn parse_accel(text: &str) -> Result<String, String> {
+    match text {
+        "kvm" => Ok(String::from("kvm")),
+        other => Err(format!(
+            "--accel {other}: this build knows `kvm` (Linux/x86-64, `--features accel-kvm`)"
+        )),
+    }
+}
+
+/// Open the backend `--accel` named, and put it in front of the board's
+/// processors.
+///
+/// [`AccelCpus::install`](rsemu::accel::cpu::AccelCpus::install) replaces the
+/// binding for `cpu.x86`, so the machine file is used verbatim — `engine =
+/// "interp"` and all — and what changes is what is underneath it. The returned
+/// handle is what keeps the VM and its vCPUs open: the host object holds its
+/// processors weakly, so the machine's devices do not keep it alive
+/// (`accel::cpu`).
+///
+/// No pool is asked for. Under `ThreadingMode::Accel` a scheduler round is
+/// **one guest exit long**, and a round costs a couple of microseconds per
+/// *dispatched* runnable against work that is a single `KVM_RUN` — so the
+/// default (`SchedulerConfig::workers` of zero, every job run inline on the
+/// driver thread) is what the boot in `tests/kvm_q35_linux_smp.rs` measured,
+/// and handing this mode a thread per processor is a performance question
+/// nobody has answered yet rather than a thing to do by analogy with
+/// `--threading parallel`.
+#[cfg(all(feature = "accel-kvm", target_os = "linux", target_arch = "x86_64"))]
+fn open_accel(
+    parsed: &RunArgs,
+    options: &mut rsemu::machine::BuildOptions,
+) -> Result<Option<Arc<rsemu::accel::cpu::AccelCpus>>, rsemu::Error> {
+    if parsed.accel.is_none() {
+        return Ok(None);
+    }
+    // `parse_accel` has already refused anything but `kvm`, and `parse_run`
+    // has already put the machine in `ThreadingMode::Accel` — which
+    // `AccelCpus::open` checks for itself, because a backend that trusted its
+    // caller about reproducibility would be the wrong place to find out.
+    let accel = rsemu::accel::cpu::AccelCpus::open(parsed.threading.0)?;
+    accel.install(&mut options.bindings);
+    Ok(Some(accel))
+}
+
+/// The same, in a build with no acceleration backend in it.
+///
+/// The flag is still parsed, so that `--accel kvm` on a build without the
+/// feature — or on a host that is not Linux/x86-64 — says which build would
+/// have it rather than `unknown option`.
+#[cfg(not(all(feature = "accel-kvm", target_os = "linux", target_arch = "x86_64")))]
+fn open_accel(
+    parsed: &RunArgs,
+    _options: &mut rsemu::machine::BuildOptions,
+) -> Result<Option<()>, rsemu::Error> {
+    match parsed.accel.as_deref() {
+        None => Ok(None),
+        Some(backend) => Err(rsemu::Error::Accel(format!(
+            "--accel {backend}: this build has no acceleration backend; it needs \
+             `--features accel-kvm` on Linux/x86-64"
+        ))),
+    }
 }
 
 /// `deterministic`, `parallel`, or `parallel:<workers>`.
 ///
-/// `accel` is deliberately absent, and no longer because the scheduler cannot
-/// do it — `ThreadingMode::Accel` is implemented. It is that nothing this
-/// binary can build would *use* it: an accelerated processor arrives through
-/// `Bindings::replace`, which is a host-side call, and `engine = "kvm"` is not
-/// a machine-file property yet (`accel::cpu`). Offering the mode here would
-/// slave an interpreted board's clocks to the wall and call it acceleration.
+/// `accel` is still absent here, and now for a smaller reason than before:
+/// `--accel <backend>` is the flag that selects it, because the mode without a
+/// backend under it would slave an *interpreted* board's clocks to the wall
+/// and call it acceleration.
 fn parse_threading(text: &str) -> Result<(ThreadingMode, Option<usize>), String> {
     let (name, workers) = match text.split_once(':') {
         Some((name, count)) => {
@@ -1955,6 +2118,11 @@ fn parse_threading(text: &str) -> Result<(ThreadingMode, Option<usize>), String>
             Ok((ThreadingMode::Deterministic, None))
         }
         "parallel" => Ok((ThreadingMode::Parallel, workers)),
+        "accel" => Err(String::from(
+            "--threading accel is not selected here: it is what `--accel <backend>` puts the \
+             machine in, because the mode on its own would slave an interpreted board's clocks \
+             to the wall and call it acceleration",
+        )),
         other => Err(format!(
             "--threading {other}: expected `deterministic` or `parallel[:<workers>]`"
         )),

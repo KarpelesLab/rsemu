@@ -357,6 +357,33 @@ pub static Q35_LINUX: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/q35-linux.machine"),
 };
 
+/// [`Q35_LINUX`]'s board with **two processors**.
+///
+/// The same five changes `machines/pc-at-smp.machine` makes to `pc-at` — a
+/// second `cpu.x86`, a second `pc.lapic` that names it, the I/O APIC moved out
+/// of its id, and `0xfee00000` decoding to `lapic0.window` rather than
+/// `lapic0.regs` — plus the one a q35 needs and an AT does not: `q35.acpi` is
+/// told how many processors there are, because a processor is not a region and
+/// the table survey cannot count them.
+///
+/// A stock Linux kernel prints `smp: Brought up 1 node, 2 CPUs` on it and
+/// `nproc` in the initramfs says `2`, measured under `--accel kvm`
+/// (`tests/kvm_q35_linux_smp.rs`). Interpreted it builds and boots; how long
+/// two interpreted x86s take to finish bringing the second one up is a
+/// question the machine file answers rather than this one.
+///
+/// **No firmware is shipped and none can be**, exactly as [`Q35_LINUX`] ships
+/// none: a `bzImage` bound to the `kernel` slot is what executes after the
+/// reset vector.
+#[cfg(feature = "machine-q35-linux-smp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-q35-linux-smp")))]
+pub static Q35_LINUX_SMP: CatalogEntry = CatalogEntry {
+    name: "q35-linux-smp",
+    summary: "the q35-linux board with two processors, each reaching its own local APIC",
+    media: &["kernel", "initrd", "nvme0"],
+    source: include_str!("../../machines/q35-linux-smp.machine"),
+};
+
 /// The q35 chipset with **two banks of NOR flash** where the ROM socket was.
 ///
 /// [`Q35`]'s board, with the `pc.rom` sockets replaced by a read-only firmware
@@ -702,6 +729,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&Q35);
     #[cfg(feature = "machine-q35-linux")]
     out.push(&Q35_LINUX);
+    #[cfg(feature = "machine-q35-linux-smp")]
+    out.push(&Q35_LINUX_SMP);
     #[cfg(feature = "machine-q35-uefi")]
     out.push(&Q35_UEFI);
     #[cfg(feature = "machine-pc64")]
@@ -2002,6 +2031,10 @@ mod tests {
             // image goes, behind `RSEMU_DISK`.
             #[cfg(feature = "machine-q35-linux")]
             ("q35-linux", "kernel" | "initrd" | "nvme0") => &[],
+            // The two-processor board takes the same three sockets, for the
+            // same reasons: it is `q35-linux` with a second processor on it.
+            #[cfg(feature = "machine-q35-linux-smp")]
+            ("q35-linux-smp", "kernel" | "initrd" | "nvme0") => &[],
             // Two blank NOR banks. A `flash.cfi` with no image is an erased
             // part, which is a board with the sockets stuffed and nothing
             // programmed into them — so this proves the board realizes without

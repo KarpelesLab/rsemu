@@ -837,6 +837,25 @@ impl<'a> Realizer<'a> {
             core::mem::take(&mut self.forest),
             self.options.scheduler.clone(),
         );
+        // `ThreadingMode::Accel` reads a round's elapsed virtual time off an
+        // injected `core::sched::HostClock` and has **no other source of
+        // it**: a machine realized in that mode with no clock fails
+        // every round with `SchedError::NoHostClock`, which is deliberate
+        // where the alternative would be guessing. It is not deliberate that
+        // every caller had to know the rule and say so — that is the mode
+        // being unusable by anything but a test.
+        //
+        // So the default is installed here, where the mode is already known.
+        // There is exactly one implementation of the trait in the tree
+        // (`host::clock::MonotonicClock`, and its own documentation says a
+        // second reading of the wall anywhere else is the bug the injection
+        // exists to prevent), and the mode is std-only anyway because the
+        // acceleration backends are. A front end that wants a different clock
+        // still overrides this with `Machine::set_host_clock` after the build.
+        #[cfg(feature = "std")]
+        if self.options.scheduler.mode == crate::core::sched::ThreadingMode::Accel {
+            sched.set_host_clock(Box::new(crate::host::clock::MonotonicClock::new()));
+        }
         let devices = self.register_with_scheduler(&mut sched)?;
 
         let mut machine = Machine::assemble(MachineParts {

@@ -237,6 +237,11 @@ controller at `00:04.0`, and busybox reads forty bytes off the namespace with
 the part worth the sentence, because it used to need three extra words and every
 one of them was hiding a defect here.
 
+`q35-linux-smp` is that board with **two processors** — the same five lines
+`pc-at-smp` adds to `pc-at`, plus a MADT that is told there are two — and the
+same kernel brings the second one up on it in under two seconds under
+`--accel kvm`.
+
 `q35-uefi` is the same chipset with the ROM socket replaced by **two banks of
 parallel NOR flash** below 4 GiB, which is the layout every split OVMF build is
 compiled for. A real OVMF runs SEC out of flash, sizes memory in PEI from the
@@ -448,21 +453,37 @@ reference host, because [`docs/bench-host.md`](docs/bench-host.md) has not been
 filled in — by the project's own rule that makes every one of them informative
 rather than gating.
 
-**Hardware acceleration** is real, and it is KVM on Linux x86-64. `q35-linux`
-boots that same stock Gentoo 6.6.67 kernel to a busybox shell in **about ten
-seconds of wall clock (9-12 s measured)** against **973 s** interpreted, and
-**279 of the accelerated run's 347 console lines are byte-identical** to the
-interpreted run's, in the same order, once the printk timestamp is removed — the
-68 that differ are the ones that describe the *host* processor, its mitigations,
-its XSAVE list and its TLB geometry. On a pure-execution workload the ratio to
-native is **99.7%, 99.9% and 101.2%** across three runs, against a phase-7 gate
-of 80%. That pair of boots is not on the board's own default line, though: an
-accelerated run still needs `no_timer_check`, and the reason is in the scheduler
-rather than the board. Two more things it is not yet: `engine = "kvm"` is not a machine-file value
-and there is no `--kvm` flag, so acceleration is reached through the API rather
-than a command line; and `ThreadingMode::Accel` is unimplemented, so an
-accelerated board runs `Parallel` and is not reproducible. HVF and WHPX are
-roadmap entries with no code behind them.
+**Hardware acceleration** is real, and it is KVM on Linux x86-64.
+`rsemu run q35-linux --media kernel=bzImage --accel kvm` boots that same stock
+Gentoo 6.6.67 kernel to a busybox shell in **about two and a half seconds of
+wall clock** against **973 s** interpreted, **on the board's own default
+command line** — the `no_timer_check` this paragraph used to carry is gone, and
+so is the defect it was hiding. **282 of the accelerated run's 346 console
+lines are byte-identical** to the interpreted run's, in the same order, once the
+printk timestamp is removed; the 62 that differ are the ones that describe the
+*host* processor, its mitigations, its XSAVE list and its TLB geometry. On a
+pure-execution workload the ratio to native is **99.7%, 99.9% and 101.2%**
+across three runs, against a phase-7 gate of 80%.
+
+What made the command line honest is `ThreadingMode::Accel`, which is now
+implemented: a scheduler round's elapsed virtual time is **read off the host
+clock** rather than counted out of the board's oscillators, and a periodic
+per-thread timer bounds a guest that takes no exits at all. Before it, virtual
+time did not advance while a vCPU was inside `KVM_RUN`, so a kernel calibrating
+its time-stamp counter against a board timer concluded it was on a
+**176,273 MHz** processor; it now reports **3,992.968 MHz** on a 3,993,994 kHz
+host. That is also what unblocked `q35-linux-smp`, the two-processor version of
+the same board, on which the kernel prints `smp: Brought up 1 node, 2 CPUs` and
+`nproc` says `2`.
+
+`--accel` is a **host** flag rather than a machine-file value, deliberately:
+`engine = "interp"` and `engine = "jit"` are two implementations of the same
+processor and their state hashes match, while a vCPU answers `CPUID` from the
+host's silicon, cannot be replayed, and only exists on Linux/x86-64 — so a
+board that named it would be a board that does not build on a Mac. The file is
+used verbatim either way and what is accelerated is the *run*. It is not
+reproducible: no state hash, no `--record-input`. HVF and WHPX are roadmap
+entries with no code behind them.
 
 **Level 3 — user-mode execution** — has its proof: a static musl Rust binary,
 built by `scripts/fetch-testdata.sh` for `riscv64gc-unknown-linux-musl` and
