@@ -254,9 +254,12 @@ fn board(
         &options,
     )
     .map_err(|e| format!("{e}"))?;
-    // What `ThreadingMode::Accel` runs on. Without it every round fails with
-    // `SchedError::NoHostClock`, and deliberately: the mode's whole content is
-    // that elapsed time comes from the wall, and a fallback would be a guess.
+    // What `ThreadingMode::Accel` runs on. `machine::realize` now installs
+    // exactly this clock when the mode asks for one — a machine without it
+    // fails every round with `SchedError::NoHostClock`, and requiring every
+    // caller to know that was what kept the mode inside tests. Kept here
+    // anyway, and deliberately: it is the override path, and a build that
+    // stopped honouring it would otherwise go unnoticed.
     machine.set_host_clock(Box::new(rsemu::host::clock::MonotonicClock::new()));
     machine.reset(ResetKind::Cold);
     machine.sweep();

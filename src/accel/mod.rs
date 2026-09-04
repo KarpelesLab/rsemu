@@ -31,18 +31,42 @@
 //!   that happens to be a [`Runnable`](crate::core::sched::Runnable), with its
 //!   register file reached through its own concrete type. So "the same seam the
 //!   interpreter uses" is two traits and a convention, not one trait.
-//! * **`engine = "kvm"` is not a machine-file property yet.** Every core in the
-//!   crate accepts `engine` and rejects anything but `"interp"`, in
-//!   `cpu::x86`'s property reader *and* in its validator schema. So a *board*
-//!   still cannot ask to be accelerated; a **host** can, through
-//!   [`Bindings::replace`](crate::machine::Bindings::replace), and [`cpu`] is
-//!   the device class it replaces `cpu.x86` with. Closing the remaining gap is
-//!   four lines in `src/cpu/x86/mod.rs` — `"kvm"` added to the property
-//!   reader's `or_enum` list and to `schema_for`'s `values` — and this module
-//!   deliberately does not make them.
+//! * **`engine = "kvm"` is not a machine-file property, and is not going to
+//!   be.** Every core in the crate accepts `engine` and rejects anything but
+//!   the engines it implements, in `cpu::x86`'s property reader *and* in its
+//!   validator schema, and adding `"kvm"` to both lists is four lines that
+//!   should not be written. `engine` chooses between implementations of the
+//!   **same processor** — `interp` and `jit` answer `CPUID` identically and
+//!   `tests/x86_engines.rs` asserts their state hashes match at every
+//!   checkpoint — while a vCPU answers from the host's silicon, cannot be
+//!   replayed, and exists only on Linux/x86-64. A board file naming it would
+//!   be a board that does not build on a Mac, and a board file is meant to be
+//!   portable text. So acceleration stays a **host** decision, made through
+//!   [`Bindings::replace`](crate::machine::Bindings::replace) with [`cpu`] as
+//!   the class that displaces `cpu.x86` — and `rsemu run <board> --accel kvm`
+//!   is that call from a command line (`src/bin/rsemu.rs`).
 //!
 //! What used to be on that list and no longer is:
 //!
+//! * **A user who is not writing a test can ask for it.** `--accel kvm` opens
+//!   the backend before the machine is built and installs it; it implies
+//!   [`ThreadingMode::Accel`](crate::core::sched::ThreadingMode::Accel),
+//!   because an accelerated board whose clocks are not slaved to the wall is
+//!   the boot failure **Time** below is about, and it refuses a `--threading`
+//!   that was actually typed rather than overruling it silently.
+//! * **A machine realized in `Accel` is handed a host clock.** That mode has
+//!   no other source of elapsed time, so a machine without one failed every
+//!   round with `SchedError::NoHostClock` and every caller had to know the
+//!   rule. `machine::realize` now installs `host::clock::MonotonicClock` when
+//!   the mode asks for one, and `Machine::set_host_clock` still overrides it.
+//! * **Two accelerated processors bring each other up.**
+//!   `machines/q35-linux-smp.machine` is `q35-linux` with a second `cpu.x86`,
+//!   a second `pc.lapic` naming it, and `0xfee00000` decoding to the APIC
+//!   `window` — and a stock Gentoo 6.6.67 kernel prints `smp: Brought up 1
+//!   node, 2 CPUs` on it in 1.7 seconds of wall clock
+//!   (`tests/kvm_q35_linux_smp.rs`). That board was committed as a
+//!   *reproduction* of a machine that stopped 126 console lines in, and what
+//!   was in the way was **Time**, exactly as its own note said.
 //! * **[`ThreadingMode::Accel`](crate::core::sched::ThreadingMode::Accel) is
 //!   implemented.** Virtual time is read off the host clock, so a guest that
 //!   runs for a host millisecond between exits advances the board's clocks by

@@ -1,81 +1,101 @@
-//! **Two processors on `q35-linux`, and the thing that is still in the way of a
-//! Linux SMP boot.** A committed reproduction, not a gate.
+//! **Two processors on `q35-linux-smp`, and a Linux kernel that brings the
+//! second one up.**
 //!
 //! [`tests/kvm_q35_linux.rs`](kvm_q35_linux.rs) boots a Gentoo `bzImage` to
-//! userspace on `machines/q35-linux.machine` with one processor, in about nine
-//! seconds of wall clock. This is the same board, the same kernel and the same
-//! firmware-less loader with a second processor added the way
-//! `machines/pc-at-smp.machine` adds one — and the line it waits for is Linux's
-//! own `smp: Brought up 1 node, 2 CPUs`.
+//! userspace on `machines/q35-linux.machine` with one processor. This is
+//! `machines/q35-linux-smp.machine` — the same board, the same kernel, the
+//! same firmware-less loader, with a second processor added the way
+//! `machines/pc-at-smp.machine` adds one — and the line it waits for is
+//! Linux's own `smp: Brought up 1 node, 2 CPUs`.
 //!
-//! **It does not reach it, and the reason is not the APIC page.** What is
-//! measured, on a Gentoo 6.6.67 `bzImage`, `--release`, `no_timer_check`:
+//! It reaches it, on the board's own command line, in under two seconds:
 //!
-//! | board | kernel's view | console lines before it stops |
+//! ```text
+//!   | [    0.254094] smp: Bringing up secondary CPUs ...
+//!   | [    0.256147] smpboot: x86: Booting SMP configuration:
+//!   | [    0.257053] .... node  #0, CPUs:      #1
+//!   | [    0.260755] smp: Brought up 1 node, 2 CPUs
+//!   | [    0.279455] smpboot: Total of 2 processors activated (15974.13 BogoMIPS)
+//! ```
+//!
+//! and `nproc` in the initramfs shell says `2`.
+//!
+//! # What was in the way, and what it turned out to be
+//!
+//! This file was committed `#[ignore]`d as a *reproduction* rather than a
+//! gate, because the board did not get there. What it measured then, on the
+//! same kernel, was:
+//!
+//! | board | kernel's view | console lines before it stopped |
 //! | --- | --- | --- |
 //! | one `cpu.x86` | `nr_cpu_ids=1` | 300, on to userspace |
 //! | two, `nosmp` on the command line | `nr_cpu_ids=1` | 301, on to userspace |
-//! | two, `map … = lapic0.window` | `nr_cpu_ids=2` | **126**, then the machine stops advancing |
+//! | two, `map … = lapic0.window` | `nr_cpu_ids=2` | **126**, then the machine stopped advancing |
 //! | two, `map … = lapic0.regs` + `lapic1.regs` at `0xfef00000` | `nr_cpu_ids=2` | **126**, identically |
 //!
-//! The last two rows are the control this file is built around, and they are
-//! the point: **the same 126 lines, the same kernel line, with the window and
-//! without it.** The board that stops is also the board that stops when its two
-//! local APICs are addressed the old way, so whatever is in the way is not how
-//! `0xfee00000` decodes. The second row rules out "two vCPUs on this board" on
-//! its own — two vCPUs boot to userspace as long as the kernel does not intend
-//! to use the second one. What is left is what happens once a kernel *believes*
-//! it has two processors, which is a question about how this machine runs two
-//! active accelerated processors, and lives in `accel/` and `core::sched`
-//! rather than in `dev/pc/apic.rs`. The guest stops mid-`printk`, several
-//! hundred lines before `smpboot` says anything, so it is not the bring-up
-//! sequence itself.
+//! The last two rows being identical is what said the APIC page was not the
+//! problem, and the attribution that went with them was **virtual time not
+//! advancing inside `KVM_RUN`** — `accel/` and `core::sched` rather than
+//! `dev/pc/apic.rs`. That was right. The two things that fixed it are in
+//! [`kvm_q35_linux.rs`](kvm_q35_linux.rs)'s module documentation at length:
+//! [`ThreadingMode::Accel`], which reads a round's elapsed virtual time off
+//! the host clock, and `accel::preempt`, which bounds a guest that takes no
+//! exits at all. This test was running in
+//! [`ThreadingMode::Parallel`](rsemu::core::sched::ThreadingMode::Parallel),
+//! where neither applies; in `Accel` the same board and the same kernel reach
+//! userspace with two processors.
 //!
-//! `tests/kvm_q35_linux.rs`'s own module documentation has the shape of the
-//! most likely explanation, at length: **virtual time does not advance while a
-//! vCPU is inside `KVM_RUN`**, and a scheduler round does not end until every
-//! runnable returns. That file needed `no_timer_check` for it with one
-//! processor. This is what the same fact may cost with two.
+//! **The negative control now discriminates, and it did not before.** With
+//! `RSEMU_SMP_NO_WINDOW=1` — each local APIC at its own address, which is what
+//! `q35-linux` does with one — the same kernel still reaches userspace and
+//! prints:
+//!
+//! ```text
+//!   | [   10.260436] CPU1 failed to report alive state
+//!   | [   10.267325] smp: Brought up 1 node, 1 CPU
+//! ```
+//!
+//! because the application processor read the bootstrap processor's APIC ID.
+//! So `lapic0.window` is load-bearing on this board after all; what hid that
+//! was a machine whose clocks stood still, in which *neither* mapping got as
+//! far as `smpboot`. Two facts, one behind the other, and the outer one had to
+//! go first.
 //!
 //! # Running it
 //!
-//! `#[ignore]`d, and on `RSEMU_SMP_KERNEL` rather than `RSEMU_KERNEL`, so that
-//! neither `cargo test` nor a developer following `kvm_q35_linux.rs`'s
-//! instructions can start a run that does not come back:
+//! Still `#[ignore]`d and still on `RSEMU_SMP_KERNEL` rather than
+//! `RSEMU_KERNEL`, because it wants a kernel image and `cargo test` must not
+//! start a run that depends on one:
 //!
 //! ```text
 //! RSEMU_SMP_KERNEL=/boot/vmlinuz \
-//!     cargo test --release --features accel-kvm,machine-q35-linux \
+//! RSEMU_INITRD=testdata/x86/initramfs-x86.cpio \
+//!     cargo test --release --features accel-kvm,machine-q35-linux-smp \
 //!                --test kvm_q35_linux_smp -- --ignored --nocapture
 //! ```
 //!
-//! `RSEMU_SMP_NO_WINDOW=1` puts the architectural page back the way it was —
-//! each local APIC at its own address — which is how the third and fourth rows
-//! of the table above were produced. Nothing is vendored or downloaded: the
+//! `RSEMU_SMP_NO_WINDOW=1` puts the architectural page back the way `q35-linux`
+//! has it, which is the control above. Nothing is vendored or downloaded: the
 //! kernel is the host's own, run and never read (`ROADMAP.md` §1).
 //!
-//! # What is patched into the board
+//! # And from a command line
 //!
-//! Five lines, exactly `machines/pc-at-smp.machine`'s five, plus the one thing
-//! a q35 needs and an AT does not — its ACPI MADT is told how many processors
-//! there are, because a processor is not a region and the survey cannot count
-//! them (`dev::q35::acpi`):
+//! The same board, without writing a test:
 //!
 //! ```text
-//! + object cpu1 "cpu.x86"     { … }               a second processor
-//! + object lapic1 "pc.lapic"  { … cpu = cpu1 }    its local APIC
-//! ~ object lapic0 "pc.lapic"  { … cpu = cpu0 }    and whose the first one is
-//! ~ object ioapic "pc.ioapic" { id = 2 }          out of lapic1's way
-//! ~ object acpi   "q35.acpi"  { cpus = 2, ioapic-id = 2 }
-//! ~ map mem 0xfee00000 = lapic0.window            not lapic0.regs
-//! + wire lapic1.intr -> cpu1.intr, lapic1.nmi -> cpu1.nmi
+//! rsemu run q35-linux-smp --media kernel=/boot/vmlinuz \
+//!                         --media initrd=initramfs.cpio --accel kvm
 //! ```
 //!
-//! Patched rather than shipped because `machines/q35-linux.machine` is a
-//! demonstration board and how many processors a Linux demonstration wants is a
-//! question for whoever ships it — and because a board file is a promise, which
-//! this one cannot yet keep. `pc-at-smp` is the board this change took, and
-//! `tests/pc_at_smp.rs` is its proof.
+//! `--accel kvm` is what selects the backend, and it implies
+//! [`ThreadingMode::Accel`] for the reason this file is about.
+//!
+//! # What a run under this engine is not
+//!
+//! **Reproducible**, for every reason `kvm_q35_linux.rs` gives. Two runs take
+//! different numbers of guest entries and reach `smpboot` at different virtual
+//! instants; the console is the comparison that means something, which is why
+//! it is what this file prints.
 
 #![cfg(all(
     feature = "accel-kvm",
@@ -83,103 +103,151 @@
     feature = "dev-q35",
     feature = "dev-nvme",
     feature = "dev-linuxboot",
-    feature = "machine-q35-linux",
+    feature = "machine-q35-linux-smp",
     target_os = "linux",
     target_arch = "x86_64"
 ))]
 
 mod x86boot;
 
+use std::sync::Arc;
+
 use rsemu::accel::cpu::AccelCpus;
 use rsemu::accel::kvm::Kvm;
 use rsemu::core::clock::GlobalTime;
 use rsemu::core::device::ResetKind;
 use rsemu::core::sched::ThreadingMode;
+use rsemu::host::chardev::CharPort;
+use rsemu::machine::Machine;
 use rsemu::machine::build;
 
 use x86boot::Script;
 
-/// The command line, which is `tests/kvm_q35_linux.rs`'s with nothing added:
-/// `no_timer_check` for the reason that file documents at length, and no
-/// `nosmp`, which is the point.
-const CMDLINE: &str = "console=ttyS0,115200 earlyprintk=ttyS0,115200 nokaslr no_timer_check";
+/// The command line, which is the board's own with nothing added to it — no
+/// `nosmp`, and no `no_timer_check` either. That second word is the one
+/// `kvm_q35_linux.rs` needed before virtual time advanced inside `KVM_RUN`,
+/// and this board does not need it any more than that one does.
+const CMDLINE: &str = "console=ttyS0,115200 earlyprintk=ttyS0,115200 nokaslr";
 
 /// What the guest has to print. Linux's own words, from `smp_init()`.
 const BROUGHT_UP: &str = "Brought up 1 node, 2 CPUs";
 
 /// How long to let it run, in virtual milliseconds.
+///
+/// Under [`ThreadingMode::Accel`] this is a ceiling on **wall clock too**, and
+/// it is generous on purpose: the negative control below spends ten of these
+/// seconds inside the kernel's own timeout for a secondary processor that
+/// never answers.
 const DEFAULT_MS: u64 = 60_000;
 
-/// `machines/q35-linux.machine` with a second processor and the architectural
-/// APIC page.
-fn two_processor_q35() -> String {
-    let mut text = String::from(rsemu::machine::catalog::Q35_LINUX.source);
-
-    // `engine` is a board parameter (`param engine = "interp"`), not a literal,
-    // so both processors follow whatever `-p engine=` selects. Matching the
-    // text means matching that reference — a literal `"interp"` here silently
-    // stopped matching the day the board grew the parameter.
-    const CPU0: &str = "  object cpu0 \"cpu.x86\" {\n\
-                        \x20   clock   = cpu\n\
-                        \x20   space   = mem\n\
-                        \x20   iospace = \"port\"\n\
-                        \x20   variant = \"x86-64\"\n\
-                        \x20   engine  = engine\n\
-                        \x20 }\n";
-    assert!(text.contains(CPU0), "the `cpu0` object moved");
-    // Order matters: `accel::cpu` allocates one vCPU per `cpu.x86` in
-    // declaration order, so `cpu0` stays first and stays vCPU 0.
-    text = text.replace(CPU0, &format!("{CPU0}{}", CPU0.replace("cpu0", "cpu1")));
-
-    const APICS: &str = "  object lapic0 \"pc.lapic\"  { clock = bus, id = 0, bus = \"apic\" }\n  \
-                         object ioapic \"pc.ioapic\" { id = 1, bus = \"apic\" }";
-    assert!(text.contains(APICS), "the APIC objects moved");
-    text = text.replace(
-        APICS,
-        "  object lapic0 \"pc.lapic\"  { clock = bus, id = 0, bus = \"apic\", cpu = cpu0 }\n  \
-         object lapic1 \"pc.lapic\"  { clock = bus, id = 1, bus = \"apic\", cpu = cpu1 }\n  \
-         object ioapic \"pc.ioapic\" { id = 2, bus = \"apic\" }",
-    );
-
-    // The one line the whole change is about. `RSEMU_SMP_NO_WINDOW` puts the
-    // board back the way it was — each APIC's own page at its own address — so
-    // that a failure on this board can be attributed to the window or cleared
-    // of it without editing anything.
-    const LAPIC_MAP: &str = "  map mem 0xfee00000 size 0x1000   = lapic0.regs";
-    assert!(text.contains(LAPIC_MAP), "the lapic0 mapping moved");
-    text = if std::env::var("RSEMU_SMP_NO_WINDOW").is_ok() {
-        text.replace(
-            LAPIC_MAP,
-            "  map mem 0xfee00000 size 0x1000   = lapic0.regs\n  \
-             map mem 0xfef00000 size 0x1000   = lapic1.regs",
-        )
-    } else {
-        text.replace(
-            LAPIC_MAP,
-            "  map mem 0xfee00000 size 0x1000   = lapic0.window",
-        )
-    };
-
-    // The MADT says how many processors there are, because a processor is not
-    // a region and the survey cannot count them (`dev::q35::acpi`).
-    const ACPI: &str = "    cpus       = 1\n    ioapic-id  = 1";
-    assert!(text.contains(ACPI), "the `acpi` object moved");
-    text = text.replace(ACPI, "    cpus       = 2\n    ioapic-id  = 2");
-
-    const WIRES: &str = "  wire lapic0.intr -> cpu0.intr\n  wire lapic0.nmi  -> cpu0.nmi";
-    assert!(text.contains(WIRES), "the lapic0 wires moved");
-    text = text.replace(
-        WIRES,
-        "  wire lapic0.intr -> cpu0.intr\n  \
-         wire lapic0.nmi  -> cpu0.nmi\n  \
-         wire lapic1.intr -> cpu1.intr\n  \
-         wire lapic1.nmi  -> cpu1.nmi",
-    );
-    text
+/// The board's text, as shipped, or with the architectural APIC page put back
+/// the way `q35-linux` has it.
+///
+/// `RSEMU_SMP_NO_WINDOW=1` is the negative control: two local APICs at two
+/// addresses, so `cpu1` reaching `0xfee00000` reaches `lapic0`. Everything
+/// else is identical, which is what makes the difference attributable.
+fn board_text() -> String {
+    let text = String::from(rsemu::machine::catalog::Q35_LINUX_SMP.source);
+    if std::env::var("RSEMU_SMP_NO_WINDOW").is_err() {
+        return text;
+    }
+    const WINDOW: &str = "  map mem 0xfee00000 size 0x1000   = lapic0.window";
+    assert!(text.contains(WINDOW), "the lapic0 mapping moved");
+    text.replace(
+        WINDOW,
+        "  map mem 0xfee00000 size 0x1000   = lapic0.regs\n  \
+         map mem 0xfef00000 size 0x1000   = lapic1.regs",
+    )
 }
 
-/// The board patch itself is asserted even without a kernel: five anchors in
-/// `machines/q35-linux.machine`, and a two-processor board that realizes.
+/// A built board, its accelerator, and the console the 16550 opened.
+type Built = (Machine, Arc<AccelCpus>, Arc<CharPort>);
+
+/// Build the board with `mode`, and with the two `cpu.x86` objects it declares
+/// running on the host's own silicon.
+fn built(
+    mode: ThreadingMode,
+    kernel: Vec<u8>,
+    initrd: Vec<u8>,
+    params: &[(&str, String)],
+) -> Result<Built, String> {
+    let accel = AccelCpus::open(mode).map_err(|e| format!("{e}"))?;
+    let mut options = rsemu::machine::catalog::build_options().expect("this build's classes");
+    // It must match what `AccelCpus::open` was given: that call is what decides
+    // this engine's slice length and its preemption interval, and it has
+    // already refused a mode claiming reproducibility.
+    options.realize.scheduler.mode = mode;
+    accel.install(&mut options.bindings);
+    options = options.with_param("disk", "16777216");
+    for (name, value) in params {
+        options = options.with_param(*name, value.as_str());
+    }
+    options.realize.media.insert("kernel", kernel);
+    options.realize.media.insert("initrd", initrd);
+    options.realize.media.insert("nvme0", Vec::new());
+    let registry = rsemu::machine::catalog::registry().expect("this build's registry");
+    let mut m = build("q35-linux-smp.machine", &board_text(), &registry, &options)
+        .map_err(|e| format!("{e}"))?;
+    // Deliberately **not** `set_host_clock`. `ThreadingMode::Accel` has no
+    // other source of elapsed time, and `machine::realize` now installs the
+    // host's monotonic clock when the mode asks for one — so a front end that
+    // selects acceleration is not also required to know that rule. A round
+    // that failed with `SchedError::NoHostClock` would end this run on its
+    // first call to `run_for`, which is what makes this an assertion rather
+    // than an omission.
+    m.reset(ResetKind::Cold);
+    m.sweep();
+    let console = rsemu::host::chardev::ports::open(&options.realize.hosts, "console")
+        .expect("the 16550 opened the board's console port");
+    Ok((m, accel, console))
+}
+
+/// The shipped board is `q35-linux` plus exactly the six things it claims.
+///
+/// Cheap, hermetic, and the thing that catches an edit to one of the two files
+/// that was not made to the other: they are meant to be read side by side, and
+/// a diff nobody can see is how they stop being comparable.
+#[test]
+fn the_shipped_board_differs_from_q35_linux_in_the_six_stated_ways() {
+    let smp = rsemu::machine::catalog::Q35_LINUX_SMP.source;
+    #[cfg(feature = "machine-q35-linux")]
+    {
+        let one = rsemu::machine::catalog::Q35_LINUX.source;
+        assert!(
+            one.contains("size 0x1000   = lapic0.regs"),
+            "the one-processor mapping"
+        );
+        assert!(!one.contains("cpu1"), "q35-linux grew a second processor");
+    }
+    for expected in [
+        // a second processor, and its local APIC naming it
+        "object cpu1 \"cpu.x86\"",
+        "object lapic1 \"pc.lapic\"",
+        "cpu = cpu0",
+        "cpu = cpu1",
+        // the I/O APIC out of lapic1's id, and the MADT told both numbers
+        "object ioapic \"pc.ioapic\" { id = 2",
+        "cpus       = 2",
+        "ioapic-id  = 2",
+        // the one mapping the whole board is about
+        "size 0x1000   = lapic0.window",
+        // and the second processor's two pins
+        "wire lapic1.intr -> cpu1.intr",
+        "wire lapic1.nmi  -> cpu1.nmi",
+    ] {
+        assert!(smp.contains(expected), "the board is missing `{expected}`");
+    }
+    // The *mapping*, not the word: the comment above it argues at length
+    // about what `= lapic0.regs` would do, and that paragraph is the point of
+    // the line rather than a thing to grep away.
+    assert!(
+        !smp.contains("size 0x1000   = lapic0.regs"),
+        "the architectural page still decodes to one APIC for everybody"
+    );
+}
+
+/// The board realizes with two accelerated processors, and the application
+/// processor has not run.
 ///
 /// This runs in an ordinary `cargo test`; the boot below does not.
 #[test]
@@ -188,40 +256,26 @@ fn the_two_processor_q35_realizes() {
         println!("q35-linux-smp: no usable /dev/kvm on this host; skipping");
         return;
     }
-    let accel = match AccelCpus::open(ThreadingMode::Parallel) {
-        Ok(accel) => accel,
-        Err(e) if e.is_unavailable() => return,
-        Err(e) => panic!("/dev/kvm is present but unusable: {e}"),
+    let (mut m, accel, _console) = match built(ThreadingMode::Accel, Vec::new(), Vec::new(), &[]) {
+        Ok(built) => built,
+        Err(e) => panic!("the two-processor q35 does not realize: {e}"),
     };
-    let mut options = rsemu::machine::catalog::build_options().expect("this build's classes");
-    options.realize.scheduler.mode = ThreadingMode::Parallel;
-    accel.install(&mut options.bindings);
-    options = options.with_param("disk", "16777216");
-    options.realize.media.insert("kernel", Vec::new());
-    options.realize.media.insert("initrd", Vec::new());
-    options.realize.media.insert("nvme0", Vec::new());
-    let text = two_processor_q35();
-    let registry = rsemu::machine::catalog::registry().expect("this build's registry");
-    let mut m = build("q35-linux-smp.machine", &text, &registry, &options)
-        .unwrap_or_else(|e| panic!("the two-processor q35 does not realize: {e}"));
-    m.reset(ResetKind::Cold);
-    m.sweep();
     assert_eq!(accel.cpus().len(), 2, "the board declares two processors");
     assert_eq!(
         accel.cpus()[1].entries(),
         0,
         "the application processor ran before anything started it"
     );
+    // One round, which is what proves the host clock the mode needs was
+    // installed by the build rather than by this test.
+    m.run_for(GlobalTime::from_nanos(1_000_000))
+        .expect("an accelerated machine runs without being handed a host clock");
 }
 
-/// The boot. See the module documentation: this **does not currently reach**
-/// `smp: Brought up 1 node, 2 CPUs`, and the control in `two_processor_q35`
-/// shows it does not reach it either way the local APIC page is mapped.
-///
-/// Kept and committed because a reproduction that says exactly what it measured
-/// is worth more than a paragraph saying it was tried.
+/// The boot: a stock Linux kernel brings up the second processor on host
+/// silicon, on the board's own command line.
 #[test]
-#[ignore = "does not yet reach SMP bring-up; see the module docs, and pass --ignored to run it"]
+#[ignore = "needs a Linux/x86 bzImage in RSEMU_SMP_KERNEL; pass --ignored to run it"]
 fn a_linux_kernel_brings_up_a_second_processor_on_host_silicon() {
     if !Kvm::is_available() {
         println!("q35-linux-smp/kvm: no usable /dev/kvm on this host; skipping");
@@ -229,7 +283,7 @@ fn a_linux_kernel_brings_up_a_second_processor_on_host_silicon() {
     }
     let Ok(path) = std::env::var("RSEMU_SMP_KERNEL") else {
         println!(
-            "q35-linux-smp/kvm: set RSEMU_SMP_KERNEL to a Linux/x86 bzImage to try two \
+            "q35-linux-smp/kvm: set RSEMU_SMP_KERNEL to a Linux/x86 bzImage to bring up two \
              processors on host silicon; see the module docs"
         );
         return;
@@ -240,30 +294,17 @@ fn a_linux_kernel_brings_up_a_second_processor_on_host_silicon() {
         .map(|p| std::fs::read(&p).unwrap_or_else(|e| panic!("{p}: {e}")))
         .unwrap_or_default();
 
-    let accel = match AccelCpus::open(ThreadingMode::Parallel) {
-        Ok(accel) => accel,
-        Err(e) if e.is_unavailable() => return,
-        Err(e) => panic!("/dev/kvm is present but unusable: {e}"),
-    };
-    let mut options = rsemu::machine::catalog::build_options().expect("this build's classes");
-    options.realize.scheduler.mode = ThreadingMode::Parallel;
-    accel.install(&mut options.bindings);
     let cmdline = std::env::var("RSEMU_KERNEL_CMDLINE").unwrap_or_else(|_| CMDLINE.to_string());
-    options = options.with_param("cmdline", cmdline.as_str());
-    options = options.with_param("disk", "16777216");
-    options.realize.media.insert("kernel", kernel);
-    options.realize.media.insert("initrd", initrd);
-    options.realize.media.insert("nvme0", Vec::new());
-
-    let text = two_processor_q35();
-    let registry = rsemu::machine::catalog::registry().expect("this build's registry");
-    let mut m = build("q35-linux-smp.machine", &text, &registry, &options)
-        .unwrap_or_else(|e| panic!("the two-processor q35 does not realize: {e}"));
-    m.reset(ResetKind::Cold);
-    m.sweep();
-    let console = rsemu::host::chardev::ports::open(&options.realize.hosts, "console")
-        .expect("the 16550 opened the board's console port");
-
+    println!("q35-linux-smp/kvm: command line {cmdline:?}");
+    let params = [("cmdline", cmdline)];
+    let (mut m, accel, console) = match built(ThreadingMode::Accel, kernel, initrd, &params) {
+        Ok(built) => built,
+        Err(e) if e.contains("/dev/kvm") => {
+            println!("q35-linux-smp/kvm: {e}; skipping");
+            return;
+        }
+        Err(e) => panic!("the two-processor q35 does not realize: {e}"),
+    };
     let cpus = accel.cpus();
     assert_eq!(cpus.len(), 2, "the board declares two processors");
 
@@ -308,6 +349,21 @@ fn a_linux_kernel_brings_up_a_second_processor_on_host_silicon() {
         cpus[1].failure()
     );
     assert!(run.long, "the kernel never reached long mode");
+    // The negative control's own assertion, so that a run with
+    // `RSEMU_SMP_NO_WINDOW=1` fails with what it *did* print rather than with
+    // the absence of what it did not.
+    if std::env::var("RSEMU_SMP_NO_WINDOW").is_ok() {
+        assert!(
+            run.text.contains("failed to report alive state"),
+            "without the window the application processor is expected to go unheard from, and \
+             this run said something else"
+        );
+        println!(
+            "q35-linux-smp/kvm: the control ran; without `lapic0.window` the kernel gave up on \
+             the second processor, which is the whole argument for the window"
+        );
+        return;
+    }
     assert!(
         run.text.contains(BROUGHT_UP),
         "the kernel did not bring up the second processor"
