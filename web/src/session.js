@@ -75,6 +75,10 @@ export class Session {
     this.paused = true;
     this.held = 0;
     this.consoleFocused = false;
+    /** Whether the picture has focus, which is what lets keys reach a PC. */
+    this.screenFocused = false;
+    /** Keysyms currently down, so losing focus can release every one. */
+    this.keysDown = new Set();
     this.consoleText = "";
 
     // Loop bookkeeping. All plain numbers, none of it reactive.
@@ -149,6 +153,7 @@ export class Session {
     this.consoleText = "";
     this.hooks.console("");
     this.held = 0;
+    this.keysDown.clear();
     this.hooks.buttons(0);
 
     if (this.canvas) {
@@ -170,6 +175,22 @@ export class Session {
     this.start();
   }
 
+  /**
+   * Put an image in a media slot for the *next* boot, alongside whatever that
+   * boot binds itself.
+   *
+   * This is what lets `pc-at` come up on the BIOS the module carries with a
+   * diskette the visitor opened in the drive — two slots, one boot.
+   */
+  stageMedia(entry, slot, image) {
+    this.emu.stageMedia(entry.index, slot.index, image);
+  }
+
+  /** Forget every staged image. The page does this when the machine changes. */
+  clearMedia() {
+    if (this.emu) this.emu.clearMedia();
+  }
+
   shutdown() {
     this.stop();
     this.speaker.silence();
@@ -177,6 +198,8 @@ export class Session {
     this.machine = null;
     this.builtin = null;
     this.paused = true;
+    this.keysDown.clear();
+    this.screenFocused = false;
     this.consoleText = "";
     this.hooks.console("");
     this.pushStats();
@@ -198,6 +221,18 @@ export class Session {
 
   get hasPad() {
     return Boolean(this.emu && this.emu.hasPad);
+  }
+
+  /**
+   * Whether this machine takes *keys* rather than characters.
+   *
+   * A PC does and a monitor does not: `pc.kbc`'s port carries set-2 scan
+   * codes. No machine in this build answers yes to both, so the page shows a
+   * terminal pane for a console and a focusable picture for a keyboard — but
+   * they are two questions and nothing forbids a board answering both.
+   */
+  get hasKeyboard() {
+    return Boolean(this.emu && this.emu.hasKeyboard);
   }
 
   /** The picture's shape right now, or zeros when there is no picture. */
@@ -446,7 +481,10 @@ export class Session {
    * canvas has focus is a d-pad that appears broken. Form controls keep their
    * keys — you must still be able to tab to the machine picker and use it —
    * and the console only takes characters while its own pane has focus, so
-   * typing at an Apple 1 never fights the rest of the page.
+   * typing at an Apple 1 never fights the rest of the page. A PC's keyboard
+   * follows the console's rule rather than the pad's, and for a stronger
+   * reason: it wants Tab and the arrow keys, which are how the rest of this
+   * page is navigated, so it only gets them while the *picture* has focus.
    */
   listen() {
     this.onKeyDown = (event) => this.key(event, true);
@@ -478,6 +516,22 @@ export class Session {
       }
     }
 
+    // A PC takes *keys*, and only while the picture has focus — the guest
+    // wants Tab and the arrows, and a page that took them globally could not
+    // be navigated. Both directions cross, because make and break codes are
+    // what the wire carries: `hasKeyboard` is exactly the machines for which
+    // that is true, and it is never true at the same time as `hasConsole`.
+    if (this.hasKeyboard && this.screenFocused && !isFormControl(event.target)) {
+      const sym = Rsemu.keysym(event.key);
+      if (sym !== 0) {
+        if (down) this.keysDown.add(sym);
+        else this.keysDown.delete(sym);
+        this.emu.key(sym, down);
+        event.preventDefault();
+      }
+      return;
+    }
+
     if (!down || !this.hasConsole || !this.consoleFocused) return;
 
     // A console machine gets characters, not scancodes. The device does the
@@ -503,9 +557,13 @@ export class Session {
     this.hooks.buttons(this.held);
   }
 
-  /** Losing focus must never leave a button stuck down. */
+  /** Losing focus must never leave a button — or a key — stuck down. */
   releaseAll() {
     this.held = 0;
+    // Nothing on the module's side can know the window went away, and a key
+    // left down is a key genuinely held: the guest will repeat it forever.
+    for (const sym of this.keysDown) this.emu?.key(sym, false);
+    this.keysDown.clear();
     if (this.emu) this.emu.setButtons(0, 0);
     this.hooks.buttons(0);
   }

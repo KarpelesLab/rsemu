@@ -39,7 +39,11 @@
 //!    too**, per machine ([`rsemu_machine_builtin_count`],
 //!    [`rsemu_machine_builtin_name`]), which is how the browser gets what
 //!    `rsemu run beneater-6502 --monitor wozmon` gets on a command line the
-//!    page does not have.
+//!    page does not have. **Media slots are named by index too**
+//!    ([`rsemu_machine_media_count`], [`rsemu_machine_media_name`]), which is
+//!    what lets [`rsemu_stage_media`] fill a second bay — a diskette in a PC
+//!    that is already booting rsemu's own BIOS — without a slot name crossing
+//!    in.
 //! 3. **One machine at a time**, in a module-wide slot. The browser runs one
 //!    console in one tab; a second instance is a second module.
 //!
@@ -53,6 +57,18 @@
 //! ([`rsemu_frame_ptr`]) and the sound ([`rsemu_audio_ptr`]). Both are still
 //! rsemu's own memory — rule 1 holds — and both are read at an address the
 //! module hands out, never one JavaScript made.
+//!
+//! # Two ways in for a person's hands
+//!
+//! [`rsemu_console_write`] delivers **characters** to whatever character port
+//! the machine opened; [`rsemu_key`] delivers **key transitions** to the AT
+//! keyboard `pc.kbc` opens, which carries set-2 scan codes rather than text.
+//! No machine in this build has both — an Apple 1's port is characters, a
+//! PC/AT's is a keyboard — but nothing forbids one, and a PC with a serial
+//! console would. So they are two questions ([`rsemu_has_console`],
+//! [`rsemu_has_keyboard`]) and a page should ask both rather than inferring one
+//! from the other: a terminal pane in front of a keyboard would show an empty
+//! screen and send `0x41` for `A` meaning the `9` key.
 //!
 //! # What runs where
 //!
@@ -181,6 +197,12 @@ struct State {
     scanout: Option<alloc::boxed::Box<dyn crate::host::display::Scanout>>,
     /// The character port the machine opened, if it opened one.
     console: Option<alloc::sync::Arc<crate::host::chardev::CharPort>>,
+    /// The AT keyboard `pc.kbc` opened, if this machine has one.
+    ///
+    /// Not the console and never confused with it: the far end of this port
+    /// carries set-2 scan codes, so what crosses it is a *key transition*
+    /// rather than a character. [`rsemu_key`] is how a page presses one.
+    keyboard: Option<crate::host::input::KeyboardSink>,
     /// The host objects the live machine was built against: its character
     /// ports, its pads, and the capture tables the interceptions filled in.
     ///
@@ -201,6 +223,15 @@ struct State {
     audio_rate: u32,
     /// Bytes JavaScript hands in: ROM images, typed characters, save states.
     input: Vec<u8>,
+    /// Media slots staged for the next boot, in the order they were staged.
+    ///
+    /// The uploaded image [`rsemu_boot`] binds goes into one slot, and a board
+    /// with a built-in firmware has no other way to be handed a *disk*. This is
+    /// the second bay: [`rsemu_stage_media`] fills it by slot index, and the
+    /// next boot binds every entry alongside whatever the boot itself chose.
+    /// Slot names are resolved when a slot is staged, so nothing here is an
+    /// index into a machine that is no longer the one being booted.
+    staged: Vec<(&'static str, Vec<u8>)>,
     /// Bytes JavaScript reads back: console output, save states, messages.
     output: Vec<u8>,
     /// Why the last call that returned `0` did.
@@ -218,12 +249,14 @@ impl State {
             frame: crate::host::display::Surface::empty(),
             scanout: None,
             console: None,
+            keyboard: None,
             hosts: None,
             #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
             pad: None,
             audio: None,
             audio_rate: DEFAULT_AUDIO_RATE,
             input: Vec::new(),
+            staged: Vec::new(),
             output: Vec::new(),
             error: String::new(),
             buttons: [0; 2],
@@ -368,6 +401,77 @@ pub extern "C" fn rsemu_machine_media(index: u32) -> usize {
         }
         state.output.len()
     })
+}
+
+/// How many media slots machine `index` declares.
+///
+/// [`rsemu_machine_media`] answers the *first* of them, which is the one a page
+/// fills to boot a cartridge. This is the whole list, because a PC has five —
+/// `bios`, `vgabios`, `floppy`, `hd0`, `hd1` — and a page that can only reach
+/// the first can hand it a firmware or a disk but never both.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_machine_media_count(index: u32) -> u32 {
+    catalog_entry(index).map_or(0, |e| e.media.len() as u32)
+}
+
+/// Copy the name of machine `index`'s media slot `slot` into the output buffer,
+/// returning its length. `0` for a slot this machine does not have.
+///
+/// The same names `rsemu run … --media floppy=disk.img` takes, so a browser
+/// session and a command line are describable in the same words.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_machine_media_name(index: u32, slot: u32) -> usize {
+    with_state(|state| {
+        state.output.clear();
+        if let Some(name) = catalog_entry(index).and_then(|e| e.media.get(slot as usize)) {
+            state.output.extend_from_slice(name.as_bytes());
+        }
+        state.output.len()
+    })
+}
+
+/// Stage the first `len` bytes of the input buffer into machine `index`'s media
+/// slot `slot`, for the next boot. Returns `1`, or `0` with [`rsemu_error`].
+///
+/// This is the second bay, and it is what [`rsemu_boot`] on its own cannot be:
+/// that call binds one uploaded image to one slot, so a board whose firmware
+/// this module *carries* had no way to also be handed a disk. Stage a floppy
+/// here and then [`rsemu_boot_builtin`] the PC's BIOS, and the machine comes up
+/// on rsemu's own firmware with the visitor's diskette in the drive.
+///
+/// Rule 2 of the ABI still holds — no string crosses in. The slot is an index
+/// into [`rsemu_machine_media_count`], and its *name* is resolved here, so a
+/// staged image belongs to a named slot from this moment rather than to a
+/// position in whatever machine is booted later. A staged slot the machine
+/// being booted does not have is refused at boot rather than ignored.
+///
+/// Staging survives a boot, so `Reboot` reboots the same media. Drop it with
+/// [`rsemu_clear_media`], which is also what a page does when it changes
+/// machines.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_stage_media(index: u32, slot: u32, len: usize) -> u32 {
+    with_state(|state| {
+        let Some(name) = catalog_entry(index)
+            .and_then(|e| e.media.get(slot as usize))
+            .copied()
+        else {
+            return fail(state, "no media slot with that index on that machine");
+        };
+        let bytes = state.input.get(..len).unwrap_or(&[]).to_vec();
+        // Staging the same slot twice replaces it: a page that lets someone
+        // change their mind about which floppy is in the drive should not have
+        // to say so in a second call.
+        state.staged.retain(|(s, _)| *s != name);
+        state.staged.push((name, bytes));
+        state.error.clear();
+        1
+    })
+}
+
+/// Forget everything [`rsemu_stage_media`] staged.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_clear_media() {
+    with_state(|state| state.staged.clear());
 }
 
 /// How many built-in images machine `index` carries.
@@ -621,6 +725,7 @@ fn boot_with(index: u32, media: Media) -> u32 {
         state.machine = None;
         state.scanout = None;
         state.console = None;
+        state.keyboard = None;
         state.shown = u64::MAX;
         state.audio = None;
         state.hosts = None;
@@ -653,6 +758,23 @@ fn boot_with(index: u32, media: Media) -> u32 {
                 .map(|i| (i.slot(), i.bytes(entry))),
         };
 
+        // The second bay and every one after it, taken out of the module state
+        // so that a rejection below can still write an error message into it.
+        // A staged slot this machine does not declare is a page bug rather than
+        // something to bind silently, and one that collides with the image this
+        // boot already chose is ambiguous — either would end as a diskette
+        // quietly not in the drive, which is the failure this call exists to
+        // remove.
+        let staged = state.staged.clone();
+        for (slot, _) in &staged {
+            if !entry.media.contains(slot) {
+                return fail(state, "a staged media slot is not on this machine");
+            }
+            if binding.as_ref().is_some_and(|(s, _)| s == slot) {
+                return fail(state, "a staged media slot is the one this boot binds");
+            }
+        }
+
         let registry = match crate::machine::catalog::registry() {
             Ok(r) => r,
             Err(e) => return fail(state, e),
@@ -664,6 +786,9 @@ fn boot_with(index: u32, media: Media) -> u32 {
         if let Some((slot, bytes)) = &binding {
             options.realize.media.insert(*slot, bytes.as_ref());
         }
+        for (slot, bytes) in &staged {
+            options.realize.media.insert(*slot, bytes.as_slice());
+        }
         // An unbound slot is an error by design (`machine::realize`), so the
         // empty bays have to be bound as empty. Same list and same argument as
         // the CLI's: a PC with no diskette, no option ROM in the video socket
@@ -672,7 +797,10 @@ fn boot_with(index: u32, media: Media) -> u32 {
         // owned. Only slots this machine actually declares, and never the one
         // the image above went into.
         for slot in EMPTY_BAYS {
-            if entry.media.contains(slot) && binding.as_ref().is_none_or(|(s, _)| s != slot) {
+            if entry.media.contains(slot)
+                && binding.as_ref().is_none_or(|(s, _)| s != slot)
+                && !staged.iter().any(|(s, _)| s == slot)
+            {
                 options.realize.media.insert(*slot, &[][..]);
             }
         }
@@ -824,6 +952,17 @@ fn boot_with(index: u32, media: Media) -> u32 {
             state.console = Some(port);
         }
 
+        // And that same excluded port is the *keyboard*, which is a different
+        // seam rather than a worse console. `host::input::KeyboardSink` turns
+        // an X11 keysym into the set-2 make and break codes an AT keyboard
+        // would have put on the wire, which is exactly what the 8042 on the
+        // other end is expecting — the identical path the VNC front end uses,
+        // so a browser and a VNC client type at a PC the same way.
+        state.keyboard = crate::host::chardev::ports::get(&hosts, KEYBOARD_PORT)
+            .ok()
+            .flatten()
+            .map(crate::host::input::KeyboardSink::new);
+
         // And whatever pad port its controllers read is where buttons go. The
         // same name-based seam as the console, for the same reason: a machine
         // file can hand a device a name and nothing else. Which console's pad
@@ -848,6 +987,7 @@ pub extern "C" fn rsemu_shutdown() {
         state.machine = None;
         state.scanout = None;
         state.console = None;
+        state.keyboard = None;
         state.audio = None;
         state.hosts = None;
         #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
@@ -1239,6 +1379,64 @@ pub extern "C" fn rsemu_console_read() -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn rsemu_has_console() -> u32 {
     with_state(|state| u32::from(state.console.is_some()))
+}
+
+/// Press or release one key on the machine's AT keyboard, naming it by **X11
+/// keysym** the way RFB does. Returns `1` if this keyboard has that key.
+///
+/// The other half of [`rsemu_console_write`], and deliberately not the same
+/// call: a console takes *characters* and an AT keyboard takes *transitions*,
+/// because the make and break codes are what the hardware puts on the wire and
+/// a guest that watches for a key coming up can tell the difference (`ROADMAP.md`
+/// §8). So a page sends `down`, then `up`, and the 8042 sees what a person's
+/// hands would have produced.
+///
+/// Printable ASCII keysyms **are** their own character codes, so `A` is `0x41`
+/// and a page needs no table for the letters; the named keys are X11's
+/// (`Return` `0xff0d`, `BackSpace` `0xff08`, `Escape` `0xff1b`, the arrows
+/// `0xff51`-`0xff54`, `F1` `0xffbe`). A key this keyboard does not have puts
+/// **no bytes at all** on the wire and answers `0` — a guest handed a scan code
+/// for a key nobody pressed is worse off than one handed nothing.
+///
+/// Shift is synthesised for a character that needs it when the page has not
+/// said a shift key is down, exactly as it is for a VNC client, so a page may
+/// send `!` without sending `Shift_L` first.
+///
+/// A page that stops receiving key events — a window losing focus — must send
+/// the `up` for whatever it last sent down. Nothing here can know, and a stuck
+/// key is a real key stuck.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_key(keysym: u32, down: u32) -> u32 {
+    with_state(|state| {
+        let Some(keyboard) = state.keyboard.as_ref() else {
+            return 0;
+        };
+        // `set2` is the same table the sink consults, asked here so the answer
+        // distinguishes "this keyboard has no such key" from "there is no
+        // keyboard" — the page shows the two differently.
+        let sym = crate::host::input::Keysym(keysym);
+        if crate::host::input::set2(sym).is_none() {
+            return 0;
+        }
+        crate::host::input::InputSink::deliver(
+            keyboard,
+            crate::host::input::InputEvent::Key {
+                keysym: sym,
+                down: down != 0,
+            },
+        );
+        1
+    })
+}
+
+/// Whether this machine has a keyboard [`rsemu_key`] can press.
+///
+/// Distinct from [`rsemu_has_console`], and on a PC the two are opposites: the
+/// PC/AT has a keyboard and no console, and an Apple 1 has a console and no
+/// keyboard, because on the Apple 1 the port carries characters.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsemu_has_keyboard() -> u32 {
+    with_state(|state| u32::from(state.keyboard.is_some()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1641,6 +1839,196 @@ mod tests {
         assert_eq!(cell(1, 1), cell(2, 1), "the two o's of Booting. differ");
         assert_eq!(cell(1, 2), cell(1, 1), "the o of No is not that o");
         assert_ne!(cell(0, 2), cell(0, 1), "N and B are the same glyph");
+        rsemu_shutdown();
+    }
+
+    /// The index of `machine`'s media slot called `name`.
+    ///
+    /// Only the staging tests name a slot, and `--no-default-features
+    /// --features wasm` compiles this module with an empty catalog, so this is
+    /// dead code in a build without the PC.
+    #[cfg(all(feature = "machine-pc-at", feature = "fw-pcbios"))]
+    fn machine_media_index(machine: u32, name: &str) -> u32 {
+        (0..rsemu_machine_media_count(machine))
+            .find(|s| {
+                rsemu_machine_media_name(machine, *s);
+                out() == name
+            })
+            .unwrap_or_else(|| panic!("this machine has no `{name}` slot"))
+    }
+
+    /// One 9x16 VGA text cell's ink, as a bit string.
+    ///
+    /// Glyph *identity* rather than a font table: two cells that carry the same
+    /// letter have the same bits, and a test pattern has no such pairs. The
+    /// same trick `web/check.mjs` plays on the picture from the other side of
+    /// the ABI.
+    #[cfg(all(feature = "machine-pc-at", feature = "fw-pcbios"))]
+    fn text_cell(cx: usize, cy: usize) -> String {
+        with_state(|state| {
+            let px = state.frame.pixels();
+            let w = state.frame.width() as usize;
+            let mut bits = String::new();
+            for y in 0..16 {
+                for x in 0..9 {
+                    let i = ((cy * 16 + y) * w + cx * 9 + x) * 4;
+                    let lit = px[i] | px[i + 1] | px[i + 2] != 0;
+                    bits.push(if lit { '1' } else { '0' });
+                }
+            }
+            bits
+        })
+    }
+
+    /// A 1.44 MB diskette whose boot sector prints one `B` and stops.
+    ///
+    /// Hand-encoded rather than assembled, because `src/fw/asm16` is the
+    /// *firmware's* assembler and this is the guest — a fixture built with the
+    /// code under test would agree with itself. Nine bytes of real mode: an
+    /// `INT 10h` teletype call, a halt, and a jump to itself. `B` because the
+    /// assertion below is glyph identity against the `B` the BIOS printed on
+    /// the line above, and no font table is consulted at either end.
+    #[cfg(all(feature = "machine-pc-at", feature = "fw-pcbios"))]
+    fn bootable_diskette() -> Vec<u8> {
+        let mut image = alloc::vec![0u8; 1_474_560];
+        image[..11].copy_from_slice(&[
+            0xb4, 0x0e, // mov ah, 0x0e   -- teletype output
+            0xb0, 0x42, // mov al, 'B'
+            0xb7, 0x00, // mov bh, 0      -- page zero
+            0xcd, 0x10, // int 0x10
+            0xf4, // hlt
+            0xeb, 0xfe, // jmp $
+        ]);
+        image[510..512].copy_from_slice(&[0x55, 0xaa]);
+        image
+    }
+
+    /// The second bay: rsemu's own BIOS **and** a diskette the visitor brought,
+    /// bound to two slots by one boot.
+    ///
+    /// This is the whole point of [`rsemu_stage_media`]. [`rsemu_boot`] binds
+    /// one image to one slot, so before this existed a page could hand `pc-at`
+    /// either a firmware or a disk and never both — and since the firmware is
+    /// the one rsemu ships, "both" is the only interesting case.
+    ///
+    /// The assertion is the *negative* of the last one in
+    /// [`a_pc_at_posts_on_its_own_bios_through_the_abi`]. That test asserts the
+    /// third line's first glyph is not the `B` of `Booting.`, because with
+    /// every drive empty the BIOS prints `No bootable device.` there. Here it
+    /// is that `B`, because `INT 19h` found a `0x55 0xAA` on the diskette,
+    /// loaded the sector at `0000:7c00`, jumped to it, and the sector's own
+    /// `INT 10h` printed one.
+    #[cfg(all(feature = "machine-pc-at", feature = "fw-pcbios"))]
+    #[test]
+    fn a_staged_diskette_boots_under_the_bios_this_module_carries() {
+        let _one = ONE_MACHINE.lock();
+        let machine = machine_index("pc-at");
+        let floppy = machine_media_index(machine, "floppy");
+
+        let image = bootable_diskette();
+        rsemu_input_reserve(image.len());
+        with_state(|state| state.input.copy_from_slice(&image));
+        assert_eq!(rsemu_stage_media(machine, floppy, image.len()), 1, "{}", {
+            rsemu_error();
+            out()
+        });
+
+        // The BIOS still comes from the module, in its own slot, with nothing
+        // uploaded for it — `rsemu_boot_builtin`'s contract, unchanged.
+        assert_eq!(rsemu_boot_builtin(machine, 0), 1, "{}", {
+            rsemu_error();
+            out()
+        });
+        for _ in 0..240 {
+            rsemu_run_frame();
+        }
+        assert_eq!(
+            text_cell(0, 2),
+            text_cell(0, 1),
+            "the third line does not start with the B of Booting. — the \
+             diskette was not booted"
+        );
+        rsemu_clear_media();
+        rsemu_shutdown();
+    }
+
+    /// A staged slot is checked against the machine that is actually booting.
+    ///
+    /// Ignoring one silently would be exactly the failure this call exists to
+    /// remove: a page that staged a diskette and got a machine with no drive
+    /// would see a correct-looking boot and an empty one.
+    #[cfg(all(feature = "machine-pc-at", feature = "fw-pcbios"))]
+    #[test]
+    fn a_staged_slot_that_does_not_fit_the_boot_is_refused() {
+        let _one = ONE_MACHINE.lock();
+        let machine = machine_index("pc-at");
+
+        // A slot index this machine has not got.
+        assert_eq!(rsemu_stage_media(machine, 99, 0), 0);
+        assert!(rsemu_error() > 0);
+
+        // And the slot the boot is about to bind itself: either image would end
+        // as a drive quietly not holding what the page put in it.
+        let bios = machine_media_index(machine, "bios");
+        rsemu_input_reserve(4);
+        assert_eq!(rsemu_stage_media(machine, bios, 4), 1);
+        assert_eq!(rsemu_boot_builtin(machine, 0), 0);
+        assert!(rsemu_error() > 0);
+
+        rsemu_clear_media();
+        assert_eq!(rsemu_boot_builtin(machine, 0), 1, "{}", {
+            rsemu_error();
+            out()
+        });
+        rsemu_shutdown();
+    }
+
+    /// A PC takes keys; a monitor takes characters. They are not one seam.
+    ///
+    /// `pc.kbc`'s port carries set-2 scan codes, so [`rsemu_key`] reaches it and
+    /// [`rsemu_console_write`] has nowhere to go — which is why this board
+    /// answers `0` to [`rsemu_has_console`] and `1` to [`rsemu_has_keyboard`],
+    /// and why the page shows a picture rather than a terminal pane.
+    #[cfg(all(feature = "machine-pc-at", feature = "fw-pcbios"))]
+    #[test]
+    fn a_pc_takes_keys_rather_than_characters() {
+        let _one = ONE_MACHINE.lock();
+        let machine = machine_index("pc-at");
+        assert_eq!(rsemu_boot_builtin(machine, 0), 1);
+        assert_eq!(rsemu_has_keyboard(), 1);
+        assert_eq!(rsemu_has_console(), 0, "a scan-code port is not a console");
+
+        // A key this keyboard has, and one it has not. The second puts no bytes
+        // on the wire at all rather than guessing at a scan code.
+        assert_eq!(rsemu_key(u32::from(b'a'), 1), 1);
+        assert_eq!(rsemu_key(u32::from(b'a'), 0), 1);
+        assert_eq!(rsemu_key(0xdead_beef, 1), 0);
+
+        // And those transitions really crossed into the machine: the same run
+        // with nothing typed at it reaches a different state.
+        for _ in 0..8 {
+            rsemu_run_frame();
+        }
+        let typed = rsemu_state_hash();
+
+        assert_eq!(rsemu_boot_builtin(machine, 0), 1);
+        for _ in 0..8 {
+            rsemu_run_frame();
+        }
+        assert_ne!(typed, rsemu_state_hash(), "the key press changed nothing");
+        rsemu_shutdown();
+    }
+
+    /// A machine with no keyboard says so rather than accepting a key.
+    #[cfg(feature = "machine-beneater")]
+    #[test]
+    fn a_board_with_a_character_console_has_no_keyboard() {
+        let _one = ONE_MACHINE.lock();
+        let machine = machine_index("beneater-6502");
+        assert_eq!(rsemu_boot_builtin(machine, 0), 1);
+        assert_eq!(rsemu_has_console(), 1);
+        assert_eq!(rsemu_has_keyboard(), 0);
+        assert_eq!(rsemu_key(u32::from(b'a'), 1), 0);
         rsemu_shutdown();
     }
 

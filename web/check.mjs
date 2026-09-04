@@ -518,6 +518,97 @@ if (pcat && pcbios) {
   emu.shutdown();
 }
 
+// ---------------------------------------------------------------------------
+// 2f. The second bay, and the keyboard
+// ---------------------------------------------------------------------------
+//
+// `rsemu_boot` binds one uploaded image to one slot, so until `rsemu_stage_media`
+// existed a PC could be handed rsemu's own BIOS *or* a diskette and never both
+// — which is the only interesting case, since the BIOS is the one the module
+// carries. This is that path end to end: a diskette staged into the `floppy`
+// slot, the firmware bound from the module, and the guest's own boot sector
+// running.
+//
+// The assertion is the *negative* of the POST screen's last one above. With
+// every drive empty the third line is "No bootable device.", so `cell(0, 2)`
+// is an N. With a bootable diskette in the drive the BIOS jumps to `0000:7c00`
+// and the sector's own `INT 10h` prints a `B` there — the same glyph as the
+// `B` of "Booting." on the line above it. No font table, at either end.
+
+if (pcat && pcbios) {
+  const floppy = pcat.slots.find((s) => s.name === "floppy");
+  check(
+    Boolean(floppy) && pcat.slots.length === 5,
+    `pc-at declares ${pcat.slots.length} media slots, "floppy" among them`,
+  );
+
+  // 1.44 MB, and eleven bytes of real mode in the first sector: teletype a
+  // `B` through the BIOS's own INT 10h, halt, and loop. Hand-encoded, because
+  // a fixture assembled by the module under test would agree with itself.
+  const diskette = new Uint8Array(1_474_560);
+  diskette.set([0xb4, 0x0e, 0xb0, 0x42, 0xb7, 0x00, 0xcd, 0x10, 0xf4, 0xeb, 0xfe], 0);
+  diskette[510] = 0x55;
+  diskette[511] = 0xaa;
+
+  emu.stageMedia(pcat.index, floppy.index, diskette);
+  emu.bootBuiltin(pcat.index, pcbios.index);
+  check(emu.running, "the PC/AT boots on the module's BIOS with a staged diskette");
+  for (let i = 0; i < 240; i++) emu.runFrame();
+
+  const W2 = emu.width;
+  const px2 = emu.bytes(instance.exports.rsemu_frame_ptr(), instance.exports.rsemu_frame_len());
+  const cell2 = (cx, cy) => {
+    let bits = "";
+    for (let y = 0; y < 16; y++) {
+      for (let x = 0; x < 9; x++) {
+        const i = ((cy * 16 + y) * W2 + cx * 9 + x) * 4;
+        bits += px2[i] | px2[i + 1] | px2[i + 2] ? "1" : "0";
+      }
+    }
+    return bits;
+  };
+  check(
+    cell2(0, 2) === cell2(0, 1),
+    "INT 19h found the diskette and its boot sector printed a B",
+  );
+
+  // The keyboard, which is the other half of what this board could not do.
+  // A key it has, both directions; a key it has not, no bytes at all.
+  check(emu.hasKeyboard, "and the PC has an AT keyboard to type at");
+  check(!emu.hasConsole, "which is not a console: on this board they are opposites");
+  check(emu.key(0x41, true) && emu.key(0x41, false), "A goes down and comes back up");
+  check(!emu.key(0xdeadbeef, true), "a key this keyboard has not got puts nothing on the wire");
+  check(Rsemu.keysym("a") === 0x61, "printable ASCII keysyms are their own character codes");
+  check(Rsemu.keysym("Enter") === 0xff0d, "and the named ones are X11's");
+  check(Rsemu.keysym("Unidentified") === 0, "a key with no keysym is refused rather than guessed");
+
+  // Staging is checked against the machine that boots, not ignored.
+  let refused = false;
+  try {
+    emu.stageMedia(pcat.index, 99, new Uint8Array(4));
+  } catch {
+    refused = true;
+  }
+  check(refused, "a slot index the machine has not got is refused");
+
+  emu.clearMedia();
+  emu.bootBuiltin(pcat.index, pcbios.index);
+  for (let i = 0; i < 240; i++) emu.runFrame();
+  const px3 = emu.bytes(instance.exports.rsemu_frame_ptr(), instance.exports.rsemu_frame_len());
+  const cell3 = (cx, cy) => {
+    let bits = "";
+    for (let y = 0; y < 16; y++) {
+      for (let x = 0; x < 9; x++) {
+        const i = ((cy * 16 + y) * emu.width + cx * 9 + x) * 4;
+        bits += px3[i] | px3[i + 1] | px3[i + 2] ? "1" : "0";
+      }
+    }
+    return bits;
+  };
+  check(cell3(0, 2) !== cell3(0, 1), "and ejecting it puts No bootable device. back");
+  emu.shutdown();
+}
+
 // And the one that is the whole point: Woz's monitor of 1976, answering in the
 // browser build. The bytes it prints are the ones the Apple-1 Operation
 // Manual's own listing holds at $FF00 — nobody at rsemu chose them — and
@@ -690,6 +781,25 @@ if (pcat && pcbios) {
     "each blit is a whole 720x400 RGBA frame",
   );
   check(!driver.hasConsole, "and the page draws no terminal pane for its keyboard port");
+
+  // Keys reach a PC only while the *picture* has focus, and for a stronger
+  // reason than the console's: the guest wants Tab and the arrow keys, which
+  // are how the rest of the page is navigated.
+  check(driver.hasKeyboard, "the driver knows this machine takes keys");
+  driver.key(press({ key: "a" }), true);
+  check(driver.keysDown.size === 0, "an unfocused picture does not swallow the page's keys");
+  driver.screenFocused = true;
+  driver.key(press({ key: "a" }), true);
+  check(driver.keysDown.has(0x61), "a focused picture sends the keysym down");
+  driver.key(press({ key: "Enter" }), true);
+  check(driver.keysDown.has(0xff0d), "and Return by its X11 name");
+  driver.key(press({ key: "a" }), false);
+  check(!driver.keysDown.has(0x61), "releasing it takes it off the wire");
+  driver.key(press({ key: "b", target: { tagName: "SELECT" } }), true);
+  check(!driver.keysDown.has(0x62), "a key aimed at the machine picker is still left alone");
+  driver.releaseAll();
+  check(driver.keysDown.size === 0, "and losing the window releases every key still down");
+  driver.screenFocused = false;
   driver.shutdown();
 }
 

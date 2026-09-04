@@ -92,8 +92,24 @@ export class Rsemu {
         name: this.text(this.e.rsemu_machine_name(i)),
         summary: this.text(this.e.rsemu_machine_summary(i)),
         media: this.text(this.e.rsemu_machine_media(i)),
+        slots: this.slots(i),
         builtins: this.builtins(i),
       });
+    }
+    return out;
+  }
+
+  /**
+   * Every media slot machine `index` declares, in the module's order.
+   *
+   * `media` above is the first of them, which is the one `boot` fills. This is
+   * the whole list, because a PC has five — `bios`, `vgabios`, `floppy`,
+   * `hd0`, `hd1` — and `stageMedia` fills the ones a boot does not.
+   */
+  slots(index) {
+    const out = [];
+    for (let s = 0; s < this.e.rsemu_machine_media_count(index); s++) {
+      out.push({ index: s, name: this.text(this.e.rsemu_machine_media_name(index, s)) });
     }
     return out;
   }
@@ -140,6 +156,35 @@ export class Rsemu {
     if (!this.e.rsemu_boot_builtin(index, builtin)) {
       throw new Error(this.error() || "boot failed");
     }
+  }
+
+  /**
+   * Put `image` in machine `index`'s media slot `slot` for the next boot.
+   *
+   * The second bay. `boot` binds one uploaded image to one slot, so before
+   * this existed a PC could be handed a firmware or a disk and never both —
+   * and since the firmware is the one the module carries, "both" is the only
+   * interesting case: `stageMedia(pc, floppySlot, img)` then
+   * `bootBuiltin(pc, bios)` is a diskette booting on rsemu's own BIOS.
+   *
+   * Staging survives a boot, so Reboot reboots the same media. It is keyed by
+   * slot *name* on the module's side, so a slot the next machine has not got
+   * is refused at boot rather than ignored — call `clearMedia` when the
+   * machine changes.
+   * @param {number} index
+   * @param {number} slot
+   * @param {Uint8Array} image
+   */
+  stageMedia(index, slot, image) {
+    const len = this.input(image);
+    if (!this.e.rsemu_stage_media(index, slot, len)) {
+      throw new Error(this.error() || "staging failed");
+    }
+  }
+
+  /** Forget everything `stageMedia` staged. */
+  clearMedia() {
+    this.e.rsemu_clear_media();
   }
 
   shutdown() {
@@ -326,6 +371,91 @@ export class Rsemu {
   /** Everything the machine has said since the last call. */
   consoleRead() {
     return this.output(this.e.rsemu_console_read());
+  }
+
+  /**
+   * Whether this machine has an AT keyboard rather than a character console.
+   *
+   * On a PC the two are opposites: `pc.kbc`'s port carries set-2 scan codes,
+   * so `hasConsole` is false and this is true. An Apple 1 is the other way
+   * round. No machine in this build has both, but nothing forbids one — a PC
+   * with a serial console would — so ask both rather than inferring.
+   */
+  get hasKeyboard() {
+    return this.e.rsemu_has_keyboard() !== 0;
+  }
+
+  /**
+   * Press or release one key, named by X11 keysym the way RFB names it.
+   *
+   * A *transition*, not a character: the make and break codes are what an AT
+   * keyboard puts on the wire, and a guest that watches for a key coming up
+   * can tell. Printable ASCII keysyms are their own character codes, so the
+   * letters need no table; `KEYSYMS` below has the named ones.
+   *
+   * Returns false for a key this keyboard has not got, which puts no bytes on
+   * the wire at all.
+   * @param {number} keysym
+   * @param {boolean} down
+   */
+  key(keysym, down) {
+    return this.e.rsemu_key(keysym >>> 0, down ? 1 : 0) !== 0;
+  }
+
+  /**
+   * The named X11 keysyms a browser's `KeyboardEvent.key` maps onto.
+   *
+   * X11's, not ours — the same numbers `host::input::Keysym` names and the
+   * same ones a VNC client sends, so a browser and a VNC session type at a PC
+   * through one table on the Rust side.
+   */
+  static KEYSYMS = {
+    Enter: 0xff0d,
+    Backspace: 0xff08,
+    Tab: 0xff09,
+    Escape: 0xff1b,
+    Home: 0xff50,
+    ArrowLeft: 0xff51,
+    ArrowUp: 0xff52,
+    ArrowRight: 0xff53,
+    ArrowDown: 0xff54,
+    PageUp: 0xff55,
+    PageDown: 0xff56,
+    End: 0xff57,
+    Insert: 0xff63,
+    Shift: 0xffe1,
+    Control: 0xffe3,
+    CapsLock: 0xffe5,
+    Alt: 0xffe9,
+    Delete: 0xffff,
+    F1: 0xffbe,
+    F2: 0xffbf,
+    F3: 0xffc0,
+    F4: 0xffc1,
+    F5: 0xffc2,
+    F6: 0xffc3,
+    F7: 0xffc4,
+    F8: 0xffc5,
+    F9: 0xffc6,
+    F10: 0xffc7,
+    F11: 0xffc8,
+    F12: 0xffc9,
+  };
+
+  /**
+   * The keysym for a browser `KeyboardEvent.key`, or 0 for one with none.
+   *
+   * A one-character `key` is the character, and for printable ASCII that *is*
+   * the keysym — X11 chose Latin-1 for the low range and never moved it. So
+   * this table is only the keys with names.
+   * @param {string} key
+   */
+  static keysym(key) {
+    if (key.length === 1) {
+      const code = key.charCodeAt(0);
+      return code >= 0x20 && code < 0x7f ? code : 0;
+    }
+    return Rsemu.KEYSYMS[key] ?? 0;
   }
 
   // -- save states ----------------------------------------------------------
