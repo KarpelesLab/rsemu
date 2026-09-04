@@ -1528,6 +1528,18 @@ machine-pc-at = [
   "dev-ata-disk",
 ]
 
+# The same board with **two processors** (machines/pc-at-smp.machine): every
+# address `pc-at` has, plus a second `cpu.x86`, a second local APIC, and one
+# changed mapping -- 0xfee00000 decodes to `lapic0.window` rather than
+# `lapic0.regs`, so each processor reaches its *own* local APIC through the
+# single architectural address the MP and ACPI tables have room for. Without
+# that an application processor reads the bootstrap processor's APIC ID and
+# programs the wrong registers, which is why no two-processor AT shipped until
+# the window existed. The second processor comes up parked in wait-for-SIPI and
+# runs only when firmware sends it the MP specification's INIT/Start-Up pair.
+# Same parts as `machine-pc-at`, so it adds no dependencies.
+machine-pc-at-smp = ["machine-pc-at"]
+
 # The same lineage stripped to its interrupt path (machines/pc-apic.machine):
 # **two** x86s with a local APIC each, the two cascaded 8259As, an I/O APIC and
 # an HPET, and nothing else -- no video, no disks, no PCI, no DMA.

@@ -59,9 +59,21 @@
 //! one-processor and a two-processor board; what this file adds is that the
 //! processor the table named then executes.
 //!
-//! The one piece still outstanding is the machine file: a second processor on
-//! the shipped board is a board decision, and this test patches the text
-//! rather than taking it.
+//! # What this file is now, since `pc-at-smp` ships
+//!
+//! It used to end by saying the machine file was the one piece outstanding.
+//! `machines/pc-at-smp.machine` is that board, and `tests/pc_at_smp.rs` is the
+//! test of it — including the thing the patched board below still gets wrong,
+//! which is that `lapic1.regs` at `0xfef00000` is not the architectural
+//! address and an application processor reading its own APIC ID at
+//! `0xfee00000` reads the bootstrap processor's.
+//!
+//! This file is deliberately left on the patched board, because that is now the
+//! *other* configuration worth keeping honest: a board that gives each local
+//! APIC a page of its own is still expressible, still boots, and still starts
+//! its second processor in hardware. What it cannot do is let that processor
+//! program its own APIC, which is why the shipped board does not do it this
+//! way.
 //!
 //! # Why the guest's spins are all `hlt`
 //!

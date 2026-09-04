@@ -81,7 +81,7 @@ use crate::core::wire::{
     FanIn, IntAck, IntAckCycle, IntAckResponse, Level, LocalController, Resolve, Startup, WireId,
     WireSink, WireSource,
 };
-use crate::machine::realize::Instance;
+use crate::machine::realize::{BindCtx, Instance};
 use crate::machine::validate::ClassSchema;
 
 pub use bus::{ApicBus, Delivery, EoiSink, Message, Shorthand, Target};
@@ -104,6 +104,24 @@ pub const REGISTER_WINDOW_LEN: u64 = 0x1000;
 /// machine file writes it in a `map` statement; it is published here so a board
 /// and a test agree on one number.
 pub const DEFAULT_BASE: u64 = 0xfee0_0000;
+
+/// The region name a board maps to get the **architectural** page: one
+/// address, decoded to whichever processor is reading.
+///
+/// `map mem 0xfee00000 size 0x1000 = lapic0.window` on a multiprocessor board,
+/// where `lapic0.regs` would give every processor the bootstrap processor's
+/// registers.
+///
+/// It decodes on
+/// [`MemAttrs::requester`](crate::core::space::MemAttrs::requester): each
+/// `pc.lapic` names its processor with `cpu = …`, resolves that to a requester
+/// id when the machine binds it, and claims it on the shared APIC bus, so one
+/// page reaches whichever local APIC belongs to the processor doing the
+/// reading. An access from anything that is not a processor on that bus — a
+/// debugger, a snapshot — reaches the APIC that publishes the page. `ApicWindow`
+/// in this module is the implementation, and `docs/platforms/pc-at.md` has the
+/// argument for why it is a region rather than a mapping.
+pub const WINDOW_REGION: &str = "window";
 
 // ---------------------------------------------------------------------------
 // the APIC message bus
@@ -134,7 +152,8 @@ pub mod bus {
     use crate::core::error::Result;
     use crate::core::hosts::{HostKind, HostObjects};
     use crate::core::props::Props;
-    use crate::core::sync::{LockRank, Mutex};
+    use crate::core::space::{MemOps, RequesterId};
+    use crate::core::sync::{AtomicBool, LockRank, Mutex, Ordering};
 
     /// The kind an APIC bus is filed under in a build's `HostObjects`.
     pub const KIND: HostKind = HostKind::rendezvous("apic-bus");
@@ -300,6 +319,14 @@ pub mod bus {
     pub struct ApicBus {
         targets: Mutex<Vec<Weak<dyn Target>>>,
         eoi: Mutex<Vec<Weak<dyn EoiSink>>>,
+        /// Which processor reaches which register block — the roster the
+        /// per-processor window decodes through. See
+        /// [`attach_local`](ApicBus::attach_local).
+        locals: Mutex<Vec<(RequesterId, Weak<dyn MemOps>)>>,
+        /// Whether anything on this bus has published the architectural
+        /// aperture. Set when a `map` statement asks a local APIC for its
+        /// `window` region, which is the only way one is reached.
+        window: AtomicBool,
     }
 
     impl fmt::Debug for ApicBus {
@@ -307,6 +334,8 @@ pub mod bus {
             f.debug_struct("ApicBus")
                 .field("targets", &self.targets.lock().len())
                 .field("eoi_sinks", &self.eoi.lock().len())
+                .field("locals", &self.locals.lock().len())
+                .field("window", &self.window.load(Ordering::Relaxed))
                 .finish()
         }
     }
@@ -318,7 +347,83 @@ pub mod bus {
             ApicBus {
                 targets: Mutex::with_rank(BUS_RANK, Vec::new()),
                 eoi: Mutex::with_rank(BUS_RANK, Vec::new()),
+                locals: Mutex::with_rank(BUS_RANK, Vec::new()),
+                window: AtomicBool::new(false),
             }
+        }
+
+        /// Say that `requester`'s accesses belong to `ops`.
+        ///
+        /// The half of the model that makes one physical page mean a different
+        /// register block to each processor. On silicon the local APIC is on
+        /// the processor's own die and its aperture never reaches the bus,
+        /// which is why `0xfee00000` can be every processor's own; here the
+        /// initiator is carried instead, in
+        /// [`MemAttrs::requester`](crate::core::space::MemAttrs::requester),
+        /// and this is the table that reads it back.
+        ///
+        /// Called from a local APIC's `bind`, once it has asked the machine
+        /// layer what id the processor its `cpu` property names stamps.
+        ///
+        /// Returns `false` if that requester is already claimed by a live
+        /// entry: two local APICs naming one processor is a board that cannot
+        /// mean anything, and the caller reports it rather than picking one.
+        pub fn attach_local(&self, requester: RequesterId, ops: Weak<dyn MemOps>) -> bool {
+            let mut locals = self.locals.lock();
+            if locals
+                .iter()
+                .any(|(id, ops)| *id == requester && ops.strong_count() > 0)
+            {
+                return false;
+            }
+            locals.push((requester, ops));
+            true
+        }
+
+        /// The register block `requester` reaches through the architectural
+        /// page, if a local APIC on this bus claimed it.
+        ///
+        /// The roster lock is released before the caller touches what it holds:
+        /// the answer is a device that takes its own state lock, and this bus
+        /// never calls outward holding its own (`CLAUDE.md`, re-entrancy).
+        #[must_use]
+        pub fn local_for(&self, requester: RequesterId) -> Option<Arc<dyn MemOps>> {
+            let locals = self.locals.lock();
+            let found = locals
+                .iter()
+                .find(|(id, _)| *id == requester)
+                .and_then(|(_, ops)| ops.upgrade());
+            // Explicitly, and before the answer is handed back: the caller is
+            // about to take that device's own state lock.
+            drop(locals);
+            found
+        }
+
+        /// How many processors have claimed a register block on this bus.
+        #[must_use]
+        pub fn local_count(&self) -> usize {
+            self.locals
+                .lock()
+                .iter()
+                .filter(|(_, ops)| ops.strong_count() > 0)
+                .count()
+        }
+
+        /// Record that a board has mapped the architectural aperture.
+        pub fn note_window(&self) {
+            self.window.store(true, Ordering::Release);
+        }
+
+        /// Whether a board has mapped it.
+        ///
+        /// What makes a local APIC that does not know its processor an error
+        /// rather than a curiosity: with a window on the bus, an APIC with no
+        /// `cpu` property is a processor whose accesses would silently land on
+        /// somebody else's registers, which is the defect the window exists to
+        /// remove.
+        #[must_use]
+        pub fn has_window(&self) -> bool {
+            self.window.load(Ordering::Acquire)
         }
 
         /// Put a local APIC on the bus.
@@ -1449,6 +1554,83 @@ impl MemOps for Registers {
 }
 
 // ---------------------------------------------------------------------------
+// the architectural page
+// ---------------------------------------------------------------------------
+
+/// The one page every processor reaches its **own** local APIC through.
+///
+/// # Why a board needs this at all
+///
+/// `IA32_APIC_BASE` comes out of reset naming `0xfee00000` (SDM Vol 3A
+/// §10.4.4), and both of the tables that describe a multiprocessor PC have room
+/// for exactly one local-APIC address (*MP* §4.2, *ACPI* §5.2.12) — because on
+/// silicon the register block is **on the processor's own die** and its
+/// aperture never reaches the system bus. Every processor therefore sees a
+/// different thing at one address, which no `map` statement can say: decode in
+/// [`core::space`](crate::core::space) is strictly address to region and
+/// nothing on that path branches on who is asking.
+///
+/// It does not have to. The initiator is already carried —
+/// [`MemAttrs::requester`](crate::core::space::MemAttrs::requester) is
+/// allocated per object by the machine layer, stamped by `cpu.x86` on every
+/// access it makes, rebuilt on both of KVM's exit paths, and delivered to
+/// [`MemOps`] unchanged. So the *device* demultiplexes on it, and the address
+/// space is untouched. This is that device.
+///
+/// # What it decodes to
+///
+/// The register block whose local APIC named this requester's processor in its
+/// `cpu` property, and failing that the APIC that publishes this window — which
+/// is the honest answer for an access that did not come from a processor at
+/// all. A debugger reading `0xfee00000`, a DMA engine that wandered there, a
+/// snapshot: none of them is a processor, none of them has an APIC, and the
+/// bootstrap processor's page is what a person reading the machine expects to
+/// see. Every attribute, `debug` included, is passed through untouched, so a
+/// debug read is still refused a write and still pops nothing.
+///
+/// It is not a device of its own. A window is a *view* of the APICs on one bus
+/// and has no state, no reset and no snapshot chunk of its own; making it an
+/// object would put a fourth thing in every board file that has to agree with
+/// the other three.
+#[derive(Debug)]
+struct ApicWindow {
+    /// The bus whose roster says which processor is which.
+    bus: Arc<ApicBus>,
+    /// The register block an access from anything that is not a processor on
+    /// that roster reaches.
+    fallback: Arc<Registers>,
+}
+
+impl ApicWindow {
+    /// Whose registers this access is for.
+    fn target(&self, attrs: MemAttrs) -> Arc<dyn MemOps> {
+        // The roster lock is taken and released inside `local_for`, before the
+        // block below takes the target's own state lock: a guest access already
+        // holds a `BUS`-ranked lock, the roster ranks under it, and a device's
+        // state ranks under that (`bus::BUS_RANK`).
+        self.bus
+            .local_for(attrs.requester)
+            .unwrap_or_else(|| Arc::clone(&self.fallback) as Arc<dyn MemOps>)
+    }
+}
+
+impl MemOps for ApicWindow {
+    fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
+        self.target(attrs).read(offset, dst, attrs)
+    }
+
+    fn write(&self, offset: u64, src: &[u8], attrs: MemAttrs) -> MemResult {
+        self.target(attrs).write(offset, src, attrs)
+    }
+
+    fn constraints(&self) -> AccessConstraints {
+        // The same register block whichever processor is reading, so the same
+        // constraints: 32 bits, naturally aligned (SDM Vol 3A §10.4.1).
+        AccessConstraints::word(Width::U32, Endian::Little)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // the device
 // ---------------------------------------------------------------------------
 
@@ -1457,6 +1639,15 @@ impl MemOps for Registers {
 pub struct LocalApic {
     regs: Arc<Registers>,
     region: RegionRef,
+    /// The architectural page, built once whether or not a board maps it: it
+    /// holds nothing a machine would have to pay for unmapped.
+    window: RegionRef,
+    /// The processor this APIC belongs to, as the machine file names it.
+    ///
+    /// Resolved to a [`RequesterId`](crate::core::space::RequesterId) at bind
+    /// time, because the id is allocated by declaration order and a file cannot
+    /// write it down.
+    cpu: Option<String>,
     /// The device's own references to its input pins. A net holds only weak
     /// ones, so something has to keep them alive.
     pins: Mutex<Vec<Arc<LintPin>>>,
@@ -1503,12 +1694,19 @@ impl LocalApic {
         // lowest APIC ID. A file that arranges otherwise says so.
         let bsp = r.or("bsp", id == 0)?;
         let name = r.or_str("bus", bus::DEFAULT_NAME)?.to_string();
+        // Which processor's accesses this APIC answers through the
+        // architectural page. A *link*, resolved to a requester id at bind
+        // time: the id is allocated by declaration order and a machine file
+        // must never write the number down.
+        let cpu = r.optional_link("cpu")?.map(|l| l.as_str().to_string());
         r.finish()?;
         // Opening the bus is allocation rather than an outward action: a
         // get-or-create of a passive object in a table the caller already owns
         // (`core::hosts`, "which phase opens one").
         let bus = bus::attach(props, &name)?;
-        Ok(LocalApic::with_bus(id, bsp, bus))
+        let mut apic = LocalApic::with_bus(id, bsp, bus);
+        apic.cpu = cpu;
+        Ok(apic)
     }
 
     /// One in the default configuration: APIC ID 0, the bootstrap processor,
@@ -1542,9 +1740,26 @@ impl LocalApic {
             REGISTER_WINDOW_LEN,
             Arc::clone(&regs) as Arc<dyn MemOps>,
         ));
+        let window: RegionRef = Arc::new(Region::io(
+            // The **same region name** as the register page, deliberately: it
+            // is a local APIC's register page, and more than one survey in the
+            // tree finds one by walking a space for a region called this
+            // (`dev::q35::acpi::survey` does). A board that maps the window
+            // instead of the page has not stopped having a local APIC there,
+            // and a name that said otherwise would quietly cost it its ACPI
+            // MADT.
+            CLASS_NAME,
+            REGISTER_WINDOW_LEN,
+            Arc::new(ApicWindow {
+                bus: Arc::clone(&regs.bus),
+                fallback: Arc::clone(&regs),
+            }) as Arc<dyn MemOps>,
+        ));
         LocalApic {
             regs,
             region,
+            window,
+            cpu: None,
             pins: Mutex::with_rank(LockRank::LEAF, Vec::new()),
             bsp,
             reset_id: id,
@@ -1681,6 +1896,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "the APIC message bus this part is on (default `apic`)",
         },
+        PropertySpec {
+            name: "cpu",
+            kind: ValueKind::Link,
+            required: false,
+            summary: "the processor this APIC belongs to, for the `window` region's decode",
+        },
     ],
     construct: |props| Ok(Box::new(LocalApic::new(props)?)),
 };
@@ -1752,6 +1973,16 @@ impl Device for LocalApic {
     }
 
     fn region(&self, name: &str) -> Option<RegionRef> {
+        if name == WINDOW_REGION {
+            // Asking for the aperture is what *makes* a board multiprocessor
+            // in this model, and it is the only route to one — so it is also
+            // where the bus learns that every local APIC on it now has to know
+            // its processor. `bind` is where that is enforced, and it runs
+            // after every `map` statement has been resolved, so the flag is
+            // set by then however the file is ordered.
+            self.regs.bus.note_window();
+            return Some(Arc::clone(&self.window));
+        }
         matches!(name, "" | "regs").then(|| Arc::clone(&self.region))
     }
 
@@ -1958,7 +2189,50 @@ impl Device for LocalApic {
     }
 }
 
-impl Instance for LocalApic {}
+impl Instance for LocalApic {
+    /// Claim the requester id of the processor this APIC belongs to.
+    ///
+    /// The whole of what makes the [`WINDOW_REGION`] page work, and the reason
+    /// [`BindCtx::peer`](crate::machine::BindCtx::peer) exists: an object's
+    /// requester id is allocated by declaration order, so a machine file names
+    /// the *processor* (`cpu = cpu1`) and the id is looked up here.
+    ///
+    /// # Errors
+    ///
+    /// If `cpu` names nothing in this machine; if two local APICs on one bus
+    /// name the same processor, which is a board that cannot mean anything; or
+    /// if a board maps the architectural page and this APIC does not say whose
+    /// it is — that last one being precisely the defect the page exists to
+    /// remove, so it fails the build rather than answering with the wrong
+    /// processor's registers.
+    fn bind(&self, ctx: &BindCtx<'_>) -> Result<()> {
+        let Some(cpu) = self.cpu.as_deref() else {
+            if self.regs.bus.has_window() {
+                return Err(Error::Config {
+                    at: ctx.path().to_string(),
+                    message: String::from(
+                        "this board maps the architectural local-APIC page, so every `pc.lapic` \
+                         on the bus has to say which processor it belongs to — add `cpu = <the \
+                         processor's name>`, or the processor would read another one's registers",
+                    ),
+                });
+            }
+            return Ok(());
+        };
+        let peer = ctx.peer(cpu)?;
+        let ops = Arc::downgrade(&self.regs) as Weak<dyn MemOps>;
+        if !self.regs.bus.attach_local(peer.requester(), ops) {
+            return Err(Error::Config {
+                at: ctx.path().to_string(),
+                message: format!(
+                    "another local APIC on this bus already answers for `{cpu}`; a processor has \
+                     one local APIC"
+                ),
+            });
+        }
+        Ok(())
+    }
+}
 
 /// Add [`CLASS`] to a registry.
 ///
@@ -1986,8 +2260,10 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("id", ValueKind::Uint).range(0, 255))
         .prop(PropSchema::new("bsp", ValueKind::Bool))
         .prop(PropSchema::new("bus", ValueKind::Str))
+        .prop(PropSchema::new("cpu", ValueKind::Link))
         .region("")
         .region("regs")
+        .region(WINDOW_REGION)
         .port("intr", PortDir::Out)
         .port("nmi", PortDir::Out)
         .port("lint0", PortDir::In)
@@ -1997,6 +2273,7 @@ pub fn schema() -> ClassSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::space::RequesterId;
     use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
     use crate::core::sync::{AtomicU32, Ordering as AtomicOrdering};
     use crate::core::wire::{Wire, WireIdAllocator};
@@ -2708,5 +2985,135 @@ mod tests {
         assert!(!b.intr.high());
         assert_eq!(Device::next_event_tick(&b.apic), None);
         assert_eq!(b.peek(REG_IRR + 2 * REG_STRIDE), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // the architectural page
+    // -----------------------------------------------------------------
+
+    /// The requester ids two processors would be allocated. Arbitrary and
+    /// non-adjacent on purpose: nothing about the decode may depend on them
+    /// being 1 and 2, which is what a machine that declared the APICs first
+    /// would give them.
+    const CPU0: RequesterId = RequesterId(7);
+    const CPU1: RequesterId = RequesterId(9);
+
+    /// Two APICs on one bus with a window over them, each having claimed its
+    /// processor the way [`Instance::bind`] does.
+    fn windowed() -> (Arc<ApicBus>, ApicWindow, Bench, Bench) {
+        let bus = Arc::new(ApicBus::new());
+        let a = bench_on(&bus, 0, true);
+        let b = bench_on(&bus, 1, false);
+        assert!(bus.attach_local(CPU0, Arc::downgrade(&a.apic.regs) as Weak<dyn MemOps>));
+        assert!(bus.attach_local(CPU1, Arc::downgrade(&b.apic.regs) as Weak<dyn MemOps>));
+        let window = ApicWindow {
+            bus: Arc::clone(&bus),
+            fallback: Arc::clone(&a.apic.regs),
+        };
+        (bus, window, a, b)
+    }
+
+    /// A 32-bit read of `offset` through `window`, as `requester` would make it.
+    fn through(window: &ApicWindow, offset: u64, requester: RequesterId) -> u32 {
+        let mut bytes = [0u8; 4];
+        window
+            .read(
+                offset,
+                &mut bytes,
+                MemAttrs::DEFAULT.with_requester(requester),
+            )
+            .expect("the window answers");
+        u32::from_le_bytes(bytes)
+    }
+
+    #[test]
+    fn one_page_gives_each_processor_its_own_apic() {
+        let (_bus, window, _a, _b) = windowed();
+        // The whole claim, in four lines: the same offset, two initiators, two
+        // answers (SDM Vol 3A §10.4.6, the local APIC ID register).
+        assert_eq!(through(&window, REG_ID, CPU0) >> 24, 0);
+        assert_eq!(through(&window, REG_ID, CPU1) >> 24, 1);
+    }
+
+    #[test]
+    fn an_access_from_nothing_on_the_bus_reaches_the_apic_that_published_it() {
+        let (_bus, window, _a, _b) = windowed();
+        // A debugger, a DMA engine, a snapshot: none of them is a processor and
+        // none of them has an APIC, so the page they see is the one the board
+        // put the window on — the bootstrap processor's.
+        assert_eq!(through(&window, REG_ID, RequesterId::ANONYMOUS) >> 24, 0);
+        assert_eq!(through(&window, REG_ID, RequesterId(4242)) >> 24, 0);
+    }
+
+    #[test]
+    fn a_write_through_the_window_lands_on_the_writers_own_apic() {
+        let (_bus, window, a, b) = windowed();
+        // The task-priority register, because it is per-processor state a real
+        // scheduler writes on every context switch (SDM Vol 3A §10.8.3.1) —
+        // the write that was silently going to the wrong APIC.
+        window
+            .write(
+                REG_TPR,
+                &0x40u32.to_le_bytes(),
+                MemAttrs::DEFAULT.with_requester(CPU1),
+            )
+            .expect("the window takes it");
+        assert_eq!(through(&window, REG_TPR, CPU1), 0x40);
+        assert_eq!(through(&window, REG_TPR, CPU0), 0);
+        assert_eq!(b.apic.regs.state.lock().tpr, 0x40);
+        assert_eq!(a.apic.regs.state.lock().tpr, 0);
+    }
+
+    #[test]
+    fn a_debug_access_keeps_its_attributes_through_the_window() {
+        let (_bus, window, _a, _b) = windowed();
+        // Passed through untouched, so the register block's own rules still
+        // apply: a debug read is answered and a debug *write* is refused,
+        // because there is no harmless write to an APIC (`ROADMAP.md` §15,
+        // invariant 5).
+        let mut bytes = [0u8; 4];
+        window
+            .read(REG_ID, &mut bytes, MemAttrs::DEBUG.with_requester(CPU1))
+            .expect("a debug read is answered");
+        assert_eq!(u32::from_le_bytes(bytes) >> 24, 1);
+        assert!(
+            window
+                .write(
+                    REG_EOI,
+                    &0u32.to_le_bytes(),
+                    MemAttrs::DEBUG.with_requester(CPU1),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_processor_cannot_have_two_local_apics() {
+        let bus = Arc::new(ApicBus::new());
+        let a = bench_on(&bus, 0, true);
+        let b = bench_on(&bus, 1, false);
+        assert!(bus.attach_local(CPU0, Arc::downgrade(&a.apic.regs) as Weak<dyn MemOps>));
+        // Two `pc.lapic` objects naming one processor is a board that cannot
+        // mean anything, and `bind` turns this into a configuration error
+        // naming both rather than picking whichever bound first.
+        assert!(!bus.attach_local(CPU0, Arc::downgrade(&b.apic.regs) as Weak<dyn MemOps>));
+        assert_eq!(bus.local_count(), 1);
+    }
+
+    #[test]
+    fn asking_for_the_window_is_what_tells_the_bus_it_has_one() {
+        let bus = Arc::new(ApicBus::new());
+        let apic = LocalApic::with_bus(0, true, Arc::clone(&bus));
+        assert!(!bus.has_window(), "nothing has asked for the aperture");
+        assert!(apic.region("regs").is_some());
+        assert!(
+            !bus.has_window(),
+            "the register page is not the architectural page"
+        );
+        // A `map` statement resolving `lapicN.window` is the only route to one,
+        // and it happens before any device is bound — which is what lets
+        // `bind` insist that every APIC on the bus knows its processor.
+        assert!(apic.region(WINDOW_REGION).is_some());
+        assert!(bus.has_window());
     }
 }

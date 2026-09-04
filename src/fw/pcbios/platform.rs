@@ -97,6 +97,14 @@ const KBC_CLASS: &str = "pc.kbc";
 /// The region a local APIC or an I/O APIC publishes its register page as.
 const REGS_REGION: &str = "regs";
 
+/// The region a local APIC publishes the **architectural** page as: one
+/// address, decoded to whichever processor is reading (`dev::pc::apic`'s
+/// `ApicWindow`).
+///
+/// A board with more than one processor maps this instead of `regs`, and it is
+/// what the tables' single local-APIC address then means.
+const WINDOW_REGION: &str = "window";
+
 // ---------------------------------------------------------------------------
 // what a description cannot say
 // ---------------------------------------------------------------------------
@@ -432,33 +440,47 @@ impl<'a> Survey<'a> {
     /// answers the same physical address, and the one taken here is the
     /// bootstrap processor's.
     ///
-    /// **This is where the tables and rsemu's model of a board disagree, and
-    /// it is worth stating rather than discovering.** rsemu models each local
-    /// APIC as its own device with its own mapping, so a two-processor board
-    /// puts the second one somewhere else — `machines/pc-apic.machine` and
-    /// `tests/kvm_pc_at_smp.rs` both use `0xfef00000`. The table says
-    /// `0xfee00000`, which is true of the bootstrap processor and of every
-    /// real machine, and is what an operating system will use on *both*
-    /// processors. So an application processor that reads its own APIC ID
-    /// through the architectural address reads the bootstrap processor's. The
-    /// fix is a per-processor alias of one page, in the board model rather
-    /// than here; until it exists, an operating system can *enumerate* the
-    /// second processor and start it, and code running on it that programs
-    /// its own APIC is programming the wrong one.
+    /// **Which region answers is the whole multiprocessor question**, and it is
+    /// worth stating rather than discovering. rsemu models each local APIC as
+    /// its own device, so a board that maps each one's `regs` gives the second
+    /// processor a *different* address — `machines/pc-apic.machine` uses
+    /// `0xfef00000` — while the table has room for one, and an operating system
+    /// will use that one on both processors. An application processor would
+    /// then read the bootstrap processor's APIC ID through the architectural
+    /// address.
+    ///
+    /// A multiprocessor board therefore maps `window` rather than `regs`
+    /// (`dev::pc::apic`'s `ApicWindow`): one page, decoded per initiator, which
+    /// is what silicon does by putting the register block on the die. So the
+    /// window is looked for first — a board that maps *both* means the window,
+    /// since that is the address every processor reaches its own APIC at — and
+    /// `regs` answers for the uniprocessor boards that have no window at all.
     fn lapic_address(&self, processors: &[(Option<ObjectId>, Processor)]) -> Result<u32> {
         let bootstrap = processors
             .iter()
             .find(|(_, p)| p.bootstrap)
             .or_else(|| processors.first());
         let apic = bootstrap.and_then(|(apic, _)| *apic);
-        let address = apic.and_then(|id| self.mapping_of(id, REGS_REGION));
+        // A window is a view of every APIC on its bus, so *whose* window a
+        // board mapped does not change what it decodes to — the bootstrap
+        // processor's is looked for first only because that is the one a
+        // reader expects the address to belong to.
+        let address = apic
+            .and_then(|id| self.mapping_of(id, WINDOW_REGION))
+            .or_else(|| {
+                self.objects_of(LAPIC_CLASS)
+                    .iter()
+                    .find_map(|(id, _)| self.mapping_of(*id, WINDOW_REGION))
+            })
+            .or_else(|| apic.and_then(|id| self.mapping_of(id, REGS_REGION)));
         address
             .and_then(|base| u32::try_from(base).ok())
             .ok_or_else(|| Error::Config {
                 at: String::from("fw::pcbios"),
                 message: String::from(
-                    "no `pc.lapic` register page is mapped below 4 GiB in this machine, so the \
-                     firmware's tables could not say where a processor reaches its own local APIC",
+                    "no `pc.lapic` page is mapped below 4 GiB in this machine — neither a `regs` \
+                     nor a `window` region — so the firmware's tables could not say where a \
+                     processor reaches its own local APIC",
                 ),
             })
     }
@@ -675,6 +697,24 @@ mod tests {
         assert_eq!(derived.ioapic.expect("an I/O APIC").id, 2);
         // Everything else is the same board.
         assert_eq!(derived.interrupts, Platform::at().interrupts);
+        assert_eq!(derived.lapic, Platform::at().lapic);
+    }
+
+    /// The shipped two-processor board, whose second processor reaches its own
+    /// APIC through a `window` region rather than a `regs` one — which is
+    /// precisely what this survey has to keep finding, or the tables would send
+    /// an operating system somewhere the board decodes nothing.
+    #[test]
+    #[cfg(feature = "machine-pc-at-smp")]
+    fn the_architectural_page_is_found_through_a_window_too() {
+        let text = crate::machine::catalog::PC_AT_SMP.source;
+        let derived =
+            Platform::from_machine("pc-at-smp.machine", text).expect("the shipped board resolves");
+        assert_eq!(derived.processor_count(), 2);
+        // Read off `map mem 0xfee00000 … = lapic0.window`. The uniprocessor
+        // board maps `lapic0.regs` at the same address and reports the same
+        // number, which is the point: the table follows the machine either way.
+        assert_eq!(derived.lapic, 0xfee0_0000);
         assert_eq!(derived.lapic, Platform::at().lapic);
     }
 
