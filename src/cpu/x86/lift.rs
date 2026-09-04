@@ -27,9 +27,14 @@
 //! * `PUSH`, `POP`, `LEAVE`, `CALL rel32`, `CALL r/m`, `RET`, `RET imm16`,
 //!   `JMP rel8`/`rel32`/`r/m`, all sixteen `Jcc` in both encodings.
 //! * `CLC`, `STC`, `CMC`, `CLD`, `STD`.
+//! * The no-operations, which is a bigger set than the mnemonic suggests:
+//!   `90`, the whole **reserved-NOP space** (`0F 0D` and `0F 18`-`0F 1F` —
+//!   the multi-byte `NOP` a compiler pads with, the prefetch hints, and
+//!   `ENDBR64` among them), and either of those behind a repeat prefix, which
+//!   is how `PAUSE` and `ENDBR64` are spelled. `90` with `REX.B` is **not**
+//!   one: it is `XCHG R8, RAX`.
 //!
-//! In long mode add `MOVSXD` and subtract the three **computed** near
-//! transfers — see "Long mode" below.
+//! In long mode add `MOVSXD`.
 //!
 //! Everything else ends the block with a terminator that hands the PC back to
 //! the interpreter, which stays the oracle (CLAUDE.md, "CPU cores"). The
@@ -38,13 +43,12 @@
 //! | Excluded | Why |
 //! | --- | --- |
 //! | x87, SSE, MMX | the IR has no vector ops (`ROADMAP.md` §9 adds them with the SIMD work) and tier-1 floating point is a helper call into soft-float that no x87 entry point exists for yet |
-//! | `RET`, `JMP r/m`, `CALL r/m` **in long mode only** | `Exec::jump_near` raises `#GP(0)` on a non-canonical target, an exception *at* the transfer with the pre-instruction state restored, and a block whose branches all go forward over an exit cannot deliver it. Below long mode the flat 4 GiB `CS` [`World::of`] insists on discharges the check for every target at once, so the same three are in. A *static* target is examined at lift time instead (`static_target`) |
 //! | real mode and virtual-8086 | `segment << 4 + offset` with a *16-bit offset wrap* is a different address path in `exec`, checked against three million hardware vectors, and generalising it is how that accuracy gets lost |
 //! | compatibility mode's 16-bit code segments, and a `67` address-size prefix in either world | 16-bit addressing inside a 32-bit segment, and 32-bit addressing inside a 64-bit one, are each a second effective-address form for no guest that matters |
 //! | a unified translation buffer | paging itself is **in** the subset now ([`Origin::Paged`]); what is out is paging on a part whose instruction and data translations share one array, where a data operand evicts the code page and the *next fetch* pays for a walk no static analysis can place — see "Paging" |
 //! | [`Smc::Guard`] under paging | the in-block guard compares **linear** pages and two of them may alias one physical page. [`Smc::EndBlock`] is the answer, and [`lift`] refuses the other combination rather than emitting a check that can miss |
 //! | `DIV`, `IDIV` | `#DE` is an exception the block cannot deliver, and the undefined flags come out of `exec::cord`'s trial-subtraction **loop**, which a block with only forward branches cannot express |
-//! | the string primitives, `REP` | a loop inside a block; the IR's verifier rejects a backward [`Opcode::BRCOND`] because `ir::pass`'s liveness is a single backward walk |
+//! | the string primitives, and a repeat prefix in front of anything but a no-operation | a loop inside a block; the IR's verifier rejects a backward [`Opcode::BRCOND`] because `ir::pass`'s liveness is a single backward walk. `PAUSE` and `ENDBR64` carry the prefix and are not loops, so they are in — see `classify` |
 //! | `LOCK`, `XCHG` with memory | the IR's atomics carry no [`MemOp`], so a byte- or word-wide atomic has no type to name (`ir`'s "Known gaps") |
 //! | segment loads, `LES`/`LDS`/`LSS`, far transfers, `INT`, `IRET`, `HLT` | a descriptor load is a mode change, which `ir`'s decision 4 makes a helper call **and** a hard barrier |
 //! | `PUSHF`/`POPF` | they observe the packed word, and `POPF`'s `IOPL` and `POPF_FORBIDDEN` rules are privilege logic rather than arithmetic. `LAHF`/`SAHF` *are* lifted, so the packed low byte is not untested |
@@ -365,16 +369,30 @@
 //!    whole address is one — see `Lifter::ea` — and the effective-address
 //!    helper's thirty-two-bit mask became [`World::addr_mask`], which is the
 //!    identity at sixty-four.
-//! 5. **A computed near transfer cannot be lifted here.** Not on the list, and
-//!    it is the one thing long mode *removes* from the subset: below it the
-//!    flat 4 GiB `CS` [`World::of`] insists on means a computed `RET` or
-//!    `JMP r/m` has no target to reject, and in it `Exec::jump_near` raises
-//!    `#GP(0)` on a non-canonical one — an exception at the transfer, with the
-//!    pre-instruction state restored, which a block with only forward branches
-//!    over an exit cannot deliver. A *static* target is checked at lift time
-//!    (`static_target`) and a computed one ends the block, so the
-//!    interpreter takes it. Making it liftable means a side exit taken before
-//!    any state is bound, which is expressible and is a separate change.
+//! 5. ~~**A computed near transfer cannot be lifted here.**~~ **It can, and
+//!    it is [`TRANSFER`].** Not on anyone's list, and for four rounds the one
+//!    thing long mode *removed* from the subset: below it the flat 4 GiB `CS`
+//!    [`World::of`] insists on means a computed `RET` or `JMP r/m` has no
+//!    target to reject, and in it `Exec::jump_near` raises `#GP(0)` on a
+//!    non-canonical one — an exception at the transfer, with the
+//!    pre-instruction state restored.
+//!
+//!    The answer that was written down here — "a side exit taken before any
+//!    state is bound" — is wrong, and measuring it is what showed why: a side
+//!    exit *restarts* the instruction, so its fetch, its operand read and its
+//!    static charge are all paid twice, and the clock is hashed. Rolling the
+//!    charges back is no better, because the operand read filled a translation
+//!    buffer and latched `State::open_bus`, neither of which unwinds. What
+//!    works is not leaving at all: the block **delivers the fault where it
+//!    happens**, at the transfer's own boundary, whose live map is by
+//!    construction the pre-instruction state. [`TRANSFER`] is how a block says
+//!    so, and the exception is `cpu::x86::engine`'s to vector exactly as it
+//!    vectors a `#PF` from a load.
+//!
+//!    On a 900-second `pc64` boot `RET` alone was **34.2 M** of the 46 M guest
+//!    instructions the frontend was still refusing — a function return is the
+//!    commonest computed transfer there is, and every one of them ended a
+//!    block and cost a round trip through the interpreter.
 //!
 //! ## Two masks that are not the same mask
 //!
@@ -530,6 +548,20 @@
 //!   say is an `i8` or an `i16`, which is why `RCL`/`RCR` and the atomics have
 //!   no type to name.
 //!
+//! # The fourth mutation survivor, and why the shape test is the answer
+//!
+//! [`TRANSFER`] makes no bus cycle, so [`Opcode::LD`] in that space must not be
+//! counted as a data access when a block's worst case is bounded
+//! (`cpu::x86::engine`'s `block_bound`). Counting it bounds every computed
+//! near transfer one whole access high — forty-eight ticks under a four-level
+//! walk — which refuses, in the tail of a quantum, a block that fits in it.
+//!
+//! That is **conservative rather than wrong**, and it is why nothing
+//! differential can see it: a bound that is too large costs coverage and never
+//! correctness, so both engines still agree about every register, every flag
+//! and every tick. It is asserted by shape instead, in
+//! `the_transfer_check_costs_nothing_in_a_blocks_bound`.
+//!
 //! # How this is known to be right
 //!
 //! It is not, on its own. [`differential`](super::differential) is the
@@ -661,6 +693,59 @@ pub const PAGE_SIZE: u64 = 4096;
 
 /// The mask selecting the offset within a [`PAGE_SIZE`] page.
 pub const PAGE_MASK: u64 = PAGE_SIZE - 1;
+
+/// The address space a **computed near transfer's target** is checked in.
+///
+/// Nothing is stored here and nothing is read from here: a host answers a
+/// load in this space without touching memory at all, by testing the address
+/// and nothing else. It exists because of a shape the IR has and this
+/// frontend needed:
+///
+/// > In 64-bit mode `Exec::jump_near` raises `#GP(0)` for a target that is not
+/// > canonical — an exception **at the transfer**, with the pre-instruction
+/// > state restored.
+///
+/// A block can deliver that, and the machinery is already there: a boundary's
+/// live map *is* the pre-instruction state, and `cpu::x86::engine`'s fault
+/// path publishes it and hands the fault to `Exec::deliver` without
+/// re-executing anything. What was missing is a way for a block to *say*
+/// "fault here", and [`IrHost`](crate::ir::IrHost)'s only failing methods are
+/// its load and its store — everything else in the op set returns a value.
+/// So the check is spelled as the access it architecturally is: an
+/// [`AccessKind::Fetch`] of the target, which either may be fetched from or
+/// may not.
+///
+/// The three earlier attempts are worth recording, because each fails on the
+/// **clock** rather than on the state, and the clock is hashed:
+///
+/// * a side exit that resumes at the transfer re-executes it, so the target's
+///   own fetch, its operand read and its static charge are all paid twice;
+/// * rolling those charges back is not sound either — the operand read filled
+///   a translation buffer and may have written an accessed bit, so the
+///   interpreter's second attempt is *cheaper* than a first one would have
+///   been, which is a divergence in the other direction;
+/// * and it cannot be rolled back at all without also restoring
+///   `State::open_bus`, which the read latched and which is in the snapshot.
+///
+/// Delivering the fault where it happens has none of those, because nothing
+/// happens twice.
+///
+/// # The contract a host owes
+///
+/// A load in this space **makes no bus cycle, charges no clocks and reads no
+/// memory**. It answers `Ok(0)` when the address is canonical
+/// ([`prot::canonical`](super::prot::canonical)) and a `#GP(0)` when it is
+/// not. Three hosts implement it — `cpu::x86::engine`'s, and both of
+/// [`differential`](super::differential)'s — and the differential corpus
+/// generates the transfers that reach it, in the world that has them.
+///
+/// The value is this frontend's own: `MemSpace` is an extensible newtype
+/// (`ir::op`), only [`MemSpace::MEM`] and [`MemSpace::IO`] have a crate-wide
+/// meaning, and a space number is interpreted by the host a frontend is
+/// paired with and by nothing else. `jit::x86`'s `Compiler::inlinable` already
+/// refuses to inline anything that is not [`MemSpace::MEM`], so both backends
+/// route this to the host without knowing what it is.
+pub const TRANSFER: MemSpace = MemSpace(0x86);
 
 /// How many guest instructions [`lift`] takes by default.
 ///
@@ -1861,6 +1946,40 @@ impl<'a> Lifter<'a> {
         }
     }
 
+    /// Check that a computed near transfer may transfer to `target`.
+    ///
+    /// Nothing below long mode: [`World::of`] insists on a flat 4 GiB code
+    /// segment there, which discharges `Exec::jump_near`'s limit check for
+    /// every target at once — which is why the same three instructions were
+    /// always lifted in the narrow world and never in the wide one.
+    ///
+    /// In long mode it is one [`Opcode::LD`] in [`TRANSFER`], emitted **after**
+    /// every effect the interpreter makes before its own check and before any
+    /// of the transfer's own state is bound. For `RET` that is after the stack
+    /// read; for `CALL r/m` it is after the return address has been *pushed*,
+    /// because `Exec::call_near` pushes before it jumps and a fault does not
+    /// unwrite a store — the register file is rolled back and the stack word
+    /// stays written, on hardware and here.
+    fn require_transfer(&mut self, target: Temp) {
+        if !self.world.long() {
+            return;
+        }
+        let mem = MemOp {
+            size: Width::U8,
+            sign: Sign::Unsigned,
+            space: TRANSFER,
+            // No segment: 64-bit mode has none to check, and the host must not
+            // reach `Exec::read_mem` for this at all.
+            seg: None,
+            endian: Endian::Little,
+            align: Align::None,
+            kind: AccessKind::Fetch,
+            // It can fault, which is the entire point, so it is not removable.
+            volatile: true,
+        };
+        let _ = self.b.load(Type::I64, target, mem);
+    }
+
     /// The self-modifying-code check: leave the block when this store landed in
     /// the page the block was lifted from.
     ///
@@ -2639,6 +2758,7 @@ impl<'a> Lifter<'a> {
                     return Flow::Rejected;
                 };
                 let target = self.mask_to(t, mask_of(f.opsize));
+                self.require_transfer(target);
                 self.pc_out = Some(target);
                 Flow::Transfer
             }
@@ -2679,11 +2799,22 @@ impl<'a> Lifter<'a> {
                 };
                 let ret = self.konst(next_eip);
                 self.push(ret, f.opsize);
+                // After the push, because `Exec::call_near` pushes and then
+                // transfers: a target the transfer rejects leaves the stack
+                // already written, which is what hardware does too.
+                self.require_transfer(target);
                 self.pc_out = Some(target);
                 Flow::Transfer
             }
             Plan::Ret { extra } => {
                 let ip = self.pop(f.opsize);
+                let target = self.mask_to(ip, mask_of(f.opsize));
+                // `Exec::RET` pops, then jumps, then adds the extra bytes, so
+                // the check sits between the pop and the rest. Where the two
+                // land is not observable — a fault publishes the boundary's
+                // map, which is the state before any of this — but matching
+                // the order costs nothing and means one fewer thing to argue.
+                self.require_transfer(target);
                 if extra != 0 {
                     let esp = self.read_r(4);
                     let k = self.konst(extra);
@@ -2692,7 +2823,6 @@ impl<'a> Lifter<'a> {
                     let sp = self.mask_to(moved, mask);
                     self.write_r(4, sp);
                 }
-                let target = self.mask_to(ip, mask_of(f.opsize));
                 self.pc_out = Some(target);
                 Flow::Transfer
             }
@@ -2903,33 +3033,69 @@ impl<'a> Lifter<'a> {
             self.write_flag(F_AF, af);
         }
 
-        let value = match nz {
-            None => r,
-            Some(nz) => {
-                for i in 0..6 {
-                    if self.fl[i] == before[i] {
-                        continue;
-                    }
-                    let old = match before[i] {
-                        Some(t) => t,
-                        // Nothing in this block has bound the flag, so the
-                        // host's own copy is still the architectural one and a
-                        // slot read is the right way to reach it. Emitted here
-                        // rather than up front so that a shift whose count is
-                        // never zero costs nothing for it.
-                        None => self.b.get_slot(Type::I1, FLAG_SLOTS[i]),
-                    };
-                    let new = match self.fl[i] {
-                        Some(t) => t,
-                        None => continue,
-                    };
-                    let chosen = self.b.emit(Opcode::MOVCOND, Type::I1, &[nz, new, old]);
-                    self.write_flag(i, chosen);
-                }
-                self.b.emit(Opcode::MOVCOND, Type::I64, &[nz, r, a])
-            }
+        // A `CL` count of zero leaves every flag alone, so each one the shift
+        // wrote is selected against the binding it had before.
+        let Some(nz) = nz else {
+            return self.write_arg(f, insn.dst, size, r);
         };
-        self.write_arg(f, insn.dst, size, value)
+        for i in 0..6 {
+            if self.fl[i] == before[i] {
+                continue;
+            }
+            let old = match before[i] {
+                Some(t) => t,
+                // Nothing in this block has bound the flag, so the host's own
+                // copy is still the architectural one and a slot read is the
+                // right way to reach it. Emitted here rather than up front so
+                // that a shift whose count is never zero costs nothing for it.
+                None => self.b.get_slot(Type::I1, FLAG_SLOTS[i]),
+            };
+            let new = match self.fl[i] {
+                Some(t) => t,
+                None => continue,
+            };
+            let chosen = self.b.emit(Opcode::MOVCOND, Type::I1, &[nz, new, old]);
+            self.write_flag(i, chosen);
+        }
+        // The write-back, and the selection is over the whole **slot** rather
+        // than over the operand. Nothing above has written the destination, so
+        // the slot as it stands here is the slot as the instruction found it.
+        //
+        // `Exec::shift` returns before it even reads the operand when a `CL`
+        // count masks to zero: nothing is written. Selecting the operand's own
+        // old value and writing *that* back says the same thing at eight and
+        // sixteen bits, where a write preserves what is above it — and says
+        // something else entirely at a 32-bit operand in long mode, where a
+        // doubleword write **zero-extends** and would clear the upper half of
+        // a register the instruction never touched. So the block writes
+        // unconditionally and then chooses between the slot as it now is and
+        // the slot as it was, which has no width to be wrong at.
+        //
+        // Found by the corpus the day it started generating in this world:
+        // `ror ecx, cl` with `CL` zero and `RCX` holding a linear address
+        // above 2^32.
+        let dst_slot = Self::shift_slot(f, size);
+        let slot_before = self.read_r(dst_slot);
+        if !self.write_arg(f, insn.dst, size, r) {
+            return false;
+        }
+        let slot_after = self.read_r(dst_slot);
+        let chosen = self
+            .b
+            .emit(Opcode::MOVCOND, Type::I64, &[nz, slot_after, slot_before]);
+        self.write_r(dst_slot, chosen);
+        true
+    }
+
+    /// The register slot a shift by `CL` writes.
+    ///
+    /// `classify` refuses a `CL` count with a memory destination, so the
+    /// destination is a register and this is total. It is not always
+    /// `Fields::rm_num`: without a `REX` prefix a byte-sized register number
+    /// four is `AH` rather than `SPL`, which lives in slot zero.
+    fn shift_slot(f: &Fields, size: u8) -> u8 {
+        let n = f.rm_num();
+        if size == 1 && !f.has_rex() { n & 3 } else { n }
     }
 
     fn shl(&mut self, a: Temp, n: Amount, bits: u32, mask: u64) -> Temp {
@@ -3360,7 +3526,19 @@ fn classify(world: &World, f: &Fields, next_eip: u64) -> Option<Plan> {
     // below already resolve. Outside long mode the byte is an `INC` or a `DEC`
     // and the decoder never sets the field, so this is a statement about the
     // world rather than a check that can fire.
-    if f.lock || f.rep.is_some() || (!long && f.has_rex()) {
+    //
+    // The one exception is a repeat prefix in front of a **no-operation**, and
+    // it is not a special case so much as the two encodings the rule was
+    // costing most: `F3 90` is `PAUSE` and `F3 0F 1E FA` is `ENDBR64`, and
+    // `Exec` reaches `f.rep` only from `Exec::string` and from the 8088's
+    // `DIV` sign inversion — so for these two operations the prefix is decoded
+    // for its length and means nothing at all, on both sides of the
+    // differential. On a real 64-bit kernel they are 17.7 M of the 105 M
+    // instructions this frontend was handing back.
+    if f.lock || (!long && f.has_rex()) {
+        return None;
+    }
+    if f.rep.is_some() && !matches!(insn.op, Op::NOP | Op::NOPR) {
         return None;
     }
     // The address size the mode itself gives, and nothing else: 16-bit
@@ -3479,14 +3657,26 @@ fn classify(world: &World, f: &Fields, next_eip: u64) -> Option<Plan> {
         Op::CBW => Plan::Cbw,
         Op::CWD => Plan::Cwd,
         Op::BSWAP => Plan::Bswap,
-        // `90` with `REX.B` is architecturally `XCHG R8, RAX` rather than a
-        // no-operation, and `Exec` executes it as a `NOP` — the table has no
-        // `XCHG` row at `90`. That is an interpreter gap rather than a lifter
-        // one, and this plan reproduces it deliberately: the interpreter is
-        // the oracle, so the frontend agreeing with it is the contract and
-        // disagreeing would be a divergence rather than a fix. Fixing it is a
-        // change to `isa`'s table, and this comment is the note it needs.
+        // `90` with `REX.B` is `XCHG R8, RAX` rather than a no-operation
+        // (*Intel SDM* volume 2, `NOP`), and `Exec` executes the exchange —
+        // the table has no `XCHG` row at `90`, so `Op::NOP`'s arm does it.
+        // This comment used to say the interpreter ignored the bit and that
+        // the frontend reproduced the gap deliberately; the interpreter does
+        // not ignore it, so what the frontend reproduced was a divergence
+        // nothing generated. The encoding leaves the subset rather than
+        // growing a second `XCHG` path for one byte of it.
+        Op::NOP if f.rex & 1 != 0 => return None,
         Op::NOP => Plan::Nop,
+        // The reserved-NOP space — `0F 0D` and `0F 18`-`0F 1F`, the multi-byte
+        // `NOP` a compiler pads with and `ENDBR64` among them. `Exec::execute`
+        // answers it with an empty arm: the ModRM byte and its displacement
+        // were decoded so the instruction has the right length, and the
+        // operand is never read. So the whole of it is one static charge and
+        // nothing else, which is exactly [`Plan::Nop`] — and it was the
+        // **largest single thing** this frontend refused, 41.5 M instructions
+        // on a 900-second `pc64` boot, because `0F 1F /0` is on every fifth
+        // line of a 64-bit kernel.
+        Op::NOPR => Plan::Nop,
         Op::CALL => {
             // A near transfer masks its target to the operand size, so a `66`
             // prefix would truncate the program counter to sixteen bits — a
@@ -3501,7 +3691,7 @@ fn classify(world: &World, f: &Fields, next_eip: u64) -> Option<Plan> {
                 Arg::Jv | Arg::Jb => Plan::CallRel {
                     target: static_target(long, relative(f, next_eip))?,
                 },
-                _ => computed_transfer(long, Plan::CallInd)?,
+                _ => Plan::CallInd,
             }
         }
         Op::JMP => {
@@ -3512,7 +3702,7 @@ fn classify(world: &World, f: &Fields, next_eip: u64) -> Option<Plan> {
                 Arg::Jv | Arg::Jb => Plan::JmpRel {
                     target: static_target(long, relative(f, next_eip))?,
                 },
-                _ => computed_transfer(long, Plan::JmpInd)?,
+                _ => Plan::JmpInd,
             }
         }
         Op::RET => {
@@ -3524,7 +3714,7 @@ fn classify(world: &World, f: &Fields, next_eip: u64) -> Option<Plan> {
             } else {
                 0
             };
-            computed_transfer(long, Plan::Ret { extra })?
+            Plan::Ret { extra }
         }
         op if op.is_conditional_jump() => {
             if f.opsize != pointer_bytes(long) {
@@ -3566,21 +3756,6 @@ fn static_target(long: bool, target: u64) -> Option<u64> {
         return None;
     }
     Some(target)
-}
-
-/// A near transfer to an address the block cannot know, admitted only where
-/// the target cannot fault.
-///
-/// `RET`, `JMP r/m` and `CALL r/m` in long mode transfer to a value read out
-/// of a register or off the stack, and `Exec::jump_near` raises `#GP(0)` when
-/// it is not canonical — an exception at the *transfer*, with the pre-
-/// instruction state restored, which a block whose branches all go forward
-/// over an exit cannot deliver. Below long mode the same instructions are in
-/// the subset because `CS` is required to be a flat 4 GiB segment and there is
-/// then no target to reject. This is the one place the two worlds differ in
-/// what they admit rather than in how they lift it.
-const fn computed_transfer(long: bool, plan: Plan) -> Option<Plan> {
-    if long { None } else { Some(plan) }
 }
 
 /// The target of a relative jump: the address of the *next* instruction plus
@@ -3666,6 +3841,15 @@ mod tests {
 
     fn ops(block: &Block) -> Vec<&'static str> {
         block.insts().iter().map(|i| i.op.name()).collect()
+    }
+
+    /// How many computed-near-transfer target checks a block carries.
+    fn checks(block: &Block) -> usize {
+        block
+            .insts()
+            .iter()
+            .filter(|i| i.mem.is_some_and(|m| m.space == TRANSFER))
+            .count()
     }
 
     // -- the world -------------------------------------------------------
@@ -4100,15 +4284,20 @@ mod tests {
         assert_eq!(count(&l.block, Opcode::MULU2), 0);
     }
 
-    /// A computed near transfer is out of the long-mode subset.
+    /// A computed near transfer carries its canonical check in long mode, and
+    /// carries nothing below it.
     ///
-    /// `Exec::jump_near` raises `#GP(0)` on a non-canonical target and the
-    /// pre-instruction state is what a guest then observes — an exception *at*
-    /// the transfer, which a block whose branches all go forward over an exit
-    /// cannot deliver. Below long mode the same three instructions are in the
-    /// subset, because a flat 4 GiB `CS` leaves no target to reject.
+    /// `Exec::jump_near` raises `#GP(0)` on a non-canonical target — an
+    /// exception *at* the transfer, with the pre-instruction state restored.
+    /// [`TRANSFER`] is how a block says that, and this asserts the shape:
+    /// exactly one check per transfer, in the world that has one, emitted
+    /// **after** the operand read that may itself fault and after `CALL`'s
+    /// push. Below long mode a flat 4 GiB `CS` leaves no target to reject and
+    /// there is nothing to emit, which is the half a differential comparison
+    /// cannot see — an omitted check diverges only on a target no generated
+    /// case produces.
     #[test]
-    fn a_computed_near_transfer_is_out_of_the_subset_in_long_mode_only() {
+    fn a_computed_near_transfer_checks_its_target_in_long_mode_only() {
         let mut world = paged_world(0x0020_0000);
         world.bits = Bits::B64;
         for bytes in [
@@ -4124,12 +4313,59 @@ mod tests {
                 Smc::EndBlock,
                 Flags::default(),
             );
-            assert_eq!(l.insns, 0, "{bytes:02x?} must not lift in long mode");
-            assert_eq!(l.stop, Stop::Unsupported);
-            // The same encoding in the 32-bit world is lifted.
+            assert_eq!(l.insns, 1, "{bytes:02x?} lifts in long mode");
+            assert_eq!(
+                checks(&l.block),
+                1,
+                "{bytes:02x?} must check its target exactly once"
+            );
+            // The same encoding in the 32-bit world is lifted, and checks
+            // nothing.
             let flat = plain(bytes);
             assert_eq!(flat.insns, 1, "{bytes:02x?} lifts below long mode");
+            assert_eq!(
+                checks(&flat.block),
+                0,
+                "{bytes:02x?} has nothing to reject below long mode"
+            );
         }
+    }
+
+    /// A `CALL r/m` pushes before it checks, because `Exec::call_near` does.
+    ///
+    /// A fault does not unwrite a store: the register file rolls back and the
+    /// return address stays on the stack, on hardware and here. A check
+    /// emitted before the push would leave the stack untouched on a
+    /// non-canonical target, which is a divergence a corpus reaches only when
+    /// it draws one.
+    #[test]
+    fn a_computed_call_pushes_before_it_checks() {
+        let mut world = paged_world(0x0020_0000);
+        world.bits = Bits::B64;
+        let l = lift_at(
+            &world,
+            AT,
+            &[0xff, 0xd0],
+            Shape::default(),
+            Smc::EndBlock,
+            Flags::default(),
+        );
+        let store = l
+            .block
+            .insts()
+            .iter()
+            .position(|i| i.op == Opcode::ST)
+            .expect("the pushed return address");
+        let check = l
+            .block
+            .insts()
+            .iter()
+            .position(|i| i.mem.is_some_and(|m| m.space == TRANSFER))
+            .expect("the check");
+        assert!(
+            store < check,
+            "the return address must be pushed before the target is judged"
+        );
     }
 
     /// A rotate by `CL` at sixty-four bits reduces its complement, so no shift
@@ -4226,6 +4462,55 @@ mod tests {
         // and `rep` is a loop.
         assert_eq!(plain(&[0xf0, 0xff, 0x00]).insns, 0);
         assert_eq!(plain(&[0xf3, 0x01, 0xc8]).insns, 0);
+        // A repeat prefix in front of a **string** instruction is the loop the
+        // rule is about, and it stays refused now that the prefix in front of
+        // a no-operation does not.
+        assert_eq!(plain(&[0xf3, 0xa4]).insns, 0, "rep movsb");
+        assert_eq!(plain(&[0xf3, 0xab]).insns, 0, "rep stosd");
+        assert_eq!(plain(&[0xf2, 0xa6]).insns, 0, "repne cmpsb");
+        // And so is a string instruction with no prefix at all: it moves two
+        // pointers and a counter, none of which this frontend lifts.
+        assert_eq!(plain(&[0xa4]).insns, 0, "movsb");
+        assert_eq!(plain(&[0xab]).insns, 0, "stosd");
+    }
+
+    /// `PAUSE` and `ENDBR64` carry a repeat prefix and are lifted anyway.
+    ///
+    /// The exception the rule above has, and the one worth stating by shape as
+    /// well as differentially: `Exec` reaches `Fields::rep` only from
+    /// `Exec::string` and from the 8088's `DIV` sign inversion, so in front of
+    /// a no-operation the prefix is decoded for its length and means nothing.
+    #[test]
+    fn a_repeat_prefix_in_front_of_a_no_operation_is_lifted() {
+        assert_eq!(plain(&[0xf3, 0x90]).insns, 1, "pause");
+        let mut world = paged_world(0x0020_0000);
+        world.bits = Bits::B64;
+        for (what, bytes) in [
+            ("pause", &[0xf3u8, 0x90][..]),
+            ("endbr64", &[0xf3, 0x0f, 0x1e, 0xfa][..]),
+            ("nop dword [rax]", &[0x0f, 0x1f, 0x40, 0x00][..]),
+            ("prefetch [rax]", &[0x0f, 0x18, 0x08][..]),
+        ] {
+            let l = lift_at(
+                &world,
+                AT,
+                bytes,
+                Shape::default(),
+                Smc::EndBlock,
+                Flags::default(),
+            );
+            assert_eq!(l.insns, 1, "{what} lifts");
+        }
+        // `90` with `REX.B` is `XCHG R8, RAX` and is not one of them.
+        let l = lift_at(
+            &world,
+            AT,
+            &[0x49, 0x90],
+            Shape::default(),
+            Smc::EndBlock,
+            Flags::default(),
+        );
+        assert_eq!(l.insns, 0, "49 90 is an exchange, not a no-operation");
     }
 
     // -- ticks and the page bound ----------------------------------------

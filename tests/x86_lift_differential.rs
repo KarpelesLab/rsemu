@@ -879,6 +879,169 @@ fn a_program_of_pure_flag_arithmetic_agrees_bit_for_bit() {
     }
 }
 
+/// A computed near transfer in long mode, to a target the transfer must
+/// reject and to one it must take.
+///
+/// The instructions `lift::TRANSFER` exists for. `Exec::jump_near` raises
+/// `#GP(0)` on a non-canonical target — an exception *at* the transfer with
+/// the pre-instruction state restored — and a block delivers it through its
+/// own boundary rather than by handing the instruction back. What is compared
+/// is every column [`compare`] compares at a fault: all sixteen registers,
+/// `RIP`, `EFLAGS` whole, the cycle counter, and guest RAM byte for byte.
+///
+/// The last of those is why `CALL` is here beside `JMP`: `Exec::call_near`
+/// pushes the return address and *then* transfers, so a rejected target
+/// leaves the stack written and the registers rolled back. A block that
+/// checked before it pushed would agree about every register and disagree
+/// about eight bytes of memory.
+#[test]
+fn a_computed_near_transfer_is_judged_the_same_by_both_engines() {
+    // `0x1234_5678_9abc_def0` is not canonical: bits 63..47 are not all equal.
+    const BAD: u64 = 0x1234_5678_9abc_def0;
+    let rejected: [(&str, Vec<u8>); 2] = [
+        ("jmp r15", vec![0x41, 0xff, 0xe7]),
+        ("call r15", vec![0x41, 0xff, 0xd7]),
+    ];
+    for (what, program) in rejected {
+        let case = Case::seeded(program).long().with_reg(15, BAD);
+        match compare(&case) {
+            Ok(Verdict::Trapped { .. }) => {}
+            other => panic!("{what} to a non-canonical target: expected a trap, got {other:?}"),
+        }
+    }
+    // And the same three where the target is canonical, so the check is a
+    // check rather than an unconditional refusal. `R11` is one of the
+    // registers `Case::seeded` aims at the data window, which in long mode is
+    // a linear address below 2^48.
+    let taken: [(&str, Vec<u8>); 2] = [
+        ("jmp r11", vec![0x41, 0xff, 0xe3]),
+        ("call r11", vec![0x41, 0xff, 0xd3]),
+    ];
+    // `RET` is not here and cannot be: the word it transfers to has to be put
+    // on the stack first, and under `Smc::EndBlock` -- which paging forces, and
+    // long mode forces paging -- a store is the last instruction in its block.
+    // So `push r15; ret` is two blocks, which is the *next* test.
+    for (what, program) in taken {
+        match compare(&Case::seeded(program).long()) {
+            Ok(Verdict::Agreed { .. }) => {}
+            other => panic!("{what} to a canonical target: expected agreement, got {other:?}"),
+        }
+    }
+}
+
+/// The same three through the block cache and the host code generator.
+///
+/// [`compare`] runs one freshly lifted block on the portable backend, so on
+/// its own it says nothing about what `jit::x86` emits for a load in a space
+/// it has never heard of — which is what the check is. `Compiler::inlinable`
+/// refuses anything that is not `MemSpace::MEM`, so it becomes a call into the
+/// host; this is the assertion that it does.
+#[test]
+fn a_computed_near_transfer_is_judged_the_same_through_the_runtime() {
+    const BAD: u64 = 0x1234_5678_9abc_def0;
+    // `push` then `ret` is two blocks under `Smc::EndBlock`, which is what
+    // makes a chained runtime the only place a `RET` to a *chosen* word can be
+    // tested at all — and the third case is the one that matters, because a
+    // block that transfers to a word it has just put there is what a function
+    // return is.
+    let cases: [(&str, Vec<u8>, bool); 5] = [
+        ("jmp r15", vec![0x41, 0xff, 0xe7], true),
+        ("call r15", vec![0x41, 0xff, 0xd7], true),
+        ("push r15; ret", vec![0x41, 0x57, 0xc3], true),
+        ("jmp r11", vec![0x41, 0xff, 0xe3], false),
+        ("push r11; ret", vec![0x41, 0x53, 0xc3], false),
+    ];
+    for (what, program, rejects) in cases {
+        let case = Case::seeded(program).long().with_reg(15, BAD);
+        let verdict = compare_cached(&case, 8).expect("the cached runtime agrees");
+        assert_eq!(
+            matches!(verdict, Verdict::Trapped { .. }),
+            rejects,
+            "{what} through the cached runtime: {verdict:?}"
+        );
+        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        {
+            let verdict = rsemu::cpu::x86::differential::compare_compiled(&case, 8)
+                .expect("the host code generator agrees");
+            assert_eq!(
+                matches!(verdict, Verdict::Trapped { .. }),
+                rejects,
+                "{what} as host code: {verdict:?}"
+            );
+        }
+    }
+}
+
+/// The reserved-NOP space, and a repeat prefix in front of a no-operation.
+///
+/// The largest thing this frontend used to hand back — `0F 1F /0` is on every
+/// fifth line of a 64-bit kernel and `F3 0F 1E FA` begins every one of its
+/// functions. Both are in the generated corpus now; this is the direct case,
+/// because a form that stops lifting would show up there as a slightly lower
+/// instruction count and nowhere else.
+#[test]
+fn the_reserved_nop_space_lifts_in_both_worlds() {
+    let long: [(&str, Vec<u8>); 5] = [
+        (
+            "nop dword [rax]",
+            vec![0x0f, 0x1f, 0x40, 0x00, 0x48, 0xff, 0xc0],
+        ),
+        (
+            "nop word ax",
+            vec![0x66, 0x0f, 0x1f, 0xc0, 0x48, 0xff, 0xc0],
+        ),
+        ("endbr64", vec![0xf3, 0x0f, 0x1e, 0xfa, 0x48, 0xff, 0xc0]),
+        ("pause", vec![0xf3, 0x90, 0x48, 0xff, 0xc0]),
+        ("prefetch", vec![0x0f, 0x18, 0x08, 0x48, 0xff, 0xc0]),
+    ];
+    for (what, program) in long {
+        match compare(&Case::seeded(program).long()) {
+            Ok(Verdict::Agreed { insns, .. }) => {
+                assert_eq!(insns, 2, "{what} and the increment after it both lift");
+            }
+            other => panic!("{what} in long mode: {other:?}"),
+        }
+    }
+    let flat: [(&str, Vec<u8>); 3] = [
+        ("nop dword [eax]", vec![0x0f, 0x1f, 0x40, 0x00, 0x40]),
+        ("nop word ax", vec![0x66, 0x0f, 0x1f, 0xc0, 0x40]),
+        ("pause", vec![0xf3, 0x90, 0x40]),
+    ];
+    for (what, program) in flat {
+        match compare(&Case::seeded(program)) {
+            Ok(Verdict::Agreed { insns, .. }) => {
+                assert_eq!(insns, 2, "{what} and the increment after it both lift");
+            }
+            other => panic!("{what} in 32-bit protected mode: {other:?}"),
+        }
+    }
+}
+
+/// `90` with `REX.B` is an exchange, and the frontend must not lift it.
+///
+/// It used to, as a no-operation, while `Exec` performed the exchange — so
+/// `49 90` in a block left `RAX` and `R8` unswapped. The encoding is now
+/// refused, which shows up here as the block ending before it: the `inc` after
+/// it does not lift, and `R8` and `RAX` are whatever the interpreter's own
+/// single step made of them.
+#[test]
+fn ninety_with_the_base_bit_is_an_exchange_and_leaves_the_subset() {
+    // `xchg r8, rax` then `inc rax`. If the exchange lifted, two instructions
+    // would retire; it does not, so the block is empty and `compare` says so.
+    let case = Case::seeded(vec![0x49, 0x90, 0x48, 0xff, 0xc0]).long();
+    assert_eq!(
+        compare(&case).expect("no divergence"),
+        Verdict::Nothing,
+        "49 90 is XCHG R8, RAX and must not lift as a NOP"
+    );
+    // And a plain `90`, with no `REX.B`, still does.
+    let case = Case::seeded(vec![0x90, 0x48, 0xff, 0xc0]).long();
+    match compare(&case) {
+        Ok(Verdict::Agreed { insns, .. }) => assert_eq!(insns, 2),
+        other => panic!("90 is a no-operation without REX.B: {other:?}"),
+    }
+}
+
 #[test]
 fn a_call_and_a_return_agree_through_the_stack() {
     let program = vec![
@@ -910,14 +1073,45 @@ fn a_shift_by_cl_agrees_at_every_count_including_zero() {
     // The one instruction in the subset whose *whole effect* is conditional: a
     // count of zero writes no flag and no operand, which the lifter expresses
     // as a select rather than a branch.
+    //
+    // Three widths and three worlds, because "writes no operand" is a
+    // different statement at each of them:
+    //
+    // * `D3` at a 32-bit operand **in long mode** is where it stopped being
+    //   true — a doubleword write zero-extends, so putting the old operand
+    //   back clears the upper half of a register the instruction never
+    //   touched. The destination therefore starts with something above 2^32
+    //   in it, which is what `HIGH` gives a pointer register;
+    // * `D2` is the byte form, where register number four without a `REX`
+    //   prefix is `AH` and lives in slot **zero** — a write-back that
+    //   preserved the wrong slot would be invisible at every other width;
+    // * and `D3` at 32 bits with paging off, which is where this test started.
     for op in [0xe0u8, 0xe8, 0xf8, 0xc0, 0xc8, 0xd0, 0xd8] {
         for count in [0u32, 1, 7, 31, 32, 33, 255] {
-            let program = vec![0xd3, op, 0xf4];
-            let case = Case::seeded(program)
-                .with_reg(0, 0x8123_4567)
+            for (what, program) in [("d3", vec![0xd3u8, op, 0xf4]), ("d2", vec![0xd2, op, 0xf4])] {
+                let case = Case::seeded(program.clone())
+                    .with_reg(0, 0x8123_4567)
+                    .with_reg(1, u64::from(count))
+                    .with_eflags(0x0002 | 0x0001);
+                compare(&case).unwrap_or_else(|e| panic!("{what} /{op:#x} by {count}: {e}"));
+                // The same in long mode, over a *seeded* accumulator: `RAX`
+                // there is a linear address in the high window, so its upper
+                // half is not zero and a write-back that narrowed it would
+                // show up immediately.
+                let case = Case::seeded(program)
+                    .long()
+                    .with_reg(1, u64::from(count))
+                    .with_eflags(0x0002 | 0x0001);
+                compare(&case)
+                    .unwrap_or_else(|e| panic!("{what} /{op:#x} by {count} in long mode: {e}"));
+            }
+            // And the byte form addressed through register number four, which
+            // is `AH` without a `REX` prefix and `SPL` with one -- the pair
+            // `Lifter::shift_slot` exists for.
+            let case = Case::seeded(vec![0xd2u8, op | 4, 0xf4])
                 .with_reg(1, u64::from(count))
                 .with_eflags(0x0002 | 0x0001);
-            compare(&case).unwrap_or_else(|e| panic!("d3 /{op:#x} by {count}: {e}"));
+            compare(&case).unwrap_or_else(|e| panic!("d2 /{op:#x} on AH by {count}: {e}"));
         }
     }
 }

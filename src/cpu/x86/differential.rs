@@ -1493,6 +1493,17 @@ impl Host {
     }
 
     fn access(&mut self, mem: &MemOp, addr: u64, value: Option<u64>) -> MemResult<u64> {
+        // `lift::TRANSFER` is not a space anything is in: it is a computed
+        // near transfer asking whether its target may be transferred to, which
+        // is `Exec::jump_near`'s canonical test. No memory, no bus cycle, no
+        // clocks. See `lift`'s constant for the whole contract.
+        if mem.space == lift::TRANSFER {
+            return if crate::cpu::x86::prot::canonical(addr) {
+                Ok(0)
+            } else {
+                Err(BusError::Protected)
+            };
+        }
         if self.mmu.is_some() {
             return self.paged_access(mem, addr, value);
         }
@@ -1692,7 +1703,13 @@ fn cached(case: &Case, blocks: usize, compiled: bool) -> Result<Verdict, Diverge
             format!("the block cache is inconsistent: {e}"),
         ));
     }
-    if run.insns == 0 {
+    // Nothing retired **and** nothing faulted: the first instruction was
+    // outside the subset. A fault on the first instruction of the first block
+    // also retires nothing and is the opposite of nothing happening — it is
+    // the precise-state comparison at its sharpest, and reporting it as
+    // `Nothing` was how this harness quietly passed a computed near transfer
+    // whose target it never judged.
+    if run.insns == 0 && !matches!(run.stop, Stop::Fault(_)) {
         return Ok(Verdict::Nothing);
     }
 
@@ -2115,6 +2132,17 @@ impl CachedHost {
     }
 
     fn access(&mut self, mem: &MemOp, addr: u64, value: Option<u64>) -> MemResult<u64> {
+        // `lift::TRANSFER` is not a space anything is in: it is a computed
+        // near transfer asking whether its target may be transferred to, which
+        // is `Exec::jump_near`'s canonical test. No memory, no bus cycle, no
+        // clocks. See `lift`'s constant for the whole contract.
+        if mem.space == lift::TRANSFER {
+            return if crate::cpu::x86::prot::canonical(addr) {
+                Ok(0)
+            } else {
+                Err(BusError::Protected)
+            };
+        }
         if self.mmu.is_some() {
             return self.paged_access(mem, addr, value);
         }
@@ -2243,7 +2271,7 @@ pub fn synthesize(form: u32, fields: u32) -> Vec<u8> {
     // a SIB byte and base 5 is `EBP`, so the two are simply not generated.
     let rm8 = |op: u8, r: u8, b: u8, d: i8| vec![op, 0x40 | (r << 3) | b, d as u8];
 
-    match form % 49 {
+    match form % 56 {
         // -- the ALU, register to register, at three widths -----------------
         0 => rr(0x01, reg, rm),         // add r/m32, r32
         1 => rr(0x03, reg, rm),         // add r32, r/m32
@@ -2336,6 +2364,36 @@ pub fn synthesize(form: u32, fields: u32) -> Vec<u8> {
         45 => rm8(0x3b, reg, base, disp), // cmp r32, [base+d]
         46 => rm8(0x39, reg, base, disp), // cmp [base+d], r32
         47 => rm8(0x85, reg, base, disp), // test [base+d], r32
+        // -- the computed near transfers -----------------------------------
+        //
+        // In the flat 4 GiB code segment `World::of` insists on there is no
+        // target to reject, so all three are lifted here with no check at
+        // all — which is the half of `lift::TRANSFER`'s rule that says
+        // *nothing*, and the half a corpus that never generated a computed
+        // transfer had never run either.
+        48 => vec![0xc3],            // ret
+        49 => vec![0xff, 0xe0 | rm], // jmp r/m32
+        50 => vec![0xff, 0xd0 | rm], // call r/m32
+        // -- the reserved-NOP space, and a repeat prefix in front of one ----
+        //
+        // `0F 1F /0` is the multi-byte NOP a compiler pads with and `F3 90`
+        // is `PAUSE`; both decode a prefix or an operand that is never used
+        // and do nothing at all. On a real kernel they were 59 M of the
+        // instructions this frontend handed back.
+        51 => vec![0x0f, 0x1f, 0x40 | base, disp as u8], // nop dword [base+d]
+        52 => vec![0x66, 0x0f, 0x1f, 0xc0 | rm],         // nop word r/m
+        53 => vec![0xf3, 0x90],                          // pause
+        // A **byte** shift by `CL`, which is the one combination neither
+        // corpus had: `D3` is the word and doubleword form and `C0` is the
+        // byte form with an immediate, so a byte destination and a count that
+        // may be zero never met. That is the pair `Lifter::shift_slot` is
+        // about — `AH` is register number four and lives in slot zero — and a
+        // mutation that wrote back the wrong slot survived a sweep because of
+        // it.
+        54 => {
+            let ext = (fields >> 24) as u8 & 7;
+            vec![0xd2, 0xc0 | (ext << 3) | (rm & 7)]
+        }
         _ => match (fields >> 28) & 7 {
             0 => vec![0xf8],             // clc
             1 => vec![0xf9],             // stc
@@ -2438,7 +2496,7 @@ pub fn synthesize64(form: u32, fields: u32) -> Vec<u8> {
     // A group encoding with the extension in the `reg` field.
     let group = |w: bool, op: u8, n: u8, m: u8| vec![rex(w, 0, m), op, 0xc0 | (n << 3) | (m & 7)];
 
-    match form % 53 {
+    match form % 62 {
         // -- the ALU, register to register, at both operand sizes -----------
         0 => rr(true, 0x01, reg, rm),  // add r/m64, r64
         1 => rr(wide, 0x03, reg, rm),  // add r, r/m
@@ -2568,15 +2626,47 @@ pub fn synthesize64(form: u32, fields: u32) -> Vec<u8> {
             out.push(0xc0 | ((reg & 7) << 3) | (rm & 7));
             out
         }
+        // -- the computed near transfers, which long mode can reject --------
+        //
+        // The whole point of `lift::TRANSFER`, and the reason these are here
+        // rather than only in the 32-bit corpus: `Case::seeded` leaves
+        // `R12`, `R14` and `R15` holding values that are **not canonical**,
+        // so a generated `jmp r/m64` over `SYNTH_REGS64` draws targets the
+        // transfer must reject as well as targets it must take, and
+        // `compare` asserts the state at the fault against the interpreter's.
+        // `RET` pops whatever the data window holds.
+        52 => vec![0xc3],                                     // ret
+        53 => vec![rex(false, 0, rm), 0xff, 0xe0 | (rm & 7)], // jmp r/m64
+        54 => vec![rex(false, 0, rm), 0xff, 0xd0 | (rm & 7)], // call r/m64
+        // -- the reserved-NOP space -----------------------------------------
+        //
+        // `0F 1F /0` is the multi-byte NOP a compiler pads with; `F3 0F 1E FA`
+        // is `ENDBR64`, which begins every function of a kernel built with
+        // indirect-branch tracking; `F3 90` is `PAUSE`. All three are one
+        // static charge and nothing else, on both sides.
+        55 => vec![0x0f, 0x1f, 0x40 | (base & 7), disp as u8], // nop dword [base+d]
+        56 => vec![0x66, 0x0f, 0x1f, 0xc0 | (rm & 7)],         // nop word r/m
+        57 => vec![0xf3, 0x0f, 0x1e, 0xfa],                    // endbr64
+        58 => vec![0xf3, 0x90],                                // pause
+        // The byte shift by `CL`, in both of its long-mode spellings: without
+        // a `REX` prefix register number four is `AH`, with one it is `SPL`.
+        59 => vec![0xd2, 0xc0 | (ext << 3) | (rm & 7)],
+        60 => group(false, 0xd2, ext, rm),
         _ => match (fields >> 28) & 7 {
-            0 => vec![0xf8],                                      // clc
-            1 => vec![0xf9],                                      // stc
-            2 => vec![0xf5],                                      // cmc
-            3 => vec![0x9f],                                      // lahf
-            4 => vec![0x9e],                                      // sahf
-            5 => vec![0x48, 0x98],                                // cdqe
-            6 => vec![0x48, 0x99],                                // cqo
-            _ => vec![rex(wide, 0, reg), 0x0f, 0xc8 | (reg & 7)], // bswap
+            0 => vec![0xf8],       // clc
+            1 => vec![0xf9],       // stc
+            2 => vec![0xf5],       // cmc
+            3 => vec![0x9f],       // lahf
+            4 => vec![0x9e],       // sahf
+            5 => vec![0x48, 0x98], // cdqe
+            6 => vec![0x48, 0x99], // cqo
+            // `90` with `REX.B` is `XCHG R8, RAX` and not a no-operation, so
+            // the frontend refuses it and the block ends there. Generated
+            // deliberately: the encoding used to lift as a `NOP` while the
+            // interpreter performed the exchange, which is a divergence
+            // nothing in the corpus could reach because nothing in the corpus
+            // wrote it.
+            _ => vec![0x49, 0x90],
         },
     }
 }

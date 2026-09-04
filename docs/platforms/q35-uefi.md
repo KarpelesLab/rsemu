@@ -320,6 +320,27 @@ compiling than about the engine is worse than no number. The ordering has not
 changed — `jit-host` is several times the interpreter — and `benches/` is where
 that belongs.
 
+**Re-measured after `cpu::x86::lift` gained the reserved-NOP space, the
+repeat-prefixed no-operations and the computed near transfers, and
+`cpu::x86::engine` stopped answering an unknown block's cost with
+`worst_bound`** — `docs/platforms/pc64.md` measures what each of those was
+worth. A different OVMF build, so the row above is not the control for the row
+below: this one is Gentoo's `edk2-ovmf` `OVMF_CODE.fd`, which stops at
+**366577 ms** rather than 367540, and it is 560 517 194 guest instructions to
+the shell rather than 561 105 521.
+
+| engine | host time | guest instructions retired in blocks |
+| --- | --- | --- |
+| `interp` | 106 s | — |
+| `jit` | 59 s | 547,917,237 of 560,517,194 (97.8%) |
+| `jit-host` | 22 s | 547,917,237 of 560,517,194 (97.8%) |
+
+What travels between the two tables is the shape rather than the ratio: a
+64-bit firmware was already the best case this board had, and the same three
+closures that took `pc64` from 84.5% to 97.3% take it from about 95% to about
+98%. All three engines still stop at the same virtual instant with
+byte-identical output, which is the property this section is about.
+
 The control-register moves are not lifted — `cpu::x86::lift` returns `None` for
 every `MOV` naming `CRn`, `DRn`, `TRn` or a segment register — so `CR8` runs on
 the interpreter under all three by construction, and the frame alignment is in
