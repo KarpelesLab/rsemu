@@ -34,7 +34,7 @@ oxideav-png = { version = "0.1", default-features = false, optional = true }
 # are the two a qcow2 with compressed clusters actually reads through, and both
 # come from `compcol`, which is permitted already. Optional, so the default
 # `cargo tree` is still only `rsemu`.
-fstool = { version = "0.4.24", default-features = false, features = [
+fstool = { version = "0.4.25", default-features = false, features = [
   "gzip",
   "zstd",
 ], optional = true }
@@ -1335,14 +1335,23 @@ dev-medium = []
 # supply, and nothing else: what it backs may be an ATA drive, an NVMe namespace
 # or a `virtio.blk`.
 #
-# **Known cost, and it is not ours to fix here.** `fstool` 0.4 declares its
-# CLI's dependencies unconditionally rather than behind a `cli` feature, so
-# enabling this feature also pulls `clap`, `serde`, `serde_json`, `toml`,
-# `uuid`, `encoding_rs` and (on unix, for the `BLKGETSIZE64` ioctl) `libc` --
-# every one of which CLAUDE.md's dependency policy names as *not* permitted,
-# and the last of which will not link on `*-linux-fullrust`. The default
-# `cargo tree` is still bare, which is what CI gates on, and the fix is a
-# feature split in `fstool`, not a parallel block layer here.
+# **Known cost, and the fix belongs upstream.** Enabling this feature pulls
+# third-party crates that CLAUDE.md's dependency policy names as *not*
+# permitted: `serde`, `serde_json`, `toml`, `uuid`, and (on unix, for the
+# `BLKGETSIZE64` ioctl) `libc` -- the last of which will not link on
+# `*-linux-fullrust`. The default `cargo tree` is still bare, which is what CI
+# gates on, and the remaining fix is a feature split in `fstool`, not a
+# parallel block layer here.
+#
+# That list used to be longer. `fstool` 0.4.25 dropped `caseless` (hashing
+# APFS directory-entry names through `intl` instead), `thiserror`,
+# `encoding_rs`, `crc32fast` and `crc32c`, which took `unicode-normalization`,
+# `tinyvec`, `tinyvec_macros`, `thiserror-impl`, `rustc_version` and `semver`
+# out with them -- 33 third-party crates down to 23. It is also why this crate
+# requires 0.4.25 and not 0.4: `tinyvec` 1.13.0 does not compile on rustc
+# 1.98.0, and until that release it was reachable from any `--all-features`
+# build through `caseless -> unicode-normalization`. The two names that
+# arrived in exchange, `intl` and `charcode`, are Karpeles Lab and MIT.
 dev-blk = ["std", "dev-medium", "dep:fstool"]
 
 # The PC/AT's IDE interface (src/dev/pc/ide.rs): one channel, which is address
