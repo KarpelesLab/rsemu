@@ -171,6 +171,87 @@ fn the_ioctl_numbers_match_the_published_ones() {
     assert_eq!(KVM_SET_REGS.0, 0x4090_ae82);
     assert_eq!(KVM_GET_SREGS.0, 0x8138_ae83);
     assert_eq!(KVM_SET_SREGS.0, 0x4138_ae84);
+
+    // The two whose size field is the *header's*, because the structure ends
+    // in a flexible array — `kvm_msrs` and `kvm_cpuid2` both being two
+    // `__u32`s and then the entries.
+    assert_eq!(KVM_GET_MSRS, 0xc008_ae88);
+    assert_eq!(KVM_SET_MSRS, 0x4008_ae89);
+    assert_eq!(KVM_GET_SUPPORTED_CPUID, 0xc008_ae05);
+    assert_eq!(KVM_SET_CPUID2, 0x4008_ae90);
+}
+
+// ---------------------------------------------------------------------------
+// what a board's processor says it is
+// ---------------------------------------------------------------------------
+
+/// One `CPUID` leaf, for the policy tests.
+fn leaf(function: u32, ecx: u32) -> KvmCpuidEntry2 {
+    KvmCpuidEntry2 {
+        function,
+        ecx,
+        ..KvmCpuidEntry2::default()
+    }
+}
+
+/// The three facilities the board's own device models have not got.
+///
+/// Each of them is a bit a guest reads and then *acts on*, and each names
+/// something that lives in `dev::pc::apic` rather than in the processor.
+#[test]
+fn the_facilities_this_boards_devices_do_not_have_are_not_advertised() {
+    let host = [leaf(
+        1,
+        CPUID1_ECX_MONITOR | CPUID1_ECX_X2APIC | CPUID1_ECX_TSC_DEADLINE | (1 << 0),
+    )];
+    let ours = board_cpuid(&host);
+    assert_eq!(ours.len(), 1);
+    assert_eq!(ours[0].ecx & CPUID1_ECX_X2APIC, 0, "no x2APIC mode");
+    assert_eq!(ours[0].ecx & CPUID1_ECX_TSC_DEADLINE, 0, "no TSC deadline");
+    assert_eq!(ours[0].ecx & CPUID1_ECX_MONITOR, 0, "no MWAIT idle");
+    assert_eq!(ours[0].ecx & 1, 1, "and everything else is the host's");
+    assert_ne!(
+        ours[0].ecx & CPUID1_ECX_HYPERVISOR,
+        0,
+        "the guest is told it is virtualized"
+    );
+}
+
+/// The host's paravirtual leaves are not the board's.
+///
+/// A guest that finds `KVM_FEATURE_CLOCKSOURCE` here takes its time from the
+/// host's clock while every other clock on the board is virtual time.
+#[test]
+fn the_hosts_paravirtual_leaves_do_not_reach_the_guest() {
+    let host = [
+        leaf(0, 0),
+        leaf(0x4000_0000, 0),
+        leaf(0x4000_0001, 0xff),
+        leaf(0x8000_0001, 0),
+    ];
+    let functions: Vec<u32> = board_cpuid(&host).iter().map(|e| e.function).collect();
+    assert_eq!(functions, vec![0, 0x8000_0001]);
+}
+
+/// What this host actually offers, and that it survives being installed.
+#[test]
+fn a_vcpu_is_given_a_cpuid_table_before_it_can_run() {
+    let Some(kvm) = kvm() else { return };
+    let supported = kvm.supported_cpuid().expect("KVM_GET_SUPPORTED_CPUID");
+    assert!(
+        supported.iter().any(|e| e.function == 1),
+        "every x86 host reports leaf 1"
+    );
+    let vm = kvm.create_vm().expect("KVM_CREATE_VM");
+    // `create_vm` has already applied the policy, and `create_vcpu` has
+    // already installed it — a vCPU that reached its first `KVM_RUN` without
+    // one would answer every leaf with zeros.
+    assert!(!vm.cpuid().is_empty());
+    assert!(
+        !vm.cpuid()
+            .iter()
+            .any(|e| (0x4000_0000..=0x4000_00ff).contains(&e.function))
+    );
 }
 
 #[test]

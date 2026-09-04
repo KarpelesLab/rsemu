@@ -32,7 +32,7 @@
 //! [`AccelCpu`] owns a real [`X86`], and that is the design rather than an
 //! implementation detail. `cpu.x86` is nineteen properties, five input pins,
 //! the [`IntAck`] and [`LocalController`] seams and a snapshot chunk at
-//! **version 7**; a second implementation of all of that would be a second
+//! **version 8**; a second implementation of all of that would be a second
 //! thing to keep in step, and the first field to drift would be the one the
 //! cross-engine half of the gate depends on. So the shell is the device, and
 //! this type is the *engine*:
@@ -43,8 +43,25 @@
 //! | `intr`, `reset`, `init`, `a20` pins | the shell's own pins |
 //! | the acknowledge cycle | the shell's `IntAck` list |
 //! | `RESET`, `INIT`, Start-Up sequences | the shell **executes** them |
-//! | every guest instruction | the vCPU |
+//! | an instruction hardware cannot *fetch* | the shell **executes** it |
+//! | every other guest instruction | the vCPU |
 //! | `nmi` | this module, because the shell's latch has no public taker |
+//!
+//! The second row is the one that turned a hypervisor client into an emulator.
+//! **A hypervisor cannot fetch through an MMIO exit** — KVM's instruction
+//! emulator declines to, and the failure arrives as an opaque
+//! `KVM_EXIT_INTERNAL_ERROR` rather than as a diagnosis. That is not a corner
+//! case: `machines/q35-linux.machine` maps its reset vector to sixteen
+//! synthesised bytes of `x86.linuxboot` at `0xfffffff0`, a *device region*,
+//! because the thing at that board's reset vector is a **loader** rather than a
+//! ROM image. So `AccelCpu::fetch_in_hardware` asks, before every entry and
+//! again after an exit it cannot explain, whether the next instruction is
+//! inside a memory slot — and if it is not, the shell runs it. On that board it
+//! is one far jump; after it, everything is hardware. An emulator that carries
+//! an interpreter can do this and a hypervisor client cannot, and it is a
+//! design rather than a patch: the two engines are one machine, so either may
+//! run any instant of it, and the choice is made per fetch by what the hardware
+//! is able to do.
 //!
 //! Running the restart sequences on the interpreter is not a shortcut. They
 //! are exactly the states in which a processor executes *no* guest
@@ -73,6 +90,13 @@
 //!   already does — the honest statement being that an accelerated guest's
 //!   progress is *not* measured in this clock domain, so pretending to measure
 //!   it would be worse than admitting it.
+//!   That cuts both ways and the cost is measured rather than assumed: because
+//!   a guest's *work* costs no virtual time, a guest that spins without exiting
+//!   stops the board's clocks entirely. A stock Linux kernel notices — its
+//!   `mdelay()` between two reads of `jiffies` sees no tick, and `check_timer()`
+//!   panics unless the command line says `no_timer_check`. `tests/kvm_q35_linux.rs`
+//!   has the whole diagnosis and [`accel`](crate::accel)'s **Time** section has
+//!   the fix, which is one level below this module.
 //! * **No sleep.** A halted guest is *parked*: `run` returns having consumed
 //!   its budget and having entered nothing. A `HLT` under a userspace
 //!   interrupt controller comes back as `KVM_EXIT_HLT` and the processor stays
@@ -123,7 +147,16 @@
 //!   and not mirrored into the shell's `init_peer`, for the same reason: no
 //!   public setter. The `INIT` **pin**'s level, which is the one a wire drives,
 //!   is the shell's and is saved.
-//! * **The time-stamp counter**, as [`state`] already says.
+//! * **The time-stamp counter**, as [`state`] already says. Under acceleration
+//!   it is the *host's*, running at the host's rate while every clock on the
+//!   board runs at virtual time — so a guest that calibrates one against the
+//!   other gets a number with no relation to either machine.
+//! * **The processor's identity.** `CPUID` is answered from the host's silicon
+//!   through [`board_cpuid`](super::kvm::board_cpuid) rather than from the
+//!   `variant` property the machine file names, so an accelerated `cpu.x86` and
+//!   an interpreted one are not the same *part*. Deriving the table from
+//!   [`Variant`] is the change that would close it, and it is a change to
+//!   `cpu::x86`'s feature model.
 //!
 //! [`ThreadingMode::Parallel`]: crate::core::sched::ThreadingMode::Parallel
 //! [`ThreadingMode::Accel`]: crate::core::sched::ThreadingMode::Accel
@@ -146,6 +179,7 @@ use crate::core::sync::{AtomicBool, AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::wire::{
     DmaPeripheral, FanIn, IntAck, Level, LocalController, Resolve, WireId, WireSink, WireSource,
 };
+use crate::cpu::x86::isa::seg;
 use crate::cpu::x86::{Variant, X86};
 use crate::machine::{BindCtx, Bindings, Instance};
 
@@ -164,6 +198,16 @@ use super::{AccelError, AccelResult};
 /// guest that runs for milliseconds between exits and the cost of coming back
 /// out is a full architectural-state read.
 const MAX_ENTRIES: u64 = 4096;
+
+/// How many guest instructions one call to [`Device::run`] interprets while
+/// the processor is fetching from something hardware cannot fetch from.
+///
+/// A bound rather than a target: the case this exists for is a reset vector a
+/// handful of instructions long (see [`AccelCpu::fetch_in_hardware`]), and a
+/// board that spends longer out there is a board running on its interpreter,
+/// which is slow but correct. Leaving it unbounded would let one slice run
+/// away with the scheduler's round.
+const MAX_INTERPRETED: u32 = 4096;
 
 /// How many restart sequences one call to [`Device::run`] executes before it
 /// gives the scheduler its turn back.
@@ -296,6 +340,7 @@ impl AccelCpus {
             halted: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             entries: AtomicU64::new(0),
+            interpreted: AtomicU64::new(0),
             failure: Mutex::new(None),
         });
         built.push(Arc::downgrade(&cpu));
@@ -332,6 +377,18 @@ impl AccelCpus {
     #[must_use]
     pub fn cpus(&self) -> Vec<Arc<AccelCpu>> {
         self.built.lock().iter().filter_map(Weak::upgrade).collect()
+    }
+
+    /// Whether a guest-physical address is inside a memory slot, and
+    /// therefore whether hardware can *fetch* from it.
+    ///
+    /// Cheaper than [`plan`](AccelCpus::plan), which clones: this is asked
+    /// once per slice.
+    fn covers(&self, addr: u64) -> bool {
+        self.plan
+            .lock()
+            .as_ref()
+            .is_some_and(|plan| plan.covers(addr))
     }
 
     /// Install `space`'s flat view as memory slots, unless that has already
@@ -468,6 +525,10 @@ pub struct AccelCpu {
     stopped: AtomicBool,
     /// How many guest entries this processor has made. Diagnostics.
     entries: AtomicU64,
+    /// How many instructions the shell has run because hardware could not.
+    /// Diagnostics, and the number that says whether a board is accelerated
+    /// or merely accompanied.
+    interpreted: AtomicU64,
     /// The last backend failure, for a test or a monitor that wants to know
     /// why a processor stopped.
     failure: Mutex<Option<String>>,
@@ -501,6 +562,18 @@ impl AccelCpu {
     #[must_use]
     pub fn entries(&self) -> u64 {
         self.entries.load(Ordering::Relaxed)
+    }
+
+    /// How many instructions this processor's shell has run because hardware
+    /// could not fetch them.
+    ///
+    /// Zero on a board whose every executable page is a memory slot. A handful
+    /// on a board whose reset vector is a device region. A large and growing
+    /// number means the guest is executing out of something that is not
+    /// memory, and the run is an interpreted one wearing a hypervisor.
+    #[must_use]
+    pub fn interpreted(&self) -> u64 {
+        self.interpreted.load(Ordering::Relaxed)
     }
 
     /// Whether the guest is idling at a `HLT`.
@@ -604,6 +677,88 @@ impl AccelCpu {
         !self.sequence_owed()
     }
 
+    /// Where the processor would fetch its next instruction from,
+    /// guest-physically.
+    ///
+    /// The code segment's **cached base** plus `RIP`, through the guest's own
+    /// page tables — the same address the fetch itself would compute, read out
+    /// of the shell, which is current between slices. `None` where the tables
+    /// map nothing, and that is not this module's problem to solve: hardware
+    /// will take the page fault the guest has earned.
+    fn fetch_phys(&self) -> Option<u64> {
+        let regs = self.shell.regs();
+        let sys = self.shell.sys();
+        let linear = sys.segs[seg::CS as usize].base.wrapping_add(regs.rip);
+        self.shell.translate_debug(linear).phys(linear)
+    }
+
+    /// Whether the next instruction can be fetched by hardware.
+    ///
+    /// **A hypervisor cannot fetch through an MMIO exit.** KVM's instruction
+    /// emulator declines to, [`board`] says so where it decides what becomes a
+    /// memory slot, and the failure is not a diagnosis: a fetch from a page
+    /// that is not a slot comes back as `KVM_EXIT_INTERNAL_ERROR` with a
+    /// suberror, at an address, with nothing saying which region it was.
+    ///
+    /// It is not a corner case either. `machines/q35-linux.machine` maps its
+    /// **reset vector** — sixteen bytes of `x86.linuxboot` synthesising a far
+    /// jump — as a device region at `0xfffffff0`, because the thing at a
+    /// board's reset vector is a *loader*, not a ROM image. A processor there
+    /// has one instruction to run and no way to run it in hardware.
+    ///
+    /// So the engine that can run it does. See
+    /// [`interpret_out_of_hardware`](AccelCpu::interpret_out_of_hardware).
+    fn fetch_in_hardware(&self) -> bool {
+        match self.fetch_phys() {
+            Some(phys) => self.host.covers(phys),
+            None => true,
+        }
+    }
+
+    /// Interpret while the processor is somewhere hardware cannot fetch from.
+    ///
+    /// The shell is this processor's architectural state whenever it is not
+    /// inside the guest, so there is nothing to marshal on the way in — the
+    /// invariant this module already keeps is exactly what makes the handover
+    /// free. On the way out the vCPU is marked stale and the next entry pushes.
+    ///
+    /// Reports whether the processor is now somewhere hardware can run.
+    ///
+    /// This is the one thing an emulator with an interpreter can do that a
+    /// hypervisor client cannot, and it is worth being explicit that it is a
+    /// *design*, not a patch: the two engines are the same machine, so either
+    /// may run any instant of it, and the choice is made per fetch by what
+    /// the hardware is able to do.
+    fn interpret_out_of_hardware(&self) -> bool {
+        // Asked once on the way in and once per interpreted instruction, and
+        // that is the whole cost on a board where every executable page is a
+        // slot: one page-table walk per slice, on the shell's own tables.
+        let mut in_hardware = self.fetch_in_hardware();
+        let mut steps = 0u32;
+        while !in_hardware && steps < MAX_INTERPRETED {
+            // Zero cycles is the interpreter saying it is stopped, and a
+            // stopped interpreter will not reach a memory slot by being asked
+            // again.
+            if self.shell.step() == 0 {
+                break;
+            }
+            steps += 1;
+            self.dirty.store(true, Ordering::Release);
+            // A `HLT` or a restart sequence is not this loop's business, and
+            // the caller looks at both.
+            if self.shell.is_halted() || self.sequence_owed() {
+                break;
+            }
+            in_hardware = self.fetch_in_hardware();
+        }
+        if steps > 0 {
+            self.interpreted
+                .fetch_add(u64::from(steps), Ordering::Relaxed);
+            in_hardware = self.fetch_in_hardware();
+        }
+        in_hardware
+    }
+
     /// One slice of guest execution. The body of [`Device::run`].
     fn slice(&self, ticks: u64) -> AccelResult<()> {
         if self.stopped.load(Ordering::Acquire) {
@@ -621,6 +776,13 @@ impl AccelCpu {
         let space = self.memory.lock().clone();
         if let Some(space) = space {
             self.host.ensure_map(&space)?;
+        }
+        // Anything hardware cannot fetch, the interpreter runs — and if the
+        // processor is still out there when its allowance runs out, this slice
+        // is over rather than entering the guest at an address that would come
+        // straight back out as an internal error.
+        if !self.interpret_out_of_hardware() {
+            return Ok(());
         }
         if self.dirty.swap(false, Ordering::AcqRel) {
             state::load_into_vcpu(&self.shell, &vcpu)?;
@@ -656,6 +818,13 @@ impl AccelCpu {
                     self.stopped.store(true, Ordering::Release);
                     *self.failure.lock() = Some("the guest shut down".to_string());
                 }
+                // An exit whose cause is that the processor left the part of
+                // the board hardware can execute. Not a failure: the next
+                // slice interprets it. This is the *reactive* half of
+                // [`fetch_in_hardware`](AccelCpu::fetch_in_hardware), and it
+                // is here because the proactive half asks before an entry and
+                // a jump into a device region happens during one.
+                _ if !self.fetch_in_hardware() => {}
                 _ => {
                     self.stopped.store(true, Ordering::Release);
                     *self.failure.lock() = Some(alloc::format!(

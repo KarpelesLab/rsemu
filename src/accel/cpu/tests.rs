@@ -100,6 +100,25 @@ fn a_processor_reports_the_class_and_the_chunk_version_the_machine_file_named() 
     assert!(!cpu.is_halted());
     assert!(!cpu.is_stopped());
     assert_eq!(cpu.entries(), 0);
+    assert_eq!(cpu.interpreted(), 0);
+}
+
+/// A processor with no memory map behind it decides it cannot fetch in
+/// hardware, which is the safe direction for that decision to fail in.
+///
+/// Nothing has been installed here — no `bind`, so no slots — and the
+/// predicate is therefore false for every address. What that buys is that the
+/// interpreter runs rather than the guest being entered at an address that
+/// would come straight back out as an opaque internal error.
+#[test]
+fn a_processor_with_no_slots_installed_will_not_fetch_in_hardware() {
+    let Some(host) = cpus() else { return };
+    let cpu = host.construct(&Props::new()).expect("a preset part");
+    assert!(host.plan().is_none(), "nothing is installed before `bind`");
+    assert!(
+        !cpu.fetch_in_hardware(),
+        "with no memory slot anywhere, every fetch belongs to the interpreter"
+    );
 }
 
 #[test]
