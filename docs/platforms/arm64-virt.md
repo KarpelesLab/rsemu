@@ -379,27 +379,232 @@ that looked as though they might forbid one — address tagging, the two `TTBR`s
 and granule selection — none of which does.
 
 
+## Two processors
+
+[`machines/arm64-virt-smp.machine`](../../machines/arm64-virt-smp.machine) is
+this board with a second core. It is a **separate file** rather than a `param`
+on the first, for the reason `pc-apic` is separate from `pc-at`: the
+description language declares objects and cannot be told how many to make, so a
+one-core run of a two-core file would be a board with a spare core spinning in
+the boot ROM. `arm64-virt` is unchanged, down to the byte in its boot ROM, and
+it is still the file the distribution-kernel gate runs on.
+
+Three things had to be true, and they are three different problems.
+
+### 1. The GIC has to know which core is asking
+
+A GICv2's low 32 interrupt ids are **banked**: interrupt 27 is a different
+interrupt on each core, with its own enable bit, its own pending bit and its
+own priority (IHI 0048 §4.1.3). `GICD_ISENABLER0` is therefore one address and
+*N* registers, and a distributor that stored one copy of it would have one core
+enabling the other core's timer.
+
+The information was already on the bus and simply never read back.
+`MemAttrs::requester` identifies the initiator, `cpu.arm.a64` stamps it on
+every access it makes, and `core::space` carries it to the leaf unchanged. What
+was missing was the **map** from a requester id to a CPU interface number — and
+it could not be written in a machine file, because an object's requester id is
+allocated at realize time by declaration order. So the file names the
+*processors*:
+
+```text
+  object gic "arm.gic" {
+    cpus       = 2
+    processors = [cpu0, cpu1]
+  }
+```
+
+and `Gic::bind` resolves each of them through `BindCtx::peer`, which exists for
+exactly this and which `pc.lapic` uses for the architectural local-APIC page.
+`core::space` needed no change at all.
+
+Two decisions worth stating. An access whose requester is not on the list —
+a debugger, a DMA engine, a `MemAttrs::DEFAULT` from a test — reads **interface
+0**, which is the same fallback the APIC window makes and is what a person
+reading the machine expects. And a block with `cpus > 1` and no `processors`
+is a **build error**: every core would read interface 0's banked registers,
+which is precisely the defect the property removes, so it fails loudly rather
+than answering the wrong core's registers.
+
+Interprocessor interrupts come out of the same fact. `GICD_SGIR`'s target list
+filter `0b01` means *everyone but me*, and *me* is only knowable because the
+write carried a requester.
+
+### 2. Two cores means two generic timers
+
+The generic timer is a **private peripheral interrupt**: each core has its own
+and it arrives in that core's own bank of the distributor. So the wiring is per
+core —
+
+```text
+  wire cpu0.cntv -> gic.cpu0ppi11
+  wire cpu1.cntv -> gic.cpu1ppi11
+  wire gic.irq0  -> cpu0.irq
+  wire gic.irq1  -> cpu1.irq
+```
+
+— and `parse_input` already understood `cpu<C>ppi<N>`, so this cost nothing
+beyond writing the four lines. Wiring a core's `cntv` out is also what takes
+the timer *out* of that core's internal interrupt OR, which is the live-lock
+described at the top of this page, now doubled.
+
+### 3. Both cores come out of reset at the same address
+
+That is what a reset vector is. A stub that unconditionally jumped to the
+kernel would enter the kernel once per processor, simultaneously, which is not
+a boot. So `arm.boot`'s reset vector now begins:
+
+```text
+  mrs  x9, mpidr_el1
+  and  x9, x9, #0xff        ; Aff0, which is this board's processor index
+  cbnz x9, secondary
+```
+
+and everything but affinity 0 goes to a **parking loop** in the same 128-byte
+vector slot, waiting on its own 64-bit word of a **release table** — one word
+per processor, in RAM below the kernel, zero until something writes an address
+into it, at which point that processor clears `x0`-`x3` and branches there.
+
+A one-processor board emits none of it and its ROM is byte-identical to the one
+this file generated before secondaries existed; `a_one_processor_rom_is_the_stub_it_always_was`
+is the test that says so.
+
+That table is the board's warm-boot entry point, and it is deliberately the
+*same* table under both boot methods:
+
+* `secondary = "spin-table"` tells the guest it exists and where it is —
+  `enable-method` and `cpu-release-addr` on each `cpu@N` node (Devicetree
+  Specification v0.4 §3.8.1: "the physical address of a spin table entry that
+  releases a secondary CPU from its spin loop"). The generated tree also
+  carries a **memory reservation** over the page, because a table the kernel's
+  own allocator can hand out is a table that gets overwritten before it is
+  read. This is what `arm64-virt-smp` ships.
+* `secondary = "psci"` says `enable-method = "psci"`, and the processors park
+  on the same table. Nothing releases them yet, and the next section is why.
+
+**What could not be established from a permissive source.** DTSpec §3.8.1
+defines `enable-method` and `cpu-release-addr` and is where both come from
+here. The AArch64-specific *release procedure* — that the value written is the
+entry point, that it is a 64-bit little-endian store, that the released
+processor starts with the same requirements as the primary one — is documented
+in Linux's own `Documentation/arm64/booting.rst`, which is GPL-2.0 and was not
+read. What is implemented was derived from the binding plus **black-box
+observation of the guest** (§1 permits exactly that): the board published a
+release address and the kernel's writes to it were watched. If that protocol
+has a corner this board gets wrong, this is where it will be.
+
+### What a kernel does with it
+
+Debian's `arm64` kernel, same image as the single-core gate, on
+`arm64-virt-smp`. Quoted from its own console:
+
+```text
+[    0.021881] EFI services will not be available.
+[    0.022077] smp: Bringing up secondary CPUs ...
+[    0.022568] Detected PIPT I-cache on CPU1
+[    0.022594] CPU1: Booted secondary processor 0x0000000001 [0x410fd034]
+[    0.022713] smp: Brought up 1 node, 2 CPUs
+[    0.022736] SMP: Total of 2 processors activated.
+[    0.022747] CPU: All CPU(s) started at EL1
+```
+
+`CPU1: Booted secondary processor` is printed **by the secondary**, which is
+what makes it evidence rather than a claim about the device tree.
+
+It also runs userspace, and the shell is where the rest of this page's claims
+get checked. Typed at the prompt, three and a half minutes into the run:
+
+```text
+rsemu# cat /proc/interrupts; head -3 /proc/stat; poweroff -f
+           CPU0       CPU1
+ 11:        184        199 GIC-0  27 Level     arch_timer
+ 13:          4          0 GIC-0  33 Level     uart-pl011
+IPI0:        38         66       Rescheduling interrupts
+IPI1:       104        115       Function call interrupts
+IPI2:         0          0       CPU stop interrupts
+…
+cpu  0 0 118 45 0 0 0 0 0 0
+cpu0 0 0 67 13 0 0 0 0 0 0
+cpu1 0 0 50 31 0 0 0 0 0 0
+[    0.853819] reboot: Power down
+```
+
+Four separate things in one screen. **Interrupt 27 is banked**: each processor
+has its own architected timer and its own count of it, 184 and 199, which a
+distributor keeping one copy of `GICD_ISENABLER0` could not produce. The
+**PL011's shared interrupt is not** banked — 4 and 0, all on the processor the
+distributor targets. **`GICD_SGIR` works both ways**: 181 interprocessor
+interrupts reached CPU1 and 142 reached CPU0, which is the path a
+requester-blind model cannot even address. `/proc/stat` says **CPU1 ran
+tasks** — 50 ticks of system time and 31 idle. And `poweroff -f` still reaches
+`PSCI_SYSTEM_OFF` through an `SMC` with two processors running.
+
+[`tests/a64_smp.rs`](../../tests/a64_smp.rs) asserts those lines and types that
+command, and carries a hermetic test beside it — a dozen hand-assembled
+instructions, no download — in which the boot processor writes the other one's
+word of the release table and waits for it to answer.
+
+### What PSCI `CPU_ON` needs from `cpu.arm.a64`
+
+The board would rather say `enable-method = "psci"`, because that is what a
+`virt` board conventionally is and because a spin table cannot power a
+processor *off* again. It cannot, and the missing piece is entirely in the
+core. `psci::call` is a pure function returning an `Outcome { x0, effect }`,
+`Effect` is `None | Poweroff | Reboot`, and `CPU_ON` answers `ALREADY_ON` for a
+declared processor — honest on a board where every processor is running, and
+wrong the moment one is not.
+
+What it needs, precisely:
+
+1. **A roster of siblings.** The `apic.bus` shape: a
+   `HostKind::rendezvous("arm-cluster")` host object that every `cpu.arm.a64`
+   on a board opens by name (a `cluster` property, defaulted, so an ordinary
+   board writes nothing), registering `(MPIDR affinity, Weak<Lines>)` at
+   construction. Not a new export mechanism — `core::hosts` already is one, and
+   `ROADMAP.md` §4.4 makes a fourth a design review.
+2. **`Lines` grows four cells**: `powered: AtomicBool`, `start_entry: AtomicU64`,
+   `start_context: AtomicU64`, `start_pending: AtomicBool`. `Lines` exists
+   because "a device raising `IRQ` from inside a write the core itself issued
+   must not re-enter the core's own critical section", and this is the same
+   requirement with a different sender: **atomics on the sibling's `Lines`, no
+   lock taken across the call, the `BUS` rank untouched.**
+3. **A `start` construction property**, default true. A machine file writes
+   `start = false` on every processor that is not the boot processor; a core
+   that is not powered consumes its budget and executes nothing.
+4. **`Cpu::run_budget` applies a pending start** at its next instruction
+   boundary: `PC = start_entry`, `X0 = start_context`, the architectural reset
+   state otherwise, `wfi` cleared. Which is the same route `pc.lapic`'s INIT
+   and Start-Up take into `cpu.x86`, and for the same reason — the sibling
+   changes its own state.
+5. **`psci::call` takes the roster.** `CPU_ON(target, entry, context)` is DEN
+   0022 §5.1.3: the target's affinity in `x1`, the entry point in `x2`, the
+   context id in `x3`, and the started processor enters with `X0 = context_id`.
+   `INVALID_PARAMETERS` for an affinity no processor has, `ALREADY_ON` for one
+   that is powered, otherwise store, set `start_pending`, set `powered`, return
+   `SUCCESS`.
+6. **`AFFINITY_INFO` stops being a constant.** It must answer `1` (OFF) for a
+   processor that has not been started and `0` (ON) for one that has — today's
+   unconditional `0` is only honest because every processor is running. And
+   `CPU_OFF` on a secondary should clear `powered` rather than returning
+   `DENIED`, which is the half a spin table cannot do at all.
+
+Nothing in `core::` changes, and nothing in `dev/arm/` changes except one word
+in the machine file: `secondary = "psci"`, whose parking loop is already there
+and already correct.
+
 ## Where it stops, and what is still in the way
 
 It did not stop, so this section is a list of what the board *has not got*
 rather than of what defeated it. In rough order of what the next person will
 want:
 
-### SMP needs a requester-to-CPU-interface map, and it is the GIC that needs it
+### PSCI `CPU_ON` is not implemented, and that is why there are two board files
 
-`Registers::cpu_of` in [`gic.rs`](../../src/dev/arm/gic.rs) returns zero. That
-is correct for a one-core board and wrong for any other, and the reason is a
-seam rather than laziness: a GIC's banked registers answer differently
-depending on **which core is asking**, the bus carries `MemAttrs::requester`,
-and there is no map from a requester id to a CPU interface number. Everything
-else in the model is already banked per CPU, and `parse_input` already accepts
-`cpu<C>ppi<N>`.
-
-PSCI `CPU_ON` is the other half and is harder: servicing it means reaching a
-*sibling* core from inside the one executing the `SMC`, and a `dyn Device` has
-no route to a `Cpu`. `psci.rs` answers `ALREADY_ON` for a processor the board
-declares and `INVALID_PARAMETERS` for one it does not, which is honest for a
-board whose every processor is running.
+See [Two processors](#two-processors) above. A second core boots off a **spin
+table**, because `CPU_ON` needs something the core has not got: a route from
+the processor executing the `SMC` to a *sibling* processor. What exactly it
+needs is written out at the end of that section, in enough detail to be
+implemented without rediscovering it.
 
 ### `GICC_CTLR.EOImode` is not implemented
 

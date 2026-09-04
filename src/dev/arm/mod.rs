@@ -71,6 +71,23 @@
 //!   /dev/vda / ext4 ro,relatime 0 0
 //!   ```
 //!
+//! * **Two processors.** `machines/arm64-virt-smp.machine` is the same board
+//!   with a second core, and the same kernel starts it:
+//!
+//!   ```text
+//!   [    0.022594] CPU1: Booted secondary processor 0x0000000001 [0x410fd034]
+//!   [    0.022713] smp: Brought up 1 node, 2 CPUs
+//!   ```
+//!
+//!   Three things made that work and each is somewhere different. The GIC
+//!   answers its banked registers per *requester* ([`gic`]), the generic timer
+//!   is wired per core into that core's own bank, and the boot ROM's reset
+//!   vector parks everything but affinity 0 on a release table ([`boot`]).
+//!   `tests/a64_smp.rs` asserts both halves, one of them hermetically. What is
+//!   *not* there is PSCI `CPU_ON`, which needs a route from the core executing
+//!   the `SMC` to a sibling core; `docs/platforms/arm64-virt.md` says exactly
+//!   what that route would be.
+//!
 //! `docs/platforms/arm64-virt.md` has the transcript, the two core bugs the
 //! boot found, and the ledger of what is still in the way.
 //!

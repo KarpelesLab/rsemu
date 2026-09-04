@@ -49,6 +49,24 @@
 //! sharing a timer. So the state below is `[[…; 32]; cpus]` for the low ids and
 //! a flat array above them, which is the register map's own shape.
 //!
+//! # Which core is asking
+//!
+//! Banking is only half of it: `GICD_ISENABLER0` is *one address* and one
+//! register per core, so the block has to know who issued the access. It does,
+//! and it always could — [`MemAttrs::requester`] identifies the initiator,
+//! `cpu.arm.a64` stamps it on every access it makes, and `core::space` carries
+//! it to the leaf unchanged. What was missing was the map from a requester id
+//! to a CPU interface number, because an id is allocated at realize time by
+//! declaration order and a machine file cannot write one down.
+//!
+//! So the file names the *processors* — `processors = [cpu0, cpu1]` — and
+//! [`Gic::bind`] resolves them through
+//! [`BindCtx::peer`](crate::machine::BindCtx::peer), which exists for exactly
+//! this. `pc.lapic` does the identical thing for the architectural local-APIC
+//! page and `core::space` needed no change for either. See
+//! [`Registers::cpu_of`] for what an access from something that is *not* a
+//! processor gets.
+//!
 //! # Why the generic timer arrives here at all
 //!
 //! `machines/a64-mini.machine` says the generic timer is *inside* the core and
@@ -74,7 +92,7 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::format;
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt;
@@ -82,12 +100,14 @@ use core::fmt;
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
-use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region, RegionRef};
+use crate::core::space::{
+    AccessConstraints, MemAttrs, MemOps, MemResult, Region, RegionRef, RequesterId,
+};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::core::sync::{LockRank, Mutex};
+use crate::core::sync::{AtomicU32, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink, WireSource};
-use crate::machine::realize::Instance;
+use crate::machine::realize::{BindCtx, Instance};
 
 use super::dt::{DtSource, IntSpec, NodeKind, NodeSpec};
 
@@ -303,6 +323,14 @@ struct Registers {
     outs: Mutex<Vec<Option<WireSource>>>,
     /// Which interrupt id each driving net lands on, for the device tree.
     wires: Mutex<BTreeMap<WireId, u32>>,
+    /// Which requester id each CPU interface answers for — the map
+    /// [`Registers::cpu_of`] reads and the thing SMP was waiting on.
+    ///
+    /// Atomics rather than a lock because this is on the path of *every*
+    /// access to either aperture and the table is written once, at bind time,
+    /// before the machine runs. [`RequesterId::ANONYMOUS`] means unclaimed,
+    /// which is also what a single-interface block leaves it at.
+    owners: Vec<AtomicU32>,
     cpus: usize,
     spis: usize,
 }
@@ -324,6 +352,11 @@ pub struct Gic {
     regs: Arc<Registers>,
     dist: RegionRef,
     cpuif: RegionRef,
+    /// The machine-file paths of the processors this block's CPU interfaces
+    /// belong to, in interface order — the `processors` property. Resolved to
+    /// requester ids in [`Gic::bind`], because an id is allocated at realize
+    /// time and a file can only name the object.
+    processors: Vec<String>,
     /// The sinks handed out by [`Device::sink`], kept alive here — a net holds
     /// only a weak reference to a sink.
     pins: Mutex<Vec<Arc<SourcePin>>>,
@@ -340,6 +373,13 @@ impl Gic {
         let mut r = props.reader();
         let cpus = r.or_range("cpus", 1u64, 1..=MAX_CPUS)?;
         let spis = r.or_range("spis", 96u64, 32..=u64::from(MAX_INTID - SPI_BASE))?;
+        let processors = match r.optional_list("processors")? {
+            Some(items) => items
+                .iter()
+                .map(|v| Ok(v.to_link("processors")?.as_str().to_string()))
+                .collect::<Result<Vec<String>>>()?,
+            None => Vec::new(),
+        };
         r.finish()?;
         if !spis.is_multiple_of(32) {
             return Err(Error::Property(format!(
@@ -347,7 +387,28 @@ impl Gic {
                  thirty-two of them per word, so it must be a multiple of 32; {spis} is not"
             )));
         }
-        Ok(Gic::build(cpus as usize, spis as usize))
+        // A GIC with more than one CPU interface and no map answers every core
+        // with interface 0's banked registers — one core would enable the
+        // other's timer and claim its interrupts. That is the whole defect
+        // `processors` exists to remove, so it is a build error rather than a
+        // quiet wrong answer.
+        if cpus > 1 && processors.is_empty() {
+            return Err(Error::Property(format!(
+                "`cpus` is {cpus}, so this distributor's banked registers have to answer \
+                 differently per core — add `processors = [<core>, …]` naming the {cpus} \
+                 processors in CPU-interface order, or every core reads interface 0's"
+            )));
+        }
+        if !processors.is_empty() && processors.len() as u64 != cpus {
+            return Err(Error::Property(format!(
+                "`processors` names {} processor(s) and `cpus` says there are {cpus} CPU \
+                 interface(s); they are the same list",
+                processors.len()
+            )));
+        }
+        let mut gic = Gic::build(cpus as usize, spis as usize);
+        gic.processors = processors;
+        Ok(gic)
     }
 
     /// Build one directly, for a test or a hand-wired machine.
@@ -357,6 +418,9 @@ impl Gic {
             state: Mutex::with_rank(LockRank::DEVICE, State::new(cpus, spis)),
             outs: Mutex::with_rank(LockRank::LEAF, alloc::vec![None; cpus]),
             wires: Mutex::with_rank(LockRank::LEAF, BTreeMap::new()),
+            owners: (0..cpus)
+                .map(|_| AtomicU32::new(RequesterId::ANONYMOUS.0))
+                .collect(),
             cpus,
             spis,
         });
@@ -376,8 +440,40 @@ impl Gic {
             regs,
             dist,
             cpuif,
+            processors: Vec::new(),
             pins: Mutex::with_rank(LockRank::LEAF, Vec::new()),
         }
+    }
+
+    /// Say that `requester`'s accesses are CPU interface `cpu`'s.
+    ///
+    /// What [`Gic::bind`] does with what the machine layer told it, and the
+    /// route a hand-wired rig takes to the same place. Returns `false` for an
+    /// interface this block does not have, or for a requester another
+    /// interface already answers for — two cores sharing one CPU interface is
+    /// a board that cannot mean anything.
+    pub fn attach_processor(&self, cpu: usize, requester: RequesterId) -> bool {
+        if cpu >= self.regs.cpus || requester == RequesterId::ANONYMOUS {
+            return false;
+        }
+        if self
+            .regs
+            .owners
+            .iter()
+            .enumerate()
+            .any(|(i, o)| i != cpu && o.load(Ordering::Relaxed) == requester.0)
+        {
+            return false;
+        }
+        self.regs.owners[cpu].store(requester.0, Ordering::Relaxed);
+        true
+    }
+
+    /// Which CPU interface `requester`'s accesses reach.
+    #[must_use]
+    pub fn interface_of(&self, requester: RequesterId) -> usize {
+        self.regs
+            .cpu_of(MemAttrs::DEFAULT.with_requester(requester))
     }
 
     /// How many CPU interfaces it has.
@@ -934,15 +1030,30 @@ impl Registers {
     /// Which CPU interface an access came from.
     ///
     /// A GIC's banked registers answer differently depending on *who is
-    /// asking*, which no other device in this tree needs and which the bus
-    /// only half carries: [`MemAttrs::requester`] identifies the master, and
-    /// the mapping from a requester id to a CPU interface number is the
-    /// board's. With one CPU the answer is always zero, and that is the
-    /// configuration this board ships; a second core needs the requester table
-    /// this seam does not have yet, and `docs/platforms/arm64-virt.md` records
-    /// it as the first thing SMP will need.
-    fn cpu_of(&self, _attrs: MemAttrs) -> usize {
-        0
+    /// asking* — interrupt 27 is a different interrupt on each core, with its
+    /// own enable, pending bit and priority (IHI 0048 §4.1.3) — and the bus
+    /// already carries the asker: [`MemAttrs::requester`] identifies the
+    /// master, stamped by `cpu.arm.a64` on every access it makes. What was
+    /// missing was the *map*, because a requester id is allocated by
+    /// declaration order and neither a machine file nor a device can write one
+    /// down. [`Gic::bind`] fills it in, from the `processors` property naming
+    /// the cores in CPU-interface order.
+    ///
+    /// **An access from something that is not one of those cores reads
+    /// interface 0.** A debugger, a DMA engine that wandered into the window,
+    /// a `MemAttrs::DEFAULT` from a test: none of them is a CPU interface, and
+    /// the boot processor's view is what a person reading the machine expects.
+    /// It is the same fallback `pc.lapic`'s `window` region makes, for the
+    /// same reason.
+    fn cpu_of(&self, attrs: MemAttrs) -> usize {
+        let id = attrs.requester.0;
+        if id == RequesterId::ANONYMOUS.0 {
+            return 0;
+        }
+        self.owners
+            .iter()
+            .position(|owner| owner.load(Ordering::Relaxed) == id)
+            .unwrap_or(0)
     }
 }
 
@@ -1112,6 +1223,13 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "how many shared peripheral interrupts, a multiple of 32 (default 96)",
         },
+        PropertySpec {
+            name: "processors",
+            kind: ValueKind::List,
+            required: false,
+            summary: "the processors the CPU interfaces belong to, in interface order; \
+                      required once `cpus` is more than one",
+        },
     ],
     construct: |props| Ok(Box::new(Gic::new(props)?)),
 };
@@ -1271,7 +1389,37 @@ impl Device for Gic {
     }
 }
 
-impl Instance for Gic {}
+impl Instance for Gic {
+    /// Resolve `processors` to the requester ids the cores stamp.
+    ///
+    /// The GIC's half of what SMP needed, and the reason
+    /// [`BindCtx::peer`](crate::machine::BindCtx::peer) exists: an object's
+    /// requester id is allocated at realize time by declaration order, so a
+    /// machine file names the *processor* and the number is looked up here.
+    /// `pc.lapic` does the identical thing for the architectural local-APIC
+    /// page (`src/dev/pc/apic.rs`); a GICv2 CPU interface is per-processor in
+    /// exactly the same way.
+    ///
+    /// # Errors
+    ///
+    /// If `processors` names something this machine does not have, or names
+    /// one processor twice.
+    fn bind(&self, ctx: &BindCtx<'_>) -> Result<()> {
+        for (cpu, path) in self.processors.iter().enumerate() {
+            let peer = ctx.peer(path)?;
+            if !self.attach_processor(cpu, peer.requester()) {
+                return Err(Error::Config {
+                    at: ctx.path().to_string(),
+                    message: format!(
+                        "`processors` names `{path}` for CPU interface {cpu}, but that processor \
+                         already answers for another interface; a core has one CPU interface"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Which CPU interface and interrupt id an input pin name refers to.
 ///
@@ -1345,6 +1493,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
     let mut s = ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("cpus", ValueKind::Uint).range(1, MAX_CPUS))
         .prop(PropSchema::new("spis", ValueKind::Uint).range(32, u64::from(MAX_INTID - SPI_BASE)))
+        .prop(PropSchema::new("processors", ValueKind::List))
         .region("")
         .region("dist")
         .region("cpu");
@@ -1698,6 +1847,225 @@ mod tests {
         // And the restored controller knows a handler is still running, which
         // is the part a snapshot that forgot the active stack would lose.
         assert_eq!(cpu_read(&restored, 0x014), 0xa0);
+    }
+
+    // -- two CPU interfaces -------------------------------------------------
+
+    /// The requester ids two processors would be allocated. Arbitrary and
+    /// non-adjacent on purpose: an id is not an interface number.
+    const CPU0: RequesterId = RequesterId(6);
+    const CPU1: RequesterId = RequesterId(11);
+
+    /// A two-interface GIC with both processors claimed, both `nIRQ` lines on
+    /// probes, and the distributor and both interfaces enabled.
+    fn paired() -> (Gic, Arc<Probe>, Arc<Probe>) {
+        let gic = Gic::build(2, 96);
+        assert!(gic.attach_processor(0, CPU0));
+        assert!(gic.attach_processor(1, CPU1));
+        let ids = WireIdAllocator::new();
+        let mut probes = Vec::new();
+        for cpu in 0..2 {
+            let id = ids.alloc();
+            let probe = Arc::new(Probe::default());
+            let wire = Wire::builder()
+                .source(id)
+                .sink(Arc::clone(&probe) as Arc<dyn WireSink>, 0)
+                .build_shared();
+            gic.connect(&format!("irq{cpu}"), WireSource::new(wire, id))
+                .expect("a GIC drives one line per interface");
+            probes.push(probe);
+        }
+        dist_write(&gic, 0x000, 1);
+        for cpu in [CPU0, CPU1] {
+            as_cpu_write(&gic, 0x000, 1, cpu);
+            as_cpu_write(&gic, 0x004, 0xf0, cpu);
+        }
+        let second = probes.pop().expect("two");
+        let first = probes.pop().expect("two");
+        (gic, first, second)
+    }
+
+    /// A distributor write made the way `requester` would make it.
+    fn as_dist_write(g: &Gic, offset: u64, value: u32, requester: RequesterId) {
+        g.regs
+            .write(
+                offset,
+                &value.to_le_bytes(),
+                MemAttrs::DEFAULT.with_requester(requester),
+            )
+            .expect("a word write is legal");
+    }
+
+    /// A CPU interface access made the way `requester` would make it.
+    fn as_cpu_write(g: &Gic, offset: u64, value: u32, requester: RequesterId) {
+        let iface = CpuIface {
+            regs: Arc::clone(&g.regs),
+        };
+        iface
+            .write(
+                offset,
+                &value.to_le_bytes(),
+                MemAttrs::DEFAULT.with_requester(requester),
+            )
+            .expect("a word write is legal");
+    }
+
+    fn as_cpu_read(g: &Gic, offset: u64, requester: RequesterId) -> u32 {
+        let iface = CpuIface {
+            regs: Arc::clone(&g.regs),
+        };
+        let mut bytes = [0u8; 4];
+        iface
+            .read(
+                offset,
+                &mut bytes,
+                MemAttrs::DEFAULT.with_requester(requester),
+            )
+            .expect("a word read is legal");
+        u32::from_le_bytes(bytes)
+    }
+
+    #[test]
+    fn a_banked_register_answers_the_core_that_is_asking() {
+        // The whole of what `cpu_of` buys: `GICD_ISENABLER0` is one address
+        // and two registers, and which one a write lands in is decided by who
+        // wrote it. A model that answered interface 0 to everybody would have
+        // one core enabling the other core's timer.
+        let (gic, _, _) = paired();
+        let intid = 27u32; // the virtual timer's private interrupt
+        as_dist_write(&gic, 0x100, 1 << intid, CPU1);
+        {
+            let state = gic.regs.state.lock();
+            assert!(!state.banked_enabled[0][intid as usize], "not CPU 0's");
+            assert!(state.banked_enabled[1][intid as usize], "CPU 1's");
+        }
+        // And reading it back through each interface says the same.
+        let mut bytes = [0u8; 4];
+        gic.regs
+            .read(0x100, &mut bytes, MemAttrs::DEFAULT.with_requester(CPU1))
+            .expect("a word read is legal");
+        assert_eq!(u32::from_le_bytes(bytes), 1 << intid);
+        gic.regs
+            .read(0x100, &mut bytes, MemAttrs::DEFAULT.with_requester(CPU0))
+            .expect("a word read is legal");
+        assert_eq!(u32::from_le_bytes(bytes), 0);
+    }
+
+    #[test]
+    fn a_private_interrupt_reaches_only_its_own_core() {
+        let (gic, first, second) = paired();
+        let intid = 27u32;
+        // Enable it on CPU 1 only, at a priority that beats the mask.
+        as_dist_write(&gic, 0x100, 1 << intid, CPU1);
+        as_dist_write(&gic, 0x400 + 24, 0xa0 << 24, CPU1);
+        // CPU 1's own timer line, which is what `wire cpu1.cntv ->
+        // gic.cpu1ppi11` drives.
+        gic.regs.set_level(1, intid, true);
+        assert!(!first.high(), "CPU 0 has no business with CPU 1's timer");
+        assert!(second.high());
+        assert_eq!(as_cpu_read(&gic, 0x00c, CPU1), intid, "GICC_IAR");
+        assert_eq!(
+            as_cpu_read(&gic, 0x00c, CPU0),
+            SPURIOUS,
+            "and there is nothing for CPU 0 to claim"
+        );
+    }
+
+    #[test]
+    fn an_interprocessor_interrupt_reaches_the_other_core() {
+        // `GICD_SGIR` with target list filter 0b01 is "everyone but me", and
+        // *me* is only knowable because the write carried a requester
+        // (IHI 0048 §4.3.15).
+        let (gic, first, second) = paired();
+        for cpu in [CPU0, CPU1] {
+            as_dist_write(&gic, 0x100, 1 << 3, cpu);
+        }
+        as_dist_write(&gic, 0xf00, (1 << 24) | 3, CPU1);
+        assert!(first.high(), "CPU 0 was told");
+        assert!(!second.high(), "and the sender was not");
+        assert_eq!(as_cpu_read(&gic, 0x00c, CPU0) & 0x3ff, 3);
+
+        // And the other direction, with the target list naming CPU 1.
+        as_dist_write(&gic, 0xf00, (2 << 16) | 3, CPU0);
+        assert!(second.high());
+    }
+
+    #[test]
+    fn an_access_from_something_that_is_not_a_processor_reads_the_boot_cores_view() {
+        // A debugger, a DMA engine, a test rig: none is a CPU interface, and
+        // interface 0's view is what a person reading the machine expects.
+        let (gic, _, _) = paired();
+        assert_eq!(gic.interface_of(CPU0), 0);
+        assert_eq!(gic.interface_of(CPU1), 1);
+        assert_eq!(gic.interface_of(RequesterId::ANONYMOUS), 0);
+        assert_eq!(gic.interface_of(RequesterId(4242)), 0);
+    }
+
+    #[test]
+    fn one_processor_cannot_own_two_cpu_interfaces() {
+        let gic = Gic::build(2, 96);
+        assert!(gic.attach_processor(0, CPU0));
+        assert!(!gic.attach_processor(1, CPU0), "already interface 0's");
+        assert!(!gic.attach_processor(2, CPU1), "no such interface");
+        assert!(
+            !gic.attach_processor(1, RequesterId::ANONYMOUS),
+            "not a processor"
+        );
+    }
+
+    #[test]
+    fn a_multiprocessor_block_that_names_no_processors_is_refused() {
+        // Without the map every core reads interface 0's banked registers,
+        // which is the defect the property exists to remove.
+        let props = Props::new().with("cpus", 2u64);
+        let e = Gic::new(&props).expect_err("no map").to_string();
+        assert!(e.contains("processors"), "{e}");
+        // And a list that does not agree with the count.
+        let props = Props::new().with("cpus", 2u64).with(
+            "processors",
+            alloc::vec![crate::core::props::Value::Link(
+                crate::core::props::Link::new("cpu0").unwrap(),
+            )],
+        );
+        assert!(Gic::new(&props).is_err(), "one name for two interfaces");
+        // One interface needs none of it.
+        assert!(Gic::new(&Props::new()).is_ok());
+    }
+
+    #[test]
+    fn two_interfaces_state_round_trips_to_an_identical_hash() {
+        let (gic, _, _) = paired();
+        let intid = 30u32;
+        as_dist_write(&gic, 0x100, 1 << intid, CPU1);
+        as_dist_write(&gic, 0x400 + 28, 0xa0 << 16, CPU1);
+        gic.regs.set_level(1, intid, true);
+        assert_eq!(as_cpu_read(&gic, 0x00c, CPU1), intid);
+
+        let mut shape = MachineShape::new();
+        shape.add_device("gic", CLASS.name).unwrap();
+        let mut w = StateWriter::new(shape);
+        {
+            let mut chunk = w.chunk("gic", CLASS.name, CLASS.version).unwrap();
+            gic.save(&mut chunk).unwrap();
+        }
+        let bytes = w.to_vec().unwrap();
+
+        let restored = Gic::build(2, 96);
+        assert!(restored.attach_processor(0, CPU0));
+        assert!(restored.attach_processor(1, CPU1));
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("gic", CLASS.name, CLASS.version, &Migrations::new())
+            .unwrap();
+        restored.load(&mut chunk.reader()).unwrap();
+        assert_eq!(snapshot(&gic), snapshot(&restored), "the state hash");
+        // CPU 1's handler is still running and CPU 0 is still idle, which is
+        // the part a snapshot that banked nothing would lose.
+        assert_eq!(as_cpu_read(&restored, 0x014, CPU1), 0xa0);
+        assert_eq!(
+            as_cpu_read(&restored, 0x014, CPU0),
+            u32::from(IDLE_PRIORITY)
+        );
     }
 
     #[test]

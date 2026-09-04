@@ -642,6 +642,23 @@ pub static ARM64_VIRT: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/arm64-virt.machine"),
 };
 
+/// The same board with a second processor.
+///
+/// A separate entry rather than a parameter on [`ARM64_VIRT`] because the
+/// description language declares objects and cannot be told how many to make.
+/// The differences are a second `cpu.arm.a64`, a GIC that knows which
+/// processor each CPU interface belongs to, a generic timer wired per core,
+/// and a boot ROM whose reset vector parks everything but the boot processor
+/// on a spin table (`docs/platforms/arm64-virt.md`).
+#[cfg(feature = "machine-arm64-virt")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-arm64-virt")))]
+pub static ARM64_VIRT_SMP: CatalogEntry = CatalogEntry {
+    name: "arm64-virt-smp",
+    summary: "AArch64 `virt` with two Cortex-A53-class cores, brought up off a spin table",
+    media: &["kernel", "initrd", "disk"],
+    source: include_str!("../../machines/arm64-virt-smp.machine"),
+};
+
 /// Every machine this build can realize, in catalog order.
 // One `#[cfg]`-gated push per shipped machine, which is what the lint is
 // complaining about: a `vec![]` literal cannot carry an attribute on one of its
@@ -657,6 +674,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&A64_MINI);
     #[cfg(feature = "machine-arm64-virt")]
     out.push(&ARM64_VIRT);
+    #[cfg(feature = "machine-arm64-virt")]
+    out.push(&ARM64_VIRT_SMP);
     #[cfg(feature = "machine-arm926")]
     out.push(&ARM926);
     #[cfg(feature = "machine-beneater")]
@@ -1833,7 +1852,7 @@ mod tests {
             // its gzip magic. `tests/a64_linux.rs` supplies a real kernel,
             // behind `RSEMU_ARM64_KERNEL`.
             #[cfg(feature = "machine-arm64-virt")]
-            ("arm64-virt", "kernel") => &[
+            ("arm64-virt" | "arm64-virt-smp", "kernel") => &[
                 0x10, 0x00, 0x00, 0x14, // code0: b .+0x40, over the header
                 0x00, 0x00, 0x00, 0x00, // code1
                 0, 0, 0, 0, 0, 0, 0, 0, // text_offset: 0, a relocatable kernel
@@ -1850,11 +1869,11 @@ mod tests {
             // loader writes nothing for an empty image and the boot ROM leaves
             // `/chosen` without the two `linux,initrd-*` properties.
             #[cfg(feature = "machine-arm64-virt")]
-            ("arm64-virt", "initrd") => &[],
+            ("arm64-virt" | "arm64-virt-smp", "initrd") => &[],
             // And no disk image, which leaves the `size` in the machine file
             // to supply a blank one — a board with an unwritten disk in it.
             #[cfg(feature = "machine-arm64-virt")]
-            ("arm64-virt", "disk") => &[],
+            ("arm64-virt" | "arm64-virt-smp", "disk") => &[],
             // The two words a Cortex-M4 fetches out of reset — an initial
             // stack pointer at the top of SRAM and a reset vector, with bit 0
             // set because there is no ARM state to interwork to — followed by

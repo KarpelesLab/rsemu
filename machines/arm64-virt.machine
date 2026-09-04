@@ -40,6 +40,17 @@
 # being told 1023, and taking it again forever.
 #
 # ---------------------------------------------------------------------------
+# One core, and where the second one lives
+# ---------------------------------------------------------------------------
+#
+# This board has one processor. `machines/arm64-virt-smp.machine` is the same
+# board with two, and is a separate file rather than a `param` here because the
+# description language declares objects and cannot be told how many to make --
+# a one-core run of a two-core file would carry a spare core spinning in the
+# boot ROM. Nothing below changes when that file is used, which is the point:
+# this is the board the distribution-kernel gate runs on.
+#
+# ---------------------------------------------------------------------------
 # The kernel is entered at EL1, and PSCI is an assertion
 # ---------------------------------------------------------------------------
 #

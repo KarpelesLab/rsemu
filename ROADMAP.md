@@ -59,8 +59,8 @@ something a person can actually run (§2).
 > 32-bit instructions with no unexpected exception, stopping only where it waits
 > on a timer no machine has supplied yet.
 >
-> **Thirty machine files**: fifteen consoles, computers and microcontrollers,
-> and fifteen synthetic boards. `nes-ntsc` and
+> **Thirty-one machine files**: sixteen consoles, computers and
+> microcontrollers, and fifteen synthetic boards. `nes-ntsc` and
 > `nes-pal` pass **AccuracyCoin 141/141** — the whole-machine gate, run
 > headlessly, with an empty known-failures ledger. Also `gameboy`; `apple1` and `beneater-6502`,
 > interactive over a terminal. **Seven boards now boot software this project did
@@ -87,9 +87,16 @@ something a person can actually run (§2).
 > **`arm64-virt`** is the AArch64 board — GICv2, PL011, PSCI, a generated DTB —
 > and Debian's own arm64 kernel **boots to a busybox shell** on it, with
 > `poweroff -f` typed at that shell reaching `PSCI_SYSTEM_OFF` through an `SMC`
-> and stopping the machine. One core only: the GIC cannot yet map a requester to
-> a CPU interface, and there is no block device, because virtio-mmio in this tree
-> is reachable only from a build carrying the RISC-V board's chips.
+> and stopping the machine, and an ext4 root off the board's virtio disk.
+> `arm64-virt-smp` is the same board with **two** cores and the same kernel says
+> `smp: Brought up 1 node, 2 CPUs` on it: the GIC's banked registers now answer
+> per `MemAttrs::requester` — resolved from the machine file's `processors =
+> [cpu0, cpu1]` through `BindCtx::peer`, the seam the local APIC's architectural
+> page uses — and the boot ROM's reset vector parks everything but affinity 0 on
+> a release table. What is still missing is PSCI `CPU_ON`, which needs a route
+> from the core executing the `SMC` to a *sibling* core; the second core comes up
+> off a spin table instead, and `docs/platforms/arm64-virt.md` says precisely
+> what the core would need.
 >
 > **The x86 side reached 6b's shape.** `pc64` and `q35-linux` enter a stock
 > `bzImage` directly and reach a shell; `q35-linux` does it **on the board's own
