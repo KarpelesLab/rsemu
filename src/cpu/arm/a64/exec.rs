@@ -992,6 +992,12 @@ impl<'a> Exec<'a> {
     /// charge — rather than `debug_translate`, whose whole purpose is to have
     /// none of those effects, and it includes the PC alignment check because
     /// `Exec::fetch` raises that before it translates anything.
+    ///
+    /// Gated on the same pair as [`engine`](super::engine), its only caller —
+    /// the frontend *and* the translation runtime — because a build with the
+    /// interpreter alone never compiles that module and `-D warnings` makes
+    /// the resulting dead-code warning fatal in the per-feature sweep.
+    #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
     pub(super) fn translate_fetch(&mut self, va: u64) -> Result<u64, Trap> {
         if va & 3 != 0 {
             return Err(Trap {
