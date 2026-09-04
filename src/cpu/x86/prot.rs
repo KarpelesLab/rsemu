@@ -663,6 +663,25 @@ pub mod msr {
     /// running with no update loaded reports. That is a fact rather than a
     /// stand-in: nothing here loads microcode, and there is no revision.
     pub const BIOS_SIGN_ID: u32 = 0x8b;
+    /// `IA32_PLATFORM_ID`: which of eight platforms this processor is for.
+    ///
+    /// *Intel SDM* volume 4 Table 2-2 and volume 3 §10.11.1. **Read-only** —
+    /// bits 52:50 hold the identifier and every other bit is reserved — and a
+    /// `WRMSR` to it falls through to `#GP(0)` with every other address this
+    /// core does not write.
+    ///
+    /// Zero, and for the same reason [`BIOS_SIGN_ID`] is: the identifier
+    /// exists so that software can pick the microcode update built for its
+    /// socket out of a container holding several, by matching the bit this
+    /// field selects against an update's processor-flags mask. Nothing here
+    /// loads microcode, so there is one platform and it is the first.
+    ///
+    /// It is modelled because a firmware that has been told `GenuineIntel` by
+    /// `CPUID` is entitled to read it. EDK II's `AsmReadMsr64 (0x17)` is where
+    /// `q35-uefi` stopped once its exception handler worked at all, and a
+    /// `#GP` for an architectural Intel register on a core claiming to be an
+    /// Intel part is this core being wrong rather than the firmware.
+    pub const PLATFORM_ID: u32 = 0x17;
     /// `IA32_APIC_BASE`: the local APIC's enable bit, its bootstrap-processor
     /// flag, and the physical address of its register page.
     ///
@@ -1214,6 +1233,41 @@ pub const TSS_SEG_ORDER: [u8; 6] = [seg::ES, seg::CS, seg::SS, seg::DS, seg::FS,
 use super::exec::{Ex, Exec, Fault, VEC_GP, VEC_NP, VEC_SS, VEC_TS, VEC_UD};
 use super::flags;
 use super::isa::{Fields, Op};
+use crate::core::value::Width;
+
+/// Byte offset of the task-priority register within a local APIC's register
+/// page — *Intel SDM* volume 3A §11.4.4, table 11-1.
+///
+/// This is where `CR8` lives; see [`Exec::read_task_priority`].
+/// `accel::state` names the same offset for the same reason and the two cannot
+/// share one constant: that module is `std` and feature-gated, and `cpu/` is
+/// neither.
+const APIC_TPR: u64 = 0x80;
+
+/// Where an interrupt's stack frame begins.
+///
+/// **In long mode the processor aligns `RSP` down to a sixteen-byte boundary
+/// before it pushes anything** — *Intel SDM* volume 3A §6.14.2, "Stack Frame",
+/// and *AMD64 Architecture Programmer's Manual* volume 2 §8.9.3, which say it
+/// in the same words. The value *pushed* is the unaligned one, so `IRET` puts
+/// the interrupted stack back exactly as it was and nothing outside the
+/// handler can tell it happened.
+///
+/// It is not cosmetic, and a UEFI firmware is what proves it. `FXSAVE`
+/// requires a sixteen-byte aligned operand and raises `#GP(0)` otherwise, and
+/// EDK II's `CommonInterruptEntry` builds that operand out of `RSP` — so
+/// without this the firmware's first exception handler faulted on its own
+/// `FXSAVE`, took a second `#GP` for it, and recursed until the stack walked
+/// off the identity map (`docs/platforms/q35-uefi.md`).
+///
+/// Only long mode. No 32-bit or 16-bit delivery aligns anything, and a
+/// **call gate** does not either even in 64-bit mode (SDM volume 3A §5.8.5.1
+/// loads `RSP` from the task state segment and leaves it alone), which is why
+/// this is a function taking the mode rather than a mask applied at the one
+/// place stacks are switched.
+const fn aligned_frame(sp: u64, long: bool) -> u64 {
+    if long { sp & !0xf } else { sp }
+}
 
 /// Which memory-type range register an `RDMSR`/`WRMSR` address names.
 ///
@@ -2378,7 +2432,7 @@ impl Exec<'_> {
                 *self.state.sys.seg_mut(seg::SS) = ss_desc.to_seg(ss_sel);
             }
             self.state.regs.ss = ss_sel;
-            self.set_sp(new_sp);
+            self.set_sp(aligned_frame(new_sp, long));
 
             self.push(u64::from(old_ss), size)?;
             self.push(old_sp, size)?;
@@ -2394,6 +2448,7 @@ impl Exec<'_> {
             let old_ss = self.state.regs.ss;
             let old_sp = self.sp();
             self.commit_cs(target_sel, target, new_cpl);
+            self.set_sp(aligned_frame(old_sp, long));
             self.push(u64::from(old_ss), size)?;
             self.push(old_sp, size)?;
             self.push(old_flags, size)?;
@@ -2868,11 +2923,92 @@ impl Exec<'_> {
             2 => Ok(self.state.sys.cr2),
             3 => Ok(self.state.sys.cr3),
             4 if self.cfg.features.cr4 => Ok(self.state.sys.cr4),
+            // `CR8` is the task-priority register and exists **only in 64-bit
+            // mode** (*Intel SDM* volume 3A §2.5). The guard is the
+            // architecture's rather than the decoder's: `REX.R` is what turns
+            // `CR0` into `CR8`, and outside 64-bit mode a `0x44` byte is
+            // `INC ESP`, so the encoding cannot be reached there anyway.
+            8 if self.sixty_four() => Ok(self.read_task_priority()),
             // `CR1` is reserved and `CR4` arrived with the Pentium; naming one
             // on a part that has none is an invalid opcode, not a read of
-            // zero — a guest probes with exactly this.
+            // zero — a guest probes with exactly this. `CR5`-`CR7` and
+            // `CR9`-`CR15` are reserved on every part and land here too.
             _ => Err(Fault::bare(VEC_UD)),
         }
+    }
+
+    /// Where this core's local APIC keeps its registers, as the processor
+    /// believes.
+    ///
+    /// `IA32_APIC_BASE`'s page frame, and `None` both when no machine wired a
+    /// local controller to this core and when one is wired but software has
+    /// hardware-disabled it — a disabled APIC has no register page at all (SDM
+    /// Vol 3A §10.4.3), which is what `dev::pc::apic` models.
+    ///
+    /// The address is the one the *register* reports rather than the one a
+    /// machine file mapped. Those can differ only if a guest moved
+    /// `IA32_APIC_BASE`, which [`apic_base::BASE`] already records as reported
+    /// and not obeyed; this inherits that gap rather than opening a second one.
+    fn apic_page(&self) -> Option<u64> {
+        let base = self.lines.base_register()?;
+        (base & apic_base::ENABLE != 0).then_some(base & apic_base::BASE)
+    }
+
+    /// `CR8`, read where it actually lives.
+    ///
+    /// **There is no `cr8` field anywhere in this core, and that is the
+    /// design.** `CR8` is not a register the processor owns: it is the top
+    /// nibble of the local APIC's task-priority register, reached over a
+    /// dedicated path (SDM Vol 3A §11.8.6.1), and rsemu models that APIC as a
+    /// device. A shadow copy in [`Sys`] would be a second home for one piece
+    /// of state, and an operating system that set its priority through
+    /// `MOV CR8` and read it back through the APIC's register page — or the
+    /// other way round — would get two different answers, which would look
+    /// like an interrupt-delivery bug rather than a register bug. So the
+    /// transfer goes the only way a device can be reached: an access to its
+    /// register page, the same route `accel::state::tpr_through_space` takes
+    /// for an accelerated vCPU.
+    ///
+    /// It also means `CR8` is **not** in the snapshot: the APIC's chunk
+    /// carries the byte, and a core that saved its own copy could restore a
+    /// machine in which the two disagreed.
+    ///
+    /// A core with no local controller has no task-priority register and
+    /// therefore no priority class that could block anything — its `INTR` pin
+    /// comes from an 8259A, whose priorities the processor never sees — so it
+    /// reads zero.
+    fn read_task_priority(&self) -> u64 {
+        let Some(page) = self.apic_page() else {
+            return 0;
+        };
+        match self.mem.read(page + APIC_TPR, Width::U32, self.attrs) {
+            Ok(tpr) => (tpr >> 4) & 0xf,
+            Err(_) => 0,
+        }
+    }
+
+    /// `CR8`, written where it actually lives.
+    ///
+    /// The value is the priority *class* and it lands in `TPR[7:4]`. The
+    /// task-priority sub-class in `TPR[3:0]` is not reachable through `CR8`
+    /// and goes to zero with it — the same shift `tpr_through_space` performs,
+    /// and the reason the SDM tells software to use one of the two routes
+    /// rather than mix them (Vol 3A §11.8.6.1).
+    ///
+    /// The store is an ordinary write to the APIC's register page, so the
+    /// device re-evaluates what it has pending and drives this core's `INTR`
+    /// pin from inside it — which is how **lowering** the priority class makes
+    /// a blocked interrupt deliverable. That pin is a latch the run loop reads
+    /// at the next instruction boundary, so the delivery lands after this
+    /// instruction retires rather than in the middle of it, which is the
+    /// ordering a serializing instruction owes.
+    fn write_task_priority(&mut self, class: u64) {
+        let Some(page) = self.apic_page() else {
+            return;
+        };
+        let _ = self
+            .mem
+            .write(page + APIC_TPR, Width::U32, class << 4, self.attrs);
     }
 
     /// `MOV CRn, r`.
@@ -2965,6 +3101,20 @@ impl Exec<'_> {
                 }
                 Ok(())
             }
+            // The task-priority register, in 64-bit mode only — see
+            // [`Exec::read_task_priority`] for why there is nothing here to
+            // assign to.
+            8 if self.sixty_four() => {
+                // Bits 63:4 do not exist. A write that names one is `#GP(0)`
+                // rather than a silent truncation (SDM Vol 3A §2.5), so a
+                // guest that thought it was setting a priority class of
+                // sixteen finds out.
+                if value & !0xf != 0 {
+                    return Err(Fault::gp(0));
+                }
+                self.write_task_priority(value);
+                Ok(())
+            }
             _ => Err(Fault::bare(VEC_UD)),
         }
     }
@@ -3055,6 +3205,8 @@ impl Exec<'_> {
             // The revision of the microcode update in force, in the high
             // doubleword. There is none, so it is zero -- see the constant.
             msr::BIOS_SIGN_ID => 0,
+            // Platform zero of eight, read-only -- see the constant.
+            msr::PLATFORM_ID => 0,
             msr::STAR if self.cfg.features.syscall => sys.star,
             msr::LSTAR if self.cfg.features.syscall => sys.lstar,
             msr::CSTAR if self.cfg.features.syscall => sys.cstar,
