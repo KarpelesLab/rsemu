@@ -325,13 +325,12 @@ same meanings the other two cores give them:
   x86-64 Linux in a build with `jit-x86`. Anywhere else it falls back to
   `jit`'s backend and answers identically.
 
-**This board's file writes `engine = "interp"` as a literal rather than as a
-`param`**, so `-p engine=jit` has nothing to override; reaching the other two
-from the command line wants the two-line change
-`param engine = "interp"` plus `engine = engine` in
-[`machines/arm64-virt.machine`](../../machines/arm64-virt.machine). Everything
-below was measured by building the same board programmatically and choosing the
-engine through `Cpu::with_engine`, which is the same path `from_props` reaches.
+The board takes `-p engine=jit` and `-p engine=jit-host`; the property is a
+`param` in [`machines/arm64-virt.machine`](../../machines/arm64-virt.machine)
+precisely so that one board can be run on all three and have the state hashes
+compared. `interp` is the default because it is the oracle, and a build without
+`cpu-arm-a64-lift` and `jit` refuses the other two with a message rather than
+quietly interpreting.
 
 All three are **indistinguishable to the guest**, cycle counts included, and
 that is asserted rather than hoped: `tests/a64_engines.rs` runs a minimal
@@ -346,37 +345,75 @@ real work rather than decompressing:
 
 | `engine` | 20 s of guest time |
 | --- | --- |
-| `interp` | 17.35 s |
-| `jit` | 11.21 s (**1.55×**) |
-| `jit-host` | **6.34 s (2.73×)** |
+| `interp` | 18.94 s |
+| `jit` | 10.42 s (**1.82×**) |
+| `jit-host` | **3.37 s (5.61×)** |
 
-Every cell is the median of three **interleaved** runs — one of each engine, in
+Every cell is the median of five **interleaved** runs — one of each engine, in
 turn, round and round, because the interpreter is the control and a control
-measured in a different sitting is not one — and all nine finished on one state
-hash, `0x415f52aebd310878`, having charged 199 990 000 cycles.
+measured in a different sitting is not one — and all fifteen finished on one
+state hash. Trust the ratios ahead of the seconds: the host was building other
+things throughout, and the interpreter column moved by 2% between sittings on
+identical code, which is exactly why the reps are interleaved.
 
 What the mechanisms did over that run:
 
 | | |
 | --- | --- |
-| blocks executed | 18 774 915 |
-| of those, compiled to host code | 18 774 316 (**99.997%**) |
-| of those, reached by a patched exit | 14 341 043 (76.4%) |
-| distinct blocks lifted | 16 655 |
-| guest instructions retired **inside** a block | 123 794 600 (**79.2%**) |
-| compiled loads served by an inlined TLB probe | 16 149 884 |
-| compiled stores served the same way | 10 535 057 |
+| blocks executed | 23 810 578 |
+| of those, compiled to host code | 23 809 916 (**99.997%**) |
+| of those, reached by a patched exit | 20 571 853 (86.4%) |
+| distinct blocks lifted | 17 638 |
+| guest instructions retired **inside** a block | 153 130 249 (**97.96%**) |
+| compiled loads served by an inlined TLB probe | 18 712 518 |
+| compiled stores served the same way | 13 350 310 |
+| blocks the scheduler-budget guard lifted to price | 14 506 |
 
-The 599 blocks the code generator refused are the ones holding a `UDIV` or an
+The blocks the code generator refused are the ones holding a `UDIV` or an
 `SDIV`, the only two ops this frontend emits that `jit::x86` does not lower.
 The inlined probes — `ROADMAP.md` §9.1's first mechanism, the software TLB's
-fast path emitted into generated code rather than called into — are worth the
-last step of that ratio on their own: before `cpu::arm::a64::mmu`'s `Tlb` had a
+fast path emitted into generated code rather than called into — are worth a
+step of that ratio on their own: before `cpu::arm::a64::mmu`'s `Tlb` had a
 `jit::Tlb` shadow to publish, the same sweep put `jit-host` at 6.92 s and
 2.54×. [`src/cpu/arm/a64/engine.rs`](../../src/cpu/arm/a64/engine.rs) has the
 argument for what a plan may cover on this architecture, and the three things
 that looked as though they might forbid one — address tagging, the two `TTBR`s
 and granule selection — none of which does.
+
+### The last row is the interesting one, and it was not in the frontend
+
+`jit-host` was **6.06 s and 3.07×** in the same harness a week ago, with 79.2%
+of guest instructions retiring inside a block. The other 20.8% were profiled by
+decoded instruction row over a real boot, and the answer was not the frontend's
+documented exclusions:
+
+| why the interpreter ran it | instructions | share |
+| --- | --- | --- |
+| the scheduler-budget guard declined a block | 30 292 743 | **94.4%** |
+| outside the lifted subset | 1 795 754 | 5.6% |
+
+A translated block may only run if its **worst case** fits what is left of the
+scheduler quantum, or the two engines would stop on different instructions and
+the state hash they are supposed to share would part. For a PC nothing had been
+lifted at, that worst case was the frontend's own limit — 64 instructions of an
+unaligned pair access, each byte walked four levels, **5 188 ticks** — against
+a quantum of 10 000. So the last half of every quantum could admit nothing, and
+it could not recover inside the quantum either: the PC after an interpreted
+instruction is in the middle of a block, and only a lift fills the cost table,
+so it was uncosted too. `engine.rs`'s `Probe` lifts the cold PC instead of
+guessing at it — reading no guest state, charging no ticks, and handing the
+block straight to the dispatcher so nothing is lifted twice.
+
+The exclusions, meanwhile, cost **1.15%** of the guest's instructions between
+them: `MRS` 1 024 738 (of which `SP_EL0` — Linux's `current` — is 645 329), the
+exclusives and acquire/release accesses 339 581, `MSR` 224 806, the
+`DC`/`IC`/`TLBI` maintenance operations 204 552, `RBIT` 1 584. **No SIMD or
+floating-point instruction executed at all**, and no `LDTR`/`STTR` either. The
+largest documented absence in the frontend is worth nothing on the guest the
+board exists to run, which is the sort of thing only a profile says.
+
+`benches/a64_dispatch.rs`'s second table sweeps the quantum so that this cliff
+is a column rather than a paragraph.
 
 
 ## Where it stops, and what is still in the way
