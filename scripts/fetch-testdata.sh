@@ -2089,19 +2089,17 @@ build_a64_tests() {
 # in the tree. Everything comes out of the Rust toolchain -- the musl libc and
 # its startup files ship with the target, and the linker is the rust-lld inside
 # the toolchain -- so there is no C toolchain and no sysroot in this path.
+#
+# Every guest is built for every architecture the proof can run, because a
+# second architecture is what proves the level-3 seam is not RISC-V-shaped
+# (ROADMAP.md 2.1). A target whose standard library is not installed is skipped
+# with a note rather than fatal: the proof runs whatever it finds.
 build_usermode_guests() {
 	need rustc
 
 	local src="${REPO_ROOT}/tests/usermode"
 	local dest="${DEST_ROOT}/usermode"
-	local target=riscv64gc-unknown-linux-musl
 	[ -d "$src" ] || die "${src} is missing; this is not an rsemu checkout"
-
-	if ! rustc --target "$target" --print target-libdir 2>/dev/null |
-		xargs -r test -d; then
-		die "the ${target} standard library is not installed
-  rustup target add ${target}"
-	fi
 
 	# rustc drives the link through `cc` for musl targets, and this host's `cc`
 	# is not a RISC-V one. rust-lld ships with the toolchain and is reached
@@ -2113,33 +2111,47 @@ build_usermode_guests() {
 	[ -x "$ld" ] || die "no rust-lld at ${ld}; install the llvm-tools component"
 
 	mkdir -p "$dest"
-	local guest name out built=0
-	for guest in "$src"/*.rs; do
-		name="$(basename "$guest" .rs)"
-		out="${dest}/${name}-riscv64"
-		if [ "$FORCE" != 1 ] && [ -f "$out" ] && [ "$out" -nt "$guest" ]; then
-			note "  $(basename "$out") is up to date"
-			built=$((built + 1))
+	local pair target suffix guest name out built=0 targets=0
+	for pair in riscv64gc-unknown-linux-musl:riscv64 aarch64-unknown-linux-musl:aarch64; do
+		target="${pair%%:*}"
+		suffix="${pair##*:}"
+		if ! rustc --target "$target" --print target-libdir 2>/dev/null |
+			xargs -r test -d; then
+			note "  no ${target} standard library; skipping ${suffix}"
+			note "    rustup target add ${target}"
 			continue
 		fi
-		note "  building ${name} for ${target} ..."
-		# -C debuginfo=0 -C strip=symbols: the loader reads program headers and
-		# nothing else, and the debug sections are twenty times the program.
-		rustc --edition 2024 \
-			--target "$target" \
-			-C target-feature=+crt-static \
-			-C link-self-contained=yes \
-			-C linker="$ld" \
-			-C linker-flavor=ld \
-			-C opt-level=1 \
-			-C debuginfo=0 \
-			-C strip=symbols \
-			--crate-name "$name" \
-			-o "$out" \
-			"$guest" || die "could not build ${name}"
-		built=$((built + 1))
+		targets=$((targets + 1))
+		for guest in "$src"/*.rs; do
+			name="$(basename "$guest" .rs)"
+			out="${dest}/${name}-${suffix}"
+			if [ "$FORCE" != 1 ] && [ -f "$out" ] && [ "$out" -nt "$guest" ]; then
+				note "  $(basename "$out") is up to date"
+				built=$((built + 1))
+				continue
+			fi
+			note "  building ${name} for ${target} ..."
+			# -C debuginfo=0 -C strip=symbols: the loader reads program headers
+			# and nothing else, and the debug sections are twenty times the
+			# program.
+			rustc --edition 2024 \
+				--target "$target" \
+				-C target-feature=+crt-static \
+				-C link-self-contained=yes \
+				-C linker="$ld" \
+				-C linker-flavor=ld \
+				-C opt-level=1 \
+				-C debuginfo=0 \
+				-C strip=symbols \
+				--crate-name "$name" \
+				-o "$out" \
+				"$guest" || die "could not build ${name} for ${target}"
+			built=$((built + 1))
+		done
 	done
 
+	[ "$targets" -gt 0 ] || die "no usermode target installed
+  rustup target add riscv64gc-unknown-linux-musl"
 	[ "$built" -gt 0 ] || die "no guests under ${src}"
 	ok "usermode-guests: ${built} static binaries in ${dest}"
 	note "    cargo test --all-features usermode::proof -- --nocapture"
@@ -2167,10 +2179,11 @@ Suites:
                  this path. See src/cpu/arm/a64/conformance.rs.
   usermode-guests  the level-3 guest programs this repository BUILDS: static
                  Linux binaries that src/usermode/proof.rs runs with no guest
-                 kernel under them. Needs `rustc` with the
-                 riscv64gc-unknown-linux-musl target installed
-                 (`rustup target add riscv64gc-unknown-linux-musl`); musl and
-                 the linker both come from the Rust toolchain.
+                 kernel under them, one per architecture. Needs `rustc` with
+                 riscv64gc-unknown-linux-musl and/or aarch64-unknown-linux-musl
+                 installed (`rustup target add ...`); an absent one is skipped
+                 with a note. musl and the linker both come from the Rust
+                 toolchain.
   riscv-arch-test  the RISC-V architectural certification tests (BSD-3-Clause).
                  Built rather than downloaded: needs clang and a RISC-V linker
                  (lld, or rustup's rust-lld), and fetches the Sail reference

@@ -677,9 +677,12 @@ jit-x86 = ["jit", "std"]
 #
 # That the four are *enough* is measured rather than asserted:
 # `src/usermode/proof.rs` is a `#[cfg(test)]` stand-in for that consumer — the
-# loader, the auxiliary vector, the syscall table and the sandbox policy,
-# written out longhand against the public API — and it runs a real statically
-# linked `riscv64` Linux binary to a `hello world` and exit 0. Nothing it
+# loader, the auxiliary vector, the syscall table, the process model and the
+# sandbox policy, written out longhand against the public API — and it runs
+# real statically linked Linux binaries on **two** architectures: a `hello
+# world` to exit 0, and a threaded program that spawns, contends an atomic,
+# joins and rendezvouses on a condition variable. It compiles against whichever
+# of `cpu-riscv` and `cpu-arm-a64` this build has, one or both. Nothing it
 # contains is compiled into a shipped build. `docs/system/usermode-abi.md`.
 usermode = []
 
