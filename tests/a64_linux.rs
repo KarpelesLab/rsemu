@@ -16,6 +16,29 @@
 //!           --test a64_linux -- --nocapture
 //! ```
 //!
+//! # Booting off the disk rather than out of the ramdisk
+//!
+//! `arm64-rootfs` builds two more fixtures: an **ext4 filesystem** in
+//! `rootfs.img` and an initramfs that carries the kernel's own `virtio_mmio`,
+//! `virtio_blk` and `ext4` modules (and the four `ext4` needs), `insmod`s
+//! them, mounts `/dev/vda` and `switch_root`s into it. The shell that comes up is running from the disk,
+//! and the initramfs is gone.
+//!
+//! ```text
+//!   scripts/fetch-testdata.sh arm64-linux arm64-initramfs arm64-rootfs
+//!
+//!   RSEMU_ARM64_KERNEL=testdata/arm64/linux \
+//!   RSEMU_ARM64_INITRD=testdata/arm64/initramfs.cpio \
+//!   RSEMU_ARM64_ROOTFS_INITRD=testdata/arm64/initramfs-virtio.cpio \
+//!   RSEMU_ARM64_DISK=testdata/arm64/rootfs.img \
+//!       cargo test --release --features machine-arm64-virt \
+//!           --test a64_linux -- --nocapture
+//! ```
+//!
+//! All four named, and every test in this file runs: the two ramdisk tests
+//! take the archive that reaches a prompt, and the disk test takes the one
+//! that reaches the disk.
+//!
 //! It is a `--release` test in practice: a whole Linux boot is a few hundred
 //! million interpreted instructions and takes about three minutes optimised.
 //! `docs/platforms/arm64-virt.md` has the transcript and the ledger.
@@ -56,6 +79,36 @@ fn initrd() -> Vec<u8> {
     }
 }
 
+/// The ramdisk the disk-boot test starts from, if one was named.
+///
+/// Its own variable rather than [`initrd`]'s, because the two archives are
+/// different fixtures for different runs and the tests that want a prompt
+/// should not have to load four megabytes of modules to get one:
+/// `initramfs.cpio` reaches a shell, `initramfs-virtio.cpio` `insmod`s the
+/// storage path and hands over to the disk. Falls back to `RSEMU_ARM64_INITRD`
+/// so that naming one variable still works.
+fn rootfs_initrd() -> Vec<u8> {
+    match std::env::var("RSEMU_ARM64_ROOTFS_INITRD") {
+        Ok(path) => std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("RSEMU_ARM64_ROOTFS_INITRD names `{path}`: {e}")),
+        Err(_) => initrd(),
+    }
+}
+
+/// The disk image, if one was named.
+///
+/// Bound to the board's `disk` media slot, which is the front of the virtio
+/// block device's platter. Nothing bound is a blank disk of the machine
+/// file's `storage` size, which is what every other test here runs on.
+fn disk() -> Vec<u8> {
+    match std::env::var("RSEMU_ARM64_DISK") {
+        Ok(path) => {
+            std::fs::read(&path).unwrap_or_else(|e| panic!("RSEMU_ARM64_DISK names `{path}`: {e}"))
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
 /// An environment variable with a default.
 fn env_or(name: &str, fallback: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| fallback.to_string())
@@ -68,12 +121,20 @@ struct Board {
 }
 
 fn board(kernel: &[u8], initrd: &[u8]) -> Board {
+    board_with_disk(kernel, initrd, &[])
+}
+
+fn board_with_disk(kernel: &[u8], initrd: &[u8], disk: &[u8]) -> Board {
     let entry = catalog::machine("arm64-virt").expect("this build ships it");
     let options = catalog::build_options()
         .expect("the catalog agrees with itself")
         .with_media("kernel", kernel)
         .with_media("initrd", initrd)
+        .with_media("disk", disk)
         .with_param("ram", env_or("RSEMU_ARM64_RAM", "1G"))
+        // Large enough that a root filesystem fits behind it and small enough
+        // that a board with an empty `disk` slot does not pay for it.
+        .with_param("storage", env_or("RSEMU_ARM64_STORAGE", "64M"))
         .with_param(
             "cmdline",
             env_or(
@@ -191,10 +252,31 @@ struct Script {
     send: &'static str,
 }
 
+/// How many quanta of silence mean the guest has stopped moving.
+///
+/// A boot that reaches a prompt goes quiet on purpose, so this is also how a
+/// finished run ends. It is a *parameter* because the honest value depends on
+/// what the guest is doing: a kernel between `Freeing unused kernel memory`
+/// and its `/init` says nothing for a few thousand quanta, but a `/init` that
+/// `insmod`s four megabytes of modules and then mounts a filesystem says
+/// nothing for a couple of hundred thousand — and a budget sized for the first
+/// reports the second as a hang. `IDLE_BOOT` was the only value there was, and
+/// it cut the disk boot off in the middle of loading `ext4`.
+const IDLE_BOOT: usize = 60_000;
+
+/// The same, for a run whose userspace does real work before it prints.
+///
+/// Measured rather than guessed: the widest silent stretch in the disk boot is
+/// the `insmod` of four megabytes of modules and the `ext4` mount that follows
+/// it, which is about a hundred thousand quanta. This is that with headroom —
+/// and it is also what the run costs *after* it succeeds, because a shell at a
+/// prompt is silent too, so it is not simply set to a large number.
+const IDLE_MODULES: usize = 250_000;
+
 /// Run until the guest stops the machine, until `quanta` have gone by, or
-/// until nothing new has been printed for a long time — printing as it goes,
+/// until nothing new has been printed for `idle` quanta — printing as it goes,
 /// because the log *is* the result.
-fn run(b: &mut Board, quanta: usize, script: Option<Script>) -> String {
+fn run(b: &mut Board, quanta: usize, idle_budget: usize, script: Option<Script>) -> String {
     // Checking the core's state costs a whole snapshot per slice, so it is
     // opt-in: `RSEMU_ARM64_TRACE=1` is what a person debugging a fault sets,
     // and it stops at the first exception rather than at the log's end.
@@ -239,10 +321,10 @@ fn run(b: &mut Board, quanta: usize, script: Option<Script>) -> String {
         }
         if out.len() == last_len {
             idle += 1;
-            // Sixty thousand slices with nothing printed is a guest that has
+            // A guest that has printed nothing for `idle_budget` slices has
             // stopped moving, and the log up to that point is what the next
             // person needs.
-            if idle > 60_000 {
+            if idle > idle_budget {
                 eprintln!("\n--- nothing printed for {idle} slices, at round {round} ---");
                 break;
             }
@@ -287,7 +369,7 @@ fn a_real_kernel_boots_and_runs_init() {
     };
     let ramdisk = initrd();
     let mut b = board(&image, &ramdisk);
-    let text = run(&mut b, quanta("600000"), None);
+    let text = run(&mut b, quanta("600000"), IDLE_BOOT, None);
 
     // Each of these was broken at some point on the way here, so each is
     // asserted rather than merely printed: a regression should be a failure
@@ -324,6 +406,54 @@ fn a_real_kernel_boots_and_runs_init() {
 }
 
 #[test]
+fn linux_mounts_a_root_filesystem_off_the_virtio_disk_and_switches_to_it() {
+    // The milestone this board's virtio device exists for: not "a ramdisk the
+    // kernel unpacked into memory" but a **filesystem on a block device**,
+    // reached through `dev::virtio`'s MMIO transport, the board's `map` at
+    // 0x0a000000 and the `virtio_mmio` node the generated tree carries.
+    //
+    // The kernel is Debian's, which builds `virtio_mmio`, `virtio_blk` and
+    // `ext4` as modules, so an initramfs is still what starts: it `insmod`s
+    // the seven modules, mounts `/dev/vda` and `switch_root`s. What runs after
+    // that is on the disk, and the initramfs is gone.
+    let Some(image) = kernel() else {
+        eprintln!(
+            "RSEMU_ARM64_KERNEL is not set, so this test does nothing.\n\
+             scripts/fetch-testdata.sh arm64-linux arm64-rootfs"
+        );
+        return;
+    };
+    let platter = disk();
+    if platter.is_empty() {
+        eprintln!(
+            "RSEMU_ARM64_DISK is not set, so there is no root filesystem.\n\
+             scripts/fetch-testdata.sh arm64-rootfs"
+        );
+        return;
+    }
+    let ramdisk = rootfs_initrd();
+    let mut b = board_with_disk(&image, &ramdisk, &platter);
+    let text = run(&mut b, quanta("1000000"), IDLE_MODULES, None);
+
+    assert!(
+        text.contains("virtio_blk virtio0: [vda]"),
+        "the kernel never claimed the board's virtio disk"
+    );
+    assert!(
+        text.contains("EXT4-fs (vda): mounted filesystem"),
+        "the kernel never mounted a filesystem off it"
+    );
+    assert!(
+        text.contains("rsemu arm64-virt: this shell is running from an ext4 root"),
+        "`/sbin/init` on the disk did not run; the console said {text:?}"
+    );
+    assert!(
+        text.contains("/dev/vda / ext4"),
+        "`/proc/mounts` does not say the root filesystem is the virtio disk"
+    );
+}
+
+#[test]
 fn a_poweroff_typed_at_the_shell_stops_the_machine() {
     // PSCI end to end, from userspace: busybox's `poweroff` asks the kernel to
     // power the machine off, the kernel's PSCI driver executes `SMC` with
@@ -342,6 +472,7 @@ fn a_poweroff_typed_at_the_shell_stops_the_machine() {
     let text = run(
         &mut b,
         quanta("900000"),
+        IDLE_BOOT,
         Some(Script {
             after: "BusyBox",
             send: "poweroff -f\n",

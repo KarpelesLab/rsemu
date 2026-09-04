@@ -362,7 +362,7 @@ fn the_boot_rom_hands_over_a_device_tree_that_parses() {
     let dtb = b.device_tree();
     assert_eq!(
         u32::from_be_bytes([dtb[0], dtb[1], dtb[2], dtb[3]]),
-        super::fdt::FDT_MAGIC,
+        crate::dev::fdt::FDT_MAGIC,
         "the blob at the address a1 points at is not a device tree"
     );
     let tree = super::dt::describe(&dtb).expect("it parses");
@@ -805,9 +805,9 @@ fn the_virtio_block_device_is_discoverable_and_serves_a_read() {
             .read(base + off, Width::U32, Attrs::DEFAULT)
             .expect("the transport answers")
     };
-    assert_eq!(read(0x000) as u32, super::virtio::mmio::MAGIC);
-    assert_eq!(read(0x004), u64::from(super::virtio::mmio::VERSION));
-    assert_eq!(read(0x008), u64::from(super::virtio::DEVICE_ID_BLOCK));
+    assert_eq!(read(0x000) as u32, crate::dev::virtio::mmio::MAGIC);
+    assert_eq!(read(0x004), u64::from(crate::dev::virtio::mmio::VERSION));
+    assert_eq!(read(0x008), u64::from(crate::dev::virtio::DEVICE_ID_BLOCK));
     // The configuration space reports the size the machine file asked for.
     let capacity = space
         .read(base + 0x100, Width::U64, Attrs::DEFAULT)
@@ -817,7 +817,7 @@ fn the_virtio_block_device_is_discoverable_and_serves_a_read() {
     let rng = 0x1000_2000u64;
     assert_eq!(
         space.read(rng + 0x008, Width::U32, Attrs::DEFAULT).unwrap(),
-        u64::from(super::virtio::DEVICE_ID_ENTROPY)
+        u64::from(crate::dev::virtio::DEVICE_ID_ENTROPY)
     );
 }
 

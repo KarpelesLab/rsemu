@@ -602,9 +602,11 @@ pub static A64_MINI: CatalogEntry = CatalogEntry {
 pub static ARM64_VIRT: CatalogEntry = CatalogEntry {
     name: "arm64-virt",
     summary: "AArch64 `virt`: a Cortex-A53-class core, GICv2, PL011, PSCI, DTB",
-    // Only `kernel` is needed to come up; `initrd` is what a kernel that has
-    // to find a root filesystem wants, and unbound means no ramdisk.
-    media: &["kernel", "initrd"],
+    // Only `kernel` is needed to come up. `initrd` is a ramdisk for a kernel
+    // that has to find a root filesystem in memory, and `disk` is the virtio
+    // block device's platter for one that finds it on a disk instead; unbound
+    // means no ramdisk and a blank disk of the machine file's `storage` size.
+    media: &["kernel", "initrd", "disk"],
     source: include_str!("../../machines/arm64-virt.machine"),
 };
 
@@ -814,6 +816,8 @@ pub fn registry() -> Result<Registry> {
     crate::cpu::riscv::register(&mut reg)?;
     #[cfg(feature = "dev-riscv")]
     crate::dev::riscv::register(&mut reg)?;
+    #[cfg(feature = "dev-virtio")]
+    crate::dev::virtio::register(&mut reg)?;
     #[cfg(feature = "dev-uart-ns16550")]
     crate::dev::uart::ns16550::register(&mut reg)?;
     #[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
@@ -926,6 +930,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::cpu::riscv::bind(&mut b)?;
     #[cfg(feature = "dev-riscv")]
     crate::dev::riscv::bind(&mut b)?;
+    #[cfg(feature = "dev-virtio")]
+    crate::dev::virtio::bind(&mut b)?;
     #[cfg(feature = "dev-uart-ns16550")]
     crate::dev::uart::ns16550::bind(&mut b)?;
     #[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
@@ -1041,6 +1047,10 @@ pub fn classes() -> ClassTable {
     table.insert(crate::cpu::riscv::schema());
     #[cfg(feature = "dev-riscv")]
     for schema in crate::dev::riscv::schemas() {
+        table.insert(schema);
+    }
+    #[cfg(feature = "dev-virtio")]
+    for schema in crate::dev::virtio::schemas() {
         table.insert(schema);
     }
     #[cfg(feature = "dev-uart-ns16550")]
@@ -1807,6 +1817,10 @@ mod tests {
             // `/chosen` without the two `linux,initrd-*` properties.
             #[cfg(feature = "machine-arm64-virt")]
             ("arm64-virt", "initrd") => &[],
+            // And no disk image, which leaves the `size` in the machine file
+            // to supply a blank one — a board with an unwritten disk in it.
+            #[cfg(feature = "machine-arm64-virt")]
+            ("arm64-virt", "disk") => &[],
             // The two words a Cortex-M4 fetches out of reset — an initial
             // stack pointer at the top of SRAM and a reset vector, with bit 0
             // set because there is no ARM state to interwork to — followed by

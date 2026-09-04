@@ -13,7 +13,6 @@
 //! | [`gic`] | the GICv2 distributor and CPU interface: enable, priority, claim, end |
 //! | [`pl011`] | the ARM PrimeCell UART, on the character-device seam |
 //! | [`power`] | where `PSCI_SYSTEM_OFF` lands, as a named host signal |
-//! | [`fdt`] | the flattened device tree *format* |
 //! | [`dt`] | the device tree *generator*, which walks the realized machine |
 //! | [`boot`] | the reset vector, and where the generated tree lands |
 //! | [`loader`] | putting a kernel or a ramdisk into guest memory |
@@ -37,6 +36,7 @@
 //!   0x0800_0000  GIC distributor
 //!   0x0801_0000  GIC CPU interface
 //!   0x0900_0000  PL011 UART
+//!   0x0a00_0000  virtio-mmio (dev::virtio), one 4 KiB window each
 //!   0x4000_0000  DRAM
 //! ```
 //!
@@ -57,21 +57,45 @@
 //!   `ttyAMA0`, unpacks an initramfs, reaches `Run /init as init process` and
 //!   gets a prompt. Typing `poweroff` at that prompt stops the machine through
 //!   PSCI.
+//! * **Linux off a disk.** With `arm64-rootfs`'s two fixtures — an **ext4
+//!   filesystem** and an initramfs carrying the kernel's own `virtio_mmio`,
+//!   `virtio_blk` and `ext4` modules — the kernel claims the board's
+//!   [`virtio`](crate::dev::virtio) block device at `0x0a000000`, mounts
+//!   `/dev/vda` and `switch_root`s onto it. The shell that comes up is running
+//!   from the disk and the ramdisk has been freed:
+//!
+//!   ```text
+//!   [    1.339042] virtio_blk virtio0: [vda] 131072 512-byte logical blocks
+//!   [    2.077553] EXT4-fs (vda): mounted filesystem … ro with ordered data mode
+//!   rsemu arm64-virt: this shell is running from an ext4 root filesystem on /dev/vda
+//!   /dev/vda / ext4 ro,relatime 0 0
+//!   ```
 //!
 //! `docs/platforms/arm64-virt.md` has the transcript, the two core bugs the
 //! boot found, and the ledger of what is still in the way.
 //!
-//! # Two things here are copies, and both are marked
+//! # What this module is not
 //!
-//! [`fdt`] is `dev::riscv::fdt` and [`power`]'s `Signal` is
-//! `dev::riscv::syscon`'s. The DTB format and a poweroff request are neither
-//! of them architecture-specific, and one copy of each would obviously be
-//! better — but the existing copy is behind `dev-riscv`, and an AArch64 board
-//! that had to link a PLIC and a CLINT to describe itself would break the
-//! crate-shape rule far more loudly than the duplication does. `src/dev/fdt.rs`
-//! and `src/dev/power.rs` behind a shared feature are the one-commit fix, and
-//! it touches two directories at once, which is why it is written down rather
-//! than done here.
+//! The DTB *format* is not here. It is [`dev::fdt`](crate::dev::fdt), behind
+//! `dev-fdt`, and this module's [`dt`] is one of the two generators that write
+//! through it — the other being [`dev::riscv::dt`](crate::dev::riscv::dt).
+//! Chapter 5 of the Devicetree Specification describes a container that knows
+//! nothing about the architecture inside it; which nodes go in the container
+//! is entirely this board's business.
+//!
+//! virtio is not here either: [`dev::virtio`](crate::dev::virtio), behind
+//! `dev-virtio`, which is what this board's disk is. What *is* board-specific
+//! about a virtio device — the `virtio,mmio` node [`dt`] describes it with —
+//! is a `dev-arm` block inside that module, exactly as `dev::arm::pl011`'s
+//! node is written here.
+//!
+//! [`power`]'s `Signal` is still `dev::riscv::syscon`'s twin, and is still
+//! filed under its own [`HostKind`] — `power`, not `signal` — deliberately: a
+//! kind's identity is its *name alone*, so two modules sharing a name must
+//! agree about the type stored under it, and these two do not (one carries an
+//! exit code a syscon can report and PSCI has no way to express).
+//!
+//! [`HostKind`]: crate::core::hosts::HostKind
 //!
 //! # Provenance
 //!
@@ -90,7 +114,6 @@
 
 pub mod boot;
 pub mod dt;
-pub mod fdt;
 pub mod gic;
 pub mod loader;
 pub mod pl011;

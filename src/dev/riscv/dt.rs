@@ -69,7 +69,7 @@ use crate::core::space::{AddressSpace, RegionKind, RegionRef};
 use crate::core::sync::{LockRank, Mutex};
 use crate::core::wire::WireId;
 
-use super::fdt::FdtWriter;
+use crate::dev::fdt::FdtWriter;
 
 /// What sort of node a region becomes, and the fields only that sort has.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -696,7 +696,7 @@ pub fn describe(dtb: &[u8]) -> Result<String> {
             .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
             .ok_or_else(|| Error::State("device tree is truncated".to_string()))
     };
-    if word(0)? != super::fdt::FDT_MAGIC {
+    if word(0)? != crate::dev::fdt::FDT_MAGIC {
         return Err(Error::State("not a flattened device tree".to_string()));
     }
     let off_struct = word(8)? as usize;

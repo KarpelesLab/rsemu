@@ -137,7 +137,7 @@ guests require it.
 than two and settles what "the seam" means in this tree: `dev::medium::Medium` is
 where a storage device's bytes come from, and a controller that invents its own
 backing store is a controller that has quietly opted out of `--drive`, out of
-the snapshot policies, and out of qcow2. `dev/riscv/virtio/blk` held a
+the snapshot policies, and out of qcow2. `dev/virtio/blk` held a
 `Vec<u8>` until it did not, and the three things that cost are worth recording
 because they are what any *next* device would also pay: the whole capacity in
 host memory whatever the guest actually touched; no answer at all to what a
@@ -149,7 +149,7 @@ buffer for it had been allocated. The seam does not fix the last one by itself
 chunks — but it is what made the check expressible.
 
 The seam has its own home: `src/dev/medium.rs`, feature `dev-medium`, which
-`dev-ata-disk`, `dev-nvme`, `dev-riscv` and `dev-blk` each depend on. It lived
+`dev-ata-disk`, `dev-nvme`, `dev-virtio` and `dev-blk` each depend on. It lived
 in `src/dev/ata/` for as long as ATA was the only device that wanted it, and
 the cost of leaving it there was a `riscv-virt` build linking an ATA command set
 it will never issue in order to name a trait, a slot and a three-valued enum —

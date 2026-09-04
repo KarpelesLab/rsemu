@@ -3,37 +3,49 @@
 //! # Source
 //!
 //! *Devicetree Specification*, release v0.4, chapter 5 ("Flattened Devicetree
-//! (DTB) Format") — <https://www.devicetree.org/specifications/>. The header
-//! layout of §5.2, the memory reservation block of §5.3, the structure block
-//! tokens of §5.4 and the strings block of §5.5, and nothing else. The
-//! document is published for exactly this purpose, so no other source was
-//! consulted and none was needed.
+//! (DTB) Format") — <https://www.devicetree.org/specifications/>. Everything
+//! here is that chapter and nothing else: the header layout of §5.2, the memory
+//! reservation block of §5.3, the structure block tokens of §5.4 and the
+//! strings block of §5.5. The document is published for exactly this purpose,
+//! so no other source was consulted.
 //!
-//! # Why there are two of these in the tree
+//! # Why we generate rather than ship one
 //!
-//! [`dev::riscv::fdt`](crate::dev::riscv::fdt) is the same encoder. The DTB
-//! format is architecture-neutral and one copy would obviously be better, but
-//! that copy lives under `dev/riscv/` and is reachable only from a build with
-//! `dev-riscv` on — and an AArch64 board that had to link a PLIC, a CLINT and
-//! a RISC-V boot ROM to get a device tree would contradict the crate-shape
-//! rule (`CLAUDE.md`: a NES build links a 6502 and nothing else) far more
-//! loudly than four hundred lines of specification-derived encoder do.
+//! `docs/platforms/riscv-virt.md` is explicit: the device tree is produced
+//! *mechanically from the realized machine graph*, because a topology that
+//! cannot describe itself is a topology that is only accidentally right. This
+//! module is the encoder half of that.
 //!
-//! **This is a seam to close, not a design.** The fix is `src/dev/fdt.rs`
-//! behind a `dev-fdt` feature that both boards depend on, exactly as the 16550
-//! moved out of `dev/riscv/` into `dev/uart/` the day a second board wanted
-//! one. Two boards want a device tree now. The move is a single commit that
-//! touches both directories, and this file is written so that it is a
-//! *deletion* when somebody makes it: the API below is a strict subset of the
-//! RISC-V one, with the same method names and the same semantics.
+//! # The format is shared; the generator is not
+//!
+//! There is one of these and there are two generators, and that split is the
+//! design rather than an accident of who wrote what first.
+//!
+//! Chapter 5 describes a container: a header, a reservation block, a stream of
+//! begin/property/end tokens and an interned strings block. Not one byte of it
+//! knows what a hart or a GIC is, and every integer in it is big-endian
+//! whatever the guest's byte order is (§5.2) — an AArch64 guest reads this
+//! blob byte-swapped, as every device tree reader on every architecture always
+//! has. So a single encoder serves every board that will ever want one, and
+//! this file is it, behind `dev-fdt`.
+//!
+//! What is emphatically *not* shared is the thing that decides which nodes to
+//! write. [`dev::riscv::dt`](crate::dev::riscv::dt) wraps its peripherals in a
+//! `/soc` node, numbers interrupts in one cell out of a PLIC's source table
+//! and emits `riscv,isa`; [`dev::arm::dt`](crate::dev::arm::dt) puts its
+//! peripherals at the root, numbers interrupts in three cells out of a GIC —
+//! and *subtracts the base again*, so architectural id 33 is `<0 1 4>` — and
+//! emits a `psci` node. Those are two different documents that happen to be
+//! encoded the same way, and merging them would produce a generator with an
+//! architecture switch in every branch.
 //!
 //! # Shape of the API
 //!
 //! An [`FdtWriter`] is a builder with a cursor: [`begin_node`] opens one,
-//! [`end_node`] closes it, and property calls in between attach to whichever
-//! is open. Nesting errors are caught at [`finish`] rather than by the type
+//! [`end_node`] closes it, and property calls in between attach to whichever is
+//! open. Nesting errors are caught at [`finish`] rather than by the type
 //! system, because the natural way to build a tree from a machine graph is a
-//! loop and not a nest of closures.
+//! loop, not a nest of closures.
 //!
 //! [`begin_node`]: FdtWriter::begin_node
 //! [`end_node`]: FdtWriter::end_node
@@ -71,9 +83,7 @@ const HEADER_LEN: usize = 40;
 /// Builds a flattened device tree.
 ///
 /// Every integer in the output is big-endian, which is the format's own byte
-/// order and has nothing to do with the guest's (§5.2) — an AArch64 guest is
-/// little-endian and reads this blob byte-swapped, as every device tree reader
-/// on every architecture always has.
+/// order and has nothing to do with the guest's (§5.2).
 #[derive(Debug, Default)]
 pub struct FdtWriter {
     /// The structure block: tokens and inline property data (§5.4).
@@ -86,7 +96,7 @@ pub struct FdtWriter {
     /// this blob lands in guest memory, so a tree that differed run to run
     /// would make the machine's state hash differ too.
     interned: BTreeMap<String, u32>,
-    /// Reserved physical ranges (§5.3).
+    /// Reserved memory ranges (§5.3).
     reservations: Vec<(u64, u64)>,
     /// How many nodes are open, so `finish` can refuse an unbalanced tree.
     depth: usize,
@@ -102,7 +112,8 @@ impl FdtWriter {
     }
 
     /// Set the header's `boot_cpuid_phys` — the processor the client program
-    /// was entered on.
+    /// is entered on. A hart id on one board, an `MPIDR_EL1` affinity on
+    /// another; the format does not care which.
     pub fn set_boot_cpu(&mut self, id: u32) {
         self.boot_cpu = id;
     }
@@ -129,9 +140,9 @@ impl FdtWriter {
     ///
     /// # Errors
     ///
-    /// [`Error::Config`] if no node is open. An unbalanced tree is a bug in
-    /// the caller, and encoding one produces a DTB that parses into the wrong
-    /// *shape* rather than one that fails to parse — much worse.
+    /// [`Error::Config`] if no node is open. An unbalanced tree is a bug in the
+    /// caller, and encoding one produces a DTB that parses into the wrong
+    /// shape rather than one that fails to parse — much worse.
     pub fn end_node(&mut self) -> Result<()> {
         if self.depth == 0 {
             return Err(malformed("`end_node` with no node open"));
@@ -165,8 +176,7 @@ impl FdtWriter {
         self.prop_bytes(name, &bytes);
     }
 
-    /// A property holding a list of null-terminated strings, as `compatible`
-    /// is.
+    /// A property holding a list of null-terminated strings, as `compatible` is.
     pub fn prop_str_list(&mut self, name: &str, values: &[&str]) {
         let mut bytes = Vec::new();
         for value in values {
@@ -325,14 +335,19 @@ mod tests {
         assert_eq!(h[1] as usize, dtb.len(), "totalsize covers the whole blob");
         assert_eq!(h[5], FDT_VERSION);
         assert_eq!(h[6], FDT_LAST_COMP_VERSION);
-        // FDT_BEGIN_NODE, a padded empty name, FDT_END_NODE, FDT_END.
+        // The struct block is FDT_BEGIN_NODE, a padded empty name,
+        // FDT_END_NODE, FDT_END: four words.
         assert_eq!(h[9], 16);
+        // And an empty reservation block is still its terminator.
         assert_eq!(h[4] as usize, HEADER_LEN);
         assert_eq!(h[2] as usize, HEADER_LEN + 16);
     }
 
     #[test]
     fn a_property_name_appears_once_however_many_nodes_use_it() {
+        // The strings block is the reason the format is compact at all, and a
+        // writer that forgot to intern would still produce a readable tree —
+        // so this has to be asserted rather than assumed.
         let mut w = FdtWriter::new();
         w.begin_node("");
         for name in ["a@0", "b@1", "c@2"] {
@@ -360,13 +375,13 @@ mod tests {
     #[test]
     fn reservations_are_written_with_their_terminator() {
         let mut w = FdtWriter::new();
-        w.reserve(0x4000_0000, 0x1000);
+        w.reserve(0x8000_0000, 0x1000);
         w.begin_node("");
         w.end_node().unwrap();
         let dtb = w.finish().unwrap();
         let h = header(&dtb);
         let at = h[4] as usize;
-        assert_eq!(&dtb[at..at + 8], &0x4000_0000u64.to_be_bytes());
+        assert_eq!(&dtb[at..at + 8], &0x8000_0000u64.to_be_bytes());
         assert_eq!(&dtb[at + 8..at + 16], &0x1000u64.to_be_bytes());
         assert_eq!(&dtb[at + 16..at + 32], &[0u8; 16], "the terminator");
         assert_eq!(h[2] as usize, at + 32, "and the struct block follows it");
@@ -376,12 +391,12 @@ mod tests {
     fn cells_and_reg_pairs_are_big_endian_whatever_the_guest_is() {
         let mut w = FdtWriter::new();
         w.begin_node("");
-        w.prop_reg64(&[(0x0900_0000, 0x1000)]);
+        w.prop_reg64(&[(0x1000_0000, 0x100)]);
         w.end_node().unwrap();
         let dtb = w.finish().unwrap();
         let needle = [
-            0u8, 0, 0, 0, 0x09, 0, 0, 0, // address: high cell, then low
-            0, 0, 0, 0, 0, 0, 0x10, 0, // size
+            0u8, 0, 0, 0, 0x10, 0, 0, 0, // address: high cell, then low
+            0, 0, 0, 0, 0, 0, 1, 0, // size
         ];
         assert!(
             dtb.windows(needle.len()).any(|w| w == needle),

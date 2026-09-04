@@ -24,7 +24,7 @@ drivers, which is the usual trap.
 - virtio-net is a `pktkit::L2Device`; virtio-blk sits on `fstool::BlockDevice`.
   Neither needs transport-specific code.
 - **virtio-blk reaches `fstool` through `dev::medium::Medium`, not directly.**
-  `src/dev/riscv/virtio` is `no_std` and `fstool` is a `std` crate, so the
+  `src/dev/virtio` is `no_std` and `fstool` is a `std` crate, so the
   device holds the narrow `&self` trait and `dev/blk` adapts that to a
   `BlockDevice` behind a lock — the same seam an ATA drive's platter and an
   NVMe namespace use, and the reason `--drive disk=root.qcow2` works on all

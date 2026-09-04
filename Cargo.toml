@@ -807,12 +807,11 @@ machine-a64-mini = ["cpu-arm-a64"]
 # `unsafe`, no dependencies. Written from the GIC Architecture Specification
 # v2.0, the PL011 TRM, DEN 0022 (PSCI) and the Devicetree Specification.
 #
-# It does not pull `dev-riscv`, and that is deliberate: the DTB *format* writer
-# and the poweroff signal are duplicated here rather than shared, because the
-# shared copies live under `dev/riscv/` and an AArch64 board that had to link a
-# PLIC and a CLINT to describe itself would break the crate-shape rule. See
-# src/dev/arm/mod.rs, which says what the one-commit fix is.
-dev-arm = []
+# It does not pull `dev-riscv`. The DTB *format* writer is `dev-fdt` below and
+# both boards depend on that; the *generator* is per-architecture and stays in
+# each board's own directory. What is left under `dev-riscv` is a PLIC, a CLINT
+# and a RISC-V boot ROM, none of which an AArch64 board has any use for.
+dev-arm = ["dev-fdt"]
 
 # The AArch64 `virt` board as a machine (machines/arm64-virt.machine plus the
 # classes it names). The board a real arm64 kernel is pointed at:
@@ -822,7 +821,7 @@ dev-arm = []
 # The kernel goes into DRAM, the boot ROM hands it a generated device tree in
 # `x0`, and the console is a PL011. `docs/platforms/arm64-virt.md` has the
 # transcript and the ledger of what is still in the way.
-machine-arm64-virt = ["cpu-arm-a64", "dev-arm"]
+machine-arm64-virt = ["cpu-arm-a64", "dev-arm", "dev-virtio"]
 
 # The `arm926` board (machines/arm926.machine plus the classes it names): a bare
 # ARM926EJ-S SoC skeleton -- an ARMv5TE core, a boot ROM at the reset vector,
@@ -863,11 +862,46 @@ dev-uart-ns16550 = []
 # `dev-uart-ns16550` is the board's console, and it is a feature of its own
 # rather than a module here: see its comment above.
 #
-# `dev-medium` is here for the storage seam alone -- `dev::medium::Medium`,
-# which `virtio.blk` stores its bytes behind so that `--drive disk=root.qcow2`
-# backs it with a host file through `dev-blk` exactly as it backs an ATA drive
-# or an NVMe namespace (ROADMAP.md 7.1). Nothing here talks ATA.
-dev-riscv = ["dev-medium", "dev-uart-ns16550"]
+# virtio is not here either, and used to be: `dev-virtio` below is the
+# transport and the two devices, and this feature only teaches them how a
+# RISC-V device tree names one. A board that wants a virtio disk asks for
+# `dev-virtio`; `machines/riscv-virt.machine` does.
+dev-riscv = ["dev-fdt", "dev-uart-ns16550"]
+
+# virtio (src/dev/virtio): the transport-agnostic core -- split virtqueues,
+# feature negotiation, the status handshake -- the **MMIO transport** (§4.2,
+# version 2 only, so a legacy driver walks away rather than programming a
+# register block that is not there), and two devices on it: **virtio-blk** over
+# the `dev::medium::Medium` seam and **virtio-rng**, deterministically seeded.
+# `no_std + alloc`, no `unsafe`, no dependencies. Written from *Virtual I/O
+# Device (VIRTIO) Version 1.2*, OASIS Standard, and from no driver of any
+# licence (ROADMAP.md 1 names Linux's virtio drivers specifically).
+#
+# It names no architecture, which is why it is a feature of its own rather than
+# a module under `dev-riscv`: `riscv-virt` and `arm64-virt` both boot off one,
+# and before this feature existed an AArch64 board that wanted a disk had to
+# link a PLIC, a CLINT and a RISC-V boot ROM to get it. What *is* per-board is
+# the device tree node, and that is a `dev-riscv` block and a `dev-arm` block
+# inside `mmio.rs`, exactly as `dev-uart-ns16550`'s `ns16550a` node is.
+#
+# `dev-medium` is the storage seam -- what `virtio.blk` stores its bytes behind
+# so that `--drive disk=root.qcow2` backs it with a host file through `dev-blk`
+# exactly as it backs an ATA drive or an NVMe namespace (ROADMAP.md 7.1).
+dev-virtio = ["dev-medium"]
+
+# The flattened device tree *format* (src/dev/fdt.rs): the encoder of chapter 5
+# of the Devicetree Specification v0.4 -- the header, the memory reservation
+# block, the begin/property/end token stream and the interned strings block.
+# About four hundred lines, `no_std + alloc`, no `unsafe`, no dependencies.
+#
+# The *format* and the *generator* are different things and only the first is
+# shared. Chapter 5 describes a container that names no architecture, so one
+# encoder serves every board; deciding which nodes go in it is the board's
+# business, and `dev::riscv::dt` and `dev::arm::dt` are two different documents
+# -- one-cell interrupts out of a PLIC and a `/soc` wrapper against three-cell
+# interrupts out of a GIC and a `psci` node -- that happen to share a container.
+# Both `dev-riscv` and `dev-arm` depend on this; neither depends on the other.
+dev-fdt = []
 
 # Parallel NOR flash (src/dev/flash/cfi): the Common Flash Interface query
 # structure and the Intel/Sharp extended command set (CFI id 0x0001) -- status
@@ -989,7 +1023,7 @@ machine-spi-flash = ["cpu-riscv", "dev-stm32-spi", "dev-stm32-octospi", "dev-fla
 # `rsemu run riscv-virt --firmware fw.bin` loads an image at 0x80000000, hands
 # it a generated device tree in a1 and the hart id in a0, and puts its console
 # on the terminal. Adds no dependencies.
-machine-riscv-virt = ["cpu-riscv", "dev-riscv", "dev-flash-cfi"]
+machine-riscv-virt = ["cpu-riscv", "dev-riscv", "dev-virtio", "dev-flash-cfi"]
 
 # The ARMv7E-M core (src/cpu/arm/v7m): a Cortex-M4/M7-class interpreter —
 # the whole T32 instruction set in both encoding widths, `IT` blocks, the DSP

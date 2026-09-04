@@ -158,7 +158,7 @@ mod tests {
     use super::*;
     use crate::core::space::{AddressSpace, MemAttrs, RamStore, Region, RequesterId};
     use crate::core::value::Width;
-    use crate::dev::riscv::virtio::queue::{DESC_F_NEXT, DESC_F_WRITE, Layout};
+    use crate::dev::virtio::queue::{DESC_F_NEXT, DESC_F_WRITE, Layout};
     use alloc::sync::Arc;
 
     const DESC: u64 = 0x1000;
