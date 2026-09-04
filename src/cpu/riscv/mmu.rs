@@ -473,6 +473,150 @@ pub fn pmp_allows(csrs: &Csrs, addr: u64, len: u64, kind: Access, mode: Priv) ->
     }
 }
 
+/// The bit [`pmp_allows`] tests for an access kind, and the bit position the
+/// same permission occupies in a `pmpcfg` byte.
+///
+/// The two are the same number by the specification's own encoding — `R` is
+/// bit 0, `W` bit 1, `X` bit 2 — which is why [`PmpSpan`] can carry a three-bit
+/// answer for all three kinds at once rather than one bool per kind.
+#[inline]
+const fn pmp_bit(kind: Access) -> u8 {
+    match kind {
+        Access::Load => 0b001,
+        Access::Store => 0b010,
+        Access::Fetch => 0b100,
+    }
+}
+
+/// A span of physical addresses over which PMP gives one answer, and that
+/// answer.
+///
+/// [`pmp_allows`] is a linear scan of up to [`PMP_ENTRIES`] entries, each of
+/// which decodes an address register, and it is asked once per guest access —
+/// on a real boot that measured at 265 host instructions a call and a fifth of
+/// all emulation. It is also, almost always, the *same* question: firmware
+/// programs PMP once and a supervisor then runs for seconds inside one entry's
+/// range.
+///
+/// So the scan's result is memoized over the largest interval it is provably
+/// constant on. The interval is built during the same scan that answers the
+/// question, and the construction is the whole correctness argument:
+///
+/// * If entry `k` matched, start from `[lo_k, hi_k)` — every address in it
+///   reaches `k` unless something earlier claims it first.
+/// * For each entry `j` examined *before* `k` (or every entry, when none
+///   matched), `j` does not contain `addr`, so it lies entirely below it or
+///   entirely above it. Clip the interval to exclude it: `lo = max(lo, hi_j)`
+///   or `hi = min(hi, lo_j)`.
+/// * Entries *after* `k` never matter: `k` matches everywhere in `[lo_k, hi_k)`
+///   and the scan stops there.
+///
+/// An access wholly inside the resulting interval therefore reaches exactly the
+/// entries the original scan reached, in the same order, with the same verdict
+/// — including [`pmp_allows`]'s refusal of an access that straddles an entry's
+/// edge, because a straddle needs one endpoint outside the interval and the
+/// containment check rules that out. `the_span_memo_answers_what_the_scan_
+/// answers` asserts that against the scan over random configurations rather
+/// than trusting the argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PmpSpan {
+    /// The lowest address this answer covers.
+    lo: u64,
+    /// One past the highest. `hi == lo` marks a slot that holds nothing.
+    hi: u64,
+    /// One bit per [`Access`], as [`pmp_bit`] numbers them.
+    perms: u8,
+}
+
+impl PmpSpan {
+    /// A slot holding no answer. `lo == hi` fails every containment test.
+    const EMPTY: PmpSpan = PmpSpan {
+        lo: 0,
+        hi: 0,
+        perms: 0,
+    };
+
+    /// Whether `[addr, last]` lies wholly inside this span.
+    #[inline]
+    const fn covers(&self, addr: u64, last: u64) -> bool {
+        addr >= self.lo && last < self.hi
+    }
+}
+
+/// The largest span around `addr` that [`pmp_allows`] answers uniformly for
+/// `mode`, together with that answer.
+///
+/// The scan is [`pmp_allows`]'s, with the interval bookkeeping added; see
+/// [`PmpSpan`] for why the bookkeeping is exactly this and not more.
+fn pmp_span(csrs: &Csrs, addr: u64, mode: Priv) -> PmpSpan {
+    let mut lo = 0u64;
+    let mut hi = u64::MAX;
+    let mut matched = None;
+    for i in 0..csrs.pmp_count {
+        let Some((l, h)) = pmp_range(csrs, i) else {
+            continue;
+        };
+        if addr >= l && addr < h {
+            matched = Some(csrs.pmpcfg[i]);
+            lo = lo.max(l);
+            hi = hi.min(h);
+            break;
+        }
+        // Examined before the match and not containing `addr`, so it lies
+        // wholly on one side of it. The span must stop short of it, or an
+        // access inside the span would reach this entry first and could be
+        // refused by it.
+        if h <= addr {
+            lo = lo.max(h);
+        } else {
+            hi = hi.min(l);
+        }
+    }
+    let perms = match matched {
+        Some(cfg) => {
+            let locked = cfg & 0x80 != 0;
+            if mode == Priv::Machine && !locked {
+                0b111
+            } else {
+                cfg & 0b111
+            }
+        }
+        None if mode == Priv::Machine || csrs.pmp_count == 0 => 0b111,
+        None => 0,
+    };
+    PmpSpan { lo, hi, perms }
+}
+
+/// One remembered [`PmpSpan`] per privilege mode, and the configuration they
+/// were computed under.
+///
+/// Three modes, so three slots and no eviction policy: a trap into M-mode and
+/// the `SRET` back is the one alternation that happens at any rate, and a
+/// single-entry cache would thrash on it. Derived state (`ROADMAP.md` §4.5) —
+/// never serialized, thrown away whenever [`Csrs::pmp_gen`] moves, and
+/// reconstructed by the scan it stands in front of.
+#[derive(Debug, Clone, Copy)]
+struct PmpCache {
+    /// Indexed by [`Priv::bits`], which is 0, 1 or 3.
+    spans: [PmpSpan; 4],
+    /// The [`Csrs::pmp_gen`] these were computed under.
+    generation: u64,
+}
+
+impl PmpCache {
+    /// An empty cache, belonging to no configuration.
+    ///
+    /// The generation is zero and [`Csrs::new`] starts the counter at one, so
+    /// the first question always misses rather than reading a span nothing
+    /// computed.
+    const fn new() -> PmpCache {
+        PmpCache {
+            spans: [PmpSpan::EMPTY; 4],
+            generation: 0,
+        }
+    }
+}
+
 /// Entry `i`'s half-open physical range, or `None` when it matches nothing.
 ///
 /// `A = OFF` matches nothing, and so does a TOR entry whose top is not above
@@ -579,6 +723,15 @@ pub struct Tlb {
     slots: [[Entry; TLB_ENTRIES]; 3],
     hits: u64,
     misses: u64,
+    /// The last physical-memory-protection answer, per privilege mode.
+    ///
+    /// Here rather than beside [`pmp_allows`] because it is per hart and
+    /// mutable, and this is the hart's one piece of derived translation state
+    /// — so it is flushed, reset and left out of a snapshot by the code that
+    /// already does all three. PMP is not translation and does not live in the
+    /// entries above; it is checked on every access, hit or miss, because a
+    /// PMP region may be smaller than a page.
+    pmp: PmpCache,
     /// The host half of the same answers, for a code generator that inlines a
     /// load. See [`Tlb::attach_shadow`].
     #[cfg(feature = "jit")]
@@ -599,6 +752,7 @@ impl Tlb {
             slots: [[Entry::default(); TLB_ENTRIES]; 3],
             hits: 0,
             misses: 0,
+            pmp: PmpCache::new(),
             #[cfg(feature = "jit")]
             shadow: None,
         }
@@ -611,6 +765,12 @@ impl Tlb {
     /// for a snapshot restore.
     pub fn flush(&mut self) {
         self.slots = [[Entry::default(); TLB_ENTRIES]; 3];
+        // A snapshot restore replaces the whole `Csrs`, and its `pmp_gen`
+        // comes back at whatever `Csrs::new` starts it at rather than at the
+        // saved hart's — so a span left here could be tagged with a generation
+        // that now means a different configuration. It goes with everything
+        // else derived.
+        self.pmp = PmpCache::new();
         // The shadow is only ever as live as this table is, so it goes with
         // it. Losing it costs a refill; keeping it after a flush would let a
         // compiled load skip a walk this table would have charged for.
@@ -676,6 +836,57 @@ impl Tlb {
     #[must_use]
     pub fn stats(&self) -> (u64, u64) {
         (self.hits, self.misses)
+    }
+
+    /// [`pmp_allows`], remembering the span the answer holds over.
+    ///
+    /// Exactly [`pmp_allows`]'s answer for every input — the span is a memo of
+    /// that function and nothing else, and the private `PmpSpan` carries the
+    /// argument for why. Anything the memo cannot represent falls through to
+    /// the scan rather than being approximated: an access whose length wraps
+    /// the address space, and one that leaves the span the scan was valid
+    /// over.
+    ///
+    /// `#[inline]` is deliberate: a hit is a compare and a bit test, this is
+    /// asked once per guest access, and the whole point is that the caller
+    /// pays no call for it.
+    #[inline]
+    #[must_use]
+    pub fn pmp_allows(
+        &mut self,
+        csrs: &Csrs,
+        addr: u64,
+        len: u64,
+        kind: Access,
+        mode: Priv,
+    ) -> bool {
+        let last = addr.wrapping_add(len.saturating_sub(1));
+        if last < addr {
+            // The access wraps the top of the address space, which no span
+            // describes. `pmp_allows` has its own answer for it.
+            return pmp_allows(csrs, addr, len, kind, mode);
+        }
+        if self.pmp.generation != csrs.pmp_gen {
+            self.pmp = PmpCache::new();
+            self.pmp.generation = csrs.pmp_gen;
+        }
+        let slot = (mode.bits() & 3) as usize;
+        let bit = pmp_bit(kind);
+        let span = self.pmp.spans[slot];
+        if span.covers(addr, last) {
+            return span.perms & bit != 0;
+        }
+        let span = pmp_span(csrs, addr, mode);
+        self.pmp.spans[slot] = span;
+        if span.covers(addr, last) {
+            span.perms & bit != 0
+        } else {
+            // The access straddles the edge of the span — an entry starts or
+            // ends inside it. The span is still worth keeping for the next
+            // access, but this one is the scan's to answer, because straddling
+            // is precisely the case `pmp_allows` refuses rather than resolves.
+            pmp_allows(csrs, addr, len, kind, mode)
+        }
     }
 
     /// The tag for a page.
@@ -1349,5 +1560,170 @@ mod tests {
         let before = csrs.translation_gen;
         csrs.write(num::SATP, 8 << 60, 0).unwrap();
         assert_ne!(csrs.translation_gen, before);
+    }
+
+    // -----------------------------------------------------------------
+    // The PMP span memo
+    // -----------------------------------------------------------------
+
+    /// A deterministic 64-bit stream, so a failure is reproducible from the
+    /// seed printed with it. `xorshift64*`, which is enough randomness to hit
+    /// entry-boundary cases and needs no dependency.
+    fn stream(seed: u64) -> impl FnMut() -> u64 {
+        let mut s = seed | 1;
+        move || {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            s.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+    }
+
+    /// Every mode a span slot is indexed by.
+    const MODES: [Priv; 3] = [Priv::User, Priv::Supervisor, Priv::Machine];
+
+    #[test]
+    fn the_span_memo_answers_what_the_scan_answers() {
+        // The memo is a memo of `pmp_allows` and of nothing else, so the test
+        // is the equivalence itself over configurations shaped like the ones
+        // firmware produces: a few small NAPOT and TOR entries near each other,
+        // where the interesting cases — an access straddling an edge, an entry
+        // hidden behind an earlier one, a locked entry constraining M-mode —
+        // all live. A fixed seed, so a failure is one command to reproduce.
+        let mut next = stream(0x5eed_1234_9abc_def0);
+        let mut checked = 0u64;
+        for _ in 0..200 {
+            let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
+            for i in 0..PMP_ENTRIES {
+                // A = OFF | TOR | NA4 | NAPOT, uniformly, and random R/W/X and
+                // lock bits: the same distribution the scan itself is written
+                // against.
+                let cfg = (next() & 0x9f) as u8;
+                csrs.pmpcfg[i] = cfg;
+                // Addresses clustered in a 4 KiB window around 0x1000 so that
+                // entries actually overlap each other and the probes.
+                csrs.pmpaddr[i] = ((0x1000 + (next() & 0xfff)) >> 2) | (next() & 0x7);
+            }
+            let mut tlb = Tlb::new();
+            for _ in 0..64 {
+                let addr = 0x1000u64.wrapping_add(next() & 0x1fff);
+                let len = 1 << (next() & 3);
+                let kind = match next() % 3 {
+                    0 => Access::Fetch,
+                    1 => Access::Load,
+                    _ => Access::Store,
+                };
+                let mode = MODES[(next() % 3) as usize];
+                let want = pmp_allows(&csrs, addr, len, kind, mode);
+                let got = tlb.pmp_allows(&csrs, addr, len, kind, mode);
+                assert_eq!(
+                    got, want,
+                    "memo disagrees at {addr:#x} len {len} {kind:?} {mode:?}"
+                );
+                // Twice, because the second answer is the one that comes out of
+                // the span rather than out of the scan that built it.
+                assert_eq!(tlb.pmp_allows(&csrs, addr, len, kind, mode), want);
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 200 * 64);
+    }
+
+    #[test]
+    fn a_pmp_write_throws_the_memo_away() {
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
+        // Everything, readable and writable, for everyone.
+        csrs.pmpaddr[0] = u64::MAX >> 10;
+        csrs.pmpcfg[0] = 0b0001_1111;
+        csrs.bump_pmp();
+        let mut tlb = Tlb::new();
+        assert!(tlb.pmp_allows(&csrs, 0x8000_0000, 8, Access::Store, Priv::Supervisor));
+        // Take the write bit away. Without the generation the memo would keep
+        // answering yes, which is the whole hazard of caching a permission.
+        csrs.write(num::PMPCFG0, 0b0001_1001, 0).unwrap();
+        assert!(!tlb.pmp_allows(&csrs, 0x8000_0000, 8, Access::Store, Priv::Supervisor));
+        assert!(tlb.pmp_allows(&csrs, 0x8000_0000, 8, Access::Load, Priv::Supervisor));
+    }
+
+    #[test]
+    fn a_pmpaddr_write_throws_the_memo_away() {
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
+        // A 4 KiB NAPOT window at 0x1000, readable.
+        csrs.write(num::PMPADDR0, (0x1000 >> 2) | 0x1ff, 0).unwrap();
+        csrs.write(num::PMPCFG0, 0b0001_1001, 0).unwrap();
+        let mut tlb = Tlb::new();
+        assert!(tlb.pmp_allows(&csrs, 0x1000, 4, Access::Load, Priv::Supervisor));
+        // Slide the window off the address the memo remembers.
+        csrs.write(num::PMPADDR0, (0x8000 >> 2) | 0x1ff, 0).unwrap();
+        assert!(!tlb.pmp_allows(&csrs, 0x1000, 4, Access::Load, Priv::Supervisor));
+    }
+
+    #[test]
+    fn one_mode_does_not_answer_for_another() {
+        // A slot per mode exists because a trap into M-mode and the return are
+        // the one alternation that happens at any rate; a single slot would
+        // answer the wrong mode's question on every one of them.
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
+        csrs.pmpaddr[0] = u64::MAX >> 10;
+        // A = NAPOT, no permissions, unlocked: M-mode passes, S-mode does not.
+        csrs.pmpcfg[0] = 0b0001_1000;
+        csrs.bump_pmp();
+        let mut tlb = Tlb::new();
+        for _ in 0..4 {
+            assert!(tlb.pmp_allows(&csrs, 0x8000_0000, 8, Access::Load, Priv::Machine));
+            assert!(!tlb.pmp_allows(&csrs, 0x8000_0000, 8, Access::Load, Priv::Supervisor));
+        }
+    }
+
+    #[test]
+    fn an_access_that_straddles_the_span_is_answered_by_the_scan() {
+        // The span ends where the next entry begins, and an access across that
+        // edge is the case `pmp_allows` refuses outright. The memo must not
+        // widen its own span to cover it.
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
+        // 16 bytes at 0x1000, readable.
+        csrs.pmpaddr[0] = (0x1000 >> 2) | 1;
+        csrs.pmpcfg[0] = 0b0001_1001;
+        csrs.bump_pmp();
+        let mut tlb = Tlb::new();
+        assert!(tlb.pmp_allows(&csrs, 0x1008, 8, Access::Load, Priv::Supervisor));
+        assert!(!tlb.pmp_allows(&csrs, 0x100e, 4, Access::Load, Priv::Supervisor));
+        // And having asked the straddling question, the memo still answers the
+        // contained one.
+        assert!(tlb.pmp_allows(&csrs, 0x1008, 8, Access::Load, Priv::Supervisor));
+    }
+
+    #[test]
+    fn an_access_that_wraps_the_address_space_is_answered_by_the_scan() {
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
+        csrs.pmpaddr[0] = u64::MAX >> 10;
+        csrs.pmpcfg[0] = 0b0001_1111;
+        csrs.bump_pmp();
+        let mut tlb = Tlb::new();
+        let want = pmp_allows(&csrs, u64::MAX, 8, Access::Load, Priv::Supervisor);
+        assert_eq!(
+            tlb.pmp_allows(&csrs, u64::MAX, 8, Access::Load, Priv::Supervisor),
+            want
+        );
+    }
+
+    #[test]
+    fn a_flush_throws_the_memo_away_with_the_translations() {
+        // A snapshot restore replaces the whole `Csrs` and calls `flush`, and
+        // the restored generation is not the saved hart's, so a span kept
+        // across it would be tagged with a number that now means something
+        // else.
+        let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
+        csrs.pmpaddr[0] = u64::MAX >> 10;
+        csrs.pmpcfg[0] = 0b0001_1111;
+        csrs.bump_pmp();
+        let mut tlb = Tlb::new();
+        assert!(tlb.pmp_allows(&csrs, 0x8000_0000, 8, Access::Store, Priv::Supervisor));
+        tlb.flush();
+        // Same question, same answer — but through a rebuilt span, which is
+        // what a restore needs and what an assertion on the generation alone
+        // would not show.
+        csrs.pmpcfg[0] = 0b0001_1001;
+        assert!(!tlb.pmp_allows(&csrs, 0x8000_0000, 8, Access::Store, Priv::Supervisor));
     }
 }

@@ -497,8 +497,9 @@ impl<'a> Exec<'a> {
         };
         // PMP applies to physical addresses in every mode, and a region may be
         // smaller than a page, so it is checked per access rather than cached
-        // alongside the translation.
-        if !mmu::pmp_allows(&self.st.csrs, phys, len, kind, mode) {
+        // alongside the translation. The check goes through the TLB's span
+        // memo — same answer, without rescanning sixteen entries per access.
+        if !self.tlb.pmp_allows(&self.st.csrs, phys, len, kind, mode) {
             return Err(Trap {
                 cause: Self::fault_cause(kind, mmu::Fault::Access),
                 tval: vaddr,
