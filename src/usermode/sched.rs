@@ -43,6 +43,37 @@
 //! type's job; §4.7 already says parallel guest execution is not reproducible
 //! and that determinism is a property of the mode rather than of the thread
 //! count.
+//!
+//! # What a real threaded guest asked of this
+//!
+//! `src/usermode/proof.rs` now runs an ordinary `std` Rust program that spawns
+//! four threads, contends an atomic, joins them, and blocks three more on a
+//! condition variable — on RISC-V and on AArch64. Everything it needed was
+//! already here, and the shape of what it needed is worth recording because it
+//! is the argument for this type being as thin as it is:
+//!
+//! * `clone` is [`insert`](ThreadSet::insert) with a core the consumer built
+//!   by copying its parent's registers. rsemu is not told that a thread was
+//!   *cloned*, only that there is one more.
+//! * `futex` is [`block`](ThreadSet::block) with no deadline plus
+//!   [`wake`](ThreadSet::wake). Which word, how many waiters and in what order
+//!   are the consumer's; this type never learns what a futex is.
+//! * A timed wait and `nanosleep` are `block` *with* a deadline, and virtual
+//!   time jumping to it is what makes a level-3 sleep free and reproducible.
+//! * `pthread_join` deadlocking because the exiting thread forgot to wake the
+//!   joiner shows up as [`run_next`](ThreadSet::run_next) returning `None`.
+//!   Reporting that rather than spinning is what turned a hang into a
+//!   diagnosis, which is the whole reason it is reported.
+//! * [`Stop::thread`] is load-bearing with more than one thread: the consumer
+//!   services the call *that thread* made, and there is no other way to know
+//!   whose it was.
+//!
+//! The one thing that did **not** hold is not this type's: the CPU cores keep
+//! their load-reserved reservation per core, so two guest threads sharing one
+//! [`UserMemory`](super::UserMemory) do not have a coherent `lr`/`sc` pair and
+//! a preemption between the two loses an update. `proof.rs` carries the
+//! ledgered reproducer and `docs/system/usermode-abi.md` argues where the fix
+//! belongs. Lengthening the quantum makes it rarer and never impossible.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;

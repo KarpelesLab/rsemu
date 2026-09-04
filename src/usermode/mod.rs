@@ -50,20 +50,35 @@
 //!
 //! # What that adds up to, measured
 //!
-//! The four pieces above are enough to run a **real statically linked Linux
-//! binary** — an ordinary `std` Rust `hello world` built for
-//! `riscv64gc-unknown-linux-musl`, which starts through `musl`'s
+//! The four pieces above are enough to run **real statically linked Linux
+//! binaries, on two architectures**.
+//!
+//! An ordinary `std` Rust `hello world` starts through `musl`'s
 //! `__libc_start_main`, finds its own program headers through the auxiliary
 //! vector, sets up thread-local storage, installs a stack-overflow handler,
-//! sizes a heap with `brk`, prints, and exits zero. Twenty-four syscalls, and
-//! the trace matches the same program's `strace` on the host one for one.
+//! sizes a heap with `brk`, prints, and exits zero — twenty-five syscalls,
+//! matching the same program's `strace` on the host one for one. An ordinary
+//! `std` Rust program that spawns four threads, contends an atomic, joins
+//! them, and then blocks three more on a condition variable does 166 calls
+//! against the host's 168, and every difference is a `futex` retry a genuinely
+//! parallel host made and this one did not.
+//!
+//! Both run identically on `riscv64gc-unknown-linux-musl` and
+//! `aarch64-unknown-linux-musl`, and the second architecture needed **no new
+//! syscall, no loader change and no policy change** — only five register
+//! numbers and the unprivileged state a kernel would have established. §2.1's
+//! claim that a syscall exit is *"a property of a core"* rather than a
+//! property of RISC-V is now measured.
 //!
 //! None of the code that does that is in this module, and that is the result.
-//! The ELF loader, the syscall table, the descriptors and the errno values
-//! live in `src/usermode/proof.rs`, which is `#[cfg(test)]` and is the
-//! *consumer's* half written out longhand — §2.1's line, held, with a working
-//! program on the far side of it. `docs/system/usermode-abi.md` has the ABI
-//! sources, the host-filesystem policy and the trace comparison.
+//! The ELF loader, the syscall table, the descriptors, the errno values and
+//! the process model live in `src/usermode/proof.rs`, which is `#[cfg(test)]`
+//! and is the *consumer's* half written out longhand — §2.1's line, held, with
+//! working programs on the far side of it. `docs/system/usermode-abi.md` has
+//! the ABI sources, the host-filesystem policy, the trace comparisons and the
+//! one thing this exercise found that is **not** on the consumer's side: the
+//! exclusive monitor is per core, so two guest threads' `lr`/`sc` pairs are
+//! not coherent with each other.
 //!
 //! # Driving it
 //!
@@ -104,7 +119,7 @@ pub mod sched;
 /// against a real binary. `#[cfg(test)]` and staying that way: §2.1 puts a
 /// syscall table, an ELF loader and a process model in the *consumer*, and
 /// this module exists to demonstrate that line is holdable, not to cross it.
-#[cfg(all(test, feature = "cpu-riscv"))]
+#[cfg(all(test, any(feature = "cpu-riscv", feature = "cpu-arm-a64")))]
 mod proof;
 #[cfg(test)]
 mod tests;
