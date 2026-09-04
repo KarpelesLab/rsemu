@@ -788,12 +788,11 @@ machine-a64-mini = ["cpu-arm-a64"]
 # `unsafe`, no dependencies. Written from the GIC Architecture Specification
 # v2.0, the PL011 TRM, DEN 0022 (PSCI) and the Devicetree Specification.
 #
-# It does not pull `dev-riscv`, and that is deliberate: the DTB *format* writer
-# and the poweroff signal are duplicated here rather than shared, because the
-# shared copies live under `dev/riscv/` and an AArch64 board that had to link a
-# PLIC and a CLINT to describe itself would break the crate-shape rule. See
-# src/dev/arm/mod.rs, which says what the one-commit fix is.
-dev-arm = []
+# It does not pull `dev-riscv`. The DTB *format* writer is `dev-fdt` below and
+# both boards depend on that; the *generator* is per-architecture and stays in
+# each board's own directory. What is left under `dev-riscv` is a PLIC, a CLINT
+# and a RISC-V boot ROM, none of which an AArch64 board has any use for.
+dev-arm = ["dev-fdt"]
 
 # The AArch64 `virt` board as a machine (machines/arm64-virt.machine plus the
 # classes it names). The board a real arm64 kernel is pointed at:
@@ -848,7 +847,7 @@ dev-uart-ns16550 = []
 # transport and the two devices, and this feature only teaches them how a
 # RISC-V device tree names one. A board that wants a virtio disk asks for
 # `dev-virtio`; `machines/riscv-virt.machine` does.
-dev-riscv = ["dev-uart-ns16550"]
+dev-riscv = ["dev-fdt", "dev-uart-ns16550"]
 
 # virtio (src/dev/virtio): the transport-agnostic core -- split virtqueues,
 # feature negotiation, the status handshake -- the **MMIO transport** (§4.2,
@@ -870,6 +869,20 @@ dev-riscv = ["dev-uart-ns16550"]
 # so that `--drive disk=root.qcow2` backs it with a host file through `dev-blk`
 # exactly as it backs an ATA drive or an NVMe namespace (ROADMAP.md 7.1).
 dev-virtio = ["dev-medium"]
+
+# The flattened device tree *format* (src/dev/fdt.rs): the encoder of chapter 5
+# of the Devicetree Specification v0.4 -- the header, the memory reservation
+# block, the begin/property/end token stream and the interned strings block.
+# About four hundred lines, `no_std + alloc`, no `unsafe`, no dependencies.
+#
+# The *format* and the *generator* are different things and only the first is
+# shared. Chapter 5 describes a container that names no architecture, so one
+# encoder serves every board; deciding which nodes go in it is the board's
+# business, and `dev::riscv::dt` and `dev::arm::dt` are two different documents
+# -- one-cell interrupts out of a PLIC and a `/soc` wrapper against three-cell
+# interrupts out of a GIC and a `psci` node -- that happen to share a container.
+# Both `dev-riscv` and `dev-arm` depend on this; neither depends on the other.
+dev-fdt = []
 
 # Parallel NOR flash (src/dev/flash/cfi): the Common Flash Interface query
 # structure and the Intel/Sharp extended command set (CFI id 0x0001) -- status

@@ -22,7 +22,6 @@
 //! | [`clint`] | `mtime`, per-hart `mtimecmp`, software interrupts |
 //! | [`plic`] | the platform-level interrupt controller: priority, enable, claim |
 //! | [`syscon`] | the system controller a guest powers itself off through |
-//! | [`fdt`] | the flattened device tree *format* |
 //! | [`dt`] | the device tree *generator*, which walks the realized machine |
 //! | [`boot`] | the reset vector, and where the generated tree lands |
 //! | [`loader`] | putting a firmware or kernel image into guest memory |
@@ -96,7 +95,6 @@
 pub mod boot;
 pub mod clint;
 pub mod dt;
-pub mod fdt;
 pub mod loader;
 pub mod plic;
 pub mod syscon;

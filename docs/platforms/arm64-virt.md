@@ -394,28 +394,40 @@ privilege escalation. `Exec::unpriv` is that one bit, and
 `an_unprivileged_store_at_el1_is_checked_with_el0s_permissions` is the test that
 would fail if it were an ordinary store.
 
-## Two files here are copies, and both are marked
+## The format is shared; the generator is not
 
-[`src/dev/arm/fdt.rs`](../../src/dev/arm/fdt.rs) is
-[`src/dev/riscv/fdt.rs`](../../src/dev/riscv/fdt.rs), and `power.rs`'s `Signal`
-is `riscv/syscon.rs`'s. The DTB format and a poweroff request are neither of
-them architecture-specific and one copy of each would obviously be better.
+[`src/dev/fdt.rs`](../../src/dev/fdt.rs) is the DTB *encoder*, behind `dev-fdt`,
+and both boards depend on it. It used to be two files — `dev/arm/fdt.rs` was a
+copy of `dev/riscv/fdt.rs`, written as a strict subset so the move would be a
+deletion, which is exactly what it turned out to be. Chapter 5 of the
+Devicetree Specification describes a container: a header, a reservation block,
+a token stream, an interned strings block, every integer big-endian whatever
+the guest is. Not one byte of that knows what a hart or a GIC is.
 
-The existing copies live under `dev/riscv/` and are reachable only from a build
-with `dev-riscv` on. An AArch64 board that had to link a PLIC, a CLINT and a
-RISC-V boot ROM in order to describe itself would break the crate-shape rule
-(`CLAUDE.md`: a NES build links a 6502 and nothing else) far more loudly than
-four hundred lines of specification-derived encoder do — and the 16550 made
-exactly this journey already, out of `dev/riscv/` into `dev/uart/`, the day a
-second board wanted one. Two boards want a device tree now.
+The *generator* is not shared and should not be.
+[`dev/arm/dt.rs`](../../src/dev/arm/dt.rs) and
+[`dev/riscv/dt.rs`](../../src/dev/riscv/dt.rs) write two different documents
+through the one encoder:
 
-**The fix is `src/dev/fdt.rs` and `src/dev/power.rs` behind a shared feature.**
-It is one commit that touches two directories at once, which is why it is
-written down here rather than done in a change that owns only one of them. The
-ARM `fdt.rs` was written as a strict subset of the RISC-V one — same method
-names, same semantics — so that the move is a deletion.
+| | `riscv-virt` | `arm64-virt` |
+| --- | --- | --- |
+| peripherals | under a `/soc` node with `ranges` | at the root |
+| `#interrupt-cells` | 1 | 3, and the binding subtracts the base again |
+| the controller | a PLIC, with `riscv,ndev` | a GIC, two apertures in one node |
+| the processors | `riscv,isa`, `mmu-type` | `MPIDR_EL1` affinity, `enable-method` |
+| power | `syscon-poweroff` / `syscon-reboot` nodes | a `psci` node with a conduit |
 
-The `power` host-object kind is deliberately *not* called `signal`: a
+Merging those would produce a generator with an architecture switch in every
+branch, so what moved was the four hundred lines that had no architecture in
+them at all.
+
+`power.rs`'s `Signal` **is** still `riscv/syscon.rs`'s twin, and stayed. The two
+`Request` enumerations are not the same type: a syscon can report an exit code
+(`Fail(u16)`, which is how a headless RISC-V test says *why* it stopped) and
+PSCI has no way to express one, so unifying them means either giving every
+AArch64 board a variant its firmware interface cannot raise, or giving the
+RISC-V board's tests a narrower signal than the device can emit. The `power`
+host-object kind is deliberately *not* called `signal` for the same reason: a
 [`HostKind`](../../src/core/hosts.rs)'s identity is its name alone, so two
 modules sharing a name must agree about the type stored under it, and these two
 do not.

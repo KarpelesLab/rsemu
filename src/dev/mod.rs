@@ -18,6 +18,7 @@
 //! | [`medium`] | `dev-medium` | what a drive's platter *is*: the storage seam every block device stores its bytes behind |
 //! | [`apu`] | `dev-nes-apu` | the RP2A03 audio half: channels, frame counter, DMC |
 //! | [`cart`] | `dev-nes-cart` | cartridge images and the mappers that decode them |
+//! | [`fdt`] | `dev-fdt` | the flattened device tree *format*: the encoder every board's generator writes through |
 //! | [`flash`] | `dev-flash-cfi`, `dev-flash-spinor` | NOR flash: parallel (CFI) and serial (W25Q on SPI) |
 //! | [`nes`] | `dev-nes-io` | the console's own I/O: controller ports, OAM DMA |
 //! | [`net`] | `dev-net`, `dev-ne2000`, `net-pktkit` | the network seam, an NE2000 card, and the `pktkit` bridge |
@@ -67,6 +68,10 @@ pub mod ahci;
 #[cfg(feature = "dev-ata-disk")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-ata-disk")))]
 pub mod ata;
+
+#[cfg(feature = "dev-fdt")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-fdt")))]
+pub mod fdt;
 
 #[cfg(feature = "dev-medium")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-medium")))]

@@ -362,7 +362,7 @@ fn the_boot_rom_hands_over_a_device_tree_that_parses() {
     let dtb = b.device_tree();
     assert_eq!(
         u32::from_be_bytes([dtb[0], dtb[1], dtb[2], dtb[3]]),
-        super::fdt::FDT_MAGIC,
+        crate::dev::fdt::FDT_MAGIC,
         "the blob at the address a1 points at is not a device tree"
     );
     let tree = super::dt::describe(&dtb).expect("it parses");
