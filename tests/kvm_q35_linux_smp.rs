@@ -115,12 +115,16 @@ const DEFAULT_MS: u64 = 60_000;
 fn two_processor_q35() -> String {
     let mut text = String::from(rsemu::machine::catalog::Q35_LINUX.source);
 
+    // `engine` is a board parameter (`param engine = "interp"`), not a literal,
+    // so both processors follow whatever `-p engine=` selects. Matching the
+    // text means matching that reference — a literal `"interp"` here silently
+    // stopped matching the day the board grew the parameter.
     const CPU0: &str = "  object cpu0 \"cpu.x86\" {\n\
                         \x20   clock   = cpu\n\
                         \x20   space   = mem\n\
                         \x20   iospace = \"port\"\n\
                         \x20   variant = \"x86-64\"\n\
-                        \x20   engine  = \"interp\"\n\
+                        \x20   engine  = engine\n\
                         \x20 }\n";
     assert!(text.contains(CPU0), "the `cpu0` object moved");
     // Order matters: `accel::cpu` allocates one vCPU per `cpu.x86` in

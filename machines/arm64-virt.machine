@@ -127,6 +127,23 @@ machine "arm64-virt" {
   param cpu-hz = 1000000000
   param cntfrq = 62500000
 
+  # Which execution engine the processor runs on: `interp`, `jit`, or
+  # `jit-host`.
+  #
+  #   rsemu run arm64-virt -p engine=jit
+  #
+  # A parameter rather than a fixed property for the reason
+  # `machines/riscv-virt.machine` gives at length: the three are supposed to
+  # be *indistinguishable to the guest* — same registers, same memory, same
+  # cycle counts — and the only way to keep that claim honest is for one
+  # board to run all three and have the state hashes compared. `tests/a64_engines.rs`
+  # does that; `docs/platforms/arm64-virt.md` has what each one costs.
+  #
+  # `interp` is the default because it is the oracle. Both others need a
+  # build with `cpu-arm-a64-lift` and `jit`, and a build without them refuses
+  # the property with a message rather than quietly interpreting.
+  param engine = "interp"
+
   # -- the crystals ----------------------------------------------------------
   #
   # Two, because the board has two. Arm defines no instruction timing at all,
@@ -155,7 +172,7 @@ machine "arm64-virt" {
   object cpu "cpu.arm.a64" {
     clock  = sysclk
     space  = mem
-    engine = "interp"
+    engine = engine
     cpu    = part
     reset  = 0x00000000
     # "Processor 0 of cluster 0": bit 31 is RES1 and the low byte is Aff0, so

@@ -173,6 +173,23 @@ machine "q35-linux" {
   # (CLAUDE.md, determinism), so it is declared.
   param time = "2026-01-01T00:00:00"
 
+  # Which execution engine the processor runs on: `interp`, `jit`, or
+  # `jit-host`.
+  #
+  #   rsemu run q35-linux -p engine=jit
+  #
+  # A parameter rather than a fixed property for the reason
+  # `machines/riscv-virt.machine` gives at length: the three are supposed to
+  # be *indistinguishable to the guest* — same registers, same memory, same
+  # cycle counts — and the only way to keep that claim honest is for one
+  # board to run all three and have the state hashes compared. `tests/x86_engines.rs`
+  # does that; `docs/platforms/q35-linux.md` has what each one costs.
+  #
+  # `interp` is the default because it is the oracle. Both others need a
+  # build with `cpu-x86-lift` and `jit`, and a build without them refuses
+  # the property with a message rather than quietly interpreting.
+  param engine = "interp"
+
   # -- crystals ---------------------------------------------------------------
   #
   # `q35`'s, less the two that only a video adapter and an 8042 counted.
@@ -214,7 +231,7 @@ machine "q35-linux" {
     space   = mem
     iospace = "port"
     variant = "x86-64"
-    engine  = "interp"
+    engine  = engine
   }
 
   # -- memory -----------------------------------------------------------------
