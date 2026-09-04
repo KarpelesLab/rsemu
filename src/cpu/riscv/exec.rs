@@ -508,12 +508,20 @@ impl<'a> Exec<'a> {
         Ok(phys)
     }
 
-    /// Write the shadow's slot for this page, so a compiled load may serve it.
+    /// Write the shadow's slot for this page, so a compiled access may serve
+    /// it.
     ///
-    /// Loads only — the backend inlines nothing else (`jit::x86::compile`,
-    /// `Compiler::inlinable`) — and always a *write*, never a skip, on the
-    /// paged path, because the caller has just evicted the matching slot of
-    /// the hart's own TLB.
+    /// Loads and stores — the backend inlines nothing else
+    /// (`jit::x86::compile`, `Compiler::inlinable`) — and always a *write*,
+    /// never a skip, on the paged path, because the caller has just evicted the
+    /// matching slot of the hart's own TLB.
+    ///
+    /// The two sets are filled by the same code and are not interchangeable.
+    /// A store entry exists only because a walk **for a store** succeeded,
+    /// which is what makes three things true that a compiled store then does
+    /// not repeat: the PTE's `W` bit was checked, its dirty bit was set by that
+    /// walk (`mmu::translate`), and PMP was asked about stores rather than
+    /// loads. Filling the store set from a load's walk would lose all three.
     ///
     /// Three things decide what is written, and each is a case where an
     /// inlined load would otherwise answer differently from
@@ -540,9 +548,13 @@ impl<'a> Exec<'a> {
         translating: bool,
     ) {
         use crate::ir::AccessKind;
-        if kind != Access::Load {
-            return;
-        }
+        let set = match kind {
+            Access::Load => AccessKind::Load,
+            Access::Store => AccessKind::Store,
+            // A fetch is never inlined, so a fetch entry would be a fill
+            // nothing reads.
+            Access::Fetch => return,
+        };
         let Exec { st, tlb, .. } = self;
         let Some(shadow) = tlb.shadow_mut() else {
             return;
@@ -559,25 +571,35 @@ impl<'a> Exec<'a> {
         // Bare mode reaches this on every access rather than on a miss, so the
         // flat-view probe a fill costs is asked for only when there is nothing
         // here yet. A page already remembered as uncacheable counts as here.
-        if !translating && shadow.caches(AccessKind::Load, vaddr, ctx) {
+        if !translating && shadow.caches(set, vaddr, ctx) {
             return;
         }
-        if mmu::pmp_page_uniform(&st.csrs, phys & !PAGE_MASK, Access::Load, mode) {
-            shadow.fill(AccessKind::Load, vaddr, phys, ctx);
+        if mmu::pmp_page_uniform(&st.csrs, phys & !PAGE_MASK, kind, mode) {
+            shadow.fill(set, vaddr, phys, ctx);
         } else {
-            shadow.refuse(AccessKind::Load, vaddr, ctx);
+            shadow.refuse(set, vaddr, ctx);
         }
     }
 
-    /// The world this hart's loads happen in, as the shadow tags them.
+    /// The world this hart's accesses happen in, as the shadow tags them.
     ///
-    /// Read at a block boundary by `engine::Host::load_plan`, which is also
-    /// where the shadow is resynchronised — so the tag a block compares
-    /// against is the one the table is currently filling with.
+    /// Read at a block boundary by `engine::Host::load_plan` and
+    /// `store_plan`, which is also where the shadow is resynchronised — so the
+    /// tag a block compares against is the one the table is currently filling
+    /// with.
+    ///
+    /// `kind` selects the set; the context is the same for both, because
+    /// `effective_priv` distinguishes a fetch from everything else and nothing
+    /// finer.
     #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
-    pub(super) fn load_plan(&mut self) -> Option<crate::jit::LoadPlan> {
+    pub(super) fn mem_plan(&mut self, kind: Access) -> Option<crate::jit::MemPlan> {
         use crate::ir::AccessKind;
-        let mode = self.effective_priv(Access::Load);
+        let set = match kind {
+            Access::Load => AccessKind::Load,
+            Access::Store => AccessKind::Store,
+            Access::Fetch => AccessKind::Fetch,
+        };
+        let mode = self.effective_priv(kind);
         let translating = mmu::translation_active(&self.st.csrs, mode);
         let ctx = crate::jit::Context {
             level: mode.bits() as u8,
@@ -590,7 +612,50 @@ impl<'a> Exec<'a> {
             translation: st.csrs.translation_gen,
         };
         shadow.sync(epoch);
-        Some(shadow.plan(AccessKind::Load, ctx))
+        Some(shadow.plan(set, ctx))
+    }
+
+    /// Pay what a store the backend served itself still owes.
+    ///
+    /// `jit::x86` moved `bytes` bytes into guest RAM through the host address
+    /// the shadow's store entry carries, and did nothing else. This is
+    /// everything `Exec::write_once` does apart from moving them, in the same
+    /// order the guest could observe it in:
+    ///
+    /// * **the reservation**, broken by a store into it — the rule
+    ///   [`Exec::store`] applies before the write, applied after it here, which
+    ///   is unobservable because nothing runs in between and a `sc` is a
+    ///   separate guest instruction;
+    /// * **one tick**, because one bus access is one cycle and the walk was
+    ///   charged when the entry was filled;
+    /// * **the `RamStore`'s dirty bitmap and the guest-physical dirty log**,
+    ///   which `jit::Tlb::note_fast_store` marks and reports — the first is the
+    ///   only record a framebuffer refresh or a snapshot has, and the second is
+    ///   what invalidates a translation of a page the guest just rewrote.
+    ///
+    /// # Panics
+    ///
+    /// Never on a guest condition. A shadow entry that does not resolve to RAM
+    /// cannot have been used by generated code, which found a host address in
+    /// it one instruction earlier; reaching that arm is a code-generation bug
+    /// and losing the dirty page silently would hide it.
+    #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
+    pub(super) fn note_fast_store(&mut self, vaddr: u64, bytes: u64) {
+        if let Some(reserved) = self.st.reservation
+            && reserved >> 3 == vaddr >> 3
+        {
+            self.st.reservation = None;
+        }
+        self.charge();
+        let phys = self
+            .tlb
+            .shadow_mut()
+            .and_then(|shadow| shadow.note_fast_store(vaddr, bytes));
+        let Some(phys) = phys else {
+            debug_assert!(false, "an inlined store used an entry that holds no RAM");
+            return;
+        };
+        self.note_write(phys);
     }
 
     /// One read that does not cross a page boundary.

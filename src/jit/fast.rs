@@ -1,4 +1,5 @@
-//! The seam a host offers a code generator, so its loads need no call.
+//! The seam a host offers a code generator, so its loads and stores need no
+//! call into it.
 //!
 //! `ROADMAP.md` §9.1's first mechanism is the software TLB, and the sentence
 //! that matters is *"the fast path is inlined into generated code: mask,
@@ -52,19 +53,27 @@
 //!
 //! # Not implementing this is the default
 //!
-//! Both methods are defaulted, so a host that has no TLB — a `no_std` board, a
+//! Every method is defaulted, so a host that has no TLB — a `no_std` board, a
 //! differential harness with a raw address space, a device test — writes
-//! `impl FastMem for MyHost {}` and every load takes the call. That is the
+//! `impl FastMem for MyHost {}` and every access takes the call. That is the
 //! honest default: a host that published a table it did not actually use for
 //! its own loads would make compiled and interpreted execution disagree, which
 //! is the one thing this crate does not tolerate.
 
 use crate::jit::tlb::FastSet;
 
-/// The parts of a host's memory path a backend may inline.
+/// The parts of a host's memory path a backend may inline, for one access
+/// type.
+///
+/// One type for loads and for stores because it is one *encoding* — a set and
+/// the tag bits a hit compares against — and two copies of an encoding are two
+/// chances for them to disagree. What differs between the two is the promise
+/// the host makes by publishing it, and that is written on
+/// [`FastMem::load_plan`] and [`FastMem::store_plan`] rather than in the type.
 #[derive(Debug, Clone, Copy)]
-pub struct LoadPlan {
-    /// The load set of the software TLB this host's loads resolve through.
+pub struct MemPlan {
+    /// The set of the software TLB the accesses this plan covers resolve
+    /// through.
     ///
     /// Valid for as long as the borrow it came from, and until the TLB is
     /// flushed. A flush comes from [`Tlb::sync`](crate::jit::Tlb::sync), which
@@ -72,7 +81,7 @@ pub struct LoadPlan {
     /// at the top of a block stays good for that block.
     pub set: FastSet,
     /// Everything a hit's tag carries besides the page number: the world those
-    /// loads happen in, and the stamp of the guest MMU's generation.
+    /// accesses happen in, and the stamp of the guest MMU's generation.
     ///
     /// [`Tlb::tag_bits`](crate::jit::Tlb::tag_bits) is what produces it, and a
     /// backend must load it per block rather than bake it in: the stamp moves
@@ -80,9 +89,15 @@ pub struct LoadPlan {
     pub tag: u64,
 }
 
-/// A host whose loads a backend may serve without calling it.
+/// A host whose accesses a backend may serve without calling it.
 ///
-/// Every method is defaulted to *no*, which is always correct.
+/// Every method is defaulted to *no*, which is always correct — and the
+/// defaults are how the one dangerous combination arises, so it is named here
+/// rather than left to be discovered: a host that returns `Some` from
+/// [`FastMem::store_plan`] and does **not** override
+/// [`FastMem::note_fast_store`] gets a no-op, and loses the tick, the store's
+/// dirty bitmap and the self-modifying-code check on every inlined store. The
+/// two are one decision. A host implements both or neither.
 pub trait FastMem {
     /// The table this host's loads resolve through, if a backend may use it.
     ///
@@ -92,8 +107,64 @@ pub trait FastMem {
     /// an entry carrying a host address produces the bytes at that address.
     /// Breaking it makes compiled and interpreted execution disagree about
     /// guest memory, which no test in this crate will forgive.
-    fn load_plan(&mut self) -> Option<LoadPlan> {
+    fn load_plan(&mut self) -> Option<MemPlan> {
         None
+    }
+
+    /// The table this host's **stores** resolve through, if a backend may
+    /// write guest memory through it.
+    ///
+    /// A far stronger promise than [`FastMem::load_plan`], and every clause is
+    /// something an inlined store would otherwise skip in silence:
+    ///
+    /// * the entry was admitted on
+    ///   [`Perms::WRITE`](crate::core::space::Perms::WRITE), and on the guest
+    ///   MMU's own **write** permission — a different bit from the read one, in
+    ///   a different set;
+    /// * whatever the architecture owes a *first* write to a page has already
+    ///   been paid. On RISC-V that is the PTE's dirty bit, and the reason a
+    ///   store plan can promise it is that a store entry only exists because a
+    ///   walk **for a store** filled it, and that walk set `D`;
+    /// * writing through the entry's host address is allowed *provided* the
+    ///   caller then reports the write, so publishing this obliges a host to
+    ///   implement [`FastMem::note_fast_store`] as well.
+    ///   `RamStore::host_ptr` is documented read-only precisely because a
+    ///   write through it skips the store's own dirty bitmap and the block
+    ///   cache's self-modifying-code check, and `note_fast_store` is where a
+    ///   host pays both.
+    ///
+    /// Returning `None` — the default — means every store takes the call.
+    fn store_plan(&mut self) -> Option<MemPlan> {
+        None
+    }
+
+    /// One aligned store was served inline at guest address `addr`, `bytes`
+    /// wide; do everything the host's own store path does apart from moving
+    /// the bytes.
+    ///
+    /// Three obligations, and a host that skips any of them is broken in a way
+    /// no unit test finds:
+    ///
+    /// * **the tick**, exactly as [`FastMem::note_fast_load`] charges one;
+    /// * **the store's dirty bitmap**, which
+    ///   [`RamStore::write_at`](crate::core::space::RamStore::write_at) would
+    ///   have marked and a host pointer does not — the only record a
+    ///   framebuffer refresh or a live snapshot has (`ROADMAP.md` §4.1);
+    /// * **the guest-physical dirty log**
+    ///   ([`StoreLog`](crate::jit::StoreLog)), which the dispatcher drains at
+    ///   the next block boundary to invalidate translations of the page just
+    ///   written. A guest that writes its own code — Linux does, in module
+    ///   loading and in alternatives patching — depends on it.
+    ///
+    /// Anything else the host's store path does that the guest can observe
+    /// belongs here too. On RISC-V that is the reservation: a store into the
+    /// reserved range breaks it, and an `sc` that succeeded because an inlined
+    /// store forgot to would be a lost update in guest software.
+    ///
+    /// Called *after* the bytes have landed, which is unobservable: nothing
+    /// runs in between, and the fast path cannot fault.
+    fn note_fast_store(&mut self, addr: u64, bytes: u64) {
+        let _ = (addr, bytes);
     }
 
     /// One aligned load was served inline; charge for it.

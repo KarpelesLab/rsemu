@@ -112,7 +112,7 @@ use rsemu::cpu::riscv::lift::{self, Origin, PC, SLOT_COUNT, Shape, x_slot};
 use rsemu::cpu::riscv::{Config, Hart};
 use rsemu::ir::{AccessKind, Align, InsnStart, IrHost, MemOp, RegSlot};
 use rsemu::jit::{
-    BlockCache, Context, DirtyPages, Dispatcher, Epoch, FastMem, Frontend, LoadPlan, StoreLog, Tlb,
+    BlockCache, Context, DirtyPages, Dispatcher, Epoch, FastMem, Frontend, MemPlan, StoreLog, Tlb,
     Translation,
 };
 
@@ -689,18 +689,37 @@ impl StoreLog for BenchHost {
     }
 }
 
-/// The seam the compiled column measures: the backend inlines an aligned load
+/// The seam the compiled column measures: the backend inlines an aligned access
 /// into a mask, a compare, an add and a `mov`, out of *this* host's own TLB.
 ///
 /// `note_fast_load` charges nothing because `BenchHost::once` charges nothing —
 /// this file measures wall time, and `charge` is a no-op throughout. The
 /// correctness of the tick accounting is `cpu::riscv::differential`'s job and
 /// is checked there, on the same code path.
+///
+/// `note_fast_store` is not free in the same way: the dirty log is what the
+/// dispatcher drains to invalidate a rewritten page, so a benchmark that
+/// skipped it would be measuring a machine that cannot run self-modifying
+/// code. It does exactly what `BenchHost::once`'s store arm does apart from
+/// moving the bytes.
 impl FastMem for BenchHost {
-    fn load_plan(&mut self) -> Option<LoadPlan> {
+    fn load_plan(&mut self) -> Option<MemPlan> {
         self.tlb
             .as_ref()
             .map(|tlb| tlb.plan(AccessKind::Load, MACHINE))
+    }
+
+    fn store_plan(&mut self) -> Option<MemPlan> {
+        self.tlb
+            .as_ref()
+            .map(|tlb| tlb.plan(AccessKind::Store, MACHINE))
+    }
+
+    fn note_fast_store(&mut self, addr: u64, bytes: u64) {
+        if let Some(tlb) = self.tlb.as_mut() {
+            tlb.note_fast_store(addr, bytes);
+        }
+        self.dirty.note(addr, bytes);
     }
 }
 

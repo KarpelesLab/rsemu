@@ -21,7 +21,7 @@
 //! the oracle either way.
 //!
 //! The first mechanism's *"inlined into generated code"* clause is
-//! [`LoadPlan`]'s job — what a host offers and what [`x86`] reads — and it is
+//! [`MemPlan`]'s job — what a host offers and what [`x86`] reads — and it is
 //! reached from a real guest: `cpu::riscv::mmu`'s `Tlb::attach_shadow` puts one
 //! of these tables inside the hart's own translation cache, so the two evict
 //! together and an inlined load is a load whose walk has already been charged
@@ -59,9 +59,13 @@
 //! [`RamStore`](crate::core::space::RamStore) — never as a `&mut [u8]` — so
 //! the TLB's "host addend" is an addend into a store, which is what keeps it
 //! working when guest RAM is a `SharedArrayBuffer` (`ROADMAP.md` §11.2). The
-//! *host address* an entry also carries is for generated code alone: read-only,
-//! computed from [`RamStore::host_ptr`](crate::core::space::RamStore::host_ptr),
-//! and zero on every page a backend may not touch that way.
+//! *host address* an entry also carries is for generated code alone: computed
+//! from [`RamStore::host_ptr`](crate::core::space::RamStore::host_ptr), and
+//! zero on every page a backend may not touch that way. Generated code reads
+//! through it, and — from the **store** set only — writes through it, which
+//! that method's documentation permits to no one who does not then call
+//! [`Tlb::note_fast_store`]: it marks the store's own dirty bitmap and names
+//! the guest-physical page, the two things a bare `mov` skips.
 //!
 //! # One answer to "stale", shared by both caches
 //!
@@ -132,7 +136,7 @@ pub use cache::{BlockCache, BlockId, CacheStats, CodeRef, DEFAULT_CAPACITY, EXIT
 pub use dispatch::{
     DirtyPages, DispatchStats, Dispatcher, Entry, Frontend, Run, Stop, StoreLog, Translation,
 };
-pub use fast::{FastMem, LoadPlan};
+pub use fast::{FastMem, MemPlan};
 pub use tlb::{
     Context, DEFAULT_ENTRIES, Epoch, FastSet, PAGE_MASK, PAGE_SIZE, STAMP_BITS, Tlb, TlbStats,
 };

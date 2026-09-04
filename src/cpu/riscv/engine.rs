@@ -103,7 +103,7 @@
 //!
 //! **And a guest load stopped costing a call.** The last of `ROADMAP.md` §9's
 //! four mechanisms — the software TLB, *inlined* — is reached from a hart now
-//! that this one publishes a [`LoadPlan`](crate::jit::LoadPlan); [`FastMem`]
+//! that this one publishes a [`MemPlan`](crate::jit::MemPlan); [`FastMem`]
 //! below is what it may cover and why. Over three seconds of this guest's boot
 //! the backend serves **3 250 549 of 3 340 050 compiled loads inline, 97.3%**,
 //! and the host instructions the whole run executes fall from 18.17 billion to
@@ -121,12 +121,48 @@
 //! block against the IR interpreter's 896, so it was ahead before compilation
 //! was counted. A block here lifts to about forty-seven IR instructions and
 //! compiles to 949 bytes of host code; 59 269 of them are compiled in sixty
-//! seconds and none is refused. And what the profile now says costs most, over
-//! that same three seconds, is not the load path at all: 13.3 million calls
-//! into `jit::x86::rt`'s flush thunk (1.16 billion instructions), the stores
-//! this backend deliberately does not inline (1.6 billion across the write
-//! path), and the PMP check the *fetch* and *store* translations still make
-//! (1.46 billion).
+//! seconds and none is refused. And what that profile said costs most was not
+//! the load path at all: the PMP check every translation still made, and the
+//! stores the backend deliberately did not inline.
+//!
+//! **Both are done now.** Measured the same way — `Hart::advance` taken
+//! *inclusively* under callgrind, which is emulation and nothing else: no
+//! machine build, no loaders, and not the 512 MiB state hash the CLI takes
+//! when a run ends — over the same three seconds of the same guest:
+//!
+//! | | host instructions in `Hart::advance` |
+//! | --- | --- |
+//! | as the inlined load left it | 7.37 G |
+//! | with the PMP scan memoized | 5.99 G (−18.8%) |
+//! | with stores inlined as well | **5.25 G (−28.7%)** |
+//!
+//! **`pmp_allows` was a fifth of it**, and that was a surprise rather than a
+//! plan: a linear scan of sixteen entries, each decoding an address register,
+//! **265 host instructions a call over 5 515 181 calls** — one per guest
+//! access *and* one per block `admit` lets through. `mmu`'s `PmpSpan`
+//! memoizes that scan over the largest interval its answer is provably
+//! constant on, one slot per privilege mode, thrown away when
+//! `Csrs::pmp_gen` moves. The interpreter gains as much as the JIT does,
+//! because the scan was on the path both take.
+//!
+//! **And a guest store stopped costing a call too.** **1 749 886 of 1 753 140
+//! compiled stores — 99.8%** — are now the same inlined probe a load makes
+//! plus one thunk that pays what moving the bytes did not: the tick, the
+//! `RamStore`'s own dirty bitmap, a broken reservation, and the
+//! guest-physical page the block cache invalidates translations on.
+//! `jit::fast`'s `FastMem::store_plan` states what a store plan promises and
+//! why it is a stronger promise than a load's; `Exec::refresh_shadow` is
+//! where the store set is filled, and the PTE dirty bit an inlined store never
+//! sets was set by the walk that filled it.
+//!
+//! What the profile says now, over that same three seconds: `jit::x86::rt`'s
+//! flush thunk (13.3 M calls, 1.16 G — but most of that is the charges and
+//! the boundaries it *replays*, which is work the interpreter does too, so the
+//! call overhead in it is nearer 0.13 G), `admit`'s per-block entry
+//! translation (0.68 G), the dispatcher itself (0.47 G), and the guest-slot
+//! reads a lifted block still makes (8.4 M calls, 0.26 G). The largest call
+//! *count* is now `get_slot`, and the flush emitted ahead of each one is the
+//! other half of it.
 //!
 //! # What is checked at a block boundary rather than at an instruction
 //!
@@ -187,7 +223,7 @@ use crate::core::space::{AddressSpace, MemAttrs, MemResult};
 use crate::core::value::Width;
 use crate::ir::{Block, InsnStart, IrHost, MemOp, Opcode, RegSlot, verify};
 use crate::jit::{
-    BlockCache, DirtyPages, Dispatcher, Entry, Epoch, FastMem, Frontend, LoadPlan, PAGE_MASK, Stop,
+    BlockCache, DirtyPages, Dispatcher, Entry, Epoch, FastMem, Frontend, MemPlan, PAGE_MASK, Stop,
     StoreLog, Translation,
 };
 
@@ -1077,8 +1113,8 @@ impl StoreLog for Host<'_, '_> {
 /// device, a page whose translation has been evicted, and every access at all
 /// on a build without a shadow.
 impl FastMem for Host<'_, '_> {
-    fn load_plan(&mut self) -> Option<LoadPlan> {
-        self.exec.load_plan()
+    fn load_plan(&mut self) -> Option<MemPlan> {
+        self.exec.mem_plan(Access::Load)
     }
 
     fn note_fast_load(&mut self) {
@@ -1086,6 +1122,19 @@ impl FastMem for Host<'_, '_> {
         // itself already done: one bus access is one cycle, and the walk was
         // charged when the entry was filled.
         self.exec.charge();
+    }
+
+    fn store_plan(&mut self) -> Option<MemPlan> {
+        self.exec.mem_plan(Access::Store)
+    }
+
+    fn note_fast_store(&mut self, addr: u64, bytes: u64) {
+        // `Exec::write_once` minus the bytes, and then the same move of
+        // `Exec::wrote` into this host's dirty log that `IrHost::store` makes
+        // — so a page written by a compiled store and one written by an
+        // interpreted store reach `StoreLog` by the same route.
+        self.exec.note_fast_store(addr, bytes);
+        self.note_writes();
     }
 }
 
@@ -1455,6 +1504,25 @@ mod tests {
                     .disp
                     .backend()
                     .map_or(0, |engine| engine.stats().fast_loads)
+            }
+            #[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
+            {
+                0
+            }
+        }
+
+        /// How many guest stores the compiled path served without the host's
+        /// own store path.
+        ///
+        /// Zero on a host with no code generator, exactly as
+        /// [`Bench::fast_loads`] is, and for the same reason.
+        fn fast_stores(&self) -> u64 {
+            #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+            {
+                self.jit
+                    .disp
+                    .backend()
+                    .map_or(0, |engine| engine.stats().fast_stores)
             }
             #[cfg(not(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64")))]
             {
@@ -2250,6 +2318,334 @@ mod tests {
         );
     }
 
+    /// `x7 = 0x800`, then a store and a reload in a tight loop, in **bare
+    /// mode**.
+    ///
+    /// The store target is clear of the code, so the write never lands on the
+    /// instructions and the block cache is not invalidated every pass — which
+    /// is what lets the loop reach the compiled path more than once.
+    const BARE_STORE: [u32; 5] = [
+        0x0000_0013, // nop                ; x7 is seeded, so this is filler
+        0x0000_0293, // addi x5, x0, 0
+        0x0052_8293, // addi x5, x5, 5     ; the loop starts here
+        0x0053_b023, // sd   x5, 0(x7)
+        0xff9f_f06f, // jal  x0, -8
+    ];
+
+    /// [`BARE_STORE`] with `x7` seeded, because `addi` cannot express a
+    /// positive 0x800 in one instruction and a second one would add a block
+    /// boundary the fixture is not about.
+    fn bare_store() -> Bench {
+        let mut b = Bench::new(&BARE_STORE);
+        b.state.x[7] = 0x800;
+        b.state.pc = 4;
+        b
+    }
+
+    #[test]
+    fn a_bare_store_is_served_inline_too() {
+        let mut jit = bare_store().with_host_code();
+        for _ in 0..8 {
+            jit.advance(10_000);
+        }
+        assert!(jit.state.csrs.minstret > 0, "the compiled hart ran nothing");
+        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        assert!(
+            jit.fast_stores() > 0,
+            "a bare hart never served a store inline"
+        );
+        let mut interp = bare_store();
+        while interp.state.csrs.minstret < jit.state.csrs.minstret {
+            interp.step();
+        }
+        assert_eq!(interp.state.csrs.minstret, jit.state.csrs.minstret);
+        assert_eq!(
+            interp.state.cycles, jit.state.cycles,
+            "the compiled hart charged a different number of bus cycles for a store"
+        );
+        assert_eq!(interp.state.x, jit.state.x, "registers");
+        // And the bytes really landed: the two harts wrote the same word, and
+        // it is the word the register file says they wrote. A fast path that
+        // wrote nowhere would pass every column above.
+        let read = |b: &Bench| {
+            b.space
+                .read(0x800, Width::U64, MemAttrs::DEFAULT)
+                .expect("in RAM")
+        };
+        assert_eq!(read(&jit), read(&interp), "guest memory");
+        assert_eq!(read(&jit), jit.state.x[5], "the store wrote the wrong word");
+    }
+
+    /// A loop that rewrites an instruction it is about to execute.
+    ///
+    /// `sb x5, 0x43(x0)` writes the **top byte** of the word at 0x40, which is
+    /// `imm[11:4]` of an `addi` — so the opcode stays valid and the increment
+    /// changes on every pass. `x28` therefore accumulates a different number
+    /// each time round, and only a hart that re-lifted the page after the
+    /// write gets the same total as the interpreter.
+    ///
+    /// The store is inlined from the second pass onward: the block cache is
+    /// invalidated by the write, but the shadow's store entry is not. That is
+    /// the arm where nothing except `note_fast_store` pays the guest-physical
+    /// dirty log, and a compiled hart that skipped it runs the *previous*
+    /// pass's instruction — which is exactly the bug Linux hits in module
+    /// loading and in alternatives patching.
+    const SELF_MODIFY: [u32; 18] = [
+        0x0012_8293, // 0x00: addi x5, x5, 1
+        0x0450_01a3, // 0x04: sb   x5, 0x43(x0)   ; imm[11:4] of the word at 0x40
+        0x0380_006f, // 0x08: jal  x0, +0x38      ; -> 0x40
+        0x0000_0013, // 0x0c: nop
+        0x0000_0013, // 0x10
+        0x0000_0013, // 0x14
+        0x0000_0013, // 0x18
+        0x0000_0013, // 0x1c
+        0x0000_0013, // 0x20
+        0x0000_0013, // 0x24
+        0x0000_0013, // 0x28
+        0x0000_0013, // 0x2c
+        0x0000_0013, // 0x30
+        0x0000_0013, // 0x34
+        0x0000_0013, // 0x38
+        0x0000_0013, // 0x3c
+        0x000e_0e13, // 0x40: addi x28, x28, 0    ; the immediate is rewritten
+        0xfbdf_f06f, // 0x44: jal  x0, -0x44      ; -> 0x00
+    ];
+
+    #[test]
+    fn a_store_the_backend_inlined_still_invalidates_the_block_it_landed_on() {
+        let mut jit = Bench::new(&SELF_MODIFY).with_host_code();
+        for _ in 0..16 {
+            jit.advance(10_000);
+        }
+        assert!(jit.state.csrs.minstret > 0, "the compiled hart ran nothing");
+        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        assert!(
+            jit.fast_stores() > 0,
+            "the self-modifying store was never inlined, so this tests nothing"
+        );
+        let mut interp = Bench::new(&SELF_MODIFY);
+        while interp.state.csrs.minstret < jit.state.csrs.minstret {
+            interp.step();
+        }
+        assert_eq!(interp.state.csrs.minstret, jit.state.csrs.minstret);
+        assert!(
+            jit.state.x[5] > 2,
+            "the fixture never got past its second pass"
+        );
+        assert_eq!(
+            interp.state.x, jit.state.x,
+            "the compiled hart executed different bytes after rewriting them"
+        );
+        assert_eq!(interp.state.pc, jit.state.pc, "pc");
+        assert_eq!(interp.state.cycles, jit.state.cycles, "the cycle counter");
+    }
+
+    /// `lr.d`, an ordinary store into the reservation, then `sc.d`.
+    ///
+    /// The reservation is the one piece of guest-visible state a store touches
+    /// that has nothing to do with memory, and an inlined store never reaches
+    /// `Exec::store` where the rule lives. An `sc` that succeeded because the
+    /// compiled path forgot to break the reservation is a lost update in guest
+    /// software and shows up nowhere else.
+    ///
+    /// `lr.d` and `sc.d` are outside the lifted subset, so they are
+    /// interpreted and the `sd` between them sits in a compiled block of its
+    /// own. `x11` accumulates `sc.d`'s result: 1 on every pass if the
+    /// reservation was broken, 0 if it was not.
+    const RESERVED_STORE: [u32; 9] = [
+        0x0000_0013, // 0x00: nop                 ; x7 is seeded
+        0x0013_0313, // 0x04: addi x6, x6, 1      ; the loop starts here
+        0x1003_b2af, // 0x08: lr.d  x5, (x7)
+        0x0014_8493, // 0x0c: addi x9, x9, 1
+        0x0063_b023, // 0x10: sd    x6, 0(x7)     ; breaks the reservation
+        0x0015_0513, // 0x14: addi x10, x10, 1
+        0x1863_b42f, // 0x18: sc.d  x8, x6, (x7)  ; must fail
+        0x0085_85b3, // 0x1c: add   x11, x11, x8
+        0xfe5f_f06f, // 0x20: jal   x0, -0x1c
+    ];
+
+    /// [`RESERVED_STORE`] with its scratch word on the page above the code, so
+    /// the store does not invalidate the block it is in.
+    fn reserved_store() -> Bench {
+        let mut b = Bench::new(&RESERVED_STORE);
+        b.state.x[7] = 0x1000;
+        b.state.pc = 4;
+        b
+    }
+
+    #[test]
+    fn an_inlined_store_breaks_a_reservation_it_lands_in() {
+        let mut jit = reserved_store().with_host_code();
+        // More calls than the other fixtures need: `lr.d` and `sc.d` are
+        // outside the lifted subset, so each pass leaves the compiled path
+        // twice and one `advance` gets through less than one iteration.
+        for _ in 0..200 {
+            jit.advance(10_000);
+        }
+        assert!(jit.state.csrs.minstret > 0, "the compiled hart ran nothing");
+        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        assert!(
+            jit.fast_stores() > 0,
+            "the store between the pair was never inlined"
+        );
+        assert!(
+            jit.state.x[11] > 1,
+            "every store-conditional succeeded, so the reservation survived a \
+             store into it"
+        );
+        let mut interp = reserved_store();
+        while interp.state.csrs.minstret < jit.state.csrs.minstret {
+            interp.step();
+        }
+        assert_eq!(interp.state.csrs.minstret, jit.state.csrs.minstret);
+        assert_eq!(interp.state.x, jit.state.x, "registers");
+        assert_eq!(interp.state.cycles, jit.state.cycles, "the cycle counter");
+    }
+
+    /// [`BARE_STORE`] at a **byte** width, so the truncation the fast path
+    /// applies is visible in the neighbouring bytes.
+    ///
+    /// A `mov` of the wrong width through a host pointer overwrites guest
+    /// bytes the store never named, and nothing about the storing register
+    /// would show it.
+    const BARE_STORE_BYTE: [u32; 5] = [
+        0x0000_0013, // nop
+        0x0000_0293, // addi x5, x0, 0
+        0x0052_8293, // addi x5, x5, 5     ; the loop starts here
+        0x0053_8023, // sb   x5, 0(x7)
+        0xff9f_f06f, // jal  x0, -8
+    ];
+
+    #[test]
+    fn an_inlined_store_writes_its_width_and_not_a_byte_more() {
+        let mut jit = Bench::new(&BARE_STORE_BYTE).with_host_code();
+        jit.state.x[7] = 0x800;
+        jit.state.pc = 4;
+        // A recognisable pattern in the seven bytes above the target, so an
+        // over-wide store shows up as a changed neighbour rather than as a
+        // zero that was already there.
+        for i in 1..8u64 {
+            jit.poke(0x800 + i, 0xa5);
+        }
+        for _ in 0..8 {
+            jit.advance(10_000);
+        }
+        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        assert!(jit.fast_stores() > 0, "the byte store was never inlined");
+        for i in 1..8u64 {
+            assert_eq!(
+                jit.space
+                    .read(0x800 + i, Width::U8, MemAttrs::DEFAULT)
+                    .expect("in RAM"),
+                0xa5,
+                "a one-byte store disturbed the byte at +{i}"
+            );
+        }
+    }
+
+    /// [`Bench::paged`] with a **writable** leaf, and a store loop on it.
+    ///
+    /// The leaf carries `A` but deliberately **not** `D`, because that is a
+    /// store plan's hardest promise: a compiled store skips the walk, and it
+    /// may only do so because the walk that filled the store entry set the
+    /// dirty bit first.
+    const PAGED_STORE: [u32; 4] = [
+        0x0000_0393, // addi x7, x0, 0
+        0x0052_8293, // addi x5, x5, 5    ; the loop starts here
+        0x0453_b823, // sd   x5, 80(x7)
+        0xff9f_f06f, // jal  x0, -8
+    ];
+
+    fn paged_store() -> Bench {
+        use super::super::mmu::pte;
+        let b = Bench::paged(&PAGED_STORE);
+        // Readable, writable, executable and accessed — but not dirty.
+        let leaf = pte::V | pte::R | pte::W | pte::X | pte::A;
+        b.poke(0x3000, ((0x4000 >> 12) << 10) | leaf);
+        b
+    }
+
+    #[test]
+    fn a_paged_store_is_served_inline_and_costs_what_the_interpreter_charged() {
+        let jit = paged_engines_agree(paged_store, 8);
+        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        assert!(
+            jit.fast_stores() > 0,
+            "the fixture never reached the path it exists to test"
+        );
+        let _ = jit;
+    }
+
+    #[test]
+    fn a_store_to_a_clean_page_sets_its_dirty_bit_before_anything_is_inlined() {
+        use super::super::mmu::pte;
+        let mut jit = paged_store().with_host_code();
+        let leaf = |b: &Bench| {
+            b.space
+                .read(0x3000, Width::U64, MemAttrs::DEFAULT)
+                .expect("in RAM")
+        };
+        assert_eq!(leaf(&jit) & pte::D, 0, "the fixture starts clean");
+        for _ in 0..8 {
+            jit.advance(10_000);
+        }
+        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        assert!(jit.fast_stores() > 0, "no store was ever inlined");
+        assert_ne!(
+            leaf(&jit) & pte::D,
+            0,
+            "a compiled store left the page's dirty bit clear, which is the one \
+             thing a store plan may never do"
+        );
+    }
+
+    /// [`PAGED_STORE`] on a page the guest may **read** but not write.
+    ///
+    /// The two sets are the point: a load may be inlined here and a store may
+    /// not, because `W` is a different bit from `R` and the shadow's store set
+    /// is filled only by a walk that checked it. A store plan that reused the
+    /// load set would write straight through a read-only mapping.
+    fn paged_read_only() -> Bench {
+        use super::super::mmu::pte;
+        let b = Bench::paged(&PAGED_STORE);
+        let leaf = pte::V | pte::R | pte::X | pte::A;
+        b.poke(0x3000, ((0x4000 >> 12) << 10) | leaf);
+        b
+    }
+
+    #[test]
+    fn a_store_to_a_page_without_write_permission_traps_under_both_engines() {
+        use super::super::csr::cause;
+        // Only as far as the first trap: `mtvec` is zero and machine mode
+        // fetches virtual zero untranslated, where this fixture has nothing,
+        // so running on would replace the cause under test with an illegal
+        // instruction.
+        let mut jit = paged_read_only().with_host_code();
+        let jit_ticks = jit.run_until_trap(Bench::advance);
+        let mut interp = paged_read_only();
+        let interp_ticks = interp.run_until_trap(|b, _| b.step());
+        assert_eq!(
+            jit.state.csrs.mcause,
+            cause::STORE_PAGE_FAULT,
+            "the compiled hart wrote through a read-only mapping"
+        );
+        assert_eq!(interp.state.csrs.mcause, jit.state.csrs.mcause);
+        assert_eq!(interp.state.csrs.mtval, jit.state.csrs.mtval);
+        assert_eq!(
+            interp_ticks, jit_ticks,
+            "the trap cost a different number of ticks"
+        );
+        // The word the store aimed at is still what the page was built with,
+        // not the register the loop was counting in.
+        assert_eq!(
+            jit.space
+                .read(0x4050, Width::U64, MemAttrs::DEFAULT)
+                .expect("in RAM"),
+            0,
+            "the refused store landed anyway"
+        );
+    }
+
     #[test]
     fn a_paged_load_is_served_inline_and_costs_what_the_interpreter_charged() {
         let jit = paged_engines_agree(paged_load, 8);
@@ -2293,6 +2689,79 @@ mod tests {
         b.state.csrs.pmpaddr[1] = u64::MAX >> 10; // everything else
         b.state.csrs.pmpcfg[1] = 0b0001_1111; // NAPOT, R, W and X
         b
+    }
+
+    /// [`Bench::paged`] with a store loop, and PMP over its page granting
+    /// **loads but not stores**.
+    ///
+    /// PMP is *uniform* over the page here — no entry's edge falls inside it —
+    /// so the question `Exec::refresh_shadow` asks is not "is this page
+    /// uniform" but "what does PMP say about the access kind I am filling
+    /// for". A fill that asked about loads would cache the page and let a
+    /// compiled store write straight through a refusal the interpreter takes
+    /// an access fault on.
+    ///
+    /// Entry 0 covers exactly the 4 KiB page at physical 0x4000 with `R` and
+    /// `X` and no `W`; entry 1 grants everything else, so the walk's own PTE
+    /// reads still pass.
+    fn paged_store_denied_by_pmp() -> Bench {
+        use super::super::csr::{PMP_ENTRIES, Priv};
+        use super::super::mmu::pte;
+        let mut b = Bench::paged(&PAGED_STORE);
+        let leaf = pte::V | pte::R | pte::W | pte::X | pte::A | pte::D;
+        b.poke(0x3000, ((0x4000 >> 12) << 10) | leaf);
+        b.cfg.pmp_count = PMP_ENTRIES;
+        b.state = State::new(&b.cfg);
+        b.state.csrs.satp = (8 << 60) | (0x1000 >> 12);
+        b.state.csrs.priv_mode = Priv::Supervisor;
+        b.state.pc = 0;
+        // NAPOT, 4 KiB at 0x4000: the base is `0x4000 >> 2` with nine trailing
+        // ones, which is what encodes 2^12 bytes.
+        b.state.csrs.pmpaddr[0] = (0x4000u64 >> 2) | 0x1ff;
+        b.state.csrs.pmpcfg[0] = 0b0001_1101; // NAPOT, R and X — no W
+        b.state.csrs.pmpaddr[1] = u64::MAX >> 10;
+        b.state.csrs.pmpcfg[1] = 0b0001_1111; // NAPOT, R, W and X
+        b
+    }
+
+    #[test]
+    fn a_page_pmp_denies_stores_over_is_never_stored_to_inline() {
+        use super::super::csr::cause;
+        // Only as far as the first trap: `mtvec` is zero and machine mode
+        // fetches virtual zero untranslated, where this fixture has nothing.
+        let mut jit = paged_store_denied_by_pmp().with_host_code();
+        let jit_ticks = jit.run_until_trap(Bench::advance);
+        let mut interp = paged_store_denied_by_pmp();
+        let interp_ticks = interp.run_until_trap(|b, _| b.step());
+        assert_eq!(
+            jit.state.csrs.mcause,
+            cause::STORE_ACCESS,
+            "the fixture did not reach the refusal it exists for"
+        );
+        assert_eq!(interp.state.csrs.mcause, jit.state.csrs.mcause);
+        assert_eq!(interp.state.csrs.mtval, jit.state.csrs.mtval);
+        assert_eq!(
+            interp_ticks, jit_ticks,
+            "the trap cost a different number of ticks"
+        );
+        assert_eq!(
+            jit.fast_stores(),
+            0,
+            "a page PMP refuses stores over must never be stored to inline"
+        );
+        // And it is a refusal rather than an absence: the shadow *was* asked,
+        // and said no every time. A fill that asked the load question would
+        // have said yes, and the counters are the only place that shows.
+        let stats = jit.shadow_stats();
+        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        {
+            assert!(stats.fills > 0, "the shadow was never asked about the page");
+            assert_eq!(
+                stats.refused, stats.fills,
+                "the page was cached for stores although PMP refuses them"
+            );
+        }
+        let _ = stats;
     }
 
     #[test]

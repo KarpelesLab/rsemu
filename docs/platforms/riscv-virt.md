@@ -72,28 +72,61 @@ initramfs, 512 MiB, one binary, `--headless` so nothing is rate-limited to the
 wall clock — over sixty seconds of virtual time, which is the boot, and over
 four minutes, which is well past the shell prompt:
 
-| `engine` | 60 s of guest time | 240 s of guest time | state hash (240 s) |
-| --- | --- | --- | --- |
-| `interp` | 36.6 s | 156.9 s | `0x267fac762c374054` |
-| `jit` | 25.2 s (**1.45×**) | 120.4 s (**1.30×**) | `0x267fac762c374054` |
-| `jit-host` | 14.9 s (**2.45×**) | 68.7 s (**2.28×**) | `0x267fac762c374054` |
+| `engine` | 60 s of guest time | 240 s of guest time |
+| --- | --- | --- |
+| `interp` | 25.1 s | 122.3 s |
+| `jit` | 19.8 s (**1.27×**) | 103.7 s (**1.18×**) |
+| `jit-host` | 10.3 s (**2.44×**) | 56.8 s (**2.15×**) |
+
+Every cell is the median of three interleaved runs, and in each sweep all three
+engines — and the binary from before the last change, run in the same sweep —
+finished on one state hash: `0x887e28c90a99e82b` at sixty seconds and
+`0xb561134639a875b9` at four minutes. Those numbers belong to *this* invocation,
+because a state hash names a stopping point as much as a machine: `--for 240s`
+stops at a virtual instant, and the environment harness's `RSEMU_RISCV_QUANTA`
+stops after a count of quanta, so the two do not hash alike and neither is more
+correct.
 
 The host code generator used to *lose* to the portable one on this guest, at
-0.50×, and none of the three things that fixed it was the code it emits.
+0.50×, and none of the five things that fixed it was the code it emits.
 **Blocks are chained** — 86% of them are reached by following a patched exit,
 where the count was previously zero in every run. **A compile stopped costing
 144 µs**, which is what two `mprotect` calls over a 256 MiB code buffer had
 been costing before `jit::x86::buf` learned to flip a page-sized window
-instead. And **a guest load stopped costing a call**: the software TLB's fast
-path is inlined into generated code now that a hart publishes a `LoadPlan`, so
-97.3% of compiled loads are a mask, a compare, an add and a `mov` rather than a
-trip through the hart's translation and PMP. That last one is worth 13% —
-78.9 s to 68.7 s over the four minutes — against 20% fewer host instructions
-executed, which is the usual gap between an instruction count and a clock.
+instead. **A guest load stopped costing a call**: the software TLB's fast path
+is inlined into generated code now that a hart publishes a `MemPlan`, so 97.3%
+of compiled loads are a mask, a compare, an add and a `mov` rather than a trip
+through the hart's translation and PMP. **A guest store stopped costing one
+too** — 99.8% of them, over a second set whose entries were admitted on write
+permission and filled by a walk that set the page's dirty bit, with one thunk
+left to pay the tick, the store's dirty bitmap, the reservation and the
+self-modifying-code check. And **the PMP scan stopped being asked sixteen
+entries at a time**: `pmp_allows` was 265 host instructions a call over 5.5
+million calls — a fifth of all emulation — and it is now memoized over the span
+its answer is provably constant on.
+
+The last two were measured the way this file insists on, with the old binary
+and the new one interleaved in one three-rep sweep over the same guest:
+
+| `engine` | 240 s before | 240 s after | |
+| --- | --- | --- | --- |
+| `interp` | 155.1 s | 122.3 s | **1.27×** |
+| `jit` | 118.6 s | 103.7 s | **1.14×** |
+| `jit-host` | 69.1 s | 56.8 s | **1.22×** |
+
+The **interpreter** gains most, and that is the point about where the PMP scan
+lived: on the path every engine takes, not on the JIT's. It is also why
+`jit-host`'s headline ratio *falls* from 2.28× to 2.15× while the engine itself
+got 22% faster — the control moved too, and a ratio against a moving control is
+the wrong number to quote on its own. Under callgrind, which is
+host-CPU-independent, `Hart::advance` taken inclusively — emulation and nothing
+else — went from 7.37 G host instructions to 5.25 G over three seconds of this
+boot, **28.7% fewer**.
 [`src/cpu/riscv/engine.rs`](../../src/cpu/riscv/engine.rs) has the reasoning and
 the measurements behind every one of those claims, including what it costs to
 keep the engines identical, and `src/jit/fast.rs` has the argument for why a
-*paged* hart may publish a plan at all.
+*paged* hart may publish a plan at all — and what a **store** plan promises on
+top of a load's.
 
 **Measure the interpreter in the same sweep as the engines it is the control
 for.** This is a shared machine, and a 150-second run of the same binary
@@ -107,7 +140,10 @@ host CPU this machine had before, read anywhere from 3.6% to 9.4% depending on
 what else was running — same code, same guest, same instruction counts. When a
 machine is busy, prefer the median of the *per-rep ratios* to the ratio of the
 medians: they agree here (13.8% against 12.9%) and the first degrades more
-gracefully.
+gracefully. They agreed again on the sweep above — 1.268 against 1.268 for the
+interpreter, 1.215 against 1.218 for `jit-host` — which is what a quiet machine
+looks like, and is worth recording so a sweep where they *disagree* is read as
+the warning it is.
 
 A build without `cpu-riscv-lift` and `jit` **refuses** both JIT values with a
 message saying which features it wants, rather than interpreting quietly — an
