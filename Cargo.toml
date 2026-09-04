@@ -778,6 +778,33 @@ cpu-arm-a64 = ["float"]
 # dependencies.
 machine-a64-mini = ["cpu-arm-a64"]
 
+# The AArch64 `virt` board's chips (src/dev/arm): a **GICv2** interrupt
+# controller (distributor and CPU interface, banked private interrupts, the
+# priority-and-preemption rules), an ARM PrimeCell **PL011** UART on the
+# character-device seam, a power controller for where `PSCI_SYSTEM_OFF` lands,
+# a kernel/ramdisk loader that checks the AArch64 `Image` header, and a
+# **device tree generator** that emits the DTB from the realized machine graph
+# rather than from a file somebody wrote by hand. `no_std + alloc`, no
+# `unsafe`, no dependencies. Written from the GIC Architecture Specification
+# v2.0, the PL011 TRM, DEN 0022 (PSCI) and the Devicetree Specification.
+#
+# It does not pull `dev-riscv`, and that is deliberate: the DTB *format* writer
+# and the poweroff signal are duplicated here rather than shared, because the
+# shared copies live under `dev/riscv/` and an AArch64 board that had to link a
+# PLIC and a CLINT to describe itself would break the crate-shape rule. See
+# src/dev/arm/mod.rs, which says what the one-commit fix is.
+dev-arm = []
+
+# The AArch64 `virt` board as a machine (machines/arm64-virt.machine plus the
+# classes it names). The board a real arm64 kernel is pointed at:
+#
+#   rsemu run arm64-virt --media kernel=Image --media initrd=rootfs.cpio
+#
+# The kernel goes into DRAM, the boot ROM hands it a generated device tree in
+# `x0`, and the console is a PL011. `docs/platforms/arm64-virt.md` has the
+# transcript and the ledger of what is still in the way.
+machine-arm64-virt = ["cpu-arm-a64", "dev-arm"]
+
 # The `arm926` board (machines/arm926.machine plus the classes it names): a bare
 # ARM926EJ-S SoC skeleton -- an ARMv5TE core, a boot ROM at the reset vector,
 # DRAM, and one peripheral aperture, with every address a `param` because an ARM9

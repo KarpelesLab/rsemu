@@ -867,6 +867,77 @@ fn map_tables(h: &Harness, target: u64, leaf_attrs: u64) {
     h.cpu.set_sysregs(regs);
 }
 
+/// `STTR Xt, [Xn, #simm]` — the unprivileged store.
+const fn sttr_x(rt: u32, rn: u32, imm9: i32) -> u32 {
+    0xf800_0800 | (((imm9 as u32) & 0x1ff) << 12) | (rn << 5) | rt
+}
+
+/// `LDTR Xt, [Xn, #simm]`.
+const fn ldtr_x(rt: u32, rn: u32, imm9: i32) -> u32 {
+    0xf840_0800 | (((imm9 as u32) & 0x1ff) << 12) | (rn << 5) | rt
+}
+
+#[test]
+fn an_unprivileged_store_at_el1_is_checked_with_el0s_permissions() {
+    // The whole point of `STTR`, and the reason a kernel is built out of it:
+    // a page the kernel may write and a process may not must fault when the
+    // kernel reaches it *on the process's behalf*. A core that treated it as
+    // an ordinary store would let `copy_to_user` write anywhere.
+    let h = Harness::a53(&[
+        movz(1, 0, 0x20, 16), // x0 = 0x0020_0000
+        str_x(1, 0, 0),       // an ordinary store: permitted at EL1
+        sttr_x(1, 0, 0),      // the same address, EL0's permissions
+    ]);
+    // `AF` alone is `AP == 0b00`: read/write at EL1, nothing at EL0.
+    map_tables(&h, 0x8000, desc::AF);
+    h.write64(0x8000, 0);
+    h.cpu.set_x(1, 0x1234);
+
+    h.steps(2);
+    assert_eq!(
+        h.read64(0x8000),
+        0x1234,
+        "the privileged store went through"
+    );
+
+    h.steps(1);
+    assert_eq!(h.cpu.pc(), 0x4200, "and the unprivileged one faulted");
+    let regs = h.cpu.sysregs();
+    assert_eq!(regs.esr_el1 >> 26, ec::DABT_SAME);
+    assert_eq!(regs.esr_el1 & 0x3f, 0b001111, "permission fault, level 3");
+    assert_ne!(regs.esr_el1 & (1 << 6), 0, "WnR set: it was a write");
+    assert_eq!(regs.far_el1, 0x20_0000);
+}
+
+#[test]
+fn an_unprivileged_access_to_a_page_el0_may_reach_goes_through() {
+    // The other half: `AP[1]` grants EL0 access, and then `LDTR` and `STTR`
+    // are ordinary loads and stores.
+    let h = Harness::a53(&[movz(1, 0, 0x20, 16), sttr_x(1, 0, 0), ldtr_x(2, 0, 0)]);
+    map_tables(&h, 0x8000, desc::AF | (1 << desc::AP_SHIFT));
+    h.cpu.set_x(1, 0xfeed_face);
+    h.steps(3);
+    assert_eq!(h.cpu.pc(), 12, "no exception was taken");
+    assert_eq!(h.read64(0x8000), 0xfeed_face);
+    assert_eq!(h.cpu.x(2), 0xfeed_face);
+}
+
+#[test]
+fn the_unprivileged_forms_decode_and_disassemble_as_themselves() {
+    // Bits 11:10 are what separates them from `STUR`/`LDUR`, and a table that
+    // masked those bits off would decode `sttr` as `stur` and silently drop
+    // the permission check.
+    assert_eq!(sttr_x(31, 0, 0), 0xf800_081f, "sttr xzr, [x0]");
+    let text = |word: u32| super::disasm::disassemble(word, 0, Features::ALL).text;
+    assert_eq!(text(0xf800_081f), "sttr\txzr, [x0]");
+    assert_eq!(text(0xf840_0801), "ldtr\tx1, [x0]");
+    assert_eq!(
+        text(0xf800_001f),
+        "stur\txzr, [x0]",
+        "and the unscaled form"
+    );
+}
+
 #[test]
 fn the_mmu_translates_a_load_through_three_levels() {
     let h = Harness::a53(&[

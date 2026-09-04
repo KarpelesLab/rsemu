@@ -34,9 +34,10 @@ use crate::float::{Env, Flags, Round};
 use super::fp;
 use super::isa::{self, Fmt, LsAccess, Nzcv, Op, ShiftKind};
 use super::mmu::{self, Access, Tlb};
+use super::psci;
 use super::simd::{self, Arrangement, FpCmp};
 use super::sysreg::{self, El, SysReg, SysRegs, VectorKind, cntctl, daif, ec, sctlr};
-use super::{Config, Lines};
+use super::{Config, Lines, PowerRequest};
 
 /// What a `CNT{P,V}_TVAL_EL0` read reports: the comparator minus the count,
 /// truncated to 32 bits.
@@ -217,6 +218,16 @@ pub(super) struct Exec<'a> {
     /// Set instead of vectoring, when a trap is named in `exits`.
     exit: Option<Exit>,
     attrs: MemAttrs,
+    /// Whether the access this instruction makes is checked with **EL0's**
+    /// permissions rather than the current level's.
+    ///
+    /// Set by [`Exec::single`] for the `LDTR`/`STTR` family and by nothing
+    /// else. A field rather than an argument threaded through `load`, `store`,
+    /// `read_once`, `write_once` and `translate`, because an `Exec` is built
+    /// fresh for **one instruction** — so a field here has exactly the
+    /// lifetime the flag needs, and five signatures do not grow a parameter
+    /// that is false in every other caller.
+    unpriv: bool,
     /// Cycles charged by this step.
     used: u64,
     /// Where execution continues, unless a branch overrides it.
@@ -246,6 +257,7 @@ impl<'a> Exec<'a> {
             exits,
             exit: None,
             attrs,
+            unpriv: false,
             used: 0,
             next_pc: this_pc,
             this_pc,
@@ -258,6 +270,17 @@ impl<'a> Exec<'a> {
     /// always make progress, and a stalled core is visible through
     /// `State::wfi` rather than through a zero return.
     pub(super) fn step(&mut self) -> u64 {
+        let used = self.step_once();
+        // Once per step, whatever the step did: a comparator can be reached by
+        // the access the instruction itself charged, and the wire out has to
+        // follow within the same step or an idle kernel in `WFI` waits for an
+        // interrupt its own timer already raised.
+        self.publish_timer_levels();
+        used
+    }
+
+    /// One step, before the outputs are sampled.
+    fn step_once(&mut self) -> u64 {
         // The stall is resolved **before** the interrupt, and the order is not
         // cosmetic. DDI 0487 D1 makes `WFI` end on a *wake-up event*, which a
         // pending interrupt is even when `PSTATE.I` would stop it being taken;
@@ -430,10 +453,33 @@ impl<'a> Exec<'a> {
         self.cfg.counter_at(self.st.cycles)
     }
 
-    /// Whether the generic timer is asserting its interrupt.
+    /// Whether the generic timer is asserting an interrupt the **core itself**
+    /// still has to take.
+    ///
+    /// A timer output the board has taken onto a wire is not one of those: it
+    /// goes to an interrupt controller and comes back on `cpu.irq`, and a core
+    /// that also raised it internally would give a kernel an interrupt its
+    /// controller never saw. That kernel reads `GICC_IAR`, is told 1023, and
+    /// takes the interrupt again forever — a live-lock rather than a crash,
+    /// and the reason this mask exists.
     #[inline]
     fn timer_irq(&self) -> bool {
-        self.st.sys.timer_irq(self.counter())
+        self.st.sys.timer_levels(self.counter()) & !self.lines.routed_timers() != 0
+    }
+
+    /// Record what both timer outputs are doing, for the wires the board took
+    /// them out on.
+    ///
+    /// Sampled at the end of every step so [`Cpu::step_to_exit`] can drive the
+    /// wires with the execution lock released.
+    ///
+    /// [`Cpu::step_to_exit`]: super::Cpu::step_to_exit
+    #[inline]
+    fn publish_timer_levels(&self) {
+        if self.lines.routed_timers() != 0 {
+            self.lines
+                .set_timer_level(self.st.sys.timer_levels(self.counter()));
+        }
     }
 
     /// Take an exception to EL1.
@@ -575,7 +621,12 @@ impl<'a> Exec<'a> {
             return Ok(va);
         }
         let vpn = va >> mmu::PAGE_BITS;
-        let el = self.st.sys.el;
+        // `LDTR`/`STTR` are translated with EL0's permissions whatever level
+        // is executing them (DDI 0487 C6.2: the unprivileged load/store
+        // family, absent `PSTATE.UAO`, which this core does not implement and
+        // reports absent in `ID_AA64MMFR2_EL1`). At EL0 this changes nothing,
+        // which is also what the architecture says.
+        let el = if self.unpriv { El::El0 } else { self.st.sys.el };
         let generation = self.st.sys.translation_gen;
         // The ASID a lookup is tagged with. A global mapping is cached under
         // ASID 0 as well, which is why a `TLBI` bumps the generation rather
@@ -990,9 +1041,34 @@ impl<'a> Exec<'a> {
                     advance: false,
                 });
             }
-            // No EL2 and no EL3, so both calls are UNDEFINED rather than a
-            // vector into a level this core does not have.
-            Op::Hvc | Op::Smc | Op::Hlt => return Err(Trap::undefined()),
+            // No EL2 and no EL3, so a call to a level this core does not have
+            // is UNDEFINED — *unless* the board said it has firmware behind
+            // that instruction, in which case the call is serviced here.
+            // `psci` argues why that is a board's decision to make and what
+            // the honest alternative would have cost.
+            Op::Hvc | Op::Smc => {
+                let conduit = match op {
+                    Op::Hvc => psci::Conduit::Hvc,
+                    _ => psci::Conduit::Smc,
+                };
+                if self.cfg.psci != conduit {
+                    return Err(Trap::undefined());
+                }
+                let args = [self.st.x[0], self.st.x[1], self.st.x[2], self.st.x[3]];
+                let outcome = psci::call(self.st.sys.el, self.cfg.cpus, args);
+                self.st.x[0] = outcome.x0;
+                match outcome.effect {
+                    psci::Effect::None => {}
+                    // Latched rather than acted on: what a board does about a
+                    // power request is the board's, and the wire out is driven
+                    // once the execution lock is released.
+                    psci::Effect::Poweroff => {
+                        self.lines.request_power(PowerRequest::Poweroff);
+                    }
+                    psci::Effect::Reboot => self.lines.request_power(PowerRequest::Reboot),
+                }
+            }
+            Op::Hlt => return Err(Trap::undefined()),
 
             // -- hints and barriers ----------------------------------------
             Op::Nop | Op::Yield | Op::Sev | Op::Sevl | Op::Hint => {}
@@ -1366,7 +1442,15 @@ impl<'a> Exec<'a> {
     /// Read the system register an `MRS` names.
     fn read_sysreg(&mut self, word: u32) -> Result<u64, Trap> {
         let key = isa::field(word, 20, 5) as u16;
-        let spec = sysreg::lookup(key).ok_or_else(Trap::undefined)?;
+        let Some(spec) = sysreg::lookup(key) else {
+            // An identification register no version of the architecture has
+            // allocated reads as zero rather than raising UNDEFINED; see
+            // `sysreg::is_id_space` for why that is load-bearing.
+            if sysreg::is_id_space(key) && self.st.sys.el == El::El1 {
+                return Ok(0);
+            }
+            return Err(Trap::undefined());
+        };
         if !spec.access.readable_at(self.st.sys.el) {
             return Err(Trap::undefined());
         }
@@ -1385,6 +1469,34 @@ impl<'a> Exec<'a> {
             SysReg::IdAa64Isar1 => 0,
             SysReg::IdAa64Mmfr0 => Config::ID_AA64MMFR0,
             SysReg::IdAa64Mmfr1 | SysReg::IdAa64Mmfr2 => 0,
+            // `DebugVer` is 0b0110, the Armv8 debug architecture: it is the
+            // one field here that must not be zero, because zero means "no
+            // debug architecture" and an operating system's debug
+            // initialisation reads it before it decides what to do. Everything
+            // else is zero — `PMUVer` especially, because there is no
+            // performance monitor and a kernel told there was one would
+            // program registers this core does not have. `BRPs` and `WRPs` are
+            // "one less than the number implemented", so zero is one of each.
+            SysReg::IdAa64Dfr0 => 0x6,
+            // No cache levels at all, so nothing selects one and the walk that
+            // reads these terminates at the first step.
+            SysReg::Clidr | SysReg::Ccsidr | SysReg::Aidr | SysReg::Csselr => 0,
+            // `F` set: this core does not implement the address translation
+            // instructions, so the only honest `PAR_EL1` is one that says the
+            // translation faulted. A zero here would claim a successful
+            // translation to physical address zero.
+            SysReg::Par => 1,
+            SysReg::PmuserenrEl0 => 0,
+            // The debug block: storage-free, so a guest reads back the zero it
+            // did not write and can tell there is nothing behind it.
+            SysReg::Dbgbvr0
+            | SysReg::Dbgbcr0
+            | SysReg::Dbgwvr0
+            | SysReg::Dbgwcr0
+            | SysReg::Oslar
+            | SysReg::Oslsr
+            | SysReg::Osdlr
+            | SysReg::MdccsrEl0 => 0,
             SysReg::Ctr => Config::CTR,
             // DZP set: `DC ZVA` is prohibited, because this core does not
             // implement it.
@@ -1506,6 +1618,18 @@ impl<'a> Exec<'a> {
             SysReg::CntvCtl => s.cntv_ctl = value & cntctl::WRITABLE,
             SysReg::CntvCval => s.cntv_cval = value,
             SysReg::CntvTval => s.cntv_cval = cval_of(value, count),
+            // Accepted and discarded. Each of these exists so that a guest's
+            // initialisation runs to completion; none of them has anything
+            // behind it, and each says so by reading back zero.
+            SysReg::Csselr
+            | SysReg::Par
+            | SysReg::PmuserenrEl0
+            | SysReg::Dbgbvr0
+            | SysReg::Dbgbcr0
+            | SysReg::Dbgwvr0
+            | SysReg::Dbgwcr0
+            | SysReg::Oslar
+            | SysReg::Osdlr => {}
             // Everything else in the table is read-only, and `writable_at`
             // already refused it.
             _ => return Err(Trap::undefined()),
@@ -1629,9 +1753,14 @@ impl<'a> Exec<'a> {
         let n = isa::rn(word);
         let base = self.read_reg(n, 64, true);
 
+        // The one thing the unprivileged forms change, and it is a permission
+        // check rather than an address: see `Exec::unpriv`.
+        self.unpriv = fmt == Fmt::LdStUnpriv;
         let (addr, writeback) = match fmt {
             Fmt::LdStUImm => (base.wrapping_add(u64::from(isa::imm12(word)) << size), None),
-            Fmt::LdStUnscaled => (base.wrapping_add(isa::imm9(word) as u64), None),
+            Fmt::LdStUnscaled | Fmt::LdStUnpriv => {
+                (base.wrapping_add(isa::imm9(word) as u64), None)
+            }
             Fmt::LdStPost => (base, Some(base.wrapping_add(isa::imm9(word) as u64))),
             Fmt::LdStPre => {
                 let a = base.wrapping_add(isa::imm9(word) as u64);

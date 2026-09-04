@@ -128,7 +128,7 @@
 //! here only as a conversion format, which is Armv8.0-A), EL2 and EL3 (so
 //! `HVC` and `SMC` are `UNDEFINED`, and so `CNTVOFF_EL2` does not exist and
 //! the virtual count equals the physical one), AArch32 at any level, the
-//! unprivileged `LDTR`/`STTR` family, pointer authentication, MTE, SVE,
+//! pointer authentication, MTE, SVE,
 //! big-endian data, and the `DC ZVA` block operation — `DCZID_EL0.DZP` says
 //! so. Of the generic timer, the event stream (`CNTKCTL_EL1.EVNT*`) is storage
 //! and `WFE` does not stall, so nothing drives it.
@@ -180,6 +180,7 @@ mod exec;
 pub mod fp;
 pub mod isa;
 pub mod mmu;
+pub mod psci;
 pub mod simd;
 pub mod sysreg;
 
@@ -212,7 +213,7 @@ use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{self, AtomicBool, AtomicU32, AtomicU64, LockRank, Ordering};
 use crate::core::value::Width;
-use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink};
+use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink, WireSource};
 
 use exec::{Exec, State};
 use isa::Features;
@@ -305,6 +306,21 @@ pub struct Config {
     pub cntdiv: u64,
     /// This core's identity in `MemAttrs::requester`.
     pub requester: RequesterId,
+    /// Which instruction, if either, this board answers PSCI calls on.
+    ///
+    /// A property of the *board* rather than of the part: `SMC` is
+    /// architecturally UNDEFINED with no EL3 and `HVC` with no EL2, and this
+    /// core implements neither level. Saying `smc` here is the board asserting
+    /// that it has firmware behind that instruction; [`psci`] argues the case
+    /// and says what the honest alternative would have cost.
+    pub psci: psci::Conduit,
+    /// How many processors the machine has, for `CPU_ON` and `AFFINITY_INFO`.
+    ///
+    /// A core cannot see its siblings, so this is the board telling it how
+    /// many there are — which is the same fact `arm.boot` puts in the device
+    /// tree, and the only thing that makes `CPU_ON` for processor 1 an honest
+    /// answer rather than a guess.
+    pub cpus: u64,
 }
 
 impl Config {
@@ -317,11 +333,30 @@ impl Config {
     /// `ID_AA64MMFR0_EL1`: a 48-bit physical address range, 16-bit ASIDs, the
     /// 4 KiB granule supported and the 16 KiB and 64 KiB granules not.
     ///
-    /// `TGran4 == 0b0000` means *supported* while `TGran16 == 0b0000` means
-    /// *not supported*; the two fields use opposite conventions, which is a
-    /// genuine trap in the architecture and the reason this constant is
-    /// written out with its fields named rather than as a bare number.
-    pub const ID_AA64MMFR0: u64 = 0x0000_0000_1000_0025;
+    /// ```text
+    ///   [31:28] TGran4  = 0b0000  4 KiB supported, without FEAT_LPA2
+    ///   [27:24] TGran64 = 0b1111  64 KiB not supported
+    ///   [23:20] TGran16 = 0b0000  16 KiB not supported
+    ///   [ 7: 4] ASIDBits = 0b0010 16-bit ASIDs
+    ///   [ 3: 0] PARange  = 0b0101 48-bit physical addresses
+    /// ```
+    ///
+    /// **The three granule fields use three different conventions**, which is
+    /// a genuine trap in the architecture and the reason this constant is
+    /// written out field by field rather than as a bare number: `TGran4 ==
+    /// 0b0000` means *supported* and `0b1111` not, `TGran16 == 0b0000` means
+    /// *not supported* and `0b0001` supported, and `TGran64` is like `TGran4`.
+    /// So "4 KiB only" is `0`, `0b1111`, `0` — and the value that looks
+    /// symmetrical is wrong in two fields at once.
+    ///
+    /// It was wrong here, in both of them, and the way it showed up is worth
+    /// recording: `TGran4 == 0b0001` is not "4 KiB supported", it is *4 KiB
+    /// supported **with FEAT_LPA2*** — 52-bit addressing and a different
+    /// descriptor format that this core does not implement — and `TGran64 ==
+    /// 0b0000` claimed a 64 KiB granule that [`mmu`] faults on.
+    /// A guest reading the old value was told it could use two things that do
+    /// not work.
+    pub const ID_AA64MMFR0: u64 = 0x0000_0000_0f00_0025;
 
     /// A bare Armv8.0-A part with no optional feature at all — **including no
     /// floating point**.
@@ -344,6 +379,8 @@ impl Config {
             cntfrq: 0,
             cntdiv: 1,
             requester: RequesterId::ANONYMOUS,
+            psci: psci::Conduit::None,
+            cpus: 1,
         }
     }
 
@@ -512,6 +549,23 @@ impl Default for Config {
 pub struct Lines {
     pending: AtomicU64,
     reset: AtomicBool,
+    /// A `PSCI_SYSTEM_OFF` or `SYSTEM_RESET` the guest asked for and the board
+    /// has not been told about yet. See [`PowerRequest`].
+    power: AtomicU32,
+    /// Which of the generic timer's two outputs the board has taken *out* of
+    /// the core, as [`Lines::TIMER_PHYS`] and [`Lines::TIMER_VIRT`].
+    ///
+    /// A board with no interrupt controller leaves both clear and the timer is
+    /// wire-ORed onto the core's own `IRQ`, which is what
+    /// `machines/a64-mini.machine` relies on. A board with a GIC wires the two
+    /// out as private peripheral interrupts, and then the *only* route back in
+    /// is through the GIC — a timer that also raised `IRQ` internally would
+    /// give a kernel an interrupt its controller never saw, which it answers
+    /// by reading `GICC_IAR`, being told 1023, and taking it again forever.
+    timer_routed: AtomicU64,
+    /// The level each of those two outputs is currently at, sampled at the end
+    /// of every step so the wire can be driven with no lock held.
+    timer_level: AtomicU64,
 }
 
 impl Lines {
@@ -519,6 +573,13 @@ impl Lines {
     pub const IRQ: u64 = 1 << 0;
     /// The `FIQ` input.
     pub const FIQ: u64 = 1 << 1;
+
+    /// The EL1 physical timer's output, as
+    /// [`route_timer`](Lines::route_timer) and
+    /// [`timer_level`](Lines::timer_level) name it.
+    pub const TIMER_PHYS: u64 = 1 << 0;
+    /// The EL1 virtual timer's output.
+    pub const TIMER_VIRT: u64 = 1 << 1;
 
     /// Drive one input.
     pub fn set(&self, mask: u64, asserted: bool) {
@@ -549,6 +610,62 @@ impl Lines {
     pub fn take_reset_request(&self) -> bool {
         self.reset.swap(false, Ordering::Relaxed)
     }
+
+    /// Record what a PSCI call asked the board to do.
+    ///
+    /// The **first** request wins, exactly as it does at the other end of the
+    /// wire: a shutdown path that asks to power off and then resets must not
+    /// come back up.
+    pub fn request_power(&self, what: PowerRequest) {
+        let _ = self
+            .power
+            .compare_exchange(0, what as u32, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    /// Take a pending power request, clearing it.
+    pub fn take_power_request(&self) -> Option<PowerRequest> {
+        match self.power.swap(0, Ordering::Relaxed) {
+            1 => Some(PowerRequest::Poweroff),
+            2 => Some(PowerRequest::Reboot),
+            _ => None,
+        }
+    }
+
+    /// Take one of the generic timer's outputs out of the core and onto a
+    /// wire. Called from `Device::connect`, once, before the core runs.
+    pub fn route_timer(&self, which: u64) {
+        self.timer_routed.fetch_or(which, Ordering::Relaxed);
+    }
+
+    /// Which timer outputs the board took out of the core.
+    #[must_use]
+    pub fn routed_timers(&self) -> u64 {
+        self.timer_routed.load(Ordering::Relaxed)
+    }
+
+    /// Record what the timer outputs are doing now.
+    pub fn set_timer_level(&self, levels: u64) {
+        self.timer_level.store(levels, Ordering::Relaxed);
+    }
+
+    /// What the timer outputs were doing at the end of the last step.
+    #[must_use]
+    pub fn timer_level(&self) -> u64 {
+        self.timer_level.load(Ordering::Relaxed)
+    }
+}
+
+/// What a PSCI call asked the board to do, as it crosses the execution lock.
+///
+/// A plain `u32` in the atomic, because `core::sync` has no atomic enum and a
+/// power request is exactly two values plus "nothing".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PowerRequest {
+    /// `PSCI_SYSTEM_OFF`.
+    Poweroff = 1,
+    /// `PSCI_SYSTEM_RESET`.
+    Reboot = 2,
 }
 
 /// Everything the interpreter mutates, behind one lock.
@@ -590,11 +707,29 @@ pub struct Cpu {
     exit: sync::Mutex<Option<ExitFlag>>,
 }
 
-/// The sinks this core has published, one per input pin.
+/// The sinks this core has published, one per input pin, and the nets its
+/// four output pins drive.
+///
+/// A core with *outputs* is new here and is worth a sentence. Two of them are
+/// the generic timer's, which on a board with an interrupt controller is a
+/// private peripheral interrupt rather than something internal (see
+/// [`Lines::route_timer`]); the other two carry a PSCI request out to whatever
+/// the board does about it. All four are driven from
+/// [`Cpu::step_to_exit`] **after** the execution lock is released, which is
+/// the re-entrancy contract and is what stops a `SYSTEM_OFF` re-entering the
+/// core through the device it just poked.
 #[derive(Debug, Default)]
 struct Pins {
     interrupts: Vec<(u64, Arc<InterruptPin>)>,
     reset: Option<Arc<ResetPin>>,
+    /// The EL1 physical timer's interrupt output, `cntp`.
+    cntp: Option<WireSource>,
+    /// The EL1 virtual timer's interrupt output, `cntv`.
+    cntv: Option<WireSource>,
+    /// Pulsed when a guest calls `PSCI_SYSTEM_OFF`.
+    poweroff: Option<WireSource>,
+    /// Pulsed when a guest calls `PSCI_SYSTEM_RESET`.
+    reboot: Option<WireSource>,
 }
 
 impl Cpu {
@@ -637,6 +772,12 @@ impl Cpu {
         let mpidr = r.or("mpidr", 0x8000_0000u64)?;
         let cntfrq = r.or("cntfrq", 0u64)?;
         let cntdiv = r.or("cntdiv", 1u64)?;
+        // Which instruction, if either, this board answers PSCI calls on. The
+        // default is `none`, which is the architectural answer for a core with
+        // neither EL2 nor EL3: a board that wants a firmware interface asks
+        // for it, and `a64-mini` never has.
+        let conduit = r.or_enum("psci", "none", psci::Conduit::NAMES)?;
+        let cpus = r.or_range("cpus", 1u64, 1..=256)?;
         // Accepted, and for now only one value is: `ROADMAP.md` §5's example
         // writes `engine = "interp"`, and there is no A64 IR frontend yet.
         let _ = r.or_enum("engine", "interp", &["interp"])?;
@@ -662,11 +803,15 @@ impl Cpu {
         let cfg = Config::by_name(part).ok_or_else(|| {
             Error::Property(alloc::format!("`cpu` names an unknown part `{part}`"))
         })?;
+        let psci = psci::Conduit::by_name(conduit)
+            .ok_or_else(|| Error::Property(alloc::format!("`psci` names `{conduit}`")))?;
         Ok(Cpu::new(Config {
             reset_vector,
             mpidr,
             cntfrq,
             cntdiv,
+            psci,
+            cpus,
             ..cfg
         }))
     }
@@ -854,13 +999,64 @@ impl Cpu {
             session.state = State::new(&cfg);
             session.tlb.flush();
         }
-        let Session { state, tlb, space } = &mut *session;
-        let Some(space) = space.clone() else {
-            return (0, None);
+        let (used, exit) = {
+            let Session { state, tlb, space } = &mut *session;
+            let Some(space) = space.clone() else {
+                return (0, None);
+            };
+            let mut exec = Exec::new(state, tlb, &space, &cfg, &self.lines, exits);
+            let used = exec.step();
+            (used, exec.take_exit())
         };
-        let mut exec = Exec::new(state, tlb, &space, &cfg, &self.lines, exits);
-        let used = exec.step();
-        (used, exec.take_exit())
+        // Everything outward happens **here**, with the execution lock
+        // released. A wire callback reaches another device, that device may
+        // reach back through the bus, and a core that drove a line while
+        // holding its own `BUS`-ranked lock would be the deadlock the ranked
+        // order exists to prevent (`CLAUDE.md`, the re-entrancy contract).
+        drop(session);
+        self.drive_outputs();
+        (used, exit)
+    }
+
+    /// Drive the four output pins from what the last step left behind.
+    ///
+    /// Never called with the session lock held. The timer levels were sampled
+    /// inside the step and stashed in [`Lines`]; the power request was put
+    /// there by a PSCI call.
+    fn drive_outputs(&self) {
+        let routed = self.lines.routed_timers();
+        let power = self.lines.take_power_request();
+        if routed == 0 && power.is_none() {
+            // The common case, and the whole of what an `a64-mini`-shaped
+            // board with no interrupt controller ever does here.
+            return;
+        }
+        let levels = self.lines.timer_level();
+        let pins = self.pins.lock();
+        let (cntp, cntv, poweroff, reboot) = (
+            pins.cntp.clone(),
+            pins.cntv.clone(),
+            pins.poweroff.clone(),
+            pins.reboot.clone(),
+        );
+        drop(pins);
+        if let Some(out) = cntp.filter(|_| routed & Lines::TIMER_PHYS != 0) {
+            out.set(Level::from_bool(levels & Lines::TIMER_PHYS != 0));
+        }
+        if let Some(out) = cntv.filter(|_| routed & Lines::TIMER_VIRT != 0) {
+            out.set(Level::from_bool(levels & Lines::TIMER_VIRT != 0));
+        }
+        // A pulse rather than a level: a request is an event, and the board's
+        // end latches it.
+        let pulse = match power {
+            Some(PowerRequest::Poweroff) => poweroff,
+            Some(PowerRequest::Reboot) => reboot,
+            None => None,
+        };
+        if let Some(out) = pulse {
+            out.set(Level::High);
+            out.set(Level::Low);
+        }
     }
 
     /// Execute until at least `budget` accesses have been charged.
@@ -1071,6 +1267,19 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "which execution engine; only `interp` exists for A64",
         },
+        PropertySpec {
+            name: "psci",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "which instruction the board answers PSCI calls on: \
+                      `smc`, `hvc`, or `none` (default none)",
+        },
+        PropertySpec {
+            name: "cpus",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "how many processors the machine has, for PSCI CPU_ON (default 1)",
+        },
     ],
     construct: |props| Ok(Box::new(Cpu::from_props(props)?)),
 };
@@ -1136,6 +1345,52 @@ impl Device for Cpu {
             sink: pin,
             line: mask.trailing_zeros(),
         })
+    }
+
+    fn connect(&self, port: &str, source: WireSource) -> Result<()> {
+        let mut pins = self.pins.lock();
+        match port {
+            // Taking a timer's output onto a wire also takes it *out* of the
+            // core: the board has an interrupt controller now, and the only
+            // route back in is through it.
+            "cntp" => {
+                pins.cntp = Some(source);
+                self.lines.route_timer(Lines::TIMER_PHYS);
+            }
+            "cntv" => {
+                pins.cntv = Some(source);
+                self.lines.route_timer(Lines::TIMER_VIRT);
+            }
+            "poweroff" => pins.poweroff = Some(source),
+            "reboot" => pins.reboot = Some(source),
+            _ => {
+                return Err(Error::Config {
+                    at: port.to_string(),
+                    message: alloc::format!(
+                        "an AArch64 core drives `cntp` and `cntv` (the generic timer's two \
+                         private peripheral interrupts) and `poweroff` and `reboot` (what a \
+                         PSCI call asks the board for); `{port}` is none of them"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn announce(&self, port: &str) {
+        // A freshly connected timer line has to start at the level the timer
+        // is actually at, or a comparator that was already expired would never
+        // be noticed.
+        if matches!(port, "cntp" | "cntv") {
+            let cfg = self.effective_config();
+            let levels = {
+                let session = self.session.lock();
+                let count = cfg.counter_at(session.state.cycles);
+                session.state.sys.timer_levels(count)
+            };
+            self.lines.set_timer_level(levels);
+            self.drive_outputs();
+        }
     }
 
     fn is_runnable(&self) -> bool {
@@ -1427,10 +1682,18 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("cntfrq", ValueKind::Uint))
         .prop(PropSchema::new("cntdiv", ValueKind::Uint))
         .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
-        // Inputs only: this core drives no line.
+        .prop(PropSchema::new("psci", ValueKind::Str).values(psci::Conduit::NAMES))
+        .prop(PropSchema::new("cpus", ValueKind::Uint).range(1, 256))
         .port("irq", PortDir::In)
         .port("fiq", PortDir::In)
         .port("reset", PortDir::In)
+        // The generic timer's two private peripheral interrupts, for a board
+        // with something to route them to, and what a PSCI call asks the board
+        // for. See `Pins`.
+        .port("cntp", PortDir::Out)
+        .port("cntv", PortDir::Out)
+        .port("poweroff", PortDir::Out)
+        .port("reboot", PortDir::Out)
 }
 
 /// One of the core's interrupt inputs, as something a wire can drive.

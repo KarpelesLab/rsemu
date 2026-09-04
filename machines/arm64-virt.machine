@@ -1,0 +1,269 @@
+# The AArch64 `virt` board — the machine an arm64 Linux kernel is pointed at.
+#
+#   rsemu run arm64-virt --media kernel=Image
+#   rsemu run arm64-virt --media kernel=Image --media initrd=rootfs.cpio \
+#       -p ram=512M -p cmdline="console=ttyAMA0 rdinit=/init"
+#
+# There is no such chip as a "virt". This is the board every AArch64 toolchain
+# and every AArch64 kernel already knows how to target: one core, a GICv2 for
+# interrupts, a PL011 for the console, PSCI for power, and a device tree that
+# says where all of it is. No PCI, no ACPI, no legacy — and no hidden
+# convention, because **the guest learns the whole layout from a device tree
+# rsemu generates from this file** (docs/platforms/arm64-virt.md).
+#
+# The addresses below are not a protocol. Change one and the generated tree
+# changes with it, and the guest follows. They are the conventional AArch64
+# `virt` numbers because familiar addresses are easier to debug, not because
+# anything outside this repository requires them.
+#
+# Sources: the ARM Generic Interrupt Controller Architecture Specification
+# v2.0, the PrimeCell UART (PL011) Technical Reference Manual, the Arm Power
+# State Coordination Interface (DEN 0022), the Arm Architecture Reference
+# Manual (DDI 0487) and the Devicetree Specification v0.4. Each device module
+# cites the sections it used.
+#
+# ---------------------------------------------------------------------------
+# What this board has that `a64-mini` does not
+# ---------------------------------------------------------------------------
+#
+# machines/a64-mini.machine says, correctly, that it has no interrupt
+# controller and that its generic timer therefore goes straight to the core's
+# own `IRQ` without crossing the board. That is the whole difference. Here the
+# timer is a **private peripheral interrupt**: the core drives `cntp` and
+# `cntv` out, the GIC forwards them, and the GIC drives `nIRQ` back. Connecting
+# those two pins is also what takes the timer *out* of the core's internal OR —
+# a core that raised the interrupt both ways would hand a kernel an interrupt
+# its controller never saw, and a kernel answers that by reading `GICC_IAR`,
+# being told 1023, and taking it again forever.
+#
+# ---------------------------------------------------------------------------
+# The kernel is entered at EL1, and PSCI is an assertion
+# ---------------------------------------------------------------------------
+#
+# `cpu.arm.a64` implements EL0 and EL1 and says so in `ID_AA64PFR0_EL1`, so the
+# boot ROM enters the kernel at EL1 rather than at EL2. What a kernel loses by
+# that is the ability to be a hypervisor itself, which a single-core `virt`
+# board was not going to do.
+#
+# `psci = "smc"` on the core below is the board asserting something the ID
+# registers do not: that there is firmware behind `SMC`, even though EL3 is not
+# implemented and `SMC` is therefore architecturally UNDEFINED. That is exactly
+# what a machine with firmware in ROM looks like from EL1. It is a property
+# rather than something the core always does, and `-p psci=none` takes it away
+# and gets the architectural answer back.
+
+machine "arm64-virt" {
+  # Which part the core is. `cortex-a53` is Armv8.0-A with FEAT_CRC32 and
+  # floating point and without FEAT_LSE; `neoverse-n1` is Armv8.2 and has all
+  # three. A kernel built for a baseline arm64 runs on either.
+  param part = "cortex-a53"
+
+  # How much DRAM the board has. A kernel with a ramdisk wants more than this;
+  # `-p ram=1G` is the usual answer.
+  param ram = 512M
+
+  # Where DRAM starts. 0x40000000 is the conventional place for it on an
+  # AArch64 board, with a 1 GiB hole below for devices.
+  param ram-base = 0x40000000
+
+  # Where the kernel is loaded, and where the boot ROM jumps. Written once and
+  # read by both objects at the bottom of this file.
+  #
+  # An AArch64 `Image` asks to sit `text_offset` bytes past a **2 MiB-aligned**
+  # base, and every kernel built in the last decade says `text_offset = 0` --
+  # so a 2 MiB-aligned address is what it wants, and 2 MiB into DRAM is the
+  # lowest one that leaves the bottom of memory alone. An older kernel says
+  # 0x80000 instead; `arm.loader` reads the header, refuses to build, and the
+  # message names the `-p kernel-addr=` that would work.
+  #
+  # A literal rather than `ram-base + 0x200000`, because a `param` default is
+  # resolved before the other parameters exist and arithmetic there has nothing
+  # to reduce -- the expression form works in an object property and not here.
+  # So this is the one number on the board that has to move with `ram-base`,
+  # and `-p ram-base=...` alone is a board that will not boot.
+  param kernel-addr = 0x40200000
+
+  # Where a ramdisk bound to the `initrd` media slot is staged, and what
+  # `/chosen/linux,initrd-start` therefore says. It only means anything when
+  # something is bound to that slot, so the default is a plain address rather
+  # than "off": 128 MiB into DRAM, clear of a kernel that decompresses itself
+  # into the space above where it was loaded.
+  param initrd-addr = 0x48000000
+
+  # The kernel command line, handed over as `/chosen/bootargs`.
+  param cmdline = ""
+
+  # Which character port the console attaches to, so two of these can run in
+  # one process without typing at each other (`-p console=b`).
+  param console = "console"
+
+  # Which named power signal a guest's PSCI request lands on, so two of these
+  # can run in one process without stopping each other.
+  param power = "power"
+
+  # Which instruction the board answers PSCI calls on: `smc`, `hvc` or `none`.
+  # See the note above.
+  param psci = "smc"
+
+  # How fast the core's clock domain runs, and how fast the generic timer's
+  # system counter runs. `cntdiv` is derived from the pair rather than written
+  # down, so the two cannot drift apart -- `cntfrq * cntdiv` is the frequency
+  # of the domain the core is on.
+  param cpu-hz = 1000000000
+  param cntfrq = 62500000
+
+  # -- the crystals ----------------------------------------------------------
+  #
+  # Two, because the board has two. Arm defines no instruction timing at all,
+  # so `sysclk` sets the wall-clock rate and nothing architectural; the
+  # generic timer's counter is an exact integer divisor of it and is therefore
+  # in the same tree (ROADMAP.md 4.2). `uartclk` is the PL011's own reference,
+  # and one tick of it is one opportunity to move a byte between the FIFOs and
+  # the host -- the scheduler is the only thing allowed to decide when.
+  osc sysclk  = cpu-hz Hz
+  osc uartclk = 24000000 Hz
+
+  # -- the bus ---------------------------------------------------------------
+  #
+  # One flat 64-bit physical space. `unassigned` is left at its default of
+  # `fault`, so an access to a hole becomes an external-abort data abort the
+  # guest can see rather than a plausible-looking zero -- an AArch64 core
+  # really does report one, and hiding it would hide our own memory-map bugs.
+  space mem { width = 64 }
+
+  # -- the core --------------------------------------------------------------
+  #
+  # It comes out of reset in the boot ROM at 0, which sets x0 to the device
+  # tree and jumps to `kernel-addr`. AArch64 fixes no reset vector -- it is
+  # `RVBAR_EL1` and IMPLEMENTATION DEFINED -- so zero here is this board's
+  # decision and nothing more.
+  object cpu "cpu.arm.a64" {
+    clock  = sysclk
+    space  = mem
+    engine = "interp"
+    cpu    = part
+    reset  = 0x00000000
+    # "Processor 0 of cluster 0": bit 31 is RES1 and the low byte is Aff0, so
+    # a kernel reading this matches it against the `reg` of `cpu@0`.
+    mpidr  = 0x80000000
+    cntfrq = cntfrq
+    cntdiv = cpu-hz / cntfrq
+    psci   = psci
+    cpus   = 1
+  }
+
+  # -- memory ----------------------------------------------------------------
+  #
+  # Declared before the things that are reset after it, because a cold reset
+  # clears it and the loaders at the bottom of this file must run afterwards.
+  object dram "ram" { size = ram }
+
+  # -- the interrupt controller ---------------------------------------------
+  #
+  # GICv2, which is entirely memory-mapped: a distributor and a CPU interface,
+  # and no system registers. src/dev/arm/gic.rs argues the choice against
+  # GICv3 at length; the short form is that a GICv3 CPU interface would put an
+  # interrupt controller inside the core's `MRS`/`MSR` path.
+  #
+  # 96 shared interrupts is what a board of this shape uses, and makes the
+  # distributor report four interrupt lines' worth of ids.
+  object gic "arm.gic" {
+    cpus = 1
+    spis = 96
+  }
+
+  # -- the console -----------------------------------------------------------
+  #
+  # An ARM PrimeCell PL011, not a 16550: a different register file, a different
+  # interrupt model, and -- the part that bites -- an AMBA peripheral whose
+  # driver reads eight identification registers before it binds.
+  object uart "uart.pl011" {
+    clock    = uartclk / 16
+    port     = console
+    clock-hz = 24000000
+  }
+
+  # -- power -----------------------------------------------------------------
+  #
+  # Where `PSCI_SYSTEM_OFF` lands. It has no registers and no address: PSCI is
+  # an instruction, the core services it, and what leaves the core is a wire.
+  # `signals::open("power")` is the host's end; a headless test watches it
+  # instead of watching a timeout.
+  object pwr "arm.power" { signal = power }
+
+  # -- the reset vector and the device tree ----------------------------------
+  #
+  # Six instructions at zero and, just below them, a device tree generated from
+  # everything above at reset time. `cpus`, `mpidr` and `psci` are declared
+  # here rather than derived because a core is not a region in any address
+  # space, so the generator cannot see one; everything with an address -- every
+  # `reg`, every `interrupts` -- comes out of the realized machine.
+  object boot "arm.boot" {
+    space    = mem
+    entry    = kernel-addr
+    cpus     = 1
+    mpidr    = 0x80000000
+    psci     = psci
+    bootargs = cmdline
+    model    = "rsemu arm64-virt"
+    # What the generated `apb-pclk` fixed clock is rated at. A PL011 is an AMBA
+    # peripheral and its driver enables two clocks before it reads a register,
+    # so a board with no clock node has a console that never probes.
+    apb-clock = 24000000
+    # Described here, placed by the `initrd` loader at the bottom of this file.
+    # The same media slot is named twice on purpose: the length comes out of
+    # the bytes in both places, so the only thing written down twice is the
+    # address, and a wrong one shows up in the generated tree.
+    initrd      = "initrd"
+    initrd-addr = initrd-addr
+  }
+
+  # -- the memory map --------------------------------------------------------
+  map mem 0x00000000 size 64K   = boot      # reset vector, then the DTB
+  map mem 0x08000000 size 4K    = gic.dist  # GICD: enable, priority, target
+  map mem 0x08010000 size 8K    = gic.cpu   # GICC: acknowledge, end of interrupt
+  map mem 0x09000000 size 4K    = uart      # PL011
+  map mem ram-base   size ram   = dram
+
+  # -- interrupts ------------------------------------------------------------
+  #
+  # The GIC source numbers below are the *only* place they are written: the
+  # generated device tree reads each device's `interrupts` property back out of
+  # this wiring, by asking the GIC which interrupt the net landed on.
+  #
+  # `spi1` is architectural interrupt 33 and the tree says `<0 1 4>`; `ppi11`
+  # is interrupt 27 and the tree says `<1 11 0xf08>`. The binding subtracts the
+  # base again, which is the detail that makes a hand-written tree wrong.
+  wire uart.irq   -> gic.spi1
+  wire cpu.cntp   -> gic.ppi14   # the EL1 physical timer
+  wire cpu.cntv   -> gic.ppi11   # the EL1 virtual timer, which a kernel at EL1 uses
+  wire gic.irq0   -> cpu.irq
+  wire cpu.poweroff -> pwr.off
+  wire cpu.reboot   -> pwr.reboot
+  wire pwr.reset    -> cpu.reset
+
+  # -- what gets loaded ------------------------------------------------------
+  #
+  # Last, and that is load-bearing: `Machine::reset` runs devices in
+  # declaration order, a cold reset zeroes `dram`, and a kernel written before
+  # that would be erased by the reset that ends realize.
+  #
+  # `format = "arm64"` makes the loader read the `Image` header and refuse a
+  # kernel that is not one, is big-endian, or wants to be somewhere other than
+  # `kernel-addr`. A `vmlinuz` is not an `Image` and the message says so.
+  object kernel "arm.loader" {
+    space  = mem
+    image  = "kernel"
+    addr   = kernel-addr
+    format = "arm64"
+  }
+
+  # The ramdisk, if one was bound. An unbound slot is empty bytes, and an empty
+  # image loads nothing — so this object costs a machine with no initrd nothing
+  # but the line it is written on.
+  object initrd "arm.loader" {
+    space = mem
+    image = "initrd"
+    addr  = initrd-addr
+  }
+}

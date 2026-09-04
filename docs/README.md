@@ -67,6 +67,7 @@ the question never arises.
 | [`platforms/q35-linux.md`](platforms/q35-linux.md) | The `q35-linux` board: that chipset with no firmware, a kernel entered directly, and an NVMe disk |
 | [`platforms/q35-uefi.md`](platforms/q35-uefi.md) | The `q35-uefi` board: that chipset with two NOR flash banks below 4 GiB, and what a real OVMF does on it |
 | [`platforms/riscv-virt.md`](platforms/riscv-virt.md) | The RISC-V `virt` board |
+| [`platforms/arm64-virt.md`](platforms/arm64-virt.md) | The AArch64 `virt` board: a GICv2, a PL011, PSCI, and a generated device tree |
 | [`platforms/stm32f407.md`](platforms/stm32f407.md) | The `stm32f407` microcontroller board, its peripherals, and how an M-profile interrupt is wired |
 
 ### Buses

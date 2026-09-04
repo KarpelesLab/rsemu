@@ -460,6 +460,15 @@ pub enum Fmt {
     LdStUImm,
     /// `Rt, [Rn|SP{, #simm}]` — `LDUR`/`STUR`.
     LdStUnscaled,
+    /// `Rt, [Rn|SP{, #simm}]` — `LDTR`/`STTR`, the **unprivileged** forms.
+    ///
+    /// The same syntax and the same addressing arithmetic as
+    /// [`Fmt::LdStUnscaled`], and a different *permission check*: executed at
+    /// EL1 they are translated with EL0's permissions, which is how a kernel
+    /// touches a user page and gets a fault rather than a privilege
+    /// escalation. Its own format because that check is the whole of the
+    /// difference and the interpreter has to see it.
+    LdStUnpriv,
     /// `Rt, [Rn|SP], #simm` — post-indexed.
     LdStPost,
     /// `Rt, [Rn|SP, #simm]!` — pre-indexed.
@@ -689,6 +698,7 @@ impl Fmt {
                 | Fmt::AddSubExtS
                 | Fmt::LdStUImm
                 | Fmt::LdStUnscaled
+                | Fmt::LdStUnpriv
                 | Fmt::LdStPost
                 | Fmt::LdStPre
                 | Fmt::LdStRegOff
@@ -741,6 +751,7 @@ impl Fmt {
             self,
             Fmt::LdStUImm
                 | Fmt::LdStUnscaled
+                | Fmt::LdStUnpriv
                 | Fmt::LdStPost
                 | Fmt::LdStPre
                 | Fmt::LdStRegOff
@@ -965,6 +976,30 @@ a64! {
     0xffe00c00 0xf8000000 SturX   "stur"   LdStUnscaled Base "store a doubleword, unscaled offset";
     0xffe00c00 0xf8400000 LdurX   "ldur"   LdStUnscaled Base "load a doubleword, unscaled offset";
     0xffe00c00 0xf8800000 Prfum   "prfum"  LdStUnscaled Base "prefetch memory, unscaled offset";
+
+    // -- unprivileged loads and stores -------------------------------------
+    //
+    // The same addressing mode as the unscaled forms above -- bits 11:10 are
+    // `0b10` here where those have `0b00` -- and a different permission check:
+    // at EL1 the translation uses EL0's permissions. There is no `PRFUM`
+    // equivalent, because a prefetch has no permissions to check.
+    //
+    // A kernel copying to or from a user pointer is built out of these, so a
+    // core without them boots and then dies the first time a process is
+    // started: `__arch_clear_user` is `STTR` in a loop.
+    0xffe00c00 0x38000800 Sttrb   "sttrb"  LdStUnpriv Base "store a byte, unprivileged";
+    0xffe00c00 0x38400800 Ldtrb   "ldtrb"  LdStUnpriv Base "load a zero-extended byte, unprivileged";
+    0xffe00c00 0x38800800 LdtrsbX "ldtrsb" LdStUnpriv Base "load a byte sign-extended to 64 bits, unprivileged";
+    0xffe00c00 0x38c00800 LdtrsbW "ldtrsb" LdStUnpriv Base "load a byte sign-extended to 32 bits, unprivileged";
+    0xffe00c00 0x78000800 Sttrh   "sttrh"  LdStUnpriv Base "store a halfword, unprivileged";
+    0xffe00c00 0x78400800 Ldtrh   "ldtrh"  LdStUnpriv Base "load a zero-extended halfword, unprivileged";
+    0xffe00c00 0x78800800 LdtrshX "ldtrsh" LdStUnpriv Base "load a halfword sign-extended to 64 bits, unprivileged";
+    0xffe00c00 0x78c00800 LdtrshW "ldtrsh" LdStUnpriv Base "load a halfword sign-extended to 32 bits, unprivileged";
+    0xffe00c00 0xb8000800 SttrW   "sttr"   LdStUnpriv Base "store a word, unprivileged";
+    0xffe00c00 0xb8400800 LdtrW   "ldtr"   LdStUnpriv Base "load a word, unprivileged";
+    0xffe00c00 0xb8800800 Ldtrsw  "ldtrsw" LdStUnpriv Base "load a word sign-extended to 64 bits, unprivileged";
+    0xffe00c00 0xf8000800 SttrX   "sttr"   LdStUnpriv Base "store a doubleword, unprivileged";
+    0xffe00c00 0xf8400800 LdtrX   "ldtr"   LdStUnpriv Base "load a doubleword, unprivileged";
 
     // -- Loads and stores: register, post-indexed ---------------------------
     0xffe00c00 0x38000400 StrbPost   "strb"  LdStPost Base "store a byte, post-indexed";

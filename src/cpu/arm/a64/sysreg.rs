@@ -324,6 +324,41 @@ sysregs! {
     3 0  0 7 0 IdAa64Mmfr0  "id_aa64mmfr0_el1" El1Ro "which translation granules and address sizes are supported";
     3 0  0 7 1 IdAa64Mmfr1  "id_aa64mmfr1_el1" El1Ro "further memory-model identification";
     3 0  0 7 2 IdAa64Mmfr2  "id_aa64mmfr2_el1" El1Ro "further memory-model identification";
+    3 0  0 5 0 IdAa64Dfr0   "id_aa64dfr0_el1"  El1Ro "which debug architecture and how many breakpoints";
+
+    // -- the cache hierarchy, which this core does not have ------------------
+    //
+    // A core with no cache still has to answer: an operating system reads
+    // `CLIDR_EL1` to walk the levels and would take an UNDEFINED at the first
+    // one. Zero is the honest answer -- no levels, nothing to select -- and it
+    // is what makes the walk terminate immediately.
+    3 1  0 0 0 Ccsidr       "ccsidr_el1"  El1Ro "the geometry of the cache CSSELR_EL1 selects";
+    3 1  0 0 1 Clidr        "clidr_el1"   El1Ro "how many cache levels there are, and of what kind";
+    3 1  0 0 7 Aidr         "aidr_el1"    El1Ro "implementation-defined identification";
+    3 2  0 0 0 Csselr       "csselr_el1"  El1Rw "which cache CCSIDR_EL1 describes";
+
+    // -- address translation -------------------------------------------------
+    3 0  7 4 0 Par          "par_el1"     El1Rw "the result of an AT instruction";
+
+    // -- the performance monitors, which this core does not have -------------
+    3 3  9 14 0 PmuserenrEl0 "pmuserenr_el0" El1Rw "what EL0 may reach of the performance monitors";
+
+    // -- debug ---------------------------------------------------------------
+    //
+    // Enough of the block for an operating system's debug initialisation to
+    // run: it reads the OS lock, clears it, and probes one breakpoint and one
+    // watchpoint because `ID_AA64DFR0_EL1` says there is one of each. None of
+    // it does anything -- there is no debug logic behind these -- and the
+    // registers are storage-free for that reason, which a guest can tell by
+    // reading back a zero it did not write.
+    2 0  0 0 4 Dbgbvr0      "dbgbvr0_el1" El1Rw "breakpoint 0's value";
+    2 0  0 0 5 Dbgbcr0      "dbgbcr0_el1" El1Rw "breakpoint 0's control";
+    2 0  0 0 6 Dbgwvr0      "dbgwvr0_el1" El1Rw "watchpoint 0's value";
+    2 0  0 0 7 Dbgwcr0      "dbgwcr0_el1" El1Rw "watchpoint 0's control";
+    2 0  1 0 4 Oslar        "oslar_el1"   El1Rw "the OS lock, which software takes and releases";
+    2 0  1 1 4 Oslsr        "oslsr_el1"   El1Ro "whether the OS lock is taken";
+    2 0  1 3 4 Osdlr        "osdlr_el1"   El1Rw "the OS double lock";
+    2 3  0 1 0 MdccsrEl0    "mdccsr_el0"  El0Ro "the debug communications channel's status";
     3 3  0 0 1 Ctr          "ctr_el0"          AllRo "cache type: the line sizes software must respect";
     3 3  0 0 7 Dczid        "dczid_el0"        AllRo "the block size DC ZVA operates on, and whether it is allowed";
 
@@ -393,6 +428,29 @@ sysregs! {
 
     // -- debug ---------------------------------------------------------------
     2 0  0 2 2 Mdscr        "mdscr_el1"   El1Rw "the debug system control register";
+}
+
+/// Whether `enc` is in the AArch64 **identification** space.
+///
+/// `op0 == 3, op1 == 0, CRn == 0`: the sixty-four encodings at
+/// `CRm` 0-7, `op2` 0-7 that DDI 0487 reserves for feature identification.
+/// Every one of them is architecturally readable at EL1, and the ones no
+/// architecture version has allocated are **RES0 and read as zero** rather
+/// than UNDEFINED.
+///
+/// That rule is not a convenience. An operating system's feature detection
+/// reads the whole block unconditionally, because a register that reads zero
+/// is how the architecture says "this extension is absent" — so a core that
+/// raised UNDEFINED for an encoding it had never heard of would take an
+/// exception during boot for every extension invented after it was written,
+/// and would need a new row in the table each time one was. Reading as zero is
+/// the architecture's own answer and the one that does not age.
+#[must_use]
+pub const fn is_id_space(enc: u16) -> bool {
+    let op0 = (enc >> 14) & 3;
+    let op1 = (enc >> 11) & 7;
+    let crn = (enc >> 7) & 15;
+    op0 == 3 && op1 == 0 && crn == 0
 }
 
 /// Look a system register up by its `op0:op1:CRn:CRm:op2` encoding.
@@ -702,16 +760,40 @@ impl SysRegs {
 
     /// Whether either EL1 timer is asserting its interrupt at `count`.
     ///
-    /// One function because the two timers are wired together here. On a real
-    /// SoC they are two private peripheral interrupts a GIC forwards
-    /// separately (PPI 30 and PPI 27); this core has no GIC, so both land on
-    /// the same internal `IRQ` and a handler tells them apart by reading
-    /// `ISTATUS`, exactly as it would with a shared line.
+    /// One function because on a board with nothing to route them the two
+    /// timers are wired together: both land on the same internal `IRQ` and a
+    /// handler tells them apart by reading `ISTATUS`, exactly as it would with
+    /// a shared line. `machines/a64-mini.machine` is that board.
+    ///
+    /// On a board with a GIC they are two *separate* private peripheral
+    /// interrupts (PPI 30 and PPI 27), the core drives them out on wires, and
+    /// this internal OR must exclude whichever ones left — see
+    /// [`timer_levels`](SysRegs::timer_levels) and `Lines::route_timer`.
     #[inline]
     #[must_use]
     pub const fn timer_irq(&self, count: u64) -> bool {
         timer_output(self.cntp_ctl, self.cntp_cval, count)
             || timer_output(self.cntv_ctl, self.cntv_cval, count)
+    }
+
+    /// What each of the two EL1 timers' outputs is doing at `count`, as a bit
+    /// each: bit 0 is the physical timer and bit 1 the virtual one.
+    ///
+    /// The bit positions are `Lines::TIMER_PHYS` and `Lines::TIMER_VIRT`. They
+    /// are written as literals here rather than named because `sysreg` is the
+    /// register file and knows nothing about the device wrapper around it; the
+    /// pairing is asserted by a test in `mod.rs`.
+    #[inline]
+    #[must_use]
+    pub const fn timer_levels(&self, count: u64) -> u64 {
+        let mut out = 0;
+        if timer_output(self.cntp_ctl, self.cntp_cval, count) {
+            out |= 1;
+        }
+        if timer_output(self.cntv_ctl, self.cntv_cval, count) {
+            out |= 2;
+        }
+        out
     }
 
     /// Whether an EL0 access to `spec` is one `CNTKCTL_EL1` permits.
