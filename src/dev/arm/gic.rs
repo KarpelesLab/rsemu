@@ -64,8 +64,8 @@
 //! [`BindCtx::peer`](crate::machine::BindCtx::peer), which exists for exactly
 //! this. `pc.lapic` does the identical thing for the architectural local-APIC
 //! page and `core::space` needed no change for either. See
-//! [`Registers::cpu_of`] for what an access from something that is *not* a
-//! processor gets.
+//! `Registers::cpu_of` (private) for what an access from something that is
+//! *not* a processor gets.
 //!
 //! # Why the generic timer arrives here at all
 //!
