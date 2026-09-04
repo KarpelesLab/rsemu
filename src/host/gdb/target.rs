@@ -27,6 +27,12 @@
 //! a `$pc` are already in the same space. [`MachineTarget::read_physical`] is
 //! the deliberate way out for a caller that really does mean a bus address.
 //!
+//! **A write is not only a write.** Guest memory a debugger changes may be
+//! *code*, and on a translating engine there may be a compiled block standing
+//! behind it. `MachineTarget::invalidate_translations` is where that is
+//! answered, and its docs have the measurement — without it a `gdb` patch into
+//! a hot loop is executed a few times in forty and ignored the rest.
+//!
 //! **Attaching stops the world.** The machine advances only inside
 //! [`DebugTarget::resume`] and [`DebugTarget::step`], both of which are called
 //! from the same thread that services packets and never while a packet is being
@@ -46,7 +52,7 @@ use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
 use crate::core::state::{ChunkReader, MachineShape, StateReader, StateWriter};
 use crate::machine::Machine;
 
-use super::arch::Arch;
+use super::arch::{Arch, RegDesc};
 
 /// Attributes for every access a debugger makes.
 ///
@@ -482,6 +488,7 @@ impl<'a> MachineTarget<'a> {
                 .write_bytes(addr, src, debug_attrs(entry.requester))
                 .map_err(|_| TargetError::Fault)?;
         }
+        self.invalidate_translations();
         self.resync_watchpoints();
         Ok(())
     }
@@ -637,6 +644,14 @@ impl<'a> MachineTarget<'a> {
             .regs
             .get(cpu.arch.pc)
             .ok_or(TargetError::NoSuchRegister)?;
+        // Every core in the tree keeps its program counter at a fixed offset,
+        // so the hook is asked only for form's sake — but a map that ever put
+        // one behind a variable-length field would otherwise read the wrong
+        // eight bytes on every tick of a breakpoint-checking run.
+        if let Some(answer) = cpu.arch.read_computed(&chunk, cpu.arch.pc) {
+            let bytes = answer.ok_or(TargetError::NoSuchRegister)?;
+            return Self::field(&bytes, 0, bytes.len());
+        }
         Self::field(&chunk, reg.offset, reg.bytes)
     }
 
@@ -724,6 +739,54 @@ impl<'a> MachineTarget<'a> {
             }
         }
         Ok(hit)
+    }
+
+    /// Tell every CPU that guest memory changed under it.
+    ///
+    /// **A debugger that writes code has to say so, or the guest keeps running
+    /// the old instructions.** A core on `engine = "jit"` caches blocks lifted
+    /// from guest memory and drops them again when a *guest* store lands in
+    /// the page they came from — `jit::cache`'s `note_write`, driven from the
+    /// core's own execution path. A write from here does not go through that
+    /// path: it goes straight at the address space, so nothing notices, and
+    /// the cached block outlives the bytes it was lifted from. Measured on
+    /// `cpu.riscv` with a four-instruction loop, a `gdb` patch one instruction
+    /// into a hot block was executed forty times out of twenty-five thousand
+    /// — the interpreter's share of the run — and ignored the rest.
+    ///
+    /// The route out is the one seam that already exists between this file and
+    /// a `dyn Device`: `save` followed by `load`. Restoring a snapshot is
+    /// *defined* to discard derived state (`ROADMAP.md` §4.5), and every core
+    /// implements it that way for exactly this reason — `cpu.x86`'s `load`
+    /// opens with "guest memory is about to be replaced wholesale by the rest
+    /// of the restore, and a block cache filled from the old RAM describes a
+    /// machine that no longer exists". A debugger write is a smaller version
+    /// of the same event, so it gets the same answer. The chunk that goes back
+    /// in is the one that just came out, so the architectural state is
+    /// unchanged by construction, and the round trip is what a `P` packet
+    /// already does on every register write.
+    ///
+    /// It is a bigger hammer than the page-granular `note_write` a core uses
+    /// on itself, and deliberately: this file cannot see which pages a core
+    /// lifted from, and a debugger write is not a hot path. What it costs is
+    /// one `save`/`load` per CPU per `M` or `X` packet.
+    ///
+    /// **Known gap.** `cpu.arm.a64`'s `load` flushes its TLB but not its block
+    /// cache, so this does not reach it — the same omission also means a
+    /// snapshot restored into a warm AArch64 core keeps stale translations,
+    /// which is the more serious half. `cpu.riscv` and `cpu.x86` both flush.
+    /// The fix belongs in that core, next to the `jit.flush()` its `reset` is
+    /// also missing.
+    fn invalidate_translations(&mut self) {
+        for index in 0..self.cpus.len() {
+            let Ok(cpu) = self.cpu(index) else { continue };
+            // A core whose chunk this build cannot decode is left alone: it is
+            // already refusing every register access, and handing its own
+            // bytes back to it would be the one operation that could not be
+            // checked first.
+            let Ok(chunk) = self.chunk(cpu) else { continue };
+            let _ = self.set_chunk(index, &chunk);
+        }
     }
 
     /// Refresh every shadow without reporting a hit.
@@ -961,11 +1024,17 @@ impl DebugTarget for MachineTarget<'_> {
         let entry = self.cpu(cpu)?;
         let chunk = self.chunk(entry)?;
         let mut out = Vec::with_capacity(entry.arch.packet_len());
-        for reg in entry.arch.regs {
-            let slice = chunk
-                .get(reg.offset..reg.offset + reg.bytes)
-                .ok_or(TargetError::NoSuchRegister)?;
-            out.extend_from_slice(slice);
+        for (index, reg) in entry.arch.regs.iter().enumerate() {
+            match entry.arch.read_computed(&chunk, index) {
+                Some(Some(bytes)) => out.extend_from_slice(&bytes),
+                Some(None) => return Err(TargetError::NoSuchRegister),
+                None => {
+                    let slice = chunk
+                        .get(reg.offset..reg.offset + reg.bytes)
+                        .ok_or(TargetError::NoSuchRegister)?;
+                    out.extend_from_slice(slice);
+                }
+            }
         }
         Ok(out)
     }
@@ -975,15 +1044,41 @@ impl DebugTarget for MachineTarget<'_> {
         if data.len() != entry.arch.packet_len() {
             return Err(TargetError::NoSuchRegister);
         }
+        let arch = entry.arch;
         let mut chunk = self.chunk(entry)?;
+        // A register that *selects where another one lives* has to go in
+        // first, whatever order the packet has them in — `Computed::selects`
+        // names them, and AArch64's `cpsr`/`sp` pair is why. So the write is
+        // two passes: everything but the selected-into registers, then those.
+        let selects: &[usize] = arch.computed.map_or(&[], |c| c.selects);
+        let mut later: Vec<(usize, usize, usize)> = Vec::new();
         let mut at = 0usize;
-        for reg in entry.arch.regs {
+        for (index, reg) in arch.regs.iter().enumerate() {
             let src = data.get(at..at + reg.bytes).ok_or(TargetError::Fault)?;
-            let dst = chunk
-                .get_mut(reg.offset..reg.offset + reg.bytes)
-                .ok_or(TargetError::Fault)?;
-            dst.copy_from_slice(src);
             at += reg.bytes;
+            // A computed register that is not itself a selector waits for the
+            // second pass. `RegDesc::COMPUTED` is what marks one, and it is
+            // the same marker `Arch::chunk_reach` reads.
+            if reg.offset == RegDesc::COMPUTED && !selects.is_empty() && !selects.contains(&index) {
+                later.push((index, at - reg.bytes, reg.bytes));
+                continue;
+            }
+            match arch.write_computed(&mut chunk, index, src) {
+                Some(true) => {}
+                Some(false) => return Err(TargetError::NoSuchRegister),
+                None => {
+                    let dst = chunk
+                        .get_mut(reg.offset..reg.offset + reg.bytes)
+                        .ok_or(TargetError::Fault)?;
+                    dst.copy_from_slice(src);
+                }
+            }
+        }
+        for (index, at, bytes) in later {
+            let src = data.get(at..at + bytes).ok_or(TargetError::Fault)?;
+            if arch.write_computed(&mut chunk, index, src) != Some(true) {
+                return Err(TargetError::NoSuchRegister);
+            }
         }
         self.set_chunk(cpu, &chunk)
     }
@@ -996,6 +1091,9 @@ impl DebugTarget for MachineTarget<'_> {
             .get(index)
             .ok_or(TargetError::NoSuchRegister)?;
         let chunk = self.chunk(entry)?;
+        if let Some(answer) = entry.arch.read_computed(&chunk, index) {
+            return answer.ok_or(TargetError::NoSuchRegister);
+        }
         chunk
             .get(reg.offset..reg.offset + reg.bytes)
             .map(<[u8]>::to_vec)
@@ -1012,11 +1110,18 @@ impl DebugTarget for MachineTarget<'_> {
         if data.len() != reg.bytes {
             return Err(TargetError::NoSuchRegister);
         }
+        let arch = entry.arch;
         let mut chunk = self.chunk(entry)?;
-        let dst = chunk
-            .get_mut(reg.offset..reg.offset + reg.bytes)
-            .ok_or(TargetError::Fault)?;
-        dst.copy_from_slice(data);
+        match arch.write_computed(&mut chunk, index, data) {
+            Some(true) => {}
+            Some(false) => return Err(TargetError::NoSuchRegister),
+            None => {
+                let dst = chunk
+                    .get_mut(reg.offset..reg.offset + reg.bytes)
+                    .ok_or(TargetError::Fault)?;
+                dst.copy_from_slice(data);
+            }
+        }
         self.set_chunk(cpu, &chunk)
     }
 
@@ -1043,6 +1148,7 @@ impl DebugTarget for MachineTarget<'_> {
                     .map_err(|_| TargetError::Fault)?;
             }
         }
+        self.invalidate_translations();
         self.resync_watchpoints();
         Ok(())
     }

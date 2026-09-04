@@ -21,6 +21,18 @@
 //! in `tests/gdb_session.rs`; a GDB built with a port for that CPU) drives the
 //! whole session.
 //!
+//! # Naming a feature `org.gnu.gdb.*` is a promise
+//!
+//! A feature called `org.gnu.gdb.<arch>.core` is a claim that it contains
+//! exactly the registers GDB's gdbarch for that architecture expects, in its
+//! order and at its widths. Most maps below cannot make that claim and use an
+//! `org.rsemu.*` name instead, which is why GDB rejects their descriptions and
+//! falls back to a built-in layout. [`A64`] **can**: GDB's AArch64 gdbarch
+//! wants `x0`-`x30`, `sp`, `pc` and `cpsr` and nothing else in that feature,
+//! which is precisely what `cpu.arm.a64` has, so it claims the name and the
+//! `<architecture>` with it and the description is accepted. That is the shape
+//! to aim at; `org.rsemu.*` is the honest fallback, not the house style.
+//!
 //! # Where the register values come from
 //!
 //! There is **no route from a `dyn Device` to a concrete CPU type**:
@@ -31,6 +43,14 @@
 //! excluded. So a register here is a byte offset into that chunk, and reading
 //! the register file is [`Device::save`](crate::core::device::Device::save) into a scratch chunk; writing it is
 //! [`Device::load`](crate::core::device::Device::load) of a patched one.
+//!
+//! A chunk is flat little-endian, so for almost everything a register is a
+//! slice of it and an offset is the whole story. Two things break that and
+//! [`Computed`] is the answer to both: a **banked** register, where which
+//! bytes are the register depends on the value of another one, and a register
+//! **assembled** out of several fields — AArch64's `SP` and `PSTATE`
+//! respectively. On that core they also sit behind a *variable-length* field,
+//! so the arithmetic that would find them is not constant either.
 //!
 //! That is a seam, and it is marked as one. The layout of a chunk is private to
 //! the core that wrote it, so each entry records the class state **version** its
@@ -91,6 +111,18 @@ pub struct RegDesc {
 }
 
 impl RegDesc {
+    /// The offset of a register whose bytes are **not** a fixed slice of the
+    /// chunk, and which [`Computed`] answers for instead.
+    ///
+    /// Two things in the tree need it. `cpu.arm.a64`'s `SP` is one of two
+    /// banked registers chosen by `PSTATE`, and its `PSTATE` is assembled out
+    /// of four separate fields; and both of them sit *after* a field whose
+    /// width depends on the value in it (the exclusive monitor's address is
+    /// written only when the monitor is armed), so even the arithmetic that
+    /// would find them is not constant. A sentinel rather than an `Option` in
+    /// the struct, so that the ordinary entries below keep reading as tables.
+    pub const COMPUTED: usize = usize::MAX;
+
     /// A general-purpose integer register.
     ///
     /// Every call site sits behind a `cpu-*` feature, so this is genuinely
@@ -125,6 +157,70 @@ pub struct RetireCounter {
     pub bytes: usize,
 }
 
+/// What a [`Computed`] hook did with a register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// Not this hook's business: the register is an ordinary slice of the
+    /// chunk at [`RegDesc::offset`].
+    Slice,
+    /// Answered.
+    Done,
+    /// The hook is the right one and refused — a `PSTATE` naming an exception
+    /// level this core does not have, say. The stub replies `E22` rather than
+    /// writing something the core would reject on `load`.
+    Refused,
+}
+
+/// How a core answers for a register a byte offset cannot name.
+///
+/// The register map is a table of byte offsets into a snapshot chunk, and for
+/// almost everything that is enough: a chunk is flat little-endian, so a
+/// register is a slice. Two things break it, and both are AArch64's:
+///
+/// * a **banked** register — `SP` is `SP_EL0` or `SP_EL1` depending on
+///   `PSTATE.EL` and `PSTATE.SPSel`, so which slice it is depends on the
+///   contents of another one;
+/// * an **assembled** register — AArch64 has no `PSTATE` field; gdb's `cpsr`
+///   is `NZCV`, `DAIF`, `EL` and `SPSel` composed into one word, which is
+///   four slices rather than none.
+///
+/// And on that core they sit behind a **variable-length field**: the exclusive
+/// monitor writes its address only when it is armed, so everything after it
+/// moves by eight bytes depending on a byte. `reach` is therefore a function
+/// of the chunk too.
+///
+/// A hook returning [`Access::Slice`] leaves the register to its static
+/// offset, so a map only writes the entries it has to.
+#[derive(Debug)]
+pub struct Computed {
+    /// Append register `index`'s little-endian bytes to `out`.
+    pub read: fn(chunk: &[u8], index: usize, out: &mut Vec<u8>) -> Access,
+    /// Patch register `index` into `chunk` from `data`.
+    pub write: fn(chunk: &mut [u8], index: usize, data: &[u8]) -> Access,
+    /// The shortest chunk this map can decode at all.
+    ///
+    /// A constant rather than a function of the chunk: it is the *minimum*
+    /// over every value the variable-length fields can take, so a chunk that
+    /// reaches it is long enough for the hooks to look at the bytes that say
+    /// how long it really is.
+    pub reach: usize,
+    /// Computed registers that **select where the others live**, and so have
+    /// to be written before them.
+    ///
+    /// A whole-register-file write (`G`) hands over every register at once, in
+    /// `g`-packet order, and that order is GDB's rather than this map's: on
+    /// AArch64 `sp` is register 31 and the `cpsr` that says which of the two
+    /// banked stack pointers `sp` *is* is register 33. Writing them in the
+    /// packet's order would put the user's stack pointer in the bank the old
+    /// `PSTATE` selected and then change the selection, so `G` would appear to
+    /// lose it — and a "fix" that simply wrote it twice would have changed
+    /// both banks, which is two registers the user did not ask for.
+    ///
+    /// So the write is ordered instead: everything named here goes in first.
+    /// Empty for a map whose computed registers do not interact.
+    pub selects: &'static [usize],
+}
+
 /// Everything the stub needs to debug one kind of CPU.
 #[derive(Debug)]
 pub struct Arch {
@@ -153,6 +249,9 @@ pub struct Arch {
     pub pc: usize,
     /// The instruction-retirement signal, if this core has one.
     pub retire: Option<RetireCounter>,
+    /// The hook for registers [`RegDesc::COMPUTED`] marks, if this map has
+    /// any.
+    pub computed: Option<&'static Computed>,
 }
 
 impl Arch {
@@ -170,12 +269,44 @@ impl Arch {
         let regs = self
             .regs
             .iter()
+            .filter(|r| r.offset != RegDesc::COMPUTED)
             .map(|r| r.offset + r.bytes)
             .max()
             .unwrap_or(0);
-        match self.retire {
+        let regs = match self.retire {
             Some(c) => regs.max(c.offset + c.bytes),
             None => regs,
+        };
+        match self.computed {
+            Some(c) => regs.max(c.reach),
+            None => regs,
+        }
+    }
+
+    /// Read register `index`, if a hook owns it.
+    ///
+    /// `None` means the caller should take [`RegDesc::offset`]'s slice, which
+    /// is the answer for every register on every core but one.
+    #[must_use]
+    pub fn read_computed(&self, chunk: &[u8], index: usize) -> Option<Option<Vec<u8>>> {
+        let hook = self.computed?;
+        let mut out = Vec::new();
+        match (hook.read)(chunk, index, &mut out) {
+            Access::Slice => None,
+            Access::Done => Some(Some(out)),
+            Access::Refused => Some(None),
+        }
+    }
+
+    /// Write register `index`, if a hook owns it. See
+    /// [`read_computed`](Arch::read_computed).
+    #[must_use]
+    pub fn write_computed(&self, chunk: &mut [u8], index: usize, data: &[u8]) -> Option<bool> {
+        let hook = self.computed?;
+        match (hook.write)(chunk, index, data) {
+            Access::Slice => None,
+            Access::Done => Some(true),
+            Access::Refused => Some(false),
         }
     }
 
@@ -245,6 +376,8 @@ static ALL: &[&Arch] = &[
     &Z80,
     #[cfg(feature = "cpu-arm-aprofile")]
     &ARM,
+    #[cfg(feature = "cpu-arm-a64")]
+    &A64,
     #[cfg(feature = "cpu-riscv")]
     &RISCV,
     #[cfg(feature = "cpu-x86")]
@@ -296,6 +429,7 @@ pub static MOS6502: Arch = Arch {
         offset: 7,
         bytes: 8,
     }),
+    computed: None,
 };
 
 // -- Zilog Z80 --------------------------------------------------------------
@@ -349,6 +483,7 @@ pub static Z80: Arch = Arch {
         offset: 35,
         bytes: 8,
     }),
+    computed: None,
 };
 
 // -- ARMv5TE ----------------------------------------------------------------
@@ -399,6 +534,7 @@ pub static ARM: Arch = Arch {
         offset: 176,
         bytes: 8,
     }),
+    computed: None,
 };
 
 // -- RISC-V -----------------------------------------------------------------
@@ -457,6 +593,7 @@ pub static RISCV: Arch = Arch {
         offset: 520,
         bytes: 8,
     }),
+    computed: None,
 };
 
 // -- Intel 8086 -------------------------------------------------------------
@@ -548,6 +685,260 @@ pub static I8086: Arch = Arch {
         offset: 64,
         bytes: 8,
     }),
+    computed: None,
+};
+
+// -- AArch64 ----------------------------------------------------------------
+
+/// Where `cpu.arm.a64`'s chunk stops being a table of constants.
+///
+/// `src/cpu/arm/a64/mod.rs`'s `save` writes, in order: `x[0..31]` as `u64`,
+/// the thirty-two SIMD&FP registers as a low and a high `u64` each, `pc`,
+/// `cycles`, `debt`, `faults`, a `wfi` byte, then the exclusive monitor — one
+/// byte saying whether it is armed, **followed by an eight-byte address only
+/// when it is**. Everything after that moves.
+///
+/// So: `x` at `0`, the vectors at `248`, `pc` at `760` and `cycles` at `768`
+/// are constants and are written as offsets in the table; `SP` and `PSTATE`
+/// are behind the hole and are [`RegDesc::COMPUTED`].
+#[cfg(feature = "cpu-arm-a64")]
+mod a64_layout {
+    /// The byte saying whether the exclusive monitor is armed.
+    pub(super) const EXCLUSIVE_TAG: usize = 793;
+    /// The first byte after the monitor when it is *not* armed.
+    pub(super) const AFTER_MONITOR: usize = 794;
+    /// What being armed adds to every offset from here on.
+    pub(super) const MONITOR_ADDR: usize = 8;
+    /// `PSTATE.NZCV`, as a `u32`, relative to the end of the monitor.
+    pub(super) const NZCV: usize = 0;
+    /// `PSTATE.DAIF`, as a `u64`.
+    pub(super) const DAIF: usize = 4;
+    /// `PSTATE.EL`, as one byte: `0` for EL0, `1` for EL1.
+    pub(super) const EL: usize = 12;
+    /// `PSTATE.SPSel`, as one byte.
+    pub(super) const SPSEL: usize = 13;
+    /// The thirty system-register words, of which `SP_EL0` is the first and
+    /// `SP_EL1` the second.
+    pub(super) const SYSREGS: usize = 14;
+    /// How many of those words there are; the interrupt lines follow them.
+    pub(super) const SYSREG_WORDS: usize = 30;
+    /// The shortest chunk this map can decode: the whole thing with the
+    /// monitor disarmed, up to and including the interrupt lines.
+    pub(super) const MIN_REACH: usize = AFTER_MONITOR + SYSREGS + SYSREG_WORDS * 8 + 8;
+
+    /// Where the fields after the exclusive monitor start, for this chunk.
+    ///
+    /// `None` when the chunk is too short to hold the byte that says.
+    pub(super) fn base(chunk: &[u8]) -> Option<usize> {
+        let armed = *chunk.get(EXCLUSIVE_TAG)? != 0;
+        Some(AFTER_MONITOR + if armed { MONITOR_ADDR } else { 0 })
+    }
+
+    /// Whether `SP` currently names `SP_EL1` rather than `SP_EL0`.
+    ///
+    /// DDI 0487 D1: at EL0 the stack pointer is always `SP_EL0` whatever
+    /// `SPSel` says. The core's own `SysRegs::sp_is_el1` is the same rule; it
+    /// is repeated rather than called because there is no route from a
+    /// `dyn Device` to it.
+    pub(super) fn sp_is_el1(chunk: &[u8], base: usize) -> Option<bool> {
+        let el = *chunk.get(base + EL)?;
+        let spsel = *chunk.get(base + SPSEL)?;
+        Some(el == 1 && spsel != 0)
+    }
+
+    /// Where the selected stack pointer lives in this chunk.
+    pub(super) fn sp_offset(chunk: &[u8], base: usize) -> Option<usize> {
+        let bank = usize::from(sp_is_el1(chunk, base)?);
+        Some(base + SYSREGS + bank * 8)
+    }
+}
+
+/// `x0`-`x30`, `sp`, `pc`, `cpsr`: gdb's `org.gnu.gdb.aarch64.core`, in gdb's
+/// order.
+#[cfg(feature = "cpu-arm-a64")]
+static A64_REGS: [RegDesc; 34] = a64_regs();
+
+#[cfg(feature = "cpu-arm-a64")]
+const fn a64_regs() -> [RegDesc; 34] {
+    const NAMES: [&str; 31] = [
+        "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+        "x14", "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26",
+        "x27", "x28", "x29", "x30",
+    ];
+    let mut out = [RegDesc::int("cpsr", 4, RegDesc::COMPUTED); 34];
+    let mut i = 0;
+    while i < 31 {
+        out[i] = RegDesc::int(NAMES[i], 8, i * 8);
+        i += 1;
+    }
+    out[31] = RegDesc {
+        name: "sp",
+        bytes: 8,
+        offset: RegDesc::COMPUTED,
+        ty: RegType::DataPtr,
+    };
+    out[32] = RegDesc {
+        name: "pc",
+        bytes: 8,
+        offset: 760,
+        ty: RegType::CodePtr,
+    };
+    out
+}
+
+/// `SP` and `PSTATE`, which no byte offset can name. See [`Computed`].
+#[cfg(feature = "cpu-arm-a64")]
+static A64_COMPUTED: Computed = Computed {
+    read: a64_read,
+    write: a64_write,
+    reach: a64_layout::MIN_REACH,
+    // `cpsr` is register 33 and selects which bank `sp` (31) names, so it goes
+    // in first whatever order the packet has them in.
+    selects: &[33],
+};
+
+/// A little-endian field of a chunk, widened.
+#[cfg(feature = "cpu-arm-a64")]
+fn field(chunk: &[u8], offset: usize, bytes: usize) -> Option<u64> {
+    let slice = chunk.get(offset..offset.checked_add(bytes)?)?;
+    let mut value = 0u64;
+    for (i, byte) in slice.iter().enumerate() {
+        value |= u64::from(*byte) << (i * 8);
+    }
+    Some(value)
+}
+
+/// `PSTATE` as gdb's `cpsr`, and the selected stack pointer.
+///
+/// The `cpsr` encoding is the one an exception would save in `SPSR_EL1`
+/// (DDI 0487 D1.11): `NZCV` at 31:28, `DAIF` at 9:6, `M[4]` clear for AArch64
+/// and `M[3:0]` naming the level and the stack pointer — `0b0000` for EL0t,
+/// `0b0100` for EL1t, `0b0101` for EL1h. That is what gdb's AArch64 gdbarch
+/// decodes, and it is what the core's own `SysRegs::spsr` composes.
+#[cfg(feature = "cpu-arm-a64")]
+fn a64_read(chunk: &[u8], index: usize, out: &mut Vec<u8>) -> Access {
+    use a64_layout as l;
+    let Some(base) = l::base(chunk) else {
+        return Access::Refused;
+    };
+    match index {
+        31 => match l::sp_offset(chunk, base).and_then(|at| field(chunk, at, 8)) {
+            Some(sp) => {
+                out.extend_from_slice(&sp.to_le_bytes());
+                Access::Done
+            }
+            None => Access::Refused,
+        },
+        33 => {
+            let (Some(nzcv), Some(daif), Some(el), Some(el1)) = (
+                field(chunk, base + l::NZCV, 4),
+                field(chunk, base + l::DAIF, 8),
+                field(chunk, base + l::EL, 1),
+                l::sp_is_el1(chunk, base),
+            ) else {
+                return Access::Refused;
+            };
+            // `DAIF` is masked to its four bits rather than trusted whole: the
+            // chunk holds the core's own field and this is the register gdb
+            // will write back.
+            let pstate = (nzcv & 0xf000_0000) | (daif & 0x3c0) | (el << 2) | u64::from(el1);
+            out.extend_from_slice(&(pstate as u32).to_le_bytes());
+            Access::Done
+        }
+        _ => Access::Slice,
+    }
+}
+
+/// The inverse of [`a64_read`].
+///
+/// A `PSTATE` whose `M[3:0]` names AArch32 or an exception level this core
+/// does not have is **refused**, exactly as the core's own `restore_pstate`
+/// refuses it: writing the byte anyway would produce a chunk whose `load`
+/// fails, and a failing `load` is a debugger that corrupted the machine.
+#[cfg(feature = "cpu-arm-a64")]
+fn a64_write(chunk: &mut [u8], index: usize, data: &[u8]) -> Access {
+    use a64_layout as l;
+    let Some(base) = l::base(chunk) else {
+        return Access::Refused;
+    };
+    match index {
+        31 => {
+            let (Some(at), Ok(value)) = (l::sp_offset(chunk, base), <[u8; 8]>::try_from(data))
+            else {
+                return Access::Refused;
+            };
+            match chunk.get_mut(at..at + 8) {
+                Some(slot) => {
+                    slot.copy_from_slice(&value);
+                    Access::Done
+                }
+                None => Access::Refused,
+            }
+        }
+        33 => {
+            let Ok(bytes) = <[u8; 4]>::try_from(data) else {
+                return Access::Refused;
+            };
+            let pstate = u32::from_le_bytes(bytes);
+            let (el, spsel) = match pstate & 0x1f {
+                0b0_0000 => (0u8, 0u8),
+                0b0_0100 => (1, 0),
+                0b0_0101 => (1, 1),
+                // `M[4]` set is a return to AArch32, and anything else names
+                // EL2 or EL3. Neither exists on this core.
+                _ => return Access::Refused,
+            };
+            let nzcv = pstate & 0xf000_0000;
+            let daif = u64::from(pstate & 0x3c0);
+            let ok = (|| {
+                chunk
+                    .get_mut(base + l::NZCV..base + l::NZCV + 4)?
+                    .copy_from_slice(&nzcv.to_le_bytes());
+                chunk
+                    .get_mut(base + l::DAIF..base + l::DAIF + 8)?
+                    .copy_from_slice(&daif.to_le_bytes());
+                *chunk.get_mut(base + l::EL)? = el;
+                *chunk.get_mut(base + l::SPSEL)? = spsel;
+                Some(())
+            })();
+            match ok {
+                Some(()) => Access::Done,
+                None => Access::Refused,
+            }
+        }
+        _ => Access::Slice,
+    }
+}
+
+/// The AArch64 core.
+///
+/// The one map in this file that claims an `org.gnu.gdb.*` feature name, and
+/// it is entitled to: gdb's AArch64 gdbarch requires
+/// `org.gnu.gdb.aarch64.core` to hold `x0`-`x30`, `sp`, `pc` and `cpsr`, in
+/// that order and at those widths, and that is exactly the thirty-four
+/// registers above. The `org.gnu.gdb.aarch64.fpu` feature is optional and is
+/// not offered: the SIMD&FP file is in the chunk, but a `V` register is a
+/// union type in a description rather than an integer, which is a description
+/// to get right rather than three lines to add.
+///
+/// Because the promise is kept, `<architecture>aarch64</architecture>` is
+/// claimed too — so a gdb with an AArch64 gdbarch **accepts** this description
+/// rather than falling back to a built-in layout, which is the difference
+/// between this core and `cpu.x86` below.
+#[cfg(feature = "cpu-arm-a64")]
+pub static A64: Arch = Arch {
+    class: &crate::cpu::arm::a64::CLASS,
+    verified_version: 2,
+    feature: "org.gnu.gdb.aarch64.core",
+    architecture: Some("aarch64"),
+    regs: &A64_REGS,
+    pc: 32,
+    // `cycles`, straight after `pc`.
+    retire: Some(RetireCounter {
+        offset: 768,
+        bytes: 8,
+    }),
+    computed: Some(&A64_COMPUTED),
 };
 
 #[cfg(test)]
@@ -617,6 +1008,78 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The sentinel and the hook have to agree about which registers are
+    /// which.
+    ///
+    /// `MachineTarget::write_registers` reads the sentinel to decide what to
+    /// defer and the hook to decide what to write, so a register marked one
+    /// way and answered the other would be written twice or not at all. This
+    /// is the only place the two are compared, and it is cheap.
+    #[test]
+    fn the_computed_marker_and_the_hook_name_the_same_registers() {
+        for arch in all() {
+            let Some(hook) = arch.computed else {
+                for reg in arch.regs {
+                    assert_ne!(
+                        reg.offset,
+                        RegDesc::COMPUTED,
+                        "{}: `{}` is marked computed but the map has no hook",
+                        arch.class.name,
+                        reg.name
+                    );
+                }
+                continue;
+            };
+            // A chunk of the minimum length, all zeroes: enough for the hooks
+            // to decide whether a register is theirs, which is all this asks.
+            let chunk = vec![0u8; hook.reach];
+            for (i, reg) in arch.regs.iter().enumerate() {
+                let mut out = Vec::new();
+                let owned = (hook.read)(&chunk, i, &mut out) != Access::Slice;
+                assert_eq!(
+                    owned,
+                    reg.offset == RegDesc::COMPUTED,
+                    "{}: `{}` is marked {} but the hook says {}",
+                    arch.class.name,
+                    reg.name,
+                    if reg.offset == RegDesc::COMPUTED {
+                        "computed"
+                    } else {
+                        "a plain slice"
+                    },
+                    if owned { "it owns it" } else { "it does not" }
+                );
+                if owned {
+                    assert_eq!(out.len(), reg.bytes, "{}: `{}`", arch.class.name, reg.name);
+                }
+            }
+            for index in hook.selects {
+                assert!(
+                    arch.regs
+                        .get(*index)
+                        .is_some_and(|r| r.offset == RegDesc::COMPUTED),
+                    "{}: `selects` names register {index}, which is not a computed one",
+                    arch.class.name
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "cpu-arm-a64")]
+    #[test]
+    fn the_aarch64_g_packet_is_gdbs_own_layout() {
+        // 31 * 8 + sp + pc + a four-byte cpsr, which is what GDB's AArch64
+        // gdbarch expects of `org.gnu.gdb.aarch64.core`.
+        assert_eq!(A64.packet_len(), 268);
+        assert_eq!(A64.regs[31].name, "sp");
+        assert_eq!(A64.regs[A64.pc].name, "pc");
+        assert_eq!(A64.regs[33].name, "cpsr");
+        // The chunk has to be long enough for the fields behind the exclusive
+        // monitor even when the monitor is disarmed and they are at their
+        // lowest offsets.
+        assert_eq!(A64.chunk_reach(), a64_layout::MIN_REACH);
     }
 
     #[cfg(feature = "cpu-mos6502")]
