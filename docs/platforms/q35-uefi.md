@@ -63,10 +63,18 @@ The defaults are a **2 MiB** split OVMF: `OVMF_CODE.fd` at 1920 KiB and
 
 ## What was reused from the RISC-V path, and what was x86-specific
 
-Reused entire: `flash.cfi` — the CFI query, the Intel/Sharp command set, the
-per-block erase, the bit-clearing-only program, the block lock bits, the
-snapshot of a half-issued command. The device did not need one line changed to
-serve an x86 firmware.
+Reused almost entire: `flash.cfi` — the CFI query, the Intel/Sharp command set,
+the per-block erase, the bit-clearing-only program, the block lock bits, the
+snapshot of a half-issued command. Everything an x86 firmware *executes* out of
+it worked unchanged, which is why this board reached a UEFI shell without the
+device being touched.
+
+It needed exactly one change, and only to *write*: **the status register read
+`0x80` where it should have read `0x00`**. That is
+["Why nothing wrote the store"](#why-nothing-wrote-the-store-one-bit-in-a-status-register)
+below; it is a defect in the model of the part rather than anything
+x86-specific, and fixing it left the RISC-V board booting EDK II exactly as
+before.
 
 Three properties are x86-specific, and each of them is a real difference rather
 than a preference:
@@ -134,8 +142,9 @@ Every byte of that came out of the 16550 at `0x3f8` — the board's only console
 and the one `PlatformBootManagerLib` puts a terminal on. `ver` is typed by
 `RSEMU_OVMF_INPUT`, echoed by the shell's line editor and then executed, so the
 path is round trip: guest output drives the keystroke, and the keystroke's reply
-ends the run. The whole thing is **367.5 seconds of virtual time** — 106 seconds
-of host time under the interpreter, 26 under `jit-host`.
+ends the run. The whole thing is **367.2 seconds of virtual time** — a couple of
+minutes of host time under the interpreter, and under a minute under `jit-host`
+on an idle machine.
 
 Each phase, as an observation rather than an inference:
 
@@ -296,13 +305,20 @@ instruction is still in memory when the run ends and no replay is needed.
 
 `RSEMU_ENGINE` now overrides this board's `engine = "interp"`, the way
 `tests/q35_linux.rs` already allowed. All three reach `Shell>`, type `ver`, and
-stop at **the same virtual instant** — 367540 ms — with byte-identical output:
+stop at **the same virtual instant** — 367174 ms — with byte-identical output,
+compared as a hash of the whole console transcript rather than by eye:
 
-| engine | host time | guest instructions retired in blocks |
-| --- | --- | --- |
-| `interp` | 106 s | — |
-| `jit` | 62 s | 532,334,334 of 561,105,521 (94.9%) |
-| `jit-host` | 26 s | 532,334,334 of 561,105,521 (94.9%) |
+| engine | guest instructions retired in blocks |
+| --- | --- |
+| `interp` | — |
+| `jit` | 528,043,760 of 561,787,038 (94.0%) |
+| `jit-host` | 528,043,760 of 561,787,038 (94.0%) |
+
+Host time is not in the table any more: these three were measured with six other
+builds running on the machine, and a number that says more about what else was
+compiling than about the engine is worse than no number. The ordering has not
+changed — `jit-host` is several times the interpreter — and `benches/` is where
+that belongs.
 
 The control-register moves are not lifted — `cpu::x86::lift` returns `None` for
 every `MOV` naming `CRn`, `DRn`, `TRn` or a segment register — so `CR8` runs on
@@ -310,20 +326,132 @@ the interpreter under all three by construction, and the frame alignment is in
 the shared delivery path. The identical instruction counts are the evidence that
 neither changed which engine ran what.
 
-## What is not reached yet
+### Why nothing wrote the store: one bit in a status register
 
-**No variable is written to flash.** The store is byte-identical to the image as
-shipped after a run that reaches the shell (127 programmed bytes before and
-after, the log still ending at `0xf020`), so `RSEMU_OVMF_VARS_OUT` produces a
-file identical to its input and a reboot has nothing extra to find. A BDS that
-selected and started a boot option would normally have written `Boot0001` and
+For a while this board booted to a shell and **kept nothing**. The variable
+store was byte-identical to the image as shipped after a run that reached
+`Shell>` — 127 programmed bytes before and after, the log still ending at
+`0xf020` — so `RSEMU_OVMF_VARS_OUT` reproduced its input and a reboot had
+nothing extra to find. A BDS that selects and starts `Boot0001` writes
 `BootOrder`, so something between `QemuFlashFvbServicesRuntimeDxe` and the
-fault-tolerant write is not binding — which the board's own tests say is not the
-flash device refusing the commands, because
-`the_variable_bank_answers_the_flash_detection_probe` and
-`a_variable_store_program_clears_bits_and_an_erase_puts_them_back` assert
-exactly those sequences through the board's address space. That is the next
-thing to look at on this board, and it is measured rather than assumed.
+fault-tolerant write was not binding.
+
+It was not SMM, and it was not a missing platform service. What settled it was
+watching the bus: with every command cycle either bank received logged, a whole
+boot to the shell issued **four**.
+
+```text
+vars +0x10 <= 0x50
+vars +0x10 <= 0x70
+code +0x10 <= 0x50
+code +0x10 <= 0x70
+```
+
+Two bytes at one address in each bank, and then silence for the rest of the
+boot. That is the opening of `QemuFlashDetected`
+(`OvmfPkg/QemuFlashFvbServicesRuntimeDxe/QemuFlash.c` — BSD-2-Clause-Patent, so
+readable), which tells flash from RAM and from ROM with single-byte cycles
+before it will use a bank at all:
+
+| it writes | it reads back | and concludes |
+| --- | --- | --- |
+| `0x50`, Clear Status Register | the command | RAM |
+| `0x70`, Read Status Register | the original byte | ROM |
+| | `0x70` | RAM |
+| | **`0x00`** | flash — go on and test whether it is writable |
+| `0x10`, the original byte, `0x70` | SR.4 set | flash, write protected |
+| | SR.4 clear | **flash, writable** |
+
+The probe address is the first byte of the bank that is none of `0x50`, `0x70`
+or `0x00`, which in a split OVMF's variable store is offset `0x10` — the first
+byte of the firmware volume's `EFI_SYSTEM_NV_DATA_FV` GUID, `0x8d`. Our part
+answered the `0x70` with `0x80`: SR.7, ready. That is not `0x8d`, not `0x70`
+and not `0x00`, so the driver fell off the end of every branch, `QemuFlashDetected`
+returned false, `QemuFlashInitialize` returned `EFI_WRITE_PROTECTED`, and OVMF
+fell back to `EmuVariableFvbRuntimeDxe` — a variable store in RAM. Everything
+after that *worked*: variables could be set, read back within the run, and
+listed. They simply were not in the flash.
+
+**`0x00` is what the silicon says, and our model was wrong.** The Intel
+StrataFlash P30 datasheet, §14.1.1:
+
+> The Clear Status Register command clears the status register. It functions
+> independent of V<sub>PP</sub>. The Write State Machine (WSM) sets and clears
+> SR[7,6,2], but it sets bits SR[5:3,1] without clearing them. […] A device
+> reset also clears the Status Register.
+
+So SR.7 is a **latch the write state machine drives**, not a live "am I busy"
+signal: it reads back one because an operation finished, and the Clear Status
+Register command — and a reset — clear the whole register. A part that has just
+been cleared and asked for nothing since reads `0x00`. `flash.cfi` had `0x50`
+clearing only the error bits and `SR_RESET` set to `SR_READY`, which is the
+plausible-sounding reading of "SR.7 means ready" and the wrong one.
+
+The fix is three lines of behaviour and no new property:
+
+* a device reset leaves the status register at zero;
+* `0x50` clears all of it, SR.7 included, and still leaves the read mode alone;
+* every operation the write state machine actually runs — a program, an erase,
+  a lock cycle, a write-buffer setup, and a refused command sequence — sets SR.7
+  when it finishes, which is where SR.7 was always coming from.
+
+Nothing else changed: no machine-file property, no `src/dev/q35`, no CPU. And
+the RISC-V board, which shares the device and drives it with EDK II's
+`VirtNorFlashDeviceLib`, still boots the same firmware to the same shell — that
+driver only ever reads the status register *after* issuing an operation
+(`NorFlashWriteSingleWord`, `NorFlashEraseSingleBlock` and
+`NorFlashUnlockSingleBlock` all spin on SR.7 after their command, and
+`NorFlashWriteBuffer` reads it right after the `0xe8` setup to ask whether a
+buffer is free), and each of those now sets it. Re-run with its own flash banks
+bound, that board still reaches `UEFI v2.70` and still leaves 1,989 changed
+bytes and a `BootOrder` in `edk2-riscv-vars.fd`.
+
+One recorded number did move with it: `riscv-virt`'s entries in
+`tests/goldens/frame-hashes.txt`, because the flash part's power-up status
+register is machine state and `Machine::state_hash` covers it. That is the
+regression doing its job, and it is the only golden this change touches.
+
+### A variable written in one boot is there in the next
+
+With the probe answered, the same run programs **5,799** bytes of the store
+where it programmed nothing before, and the names in it are the ones a BDS
+writes: `BootOrder`, `Boot0000` (`UiApp`), `Boot0001` (`EFI Internal Shell`),
+`Boot0002`, `Timeout`, `PlatformLang`, `ConIn`/`ConOut`/`ErrOut`,
+`MemoryTypeInformation`.
+
+The test that holds it is
+`a_variable_written_at_the_shell_is_there_after_a_reboot`, and it is a **second
+boot** rather than a second look: two machines built from the machine file, and
+the only thing carried from the first to the second is the variable bank's
+bytes. The bank is bound as a `dev::medium::Medium` — the `--drive` path, not
+the media table — so what crosses is what `Machine::flush` wrote back, which is
+the call `rsemu run` makes when a machine stops and the one a no-op
+`Device::flush` would have skipped.
+
+The first boot types this at the shell:
+
+```text
+Shell> setvar rsemu -guid 8f1d4a52-6b3c-4e19-9d20-72736656d757 -nv -bs -rt =0102030405060708
+Shell> setvar rsemu -guid 8f1d4a52-6b3c-4e19-9d20-72736656d757
+8F1D4A52-6B3C-4E19-9D20-72736656D757 - rsemu - 0008 Bytes
+01 02 03 04 05 06 07 08
+```
+
+and the second, on a fresh machine that has never been told about the variable:
+
+```text
+Shell> setvar rsemu -guid 8f1d4a52-6b3c-4e19-9d20-72736656d757
+8F1D4A52-6B3C-4E19-9D20-72736656D757 - rsemu - 0008 Bytes
+01 02 03 04 05 06 07 08
+```
+
+The GUID is the test's own and deliberately not `gEfiGlobalVariableGuid`: EDK
+II's `VarCheckUefiLib` refuses a name under the global GUID that the UEFI
+specification does not define, so `setvar rsemu` with no `-guid` answers
+"Unable to set" however well the flash works. That was worth finding out the
+first time rather than mistaking it for the bug.
+
+## What is not reached yet
 
 **A debug console at I/O port `0x402`** would still be worth having.
 `PlatformDebugLibIoPort` writes EDK II's whole `DEBUG()` log there once
@@ -332,6 +460,13 @@ space is `read-as-ones`, so the detect fails and the log is dropped. It is much
 less urgent now that the firmware reaches a real console, but it is the
 difference between the last few lines of BDS and the whole boot. That is a
 `src/dev/pc` addition.
+
+It would also have turned the variable-store hunt above into a one-line answer:
+`QemuFlashDetected` ends with `DEBUG ((DEBUG_INFO, "QemuFlashDetected => %a\n",
+…))` on exactly that port, so a build with debug strings would have printed
+`QemuFlashDetected => No` — the whole finding — before anything had to be
+inferred from four bus cycles. Worth remembering the next time this board goes
+quiet.
 
 ## Running it
 
@@ -346,11 +481,27 @@ RSEMU_OVMF_STOP_AT='UEFI v2.70' \
     cargo test --release --features machine-q35-uefi --test q35_uefi -- --nocapture
 ```
 
+and the reboot, which needs no arguments beyond the two images because it types
+its own script and knows what it is waiting for:
+
+```console
+RSEMU_OVMF_CODE=testdata/x86/OVMF_CODE.fd \
+RSEMU_OVMF_VARS=testdata/x86/OVMF_VARS.fd \
+    cargo test --release --features machine-q35-uefi --test q35_uefi -- --nocapture \
+        a_variable_written_at_the_shell_is_there_after_a_reboot
+```
+
+It costs two boots — about two minutes of host time under `jit-host`, six under
+the interpreter — and neither image is modified: the bank the second boot starts
+from is the medium the first flushed to, in memory.
+
 `tests/q35_uefi.rs` has the whole variable table. The three tests that do *not*
 need an image run on every `cargo test`: that the two banks are one contiguous
 run up to the reset vector, that the variable bank answers the byte-wide probe
-`QemuFlashDetected` opens with, and that a program clears bits while only an
-erase puts them back — asked of the board, through its address space, at the
+`QemuFlashDetected` opens with — the whole sequence, not just its first cycle,
+which is the difference between the test that passed while nothing was written
+and the one that is there now — and that a program clears bits while only an
+erase puts them back, asked of the board, through its address space, at the
 width the driver uses.
 
 ## The ledger
@@ -369,8 +520,10 @@ width the driver uses.
 | the shell executing what is typed at it | **works** (`ver`, over the board's 16550) |
 | the same run under `interp`, `jit` and `jit-host` | **works** — same virtual instant, same output |
 | the flash probe, program and erase the variable driver needs | **works** (asserted without a firmware) |
-| a variable written in one run present in the next | **not reached**; nothing writes the store, and why is open — see above |
-| SMRAM / SMM | not modelled, and not needed by a non-`SMM_REQUIRE` OVMF; [`q35.md`](q35.md) records the gap |
+| the variable driver binding the flash rather than falling back to RAM | **works** — and it took the status register reading `0x00` after a Clear Status Register |
+| a variable written in one run present in the next | **works** — `setvar` at the shell in one boot, read back at the shell in the next, across two machines sharing only the bank's bytes |
+| `BootOrder`, `Boot000n`, `Timeout`, `ConIn`/`ConOut` in the store | **works** — 5,799 programmed bytes where the shipped image had 127 |
+| SMRAM / SMM | not modelled, **and not what was stopping the variable writes**; a non-`SMM_REQUIRE` OVMF never touches it, and [`q35.md`](q35.md) records the gap |
 | `fw_cfg` | absent, and deliberately: EDK II degrades cleanly when the signature at `0x510` does not read `QEMU`, and everything above happened without it |
 | a boot device | none: this board has no storage controller, so the shell finds `map: No mapping found.` |
 
@@ -383,11 +536,17 @@ Registers* and `FXSAVE`; Vol. 4 Table 2-2 (`IA32_PLATFORM_ID`). *AMD64
 Architecture Programmer's Manual* Vol. 2 §8.9.3 for the same frame alignment. Intel 3 Series Express Chipset Family Datasheet
 (316966-002) and Intel I/O Controller Hub 9 Family Datasheet (316972-004) for
 the chipset. JEDEC JESD68.01 and the Intel StrataFlash P30 datasheet for the
-flash. The UEFI Specification 2.10 and the PI Specification 1.8 for what a
+flash — **§14.1.1** for what the Clear Status Register command and a device
+reset do to SR.7, which is the whole of why this board now keeps a variable. The UEFI Specification 2.10 and the PI Specification 1.8 for what a
 firmware expects of a platform. EDK II itself — BSD-2-Clause-Patent, and
 therefore a permitted *reference* under `CLAUDE.md` — for `OvmfPkg`'s flash
 command sequence, `PlatformInitLib`'s chipset detection, and
-`CpuExceptionHandlerLib`'s saved context and `BaseLib`'s `AsmReadMsr64`.
+`CpuExceptionHandlerLib`'s saved context, `BaseLib`'s `AsmReadMsr64`,
+`QemuFlashFvbServicesRuntimeDxe`'s `QemuFlashDetected` for the four cycles that
+decide whether the variable store is used at all, `VirtNorFlashDeviceLib` for
+the status polling the RISC-V board's driver does with the same part, and
+`VarCheckUefiLib` for why a variable under the global GUID has to be one the
+specification names.
 
 **No emulator source of any licence was consulted.** The firmware images were
 run and never read; every number above is either a register this repository's

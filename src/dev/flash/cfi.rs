@@ -160,20 +160,40 @@ const CMD_SUSPEND: u8 = 0xb0;
 /// Confirm — of an erase, of a buffered program, of an unlock, of a resume.
 const CMD_CONFIRM: u8 = 0xd0;
 
-/// SR.7, the write state machine's ready bit. Set means *not busy*.
+/// SR.7, the bit the write state machine sets when it has finished.
+///
+/// It is a **latch the write state machine drives**, not a live "am I busy"
+/// signal: the P30 datasheet says the WSM "sets and clears SR[7,6,2]" while it
+/// only ever sets SR[5:3,1] (§14.1.1), and in the same paragraph that a device
+/// reset and the Clear Status Register command both clear *the whole register*.
+/// So SR.7 reads back one because an operation finished, not because none is
+/// running — and after a reset or a `0x50`, before anything has been asked of
+/// the part, the register reads **zero**. See [`SR_RESET`].
 const SR_READY: u16 = 0x80;
 /// SR.5, block erase error.
 const SR_ERASE_ERROR: u16 = 0x20;
 /// SR.4, program error. Set together with [`SR_ERASE_ERROR`] it means the
 /// command sequence itself was wrong.
 const SR_PROGRAM_ERROR: u16 = 0x10;
-/// SR.3, Vpp out of range. Never set here: this part has no separate Vpp.
-const SR_VPP_ERROR: u16 = 0x08;
+// SR.3 is Vpp out of range and is never set here: this part has no separate
+// programming supply, so there is no state in which it could be.
 /// SR.1, the operation was refused because the block is locked.
 const SR_LOCK_ERROR: u16 = 0x02;
 
-/// The status register a part powers up with: ready, no errors.
-const SR_RESET: u16 = SR_READY;
+/// The status register a part powers up with: **zero**.
+///
+/// "A device reset also clears the Status Register" (P30 datasheet §14.1.1),
+/// and there is nothing for the write state machine to have reported yet. Not
+/// `SR_READY`: a part fresh out of reset has completed no operation, so the
+/// bit the WSM sets when it finishes one is not set.
+///
+/// This is the difference between a variable store a firmware writes and one it
+/// decides is a ROM. EDK II's `OvmfPkg/QemuFlashFvbServicesRuntimeDxe` tells
+/// flash from RAM and from ROM by issuing `0x50` and then `0x70` and requiring
+/// the status register to read **`0x00`**; anything else and `QemuFlashDetected`
+/// returns false, the firmware falls back to a variable store in RAM, and every
+/// variable a boot writes is gone at the next power-on.
+const SR_RESET: u16 = 0;
 
 /// How many bytes one device will take in a single buffered program.
 ///
@@ -755,6 +775,7 @@ impl Array {
             Pending::None => self.first_cycle(chip, cmd),
             Pending::Program => {
                 self.program(chip, offset, value);
+                chip.status |= SR_READY;
                 chip.mode = Mode::Status;
             }
             Pending::Erase => {
@@ -763,6 +784,7 @@ impl Array {
                 } else {
                     chip.status |= SR_ERASE_ERROR | SR_PROGRAM_ERROR;
                 }
+                chip.status |= SR_READY;
                 chip.mode = Mode::Status;
             }
             Pending::Lock => self.lock_cycle(chip, offset, cmd),
@@ -771,7 +793,7 @@ impl Array {
                 // word (P30 datasheet, Write to Buffer).
                 let words = u64::from(value) + 1;
                 if words > BUFFER_BYTES_PER_DEVICE / self.geom.device_width() {
-                    chip.status |= SR_ERASE_ERROR | SR_PROGRAM_ERROR;
+                    chip.status |= SR_ERASE_ERROR | SR_PROGRAM_ERROR | SR_READY;
                     chip.mode = Mode::Status;
                 } else {
                     chip.buffer.clear();
@@ -797,6 +819,7 @@ impl Array {
                     chip.buffer.clear();
                     chip.status |= SR_ERASE_ERROR | SR_PROGRAM_ERROR;
                 }
+                chip.status |= SR_READY;
                 chip.mode = Mode::Status;
             }
         }
@@ -808,11 +831,18 @@ impl Array {
             CMD_READ_STATUS => chip.mode = Mode::Status,
             CMD_READ_ID => chip.mode = Mode::Id,
             CMD_READ_CFI => chip.mode = Mode::Cfi,
-            // Clearing the status register says nothing about what the outputs
-            // are muxed to, so the read mode is left exactly as it was.
-            CMD_CLEAR_STATUS => {
-                chip.status &= !(SR_ERASE_ERROR | SR_PROGRAM_ERROR | SR_VPP_ERROR | SR_LOCK_ERROR);
-            }
+            // "The Clear Status Register command clears the status register"
+            // (P30 datasheet §14.1.1) — the whole register, SR.7 included,
+            // because SR.7 is a latch the write state machine sets when it
+            // finishes an operation rather than a live busy signal. Clearing
+            // only the error bits would leave `0x80` where a driver that has
+            // just cleared the register expects `0x00`, and EDK II's `OvmfPkg`
+            // flash driver reads exactly there to decide whether the part is
+            // flash at all.
+            //
+            // Clearing it says nothing about what the outputs are muxed to, so
+            // the read mode is left exactly as it was.
+            CMD_CLEAR_STATUS => chip.status = 0,
             CMD_PROGRAM | CMD_PROGRAM_ALT => {
                 chip.pending = Pending::Program;
                 chip.mode = Mode::Status;
@@ -821,9 +851,16 @@ impl Array {
                 chip.pending = Pending::Erase;
                 chip.mode = Mode::Status;
             }
+            // The setup cycle of a buffered program is the one command whose
+            // *first* cycle reports through the status register: the driver
+            // reads SR.7 straight back to find out whether a write buffer is
+            // free (P30 datasheet, Write to Buffer flowchart), and EDK II's
+            // `NorFlashWriteBuffer` spins on exactly that before it sends the
+            // word count. This part always has one.
             CMD_BUFFER => {
                 chip.buffer.clear();
                 chip.pending = Pending::BufferCount;
+                chip.status |= SR_READY;
                 chip.mode = Mode::Status;
             }
             CMD_LOCK_SETUP => {
@@ -835,11 +872,17 @@ impl Array {
             // so there is never anything to suspend. The part still switches
             // its outputs to the status register, which is what the guest is
             // about to read.
-            CMD_SUSPEND | CMD_CONFIRM => chip.mode = Mode::Status,
+            CMD_SUSPEND | CMD_CONFIRM => {
+                chip.status |= SR_READY;
+                chip.mode = Mode::Status;
+            }
             // An unrecognised command is a command sequence error, and the
-            // pair of error bits is how the Intel set says so.
+            // pair of error bits is how the Intel set says so — with SR.7,
+            // because the write state machine has finished deciding
+            // ("the Status Register contains the command sequence error
+            // status (SR[7,5,4] set)", P30 datasheet §14.1).
             _ => {
-                chip.status |= SR_ERASE_ERROR | SR_PROGRAM_ERROR;
+                chip.status |= SR_ERASE_ERROR | SR_PROGRAM_ERROR | SR_READY;
                 chip.mode = Mode::Status;
             }
         }
@@ -853,6 +896,9 @@ impl Array {
             return;
         }
         chip.mode = Mode::Status;
+        // The write state machine has run either way, and EDK II's
+        // `NorFlashUnlockSingleBlock` spins on SR.7 until it says so.
+        chip.status |= SR_READY;
         let Some((block, _, _)) = self.geom.block_at(offset) else {
             chip.status |= SR_ERASE_ERROR | SR_PROGRAM_ERROR;
             return;

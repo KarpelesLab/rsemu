@@ -1,17 +1,21 @@
-//! Does `q35-uefi` assemble, do its two flash banks behave like flash, and how
-//! far does a real UEFI firmware get on it?
+//! Does `q35-uefi` assemble, do its two flash banks behave like flash, and does
+//! a real UEFI firmware boot on it and **keep what it writes**?
 //!
-//! Three questions, and only the last one needs anything downloaded. The first
-//! two run on every `cargo test` and hold the board's own claims: that the code
-//! bank ends at the reset vector, that the variable bank answers the probe EDK
-//! II's `OvmfPkg` flash driver opens with, and that a program clears bits and
-//! an erase is what puts them back.
+//! Three of the questions need nothing downloaded and run on every
+//! `cargo test`: that the code bank ends at the reset vector, that the variable
+//! bank answers the detection probe EDK II's `OvmfPkg` flash driver opens with
+//! — byte by byte, exactly as `QemuFlashDetected` issues it — and that a
+//! program clears bits while only an erase puts them back.
 //!
-//! The third is [`a_uefi_firmware_from_the_environment_reaches_its_console`],
-//! gated on `RSEMU_OVMF_CODE` exactly as `tests/q35_linux.rs` is gated on
-//! `RSEMU_KERNEL` and for the same reasons: the image is several megabytes,
-//! it is not ours, and `CLAUDE.md` forbids vendoring a fixture. Nothing here is
-//! committed and nothing is required for `cargo test`.
+//! The other two need a firmware and are gated on `RSEMU_OVMF_CODE`, exactly as
+//! `tests/q35_linux.rs` is gated on `RSEMU_KERNEL` and for the same reasons: the
+//! image is several megabytes, it is not ours, and `CLAUDE.md` forbids
+//! vendoring a fixture. Nothing here is committed and nothing is required for
+//! `cargo test`. They are
+//! [`a_uefi_firmware_from_the_environment_reaches_its_console`], which boots one
+//! and reports where it got to, and
+//! [`a_variable_written_at_the_shell_is_there_after_a_reboot`], which boots it
+//! **twice** and carries nothing between the two but the variable bank.
 //!
 //! ```console
 //! scripts/fetch-testdata.sh ovmf
@@ -27,7 +31,7 @@
 //! | `RSEMU_OVMF_CODE` | the firmware bank's image. Unset, the boot test skips. |
 //! | `RSEMU_OVMF_VARS` | the variable bank's. Unset, the store comes up erased. |
 //! | `RSEMU_OVMF_VARS_OUT` | writes the variable bank back out when the run ends; pointing it at the file `RSEMU_OVMF_VARS` read makes the next run a reboot. |
-//! | `RSEMU_OVMF_MS` | virtual milliseconds to run for (default 60000). |
+//! | `RSEMU_OVMF_MS` | virtual milliseconds to run for (default 420000, which is past the shell prompt at ~367000). |
 //! | `RSEMU_OVMF_EXTMEM` | how much memory above 1 MiB the board has. |
 //! | `RSEMU_OVMF_STOP_AT` | end the run at the first output containing this. |
 //! | `RSEMU_OVMF_EXPECT` | a string the guest must have printed for the test to pass. |
@@ -61,9 +65,10 @@ use std::sync::Arc;
 use rsemu::core::Captured;
 use rsemu::core::clock::GlobalTime;
 use rsemu::core::device::ResetKind;
-use rsemu::core::space::{AddressSpace, MemAttrs};
+use rsemu::core::space::{AddressSpace, MemAttrs, RamStore};
 use rsemu::core::value::Width;
 use rsemu::cpu::x86::{Variant, X86};
+use rsemu::dev::medium::Medium;
 use rsemu::host::chardev::CharPort;
 use rsemu::machine::Machine;
 use rsemu::machine::build;
@@ -75,7 +80,13 @@ use x86boot::Script;
 ///
 /// A ceiling rather than a target: the run stops early when the processor stops
 /// making progress or when the guest prints `RSEMU_OVMF_STOP_AT`.
-const DEFAULT_MS: u64 = 60_000;
+///
+/// Seven minutes of virtual time, because the UEFI Shell prompt arrives at
+/// about 367 seconds of it and a ceiling below that is a run that ends in the
+/// DXE dispatcher having printed nothing — which the assertions here read as a
+/// failure, and rightly, since a firmware that never reaches a console is a
+/// firmware nothing can be said about. A shorter ceiling is `RSEMU_OVMF_MS`.
+const DEFAULT_MS: u64 = 420_000;
 
 /// The top of the address space, which is where the flash ends.
 const TOP: u64 = 0x1_0000_0000;
@@ -112,6 +123,23 @@ fn board(
     vars: Vec<u8>,
     params: &[(&str, String)],
 ) -> Result<(Machine, Arc<X86>, Arc<CharPort>), String> {
+    board_on_a_medium(code, vars, None, params)
+}
+
+/// The same, with the variable bank bound to a **medium** rather than filled
+/// from the media table — which is the difference between `--flash1 vars.fd`
+/// and `--drive flash1=vars.fd`, and the only one of the two that a
+/// [`Machine::flush`] can write back.
+///
+/// The caller keeps the store it passed in: it is what the bank was loaded
+/// from and what its `flush` reaches, so reading it after the run is reading
+/// the file a `--drive` run would have left behind.
+fn board_on_a_medium(
+    code: Vec<u8>,
+    vars: Vec<u8>,
+    store: Option<Arc<RamStore>>,
+    params: &[(&str, String)],
+) -> Result<(Machine, Arc<X86>, Arc<CharPort>), String> {
     let cpus: Arc<Captured<X86>> = Arc::new(Captured::new());
     let mut options = rsemu::machine::BuildOptions::new()
         .with_classes(rsemu::machine::catalog::classes())
@@ -121,6 +149,14 @@ fn board(
     }
     options.realize.media.insert("flash0", code);
     options.realize.media.insert("flash1", vars);
+    if let Some(store) = &store {
+        rsemu::dev::medium::install(
+            &options.realize.hosts,
+            "flash1",
+            Arc::clone(store) as Arc<dyn Medium>,
+        )
+        .map_err(|e| format!("{e}"))?;
+    }
     let registry = rsemu::machine::catalog::registry().expect("this build's registry");
     let mut machine = build(
         "q35-uefi.machine",
@@ -212,46 +248,87 @@ fn the_two_banks_run_contiguously_up_to_the_reset_vector() {
 
 /// The probe EDK II's `OvmfPkg` flash driver opens with, on the variable bank.
 ///
-/// `QemuFlashDetected` tells flash from RAM and from ROM by writing a **single
-/// byte** command and reading the same address back: a part that answers with
-/// its status register is flash, one that answers with the byte just written is
-/// RAM, and one that answers with what was there before is ROM. Every cycle is
-/// a byte, which is why this board wires an x8 part rather than the RISC-V
-/// board's pair of x16s — and the assertion below is that the device gets all
-/// three answers right.
+/// `QemuFlashDetected` — `OvmfPkg/QemuFlashFvbServicesRuntimeDxe/QemuFlash.c`,
+/// BSD-2-Clause-Patent and readable under `CLAUDE.md` — tells flash from RAM
+/// and from ROM with **single-byte** cycles at one address, and everything the
+/// variable store ever gets written depends on it answering yes. It is
+/// replayed here exactly, because getting it *nearly* right is what a run that
+/// boots to a shell and silently keeps its variables in RAM looks like.
+///
+/// The sequence, and what each answer means to the driver:
+///
+/// | it writes | it reads | and concludes |
+/// | --- | --- | --- |
+/// | `0x50` (clear status) | the byte back | RAM |
+/// | `0x70` (read status) | the original byte | ROM |
+/// | | `0x70` | RAM |
+/// | | **`0x00`** | flash — carry on |
+/// | `0x10`, the original byte, `0x70` | SR.4 set | flash, write protected |
+/// | | SR.4 clear | **flash, writable** |
+///
+/// The load-bearing line is the status register reading **zero**. It is zero
+/// because SR.7 is a latch the write state machine sets when it finishes an
+/// operation, and the Clear Status Register command clears the whole register
+/// (Intel StrataFlash P30 datasheet §14.1.1) — a part that answered `0x80`
+/// there would fall off the end of every branch above, and
+/// `docs/platforms/q35-uefi.md` records the boot where one did.
 #[test]
 fn the_variable_bank_answers_the_flash_detection_probe() {
     let machine = bare_board();
     let mem = machine.space("mem").expect("the board declares `mem`");
     const VARS: u64 = TOP - 2 * 1024 * 1024;
 
-    // `0x70` is Read Status Register. A flash answers with SR, which is 0x80
-    // — ready, no errors — and is neither the command nor the array byte.
-    write8(mem, VARS, 0x70);
-    let status = read8(mem, VARS);
-    assert_eq!(status, 0x80, "SR.7 alone: ready, and not RAM's 0x70");
+    // The driver probes the first byte of block 0 that is neither of the two
+    // status commands nor zero, so that it can tell its own writes apart from
+    // what was already there. On an erased bank that is the very first byte.
+    let original = read8(mem, VARS);
+    assert_eq!(original, 0xff, "an erased bank's first byte is the probe");
 
-    // `0xff` is Read Array, and puts it back.
-    write8(mem, VARS, 0xff);
+    // Clear Status Register. A RAM would hand `0x50` straight back.
+    write8(mem, VARS, 0x50);
+    assert_ne!(
+        read8(mem, VARS),
+        0x50,
+        "not RAM: the array, not the command"
+    );
+
+    // Read Status Register, and this is the answer the whole boot turns on:
+    // the register was just cleared and nothing has been asked of the part
+    // since, so it reads zero.
+    write8(mem, VARS, 0x70);
     assert_eq!(
         read8(mem, VARS),
-        0xff,
-        "erased array, not a status register"
+        0x00,
+        "a status register the Clear Status Register command has just cleared"
     );
+
+    // Write the original byte back over itself. On flash that is a legal
+    // program — every bit it would set is already set — and SR.4 stays clear,
+    // which is how the driver decides the part is writable rather than
+    // write protected.
+    write8(mem, VARS, 0x10);
+    write8(mem, VARS, original);
+    write8(mem, VARS, 0x70);
+    let status = read8(mem, VARS);
+    assert_eq!(status & 0x10, 0, "SR.4 clear: the program was accepted");
+    assert_eq!(status & 0x80, 0x80, "SR.7: and the write state machine ran");
+    write8(mem, VARS, 0xff);
+    assert_eq!(read8(mem, VARS), original, "and the array is unchanged");
 
     // The code bank is `readonly`, and that is `WP#` tied low rather than a
     // ROM: an Intel part still *answers* every command with `WP#` low — the
     // pin gates the lock bits, not the command interface (StrataFlash P30
     // datasheet, block locking) — so the probe above finds flash here too. What
-    // it cannot do is change the array, and the status register says why.
+    // it cannot do is change the array, and the status register says why: SR.4
+    // set is the "flash, write-protected" leg of the table above.
     const CODE: u64 = TOP - 2 * 1024 * 1024 + 128 * 1024;
     write8(mem, CODE, 0x10);
     write8(mem, CODE, 0x00);
     let status = read8(mem, CODE);
     assert_eq!(
-        status & 0x02,
-        0x02,
-        "SR.1: the program was refused because the block is locked"
+        status & 0x12,
+        0x12,
+        "SR.4 and SR.1: the program was refused because the block is locked"
     );
     write8(mem, CODE, 0x50); // clear status
     write8(mem, CODE, 0xff); // read array
@@ -362,6 +439,197 @@ fn a_uefi_firmware_from_the_environment_reaches_its_console() {
     probe_first_exception(&params, run.at);
     write_back_the_variable_store(&m);
     assert_reached_uefi(&run, &script);
+}
+
+/// The whole point of a variable store: what one boot writes, the next boot
+/// reads.
+///
+/// Two boots of the same firmware, and the **only** thing carried from the
+/// first to the second is the variable bank's bytes. In the first, the UEFI
+/// Shell is told to create a non-volatile variable; in the second it is asked
+/// for it, and prints it back.
+///
+/// This is the assertion the board could not make until the flash answered
+/// `QemuFlashDetected`. Before that, everything in the first boot below still
+/// happened — the shell set the variable, read it back in the same run and
+/// reported the bytes — because the firmware had quietly fallen back to a
+/// variable store in RAM, and the second boot found nothing. What makes this a
+/// *reboot* rather than a second look at the same machine is that the second
+/// `board_on_a_medium` builds a fresh one from the machine file, so the only
+/// state that crosses is the medium.
+///
+/// The bank is bound as a **medium** rather than filled from the media table,
+/// so the bytes that cross are the ones [`Machine::flush`] wrote back — the
+/// path `--drive flash1=vars.fd` takes, and the one that would silently lose
+/// everything the guest never barriered if `flash.cfi` had inherited the no-op
+/// `Device::flush`.
+///
+/// Costs two whole boots, so it is gated on both images being present and
+/// skips cleanly otherwise, like everything else here.
+#[test]
+fn a_variable_written_at_the_shell_is_there_after_a_reboot() {
+    let (Ok(code_path), Ok(vars_path)) = (
+        std::env::var("RSEMU_OVMF_CODE"),
+        std::env::var("RSEMU_OVMF_VARS"),
+    ) else {
+        println!(
+            "q35-uefi: set RSEMU_OVMF_CODE and RSEMU_OVMF_VARS to boot a firmware twice and \
+             watch a variable survive the restart; see the module docs"
+        );
+        return;
+    };
+    let code = std::fs::read(&code_path).unwrap_or_else(|e| panic!("{code_path}: {e}"));
+    let vars = std::fs::read(&vars_path).unwrap_or_else(|e| panic!("{vars_path}: {e}"));
+    let params: Vec<(&str, String)> = vec![
+        ("flash", format!("{}", code.len() + vars.len())),
+        ("vars", format!("{}", vars.len().max(0x1000))),
+    ];
+    let ms: u64 = std::env::var("RSEMU_OVMF_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MS);
+
+    // A GUID of this test's own, and deliberately not the UEFI global variable
+    // namespace: EDK II's `VarCheckUefiLib` refuses a name under
+    // `gEfiGlobalVariableGuid` that the specification does not define, so
+    // `setvar rsemu` with no `-guid` answers "Unable to set" whatever the flash
+    // does. Nothing else on this board uses it.
+    const GUID: &str = "8f1d4a52-6b3c-4e19-9d20-72736656d757";
+    /// What the shell prints for the eight bytes below, and the marker that
+    /// ends both runs.
+    const VALUE: &str = "01 02 03 04 05 06 07 08";
+
+    // -- the first boot: create it, and read it back in the same run ---------
+    let first = run_the_shell(
+        &code,
+        &vars,
+        &params,
+        ms,
+        &[
+            format!("setvar rsemu -guid {GUID} -nv -bs -rt =0102030405060708\r"),
+            format!("setvar rsemu -guid {GUID}\r"),
+        ],
+        VALUE,
+    );
+    assert!(
+        first.reached,
+        "the shell never printed the variable it had just been told to set; it printed:\n{}",
+        first.text
+    );
+    assert_ne!(
+        first.store, vars,
+        "the run reached the shell and set a non-volatile variable, and the variable store came \
+         back byte-identical to the image it started from: nothing wrote the flash"
+    );
+
+    // The variable driver's own housekeeping is in there too, and `BootOrder`
+    // is the one `docs/platforms/q35-uefi.md` named: a BDS that selected and
+    // started a boot option writes it, and for a long time this board's store
+    // did not have it.
+    for name in ["BootOrder", "Boot0001", "rsemu"] {
+        assert!(
+            contains(&first.store, &utf16(name)),
+            "the variable store the first boot left has no {name:?} in it"
+        );
+    }
+    println!(
+        "q35-uefi: the first boot left {} programmed byte(s) in the variable store, against {} \
+         in the image it started from",
+        first.store.iter().filter(|b| **b != 0xff).count(),
+        vars.iter().filter(|b| **b != 0xff).count()
+    );
+
+    // -- and the second: a fresh machine, and only those bytes carried over --
+    let second = run_the_shell(
+        &code,
+        &first.store,
+        &params,
+        ms,
+        &[format!("setvar rsemu -guid {GUID}\r")],
+        VALUE,
+    );
+    assert!(
+        second.reached,
+        "a variable a previous boot wrote to the flash did not come back after a restart; the \
+         second boot printed:\n{}",
+        second.text
+    );
+    println!("q35-uefi: and the second boot read it back out of the flash");
+}
+
+/// One boot to the UEFI Shell with a script typed at it, and the variable bank
+/// as [`Machine::flush`] left it.
+struct Shell {
+    /// Everything the guest wrote to COM1.
+    text: String,
+    /// Whether it printed the marker the run was waiting for.
+    reached: bool,
+    /// The variable bank's bytes, read out of the medium the run flushed to.
+    store: Vec<u8>,
+}
+
+/// Boot the board with `vars` in the variable bank, type each of `lines` at the
+/// `Shell>` prompt, and stop when the guest prints `stop_at`.
+fn run_the_shell(
+    code: &[u8],
+    vars: &[u8],
+    params: &[(&str, String)],
+    ms: u64,
+    lines: &[String],
+    stop_at: &str,
+) -> Shell {
+    // The bank's backing store, exactly its size: `flash.cfi` refuses a medium
+    // of any other, because a short one would take back only a prefix and
+    // leave a firmware that boots once and never again.
+    let store = Arc::new(RamStore::new(vars.len() as u64));
+    Medium::write_at(&*store, 0, vars).expect("a fresh store takes the image");
+    let (mut m, cpu, console) =
+        match board_on_a_medium(code.to_vec(), Vec::new(), Some(Arc::clone(&store)), params) {
+            Ok(built) => built,
+            Err(e) => panic!("the board does not realize: {e}"),
+        };
+    let script = Script {
+        steps: lines
+            .iter()
+            .map(|line| (String::from("Shell> "), line.clone()))
+            .collect(),
+        stop_at: String::from(stop_at),
+    };
+    let run = x86boot::run(
+        &mut m,
+        &cpu,
+        &console,
+        GlobalTime::from_nanos(ms * 1_000_000),
+        &script,
+    );
+    println!(
+        "q35-uefi: a boot of {} ms stopped at {} ms having typed {} of {} line(s)",
+        ms,
+        run.at.as_nanos() / 1_000_000,
+        run.typed,
+        script.steps.len()
+    );
+    // The run is over: this is what `rsemu run … --drive flash1=vars.fd` does
+    // when the machine stops, and it is the one call that puts what the guest
+    // programmed where the next boot will look for it.
+    m.flush().expect("the flash writes its bank back");
+    let mut out = vec![0u8; vars.len()];
+    Medium::read_at(&*store, 0, &mut out).expect("reading the medium back");
+    Shell {
+        text: run.text,
+        reached: run.reached,
+        store: out,
+    }
+}
+
+/// A variable name as the store holds it: UTF-16LE, no terminator.
+fn utf16(name: &str) -> Vec<u8> {
+    name.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+/// Whether `needle` appears anywhere in `haystack`.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// What a run of a UEFI firmware has to have shown to count.

@@ -288,11 +288,16 @@ fn an_unrecognised_command_is_a_command_sequence_error() {
     let cfi = flash(4, 0x1000);
     command(&cfi, 0, 0x00a5);
     // SR.4 and SR.5 together is how the Intel set spells "that sequence was
-    // not a command".
+    // not a command", and SR.7 comes with them: the datasheet's own words for
+    // this state are "SR[7,5,4] set".
     assert_eq!(peek(&cfi, 0), 0x00b0_00b0);
-    // Clear Status Register takes them away and leaves the read mode alone.
+    // Clear Status Register takes the *whole* register away — SR.7 included,
+    // because it is a latch the write state machine sets when it finishes
+    // something and nothing has been asked of the part since (P30 §14.1.1) —
+    // and leaves the read mode alone, so this read is still the status
+    // register rather than the array.
     command(&cfi, 0, 0x0050);
-    assert_eq!(peek(&cfi, 0), 0x0080_0080);
+    assert_eq!(peek(&cfi, 0), 0x0000_0000);
 }
 
 #[test]
@@ -310,12 +315,17 @@ fn each_part_on_the_bus_has_its_own_state_machine() {
     // A command sent to only the low halfword leaves the high one reading the
     // array, which is the whole reason a lane is not an implementation detail.
     let cfi = flash(4, 0x1000);
+    // Both parts first, so there is something in each status register and
+    // something in the array: a program leaves SR.7 set in both, and the read
+    // array afterwards puts both back to answering with the contents.
+    word_program(&cfi, 0, 0x1111_2222);
+    read_array(&cfi);
     cfi.array()
         .write(0, &0x0070u16.to_le_bytes(), MemAttrs::DEFAULT)
         .expect("a halfword write reaches one part");
     assert_eq!(
         peek(&cfi, 0),
-        0xffff_0080,
+        0x1111_0080,
         "status from the low part, array from the high one"
     );
 }
@@ -357,7 +367,9 @@ fn a_reset_returns_the_command_state_and_keeps_the_contents() {
     // Flash is non-volatile. A cold reset that restored the factory image
     // would defeat the entire point of the device.
     assert_eq!(peek(&cfi, 0), 0xdead_beef);
-    assert_eq!(cfi.array().status(0), Some(0x80));
+    // "A device reset also clears the Status Register" (P30 §14.1.1): zero,
+    // not SR.7, because the part has completed no operation since.
+    assert_eq!(cfi.array().status(0), Some(0x00));
 }
 
 #[test]
