@@ -18,6 +18,20 @@
 # failure count in field *six*, and a gate that counted field seven let a red
 # build through once already. Do not count fields. Use `$?`.
 #
+# One failure shape that is never a code failure.
+#
+# If a stage fails with `could not execute process ... (No such file or
+# directory)` naming a test binary, or a test reports `never executed`, two
+# builders shared one target directory and one deleted the other's binaries
+# mid-run. A real regression never has that shape. It has happened three times:
+# two `check.sh` runs started in one worktree, an unscoped `pkill` that killed a
+# sibling agent's build, and an orphaned run that survived a `pkill -f` because
+# it had been invoked as `bash ./scripts/check.sh` and the pattern did not
+# match. Do not chase it as a defect -- give each concurrent run its own
+# `CARGO_TARGET_DIR`, and kill by working directory
+# (`readlink /proc/$pid/cwd`) rather than by command-line pattern, which misses
+# a relative invocation and can match somebody else's.
+#
 # Usage:
 #   scripts/check.sh              the per-commit set: fast, test, wasm, combos
 #   scripts/check.sh --all        everything, including the full feature sweep
