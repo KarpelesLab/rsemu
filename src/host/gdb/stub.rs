@@ -1031,6 +1031,7 @@ mod tests {
         regs: FAKE_REGS,
         pc: 1,
         retire: None,
+        computed: None,
     };
 
     impl FakeTarget {

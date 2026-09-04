@@ -12,22 +12,40 @@
 //! `ROADMAP.md` §1 permits in as many words. Nothing here reads GDB's source;
 //! the protocol comes from the GDB manual's "Remote Protocol" appendix.
 //!
+//! # Two guests
+//!
+//! There is an **x86** session and an **AArch64** one, and they are not the
+//! same test twice. The x86 guest is the one a stock `gdb` on an x86-64
+//! developer machine will talk to, so it is the session that actually runs in
+//! most places. The AArch64 guest is `arm64-virt`'s core, and it is the one
+//! where the target description is *accepted* rather than rejected — see
+//! below. Whichever `gdb` is to hand, at least one of them says something.
+//!
+//! Three tests need no `gdb` at all: the x86 fixture board resets into its
+//! ROM, the AArch64 register map agrees with the core it describes, and an
+//! AArch64 breakpoint stops where it was put. Those run everywhere, which
+//! matters because the AArch64 session skips on the common host.
+//!
 //! # It skips rather than fails
 //!
-//! Two things have to be true for this test to mean anything, and neither is
-//! true everywhere:
+//! Two things have to be true for a real-`gdb` session to mean anything, and
+//! neither is true everywhere:
 //!
 //! * **A `gdb` binary exists.** `$RSEMU_GDB`, else `gdb`, else `gdb-multiarch`.
 //!   Absent, the test prints why and returns, exactly as the `RSEMU_BIOS` tests
 //!   do — `cargo test` stays hermetic.
-//! * **That `gdb` knows x86.** A distribution's GDB is usually built for one
-//!   architecture, and stock GDB refuses a target description for a CPU it has
-//!   no gdbarch for (`src/host/gdb/arch.rs` says why, at length). The guest here
-//!   is therefore an 8086, because on the overwhelmingly common x86-64
-//!   developer machine that is the one guest family a stock `gdb` will talk to.
-//!   A `gdb` that cannot name `i8086` skips.
+//! * **That `gdb` knows the guest's architecture.** A distribution's GDB is
+//!   usually built for one, and stock GDB refuses a target description for a
+//!   CPU it has no gdbarch for (`src/host/gdb/arch.rs` says why, at length).
+//!   [`knows`] asks GDB's own `complete set architecture` rather than guessing;
+//!   a session whose architecture is missing prints why and returns.
 //!
 //! # What GDB does with our target description
+//!
+//! The two guests differ here, and the difference is the point of the AArch64
+//! map. GDB **accepts** `org.gnu.gdb.aarch64.core`, because that feature has a
+//! fixed meaning — `x0`-`x30`, `sp`, `pc`, `cpsr` — and rsemu supplies exactly
+//! it. For x86 it does not, and the paragraph below explains why that is fine.
 //!
 //! It rejects it — `warning: Architecture rejected target-supplied description`
 //! — and that is expected and harmless. GDB's `i386` gdbarch will only accept a
@@ -42,8 +60,9 @@
 //! Asserting on that warning is part of the test: it is the behaviour, and if it
 //! ever changes we want to be told.
 
-#![cfg(all(feature = "gdb", feature = "cpu-x86"))]
+#![cfg(all(feature = "gdb", any(feature = "cpu-x86", feature = "cpu-arm-a64")))]
 
+#[cfg(feature = "cpu-x86")]
 use std::io::Write as _;
 use std::process::Command;
 use std::sync::Arc;
@@ -53,6 +72,7 @@ use rsemu::host::gdb::{GdbServer, MachineTarget, Progress};
 use rsemu::machine::{Machine, catalog};
 
 /// The board: an 8086, a megabyte of RAM and sixteen bytes of ROM that matter.
+#[cfg(feature = "cpu-x86")]
 const X86_MINI: &str = include_str!("../machines/tests/x86-mini.machine");
 
 /// Where the ROM's far jump sends the guest, and where the test's program goes.
@@ -60,10 +80,13 @@ const X86_MINI: &str = include_str!("../machines/tests/x86-mini.machine");
 /// `0x500` is the first byte of low memory a PC's own firmware would not have
 /// claimed, which is why every DOS-era loader used it. Nothing here needs that
 /// to be true; it is just a recognisable address.
+#[cfg(feature = "cpu-x86")]
 const PROGRAM: u16 = 0x0500;
 
 /// The byte the guest stores, and where it stores it.
+#[cfg(feature = "cpu-x86")]
 const SENTINEL: u8 = 0x42;
+#[cfg(feature = "cpu-x86")]
 const SENTINEL_ADDR: u16 = 0x0600;
 
 /// Find a GDB to drive, or explain why there is none.
@@ -88,15 +111,22 @@ fn find_gdb() -> Option<String> {
     None
 }
 
-/// Whether this GDB has an x86 gdbarch compiled in.
-fn knows_x86(gdb: &str) -> bool {
+/// Whether this GDB has a gdbarch for `arch` compiled in.
+///
+/// A distribution's GDB is usually built for one architecture, and one that
+/// has never heard of the guest cannot debug it whatever the stub says — so
+/// this is what turns a test into a skip rather than a failure. `complete set
+/// architecture ` is GDB's own list, which is why it is asked rather than
+/// guessed from the host triple.
+fn knows(gdb: &str, arch: &str) -> bool {
     let out = Command::new(gdb)
         .args(["-batch", "-ex", "complete set architecture "])
         .output();
+    let want = format!("set architecture {arch}");
     match out {
         Ok(out) => {
             let text = String::from_utf8_lossy(&out.stdout);
-            text.lines().any(|l| l.trim() == "set architecture i8086")
+            text.lines().any(|l| l.trim() == want)
         }
         Err(_) => false,
     }
@@ -109,6 +139,7 @@ fn knows_x86(gdb: &str) -> bool {
 /// is offset `0xfff0` in a ROM mapped at `0xf0000`. `EA` is the intersegment
 /// direct `JMP`, offset first then segment (Intel 8086 Family User's Manual,
 /// "Program Transfer Instructions").
+#[cfg(feature = "cpu-x86")]
 fn boot_rom() -> Vec<u8> {
     let mut rom = vec![0u8; 64 * 1024];
     rom[0xfff0..0xfff5].copy_from_slice(&[0xea, 0x00, 0x05, 0x00, 0x00]);
@@ -116,6 +147,7 @@ fn boot_rom() -> Vec<u8> {
 }
 
 /// Build the board.
+#[cfg(feature = "cpu-x86")]
 fn board() -> Machine {
     let mut options = catalog::build_options().expect("the catalog agrees with itself");
     options.realize.media.insert("firmware", boot_rom());
@@ -134,7 +166,13 @@ struct Server {
 }
 
 impl Server {
-    fn start() -> Server {
+    /// Serve `build`'s board on an ephemeral loopback port.
+    ///
+    /// The board is built on the session thread rather than handed in, because
+    /// a `Machine` is not `Send` and because the debugger and the machine
+    /// share a thread on purpose — that sharing is what makes "attaching stops
+    /// the world" true without a barrier (`src/host/gdb/mod.rs`).
+    fn start(build: fn() -> Machine) -> Server {
         let server = GdbServer::bind(":0").expect("bind an ephemeral port");
         let addr = server.local_addr().expect("local_addr");
         let stop = Arc::new(AtomicBool::new(false));
@@ -143,7 +181,7 @@ impl Server {
             .name(String::from("gdb-real-client"))
             .spawn(move || {
                 let mut server = server;
-                let mut machine = board();
+                let mut machine = build();
                 let mut target = MachineTarget::new(&mut machine);
                 while !flag.load(Ordering::Relaxed) {
                     match server.poll(&mut target) {
@@ -182,6 +220,7 @@ impl Drop for Server {
 /// A loop, so `continue` always reaches a breakpoint anywhere in it, and a store
 /// to a known address, so a memory read has something to find that the debugger
 /// did not put there itself.
+#[cfg(feature = "cpu-x86")]
 const GUEST_PROGRAM: [u8; 7] = [0xb0, SENTINEL, 0xa2, 0x00, 0x06, 0xeb, 0xf9];
 
 /// The board itself, with no `gdb` involved.
@@ -189,6 +228,7 @@ const GUEST_PROGRAM: [u8; 7] = [0xb0, SENTINEL, 0xa2, 0x00, 0x06, 0xeb, 0xf9];
 /// The session test above skips wherever there is no usable `gdb`, and a
 /// fixture only exercised by a skipping test is a fixture nothing checks. This
 /// one always runs, so `machines/tests/x86-mini.machine` cannot rot quietly.
+#[cfg(feature = "cpu-x86")]
 #[test]
 fn the_fixture_board_realizes_and_resets_into_its_rom() {
     use rsemu::host::gdb::DebugTarget;
@@ -231,6 +271,7 @@ fn the_fixture_board_realizes_and_resets_into_its_rom() {
     );
 }
 
+#[cfg(feature = "cpu-x86")]
 #[test]
 fn a_real_gdb_debugs_a_guest_end_to_end() {
     let Some(gdb) = find_gdb() else {
@@ -240,7 +281,7 @@ fn a_real_gdb_debugs_a_guest_end_to_end() {
         );
         return;
     };
-    if !knows_x86(&gdb) {
+    if !knows(&gdb, "i8086") {
         println!(
             "skipping: `{gdb}` has no i8086 gdbarch, so it cannot debug the one \
              guest family a stock gdb can talk to. See this file's header."
@@ -248,7 +289,7 @@ fn a_real_gdb_debugs_a_guest_end_to_end() {
         return;
     }
 
-    let server = Server::start();
+    let server = Server::start(board);
     let port = server.addr.port();
 
     // The program, as a file `restore` can push over the wire in `X` packets.
@@ -396,5 +437,495 @@ fn a_real_gdb_debugs_a_guest_end_to_end() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+    drop(server);
+}
+
+// ---------------------------------------------------------------------------
+// AArch64
+// ---------------------------------------------------------------------------
+
+/// The AArch64 board: a clock, a megabyte of RAM and a core, and nothing else.
+///
+/// Built from a string rather than taken from `machines/`, for the reason
+/// `tests/a64_engines.rs` gives: `arm64-virt` wants a kernel image and
+/// `a64-mini` wants a firmware, and a debugger test should not be a boot test.
+/// The reset vector is zero, which is also where the program is, so `$pc` is
+/// `0` the instant GDB attaches.
+#[cfg(feature = "cpu-arm-a64")]
+const A64_MINI: &str = r#"
+machine "gdb-a64" {
+  osc sysclk = 100000000 Hz
+  space mem { width = 64 }
+  object cpu "cpu.arm.a64" {
+    clock  = sysclk
+    space  = mem
+    cpu    = "cortex-a53"
+    reset  = 0x00000000
+  }
+  object dram "ram" { size = 1M }
+  map mem 0x00000000 size 1M = dram
+}
+"#;
+
+/// Where the guest stores its byte, and what it stores.
+#[cfg(feature = "cpu-arm-a64")]
+const A64_SENTINEL_ADDR: u64 = 0x600;
+#[cfg(feature = "cpu-arm-a64")]
+const A64_SENTINEL: u64 = 0x42;
+
+/// The guest program, at `0`.
+///
+/// ```text
+///   0x00  movz x0, #0x42
+///   0x04  movz x1, #0x600
+///   0x08  strb w0, [x1]
+///   0x0c  ldxr x2, [x1]      arms the exclusive monitor
+///   0x10  b    0x00
+/// ```
+///
+/// Encodings from *Arm Architecture Reference Manual for A-profile*
+/// (DDI 0487), C6.2: `MOVZ` (32-bit immediate, `hw = 0`), `STRB` (unsigned
+/// offset), `LDXR` and `B`.
+///
+/// The `LDXR` is not decoration. `cpu.arm.a64`'s snapshot writes the exclusive
+/// monitor's address **only when the monitor is armed**, so every field after
+/// it — `PSTATE` and both stack pointers among them — moves by eight bytes the
+/// moment this instruction retires. `src/host/gdb/arch.rs`'s `Computed` hook
+/// exists for exactly that, and this is what makes it a tested claim rather
+/// than a comment.
+#[cfg(feature = "cpu-arm-a64")]
+const A64_PROGRAM: [u32; 5] = [
+    0xd280_0840,
+    0xd280_c001,
+    0x3900_0020,
+    0xc85f_7c22,
+    0x17ff_fffc,
+];
+
+/// Build the board, and keep the core so a test can ask it what it thinks.
+#[cfg(feature = "cpu-arm-a64")]
+fn a64_board_with_core() -> (Machine, Arc<rsemu::cpu::arm::a64::Cpu>) {
+    use rsemu::core::Captured;
+    use rsemu::core::space::MemAttrs;
+    use rsemu::core::value::Width;
+    use rsemu::cpu::arm::a64::Cpu;
+
+    let cores: Arc<Captured<Cpu>> = Arc::new(Captured::new());
+    let kept = Arc::clone(&cores);
+    let mut bindings = catalog::bindings().expect("this build's bindings");
+    bindings.replace("cpu.arm.a64", move |props| {
+        let cpu = Arc::new(Cpu::from_props(props)?);
+        kept.push(&cpu);
+        Ok(cpu)
+    });
+    let options = rsemu::machine::BuildOptions::new()
+        .with_classes(catalog::classes())
+        .with_bindings(bindings);
+    let registry = catalog::registry().expect("a registry");
+    let machine = rsemu::machine::build("gdb-a64.machine", A64_MINI, &registry, &options)
+        .unwrap_or_else(|e| panic!("the AArch64 fixture does not realize: {e}"));
+    let cpu = cores.take().expect("the binding captured the core");
+
+    // `build` realizes *and* resets, and a cold reset zeroes RAM, so the
+    // program goes in afterwards.
+    let space = cpu.space().expect("the core has its space");
+    for (i, word) in A64_PROGRAM.iter().enumerate() {
+        space
+            .write(
+                4 * i as u64,
+                Width::U32,
+                u64::from(*word),
+                MemAttrs::DEFAULT,
+            )
+            .expect("the program fits in RAM");
+    }
+    (machine, cpu)
+}
+
+/// The same board, for [`Server::start`].
+#[cfg(feature = "cpu-arm-a64")]
+fn a64_board() -> Machine {
+    a64_board_with_core().0
+}
+
+/// The AArch64 register map, checked against the core it describes.
+///
+/// The map is a table of byte offsets into a snapshot chunk, so the one thing
+/// that can go wrong silently is an offset that names the wrong bytes: GDB
+/// would show plausible numbers that are not the machine's. Every register
+/// below is therefore compared against the core's *own* accessor, and the two
+/// that no offset can name — `SP`, which is one of two banked registers, and
+/// `cpsr`, which is four fields composed — are checked on both sides of the
+/// `LDXR` that moves them.
+#[cfg(feature = "cpu-arm-a64")]
+#[test]
+fn the_aarch64_register_map_agrees_with_the_core() {
+    use rsemu::host::gdb::DebugTarget;
+
+    /// Register numbers, as `org.gnu.gdb.aarch64.core` numbers them.
+    const SP: usize = 31;
+    const PC: usize = 32;
+    const CPSR: usize = 33;
+
+    let (mut m, cpu) = a64_board_with_core();
+    let mut target = MachineTarget::new(&mut m);
+    assert_eq!(target.cpu_count(), 1, "one AArch64 core");
+    let arch = target.arch(0).expect("a register map");
+    assert_eq!(arch.class.name, "cpu.arm.a64");
+    assert_eq!(arch.feature, "org.gnu.gdb.aarch64.core");
+    assert_eq!(arch.architecture, Some("aarch64"));
+    // 31 * 8 + sp + pc + a four-byte cpsr: what GDB's own AArch64 layout is.
+    assert_eq!(arch.packet_len(), 268);
+    assert_eq!(arch.regs[SP].name, "sp");
+    assert_eq!(arch.regs[PC].name, "pc");
+    assert_eq!(arch.regs[CPSR].name, "cpsr");
+
+    let u64_of =
+        |bytes: &[u8]| u64::from_le_bytes(<[u8; 8]>::try_from(bytes).expect("eight bytes"));
+    let u32_of = |bytes: &[u8]| u32::from_le_bytes(<[u8; 4]>::try_from(bytes).expect("four bytes"));
+
+    // The general registers, with a distinct value in each so a table that is
+    // off by one entry cannot pass.
+    for i in 0..31u32 {
+        cpu.set_x(i, 0xa500_0000_0000_0000 | u64::from(i));
+    }
+    let g = target.read_registers(0).expect("the whole register file");
+    assert_eq!(g.len(), 268);
+    for i in 0..31usize {
+        assert_eq!(
+            u64_of(&g[i * 8..i * 8 + 8]),
+            0xa500_0000_0000_0000 | i as u64,
+            "x{i} does not come out of the chunk where the map says it does"
+        );
+    }
+    assert_eq!(u64_of(&g[248..256]), cpu.sp(), "sp");
+    assert_eq!(u64_of(&g[256..264]), cpu.pc(), "pc");
+    assert_eq!(u32_of(&g[264..268]), cpu.sysregs().spsr() as u32, "cpsr");
+
+    // `SP` is banked, and which bank it names is `PSTATE`'s business. Give the
+    // two different values and check the debugger follows the selection rather
+    // than always reading `SP_EL0`.
+    let mut sys = cpu.sysregs();
+    sys.sp_el0 = 0x1111_0000;
+    sys.sp_el1 = 0x2222_0000;
+    sys.spsel = true;
+    cpu.set_sysregs(sys);
+    assert_eq!(
+        u64_of(&target.read_register(0, SP).expect("sp")),
+        0x2222_0000,
+        "with SPSel set at EL1 the debugger must show SP_EL1"
+    );
+    let mut sys = cpu.sysregs();
+    sys.spsel = false;
+    cpu.set_sysregs(sys);
+    assert_eq!(
+        u64_of(&target.read_register(0, SP).expect("sp")),
+        0x1111_0000,
+        "with SPSel clear the debugger must show SP_EL0"
+    );
+
+    // And a write goes to the bank that is selected, leaving the other alone.
+    target
+        .write_register(0, SP, &0x3333_0000u64.to_le_bytes())
+        .expect("sp is writable");
+    assert_eq!(cpu.sp(), 0x3333_0000);
+    assert_eq!(cpu.sysregs().sp_el0, 0x3333_0000);
+    assert_eq!(cpu.sysregs().sp_el1, 0x2222_0000, "the other bank moved");
+
+    // `cpsr` round-trips through `PSTATE`'s four fields.
+    let el1h = 0xf000_0000u32 | 0x3c0 | 0b0101;
+    target
+        .write_register(0, CPSR, &el1h.to_le_bytes())
+        .expect("cpsr is writable");
+    assert_eq!(cpu.sysregs().spsr() as u32, el1h);
+    assert_eq!(
+        u32_of(&target.read_register(0, CPSR).expect("cpsr")),
+        el1h,
+        "cpsr does not read back what was written to it"
+    );
+    // ... and a `PSTATE` naming a level this core does not have is refused
+    // rather than written, because a chunk carrying it would fail to load.
+    let el3h = 0x0000_000du32; // M[3:0] = 0b1101: EL3h.
+    assert!(
+        target.write_register(0, CPSR, &el3h.to_le_bytes()).is_err(),
+        "an exception level this core does not have must be refused"
+    );
+    assert_eq!(
+        cpu.sysregs().spsr() as u32,
+        el1h,
+        "the refusal wrote anyway"
+    );
+}
+
+/// A whole-register-file write, which is where the two computed registers can
+/// fight.
+///
+/// GDB's `G` packet carries every register in `g`-packet order, and that order
+/// puts `sp` at 31 and `cpsr` at 33 — so a stub that walks it once writes the
+/// stack pointer into the bank the *old* `PSTATE` selected and then changes
+/// the selection, and the value the user asked for is in the wrong bank. This
+/// is the case that catches it: the packet says "EL1h, and SP is this", and
+/// the core has to end up with that in `SP_EL1`.
+#[cfg(feature = "cpu-arm-a64")]
+#[test]
+fn a_whole_register_file_write_lands_the_stack_pointer_in_the_selected_bank() {
+    use rsemu::host::gdb::DebugTarget;
+
+    let (mut m, cpu) = a64_board_with_core();
+    let mut target = MachineTarget::new(&mut m);
+
+    // Start at EL1t, so `SP` names `SP_EL0` and the packet below has to move
+    // the selection before its stack pointer means anything.
+    let mut sys = cpu.sysregs();
+    sys.spsel = false;
+    sys.sp_el0 = 0;
+    sys.sp_el1 = 0;
+    cpu.set_sysregs(sys);
+
+    let mut packet = target.read_registers(0).expect("the register file");
+    packet[248..256].copy_from_slice(&0x7fff_0000u64.to_le_bytes());
+    // NZCV all set, DAIF all masked, `M[3:0] = 0b0101`: EL1h.
+    packet[264..268].copy_from_slice(&(0xf000_0000u32 | 0x3c0 | 0b0101).to_le_bytes());
+    target
+        .write_registers(0, &packet)
+        .expect("the whole file is writable");
+
+    assert_eq!(cpu.sysregs().el.bits(), 1, "PSTATE.EL did not move to EL1");
+    assert!(cpu.sysregs().spsel, "SPSel did not move");
+    assert_eq!(
+        cpu.sysregs().sp_el1,
+        0x7fff_0000,
+        "the stack pointer went into the bank PSTATE selected *before* the packet"
+    );
+    assert_eq!(cpu.sysregs().sp_el0, 0, "and not into the other one");
+    assert_eq!(
+        target.read_registers(0).expect("read back"),
+        packet,
+        "the register file does not read back what was written to it"
+    );
+}
+
+/// The same map, on the far side of the variable-length field it has to see
+/// through.
+///
+/// `cpu.arm.a64`'s snapshot writes the exclusive monitor's address only when
+/// the monitor is armed, so `LDXR` moves `PSTATE` and both stack pointers
+/// eight bytes further down the chunk. A map of constants would read the
+/// wrong bytes from here on and say nothing about it.
+#[cfg(feature = "cpu-arm-a64")]
+#[test]
+fn the_exclusive_monitor_does_not_move_the_register_map() {
+    use rsemu::host::gdb::DebugTarget;
+
+    const SP: usize = 31;
+    const CPSR: usize = 33;
+
+    let (mut m, cpu) = a64_board_with_core();
+    let mut target = MachineTarget::new(&mut m);
+    let mut sys = cpu.sysregs();
+    sys.sp_el1 = 0x4444_0000;
+    sys.spsel = true;
+    cpu.set_sysregs(sys);
+
+    let sp_before = target.read_register(0, SP).expect("sp");
+    let cpsr_before = target.read_register(0, CPSR).expect("cpsr");
+    assert_eq!(sp_before, 0x4444_0000u64.to_le_bytes());
+
+    // Step past `movz`, `movz`, `strb` and into the `LDXR`, which arms the
+    // monitor. Four steps rather than a loop with a condition, because that is
+    // what the program is.
+    for _ in 0..4 {
+        target.step(0).expect("a step");
+    }
+    let mut stored = [0u8; 1];
+    target
+        .read_memory(0, A64_SENTINEL_ADDR, &mut stored)
+        .expect("the store landed");
+    assert_eq!(
+        u64::from(stored[0]),
+        A64_SENTINEL,
+        "the guest never ran its store, so the monitor is probably not armed \
+         either and this test is checking nothing"
+    );
+
+    // Everything after the monitor has moved eight bytes, and neither register
+    // may notice.
+    assert_eq!(
+        target.read_register(0, SP).expect("sp"),
+        sp_before,
+        "the stack pointer moved when the exclusive monitor was armed"
+    );
+    assert_eq!(
+        target.read_register(0, CPSR).expect("cpsr"),
+        cpsr_before,
+        "PSTATE moved when the exclusive monitor was armed"
+    );
+    assert_eq!(
+        u64::from_le_bytes(
+            <[u8; 8]>::try_from(&target.read_register(0, SP).expect("sp")[..]).expect("8")
+        ),
+        cpu.sp(),
+        "and it still agrees with the core"
+    );
+
+    // A write on this side of the hole lands too.
+    target
+        .write_register(0, SP, &0x5555_0000u64.to_le_bytes())
+        .expect("sp is writable");
+    assert_eq!(cpu.sp(), 0x5555_0000);
+}
+
+/// A breakpoint and a step on the AArch64 board, with no `gdb` involved.
+///
+/// The register map is what a debugger reads; this is what it *does*. It runs
+/// everywhere, so `arm64-virt`'s debug surface is covered on a host whose
+/// `gdb` has never heard of AArch64 — which is most of them.
+#[cfg(feature = "cpu-arm-a64")]
+#[test]
+fn an_aarch64_guest_stops_where_the_breakpoint_is() {
+    use rsemu::host::gdb::{DebugTarget, StopKind};
+
+    let (mut m, cpu) = a64_board_with_core();
+    let mut target = MachineTarget::new(&mut m);
+    assert_eq!(cpu.pc(), 0, "the core resets to its RVBAR");
+
+    // `strb w0, [x1]`, the third instruction: reached only by going round the
+    // loop, so a stub that never checks would run for ever.
+    target.add_breakpoint(0x08, false).expect("Z0");
+    target.begin_resume();
+    let mut stop = None;
+    for _ in 0..8 {
+        if let Some(hit) = target.resume().expect("the machine advances") {
+            stop = Some(hit);
+            break;
+        }
+    }
+    let stop = stop.expect("the breakpoint was never reached");
+    assert_eq!(stop.kind, StopKind::Breakpoint { hardware: false });
+    assert_eq!(stop.cpu, 0);
+    assert_eq!(cpu.pc(), 0x08, "stopped somewhere else");
+    assert_eq!(cpu.x(0), A64_SENTINEL, "the first movz did not run");
+
+    // One instruction, and exactly one.
+    target.step(0).expect("a step");
+    assert_eq!(cpu.pc(), 0x0c);
+}
+
+/// The AArch64 half of phase 9's gate: a real `gdb`, driving `arm64-virt`'s
+/// core.
+///
+/// Skips wherever the distribution's `gdb` has no AArch64 gdbarch, which on an
+/// x86-64 developer machine is the usual case — `gdb-multiarch`, or a
+/// cross `aarch64-linux-gnu-gdb` named in `$RSEMU_GDB`, is what runs it.
+///
+/// Unlike the x86 session below, GDB **accepts** this target description
+/// rather than rejecting it and falling back: `org.gnu.gdb.aarch64.core` with
+/// `x0`-`x30`, `sp`, `pc` and `cpsr` is exactly what its AArch64 gdbarch asks
+/// for, so `set architecture` is not even needed. That is asserted, because it
+/// is the difference the map was written to make.
+#[cfg(feature = "cpu-arm-a64")]
+#[test]
+fn a_real_gdb_debugs_an_aarch64_guest_end_to_end() {
+    let Some(gdb) = find_gdb() else {
+        println!("skipping: no gdb binary. Set $RSEMU_GDB, or install gdb.");
+        return;
+    };
+    if !knows(&gdb, "aarch64") {
+        println!(
+            "skipping: `{gdb}` has no aarch64 gdbarch. Install gdb-multiarch, or point \
+             $RSEMU_GDB at a cross gdb, to run this."
+        );
+        return;
+    }
+
+    let server = Server::start(a64_board);
+    let port = server.addr.port();
+
+    let mut script = Vec::new();
+    if std::env::var_os("RSEMU_GDB_DEBUG_REMOTE").is_some() {
+        script.push(String::from("set debug remote 1"));
+    }
+    script.extend([
+        format!("target remote 127.0.0.1:{port}"),
+        // No `set architecture`: the description is supposed to be enough.
+        String::from("printf \"RSEMU arch [%s]\\n\", $_gdb_setting_str(\"architecture\")"),
+        String::from("printf \"RSEMU pc0 [%#x]\\n\", $pc"),
+        // Run to the store, which is three instructions in.
+        String::from("break *0x8"),
+        String::from("continue"),
+        String::from("printf \"RSEMU pc1 [%#x]\\n\", $pc"),
+        String::from("printf \"RSEMU x0 [%#x]\\n\", $x0"),
+        String::from("printf \"RSEMU x1 [%#x]\\n\", $x1"),
+        String::from("delete 1"),
+        // One instruction: the store.
+        String::from("stepi"),
+        format!("printf \"RSEMU stored [%#x]\\n\", *(unsigned char *) {A64_SENTINEL_ADDR:#x}"),
+        // The two registers no byte offset can name.
+        String::from("set $sp = 0x8000"),
+        String::from("printf \"RSEMU sp [%#x]\\n\", $sp"),
+        String::from("printf \"RSEMU cpsr [%#x]\\n\", $cpsr"),
+        // A watchpoint on the byte the loop rewrites every time round.
+        format!("set *(unsigned char *) {A64_SENTINEL_ADDR:#x} = 0"),
+        format!("watch *(unsigned char *) {A64_SENTINEL_ADDR:#x}"),
+        String::from("continue"),
+        format!("printf \"RSEMU watched [%#x]\\n\", *(unsigned char *) {A64_SENTINEL_ADDR:#x}"),
+        String::from("delete"),
+        String::from("monitor devices"),
+        String::from("monitor translate 8"),
+        String::from("info threads"),
+        String::from("detach"),
+    ]);
+
+    let mut cmd = Command::new(&gdb);
+    cmd.arg("-batch").arg("-nx");
+    for line in &script {
+        cmd.arg("-ex").arg(line);
+    }
+    let out = cmd.output().expect("gdb runs");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let all = format!("{stdout}\n{stderr}");
+    println!("--- gdb stdout ---\n{stdout}\n--- gdb stderr ---\n{stderr}");
+
+    let says = |needle: &str| {
+        assert!(
+            all.contains(needle),
+            "gdb never said `{needle}`.\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+    };
+
+    says("RSEMU arch [aarch64]");
+    says("RSEMU pc0 [0]");
+    says("Breakpoint 1");
+    says("RSEMU pc1 [0x8]");
+    says("RSEMU x0 [0x42]");
+    says("RSEMU x1 [0x600]");
+    says("RSEMU stored [0x42]");
+    says("RSEMU sp [0x8000]");
+    says("Old value = 0");
+    says("New value = 66");
+    says("RSEMU watched [0x42]");
+    says("cpu.arm.a64");
+    says("0x8 -> 0x8 (identity)");
+
+    // The description is accepted, which is the whole point of naming the
+    // feature `org.gnu.gdb.aarch64.core` and claiming the architecture.
+    assert!(
+        !all.contains("Architecture rejected target-supplied description"),
+        "gdb rejected the AArch64 target description:\n{all}"
+    );
+    for bad in [
+        "Truncated register",
+        "Remote failure reply",
+        "Cannot access memory",
+        "Remote communication error",
+        "Ignoring packet error",
+    ] {
+        assert!(
+            !all.contains(bad),
+            "gdb reported `{bad}`:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+    }
+
     drop(server);
 }
