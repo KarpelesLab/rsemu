@@ -298,6 +298,11 @@ machine "q35-uefi" {
   # than silently corrupted. `flash1` is not, and is the whole point — bind it
   # with `--drive flash1=vars.fd` and what the guest programs is in the file
   # when the run ends.
+  #
+  # Nothing here says whether the firmware will *use* the variable bank. That
+  # is decided four bus cycles into DXE, by whether the part's status register
+  # reads zero after a Clear Status Register — `flash.cfi`'s business, not the
+  # board's, and `docs/platforms/q35-uefi.md` has the boot where it did not.
   object flashcode "flash.cfi" {
     size       = flash - vars
     image      = "flash0"
