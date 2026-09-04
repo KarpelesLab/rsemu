@@ -3,13 +3,19 @@
 //!
 //! [`tests/q35_linux.rs`](q35_linux.rs) is this board interpreted: a Gentoo
 //! 6.6.67 `bzImage` reaches userspace and reads off its NVMe namespace in
-//! **2,374 seconds of guest time and about sixteen minutes of wall clock**.
-//! This is the same board, the same machine file, the same kernel and the same
-//! initramfs, with [`AccelCpus`] replacing what is underneath `cpu0` — and it
-//! reaches the same line in **35 seconds of guest time and nine to twelve
-//! seconds of wall clock**, which is the whole point of `ROADMAP.md` §10. Run
-//! to run those numbers move, because nothing here is reproducible; the
-//! console is what does not.
+//! **2,826 seconds of guest time and about sixteen minutes of wall clock**.
+//! This is the same board, the same machine file, the same kernel, the same
+//! initramfs and — now — the same command line, with [`AccelCpus`] replacing
+//! what is underneath `cpu0`, and it reaches the same line in **about two and
+//! a half seconds**, which is the whole point of `ROADMAP.md` §10. Run to run
+//! that number moves, because nothing here is reproducible; the console is
+//! what does not.
+//!
+//! Guest time and wall clock are the *same* two and a half seconds, and that
+//! is not a coincidence: this board runs under
+//! [`ThreadingMode::Accel`](rsemu::core::sched::ThreadingMode::Accel), where
+//! virtual time is read off the host clock. On its own command line, with no
+//! `no_timer_check` — see below for what that used to cost.
 //!
 //! ```text
 //! RSEMU_KERNEL=/boot/vmlinuz \
@@ -52,37 +58,57 @@
 //!    it runs in hardware, which is a thing an emulator with an interpreter can
 //!    do and a hypervisor client cannot.
 //!
-//! # `no_timer_check`, and why it is the honest word to add
+//! # Time, and the word that is no longer on the command line
 //!
-//! The board's own command line boots interpreted and **panics accelerated**,
-//! in `check_timer()`, and the reason is not the board's interrupt tree — that
-//! is measurably correct, and the same tree carries the tick here. It is time:
+//! The board's own command line used to boot interpreted and **panic
+//! accelerated**, in `check_timer()`, and the reason was never the board's
+//! interrupt tree — that is measurably correct, and the same tree carries the
+//! tick here. It was time:
 //!
-//! > **Virtual time does not advance while a vCPU is inside `KVM_RUN`.**
+//! > **Virtual time did not advance while a vCPU was inside `KVM_RUN`.**
 //!
 //! A scheduler round ends when every runnable returns, and an accelerated
-//! processor returns when the *guest* exits. So a guest that runs without
-//! exiting — a delay loop, which is exactly what `mdelay()` is — holds the
-//! round, and the board's clocks stand still for as long as it takes. Both
-//! failures on the stock line are that one fact:
+//! processor returns when the *guest* exits. So a guest that ran without
+//! exiting — a delay loop, which is exactly what `mdelay()` is — held the
+//! round, and the board's clocks stood still for as long as it took. Both
+//! failures on the stock line were that one fact:
 //!
-//! | what the kernel prints | what it did |
+//! | what the kernel printed | what it did |
 //! | --- | --- |
-//! | `hpet: Counter not counting. HPET disabled` | read `HPET_COUNTER`, spun 200,000 TSC cycles, read it again. Both reads are in one round, so the counter had not moved. |
-//! | `..MP-BIOS bug: 8254 timer not connected to IO-APIC`, then the panic | `timer_irq_works()`: read `jiffies`, `mdelay()`, read `jiffies`. The delay loop takes no exits, so no timer fired. |
+//! | `hpet: Counter not counting. HPET disabled` | read `HPET_COUNTER`, spun 200,000 TSC cycles, read it again. Both reads fell in one round, so the counter had not moved. |
+//! | `..MP-BIOS bug: 8254 timer not connected to IO-APIC`, then the panic | `timer_irq_works()`: read `jiffies`, spin about forty milliseconds, read `jiffies`. The spin took no exits, so no timer fired. |
 //!
-//! `no_timer_check` skips the second, and the first is self-correcting — Linux
-//! falls back to the 8254, whose interrupt reaches the processor through this
-//! board's `LEG_RT_CNF` multiplexer with the gate the *other* way round from
-//! the interpreted run, and the boot proceeds. Nothing is wrong with either
-//! APIC and nothing is wrong with the wires.
+//! Two changes, one level below `accel/` and one inside it, removed both:
 //!
-//! What would remove the word is
-//! [`ThreadingMode::Accel`](rsemu::core::sched::ThreadingMode::Accel), which
-//! `src/core/sched.rs` refuses with `SchedError::ModeUnimplemented` and which
-//! §4.2 defines as *"CPUs run in hardware and virtual time is slaved to the
-//! host clock"*. That is this test's named next obstacle, and it is one level
-//! below `accel/`.
+//! * [`ThreadingMode::Accel`](rsemu::core::sched::ThreadingMode::Accel) is
+//!   implemented in `src/core/sched.rs`. A round's elapsed virtual time is
+//!   read off the injected [`HostClock`](rsemu::core::sched::HostClock)
+//!   instead of being taken from what the runnables claimed, which is §4.2's
+//!   *"virtual time is slaved to the host clock"*. That is what makes the
+//!   board's clocks move while the guest runs, and — because this engine's
+//!   slice is **one guest exit long** — it makes every device access see the
+//!   wall as of that access. `hpet_counting()` reads a counter that has moved.
+//! * A **preemption interval** bounds a guest that takes no exits
+//!   (`accel::preempt`): the vCPU's own thread asks the kernel for a periodic
+//!   signal, whose delivery is what makes `KVM_RUN` return `EINTR`. That is
+//!   what makes `timer_irq_works()` see a tick, and it is the one thing no
+//!   signal-free mechanism could do — that module argues each alternative.
+//!
+//! What the kernel says now, on the same line, is the measurement that matters:
+//!
+//! ```text
+//!   | [    0.033333] tsc: using HPET reference calibration
+//!   | [    0.036666] tsc: Detected 3992.968 MHz processor
+//!   | [    0.736685] hpet0: at MMIO 0xfed00000, IRQs 2, 8, 0
+//!   | [    0.737097] hpet0: 3 comparators, 64-bit 10.000000 MHz counter
+//! ```
+//!
+//! **3,992.968 MHz against a host that is 3,993,994 kHz.** Before this it
+//! reported a **176,273 MHz** processor: it was measuring a real time-stamp
+//! counter against a board whose clocks only moved when it stopped running, so
+//! every delay it computed was wrong by about forty-four times. A guest's own
+//! view of the clock is the honest test of whether the clock is right, and this
+//! is it.
 //!
 //! # Do the two engines agree?
 //!
@@ -99,12 +125,12 @@
 //! So a kernel that boots on both takes different paths through its own feature
 //! dispatch and says so.
 //!
-//! Measured, on the same board with the same kernel, the same initramfs and the
-//! same command line — 2,561 seconds of guest time in 973 seconds of wall clock
-//! interpreted, against 35 seconds of guest time in about 10 seconds of wall
-//! clock here:
+//! Measured, on the same board with the same kernel, the same initramfs and —
+//! now that `no_timer_check` is gone — *literally the same command line*:
+//! 2,826 seconds of guest time in 978 seconds of wall clock interpreted,
+//! against 2.4 seconds of both here.
 //!
-//! * **279 of the accelerated run's 347 console lines are byte-identical** to
+//! * **282 of the accelerated run's 346 console lines are byte-identical** to
 //!   the interpreted run's, in the same order, once the printk timestamp is
 //!   removed.
 //! * **Every milestone appears in both**, in order: the RSDP found by scanning
@@ -112,28 +138,31 @@
 //!   PCI root bridge, `PCI: Using ACPI for IRQ routing`, `ttyS0`, the NVMe
 //!   function at `0000:00:04.0`, its queue pair, `Run /init as init process`,
 //!   the shell, and the signature read off the namespace.
-//! * The 68 lines that differ are **all** downstream of who the processor is —
+//! * The 62 lines that differ are **all** downstream of who the processor is —
 //!   the model line (`AMD 1a/08` against the interpreter's `Intel 06/0f`), the
 //!   speculative-execution mitigations, the `XSAVE` feature list, the PMU, the
-//!   TLB geometry — plus the timekeeping lines this file's `no_timer_check`
-//!   section explains. Not one of them is a device answering differently.
-//! * The interpreted run additionally prints two `soft lockup` backtraces,
-//!   which are *its* artefact: the guest's own watchdog notices that its
-//!   interpreter is slow.
+//!   TLB geometry, the `BogoMIPS` a correct calibration produces. Not one of
+//!   them is a device answering differently, and **not one of them is a
+//!   timekeeping failure any more**: the lines that used to say the HPET was
+//!   not counting now say what its counter runs at.
+//! * The interpreted run additionally prints five `soft lockup` backtraces and
+//!   the 636 lines of stack that go with them, which is *its* artefact: the
+//!   guest's own watchdog notices that its interpreter is slow.
 //!
-//! To reproduce, run this test and `tests/q35_linux.rs` with the same
-//! `RSEMU_KERNEL_CMDLINE` (the constant below) and `RSEMU_KERNEL_MS=3000000`
-//! on the interpreted one, and diff the `  | ` lines with the printk timestamp
-//! stripped.
+//! To reproduce, run this test and `tests/q35_linux.rs` with
+//! `RSEMU_KERNEL_MS=3000000` on the interpreted one — no
+//! `RSEMU_KERNEL_CMDLINE` on either, which is the point — and diff the `  | `
+//! lines with the printk timestamp stripped.
 //!
 //! # What a run under this engine is not
 //!
 //! **Reproducible.** [`AccelCpus::open`] refuses a deterministic
 //! [`ThreadingMode`], `Machine::set_recorder` refuses a non-deterministic one,
-//! and `Machine::state_hash` over a `Parallel` run is meaningless. Two runs of
-//! this test take different numbers of guest entries and reach the shell at
-//! different virtual instants. The console is the comparison that means
-//! something, which is why it is what this file prints.
+//! and `Machine::state_hash` over an `Accel` run is meaningless — more so than
+//! over a `Parallel` one, because here the *clock itself* is the host's. Two
+//! runs of this test take different numbers of guest entries and reach the
+//! shell at different virtual instants. The console is the comparison that
+//! means something, which is why it is what this file prints.
 
 #![cfg(all(
     feature = "accel-kvm",
@@ -164,21 +193,21 @@ use x86boot::Script;
 
 /// How long to let the board run, in virtual milliseconds.
 ///
-/// A ceiling, not a target: the interpreted run needs 2,374 virtual seconds to
-/// reach a shell and this one needs about 35, because an accelerated processor
-/// does far more guest work per virtual millisecond. The run ends early when
-/// the guest prints `RSEMU_KERNEL_STOP_AT` or stops making progress.
+/// A ceiling, not a target, and under
+/// [`ThreadingMode::Accel`](rsemu::core::sched::ThreadingMode::Accel) it is a
+/// ceiling on **wall clock too**: virtual time is the host clock there, so 200
+/// virtual seconds is 200 real ones. The boot needs about two and a half of
+/// them, and the run ends early when the guest prints `RSEMU_KERNEL_STOP_AT`
+/// or stops making progress.
 const DEFAULT_MS: u64 = 200_000;
 
 /// The command line an accelerated run gets.
 ///
-/// The first three words are `machines/q35-linux.machine`'s own default,
-/// repeated here because a machine-file parameter can only be replaced whole;
-/// if that line changes, change this one. The fourth is the subject of this
-/// file's module documentation — it is a *statement about the scheduler*, not
-/// about the board, and it comes out when
-/// [`ThreadingMode::Accel`](rsemu::core::sched::ThreadingMode::Accel) lands.
-const CMDLINE: &str = "console=ttyS0,115200 earlyprintk=ttyS0,115200 nokaslr no_timer_check";
+/// **`machines/q35-linux.machine`'s own default, word for word**, repeated
+/// here only because a machine-file parameter can only be replaced whole. It
+/// used to carry a fourth word, `no_timer_check`, and this file's module
+/// documentation is about why it does not any more.
+const CMDLINE: &str = "console=ttyS0,115200 earlyprintk=ttyS0,115200 nokaslr";
 
 /// What the test stamps over the front of a blank namespace, byte for byte the
 /// same as the interpreted run's — so `head -c 40 /dev/nvme0n1` in the guest
@@ -202,12 +231,12 @@ fn board(
     disk: Vec<u8>,
     params: &[(&str, String)],
 ) -> Result<Built, String> {
-    let accel = AccelCpus::open(ThreadingMode::Parallel).map_err(|e| format!("{e}"))?;
+    let accel = AccelCpus::open(ThreadingMode::Accel).map_err(|e| format!("{e}"))?;
     let mut options = rsemu::machine::catalog::build_options().expect("this build's classes");
-    // `Parallel` rather than `Deterministic`, and not by preference:
-    // `AccelCpus::open` above has already refused a mode that claims
-    // reproducibility.
-    options.realize.scheduler.mode = ThreadingMode::Parallel;
+    // `Accel`, and it must match what `AccelCpus::open` was given above: that
+    // call is what decides this engine's slice length and its preemption
+    // interval, and it has already refused a mode claiming reproducibility.
+    options.realize.scheduler.mode = ThreadingMode::Accel;
     accel.install(&mut options.bindings);
     let capacity = format!("{}", (disk.len() as u64).max(DEFAULT_DISK));
     options = options.with_param("disk", capacity.as_str());
@@ -225,6 +254,10 @@ fn board(
         &options,
     )
     .map_err(|e| format!("{e}"))?;
+    // What `ThreadingMode::Accel` runs on. Without it every round fails with
+    // `SchedError::NoHostClock`, and deliberately: the mode's whole content is
+    // that elapsed time comes from the wall, and a fallback would be a guess.
+    machine.set_host_clock(Box::new(rsemu::host::clock::MonotonicClock::new()));
     machine.reset(ResetKind::Cold);
     machine.sweep();
     let console = rsemu::host::chardev::ports::open(&options.realize.hosts, "console")
@@ -411,7 +444,7 @@ fn a_linux_kernel_boots_on_host_silicon_and_reads_the_disk() {
     );
     println!(
         "q35-linux/kvm: {} ms of guest time in {:.1} s of wall clock; the interpreted run of \
-         this board on this command line measured 2,561,473 ms and 973 s",
+         this board on this same command line measured 2,826,342 ms and 978 s",
         run.at.as_nanos() / 1_000_000,
         wall.as_secs_f64()
     );

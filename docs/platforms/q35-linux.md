@@ -500,17 +500,23 @@ unreliable leftover stack word, not a live frame — and this controller sets
 
 ## The same board under KVM
 
-The run above is the *interpreted* one: 2,374 seconds of guest time and about
+The run above is the *interpreted* one: 2,826 seconds of guest time and about
 sixteen minutes of wall clock. `tests/kvm_q35_linux.rs` is the same machine
 file, the same kernel, the same initramfs and the same namespace signature,
 with the engine underneath `cpu0` replaced by a KVM vCPU
 (`Bindings::replace`, `src/accel/cpu.rs`), and it reaches the same line —
 `rsemu q35-linux nvme namespace, LBA 0`, read off the emulated controller by
-the kernel's own driver — in **35 seconds of guest time and about ten seconds
-of wall clock**. Roughly a hundredfold on the clock a person watches. (The
-2,374 s above is the board's own command line; with the `no_timer_check` an
-accelerated run needs, the interpreted reference measured 2,561 s of guest time
-in 973 s of wall clock, and the accelerated one 35 s in 9-12 s.)
+the kernel's own driver — in **about three seconds**. Roughly three hundredfold
+on the clock a person watches, **on this board's own command line**: nothing is
+added to it.
+
+Guest time and wall clock are the same three seconds, and that is the point
+rather than a coincidence. The accelerated run is in `ThreadingMode::Accel`,
+where the scheduler reads a round's elapsed virtual time off the host clock
+instead of taking it from what the runnables claimed — `ROADMAP.md` §4.2's
+*"virtual time is slaved to the host clock"*. See
+[below](#the-word-the-command-line-no-longer-needs) for the two kernel checks
+that used to make this impossible.
 
 ```text
 RSEMU_KERNEL=/boot/vmlinuz \
@@ -524,18 +530,23 @@ RSEMU_KERNEL_STOP_AT='LBA 0' \
 Nothing about the board changes. The memory map, the ACPI tables, the PCI
 enumeration, the `PIRQ` swizzle, the I/O APIC redirection entry and the NVMe
 controller are the same objects doing the same work; what changes is who
-executes the guest's instructions between two of their accesses. About 600,000
-of those accesses leave hardware over a whole boot — 520,000 port accesses and
-80,000 MMIO — and every one is served by this board's own device models.
+executes the guest's instructions between two of their accesses. About 132,000
+of those accesses leave hardware over a whole boot — 69,000 port accesses and
+63,000 MMIO — and every one is served by this board's own device models.
 
-The two runs were compared line for line: **279 of the accelerated run's 347
-console lines are byte-identical to the interpreted run's**, in the same order,
-and every milestone from the RSDP scan to `rsemu q35-linux nvme namespace,
-LBA 0` appears in both. The 68 that differ are all downstream of *who the
-processor is* — the model line, the speculative-execution mitigations, the
-`XSAVE` list, the PMU, the TLB geometry — because an accelerated `cpu.x86`
-reports the host's silicon rather than the `variant` this file declares. Not
-one of them is a device answering differently.
+The two runs were compared line for line, on *literally* the same command line
+now that `no_timer_check` is gone: **282 of the accelerated run's 346 console
+lines are byte-identical to the interpreted run's**, in the same order, and
+every milestone from the RSDP scan to `rsemu q35-linux nvme namespace, LBA 0`
+appears in both. The 62 that differ are all downstream of *who the processor
+is* — the model line, the speculative-execution mitigations, the `XSAVE` list,
+the PMU, the TLB geometry, the BogoMIPS a correct calibration produces —
+because an accelerated `cpu.x86` reports the host's silicon rather than the
+`variant` this file declares. Not one of them is a device answering
+differently, and none of them is a timekeeping failure. (The interpreted run
+also prints five `soft lockup` backtraces and the 636 lines of stack that go
+with them; that is its own artefact, the guest's watchdog noticing that its
+interpreter is slow.)
 
 Two things had to exist first, and both are in `src/accel/`:
 
@@ -554,37 +565,58 @@ Two things had to exist first, and both are in `src/accel/`:
   shell interpreter that every accelerated `cpu.x86` carries; everything after
   it runs on silicon. One instruction, measured.
 
-### The one word the command line still needs
+### The word the command line no longer needs
 
-`no_timer_check`, and it is a statement about the *scheduler* rather than about
-this board:
+`no_timer_check` used to be on it, and it was a statement about the *scheduler*
+rather than about this board:
 
-> Virtual time does not advance while a vCPU is inside `KVM_RUN`.
+> Virtual time did not advance while a vCPU was inside `KVM_RUN`.
 
 A scheduler round ends when every runnable returns, and an accelerated
-processor returns when the guest exits — so a guest that runs without exiting
-holds the round, and the board's clocks stand still for as long as it takes. A
-delay loop is exactly such a guest. Two of this kernel's checks are that one
+processor returns when the guest exits — so a guest that ran without exiting
+held the round, and the board's clocks stood still for as long as it took. A
+delay loop is exactly such a guest. Two of this kernel's checks were that one
 fact:
 
-| what the kernel prints | what it did |
+| what the kernel printed | what it did |
 | --- | --- |
 | `hpet: Counter not counting. HPET disabled` | read `HPET_COUNTER`, spun 200,000 TSC cycles, read it again — both reads inside one round |
-| `..MP-BIOS bug: 8254 timer not connected to IO-APIC`, then a panic | `timer_irq_works()`: read `jiffies`, `mdelay()`, read `jiffies` — the delay loop takes no exits, so no tick arrived |
+| `..MP-BIOS bug: 8254 timer not connected to IO-APIC`, then a panic | `timer_irq_works()`: read `jiffies`, spin ~40 ms, read `jiffies` — the delay loop takes no exits, so no tick arrived |
 
-Neither is a defect in the interrupt tree this page spent four obstacles
-getting right. The first is self-correcting: with the HPET disabled by the
-guest, `LEG_RT_CNF` stays clear and the tick arrives from the 8254 through the
-*other* side of the same multiplexer — which is a second, unplanned test of it.
-The second needs the word until `ThreadingMode::Accel` lands in
-`src/core/sched.rs` and slaves virtual time to the host clock, which is
-`ROADMAP.md` §4.2's own description of the mode.
+Neither was a defect in the interrupt tree this page spent four obstacles
+getting right. Two changes removed both, and only one of them is in `accel/`:
 
-The same fact is why the guest's own sense of time is nonsense under
-acceleration: it calibrates the host's time-stamp counter against this board's
-virtual-time ACPI timer and reports a `176273.643 MHz processor`. It boots and
-it runs; every delay it computes from that number is wrong by the same factor.
-`src/accel/mod.rs` has the full list of what acceleration costs.
+* **`ThreadingMode::Accel`, in `src/core/sched.rs`.** A round's elapsed virtual
+  time is read off the injected `HostClock` rather than derived from what the
+  runnables reported — an accelerated core can only report its whole budget, so
+  deriving it made the board's clocks run at a rate set by the quantum. And
+  because this engine's slice under that mode is **one guest exit long**, every
+  access the guest makes to a device sees the wall as of that access:
+  `hpet_counting()` now reads a counter that has moved.
+* **A preemption interval, in `src/accel/preempt.rs`.** Slaving time to the wall
+  is not enough on its own — a guest spinning in `RDTSC` and `PAUSE` takes no
+  exits at all, so the round cannot end and the tick that is *due* cannot be
+  delivered. The vCPU's own thread asks the kernel for a periodic signal, whose
+  delivery is what makes `KVM_RUN` return `EINTR`; that module works through
+  `immediate_exit`, the safe-point exit flag, an `ioctl` from another thread and
+  VMX's notify window, and why none of them can do it.
+
+What the kernel says now is the measurement that matters, because a guest's own
+view of the clock is the honest test of whether the clock is right:
+
+```text
+[    0.033333] tsc: using HPET reference calibration
+[    0.036666] tsc: Detected 3992.942 MHz processor
+[    0.736685] hpet0: at MMIO 0xfed00000, IRQs 2, 8, 0
+[    0.737097] hpet0: 3 comparators, 64-bit 10.000000 MHz counter
+```
+
+3,992.942 MHz against a host that is 3,993,994 kHz — the last digits move run
+to run, because it is a measurement. Before this it reported a
+`176273.643 MHz processor` — it was measuring a real time-stamp counter against
+a board whose clocks only moved when it stopped running, so every delay it
+computed was wrong by about forty-four times. `src/accel/mod.rs` has the full
+list of what acceleration still costs.
 
 ## Sources
 

@@ -1928,8 +1928,12 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
 
 /// `deterministic`, `parallel`, or `parallel:<workers>`.
 ///
-/// `accel` is deliberately absent: it needs the hardware backends of
-/// `ROADMAP.md` 10 and would only be a way to type an error message.
+/// `accel` is deliberately absent, and no longer because the scheduler cannot
+/// do it — `ThreadingMode::Accel` is implemented. It is that nothing this
+/// binary can build would *use* it: an accelerated processor arrives through
+/// `Bindings::replace`, which is a host-side call, and `engine = "kvm"` is not
+/// a machine-file property yet (`accel::cpu`). Offering the mode here would
+/// slave an interpreted board's clocks to the wall and call it acceleration.
 fn parse_threading(text: &str) -> Result<(ThreadingMode, Option<usize>), String> {
     let (name, workers) = match text.split_once(':') {
         Some((name, count)) => {

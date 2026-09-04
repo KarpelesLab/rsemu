@@ -40,19 +40,14 @@
 //!   four lines in `src/cpu/x86/mod.rs` — `"kvm"` added to the property
 //!   reader's `or_enum` list and to `schema_for`'s `values` — and this module
 //!   deliberately does not make them.
-//! * **[`ThreadingMode::Accel`](crate::core::sched::ThreadingMode::Accel) is
-//!   unimplemented in the scheduler**, which refuses it with
-//!   `SchedError::ModeUnimplemented`, so an accelerated board runs under
-//!   [`Parallel`](crate::core::sched::ThreadingMode::Parallel) — where virtual
-//!   time is still the emulated grid, so a guest that runs for a host
-//!   millisecond between exits advances the board's clock by one budget rather
-//!   than by a millisecond. **That is now the single thing standing between
-//!   this backend and an unmodified guest**, and it is worked out under
-//!   **Time** below; it was written here as a limitation and has since been
-//!   measured as a wall.
 //!
 //! What used to be on that list and no longer is:
 //!
+//! * **[`ThreadingMode::Accel`](crate::core::sched::ThreadingMode::Accel) is
+//!   implemented.** Virtual time is read off the host clock, so a guest that
+//!   runs for a host millisecond between exits advances the board's clocks by
+//!   a millisecond. That was *"the single thing standing between this backend
+//!   and an unmodified guest"*, and **Time** below is what it took.
 //! * **An interrupt reaches an accelerated guest on a board.** The vector comes
 //!   from the board's 8259A or local APIC on an *acknowledge cycle*
 //!   ([`IntAck`](crate::core::wire::IntAck)), and [`cpu::AccelCpu`] is the CPU
@@ -69,13 +64,13 @@
 //!   `tests/kvm_q35_linux.rs` runs `machines/q35-linux.machine` with a Gentoo
 //!   6.6.67 `bzImage` in its socket: the kernel enumerates the PCI bus, binds
 //!   the NVM Express driver, mounts an initramfs, reaches a shell and reads a
-//!   signature off the emulated namespace — **in about nine seconds of wall
-//!   clock against the interpreted run's sixteen minutes**. Two things had to
-//!   exist for that and both are in this module: a `CPUID` table
-//!   ([`kvm::board_cpuid`]) and an engine that can execute what hardware
-//!   cannot fetch ([`cpu::AccelCpu`]'s interpreter fallback). What still has to
-//!   be said on the kernel's command line, and why it is a statement about the
-//!   *scheduler* rather than about the board, is under **Time** below.
+//!   signature off the emulated namespace — **in about three seconds of wall
+//!   clock against the interpreted run's sixteen minutes**, on the board's own
+//!   command line with nothing added to it. Two things had to exist for that
+//!   and both are in this module: a `CPUID` table ([`kvm::board_cpuid`]) and an
+//!   engine that can execute what hardware cannot fetch ([`cpu::AccelCpu`]'s
+//!   interpreter fallback). The third was **Time**, below, and it was not in
+//!   this module at all.
 //!
 //! # The interrupt controllers stay in userspace, and that is the decision
 //!
@@ -122,9 +117,9 @@
 //! including the end-of-interrupt at the close of every interrupt; there is no
 //! `irqfd`, no `ioeventfd`, no posted interrupt and no paravirtual EOI; and the
 //! local APIC's timer is a device on the board's virtual time rather than a
-//! host `hrtimer`. A whole `q35-linux` boot to a shell measures about 600,000
-//! guest entries, of which roughly 520,000 are port accesses and 80,000 are
-//! MMIO — and it still takes nine seconds. The split irqchip is the natural
+//! host `hrtimer`. A whole `q35-linux` boot to a shell measures about 132,000
+//! guest entries, of which roughly 69,000 are port accesses and 63,000 are
+//! MMIO — and it still takes three seconds. The split irqchip is the natural
 //! upgrade if that ever stops being true, and it is *only* available at the
 //! price named above.
 //!
@@ -132,40 +127,52 @@
 //! the board's local APIC is a device that implements neither, and a processor
 //! must not advertise what the machine around it has not got.
 //!
-//! # Time, which is where this is still unfinished
+//! # Time, which is where this used to be unfinished
 //!
-//! **Virtual time does not advance while a vCPU is inside `KVM_RUN`.** A
+//! **Virtual time did not advance while a vCPU was inside `KVM_RUN`.** A
 //! scheduler round ends when every runnable returns; an accelerated processor
-//! returns when the *guest* exits; so a guest that runs without exiting holds
-//! the round and the board's clocks stand still for as long as it takes. A
+//! returns when the *guest* exits; so a guest that ran without exiting held
+//! the round and the board's clocks stood still for as long as it took. A
 //! delay loop is exactly such a guest, and a kernel is full of them.
 //!
-//! Two things a stock Linux kernel does are that one fact, and both are
-//! written out in `tests/kvm_q35_linux.rs`: `hpet_counting()` reads the HPET
-//! counter twice within one round and finds it unmoved, and
-//! `timer_irq_works()` calls `mdelay()` between two reads of `jiffies` and
-//! finds no tick. The first disables the HPET and is self-correcting — the
-//! 8254 takes the tick over through the same multiplexer — and the second
-//! needs `no_timer_check` on the command line until the scheduler can advance
-//! virtual time under a running guest.
+//! Two things a stock Linux kernel does were that one fact, and both are
+//! written out in `tests/kvm_q35_linux.rs`: `hpet_counting()` read the HPET
+//! counter twice within one round and found it unmoved, and
+//! `timer_irq_works()` waited out a delay loop between two reads of `jiffies`
+//! and saw no tick, which panics `check_timer()` unless the command line says
+//! `no_timer_check`. The visible symptom in between was that a kernel
+//! calibrating its time-stamp counter against a board timer measured the
+//! *host's* TSC against *virtual* microseconds and concluded it was on a
+//! **176,273 MHz** processor, so every delay it computed was wrong by
+//! forty-four times.
 //!
-//! That is [`ThreadingMode::Accel`](crate::core::sched::ThreadingMode::Accel)'s
-//! whole job — §4.2's *"CPUs run in hardware and virtual time is slaved to the
-//! host clock; the scheduler becomes a deadline service"* — and it is
-//! unimplemented one level below this module, in `core::sched`. Nothing in
-//! `accel/` can substitute for it: bounding a guest's execution needs either a
-//! host signal, which `CLAUDE.md` rules out, or a clock read, which a device
-//! may not make. The seam it would use already exists —
-//! [`RateController`](crate::core::sched::RateController),
-//! [`HostClock`](crate::core::sched::HostClock) and `Machine::set_host_clock`
-//! — and nothing in the run path calls it yet.
+//! That word is off the command line and that number is now about 3,993 MHz on
+//! a 3,993,994 kHz host — it moves in the last digits run to run, because it is
+//! a measurement rather than a constant, which is the point. Two halves, one on each side of this module's floor:
 //!
-//! The visible symptom in the meantime is that a guest's own time runs at a
-//! rate that has nothing to do with the board's. A kernel that calibrates its
-//! time-stamp counter against this board's ACPI timer measures the *host's*
-//! TSC against *virtual* microseconds and concludes it is on a 176 THz
-//! processor. It boots, it runs, and every delay it computes from that number
-//! is wrong by the same factor.
+//! * **[`ThreadingMode::Accel`](crate::core::sched::ThreadingMode::Accel), in
+//!   `core::sched`** — §4.2's *"CPUs run in hardware and virtual time is
+//!   slaved to the host clock; the scheduler becomes a deadline service"*. A
+//!   round's elapsed virtual time is read off the injected
+//!   [`HostClock`](crate::core::sched::HostClock) rather than taken from what
+//!   the runnables reported, because a runnable that reports its whole budget
+//!   — which is all an accelerated core *can* report — makes the board's
+//!   clocks run at a rate set by the quantum. The seam was already there;
+//!   nothing in the run path called it.
+//! * **A preemption interval, in [`preempt`]** — because slaving time to the
+//!   wall is not enough on its own. A guest spinning in `RDTSC` and `PAUSE`
+//!   takes no exits at all, so the round cannot end and the tick that is *due*
+//!   cannot be delivered. Bounding that needs the kernel to interrupt the
+//!   thread, and the only mechanism that does is a signal. [`preempt`] works
+//!   through every alternative — `immediate_exit`, the exit flag, an `ioctl`
+//!   from another thread, VMX's notify window — and why each fails, and why
+//!   the rule that forbids a signal in the *safe-point protocol* does not
+//!   reach a preemption timer in a Linux-only module.
+//!
+//! What it costs is stated where it is set: [`cpu`]'s slice under this mode is
+//! **one guest exit long**, so every access a guest makes to a device sees the
+//! wall clock as of that access, at the price of a scheduler round per exit —
+//! about 130,000 of them across a `q35-linux` boot, in three seconds.
 //!
 //! # A board, not a harness
 //!
@@ -198,11 +205,11 @@
 //! | given up | why, and what it means in practice |
 //! | --- | --- |
 //! | **Reproducibility** | instruction timing, the instant an interrupt is taken and the TSC all come from the host. [`kvm::Vcpu::into_runnable`] and [`cpu::AccelCpus::open`] *refuse* a deterministic [`ThreadingMode`](crate::core::sched::ThreadingMode) rather than trusting a caller to know. So: no record/replay, no rewind, and no state hash that would mean anything. |
-//! | **The board's timing** | see **Time** above. Guest work costs no virtual time, so a guest's idea of elapsed time and the board's diverge without bound, and anything a guest measures against a board clock — a calibration, a timeout, a baud rate — comes out wrong. Guest-visible *behaviour* is unaffected; guest-visible *timing* is not modelled at all. |
+//! | **The board's declared timing** | see **Time** above. Under [`ThreadingMode::Accel`](crate::core::sched::ThreadingMode::Accel) the board's clocks track the *host's* wall clock rather than the frequencies the machine file names, so a guest measuring one clock against another gets consistent answers and a guest measuring anything against the machine file gets host time. That is a real trade and not the same as the old one: guest-visible timing is now *modelled by the host*, where before it was not modelled at all. |
 //! | **The processor the machine file asked for** | `cpu::x86` answers `CPUID` from its declared [`Variant`](crate::cpu::x86::Variant); an accelerated one answers from the host's silicon, filtered by [`kvm::board_cpuid`]. A guest takes different paths through its own feature dispatch under the two engines and prints a different model name. |
 //! | **The A20 gate** | modelled inside the interpreter for want of anywhere else to put it, so a guest's *hardware* accesses are not masked ([`cpu`]). A board that closes the gate and relies on the megabyte wrap is a board to interpret. |
 //! | **Three fields of the snapshot** | a pending `NMI`, the `NMI` level and `halted` are this module's rather than the shell's, for want of a public setter; [`cpu`] names each and the one-line change that would end it. |
-//! | **A hard bound on stopping** | a guest that takes no exits is not preemptible, because the alternative is a host signal ([`kvm`]). |
+//! | **A hard bound on *stopping*** | a stop-the-world request reaches a guest only at its next exit, because the safe-point protocol is a flag the guest's own exits are checked against ([`kvm`]). [`preempt`]'s interval bounds how long an *entry* lasts, which is a different question and does not make a stop synchronous. |
 //!
 //! What is *not* given up: the memory map, the devices, the interrupt
 //! controllers, the wires, the ACPI tables, the snapshot format and the
@@ -218,15 +225,19 @@
 //!
 //! # `unsafe`, and where it is
 //!
-//! Two of `ROADMAP.md` §0's seven sanctioned subsystems meet here, and this
-//! module uses **both and only those two**:
+//! Three of `ROADMAP.md` §0's seven sanctioned subsystems meet here, and this
+//! module uses **those three and no others**:
 //!
 //! | Site | Where | What |
 //! | --- | --- | --- |
-//! | the raw-syscall accel backends | [`sys`] | one `asm!` block, plus the wrappers that establish what each kernel entry point needs |
+//! | the raw-syscall accel backends | [`sys`] | one `asm!` block, plus the wrappers that establish what each kernel entry point needs — the `ioctl`s, the maps, and the interval timer [`preempt`] arms |
 //! | the RAM host-pointer fast path | [`sys::Mapping::cells`] | one `from_raw_parts`, for the `kvm_run` page |
+//! | the host signal disposition | [`crate::host::signal`], *not here* | [`preempt`] needs `Signal::PREEMPT` to have a handler, and asks the one module in the tree that installs one |
 //!
-//! No seventh site is created and neither existing one is widened. Every block
+//! **No eighth subsystem is created and no existing one is widened.**
+//! [`preempt`] itself contains no `unsafe` at all: it is a `timer_create` and
+//! two `timer_settime`s through [`sys`]'s existing wrappers, and a disposition
+//! installed by a `host/` module that already had that job. Every block
 //! carries a `// SAFETY:` comment naming its invariant and who upholds it.
 //!
 //! Worth noting what page-aligning `RamStore` did *not* cost: nothing.
@@ -250,6 +261,7 @@ use core::fmt;
 
 pub mod board;
 pub mod kvm;
+pub mod preempt;
 pub mod sys;
 
 #[cfg(feature = "cpu-x86")]

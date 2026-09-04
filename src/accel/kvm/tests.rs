@@ -498,6 +498,69 @@ fn a_raised_exit_flag_declines_to_enter_the_guest() {
     assert!(vcpu.stats().entries > 0);
 }
 
+/// **The thing the module documentation used to say was impossible.**
+///
+/// *"A vCPU spinning in a register-only loop with interrupts masked will run
+/// until something else makes it exit, and there is nothing portable left to
+/// force one."* This is that guest — `cli; jmp $`, which takes no exits, has
+/// no timer to rescue it, and would hold `KVM_RUN` for ever — and it comes
+/// back, because [`Vcpu::set_preempt_nanos`] armed the interval that pulls it
+/// out. Without the preemption this test would hang rather than fail, which
+/// is why it is worth having: nothing else in the suite can hang.
+#[test]
+fn a_guest_that_takes_no_exits_at_all_is_still_bounded() {
+    let Some(kvm) = kvm() else { return };
+    let guest = Guest::new(kvm);
+
+    //   cli                fa
+    //   jmp $              eb fe
+    let code: &[u8] = &[0xfa, 0xeb, 0xfe];
+    let mut vcpu = guest.vcpu_at(code);
+    vcpu.set_preempt_nanos(super::super::preempt::DEFAULT_NANOS);
+    assert_eq!(vcpu.preempt_nanos(), super::super::preempt::DEFAULT_NANOS);
+
+    // Several, because the first entry may be declined outright: the interval
+    // is armed a hair before `KVM_RUN` and an expiry that lands in that hair
+    // is a signal already pending, which the kernel answers with `EINTR`
+    // rather than a guest entry. That is the *periodic* timer's own recovery
+    // — see [`IntervalTimer::arm`] — and what matters is that every one of
+    // these returns.
+    let mut reached_the_loop = false;
+    for _ in 0..16 {
+        let run = vcpu.run_until_exit(1).expect("the run returns");
+        // Nothing happened *to the guest*: it was interrupted, not stopped,
+        // and resuming is unconditional — which is what `Run::completed`
+        // means.
+        assert!(run.exit.is_none(), "{run:?}");
+        // Still inside its own three bytes, exactly where a resumed guest
+        // should be, and `jmp $` is where it settles.
+        let rip = vcpu.regs().expect("regs").rip;
+        assert!((CODE..CODE + 3).contains(&rip), "{rip:#x}");
+        reached_the_loop |= rip == CODE + 1;
+    }
+    assert!(reached_the_loop, "the guest never got as far as its loop");
+    // Every one of those returns was a preemption: this guest offers no other
+    // way out.
+    assert!(vcpu.stats().declined > 0, "{:?}", vcpu.stats());
+}
+
+/// And with no bound set it is *not* preemptible, which is the honest
+/// statement of what the default costs.
+///
+/// Asserted the only way that cannot hang: a guest that does end, entered with
+/// no interval armed, must reach its `HLT` and take no preemption.
+#[test]
+fn no_bound_means_no_preemption() {
+    let Some(kvm) = kvm() else { return };
+    let guest = Guest::new(kvm);
+    let code: &[u8] = &[0x90, 0xf4]; // nop; hlt
+    let vcpu = guest.vcpu_at(code);
+    assert_eq!(vcpu.preempt_nanos(), 0, "off unless a caller asks");
+    let run = vcpu.run_until_exit(4).expect("the run returns");
+    assert_eq!(run.exit.expect("halted").reason, ExitReason::HALT);
+    assert_eq!(vcpu.stats().declined, 0);
+}
+
 #[test]
 fn immediate_exit_is_what_makes_that_race_free() {
     let Some(kvm) = kvm() else { return };
