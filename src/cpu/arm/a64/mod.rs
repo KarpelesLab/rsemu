@@ -149,6 +149,35 @@
 //! becoming writable when `Access::El0Ro` was corrected to let EL1 write
 //! `TPIDRRO_EL0`: `llvm-mc` has a writable name for one and not for the others.
 //!
+//! The **whole table** has since been swept in one piece, at the layer that
+//! decides UNDEFINED rather than at the layer that matches fixed bits: every
+//! row's fixed encoding, every one- and two-bit flip of the bits each row
+//! leaves free, and every value of those bits where there are twelve or fewer
+//! of them — **369 600 words**, each executed on a core and judged by whether
+//! it raised `ESR_EL1.EC = 0`. Nothing this core accepts is rejected by
+//! `llvm-mc`, and of the 276 698 words both accept, every mnemonic agrees
+//! modulo aliasing (`llvm-mc` prints `mov` for `ORR Xd, XZR, Xm`, `cmp` for
+//! `SUBS XZR`, `b.eq` where the suffix is this core's, and the `2` suffix on
+//! an upper-half SIMD operation where this core puts the half in the operands).
+//!
+//! The 4 978 words `llvm-mc` decodes and this core does not are four groups,
+//! all deliberate: `FCMP`/`FCMPE` against zero with a **non-zero `Rm`**, which
+//! `exec` refuses as unallocated and `llvm-mc` ignores; IMPLEMENTATION DEFINED
+//! system registers and `SYS`/`SYSL` operations this core does not implement;
+//! `HVC`, because EL2 is not implemented; and `HLT`, because halting debug is
+//! not.
+//!
+//! Two things about *how* that sweep is run are worth writing down, because
+//! both produced large phantom results before they were found — 82 004
+//! over-acceptances that were all the harness's. A core that has executed one
+//! `MSR SCTLR_EL1` has its MMU on with no tables behind it, so every word
+//! after it takes an instruction abort — `EC = 0x21`, not zero — and reads as
+//! *accepted*; and a core that has executed one `WFI` retires nothing
+//! afterwards and leaves `ESR_EL1` alone, which reads as accepted too. A
+//! sweep of this kind wants a **fresh core per word**, and the answer it gets
+//! should be spot-checked by re-asking about the words it flagged, one at a
+//! time.
+//!
 //! The saturating group was swept the same way and **enumerated** rather than
 //! sampled: every `Q`, `U`, `size`, `opcode` and `immh`:`immb` of the
 //! three-same, two-misc, three-different and shift-by-immediate encodings,
@@ -1608,6 +1637,13 @@ impl Device for Cpu {
         let mut session = self.session.lock();
         session.state = State::new(&cfg);
         session.tlb.flush();
+        // Both caches, and for the same reason: a reset can be accompanied by
+        // a reload of the memory a translation was lifted from, and a block
+        // cache is derived state in exactly `ROADMAP.md` §4.5's sense.
+        #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+        if let Some(jit) = session.jit.as_mut() {
+            jit.flush();
+        }
         drop(session);
         if kind == ResetKind::Cold {
             // A cold start has nothing driving the interrupt pins yet. A warm
@@ -1703,6 +1739,20 @@ impl Device for Cpu {
         // The TLB is derived state and is never restored: it comes back empty,
         // which is always correct (`ROADMAP.md` §4.5).
         session.tlb.flush();
+        // **And so is the block cache**, which is the harder half to remember
+        // because a snapshot's own chunk says nothing about it. A restore
+        // replaces the RAM a block was lifted from, so every translation in
+        // the cache describes bytes that are no longer there — and nothing
+        // else would notice, because `jit::dispatch`'s invalidation watches
+        // *guest stores* and a restore is not one. Measured: a debugger that
+        // patched one instruction into a hot loop, then round-tripped the
+        // machine through `save`/`load` to publish it, still ran the stale
+        // block 107 times out of 66 667 iterations. `cpu::riscv` and
+        // `cpu::x86` have always flushed here; this core did not.
+        #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+        if let Some(jit) = session.jit.as_mut() {
+            jit.flush();
+        }
         drop(session);
         self.lines.set_all(pending);
         Ok(())

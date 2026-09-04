@@ -500,6 +500,17 @@ pub struct Lifted {
 /// `a_cold_block_fits_inside_a_scheduler_quantum` asserts the bound rather
 /// than leaving it in prose.
 ///
+/// **Two thirds of a quantum was not the safe side of that line, and this is
+/// the correction.** A bound that fits *once* is not a bound that can be paid
+/// repeatedly: `admit` deducts what the quantum has already spent, so the last
+/// 5 188 ticks of every 10 000 could admit nothing, and the PC after each
+/// interpreted instruction is in the middle of a block and so is uncosted too.
+/// A measured boot spent **19.4%** of its guest instructions in that tail —
+/// more than three times everything outside the lifted subset put together.
+/// `engine`'s `Probe` closes it by lifting the cold PC rather than guessing
+/// at it, which is also why this number is no longer the only thing standing
+/// between a short quantum and an interpreted run.
+///
 /// It does a second job under [`Shape::Trace`]: it is the only thing that
 /// bounds an unrolled loop, and — because a dispatcher checks its exit flag at
 /// block boundaries and a trace has fewer of them — it is also the bound on

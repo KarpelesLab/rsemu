@@ -41,9 +41,11 @@
 //!   depend on the engine: an interpreter overruns its budget by one
 //!   instruction and a trace by up to sixty-four, the overrun is carried as
 //!   `State::debt`, and both numbers are in the snapshot a machine's state
-//!   hash is taken over. [`Costs`] keeps the bound tight enough for that tail
-//!   to be short, and the guard is asked once per block of a chain, against
-//!   what the chain has *left*.
+//!   hash is taken over. The guard is asked once per block of a chain, against
+//!   what the chain has *left*, and [`Costs`] is what it asks — with
+//!   [`Probe`] behind it for the PCs [`Costs`] has no answer for, because a
+//!   guard that guesses the worst case at a cold PC declines the whole tail of
+//!   every quantum and never learns better.
 //! * **A pending interrupt is looked for at every block boundary**, chained
 //!   ones included, which is what keeps a sixteen-block chain
 //!   indistinguishable from sixteen one-block calls. A store into the GIC ends
@@ -56,41 +58,75 @@
 //! Linux 6.12 `arm64` with a busybox initramfs, 512 MiB of DRAM — one binary,
 //! three engines, over twenty seconds of virtual time:
 //!
-//! | `engine` | 20 s of guest time |
-//! | --- | --- |
-//! | `interp` | 17.35 s |
-//! | `jit` | 11.21 s (1.55×) |
-//! | `jit-host` | **6.34 s (2.73×)** |
+//! | `engine` | before [`Probe`] | with it |
+//! | --- | --- | --- |
+//! | `interp` | 18.56 s | 18.94 s |
+//! | `jit` | 12.17 s (1.52×) | 10.42 s (**1.82×**) |
+//! | `jit-host` | 6.06 s (3.07×) | 3.37 s (**5.61×**) |
 //!
-//! Median of three **interleaved** reps — one of each engine, in turn, round
+//! Median of five **interleaved** reps — one of each engine, in turn, round
 //! and round — because the interpreter is the control and a control measured
-//! in a different sitting is not one. All nine runs charged 199 990 000 cycles
-//! and finished on one state hash, `0x415f52aebd310878`.
+//! in a different sitting is not one. Every run of both columns charged the
+//! same cycles and finished on one state hash, which is the claim at the top
+//! of this file: the guard moved, and the guest did not notice.
 //!
-//! What the mechanisms did, over that run:
+//! The absolute seconds are worth less than the ratios. The host was running
+//! several builds while these were taken, and the interpreter column — the
+//! same code in both — moved 2% between the two sittings; the ratio within a
+//! sitting is what is contention-proof, which is the whole reason the reps are
+//! interleaved.
+//!
+//! What the mechanisms did, over the right-hand column's run:
 //!
 //! | | |
 //! | --- | --- |
-//! | blocks executed | 18 774 915 |
-//! | of those, compiled to host code | 18 774 316 (**99.997%**) |
-//! | of those, reached by a patched exit | 14 341 043 (76.4%) |
-//! | distinct blocks lifted | 16 655 |
-//! | guest instructions retired **inside** a block | 123 794 600 (**79.2%**) |
-//! | compiled loads served by an inlined probe | 16 149 884 |
-//! | compiled stores served the same way | 10 535 057 |
-//! | translations a guest store invalidated | 7 801 |
+//! | blocks executed | 23 810 578 |
+//! | of those, compiled to host code | 23 809 916 (**99.997%**) |
+//! | of those, reached by a patched exit | 20 571 853 (86.4%) |
+//! | distinct blocks lifted | 17 638 |
+//! | guest instructions retired **inside** a block | 153 130 249 (**97.96%**) |
+//! | compiled loads served by an inlined probe | 18 712 518 |
+//! | compiled stores served the same way | 13 350 310 |
+//! | translations a guest store invalidated | 10 037 |
+//! | blocks the **budget guard** lifted to price | 14 506 |
 //!
-//! The 599 blocks the code generator refused are the ones holding a `UDIV` or
-//! an `SDIV`, which are the only two ops this frontend emits that `jit::x86`
-//! does not lower. That is 0.003%, and it is why [`lift`](super::lift) goes
-//! out of its way not to emit [`Opcode::ADDC`](crate::ir::Opcode::ADDC): the
+//! The blocks the code generator refused are the ones holding a `UDIV` or an
+//! `SDIV`, which are the only two ops this frontend emits that `jit::x86` does
+//! not lower. That is 0.003%, and it is why [`lift`](super::lift) goes out of
+//! its way not to emit [`Opcode::ADDC`](crate::ir::Opcode::ADDC): the
 //! architecture's own `AddWithCarry` is refused too, and `CMP` is `SUBS`, so a
 //! lifter that used it would have had *every* block refused rather than six
 //! hundred.
 //!
-//! The inlined probes are worth the last step of that ratio on their own:
-//! before `mmu::Tlb` had a shadow to publish, the same sweep put `jit-host` at
+//! The inlined probes are worth a step of that ratio on their own: before
+//! `mmu::Tlb` had a shadow to publish, the same sweep put `jit-host` at
 //! 6.92 s and **2.54×**.
+//!
+//! ## Where the rest of it was, and it was not in the frontend
+//!
+//! 79.2% of guest instructions used to retire inside a block and 97.96% do
+//! now, and the whole of that difference is [`Probe`] rather than anything
+//! newly lifted. The instructions the interpreter was running were profiled
+//! by decoded table row over a real boot, and they came out like this:
+//!
+//! | why the interpreter ran it | instructions | of all interpreted |
+//! | --- | --- | --- |
+//! | the **budget guard** declined a block | 30 292 743 | **94.4%** |
+//! | outside the lifted subset | 1 795 754 | 5.6% |
+//! | a lift that produced nothing | 251 | 0.0% |
+//!
+//! So every exclusion [`lift`](super::lift) documents — the whole SIMD and
+//! floating-point family, the exclusives, `LDTR`/`STTR`, `RBIT`, every system
+//! instruction — cost **1.15%** of the guest's instructions between them, and
+//! the guard cost 19.4%. Within that 5.6%, measured over the same boot:
+//! `MRS` 1 024 738 (of which `SP_EL0` alone is 645 329 — Linux's `current`),
+//! the exclusives and the acquire/release accesses 339 581, `MSR` 224 806,
+//! `SYS` — the `DC`/`IC`/`TLBI` maintenance operations — 204 552, and `RBIT`
+//! 1 584. **Not one SIMD or floating-point instruction executed**, and no
+//! `LDTR`/`STTR` either: an `arm64` kernel booting to a busybox shell uses
+//! neither, so the largest documented absence in the frontend is worth nothing
+//! at all on the guest this core exists to run. That is written down so the
+//! next person picks by measurement rather than by list order.
 //!
 //! # What is checked at a block boundary rather than at an instruction
 //!
@@ -290,6 +326,23 @@ pub(super) struct Jit {
     /// mutation pass is how that was found, by way of an assertion that could
     /// not hold.
     smc: u64,
+    /// What the budget guard's own lifter has done.
+    probes: Probes,
+}
+
+/// What [`Probe`] did, kept across calls because a `Probe` lives for one.
+///
+/// Two counters rather than one, for the reason [`Stats::smc`] and
+/// [`Stats::smc_interpreted`] are two: a single total lets either half stop
+/// working while the other keeps it above zero. A mutation pass demonstrated
+/// exactly that — switching the reuse off changed no test in the tree, because
+/// the dispatcher's own `translated` counter never sees the guard's lift.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Probes {
+    /// Blocks the guard lifted to learn a bound it had no answer for.
+    lifted: u64,
+    /// Those the dispatcher then took rather than lifting again.
+    reused: u64,
 }
 
 /// What this core's translated engine has done.
@@ -331,6 +384,16 @@ pub struct Stats {
     pub fast_loads: u64,
     /// Compiled stores served the same way.
     pub fast_stores: u64,
+    /// Blocks the **budget guard** lifted, to replace a worst-case guess that
+    /// did not fit with the bound the block actually has.
+    ///
+    /// Zero on a run whose quanta are always long enough for the cold bound;
+    /// on a real guest it is the tail of every quantum, and it is what stops
+    /// that tail from being interpreted an instruction at a time. `Probe`, in
+    /// this module, is the mechanism and carries the argument for it.
+    pub probed: u64,
+    /// Those the dispatcher then took rather than lifting the same PC twice.
+    pub probe_reused: u64,
 }
 
 impl Jit {
@@ -356,6 +419,7 @@ impl Jit {
             retired: 0,
             interpreted: 0,
             smc: 0,
+            probes: Probes::default(),
         }
     }
 
@@ -379,6 +443,8 @@ impl Jit {
             interpreted: self.interpreted,
             fast_loads: self.fast().0,
             fast_stores: self.fast().1,
+            probed: self.probes.lifted,
+            probe_reused: self.probes.reused,
         }
     }
 
@@ -460,6 +526,16 @@ impl Jit {
 #[derive(Debug)]
 struct Costs {
     slots: Box<[Slot]>,
+    /// Which era of the table an entry has to carry to be believed.
+    ///
+    /// **Bumped rather than swept**, because a sweep is not free at this size
+    /// and it happens on every self-modifying-code hit: a guest store into a
+    /// page a translation came from clears the whole table, and a Linux boot
+    /// does that thousands of times. Sixty-five thousand slots of thirty-two
+    /// bytes is two megabytes of `memset` per clear, on the emulation thread,
+    /// for a table that is a pure cache — so the invalidation is a counter and
+    /// a stale slot is simply never believed again.
+    era: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -467,13 +543,16 @@ struct Slot {
     pc: u64,
     key: u64,
     ticks: u64,
-    live: bool,
+    /// The [`Costs::era`] this answer was recorded under; zero is *never*,
+    /// which is what makes a freshly allocated table empty.
+    era: u64,
 }
 
 impl Costs {
     fn new() -> Costs {
         Costs {
             slots: vec![Slot::default(); COST_SLOTS].into_boxed_slice(),
+            era: 1,
         }
     }
 
@@ -487,21 +566,22 @@ impl Costs {
     #[inline]
     fn get(&self, pc: u64, key: u64) -> Option<u64> {
         let slot = &self.slots[Costs::index(pc)];
-        (slot.live && slot.pc == pc && slot.key == key).then_some(slot.ticks)
+        (slot.era == self.era && slot.pc == pc && slot.key == key).then_some(slot.ticks)
     }
 
     #[inline]
     fn put(&mut self, pc: u64, key: u64, ticks: u64) {
+        let era = self.era;
         self.slots[Costs::index(pc)] = Slot {
             pc,
             key,
             ticks,
-            live: true,
+            era,
         };
     }
 
     fn clear(&mut self) {
-        self.slots.fill(Slot::default());
+        self.era += 1;
     }
 }
 
@@ -624,7 +704,14 @@ enum Admit {
 /// afterwards has not wasted the walk: the interpreter's own fetch then finds
 /// the entry this translation just filled, and charges what it would have
 /// charged anyway.
-fn admit(cfg: &Config, costs: &Costs, exec: &mut Exec<'_>, pc: u64, remaining: u64) -> Admit {
+fn admit(
+    cfg: &Config,
+    costs: &mut Costs,
+    probe: &mut Probe<'_>,
+    exec: &mut Exec<'_>,
+    pc: u64,
+    remaining: u64,
+) -> Admit {
     if exec.pending_interrupt().is_some() || exec.st.wfi {
         return Admit::Interpret;
     }
@@ -640,28 +727,170 @@ fn admit(cfg: &Config, costs: &Costs, exec: &mut Exec<'_>, pc: u64, remaining: u
         strict_align,
     };
     let key = lift::key(&world, SHAPE);
-
-    // Known unliftable, or too big for what is left of the budget: either way
-    // the interpreter takes this instruction, and reaching it without a lift
-    // that fails at its first instruction is the whole point of remembering
-    // the first.
-    let bound = match costs.get(pc, key) {
-        Some(0) => return Admit::Interpret,
-        Some(bound) => bound,
-        None => worst_bound(strict_align, translating),
-    };
-    if bound > remaining.saturating_sub(exec.used) {
-        return Admit::Interpret;
-    }
-
-    Admit::Ready(Admitted {
+    let at = Admitted {
         world,
         key,
         page: pc & !PAGE_MASK,
         base: phys & !PAGE_MASK,
         access: per_access(strict_align, translating),
         entry: if translating { WALK_ACCESSES } else { 0 },
-    })
+    };
+
+    // Known unliftable, or too big for what is left of the budget: either way
+    // the interpreter takes this instruction, and reaching it without a lift
+    // that fails at its first instruction is the whole point of remembering
+    // the first.
+    let left = remaining.saturating_sub(exec.used);
+    let bound = match costs.get(pc, key) {
+        Some(bound) => bound,
+        None => {
+            // The conservative answer first, because it is free: while a
+            // quantum still has room for the largest block this frontend can
+            // produce, nothing is gained by knowing how big *this* one is.
+            // Only once it does not fit is the guess worth replacing with the
+            // truth — see [`Probe`].
+            let cold = worst_bound(strict_align, translating);
+            if cold <= left {
+                cold
+            } else {
+                probe.bound(costs, &at, pc, left)
+            }
+        }
+    };
+    // Zero is [`Costs`]'s *there is no block here*, so the guard reads as one
+    // test: nothing to run, or too much to fit.
+    if bound == 0 || bound > left {
+        return Admit::Interpret;
+    }
+
+    Admit::Ready(at)
+}
+
+/// The lifter, reachable from the budget guard as well as from the dispatcher.
+///
+/// # Why the guard is allowed to lift
+///
+/// [`Costs`] answers *"what is the most this block can charge"* for a PC a
+/// block has already been lifted at. Every other PC gets [`worst_bound`], and
+/// on a real guest that is where nearly all the time went — for a reason that
+/// is a cold-start deadlock rather than a tuning mistake:
+///
+/// * a scheduler quantum on `machines/arm64-virt.machine` is **10 000 ticks**,
+///   and [`worst_bound`] is **5 188** — sixty-four instructions of a pair
+///   access, split into bytes, each byte walking four levels;
+/// * so as soon as a quantum has less than 5 188 ticks left, no PC without a
+///   resident cost can be admitted, and the interpreter takes one instruction;
+/// * the PC after that instruction is in the *middle* of a block, which is a
+///   PC nothing was ever lifted at — and it stays that way, because the only
+///   thing that fills [`Costs`] is a block being lifted there.
+///
+/// The tail therefore never recovers. Over half of every quantum was
+/// interpreted an instruction at a time, and a measured Linux boot spent
+/// **19.6%** of its guest instructions there — 94% of everything the
+/// interpreter ran, against 5.6% for every instruction outside the lifted
+/// subset put together. The bound the guard was guessing at is two orders of
+/// magnitude too big: a real block on that guest bounds at about 265 ticks,
+/// not 5 188. So the fix is to stop guessing and lift.
+///
+/// A lift is not free, which is why it is only reached when the conservative
+/// answer has already failed: a PC with a resident cost is answered from the
+/// table, and a PC whose worst case fits is admitted without one. What is left
+/// is exactly the tail, where the alternative was interpreting hundreds of
+/// instructions one dispatcher round trip at a time.
+///
+/// **Nothing about it is guest-visible.** Lifting reads guest memory through
+/// [`MemAttrs::DEBUG`], charges no ticks and changes no state, and what it
+/// produces is still a *bound* — the guard refuses anything that does not fit,
+/// so a block admitted after a probe can overrun no more than one admitted
+/// without it.
+///
+/// The block itself is kept in [`Probe::held`] so that the dispatcher's own
+/// `Frontend::translate` can take it rather than lift the same PC twice in one
+/// call.
+struct Probe<'a> {
+    space: &'a AddressSpace,
+    /// Lifting reads *ahead* of the guest: up to sixty-four instructions it
+    /// has not asked for. A fetch is an ordinary access and a read-ahead is
+    /// not, so this is the one place in the core that reads guest memory the
+    /// way a debugger does — CLAUDE.md's "a debugger read must not pop a FIFO"
+    /// is exactly the hazard. Nothing about the *translation* is relaxed: that
+    /// happens in [`admit`], through the fetch path, with its walk and its
+    /// permission check.
+    attrs: MemAttrs,
+    /// The last block lifted, and the `(pc, key)` it answers for.
+    held: Option<(u64, u64, lift::Lifted)>,
+    /// What this guard has lifted, and how much of it was used twice.
+    counts: &'a mut Probes,
+}
+
+impl Probe<'_> {
+    /// Lift at `pc` and read the block's bound off it, remembering both.
+    ///
+    /// Returns zero — [`Costs`]'s *there is no block here* sentinel — when the
+    /// instruction at `pc` is outside the lifted subset, which is the same
+    /// answer `Frontend::translate` records for it.
+    ///
+    /// **The two writers are redundant, and that is stated rather than
+    /// hidden**: a mutation pass switched off each in turn and nothing failed,
+    /// because whichever survives fills the table on the next pass. What is
+    /// lost by dropping either is one dispatcher round trip per `(pc, key)`
+    /// per [`Costs::era`] — measured at three translations instead of two on
+    /// the paged test below — so the redundancy is a cost, not a correctness
+    /// claim, and both stay because either alone leaves a case paying for it. Returns [`u64::MAX`], a
+    /// bound nothing can fit, where a lift is not worth doing or did not
+    /// happen; neither is recorded, so the next visit asks again.
+    fn bound(&mut self, costs: &mut Costs, at: &Admitted, pc: u64, left: u64) -> u64 {
+        // Below the cheapest block there is, nothing a lift could find would
+        // fit: a block charges its entry walk and at least one fetch tick.
+        if left <= at.entry {
+            return u64::MAX;
+        }
+        let Ok(lifted) = self.lift(at, pc) else {
+            return u64::MAX;
+        };
+        let bound = if lifted.insns > 0 {
+            block_bound(&lifted.block, at.access, at.entry)
+        } else {
+            0
+        };
+        costs.put(pc, at.key, bound);
+        self.counts.lifted = self.counts.lifted.wrapping_add(1);
+        self.held = Some((pc, at.key, lifted));
+        bound
+    }
+
+    /// Lift at `pc`, reading only what the entry translation covers.
+    fn lift(&mut self, at: &Admitted, pc: u64) -> Result<lift::Lifted> {
+        let space = self.space;
+        let attrs = self.attrs;
+        let base = at.base;
+        let page = at.page;
+        let mut src = |addr: u64| {
+            // Outside the entry page there is no translation to read through,
+            // so the lifter is told the bytes are unreadable and ends the
+            // block. It would have ended it at the page bound anyway; this is
+            // the belt.
+            if addr & !PAGE_MASK != page {
+                return None;
+            }
+            space
+                .read(base | (addr & PAGE_MASK), Width::U32, attrs)
+                .ok()
+                .map(|v| v as u32)
+        };
+        lift::lift(&at.world, pc, &mut src, lift::MAX_INSNS, SHAPE)
+    }
+
+    /// The block already lifted for `(pc, key)`, if this probe still holds it.
+    fn take(&mut self, pc: u64, key: u64) -> Option<lift::Lifted> {
+        match &self.held {
+            Some((held_pc, held_key, _)) if *held_pc == pc && *held_key == key => {
+                self.counts.reused = self.counts.reused.wrapping_add(1);
+                self.held.take().map(|(_, _, lifted)| lifted)
+            }
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +934,7 @@ pub(super) fn advance(
         retired,
         interpreted,
         smc,
+        probes,
     } = jit;
     let mut exec = Exec::new(state, tlb, space, cfg, lines, exits);
     let pc = exec.st.pc;
@@ -714,7 +944,13 @@ pub(super) fn advance(
     // guest is "not a block at all" — an `MSR`, an `SVC`, a floating-point
     // instruction — and reaching the interpreter for one should not cost a
     // frontend, a host and a dispatcher round trip.
-    let at = match admit(cfg, costs, &mut exec, pc, remaining) {
+    let mut probe = Probe {
+        space,
+        attrs: MemAttrs::DEBUG.with_requester(cfg.requester),
+        held: None,
+        counts: probes,
+    };
+    let at = match admit(cfg, costs, &mut probe, &mut exec, pc, remaining) {
         Admit::Ready(at) => at,
         Admit::Interpret => return interpret(interpreted, smc, disp, costs, exec),
         // The instruction at `pc` has not started, so its own PC is both where
@@ -728,15 +964,7 @@ pub(super) fn advance(
     let mut front = Lifter {
         cfg,
         at,
-        space,
-        // Lifting reads *ahead* of the guest: up to sixty-four instructions it
-        // has not asked for. A fetch is an ordinary access and a read-ahead is
-        // not, so this is the one place in the core that reads guest memory
-        // the way a debugger does — CLAUDE.md's "a debugger read must not pop
-        // a FIFO" is exactly the hazard. Nothing about the *translation* is
-        // relaxed: that happened above, through the fetch path, with its walk
-        // and its permission check.
-        attrs: MemAttrs::DEBUG.with_requester(cfg.requester),
+        probe,
         costs,
         remaining,
         admitted: true,
@@ -903,8 +1131,8 @@ struct Lifter<'a> {
     /// by [`Lifter::enter`], because a chained successor is on its own page,
     /// under its own key.
     at: Admitted,
-    space: &'a AddressSpace,
-    attrs: MemAttrs,
+    /// The lifter, and whatever [`admit`] has already lifted with it.
+    probe: Probe<'a>,
     costs: &'a mut Costs,
     /// What [`advance`] was given, so a chained boundary can guard the next
     /// block against what the chain has *left* rather than against the whole.
@@ -928,7 +1156,7 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
             // Read live, at every boundary: a chained successor must not be
             // served out of a cache lifted through a topology a store in the
             // block before it replaced. One relaxed atomic load.
-            topology: self.space.generation(),
+            topology: self.probe.space.generation(),
             // Zero, and deliberately: `Epoch::translation` is what a cache
             // keyed on the guest MMU's generation is stale against, and these
             // blocks are not keyed on it — `key_origin` puts the physical page
@@ -950,7 +1178,14 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
         // of them — it reads the system registers, the core's TLB and the tick
         // counter — so a chained boundary sees the same world a fresh
         // `advance` would have seen.
-        let entry = match admit(self.cfg, self.costs, host.exec, pc, self.remaining) {
+        let entry = match admit(
+            self.cfg,
+            self.costs,
+            &mut self.probe,
+            host.exec,
+            pc,
+            self.remaining,
+        ) {
             Admit::Ready(at) => {
                 self.at = at;
                 Entry::Ready
@@ -973,24 +1208,16 @@ impl<'h, 'e> Frontend<Host<'h, 'e>> for Lifter<'_> {
     }
 
     fn translate(&mut self, pc: u64) -> Result<Translation> {
-        let space = self.space;
-        let attrs = self.attrs;
         let base = self.at.base;
-        let page = self.at.page;
-        let mut src = |addr: u64| {
-            // Outside the entry page there is no translation to read through,
-            // so the lifter is told the bytes are unreadable and ends the
-            // block. It would have ended it at the page bound anyway; this is
-            // the belt.
-            if addr & !PAGE_MASK != page {
-                return None;
-            }
-            space
-                .read(base | (addr & PAGE_MASK), Width::U32, attrs)
-                .ok()
-                .map(|v| v as u32)
+        // The budget guard lifts too, and when it did it was this block: a
+        // cold PC whose worst case did not fit is lifted once by [`Probe`] to
+        // learn its bound and then, if it fits, immediately again by the
+        // dispatcher. Taking it here is what makes that one lift rather than
+        // two.
+        let lifted = match self.probe.take(pc, self.at.key) {
+            Some(lifted) => lifted,
+            None => self.probe.lift(&self.at, pc)?,
         };
-        let lifted = lift::lift(&self.at.world, pc, &mut src, lift::MAX_INSNS, SHAPE)?;
         if self.rejected.is_none()
             && let Err(e) = verify(&lifted.block)
         {
@@ -1387,11 +1614,445 @@ mod tests {
     }
 
     #[test]
+    fn a_quantum_too_small_for_a_cold_block_still_runs_the_blocks_that_fit() {
+        // The defect [`Probe`] exists for, in one assertion.
+        //
+        // A budget between a real block's bound and [`worst_bound`] is the
+        // whole of a quantum's tail, and on `arm64-virt` it was more than half
+        // of every quantum: `admit` had no cost for a mid-block PC, guessed
+        // the cold worst case, and declined — and because only a lift fills
+        // [`Costs`], the guess was never replaced. Every instruction of the
+        // tail went to the interpreter one dispatcher round trip at a time.
+        //
+        // Without the probe `retired` here is **zero**, because no PC in this
+        // program ever gets a cost: the guard declines the first block, the
+        // interpreter moves the PC into the middle of one, and it stays
+        // declined for the rest of the run.
+        let budget = worst_bound(false, false) / 2;
+        let (interp, jit) = agree(&LOOP, budget, 40);
+        assert!(interp.cycles() > 100, "the loop ran");
+        let stats = jit.jit_stats().expect("a jit core");
+        assert!(
+            stats.retired > 8 * stats.interpreted,
+            "a budget smaller than the cold bound sent the run to the \
+             interpreter, which is the cold-start deadlock `Probe` closes: \
+             {stats:?}"
+        );
+    }
+
+    #[test]
+    fn a_probe_is_only_paid_for_once_per_block() {
+        // The probe lifts, and the dispatcher lifts. If the second did not
+        // take the first's block, every declined-then-admitted PC would lift
+        // twice — and nothing about the guest would change, so only a count
+        // can say. `translated` is the dispatcher's own counter, and it rises
+        // by one per *distinct* block however many probes preceded it.
+        let budget = worst_bound(false, false) / 2;
+        let (_, jit) = agree_on(Engine::Jit, &LOOP, budget, 40);
+        let stats = jit.jit_stats().expect("a jit core");
+        assert!(stats.blocks > 100, "{stats:?}");
+        assert!(
+            stats.probed > 0,
+            "a budget below the cold bound probed nothing: {stats:?}"
+        );
+        // The dispatcher's own `translated` cannot say this: it rises once per
+        // *distinct* block however many probes preceded it, so a mutation pass
+        // that switched the reuse off left every test in this file passing.
+        // Hence a counter of its own.
+        assert!(
+            stats.probe_reused > 0,
+            "every probe lifted a block the dispatcher then lifted again: \
+             {stats:?}"
+        );
+        // Four short blocks is what this loop lifts to; a handful more would
+        // still be fine, a hundred would mean the cache was being thrashed.
+        assert!(
+            stats.translated < 16,
+            "a re-lift per admission, which is what reusing the probe's block \
+             is supposed to prevent: {stats:?}"
+        );
+    }
+
+    /// An arithmetic loop that touches no memory at all.
+    ///
+    /// [`block_bound`] adds a block's `CHARGE` ticks to its accesses, and on a
+    /// program with accesses the accesses dominate — so a bound that dropped
+    /// the charges entirely would still be big enough there, and a mutation
+    /// pass proved it by dropping them and passing. Here there is nothing but
+    /// charges, so the bound *is* the charges.
+    const ALU_LOOP: [u32; 5] = [
+        0x9100_04a5, // add  x5, x5, #1
+        0x8b05_00c6, // add  x6, x6, x5
+        0xca05_0108, // eor  x8, x8, x5
+        0xcb06_00e7, // sub  x7, x7, x6
+        0x17ff_fffc, // b    .-16
+    ];
+
+    #[test]
+    fn a_block_that_only_computes_is_still_bounded_by_what_it_charges() {
+        // Swept across the guard, because the failure is not "wrong answer" but
+        // "stopped one instruction later than the interpreter would" — which
+        // shows in `cycles` and `cycle_debt` and in nothing else.
+        for budget in 1..=64u64 {
+            agree_on(Engine::Jit, &ALU_LOOP, budget, 12);
+        }
+        // Above a trace's own bound — this loop unrolls to `MAX_INSNS`, so its
+        // block charges 64 ticks and nothing else — so that blocks really run.
+        let (_, jit) = agree_on(Engine::Jit, &ALU_LOOP, 256, 40);
+        let stats = jit.jit_stats().expect("a jit core");
+        assert!(stats.retired > stats.interpreted, "no block ran: {stats:?}");
+    }
+
+    #[test]
+    fn a_paged_core_reaches_the_interpreter_for_an_unliftable_pc_without_lifting() {
+        // The zero sentinel, in the world where zero is not what an empty
+        // block bounds at: under a paged MMU a block owes its entry walk, so
+        // `block_bound` of a block with no instructions in it is *four*, not
+        // zero. A guard that recorded that instead of the sentinel would admit
+        // the `mrs`, reach the dispatcher, lift nothing and interpret anyway —
+        // every time round the loop, and with every column still agreeing. A
+        // mutation pass found exactly that.
+        // Back to the `mrs` every iteration, so the sentinel is met again and
+        // again rather than once — and `0xd538_0000`, a real `MRS`, because
+        // an encoding that names no system register is UNDEFINED and would
+        // send the core round a vector table instead of round this loop.
+        let program = [
+            0xd538_0000, // mrs x0, midr_el1   ; outside the subset
+            0x9100_0421, // add x1, x1, #1
+            0x9100_0442, // add x2, x2, #1
+            0x17ff_fffd, // b   .-12
+        ];
+        let interp = core(Engine::Interp, &program);
+        let jit = core(Engine::Jit, &program);
+        enable_mmu(&interp);
+        enable_mmu(&jit);
+        // Small enough that the cold bound never fits, so every admission goes
+        // through `Probe`, which is where the sentinel is written.
+        for _ in 0..40 {
+            assert_eq!(interp.run_budget(128), jit.run_budget(128));
+        }
+        for n in 0..31 {
+            assert_eq!(interp.x(n), jit.x(n), "x{n}");
+        }
+        assert_eq!(interp.cycles(), jit.cycles(), "the cycle counter");
+        let stats = jit.jit_stats().expect("a jit core");
+        assert!(stats.interpreted > 8, "the `mrs` came round: {stats:?}");
+        assert!(
+            stats.blocks > 8,
+            "no block ran, so nothing here is about the sentinel: {stats:?}"
+        );
+        assert!(
+            stats.translated <= 8,
+            "the `mrs` cost a fresh translation every time it came round: \
+             {stats:?}"
+        );
+    }
+
+    #[test]
+    fn a_probe_never_hands_back_a_block_lifted_for_another_pc_or_another_world() {
+        // The reuse is keyed on `(pc, key)` and both halves are load-bearing.
+        // A probe's block survives into the *next* boundary when the block it
+        // priced turned out to be in the dispatcher's cache — so the block
+        // held is routinely one the next `translate` must not be given, and
+        // handing it over would execute the wrong instructions at the right
+        // PC. A mutation pass dropped each half in turn and no test in this
+        // file noticed, which is why this one is a unit test rather than an
+        // outcome.
+        let space = AddressSpace::new("mem", 64);
+        let space = Arc::new(space);
+        let mut counts = Probes::default();
+        let mut probe = Probe {
+            space: &space,
+            attrs: MemAttrs::DEBUG,
+            held: None,
+            counts: &mut counts,
+        };
+        assert!(
+            probe.take(0x40, 7).is_none(),
+            "an empty probe holds nothing"
+        );
+        let lifted = lift::lift(
+            &World {
+                features: Config::cortex_a53().features,
+                origin: Origin::Bare,
+                strict_align: false,
+            },
+            0x40,
+            &mut |_| Some(0xd503_201f),
+            4,
+            SHAPE,
+        )
+        .expect("a nop lifts");
+        probe.held = Some((0x40, 7, lifted));
+        assert!(probe.take(0x44, 7).is_none(), "another PC");
+        assert!(probe.take(0x40, 8).is_none(), "another world");
+        assert!(probe.take(0x40, 7).is_some(), "and the one it holds");
+        assert!(probe.take(0x40, 7).is_none(), "which it hands over once");
+    }
+
+    /// Warm a core, snapshot it, rewrite an instruction under it, restore, and
+    /// carry on — which is what a debugger does to publish a patch and what a
+    /// rewind does every time.
+    ///
+    /// `ROADMAP.md` §4.5: derived state is never serialized and is always
+    /// invalidated. A block cache is derived state by that definition, and a
+    /// `load` replaces the memory a block was lifted from — so a core that
+    /// kept its blocks runs instructions the snapshot does not contain, and
+    /// nothing else notices, because `jit::dispatch`'s invalidation watches
+    /// *guest stores* and a restore is not one. Measured before the fix: a
+    /// patched instruction in a hot loop still ran stale 107 times out of
+    /// 66 667 iterations.
+    fn patch_across(engine: Engine, restore: bool) -> (Cpu, Cpu) {
+        use super::super::CLASS;
+        use crate::core::device::{Device, ResetKind};
+        use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
+        // Named rather than inherited: the test module compiles in a
+        // `no_std` build too, where the prelude has no `Vec`.
+        use alloc::vec::Vec;
+
+        let interp = core(Engine::Interp, &LOOP);
+        let jit = core(engine, &LOOP);
+        // Warm: by now the loop is lifted, compiled and chained.
+        for _ in 0..8 {
+            assert_eq!(interp.run_budget(4096), jit.run_budget(4096));
+        }
+        assert!(
+            jit.jit_stats().expect("a jit core").retired > 100,
+            "the loop never warmed up under {engine:?}"
+        );
+        let mut saved: Vec<Vec<u8>> = Vec::new();
+        for cpu in [&interp, &jit] {
+            let mut shape = MachineShape::new();
+            shape.add_device("cpu", CLASS.name).expect("one device");
+            let mut w = StateWriter::new(shape);
+            {
+                let mut chunk = w.chunk("cpu", CLASS.name, CLASS.version).expect("a chunk");
+                cpu.save(&mut chunk).expect("the core saves");
+            }
+            saved.push(w.to_vec().expect("a snapshot"));
+            // `add x5, x5, #1` becomes `add x5, x5, #2`, in the page the warm
+            // blocks were lifted from.
+            let space = cpu.space().expect("the core has its space");
+            space
+                .write(8, Width::U32, 0x9100_08a5, MemAttrs::DEFAULT)
+                .expect("in RAM");
+        }
+        for (bytes, cpu) in saved.iter().zip([&interp, &jit]) {
+            if restore {
+                let reader = StateReader::new(bytes).expect("a reader");
+                let chunk = reader
+                    .load("cpu", CLASS.name, CLASS.version, &Migrations::new())
+                    .expect("the chunk");
+                let mut cr = chunk.reader();
+                cpu.load(&mut cr).expect("the core loads");
+                cr.end().expect("the whole chunk");
+            } else {
+                cpu.reset(ResetKind::Warm);
+            }
+        }
+        for _ in 0..8 {
+            assert_eq!(
+                interp.run_budget(4096),
+                jit.run_budget(4096),
+                "the two engines consumed different amounts after the patch"
+            );
+        }
+        (interp, jit)
+    }
+
+    #[test]
+    fn a_snapshot_restore_throws_the_block_cache_away() {
+        for engine in [Engine::Jit, Engine::JitHost] {
+            let (interp, jit) = patch_across(engine, true);
+            for n in 0..31 {
+                assert_eq!(
+                    interp.x(n),
+                    jit.x(n),
+                    "x{n} under {engine:?}: a block lifted before the restore \
+                     ran afterwards"
+                );
+            }
+            assert_eq!(interp.cycles(), jit.cycles(), "the cycle counter");
+            assert_ne!(interp.x(5), 0, "the patched loop ran at all");
+        }
+    }
+
+    #[test]
+    fn a_reset_throws_the_block_cache_away_too() {
+        for engine in [Engine::Jit, Engine::JitHost] {
+            let (interp, jit) = patch_across(engine, false);
+            for n in 0..31 {
+                assert_eq!(
+                    interp.x(n),
+                    jit.x(n),
+                    "x{n} under {engine:?}: a block lifted before the reset \
+                     ran afterwards"
+                );
+            }
+            assert_eq!(interp.cycles(), jit.cycles(), "the cycle counter");
+            assert_ne!(interp.x(5), 0, "the patched loop ran at all");
+        }
+    }
+
+    #[test]
+    fn a_budget_that_always_fits_the_cold_bound_never_probes() {
+        // The guard asks the cheap question first, and it is the *common*
+        // path: while a quantum still has room for the largest block this
+        // frontend can produce, knowing how big this one is buys nothing.
+        // Without that order every admission on a real guest would pay for a
+        // lift, and nothing else in this file would notice.
+        let (_, jit) = agree(&LOOP, 4096, 8);
+        let stats = jit.jit_stats().expect("a jit core");
+        assert!(stats.blocks > 0, "no block ran: {stats:?}");
+        // Not *zero*: a chain spends the budget it was given, so the last
+        // block of every quantum still meets a `left` below the cold bound and
+        // probes. What the order buys is that only the tail does — two orders
+        // of magnitude fewer lifts than admissions, where always probing would
+        // be one for one.
+        assert!(
+            stats.probed * 100 < stats.blocks,
+            "the guard lifted where the conservative bound already fitted: \
+             {stats:?}"
+        );
+    }
+
+    #[test]
+    fn a_budget_below_the_entry_walk_is_declined_without_a_lift() {
+        // Under a paged MMU a block owes its entry walk before its first
+        // fetch, so a budget of four ticks or fewer cannot hold one however
+        // short it is — and lifting to find that out is work with a known
+        // answer.
+        for budget in 1..=WALK_ACCESSES {
+            let interp = core(Engine::Interp, &LOOP);
+            let jit = core(Engine::Jit, &LOOP);
+            enable_mmu(&interp);
+            enable_mmu(&jit);
+            for _ in 0..12 {
+                assert_eq!(interp.run_budget(budget), jit.run_budget(budget));
+            }
+            let stats = jit.jit_stats().expect("a jit core");
+            assert_eq!(
+                stats.probed, 0,
+                "budget {budget}: a lift whose block could not have been \
+                 admitted: {stats:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clearing_the_cost_table_forgets_every_answer_at_once() {
+        // The invalidation is a counter rather than a sweep, because a guest
+        // store into a page a translation came from clears the whole table and
+        // a Linux boot does that thousands of times. A counter that did not
+        // advance would keep serving bounds for instructions that have been
+        // overwritten — including the *zero* that says "outside the subset",
+        // which is exactly the answer an overwrite can invalidate.
+        let mut costs = Costs::new();
+        costs.put(0x1000, 7, 42);
+        assert_eq!(costs.get(0x1000, 7), Some(42));
+        assert_eq!(costs.get(0x1000, 8), None, "the key is part of the answer");
+        costs.clear();
+        assert_eq!(
+            costs.get(0x1000, 7),
+            None,
+            "a cleared table answers nothing"
+        );
+        costs.put(0x1000, 7, 43);
+        assert_eq!(costs.get(0x1000, 7), Some(43), "and can be filled again");
+    }
+
+    #[test]
     fn an_instruction_outside_the_subset_is_interpreted_without_a_wasted_lift() {
         // `mrs x0, midr_el1` is outside the subset; the cost table remembers
         // that so the next pass reaches the interpreter directly.
-        let program = [0xd530_0000, 0xd280_0025, 0x17ff_ffff];
-        agree(&program, 4096, 4);
+        //
+        // **0xd538_0000, not 0xd530_0000**, which is what this test used to
+        // say. The latter names no allocated system register, so it is
+        // UNDEFINED rather than merely unlifted: it trapped, and with
+        // `VBAR_EL1` at zero the core spent the whole run going round an
+        // exception vector full of zero words. The two engines agreed about
+        // that perfectly, and the test passed while exercising none of what it
+        // names.
+        let program = [0xd538_0000, 0xd280_0025, 0x17ff_fffe];
+        let (_, jit) = agree(&program, 4096, 4);
+        // *Without a wasted lift*, which is the half of the sentence no
+        // comparison can assert: admitting a zero bound still reaches the
+        // right answer, through a dispatcher round trip and a fresh `lift`
+        // that fails at its first instruction — every time round the loop. A
+        // mutation pass that admitted the zero left this test green, so what
+        // is asserted is the count rather than the outcome.
+        let stats = jit.jit_stats().expect("a jit core");
+        assert!(
+            stats.interpreted > 4,
+            "the `mrs` was reached more than once: {stats:?}"
+        );
+        assert!(
+            stats.translated <= 4,
+            "the `mrs` cost a fresh translation every time it came round: \
+             {stats:?}"
+        );
+    }
+
+    #[test]
+    fn the_two_engines_agree_at_every_budget_across_the_guard() {
+        // The budget guard's own boundary, swept rather than sampled.
+        //
+        // [`Probe`] moved where that boundary *is*: it used to be one cliff at
+        // [`worst_bound`] and it is now wherever each block's real bound
+        // falls, which is a different number for every PC in the program. So
+        // the assertion that matters is not "some small budget works" but
+        // "every budget works" — and the columns `agree_on` compares include
+        // `cycle_debt`, the carried overrun, which is exactly what a block
+        // admitted where an instruction should have run would move.
+        for budget in 1..=96u64 {
+            agree_on(Engine::Jit, &LOOP, budget, 12);
+        }
+        // The host code generator over the same sweep, sampled coarsely
+        // because it compiles every distinct block and the cliff is the same
+        // one.
+        for budget in (1..=96u64).step_by(3) {
+            agree_on(Engine::JitHost, &LOOP, budget, 12);
+        }
+    }
+
+    #[test]
+    fn a_paged_core_agrees_at_every_budget_across_the_guard_too() {
+        // The paged world has its own [`Admitted::entry`] and its own
+        // `per_access`, so its guard boundary is a different number — and it
+        // is the one a real guest runs in, where the cold bound is 5 188 ticks
+        // against a 10 000-tick quantum.
+        for budget in (1..=256u64).step_by(5) {
+            let interp = core(Engine::Interp, &LOOP);
+            let jit = core(Engine::Jit, &LOOP);
+            enable_mmu(&interp);
+            enable_mmu(&jit);
+            for n in 0..12 {
+                assert_eq!(
+                    interp.run_budget(budget),
+                    jit.run_budget(budget),
+                    "budget {budget}, quantum {n}: the two engines consumed \
+                     different amounts"
+                );
+            }
+            assert_eq!(
+                interp.pc(),
+                jit.pc(),
+                "budget {budget}: the program counter"
+            );
+            assert_eq!(
+                interp.cycles(),
+                jit.cycles(),
+                "budget {budget}: the cycle counter"
+            );
+            assert_eq!(
+                interp.cycle_debt(),
+                jit.cycle_debt(),
+                "budget {budget}: the carried overrun"
+            );
+            for n in 0..31 {
+                assert_eq!(interp.x(n), jit.x(n), "budget {budget}: x{n}");
+            }
+        }
     }
 
     /// Turn a core's MMU on over a three-level hierarchy that identity-maps

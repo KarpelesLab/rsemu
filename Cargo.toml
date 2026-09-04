@@ -1878,6 +1878,21 @@ harness          = false
 required-features = ["jit", "cpu-x86-lift"]
 
 [[bench]]
+# What the AArch64 frontend's mechanisms bought, one at a time, in the same
+# shape as the other two cores -- plus a second table the other two do not
+# have: throughput against `Cpu::run_budget`'s *quantum*. That column exists
+# because the largest number in this subsystem lived there rather than in the
+# mechanism ladder: the budget guard answered for a cold PC with the worst case
+# a 64-instruction block can charge (5 188 ticks) against an `arm64-virt`
+# quantum of 10 000, so over half of every quantum was interpreted an
+# instruction at a time. `harness = false` for the same reason the other three
+# benchmarks give -- libtest's bench harness is nightly-only and this project is
+# stable.
+name             = "a64_dispatch"
+harness          = false
+required-features = ["jit", "cpu-arm-a64-lift"]
+
+[[bench]]
 # What the software TLB and the block cache bought, measured one mechanism at a
 # time (ROADMAP.md §9.1). `harness = false` for the same reason the frame-time
 # benchmark gives — libtest's bench harness is nightly-only and this project is
