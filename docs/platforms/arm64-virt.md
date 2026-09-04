@@ -229,6 +229,66 @@ timer counts this core's bus accesses divided by an integer, so `[ 1.12]` is
 what the kernel measured and not what a person waited.
 
 
+## Choosing an execution engine
+
+`cpu.arm.a64` takes three, and they are `interp`, `jit` and `jit-host` with the
+same meanings the other two cores give them:
+
+- **`interp`** — the interpreter, and the oracle everything else is measured
+  against. The default.
+- **`jit`** — the translation runtime in [`src/jit`](../../src/jit): guest
+  instructions lifted into IR blocks by
+  [`cpu::arm::a64::lift`](../../src/cpu/arm/a64/lift.rs), cached under
+  `(pc, physical page)`, executed by the portable IR backend. Runs everywhere
+  the crate does.
+- **`jit-host`** — the same runtime with the **host code generator** attached,
+  so blocks are lowered to machine code by [`jit::x86`](../../src/jit/x86) on
+  x86-64 Linux in a build with `jit-x86`. Anywhere else it falls back to
+  `jit`'s backend and answers identically.
+
+**This board's file writes `engine = "interp"` as a literal rather than as a
+`param`**, so `-p engine=jit` has nothing to override; reaching the other two
+from the command line wants the two-line change
+`param engine = "interp"` plus `engine = engine` in
+[`machines/arm64-virt.machine`](../../machines/arm64-virt.machine). Everything
+below was measured by building the same board programmatically and choosing the
+engine through `Cpu::with_engine`, which is the same path `from_props` reaches.
+
+All three are **indistinguishable to the guest**, cycle counts included, and
+that is asserted rather than hoped: `tests/a64_engines.rs` runs a minimal
+AArch64 board on each and compares `Machine::state_hash` at ten checkpoints,
+then moves a snapshot between engines in both directions;
+`cpu::arm::a64::engine`'s own tests do it for a bare core, a paged one, and one
+that takes an interrupt mid-run.
+
+It holds on a real guest too. The kernel and initramfs above, 512 MiB, over
+twenty seconds of virtual time — well past the point where the kernel is doing
+real work rather than decompressing:
+
+| `engine` | 20 s of guest time |
+| --- | --- |
+| `interp` | 17.59 s |
+| `jit` | 11.67 s (**1.51×**) |
+| `jit-host` | **6.92 s (2.54×)** |
+
+Every cell is the median of three **interleaved** runs — one of each engine, in
+turn, round and round, because the interpreter is the control and a control
+measured in a different sitting is not one — and all nine finished on one state
+hash, `0x415f52aebd310878`, having charged 199 990 000 cycles. The translated
+runs executed 18 774 915 blocks; under `jit-host` the code generator compiled
+18 774 316 of them and refused 599, which are the blocks holding a `UDIV` or an
+`SDIV`, the two ops `jit::x86` does not lower.
+
+What is **not** here yet, and what the RISC-V board's equivalent section says
+bought it the most: a `MemPlan`. The software TLB's fast path is not inlined
+into generated code, because `cpu::arm::a64::mmu`'s `Tlb` has no `jit::Tlb`
+shadow to publish; every guest access on the compiled path still takes a call
+into the core's own translation.
+[`src/cpu/arm/a64/engine.rs`](../../src/cpu/arm/a64/engine.rs) has the argument
+for why nothing about AArch64 forbids one — no address tagging, and which
+`TTBR` a walk starts from is a pure function of the address.
+
+
 ## Where it stops, and what is still in the way
 
 It did not stop, so this section is a list of what the board *has not got*

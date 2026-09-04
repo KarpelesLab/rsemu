@@ -769,6 +769,35 @@ cpu-arm-aprofile = []
 # generic timer's event stream. Adds no dependencies and is `no_std + alloc`.
 cpu-arm-a64 = ["float"]
 
+# The AArch64 IR frontend (src/cpu/arm/a64/lift.rs): lifting guest instructions
+# into `ir::Block`s — the **third** frontend for the translation IR, after
+# RISC-V and x86, and the one that exercises what neither of those could. A64
+# is a flag machine whose condition codes are read by five different branch
+# forms and written by nearly every arithmetic instruction, so the flags are
+# four one-bit slots computed as ordinary temporaries (ir's decision 1), and an
+# ARM condition is boolean algebra over them rather than a table.
+#
+# The subset is the A64 integer core, done exactly: PC-relative addressing, the
+# immediate and shifted- and extended-register arithmetic, the logical
+# families, the bitfield moves, EXTR, ADC/SBC, CCMP/CCMN, the conditional
+# selects, divide, the register shifts, REV/CLZ/CLS, the multiply-accumulates
+# and high multiplies, every single-register and pair load and store in every
+# addressing mode, the literal loads, and every branch. It reads the same
+# declarative rows in `isa.rs` that decode, execute and the disassembler read,
+# so there is still one description of the instruction set and not a second.
+#
+# Deliberately **not** here: everything that touches the SIMD and
+# floating-point register file (ROADMAP.md §9.1 makes guest FP a call into
+# software IEEE-754, and a second float implementation is worse than none), the
+# exclusives and LSE atomics (the IR's atomics have no 16-byte type, so LDXP
+# has none), the unprivileged LDTR/STTR forms (a permission check a MemOp
+# cannot carry), and every system instruction. Each ends the block and hands
+# the PC back to the interpreter, which stays the oracle (CLAUDE.md, "CPU
+# cores"). Needs `cpu-arm-a64` for the core and `ir` for the block types; `jit`
+# on top of it builds the execution engine `engine = "jit"` reaches. Adds no
+# dependencies and is `no_std + alloc`.
+cpu-arm-a64-lift = ["cpu-arm-a64", "ir"]
+
 # The `a64-mini` board (machines/a64-mini.machine plus the classes it names): a
 # minimal AArch64 board -- a boot ROM at the reset vector, DRAM, and one
 # peripheral aperture, with every address a `param` because an SoC's memory map

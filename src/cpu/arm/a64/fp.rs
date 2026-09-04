@@ -771,6 +771,15 @@ mod tests {
             ("fp.rs", include_str!("fp.rs")),
             ("simd.rs", include_str!("simd.rs")),
             ("exec.rs", include_str!("exec.rs")),
+            // The IR frontend and its engine are guest-path code too, and the
+            // whole reason they exclude the SIMD and floating-point family is
+            // that lifting it would be a second float implementation. Read
+            // back here rather than asserted in prose. `include_str!` does not
+            // care whether the module is compiled, so the gate holds in a
+            // build without `cpu-arm-a64-lift`.
+            ("lift.rs", include_str!("lift.rs")),
+            ("engine.rs", include_str!("engine.rs")),
+            ("differential.rs", include_str!("differential.rs")),
         ];
         for (name, src) in sources {
             // Everything from the test module down is exempt.
