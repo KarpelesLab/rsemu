@@ -9,7 +9,7 @@
 use super::*;
 use crate::core::space::{AddressSpace, MemAttrs, RamStore, Region, RequesterId};
 use crate::core::value::Width;
-use crate::dev::riscv::virtio::queue::{DESC_F_NEXT, DESC_F_WRITE, Layout};
+use crate::dev::virtio::queue::{DESC_F_NEXT, DESC_F_WRITE, Layout};
 
 const DESC: u64 = 0x1000;
 const AVAIL: u64 = 0x2000;

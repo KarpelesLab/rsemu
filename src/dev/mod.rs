@@ -29,7 +29,8 @@
 //! | [`sitronix`] | `dev-st7272a` | the ST7272A TFT panel driver: SPI register configuration, no pixel path |
 //! | [`stm32`] | `dev-stm32` | STM32 peripherals: a GPIO port and a USART |
 //! | [`q35`] | `dev-q35` | the q35 chipset: an 82Q35 (G)MCH, an ICH9 LPC bridge, ECAM, and the ACPI table generator |
-//! | [`riscv`] | `dev-riscv` | the RISC-V `virt` board: CLINT, PLIC, virtio, and the device tree generator |
+//! | [`riscv`] | `dev-riscv` | the RISC-V `virt` board: CLINT, PLIC, and the device tree generator |
+//! | [`virtio`] | `dev-virtio` | virtio: split virtqueues, the MMIO transport, and block and entropy devices |
 //! | [`uart`] | `dev-uart-ns16550` | serial ports that belong to no board: a National Semiconductor 16550 |
 //! | [`sd`] | `dev-sd-card` | an SD memory card: the command set, the state machine, the registers |
 //! | [`usb`] | `dev-usb-*` | USB host controllers — a generic EHCI, the ChipIdea/ARC variant over it, and a Synopsys dwc2 that shares nothing with either — a HID mouse, and a mass storage device on a real medium |
@@ -152,6 +153,10 @@ pub mod sd;
 #[cfg(feature = "dev-uart-ns16550")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-uart-ns16550")))]
 pub mod uart;
+
+#[cfg(feature = "dev-virtio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-virtio")))]
+pub mod virtio;
 
 #[cfg(any(
     feature = "dev-usb-ehci",

@@ -49,7 +49,7 @@
 
 use alloc::format;
 use alloc::string::{String, ToString};
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{self, AtomicBool, AtomicU64};
@@ -64,7 +64,6 @@ use crate::core::value::{Endian, Width};
 use crate::core::wire::{Level, WireSource};
 use crate::machine::realize::{BindCtx, Instance};
 
-use super::super::dt::{DtSource, NodeSpec};
 use super::queue::{Descriptor, Layout, QUEUE_SIZE_MAX, Queue};
 use super::{Backend, VENDOR_ID};
 
@@ -176,8 +175,9 @@ struct Links {
     out: Option<WireSource>,
     space: Option<Arc<AddressSpace>>,
     requester: RequesterId,
-    /// The net the interrupt pin drives, so the device tree can look its
-    /// number up in the PLIC's pin table. See [`dt`](super::super::dt).
+    /// The net the interrupt pin drives, so a board's device tree can look
+    /// its number up in its own interrupt controller's pin table. See the
+    /// `DtSource` implementations at the bottom of this file.
     irq_wire: Option<crate::core::wire::WireId>,
 }
 
@@ -664,9 +664,24 @@ impl MemOps for Registers {
     }
 }
 
-impl DtSource for Registers {
-    fn dt_spec(&self) -> NodeSpec {
-        let mut spec = NodeSpec::peripheral("virtio_mmio", &["virtio,mmio"]);
+// ---------------------------------------------------------------------------
+// how each board's device tree describes this device
+// ---------------------------------------------------------------------------
+//
+// A flattened device tree is a *board's* mechanism, not virtio's: the node is
+// the same everywhere — `virtio,mmio` with a `reg` and an interrupt, because
+// §4.2 says so and says nothing about the architecture underneath — but the
+// generator that places it is the board's. So the transport carries one small
+// implementation per generator, behind the feature that provides it, exactly
+// as `dev::uart::ns16550` and `dev::flash::cfi` already do. A build with none
+// of them has a virtio device that describes itself to nobody, which is what a
+// board that hands out addresses some other way wants.
+
+#[cfg(feature = "dev-riscv")]
+impl crate::dev::riscv::dt::DtSource for Registers {
+    fn dt_spec(&self) -> crate::dev::riscv::dt::NodeSpec {
+        let mut spec =
+            crate::dev::riscv::dt::NodeSpec::peripheral("virtio_mmio", &["virtio,mmio"]);
         spec.irq_wire = self.links.lock().irq_wire;
         spec
     }
@@ -677,13 +692,16 @@ impl Device for VirtioMmio {
         self.class
     }
 
+    #[cfg_attr(not(feature = "dev-riscv"), expect(unused_variables))]
     fn realize(&self, ctx: &mut RealizeCtx<'_>) -> Result<()> {
         // What this region is, for the board's device-tree generator.
-        super::super::dt::publish(
+        #[cfg(feature = "dev-riscv")]
+        crate::dev::riscv::dt::publish(
             ctx.hosts(),
             &self.region,
-            Arc::downgrade(&self.regs) as Weak<dyn DtSource>,
-        )
+            Arc::downgrade(&self.regs) as alloc::sync::Weak<dyn crate::dev::riscv::dt::DtSource>,
+        )?;
+        Ok(())
     }
 
     fn reset(&self, _kind: ResetKind) {
@@ -928,7 +946,7 @@ mod tests {
             self.poke(
                 DESC + 12,
                 W::U16,
-                u64::from(super::super::queue::DESC_F_WRITE),
+                u64::from(crate::dev::virtio::queue::DESC_F_WRITE),
             );
             self.poke(DESC + 14, W::U16, 0);
             self.poke(AVAIL + 4, W::U16, 0);
@@ -1168,7 +1186,7 @@ mod tests {
         poke(
             DESC + 12,
             W::U16,
-            u64::from(super::super::queue::DESC_F_WRITE),
+            u64::from(crate::dev::virtio::queue::DESC_F_WRITE),
         );
         poke(DESC + 14, W::U16, 0);
         poke(AVAIL + 4, W::U16, 0);

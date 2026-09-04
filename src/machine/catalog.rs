@@ -814,6 +814,8 @@ pub fn registry() -> Result<Registry> {
     crate::cpu::riscv::register(&mut reg)?;
     #[cfg(feature = "dev-riscv")]
     crate::dev::riscv::register(&mut reg)?;
+    #[cfg(feature = "dev-virtio")]
+    crate::dev::virtio::register(&mut reg)?;
     #[cfg(feature = "dev-uart-ns16550")]
     crate::dev::uart::ns16550::register(&mut reg)?;
     #[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
@@ -926,6 +928,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::cpu::riscv::bind(&mut b)?;
     #[cfg(feature = "dev-riscv")]
     crate::dev::riscv::bind(&mut b)?;
+    #[cfg(feature = "dev-virtio")]
+    crate::dev::virtio::bind(&mut b)?;
     #[cfg(feature = "dev-uart-ns16550")]
     crate::dev::uart::ns16550::bind(&mut b)?;
     #[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
@@ -1041,6 +1045,10 @@ pub fn classes() -> ClassTable {
     table.insert(crate::cpu::riscv::schema());
     #[cfg(feature = "dev-riscv")]
     for schema in crate::dev::riscv::schemas() {
+        table.insert(schema);
+    }
+    #[cfg(feature = "dev-virtio")]
+    for schema in crate::dev::virtio::schemas() {
         table.insert(schema);
     }
     #[cfg(feature = "dev-uart-ns16550")]

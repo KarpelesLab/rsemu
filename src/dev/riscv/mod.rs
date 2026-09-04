@@ -7,19 +7,21 @@
 //! controller, a serial port, and virtio for storage. No PCI, no ACPI, no
 //! legacy — and every part of it specified in a document anybody can download.
 //!
-//! The serial port is **not** in this module. It is a 16550, which is nobody's
-//! board's chip, and it lives in [`dev::uart::ns16550`](crate::dev::uart) where
-//! `pc64` and `q35` reach it without linking a PLIC. What *is* board-specific
-//! about it — the `ns16550a` node [`dt`] describes it with — is a `dev-riscv`
-//! block in that file, exactly as [`dev::flash::cfi`](crate::dev::flash)'s
-//! `cfi-flash` node is.
+//! Neither the console nor virtio is **in** this module, and for the same
+//! reason. The serial port is a 16550, which is nobody's board's chip, and it
+//! lives in [`dev::uart::ns16550`](crate::dev::uart) where `pc64` and `q35`
+//! reach it without linking a PLIC; virtio is an OASIS standard that names no
+//! architecture, and it lives in [`dev::virtio`](crate::dev::virtio) where an
+//! AArch64 board reaches it without linking a CLINT. What *is* board-specific
+//! about each of them — the `ns16550a` and `virtio,mmio` nodes [`dt`]
+//! describes them with — is a `dev-riscv` block in those files, exactly as
+//! [`dev::flash::cfi`](crate::dev::flash)'s `cfi-flash` node is.
 //!
 //! | Module | Covers |
 //! | --- | --- |
 //! | [`clint`] | `mtime`, per-hart `mtimecmp`, software interrupts |
 //! | [`plic`] | the platform-level interrupt controller: priority, enable, claim |
 //! | [`syscon`] | the system controller a guest powers itself off through |
-//! | [`virtio`] | the virtio-MMIO transport, plus block and entropy devices |
 //! | [`fdt`] | the flattened device tree *format* |
 //! | [`dt`] | the device tree *generator*, which walks the realized machine |
 //! | [`boot`] | the reset vector, and where the generated tree lands |
@@ -39,7 +41,7 @@
 //!   0x0200_0000  CLINT
 //!   0x0c00_0000  PLIC
 //!   0x1000_0000  16550 UART
-//!   0x1000_1000  virtio-mmio, one 4 KiB window each
+//!   0x1000_1000  virtio-mmio (dev::virtio), one 4 KiB window each
 //!   0x2000_0000  NOR flash bank 0: the firmware
 //!   0x2200_0000  NOR flash bank 1: the UEFI variable store
 //!   0x8000_0000  DRAM
@@ -98,7 +100,6 @@ pub mod fdt;
 pub mod loader;
 pub mod plic;
 pub mod syscon;
-pub mod virtio;
 
 // The board-level tests need a hart and the machine layer to run on, so they
 // come with `machine-riscv-virt` rather than with the devices alone.
@@ -121,8 +122,7 @@ pub fn register(registry: &mut crate::core::Registry) -> crate::core::Result<()>
     plic::register(registry)?;
     syscon::register(registry)?;
     boot::register(registry)?;
-    loader::register(registry)?;
-    virtio::register(registry)
+    loader::register(registry)
 }
 
 /// Bind every board class into the machine graph.
@@ -135,20 +135,17 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> crate::core::Result<()> 
     plic::bind(bindings)?;
     syscon::bind(bindings)?;
     boot::bind(bindings)?;
-    loader::bind(bindings)?;
-    virtio::bind(bindings)
+    loader::bind(bindings)
 }
 
 /// Every board class's validator schema.
 #[must_use]
 pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
-    let mut out = alloc::vec![
+    alloc::vec![
         clint::schema(),
         plic::schema(),
         syscon::schema(),
         boot::schema(),
         loader::schema(),
-    ];
-    out.extend(virtio::schemas());
-    out
+    ]
 }

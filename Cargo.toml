@@ -844,11 +844,32 @@ dev-uart-ns16550 = []
 # `dev-uart-ns16550` is the board's console, and it is a feature of its own
 # rather than a module here: see its comment above.
 #
-# `dev-medium` is here for the storage seam alone -- `dev::medium::Medium`,
-# which `virtio.blk` stores its bytes behind so that `--drive disk=root.qcow2`
-# backs it with a host file through `dev-blk` exactly as it backs an ATA drive
-# or an NVMe namespace (ROADMAP.md 7.1). Nothing here talks ATA.
-dev-riscv = ["dev-medium", "dev-uart-ns16550"]
+# virtio is not here either, and used to be: `dev-virtio` below is the
+# transport and the two devices, and this feature only teaches them how a
+# RISC-V device tree names one. A board that wants a virtio disk asks for
+# `dev-virtio`; `machines/riscv-virt.machine` does.
+dev-riscv = ["dev-uart-ns16550"]
+
+# virtio (src/dev/virtio): the transport-agnostic core -- split virtqueues,
+# feature negotiation, the status handshake -- the **MMIO transport** (§4.2,
+# version 2 only, so a legacy driver walks away rather than programming a
+# register block that is not there), and two devices on it: **virtio-blk** over
+# the `dev::medium::Medium` seam and **virtio-rng**, deterministically seeded.
+# `no_std + alloc`, no `unsafe`, no dependencies. Written from *Virtual I/O
+# Device (VIRTIO) Version 1.2*, OASIS Standard, and from no driver of any
+# licence (ROADMAP.md 1 names Linux's virtio drivers specifically).
+#
+# It names no architecture, which is why it is a feature of its own rather than
+# a module under `dev-riscv`: `riscv-virt` and `arm64-virt` both boot off one,
+# and before this feature existed an AArch64 board that wanted a disk had to
+# link a PLIC, a CLINT and a RISC-V boot ROM to get it. What *is* per-board is
+# the device tree node, and that is a `dev-riscv` block and a `dev-arm` block
+# inside `mmio.rs`, exactly as `dev-uart-ns16550`'s `ns16550a` node is.
+#
+# `dev-medium` is the storage seam -- what `virtio.blk` stores its bytes behind
+# so that `--drive disk=root.qcow2` backs it with a host file through `dev-blk`
+# exactly as it backs an ATA drive or an NVMe namespace (ROADMAP.md 7.1).
+dev-virtio = ["dev-medium"]
 
 # Parallel NOR flash (src/dev/flash/cfi): the Common Flash Interface query
 # structure and the Intel/Sharp extended command set (CFI id 0x0001) -- status
@@ -970,7 +991,7 @@ machine-spi-flash = ["cpu-riscv", "dev-stm32-spi", "dev-stm32-octospi", "dev-fla
 # `rsemu run riscv-virt --firmware fw.bin` loads an image at 0x80000000, hands
 # it a generated device tree in a1 and the hart id in a0, and puts its console
 # on the terminal. Adds no dependencies.
-machine-riscv-virt = ["cpu-riscv", "dev-riscv", "dev-flash-cfi"]
+machine-riscv-virt = ["cpu-riscv", "dev-riscv", "dev-virtio", "dev-flash-cfi"]
 
 # The ARMv7E-M core (src/cpu/arm/v7m): a Cortex-M4/M7-class interpreter —
 # the whole T32 instruction set in both encoding widths, `IT` blocks, the DSP

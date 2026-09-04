@@ -68,7 +68,7 @@ use rsemu::core::sync::{LockRank, Mutex};
 use rsemu::core::value::Width;
 use rsemu::core::wire::{Level, Wire, WireId, WireIdAllocator, WireSink, WireSource};
 use rsemu::dev::medium::Medium;
-use rsemu::dev::riscv::virtio::{self, VirtioBlk, VirtioMmio};
+use rsemu::dev::virtio::{self, VirtioBlk, VirtioMmio};
 use std::sync::Arc;
 
 /// Where guest RAM starts. Not zero, so a null descriptor address is a bus

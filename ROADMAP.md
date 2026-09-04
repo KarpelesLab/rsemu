@@ -1568,7 +1568,7 @@ and `virtio.blk`'s disk are `Medium`s too, so `--drive nvme0=disk.qcow2` and
 `--drive disk=root.qcow2` mean what `--drive hd0=disk.qcow2` means, and
 `riscv-virt` boots Linux off a qcow2 that stays on disk. The seam has a home of
 its own: `src/dev/medium.rs`, feature `dev-medium`, which `dev-ata-disk`,
-`dev-nvme`, `dev-riscv` and `dev-blk` each depend on. It used to live under
+`dev-nvme`, `dev-virtio` and `dev-blk` each depend on. It used to live under
 `dev/ata` because ATA wanted it first, and a `riscv-virt` build linked a whole
 ATA command set to name a trait — which is not what §3's crate-shape rule asks
 for.
