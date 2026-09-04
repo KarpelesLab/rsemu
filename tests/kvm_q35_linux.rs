@@ -86,8 +86,13 @@
 //!
 //! # Do the two engines agree?
 //!
-//! `tests/riscv_virt_engines.rs` diffs 265 lines of identical console across
-//! three engines, and that is the standard. This board cannot quite meet it,
+//! `tests/riscv_virt_engines.rs` runs one guest under all three engines and
+//! asserts an identical `Machine::state_hash` at every checkpoint — the whole
+//! machine, not a console — and that is the standard. (It does *not* diff
+//! console output; an earlier version of this comment said it diffed 265 lines
+//! of console, which was never true and was quoted onward from here into
+//! several task briefs before anyone checked.) This board cannot quite meet
+//! that standard,
 //! for a reason worth stating rather than averaging away: **an accelerated
 //! processor is not the same part as an interpreted one.** `cpu::x86` answers
 //! `CPUID` from its declared `variant`; a vCPU answers from the host's silicon.
