@@ -207,6 +207,13 @@ struct Entry {
     ///
     /// Reading through it is the JIT code buffer's obligation, stated in
     /// [`RamStore::host_ptr`](crate::core::space::RamStore::host_ptr).
+    ///
+    /// **Writing through it is allowed only for the store set, and only with
+    /// [`Tlb::note_fast_store`] called after.** That method marks the
+    /// `RamStore`'s own dirty bitmap and names the guest-physical page, which
+    /// are the two things `host_ptr`'s "read-only on purpose" paragraph exists
+    /// to protect: a framebuffer refresh and a live snapshot read the first,
+    /// and the block cache invalidates translations from the second.
     host: u64,
     /// `guest address + addend` is the offset in [`Entry::store`].
     addend: u64,
@@ -279,6 +286,20 @@ pub struct Tlb {
     /// The stores entries point into, so an entry costs a `u32` rather than an
     /// `Arc` clone and a drop on every fill.
     stores: Vec<Arc<RamStore>>,
+    /// The guest-**physical** page each store-set entry resolves to, parallel
+    /// to `sets[2]` and valid exactly when that entry's tag matches.
+    ///
+    /// A side array rather than a fourth field in [`Entry`], and the reason is
+    /// the layout: generated code indexes the entry array with a shift, so
+    /// [`FastSet::STRIDE`] has to stay a power of two, and a fifth `u64` would
+    /// take an entry from 32 bytes to 64 — doubling the footprint of the two
+    /// sets that do not need it. Nothing generated ever reads this: it is for
+    /// [`Tlb::note_fast_store`], which is Rust, called once per inlined store.
+    ///
+    /// Only the store set has one. A load does not need to know where it read
+    /// from; a store does, because the block cache invalidates translations by
+    /// guest-physical page and that is the only address that answers it.
+    phys: Box<[u64]>,
     epoch: Epoch,
     stats: TlbStats,
 }
@@ -318,6 +339,7 @@ impl Tlb {
             ],
             mask: entries - 1,
             stores: Vec::new(),
+            phys: vec![0u64; n].into_boxed_slice(),
             epoch,
             stats: TlbStats::default(),
         }
@@ -554,6 +576,11 @@ impl Tlb {
             self.stats.refused += 1;
         }
         self.stats.fills += 1;
+        if matches!(kind, AccessKind::Store) {
+            // Written under the same tag as the entry, so it is exactly as
+            // valid as the entry is and needs no invalidation of its own.
+            self.phys[index] = phys & !PAGE_MASK;
+        }
         self.sets[set_of(kind)][index] = Entry { tag, ..entry };
     }
 
@@ -680,13 +707,58 @@ impl Tlb {
         ctx.tag_bits() | ((self.epoch.translation & STAMP_MASK) << STAMP_SHIFT)
     }
 
+    /// Pay what a store served out of this table's *host address* still owes,
+    /// and say which guest-physical address it landed on.
+    ///
+    /// Generated code that writes through [`FastSet::HOST`] has moved the
+    /// bytes and nothing else. Two things are missing at that point and both
+    /// are silent:
+    ///
+    /// * the [`RamStore`]'s own dirty bitmap, which
+    ///   [`RamStore::write_at`](crate::core::space::RamStore::write_at) marks
+    ///   and a host pointer does not — the only record a framebuffer refresh
+    ///   or a live snapshot has, which is *why*
+    ///   [`RamStore::host_ptr`](crate::core::space::RamStore::host_ptr) is
+    ///   documented read-only;
+    /// * the guest-physical address, which the caller owes its own
+    ///   [`StoreLog`](crate::jit::StoreLog) so the block cache can invalidate
+    ///   translations of a page the guest has just rewritten.
+    ///
+    /// This does the first and returns the second.
+    ///
+    /// **The tag is not re-checked, and must not be.** Generated code matched
+    /// it one instruction ago and nothing has run since, so the entry at this
+    /// index is by construction the entry the store used. Re-deriving the
+    /// [`Context`] here to check it again would be a second copy of a
+    /// computation that can only ever disagree with the first — the privilege
+    /// and the stamp are read from live state, and a mismatch would silently
+    /// drop the write from the dirty log rather than reporting anything.
+    ///
+    /// `None` means the entry does not resolve to RAM at all, which generated
+    /// code cannot produce: it took the fast path only after finding a host
+    /// address, and an entry has one only when it resolves to RAM. A caller
+    /// that gets `None` anyway has a code-generation bug, not a guest one.
+    pub fn note_fast_store(&mut self, addr: u64, bytes: u64) -> Option<u64> {
+        let index = self.index(addr);
+        let entry = &self.sets[set_of(AccessKind::Store)][index];
+        if entry.store == Entry::SLOW {
+            return None;
+        }
+        let (store, offset) = (entry.store as usize, addr.wrapping_add(entry.addend));
+        // Exactly the bytes written, not the page: over-marking would make a
+        // framebuffer redraw rows nothing touched, and the granularity is the
+        // store's to choose.
+        self.stores[store].mark_dirty(offset, bytes);
+        Some(self.phys[index] | (addr & PAGE_MASK))
+    }
+
     /// This set and this world, in the shape [`FastMem`] publishes.
     ///
     /// [`FastMem`]: crate::jit::FastMem
     #[inline]
     #[must_use]
-    pub fn plan(&self, kind: AccessKind, ctx: Context) -> super::LoadPlan {
-        super::LoadPlan {
+    pub fn plan(&self, kind: AccessKind, ctx: Context) -> super::MemPlan {
+        super::MemPlan {
             set: self.fast_set(kind),
             tag: self.tag_bits(ctx),
         }
@@ -880,6 +952,97 @@ mod tests {
         level: 3,
         translating: false,
     };
+
+    #[test]
+    fn an_inlined_store_marks_the_bytes_it_wrote_and_names_where_they_landed() {
+        // What generated code cannot do for itself, and what nothing else
+        // would notice: `RamStore::host_ptr` is documented read-only *because*
+        // a write through it skips the store's dirty bitmap, and the block
+        // cache invalidates translations by guest-physical page. This is the
+        // one place both are paid, so this is where both are asserted.
+        let (mut tlb, ram) = tlb();
+        let addr = BASE + PAGE_SIZE + 0x40;
+        // Fill the store entry the way an access does, then start from clean:
+        // the fill itself went through `AddressSpace::write`, which marks.
+        tlb.write(addr, addr, Width::U64, 0, BARE, MemAttrs::DEFAULT)
+            .expect("in RAM");
+        ram.clear_dirty();
+        assert_eq!(ram.dirty_page_count(), 0, "the fixture starts clean");
+
+        let phys = tlb
+            .note_fast_store(addr, 8)
+            .expect("the entry resolves to RAM");
+        assert_eq!(phys, addr, "the physical address the block cache is owed");
+        assert_eq!(
+            ram.dirty_page_count(),
+            1,
+            "an inlined store left the store's dirty bitmap alone"
+        );
+        // Exactly the page written, not the whole store, and not the page the
+        // entry happens to be indexed under.
+        assert!(ram.is_page_dirty((addr - BASE) / ram.page_size()));
+    }
+
+    #[test]
+    fn an_inlined_store_marks_its_own_bytes_and_not_the_translation_granule() {
+        // The store's dirty granularity is its own — a framebuffer asks for a
+        // finer one so a refresh redraws the rows that changed — and it has
+        // nothing to do with the 4 KiB page this table is indexed by. Marking
+        // the TLB's page instead of the access's bytes gives the same answer
+        // at the default granularity and the wrong one here, which is why the
+        // fixture sets it.
+        let ram = Arc::new(RamStore::with_page_bits(SIZE, 8));
+        assert_eq!(ram.page_size(), 256);
+        let space = AddressSpace::new("mem", 64).with_unassigned(UnassignedPolicy::FAULT);
+        space
+            .topology()
+            .map(Region::ram("ram", Arc::clone(&ram)), BASE)
+            .expect("one region maps");
+        let mut tlb = Tlb::with_entries(Arc::new(space), 64);
+        let addr = BASE + 0x40;
+        tlb.write(addr, addr, Width::U64, 0, BARE, MemAttrs::DEFAULT)
+            .expect("in RAM");
+        ram.clear_dirty();
+
+        tlb.note_fast_store(addr, 8).expect("the entry holds RAM");
+        assert_eq!(
+            ram.dirty_page_count(),
+            1,
+            "eight bytes marked more than the one granule they lie in"
+        );
+        assert!(ram.is_page_dirty(0x40 / ram.page_size()));
+    }
+
+    #[test]
+    fn a_page_with_no_store_entry_names_nothing() {
+        // The arm generated code cannot reach — it took the fast path only
+        // after finding a host address — but a caller that reached it anyway
+        // must be told, not handed a plausible page.
+        let (mut tlb, _ram) = tlb();
+        let addr = BASE + 0x40;
+        assert_eq!(tlb.note_fast_store(addr, 8), None, "nothing is cached yet");
+        // A page remembered as uncacheable is still not a page a store may be
+        // served from.
+        tlb.refuse(AccessKind::Store, addr, BARE);
+        assert_eq!(tlb.note_fast_store(addr, 8), None);
+    }
+
+    #[test]
+    fn the_store_set_answers_for_the_physical_page_it_was_filled_with() {
+        // Bare mode makes the virtual and physical addresses the same number
+        // and hides the whole question, so this fills the way a *paged* hart
+        // does: one virtual address, a different physical one.
+        let (space, _ram) = space();
+        let mut tlb = Tlb::with_entries(space, 64);
+        let virt = 0x1000_0000;
+        let phys = BASE + 2 * PAGE_SIZE;
+        tlb.fill(AccessKind::Store, virt, phys, BARE);
+        assert_eq!(
+            tlb.note_fast_store(virt + 0x18, 4),
+            Some(phys + 0x18),
+            "the page reported is the guest-physical one, offset included"
+        );
+    }
 
     #[test]
     fn a_hit_returns_what_the_address_space_would_have_returned() {

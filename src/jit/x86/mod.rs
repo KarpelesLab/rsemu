@@ -51,7 +51,7 @@
 //!
 //! §9.1 says of the TLB that *"the fast path is inlined into generated code:
 //! mask, compare, add, load"*, and that everything else about the JIT is
-//! secondary to it. It is, for a load whose address the frontend hands over
+//! secondary to it. It is, for an access whose address the frontend hands over
 //! unsegmented: [`Tlb::fast_set`](crate::jit::Tlb::fast_set) publishes the
 //! entry array's base and mask, [`Tlb`](crate::jit::Tlb) precomputes a **host
 //! address** per entry, and the generated sequence is a null check, an
@@ -68,10 +68,17 @@
 //! aligned access charges, or compiled and interpreted execution stop agreeing
 //! on the cycle counter (`ROADMAP.md` §0).
 //!
-//! **Stores are not inlined**, and [`compile`](mod@compile)'s `store` says why: a store owes
-//! the guest-physical dirty log the block cache drains for self-modifying code,
-//! and the `RamStore`'s own dirty bitmap. Both are invisible from generated
-//! code, so `RamStore::host_ptr` is read-only and stores keep the call.
+//! **Stores are inlined too**, over the *store* set — a different table, whose
+//! entries were admitted on write permission and, on a paged host, filled by a
+//! walk for a store rather than for a load. What a store owes on top of a load
+//! is one call rather than none:
+//! [`FastMem::note_fast_store`](crate::jit::FastMem::note_fast_store) pays the
+//! tick, the `RamStore`'s own dirty bitmap and the guest-physical dirty log
+//! the block cache drains for self-modifying code. `RamStore::host_ptr` is
+//! still read-only as a Rust API, and that documentation's warning is still
+//! exactly right: a backend that writes through it and does not report the
+//! write is broken. [`compile`](mod@compile)'s `store` is where the four
+//! differences between a store and a load are named.
 //!
 //! # Where this is not available
 //!

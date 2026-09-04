@@ -77,9 +77,10 @@
 //! access was attempted, and `retired` is the charged count as of the last
 //! boundary the run actually passed.
 //!
-//! The two things generated code still writes itself are `committed`, which a
-//! store and a volatile load set after their flush, and `fast_hits`. That is
-//! the whole of a guest instruction's per-instruction cost now: nothing.
+//! The three things generated code still writes itself are `committed`, which
+//! a store and a volatile load set after their flush, and the two counters
+//! `fast_hits` and `fast_writes`. That is the whole of a guest instruction's
+//! per-instruction cost now: nothing.
 //!
 //! ### What it costs, which is in the allocator
 //!
@@ -128,8 +129,9 @@
 //! three callee-saved registers instead of one is the difference between an
 //! allocation that can hold a guest register across a boundary and one that
 //! cannot. What that cost is written down where it is paid: the inlined probe
-//! reloads the load set from the context, and parks its result in a stack slot
-//! across `note_fast_load`.
+//! reloads its set from the context, and parks a value across the call that
+//! follows it — the loaded word across `note_fast_load`, the guest address
+//! across `note_fast_store`.
 //!
 //! Seven registers is the ceiling, and it is worth knowing why it is so low.
 //! Generated code still calls into the host at every `get_slot`, on every
@@ -163,8 +165,8 @@ use alloc::vec::Vec;
 
 use crate::core::value::Width;
 use crate::ir::{
-    AccessKind, Allocation, Block, CallSites, Cond, Home, Inst, Liveness, MemOp, MemSpace, Opcode,
-    RegBanks, Sign, Temp, Type, bitfield_parts, linear_scan,
+    Allocation, Block, CallSites, Cond, Home, Inst, Liveness, MemOp, MemSpace, Opcode, RegBanks,
+    Sign, Temp, Type, bitfield_parts, linear_scan,
 };
 use crate::jit::PAGE_MASK;
 use crate::jit::tlb::FastSet;
@@ -1482,22 +1484,77 @@ impl<'a> Compiler<'a> {
     /// [`Tlb::read`](crate::jit::Tlb::read) would not agree, rather than a
     /// case where the fast path would merely be slower:
     ///
-    /// * A **store** reads a different set, and its entry was admitted on
-    ///   `WRITE` alone. Stores are not inlined at all — see [`Compiler::store`].
     /// * A **segmented** access is translated before it reaches the TLB (x86's
     ///   `mem_load` adds the segment base and checks the limit), and that
     ///   translation is the frontend's, not this backend's.
     /// * A **separate I/O space** is not what the TLB fronts.
     /// * A width that is not a whole power of two up to eight has no single
-    ///   host load.
+    ///   host access.
+    ///
+    /// A store's own extra conditions are not here, because none of them is a
+    /// property of the [`MemOp`]: they are properties of the *entry*, and they
+    /// were settled when it was filled. See [`Compiler::store`].
     ///
     /// Alignment and page containment are checked at run time, not here,
     /// because they are properties of the address rather than of the access.
     fn inlinable(mem: &MemOp) -> bool {
         mem.space == MemSpace::MEM
             && mem.seg.is_none()
-            && mem.kind == AccessKind::Load
             && matches!(mem.size, Width::U8 | Width::U16 | Width::U32 | Width::U64)
+    }
+
+    /// The inlined software-TLB probe, shared by a load and a store.
+    ///
+    /// `ROADMAP.md` §9.1's first mechanism: mask, compare, add. On entry
+    /// `Rax` holds the guest address; on the fall-through `Rdx` holds the host
+    /// address of that guest byte and `Rax` still holds the guest address.
+    /// Every way of not being a hit — no plan, a misaligned address, the wrong
+    /// page, the wrong world, a page with no host address — lands in the
+    /// returned fixups, which the caller binds to its slow path.
+    ///
+    /// `base`, `mask` and `tag` name the [`Ctx`](super::rt::Ctx) fields of the
+    /// set to probe, which is what makes one sequence serve two sets: a load
+    /// reads the set admitted on read permission and a store the one admitted
+    /// on write permission, and nothing else about the probe differs.
+    fn probe(&mut self, base: i32, mask: i32, tag_bits: i32, bytes: u64) -> Vec<Fixup> {
+        let mut slow: Vec<Fixup> = Vec::new();
+        // The set, which used to sit in `r15` for the whole block and is now
+        // one of the three registers the allocator has to work with.
+        self.asm.mov_rm(Reg::Rsi, Reg::Rbx, base);
+        self.asm.test_rr(Reg::Rsi, Reg::Rsi);
+        slow.push(self.asm.jcc(Cc::E));
+        if bytes > 1 {
+            // Natural alignment. It is also what makes the page-crossing check
+            // unnecessary: an aligned access of at most eight bytes cannot
+            // span two 4 KiB pages.
+            self.asm
+                .test_ri32(Reg::Rax, i32::try_from(bytes - 1).unwrap_or(7));
+            slow.push(self.asm.jcc(Cc::Ne));
+        }
+        // index = (addr >> 12) & mask, scaled by the entry stride
+        self.asm.mov_rr(Reg::Rcx, Reg::Rax);
+        self.asm.shift_ri(Shift::Shr, Reg::Rcx, 12);
+        self.asm.mov_rm(Reg::Rdx, Reg::Rbx, mask);
+        self.asm.alu_rr(Alu::And, Reg::Rcx, Reg::Rdx);
+        self.asm
+            .shift_ri(Shift::Shl, Reg::Rcx, FastSet::STRIDE.trailing_zeros() as u8);
+        self.asm.alu_rr(Alu::Add, Reg::Rcx, Reg::Rsi);
+        // tag = (addr & !PAGE_MASK) | context | valid
+        self.asm.mov_rr(Reg::Rdx, Reg::Rax);
+        self.asm.mov_ri(Reg::Rsi, !PAGE_MASK);
+        self.asm.alu_rr(Alu::And, Reg::Rdx, Reg::Rsi);
+        self.asm.mov_rm(Reg::Rsi, Reg::Rbx, tag_bits);
+        self.asm.alu_rr(Alu::Or, Reg::Rdx, Reg::Rsi);
+        let tag = i32::try_from(FastSet::TAG).unwrap_or(0);
+        self.asm.alu_rm(Alu::Cmp, Reg::Rdx, Reg::Rcx, tag);
+        slow.push(self.asm.jcc(Cc::Ne));
+        // The host addend, zero when this page has no inline path.
+        let host = i32::try_from(FastSet::HOST).unwrap_or(8);
+        self.asm.mov_rm(Reg::Rdx, Reg::Rcx, host);
+        self.asm.test_rr(Reg::Rdx, Reg::Rdx);
+        slow.push(self.asm.jcc(Cc::E));
+        self.asm.alu_rr(Alu::Add, Reg::Rdx, Reg::Rax);
+        slow
     }
 
     fn load(&mut self, at: usize, inst: &Inst) -> Result<(), Refusal> {
@@ -1524,42 +1581,7 @@ impl<'a> Compiler<'a> {
             // RAM branches out to the host's own path, which is the one that
             // fills the entry.
             self.load_temp(Reg::Rax, addr);
-            // The load set, which used to sit in `r15` for the whole block and
-            // is now one of the three registers the allocator has to work with.
-            self.asm.mov_rm(Reg::Rsi, Reg::Rbx, off::TLB_BASE);
-            self.asm.test_rr(Reg::Rsi, Reg::Rsi);
-            slow.push(self.asm.jcc(Cc::E));
-            if bytes > 1 {
-                // Natural alignment. It is also what makes the page-crossing
-                // check unnecessary: an aligned access of at most eight bytes
-                // cannot span two 4 KiB pages.
-                self.asm
-                    .test_ri32(Reg::Rax, i32::try_from(bytes - 1).unwrap_or(7));
-                slow.push(self.asm.jcc(Cc::Ne));
-            }
-            // index = (addr >> 12) & mask, scaled by the entry stride
-            self.asm.mov_rr(Reg::Rcx, Reg::Rax);
-            self.asm.shift_ri(Shift::Shr, Reg::Rcx, 12);
-            self.asm.mov_rm(Reg::Rdx, Reg::Rbx, off::TLB_MASK);
-            self.asm.alu_rr(Alu::And, Reg::Rcx, Reg::Rdx);
-            self.asm
-                .shift_ri(Shift::Shl, Reg::Rcx, FastSet::STRIDE.trailing_zeros() as u8);
-            self.asm.alu_rr(Alu::Add, Reg::Rcx, Reg::Rsi);
-            // tag = (addr & !PAGE_MASK) | context | valid
-            self.asm.mov_rr(Reg::Rdx, Reg::Rax);
-            self.asm.mov_ri(Reg::Rsi, !PAGE_MASK);
-            self.asm.alu_rr(Alu::And, Reg::Rdx, Reg::Rsi);
-            self.asm.mov_rm(Reg::Rsi, Reg::Rbx, off::TAG_BITS);
-            self.asm.alu_rr(Alu::Or, Reg::Rdx, Reg::Rsi);
-            let tag = i32::try_from(FastSet::TAG).unwrap_or(0);
-            self.asm.alu_rm(Alu::Cmp, Reg::Rdx, Reg::Rcx, tag);
-            slow.push(self.asm.jcc(Cc::Ne));
-            // The host addend, zero when this page has no inline path.
-            let host = i32::try_from(FastSet::HOST).unwrap_or(8);
-            self.asm.mov_rm(Reg::Rdx, Reg::Rcx, host);
-            self.asm.test_rr(Reg::Rdx, Reg::Rdx);
-            slow.push(self.asm.jcc(Cc::E));
-            self.asm.alu_rr(Alu::Add, Reg::Rdx, Reg::Rax);
+            slow = self.probe(off::TLB_BASE, off::TLB_MASK, off::TAG_BITS, bytes);
             self.asm.load_zx(Reg::Rax, Reg::Rdx, 0, bytes);
             // Park the value across the call rather than in a callee-saved
             // register, which the allocator now owns; see `PARKED`.
@@ -1596,18 +1618,42 @@ impl<'a> Compiler<'a> {
         self.write(inst, Reg::Rax)
     }
 
-    /// A store, always through the host.
+    /// A store: the same inlined probe a load uses, over the store set, plus
+    /// one call that pays what moving the bytes did not.
     ///
-    /// Not inlined, and the reason is a contract rather than a difficulty: a
-    /// guest store owes two things the backend cannot see. It has to reach the
-    /// host's guest-physical dirty log, which the dispatcher drains at the next
-    /// block boundary to invalidate translations of the page it wrote
-    /// (`ROADMAP.md` §9.1's third mechanism), and it has to mark the
-    /// [`RamStore`](crate::core::space::RamStore)'s own dirty bitmap, which is
-    /// the only record a framebuffer refresh or a live snapshot has. Writing
-    /// guest RAM through a host pointer skips both, silently, and
-    /// `RamStore::host_ptr` is read-only for exactly that reason. Inlining
-    /// stores is a real win and it is owed those two bits first.
+    /// A store is harder than a load and the differences are worth naming,
+    /// because every one of them is silent when it is wrong. Three of the four
+    /// are settled at *fill* time, in the host, which is why none of them
+    /// appears here:
+    ///
+    /// * **Write permission is a different bit from read permission**, so the
+    ///   store set is a different table — [`off::ST_BASE`], not
+    ///   [`off::TLB_BASE`] — and an entry in it was admitted on
+    ///   [`Perms::WRITE`](crate::core::space::Perms::WRITE) and on the guest
+    ///   MMU's own write permission.
+    /// * **The architecture's first-write bookkeeping** — RISC-V's PTE dirty
+    ///   bit — was done by the walk that filled the entry, because a store
+    ///   entry only exists because a walk *for a store* succeeded.
+    /// * **A protection check that may differ within one page** (PMP) was asked
+    ///   as `pmp_page_uniform` rather than `pmp_allows` before the page was
+    ///   admitted at all.
+    ///
+    /// The fourth cannot be settled in advance, and it is
+    /// [`vt::FAST_STORE`]: the [`RamStore`](crate::core::space::RamStore)'s own
+    /// dirty bitmap, which a host pointer does not mark and which is the only
+    /// record a framebuffer refresh or a live snapshot has; the guest-physical
+    /// dirty log the dispatcher drains to invalidate translations of a page
+    /// the guest has just rewritten (`ROADMAP.md` §9.1's third mechanism, and
+    /// Linux really does write its own code, in module loading and in
+    /// alternatives patching); and whatever else the core owes a store, such as
+    /// RISC-V's reservation. One call, after the bytes have landed, which is
+    /// unobservable — nothing runs in between and the fast path cannot fault.
+    ///
+    /// So `RamStore::host_ptr` stays read-only *as a Rust API*, and what
+    /// changed is not that rule but that there is now a place where the two
+    /// bits it exists to protect are paid. A backend that wrote through it and
+    /// did not call this would be exactly the bug that documentation warns
+    /// about.
     fn store(&mut self, at: usize, inst: &Inst) -> Result<(), Refusal> {
         let mem = inst
             .mem
@@ -1615,13 +1661,50 @@ impl<'a> Compiler<'a> {
         let addr = self.src(at, 0)?;
         let value = self.src(at, 1)?;
         let descriptor = self.next_descriptor()?;
+        let bytes = mem.size.bytes();
+        let mask = mem.size.mask();
 
+        // A store commits before it is attempted, because whether the fault it
+        // may take is restartable depends on whether anything has been seen.
         self.asm.mov_mi(Reg::Rbx, off::COMMITTED, 1);
+
+        let mut slow: Vec<Fixup> = Vec::new();
+        let mut joined: Option<Fixup> = None;
+        if Self::inlinable(&mem) {
+            self.load_temp(Reg::Rax, addr);
+            slow = self.probe(off::ST_BASE, off::ST_MASK, off::ST_TAG, bytes);
+            // The guest address is the thunk's first argument and `rax` is
+            // about to hold the value, so it goes to the stack slot the
+            // prologue reserved rather than to a callee-saved register the
+            // allocator now owns; see `PARKED`.
+            self.asm.mov_mr(Reg::Rsp, PARKED, Reg::Rax);
+            self.load_temp(Reg::Rax, value);
+            // The bytes, and only the bytes: `store_trunc` writes the width the
+            // guest asked for, so a neighbouring guest byte another device is
+            // reading is never disturbed — and the high bits of the value are
+            // discarded by the instruction rather than by a mask ahead of it.
+            //
+            // The slow path *does* mask, and the asymmetry is not an oversight:
+            // there the value is handed to
+            // [`IrHost::store`](crate::ir::IrHost::store), whose contract says
+            // it arrives already truncated to the access width, and a host is
+            // entitled to rely on that. Here the only consumer is the `mov`.
+            self.asm.store_trunc(Reg::Rdx, 0, Reg::Rax, bytes);
+            self.ctx_to_rdi();
+            self.asm.mov_rm(Reg::Rsi, Reg::Rsp, PARKED);
+            self.asm.mov_ri(Reg::Rdx, bytes);
+            self.call(vt::FAST_STORE);
+            self.bump(off::FAST_WRITES);
+            joined = Some(self.asm.jmp());
+        }
+
+        for f in slow {
+            self.asm.bind(f);
+        }
         self.ctx_to_rdi();
         self.asm.mov_ri(Reg::Rsi, descriptor);
         self.load_temp(Reg::Rdx, addr);
         self.load_temp(Reg::Rcx, value);
-        let mask = mem.size.mask();
         if mask != u64::MAX {
             // `rax` rather than a callee-saved register: it is not an argument
             // register, this sequence makes no call before the `and`, and
@@ -1634,6 +1717,9 @@ impl<'a> Compiler<'a> {
         let ok = self.asm.jcc(Cc::E);
         self.fault(at)?;
         self.asm.bind(ok);
+        if let Some(f) = joined {
+            self.asm.bind(f);
+        }
         Ok(())
     }
 }

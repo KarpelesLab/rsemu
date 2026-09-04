@@ -629,6 +629,18 @@ pub struct Csrs {
     /// Bumped whenever a write invalidates address translation, so the
     /// software TLB can be tagged rather than flushed by hand at each site.
     pub translation_gen: u64,
+    /// Bumped whenever a write changes what physical memory protection
+    /// permits, so a cached PMP answer can be tagged rather than recomputed.
+    ///
+    /// Deliberately **not** [`Csrs::translation_gen`], although every PMP write
+    /// bumps that one too. Translation's counter moves on every `SRET`, every
+    /// `MRET` and every `sstatus` write — thousands of times a millisecond
+    /// under a supervisor guest — and a PMP cache keyed on it would be thrown
+    /// away before it ever answered twice. PMP is programmed by firmware at
+    /// boot and then left alone, so its own counter is the one that makes
+    /// caching worth anything. Derived state in the sense of `ROADMAP.md`
+    /// §4.5: never serialized, and whoever caches against it starts empty.
+    pub pmp_gen: u64,
 }
 
 impl Csrs {
@@ -683,6 +695,7 @@ impl Csrs {
             pmpcfg: [0; PMP_ENTRIES],
             pmpaddr: [0; PMP_ENTRIES],
             translation_gen: 1,
+            pmp_gen: 1,
         }
     }
 
@@ -745,6 +758,19 @@ impl Csrs {
     #[inline]
     pub fn bump_translation(&mut self) {
         self.translation_gen = self.translation_gen.wrapping_add(1);
+    }
+
+    /// Note that physical memory protection may have changed.
+    ///
+    /// Bumps [`Csrs::translation_gen`] as well, because a cached *translation*
+    /// carries no PMP answer of its own only as long as nothing caches one:
+    /// `mmu::Tlb`'s shadow admits a page on `pmp_page_uniform`, so a PMP write
+    /// has to reach that table too. One call at each of the two PMP write
+    /// sites, rather than two, so the pair cannot drift.
+    #[inline]
+    pub fn bump_pmp(&mut self) {
+        self.pmp_gen = self.pmp_gen.wrapping_add(1);
+        self.bump_translation();
     }
 
     /// Whether `num` names a register that exists and may be accessed from
@@ -1203,7 +1229,7 @@ impl Csrs {
 
             num::PMPCFG0..=num::PMPCFG15 => {
                 self.write_pmpcfg(num - num::PMPCFG0, value)?;
-                self.bump_translation();
+                self.bump_pmp();
             }
             num::PMPADDR0..=num::PMPADDR63 => {
                 let i = (num - num::PMPADDR0) as usize;
@@ -1216,7 +1242,7 @@ impl Csrs {
                         && (self.pmpcfg[i + 1] >> 3) & 3 == 1;
                     if !locked && !next_tor_locked {
                         self.pmpaddr[i] = value & 0x003f_ffff_ffff_ffff;
-                        self.bump_translation();
+                        self.bump_pmp();
                     }
                 }
             }

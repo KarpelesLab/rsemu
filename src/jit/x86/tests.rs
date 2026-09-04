@@ -33,7 +33,7 @@ use crate::ir::{
     AccessKind, Block, BlockBuilder, Cond, Const, InsnStart, Interp, IrHost, MemOp, Opcode,
     Outcome, RegSlot, Sign, Temp, Type, bitfield_aux, verify,
 };
-use crate::jit::{Context, FastMem, LoadPlan, Tlb};
+use crate::jit::{Context, FastMem, MemPlan, Tlb};
 
 use super::compile::Regs;
 use super::rt::Engine;
@@ -42,9 +42,22 @@ use super::rt::Engine;
 const BASE: u64 = 0x2000_0000;
 /// Four pages, so an address can miss the mapping and fault.
 const RAM: u64 = 4 * 4096;
-/// The world an access happens in.
+/// The world a *load* happens in.
 const WORLD: Context = Context {
     level: 3,
+    translating: false,
+};
+/// The world a *store* happens in — deliberately not [`WORLD`].
+///
+/// A host publishes a tag with each plan, and nothing says the two plans have
+/// to carry the same one. On the RISC-V host they do, because
+/// `Exec::effective_priv` distinguishes a fetch from everything else and
+/// nothing finer — which makes a backend that read the load plan's tag bits
+/// for a store *indistinguishable* from a correct one there. Here they differ,
+/// so it is distinguishable, and the store set's entries are filled and probed
+/// under this one throughout.
+const STORE_WORLD: Context = Context {
+    level: 2,
     translating: false,
 };
 /// How many guest state slots the generator uses.
@@ -77,6 +90,13 @@ struct Scratch {
     inline: bool,
     ticks: u64,
     log: Vec<Event>,
+    /// `(address, width)` of every store the backend served itself.
+    ///
+    /// Recorded rather than counted, because the width is an argument
+    /// generated code chooses and nothing else checks it: a store that
+    /// reported eight bytes for one would mark the wrong granules dirty and
+    /// log the wrong page, and both are invisible in a state comparison.
+    inlined_stores: Vec<(u64, u64)>,
 }
 
 impl Scratch {
@@ -108,6 +128,7 @@ impl Scratch {
             inline,
             ticks: 0,
             log: Vec::new(),
+            inlined_stores: Vec::new(),
         }
     }
 
@@ -164,7 +185,7 @@ impl IrHost for Scratch {
         );
         self.ticks += 1;
         self.tlb
-            .write(addr, addr, mem.size, value, WORLD, MemAttrs::DEFAULT)
+            .write(addr, addr, mem.size, value, STORE_WORLD, MemAttrs::DEFAULT)
     }
 
     fn charge(&mut self, ticks: u64) {
@@ -178,13 +199,32 @@ impl IrHost for Scratch {
 }
 
 impl FastMem for Scratch {
-    fn load_plan(&mut self) -> Option<LoadPlan> {
+    fn load_plan(&mut self) -> Option<MemPlan> {
         self.inline.then(|| self.tlb.plan(AccessKind::Load, WORLD))
     }
 
     fn note_fast_load(&mut self) {
         // Exactly what `load` charges for one access, and nothing else.
         self.ticks += 1;
+    }
+
+    fn store_plan(&mut self) -> Option<MemPlan> {
+        self.inline
+            .then(|| self.tlb.plan(AccessKind::Store, STORE_WORLD))
+    }
+
+    fn note_fast_store(&mut self, addr: u64, bytes: u64) {
+        // Exactly what `store` charges, plus the two bits writing through a
+        // host pointer skipped. The address is asserted because the whole
+        // point of the side array it comes out of is that a compiled store can
+        // say *which guest-physical page* it wrote.
+        self.ticks += 1;
+        assert_eq!(
+            self.tlb.note_fast_store(addr, bytes),
+            Some(addr),
+            "an inlined store must report where it landed"
+        );
+        self.inlined_stores.push((addr, bytes));
     }
 }
 
@@ -789,8 +829,8 @@ fn the_call_map_the_allocator_is_given_matches_what_the_lowerings_emit() {
     let shifted = b.binary(Opcode::SHL, Type::I64, sum, one);
     let _ = b.unary(Opcode::POPCOUNT, Type::I64, shifted);
     let addr = b.imm(Type::I64, Const::Int(u128::from(BASE + 64)));
-    // One load the backend inlines — two calls, the fast path's tick and the
-    // slow path's own — and one store, which is always a call.
+    // One load and one store, each of which the backend inlines — so each
+    // carries two calls, the fast path's own and the slow path's.
     let value = b.load(Type::I64, addr, MemOp::load(Width::U64));
     b.store(Type::I64, addr, value, MemOp::store(Width::U64));
     b.insn_start(InsnStart {
@@ -811,10 +851,11 @@ fn the_call_map_the_allocator_is_given_matches_what_the_lowerings_emit() {
     let mut want = 0usize;
     for inst in block.insts() {
         want += match inst.op {
-            Opcode::GET_SLOT | Opcode::ST => 1,
-            // A load carries the slow path's call whatever happens, and the
-            // inlined probe adds `note_fast_load` on top of it.
-            Opcode::LD => 2,
+            Opcode::GET_SLOT => 1,
+            // An access carries the slow path's call whatever happens, and the
+            // inlined probe adds its own — `note_fast_load` for a load,
+            // `note_fast_store` for a store — on top of it.
+            Opcode::LD | Opcode::ST => 2,
             // A charge and a boundary emit nothing at all: their work is the
             // region's flush, counted below.
             _ => 0,
@@ -1567,6 +1608,107 @@ fn a_full_code_buffer_recompiles_rather_than_failing() {
     let mut host = Scratch::new(true);
     assert!(engine.run(&block, first, &mut host).is_none());
     assert!(engine.run(&block, last, &mut host).is_some());
+}
+
+#[test]
+fn an_inlined_store_reports_the_width_it_actually_wrote() {
+    // The width is an argument generated code chooses, and everything that
+    // consumes it is a *set* operation on a bitmap or a page list — so getting
+    // it wrong marks a neighbour dirty and logs a page the store never
+    // touched, and neither shows up in a comparison of guest memory or of
+    // registers. It is checked where it is produced.
+    for size in WIDTHS {
+        let bytes = size.bytes();
+        let at = BASE + 64;
+        let mut b = BlockBuilder::new(BASE, 0);
+        b.insn_start(InsnStart {
+            pc: BASE,
+            next_pc: BASE + 4,
+            ticks: 0,
+            live: Vec::new(),
+        });
+        let addr = b.imm(Type::I64, Const::Int(u128::from(at)));
+        let value = b.imm(Type::I64, Const::Int(0x0102_0304_0506_0708));
+        // Twice: the first fills the entry through the host, the second is
+        // inlined.
+        b.store(Type::I64, addr, value, MemOp::store(size));
+        b.store(Type::I64, addr, value, MemOp::store(size));
+        b.exit_tb();
+        let block = b.finish();
+        verify(&block).expect("well formed");
+
+        let mut engine = Engine::with_capacity(1 << 16).expect("a code buffer");
+        let code = engine.compile(&block).expect("compiles");
+        let mut host = Scratch::new(true);
+        engine
+            .run(&block, code, &mut host)
+            .expect("live")
+            .expect("ok");
+        assert_eq!(
+            host.inlined_stores,
+            vec![(at, bytes)],
+            "a {bytes}-byte store reported something else"
+        );
+    }
+}
+
+#[test]
+fn the_inlined_probe_really_serves_the_stores() {
+    // The mirror of `the_inlined_probe_really_serves_the_loads`, and it has one
+    // assertion that test does not need: the *bytes*. A store is the only
+    // inlined access that writes, so "the fast path was taken" and "the fast
+    // path wrote the right thing in the right place" are separate claims, and
+    // a probe that computed the wrong host address would satisfy the first.
+    let mut b = BlockBuilder::new(BASE, 0);
+    b.insn_start(InsnStart {
+        pc: BASE,
+        next_pc: BASE + 4,
+        ticks: 0,
+        live: Vec::new(),
+    });
+    b.charge(1);
+    let addr = b.imm(Type::I64, Const::Int(u128::from(BASE + 64)));
+    let value = b.imm(Type::I64, Const::Int(0x0102_0304_0506_0708));
+    for _ in 0..16 {
+        b.store(Type::I64, addr, value, MemOp::store(Width::U64));
+    }
+    b.insn_start(InsnStart {
+        pc: BASE + 4,
+        next_pc: BASE + 8,
+        ticks: 1,
+        live: Vec::new(),
+    });
+    b.exit_tb();
+    let block = b.finish();
+
+    let mut engine = Engine::with_capacity(1 << 16).expect("a code buffer");
+    let code = engine.compile(&block).expect("compiles");
+    let mut host = Scratch::new(true);
+    engine
+        .run(&block, code, &mut host)
+        .expect("live")
+        .expect("ok");
+    // The first store misses and fills through the host; the rest are inlined.
+    assert_eq!(engine.stats().fast_stores, 15, "{:?}", host.tlb.stats());
+    assert_eq!(host.ticks, 17, "one charge and sixteen accesses");
+    let inlined = host.bytes();
+
+    // With the plan withheld, not one of them is — and the memory that comes
+    // out is the same memory, byte for byte, which is the whole claim.
+    let mut engine = Engine::with_capacity(1 << 16).expect("a code buffer");
+    let code = engine.compile(&block).expect("compiles");
+    let mut host = Scratch::new(false);
+    engine
+        .run(&block, code, &mut host)
+        .expect("live")
+        .expect("ok");
+    assert_eq!(engine.stats().fast_stores, 0);
+    assert_eq!(host.ticks, 17, "and the ticks are the same either way");
+    assert_eq!(
+        inlined,
+        host.bytes(),
+        "the inlined store and the call did not agree about guest memory"
+    );
 }
 
 #[test]

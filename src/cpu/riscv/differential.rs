@@ -115,7 +115,7 @@ use super::{Config, Hart};
 use crate::ir::AccessKind;
 #[cfg(feature = "jit")]
 use crate::jit::{
-    BlockCache, Context as TlbContext, DirtyPages, Dispatcher, Epoch, FastMem, Frontend, LoadPlan,
+    BlockCache, Context as TlbContext, DirtyPages, Dispatcher, Epoch, FastMem, Frontend, MemPlan,
     Stop, StoreLog, Tlb, Translation,
 };
 
@@ -1427,7 +1427,7 @@ impl StoreLog for CachedHost {
 /// through the slow path is what the next inlined probe hits.
 #[cfg(feature = "jit")]
 impl FastMem for CachedHost {
-    fn load_plan(&mut self) -> Option<LoadPlan> {
+    fn load_plan(&mut self) -> Option<MemPlan> {
         Some(self.tlb.plan(AccessKind::Load, MACHINE))
     }
 
@@ -1435,6 +1435,26 @@ impl FastMem for CachedHost {
         // `CachedHost::once`, with the access itself already done: one bus
         // access is one cycle (`cpu::riscv::exec`).
         self.ticks += 1;
+    }
+
+    fn store_plan(&mut self) -> Option<MemPlan> {
+        Some(self.tlb.plan(AccessKind::Store, MACHINE))
+    }
+
+    fn note_fast_store(&mut self, addr: u64, bytes: u64) {
+        // `CachedHost::once`'s store arm minus the bytes: the tick, the store's
+        // own dirty bitmap, and the self-modifying-code hook — and the same
+        // guest-physical address the slow path notes, which is asserted rather
+        // than assumed, because a compiled store that reported the wrong page
+        // would leave a stale translation of the page it really wrote.
+        self.ticks += 1;
+        let phys = self.tlb.note_fast_store(addr, bytes);
+        assert_eq!(
+            phys,
+            Some(addr),
+            "an inlined store must report where it landed"
+        );
+        self.dirty.note(addr, bytes);
     }
 }
 

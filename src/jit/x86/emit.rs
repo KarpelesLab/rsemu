@@ -362,6 +362,46 @@ impl Asm {
         }
     }
 
+    /// A truncating store of the low `bytes` bytes of `src` to `[base + disp]`.
+    ///
+    /// The mirror of [`Asm::load_zx`], and the same widths for the same reason:
+    /// one, two and four are the byte, word and doubleword forms of `MOV
+    /// r/m, r`, and eight is the 64-bit one. Only the named bytes are written,
+    /// so a store never disturbs a neighbouring guest byte — which matters
+    /// because the destination is guest RAM another device may be reading.
+    ///
+    /// The byte form forces a REX prefix for the same reason [`Asm::setcc`]
+    /// does: without one, register numbers 4..7 name `ah`/`ch`/`dh`/`bh`
+    /// instead of `spl`/`bpl`/`sil`/`dil`, so `mov [rdx], sil` would silently
+    /// become `mov [rdx], dh`.
+    ///
+    /// # Panics
+    ///
+    /// On a width that is not 1, 2, 4 or 8 — a caller that has not checked is
+    /// a code-generator bug rather than a guest one.
+    pub fn store_trunc(&mut self, base: Reg, disp: i32, src: Reg, bytes: u64) {
+        match bytes {
+            1 => {
+                self.byte(0x40 | (src.high() << 2) | base.high());
+                self.byte(0x88);
+                self.modrm_mem(src.low(), base, disp);
+            }
+            2 => {
+                self.byte(0x66);
+                self.rex(false, src.high(), base.high());
+                self.byte(0x89);
+                self.modrm_mem(src.low(), base, disp);
+            }
+            4 => {
+                self.rex(false, src.high(), base.high());
+                self.byte(0x89);
+                self.modrm_mem(src.low(), base, disp);
+            }
+            8 => self.mov_mr(base, disp, src),
+            _ => panic!("a guest access is 1, 2, 4 or 8 bytes wide"),
+        }
+    }
+
     // ---- arithmetic -----------------------------------------------------
 
     /// `op dst, src`, 64-bit.
@@ -651,6 +691,29 @@ mod tests {
         let mut a = Asm::new();
         a.setcc(Cc::E, Reg::Rsi);
         assert_eq!(a.code(), &[0x40, 0x0f, 0x94, 0xc6, 0x48, 0x0f, 0xb6, 0xf6]);
+
+        // The four widths of a truncating store, into `[rdx]`.
+        let mut a = Asm::new();
+        a.store_trunc(Reg::Rdx, 0, Reg::Rax, 1);
+        assert_eq!(a.code(), &[0x40, 0x88, 0x82, 0x00, 0x00, 0x00, 0x00]);
+        let mut a = Asm::new();
+        a.store_trunc(Reg::Rdx, 0, Reg::Rax, 2);
+        assert_eq!(a.code(), &[0x66, 0x89, 0x82, 0x00, 0x00, 0x00, 0x00]);
+        let mut a = Asm::new();
+        a.store_trunc(Reg::Rdx, 0, Reg::Rax, 4);
+        assert_eq!(a.code(), &[0x89, 0x82, 0x00, 0x00, 0x00, 0x00]);
+        let mut a = Asm::new();
+        a.store_trunc(Reg::Rdx, 0, Reg::Rax, 8);
+        assert_eq!(a.code(), &[0x48, 0x89, 0x82, 0x00, 0x00, 0x00, 0x00]);
+
+        // And the forced REX on the byte form, for the same reason `setcc` has
+        // one: without it, source register 6 is `dh` rather than `sil`, so
+        // `mov [rdx], sil` would write the wrong half of the wrong register.
+        // The lowering happens to use `rax` today, which is why this is
+        // asserted on the encoding rather than left to a functional test.
+        let mut a = Asm::new();
+        a.store_trunc(Reg::Rdx, 0, Reg::Rsi, 1);
+        assert_eq!(a.code(), &[0x40, 0x88, 0xb2, 0x00, 0x00, 0x00, 0x00]);
 
         let mut a = Asm::new();
         a.call_m(Reg::R14, 0x10);

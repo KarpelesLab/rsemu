@@ -166,6 +166,19 @@ pub struct Ctx {
     pub published: u64,
     /// Loads served entirely from an inlined TLB probe.
     pub fast_hits: u64,
+    /// The software TLB's store set, or null when the host published none.
+    ///
+    /// A separate table from [`Ctx::tlb_base`], not the same one indexed
+    /// differently: an entry in the store set was admitted on write permission
+    /// and one in the load set on read permission, and the two are different
+    /// bits in both the topology and the guest's own page tables.
+    pub st_base: *const u8,
+    /// `entries - 1` for that set.
+    pub st_mask: u64,
+    /// Everything a store's TLB tag carries besides the page number.
+    pub st_tag: u64,
+    /// Stores served entirely from an inlined TLB probe.
+    pub fast_writes: u64,
     /// The compiled block's deferred bookkeeping, in instruction order.
     ///
     /// Generated code never names this — it passes a *range* into it — so it
@@ -204,6 +217,14 @@ pub mod off {
     pub const COMMITTED: i32 = 120;
     /// [`Ctx::fast_hits`](super::Ctx::fast_hits).
     pub const FAST_HITS: i32 = 136;
+    /// [`Ctx::st_base`](super::Ctx::st_base).
+    pub const ST_BASE: i32 = 144;
+    /// [`Ctx::st_mask`](super::Ctx::st_mask).
+    pub const ST_MASK: i32 = 152;
+    /// [`Ctx::st_tag`](super::Ctx::st_tag).
+    pub const ST_TAG: i32 = 160;
+    /// [`Ctx::fast_writes`](super::Ctx::fast_writes).
+    pub const FAST_WRITES: i32 = 168;
 }
 
 /// The thunks generated code calls, one table per host type.
@@ -228,6 +249,13 @@ pub struct Vtable {
     pub store: unsafe extern "sysv64" fn(*mut c_void, *const MemOp, u64, u64) -> u64,
     /// [`FastMem::note_fast_load`], for an access the backend served itself.
     pub fast_tick: unsafe extern "sysv64" fn(*mut c_void),
+    /// [`FastMem::note_fast_store`], for a store the backend served itself.
+    ///
+    /// Takes the guest address and the width, because everything the host
+    /// still owes — the tick, the store's dirty bitmap, the guest-physical
+    /// dirty log, the broken reservation — is a function of exactly those two
+    /// and the table the plan named.
+    pub fast_store: unsafe extern "sysv64" fn(*mut c_void, u64, u64),
 }
 
 /// Byte offsets into [`Vtable`], as generated code bakes them in.
@@ -242,6 +270,8 @@ pub mod vt {
     pub const STORE: i32 = 24;
     /// [`Vtable::fast_tick`](super::Vtable::fast_tick).
     pub const FAST_TICK: i32 = 32;
+    /// [`Vtable::fast_store`](super::Vtable::fast_store).
+    pub const FAST_STORE: i32 = 40;
 }
 
 /// Reconstitute the context a thunk was handed.
@@ -465,6 +495,18 @@ unsafe extern "sysv64" fn fast_tick_thunk<H: IrHost + FastMem>(raw: *mut c_void)
     }
 }
 
+unsafe extern "sysv64" fn fast_store_thunk<H: IrHost + FastMem>(
+    raw: *mut c_void,
+    addr: u64,
+    bytes: u64,
+) {
+    // SAFETY: as `charge_thunk`.
+    unsafe {
+        let c = ctx(raw);
+        host_of::<H>(c).note_fast_store(addr, bytes);
+    }
+}
+
 impl Vtable {
     /// The thunks for one host type.
     #[must_use]
@@ -475,6 +517,7 @@ impl Vtable {
             load: load_thunk::<H>,
             store: store_thunk::<H>,
             fast_tick: fast_tick_thunk::<H>,
+            fast_store: fast_store_thunk::<H>,
         }
     }
 }
@@ -492,6 +535,9 @@ pub struct EngineStats {
     pub resets: u64,
     /// Guest loads served by an inlined TLB probe, with no call at all.
     pub fast_loads: u64,
+    /// Guest stores served by an inlined TLB probe, with only the thunk that
+    /// reports the write.
+    pub fast_stores: u64,
 }
 
 /// The x86-64 backend: a code buffer, the blocks in it, and a way in.
@@ -701,6 +747,7 @@ impl Engine {
         // pointer is valid until the TLB is flushed, and a flush happens at a
         // block boundary (`Tlb::sync`) — never inside one.
         let plan = host.load_plan();
+        let stores = host.store_plan();
         let vt = Vtable::of::<H>();
         let mut ctx = Ctx {
             temps: self.temps.as_mut_ptr(),
@@ -721,6 +768,10 @@ impl Engine {
             committed: 0,
             published: 1,
             fast_hits: 0,
+            st_base: stores.map_or(core::ptr::null(), |p| p.set.base),
+            st_mask: stores.map_or(0, |p| p.set.mask),
+            st_tag: stores.map_or(0, |p| p.tag),
+            fast_writes: 0,
             events,
             event_count,
         };
@@ -734,6 +785,19 @@ impl Engine {
         // through host addresses taken from live TLB entries — all of which
         // are alive for the whole call, because `self` and `host` are borrowed
         // mutably across it and `ctx` is a local.
+        //
+        // Guest RAM is both read and written that way. An entry carries a host
+        // address only for a whole page of a `RamStore` that outlives this
+        // call (the plan is taken above, and the `Arc` lives in the host's own
+        // TLB), and generated code touches exactly the bytes of the access —
+        // `store_trunc` emits the width the guest asked for. Those bytes are
+        // `AtomicU8`, written elsewhere with relaxed stores, and the emitted
+        // `mov` is the instruction a relaxed atomic byte store compiles to; no
+        // Rust reference to them is ever formed, which is the obligation
+        // `RamStore::host_ptr` states. What that documentation additionally
+        // forbids — writing without marking the store dirty — is paid by
+        // `FastMem::note_fast_store`, called on the same path before anything
+        // can observe the write.
         let entry = unsafe { self.buf.entry(offset) }?;
         // SAFETY: as above. `ctx` is a live, initialized `Ctx` and the pointer
         // does not escape the call.
@@ -741,6 +805,7 @@ impl Engine {
 
         self.stats.executed += 1;
         self.stats.fast_loads += ctx.fast_hits;
+        self.stats.fast_stores += ctx.fast_writes;
         self.ticks = ctx.ticks;
         self.boundaries = ctx.boundaries;
         self.mark = u32::try_from(ctx.mark).ok();
@@ -810,9 +875,16 @@ mod tests {
         );
         assert_eq!(core::mem::offset_of!(Ctx, committed) as i32, off::COMMITTED);
         assert_eq!(core::mem::offset_of!(Ctx, fast_hits) as i32, off::FAST_HITS);
+        assert_eq!(core::mem::offset_of!(Ctx, st_base) as i32, off::ST_BASE);
+        assert_eq!(core::mem::offset_of!(Ctx, st_mask) as i32, off::ST_MASK);
+        assert_eq!(core::mem::offset_of!(Ctx, st_tag) as i32, off::ST_TAG);
+        assert_eq!(
+            core::mem::offset_of!(Ctx, fast_writes) as i32,
+            off::FAST_WRITES
+        );
         // The deferred bookkeeping sits past every declared offset, which is
         // what lets it be added without moving anything generated code names.
-        assert!(core::mem::offset_of!(Ctx, events) > off::FAST_HITS as usize);
+        assert!(core::mem::offset_of!(Ctx, events) > off::FAST_WRITES as usize);
 
         // The six the bookkeeping took back are still where a displacement
         // *would* have reached them. They are asserted anyway, and not out of
@@ -836,6 +908,10 @@ mod tests {
         assert_eq!(
             core::mem::offset_of!(Vtable, fast_tick) as i32,
             vt::FAST_TICK
+        );
+        assert_eq!(
+            core::mem::offset_of!(Vtable, fast_store) as i32,
+            vt::FAST_STORE
         );
     }
 
