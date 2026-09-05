@@ -199,44 +199,46 @@ thread blocks, and a `FUTEX_WAKE` overwrites it with `0`. A deadline that fires
 leaves what was already there. That is what lets `ThreadSet` stay out of it —
 the framework never has to say *why* a thread became runnable.
 
-## A ledgered divergence: the exclusive monitor is per core
+## A ledger line that closed: the exclusive monitor used to be per core
 
-The threaded guest is where this surfaced, and it is the one thing level-3
-threading found that is **not** on the consumer's side of §2.1's line.
+The threaded guest is where this surfaced, and it was the one thing level-3
+threading found that was **not** on the consumer's side of §2.1's line.
 
-Both cores keep their reservation in their own execution state — RISC-V's
-`reservation`, AArch64's `State::exclusive` — and break it only on a store
-*that core* makes. Level-3 threads are one core each over one `UserMemory`, so
-a sibling's store does not break this core's reservation: a `sc.d`/`stxr` that
-the architecture requires to fail succeeds instead, and the sibling's update is
+Both cores kept their reservation in their own execution state — RISC-V's
+`reservation`, AArch64's `State::exclusive` — and broke it only on a store
+*that core* made. Level-3 threads are one core each over one `UserMemory`, so a
+sibling's store did not break this core's reservation: a `sc.d`/`stxr` that the
+architecture requires to fail succeeded instead, and the sibling's update was
 lost.
 
-`core::space::MemAttrs` already carries an `exclusive` flag whose own
-documentation says *"the core carries the flag; the monitor that implements the
-reservation"* is elsewhere. Elsewhere does not exist yet, because until level-3
-threading nothing in this tree had two cores sharing one map at instruction
-granularity. A **global monitor on the address space** is where it belongs, and
-that is `src/cpu/` and `src/core/space/`, not here.
+Whether a guest *hit* it depended on its compiler rather than on its
+architecture, which is why it took both:
 
-Whether a guest *hits* it depends on its compiler rather than on its
-architecture:
-
-| | `fetch_add` compiles to | the threaded guest's counter |
+| | `fetch_add` compiles to | the threaded guest's counter, before |
 | --- | --- | --- |
 | `riscv64gc` (has `A`) | one `amoadd.d` | 40000 of 40000 |
 | `aarch64` baseline (no `FEAT_LSE`) | an `ldxr`/`stxr` loop | 32038 of 40000 |
 
-`proof.rs`'s `a_reservation_is_core_local_so_two_threads_lose_an_update` is the
-minimal statement of the same defect — two hand-assembled threads, one word,
-one preemption in the wrong place, **on both architectures**, with no toolchain
-— and it is the ledger entry. It is written to **fail the day the monitor
-lands**, with a message saying what to change it to, because a known-failures
-ledger that only ever shrinks has to be able to notice.
+`core::space::ExclusiveMonitor` closed it: a reservation table on the
+`AddressSpace`, one slot per core, keyed on the guest-**physical** granule and
+consulted by every store that reaches `SpaceView::write_span` — which a
+`UserMemory` write is, so a syscall that writes into a reserved granule breaks
+it too. The core's own field stayed as the *local* monitor and a
+store-conditional now needs both to agree. Both columns of that table are
+40000 of 40000, and `proof.rs`'s
+`a_siblings_store_breaks_this_cores_reservation` — two hand-assembled threads,
+one word, one preemption in the wrong place, **on both architectures**, with no
+toolchain — asserts the inverse of what it used to.
 
-A consumer can make the race arbitrarily rare by lengthening
-`ThreadSet::set_quantum`, and cannot make it impossible. That is worth writing
-down rather than doing quietly: a knob that turns a wrong answer into a rare
-wrong answer is not a fix.
+The knob that used to be the only mitigation is worth remembering rather than
+reaching for: lengthening `ThreadSet::set_quantum` made the race arbitrarily
+rare and could not make it impossible, and a knob that turns a wrong answer
+into a rare wrong answer is not a fix.
+
+What is **not** fixed by this is memory *ordering*. A core here executes one
+instruction at a time and completes every access before the next, so a fence is
+a no-op and a guest that depends on a weak memory model being weak still has
+nothing to disagree with. Atomicity and ordering are different promises.
 
 ## The initial stack
 

@@ -215,7 +215,7 @@ use alloc::vec;
 
 use crate::core::error::{BusError, Result};
 use crate::core::exec::{Exit, ExitMask};
-use crate::core::space::{AddressSpace, MemAttrs, MemResult};
+use crate::core::space::{AddressSpace, MemAttrs, MemResult, MonitorSlot};
 use crate::core::value::Width;
 use crate::ir::{Block, InsnStart, IrHost, MemOp, Opcode, RegSlot, verify};
 use crate::jit::{
@@ -926,6 +926,7 @@ pub(super) fn advance(
     cfg: &Config,
     lines: &Lines,
     exits: ExitMask,
+    monitor: Option<&MonitorSlot>,
     remaining: u64,
 ) -> (u64, Option<Exit>) {
     let Jit {
@@ -936,7 +937,7 @@ pub(super) fn advance(
         smc,
         probes,
     } = jit;
-    let mut exec = Exec::new(state, tlb, space, cfg, lines, exits);
+    let mut exec = Exec::new(state, tlb, space, cfg, lines, exits, monitor);
     let pc = exec.st.pc;
 
     // The entry work for the *first* block, done here rather than through
@@ -1402,7 +1403,7 @@ impl FastMem for Host<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::space::{RamStore, Region};
+    use crate::core::space::{MonitorSlot, RamStore, Region};
     use crate::cpu::arm::a64::mmu::desc;
     use crate::cpu::arm::a64::{Cpu, Engine};
 
@@ -2482,6 +2483,95 @@ mod tests {
                     "the store between the pair was never inlined: {stats:?}"
                 );
             }
+        }
+    }
+
+    /// `note_fast_store` in isolation: the store has already happened through
+    /// a host pointer, and everything the guest can still observe about it is
+    /// owed from here.
+    ///
+    /// Driven directly rather than through a run, because a run cannot be made
+    /// *pure*: `run_budget` always interprets a handful of instructions at its
+    /// entry, one of them is the loop's store, and an interpreted store reaches
+    /// the monitor through `SpaceView::write_span` — which would let a missing
+    /// hook here pass unnoticed. One call, no run, no ambiguity.
+    #[test]
+    fn note_fast_store_tells_the_global_monitor_itself() {
+        let cpu = core(Engine::JitHost, &LOOP);
+        let space = cpu.space().expect("the core has a space");
+        let cfg = cpu.config();
+        let lines = Lines::default();
+        let mut state = State::new(&cfg);
+        let mut tlb = Tlb::new();
+        tlb.attach_shadow(Arc::clone(&space));
+
+        // One ordinary store first, so the software TLB and the shadow beside
+        // it hold an entry for the page: an inlined store is only ever issued
+        // against an entry generated code has already resolved.
+        let mut exec = Exec::new(
+            &mut state,
+            &mut tlb,
+            &space,
+            &cfg,
+            &lines,
+            ExitMask::NONE,
+            None,
+        );
+        exec.store(0x1000, 8, 0).expect("the page is RAM");
+
+        let sibling = MonitorSlot::new(Arc::clone(&space), 4).expect("a free slot");
+        sibling.reserve(0x1000);
+        assert!(sibling.holds(), "the reservation was taken");
+        exec.note_fast_store(0x1000, 8);
+        assert!(
+            !sibling.holds(),
+            "an inlined store did not reach the global monitor, so a sibling's \
+             `STXR` would succeed against a word this core had overwritten"
+        );
+    }
+
+    #[test]
+    fn a_compiled_store_breaks_a_siblings_reservation_too() {
+        // The other half, and the one SMP needs. The test above proves a
+        // compiled store breaks the *storing* core's own reservation; this one
+        // proves it reaches the **global** monitor, where a sibling's
+        // reservation lives. An inlined store never calls
+        // `SpaceView::write_span`, so `Exec::note_fast_store` has to tell the
+        // monitor itself — and 99% of this core's stores are inlined.
+        //
+        // The sibling is a bare `MonitorSlot` rather than a second `Cpu`
+        // because what is under test is the hook, not the interleaving: a
+        // registration on the same space is exactly what a second core would
+        // hold.
+        for engine in [Engine::Jit, Engine::JitHost] {
+            let cpu = core(engine, &LOOP);
+            let space = cpu.space().expect("the core has a space");
+            // Warm the loop first, so that by the time the reservation is
+            // taken every store in the next budget is coming out of generated
+            // code rather than out of the interpreter.
+            for _ in 0..4 {
+                cpu.run_budget(4096);
+            }
+            let before = cpu.jit_stats().expect("a jit core");
+
+            let sibling = MonitorSlot::new(Arc::clone(&space), 4).expect("a free slot");
+            // `LOOP` stores to 0x1000, and with the MMU off that is also the
+            // physical address.
+            sibling.reserve(0x1000);
+            assert!(sibling.holds(), "the reservation was taken");
+            cpu.run_budget(4096);
+
+            let stats = cpu.jit_stats().expect("a jit core");
+            if engine == Engine::JitHost && HOST_BACKEND {
+                assert!(
+                    stats.fast_stores > before.fast_stores,
+                    "no store was inlined in the budget under test: {stats:?}"
+                );
+            }
+            assert!(
+                !sibling.holds(),
+                "a store under {engine:?} left a sibling's reservation                  standing, so its `STXR` would succeed against a word this                  core had already overwritten"
+            );
         }
     }
 

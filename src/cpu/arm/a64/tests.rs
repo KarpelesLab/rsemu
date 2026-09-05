@@ -652,6 +652,191 @@ fn an_intervening_store_breaks_the_reservation() {
     assert_eq!(h.cpu.x(2), 1);
 }
 
+/// A `STXR` at an address the `LDXR` never reserved must fail, even though the
+/// global monitor is perfectly happy.
+///
+/// DDI 0487 B2.9 gives a PE two monitors and requires a store-exclusive to
+/// pass **both**. The global one only ever says "nobody has written since";
+/// which granule was claimed is the local one's job, and a `STXR` that
+/// consulted only the global monitor would store anywhere the core had once
+/// taken a reservation.
+#[test]
+fn a_store_exclusive_elsewhere_fails_even_with_the_global_monitor_intact() {
+    let h = Harness::a53(&[
+        movz(1, 0, 0x8000, 0),
+        movz(1, 3, 0x9000, 0),
+        ldxr_x(1, 0),    // reserve the granule at 0x8000
+        stxr_x(2, 1, 3), // store to 0x9000 — a different granule
+    ]);
+    h.steps(4);
+    assert_eq!(h.cpu.x(2), 1, "nothing reserved 0x9000");
+    assert_eq!(h.read64(0x9000), 0, "and nothing was written there");
+}
+
+/// The pair's granule covers **both** halves, which is why it is sixteen bytes
+/// and not eight.
+///
+/// `LDXP`/`STXP` of two doublewords is one 16-byte access aligned to its total
+/// size, so an observer's store to the *upper* half is a store to the
+/// reservation granule. An eight-byte granule would watch only the first
+/// doubleword and let the second be overwritten under the pair.
+#[test]
+fn a_store_to_the_upper_half_of_a_pair_breaks_its_reservation() {
+    let h = Harness::a53(&[movz(1, 0, 0x8000, 0), ldxp_x(1, 2, 0), stxp_x(3, 1, 2, 0)]);
+    h.steps(2); // the pair is reserved
+    let space = h.cpu.space().expect("attached");
+    space
+        .write(
+            0x8008,
+            crate::core::value::Width::U64,
+            0x5555,
+            crate::core::space::MemAttrs::DEFAULT,
+        )
+        .expect("the write lands");
+    h.steps(2);
+    assert_eq!(
+        h.cpu.x(3),
+        1,
+        "the store-exclusive pair must fail: its second doubleword was written"
+    );
+    assert_eq!(h.read64(0x8008), 0x5555, "and that value stands");
+}
+
+/// `CLREX` and an exception give up **both** halves of the reservation.
+///
+/// DDI 0487 lets either monitor be cleared without the other, and the guest
+/// cannot tell the difference here: the local half already fails the `STXR`.
+/// What it costs is a slot left live in the space's table, which every store in
+/// the machine then walks past. The two halves are one piece of state and they
+/// are dropped together.
+#[test]
+fn clrex_and_an_exception_drop_the_global_half_too() {
+    /// `CLREX`, with the default `CRm` of `0b1111`.
+    const CLREX: u32 = 0xd503_3f5f;
+    /// `SVC #0`.
+    const SVC: u32 = 0xd400_0001;
+
+    for ender in [CLREX, SVC] {
+        let h = Harness::a53(&[movz(1, 0, 0x8000, 0), ldxr_x(1, 0), ender]);
+        let mut regs = h.cpu.sysregs();
+        regs.vbar_el1 = 0x4000;
+        h.cpu.set_sysregs(regs);
+        h.steps(2);
+        let space = h.cpu.space().expect("attached");
+        assert_eq!(
+            space.monitor().outstanding(),
+            1,
+            "the ldxr published its reservation"
+        );
+        h.steps(1);
+        assert_eq!(
+            space.monitor().outstanding(),
+            0,
+            "and {ender:#x} took it back"
+        );
+    }
+}
+
+/// The global monitor is keyed on the **physical** address, which is the only
+/// key two cores with different translation regimes can collide on.
+#[test]
+fn the_reservation_is_watched_by_physical_address() {
+    // `map_tables` puts virtual 0x20_0000 on physical `target` — two numbers
+    // that are nothing like each other — and identity-maps the program.
+    const TARGET: u64 = 0x3_0000;
+    let h = Harness::a53(&[
+        movz(1, 0, 0x20, 16), // x0 = 0x0020_0000
+        ldxr_x(1, 0),
+        stxr_x(2, 1, 0),
+    ]);
+    map_tables(&h, TARGET, desc::AF);
+    h.steps(2); // the ldxr takes the reservation
+
+    // Another observer writes the same *physical* granule, naming it the way
+    // it sees it. A monitor keyed on the virtual address would not notice.
+    let space = h.cpu.space().expect("attached");
+    space
+        .write(
+            TARGET,
+            crate::core::value::Width::U64,
+            7,
+            crate::core::space::MemAttrs::DEFAULT,
+        )
+        .expect("the write lands");
+    h.steps(1);
+    assert_eq!(
+        h.cpu.x(2),
+        1,
+        "the store-exclusive must fail: the physical granule was written"
+    );
+    assert_eq!(h.read64(TARGET), 7, "and the other observer's value stands");
+}
+
+/// Two cores, one address space, one granule — the *global* monitor, which is
+/// separate state from the local one and is the half a multiprocessor needs.
+///
+/// DDI 0487 B2.9: a store by another observer to the same reservation granule
+/// clears the global monitor, and a `STXR` passes only if both monitors agree.
+/// While each core kept its reservation privately, the sibling's store did
+/// nothing and this `STXR` returned 0 — overwriting an update the other core
+/// had already made. `machines/arm64-virt-smp` runs two processors and its
+/// kernel spinlocks are exactly this sequence.
+#[test]
+fn a_sibling_cores_store_breaks_this_cores_reservation() {
+    /// The contended granule, and where the sibling's program lives.
+    const WORD: u64 = 0x8000;
+    const SIBLING: u64 = 0x400;
+
+    let ram = Arc::new(RamStore::new(RAM));
+    let space = Arc::new(AddressSpace::new("mem", 64));
+    space
+        .topology()
+        .map(Region::ram("ram", Arc::clone(&ram)), 0)
+        .expect("the map fits");
+    let write = |at: u64, program: &[u32]| {
+        for (i, word) in program.iter().enumerate() {
+            for (k, byte) in word.to_le_bytes().iter().enumerate() {
+                ram.write_u8(at + 4 * i as u64 + k as u64, *byte)
+                    .expect("in range");
+            }
+        }
+    };
+    // Core 0 reserves, is preempted, and then tries to store.
+    write(
+        0,
+        &[movz(1, 0, WORD as u32, 0), ldxr_x(1, 0), stxr_x(2, 1, 0)],
+    );
+    // Core 1 writes the same granule with an ordinary store, and stops.
+    write(
+        SIBLING,
+        &[movz(1, 0, WORD as u32, 0), movz(1, 1, 7, 0), str_x(1, 0, 0)],
+    );
+
+    let a = Cpu::new(Config::cortex_a53());
+    let b = Cpu::new(Config::cortex_a53().with_reset_vector(SIBLING));
+    a.attach_space(Arc::clone(&space));
+    b.attach_space(Arc::clone(&space));
+
+    for _ in 0..2 {
+        a.step();
+    }
+    for _ in 0..3 {
+        b.step();
+    }
+    a.step();
+
+    assert_eq!(
+        a.x(2),
+        1,
+        "the store-exclusive must fail: core 1 stored into the granule"
+    );
+    let mut word = 0u64;
+    for i in 0..8 {
+        word |= u64::from(ram.read_u8(WORD + i).expect("in range")) << (8 * i);
+    }
+    assert_eq!(word, 7, "and core 1's value must still be there");
+}
+
 /// The lattice, executed: `CAS` is `FEAT_LSE`, so it runs on a Neoverse N1 and
 /// must raise `UNDEFINED` on a Cortex-A53.
 #[test]

@@ -197,6 +197,7 @@
 mod attrs;
 mod dispatch;
 mod flat;
+mod monitor;
 mod region;
 mod store;
 
@@ -206,6 +207,9 @@ mod tests;
 pub use attrs::{AccessConstraints, MemAttrs, MemOps, MemResult, Perms, RequesterId};
 pub use dispatch::{Dispatch, DispatchEntry, DispatchPolicy};
 pub use flat::{EntryKind, FlatEntry, FlatLeaf, FlatTarget, FlatView};
+pub use monitor::{
+    ExclusiveMonitor, MAX_GRANULE_SHIFT, MIN_GRANULE_SHIFT, MONITOR_SLOTS, MonitorId, MonitorSlot,
+};
 pub use region::{
     Alias, AliasId, CombinePolicy, Container, Mapping, MappingId, Region, RegionKind, RegionRef,
     RomWrite,
@@ -357,6 +361,14 @@ pub struct AddressSpace {
     combine: CombinePolicy,
     dispatch_policy: DispatchPolicy,
     topo: RwLock<Topology>,
+    /// The reservation table every core on this space shares.
+    ///
+    /// Inline rather than boxed: the store path reads its first word on every
+    /// store in the machine, and behind a `Box` that was a second dependent
+    /// load worth about a nanosecond a store. The two kilobytes of slot table
+    /// are boxed *inside* it instead, because a store with nothing outstanding
+    /// never reads them.
+    monitor: ExclusiveMonitor,
     // Outside the lock on purpose: a derived cache validating itself wants the
     // generation *without* acquiring anything, which is the whole point of
     // having a generation counter.
@@ -393,6 +405,7 @@ impl AddressSpace {
                     dirty: false,
                 },
             ),
+            monitor: ExclusiveMonitor::new(),
             generation: AtomicU64::new(1),
             unassigned_count: AtomicU64::new(0),
             unassigned_last: AtomicU64::new(0),
@@ -447,6 +460,20 @@ impl AddressSpace {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The **global exclusive monitor**: the reservation table every core on
+    /// this space shares.
+    ///
+    /// A space is one coherence domain, so it is the object that knows what a
+    /// sibling's store did to this core's `LR`/`LDXR`. Cores register a slot
+    /// through [`MonitorSlot::new`] when they are given the space; every store
+    /// that reaches this space consults it, which is where an ordinary store by
+    /// another observer breaks a reservation.
+    #[inline]
+    #[must_use]
+    pub fn monitor(&self) -> &ExclusiveMonitor {
+        &self.monitor
     }
 
     /// Address width in bits.
@@ -1069,6 +1096,24 @@ impl SpaceView<'_> {
             return Ok(());
         }
         addr.checked_add(total - 1).ok_or(BusError::BadAccess)?;
+        // Every store in the machine funnels through here, so this is where an
+        // ordinary store by any observer breaks a reservation covering the
+        // bytes it touches — AArch64's global monitor rule, RISC-V's write to
+        // the reservation set. One relaxed load with nothing outstanding; see
+        // `monitor` for the shape and the cost.
+        //
+        // Before the transfer rather than after: a store that then faults has
+        // still broken the reservation, which is a *spurious* clear and is
+        // exactly what both architectures permit. Clearing afterwards would
+        // mean threading the outcome of a split transfer back out of the loop
+        // to buy nothing.
+        //
+        // Not for a debug access. `MemAttrs::debug` promises no side effects,
+        // and a reservation a debugger silently dropped is one
+        // (`ROADMAP.md` §15, invariant 5).
+        if !attrs.debug {
+            self.space.monitor.note_store(addr, total);
+        }
         let mut done = 0u64;
         let mut committed = false;
         while done < total {

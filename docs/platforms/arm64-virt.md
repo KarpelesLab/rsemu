@@ -629,34 +629,48 @@ Nothing in `core::` changes, and nothing in `dev/arm/` changes except one word
 in the machine file: `secondary = "psci"`, whose parking loop is already there
 and already correct.
 
+## The exclusive monitor is global now, and this board is why
+
+**Was**: `arm64-virt-smp` ran two processors and the reservation each one kept
+was private to it. `cpu::arm::a64`'s `State::exclusive` — like `cpu::riscv`'s
+`reservation` — was per-core state, so a sibling's store did not break this
+core's reservation: an `stxr` the architecture *requires* to fail succeeded,
+and the sibling's update was lost. The board still booted, because a kernel's
+spinlocks are uncontended almost always and two cores rarely reach the same
+lock inside one scheduler quantum. That was luck about timing, not a property
+of the model.
+
+It was found from the other direction — `usermode`'s threaded guest puts two
+cores on one `UserMemory` and lost increments measurably: an AArch64
+`AtomicU32::fetch_add` loop (an `ldxr`/`stxr` pair, no `FEAT_LSE`) landed
+**32038 of 40000**, while the same program on RISC-V landed 40000 because LLVM
+emits a single `amoadd.d` there. Same source, same defect, different compiler
+output — neither architecture alone would have named it.
+
+**Is**: `core::space::ExclusiveMonitor` is DDI 0487 B2.9's *global* monitor,
+living on the `AddressSpace` because a space is one coherence domain. Each
+core claims a slot when it is given the space; `State::exclusive` stays as the
+*local* monitor and a `STXR` passes only if both agree. Every store that
+reaches `SpaceView::write_span` — a guest store, a DMA burst, a `LOCK`ed x86
+access on a heterogeneous board — breaks any reservation covering the bytes it
+touches, keyed on the **physical** address, because two cores contending for
+one lock reach it through their own translation regimes. The compiled fast path
+does not go through the space at all, so `Exec::note_fast_store` tells the
+monitor itself.
+
+The reservation granule is sixteen bytes: `IMPLEMENTATION DEFINED` between 8
+and 2048 in the architecture, and 16 is the smallest that holds a 64-bit
+`LDXP`/`STXP` pair, which is a single 16-byte access. Larger would be legal and
+would cost forward progress.
+
+So `arm64-virt-smp`'s green boot is now evidence about its atomics as well as
+about bring-up, banking and IPIs. What it is still not evidence about is
+*ordering*: this core executes one instruction at a time and completes every
+access before the next, so `DMB`, `DSB` and the acquire/release forms remain
+no-ops, and a guest that depends on a weak memory model being weak has nothing
+here to disagree with.
+
 ## Where it stops, and what is still in the way
-
-### The exclusive monitor is core-local, and two cores need it not to be
-
-**`arm64-virt-smp` runs two processors, and the reservation each one keeps is
-private to it.** `cpu::arm::a64`'s `State::exclusive` — like `cpu::riscv`'s
-`reservation` — is per-core state, so a sibling's store does not break this
-core's reservation. An `stxr` the architecture *requires* to fail succeeds, and
-the sibling's update is lost.
-
-`core::space::MemAttrs::exclusive` already carries the flag and its own
-documentation says the monitor "lives with the CPU, not here". Nothing reads
-the flag back; a **global monitor on the address space** is what would, and it
-does not exist. This was found from the other direction — `usermode`'s threaded
-guest puts two cores on one `UserMemory` and loses increments measurably: an
-AArch64 `AtomicU32::fetch_add` loop (an `ldxr`/`stxr` pair, no `FEAT_LSE`)
-lands **32038 of 40000**, while the same program on RISC-V lands 40000 because
-LLVM emits a single `amoadd.d` there. Same defect, different compiler output.
-`usermode::proof`'s
-`a_reservation_is_core_local_so_two_threads_lose_an_update` is a hermetic
-reproducer on both architectures, written to fail when the monitor lands.
-
-**Why this board still boots**: a kernel's spinlocks are uncontended almost
-always, and both cores rarely reach the same lock inside one scheduler
-quantum. That is luck about timing, not a property of the model — so treat
-`arm64-virt-smp`'s green boot as evidence that bring-up, banking and IPIs work,
-and not as evidence that its atomics do.
-
 
 It did not stop, so this section is a list of what the board *has not got*
 rather than of what defeated it. In rough order of what the next person will

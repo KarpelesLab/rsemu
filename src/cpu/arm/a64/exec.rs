@@ -27,7 +27,7 @@
 //! result. No emulator source of any licence was consulted (`ROADMAP.md` §1).
 
 use crate::core::exec::{Access as ExitAccess, Exit, ExitMask, ExitReason};
-use crate::core::space::{AddressSpace, MemAttrs};
+use crate::core::space::{AddressSpace, MemAttrs, MonitorSlot};
 use crate::core::value::Width;
 use crate::float::{Env, Flags, Round};
 
@@ -136,7 +136,19 @@ pub(super) struct State {
     pub pc: u64,
     /// `PSTATE` and the system registers.
     pub sys: SysRegs,
-    /// The address the exclusive monitor is watching, in 16-byte granules.
+    /// The **virtual** address the *local* exclusive monitor is watching, in
+    /// 16-byte granules.
+    ///
+    /// DDI 0487 B2.9 gives a PE two monitors, not one: this is the local one,
+    /// and the other is this core's slot in the space's
+    /// [`ExclusiveMonitor`](crate::core::space::ExclusiveMonitor), which
+    /// carries the same reservation keyed by its *physical* granule so that a
+    /// store by another observer can clear it. A `STXR` has to pass both.
+    ///
+    /// Virtual here and physical there on purpose: this field is what the
+    /// snapshot carries and what the `STXR` compares, neither of which
+    /// involves a translation. See the monitor's module docs for why the
+    /// shared half is deliberately not serialized.
     pub exclusive: Option<u64>,
     /// Bus accesses since reset.
     pub cycles: u64,
@@ -264,6 +276,13 @@ pub(super) struct Exec<'a> {
     pub(super) wrote: [u64; 4],
     /// How many of [`Exec::wrote`] are live.
     pub(super) wrote_n: u8,
+    /// This core's slot in the space's global exclusive monitor, if it has
+    /// one.
+    ///
+    /// `None` on a core whose space had no free slot — a ceiling only
+    /// `usermode` can reach — in which case the reservation is core-local
+    /// exactly as it was before the monitor existed.
+    monitor: Option<&'a MonitorSlot>,
 }
 
 impl<'a> Exec<'a> {
@@ -275,6 +294,7 @@ impl<'a> Exec<'a> {
         cfg: &'a Config,
         lines: &'a Lines,
         exits: ExitMask,
+        monitor: Option<&'a MonitorSlot>,
     ) -> Exec<'a> {
         let attrs = MemAttrs::DEFAULT.with_requester(cfg.requester);
         let this_pc = st.pc;
@@ -293,6 +313,7 @@ impl<'a> Exec<'a> {
             this_pc,
             wrote: [0; 4],
             wrote_n: 0,
+            monitor,
         }
     }
 
@@ -568,10 +589,10 @@ impl<'a> Exec<'a> {
         self.st.sys.el = El::El1;
         self.st.sys.spsel = true;
         self.st.sys.daif |= daif::ALL;
-        // Taking an exception clears the local exclusive monitor, so a
+        // Taking an exception clears the exclusive monitor, so a
         // load-exclusive interrupted before its store-exclusive fails rather
         // than succeeding against a context that has changed underneath it.
-        self.st.exclusive = None;
+        self.drop_reservation();
         self.next_pc = self
             .st
             .sys
@@ -849,6 +870,12 @@ impl<'a> Exec<'a> {
             debug_assert!(false, "an inlined store used an entry that holds no RAM");
             return;
         };
+        // The **global** monitor, which an inlined store would otherwise walk
+        // straight past: it is broken by `SpaceView::write_span` and this store
+        // never went through one. A sibling's reservation surviving a store
+        // because the store happened to be compiled is the same defect in a
+        // faster wrapper.
+        self.space.monitor().note_store(phys, bytes);
         self.note_write(phys);
     }
 
@@ -869,13 +896,25 @@ impl<'a> Exec<'a> {
 
     /// One read that does not cross a page boundary.
     fn read_once(&mut self, va: u64, width: Width, kind: Access) -> Result<u64, Trap> {
+        self.read_once_at(va, width, kind).map(|(value, _)| value)
+    }
+
+    /// [`Exec::read_once`], also reporting where the access landed.
+    ///
+    /// The load-exclusives are the only callers that need the physical
+    /// address: the global monitor is keyed on it, because two cores
+    /// contending for one lock reach it through their own translation regimes
+    /// and a virtual key would not collide. Surfaced from here rather than
+    /// translated a second time, which would charge a second walk on a TLB
+    /// miss.
+    fn read_once_at(&mut self, va: u64, width: Width, kind: Access) -> Result<(u64, u64), Trap> {
         let pa = self.translate(va, kind).map_err(|f| match kind {
             Access::Fetch => self.insn_abort(va, f),
             _ => self.data_abort(va, f, kind),
         })?;
         self.charge();
         match self.space.read(pa, width, self.attrs) {
-            Ok(v) => Ok(v),
+            Ok(v) => Ok((v, pa)),
             Err(_) => {
                 self.st.faults = self.st.faults.wrapping_add(1);
                 Err(match kind {
@@ -957,14 +996,50 @@ impl<'a> Exec<'a> {
         Ok(())
     }
 
-    /// A store into the reserved granule breaks the reservation, which is what
-    /// makes a load-exclusive/store-exclusive pair fail when something else
+    /// A store into the reserved granule breaks the **local** monitor, which
+    /// is what makes a load-exclusive/store-exclusive pair fail when this core
     /// wrote the location in between.
+    ///
+    /// The global half is broken by `SpaceView::write_span`, on the physical
+    /// address, for every observer including this one — so the two agree, and
+    /// a store through a *different* virtual address onto the same physical
+    /// granule is caught there even though it is invisible here.
     fn break_reservation(&mut self, va: u64) {
         if let Some(reserved) = self.st.exclusive
             && reserved == va >> 4
         {
             self.st.exclusive = None;
+        }
+    }
+
+    /// Reserve the granule containing virtual `va`, whose translation is `pa`.
+    ///
+    /// Both monitors at once: DDI 0487 B2.9's local one holds the virtual
+    /// granule a `STXR` compares, the global one the physical granule another
+    /// observer's store has to clear. Sixteen bytes, because the 64-bit
+    /// exclusive *pair* is one 16-byte access and has to fit inside a single
+    /// granule.
+    fn take_reservation(&mut self, va: u64, pa: u64) {
+        self.st.exclusive = Some(va >> 4);
+        if let Some(monitor) = self.monitor {
+            monitor.reserve(pa);
+        }
+    }
+
+    /// Whether the reservation on `va` still stands in **both** monitors.
+    ///
+    /// A core with no slot in the space's monitor — the `usermode` core-count
+    /// ceiling, and nothing else — falls back to the local half alone, which
+    /// is what every core did before the global monitor existed.
+    fn reservation_holds(&self, va: u64) -> bool {
+        self.st.exclusive == Some(va >> 4) && self.monitor.is_none_or(MonitorSlot::holds)
+    }
+
+    /// Give up the reservation, in both monitors.
+    fn drop_reservation(&mut self) {
+        self.st.exclusive = None;
+        if let Some(monitor) = self.monitor {
+            monitor.clear();
         }
     }
 
@@ -1260,7 +1335,7 @@ impl<'a> Exec<'a> {
                 if !self.st.sys.restore_pstate(spsr) {
                     return Err(Trap::undefined());
                 }
-                self.st.exclusive = None;
+                self.drop_reservation();
                 self.next_pc = elr;
             }
 
@@ -1321,7 +1396,11 @@ impl<'a> Exec<'a> {
             // Barriers on a core that executes one instruction at a time and
             // completes every access before the next: nothing to order.
             Op::Dsb | Op::Dmb | Op::Isb => {}
-            Op::Clrex => self.st.exclusive = None,
+            // `CLREX` clears the local monitor, and the architecture allows
+            // it to clear the global one too. Clearing both keeps the two
+            // halves from disagreeing, and a guest that executes `CLREX` is
+            // telling us it does not want the reservation.
+            Op::Clrex => self.drop_reservation(),
 
             // -- PSTATE and system registers -------------------------------
             Op::MsrSpsel => {
@@ -2125,21 +2204,30 @@ impl<'a> Exec<'a> {
         }
 
         if fmt == Fmt::LdStExclusive {
-            let value = self.load(addr, bytes)?;
-            self.st.exclusive = Some(addr >> 4);
+            // Aligned by `check_align` above, so the access never splits and
+            // the physical address of the whole of it is this one — which is
+            // what the global monitor is keyed on.
+            let elem = Width::from_bytes(bytes).ok_or_else(Trap::undefined)?;
+            let (value, pa) = self.read_once_at(addr, elem, Access::Load)?;
+            self.take_reservation(addr, pa);
             self.write_reg(t, width, false, value);
             return Ok(());
         }
 
         // `STXR Ws, Rt, [Rn]`: `Ws` reports 0 on success and 1 on failure.
+        //
+        // Both monitors have to agree. The local one says *which* granule was
+        // reserved; the global one says whether any observer — this core, a
+        // sibling, a DMA engine — has written it since. A `STXR` that ignored
+        // the second is the lost update `usermode::proof` reproduces.
         let status_reg = isa::rm(word);
-        let matched = self.st.exclusive == Some(addr >> 4);
+        let matched = self.reservation_holds(addr);
         if matched {
             let value = self.read_reg(t, 64, false);
             self.store(addr, bytes, value)?;
         }
         // The monitor is cleared by the attempt, successful or not.
-        self.st.exclusive = None;
+        self.drop_reservation();
         self.write_reg(status_reg, 32, false, u64::from(!matched));
         Ok(())
     }
@@ -2186,26 +2274,31 @@ impl<'a> Exec<'a> {
         self.check_align(addr, total, kind, true)?;
 
         if load {
-            let first = self.load(addr, elem)?;
-            let second = self.load(addr.wrapping_add(elem), elem)?;
+            // Aligned to the *whole* access by `check_align` above, so neither
+            // half splits and both lie in the one granule `pa` names.
+            let each = Width::from_bytes(elem).ok_or_else(Trap::undefined)?;
+            let (first, pa) = self.read_once_at(addr, each, Access::Load)?;
+            let second = self
+                .read_once_at(addr.wrapping_add(elem), each, Access::Load)?
+                .0;
             // The reservation is taken only once both halves arrived: a fault
             // on the second must leave the monitor exactly as it was, not
             // watching a granule the guest never successfully read.
-            self.st.exclusive = Some(addr >> 4);
+            self.take_reservation(addr, pa);
             self.write_reg(t, width, false, first);
             self.write_reg(t2, width, false, second);
             return Ok(());
         }
 
         let status_reg = isa::rm(word);
-        let matched = self.st.exclusive == Some(addr >> 4);
+        let matched = self.reservation_holds(addr);
         if matched {
             let first = self.read_reg(t, 64, false);
             let second = self.read_reg(t2, 64, false);
             self.store(addr, elem, first)?;
             self.store(addr.wrapping_add(elem), elem, second)?;
         }
-        self.st.exclusive = None;
+        self.drop_reservation();
         self.write_reg(status_reg, 32, false, u64::from(!matched));
         Ok(())
     }

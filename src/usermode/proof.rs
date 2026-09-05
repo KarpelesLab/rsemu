@@ -908,19 +908,6 @@ struct Arch {
     /// per-feature sweep is entitled to complain about, and did.
     #[cfg(feature = "std")]
     suffix: &'static str,
-    /// Whether `rustc` compiles an atomic read-modify-write for this target
-    /// into a **load-reserved/store-conditional pair** rather than into one
-    /// instruction.
-    ///
-    /// Less a property of the architecture than of the baseline this project
-    /// builds guests at: RV64GC has the `A` extension, so a `fetch_add` is a
-    /// single `amoadd.d` and cannot be preempted in the middle;
-    /// `aarch64-unknown-linux-musl`'s baseline is Armv8.0 without `FEAT_LSE`,
-    /// so it is an `ldxr`/`stxr` loop and can. It is recorded here because it
-    /// decides whether a threaded guest hits
-    /// [`a_reservation_is_core_local_so_two_threads_lose_an_update`].
-    #[cfg(feature = "std")]
-    rmw_is_a_pair: bool,
     /// The first thread of a process: a core over `mem`, at `entry`, with
     /// `sp`, in whatever state that architecture calls unprivileged.
     start: fn(mem: &Arc<UserMemory>, entry: u64, sp: u64) -> Arc<dyn Thread>,
@@ -1135,8 +1122,6 @@ mod riscv {
         uname: "riscv64",
         #[cfg(feature = "std")]
         suffix: "riscv64",
-        #[cfg(feature = "std")]
-        rmw_is_a_pair: false,
         start,
         asm: Asm {
             li,
@@ -1347,8 +1332,6 @@ mod a64 {
         uname: "aarch64",
         #[cfg(feature = "std")]
         suffix: "aarch64",
-        #[cfg(feature = "std")]
-        rmw_is_a_pair: true,
         start,
         asm: Asm {
             li,
@@ -4110,13 +4093,12 @@ fn a_timed_futex_wait_reports_a_timeout_by_jumping_virtual_time() {
 /// The reservation race, hand-assembled, with no toolchain and no guest
 /// program: two threads, one word, one preemption in the wrong place.
 ///
-/// This is the ledgered divergence
-/// [`a_reservation_is_core_local_so_two_threads_lose_an_update`] asserts, and
-/// it is built here rather than taken from the threaded guest because the
-/// guest only reaches it on one of the two architectures — `rustc` emits a
+/// What [`a_siblings_store_breaks_this_cores_reservation`] asserts, built here
+/// rather than taken from the threaded guest because the guest only reaches
+/// the sequence on one of the two architectures — `rustc` emits a
 /// single-instruction `amoadd.d` on RISC-V and an `ldxr`/`stxr` loop on an
-/// AArch64 part without `FEAT_LSE`. The defect is in neither compiler and in
-/// neither instruction set: it is that **the exclusive monitor is per core**,
+/// AArch64 part without `FEAT_LSE`. Neither compiler and neither instruction
+/// set was ever the point: it was that **the exclusive monitor was per core**,
 /// and level-3 threads are one core each over one map.
 fn reservation_race(arch: &'static Arch) -> (u64, u64, u64) {
     let asm = arch.asm;
@@ -4230,27 +4212,26 @@ fn reservation_race(arch: &'static Arch) -> (u64, u64, u64) {
 }
 
 #[test]
-fn a_reservation_is_core_local_so_two_threads_lose_an_update() {
-    // **A ledgered divergence, asserted rather than skipped.**
+fn a_siblings_store_breaks_this_cores_reservation() {
+    // **The ledger entry, shrunk.**
     //
-    // The exclusive monitor lives in the core's own execution state — RISC-V's
-    // `reservation` and AArch64's `State::exclusive` — and is broken only by a
-    // store *that core* makes. Level-3 threads are one core each over one
-    // `UserMemory`, so a sibling's store does not break this core's
-    // reservation, and a `sc`/`stxr` that the architecture requires to fail
-    // succeeds instead. The update the sibling made is lost.
+    // This test used to assert the defect. The exclusive monitor lived in the
+    // core's own execution state — RISC-V's `reservation`, AArch64's
+    // `State::exclusive` — and was broken only by a store *that core* made, so
+    // a `sc`/`stxr` the architecture requires to fail succeeded instead and the
+    // sibling's update was lost. Level-3 threads are one core each over one
+    // `UserMemory`, which is how it was found.
     //
-    // `core::space::MemAttrs` already carries an `exclusive` flag whose own
-    // documentation says *"the core carries the flag; the monitor that
-    // implements the reservation"* is elsewhere — and elsewhere does not exist
-    // yet, because until level-3 threading nothing in this tree had two cores
-    // sharing one map at instruction granularity. A **global monitor on the
-    // address space** is where the fix belongs, and it is in `src/cpu/` and
-    // `src/core/space/`, not here.
+    // `core::space::ExclusiveMonitor` is the fix: a reservation table on the
+    // address space, one slot per core, consulted by every store that reaches
+    // `SpaceView::write_span`. That is AArch64's *global* monitor (DDI 0487
+    // B2.9) and RISC-V's reservation set — the same object seen twice. The
+    // core's own field stays as the local monitor, and a store-conditional now
+    // needs both to agree.
     //
-    // This test fails the day that lands, and it is supposed to: the message
-    // says what to change it to. A known-failures ledger that only ever
-    // shrinks needs to notice when it can.
+    // So the assertions are inverted, on both architectures: the first
+    // thread's store-conditional must now *fail*, and the word must still hold
+    // what the second thread put there.
     for arch in ARCHES {
         let (word, a_status, b_status) = reservation_race(arch);
         assert_eq!(
@@ -4258,18 +4239,17 @@ fn a_reservation_is_core_local_so_two_threads_lose_an_update() {
             "{}: the second thread's own pair should store",
             arch.name
         );
-        assert_eq!(
+        assert_ne!(
             a_status, 0,
-            "{}: the first thread's store-conditional failed — a global \
-             exclusive monitor has landed. Change this test to assert that \
-             `a_status != 0` and that the word is still {:#x}, and take the \
-             AArch64 line out of the threaded guest's ledger.",
-            arch.name, 0xbbbbu64
+            "{}: the first thread's store-conditional succeeded even though a \
+             sibling wrote the reservation set in between — the global \
+             exclusive monitor is not being consulted",
+            arch.name
         );
         assert_eq!(
-            word, 0xaaaa,
-            "{}: the first thread's store-conditional succeeded, so it \
-             overwrote a value written after its reservation was taken",
+            word, 0xbbbb,
+            "{}: the second thread's update survived, because the first \
+             thread's conditional store did not happen",
             arch.name
         );
     }
@@ -4564,36 +4544,22 @@ fn a_real_threaded_binary_spawns_joins_and_agrees_on_the_answer() {
             .strip_prefix("counter = ")
             .and_then(|n| n.parse().ok())
             .unwrap_or_else(|| panic!("{}: {:?}", arch.name, lines[1]));
-        if arch.rmw_is_a_pair {
-            // **Ledgered.** On this target `fetch_add` is an `ldxr`/`stxr`
-            // loop, and the exclusive monitor is core-local, so a preemption
-            // between the two lets a sibling's increment be overwritten.
-            // `a_reservation_is_core_local_so_two_threads_lose_an_update`
-            // above is the minimal, hermetic statement of the same defect and
-            // is the ledger entry that will notice when it is fixed; this one
-            // only refuses to pretend the number is right.
-            assert!(
-                counter > 0 && counter <= TOTAL,
-                "{}: counter {counter} is not even a possible answer",
-                arch.name
-            );
-            if counter < TOTAL {
-                std::eprintln!(
-                    "usermode/threads on {}: {} of {TOTAL} increments landed — \
-                     the exclusive monitor is per core (see \
-                     a_reservation_is_core_local_so_two_threads_lose_an_update)",
-                    arch.name,
-                    counter
-                );
-            }
-        } else {
-            assert_eq!(
-                counter, TOTAL,
-                "{}: a single-instruction atomic cannot be preempted, so \
-                 every increment must have landed",
-                arch.name
-            );
-        }
+        // **No ledger line here any more, on either architecture.** This used
+        // to accept any count on a target whose `fetch_add` is an `ldxr`/`stxr`
+        // loop — `aarch64-unknown-linux-musl`'s baseline is Armv8.0 without
+        // `FEAT_LSE`, so it is — because the exclusive monitor was core-local
+        // and a preemption between the two let a sibling's increment be
+        // overwritten. It landed 32038 of 40000. With
+        // `core::space::ExclusiveMonitor` the sibling's store breaks the
+        // reservation, the `stxr` fails, and the loop retries: one arithmetic
+        // answer, whatever the compiler emitted for it.
+        assert_eq!(
+            counter, TOTAL,
+            "{}: every increment must land — whether `fetch_add` is one \
+             instruction or an `ldxr`/`stxr` loop is the compiler's business, \
+             not the answer's",
+            arch.name
+        );
     });
 }
 

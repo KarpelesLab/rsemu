@@ -119,7 +119,7 @@ use crate::core::exec::{Exit, ExitMask, ExitingCore, Run};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
 use crate::core::sched::{Budget, Consumed, ExitFlag, TickCursor};
-use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
+use crate::core::space::{AddressSpace, MemAttrs, MonitorSlot, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{self, AtomicU32, AtomicU64, LockRank, Ordering};
 use crate::core::value::Width;
@@ -132,6 +132,17 @@ use mmu::Tlb;
 
 /// A mask of the bits below a page boundary.
 pub(crate) const PAGE_MASK: u64 = mmu::PAGE_SIZE - 1;
+
+/// The reservation granule, as a shift: eight bytes.
+///
+/// Volume I, "Load-Reserved/Store-Conditional Instructions": the reservation
+/// set must contain at least the naturally aligned `XLEN`-bit word the `LR`
+/// read, and an implementation may make it larger. Larger is where the
+/// *eventuality* guarantee goes to die — a set the size of a cache line lets
+/// unrelated traffic on the same line fail a constrained LR/SC sequence
+/// forever — so this model reserves exactly the word, which is also what
+/// `Exec::store`'s own `>> 3` has always compared.
+const RESERVATION_SHIFT: u32 = 3;
 
 /// The ABI names of the integer registers, in numeric order.
 ///
@@ -366,6 +377,15 @@ struct Session {
     /// (`ROADMAP.md` §4.5).
     tlb: Tlb,
     space: Option<Arc<AddressSpace>>,
+    /// This hart's registration in `space`'s global exclusive monitor.
+    ///
+    /// Derived state, like the TLB beside it: the architectural reservation is
+    /// `State::reservation`, and this is the shared broadcast of it that lets a
+    /// sibling hart's store break it. Held here rather than in `state` because
+    /// it belongs to the *space*, and because a reset replaces `state` while
+    /// leaving the hart plugged into the same memory. `None` if the space had
+    /// no free slot, which leaves the reservation core-local.
+    monitor: Option<MonitorSlot>,
     /// The platform timer, when a machine has one. Wiring rather than guest
     /// state, so it lives here beside `space` instead of in `state`: `reset`
     /// replaces `state`, and a reset must not unplug the clock.
@@ -461,6 +481,7 @@ impl Hart {
                     state: State::new(&cfg),
                     tlb: Tlb::new(),
                     space: None,
+                    monitor: None,
                     time_src: None,
                     #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
                     jit: None,
@@ -619,6 +640,10 @@ impl Hart {
     /// Give the hart the address space it executes from.
     pub fn attach_space(&self, space: Arc<AddressSpace>) {
         let mut session = self.session.lock();
+        // The old registration goes back to the old space as this is replaced;
+        // a reservation held over a change of address space is meaningless
+        // anyway.
+        session.monitor = MonitorSlot::new(Arc::clone(&space), RESERVATION_SHIFT);
         session.space = Some(space);
         // Everything derived from the old space is now about the wrong one:
         // the hart's translations, the shadow that carries host addresses out
@@ -842,6 +867,7 @@ impl Hart {
             state,
             tlb,
             space,
+            monitor,
             time_src,
             ..
         } = &mut *session;
@@ -853,7 +879,15 @@ impl Hart {
         let Some(space) = space.clone() else {
             return (0, None);
         };
-        let mut exec = Exec::new(state, tlb, &space, &cfg, &self.lines, exits);
+        let mut exec = Exec::new(
+            state,
+            tlb,
+            &space,
+            &cfg,
+            &self.lines,
+            exits,
+            monitor.as_ref(),
+        );
         let used = exec.step();
         (used, exec.take_exit())
     }
@@ -899,6 +933,7 @@ impl Hart {
                 state,
                 tlb,
                 space,
+                monitor,
                 time_src,
                 jit,
             } = &mut *session;
@@ -909,7 +944,17 @@ impl Hart {
                 return (0, None);
             };
             let jit = jit.as_mut().expect("just installed");
-            return engine::advance(jit, state, tlb, &space, &cfg, &self.lines, exits, remaining);
+            return engine::advance(
+                jit,
+                state,
+                tlb,
+                &space,
+                &cfg,
+                &self.lines,
+                exits,
+                monitor.as_ref(),
+                remaining,
+            );
         }
         let _ = remaining;
         self.step_to_exit()

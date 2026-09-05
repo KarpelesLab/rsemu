@@ -29,7 +29,7 @@
 //! double-precision registers.
 
 use crate::core::exec::{Access as ExitAccess, Exit, ExitMask, ExitReason};
-use crate::core::space::{AddressSpace, MemAttrs};
+use crate::core::space::{AddressSpace, MemAttrs, MonitorSlot};
 use crate::core::value::Width;
 
 use super::csr::{self, Csrs, Lines, Priv, cause, irq, status};
@@ -84,7 +84,18 @@ pub(super) struct State {
     pub pc: u64,
     /// Every CSR, and the current privilege mode.
     pub csrs: Csrs,
-    /// The address `LR` reserved, if any.
+    /// The **virtual** address `LR` reserved, if any — the *local* half of
+    /// the reservation.
+    ///
+    /// The other half is this hart's slot in the space's
+    /// [`ExclusiveMonitor`](crate::core::space::ExclusiveMonitor), which
+    /// carries the same reservation keyed by its *physical* address so that a
+    /// sibling hart's store can break it. An `SC` needs both to agree.
+    ///
+    /// Virtual here and physical there on purpose: this field is what the
+    /// snapshot carries, and it is the address the `SC` compares, neither of
+    /// which involves a translation. See the monitor's module docs for why the
+    /// shared half is deliberately not serialized.
     pub reservation: Option<u64>,
     /// Bus accesses since reset.
     pub cycles: u64,
@@ -147,6 +158,13 @@ pub(super) struct Exec<'a> {
     pub(super) wrote: [u64; 2],
     /// How many of [`Exec::wrote`] are live.
     pub(super) wrote_n: u8,
+    /// This hart's slot in the space's global exclusive monitor, if it has
+    /// one.
+    ///
+    /// `None` on a hart whose space had no free slot — a ceiling only
+    /// `usermode` can reach — in which case the reservation is core-local
+    /// exactly as it was before the monitor existed.
+    monitor: Option<&'a MonitorSlot>,
     /// Set when this instruction wrote `minstret` itself.
     ///
     /// Volume II: a write to `minstret` takes precedence over the increment
@@ -216,6 +234,7 @@ impl<'a> Exec<'a> {
         cfg: &'a Config,
         lines: &'a Lines,
         exits: ExitMask,
+        monitor: Option<&'a MonitorSlot>,
     ) -> Exec<'a> {
         let attrs = MemAttrs::DEFAULT.with_requester(cfg.requester);
         let this_pc = st.pc;
@@ -228,6 +247,7 @@ impl<'a> Exec<'a> {
             exits,
             exit: None,
             attrs,
+            monitor,
             used: 0,
             next_pc: this_pc,
             this_pc,
@@ -655,15 +675,33 @@ impl<'a> Exec<'a> {
             debug_assert!(false, "an inlined store used an entry that holds no RAM");
             return;
         };
+        // The **global** monitor, which an inlined store would otherwise walk
+        // straight past: it is broken by `SpaceView::write_span` and this store
+        // never went through one. A sibling's reservation surviving a store
+        // because the store happened to be compiled is the same defect in a
+        // faster wrapper, and 99.8% of this core's stores are compiled.
+        self.space.monitor().note_store(phys, bytes);
         self.note_write(phys);
     }
 
     /// One read that does not cross a page boundary.
     fn read_once(&mut self, vaddr: u64, width: Width, kind: Access) -> Result<u64, Trap> {
+        self.read_once_at(vaddr, width, kind)
+            .map(|(value, _)| value)
+    }
+
+    /// [`Exec::read_once`], also reporting where the access landed.
+    ///
+    /// `LR` is the only caller that needs the physical address: the global
+    /// monitor is keyed on it, because two harts contending for one lock reach
+    /// it through their own page tables and a virtual key would not collide.
+    /// Surfaced from here rather than translated a second time, which would
+    /// charge a second walk on a TLB miss.
+    fn read_once_at(&mut self, vaddr: u64, width: Width, kind: Access) -> Result<(u64, u64), Trap> {
         let phys = self.translate(vaddr, kind, width.bytes())?;
         self.charge();
         match self.space.read(phys, width, self.attrs) {
-            Ok(v) => Ok(v),
+            Ok(v) => Ok((v, phys)),
             Err(_) => {
                 // A refused access is a bus fault, which RISC-V *does* have a
                 // way to report — unlike the 6502, where it can only be open
@@ -694,6 +732,37 @@ impl<'a> Exec<'a> {
                     tval: vaddr,
                 })
             }
+        }
+    }
+
+    /// Reserve the word at virtual `vaddr`, whose translation is `phys`.
+    ///
+    /// Both monitors at once: the local one holds the virtual address an `SC`
+    /// compares, the global one the physical granule a sibling's store has to
+    /// break. Volume I's reservation set must contain at least the naturally
+    /// aligned `XLEN`-bit word the `LR` read, which is the eight bytes
+    /// `MIN_GRANULE_SHIFT` names.
+    fn take_reservation(&mut self, vaddr: u64, phys: u64) {
+        self.st.reservation = Some(vaddr);
+        if let Some(monitor) = self.monitor {
+            monitor.reserve(phys);
+        }
+    }
+
+    /// Whether the reservation on `vaddr` still stands in **both** monitors.
+    ///
+    /// A hart with no slot in the space's monitor — the `usermode` core-count
+    /// ceiling, and nothing else — falls back to the local half alone, which
+    /// is what every hart did before the global monitor existed.
+    fn reservation_holds(&self, vaddr: u64) -> bool {
+        self.st.reservation == Some(vaddr) && self.monitor.is_none_or(MonitorSlot::holds)
+    }
+
+    /// Give up the reservation, in both monitors.
+    fn drop_reservation(&mut self) {
+        self.st.reservation = None;
+        if let Some(monitor) = self.monitor {
+            monitor.clear();
         }
     }
 
@@ -902,7 +971,7 @@ impl<'a> Exec<'a> {
 
         // A trap always breaks any outstanding reservation: the hart is about
         // to run code that has no idea one was held.
-        self.st.reservation = None;
+        self.drop_reservation();
         // Vectored mode sends *interrupts* to base + 4 * cause; exceptions
         // always go to the base, even in vectored mode.
         let base = tvec & !3;
@@ -1253,8 +1322,8 @@ impl<'a> Exec<'a> {
                     });
                 }
                 let width = Width::from_bytes(bytes).expect("4 or 8");
-                let v = self.read_once(a, width, Access::Load)?;
-                self.st.reservation = Some(a);
+                let (v, phys) = self.read_once_at(a, width, Access::Load)?;
+                self.take_reservation(a, phys);
                 self.set_x(rd, sign_extend(v, bytes * 8));
             }
             Op::ScW | Op::ScD => {
@@ -1266,11 +1335,16 @@ impl<'a> Exec<'a> {
                         tval: a,
                     });
                 }
-                let held = self.st.reservation == Some(a);
+                // Both halves have to agree. The local one says *which*
+                // address was reserved; the global one says whether anything —
+                // this hart, a sibling, a DMA engine — has written the
+                // reservation set since. An `SC` that ignored the second is
+                // the lost update `usermode::proof` reproduces.
+                let held = self.reservation_holds(a);
                 // The reservation is given up whether the store succeeds or
                 // not: Volume I requires an SC to end the reservation, which
                 // is what stops a livelock of retries.
-                self.st.reservation = None;
+                self.drop_reservation();
                 if held {
                     let width = Width::from_bytes(bytes).expect("4 or 8");
                     self.write_once(a, width, b)?;

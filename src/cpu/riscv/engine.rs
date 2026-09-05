@@ -219,7 +219,7 @@ use alloc::vec;
 
 use crate::core::error::{BusError, Result};
 use crate::core::exec::{Exit, ExitMask};
-use crate::core::space::{AddressSpace, MemAttrs, MemResult};
+use crate::core::space::{AddressSpace, MemAttrs, MemResult, MonitorSlot};
 use crate::core::value::Width;
 use crate::ir::{Block, InsnStart, IrHost, MemOp, Opcode, RegSlot, verify};
 use crate::jit::{
@@ -676,10 +676,11 @@ pub(super) fn advance(
     cfg: &Config,
     lines: &Lines,
     exits: ExitMask,
+    monitor: Option<&MonitorSlot>,
     remaining: u64,
 ) -> (u64, Option<Exit>) {
     let Jit { disp, costs } = jit;
-    let mut exec = Exec::new(state, tlb, space, cfg, lines, exits);
+    let mut exec = Exec::new(state, tlb, space, cfg, lines, exits, monitor);
     let pc = exec.st.pc;
 
     // The entry work for the *first* block, done here rather than through
@@ -1141,7 +1142,7 @@ impl FastMem for Host<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::space::{Mapping, RamStore, Region};
+    use crate::core::space::{Mapping, MonitorSlot, RamStore, Region};
     use crate::cpu::riscv::{Engine, Hart};
 
     /// How much RAM a test hart gets, at address zero.
@@ -1569,7 +1570,7 @@ mod tests {
                 lines,
                 jit,
             } = self;
-            let mut exec = Exec::new(state, tlb, space, cfg, lines, ExitMask::NONE);
+            let mut exec = Exec::new(state, tlb, space, cfg, lines, ExitMask::NONE, None);
             let pc = exec.st.pc;
             admit(cfg, &jit.costs, &mut exec, pc, remaining)
         }
@@ -1584,7 +1585,18 @@ mod tests {
                 lines,
                 jit,
             } = self;
-            advance(jit, state, tlb, space, cfg, lines, ExitMask::NONE, budget).0
+            advance(
+                jit,
+                state,
+                tlb,
+                space,
+                cfg,
+                lines,
+                ExitMask::NONE,
+                None,
+                budget,
+            )
+            .0
         }
 
         /// One interpreted instruction, reporting what it consumed.
@@ -1597,7 +1609,7 @@ mod tests {
                 lines,
                 ..
             } = self;
-            Exec::new(state, tlb, space, cfg, lines, ExitMask::NONE).step()
+            Exec::new(state, tlb, space, cfg, lines, ExitMask::NONE, None).step()
         }
     }
 
@@ -2471,6 +2483,95 @@ mod tests {
         b.state.x[7] = 0x1000;
         b.state.pc = 4;
         b
+    }
+
+    /// `note_fast_store` in isolation, under **translation**: the global
+    /// monitor is keyed on the physical address, and an inlined store is the
+    /// one place in this core that has to translate the pair itself.
+    ///
+    /// Driven directly rather than through a run, because a run cannot be made
+    /// to prove it: with the MMU off a virtual address and a physical one are
+    /// the same number, and a paged run interleaves interpreted stores that
+    /// reach the monitor through `SpaceView::write_span` anyway. One call, one
+    /// page table, no ambiguity.
+    #[test]
+    fn note_fast_store_reports_the_physical_address() {
+        use super::super::mmu::pte;
+        // `Bench::paged` maps virtual page 0 onto physical 0x4000, but its leaf
+        // is read-execute; a store needs write and dirty.
+        let mut b = Bench::paged(&[]);
+        b.poke(
+            0x3000,
+            ((0x4000 >> 12) << 10) | pte::V | pte::R | pte::W | pte::X | pte::A | pte::D,
+        );
+        let sibling = MonitorSlot::new(Arc::clone(&b.space), 3).expect("a free slot");
+        b.tlb.attach_shadow(Arc::clone(&b.space));
+
+        let Bench {
+            space,
+            cfg,
+            state,
+            tlb,
+            lines,
+            ..
+        } = &mut b;
+        let mut exec = Exec::new(state, tlb, space, cfg, lines, ExitMask::NONE, None);
+        // One ordinary store first, so the software TLB and the shadow beside
+        // it hold an entry for the page: an inlined store is only ever issued
+        // against an entry generated code has already resolved.
+        exec.store(0x40, 8, 0).expect("the page is writable RAM");
+
+        // Virtual 0x40 is physical 0x4040, and those are the two numbers a
+        // virtual key would confuse.
+        sibling.reserve(0x4040);
+        assert!(sibling.holds(), "the reservation was taken");
+        exec.note_fast_store(0x40, 8);
+        assert!(
+            !sibling.holds(),
+            "an inlined store named its virtual address to the global monitor, \
+             which is keyed on the physical one"
+        );
+    }
+
+    #[test]
+    fn an_inlined_store_breaks_a_siblings_reservation_too() {
+        // The other half, and the one SMP needs.
+        // [`an_inlined_store_breaks_a_reservation_it_lands_in`] proves a
+        // compiled store breaks the *storing* hart's own reservation; this one
+        // proves it reaches the **global** monitor, where a sibling hart's
+        // reservation lives. An inlined store never calls
+        // `SpaceView::write_span`, so `Exec::note_fast_store` has to tell the
+        // monitor itself — and 99.8% of this core's stores are inlined.
+        //
+        // The sibling is a bare `MonitorSlot` rather than a second hart because
+        // what is under test is the hook, not the interleaving: a registration
+        // on the same space is exactly what a second hart would hold.
+        let mut jit = bare_store().with_host_code();
+        // Warm the loop first, so the stores in the budget under test come out
+        // of generated code rather than out of the interpreter.
+        for _ in 0..8 {
+            jit.advance(10_000);
+        }
+        let before = jit.fast_stores();
+
+        let sibling =
+            MonitorSlot::new(Arc::clone(&jit.space), 3).expect("the space has a free slot");
+        // `BARE_STORE` stores to `x7` = 0x800, and with no translation active
+        // that is also the physical address.
+        sibling.reserve(0x800);
+        assert!(sibling.holds(), "the reservation was taken");
+        jit.advance(10_000);
+
+        #[cfg(all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"))]
+        assert!(
+            jit.fast_stores() > before,
+            "no store was inlined in the budget under test"
+        );
+        let _ = before;
+        assert!(
+            !sibling.holds(),
+            "a compiled store left a sibling's reservation standing, so its              `sc.d` would succeed against a word this hart had already              overwritten"
+        );
     }
 
     #[test]
