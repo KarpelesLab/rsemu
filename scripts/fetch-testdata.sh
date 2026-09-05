@@ -870,6 +870,116 @@ ovmf_hint() {
 	note "              --test q35_uefi -- --nocapture"
 }
 
+# The disk `q35-uefi` boots from: a FAT volume with an EFI application at the
+# one path a UEFI boot manager looks for without being told.
+#
+# **Built here, not downloaded and not committed.** The volume is `mformat`'s
+# and the application is the local edk2/ovmf package's `Shell.efi`
+# (BSD-2-Clause-Patent), the same source `fetch_ovmf` takes the firmware from.
+#
+# Why no partition table: the UEFI Specification's boot manager looks for
+# `\EFI\BOOT\BOOTX64.EFI` on *every* handle with a file system on it (UEFI 2.10
+# §3.5.1.1), and EDK II's FAT driver binds the whole-disk `BlockIo` as readily
+# as a partition's. A GPT would be more like a real disk and would need `sgdisk`
+# or `parted` on the path; a bare FAT volume needs `mtools` and nothing else,
+# and it is the shorter route to the same question. `fstool` builds either from
+# a TOML spec (`examples/efi-disk.toml`) once its CLI is installable here.
+#
+# Deterministic on purpose: a fixed volume serial (`-N`), because a fixture
+# whose bytes change every time it is built cannot be the input to a state hash.
+# `mcopy` still stamps each file with its source's timestamp, which is the one
+# thing left that is not.
+fetch_esp() {
+	local dest="${DEST_ROOT}/x86"
+	local dir app=""
+	mkdir -p "$dest"
+
+	for dir in mformat mmd mcopy; do
+		command -v "$dir" >/dev/null 2>&1 || {
+			note "  mtools is not on PATH (Debian/Ubuntu: mtools; Fedora: mtools;"
+			note "  Gentoo: sys-fs/mtools), and the FAT volume is built with it."
+			return 0
+		}
+	done
+
+	for dir in ${RSEMU_ESP_APP:-} /usr/share/edk2-ovmf/Shell.efi \
+		/usr/share/edk2/OvmfX64/Shell.efi /usr/share/OVMF/Shell.efi \
+		/usr/share/qemu/Shell.efi; do
+		[ -n "$dir" ] || continue
+		if [ -r "$dir" ]; then
+			app="$dir"
+			break
+		fi
+	done
+
+	if [ -z "$app" ]; then
+		note "  no Shell.efi under any of the usual places; set RSEMU_ESP_APP to"
+		note "  any EFI application to put one at \\EFI\\BOOT\\BOOTX64.EFI."
+		return 0
+	fi
+
+	local img="${dest}/esp.img"
+	rm -f "$img"
+	# 64 MiB: enough for a kernel and an initramfs beside the application, and
+	# small enough that the namespace it becomes is a rounding error in host
+	# memory. The whole image is the namespace -- `nvme.controller` takes the
+	# bytes of its media slot as the namespace's contents.
+	dd if=/dev/zero of="$img" bs=1M count=64 status=none
+	mformat -i "$img" -F -N 52534d55 -v RSEMUESP ::
+	mmd -i "$img" ::/EFI ::/EFI/BOOT
+	mcopy -i "$img" "$app" ::/EFI/BOOT/BOOTX64.EFI
+
+	# A shell script the firmware's own shell runs on its way up, which is the
+	# cheapest possible proof that a *file* was read off the disk rather than
+	# merely that the disk was enumerated: `startup.nsh` is looked for on each
+	# mapped file system in turn (UEFI Shell Specification 2.2 §3.1).
+	local nsh="${dest}/startup.nsh"
+	printf 'echo rsemu: startup.nsh ran off %%hostname%%FS0\r\nmap -b\r\n' >"$nsh"
+	mcopy -i "$img" "$nsh" ::/startup.nsh
+	rm -f "$nsh"
+
+	# And, if the run supplies them, a kernel and an initramfs beside it. A
+	# modern `bzImage` *is* a PE/COFF EFI application (the EFI stub), so the
+	# shell can launch one with a command line of its own -- which is how a
+	# kernel gets `console=ttyS0` on a board whose only console is a 16550.
+	if [ -n "${RSEMU_ESP_KERNEL:-}" ] && [ -r "${RSEMU_ESP_KERNEL}" ]; then
+		mcopy -i "$img" "${RSEMU_ESP_KERNEL}" ::/vmlinuz.efi
+		ok "vmlinuz.efi ($(wc -c <"${RSEMU_ESP_KERNEL}" | tr -d ' ') bytes)"
+	fi
+	if [ -n "${RSEMU_ESP_INITRD:-}" ] && [ -r "${RSEMU_ESP_INITRD}" ]; then
+		mcopy -i "$img" "${RSEMU_ESP_INITRD}" ::/initrd.img
+		ok "initrd.img ($(wc -c <"${RSEMU_ESP_INITRD}" | tr -d ' ') bytes)"
+	fi
+
+	ok "esp.img ($(wc -c <"$img" | tr -d ' ') bytes, \\EFI\\BOOT\\BOOTX64.EFI from ${app})"
+	esp_notice "$dest" "$app"
+	esp_hint "$dest"
+}
+
+esp_notice() {
+	printf '%s\n' "An EFI System Partition for q35-uefi, built by
+scripts/fetch-testdata.sh esp.
+
+The volume is mformat's. The application at \\EFI\\BOOT\\BOOTX64.EFI is
+${2} -- the EDK II UEFI Shell, BSD-2-Clause-Patent, copied from a local
+firmware package rather than downloaded. Nothing here is committed.
+
+Consumed by RSEMU_OVMF_DISK in tests/q35_uefi.rs.
+docs/platforms/q35-uefi.md has the whole command line and says where it gets
+to." >"${1}/PROVENANCE-esp.txt"
+}
+
+esp_hint() {
+	local dest="$1"
+	note ""
+	note "  boot it with:"
+	note "      RSEMU_OVMF_CODE=${dest}/OVMF_CODE.fd \\"
+	note "      RSEMU_OVMF_VARS=${dest}/OVMF_VARS.fd \\"
+	note "      RSEMU_OVMF_DISK=${dest}/esp.img \\"
+	note "          cargo test --release --features machine-q35-uefi \\"
+	note "              --test q35_uefi -- --nocapture"
+}
+
 fetch_linux() {
 	need curl
 	local dest="${DEST_ROOT}/riscv"
@@ -2333,6 +2443,11 @@ Suites:
   ovmf           UEFI for q35-uefi: a split OVMF _CODE.fd / _VARS.fd pair,
                  copied from the local edk2/ovmf package the same way
                  (BSD-2-Clause-Patent; nothing to download)
+  esp            the disk q35-uefi boots from: a FAT volume with an EFI
+                 application at \EFI\BOOT\BOOTX64.EFI, built here with mtools
+                 around the local package's Shell.efi (BSD-2-Clause-Patent).
+                 RSEMU_ESP_APP replaces the application; RSEMU_ESP_KERNEL and
+                 RSEMU_ESP_INITRD put a bzImage and an initramfs beside it.
   linux          riscv64 Linux Image to boot on it (GPL-2.0, FETCH-ONLY)
   initramfs      a busybox root filesystem for that kernel, built here around
                  Debian's riscv64 busybox-static (GPL-2.0, FETCH-ONLY)
@@ -2442,6 +2557,7 @@ for suite in "${SUITES[@]}"; do
 		riscv-arch-test|arch-test|act) fetch_arch_test ;;
 		edk2|uefi) fetch_edk2 ;;
 		ovmf|x86-uefi) fetch_ovmf ;;
+		esp|efi-disk) fetch_esp ;;
 		linux|kernel) fetch_linux ;;
 		arm64-linux|arm64) fetch_arm64_linux ;;
 		arm64-initramfs) fetch_arm64_initramfs ;;

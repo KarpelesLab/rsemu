@@ -35,7 +35,11 @@ absence is load bearing rather than tidying:
   and none of them is this board's, so a display adapter here would be a card
   nothing drives. The console is the 16550 at `0x3f8`, which is what
   `PlatformBootManagerLib` puts a terminal on.
-* **No IDE, no 8237As.** A UEFI build reaches its disks through PCI.
+* **No IDE, no 8237As.** A UEFI build reaches its disks through PCI — and the
+  one thing this board *adds* to `q35` besides the flash is where it reaches
+  them: an NVM Express controller at `00:04.0`. What that got to is
+  ["The disk"](#the-disk-and-the-one-thing-between-this-board-and-an-operating-system)
+  below.
 * **A20 is deliberately unwired**, the same decision
   [`q35-linux`](q35-linux.md) documents. A net with a driver comes up low and a
   low `a20` pin shuts the gate; a UEFI reset vector goes from real mode to long
@@ -142,7 +146,17 @@ Every byte of that came out of the 16550 at `0x3f8` — the board's only console
 and the one `PlatformBootManagerLib` puts a terminal on. `ver` is typed by
 `RSEMU_OVMF_INPUT`, echoed by the shell's line editor and then executed, so the
 path is round trip: guest output drives the keystroke, and the keystroke's reply
-ends the run. The whole thing is **367.2 seconds of virtual time** — a couple of
+ends the run.
+
+**Every virtual-time figure in this section predates the disk controller.** The
+prompt now arrives at 815,584 ms rather than 367,174, and the 448-second
+difference is `NvmExpressDxe` waiting out timeouts on a window that does not
+decode — ["The disk"](#the-disk-and-the-one-thing-between-this-board-and-an-operating-system)
+has why. The numbers below are still the right ones to compare the three
+engines against each other, because all three pay the same wait; they are the
+wrong ones to quote for how long a boot takes today.
+
+The whole thing was **367.2 seconds of virtual time** — a couple of
 minutes of host time under the interpreter, and under a minute under `jit-host`
 on an idle machine.
 
@@ -472,6 +486,133 @@ specification does not define, so `setvar rsemu` with no `-guid` answers
 "Unable to set" however well the flash works. That was worth finding out the
 first time rather than mistaking it for the bug.
 
+## The disk, and the one thing between this board and an operating system
+
+A firmware exists to start an operating system, and this board could not: it
+had no storage controller, so `map` answered `No mapping found.` and there was
+nothing else to say. It has one now — an **NVM Express controller at
+`00:04.0`**, the same part at the same address `q35-linux` gives a kernel, for
+a different consumer. EDK II's `NvmExpressDxe` is a generic `MdeModulePkg`
+driver that binds on a class code of `010802h` and **polls** its completion
+queues, so a namespace needs nothing wired: the board adds ten lines and no
+interrupt.
+
+The firmware finds it. `PciBusDxe` enumerates `00:04.0`, sizes its 8 KiB
+window, allocates it out of the 64-bit aperture `PlatformInitLib` published,
+and `NvmExpressDxe` binds and enables memory space and bus mastering:
+
+```text
+q35-uefi:   nvme 00:04.0 command=0x2000006 bar0=0x800000000 (MSE=1, BME=1)
+```
+
+And then it reads `0xffffffff` out of every register in that window, because
+**a base address register programmed through the ECAM window never decodes**.
+
+### The firmware said so itself, in a buffer it never printed
+
+A `RELEASE` OVMF simply stalls; the debug build asserts. Neither prints
+anything, because EDK II's `DebugAssert` offers its message to
+`SerialPortWrite` only if the debug port answered, and this board's `0x402`
+does not. But the message is *formatted first*, into a 512-byte buffer on the
+asserting driver's own stack, and then `CpuDeadLoop` spins with that stack
+frame intact. `RSEMU_OVMF_WHOIS` named the frame out of the loaded image's own
+PE/COFF debug directory, and `RSEMU_OVMF_ASCII` read the buffer:
+
+```text
+q35-uefi:              rip = 0x0007e03058  DxeCore.dll + 0x11058
+q35-uefi:       [rsp+0xf8] = 0x00068ee420  NvmExpressDxe.dll + 0x9420
+q35-uefi: the string at 0x7df1500: "ASSERT .../MdeModulePkg/Bus/Pci/
+    NvmExpressDxe/NvmExpressHci.c(778): (Private->Cap.Mpsmin + 12) <= 12"
+```
+
+`CAP.MPSMIN` is `CAP[51:48]`, the smallest host page size the controller
+supports; ours is 0, which is the 4 KiB `NvmExpressDxe` requires. The value it
+asserted on is `0xf` — the top nibble of an all-ones read. `RSEMU_OVMF_HEX` at
+the driver's private structure (found by its `NVME` signature, which the
+register `RDI` was left holding pointed straight at) confirms it: `Cap` is
+sixteen `ff` bytes.
+
+### Why the window is dead, and why looking at it makes it work
+
+`src/bus/pci/bar.rs`'s module docs describe the hard case exactly, under
+"Moving a mapping from inside a configuration write". A BAR write arrives
+*inside* an address-space access, so that space's topology lock is already held
+for reading; taking the blocking write guard would invert `core::sync`'s
+ladder. `Bars::sync` therefore uses the order-exempt `try_topology`, and when
+that fails it sets a `stale` flag and re-applies **at the next configuration
+access**. The file states the assumption that makes this safe:
+
+> A configuration cycle **travels through the I/O space** […] the retry at the
+> next configuration access fails for the same reason, for ever.
+
+It says that of an *I/O* BAR, and refuses to map one at all. But a q35 has a
+second route to configuration space — **ECAM, in the memory space** — and
+through it every BAR is in precisely that position. The write is a memory
+access, so `try_topology` on the memory space cannot succeed; neither can the
+retry, or the one after that. A firmware that never touches `0xcf8` never heals
+it, and a UEFI firmware on a q35 never touches `0xcf8`.
+
+`tests/q35_uefi.rs` reproduces it in sixty milliseconds with no firmware at
+all, and it is committed `#[ignore]`d as a reproduction the way
+`tests/kvm_q35_linux_smp.rs` was:
+
+```console
+cargo test --release --features machine-q35-uefi --test q35_uefi -- \
+    --ignored --nocapture ecam
+after ECAM: 0xffffffff, after a conf1 access: 0x010103ff
+```
+
+The second half of that line is the proof and also a warning about
+instruments. One configuration access through the *port* space — mechanism #1,
+which does not hold the memory space's topology — and the window appears at
+once. `report_chipset` and `report_nvme` reach configuration space that way, so
+**every register they print looks perfect because looking at it fixed it**.
+That is why the post-mortem above shows a placed BAR and a readable `CAP` while
+the guest saw neither.
+
+This is not a UEFI problem and not a q35-uefi problem. Any guest on any board
+in this tree that programs a BAR through MMCONFIG gets a function that answers
+its configuration space and decodes nothing; `q35-linux` escapes it because
+Linux assigns its resources through `0xcf8` before MMCONFIG is up. Two fixes
+are open and both are outside this page: the `Deferred` action `bar.rs` already
+names, landing a scheduler quantum later, or an "owed retopology" the space
+drains when its last read guard goes.
+
+### What it costs while it is unfixed
+
+The shell still comes up and still answers `map: No mapping found.` — the
+`RELEASE` build's `ASSERT` is compiled out, so `NvmExpressDxe` waits out its
+timeouts, fails its `Start`, and BDS carries on. `CAP.TO` reads as ones with
+the rest of the register, which the driver reads as 128 seconds per wait, so
+the prompt now arrives at **815,584 ms** of virtual time rather than 367,174.
+Those 450 seconds are a measurement of the defect and go away with it;
+`DEFAULT_MS` in the test is 900,000 for the same reason.
+
+### The fixture that is waiting for it
+
+`scripts/fetch-testdata.sh esp` builds the disk, into the same ignored
+directory as everything else and committed no more than the firmware is: a
+64 MiB FAT volume with an EFI application at **`\EFI\BOOT\BOOTX64.EFI`**, which
+is the file name an x64 boot manager looks for on a device it has no `Boot####`
+for (UEFI 2.10 §3.5.1.1, "Removable Media Boot Behavior"), plus a `startup.nsh`
+the shell runs on its way up. The application is the local edk2 package's own
+`Shell.efi` — BSD-2-Clause-Patent, the same source the firmware comes from.
+
+No partition table, deliberately: EDK II's FAT driver binds a whole-disk
+`BlockIo` as readily as a partition's, and a bare FAT volume needs `mtools` and
+nothing else where a GPT would need `sgdisk` or `parted` on the path. `fstool`
+builds either from a TOML spec — `examples/efi-disk.toml` is exactly this
+image — once its CLI is installable here, and that is the better answer the day
+a board wants a realistic disk.
+
+`RSEMU_ESP_KERNEL` and `RSEMU_ESP_INITRD` put a `bzImage` and an initramfs
+beside the application. That is the stretch this board is aimed at and has not
+reached: a modern `bzImage` **is** a PE/COFF EFI application, so the shell can
+launch one with a command line of its own — `fs0:\vmlinuz.efi console=ttyS0
+initrd=\initrd.img` — and a kernel would reach userspace with the firmware,
+not a loader, having placed it. Every part of that is in the tree except a disk
+the firmware can read.
+
 ## What is not reached yet
 
 **A debug console at I/O port `0x402`** would still be worth having.
@@ -492,8 +633,29 @@ quiet.
 ## Running it
 
 ```console
-scripts/fetch-testdata.sh ovmf
+scripts/fetch-testdata.sh ovmf esp
 
+RSEMU_OVMF_CODE=testdata/x86/OVMF_CODE.fd \
+RSEMU_OVMF_VARS=testdata/x86/OVMF_VARS.fd \
+RSEMU_OVMF_DISK=testdata/x86/esp.img \
+RSEMU_ENGINE=jit-host \
+RSEMU_OVMF_INPUT='Shell> =>map -b\r' \
+    cargo test --release --features machine-q35-uefi,jit,cpu-x86-lift \
+        --test q35_uefi -- --nocapture a_uefi_firmware
+```
+
+and when a boot goes quiet, the three instruments that make a silent firmware
+talk — the driver an address belongs to, out of the loaded image's own PE/COFF
+debug directory; the string a stack pointer is pointing at; and a hex dump
+through the guest's page tables:
+
+```console
+RSEMU_OVMF_WHOIS=1 RSEMU_OVMF_ASCII=0x7df1500 RSEMU_OVMF_HEX=0x688ad18:384 …
+```
+
+The original, without a disk:
+
+```console
 RSEMU_OVMF_CODE=testdata/x86/OVMF_CODE.fd \
 RSEMU_OVMF_VARS=testdata/x86/OVMF_VARS.fd \
 RSEMU_OVMF_MS=600000 \
@@ -512,9 +674,12 @@ RSEMU_OVMF_VARS=testdata/x86/OVMF_VARS.fd \
         a_variable_written_at_the_shell_is_there_after_a_reboot
 ```
 
-It costs two boots — about two minutes of host time under `jit-host`, six under
-the interpreter — and neither image is modified: the bank the second boot starts
-from is the medium the first flushed to, in memory.
+It costs two boots — about seven minutes of host time under `jit-host` on an
+idle machine, and more than twice that under the interpreter — and neither
+image is modified: the bank the second boot starts from is the medium the first
+flushed to, in memory. It used to be two minutes; the difference is the
+450 seconds of virtual time per boot that `NvmExpressDxe` spends timing out,
+and it goes away with the defect above.
 
 `tests/q35_uefi.rs` has the whole variable table. The three tests that do *not*
 need an image run on every `cargo test`: that the two banks are one contiguous
@@ -544,9 +709,14 @@ width the driver uses.
 | the variable driver binding the flash rather than falling back to RAM | **works** — and it took the status register reading `0x00` after a Clear Status Register |
 | a variable written in one run present in the next | **works** — `setvar` at the shell in one boot, read back at the shell in the next, across two machines sharing only the bank's bytes |
 | `BootOrder`, `Boot000n`, `Timeout`, `ConIn`/`ConOut` in the store | **works** — 5,799 programmed bytes where the shipped image had 127 |
+| an NVMe controller at `00:04.0`, enumerated and bound | **works** — `PciBusDxe` sizes and places its window and `NvmExpressDxe` enables memory space and bus mastering |
+| the driver reading a register out of that window | **no** — a BAR programmed through ECAM never decodes, so `CAP` reads all-ones; `src/bus/pci/bar.rs`, reproduced hermetically and ledgered above |
+| a file system on that disk, `map` finding an `FS0:` | not reached, and blocked only by the row above |
+| an EFI application started off the disk | not reached; the fixture that would be started is built by `scripts/fetch-testdata.sh esp` |
+| a Linux kernel entered through its EFI stub | not reached; `RSEMU_ESP_KERNEL` puts one on the fixture against the day it is |
 | SMRAM / SMM | not modelled, **and not what was stopping the variable writes**; a non-`SMM_REQUIRE` OVMF never touches it, and [`q35.md`](q35.md) records the gap |
 | `fw_cfg` | absent, and deliberately: EDK II degrades cleanly when the signature at `0x510` does not read `QEMU`, and everything above happened without it |
-| a boot device | none: this board has no storage controller, so the shell finds `map: No mapping found.` |
+| a boot device | an NVMe controller is on the bus and cannot be read; the four rows above are the ledger of it, and the shell still finds `map: No mapping found.` |
 
 ## Sources
 
@@ -569,6 +739,21 @@ the status polling the RISC-V board's driver does with the same part, and
 `VarCheckUefiLib` for why a variable under the global GUID has to be one the
 specification names.
 
+For the disk: the **UEFI Specification 2.10** §3.5.1.1 for the default file
+name a boot manager looks for on a device it has no `Boot####` for, §13.3 for
+the EFI System Partition and its FAT requirements, and §7.4/§7.6 for
+`LoadImage`/`StartImage`; the **UEFI Shell Specification 2.2** §3.1 for
+`startup.nsh`; **NVM Express 1.4** §2.1.5 for the class code and §3.1.1 for
+`CAP` and its `MPSMIN`; **PCI Local Bus Specification** revision 2.1 §6.2.5.1
+for a 64-bit memory base address register and §6.2.2 for the Command register
+bit that gates it; and the Intel 3 Series datasheet §5.1.16 for where in the
+ECAM window a function's configuration space is. EDK II's
+`MdeModulePkg/Bus/Pci/NvmExpressDxe` named its own assertion and is quoted
+above; `MdePkg`'s `BaseDebugLibSerialPort` is why that assertion was formatted
+and not printed.
+
 **No emulator source of any licence was consulted.** The firmware images were
 run and never read; every number above is either a register this repository's
-own devices hold or a byte the guest itself executed.
+own devices hold or a byte the guest itself executed — including the assertion
+text, which the guest wrote into its own stack and this repository read back
+out of it.

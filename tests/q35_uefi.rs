@@ -1,11 +1,22 @@
 //! Does `q35-uefi` assemble, do its two flash banks behave like flash, and does
 //! a real UEFI firmware boot on it and **keep what it writes**?
 //!
-//! Three of the questions need nothing downloaded and run on every
+//! Six of the questions need nothing downloaded and run on every
 //! `cargo test`: that the code bank ends at the reset vector, that the variable
 //! bank answers the detection probe EDK II's `OvmfPkg` flash driver opens with
-//! — byte by byte, exactly as `QemuFlashDetected` issues it — and that a
-//! program clears bits while only an erase puts them back.
+//! — byte by byte, exactly as `QemuFlashDetected` issues it — that a
+//! program clears bits while only an erase puts them back, and three about the
+//! **disk**: that `00:04.0` is the class code `NvmExpressDxe` binds on, that
+//! `CAP` survives the single 64-bit read that driver makes of it, and that its
+//! window decodes where a base address register was told to put it.
+//!
+//! The last of those is `#[ignore]`d, because it **fails**. It is committed as
+//! a reproduction of the one thing standing between this board and an
+//! operating system: a BAR programmed through the ECAM window never decodes,
+//! so a UEFI firmware enumerates the controller, binds a driver to it and then
+//! reads `0xffffffff` out of every register. See
+//! [`the_disk_controllers_window_decodes_when_ecam_placed_it`] for the
+//! mechanism and `docs/platforms/q35-uefi.md` for what it costs.
 //!
 //! The other two need a firmware and are gated on `RSEMU_OVMF_CODE`, exactly as
 //! `tests/q35_linux.rs` is gated on `RSEMU_KERNEL` and for the same reasons: the
@@ -31,6 +42,7 @@
 //! | `RSEMU_OVMF_CODE` | the firmware bank's image. Unset, the boot test skips. |
 //! | `RSEMU_OVMF_VARS` | the variable bank's. Unset, the store comes up erased. |
 //! | `RSEMU_OVMF_VARS_OUT` | writes the variable bank back out when the run ends; pointing it at the file `RSEMU_OVMF_VARS` read makes the next run a reboot. |
+//! | `RSEMU_OVMF_DISK` | a raw disk image for the NVMe namespace. `scripts/fetch-testdata.sh esp` builds one with an EFI application at `\EFI\BOOT\BOOTX64.EFI`. |
 //! | `RSEMU_OVMF_MS` | virtual milliseconds to run for (default 420000, which is past the shell prompt at ~367000). |
 //! | `RSEMU_OVMF_EXTMEM` | how much memory above 1 MiB the board has. |
 //! | `RSEMU_OVMF_STOP_AT` | end the run at the first output containing this. |
@@ -39,6 +51,9 @@
 //! | `RSEMU_KERNEL_TRACE` | print where the processor is once per virtual millisecond. Shared with the kernel boots, because the run loop is. |
 //! | `RSEMU_ENGINE` | `interp`, `jit` or `jit-host`, overriding the machine file. |
 //! | `RSEMU_OVMF_DISASM` | a comma-separated list of guest addresses to disassemble after the run — for the address a firmware's own exception dump names. |
+//! | `RSEMU_OVMF_ASCII` | print the NUL-terminated string at each address — for the assertion buffer a firmware formats and then does not print. |
+//! | `RSEMU_OVMF_HEX` | hex dump `addr[:length]`, through the guest's page tables — for the structure a register was left pointing at. |
+//! | `RSEMU_OVMF_WHOIS` | name the driver each address is in, out of the loaded image's own PE/COFF debug directory: `1` for the final `RIP` and the stack, or a comma-separated list of addresses. |
 //! | `RSEMU_OVMF_PROBE` | replay the boot and report the first exception the firmware takes, with the frame the processor pushed. Costs a second boot. |
 //! | `RSEMU_OVMF_PROBE_MS` | how far back that replay switches to one-instruction stepping (default 150). |
 //!
@@ -81,12 +96,21 @@ use x86boot::Script;
 /// A ceiling rather than a target: the run stops early when the processor stops
 /// making progress or when the guest prints `RSEMU_OVMF_STOP_AT`.
 ///
-/// Seven minutes of virtual time, because the UEFI Shell prompt arrives at
-/// about 367 seconds of it and a ceiling below that is a run that ends in the
-/// DXE dispatcher having printed nothing — which the assertions here read as a
-/// failure, and rightly, since a firmware that never reaches a console is a
-/// firmware nothing can be said about. A shorter ceiling is `RSEMU_OVMF_MS`.
-const DEFAULT_MS: u64 = 420_000;
+/// Fifteen minutes of virtual time, because the UEFI Shell prompt arrives at
+/// about **816** seconds of it and a ceiling below that is a run that ends in
+/// BDS having printed nothing — which the assertions here read as a failure,
+/// and rightly, since a firmware that never reaches a console is a firmware
+/// nothing can be said about. A shorter ceiling is `RSEMU_OVMF_MS`.
+///
+/// It used to be 420 000, and the shell used to arrive at 367 000. The
+/// difference is **`NvmExpressDxe` timing out**: the controller at `00:04.0`
+/// is enumerated and bound, and then every register it reads is `0xffffffff`,
+/// because a BAR programmed through the ECAM window does not decode
+/// ([`the_disk_controllers_window_decodes_when_ecam_placed_it`]). `CAP.TO`
+/// reads as ones with the rest, which the driver takes for 128 seconds per
+/// wait. So 450 of these 816 seconds are a measurement of that defect and go
+/// away with it.
+const DEFAULT_MS: u64 = 900_000;
 
 /// The top of the address space, which is where the flash ends.
 const TOP: u64 = 0x1_0000_0000;
@@ -121,9 +145,10 @@ fn bindings(cpus: &Arc<Captured<X86>>) -> Bindings {
 fn board(
     code: Vec<u8>,
     vars: Vec<u8>,
+    disk: Vec<u8>,
     params: &[(&str, String)],
 ) -> Result<(Machine, Arc<X86>, Arc<CharPort>), String> {
-    board_on_a_medium(code, vars, None, params)
+    board_on_a_medium(code, vars, disk, None, params)
 }
 
 /// The same, with the variable bank bound to a **medium** rather than filled
@@ -137,6 +162,7 @@ fn board(
 fn board_on_a_medium(
     code: Vec<u8>,
     vars: Vec<u8>,
+    disk: Vec<u8>,
     store: Option<Arc<RamStore>>,
     params: &[(&str, String)],
 ) -> Result<(Machine, Arc<X86>, Arc<CharPort>), String> {
@@ -149,6 +175,13 @@ fn board_on_a_medium(
     }
     options.realize.media.insert("flash0", code);
     options.realize.media.insert("flash1", vars);
+    // The namespace's contents, stamped into a blank one. Bound even when it is
+    // empty, because the slot the machine file names has to exist: an unbound
+    // one is refused at realize, and an empty one is a namespace of `size`
+    // erased bytes — a disk the firmware enumerates and finds no file system
+    // on, which is the ordinary case here and the one the three hermetic tests
+    // build.
+    options.realize.media.insert("nvme0", disk);
     if let Some(store) = &store {
         rsemu::dev::medium::install(
             &options.realize.hosts,
@@ -175,10 +208,29 @@ fn board_on_a_medium(
 
 /// The board with both sockets stuffed and nothing programmed into them.
 fn bare_board() -> Machine {
-    match board(Vec::new(), Vec::new(), &[]) {
+    match board(Vec::new(), Vec::new(), Vec::new(), &[]) {
         Ok((machine, _cpu, _console)) => machine,
         Err(e) => panic!("the board does not realize: {e}"),
     }
+}
+
+/// Whatever `RSEMU_OVMF_DISK` names, as the NVMe namespace's contents.
+///
+/// Empty when it is unset, which is every run that is only asking about the
+/// firmware: the controller is still on the bus, and a namespace of erased
+/// bytes is a disk with no file system on it — which is a fact about the board
+/// worth being able to observe, since it is what `map: No mapping found.`
+/// looks like from the *other* side.
+///
+/// `scripts/fetch-testdata.sh esp` builds one: a FAT16 volume with an EFI
+/// application at `\EFI\BOOT\BOOTX64.EFI`, which is the file name UEFI 2.10
+/// §3.5.1.1 says an x64 boot manager looks for on a device it has no
+/// `Boot####` for.
+fn disk_from_env() -> Vec<u8> {
+    let Ok(path) = std::env::var("RSEMU_OVMF_DISK") else {
+        return Vec::new();
+    };
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
 }
 
 /// Read a byte out of a space the way a guest would.
@@ -373,6 +425,217 @@ fn a_variable_store_program_clears_bits_and_an_erase_puts_them_back() {
     assert_eq!(read8(mem, VARS + 4), 0xff, "an erase is what sets bits");
 }
 
+/// The disk is on the bus, at the address the machine file names, with the
+/// class code EDK II's storage driver binds on.
+///
+/// `NvmExpressDxe` is a `MdeModulePkg` driver and its `Supported()` accepts a
+/// function whose class, subclass and programming interface are 01/08/02 (NVM
+/// Express 1.4 §2.1.5, "Class Code"); nothing about the platform enters into
+/// it. So this is the whole of what the board has to get right for a UEFI
+/// firmware to find a disk here, and it is asserted without a firmware — the
+/// same division of labour as the flash probe above, where the byte-wide
+/// detection sequence is checked here and the boot that depends on it is
+/// gated on an image.
+///
+/// Both routes to configuration space, because `PciBusDxe` reaches a function
+/// through whichever one the platform's `PciHostBridgeLib` published and this
+/// board publishes ECAM.
+#[test]
+fn the_disk_controller_is_the_class_code_the_uefi_driver_binds_on() {
+    let machine = bare_board();
+    let mem = machine.space("mem").expect("the board declares `mem`");
+    let port = machine.space("port").expect("the board declares `port`");
+
+    port.write(0xcf8, Width::U32, 0x8000_2000, MemAttrs::DEFAULT)
+        .expect("CONFADD is a dword register");
+    let id = port
+        .read(0xcfc, Width::U32, MemAttrs::DEFAULT)
+        .expect("CONFDATA") as u32;
+    assert_ne!(id, 0xffff_ffff, "00:04.0 answers");
+
+    port.write(0xcf8, Width::U32, 0x8000_2008, MemAttrs::DEFAULT)
+        .expect("CONFADD");
+    let class = port
+        .read(0xcfc, Width::U32, MemAttrs::DEFAULT)
+        .expect("CONFDATA") as u32;
+    assert_eq!(
+        class >> 8,
+        0x0001_0802,
+        "NVM Express is class 010802h, which is what NvmExpressDxe binds on"
+    );
+
+    // And through the window `PCIEXBAR` places, which is the route the
+    // firmware's own PCI bus driver takes: bus 0 is 0, device 4 is 4 * 32 KiB
+    // (Intel 3 Series datasheet §5.1.16).
+    assert_eq!(
+        mem.read(0xe000_0000 + 4 * 0x8000, Width::U32, MemAttrs::DEFAULT)
+            .expect("the ECAM window decodes") as u32,
+        id,
+        "the same function through the window the (G)MCH placed"
+    );
+}
+
+/// `CAP` read the way the UEFI driver reads it: **one 64-bit access**.
+///
+/// `CAP` is the only 64-bit register a controller has to answer before anything
+/// else works (NVM Express 1.4 §3.1.1, "Offset 00h: CAP"), and the two drivers
+/// this repository points at the same part read it differently. Linux's
+/// `nvme_pci_enable` uses `lo_hi_readq`, which is **two 32-bit reads**;
+/// EDK II's `NvmExpressDxe` uses `PciIo->Mem.Read (EfiPciIoWidthUint64, ...)`,
+/// which is one. A part that answers the first correctly and the second with
+/// the low half in both places is a part a kernel boots from and a firmware
+/// asserts on — and it asserted on exactly the field the halves disagree
+/// about:
+///
+/// ```text
+/// ASSERT MdeModulePkg/Bus/Pci/NvmExpressDxe/NvmExpressHci.c(778):
+///     (Private->Cap.Mpsmin + 12) <= 12
+/// ```
+///
+/// `MPSMIN` is `CAP[51:48]`, in the *upper* half. The controller's real answer
+/// there is 0 — 4 KiB, the only page size the driver supports — and the value
+/// it asserted on is bit 48 of a duplicated lower half, which is
+/// `CAP[19:16] = 1`.
+///
+/// So this reads the register both ways at the address the board's own PCI
+/// configuration space puts it, and asserts they agree. It needs no firmware.
+#[test]
+fn the_disk_controllers_capabilities_survive_a_single_64_bit_read() {
+    /// Somewhere in the hole below 4 GiB, which is where this board's PCI
+    /// window is and where nothing else decodes.
+    const BAR0: u64 = 0x8_0000_0000;
+
+    let machine = bare_board();
+    let mem = machine.space("mem").expect("the board declares `mem`");
+    let port = machine.space("port").expect("the board declares `port`");
+    let cfg = |offset: u32, value: u32| {
+        port.write(
+            0xcf8,
+            Width::U32,
+            u64::from(0x8000_2000 | offset),
+            MemAttrs::DEFAULT,
+        )
+        .expect("CONFADD is a dword register");
+        port.write(0xcfc, Width::U32, u64::from(value), MemAttrs::DEFAULT)
+            .expect("CONFDATA");
+    };
+    // The sequence `PciBusDxe` puts a function through, in its order: size the
+    // register by writing all-ones to both halves, then place it, then enable
+    // memory space. The sizing write is not decoration — it asks the function
+    // to decode at the top of the address space for as long as it takes to
+    // read the mask back, and a model that took it literally would leave a
+    // region there.
+    cfg(0x10, 0xffff_ffff);
+    cfg(0x14, 0xffff_ffff);
+    cfg(0x10, BAR0 as u32);
+    cfg(0x14, (BAR0 >> 32) as u32);
+    cfg(0x04, 0x0006);
+
+    let read = |at: u64, width: Width| {
+        mem.read(at, width, MemAttrs::DEFAULT)
+            .unwrap_or_else(|e| panic!("a read of {at:#x} faulted: {e:?}"))
+    };
+    let (low, high) = (read(BAR0, Width::U32), read(BAR0 + 4, Width::U32));
+    assert_ne!(
+        low, 0xffff_ffff,
+        "the register block decodes where it was put"
+    );
+    assert_eq!(
+        read(BAR0, Width::U64),
+        low | (high << 32),
+        "one 64-bit read of CAP is the two 32-bit reads of it, in the order the \
+         register is laid out"
+    );
+    assert_eq!(
+        (high >> 16) & 0xf,
+        0,
+        "CAP.MPSMIN is 4 KiB: NvmExpressDxe asserts on anything else"
+    );
+}
+
+/// The same window, placed the way a **UEFI** firmware places it: through ECAM.
+///
+/// **This test fails, and it is committed `#[ignore]`d as a reproduction** —
+/// `tests/kvm_q35_linux_smp.rs` set the precedent. It is the whole of what
+/// stands between this board and an operating system, it takes 60 milliseconds
+/// to demonstrate, and it is not a UEFI problem at all: *any* guest that
+/// programs a base address register through the memory-mapped configuration
+/// window gets a function that answers its configuration space and decodes
+/// nothing.
+///
+/// ```console
+/// cargo test --release --features machine-q35-uefi --test q35_uefi -- \
+///     --ignored --nocapture ecam
+/// after ECAM: 0xffffffff, after a conf1 access: 0x010103ff
+/// ```
+///
+/// The mechanism is written down in `src/bus/pci/bar.rs`'s own module docs,
+/// under "Moving a mapping from inside a configuration write". A BAR write
+/// arrives inside an address-space access, so the space's topology lock is
+/// already held for reading and the blocking `AddressSpace::topology` would invert
+/// `core::sync`'s ladder. `Bars::sync` therefore takes the order-exempt
+/// `try_topology`, and when that fails it sets a `stale` flag and re-applies
+/// **at the next configuration access**. That resolution rests on an
+/// assumption the file states plainly:
+///
+/// > A configuration cycle **travels through the I/O space** […] the retry at
+/// > the next configuration access fails for the same reason, for ever.
+///
+/// It says that of an *I/O* BAR, and refuses to map one. But a q35 has a
+/// second route to configuration space — ECAM, in the **memory** space — and
+/// through it every BAR is in exactly that position: the write is a memory
+/// access, so `try_topology` on the memory space cannot succeed, and neither
+/// can the retry, or the retry after that. A firmware that never touches
+/// `0xcf8` never heals it.
+///
+/// The second half of this test is the proof rather than a flourish: one
+/// configuration access through the port space — mechanism #1, which does not
+/// hold the memory space's topology — and the window appears at once, with
+/// `CAP` reading `0x010103ff`. It is also a warning about instruments, because
+/// [`report_nvme`] reaches configuration space that way: every register it
+/// prints looks perfect *because looking at it fixed it*.
+///
+/// Two fixes are open, and neither belongs in this file: the `Deferred` action
+/// `bar.rs` names, landing a scheduler quantum later; or an "owed
+/// retopology" the space drains when
+/// its last read guard goes. The first is what the module docs already say
+/// they would do when something needed it. Something does.
+#[test]
+#[ignore = "reproduces the ECAM-placed BAR defect in src/bus/pci/bar.rs; pass --ignored to run it"]
+fn the_disk_controllers_window_decodes_when_ecam_placed_it() {
+    const BAR0: u64 = 0x8_0000_0000;
+    let machine = bare_board();
+    let mem = machine.space("mem").expect("the board declares `mem`");
+    // Bus 0, device 4, function 0 is 4 * 32 KiB into the window `PCIEXBAR`
+    // placed (Intel 3 Series datasheet §5.1.16).
+    let ecam = |offset: u64, value: u32| {
+        mem.write(
+            0xe000_0000 + 4 * 0x8000 + offset,
+            Width::U32,
+            u64::from(value),
+            MemAttrs::DEFAULT,
+        )
+        .expect("the ECAM window takes a dword");
+    };
+    ecam(0x10, BAR0 as u32);
+    ecam(0x14, (BAR0 >> 32) as u32);
+    ecam(0x04, 0x0006);
+    let after_ecam = mem.read(BAR0, Width::U32, MemAttrs::DEFAULT).unwrap_or(!0) as u32;
+    // One configuration access through the *other* window, which travels
+    // through the port space and therefore leaves the memory space's topology
+    // free.
+    let port = machine.space("port").expect("the board declares `port`");
+    port.write(0xcf8, Width::U32, 0x8000_2000, MemAttrs::DEFAULT)
+        .expect("CONFADD");
+    let _ = port.read(0xcfc, Width::U32, MemAttrs::DEFAULT);
+    let after_conf1 = mem.read(BAR0, Width::U32, MemAttrs::DEFAULT).unwrap_or(!0) as u32;
+    println!("after ECAM: {after_ecam:#010x}, after a conf1 access: {after_conf1:#010x}");
+    assert_ne!(
+        after_ecam, 0xffff_ffff,
+        "a BAR programmed through the ECAM window decodes where it was put"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // and the firmware
 // ---------------------------------------------------------------------------
@@ -408,6 +671,10 @@ fn a_uefi_firmware_from_the_environment_reaches_its_console() {
     if let Ok(extmem) = std::env::var("RSEMU_OVMF_EXTMEM") {
         params.push(("extmem", extmem));
     }
+    let disk = disk_from_env();
+    if !disk.is_empty() {
+        params.push(("disk", format!("{}", disk.len())));
+    }
     println!(
         "q35-uefi: {} bytes of firmware and {} bytes of variable store, mapped at {:#x}",
         code.len(),
@@ -415,7 +682,7 @@ fn a_uefi_firmware_from_the_environment_reaches_its_console() {
         TOP - (code.len() + vars.len()) as u64
     );
 
-    let (mut m, cpu, console) = match board(code.clone(), vars.clone(), &params) {
+    let (mut m, cpu, console) = match board(code.clone(), vars.clone(), disk, &params) {
         Ok(built) => built,
         Err(e) => panic!("the board does not realize: {e}"),
     };
@@ -435,7 +702,11 @@ fn a_uefi_firmware_from_the_environment_reaches_its_console() {
     );
     x86boot::report("q35-uefi", &m, &cpu, &run, &script);
     report_chipset(&m);
+    report_nvme(&m, &cpu);
     report_disassembly(&m, &cpu);
+    report_modules(&m, &cpu);
+    report_ascii(&m, &cpu);
+    report_hex(&m, &cpu);
     probe_first_exception(&params, run.at);
     write_back_the_variable_store(&m);
     assert_reached_uefi(&run, &script);
@@ -503,6 +774,7 @@ fn a_variable_written_at_the_shell_is_there_after_a_reboot() {
     let first = run_the_shell(
         &code,
         &vars,
+        &[],
         &params,
         ms,
         &[
@@ -543,6 +815,7 @@ fn a_variable_written_at_the_shell_is_there_after_a_reboot() {
     let second = run_the_shell(
         &code,
         &first.store,
+        &[],
         &params,
         ms,
         &[format!("setvar rsemu -guid {GUID}\r")],
@@ -573,6 +846,7 @@ struct Shell {
 fn run_the_shell(
     code: &[u8],
     vars: &[u8],
+    disk: &[u8],
     params: &[(&str, String)],
     ms: u64,
     lines: &[String],
@@ -583,11 +857,16 @@ fn run_the_shell(
     // leave a firmware that boots once and never again.
     let store = Arc::new(RamStore::new(vars.len() as u64));
     Medium::write_at(&*store, 0, vars).expect("a fresh store takes the image");
-    let (mut m, cpu, console) =
-        match board_on_a_medium(code.to_vec(), Vec::new(), Some(Arc::clone(&store)), params) {
-            Ok(built) => built,
-            Err(e) => panic!("the board does not realize: {e}"),
-        };
+    let (mut m, cpu, console) = match board_on_a_medium(
+        code.to_vec(),
+        Vec::new(),
+        disk.to_vec(),
+        Some(Arc::clone(&store)),
+        params,
+    ) {
+        Ok(built) => built,
+        Err(e) => panic!("the board does not realize: {e}"),
+    };
     let script = Script {
         steps: lines
             .iter()
@@ -826,6 +1105,86 @@ fn report_chipset(m: &Machine) {
     );
 }
 
+/// What the firmware did with the disk controller.
+///
+/// Three registers and one bit, and between them they say how far the storage
+/// stack got without any output from the guest at all:
+///
+/// * `BAR0` non-zero means **`PciBusDxe` enumerated the function and allocated
+///   it a window** out of the 32-bit aperture `PlatformInitLib` published.
+/// * `COMMAND.MSE` (bit 1) and `COMMAND.BME` (bit 2) mean a driver called
+///   `PciIo->Attributes()` — that is `NvmExpressDxe` starting, and bus
+///   mastering is what lets the controller fetch its own submission queue.
+/// * `CC.EN` and `CSTS.RDY` mean the driver **brought the controller up** and
+///   the controller answered (NVM Express 1.4 §3.1.5): admin queues placed,
+///   doorbells written, identify issued.
+///
+/// A run that reaches the shell and prints `map: No mapping found.` is telling
+/// you the same thing from the guest's side; this says which of those steps
+/// was the one that did not happen.
+fn report_nvme(m: &Machine, cpu: &X86) {
+    let mem = m.space("mem").expect("the board declares `mem`");
+    let port = m.space("port").expect("the board declares `port`");
+    let cfg = |offset: u32| -> u32 {
+        // `MemAttrs::DEFAULT` for the address latch, as in `report_chipset`:
+        // mechanism #1 cannot be reached without writing one, and the run is
+        // over.
+        let _ = port.write(
+            0xcf8,
+            Width::U32,
+            u64::from(0x8000_2000 | (offset & 0xfc)),
+            MemAttrs::DEFAULT,
+        );
+        port.read(0xcfc, Width::U32, MemAttrs::DEBUG).unwrap_or(!0) as u32
+    };
+    let command = cfg(0x04);
+    let bar = u64::from(cfg(0x10) & !0xf_u32) | (u64::from(cfg(0x14)) << 32);
+    println!(
+        "q35-uefi:   nvme 00:04.0 command={command:#06x} bar0={bar:#x} (MSE={}, BME={})",
+        (command >> 1) & 1,
+        (command >> 2) & 1
+    );
+    if bar == 0 || command & 0x2 == 0 {
+        println!(
+            "q35-uefi:   no memory window: the firmware's PCI bus driver never placed one, so \
+             nothing could have bound"
+        );
+        return;
+    }
+    // Whether the *guest* can reach the window, which is a different question
+    // from whether the board decodes it: a 64-bit BAR the firmware placed above
+    // 4 GiB is only reachable if the firmware's own page tables cover it, and a
+    // driver that reads all-ones from a register block it cannot see waits for
+    // a bit that will never change.
+    match read_debug(cpu, mem, bar, Width::U32) {
+        Some(word) => println!(
+            "q35-uefi:   the firmware's page tables map {bar:#x}, and CAP reads {word:#010x} \
+             through them"
+        ),
+        None => println!(
+            "q35-uefi:   {bar:#x} is NOT mapped by the page tables in CR3: a guest access to the \
+             register block would fault"
+        ),
+    }
+    let reg = |offset: u64| {
+        mem.read(bar + offset, Width::U32, MemAttrs::DEBUG)
+            .unwrap_or(!0) as u32
+    };
+    let (cc, csts) = (reg(0x14), reg(0x1c));
+    println!(
+        "q35-uefi:   cap={:08x}_{:08x} cc={cc:#010x} csts={csts:#010x} aqa={:#010x} asq={:#x}",
+        reg(4),
+        reg(0),
+        reg(0x24),
+        u64::from(reg(0x28)) | (u64::from(reg(0x2c)) << 32),
+    );
+    println!(
+        "q35-uefi:   controller {} and {}",
+        if cc & 1 == 1 { "enabled" } else { "disabled" },
+        if csts & 1 == 1 { "ready" } else { "not ready" }
+    );
+}
+
 // ---------------------------------------------------------------------------
 // naming what stopped it
 // ---------------------------------------------------------------------------
@@ -870,7 +1229,7 @@ fn probe_first_exception(params: &[(&str, String)], stopped: GlobalTime) {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(150);
-    let Ok((mut m, cpu, _console)) = board(code, vars, params) else {
+    let Ok((mut m, cpu, _console)) = board(code, vars, disk_from_env(), params) else {
         return;
     };
     let fine_from = stopped.as_nanos().saturating_sub(window * 1_000_000);
@@ -1006,6 +1365,222 @@ fn read_gates(cpu: &X86, mem: &AddressSpace, base: u64, limit: u32) -> Vec<u64> 
             read(0, Width::U16) | (read(6, Width::U16) << 16) | (read(8, Width::U32) << 32)
         })
         .collect()
+}
+
+/// The NUL-terminated ASCII at each address `RSEMU_OVMF_ASCII` names.
+///
+/// One line of code, and it is the difference between "the firmware stopped"
+/// and "the firmware said why". EDK II's `DebugAssert` formats
+/// `ASSERT [<driver>] <file>(<line>): <expression>` into a 512-byte buffer on
+/// its own stack, offers it to `SerialPortWrite` **only if the debug port
+/// answered**, and then calls `CpuDeadLoop`. On this board the port at `0x402`
+/// does not answer, so the message is never printed — but it is still sitting
+/// in that stack frame when the run ends, and the register that pointed at it
+/// is in the post-mortem dump.
+fn report_ascii(m: &Machine, cpu: &X86) {
+    let Ok(list) = std::env::var("RSEMU_OVMF_ASCII") else {
+        return;
+    };
+    let mem = m.space("mem").expect("the board declares `mem`");
+    for item in list.split(',').filter(|s| !s.trim().is_empty()) {
+        let text = item.trim().trim_start_matches("0x");
+        let Ok(at) = u64::from_str_radix(text, 16) else {
+            continue;
+        };
+        let mut out = String::new();
+        for i in 0..512 {
+            match read_debug(cpu, mem, at + i, Width::U8).map(|b| b as u8) {
+                None | Some(0) => break,
+                Some(byte) if byte.is_ascii_graphic() || byte == b' ' => out.push(char::from(byte)),
+                Some(_) => out.push('.'),
+            }
+        }
+        println!("q35-uefi: the string at {at:#x}: {out:?}");
+    }
+}
+
+/// A hex dump of whatever `RSEMU_OVMF_HEX=addr[:length]` names.
+///
+/// The companion to [`report_ascii`]: an assertion says *what* was wrong with a
+/// value and this says what the value was. Reads are `MemAttrs::DEBUG` and
+/// through the guest's own page tables, so a driver's private structure can be
+/// read at the pointer a register was left holding.
+fn report_hex(m: &Machine, cpu: &X86) {
+    let Ok(list) = std::env::var("RSEMU_OVMF_HEX") else {
+        return;
+    };
+    let mem = m.space("mem").expect("the board declares `mem`");
+    for item in list.split(',').filter(|s| !s.trim().is_empty()) {
+        let (address, length) = item.split_once(':').unwrap_or((item, "64"));
+        let Ok(at) = u64::from_str_radix(address.trim().trim_start_matches("0x"), 16) else {
+            continue;
+        };
+        let length: u64 = length.trim().parse().unwrap_or(64);
+        for row in 0..length.div_ceil(16) {
+            let base = at + row * 16;
+            let bytes: Vec<String> = (0..16)
+                .map(|i| {
+                    read_debug(cpu, mem, base + i, Width::U8)
+                        .map_or_else(|| "??".to_string(), |b| format!("{:02x}", b as u8))
+                })
+                .collect();
+            println!("q35-uefi:   {base:#012x}  {}", bytes.join(" "));
+        }
+    }
+}
+
+/// Which firmware driver an address is in, asked of the firmware.
+///
+/// `RSEMU_OVMF_WHOIS=1` resolves the processor's final `RIP` and every word on
+/// the stack that lands inside a loaded image; `RSEMU_OVMF_WHOIS=0x7e80347,…`
+/// adds addresses of its own. It costs nothing and needs no replay, because
+/// everything it reads is still resident when the run ends.
+///
+/// **This is the answer to "a `RELEASE` build prints nothing".** A firmware
+/// that hangs is a hexadecimal address and no name — and the driver that owns
+/// that address is written down *inside the image itself*, because every EDK II
+/// build carries a PE/COFF debug directory whose CodeView record is the path of
+/// the `.pdb` it was linked against. `PeCoffLoaderGetPdbPointer` is how EDK II
+/// prints `Loading driver at 0x0007E7E000 EntryPoint=… NvmExpressDxe.efi`; this
+/// reads exactly the same field, from outside, after the fact.
+///
+/// PE/COFF is the *UEFI Specification*'s own image format (UEFI 2.10 §2.1.1),
+/// so the layout is Microsoft's published PE32+ one: `MZ` at the image base,
+/// `e_lfanew` at 0x3c, `PE\0\0`, then the optional header with `SizeOfImage` at
+/// +0x38 and the debug data directory at +0xa0.
+///
+/// A `LoadImage` allocates pages, so a loaded image always starts on a 4 KiB
+/// boundary and the search below is a walk down from the address.
+fn report_modules(m: &Machine, cpu: &X86) {
+    let Ok(list) = std::env::var("RSEMU_OVMF_WHOIS") else {
+        return;
+    };
+    let mem = m.space("mem").expect("the board declares `mem`");
+    let regs = cpu.regs();
+    let mut wanted: Vec<(String, u64)> = vec![(String::from("rip"), regs.rip)];
+    for item in list.split(',').filter(|s| !s.trim().is_empty()) {
+        let text = item.trim().trim_start_matches("0x");
+        if let Ok(at) = u64::from_str_radix(text, 16) {
+            wanted.push((format!("{at:#x}"), at));
+        }
+    }
+    // The stack, which is the poor relation of a backtrace and enough: a
+    // firmware's frames are not walkable without unwind data, but every return
+    // address a chain of calls left behind is still sitting there, and naming
+    // the *images* they fall in says which drivers are on the stack.
+    for i in 0..64u64 {
+        let at = regs.rsp + i * 8;
+        if let Some(word) = read_debug(cpu, mem, at, Width::U64)
+            && word > 0x10_0000
+            && word < 0x1_0000_0000
+        {
+            wanted.push((format!("[rsp+{:#x}]", i * 8), word));
+        }
+    }
+    println!("q35-uefi: which image each address is in:");
+    let mut said: Vec<(u64, String)> = Vec::new();
+    for (label, at) in wanted {
+        let Some(base) = image_base(cpu, mem, at) else {
+            continue;
+        };
+        let name = said
+            .iter()
+            .find(|(b, _)| *b == base)
+            .map(|(_, n)| n.clone())
+            .unwrap_or_else(|| {
+                let name = module_name(cpu, mem, base)
+                    .unwrap_or_else(|| String::from("<no debug directory>"));
+                said.push((base, name.clone()));
+                name
+            });
+        println!(
+            "q35-uefi:   {label:>14} = {at:#012x}  {name} + {:#x}",
+            at - base
+        );
+    }
+}
+
+/// A debug read of `width` bytes at a guest *virtual* address, or `None` if it
+/// is not mapped.
+fn read_debug(cpu: &X86, mem: &AddressSpace, at: u64, width: Width) -> Option<u64> {
+    let pa = cpu.translate_debug(at).phys(at)?;
+    mem.read(pa, width, MemAttrs::DEBUG).ok()
+}
+
+/// The base of the PE/COFF image containing `at`, found by walking down.
+///
+/// Bounded at 64 MiB, which is more than the largest thing a UEFI firmware
+/// loads and short enough that an address in no image costs nothing.
+fn image_base(cpu: &X86, mem: &AddressSpace, at: u64) -> Option<u64> {
+    let mut base = at & !0xfff;
+    for _ in 0..16384 {
+        if read_debug(cpu, mem, base, Width::U16) == Some(0x5a4d) {
+            let lfanew = read_debug(cpu, mem, base + 0x3c, Width::U32)?;
+            if lfanew >= 0x1000 {
+                base = base.checked_sub(0x1000)?;
+                continue;
+            }
+            let pe = base + lfanew;
+            if read_debug(cpu, mem, pe, Width::U32) == Some(0x0000_4550) {
+                // The optional header follows the 24-byte file header, and
+                // `SizeOfImage` is 0x38 into it. An address past the end is an
+                // image that merely sits below this one.
+                let opt = pe + 0x18;
+                let size = read_debug(cpu, mem, opt + 0x38, Width::U32)?;
+                if at - base < size {
+                    return Some(base);
+                }
+                return None;
+            }
+        }
+        base = base.checked_sub(0x1000)?;
+    }
+    None
+}
+
+/// The name the image was linked under, out of its own CodeView record.
+fn module_name(cpu: &X86, mem: &AddressSpace, base: u64) -> Option<String> {
+    let lfanew = read_debug(cpu, mem, base + 0x3c, Width::U32)?;
+    let opt = base + lfanew + 0x18;
+    // DataDirectory[6] is the debug directory: 0x70 for the sixteen directory
+    // entries, plus six of them at eight bytes each.
+    let rva = read_debug(cpu, mem, opt + 0xa0, Width::U32)?;
+    let size = read_debug(cpu, mem, opt + 0xa4, Width::U32)?;
+    if rva == 0 || size < 28 {
+        return None;
+    }
+    for entry in 0..size / 28 {
+        let at = base + rva + entry * 28;
+        if read_debug(cpu, mem, at + 12, Width::U32)? != 2 {
+            continue; // not IMAGE_DEBUG_TYPE_CODEVIEW
+        }
+        let data = read_debug(cpu, mem, at + 20, Width::U32)?;
+        if data == 0 {
+            continue;
+        }
+        let record = base + data;
+        // `RSDS` (16-byte GUID + age), `NB10` (offset + two dwords) and `MTOC`
+        // (a 16-byte UUID) are the three EDK II toolchains emit, and each is
+        // followed by a NUL-terminated path.
+        let text = match read_debug(cpu, mem, record, Width::U32)? {
+            0x5344_5352 => record + 24,
+            0x3031_424e => record + 16,
+            0x434f_544d => record + 20,
+            _ => continue,
+        };
+        let mut name = String::new();
+        for i in 0..256 {
+            match read_debug(cpu, mem, text + i, Width::U8)? as u8 {
+                0 => break,
+                b'/' | b'\\' => name.clear(),
+                byte => name.push(char::from(byte)),
+            }
+        }
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    None
 }
 
 /// Disassemble whatever `RSEMU_OVMF_DISASM` names, after the run.
