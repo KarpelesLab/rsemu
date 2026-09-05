@@ -2546,14 +2546,14 @@ pub fn synthesize(form: u32, fields: u32) -> Vec<u8> {
         // a rotate's overflow comes off bits fifteen and fourteen, and a word
         // write is a `deposit` that must **preserve** the doubleword above it
         // where a doubleword write zero-extends.
-        55 => rr16(0x01, reg, rm),  // add r/m16, r16
-        56 => rr16(0x03, reg, rm),  // add r16, r/m16
-        57 => rr16(0x19, reg, rm),  // sbb — the borrow at a width neither
-        58 => rr16(0x29, reg, rm),  // sub    corpus reached
-        59 => rr16(0x31, reg, rm),  // xor
-        60 => rr16(0x39, reg, rm),  // cmp
-        61 => rr16(0x85, reg, rm),  // test
-        62 => rr16(0x89, reg, rm),  // mov r/m16, r16
+        55 => rr16(0x01, reg, rm),         // add r/m16, r16
+        56 => rr16(0x03, reg, rm),         // add r16, r/m16
+        57 => rr16(0x19, reg, rm),         // sbb — the borrow at a width neither
+        58 => rr16(0x29, reg, rm),         // sub    corpus reached
+        59 => rr16(0x31, reg, rm),         // xor
+        60 => rr16(0x39, reg, rm),         // cmp
+        61 => rr16(0x85, reg, rm),         // test
+        62 => rr16(0x89, reg, rm),         // mov r/m16, r16
         63 => rm16(0x8b, reg, base, disp), // mov r16, [base+d]
         64 => rm16(0x89, reg, base, disp), // mov [base+d], r16
         65 => {
@@ -2572,7 +2572,14 @@ pub fn synthesize(form: u32, fields: u32) -> Vec<u8> {
         // `IDIV`, which are outside the subset.
         67 => grp16(0xf7, [2u8, 3, 4, 5][((fields >> 24) & 3) as usize], rm),
         68 => vec![0x66, 0x0f, 0xaf, 0xc0 | (reg << 3) | rm], // imul r16, r/m16
-        69 => vec![0x66, if fields & 1 == 0 { 0x40 | reg } else { 0x48 | reg }],
+        69 => vec![
+            0x66,
+            if fields & 1 == 0 {
+                0x40 | reg
+            } else {
+                0x48 | reg
+            },
+        ],
         // `CBW` and `CWD` at this size are `AL`→`AX` and `AX`→`DX:AX`, which
         // is the *half*-width case `Plan::Cbw`'s table has and the corpus
         // only ever drove at thirty-two.
@@ -2617,14 +2624,18 @@ pub fn synthesize(form: u32, fields: u32) -> Vec<u8> {
         // by one form. These four read one without writing anything, write
         // one with a value small enough to keep a pointer inside its segment,
         // and move one down into a low byte.
-        77 => rr(0x84, breg, breg2),   // test r/m8, r8
-        78 => rr(0x38, breg, breg2),   // cmp r/m8, r8
-        79 => rr(0x8a, reg & 3, breg), // mov r8, r/m8 — a high byte read
-        80 => vec![0xb0 | high, imm8 & 0x3f], // mov ah/ch/dh/bh, imm8
+        77 => rr(0x84, breg, breg2),              // test r/m8, r8
+        78 => rr(0x38, breg, breg2),              // cmp r/m8, r8
+        79 => rr(0x8a, reg & 3, breg),            // mov r8, r/m8 — a high byte read
+        80 => vec![0xb0 | high, imm8 & 0x3f],     // mov ah/ch/dh/bh, imm8
         81 => vec![0x0f, 0x90 | cc, 0xc0 | high], // setcc ah/ch/dh/bh
         // Group `80`: the byte-width immediate group, which is a third
         // encoding of the eight ALU operations and was not generated at all.
-        82 => vec![0x80, 0xc0 | (((fields >> 24) as u8 & 7) << 3) | (rm & 3), imm8],
+        82 => vec![
+            0x80,
+            0xc0 | (((fields >> 24) as u8 & 7) << 3) | (rm & 3),
+            imm8,
+        ],
         // -- the accumulator-immediate forms --------------------------------
         //
         // A different *encoding* of operations the corpus already covers, and
@@ -2856,9 +2867,8 @@ pub fn synthesize64(form: u32, fields: u32) -> Vec<u8> {
     // operand here and **not** a 64-bit one: `REX.W` beats `66`, so every one
     // of these drops it. Legacy prefixes come before `REX` and `REX` is the
     // last prefix before the opcode (*Intel SDM* volume 2 §2.2.1).
-    let rr16 = |op: u8, r: u8, m: u8| {
-        vec![0x66, rex(false, r, m), op, 0xc0 | ((r & 7) << 3) | (m & 7)]
-    };
+    let rr16 =
+        |op: u8, r: u8, m: u8| vec![0x66, rex(false, r, m), op, 0xc0 | ((r & 7) << 3) | (m & 7)];
     let rmd16 = |op: u8, r: u8, b: u8, d: i8| {
         vec![
             0x66,
@@ -2868,9 +2878,7 @@ pub fn synthesize64(form: u32, fields: u32) -> Vec<u8> {
             d as u8,
         ]
     };
-    let grp16 = |op: u8, n: u8, m: u8| {
-        vec![0x66, rex(false, 0, m), op, 0xc0 | (n << 3) | (m & 7)]
-    };
+    let grp16 = |op: u8, n: u8, m: u8| vec![0x66, rex(false, 0, m), op, 0xc0 | (n << 3) | (m & 7)];
     // A byte register number over the whole eight **without** a `REX` prefix,
     // where four to seven are `AH`, `CH`, `DH` and `BH` — the top halves of
     // the first four registers rather than `SPL`..`DIL`.
@@ -3056,13 +3064,13 @@ pub fn synthesize64(form: u32, fields: u32) -> Vec<u8> {
         // sixty-four bits above it — the exact opposite of what the 32-bit
         // form beside it does. `REX` is present and `REX.W` is not, because
         // `REX.W` beats `66`.
-        62 => rr16(0x01, reg, rm), // add r/m16, r16
-        63 => rr16(0x03, reg, rm), // add r16, r/m16
-        64 => rr16(0x19, reg, rm), // sbb
-        65 => rr16(0x29, reg, rm), // sub
-        66 => rr16(0x31, reg, rm), // xor
-        67 => rr16(0x39, reg, rm), // cmp
-        68 => rr16(0x89, reg, rm), // mov r/m16, r16
+        62 => rr16(0x01, reg, rm),          // add r/m16, r16
+        63 => rr16(0x03, reg, rm),          // add r16, r/m16
+        64 => rr16(0x19, reg, rm),          // sbb
+        65 => rr16(0x29, reg, rm),          // sub
+        66 => rr16(0x31, reg, rm),          // xor
+        67 => rr16(0x39, reg, rm),          // cmp
+        68 => rr16(0x89, reg, rm),          // mov r/m16, r16
         69 => rmd16(0x8b, reg, base, disp), // mov r16, [base+d]
         70 => rmd16(0x89, reg, base, disp), // mov [base+d], r16
         71 => {
@@ -3223,9 +3231,9 @@ pub fn synthesize64(form: u32, fields: u32) -> Vec<u8> {
                 out.extend_from_slice(&imm32.to_le_bytes());
                 out
             }
-            1 => vec![0x6a, imm8],                // push imm8
-            2 => vec![0x48, 0x89, 0xe5, 0xc9],    // mov rbp, rsp ; leave
-            _ => vec![0xeb, rel as u8],           // jmp rel8
+            1 => vec![0x6a, imm8],             // push imm8
+            2 => vec![0x48, 0x89, 0xe5, 0xc9], // mov rbp, rsp ; leave
+            _ => vec![0xeb, rel as u8],        // jmp rel8
         },
         93 => {
             let mut out = vec![0xe8]; // call rel32
@@ -3660,8 +3668,8 @@ mod tests {
             for form in 0..forms {
                 let mut lifted = false;
                 'draws: for draw in 0..64u32 {
-                    let fields = draw.wrapping_mul(0x9e37_79b9).rotate_left(draw % 32)
-                        ^ (draw << 7);
+                    let fields =
+                        draw.wrapping_mul(0x9e37_79b9).rotate_left(draw % 32) ^ (draw << 7);
                     let bytes = if long {
                         synthesize64(form, fields)
                     } else {

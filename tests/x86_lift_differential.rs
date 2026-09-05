@@ -42,10 +42,10 @@
 
 #![cfg(all(feature = "cpu-x86-lift", feature = "jit"))]
 
+use rsemu::cpu::x86::Variant;
 use rsemu::cpu::x86::differential::{
     Case, Verdict, compare, compare_cached, measure_cached, synthesize, synthesize64,
 };
-use rsemu::cpu::x86::Variant;
 use rsemu::cpu::x86::lift::{Flags, Shape, Smc};
 
 /// A 64-bit linear congruential generator — Knuth's MMIX multiplier and
@@ -312,7 +312,10 @@ fn the_compatibility_mode_corpus_agrees_through_the_cached_and_chained_runtime()
         "only {agreed} of 400 cached compatibility-mode cases ran to completion ({trapped} \
          trapped, {nothing} lifted nothing)"
     );
-    assert!(trapped > 0, "no cached compatibility-mode case reached a fault");
+    assert!(
+        trapped > 0,
+        "no cached compatibility-mode case reached a fault"
+    );
 }
 
 #[test]
