@@ -139,6 +139,24 @@ pub static RISCV_VIRT: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/riscv-virt.machine"),
 };
 
+/// The same board with a second hart.
+///
+/// A separate entry rather than a parameter on [`RISCV_VIRT`] because the
+/// description language declares objects and cannot be told how many to make.
+/// The differences are a second `cpu.riscv`, `harts = 2` on the CLINT and the
+/// PLIC — both of which were per-hart from the first commit, because RISC-V
+/// gives every hart its own registers rather than banking one address — and
+/// four more wires. Secondaries come up through SBI HSM, not off a spin table
+/// (`docs/platforms/riscv-virt.md`).
+#[cfg(feature = "machine-riscv-virt")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-riscv-virt")))]
+pub static RISCV_VIRT_SMP: CatalogEntry = CatalogEntry {
+    name: "riscv-virt-smp",
+    summary: "RISC-V `virt` with two RV64GC harts, brought up through SBI HSM",
+    media: &["firmware", "flash0", "flash1", "initrd", "disk"],
+    source: include_str!("../../machines/riscv-virt-smp.machine"),
+};
+
 /// The Game Boy, when this build has an SM83 and the console's chips.
 ///
 /// Phase 4's genericity proof (`ROADMAP.md` §13): a machine that is not
@@ -741,6 +759,8 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&NES_PAL);
     #[cfg(feature = "machine-riscv-virt")]
     out.push(&RISCV_VIRT);
+    #[cfg(feature = "machine-riscv-virt")]
+    out.push(&RISCV_VIRT_SMP);
     #[cfg(feature = "machine-sms")]
     out.push(&SMS_NTSC);
     #[cfg(feature = "machine-sms")]
@@ -1839,23 +1859,25 @@ mod tests {
             // check needs no download and no toolchain. `dev::riscv::tests`
             // supplies the programs that actually do something.
             #[cfg(feature = "machine-riscv-virt")]
-            ("riscv-virt", "firmware") => &[0x73, 0x00, 0x50, 0x10, 0x6f, 0xf0, 0xdf, 0xff],
+            ("riscv-virt" | "riscv-virt-smp", "firmware") => {
+                &[0x73, 0x00, 0x50, 0x10, 0x6f, 0xf0, 0xdf, 0xff]
+            }
             // Both NOR banks come up erased when nothing is put in them, which
             // is a board with blank parts soldered on — the state a factory
             // ships and the state a UEFI build initialises for itself.
             #[cfg(feature = "machine-riscv-virt")]
-            ("riscv-virt", "flash0" | "flash1") => &[],
+            ("riscv-virt" | "riscv-virt-smp", "flash0" | "flash1") => &[],
             // No ramdisk, which is what a bare-metal or disk-rooted boot has.
             // The `initrd` loader writes nothing for an empty image and the
             // boot ROM leaves `/chosen` without the two `linux,initrd-*`
             // properties, so a machine with this slot unbound is the machine
             // that existed before the slot did.
             #[cfg(feature = "machine-riscv-virt")]
-            ("riscv-virt", "initrd") => &[],
+            ("riscv-virt" | "riscv-virt-smp", "initrd") => &[],
             // And no disk image, which leaves the `size` in the machine file
             // to supply a blank one — a board with an unwritten disk in it.
             #[cfg(feature = "machine-riscv-virt")]
-            ("riscv-virt", "disk") => &[],
+            ("riscv-virt" | "riscv-virt-smp", "disk") => &[],
             // The board's own demo: it configures the panel over SPI, paints a
             // gradient and enables the scanout engine. Assembled at compile
             // time by `dev::lcd::demo`, so it needs no toolchain either.

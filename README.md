@@ -156,6 +156,26 @@ generated device tree describes, and a variable written in one run is read back
 in the next. Where each stops is written down in
 `docs/platforms/riscv-virt.md` rather than rounded up.
 
+`riscv-virt-smp` is that board with a **second hart**, and the same kernel
+reports `smp: Brought up 1 node, 2 CPUs` on it and then **runs userspace on
+both** — `nproc` says 2, `/proc/interrupts` has a column per hart with the
+timer counted separately in each and interprocessor interrupts going both
+directions, and `/proc/stat` gives the second hart more system time than the
+first. It needed less than either of
+the other two multiprocessor boards, and for a reason that is architectural
+rather than lucky: a GICv2 *banks* its low interrupt ids and an x86 local APIC
+shares one page between processors, so both had to be taught to demultiplex on
+`MemAttrs::requester` — while RISC-V gives every hart its own **address** for
+`msip`, `mtimecmp` and its PLIC context. So the CLINT and the PLIC were already
+per-hart, the device tree generator already emitted a node per hart, and an
+**IPI is a store to a sibling's `msip` word** rather than a mechanism. The
+second hart is started through **SBI HSM** — the firmware's own hart state
+machine — rather than off a spin table this repository invents, which is what
+`arm64-virt-smp` has to do because PSCI `CPU_ON` is not implemented there. What
+it shares with both is the caveat: the exclusive monitor is still per core, so
+that boot is evidence about bring-up, interrupt delivery and IPIs and not about
+`lr`/`sc`.
+
 `arm64-virt` is the newest, and the first AArch64 board here. A
 Cortex-A53-class core, a **GICv2**, a **PL011**, a power controller for where
 `PSCI_SYSTEM_OFF` lands, and a **device tree generated from the realized

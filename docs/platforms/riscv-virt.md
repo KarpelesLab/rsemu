@@ -313,6 +313,277 @@ $ RSEMU_RISCV_FIRMWARE=$TD/fw_jump.bin \
   cargo test --release --all-features firmware_from_the --lib -- --nocapture
 ```
 
+## Two harts
+
+[`machines/riscv-virt-smp.machine`](../../machines/riscv-virt-smp.machine) is
+this board with a second hart. It is a **separate file** rather than a `param`
+on the first, for the reason `arm64-virt-smp` is separate from `arm64-virt`:
+the description language declares objects and cannot be told how many to make,
+so a one-hart run of a two-hart file would be a board with a spare hart parked
+in firmware. `riscv-virt` is unchanged, down to the byte in its device tree,
+and it is still the file `tests/riscv_virt_engines.rs` runs its three-engine
+equivalence gate on.
+
+### What had to change, and it was less than on the other two architectures
+
+**No device model changed** — not a line of `clint.rs`, `plic.rs`, `dt.rs` or
+`boot.rs`, and nothing in `src/cpu/riscv/` or `src/core/`. The diff under
+`src/` is a catalog entry, module documentation and tests. That is not modesty
+about the work; it is the architectural fact this board exists to demonstrate,
+and it is worth stating next to what the other two boards needed.
+
+`arm64-virt-smp` and `pc-at-smp` both had to teach a controller *who was
+asking*. A GICv2 banks its low 32 interrupt ids — one address, N registers
+(IHI 0048 §4.1.3) — and an x86 local APIC has one architectural page shared by
+every processor. Both are demultiplexed on `MemAttrs::requester`, resolved from
+the machine file's `processors = [...]` through `BindCtx::peer`.
+
+RISC-V has no such register. Both of its controllers are indexed by hart id in
+the *address*:
+
+| | where hart `h`'s copy lives | source |
+| --- | --- | --- |
+| software interrupt | `MSIP + 4·h` | ACLINT specification, MSWI register map |
+| timer comparator | `MTIMECMP + 8·h`, i.e. `0x4000 + 8·h` | ACLINT specification, MTIMER register map |
+| interrupt enables | `0x2000 + 0x80·c` for context `c` | PLIC specification §3 |
+| threshold and claim | `0x200000 + 0x1000·c` | PLIC specification §3 |
+
+A hart reaches its own registers because it knows its own `mhartid`, which the
+boot ROM has always put in `a0`. `mtime` is the one genuinely shared register,
+and it is shared on real hardware too. So `harts = 2` on the CLINT and on the
+PLIC is the entire model change, and both blocks were written that way in their
+first commit — `Clint::with_harts` allocates a comparator and an `msip` bit per
+hart, `Plic::build` allocates `harts × 2` contexts, and both refuse a snapshot
+whose hart count disagrees. There is **no `processors` property on this board
+and no `BindCtx::peer` call anywhere in it.**
+
+The device tree needed nothing either. [`dt.rs`](../../src/dev/riscv/dt.rs)
+takes the hart count from `riscv.boot` and already emitted one `cpu@N` node
+with its own `riscv,cpu-intc` phandle per hart, and one phandle-and-cause pair
+per hart in the CLINT's and the PLIC's `interrupts-extended` — causes 3 and 7
+for machine software and machine timer, 11 and 9 for machine and supervisor
+external (Privileged Architecture, the interrupt cause table).
+
+What the file does add is eight wires instead of four: `clint.mtip1`,
+`clint.msip1`, `plic.meip1` and `plic.seip1` into the second hart. And an
+**IPI needs no mechanism at all** — on this architecture an interprocessor
+interrupt *is* a store of 1 to a sibling's `msip` word, delivered as cause 3.
+`a_store_to_the_other_harts_msip_is_an_interprocessor_interrupt` in
+`src/dev/riscv/tests.rs` is that in twenty instructions: hart 0 writes
+`0x02000004`, hart 1 is in `wfi` and lands in `mtvec`.
+
+The CLINT's re-entrancy was already right, and this is where a board like this
+usually breaks. A CPU holds a `BUS`-ranked lock across the accesses it issues,
+so delivering an IPI — a device reaching *another hart* from inside a guest
+access — must not take a lock above it. `Registers::write` mutates `msip` under
+the state lock, releases it, and only then calls `drive_msip`, which takes the
+output pins at `LockRank::LEAF`. That contract is `CLAUDE.md`'s and it was
+being kept before there was a second hart to keep it for.
+
+### How the second hart starts: SBI HSM, not a spin table
+
+This is the one design decision the board file makes, and it is different from
+`arm64-virt-smp`'s.
+
+Both harts come out of reset at `0x1000` — that is what a reset vector is — and
+the boot ROM's five instructions send both of them to `0x80000000` with
+`mhartid` in `a0`. There is no parking loop in the ROM, because on this
+architecture the firmware already provides one. OpenSBI picks one hart to
+initialise the platform on — its own banner names it, `Boot HART ID : 0` —
+and holds the others until something asks the **Hart State Management**
+extension to start them: `sbi_hart_start(hartid, start_addr, opaque)`, SBI
+specification v2.0 §9. Linux's `smp: Bringing up secondary CPUs` is that call.
+
+What the board has to supply for it is exactly what the CLINT already supplied,
+because **HSM's wake-up is an IPI**: a hart waiting to be started is woken by a
+write to its own `msip` word. So the interprocessor path above is on the
+bring-up path and not only on the reschedule one, and `IPI1: 4620 2007` in the
+`/proc/interrupts` further down is the same wire doing the ordinary job
+afterwards.
+
+The alternative was a boot ROM that parks secondaries by hart id, the way
+`arm.boot`'s reset vector parks everything but affinity 0 on a release table.
+It was rejected for two reasons. This board's documented boot chain **is**
+OpenSBI, so SBI HSM is present in every guest anybody boots on it, and a kernel
+would use it in preference to anything else on offer. And a parking loop would
+be a second, rsemu-specific bring-up protocol invented here rather than read
+out of a specification — exactly the sort of thing the AArch64 board had to
+resort to only because PSCI `CPU_ON` needs a route to a *sibling* core that
+`cpu.arm.a64` has not got. `cpu.riscv` needs no such route: hart 0 starts hart 1
+by writing a register through the ordinary address space, which is what the
+hardware does.
+
+Nothing in `riscv.boot` therefore grew a `secondary` property, and nothing in
+`src/cpu/riscv/` was asked for.
+
+### The exclusive monitor is per hart, and Linux's spinlocks are built on it
+
+**Read this before quoting the boot below as evidence that anything atomic
+works.** `cpu::riscv`'s `reservation` is private per-hart state in
+`src/cpu/riscv/exec.rs`: it is broken by *this* hart's stores, its AMOs and its
+traps, and by nothing a sibling does. So an `sc.d` the architecture requires to
+fail can succeed, and the sibling's update is lost. It is the identical defect
+`docs/platforms/arm64-virt.md` records for `arm64-virt-smp`, from the same
+cause — `MemAttrs::exclusive` carries the flag to the leaf and nothing reads it
+back, because the **global monitor on the address space** that would is not
+built.
+
+Why this board still boots to a shell: a kernel's spinlocks are uncontended
+almost always, and two harts rarely reach the same lock inside one scheduler
+quantum. That is luck about timing rather than a property of the model. Linux
+on RISC-V also gets some of it for free — LLVM emits a single `amoadd.d` for an
+atomic add where AArch64 needs an `ldxr`/`stxr` pair, and an AMO here is one
+instruction that reads and writes without yielding, so it is atomic by
+construction under a scheduler that runs one hart at a time. `cmpxchg` is
+`lr`/`sc` and is not.
+
+So: treat the boot below as evidence that bring-up, per-hart timer and external
+interrupt delivery, and IPIs work. It is not evidence about `lr`/`sc`.
+
+### What a kernel does with it
+
+Debian's `riscv64` kernel — the same image as the single-hart gate, behind the
+same OpenSBI `fw_jump.bin` — on `riscv-virt-smp`:
+
+```console
+$ export TD=testdata/riscv
+$ RSEMU_RISCV_MACHINE=riscv-virt-smp \
+  RSEMU_RISCV_FIRMWARE=$TD/fw_jump.bin \
+  RSEMU_RISCV_PAYLOAD=0x80200000:$TD/linux \
+  RSEMU_RISCV_INITRD=$TD/initramfs.cpio \
+  RSEMU_RISCV_BOOTARGS='console=ttyS0 earlycon=sbi' \
+  RSEMU_RISCV_RAM=512M RSEMU_RISCV_QUANTA=8000000 \
+  RSEMU_RISCV_INPUT='rsemu# =>cat /proc/interrupts; nproc; head -3 /proc/stat\n' \
+  RSEMU_RISCV_STOP_AT='cpu1 ' \
+  cargo test --release --all-features firmware_from_the --lib -- --nocapture
+```
+
+`RSEMU_RISCV_MACHINE` is the only difference from the single-hart invocation,
+which is the point: same firmware, same kernel, same ramdisk, same script.
+
+OpenSBI sizes the board off the generated tree and finds both harts (its own
+banner, with the lines this section is about kept and the rest elided):
+
+```text
+Platform Name               : rsemu riscv-virt-smp
+Platform HART Count         : 2
+Platform IPI Device         : aclint-mswi
+Platform Timer Device       : aclint-mtimer @ 10000000Hz
+Platform HSM Device         : ---
+…
+Standard SBI Extensions     : ipi,pmu,srst,hsm,rfnc,time,base,legacy,dbcn
+…
+Domain0 Boot HART           : 0
+Domain0 HARTs               : 0*,1*
+```
+
+`Platform HSM Device : ---` is not a gap. That line reports a platform-specific
+hart power controller; OpenSBI's *generic* HSM implementation — the one that
+parks a hart until `sbi_hart_start` arrives and wakes it with an IPI — needs no
+device behind it, and `hsm` is in the extension list below it. `0*,1*` is the
+domain saying both harts are assigned to it and both may boot.
+
+And the kernel:
+
+```text
+[    0.000000] Machine model: rsemu riscv-virt-smp
+[    4.379000] smp: Bringing up secondary CPUs ...
+[    4.481000] smp: Brought up 1 node, 2 CPUs
+[    6.786000] cpu1: Ratio of byte access time to unaligned word access is 4.00, unaligned accesses are fast
+[    6.817998] cpu0: Ratio of byte access time to unaligned word access is 1.99, unaligned accesses are fast
+```
+
+The last two lines are what makes this evidence rather than a claim about a
+device tree. The unaligned-access probe runs **on each hart**, times a copy
+loop there, and prints from that hart — so `cpu1:` is a line hart 1 printed
+about work hart 1 did. The two ratios differ because the harts measured at
+different points in the same virtual timeline, which is what a real pair of
+cores does too.
+
+One more line says the same thing from the other direction, and it is a
+complaint rather than a status report:
+
+```text
+[   57.142009] rcu: INFO: rcu_sched self-detected stall on CPU
+[   57.145000] rcu: 	1-....: (5249 ticks this GP) …
+[   57.147000] rcu: 	(t=5250 jiffies g=-1131 q=2 ncpus=2)
+[   57.150000] CPU: 1 UID: 0 PID: 1 Comm: swapper/0 Not tainted …
+[   57.152000] epc : keccakf_round+0x352/0x4f8
+[   57.154000]  ra : crypto_sha3_final+0xf2/0x1c0
+```
+
+`ncpus=2`, and PID 1 — the kernel's own init thread — is running on **hart 1**
+when it stalls. This is the same artifact the single-hart boot has and the same
+cause: virtual time here is derived from bus accesses, a crypto self-test makes
+a great many of them, and the kernel decides 5250 jiffies went by without a
+grace period. It is not an SMP defect; what is new is only that the scheduler
+put the thread on the second hart, which nothing but a running second hart can
+do. The kernel warns and carries on to a shell.
+
+And it runs userspace on both. Typed at the busybox prompt, three minutes of
+host time into the run:
+
+```text
+rsemu# cat /proc/interrupts; nproc; head -3 /proc/stat
+           CPU0       CPU1
+ 10:      53635      58007  RISC-V INTC   5 Edge      riscv-timer
+ 12:         64          0  SiFive PLIC  10 Edge      ttyS0
+IPI0:        64         67  Rescheduling interrupts
+IPI1:      4620       2007  Function call interrupts
+IPI2:         0          0  CPU stop interrupts
+…
+2
+cpu  38 0 18424 7173 0 0 38 0 0 0
+cpu0 25 0 6883 5036 0 0 19 0 0 0
+cpu1 13 0 11540 2136 0 0 19 0 0 0
+```
+
+Five separate claims, each checked by a different column:
+
+* **`nproc` → 2.** Userspace agrees with the kernel.
+* **The timer row is per hart** — 53 635 against 58 007. That is `riscv-timer`
+  on `RISC-V INTC 5`, the *supervisor* timer, which arrives because OpenSBI
+  answers `sbi_set_timer` by programming that hart's own `mtimecmp` in the
+  CLINT and the CLINT drives that hart's own `mtip` wire. Two harts, two
+  comparators, two wires, two counts.
+* **The IPI rows are non-zero in both directions.** 64/67 rescheduling and
+  4620/2007 function-call interrupts are `msip` writes each hart made to the
+  other's word, and each one is a device driving a wire into a sibling hart
+  from inside a guest store — the re-entrancy case the CLINT's lock discipline
+  exists for.
+* **`ttyS0` counts 64 on CPU0 and 0 on CPU1**, which is the PLIC doing the
+  opposite thing correctly: an external interrupt is offered to the contexts
+  that enabled it, and Linux enabled it on one.
+* **`/proc/stat`'s `cpu1` line has 11 540 jiffies of system time and only
+  2 136 idle** — more system time than `cpu0`. The second hart is not parked
+  after bring-up; it is where most of the kernel work went.
+
+178 seconds of host time from reset to that output, under the interpreter, in
+a release build — on a machine running six other builds at the time, so read it
+as an order of magnitude and not as a measurement. This page's own rule about
+interleaving a sweep applies: the 143 s the single-hart boot quotes above was
+taken in a different sitting and the two are **not** a before-and-after.
+
+### What the hermetic tests cover
+
+Five of them, in `src/dev/riscv/tests.rs`, none of which needs a download:
+
+* `both_harts_run_and_each_one_knows_which_it_is` — one image, both harts
+  enter it, `bne a0, x0` sends them to different halves, and hart 0 cannot
+  reach its `poweroff` unless hart 1 wrote the handshake word.
+* `the_single_hart_board_runs_only_hart_zero` — the control. The same program
+  on `riscv-virt` never finishes, which is what says the two board files are
+  genuinely different rather than both being SMP.
+* `a_store_to_the_other_harts_msip_is_an_interprocessor_interrupt` — hart 1
+  sets `mtvec`, enables `mie.MSIE` and `mstatus.MIE` and waits in `wfi`; hart 0
+  stores 1 to `0x02000004`; hart 1 lands in its handler, clears the word (the
+  only way `msip` clears — there is no acknowledge bit) and answers.
+* `a_two_hart_machine_snapshots_and_restores_to_the_same_state_hash` — two
+  comparators, two `msip` bits, four PLIC contexts and two harts' register
+  files, out and back.
+* `the_generated_tree_describes_both_harts` — `cpu@0`, `cpu@1`, and eight cells
+  of `interrupts-extended` on each of the CLINT and the PLIC.
+
 ## How far each guest gets
 
 Written down rather than rounded up, because a precisely located stopping point
