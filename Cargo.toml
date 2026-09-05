@@ -160,10 +160,10 @@ display-png = ["std", "dep:oxideav-png"]
 # bare boards — z80-mini (+4 578 bytes), mips-mini (+60 648), m68k-mini
 # (+77 182), a64-mini (+165 692), arm926, stm32f407 — want a firmware image and
 # have neither a console nor a screen without one; z80-mini is nearly free and
-# still not worth a catalog row that cannot do anything. `riscv-virt` (+262 243)
+# still not worth a catalog row that cannot do anything. `riscv-virt` (+261 029)
 # wants a kernel or an SBI build — it is no longer "the largest thing this list
 # could add", `pc-at` is, by more than three times. `pc64` (+523 702) and
-# `q35-linux` do reach a shell prompt on an uploaded `bzImage`, but only after
+# `q35-linux` (+280 443) do reach a shell prompt on an uploaded `bzImage`, but only after
 # several hundred *guest* seconds (docs/platforms/pc64.md), and only on a
 # stock kernel the visitor has to find. A second media slot is no longer the
 # obstacle there — `rsemu_stage_media` binds one, for 6 142 bytes of module —
@@ -171,11 +171,19 @@ display-png = ["std", "dep:oxideav-png"]
 # second POST screen, and its `bios` slot does not in fact default to rsemu's
 # image the way this file used to claim — neither `builtin_bios` in
 # src/bin/rsemu.rs nor `builtin_media` in src/ffi/abi.rs has a q35 arm.
-# `arm64-virt` (+362 417) wants a Debian arm64 `Image` *and* an initramfs and
-# takes three minutes of native host time to reach busybox interpreted, which a
-# browser cannot better; `q35-uefi` (+222 399) wants an OVMF copied off the
-# visitor's own distribution and has no display and no serial output at all, so
-# it would be a black rectangle. The storage and USB boards (nvme-mini
+#
+# Two rows were re-measured against the current 3 089 306-byte module because
+# the boards behind them moved, and neither answer changed. `arm64-virt` went
+# *up*, to +429 956: it now mounts an ext4 root off a virtio disk, which makes
+# the file a visitor must find bigger rather than smaller, it still wants a
+# Debian arm64 `Image` beside it, and it still takes three minutes of *native*
+# host time to reach busybox interpreted. `q35-uefi` (+223 660) is the one whose
+# *reason* changed: it is no longer a black rectangle — it reaches an
+# interactive `UEFI Interactive Shell v2.2` on the 16550 at 0x3f8, which is a
+# console this page can already draw. What still rules it out is an OVMF build
+# the visitor has to find on their own distribution, and 367.2 seconds of guest
+# time before that prompt — minutes of native host time interpreted, and worse
+# in a browser. The storage and USB boards (nvme-mini
 # +358 717, xhci-pci-mini +466 147, ahci-mini, usb-mini, hub-mini, xhci-mini)
 # want a disk image *and* a firmware and have nothing to look at either way.
 demo = [

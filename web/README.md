@@ -155,11 +155,12 @@ page says so — the picker puts the two quadrants in their own `<optgroup>`s,
 `check.mjs` proves the path anyway by generating a cartridge of its own for
 each of them.
 
-The module is **3.08 MB** (≈782 KB over the wire, gzipped). The Game Boy and
-the Master System cost **406 KB** of that between them — two CPU cores (SM83
-and Z80) and two video chips, which is most of a console each; measured as
-1 416 362 bytes before and 1 822 234 after, both `--release` and unstripped.
-`pc-at` costs three times that again, and the next two sections are why.
+The module is **3 089 306 bytes** (785 259 gzipped, so ≈767 KiB over the wire).
+The Game Boy and the Master System cost **406 KB** of that between them — two
+CPU cores (SM83 and Z80) and two video chips, which is most of a console each;
+measured as 1 416 362 bytes before and 1 822 234 after, both `--release` and
+unstripped. `pc-at` costs three times that again, and the next two sections are
+why.
 
 ### `pc-at`, and what it costs
 
@@ -207,22 +208,37 @@ it. It works; it is just not a 200 KB NES state.
 ### What is deliberately not here
 
 Measured the same way, each on top of the same baseline, `--release` and
-unstripped. (That baseline was 1 841 847 rather than the 1 844 822 above:
-these were taken before `src/wasm.rs` grew the two-armed `Builtin` and the
-empty-bay list, 2 975 bytes between them. Nothing here turns on that.)
+unstripped. (The bare-board rows' baseline was 1 841 847 rather than the
+1 844 822 above: these were taken before `src/wasm.rs` grew the two-armed
+`Builtin` and the empty-bay list, 2 975 bytes between them. Nothing here turns
+on that.)
+
+**Four rows were re-measured this round** against the current 3 089 306-byte
+`demo` module, because the boards behind them changed: `arm64-virt` now mounts
+an ext4 root off a virtio disk, `q35-uefi` now reaches an interactive shell, and
+the RISC-V and x86 cores both grew IR frontends. The answer did not change and
+one of the numbers moved the wrong way — **`arm64-virt` got 19% more
+expensive**, not less.
+
+| Re-measured | Then | Now | Δ |
+| --- | --- | --- | --- |
+| `arm64-virt` | +362 417 | **+429 956** (3 519 262; +115 741 gzipped) | worse |
+| `q35-uefi` | +222 399 | **+223 660** (3 312 966; +59 785 gzipped) | flat |
+| `q35-linux` | +285 751 | **+280 443** (3 369 749; +72 529 gzipped) | flat |
+| `riscv-virt` | +262 243 | **+261 029** (3 350 335; +67 890 gzipped) | flat |
 
 | Not added | Cost | Why not |
 | --- | --- | --- |
-| `riscv-virt` | +262 243 | wants a kernel or an SBI build, and rsemu ships neither |
+| `riscv-virt` | +261 029 | wants a kernel or an SBI build, and rsemu ships neither |
 | `a64-mini` | +165 692 | wants a firmware image, and has neither a screen nor a console without one |
 | `m68k-mini` | +77 182 | same |
 | `mips-mini` | +60 648 | same |
 | `z80-mini` | +4 578 | same — and being nearly free is not a reason for a catalog row that cannot do anything |
 | `arm926`, `stm32f407` | — | same |
 | `q35` | +190 802 *on top of `pc-at`* | a second POST screen. Its `bios` slot does **not** in fact default to rsemu's image, whatever `Cargo.toml` used to say: neither `builtin_bios` in `src/bin/rsemu.rs` nor `builtin_media` in `src/ffi/abi.rs` has a `q35` arm |
-| `pc64`, `q35-linux` | +523 702 together, +285 751 for `q35-linux` alone | they do reach a shell prompt on an uploaded `bzImage` — after several hundred *guest* seconds (`docs/platforms/pc64.md`), and on a stock kernel the visitor would have to find. The second media slot is no longer the obstacle (see below); the wall clock is |
-| `arm64-virt` | +362 417 | measured against the current baseline. Wants a Debian arm64 `Image` **and** an initramfs, neither of which rsemu ships; three minutes of *native* host time to reach busybox interpreted (`docs/platforms/arm64-virt.md`), and a browser is slower than that |
-| `q35-uefi` | +222 399 | measured against the current baseline. Wants an OVMF build copied off the visitor's own distribution, and the board **has no display and emits no serial output at all** — it would be a black rectangle that stops in the DXE dispatcher (`docs/platforms/q35-uefi.md`) |
+| `pc64`, `q35-linux` | +523 702 together, +280 443 for `q35-linux` alone | they do reach a shell prompt on an uploaded `bzImage` — after several hundred *guest* seconds (`docs/platforms/pc64.md`), and on a stock kernel the visitor would have to find. The second media slot is no longer the obstacle (see below); the wall clock is |
+| `arm64-virt` | **+429 956** | re-measured, and it went *up* — the A64 core gained an IR frontend since. Wants a Debian arm64 `Image` **and** either an initramfs or an ext4 root image, none of which rsemu ships; three minutes of *native* host time to reach busybox interpreted (`docs/platforms/arm64-virt.md`), and a browser is slower than that. The ext4 root it can now mount makes the file the visitor has to find *bigger*, not smaller |
+| `q35-uefi` | **+223 660** | re-measured, and this row's reason changed even though its answer did not. It is no longer a black rectangle: the board reaches an interactive `UEFI Interactive Shell v2.2` over the 16550 at `0x3f8`, and a `demo,machine-q35-uefi` module puts it in the catalog with `media=[flash0,flash1]` and no built-in image, so `rsemu_stage_media` has both banks to fill. What still rules it out is the *other* half — an OVMF build the visitor has to go and find on their own distribution (`.nes` files are easy; `OVMF_CODE.fd` is not), and **367.2 seconds of guest time** to that prompt, which is a couple of minutes of *native* host time interpreted and worse in a browser. Ship a board whose first output is minutes away and the honest label for it is "hung". Whether `rsemu_has_console` would answer `1` for it was **not** measured, because measuring it needs the OVMF this repository cannot ship — which is the point (`docs/platforms/q35-uefi.md`) |
 | `nvme-mini` | +358 717 | wants a disk image, and has neither a screen nor a console to show you it read it |
 | `xhci-pci-mini` | +466 147 | has no processor at all: it would realize, run, and be a black rectangle |
 | `ahci-mini`, `usb-mini`, `hub-mini`, `xhci-mini` | — | a firmware *and* a disk image, and nothing to look at either way |
@@ -260,6 +276,20 @@ now built**, and neither was a board:
 * **A built-in demonstration program for one of the bare boards**, the way
   `spi-panel` has one. `z80-mini` is 4.5 KB of module away from being on this
   page; what it lacks is thirty bytes of Z80 to run. Still true, still not done.
+
+**And a fourth thing, which the round after those two nearly supplied and did
+not.** `q35-uefi` now reaches a `Shell>` on a real 16550, so for the first time
+a board other than a monitor or a PC/AT has *something to show a visitor*, and a
+`demo,machine-q35-uefi` build does list it with both flash banks as media slots
+for `rsemu_stage_media` to fill. It is still not on this
+page, and the reason is worth stating because it is not the one this file gave
+before: the missing half is not the mechanism, it is the **image and the clock**
+— an OVMF build off the visitor's own distribution, and 367.2 seconds of guest
+time before the prompt appears. The rule this list has always applied is *a
+visitor must be able to press something*, and a board that needs a file most
+people do not have plus minutes of waiting fails it twice. If rsemu ever grows
+its own small UEFI the way it grew its own BIOS, this row is the first one to
+re-open.
 
 **The two together cost 6 142 bytes** — 3 072 043 before and 3 078 185 after,
 `--release` and unstripped; 2 122 more gzipped. That is 0.2% of the module for
