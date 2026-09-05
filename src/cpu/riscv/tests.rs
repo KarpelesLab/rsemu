@@ -525,6 +525,234 @@ fn an_intervening_store_breaks_the_reservation() {
     assert_eq!(h.hart.x(13), 1);
 }
 
+/// Two harts, one address space, one word — the reason the reservation cannot
+/// live inside a hart.
+///
+/// Volume I: an `SC` succeeds "only if no other harts or devices have written
+/// to the reservation set between the `LR` and the `SC`". While each hart kept
+/// its reservation privately, a sibling's store did not break it and this
+/// `sc.d` returned 0 — writing over an update the other hart had already made.
+/// `machines/riscv-virt` runs two harts; so does every `usermode` process with
+/// two threads.
+#[test]
+fn a_sibling_harts_store_breaks_this_harts_reservation() {
+    let mut cfg = Config::rv64i();
+    cfg.ext.a = true;
+    /// The contended word, well clear of either program.
+    const WORD: u64 = BASE + 0x400;
+    /// Where the second hart's one instruction lives.
+    const SIBLING: u64 = BASE + 0x100;
+
+    let ram = Arc::new(RamStore::new(RAM_SIZE));
+    let put = |at: u64, program: &[u32]| {
+        for (n, word) in program.iter().enumerate() {
+            for (k, byte) in word.to_le_bytes().iter().enumerate() {
+                ram.write_u8(at - BASE + n as u64 * 4 + k as u64, *byte)
+                    .unwrap();
+            }
+        }
+    };
+    // Hart 0 reserves, waits while hart 1 runs, then tries to store.
+    put(
+        BASE,
+        &[
+            lui(11, BASE as u32),
+            addi(11, 11, 0x400),
+            amo(0b00010, 3, 10, 11, 0), // lr.d a0, (a1)
+            addi(12, 0, 99),
+            amo(0b00011, 3, 13, 11, 12), // sc.d a3, a2, (a1)
+        ],
+    );
+    // Hart 1 writes the same word, and nothing else.
+    put(
+        SIBLING,
+        &[
+            lui(11, BASE as u32),
+            addi(11, 11, 0x400),
+            addi(12, 0, 7),
+            s(0x23, 3, 11, 12, 0), // sd a2, 0(a1)
+        ],
+    );
+
+    let space = Arc::new(AddressSpace::new("mem", 64));
+    space
+        .topology()
+        .map(Region::ram("ram", Arc::clone(&ram)), BASE)
+        .unwrap();
+    let a = Hart::new(cfg.with_reset_vector(BASE));
+    let b = Hart::new(cfg.with_reset_vector(SIBLING));
+    a.attach_space(Arc::clone(&space));
+    b.attach_space(Arc::clone(&space));
+
+    // Interleaved the way a scheduler would: the reservation is taken, the
+    // quantum ends, the sibling runs to completion, and only then does the
+    // store-conditional get its turn.
+    for _ in 0..3 {
+        a.step();
+    }
+    for _ in 0..4 {
+        b.step();
+    }
+    for _ in 0..2 {
+        a.step();
+    }
+
+    assert_eq!(
+        a.x(13),
+        1,
+        "the store-conditional must fail: hart 1 wrote the reservation set"
+    );
+    assert_eq!(
+        read_u64(&ram, WORD),
+        7,
+        "and hart 1's value must still be there"
+    );
+}
+
+/// The reservation set is the naturally aligned **word**, not the cache line
+/// it happens to sit on.
+///
+/// Volume I lets an implementation make the set larger, and the eventuality
+/// guarantee is what that costs: a set the size of a line fails a constrained
+/// LR/SC sequence every time unrelated traffic touches the line. So a sibling's
+/// store to the *next* word must leave this reservation standing.
+#[test]
+fn a_sibling_store_to_the_next_word_leaves_the_reservation_alone() {
+    let mut cfg = Config::rv64i();
+    cfg.ext.a = true;
+    let program = [
+        lui(11, BASE as u32),
+        addi(11, 11, 0x400),
+        amo(0b00010, 3, 10, 11, 0), // lr.d a0, (a1)
+        addi(12, 0, 99),
+        amo(0b00011, 3, 13, 11, 12), // sc.d a3, a2, (a1)
+    ];
+    let h = Harness::with(cfg, &program);
+    h.steps(3);
+    // A second master on the same bus writes the doubleword above the
+    // reservation — the neighbour, not the word itself.
+    let space = h.hart.space().expect("attached");
+    space
+        .write(
+            BASE + 0x408,
+            crate::core::value::Width::U64,
+            0x1234,
+            crate::core::space::MemAttrs::DEFAULT,
+        )
+        .expect("the write lands");
+    h.steps(2);
+    assert_eq!(
+        h.hart.x(13),
+        0,
+        "the store was outside the reservation set, so the sc.d must succeed"
+    );
+}
+
+/// A trap gives up **both** halves of the reservation.
+///
+/// The local half is what an `SC` compares and the global half is what a
+/// sibling's store clears; leaving the global one standing is not visible to
+/// the guest, because the local half already fails the `SC` — but it leaves a
+/// slot live in the space's table, which every store in the machine then walks
+/// past. The two halves are one piece of state and they are dropped together.
+#[test]
+fn a_trap_drops_the_global_half_of_the_reservation_too() {
+    let mut cfg = Config::rv64i();
+    cfg.ext.a = true;
+    let program = [
+        lui(11, BASE as u32),
+        addi(11, 11, 0x400),
+        amo(0b00010, 3, 10, 11, 0), // lr.d a0, (a1)
+        ECALL,
+    ];
+    let h = Harness::with(cfg, &program);
+    h.steps(3);
+    let space = h.hart.space().expect("attached");
+    assert_eq!(
+        space.monitor().outstanding(),
+        1,
+        "the lr.d published its reservation"
+    );
+    h.steps(1);
+    assert_eq!(
+        space.monitor().outstanding(),
+        0,
+        "and the trap took it back"
+    );
+}
+
+/// The global monitor is keyed on the **physical** address, which is the only
+/// key two harts with different page tables can collide on.
+#[test]
+fn the_reservation_is_watched_by_physical_address() {
+    // Entry 0 identity-maps the first gigabyte so the code keeps running;
+    // entry 1 walks three levels to a page at BASE+0x4000. The hart therefore
+    // reserves virtual 0x4000_1000, whose physical address is BASE+0x4000 —
+    // two numbers that are nothing like each other.
+    let h = Harness::rv64gc(&[]);
+    let v = super::mmu::pte::V;
+    let x = super::mmu::pte::X;
+    let rw = super::mmu::pte::R | super::mmu::pte::W;
+    let ad = super::mmu::pte::A | super::mmu::pte::D;
+    let root = BASE + 0x1000;
+    h.put_u64(root, v | rw | x | ad);
+    h.put_u64(root + 8, (((BASE + 0x2000) >> 12) << 10) | v);
+    h.put_u64(BASE + 0x2000, (((BASE + 0x3000) >> 12) << 10) | v);
+    h.put_u64(
+        BASE + 0x3000 + 8,
+        (((BASE + 0x4000) >> 12) << 10) | v | rw | ad,
+    );
+
+    // lr.d a0, (a1) then sc.d a3, a2, (a1), with a1 = 0x4000_1000.
+    h.ram
+        .write_at(0, &amo(0b00010, 3, 10, 11, 0).to_le_bytes())
+        .unwrap();
+    h.ram
+        .write_at(4, &amo(0b00011, 3, 13, 11, 12).to_le_bytes())
+        .unwrap();
+    h.hart.set_x(11, 0x4000_1000);
+    h.hart.set_x(12, 99);
+    h.hart.set_pc(BASE);
+    let mut csrs = h.hart.csrs();
+    csrs.satp = (8 << 60) | (root >> 12);
+    csrs.priv_mode = Priv::Supervisor;
+    h.hart.set_csrs(csrs);
+
+    h.steps(1); // the lr.d takes the reservation
+    // Another master writes the same *physical* doubleword, naming it the way
+    // it sees it. A monitor keyed on the virtual address would not notice.
+    let space = h.hart.space().expect("attached");
+    space
+        .write(
+            BASE + 0x4000,
+            crate::core::value::Width::U64,
+            7,
+            crate::core::space::MemAttrs::DEFAULT,
+        )
+        .expect("the write lands");
+    h.steps(1);
+    assert_eq!(
+        h.hart.x(13),
+        1,
+        "the sc.d must fail: the physical word it reserved was written"
+    );
+    assert_eq!(
+        h.get_u64(BASE + 0x4000),
+        7,
+        "and the other master's value stands"
+    );
+}
+
+/// Read a 64-bit value out of a `RamStore` at a guest address in [`BASE`]'s
+/// region — [`Harness::get_u64`] for a test that builds its own memory.
+fn read_u64(ram: &RamStore, addr: u64) -> u64 {
+    let mut v = 0u64;
+    for k in 0..8 {
+        v |= u64::from(ram.read_u8(addr - BASE + k).unwrap()) << (8 * k);
+    }
+    v
+}
+
 #[test]
 fn the_amo_family_returns_the_old_value_and_stores_the_new_one() {
     let mut cfg = Config::rv64i();

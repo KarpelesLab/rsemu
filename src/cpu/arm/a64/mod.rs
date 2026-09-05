@@ -256,7 +256,7 @@ use crate::core::exec::{Exit, ExitMask, ExitingCore, Run};
 use crate::core::props::{Props, ValueKind};
 use crate::core::registry::Registry;
 use crate::core::sched::{Budget, Consumed, ExitFlag, TickCursor};
-use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
+use crate::core::space::{AddressSpace, MemAttrs, MonitorSlot, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{self, AtomicBool, AtomicU32, AtomicU64, LockRank, Ordering};
 use crate::core::value::Width;
@@ -266,6 +266,17 @@ use exec::{Exec, State};
 use isa::Features;
 use mmu::Tlb;
 use sysreg::{El, SysRegs};
+
+/// The exclusive reservation granule, as a shift: sixteen bytes.
+///
+/// DDI 0487 leaves the size `IMPLEMENTATION DEFINED` between 8 and 2048 bytes
+/// and reports it in `CTR_EL0.ERG`. Sixteen is the smallest value that works
+/// here, because the 64-bit exclusive **pair** (`LDXP`/`STXP`) is a single
+/// 16-byte access aligned to its total size, and a reservation has to cover
+/// the whole of it. Larger would be legal and would cost forward progress:
+/// unrelated traffic in the same granule fails a `STXR` that had no reason to
+/// fail.
+const RESERVATION_SHIFT: u32 = 4;
 
 /// The names a disassembler, gdb and the monitor print for the 31 general
 /// registers.
@@ -765,6 +776,16 @@ struct Session {
     /// generation counter (`ROADMAP.md` §4.5).
     tlb: Tlb,
     space: Option<Arc<AddressSpace>>,
+    /// This core's registration in `space`'s global exclusive monitor — DDI
+    /// 0487 B2.9's *global* monitor, the one `State::exclusive` is not.
+    ///
+    /// Derived state, like the TLB beside it: the architectural reservation is
+    /// `State::exclusive`, and this is the shared broadcast of it that lets
+    /// another observer's store clear it. Held here rather than in `state`
+    /// because it belongs to the *space*, and because a reset replaces `state`
+    /// while leaving the core plugged into the same memory. `None` if the
+    /// space had no free slot, which leaves the reservation core-local.
+    monitor: Option<MonitorSlot>,
     /// The translation state, built on first use because §4.4 says `new`
     /// performs no outward action — and a 256 MiB code buffer is an outward
     /// action.
@@ -845,6 +866,7 @@ impl Cpu {
                     state: State::new(&cfg),
                     tlb: Tlb::new(),
                     space: None,
+                    monitor: None,
                     #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
                     jit: None,
                 },
@@ -977,7 +999,12 @@ impl Cpu {
 
     /// Give the core the address space it executes from.
     pub fn attach_space(&self, space: Arc<AddressSpace>) {
-        self.session.lock().space = Some(space);
+        let mut session = self.session.lock();
+        // The old registration goes back to the old space as this is replaced;
+        // a reservation held over a change of address space is meaningless
+        // anyway.
+        session.monitor = MonitorSlot::new(Arc::clone(&space), RESERVATION_SHIFT);
+        session.space = Some(space);
     }
 
     /// The address space this core executes from, if one is attached.
@@ -1157,13 +1184,22 @@ impl Cpu {
                 state,
                 tlb,
                 space,
+                monitor,
                 #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
                     jit: _jit,
             } = &mut *session;
             let Some(space) = space.clone() else {
                 return (0, None);
             };
-            let mut exec = Exec::new(state, tlb, &space, &cfg, &self.lines, exits);
+            let mut exec = Exec::new(
+                state,
+                tlb,
+                &space,
+                &cfg,
+                &self.lines,
+                exits,
+                monitor.as_ref(),
+            );
             let used = exec.step();
             // What one interpreted instruction wrote, handed to the block
             // cache. A core whose blocks were invalidated only by `advance`
@@ -1267,13 +1303,24 @@ impl Cpu {
                 state,
                 tlb,
                 space,
+                monitor,
                 jit,
             } = &mut *session;
             let Some(space) = space.clone() else {
                 return (0, None);
             };
             let jit = jit.as_mut().expect("just installed");
-            let out = engine::advance(jit, state, tlb, &space, &cfg, &self.lines, exits, remaining);
+            let out = engine::advance(
+                jit,
+                state,
+                tlb,
+                &space,
+                &cfg,
+                &self.lines,
+                exits,
+                monitor.as_ref(),
+                remaining,
+            );
             // Everything outward happens **here**, with the execution lock
             // released — the same rule `step_to_exit` follows and for the same
             // reason (CLAUDE.md, the re-entrancy contract).
