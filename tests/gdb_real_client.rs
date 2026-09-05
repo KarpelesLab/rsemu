@@ -12,19 +12,23 @@
 //! `ROADMAP.md` §1 permits in as many words. Nothing here reads GDB's source;
 //! the protocol comes from the GDB manual's "Remote Protocol" appendix.
 //!
-//! # Two guests
+//! # Three guests
 //!
-//! There is an **x86** session and an **AArch64** one, and they are not the
-//! same test twice. The x86 guest is the one a stock `gdb` on an x86-64
-//! developer machine will talk to, so it is the session that actually runs in
-//! most places. The AArch64 guest is `arm64-virt`'s core, and it is the one
-//! where the target description is *accepted* rather than rejected — see
-//! below. Whichever `gdb` is to hand, at least one of them says something.
+//! There is a **16-bit x86** session, an **x86-64** one and an **AArch64** one,
+//! and they are not the same test three times. The two x86 guests are the ones
+//! a stock `gdb` on an x86-64 developer machine will talk to, so they are the
+//! sessions that actually run in most places, and they exercise `cpu.x86`'s
+//! *two* register views: the same class is an 8088 on one board and an x86-64
+//! part on another, and which view a board gets is decided by the width of the
+//! address space it gave its core. The AArch64 guest is `arm64-virt`'s core.
+//! Whichever `gdb` is to hand, at least one of them says something.
 //!
-//! Three tests need no `gdb` at all: the x86 fixture board resets into its
-//! ROM, the AArch64 register map agrees with the core it describes, and an
-//! AArch64 breakpoint stops where it was put. Those run everywhere, which
-//! matters because the AArch64 session skips on the common host.
+//! Several tests need no `gdb` at all: the x86 fixture board resets into its
+//! ROM, the x86-64 register map agrees with the core it describes, the two
+//! views go to the right boards, `cpu.i8086` is debuggable, the AArch64
+//! register map agrees with its core, and an AArch64 breakpoint stops where it
+//! was put. Those run everywhere, which matters because the AArch64 session
+//! skips on the common host.
 //!
 //! # It skips rather than fails
 //!
@@ -42,23 +46,24 @@
 //!
 //! # What GDB does with our target description
 //!
-//! The two guests differ here, and the difference is the point of the AArch64
-//! map. GDB **accepts** `org.gnu.gdb.aarch64.core`, because that feature has a
-//! fixed meaning — `x0`-`x30`, `sp`, `pc`, `cpsr` — and rsemu supplies exactly
-//! it. For x86 it does not, and the paragraph below explains why that is fine.
+//! It **accepts** all three, and that is asserted in all three, because it used
+//! not to. A feature named `org.gnu.gdb.<arch>.core` is a promise that it holds
+//! exactly the registers GDB's gdbarch for that architecture expects, in its
+//! order and at its widths; a description that breaks the promise is refused
+//! with `warning: Architecture rejected target-supplied description`, after
+//! which GDB reads the `g` packet through a built-in layout that may or may not
+//! happen to agree.
 //!
-//! It rejects it — `warning: Architecture rejected target-supplied description`
-//! — and that is expected and harmless. GDB's `i386` gdbarch will only accept a
-//! description whose feature is `org.gnu.gdb.i386.core` *and* which supplies the
-//! x87 register block; ours is `org.rsemu.i386` and supplies the sixteen
-//! integer registers the core actually has. Having rejected it GDB falls back to
-//! its built-in i386 layout, whose first sixteen registers are `eax ecx edx ebx
-//! esp ebp esi edi eip eflags cs ss ds es fs gs` — which is exactly the order
-//! `cpu.x86` saves them in, and exactly what `src/host/gdb/arch.rs` documents as
-//! the reason that map is the identity rather than a translation. So the `g`
-//! packet lines up, `info registers` is right, and the session below works.
-//! Asserting on that warning is part of the test: it is the behaviour, and if it
-//! ever changes we want to be told.
+//! For x86 it did break the promise, and it happened to agree: the map was
+//! sixteen integer registers under an `org.rsemu.i386` name, GDB fell back to
+//! its own i386 layout, and that layout's first sixteen are `eax ecx edx ebx
+//! esp ebp esi edi eip eflags cs ss ds es fs gs` — exactly the order `cpu.x86`
+//! saves them in. Agreeing by luck is not the same as being right, and it is no
+//! use at all in 64-bit mode, where GDB's fallback layout is not this chunk.
+//! Both x86 maps now supply the x87 block GDB's `i386.core` requires, so the
+//! description is accepted; the 64-bit one claims
+//! `<architecture>i386:x86-64</architecture>` with it, which is what makes
+//! `$r15` and the high half of `$rax` reachable at all.
 
 #![cfg(all(feature = "gdb", any(feature = "cpu-x86", feature = "cpu-arm-a64")))]
 
@@ -172,7 +177,7 @@ impl Server {
     /// a `Machine` is not `Send` and because the debugger and the machine
     /// share a thread on purpose — that sharing is what makes "attaching stops
     /// the world" true without a barrier (`src/host/gdb/mod.rs`).
-    fn start(build: fn() -> Machine) -> Server {
+    fn start<F: FnOnce() -> Machine + Send + 'static>(build: F) -> Server {
         let server = GdbServer::bind(":0").expect("bind an ephemeral port");
         let addr = server.local_addr().expect("local_addr");
         let stop = Arc::new(AtomicBool::new(false));
@@ -314,6 +319,10 @@ fn a_real_gdb_debugs_a_guest_end_to_end() {
     }
     script.extend([
         format!("target remote 127.0.0.1:{port}"),
+        // What GDB settled on from a description that names no architecture,
+        // before anybody tells it. Asserted below, because the answer is the
+        // reason the 32-bit map leaves `<architecture>` out.
+        String::from("show architecture"),
         String::from("set architecture i8086"),
         // Where an 8086 wakes up: `CS:IP = ffff:0000`, so linear `0xffff0` and
         // GDB's flat `$pc` is zero. The brackets are so an assertion can match
@@ -422,6 +431,20 @@ fn a_real_gdb_debugs_a_guest_end_to_end() {
     says("mem (20 bits)");
     says("rom  rwx");
 
+    // The description is accepted rather than refused, which is what supplying
+    // the x87 block gdb's `org.gnu.gdb.i386.core` requires buys — and it holds
+    // under `set architecture i8086`, which is the whole reason the 32-bit map
+    // supplies no `<architecture>` of its own.
+    assert!(
+        !all.contains("Architecture rejected target-supplied description"),
+        "gdb rejected the i386 target description:\n{all}"
+    );
+    // And with nothing said, gdb resolves the description to `i386` — not to
+    // the x86-64 it is itself built for, which would read this `g` packet
+    // through the wrong layout. That is the whole benefit of leaving
+    // `<architecture>` out of a map that covers two of gdb's gdbarches.
+    says("(currently \"i386\")");
+
     // Nothing in the session was an error GDB reported to the user.
     for bad in [
         "Truncated register",
@@ -440,6 +463,452 @@ fn a_real_gdb_debugs_a_guest_end_to_end() {
     drop(server);
 }
 
+// ---------------------------------------------------------------------------
+// x86-64
+// ---------------------------------------------------------------------------
+
+/// A board whose core is an x86-64 part on a 64-bit bus.
+///
+/// The one difference from [`X86_MINI`] that the debugger cares about is
+/// `width = 64`: `host::gdb::arch::for_cpu` reads the width of a CPU's address
+/// space to decide which of `cpu.x86`'s two register views to serve, because
+/// nothing reachable from a `Machine` says which variant the machine file asked
+/// for. Every board in `machines/` that says `variant = "x86-64"` gives its
+/// core a 64-bit space, and this fixture is written the same way for the same
+/// reason.
+#[cfg(feature = "cpu-x86")]
+const X86_64_MINI: &str = r#"
+machine "gdb-x86-64" {
+  osc xtal = 100000000 Hz
+  space mem  { width = 64, unassigned = read-as-ones }
+  space port { width = 16, unassigned = read-as-ones }
+  object cpu "cpu.x86" {
+    clock   = xtal
+    space   = mem
+    iospace = "port"
+    variant = "x86-64"
+    engine  = "interp"
+  }
+  object dram "ram" { size = 1M }
+  map mem 0x00000 size 1M = dram
+}
+"#;
+
+/// The same board with a 32-bit bus, which is what `pc-at` and `pc-apic` have.
+#[cfg(feature = "cpu-x86")]
+const X86_32_MINI: &str = r#"
+machine "gdb-x86-32" {
+  osc xtal = 100000000 Hz
+  space mem  { width = 32, unassigned = read-as-ones }
+  space port { width = 16, unassigned = read-as-ones }
+  object cpu "cpu.x86" {
+    clock   = xtal
+    space   = mem
+    iospace = "port"
+    variant = "80486"
+    engine  = "interp"
+  }
+  object dram "ram" { size = 1M }
+  map mem 0x00000 size 1M = dram
+}
+"#;
+
+/// The 64-bit values the fixture seeds, so a debugger showing thirty-two bits
+/// of them is visibly wrong rather than plausibly right.
+#[cfg(feature = "cpu-x86")]
+const X64_RAX: u64 = 0x1122_3344_5566_7788;
+#[cfg(feature = "cpu-x86")]
+const X64_RBX: u64 = 0xdead_beef_cafe_babe;
+#[cfg(feature = "cpu-x86")]
+const X64_R15: u64 = 0x8000_0000_0000_0001;
+/// What the gdb session writes into `r14`, which the core is asked for
+/// afterwards.
+#[cfg(feature = "cpu-x86")]
+const X64_R14: u64 = 0xfeed_face_1234_5678;
+
+/// Build an x86 board from `src`, keeping the core.
+#[cfg(feature = "cpu-x86")]
+fn x86_board_with_core(name: &str, src: &str) -> (Machine, Arc<rsemu::cpu::x86::X86>) {
+    use rsemu::core::Captured;
+    use rsemu::cpu::x86::X86;
+
+    let cores: Arc<Captured<X86>> = Arc::new(Captured::new());
+    let kept = Arc::clone(&cores);
+    let mut bindings = catalog::bindings().expect("this build's bindings");
+    bindings.replace("cpu.x86", move |props| {
+        let cpu = Arc::new(X86::from_props(props)?);
+        kept.push(&cpu);
+        Ok(cpu)
+    });
+    let options = rsemu::machine::BuildOptions::new()
+        .with_classes(catalog::classes())
+        .with_bindings(bindings);
+    let registry = catalog::registry().expect("a registry");
+    let machine = rsemu::machine::build(name, src, &registry, &options)
+        .unwrap_or_else(|e| panic!("the fixture does not realize: {e}"));
+    let cpu = cores.last().expect("the binding captured the core");
+    (machine, cpu)
+}
+
+/// The x86-64 register map, checked register by register against the core.
+///
+/// This is the test the 64-bit view exists for. `cpu.x86` has written
+/// `RAX`-`R15` and `RIP` at full width since chunk version 4, and a debugger
+/// could not reach them: they sit behind the **prefetch queue**, which `save`
+/// writes length-prefixed, so the long-mode block is at a different offset
+/// depending on how many bytes the bus interface unit happens to be holding.
+/// Every register below is therefore compared against the core's own accessor,
+/// and then compared again with the queue full — which is the case a table of
+/// constants gets wrong and says nothing about.
+#[cfg(feature = "cpu-x86")]
+#[test]
+fn the_x86_64_register_map_agrees_with_the_core() {
+    use rsemu::cpu::x86::Reg;
+    use rsemu::host::gdb::DebugTarget;
+
+    /// gdb's AMD64 core numbering, which is the DWARF one and not ModRM's.
+    const GDB_ORDER: [Reg; 16] = [
+        Reg::Rax,
+        Reg::Rbx,
+        Reg::Rcx,
+        Reg::Rdx,
+        Reg::Rsi,
+        Reg::Rdi,
+        Reg::Rbp,
+        Reg::Rsp,
+        Reg::R8,
+        Reg::R9,
+        Reg::R10,
+        Reg::R11,
+        Reg::R12,
+        Reg::R13,
+        Reg::R14,
+        Reg::R15,
+    ];
+
+    let (mut m, cpu) = x86_board_with_core("gdb-x86-64.machine", X86_64_MINI);
+    let mut target = MachineTarget::new(&mut m);
+    assert_eq!(target.cpu_count(), 1, "one core");
+    let arch = target.arch(0).expect("a register map");
+    assert_eq!(arch.class.name, "cpu.x86");
+    assert_eq!(arch.feature, "org.gnu.gdb.i386.core");
+    assert_eq!(arch.architecture, Some("i386:x86-64"));
+    // 16 * 8 + rip + eflags + six selectors + eight ten-byte x87 registers +
+    // eight control words: gdb's own AMD64 core block, with no SSE feature.
+    assert_eq!(arch.packet_len(), 276);
+    assert_eq!(arch.regs[16].name, "rip");
+    assert_eq!(arch.regs[arch.pc].name, "rip");
+
+    // A distinct value in every register, so a map that is off by one entry
+    // cannot pass — and every value with its high half set, so a map that is
+    // thirty-two bits wide cannot either.
+    for (i, reg) in GDB_ORDER.iter().enumerate() {
+        cpu.set_reg(*reg, 0xa500_0000_0000_0000 | i as u64);
+    }
+    let mut x87 = cpu.x87();
+    for (i, slot) in x87.regs.iter_mut().enumerate() {
+        slot.sig = 0xc0c0_0000_0000_0000 | i as u64;
+        slot.sign_exp = 0x4000 | i as u16;
+    }
+    x87.control = 0x037f;
+    x87.status = 0x1234;
+    x87.tag = 0x5555;
+    x87.last_op = 0x01ff;
+    x87.last_ip = 0x1111_2222_3333_4444;
+    x87.last_dp = 0x5555_6666_7777_8888;
+    x87.last_cs = 0x0008;
+    x87.last_ds = 0x0010;
+    cpu.set_x87(x87);
+
+    let check = |target: &MachineTarget<'_>, why: &str| {
+        let u64_of =
+            |bytes: &[u8]| u64::from_le_bytes(<[u8; 8]>::try_from(bytes).expect("eight bytes"));
+        let u32_of =
+            |bytes: &[u8]| u32::from_le_bytes(<[u8; 4]>::try_from(bytes).expect("four bytes"));
+        let g = target.read_registers(0).expect("the whole register file");
+        assert_eq!(g.len(), 276, "{why}");
+        for (i, reg) in GDB_ORDER.iter().enumerate() {
+            assert_eq!(
+                u64_of(&g[i * 8..i * 8 + 8]),
+                cpu.reg(*reg),
+                "{why}: {reg:?} is not where the map says it is"
+            );
+        }
+        assert_eq!(u64_of(&g[128..136]), cpu.reg(Reg::Rip), "{why}: rip");
+        assert_eq!(
+            u32_of(&g[136..140]),
+            cpu.reg(Reg::Eflags) as u32,
+            "{why}: eflags"
+        );
+        for (i, reg) in [Reg::Cs, Reg::Ss, Reg::Ds, Reg::Es, Reg::Fs, Reg::Gs]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                u32_of(&g[140 + i * 4..144 + i * 4]),
+                cpu.reg(reg) as u32,
+                "{why}: {reg:?}"
+            );
+        }
+        // The x87 file: ten bytes each, significand then sign-and-exponent,
+        // which is the 80-bit format's own layout.
+        let x87 = cpu.x87();
+        for (i, slot) in x87.regs.iter().enumerate() {
+            let at = 164 + i * 10;
+            assert_eq!(
+                u64::from_le_bytes(<[u8; 8]>::try_from(&g[at..at + 8]).expect("8")),
+                slot.sig,
+                "{why}: st{i} significand"
+            );
+            assert_eq!(
+                u16::from_le_bytes(<[u8; 2]>::try_from(&g[at + 8..at + 10]).expect("2")),
+                slot.sign_exp,
+                "{why}: st{i} sign and exponent"
+            );
+        }
+        for (i, (name, want)) in [
+            ("fctrl", u32::from(x87.control)),
+            ("fstat", u32::from(x87.status)),
+            ("ftag", u32::from(x87.tag)),
+            ("fiseg", u32::from(x87.last_cs)),
+            ("fioff", x87.last_ip as u32),
+            ("foseg", u32::from(x87.last_ds)),
+            ("fooff", x87.last_dp as u32),
+            ("fop", u32::from(x87.last_op)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let at = 244 + i * 4;
+            assert_eq!(u32_of(&g[at..at + 4]), want, "{why}: {name}");
+        }
+    };
+
+    check(&target, "with an empty prefetch queue");
+
+    // And now with the queue full. `save` writes one byte of length and then
+    // that many bytes, so every register above has just moved.
+    cpu.set_prefetch_queue(&[0x90, 0x90, 0x90, 0x90, 0x90, 0x90])
+        .expect("the queue takes six bytes on an x86-64 part");
+    check(&target, "with six bytes queued");
+
+    // Writes land, on the far side of the same hole.
+    target
+        .write_register(0, 15, &0x1234_5678_9abc_def0u64.to_le_bytes())
+        .expect("r15 is writable");
+    assert_eq!(cpu.reg(Reg::R15), 0x1234_5678_9abc_def0);
+    target
+        .write_register(0, 16, &0x0000_7fff_0000_1000u64.to_le_bytes())
+        .expect("rip is writable");
+    assert_eq!(cpu.reg(Reg::Rip), 0x0000_7fff_0000_1000);
+    // A control word gdb declares as thirty-two bits and the core keeps as
+    // sixteen.
+    target
+        .write_register(0, 32, &0x0000_027fu32.to_le_bytes())
+        .expect("fctrl is writable");
+    assert_eq!(cpu.x87().control, 0x027f);
+
+    // A whole-register-file write round-trips.
+    let packet = target.read_registers(0).expect("the register file");
+    target
+        .write_registers(0, &packet)
+        .expect("the whole file is writable");
+    assert_eq!(
+        target.read_registers(0).expect("read back"),
+        packet,
+        "the register file does not read back what was written to it"
+    );
+}
+
+/// Which of `cpu.x86`'s two register views a board gets, and why.
+///
+/// The map is per class and the register file is per instance, so something has
+/// to choose; the width of the address space the board gave its core is what
+/// does. This pins both halves, because the failure mode is silent in both
+/// directions — a 64-bit guest debugged through a 32-bit window shows no
+/// `R8`-`R15`, and a real-mode guest presented as x86-64 gets disassembled as
+/// x86-64.
+#[cfg(feature = "cpu-x86")]
+#[test]
+fn the_register_view_follows_the_address_space_width() {
+    use rsemu::host::gdb::DebugTarget;
+
+    let (mut wide, _) = x86_board_with_core("gdb-x86-64.machine", X86_64_MINI);
+    let target = MachineTarget::new(&mut wide);
+    let arch = target.arch(0).expect("a map");
+    assert_eq!(arch.architecture, Some("i386:x86-64"));
+    assert_eq!(arch.regs[0].name, "rax");
+
+    let (mut narrow, _) = x86_board_with_core("gdb-x86-32.machine", X86_32_MINI);
+    let target = MachineTarget::new(&mut narrow);
+    let arch = target.arch(0).expect("a map");
+    assert_eq!(arch.architecture, None);
+    assert_eq!(arch.regs[0].name, "eax");
+    // The i386 view is `org.gnu.gdb.i386.core` too, and gdb only accepts that
+    // name with the x87 block after the integer file.
+    assert_eq!(arch.feature, "org.gnu.gdb.i386.core");
+    assert_eq!(arch.regs.len(), 32);
+    assert_eq!(arch.regs[16].name, "st0");
+    assert_eq!(arch.regs[31].name, "fop");
+
+    // And the 20-bit fixture the session test drives, which is the case that
+    // would break loudly if the threshold ever moved.
+    let mut mini = board();
+    let target = MachineTarget::new(&mut mini);
+    assert_eq!(target.arch(0).expect("a map").regs[0].name, "eax");
+}
+
+/// `cpu.i8086` is the same core under its older class name, and a machine file
+/// that uses it must get threads rather than silence.
+#[cfg(feature = "cpu-x86")]
+#[test]
+fn the_older_class_name_is_debuggable_too() {
+    let x86 = rsemu::host::gdb::arch::for_class("cpu.x86").expect("cpu.x86 has a map");
+    let i8086 = rsemu::host::gdb::arch::for_class("cpu.i8086").expect("cpu.i8086 has a map");
+    assert_eq!(i8086.regs.len(), x86.regs.len());
+    assert_eq!(i8086.feature, x86.feature);
+    assert_eq!(i8086.pc, x86.pc);
+    for (a, b) in i8086.regs.iter().zip(x86.regs) {
+        assert_eq!(a, b, "the two views of one core disagree");
+    }
+    // The versions do *not* agree, and that is the core's defect rather than
+    // the map's — see `src/host/gdb/arch.rs`'s `I8086`. The map is verified
+    // against whatever each class claims, so both `check()`s pass; this asserts
+    // the drift is still there so that fixing it fails here and gets the
+    // comment removed.
+    assert!(i8086.check() && x86.check());
+    assert_ne!(
+        i8086.class.version, x86.class.version,
+        "`cpu.i8086` and `cpu.x86` now agree on a version — good; drop the \
+         note in `arch.rs` and give this map `verified_version` {}",
+        x86.class.version
+    );
+}
+
+/// The 64-bit half of phase 9's gate: a real `gdb`, reading a 64-bit register
+/// file off a 64-bit guest.
+///
+/// The claim being proved is narrow and was the largest gap in the debug
+/// surface: gdb's AMD64 gdbarch accepts `org.gnu.gdb.i386.core` only when it
+/// carries all forty registers it expects — the integer sixteen at full width,
+/// `rip`, `eflags`, the six selectors and the x87 block — so a session that
+/// prints `$r15` and `$rax` with their high halves intact is a session gdb
+/// built out of *this* description rather than out of its own fallback layout.
+/// The rejection warning is asserted absent for the same reason it is asserted
+/// present in the AArch64 test.
+#[cfg(feature = "cpu-x86")]
+#[test]
+fn a_real_gdb_sees_a_sixty_four_bit_register_file() {
+    use rsemu::core::Captured;
+    use rsemu::cpu::x86::{Reg, X86};
+
+    let Some(gdb) = find_gdb() else {
+        println!("skipping: no gdb binary. Set $RSEMU_GDB, or install gdb.");
+        return;
+    };
+    if !knows(&gdb, "i386:x86-64") {
+        println!(
+            "skipping: `{gdb}` has no x86-64 gdbarch, so it cannot read a 64-bit \
+             register file however the description is written."
+        );
+        return;
+    }
+
+    let cores: Arc<Captured<X86>> = Arc::new(Captured::new());
+    let kept = Arc::clone(&cores);
+    let server = Server::start(move || {
+        let (machine, cpu) = x86_board_with_core("gdb-x86-64.machine", X86_64_MINI);
+        // Seeded here rather than before the server starts, because the board
+        // is built on the session's own thread — a `Machine` is not `Send`.
+        cpu.set_reg(Reg::Rax, X64_RAX);
+        cpu.set_reg(Reg::Rbx, X64_RBX);
+        cpu.set_reg(Reg::R15, X64_R15);
+        kept.push(&cpu);
+        machine
+    });
+    let port = server.addr.port();
+
+    let mut script = Vec::new();
+    if std::env::var_os("RSEMU_GDB_DEBUG_REMOTE").is_some() {
+        script.push(String::from("set debug remote 1"));
+    }
+    script.extend([
+        format!("target remote 127.0.0.1:{port}"),
+        // No `set architecture`: the description is supposed to be enough, and
+        // saying which architecture it settled on is half the assertion.
+        // `show architecture` rather than `$_gdb_setting_str("architecture")`,
+        // which reports the *setting* — "auto" — and not what auto resolved to.
+        String::from("show architecture"),
+        // The registers a 32-bit window cannot show: two with their high half
+        // set, and one that only exists in long mode.
+        String::from("printf \"RSEMU rax [%#llx]\\n\", (unsigned long long) $rax"),
+        String::from("printf \"RSEMU rbx [%#llx]\\n\", (unsigned long long) $rbx"),
+        String::from("printf \"RSEMU r15 [%#llx]\\n\", (unsigned long long) $r15"),
+        // And the other direction: gdb writes sixty-four bits, and the core is
+        // asked afterwards whether it got them.
+        format!("set $r14 = {X64_R14:#x}"),
+        String::from("printf \"RSEMU r14 [%#llx]\\n\", (unsigned long long) $r14"),
+        // `info registers` is the shape a user recognises, and it is also what
+        // reads the whole `g` packet through the description's own layout.
+        String::from("info registers rax rbx r14 r15 rip eflags"),
+        String::from("info float"),
+        String::from("monitor devices"),
+        String::from("detach"),
+    ]);
+
+    let mut cmd = Command::new(&gdb);
+    cmd.arg("-batch").arg("-nx");
+    for line in &script {
+        cmd.arg("-ex").arg(line);
+    }
+    let out = cmd.output().expect("gdb runs");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let all = format!("{stdout}\n{stderr}");
+    println!("--- gdb stdout ---\n{stdout}\n--- gdb stderr ---\n{stderr}");
+
+    let says = |needle: &str| {
+        assert!(
+            all.contains(needle),
+            "gdb never said `{needle}`.\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+    };
+
+    says("(currently \"i386:x86-64\")");
+    says(&format!("RSEMU rax [{X64_RAX:#x}]"));
+    says(&format!("RSEMU rbx [{X64_RBX:#x}]"));
+    says(&format!("RSEMU r15 [{X64_R15:#x}]"));
+    says(&format!("RSEMU r14 [{X64_R14:#x}]"));
+    says("cpu.x86");
+
+    // The description is accepted, which is what claiming `i386:x86-64` and
+    // supplying gdb's own forty registers buys.
+    assert!(
+        !all.contains("Architecture rejected target-supplied description"),
+        "gdb rejected the x86-64 target description:\n{all}"
+    );
+    for bad in [
+        "Truncated register",
+        "Remote failure reply",
+        "Remote communication error",
+        "Ignoring packet error",
+    ] {
+        assert!(
+            !all.contains(bad),
+            "gdb reported `{bad}`:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+    }
+
+    // What gdb wrote is in the core, at full width.
+    let cpu = cores.last().expect("the fixture captured its core");
+    assert_eq!(
+        cpu.reg(Reg::R14),
+        X64_R14,
+        "gdb's sixty-four bit write did not reach the core"
+    );
+
+    drop(server);
+}
 // ---------------------------------------------------------------------------
 // AArch64
 // ---------------------------------------------------------------------------
@@ -848,7 +1317,9 @@ fn a_real_gdb_debugs_an_aarch64_guest_end_to_end() {
     script.extend([
         format!("target remote 127.0.0.1:{port}"),
         // No `set architecture`: the description is supposed to be enough.
-        String::from("printf \"RSEMU arch [%s]\\n\", $_gdb_setting_str(\"architecture\")"),
+        // `show architecture` and not `$_gdb_setting_str("architecture")`: the
+        // setting is "auto", and what it resolved to is the thing being tested.
+        String::from("show architecture"),
         String::from("printf \"RSEMU pc0 [%#x]\\n\", $pc"),
         // Run to the store, which is three instructions in.
         String::from("break *0x8"),
@@ -894,7 +1365,7 @@ fn a_real_gdb_debugs_an_aarch64_guest_end_to_end() {
         );
     };
 
-    says("RSEMU arch [aarch64]");
+    says("(currently \"aarch64\")");
     says("RSEMU pc0 [0]");
     says("Breakpoint 1");
     says("RSEMU pc1 [0x8]");

@@ -414,14 +414,23 @@ impl<'a> MachineTarget<'a> {
     /// Wrap a machine, discovering its CPUs.
     ///
     /// A device is a CPU here when this build has a register map for its class
-    /// ([`super::arch::for_class`]) and the machine gave it a clock domain. A
+    /// ([`super::arch::for_cpu`]) and the machine gave it a clock domain. A
     /// core with no domain cannot be stepped, and presenting a thread that
     /// cannot be stepped is worse than not presenting it.
+    ///
+    /// The map is chosen per *instance*, not per class: `cpu.x86` is an 8088 on
+    /// one board and an x86-64 part on another, and the width of the address
+    /// space the board gave it is what says which. [`super::arch::for_cpu`] has
+    /// the reasoning.
     #[must_use]
     pub fn new(machine: &'a mut Machine) -> MachineTarget<'a> {
         let mut cpus = Vec::new();
         for (index, entry) in machine.devices().iter().enumerate() {
-            let Some(arch) = super::arch::for_class(entry.class().name) else {
+            let bits = entry
+                .space_index()
+                .and_then(|i| machine.spaces().get(i))
+                .map(|entry| entry.space().bits());
+            let Some(arch) = super::arch::for_cpu(entry.class().name, bits) else {
                 continue;
             };
             let Some(domain) = entry.domain() else {
