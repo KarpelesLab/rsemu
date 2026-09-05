@@ -2121,6 +2121,10 @@ impl Exec<'_> {
             // says so with `#GP(0)` rather than by splitting the access.
             self.require_aligned(off)?;
         }
+        // Two reads and then, on a match, two writes — four accesses where the
+        // architecture promises one indivisible operation. The same gap the
+        // other three read-modify-writes have and from the same cause; see
+        // `cpu::x86`'s "What is not modelled", under `LOCK`.
         let lo = self.read_mem(sr, off, half)?;
         let hi = self.read_mem(sr, off.wrapping_add(u64::from(half)), half)?;
         let width = u32::from(half) * 8;

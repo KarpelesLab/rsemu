@@ -1614,15 +1614,23 @@ mod tests {
         0xeb, 0xe5, // jmp top
     ];
 
-    /// [`BUSY_LOOP`] in the flat world, the paged one and long mode.
+    /// [`BUSY_LOOP`] in each of the four worlds `World::of` accepts: flat
+    /// 32-bit protected mode, the legacy two-level paged one, long mode, and
+    /// **compatibility mode** — long mode's four-level walk under a 32-bit
+    /// code segment, which is the world a 64-bit kernel is in whenever it runs
+    /// a 32-bit program and the one [`narrow_state_is_clean`] exists for.
     fn busy(world: usize) -> Case {
         let case = Case::seeded(BUSY_LOOP.to_vec());
         match world {
             0 => case,
             1 => case.paged(),
-            _ => case.long(),
+            2 => case.long(),
+            _ => case.compat(),
         }
     }
+
+    /// How many of them there are, so a loop cannot silently stop covering one.
+    const WORLDS: usize = 4;
 
     /// A generated program, which is what the differential corpus runs.
     fn seeded(seed: u64) -> Case {
@@ -1669,6 +1677,9 @@ mod tests {
             agree_on(&seeded(seed * 7 + 1), Engine::Jit, 6_000, 6);
             agree_on(&seeded(seed * 7 + 1).paged(), Engine::JitHost, 6_000, 6);
             agree_on(&seeded64(seed * 13 + 3), Engine::JitHost, 6_000, 6);
+            // Compatibility mode runs the *32-bit* corpus, because the decoder
+            // is driven at `Bits::B32` there.
+            agree_on(&seeded(seed * 11 + 5).compat(), Engine::JitHost, 6_000, 6);
         }
     }
 
@@ -1707,7 +1718,7 @@ mod tests {
         // That is how three bound mutations survived a sweep that looked
         // thorough.
         for budget in [1_400u64, 1_900, 2_600, 3_400, 4_200, 5_600, 7_000] {
-            for world in 0..3 {
+            for world in 0..WORLDS {
                 agree_on(&busy(world), Engine::Jit, budget, 24);
                 agree_on(&busy(world), Engine::JitHost, budget, 24);
             }
@@ -1729,7 +1740,7 @@ mod tests {
         //
         // The paged worlds only: with `CR0.PG` clear the cold bound is 1 824
         // and this budget clears it, so the arm under test is never reached.
-        for world in [1, 2] {
+        for world in [1, 2, 3] {
             for engine in [Engine::Jit, Engine::JitHost] {
                 let jit = agree_on(&busy(world), engine, 2_000, 24);
                 let stats = jit.jit_stats().expect("statistics");
