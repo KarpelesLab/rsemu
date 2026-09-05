@@ -9,7 +9,14 @@
 //! # The subset, exactly
 //!
 //! **32-bit protected mode and 64-bit long mode, integer instructions, with or
-//! without paging.** A documented subset done
+//! without paging.** That is four worlds rather than two, because what
+//! [`World::of`] asks about paging and about the code segment's width are
+//! separate questions: flat 32-bit protected mode, the same with `CR0.PG` set
+//! over a two-level walk, long mode, and **compatibility mode** — `EFER.LMA`
+//! set, so the walk is IA-32e's four levels, under a 32-bit code segment, which
+//! is what a 64-bit kernel is in while it runs a 32-bit program. All four are
+//! separate keys, and `cpu::x86::differential` runs a generated corpus in each.
+//! A documented subset done
 //! exactly beats a broad one done approximately, so the world this frontend
 //! lifts in is checked rather than assumed — [`World::of`] refuses everything
 //! else — and within it the instruction list is closed:
