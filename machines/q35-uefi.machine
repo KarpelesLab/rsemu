@@ -3,6 +3,8 @@
 #
 #   rsemu run q35-uefi --flash0 OVMF_CODE.fd --flash1 OVMF_VARS.fd
 #   rsemu run q35-uefi --flash0 OVMF_CODE.fd --drive flash1=OVMF_VARS.fd
+#   rsemu run q35-uefi --flash0 OVMF_CODE.fd --drive flash1=OVMF_VARS.fd \
+#       --drive nvme0=esp.img -p disk=64M
 #   rsemu run q35-uefi --flash0 edk2-x86_64-code.fd --flash1 edk2-i386-vars.fd \
 #       -p flash=4M -p vars=528K
 #
@@ -63,7 +65,19 @@
 #     what every measurement in `docs/platforms/q35-uefi.md` is taken through.
 #   * **Both IDE channels and the 8237As.** A UEFI build reaches its disks
 #     through a PCI storage controller, not through `0x1f0`; each of these would
-#     be a second thing under test.
+#     be a second thing under test. The controller it does reach them through is
+#     the `nvme.controller` at `00:04.0` below.
+#
+# # The disk is on the bus and is not yet reachable
+#
+# `nvme0` is enumerated by the firmware, bound by EDK II's `NvmExpressDxe`, and
+# then answers `0xffffffff` at every register — because a base address register
+# programmed through the **ECAM** window never decodes. That is a defect in
+# `src/bus/pci/bar.rs` rather than anything about this board:
+# `tests/q35_uefi.rs` reproduces it in sixty milliseconds with no firmware, and
+# `docs/platforms/q35-uefi.md` has the mechanism. Until it is fixed the shell
+# still comes up and still answers `map: No mapping found.`, about 450 seconds
+# of virtual time later than it used to, which is the driver timing out.
 #
 # # A20 is deliberately unwired
 #
@@ -134,6 +148,21 @@ machine "q35-uefi" {
   # 0x600 is both the arrangement `machines/q35.machine` uses and the address
   # OVMF is built for, so the firmware finds the timer already running.
   param pmbase = 0x600
+
+  # How big the NVMe namespace is when the run supplies no image. A `--drive
+  # nvme0=disk.img`, or bytes in the `nvme0` media slot, brings its own size and
+  # this has to be at least as large: 16 MiB is a namespace the firmware
+  # enumerates and finds nothing on, which is the right answer for a board
+  # booted with no disk at all.
+  param disk = 16M
+
+  # Bytes in a logical block. 512 is what an EFI System Partition is laid out
+  # in and what EDK II's `NvmExpressDxe` reports up as the media's block size,
+  # so a FAT whose BPB says 512 and a namespace that says 4096 would disagree
+  # about where every cluster is. Spelled `sector` rather than `block` because
+  # `block` on this board is already the flash's *erase* block, and the two are
+  # different sizes for different parts.
+  param sector = 512
 
   # Which host character port the keyboard's scan codes arrive on.
   param keyboard = "keyboard"
@@ -271,6 +300,40 @@ machine "q35-uefi" {
     clock     = uart / 16
     port      = console
     frequency = 1843200
+  }
+
+  # -- the disk ---------------------------------------------------------------
+  #
+  # An NVM Express controller at device 4, function 0 — the same part at the
+  # same address as `machines/q35-linux.machine`, and here for a different
+  # reason. There a kernel needs a root; here the **firmware** needs somewhere
+  # to look for an operating system. UEFI's boot manager searches the block
+  # devices it can see for a FAT file system and, failing a `Boot####` that
+  # names something else, for the architecture's default file name
+  # `\EFI\BOOT\BOOTX64.EFI` (UEFI 2.10 §3.5.1.1, "Removable Media Boot
+  # Behavior"). A board with no storage controller has nothing for it to
+  # search, which is why this one used to answer `map: No mapping found.`
+  #
+  # NVMe rather than AHCI or IDE because of what OVMF dispatches: EDK II's
+  # `NvmExpressDxe` is a generic `MdeModulePkg` driver that binds on a PCI
+  # class code of 01/08/02 and needs nothing from the platform, and it **polls**
+  # its completion queues rather than taking an interrupt — so a namespace is
+  # reachable with nothing on this board wired for it. That is the same
+  # argument `docs/platforms/q35-linux.md` makes for a kernel's built-in driver
+  # set, one layer down.
+  #
+  # `space = mem` is not decoration: the controller is a **bus master**, and its
+  # queues, its PRP lists and its data buffers are all in this board's RAM,
+  # which it reads and writes itself. Its register block is deliberately absent
+  # from the memory map below — `BAR0` places it, and on this board the thing
+  # that programs `BAR0` is `PciBusDxe`.
+  object nvme0 "nvme.controller" {
+    space  = mem
+    bus    = "pci0"
+    device = 4
+    image  = "nvme0"
+    size   = disk
+    block  = sector
   }
 
   # -- the flash --------------------------------------------------------------

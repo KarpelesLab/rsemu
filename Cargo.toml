@@ -1675,7 +1675,11 @@ machine-q35-linux-smp = ["machine-q35-linux"]
 # No video adapter, no IDE, no 8237As and no generated ACPI tables: a UEFI
 # firmware publishes its own tables and reaches its disks through PCI, and the
 # console is the 16550 EDK II puts a terminal on. What it gets you over
-# `machine-q35` is `dev-flash-cfi`; nothing else is added and no dependency is.
+# `machine-q35` is `dev-flash-cfi` and `dev-nvme` -- the second because a
+# firmware with nowhere to look for an operating system is a firmware that
+# stops at its own shell, and EDK II's `NvmExpressDxe` is the storage driver
+# that binds on a class code and polls, so a namespace is reachable with
+# nothing on the board wired for it. Adds no dependency either way.
 machine-q35-uefi = [
   "cpu-x86",
   "dev-q35",
@@ -1683,6 +1687,7 @@ machine-q35-uefi = [
   "dev-pc-apic",
   "dev-pc-hpet",
   "dev-flash-cfi",
+  "dev-nvme",
 ]
 
 # The pc64 board (machines/pc64.machine): a PC with a long-mode processor and no

@@ -393,14 +393,21 @@ pub static Q35_LINUX_SMP: CatalogEntry = CatalogEntry {
 /// beside its `_VARS.fd` — is compiled for, and it is the same arrangement
 /// [`RISCV_VIRT`] already boots EDK II from one architecture over.
 ///
+/// An **NVM Express controller** at `00:04.0` is the third slot: what a UEFI
+/// boot manager searches for a FAT file system and the default file name
+/// `\EFI\BOOT\BOOTX64.EFI` (UEFI 2.10 §3.5.1.1). The firmware enumerates it and
+/// binds a driver to it, and cannot yet read it — `docs/platforms/q35-uefi.md`
+/// has the defect that stops it, in `src/bus/pci/bar.rs` rather than here.
+///
 /// **No firmware is shipped and none can be.** `--flash0` and `--flash1` bind
-/// the two banks; `docs/platforms/q35-uefi.md` says where a run of one gets to.
+/// the two banks and `--drive nvme0=disk.img` the disk;
+/// `docs/platforms/q35-uefi.md` says where a run of one gets to.
 #[cfg(feature = "machine-q35-uefi")]
 #[cfg_attr(docsrs, doc(cfg(feature = "machine-q35-uefi")))]
 pub static Q35_UEFI: CatalogEntry = CatalogEntry {
     name: "q35-uefi",
-    summary: "a q35 that boots UEFI: ECAM, ICH9, APICs, HPET, and two NOR flash banks below 4 GiB",
-    media: &["flash0", "flash1"],
+    summary: "a q35 that boots UEFI: ECAM, ICH9, APICs, HPET, NVMe, and two NOR flash banks",
+    media: &["flash0", "flash1", "nvme0"],
     source: include_str!("../../machines/q35-uefi.machine"),
 };
 
@@ -2035,13 +2042,15 @@ mod tests {
             // same reasons: it is `q35-linux` with a second processor on it.
             #[cfg(feature = "machine-q35-linux-smp")]
             ("q35-linux-smp", "kernel" | "initrd" | "nvme0") => &[],
-            // Two blank NOR banks. A `flash.cfi` with no image is an erased
-            // part, which is a board with the sockets stuffed and nothing
-            // programmed into them — so this proves the board realizes without
-            // a 2 MiB firmware nobody could commit. `tests/q35_uefi` is where a
-            // real one runs, behind `RSEMU_OVMF_CODE`.
+            // Two blank NOR banks and an empty namespace. A `flash.cfi` with no
+            // image is an erased part, which is a board with the sockets
+            // stuffed and nothing programmed into them — so this proves the
+            // board realizes without a 2 MiB firmware nobody could commit — and
+            // `disk` gives the NVMe controller its capacity with no bytes
+            // bound. `tests/q35_uefi` is where a real firmware and a real disk
+            // run, behind `RSEMU_OVMF_CODE` and `RSEMU_OVMF_DISK`.
             #[cfg(feature = "machine-q35-uefi")]
-            ("q35-uefi", "flash0" | "flash1") => &[],
+            ("q35-uefi", "flash0" | "flash1" | "nvme0") => &[],
             (m, other) => panic!("no fixture for `{m}`'s media slot `{other}`"),
         }
     }
