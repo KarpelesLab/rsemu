@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/KarpelesLab/rsemu/compare/v0.0.4...v0.0.5) - 2026-09-05
+
+### Added
+
+- *(space)* [**breaking**] a global exclusive monitor, so a sibling's store breaks the reservation
+- *(machine)* the JIT engines are reachable from the command line
+- *(cpu-arm-a64)* [**breaking**] an IR frontend, and the engine that runs its blocks
+- *(accel)* [**breaking**] a Linux kernel boots to userspace on host silicon
+- *(cpu-x86)* [**breaking**] lift paged code, named by what the entry resolved to
+- *(cpu-riscv)* engine = "jit", so a machine can reach the dispatcher
+- *(ir)* linear-scan register allocation, and what it costs precise state
+- *(jit)* an x86-64 host backend, with the software TLB inlined into it
+- *(cpu-x86)* lift 32-bit protected mode into the translation IR
+
+### Fixed
+
+- *(cpu-arm-a64)* gate translate_fetch on the engine that calls it
+- *(host)* make Ctrl-C end a run through finish rather than around it
+- *(cpu-arm-a64)* the bucket-margin report needs std, which the feature does not imply
+- *(space)* host_ptr must skip the alignment slack, like every other accessor
+
+### Other
+
+- Merge branch 'worktree-agent-a624808cd91c98a0a'
+- *(deps)* fstool 0.4.26 takes the tree from 23 third-party crates to 10
+- Merge branch 'worktree-agent-abe5a7278a36b654f'
+- *(cpu-arm-a64)* [**breaking**] the budget guard lifts a cold PC instead of guessing at it
+- Merge branch 'worktree-agent-a0127d022851e35b4'
+- *(cpu-arm-a64)* the software TLB's fast path, inlined into compiled code
+- *(deps)* fstool 0.4.25 drops ten third-party crates, tinyvec among them
+- Merge branch 'worktree-agent-a257daf5348ddcd77'
+- Merge branch 'worktree-agent-a28a9febe7887be47'
+- Merge branch 'worktree-agent-ab6c06f2766f3462a'
+- Merge branch 'worktree-agent-ad90767a5f7773fb4'
+- Merge branch 'worktree-agent-a6f1add36f0b152b3'
+- *(accel)* one page walk per slice, and the measured numbers
+- *(accel)* what the two engines agree about, measured line for line
+- *(cpu-riscv)* [**breaking**] a paged hart publishes a LoadPlan, so a compiled load needs no call
+- Merge branch 'worktree-agent-a7f9c932c88907426'
+- the unsafe ceiling is seven, and the seventh is the signal disposition
+- Merge branch 'worktree-agent-ac79776f77a85412a'
+- Merge branch 'worktree-agent-a176e68c47228bf60'
+- Merge branch 'worktree-agent-ad298bafa1bf75018'
+- Merge branch 'worktree-agent-a582c461314190650'
+- Merge branch 'worktree-agent-a8c31f0557c91d5ec'
+- *(machine)* q35-linux reads off its disk now
+- Merge branch 'worktree-agent-a6237079568edb1f3'
+- Merge branch 'worktree-agent-a5ed51bcf433288db'
+- *(jit)* [**breaking**] chain blocks on a real guest, and stop paying 144 µs to compile one
+- Merge branch 'worktree-agent-a68879c0e859b6804'
+- Merge branch 'worktree-agent-aa79687f9f1821bf3'
+- Merge branch 'worktree-agent-af4af447a0627593e'
+- *(jit)* the guard's compiled numbers, measured at the table's own settings
+- Merge branch 'worktree-agent-af09d4e27f0f0fa04'
+
 ## [0.0.4](https://github.com/KarpelesLab/rsemu/compare/v0.0.3...v0.0.4) - 2026-09-02
 
 ### Added
