@@ -45,6 +45,7 @@
 use rsemu::cpu::x86::differential::{
     Case, Verdict, compare, compare_cached, measure_cached, synthesize, synthesize64,
 };
+use rsemu::cpu::x86::Variant;
 use rsemu::cpu::x86::lift::{Flags, Shape, Smc};
 
 /// A 64-bit linear congruential generator — Knuth's MMIX multiplier and
@@ -135,6 +136,21 @@ fn sweep_in(seed: u64, count: usize, shape: Shape, flags: Flags, paged: bool) ->
         let case = Case::seeded(generate(&mut rng, len))
             .with_shape(shape)
             .with_flags(flags);
+        // Half the unpaged cases run on a part that **has** `CMOVcc`, and it
+        // is not a detail: `World::cmov` is a property of the instance, a 386
+        // and a 486 both have it clear, `Exec` raises `#UD` for one there, and
+        // `lift` refuses it — so the whole of `Plan::CmovCc` under
+        // `Smc::Guard` in a flat world had never been generated. Every other
+        // column is unchanged, and the two parts differ in nothing a block
+        // depends on except that bit and the number `lift::key` gives them.
+        let case = if paged || n % 2 == 0 {
+            case
+        } else {
+            Case {
+                variant: Variant::X86_64,
+                ..case
+            }
+        };
         let case = if paged { case.paged() } else { case };
         match compare(&case) {
             Ok(Verdict::Agreed { insns, .. }) => {
@@ -188,6 +204,115 @@ fn sweep_long(seed: u64, count: usize, shape: Shape, flags: Flags) -> Coverage {
         }
     }
     cov
+}
+
+/// The same sweep in **compatibility mode**: long mode's four-level walk under
+/// a 32-bit code segment.
+///
+/// The fourth world, and the encodings are [`synthesize`]'s rather than
+/// [`synthesize64`]'s — because the decoder is driven at `Bits::B32` here, so
+/// `40`-`4f` are `INC` and `DEC` again and nothing can name a register above
+/// seven. What is different from the paged sweep beside it is the *walk*:
+/// four levels of eight-byte entries rather than two of four, which is a
+/// different tick column and a different set of accessed bits, both compared.
+/// And what is different from the long-mode sweep is segmentation, which is
+/// back in force for the data registers.
+fn sweep_compat(seed: u64, count: usize, shape: Shape, flags: Flags) -> Coverage {
+    let mut rng = Lcg(seed);
+    let mut cov = Coverage::default();
+    for n in 0..count {
+        let len = 1 + (rng.next() % 12) as usize;
+        let case = Case::seeded(generate(&mut rng, len))
+            .with_shape(shape)
+            .with_flags(flags)
+            .compat();
+        match compare(&case) {
+            Ok(Verdict::Agreed { insns, .. }) => {
+                cov.agreed += 1;
+                cov.insns += insns;
+            }
+            Ok(Verdict::Trapped { insns }) => {
+                cov.trapped += 1;
+                cov.insns += insns;
+            }
+            Ok(Verdict::Nothing) => cov.nothing += 1,
+            Err(e) => {
+                panic!("compat case {n} of seed {seed:#x} diverged under {shape:?}/{flags:?}:\n{e}")
+            }
+        }
+    }
+    cov
+}
+
+/// The corpus in compatibility mode, under all six shape-and-flag frontends.
+///
+/// A 64-bit kernel is in this world whenever it runs a 32-bit program, so it
+/// is reachable on `pc64` and `q35-linux` rather than merely legal — and
+/// `World::of` has accepted it all along, because it asks `Sys::sixty_four`,
+/// which is `EFER.LMA` **and** `CS.L`. Nothing generated had ever put a case
+/// in it. It is also the state `cpu::x86::engine`'s `narrow_state_is_clean`
+/// exists for.
+#[test]
+fn the_same_corpus_agrees_in_compatibility_mode() {
+    let mut total = Coverage::default();
+    for (n, shape) in [Shape::BasicBlock, Shape::Extended, Shape::Trace]
+        .into_iter()
+        .enumerate()
+    {
+        for (m, flags) in [Flags::Eager, Flags::Elide].into_iter().enumerate() {
+            let seed = 0xc0a1_0000 + (n as u64) * 16 + m as u64;
+            let cov = sweep_compat(seed, 400, shape, flags);
+            assert!(
+                cov.agreed > 200,
+                "{shape:?}/{flags:?} compat: only {} of 400 cases ran to completion ({} \
+                 trapped, {} lifted nothing)",
+                cov.agreed,
+                cov.trapped,
+                cov.nothing
+            );
+            total.agreed += cov.agreed;
+            total.trapped += cov.trapped;
+            total.nothing += cov.nothing;
+            total.insns += cov.insns;
+        }
+    }
+    assert!(
+        total.trapped > 0,
+        "no compatibility-mode case reached a fault, so the precise-state column was never \
+         tested there"
+    );
+    assert!(
+        total.insns > 3_000,
+        "only {} guest instructions retired across the compatibility-mode corpus",
+        total.insns
+    );
+}
+
+/// The compatibility-mode corpus through the translation runtime.
+///
+/// The entry translation is a four-level walk here under a 32-bit code
+/// segment, and it happens on every execution — including a block served from
+/// the cache and one reached by following a patched exit.
+#[test]
+fn the_compatibility_mode_corpus_agrees_through_the_cached_and_chained_runtime() {
+    let mut rng = Lcg(0xc0a1_beef);
+    let (mut agreed, mut trapped, mut nothing) = (0usize, 0usize, 0usize);
+    for n in 0..400 {
+        let len = 1 + (rng.next() % 12) as usize;
+        let case = Case::seeded(generate(&mut rng, len)).compat();
+        match compare_cached(&case, 32) {
+            Ok(Verdict::Agreed { .. }) => agreed += 1,
+            Ok(Verdict::Trapped { .. }) => trapped += 1,
+            Ok(Verdict::Nothing) => nothing += 1,
+            Err(e) => panic!("cached compat case {n} diverged:\n{e}"),
+        }
+    }
+    assert!(
+        agreed > 200,
+        "only {agreed} of 400 cached compatibility-mode cases ran to completion ({trapped} \
+         trapped, {nothing} lifted nothing)"
+    );
+    assert!(trapped > 0, "no cached compatibility-mode case reached a fault");
 }
 
 #[test]

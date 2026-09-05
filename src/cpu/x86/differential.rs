@@ -74,6 +74,22 @@
 //! **accessed and dirty bits both engines wrote are a compared column** rather
 //! than an assumption.
 //!
+//! [`Case::compat`] is the **fourth**, and it is neither of the two it sits
+//! between: `EFER.LMA` set, so the walk is IA-32e's four levels of eight-byte
+//! entries and the interrupt structures are long mode's, under a **32-bit**
+//! code segment. [`lift::World::of`] asks `Sys::sixty_four`, which is `LMA`
+//! *and* `CS.L`, so it has accepted this world all along and nothing generated
+//! had ever put a case in it. Three things separate it from the two it looks
+//! like: the decoder is driven at [`Bits::B32`], so it runs [`synthesize`]'s
+//! corpus and not [`synthesize64`]'s; segmentation is back in force for the
+//! data registers, where 64-bit mode defines base, limit and type away; and
+//! `cpu::x86::engine`'s `narrow_state_is_clean` is a check that can fire
+//! rather than a formality, because this is exactly the state its
+//! documentation names — a 64-bit kernel's leftovers still in the register
+//! file when a 32-bit code segment starts executing. A 64-bit kernel is in it
+//! whenever it runs a 32-bit program, so it is reachable on `pc64` and
+//! `q35-linux` rather than merely legal.
+//!
 //! [`Case::long`] is the third, and it is the second plus what long mode
 //! requires: `CR4.PAE`, `EFER.LME` with the `LMA` the processor sets, and a
 //! code segment with its `L` bit set. The walk becomes four levels of
@@ -177,6 +193,67 @@
 //! whose first draft wrote the same zero to both the right address and the
 //! wrong one and caught nothing.
 //!
+//! # What the corpus reaches, and the three things widening it found
+//!
+//! [`synthesize`] and [`synthesize64`] are the coverage claim, so what they do
+//! *not* draw is a gap with no symptom: a form nobody generates is a path
+//! nobody compares, and every sweep still passes. Both were widened this
+//! round, from fifty-six forms to ninety-eight and from sixty-two to
+//! ninety-seven, and what went in is what an audit of [`lift`] against them
+//! said was unreachable:
+//!
+//! * **a 16-bit operand size**, which is a whole operand *width* the lifter
+//!   has always had and neither corpus had ever written — `set_szp` at bit
+//!   fifteen, `add`'s carry and `sub`'s borrow at sixteen, a rotate's overflow
+//!   off bits fifteen and fourteen, `MUL` into `DX:AX`, `CBW`'s half-width
+//!   arm, and a word write that must **preserve** the doubleword above it
+//!   where a doubleword write zero-extends;
+//! * **`AH`, `CH`, `DH` and `BH`** — byte register numbers four to seven,
+//!   which are the *top* halves of the first four registers and are why
+//!   [`Opcode::EXTRACT`](crate::ir::Opcode::EXTRACT)'s documentation names
+//!   x86. One form reached them;
+//! * **`Lifter::ea`'s SIB arm** — a base, a scaled index, "no index" and "no
+//!   base" — which nothing generated at all, because every memory form was
+//!   `mod=01` with a base of zero to three. The long-mode draw has to *make*
+//!   an index register, because both windows are two and a half tebibytes up
+//!   and two pointers added together are nowhere;
+//! * **`mod=10`'s 32-bit displacement, `mod=00`'s bare one, and the direct
+//!   offsets** (`A0`-`A3`), the last of which is the only encoding whose
+//!   immediate is an *address* — a `moffs64` in long mode, and the only reason
+//!   `Lifter::ea`'s `None` arm exists;
+//! * **`MOVZX`/`MOVSX` from a word**, the other arm of `Plan::MovX`'s
+//!   `src_size`;
+//! * **the accumulator-immediate forms and group `80`**, which are second and
+//!   third encodings of operations already covered and the only ones that
+//!   reach `Arg::Al` and `Arg::Ax`;
+//! * **`PUSH imm`, `LEAVE`, `CALL rel`, `JMP rel` and the near `Jcc`**, which
+//!   hand-written cases reached and the generator did not — including the
+//!   merged `CALL` whose self-modifying-code exit resumes at the call's
+//!   *target*.
+//!
+//! Three things came out of it, and none of them is a lifter bug:
+//!
+//! 1. **`CMOVcc` had never been generated in a 32-bit world at all.** It is a
+//!    property of the *instance* — `Exec` raises `#UD` for one on a part
+//!    without the feature and [`lift`] refuses it there — and the unpaged
+//!    sweep ran a 386, which has it clear. The form was drawn six hundred
+//!    times a sweep and lifted nothing every time. Half the unpaged cases now
+//!    run on a part that has it.
+//! 2. **[`synthesize64`]'s byte shift had no immediate.** `C0 /n` takes an
+//!    `ib` and the arm did not push one, so every draw of it swallowed the
+//!    first byte of the instruction after it and shifted the rest of the
+//!    program along. Both engines still agreed, because both decode the same
+//!    bytes; what was lost is that the form after it was not the form the
+//!    generator drew.
+//! 3. Neither of those has a symptom a sweep can report, which is why
+//!    `every_generated_form_is_one_the_frontend_lifts` is now a test: it
+//!    checks **form by form** that what the generator can draw is something
+//!    the frontend lifts, in both of the parts the sweeps run. A form that
+//!    quietly leaves the subset fails it, where the thresholds — counted over
+//!    whole programs — would not notice.
+//!
+//! ## The mutation that survived, and why the shape test is the answer
+//!
 //! The one that survived: making a `CL` shift claim it writes its flags
 //! **unconditionally**, so the boundary before it elides them. That is a wrong
 //! statement about the instruction and it is not an observable one, for a
@@ -197,7 +274,9 @@
 //!   and paging on a part with one translation buffer**, none of which
 //!   [`lift::World::of`] accepts. Paging on a part with two is covered — see
 //!   [`Case::paged`] — and so is long mode, which this list named for four
-//!   rounds; see [`Case::long`].
+//!   rounds; see [`Case::long`]. Compatibility mode's **32-bit** code segments
+//!   are covered too, and are a world rather than a sixth policy; see
+//!   [`Case::compat`].
 //! * **The three computed near transfers in long mode.** `RET`, `JMP r/m` and
 //!   `CALL r/m` end a block there rather than being lifted, because a
 //!   non-canonical target is a `#GP` at the transfer that a block cannot
@@ -403,6 +482,17 @@ pub struct Case {
     /// IA-32e paging requires `CR4.PAE` (*Intel SDM* volume 3 §9.8.5). See
     /// [`Case::long`].
     pub long: bool,
+    /// Whether this case runs in **compatibility mode**.
+    ///
+    /// The fourth world, and the one that is neither of the two it is made
+    /// of: a processor with `EFER.LMA` set — so the walk is IA-32e's four
+    /// levels of eight-byte entries and the interrupt structures are long
+    /// mode's — executing a **32-bit** code segment, where segmentation is
+    /// back in force for the data registers and `Bits::B32` is what the
+    /// decoder is driven with. `World::of` asks `Sys::sixty_four`, which is
+    /// `LMA` *and* `CS.L`, so this is a world it accepts and nothing
+    /// generated had ever put it in. See [`Case::compat`].
+    pub compat: bool,
 }
 
 impl Case {
@@ -421,6 +511,7 @@ impl Case {
             flags: Flags::default(),
             paged: false,
             long: false,
+            compat: false,
         }
     }
 
@@ -428,7 +519,7 @@ impl Case {
     /// two engines are compared over.
     #[must_use]
     pub const fn ram_size(&self) -> u64 {
-        if self.long {
+        if self.long || self.compat {
             LONG_RAM_SIZE
         } else if self.paged {
             PAGED_RAM_SIZE
@@ -559,6 +650,38 @@ impl Case {
     #[must_use]
     pub const fn long(mut self) -> Case {
         self.long = true;
+        self = self.paged();
+        self
+    }
+
+    /// The same case in **compatibility mode**, which is long mode's tables
+    /// under a 32-bit code segment.
+    ///
+    /// A world rather than a policy, and the one a 64-bit kernel is in
+    /// whenever it runs a 32-bit program — so it is reachable on `pc64` and
+    /// `q35-linux` rather than merely legal. What makes it a *different*
+    /// world from either of the two it sits between:
+    ///
+    /// * the walk is **IA-32e's four levels of eight-byte entries**, as long
+    ///   mode's is, and not the two-level legacy walk [`Case::paged`] uses;
+    /// * the decoder is driven at [`Bits::B32`], so `40`-`4f` are `INC` and
+    ///   `DEC` again and no encoding can name a register above seven — which
+    ///   is why this world runs [`synthesize`]'s corpus and not
+    ///   [`synthesize64`]'s;
+    /// * **segmentation is back**: `DS`, `ES` and `SS` have a base and a
+    ///   limit again, where 64-bit mode defines all three away, so an access
+    ///   past the window is a `#GP` from a segment limit rather than a `#PF`
+    ///   from an unmapped page;
+    /// * and `cpu::x86::engine`'s `narrow_state_is_clean` is a real check
+    ///   here rather than a formality — this is precisely the state its
+    ///   documentation names, "a 64-bit kernel's leftovers still in the file
+    ///   when a 32-bit code segment starts executing".
+    ///
+    /// `lift::key` separates it from long mode on bit seven, which is the one
+    /// bit that says the two are the same part in two worlds.
+    #[must_use]
+    pub const fn compat(mut self) -> Case {
+        self.compat = true;
         self = self.paged();
         self
     }
@@ -1149,7 +1272,7 @@ pub fn machine(case: &Case) -> (Arc<AddressSpace>, Arc<RamStore>) {
     // happens to hold.
     ram.write_u8(at + case.program.len() as u64, 0xf4)
         .expect("the terminator fits");
-    if case.long {
+    if case.long || case.compat {
         map_pages64(&ram);
     } else if case.paged {
         map_pages(&ram);
@@ -1204,7 +1327,7 @@ pub fn system(case: &Case) -> Sys {
             ar: DATA32,
         };
     }
-    if case.long {
+    if case.long || case.compat {
         // The order is the manual's, minus the guest instructions that would
         // have performed it: `CR4.PAE`, `CR3`, `EFER.LME`, then `CR0.PG` —
         // at which point *the processor* sets `EFER.LMA`. This harness sets
@@ -2264,14 +2387,35 @@ pub fn synthesize(form: u32, fields: u32) -> Vec<u8> {
     // Halfword-granular and small, so a taken branch lands on a real
     // instruction boundary more often than not and never leaves the page.
     let rel = ((((fields >> 24) & 0x1f) as i32) - 16) as i8;
+    // A byte register number over the **whole** eight, so numbers four to
+    // seven — `AH`, `CH`, `DH` and `BH`, which are the *top* halves of
+    // `EAX`..`EBX` and are what `Opcode::EXTRACT`'s documentation names x86
+    // for. Everything else in this generator writes `reg & 3`.
+    let breg = ((fields >> 4) & 7) as u8;
+    let breg2 = ((fields >> 20) & 7) as u8;
+    // A high byte register only: `mov ah, imm` and `setcc bh` are the two
+    // forms here that *write* one, and a write of at most `0x3f` into the
+    // second byte of a data-window pointer leaves it inside the segment.
+    let high = 4 | (breg & 3);
+    // An absolute offset inside the data window, for the addressing modes
+    // whose whole address is the displacement.
+    let window = (DATA as u32) + ((fields >> 3) & 0xff8);
 
     // `mod=11` — both operands are registers.
     let rr = |op: u8, r: u8, m: u8| vec![op, 0xc0 | (r << 3) | m];
     // `mod=01` — a base register and an 8-bit displacement. Base 4 would need
     // a SIB byte and base 5 is `EBP`, so the two are simply not generated.
     let rm8 = |op: u8, r: u8, b: u8, d: i8| vec![op, 0x40 | (r << 3) | b, d as u8];
+    // The same two behind a `66` operand-size prefix, and a group encoding
+    // with the extension in the `reg` field.
+    let rr16 = |op: u8, r: u8, m: u8| vec![0x66, op, 0xc0 | (r << 3) | m];
+    let rm16 = |op: u8, r: u8, b: u8, d: i8| vec![0x66, op, 0x40 | (r << 3) | b, d as u8];
+    let grp16 = |op: u8, n: u8, m: u8| vec![0x66, op, 0xc0 | (n << 3) | m];
+    // A SIB byte. `index == 4` means *no index* and `base == 5` with `mod == 0`
+    // means *no base*, which are two separate arms of `Lifter::ea`.
+    let sib = |scale: u8, index: u8, b: u8| (scale << 6) | (index << 3) | b;
 
-    match form % 56 {
+    match form % 98 {
         // -- the ALU, register to register, at three widths -----------------
         0 => rr(0x01, reg, rm),         // add r/m32, r32
         1 => rr(0x03, reg, rm),         // add r32, r/m32
@@ -2394,6 +2538,219 @@ pub fn synthesize(form: u32, fields: u32) -> Vec<u8> {
             let ext = (fields >> 24) as u8 & 7;
             vec![0xd2, 0xc0 | (ext << 3) | (rm & 7)]
         }
+        // -- a 16-bit operand size, which neither corpus had at all ---------
+        //
+        // `66` is a whole operand **width** rather than a policy, and every
+        // one of these was already lifted and never compared: `set_szp` reads
+        // bit fifteen, `add`'s carry is at sixteen, `sub`'s borrow with it,
+        // a rotate's overflow comes off bits fifteen and fourteen, and a word
+        // write is a `deposit` that must **preserve** the doubleword above it
+        // where a doubleword write zero-extends.
+        55 => rr16(0x01, reg, rm),  // add r/m16, r16
+        56 => rr16(0x03, reg, rm),  // add r16, r/m16
+        57 => rr16(0x19, reg, rm),  // sbb — the borrow at a width neither
+        58 => rr16(0x29, reg, rm),  // sub    corpus reached
+        59 => rr16(0x31, reg, rm),  // xor
+        60 => rr16(0x39, reg, rm),  // cmp
+        61 => rr16(0x85, reg, rm),  // test
+        62 => rr16(0x89, reg, rm),  // mov r/m16, r16
+        63 => rm16(0x8b, reg, base, disp), // mov r16, [base+d]
+        64 => rm16(0x89, reg, base, disp), // mov [base+d], r16
+        65 => {
+            let ext = (fields >> 24) as u8 & 7;
+            let mut out = grp16(0xc1, ext, rm); // shift r/m16, imm8
+            out.push(imm8 & 0x1f);
+            out
+        }
+        // A shift by `CL` at sixteen bits: the count masks to five bits at
+        // every width but sixty-four, so a count of 16..31 shifts a word
+        // *out* of existence and the carry it leaves is not the one a
+        // sixteen-bit reading would give.
+        66 => grp16(0xd3, (fields >> 24) as u8 & 7, rm),
+        // `MUL`, `IMUL`, `NOT` and `NEG` at sixteen bits, where the product
+        // is `DX:AX` rather than `EDX:EAX`. `/6` and `/7` are `DIV` and
+        // `IDIV`, which are outside the subset.
+        67 => grp16(0xf7, [2u8, 3, 4, 5][((fields >> 24) & 3) as usize], rm),
+        68 => vec![0x66, 0x0f, 0xaf, 0xc0 | (reg << 3) | rm], // imul r16, r/m16
+        69 => vec![0x66, if fields & 1 == 0 { 0x40 | reg } else { 0x48 | reg }],
+        // `CBW` and `CWD` at this size are `AL`→`AX` and `AX`→`DX:AX`, which
+        // is the *half*-width case `Plan::Cbw`'s table has and the corpus
+        // only ever drove at thirty-two.
+        70 => vec![0x66, if fields & 1 == 0 { 0x98 } else { 0x99 }],
+        71 => {
+            let mut out = vec![0x66, 0xb8 | reg]; // mov r16, imm16
+            out.extend_from_slice(&(imm32 as u16).to_le_bytes());
+            out
+        }
+        72 => {
+            let mut out = grp16(0x83, (fields >> 24) as u8 & 7, rm);
+            out.push(imm8);
+            out
+        }
+        73 => vec![0x66, 0x0f, 0x40 | cc, 0xc0 | (reg << 3) | rm], // cmovcc r16
+        // `BSWAP` at a 16-bit operand is undefined in the manual and is a
+        // **doubleword** swap on the silicon, which `Exec` reproduces — so
+        // the frontend has to reproduce it too, and nothing checked that.
+        74 => vec![0x66, 0x0f, 0xc8 | reg],
+        // -- `MOVZX`/`MOVSX` from a **word** --------------------------------
+        //
+        // `Plan::MovX` takes `src_size` from whether the source is `Arg::Eb`,
+        // so the two-byte arm of it is a different number and the corpus only
+        // ever wrote the one-byte one.
+        75 => vec![
+            0x0f,
+            if fields & 1 == 0 { 0xb7 } else { 0xbf },
+            0xc0 | (reg << 3) | rm,
+        ],
+        76 => vec![
+            0x0f,
+            if fields & 1 == 0 { 0xb7 } else { 0xbf },
+            0x40 | (reg << 3) | base,
+            disp as u8,
+        ],
+        // -- `AH`, `CH`, `DH` and `BH` --------------------------------------
+        //
+        // A byte register number of four to seven is the *top* half of one of
+        // the first four registers, which is why `Lifter::read_reg` has a
+        // `pos` of eight and `Lifter::shift_slot` exists — and the corpus
+        // wrote `reg & 3` everywhere, so the whole of that path was reached
+        // by one form. These four read one without writing anything, write
+        // one with a value small enough to keep a pointer inside its segment,
+        // and move one down into a low byte.
+        77 => rr(0x84, breg, breg2),   // test r/m8, r8
+        78 => rr(0x38, breg, breg2),   // cmp r/m8, r8
+        79 => rr(0x8a, reg & 3, breg), // mov r8, r/m8 — a high byte read
+        80 => vec![0xb0 | high, imm8 & 0x3f], // mov ah/ch/dh/bh, imm8
+        81 => vec![0x0f, 0x90 | cc, 0xc0 | high], // setcc ah/ch/dh/bh
+        // Group `80`: the byte-width immediate group, which is a third
+        // encoding of the eight ALU operations and was not generated at all.
+        82 => vec![0x80, 0xc0 | (((fields >> 24) as u8 & 7) << 3) | (rm & 3), imm8],
+        // -- the accumulator-immediate forms --------------------------------
+        //
+        // A different *encoding* of operations the corpus already covers, and
+        // the only one that reaches `Arg::Al` and `Arg::Ax` — the two operand
+        // kinds `Lifter::read_arg` answers with a fixed register number and
+        // no `REX` bit, whatever prefix the instruction carries.
+        83 => match (fields >> 28) & 7 {
+            0 => {
+                let mut out = vec![0x05]; // add eax, imm32
+                out.extend_from_slice(&imm32.to_le_bytes());
+                out
+            }
+            1 => {
+                let mut out = vec![0x2d]; // sub eax, imm32
+                out.extend_from_slice(&imm32.to_le_bytes());
+                out
+            }
+            2 => {
+                let mut out = vec![0x25]; // and eax, imm32
+                out.extend_from_slice(&imm32.to_le_bytes());
+                out
+            }
+            3 => {
+                let mut out = vec![0x3d]; // cmp eax, imm32
+                out.extend_from_slice(&imm32.to_le_bytes());
+                out
+            }
+            4 => {
+                let mut out = vec![0xa9]; // test eax, imm32
+                out.extend_from_slice(&imm32.to_le_bytes());
+                out
+            }
+            5 => vec![0x04, imm8], // add al, imm8
+            6 => vec![0x0c, imm8], // or  al, imm8
+            _ => vec![0xa8, imm8], // test al, imm8
+        },
+        // -- the addressing modes the corpus never wrote --------------------
+        //
+        // `Lifter::ea`'s SIB arm — the base, the scaled index, "no index" and
+        // "no base" — was reached by nothing at all: every memory form above
+        // is `mod=01` with a base of zero to three. The base and the index
+        // here are two of the four data-window pointers and the scale is at
+        // most one, so `base + index*2 + disp` stays inside the window
+        // whatever the draw.
+        84 => vec![
+            0x8b,
+            0x44 | (reg << 3),
+            sib(
+                ((fields >> 10) & 1) as u8,
+                ((fields >> 9) & 1) as u8,
+                ((fields >> 8) & 1) as u8,
+            ),
+            disp as u8,
+        ],
+        // The same with **no index**, which is a different branch of
+        // `Fields::has_index` and the one a compiler emits for `[esp+n]`.
+        85 => vec![
+            0x8b,
+            0x44 | (reg << 3),
+            sib(((fields >> 10) & 3) as u8, 4, base),
+            disp as u8,
+        ],
+        // `mod=00`, `r/m=100`, `base=101`: no base at all, so the
+        // displacement stands alone — the one arm of `Lifter::ea` that reads
+        // no register and the one `Exec::ea_offset` answers the same way.
+        86 => {
+            let mut out = vec![0x8b, 0x04 | (reg << 3), sib(0, 4, 5)];
+            out.extend_from_slice(&window.to_le_bytes());
+            out
+        }
+        // `mod=00`, `r/m=101`: a bare 32-bit displacement, which is absolute
+        // here and `RIP`-relative in long mode.
+        87 => {
+            let mut out = vec![0x8b, (reg << 3) | 5];
+            out.extend_from_slice(&window.to_le_bytes());
+            out
+        }
+        // `mod=10`: the same base with a 32-bit displacement rather than an
+        // 8-bit one.
+        88 => {
+            let mut out = vec![0x8b, 0x80 | (reg << 3) | base];
+            out.extend_from_slice(&i32::from(disp).to_le_bytes());
+            out
+        }
+        // `MOV` to and from a direct offset: no ModRM byte at all, and the
+        // one operand kind whose immediate is an **address** — so its width
+        // follows the address size rather than the operand size.
+        89 => {
+            let mut out = vec![if fields & 1 == 0 { 0xa1 } else { 0xa3 }];
+            out.extend_from_slice(&window.to_le_bytes());
+            out
+        }
+        90 => {
+            let mut out = vec![if fields & 1 == 0 { 0xa0 } else { 0xa2 }];
+            out.extend_from_slice(&window.to_le_bytes());
+            out
+        }
+        // -- the stack, and the direct transfers ----------------------------
+        //
+        // `PUSH imm` is the only push whose operand is not a register, and
+        // `LEAVE`, `CALL rel`, `JMP rel` and the near `Jcc` were reached by
+        // hand-written cases and by nothing generated — including the merged
+        // `CALL` whose self-modifying-code exit has to resume at the call's
+        // *target* rather than after it.
+        91 => {
+            let mut out = vec![0x68]; // push imm32
+            out.extend_from_slice(&imm32.to_le_bytes());
+            out
+        }
+        92 => vec![0x6a, imm8], // push imm8, sign-extended to the stack width
+        93 => vec![0x89, 0xe5, 0xc9], // mov ebp, esp ; leave
+        94 => {
+            let mut out = vec![0xe8]; // call rel32
+            out.extend_from_slice(&i32::from(rel).to_le_bytes());
+            out
+        }
+        95 => {
+            let mut out = vec![0xe9]; // jmp rel32
+            out.extend_from_slice(&i32::from(rel).to_le_bytes());
+            out
+        }
+        96 => {
+            let mut out = vec![0x0f, 0x80 | cc]; // jcc rel32
+            out.extend_from_slice(&i32::from(rel).to_le_bytes());
+            out
+        }
         _ => match (fields >> 28) & 7 {
             0 => vec![0xf8],             // clc
             1 => vec![0xf9],             // stc
@@ -2495,8 +2852,36 @@ pub fn synthesize64(form: u32, fields: u32) -> Vec<u8> {
     };
     // A group encoding with the extension in the `reg` field.
     let group = |w: bool, op: u8, n: u8, m: u8| vec![rex(w, 0, m), op, 0xc0 | (n << 3) | (m & 7)];
+    // The same three behind a `66` operand-size prefix, which is a 16-bit
+    // operand here and **not** a 64-bit one: `REX.W` beats `66`, so every one
+    // of these drops it. Legacy prefixes come before `REX` and `REX` is the
+    // last prefix before the opcode (*Intel SDM* volume 2 §2.2.1).
+    let rr16 = |op: u8, r: u8, m: u8| {
+        vec![0x66, rex(false, r, m), op, 0xc0 | ((r & 7) << 3) | (m & 7)]
+    };
+    let rmd16 = |op: u8, r: u8, b: u8, d: i8| {
+        vec![
+            0x66,
+            rex(false, r, b),
+            op,
+            0x40 | ((r & 7) << 3) | (b & 7),
+            d as u8,
+        ]
+    };
+    let grp16 = |op: u8, n: u8, m: u8| {
+        vec![0x66, rex(false, 0, m), op, 0xc0 | (n << 3) | (m & 7)]
+    };
+    // A byte register number over the whole eight **without** a `REX` prefix,
+    // where four to seven are `AH`, `CH`, `DH` and `BH` — the top halves of
+    // the first four registers rather than `SPL`..`DIL`.
+    let breg = ((fields >> 4) & 7) as u8;
+    let breg2 = ((fields >> 20) & 7) as u8;
+    let high = 4 | (breg & 3);
+    // A SIB byte, and an absolute linear address inside the high window.
+    let sib = |scale: u8, index: u8, b: u8| (scale << 6) | ((index & 7) << 3) | (b & 7);
+    let win64 = HIGH + u64::from(DATA as u32 + ((fields >> 3) & 0xff8));
 
-    match form % 62 {
+    match form % 97 {
         // -- the ALU, register to register, at both operand sizes -----------
         0 => rr(true, 0x01, reg, rm),  // add r/m64, r64
         1 => rr(wide, 0x03, reg, rm),  // add r, r/m
@@ -2555,7 +2940,19 @@ pub fn synthesize64(form: u32, fields: u32) -> Vec<u8> {
         }
         27 => group(true, 0xd1, ext, rm),
         28 => group(true, 0xd3, ext, rm),
-        29 => group(false, 0xc0, ext, rm), // the byte forms
+        29 => {
+            // The byte forms, **with their immediate**. `C0 /n` takes an
+            // `ib` and this arm did not push one, so every draw of it
+            // swallowed the first byte of whatever instruction followed and
+            // shifted the rest of the program along by one. Both engines
+            // still agreed — they decode the same bytes — so nothing failed;
+            // what was lost is that the form after it was not the form the
+            // generator drew. `every_generated_form_is_one_the_frontend_lifts`
+            // is what noticed, because a truncated encoding lifts nothing.
+            let mut out = group(false, 0xc0, ext, rm);
+            out.push(imm8 & 0x1f);
+            out
+        }
         // -- multiplies -----------------------------------------------------
         30 => group(true, 0xf7, 4, rm),  // mul r/m64
         31 => group(true, 0xf7, 5, rm),  // imul r/m64
@@ -2652,6 +3049,202 @@ pub fn synthesize64(form: u32, fields: u32) -> Vec<u8> {
         // a `REX` prefix register number four is `AH`, with one it is `SPL`.
         59 => vec![0xd2, 0xc0 | (ext << 3) | (rm & 7)],
         60 => group(false, 0xd2, ext, rm),
+        // -- a 16-bit operand size, which neither corpus had at all ---------
+        //
+        // A third operand width beside the two this generator already writes,
+        // and the one where a write is a `deposit` that must **preserve** the
+        // sixty-four bits above it — the exact opposite of what the 32-bit
+        // form beside it does. `REX` is present and `REX.W` is not, because
+        // `REX.W` beats `66`.
+        62 => rr16(0x01, reg, rm), // add r/m16, r16
+        63 => rr16(0x03, reg, rm), // add r16, r/m16
+        64 => rr16(0x19, reg, rm), // sbb
+        65 => rr16(0x29, reg, rm), // sub
+        66 => rr16(0x31, reg, rm), // xor
+        67 => rr16(0x39, reg, rm), // cmp
+        68 => rr16(0x89, reg, rm), // mov r/m16, r16
+        69 => rmd16(0x8b, reg, base, disp), // mov r16, [base+d]
+        70 => rmd16(0x89, reg, base, disp), // mov [base+d], r16
+        71 => {
+            let mut out = grp16(0xc1, ext, rm); // shift r/m16, imm8
+            out.push(imm8 & 0x1f);
+            out
+        }
+        72 => grp16(0xd3, ext, rm), // shift r/m16, cl
+        // `MUL`, `IMUL`, `NOT` and `NEG` at sixteen bits, where the product is
+        // `DX:AX`. `/6` and `/7` are `DIV` and `IDIV` and are out of the subset.
+        73 => grp16(0xf7, [2u8, 3, 4, 5][((fields >> 24) & 3) as usize], rm),
+        74 => {
+            let mut out = vec![0x66, rex(false, reg, rm), 0x0f, 0xaf];
+            out.push(0xc0 | ((reg & 7) << 3) | (rm & 7)); // imul r16, r/m16
+            out
+        }
+        // `40+r` is the `REX` prefix, so the 16-bit increments go through
+        // group `FF` exactly as the 64-bit ones do.
+        75 => grp16(0xff, u8::from(fields & 1 == 1), rm),
+        // `CBW` and `CWD` at sixteen bits: `AL`→`AX` and `AX`→`DX:AX`, the
+        // half-width arm of `Plan::Cbw`'s table.
+        76 => vec![0x66, if fields & 1 == 0 { 0x98 } else { 0x99 }],
+        // `BSWAP` at a 16-bit operand is undefined in the manual and is a
+        // doubleword swap on the silicon, which `Exec` reproduces.
+        77 => vec![0x66, rex(false, 0, reg), 0x0f, 0xc8 | (reg & 7)],
+        78 => {
+            let mut out = grp16(0x83, ext, rm); // group 83 at sixteen bits
+            out.push(imm8);
+            out
+        }
+        // -- `MOVZX`/`MOVSX` from a **word** --------------------------------
+        //
+        // `Plan::MovX` takes `src_size` from whether the source is `Arg::Eb`,
+        // and the two-byte arm of it had never been drawn.
+        79 => {
+            let mut out = vec![rex(true, reg, rm), 0x0f];
+            out.push(if fields & 1 == 0 { 0xb7 } else { 0xbf });
+            out.push(0xc0 | ((reg & 7) << 3) | (rm & 7));
+            out
+        }
+        80 => {
+            let mut out = vec![rex(true, reg, base), 0x0f];
+            out.push(if fields & 1 == 0 { 0xb7 } else { 0xbf });
+            out.push(0x40 | ((reg & 7) << 3) | (base & 7));
+            out.push(disp as u8);
+            out
+        }
+        // -- `AH`, `CH`, `DH` and `BH`, which need **no** `REX` -------------
+        //
+        // With any `REX` prefix byte register four is `SPL`; without one it is
+        // `AH`, the *top* half of `RAX`. This generator prefixes nearly
+        // everything, so the second of those had one form — a shift — and
+        // nothing else. These read one without writing anything, move one down
+        // into a low byte, and write one with a value small enough to leave a
+        // data-window pointer inside its own window.
+        81 => vec![0x84, 0xc0 | (breg2 << 3) | breg], // test r/m8, r8
+        82 => vec![0x38, 0xc0 | (breg2 << 3) | breg], // cmp r/m8, r8
+        83 => vec![0x8a, 0xc0 | ((reg & 3) << 3) | breg], // mov r8, r/m8
+        84 => vec![0xb0 | high, imm8 & 0x3f],         // mov ah/ch/dh/bh, imm8
+        85 => vec![0x0f, 0x90 | cc, 0xc0 | high],     // setcc ah/ch/dh/bh
+        // Group `80`: the byte-width immediate group, a third encoding of the
+        // eight ALU operations that was not generated at all.
+        86 => {
+            let mut out = group(false, 0x80, ext, rm);
+            out.push(imm8);
+            out
+        }
+        // -- the accumulator-immediate forms --------------------------------
+        //
+        // The only encodings that reach `Arg::Al` and `Arg::Ax`, which
+        // `Lifter::read_arg` answers with a fixed register number and **no**
+        // `REX` bit whatever prefix the instruction carries.
+        87 => match (fields >> 28) & 7 {
+            0 => {
+                let mut out = vec![0x48, 0x05]; // add rax, imm32
+                out.extend_from_slice(&imm32.to_le_bytes());
+                out
+            }
+            1 => {
+                let mut out = vec![0x48, 0x2d]; // sub rax, imm32
+                out.extend_from_slice(&imm32.to_le_bytes());
+                out
+            }
+            2 => {
+                let mut out = vec![0x48, 0x25]; // and rax, imm32
+                out.extend_from_slice(&imm32.to_le_bytes());
+                out
+            }
+            3 => {
+                let mut out = vec![0x48, 0x3d]; // cmp rax, imm32
+                out.extend_from_slice(&imm32.to_le_bytes());
+                out
+            }
+            4 => {
+                let mut out = vec![0x48, 0xa9]; // test rax, imm32
+                out.extend_from_slice(&imm32.to_le_bytes());
+                out
+            }
+            5 => vec![0x04, imm8], // add al, imm8
+            6 => vec![0x0c, imm8], // or  al, imm8
+            _ => vec![0xa8, imm8], // test al, imm8
+        },
+        // -- the addressing modes the corpus never wrote --------------------
+        //
+        // `Lifter::ea`'s SIB arm was reached by nothing: every memory form
+        // above is `mod=01` with a base and no SIB byte. A scaled index needs
+        // a register holding something small — both windows are two and a
+        // half tebibytes up, so two pointers added together are nowhere — so
+        // this form makes one: `mov r13d, n` zero-extends a value under
+        // sixteen into `R13`, and the access then indexes by it through
+        // `REX.X`, which nothing else in this generator sets.
+        88 => {
+            let n = ((fields >> 2) & 0xf) as u8;
+            let mut out = vec![0x41, 0xc7, 0xc5, n, 0, 0, 0]; // mov r13d, n
+            out.push(0x48 | (((reg >> 3) & 1) << 2) | 2 | ((base >> 3) & 1));
+            out.push(0x8b);
+            out.push(0x40 | ((reg & 7) << 3) | 4);
+            out.push(sib(((fields >> 10) & 3) as u8, 5, base));
+            out.push(disp as u8);
+            out
+        }
+        // The same with **no index**, which is a different branch of
+        // `Fields::has_index` and the one a compiler emits for `[rsp+n]`.
+        89 => vec![
+            rex(true, reg, base),
+            0x8b,
+            0x40 | ((reg & 7) << 3) | 4,
+            sib(((fields >> 10) & 3) as u8, 4, base),
+            disp as u8,
+        ],
+        // `mod=10`: the same base with a 32-bit displacement rather than an
+        // 8-bit one.
+        90 => {
+            let mut out = vec![rex(true, reg, base), 0x8b];
+            out.push(0x80 | ((reg & 7) << 3) | (base & 7));
+            out.extend_from_slice(&i32::from(disp).to_le_bytes());
+            out
+        }
+        // `MOV` to and from a direct offset. In long mode the immediate is a
+        // **`moffs64`** — eight bytes, because the width of this one operand
+        // kind follows the address size and not the operand size — which is
+        // the only encoding in the instruction set that carries a full 64-bit
+        // address, and the only reason `Lifter::ea`'s `None` arm exists.
+        91 => {
+            let mut out = vec![0x48, if fields & 1 == 0 { 0xa1 } else { 0xa3 }];
+            out.extend_from_slice(&win64.to_le_bytes());
+            out
+        }
+        // -- the stack, and the direct transfers ----------------------------
+        //
+        // `PUSH imm` is the only push whose operand is not a register;
+        // `LEAVE`, `CALL rel`, `JMP rel` and the near `Jcc` were reached by
+        // hand-written cases and by nothing generated — including the merged
+        // `CALL` whose self-modifying-code exit resumes at the call's target.
+        92 => match (fields >> 28) & 3 {
+            0 => {
+                let mut out = vec![0x68]; // push imm32, sign-extended to 64
+                out.extend_from_slice(&imm32.to_le_bytes());
+                out
+            }
+            1 => vec![0x6a, imm8],                // push imm8
+            2 => vec![0x48, 0x89, 0xe5, 0xc9],    // mov rbp, rsp ; leave
+            _ => vec![0xeb, rel as u8],           // jmp rel8
+        },
+        93 => {
+            let mut out = vec![0xe8]; // call rel32
+            out.extend_from_slice(&i32::from(rel).to_le_bytes());
+            out
+        }
+        94 => {
+            let mut out = vec![if fields & 1 == 0 { 0xe9 } else { 0x0f }];
+            if fields & 1 != 0 {
+                out.push(0x80 | cc); // jcc rel32
+            }
+            out.extend_from_slice(&i32::from(rel).to_le_bytes());
+            out
+        }
+        95 => {
+            let mut out = rr(true, 0x69, reg, rm); // imul r64, r/m64, imm32
+            out.extend_from_slice(&imm32.to_le_bytes());
+            out
+        }
         _ => match (fields >> 28) & 7 {
             0 => vec![0xf8],       // clc
             1 => vec![0xf9],       // stc
@@ -2722,6 +3315,7 @@ mod tests {
             Case::new(vec![0xf4]),
             Case::new(vec![0xf4]).paged(),
             Case::new(vec![0xf4]).long(),
+            Case::new(vec![0xf4]).compat(),
         ] {
             let (space, _ram) = machine(&case);
             let cpu = oracle(&case, space);
@@ -2782,6 +3376,52 @@ mod tests {
     /// Asserted separately because "both engines left RAM identical" is true
     /// of a machine where neither engine touched a page table at all, and that
     /// would be a harness measuring nothing.
+    /// Compatibility mode is a **fourth world** rather than a re-run of the
+    /// paged one, and the walk is what says so.
+    ///
+    /// The same bytes, the same segment bases, the same physical frames — and
+    /// four levels of eight-byte entries rather than two of four, which is two
+    /// more descriptor reads for every translation that misses the buffer.
+    /// That is a tick column, and both engines have to agree about it, so a
+    /// harness that had quietly built the legacy walk here would be running
+    /// `the_same_corpus_agrees_with_paging_on` a second time under a different
+    /// name.
+    #[test]
+    fn compatibility_mode_walks_four_levels_where_the_paged_world_walks_two() {
+        // A load and a store through a data segment, so the walk happens and
+        // the dirty bit is written.
+        let program = vec![0x8b, 0x03, 0x89, 0x43, 0x04, 0xf4];
+        let legacy = Case::seeded(program.clone()).paged();
+        let compat = Case::seeded(program).compat();
+        let (a, b) = match (compare(&legacy), compare(&compat)) {
+            (Ok(a), Ok(b)) => (a, b),
+            (a, b) => panic!("{a:?}\n{b:?}"),
+        };
+        let (
+            Verdict::Agreed {
+                insns: ia,
+                ticks: ta,
+            },
+            Verdict::Agreed {
+                insns: ib,
+                ticks: tb,
+            },
+        ) = (a.clone(), b.clone())
+        else {
+            panic!("both worlds run this program to completion: {a:?} {b:?}");
+        };
+        assert_eq!(ia, ib, "the same bytes retire the same instructions");
+        assert!(
+            tb > ta,
+            "compatibility mode cost no more than the two-level walk ({ta} against {tb}), so \
+             it is not walking four levels"
+        );
+        // And it is the *32-bit* world, not long mode's: `World::of` derives
+        // the code segment's width from `Sys::sixty_four`, which is `LMA` and
+        // `CS.L` together.
+        assert!(!world(&Case::new(vec![0xf4]).compat()).long());
+    }
+
     #[test]
     fn a_paged_case_writes_the_accessed_and_dirty_bits() {
         let program = vec![0x8b, 0x03, 0x89, 0x43, 0x04, 0xf4];
@@ -3002,6 +3642,63 @@ mod tests {
                     assert!(run.compiled > 0, "{flags:?}/{smc:?} compiled nothing");
                 }
             }
+        }
+    }
+
+    /// Every form the generator can draw must be one the frontend actually
+    /// lifts — or one of the two it is deliberately asked to refuse.
+    ///
+    /// A form that quietly left the subset would keep every sweep passing: the
+    /// case would report [`Verdict::Nothing`], the thresholds are counted over
+    /// whole programs rather than over forms, and the coverage the form was
+    /// added for would simply stop happening. That is the failure this test
+    /// exists for, and it is checked form by form rather than in aggregate.
+    #[test]
+    fn every_generated_form_is_one_the_frontend_lifts() {
+        for (long, forms) in [(false, 98u32), (true, 97u32)] {
+            let mut refused = Vec::new();
+            for form in 0..forms {
+                let mut lifted = false;
+                'draws: for draw in 0..64u32 {
+                    let fields = draw.wrapping_mul(0x9e37_79b9).rotate_left(draw % 32)
+                        ^ (draw << 7);
+                    let bytes = if long {
+                        synthesize64(form, fields)
+                    } else {
+                        synthesize(form, fields)
+                    };
+                    // Both parts the sweeps run, because one of them decides
+                    // whether an encoding is in the subset at all: `CMOVcc`
+                    // raises `#UD` on a 386 and the frontend refuses it there
+                    // (`World::cmov`), so a form carrying one lifts on the
+                    // wider part and nowhere else.
+                    for wide in [false, true] {
+                        let case = Case::seeded(bytes.clone());
+                        let case = if long {
+                            case.long()
+                        } else if wide {
+                            Case {
+                                variant: Variant::X86_64,
+                                ..case
+                            }
+                        } else {
+                            case
+                        };
+                        if !matches!(compare(&case), Ok(Verdict::Nothing)) {
+                            lifted = true;
+                            break 'draws;
+                        }
+                    }
+                }
+                if !lifted {
+                    refused.push(form);
+                }
+            }
+            assert!(
+                refused.is_empty(),
+                "{} form(s) the generator draws lift nothing at all: {refused:?}",
+                refused.len(),
+            );
         }
     }
 

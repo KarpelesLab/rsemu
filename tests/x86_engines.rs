@@ -142,6 +142,18 @@ enum World {
     Flat,
     /// 64-bit long mode over a four-level identity map.
     Long,
+    /// **Compatibility mode**: the same four-level map and the same
+    /// `EFER.LMA`, under a 32-bit code segment.
+    ///
+    /// Neither of the two it sits between, and a world `lift::World::of`
+    /// accepts because it asks `Sys::sixty_four` — which is `LMA` **and**
+    /// `CS.L`. The block key separates it from long mode on one bit, the
+    /// decoder is driven at `Bits::B32`, and it is the state
+    /// `cpu::x86::engine::narrow_state_is_clean` was written for: a 64-bit
+    /// kernel's leftovers still in the register file when a 32-bit code
+    /// segment starts executing. A 64-bit kernel is in it whenever it runs a
+    /// 32-bit program, so it is reachable on `pc64` rather than merely legal.
+    Compat,
 }
 
 /// A selector value. Nothing loads a descriptor here — the hidden caches are
@@ -190,7 +202,7 @@ fn board(engine: &str, world: World, tag: &str) -> (Machine, Arc<X86>) {
             )
             .expect("the program fits in RAM");
     }
-    if world == World::Long {
+    if world != World::Flat {
         map_identity(&space);
     }
     cpu.set_sys(system(world));
@@ -208,6 +220,7 @@ fn board(engine: &str, world: World, tag: &str) -> (Machine, Arc<X86>) {
 /// The system registers for `world`.
 fn system(world: World) -> Sys {
     let long = world == World::Long;
+    let paged = world != World::Flat;
     let mut sys = Sys::reset();
     sys.cr0 |= cr0::PE;
     // A zero-limit interrupt table, on purpose: nothing in this guest faults,
@@ -237,12 +250,17 @@ fn system(world: World) -> Sys {
             ar: ar::PRESENT | ar::S | ar::RW | ar::ACCESSED | ar::DB,
         };
     }
-    if long {
+    if paged {
         // The manual's order, minus the instructions that would have performed
         // it: `CR4.PAE`, `CR3`, `EFER.LME`, then `CR0.PG` — at which point the
         // processor sets `EFER.LMA`. Both bits are written here because this
         // builds the state rather than reaching it; `cpu::x86::tests` is where
         // the transition is executed as real instructions.
+        //
+        // Compatibility mode is exactly this state with the code segment's
+        // `L` bit clear and its `D` bit set, which the descriptor above
+        // already says — so the *only* difference between the two paged
+        // worlds here is one bit of one descriptor, which is the point.
         sys.cr4 |= cr4::PAE;
         sys.cr3 = PML4;
         sys.efer |= efer::LME | efer::LMA;
@@ -340,6 +358,20 @@ fn every_engine_hashes_to_the_same_machine_with_paging_off() {
 #[test]
 fn every_engine_hashes_to_the_same_machine_in_long_mode() {
     every_engine_agrees(World::Long, 40, 4);
+}
+
+/// The same gate in **compatibility mode**, which is a third world rather than
+/// a second run of either.
+///
+/// The four-level walk and the 64-bit interrupt structures of long mode, under
+/// a 32-bit code segment — so the decoder is driven at `Bits::B32`, the block
+/// key differs from long mode's in one bit, segmentation is back in force for
+/// the data registers, and `engine::narrow_state_is_clean` is a check that can
+/// actually fire rather than a formality. It is what a 64-bit kernel is in
+/// while it runs a 32-bit program.
+#[test]
+fn every_engine_hashes_to_the_same_machine_in_compatibility_mode() {
+    every_engine_agrees(World::Compat, 40, 4);
 }
 
 #[test]

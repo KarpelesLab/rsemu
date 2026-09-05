@@ -47,15 +47,18 @@
 //! `state_roundtrip` gives: a dependency bump must not reinterpret every
 //! committed seed.
 //!
-//! # Twelve frontends, in three worlds
+//! # Twelve frontends, in four worlds
 //!
 //! The header's first byte picks a [`Shape`], a [`Smc`] policy and a [`Flags`]
 //! policy, and whether the run goes through `compare` or through
 //! `compare_cached`. All of them are separate frontends in everything that
 //! matters — every one is in the block's cache key, and each emits different IR
-//! from the same bytes. Two more bits pick the *world*: 32-bit protected mode,
-//! the same with `CR0.PG` set, or long mode — which is paged by construction,
-//! because `EFER.LMA` is set only when `CR0.PG` goes on with `EFER.LME`.
+//! from the same bytes. Three more bits pick the *world*: 32-bit protected
+//! mode, the same with `CR0.PG` set, long mode — which is paged by
+//! construction, because `EFER.LMA` is set only when `CR0.PG` goes on with
+//! `EFER.LME` — and **compatibility mode**, which is long mode's four-level
+//! walk under a 32-bit code segment and therefore runs the *32-bit*
+//! encodings.
 
 use libfuzzer_sys::fuzz_target;
 
@@ -105,6 +108,13 @@ fuzz_target!(|data: &[u8]| {
     // needs its own encodings, because `40`-`4f` are `INC` and `DEC` in one
     // world and the prefix in the other.
     let long = policies & 0x40 != 0;
+    // The sixth world: compatibility mode — long mode's four-level walk and
+    // its `EFER.LMA` under a **32-bit** code segment, which is what a 64-bit
+    // kernel is in whenever it runs a 32-bit program. It runs `synthesize`'s
+    // encodings rather than `synthesize64`'s, because the decoder is driven at
+    // `Bits::B32` there, so it is a world the long-mode bit must not also
+    // claim.
+    let compat = !long && policies & 0x80 != 0;
 
     let available = (data.len() - HEADER) / STRIDE;
     let want = 1 + usize::from(data[1]) % MAX_INSNS;
@@ -137,6 +147,8 @@ fuzz_target!(|data: &[u8]| {
     let seeded = Case::seeded(program).with_shape(shape).with_smc(smc).with_flags(flags);
     let mut case = if long {
         seeded.long()
+    } else if compat {
+        seeded.compat()
     } else if paged {
         seeded.paged()
     } else {
