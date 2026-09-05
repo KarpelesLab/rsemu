@@ -148,6 +148,31 @@ mod asm {
         0x1050_0073
     }
 
+    /// The B-type layout (§2.3): the immediate is in halfwords and its bits
+    /// are scattered, which is the price of sharing the register fields with
+    /// S-type.
+    fn b_type(funct3: u32, rs1: u32, rs2: u32, imm: i32) -> u32 {
+        let imm = imm as u32;
+        (((imm >> 12) & 1) << 31)
+            | (((imm >> 5) & 0x3f) << 25)
+            | (rs2 << 20)
+            | (rs1 << 15)
+            | (funct3 << 12)
+            | (((imm >> 1) & 0xf) << 8)
+            | (((imm >> 11) & 1) << 7)
+            | 0b1100011
+    }
+
+    /// `beq rs1, rs2, imm`.
+    pub(super) fn beq(rs1: u32, rs2: u32, imm: i32) -> u32 {
+        b_type(0b000, rs1, rs2, imm)
+    }
+
+    /// `bne rs1, rs2, imm`.
+    pub(super) fn bne(rs1: u32, rs2: u32, imm: i32) -> u32 {
+        b_type(0b001, rs1, rs2, imm)
+    }
+
     /// `jal x0, imm` — a plain jump. J-type (§2.5).
     pub(super) fn j(imm: i32) -> u32 {
         let imm = imm as u32;
@@ -275,10 +300,16 @@ struct Board {
 /// host objects, so two boards in one binary cannot type at each other however
 /// they name their console. `tag` survives only so a failure names the test.
 fn board(tag: &str, firmware: &[u8]) -> Board {
+    board_named("riscv-virt", tag, firmware)
+}
+
+/// The same, for one of the board's variants: `riscv-virt-smp` is this file
+/// with a second hart, and everything a program here does works on both.
+fn board_named(machine: &str, tag: &str, firmware: &[u8]) -> Board {
     let _ = tag;
     let console_name = String::from("console");
     let power_name = String::from("power");
-    let entry = catalog::machine("riscv-virt").expect("this build ships it");
+    let entry = catalog::machine(machine).expect("this build ships it");
     let options = catalog::build_options()
         .expect("the catalog agrees with itself")
         .with_media("firmware", firmware)
@@ -294,7 +325,7 @@ fn board(tag: &str, firmware: &[u8]) -> Board {
     let registry = catalog::registry().expect("the catalog agrees with itself");
     let machine = match crate::machine::build(entry.name, entry.source, &registry, &options) {
         Ok(m) => m,
-        Err(e) => panic!("riscv-virt does not build: {e}"),
+        Err(e) => panic!("{machine} does not build: {e}"),
     };
     Board {
         machine,
@@ -822,6 +853,222 @@ fn the_virtio_block_device_is_discoverable_and_serves_a_read() {
 }
 
 // ---------------------------------------------------------------------------
+// two harts
+// ---------------------------------------------------------------------------
+
+/// Where the second hart's `msip` word is: `MSIP` base plus four bytes per
+/// hart (ACLINT specification, the MSWI register map).
+const MSIP1: u64 = 0x0200_0004;
+
+/// A word in DRAM the two harts pass a flag through.
+const HANDSHAKE: u64 = DRAM + 0x2000;
+
+/// Where the second hart's half of a two-hart program starts.
+const SECONDARY_OFFSET: u64 = 0x200;
+
+/// Where its trap handler starts.
+const HANDLER_OFFSET: u64 = 0x400;
+
+/// The `mie.MSIE` and `mstatus.MIE` bit, which happen to be the same number:
+/// bit 3, the machine software interrupt (Privileged Architecture, the machine
+/// interrupt registers).
+const MSIE: u32 = 1 << 3;
+
+/// Both harts enter the same image, and `a0` is the only thing that differs.
+///
+/// ```text
+///        bne  a0, x0, secondary   ; the boot ROM put mhartid in a0
+///        ; hart 0
+///        t3 = HANDSHAKE
+///   1:   lw   t1, 0(t3)
+///        beq  t1, x0, 1b          ; wait for the other hart
+///        t0 = UART; putc 'S'
+///        poweroff
+///   secondary:                    ; +0x200
+///        t3 = HANDSHAKE
+///        t1 = 1
+///        sw   t1, 0(t3)
+///        j    .
+/// ```
+///
+/// The flag is a plain store rather than an `sc.w`, on purpose: this is a test
+/// of hart identity and independent execution, and the reservation is core-local
+/// (see the machine file's note 4), so an exclusive here would be testing
+/// something known to be wrong.
+fn two_hart_handshake() -> Vec<u8> {
+    let mut p = Program::new(DRAM);
+    p.push(asm::bne(asm::A0, asm::ZERO, SECONDARY_OFFSET as i32));
+    p.la(asm::T3, HANDSHAKE);
+    let spin = p.here();
+    p.push(asm::lw(asm::T1, asm::T3, 0));
+    let back = (spin as i64 - p.here() as i64) as i32;
+    p.push(asm::beq(asm::T1, asm::ZERO, back));
+    p.li(asm::T0, UART as u32);
+    p.putc(b'S');
+    p.poweroff();
+
+    p.pad_to(SECONDARY_OFFSET);
+    p.la(asm::T3, HANDSHAKE);
+    p.li(asm::T1, 1);
+    p.push(asm::sw(asm::T3, asm::T1, 0));
+    p.push(asm::j(0));
+    p.bytes()
+}
+
+#[test]
+fn both_harts_run_and_each_one_knows_which_it_is() {
+    // The whole bring-up mechanism of this board in one program: both harts
+    // come out of reset in the same boot ROM, the ROM's `csrr a0, mhartid`
+    // gives each of them a different `a0`, and they take different branches
+    // out of the same image. Hart 0 cannot finish unless hart 1 ran.
+    let mut b = board_named("riscv-virt-smp", "smp", &two_hart_handshake());
+    assert_eq!(
+        b.run(20_000),
+        Some(Request::Poweroff),
+        "hart 0 never saw hart 1's flag: either the second hart is not running or `mhartid` is \
+         the same on both"
+    );
+    assert!(
+        b.output().contains('S'),
+        "the machine stopped without hart 0 reaching its console write"
+    );
+}
+
+#[test]
+fn the_single_hart_board_runs_only_hart_zero() {
+    // The control for the test above, and the thing that says the two board
+    // files are genuinely different rather than both being SMP. The same
+    // program on `riscv-virt` spins forever, because nothing writes the flag.
+    let mut b = board("smp-control", &two_hart_handshake());
+    assert_eq!(
+        b.run(4_000),
+        None,
+        "something answered hart 0 on a one-hart board"
+    );
+}
+
+/// The IPI: hart 0 stores 1 to hart 1's `msip` word and hart 1 traps.
+///
+/// ```text
+///        bne  a0, x0, secondary
+///        ; hart 0
+///        t0 = MSIP1; t1 = 1; sw t1, 0(t0)   ; the interprocessor interrupt
+///        t3 = HANDSHAKE
+///   1:   lw   t1, 0(t3)
+///        beq  t1, x0, 1b
+///        poweroff
+///   secondary:                              ; +0x200
+///        t0 = HANDLER; csrw mtvec, t0
+///        t1 = MSIE;    csrs mie, t1; csrs mstatus, t1
+///   2:   wfi
+///        j    2b
+///   handler:                                ; +0x400
+///        t0 = MSIP1; sw x0, 0(t0)           ; the only way to clear msip
+///        t3 = HANDSHAKE; t1 = 1; sw t1, 0(t3)
+///        j    .
+/// ```
+fn two_hart_ipi() -> Vec<u8> {
+    let mut p = Program::new(DRAM);
+    p.push(asm::bne(asm::A0, asm::ZERO, SECONDARY_OFFSET as i32));
+    p.li(asm::T0, MSIP1 as u32);
+    p.li(asm::T1, 1);
+    p.push(asm::sw(asm::T0, asm::T1, 0));
+    p.la(asm::T3, HANDSHAKE);
+    let spin = p.here();
+    p.push(asm::lw(asm::T1, asm::T3, 0));
+    let back = (spin as i64 - p.here() as i64) as i32;
+    p.push(asm::beq(asm::T1, asm::ZERO, back));
+    p.poweroff();
+
+    p.pad_to(SECONDARY_OFFSET);
+    p.la(asm::T0, DRAM + HANDLER_OFFSET);
+    p.push(asm::csrw(asm::CSR_MTVEC, asm::T0));
+    p.li(asm::T1, MSIE);
+    p.push(asm::csrs(asm::CSR_MIE, asm::T1));
+    p.push(asm::csrs(asm::CSR_MSTATUS, asm::T1));
+    let idle = p.here();
+    p.push(asm::wfi());
+    let back = (idle as i64 - p.here() as i64) as i32;
+    p.push(asm::j(back));
+
+    p.pad_to(HANDLER_OFFSET);
+    p.li(asm::T0, MSIP1 as u32);
+    // `msip` has no acknowledge bit: clearing the word is the acknowledgement,
+    // which is what makes an IPI handler that forgets it live-lock.
+    p.push(asm::sw(asm::T0, asm::ZERO, 0));
+    p.la(asm::T3, HANDSHAKE);
+    p.li(asm::T1, 1);
+    p.push(asm::sw(asm::T3, asm::T1, 0));
+    p.push(asm::j(0));
+    p.bytes()
+}
+
+#[test]
+fn a_store_to_the_other_harts_msip_is_an_interprocessor_interrupt() {
+    // There is no separate IPI mechanism on this architecture: an IPI *is* a
+    // write to a sibling's `msip` register, delivered as cause 3, the machine
+    // software interrupt (Privileged Architecture; ACLINT MSWI). Hart 1 is in
+    // `wfi` when it arrives, which is where a parked hart waits.
+    let mut b = board_named("riscv-virt-smp", "ipi", &two_hart_ipi());
+    assert_eq!(
+        b.run(20_000),
+        Some(Request::Poweroff),
+        "hart 1 never reached its trap handler: the store to msip1 did not become a machine \
+         software interrupt on the other hart"
+    );
+    assert_eq!(
+        b.peek(HANDSHAKE, Width::U32),
+        1,
+        "the handler ran but wrote nothing"
+    );
+    // Cleared by the handler, which is the only way `msip` clears.
+    assert_eq!(b.peek(MSIP1, Width::U32), 0);
+}
+
+#[test]
+fn a_two_hart_machine_snapshots_and_restores_to_the_same_state_hash() {
+    // The per-hart half of `ROADMAP.md` §4.5: two harts, two comparators, two
+    // software-interrupt bits and four PLIC contexts all have to come back.
+    let mut b = board_named("riscv-virt-smp", "smp-snapshot", &two_hart_ipi());
+    b.run(2_000);
+    let saved = b.machine.save().expect("a machine saves");
+    let before = b.machine.state_hash().expect("a machine hashes");
+    b.machine.load(&saved).expect("its own snapshot loads");
+    assert_eq!(b.machine.state_hash().expect("hashes"), before);
+}
+
+#[test]
+fn the_generated_tree_describes_both_harts() {
+    // `dt.rs` emits one `cpu@N` node per hart and one `interrupts-extended`
+    // pair per hart on the CLINT and the PLIC. Nothing here was written for
+    // SMP — the generator has always taken the count from `riscv.boot` — so
+    // this is the assertion that says so out loud.
+    let b = board_named("riscv-virt-smp", "smp-dt", &[]);
+    let dtb = b.device_tree();
+    let tree = super::dt::describe(&dtb).expect("it parses");
+    for node in ["cpu@0", "cpu@1"] {
+        assert!(tree.contains(node), "no `{node}` in the tree:\n{tree}");
+    }
+    assert!(
+        dtb.windows(21).any(|w| w == b"rsemu riscv-virt-smp\0"),
+        "the tree names the wrong board"
+    );
+    // Two harts is four cells per controller in `interrupts-extended`: a
+    // phandle and a cause number for each of the two interrupts each of the
+    // two harts takes from it.
+    assert_eq!(
+        prop_bytes(&dtb, "clint@2000000", "interrupts-extended").map(<[u8]>::len),
+        Some(32),
+        "the CLINT node does not name both harts"
+    );
+    assert_eq!(
+        prop_bytes(&dtb, "plic@c000000", "interrupts-extended").map(<[u8]>::len),
+        Some(32),
+        "the PLIC node does not name both harts"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // firmware fetched at test time
 // ---------------------------------------------------------------------------
 
@@ -903,6 +1150,10 @@ fn unescape(text: &str) -> String {
 /// fixture whose licence has not been checked, and this one is fetched even
 /// though its licence is fine, because the rule is about the repository rather
 /// than about any one file.
+///
+/// `RSEMU_RISCV_MACHINE` picks the board: `riscv-virt` (the default, one hart)
+/// or `riscv-virt-smp` (two). Everything else about the run is identical, which
+/// is what makes a two-hart boot comparable with a one-hart one.
 ///
 /// `RSEMU_RISCV_PAYLOAD` stages further images, as a comma-separated list of
 /// `addr:path`. That is how a supervisor-mode guest is booted: `fw_jump.bin` as
@@ -996,7 +1247,14 @@ fn firmware_from_the_environment_reaches_its_console() {
 
     let console_name = String::from("test.riscv.console.firmware");
     let power_name = String::from("test.riscv.power.firmware");
-    let entry = catalog::machine("riscv-virt").expect("shipped");
+    // Which board. `riscv-virt` is one hart and is what every run before
+    // `riscv-virt-smp` existed used; the SMP board is the same file with a
+    // second hart, so the same firmware, the same payloads and the same
+    // scripted session drive both and the *only* difference in a comparison is
+    // the hart count.
+    let board = std::env::var("RSEMU_RISCV_MACHINE").unwrap_or_else(|_| String::from("riscv-virt"));
+    let entry = catalog::machine(&board)
+        .unwrap_or_else(|| panic!("this build does not ship a machine called `{board}`"));
     let mut options = catalog::build_options()
         .expect("catalog")
         .with_media("firmware", image.as_slice())

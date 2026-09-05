@@ -1,0 +1,244 @@
+# The RISC-V `virt` board with two harts.
+#
+#   rsemu run riscv-virt-smp --media firmware=fw_payload.bin -p ram=512M
+#
+# Everything here is `machines/riscv-virt.machine` — same addresses, same
+# CLINT, same PLIC, same 16550, same virtio, same NOR banks, same generated
+# device tree — with a **second hart** and the four things a second hart needs.
+# It is a separate file rather than a `param` on that one for the reason
+# `machines/arm64-virt-smp.machine` is separate from `arm64-virt.machine`: the
+# description language declares objects, and the number of them cannot come
+# from a parameter. A one-hart run of this board would be a board with a spare
+# hart parked in firmware.
+#
+# Read `docs/platforms/riscv-virt.md` for the board; this header is only about
+# what the second hart changes.
+#
+# ---------------------------------------------------------------------------
+# 1. The CLINT and the PLIC were already per-hart, and that is architectural
+# ---------------------------------------------------------------------------
+#
+# This is where RISC-V differs from both of rsemu's other SMP boards, and the
+# difference is in the specifications rather than in our models. A GICv2's low
+# 32 interrupt ids are *banked* — one address, N registers, demultiplexed by
+# who is asking — and so is the x86 local APIC's architectural page. Neither
+# RISC-V controller works that way:
+#
+#   * ACLINT/CLINT gives every hart its **own address**: `msip` at `0 + 4*hart`
+#     and `mtimecmp` at `0x4000 + 8*hart` (RISC-V ACLINT specification, the
+#     MSWI and MTIMER register maps). `mtime` is the one shared register.
+#   * The PLIC gives every hart-and-privilege-level pair its own **context**,
+#     with its own enable array at `0x2000 + 0x80*c` and its own threshold and
+#     claim registers at `0x200000 + 0x1000*c` (RISC-V PLIC specification §3).
+#
+# So there is no `processors = [...]` property here and no `MemAttrs::requester`
+# demultiplexing anywhere on this board: a hart addresses its own registers by
+# hart number, which is what `mhartid` told it at reset. `harts = 2` on each
+# block is the whole change, and both blocks were written that way from the
+# first commit.
+#
+# ---------------------------------------------------------------------------
+# 2. Two harts means two timers, two software lines and two external lines
+# ---------------------------------------------------------------------------
+#
+# Eight wires rather than four. `clint.mtip1 -> cpu1.mtip` is the second hart's
+# machine timer interrupt (cause 7), `clint.msip1 -> cpu1.msip` is its machine
+# software interrupt (cause 3) — which is what an **IPI is** on RISC-V: a store
+# of 1 to another hart's `msip` word, not a separate mechanism — and
+# `plic.meip1`/`plic.seip1` are contexts 2 and 3 of the PLIC.
+#
+# ---------------------------------------------------------------------------
+# 3. Both harts come out of reset at the same address
+# ---------------------------------------------------------------------------
+#
+# That is what a reset vector is, and unlike the AArch64 board this one needs
+# no parking loop for it. The boot ROM's five instructions already read
+# `mhartid` into `a0` before jumping, because that is the hand-off convention
+# every RISC-V firmware expects, so both harts arrive at `0x80000000` knowing
+# which one they are and the firmware does the rest: OpenSBI initialises the
+# platform on one of them — its banner names it, `Boot HART ID : 0` — and holds
+# the others until something asks the **HSM** extension to start them
+# (`sbi_hart_start`, RISC-V SBI specification v2.0 §9). Linux's SMP bring-up is
+# that call, and the hart it starts is woken by an `msip` write through the
+# CLINT, so the IPI wiring below is on the bring-up path too.
+#
+# The alternative is a bare-metal board parking secondaries by hart id at the
+# reset vector, the way `arm64-virt-smp` parks on a spin table. This board does
+# not take it, for two reasons: it boots **behind OpenSBI** — that is what the
+# single-hart board's documented boot chain is — so SBI HSM is present and is
+# what a kernel will use anyway; and a parking loop in the boot ROM would be a
+# second, rsemu-specific bring-up protocol that no guest asks for. A board that
+# wanted one would need a `secondary` property on `riscv.boot`, which does not
+# exist because nothing has needed it.
+#
+# ---------------------------------------------------------------------------
+# 4. The exclusive monitor is per hart, and Linux's spinlocks are built on it
+# ---------------------------------------------------------------------------
+#
+# `cpu.riscv`'s reservation is private per-hart state, so a sibling's store does
+# not break this hart's reservation and an `sc.d` the architecture requires to
+# fail can succeed. See `docs/platforms/riscv-virt.md`. A green boot here is
+# evidence that bring-up, per-hart interrupt delivery and IPIs work; it is not
+# evidence that the atomics do.
+#
+# Sources: the RISC-V Privileged Architecture (CC-BY-4.0), the RISC-V ACLINT
+# specification, the RISC-V PLIC specification, the RISC-V SBI specification
+# v2.0 and the Devicetree Specification. Each device module cites the sections
+# it used.
+
+machine "riscv-virt-smp" {
+  param ram = 128M
+  param console = "console"
+  param cmdline = ""
+  param initrd_addr = 0x88000000
+  param power = "power"
+  param engine = "interp"
+  param storage = 16M
+  param flash = 32M
+
+  osc core    = 1000000000 Hz
+  osc rtc     = 10000000 Hz
+  osc uartclk = 1843200 Hz
+
+  space mem { width = 64 }
+
+  # -- the harts -------------------------------------------------------------
+  #
+  # Identical but for `hartid`, which is what `mhartid` reports, what the boot
+  # ROM puts in `a0`, what each `cpu@N` node's `reg` says, and what indexes this
+  # hart's `msip`, its `mtimecmp` and its PLIC contexts. Both come out of reset
+  # in the boot ROM at 0x1000; see note 3 above.
+  object cpu0 "cpu.riscv" {
+    clock  = core
+    space  = mem
+    engine = engine
+    xlen   = "rv64"
+    isa    = "imafdc"
+    hartid = 0
+    reset  = 0x1000
+    timer  = clint
+  }
+
+  object cpu1 "cpu.riscv" {
+    clock  = core
+    space  = mem
+    engine = engine
+    xlen   = "rv64"
+    isa    = "imafdc"
+    hartid = 1
+    reset  = 0x1000
+    timer  = clint
+  }
+
+  object dram "ram" { size = ram }
+
+  # Two comparators and two software-interrupt bits, at their own addresses.
+  object clint "riscv.clint" {
+    clock    = rtc
+    harts    = 2
+    timebase = 10000000
+  }
+
+  # Four contexts: machine and supervisor for each hart, in that order, so
+  # `meip1` is context 2 and `seip1` is context 3.
+  object plic "riscv.plic" {
+    sources    = 31
+    harts      = 2
+    supervisor = true
+  }
+
+  object uart "uart.ns16550" {
+    clock     = uartclk / 16
+    port      = console
+    frequency = 1843200
+  }
+
+  object test "riscv.syscon" { signal = power }
+
+  object blk "virtio.blk" {
+    space  = mem
+    size   = storage
+    image  = "disk"
+    serial = "rsemu-virt-0"
+  }
+
+  object rng "virtio.rng" {
+    space = mem
+    seed  = 1
+  }
+
+  object flash0 "flash.cfi" {
+    size     = flash
+    image    = "flash0"
+    block    = 256K
+    readonly = true
+  }
+
+  object flash1 "flash.cfi" {
+    size  = flash
+    image = "flash1"
+    block = 256K
+  }
+
+  object boot "riscv.boot" {
+    space       = mem
+    entry       = 0x80000000
+    harts       = 2
+    boot-hart   = 0
+    isa         = "rv64imafdc"
+    mmu         = "sv39"
+    bootargs    = cmdline
+    timebase    = 10000000
+    model       = "rsemu riscv-virt-smp"
+    initrd      = "initrd"
+    initrd-addr = initrd_addr
+  }
+
+  # -- the memory map --------------------------------------------------------
+  map mem 0x00001000 size 0x0000f000 = boot
+  map mem 0x00100000 size 0x00001000 = test
+  map mem 0x02000000 size 0x00010000 = clint
+  map mem 0x0c000000 size 0x00400000 = plic
+  map mem 0x10000000 size 0x00000100 = uart
+  map mem 0x10001000 size 0x00001000 = blk
+  map mem 0x10002000 size 0x00001000 = rng
+  map mem 0x20000000 size flash      = flash0
+  map mem 0x22000000 size flash      = flash1
+  map mem 0x80000000 size ram        = dram
+
+  # -- interrupts ------------------------------------------------------------
+  #
+  # Per hart, all four lines. `msip<h>` is the IPI: another hart stores 1 to
+  # `0x02000000 + 4*h` and this wire is what carries it.
+  wire clint.mtip0 -> cpu0.mtip
+  wire clint.msip0 -> cpu0.msip
+  wire plic.meip0  -> cpu0.meip
+  wire plic.seip0  -> cpu0.seip
+
+  wire clint.mtip1 -> cpu1.mtip
+  wire clint.msip1 -> cpu1.msip
+  wire plic.meip1  -> cpu1.meip
+  wire plic.seip1  -> cpu1.seip
+
+  wire uart.irq    -> plic.irq10
+  wire blk.irq     -> plic.irq1
+  wire rng.irq     -> plic.irq2
+
+  # A reset request reaches both harts, or the board would come back up with
+  # one of them still in the kernel it was told to leave.
+  wire test.reset  -> cpu0.reset
+  wire test.reset  -> cpu1.reset
+
+  # -- what gets loaded ------------------------------------------------------
+  object fw "riscv.loader" {
+    space = mem
+    image = "firmware"
+    addr  = 0x80000000
+  }
+
+  object initrd "riscv.loader" {
+    space = mem
+    image = "initrd"
+    addr  = initrd_addr
+  }
+}

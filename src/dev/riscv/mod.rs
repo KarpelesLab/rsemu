@@ -46,6 +46,36 @@
 //!   0x8000_0000  DRAM
 //! ```
 //!
+//! # Two harts
+//!
+//! `machines/riscv-virt-smp.machine` is the same board with a second
+//! `cpu.riscv` on it, and what it needed from this module was **nothing**.
+//! That is worth stating rather than glossing, because it is the one thing
+//! RISC-V does differently from the other two architectures with a
+//! multiprocessor board here:
+//!
+//! * A GICv2 *banks* its low 32 interrupt ids and an x86 local APIC has one
+//!   architectural page for every processor, so both had to be taught to
+//!   demultiplex on [`MemAttrs::requester`](crate::core::space::MemAttrs) —
+//!   resolved from the machine file through
+//!   [`BindCtx::peer`](crate::machine::BindCtx::peer).
+//! * RISC-V gives every hart its **own addresses**. `msip` is at `4*hart` and
+//!   `mtimecmp` at `0x4000 + 8*hart` (ACLINT), and a PLIC context has its own
+//!   enable array, threshold and claim register (PLIC specification §3). A
+//!   hart reaches its own registers because it knows its own `mhartid`, which
+//!   the boot ROM already puts in `a0`.
+//!
+//! So [`clint`] and [`plic`] were already per-hart, [`dt`] already emitted one
+//! `cpu@N` node and one `interrupts-extended` pair per hart, and [`boot`]'s
+//! reset vector already read `mhartid`. `harts = 2` and eight wires is the
+//! whole board file. An **IPI** is a store to a sibling's `msip` word — there
+//! is no other mechanism — and secondaries are started through SBI HSM by the
+//! firmware rather than off a spin table this repository invents.
+//!
+//! The caveat is in `docs/platforms/riscv-virt.md` and is not this module's:
+//! the exclusive monitor is per hart, so `lr`/`sc` between two harts is not
+//! sound yet.
+//!
 //! The two flash banks are [`crate::dev::flash::cfi`] rather than anything in
 //! this module: a CFI part is not a RISC-V device, and the board simply maps
 //! two of them. What *is* board-specific is that they appear in the generated
